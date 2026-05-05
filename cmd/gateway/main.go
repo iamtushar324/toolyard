@@ -96,6 +96,7 @@ func runServe(argv []string) error {
 	stdio := fs.Bool("stdio", false, "also serve MCP over stdio (for direct agent host wiring)")
 	upstreamConfig := fs.String("upstreams", "", "path to JSON file with upstream MCP server configs (optional)")
 	pushSubject := fs.String("push-subject", "mailto:admin@example.invalid", "VAPID `sub` claim")
+	inLineWait := fs.Duration("in-line-wait", 30*time.Second, "max time to block a held call before returning a deferred response")
 	_ = fs.Parse(argv)
 
 	if err := os.MkdirAll(*dataDir, 0o755); err != nil {
@@ -166,13 +167,14 @@ func runServe(argv []string) error {
 	}()
 
 	gw := gateway.New(gateway.Options{
-		Name:     "toolyard",
-		Version:  version,
-		Policy:   policy.New(),
-		Approval: bus,
-		Audit:    auditSvc,
-		Hub:      hub,
-		Memory:   memSvc,
+		Name:       "toolyard",
+		Version:    version,
+		Policy:     policy.New(),
+		Approval:   bus,
+		Audit:      auditSvc,
+		Hub:        hub,
+		Memory:     memSvc,
+		InLineWait: *inLineWait,
 	})
 	gw.RegisterBuiltins()
 	defer gw.Close()

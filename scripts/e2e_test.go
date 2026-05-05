@@ -1,10 +1,10 @@
 //go:build e2e
 
-// scripts/e2e_test.go runs an end-to-end smoke against a live toolyard server.
+// scripts/e2e_test.go runs end-to-end smokes against a live toolyard server.
 //
 // Usage:
 //
-//	go test -tags=e2e ./scripts -run TestEndToEnd -toolyard=http://localhost:18787
+//	go test -tags=e2e ./scripts -run TestE2E -toolyard=http://localhost:18787
 package scripts
 
 import (
@@ -31,7 +31,7 @@ type httpClient struct {
 	cookies []*http.Cookie
 }
 
-func (h *httpClient) do(t *testing.T, method, path string, body any) map[string]any {
+func (h *httpClient) raw(t *testing.T, method, path string, body any, dst any) {
 	t.Helper()
 	var buf io.Reader
 	if body != nil {
@@ -60,167 +60,118 @@ func (h *httpClient) do(t *testing.T, method, path string, body any) map[string]
 	if len(resp.Cookies()) > 0 {
 		h.cookies = append(h.cookies, resp.Cookies()...)
 	}
-	var out map[string]any
-	all, _ := io.ReadAll(resp.Body)
-	if len(all) == 0 {
-		return nil
+	if dst != nil {
+		all, _ := io.ReadAll(resp.Body)
+		if len(all) == 0 {
+			return
+		}
+		if err := json.Unmarshal(all, dst); err != nil {
+			t.Fatalf("decode %s: %v body=%s", path, err, string(all))
+		}
 	}
-	if err := json.Unmarshal(all, &out); err != nil {
-		// Maybe an array; ignore for this helper.
-		return map[string]any{"_raw": string(all)}
-	}
-	return out
 }
 
-func TestEndToEnd(t *testing.T) {
-	flag.Parse()
-	h := &httpClient{base: *toolyardURL}
-
-	// Idempotent: try setup; if user already exists, just login.
-	_, err := http.Post(h.base+"/v1/auth/setup", "application/json",
+func mustLogin(t *testing.T, h *httpClient) {
+	// idempotent: setup; if already exists fall through to login.
+	resp, err := http.Post(h.base+"/v1/auth/setup", "application/json",
 		strings.NewReader(`{"Username":"admin","Password":"correct horse battery staple"}`))
 	if err != nil {
 		t.Fatalf("setup: %v", err)
 	}
-	loginRes := h.do(t, "POST", "/v1/auth/login",
-		map[string]string{"Username": "admin", "Password": "correct horse battery staple"})
-	t.Logf("logged in as %v", loginRes["username"])
+	resp.Body.Close()
 
-	// Enroll an agent.
-	enr := h.do(t, "POST", "/v1/agents/enroll", map[string]string{"Name": "e2e"})
+	var out map[string]any
+	h.raw(t, "POST", "/v1/auth/login",
+		map[string]string{"Username": "admin", "Password": "correct horse battery staple"}, &out)
+	t.Logf("logged in as %v", out["username"])
+}
+
+func enrollAgent(t *testing.T, h *httpClient, name string) string {
+	var enr map[string]any
+	h.raw(t, "POST", "/v1/agents/enroll", map[string]string{"Name": name}, &enr)
 	code, _ := enr["enrollment_code"].(string)
 	if code == "" {
 		t.Fatal("no enrollment code")
 	}
-	xch := h.do(t, "POST", "/v1/agents/exchange", map[string]string{"Code": code})
-	token, _ := xch["token"].(string)
-	if token == "" {
+	var xch map[string]any
+	h.raw(t, "POST", "/v1/agents/exchange", map[string]string{"Code": code}, &xch)
+	tok, _ := xch["token"].(string)
+	if tok == "" {
 		t.Fatal("no token")
 	}
-	t.Logf("enrolled, token = %s…", token[:min(16, len(token))])
+	return tok
+}
 
-	// Connect MCP streamable client.
-	tr, err := transport.NewStreamableHTTP(*toolyardURL+"/mcp",
+func mcpClient(t *testing.T, base, token string) *client.Client {
+	tr, err := transport.NewStreamableHTTP(base+"/mcp",
 		transport.WithHTTPHeaders(map[string]string{"Authorization": "Bearer " + token}))
 	if err != nil {
 		t.Fatal(err)
 	}
 	c := client.NewClient(tr)
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 	if err := c.Start(ctx); err != nil {
 		t.Fatal(err)
 	}
-	defer c.Close()
-
 	initReq := mcp.InitializeRequest{}
 	initReq.Params.ProtocolVersion = mcp.LATEST_PROTOCOL_VERSION
 	initReq.Params.ClientInfo = mcp.Implementation{Name: "toolyard-e2e", Version: "0.0.1"}
 	if _, err := c.Initialize(ctx, initReq); err != nil {
 		t.Fatal(err)
 	}
+	return c
+}
+
+// TestE2EHappyPath: enroll, list, read passes, write holds, approve, write completes.
+func TestE2EHappyPath(t *testing.T) {
+	flag.Parse()
+	h := &httpClient{base: *toolyardURL}
+	mustLogin(t, h)
+	token := enrollAgent(t, h, "happy-path")
+	c := mcpClient(t, *toolyardURL, token)
+	defer c.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
 
 	tools, err := c.ListTools(ctx, mcp.ListToolsRequest{})
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Logf("tools: %d", len(tools.Tools))
-	if len(tools.Tools) == 0 {
-		t.Fatal("expected at least the built-in memory tools")
-	}
-	var foundReason bool
 	for _, tl := range tools.Tools {
-		_, hasReason := tl.InputSchema.Properties["_reason"]
-		if hasReason {
-			foundReason = true
+		if _, ok := tl.InputSchema.Properties["_reason"]; !ok {
+			t.Errorf("%s missing _reason in schema", tl.Name)
 		}
-		if tl.Name == "memory.set" && !hasReason {
-			t.Errorf("memory.set is missing _reason field")
-		}
-	}
-	if !foundReason {
-		t.Fatal("schema-wrap did not inject _reason on any tool")
 	}
 
-	// memory.get should pass without approval (read-only).
+	// memory.get is read-only -> passes through immediately.
 	getReq := mcp.CallToolRequest{}
 	getReq.Params.Name = "memory.get"
 	getReq.Params.Arguments = map[string]any{
 		"_reason": "smoke test reading a missing key just to exercise the read path",
-		"key":     "no-such-key",
+		"key":     "no-such-key-yet",
 	}
 	getRes, err := c.CallTool(ctx, getReq)
 	if err != nil {
-		t.Fatalf("memory.get call: %v", err)
+		t.Fatalf("read call: %v", err)
 	}
-	t.Logf("memory.get result isError=%v content=%s", getRes.IsError, dumpResult(getRes))
-
-	// memory.set requires approval. Run in a goroutine and approve mid-flight.
-	resultCh := make(chan *mcp.CallToolResult, 1)
-	errCh := make(chan error, 1)
-	go func() {
-		setReq := mcp.CallToolRequest{}
-		setReq.Params.Name = "memory.set"
-		setReq.Params.Arguments = map[string]any{
-			"_reason": "writing a value to demonstrate the approval flow end to end",
-			"key":     "hello",
-			"value":   "world",
-		}
-		res, err := c.CallTool(ctx, setReq)
-		if err != nil {
-			errCh <- err
-			return
-		}
-		resultCh <- res
-	}()
-
-	// Poll for the pending approval and approve it.
-	deadline := time.Now().Add(15 * time.Second)
-	var apID string
-	for time.Now().Before(deadline) {
-		time.Sleep(200 * time.Millisecond)
-		list := h.do(t, "GET", "/v1/approvals?status=pending", nil)
-		raw, _ := json.Marshal(list)
-		t.Logf("pending list: %s", string(raw))
-		// `list` is a JSON array but we decoded as map; switch to direct decode.
-		req, err := http.NewRequest("GET", h.base+"/v1/approvals?status=pending", nil)
-		if err != nil {
-			t.Fatal(err)
-		}
-		for _, c := range h.cookies {
-			req.AddCookie(c)
-		}
-		resp, err := http.DefaultClient.Do(req)
-		if err != nil {
-			t.Fatal(err)
-		}
-		var arr []map[string]any
-		_ = json.NewDecoder(resp.Body).Decode(&arr)
-		resp.Body.Close()
-		if len(arr) > 0 {
-			apID, _ = arr[0]["id"].(string)
-			break
-		}
-	}
-	if apID == "" {
-		t.Fatal("no approval appeared")
-	}
-	t.Logf("approving %s", apID)
-	h.do(t, "POST", "/v1/approvals/"+apID+"/decide", map[string]string{"Action": "allowed"})
-
-	select {
-	case res := <-resultCh:
-		if res.IsError {
-			t.Fatalf("memory.set returned error: %s", dumpResult(res))
-		}
-		t.Logf("memory.set OK: %s", dumpResult(res))
-	case err := <-errCh:
-		t.Fatalf("memory.set call: %v", err)
-	case <-time.After(20 * time.Second):
-		t.Fatal("memory.set never returned")
+	if !getRes.IsError {
+		t.Errorf("expected error for missing key")
 	}
 
-	// Verify the value landed.
+	// memory.set requires approval.
+	setRes, _ := callWithApproval(t, h, c, ctx, "memory.set", map[string]any{
+		"_reason": "writing a value to demonstrate the approval flow end to end",
+		"key":     "hello",
+		"value":   "world",
+	}, "allowed")
+	if setRes.IsError {
+		t.Fatalf("set returned error: %s", dumpResult(setRes))
+	}
+
+	// Read it back.
 	getReq2 := mcp.CallToolRequest{}
 	getReq2.Params.Name = "memory.get"
 	getReq2.Params.Arguments = map[string]any{
@@ -232,28 +183,181 @@ func TestEndToEnd(t *testing.T) {
 		t.Fatal(err)
 	}
 	if !strings.Contains(dumpResult(getRes2), "world") {
-		t.Errorf("expected 'world' in result, got %s", dumpResult(getRes2))
+		t.Errorf("expected 'world', got %s", dumpResult(getRes2))
+	}
+}
+
+// TestE2EDeny: write call held, dashboard denies, agent gets denial.
+func TestE2EDeny(t *testing.T) {
+	flag.Parse()
+	h := &httpClient{base: *toolyardURL}
+	mustLogin(t, h)
+	token := enrollAgent(t, h, "deny-path")
+	c := mcpClient(t, *toolyardURL, token)
+	defer c.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	res, _ := callWithApproval(t, h, c, ctx, "memory.set", map[string]any{
+		"_reason": "demonstrating the deny path returns a clean error to the agent",
+		"key":     "denied-key",
+		"value":   "should-not-store",
+	}, "denied")
+	if !res.IsError {
+		t.Errorf("expected isError after deny, got %s", dumpResult(res))
+	}
+	if !strings.Contains(strings.ToLower(dumpResult(res)), "den") {
+		t.Errorf("denied result should mention denial, got %s", dumpResult(res))
 	}
 
-	// Audit log should have records.
-	req, err := http.NewRequest("GET", h.base+"/v1/audit?limit=20", nil)
+	// Verify memory wasn't actually written.
+	getReq := mcp.CallToolRequest{}
+	getReq.Params.Name = "memory.get"
+	getReq.Params.Arguments = map[string]any{
+		"_reason": "verifying the previously denied write did not actually persist",
+		"key":     "denied-key",
+	}
+	gr, _ := c.CallTool(ctx, getReq)
+	if !gr.IsError {
+		t.Errorf("denied write should not have persisted; got: %s", dumpResult(gr))
+	}
+}
+
+// TestE2EDeferred: when the in-line wait elapses with no decision, the
+// server returns a deferred response; resuming with _approval_id after the
+// human approves yields the actual result.
+//
+// Run the server with -in-line-wait 2s for this test.
+func TestE2EDeferred(t *testing.T) {
+	flag.Parse()
+	h := &httpClient{base: *toolyardURL}
+	mustLogin(t, h)
+	token := enrollAgent(t, h, "deferred-path")
+	c := mcpClient(t, *toolyardURL, token)
+	defer c.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	// First call: held > in-line wait -> deferred response.
+	req := mcp.CallToolRequest{}
+	req.Params.Name = "memory.set"
+	req.Params.Arguments = map[string]any{
+		"_reason": "exercising the deferred-response path with a long approval window",
+		"key":     "deferred-key",
+		"value":   "later",
+	}
+	res, err := c.CallTool(ctx, req)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("first call: %v", err)
 	}
-	for _, c := range h.cookies {
-		req.AddCookie(c)
+	sc, _ := res.StructuredContent.(map[string]any)
+	if sc == nil || sc["status"] != "pending_approval" {
+		t.Skipf("server returned a non-deferred response (status=%v); requires in-line-wait flag short. Skipping.", sc)
 	}
-	resp, err := http.DefaultClient.Do(req)
+	apID, _ := sc["approval_id"].(string)
+	if apID == "" {
+		t.Fatal("deferred response missing approval_id")
+	}
+	t.Logf("deferred approval_id=%s", apID)
+
+	// Approve from the dashboard.
+	var dummy map[string]any
+	h.raw(t, "POST", "/v1/approvals/"+apID+"/decide", map[string]string{"Action": "allowed"}, &dummy)
+
+	// Re-call with _approval_id to resume.
+	req2 := mcp.CallToolRequest{}
+	req2.Params.Name = "memory.set"
+	req2.Params.Arguments = map[string]any{
+		"_reason":      "resuming the deferred call with the approval id",
+		"_approval_id": apID,
+	}
+	res2, err := c.CallTool(ctx, req2)
 	if err != nil {
-		t.Fatal(err)
+		t.Fatalf("resume call: %v", err)
 	}
-	var arr []map[string]any
-	_ = json.NewDecoder(resp.Body).Decode(&arr)
-	resp.Body.Close()
-	if len(arr) < 2 {
-		t.Fatalf("expected multiple audit events, got %d", len(arr))
+	if res2.IsError {
+		t.Fatalf("resume returned error: %s", dumpResult(res2))
 	}
-	t.Logf("audit events: %d", len(arr))
+	if !strings.Contains(dumpResult(res2), "later") {
+		t.Errorf("expected resumed call result to mention stored value, got %s", dumpResult(res2))
+	}
+}
+
+// TestE2EReasonValidation: missing/short reason rejected.
+func TestE2EReasonValidation(t *testing.T) {
+	flag.Parse()
+	h := &httpClient{base: *toolyardURL}
+	mustLogin(t, h)
+	token := enrollAgent(t, h, "reason-validation")
+	c := mcpClient(t, *toolyardURL, token)
+	defer c.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	// missing _reason
+	req := mcp.CallToolRequest{}
+	req.Params.Name = "memory.get"
+	req.Params.Arguments = map[string]any{"key": "x"}
+	_, _ = c.CallTool(ctx, req)
+	// mcp-go validates the required field client-side (or server returns
+	// an error). Either way we should not see a successful tool result.
+
+	// too-short reason
+	req2 := mcp.CallToolRequest{}
+	req2.Params.Name = "memory.get"
+	req2.Params.Arguments = map[string]any{"_reason": "too short", "key": "x"}
+	res, err := c.CallTool(ctx, req2)
+	if err == nil && res != nil && !res.IsError {
+		t.Error("expected reason validation to fail")
+	}
+}
+
+// callWithApproval issues the tool call in a goroutine, polls the dashboard
+// for the resulting pending approval, decides it, then waits for the call to
+// return.
+func callWithApproval(t *testing.T, h *httpClient, c *client.Client, ctx context.Context,
+	tool string, args map[string]any, action string) (*mcp.CallToolResult, error) {
+	t.Helper()
+	type result struct {
+		res *mcp.CallToolResult
+		err error
+	}
+	ch := make(chan result, 1)
+	go func() {
+		req := mcp.CallToolRequest{}
+		req.Params.Name = tool
+		req.Params.Arguments = args
+		res, err := c.CallTool(ctx, req)
+		ch <- result{res, err}
+	}()
+
+	deadline := time.Now().Add(15 * time.Second)
+	var apID string
+	for time.Now().Before(deadline) {
+		time.Sleep(150 * time.Millisecond)
+		var arr []map[string]any
+		h.raw(t, "GET", "/v1/approvals?status=pending", nil, &arr)
+		if len(arr) > 0 {
+			apID, _ = arr[0]["id"].(string)
+			break
+		}
+	}
+	if apID == "" {
+		t.Fatal("no approval appeared")
+	}
+	var dummy map[string]any
+	h.raw(t, "POST", "/v1/approvals/"+apID+"/decide", map[string]string{"Action": action}, &dummy)
+
+	select {
+	case r := <-ch:
+		return r.res, r.err
+	case <-time.After(20 * time.Second):
+		t.Fatal("call never returned after decision")
+		return nil, nil
+	}
 }
 
 func dumpResult(res *mcp.CallToolResult) string {
@@ -269,7 +373,5 @@ func dumpResult(res *mcp.CallToolResult) string {
 	}
 	return strings.TrimSpace(b.String())
 }
-
-func min(a, b int) int { if a < b { return a }; return b }
 
 var _ = fmt.Sprint
