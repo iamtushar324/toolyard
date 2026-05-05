@@ -16,7 +16,8 @@ const state = {
   marketplace: [],
   marketModal: null,
   toolFilter: '',
-  settings: { router_only_mode: false },
+  settings: { surface_mode: 'full', top_n_count: 20, top_n_personalize_after: 100, router_only_mode: false },
+  usage: { per_tool: {}, rows: [] },
   workbench: {
     selected: null,    // tool name
     inputs: {},        // toolName -> { fieldKey: value }
@@ -113,7 +114,7 @@ async function refreshUser() {
 async function loadAll() {
   if (!state.user) return;
   try {
-    const [pendings, audits, agents, memos, servers, tools, market, settingsRes, vapid] = await Promise.all([
+    const [pendings, audits, agents, memos, servers, tools, market, settingsRes, usageRes, vapid] = await Promise.all([
       api('/v1/approvals?status=pending'),
       api('/v1/audit?limit=50'),
       api('/v1/agents'),
@@ -122,9 +123,11 @@ async function loadAll() {
       api('/v1/tools').catch(() => []),
       api('/v1/marketplace').catch(() => []),
       api('/v1/settings').catch(() => ({})),
+      api('/v1/usage').catch(() => ({ per_tool: {}, rows: [] })),
       api('/v1/push/vapid_key').catch(() => null),
     ]);
-    state.settings = settingsRes || state.settings;
+    state.settings = Object.assign({}, state.settings, settingsRes || {});
+    state.usage = usageRes || state.usage;
     state.approvals = pendings || [];
     state.audit = audits || [];
     state.agents = agents || [];
@@ -678,12 +681,20 @@ async function removeServer(name) {
 
 function viewTools() {
   const filter = (state.toolFilter || '').toLowerCase();
+  const counts = (state.usage && state.usage.per_tool) || {};
   const tools = state.tools.filter((t) =>
     !filter ||
     t.name.toLowerCase().includes(filter) ||
     (t.description || '').toLowerCase().includes(filter) ||
     (t.upstream || '').toLowerCase().includes(filter)
-  ).sort((a, b) => a.name.localeCompare(b.name));
+  ).sort((a, b) => {
+    // Sort by uses desc, then name asc, so the most-used tools surface
+    // at the top of the catalog.
+    const ca = counts[a.name] || 0;
+    const cb = counts[b.name] || 0;
+    if (ca !== cb) return cb - ca;
+    return a.name.localeCompare(b.name);
+  });
 
   // Auto-select the first tool if nothing is selected and we have results.
   if (!state.workbench.selected && tools.length) {
@@ -713,13 +724,19 @@ function viewTools() {
       ? el('div', { class: 'card empty' }, state.tools.length === 0 ? 'No tools yet — install an MCP server in the Servers tab.' : 'No tools match your filter.')
       : el('div', { class: 'workbench' },
           el('div', { class: 'tool-list' },
-            tools.map((t) => el('div', {
-              class: 'item' + (t.name === state.workbench.selected ? ' active' : ''),
-              on: { click: () => { state.workbench.selected = t.name; state.workbench.result = null; render(); } },
-            },
-              el('div', { class: 'name' }, t.name),
-              el('div', { class: 'upstream' }, t.upstream),
-            )),
+            tools.map((t) => {
+              const c = counts[t.name] || 0;
+              return el('div', {
+                class: 'item' + (t.name === state.workbench.selected ? ' active' : ''),
+                on: { click: () => { state.workbench.selected = t.name; state.workbench.result = null; render(); } },
+              },
+                el('div', { style: 'display: flex; gap: 6px; align-items: baseline;' },
+                  el('div', { class: 'name', style: 'flex: 1;' }, t.name),
+                  c > 0 ? el('div', { class: 'upstream', title: 'successful calls', style: 'color: var(--accent);' }, String(c)) : null,
+                ),
+                el('div', { class: 'upstream' }, t.upstream),
+              );
+            }),
           ),
           selected ? renderToolPane(selected) : el('div', { class: 'pane empty' }, 'Pick a tool on the left.'),
         ),
@@ -909,37 +926,105 @@ function renderResult(r) {
 }
 
 function viewSettings() {
-  const routerOnly = !!state.settings.router_only_mode;
+  const mode = state.settings.surface_mode || 'full';
+  const N    = Number(state.settings.top_n_count || 20);
+  const T    = Number(state.settings.top_n_personalize_after || 100);
+
+  // Pinned set (must mirror gateway.PinnedTools).
+  const pinned = new Set(['tools.search', 'tools.execute', 'memory.get', 'memory.set', 'memory.list', 'memory.delete']);
+  const totalTools = state.tools.length;
+  const pinnedCount = state.tools.filter((t) => pinned.has(t.name)).length;
+
+  // Approximate "what each NEW agent currently sees" — pinned + top-N
+  // selected globally because no agent has crossed the personalisation
+  // threshold for them.
+  const globalTop = Object.entries(state.usage.per_tool || {})
+    .filter(([name]) => !pinned.has(name))
+    .sort((a, b) => b[1] - a[1])
+    .slice(0, N)
+    .map(([name]) => name);
+  const exposedInTopN = pinnedCount + globalTop.length;
+
+  const exposedCount =
+    mode === 'full' ? totalTools :
+    mode === 'router_only' ? pinnedCount :
+    exposedInTopN;
+
+  const setMode = async (next) => {
+    try {
+      await api('/v1/settings', { method: 'PATCH', body: { surface_mode: next }});
+      state.settings.surface_mode = next;
+      toast('Mode: ' + next);
+      render();
+    } catch (err) { toast(err.message, 'error'); }
+  };
+
+  const radio = (val, label, sub) => el('label', {
+    style: 'display: flex; gap: 12px; align-items: flex-start; cursor: pointer; padding: 8px 0; border-top: 1px solid var(--border);',
+  },
+    el('input', {
+      type: 'radio',
+      name: 'surface_mode',
+      checked: mode === val,
+      style: 'margin-top: 4px;',
+      on: { change: () => setMode(val) },
+    }),
+    el('div', {},
+      el('div', { style: 'font-weight: 500;' }, label),
+      el('div', { class: 'meta', style: 'margin-top: 4px;' }, sub),
+    ),
+  );
+
   return el('div', {},
     el('div', { class: 'card' },
       el('h2', {}, 'Agent surface'),
-      el('label', { style: 'display: flex; gap: 12px; align-items: flex-start; cursor: pointer;' },
-        el('input', {
-          type: 'checkbox',
-          checked: routerOnly,
-          style: 'margin-top: 4px;',
-          on: { change: async (e) => {
-            const next = e.target.checked;
-            try {
-              await api('/v1/settings', { method: 'PATCH', body: { router_only_mode: next }});
-              state.settings.router_only_mode = next;
-              toast(next ? 'Router-only mode on. Agents now see only tools.search + tools.execute.' : 'Router-only mode off.');
-              render();
-            } catch (err) { toast(err.message, 'error'); }
-          }},
-        }),
-        el('div', {},
-          el('div', { style: 'font-weight: 500;' }, 'Router-only mode'),
-          el('div', { class: 'meta', style: 'margin-top: 4px;' },
-            'Hide every tool from agents\' tools/list except ', el('code', {}, 'tools.search'), ' and ', el('code', {}, 'tools.execute'), '. ',
-            'Underlying tools stay registered, so the meta-tools can still route into any of them. ',
-            'Use this when you have many MCP servers connected and don\'t want every agent prompt to carry hundreds of tool schemas.'),
-          el('div', { class: 'meta', style: 'margin-top: 6px;' },
-            'Currently exposed to agents: ',
-            el('code', {}, routerOnly ? '2 meta-tools' : `${state.tools.length} tools`),
-            '.'),
+      el('p', { class: 'meta' },
+        'Controls which tools each agent sees in its tools/list. Pinned tools (',
+        el('code', {}, 'tools.search'), ', ', el('code', {}, 'tools.execute'), ', ', el('code', {}, 'memory.*'),
+        ') are always visible regardless of mode. Approximate exposure for a new agent: ',
+        el('code', {}, exposedCount + ' / ' + totalTools + ' tools'), '.'),
+      radio('full', 'Full catalog',
+        'Every wrapped tool. Simple, but the agent\'s prompt carries every schema — pricey when you have many servers connected.'),
+      radio('top_n', 'Top-N most used (recommended)',
+        'Pinned tools + the agent\'s top-N most-used real tools. New agents fall back to the overall top-N until they\'ve made enough calls of their own to personalise.'),
+      radio('router_only', 'Router only',
+        'Pinned tools only. The model uses tools.search to discover anything else and tools.execute to invoke. Smallest possible prompt; one extra hop per call.'),
+      mode === 'top_n' ? el('div', { style: 'margin-top: 12px; display: grid; grid-template-columns: 1fr 1fr; gap: 12px;' },
+        el('label', {},
+          el('div', { class: 'meta' }, 'Top-N count'),
+          el('input', {
+            type: 'number', min: 1, max: 200,
+            value: String(N),
+            on: { change: async (e) => {
+              const v = Math.max(1, Math.min(200, parseInt(e.target.value, 10) || 20));
+              try {
+                await api('/v1/settings', { method: 'PATCH', body: { top_n_count: v }});
+                state.settings.top_n_count = v;
+                toast('top_n_count = ' + v);
+                render();
+              } catch (err) { toast(err.message, 'error'); }
+            }},
+          }),
+          el('div', { class: 'meta', style: 'margin-top: 4px;' }, 'Extra tools beyond the pinned set.'),
         ),
-      ),
+        el('label', {},
+          el('div', { class: 'meta' }, 'Personalise after (calls)'),
+          el('input', {
+            type: 'number', min: 0, max: 1000000,
+            value: String(T),
+            on: { change: async (e) => {
+              const v = Math.max(0, parseInt(e.target.value, 10) || 0);
+              try {
+                await api('/v1/settings', { method: 'PATCH', body: { top_n_personalize_after: v }});
+                state.settings.top_n_personalize_after = v;
+                toast('top_n_personalize_after = ' + v);
+                render();
+              } catch (err) { toast(err.message, 'error'); }
+            }},
+          }),
+          el('div', { class: 'meta', style: 'margin-top: 4px;' }, 'Until an agent has made this many successful calls, it sees the overall top-N rather than its own.'),
+        ),
+      ) : null,
     ),
     el('div', { class: 'card' },
       el('h2', {}, 'Web Push'),

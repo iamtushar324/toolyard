@@ -585,7 +585,7 @@ func TestE2ERouterOnlyMode(t *testing.T) {
 		t.Fatalf("expected >2 tools when router_only_mode is off, got %d", len(full.Tools))
 	}
 
-	// Turn it on; tools/list must shrink to just the meta-tools.
+	// Turn it on; tools/list must shrink to just the pinned set.
 	var on map[string]any
 	h.raw(t, "PATCH", "/v1/settings", map[string]any{"router_only_mode": true}, &on)
 	if on["router_only_mode"] != true {
@@ -596,68 +596,183 @@ func TestE2ERouterOnlyMode(t *testing.T) {
 	// a server-info snapshot; the filter is still applied per-call though.
 	c2 := mcpClient(t, *toolyardURL, token)
 	defer c2.Close()
+	pinned := map[string]bool{
+		"tools.search": true, "tools.execute": true,
+		"memory.get": true, "memory.set": true,
+		"memory.list": true, "memory.delete": true,
+	}
 	min, err := c2.ListTools(ctx, mcp.ListToolsRequest{})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(min.Tools) != 2 {
-		t.Fatalf("expected exactly 2 tools (search + execute) in router-only mode, got %d", len(min.Tools))
+	if len(min.Tools) != len(pinned) {
+		t.Fatalf("router-only should expose the pinned set (%d), got %d", len(pinned), len(min.Tools))
 	}
 	gotNames := map[string]bool{}
 	for _, tl := range min.Tools {
 		gotNames[tl.Name] = true
 	}
-	if !gotNames["tools.search"] || !gotNames["tools.execute"] {
-		t.Errorf("expected tools.search and tools.execute; got %v", gotNames)
+	for name := range pinned {
+		if !gotNames[name] {
+			t.Errorf("pinned tool %q missing in router-only mode", name)
+		}
 	}
 
-	// Direct calls to a hidden tool are rejected with a pointer at
-	// tools.execute (so an agent that has memory.get cached in its context
-	// from before the toggle can't bypass the setting).
+	// Direct calls to a non-pinned tool are rejected. fixture.echo is the
+	// upstream we know is always registered and not pinned.
 	directReq := mcp.CallToolRequest{}
-	directReq.Params.Name = "memory.get"
+	directReq.Params.Name = "fixture.echo"
 	directReq.Params.Arguments = map[string]any{
 		"_reason": "trying to bypass router-only mode by calling the hidden tool directly",
-		"key":     "no-such-key",
+		"message": "hi",
 	}
 	directRes, err := c2.CallTool(ctx, directReq)
 	if err != nil {
 		t.Fatalf("direct call in router-only mode: %v", err)
 	}
 	if !directRes.IsError {
-		t.Errorf("expected direct call to be rejected in router-only mode, got %s", dumpResult(directRes))
+		t.Errorf("expected direct call to fixture.echo to be rejected in router-only mode, got %s", dumpResult(directRes))
 	}
-	if !strings.Contains(strings.ToLower(dumpResult(directRes)), "router-only") {
-		t.Errorf("rejection message should mention router-only mode, got %s", dumpResult(directRes))
+	if !strings.Contains(strings.ToLower(dumpResult(directRes)), "hidden") {
+		t.Errorf("rejection message should mention hiding, got %s", dumpResult(directRes))
 	}
 
-	// Underlying tool is still callable through tools.execute.
+	// Underlying hidden tool is still callable through tools.execute.
 	exec := mcp.CallToolRequest{}
 	exec.Params.Name = "tools.execute"
 	exec.Params.Arguments = map[string]any{
-		"_reason": "verifying tools.execute still routes when the catalog is hidden",
-		"tool":    "memory.get",
+		"_reason": "verifying tools.execute still routes to a hidden tool",
+		"tool":    "fixture.echo",
 		"arguments": map[string]any{
 			"_reason": "router-only-mode reachability check via meta-tool",
-			"key":     "no-such-key",
+			"message": "hi",
 		},
 	}
 	res, err := c2.CallTool(ctx, exec)
 	if err != nil {
 		t.Fatalf("execute via meta in router-only-mode: %v", err)
 	}
-	// Expected: memory.get returns isError=true (key missing), but the call
-	// succeeded in routing — that's what we're testing.
-	if !res.IsError {
-		t.Logf("memory.get returned ok unexpectedly: %s", dumpResult(res))
-	}
-	// And the result text mentions a missing key, not a router-only rejection.
-	if strings.Contains(strings.ToLower(dumpResult(res)), "router-only") {
-		t.Errorf("tools.execute should bypass the filter, got %s", dumpResult(res))
+	// fixture.echo is a write -> the inner call holds for approval and we
+	// see a deferred response. That's the proof we want: routing reached the
+	// hidden tool's policy/approval pipeline. The rejection message would
+	// have mentioned hiding instead.
+	if strings.Contains(strings.ToLower(dumpResult(res)), "hidden") {
+		t.Errorf("tools.execute should bypass the filter; got %s", dumpResult(res))
 	}
 
 	// Restore default for other tests.
 	h.raw(t, "PATCH", "/v1/settings", map[string]any{"router_only_mode": false}, &off)
+}
+
+// TestE2EUsageAndTopN: counters increment only on success, top-N mode keeps
+// pinned tools always visible plus a per-agent ranked tail. Cold-start
+// agents with no history fall back to the overall top-N.
+func TestE2EUsageAndTopN(t *testing.T) {
+	flag.Parse()
+	h := &httpClient{base: *toolyardURL}
+	mustLogin(t, h)
+
+	// Reset to full mode so we have a clean baseline.
+	var s map[string]any
+	h.raw(t, "PATCH", "/v1/settings", map[string]any{"surface_mode": "full"}, &s)
+
+	// Drive a few successful memory.set calls under the dashboard:<uid>
+	// agent so the counter accrues.
+	for i := 0; i < 3; i++ {
+		var dummy map[string]any
+		h.raw(t, "POST", "/v1/tools/run", map[string]any{
+			"tool": "memory.set",
+			"arguments": map[string]any{
+				"_reason":      "exercising the usage counter increment via the dashboard agent",
+				"_approval_id": "", // no approval needed because dashboard agent calls go through approval flow
+				"key":          fmt.Sprintf("usage-%d", i),
+				"value":        "x",
+			},
+		}, &dummy)
+		// The first call returns deferred (write needs approval). Approve it.
+		if sc, ok := dummy["structured_content"].(map[string]any); ok {
+			if apID, _ := sc["approval_id"].(string); apID != "" {
+				var d map[string]any
+				h.raw(t, "POST", "/v1/approvals/"+apID+"/decide", map[string]string{"Action": "allowed"}, &d)
+				// Resume to actually run the call.
+				h.raw(t, "POST", "/v1/tools/run", map[string]any{
+					"tool": "memory.set",
+					"arguments": map[string]any{
+						"_reason":      "resuming the deferred call after approval",
+						"_approval_id": apID,
+					},
+				}, &dummy)
+			}
+		}
+	}
+
+	// /v1/usage should now show memory.set counts.
+	var usage map[string]any
+	h.raw(t, "GET", "/v1/usage", nil, &usage)
+	per, _ := usage["per_tool"].(map[string]any)
+	if v, _ := per["memory.set"].(float64); v < 1 {
+		t.Errorf("expected memory.set counter > 0, got %v", per["memory.set"])
+	}
+	t.Logf("per_tool counts: %v", per)
+
+	// Switch to top_n mode with N=2 and a high threshold so cold-start
+	// (overall top-N) applies.
+	h.raw(t, "PATCH", "/v1/settings", map[string]any{
+		"surface_mode": "top_n", "top_n_count": 2, "top_n_personalize_after": 1000000,
+	}, &s)
+
+	// New agent → cold start → sees pinned + overall top-2.
+	token := enrollAgent(t, h, "topn-cold")
+	c := mcpClient(t, *toolyardURL, token)
+	defer c.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	tools, err := c.ListTools(ctx, mcp.ListToolsRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	gotNames := map[string]bool{}
+	for _, tl := range tools.Tools {
+		gotNames[tl.Name] = true
+	}
+	t.Logf("cold-start agent saw %d tools: %v", len(tools.Tools), keysOf(gotNames))
+	pinned := []string{"tools.search", "tools.execute", "memory.get", "memory.set", "memory.list", "memory.delete"}
+	for _, p := range pinned {
+		if !gotNames[p] {
+			t.Errorf("pinned tool %q not visible in top_n cold-start; got %v", p, keysOf(gotNames))
+		}
+	}
+	// We expect at most 6 pinned + 2 ranked tail = 8.
+	if len(tools.Tools) > 8 {
+		t.Errorf("expected ≤8 tools in top_n with N=2, got %d", len(tools.Tools))
+	}
+	// memory.set is in the pinned set, so it'll be there regardless. Check
+	// at least one *non-pinned* tool came in via the ranked tail (if there
+	// is any usage on a non-pinned tool — there isn't yet, so the tail may
+	// be empty; the pinned set alone is acceptable).
+
+	// Switch to router_only and confirm we shrink to exactly the pinned set.
+	h.raw(t, "PATCH", "/v1/settings", map[string]any{"surface_mode": "router_only"}, &s)
+	c2 := mcpClient(t, *toolyardURL, token)
+	defer c2.Close()
+	ro, err := c2.ListTools(ctx, mcp.ListToolsRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(ro.Tools) != len(pinned) {
+		t.Errorf("router_only should expose exactly the pinned set (%d), got %d", len(pinned), len(ro.Tools))
+	}
+
+	// Restore default for other tests.
+	h.raw(t, "PATCH", "/v1/settings", map[string]any{"surface_mode": "full"}, &s)
+}
+
+func keysOf(m map[string]bool) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	return out
 }
 
 // TestE2EReasonValidation: missing/short reason rejected.

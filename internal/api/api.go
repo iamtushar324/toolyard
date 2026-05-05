@@ -49,6 +49,7 @@ import (
 	"github.com/tusharbhardwaj/toolyard/internal/realtime"
 	"github.com/tusharbhardwaj/toolyard/internal/settings"
 	"github.com/tusharbhardwaj/toolyard/internal/upstreams"
+	"github.com/tusharbhardwaj/toolyard/internal/usage"
 )
 
 const (
@@ -67,6 +68,7 @@ type Server struct {
 	gateway    *gateway.Gateway
 	upstreams  *upstreams.Service
 	settings   *settings.Service
+	usage      *usage.Service
 	sessionKey []byte
 }
 
@@ -80,6 +82,7 @@ type Options struct {
 	Gateway    *gateway.Gateway
 	Upstreams  *upstreams.Service
 	Settings   *settings.Service
+	Usage      *usage.Service
 	SessionKey []byte
 }
 
@@ -94,6 +97,7 @@ func New(opts Options) *Server {
 		gateway:    opts.Gateway,
 		upstreams:  opts.Upstreams,
 		settings:   opts.Settings,
+		usage:      opts.Usage,
 		sessionKey: opts.SessionKey,
 	}
 }
@@ -128,6 +132,7 @@ func (s *Server) Routes(mux *http.ServeMux) {
 	mux.HandleFunc("/v1/tools/run", s.toolsRun)
 	mux.HandleFunc("/v1/marketplace", s.marketplaceList)
 	mux.HandleFunc("/v1/settings", s.settingsHandler)
+	mux.HandleFunc("/v1/usage", s.usageHandler)
 }
 
 // ---- helpers ----------------------------------------------------------------
@@ -810,14 +815,50 @@ func (s *Server) settingsHandler(w http.ResponseWriter, r *http.Request) {
 		// If the change affects what tools agents can see, push a
 		// notifications/tools/list_changed so connected MCP clients
 		// re-fetch instead of relying on their cached tool list.
-		if _, touched := body["router_only_mode"]; touched && s.gateway != nil {
-			s.gateway.NotifyToolListChanged()
+		if s.gateway != nil {
+			for _, k := range []string{"router_only_mode", "surface_mode", "top_n_count", "top_n_personalize_after"} {
+				if _, touched := body[k]; touched {
+					s.gateway.NotifyToolListChanged()
+					break
+				}
+			}
 		}
 		out, _ := s.settings.All(r.Context())
 		writeJSON(w, http.StatusOK, out)
 	default:
 		writeError(w, http.StatusMethodNotAllowed, "GET, PATCH")
 	}
+}
+
+// ---- usage ----------------------------------------------------------------
+
+func (s *Server) usageHandler(w http.ResponseWriter, r *http.Request) {
+	if _, err := s.requireUser(r); err != nil {
+		writeError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+	if s.usage == nil {
+		writeJSON(w, http.StatusOK, map[string]any{"per_tool": map[string]int64{}, "rows": []any{}})
+		return
+	}
+	agentID := r.URL.Query().Get("agent_id")
+	rows, err := s.usage.All(r.Context(), agentID)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if rows == nil {
+		rows = []usage.Row{}
+	}
+	perTool, err := s.usage.AggregatePerTool(r.Context())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"per_tool": perTool,
+		"rows":     rows,
+	})
 }
 
 // ---- placeholder for context.Background usage ------------------------------

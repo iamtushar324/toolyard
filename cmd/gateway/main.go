@@ -42,9 +42,9 @@ import (
 	"github.com/tusharbhardwaj/toolyard/internal/settings"
 	"github.com/tusharbhardwaj/toolyard/internal/store"
 	"github.com/tusharbhardwaj/toolyard/internal/upstreams"
+	usagepkg "github.com/tusharbhardwaj/toolyard/internal/usage"
+	"github.com/tusharbhardwaj/toolyard/internal/visibility"
 	dashboard "github.com/tusharbhardwaj/toolyard/web/dashboard"
-
-	"github.com/mark3labs/mcp-go/mcp"
 )
 
 const version = "0.1.0"
@@ -174,6 +174,8 @@ func runServe(argv []string) error {
 	if err != nil {
 		return err
 	}
+	usageSvc := usagepkg.New(db)
+	vis := visibility.New(settingsSvc, usageSvc)
 
 	gw := gateway.New(gateway.Options{
 		Name:       "toolyard",
@@ -184,15 +186,8 @@ func runServe(argv []string) error {
 		Hub:        hub,
 		Memory:     memSvc,
 		InLineWait: *inLineWait,
-		// router_only_mode hides every tool except tools.search/execute
-		// from the agent's tools/list. The full set stays registered so
-		// the meta-tools can still route into it.
-		Filter: func(_ context.Context, t mcp.Tool) bool {
-			if !settingsSvc.GetBool(settings.RouterOnlyMode) {
-				return true
-			}
-			return t.Name == gateway.MetaSearchTool || t.Name == gateway.MetaExecuteTool
-		},
+		Visibility: vis,
+		Usage:      usageSvc,
 	})
 	gw.RegisterBuiltins()
 	defer gw.Close()
@@ -221,6 +216,7 @@ func runServe(argv []string) error {
 		Gateway:    gw,
 		Upstreams:  upstreamSvc,
 		Settings:   settingsSvc,
+		Usage:      usageSvc,
 		SessionKey: loadOrCreateSessionKey(*dataDir),
 	})
 

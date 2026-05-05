@@ -30,6 +30,26 @@ const (
 // is not registered.
 var ErrUpstreamNotFound = errors.New("upstream not found")
 
+// PinnedTools are always exposed to agents regardless of surface_mode. The
+// list intentionally includes the meta-tools (so the agent can always
+// discover and proxy) and the built-in memory tools (so memory stays usable
+// as a baseline shared scratchpad). The set is hardcoded — there is no UI
+// for removing entries.
+var PinnedTools = map[string]struct{}{
+	"tools.search":  {},
+	"tools.execute": {},
+	"memory.get":    {},
+	"memory.set":    {},
+	"memory.list":   {},
+	"memory.delete": {},
+}
+
+// IsPinned reports whether toolName is in the always-visible set.
+func IsPinned(toolName string) bool {
+	_, ok := PinnedTools[toolName]
+	return ok
+}
+
 // directHandler is the in-process call handler used by built-in tools and the
 // fixture upstream. Upstream MCP-server-backed tools have a nil directHandler
 // and instead route through the gateway's upstream pool.
@@ -53,7 +73,8 @@ type Gateway struct {
 	audit      *audit.Logger
 	hub        *realtime.Hub
 	memory     *memory.Service
-	filter     ToolListFilter
+	visibility VisibilityProvider
+	usage      UsageRecorder
 	inLineWait time.Duration
 
 	mu        sync.RWMutex
@@ -61,10 +82,15 @@ type Gateway struct {
 	upstreams map[string]*upstream
 }
 
-// ToolListFilter is consulted on every tools/list to decide whether each
-// tool should be exposed to the calling agent. This is what powers
-// router_only_mode.
-type ToolListFilter func(ctx context.Context, tool mcp.Tool) bool
+// VisibilityProvider gives the gateway a way to compute, per request, which
+// tools are visible to the calling agent. List shapes the tools/list
+// response (and may rank/truncate); IsVisible answers the cheap per-tool
+// check used by direct-call gating. Implementations are allowed to share
+// state — the gateway never modifies the slice it passes to List.
+type VisibilityProvider interface {
+	List(ctx context.Context, tools []mcp.Tool) []mcp.Tool
+	IsVisible(ctx context.Context, toolName string) bool
+}
 
 type Options struct {
 	Name       string
@@ -75,10 +101,20 @@ type Options struct {
 	Hub        *realtime.Hub
 	Memory     *memory.Service
 	InLineWait time.Duration
-	// Filter, if non-nil, is applied to every tool before tools/list returns.
-	// A tool returning false stays callable via direct name + tools.execute,
-	// just hidden from the catalog the agent sees.
-	Filter ToolListFilter
+	// Visibility, if non-nil, decides which tools the agent sees in
+	// tools/list and whether direct calls to a tool are accepted. Tools
+	// that the provider hides remain registered, so meta-tool routing
+	// (tools.execute) can still reach them.
+	Visibility VisibilityProvider
+	// Usage, if non-nil, has its Increment called on every call.succeeded
+	// so top-N selections reflect real usage.
+	Usage UsageRecorder
+}
+
+// UsageRecorder is satisfied by *internal/usage.Service. The gateway only
+// needs Increment; we keep the surface narrow for testability.
+type UsageRecorder interface {
+	Increment(ctx context.Context, agentID, toolName string) error
 }
 
 func New(opts Options) *Gateway {
@@ -97,17 +133,11 @@ func New(opts Options) *Gateway {
 		server.WithRecovery(),
 		server.WithInstructions("toolyard gateway. All tool calls require an explicit _reason; writes go through human approval."),
 	}
-	if opts.Filter != nil {
-		filter := opts.Filter
+	if opts.Visibility != nil {
+		vp := opts.Visibility
 		serverOpts = append(serverOpts, server.WithToolFilter(
 			func(ctx context.Context, tools []mcp.Tool) []mcp.Tool {
-				out := tools[:0:0]
-				for _, t := range tools {
-					if filter(ctx, t) {
-						out = append(out, t)
-					}
-				}
-				return out
+				return vp.List(ctx, tools)
 			},
 		))
 	}
@@ -119,7 +149,8 @@ func New(opts Options) *Gateway {
 		audit:      opts.Audit,
 		hub:        opts.Hub,
 		memory:     opts.Memory,
-		filter:     opts.Filter,
+		visibility: opts.Visibility,
+		usage:      opts.Usage,
 		inLineWait: opts.InLineWait,
 		tools:      map[string]toolEntry{},
 		upstreams:  map[string]*upstream{},
@@ -402,9 +433,9 @@ func (g *Gateway) handlerFor(toolName string) server.ToolHandlerFunc {
 		if !ok {
 			return mcp.NewToolResultErrorf("tool %q not registered", toolName), nil
 		}
-		if g.filter != nil && !g.filter(ctx, entry.tool) {
+		if g.visibility != nil && !g.visibility.IsVisible(ctx, entry.tool.Name) {
 			return mcp.NewToolResultErrorf(
-				"tool %q is hidden in router-only mode. Use tools.execute with tool=%q to invoke it.",
+				"tool %q is hidden by the current agent-surface mode. Use tools.execute with tool=%q to invoke it.",
 				toolName, toolName,
 			), nil
 		}
@@ -530,6 +561,13 @@ func (g *Gateway) dispatch(ctx context.Context, entry toolEntry, args map[string
 		ApprovalID:   approvalID,
 		ResultSummary: summariseResult(res),
 	})
+	if g.usage != nil && !res.IsError {
+		// We treat IsError=true (e.g., "key not found") as a logical
+		// failure even though the call dispatched cleanly, so it does
+		// not feed top-N. Outright transport/protocol failures already
+		// short-circuited above.
+		_ = g.usage.Increment(ctx, agentID, entry.tool.Name)
+	}
 	return res, nil
 }
 
@@ -588,6 +626,13 @@ func agentIDFromContext(ctx context.Context) string {
 		return v
 	}
 	return ""
+}
+
+// AgentIDFromContext is the public read accessor for the agent ID stashed
+// by WithAgentID. Used by the visibility provider; equivalent to
+// agentIDFromContext but exported.
+func AgentIDFromContext(ctx context.Context) string {
+	return agentIDFromContext(ctx)
 }
 
 // SetUpstreamLogger wires log output for upstream errors to the supplied logger.
