@@ -238,8 +238,28 @@ func runServe(argv []string) error {
 			return ctx
 		}),
 	)
-	mux.Handle("/mcp", streamable)
-	mux.Handle("/mcp/", streamable)
+	// Reject calls that carry a Bearer token we can't verify, so a stale
+	// token surfaces as a clear 401 instead of silently falling through to
+	// the anonymous bucket (where audit/approval rows lose their agent_id
+	// and the operator has no way to tell which Claude Code session
+	// generated them). Calls with no Authorization header at all are still
+	// accepted as anonymous — that's how stdio sessions work.
+	mcpAuthGuard := func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if tok := r.Header.Get("Authorization"); strings.HasPrefix(tok, "Bearer ") {
+				raw := strings.TrimPrefix(tok, "Bearer ")
+				if _, err := idSvc.VerifyAgentToken(r.Context(), raw); err != nil {
+					w.Header().Set("Content-Type", "application/json")
+					w.WriteHeader(http.StatusUnauthorized)
+					_, _ = w.Write([]byte(`{"jsonrpc":"2.0","error":{"code":-32001,"message":"toolyard: invalid agent token; re-enroll via the dashboard"}}`))
+					return
+				}
+			}
+			next.ServeHTTP(w, r)
+		})
+	}
+	mux.Handle("/mcp", mcpAuthGuard(streamable))
+	mux.Handle("/mcp/", mcpAuthGuard(streamable))
 
 	// Dashboard static assets.
 	mux.Handle("/", staticHandler())
