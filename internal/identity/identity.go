@@ -36,15 +36,15 @@ type Service struct {
 func New(db *store.DB) *Service { return &Service{db: db} }
 
 type User struct {
-	ID       string
-	Username string
+	ID       string `json:"id"`
+	Username string `json:"username"`
 }
 
 type Agent struct {
-	ID       string
-	Name     string
-	Owner    string
-	LastSeen time.Time
+	ID       string    `json:"id"`
+	Name     string    `json:"name"`
+	Owner    string    `json:"owner"`
+	LastSeen time.Time `json:"last_seen"`
 }
 
 // ---- argon2id password hashing -----------------------------------------------

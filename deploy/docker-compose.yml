@@ -1,0 +1,18 @@
+services:
+  toolyard:
+    build:
+      context: ..
+      dockerfile: deploy/Dockerfile
+    image: toolyard:dev
+    container_name: toolyard
+    restart: unless-stopped
+    ports:
+      - "8787:8787"
+    volumes:
+      - toolyard-data:/var/lib/toolyard/data
+    environment:
+      TOOLYARD_DATA_DIR: /var/lib/toolyard/data
+    command: ["serve", "-addr", ":8787", "-data", "/var/lib/toolyard/data"]
+
+volumes:
+  toolyard-data:

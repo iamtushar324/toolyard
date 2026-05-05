@@ -59,20 +59,29 @@ func (e *Engine) Eval(req Request) Decision {
 	}
 }
 
+// readVerbs are the leading verb-words that mark a tool as read-only when
+// matched against the first segment of a tool name (split on . _ /).
+var readVerbs = map[string]bool{
+	"get": true, "list": true, "search": true, "find": true, "read": true,
+	"show": true, "describe": true, "fetch": true, "view": true,
+	"lookup": true, "query": true, "head": true, "ls": true,
+}
+
 func isReadOnlyName(name string) bool {
 	low := strings.ToLower(name)
-	// Strip common upstream prefixes (e.g., "github__", "github.").
-	if i := strings.IndexAny(low, "._/"); i >= 0 {
+	// Strip an upstream prefix ("github.", "linear/", ...). We deliberately
+	// do not strip on `_` because plenty of raw tool names look like
+	// "read_file" with no upstream prefix.
+	if i := strings.IndexAny(low, "./"); i >= 0 {
 		low = low[i+1:]
 	}
-	prefixes := []string{
-		"get_", "list_", "search_", "find_", "read_", "show_", "describe_",
-		"fetch_", "view_", "lookup_", "query_", "head_", "memory_get", "memory_list",
-	}
-	for _, p := range prefixes {
-		if strings.HasPrefix(low, p) {
-			return true
+	// First word of the snake/dash-separated remainder.
+	first := low
+	for i := 0; i < len(low); i++ {
+		if low[i] == '_' || low[i] == '-' {
+			first = low[:i]
+			break
 		}
 	}
-	return false
+	return readVerbs[first]
 }
