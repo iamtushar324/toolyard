@@ -441,6 +441,18 @@ func staticHandler() http.Handler {
 			http.NotFound(w, r)
 			return
 		}
+		// MCP-over-HTTP clients probe OAuth discovery endpoints first
+		// (.well-known/oauth-protected-resource, oauth-authorization-server,
+		// /register). We use static bearer-token auth, so these must 404 —
+		// returning the SPA's index.html breaks the client with
+		// "Failed to parse JSON" because it expects a discovery document.
+		if strings.HasPrefix(r.URL.Path, "/.well-known/") ||
+			r.URL.Path == "/register" ||
+			r.URL.Path == "/authorize" ||
+			r.URL.Path == "/token" {
+			http.NotFound(w, r)
+			return
+		}
 		// Serve index.html for the root and any unknown path so the SPA can
 		// pick up via #hash routing.
 		if r.URL.Path == "/" || !assetExists(sub, strings.TrimPrefix(r.URL.Path, "/")) {
