@@ -121,6 +121,7 @@ func (s *Server) Routes(mux *http.ServeMux) {
 	mux.HandleFunc("/v1/servers", s.serversCollection)
 	mux.HandleFunc("/v1/servers/", s.serversItem)
 	mux.HandleFunc("/v1/tools", s.toolsList)
+	mux.HandleFunc("/v1/tools/run", s.toolsRun)
 	mux.HandleFunc("/v1/marketplace", s.marketplaceList)
 }
 
@@ -715,6 +716,61 @@ func (s *Server) toolsList(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, s.gateway.Catalog())
+}
+
+// toolsRun lets the dashboard's "workbench" UI try any registered tool.
+// Body: {"tool":"<name>", "arguments":{...}}. Calls go through the same
+// policy + approval path as a regular MCP call; if a write needs approval
+// the response is the deferred CallToolResult payload, and the dashboard's
+// Approvals tab will show the pending request.
+func (s *Server) toolsRun(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "POST only")
+		return
+	}
+	uid, err := s.requireUser(r)
+	if err != nil {
+		writeError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+	if s.gateway == nil {
+		writeError(w, http.StatusServiceUnavailable, "gateway not wired")
+		return
+	}
+	var body struct {
+		Tool      string         `json:"tool"`
+		Arguments map[string]any `json:"arguments"`
+	}
+	if err := decode(r, &body); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if strings.TrimSpace(body.Tool) == "" {
+		writeError(w, http.StatusBadRequest, "tool is required")
+		return
+	}
+	if body.Arguments == nil {
+		body.Arguments = map[string]any{}
+	}
+	// Tag the call as coming from the dashboard so audit/approval rows show
+	// the actual operator instead of an empty agent_id.
+	ctx := gateway.WithAgentID(r.Context(), "dashboard:"+uid)
+	res, err := s.gateway.RouteCall(ctx, "dashboard", body.Tool, body.Arguments)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	// Marshal the CallToolResult: we mirror MCP's shape so the UI can
+	// handle errors / deferred responses uniformly with what an agent sees.
+	out := map[string]any{
+		"is_error":           res.IsError,
+		"content":            res.Content,
+		"structured_content": res.StructuredContent,
+	}
+	if res.Meta != nil {
+		out["_meta"] = res.Meta.AdditionalFields
+	}
+	writeJSON(w, http.StatusOK, out)
 }
 
 // ---- placeholder for context.Background usage ------------------------------

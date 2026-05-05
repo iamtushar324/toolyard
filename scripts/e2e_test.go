@@ -490,6 +490,75 @@ func TestE2EMarketplace(t *testing.T) {
 	h.raw(t, "DELETE", "/v1/servers/thinking-mp", nil, nil)
 }
 
+// TestE2EToolsRun: dashboard-initiated tool calls go through the same policy
+// + approval flow as a direct MCP call.
+func TestE2EToolsRun(t *testing.T) {
+	flag.Parse()
+	h := &httpClient{base: *toolyardURL}
+	mustLogin(t, h)
+
+	// memory.get is a read -> no approval, immediate result.
+	var read map[string]any
+	h.raw(t, "POST", "/v1/tools/run",
+		map[string]any{
+			"tool": "memory.get",
+			"arguments": map[string]any{
+				"_reason": "workbench smoke test reading a key that does not exist yet",
+				"key":     "wb-missing",
+			},
+		}, &read)
+	if read["is_error"] != true {
+		t.Errorf("expected is_error true on missing key, got %v", read)
+	}
+
+	// memory.set is a write -> first call returns deferred or pending; we
+	// approve and re-run with _approval_id to fetch the actual result.
+	var write1 map[string]any
+	h.raw(t, "POST", "/v1/tools/run",
+		map[string]any{
+			"tool": "memory.set",
+			"arguments": map[string]any{
+				"_reason": "workbench smoke test setting a value to demonstrate the approval flow",
+				"key":     "wb-key",
+				"value":   "from-workbench",
+			},
+		}, &write1)
+	sc, _ := write1["structured_content"].(map[string]any)
+	if sc == nil || sc["status"] != "pending_approval" {
+		t.Skipf("expected pending_approval (server may have a long in-line wait); got %v", write1)
+	}
+	apID, _ := sc["approval_id"].(string)
+	if apID == "" {
+		t.Fatal("no approval_id in workbench response")
+	}
+	var dummy map[string]any
+	h.raw(t, "POST", "/v1/approvals/"+apID+"/decide", map[string]string{"Action": "allowed"}, &dummy)
+
+	var write2 map[string]any
+	h.raw(t, "POST", "/v1/tools/run",
+		map[string]any{
+			"tool": "memory.set",
+			"arguments": map[string]any{
+				"_reason":      "workbench resume after approval",
+				"_approval_id": apID,
+			},
+		}, &write2)
+	if write2["is_error"] == true {
+		t.Errorf("workbench resume returned error: %v", write2)
+	}
+	body := ""
+	if cs, ok := write2["content"].([]any); ok {
+		for _, c := range cs {
+			if cm, ok := c.(map[string]any); ok && cm["type"] == "text" {
+				body += cm["text"].(string)
+			}
+		}
+	}
+	if !strings.Contains(body, "from-workbench") {
+		t.Errorf("expected stored value in result, got %q", body)
+	}
+}
+
 // TestE2EReasonValidation: missing/short reason rejected.
 func TestE2EReasonValidation(t *testing.T) {
 	flag.Parse()

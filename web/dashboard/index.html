@@ -177,6 +177,63 @@
   .modal h3 { margin: 0 0 4px 0; font-size: 16px; }
   .modal .meta { margin-bottom: 12px; }
   .modal label .meta { margin-top: 8px; }
+  .workbench {
+    display: grid;
+    grid-template-columns: 280px 1fr;
+    gap: 12px;
+    align-items: flex-start;
+  }
+  .workbench .tool-list {
+    background: var(--bg-elev);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    max-height: 70vh;
+    overflow-y: auto;
+    padding: 6px;
+  }
+  .workbench .tool-list .item {
+    padding: 8px 10px;
+    border-radius: 6px;
+    cursor: pointer;
+    border: 1px solid transparent;
+  }
+  .workbench .tool-list .item:hover { background: var(--bg-elev-2); }
+  .workbench .tool-list .item.active { background: var(--bg-elev-2); border-color: var(--border); }
+  .workbench .tool-list .item .name { font-weight: 500; font-size: 13px; }
+  .workbench .tool-list .item .upstream { font-size: 11px; color: var(--muted); }
+  .workbench .pane {
+    background: var(--bg-elev);
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    padding: 16px;
+  }
+  .workbench .pane h3 { margin: 0 0 4px; font-size: 15px; }
+  .workbench .pane .desc { color: var(--muted); margin-bottom: 12px; font-size: 13px; }
+  .workbench .field { margin-bottom: 10px; }
+  .workbench .field .label-row { display: flex; gap: 8px; margin-bottom: 3px; align-items: baseline; }
+  .workbench .field .label-row .name { font-weight: 500; font-size: 13px; }
+  .workbench .field .label-row .req { color: var(--danger); font-size: 11px; }
+  .workbench .field .label-row .type { color: var(--muted); font-size: 11px; }
+  .workbench .field .desc { color: var(--muted); font-size: 12px; margin: 0 0 4px 0; }
+  .workbench .result {
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-left: 3px solid var(--accent);
+    border-radius: 4px;
+    padding: 10px;
+    margin-top: 12px;
+    font-family: ui-monospace, monospace;
+    font-size: 12px;
+    white-space: pre-wrap;
+    max-height: 300px;
+    overflow-y: auto;
+  }
+  .workbench .result.error   { border-left-color: var(--danger); }
+  .workbench .result.pending { border-left-color: var(--pending); }
+  @media (max-width: 800px) {
+    .workbench { grid-template-columns: 1fr; }
+    .workbench .tool-list { max-height: 220px; }
+  }
   @media (max-width: 700px) {
     main { padding: 12px; }
     header { padding: 10px 12px; gap: 8px; }

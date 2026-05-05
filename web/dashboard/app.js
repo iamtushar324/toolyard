@@ -16,6 +16,14 @@ const state = {
   marketplace: [],
   marketModal: null,
   toolFilter: '',
+  workbench: {
+    selected: null,    // tool name
+    inputs: {},        // toolName -> { fieldKey: value }
+    rawJSON: {},       // toolName -> string when in raw JSON mode
+    rawMode: {},       // toolName -> bool
+    result: null,      // last call result/error
+    running: false,
+  },
   enrollment: null,
   errors: {},
   notice: '',
@@ -670,35 +678,230 @@ function viewTools() {
   const tools = state.tools.filter((t) =>
     !filter ||
     t.name.toLowerCase().includes(filter) ||
-    (t.description || '').toLowerCase().includes(filter)
-  );
+    (t.description || '').toLowerCase().includes(filter) ||
+    (t.upstream || '').toLowerCase().includes(filter)
+  ).sort((a, b) => a.name.localeCompare(b.name));
+
+  // Auto-select the first tool if nothing is selected and we have results.
+  if (!state.workbench.selected && tools.length) {
+    state.workbench.selected = tools[0].name;
+  }
+  // If filter dropped the current selection, snap to first result.
+  if (state.workbench.selected && !tools.find((t) => t.name === state.workbench.selected)) {
+    state.workbench.selected = tools[0] ? tools[0].name : null;
+  }
+
+  const selected = tools.find((t) => t.name === state.workbench.selected);
+
   return el('div', {},
     el('div', { class: 'card' },
-      el('h2', {}, 'Tool catalog'),
+      el('h2', {}, 'Tool workbench'),
       el('p', { class: 'meta' },
-        'Every tool below has been schema-wrapped with a required ',
-        el('code', {}, '_reason'), ' field. Built-in tools include the ',
-        el('code', {}, 'tools.search'), ' and ', el('code', {}, 'tools.execute'),
-        ' meta-tools that let an agent discover and proxy any other tool through toolyard.'),
+        'Search across every connected MCP server and try a tool right here. Calls run through the gateway exactly like an agent would: writes hold for approval, reads pass through. Stuck-pending calls show up in the Approvals tab — approve in another tab and the result lands here.'),
       el('input', {
-        placeholder: 'filter by name or description…',
+        placeholder: 'filter by name, description, or upstream (e.g. "github", "search", "context7")…',
         value: filter,
         on: { input: (e) => { state.toolFilter = e.target.value; render(); } },
       }),
+      el('div', { class: 'meta', style: 'margin-top: 8px;' },
+        `${tools.length} of ${state.tools.length} tools`),
     ),
     tools.length === 0
-      ? el('div', { class: 'card empty' }, state.tools.length === 0 ? 'Catalog is empty.' : 'No tools match.')
-      : el('div', {}, tools.map((t) => el('div', { class: 'card' },
-          el('div', { class: 'row' },
-            el('span', { class: 'grow', style: 'font-weight: 600;' }, t.name),
-            el('span', { class: 'badge', title: 'upstream' }, t.upstream),
+      ? el('div', { class: 'card empty' }, state.tools.length === 0 ? 'No tools yet — install an MCP server in the Servers tab.' : 'No tools match your filter.')
+      : el('div', { class: 'workbench' },
+          el('div', { class: 'tool-list' },
+            tools.map((t) => el('div', {
+              class: 'item' + (t.name === state.workbench.selected ? ' active' : ''),
+              on: { click: () => { state.workbench.selected = t.name; state.workbench.result = null; render(); } },
+            },
+              el('div', { class: 'name' }, t.name),
+              el('div', { class: 'upstream' }, t.upstream),
+            )),
           ),
-          t.description ? el('div', { class: 'meta', style: 'margin-top: 6px;' }, t.description) : null,
-          el('details', {},
-            el('summary', {}, 'input schema'),
-            el('pre', { class: 'json' }, JSON.stringify(t.input_schema, null, 2)),
-          ),
-        ))),
+          selected ? renderToolPane(selected) : el('div', { class: 'pane empty' }, 'Pick a tool on the left.'),
+        ),
+  );
+}
+
+function renderToolPane(t) {
+  const wb = state.workbench;
+  const props = (t.input_schema && t.input_schema.properties) || {};
+  const required = new Set((t.input_schema && t.input_schema.required) || []);
+  const orderedKeys = Object.keys(props).sort((a, b) => {
+    if (a === '_reason') return -1;
+    if (b === '_reason') return 1;
+    if (a === '_intent_category') return -1;
+    if (b === '_intent_category') return 1;
+    if (required.has(a) && !required.has(b)) return -1;
+    if (required.has(b) && !required.has(a)) return 1;
+    return a.localeCompare(b);
+  });
+  if (!wb.inputs[t.name]) wb.inputs[t.name] = {};
+  const inputs = wb.inputs[t.name];
+
+  const rawMode = !!wb.rawMode[t.name];
+
+  return el('div', { class: 'pane' },
+    el('h3', {}, t.name),
+    el('div', { class: 'desc' }, (t.description || '').replace(/^\[Gated by toolyard.[^\]]+\]\s*/, '')),
+    el('div', { class: 'row', style: 'gap: 6px; margin-bottom: 12px;' },
+      el('span', { class: 'badge', title: 'upstream' }, t.upstream),
+      el('button', {
+        class: rawMode ? '' : 'primary',
+        on: { click: () => { wb.rawMode[t.name] = false; render(); } },
+      }, 'Form'),
+      el('button', {
+        class: rawMode ? 'primary' : '',
+        on: { click: () => {
+          // moving to raw: serialize current form state
+          const filled = collectArgs(t, inputs);
+          wb.rawJSON[t.name] = JSON.stringify(filled, null, 2);
+          wb.rawMode[t.name] = true;
+          render();
+        }},
+      }, 'Raw JSON'),
+    ),
+    rawMode
+      ? el('textarea', {
+          id: 'wb-raw-' + t.name,
+          style: 'min-height: 220px; font-family: ui-monospace, monospace;',
+          value: wb.rawJSON[t.name] != null ? wb.rawJSON[t.name] : '{}',
+          on: { input: (e) => { wb.rawJSON[t.name] = e.target.value; }},
+        })
+      : el('div', {}, orderedKeys.map((k) => renderField(t, k, props[k], required.has(k), inputs))),
+
+    el('div', { class: 'row', style: 'margin-top: 12px;' },
+      el('button', {
+        class: 'primary',
+        disabled: wb.running ? '' : null,
+        on: { click: () => runTool(t) },
+      }, wb.running ? 'Running…' : 'Run'),
+      el('button', {
+        on: { click: () => { wb.inputs[t.name] = {}; wb.rawJSON[t.name] = '{}'; wb.result = null; render(); }},
+      }, 'Reset'),
+    ),
+    wb.result && wb.result.toolName === t.name ? renderResult(wb.result) : null,
+  );
+}
+
+function renderField(t, key, schema, required, inputs) {
+  const type = (schema && schema.type) || 'string';
+  const enumVals = schema && schema.enum;
+  const value = inputs[key] != null ? inputs[key] : '';
+
+  let input;
+  if (enumVals && enumVals.length) {
+    input = el('select', {
+      on: { change: (e) => { inputs[key] = e.target.value; }},
+    },
+      el('option', { value: '' }, '—'),
+      ...enumVals.map((v) => el('option', { value: v, selected: value === v }, v)),
+    );
+  } else if (type === 'boolean') {
+    input = el('input', {
+      type: 'checkbox',
+      checked: !!value,
+      on: { change: (e) => { inputs[key] = e.target.checked; }},
+    });
+  } else if (type === 'integer' || type === 'number') {
+    input = el('input', {
+      type: 'number',
+      value: String(value),
+      on: { input: (e) => {
+        if (e.target.value === '') { delete inputs[key]; return; }
+        const n = type === 'integer' ? parseInt(e.target.value, 10) : parseFloat(e.target.value);
+        if (!isNaN(n)) inputs[key] = n;
+      }},
+    });
+  } else if (type === 'object' || type === 'array') {
+    input = el('textarea', {
+      placeholder: type === 'array' ? '[]' : '{}',
+      value: typeof value === 'string' ? value : JSON.stringify(value || (type === 'array' ? [] : {}), null, 2),
+      style: 'font-family: ui-monospace, monospace; min-height: 80px;',
+      on: { input: (e) => { inputs[key] = e.target.value; }},  // parsed at submit time
+    });
+  } else if (key === '_reason' || (schema && schema.maxLength && schema.maxLength > 200)) {
+    input = el('textarea', {
+      placeholder: schema && schema.description ? schema.description : '',
+      value: String(value || ''),
+      on: { input: (e) => { inputs[key] = e.target.value; }},
+    });
+  } else {
+    input = el('input', {
+      type: 'text',
+      placeholder: schema && schema.description ? '' : '',
+      value: String(value || ''),
+      on: { input: (e) => { inputs[key] = e.target.value; }},
+    });
+  }
+  return el('div', { class: 'field' },
+    el('div', { class: 'label-row' },
+      el('span', { class: 'name' }, key),
+      required ? el('span', { class: 'req' }, 'required') : null,
+      el('span', { class: 'type' }, type + (enumVals ? ' enum' : '')),
+    ),
+    schema && schema.description ? el('div', { class: 'desc' }, schema.description) : null,
+    input,
+  );
+}
+
+function collectArgs(t, inputs) {
+  const out = {};
+  const props = (t.input_schema && t.input_schema.properties) || {};
+  for (const k of Object.keys(inputs)) {
+    if (inputs[k] === '' || inputs[k] == null) continue;
+    const propType = props[k] && props[k].type;
+    if (propType === 'object' || propType === 'array') {
+      try { out[k] = JSON.parse(inputs[k]); }
+      catch { out[k] = inputs[k]; }   // leave invalid JSON for the server to reject
+    } else {
+      out[k] = inputs[k];
+    }
+  }
+  return out;
+}
+
+async function runTool(t) {
+  const wb = state.workbench;
+  let args;
+  if (wb.rawMode[t.name]) {
+    try { args = JSON.parse(wb.rawJSON[t.name] || '{}'); }
+    catch (e) { toast('Invalid JSON: ' + e.message, 'error'); return; }
+  } else {
+    args = collectArgs(t, wb.inputs[t.name] || {});
+  }
+  wb.running = true; wb.result = null; render();
+  try {
+    const r = await api('/v1/tools/run', { method: 'POST', body: { tool: t.name, arguments: args }});
+    wb.result = { toolName: t.name, ...r };
+  } catch (e) {
+    wb.result = { toolName: t.name, is_error: true, error: e.message };
+  }
+  wb.running = false;
+  render();
+}
+
+function renderResult(r) {
+  const isPending = r.structured_content && r.structured_content.status === 'pending_approval';
+  const cls = r.is_error ? 'result error' : (isPending ? 'result pending' : 'result');
+  const title = r.is_error ? 'Error'
+              : isPending ? 'Approval pending — approve in the Approvals tab, then re-run with _approval_id'
+              : 'Result';
+  let body = r.error || '';
+  if (Array.isArray(r.content)) {
+    for (const c of r.content) {
+      if (c && c.type === 'text' && typeof c.text === 'string') {
+        body += (body ? '\n' : '') + c.text;
+      }
+    }
+  }
+  if (!body && r.structured_content) body = JSON.stringify(r.structured_content, null, 2);
+  return el('div', {},
+    el('div', { class: 'meta', style: 'margin-top: 12px;' }, title),
+    el('div', { class: cls }, body || '(empty)'),
+    isPending && r.structured_content && r.structured_content.approval_id ? el('div', { class: 'meta' },
+      'approval_id: ', el('code', {}, r.structured_content.approval_id),
+    ) : null,
   );
 }
 
