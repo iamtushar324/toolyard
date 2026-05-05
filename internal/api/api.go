@@ -47,6 +47,7 @@ import (
 	"github.com/tusharbhardwaj/toolyard/internal/memory"
 	"github.com/tusharbhardwaj/toolyard/internal/push"
 	"github.com/tusharbhardwaj/toolyard/internal/realtime"
+	"github.com/tusharbhardwaj/toolyard/internal/settings"
 	"github.com/tusharbhardwaj/toolyard/internal/upstreams"
 )
 
@@ -65,6 +66,7 @@ type Server struct {
 	hub        *realtime.Hub
 	gateway    *gateway.Gateway
 	upstreams  *upstreams.Service
+	settings   *settings.Service
 	sessionKey []byte
 }
 
@@ -77,6 +79,7 @@ type Options struct {
 	Hub        *realtime.Hub
 	Gateway    *gateway.Gateway
 	Upstreams  *upstreams.Service
+	Settings   *settings.Service
 	SessionKey []byte
 }
 
@@ -90,6 +93,7 @@ func New(opts Options) *Server {
 		hub:        opts.Hub,
 		gateway:    opts.Gateway,
 		upstreams:  opts.Upstreams,
+		settings:   opts.Settings,
 		sessionKey: opts.SessionKey,
 	}
 }
@@ -123,6 +127,7 @@ func (s *Server) Routes(mux *http.ServeMux) {
 	mux.HandleFunc("/v1/tools", s.toolsList)
 	mux.HandleFunc("/v1/tools/run", s.toolsRun)
 	mux.HandleFunc("/v1/marketplace", s.marketplaceList)
+	mux.HandleFunc("/v1/settings", s.settingsHandler)
 }
 
 // ---- helpers ----------------------------------------------------------------
@@ -771,6 +776,42 @@ func (s *Server) toolsRun(w http.ResponseWriter, r *http.Request) {
 		out["_meta"] = res.Meta.AdditionalFields
 	}
 	writeJSON(w, http.StatusOK, out)
+}
+
+// ---- settings -------------------------------------------------------------
+
+func (s *Server) settingsHandler(w http.ResponseWriter, r *http.Request) {
+	if _, err := s.requireUser(r); err != nil {
+		writeError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+	if s.settings == nil {
+		writeJSON(w, http.StatusOK, map[string]any{})
+		return
+	}
+	switch r.Method {
+	case http.MethodGet:
+		out, err := s.settings.All(r.Context())
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, out)
+	case http.MethodPatch, http.MethodPost:
+		var body map[string]any
+		if err := decode(r, &body); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		if err := s.settings.Patch(r.Context(), body); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		out, _ := s.settings.All(r.Context())
+		writeJSON(w, http.StatusOK, out)
+	default:
+		writeError(w, http.StatusMethodNotAllowed, "GET, PATCH")
+	}
 }
 
 // ---- placeholder for context.Background usage ------------------------------

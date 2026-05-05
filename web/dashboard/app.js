@@ -16,6 +16,7 @@ const state = {
   marketplace: [],
   marketModal: null,
   toolFilter: '',
+  settings: { router_only_mode: false },
   workbench: {
     selected: null,    // tool name
     inputs: {},        // toolName -> { fieldKey: value }
@@ -112,7 +113,7 @@ async function refreshUser() {
 async function loadAll() {
   if (!state.user) return;
   try {
-    const [pendings, audits, agents, memos, servers, tools, market, vapid] = await Promise.all([
+    const [pendings, audits, agents, memos, servers, tools, market, settingsRes, vapid] = await Promise.all([
       api('/v1/approvals?status=pending'),
       api('/v1/audit?limit=50'),
       api('/v1/agents'),
@@ -120,8 +121,10 @@ async function loadAll() {
       api('/v1/servers').catch(() => []),
       api('/v1/tools').catch(() => []),
       api('/v1/marketplace').catch(() => []),
+      api('/v1/settings').catch(() => ({})),
       api('/v1/push/vapid_key').catch(() => null),
     ]);
+    state.settings = settingsRes || state.settings;
     state.approvals = pendings || [];
     state.audit = audits || [];
     state.agents = agents || [];
@@ -906,7 +909,38 @@ function renderResult(r) {
 }
 
 function viewSettings() {
+  const routerOnly = !!state.settings.router_only_mode;
   return el('div', {},
+    el('div', { class: 'card' },
+      el('h2', {}, 'Agent surface'),
+      el('label', { style: 'display: flex; gap: 12px; align-items: flex-start; cursor: pointer;' },
+        el('input', {
+          type: 'checkbox',
+          checked: routerOnly,
+          style: 'margin-top: 4px;',
+          on: { change: async (e) => {
+            const next = e.target.checked;
+            try {
+              await api('/v1/settings', { method: 'PATCH', body: { router_only_mode: next }});
+              state.settings.router_only_mode = next;
+              toast(next ? 'Router-only mode on. Agents now see only tools.search + tools.execute.' : 'Router-only mode off.');
+              render();
+            } catch (err) { toast(err.message, 'error'); }
+          }},
+        }),
+        el('div', {},
+          el('div', { style: 'font-weight: 500;' }, 'Router-only mode'),
+          el('div', { class: 'meta', style: 'margin-top: 4px;' },
+            'Hide every tool from agents\' tools/list except ', el('code', {}, 'tools.search'), ' and ', el('code', {}, 'tools.execute'), '. ',
+            'Underlying tools stay registered, so the meta-tools can still route into any of them. ',
+            'Use this when you have many MCP servers connected and don\'t want every agent prompt to carry hundreds of tool schemas.'),
+          el('div', { class: 'meta', style: 'margin-top: 6px;' },
+            'Currently exposed to agents: ',
+            el('code', {}, routerOnly ? '2 meta-tools' : `${state.tools.length} tools`),
+            '.'),
+        ),
+      ),
+    ),
     el('div', { class: 'card' },
       el('h2', {}, 'Web Push'),
       el('p', { class: 'meta' },

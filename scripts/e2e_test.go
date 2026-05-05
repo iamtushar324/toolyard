@@ -559,6 +559,83 @@ func TestE2EToolsRun(t *testing.T) {
 	}
 }
 
+// TestE2ERouterOnlyMode: when router_only_mode is on, agents' tools/list
+// returns only tools.search and tools.execute, but the underlying tools are
+// still callable through tools.execute.
+func TestE2ERouterOnlyMode(t *testing.T) {
+	flag.Parse()
+	h := &httpClient{base: *toolyardURL}
+	mustLogin(t, h)
+	token := enrollAgent(t, h, "router-only-test")
+
+	// First, baseline: with router_only_mode off, the agent should see >2
+	// tools.
+	var off map[string]any
+	h.raw(t, "PATCH", "/v1/settings", map[string]any{"router_only_mode": false}, &off)
+
+	c := mcpClient(t, *toolyardURL, token)
+	defer c.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	full, err := c.ListTools(ctx, mcp.ListToolsRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(full.Tools) <= 2 {
+		t.Fatalf("expected >2 tools when router_only_mode is off, got %d", len(full.Tools))
+	}
+
+	// Turn it on; tools/list must shrink to just the meta-tools.
+	var on map[string]any
+	h.raw(t, "PATCH", "/v1/settings", map[string]any{"router_only_mode": true}, &on)
+	if on["router_only_mode"] != true {
+		t.Errorf("settings did not echo router_only_mode=true; got %v", on)
+	}
+
+	// Need a fresh MCP client since the streamable HTTP session caches
+	// a server-info snapshot; the filter is still applied per-call though.
+	c2 := mcpClient(t, *toolyardURL, token)
+	defer c2.Close()
+	min, err := c2.ListTools(ctx, mcp.ListToolsRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(min.Tools) != 2 {
+		t.Fatalf("expected exactly 2 tools (search + execute) in router-only mode, got %d", len(min.Tools))
+	}
+	gotNames := map[string]bool{}
+	for _, tl := range min.Tools {
+		gotNames[tl.Name] = true
+	}
+	if !gotNames["tools.search"] || !gotNames["tools.execute"] {
+		t.Errorf("expected tools.search and tools.execute; got %v", gotNames)
+	}
+
+	// Underlying tool is still callable through tools.execute.
+	exec := mcp.CallToolRequest{}
+	exec.Params.Name = "tools.execute"
+	exec.Params.Arguments = map[string]any{
+		"_reason": "verifying tools.execute still routes when the catalog is hidden",
+		"tool":    "memory.get",
+		"arguments": map[string]any{
+			"_reason": "router-only-mode reachability check via meta-tool",
+			"key":     "no-such-key",
+		},
+	}
+	res, err := c2.CallTool(ctx, exec)
+	if err != nil {
+		t.Fatalf("execute via meta in router-only-mode: %v", err)
+	}
+	// Expected: memory.get returns isError=true (key missing), but the call
+	// succeeded in routing — that's what we're testing.
+	if !res.IsError {
+		t.Logf("memory.get returned ok unexpectedly: %s", dumpResult(res))
+	}
+
+	// Restore default for other tests.
+	h.raw(t, "PATCH", "/v1/settings", map[string]any{"router_only_mode": false}, &off)
+}
+
 // TestE2EReasonValidation: missing/short reason rejected.
 func TestE2EReasonValidation(t *testing.T) {
 	flag.Parse()

@@ -60,6 +60,11 @@ type Gateway struct {
 	upstreams map[string]*upstream
 }
 
+// ToolListFilter is consulted on every tools/list to decide whether each
+// tool should be exposed to the calling agent. This is what powers
+// router_only_mode.
+type ToolListFilter func(ctx context.Context, tool mcp.Tool) bool
+
 type Options struct {
 	Name       string
 	Version    string
@@ -69,6 +74,10 @@ type Options struct {
 	Hub        *realtime.Hub
 	Memory     *memory.Service
 	InLineWait time.Duration
+	// Filter, if non-nil, is applied to every tool before tools/list returns.
+	// A tool returning false stays callable via direct name + tools.execute,
+	// just hidden from the catalog the agent sees.
+	Filter ToolListFilter
 }
 
 func New(opts Options) *Gateway {
@@ -81,12 +90,27 @@ func New(opts Options) *Gateway {
 	if opts.InLineWait == 0 {
 		opts.InLineWait = defaultInLineWait
 	}
-	mcpSrv := server.NewMCPServer(opts.Name, opts.Version,
+	serverOpts := []server.ServerOption{
 		server.WithToolCapabilities(true),
 		server.WithLogging(),
 		server.WithRecovery(),
 		server.WithInstructions("toolyard gateway. All tool calls require an explicit _reason; writes go through human approval."),
-	)
+	}
+	if opts.Filter != nil {
+		filter := opts.Filter
+		serverOpts = append(serverOpts, server.WithToolFilter(
+			func(ctx context.Context, tools []mcp.Tool) []mcp.Tool {
+				out := tools[:0:0]
+				for _, t := range tools {
+					if filter(ctx, t) {
+						out = append(out, t)
+					}
+				}
+				return out
+			},
+		))
+	}
+	mcpSrv := server.NewMCPServer(opts.Name, opts.Version, serverOpts...)
 	return &Gateway{
 		mcp:        mcpSrv,
 		policy:     opts.Policy,
