@@ -409,7 +409,7 @@ function viewServers() {
     el('textarea', { id: 'srv-env', placeholder: 'GITHUB_PERSONAL_ACCESS_TOKEN=ghp_…', value: draftEnvAsText(draft) }),
   );
 
-  const installedNames = new Set(state.servers.map((s) => s.name));
+  const installedByName = new Map(state.servers.map((s) => [s.name, s]));
 
   return el('div', {},
     state.marketModal ? renderMarketModal() : null,
@@ -420,9 +420,10 @@ function viewServers() {
       state.marketplace.length === 0
         ? el('div', { class: 'empty' }, 'No marketplace entries.')
         : el('div', { class: 'market-grid' }, state.marketplace.map((m) => {
-            const installed = installedNames.has(m.suggested_name);
+            const existing = installedByName.get(m.suggested_name);
             const needsEnv = (m.env || []).some((v) => v.required);
-            return el('div', { class: 'market-card' + (installed ? ' installed' : '') },
+            const failed = existing && existing.last_status && existing.last_status !== 'ok';
+            return el('div', { class: 'market-card' + (existing && !failed ? ' installed' : '') },
               el('div', { class: 'title' },
                 el('span', { class: 'grow' }, m.name),
                 el('span', { class: 'cat' }, m.category),
@@ -430,10 +431,16 @@ function viewServers() {
               el('div', { class: 'tag' }, m.tagline),
               el('div', { class: 'desc' }, m.description),
               m.notes ? el('div', { class: 'meta' }, 'Note: ', m.notes) : null,
+              failed ? el('div', { class: 'err' }, existing.last_error || 'connect failed') : null,
               el('div', { class: 'actions' },
                 m.homepage ? el('a', { href: m.homepage, target: '_blank', class: 'meta' }, 'docs ↗') : el('span'),
-                installed
-                  ? el('span', { class: 'badge allowed' }, 'installed')
+                existing
+                  ? (failed
+                      ? el('div', { class: 'row' },
+                          el('button', { on: { click: () => reconnectServer(existing.name) }}, 'Retry'),
+                          el('button', { class: 'danger', on: { click: () => removeServer(existing.name) }}, 'Remove'),
+                        )
+                      : el('span', { class: 'badge allowed' }, 'installed'))
                   : el('button', {
                       class: 'primary',
                       on: { click: () => openMarketAdd(m, needsEnv) },

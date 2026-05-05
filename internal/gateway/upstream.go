@@ -57,7 +57,10 @@ func newUpstream(ctx context.Context, cfg UpstreamConfig) (*upstream, error) {
 		return nil, fmt.Errorf("unsupported transport %q", cfg.Transport)
 	}
 
-	startCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	// First-run starts that need to npm/pnpm/uv install can take well over a
+	// minute. We give the connect a generous deadline; once the package cache
+	// is warm subsequent runs return in seconds.
+	startCtx, cancel := context.WithTimeout(ctx, 180*time.Second)
 	defer cancel()
 	if err := c.Start(startCtx); err != nil {
 		return nil, fmt.Errorf("start upstream %s: %w", cfg.Name, err)
