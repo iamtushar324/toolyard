@@ -1,0 +1,36 @@
+# Binaries
+/toolyard
+/cmd/gateway/gateway
+*.exe
+*.so
+
+# Go
+/vendor/
+
+# SQLite runtime artifacts
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+/data/
+/tmp/
+*.toolyard.db*
+
+# Env
+.env
+.env.local
+
+# Editor
+.vscode/
+.idea/
+*.swp
+
+# Web
+web/dashboard/node_modules/
+web/dashboard/dist/
+web/dashboard/.vite/
+.pnpm-store/
+
+# OS
+.DS_Store
+Thumbs.db
