@@ -13,6 +13,8 @@ const state = {
   memory: [],
   servers: [],
   tools: [],
+  marketplace: [],
+  marketModal: null,
   toolFilter: '',
   enrollment: null,
   errors: {},
@@ -102,13 +104,14 @@ async function refreshUser() {
 async function loadAll() {
   if (!state.user) return;
   try {
-    const [pendings, audits, agents, memos, servers, tools, vapid] = await Promise.all([
+    const [pendings, audits, agents, memos, servers, tools, market, vapid] = await Promise.all([
       api('/v1/approvals?status=pending'),
       api('/v1/audit?limit=50'),
       api('/v1/agents'),
       api('/v1/memory'),
       api('/v1/servers').catch(() => []),
       api('/v1/tools').catch(() => []),
+      api('/v1/marketplace').catch(() => []),
       api('/v1/push/vapid_key').catch(() => null),
     ]);
     state.approvals = pendings || [];
@@ -117,6 +120,7 @@ async function loadAll() {
     state.memory = memos || [];
     state.servers = servers || [];
     state.tools = tools || [];
+    state.marketplace = market || [];
     state.vapidKey = vapid && vapid.public_key ? vapid.public_key : null;
   } catch (e) {
     toast(e.message, 'error');
@@ -405,9 +409,41 @@ function viewServers() {
     el('textarea', { id: 'srv-env', placeholder: 'GITHUB_PERSONAL_ACCESS_TOKEN=ghp_…', value: draftEnvAsText(draft) }),
   );
 
+  const installedNames = new Set(state.servers.map((s) => s.name));
+
   return el('div', {},
+    state.marketModal ? renderMarketModal() : null,
     el('div', { class: 'card' },
-      el('h2', {}, 'Add MCP server'),
+      el('h2', {}, 'Browse popular MCP servers'),
+      el('p', { class: 'meta' },
+        'Curated recipes — one tap installs them, secret-bearing ones open a small form for the env values.'),
+      state.marketplace.length === 0
+        ? el('div', { class: 'empty' }, 'No marketplace entries.')
+        : el('div', { class: 'market-grid' }, state.marketplace.map((m) => {
+            const installed = installedNames.has(m.suggested_name);
+            const needsEnv = (m.env || []).some((v) => v.required);
+            return el('div', { class: 'market-card' + (installed ? ' installed' : '') },
+              el('div', { class: 'title' },
+                el('span', { class: 'grow' }, m.name),
+                el('span', { class: 'cat' }, m.category),
+              ),
+              el('div', { class: 'tag' }, m.tagline),
+              el('div', { class: 'desc' }, m.description),
+              m.notes ? el('div', { class: 'meta' }, 'Note: ', m.notes) : null,
+              el('div', { class: 'actions' },
+                m.homepage ? el('a', { href: m.homepage, target: '_blank', class: 'meta' }, 'docs ↗') : el('span'),
+                installed
+                  ? el('span', { class: 'badge allowed' }, 'installed')
+                  : el('button', {
+                      class: 'primary',
+                      on: { click: () => openMarketAdd(m, needsEnv) },
+                    }, needsEnv ? 'Configure & add' : 'Add'),
+              ),
+            );
+          })),
+    ),
+    el('div', { class: 'card' },
+      el('h2', {}, 'Add custom MCP server'),
       el('p', { class: 'meta' },
         'Connect an upstream MCP server. Its tools are wrapped with the required _reason field, fed through the policy engine, and surface in the catalog as ',
         el('code', {}, '<server>.<tool-name>'), '.'),
@@ -501,6 +537,106 @@ async function addServer() {
     await reloadServers();
     render();
   } catch (e) { toast(e.message, 'error'); }
+}
+
+function openMarketAdd(entry, needsEnv) {
+  if (!needsEnv) {
+    installFromMarket(entry, {});
+    return;
+  }
+  state.marketModal = { entry, env: {}, name: entry.suggested_name, error: '' };
+  for (const v of entry.env || []) {
+    state.marketModal.env[v.name] = v.default || '';
+  }
+  render();
+}
+
+function closeMarketModal() {
+  state.marketModal = null;
+  render();
+}
+
+function renderMarketModal() {
+  const { entry, env, name, error } = state.marketModal;
+  return el('div', { class: 'modal-bg', on: { click: (e) => { if (e.target === e.currentTarget) closeMarketModal(); } } },
+    el('div', { class: 'modal' },
+      el('h3', {}, 'Add ', entry.name),
+      el('div', { class: 'meta' }, entry.tagline),
+      el('label', {},
+        el('div', { class: 'meta' }, 'Server name (must be unique)'),
+        el('input', {
+          value: name,
+          on: { input: (e) => { state.marketModal.name = e.target.value; } },
+        }),
+      ),
+      ...(entry.env || []).map((v) => el('label', {},
+        el('div', { class: 'meta' }, v.name, v.required ? ' *' : '', v.secret ? ' (secret)' : ''),
+        el('input', {
+          type: v.secret ? 'password' : 'text',
+          value: env[v.name] || '',
+          placeholder: v.description || '',
+          autocomplete: v.secret ? 'off' : '',
+          on: { input: (e) => { state.marketModal.env[v.name] = e.target.value; } },
+        }),
+        v.description ? el('div', { class: 'meta', style: 'margin-top: 2px;' }, v.description) : null,
+      )),
+      error ? el('div', { class: 'err' }, error) : null,
+      el('div', { class: 'row', style: 'margin-top: 16px; justify-content: flex-end;' },
+        el('button', { on: { click: closeMarketModal } }, 'Cancel'),
+        el('button', { class: 'primary', on: { click: () => {
+          // Validate required env now.
+          for (const v of entry.env || []) {
+            if (v.required && !((state.marketModal.env[v.name] || '').trim())) {
+              state.marketModal.error = v.name + ' is required';
+              render();
+              return;
+            }
+          }
+          installFromMarket(entry, state.marketModal.env, state.marketModal.name);
+        }}}, 'Install'),
+      ),
+    ),
+  );
+}
+
+async function installFromMarket(entry, env, overrideName) {
+  const args = (entry.args || []).map((a) =>
+    a.replace(/\$\{([A-Z0-9_]+)\}/g, (_, key) => env[key] || '')
+  );
+  const body = {
+    name:      (overrideName || entry.suggested_name).trim(),
+    transport: entry.transport,
+    command:   entry.command,
+    args,
+    url:       entry.url,
+    env,
+  };
+  // Strip placeholder env keys whose value is empty (e.g., FS uses ROOT for
+  // arg substitution only, not as an actual env var the server needs).
+  for (const k of Object.keys(env)) {
+    if (!env[k]) delete body.env[k];
+  }
+  try {
+    const resp = await fetch('/v1/servers', {
+      method: 'POST', credentials: 'include',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    const out = await resp.json();
+    if (resp.status === 202) {
+      toast('Saved, but failed to connect: ' + (out.warning || 'unknown'), 'error');
+    } else if (!resp.ok) {
+      throw new Error(out.error || ('HTTP ' + resp.status));
+    } else {
+      toast(entry.name + ' installed.');
+    }
+    state.marketModal = null;
+    await reloadServers();
+    render();
+  } catch (e) {
+    if (state.marketModal) { state.marketModal.error = e.message; render(); }
+    else toast(e.message, 'error');
+  }
 }
 
 async function reconnectServer(name) {

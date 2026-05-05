@@ -43,6 +43,7 @@ import (
 	"github.com/tusharbhardwaj/toolyard/internal/audit"
 	"github.com/tusharbhardwaj/toolyard/internal/gateway"
 	"github.com/tusharbhardwaj/toolyard/internal/identity"
+	"github.com/tusharbhardwaj/toolyard/internal/marketplace"
 	"github.com/tusharbhardwaj/toolyard/internal/memory"
 	"github.com/tusharbhardwaj/toolyard/internal/push"
 	"github.com/tusharbhardwaj/toolyard/internal/realtime"
@@ -120,6 +121,7 @@ func (s *Server) Routes(mux *http.ServeMux) {
 	mux.HandleFunc("/v1/servers", s.serversCollection)
 	mux.HandleFunc("/v1/servers/", s.serversItem)
 	mux.HandleFunc("/v1/tools", s.toolsList)
+	mux.HandleFunc("/v1/marketplace", s.marketplaceList)
 }
 
 // ---- helpers ----------------------------------------------------------------
@@ -689,6 +691,18 @@ func (s *Server) serversItem(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeError(w, http.StatusMethodNotAllowed, "DELETE")
+}
+
+// marketplaceList returns the curated MCP recipes. We require a logged-in
+// user so we don't accidentally expose the catalog (small, but still
+// confirms the operator's identity before suggesting installs that may want
+// secrets).
+func (s *Server) marketplaceList(w http.ResponseWriter, r *http.Request) {
+	if _, err := s.requireUser(r); err != nil {
+		writeError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+	writeJSON(w, http.StatusOK, marketplace.Catalog())
 }
 
 func (s *Server) toolsList(w http.ResponseWriter, r *http.Request) {

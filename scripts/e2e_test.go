@@ -413,6 +413,83 @@ func postJSON(h *httpClient, path string, body any) (*http.Response, error) {
 	return http.DefaultClient.Do(req)
 }
 
+// TestE2EMarketplace: catalog endpoint returns curated entries with the
+// expected shape, and a no-env entry round-trips through /v1/servers.
+func TestE2EMarketplace(t *testing.T) {
+	flag.Parse()
+	h := &httpClient{base: *toolyardURL}
+	mustLogin(t, h)
+
+	var catalog []map[string]any
+	h.raw(t, "GET", "/v1/marketplace", nil, &catalog)
+	if len(catalog) < 5 {
+		t.Fatalf("expected at least 5 marketplace entries, got %d", len(catalog))
+	}
+	want := map[string]bool{"context7": false, "github": false, "filesystem": false}
+	for _, e := range catalog {
+		if id, _ := e["id"].(string); want[id] == false {
+			if _, ok := want[id]; ok {
+				want[id] = true
+			}
+		}
+	}
+	for k, ok := range want {
+		if !ok {
+			t.Errorf("marketplace missing expected entry %q", k)
+		}
+	}
+
+	// Pick the sequential-thinking recipe (no env vars), construct the body
+	// the same way the dashboard does, and POST it.
+	var seq map[string]any
+	for _, e := range catalog {
+		if id, _ := e["id"].(string); id == "sequential-thinking" {
+			seq = e
+			break
+		}
+	}
+	if seq == nil {
+		t.Fatal("sequential-thinking missing from catalog")
+	}
+	args, _ := seq["args"].([]any)
+	argsStr := make([]string, 0, len(args))
+	for _, a := range args {
+		if s, ok := a.(string); ok {
+			argsStr = append(argsStr, s)
+		}
+	}
+	body := map[string]any{
+		"name":      "thinking-mp",
+		"transport": seq["transport"],
+		"command":   seq["command"],
+		"args":      argsStr,
+	}
+	resp, err := postJSON(h, "/v1/servers", body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	// We don't actually have npx available with that package on this box, so
+	// 200 (cached) or 202 (saved with warning) are both acceptable; what
+	// matters is the row exists.
+	if resp.StatusCode != 200 && resp.StatusCode != 202 {
+		t.Fatalf("unexpected status %d", resp.StatusCode)
+	}
+	var servers []map[string]any
+	h.raw(t, "GET", "/v1/servers", nil, &servers)
+	found := false
+	for _, s := range servers {
+		if s["name"] == "thinking-mp" {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("server row not persisted after marketplace install")
+	}
+	// Cleanup.
+	h.raw(t, "DELETE", "/v1/servers/thinking-mp", nil, nil)
+}
+
 // TestE2EReasonValidation: missing/short reason rejected.
 func TestE2EReasonValidation(t *testing.T) {
 	flag.Parse()
