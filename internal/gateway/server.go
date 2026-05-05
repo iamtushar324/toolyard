@@ -53,6 +53,7 @@ type Gateway struct {
 	audit      *audit.Logger
 	hub        *realtime.Hub
 	memory     *memory.Service
+	filter     ToolListFilter
 	inLineWait time.Duration
 
 	mu        sync.RWMutex
@@ -118,10 +119,23 @@ func New(opts Options) *Gateway {
 		audit:      opts.Audit,
 		hub:        opts.Hub,
 		memory:     opts.Memory,
+		filter:     opts.Filter,
 		inLineWait: opts.InLineWait,
 		tools:      map[string]toolEntry{},
 		upstreams:  map[string]*upstream{},
 	}
+}
+
+// NotifyToolListChanged sends notifications/tools/list_changed to every
+// connected MCP session. Call this when something that affects what tools
+// agents see has changed (e.g., the router_only_mode setting flipped, an
+// upstream connected/disconnected). Without this, MCP clients keep using
+// the cached tool list from their initial connect.
+func (g *Gateway) NotifyToolListChanged() {
+	if g == nil || g.mcp == nil {
+		return
+	}
+	g.mcp.SendNotificationToAllClients(mcp.MethodNotificationToolsListChanged, nil)
 }
 
 func (g *Gateway) MCPServer() *server.MCPServer { return g.mcp }
@@ -374,6 +388,12 @@ func (g *Gateway) registerEntry(e toolEntry) {
 // handlerFor returns the ToolHandlerFunc that performs schema-wrap unwrap,
 // policy eval, optional approval, and dispatch. It delegates to routeEntry
 // so the same routing logic backs the meta-tool tools.execute.
+//
+// Direct calls to a tool that the filter has hidden (e.g., everything except
+// tools.search/execute when router_only_mode is on) are rejected here with
+// a clear pointer at tools.execute. RouteCall — which is what tools.execute
+// itself uses — bypasses this check, so the meta-tool can still reach the
+// hidden tool.
 func (g *Gateway) handlerFor(toolName string) server.ToolHandlerFunc {
 	return func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		g.mu.RLock()
@@ -381,6 +401,12 @@ func (g *Gateway) handlerFor(toolName string) server.ToolHandlerFunc {
 		g.mu.RUnlock()
 		if !ok {
 			return mcp.NewToolResultErrorf("tool %q not registered", toolName), nil
+		}
+		if g.filter != nil && !g.filter(ctx, entry.tool) {
+			return mcp.NewToolResultErrorf(
+				"tool %q is hidden in router-only mode. Use tools.execute with tool=%q to invoke it.",
+				toolName, toolName,
+			), nil
 		}
 		args := argsAsMap(request.Params.Arguments)
 		return g.routeEntry(ctx, entry, args)

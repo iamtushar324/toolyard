@@ -611,6 +611,26 @@ func TestE2ERouterOnlyMode(t *testing.T) {
 		t.Errorf("expected tools.search and tools.execute; got %v", gotNames)
 	}
 
+	// Direct calls to a hidden tool are rejected with a pointer at
+	// tools.execute (so an agent that has memory.get cached in its context
+	// from before the toggle can't bypass the setting).
+	directReq := mcp.CallToolRequest{}
+	directReq.Params.Name = "memory.get"
+	directReq.Params.Arguments = map[string]any{
+		"_reason": "trying to bypass router-only mode by calling the hidden tool directly",
+		"key":     "no-such-key",
+	}
+	directRes, err := c2.CallTool(ctx, directReq)
+	if err != nil {
+		t.Fatalf("direct call in router-only mode: %v", err)
+	}
+	if !directRes.IsError {
+		t.Errorf("expected direct call to be rejected in router-only mode, got %s", dumpResult(directRes))
+	}
+	if !strings.Contains(strings.ToLower(dumpResult(directRes)), "router-only") {
+		t.Errorf("rejection message should mention router-only mode, got %s", dumpResult(directRes))
+	}
+
 	// Underlying tool is still callable through tools.execute.
 	exec := mcp.CallToolRequest{}
 	exec.Params.Name = "tools.execute"
@@ -630,6 +650,10 @@ func TestE2ERouterOnlyMode(t *testing.T) {
 	// succeeded in routing — that's what we're testing.
 	if !res.IsError {
 		t.Logf("memory.get returned ok unexpectedly: %s", dumpResult(res))
+	}
+	// And the result text mentions a missing key, not a router-only rejection.
+	if strings.Contains(strings.ToLower(dumpResult(res)), "router-only") {
+		t.Errorf("tools.execute should bypass the filter, got %s", dumpResult(res))
 	}
 
 	// Restore default for other tests.

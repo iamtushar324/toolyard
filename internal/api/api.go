@@ -807,6 +807,12 @@ func (s *Server) settingsHandler(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, err.Error())
 			return
 		}
+		// If the change affects what tools agents can see, push a
+		// notifications/tools/list_changed so connected MCP clients
+		// re-fetch instead of relying on their cached tool list.
+		if _, touched := body["router_only_mode"]; touched && s.gateway != nil {
+			s.gateway.NotifyToolListChanged()
+		}
 		out, _ := s.settings.All(r.Context())
 		writeJSON(w, http.StatusOK, out)
 	default:

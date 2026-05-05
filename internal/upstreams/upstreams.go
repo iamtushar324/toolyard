@@ -205,6 +205,7 @@ func (s *Service) Remove(ctx context.Context, name string) error {
 	if n == 0 {
 		return ErrNotFound
 	}
+	s.gw.NotifyToolListChanged()
 	return nil
 }
 
@@ -232,6 +233,7 @@ func (s *Service) connect(ctx context.Context, srv Server) error {
 		return err
 	}
 	s.recordStatus(ctx, srv.Name, "ok", "", s.gw.UpstreamToolCount(srv.Name))
+	s.gw.NotifyToolListChanged()
 	return nil
 }
 
