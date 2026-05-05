@@ -26,6 +26,10 @@ const (
 	deferredRetryAfter = 60
 )
 
+// ErrUpstreamNotFound is returned when an upstream is referenced by name but
+// is not registered.
+var ErrUpstreamNotFound = errors.New("upstream not found")
+
 // directHandler is the in-process call handler used by built-in tools and the
 // fixture upstream. Upstream MCP-server-backed tools have a nil directHandler
 // and instead route through the gateway's upstream pool.
@@ -98,11 +102,13 @@ func New(opts Options) *Gateway {
 
 func (g *Gateway) MCPServer() *server.MCPServer { return g.mcp }
 
-// RegisterBuiltins wires the built-in memory tools and (in v0.1) the fixture
-// echo tool into the MCP server.
+// RegisterBuiltins wires the built-in memory tools, the meta-tools
+// (tools.search / tools.execute), and the fixture echo tool into the MCP
+// server.
 func (g *Gateway) RegisterBuiltins() {
 	entries := g.builtinMemoryTools()
 	entries = append(entries, g.staticFixtureTool())
+	entries = append(entries, g.metaTools()...)
 	for _, e := range entries {
 		g.registerEntry(e)
 	}
@@ -161,6 +167,179 @@ func (g *Gateway) Close() error {
 	return nil
 }
 
+// RemoveUpstream disconnects an upstream and removes all of its registered
+// tools from the gateway catalog (and from the underlying MCP server).
+func (g *Gateway) RemoveUpstream(name string) error {
+	g.mu.Lock()
+	u, ok := g.upstreams[name]
+	if !ok {
+		g.mu.Unlock()
+		return ErrUpstreamNotFound
+	}
+	delete(g.upstreams, name)
+	// Collect the wrapped tool names to remove.
+	var toRemove []string
+	for k, e := range g.tools {
+		if e.upstream == name {
+			toRemove = append(toRemove, k)
+		}
+	}
+	for _, k := range toRemove {
+		delete(g.tools, k)
+	}
+	g.mu.Unlock()
+
+	g.mcp.DeleteTools(toRemove...)
+	_ = u.close()
+	return nil
+}
+
+// UpstreamToolCount returns the number of registered tools for the named
+// upstream (0 if unknown).
+func (g *Gateway) UpstreamToolCount(name string) int {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	n := 0
+	for _, e := range g.tools {
+		if e.upstream == name {
+			n++
+		}
+	}
+	return n
+}
+
+// CatalogEntry summarises one wrapped tool for the dashboard or the
+// tools.search meta-tool. The schema is the upstream-facing schema (after
+// schema-wrap).
+type CatalogEntry struct {
+	Name        string         `json:"name"`
+	Upstream    string         `json:"upstream"`
+	Description string         `json:"description"`
+	InputSchema map[string]any `json:"input_schema"`
+}
+
+// Catalog returns the flat list of registered tools.
+func (g *Gateway) Catalog() []CatalogEntry {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	out := make([]CatalogEntry, 0, len(g.tools))
+	for _, e := range g.tools {
+		schema := map[string]any{
+			"type":       e.tool.InputSchema.Type,
+			"properties": e.tool.InputSchema.Properties,
+			"required":   e.tool.InputSchema.Required,
+		}
+		out = append(out, CatalogEntry{
+			Name:        e.tool.Name,
+			Upstream:    e.upstream,
+			Description: e.tool.Description,
+			InputSchema: schema,
+		})
+	}
+	return out
+}
+
+// HasTool returns true if a tool with the given name is registered.
+func (g *Gateway) HasTool(name string) bool {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	_, ok := g.tools[name]
+	return ok
+}
+
+// RouteCall is the same call routing used by every registered MCP tool, but
+// callable directly: the meta-tool tools.execute uses it to dispatch a call to
+// any tool in the catalog without having to round-trip through the MCP server
+// stack. The args map should already have _reason / _intent_category fields.
+//
+// Behaviour:
+//   - Unknown tool -> error CallToolResult.
+//   - Reads pass straight through.
+//   - Writes hold for approval (in-line then deferred), exactly like a direct
+//     call would.
+//
+// `viaTool` is the meta-tool name we record in the audit log so it's clear
+// the call was reached through tools.execute.
+func (g *Gateway) RouteCall(ctx context.Context, viaTool, targetName string, args map[string]any) (*mcp.CallToolResult, error) {
+	g.mu.RLock()
+	entry, ok := g.tools[targetName]
+	g.mu.RUnlock()
+	if !ok {
+		return mcp.NewToolResultErrorf("tool %q not found in catalog", targetName), nil
+	}
+	if targetName == viaTool {
+		return mcp.NewToolResultError("tools.execute cannot target itself"), nil
+	}
+	return g.routeEntry(ctx, entry, args)
+}
+
+// routeEntry is the shared path used by both the MCP-side handler and
+// tools.execute. It assumes entry is a registered toolEntry.
+func (g *Gateway) routeEntry(ctx context.Context, entry toolEntry, args map[string]any) (*mcp.CallToolResult, error) {
+	// Deferred-resume short-circuit.
+	if approvalID, ok := args["_approval_id"].(string); ok && approvalID != "" {
+		return g.resumeDeferred(ctx, entry, approvalID)
+	}
+
+	reason, intent, cleanArgs, err := extractReason(args, entry.reasonField)
+	if err != nil {
+		_ = g.audit.Write(ctx, audit.Event{
+			EventType:     audit.EventCallFailed,
+			UpstreamName:  entry.upstream,
+			ToolName:      entry.tool.Name,
+			ResultSummary: "rejected: " + err.Error(),
+		})
+		return mcp.NewToolResultError(err.Error()), nil
+	}
+
+	agentID := agentIDFromContext(ctx)
+	argsJSON, _ := json.Marshal(cleanArgs)
+	_ = g.audit.Write(ctx, audit.Event{
+		EventType:    audit.EventCallStart,
+		AgentID:      agentID,
+		UpstreamName: entry.upstream,
+		ToolName:     entry.tool.Name,
+		Reason:       reason,
+		Arguments:    argsJSON,
+	})
+
+	decision := g.policy.Eval(policy.Request{
+		AgentID:        agentID,
+		UpstreamName:   entry.upstream,
+		ToolName:       entry.originalName,
+		IntentCategory: intent,
+		Arguments:      cleanArgs,
+		UserReason:     reason,
+	})
+
+	switch decision.Action {
+	case policy.ActionAllow:
+		_ = g.audit.Write(ctx, audit.Event{
+			EventType:    audit.EventCallAllowed,
+			AgentID:      agentID,
+			UpstreamName: entry.upstream,
+			ToolName:     entry.tool.Name,
+			Decision:     string(decision.Action),
+			Reason:       reason,
+		})
+		return g.dispatch(ctx, entry, cleanArgs, agentID, reason, "")
+	case policy.ActionDeny:
+		_ = g.audit.Write(ctx, audit.Event{
+			EventType:    audit.EventCallDenied,
+			AgentID:      agentID,
+			UpstreamName: entry.upstream,
+			ToolName:     entry.tool.Name,
+			Decision:     string(decision.Action),
+			Reason:       reason,
+		})
+		return mcp.NewToolResultError("denied by policy: " + decision.Reason), nil
+	case policy.ActionApprove:
+		return g.holdAndWait(ctx, entry, cleanArgs, agentID, reason, intent)
+	default:
+		return mcp.NewToolResultErrorf("policy returned unknown action %q", decision.Action), nil
+	}
+}
+
 func (g *Gateway) registerEntry(e toolEntry) {
 	g.mu.Lock()
 	g.tools[e.tool.Name] = e
@@ -169,7 +348,8 @@ func (g *Gateway) registerEntry(e toolEntry) {
 }
 
 // handlerFor returns the ToolHandlerFunc that performs schema-wrap unwrap,
-// policy eval, optional approval, and dispatch.
+// policy eval, optional approval, and dispatch. It delegates to routeEntry
+// so the same routing logic backs the meta-tool tools.execute.
 func (g *Gateway) handlerFor(toolName string) server.ToolHandlerFunc {
 	return func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		g.mu.RLock()
@@ -178,71 +358,8 @@ func (g *Gateway) handlerFor(toolName string) server.ToolHandlerFunc {
 		if !ok {
 			return mcp.NewToolResultErrorf("tool %q not registered", toolName), nil
 		}
-
 		args := argsAsMap(request.Params.Arguments)
-		// Deferred-resume path: a previous call returned a deferred response and
-		// the agent is now polling with _approval_id. Don't re-create an approval.
-		if approvalID, ok := args["_approval_id"].(string); ok && approvalID != "" {
-			return g.resumeDeferred(ctx, entry, approvalID)
-		}
-
-		reason, intent, cleanArgs, err := extractReason(args, entry.reasonField)
-		if err != nil {
-			_ = g.audit.Write(ctx, audit.Event{
-				EventType:    audit.EventCallFailed,
-				UpstreamName: entry.upstream,
-				ToolName:     entry.tool.Name,
-				ResultSummary: "rejected: " + err.Error(),
-			})
-			return mcp.NewToolResultError(err.Error()), nil
-		}
-
-		agentID := agentIDFromContext(ctx)
-		argsJSON, _ := json.Marshal(cleanArgs)
-		_ = g.audit.Write(ctx, audit.Event{
-			EventType:    audit.EventCallStart,
-			AgentID:      agentID,
-			UpstreamName: entry.upstream,
-			ToolName:     entry.tool.Name,
-			Reason:       reason,
-			Arguments:    argsJSON,
-		})
-
-		decision := g.policy.Eval(policy.Request{
-			AgentID:        agentID,
-			UpstreamName:   entry.upstream,
-			ToolName:       entry.originalName,
-			IntentCategory: intent,
-			Arguments:      cleanArgs,
-			UserReason:     reason,
-		})
-
-		switch decision.Action {
-		case policy.ActionAllow:
-			_ = g.audit.Write(ctx, audit.Event{
-				EventType:    audit.EventCallAllowed,
-				AgentID:      agentID,
-				UpstreamName: entry.upstream,
-				ToolName:     entry.tool.Name,
-				Decision:     string(decision.Action),
-				Reason:       reason,
-			})
-			return g.dispatch(ctx, entry, cleanArgs, agentID, reason, "")
-		case policy.ActionDeny:
-			_ = g.audit.Write(ctx, audit.Event{
-				EventType:    audit.EventCallDenied,
-				AgentID:      agentID,
-				UpstreamName: entry.upstream,
-				ToolName:     entry.tool.Name,
-				Decision:     string(decision.Action),
-				Reason:       reason,
-			})
-			return mcp.NewToolResultError("denied by policy: " + decision.Reason), nil
-		case policy.ActionApprove:
-			return g.holdAndWait(ctx, entry, cleanArgs, agentID, reason, intent)
-		default:
-			return mcp.NewToolResultErrorf("policy returned unknown action %q", decision.Action), nil
-		}
+		return g.routeEntry(ctx, entry, args)
 	}
 }
 

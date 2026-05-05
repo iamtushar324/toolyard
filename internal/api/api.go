@@ -41,10 +41,12 @@ import (
 
 	"github.com/tusharbhardwaj/toolyard/internal/approval"
 	"github.com/tusharbhardwaj/toolyard/internal/audit"
+	"github.com/tusharbhardwaj/toolyard/internal/gateway"
 	"github.com/tusharbhardwaj/toolyard/internal/identity"
 	"github.com/tusharbhardwaj/toolyard/internal/memory"
 	"github.com/tusharbhardwaj/toolyard/internal/push"
 	"github.com/tusharbhardwaj/toolyard/internal/realtime"
+	"github.com/tusharbhardwaj/toolyard/internal/upstreams"
 )
 
 const (
@@ -60,6 +62,8 @@ type Server struct {
 	memory     *memory.Service
 	push       *push.Service
 	hub        *realtime.Hub
+	gateway    *gateway.Gateway
+	upstreams  *upstreams.Service
 	sessionKey []byte
 }
 
@@ -70,6 +74,8 @@ type Options struct {
 	Memory     *memory.Service
 	Push       *push.Service
 	Hub        *realtime.Hub
+	Gateway    *gateway.Gateway
+	Upstreams  *upstreams.Service
 	SessionKey []byte
 }
 
@@ -81,6 +87,8 @@ func New(opts Options) *Server {
 		memory:     opts.Memory,
 		push:       opts.Push,
 		hub:        opts.Hub,
+		gateway:    opts.Gateway,
+		upstreams:  opts.Upstreams,
 		sessionKey: opts.SessionKey,
 	}
 }
@@ -108,6 +116,10 @@ func (s *Server) Routes(mux *http.ServeMux) {
 
 	mux.HandleFunc("/v1/push/vapid_key", s.pushVapidKey)
 	mux.HandleFunc("/v1/push/subscribe", s.pushSubscribe)
+
+	mux.HandleFunc("/v1/servers", s.serversCollection)
+	mux.HandleFunc("/v1/servers/", s.serversItem)
+	mux.HandleFunc("/v1/tools", s.toolsList)
 }
 
 // ---- helpers ----------------------------------------------------------------
@@ -573,6 +585,122 @@ func (s *Server) pushSubscribe(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, sub)
+}
+
+// ---- servers (upstream MCP) ------------------------------------------------
+
+func (s *Server) serversCollection(w http.ResponseWriter, r *http.Request) {
+	if _, err := s.requireUser(r); err != nil {
+		writeError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+	switch r.Method {
+	case http.MethodGet:
+		out, err := s.upstreams.List(r.Context())
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		if out == nil {
+			out = []upstreams.Server{}
+		}
+		// annotate live tool counts so the dashboard does not need a second call
+		for i := range out {
+			if s.gateway != nil {
+				if c := s.gateway.UpstreamToolCount(out[i].Name); c > 0 {
+					out[i].ToolCount = c
+				}
+			}
+		}
+		writeJSON(w, http.StatusOK, out)
+	case http.MethodPost:
+		var body upstreams.Server
+		if err := decode(r, &body); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		srv, err := s.upstreams.Add(r.Context(), body)
+		if err != nil {
+			// If the row was created but the connect failed, return 207 with the
+			// row body so the dashboard shows the persisted error. Otherwise 400.
+			if srv != nil && (errors.Is(err, gateway.ErrUpstreamNotFound) || !errors.Is(err, upstreams.ErrInvalid)) && !errors.Is(err, upstreams.ErrAlreadyHere) && !errors.Is(err, upstreams.ErrReserved) {
+				writeJSON(w, http.StatusAccepted, map[string]any{
+					"server":     srv,
+					"warning":    err.Error(),
+				})
+				return
+			}
+			status := http.StatusBadRequest
+			if errors.Is(err, upstreams.ErrAlreadyHere) {
+				status = http.StatusConflict
+			}
+			writeError(w, status, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, srv)
+	default:
+		writeError(w, http.StatusMethodNotAllowed, "GET or POST")
+	}
+}
+
+func (s *Server) serversItem(w http.ResponseWriter, r *http.Request) {
+	if _, err := s.requireUser(r); err != nil {
+		writeError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+	tail := strings.TrimPrefix(r.URL.Path, "/v1/servers/")
+	if tail == "" {
+		http.NotFound(w, r)
+		return
+	}
+	parts := strings.SplitN(tail, "/", 2)
+	name := parts[0]
+	subpath := ""
+	if len(parts) > 1 {
+		subpath = parts[1]
+	}
+	if subpath == "reconnect" {
+		if r.Method != http.MethodPost {
+			writeError(w, http.StatusMethodNotAllowed, "POST")
+			return
+		}
+		srv, err := s.upstreams.Reconnect(r.Context(), name)
+		if err != nil {
+			if srv != nil {
+				writeJSON(w, http.StatusAccepted, map[string]any{"server": srv, "warning": err.Error()})
+				return
+			}
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, srv)
+		return
+	}
+	if r.Method == http.MethodDelete {
+		if err := s.upstreams.Remove(r.Context(), name); err != nil {
+			if errors.Is(err, upstreams.ErrNotFound) {
+				writeError(w, http.StatusNotFound, err.Error())
+				return
+			}
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+		return
+	}
+	writeError(w, http.StatusMethodNotAllowed, "DELETE")
+}
+
+func (s *Server) toolsList(w http.ResponseWriter, r *http.Request) {
+	if _, err := s.requireUser(r); err != nil {
+		writeError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+	if s.gateway == nil {
+		writeJSON(w, http.StatusOK, []any{})
+		return
+	}
+	writeJSON(w, http.StatusOK, s.gateway.Catalog())
 }
 
 // ---- placeholder for context.Background usage ------------------------------

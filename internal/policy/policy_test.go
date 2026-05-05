@@ -20,6 +20,8 @@ func TestEvalCategories(t *testing.T) {
 		{"name create_", Request{ToolName: "github.create_issue"}, ActionApprove},
 		{"unknown verb", Request{ToolName: "github.transmogrify"}, ActionApprove},
 		{"snake read", Request{ToolName: "read_file"}, ActionAllow},
+		{"meta tools.execute", Request{UpstreamName: "tools", ToolName: "execute"}, ActionAllow},
+		{"meta tools.search", Request{UpstreamName: "tools", ToolName: "search"}, ActionAllow},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {

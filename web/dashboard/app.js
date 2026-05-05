@@ -11,6 +11,9 @@ const state = {
   audit: [],
   agents: [],
   memory: [],
+  servers: [],
+  tools: [],
+  toolFilter: '',
   enrollment: null,
   errors: {},
   notice: '',
@@ -99,21 +102,36 @@ async function refreshUser() {
 async function loadAll() {
   if (!state.user) return;
   try {
-    const [pendings, audits, agents, memos, vapid] = await Promise.all([
+    const [pendings, audits, agents, memos, servers, tools, vapid] = await Promise.all([
       api('/v1/approvals?status=pending'),
       api('/v1/audit?limit=50'),
       api('/v1/agents'),
       api('/v1/memory'),
+      api('/v1/servers').catch(() => []),
+      api('/v1/tools').catch(() => []),
       api('/v1/push/vapid_key').catch(() => null),
     ]);
     state.approvals = pendings || [];
     state.audit = audits || [];
     state.agents = agents || [];
     state.memory = memos || [];
+    state.servers = servers || [];
+    state.tools = tools || [];
     state.vapidKey = vapid && vapid.public_key ? vapid.public_key : null;
   } catch (e) {
     toast(e.message, 'error');
   }
+}
+
+async function reloadServers() {
+  try {
+    const [servers, tools] = await Promise.all([
+      api('/v1/servers').catch(() => []),
+      api('/v1/tools').catch(() => []),
+    ]);
+    state.servers = servers || [];
+    state.tools = tools || [];
+  } catch (e) { toast(e.message, 'error'); }
 }
 
 let evtSrc = null;
@@ -342,6 +360,205 @@ function viewMemory() {
   );
 }
 
+function viewServers() {
+  const transport = (state._serverDraft && state._serverDraft.transport) || 'stdio';
+  const draft = state._serverDraft || (state._serverDraft = { transport: 'stdio' });
+
+  const setDraft = (k, v) => { draft[k] = v; render(); };
+
+  const transportRow = el('div', { class: 'row' },
+    el('label', { style: 'flex: 1;' },
+      el('div', { class: 'meta' }, 'Transport'),
+      el('select', {
+        on: { change: (e) => setDraft('transport', e.target.value) }
+      },
+        el('option', { value: 'stdio',           selected: transport === 'stdio'           }, 'stdio (subprocess)'),
+        el('option', { value: 'http',            selected: transport === 'http'            }, 'streamable HTTP'),
+      ),
+    ),
+    el('label', { style: 'flex: 1;' },
+      el('div', { class: 'meta' }, 'Server name'),
+      el('input', { id: 'srv-name', placeholder: 'e.g. github', value: draft.name || '' }),
+    ),
+  );
+
+  const transportFields = transport === 'stdio'
+    ? el('div', {},
+        el('div', { class: 'row' },
+          el('label', { style: 'flex: 1;' },
+            el('div', { class: 'meta' }, 'Command'),
+            el('input', { id: 'srv-cmd', placeholder: 'e.g. uvx', value: draft.command || '' }),
+          ),
+          el('label', { style: 'flex: 2;' },
+            el('div', { class: 'meta' }, 'Args (one per line)'),
+            el('textarea', { id: 'srv-args', placeholder: 'mcp-server-github', value: (draft.args || []).join('\n') }),
+          ),
+        ),
+      )
+    : el('label', {},
+        el('div', { class: 'meta' }, 'URL'),
+        el('input', { id: 'srv-url', placeholder: 'https://example.com/mcp', value: draft.url || '' }),
+      );
+
+  const envRow = el('label', {},
+    el('div', { class: 'meta' }, 'Environment (KEY=VALUE per line, optional)'),
+    el('textarea', { id: 'srv-env', placeholder: 'GITHUB_PERSONAL_ACCESS_TOKEN=ghp_…', value: draftEnvAsText(draft) }),
+  );
+
+  return el('div', {},
+    el('div', { class: 'card' },
+      el('h2', {}, 'Add MCP server'),
+      el('p', { class: 'meta' },
+        'Connect an upstream MCP server. Its tools are wrapped with the required _reason field, fed through the policy engine, and surface in the catalog as ',
+        el('code', {}, '<server>.<tool-name>'), '.'),
+      transportRow,
+      transportFields,
+      envRow,
+      el('div', { class: 'row', style: 'margin-top: 12px;' },
+        el('button', { class: 'primary', on: { click: () => addServer() }}, 'Add server'),
+        el('button', { on: { click: () => { state._serverDraft = { transport: 'stdio' }; render(); } } }, 'Reset'),
+      ),
+    ),
+    el('div', { class: 'card' },
+      el('h2', {}, 'Connected servers'),
+      state.servers.length === 0
+        ? el('div', { class: 'empty' }, 'No upstream MCP servers yet. Built-in tools (memory.*, tools.*, fixture.echo) are still available.')
+        : el('table', {}, el('thead', {}, el('tr', {},
+            el('th', {}, 'Name'),
+            el('th', {}, 'Transport'),
+            el('th', {}, 'Tools'),
+            el('th', {}, 'Status'),
+            el('th', {}, ''))),
+            el('tbody', {}, state.servers.map((s) => el('tr', {},
+              el('td', {}, el('code', {}, s.name)),
+              el('td', {}, transportLabel(s)),
+              el('td', {}, String(s.tool_count || 0)),
+              el('td', {}, s.last_status === 'ok'
+                ? el('span', { class: 'badge allowed' }, 'connected')
+                : el('span', { class: 'badge denied', title: s.last_error || '' }, s.last_status || 'error')),
+              el('td', {},
+                el('div', { class: 'row' },
+                  el('button', { on: { click: () => reconnectServer(s.name) }}, 'Reconnect'),
+                  el('button', { class: 'danger', on: { click: () => removeServer(s.name) }}, 'Remove'),
+                ),
+              ),
+            )))),
+    ),
+  );
+}
+
+function transportLabel(s) {
+  if (s.transport === 'stdio') return s.command + (s.args && s.args.length ? ' ' + s.args.join(' ') : '');
+  return s.url || '';
+}
+
+function draftEnvAsText(d) {
+  if (!d.env) return '';
+  return Object.entries(d.env).map(([k, v]) => k + '=' + v).join('\n');
+}
+
+function parseEnvText(t) {
+  const out = {};
+  (t || '').split(/\r?\n/).forEach((line) => {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith('#')) return;
+    const i = trimmed.indexOf('=');
+    if (i <= 0) return;
+    out[trimmed.slice(0, i).trim()] = trimmed.slice(i + 1);
+  });
+  return out;
+}
+
+async function addServer() {
+  const draft = state._serverDraft || {};
+  const body = {
+    name:      $('srv-name').value.trim(),
+    transport: draft.transport || 'stdio',
+  };
+  if (body.transport === 'stdio') {
+    body.command = $('srv-cmd').value.trim();
+    body.args = $('srv-args').value.split(/\r?\n/).map((s) => s.trim()).filter(Boolean);
+  } else {
+    body.url = $('srv-url').value.trim();
+  }
+  body.env = parseEnvText($('srv-env').value);
+  if (!body.name) { toast('name required', 'error'); return; }
+  try {
+    const resp = await fetch('/v1/servers', {
+      method: 'POST', credentials: 'include',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify(body),
+    });
+    const out = await resp.json();
+    if (resp.status === 202) {
+      toast('Saved, but failed to connect: ' + (out.warning || 'unknown'), 'error');
+    } else if (!resp.ok) {
+      throw new Error(out.error || ('HTTP ' + resp.status));
+    } else {
+      toast('Connected.');
+    }
+    state._serverDraft = { transport: 'stdio' };
+    await reloadServers();
+    render();
+  } catch (e) { toast(e.message, 'error'); }
+}
+
+async function reconnectServer(name) {
+  try {
+    const resp = await fetch('/v1/servers/' + encodeURIComponent(name) + '/reconnect',
+      { method: 'POST', credentials: 'include' });
+    const out = await resp.json();
+    if (resp.status === 202) toast('Still failing: ' + (out.warning || ''), 'error');
+    else if (!resp.ok) throw new Error(out.error || ('HTTP ' + resp.status));
+    else toast('Reconnected.');
+    await reloadServers(); render();
+  } catch (e) { toast(e.message, 'error'); }
+}
+
+async function removeServer(name) {
+  try {
+    await api('/v1/servers/' + encodeURIComponent(name), { method: 'DELETE' });
+    await reloadServers(); render();
+  } catch (e) { toast(e.message, 'error'); }
+}
+
+function viewTools() {
+  const filter = (state.toolFilter || '').toLowerCase();
+  const tools = state.tools.filter((t) =>
+    !filter ||
+    t.name.toLowerCase().includes(filter) ||
+    (t.description || '').toLowerCase().includes(filter)
+  );
+  return el('div', {},
+    el('div', { class: 'card' },
+      el('h2', {}, 'Tool catalog'),
+      el('p', { class: 'meta' },
+        'Every tool below has been schema-wrapped with a required ',
+        el('code', {}, '_reason'), ' field. Built-in tools include the ',
+        el('code', {}, 'tools.search'), ' and ', el('code', {}, 'tools.execute'),
+        ' meta-tools that let an agent discover and proxy any other tool through toolyard.'),
+      el('input', {
+        placeholder: 'filter by name or description…',
+        value: filter,
+        on: { input: (e) => { state.toolFilter = e.target.value; render(); } },
+      }),
+    ),
+    tools.length === 0
+      ? el('div', { class: 'card empty' }, state.tools.length === 0 ? 'Catalog is empty.' : 'No tools match.')
+      : el('div', {}, tools.map((t) => el('div', { class: 'card' },
+          el('div', { class: 'row' },
+            el('span', { class: 'grow', style: 'font-weight: 600;' }, t.name),
+            el('span', { class: 'badge', title: 'upstream' }, t.upstream),
+          ),
+          t.description ? el('div', { class: 'meta', style: 'margin-top: 6px;' }, t.description) : null,
+          el('details', {},
+            el('summary', {}, 'input schema'),
+            el('pre', { class: 'json' }, JSON.stringify(t.input_schema, null, 2)),
+          ),
+        ))),
+  );
+}
+
 function viewSettings() {
   return el('div', {},
     el('div', { class: 'card' },
@@ -411,6 +628,8 @@ function shell(content) {
       el('nav', {},
         navBtn('approvals', 'Approvals'),
         navBtn('audit',     'Audit'),
+        navBtn('servers',   'Servers'),
+        navBtn('tools',     'Tools'),
         navBtn('memory',    'Memory'),
         navBtn('agents',    'Agents'),
         navBtn('settings',  'Settings'),
@@ -439,6 +658,8 @@ function render() {
     case 'audit':    body = viewAudit();    break;
     case 'memory':   body = viewMemory();   break;
     case 'agents':   body = viewAgents();   break;
+    case 'servers':  body = viewServers();  break;
+    case 'tools':    body = viewTools();    break;
     case 'settings': body = viewSettings(); break;
     default:         body = viewApprovals();
   }

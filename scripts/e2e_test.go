@@ -285,6 +285,134 @@ func TestE2EDeferred(t *testing.T) {
 	}
 }
 
+// TestE2EMetaTools: tools.search returns the catalog and tools.execute proxies
+// a write through the same approval flow as a direct call.
+func TestE2EMetaTools(t *testing.T) {
+	flag.Parse()
+	h := &httpClient{base: *toolyardURL}
+	mustLogin(t, h)
+	token := enrollAgent(t, h, "meta-tools")
+	c := mcpClient(t, *toolyardURL, token)
+	defer c.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	// tools.search reads → no approval.
+	req := mcp.CallToolRequest{}
+	req.Params.Name = "tools.search"
+	req.Params.Arguments = map[string]any{
+		"_reason": "discovering available tools to pick the right one for the task",
+		"query":   "memory",
+	}
+	res, err := c.CallTool(ctx, req)
+	if err != nil {
+		t.Fatalf("search: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("search returned error: %s", dumpResult(res))
+	}
+	out := dumpResult(res)
+	if !strings.Contains(out, "memory.set") || !strings.Contains(out, "memory.get") {
+		t.Errorf("search did not include memory tools: %s", out)
+	}
+	// Meta-tools themselves should be filtered out of search results.
+	if strings.Contains(out, "tools.search") {
+		t.Errorf("search should hide tools.search from its own results")
+	}
+
+	// tools.execute → memory.set: holds for approval.
+	setRes, _ := callWithApproval(t, h, c, ctx, "tools.execute", map[string]any{
+		"_reason": "exercising the tools.execute meta-tool against memory.set",
+		"tool":    "memory.set",
+		"arguments": map[string]any{
+			"_reason": "writing via meta-tool to verify the proxy preserves approvals",
+			"key":     "via-meta",
+			"value":   "yes",
+		},
+	}, "allowed")
+	if setRes.IsError {
+		t.Fatalf("execute proxy returned error: %s", dumpResult(setRes))
+	}
+	if !strings.Contains(dumpResult(setRes), "via-meta") {
+		t.Errorf("expected key in result, got %s", dumpResult(setRes))
+	}
+
+	// Verify the audit log shows the call as memory.set, not tools.execute.
+	var events []map[string]any
+	h.raw(t, "GET", "/v1/audit?limit=20", nil, &events)
+	sawMemorySet := false
+	for _, e := range events {
+		if e["tool_name"] == "memory.set" && e["event_type"] == "call.succeeded" {
+			sawMemorySet = true
+			break
+		}
+	}
+	if !sawMemorySet {
+		t.Error("audit log should record the underlying memory.set call")
+	}
+}
+
+// TestE2EServerCRUD: add an MCP server via REST, see it listed, remove it.
+// Uses an obviously invalid command so the connect failure is recorded but
+// the row persists (confirming the persisted-error UX).
+func TestE2EServerCRUD(t *testing.T) {
+	flag.Parse()
+	h := &httpClient{base: *toolyardURL}
+	mustLogin(t, h)
+
+	body := map[string]any{
+		"name":      "broken-test",
+		"transport": "stdio",
+		"command":   "/usr/bin/false",
+	}
+	resp, err := postJSON(h, "/v1/servers", body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != 202 && resp.StatusCode != 200 {
+		t.Fatalf("expected 200/202, got %d", resp.StatusCode)
+	}
+
+	// List should include it.
+	var servers []map[string]any
+	h.raw(t, "GET", "/v1/servers", nil, &servers)
+	found := false
+	for _, s := range servers {
+		if s["name"] == "broken-test" {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("server not in list after add")
+	}
+
+	// Remove.
+	h.raw(t, "DELETE", "/v1/servers/broken-test", nil, nil)
+	servers = nil
+	h.raw(t, "GET", "/v1/servers", nil, &servers)
+	for _, s := range servers {
+		if s["name"] == "broken-test" {
+			t.Error("server still listed after delete")
+		}
+	}
+}
+
+// postJSON is a small helper that lets us inspect status code + cookies.
+func postJSON(h *httpClient, path string, body any) (*http.Response, error) {
+	raw, _ := json.Marshal(body)
+	req, err := http.NewRequest("POST", h.base+path, bytes.NewReader(raw))
+	if err != nil {
+		return nil, err
+	}
+	req.Header.Set("Content-Type", "application/json")
+	for _, c := range h.cookies {
+		req.AddCookie(c)
+	}
+	return http.DefaultClient.Do(req)
+}
+
 // TestE2EReasonValidation: missing/short reason rejected.
 func TestE2EReasonValidation(t *testing.T) {
 	flag.Parse()

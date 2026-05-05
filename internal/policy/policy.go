@@ -33,12 +33,17 @@ type Engine struct{}
 func New() *Engine { return &Engine{} }
 
 // Eval returns the decision for req. The hardcoded rule:
+//   - meta-tools on the synthetic "tools" upstream pass through (their inner
+//     call is policy-evaluated independently)
 //   - explicit category "read" -> allow
 //   - explicit category "write" / "destructive" / "external_communication" /
 //     "financial" / "privileged_admin" -> approve
 //   - otherwise infer from tool name (read-ish prefixes pass; everything else
 //     gets approval).
 func (e *Engine) Eval(req Request) Decision {
+	if req.UpstreamName == "tools" {
+		return Decision{Action: ActionAllow, Reason: "meta-tool routes inner call", RuleID: "v0.1-meta-tool"}
+	}
 	switch req.IntentCategory {
 	case "read":
 		return Decision{Action: ActionAllow, Reason: "category=read", RuleID: "v0.1-category"}

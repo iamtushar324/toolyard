@@ -40,6 +40,7 @@ import (
 	"github.com/tusharbhardwaj/toolyard/internal/push"
 	"github.com/tusharbhardwaj/toolyard/internal/realtime"
 	"github.com/tusharbhardwaj/toolyard/internal/store"
+	"github.com/tusharbhardwaj/toolyard/internal/upstreams"
 	dashboard "github.com/tusharbhardwaj/toolyard/web/dashboard"
 )
 
@@ -179,10 +180,16 @@ func runServe(argv []string) error {
 	gw.RegisterBuiltins()
 	defer gw.Close()
 
-	// Optional upstreams from JSON config.
+	upstreamSvc := upstreams.New(db, gw)
+	if err := upstreamSvc.LoadAll(ctx); err != nil {
+		log.Printf("upstreams: load: %v", err)
+	}
+
+	// Legacy: also accept a JSON config file. Configs from -upstreams are
+	// imported into the DB so the dashboard can manage them afterwards.
 	if *upstreamConfig != "" {
-		if err := loadUpstreams(ctx, gw, *upstreamConfig); err != nil {
-			return fmt.Errorf("load upstreams: %w", err)
+		if err := importUpstreams(ctx, upstreamSvc, *upstreamConfig); err != nil {
+			log.Printf("import upstreams: %v", err)
 		}
 	}
 
@@ -194,6 +201,8 @@ func runServe(argv []string) error {
 		Memory:     memSvc,
 		Push:       pushSvc,
 		Hub:        hub,
+		Gateway:    gw,
+		Upstreams:  upstreamSvc,
 		SessionKey: loadOrCreateSessionKey(*dataDir),
 	})
 
@@ -352,7 +361,11 @@ func defaultDataDir() string {
 	return ".toolyard"
 }
 
-func loadUpstreams(ctx context.Context, gw *gateway.Gateway, path string) error {
+// importUpstreams reads a JSON file of upstream configs and inserts them via
+// the upstreams.Service so they end up persisted and dashboard-manageable. A
+// row that already exists by name is left alone — the dashboard is the
+// source of truth after first run.
+func importUpstreams(ctx context.Context, svc *upstreams.Service, path string) error {
 	body, err := os.ReadFile(path)
 	if err != nil {
 		return err
@@ -362,11 +375,18 @@ func loadUpstreams(ctx context.Context, gw *gateway.Gateway, path string) error 
 		return err
 	}
 	for _, c := range cfgs {
-		if err := gw.AddUpstream(ctx, c); err != nil {
+		srv := upstreams.Server{
+			Name: c.Name, Transport: c.Transport, Command: c.Command,
+			Args: c.Args, URL: c.URL, Env: c.Env,
+		}
+		if _, err := svc.Add(ctx, srv); err != nil {
+			if errors.Is(err, upstreams.ErrAlreadyHere) {
+				continue
+			}
 			log.Printf("upstream %s: %v", c.Name, err)
 			continue
 		}
-		log.Printf("upstream %s: connected", c.Name)
+		log.Printf("upstream %s: imported and connected", c.Name)
 	}
 	return nil
 }
