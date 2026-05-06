@@ -35,7 +35,11 @@ const (
 	StatusExpired  = "expired"
 
 	signingKeyPurpose = "approval_sign"
-	defaultTTL        = 1 * time.Hour
+	// DefaultTTL is how long an approval row stays decidable. Phones and
+	// laptops sleep, you may be in a meeting; three hours is a comfortable
+	// upper bound that's still bounded enough to not pile up rows
+	// indefinitely. Override per-process via Bus.SetTTL.
+	DefaultTTL = 3 * time.Hour
 )
 
 var (
@@ -98,10 +102,23 @@ func New(ctx context.Context, db *store.DB) (*Bus, error) {
 		db:        db,
 		signKey:   priv,
 		verifyKey: pub,
-		ttl:       defaultTTL,
+		ttl:       DefaultTTL,
 		waiters:   map[string]*pending{},
 	}, nil
 }
+
+// SetTTL overrides how long pending approvals stay decidable. Pre-existing
+// rows are not retroactively changed — only future Hold() calls use the
+// new value. Pass 0 or negative to keep the current TTL.
+func (b *Bus) SetTTL(d time.Duration) {
+	if d <= 0 {
+		return
+	}
+	b.ttl = d
+}
+
+// TTL returns the current approval-decision TTL.
+func (b *Bus) TTL() time.Duration { return b.ttl }
 
 // AddNotifier registers a fan-out target. Notifiers are called with no lock
 // held so they may use blocking IO.

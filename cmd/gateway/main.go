@@ -101,6 +101,7 @@ func runServe(argv []string) error {
 	upstreamConfig := fs.String("upstreams", "", "path to JSON file with upstream MCP server configs (optional)")
 	pushSubject := fs.String("push-subject", "mailto:admin@example.invalid", "VAPID `sub` claim")
 	inLineWait := fs.Duration("in-line-wait", 30*time.Second, "max time to block a held call before returning a deferred response")
+	approvalTTL := fs.Duration("approval-ttl", 3*time.Hour, "how long a pending approval stays decidable before auto-expiring")
 	_ = fs.Parse(argv)
 
 	if err := os.MkdirAll(*dataDir, 0o755); err != nil {
@@ -125,6 +126,8 @@ func runServe(argv []string) error {
 	if err != nil {
 		return err
 	}
+	bus.SetTTL(*approvalTTL)
+	log.Printf("toolyard: approval TTL %s (in-line wait %s)", bus.TTL(), *inLineWait)
 	go bus.RunSweeper(ctx, 30*time.Second)
 
 	pushSvc, err := push.New(ctx, db, *pushSubject)

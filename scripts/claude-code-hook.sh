@@ -27,13 +27,14 @@
 # Environment variables:
 #   TOOLYARD_URL       default: http://localhost:8787
 #   TOOLYARD_TOKEN     agent token for /v1/agents/exchange
-#   TOOLYARD_TIMEOUT   total wait per call in seconds (default: 3600)
+#   TOOLYARD_TIMEOUT   total wait per call in seconds (default: 10800 = 3h)
+#                      should match -approval-ttl on the server
 #   TOOLYARD_INTERVAL  poll interval seconds (default: 5)
 
 set -euo pipefail
 
 TOOLYARD_URL="${TOOLYARD_URL:-http://localhost:8787}"
-TOOLYARD_TIMEOUT="${TOOLYARD_TIMEOUT:-3600}"
+TOOLYARD_TIMEOUT="${TOOLYARD_TIMEOUT:-10800}"
 TOOLYARD_INTERVAL="${TOOLYARD_INTERVAL:-5}"
 
 # Read the entire hook payload from stdin (Claude Code passes JSON).
