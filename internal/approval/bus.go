@@ -405,13 +405,15 @@ func (b *Bus) Get(ctx context.Context, id string) (*Request, error) {
 	row := b.db.QueryRowContext(ctx,
 		`SELECT id, agent_id, upstream_name, tool_name, arguments, reason,
             COALESCE(intent_category,''), status, COALESCE(decision_token,''),
-            COALESCE(decided_by,''), COALESCE(decided_at,0), created_at, expires_at
+            COALESCE(decided_by,''), COALESCE(decided_at,0), created_at, expires_at,
+            COALESCE(fingerprint,'')
          FROM approval_requests WHERE id = ?`, id)
 	var req Request
 	var args string
 	if err := row.Scan(&req.ID, &req.AgentID, &req.UpstreamName, &req.ToolName, &args,
 		&req.Reason, &req.IntentCategory, &req.Status, &req.DecisionToken,
-		&req.DecidedBy, &req.DecidedAt, &req.CreatedAt, &req.ExpiresAt); err != nil {
+		&req.DecidedBy, &req.DecidedAt, &req.CreatedAt, &req.ExpiresAt,
+		&req.Fingerprint); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, ErrNotFound
 		}
@@ -427,7 +429,8 @@ func (b *Bus) ListPending(ctx context.Context) ([]Request, error) {
 	rows, err := b.db.QueryContext(ctx,
 		`SELECT id, agent_id, upstream_name, tool_name, arguments, reason,
             COALESCE(intent_category,''), status, COALESCE(decision_token,''),
-            COALESCE(decided_by,''), COALESCE(decided_at,0), created_at, expires_at
+            COALESCE(decided_by,''), COALESCE(decided_at,0), created_at, expires_at,
+            COALESCE(fingerprint,'')
          FROM approval_requests WHERE status = ? ORDER BY created_at DESC`, StatusPending)
 	if err != nil {
 		return nil, err
@@ -439,7 +442,8 @@ func (b *Bus) ListPending(ctx context.Context) ([]Request, error) {
 		var args string
 		if err := rows.Scan(&req.ID, &req.AgentID, &req.UpstreamName, &req.ToolName, &args,
 			&req.Reason, &req.IntentCategory, &req.Status, &req.DecisionToken,
-			&req.DecidedBy, &req.DecidedAt, &req.CreatedAt, &req.ExpiresAt); err != nil {
+			&req.DecidedBy, &req.DecidedAt, &req.CreatedAt, &req.ExpiresAt,
+			&req.Fingerprint); err != nil {
 			return nil, err
 		}
 		if args != "" {
@@ -458,7 +462,8 @@ func (b *Bus) Recent(ctx context.Context, limit int) ([]Request, error) {
 	rows, err := b.db.QueryContext(ctx,
 		`SELECT id, agent_id, upstream_name, tool_name, arguments, reason,
             COALESCE(intent_category,''), status, COALESCE(decision_token,''),
-            COALESCE(decided_by,''), COALESCE(decided_at,0), created_at, expires_at
+            COALESCE(decided_by,''), COALESCE(decided_at,0), created_at, expires_at,
+            COALESCE(fingerprint,'')
          FROM approval_requests ORDER BY created_at DESC LIMIT ?`, limit)
 	if err != nil {
 		return nil, err
@@ -470,7 +475,8 @@ func (b *Bus) Recent(ctx context.Context, limit int) ([]Request, error) {
 		var args string
 		if err := rows.Scan(&req.ID, &req.AgentID, &req.UpstreamName, &req.ToolName, &args,
 			&req.Reason, &req.IntentCategory, &req.Status, &req.DecisionToken,
-			&req.DecidedBy, &req.DecidedAt, &req.CreatedAt, &req.ExpiresAt); err != nil {
+			&req.DecidedBy, &req.DecidedAt, &req.CreatedAt, &req.ExpiresAt,
+			&req.Fingerprint); err != nil {
 			return nil, err
 		}
 		if args != "" {
