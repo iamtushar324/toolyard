@@ -15,6 +15,7 @@ const state = {
   tools: [],
   marketplace: [],
   marketModal: null,
+  agentModal: null,        // { stage: 'name'|'done', name, agent, snippetTab }
   toolFilter: '',
   settings: { surface_mode: 'full', top_n_count: 20, top_n_personalize_after: 100, router_only_mode: false },
   usage: { per_tool: {}, rows: [] },
@@ -363,30 +364,19 @@ function viewAudit() {
 
 function viewAgents() {
   return el('div', {},
+    state.agentModal ? renderAgentModal() : null,
     el('div', { class: 'card' },
-      el('h2', {}, 'Enroll a new agent'),
-      el('p', { class: 'meta' },
-        'Generate a one-time enrollment code, then exchange it from your agent host with: ',
-        el('code', {}, 'curl -sX POST http://localhost:8787/v1/agents/exchange -H "content-type: application/json" -d \'{"Code":"<code>"}\'')),
-      el('div', { class: 'row' },
-        el('input', { id: 'enroll-name', placeholder: 'agent name (e.g. claude-code)', class: 'grow' }),
-        el('button', { class: 'primary', on: { click: async () => {
-          try {
-            const r = await api('/v1/agents/enroll', { method: 'POST', body: { Name: $('enroll-name').value.trim() || 'agent' }});
-            state.enrollment = r;
-            render();
-          } catch (e) { toast(e.message, 'error'); }
-        }}}, 'Generate code'),
+      el('div', { class: 'agent-add-bar' },
+        el('h2', { style: 'margin: 0;' }, 'Agents'),
+        el('button', {
+          class: 'primary',
+          on: { click: () => { state.agentModal = { stage: 'name', name: 'claude-code', snippetTab: 'cli' }; render(); } },
+        }, '+ Add new agent'),
       ),
-      state.enrollment ? el('div', { class: 'card', style: 'margin-top: 12px; background: var(--bg);' },
-        el('div', { class: 'meta' }, `code (expires in ${Math.round(state.enrollment.expires_in/60)}m)`),
-        el('pre', { class: 'json' }, state.enrollment.enrollment_code),
-      ) : null,
-    ),
-    el('div', { class: 'card' },
-      el('h2', {}, 'Enrolled agents'),
+      el('p', { class: 'meta', style: 'margin: 4px 0 12px;' },
+        'Each enrolled agent gets a long-lived bearer token. Tokens are shown once on creation — store them in your agent\'s MCP config and you\'re done.'),
       state.agents.length === 0
-        ? el('div', { class: 'empty' }, 'No agents yet.')
+        ? el('div', { class: 'empty' }, 'No agents yet. Click "Add new agent" to enrol your first one.')
         : el('table', {}, el('thead', {}, el('tr', {},
             el('th', {}, 'Name'), el('th', {}, 'ID'), el('th', {}, 'Last seen'))),
             el('tbody', {}, state.agents.map((a) => el('tr', {},
@@ -396,6 +386,166 @@ function viewAgents() {
             )))),
     ),
   );
+}
+
+function renderAgentModal() {
+  const m = state.agentModal;
+  if (m.stage === 'name') return renderAgentNameStep(m);
+  if (m.stage === 'done') return renderAgentDoneStep(m);
+  return null;
+}
+
+function closeAgentModal() {
+  state.agentModal = null;
+  render();
+}
+
+function renderAgentNameStep(m) {
+  return el('div', { class: 'modal-bg', on: { click: (e) => { if (e.target === e.currentTarget) closeAgentModal(); } } },
+    el('div', { class: 'modal' },
+      el('h3', {}, 'Add a new agent'),
+      el('div', { class: 'meta' },
+        'Pick a name for the agent. You\'ll see the bearer token and copy-paste setup snippets next.'),
+      el('label', {},
+        el('div', { class: 'meta' }, 'Name'),
+        el('input', {
+          id: 'agent-modal-name', autofocus: true,
+          placeholder: 'e.g. claude-code, my-laptop, prod-bot',
+          value: m.name,
+          on: {
+            input: (e) => { state.agentModal.name = e.target.value; },
+            keydown: (e) => { if (e.key === 'Enter') createAgentFromModal(); },
+          },
+        }),
+      ),
+      m.error ? el('div', { class: 'err' }, m.error) : null,
+      el('div', { class: 'row', style: 'margin-top: 16px; justify-content: flex-end;' },
+        el('button', { on: { click: closeAgentModal } }, 'Cancel'),
+        el('button', { class: 'primary', on: { click: createAgentFromModal } }, 'Create agent'),
+      ),
+    ),
+  );
+}
+
+async function createAgentFromModal() {
+  const m = state.agentModal;
+  const name = (m.name || '').trim();
+  if (!name) { state.agentModal.error = 'name required'; render(); return; }
+  try {
+    const ag = await api('/v1/agents', { method: 'POST', body: { Name: name }});
+    state.agentModal = { stage: 'done', name, agent: ag, snippetTab: 'cli' };
+    await reloadAgents();
+    render();
+  } catch (e) { state.agentModal.error = e.message; render(); }
+}
+
+async function reloadAgents() {
+  try {
+    const agents = await api('/v1/agents');
+    state.agents = agents || [];
+  } catch {}
+}
+
+function renderAgentDoneStep(m) {
+  const url = window.location.origin + '/mcp';
+  const baseUrlNoMcp = window.location.origin;
+  const tok = m.agent.token;
+  const tabs = [
+    { id: 'cli',     label: 'Claude Code CLI' },
+    { id: 'project', label: '.mcp.json (project)' },
+    { id: 'global',  label: '~/.claude.json (global)' },
+  ];
+
+  const cli =
+`claude mcp add --transport http --scope user toolyard \\
+  ${url} \\
+  --header "Authorization: Bearer ${tok}"`;
+
+  const project = JSON.stringify({
+    mcpServers: {
+      toolyard: {
+        type: 'http',
+        url,
+        headers: { Authorization: `Bearer ${tok}` },
+      },
+    },
+  }, null, 2);
+
+  const global = `// merge into ~/.claude.json under "mcpServers":
+${JSON.stringify({
+  toolyard: {
+    type: 'http',
+    url,
+    headers: { Authorization: `Bearer ${tok}` },
+  },
+}, null, 2)}`;
+
+  const snippet = m.snippetTab === 'cli' ? cli :
+                  m.snippetTab === 'project' ? project : global;
+  const snippetLang = m.snippetTab === 'cli' ? 'bash' : 'json';
+
+  return el('div', { class: 'modal-bg', on: { click: (e) => { if (e.target === e.currentTarget) closeAgentModal(); } } },
+    el('div', { class: 'modal modal-wide' },
+      el('h3', {}, '✓  Agent "', m.name, '" ready'),
+      el('div', { class: 'warn-pill' }, '⚠  Save the token now — it cannot be retrieved later.'),
+      el('div', { style: 'margin: 8px 0;' },
+        el('div', { class: 'meta' }, 'agent_id'),
+        el('code', { style: 'word-break: break-all;' }, m.agent.agent_id),
+      ),
+      el('div', { style: 'margin: 8px 0 12px;' },
+        el('div', { class: 'meta' }, 'token'),
+        el('div', { class: 'snippet' },
+          el('div', { class: 'head' },
+            el('span', {}, 'bearer token'),
+            el('button', { class: 'copy-btn', on: { click: (e) => copyToButton(e.target, tok) }}, 'Copy'),
+          ),
+          el('pre', {}, tok),
+        ),
+      ),
+      el('div', { class: 'tabs' },
+        ...tabs.map((t) => el('button', {
+          class: m.snippetTab === t.id ? 'active' : '',
+          on: { click: () => { state.agentModal.snippetTab = t.id; render(); } },
+        }, t.label)),
+      ),
+      el('div', { class: 'snippet' },
+        el('div', { class: 'head' },
+          el('span', {}, m.snippetTab === 'cli'
+            ? 'Run this in your terminal'
+            : m.snippetTab === 'project'
+              ? 'Save as .mcp.json at the root of any project'
+              : 'Open ~/.claude.json and merge under mcpServers'),
+          el('button', { class: 'copy-btn', on: { click: (e) => copyToButton(e.target, snippet) }}, 'Copy'),
+        ),
+        el('pre', { 'data-lang': snippetLang }, snippet),
+      ),
+      m.snippetTab === 'cli' ? el('div', { class: 'meta', style: 'margin-top: 8px;' },
+        'After running, restart your Claude Code session and run ', el('code', {}, '/mcp'),
+        '. You should see ', el('code', {}, 'toolyard ✔ connected'), ' with ',
+        el('code', {}, String(state.tools.length || '...')), ' tools.',
+      ) : null,
+      el('div', { class: 'meta', style: 'margin-top: 6px; font-size: 11px;' },
+        'Endpoint: ', el('code', {}, url),
+        ' · Dashboard: ', el('code', {}, baseUrlNoMcp),
+      ),
+      el('div', { class: 'row', style: 'margin-top: 16px; justify-content: flex-end;' },
+        el('button', { class: 'primary', on: { click: closeAgentModal } }, 'Done'),
+      ),
+    ),
+  );
+}
+
+async function copyToButton(btn, text) {
+  try {
+    await navigator.clipboard.writeText(text);
+    const orig = btn.textContent;
+    btn.textContent = 'Copied';
+    btn.classList.add('copied');
+    setTimeout(() => { btn.textContent = orig; btn.classList.remove('copied'); }, 1400);
+  } catch (e) {
+    // Fallback: select the next sibling pre's text.
+    toast('Copy failed: ' + e.message, 'error');
+  }
 }
 
 function viewMemory() {

@@ -865,6 +865,51 @@ func TestE2EBatchApproval(t *testing.T) {
 	}
 }
 
+// TestE2EAgentDirectCreate: POST /v1/agents returns the token in one shot
+// and the token works against /mcp without an intermediate exchange step.
+func TestE2EAgentDirectCreate(t *testing.T) {
+	flag.Parse()
+	h := &httpClient{base: *toolyardURL}
+	mustLogin(t, h)
+
+	var ag map[string]any
+	h.raw(t, "POST", "/v1/agents", map[string]string{"Name": "direct-create-test"}, &ag)
+	tok, _ := ag["token"].(string)
+	id, _ := ag["agent_id"].(string)
+	if tok == "" || id == "" {
+		t.Fatalf("expected token + agent_id, got %v", ag)
+	}
+	if !strings.HasPrefix(tok, id+".") {
+		t.Errorf("token should start with %s., got %s", id, tok[:20])
+	}
+
+	// Use the token immediately against /mcp (initialize handshake).
+	c := mcpClient(t, *toolyardURL, tok)
+	defer c.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	tools, err := c.ListTools(ctx, mcp.ListToolsRequest{})
+	if err != nil {
+		t.Fatalf("token from /v1/agents failed against /mcp: %v", err)
+	}
+	if len(tools.Tools) == 0 {
+		t.Fatal("expected at least one tool")
+	}
+
+	// And the agent should appear in the list.
+	var listed []map[string]any
+	h.raw(t, "GET", "/v1/agents", nil, &listed)
+	found := false
+	for _, a := range listed {
+		if a["id"] == id && a["name"] == "direct-create-test" {
+			found = true
+		}
+	}
+	if !found {
+		t.Error("agent not in /v1/agents list after create")
+	}
+}
+
 // TestE2EReasonValidation: missing/short reason rejected.
 func TestE2EReasonValidation(t *testing.T) {
 	flag.Parse()

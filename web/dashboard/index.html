@@ -177,6 +177,84 @@
   .modal h3 { margin: 0 0 4px 0; font-size: 16px; }
   .modal .meta { margin-bottom: 12px; }
   .modal label .meta { margin-top: 8px; }
+  .modal-wide { width: min(640px, calc(100% - 24px)); }
+  .snippet {
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 0;
+    margin: 8px 0 4px;
+    overflow: hidden;
+  }
+  .snippet pre {
+    margin: 0;
+    padding: 12px;
+    overflow-x: auto;
+    font-family: ui-monospace, SFMono-Regular, Consolas, monospace;
+    font-size: 12px;
+    line-height: 1.5;
+    white-space: pre;
+    color: var(--text);
+  }
+  .snippet .head {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 6px 10px;
+    background: var(--bg-elev-2);
+    border-bottom: 1px solid var(--border);
+    font-size: 12px;
+    color: var(--muted);
+  }
+  .copy-btn {
+    background: transparent;
+    border: 1px solid var(--border);
+    padding: 3px 10px;
+    font-size: 11px;
+    border-radius: 4px;
+    cursor: pointer;
+    color: var(--text);
+  }
+  .copy-btn:hover { border-color: var(--accent); color: var(--accent); }
+  .copy-btn.copied { color: var(--accent); border-color: var(--accent); }
+  .tabs {
+    display: flex;
+    gap: 4px;
+    border-bottom: 1px solid var(--border);
+    margin: 16px 0 0 0;
+  }
+  .tabs button {
+    background: transparent;
+    border: 1px solid transparent;
+    border-bottom: none;
+    border-radius: 6px 6px 0 0;
+    padding: 6px 12px;
+    color: var(--muted);
+    font-size: 13px;
+    cursor: pointer;
+    margin-bottom: -1px;
+  }
+  .tabs button.active {
+    background: var(--bg);
+    color: var(--text);
+    border-color: var(--border);
+  }
+  .warn-pill {
+    display: inline-block;
+    padding: 2px 8px;
+    background: rgba(210, 153, 34, 0.15);
+    border: 1px solid var(--warn);
+    color: var(--warn);
+    border-radius: 4px;
+    font-size: 11px;
+    margin-bottom: 8px;
+  }
+  .agent-add-bar {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 12px;
+  }
   .workbench {
     display: grid;
     grid-template-columns: 280px 1fr;

@@ -187,6 +187,32 @@ func (s *Service) CreateEnrollment(ctx context.Context, ownerUserID, agentName s
 	return code, &Agent{ID: id, Name: agentName, Owner: ownerUserID}, nil
 }
 
+// CreateAgentWithToken provisions a new agent and returns its long-lived
+// token in one step. Use this from the dashboard (which already
+// authenticates the operator), so they don't have to do the
+// enrollment-code -> exchange dance just to set up Claude Code locally.
+// The plaintext token is returned exactly once; only its sha256 is stored.
+func (s *Service) CreateAgentWithToken(ctx context.Context, ownerUserID, agentName string) (string, *Agent, error) {
+	if agentName == "" {
+		agentName = "agent"
+	}
+	id := "ag_" + uuid.NewString()
+	now := time.Now()
+	rawToken, err := randCode(32)
+	if err != nil {
+		return "", nil, err
+	}
+	token := id + "." + rawToken
+	hash := hashToken(token)
+	if _, err := s.db.ExecContext(ctx,
+		`INSERT INTO agents(id, name, owner_user, token_hash, last_seen, created_at)
+         VALUES(?,?,?,?,?,?)`,
+		id, agentName, ownerUserID, hash, now.UnixMilli(), now.UnixMilli()); err != nil {
+		return "", nil, err
+	}
+	return token, &Agent{ID: id, Name: agentName, Owner: ownerUserID}, nil
+}
+
 // ExchangeEnrollment swaps a one-time enrollment code for a long-lived token.
 // The token is returned to the caller in plaintext exactly once; only its hash
 // is persisted.

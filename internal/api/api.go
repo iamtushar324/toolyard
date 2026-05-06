@@ -109,7 +109,7 @@ func (s *Server) Routes(mux *http.ServeMux) {
 	mux.HandleFunc("/v1/auth/logout", s.authLogout)
 	mux.HandleFunc("/v1/auth/me", s.authMe)
 
-	mux.HandleFunc("/v1/agents", s.agentsList)
+	mux.HandleFunc("/v1/agents", s.agentsCollection)
 	mux.HandleFunc("/v1/agents/enroll", s.agentsEnroll)
 	mux.HandleFunc("/v1/agents/exchange", s.agentsExchange)
 
@@ -299,26 +299,52 @@ func (s *Server) authMe(w http.ResponseWriter, r *http.Request) {
 
 // ---- agents ----------------------------------------------------------------
 
-func (s *Server) agentsList(w http.ResponseWriter, r *http.Request) {
+// agentsCollection handles GET (list) and POST (create-direct). The POST
+// path is the one-step "name -> token" used by the dashboard so the
+// operator gets a copy-pasteable agent token without doing the
+// enrollment-code dance.
+func (s *Server) agentsCollection(w http.ResponseWriter, r *http.Request) {
 	uid, err := s.requireUser(r)
 	if err != nil {
 		writeError(w, http.StatusUnauthorized, "unauthorized")
 		return
 	}
-	agents, err := s.identity.ListAgents(r.Context(), uid)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-	out := make([]map[string]any, 0, len(agents))
-	for _, a := range agents {
-		row := map[string]any{"id": a.ID, "name": a.Name}
-		if !a.LastSeen.IsZero() {
-			row["last_seen"] = a.LastSeen.UnixMilli()
+	switch r.Method {
+	case http.MethodGet:
+		agents, err := s.identity.ListAgents(r.Context(), uid)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
 		}
-		out = append(out, row)
+		out := make([]map[string]any, 0, len(agents))
+		for _, a := range agents {
+			row := map[string]any{"id": a.ID, "name": a.Name}
+			if !a.LastSeen.IsZero() {
+				row["last_seen"] = a.LastSeen.UnixMilli()
+			}
+			out = append(out, row)
+		}
+		writeJSON(w, http.StatusOK, out)
+	case http.MethodPost:
+		var body struct{ Name string }
+		if err := decode(r, &body); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		token, ag, err := s.identity.CreateAgentWithToken(r.Context(), uid, strings.TrimSpace(body.Name))
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		_ = s.audit.Write(r.Context(), audit.Event{EventType: audit.EventAgentEnroll, AgentID: ag.ID, ResultSummary: ag.Name})
+		writeJSON(w, http.StatusOK, map[string]any{
+			"agent_id": ag.ID,
+			"name":     ag.Name,
+			"token":    token,
+		})
+	default:
+		writeError(w, http.StatusMethodNotAllowed, "GET or POST")
 	}
-	writeJSON(w, http.StatusOK, out)
 }
 
 func (s *Server) agentsEnroll(w http.ResponseWriter, r *http.Request) {
