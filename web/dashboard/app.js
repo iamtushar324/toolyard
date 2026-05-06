@@ -1136,6 +1136,30 @@ function renderResult(r) {
   );
 }
 
+// --- platform detection used by the push UI -------------------------------
+
+function isIOS() {
+  const ua = navigator.userAgent || '';
+  // Includes iPad on iPadOS (which reports as Mac with touch) — covers the
+  // "iPhone, iPad, iPod" trio plus the iPadOS 13+ desktop-UA case.
+  return /iPad|iPhone|iPod/.test(ua) ||
+    (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+}
+
+function isStandalonePWA() {
+  // navigator.standalone is iOS-Safari-specific; the matchMedia check covers
+  // Chrome/Edge/Firefox's Add-to-Home-Screen mode.
+  return !!(window.navigator.standalone) ||
+    (window.matchMedia && window.matchMedia('(display-mode: standalone)').matches);
+}
+
+function pushSupportStatus() {
+  if (!('serviceWorker' in navigator)) return { ok: false, reason: 'no-sw' };
+  if (!('PushManager' in window))      return { ok: false, reason: 'no-push' };
+  if (!('Notification' in window))     return { ok: false, reason: 'no-notif' };
+  return { ok: true };
+}
+
 function viewSettings() {
   const mode = state.settings.surface_mode || 'full';
   const N    = Number(state.settings.top_n_count || 20);
@@ -1237,16 +1261,7 @@ function viewSettings() {
         ),
       ) : null,
     ),
-    el('div', { class: 'card' },
-      el('h2', {}, 'Web Push'),
-      el('p', { class: 'meta' },
-        'Subscribe this browser to push notifications. On iOS, install this dashboard to your home screen first.'),
-      el('div', { class: 'row' },
-        state.vapidKey
-          ? el('button', { class: 'primary', on: { click: enablePush }}, state.pushReady ? 'Push enabled' : 'Enable push')
-          : el('span', { class: 'meta' }, 'No VAPID key on the server.'),
-      ),
-    ),
+    renderPushCard(),
     el('div', { class: 'card' },
       el('h2', {}, 'About'),
       el('p', {}, 'toolyard v0.1.0 — Apache-2.0.'),
@@ -1255,15 +1270,85 @@ function viewSettings() {
   );
 }
 
+function renderPushCard() {
+  const ios = isIOS();
+  const standalone = isStandalonePWA();
+  const support = pushSupportStatus();
+
+  // Helper: render the iOS install steps when relevant.
+  const iosSteps = el('div', { style: 'margin-top: 8px;' },
+    el('div', { class: 'meta', style: 'font-weight: 500; color: var(--text);' },
+      'On iPhone (iOS 16.4+):'),
+    el('ol', { style: 'margin: 4px 0 0 18px; padding: 0; color: var(--muted); font-size: 13px; line-height: 1.6;' },
+      el('li', {}, 'Open this dashboard in Safari (other iOS browsers can\'t do PWA push).'),
+      el('li', {}, 'Tap the ', el('b', {}, 'Share'), ' button, then ', el('b', {}, 'Add to Home Screen'), '.'),
+      el('li', {}, 'Open the new ', el('b', {}, 'toolyard'), ' icon from your Home Screen.'),
+      el('li', {}, 'In the installed app, return to ', el('b', {}, 'Settings'), ' and tap ', el('b', {}, 'Enable push'),
+        ' — iOS will show its permission prompt.'),
+    ),
+    !standalone && ios ? el('div', { class: 'meta', style: 'margin-top: 8px;' },
+      'You\'re currently on a Safari tab (not the installed app), so the Enable button will fail until step 3 is done.',
+    ) : null,
+  );
+
+  let body;
+  if (!state.vapidKey) {
+    body = el('div', { class: 'meta' }, 'No VAPID key on the server.');
+  } else if (!support.ok) {
+    if (ios && !standalone) {
+      // Most common iOS case: PushManager hidden inside Safari tabs.
+      body = el('div', {},
+        el('div', { class: 'warn-pill' }, '⚠  Web Push on iOS only works after Add to Home Screen.'),
+        iosSteps,
+      );
+    } else if (support.reason === 'no-push') {
+      body = el('div', { class: 'meta' },
+        'This browser doesn\'t expose the PushManager API. Try a recent Chrome, Edge, Firefox, or Safari (16.4+).');
+    } else if (support.reason === 'no-sw') {
+      body = el('div', { class: 'meta' },
+        'Service workers aren\'t available — usually because you\'re on a non-HTTPS / non-localhost origin. ',
+        'Web Push requires a secure context.');
+    } else {
+      body = el('div', { class: 'meta' }, 'This browser doesn\'t support the Notifications API.');
+    }
+  } else {
+    // Browser supports push. If iOS but not standalone, still warn.
+    body = el('div', {},
+      ios && !standalone
+        ? el('div', { class: 'warn-pill' }, '⚠  Looks like Safari thinks push is available, but iOS only delivers when run from the Home Screen icon. If Enable fails, follow the install steps below.')
+        : null,
+      el('div', { class: 'row' },
+        el('button', { class: 'primary', on: { click: enablePush }},
+          state.pushReady ? 'Push enabled ✓ (re-enroll)' : 'Enable push'),
+      ),
+      ios ? iosSteps : null,
+    );
+  }
+
+  return el('div', { class: 'card' },
+    el('h2', {}, 'Web Push'),
+    el('p', { class: 'meta' },
+      'Get a notification on this device when an approval is pending. The notification has Allow / Deny actions tied to the approval\'s signed token, so you can decide right from the lock screen.'),
+    body,
+  );
+}
+
 async function enablePush() {
   try {
-    if (!('serviceWorker' in navigator) || !('PushManager' in window)) {
-      throw new Error('this browser does not support Web Push');
+    const support = pushSupportStatus();
+    if (!support.ok) {
+      if (isIOS() && !isStandalonePWA()) {
+        throw new Error('On iPhone, tap Share → Add to Home Screen, open toolyard from the Home Screen, then try again. Web Push only works in installed PWAs on iOS.');
+      }
+      if (support.reason === 'no-sw') {
+        throw new Error('Service workers unavailable — Web Push needs HTTPS or localhost.');
+      }
+      throw new Error('This browser does not support Web Push.');
     }
     const reg = await navigator.serviceWorker.register('/sw.js');
     await navigator.serviceWorker.ready;
     const perm = await Notification.requestPermission();
-    if (perm !== 'granted') throw new Error('notification permission denied');
+    if (perm !== 'granted') throw new Error('Notification permission denied — enable it in browser settings.');
     const sub = await reg.pushManager.subscribe({
       userVisibleOnly: true,
       applicationServerKey: urlBase64ToUint8Array(state.vapidKey),

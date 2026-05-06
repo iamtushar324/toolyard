@@ -7,6 +7,12 @@
 <title>toolyard</title>
 <link rel="manifest" href="/manifest.webmanifest" />
 <link rel="icon" type="image/svg+xml" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='12' fill='%2316a34a'/%3E%3Cpath d='M16 32 L28 44 L48 20' stroke='white' stroke-width='6' fill='none' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E" />
+<!-- iOS Safari ignores manifest icons; uses these tags for the Home Screen -->
+<link rel="apple-touch-icon" sizes="192x192" href="/icon-192.svg" />
+<link rel="apple-touch-icon" sizes="512x512" href="/icon-512.svg" />
+<meta name="apple-mobile-web-app-capable" content="yes" />
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
+<meta name="apple-mobile-web-app-title" content="toolyard" />
 <style>
   :root {
     --bg: #0d1117;
