@@ -775,6 +775,96 @@ func keysOf(m map[string]bool) []string {
 	return out
 }
 
+// TestE2EBatchApproval: an agent fires several writes in parallel; the
+// dashboard's batch-decide resolves them all in one call.
+func TestE2EBatchApproval(t *testing.T) {
+	flag.Parse()
+	h := &httpClient{base: *toolyardURL}
+	mustLogin(t, h)
+	token := enrollAgent(t, h, "batch-test")
+	c := mcpClient(t, *toolyardURL, token)
+	defer c.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	// Fire three concurrent memory.set writes. They all need approval.
+	type cr struct {
+		res *mcp.CallToolResult
+		err error
+	}
+	results := make(chan cr, 3)
+	keys := []string{"batch-a", "batch-b", "batch-c"}
+	for _, k := range keys {
+		key := k
+		go func() {
+			req := mcp.CallToolRequest{}
+			req.Params.Name = "memory.set"
+			req.Params.Arguments = map[string]any{
+				"_reason": "batch-approval e2e: three parallel writes from one turn (" + key + ")",
+				"key":     key,
+				"value":   "v",
+			}
+			res, err := c.CallTool(ctx, req)
+			results <- cr{res, err}
+		}()
+	}
+
+	// Wait until at least 3 pending approvals are visible for this agent.
+	deadline := time.Now().Add(8 * time.Second)
+	var pending []map[string]any
+	for time.Now().Before(deadline) {
+		time.Sleep(120 * time.Millisecond)
+		var arr []map[string]any
+		h.raw(t, "GET", "/v1/approvals?status=pending", nil, &arr)
+		pending = pending[:0]
+		for _, a := range arr {
+			if rr, _ := a["reason"].(string); strings.Contains(rr, "batch-approval e2e") {
+				pending = append(pending, a)
+			}
+		}
+		if len(pending) >= 3 {
+			break
+		}
+	}
+	if len(pending) < 3 {
+		t.Fatalf("expected 3 pending approvals, got %d", len(pending))
+	}
+	ids := make([]string, 0, len(pending))
+	for _, a := range pending {
+		ids = append(ids, a["id"].(string))
+	}
+
+	// Batch-allow.
+	var out []map[string]any
+	h.raw(t, "POST", "/v1/approvals/decide-batch",
+		map[string]any{"ids": ids, "action": "allowed"}, &out)
+	if len(out) != len(ids) {
+		t.Fatalf("expected %d results, got %d", len(ids), len(out))
+	}
+	for _, r := range out {
+		if r["status"] != "allowed" {
+			t.Errorf("expected allowed, got %v", r)
+		}
+	}
+
+	// All three calls should now complete.
+	for i := 0; i < 3; i++ {
+		select {
+		case r := <-results:
+			if r.err != nil {
+				t.Errorf("call err: %v", r.err)
+				continue
+			}
+			if r.res.IsError {
+				t.Errorf("call error: %s", dumpResult(r.res))
+			}
+		case <-time.After(15 * time.Second):
+			t.Fatal("a batched call never returned")
+		}
+	}
+}
+
 // TestE2EReasonValidation: missing/short reason rejected.
 func TestE2EReasonValidation(t *testing.T) {
 	flag.Parse()

@@ -24,9 +24,9 @@ const (
 	minReasonLen = 20
 	maxReasonLen = 2000
 
-	reasonPropDescription = "One sentence on why you are calling this tool. Will be shown to a human approver. Required, 20-2000 chars."
+	reasonPropDescription = "One short sentence on why you are calling this tool. Shown verbatim to the human approver. Required, 20-2000 chars."
 	intentPropDescription = "Coarse intent category: read | write | destructive | external_communication | financial | privileged_admin."
-	descriptionBanner     = "[Gated by toolyard. You MUST provide _reason explaining why you are calling this tool.] "
+	descriptionBanner     = "[toolyard-gated · _reason required · writes need approval · safe to batch with parallel tool calls so the human reviews them together] "
 )
 
 var intentEnum = []string{

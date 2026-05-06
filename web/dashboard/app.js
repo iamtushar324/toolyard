@@ -243,27 +243,77 @@ function viewApprovals() {
   if (!state.approvals.length) {
     return el('div', { class: 'card empty' }, 'No pending approvals.');
   }
-  return el('div', {}, state.approvals.map((a) => el('div', { class: 'card' },
+  // Group by agent_id. Within each group, sort by created_at ascending so
+  // the user reads the batch in chronological order. Anonymous calls fall
+  // into a "—" bucket (likely stdio sessions or stale tokens; see Settings).
+  const groups = new Map();
+  for (const a of state.approvals) {
+    const key = a.agent_id || '__anon__';
+    if (!groups.has(key)) groups.set(key, []);
+    groups.get(key).push(a);
+  }
+  // Sort groups by the most recent approval in each, descending — newest
+  // batch on top.
+  const ordered = Array.from(groups.entries()).sort((x, y) => {
+    const xMax = Math.max(...x[1].map((a) => a.created_at));
+    const yMax = Math.max(...y[1].map((a) => a.created_at));
+    return yMax - xMax;
+  });
+
+  return el('div', {}, ordered.map(([key, items]) => {
+    items.sort((a, b) => a.created_at - b.created_at);
+    return renderApprovalBatch(key, items);
+  }));
+}
+
+function renderApprovalBatch(agentKey, items) {
+  const ids = items.map((a) => a.id);
+  const earliest = Math.min(...items.map((a) => a.expires_at));
+  const isBatch = items.length > 1;
+  const labelAgent = agentKey === '__anon__' ? 'anonymous (no agent token)' : agentKey;
+
+  // Compact summary line: "fs.write_file · github.create_issue · …"
+  const toolSummary = items.map((a) => `${a.upstream_name}·${a.tool_name}`).join('  ·  ');
+
+  const header = el('div', { class: 'row', style: 'margin-bottom: 8px;' },
+    el('div', { class: 'grow' },
+      el('div', { style: 'font-weight: 600; font-size: 14px;' },
+        isBatch ? `Batch: ${items.length} pending writes` : `${items[0].upstream_name} · ${items[0].tool_name}`),
+      el('div', { class: 'meta', style: 'margin-top: 2px;' },
+        `agent: `, el('code', {}, labelAgent),
+        ` · earliest expires ${relTime(earliest)}`),
+      isBatch ? el('div', { class: 'meta', style: 'margin-top: 4px; font-family: ui-monospace, monospace;' }, toolSummary) : null,
+    ),
+    isBatch ? el('div', { class: 'row' },
+      el('button', { class: 'primary', on: { click: () => decideBatch(ids, 'allowed') }}, `Allow all (${items.length})`),
+      el('button', { class: 'danger',  on: { click: () => decideBatch(ids, 'denied')  }}, `Deny all`),
+    ) : null,
+  );
+
+  const rows = items.map((a) => el('div', {
+    style: 'border-top: 1px solid var(--border); padding: 12px 0; margin-top: 8px;',
+  },
     el('div', { class: 'row' },
-      el('span', { class: 'grow', style: 'font-weight: 600;' },
-        `${a.upstream_name} · ${a.tool_name}`),
+      el('span', { class: 'grow', style: 'font-weight: 500;' }, `${a.upstream_name} · ${a.tool_name}`),
+      a.intent_category ? el('span', { class: 'badge' }, a.intent_category) : null,
       badge(a.status),
     ),
-    el('div', { class: 'meta', style: 'margin: 4px 0 8px;' },
-      `agent: ${a.agent_id || '—'} · created ${relTime(a.created_at)} · expires ${relTime(a.expires_at)}`),
+    el('div', { class: 'meta', style: 'margin: 4px 0 6px;' },
+      `created ${relTime(a.created_at)} · expires ${relTime(a.expires_at)}`),
     el('div', { style: 'background: var(--bg); border: 1px solid var(--border); border-radius: 4px; padding: 8px; margin: 4px 0;' },
       el('div', { class: 'meta' }, 'reasoning'),
       a.reason || '(none provided)'),
-    a.intent_category ? el('div', { class: 'meta' }, 'intent: ', el('code', {}, a.intent_category)) : null,
     el('details', {},
       el('summary', {}, 'arguments'),
       el('pre', { class: 'json' }, JSON.stringify(a.arguments || {}, null, 2)),
     ),
-    el('div', { class: 'row', style: 'margin-top: 10px;' },
+    el('div', { class: 'row', style: 'margin-top: 8px;' },
       el('button', { class: 'primary', on: { click: () => decideApproval(a.id, 'allowed') } }, 'Allow'),
       el('button', { class: 'danger',  on: { click: () => decideApproval(a.id, 'denied')  } }, 'Deny'),
     ),
-  )));
+  ));
+
+  return el('div', { class: 'card' }, header, ...rows);
 }
 
 async function decideApproval(id, action) {
@@ -271,6 +321,17 @@ async function decideApproval(id, action) {
     await api(`/v1/approvals/${id}/decide`, { method: 'POST', body: { Action: action } });
     state.approvals = state.approvals.filter((a) => a.id !== id);
     toast(action === 'allowed' ? 'Approved' : 'Denied');
+    render();
+  } catch (e) { toast(e.message, 'error'); }
+}
+
+async function decideBatch(ids, action) {
+  if (!ids.length) return;
+  try {
+    const out = await api('/v1/approvals/decide-batch', { method: 'POST', body: { ids, action }});
+    const flipped = (out || []).filter((r) => r.status === action).length;
+    state.approvals = state.approvals.filter((a) => !ids.includes(a.id));
+    toast(`${action === 'allowed' ? 'Approved' : 'Denied'} ${flipped} of ${ids.length}`);
     render();
   } catch (e) { toast(e.message, 'error'); }
 }

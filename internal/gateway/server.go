@@ -131,7 +131,7 @@ func New(opts Options) *Gateway {
 		server.WithToolCapabilities(true),
 		server.WithLogging(),
 		server.WithRecovery(),
-		server.WithInstructions("toolyard gateway. All tool calls require an explicit _reason; writes go through human approval."),
+		server.WithInstructions(buildInstructions(opts.Approval, opts.InLineWait)),
 	}
 	if opts.Visibility != nil {
 		vp := opts.Visibility
@@ -633,6 +633,25 @@ func agentIDFromContext(ctx context.Context) string {
 // agentIDFromContext but exported.
 func AgentIDFromContext(ctx context.Context) string {
 	return agentIDFromContext(ctx)
+}
+
+// buildInstructions composes the MCP server's `instructions` field. It tells
+// the agent how reasons + approvals + batching work so it knows it can fire
+// several writes in parallel and let the human approve them together.
+func buildInstructions(bus *approval.Bus, inLineWait time.Duration) string {
+	ttl := approval.DefaultTTL
+	if bus != nil {
+		ttl = bus.TTL()
+	}
+	var b strings.Builder
+	b.WriteString("toolyard gateway. ")
+	b.WriteString("Every tool call REQUIRES a `_reason` field (20-2000 chars) explaining why you are calling it; this string is shown verbatim to the human reviewer. ")
+	b.WriteString("Reads pass through silently; writes hold for human approval. ")
+	b.WriteString(fmt.Sprintf("Approvals expire after %s. ", ttl.Round(time.Minute)))
+	b.WriteString(fmt.Sprintf("If a decision does not arrive within ~%s the gateway returns a deferred response containing `approval_id`; resume by re-calling the same tool with `_approval_id` set to that value. ", inLineWait))
+	b.WriteString("BATCHING: when a task needs several writes (e.g. create issue + comment + assign), invoke them in parallel from one turn rather than serially. The dashboard groups concurrent calls from the same agent into a single approval card so the human approves the whole batch with one tap. Per-call `_reason` strings are surfaced in that summary, so write each one to be readable on its own. ")
+	b.WriteString("Use `tools.search` and `tools.execute` to discover and proxy tools that aren't directly visible in your catalog.")
+	return b.String()
 }
 
 // SetUpstreamLogger wires log output for upstream errors to the supplied logger.

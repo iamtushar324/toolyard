@@ -116,6 +116,7 @@ func (s *Server) Routes(mux *http.ServeMux) {
 	mux.HandleFunc("/v1/approvals", s.approvalsList)
 	mux.HandleFunc("/v1/approvals/", s.approvalsOne)
 	mux.HandleFunc("/v1/approvals/decide-by-token", s.approvalsDecideByToken)
+	mux.HandleFunc("/v1/approvals/decide-batch", s.approvalsDecideBatch)
 
 	mux.HandleFunc("/v1/audit", s.auditList)
 	mux.HandleFunc("/v1/events/stream", s.eventsStream)
@@ -399,7 +400,7 @@ func (s *Server) approvalsList(w http.ResponseWriter, r *http.Request) {
 
 func (s *Server) approvalsOne(w http.ResponseWriter, r *http.Request) {
 	id := strings.TrimPrefix(r.URL.Path, "/v1/approvals/")
-	if id == "" || id == "decide-by-token" {
+	if id == "" || id == "decide-by-token" || id == "decide-batch" {
 		http.NotFound(w, r)
 		return
 	}
@@ -453,6 +454,60 @@ func (s *Server) approvalsDecide(w http.ResponseWriter, r *http.Request, id stri
 		return
 	}
 	writeJSON(w, http.StatusOK, req)
+}
+
+// approvalsDecideBatch resolves several pending approvals in one shot. The
+// dashboard's "Allow all / Deny all" buttons use it. Returns a per-id status
+// array so the UI can show which ones flipped vs which were already
+// resolved/expired.
+func (s *Server) approvalsDecideBatch(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "POST only")
+		return
+	}
+	uid, err := s.requireUser(r)
+	if err != nil {
+		writeError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+	var body struct {
+		IDs    []string `json:"ids"`
+		Action string   `json:"action"`
+	}
+	if err := decode(r, &body); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if len(body.IDs) == 0 {
+		writeError(w, http.StatusBadRequest, "ids is required")
+		return
+	}
+	if body.Action != approval.StatusAllowed && body.Action != approval.StatusDenied {
+		writeError(w, http.StatusBadRequest, "action must be allowed or denied")
+		return
+	}
+	type result struct {
+		ID     string `json:"id"`
+		Status string `json:"status"`
+		Error  string `json:"error,omitempty"`
+	}
+	out := make([]result, 0, len(body.IDs))
+	for _, id := range body.IDs {
+		req, err := s.approval.Decide(r.Context(), id, body.Action, uid)
+		switch {
+		case err == nil:
+			out = append(out, result{ID: id, Status: req.Status})
+		case errors.Is(err, approval.ErrNotPending) && req != nil:
+			out = append(out, result{ID: id, Status: req.Status, Error: "not pending"})
+		default:
+			msg := "error"
+			if err != nil {
+				msg = err.Error()
+			}
+			out = append(out, result{ID: id, Error: msg})
+		}
+	}
+	writeJSON(w, http.StatusOK, out)
 }
 
 func (s *Server) approvalsDecideByToken(w http.ResponseWriter, r *http.Request) {
