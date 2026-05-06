@@ -17,21 +17,53 @@ import (
 )
 
 const (
-	ReasonField   = "_reason"
-	IntentField   = "_intent_category"
-	FallbackField = "__toolyard_reason"
+	ReasonField     = "_reason"
+	IntentField     = "_intent_category"
+	ApprovalIDField = "_approval_id"
+	FallbackField   = "__toolyard_reason"
 
 	minReasonLen = 20
 	maxReasonLen = 2000
 
-	reasonPropDescription = "One short sentence on why you are calling this tool. Shown verbatim to the human approver. Required, 20-2000 chars."
-	intentPropDescription = "Coarse intent category: read | write | destructive | external_communication | financial | privileged_admin."
-	descriptionBanner     = "[toolyard-gated · _reason required · writes need approval · safe to batch with parallel tool calls so the human reviews them together] "
+	reasonPropDescription     = "One short sentence on why you are calling this tool. Shown verbatim to the human approver. Required, 20-2000 chars."
+	intentPropDescription     = "Coarse intent category: read | write | destructive | external_communication | financial | privileged_admin."
+	approvalIDPropDescription = "If a previous call to this tool returned a deferred response with an `approval_id`, set this to that value to resume the held call instead of creating a new approval."
+	descriptionBanner         = "[toolyard-gated · _reason required · writes need approval · safe to batch with parallel tool calls so the human reviews them together · resume a deferred call by passing _approval_id] "
 )
 
 var intentEnum = []string{
 	"read", "write", "destructive", "external_communication",
 	"financial", "privileged_admin",
+}
+
+// metaProps returns the three toolyard-injected schema properties:
+// _reason (required), _intent_category, and _approval_id. Built-in tool
+// schemas merge these into their hand-rolled property maps so direct
+// upstream calls and meta-tools stay consistent.
+func metaProps() map[string]any {
+	return map[string]any{
+		ReasonField: map[string]any{
+			"type": "string", "minLength": minReasonLen, "maxLength": maxReasonLen,
+			"description": reasonPropDescription,
+		},
+		IntentField: map[string]any{
+			"type": "string", "enum": intentEnum, "description": intentPropDescription,
+		},
+		ApprovalIDField: map[string]any{
+			"type": "string", "description": approvalIDPropDescription,
+		},
+	}
+}
+
+// addMetaProps merges metaProps into props (without overwriting existing
+// keys). Used by built-in tool definitions.
+func addMetaProps(props map[string]any) map[string]any {
+	for k, v := range metaProps() {
+		if _, has := props[k]; !has {
+			props[k] = v
+		}
+	}
+	return props
 }
 
 // wrapSchema returns a deep-copied tool with the _reason / _intent_category
@@ -87,6 +119,12 @@ func wrapSchema(t mcp.Tool) (mcp.Tool, string) {
 			"type":        "string",
 			"enum":        intentEnum,
 			"description": intentPropDescription,
+		}
+	}
+	if _, has := props[ApprovalIDField]; !has {
+		props[ApprovalIDField] = map[string]any{
+			"type":        "string",
+			"description": approvalIDPropDescription,
 		}
 	}
 	required = appendUnique(required, field)
@@ -145,7 +183,7 @@ func extractReason(args map[string]any, fieldName string) (string, string, map[s
 
 	out := make(map[string]any, len(args))
 	for k, v := range args {
-		if k == fieldName || k == IntentField {
+		if k == fieldName || k == IntentField || k == ApprovalIDField {
 			continue
 		}
 		out[k] = v

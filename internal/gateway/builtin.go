@@ -13,7 +13,9 @@ import (
 
 // builtinMemoryTools returns the four memory.* tools as MCP-style ServerTools
 // (with ALREADY-WRAPPED schemas — they're built-in so we avoid round-tripping
-// through the schema rewriter).
+// through the schema rewriter). The toolyard-injected meta props (_reason,
+// _intent_category, _approval_id) are merged in via addMetaProps so direct
+// upstream tool schemas and built-in schemas stay consistent.
 func (g *Gateway) builtinMemoryTools() []toolEntry {
 	mem := g.memory
 
@@ -23,17 +25,10 @@ func (g *Gateway) builtinMemoryTools() []toolEntry {
 		InputSchema: mcp.ToolInputSchema{
 			Type:     "object",
 			Required: []string{ReasonField, "key"},
-			Properties: map[string]any{
-				ReasonField: map[string]any{
-					"type": "string", "minLength": minReasonLen, "maxLength": maxReasonLen,
-					"description": reasonPropDescription,
-				},
-				IntentField: map[string]any{
-					"type": "string", "enum": intentEnum, "description": intentPropDescription,
-				},
+			Properties: addMetaProps(map[string]any{
 				"scope": map[string]any{"type": "string"},
 				"key":   map[string]any{"type": "string"},
-			},
+			}),
 		},
 	}
 
@@ -43,18 +38,11 @@ func (g *Gateway) builtinMemoryTools() []toolEntry {
 		InputSchema: mcp.ToolInputSchema{
 			Type:     "object",
 			Required: []string{ReasonField, "key", "value"},
-			Properties: map[string]any{
-				ReasonField: map[string]any{
-					"type": "string", "minLength": minReasonLen, "maxLength": maxReasonLen,
-					"description": reasonPropDescription,
-				},
-				IntentField: map[string]any{
-					"type": "string", "enum": intentEnum, "description": intentPropDescription,
-				},
+			Properties: addMetaProps(map[string]any{
 				"scope": map[string]any{"type": "string"},
 				"key":   map[string]any{"type": "string"},
 				"value": map[string]any{"type": "string"},
-			},
+			}),
 		},
 	}
 
@@ -64,17 +52,10 @@ func (g *Gateway) builtinMemoryTools() []toolEntry {
 		InputSchema: mcp.ToolInputSchema{
 			Type:     "object",
 			Required: []string{ReasonField},
-			Properties: map[string]any{
-				ReasonField: map[string]any{
-					"type": "string", "minLength": minReasonLen, "maxLength": maxReasonLen,
-					"description": reasonPropDescription,
-				},
-				IntentField: map[string]any{
-					"type": "string", "enum": intentEnum, "description": intentPropDescription,
-				},
+			Properties: addMetaProps(map[string]any{
 				"scope":  map[string]any{"type": "string"},
 				"prefix": map[string]any{"type": "string"},
-			},
+			}),
 		},
 	}
 
@@ -84,17 +65,10 @@ func (g *Gateway) builtinMemoryTools() []toolEntry {
 		InputSchema: mcp.ToolInputSchema{
 			Type:     "object",
 			Required: []string{ReasonField, "key"},
-			Properties: map[string]any{
-				ReasonField: map[string]any{
-					"type": "string", "minLength": minReasonLen, "maxLength": maxReasonLen,
-					"description": reasonPropDescription,
-				},
-				IntentField: map[string]any{
-					"type": "string", "enum": intentEnum, "description": intentPropDescription,
-				},
+			Properties: addMetaProps(map[string]any{
 				"scope": map[string]any{"type": "string"},
 				"key":   map[string]any{"type": "string"},
-			},
+			}),
 		},
 	}
 
@@ -180,16 +154,9 @@ func (g *Gateway) staticFixtureTool() toolEntry {
 		InputSchema: mcp.ToolInputSchema{
 			Type:     "object",
 			Required: []string{ReasonField, "message"},
-			Properties: map[string]any{
-				ReasonField: map[string]any{
-					"type": "string", "minLength": minReasonLen, "maxLength": maxReasonLen,
-					"description": reasonPropDescription,
-				},
-				IntentField: map[string]any{
-					"type": "string", "enum": intentEnum, "description": intentPropDescription,
-				},
+			Properties: addMetaProps(map[string]any{
 				"message": map[string]any{"type": "string"},
-			},
+			}),
 		},
 	}
 	handler := directHandler(func(_ context.Context, args map[string]any) (*mcp.CallToolResult, error) {

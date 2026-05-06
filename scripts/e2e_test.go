@@ -910,6 +910,135 @@ func TestE2EAgentDirectCreate(t *testing.T) {
 	}
 }
 
+// TestE2ECoalesceAndApprovalIDSchema: identical pending writes coalesce
+// into one approval row, the schema-wrap exposes _approval_id on every
+// wrapped tool, and direct upstream calls accept it for resume.
+func TestE2ECoalesceAndApprovalIDSchema(t *testing.T) {
+	flag.Parse()
+	h := &httpClient{base: *toolyardURL}
+	mustLogin(t, h)
+	token := enrollAgent(t, h, "coalesce-test")
+	c := mcpClient(t, *toolyardURL, token)
+	defer c.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
+	tools, err := c.ListTools(ctx, mcp.ListToolsRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Every wrapped tool should expose _approval_id in its inputSchema.
+	for _, tl := range tools.Tools {
+		props, _ := tl.InputSchema.Properties, tl.InputSchema.Required
+		if _, ok := props["_approval_id"]; !ok {
+			t.Errorf("tool %q is missing _approval_id in its schema", tl.Name)
+		}
+	}
+
+	// Fire the SAME write twice in parallel. Should produce ONE approval
+	// row (coalesced), not two.
+	resCh := make(chan *mcp.CallToolResult, 2)
+	args := map[string]any{
+		"_reason": "coalesce test: identical writes should produce one approval card",
+		"key":     "coalesce-key",
+		"value":   "v1",
+	}
+	for i := 0; i < 2; i++ {
+		go func() {
+			req := mcp.CallToolRequest{}
+			req.Params.Name = "memory.set"
+			req.Params.Arguments = args
+			r, _ := c.CallTool(ctx, req)
+			resCh <- r
+		}()
+	}
+
+	deadline := time.Now().Add(8 * time.Second)
+	var apID string
+	for time.Now().Before(deadline) {
+		time.Sleep(120 * time.Millisecond)
+		var arr []map[string]any
+		h.raw(t, "GET", "/v1/approvals?status=pending", nil, &arr)
+		matched := 0
+		for _, a := range arr {
+			if rr, _ := a["reason"].(string); strings.Contains(rr, "coalesce test") {
+				matched++
+				apID, _ = a["id"].(string)
+			}
+		}
+		if matched > 0 {
+			if matched != 1 {
+				t.Fatalf("expected exactly one pending approval after coalesce, got %d", matched)
+			}
+			break
+		}
+	}
+	if apID == "" {
+		t.Fatal("no pending approval appeared")
+	}
+
+	// Approve and confirm both in-flight calls return.
+	var d map[string]any
+	h.raw(t, "POST", "/v1/approvals/"+apID+"/decide", map[string]string{"Action": "allowed"}, &d)
+	for i := 0; i < 2; i++ {
+		select {
+		case r := <-resCh:
+			// One of them might be a deferred response (the second goroutine
+			// landed after the first, saw the same fingerprint, got the
+			// same id back; if the first goroutine already consumed the
+			// approval the second sees status=allowed and dispatches).
+			if r != nil && r.IsError {
+				// Acceptable iff this is the deferred response that ran
+				// before approval; ignore.
+			}
+		case <-time.After(15 * time.Second):
+			t.Fatal("call never returned after coalesced-approval decision")
+		}
+	}
+
+	// Direct upstream call with _approval_id resumes a deferred call.
+	// Create a fresh deferred approval and resume by passing _approval_id.
+	req := mcp.CallToolRequest{}
+	req.Params.Name = "memory.set"
+	req.Params.Arguments = map[string]any{
+		"_reason": "approval-id schema test: a fresh write that we will resume by id",
+		"key":     "resume-key",
+		"value":   "v2",
+	}
+	first, err := c.CallTool(ctx, req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sc, _ := first.StructuredContent.(map[string]any)
+	if sc == nil || sc["status"] != "pending_approval" {
+		t.Skipf("first call did not defer (server may have a long in-line wait); got %v", sc)
+	}
+	resumeID, _ := sc["approval_id"].(string)
+	if resumeID == "" {
+		t.Fatal("missing approval_id in deferred response")
+	}
+	h.raw(t, "POST", "/v1/approvals/"+resumeID+"/decide", map[string]string{"Action": "allowed"}, &d)
+
+	// Resume by passing _approval_id directly to memory.set (NOT via tools.execute).
+	resumeReq := mcp.CallToolRequest{}
+	resumeReq.Params.Name = "memory.set"
+	resumeReq.Params.Arguments = map[string]any{
+		"_reason":      "resuming the approved write directly",
+		"_approval_id": resumeID,
+	}
+	resumeRes, err := c.CallTool(ctx, resumeReq)
+	if err != nil {
+		t.Fatalf("resume direct: %v", err)
+	}
+	if resumeRes.IsError {
+		t.Errorf("expected resume to succeed, got: %s", dumpResult(resumeRes))
+	}
+	if !strings.Contains(dumpResult(resumeRes), "v2") {
+		t.Errorf("expected stored value in resumed result, got: %s", dumpResult(resumeRes))
+	}
+}
+
 // TestE2EReasonValidation: missing/short reason rejected.
 func TestE2EReasonValidation(t *testing.T) {
 	flag.Parse()

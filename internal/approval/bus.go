@@ -14,12 +14,15 @@ import (
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"log"
+	"sort"
 	"sync"
 	"time"
 
@@ -61,6 +64,8 @@ type Request struct {
 	DecidedAt      int64          `json:"decided_at,omitempty"`
 	CreatedAt      int64          `json:"created_at"`
 	ExpiresAt      int64          `json:"expires_at"`
+	Fingerprint    string         `json:"fingerprint,omitempty"`
+	Coalesced      bool           `json:"coalesced,omitempty"` // true if Hold returned an existing pending row instead of creating a new one
 }
 
 // Notifier is implemented by the push and realtime services so the bus can
@@ -189,6 +194,16 @@ type NewRequest struct {
 }
 
 func (b *Bus) create(ctx context.Context, in NewRequest) (*Request, error) {
+	// Coalesce: if there's already a pending row with the same
+	// (agent, upstream, tool, args) fingerprint, return it. This stops a
+	// retrying hook or a model that re-issues the same call from piling up
+	// identical approval cards on the dashboard.
+	fp := computeFingerprint(in.AgentID, in.UpstreamName, in.ToolName, in.Arguments)
+	if existing, err := b.findPendingByFingerprint(ctx, fp); err == nil && existing != nil {
+		existing.Coalesced = true
+		return existing, nil
+	}
+
 	id := "ap_" + uuid.NewString()
 	now := time.Now()
 	req := &Request{
@@ -202,19 +217,146 @@ func (b *Bus) create(ctx context.Context, in NewRequest) (*Request, error) {
 		Status:         StatusPending,
 		CreatedAt:      now.UnixMilli(),
 		ExpiresAt:      now.Add(b.ttl).UnixMilli(),
+		Fingerprint:    fp,
 	}
 	req.DecisionToken = b.signToken(req.ID)
 	args, _ := json.Marshal(in.Arguments)
-	if _, err := b.db.ExecContext(ctx,
+	_, err := b.db.ExecContext(ctx,
 		`INSERT INTO approval_requests(id, agent_id, upstream_name, tool_name, arguments,
-            reason, intent_category, status, decision_token, created_at, expires_at)
-         VALUES(?,?,?,?,?,?,?,?,?,?,?)`,
+            reason, intent_category, status, decision_token, created_at, expires_at, fingerprint)
+         VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`,
 		req.ID, req.AgentID, req.UpstreamName, req.ToolName, string(args),
 		req.Reason, nullStr(req.IntentCategory), req.Status, req.DecisionToken,
-		req.CreatedAt, req.ExpiresAt); err != nil {
+		req.CreatedAt, req.ExpiresAt, fp)
+	if err != nil {
+		// SQLite's UNIQUE constraint on the partial fingerprint index can fire
+		// if a parallel request landed first; fall back to coalescing.
+		if isUniqueViolation(err) {
+			if existing, lookupErr := b.findPendingByFingerprint(ctx, fp); lookupErr == nil && existing != nil {
+				existing.Coalesced = true
+				return existing, nil
+			}
+		}
 		return nil, err
 	}
 	return req, nil
+}
+
+// computeFingerprint is sha256(agent_id||0x1f||upstream||0x1f||tool||0x1f||canonical-args).
+// Canonical args are produced by sorting object keys recursively so
+// {a:1, b:2} and {b:2, a:1} hash identically.
+func computeFingerprint(agentID, upstream, tool string, args map[string]any) string {
+	h := sha256.New()
+	_, _ = h.Write([]byte(agentID))
+	h.Write([]byte{0x1f})
+	_, _ = h.Write([]byte(upstream))
+	h.Write([]byte{0x1f})
+	_, _ = h.Write([]byte(tool))
+	h.Write([]byte{0x1f})
+	if blob, err := canonicalJSON(args); err == nil {
+		_, _ = h.Write(blob)
+	}
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+// canonicalJSON marshals v with sorted object keys at every level so two
+// equivalent argument maps produce identical bytes.
+func canonicalJSON(v any) ([]byte, error) {
+	switch x := v.(type) {
+	case map[string]any:
+		keys := make([]string, 0, len(x))
+		for k := range x {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		var buf []byte
+		buf = append(buf, '{')
+		for i, k := range keys {
+			if i > 0 {
+				buf = append(buf, ',')
+			}
+			kb, _ := json.Marshal(k)
+			buf = append(buf, kb...)
+			buf = append(buf, ':')
+			vb, err := canonicalJSON(x[k])
+			if err != nil {
+				return nil, err
+			}
+			buf = append(buf, vb...)
+		}
+		buf = append(buf, '}')
+		return buf, nil
+	case []any:
+		var buf []byte
+		buf = append(buf, '[')
+		for i, item := range x {
+			if i > 0 {
+				buf = append(buf, ',')
+			}
+			vb, err := canonicalJSON(item)
+			if err != nil {
+				return nil, err
+			}
+			buf = append(buf, vb...)
+		}
+		buf = append(buf, ']')
+		return buf, nil
+	default:
+		return json.Marshal(v)
+	}
+}
+
+func (b *Bus) findPendingByFingerprint(ctx context.Context, fp string) (*Request, error) {
+	if fp == "" {
+		return nil, nil
+	}
+	row := b.db.QueryRowContext(ctx,
+		`SELECT id, agent_id, upstream_name, tool_name, arguments, reason,
+            COALESCE(intent_category,''), status, COALESCE(decision_token,''),
+            COALESCE(decided_by,''), COALESCE(decided_at,0), created_at, expires_at,
+            COALESCE(fingerprint,'')
+         FROM approval_requests
+         WHERE status = ? AND fingerprint = ? LIMIT 1`,
+		StatusPending, fp)
+	var req Request
+	var args string
+	if err := row.Scan(&req.ID, &req.AgentID, &req.UpstreamName, &req.ToolName, &args,
+		&req.Reason, &req.IntentCategory, &req.Status, &req.DecisionToken,
+		&req.DecidedBy, &req.DecidedAt, &req.CreatedAt, &req.ExpiresAt,
+		&req.Fingerprint); err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	if args != "" {
+		_ = json.Unmarshal([]byte(args), &req.Arguments)
+	}
+	return &req, nil
+}
+
+func isUniqueViolation(err error) bool {
+	if err == nil {
+		return false
+	}
+	msg := err.Error()
+	// mattn/go-sqlite3 returns "UNIQUE constraint failed" in the message.
+	return contains(msg, "UNIQUE constraint failed") || contains(msg, "constraint failed: UNIQUE")
+}
+
+func contains(s, needle string) bool {
+	return len(needle) > 0 && len(s) >= len(needle) && stringIndex(s, needle) >= 0
+}
+
+// stringIndex avoids importing strings into this file just for one call.
+func stringIndex(s, needle string) int {
+	n := len(needle)
+	for i := 0; i+n <= len(s); i++ {
+		if s[i:i+n] == needle {
+			return i
+		}
+	}
+	return -1
 }
 
 // Decide resolves a pending approval. user is the deciding user's ID.

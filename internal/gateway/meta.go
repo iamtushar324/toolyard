@@ -25,14 +25,7 @@ func (g *Gateway) metaTools() []toolEntry {
 		InputSchema: mcp.ToolInputSchema{
 			Type:     "object",
 			Required: []string{ReasonField},
-			Properties: map[string]any{
-				ReasonField: map[string]any{
-					"type": "string", "minLength": minReasonLen, "maxLength": maxReasonLen,
-					"description": reasonPropDescription,
-				},
-				IntentField: map[string]any{
-					"type": "string", "enum": intentEnum, "description": intentPropDescription,
-				},
+			Properties: addMetaProps(map[string]any{
 				"query": map[string]any{
 					"type":        "string",
 					"description": "Substring matched (case-insensitive) against tool name and description. Empty matches all.",
@@ -47,7 +40,7 @@ func (g *Gateway) metaTools() []toolEntry {
 					"maximum":     200,
 					"description": "Max results (default 50).",
 				},
-			},
+			}),
 		},
 	}
 
@@ -57,14 +50,7 @@ func (g *Gateway) metaTools() []toolEntry {
 		InputSchema: mcp.ToolInputSchema{
 			Type:     "object",
 			Required: []string{ReasonField, "tool"},
-			Properties: map[string]any{
-				ReasonField: map[string]any{
-					"type": "string", "minLength": minReasonLen, "maxLength": maxReasonLen,
-					"description": reasonPropDescription,
-				},
-				IntentField: map[string]any{
-					"type": "string", "enum": intentEnum, "description": intentPropDescription,
-				},
+			Properties: addMetaProps(map[string]any{
 				"tool": map[string]any{
 					"type":        "string",
 					"description": "Catalog name of the target tool (as returned by tools.search).",
@@ -73,11 +59,7 @@ func (g *Gateway) metaTools() []toolEntry {
 					"type":        "object",
 					"description": "Arguments forwarded to the target tool. _reason on the outer call propagates if not specified here.",
 				},
-				"_approval_id": map[string]any{
-					"type":        "string",
-					"description": "Optional: resume a previously deferred call.",
-				},
-			},
+			}),
 		},
 	}
 
