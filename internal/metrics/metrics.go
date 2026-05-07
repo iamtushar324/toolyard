@@ -414,6 +414,10 @@ type ToolRow struct {
 }
 
 // Tools returns one row per tool seen in the range, sorted by call count desc.
+//
+// The aggregation cursor is fully drained before any per-tool latency
+// percentile query runs — running both nested under SetMaxOpenConns(1)
+// would deadlock waiting for the outer cursor to release the connection.
 func (r *Reader) Tools(ctx context.Context, rg Range) ([]ToolRow, error) {
 	from, to := rg.bounds()
 	rows, err := r.db.QueryContext(ctx, `SELECT
@@ -432,13 +436,13 @@ func (r *Reader) Tools(ctx context.Context, rg Range) ([]ToolRow, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
 	var out []ToolRow
 	for rows.Next() {
 		var t ToolRow
 		var totalDecided, okApprovals int64
 		if err := rows.Scan(&t.ToolName, &t.Upstream, &t.Calls, &t.Errors, &t.DistinctAgents,
 			&okApprovals, &totalDecided, &t.BytesIn, &t.BytesOut, &t.LastSeen); err != nil {
+			rows.Close()
 			return nil, err
 		}
 		if t.Calls > 0 {
@@ -447,10 +451,17 @@ func (r *Reader) Tools(ctx context.Context, rg Range) ([]ToolRow, error) {
 		if totalDecided > 0 {
 			t.ApprovalRatio = float64(okApprovals) / float64(totalDecided)
 		}
-		t.P50LatencyMs, t.P95LatencyMs, _ = r.latencyPercentiles(ctx, t.ToolName, from, to)
 		out = append(out, t)
 	}
-	return out, rows.Err()
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, err
+	}
+	rows.Close()
+	for i := range out {
+		out[i].P50LatencyMs, out[i].P95LatencyMs, _ = r.latencyPercentiles(ctx, out[i].ToolName, from, to)
+	}
+	return out, nil
 }
 
 // AgentRow summarises one agent's behaviour for the Per-agent panel.
@@ -467,7 +478,9 @@ type AgentRow struct {
 	LastSeen       int64   `json:"last_seen"`
 }
 
-// Agents returns one row per agent seen in the range.
+// Agents returns one row per agent seen in the range. Same drain-first
+// discipline as Tools: outer aggregation cursor closes before per-agent
+// latency queries run.
 func (r *Reader) Agents(ctx context.Context, rg Range) ([]AgentRow, error) {
 	from, to := rg.bounds()
 	rows, err := r.db.QueryContext(ctx, `SELECT
@@ -485,13 +498,13 @@ func (r *Reader) Agents(ctx context.Context, rg Range) ([]AgentRow, error) {
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
 	var out []AgentRow
 	for rows.Next() {
 		var a AgentRow
 		var totalDecided, okApprovals int64
 		if err := rows.Scan(&a.AgentID, &a.AgentName, &a.Calls, &a.Errors, &a.DistinctTools,
 			&a.WriteCalls, &okApprovals, &totalDecided, &a.LastSeen); err != nil {
+			rows.Close()
 			return nil, err
 		}
 		if a.Calls > 0 {
@@ -500,10 +513,17 @@ func (r *Reader) Agents(ctx context.Context, rg Range) ([]AgentRow, error) {
 		if totalDecided > 0 {
 			a.ApprovalRatio = float64(okApprovals) / float64(totalDecided)
 		}
-		a.P95LatencyMs = r.agentP95(ctx, a.AgentID, from, to)
 		out = append(out, a)
 	}
-	return out, rows.Err()
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, err
+	}
+	rows.Close()
+	for i := range out {
+		out[i].P95LatencyMs = r.agentP95(ctx, out[i].AgentID, from, to)
+	}
+	return out, nil
 }
 
 // FingerprintStat is the per-(fingerprint, agent) summary used by the auto-
@@ -863,6 +883,95 @@ func (r *Reader) PurgeAgent(ctx context.Context, agentID string) error {
 		return err
 	}
 	return nil
+}
+
+// ExportCSV streams a CSV dump of call_events in the supplied range to w.
+// One header row, then one data row per event. Memory usage is O(1) — we
+// stream straight from the cursor.
+func (r *Reader) ExportCSV(ctx context.Context, w interface{ Write(p []byte) (int, error) }, rg Range) error {
+	from, to := rg.bounds()
+	rows, err := r.db.QueryContext(ctx, `SELECT
+        event_id, ts, COALESCE(agent_id,''), COALESCE(agent_name,''),
+        upstream, short_name, tool_name,
+        is_write, is_destructive, pinned_tool,
+        COALESCE(via,''), COALESCE(surface_mode,''),
+        COALESCE(fingerprint,''), COALESCE(args_size_bytes,0),
+        COALESCE(reason_text,''), COALESCE(reason_len,0), COALESCE(reason_quality,0),
+        COALESCE(approval_id,''), COALESCE(approval_outcome,''),
+        COALESCE(approval_latency_ms,0), COALESCE(approval_via,''),
+        outcome, COALESCE(error_class,''), COALESCE(total_latency_ms,0),
+        COALESCE(result_size_bytes,0)
+        FROM call_events WHERE ts >= ? AND ts < ? ORDER BY ts ASC`, from, to)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	header := "event_id,ts,agent_id,agent_name,upstream,short_name,tool_name," +
+		"is_write,is_destructive,pinned_tool,via,surface_mode,fingerprint," +
+		"args_size_bytes,reason_text,reason_len,reason_quality,approval_id," +
+		"approval_outcome,approval_latency_ms,approval_via,outcome,error_class," +
+		"total_latency_ms,result_size_bytes\n"
+	if _, err := w.Write([]byte(header)); err != nil {
+		return err
+	}
+	for rows.Next() {
+		var (
+			eventID, ts                                                        int64
+			agentID, agentName, upstream, shortName, toolName                  string
+			isWrite, isDestructive, pinned                                     int
+			via, surfaceMode, fp                                               string
+			argsSize                                                           int
+			reason                                                             string
+			reasonLen                                                          int
+			reasonQuality                                                      float64
+			approvalID, approvalOutcome                                         string
+			approvalLatency                                                    int
+			approvalVia                                                        string
+			outcome, errClass                                                  string
+			totalLatency, resultSize                                           int
+		)
+		if err := rows.Scan(&eventID, &ts, &agentID, &agentName, &upstream, &shortName, &toolName,
+			&isWrite, &isDestructive, &pinned, &via, &surfaceMode, &fp, &argsSize,
+			&reason, &reasonLen, &reasonQuality, &approvalID, &approvalOutcome,
+			&approvalLatency, &approvalVia, &outcome, &errClass, &totalLatency, &resultSize); err != nil {
+			return err
+		}
+		fields := []string{
+			fmt.Sprintf("%d", eventID), fmt.Sprintf("%d", ts), agentID, agentName,
+			upstream, shortName, toolName,
+			fmt.Sprintf("%d", isWrite), fmt.Sprintf("%d", isDestructive), fmt.Sprintf("%d", pinned),
+			via, surfaceMode, fp, fmt.Sprintf("%d", argsSize),
+			reason, fmt.Sprintf("%d", reasonLen), fmt.Sprintf("%.3f", reasonQuality),
+			approvalID, approvalOutcome, fmt.Sprintf("%d", approvalLatency), approvalVia,
+			outcome, errClass, fmt.Sprintf("%d", totalLatency), fmt.Sprintf("%d", resultSize),
+		}
+		if _, err := w.Write([]byte(csvEscape(fields))); err != nil {
+			return err
+		}
+	}
+	return rows.Err()
+}
+
+// csvEscape returns a CSV row terminated with \n. Fields containing comma,
+// double-quote, or newline are wrapped in quotes with internal quotes
+// doubled.
+func csvEscape(fields []string) string {
+	var b strings.Builder
+	for i, f := range fields {
+		if i > 0 {
+			b.WriteByte(',')
+		}
+		needsQuote := strings.ContainsAny(f, ",\"\n\r")
+		if !needsQuote {
+			b.WriteString(f)
+			continue
+		}
+		b.WriteByte('"')
+		b.WriteString(strings.ReplaceAll(f, `"`, `""`))
+		b.WriteByte('"')
+	}
+	b.WriteByte('\n')
+	return b.String()
 }
 
 // PurgeOlderThan deletes call_events rows older than `before`. Returns the

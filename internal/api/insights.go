@@ -300,6 +300,27 @@ func (s *Server) autoRulesItem(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
+// insightsExport streams a CSV dump of call_events for the supplied range.
+// CSV is the universal interchange format — DuckDB / pandas / SQLite all
+// load it without coercion.
+func (s *Server) insightsExport(w http.ResponseWriter, r *http.Request) {
+	if _, err := s.requireUser(r); err != nil {
+		writeError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+	if s.metrics == nil {
+		writeError(w, http.StatusServiceUnavailable, "metrics not wired")
+		return
+	}
+	rg := rangeFromQuery(r)
+	w.Header().Set("Content-Type", "text/csv; charset=utf-8")
+	w.Header().Set("Content-Disposition", `attachment; filename="toolyard-call-events.csv"`)
+	if err := s.metrics.ExportCSV(r.Context(), w, rg); err != nil {
+		// Headers may already be written; just log and bail.
+		return
+	}
+}
+
 // insightsPurgeAgent removes all metrics rows for the named agent. Privacy
 // "forget this agent" affordance.
 func (s *Server) insightsPurgeAgent(w http.ResponseWriter, r *http.Request) {

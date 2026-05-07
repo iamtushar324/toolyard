@@ -153,6 +153,7 @@ func (s *Server) Routes(mux *http.ServeMux) {
 	mux.HandleFunc("/v1/insights/auto/rules", s.autoRulesCollection)
 	mux.HandleFunc("/v1/insights/auto/rules/", s.autoRulesItem)
 	mux.HandleFunc("/v1/insights/purge-agent", s.insightsPurgeAgent)
+	mux.HandleFunc("/v1/insights/export", s.insightsExport)
 }
 
 // ---- helpers ----------------------------------------------------------------

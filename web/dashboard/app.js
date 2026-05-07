@@ -27,6 +27,16 @@ const state = {
     result: null,      // last call result/error
     running: false,
   },
+  insights: {
+    range: '7d',
+    overview: null,
+    tools: [],
+    agents: [],
+    cost: { rows: [], input_usd_per_m: 0, output_usd_per_m: 0 },
+    autoRules: [],
+    loading: false,
+  },
+  anomalies: [],
   enrollment: null,
   errors: {},
   notice: '',
@@ -177,6 +187,30 @@ function handleApprovalEvent(req) {
 function handleAuditEvent(ev) {
   state.audit.unshift(ev);
   if (state.audit.length > 200) state.audit.length = 200;
+  render();
+}
+
+async function loadInsights() {
+  state.insights.loading = true;
+  render();
+  const range = state.insights.range;
+  try {
+    const [overview, tools, agents, cost, rules, anomalies] = await Promise.all([
+      api('/v1/insights/overview?range=' + range).catch(() => null),
+      api('/v1/insights/tools?range=' + range).catch(() => []),
+      api('/v1/insights/agents?range=' + range).catch(() => []),
+      api('/v1/insights/cost?range=' + range).catch(() => ({ rows: [] })),
+      api('/v1/insights/auto/rules').catch(() => []),
+      api('/v1/insights/anomalies?limit=50').catch(() => []),
+    ]);
+    state.insights.overview = overview;
+    state.insights.tools = tools || [];
+    state.insights.agents = agents || [];
+    state.insights.cost = cost || { rows: [] };
+    state.insights.autoRules = rules || [];
+    state.anomalies = anomalies || [];
+  } catch (e) { toast(e.message, 'error'); }
+  state.insights.loading = false;
   render();
 }
 
@@ -1370,11 +1404,265 @@ function urlBase64ToUint8Array(b64) {
   return out;
 }
 
+// ---- insights view ---------------------------------------------------------
+
+function viewInsights() {
+  const ranges = ['1h', '24h', '7d', '30d', '90d'];
+  const o = state.insights.overview || {};
+  const cardNum = (label, value, sub) => el('div', {
+    style: 'background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 10px 12px; flex: 1; min-width: 120px;',
+  },
+    el('div', { class: 'meta', style: 'font-size: 11px; text-transform: uppercase;' }, label),
+    el('div', { style: 'font-size: 22px; font-weight: 600; margin-top: 2px;' }, String(value)),
+    sub ? el('div', { class: 'meta', style: 'font-size: 11px;' }, sub) : null,
+  );
+  const fmtNum = (n) => (n == null ? '0' : Number(n).toLocaleString());
+  const pct = (x) => (x == null ? '0%' : (Number(x) * 100).toFixed(1) + '%');
+  const ms = (n) => (n == null || n === 0 ? '–' : n + 'ms');
+
+  const rangePicker = el('div', { class: 'row' },
+    el('span', { class: 'meta', style: 'margin-right: 4px;' }, 'Range'),
+    ranges.map((r) => el('button', {
+      class: state.insights.range === r ? 'primary' : '',
+      on: { click: () => { state.insights.range = r; loadInsights(); }},
+    }, r)),
+  );
+
+  const overviewCard = el('div', { class: 'card' },
+    el('div', { class: 'row', style: 'justify-content: space-between; align-items: center;' },
+      el('h2', { style: 'margin: 0;' }, 'Overview'),
+      rangePicker,
+    ),
+    el('div', { class: 'row', style: 'gap: 10px; margin-top: 12px; flex-wrap: wrap;' },
+      cardNum('Calls', fmtNum(o.calls), o.distinct_agents != null ? `${o.distinct_agents} agents` : ''),
+      cardNum('Errors', fmtNum(o.errors), pct(o.error_rate) + ' rate'),
+      cardNum('Writes', fmtNum(o.write_calls), 'gated by approval'),
+      cardNum('Approvals', fmtNum(o.approvals), 'human-decided'),
+      cardNum('Auto', fmtNum(o.auto_approvals), 'auto-decided'),
+      cardNum('Denials', fmtNum(o.denials)),
+      cardNum('p50', ms(o.p50_latency_ms), 'p95 ' + ms(o.p95_latency_ms)),
+      cardNum('Tools', fmtNum(o.distinct_tools), 'distinct'),
+    ),
+  );
+
+  // Tool table
+  const toolRows = (state.insights.tools || []).map((t) =>
+    el('tr', {},
+      el('td', {}, el('code', {}, t.tool_name)),
+      el('td', {}, t.upstream),
+      el('td', {}, fmtNum(t.calls)),
+      el('td', {}, t.distinct_agents),
+      el('td', { style: t.error_rate > 0.1 ? 'color: var(--danger);' : '' }, pct(t.error_rate)),
+      el('td', {}, t.approval_ratio ? pct(t.approval_ratio) : '–'),
+      el('td', {}, ms(t.p50_latency_ms) + ' / ' + ms(t.p95_latency_ms)),
+      el('td', {}, relTime(t.last_seen)),
+    ),
+  );
+  const toolCard = el('div', { class: 'card' },
+    el('h2', {}, 'Tools'),
+    state.insights.tools.length === 0
+      ? el('div', { class: 'empty' }, 'No tool calls in this range yet.')
+      : el('table', {},
+        el('thead', {}, el('tr', {},
+          el('th', {}, 'Tool'), el('th', {}, 'Upstream'), el('th', {}, 'Calls'),
+          el('th', {}, 'Agents'), el('th', {}, 'Err %'), el('th', {}, 'Approval %'),
+          el('th', {}, 'p50 / p95'), el('th', {}, 'Last seen'),
+        )),
+        el('tbody', {}, ...toolRows),
+      ),
+  );
+
+  // Agents
+  const agentRows = (state.insights.agents || []).map((a) => {
+    const idShort = a.agent_id ? a.agent_id.slice(0, 12) : '(anonymous)';
+    return el('tr', {},
+      el('td', {}, el('code', {}, idShort), a.agent_name ? el('div', { class: 'meta' }, a.agent_name) : null),
+      el('td', {}, fmtNum(a.calls)),
+      el('td', {}, a.distinct_tools),
+      el('td', { style: a.error_rate > 0.1 ? 'color: var(--danger);' : '' }, pct(a.error_rate)),
+      el('td', {}, fmtNum(a.write_calls)),
+      el('td', {}, a.approval_ratio ? pct(a.approval_ratio) : '–'),
+      el('td', {}, ms(a.p95_latency_ms)),
+      el('td', {}, relTime(a.last_seen)),
+      el('td', {},
+        a.agent_id ? el('button', { class: 'danger', on: { click: () => purgeAgent(a.agent_id) }}, 'Forget') : null,
+      ),
+    );
+  });
+  const agentCard = el('div', { class: 'card' },
+    el('h2', {}, 'Agents'),
+    state.insights.agents.length === 0
+      ? el('div', { class: 'empty' }, 'No agent activity in this range yet.')
+      : el('table', {},
+        el('thead', {}, el('tr', {},
+          el('th', {}, 'Agent'), el('th', {}, 'Calls'), el('th', {}, 'Tools'),
+          el('th', {}, 'Err %'), el('th', {}, 'Writes'), el('th', {}, 'Appr %'),
+          el('th', {}, 'p95'), el('th', {}, 'Last seen'), el('th', {}, ''),
+        )),
+        el('tbody', {}, ...agentRows),
+      ),
+  );
+
+  // Auto-approval rules — split into active + suggested.
+  const rules = state.insights.autoRules || [];
+  const active = rules.filter((r) => r.enabled);
+  const suggested = rules.filter((r) => !r.enabled && r.source === 'proposer');
+
+  const ruleSummary = (r) => {
+    const parts = [];
+    if (r.kind) parts.push(r.kind);
+    if (r.tool_name) parts.push('tool=' + r.tool_name);
+    if (r.agent_id) parts.push('agent=' + r.agent_id.slice(0, 10));
+    if (r.fingerprint) parts.push('fp=' + r.fingerprint.slice(0, 8));
+    return parts.join(' · ');
+  };
+  const rationale = (r) => {
+    if (!r.rationale_json) return null;
+    let parsed; try { parsed = JSON.parse(r.rationale_json); } catch { return null; }
+    if (!parsed) return null;
+    const bits = [];
+    if (parsed.approved != null) bits.push(parsed.approved + ' approved');
+    if (parsed.denied != null) bits.push(parsed.denied + ' denied');
+    if (parsed.calls != null) bits.push(parsed.calls + ' calls');
+    if (parsed.approval_ratio != null) bits.push(pct(parsed.approval_ratio) + ' approval rate');
+    if (parsed.window_days != null) bits.push('window ' + parsed.window_days + 'd');
+    return bits.join(' · ');
+  };
+
+  const enabled = !!(state.settings.auto_approval_enabled);
+  const autoCard = el('div', { class: 'card' },
+    el('div', { class: 'row', style: 'justify-content: space-between;' },
+      el('h2', { style: 'margin: 0;' }, 'Auto-approval'),
+      el('label', { style: 'display: flex; gap: 6px; align-items: center;' },
+        el('input', { type: 'checkbox', checked: enabled, on: { change: async (e) => {
+          await api('/v1/settings', { method: 'PATCH', body: { auto_approval_enabled: e.target.checked }});
+          state.settings.auto_approval_enabled = e.target.checked;
+          toast('Auto-approval ' + (e.target.checked ? 'enabled' : 'disabled'));
+          render();
+        }}}),
+        'Enabled',
+      ),
+    ),
+    el('p', { class: 'meta' },
+      'When on, calls that match an active rule skip the human tap and decide as ',
+      el('strong', {}, 'auto'), '. Destructive tools and rules in cool-off (after a denial) are always blocked.'),
+    el('h3', { style: 'margin-top: 12px; font-size: 14px;' }, `Active rules (${active.length})`),
+    active.length === 0 ? el('div', { class: 'empty' }, 'No active rules.') :
+      el('table', {},
+        el('thead', {}, el('tr', {}, el('th', {}, 'Rule'), el('th', {}, 'Hits'), el('th', {}, 'Last hit'), el('th', {}, ''))),
+        el('tbody', {}, ...active.map((r) => el('tr', {},
+          el('td', {}, ruleSummary(r), rationale(r) ? el('div', { class: 'meta' }, rationale(r)) : null),
+          el('td', {}, r.hit_count || 0),
+          el('td', {}, relTime(r.last_hit_ts)),
+          el('td', {}, el('button', {
+            class: 'danger',
+            on: { click: async () => { await api('/v1/insights/auto/rules/' + r.id + '/disable', { method: 'POST' }); toast('Rule revoked'); loadInsights(); }},
+          }, 'Revoke')),
+        ))),
+      ),
+    el('h3', { style: 'margin-top: 16px; font-size: 14px;' }, `Suggested rules (${suggested.length})`),
+    suggested.length === 0 ? el('div', { class: 'empty' }, 'No suggestions yet — the proposer runs hourly.') :
+      el('table', {},
+        el('thead', {}, el('tr', {}, el('th', {}, 'Rule'), el('th', {}, 'Why'), el('th', {}, ''))),
+        el('tbody', {}, ...suggested.map((r) => el('tr', {},
+          el('td', {}, ruleSummary(r)),
+          el('td', {}, rationale(r) || ''),
+          el('td', {},
+            el('button', {
+              class: 'primary',
+              on: { click: async () => { await api('/v1/insights/auto/rules/' + r.id + '/enable', { method: 'POST' }); toast('Rule enabled'); loadInsights(); }},
+            }, 'Enable'),
+            ' ',
+            el('button', {
+              class: 'danger',
+              on: { click: async () => { await api('/v1/insights/auto/rules/' + r.id, { method: 'DELETE' }); toast('Dismissed'); loadInsights(); }},
+            }, 'Dismiss'),
+          ),
+        ))),
+      ),
+  );
+
+  // Cost panel
+  const costRows = state.insights.cost.rows || [];
+  const totalUsd = costRows.reduce((acc, r) => acc + (r.usd_estimated || 0), 0);
+  const costCard = el('div', { class: 'card' },
+    el('h2', {}, 'Cost (estimated)'),
+    el('p', { class: 'meta' },
+      'Token estimate: 1 token ≈ 4 bytes. Edit the per-million USD rates in Settings — they default to 0 (i.e. cost panel is dark) so we don\'t pretend to know what your stack costs.',
+    ),
+    el('div', { class: 'row', style: 'gap: 6px; margin-bottom: 8px;' },
+      el('span', { class: 'meta' }, 'Rates: input $' + state.insights.cost.input_usd_per_m + '/M · output $' + state.insights.cost.output_usd_per_m + '/M · estimated total: '),
+      el('strong', {}, '$' + totalUsd.toFixed(4)),
+    ),
+    costRows.length === 0 ? el('div', { class: 'empty' }, 'No data.') :
+      el('table', {},
+        el('thead', {}, el('tr', {}, el('th', {}, 'Tool'), el('th', {}, 'Tokens in'), el('th', {}, 'Tokens out'), el('th', {}, 'USD'))),
+        el('tbody', {}, ...costRows.slice(0, 30).map((r) => el('tr', {},
+          el('td', {}, el('code', {}, r.tool_name)),
+          el('td', {}, fmtNum(r.tokens_in)),
+          el('td', {}, fmtNum(r.tokens_out)),
+          el('td', {}, '$' + r.usd_estimated.toFixed(4)),
+        ))),
+      ),
+    el('div', { class: 'row', style: 'margin-top: 8px;' },
+      el('a', { href: '/v1/insights/export?range=' + state.insights.range, target: '_blank' }, 'Download CSV (range)'),
+    ),
+  );
+
+  return el('div', {},
+    overviewCard,
+    toolCard,
+    agentCard,
+    autoCard,
+    costCard,
+  );
+}
+
+async function purgeAgent(agentID) {
+  if (!confirm('Permanently delete all metrics for ' + agentID + '? This cannot be undone.')) return;
+  try {
+    await api('/v1/insights/purge-agent', { method: 'POST', body: { agent_id: agentID }});
+    toast('Purged.');
+    loadInsights();
+  } catch (e) { toast(e.message, 'error'); }
+}
+
+function viewNotifications() {
+  const items = state.anomalies || [];
+  const sevColor = (s) => s === 'crit' ? 'var(--danger)' : s === 'warn' ? 'var(--warn)' : 'var(--muted)';
+  return el('div', {},
+    el('div', { class: 'card' },
+      el('h2', {}, 'Notifications'),
+      el('p', { class: 'meta' }, 'Anomalies surfaced by the detector — rate spikes, error spikes, oversized arguments, repeated reasons. Dismissing only hides the row; the underlying calls remain in the audit log.'),
+      items.length === 0 ? el('div', { class: 'empty' }, 'Nothing to report.') :
+        el('table', {},
+          el('thead', {}, el('tr', {},
+            el('th', {}, 'When'), el('th', {}, 'Kind'), el('th', {}, 'Subject'),
+            el('th', {}, 'Summary'), el('th', {}, ''),
+          )),
+          el('tbody', {}, ...items.map((a) => el('tr', {},
+            el('td', {}, relTime(a.ts)),
+            el('td', { style: 'color: ' + sevColor(a.severity) + ';' }, a.kind),
+            el('td', {}, [a.agent_id ? el('div', {}, el('code', {}, (a.agent_id || '').slice(0, 12))) : null,
+                          a.tool_name ? el('div', {}, el('code', {}, a.tool_name)) : null]),
+            el('td', {}, a.summary),
+            el('td', {}, el('button', {
+              on: { click: async () => { await api('/v1/insights/anomalies/' + a.id + '/dismiss', { method: 'POST' }); loadInsights(); }},
+            }, 'Dismiss')),
+          ))),
+        ),
+    ),
+  );
+}
+
 // ---- shell -----------------------------------------------------------------
 
 function navigate(route) {
   state.route = route;
   history.replaceState(null, '', '#' + route);
+  if ((route === 'insights' || route === 'notifications') && !state.insights.loading) {
+    loadInsights();
+  }
   render();
 }
 
@@ -1387,13 +1675,15 @@ function shell(content) {
     el('header', {},
       el('div', { class: 'brand' }, el('span', { class: 'dot' }), 'toolyard'),
       el('nav', {},
-        navBtn('approvals', 'Approvals'),
-        navBtn('audit',     'Audit'),
-        navBtn('servers',   'Servers'),
-        navBtn('tools',     'Tools'),
-        navBtn('memory',    'Memory'),
-        navBtn('agents',    'Agents'),
-        navBtn('settings',  'Settings'),
+        navBtn('approvals',    'Approvals'),
+        navBtn('insights',     'Insights'),
+        navBtn('notifications', 'Alerts' + (state.anomalies && state.anomalies.length ? ' (' + state.anomalies.length + ')' : '')),
+        navBtn('audit',        'Audit'),
+        navBtn('servers',      'Servers'),
+        navBtn('tools',        'Tools'),
+        navBtn('memory',       'Memory'),
+        navBtn('agents',       'Agents'),
+        navBtn('settings',     'Settings'),
       ),
       el('span', { class: 'user' },
         el('span', { class: 'stream-pill ' + (state.streamLive ? 'live' : '') }),
@@ -1416,13 +1706,15 @@ function render() {
   if (!state.user) { root.appendChild(viewLogin()); return; }
   let body;
   switch (state.route) {
-    case 'audit':    body = viewAudit();    break;
-    case 'memory':   body = viewMemory();   break;
-    case 'agents':   body = viewAgents();   break;
-    case 'servers':  body = viewServers();  break;
-    case 'tools':    body = viewTools();    break;
-    case 'settings': body = viewSettings(); break;
-    default:         body = viewApprovals();
+    case 'audit':         body = viewAudit();         break;
+    case 'memory':        body = viewMemory();        break;
+    case 'agents':        body = viewAgents();        break;
+    case 'servers':       body = viewServers();       break;
+    case 'tools':         body = viewTools();         break;
+    case 'settings':      body = viewSettings();      break;
+    case 'insights':      body = viewInsights();      break;
+    case 'notifications': body = viewNotifications(); break;
+    default:              body = viewApprovals();
   }
   root.appendChild(shell(body));
 }
@@ -1433,6 +1725,14 @@ function render() {
   }
   if (location.hash) state.route = location.hash.slice(1) || 'approvals';
   await refreshUser();
-  if (state.user) { await loadAll(); startStream(); }
+  if (state.user) {
+    await loadAll(); startStream();
+    if (state.route === 'insights' || state.route === 'notifications') {
+      loadInsights();
+    } else {
+      // Fetch anomaly count for the navbar badge in the background.
+      api('/v1/insights/anomalies?limit=50').then((a) => { state.anomalies = a || []; render(); }).catch(() => {});
+    }
+  }
   render();
 })();

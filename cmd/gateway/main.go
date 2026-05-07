@@ -194,6 +194,14 @@ func runServe(argv []string) error {
 	bus.SetAutoApprover(autoApprover)
 	go autoApprover.RunProposer(ctx, time.Hour)
 
+	// Background analytics jobs: anomaly detection, reason quality
+	// scoring, retention compaction. All best-effort — failures log and
+	// continue.
+	zScore := settingsSvc.GetFloat(settings.AnomalyRateZScore, 3)
+	go metrics.NewAnomalyDetector(metricsReader, zScore).RunForever(ctx)
+	go runReasonScorer(ctx, metricsReader)
+	go runRetentionCompactor(ctx, metricsReader, settingsSvc)
+
 	gw := gateway.New(gateway.Options{
 		Name:       "toolyard",
 		Version:    version,
@@ -444,6 +452,56 @@ func importUpstreams(ctx context.Context, svc *upstreams.Service, path string) e
 		log.Printf("upstream %s: imported and connected", c.Name)
 	}
 	return nil
+}
+
+// runReasonScorer runs the reason-quality scorer every 10 minutes, scoring
+// rows whose reason_quality is still NULL. Cheap — nothing else to do.
+func runReasonScorer(ctx context.Context, r *metrics.Reader) {
+	t := time.NewTicker(10 * time.Minute)
+	defer t.Stop()
+	// First pass at startup so existing rows get scored.
+	if err := r.ScoreReasons(ctx, time.Now().Add(-24*time.Hour)); err != nil {
+		log.Printf("reason scorer (initial): %v", err)
+	}
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			if err := r.ScoreReasons(ctx, time.Now().Add(-24*time.Hour)); err != nil {
+				log.Printf("reason scorer: %v", err)
+			}
+		}
+	}
+}
+
+// runRetentionCompactor wakes daily and removes call_events older than the
+// configured retention window. This keeps the metrics DB from growing
+// unboundedly while still leaving plenty of history for analytics.
+func runRetentionCompactor(ctx context.Context, r *metrics.Reader, set *settings.Service) {
+	t := time.NewTicker(24 * time.Hour)
+	defer t.Stop()
+	step := func() {
+		days := set.GetInt(settings.MetricsRetentionDays, 90)
+		if days <= 0 {
+			return
+		}
+		before := time.Now().Add(-time.Duration(days) * 24 * time.Hour)
+		if n, err := r.PurgeOlderThan(ctx, before); err != nil {
+			log.Printf("retention compactor: %v", err)
+		} else if n > 0 {
+			log.Printf("retention compactor: purged %d rows older than %s", n, before.Format(time.RFC3339))
+		}
+	}
+	step()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			step()
+		}
+	}
 }
 
 // loadOrCreateSessionKey persists a 32-byte HMAC key in <data-dir>/session.key
