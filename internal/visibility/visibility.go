@@ -82,6 +82,12 @@ func (p *Provider) List(ctx context.Context, tools []mcp.Tool) []mcp.Tool {
 	return out
 }
 
+// SurfaceMode reports the active surface_mode value, used by the gateway to
+// tag metrics rows with which mode was in effect when the call was routed.
+func (p *Provider) SurfaceMode(ctx context.Context) string {
+	return p.surfaceMode()
+}
+
 // IsVisible answers the cheap per-tool gating used for direct calls.
 func (p *Provider) IsVisible(ctx context.Context, toolName string) bool {
 	if gateway.IsPinned(toolName) {

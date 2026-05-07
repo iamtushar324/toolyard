@@ -1,0 +1,330 @@
+package api
+
+import (
+	"net/http"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/tusharbhardwaj/toolyard/internal/autoapproval"
+	"github.com/tusharbhardwaj/toolyard/internal/metrics"
+	"github.com/tusharbhardwaj/toolyard/internal/settings"
+)
+
+// rangeFromQuery parses a ?range=24h|7d|30d|90d query into a metrics.Range.
+// Defaults to 7d. We deliberately keep the set tiny so the dashboard can
+// render time-pickers as a fixed segmented control.
+func rangeFromQuery(r *http.Request) metrics.Range {
+	q := strings.ToLower(r.URL.Query().Get("range"))
+	now := time.Now()
+	switch q {
+	case "1h", "60m":
+		return metrics.Range{From: now.Add(-1 * time.Hour), To: now}
+	case "24h", "1d":
+		return metrics.Range{From: now.Add(-24 * time.Hour), To: now}
+	case "30d":
+		return metrics.Range{From: now.Add(-30 * 24 * time.Hour), To: now}
+	case "90d":
+		return metrics.Range{From: now.Add(-90 * 24 * time.Hour), To: now}
+	default:
+		return metrics.Range{From: now.Add(-7 * 24 * time.Hour), To: now}
+	}
+}
+
+func (s *Server) insightsOverview(w http.ResponseWriter, r *http.Request) {
+	if _, err := s.requireUser(r); err != nil {
+		writeError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+	if s.metrics == nil {
+		writeJSON(w, http.StatusOK, map[string]any{})
+		return
+	}
+	o, err := s.metrics.Overview(r.Context(), rangeFromQuery(r))
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, o)
+}
+
+func (s *Server) insightsTools(w http.ResponseWriter, r *http.Request) {
+	if _, err := s.requireUser(r); err != nil {
+		writeError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+	if s.metrics == nil {
+		writeJSON(w, http.StatusOK, []any{})
+		return
+	}
+	rows, err := s.metrics.Tools(r.Context(), rangeFromQuery(r))
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if rows == nil {
+		rows = []metrics.ToolRow{}
+	}
+	writeJSON(w, http.StatusOK, rows)
+}
+
+func (s *Server) insightsAgents(w http.ResponseWriter, r *http.Request) {
+	if _, err := s.requireUser(r); err != nil {
+		writeError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+	if s.metrics == nil {
+		writeJSON(w, http.StatusOK, []any{})
+		return
+	}
+	rows, err := s.metrics.Agents(r.Context(), rangeFromQuery(r))
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if rows == nil {
+		rows = []metrics.AgentRow{}
+	}
+	writeJSON(w, http.StatusOK, rows)
+}
+
+// insightsAgentDetail handles /v1/insights/agents/{id} — returns the agent's
+// rollup row plus its hour-of-day heatmap for the chosen range.
+func (s *Server) insightsAgentDetail(w http.ResponseWriter, r *http.Request) {
+	if _, err := s.requireUser(r); err != nil {
+		writeError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+	id := strings.TrimPrefix(r.URL.Path, "/v1/insights/agents/")
+	if id == "" {
+		http.NotFound(w, r)
+		return
+	}
+	if s.metrics == nil {
+		writeJSON(w, http.StatusOK, map[string]any{})
+		return
+	}
+	heat, err := s.metrics.AgentHeatmap(r.Context(), id, 14)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if heat == nil {
+		heat = []metrics.HourBucket{}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"agent_id": id,
+		"heatmap":  heat,
+	})
+}
+
+func (s *Server) insightsAnomalies(w http.ResponseWriter, r *http.Request) {
+	if _, err := s.requireUser(r); err != nil {
+		writeError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+	if s.metrics == nil {
+		writeJSON(w, http.StatusOK, []any{})
+		return
+	}
+	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
+	includeDismissed := r.URL.Query().Get("include_dismissed") == "1"
+	out, err := s.metrics.Anomalies(r.Context(), limit, includeDismissed)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if out == nil {
+		out = []metrics.AnomalyEvent{}
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+// insightsAnomalyAction handles /v1/insights/anomalies/{id}/dismiss.
+func (s *Server) insightsAnomalyAction(w http.ResponseWriter, r *http.Request) {
+	if _, err := s.requireUser(r); err != nil {
+		writeError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+	tail := strings.TrimPrefix(r.URL.Path, "/v1/insights/anomalies/")
+	if !strings.HasSuffix(tail, "/dismiss") {
+		http.NotFound(w, r)
+		return
+	}
+	id := strings.TrimSuffix(tail, "/dismiss")
+	if id == "" {
+		http.NotFound(w, r)
+		return
+	}
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "POST only")
+		return
+	}
+	if s.metrics == nil {
+		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+		return
+	}
+	if err := s.metrics.DismissAnomaly(r.Context(), id); err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}
+
+func (s *Server) insightsCost(w http.ResponseWriter, r *http.Request) {
+	if _, err := s.requireUser(r); err != nil {
+		writeError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+	if s.metrics == nil {
+		writeJSON(w, http.StatusOK, []any{})
+		return
+	}
+	in, out := 0.0, 0.0
+	if s.settings != nil {
+		in = s.settings.GetFloat(settings.CostInputUsdPerM, 0)
+		out = s.settings.GetFloat(settings.CostOutputUsdPerM, 0)
+	}
+	rows, err := s.metrics.Cost(r.Context(), rangeFromQuery(r), in, out)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if rows == nil {
+		rows = []metrics.CostRow{}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"rows":            rows,
+		"input_usd_per_m":  in,
+		"output_usd_per_m": out,
+	})
+}
+
+// autoRulesCollection handles GET (list all rules) and POST (operator-created
+// static rule).
+func (s *Server) autoRulesCollection(w http.ResponseWriter, r *http.Request) {
+	if _, err := s.requireUser(r); err != nil {
+		writeError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+	if s.autoApproval == nil {
+		writeJSON(w, http.StatusOK, []any{})
+		return
+	}
+	switch r.Method {
+	case http.MethodGet:
+		out, err := s.autoApproval.List(r.Context())
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		if out == nil {
+			out = []autoapproval.Rule{}
+		}
+		writeJSON(w, http.StatusOK, out)
+	case http.MethodPost:
+		var body autoapproval.Rule
+		if err := decode(r, &body); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		if body.Kind == "" {
+			body.Kind = "static"
+		}
+		body.Source = "user"
+		body.Enabled = true
+		out, err := s.autoApproval.CreateOrUpdate(r.Context(), body)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, out)
+	default:
+		writeError(w, http.StatusMethodNotAllowed, "GET or POST")
+	}
+}
+
+// autoRulesItem handles per-rule actions: enable, disable, delete.
+//
+//	POST /v1/insights/auto/rules/{id}/enable
+//	POST /v1/insights/auto/rules/{id}/disable
+//	DELETE /v1/insights/auto/rules/{id}
+func (s *Server) autoRulesItem(w http.ResponseWriter, r *http.Request) {
+	if _, err := s.requireUser(r); err != nil {
+		writeError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+	if s.autoApproval == nil {
+		writeError(w, http.StatusServiceUnavailable, "auto-approval not wired")
+		return
+	}
+	tail := strings.TrimPrefix(r.URL.Path, "/v1/insights/auto/rules/")
+	parts := strings.SplitN(tail, "/", 2)
+	id := parts[0]
+	if id == "" {
+		http.NotFound(w, r)
+		return
+	}
+	subpath := ""
+	if len(parts) > 1 {
+		subpath = parts[1]
+	}
+	switch {
+	case subpath == "enable" && r.Method == http.MethodPost:
+		if err := s.autoApproval.Enable(r.Context(), id); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+	case subpath == "disable" && r.Method == http.MethodPost:
+		if err := s.autoApproval.Disable(r.Context(), id); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+	case subpath == "" && r.Method == http.MethodDelete:
+		if err := s.autoApproval.Delete(r.Context(), id); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+	case subpath == "" && r.Method == http.MethodGet:
+		out, err := s.autoApproval.Get(r.Context(), id)
+		if err != nil {
+			writeError(w, http.StatusNotFound, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, out)
+	default:
+		writeError(w, http.StatusMethodNotAllowed, "POST {enable,disable} or DELETE")
+	}
+}
+
+// insightsPurgeAgent removes all metrics rows for the named agent. Privacy
+// "forget this agent" affordance.
+func (s *Server) insightsPurgeAgent(w http.ResponseWriter, r *http.Request) {
+	if _, err := s.requireUser(r); err != nil {
+		writeError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "POST only")
+		return
+	}
+	if s.metrics == nil {
+		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+		return
+	}
+	var body struct {
+		AgentID string `json:"agent_id"`
+	}
+	if err := decode(r, &body); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if err := s.metrics.PurgeAgent(r.Context(), body.AgentID); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+}

@@ -54,7 +54,7 @@ func (e *Engine) Eval(req Request) Decision {
 			RuleID: "v0.1-category",
 		}
 	}
-	if isReadOnlyName(req.ToolName) {
+	if IsReadOnlyName(req.ToolName) {
 		return Decision{Action: ActionAllow, Reason: "tool name looks read-only", RuleID: "v0.1-name-heuristic"}
 	}
 	return Decision{
@@ -72,7 +72,11 @@ var readVerbs = map[string]bool{
 	"lookup": true, "query": true, "head": true, "ls": true,
 }
 
-func isReadOnlyName(name string) bool {
+// IsReadOnlyName is a name-only heuristic: returns true when the tool name's
+// first verb-segment matches one of the known read verbs. Exported so the
+// gateway can populate its is_write metric column without re-running policy
+// eval.
+func IsReadOnlyName(name string) bool {
 	low := strings.ToLower(name)
 	// Strip an upstream prefix ("github.", "linear/", ...). We deliberately
 	// do not strip on `_` because plenty of raw tool names look like

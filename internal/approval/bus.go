@@ -66,6 +66,10 @@ type Request struct {
 	ExpiresAt      int64          `json:"expires_at"`
 	Fingerprint    string         `json:"fingerprint,omitempty"`
 	Coalesced      bool           `json:"coalesced,omitempty"` // true if Hold returned an existing pending row instead of creating a new one
+	// AutoDecidedBy is the auto-approval rule id that decided this request,
+	// or empty if a human (or the rule engine wasn't consulted). Set on
+	// Status=allowed responses produced via the AutoApprover hook.
+	AutoDecidedBy  string         `json:"auto_decided_by,omitempty"`
 }
 
 // Notifier is implemented by the push and realtime services so the bus can
@@ -86,6 +90,25 @@ type pending struct {
 	done chan struct{}
 }
 
+// AutoApprover is the optional hook that decides whether a fresh approval
+// request should be auto-decided rather than queued for human review.
+// Returning a non-empty ruleID short-circuits the bus into an immediate
+// allow with decided_via="auto".
+type AutoApprover interface {
+	Match(agentID, upstream, toolName, fingerprint string, isDestructive bool) *AutoMatch
+	MarkHit(ctx context.Context, ruleID, agentID string)
+	MarkDenial(ctx context.Context, agentID, toolName, fingerprint string)
+	IsDestructive(ctx context.Context, toolName string) bool
+}
+
+// AutoMatch is the return value from AutoApprover.Match. ID is the rule's
+// stable identifier — it appears as decided_by="rule:<id>" on the resulting
+// approved approval.
+type AutoMatch struct {
+	ID   string
+	Kind string
+}
+
 type Bus struct {
 	db        *store.DB
 	signKey   ed25519.PrivateKey
@@ -96,6 +119,8 @@ type Bus struct {
 	waiters map[string]*pending // approval_id -> waiter
 
 	notifiers []Notifier
+
+	auto AutoApprover
 }
 
 func New(ctx context.Context, db *store.DB) (*Bus, error) {
@@ -125,6 +150,9 @@ func (b *Bus) SetTTL(d time.Duration) {
 // TTL returns the current approval-decision TTL.
 func (b *Bus) TTL() time.Duration { return b.ttl }
 
+// SetAutoApprover wires the auto-approval engine in. Pass nil to disable.
+func (b *Bus) SetAutoApprover(a AutoApprover) { b.auto = a }
+
 // AddNotifier registers a fan-out target. Notifiers are called with no lock
 // held so they may use blocking IO.
 func (b *Bus) AddNotifier(n Notifier) { b.notifiers = append(b.notifiers, n) }
@@ -143,6 +171,21 @@ func (b *Bus) Hold(ctx context.Context, in NewRequest, maxWait time.Duration) (*
 	req, err := b.create(ctx, in)
 	if err != nil {
 		return nil, err
+	}
+	// Auto-approval short-circuit: if a rule matches the new request, decide
+	// it in-line (status -> allowed) before any notifier sees it as pending.
+	// Coalesced rows that landed on an existing pending request are skipped
+	// — their fate is tied to the original.
+	if b.auto != nil && !req.Coalesced && req.Status == StatusPending {
+		destructive := b.auto.IsDestructive(ctx, req.ToolName)
+		if m := b.auto.Match(req.AgentID, req.UpstreamName, req.ToolName, req.Fingerprint, destructive); m != nil {
+			decided, derr := b.Decide(ctx, req.ID, StatusAllowed, "rule:"+m.ID)
+			if derr == nil && decided != nil {
+				decided.AutoDecidedBy = m.ID
+				b.auto.MarkHit(ctx, m.ID, req.AgentID)
+				return decided, nil
+			}
+		}
 	}
 	b.fanOut(ctx, req, "approval.create")
 
@@ -198,7 +241,7 @@ func (b *Bus) create(ctx context.Context, in NewRequest) (*Request, error) {
 	// (agent, upstream, tool, args) fingerprint, return it. This stops a
 	// retrying hook or a model that re-issues the same call from piling up
 	// identical approval cards on the dashboard.
-	fp := computeFingerprint(in.AgentID, in.UpstreamName, in.ToolName, in.Arguments)
+	fp := ComputeFingerprint(in.AgentID, in.UpstreamName, in.ToolName, in.Arguments)
 	if existing, err := b.findPendingByFingerprint(ctx, fp); err == nil && existing != nil {
 		existing.Coalesced = true
 		return existing, nil
@@ -242,10 +285,12 @@ func (b *Bus) create(ctx context.Context, in NewRequest) (*Request, error) {
 	return req, nil
 }
 
-// computeFingerprint is sha256(agent_id||0x1f||upstream||0x1f||tool||0x1f||canonical-args).
+// ComputeFingerprint is sha256(agent_id||0x1f||upstream||0x1f||tool||0x1f||canonical-args).
 // Canonical args are produced by sorting object keys recursively so
-// {a:1, b:2} and {b:2, a:1} hash identically.
-func computeFingerprint(agentID, upstream, tool string, args map[string]any) string {
+// {a:1, b:2} and {b:2, a:1} hash identically. Exported so other packages
+// (e.g. autoapproval, gateway) can derive the same identity without
+// reimplementing the hash.
+func ComputeFingerprint(agentID, upstream, tool string, args map[string]any) string {
 	h := sha256.New()
 	_, _ = h.Write([]byte(agentID))
 	h.Write([]byte{0x1f})
@@ -383,6 +428,10 @@ func (b *Bus) Decide(ctx context.Context, id, action, userID string) (*Request, 
 	req, err := b.Get(ctx, id)
 	if err != nil {
 		return nil, err
+	}
+	// Denials feed back into auto-approval as a cool-off signal.
+	if action == StatusDenied && b.auto != nil {
+		b.auto.MarkDenial(ctx, req.AgentID, req.ToolName, req.Fingerprint)
 	}
 	b.signal(id)
 	b.fanOut(ctx, req, "approval.decide")

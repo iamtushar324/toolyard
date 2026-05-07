@@ -33,6 +33,34 @@ const (
 	// translated into surface_mode = "router_only" / "full" and reads
 	// reflect surface_mode == "router_only".
 	RouterOnlyMode = "router_only_mode"
+
+	// AutoApprovalEnabled toggles the auto-approval engine on/off globally.
+	// Default false — the operator opts in once they're comfortable with
+	// the audit trail.
+	AutoApprovalEnabled = "auto_approval_enabled"
+	// AutoApprovalPatternMinApprovals: how many human approvals (with zero
+	// denials) of an exact (agent, fingerprint) pair are required before a
+	// pattern rule will fire. Default 10.
+	AutoApprovalPatternMinApprovals = "auto_approval_pattern_min_approvals"
+	// AutoApprovalCooloffDays: a denial of a fingerprint locks any matching
+	// auto-rule out of firing for this many days. Default 30.
+	AutoApprovalCooloffDays = "auto_approval_cooloff_days"
+	// AutoApprovalRateLimitPerHour: hard cap on auto-decisions per agent per
+	// hour. Once tripped, the bus falls back to human approvals until the
+	// hour rolls over. Default 100.
+	AutoApprovalRateLimitPerHour = "auto_approval_rate_limit_per_hour"
+
+	// MetricsRetentionDays: how many days of call_events to keep before the
+	// retention compactor purges. Default 90.
+	MetricsRetentionDays = "metrics_retention_days"
+	// AnomalyRateZScore: how many standard deviations above the trailing
+	// 7-day baseline triggers a rate_spike anomaly. Default 3.
+	AnomalyRateZScore = "anomaly_rate_z_score"
+
+	// CostInputUsdPerM: USD per 1M input tokens (default 0).
+	CostInputUsdPerM = "cost_input_usd_per_m"
+	// CostOutputUsdPerM: USD per 1M output tokens (default 0).
+	CostOutputUsdPerM = "cost_output_usd_per_m"
 )
 
 // Surface modes.
@@ -154,6 +182,21 @@ func (s *Service) SurfaceModeOrDefault() string {
 		return SurfaceRouterOnly
 	}
 	return SurfaceFull
+}
+
+// GetFloat reads a numeric setting as float64.
+func (s *Service) GetFloat(key string, fallback float64) float64 {
+	s.mu.RLock()
+	v, ok := s.cache[key]
+	s.mu.RUnlock()
+	if !ok {
+		return fallback
+	}
+	var f float64
+	if err := json.Unmarshal(v, &f); err != nil {
+		return fallback
+	}
+	return f
 }
 
 // GetBool reads a boolean setting from the in-memory cache.

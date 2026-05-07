@@ -16,6 +16,7 @@ import (
 	"github.com/tusharbhardwaj/toolyard/internal/approval"
 	"github.com/tusharbhardwaj/toolyard/internal/audit"
 	"github.com/tusharbhardwaj/toolyard/internal/memory"
+	"github.com/tusharbhardwaj/toolyard/internal/metrics"
 	"github.com/tusharbhardwaj/toolyard/internal/policy"
 	"github.com/tusharbhardwaj/toolyard/internal/realtime"
 )
@@ -75,6 +76,8 @@ type Gateway struct {
 	memory     *memory.Service
 	visibility VisibilityProvider
 	usage      UsageRecorder
+	metrics    MetricsRecorder
+	surface    SurfaceModeProvider
 	inLineWait time.Duration
 
 	mu        sync.RWMutex
@@ -109,12 +112,31 @@ type Options struct {
 	// Usage, if non-nil, has its Increment called on every call.succeeded
 	// so top-N selections reflect real usage.
 	Usage UsageRecorder
+	// Metrics, if non-nil, receives one Event per terminal call outcome.
+	// Events are recorded asynchronously so this never adds latency to
+	// the request path.
+	Metrics MetricsRecorder
+	// Surface lets the gateway tag each event with the active surface_mode
+	// so analytics can correlate visibility decisions to call counts.
+	Surface SurfaceModeProvider
 }
 
 // UsageRecorder is satisfied by *internal/usage.Service. The gateway only
 // needs Increment; we keep the surface narrow for testability.
 type UsageRecorder interface {
 	Increment(ctx context.Context, agentID, toolName string) error
+}
+
+// MetricsRecorder is satisfied by *internal/metrics.Recorder. We declare it
+// here as a small interface so test doubles don't need a DB.
+type MetricsRecorder interface {
+	Record(metrics.Event)
+}
+
+// SurfaceModeProvider returns the surface mode that was in effect when a
+// call was routed. internal/visibility implements this.
+type SurfaceModeProvider interface {
+	SurfaceMode(ctx context.Context) string
 }
 
 func New(opts Options) *Gateway {
@@ -151,6 +173,8 @@ func New(opts Options) *Gateway {
 		memory:     opts.Memory,
 		visibility: opts.Visibility,
 		usage:      opts.Usage,
+		metrics:    opts.Metrics,
+		surface:    opts.Surface,
 		inLineWait: opts.InLineWait,
 		tools:      map[string]toolEntry{},
 		upstreams:  map[string]*upstream{},
@@ -343,25 +367,77 @@ func (g *Gateway) RouteCall(ctx context.Context, viaTool, targetName string, arg
 }
 
 // routeEntry is the shared path used by both the MCP-side handler and
-// tools.execute. It assumes entry is a registered toolEntry.
-func (g *Gateway) routeEntry(ctx context.Context, entry toolEntry, args map[string]any) (*mcp.CallToolResult, error) {
+// tools.execute. It assumes entry is a registered toolEntry. The metric
+// Event captured here is emitted to the metrics sink (if any) once the
+// terminal outcome of this call is known.
+func (g *Gateway) routeEntry(ctx context.Context, entry toolEntry, args map[string]any) (res *mcp.CallToolResult, err error) {
+	started := time.Now()
+	agentID := agentIDFromContext(ctx)
+	ev := metrics.Event{
+		TS:         started.UnixMilli(),
+		AgentID:    agentID,
+		Upstream:   entry.upstream,
+		ShortName:  entry.originalName,
+		ToolName:   entry.tool.Name,
+		IsWrite:    !policy.IsReadOnlyName(entry.tool.Name),
+		PinnedTool: IsPinned(entry.tool.Name),
+		Via:        "direct",
+	}
+	if g.surface != nil {
+		ev.SurfaceMode = g.surface.SurfaceMode(ctx)
+	}
+	if g.visibility != nil {
+		v := g.visibility.IsVisible(ctx, entry.tool.Name)
+		ev.InTopN = &v
+	}
+	defer func() {
+		ev.TotalLatencyMs = int(time.Since(started).Milliseconds())
+		if ev.Outcome == "" {
+			switch {
+			case err != nil:
+				ev.Outcome = metrics.OutcomeError
+			case res != nil && res.IsError:
+				ev.Outcome = metrics.OutcomeError
+			default:
+				ev.Outcome = metrics.OutcomeOK
+			}
+		}
+		if res != nil {
+			ev.ResultSizeBytes = approxResultSize(res)
+		}
+		if g.metrics != nil {
+			g.metrics.Record(ev)
+		}
+	}()
+
 	// Deferred-resume short-circuit.
 	if approvalID, ok := args["_approval_id"].(string); ok && approvalID != "" {
-		return g.resumeDeferred(ctx, entry, approvalID)
+		ev.ApprovalID = approvalID
+		return g.resumeDeferred(ctx, entry, approvalID, &ev)
 	}
 
-	reason, intent, cleanArgs, err := extractReason(args, entry.reasonField)
-	if err != nil {
+	reason, intent, cleanArgs, rerr := extractReason(args, entry.reasonField)
+	if rerr != nil {
 		_ = g.audit.Write(ctx, audit.Event{
 			EventType:     audit.EventCallFailed,
 			UpstreamName:  entry.upstream,
 			ToolName:      entry.tool.Name,
-			ResultSummary: "rejected: " + err.Error(),
+			ResultSummary: "rejected: " + rerr.Error(),
 		})
-		return mcp.NewToolResultError(err.Error()), nil
+		ev.Outcome = metrics.OutcomeError
+		ev.ErrorClass = "schema"
+		return mcp.NewToolResultError(rerr.Error()), nil
 	}
 
-	agentID := agentIDFromContext(ctx)
+	keys, sizeBytes := metrics.ArgsShape(cleanArgs)
+	ev.ArgsTopKeys = keys
+	ev.ArgsSizeBytes = sizeBytes
+	ev.ReasonText = reason
+	ev.ReasonLen = len(reason)
+	ev.IntentCategory = intent
+	if g.approval != nil {
+		ev.Fingerprint = approval.ComputeFingerprint(agentID, entry.upstream, entry.tool.Name, cleanArgs)
+	}
 	argsJSON, _ := json.Marshal(cleanArgs)
 	_ = g.audit.Write(ctx, audit.Event{
 		EventType:    audit.EventCallStart,
@@ -391,7 +467,8 @@ func (g *Gateway) routeEntry(ctx context.Context, entry toolEntry, args map[stri
 			Decision:     string(decision.Action),
 			Reason:       reason,
 		})
-		return g.dispatch(ctx, entry, cleanArgs, agentID, reason, "")
+		ev.ApprovalOutcome = metrics.ApprovalNone
+		return g.dispatch(ctx, entry, cleanArgs, agentID, reason, "", &ev)
 	case policy.ActionDeny:
 		_ = g.audit.Write(ctx, audit.Event{
 			EventType:    audit.EventCallDenied,
@@ -401,10 +478,14 @@ func (g *Gateway) routeEntry(ctx context.Context, entry toolEntry, args map[stri
 			Decision:     string(decision.Action),
 			Reason:       reason,
 		})
+		ev.Outcome = metrics.OutcomeDenied
+		ev.ErrorClass = "policy"
 		return mcp.NewToolResultError("denied by policy: " + decision.Reason), nil
 	case policy.ActionApprove:
-		return g.holdAndWait(ctx, entry, cleanArgs, agentID, reason, intent)
+		return g.holdAndWait(ctx, entry, cleanArgs, agentID, reason, intent, &ev)
 	default:
+		ev.Outcome = metrics.OutcomeError
+		ev.ErrorClass = "policy"
 		return mcp.NewToolResultErrorf("policy returned unknown action %q", decision.Action), nil
 	}
 }
@@ -445,11 +526,12 @@ func (g *Gateway) handlerFor(toolName string) server.ToolHandlerFunc {
 }
 
 func (g *Gateway) holdAndWait(ctx context.Context, entry toolEntry, args map[string]any,
-	agentID, reason, intent string) (*mcp.CallToolResult, error) {
+	agentID, reason, intent string, ev *metrics.Event) (*mcp.CallToolResult, error) {
 
 	holdCtx, cancel := context.WithTimeout(ctx, g.inLineWait+5*time.Second)
 	defer cancel()
 
+	holdStart := time.Now()
 	req, err := g.approval.Hold(holdCtx, approval.NewRequest{
 		AgentID:        agentID,
 		UpstreamName:   entry.upstream,
@@ -459,7 +541,17 @@ func (g *Gateway) holdAndWait(ctx context.Context, entry toolEntry, args map[str
 		IntentCategory: intent,
 	}, g.inLineWait)
 	if err != nil {
+		ev.Outcome = metrics.OutcomeError
+		ev.ErrorClass = "approval"
 		return mcp.NewToolResultErrorFromErr("approval hold failed", err), nil
+	}
+	ev.ApprovalID = req.ID
+	if req.AutoDecidedBy != "" {
+		ev.ApprovalVia = "auto"
+		ev.ApprovalDecider = req.AutoDecidedBy
+	}
+	if req.Coalesced {
+		ev.CoalescedInto = req.ID
 	}
 
 	switch req.Status {
@@ -473,7 +565,13 @@ func (g *Gateway) holdAndWait(ctx context.Context, entry toolEntry, args map[str
 			ApprovalID:   req.ID,
 			Reason:       reason,
 		})
-		return g.dispatch(ctx, entry, args, agentID, reason, req.ID)
+		ev.ApprovalLatencyMs = int(time.Since(holdStart).Milliseconds())
+		if req.AutoDecidedBy != "" {
+			ev.ApprovalOutcome = metrics.ApprovalAuto
+		} else {
+			ev.ApprovalOutcome = metrics.ApprovalApproved
+		}
+		return g.dispatch(ctx, entry, args, agentID, reason, req.ID, ev)
 	case approval.StatusDenied:
 		_ = g.audit.Write(ctx, audit.Event{
 			EventType:    audit.EventCallDenied,
@@ -484,18 +582,26 @@ func (g *Gateway) holdAndWait(ctx context.Context, entry toolEntry, args map[str
 			ApprovalID:   req.ID,
 			Reason:       reason,
 		})
+		ev.ApprovalOutcome = metrics.ApprovalDenied
+		ev.ApprovalLatencyMs = int(time.Since(holdStart).Milliseconds())
+		ev.Outcome = metrics.OutcomeDenied
 		return mcp.NewToolResultError("denied by human reviewer"), nil
 	case approval.StatusExpired:
+		ev.ApprovalOutcome = metrics.ApprovalExpired
+		ev.Outcome = metrics.OutcomeExpired
 		return mcp.NewToolResultError("approval window expired without a decision"), nil
 	default:
 		// Still pending after in-line window — return deferred response.
+		ev.Outcome = metrics.OutcomeDeferred
 		return deferredResponse(req), nil
 	}
 }
 
-func (g *Gateway) resumeDeferred(ctx context.Context, entry toolEntry, approvalID string) (*mcp.CallToolResult, error) {
+func (g *Gateway) resumeDeferred(ctx context.Context, entry toolEntry, approvalID string, ev *metrics.Event) (*mcp.CallToolResult, error) {
 	req, err := g.approval.Get(ctx, approvalID)
 	if err != nil {
+		ev.Outcome = metrics.OutcomeError
+		ev.ErrorClass = "approval"
 		return mcp.NewToolResultErrorf("unknown approval %q", approvalID), nil
 	}
 	if req.Status == approval.StatusPending {
@@ -509,23 +615,41 @@ func (g *Gateway) resumeDeferred(ctx context.Context, entry toolEntry, approvalI
 		}
 		req, err = g.approval.Get(ctx, approvalID)
 		if err != nil {
+			ev.Outcome = metrics.OutcomeError
+			ev.ErrorClass = "approval"
 			return mcp.NewToolResultErrorFromErr("approval lookup", err), nil
 		}
 	}
+	ev.Fingerprint = req.Fingerprint
+	ev.ReasonText = req.Reason
+	ev.ReasonLen = len(req.Reason)
 	switch req.Status {
 	case approval.StatusAllowed:
-		return g.dispatch(ctx, entry, req.Arguments, req.AgentID, req.Reason, req.ID)
+		if req.AutoDecidedBy != "" {
+			ev.ApprovalOutcome = metrics.ApprovalAuto
+			ev.ApprovalVia = "auto"
+			ev.ApprovalDecider = req.AutoDecidedBy
+		} else {
+			ev.ApprovalOutcome = metrics.ApprovalApproved
+		}
+		ev.ApprovalLatencyMs = int(time.Now().UnixMilli() - req.CreatedAt)
+		return g.dispatch(ctx, entry, req.Arguments, req.AgentID, req.Reason, req.ID, ev)
 	case approval.StatusDenied:
+		ev.ApprovalOutcome = metrics.ApprovalDenied
+		ev.Outcome = metrics.OutcomeDenied
 		return mcp.NewToolResultError("denied by human reviewer"), nil
 	case approval.StatusExpired:
+		ev.ApprovalOutcome = metrics.ApprovalExpired
+		ev.Outcome = metrics.OutcomeExpired
 		return mcp.NewToolResultError("approval window expired without a decision"), nil
 	default:
+		ev.Outcome = metrics.OutcomeDeferred
 		return deferredResponse(req), nil
 	}
 }
 
 func (g *Gateway) dispatch(ctx context.Context, entry toolEntry, args map[string]any,
-	agentID, reason, approvalID string) (*mcp.CallToolResult, error) {
+	agentID, reason, approvalID string, ev *metrics.Event) (*mcp.CallToolResult, error) {
 
 	if entry.handle == nil {
 		// Upstream-backed tool — route through the upstream pool.
@@ -533,13 +657,17 @@ func (g *Gateway) dispatch(ctx context.Context, entry toolEntry, args map[string
 		u := g.upstreams[entry.upstream]
 		g.mu.RUnlock()
 		if u == nil {
+			ev.Outcome = metrics.OutcomeError
+			ev.ErrorClass = "upstream_not_connected"
 			return mcp.NewToolResultErrorf("upstream %q not connected", entry.upstream), nil
 		}
 		entry.handle = func(ctx context.Context, args map[string]any) (*mcp.CallToolResult, error) {
 			return u.callTool(ctx, entry.originalName, args)
 		}
 	}
+	upstreamStart := time.Now()
 	res, err := entry.handle(ctx, args)
+	ev.UpstreamLatencyMs = int(time.Since(upstreamStart).Milliseconds())
 	if err != nil {
 		_ = g.audit.Write(ctx, audit.Event{
 			EventType:    audit.EventCallFailed,
@@ -550,6 +678,8 @@ func (g *Gateway) dispatch(ctx context.Context, entry toolEntry, args map[string
 			ApprovalID:   approvalID,
 			ResultSummary: err.Error(),
 		})
+		ev.Outcome = metrics.OutcomeError
+		ev.ErrorClass = "upstream"
 		return mcp.NewToolResultErrorFromErr("tool failed", err), nil
 	}
 	_ = g.audit.Write(ctx, audit.Event{
@@ -568,7 +698,31 @@ func (g *Gateway) dispatch(ctx context.Context, entry toolEntry, args map[string
 		// short-circuited above.
 		_ = g.usage.Increment(ctx, agentID, entry.tool.Name)
 	}
+	if res.IsError {
+		ev.Outcome = metrics.OutcomeError
+		if ev.ErrorClass == "" {
+			ev.ErrorClass = "tool"
+		}
+	}
 	return res, nil
+}
+
+// approxResultSize estimates the byte size of a tool result for the cost
+// panel and args-shape analysis. It walks text content and adds raw lengths;
+// non-text content contributes a flat 64-byte fudge.
+func approxResultSize(res *mcp.CallToolResult) int {
+	if res == nil {
+		return 0
+	}
+	n := 0
+	for _, c := range res.Content {
+		if t, ok := mcp.AsTextContent(c); ok {
+			n += len(t.Text)
+		} else {
+			n += 64
+		}
+	}
+	return n
 }
 
 // deferredResponse formats the "approval pending — retry with _approval_id"

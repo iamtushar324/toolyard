@@ -41,10 +41,12 @@ import (
 
 	"github.com/tusharbhardwaj/toolyard/internal/approval"
 	"github.com/tusharbhardwaj/toolyard/internal/audit"
+	"github.com/tusharbhardwaj/toolyard/internal/autoapproval"
 	"github.com/tusharbhardwaj/toolyard/internal/gateway"
 	"github.com/tusharbhardwaj/toolyard/internal/identity"
 	"github.com/tusharbhardwaj/toolyard/internal/marketplace"
 	"github.com/tusharbhardwaj/toolyard/internal/memory"
+	"github.com/tusharbhardwaj/toolyard/internal/metrics"
 	"github.com/tusharbhardwaj/toolyard/internal/push"
 	"github.com/tusharbhardwaj/toolyard/internal/realtime"
 	"github.com/tusharbhardwaj/toolyard/internal/settings"
@@ -59,46 +61,52 @@ const (
 )
 
 type Server struct {
-	identity   *identity.Service
-	approval   *approval.Bus
-	audit      *audit.Logger
-	memory     *memory.Service
-	push       *push.Service
-	hub        *realtime.Hub
-	gateway    *gateway.Gateway
-	upstreams  *upstreams.Service
-	settings   *settings.Service
-	usage      *usage.Service
-	sessionKey []byte
+	identity     *identity.Service
+	approval     *approval.Bus
+	audit        *audit.Logger
+	memory       *memory.Service
+	push         *push.Service
+	hub          *realtime.Hub
+	gateway      *gateway.Gateway
+	upstreams    *upstreams.Service
+	settings     *settings.Service
+	usage        *usage.Service
+	metrics      *metrics.Reader
+	autoApproval *autoapproval.Service
+	sessionKey   []byte
 }
 
 type Options struct {
-	Identity   *identity.Service
-	Approval   *approval.Bus
-	Audit      *audit.Logger
-	Memory     *memory.Service
-	Push       *push.Service
-	Hub        *realtime.Hub
-	Gateway    *gateway.Gateway
-	Upstreams  *upstreams.Service
-	Settings   *settings.Service
-	Usage      *usage.Service
-	SessionKey []byte
+	Identity     *identity.Service
+	Approval     *approval.Bus
+	Audit        *audit.Logger
+	Memory       *memory.Service
+	Push         *push.Service
+	Hub          *realtime.Hub
+	Gateway      *gateway.Gateway
+	Upstreams    *upstreams.Service
+	Settings     *settings.Service
+	Usage        *usage.Service
+	Metrics      *metrics.Reader
+	AutoApproval *autoapproval.Service
+	SessionKey   []byte
 }
 
 func New(opts Options) *Server {
 	return &Server{
-		identity:   opts.Identity,
-		approval:   opts.Approval,
-		audit:      opts.Audit,
-		memory:     opts.Memory,
-		push:       opts.Push,
-		hub:        opts.Hub,
-		gateway:    opts.Gateway,
-		upstreams:  opts.Upstreams,
-		settings:   opts.Settings,
-		usage:      opts.Usage,
-		sessionKey: opts.SessionKey,
+		identity:     opts.Identity,
+		approval:     opts.Approval,
+		audit:        opts.Audit,
+		memory:       opts.Memory,
+		push:         opts.Push,
+		hub:          opts.Hub,
+		gateway:      opts.Gateway,
+		upstreams:    opts.Upstreams,
+		settings:     opts.Settings,
+		usage:        opts.Usage,
+		metrics:      opts.Metrics,
+		autoApproval: opts.AutoApproval,
+		sessionKey:   opts.SessionKey,
 	}
 }
 
@@ -134,6 +142,17 @@ func (s *Server) Routes(mux *http.ServeMux) {
 	mux.HandleFunc("/v1/marketplace", s.marketplaceList)
 	mux.HandleFunc("/v1/settings", s.settingsHandler)
 	mux.HandleFunc("/v1/usage", s.usageHandler)
+
+	mux.HandleFunc("/v1/insights/overview", s.insightsOverview)
+	mux.HandleFunc("/v1/insights/tools", s.insightsTools)
+	mux.HandleFunc("/v1/insights/agents", s.insightsAgents)
+	mux.HandleFunc("/v1/insights/agents/", s.insightsAgentDetail)
+	mux.HandleFunc("/v1/insights/anomalies", s.insightsAnomalies)
+	mux.HandleFunc("/v1/insights/anomalies/", s.insightsAnomalyAction)
+	mux.HandleFunc("/v1/insights/cost", s.insightsCost)
+	mux.HandleFunc("/v1/insights/auto/rules", s.autoRulesCollection)
+	mux.HandleFunc("/v1/insights/auto/rules/", s.autoRulesItem)
+	mux.HandleFunc("/v1/insights/purge-agent", s.insightsPurgeAgent)
 }
 
 // ---- helpers ----------------------------------------------------------------

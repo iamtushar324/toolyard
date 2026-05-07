@@ -33,9 +33,11 @@ import (
 	"github.com/tusharbhardwaj/toolyard/internal/api"
 	"github.com/tusharbhardwaj/toolyard/internal/approval"
 	"github.com/tusharbhardwaj/toolyard/internal/audit"
+	"github.com/tusharbhardwaj/toolyard/internal/autoapproval"
 	"github.com/tusharbhardwaj/toolyard/internal/gateway"
 	"github.com/tusharbhardwaj/toolyard/internal/identity"
 	"github.com/tusharbhardwaj/toolyard/internal/memory"
+	"github.com/tusharbhardwaj/toolyard/internal/metrics"
 	"github.com/tusharbhardwaj/toolyard/internal/policy"
 	"github.com/tusharbhardwaj/toolyard/internal/push"
 	"github.com/tusharbhardwaj/toolyard/internal/realtime"
@@ -180,6 +182,18 @@ func runServe(argv []string) error {
 	usageSvc := usagepkg.New(db)
 	vis := visibility.New(settingsSvc, usageSvc)
 
+	metricsRec := metrics.New(db)
+	defer func() {
+		shCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = metricsRec.Close(shCtx)
+	}()
+	metricsReader := metrics.NewReader(db)
+
+	autoApprover := autoapproval.New(db, metricsReader, settingsSvc)
+	bus.SetAutoApprover(autoApprover)
+	go autoApprover.RunProposer(ctx, time.Hour)
+
 	gw := gateway.New(gateway.Options{
 		Name:       "toolyard",
 		Version:    version,
@@ -191,6 +205,8 @@ func runServe(argv []string) error {
 		InLineWait: *inLineWait,
 		Visibility: vis,
 		Usage:      usageSvc,
+		Metrics:    metricsRec,
+		Surface:    vis,
 	})
 	gw.RegisterBuiltins()
 	defer gw.Close()
@@ -210,17 +226,19 @@ func runServe(argv []string) error {
 
 	// REST API + dashboard.
 	apiSrv := api.New(api.Options{
-		Identity:   idSvc,
-		Approval:   bus,
-		Audit:      auditSvc,
-		Memory:     memSvc,
-		Push:       pushSvc,
-		Hub:        hub,
-		Gateway:    gw,
-		Upstreams:  upstreamSvc,
-		Settings:   settingsSvc,
-		Usage:      usageSvc,
-		SessionKey: loadOrCreateSessionKey(*dataDir),
+		Identity:     idSvc,
+		Approval:     bus,
+		Audit:        auditSvc,
+		Memory:       memSvc,
+		Push:         pushSvc,
+		Hub:          hub,
+		Gateway:      gw,
+		Upstreams:    upstreamSvc,
+		Settings:     settingsSvc,
+		Usage:        usageSvc,
+		Metrics:      metricsReader,
+		AutoApproval: autoApprover,
+		SessionKey:   loadOrCreateSessionKey(*dataDir),
 	})
 
 	mux := http.NewServeMux()
