@@ -80,7 +80,10 @@ say() { printf '\033[1;32m==>\033[0m %s\n' "$*"; }
 say "building toolyard"
 TMP_BIN="$(mktemp /tmp/toolyard.XXXXXX)"
 chown "$BUILDER":"$BUILDER" "$TMP_BIN"
-sudo -u "$BUILDER" \
+# GOTOOLCHAIN=auto so an older system Go (e.g. 1.23) transparently fetches
+# the toolchain version pinned in go.mod. Without this, distros pinned at
+# GOTOOLCHAIN=local fail with "go.mod requires go >= X (running Y)".
+sudo -u "$BUILDER" env GOTOOLCHAIN=auto \
   bash -c "cd '$(pwd)' && CGO_ENABLED=1 go build -trimpath -ldflags '-s -w' -o '$TMP_BIN' ./cmd/gateway"
 
 say "installing binary -> $BINARY_PATH"
