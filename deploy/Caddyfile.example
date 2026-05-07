@@ -1,0 +1,38 @@
+# Caddy reverse proxy in front of toolyard.
+#
+# Caddy is the simplest TLS termination story: it auto-issues + auto-renews
+# Let's Encrypt certs and is one apt-install / dnf-install away. Drop this
+# at /etc/caddy/Caddyfile and `systemctl reload caddy`.
+#
+# Replace toolyard.example.com with your actual hostname before deploying.
+
+toolyard.example.com {
+    # Strict TLS: TLS 1.3 only.
+    tls {
+        protocols tls1.3
+    }
+
+    # Pass-through to the local toolyard binding (must match -addr in the
+    # systemd unit). The X-Forwarded-* headers are set by Caddy by default
+    # and toolyard's -trusted-proxy 127.0.0.1/32 honors them.
+    reverse_proxy 127.0.0.1:8787 {
+        # Stream SSE without buffering — keeps the dashboard's live event
+        # feed responsive.
+        flush_interval -1
+    }
+
+    # Cap request body up front so we drop oversized uploads at the edge
+    # rather than after they hit the gateway.
+    request_body {
+        max_size 16MB
+    }
+
+    # Optional: redirect bare http to https (Caddy does this by default but
+    # being explicit doesn't hurt).
+    @insecure {
+        protocol http
+    }
+    redir @insecure https://{host}{uri} 308
+
+    encode gzip
+}

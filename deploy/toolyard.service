@@ -1,0 +1,87 @@
+# systemd unit for toolyard.
+#
+# Tested on systemd 240+. Drop into /etc/systemd/system/toolyard.service,
+# adjust the User= / paths as needed, then:
+#
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now toolyard
+#   sudo journalctl -u toolyard -f      # live logs
+#
+# Defaults are tuned for the *public-facing* posture: a reverse proxy
+# (Caddy/nginx/Cloudflare Tunnel) terminates TLS and forwards to
+# 127.0.0.1:8787; toolyard refuses to expose itself directly to the
+# public network.
+#
+# For the LAN-only "trust everything" posture, drop the -public-url and
+# -no-stdio-upstreams flags and change ExecStart's bind address to :8787.
+
+[Unit]
+Description=toolyard MCP gateway
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+
+# A dedicated low-privilege user. Create with:
+#   sudo useradd --system --home-dir /var/lib/toolyard --shell /usr/sbin/nologin toolyard
+User=toolyard
+Group=toolyard
+
+# Where the binary lives and where state goes. Match StateDirectory below.
+ExecStart=/usr/local/bin/toolyard serve \
+    -addr 127.0.0.1:8787 \
+    -data /var/lib/toolyard \
+    -public-url https://toolyard.example.com \
+    -trusted-proxy 127.0.0.1/32,::1/128 \
+    -no-stdio-upstreams \
+    -push-subject "mailto:you@example.com"
+
+# Restart on crash, with a small backoff so a tight crashloop doesn't burn CPU.
+Restart=on-failure
+RestartSec=5
+StartLimitIntervalSec=60
+StartLimitBurst=10
+
+# Owns and creates /var/lib/toolyard (mode 0700, owner=toolyard).
+StateDirectory=toolyard
+StateDirectoryMode=0700
+LogsDirectory=toolyard
+
+# Sandbox hardening — see systemd.exec(5).
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectKernelLogs=true
+ProtectControlGroups=true
+ProtectClock=true
+ProtectHostname=true
+ProtectProc=invisible
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
+RestrictNamespaces=true
+RestrictRealtime=true
+RestrictSUIDSGID=true
+LockPersonality=true
+MemoryDenyWriteExecute=true
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources
+
+# Allow the binary to write only here.
+ReadWritePaths=/var/lib/toolyard /var/log/toolyard
+
+# Cap resources so a runaway process can't take the box down.
+LimitNOFILE=8192
+TasksMax=512
+MemoryMax=512M
+
+# Graceful shutdown: SIGINT triggers context cancel + 5s drain in main.go.
+KillSignal=SIGINT
+TimeoutStopSec=10s
+
+[Install]
+WantedBy=multi-user.target
