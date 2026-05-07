@@ -83,7 +83,16 @@ chown "$BUILDER":"$BUILDER" "$TMP_BIN"
 # GOTOOLCHAIN=auto so an older system Go (e.g. 1.23) transparently fetches
 # the toolchain version pinned in go.mod. Without this, distros pinned at
 # GOTOOLCHAIN=local fail with "go.mod requires go >= X (running Y)".
-sudo -u "$BUILDER" env GOTOOLCHAIN=auto \
+#
+# GOSUMDB=sum.golang.org is required because Go refuses to verify a
+# downloaded toolchain when GOSUMDB=off; we set it explicitly here so the
+# installer works even when the invoking user has GOSUMDB=off in their env.
+# GOPROXY=https://proxy.golang.org,direct mirrors that for the module
+# fetch path.
+sudo -u "$BUILDER" env \
+    GOTOOLCHAIN=auto \
+    GOSUMDB=sum.golang.org \
+    GOPROXY="https://proxy.golang.org,direct" \
   bash -c "cd '$(pwd)' && CGO_ENABLED=1 go build -trimpath -ldflags '-s -w' -o '$TMP_BIN' ./cmd/gateway"
 
 say "installing binary -> $BINARY_PATH"
