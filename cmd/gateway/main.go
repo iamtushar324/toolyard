@@ -693,6 +693,13 @@ func staticHandler() http.Handler {
 		// /etc/mime.types — be explicit so the browser actually applies it
 		// (and the strict Content-Security-Policy doesn't reject it for
 		// being the wrong MIME).
+		//
+		// Cache-Control:no-cache forces the browser to revalidate every
+		// time. http.FileServer still emits a Last-Modified / ETag, so a
+		// 304 keeps the network cost roughly nil. The big win: a fresh
+		// `sudo ./deploy/install.sh` lands a new app.js / style.css and
+		// the next page load picks them up without a hard refresh — no
+		// more "X-Requested-With required" surprises after a redeploy.
 		switch filepath.Ext(r.URL.Path) {
 		case ".webmanifest":
 			w.Header().Set("Content-Type", "application/manifest+json")
@@ -700,8 +707,10 @@ func staticHandler() http.Handler {
 			w.Header().Set("Content-Type", "image/svg+xml")
 		case ".css":
 			w.Header().Set("Content-Type", "text/css; charset=utf-8")
+			w.Header().Set("Cache-Control", "no-cache")
 		case ".js":
 			w.Header().Set("Content-Type", "application/javascript; charset=utf-8")
+			w.Header().Set("Cache-Control", "no-cache")
 		}
 		fileServer.ServeHTTP(w, r)
 	})
