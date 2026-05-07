@@ -74,6 +74,8 @@ type Server struct {
 	metrics      *metrics.Reader
 	autoApproval *autoapproval.Service
 	sessionKey   []byte
+	security     SecurityOptions
+	loginLimit   *loginThrottle
 }
 
 type Options struct {
@@ -90,10 +92,11 @@ type Options struct {
 	Metrics      *metrics.Reader
 	AutoApproval *autoapproval.Service
 	SessionKey   []byte
+	Security     SecurityOptions
 }
 
 func New(opts Options) *Server {
-	return &Server{
+	s := &Server{
 		identity:     opts.Identity,
 		approval:     opts.Approval,
 		audit:        opts.Audit,
@@ -107,8 +110,22 @@ func New(opts Options) *Server {
 		metrics:      opts.Metrics,
 		autoApproval: opts.AutoApproval,
 		sessionKey:   opts.SessionKey,
+		security:     opts.Security,
+		loginLimit:   newLoginThrottle(5, 15*time.Minute),
 	}
+	go func() {
+		t := time.NewTicker(2 * time.Minute)
+		defer t.Stop()
+		for range t.C {
+			s.loginLimit.Sweep()
+		}
+	}()
+	return s
 }
+
+// SecurityOpts exposes the configured options for middleware wiring outside
+// the api package (cmd/gateway uses this when stitching the mux).
+func (s *Server) SecurityOpts() SecurityOptions { return s.security }
 
 func (s *Server) Routes(mux *http.ServeMux) {
 	mux.HandleFunc("/v1/health", s.health)
@@ -120,6 +137,7 @@ func (s *Server) Routes(mux *http.ServeMux) {
 	mux.HandleFunc("/v1/agents", s.agentsCollection)
 	mux.HandleFunc("/v1/agents/enroll", s.agentsEnroll)
 	mux.HandleFunc("/v1/agents/exchange", s.agentsExchange)
+	mux.HandleFunc("/v1/agents/", s.agentsItem)
 
 	mux.HandleFunc("/v1/approvals", s.approvalsList)
 	mux.HandleFunc("/v1/approvals/", s.approvalsOne)
@@ -174,36 +192,71 @@ func writeError(w http.ResponseWriter, status int, msg string) {
 	writeJSON(w, status, map[string]string{"error": msg})
 }
 
+// maxJSONBody caps every control-plane JSON body. The middleware also
+// applies http.MaxBytesReader to the raw stream — this is a second belt for
+// callers that bypass the middleware (none today, but cheap).
+const maxJSONBody = 1 << 20 // 1 MiB
+
 func decode(r *http.Request, dst any) error {
 	if r.Body == nil {
 		return errors.New("empty body")
 	}
 	defer r.Body.Close()
-	return json.NewDecoder(r.Body).Decode(dst)
+	limited := http.MaxBytesReader(nil, r.Body, maxJSONBody)
+	dec := json.NewDecoder(limited)
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(dst); err != nil {
+		return err
+	}
+	// Reject trailing garbage so a caller can't smuggle a second JSON value.
+	if dec.More() {
+		return errors.New("body has trailing JSON tokens")
+	}
+	return nil
 }
 
 // ---- auth & session ---------------------------------------------------------
 
 type sessionClaims struct {
-	UserID string `json:"sub"`
+	UserID    string `json:"sub"`
+	SessionID string `json:"sid"`
 	jwt.RegisteredClaims
 }
 
-func (s *Server) issueSession(w http.ResponseWriter, userID string) error {
+func (s *Server) issueSession(w http.ResponseWriter, r *http.Request, userID string) error {
+	// Persist a session anchor so we can revoke this JWT before its expiry.
+	sid, err := s.identity.CreateSession(r.Context(), userID, r.UserAgent(), s.security.ClientIP(r), sessionTTL)
+	if err != nil {
+		return err
+	}
 	claims := sessionClaims{
-		UserID:           userID,
-		RegisteredClaims: jwt.RegisteredClaims{ExpiresAt: jwt.NewNumericDate(time.Now().Add(sessionTTL))},
+		UserID:    userID,
+		SessionID: sid,
+		RegisteredClaims: jwt.RegisteredClaims{
+			ExpiresAt: jwt.NewNumericDate(time.Now().Add(sessionTTL)),
+			ID:        sid,
+		},
 	}
 	tok, err := jwt.NewWithClaims(jwt.SigningMethodHS256, claims).SignedString(s.sessionKey)
 	if err != nil {
 		return err
+	}
+	// Secure flag only when behind real HTTPS; otherwise local dev (plain HTTP)
+	// would lose the cookie on every request.
+	secure := s.security.IsBehindHTTPS(r)
+	sameSite := http.SameSiteLaxMode
+	if secure {
+		// Strict gives the strongest CSRF posture once we're confident
+		// every cross-tab transition still works under HTTPS. Lax in dev.
+		sameSite = http.SameSiteStrictMode
 	}
 	http.SetCookie(w, &http.Cookie{
 		Name:     sessionCookieName,
 		Value:    tok,
 		Path:     "/",
 		HttpOnly: true,
-		SameSite: http.SameSiteLaxMode,
+		Secure:   secure,
+		SameSite: sameSite,
 		Expires:  time.Now().Add(sessionTTL),
 	})
 	return nil
@@ -223,10 +276,37 @@ func (s *Server) verifySession(r *http.Request) (string, bool) {
 	if err != nil || !parsed.Valid {
 		return "", false
 	}
-	if c, ok := parsed.Claims.(*sessionClaims); ok {
-		return c.UserID, true
+	c, ok := parsed.Claims.(*sessionClaims)
+	if !ok {
+		return "", false
 	}
-	return "", false
+	// Server-side anchor check: a JWT survives the cookie clear, but a
+	// revoked sid stops authenticating immediately. SID is empty for any
+	// JWT minted before this change — those are accepted only until they
+	// naturally expire (24h grace).
+	if c.SessionID != "" && !s.identity.IsSessionValid(r.Context(), c.SessionID) {
+		return "", false
+	}
+	return c.UserID, true
+}
+
+// currentSessionID extracts the sid claim if the cookie is present and
+// valid. Used by logout so we revoke this JWT specifically.
+func (s *Server) currentSessionID(r *http.Request) string {
+	cookie, err := r.Cookie(sessionCookieName)
+	if err != nil {
+		return ""
+	}
+	parsed, err := jwt.ParseWithClaims(cookie.Value, &sessionClaims{}, func(t *jwt.Token) (any, error) {
+		return s.sessionKey, nil
+	})
+	if err != nil {
+		return ""
+	}
+	if c, ok := parsed.Claims.(*sessionClaims); ok {
+		return c.SessionID
+	}
+	return ""
 }
 
 func (s *Server) requireUser(r *http.Request) (string, error) {
@@ -240,6 +320,18 @@ func (s *Server) requireUser(r *http.Request) (string, error) {
 func (s *Server) authSetup(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeError(w, http.StatusMethodNotAllowed, "POST only")
+		return
+	}
+	// Bootstrap is only safe over the loopback (or trusted-proxy localhost),
+	// otherwise an attacker on the public internet can race the legit
+	// operator and claim the admin account.
+	if !s.security.IsLoopback(r) {
+		writeError(w, http.StatusForbidden, "first-time setup must be performed from localhost")
+		return
+	}
+	// One-shot: once any user exists the route closes entirely.
+	if exists, err := s.identity.HasUser(r.Context()); err == nil && exists {
+		http.NotFound(w, r)
 		return
 	}
 	var body struct{ Username, Password string }
@@ -256,7 +348,7 @@ func (s *Server) authSetup(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	if err := s.issueSession(w, u.ID); err != nil {
+	if err := s.issueSession(w, r, u.ID); err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -266,6 +358,12 @@ func (s *Server) authSetup(w http.ResponseWriter, r *http.Request) {
 func (s *Server) authLogin(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeError(w, http.StatusMethodNotAllowed, "POST only")
+		return
+	}
+	// Per-IP throttle. We don't let an attacker walk past argon2id at full speed.
+	ip := s.security.ClientIP(r)
+	if !s.loginLimit.Allow(ip) {
+		writeError(w, http.StatusTooManyRequests, "too many login attempts; try again later")
 		return
 	}
 	var body struct{ Username, Password string }
@@ -278,7 +376,9 @@ func (s *Server) authLogin(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusUnauthorized, "invalid credentials")
 		return
 	}
-	if err := s.issueSession(w, u.ID); err != nil {
+	// Successful login resets the bucket so later legit requests aren't blocked.
+	s.loginLimit.Reset(ip)
+	if err := s.issueSession(w, r, u.ID); err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
@@ -287,12 +387,22 @@ func (s *Server) authLogin(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) authLogout(w http.ResponseWriter, r *http.Request) {
+	if sid := s.currentSessionID(r); sid != "" {
+		_ = s.identity.RevokeSession(r.Context(), sid)
+	}
+	secure := s.security.IsBehindHTTPS(r)
+	sameSite := http.SameSiteLaxMode
+	if secure {
+		sameSite = http.SameSiteStrictMode
+	}
 	http.SetCookie(w, &http.Cookie{
 		Name:     sessionCookieName,
 		Value:    "",
 		Path:     "/",
 		MaxAge:   -1,
 		HttpOnly: true,
+		Secure:   secure,
+		SameSite: sameSite,
 	})
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
@@ -396,6 +506,49 @@ func (s *Server) agentsEnroll(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// agentsItem handles per-agent actions:
+//
+//	POST   /v1/agents/{id}/rotate   issue a fresh token, invalidate old hash
+//	DELETE /v1/agents/{id}          remove the agent entirely
+//
+// Owner-scoped via identity.{Rotate,Delete}AgentToken — callers can't reach
+// agents owned by other users (relevant the day toolyard goes multi-user).
+func (s *Server) agentsItem(w http.ResponseWriter, r *http.Request) {
+	uid, err := s.requireUser(r)
+	if err != nil {
+		writeError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+	tail := strings.TrimPrefix(r.URL.Path, "/v1/agents/")
+	parts := strings.SplitN(tail, "/", 2)
+	id := parts[0]
+	if id == "" || id == "enroll" || id == "exchange" {
+		http.NotFound(w, r)
+		return
+	}
+	subpath := ""
+	if len(parts) > 1 {
+		subpath = parts[1]
+	}
+	switch {
+	case subpath == "rotate" && r.Method == http.MethodPost:
+		tok, err := s.identity.RotateAgentToken(r.Context(), uid, id)
+		if err != nil {
+			writeError(w, http.StatusNotFound, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"agent_id": id, "token": tok})
+	case subpath == "" && r.Method == http.MethodDelete:
+		if err := s.identity.DeleteAgent(r.Context(), uid, id); err != nil {
+			writeError(w, http.StatusNotFound, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+	default:
+		writeError(w, http.StatusMethodNotAllowed, "POST /rotate or DELETE")
+	}
+}
+
 func (s *Server) agentsExchange(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeError(w, http.StatusMethodNotAllowed, "POST only")
@@ -454,17 +607,13 @@ func (s *Server) approvalsOne(w http.ResponseWriter, r *http.Request) {
 		s.approvalsDecide(w, r, strings.TrimSuffix(id, "/decide"))
 		return
 	}
-	// Allow unauthenticated GET when the request carries a valid signed
-	// decision token in ?token= so the phone push deep-link works without a
-	// session cookie.
+	// Authenticated GET only — the previous ?token= URL fallback was
+	// dropped because query strings end up in proxy / browser-history
+	// logs, leaking both the approval ID and a key that decides it. The
+	// push notification flow uses POST /v1/approvals/decide-by-token
+	// which keeps the token in the body.
 	if r.Method == http.MethodGet {
 		if _, err := s.requireUser(r); err != nil {
-			if tok := r.URL.Query().Get("token"); tok != "" {
-				if req, terr := s.approval.Get(r.Context(), id); terr == nil && req.DecisionToken == tok {
-					writeJSON(w, http.StatusOK, req)
-					return
-				}
-			}
 			writeError(w, http.StatusUnauthorized, "unauthorized")
 			return
 		}
@@ -887,7 +1036,8 @@ func (s *Server) toolsRun(w http.ResponseWriter, r *http.Request) {
 // ---- settings -------------------------------------------------------------
 
 func (s *Server) settingsHandler(w http.ResponseWriter, r *http.Request) {
-	if _, err := s.requireUser(r); err != nil {
+	uid, err := s.requireUser(r)
+	if err != nil {
 		writeError(w, http.StatusUnauthorized, "unauthorized")
 		return
 	}
@@ -913,6 +1063,17 @@ func (s *Server) settingsHandler(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, err.Error())
 			return
 		}
+		// Forensic trail: who changed what. Keys recorded; values omitted
+		// so we don't end up logging an API-rate fragment as an event row.
+		keys := make([]string, 0, len(body))
+		for k := range body {
+			keys = append(keys, k)
+		}
+		_ = s.audit.Write(r.Context(), audit.Event{
+			EventType:     "settings.patch",
+			AgentID:       "user:" + uid,
+			ResultSummary: strings.Join(keys, ","),
+		})
 		// If the change affects what tools agents can see, push a
 		// notifications/tools/list_changed so connected MCP clients
 		// re-fetch instead of relying on their cached tool list.

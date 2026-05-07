@@ -82,7 +82,10 @@ func (l *Logger) fanOut(e Event) {
 	}
 }
 
-// Write appends an event. ID and TS are filled in if zero.
+// Write appends an event. ID and TS are filled in if zero. Reason and
+// arguments are passed through RedactString / RedactJSONBytes first so a
+// fat-fingered API key in a tool argument doesn't become a permanent leak
+// in the audit log.
 func (l *Logger) Write(ctx context.Context, e Event) error {
 	if e.ID == "" {
 		e.ID = "ev_" + uuid.NewString()
@@ -90,6 +93,9 @@ func (l *Logger) Write(ctx context.Context, e Event) error {
 	if e.TS == 0 {
 		e.TS = time.Now().UnixMilli()
 	}
+	e.Reason = RedactString(e.Reason)
+	e.ResultSummary = RedactString(e.ResultSummary)
+	e.Arguments = RedactJSONBytes(e.Arguments)
 	_, err := l.db.ExecContext(ctx,
 		`INSERT INTO audit_events(id, ts, agent_id, upstream_name, tool_name, event_type,
             decision, reason, arguments, result_summary, approval_id)

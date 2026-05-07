@@ -12,6 +12,7 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"regexp"
 	"strings"
 	"time"
 
@@ -20,6 +21,19 @@ import (
 
 	"github.com/tusharbhardwaj/toolyard/internal/store"
 )
+
+// usernameRE constrains usernames to "safe" identifier characters and a
+// reasonable length. Prevents 1MB usernames that DoS argon2id and stops
+// control-character / shell-metachar shenanigans in display contexts.
+var usernameRE = regexp.MustCompile(`^[A-Za-z0-9._-]{2,64}$`)
+
+// agentNameRE allows a slightly broader set since agent names show up in UI
+// and audit only, never in shells.
+var agentNameRE = regexp.MustCompile(`^[A-Za-z0-9 ._:-]{1,64}$`)
+
+// MinPasswordLen — picked to match the OWASP "memorized secret" baseline.
+// Stronger ones welcome; we don't enforce upper cap to allow passphrases.
+const MinPasswordLen = 10
 
 var (
 	ErrNoUser            = errors.New("no user configured")
@@ -49,8 +63,11 @@ type Agent struct {
 
 // ---- argon2id password hashing -----------------------------------------------
 
+// Argon2id cost. Bumped from time=2 to time=3 — within OWASP recommendations
+// and on a modern desktop costs ~150ms per attempt, slow enough to throttle
+// a guesser while remaining unobtrusive on legitimate logins.
 const (
-	argonTime    = 2
+	argonTime    = 3
 	argonMemory  = 64 * 1024
 	argonThreads = 2
 	argonKeyLen  = 32
@@ -102,8 +119,14 @@ func (s *Service) HasUser(ctx context.Context) (bool, error) {
 }
 
 func (s *Service) CreateUser(ctx context.Context, username, password string) (*User, error) {
-	if username == "" || len(password) < 8 {
-		return nil, errors.New("username required, password must be 8+ chars")
+	if !usernameRE.MatchString(username) {
+		return nil, errors.New("username must be 2-64 chars of [A-Za-z0-9._-]")
+	}
+	if len(password) < MinPasswordLen {
+		return nil, fmt.Errorf("password must be at least %d characters", MinPasswordLen)
+	}
+	if len(password) > 1024 {
+		return nil, errors.New("password too long")
 	}
 	exists, err := s.HasUser(ctx)
 	if err != nil {
@@ -171,6 +194,12 @@ func (s *Service) PrimaryUser(ctx context.Context) (*User, error) {
 // CreateEnrollment returns a short-lived code an operator pastes into an agent's
 // MCP config. The agent then exchanges it for a long-lived token.
 func (s *Service) CreateEnrollment(ctx context.Context, ownerUserID, agentName string, ttl time.Duration) (string, *Agent, error) {
+	if agentName == "" {
+		agentName = "agent"
+	}
+	if !agentNameRE.MatchString(agentName) {
+		return "", nil, errors.New("agent name must be 1-64 chars of [A-Za-z0-9 ._:-]")
+	}
 	code, err := randCode(8)
 	if err != nil {
 		return "", nil, err
@@ -195,6 +224,9 @@ func (s *Service) CreateEnrollment(ctx context.Context, ownerUserID, agentName s
 func (s *Service) CreateAgentWithToken(ctx context.Context, ownerUserID, agentName string) (string, *Agent, error) {
 	if agentName == "" {
 		agentName = "agent"
+	}
+	if !agentNameRE.MatchString(agentName) {
+		return "", nil, errors.New("agent name must be 1-64 chars of [A-Za-z0-9 ._:-]")
 	}
 	id := "ag_" + uuid.NewString()
 	now := time.Now()
@@ -271,6 +303,127 @@ func (s *Service) VerifyAgentToken(ctx context.Context, token string) (*Agent, e
 	_, _ = s.db.ExecContext(ctx, `UPDATE agents SET last_seen = ? WHERE id = ?`,
 		time.Now().UnixMilli(), ag.ID)
 	return &ag, nil
+}
+
+// RotateAgentToken issues a fresh token for an existing agent and invalidates
+// the old hash. Returned plaintext token must be re-distributed by the
+// operator; the old token is dead the instant this returns.
+func (s *Service) RotateAgentToken(ctx context.Context, ownerUserID, agentID string) (string, error) {
+	if agentID == "" {
+		return "", ErrAgentTokenInvalid
+	}
+	rawToken, err := randCode(32)
+	if err != nil {
+		return "", err
+	}
+	token := agentID + "." + rawToken
+	hash := hashToken(token)
+	res, err := s.db.ExecContext(ctx,
+		`UPDATE agents SET token_hash = ?, last_seen = ?
+         WHERE id = ? AND owner_user = ?`,
+		hash, time.Now().UnixMilli(), agentID, ownerUserID)
+	if err != nil {
+		return "", err
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return "", ErrAgentTokenInvalid
+	}
+	return token, nil
+}
+
+// DeleteAgent removes the agent row entirely so any outstanding bearer
+// token stops authenticating. Owner-scoped — callers can't delete agents
+// belonging to other users.
+func (s *Service) DeleteAgent(ctx context.Context, ownerUserID, agentID string) error {
+	if agentID == "" {
+		return ErrAgentTokenInvalid
+	}
+	res, err := s.db.ExecContext(ctx,
+		`DELETE FROM agents WHERE id = ? AND owner_user = ?`, agentID, ownerUserID)
+	if err != nil {
+		return err
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return ErrAgentTokenInvalid
+	}
+	return nil
+}
+
+// CreateSession persists a server-side session anchor so the JWT carrying
+// this id can be invalidated (logout, password change, admin revoke) ahead
+// of its TTL. Returns the new session id.
+func (s *Service) CreateSession(ctx context.Context, userID, userAgent, clientIP string, ttl time.Duration) (string, error) {
+	id := "sess_" + uuid.NewString()
+	now := time.Now()
+	exp := now.Add(ttl)
+	_, err := s.db.ExecContext(ctx,
+		`INSERT INTO sessions(id, user_id, created_at, expires_at, user_agent, client_ip)
+         VALUES(?,?,?,?,?,?)`,
+		id, userID, now.UnixMilli(), exp.UnixMilli(), nullStr(userAgent), nullStr(clientIP))
+	if err != nil {
+		return "", err
+	}
+	return id, nil
+}
+
+// IsSessionValid reports whether a session row is non-revoked and unexpired.
+func (s *Service) IsSessionValid(ctx context.Context, sessionID string) bool {
+	if sessionID == "" {
+		return false
+	}
+	row := s.db.QueryRowContext(ctx,
+		`SELECT expires_at, COALESCE(revoked_at,0) FROM sessions WHERE id = ?`, sessionID)
+	var exp, revoked int64
+	if err := row.Scan(&exp, &revoked); err != nil {
+		return false
+	}
+	if revoked > 0 {
+		return false
+	}
+	return exp > time.Now().UnixMilli()
+}
+
+// RevokeSession marks one session revoked (logout).
+func (s *Service) RevokeSession(ctx context.Context, sessionID string) error {
+	if sessionID == "" {
+		return nil
+	}
+	_, err := s.db.ExecContext(ctx,
+		`UPDATE sessions SET revoked_at = ? WHERE id = ?`,
+		time.Now().UnixMilli(), sessionID)
+	return err
+}
+
+// RevokeAllForUser is the "log out of every device" affordance — used after
+// password change or stolen-laptop scenarios.
+func (s *Service) RevokeAllForUser(ctx context.Context, userID string) error {
+	_, err := s.db.ExecContext(ctx,
+		`UPDATE sessions SET revoked_at = ?
+         WHERE user_id = ? AND revoked_at IS NULL`,
+		time.Now().UnixMilli(), userID)
+	return err
+}
+
+// PurgeExpiredSessions wipes rows past expiry+grace so the table doesn't
+// grow forever. Called from a goroutine.
+func (s *Service) PurgeExpiredSessions(ctx context.Context, grace time.Duration) (int64, error) {
+	cut := time.Now().Add(-grace).UnixMilli()
+	res, err := s.db.ExecContext(ctx,
+		`DELETE FROM sessions WHERE expires_at < ?`, cut)
+	if err != nil {
+		return 0, err
+	}
+	n, _ := res.RowsAffected()
+	return n, nil
+}
+
+func nullStr(s string) any {
+	if s == "" {
+		return nil
+	}
+	return s
 }
 
 func (s *Service) ListAgents(ctx context.Context, ownerUserID string) ([]Agent, error) {

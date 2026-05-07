@@ -104,11 +104,23 @@ func runServe(argv []string) error {
 	pushSubject := fs.String("push-subject", "mailto:admin@example.invalid", "VAPID `sub` claim")
 	inLineWait := fs.Duration("in-line-wait", 30*time.Second, "max time to block a held call before returning a deferred response")
 	approvalTTL := fs.Duration("approval-ttl", 3*time.Hour, "how long a pending approval stays decidable before auto-expiring")
+	publicURL := fs.String("public-url", "", "public origin (e.g. https://toolyard.example.com). When set, enables HSTS, secure cookies, Origin enforcement, and locks /v1/auth/setup to loopback.")
+	trustedProxies := fs.String("trusted-proxy", "", "comma-separated CIDRs to trust for X-Forwarded-* headers (e.g. 127.0.0.1/32,::1/128,10.0.0.0/8)")
+	requireAuthMCP := fs.Bool("require-auth-on-mcp", false, "reject anonymous /mcp calls (no Authorization header). Auto-enabled when -public-url is set.")
+	noStdioUpstreams := fs.Bool("no-stdio-upstreams", false, "refuse to start any stdio (subprocess) MCP upstream. Use when the dashboard is exposed publicly so a compromised session can't spawn arbitrary commands.")
+	envDenylistFlag := fs.String("upstream-env-denylist", "LD_PRELOAD,LD_LIBRARY_PATH,DYLD_INSERT_LIBRARIES,DYLD_LIBRARY_PATH,PATH", "comma-separated env var keys forbidden in upstream stdio configs")
 	_ = fs.Parse(argv)
 
-	if err := os.MkdirAll(*dataDir, 0o755); err != nil {
+	// Public mode auto-enables matching safeguards.
+	if *publicURL != "" {
+		*requireAuthMCP = true
+	}
+
+	if err := os.MkdirAll(*dataDir, 0o700); err != nil {
 		return err
 	}
+	// Tighten any pre-existing data dir so other local users can't read keys.
+	_ = os.Chmod(*dataDir, 0o700)
 	dbPath := filepath.Join(*dataDir, "toolyard.db")
 	db, err := store.Open(dbPath)
 	if err != nil {
@@ -147,10 +159,14 @@ func runServe(argv []string) error {
 			if err != nil {
 				return
 			}
-			body := fmt.Sprintf("%s · %s — %.140s", req.UpstreamName, req.ToolName, req.Reason)
+			// Don't put the operator's reason text in the push payload.
+			// Web Push payloads transit (and may briefly cache on)
+			// third-party push services; keeping the body content-free
+			// minimizes what a key compromise could reveal. The dashboard
+			// fills in details when the user opens the approval card.
 			n := push.Notification{
 				Title:    "toolyard approval needed",
-				Body:     body,
+				Body:     fmt.Sprintf("%s · %s — tap to review", req.UpstreamName, req.ToolName),
 				URL:      "/?approval=" + req.ID,
 				Approval: req.ID,
 				Tag:      req.ID,
@@ -193,6 +209,7 @@ func runServe(argv []string) error {
 	autoApprover := autoapproval.New(db, metricsReader, settingsSvc)
 	bus.SetAutoApprover(autoApprover)
 	go autoApprover.RunProposer(ctx, time.Hour)
+	go runSessionPurger(ctx, idSvc)
 
 	// Background analytics jobs: anomaly detection, reason quality
 	// scoring, retention compaction. All best-effort — failures log and
@@ -220,6 +237,13 @@ func runServe(argv []string) error {
 	defer gw.Close()
 
 	upstreamSvc := upstreams.New(db, gw)
+	upstreamSvc.SetPolicy(upstreams.Policy{
+		AllowStdio:  !*noStdioUpstreams,
+		EnvDenylist: splitCSV(*envDenylistFlag),
+	})
+	if *noStdioUpstreams {
+		log.Printf("toolyard: stdio upstreams disabled (--no-stdio-upstreams)")
+	}
 	if err := upstreamSvc.LoadAll(ctx); err != nil {
 		log.Printf("upstreams: load: %v", err)
 	}
@@ -230,6 +254,11 @@ func runServe(argv []string) error {
 		if err := importUpstreams(ctx, upstreamSvc, *upstreamConfig); err != nil {
 			log.Printf("import upstreams: %v", err)
 		}
+	}
+
+	secOpts := api.SecurityOptions{
+		PublicURL:      *publicURL,
+		TrustedProxies: parseCIDRs(*trustedProxies),
 	}
 
 	// REST API + dashboard.
@@ -247,6 +276,7 @@ func runServe(argv []string) error {
 		Metrics:      metricsReader,
 		AutoApproval: autoApprover,
 		SessionKey:   loadOrCreateSessionKey(*dataDir),
+		Security:     secOpts,
 	})
 
 	mux := http.NewServeMux()
@@ -269,34 +299,59 @@ func runServe(argv []string) error {
 	)
 	// Reject calls that carry a Bearer token we can't verify, so a stale
 	// token surfaces as a clear 401 instead of silently falling through to
-	// the anonymous bucket (where audit/approval rows lose their agent_id
-	// and the operator has no way to tell which Claude Code session
-	// generated them). Calls with no Authorization header at all are still
-	// accepted as anonymous — that's how stdio sessions work.
+	// the anonymous bucket. When -require-auth-on-mcp is on (auto-enabled
+	// when -public-url is set), we *also* reject anonymous traffic — the
+	// dashboard is exposed publicly so we can't trust unauthenticated
+	// callers to have any business calling our tools.
 	mcpAuthGuard := func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if tok := r.Header.Get("Authorization"); strings.HasPrefix(tok, "Bearer ") {
-				raw := strings.TrimPrefix(tok, "Bearer ")
-				if _, err := idSvc.VerifyAgentToken(r.Context(), raw); err != nil {
+			tok := r.Header.Get("Authorization")
+			if !strings.HasPrefix(tok, "Bearer ") {
+				if *requireAuthMCP {
 					w.Header().Set("Content-Type", "application/json")
 					w.WriteHeader(http.StatusUnauthorized)
-					_, _ = w.Write([]byte(`{"jsonrpc":"2.0","error":{"code":-32001,"message":"toolyard: invalid agent token; re-enroll via the dashboard"}}`))
+					_, _ = w.Write([]byte(`{"jsonrpc":"2.0","error":{"code":-32001,"message":"toolyard: bearer token required"}}`))
 					return
 				}
+				next.ServeHTTP(w, r)
+				return
+			}
+			raw := strings.TrimPrefix(tok, "Bearer ")
+			if _, err := idSvc.VerifyAgentToken(r.Context(), raw); err != nil {
+				w.Header().Set("Content-Type", "application/json")
+				w.WriteHeader(http.StatusUnauthorized)
+				_, _ = w.Write([]byte(`{"jsonrpc":"2.0","error":{"code":-32001,"message":"toolyard: invalid agent token; re-enroll via the dashboard"}}`))
+				return
 			}
 			next.ServeHTTP(w, r)
 		})
 	}
-	mux.Handle("/mcp", mcpAuthGuard(streamable))
-	mux.Handle("/mcp/", mcpAuthGuard(streamable))
+	// /mcp gets a larger body limit because tool-call args can be a few MB.
+	mux.Handle("/mcp", api.LimitBody(mcpAuthGuard(streamable), 16<<20))
+	mux.Handle("/mcp/", api.LimitBody(mcpAuthGuard(streamable), 16<<20))
 
 	// Dashboard static assets.
 	mux.Handle("/", staticHandler())
 
+	// Compose the public-facing handler:
+	//   security headers → origin enforcement → body size cap → mux
+	// The body cap here is the universal ceiling; /mcp's loop above
+	// reapplies a larger one for that subtree only.
+	var handler http.Handler = mux
+	handler = api.LimitBody(handler, 4<<20) // 4 MiB control-plane cap
+	handler = apiSrv.EnforceOriginOnMutations(handler)
+	handler = apiSrv.SecurityHeaders(handler)
+
 	httpSrv := &http.Server{
 		Addr:              *addr,
-		Handler:           mux,
+		Handler:           handler,
 		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       60 * time.Second,
+		// SSE responses are open-ended; keep WriteTimeout 0 so the streamer
+		// isn't cut off at deadline. The handler enforces its own keep-alive
+		// timing.
+		WriteTimeout: 0,
+		IdleTimeout:  120 * time.Second,
 	}
 
 	stop := make(chan os.Signal, 1)
@@ -502,6 +557,68 @@ func runRetentionCompactor(ctx context.Context, r *metrics.Reader, set *settings
 			step()
 		}
 	}
+}
+
+// runSessionPurger drops expired session rows so the table doesn't bloat.
+// Runs every 6h with a 24h grace window past expiry — long enough that a
+// laptop coming back online from a long sleep can still see its session
+// row before deletion (so the user gets a "your session expired" message
+// rather than an opaque 401 after a normal token expiry).
+func runSessionPurger(ctx context.Context, id *identity.Service) {
+	t := time.NewTicker(6 * time.Hour)
+	defer t.Stop()
+	step := func() {
+		if n, err := id.PurgeExpiredSessions(ctx, 24*time.Hour); err != nil {
+			log.Printf("session purger: %v", err)
+		} else if n > 0 {
+			log.Printf("session purger: removed %d expired session rows", n)
+		}
+	}
+	step()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			step()
+		}
+	}
+}
+
+// parseCIDRs is used to translate the -trusted-proxy CSV flag into
+// net.IPNet entries. Bad entries are logged and skipped — better to start
+// up with a partial allowlist than refuse to boot on a typo.
+func parseCIDRs(csv string) []*net.IPNet {
+	csv = strings.TrimSpace(csv)
+	if csv == "" {
+		return nil
+	}
+	var out []*net.IPNet
+	for _, raw := range strings.Split(csv, ",") {
+		raw = strings.TrimSpace(raw)
+		if raw == "" {
+			continue
+		}
+		_, c, err := net.ParseCIDR(raw)
+		if err != nil {
+			log.Printf("trusted-proxy: ignoring invalid CIDR %q: %v", raw, err)
+			continue
+		}
+		out = append(out, c)
+	}
+	return out
+}
+
+// splitCSV is a tiny helper for the env-key denylist flag.
+func splitCSV(s string) []string {
+	out := []string{}
+	for _, raw := range strings.Split(s, ",") {
+		raw = strings.TrimSpace(raw)
+		if raw != "" {
+			out = append(out, raw)
+		}
+	}
+	return out
 }
 
 // loadOrCreateSessionKey persists a 32-byte HMAC key in <data-dir>/session.key

@@ -56,9 +56,32 @@ type Subscription struct {
 	CreatedAt int64  `json:"created_at"`
 }
 
+// MaxSubsPerUser caps how many push subscriptions a single user can have.
+// Each subscription is one device + one browser-profile, so 16 leaves
+// plenty of headroom (phone + tablet + 4 laptops + spares) without letting
+// a runaway loop keep upserting fresh ones until Notify() crawls.
+const MaxSubsPerUser = 16
+
 func (s *Service) Subscribe(ctx context.Context, userID, endpoint, p256dh, auth, userAgent string) (*Subscription, error) {
 	if endpoint == "" || p256dh == "" || auth == "" {
 		return nil, errors.New("push subscription missing fields")
+	}
+	if len(endpoint) > 1024 || len(p256dh) > 256 || len(auth) > 256 {
+		return nil, errors.New("push subscription field too long")
+	}
+	// Reject if the user is at the cap and this endpoint is new — UPSERT
+	// of an existing endpoint stays allowed (re-subscribe path).
+	var existing int
+	if err := s.db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM push_subscriptions WHERE user_id = ?`, userID).
+		Scan(&existing); err == nil && existing >= MaxSubsPerUser {
+		var matches int
+		_ = s.db.QueryRowContext(ctx,
+			`SELECT COUNT(*) FROM push_subscriptions WHERE user_id = ? AND endpoint = ?`,
+			userID, endpoint).Scan(&matches)
+		if matches == 0 {
+			return nil, fmt.Errorf("user has reached the push subscription cap (%d); revoke an old device first", MaxSubsPerUser)
+		}
 	}
 	id := "sub_" + uuid.NewString()
 	now := time.Now().UnixMilli()

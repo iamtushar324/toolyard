@@ -887,7 +887,10 @@ func (r *Reader) PurgeAgent(ctx context.Context, agentID string) error {
 
 // ExportCSV streams a CSV dump of call_events in the supplied range to w.
 // One header row, then one data row per event. Memory usage is O(1) — we
-// stream straight from the cursor.
+// stream straight from the cursor. Capped at 200k rows so a long-range +
+// big-DB request can't tie up the connection indefinitely.
+const exportRowCap = 200_000
+
 func (r *Reader) ExportCSV(ctx context.Context, w interface{ Write(p []byte) (int, error) }, rg Range) error {
 	from, to := rg.bounds()
 	rows, err := r.db.QueryContext(ctx, `SELECT
@@ -901,7 +904,8 @@ func (r *Reader) ExportCSV(ctx context.Context, w interface{ Write(p []byte) (in
         COALESCE(approval_latency_ms,0), COALESCE(approval_via,''),
         outcome, COALESCE(error_class,''), COALESCE(total_latency_ms,0),
         COALESCE(result_size_bytes,0)
-        FROM call_events WHERE ts >= ? AND ts < ? ORDER BY ts ASC`, from, to)
+        FROM call_events WHERE ts >= ? AND ts < ? ORDER BY ts ASC LIMIT ?`,
+		from, to, exportRowCap)
 	if err != nil {
 		return err
 	}

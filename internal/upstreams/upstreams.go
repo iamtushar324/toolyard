@@ -41,16 +41,47 @@ type Server struct {
 	UpdatedAt  int64             `json:"updated_at"`
 }
 
+// Policy gates which upstream configurations are admissible. Used to
+// implement -no-stdio-upstreams and -upstream-env-denylist on the public
+// deployment so a compromised dashboard session can't spawn arbitrary
+// subprocesses or hijack the loader via LD_PRELOAD.
+type Policy struct {
+	AllowStdio   bool
+	EnvDenylist  []string // case-insensitive prefix or exact match
+}
+
 // Service owns the upstream_servers table and keeps the live gateway in sync.
 type Service struct {
-	db *store.DB
-	gw *gateway.Gateway
+	db     *store.DB
+	gw     *gateway.Gateway
+	policy Policy
 
 	mu sync.Mutex // serializes connect/disconnect side-effects
 }
 
 func New(db *store.DB, gw *gateway.Gateway) *Service {
-	return &Service{db: db, gw: gw}
+	return &Service{db: db, gw: gw, policy: Policy{AllowStdio: true}}
+}
+
+// SetPolicy installs admission rules. Idempotent.
+func (s *Service) SetPolicy(p Policy) { s.policy = p }
+
+// envDenied returns the first env key in the supplied map that the policy
+// forbids. Empty string means clean.
+func (p Policy) envDenied(env map[string]string) string {
+	if len(env) == 0 || len(p.EnvDenylist) == 0 {
+		return ""
+	}
+	for k := range env {
+		ku := strings.ToUpper(k)
+		for _, deny := range p.EnvDenylist {
+			du := strings.ToUpper(deny)
+			if ku == du || strings.HasPrefix(ku, du) {
+				return k
+			}
+		}
+	}
+	return ""
 }
 
 func (s *Service) toCfg(srv Server) gateway.UpstreamConfig {
@@ -154,6 +185,12 @@ func (s *Service) List(ctx context.Context) ([]Server, error) { return s.list(ct
 func (s *Service) Add(ctx context.Context, srv Server) (*Server, error) {
 	if err := validate(srv); err != nil {
 		return nil, err
+	}
+	if srv.Transport == "stdio" && !s.policy.AllowStdio {
+		return nil, fmt.Errorf("%w: stdio upstreams disabled by -no-stdio-upstreams", ErrInvalid)
+	}
+	if denied := s.policy.envDenied(srv.Env); denied != "" {
+		return nil, fmt.Errorf("%w: env key %q is on the denylist", ErrInvalid, denied)
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
