@@ -68,9 +68,14 @@ function el(tag, attrs = {}, ...children) {
 
 async function api(path, opts = {}) {
   const init = { credentials: 'include', ...opts };
+  // X-Requested-With is the dashboard's anti-CSRF tell — the gateway's
+  // HardenAPI middleware refuses cookie-authenticated mutations without
+  // it. Custom headers can't be set by cross-site form submissions, so
+  // this is a robust supplementary defense to SameSite + Origin checks.
+  init.headers = { 'X-Requested-With': 'toolyard', ...(init.headers || {}) };
   if (init.body && typeof init.body !== 'string') {
     init.body = JSON.stringify(init.body);
-    init.headers = { 'Content-Type': 'application/json', ...(init.headers || {}) };
+    init.headers = { 'Content-Type': 'application/json', ...init.headers };
   }
   const r = await fetch(path, init);
   let body = null;

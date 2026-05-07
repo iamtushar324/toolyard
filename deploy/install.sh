@@ -129,24 +129,36 @@ EXEC_FLAGS=(
 [[ -n "$PUBLIC_URL" ]] && EXEC_FLAGS+=( -public-url "$PUBLIC_URL" )
 [[ "$NO_STDIO_UPSTREAMS" == "true" ]] && EXEC_FLAGS+=( -no-stdio-upstreams )
 
-# Sandbox flag set depends on whether stdio upstreams are allowed.
+# Sandbox tier picked by stdio upstream policy.
 #
-# Node.js (and most JIT'd runtimes — V8, LuaJIT, Pythons under PyPy, …)
-# need PROT_WRITE | PROT_EXEC pages for code generation. systemd's
-# MemoryDenyWriteExecute=true forbids that, so any Node-backed MCP
-# upstream like Context7 or sequential-thinking dies at startup with
-# "transport closed". LockPersonality=true breaks some Node ABI probes
-# similarly.
+# When stdio upstreams are allowed (the default for the LAN box) we keep
+# the kernel sandbox loose enough that Node, Python, and other JIT'd /
+# namespace-using runtimes don't crash at startup. The hardening then
+# lives at the application layer (per-route body caps, custom-header
+# CSRF, content-type enforcement, rate limits) — see internal/api.
 #
-# When stdio upstreams are off, we keep both on — the toolyard binary
-# itself doesn't JIT, so the tighter sandbox is free.
+# When stdio upstreams are off we tighten everything: the toolyard binary
+# is the only thing in the sandbox, it doesn't JIT, doesn't need
+# namespaces, and never reads /proc/$PID outside its own.
 if [[ "$NO_STDIO_UPSTREAMS" == "true" ]]; then
-  JIT_FLAGS="MemoryDenyWriteExecute=true
-LockPersonality=true"
+  # Strict tier — public-deployment posture.
+  TIER_FLAGS="MemoryDenyWriteExecute=true
+LockPersonality=true
+RestrictNamespaces=true
+ProtectProc=invisible
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallFilter=~@privileged @resources"
 else
-  JIT_FLAGS="# MemoryDenyWriteExecute / LockPersonality omitted: Node-backed
-# stdio upstreams (Context7, sequential-thinking, …) need V8 JIT pages.
-# Re-run with NO_STDIO_UPSTREAMS=true if you don't want stdio upstreams."
+  # Loose tier — stdio upstreams compatible.
+  # Dropped vs strict tier:
+  #   MemoryDenyWriteExecute  (V8 JIT needs PROT_WRITE|PROT_EXEC)
+  #   LockPersonality         (some Node ABI probes use personality(2))
+  #   RestrictNamespaces      (npm/uv install can clone-namespace)
+  #   ProtectProc=invisible   (Node libraries inspect /proc/self/fd)
+  #   SystemCallFilter        (Node uses many syscalls outside @system-service)
+  TIER_FLAGS="# Loose-tier kernel sandbox: defenders live at the app layer.
+# Re-run with NO_STDIO_UPSTREAMS=true to harden if you drop stdio upstreams."
 fi
 
 # Render the unit file. Heredoc, not a template, so failures fail loudly.
@@ -181,8 +193,7 @@ StateDirectory=toolyard
 StateDirectoryMode=0700
 LogsDirectory=toolyard
 
-# Sandbox — read-only filesystem outside ReadWritePaths, no kernel namespaces,
-# no SUID, syscall allowlist tuned for a network service.
+# Sandbox — kernel-level hygiene that's safe for any subprocess.
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
@@ -194,15 +205,10 @@ ProtectKernelLogs=true
 ProtectControlGroups=true
 ProtectClock=true
 ProtectHostname=true
-ProtectProc=invisible
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
-RestrictNamespaces=true
 RestrictRealtime=true
 RestrictSUIDSGID=true
-SystemCallArchitectures=native
-SystemCallFilter=@system-service
-SystemCallFilter=~@privileged @resources
-$JIT_FLAGS
+$TIER_FLAGS
 ReadWritePaths=$DATA_DIR
 
 # Resource caps.

@@ -334,11 +334,16 @@ func runServe(argv []string) error {
 	mux.Handle("/", staticHandler())
 
 	// Compose the public-facing handler:
-	//   security headers → origin enforcement → body size cap → mux
-	// The body cap here is the universal ceiling; /mcp's loop above
-	// reapplies a larger one for that subtree only.
+	//   security headers → origin enforcement → API hardening → body cap → mux
+	//
+	// HardenAPI is the load-bearing application-layer defense: per-route
+	// body caps, anti-CSRF custom-header check on cookie mutations,
+	// strict content-type, and per-IP rate limits on the unauthenticated
+	// bootstrap routes. It only applies to /v1/* — /mcp keeps its
+	// dedicated bearer-token guard above.
 	var handler http.Handler = mux
-	handler = api.LimitBody(handler, 4<<20) // 4 MiB control-plane cap
+	handler = api.LimitBody(handler, 4<<20) // 4 MiB universal ceiling
+	handler = apiSrv.HardenAPI(handler)
 	handler = apiSrv.EnforceOriginOnMutations(handler)
 	handler = apiSrv.SecurityHeaders(handler)
 

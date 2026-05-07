@@ -45,6 +45,9 @@ func (h *httpClient) raw(t *testing.T, method, path string, body any, dst any) {
 	if body != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
+	// Pretend to be the dashboard. Production middleware refuses
+	// cookie-authenticated mutations that don't carry X-Requested-With.
+	req.Header.Set("X-Requested-With", "toolyard")
 	for _, c := range h.cookies {
 		req.AddCookie(c)
 	}
@@ -407,6 +410,7 @@ func postJSON(h *httpClient, path string, body any) (*http.Response, error) {
 		return nil, err
 	}
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Requested-With", "toolyard")
 	for _, c := range h.cookies {
 		req.AddCookie(c)
 	}

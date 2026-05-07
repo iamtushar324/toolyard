@@ -76,6 +76,7 @@ type Server struct {
 	sessionKey   []byte
 	security     SecurityOptions
 	loginLimit   *loginThrottle
+	unauthLimit  *loginThrottle
 }
 
 type Options struct {
@@ -112,12 +113,14 @@ func New(opts Options) *Server {
 		sessionKey:   opts.SessionKey,
 		security:     opts.Security,
 		loginLimit:   newLoginThrottle(5, 15*time.Minute),
+		unauthLimit:  newLoginThrottle(0, time.Hour), // max/window passed per-call via AllowN
 	}
 	go func() {
 		t := time.NewTicker(2 * time.Minute)
 		defer t.Stop()
 		for range t.C {
 			s.loginLimit.Sweep()
+			s.unauthLimit.Sweep()
 		}
 	}()
 	return s
@@ -537,12 +540,18 @@ func (s *Server) agentsItem(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusNotFound, err.Error())
 			return
 		}
+		_ = s.audit.Write(r.Context(), audit.Event{
+			EventType: "agent.rotate", AgentID: id, ResultSummary: "user:" + uid,
+		})
 		writeJSON(w, http.StatusOK, map[string]any{"agent_id": id, "token": tok})
 	case subpath == "" && r.Method == http.MethodDelete:
 		if err := s.identity.DeleteAgent(r.Context(), uid, id); err != nil {
 			writeError(w, http.StatusNotFound, err.Error())
 			return
 		}
+		_ = s.audit.Write(r.Context(), audit.Event{
+			EventType: "agent.delete", AgentID: id, ResultSummary: "user:" + uid,
+		})
 		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 	default:
 		writeError(w, http.StatusMethodNotAllowed, "POST /rotate or DELETE")

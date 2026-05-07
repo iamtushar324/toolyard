@@ -166,6 +166,163 @@ func LimitBody(next http.Handler, maxBytes int64) http.Handler {
 	})
 }
 
+// HardenAPI is the application-layer security envelope around every /v1/*
+// route. It is the load-bearing defense in our chosen posture: kernel
+// sandbox is loose so subprocesses can run; this middleware compensates by
+// enforcing every check uniformly per route.
+//
+// Per request:
+//   - Per-route body cap (writeable routes get 64–256 KiB; tools/run gets
+//     4 MiB; everything else gets 8 KiB. Independently of the global mux
+//     cap so misconfiguration on one side can't widen the other.)
+//   - Anti-CSRF custom-header check on cookie-authenticated mutations.
+//     The dashboard sets X-Requested-With: toolyard; cross-site forms
+//     can't add a custom header without a CORS preflight, which we never
+//     answer with a permissive Allow-Origin.
+//   - Strict Content-Type on JSON-bodied mutations: only application/json
+//     is accepted. This kills form-encoded CSRF entirely.
+//   - Per-IP rate limit on the unauthenticated routes (setup, exchange,
+//     decide-by-token) so brute force / spray attacks have a hard wall.
+func (s *Server) HardenAPI(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		path := r.URL.Path
+		if !strings.HasPrefix(path, "/v1/") {
+			next.ServeHTTP(w, r)
+			return
+		}
+
+		// 1) Per-route body cap.
+		cap := perRouteBodyCap(path)
+		if r.Body != nil {
+			r.Body = http.MaxBytesReader(w, r.Body, cap)
+		}
+
+		// 2) Mutation-only checks: header + content-type + auth-route throttle.
+		isMut := r.Method == http.MethodPost ||
+			r.Method == http.MethodPatch ||
+			r.Method == http.MethodPut ||
+			r.Method == http.MethodDelete
+
+		if isMut {
+			// Anti-CSRF custom header. The dashboard's app.js sets
+			// X-Requested-With on every fetch; phone push handlers do
+			// likewise. Cross-site form POSTs cannot add this header,
+			// even when Same-Origin is bypassed by a downgrade attack.
+			//
+			// Exempt: /v1/auth/setup (one-shot, loopback-only) and
+			// /v1/auth/login (cookie isn't issued yet) and
+			// /v1/agents/exchange (Bearer-bootstrap path) and
+			// /v1/approvals/decide-by-token (push-tap path; signed token
+			// is the auth, no cookie present).
+			if !exemptFromCSRFHeader(path) {
+				if r.Header.Get("X-Requested-With") == "" {
+					writeError(w, http.StatusForbidden,
+						"X-Requested-With header required on mutating requests")
+					return
+				}
+			}
+
+			// Strict Content-Type for JSON bodies. Anything carrying a
+			// body must declare application/json. Empty body (e.g.
+			// agent rotate POST with no payload) skips this check.
+			if r.ContentLength != 0 {
+				ct := r.Header.Get("Content-Type")
+				if ct == "" {
+					writeError(w, http.StatusUnsupportedMediaType, "Content-Type required")
+					return
+				}
+				if i := strings.IndexByte(ct, ';'); i >= 0 {
+					ct = ct[:i]
+				}
+				ct = strings.ToLower(strings.TrimSpace(ct))
+				if ct != "application/json" {
+					writeError(w, http.StatusUnsupportedMediaType,
+						"only application/json is accepted")
+					return
+				}
+			}
+		}
+
+		// 3) Per-IP rate limit on the unauthenticated bootstrap / push paths.
+		if rl := unauthRouteLimit(path); rl != nil {
+			ip := s.security.ClientIP(r)
+			if !s.unauthLimit.AllowN(rl.key+":"+ip, rl.max, rl.window) {
+				writeError(w, http.StatusTooManyRequests,
+					"too many requests; try again later")
+				return
+			}
+		}
+
+		next.ServeHTTP(w, r)
+	})
+}
+
+// perRouteBodyCap returns the per-route MaxBytesReader cap. Tighter than
+// the global mux cap so misconfiguration upstream can't widen the
+// per-handler allowance, and so a CSP-bypassing attacker can't park
+// unbounded data on a small handler.
+func perRouteBodyCap(path string) int64 {
+	switch {
+	case strings.HasPrefix(path, "/v1/tools/run"):
+		return 4 << 20 // 4 MiB — tool arguments can be substantial
+	case strings.HasPrefix(path, "/v1/memory"):
+		return 1 << 20 // 1 MiB — memory.set values
+	case strings.HasPrefix(path, "/v1/push/subscribe"):
+		return 8 << 10 // 8 KiB — subscription metadata
+	case strings.HasPrefix(path, "/v1/auth/login"),
+		strings.HasPrefix(path, "/v1/auth/setup"):
+		return 4 << 10 // 4 KiB — username + password is tiny
+	case strings.HasPrefix(path, "/v1/agents"),
+		strings.HasPrefix(path, "/v1/approvals"),
+		strings.HasPrefix(path, "/v1/servers"),
+		strings.HasPrefix(path, "/v1/insights"):
+		return 64 << 10 // 64 KiB — config rows + decision payloads
+	default:
+		return 16 << 10 // 16 KiB
+	}
+}
+
+// exemptFromCSRFHeader lists routes that can't carry a custom header
+// because the caller is either (a) bootstrapping with no cookie / dashboard
+// origin in the picture, or (b) a third-party token-tap path.
+func exemptFromCSRFHeader(path string) bool {
+	switch path {
+	case "/v1/auth/setup", "/v1/auth/login",
+		"/v1/agents/exchange",
+		"/v1/approvals/decide-by-token":
+		return true
+	}
+	return false
+}
+
+// unauthRouteRule describes a per-(route, IP) budget for the unauth-route
+// throttle. window is the bucket length; max is the credit cap.
+type unauthRouteRule struct {
+	key    string
+	max    int
+	window time.Duration
+}
+
+// unauthRouteLimit picks a rate-limit rule for unauthenticated routes that
+// would otherwise be infinitely abusable (no cookie required, and either
+// fast or DB-backed). /v1/auth/setup is intentionally NOT here — it has
+// stronger guards (loopback-only + 404 after the first success) and the
+// rate limit there mostly hurts test harnesses that re-bootstrap.
+func unauthRouteLimit(path string) *unauthRouteRule {
+	switch {
+	case path == "/v1/agents/exchange":
+		// Exchange burns the enrollment code on success; legitimate users
+		// hit it once per agent enrollment. 120/hour leaves room for a
+		// fleet of agents and for the e2e suite to spin up many in burst.
+		return &unauthRouteRule{"exchange", 120, time.Hour}
+	case path == "/v1/approvals/decide-by-token":
+		// Push-tap path. A real user taps approve maybe a few times per
+		// minute at peak.
+		return &unauthRouteRule{"decide", 120, time.Hour}
+	}
+	return nil
+}
+
 // loginThrottle is a token-bucket per (ip, username) for /v1/auth/login.
 // 5 attempts per 15 minutes per source. Cheap, in-process — sufficient for a
 // single-instance gateway. Distributed deployments would swap for Redis.
@@ -192,15 +349,21 @@ func newLoginThrottle(max int, window time.Duration) *loginThrottle {
 // Allow returns true if the key is under its budget; consumes one credit.
 // Buckets older than window are reset.
 func (t *loginThrottle) Allow(key string) bool {
+	return t.AllowN(key, t.max, t.window)
+}
+
+// AllowN is the variant for callers that want to specify max + window per
+// call (e.g. different rate limits per route from one shared bucket store).
+func (t *loginThrottle) AllowN(key string, max int, window time.Duration) bool {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	b := t.buckets[key]
 	now := time.Now()
-	if b == nil || now.Sub(b.since) > t.window {
+	if b == nil || now.Sub(b.since) > window {
 		b = &throttleBucket{since: now}
 		t.buckets[key] = b
 	}
-	if b.count >= t.max {
+	if b.count >= max {
 		return false
 	}
 	b.count++
