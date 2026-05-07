@@ -129,6 +129,26 @@ EXEC_FLAGS=(
 [[ -n "$PUBLIC_URL" ]] && EXEC_FLAGS+=( -public-url "$PUBLIC_URL" )
 [[ "$NO_STDIO_UPSTREAMS" == "true" ]] && EXEC_FLAGS+=( -no-stdio-upstreams )
 
+# Sandbox flag set depends on whether stdio upstreams are allowed.
+#
+# Node.js (and most JIT'd runtimes — V8, LuaJIT, Pythons under PyPy, …)
+# need PROT_WRITE | PROT_EXEC pages for code generation. systemd's
+# MemoryDenyWriteExecute=true forbids that, so any Node-backed MCP
+# upstream like Context7 or sequential-thinking dies at startup with
+# "transport closed". LockPersonality=true breaks some Node ABI probes
+# similarly.
+#
+# When stdio upstreams are off, we keep both on — the toolyard binary
+# itself doesn't JIT, so the tighter sandbox is free.
+if [[ "$NO_STDIO_UPSTREAMS" == "true" ]]; then
+  JIT_FLAGS="MemoryDenyWriteExecute=true
+LockPersonality=true"
+else
+  JIT_FLAGS="# MemoryDenyWriteExecute / LockPersonality omitted: Node-backed
+# stdio upstreams (Context7, sequential-thinking, …) need V8 JIT pages.
+# Re-run with NO_STDIO_UPSTREAMS=true if you don't want stdio upstreams."
+fi
+
 # Render the unit file. Heredoc, not a template, so failures fail loudly.
 say "writing $SERVICE_PATH"
 cat > "$SERVICE_PATH" <<EOF
@@ -144,6 +164,12 @@ User=$USER_NAME
 Group=$USER_NAME
 ExecStart=$BINARY_PATH ${EXEC_FLAGS[*]}
 
+# systemd's default PATH for services is just /usr/local/sbin:/usr/local/bin:
+# /usr/sbin:/usr/bin which usually has npx and uvx, but explicit is better
+# than waiting for "command not found" on the first stdio upstream.
+Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/snap/bin
+Environment=HOME=$DATA_DIR
+
 # Restart on crash with backoff.
 Restart=on-failure
 RestartSec=5
@@ -155,7 +181,8 @@ StateDirectory=toolyard
 StateDirectoryMode=0700
 LogsDirectory=toolyard
 
-# Sandbox.
+# Sandbox — read-only filesystem outside ReadWritePaths, no kernel namespaces,
+# no SUID, syscall allowlist tuned for a network service.
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true
@@ -172,11 +199,10 @@ RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX AF_NETLINK
 RestrictNamespaces=true
 RestrictRealtime=true
 RestrictSUIDSGID=true
-LockPersonality=true
-MemoryDenyWriteExecute=true
 SystemCallArchitectures=native
 SystemCallFilter=@system-service
 SystemCallFilter=~@privileged @resources
+$JIT_FLAGS
 ReadWritePaths=$DATA_DIR
 
 # Resource caps.
