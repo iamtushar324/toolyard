@@ -683,12 +683,20 @@ func staticHandler() http.Handler {
 			_, _ = w.Write(body)
 			return
 		}
-		// Common content types for our few static files.
+		// Common content types for our few static files. http.FileServer
+		// can sometimes mistype CSS as text/plain on systems with sparse
+		// /etc/mime.types — be explicit so the browser actually applies it
+		// (and the strict Content-Security-Policy doesn't reject it for
+		// being the wrong MIME).
 		switch filepath.Ext(r.URL.Path) {
 		case ".webmanifest":
 			w.Header().Set("Content-Type", "application/manifest+json")
 		case ".svg":
 			w.Header().Set("Content-Type", "image/svg+xml")
+		case ".css":
+			w.Header().Set("Content-Type", "text/css; charset=utf-8")
+		case ".js":
+			w.Header().Set("Content-Type", "application/javascript; charset=utf-8")
 		}
 		fileServer.ServeHTTP(w, r)
 	})
