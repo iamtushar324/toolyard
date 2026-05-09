@@ -25,6 +25,9 @@
 .idea/
 *.swp
 
+# Claude Code local state
+.claude/
+
 # Web
 web/dashboard/node_modules/
 web/dashboard/dist/

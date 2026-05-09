@@ -5,9 +5,9 @@ import "testing"
 func TestEvalCategories(t *testing.T) {
 	e := New()
 	cases := []struct {
-		name     string
-		req      Request
-		want     Action
+		name string
+		req  Request
+		want Action
 	}{
 		{"explicit read", Request{IntentCategory: "read", ToolName: "github.delete_repo"}, ActionAllow},
 		{"explicit write", Request{IntentCategory: "write", ToolName: "memory.get"}, ActionApprove},

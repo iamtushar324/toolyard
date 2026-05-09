@@ -38,6 +38,7 @@ import (
 	"github.com/tusharbhardwaj/toolyard/internal/identity"
 	"github.com/tusharbhardwaj/toolyard/internal/memory"
 	"github.com/tusharbhardwaj/toolyard/internal/metrics"
+	"github.com/tusharbhardwaj/toolyard/internal/oauth"
 	"github.com/tusharbhardwaj/toolyard/internal/policy"
 	"github.com/tusharbhardwaj/toolyard/internal/push"
 	"github.com/tusharbhardwaj/toolyard/internal/realtime"
@@ -102,11 +103,16 @@ func runServe(argv []string) error {
 	stdio := fs.Bool("stdio", false, "also serve MCP over stdio (for direct agent host wiring)")
 	upstreamConfig := fs.String("upstreams", "", "path to JSON file with upstream MCP server configs (optional)")
 	pushSubject := fs.String("push-subject", "mailto:admin@example.invalid", "VAPID `sub` claim")
-	inLineWait := fs.Duration("in-line-wait", 30*time.Second, "max time to block a held call before returning a deferred response")
+	// Default 0: defer immediately. Agents use tools.poll_approval /
+	// tools.wait_for_approval to coordinate. Operators with old MCP
+	// clients that don't understand the deferred envelope can set this
+	// to e.g. 90s to fall back to the legacy block-and-hold behaviour.
+	inLineWait := fs.Duration("in-line-wait", 0, "if non-zero, hold an approval-required call open for up to this long waiting for a human decision before returning the deferred-response envelope. The new default 0s returns the envelope immediately and lets the agent poll via tools.poll_approval or block via tools.wait_for_approval.")
 	approvalTTL := fs.Duration("approval-ttl", 3*time.Hour, "how long a pending approval stays decidable before auto-expiring")
 	publicURL := fs.String("public-url", "", "public origin (e.g. https://toolyard.example.com). When set, enables HSTS, secure cookies, Origin enforcement, and locks /v1/auth/setup to loopback.")
 	trustedProxies := fs.String("trusted-proxy", "", "comma-separated CIDRs to trust for X-Forwarded-* headers (e.g. 127.0.0.1/32,::1/128,10.0.0.0/8)")
 	requireAuthMCP := fs.Bool("require-auth-on-mcp", false, "reject anonymous /mcp calls (no Authorization header). Auto-enabled when -public-url is set.")
+	statelessMCP := fs.Bool("stateless-mcp", false, "skip MCP session-ID tracking. Every request stands alone — no server-initiated notifications, but agents that don't auto-reconnect on session-invalid (e.g., hermes) survive a toolyard restart without manual intervention.")
 	noStdioUpstreams := fs.Bool("no-stdio-upstreams", false, "refuse to start any stdio (subprocess) MCP upstream. Use when the dashboard is exposed publicly so a compromised session can't spawn arbitrary commands.")
 	envDenylistFlag := fs.String("upstream-env-denylist", "LD_PRELOAD,LD_LIBRARY_PATH,DYLD_INSERT_LIBRARIES,DYLD_LIBRARY_PATH,PATH", "comma-separated env var keys forbidden in upstream stdio configs")
 	_ = fs.Parse(argv)
@@ -172,12 +178,12 @@ func runServe(argv []string) error {
 				Tag:      req.ID,
 			}
 			payload := map[string]any{
-				"title":           n.Title,
-				"body":            n.Body,
-				"url":             n.URL,
-				"approval_id":     req.ID,
-				"decision_token":  req.DecisionToken,
-				"tag":             req.ID,
+				"title":          n.Title,
+				"body":           n.Body,
+				"url":            n.URL,
+				"approval_id":    req.ID,
+				"decision_token": req.DecisionToken,
+				"tag":            req.ID,
 			}
 			_ = pushSvc.Notify(ctx, user.ID, payload)
 		}
@@ -220,18 +226,19 @@ func runServe(argv []string) error {
 	go runRetentionCompactor(ctx, metricsReader, settingsSvc)
 
 	gw := gateway.New(gateway.Options{
-		Name:       "toolyard",
-		Version:    version,
-		Policy:     policy.New(),
-		Approval:   bus,
-		Audit:      auditSvc,
-		Hub:        hub,
-		Memory:     memSvc,
-		InLineWait: *inLineWait,
-		Visibility: vis,
-		Usage:      usageSvc,
-		Metrics:    metricsRec,
-		Surface:    vis,
+		Name:          "toolyard",
+		Version:       version,
+		Policy:        policy.New(),
+		Approval:      bus,
+		Audit:         auditSvc,
+		Hub:           hub,
+		Memory:        memSvc,
+		InLineWait:    *inLineWait,
+		Visibility:    vis,
+		Usage:         usageSvc,
+		Metrics:       metricsRec,
+		MetricsReader: metricsReader,
+		Surface:       vis,
 	})
 	gw.RegisterBuiltins()
 	defer gw.Close()
@@ -244,6 +251,31 @@ func runServe(argv []string) error {
 	if *noStdioUpstreams {
 		log.Printf("toolyard: stdio upstreams disabled (--no-stdio-upstreams)")
 	}
+
+	// Wire the OAuth service. Master key lives in <data-dir>/oauth.key
+	// (separate from session.key so leaking the cookie HMAC doesn't expose
+	// every upstream's refresh token). The hub adapter forwards the
+	// service's small set of event names ("mcp_oauth_done", etc.) onto the
+	// dashboard's SSE feed.
+	oauthKey, err := oauth.LoadOrCreateKey(*dataDir)
+	if err != nil {
+		return fmt.Errorf("oauth key: %w", err)
+	}
+	oauthCipher, err := oauth.NewCipher(oauthKey)
+	if err != nil {
+		return fmt.Errorf("oauth cipher: %w", err)
+	}
+	oauthSvc := oauth.New(db, oauthCipher,
+		hubEventBus{hub: hub},
+		pushSvc,
+		identityResolver{id: idSvc},
+	)
+	upstreamSvc.SetAuth(oauthSvc)
+	if err := oauthSvc.PrimeBearers(ctx); err != nil {
+		log.Printf("oauth: prime bearers: %v", err)
+	}
+	go oauthSvc.RunRefresher(ctx)
+
 	if err := upstreamSvc.LoadAll(ctx); err != nil {
 		log.Printf("upstreams: load: %v", err)
 	}
@@ -275,6 +307,7 @@ func runServe(argv []string) error {
 		Usage:        usageSvc,
 		Metrics:      metricsReader,
 		AutoApproval: autoApprover,
+		OAuth:        oauthSvc,
 		SessionKey:   loadOrCreateSessionKey(*dataDir),
 		Security:     secOpts,
 	})
@@ -286,7 +319,22 @@ func runServe(argv []string) error {
 	// HTTP over stdio. Auth via Authorization: Bearer <agent-token>.
 	streamable := server.NewStreamableHTTPServer(gw.MCPServer(),
 		server.WithEndpointPath("/mcp"),
-		server.WithStateLess(false),
+		// Stateless mode is opt-in via -stateless-mcp. The default
+		// (stateful) lets us push notifications/tools/list_changed to
+		// connected agents when servers/settings change; the cost is
+		// every toolyard restart invalidates outstanding session IDs and
+		// MCP clients that don't auto-reconnect on session-invalid see
+		// "Invalid session ID" 404s until they're manually bounced.
+		server.WithStateLess(*statelessMCP),
+		// In stateless mode there's no session for the server to push
+		// notifications onto, so a GET /mcp listening connection has
+		// nothing to ever stream — but mcp-go will hold it open
+		// indefinitely waiting. Clients like hermes that open a GET
+		// listener as part of their handshake then time out before
+		// they ever try POST. Telling the server to 405 GETs in
+		// stateless mode lets those clients immediately fall back to
+		// POST-only operation, which works fine.
+		server.WithDisableStreaming(*statelessMCP),
 		server.WithHTTPContextFunc(func(ctx context.Context, r *http.Request) context.Context {
 			tok := r.Header.Get("Authorization")
 			if strings.HasPrefix(tok, "Bearer ") {
@@ -652,6 +700,22 @@ func staticHandler() http.Handler {
 		panic(err)
 	}
 	fileServer := http.FileServer(http.FS(sub))
+
+	// Bust browser caches across deploys: hash app.js + style.css at
+	// startup, then rewrite index.html's <script src="/app.js"> and
+	// <link href="/style.css"> to include ?v=<hash>. A new build → new
+	// hash → the browser fetches a fresh URL it has never seen, even
+	// when the previously-cached asset still has a long-lived freshness
+	// window (which Cache-Control:no-cache cannot retroactively shorten).
+	appHash := assetHash(sub, "app.js")
+	cssHash := assetHash(sub, "style.css")
+	swHash := assetHash(sub, "sw.js")
+	rewriteIndex := func(body []byte) []byte {
+		out := strings.ReplaceAll(string(body), `src="/app.js"`, `src="/app.js?v=`+appHash+`"`)
+		out = strings.ReplaceAll(out, `href="/style.css"`, `href="/style.css?v=`+cssHash+`"`)
+		return []byte(out)
+	}
+
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Don't let SPA path swallow the API.
 		if strings.HasPrefix(r.URL.Path, "/v1/") || strings.HasPrefix(r.URL.Path, "/mcp") {
@@ -673,12 +737,14 @@ func staticHandler() http.Handler {
 		// Serve index.html for the root and any unknown path so the SPA can
 		// pick up via #hash routing.
 		if r.URL.Path == "/" || !assetExists(sub, strings.TrimPrefix(r.URL.Path, "/")) {
-			body, err := fs.ReadFile(dashboard.Assets, "index.html")
+			raw, err := fs.ReadFile(dashboard.Assets, "index.html")
 			if err != nil {
 				http.Error(w, "missing index", http.StatusInternalServerError)
 				return
 			}
+			body := rewriteIndex(raw)
 			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+			w.Header().Set("Cache-Control", "no-cache")
 			etag := contentETag(body)
 			w.Header().Set("ETag", etag)
 			if r.Header.Get("If-None-Match") == etag {
@@ -688,6 +754,7 @@ func staticHandler() http.Handler {
 			_, _ = w.Write(body)
 			return
 		}
+		_ = swHash // referenced for completeness; sw.js is loaded once and updates via SW lifecycle
 		// Common content types for our few static files. http.FileServer
 		// can sometimes mistype CSS as text/plain on systems with sparse
 		// /etc/mime.types — be explicit so the browser actually applies it
@@ -724,9 +791,40 @@ func assetExists(sub fs.FS, name string) bool {
 	return err == nil
 }
 
+// assetHash returns 8 hex chars of sha256(body) for the embedded asset,
+// or "dev" if the file is missing (shouldn't happen, but we don't want
+// to panic the binary on a stripped build).
+func assetHash(sub fs.FS, name string) string {
+	body, err := fs.ReadFile(sub, name)
+	if err != nil || len(body) == 0 {
+		return "dev"
+	}
+	sum := sha256.Sum256(body)
+	return base64.RawURLEncoding.EncodeToString(sum[:])[:8]
+}
+
 func contentETag(body []byte) string {
 	sum := sha256.Sum256(body)
 	return `W/"` + base64.RawURLEncoding.EncodeToString(sum[:8]) + `"`
+}
+
+// hubEventBus adapts realtime.Hub to oauth.EventBus by translating
+// (eventType, data) -> realtime.Event{Type, Data}.
+type hubEventBus struct{ hub *realtime.Hub }
+
+func (h hubEventBus) Publish(eventType string, data any) {
+	h.hub.Publish(realtime.Event{Type: eventType, Data: data})
+}
+
+// identityResolver adapts identity.Service.PrimaryUser → oauth.IdentityResolver.
+type identityResolver struct{ id *identity.Service }
+
+func (r identityResolver) PrimaryUserID(ctx context.Context) (string, error) {
+	u, err := r.id.PrimaryUser(ctx)
+	if err != nil {
+		return "", err
+	}
+	return u.ID, nil
 }
 
 // silence unused-import warnings in case build tags drop something.

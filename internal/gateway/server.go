@@ -22,9 +22,23 @@ import (
 )
 
 const (
-	builtinUpstream    = "builtin"
-	defaultInLineWait  = 30 * time.Second
+	builtinUpstream = "builtin"
+	// defaultInLineWait used to be 30s — block the agent's HTTP request
+	// for up to half a minute hoping a human taps Allow. The new model
+	// returns deferred immediately and lets the agent decide whether to
+	// poll or wait via tools.poll_approval / tools.wait_for_approval.
+	// Operators can opt back into the legacy flow with -in-line-wait > 0.
+	defaultInLineWait  = 0
 	deferredRetryAfter = 60
+	// DefaultMaxPendingPerAgent caps how many approvals one agent can
+	// have queued at once. With the deferred-by-default flow agents can
+	// fire many in parallel; this stops a runaway agent from filling the
+	// human reviewer's queue.
+	DefaultMaxPendingPerAgent = 16
+	// WaitForApprovalMaxTimeout caps tools.wait_for_approval so a single
+	// blocking call can't hold a connection longer than common LB read
+	// timeouts.
+	WaitForApprovalMaxTimeout = 5 * time.Minute
 )
 
 // ErrUpstreamNotFound is returned when an upstream is referenced by name but
@@ -37,12 +51,18 @@ var ErrUpstreamNotFound = errors.New("upstream not found")
 // as a baseline shared scratchpad). The set is hardcoded — there is no UI
 // for removing entries.
 var PinnedTools = map[string]struct{}{
-	"tools.search":  {},
-	"tools.execute": {},
-	"memory.get":    {},
-	"memory.set":    {},
-	"memory.list":   {},
-	"memory.delete": {},
+	"tools.search":                    {},
+	"tools.execute":                   {},
+	"tools.poll_approval":             {},
+	"tools.poll_approvals":            {},
+	"tools.wait_for_approval":         {},
+	"tools.list_my_pending_approvals": {},
+	"tools.cancel_my_approval":        {},
+	"tools.approval_stats":            {},
+	"memory.get":                      {},
+	"memory.set":                      {},
+	"memory.list":                     {},
+	"memory.delete":                   {},
 }
 
 // IsPinned reports whether toolName is in the always-visible set.
@@ -68,17 +88,19 @@ type toolEntry struct {
 // Gateway stitches the MCP server, policy, approval bus, memory, and upstream
 // pool into one coordinated unit.
 type Gateway struct {
-	mcp        *server.MCPServer
-	policy     *policy.Engine
-	approval   *approval.Bus
-	audit      *audit.Logger
-	hub        *realtime.Hub
-	memory     *memory.Service
-	visibility VisibilityProvider
-	usage      UsageRecorder
-	metrics    MetricsRecorder
-	surface    SurfaceModeProvider
-	inLineWait time.Duration
+	mcp                *server.MCPServer
+	policy             *policy.Engine
+	approval           *approval.Bus
+	audit              *audit.Logger
+	hub                *realtime.Hub
+	memory             *memory.Service
+	visibility         VisibilityProvider
+	usage              UsageRecorder
+	metrics            MetricsRecorder
+	metricsReader      MetricsLatencyReader
+	surface            SurfaceModeProvider
+	inLineWait         time.Duration
+	maxPendingPerAgent int
 
 	mu        sync.RWMutex
 	tools     map[string]toolEntry
@@ -116,9 +138,18 @@ type Options struct {
 	// Events are recorded asynchronously so this never adds latency to
 	// the request path.
 	Metrics MetricsRecorder
+	// MetricsReader, if non-nil, lets the gateway look up the human
+	// reviewer's recent decision-time percentiles so deferred responses
+	// can tell the agent "expected ~30s" instead of guessing. Optional —
+	// when nil the deferred envelope omits the timing hint and the agent
+	// gets a static fallback in next_steps_for_agent.
+	MetricsReader MetricsLatencyReader
 	// Surface lets the gateway tag each event with the active surface_mode
 	// so analytics can correlate visibility decisions to call counts.
 	Surface SurfaceModeProvider
+	// MaxPendingPerAgent overrides the per-agent pending-approval cap.
+	// Zero falls back to DefaultMaxPendingPerAgent.
+	MaxPendingPerAgent int
 }
 
 // UsageRecorder is satisfied by *internal/usage.Service. The gateway only
@@ -131,6 +162,14 @@ type UsageRecorder interface {
 // here as a small interface so test doubles don't need a DB.
 type MetricsRecorder interface {
 	Record(metrics.Event)
+}
+
+// MetricsLatencyReader returns the human reviewer's recent
+// decision-time percentiles for use in deferred-response envelopes.
+// Implemented by *internal/metrics.Reader; gateway treats nil as "no
+// hint available."
+type MetricsLatencyReader interface {
+	ApprovalLatency(ctx context.Context, fingerprint, toolName, upstream string) *metrics.ApprovalLatencyEstimate
 }
 
 // SurfaceModeProvider returns the surface mode that was in effect when a
@@ -146,8 +185,13 @@ func New(opts Options) *Gateway {
 	if opts.Version == "" {
 		opts.Version = "0.1.0"
 	}
-	if opts.InLineWait == 0 {
+	// InLineWait of 0 is the new default: deferred response is returned
+	// immediately. We treat any negative value as "use the default."
+	if opts.InLineWait < 0 {
 		opts.InLineWait = defaultInLineWait
+	}
+	if opts.MaxPendingPerAgent <= 0 {
+		opts.MaxPendingPerAgent = DefaultMaxPendingPerAgent
 	}
 	serverOpts := []server.ServerOption{
 		server.WithToolCapabilities(true),
@@ -165,19 +209,21 @@ func New(opts Options) *Gateway {
 	}
 	mcpSrv := server.NewMCPServer(opts.Name, opts.Version, serverOpts...)
 	return &Gateway{
-		mcp:        mcpSrv,
-		policy:     opts.Policy,
-		approval:   opts.Approval,
-		audit:      opts.Audit,
-		hub:        opts.Hub,
-		memory:     opts.Memory,
-		visibility: opts.Visibility,
-		usage:      opts.Usage,
-		metrics:    opts.Metrics,
-		surface:    opts.Surface,
-		inLineWait: opts.InLineWait,
-		tools:      map[string]toolEntry{},
-		upstreams:  map[string]*upstream{},
+		mcp:                mcpSrv,
+		policy:             opts.Policy,
+		approval:           opts.Approval,
+		audit:              opts.Audit,
+		hub:                opts.Hub,
+		memory:             opts.Memory,
+		visibility:         opts.Visibility,
+		usage:              opts.Usage,
+		metrics:            opts.Metrics,
+		metricsReader:      opts.MetricsReader,
+		surface:            opts.Surface,
+		inLineWait:         opts.InLineWait,
+		maxPendingPerAgent: opts.MaxPendingPerAgent,
+		tools:              map[string]toolEntry{},
+		upstreams:          map[string]*upstream{},
 	}
 }
 
@@ -202,6 +248,7 @@ func (g *Gateway) RegisterBuiltins() {
 	entries := g.builtinMemoryTools()
 	entries = append(entries, g.staticFixtureTool())
 	entries = append(entries, g.metaTools()...)
+	entries = append(entries, g.approvalMetaTools()...)
 	for _, e := range entries {
 		g.registerEntry(e)
 	}
@@ -528,7 +575,26 @@ func (g *Gateway) handlerFor(toolName string) server.ToolHandlerFunc {
 func (g *Gateway) holdAndWait(ctx context.Context, entry toolEntry, args map[string]any,
 	agentID, reason, intent string, ev *metrics.Event) (*mcp.CallToolResult, error) {
 
-	holdCtx, cancel := context.WithTimeout(ctx, g.inLineWait+5*time.Second)
+	// Per-agent budget: too many concurrent pendings from one agent can
+	// drown the human reviewer. Reject before persisting so a runaway
+	// agent doesn't fill the queue.
+	if agentID != "" && g.approval != nil {
+		if n, err := g.approval.CountPendingForAgent(ctx, agentID); err == nil && n >= g.maxPendingPerAgent {
+			ev.Outcome = metrics.OutcomeError
+			ev.ErrorClass = "budget"
+			return budgetExceededResponse(agentID, n, g.maxPendingPerAgent), nil
+		}
+	}
+
+	// holdCtx ensures Hold() unblocks even if the caller's context is
+	// long. With inLineWait=0 (the new default) Hold returns immediately
+	// after the row is committed; we still give a tiny buffer for the
+	// auto-approval evaluator and SQLite write.
+	holdTimeout := g.inLineWait + 5*time.Second
+	if holdTimeout < 5*time.Second {
+		holdTimeout = 5 * time.Second
+	}
+	holdCtx, cancel := context.WithTimeout(ctx, holdTimeout)
 	defer cancel()
 
 	holdStart := time.Now()
@@ -593,7 +659,7 @@ func (g *Gateway) holdAndWait(ctx context.Context, entry toolEntry, args map[str
 	default:
 		// Still pending after in-line window — return deferred response.
 		ev.Outcome = metrics.OutcomeDeferred
-		return deferredResponse(req), nil
+		return g.deferredResponse(ctx, req, entry, args), nil
 	}
 }
 
@@ -642,10 +708,40 @@ func (g *Gateway) resumeDeferred(ctx context.Context, entry toolEntry, approvalI
 		ev.ApprovalOutcome = metrics.ApprovalExpired
 		ev.Outcome = metrics.OutcomeExpired
 		return mcp.NewToolResultError("approval window expired without a decision"), nil
+	case approval.StatusCancelled:
+		ev.ApprovalOutcome = metrics.ApprovalDenied
+		ev.Outcome = metrics.OutcomeDenied
+		return mcp.NewToolResultError("approval was cancelled by the agent"), nil
 	default:
 		ev.Outcome = metrics.OutcomeDeferred
-		return deferredResponse(req), nil
+		return g.deferredResponse(ctx, req, entry, req.Arguments), nil
 	}
+}
+
+// budgetExceededResponse explains the per-agent pending cap to the AI
+// in the same self-describing envelope shape as a deferred response, so
+// the client knows it should poll/cancel its existing pendings before
+// firing more.
+func budgetExceededResponse(agentID string, current, max int) *mcp.CallToolResult {
+	text := fmt.Sprintf(
+		"Per-agent pending-approval budget exceeded: you have %d pendings (max %d). "+
+			"Resolve or cancel some before firing new approval-required calls. "+
+			"Use tools.list_my_pending_approvals to see them, "+
+			"tools.poll_approvals to check status, or tools.cancel_my_approval to withdraw.",
+		current, max)
+	res := mcp.NewToolResultError(text)
+	res.StructuredContent = map[string]any{
+		"status":           "agent_pending_budget_exceeded",
+		"agent_id":         agentID,
+		"current_pendings": current,
+		"budget":           max,
+		"recovery_options": []map[string]any{
+			{"tool": "tools.list_my_pending_approvals", "args": map[string]any{"_reason": "(your reason)"}},
+			{"tool": "tools.poll_approvals", "args": map[string]any{"approval_ids": []string{"…"}, "_reason": "(your reason)"}},
+			{"tool": "tools.cancel_my_approval", "args": map[string]any{"approval_id": "…", "_reason": "(your reason)"}},
+		},
+	}
+	return res
 }
 
 func (g *Gateway) dispatch(ctx context.Context, entry toolEntry, args map[string]any,
@@ -670,12 +766,12 @@ func (g *Gateway) dispatch(ctx context.Context, entry toolEntry, args map[string
 	ev.UpstreamLatencyMs = int(time.Since(upstreamStart).Milliseconds())
 	if err != nil {
 		_ = g.audit.Write(ctx, audit.Event{
-			EventType:    audit.EventCallFailed,
-			AgentID:      agentID,
-			UpstreamName: entry.upstream,
-			ToolName:     entry.tool.Name,
-			Reason:       reason,
-			ApprovalID:   approvalID,
+			EventType:     audit.EventCallFailed,
+			AgentID:       agentID,
+			UpstreamName:  entry.upstream,
+			ToolName:      entry.tool.Name,
+			Reason:        reason,
+			ApprovalID:    approvalID,
 			ResultSummary: err.Error(),
 		})
 		ev.Outcome = metrics.OutcomeError
@@ -683,12 +779,12 @@ func (g *Gateway) dispatch(ctx context.Context, entry toolEntry, args map[string
 		return mcp.NewToolResultErrorFromErr("tool failed", err), nil
 	}
 	_ = g.audit.Write(ctx, audit.Event{
-		EventType:    audit.EventCallSucceeded,
-		AgentID:      agentID,
-		UpstreamName: entry.upstream,
-		ToolName:     entry.tool.Name,
-		Reason:       reason,
-		ApprovalID:   approvalID,
+		EventType:     audit.EventCallSucceeded,
+		AgentID:       agentID,
+		UpstreamName:  entry.upstream,
+		ToolName:      entry.tool.Name,
+		Reason:        reason,
+		ApprovalID:    approvalID,
 		ResultSummary: summariseResult(res),
 	})
 	if g.usage != nil && !res.IsError {
@@ -725,24 +821,144 @@ func approxResultSize(res *mcp.CallToolResult) int {
 	return n
 }
 
-// deferredResponse formats the "approval pending — retry with _approval_id"
-// body described in the plan.
-func deferredResponse(req *approval.Request) *mcp.CallToolResult {
+// deferredResponse builds the "approval queued, here's how to track it"
+// envelope. Both the human-readable text and the structured_content carry
+// enough context for any MCP client to react intelligently — the AI
+// learns the meta-tool names and recommended polling cadence from the
+// response itself, no out-of-band documentation required.
+func (g *Gateway) deferredResponse(ctx context.Context, req *approval.Request, entry toolEntry, originalArgs map[string]any) *mcp.CallToolResult {
 	expires := time.UnixMilli(req.ExpiresAt).UTC().Format(time.RFC3339)
-	text := fmt.Sprintf(
-		"Approval pending. Re-call this tool with _approval_id=%q to resume. Expires at %s.",
-		req.ID, expires,
-	)
-	res := mcp.NewToolResultText(text)
-	res.StructuredContent = map[string]any{
-		"status":              "pending_approval",
-		"approval_id":         req.ID,
-		"retry_after_seconds": deferredRetryAfter,
-		"expires_at":          expires,
+
+	// Latency hint: the most-specific bucket with enough samples wins.
+	var latencyHint *metrics.ApprovalLatencyEstimate
+	if g.metricsReader != nil {
+		latencyHint = g.metricsReader.ApprovalLatency(ctx, req.Fingerprint, entry.tool.Name, entry.upstream)
 	}
+	expected := defaultExpectedDecisionSeconds
+	expectedBasis := "default-static-guess"
+	expectedSamples := 0
+	expectedP90 := 0
+	if latencyHint != nil && latencyHint.BasedOn != "default" && latencyHint.P50Seconds > 0 {
+		expected = latencyHint.P50Seconds
+		expectedBasis = latencyHint.BasedOn
+		expectedSamples = latencyHint.Samples
+		expectedP90 = latencyHint.P90Seconds
+	}
+
+	// Snapshot of this agent's other in-flight pendings so the AI can plan
+	// batch polling. Best-effort — failure here doesn't break the deferred path.
+	var otherPendings []string
+	if g.approval != nil && req.AgentID != "" {
+		if peers, err := g.approval.ListPendingByAgent(ctx, req.AgentID); err == nil {
+			for _, p := range peers {
+				if p.ID == req.ID {
+					continue
+				}
+				otherPendings = append(otherPendings, p.ID)
+			}
+		}
+	}
+
+	// Plain-text body — visible to any MCP client that doesn't read structured_content.
+	text := buildDeferredText(req, expires, expected)
+
+	// Structured content — the protocol guide for AI clients that DO read it.
+	envelope := map[string]any{
+		// "pending_approval" is the canonical status the dashboard's
+		// workbench filters on. We keep the value stable so existing
+		// consumers keep working; the rich metadata around it is what's
+		// new in the deferred-by-default flow.
+		"status":          "pending_approval",
+		"approval_id":     req.ID,
+		"fingerprint":     req.Fingerprint,
+		"agent_id":        req.AgentID,
+		"tool":            entry.tool.Name,
+		"upstream":        entry.upstream,
+		"reason_to_human": req.Reason,
+		"queued_at":       time.UnixMilli(req.CreatedAt).UTC().Format(time.RFC3339),
+		"expires_at":      expires,
+		"expected_decision": map[string]any{
+			"in_seconds_p50": expected,
+			"in_seconds_p90": expectedP90,
+			"based_on":       expectedBasis,
+			"samples":        expectedSamples,
+			"window_days":    defaultExpectedDecisionWindowDays,
+		},
+		"your_other_pending":        otherPendings,
+		"min_poll_interval_seconds": minPollIntervalSeconds,
+		"next_steps_for_agent": map[string]any{
+			"poll_status": map[string]any{
+				"tool":     "tools.poll_approval",
+				"args":     map[string]any{"approval_id": req.ID, "_reason": "(your reason)"},
+				"blocking": false,
+			},
+			"poll_many_at_once": map[string]any{
+				"tool":     "tools.poll_approvals",
+				"args":     map[string]any{"approval_ids": []string{req.ID}, "_reason": "(your reason)"},
+				"blocking": false,
+				"hint":     "more efficient than one-at-a-time when several approvals are in flight",
+			},
+			"wait_then_check": map[string]any{
+				"tool":                "tools.wait_for_approval",
+				"args":                map[string]any{"approval_id": req.ID, "timeout_seconds": 60, "_reason": "(your reason)"},
+				"blocking":            true,
+				"max_timeout_seconds": int(WaitForApprovalMaxTimeout.Seconds()),
+			},
+			"execute_when_approved": map[string]any{
+				"tool": entry.tool.Name,
+				"args": map[string]any{"_approval_id": req.ID, "_reason": "(your reason)"},
+				"hint": "the gateway preserves your original arguments; only _approval_id is required to resume",
+			},
+			"cancel_if_no_longer_needed": map[string]any{
+				"tool": "tools.cancel_my_approval",
+				"args": map[string]any{"approval_id": req.ID, "_reason": "(your reason)"},
+			},
+			"list_all_my_pending": map[string]any{
+				"tool": "tools.list_my_pending_approvals",
+				"args": map[string]any{"_reason": "(your reason)"},
+			},
+		},
+		"concurrency_advice": "You may fire other approval-required tools in parallel; each returns its own approval_id without holding any connection. Polling all at once via tools.poll_approvals is more efficient than serially.",
+	}
+	res := mcp.NewToolResultText(text)
+	res.StructuredContent = envelope
 	res.Meta = &mcp.Meta{AdditionalFields: map[string]any{"toolyard.deferred": true}}
 	return res
 }
+
+// buildDeferredText is the plain-text version of the envelope. Every MCP
+// client renders text content; this paragraph is what humans / older AI
+// clients see when they don't parse structured_content.
+func buildDeferredText(req *approval.Request, expires string, expectedSeconds int) string {
+	var b strings.Builder
+	b.WriteString("Tool execution requires human approval. Your call has been queued.\n\n")
+	fmt.Fprintf(&b, "approval_id: %s\n", req.ID)
+	if expectedSeconds > 0 {
+		fmt.Fprintf(&b, "expected_decision_in: ~%ds (based on the human reviewer's recent average)\n", expectedSeconds)
+	}
+	fmt.Fprintf(&b, "expires_at: %s\n\n", expires)
+	b.WriteString("To proceed:\n")
+	b.WriteString("- Continue with other work; you may fire more approval-required tools in parallel.\n")
+	fmt.Fprintf(&b, "- Poll status: tools.poll_approval(approval_id=%q)\n", req.ID)
+	fmt.Fprintf(&b, "- Block until decided: tools.wait_for_approval(approval_id=%q, timeout_seconds=60)\n", req.ID)
+	fmt.Fprintf(&b, "- When approved, re-call this tool with _approval_id=%q to execute.\n", req.ID)
+	if req.Reason != "" {
+		b.WriteString("\nThe human reviewer sees your reason: ")
+		b.WriteString(strings.TrimSpace(req.Reason))
+	}
+	return b.String()
+}
+
+const (
+	// defaultExpectedDecisionSeconds is the static fallback when we have
+	// no historical data about this user's decision latency. 30s is a
+	// reasonable typical "look at phone, tap Allow."
+	defaultExpectedDecisionSeconds    = 30
+	defaultExpectedDecisionWindowDays = 30
+	// minPollIntervalSeconds is what the deferred envelope advertises to
+	// agents as a polite floor between poll attempts.
+	minPollIntervalSeconds = 3
+)
 
 func summariseResult(res *mcp.CallToolResult) string {
 	if res == nil {

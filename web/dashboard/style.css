@@ -23,6 +23,12 @@ body {
   font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, "Helvetica Neue", Arial, sans-serif;
   font-size: 14px;
   line-height: 1.4;
+  /* iOS PWA: prevent rubber-band overscroll bouncing past the layout */
+  overscroll-behavior-y: none;
+  /* Tap highlight is heavy on iOS — let buttons handle their own pressed state */
+  -webkit-tap-highlight-color: transparent;
+  /* Hardware-accelerated smooth scrolling on iOS */
+  -webkit-overflow-scrolling: touch;
 }
 a { color: var(--link); text-decoration: none; }
 a:hover { text-decoration: underline; }
@@ -56,6 +62,13 @@ header {
   align-items: center;
   gap: 16px;
   padding: 12px 20px;
+  /* iOS notch / Dynamic Island: push the header down behind the safe-area
+     inset so it isn't sitting under the status bar in standalone PWAs.
+     env(safe-area-inset-top) is 0 in regular browsers, ~44pt under the
+     iPhone notch. */
+  padding-top: calc(12px + env(safe-area-inset-top, 0px));
+  padding-left: calc(20px + env(safe-area-inset-left, 0px));
+  padding-right: calc(20px + env(safe-area-inset-right, 0px));
   border-bottom: 1px solid var(--border);
   background: var(--bg-elev);
   position: sticky;
@@ -73,7 +86,85 @@ nav button {
 }
 nav button.active { color: var(--text); border-color: var(--border); background: var(--bg-elev-2); }
 header .user { color: var(--muted); font-size: 13px; }
-main { max-width: 1100px; margin: 0 auto; padding: 20px; }
+main {
+  max-width: 1100px;
+  margin: 0 auto;
+  padding: 20px;
+  padding-left: calc(20px + env(safe-area-inset-left, 0px));
+  padding-right: calc(20px + env(safe-area-inset-right, 0px));
+  /* Leave room for the home indicator at the bottom of newer iPhones */
+  padding-bottom: calc(20px + env(safe-area-inset-bottom, 0px));
+}
+
+/* ---- bottom navigation (mobile only) ----
+   iOS users expect the primary nav at the bottom, not the top. We render
+   the same nav buttons in two locations and use CSS to show the
+   appropriate one per viewport. The bottom bar gets safe-area-inset-bottom
+   so the home indicator doesn't sit on top of the buttons. */
+.bottom-nav {
+  display: none; /* shown via media query below */
+  position: fixed;
+  bottom: 0;
+  left: 0;
+  right: 0;
+  background: var(--bg-elev);
+  border-top: 1px solid var(--border);
+  padding: 6px 8px;
+  padding-bottom: calc(6px + env(safe-area-inset-bottom, 0px));
+  padding-left: calc(8px + env(safe-area-inset-left, 0px));
+  padding-right: calc(8px + env(safe-area-inset-right, 0px));
+  z-index: 6;
+  /* Backdrop blur for that translucent iOS-native look when content scrolls under */
+  -webkit-backdrop-filter: blur(20px);
+  backdrop-filter: blur(20px);
+  background: rgba(22, 27, 34, 0.85);
+}
+.bottom-nav .row {
+  display: flex;
+  justify-content: space-around;
+  align-items: stretch;
+  gap: 0;
+  flex-wrap: nowrap;
+  width: 100%;
+}
+.bottom-nav button {
+  background: transparent;
+  border: 0;
+  color: var(--muted);
+  /* 44pt minimum tap target per Apple HIG */
+  min-height: 48px;
+  min-width: 56px;
+  padding: 4px 6px;
+  font-size: 11px;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 2px;
+  flex: 1 1 0;
+  border-radius: 8px;
+  position: relative;
+}
+.bottom-nav button .icon {
+  font-size: 20px;
+  line-height: 1;
+}
+.bottom-nav button.active { color: var(--text); }
+.bottom-nav button.active .icon { color: var(--accent); }
+.bottom-nav button .badge-count {
+  position: absolute;
+  top: 4px;
+  right: 14px;
+  background: var(--danger);
+  color: white;
+  font-size: 9px;
+  font-weight: 600;
+  min-width: 16px;
+  padding: 1px 4px;
+  border-radius: 999px;
+  border: 0;
+  line-height: 1.2;
+}
 .card {
   background: var(--bg-elev);
   border: 1px solid var(--border);
@@ -302,8 +393,97 @@ code { background: var(--bg); padding: 1px 4px; border-radius: 3px; font-size: 1
   .workbench { grid-template-columns: 1fr; }
   .workbench .tool-list { max-height: 220px; }
 }
-@media (max-width: 700px) {
-  main { padding: 12px; }
-  header { padding: 10px 12px; gap: 8px; }
-  nav { overflow-x: auto; }
+
+/* iPhone 11 portrait is 414px; we target 768 and below as "phone or small
+   tablet". Layout flips to single column, top nav hides in favor of the
+   bottom bar, and content gets enough bottom padding to clear the bar. */
+@media (max-width: 768px) {
+  /* Compact header — keep brand + status + logout, drop the top nav. */
+  header {
+    gap: 8px;
+    padding: 10px 12px;
+    padding-top: calc(10px + env(safe-area-inset-top, 0px));
+    padding-left: calc(12px + env(safe-area-inset-left, 0px));
+    padding-right: calc(12px + env(safe-area-inset-right, 0px));
+  }
+  header .brand { font-size: 15px; flex: 1; }
+  header nav { display: none; }
+  header .user { font-size: 12px; }
+
+  main {
+    padding: 12px;
+    padding-left: calc(12px + env(safe-area-inset-left, 0px));
+    padding-right: calc(12px + env(safe-area-inset-right, 0px));
+    /* Bottom nav is ~64px tall + safe-area; content has to clear it */
+    padding-bottom: calc(80px + env(safe-area-inset-bottom, 0px));
+  }
+
+  /* Bottom nav appears on mobile */
+  .bottom-nav { display: block; }
+
+  /* Cards: tighten padding to make more room. */
+  .card { padding: 12px; margin-bottom: 10px; }
+  .card h2 { font-size: 15px; }
+
+  /* Bigger tap targets across the board — 44pt minimum per Apple HIG. */
+  button {
+    min-height: 40px;
+    padding: 8px 14px;
+  }
+  /* Buttons inside .row that are explicitly action buttons should be full-touch */
+  .card .row button { min-height: 44px; }
+
+  /* Inputs: same minimum height + larger font (≥16px prevents iOS auto-zoom on focus). */
+  input, textarea, select {
+    min-height: 44px;
+    font-size: 16px;
+    padding: 10px 12px;
+  }
+  textarea { min-height: 100px; }
+
+  /* Tables become horizontally scrollable rather than overflowing the card.
+     Wrap any table in a card-content div automatically gets this via the card itself. */
+  .card { overflow-x: auto; }
+  table { min-width: 480px; }
+  th, td { padding: 10px 8px; font-size: 13px; }
+
+  /* Marketplace grid → single column to avoid cramped 260px cards squashing. */
+  .market-grid { grid-template-columns: 1fr; }
+
+  /* Modal: nearly fullscreen on mobile, slide from bottom feel. */
+  .modal {
+    width: 100%;
+    max-height: calc(100vh - env(safe-area-inset-top, 0px) - 40px);
+    overflow-y: auto;
+    margin: 0 8px;
+    padding: 16px;
+  }
+  .modal-bg {
+    align-items: flex-end;
+    padding-bottom: calc(env(safe-area-inset-bottom, 0px));
+  }
+  .modal { border-radius: 16px 16px 8px 8px; }
+
+  /* Toast: don't sit on top of bottom nav */
+  .toast {
+    bottom: calc(80px + env(safe-area-inset-bottom, 0px));
+    right: 12px;
+    left: 12px;
+    max-width: none;
+  }
+
+  /* Workbench: remove the side panel, stack list above pane */
+  .workbench { grid-template-columns: 1fr; gap: 8px; }
+  .workbench .tool-list { max-height: 200px; }
+
+  /* Tabs: scroll horizontally rather than wrap */
+  .tabs { overflow-x: auto; flex-wrap: nowrap; -webkit-overflow-scrolling: touch; }
+  .tabs button { white-space: nowrap; min-height: 40px; }
+}
+
+/* Very small phones (iPhone SE 1st gen, etc.) — 375px wide */
+@media (max-width: 380px) {
+  header .brand { font-size: 14px; }
+  .bottom-nav button .icon { font-size: 18px; }
+  .bottom-nav button { font-size: 10px; min-width: 48px; }
 }

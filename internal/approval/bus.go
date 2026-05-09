@@ -32,10 +32,11 @@ import (
 )
 
 const (
-	StatusPending  = "pending"
-	StatusAllowed  = "allowed"
-	StatusDenied   = "denied"
-	StatusExpired  = "expired"
+	StatusPending   = "pending"
+	StatusAllowed   = "allowed"
+	StatusDenied    = "denied"
+	StatusExpired   = "expired"
+	StatusCancelled = "cancelled"
 
 	signingKeyPurpose = "approval_sign"
 	// DefaultTTL is how long an approval row stays decidable. Phones and
@@ -69,7 +70,7 @@ type Request struct {
 	// AutoDecidedBy is the auto-approval rule id that decided this request,
 	// or empty if a human (or the rule engine wasn't consulted). Set on
 	// Status=allowed responses produced via the AutoApprover hook.
-	AutoDecidedBy  string         `json:"auto_decided_by,omitempty"`
+	AutoDecidedBy string `json:"auto_decided_by,omitempty"`
 }
 
 // Notifier is implemented by the push and realtime services so the bus can
@@ -472,6 +473,94 @@ func (b *Bus) Get(ctx context.Context, id string) (*Request, error) {
 		_ = json.Unmarshal([]byte(args), &req.Arguments)
 	}
 	return &req, nil
+}
+
+// CancelByAgent flips a pending approval to cancelled, but only if the
+// agent owns it. Used by tools.cancel_my_approval so an AI can withdraw
+// its own queue entry without involving the human reviewer. Errors with
+// ErrNotPending if the approval is already decided/expired/cancelled,
+// or ErrNotFound on missing/wrong-agent.
+func (b *Bus) CancelByAgent(ctx context.Context, id, agentID string) (*Request, error) {
+	res, err := b.db.ExecContext(ctx,
+		`UPDATE approval_requests SET status = ?, decided_by = ?, decided_at = ?
+         WHERE id = ? AND status = ? AND agent_id = ?`,
+		StatusCancelled, "agent:"+agentID, time.Now().UnixMilli(), id, StatusPending, agentID)
+	if err != nil {
+		return nil, err
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		existing, getErr := b.Get(ctx, id)
+		if getErr != nil {
+			return nil, ErrNotFound
+		}
+		// Either decided already, expired, or owned by a different agent —
+		// uniformly reported as ErrNotPending so callers don't probe other
+		// agents' queues.
+		if existing.AgentID != agentID {
+			return nil, ErrNotFound
+		}
+		return existing, ErrNotPending
+	}
+	req, err := b.Get(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	b.signal(id)
+	b.fanOut(ctx, req, "approval.cancel")
+	return req, nil
+}
+
+// ListPendingByAgent is the agent-scoped view used by
+// tools.list_my_pending_approvals — only returns rows whose agent_id
+// matches the caller, never leaks other agents' queues.
+func (b *Bus) ListPendingByAgent(ctx context.Context, agentID string) ([]Request, error) {
+	if agentID == "" {
+		return nil, nil
+	}
+	rows, err := b.db.QueryContext(ctx,
+		`SELECT id, agent_id, upstream_name, tool_name, arguments, reason,
+            COALESCE(intent_category,''), status, COALESCE(decision_token,''),
+            COALESCE(decided_by,''), COALESCE(decided_at,0), created_at, expires_at,
+            COALESCE(fingerprint,'')
+         FROM approval_requests WHERE status = ? AND agent_id = ?
+         ORDER BY created_at ASC`, StatusPending, agentID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []Request
+	for rows.Next() {
+		var req Request
+		var args string
+		if err := rows.Scan(&req.ID, &req.AgentID, &req.UpstreamName, &req.ToolName, &args,
+			&req.Reason, &req.IntentCategory, &req.Status, &req.DecisionToken,
+			&req.DecidedBy, &req.DecidedAt, &req.CreatedAt, &req.ExpiresAt,
+			&req.Fingerprint); err != nil {
+			return nil, err
+		}
+		if args != "" {
+			_ = json.Unmarshal([]byte(args), &req.Arguments)
+		}
+		out = append(out, req)
+	}
+	return out, rows.Err()
+}
+
+// CountPendingForAgent is the per-agent budget enforcer: how many
+// pendings does this agent currently have outstanding?
+func (b *Bus) CountPendingForAgent(ctx context.Context, agentID string) (int, error) {
+	if agentID == "" {
+		return 0, nil
+	}
+	row := b.db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM approval_requests WHERE status = ? AND agent_id = ?`,
+		StatusPending, agentID)
+	var n int
+	if err := row.Scan(&n); err != nil {
+		return 0, err
+	}
+	return n, nil
 }
 
 func (b *Bus) ListPending(ctx context.Context) ([]Request, error) {

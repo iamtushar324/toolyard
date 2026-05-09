@@ -15,14 +15,14 @@ import (
 // Detectors implemented:
 //
 //   - rate_spike      : per-agent calls/hour > zScore × stdev over the 7d
-//                       baseline.
+//     baseline.
 //   - error_spike     : per-tool 1h error rate > 3× the trailing-7d rate
-//                       (and at least 20 calls in the spike window).
+//     (and at least 20 calls in the spike window).
 //   - args_outlier    : args_size_bytes for a single call exceeds the
-//                       p99 of the trailing 30d sample for that tool by
-//                       at least 3×.
+//     p99 of the trailing 30d sample for that tool by
+//     at least 3×.
 //   - reason_repeat   : the same reason_text appears ≥5 times in 1h
-//                       across one agent (indicates "phoning it in").
+//     across one agent (indicates "phoning it in").
 type AnomalyDetector struct {
 	r        *Reader
 	zScore   float64
@@ -391,10 +391,11 @@ func ftoa(f float64, decimals int) string {
 // based on length + duplicate rate. Cheap and intended to be run periodically.
 //
 // The score is a heuristic in [0,1]:
-//   +0.4 if length >= 40
-//   +0.4 if length <= 600     (we want substance, not novels)
-//   +0.2 if first word is an action verb-ish token
-//   -0.6 if the same reason was used >= 5 times by this agent in the last 24h
+//
+//	+0.4 if length >= 40
+//	+0.4 if length <= 600     (we want substance, not novels)
+//	+0.2 if first word is an action verb-ish token
+//	-0.6 if the same reason was used >= 5 times by this agent in the last 24h
 func (r *Reader) ScoreReasons(ctx context.Context, since time.Time) error {
 	rows, err := r.db.QueryContext(ctx, `SELECT event_id, COALESCE(agent_id,''), reason_text
         FROM call_events

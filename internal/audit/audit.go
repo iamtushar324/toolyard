@@ -47,7 +47,7 @@ type Logger struct {
 }
 
 type subscribers struct {
-	mu      sync.Mutex
+	mu        sync.Mutex
 	listeners map[chan Event]struct{}
 }
 

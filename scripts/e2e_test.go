@@ -602,7 +602,13 @@ func TestE2ERouterOnlyMode(t *testing.T) {
 	defer c2.Close()
 	pinned := map[string]bool{
 		"tools.search": true, "tools.execute": true,
-		"memory.get": true, "memory.set": true,
+		"tools.poll_approval":             true,
+		"tools.poll_approvals":            true,
+		"tools.wait_for_approval":         true,
+		"tools.list_my_pending_approvals": true,
+		"tools.cancel_my_approval":        true,
+		"tools.approval_stats":            true,
+		"memory.get":                      true, "memory.set": true,
 		"memory.list": true, "memory.delete": true,
 	}
 	min, err := c2.ListTools(ctx, mcp.ListToolsRequest{})
@@ -740,15 +746,20 @@ func TestE2EUsageAndTopN(t *testing.T) {
 		gotNames[tl.Name] = true
 	}
 	t.Logf("cold-start agent saw %d tools: %v", len(tools.Tools), keysOf(gotNames))
-	pinned := []string{"tools.search", "tools.execute", "memory.get", "memory.set", "memory.list", "memory.delete"}
+	pinned := []string{
+		"tools.search", "tools.execute",
+		"tools.poll_approval", "tools.poll_approvals", "tools.wait_for_approval",
+		"tools.list_my_pending_approvals", "tools.cancel_my_approval", "tools.approval_stats",
+		"memory.get", "memory.set", "memory.list", "memory.delete",
+	}
 	for _, p := range pinned {
 		if !gotNames[p] {
 			t.Errorf("pinned tool %q not visible in top_n cold-start; got %v", p, keysOf(gotNames))
 		}
 	}
-	// We expect at most 6 pinned + 2 ranked tail = 8.
-	if len(tools.Tools) > 8 {
-		t.Errorf("expected ≤8 tools in top_n with N=2, got %d", len(tools.Tools))
+	// At most 12 pinned + 2 ranked tail = 14.
+	if len(tools.Tools) > len(pinned)+2 {
+		t.Errorf("expected ≤%d tools in top_n with N=2, got %d", len(pinned)+2, len(tools.Tools))
 	}
 	// memory.set is in the pinned set, so it'll be there regardless. Check
 	// at least one *non-pinned* tool came in via the ranked tail (if there
@@ -1073,49 +1084,58 @@ func TestE2EReasonValidation(t *testing.T) {
 	}
 }
 
-// callWithApproval issues the tool call in a goroutine, polls the dashboard
-// for the resulting pending approval, decides it, then waits for the call to
-// return.
+// callWithApproval drives the new defer-by-default flow end to end:
+// it issues the tool call (which returns the deferred-envelope
+// immediately), reads approval_id from structured_content, decides via
+// the dashboard API, then re-calls the tool with _approval_id to
+// resume. Returns the final result. If the original call surfaced a
+// pending-approval envelope but the human denied it, the resume still
+// happens and is expected to come back with an error.
 func callWithApproval(t *testing.T, h *httpClient, c *client.Client, ctx context.Context,
 	tool string, args map[string]any, action string) (*mcp.CallToolResult, error) {
 	t.Helper()
-	type result struct {
-		res *mcp.CallToolResult
-		err error
+	req := mcp.CallToolRequest{}
+	req.Params.Name = tool
+	req.Params.Arguments = args
+	first, err := c.CallTool(ctx, req)
+	if err != nil {
+		return first, err
 	}
-	ch := make(chan result, 1)
-	go func() {
-		req := mcp.CallToolRequest{}
-		req.Params.Name = tool
-		req.Params.Arguments = args
-		res, err := c.CallTool(ctx, req)
-		ch <- result{res, err}
-	}()
-
-	deadline := time.Now().Add(15 * time.Second)
-	var apID string
-	for time.Now().Before(deadline) {
-		time.Sleep(150 * time.Millisecond)
-		var arr []map[string]any
-		h.raw(t, "GET", "/v1/approvals?status=pending", nil, &arr)
-		if len(arr) > 0 {
-			apID, _ = arr[0]["id"].(string)
-			break
+	sc, _ := first.StructuredContent.(map[string]any)
+	if sc == nil || sc["status"] != "pending_approval" {
+		// Inline-decided (auto-approval, or in-line-wait > 0 and the
+		// decision arrived before the wait timed out). Return as-is.
+		return first, nil
+	}
+	apID, _ := sc["approval_id"].(string)
+	if apID == "" {
+		t.Fatal("deferred envelope missing approval_id")
+	}
+	// The approval row's tool may differ from `tool` if the call went
+	// through a meta-tool proxy (e.g. tools.execute → memory.set holds
+	// against memory.set, not tools.execute). The envelope's
+	// next_steps_for_agent.execute_when_approved.tool tells us what to
+	// re-call with — use that.
+	resumeTool := tool
+	if next, ok := sc["next_steps_for_agent"].(map[string]any); ok {
+		if exec, ok := next["execute_when_approved"].(map[string]any); ok {
+			if t, ok := exec["tool"].(string); ok && t != "" {
+				resumeTool = t
+			}
 		}
 	}
-	if apID == "" {
-		t.Fatal("no approval appeared")
-	}
+
 	var dummy map[string]any
 	h.raw(t, "POST", "/v1/approvals/"+apID+"/decide", map[string]string{"Action": action}, &dummy)
 
-	select {
-	case r := <-ch:
-		return r.res, r.err
-	case <-time.After(20 * time.Second):
-		t.Fatal("call never returned after decision")
-		return nil, nil
+	resumeArgs := map[string]any{
+		"_approval_id": apID,
+		"_reason":      "resuming after dashboard decision",
 	}
+	resumeReq := mcp.CallToolRequest{}
+	resumeReq.Params.Name = resumeTool
+	resumeReq.Params.Arguments = resumeArgs
+	return c.CallTool(ctx, resumeReq)
 }
 
 func dumpResult(res *mcp.CallToolResult) string {
@@ -1205,13 +1225,13 @@ func TestE2EInsightsEndpoints(t *testing.T) {
 }
 
 // TestE2EAutoApprovalFlow exercises the auto-approval engine end-to-end:
-//   1. Manually create a static rule fingerprinted to memory.set with a
-//      specific (key, value) pair via the rules API.
-//   2. Issue that exact call and assert it resolves WITHOUT the test
-//      harness having to approve a pending card.
-//   3. Issue a slightly-different call and assert the human-approval
-//      flow still gates it.
-//   4. Verify the rule's hit_count incremented.
+//  1. Manually create a static rule fingerprinted to memory.set with a
+//     specific (key, value) pair via the rules API.
+//  2. Issue that exact call and assert it resolves WITHOUT the test
+//     harness having to approve a pending card.
+//  3. Issue a slightly-different call and assert the human-approval
+//     flow still gates it.
+//  4. Verify the rule's hit_count incremented.
 func TestE2EAutoApprovalFlow(t *testing.T) {
 	flag.Parse()
 	h := &httpClient{base: *toolyardURL}
@@ -1260,12 +1280,12 @@ func TestE2EAutoApprovalFlow(t *testing.T) {
 	// Install a static rule for this exact (agent, fingerprint).
 	var rule map[string]any
 	h.raw(t, "POST", "/v1/insights/auto/rules", map[string]any{
-		"kind":         "static",
-		"agent_id":     agentID,
-		"fingerprint":  fp,
-		"tool_name":    "memory.set",
-		"enabled":      true,
-		"source":       "user",
+		"kind":        "static",
+		"agent_id":    agentID,
+		"fingerprint": fp,
+		"tool_name":   "memory.set",
+		"enabled":     true,
+		"source":      "user",
 	}, &rule)
 	ruleID, _ := rule["id"].(string)
 	if ruleID == "" {

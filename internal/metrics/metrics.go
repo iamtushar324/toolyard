@@ -37,7 +37,7 @@ const (
 // ApprovalOutcome values stored on call_events.approval_outcome.
 const (
 	ApprovalNone     = "none"
-	ApprovalAuto    = "auto"
+	ApprovalAuto     = "auto"
 	ApprovalApproved = "approved"
 	ApprovalDenied   = "denied"
 	ApprovalExpired  = "expired"
@@ -46,30 +46,30 @@ const (
 // Event is the per-call fact row. Fields left zero are stored as NULL so the
 // dashboard can distinguish "absent" from "zero".
 type Event struct {
-	TS                int64
-	RequestID         string
-	SessionID         string
-	AgentID           string
-	AgentName         string
+	TS        int64
+	RequestID string
+	SessionID string
+	AgentID   string
+	AgentName string
 
-	Upstream          string
-	ShortName         string
-	ToolName          string
-	IsWrite           bool
-	IsDestructive     bool
-	PinnedTool        bool
+	Upstream      string
+	ShortName     string
+	ToolName      string
+	IsWrite       bool
+	IsDestructive bool
+	PinnedTool    bool
 
-	Via               string // direct | tools.execute | dashboard
-	SurfaceMode       string
-	InTopN            *bool
+	Via         string // direct | tools.execute | dashboard
+	SurfaceMode string
+	InTopN      *bool
 
-	Fingerprint       string
-	ArgsSizeBytes     int
-	ArgsTopKeys       []string
+	Fingerprint   string
+	ArgsSizeBytes int
+	ArgsTopKeys   []string
 
-	ReasonText        string
-	ReasonLen         int
-	IntentCategory   string
+	ReasonText     string
+	ReasonLen      int
+	IntentCategory string
 
 	ApprovalID        string
 	ApprovalOutcome   string
@@ -96,8 +96,8 @@ type Sink interface {
 // Noop is used in tests / probe binaries that don't need persistence.
 type Noop struct{}
 
-func (Noop) Record(Event)                       {}
-func (Noop) Close(ctx context.Context) error    { return nil }
+func (Noop) Record(Event)                    {}
+func (Noop) Close(ctx context.Context) error { return nil }
 
 // Recorder is the production Sink — buffered channel + background flusher.
 type Recorder struct {
@@ -352,20 +352,20 @@ func (r Range) bounds() (int64, int64) {
 
 // Overview is the headline numbers panel.
 type Overview struct {
-	Calls           int64   `json:"calls"`
-	Errors          int64   `json:"errors"`
-	WriteCalls      int64   `json:"write_calls"`
-	Approvals       int64   `json:"approvals"`
-	AutoApprovals   int64   `json:"auto_approvals"`
-	Denials         int64   `json:"denials"`
-	ExpiredApprovals int64  `json:"expired_approvals"`
-	DistinctAgents  int64   `json:"distinct_agents"`
-	DistinctTools   int64   `json:"distinct_tools"`
-	BytesIn         int64   `json:"bytes_in"`
-	BytesOut        int64   `json:"bytes_out"`
-	P50LatencyMs    int     `json:"p50_latency_ms"`
-	P95LatencyMs    int     `json:"p95_latency_ms"`
-	ErrorRate       float64 `json:"error_rate"`
+	Calls            int64   `json:"calls"`
+	Errors           int64   `json:"errors"`
+	WriteCalls       int64   `json:"write_calls"`
+	Approvals        int64   `json:"approvals"`
+	AutoApprovals    int64   `json:"auto_approvals"`
+	Denials          int64   `json:"denials"`
+	ExpiredApprovals int64   `json:"expired_approvals"`
+	DistinctAgents   int64   `json:"distinct_agents"`
+	DistinctTools    int64   `json:"distinct_tools"`
+	BytesIn          int64   `json:"bytes_in"`
+	BytesOut         int64   `json:"bytes_out"`
+	P50LatencyMs     int     `json:"p50_latency_ms"`
+	P95LatencyMs     int     `json:"p95_latency_ms"`
+	ErrorRate        float64 `json:"error_rate"`
 }
 
 // Overview returns the Overview block for the given range.
@@ -466,16 +466,16 @@ func (r *Reader) Tools(ctx context.Context, rg Range) ([]ToolRow, error) {
 
 // AgentRow summarises one agent's behaviour for the Per-agent panel.
 type AgentRow struct {
-	AgentID        string  `json:"agent_id"`
-	AgentName      string  `json:"agent_name"`
-	Calls          int64   `json:"calls"`
-	Errors         int64   `json:"errors"`
-	DistinctTools  int64   `json:"distinct_tools"`
-	WriteCalls     int64   `json:"write_calls"`
-	ApprovalRatio  float64 `json:"approval_ratio"`
-	ErrorRate      float64 `json:"error_rate"`
-	P95LatencyMs   int     `json:"p95_latency_ms"`
-	LastSeen       int64   `json:"last_seen"`
+	AgentID       string  `json:"agent_id"`
+	AgentName     string  `json:"agent_name"`
+	Calls         int64   `json:"calls"`
+	Errors        int64   `json:"errors"`
+	DistinctTools int64   `json:"distinct_tools"`
+	WriteCalls    int64   `json:"write_calls"`
+	ApprovalRatio float64 `json:"approval_ratio"`
+	ErrorRate     float64 `json:"error_rate"`
+	P95LatencyMs  int     `json:"p95_latency_ms"`
+	LastSeen      int64   `json:"last_seen"`
 }
 
 // Agents returns one row per agent seen in the range. Same drain-first
@@ -529,17 +529,17 @@ func (r *Reader) Agents(ctx context.Context, rg Range) ([]AgentRow, error) {
 // FingerprintStat is the per-(fingerprint, agent) summary used by the auto-
 // approval engine and the rule proposer.
 type FingerprintStat struct {
-	Fingerprint    string `json:"fingerprint"`
-	AgentID        string `json:"agent_id"`
-	ToolName       string `json:"tool_name"`
-	FirstSeen      int64  `json:"first_seen"`
-	LastSeen       int64  `json:"last_seen"`
-	LastDecidedTs  int64  `json:"last_decided_ts"`
-	TotalSeen      int64  `json:"total_seen"`
-	Approved       int64  `json:"approved"`
-	AutoApproved   int64  `json:"auto_approved"`
-	Denied         int64  `json:"denied"`
-	Expired        int64  `json:"expired"`
+	Fingerprint   string `json:"fingerprint"`
+	AgentID       string `json:"agent_id"`
+	ToolName      string `json:"tool_name"`
+	FirstSeen     int64  `json:"first_seen"`
+	LastSeen      int64  `json:"last_seen"`
+	LastDecidedTs int64  `json:"last_decided_ts"`
+	TotalSeen     int64  `json:"total_seen"`
+	Approved      int64  `json:"approved"`
+	AutoApproved  int64  `json:"auto_approved"`
+	Denied        int64  `json:"denied"`
+	Expired       int64  `json:"expired"`
 }
 
 // FingerprintStats returns per-(agent, fingerprint) stats over the given
@@ -665,8 +665,8 @@ func (r *Reader) ToolHealth(ctx context.Context, rg Range) ([]ToolHealth, error)
 
 // HourBucket is one hour-of-day cell in an agent activity heatmap.
 type HourBucket struct {
-	Day    int `json:"day"`     // unix-millis at start of day, UTC
-	Hour   int `json:"hour"`    // 0..23
+	Day    int `json:"day"`  // unix-millis at start of day, UTC
+	Hour   int `json:"hour"` // 0..23
 	Calls  int `json:"calls"`
 	Errors int `json:"errors"`
 }
@@ -920,19 +920,19 @@ func (r *Reader) ExportCSV(ctx context.Context, w interface{ Write(p []byte) (in
 	}
 	for rows.Next() {
 		var (
-			eventID, ts                                                        int64
-			agentID, agentName, upstream, shortName, toolName                  string
-			isWrite, isDestructive, pinned                                     int
-			via, surfaceMode, fp                                               string
-			argsSize                                                           int
-			reason                                                             string
-			reasonLen                                                          int
-			reasonQuality                                                      float64
-			approvalID, approvalOutcome                                         string
-			approvalLatency                                                    int
-			approvalVia                                                        string
-			outcome, errClass                                                  string
-			totalLatency, resultSize                                           int
+			eventID, ts                                       int64
+			agentID, agentName, upstream, shortName, toolName string
+			isWrite, isDestructive, pinned                    int
+			via, surfaceMode, fp                              string
+			argsSize                                          int
+			reason                                            string
+			reasonLen                                         int
+			reasonQuality                                     float64
+			approvalID, approvalOutcome                       string
+			approvalLatency                                   int
+			approvalVia                                       string
+			outcome, errClass                                 string
+			totalLatency, resultSize                          int
 		)
 		if err := rows.Scan(&eventID, &ts, &agentID, &agentName, &upstream, &shortName, &toolName,
 			&isWrite, &isDestructive, &pinned, &via, &surfaceMode, &fp, &argsSize,

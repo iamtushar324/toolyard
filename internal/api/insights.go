@@ -194,7 +194,7 @@ func (s *Server) insightsCost(w http.ResponseWriter, r *http.Request) {
 		rows = []metrics.CostRow{}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"rows":            rows,
+		"rows":             rows,
 		"input_usd_per_m":  in,
 		"output_usd_per_m": out,
 	})

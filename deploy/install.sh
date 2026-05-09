@@ -44,9 +44,16 @@ USER_NAME="toolyard"
 LISTEN_ADDR="0.0.0.0:18787"
 
 PUBLIC_URL="${PUBLIC_URL:-}"
-PUSH_SUBJECT="${PUSH_SUBJECT:-mailto:admin@example.invalid}"
+PUSH_SUBJECT="${PUSH_SUBJECT:-mailto:ops.nova.21@gmail.com}"
 TRUSTED_PROXY="${TRUSTED_PROXY:-127.0.0.1/32,::1/128,100.64.0.0/10,10.0.0.0/8,192.168.0.0/16,172.16.0.0/12}"
 NO_STDIO_UPSTREAMS="${NO_STDIO_UPSTREAMS:-false}"
+# Stateless MCP: defaults to true here because agents like hermes don't
+# auto-reconnect on "Invalid session ID" 404s after a toolyard restart.
+# Stateful is more spec-pure (lets the server push tools/list_changed
+# notifications) but the operational pain isn't worth it for a single-user
+# gateway. Override with STATELESS_MCP=false if you genuinely need server
+# push notifications and your agents handle session-invalidation cleanly.
+STATELESS_MCP="${STATELESS_MCP:-true}"
 IMPORT_FROM=""
 
 while [[ $# -gt 0 ]]; do
@@ -119,15 +126,26 @@ if [[ -n "$IMPORT_FROM" ]]; then
 fi
 
 # Compose the ExecStart flag string.
+#
+# in-line-wait defaults to 0s — every approval-required call returns a
+# self-describing deferred-response envelope immediately, and agents
+# coordinate via tools.poll_approval / tools.wait_for_approval. This
+# scales much better than holding HTTP connections (multiple parallel
+# approvals don't compete for the same request slot, nginx timeouts
+# become irrelevant, restart-resilience improves). Operators with old
+# MCP clients that don't understand the envelope can set IN_LINE_WAIT=
+# 90s to fall back to the legacy block-and-hold mode.
 EXEC_FLAGS=(
   serve
   -addr "$LISTEN_ADDR"
   -data "$DATA_DIR"
   -trusted-proxy "$TRUSTED_PROXY"
   -push-subject "$PUSH_SUBJECT"
+  -in-line-wait "${IN_LINE_WAIT:-0s}"
 )
 [[ -n "$PUBLIC_URL" ]] && EXEC_FLAGS+=( -public-url "$PUBLIC_URL" )
 [[ "$NO_STDIO_UPSTREAMS" == "true" ]] && EXEC_FLAGS+=( -no-stdio-upstreams )
+[[ "$STATELESS_MCP" == "true" ]] && EXEC_FLAGS+=( -stateless-mcp )
 
 # Sandbox tier picked by stdio upstream policy.
 #
@@ -213,8 +231,9 @@ ReadWritePaths=$DATA_DIR
 
 # Resource caps.
 LimitNOFILE=8192
-TasksMax=512
-MemoryMax=512M
+TasksMax=1024
+MemoryMax=1G
+MemoryHigh=768M
 
 # Graceful stop: SIGINT triggers context cancel + 5s drain in main.go.
 KillSignal=SIGINT
@@ -278,6 +297,14 @@ toolyard is up.
   data        : $DATA_DIR (toolyard.db, session.key, server keys)
   unit        : $SERVICE_PATH
   bind        : $LISTEN_ADDR
+
+  reminders:
+    - RESTART your MCP agents (Claude Code, etc.) after this. Their MCP
+      streamable-http sessions don't survive a toolyard restart and most
+      clients don't auto-reconnect on session-invalid.
+    - iPhone PWA: if dashboard buttons look stale, long-press the Home
+      Screen icon → Delete App, then Safari → toolyard URL → Share → Add
+      to Home Screen again. iOS caches the PWA shell aggressively.
 EOF
 
 if [[ "$need_setup" == "yes" ]]; then

@@ -46,8 +46,16 @@ type Server struct {
 // deployment so a compromised dashboard session can't spawn arbitrary
 // subprocesses or hijack the loader via LD_PRELOAD.
 type Policy struct {
-	AllowStdio   bool
-	EnvDenylist  []string // case-insensitive prefix or exact match
+	AllowStdio  bool
+	EnvDenylist []string // case-insensitive prefix or exact match
+}
+
+// HeaderProvider lets the OAuth service hand the upstream package a
+// closure that returns "Authorization: Bearer <live-token>" headers per
+// request. Decoupled so we don't import oauth here.
+type HeaderProvider interface {
+	HeaderFunc(upstream string) func(ctx context.Context) map[string]string
+	HasClient(ctx context.Context, upstream string) (bool, error)
 }
 
 // Service owns the upstream_servers table and keeps the live gateway in sync.
@@ -55,6 +63,7 @@ type Service struct {
 	db     *store.DB
 	gw     *gateway.Gateway
 	policy Policy
+	auth   HeaderProvider // optional
 
 	mu sync.Mutex // serializes connect/disconnect side-effects
 }
@@ -65,6 +74,10 @@ func New(db *store.DB, gw *gateway.Gateway) *Service {
 
 // SetPolicy installs admission rules. Idempotent.
 func (s *Service) SetPolicy(p Policy) { s.policy = p }
+
+// SetAuth installs the OAuth header provider. Calling this with nil
+// disables the wiring (useful for tests).
+func (s *Service) SetAuth(a HeaderProvider) { s.auth = a }
 
 // envDenied returns the first env key in the supplied map that the policy
 // forbids. Empty string means clean.
@@ -85,7 +98,7 @@ func (p Policy) envDenied(env map[string]string) string {
 }
 
 func (s *Service) toCfg(srv Server) gateway.UpstreamConfig {
-	return gateway.UpstreamConfig{
+	cfg := gateway.UpstreamConfig{
 		Name:      srv.Name,
 		Transport: srv.Transport,
 		Command:   srv.Command,
@@ -93,6 +106,15 @@ func (s *Service) toCfg(srv Server) gateway.UpstreamConfig {
 		URL:       srv.URL,
 		Env:       srv.Env,
 	}
+	// Wire OAuth bearer headers for http upstreams that have a registered
+	// client. We always install the closure when the auth provider is
+	// present; it returns an empty map when no token is stored, which
+	// means the first connect attempt may 401 — the dashboard can then
+	// kick off the OAuth dance.
+	if s.auth != nil && (cfg.Transport == "http" || cfg.Transport == "streamable-http" || cfg.Transport == "") {
+		cfg.HeaderFunc = gateway.HeaderFunc(s.auth.HeaderFunc(srv.Name))
+	}
+	return cfg
 }
 
 func validate(srv Server) error {
@@ -179,6 +201,11 @@ func (s *Service) list(ctx context.Context) ([]Server, error) {
 // List returns the persisted upstream configs.
 func (s *Service) List(ctx context.Context) ([]Server, error) { return s.list(ctx) }
 
+// Get returns one upstream server by name. Returns ErrNotFound when missing.
+func (s *Service) Get(ctx context.Context, name string) (*Server, error) {
+	return s.get(ctx, name)
+}
+
 // Add inserts a new upstream and tries to connect. On a connection failure the
 // row stays around (so the dashboard can show the error and the operator can
 // edit + retry); the call returns the connection error for the API layer.
@@ -244,6 +271,26 @@ func (s *Service) Remove(ctx context.Context, name string) error {
 	}
 	s.gw.NotifyToolListChanged()
 	return nil
+}
+
+// ReconnectAfterAuth is called after the OAuth flow completes for an
+// upstream so the live gateway picks up the freshly-stored bearer
+// without an operator click. Best-effort — errors are logged via the
+// status row.
+func (s *Service) ReconnectAfterAuth(ctx context.Context, name string) {
+	srv, err := s.get(ctx, name)
+	if err != nil {
+		return
+	}
+	if !srv.Enabled {
+		return
+	}
+	s.mu.Lock()
+	_ = s.gw.RemoveUpstream(name)
+	if err := s.connect(ctx, *srv); err != nil {
+		s.recordStatus(ctx, name, "", err.Error(), 0)
+	}
+	s.mu.Unlock()
 }
 
 // Reconnect drops any existing connection and re-tries.

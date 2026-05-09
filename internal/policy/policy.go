@@ -13,9 +13,9 @@ const (
 )
 
 type Decision struct {
-	Action  Action
-	Reason  string // human-readable rationale for the decision
-	RuleID  string
+	Action Action
+	Reason string // human-readable rationale for the decision
+	RuleID string
 }
 
 type Request struct {

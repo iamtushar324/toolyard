@@ -1,30 +1,31 @@
 // Package api exposes the dashboard's REST surface and SSE feeds.
 //
 // Routes (all under /v1):
-//   POST /v1/auth/setup           one-time create the local user
-//   POST /v1/auth/login           username + password -> session cookie
-//   POST /v1/auth/logout
-//   GET  /v1/auth/me              current user
 //
-//   GET  /v1/agents
-//   POST /v1/agents/enroll        creates a code (op uses it on the agent)
-//   POST /v1/agents/exchange      agent swaps code for a long-lived token
+//	POST /v1/auth/setup           one-time create the local user
+//	POST /v1/auth/login           username + password -> session cookie
+//	POST /v1/auth/logout
+//	GET  /v1/auth/me              current user
 //
-//   GET  /v1/approvals
-//   GET  /v1/approvals/{id}
-//   POST /v1/approvals/{id}/decide      {"action":"allowed|denied"}
-//   POST /v1/approvals/decide-by-token  one-tap approve via signed token
+//	GET  /v1/agents
+//	POST /v1/agents/enroll        creates a code (op uses it on the agent)
+//	POST /v1/agents/exchange      agent swaps code for a long-lived token
 //
-//   GET  /v1/audit
-//   GET  /v1/audit/stream         SSE
-//   GET  /v1/events/stream        SSE - approval/audit fan-out
+//	GET  /v1/approvals
+//	GET  /v1/approvals/{id}
+//	POST /v1/approvals/{id}/decide      {"action":"allowed|denied"}
+//	POST /v1/approvals/decide-by-token  one-tap approve via signed token
 //
-//   GET  /v1/memory               list (?scope=, ?prefix=)
-//   POST /v1/memory               {"scope":..., "key":..., "value":...}
-//   DELETE /v1/memory             ?scope=&key=
+//	GET  /v1/audit
+//	GET  /v1/audit/stream         SSE
+//	GET  /v1/events/stream        SSE - approval/audit fan-out
 //
-//   POST /v1/push/subscribe       browser PushSubscription
-//   GET  /v1/push/vapid_key
+//	GET  /v1/memory               list (?scope=, ?prefix=)
+//	POST /v1/memory               {"scope":..., "key":..., "value":...}
+//	DELETE /v1/memory             ?scope=&key=
+//
+//	POST /v1/push/subscribe       browser PushSubscription
+//	GET  /v1/push/vapid_key
 package api
 
 import (
@@ -47,6 +48,7 @@ import (
 	"github.com/tusharbhardwaj/toolyard/internal/marketplace"
 	"github.com/tusharbhardwaj/toolyard/internal/memory"
 	"github.com/tusharbhardwaj/toolyard/internal/metrics"
+	"github.com/tusharbhardwaj/toolyard/internal/oauth"
 	"github.com/tusharbhardwaj/toolyard/internal/push"
 	"github.com/tusharbhardwaj/toolyard/internal/realtime"
 	"github.com/tusharbhardwaj/toolyard/internal/settings"
@@ -73,6 +75,7 @@ type Server struct {
 	usage        *usage.Service
 	metrics      *metrics.Reader
 	autoApproval *autoapproval.Service
+	oauth        *oauth.Service
 	sessionKey   []byte
 	security     SecurityOptions
 	loginLimit   *loginThrottle
@@ -92,6 +95,7 @@ type Options struct {
 	Usage        *usage.Service
 	Metrics      *metrics.Reader
 	AutoApproval *autoapproval.Service
+	OAuth        *oauth.Service
 	SessionKey   []byte
 	Security     SecurityOptions
 }
@@ -110,6 +114,7 @@ func New(opts Options) *Server {
 		usage:        opts.Usage,
 		metrics:      opts.Metrics,
 		autoApproval: opts.AutoApproval,
+		oauth:        opts.OAuth,
 		sessionKey:   opts.SessionKey,
 		security:     opts.Security,
 		loginLimit:   newLoginThrottle(5, 15*time.Minute),
@@ -155,6 +160,10 @@ func (s *Server) Routes(mux *http.ServeMux) {
 
 	mux.HandleFunc("/v1/push/vapid_key", s.pushVapidKey)
 	mux.HandleFunc("/v1/push/subscribe", s.pushSubscribe)
+	mux.HandleFunc("/v1/push/test", s.pushTest)
+	mux.HandleFunc("/v1/push/diag", s.pushDiag)
+	mux.HandleFunc("/v1/push/rotate-vapid", s.pushRotateVapid)
+	mux.HandleFunc("/v1/push/jwt-preview", s.pushJWTPreview)
 
 	mux.HandleFunc("/v1/servers", s.serversCollection)
 	mux.HandleFunc("/v1/servers/", s.serversItem)
@@ -175,6 +184,8 @@ func (s *Server) Routes(mux *http.ServeMux) {
 	mux.HandleFunc("/v1/insights/auto/rules/", s.autoRulesItem)
 	mux.HandleFunc("/v1/insights/purge-agent", s.insightsPurgeAgent)
 	mux.HandleFunc("/v1/insights/export", s.insightsExport)
+
+	s.oauthRoutes(mux)
 }
 
 // ---- helpers ----------------------------------------------------------------
@@ -830,7 +841,12 @@ func (s *Server) pushVapidKey(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]string{"public_key": s.push.PublicKey()})
 }
 
-func (s *Server) pushSubscribe(w http.ResponseWriter, r *http.Request) {
+// pushTest sends a synthetic notification to every push_subscription
+// row owned by the current user and returns per-row delivery results so
+// the operator can see why notifications might be silently dropped
+// (e.g. Apple rejecting `mailto:admin@example.invalid`, an expired
+// subscription returning 410 Gone, a VAPID encryption failure, etc.).
+func (s *Server) pushTest(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeError(w, http.StatusMethodNotAllowed, "POST only")
 		return
@@ -840,23 +856,222 @@ func (s *Server) pushSubscribe(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusUnauthorized, "unauthorized")
 		return
 	}
-	var body struct {
-		Endpoint string `json:"endpoint"`
-		Keys     struct {
-			P256dh string `json:"p256dh"`
-			Auth   string `json:"auth"`
-		} `json:"keys"`
-	}
-	if err := decode(r, &body); err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
+	if s.push == nil {
+		writeError(w, http.StatusServiceUnavailable, "push service not wired")
 		return
 	}
-	sub, err := s.push.Subscribe(r.Context(), uid, body.Endpoint, body.Keys.P256dh, body.Keys.Auth, r.UserAgent())
+	payload := map[string]any{
+		"title": "toolyard test notification",
+		"body":  "If you can read this, push works on this device. Tap to dismiss.",
+		"url":   "/",
+		"tag":   "toolyard-test",
+	}
+	results, err := s.push.NotifyDetailed(r.Context(), uid, payload)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
+		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, sub)
+	delivered, pruned, failed := 0, 0, 0
+	for _, r := range results {
+		switch {
+		case r.Error != "" || r.Status == 0 || r.Status >= 500:
+			failed++
+		case r.Pruned:
+			pruned++
+		case r.Status/100 == 2:
+			delivered++
+		default:
+			failed++
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"subject":   s.push.Subject(),
+		"results":   results,
+		"delivered": delivered,
+		"pruned":    pruned,
+		"failed":    failed,
+	})
+}
+
+// pushDiag returns the configured VAPID subject and the list of stored
+// subscriptions for the current user (endpoints + creation time, no
+// keys). Lets the operator confirm the dashboard's subscribe call
+// actually persisted, which device-IDs are registered, and whether the
+// default `.invalid` subject is in use.
+func (s *Server) pushDiag(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "GET only")
+		return
+	}
+	uid, err := s.requireUser(r)
+	if err != nil {
+		writeError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+	if s.push == nil {
+		writeJSON(w, http.StatusOK, map[string]any{"enabled": false})
+		return
+	}
+	subs, err := s.push.ListForUser(r.Context(), uid)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	out := make([]map[string]any, 0, len(subs))
+	for _, sub := range subs {
+		// Hostname-only — full endpoint contains the device's push channel
+		// secret on some platforms; trim to "fcm.googleapis.com" / "*.push.apple.com".
+		host := sub.Endpoint
+		if i := strings.Index(host, "://"); i >= 0 {
+			host = host[i+3:]
+		}
+		if i := strings.IndexByte(host, '/'); i >= 0 {
+			host = host[:i]
+		}
+		out = append(out, map[string]any{
+			"id":         sub.ID,
+			"host":       host,
+			"user_agent": sub.UserAgent,
+			"created_at": sub.CreatedAt,
+		})
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"enabled":         true,
+		"subject":         s.push.Subject(),
+		"subject_warning": pushSubjectWarning(s.push.Subject()),
+		"subscriptions":   out,
+		"public_key_set":  s.push.PublicKey() != "",
+	})
+}
+
+// pushRotateVapid is the nuclear option for "BadJwtToken" — regenerate
+// the VAPID keypair from scratch using the well-tested generator in
+// SherClockHolmes/webpush-go (so format / scalar interpretation can't be
+// the bug), wipe every existing subscription (they're bound to the old
+// public key), and return the new public key. The operator then tells
+// every device to Enable push again.
+func (s *Server) pushRotateVapid(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "POST only")
+		return
+	}
+	uid, err := s.requireUser(r)
+	if err != nil {
+		writeError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+	if s.push == nil {
+		writeError(w, http.StatusServiceUnavailable, "push service not wired")
+		return
+	}
+	pub, err := s.push.RotateKeys(r.Context())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	_ = s.audit.Write(r.Context(), audit.Event{
+		EventType:     "push.rotate_vapid",
+		AgentID:       "user:" + uid,
+		ResultSummary: "vapid keypair regenerated",
+	})
+	writeJSON(w, http.StatusOK, map[string]any{
+		"new_public_key":      pub,
+		"subscriptions_wiped": true,
+	})
+}
+
+// pushJWTPreview returns the per-subscription JWT diagnostic so the
+// operator can see exactly what claims toolyard is signing into the
+// VAPID Authorization header.
+func (s *Server) pushJWTPreview(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "GET only")
+		return
+	}
+	uid, err := s.requireUser(r)
+	if err != nil {
+		writeError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+	if s.push == nil {
+		writeError(w, http.StatusServiceUnavailable, "push service not wired")
+		return
+	}
+	out, err := s.push.JWTPreview(r.Context(), uid)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"entries": out})
+}
+
+// pushSubjectWarning highlights the common operator misconfiguration
+// where the VAPID subject is left at the docs default (or a non-mailto
+// scheme): Apple silently drops messages addressed from an unroutable
+// mailbox and several push services follow suit.
+func pushSubjectWarning(subj string) string {
+	if subj == "" {
+		return "no subject configured"
+	}
+	if !strings.HasPrefix(subj, "mailto:") && !strings.HasPrefix(subj, "https://") {
+		return "subject must be 'mailto:…' or 'https://…'"
+	}
+	if strings.Contains(subj, "@example.invalid") || strings.Contains(subj, "@example.com") {
+		return "subject is the default placeholder; Apple/APNS may drop. Set -push-subject mailto:you@yourdomain.com"
+	}
+	return ""
+}
+
+func (s *Server) pushSubscribe(w http.ResponseWriter, r *http.Request) {
+	uid, err := s.requireUser(r)
+	if err != nil {
+		writeError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+	if s.push == nil {
+		writeError(w, http.StatusServiceUnavailable, "push service not wired")
+		return
+	}
+	switch r.Method {
+	case http.MethodPost:
+		var body struct {
+			Endpoint string `json:"endpoint"`
+			Keys     struct {
+				P256dh string `json:"p256dh"`
+				Auth   string `json:"auth"`
+			} `json:"keys"`
+		}
+		if err := decode(r, &body); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		sub, err := s.push.Subscribe(r.Context(), uid, body.Endpoint, body.Keys.P256dh, body.Keys.Auth, r.UserAgent())
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, sub)
+	case http.MethodDelete:
+		// Wipe every subscription this user owns. Recovery path when
+		// existing subscriptions are bound to a stale VAPID key (or
+		// rejected by Apple/Google for any reason) — operator hits
+		// "Wipe & re-enroll" in the dashboard, the browser's old sub is
+		// unsubscribed client-side, and a fresh row is created on the
+		// follow-up Enable-push tap.
+		n, err := s.push.DeleteAllForUser(r.Context(), uid)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		_ = s.audit.Write(r.Context(), audit.Event{
+			EventType:     "push.wipe",
+			AgentID:       "user:" + uid,
+			ResultSummary: fmt.Sprintf("removed %d subscription(s)", n),
+		})
+		writeJSON(w, http.StatusOK, map[string]any{"removed": n})
+	default:
+		writeError(w, http.StatusMethodNotAllowed, "POST or DELETE")
+	}
 }
 
 // ---- servers (upstream MCP) ------------------------------------------------
@@ -897,8 +1112,8 @@ func (s *Server) serversCollection(w http.ResponseWriter, r *http.Request) {
 			// row body so the dashboard shows the persisted error. Otherwise 400.
 			if srv != nil && (errors.Is(err, gateway.ErrUpstreamNotFound) || !errors.Is(err, upstreams.ErrInvalid)) && !errors.Is(err, upstreams.ErrAlreadyHere) && !errors.Is(err, upstreams.ErrReserved) {
 				writeJSON(w, http.StatusAccepted, map[string]any{
-					"server":     srv,
-					"warning":    err.Error(),
+					"server":  srv,
+					"warning": err.Error(),
 				})
 				return
 			}
@@ -930,6 +1145,11 @@ func (s *Server) serversItem(w http.ResponseWriter, r *http.Request) {
 	subpath := ""
 	if len(parts) > 1 {
 		subpath = parts[1]
+	}
+	if strings.HasPrefix(subpath, "oauth") {
+		if s.dispatchOAuth(w, r, name, subpath) {
+			return
+		}
 	}
 	if subpath == "reconnect" {
 		if r.Method != http.MethodPost {

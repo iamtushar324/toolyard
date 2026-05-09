@@ -8,10 +8,18 @@ import (
 	"time"
 
 	"github.com/mark3labs/mcp-go/client"
+	"github.com/mark3labs/mcp-go/client/transport"
 	"github.com/mark3labs/mcp-go/mcp"
 )
 
-// UpstreamConfig describes one configured upstream MCP server.
+// HeaderFunc provides dynamic per-request HTTP headers. Used by remote
+// upstreams to attach an OAuth Authorization: Bearer header that may
+// rotate while the connection is alive.
+type HeaderFunc func(ctx context.Context) map[string]string
+
+// UpstreamConfig describes one configured upstream MCP server. The
+// HeaderFunc field is in-memory only — it is wired by the upstreams
+// package when an OAuth client + token are registered.
 type UpstreamConfig struct {
 	Name      string            `json:"name"`
 	Transport string            `json:"transport"` // "stdio" | "http"
@@ -19,6 +27,11 @@ type UpstreamConfig struct {
 	Args      []string          `json:"args,omitempty"`
 	URL       string            `json:"url,omitempty"`
 	Env       map[string]string `json:"env,omitempty"`
+
+	// HeaderFunc, when non-nil on an http transport, is invoked per
+	// request to obtain Authorization (and any other) headers. Populated
+	// by the upstreams.Service when an OAuth client is registered.
+	HeaderFunc HeaderFunc `json:"-"`
 }
 
 type upstream struct {
@@ -48,7 +61,11 @@ func newUpstream(ctx context.Context, cfg UpstreamConfig) (*upstream, error) {
 		if cfg.URL == "" {
 			return nil, errors.New("http upstream requires url")
 		}
-		hc, err := client.NewStreamableHttpClient(cfg.URL)
+		var opts []transport.StreamableHTTPCOption
+		if cfg.HeaderFunc != nil {
+			opts = append(opts, transport.WithHTTPHeaderFunc(transport.HTTPHeaderFunc(cfg.HeaderFunc)))
+		}
+		hc, err := client.NewStreamableHttpClient(cfg.URL, opts...)
 		if err != nil {
 			return nil, fmt.Errorf("http upstream %s: %w", cfg.Name, err)
 		}

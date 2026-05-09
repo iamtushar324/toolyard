@@ -43,6 +43,15 @@ const state = {
   streamLive: false,
   vapidKey: null,
   pushReady: false,
+  // oauthStatus is keyed by upstream name -> {has_client, has_token, state,
+  // scopes, redirect_uri, device_supported, last_error, ...}.
+  oauthStatus: {},
+  // oauthFlow is the in-progress OAuth dance the user just kicked off.
+  oauthFlow: null, // { name, mode, state, authorize_url, paste:'', error:'' }
+  pushDiag: null,        // /v1/push/diag last response
+  pushTestResult: null,  // /v1/push/test last response
+  jwtPreview: null,      // /v1/push/jwt-preview last response
+  moreSheet: false,      // bottom-nav "More" sheet open?
 };
 
 // ---- helpers ----------------------------------------------------------------
@@ -152,6 +161,8 @@ async function loadAll() {
     state.tools = tools || [];
     state.marketplace = market || [];
     state.vapidKey = vapid && vapid.public_key ? vapid.public_key : null;
+    // Fire-and-forget — the badges fill in once the responses land.
+    preloadOAuthStatus().then(() => render()).catch(() => {});
   } catch (e) {
     toast(e.message, 'error');
   }
@@ -165,6 +176,7 @@ async function reloadServers() {
     ]);
     state.servers = servers || [];
     state.tools = tools || [];
+    preloadOAuthStatus().catch(() => {});
   } catch (e) { toast(e.message, 'error'); }
 }
 
@@ -176,6 +188,36 @@ function startStream() {
   evtSrc.onerror = () => { state.streamLive = false; render(); };
   evtSrc.addEventListener('approval', (e) => { handleApprovalEvent(JSON.parse(e.data)); });
   evtSrc.addEventListener('audit', (e) => { handleAuditEvent(JSON.parse(e.data)); });
+  evtSrc.addEventListener('mcp_oauth_done', (e) => { handleOAuthDone(JSON.parse(e.data)); });
+  evtSrc.addEventListener('mcp_oauth_refreshed', () => { reloadServers(); render(); });
+  evtSrc.addEventListener('mcp_oauth_needs_reauth', (e) => { handleOAuthReauth(JSON.parse(e.data)); });
+}
+
+function handleOAuthDone(payload) {
+  const name = payload && payload.upstream;
+  if (!name) return;
+  if (state.oauthFlow && state.oauthFlow.name === name) {
+    state.oauthFlow = null;
+  }
+  toast(name + ': authorized.');
+  reloadServers().then(() => loadOAuthStatus(name)).then(render);
+}
+
+function handleOAuthReauth(payload) {
+  const name = payload && payload.upstream;
+  if (!name) return;
+  toast(name + ' needs reauthorization', 'error');
+  state.oauthStatus = state.oauthStatus || {};
+  state.oauthStatus[name] = { ...(state.oauthStatus[name] || {}), state: 'needs_reauth', last_error: payload.error || '' };
+  render();
+}
+
+async function loadOAuthStatus(name) {
+  try {
+    const st = await api('/v1/servers/' + encodeURIComponent(name) + '/oauth');
+    state.oauthStatus = state.oauthStatus || {};
+    state.oauthStatus[name] = st;
+  } catch (_) {}
 }
 
 function handleApprovalEvent(req) {
@@ -735,6 +777,7 @@ function viewServers() {
             el('th', {}, 'Transport'),
             el('th', {}, 'Tools'),
             el('th', {}, 'Status'),
+            el('th', {}, 'Auth'),
             el('th', {}, ''))),
             el('tbody', {}, state.servers.map((s) => el('tr', {},
               el('td', {}, el('code', {}, s.name)),
@@ -743,14 +786,17 @@ function viewServers() {
               el('td', {}, s.last_status === 'ok'
                 ? el('span', { class: 'badge allowed' }, 'connected')
                 : el('span', { class: 'badge denied', title: s.last_error || '' }, s.last_status || 'error')),
+              el('td', {}, oauthBadge(s)),
               el('td', {},
                 el('div', { class: 'row' },
+                  isHTTPUpstream(s) ? el('button', { on: { click: () => openOAuthPanel(s.name) }}, 'Auth…') : null,
                   el('button', { on: { click: () => reconnectServer(s.name) }}, 'Reconnect'),
                   el('button', { class: 'danger', on: { click: () => removeServer(s.name) }}, 'Remove'),
                 ),
               ),
             )))),
     ),
+    state.oauthFlow ? renderOAuthModal() : null,
   );
 }
 
@@ -793,7 +839,7 @@ async function addServer() {
   try {
     const resp = await fetch('/v1/servers', {
       method: 'POST', credentials: 'include',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', 'X-Requested-With': 'toolyard' },
       body: JSON.stringify(body),
     });
     const out = await resp.json();
@@ -890,7 +936,7 @@ async function installFromMarket(entry, env, overrideName) {
   try {
     const resp = await fetch('/v1/servers', {
       method: 'POST', credentials: 'include',
-      headers: { 'Content-Type': 'application/json' },
+      headers: { 'Content-Type': 'application/json', 'X-Requested-With': 'toolyard' },
       body: JSON.stringify(body),
     });
     const out = await resp.json();
@@ -913,7 +959,8 @@ async function installFromMarket(entry, env, overrideName) {
 async function reconnectServer(name) {
   try {
     const resp = await fetch('/v1/servers/' + encodeURIComponent(name) + '/reconnect',
-      { method: 'POST', credentials: 'include' });
+      { method: 'POST', credentials: 'include',
+        headers: { 'X-Requested-With': 'toolyard' } });
     const out = await resp.json();
     if (resp.status === 202) toast('Still failing: ' + (out.warning || ''), 'error');
     else if (!resp.ok) throw new Error(out.error || ('HTTP ' + resp.status));
@@ -1359,7 +1406,19 @@ function renderPushCard() {
       el('div', { class: 'row' },
         el('button', { class: 'primary', on: { click: enablePush }},
           state.pushReady ? 'Push enabled ✓ (re-enroll)' : 'Enable push'),
+        el('button', { on: { click: testPush }}, 'Send test push'),
+        el('button', { on: { click: showPushDiag }}, 'Diagnostics'),
+        el('button', { class: 'danger', on: { click: wipeAndReenroll }}, 'Wipe & re-enroll'),
       ),
+      el('div', { class: 'row', style: 'margin-top: 6px;' },
+        el('button', { on: { click: showJWTPreview }}, 'Show JWT details'),
+        el('button', { class: 'danger', on: { click: rotateVapidKeypair }}, 'Rotate VAPID keys'),
+      ),
+      el('div', { class: 'meta', style: 'margin-top: 4px;' },
+        'BadJwtToken from Apple? Tap "Rotate VAPID keys" — that regenerates the keypair using the upstream library (eliminating any format ambiguity), wipes all subscriptions, and lets you re-enroll fresh. Tap "Show JWT details" to inspect the exact claims toolyard signs into the Authorization header.'),
+      state.jwtPreview ? renderJWTPreview() : null,
+      state.pushDiag ? renderPushDiag() : null,
+      state.pushTestResult ? renderPushTestResult() : null,
       ios ? iosSteps : null,
     );
   }
@@ -1369,6 +1428,163 @@ function renderPushCard() {
     el('p', { class: 'meta' },
       'Get a notification on this device when an approval is pending. The notification has Allow / Deny actions tied to the approval\'s signed token, so you can decide right from the lock screen.'),
     body,
+  );
+}
+
+async function rotateVapidKeypair() {
+  if (!confirm('Generate a brand-new VAPID keypair and wipe ALL push subscriptions? You will need to Enable push again on every device.')) return;
+  try {
+    const r = await api('/v1/push/rotate-vapid', { method: 'POST', body: {} });
+    // Tear down browser-side subscription too, otherwise iOS hands back the stale one.
+    if ('serviceWorker' in navigator) {
+      try {
+        const reg = await navigator.serviceWorker.getRegistration();
+        if (reg) {
+          const existing = await reg.pushManager.getSubscription();
+          if (existing) await existing.unsubscribe();
+        }
+      } catch (_) {}
+    }
+    state.pushReady = false;
+    state.pushDiag = null;
+    state.pushTestResult = null;
+    state.jwtPreview = null;
+    state.vapidKey = r.new_public_key;
+    toast('New VAPID keypair generated. Tap Enable push to re-enroll.');
+    render();
+  } catch (e) { toast(e.message, 'error'); }
+}
+
+async function showJWTPreview() {
+  try {
+    const out = await api('/v1/push/jwt-preview');
+    state.jwtPreview = out;
+    if (!out.entries || out.entries.length === 0) {
+      toast('No subscriptions yet — tap Enable push first.', 'error');
+    }
+    render();
+  } catch (e) { toast(e.message, 'error'); }
+}
+
+function renderJWTPreview() {
+  const j = state.jwtPreview;
+  if (!j || !j.entries) return null;
+  return el('div', { class: 'card', style: 'margin-top: 12px;' },
+    el('div', { class: 'meta' }, 'Per-subscription JWT diagnostic. The "derived_pub_matches_stored" field MUST be true — if it\'s false, the VAPID keypair is corrupted and you should tap Rotate VAPID keys.'),
+    ...j.entries.map((e, i) => el('div', { style: 'margin-top: 8px;' },
+      el('div', {}, `Subscription #${i + 1}`),
+      el('pre', { style: 'background: rgba(0,0,0,0.3); padding: 8px; border-radius: 4px; overflow-x: auto; font-size: 11px;' },
+        JSON.stringify(e, null, 2)),
+    )),
+    el('div', { class: 'row', style: 'margin-top: 8px;' },
+      el('button', { on: { click: () => { state.jwtPreview = null; render(); } }}, 'Hide'),
+    ),
+  );
+}
+
+async function wipeAndReenroll() {
+  try {
+    // 1) Server side: drop every push_subscription row this user owns.
+    const r = await api('/v1/push/subscribe', { method: 'DELETE' });
+    // 2) Browser side: tear down the existing PushSubscription so the
+    //    push service issues a fresh one bound to the *current* VAPID
+    //    public key. Without this, pushManager.subscribe() returns the
+    //    same stale subscription.
+    if ('serviceWorker' in navigator) {
+      try {
+        const reg = await navigator.serviceWorker.getRegistration();
+        if (reg) {
+          const existing = await reg.pushManager.getSubscription();
+          if (existing) await existing.unsubscribe();
+        }
+      } catch (_) {}
+    }
+    state.pushReady = false;
+    state.pushTestResult = null;
+    state.pushDiag = null;
+    toast(`Removed ${r.removed || 0} subscription(s). Tap Enable push to re-enroll.`);
+    render();
+  } catch (e) { toast(e.message, 'error'); }
+}
+
+async function testPush() {
+  try {
+    const out = await api('/v1/push/test', { method: 'POST', body: {} });
+    state.pushTestResult = out;
+    if (out.delivered === 0 && out.results.length === 0) {
+      toast('No push subscriptions registered yet — tap Enable push first.', 'error');
+    } else if (out.failed > 0) {
+      toast(`Push: ${out.delivered} delivered, ${out.failed} failed (see results below)`, 'error');
+    } else {
+      toast(`Push: ${out.delivered} delivered. Check your device.`);
+    }
+    render();
+  } catch (e) { toast(e.message, 'error'); }
+}
+
+async function showPushDiag() {
+  try {
+    const out = await api('/v1/push/diag');
+    state.pushDiag = out;
+    render();
+  } catch (e) { toast(e.message, 'error'); }
+}
+
+function renderPushTestResult() {
+  const r = state.pushTestResult;
+  if (!r || !r.results) return null;
+  return el('div', { class: 'card', style: 'margin-top: 12px;' },
+    el('div', { class: 'meta' }, `Delivered: ${r.delivered} · Pruned: ${r.pruned} · Failed: ${r.failed}`),
+    el('table', {}, el('thead', {}, el('tr', {},
+      el('th', {}, 'Device'),
+      el('th', {}, 'Push host'),
+      el('th', {}, 'HTTP'),
+      el('th', {}, 'Result'))),
+      el('tbody', {}, r.results.map((rr) => {
+        const host = (rr.endpoint || '').replace(/^https?:\/\//, '').replace(/\/.*$/, '');
+        let resultLabel = '';
+        let cls = 'badge';
+        if (rr.pruned) { resultLabel = 'gone (subscription pruned)'; cls = 'badge denied'; }
+        else if (rr.status >= 200 && rr.status < 300) { resultLabel = 'delivered'; cls = 'badge allowed'; }
+        else if (rr.error) { resultLabel = rr.error; cls = 'badge denied'; }
+        else if (rr.status === 401 || rr.status === 403) { resultLabel = 'rejected — VAPID/subject?'; cls = 'badge denied'; }
+        else if (rr.status === 413) { resultLabel = 'payload too large'; cls = 'badge denied'; }
+        else { resultLabel = 'status ' + rr.status; cls = 'badge'; }
+        return el('tr', {},
+          el('td', {}, rr.user_agent ? rr.user_agent.slice(0, 40) : '—'),
+          el('td', {}, el('code', {}, host)),
+          el('td', {}, String(rr.status || '—')),
+          el('td', { style: 'word-break: break-word; max-width: 500px;' },
+            el('span', { class: cls }, resultLabel)),
+        );
+      }))),
+    el('div', { class: 'row', style: 'margin-top: 8px;' },
+      el('button', { on: { click: () => { state.pushTestResult = null; render(); } }}, 'Hide'),
+    ),
+  );
+}
+
+function renderPushDiag() {
+  const d = state.pushDiag;
+  if (!d) return null;
+  return el('div', { class: 'card', style: 'margin-top: 12px;' },
+    el('div', {}, 'VAPID subject: ', el('code', {}, d.subject || '(none)')),
+    d.subject_warning
+      ? el('div', { class: 'err', style: 'margin-top: 4px;' }, '⚠ ' + d.subject_warning)
+      : el('div', { class: 'meta' }, 'Subject looks valid.'),
+    el('div', { style: 'margin-top: 8px;' }, `Subscriptions registered for this user: ${(d.subscriptions || []).length}`),
+    (d.subscriptions || []).length > 0
+      ? el('table', {}, el('thead', {}, el('tr', {},
+          el('th', {}, 'Push host'), el('th', {}, 'User agent'), el('th', {}, 'Added'))),
+          el('tbody', {}, d.subscriptions.map((s) => el('tr', {},
+            el('td', {}, el('code', {}, s.host)),
+            el('td', {}, (s.user_agent || '').slice(0, 60)),
+            el('td', {}, relTime(s.created_at)),
+          ))))
+      : el('div', { class: 'meta' }, 'None — tap Enable push, then check this dialog again.'),
+    el('div', { class: 'row', style: 'margin-top: 8px;' },
+      el('button', { on: { click: () => { state.pushDiag = null; render(); } }}, 'Hide'),
+    ),
   );
 }
 
@@ -1676,13 +1892,29 @@ function shell(content) {
     class: state.route === key ? 'active' : '',
     on: { click: () => navigate(key) }
   }, label);
+
+  // Bottom-nav routes for mobile. We surface the 5 most-used routes
+  // directly and put the rest behind a "More" sheet so the bar isn't
+  // cramped. Approvals + Tools are the bread-and-butter; Servers and
+  // Notifications get badges when there's something to act on.
+  const pendingCount = (state.approvals || []).filter((a) => a.status === 'pending').length;
+  const alertCount   = (state.anomalies || []).length;
+  const bottomItem = (key, icon, label, badge) => el('button', {
+    class: state.route === key ? 'active' : '',
+    on: { click: () => navigate(key) }
+  },
+    el('span', { class: 'icon' }, icon),
+    el('span', {}, label),
+    badge > 0 ? el('span', { class: 'badge-count' }, String(badge)) : null,
+  );
+
   return el('div', {},
     el('header', {},
       el('div', { class: 'brand' }, el('span', { class: 'dot' }), 'toolyard'),
       el('nav', {},
         navBtn('approvals',    'Approvals'),
         navBtn('insights',     'Insights'),
-        navBtn('notifications', 'Alerts' + (state.anomalies && state.anomalies.length ? ' (' + state.anomalies.length + ')' : '')),
+        navBtn('notifications', 'Alerts' + (alertCount ? ' (' + alertCount + ')' : '')),
         navBtn('audit',        'Audit'),
         navBtn('servers',      'Servers'),
         navBtn('tools',        'Tools'),
@@ -1701,6 +1933,50 @@ function shell(content) {
       }}}, 'Logout') : null,
     ),
     el('main', {}, content),
+    // Bottom nav is rendered for everyone but CSS hides it above 768px.
+    // The "More" item opens a sheet rather than navigating, so its active
+    // state mirrors whatever the current route is when it isn't one of
+    // the four primary routes.
+    el('div', { class: 'bottom-nav' }, el('div', { class: 'row' },
+      bottomItem('approvals', '✓', 'Approvals', pendingCount),
+      bottomItem('tools',     '⚙', 'Tools'),
+      bottomItem('servers',   '⌘', 'Servers'),
+      bottomItem('notifications', '◔', 'Alerts', alertCount),
+      el('button', {
+        class: ['audit','memory','agents','settings','insights'].includes(state.route) ? 'active' : '',
+        on: { click: () => { state.moreSheet = true; render(); } }
+      },
+        el('span', { class: 'icon' }, '☰'),
+        el('span', {}, 'More'),
+      ),
+    )),
+    state.moreSheet ? renderMoreSheet() : null,
+  );
+}
+
+function renderMoreSheet() {
+  const item = (key, label, hint) => el('button', {
+    class: state.route === key ? 'active primary' : '',
+    style: 'width: 100%; justify-content: flex-start; text-align: left; min-height: 52px; padding: 10px 14px;',
+    on: { click: () => { state.moreSheet = false; navigate(key); } }
+  },
+    el('div', {},
+      el('div', { style: 'font-weight: 500;' }, label),
+      hint ? el('div', { class: 'meta', style: 'font-size: 12px; margin-top: 2px;' }, hint) : null,
+    ),
+  );
+  return el('div', { class: 'modal-bg', on: { click: (e) => { if (e.target === e.currentTarget) { state.moreSheet = false; render(); } }}},
+    el('div', { class: 'modal', style: 'display: flex; flex-direction: column; gap: 6px;' },
+      el('h3', {}, 'More'),
+      item('insights', 'Insights', 'Per-tool, per-agent, cost breakdowns'),
+      item('audit',    'Audit',    'Append-only event log'),
+      item('memory',   'Memory',   'Scope/key-value store'),
+      item('agents',   'Agents',   'Manage enrolled agents'),
+      item('settings', 'Settings', 'Surface mode, auto-approval, retention'),
+      el('div', { class: 'row', style: 'margin-top: 12px; justify-content: flex-end;' },
+        el('button', { on: { click: () => { state.moreSheet = false; render(); } }}, 'Close'),
+      ),
+    ),
   );
 }
 
@@ -1722,6 +1998,322 @@ function render() {
     default:              body = viewApprovals();
   }
   root.appendChild(shell(body));
+}
+
+// ---- OAuth integration (remote MCPs) ---------------------------------------
+
+function isHTTPUpstream(s) {
+  return s.transport === 'http' || s.transport === 'streamable-http' || (!s.transport && s.url);
+}
+
+function oauthBadge(s) {
+  if (!isHTTPUpstream(s)) return el('span', { class: 'meta' }, '—');
+  const st = (state.oauthStatus || {})[s.name];
+  if (!st) return el('span', { class: 'meta' }, 'unknown');
+  if (st.is_pat) return el('span', { class: 'badge allowed', title: 'personal access token' }, 'PAT');
+  if (!st.has_client) return el('span', { class: 'meta' }, 'none');
+  if (!st.has_token) return el('span', { class: 'badge', title: 'client registered, no token yet' }, 'no token');
+  if (st.state === 'active') {
+    let title = 'authorized';
+    if (st.access_expires_at) title += ' — expires ' + new Date(st.access_expires_at).toLocaleString();
+    return el('span', { class: 'badge allowed', title }, 'active');
+  }
+  if (st.state === 'needs_reauth') {
+    return el('span', { class: 'badge denied', title: st.last_error || '' }, 'needs reauth');
+  }
+  return el('span', { class: 'badge', title: st.last_error || st.state }, st.state || 'unknown');
+}
+
+async function openOAuthPanel(name) {
+  await loadOAuthStatus(name);
+  state.oauthFlow = {
+    name,
+    mode: 'callback',
+    state: '',
+    authorize_url: '',
+    paste: '',
+    error: '',
+    pat: '',
+    busy: false,
+  };
+  render();
+}
+
+function closeOAuthPanel() { state.oauthFlow = null; render(); }
+
+function renderOAuthModal() {
+  const f = state.oauthFlow;
+  const st = (state.oauthStatus || {})[f.name] || {};
+  const supportsDevice = !!st.device_supported;
+
+  const sectionDiscover = el('div', { class: 'card', style: 'margin: 0 0 12px 0;' },
+    el('div', { class: 'meta' }, 'No client registered yet for this upstream.'),
+    el('div', { class: 'row', style: 'margin-top: 8px;' },
+      el('button', {
+        class: 'primary',
+        disabled: f.busy,
+        on: { click: () => oauthDiscoverClick() }
+      }, f.busy ? 'Discovering…' : 'Discover OAuth + register'),
+      el('button', {
+        on: { click: () => { f.showManual = true; render(); } }
+      }, 'Or paste client_id manually'),
+    ),
+    f.showManual ? renderManualClient() : null,
+    el('div', { class: 'meta', style: 'margin-top: 12px;' },
+      'Alternative: skip OAuth and store a personal access token.'),
+    el('div', { class: 'row' },
+      el('input', {
+        placeholder: 'pat or api token',
+        type: 'password',
+        value: f.pat || '',
+        on: { input: (e) => { state.oauthFlow.pat = e.target.value; } }
+      }),
+      el('button', { on: { click: () => oauthSubmitPAT() } }, 'Save PAT'),
+    ),
+  );
+
+  const modeRow = el('div', { class: 'row', style: 'gap: 16px;' },
+    radio('Same browser (recommended)', 'callback', f.mode, (v) => { state.oauthFlow.mode = v; render(); }),
+    radio('Different browser → paste URL back', 'paste', f.mode, (v) => { state.oauthFlow.mode = v; render(); }),
+    supportsDevice ? radio('Device code', 'device', f.mode, (v) => { state.oauthFlow.mode = v; render(); }) : null,
+  );
+
+  const sectionAuthorize = el('div', { class: 'card', style: 'margin: 0 0 12px 0;' },
+    el('div', { class: 'meta' }, 'Authorize this upstream:'),
+    modeRow,
+    !f.authorize_url
+      ? el('div', { class: 'row', style: 'margin-top: 8px;' },
+          el('button', { class: 'primary', disabled: f.busy, on: { click: () => oauthBeginClick() }},
+            f.busy ? 'Working…' : 'Open authorization page'),
+        )
+      : renderActiveFlow(f),
+  );
+
+  const sectionConnected = el('div', { class: 'card', style: 'margin: 0 0 12px 0;' },
+    el('div', {}, 'Connected. ',
+      st.scope_granted ? el('code', {}, st.scope_granted) : null),
+    st.access_expires_at
+      ? el('div', { class: 'meta' }, 'Access token expires ' + new Date(st.access_expires_at).toLocaleString())
+      : null,
+    el('div', { class: 'row', style: 'margin-top: 8px;' },
+      el('button', { on: { click: () => oauthReauthClick() }}, 'Reauthorize'),
+      el('button', { class: 'danger', on: { click: () => oauthDisconnectClick() }}, 'Disconnect'),
+    ),
+  );
+
+  let body;
+  if (!st.has_client && !st.is_pat) body = sectionDiscover;
+  else if (st.state === 'active' && !f.authorize_url) body = sectionConnected;
+  else body = sectionAuthorize;
+
+  return el('div', { class: 'modal-bg', on: { click: (e) => { if (e.target === e.currentTarget) closeOAuthPanel(); } }},
+    el('div', { class: 'modal' },
+      el('h3', {}, 'Authorize ', f.name),
+      st.issuer ? el('div', { class: 'meta' }, 'Provider: ' + st.issuer) : null,
+      body,
+      f.error ? el('div', { class: 'err' }, f.error) : null,
+      el('div', { class: 'row', style: 'margin-top: 12px; justify-content: flex-end;' },
+        el('button', { on: { click: closeOAuthPanel }}, 'Close'),
+      ),
+    ),
+  );
+}
+
+function radio(label, value, current, onChange) {
+  return el('label', { style: 'display: flex; align-items: center; gap: 6px; cursor: pointer;' },
+    el('input', {
+      type: 'radio', name: 'oauth-mode', value,
+      checked: current === value,
+      on: { change: (e) => onChange(e.target.value) },
+    }),
+    label,
+  );
+}
+
+function renderManualClient() {
+  return el('div', { style: 'margin-top: 8px;' },
+    el('label', {},
+      el('div', { class: 'meta' }, 'client_id'),
+      el('input', { id: 'oa-cid' }),
+    ),
+    el('label', {},
+      el('div', { class: 'meta' }, 'client_secret (optional)'),
+      el('input', { id: 'oa-csec', type: 'password' }),
+    ),
+    el('div', { class: 'row', style: 'margin-top: 8px;' },
+      el('button', { class: 'primary', on: { click: () => oauthSubmitManual() }}, 'Save client'),
+    ),
+  );
+}
+
+function renderActiveFlow(f) {
+  if (f.mode === 'device') {
+    return el('div', {},
+      el('div', { class: 'meta' }, 'Open ',
+        el('a', { href: f.verification_uri, target: '_blank' }, f.verification_uri),
+        ' and enter:'),
+      el('div', { style: 'font-size: 24px; font-family: monospace; padding: 8px 0;' }, f.user_code || ''),
+      el('div', { class: 'meta' }, 'Polling — this dialog auto-updates when you approve.'),
+    );
+  }
+  return el('div', {},
+    el('div', { class: 'meta' }, 'Authorization page opened in a new tab.'),
+    el('div', { class: 'meta' }, 'If you can return here in the same browser, this dialog updates automatically.'),
+    f.mode === 'paste'
+      ? el('label', { style: 'margin-top: 8px;' },
+          el('div', { class: 'meta' }, 'Paste the post-redirect URL here:'),
+          el('textarea', {
+            placeholder: 'https://your-callback/cb?code=…&state=…',
+            on: { input: (e) => { state.oauthFlow.paste = e.target.value; } },
+            rows: 3,
+          }),
+          el('div', { class: 'row', style: 'margin-top: 4px;' },
+            el('button', { class: 'primary', disabled: f.busy, on: { click: () => oauthSubmitPaste() }},
+              f.busy ? 'Submitting…' : 'Submit pasted URL'),
+          ),
+        )
+      : null,
+  );
+}
+
+async function oauthDiscoverClick() {
+  const f = state.oauthFlow;
+  f.busy = true; f.error = ''; render();
+  try {
+    await api('/v1/servers/' + encodeURIComponent(f.name) + '/oauth/discover', {
+      method: 'POST', body: {}
+    });
+    await loadOAuthStatus(f.name);
+  } catch (e) { f.error = e.message; }
+  f.busy = false; render();
+}
+
+async function oauthBeginClick() {
+  const f = state.oauthFlow;
+  f.busy = true; f.error = ''; render();
+  try {
+    if (f.mode === 'device') {
+      const out = await api('/v1/servers/' + encodeURIComponent(f.name) + '/oauth/device-begin', {
+        method: 'POST', body: {}
+      });
+      f.state = out.state;
+      f.user_code = out.user_code;
+      f.verification_uri = out.verification_uri;
+      f.authorize_url = '(device)';
+      pollDevice(f);
+    } else {
+      const out = await api('/v1/servers/' + encodeURIComponent(f.name) + '/oauth/begin', {
+        method: 'POST', body: { mode: f.mode }
+      });
+      f.state = out.state;
+      f.authorize_url = out.authorize_url;
+      window.open(out.authorize_url, '_blank', 'noopener');
+    }
+  } catch (e) { f.error = e.message; }
+  f.busy = false; render();
+}
+
+async function oauthSubmitPaste() {
+  const f = state.oauthFlow;
+  f.busy = true; f.error = ''; render();
+  try {
+    await api('/v1/mcp-oauth/paste', {
+      method: 'POST', body: { url: f.paste }
+    });
+    // mcp_oauth_done will fire via SSE.
+  } catch (e) { f.error = e.message; }
+  f.busy = false; render();
+}
+
+async function oauthSubmitPAT() {
+  const f = state.oauthFlow;
+  if (!f.pat) { f.error = 'token is required'; render(); return; }
+  f.busy = true; f.error = ''; render();
+  try {
+    await api('/v1/servers/' + encodeURIComponent(f.name) + '/oauth/pat', {
+      method: 'POST', body: { token: f.pat }
+    });
+    await loadOAuthStatus(f.name);
+    await reloadServers();
+    toast(f.name + ': PAT saved.');
+    state.oauthFlow = null;
+  } catch (e) { f.error = e.message; }
+  if (state.oauthFlow) state.oauthFlow.busy = false;
+  render();
+}
+
+async function oauthSubmitManual() {
+  const f = state.oauthFlow;
+  const cid = ($('oa-cid') || {}).value || '';
+  const csec = ($('oa-csec') || {}).value || '';
+  if (!cid.trim()) { f.error = 'client_id is required'; render(); return; }
+  f.busy = true; f.error = ''; render();
+  try {
+    await api('/v1/servers/' + encodeURIComponent(f.name) + '/oauth/manual-client', {
+      method: 'POST', body: { client_id: cid.trim(), client_secret: csec }
+    });
+    await loadOAuthStatus(f.name);
+    f.showManual = false;
+  } catch (e) { f.error = e.message; }
+  f.busy = false; render();
+}
+
+async function oauthReauthClick() {
+  const f = state.oauthFlow;
+  try {
+    await api('/v1/servers/' + encodeURIComponent(f.name) + '/oauth/reauth', { method: 'POST', body: {} });
+    await loadOAuthStatus(f.name);
+    f.authorize_url = '';
+  } catch (e) { f.error = e.message; }
+  render();
+}
+
+async function oauthDisconnectClick() {
+  const f = state.oauthFlow;
+  try {
+    await api('/v1/servers/' + encodeURIComponent(f.name) + '/oauth', { method: 'DELETE' });
+    await loadOAuthStatus(f.name);
+    await reloadServers();
+    toast(f.name + ' disconnected.');
+    state.oauthFlow = null;
+  } catch (e) { f.error = e.message; }
+  render();
+}
+
+async function pollDevice(f) {
+  // Poll once a second until we either succeed, error, or the user closes the modal.
+  const myFlow = f;
+  const tick = async () => {
+    if (state.oauthFlow !== myFlow) return; // user moved on
+    try {
+      const resp = await fetch('/v1/servers/' + encodeURIComponent(f.name) + '/oauth/device-poll', {
+        method: 'POST', credentials: 'include',
+        headers: { 'Content-Type': 'application/json', 'X-Requested-With': 'toolyard' },
+        body: JSON.stringify({ state: f.state }),
+      });
+      if (resp.status === 200) {
+        // mcp_oauth_done SSE will close the modal.
+        return;
+      }
+      if (resp.status === 202) {
+        setTimeout(tick, Math.max(1000, 1000 * (f.interval || 1)));
+        return;
+      }
+      const out = await resp.json();
+      f.error = out.error || ('HTTP ' + resp.status);
+      render();
+    } catch (e) {
+      f.error = e.message;
+      render();
+    }
+  };
+  setTimeout(tick, 1000);
+}
+
+// Pre-load OAuth status for any visible upstreams.
+async function preloadOAuthStatus() {
+  const targets = (state.servers || []).filter(isHTTPUpstream).map((s) => s.name);
+  for (const n of targets) await loadOAuthStatus(n);
 }
 
 (async () => {

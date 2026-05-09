@@ -50,12 +50,12 @@ import (
 // against a snapshot built every time the rule set changes.
 type Rule struct {
 	ID            string `json:"id"`
-	Kind          string `json:"kind"`           // static | pattern | tool
-	AgentID       string `json:"agent_id"`        // "" = any
-	Fingerprint   string `json:"fingerprint"`     // "" = any
-	ToolName      string `json:"tool_name"`       // "" = any
+	Kind          string `json:"kind"`        // static | pattern | tool
+	AgentID       string `json:"agent_id"`    // "" = any
+	Fingerprint   string `json:"fingerprint"` // "" = any
+	ToolName      string `json:"tool_name"`   // "" = any
 	Enabled       bool   `json:"enabled"`
-	Source        string `json:"source"`          // user | proposer
+	Source        string `json:"source"` // user | proposer
 	RationaleJSON string `json:"rationale_json,omitempty"`
 	CreatedAt     int64  `json:"created_at"`
 	CoolOffUntil  int64  `json:"cool_off_until,omitempty"`
@@ -73,7 +73,7 @@ type Service struct {
 	mu    sync.RWMutex
 	cache []Rule
 
-	rateMu  sync.Mutex
+	rateMu      sync.Mutex
 	rateBuckets map[string]*rateBucket // agent -> bucket
 }
 
