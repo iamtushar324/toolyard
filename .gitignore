@@ -37,3 +37,5 @@ web/dashboard/.vite/
 # OS
 .DS_Store
 Thumbs.db
+
+.mcp.json

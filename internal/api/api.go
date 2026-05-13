@@ -47,6 +47,7 @@ import (
 	"github.com/tusharbhardwaj/toolyard/internal/identity"
 	"github.com/tusharbhardwaj/toolyard/internal/marketplace"
 	"github.com/tusharbhardwaj/toolyard/internal/memory"
+	"github.com/tusharbhardwaj/toolyard/internal/mempalace"
 	"github.com/tusharbhardwaj/toolyard/internal/metrics"
 	"github.com/tusharbhardwaj/toolyard/internal/oauth"
 	"github.com/tusharbhardwaj/toolyard/internal/push"
@@ -76,6 +77,7 @@ type Server struct {
 	metrics      *metrics.Reader
 	autoApproval *autoapproval.Service
 	oauth        *oauth.Service
+	mempalace    *mempalace.Service
 	sessionKey   []byte
 	security     SecurityOptions
 	loginLimit   *loginThrottle
@@ -96,6 +98,7 @@ type Options struct {
 	Metrics      *metrics.Reader
 	AutoApproval *autoapproval.Service
 	OAuth        *oauth.Service
+	Mempalace    *mempalace.Service
 	SessionKey   []byte
 	Security     SecurityOptions
 }
@@ -115,6 +118,7 @@ func New(opts Options) *Server {
 		metrics:      opts.Metrics,
 		autoApproval: opts.AutoApproval,
 		oauth:        opts.OAuth,
+		mempalace:    opts.Mempalace,
 		sessionKey:   opts.SessionKey,
 		security:     opts.Security,
 		loginLimit:   newLoginThrottle(5, 15*time.Minute),
@@ -157,6 +161,10 @@ func (s *Server) Routes(mux *http.ServeMux) {
 
 	mux.HandleFunc("/v1/memory", s.memoryHandler)
 	mux.HandleFunc("/v1/memory/list", s.memoryList)
+
+	mux.HandleFunc("/v1/mempalace/ingest", s.mempalaceIngest)
+	mux.HandleFunc("/v1/mempalace/status", s.mempalaceStatus)
+	mux.HandleFunc("/v1/mempalace/agents", s.mempalaceAgents)
 
 	mux.HandleFunc("/v1/push/vapid_key", s.pushVapidKey)
 	mux.HandleFunc("/v1/push/subscribe", s.pushSubscribe)
@@ -1170,11 +1178,14 @@ func (s *Server) serversItem(w http.ResponseWriter, r *http.Request) {
 	}
 	if r.Method == http.MethodDelete {
 		if err := s.upstreams.Remove(r.Context(), name); err != nil {
-			if errors.Is(err, upstreams.ErrNotFound) {
+			switch {
+			case errors.Is(err, upstreams.ErrNotFound):
 				writeError(w, http.StatusNotFound, err.Error())
-				return
+			case errors.Is(err, upstreams.ErrReserved):
+				writeError(w, http.StatusForbidden, "reserved built-in upstream cannot be removed")
+			default:
+				writeError(w, http.StatusInternalServerError, err.Error())
 			}
-			writeError(w, http.StatusInternalServerError, err.Error())
 			return
 		}
 		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
@@ -1350,6 +1361,117 @@ func (s *Server) usageHandler(w http.ResponseWriter, r *http.Request) {
 		"per_tool": perTool,
 		"rows":     rows,
 	})
+}
+
+// ---- mempalace -------------------------------------------------------------
+
+// requireAgent extracts the agent identity from an Authorization: Bearer
+// header. The same bearer-token flow used by /mcp. Returns the agent ID and
+// true on success; on failure writes a 401 and returns false so the handler
+// can return immediately.
+func (s *Server) requireAgent(w http.ResponseWriter, r *http.Request) (string, bool) {
+	authz := r.Header.Get("Authorization")
+	if !strings.HasPrefix(authz, "Bearer ") {
+		writeError(w, http.StatusUnauthorized, "bearer token required")
+		return "", false
+	}
+	raw := strings.TrimPrefix(authz, "Bearer ")
+	ag, err := s.identity.VerifyAgentToken(r.Context(), raw)
+	if err != nil {
+		writeError(w, http.StatusUnauthorized, "invalid agent token")
+		return "", false
+	}
+	return ag.ID, true
+}
+
+// mempalaceIngest accepts a chat-memory entry from an authenticated agent
+// and forwards it to mempalace.diary_write via the gateway's internal call
+// path (no human approval — chat capture must not block).
+func (s *Server) mempalaceIngest(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "POST only")
+		return
+	}
+	if s.mempalace == nil || s.mempalace.Disabled() {
+		writeError(w, http.StatusServiceUnavailable, "mempalace integration is disabled")
+		return
+	}
+	agentID, ok := s.requireAgent(w, r)
+	if !ok {
+		return
+	}
+	var body struct {
+		Entry string `json:"entry"`
+		Topic string `json:"topic,omitempty"`
+		Wing  string `json:"wing,omitempty"`
+	}
+	if err := decode(r, &body); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	res, err := s.mempalace.Ingest(r.Context(), agentID, body.Entry, body.Topic, body.Wing)
+	if err != nil {
+		switch {
+		case errors.Is(err, mempalace.ErrEntryRequired):
+			writeError(w, http.StatusBadRequest, err.Error())
+		case errors.Is(err, mempalace.ErrDisabled):
+			writeError(w, http.StatusServiceUnavailable, err.Error())
+		case errors.Is(err, mempalace.ErrNotReady):
+			writeError(w, http.StatusServiceUnavailable, err.Error())
+		default:
+			writeError(w, http.StatusInternalServerError, err.Error())
+		}
+		return
+	}
+	out := map[string]any{
+		"ok":       res.OK,
+		"agent_id": agentID,
+		"detail":   res.Detail,
+	}
+	if res.Raw != nil {
+		out["raw"] = res.Raw
+	}
+	status := http.StatusOK
+	if !res.OK {
+		status = http.StatusBadGateway
+	}
+	writeJSON(w, status, out)
+}
+
+// mempalaceStatus returns the integration snapshot for the dashboard card.
+// Cookie-authenticated (dashboard user), not the agent path.
+func (s *Server) mempalaceStatus(w http.ResponseWriter, r *http.Request) {
+	if _, err := s.requireUser(r); err != nil {
+		writeError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+	if s.mempalace == nil {
+		writeJSON(w, http.StatusOK, map[string]any{"enabled": false})
+		return
+	}
+	writeJSON(w, http.StatusOK, s.mempalace.Snapshot(r.Context()))
+}
+
+// mempalaceAgents returns the top-N agents by ingest count.
+func (s *Server) mempalaceAgents(w http.ResponseWriter, r *http.Request) {
+	if _, err := s.requireUser(r); err != nil {
+		writeError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+	if s.mempalace == nil {
+		writeJSON(w, http.StatusOK, []any{})
+		return
+	}
+	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
+	rows, err := s.mempalace.TopAgents(r.Context(), limit)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if rows == nil {
+		rows = []mempalace.AgentRow{}
+	}
+	writeJSON(w, http.StatusOK, rows)
 }
 
 // ---- placeholder for context.Background usage ------------------------------

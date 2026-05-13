@@ -22,6 +22,7 @@ import (
 	"net"
 	"net/http"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
 	"strings"
@@ -37,6 +38,7 @@ import (
 	"github.com/tusharbhardwaj/toolyard/internal/gateway"
 	"github.com/tusharbhardwaj/toolyard/internal/identity"
 	"github.com/tusharbhardwaj/toolyard/internal/memory"
+	"github.com/tusharbhardwaj/toolyard/internal/mempalace"
 	"github.com/tusharbhardwaj/toolyard/internal/metrics"
 	"github.com/tusharbhardwaj/toolyard/internal/oauth"
 	"github.com/tusharbhardwaj/toolyard/internal/policy"
@@ -115,6 +117,7 @@ func runServe(argv []string) error {
 	statelessMCP := fs.Bool("stateless-mcp", false, "skip MCP session-ID tracking. Every request stands alone — no server-initiated notifications, but agents that don't auto-reconnect on session-invalid (e.g., hermes) survive a toolyard restart without manual intervention.")
 	noStdioUpstreams := fs.Bool("no-stdio-upstreams", false, "refuse to start any stdio (subprocess) MCP upstream. Use when the dashboard is exposed publicly so a compromised session can't spawn arbitrary commands.")
 	envDenylistFlag := fs.String("upstream-env-denylist", "LD_PRELOAD,LD_LIBRARY_PATH,DYLD_INSERT_LIBRARIES,DYLD_LIBRARY_PATH,PATH", "comma-separated env var keys forbidden in upstream stdio configs")
+	mempalaceFlag := fs.String("mempalace", "auto", "MemPalace integration mode: on|off|auto. auto=install via `uv tool install mempalace` if missing and proceed; on=fail boot when install fails; off=skip the integration entirely.")
 	_ = fs.Parse(argv)
 
 	// Public mode auto-enables matching safeguards.
@@ -288,6 +291,42 @@ func runServe(argv []string) error {
 		}
 	}
 
+	// MemPalace: install (if needed), initialize palace dir, and register
+	// the built-in stdio upstream so its 29 tools surface as `mempalace.*`.
+	// All wired in a soft style so a missing `uv` on the host doesn't break
+	// the rest of the gateway.
+	mpMode := mempalace.ParseMode(*mempalaceFlag)
+	mpSvc := mempalace.New(db, gw, auditSvc, *dataDir, mpMode)
+	if !mpSvc.Disabled() {
+		if err := mpSvc.EnsureInstalled(ctx); err != nil {
+			return fmt.Errorf("mempalace install: %w", err)
+		}
+		if err := mpSvc.EnsureInitialized(ctx); err != nil {
+			log.Printf("mempalace init: %v", err)
+		}
+		// Only register the upstream if the binary is actually findable;
+		// otherwise the upstreams package will try to fork it and fail.
+		if _, lookErr := exec.LookPath(mpSvc.Binary()); lookErr == nil {
+			if _, err := upstreamSvc.UpsertBuiltin(ctx, upstreams.Server{
+				Name:      mempalace.ToolPrefix,
+				Transport: "stdio",
+				Command:   mpSvc.Binary(),
+				Args:      []string{"--palace", mpSvc.PalaceDir()},
+				Enabled:   true,
+			}); err != nil {
+				log.Printf("mempalace upstream: %v", err)
+			} else {
+				log.Printf("mempalace: connected (palace=%s)", mpSvc.PalaceDir())
+			}
+		} else if mpMode == mempalace.ModeOn {
+			return fmt.Errorf("mempalace: binary %q not on PATH after install (mode=on)", mpSvc.Binary())
+		} else {
+			log.Printf("mempalace: binary %q not found on PATH; integration inactive (mode=auto)", mpSvc.Binary())
+		}
+	} else {
+		log.Printf("mempalace: disabled (-mempalace=off)")
+	}
+
 	secOpts := api.SecurityOptions{
 		PublicURL:      *publicURL,
 		TrustedProxies: parseCIDRs(*trustedProxies),
@@ -308,6 +347,7 @@ func runServe(argv []string) error {
 		Metrics:      metricsReader,
 		AutoApproval: autoApprover,
 		OAuth:        oauthSvc,
+		Mempalace:    mpSvc,
 		SessionKey:   loadOrCreateSessionKey(*dataDir),
 		Security:     secOpts,
 	})
