@@ -50,6 +50,7 @@ import (
 	"github.com/tusharbhardwaj/toolyard/internal/marketplace"
 	"github.com/tusharbhardwaj/toolyard/internal/memory"
 	"github.com/tusharbhardwaj/toolyard/internal/mempalace"
+	"github.com/tusharbhardwaj/toolyard/internal/notes"
 	"github.com/tusharbhardwaj/toolyard/internal/metrics"
 	"github.com/tusharbhardwaj/toolyard/internal/oauth"
 	"github.com/tusharbhardwaj/toolyard/internal/push"
@@ -89,6 +90,7 @@ type Server struct {
 	grafanaRuntimeEnvPath    string
 	clickhouseRuntimeEnvPath string
 	mempalace                *mempalace.Service
+	notes                    *notes.Service
 	sessionKey               []byte
 	security     SecurityOptions
 	loginLimit   *loginThrottle
@@ -132,6 +134,10 @@ type Options struct {
 	// the container re-reads the env on next process start.
 	ClickhouseRuntimeEnvPath string
 	Mempalace                *mempalace.Service
+	// Notes, when set, enables /v1/notes/* — markdown workspace +
+	// background MemPalace sync. The Service itself nil-checks so an
+	// unwired install just returns 503 from the routes.
+	Notes                    *notes.Service
 	SessionKey               []byte
 	Security                 SecurityOptions
 }
@@ -156,6 +162,7 @@ func New(opts Options) *Server {
 		grafanaRuntimeEnvPath:    opts.GrafanaRuntimeEnvPath,
 		clickhouseRuntimeEnvPath: opts.ClickhouseRuntimeEnvPath,
 		mempalace:                opts.Mempalace,
+		notes:                    opts.Notes,
 		sessionKey:               opts.SessionKey,
 		security:     opts.Security,
 		loginLimit:   newLoginThrottle(5, 15*time.Minute),
@@ -202,6 +209,10 @@ func (s *Server) Routes(mux *http.ServeMux) {
 	mux.HandleFunc("/v1/mempalace/ingest", s.mempalaceIngest)
 	mux.HandleFunc("/v1/mempalace/status", s.mempalaceStatus)
 	mux.HandleFunc("/v1/mempalace/agents", s.mempalaceAgents)
+
+	mux.HandleFunc("/v1/notes/sync", s.notesSync)
+	mux.HandleFunc("/v1/notes/status", s.notesStatus)
+	mux.HandleFunc("/v1/notes/publish", s.notesPublish)
 
 	mux.HandleFunc("/v1/push/vapid_key", s.pushVapidKey)
 	mux.HandleFunc("/v1/push/subscribe", s.pushSubscribe)
@@ -1660,6 +1671,88 @@ func (s *Server) mempalaceAgents(w http.ResponseWriter, r *http.Request) {
 		rows = []mempalace.AgentRow{}
 	}
 	writeJSON(w, http.StatusOK, rows)
+}
+
+// ---- notes ------------------------------------------------------------------
+
+// notesSync triggers a one-shot scan of $NOTES_DIR, ingesting any
+// markdown file whose mtime advanced since the last sync. Bearer-authed
+// (any enrolled agent can fire it; this is what cron / a `toolyard
+// notes sync` CLI hook would hit). Returns count of ingested files.
+func (s *Server) notesSync(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "POST only")
+		return
+	}
+	if s.notes == nil || !s.notes.Enabled() {
+		writeError(w, http.StatusServiceUnavailable, "notes service is disabled")
+		return
+	}
+	if _, ok := s.requireAgent(w, r); !ok {
+		return
+	}
+	n, err := s.notes.Sync(r.Context())
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"ingested": n})
+}
+
+// notesStatus is the dashboard snapshot. Cookie-authenticated.
+func (s *Server) notesStatus(w http.ResponseWriter, r *http.Request) {
+	if _, err := s.requireUser(r); err != nil {
+		writeError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+	if s.notes == nil {
+		writeJSON(w, http.StatusOK, map[string]any{"enabled": false})
+		return
+	}
+	writeJSON(w, http.StatusOK, s.notes.Snapshot(r.Context()))
+}
+
+// notesPublish is the HTTP twin of the notes.publish MCP tool. Bearer-
+// authed; takes the same shape as the tool and forwards through the
+// service. Lets non-MCP callers (a phone shortcut, a cron, a third-party
+// agent) drop a note + index it in one call.
+func (s *Server) notesPublish(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "POST only")
+		return
+	}
+	if s.notes == nil || !s.notes.Enabled() {
+		writeError(w, http.StatusServiceUnavailable, "notes service is disabled")
+		return
+	}
+	agentID, ok := s.requireAgent(w, r)
+	if !ok {
+		return
+	}
+	var body struct {
+		Path    string `json:"path"`
+		Content string `json:"content"`
+		Topic   string `json:"topic,omitempty"`
+	}
+	if err := decode(r, &body); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	res, err := s.notes.Publish(r.Context(), agentID, body.Path, body.Content, body.Topic)
+	if err != nil {
+		switch {
+		case errors.Is(err, notes.ErrPathRequired),
+			errors.Is(err, notes.ErrEmptyContent),
+			errors.Is(err, notes.ErrPathEscape):
+			writeError(w, http.StatusBadRequest, err.Error())
+		case errors.Is(err, notes.ErrDisabled):
+			writeError(w, http.StatusServiceUnavailable, err.Error())
+		default:
+			writeError(w, http.StatusInternalServerError, err.Error())
+		}
+		return
+	}
+	writeJSON(w, http.StatusOK, res)
 }
 
 // ---- placeholder for context.Background usage ------------------------------

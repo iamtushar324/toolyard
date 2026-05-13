@@ -44,6 +44,7 @@ import (
 	"github.com/tusharbhardwaj/toolyard/internal/memory"
 	"github.com/tusharbhardwaj/toolyard/internal/mempalace"
 	"github.com/tusharbhardwaj/toolyard/internal/metrics"
+	notespkg "github.com/tusharbhardwaj/toolyard/internal/notes"
 	"github.com/tusharbhardwaj/toolyard/internal/oauth"
 	"github.com/tusharbhardwaj/toolyard/internal/policy"
 	"github.com/tusharbhardwaj/toolyard/internal/push"
@@ -131,6 +132,7 @@ func runServe(argv []string) error {
 	mempalaceFlag := fs.String("mempalace", "auto", "MemPalace integration mode: on|off|auto. auto=install via `uv tool install mempalace` if missing and proceed; on=fail boot when install fails; off=skip the integration entirely.")
 	notesFlag := fs.String("notes", "auto", "Notes (markdown workspace) upstream mode: on|off|auto. auto=register the filesystem MCP if npx is on PATH; on=fail boot when npx missing; off=skip the integration entirely.")
 	notesDir := fs.String("notes-dir", "", "Directory the notes filesystem upstream exposes (defaults to <data-dir>/notes). Lives under <data-dir> so the existing data-dir backup captures it.")
+	notesSyncEvery := fs.Duration("notes-sync-interval", notespkg.DefaultScanEvery, "How often the notes->mempalace background sync walks the notes dir. Use a negative value to disable scanning (notes.publish still works).")
 	_ = fs.Parse(argv)
 
 	// Public mode auto-enables matching safeguards.
@@ -469,6 +471,25 @@ func runServe(argv []string) error {
 		log.Printf("notes: unknown mode %q; treating as auto", notesMode)
 	}
 
+	// Notes service: notes.publish built-in tool + background scanner
+	// that keeps mempalace's diary in sync with the on-disk notes/ dir.
+	// Constructed regardless of the upstream's status — Publish() and
+	// Sync() short-circuit when mempalace isn't registered yet, and the
+	// scanner retries on every tick. Lives on the same goroutine
+	// lifecycle as the gateway (ctx cancellation stops it cleanly).
+	var notesSvc *notespkg.Service
+	if notesMode != "off" {
+		notesSvc = notespkg.New(notespkg.Options{
+			DB:       db,
+			Gateway:  gw,
+			NotesDir: resolvedNotesDir,
+			Interval: *notesSyncEvery,
+		})
+		gw.RegisterNotesPublish(notesAdapter{notesSvc})
+		go notesSvc.StartScanner(ctx)
+		log.Printf("notes-sync: scanner started (interval=%s, dir=%s)", *notesSyncEvery, resolvedNotesDir)
+	}
+
 	secOpts := api.SecurityOptions{
 		PublicURL:      *publicURL,
 		TrustedProxies: parseCIDRs(*trustedProxies),
@@ -494,6 +515,7 @@ func runServe(argv []string) error {
 		GrafanaRuntimeEnvPath:    *grafanaRuntimeEnvPath,
 		ClickhouseRuntimeEnvPath: *clickhouseRuntimeEnvPath,
 		Mempalace:                mpSvc,
+		Notes:                    notesSvc,
 		SessionKey:               loadOrCreateSessionKey(*dataDir),
 		Security:                 secOpts,
 	})
@@ -1088,6 +1110,17 @@ func (r identityResolver) PrimaryUserID(ctx context.Context) (string, error) {
 	}
 	return u.ID, nil
 }
+
+// notesAdapter bridges *notes.Service's typed return to the gateway's
+// `(any, error)` NotesPublisher contract — the interface is declared
+// without importing internal/notes to avoid a dependency cycle, so we
+// flatten the typed value here.
+type notesAdapter struct{ s *notespkg.Service }
+
+func (a notesAdapter) Publish(ctx context.Context, agentID, path, content, topic string) (any, error) {
+	return a.s.Publish(ctx, agentID, path, content, topic)
+}
+func (a notesAdapter) NotesDir() string { return a.s.NotesDir() }
 
 // silence unused-import warnings in case build tags drop something.
 var _ = net.Listen

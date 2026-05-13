@@ -297,6 +297,10 @@ func perRouteBodyCap(path string) int64 {
 		return 1 << 20 // 1 MiB — memory.set values
 	case strings.HasPrefix(path, "/v1/mempalace/ingest"):
 		return 1 << 20 // 1 MiB — chat-interaction entries can be sizeable
+	case strings.HasPrefix(path, "/v1/notes/publish"):
+		return 1 << 20 // 1 MiB — markdown documents
+	case strings.HasPrefix(path, "/v1/notes/sync"):
+		return 4 << 10 // tiny — no body needed
 	case strings.HasPrefix(path, "/v1/push/subscribe"):
 		return 8 << 10 // 8 KiB — subscription metadata
 	case strings.HasPrefix(path, "/v1/auth/login"),
@@ -322,7 +326,9 @@ func exemptFromCSRFHeader(path string) bool {
 		"/v1/approvals/decide-by-token",
 		// Agent-authenticated (Bearer) ingest — no cookie, no dashboard
 		// origin, so the CSRF custom-header check doesn't apply.
-		"/v1/mempalace/ingest":
+		"/v1/mempalace/ingest",
+		"/v1/notes/sync",
+		"/v1/notes/publish":
 		return true
 	}
 	return false
