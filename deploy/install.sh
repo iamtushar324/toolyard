@@ -31,7 +31,15 @@
 #   PUSH_SUBJECT=mailto:...  VAPID `sub` claim (your contact email).
 #   NO_STDIO_UPSTREAMS=true  refuse subprocess MCP upstreams. Recommended once
 #                            you trust the auth surface.
+#   MEMPALACE=auto|on|off    MemPalace integration. auto (default) installs
+#                            uv + mempalace-mcp to /usr/local/bin if missing
+#                            and lets the gateway register the upstream; on
+#                            hard-fails when install doesn't land; off skips
+#                            the integration entirely. The systemd user's PATH
+#                            includes /usr/local/bin, so installing the shim
+#                            there is what makes it reachable.
 #   --import-from <dir>      copy existing toolyard.db + session.key from <dir>.
+#   --mempalace <mode>       same as MEMPALACE env var.
 #
 # Run from the repo root.
 
@@ -75,6 +83,14 @@ NO_STDIO_UPSTREAMS="${NO_STDIO_UPSTREAMS:-false}"
 # gateway. Override with STATELESS_MCP=false if you genuinely need server
 # push notifications and your agents handle session-invalidation cleanly.
 STATELESS_MCP="${STATELESS_MCP:-true}"
+# MemPalace integration. auto = install if missing + proceed; on = also
+# fail-hard if install doesn't produce /usr/local/bin/mempalace-mcp; off
+# = skip the integration entirely. Forwarded to the gateway as -mempalace.
+MEMPALACE="${MEMPALACE:-auto}"
+# Directory the uv-managed mempalace venv lives in (binary shim still ends
+# up at /usr/local/bin/mempalace-mcp). Persistent + root-owned so re-runs
+# upgrade in place and the systemd-sandboxed toolyard user only reads it.
+UV_TOOL_STATE_DIR="/var/lib/uv-tools"
 IMPORT_FROM=""
 
 while [[ $# -gt 0 ]]; do
@@ -82,10 +98,16 @@ while [[ $# -gt 0 ]]; do
     --import-from)        IMPORT_FROM="$2"; shift 2 ;;
     --public-url)         PUBLIC_URL="$2"; shift 2 ;;
     --no-stdio-upstreams) NO_STDIO_UPSTREAMS=true; shift ;;
-    -h|--help)            sed -n '2,40p' "$0"; exit 0 ;;
+    --mempalace)          MEMPALACE="$2"; shift 2 ;;
+    -h|--help)            sed -n '2,46p' "$0"; exit 0 ;;
     *) echo "unknown flag: $1" >&2; exit 1 ;;
   esac
 done
+
+case "$MEMPALACE" in
+  on|off|auto) ;;
+  *) echo "MEMPALACE must be one of: on, off, auto (got: $MEMPALACE)" >&2; exit 1 ;;
+esac
 
 if [[ $EUID -ne 0 ]]; then
   echo "must run as root (use sudo)" >&2
@@ -163,6 +185,75 @@ EOF
   chmod 0640 "$ENV_FILE"
 fi
 
+# MemPalace runtime — install `uv` (if missing) and `mempalace-mcp` so the
+# gateway's startup wiring finds them on PATH. The toolyard service runs as
+# an unprivileged user whose PATH is /usr/local/sbin:/usr/local/bin:..., so
+# we deliberately drop both binaries under /usr/local/bin/ (not the
+# operator's ~/.local/bin/). The tool venv data goes to /var/lib/uv-tools/
+# so it survives operator-user re-installs and isn't tied to a home dir.
+#
+# Skipped entirely when MEMPALACE=off; soft-warns on auto when install
+# fails; hard-fails on on.
+ensure_mempalace() {
+  if [[ "$MEMPALACE" == "off" ]]; then
+    say "mempalace: integration disabled (MEMPALACE=off)"
+    return 0
+  fi
+
+  if [[ ! -x /usr/local/bin/uv ]] && ! command -v uv >/dev/null 2>&1; then
+    say "installing uv -> /usr/local/bin/uv"
+    # The astral installer reads UV_INSTALL_DIR for the destination. We
+    # pipe through env so the variable reaches sh inside the pipe.
+    if ! curl -LsSf https://astral.sh/uv/install.sh | env UV_INSTALL_DIR=/usr/local/bin sh; then
+      if [[ "$MEMPALACE" == "on" ]]; then
+        echo "mempalace: uv install failed and MEMPALACE=on; aborting" >&2
+        exit 1
+      fi
+      echo "mempalace: uv install failed; gateway will boot without mempalace" >&2
+      return 0
+    fi
+  fi
+  local UV_BIN
+  UV_BIN="$(command -v uv 2>/dev/null || echo /usr/local/bin/uv)"
+
+  install -d -m 0755 "$UV_TOOL_STATE_DIR"
+
+  if [[ ! -x /usr/local/bin/mempalace-mcp ]]; then
+    say "installing mempalace via $UV_BIN tool install (state: $UV_TOOL_STATE_DIR, shim: /usr/local/bin/mempalace-mcp)"
+    # UV_TOOL_DIR controls where the venv lives; UV_TOOL_BIN_DIR is where
+    # uv drops the shim. --force keeps re-runs idempotent on upgrades.
+    if ! env UV_TOOL_DIR="$UV_TOOL_STATE_DIR" \
+            UV_TOOL_BIN_DIR="/usr/local/bin" \
+            "$UV_BIN" tool install --force mempalace; then
+      if [[ "$MEMPALACE" == "on" ]]; then
+        echo "mempalace: install failed and MEMPALACE=on; aborting" >&2
+        exit 1
+      fi
+      echo "mempalace: install failed; gateway will boot without mempalace" >&2
+      return 0
+    fi
+  else
+    say "mempalace-mcp already at /usr/local/bin/mempalace-mcp; upgrading"
+    env UV_TOOL_DIR="$UV_TOOL_STATE_DIR" \
+        UV_TOOL_BIN_DIR="/usr/local/bin" \
+        "$UV_BIN" tool upgrade mempalace || true
+  fi
+
+  # Hard check: the shim must exist and be executable for the gateway's
+  # `exec.LookPath("mempalace-mcp")` probe to succeed.
+  if [[ ! -x /usr/local/bin/mempalace-mcp ]]; then
+    if [[ "$MEMPALACE" == "on" ]]; then
+      echo "mempalace: /usr/local/bin/mempalace-mcp missing after install (MEMPALACE=on); aborting" >&2
+      exit 1
+    fi
+    echo "mempalace: /usr/local/bin/mempalace-mcp missing after install; gateway will boot without mempalace" >&2
+    return 0
+  fi
+  say "mempalace ready: /usr/local/bin/mempalace-mcp"
+}
+
+ensure_mempalace
+
 if [[ -n "$IMPORT_FROM" ]]; then
   if [[ -f "$IMPORT_FROM/toolyard.db" ]]; then
     say "importing existing data from $IMPORT_FROM"
@@ -193,6 +284,7 @@ EXEC_FLAGS=(
   -trusted-proxy "$TRUSTED_PROXY"
   -push-subject "$PUSH_SUBJECT"
   -in-line-wait "${IN_LINE_WAIT:-0s}"
+  -mempalace "$MEMPALACE"
 )
 [[ -n "$PUBLIC_URL" ]] && EXEC_FLAGS+=( -public-url "$PUBLIC_URL" )
 [[ "$NO_STDIO_UPSTREAMS" == "true" ]] && EXEC_FLAGS+=( -no-stdio-upstreams )
@@ -332,6 +424,27 @@ for i in {1..30}; do
 done
 
 systemctl --no-pager status toolyard | head -15 || true
+
+# Mempalace registration check. The gateway logs "mempalace: connected" or
+# "mempalace: disabled" / "mempalace: binary ... not found" on boot. Parse
+# the most recent boot's log to decide if the integration is live and fail
+# the install when MEMPALACE=on but the upstream didn't come up.
+if [[ "$MEMPALACE" != "off" ]]; then
+  say "checking mempalace upstream registration in toolyard journal"
+  mp_line="$(journalctl -u toolyard -n 200 --no-pager 2>/dev/null | grep -E 'mempalace:' | tail -1 || true)"
+  if [[ -z "$mp_line" ]]; then
+    echo "    no mempalace boot line yet; the upstream may still be connecting"
+  elif echo "$mp_line" | grep -q 'connected'; then
+    echo "    $mp_line"
+    echo "    mempalace upstream is live; expect ~30 mempalace.* tools in /v1/tools"
+  else
+    echo "    $mp_line"
+    if [[ "$MEMPALACE" == "on" ]]; then
+      echo "mempalace: upstream did not connect (MEMPALACE=on); aborting" >&2
+      exit 1
+    fi
+  fi
+fi
 
 # ----- ClickHouse stack ------------------------------------------------
 #
