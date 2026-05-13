@@ -125,7 +125,7 @@ func validate(srv Server) error {
 		return fmt.Errorf("%w: name must not contain spaces or dots", ErrInvalid)
 	}
 	switch srv.Name {
-	case "builtin", "fixture", "memory", "tools", "mempalace":
+	case "builtin", "fixture", "memory", "tools", "mempalace", "notes":
 		return ErrReserved
 	}
 	switch srv.Transport {
@@ -373,7 +373,7 @@ func nullStr(s string) any {
 // boot would simply re-insert the row anyway.
 func isReservedBuiltin(name string) bool {
 	switch name {
-	case "mempalace":
+	case "mempalace", "notes":
 		return true
 	}
 	return false

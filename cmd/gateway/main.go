@@ -129,6 +129,8 @@ func runServe(argv []string) error {
 	envDenylistFlag := fs.String("upstream-env-denylist", "LD_PRELOAD,LD_LIBRARY_PATH,DYLD_INSERT_LIBRARIES,DYLD_LIBRARY_PATH,PATH", "comma-separated env var keys forbidden in upstream stdio configs")
 	upstreamCallTimeout := fs.Duration("upstream-call-timeout", 120*time.Second, "per-tool-call deadline applied to every dispatch (built-in, fixture, and external upstreams). 0 disables the cap. Without it, a hung upstream pins a goroutine indefinitely and queues every other caller behind it.")
 	mempalaceFlag := fs.String("mempalace", "auto", "MemPalace integration mode: on|off|auto. auto=install via `uv tool install mempalace` if missing and proceed; on=fail boot when install fails; off=skip the integration entirely.")
+	notesFlag := fs.String("notes", "auto", "Notes (markdown workspace) upstream mode: on|off|auto. auto=register the filesystem MCP if npx is on PATH; on=fail boot when npx missing; off=skip the integration entirely.")
+	notesDir := fs.String("notes-dir", "", "Directory the notes filesystem upstream exposes (defaults to <data-dir>/notes). Lives under <data-dir> so the existing data-dir backup captures it.")
 	_ = fs.Parse(argv)
 
 	// Public mode auto-enables matching safeguards.
@@ -417,6 +419,54 @@ func runServe(argv []string) error {
 		}
 	} else {
 		log.Printf("mempalace: disabled (-mempalace=off)")
+	}
+
+	// Notes workspace: a markdown scratchpad agents read/write through the
+	// official @modelcontextprotocol/server-filesystem MCP. The upstream is
+	// scoped to a single directory so agents can only touch the notes dir,
+	// never the rest of the toolyard data root. We launch via `npx -y` so
+	// re-runs don't need a global npm install — npm's cache handles repeat
+	// boots fast.
+	notesMode := strings.ToLower(strings.TrimSpace(*notesFlag))
+	if notesMode == "" {
+		notesMode = "auto"
+	}
+	resolvedNotesDir := *notesDir
+	if resolvedNotesDir == "" {
+		resolvedNotesDir = filepath.Join(*dataDir, "notes")
+	}
+	switch notesMode {
+	case "off":
+		log.Printf("notes: disabled (-notes=off)")
+	case "on", "auto":
+		if err := os.MkdirAll(resolvedNotesDir, 0o750); err != nil {
+			if notesMode == "on" {
+				return fmt.Errorf("notes: mkdir %s: %w", resolvedNotesDir, err)
+			}
+			log.Printf("notes: mkdir %s: %v", resolvedNotesDir, err)
+			break
+		}
+		npxPath, lookErr := exec.LookPath("npx")
+		if lookErr != nil {
+			if notesMode == "on" {
+				return fmt.Errorf("notes: npx not on PATH (-notes=on); install Node.js or set -notes=off")
+			}
+			log.Printf("notes: npx not on PATH; integration inactive (-notes=auto)")
+			break
+		}
+		if _, err := upstreamSvc.UpsertBuiltin(ctx, upstreams.Server{
+			Name:      "notes",
+			Transport: "stdio",
+			Command:   npxPath,
+			Args:      []string{"-y", "@modelcontextprotocol/server-filesystem", resolvedNotesDir},
+			Enabled:   true,
+		}); err != nil {
+			log.Printf("notes upstream: %v", err)
+		} else {
+			log.Printf("notes: connected (dir=%s)", resolvedNotesDir)
+		}
+	default:
+		log.Printf("notes: unknown mode %q; treating as auto", notesMode)
 	}
 
 	secOpts := api.SecurityOptions{

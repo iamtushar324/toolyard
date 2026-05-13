@@ -38,8 +38,16 @@
 #                            the integration entirely. The systemd user's PATH
 #                            includes /usr/local/bin, so installing the shim
 #                            there is what makes it reachable.
+#   NOTES=auto|on|off        Notes workspace integration. auto (default)
+#                            creates $NOTES_DIR + registers the filesystem
+#                            MCP upstream if `npx` is on PATH; on hard-fails
+#                            when npx is missing; off skips it entirely.
+#   NOTES_DIR=/path          Override the notes directory (default
+#                            $DATA_DIR/notes — lives inside the data root
+#                            so existing backups capture it).
 #   --import-from <dir>      copy existing toolyard.db + session.key from <dir>.
 #   --mempalace <mode>       same as MEMPALACE env var.
+#   --notes <mode>           same as NOTES env var.
 #
 # Run from the repo root.
 
@@ -91,6 +99,12 @@ MEMPALACE="${MEMPALACE:-auto}"
 # up at /usr/local/bin/mempalace-mcp). Persistent + root-owned so re-runs
 # upgrade in place and the systemd-sandboxed toolyard user only reads it.
 UV_TOOL_STATE_DIR="/var/lib/uv-tools"
+# Notes workspace — markdown scratchpad agents read/write through the
+# @modelcontextprotocol/server-filesystem MCP. Lives inside DATA_DIR so
+# the same /var/lib/toolyard snapshot captures it for backups.
+NOTES="${NOTES:-auto}"
+NOTES_DIR_DEFAULT="$DATA_DIR/notes"
+NOTES_DIR="${NOTES_DIR:-$NOTES_DIR_DEFAULT}"
 IMPORT_FROM=""
 
 while [[ $# -gt 0 ]]; do
@@ -99,7 +113,8 @@ while [[ $# -gt 0 ]]; do
     --public-url)         PUBLIC_URL="$2"; shift 2 ;;
     --no-stdio-upstreams) NO_STDIO_UPSTREAMS=true; shift ;;
     --mempalace)          MEMPALACE="$2"; shift 2 ;;
-    -h|--help)            sed -n '2,46p' "$0"; exit 0 ;;
+    --notes)              NOTES="$2"; shift 2 ;;
+    -h|--help)            sed -n '2,52p' "$0"; exit 0 ;;
     *) echo "unknown flag: $1" >&2; exit 1 ;;
   esac
 done
@@ -107,6 +122,10 @@ done
 case "$MEMPALACE" in
   on|off|auto) ;;
   *) echo "MEMPALACE must be one of: on, off, auto (got: $MEMPALACE)" >&2; exit 1 ;;
+esac
+case "$NOTES" in
+  on|off|auto) ;;
+  *) echo "NOTES must be one of: on, off, auto (got: $NOTES)" >&2; exit 1 ;;
 esac
 
 if [[ $EUID -ne 0 ]]; then
@@ -254,6 +273,44 @@ ensure_mempalace() {
 
 ensure_mempalace
 
+# Notes workspace — see install-time docs for what this enables. The
+# gateway also creates $NOTES_DIR on boot, but doing it here lets us
+# git-init for free version history (gateway can't, since it runs under
+# a sandbox that doesn't include git).
+ensure_notes() {
+  if [[ "$NOTES" == "off" ]]; then
+    say "notes: integration disabled (NOTES=off)"
+    return 0
+  fi
+
+  say "ensuring notes dir $NOTES_DIR (owned by $USER_NAME)"
+  install -d -m 0750 -o "$USER_NAME" -g "$USER_NAME" "$NOTES_DIR"
+
+  # Free version history for every edit, no extra infrastructure. The
+  # MCP filesystem server only does write_file/edit_file, so a daily
+  # `git add -A && git commit` cron is the simplest audit story — left
+  # to the operator to wire up if desired.
+  if command -v git >/dev/null 2>&1 && [[ ! -d "$NOTES_DIR/.git" ]]; then
+    say "notes: git init $NOTES_DIR"
+    sudo -u "$USER_NAME" git -C "$NOTES_DIR" init -q -b main || true
+    sudo -u "$USER_NAME" git -C "$NOTES_DIR" config user.email "toolyard@localhost" || true
+    sudo -u "$USER_NAME" git -C "$NOTES_DIR" config user.name "toolyard" || true
+    sudo -u "$USER_NAME" bash -c "cd '$NOTES_DIR' && printf '# toolyard notes\n\nMarkdown scratchpad shared with toolyard agents.\nEdits land here via the `notes.*` MCP tools or a regular editor.\n' > README.md && git add README.md && git -c gpg.gpgsign=false commit -q -m 'initial' 2>/dev/null" || true
+  fi
+
+  if ! command -v npx >/dev/null 2>&1 && [[ ! -x /usr/local/bin/npx ]]; then
+    if [[ "$NOTES" == "on" ]]; then
+      echo "notes: npx not found and NOTES=on; aborting (install Node.js or set NOTES=off)" >&2
+      exit 1
+    fi
+    echo "notes: npx not found; gateway will boot without notes upstream (install Node.js to enable)" >&2
+    return 0
+  fi
+  say "notes ready: $NOTES_DIR (filesystem MCP exposes it as notes.*)"
+}
+
+ensure_notes
+
 if [[ -n "$IMPORT_FROM" ]]; then
   if [[ -f "$IMPORT_FROM/toolyard.db" ]]; then
     say "importing existing data from $IMPORT_FROM"
@@ -285,6 +342,8 @@ EXEC_FLAGS=(
   -push-subject "$PUSH_SUBJECT"
   -in-line-wait "${IN_LINE_WAIT:-0s}"
   -mempalace "$MEMPALACE"
+  -notes "$NOTES"
+  -notes-dir "$NOTES_DIR"
 )
 [[ -n "$PUBLIC_URL" ]] && EXEC_FLAGS+=( -public-url "$PUBLIC_URL" )
 [[ "$NO_STDIO_UPSTREAMS" == "true" ]] && EXEC_FLAGS+=( -no-stdio-upstreams )
@@ -441,6 +500,23 @@ if [[ "$MEMPALACE" != "off" ]]; then
     echo "    $mp_line"
     if [[ "$MEMPALACE" == "on" ]]; then
       echo "mempalace: upstream did not connect (MEMPALACE=on); aborting" >&2
+      exit 1
+    fi
+  fi
+fi
+
+if [[ "$NOTES" != "off" ]]; then
+  say "checking notes upstream registration in toolyard journal"
+  notes_line="$(journalctl -u toolyard -n 200 --no-pager 2>/dev/null | grep -E '^[^@]*notes:' | tail -1 || true)"
+  if [[ -z "$notes_line" ]]; then
+    echo "    no notes boot line yet; the upstream may still be connecting"
+  elif echo "$notes_line" | grep -q 'connected'; then
+    echo "    $notes_line"
+    echo "    notes upstream is live; agents can use notes.read_file / write_file / list_directory etc."
+  else
+    echo "    $notes_line"
+    if [[ "$NOTES" == "on" ]]; then
+      echo "notes: upstream did not connect (NOTES=on); aborting" >&2
       exit 1
     fi
   fi
