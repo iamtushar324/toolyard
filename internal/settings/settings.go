@@ -7,9 +7,13 @@ package settings
 
 import (
 	"context"
+	"crypto/rand"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"net/url"
+	"strings"
 	"sync"
 	"time"
 
@@ -61,7 +65,41 @@ const (
 	CostInputUsdPerM = "cost_input_usd_per_m"
 	// CostOutputUsdPerM: USD per 1M output tokens (default 0).
 	CostOutputUsdPerM = "cost_output_usd_per_m"
+
+	// LakeAPIToken is the static Bearer token external read-only consumers
+	// (Grafana Infinity datasource, ad-hoc scripts) present to /v1/lake/*.
+	// Generated on first gateway start if empty; rotatable from the UI.
+	// Classified as a secret — never returned by All(), only by an
+	// explicit reveal call.
+	LakeAPIToken = "lake_api_token"
+	// GrafanaOrigin, when non-empty, is added to the CSP frame-src
+	// directive so the toolyard /lake/ page can iframe Grafana panels
+	// from this origin (e.g. http://localhost:3030).
+	GrafanaOrigin = "grafana_origin"
+	// ClickhousePassword is the password for the `default` user of the
+	// toolyard-clickhouse docker stack. Generated on first gateway start
+	// if empty; rotatable from the UI. Toolyard renders it into a
+	// runtime env file that the compose env_file directive consumes;
+	// CH reads it at process start via the from_env="TOOLYARD_CH_PASSWORD"
+	// reference in users.d/toolyard.xml.
+	ClickhousePassword = "clickhouse_password"
 )
+
+// secretKeys lists settings whose values must not flow back through the
+// generic GET /v1/settings response. Reads of these keys go through the
+// dedicated Reveal() path so the dashboard can present a "show once"
+// rotation flow with audit logging instead of a static token sitting in
+// every page response.
+var secretKeys = map[string]struct{}{
+	LakeAPIToken:       {},
+	ClickhousePassword: {},
+}
+
+// IsSecretKey reports whether key is classified as a secret.
+func IsSecretKey(key string) bool {
+	_, ok := secretKeys[key]
+	return ok
+}
 
 // Surface modes.
 const (
@@ -108,17 +146,36 @@ func (s *Service) reloadAll(ctx context.Context) error {
 // All returns a snapshot of every setting (decoded to interface{}). Used by
 // the dashboard's GET /v1/settings. The result also fills in defaults +
 // the virtual router_only_mode alias derived from surface_mode.
+//
+// Secret keys (see secretKeys) are not returned by value — instead a
+// companion `<key>_present` boolean is included so the UI can render
+// status without ever pulling the cleartext into a normal response.
+// Use Reveal() to fetch the value for an explicit one-shot rotation flow.
 func (s *Service) All(ctx context.Context) (map[string]any, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	out := make(map[string]any, len(s.cache))
 	for k, v := range s.cache {
+		if IsSecretKey(k) {
+			// Emit only the presence flag. A non-empty JSON string ("..."
+			// is at minimum 2 bytes) means the operator has set it.
+			out[k+"_present"] = len(v) > 2
+			continue
+		}
 		var x any
 		if err := json.Unmarshal(v, &x); err != nil {
 			out[k] = string(v)
 			continue
 		}
 		out[k] = x
+	}
+	// Always emit *_present for known secret keys so the UI can show a
+	// "Not set" state without a separate request.
+	for k := range secretKeys {
+		flag := k + "_present"
+		if _, ok := out[flag]; !ok {
+			out[flag] = false
+		}
 	}
 	// Defaults for the keys the UI expects to be present.
 	if _, ok := out[SurfaceMode]; !ok {
@@ -137,6 +194,142 @@ func (s *Service) All(ctx context.Context) (map[string]any, error) {
 		out[RouterOnlyMode] = false
 	}
 	return out, nil
+}
+
+// Reveal returns the cleartext value of a single setting. Intended for
+// the dashboard's "show once" rotation flow on secret keys; for non-
+// secret keys it's just GetString. Returns "" without error when the key
+// is absent so the caller can distinguish empty from error.
+func (s *Service) Reveal(_ context.Context, key string) (string, error) {
+	if key == "" {
+		return "", errors.New("key required")
+	}
+	s.mu.RLock()
+	v, ok := s.cache[key]
+	s.mu.RUnlock()
+	if !ok {
+		return "", nil
+	}
+	var str string
+	if err := json.Unmarshal(v, &str); err != nil {
+		return "", err
+	}
+	return str, nil
+}
+
+// EnsureLakeAPIToken makes sure lake_api_token is set, generating a fresh
+// 32-byte random value on first boot. Returns the (current or newly
+// minted) token plus a flag indicating whether a generation happened —
+// the caller logs / surfaces this so the operator knows a one-time
+// secret was created on their behalf.
+func (s *Service) EnsureLakeAPIToken(ctx context.Context) (string, bool, error) {
+	s.mu.RLock()
+	v, ok := s.cache[LakeAPIToken]
+	s.mu.RUnlock()
+	if ok && len(v) > 2 {
+		var existing string
+		if err := json.Unmarshal(v, &existing); err == nil && existing != "" {
+			return existing, false, nil
+		}
+	}
+	tok, err := randomHex(32)
+	if err != nil {
+		return "", false, err
+	}
+	if err := s.Set(ctx, LakeAPIToken, tok); err != nil {
+		return "", false, err
+	}
+	return tok, true, nil
+}
+
+// RotateLakeAPIToken replaces the existing token with a freshly generated
+// one and returns it. Callers must follow up with whatever side effects
+// the token's consumers expect (e.g. writing the runtime env file the
+// Grafana container reads).
+func (s *Service) RotateLakeAPIToken(ctx context.Context) (string, error) {
+	tok, err := randomHex(32)
+	if err != nil {
+		return "", err
+	}
+	if err := s.Set(ctx, LakeAPIToken, tok); err != nil {
+		return "", err
+	}
+	return tok, nil
+}
+
+// EnsureClickhousePassword mirrors EnsureLakeAPIToken for the CH stack:
+// reads the existing password if any, mints one on first call, returns
+// (current_or_new, was_generated, error). Hex output (64 chars) keeps it
+// safe for shell-style env files — no quoting concerns.
+func (s *Service) EnsureClickhousePassword(ctx context.Context) (string, bool, error) {
+	s.mu.RLock()
+	v, ok := s.cache[ClickhousePassword]
+	s.mu.RUnlock()
+	if ok && len(v) > 2 {
+		var existing string
+		if err := json.Unmarshal(v, &existing); err == nil && existing != "" {
+			return existing, false, nil
+		}
+	}
+	pw, err := randomHex(32)
+	if err != nil {
+		return "", false, err
+	}
+	if err := s.Set(ctx, ClickhousePassword, pw); err != nil {
+		return "", false, err
+	}
+	return pw, true, nil
+}
+
+// RotateClickhousePassword replaces the existing CH password with a
+// freshly generated one. Same caveat as RotateLakeAPIToken: the caller
+// is responsible for re-rendering the runtime env file (and operationally
+// for restarting the CH container so it re-reads it).
+func (s *Service) RotateClickhousePassword(ctx context.Context) (string, error) {
+	pw, err := randomHex(32)
+	if err != nil {
+		return "", err
+	}
+	if err := s.Set(ctx, ClickhousePassword, pw); err != nil {
+		return "", err
+	}
+	return pw, nil
+}
+
+// SetGrafanaOrigin validates and persists grafana_origin. We accept
+// http(s):// origins only, with no path / query / fragment, so a stray
+// trailing slash or full panel URL doesn't end up in the CSP header
+// where it would either silently fail or mis-broaden the allow-list.
+func (s *Service) SetGrafanaOrigin(ctx context.Context, raw string) error {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return s.Set(ctx, GrafanaOrigin, "")
+	}
+	u, err := url.Parse(raw)
+	if err != nil {
+		return errors.New("not a valid URL")
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return errors.New("origin must use http or https")
+	}
+	if u.Host == "" {
+		return errors.New("origin must include a host")
+	}
+	if u.Path != "" && u.Path != "/" || u.RawQuery != "" || u.Fragment != "" {
+		return errors.New("origin must not include path/query/fragment")
+	}
+	canonical := u.Scheme + "://" + u.Host
+	return s.Set(ctx, GrafanaOrigin, canonical)
+}
+
+// randomHex returns 2*n hex chars from crypto/rand. Used for the lake
+// API token (n=32 -> 64 hex chars, 256 bits of entropy).
+func randomHex(n int) (string, error) {
+	b := make([]byte, n)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(b), nil
 }
 
 // GetString reads a string setting from the in-memory cache, returning
@@ -237,8 +430,26 @@ func (s *Service) Set(ctx context.Context, key string, value any) error {
 
 // Patch merges a map of {key: value} updates in one go, rolled back on error.
 // router_only_mode is normalised into surface_mode at write time so older
-// callers continue working.
+// callers continue working. Secret keys are rejected here — they have to
+// flow through Rotate/Reveal so the audit trail and reveal-once UX stay
+// consistent. grafana_origin is normalised through SetGrafanaOrigin to
+// keep CSP-incompatible inputs out of the table.
 func (s *Service) Patch(ctx context.Context, updates map[string]any) error {
+	for k := range updates {
+		if IsSecretKey(k) {
+			return errors.New("secret keys are write-only via the rotate endpoint")
+		}
+	}
+	if v, ok := updates[GrafanaOrigin]; ok {
+		raw, _ := v.(string)
+		if err := s.SetGrafanaOrigin(ctx, raw); err != nil {
+			return err
+		}
+		delete(updates, GrafanaOrigin)
+		if len(updates) == 0 {
+			return nil
+		}
+	}
 	updates = normalise(updates)
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {

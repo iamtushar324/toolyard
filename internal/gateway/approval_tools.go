@@ -4,7 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
+	"reflect"
 	"strings"
 	"time"
 
@@ -21,6 +21,7 @@ const (
 	MetaPollApproval         = "tools.poll_approval"
 	MetaPollApprovals        = "tools.poll_approvals"
 	MetaWaitForApproval      = "tools.wait_for_approval"
+	MetaWaitForApprovals     = "tools.wait_for_approvals"
 	MetaListPendingApprovals = "tools.list_my_pending_approvals"
 	MetaCancelMyApproval     = "tools.cancel_my_approval"
 	MetaApprovalStats        = "tools.approval_stats"
@@ -39,9 +40,10 @@ func (g *Gateway) approvalMetaTools() []toolEntry {
 	poll := mcp.Tool{
 		Name: MetaPollApproval,
 		Description: descriptionBanner +
-			"Check the status of one approval queued earlier. Non-blocking — returns the current state immediately. " +
-			"Use this when you got a deferred response from a tool call and want to know whether the human has decided yet. " +
-			"If the response says status=allowed, re-call the original tool with _approval_id to execute and get the result.",
+			"Fetch the status — and, when ready, the executed result — of one approval queued earlier. Non-blocking. " +
+			"Auto-execute: the moment the human flips an approval to allowed, toolyard runs the original tool itself with your persisted arguments. The poll response carries result.content + result.structured_content as soon as that finishes (status='executed'). " +
+			"Status flow: pending -> executed | denied | expired | cancelled. While the executor is mid-flight you'll briefly see status='allowed' with no result; just poll again. " +
+			"Do NOT re-call the original tool to get the result — toolyard already ran it; this poll is the canonical way to retrieve the answer.",
 		InputSchema: mcp.ToolInputSchema{
 			Type:     "object",
 			Required: []string{ReasonField, "approval_id"},
@@ -78,15 +80,50 @@ func (g *Gateway) approvalMetaTools() []toolEntry {
 	wait := mcp.Tool{
 		Name: MetaWaitForApproval,
 		Description: descriptionBanner +
-			"Block up to timeout_seconds for a single approval to be decided. Returns as soon as a decision lands, or when the timeout elapses (whichever comes first). " +
-			"Use this when you've decided you want to wait synchronously rather than poll — for example, the deferred response says expected_decision_in_seconds=10 and you'd rather wait than check back. " +
-			"Maximum timeout is 300 seconds. The connection is held open server-side; for longer waits, prefer polling.",
+			"Block up to timeout_seconds for one approval to reach a final state — either status='executed' (with result.content + result.structured_content populated) or one of denied/expired/cancelled. Returns as soon as that lands, or when the timeout elapses. " +
+			"Auto-execute: the gateway runs the approved tool itself, so a single wait_for_approval round-trip gets the executed answer; you do not need to follow up with a re-call of the original tool. " +
+			"Use this when expected_decision_in_seconds is short and you'd rather wait than poll. " +
+			"Maximum timeout is 300 seconds; the connection is held open server-side. For longer waits, prefer polling.",
 		InputSchema: mcp.ToolInputSchema{
 			Type:     "object",
 			Required: []string{ReasonField, "approval_id"},
 			Properties: addMetaProps(map[string]any{
 				"approval_id": map[string]any{
 					"type": "string",
+				},
+				"timeout_seconds": map[string]any{
+					"type":        "integer",
+					"minimum":     1,
+					"maximum":     int(WaitForApprovalMaxTimeout.Seconds()),
+					"description": "How long to wait before returning the current state. Default 60.",
+				},
+			}),
+		},
+	}
+
+	waitMany := mcp.Tool{
+		Name: MetaWaitForApprovals,
+		Description: descriptionBanner +
+			"Block on SEVERAL approvals at once. Server-side fan-in: one connection waits on up to 32 approval_ids and returns when the requested condition is met (or timeout elapses). " +
+			"mode='all' (default) returns when EVERY id has reached a terminal state (executed/denied/expired/cancelled) — preferred when you need every result before continuing. " +
+			"mode='any' returns as soon as ONE id is terminal — preferred when you can act on the first available result. " +
+			"This is strictly more efficient than running tools.wait_for_approval N times in parallel (one server connection vs. N) and than poll-loops via tools.poll_approvals. " +
+			"Maximum timeout is 300 seconds.",
+		InputSchema: mcp.ToolInputSchema{
+			Type:     "object",
+			Required: []string{ReasonField, "approval_ids"},
+			Properties: addMetaProps(map[string]any{
+				"approval_ids": map[string]any{
+					"type":        "array",
+					"items":       map[string]any{"type": "string"},
+					"minItems":    1,
+					"maxItems":    32,
+					"description": "Up to 32 approval IDs to wait on.",
+				},
+				"mode": map[string]any{
+					"type":        "string",
+					"enum":        []string{"all", "any"},
+					"description": "all (default): return when every id is terminal. any: return when any one is terminal.",
 				},
 				"timeout_seconds": map[string]any{
 					"type":        "integer",
@@ -151,6 +188,8 @@ func (g *Gateway) approvalMetaTools() []toolEntry {
 			reasonField: ReasonField, handle: g.handlePollApprovals()},
 		{tool: wait, upstream: "tools", originalName: "wait_for_approval",
 			reasonField: ReasonField, handle: g.handleWaitForApproval()},
+		{tool: waitMany, upstream: "tools", originalName: "wait_for_approvals",
+			reasonField: ReasonField, handle: g.handleWaitForApprovals()},
 		{tool: list, upstream: "tools", originalName: "list_my_pending_approvals",
 			reasonField: ReasonField, handle: g.handleListMyPendingApprovals()},
 		{tool: cancel, upstream: "tools", originalName: "cancel_my_approval",
@@ -164,10 +203,20 @@ func (g *Gateway) approvalMetaTools() []toolEntry {
 // the meta-tools. Compact deliberately — the AI doesn't need the full
 // argument map echoed back at it (it has its own copy from the original
 // call).
+//
+// `status` follows the request lifecycle: pending -> allowed -> executed
+// (synthesised when the bus has persisted a result_executed_at) /
+// denied / expired / cancelled. The "executed" pseudo-status is the
+// agent's signal that `result` is populated and the call is done.
 func approvalSnapshot(req *approval.Request, includeArgs bool) map[string]any {
+	status := req.Status
+	if req.Status == approval.StatusAllowed && req.ResultExecutedAt > 0 {
+		status = "executed"
+	}
 	out := map[string]any{
 		"approval_id": req.ID,
-		"status":      req.Status,
+		"status":      status,
+		"raw_status":  req.Status,
 		"tool":        req.ToolName,
 		"upstream":    req.UpstreamName,
 		"agent_id":    req.AgentID,
@@ -182,8 +231,40 @@ func approvalSnapshot(req *approval.Request, includeArgs bool) map[string]any {
 		out["decided_by"] = req.DecidedBy
 		out["decision_latency_seconds"] = int((req.DecidedAt - req.CreatedAt) / 1000)
 	}
-	if req.Status == approval.StatusAllowed {
-		out["result_via"] = fmt.Sprintf("re-call %s with _approval_id=%q to execute", req.ToolName, req.ID)
+	switch req.Status {
+	case approval.StatusAllowed:
+		// Auto-execute: gateway runs the approved tool itself. The
+		// snapshot carries the result if the executor has finished;
+		// otherwise it tells the agent to keep polling rather than
+		// re-call the original tool.
+		if req.ResultExecutedAt > 0 {
+			out["executed_at"] = time.UnixMilli(req.ResultExecutedAt).UTC().Format(time.RFC3339)
+			out["execution_latency_seconds"] = int((req.ResultExecutedAt - req.DecidedAt) / 1000)
+			if req.ResultError != "" {
+				out["execution_error"] = req.ResultError
+			}
+			result, err := rehydrateApprovalResult(req.ResultEnvelope)
+			if err != nil {
+				out["execution_error_decode"] = err.Error()
+			} else if result != nil {
+				out["result"] = map[string]any{
+					"is_error":           result.IsError,
+					"content":            result.Content,
+					"structured_content": result.StructuredContent,
+				}
+			}
+			out["how_to_use_result"] = "result.content + result.structured_content are exactly what the original tool returned. The call is done; nothing else to do."
+		} else {
+			out["how_to_get_result"] = "The tool is executing right now (the human just approved). Poll again shortly with the same approval_id; the response will carry result.content + result.structured_content once the executor finishes."
+		}
+	case approval.StatusDenied:
+		out["how_to_proceed"] = "The human reviewer rejected this call. Do not re-fire the same fingerprint; explain to the user what they declined and ask for an alternative."
+	case approval.StatusExpired:
+		out["how_to_proceed"] = "The approval window expired without a decision. If still relevant, fire the tool again to enqueue a fresh approval."
+	case approval.StatusCancelled:
+		out["how_to_proceed"] = "This approval was cancelled (by the agent or operator). If still needed, fire the tool again."
+	case approval.StatusPending:
+		out["how_to_proceed"] = "Still awaiting the human's decision. Once approved, toolyard runs the tool automatically — keep polling this approval_id, no re-call needed."
 	}
 	if includeArgs {
 		out["arguments"] = req.Arguments
@@ -270,9 +351,16 @@ func (g *Gateway) handleWaitForApproval() directHandler {
 		if callerAgent := agentIDFromContext(ctx); callerAgent != "" && req.AgentID != "" && callerAgent != req.AgentID {
 			return mcp.NewToolResultError("approval_id does not belong to the calling agent"), nil
 		}
-		// Already decided — return immediately, no waiting.
+		// Already in a terminal state (denied/expired/cancelled, or
+		// allowed-and-executed) — return immediately. Allowed-but-
+		// executor-not-yet-finished still falls through so the caller
+		// gets the result in the same round-trip rather than being
+		// told "approved, poll again."
 		if req.Status != approval.StatusPending {
-			return jsonResultMap(approvalSnapshot(req, false))
+			executed := req.Status == approval.StatusAllowed && req.ResultExecutedAt > 0
+			if req.Status != approval.StatusAllowed || executed {
+				return jsonResultMap(approvalSnapshot(req, false))
+			}
 		}
 		// Subscribe to the bus's per-approval signal channel. If the
 		// approval row is in a different process / restart, Watch returns
@@ -313,6 +401,137 @@ func (g *Gateway) handleWaitForApproval() directHandler {
 		}
 		return jsonResultMap(approvalSnapshot(req, false))
 	}
+}
+
+// handleWaitForApprovals fans in on N approvals at once. Returns when
+// the requested condition (mode=any|all) holds across the supplied IDs
+// or timeout elapses, whichever comes first. Subscribes to each id's
+// in-memory waiter; falls back to a 2 s polling ceiling for ids
+// without one (e.g., rows surfaced from a previous process restart).
+func (g *Gateway) handleWaitForApprovals() directHandler {
+	return func(ctx context.Context, args map[string]any) (*mcp.CallToolResult, error) {
+		raw, _ := args["approval_ids"].([]any)
+		if len(raw) == 0 {
+			return mcp.NewToolResultError("approval_ids is required and non-empty"), nil
+		}
+		if len(raw) > 32 {
+			return mcp.NewToolResultError("approval_ids: max 32 per call"), nil
+		}
+		mode := "all"
+		if m, ok := args["mode"].(string); ok && m != "" {
+			if m != "all" && m != "any" {
+				return mcp.NewToolResultError(`mode must be "all" or "any"`), nil
+			}
+			mode = m
+		}
+		timeoutSec := 60
+		if v, ok := args["timeout_seconds"].(float64); ok && v > 0 {
+			timeoutSec = int(v)
+		}
+		if maxSec := int(WaitForApprovalMaxTimeout.Seconds()); timeoutSec > maxSec {
+			timeoutSec = maxSec
+		}
+		ids := make([]string, 0, len(raw))
+		for _, item := range raw {
+			id, _ := item.(string)
+			id = strings.TrimSpace(id)
+			if id == "" {
+				return mcp.NewToolResultError("approval_ids contains an empty string"), nil
+			}
+			ids = append(ids, id)
+		}
+		callerAgent := agentIDFromContext(ctx)
+		deadline := time.Now().Add(time.Duration(timeoutSec) * time.Second)
+
+		// Each loop iteration: snapshot every id, evaluate condition,
+		// return if met or timed out, otherwise reflect.Select on every
+		// in-memory watcher channel + a polling tick + timeout + ctx.
+		for {
+			snapshots := make([]map[string]any, 0, len(ids))
+			anyTerm, allTerm := false, true
+			for _, id := range ids {
+				req, err := g.approval.Get(ctx, id)
+				if err != nil {
+					if errors.Is(err, approval.ErrNotFound) {
+						snapshots = append(snapshots, map[string]any{
+							"approval_id": id, "status": "unknown",
+						})
+						// "unknown" is terminal — there's nothing to wait for.
+						anyTerm = true
+						continue
+					}
+					return mcp.NewToolResultErrorFromErr("lookup approval", err), nil
+				}
+				if callerAgent != "" && req.AgentID != "" && callerAgent != req.AgentID {
+					snapshots = append(snapshots, map[string]any{
+						"approval_id": id, "status": "forbidden",
+					})
+					anyTerm = true
+					continue
+				}
+				if isTerminal(req) {
+					anyTerm = true
+				} else {
+					allTerm = false
+				}
+				snapshots = append(snapshots, approvalSnapshot(req, false))
+			}
+
+			finished := (mode == "all" && allTerm) || (mode == "any" && anyTerm)
+			now := time.Now()
+			if finished || !now.Before(deadline) {
+				return jsonResultMap(map[string]any{
+					"count":        len(snapshots),
+					"mode":         mode,
+					"all_terminal": allTerm,
+					"any_terminal": anyTerm,
+					"timed_out":    !finished,
+					"results":      snapshots,
+				})
+			}
+
+			// Build a dynamic select over every available watcher,
+			// plus a polling cap (for IDs without an in-memory waiter)
+			// plus the deadline plus ctx.Done.
+			remaining := time.Until(deadline)
+			pollCap := 2 * time.Second
+			if remaining < pollCap {
+				pollCap = remaining
+			}
+			cases := make([]reflect.SelectCase, 0, len(ids)+3)
+			for _, id := range ids {
+				if ch, ok := g.approval.Watch(id); ok {
+					cases = append(cases, reflect.SelectCase{
+						Dir:  reflect.SelectRecv,
+						Chan: reflect.ValueOf(ch),
+					})
+				}
+			}
+			cases = append(cases,
+				reflect.SelectCase{Dir: reflect.SelectRecv, Chan: reflect.ValueOf(time.After(pollCap))},
+				reflect.SelectCase{Dir: reflect.SelectRecv, Chan: reflect.ValueOf(time.After(remaining))},
+				reflect.SelectCase{Dir: reflect.SelectRecv, Chan: reflect.ValueOf(ctx.Done())},
+			)
+			_, _, _ = reflect.Select(cases)
+			// Loop back and re-snapshot. The deadline check at the top
+			// handles the "timer fired" path uniformly.
+		}
+	}
+}
+
+// isTerminal reports whether the request is in a state that won't
+// change further: the human refused / the window expired / the agent
+// withdrew, or the call is allowed AND the executor has persisted a
+// result. Allowed-without-result is NOT terminal — the executor is
+// still mid-flight.
+func isTerminal(req *approval.Request) bool {
+	switch req.Status {
+	case approval.StatusDenied, approval.StatusExpired, approval.StatusCancelled:
+		return true
+	case approval.StatusAllowed:
+		return req.ResultExecutedAt > 0
+	}
+	return false
 }
 
 func (g *Gateway) handleListMyPendingApprovals() directHandler {

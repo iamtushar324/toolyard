@@ -59,6 +59,51 @@ The full self-hosting guide is in [`docs/self-hosting.md`](docs/self-hosting.md)
   PostToolUse hook that resumes deferred approvals.
 - Multi-stage `deploy/Dockerfile` + `deploy/docker-compose.yml`.
 
+## Personal data lake (TUS-104)
+
+toolyard ships a DuckDB-backed warehouse so any "data not modified per row"
+— finance JSONs, daily memory markdowns, Nova SQLite stores, ingest logs —
+can land in one queryable place. File: `~/.toolyard/lake.duckdb`.
+
+**Tools agents can call (no approval, additive):**
+
+- `lake.query` — read-only SQL (SELECT/WITH/SHOW/PRAGMA only).
+- `lake.list_tables`, `lake.describe_table` — catalog introspection.
+- `lake.insert` — append rows (structured or raw INSERT).
+- `lake.create_table` — CREATE TABLE/VIEW/INDEX. CREATE OR REPLACE allowed.
+- `lake.ingest` — bulk load CSV/Parquet/JSON/JSONL/SQLite/HTTP into a target.
+
+**Tools agents can call (phone approval required):**
+
+- `lake.update`, `lake.delete` — WHERE is mandatory.
+- `lake.alter`, `lake.drop`.
+
+**Schema layout:**
+
+- `raw.*` — immutable mirrors of source files; lineage record only.
+- `mart.*` — Kimball dimensional model: `dim_*` (account, category,
+  investment, physical_asset, learning_goal, exercise, date) and
+  `fact_*` (account_balance, investment_valuation, credit_card_bill,
+  net_worth_snapshot, recurring_schedule, workout, exercise_set,
+  chat_interaction, daily_memory, deployment_plan).
+- `app.*` — agent's free-form scratch space.
+
+**Ingest:** drop new files in `~/.toolyard/inbox/`, then call
+`lake.ingest` (CSV/Parquet/JSON/JSONL/SQLite/HTTP). DuckDB is the
+sole source of truth; there is no scheduled refresh from any external
+location.
+
+**Backup:** `toolyard lake backup` runs `EXPORT DATABASE` to
+`<data>/backups/lake-<ts>/`.
+
+**Dashboard:** [/lake/](http://192.168.1.179:18787/lake/) — manifest-
+driven, vanilla JS + ECharts. Adding a new chart = drop a `.sql` file in
+`web/lake/queries/<tab>/` and append a panel to
+`web/lake/manifest.json`. No JS change required.
+
+Architectural decisions live in
+[`docs/adr/0004-lake-engine.md`](docs/adr/0004-lake-engine.md).
+
 ## Verification
 
 End-to-end smoke test (run while the binary is up on `:18787`):

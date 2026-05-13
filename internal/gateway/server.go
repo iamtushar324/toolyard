@@ -8,6 +8,7 @@ import (
 	"log"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/mark3labs/mcp-go/mcp"
@@ -15,6 +16,7 @@ import (
 
 	"github.com/tusharbhardwaj/toolyard/internal/approval"
 	"github.com/tusharbhardwaj/toolyard/internal/audit"
+	"github.com/tusharbhardwaj/toolyard/internal/lake"
 	"github.com/tusharbhardwaj/toolyard/internal/memory"
 	"github.com/tusharbhardwaj/toolyard/internal/metrics"
 	"github.com/tusharbhardwaj/toolyard/internal/policy"
@@ -56,6 +58,7 @@ var PinnedTools = map[string]struct{}{
 	"tools.poll_approval":             {},
 	"tools.poll_approvals":            {},
 	"tools.wait_for_approval":         {},
+	"tools.wait_for_approvals":        {},
 	"tools.list_my_pending_approvals": {},
 	"tools.cancel_my_approval":        {},
 	"tools.approval_stats":            {},
@@ -63,6 +66,16 @@ var PinnedTools = map[string]struct{}{
 	"memory.set":                      {},
 	"memory.list":                     {},
 	"memory.delete":                   {},
+	// Personal data lake — the additive tools are pinned so agents always
+	// see them; the approval-gated mutations (lake.update, lake.delete,
+	// lake.alter, lake.drop) are deliberately not pinned, keeping them off
+	// the default toolbelt unless the agent reaches via tools.search.
+	"lake.query":          {},
+	"lake.list_tables":    {},
+	"lake.describe_table": {},
+	"lake.insert":         {},
+	"lake.create_table":   {},
+	"lake.ingest":         {},
 }
 
 // IsPinned reports whether toolName is in the always-visible set.
@@ -83,6 +96,13 @@ type toolEntry struct {
 	originalName string // upstream-side name (without prefix)
 	reasonField  string // "_reason" (or "__toolyard_reason" if a clash forced a rename)
 	handle       directHandler
+	// forcedAction, when non-nil, short-circuits policy.Eval for this tool
+	// and uses the provided action instead. Used by built-in tools that
+	// need a deterministic policy decision regardless of the name-heuristic
+	// (e.g., lake.create_table looks like a write but is intentionally
+	// auto-allowed). The intent_category supplied by the agent is ignored
+	// when forcedAction is set.
+	forcedAction *policy.Action
 }
 
 // Gateway stitches the MCP server, policy, approval bus, memory, and upstream
@@ -94,13 +114,20 @@ type Gateway struct {
 	audit              *audit.Logger
 	hub                *realtime.Hub
 	memory             *memory.Service
+	lake               *lake.Service
 	visibility         VisibilityProvider
 	usage              UsageRecorder
 	metrics            MetricsRecorder
 	metricsReader      MetricsLatencyReader
 	surface            SurfaceModeProvider
-	inLineWait         time.Duration
-	maxPendingPerAgent int
+	inLineWait          time.Duration
+	maxPendingPerAgent  int
+	upstreamCallTimeout time.Duration
+
+	// inFlight is the live count of routeEntry calls currently executing
+	// (not yet returned). Surfaced via /v1/health and the dashboard so a
+	// runaway upstream is visible without dumping goroutines.
+	inFlight atomic.Int64
 
 	mu        sync.RWMutex
 	tools     map[string]toolEntry
@@ -125,6 +152,11 @@ type Options struct {
 	Audit      *audit.Logger
 	Hub        *realtime.Hub
 	Memory     *memory.Service
+	// Lake, when non-nil, gives the gateway a DuckDB-backed personal data
+	// lake. The lake.* MCP tools are registered against it during
+	// RegisterBuiltins. Nil keeps the gateway working without a lake (e.g.,
+	// in tests that don't need it).
+	Lake       *lake.Service
 	InLineWait time.Duration
 	// Visibility, if non-nil, decides which tools the agent sees in
 	// tools/list and whether direct calls to a tool are accepted. Tools
@@ -150,6 +182,12 @@ type Options struct {
 	// MaxPendingPerAgent overrides the per-agent pending-approval cap.
 	// Zero falls back to DefaultMaxPendingPerAgent.
 	MaxPendingPerAgent int
+	// UpstreamCallTimeout caps how long a single tool dispatch may take
+	// before the gateway aborts it. Zero (the default) disables the cap;
+	// any positive value applies to every dispatch (built-in, fixture,
+	// and external upstreams alike). Without a cap, a hung upstream
+	// pinned a goroutine forever and piled up everyone behind it.
+	UpstreamCallTimeout time.Duration
 }
 
 // UsageRecorder is satisfied by *internal/usage.Service. The gateway only
@@ -209,22 +247,34 @@ func New(opts Options) *Gateway {
 	}
 	mcpSrv := server.NewMCPServer(opts.Name, opts.Version, serverOpts...)
 	return &Gateway{
-		mcp:                mcpSrv,
-		policy:             opts.Policy,
-		approval:           opts.Approval,
-		audit:              opts.Audit,
-		hub:                opts.Hub,
-		memory:             opts.Memory,
-		visibility:         opts.Visibility,
-		usage:              opts.Usage,
-		metrics:            opts.Metrics,
-		metricsReader:      opts.MetricsReader,
-		surface:            opts.Surface,
-		inLineWait:         opts.InLineWait,
-		maxPendingPerAgent: opts.MaxPendingPerAgent,
-		tools:              map[string]toolEntry{},
-		upstreams:          map[string]*upstream{},
+		mcp:                 mcpSrv,
+		policy:              opts.Policy,
+		approval:            opts.Approval,
+		audit:               opts.Audit,
+		hub:                 opts.Hub,
+		memory:              opts.Memory,
+		lake:                opts.Lake,
+		visibility:          opts.Visibility,
+		usage:               opts.Usage,
+		metrics:             opts.Metrics,
+		metricsReader:       opts.MetricsReader,
+		surface:             opts.Surface,
+		inLineWait:          opts.InLineWait,
+		maxPendingPerAgent:  opts.MaxPendingPerAgent,
+		upstreamCallTimeout: opts.UpstreamCallTimeout,
+		tools:               map[string]toolEntry{},
+		upstreams:           map[string]*upstream{},
 	}
+}
+
+// InFlight returns the number of tool calls currently being routed. Used
+// by /v1/health and the dashboard to spot pile-ups; it is also a quick
+// signal during a hang ("how many calls are stuck").
+func (g *Gateway) InFlight() int64 {
+	if g == nil {
+		return 0
+	}
+	return g.inFlight.Load()
 }
 
 // NotifyToolListChanged sends notifications/tools/list_changed to every
@@ -242,13 +292,16 @@ func (g *Gateway) NotifyToolListChanged() {
 func (g *Gateway) MCPServer() *server.MCPServer { return g.mcp }
 
 // RegisterBuiltins wires the built-in memory tools, the meta-tools
-// (tools.search / tools.execute), and the fixture echo tool into the MCP
-// server.
+// (tools.search / tools.execute), the fixture echo tool, and (if a Lake is
+// configured) the lake.* personal-data-warehouse tools into the MCP server.
 func (g *Gateway) RegisterBuiltins() {
 	entries := g.builtinMemoryTools()
 	entries = append(entries, g.staticFixtureTool())
 	entries = append(entries, g.metaTools()...)
 	entries = append(entries, g.approvalMetaTools()...)
+	if g.lake != nil {
+		entries = append(entries, g.lakeTools()...)
+	}
 	for _, e := range entries {
 		g.registerEntry(e)
 	}
@@ -420,6 +473,18 @@ func (g *Gateway) RouteCall(ctx context.Context, viaTool, targetName string, arg
 func (g *Gateway) routeEntry(ctx context.Context, entry toolEntry, args map[string]any) (res *mcp.CallToolResult, err error) {
 	started := time.Now()
 	agentID := agentIDFromContext(ctx)
+
+	// In-flight tracking + slow-call watchdog. The watchdog goroutine
+	// logs at 5s / 30s / 2m elapsed if the call is still routing, so a
+	// hang shows up in the journal naming the offending tool / upstream
+	// / agent instead of just "everything is stuck."
+	g.inFlight.Add(1)
+	doneWatch := make(chan struct{})
+	defer func() {
+		g.inFlight.Add(-1)
+		close(doneWatch)
+	}()
+	go watchSlowCall(doneWatch, started, entry.tool.Name, entry.upstream, agentID)
 	ev := metrics.Event{
 		TS:         started.UnixMilli(),
 		AgentID:    agentID,
@@ -495,14 +560,23 @@ func (g *Gateway) routeEntry(ctx context.Context, entry toolEntry, args map[stri
 		Arguments:    argsJSON,
 	})
 
-	decision := g.policy.Eval(policy.Request{
-		AgentID:        agentID,
-		UpstreamName:   entry.upstream,
-		ToolName:       entry.originalName,
-		IntentCategory: intent,
-		Arguments:      cleanArgs,
-		UserReason:     reason,
-	})
+	var decision policy.Decision
+	if entry.forcedAction != nil {
+		decision = policy.Decision{
+			Action: *entry.forcedAction,
+			Reason: "built-in tool policy",
+			RuleID: "builtin-forced-" + string(*entry.forcedAction),
+		}
+	} else {
+		decision = g.policy.Eval(policy.Request{
+			AgentID:        agentID,
+			UpstreamName:   entry.upstream,
+			ToolName:       entry.originalName,
+			IntentCategory: intent,
+			Arguments:      cleanArgs,
+			UserReason:     reason,
+		})
+	}
 
 	switch decision.Action {
 	case policy.ActionAllow:
@@ -663,6 +737,20 @@ func (g *Gateway) holdAndWait(ctx context.Context, entry toolEntry, args map[str
 	}
 }
 
+// resumeDeferred is the legacy `_approval_id` re-call path. With
+// auto-execute, the gateway has already dispatched the tool the moment
+// the human tapped Allow — so this path NEVER re-dispatches. It only:
+//
+//   - returns the cached result if one is already persisted;
+//   - waits briefly (up to inLineWait) for the result if the request
+//     is approved-but-still-executing, then returns it (or an
+//     "executing" envelope telling the agent to poll);
+//   - returns the appropriate denied/expired/cancelled message.
+//
+// The agent doesn't have to use this path anymore — tools.poll_approval
+// and tools.wait_for_approval surface the same cached result. We keep
+// `_approval_id` working only for backwards-compat with already-deployed
+// agent code.
 func (g *Gateway) resumeDeferred(ctx context.Context, entry toolEntry, approvalID string, ev *metrics.Event) (*mcp.CallToolResult, error) {
 	req, err := g.approval.Get(ctx, approvalID)
 	if err != nil {
@@ -670,12 +758,20 @@ func (g *Gateway) resumeDeferred(ctx context.Context, entry toolEntry, approvalI
 		ev.ErrorClass = "approval"
 		return mcp.NewToolResultErrorf("unknown approval %q", approvalID), nil
 	}
-	if req.Status == approval.StatusPending {
-		// Agent is polling early — block briefly, then re-emit deferred.
+	// Wait briefly if either the human hasn't decided yet, or we're
+	// approved-but-the-executor-hasn't-finished. Either way the
+	// signal channel closes when the row reaches its terminal state.
+	awaitingDecision := req.Status == approval.StatusPending
+	awaitingResult := req.Status == approval.StatusAllowed && req.ResultExecutedAt == 0
+	if awaitingDecision || awaitingResult {
 		if waitCh, ok := g.approval.Watch(approvalID); ok {
+			wait := g.inLineWait
+			if wait <= 0 {
+				wait = 5 * time.Second // give the executor a brief chance even in deferred-by-default mode
+			}
 			select {
 			case <-waitCh:
-			case <-time.After(g.inLineWait):
+			case <-time.After(wait):
 			case <-ctx.Done():
 			}
 		}
@@ -699,7 +795,23 @@ func (g *Gateway) resumeDeferred(ctx context.Context, entry toolEntry, approvalI
 			ev.ApprovalOutcome = metrics.ApprovalApproved
 		}
 		ev.ApprovalLatencyMs = int(time.Now().UnixMilli() - req.CreatedAt)
-		return g.dispatch(ctx, entry, req.Arguments, req.AgentID, req.Reason, req.ID, ev)
+		if req.ResultExecutedAt > 0 {
+			res, rerr := rehydrateApprovalResult(req.ResultEnvelope)
+			if rerr != nil {
+				return mcp.NewToolResultErrorFromErr("decode cached result", rerr), nil
+			}
+			if req.ResultError != "" {
+				return mcp.NewToolResultErrorf("auto-execute failed: %s", req.ResultError), nil
+			}
+			if res == nil {
+				return mcp.NewToolResultText("(approved tool returned no content)"), nil
+			}
+			return res, nil
+		}
+		// Approved but executor still running — tell the agent to poll
+		// the approval_id rather than re-call the original tool.
+		ev.Outcome = metrics.OutcomeDeferred
+		return executingResponse(req, entry), nil
 	case approval.StatusDenied:
 		ev.ApprovalOutcome = metrics.ApprovalDenied
 		ev.Outcome = metrics.OutcomeDenied
@@ -716,6 +828,38 @@ func (g *Gateway) resumeDeferred(ctx context.Context, entry toolEntry, approvalI
 		ev.Outcome = metrics.OutcomeDeferred
 		return g.deferredResponse(ctx, req, entry, req.Arguments), nil
 	}
+}
+
+// executingResponse is the envelope returned when the agent re-calls
+// with `_approval_id` after Allow but before the executor has written
+// the result. It steers the agent to poll the approval ID rather than
+// firing another resume call.
+func executingResponse(req *approval.Request, entry toolEntry) *mcp.CallToolResult {
+	text := fmt.Sprintf(
+		"Approval %s is approved and the tool is executing now. "+
+			"Poll tools.poll_approval(approval_id=%q) (or block via tools.wait_for_approval) "+
+			"to receive the result — re-calling %s with _approval_id will only spin until the "+
+			"same poll surfaces the cached result.",
+		req.ID, req.ID, entry.tool.Name)
+	res := mcp.NewToolResultText(text)
+	res.StructuredContent = map[string]any{
+		"status":      "executing",
+		"approval_id": req.ID,
+		"tool":        entry.tool.Name,
+		"upstream":    entry.upstream,
+		"next_steps_for_agent": map[string]any{
+			"poll_status": map[string]any{
+				"tool": "tools.poll_approval",
+				"args": map[string]any{"approval_id": req.ID, "_reason": "(your reason)"},
+			},
+			"wait_then_check": map[string]any{
+				"tool": "tools.wait_for_approval",
+				"args": map[string]any{"approval_id": req.ID, "timeout_seconds": 60, "_reason": "(your reason)"},
+			},
+		},
+	}
+	res.Meta = &mcp.Meta{AdditionalFields: map[string]any{"toolyard.executing": true}}
+	return res
 }
 
 // budgetExceededResponse explains the per-agent pending cap to the AI
@@ -762,8 +906,19 @@ func (g *Gateway) dispatch(ctx context.Context, entry toolEntry, args map[string
 		}
 	}
 	upstreamStart := time.Now()
-	res, err := entry.handle(ctx, args)
+	callCtx := ctx
+	if g.upstreamCallTimeout > 0 {
+		var cancel context.CancelFunc
+		callCtx, cancel = context.WithTimeout(ctx, g.upstreamCallTimeout)
+		defer cancel()
+	}
+	res, err := entry.handle(callCtx, args)
 	ev.UpstreamLatencyMs = int(time.Since(upstreamStart).Milliseconds())
+	if errors.Is(err, context.DeadlineExceeded) {
+		log.Printf("upstream-timeout: tool=%s upstream=%s agent=%s elapsed=%s timeout=%s",
+			entry.tool.Name, entry.upstream, agentID,
+			time.Since(upstreamStart).Round(time.Millisecond), g.upstreamCallTimeout)
+	}
 	if err != nil {
 		_ = g.audit.Write(ctx, audit.Event{
 			EventType:     audit.EventCallFailed,
@@ -886,28 +1041,34 @@ func (g *Gateway) deferredResponse(ctx context.Context, req *approval.Request, e
 		},
 		"your_other_pending":        otherPendings,
 		"min_poll_interval_seconds": minPollIntervalSeconds,
+		// auto_execute_on_approve: the gateway dispatches the original
+		// tool itself the moment the human (or an auto-rule) flips this
+		// approval to allowed. The agent's job is ONLY to fetch the
+		// result via tools.poll_approval / tools.wait_for_approval.
+		// Re-calling the original tool with _approval_id still works as
+		// a backwards-compat path but is strictly slower and offers no
+		// new behaviour.
+		"auto_execute_on_approve": true,
+		"how_to_get_the_result": "Poll this approval_id with tools.poll_approval (or block with tools.wait_for_approval). The response will carry the executed tool's result under `result` once the executor finishes. Do NOT re-call the original tool — toolyard already runs it for you on approve.",
 		"next_steps_for_agent": map[string]any{
-			"poll_status": map[string]any{
+			"poll_status_and_result": map[string]any{
 				"tool":     "tools.poll_approval",
 				"args":     map[string]any{"approval_id": req.ID, "_reason": "(your reason)"},
 				"blocking": false,
+				"hint":     "preferred — non-blocking; response carries the executed tool's result once status='executed'",
 			},
 			"poll_many_at_once": map[string]any{
 				"tool":     "tools.poll_approvals",
 				"args":     map[string]any{"approval_ids": []string{req.ID}, "_reason": "(your reason)"},
 				"blocking": false,
-				"hint":     "more efficient than one-at-a-time when several approvals are in flight",
+				"hint":     "preferred when several approvals are in flight; one round-trip returns each one's status + result",
 			},
 			"wait_then_check": map[string]any{
 				"tool":                "tools.wait_for_approval",
 				"args":                map[string]any{"approval_id": req.ID, "timeout_seconds": 60, "_reason": "(your reason)"},
 				"blocking":            true,
 				"max_timeout_seconds": int(WaitForApprovalMaxTimeout.Seconds()),
-			},
-			"execute_when_approved": map[string]any{
-				"tool": entry.tool.Name,
-				"args": map[string]any{"_approval_id": req.ID, "_reason": "(your reason)"},
-				"hint": "the gateway preserves your original arguments; only _approval_id is required to resume",
+				"hint":                "blocks server-side until the executor writes the result, then returns it",
 			},
 			"cancel_if_no_longer_needed": map[string]any{
 				"tool": "tools.cancel_my_approval",
@@ -916,6 +1077,11 @@ func (g *Gateway) deferredResponse(ctx context.Context, req *approval.Request, e
 			"list_all_my_pending": map[string]any{
 				"tool": "tools.list_my_pending_approvals",
 				"args": map[string]any{"_reason": "(your reason)"},
+			},
+			"backwards_compat_resume": map[string]any{
+				"tool": entry.tool.Name,
+				"args": map[string]any{"_approval_id": req.ID, "_reason": "(your reason)"},
+				"hint": "DEPRECATED — re-calling with _approval_id returns the same cached result that the polling tools surface. Use the polling tools instead; they're cheaper and match the auto-execute model.",
 			},
 		},
 		"concurrency_advice": "You may fire other approval-required tools in parallel; each returns its own approval_id without holding any connection. Polling all at once via tools.poll_approvals is more efficient than serially.",
@@ -931,7 +1097,9 @@ func (g *Gateway) deferredResponse(ctx context.Context, req *approval.Request, e
 // clients see when they don't parse structured_content.
 func buildDeferredText(req *approval.Request, expires string, expectedSeconds int) string {
 	var b strings.Builder
-	b.WriteString("Tool execution requires human approval. Your call has been queued.\n\n")
+	b.WriteString("Tool execution requires human approval. Your call has been queued.\n")
+	b.WriteString("On approve, toolyard fires the tool itself — you do NOT re-call the original tool. ")
+	b.WriteString("Just poll this approval_id and the response carries the executed tool's result.\n\n")
 	fmt.Fprintf(&b, "approval_id: %s\n", req.ID)
 	if expectedSeconds > 0 {
 		fmt.Fprintf(&b, "expected_decision_in: ~%ds (based on the human reviewer's recent average)\n", expectedSeconds)
@@ -939,9 +1107,8 @@ func buildDeferredText(req *approval.Request, expires string, expectedSeconds in
 	fmt.Fprintf(&b, "expires_at: %s\n\n", expires)
 	b.WriteString("To proceed:\n")
 	b.WriteString("- Continue with other work; you may fire more approval-required tools in parallel.\n")
-	fmt.Fprintf(&b, "- Poll status: tools.poll_approval(approval_id=%q)\n", req.ID)
-	fmt.Fprintf(&b, "- Block until decided: tools.wait_for_approval(approval_id=%q, timeout_seconds=60)\n", req.ID)
-	fmt.Fprintf(&b, "- When approved, re-call this tool with _approval_id=%q to execute.\n", req.ID)
+	fmt.Fprintf(&b, "- Get the result: tools.poll_approval(approval_id=%q) — when status='executed', the result is in the response.\n", req.ID)
+	fmt.Fprintf(&b, "- Or block server-side: tools.wait_for_approval(approval_id=%q, timeout_seconds=60) — returns as soon as the executor finishes.\n", req.ID)
 	if req.Reason != "" {
 		b.WriteString("\nThe human reviewer sees your reason: ")
 		b.WriteString(strings.TrimSpace(req.Reason))
@@ -1017,9 +1184,16 @@ func buildInstructions(bus *approval.Bus, inLineWait time.Duration) string {
 	b.WriteString("toolyard gateway. ")
 	b.WriteString("Every tool call REQUIRES a `_reason` field (20-2000 chars) explaining why you are calling it; this string is shown verbatim to the human reviewer. ")
 	b.WriteString("Reads pass through silently; writes hold for human approval. ")
-	b.WriteString(fmt.Sprintf("Approvals expire after %s. ", ttl.Round(time.Minute)))
-	b.WriteString(fmt.Sprintf("If a decision does not arrive within ~%s the gateway returns a deferred response containing `approval_id`; resume by re-calling the same tool with `_approval_id` set to that value. ", inLineWait))
-	b.WriteString("BATCHING: when a task needs several writes (e.g. create issue + comment + assign), invoke them in parallel from one turn rather than serially. The dashboard groups concurrent calls from the same agent into a single approval card so the human approves the whole batch with one tap. Per-call `_reason` strings are surfaced in that summary, so write each one to be readable on its own. ")
+	b.WriteString(fmt.Sprintf("Approvals expire after %s if no decision arrives. ", ttl.Round(time.Minute)))
+	b.WriteString("AUTO-EXECUTE ON APPROVE: when a write needs human review the gateway returns a deferred response containing `approval_id`. The moment the human (or an auto-approval rule) flips the request to allowed, toolyard fires the original tool itself with your persisted arguments and stashes the result. ")
+	b.WriteString("Collecting that result is OPTIONAL — the tool runs (and its side effect happens) regardless of whether you fetch the result. Skip the collect step for fire-and-forget writes (logging, notifications, anything you don't need to read back). ")
+	b.WriteString("If you DO need the result, the canonical way to retrieve it is to poll the approval_id, NOT to re-call the original tool: ")
+	b.WriteString("• `tools.poll_approval(approval_id=…)` — non-blocking; response carries the executed tool's `result` once `status='executed'`. ")
+	b.WriteString("• `tools.poll_approvals(approval_ids=[…])` — same shape, batched (up to 32 at once). ")
+	b.WriteString("• `tools.wait_for_approval(approval_id=…, timeout_seconds=60)` — block server-side until the executor finishes (single id). ")
+	b.WriteString("• `tools.wait_for_approvals(approval_ids=[…], mode='all'|'any', timeout_seconds=60)` — block server-side on several ids at once. mode='all' (default) returns when every id is terminal; mode='any' returns as soon as one is. Strictly more efficient than firing N parallel `tools.wait_for_approval` calls. ")
+	b.WriteString("Re-calling the original tool with `_approval_id` still works for backwards compat, but returns the same cached result the polling tools already surface — strictly slower, no extra capability. ")
+	b.WriteString("BATCHING: when a task needs several writes (e.g. create issue + comment + assign), invoke them in parallel from one turn rather than serially. The dashboard groups concurrent calls from the same agent into a single approval card so the human approves the whole batch with one tap. Per-call `_reason` strings are surfaced in that summary, so write each one to be readable on its own. After approving, toolyard executes each tool independently — `tools.wait_for_approvals(mode='all')` is the natural way to collect all the results in one round-trip. ")
 	b.WriteString("Use `tools.search` and `tools.execute` to discover and proxy tools that aren't directly visible in your catalog.")
 	return b.String()
 }
@@ -1027,4 +1201,166 @@ func buildInstructions(bus *approval.Bus, inLineWait time.Duration) string {
 // SetUpstreamLogger wires log output for upstream errors to the supplied logger.
 func (g *Gateway) SetUpstreamLogger(l *log.Logger) {
 	// (placeholder) Future: pass into upstream client options.
+}
+
+// Execute is the bus-driven auto-execute hook. It runs the approved
+// tool with the persisted arguments and stashes the result on the
+// approval row via bus.SetResult. The bus calls Execute on its own
+// background context, so a slow upstream doesn't tie up the dashboard
+// request that flipped the approval to allowed.
+//
+// We bypass policy/approval here because the row is already in
+// Status=allowed — the gating decision is final. We still go through
+// dispatch() so audit, metrics, the upstream-call timeout, and the
+// slow-call watchdog all apply just like a normal call.
+func (g *Gateway) Execute(ctx context.Context, req *approval.Request) {
+	if g == nil || req == nil || g.approval == nil {
+		return
+	}
+	g.mu.RLock()
+	entry, ok := g.tools[req.ToolName]
+	g.mu.RUnlock()
+	if !ok {
+		_ = g.approval.SetResult(ctx, req.ID, "", false,
+			fmt.Sprintf("tool %q is no longer registered (was the upstream removed?)", req.ToolName))
+		return
+	}
+	// Stamp the agent ID so audit / usage rows attribute the call to
+	// the originating agent rather than to a phantom anonymous caller.
+	execCtx := WithAgentID(ctx, req.AgentID)
+
+	// Build a metrics.Event and run dispatch directly. The original
+	// routeEntry already evaluated policy and consumed the human's
+	// reason; here we just need to fire the tool with the recorded
+	// arguments.
+	started := time.Now()
+	ev := &metrics.Event{
+		TS:              started.UnixMilli(),
+		AgentID:         req.AgentID,
+		Upstream:        entry.upstream,
+		ShortName:       entry.originalName,
+		ToolName:        entry.tool.Name,
+		IsWrite:         !policy.IsReadOnlyName(entry.tool.Name),
+		PinnedTool:      IsPinned(entry.tool.Name),
+		Via:             "auto-execute",
+		ApprovalID:      req.ID,
+		Fingerprint:     req.Fingerprint,
+		ReasonText:      req.Reason,
+		ReasonLen:       len(req.Reason),
+		IntentCategory:  req.IntentCategory,
+		ApprovalOutcome: metrics.ApprovalApproved,
+	}
+	res, dispatchErr := g.dispatch(execCtx, entry, req.Arguments, req.AgentID, req.Reason, req.ID, ev)
+	ev.TotalLatencyMs = int(time.Since(started).Milliseconds())
+	if g.metrics != nil {
+		g.metrics.Record(*ev)
+	}
+
+	envelope, encErr := encodeApprovalResult(res)
+	if encErr != nil {
+		_ = g.approval.SetResult(ctx, req.ID, "", false, "encode result: "+encErr.Error())
+		return
+	}
+	var execErr string
+	if dispatchErr != nil {
+		execErr = dispatchErr.Error()
+	}
+	isErr := res != nil && res.IsError
+	if err := g.approval.SetResult(ctx, req.ID, envelope, isErr, execErr); err != nil {
+		log.Printf("auto-execute: persist result %s: %v", req.ID, err)
+	}
+}
+
+// approvalResultEnvelope is the JSON shape persisted on the approval
+// row and rehydrated by both the legacy `_approval_id` re-call path
+// and the polling meta-tools. We persist the text content separately
+// from structured_content so a client that only reads text content
+// still gets a usable answer.
+type approvalResultEnvelope struct {
+	IsError           bool   `json:"is_error"`
+	TextContent       string `json:"text_content,omitempty"`
+	StructuredContent any    `json:"structured_content,omitempty"`
+	Meta              any    `json:"meta,omitempty"`
+}
+
+func encodeApprovalResult(res *mcp.CallToolResult) (string, error) {
+	if res == nil {
+		return "", nil
+	}
+	env := approvalResultEnvelope{IsError: res.IsError, StructuredContent: res.StructuredContent}
+	if res.Meta != nil {
+		env.Meta = res.Meta.AdditionalFields
+	}
+	var text strings.Builder
+	for _, c := range res.Content {
+		if t, ok := mcp.AsTextContent(c); ok {
+			text.WriteString(t.Text)
+		}
+	}
+	env.TextContent = text.String()
+	out, err := json.Marshal(env)
+	if err != nil {
+		return "", err
+	}
+	return string(out), nil
+}
+
+// rehydrateApprovalResult turns a stored envelope back into a
+// CallToolResult so the agent's polling/_approval_id path receives an
+// answer indistinguishable from running the tool inline.
+func rehydrateApprovalResult(envelope string) (*mcp.CallToolResult, error) {
+	if envelope == "" {
+		return nil, nil
+	}
+	var env approvalResultEnvelope
+	if err := json.Unmarshal([]byte(envelope), &env); err != nil {
+		return nil, err
+	}
+	res := &mcp.CallToolResult{IsError: env.IsError}
+	if env.TextContent != "" {
+		res = mcp.NewToolResultText(env.TextContent)
+		res.IsError = env.IsError
+	}
+	if env.StructuredContent != nil {
+		res.StructuredContent = env.StructuredContent
+	}
+	if m, ok := env.Meta.(map[string]any); ok && len(m) > 0 {
+		res.Meta = &mcp.Meta{AdditionalFields: m}
+	}
+	return res, nil
+}
+
+// slowCallTiers are the absolute elapsed-time thresholds at which the
+// watchdog logs that a call is still in flight. The list is short on
+// purpose — at the 2m mark the upstream-call-timeout (default 120s) has
+// usually already aborted the call; anything past that is a stuck
+// built-in or a missing timeout, both worth a noisy log.
+var slowCallTiers = []time.Duration{
+	5 * time.Second,
+	30 * time.Second,
+	2 * time.Minute,
+	5 * time.Minute,
+}
+
+// watchSlowCall logs a "slow-call" line each time the elapsed routing
+// time crosses one of slowCallTiers, until done is closed. The lines
+// are intentionally structured (key=value) so journalctl | grep
+// slow-call gives a clean diagnostic timeline.
+func watchSlowCall(done <-chan struct{}, started time.Time, tool, upstream, agentID string) {
+	for _, tier := range slowCallTiers {
+		wait := tier - time.Since(started)
+		if wait <= 0 {
+			continue
+		}
+		t := time.NewTimer(wait)
+		select {
+		case <-done:
+			t.Stop()
+			return
+		case <-t.C:
+			log.Printf("slow-call still in flight: tool=%s upstream=%s agent=%q elapsed=%s tier=%s",
+				tool, upstream, agentID,
+				time.Since(started).Round(time.Millisecond), tier)
+		}
+	}
 }

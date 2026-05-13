@@ -21,9 +21,12 @@ import (
 	"log"
 	"net"
 	"net/http"
+	httppprof "net/http/pprof"
 	"os"
 	"os/signal"
 	"path/filepath"
+	"runtime"
+	runtimepprof "runtime/pprof"
 	"strings"
 	"syscall"
 	"time"
@@ -36,6 +39,7 @@ import (
 	"github.com/tusharbhardwaj/toolyard/internal/autoapproval"
 	"github.com/tusharbhardwaj/toolyard/internal/gateway"
 	"github.com/tusharbhardwaj/toolyard/internal/identity"
+	"github.com/tusharbhardwaj/toolyard/internal/lake"
 	"github.com/tusharbhardwaj/toolyard/internal/memory"
 	"github.com/tusharbhardwaj/toolyard/internal/metrics"
 	"github.com/tusharbhardwaj/toolyard/internal/oauth"
@@ -48,6 +52,7 @@ import (
 	usagepkg "github.com/tusharbhardwaj/toolyard/internal/usage"
 	"github.com/tusharbhardwaj/toolyard/internal/visibility"
 	dashboard "github.com/tusharbhardwaj/toolyard/web/dashboard"
+	weblake "github.com/tusharbhardwaj/toolyard/web/lake"
 )
 
 const version = "0.1.0"
@@ -67,6 +72,8 @@ func main() {
 		err = runExchange(args)
 	case "probe":
 		err = runProbe(args)
+	case "lake":
+		err = runLake(args)
 	case "version", "-v", "--version":
 		fmt.Println("toolyard", version)
 	case "help", "-h", "--help":
@@ -89,6 +96,7 @@ Commands:
   serve       run gateway + HTTP dashboard (default ports: stdio + :8787)
   exchange    swap an enrollment code for an agent token
   probe       dry-run a tool against an upstream MCP server
+  lake        manage the personal data lake (backup | tables)
   version     print version
 
 Run 'toolyard <command> -h' for command flags.`)
@@ -111,10 +119,13 @@ func runServe(argv []string) error {
 	approvalTTL := fs.Duration("approval-ttl", 3*time.Hour, "how long a pending approval stays decidable before auto-expiring")
 	publicURL := fs.String("public-url", "", "public origin (e.g. https://toolyard.example.com). When set, enables HSTS, secure cookies, Origin enforcement, and locks /v1/auth/setup to loopback.")
 	trustedProxies := fs.String("trusted-proxy", "", "comma-separated CIDRs to trust for X-Forwarded-* headers (e.g. 127.0.0.1/32,::1/128,10.0.0.0/8)")
+	grafanaRuntimeEnvPath := fs.String("grafana-runtime-env", "/var/lib/toolyard/grafana-runtime.env", "path where toolyard maintains a TOOLYARD_LAKE_TOKEN=... line for the Grafana container's docker-compose env_file to consume. Updated on bootstrap and on every rotate. Empty disables the write (useful in tests).")
+	clickhouseRuntimeEnvPath := fs.String("clickhouse-runtime-env", "/var/lib/toolyard/clickhouse-runtime.env", "path where toolyard maintains a TOOLYARD_CH_PASSWORD=... line for the toolyard-clickhouse container's docker-compose env_file to consume. Updated on bootstrap and on every rotate. Empty disables the write (useful in tests).")
 	requireAuthMCP := fs.Bool("require-auth-on-mcp", false, "reject anonymous /mcp calls (no Authorization header). Auto-enabled when -public-url is set.")
 	statelessMCP := fs.Bool("stateless-mcp", false, "skip MCP session-ID tracking. Every request stands alone — no server-initiated notifications, but agents that don't auto-reconnect on session-invalid (e.g., hermes) survive a toolyard restart without manual intervention.")
 	noStdioUpstreams := fs.Bool("no-stdio-upstreams", false, "refuse to start any stdio (subprocess) MCP upstream. Use when the dashboard is exposed publicly so a compromised session can't spawn arbitrary commands.")
 	envDenylistFlag := fs.String("upstream-env-denylist", "LD_PRELOAD,LD_LIBRARY_PATH,DYLD_INSERT_LIBRARIES,DYLD_LIBRARY_PATH,PATH", "comma-separated env var keys forbidden in upstream stdio configs")
+	upstreamCallTimeout := fs.Duration("upstream-call-timeout", 120*time.Second, "per-tool-call deadline applied to every dispatch (built-in, fixture, and external upstreams). 0 disables the cap. Without it, a hung upstream pins a goroutine indefinitely and queues every other caller behind it.")
 	_ = fs.Parse(argv)
 
 	// Public mode auto-enables matching safeguards.
@@ -141,6 +152,14 @@ func runServe(argv []string) error {
 	idSvc := identity.New(db)
 	auditSvc := audit.New(db)
 	memSvc := memory.New(db)
+
+	// Personal data lake (ClickHouse). Opened below, once settings are
+	// loaded — see the `lake: opened …` log line right after the CH
+	// password block. Distinct from toolyard.db: the SQLite control
+	// plane is OLTP-shaped, the lake is OLAP-shaped. Failure to open
+	// the lake is logged but not fatal — the gateway still serves
+	// non-lake tools.
+	var lakeSvc *lake.Service
 
 	bus, err := approval.New(ctx, db)
 	if err != nil {
@@ -201,6 +220,44 @@ func runServe(argv []string) error {
 	if err != nil {
 		return err
 	}
+
+	// ClickHouse password lives in the settings DB (same pattern as
+	// lake_api_token): toolyard is the source of truth, the env file
+	// the docker stack reads is a rendered view. Auto-mint on first
+	// boot so a fresh install + `docker compose up` Just Works. The
+	// rendered file is mode 0600 toolyard:toolyard.
+	chPass, chGenerated, err := settingsSvc.EnsureClickhousePassword(ctx)
+	if err != nil {
+		return fmt.Errorf("ensure clickhouse password: %w", err)
+	}
+	if chGenerated {
+		log.Printf("toolyard: minted a new clickhouse_password; reveal it once from the dashboard's Settings tab")
+	}
+	if err := api.WriteClickhouseRuntimeEnv(*clickhouseRuntimeEnvPath, chPass); err != nil {
+		log.Printf("warning: could not write clickhouse runtime env file at %s: %v", *clickhouseRuntimeEnvPath, err)
+	}
+
+	// Open the lake against the local CH stack. Addr is hardcoded to
+	// 127.0.0.1:19000 (the host binding from deploy/clickhouse/docker-compose.yaml);
+	// CH is loopback-only and the gateway runs on the host, so no
+	// further indirection. If CH is down or the password is wrong,
+	// log and continue with lake.* tools disabled — the gateway still
+	// serves non-lake tools.
+	{
+		var lakeErr error
+		lakeSvc, lakeErr = lake.Open(lake.Config{
+			Addr:     "127.0.0.1:19000",
+			User:     "default",
+			Password: chPass,
+		})
+		if lakeErr != nil {
+			log.Printf("lake: open clickhouse: %v (lake.* tools disabled)", lakeErr)
+		} else {
+			defer lakeSvc.Close()
+			log.Printf("lake: opened clickhouse @ 127.0.0.1:19000")
+		}
+	}
+
 	usageSvc := usagepkg.New(db)
 	vis := visibility.New(settingsSvc, usageSvc)
 
@@ -226,22 +283,37 @@ func runServe(argv []string) error {
 	go runRetentionCompactor(ctx, metricsReader, settingsSvc)
 
 	gw := gateway.New(gateway.Options{
-		Name:          "toolyard",
-		Version:       version,
-		Policy:        policy.New(),
-		Approval:      bus,
-		Audit:         auditSvc,
-		Hub:           hub,
-		Memory:        memSvc,
-		InLineWait:    *inLineWait,
-		Visibility:    vis,
-		Usage:         usageSvc,
-		Metrics:       metricsRec,
-		MetricsReader: metricsReader,
-		Surface:       vis,
+		Name:                "toolyard",
+		Version:             version,
+		Policy:              policy.New(),
+		Approval:            bus,
+		Audit:               auditSvc,
+		Hub:                 hub,
+		Memory:              memSvc,
+		Lake:                lakeSvc,
+		InLineWait:          *inLineWait,
+		Visibility:          vis,
+		Usage:               usageSvc,
+		Metrics:             metricsRec,
+		MetricsReader:       metricsReader,
+		Surface:             vis,
+		UpstreamCallTimeout: *upstreamCallTimeout,
 	})
 	gw.RegisterBuiltins()
 	defer gw.Close()
+
+	// Auto-execute on approve: when the human (or an auto-rule) flips
+	// an approval to allowed, the bus invokes Gateway.Execute on a
+	// background goroutine, which runs the persisted tool args and
+	// writes the result back via bus.SetResult. The agent collects the
+	// result through tools.poll_approval / tools.wait_for_approval —
+	// no need to re-call the original tool.
+	bus.SetExecutor(gw)
+	if n, err := bus.SweepUnexecuted(ctx); err != nil {
+		log.Printf("auto-execute: startup sweep: %v", err)
+	} else if n > 0 {
+		log.Printf("auto-execute: startup sweep re-fired %d allowed-but-not-executed approvals", n)
+	}
 
 	upstreamSvc := upstreams.New(db, gw)
 	upstreamSvc.SetPolicy(upstreams.Policy{
@@ -288,6 +360,26 @@ func runServe(argv []string) error {
 		}
 	}
 
+	// Lake API token + Grafana origin used to live in env vars; they're
+	// now persisted in the settings DB and managed via the dashboard. On
+	// first boot we mint a token if there isn't one (so a fresh install
+	// just works) and write it to the runtime env file the Grafana
+	// docker-compose stack reads. Operators rotate from the UI; the
+	// runtime env file gets re-rendered automatically.
+	lakeTok, generated, err := settingsSvc.EnsureLakeAPIToken(ctx)
+	if err != nil {
+		return fmt.Errorf("ensure lake api token: %w", err)
+	}
+	if generated {
+		log.Printf("toolyard: minted a new lake_api_token; reveal it once from the dashboard's Settings tab")
+	}
+	if err := api.WriteGrafanaRuntimeEnv(*grafanaRuntimeEnvPath, lakeTok); err != nil {
+		log.Printf("warning: could not write grafana runtime env file at %s: %v", *grafanaRuntimeEnvPath, err)
+	}
+
+	// (CH password is ensured + rendered earlier, right after settings
+	// init, because the lake.Open() call also needs the password.)
+
 	secOpts := api.SecurityOptions{
 		PublicURL:      *publicURL,
 		TrustedProxies: parseCIDRs(*trustedProxies),
@@ -305,11 +397,15 @@ func runServe(argv []string) error {
 		Upstreams:    upstreamSvc,
 		Settings:     settingsSvc,
 		Usage:        usageSvc,
-		Metrics:      metricsReader,
+		Metrics:         metricsReader,
+		MetricsRecorder: metricsRec,
 		AutoApproval: autoApprover,
 		OAuth:        oauthSvc,
-		SessionKey:   loadOrCreateSessionKey(*dataDir),
-		Security:     secOpts,
+		Lake:                  lakeSvc,
+		GrafanaRuntimeEnvPath: *grafanaRuntimeEnvPath,
+		ClickhouseRuntimeEnvPath: *clickhouseRuntimeEnvPath,
+		SessionKey:            loadOrCreateSessionKey(*dataDir),
+		Security:              secOpts,
 	})
 
 	mux := http.NewServeMux()
@@ -378,6 +474,30 @@ func runServe(argv []string) error {
 	mux.Handle("/mcp", api.LimitBody(mcpAuthGuard(streamable), 16<<20))
 	mux.Handle("/mcp/", api.LimitBody(mcpAuthGuard(streamable), 16<<20))
 
+	// pprof endpoints, gated to loopback. When toolyard hangs, run
+	//   curl -s http://127.0.0.1:<port>/debug/pprof/goroutine?debug=2
+	// from the host to capture every goroutine's stack — that's how
+	// we'll find which call is stuck and on what mutex/syscall.
+	pprofMux := http.NewServeMux()
+	pprofMux.HandleFunc("/debug/pprof/", httppprof.Index)
+	pprofMux.HandleFunc("/debug/pprof/cmdline", httppprof.Cmdline)
+	pprofMux.HandleFunc("/debug/pprof/profile", httppprof.Profile)
+	pprofMux.HandleFunc("/debug/pprof/symbol", httppprof.Symbol)
+	pprofMux.HandleFunc("/debug/pprof/trace", httppprof.Trace)
+	loopbackOnly := func(next http.Handler) http.Handler {
+		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if !apiSrv.SecurityOpts().IsLoopback(r) {
+				http.NotFound(w, r)
+				return
+			}
+			next.ServeHTTP(w, r)
+		})
+	}
+	mux.Handle("/debug/pprof/", loopbackOnly(pprofMux))
+
+	// Lake dashboard static assets at /lake/*.
+	mux.Handle("/lake/", http.StripPrefix("/lake/", lakeStaticHandler()))
+
 	// Dashboard static assets.
 	mux.Handle("/", staticHandler())
 
@@ -409,6 +529,20 @@ func runServe(argv []string) error {
 
 	stop := make(chan os.Signal, 1)
 	signal.Notify(stop, syscall.SIGINT, syscall.SIGTERM)
+
+	// SIGUSR1 -> dump every goroutine to stderr. `kill -USR1 <pid>` is
+	// how the operator captures a hang without enabling pprof or
+	// attaching a debugger; the dump shows up in journalctl alongside
+	// the slow-call lines logged by the watchdog.
+	dumpSig := make(chan os.Signal, 1)
+	signal.Notify(dumpSig, syscall.SIGUSR1)
+	go func() {
+		for range dumpSig {
+			log.Printf("goroutine-dump: count=%d inflight_calls=%d (SIGUSR1; full stacks below)",
+				runtime.NumGoroutine(), gw.InFlight())
+			_ = runtimepprof.Lookup("goroutine").WriteTo(os.Stderr, 2)
+		}
+	}()
 
 	go func() {
 		log.Printf("toolyard: HTTP listening on %s (dashboard + /mcp + /v1/*)", *addr)
@@ -778,6 +912,44 @@ func staticHandler() http.Handler {
 		case ".js":
 			w.Header().Set("Content-Type", "application/javascript; charset=utf-8")
 			w.Header().Set("Cache-Control", "no-cache")
+		}
+		fileServer.ServeHTTP(w, r)
+	})
+}
+
+// lakeStaticHandler serves the embedded /lake/ dashboard. Strict-by-default:
+// any unknown path falls back to index.html so the SPA can handle hash
+// routing, and we set Cache-Control:no-cache so a redeploy lands cleanly.
+func lakeStaticHandler() http.Handler {
+	sub, err := fs.Sub(weblake.Assets, ".")
+	if err != nil {
+		panic(err)
+	}
+	fileServer := http.FileServer(http.FS(sub))
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		// Strip-prefix has already removed /lake/. The empty path is the
+		// SPA root; unknown paths fall back to index.html.
+		p := strings.TrimPrefix(r.URL.Path, "/")
+		if p == "" || !assetExists(sub, p) {
+			body, err := fs.ReadFile(weblake.Assets, "index.html")
+			if err != nil {
+				http.Error(w, "missing lake index", http.StatusInternalServerError)
+				return
+			}
+			w.Header().Set("Content-Type", "text/html; charset=utf-8")
+			w.Header().Set("Cache-Control", "no-cache")
+			_, _ = w.Write(body)
+			return
+		}
+		switch filepath.Ext(p) {
+		case ".css":
+			w.Header().Set("Content-Type", "text/css; charset=utf-8")
+			w.Header().Set("Cache-Control", "no-cache")
+		case ".js":
+			w.Header().Set("Content-Type", "application/javascript; charset=utf-8")
+			w.Header().Set("Cache-Control", "no-cache")
+		case ".json":
+			w.Header().Set("Content-Type", "application/json")
 		}
 		fileServer.ServeHTTP(w, r)
 	})

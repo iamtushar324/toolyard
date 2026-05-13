@@ -1,0 +1,105 @@
+/* toolyard lake — minimal, dark-friendly, panel-grid driven by manifest. */
+
+:root {
+  --bg: #0e1014;
+  --fg: #e8eaed;
+  --muted: #8a93a3;
+  --accent: #6ea8fe;
+  --panel: #161a21;
+  --panel-border: #232833;
+  --row-alt: #11141a;
+  --error: #ff6b6b;
+}
+
+* { box-sizing: border-box; }
+
+html, body {
+  margin: 0; padding: 0;
+  background: var(--bg); color: var(--fg);
+  font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", Roboto,
+               "Helvetica Neue", Arial, sans-serif;
+  font-size: 14px;
+  line-height: 1.45;
+}
+
+a { color: var(--accent); text-decoration: none; }
+a:hover { text-decoration: underline; }
+
+.lake-topbar {
+  display: flex; align-items: center; gap: 1rem;
+  padding: 0.6rem 1rem;
+  border-bottom: 1px solid var(--panel-border);
+  position: sticky; top: 0; background: var(--bg); z-index: 10;
+}
+.lake-brand { font-weight: 600; }
+.lake-brand span { color: var(--muted); font-weight: 400; margin-left: 0.25rem; }
+.lake-tabs { display: flex; gap: 0.4rem; }
+.lake-tabs button {
+  background: transparent; color: var(--muted);
+  border: 1px solid transparent; border-radius: 6px;
+  padding: 0.3rem 0.7rem; font: inherit; cursor: pointer;
+}
+.lake-tabs button.active {
+  color: var(--fg); background: var(--panel); border-color: var(--panel-border);
+}
+.lake-tabs button:hover { color: var(--fg); }
+.lake-spacer { flex: 1; }
+.lake-back { color: var(--muted); font-size: 0.9em; }
+
+.lake-main { padding: 1rem; max-width: 1400px; margin: 0 auto; }
+.lake-loading { color: var(--muted); padding: 2rem; text-align: center; }
+.lake-error { color: var(--error); padding: 1rem; }
+
+.lake-grid {
+  display: grid; gap: 1rem;
+  grid-template-columns: repeat(12, 1fr);
+}
+.lake-panel {
+  background: var(--panel); border: 1px solid var(--panel-border);
+  border-radius: 8px; padding: 0.8rem 1rem;
+  display: flex; flex-direction: column;
+  min-height: 220px;
+  grid-column: span 6;
+}
+.lake-panel.size-small  { grid-column: span 4; }
+.lake-panel.size-wide   { grid-column: span 12; }
+.lake-panel.size-medium { grid-column: span 6; }
+.lake-panel-title {
+  display: flex; justify-content: space-between; align-items: baseline;
+  margin: 0 0 0.5rem; font-size: 0.95em; color: var(--muted);
+}
+.lake-panel-body { flex: 1; min-height: 200px; position: relative; }
+.lake-panel.kpi .lake-panel-body {
+  display: flex; flex-direction: column; justify-content: center;
+  align-items: flex-start; padding: 1rem 0;
+}
+.lake-kpi-value { font-size: 2.4em; font-weight: 600; }
+.lake-kpi-delta { color: var(--muted); font-size: 0.9em; margin-top: 0.25em; }
+
+.lake-table { width: 100%; border-collapse: collapse; font-size: 0.92em; }
+.lake-table th { text-align: left; color: var(--muted); padding: 0.4rem 0.6rem; border-bottom: 1px solid var(--panel-border); }
+.lake-table td { padding: 0.35rem 0.6rem; border-bottom: 1px solid var(--row-alt); }
+.lake-table tr:hover td { background: var(--row-alt); }
+
+.lake-explorer textarea {
+  width: 100%; min-height: 140px;
+  background: var(--panel); color: var(--fg);
+  border: 1px solid var(--panel-border); border-radius: 6px;
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
+  font-size: 0.92em; padding: 0.6rem; resize: vertical;
+}
+.lake-explorer button {
+  margin-top: 0.5rem;
+  background: var(--accent); color: #0e1014; border: 0;
+  padding: 0.4rem 0.9rem; border-radius: 6px; cursor: pointer;
+  font: inherit; font-weight: 600;
+}
+.lake-explorer-result { margin-top: 1rem; }
+.lake-explorer-meta { color: var(--muted); font-size: 0.85em; margin-bottom: 0.4rem; }
+
+@media (max-width: 800px) {
+  .lake-panel,
+  .lake-panel.size-small,
+  .lake-panel.size-medium,
+  .lake-panel.size-wide { grid-column: span 12; }
+}

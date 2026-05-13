@@ -6,6 +6,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/tusharbhardwaj/toolyard/internal/settings"
 )
 
 // SecurityOptions tunes the public-host hardening middleware.
@@ -96,17 +98,29 @@ func (s *Server) SecurityHeaders(next http.Handler) http.Handler {
 		h.Set("Cross-Origin-Opener-Policy", "same-origin")
 		// CSP — same-origin everything, no inline. data: allowed for SVG icons.
 		// Workers + ServiceWorker explicitly allowed for the push SW.
-		h.Set("Content-Security-Policy",
-			"default-src 'self'; "+
-				"script-src 'self'; "+
-				"style-src 'self'; "+
-				"img-src 'self' data:; "+
-				"font-src 'self'; "+
-				"connect-src 'self'; "+
-				"worker-src 'self'; "+
-				"frame-ancestors 'none'; "+
-				"base-uri 'self'; "+
-				"form-action 'self'")
+		csp := "default-src 'self'; " +
+			"script-src 'self'; " +
+			"style-src 'self'; " +
+			"img-src 'self' data:; " +
+			"font-src 'self'; " +
+			"connect-src 'self'; " +
+			"worker-src 'self'; " +
+			"frame-ancestors 'none'; " +
+			"base-uri 'self'; " +
+			"form-action 'self'"
+		// frame-src is only emitted when an external embed origin (Grafana)
+		// is configured. Without it, default-src 'self' covers frames and
+		// rejects any cross-origin iframe. With it, only the named origin
+		// gains frame access — toolyard itself is still un-embeddable
+		// because frame-ancestors stays 'none'. The origin is read live
+		// from settings so a UI change applies on the next request, no
+		// gateway restart needed.
+		if s.settings != nil {
+			if origin := s.settings.GetString(settings.GrafanaOrigin, ""); origin != "" {
+				csp += "; frame-src 'self' " + origin
+			}
+		}
+		h.Set("Content-Security-Policy", csp)
 		// HSTS only when actually behind HTTPS so HTTP browser dev doesn't
 		// get pinned to a non-existent TLS endpoint.
 		if s.security.IsBehindHTTPS(r) {
@@ -214,7 +228,21 @@ func (s *Server) HardenAPI(next http.Handler) http.Handler {
 			// /v1/agents/exchange (Bearer-bootstrap path) and
 			// /v1/approvals/decide-by-token (push-tap path; signed token
 			// is the auth, no cookie present).
-			if !exemptFromCSRFHeader(path) {
+			//
+			// Also exempt: every /v1/lake/* path. The lake routes are
+			// read-only at the engine level (lake.Query rejects non-
+			// SELECT statements via ValidateSelect), so a CSRF-replayed
+			// POST can't mutate state. The response is still
+			// session-bound or Bearer-bound (requireLakeSession), and
+			// the gateway's CORS isn't permissive, so a malicious
+			// cross-site form can't read the response either. The
+			// previous "only when Bearer is present" variant tripped
+			// every Grafana Infinity panel because Grafana's HTTP
+			// proxy strips the Authorization header in some code
+			// paths, so the X-Requested-With check fired even though
+			// the underlying call was harmless.
+			lakePath := strings.HasPrefix(path, "/v1/lake/")
+			if !exemptFromCSRFHeader(path) && !lakePath {
 				if r.Header.Get("X-Requested-With") == "" {
 					writeError(w, http.StatusForbidden,
 						"X-Requested-With header required on mutating requests")

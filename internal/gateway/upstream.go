@@ -37,7 +37,16 @@ type UpstreamConfig struct {
 type upstream struct {
 	cfg    UpstreamConfig
 	client *client.Client
-	mu     sync.Mutex
+	// closeMu guards lifecycle (Close) from racing with in-flight RPCs.
+	// It is NOT held during ListTools/CallTool: mcp-go's transports
+	// (stdio + streamable HTTP) are explicitly goroutine-safe — see
+	// client/transport/stdio.go SendRequest, which uses a per-request
+	// response channel and only takes its internal stdinMu around the
+	// frame write. Holding a per-upstream mutex around the full RPC
+	// turned every upstream into a serial bottleneck: one slow call
+	// (e.g. context7 search) would block every other call to the same
+	// upstream and the dashboard's tool catalog refresh as well.
+	closeMu sync.Mutex
 }
 
 // newUpstream connects to one upstream MCP server using the configured transport.
@@ -93,8 +102,6 @@ func newUpstream(ctx context.Context, cfg UpstreamConfig) (*upstream, error) {
 
 // listTools fetches the upstream's tool catalog.
 func (u *upstream) listTools(ctx context.Context) ([]mcp.Tool, error) {
-	u.mu.Lock()
-	defer u.mu.Unlock()
 	res, err := u.client.ListTools(ctx, mcp.ListToolsRequest{})
 	if err != nil {
 		return nil, err
@@ -102,10 +109,11 @@ func (u *upstream) listTools(ctx context.Context) ([]mcp.Tool, error) {
 	return res.Tools, nil
 }
 
-// callTool dispatches a forwarded call to the upstream.
+// callTool dispatches a forwarded call to the upstream. mcp-go's transports
+// multiplex concurrent requests internally, so we deliberately do not
+// serialize callers here — multiple agents (and tools.execute) can hit
+// the same upstream in parallel.
 func (u *upstream) callTool(ctx context.Context, name string, args map[string]any) (*mcp.CallToolResult, error) {
-	u.mu.Lock()
-	defer u.mu.Unlock()
 	req := mcp.CallToolRequest{}
 	req.Params.Name = name
 	req.Params.Arguments = args
@@ -116,5 +124,7 @@ func (u *upstream) close() error {
 	if u == nil || u.client == nil {
 		return nil
 	}
+	u.closeMu.Lock()
+	defer u.closeMu.Unlock()
 	return u.client.Close()
 }

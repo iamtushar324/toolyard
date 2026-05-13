@@ -1,0 +1,99 @@
+# toolyard-grafana — visualisation layer for the personal data lake.
+#
+# Brought up as a sibling to the toolyard gateway (which itself runs as a
+# systemd service, not in compose) and to the toolyard-clickhouse stack
+# in deploy/clickhouse/. Image pinned to the same tag that nova-grafana
+# ran so a volume copy from `nova_grafana-storage` lands bit-for-bit if
+# you ever decide to migrate state instead of starting fresh.
+#
+# Networking: attached to the shared `toolyard_lake_net` docker network
+# so Grafana can reach ClickHouse at `clickhouse:9000` without crossing
+# the host loopback. Port 3030 is exposed to the host so you can hit
+# Grafana directly and so the toolyard /lake/ page can iframe it once
+# TOOLYARD_GRAFANA_ORIGIN is set.
+#
+# Secrets: TOOLYARD_CH_PASSWORD is managed by the toolyard gateway —
+# auto-generated on first boot, persisted to the settings DB, rotated
+# from the dashboard's Settings tab. Toolyard renders it into
+# /var/lib/toolyard/clickhouse-runtime.env on every change; this compose
+# reads it via env_file so the provisioned ClickHouse datasource picks
+# it up via $__env{TOOLYARD_CH_PASSWORD}. Grafana admin creds live in
+# /etc/toolyard/toolyard.env (operator-managed). Run with `sudo` so root
+# can read both.
+#
+# Bring up:
+#   docker compose -f deploy/grafana/docker-compose.yaml up -d
+# Tear down:
+#   docker compose -f deploy/grafana/docker-compose.yaml down
+# Tear down + wipe state (destructive):
+#   docker compose -f deploy/grafana/docker-compose.yaml down -v
+
+services:
+  grafana:
+    image: grafana/grafana:12.4.1
+    container_name: toolyard-grafana
+    restart: unless-stopped
+    ports:
+      - "3030:3000"
+    # Two env files, both read at container start:
+    #   1) /etc/toolyard/toolyard.env  — operator-managed, hand-edited.
+    #      Holds Grafana admin creds (GF_SECURITY_ADMIN_USER/PASSWORD).
+    #      0640 root:toolyard, seeded by deploy/install.sh.
+    #   2) /var/lib/toolyard/clickhouse-runtime.env — toolyard-managed.
+    #      Holds TOOLYARD_CH_PASSWORD (the same file the CH stack reads).
+    #      Re-rendered automatically when the operator rotates the
+    #      password from the dashboard's Settings tab. Don't hand-edit;
+    #      rotations overwrite. 0600 toolyard:toolyard.
+    # Compose runs sudo on most distros, so root reads both fine.
+    # Anything declared in `environment:` below wins over env_file.
+    env_file:
+      - /etc/toolyard/toolyard.env
+      - /var/lib/toolyard/clickhouse-runtime.env
+    environment:
+      # Plugins installed on first boot. grafana-clickhouse-datasource is
+      # the read path to the toolyard lake (native protocol direct to
+      # `clickhouse:9000` over the shared docker network).
+      # frser-sqlite-datasource is carried over so any panel still
+      # pointing at a SQLite file keeps working without a re-import.
+      GF_INSTALL_PLUGINS: "grafana-clickhouse-datasource,frser-sqlite-datasource"
+
+      # No public sign-up; single-operator install.
+      GF_USERS_ALLOW_SIGN_UP: "false"
+
+      # Embedding posture: allow_embedding lets the toolyard /lake/ page
+      # iframe panels via /d-solo URLs; anonymous Viewer means the iframe
+      # doesn't bounce visitors through a login screen. Turn these off if
+      # you ever expose this Grafana on the public internet.
+      GF_SECURITY_ALLOW_EMBEDDING: "true"
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: "Viewer"
+      GF_SECURITY_COOKIE_SAMESITE: "lax"
+
+      # Default landing page once dashboards are imported. Path exists in
+      # /var/lib/grafana/dashboards/ — comment out to use Grafana's home.
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: "/var/lib/grafana/dashboards/finance-overview.json"
+    volumes:
+      - toolyard_grafana-storage:/var/lib/grafana
+      - ./provisioning:/etc/grafana/provisioning:ro
+      - ./dashboards:/var/lib/grafana/dashboards:ro
+    networks:
+      # Joins the toolyard-clickhouse stack on the shared lake network.
+      # The CH container is reachable at `clickhouse:9000` (native) and
+      # `clickhouse:8123` (HTTP) inside this network.
+      - toolyard_lake_net
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://127.0.0.1:3000/api/health"]
+      interval: 30s
+      timeout: 3s
+      retries: 3
+      start_period: 20s
+
+networks:
+  toolyard_lake_net:
+    # external: true — created once by deploy/install.sh; the CH compose
+    # owns the same external reference, so neither stack tears it down.
+    external: true
+
+volumes:
+  toolyard_grafana-storage:
+    driver: local

@@ -1,0 +1,130 @@
+{
+  "version": 1,
+  "tabs": [
+    {
+      "id": "finance",
+      "label": "Finance",
+      "panels": [
+        {
+          "id": "kpi_net_worth",
+          "type": "kpi",
+          "title": "Net worth (latest)",
+          "query": "finance/net_worth_latest.sql",
+          "value": "net_worth",
+          "size": "small"
+        },
+        {
+          "id": "kpi_total_assets",
+          "type": "kpi",
+          "title": "Total assets",
+          "query": "finance/net_worth_latest.sql",
+          "value": "total_assets",
+          "size": "small"
+        },
+        {
+          "id": "kpi_total_liabilities",
+          "type": "kpi",
+          "title": "Total liabilities",
+          "query": "finance/net_worth_latest.sql",
+          "value": "total_liabilities",
+          "size": "small"
+        },
+        {
+          "id": "net_worth_history",
+          "type": "line_chart",
+          "title": "Net worth over time",
+          "query": "finance/net_worth_history.sql",
+          "x": "snapshot_date",
+          "y": ["net_worth", "total_assets", "total_liabilities"],
+          "size": "wide"
+        },
+        {
+          "id": "asset_allocation",
+          "type": "pie_chart",
+          "title": "Asset allocation (latest snapshot)",
+          "query": "finance/asset_allocation.sql",
+          "label": "category",
+          "value": "value",
+          "size": "medium"
+        },
+        {
+          "id": "account_balances",
+          "type": "bar_chart",
+          "title": "Balance by account",
+          "query": "finance/account_balances.sql",
+          "x": "account_name",
+          "y": ["current_balance"],
+          "size": "medium"
+        },
+        {
+          "id": "cc_bills_monthly",
+          "type": "bar_chart",
+          "title": "Credit card bills by month",
+          "query": "finance/cc_bills_monthly.sql",
+          "x": "bill_month",
+          "y": ["billed", "paid"],
+          "size": "wide"
+        },
+        {
+          "id": "investments_history",
+          "type": "line_chart",
+          "title": "Investment portfolio value",
+          "query": "finance/investments_history.sql",
+          "x": "as_of_date",
+          "y": ["total_value", "unrealized_pnl"],
+          "size": "wide"
+        },
+        {
+          "id": "accounts_table",
+          "type": "table",
+          "title": "Accounts",
+          "query": "finance/accounts.sql",
+          "size": "wide"
+        }
+      ]
+    },
+    {
+      "id": "ops",
+      "label": "Ops",
+      "panels": [
+        {
+          "id": "interactions",
+          "type": "line_chart",
+          "title": "Interactions per day",
+          "query": "ops/interactions_per_day.sql",
+          "x": "day",
+          "y": ["count"],
+          "size": "wide"
+        },
+        {
+          "id": "interactions_by_platform",
+          "type": "pie_chart",
+          "title": "Interactions by platform",
+          "query": "ops/interactions_by_platform.sql",
+          "label": "platform",
+          "value": "count",
+          "size": "medium"
+        },
+        {
+          "id": "tables",
+          "type": "table",
+          "title": "Lake catalog (raw + mart)",
+          "query": "ops/catalog.sql",
+          "size": "medium"
+        }
+      ]
+    },
+    {
+      "id": "explorer",
+      "label": "SQL",
+      "panels": [
+        {
+          "id": "editor",
+          "type": "sql_editor",
+          "title": "Ad-hoc read-only SQL",
+          "size": "wide"
+        }
+      ]
+    }
+  ]
+}

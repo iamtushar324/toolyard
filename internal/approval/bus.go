@@ -71,6 +71,22 @@ type Request struct {
 	// or empty if a human (or the rule engine wasn't consulted). Set on
 	// Status=allowed responses produced via the AutoApprover hook.
 	AutoDecidedBy string `json:"auto_decided_by,omitempty"`
+
+	// ResultEnvelope is the JSON-encoded executed tool result; populated
+	// after the executor runs the approved tool and persists the answer.
+	// Empty means "approved but executor hasn't completed yet" (or the
+	// row pre-dates the auto-execute feature).
+	ResultEnvelope string `json:"result_envelope,omitempty"`
+	// ResultIsError mirrors mcp.CallToolResult.IsError on the executed
+	// result. Meaningful only when ResultExecutedAt > 0.
+	ResultIsError bool `json:"result_is_error,omitempty"`
+	// ResultExecutedAt is the ms-UTC timestamp at which the executor
+	// finished writing the result. Zero means "not yet executed."
+	ResultExecutedAt int64 `json:"result_executed_at,omitempty"`
+	// ResultError, when non-empty, is a toolyard-side execution failure
+	// that prevented the tool from being invoked at all (e.g., the
+	// upstream disappeared between approval and execution).
+	ResultError string `json:"result_error,omitempty"`
 }
 
 // Notifier is implemented by the push and realtime services so the bus can
@@ -122,6 +138,24 @@ type Bus struct {
 	notifiers []Notifier
 
 	auto AutoApprover
+	exec Executor
+
+	// bgCtx is the long-lived context used for background work the bus
+	// initiates itself (auto-execute on approve, recovery sweep on
+	// startup). The dashboard's Decide() returns the moment the human's
+	// tap is persisted; the actual tool dispatch runs on bgCtx so the
+	// HTTP request finishing doesn't cancel the executor.
+	bgCtx context.Context
+}
+
+// Executor runs an approved tool's actual call after the human (or an
+// auto-approval rule) flips the request to allowed. The bus invokes
+// Execute on its own background goroutine and expects the executor to
+// call Bus.SetResult exactly once per request — either with the
+// CallToolResult envelope from the dispatched tool, or with a non-empty
+// execErr describing why dispatch couldn't even be attempted.
+type Executor interface {
+	Execute(ctx context.Context, req *Request)
 }
 
 func New(ctx context.Context, db *store.DB) (*Bus, error) {
@@ -135,8 +169,17 @@ func New(ctx context.Context, db *store.DB) (*Bus, error) {
 		verifyKey: pub,
 		ttl:       DefaultTTL,
 		waiters:   map[string]*pending{},
+		bgCtx:     ctx,
 	}, nil
 }
+
+// SetExecutor installs the auto-execute hook. With one set, bus.Decide
+// flipping a request to "allowed" spawns a background goroutine that
+// invokes Executor.Execute (with bgCtx). The executor must call
+// SetResult to persist the outcome. Pass nil to fall back to the legacy
+// behaviour where the agent re-calls the original tool with
+// _approval_id to drive execution.
+func (b *Bus) SetExecutor(e Executor) { b.exec = e }
 
 // SetTTL overrides how long pending approvals stay decidable. Pre-existing
 // rows are not retroactively changed — only future Hold() calls use the
@@ -180,7 +223,7 @@ func (b *Bus) Hold(ctx context.Context, in NewRequest, maxWait time.Duration) (*
 	if b.auto != nil && !req.Coalesced && req.Status == StatusPending {
 		destructive := b.auto.IsDestructive(ctx, req.ToolName)
 		if m := b.auto.Match(req.AgentID, req.UpstreamName, req.ToolName, req.Fingerprint, destructive); m != nil {
-			decided, derr := b.Decide(ctx, req.ID, StatusAllowed, "rule:"+m.ID)
+			decided, derr := b.decideInline(ctx, req.ID, StatusAllowed, "rule:"+m.ID)
 			if derr == nil && decided != nil {
 				decided.AutoDecidedBy = m.ID
 				b.auto.MarkHit(ctx, m.ID, req.AgentID)
@@ -352,33 +395,60 @@ func canonicalJSON(v any) ([]byte, error) {
 	}
 }
 
+// requestSelectColumns is the canonical column list for SELECTs that
+// hydrate a Request. Centralised so adding a column is a one-line edit
+// instead of a five-site grep.
+const requestSelectColumns = `id, agent_id, upstream_name, tool_name, arguments, reason,
+            COALESCE(intent_category,''), status, COALESCE(decision_token,''),
+            COALESCE(decided_by,''), COALESCE(decided_at,0), created_at, expires_at,
+            COALESCE(fingerprint,''),
+            COALESCE(result_envelope,''), COALESCE(result_is_error,0),
+            COALESCE(result_executed_at,0), COALESCE(result_error,'')`
+
+// rowScanner is the subset shared by *sql.Row and *sql.Rows; lets the
+// helper hydrate either with the same code.
+type rowScanner interface {
+	Scan(dest ...any) error
+}
+
+// scanRequest reads one approval row from any source that SELECTed
+// requestSelectColumns. The resulting Request is fully hydrated,
+// including the Arguments map decoded from its JSON column.
+func scanRequest(s rowScanner) (*Request, error) {
+	var req Request
+	var args string
+	var isErr int
+	if err := s.Scan(&req.ID, &req.AgentID, &req.UpstreamName, &req.ToolName, &args,
+		&req.Reason, &req.IntentCategory, &req.Status, &req.DecisionToken,
+		&req.DecidedBy, &req.DecidedAt, &req.CreatedAt, &req.ExpiresAt,
+		&req.Fingerprint,
+		&req.ResultEnvelope, &isErr, &req.ResultExecutedAt, &req.ResultError); err != nil {
+		return nil, err
+	}
+	req.ResultIsError = isErr != 0
+	if args != "" {
+		_ = json.Unmarshal([]byte(args), &req.Arguments)
+	}
+	return &req, nil
+}
+
 func (b *Bus) findPendingByFingerprint(ctx context.Context, fp string) (*Request, error) {
 	if fp == "" {
 		return nil, nil
 	}
 	row := b.db.QueryRowContext(ctx,
-		`SELECT id, agent_id, upstream_name, tool_name, arguments, reason,
-            COALESCE(intent_category,''), status, COALESCE(decision_token,''),
-            COALESCE(decided_by,''), COALESCE(decided_at,0), created_at, expires_at,
-            COALESCE(fingerprint,'')
+		`SELECT `+requestSelectColumns+`
          FROM approval_requests
          WHERE status = ? AND fingerprint = ? LIMIT 1`,
 		StatusPending, fp)
-	var req Request
-	var args string
-	if err := row.Scan(&req.ID, &req.AgentID, &req.UpstreamName, &req.ToolName, &args,
-		&req.Reason, &req.IntentCategory, &req.Status, &req.DecisionToken,
-		&req.DecidedBy, &req.DecidedAt, &req.CreatedAt, &req.ExpiresAt,
-		&req.Fingerprint); err != nil {
+	req, err := scanRequest(row)
+	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, nil
 		}
 		return nil, err
 	}
-	if args != "" {
-		_ = json.Unmarshal([]byte(args), &req.Arguments)
-	}
-	return &req, nil
+	return req, nil
 }
 
 func isUniqueViolation(err error) bool {
@@ -405,8 +475,33 @@ func stringIndex(s, needle string) int {
 	return -1
 }
 
-// Decide resolves a pending approval. user is the deciding user's ID.
+// Decide is the public decision entrypoint used by the dashboard and
+// the signed-token tap path. On allow it kicks the registered Executor
+// on a background goroutine; pollers wake when SetResult lands.
 func (b *Bus) Decide(ctx context.Context, id, action, userID string) (*Request, error) {
+	return b.decide(ctx, id, action, userID, true)
+}
+
+// decideInline is the in-process variant used by Hold's auto-approval
+// short-circuit. Hold's caller (gateway.holdAndWait) dispatches the
+// approved tool synchronously in its own goroutine, so we MUST NOT
+// also fire the background executor or the tool would run twice.
+func (b *Bus) decideInline(ctx context.Context, id, action, userID string) (*Request, error) {
+	return b.decide(ctx, id, action, userID, false)
+}
+
+// decide is the shared implementation. runExec controls whether an
+// allow with a registered executor schedules background dispatch.
+//
+// On allow + runExec + executor present: signal() is deferred until
+// the executor calls SetResult. Pollers therefore wake when the result
+// is ready, not when the human merely tapped Allow — a single
+// wait_for_approval gets back the executed result instead of forcing
+// the agent to poll again.
+//
+// On deny / cancel / expire / allow-without-executor: signal() fires
+// immediately because there is nothing to wait for.
+func (b *Bus) decide(ctx context.Context, id, action, userID string, runExec bool) (*Request, error) {
 	if action != StatusAllowed && action != StatusDenied {
 		return nil, fmt.Errorf("invalid action %q", action)
 	}
@@ -419,7 +514,6 @@ func (b *Bus) Decide(ctx context.Context, id, action, userID string) (*Request, 
 	}
 	n, _ := res.RowsAffected()
 	if n == 0 {
-		// Either not found or already resolved.
 		existing, getErr := b.Get(ctx, id)
 		if getErr != nil {
 			return nil, getErr
@@ -430,13 +524,104 @@ func (b *Bus) Decide(ctx context.Context, id, action, userID string) (*Request, 
 	if err != nil {
 		return nil, err
 	}
-	// Denials feed back into auto-approval as a cool-off signal.
 	if action == StatusDenied && b.auto != nil {
 		b.auto.MarkDenial(ctx, req.AgentID, req.ToolName, req.Fingerprint)
 	}
-	b.signal(id)
 	b.fanOut(ctx, req, "approval.decide")
+	if action == StatusAllowed && runExec && b.exec != nil {
+		go b.runExecutor(req)
+		return req, nil
+	}
+	b.signal(id)
 	return req, nil
+}
+
+// runExecutor invokes the registered executor on the bus's bgCtx,
+// recovers from a panicking executor, and records a generic execution
+// failure if the executor disappears mid-flight without persisting a
+// result.
+func (b *Bus) runExecutor(req *Request) {
+	defer func() {
+		if r := recover(); r != nil {
+			log.Printf("approval executor: panic on %s: %v", req.ID, r)
+			_ = b.SetResult(b.bgCtx, req.ID, "", false, fmt.Sprintf("executor panic: %v", r))
+		}
+	}()
+	b.exec.Execute(b.bgCtx, req)
+	// Defensive: if the executor returned without persisting a result,
+	// mark the row as failed so pollers don't spin forever.
+	cur, err := b.Get(b.bgCtx, req.ID)
+	if err == nil && cur.Status == StatusAllowed && cur.ResultExecutedAt == 0 {
+		_ = b.SetResult(b.bgCtx, req.ID, "", false, "executor returned without persisting result")
+	}
+}
+
+// SetResult persists the executed tool's outcome and wakes any pollers
+// blocked on this approval. envelope is a JSON blob shaped like an MCP
+// CallToolResult; execErr is non-empty only when toolyard itself
+// couldn't run the tool (vs. the tool returning a logical error).
+//
+// The UPDATE is gated on result_executed_at IS NULL so a Decide-spawned
+// executor and the recovery sweep can't race — whichever lands first
+// wins; the loser is a no-op.
+func (b *Bus) SetResult(ctx context.Context, id, envelope string, isError bool, execErr string) error {
+	res, err := b.db.ExecContext(ctx,
+		`UPDATE approval_requests
+            SET result_envelope = ?, result_is_error = ?, result_error = ?, result_executed_at = ?
+          WHERE id = ? AND result_executed_at IS NULL`,
+		nullStr(envelope), boolInt(isError), nullStr(execErr), time.Now().UnixMilli(), id)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n > 0 {
+		b.signal(id)
+		if req, gerr := b.Get(ctx, id); gerr == nil {
+			b.fanOut(ctx, req, "approval.executed")
+		}
+	}
+	return nil
+}
+
+func boolInt(b bool) int {
+	if b {
+		return 1
+	}
+	return 0
+}
+
+// SweepUnexecuted re-fires the executor for any approval that was
+// allowed but whose result was never persisted. Called once at startup
+// to recover from a crash between "human tapped Allow" and "tool
+// finished writing the result." Safe to call multiple times — the
+// SetResult UPDATE is gated on result_executed_at IS NULL.
+func (b *Bus) SweepUnexecuted(ctx context.Context) (int, error) {
+	if b.exec == nil {
+		return 0, nil
+	}
+	rows, err := b.db.QueryContext(ctx,
+		`SELECT `+requestSelectColumns+`
+         FROM approval_requests
+         WHERE status = ? AND result_executed_at IS NULL
+         ORDER BY decided_at ASC`, StatusAllowed)
+	if err != nil {
+		return 0, err
+	}
+	defer rows.Close()
+	var pending []*Request
+	for rows.Next() {
+		req, err := scanRequest(rows)
+		if err != nil {
+			return 0, err
+		}
+		pending = append(pending, req)
+	}
+	if err := rows.Err(); err != nil {
+		return 0, err
+	}
+	for _, req := range pending {
+		go b.runExecutor(req)
+	}
+	return len(pending), nil
 }
 
 // DecideByToken verifies a signed decision token and resolves the approval.
@@ -453,26 +638,15 @@ func (b *Bus) DecideByToken(ctx context.Context, token, action string) (*Request
 // Get fetches an approval by ID, regardless of status.
 func (b *Bus) Get(ctx context.Context, id string) (*Request, error) {
 	row := b.db.QueryRowContext(ctx,
-		`SELECT id, agent_id, upstream_name, tool_name, arguments, reason,
-            COALESCE(intent_category,''), status, COALESCE(decision_token,''),
-            COALESCE(decided_by,''), COALESCE(decided_at,0), created_at, expires_at,
-            COALESCE(fingerprint,'')
-         FROM approval_requests WHERE id = ?`, id)
-	var req Request
-	var args string
-	if err := row.Scan(&req.ID, &req.AgentID, &req.UpstreamName, &req.ToolName, &args,
-		&req.Reason, &req.IntentCategory, &req.Status, &req.DecisionToken,
-		&req.DecidedBy, &req.DecidedAt, &req.CreatedAt, &req.ExpiresAt,
-		&req.Fingerprint); err != nil {
+		`SELECT `+requestSelectColumns+` FROM approval_requests WHERE id = ?`, id)
+	req, err := scanRequest(row)
+	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, ErrNotFound
 		}
 		return nil, err
 	}
-	if args != "" {
-		_ = json.Unmarshal([]byte(args), &req.Arguments)
-	}
-	return &req, nil
+	return req, nil
 }
 
 // CancelByAgent flips a pending approval to cancelled, but only if the
@@ -519,10 +693,7 @@ func (b *Bus) ListPendingByAgent(ctx context.Context, agentID string) ([]Request
 		return nil, nil
 	}
 	rows, err := b.db.QueryContext(ctx,
-		`SELECT id, agent_id, upstream_name, tool_name, arguments, reason,
-            COALESCE(intent_category,''), status, COALESCE(decision_token,''),
-            COALESCE(decided_by,''), COALESCE(decided_at,0), created_at, expires_at,
-            COALESCE(fingerprint,'')
+		`SELECT `+requestSelectColumns+`
          FROM approval_requests WHERE status = ? AND agent_id = ?
          ORDER BY created_at ASC`, StatusPending, agentID)
 	if err != nil {
@@ -531,18 +702,11 @@ func (b *Bus) ListPendingByAgent(ctx context.Context, agentID string) ([]Request
 	defer rows.Close()
 	var out []Request
 	for rows.Next() {
-		var req Request
-		var args string
-		if err := rows.Scan(&req.ID, &req.AgentID, &req.UpstreamName, &req.ToolName, &args,
-			&req.Reason, &req.IntentCategory, &req.Status, &req.DecisionToken,
-			&req.DecidedBy, &req.DecidedAt, &req.CreatedAt, &req.ExpiresAt,
-			&req.Fingerprint); err != nil {
+		req, err := scanRequest(rows)
+		if err != nil {
 			return nil, err
 		}
-		if args != "" {
-			_ = json.Unmarshal([]byte(args), &req.Arguments)
-		}
-		out = append(out, req)
+		out = append(out, *req)
 	}
 	return out, rows.Err()
 }
@@ -565,10 +729,7 @@ func (b *Bus) CountPendingForAgent(ctx context.Context, agentID string) (int, er
 
 func (b *Bus) ListPending(ctx context.Context) ([]Request, error) {
 	rows, err := b.db.QueryContext(ctx,
-		`SELECT id, agent_id, upstream_name, tool_name, arguments, reason,
-            COALESCE(intent_category,''), status, COALESCE(decision_token,''),
-            COALESCE(decided_by,''), COALESCE(decided_at,0), created_at, expires_at,
-            COALESCE(fingerprint,'')
+		`SELECT `+requestSelectColumns+`
          FROM approval_requests WHERE status = ? ORDER BY created_at DESC`, StatusPending)
 	if err != nil {
 		return nil, err
@@ -576,18 +737,11 @@ func (b *Bus) ListPending(ctx context.Context) ([]Request, error) {
 	defer rows.Close()
 	var out []Request
 	for rows.Next() {
-		var req Request
-		var args string
-		if err := rows.Scan(&req.ID, &req.AgentID, &req.UpstreamName, &req.ToolName, &args,
-			&req.Reason, &req.IntentCategory, &req.Status, &req.DecisionToken,
-			&req.DecidedBy, &req.DecidedAt, &req.CreatedAt, &req.ExpiresAt,
-			&req.Fingerprint); err != nil {
+		req, err := scanRequest(rows)
+		if err != nil {
 			return nil, err
 		}
-		if args != "" {
-			_ = json.Unmarshal([]byte(args), &req.Arguments)
-		}
-		out = append(out, req)
+		out = append(out, *req)
 	}
 	return out, rows.Err()
 }
@@ -598,10 +752,7 @@ func (b *Bus) Recent(ctx context.Context, limit int) ([]Request, error) {
 		limit = 100
 	}
 	rows, err := b.db.QueryContext(ctx,
-		`SELECT id, agent_id, upstream_name, tool_name, arguments, reason,
-            COALESCE(intent_category,''), status, COALESCE(decision_token,''),
-            COALESCE(decided_by,''), COALESCE(decided_at,0), created_at, expires_at,
-            COALESCE(fingerprint,'')
+		`SELECT `+requestSelectColumns+`
          FROM approval_requests ORDER BY created_at DESC LIMIT ?`, limit)
 	if err != nil {
 		return nil, err
@@ -609,18 +760,11 @@ func (b *Bus) Recent(ctx context.Context, limit int) ([]Request, error) {
 	defer rows.Close()
 	var out []Request
 	for rows.Next() {
-		var req Request
-		var args string
-		if err := rows.Scan(&req.ID, &req.AgentID, &req.UpstreamName, &req.ToolName, &args,
-			&req.Reason, &req.IntentCategory, &req.Status, &req.DecisionToken,
-			&req.DecidedBy, &req.DecidedAt, &req.CreatedAt, &req.ExpiresAt,
-			&req.Fingerprint); err != nil {
+		req, err := scanRequest(rows)
+		if err != nil {
 			return nil, err
 		}
-		if args != "" {
-			_ = json.Unmarshal([]byte(args), &req.Arguments)
-		}
-		out = append(out, req)
+		out = append(out, *req)
 	}
 	return out, rows.Err()
 }

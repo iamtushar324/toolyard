@@ -34,6 +34,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
@@ -45,6 +46,7 @@ import (
 	"github.com/tusharbhardwaj/toolyard/internal/autoapproval"
 	"github.com/tusharbhardwaj/toolyard/internal/gateway"
 	"github.com/tusharbhardwaj/toolyard/internal/identity"
+	"github.com/tusharbhardwaj/toolyard/internal/lake"
 	"github.com/tusharbhardwaj/toolyard/internal/marketplace"
 	"github.com/tusharbhardwaj/toolyard/internal/memory"
 	"github.com/tusharbhardwaj/toolyard/internal/metrics"
@@ -74,9 +76,18 @@ type Server struct {
 	settings     *settings.Service
 	usage        *usage.Service
 	metrics      *metrics.Reader
+	// metricsRecorder, when set, lets /v1/health surface the
+	// async-flusher's dropped-event counter — a quiet warning sign that
+	// the metrics buffer is overflowing (often the canary for "the
+	// SQLite write path is stalled"), which usually shows up before the
+	// dashboard noticeably hangs.
+	metricsRecorder       *metrics.Recorder
 	autoApproval *autoapproval.Service
-	oauth        *oauth.Service
-	sessionKey   []byte
+	oauth                 *oauth.Service
+	lake                  *lake.Service
+	grafanaRuntimeEnvPath string
+	clickhouseRuntimeEnvPath string
+	sessionKey            []byte
 	security     SecurityOptions
 	loginLimit   *loginThrottle
 	unauthLimit  *loginThrottle
@@ -94,10 +105,32 @@ type Options struct {
 	Settings     *settings.Service
 	Usage        *usage.Service
 	Metrics      *metrics.Reader
-	AutoApproval *autoapproval.Service
+	// MetricsRecorder, when set, exposes the async metrics writer's
+	// dropped-event counter on /v1/health. Optional — nil omits the
+	// field from the response.
+	MetricsRecorder *metrics.Recorder
+	AutoApproval    *autoapproval.Service
 	OAuth        *oauth.Service
-	SessionKey   []byte
-	Security     SecurityOptions
+	// Lake, when set, enables /v1/lake/* — read-only query, named queries
+	// from the embedded queries/ tree, manifest, bootstrap kick-off, ad-hoc
+	// SELECT for the explorer tab. nil disables the routes cleanly.
+	Lake *lake.Service
+	// GrafanaRuntimeEnvPath, when non-empty, is the path on disk where
+	// toolyard maintains a TOOLYARD_LAKE_TOKEN=... line for the Grafana
+	// container's docker-compose `env_file:` to consume. Updated on
+	// initial token bootstrap and on every rotation so the operator
+	// only needs to `docker compose restart grafana` after a rotate
+	// instead of re-syncing config files manually.
+	GrafanaRuntimeEnvPath string
+	// ClickhouseRuntimeEnvPath, when non-empty, is the path on disk
+	// where toolyard maintains a TOOLYARD_CH_PASSWORD=... line for the
+	// toolyard-clickhouse docker-compose `env_file:` to consume.
+	// Updated on initial password bootstrap and on every rotation; the
+	// operator follows up with `docker compose restart clickhouse` so
+	// the container re-reads the env on next process start.
+	ClickhouseRuntimeEnvPath string
+	SessionKey            []byte
+	Security              SecurityOptions
 }
 
 func New(opts Options) *Server {
@@ -112,10 +145,14 @@ func New(opts Options) *Server {
 		upstreams:    opts.Upstreams,
 		settings:     opts.Settings,
 		usage:        opts.Usage,
-		metrics:      opts.Metrics,
+		metrics:         opts.Metrics,
+		metricsRecorder: opts.MetricsRecorder,
 		autoApproval: opts.AutoApproval,
-		oauth:        opts.OAuth,
-		sessionKey:   opts.SessionKey,
+		oauth:                 opts.OAuth,
+		lake:                  opts.Lake,
+		grafanaRuntimeEnvPath: opts.GrafanaRuntimeEnvPath,
+		clickhouseRuntimeEnvPath: opts.ClickhouseRuntimeEnvPath,
+		sessionKey:            opts.SessionKey,
 		security:     opts.Security,
 		loginLimit:   newLoginThrottle(5, 15*time.Minute),
 		unauthLimit:  newLoginThrottle(0, time.Hour), // max/window passed per-call via AllowN
@@ -171,6 +208,8 @@ func (s *Server) Routes(mux *http.ServeMux) {
 	mux.HandleFunc("/v1/tools/run", s.toolsRun)
 	mux.HandleFunc("/v1/marketplace", s.marketplaceList)
 	mux.HandleFunc("/v1/settings", s.settingsHandler)
+	mux.HandleFunc("/v1/settings/reveal", s.settingsReveal)
+	mux.HandleFunc("/v1/settings/rotate", s.settingsRotate)
 	mux.HandleFunc("/v1/usage", s.usageHandler)
 
 	mux.HandleFunc("/v1/insights/overview", s.insightsOverview)
@@ -186,12 +225,29 @@ func (s *Server) Routes(mux *http.ServeMux) {
 	mux.HandleFunc("/v1/insights/export", s.insightsExport)
 
 	s.oauthRoutes(mux)
+	s.lakeRoutes(mux)
 }
 
 // ---- helpers ----------------------------------------------------------------
 
 func (s *Server) health(w http.ResponseWriter, r *http.Request) {
-	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "service": "toolyard", "version": "0.1.0"})
+	// /v1/health doubles as a quick "is the binary stuck?" probe.
+	// goroutines + inflight_calls usually move together; if goroutines
+	// climbs into the thousands while inflight stays low, leak. If both
+	// climb together, upstream pile-up. metrics_dropped > 0 means the
+	// async writer's buffer overflowed — typically because SQLite is
+	// stalled on a long transaction.
+	body := map[string]any{
+		"ok":              true,
+		"service":         "toolyard",
+		"version":         "0.1.0",
+		"goroutines":      runtime.NumGoroutine(),
+		"inflight_calls":  s.gateway.InFlight(),
+	}
+	if s.metricsRecorder != nil {
+		body["metrics_dropped"] = s.metricsRecorder.DroppedCount()
+	}
+	writeJSON(w, http.StatusOK, body)
 }
 
 func writeJSON(w http.ResponseWriter, status int, body any) {
@@ -1318,6 +1374,138 @@ func (s *Server) settingsHandler(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, out)
 	default:
 		writeError(w, http.StatusMethodNotAllowed, "GET, PATCH")
+	}
+}
+
+// settingsReveal returns the cleartext value of a single secret-classified
+// setting key. The generic GET /v1/settings response masks these values
+// behind a `<key>_present` boolean so the dashboard can render status
+// without ever pulling cleartext into a normal page response. Reveal is
+// the explicit one-shot path for the rotation/copy flow, and every call
+// is audit-logged.
+//
+// POST /v1/settings/reveal {"key":"lake_api_token"} -> {"value":"..."}
+func (s *Server) settingsReveal(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "POST only")
+		return
+	}
+	uid, err := s.requireUser(r)
+	if err != nil {
+		writeError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+	if s.settings == nil {
+		writeError(w, http.StatusServiceUnavailable, "settings not wired")
+		return
+	}
+	var body struct{ Key string }
+	if err := decode(r, &body); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if !settings.IsSecretKey(body.Key) {
+		writeError(w, http.StatusBadRequest, "key is not a secret; use GET /v1/settings")
+		return
+	}
+	val, err := s.settings.Reveal(r.Context(), body.Key)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	_ = s.audit.Write(r.Context(), audit.Event{
+		EventType:     "settings.reveal",
+		AgentID:       "user:" + uid,
+		ResultSummary: body.Key,
+	})
+	writeJSON(w, http.StatusOK, map[string]string{"key": body.Key, "value": val})
+}
+
+// settingsRotate generates a fresh value for a known rotatable secret
+// key and returns it once for the operator to copy. Side effect: any
+// downstream files (the Grafana runtime env that the docker-compose
+// stack reads) get re-rendered so the new value reaches its consumers
+// without manual file edits.
+//
+// POST /v1/settings/rotate {"key":"lake_api_token"} -> {"value":"..."}
+func (s *Server) settingsRotate(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "POST only")
+		return
+	}
+	uid, err := s.requireUser(r)
+	if err != nil {
+		writeError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+	if s.settings == nil {
+		writeError(w, http.StatusServiceUnavailable, "settings not wired")
+		return
+	}
+	var body struct{ Key string }
+	if err := decode(r, &body); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	switch body.Key {
+	case settings.LakeAPIToken:
+		tok, err := s.settings.RotateLakeAPIToken(r.Context())
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		// Re-render the Grafana runtime env file. If the write fails
+		// the new token is still live for /v1/lake/* (settings already
+		// won), but Grafana keeps the old value until the env file is
+		// reconciled. Surface the warning so the operator knows.
+		envWriteWarning := ""
+		if err := WriteGrafanaRuntimeEnv(s.grafanaRuntimeEnvPath, tok); err != nil {
+			envWriteWarning = "token rotated but grafana runtime env file write failed: " + err.Error()
+		}
+		summary := body.Key
+		if envWriteWarning != "" {
+			summary += " (env write warned)"
+		}
+		_ = s.audit.Write(r.Context(), audit.Event{
+			EventType: "settings.rotate", AgentID: "user:" + uid,
+			ResultSummary: summary,
+		})
+		out := map[string]any{"key": body.Key, "value": tok}
+		if envWriteWarning != "" {
+			out["warning"] = envWriteWarning
+		}
+		writeJSON(w, http.StatusOK, out)
+	case settings.ClickhousePassword:
+		pw, err := s.settings.RotateClickhousePassword(r.Context())
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		envWriteWarning := ""
+		if err := WriteClickhouseRuntimeEnv(s.clickhouseRuntimeEnvPath, pw); err != nil {
+			envWriteWarning = "password rotated but clickhouse runtime env file write failed: " + err.Error()
+		}
+		summary := body.Key
+		if envWriteWarning != "" {
+			summary += " (env write warned)"
+		}
+		_ = s.audit.Write(r.Context(), audit.Event{
+			EventType: "settings.rotate", AgentID: "user:" + uid,
+			ResultSummary: summary,
+		})
+		out := map[string]any{
+			"key":   body.Key,
+			"value": pw,
+			// CH only re-reads the env at process start, so a rotation
+			// is incomplete until the container restarts. Tell the UI.
+			"requires": "docker compose -f deploy/clickhouse/docker-compose.yaml restart clickhouse",
+		}
+		if envWriteWarning != "" {
+			out["warning"] = envWriteWarning
+		}
+		writeJSON(w, http.StatusOK, out)
+	default:
+		writeError(w, http.StatusBadRequest, "key is not rotatable")
 	}
 }
 

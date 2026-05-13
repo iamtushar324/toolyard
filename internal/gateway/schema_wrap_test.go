@@ -39,7 +39,7 @@ func TestWrapSchemaInjectsReason(t *testing.T) {
 	if !hasRequired {
 		t.Fatal("_reason should be required")
 	}
-	if !strings.Contains(out.Description, "Gated by toolyard") {
+	if !strings.Contains(out.Description, "toolyard-gated") {
 		t.Fatal("missing description banner")
 	}
 	if _, ok := out.InputSchema.Properties["repo"]; !ok {

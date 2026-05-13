@@ -1,0 +1,61 @@
+<?xml version="1.0"?>
+<!--
+  Server-level overrides for toolyard's ClickHouse instance. Merged on top
+  of the upstream config.xml shipped in the image. Sized for a single-user
+  analytics workload on a 2 GiB memory cap, not a many-tenant warehouse.
+
+  Anything you change here takes effect on container restart.
+-->
+<clickhouse>
+    <!-- Listen on all interfaces *inside* the container so the published
+         host loopback ports actually answer. The host-side bind in
+         docker-compose.yaml is what limits exposure (127.0.0.1 only). -->
+    <listen_host>0.0.0.0</listen_host>
+
+    <!-- Memory caps. The docker mem_limit is 2 GiB; we cap CH at 1.5 GiB
+         so CH itself OOM-aborts a runaway query rather than the kernel
+         killing the whole container. The to_ram_ratio fallback only
+         applies when the absolute cap is unset, which it isn't here. -->
+    <max_server_memory_usage>1610612736</max_server_memory_usage> <!-- 1.5 GiB -->
+    <max_concurrent_queries>4</max_concurrent_queries>
+
+    <!-- Caches. Defaults are 5 GiB+ each — absurd for our scale. -->
+    <mark_cache_size>134217728</mark_cache_size>           <!-- 128 MiB -->
+    <uncompressed_cache_size>134217728</uncompressed_cache_size>
+    <index_mark_cache_size>0</index_mark_cache_size>
+    <index_uncompressed_cache_size>0</index_uncompressed_cache_size>
+    <mmap_cache_size>0</mmap_cache_size>
+
+    <!-- Background pools. Default merges/mutations pool is 16 threads;
+         we drop to 4. The concurrency_ratio is bumped to 8 (default 2)
+         so total slots = 4*8 = 32, which clears CH's MergeTree sanity
+         checks against the default merge_tree reserves (mutation=20,
+         optimize_entire_partition=25, etc.). Ratio adds queue depth,
+         not threads — the actual OS thread count stays at 4. -->
+    <background_pool_size>4</background_pool_size>
+    <background_merges_mutations_concurrency_ratio>8</background_merges_mutations_concurrency_ratio>
+    <background_schedule_pool_size>2</background_schedule_pool_size>
+    <background_message_broker_schedule_pool_size>1</background_message_broker_schedule_pool_size>
+    <background_distributed_schedule_pool_size>1</background_distributed_schedule_pool_size>
+
+    <!-- Logging. Stdout goes to docker logs / journald via the runtime;
+         the rotated text logs in /var/log/clickhouse-server are the
+         backup for incidents. Drop the verbose system tables — they
+         write *constantly* and we have no analyst staring at them. -->
+    <logger>
+        <level>information</level>
+        <console>true</console>
+    </logger>
+    <query_log remove="1"/>
+    <query_thread_log remove="1"/>
+    <query_views_log remove="1"/>
+    <part_log remove="1"/>
+    <metric_log remove="1"/>
+    <asynchronous_metric_log remove="1"/>
+    <trace_log remove="1"/>
+    <session_log remove="1"/>
+    <text_log remove="1"/>
+    <crash_log remove="1"/>
+    <opentelemetry_span_log remove="1"/>
+    <processors_profile_log remove="1"/>
+</clickhouse>

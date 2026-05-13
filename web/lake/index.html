@@ -1,0 +1,27 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>toolyard · lake</title>
+  <link rel="stylesheet" href="/lake/style.css">
+</head>
+<body>
+  <header class="lake-topbar">
+    <div class="lake-brand">toolyard <span>lake</span></div>
+    <nav id="lake-tabs" class="lake-tabs"></nav>
+    <div class="lake-spacer"></div>
+    <a class="lake-back" href="/">← gateway</a>
+  </header>
+  <main id="lake-main" class="lake-main">
+    <div class="lake-loading">Loading manifest…</div>
+  </main>
+  <!-- ECharts is loaded if present at /lake/vendor/echarts.min.js. Tables
+       and KPIs work without it; line/bar/pie panels fall back to a
+       graceful error. To enable charts, drop a vendored ECharts build
+       into web/lake/vendor/ and rebuild. The intentional decoupling
+       keeps the binary small for users who only care about tables. -->
+  <script src="/lake/vendor/echarts.min.js" onerror="window.__echarts_missing=true"></script>
+  <script src="/lake/app.js"></script>
+</body>
+</html>

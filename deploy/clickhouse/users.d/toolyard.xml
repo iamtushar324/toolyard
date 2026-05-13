@@ -1,0 +1,39 @@
+<?xml version="1.0"?>
+<!--
+  User overrides. The default user gets a real password (sourced from the
+  TOOLYARD_CH_PASSWORD env var, which docker-compose loads from
+  /var/lib/toolyard/clickhouse-runtime.env). Profile is sized to match the
+  server caps — a single query can't blow past 1 GiB or 4 threads.
+
+  Env var name is *deliberately not* CLICKHOUSE_PASSWORD: setting that
+  trips the upstream entrypoint into writing a /etc/clickhouse-server/
+  users.d/default-user.xml at boot, which fails because we mount users.d
+  read-only. The rename keeps the entrypoint quiet; our config reads the
+  password directly via from_env, which is all we need.
+-->
+<clickhouse>
+    <users>
+        <default>
+            <password from_env="TOOLYARD_CH_PASSWORD"/>
+            <networks>
+                <ip>::/0</ip>
+            </networks>
+            <profile>default</profile>
+            <quota>default</quota>
+            <!-- Off: no SQL-level role/grant management. The single
+                 default user is the whole access surface; lock it down
+                 here rather than juggling RBAC. -->
+            <access_management>0</access_management>
+        </default>
+    </users>
+
+    <profiles>
+        <default>
+            <max_memory_usage>1073741824</max_memory_usage>  <!-- 1 GiB / query -->
+            <max_threads>4</max_threads>
+            <!-- Don't let a runaway client cache eat all our RAM. -->
+            <use_uncompressed_cache>0</use_uncompressed_cache>
+            <load_balancing>random</load_balancing>
+        </default>
+    </profiles>
+</clickhouse>
