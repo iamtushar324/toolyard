@@ -440,6 +440,65 @@ func (g *Gateway) HasTool(name string) bool {
 	return ok
 }
 
+// CallInternal dispatches a registered tool by name, bypassing the
+// approval/policy gate. It is intended for toolyard-internal call paths
+// (e.g. /v1/mempalace/ingest) where the call comes from a trusted code path
+// rather than an agent, so blocking on a human tap would defeat the
+// integration's purpose. The audit trail still records the call so it is
+// reviewable after the fact, with `viaTool` recorded as the dispatcher.
+//
+// Approval, policy.Eval, and the per-agent budget are all skipped — callers
+// must already be confident the operation is safe. Schema-wrap reason
+// extraction is also skipped; the caller is responsible for whatever shape
+// the underlying tool expects.
+//
+// Returns the tool result (possibly with IsError=true) just like a regular
+// call. Errors surface dispatch / upstream connection failures only.
+func (g *Gateway) CallInternal(ctx context.Context, viaTool, targetName string, args map[string]any) (*mcp.CallToolResult, error) {
+	g.mu.RLock()
+	entry, ok := g.tools[targetName]
+	g.mu.RUnlock()
+	if !ok {
+		return mcp.NewToolResultErrorf("tool %q not found in catalog", targetName), nil
+	}
+
+	started := time.Now()
+	agentID := agentIDFromContext(ctx)
+	ev := &metrics.Event{
+		TS:         started.UnixMilli(),
+		AgentID:    agentID,
+		Upstream:   entry.upstream,
+		ShortName:  entry.originalName,
+		ToolName:   entry.tool.Name,
+		IsWrite:    !policy.IsReadOnlyName(entry.tool.Name),
+		PinnedTool: IsPinned(entry.tool.Name),
+		Via:        viaTool,
+	}
+	if g.surface != nil {
+		ev.SurfaceMode = g.surface.SurfaceMode(ctx)
+	}
+	// We log the dispatch as already-allowed so the dashboard's audit feed
+	// shows the call. We deliberately omit the arguments blob because the
+	// ingest path treats whatever the agent posted as opaque — the redactor
+	// runs in audit.Write anyway, but skipping the marshal keeps the hot
+	// path cheap.
+	_ = g.audit.Write(ctx, audit.Event{
+		EventType:    audit.EventCallAllowed,
+		AgentID:      agentID,
+		UpstreamName: entry.upstream,
+		ToolName:     entry.tool.Name,
+		Decision:     "internal",
+		Reason:       "internal:" + viaTool,
+	})
+	ev.ApprovalOutcome = metrics.ApprovalNone
+	res, err := g.dispatch(ctx, entry, args, agentID, "internal:"+viaTool, "", ev)
+	ev.TotalLatencyMs = int(time.Since(started).Milliseconds())
+	if g.metrics != nil {
+		g.metrics.Record(*ev)
+	}
+	return res, err
+}
+
 // RouteCall is the same call routing used by every registered MCP tool, but
 // callable directly: the meta-tool tools.execute uses it to dispatch a call to
 // any tool in the catalog without having to round-trip through the MCP server

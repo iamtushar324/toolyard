@@ -125,7 +125,7 @@ func validate(srv Server) error {
 		return fmt.Errorf("%w: name must not contain spaces or dots", ErrInvalid)
 	}
 	switch srv.Name {
-	case "builtin", "fixture", "memory", "tools":
+	case "builtin", "fixture", "memory", "tools", "mempalace":
 		return ErrReserved
 	}
 	switch srv.Transport {
@@ -255,6 +255,9 @@ func (s *Service) Add(ctx context.Context, srv Server) (*Server, error) {
 
 // Remove disconnects the upstream and deletes the row.
 func (s *Service) Remove(ctx context.Context, name string) error {
+	if isReservedBuiltin(name) {
+		return ErrReserved
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if err := s.gw.RemoveUpstream(name); err != nil &&
@@ -361,6 +364,89 @@ func nullStr(s string) any {
 		return nil
 	}
 	return s
+}
+
+// isReservedBuiltin reports whether name refers to a toolyard-managed
+// upstream that the dashboard shouldn't allow operators to delete. Built-in
+// upstreams (e.g. "mempalace") are managed by the gateway's startup wiring;
+// removing them from the DB doesn't unregister the live tools, and the next
+// boot would simply re-insert the row anyway.
+func isReservedBuiltin(name string) bool {
+	switch name {
+	case "mempalace":
+		return true
+	}
+	return false
+}
+
+// UpsertBuiltin persists a toolyard-managed upstream config and connects it.
+// It bypasses the AllowStdio policy check (which exists to fence
+// dashboard-driven user input) and the reserved-name validation — built-ins
+// are part of the binary's startup contract, not user-supplied. If a row by
+// the same name already exists the config is updated in place; otherwise a
+// new row is inserted. Either way the upstream is (re)connected and an
+// tools/list_changed notification fires so live MCP clients pick the new
+// tools up immediately.
+//
+// Connection errors leave the row in place with last_error populated so the
+// dashboard can show the failure; the operator may retry via the standard
+// reconnect endpoint.
+func (s *Service) UpsertBuiltin(ctx context.Context, srv Server) (*Server, error) {
+	if strings.TrimSpace(srv.Name) == "" {
+		return nil, fmt.Errorf("%w: name required", ErrInvalid)
+	}
+	if !isReservedBuiltin(srv.Name) {
+		return nil, fmt.Errorf("%w: UpsertBuiltin is only for reserved built-in names", ErrInvalid)
+	}
+	// Built-ins still get the env-denylist check — even toolyard's own
+	// startup wiring shouldn't accidentally pass LD_PRELOAD.
+	if denied := s.policy.envDenied(srv.Env); denied != "" {
+		return nil, fmt.Errorf("%w: env key %q is on the denylist", ErrInvalid, denied)
+	}
+
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	now := time.Now().UnixMilli()
+	srv.UpdatedAt = now
+	if srv.CreatedAt == 0 {
+		srv.CreatedAt = now
+	}
+	srv.Enabled = true
+
+	argsBlob, _ := json.Marshal(srv.Args)
+	envBlob, _ := json.Marshal(srv.Env)
+
+	// INSERT … ON CONFLICT keeps the existing created_at while updating the
+	// rest. SQLite's "excluded" pseudo-table refers to the would-be-inserted row.
+	_, err := s.db.ExecContext(ctx,
+		`INSERT INTO upstream_servers(name, transport, command, args_json, url,
+            env_json, enabled, created_at, updated_at)
+         VALUES(?,?,?,?,?,?,?,?,?)
+         ON CONFLICT(name) DO UPDATE SET
+            transport = excluded.transport,
+            command   = excluded.command,
+            args_json = excluded.args_json,
+            url       = excluded.url,
+            env_json  = excluded.env_json,
+            enabled   = 1,
+            updated_at = excluded.updated_at`,
+		srv.Name, srv.Transport, nullStr(srv.Command), string(argsBlob),
+		nullStr(srv.URL), string(envBlob), 1, srv.CreatedAt, now)
+	if err != nil {
+		return nil, err
+	}
+
+	// If something was already connected under this name, drop it first so
+	// we pick up command/args changes across restarts.
+	_ = s.gw.RemoveUpstream(srv.Name)
+
+	if err := s.connect(ctx, srv); err != nil {
+		s.recordStatus(ctx, srv.Name, "", err.Error(), 0)
+		final, _ := s.get(ctx, srv.Name)
+		return final, err
+	}
+	return s.get(ctx, srv.Name)
 }
 
 // SortedNames is a small helper for the API layer.
