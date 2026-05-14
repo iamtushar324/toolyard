@@ -48,6 +48,16 @@ func (s *Server) insightsOverview(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, o)
 }
 
+// toolRowWithPolicy is the wire shape returned by /v1/insights/tools: the
+// underlying metrics.ToolRow plus the two policy flags the dashboard needs
+// to render the quick-switch toggle. The metrics row is embedded so existing
+// JSON consumers see the same fields they always did.
+type toolRowWithPolicy struct {
+	metrics.ToolRow
+	AutoApprove   bool `json:"auto_approve"`
+	IsDestructive bool `json:"is_destructive"`
+}
+
 func (s *Server) insightsTools(w http.ResponseWriter, r *http.Request) {
 	if _, err := s.requireUser(r); err != nil {
 		writeError(w, http.StatusUnauthorized, "unauthorized")
@@ -65,7 +75,73 @@ func (s *Server) insightsTools(w http.ResponseWriter, r *http.Request) {
 	if rows == nil {
 		rows = []metrics.ToolRow{}
 	}
-	writeJSON(w, http.StatusOK, rows)
+	var policies map[string]bool
+	if s.autoApproval != nil {
+		policies = s.autoApproval.ToolPolicies(r.Context())
+	}
+	out := make([]toolRowWithPolicy, 0, len(rows))
+	for _, row := range rows {
+		enriched := toolRowWithPolicy{ToolRow: row}
+		if policies != nil {
+			enriched.AutoApprove = policies[row.ToolName]
+		}
+		if s.autoApproval != nil {
+			enriched.IsDestructive = s.autoApproval.IsDestructive(r.Context(), row.ToolName)
+		}
+		out = append(out, enriched)
+	}
+	writeJSON(w, http.StatusOK, out)
+}
+
+// insightsToolPolicy handles POST /v1/insights/tools/{tool_name}/policy with
+// body {"auto_approve": bool}. It flips a kind=tool auto-approval rule for
+// the tool: ON creates (or re-enables) a rule, OFF disables every enabled
+// rule of that kind. Destructive tools are accepted but the response carries
+// a `destructive_veto` flag so the UI can warn the user that auto-approval
+// will still block at decision time.
+func (s *Server) insightsToolPolicy(w http.ResponseWriter, r *http.Request) {
+	if _, err := s.requireUser(r); err != nil {
+		writeError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+	if s.autoApproval == nil {
+		writeError(w, http.StatusServiceUnavailable, "auto-approval not wired")
+		return
+	}
+	tail := strings.TrimPrefix(r.URL.Path, "/v1/insights/tools/")
+	if !strings.HasSuffix(tail, "/policy") {
+		http.NotFound(w, r)
+		return
+	}
+	tool := strings.TrimSuffix(tail, "/policy")
+	if tool == "" {
+		http.NotFound(w, r)
+		return
+	}
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "POST only")
+		return
+	}
+	var body struct {
+		AutoApprove bool `json:"auto_approve"`
+	}
+	if err := decode(r, &body); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if err := s.autoApproval.SetToolPolicy(r.Context(), tool, body.AutoApprove); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	resp := map[string]any{
+		"ok":           true,
+		"tool_name":    tool,
+		"auto_approve": body.AutoApprove,
+	}
+	if body.AutoApprove && s.autoApproval.IsDestructive(r.Context(), tool) {
+		resp["destructive_veto"] = true
+	}
+	writeJSON(w, http.StatusOK, resp)
 }
 
 func (s *Server) insightsAgents(w http.ResponseWriter, r *http.Request) {

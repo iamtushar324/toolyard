@@ -1811,11 +1811,48 @@ function viewInsights() {
     ),
   );
 
-  // Tool table
+  // Tool table — each row carries a quick-switch toggle that flips the tool
+  // between "auto-approve" and "needs approval (human review)". The toggle
+  // calls POST /v1/insights/tools/{name}/policy and re-loads on success.
+  // Destructive tools are still hard-vetoed by the engine even when toggled
+  // on; the UI shows a "(destructive)" hint so the operator isn't surprised.
+  const renderPolicyToggle = (t) => {
+    const on = !!t.auto_approve;
+    const destructive = !!t.is_destructive;
+    return el('label', {
+      class: 'policy-toggle' + (on ? ' on' : '') + (destructive ? ' veto' : ''),
+      title: destructive
+        ? 'Destructive tools always require human review — the engine ignores the rule.'
+        : (on ? 'Auto-approves on every call.' : 'Holds for human review.'),
+    },
+      el('input', { type: 'checkbox', checked: on, on: { change: async (e) => {
+        const want = e.target.checked;
+        try {
+          const resp = await api('/v1/insights/tools/' + encodeURIComponent(t.tool_name) + '/policy', {
+            method: 'POST', body: { auto_approve: want },
+          });
+          if (resp && resp.destructive_veto) {
+            toast(t.tool_name + ': rule saved, but destructive tools still require human review.', 'warn');
+          } else {
+            toast(t.tool_name + ' → ' + (want ? 'auto-approve' : 'needs approval'));
+          }
+          loadInsights();
+        } catch (err) {
+          toast(err.message, 'error');
+          render(); // revert the checkbox visually
+        }
+      }}}),
+      el('span', { class: 'policy-pill' }, on ? 'Auto' : 'Ask'),
+    );
+  };
+
   const toolRows = (state.insights.tools || []).map((t) =>
     el('tr', {},
-      el('td', {}, el('code', {}, t.tool_name)),
+      el('td', {}, el('code', {}, t.tool_name),
+        t.is_destructive ? el('div', { class: 'meta', style: 'color: var(--warn);' }, 'destructive') : null,
+      ),
       el('td', {}, t.upstream),
+      el('td', {}, renderPolicyToggle(t)),
       el('td', {}, fmtNum(t.calls)),
       el('td', {}, t.distinct_agents),
       el('td', { style: t.error_rate > 0.1 ? 'color: var(--danger);' : '' }, pct(t.error_rate)),
@@ -1826,11 +1863,19 @@ function viewInsights() {
   );
   const toolCard = el('div', { class: 'card' },
     el('h2', {}, 'Tools'),
+    el('p', { class: 'meta' },
+      'Toggle ',
+      el('strong', {}, 'Auto'),
+      ' to skip the human tap for that tool. ',
+      el('strong', {}, 'Ask'),
+      ' keeps the default — every call waits for review.',
+    ),
     state.insights.tools.length === 0
       ? el('div', { class: 'empty' }, 'No tool calls in this range yet.')
       : el('table', {},
         el('thead', {}, el('tr', {},
-          el('th', {}, 'Tool'), el('th', {}, 'Upstream'), el('th', {}, 'Calls'),
+          el('th', {}, 'Tool'), el('th', {}, 'Upstream'), el('th', {}, 'Policy'),
+          el('th', {}, 'Calls'),
           el('th', {}, 'Agents'), el('th', {}, 'Err %'), el('th', {}, 'Approval %'),
           el('th', {}, 'p50 / p95'), el('th', {}, 'Last seen'),
         )),
