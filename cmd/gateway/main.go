@@ -50,6 +50,7 @@ import (
 	"github.com/tusharbhardwaj/toolyard/internal/push"
 	"github.com/tusharbhardwaj/toolyard/internal/realtime"
 	"github.com/tusharbhardwaj/toolyard/internal/settings"
+	skillspkg "github.com/tusharbhardwaj/toolyard/internal/skills"
 	"github.com/tusharbhardwaj/toolyard/internal/store"
 	"github.com/tusharbhardwaj/toolyard/internal/upstreams"
 	usagepkg "github.com/tusharbhardwaj/toolyard/internal/usage"
@@ -133,6 +134,10 @@ func runServe(argv []string) error {
 	notesFlag := fs.String("notes", "auto", "Notes (markdown workspace) upstream mode: on|off|auto. auto=register the filesystem MCP if npx is on PATH; on=fail boot when npx missing; off=skip the integration entirely.")
 	notesDir := fs.String("notes-dir", "", "Directory the notes filesystem upstream exposes (defaults to <data-dir>/notes). Lives under <data-dir> so the existing data-dir backup captures it.")
 	notesSyncEvery := fs.Duration("notes-sync-interval", notespkg.DefaultScanEvery, "How often the notes->mempalace background sync walks the notes dir. Use a negative value to disable scanning (notes.publish still works).")
+	skillsFlag := fs.String("skills", "auto", "Skills (centralised Claude Code skills workspace) upstream mode: on|off|auto. auto=register the filesystem MCP if npx is on PATH; on=fail boot when npx missing; off=skip the integration entirely.")
+	skillsDir := fs.String("skills-dir", "", "Directory the skills filesystem upstream exposes (defaults to <data-dir>/skills). Lives under <data-dir> so the existing data-dir backup captures it.")
+	skillsSyncEvery := fs.Duration("skills-sync-interval", skillspkg.DefaultScanEvery, "How often the skills->mempalace background sync walks the skills dir. Use a negative value to disable scanning (skills.publish still works).")
+	claudeSkillsDir := fs.String("claude-skills-dir", "", "Default parent directory `skills.install` symlinks/copies into when the caller doesn't pass `target`. Empty means callers must pass `target` explicitly; a typical value is `~/.claude/skills`.")
 	_ = fs.Parse(argv)
 
 	// Public mode auto-enables matching safeguards.
@@ -490,6 +495,71 @@ func runServe(argv []string) error {
 		log.Printf("notes-sync: scanner started (interval=%s, dir=%s)", *notesSyncEvery, resolvedNotesDir)
 	}
 
+	// Skills workspace: sibling to notes. Same filesystem-MCP-upstream
+	// recipe (zero custom CRUD), same MemPalace ingest pattern, same
+	// dataDir-captures-it-all backup story. Two custom built-in tools on
+	// top — skills.publish (validate + write + index) and skills.install
+	// (symlink/copy into the user's local Claude install).
+	skillsMode := strings.ToLower(strings.TrimSpace(*skillsFlag))
+	if skillsMode == "" {
+		skillsMode = "auto"
+	}
+	resolvedSkillsDir := *skillsDir
+	if resolvedSkillsDir == "" {
+		resolvedSkillsDir = filepath.Join(*dataDir, "skills")
+	}
+	switch skillsMode {
+	case "off":
+		log.Printf("skills: disabled (-skills=off)")
+	case "on", "auto":
+		if err := os.MkdirAll(resolvedSkillsDir, 0o750); err != nil {
+			if skillsMode == "on" {
+				return fmt.Errorf("skills: mkdir %s: %w", resolvedSkillsDir, err)
+			}
+			log.Printf("skills: mkdir %s: %v", resolvedSkillsDir, err)
+			break
+		}
+		npxPath, lookErr := exec.LookPath("npx")
+		if lookErr != nil {
+			if skillsMode == "on" {
+				return fmt.Errorf("skills: npx not on PATH (-skills=on); install Node.js or set -skills=off")
+			}
+			log.Printf("skills: npx not on PATH; integration inactive (-skills=auto)")
+			break
+		}
+		if _, err := upstreamSvc.UpsertBuiltin(ctx, upstreams.Server{
+			Name:      "skills",
+			Transport: "stdio",
+			Command:   npxPath,
+			Args:      []string{"-y", "@modelcontextprotocol/server-filesystem", resolvedSkillsDir},
+			Enabled:   true,
+		}); err != nil {
+			log.Printf("skills upstream: %v", err)
+		} else {
+			log.Printf("skills: connected (dir=%s)", resolvedSkillsDir)
+		}
+	default:
+		log.Printf("skills: unknown mode %q; treating as auto", skillsMode)
+	}
+
+	// Same shape as notes: construct the Service regardless of the
+	// upstream's status. Publish/Install short-circuit if the filesystem
+	// MCP isn't registered yet (falls back to direct disk write), and the
+	// scanner retries on every tick.
+	var skillsSvc *skillspkg.Service
+	if skillsMode != "off" {
+		skillsSvc = skillspkg.New(skillspkg.Options{
+			DB:              db,
+			Gateway:         gw,
+			SkillsDir:       resolvedSkillsDir,
+			Interval:        *skillsSyncEvery,
+			ClaudeSkillsDir: *claudeSkillsDir,
+		})
+		gw.RegisterSkillsBuiltins(skillsAdapter{skillsSvc})
+		go skillsSvc.StartScanner(ctx)
+		log.Printf("skills-sync: scanner started (interval=%s, dir=%s)", *skillsSyncEvery, resolvedSkillsDir)
+	}
+
 	secOpts := api.SecurityOptions{
 		PublicURL:      *publicURL,
 		TrustedProxies: parseCIDRs(*trustedProxies),
@@ -497,25 +567,26 @@ func runServe(argv []string) error {
 
 	// REST API + dashboard.
 	apiSrv := api.New(api.Options{
-		Identity:     idSvc,
-		Approval:     bus,
-		Audit:        auditSvc,
-		Memory:       memSvc,
-		Push:         pushSvc,
-		Hub:          hub,
-		Gateway:      gw,
-		Upstreams:    upstreamSvc,
-		Settings:     settingsSvc,
-		Usage:        usageSvc,
-		Metrics:         metricsReader,
-		MetricsRecorder: metricsRec,
-		AutoApproval: autoApprover,
-		OAuth:        oauthSvc,
+		Identity:                 idSvc,
+		Approval:                 bus,
+		Audit:                    auditSvc,
+		Memory:                   memSvc,
+		Push:                     pushSvc,
+		Hub:                      hub,
+		Gateway:                  gw,
+		Upstreams:                upstreamSvc,
+		Settings:                 settingsSvc,
+		Usage:                    usageSvc,
+		Metrics:                  metricsReader,
+		MetricsRecorder:          metricsRec,
+		AutoApproval:             autoApprover,
+		OAuth:                    oauthSvc,
 		Lake:                     lakeSvc,
 		GrafanaRuntimeEnvPath:    *grafanaRuntimeEnvPath,
 		ClickhouseRuntimeEnvPath: *clickhouseRuntimeEnvPath,
 		Mempalace:                mpSvc,
 		Notes:                    notesSvc,
+		Skills:                   skillsSvc,
 		SessionKey:               loadOrCreateSessionKey(*dataDir),
 		Security:                 secOpts,
 	})
@@ -1121,6 +1192,31 @@ func (a notesAdapter) Publish(ctx context.Context, agentID, path, content, topic
 	return a.s.Publish(ctx, agentID, path, content, topic)
 }
 func (a notesAdapter) NotesDir() string { return a.s.NotesDir() }
+
+// skillsAdapter bridges *skills.Service to the gateway's SkillsPublisher
+// contract — flattens the typed return into `(any, error)` so
+// internal/gateway doesn't need to import internal/skills.
+type skillsAdapter struct{ s *skillspkg.Service }
+
+func (a skillsAdapter) Publish(ctx context.Context, agentID, slug, skillMD, agentsYAML string, scripts map[string]string, topic string) (any, error) {
+	return a.s.Publish(ctx, agentID, slug, skillMD, agentsYAML, scripts, topic)
+}
+func (a skillsAdapter) Install(ctx context.Context, agentID, slug, mode, target string) (any, error) {
+	return a.s.Install(ctx, agentID, slug, mode, target)
+}
+func (a skillsAdapter) List(ctx context.Context, tagFilter []string) (any, error) {
+	return a.s.List(ctx, tagFilter)
+}
+func (a skillsAdapter) ListTags(ctx context.Context) (any, error) {
+	return a.s.ListTags(ctx)
+}
+func (a skillsAdapter) Get(ctx context.Context, slug string, includeFiles bool) (any, error) {
+	return a.s.Get(ctx, slug, includeFiles)
+}
+func (a skillsAdapter) Bundle(ctx context.Context, slugs []string) (any, error) {
+	return a.s.Bundle(ctx, slugs)
+}
+func (a skillsAdapter) SkillsDir() string { return a.s.SkillsDir() }
 
 // silence unused-import warnings in case build tags drop something.
 var _ = net.Listen
