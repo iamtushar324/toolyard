@@ -410,6 +410,42 @@ code { background: var(--bg); padding: 1px 4px; border-radius: 3px; font-size: 1
   .workbench .tool-list { max-height: 220px; }
 }
 
+/* Quick-switch toggle for per-tool approval policy. The checkbox itself is
+   hidden — the visible pill is the label, recolored via the .on modifier. */
+.policy-toggle {
+  display: inline-flex;
+  align-items: center;
+  cursor: pointer;
+  user-select: none;
+  gap: 6px;
+}
+.policy-toggle input { display: none; }
+.policy-toggle .policy-pill {
+  display: inline-block;
+  min-width: 52px;
+  text-align: center;
+  padding: 4px 10px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  background: var(--bg-elev-2);
+  color: var(--muted);
+  font-size: 12px;
+  font-weight: 600;
+  letter-spacing: 0.02em;
+  transition: background 80ms ease, color 80ms ease, border-color 80ms ease;
+}
+.policy-toggle.on .policy-pill {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+}
+.policy-toggle.veto .policy-pill {
+  border-color: var(--warn);
+  color: var(--warn);
+  background: transparent;
+}
+.policy-toggle:hover .policy-pill { filter: brightness(1.08); }
+
 /* iPhone 11 portrait is 414px; we target 768 and below as "phone or small
    tablet". Layout flips to single column, top nav hides in favor of the
    bottom bar, and content gets enough bottom padding to clear the bar. */

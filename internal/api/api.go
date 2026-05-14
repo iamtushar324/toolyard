@@ -241,6 +241,7 @@ func (s *Server) Routes(mux *http.ServeMux) {
 
 	mux.HandleFunc("/v1/insights/overview", s.insightsOverview)
 	mux.HandleFunc("/v1/insights/tools", s.insightsTools)
+	mux.HandleFunc("/v1/insights/tools/", s.insightsToolPolicy)
 	mux.HandleFunc("/v1/insights/agents", s.insightsAgents)
 	mux.HandleFunc("/v1/insights/agents/", s.insightsAgentDetail)
 	mux.HandleFunc("/v1/insights/anomalies", s.insightsAnomalies)

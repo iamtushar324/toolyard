@@ -535,6 +535,79 @@ func (s *Service) ruleExistsForTool(ctx context.Context, tool string) (bool, err
 	return true, nil
 }
 
+// SetToolPolicy is the operator-facing quick switch. autoApprove=true creates
+// (or re-enables and clears cool-off on) a kind=tool rule for the supplied
+// tool, so every future call to that tool decides as `auto`. autoApprove=false
+// disables every enabled kind=tool rule for the tool, sending future calls
+// back to the human review queue.
+//
+// Destructive tools (is_destructive=1 in tool_dim, or matching one of the
+// built-in name markers) still hard-veto inside Match(), so flipping the
+// switch on a destructive tool is a no-op at decision time — the rule row
+// gets written but the engine refuses to fire it. The handler surfaces this
+// to the caller as a normal success; the API layer flags it for the UI.
+func (s *Service) SetToolPolicy(ctx context.Context, toolName string, autoApprove bool) error {
+	if strings.TrimSpace(toolName) == "" {
+		return errors.New("tool_name required")
+	}
+	if autoApprove {
+		s.mu.RLock()
+		var existingID string
+		for i := range s.cache {
+			r := &s.cache[i]
+			if r.Kind == "tool" && r.ToolName == toolName {
+				existingID = r.ID
+				break
+			}
+		}
+		s.mu.RUnlock()
+		if existingID != "" {
+			if _, err := s.db.ExecContext(ctx,
+				`UPDATE auto_approval_rules SET enabled=1, cooloff_until=NULL WHERE id=?`,
+				existingID); err != nil {
+				return err
+			}
+			return s.reload(ctx)
+		}
+		rationale, _ := json.Marshal(map[string]any{
+			"basis":  "manual",
+			"source": "user-toggle",
+		})
+		_, err := s.CreateOrUpdate(ctx, Rule{
+			Kind:          "tool",
+			ToolName:      toolName,
+			Enabled:       true,
+			Source:        "user",
+			RationaleJSON: string(rationale),
+		})
+		return err
+	}
+	if _, err := s.db.ExecContext(ctx,
+		`UPDATE auto_approval_rules SET enabled=0 WHERE kind='tool' AND tool_name=?`,
+		toolName); err != nil {
+		return err
+	}
+	return s.reload(ctx)
+}
+
+// ToolPolicies returns the set of tools that currently have an enabled
+// kind=tool auto-approval rule. The dashboard reads this to render the
+// per-tool toggle state without parsing the full rules list.
+func (s *Service) ToolPolicies(ctx context.Context) map[string]bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	out := make(map[string]bool, len(s.cache))
+	for _, r := range s.cache {
+		if r.Kind != "tool" || r.ToolName == "" {
+			continue
+		}
+		if r.Enabled {
+			out[r.ToolName] = true
+		}
+	}
+	return out
+}
+
 // MarkToolDestructive lets the operator (or an automated heuristic) flag a
 // tool so auto-approval will hard-veto it. Idempotent.
 func (s *Service) MarkToolDestructive(ctx context.Context, toolName, upstream string, destructive bool) error {
