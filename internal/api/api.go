@@ -50,12 +50,13 @@ import (
 	"github.com/tusharbhardwaj/toolyard/internal/marketplace"
 	"github.com/tusharbhardwaj/toolyard/internal/memory"
 	"github.com/tusharbhardwaj/toolyard/internal/mempalace"
-	"github.com/tusharbhardwaj/toolyard/internal/notes"
 	"github.com/tusharbhardwaj/toolyard/internal/metrics"
+	"github.com/tusharbhardwaj/toolyard/internal/notes"
 	"github.com/tusharbhardwaj/toolyard/internal/oauth"
 	"github.com/tusharbhardwaj/toolyard/internal/push"
 	"github.com/tusharbhardwaj/toolyard/internal/realtime"
 	"github.com/tusharbhardwaj/toolyard/internal/settings"
+	"github.com/tusharbhardwaj/toolyard/internal/skills"
 	"github.com/tusharbhardwaj/toolyard/internal/upstreams"
 	"github.com/tusharbhardwaj/toolyard/internal/usage"
 )
@@ -67,54 +68,55 @@ const (
 )
 
 type Server struct {
-	identity     *identity.Service
-	approval     *approval.Bus
-	audit        *audit.Logger
-	memory       *memory.Service
-	push         *push.Service
-	hub          *realtime.Hub
-	gateway      *gateway.Gateway
-	upstreams    *upstreams.Service
-	settings     *settings.Service
-	usage        *usage.Service
-	metrics      *metrics.Reader
+	identity  *identity.Service
+	approval  *approval.Bus
+	audit     *audit.Logger
+	memory    *memory.Service
+	push      *push.Service
+	hub       *realtime.Hub
+	gateway   *gateway.Gateway
+	upstreams *upstreams.Service
+	settings  *settings.Service
+	usage     *usage.Service
+	metrics   *metrics.Reader
 	// metricsRecorder, when set, lets /v1/health surface the
 	// async-flusher's dropped-event counter — a quiet warning sign that
 	// the metrics buffer is overflowing (often the canary for "the
 	// SQLite write path is stalled"), which usually shows up before the
 	// dashboard noticeably hangs.
-	metricsRecorder       *metrics.Recorder
-	autoApproval *autoapproval.Service
+	metricsRecorder          *metrics.Recorder
+	autoApproval             *autoapproval.Service
 	oauth                    *oauth.Service
 	lake                     *lake.Service
 	grafanaRuntimeEnvPath    string
 	clickhouseRuntimeEnvPath string
 	mempalace                *mempalace.Service
 	notes                    *notes.Service
+	skills                   *skills.Service
 	sessionKey               []byte
-	security     SecurityOptions
-	loginLimit   *loginThrottle
-	unauthLimit  *loginThrottle
+	security                 SecurityOptions
+	loginLimit               *loginThrottle
+	unauthLimit              *loginThrottle
 }
 
 type Options struct {
-	Identity     *identity.Service
-	Approval     *approval.Bus
-	Audit        *audit.Logger
-	Memory       *memory.Service
-	Push         *push.Service
-	Hub          *realtime.Hub
-	Gateway      *gateway.Gateway
-	Upstreams    *upstreams.Service
-	Settings     *settings.Service
-	Usage        *usage.Service
-	Metrics      *metrics.Reader
+	Identity  *identity.Service
+	Approval  *approval.Bus
+	Audit     *audit.Logger
+	Memory    *memory.Service
+	Push      *push.Service
+	Hub       *realtime.Hub
+	Gateway   *gateway.Gateway
+	Upstreams *upstreams.Service
+	Settings  *settings.Service
+	Usage     *usage.Service
+	Metrics   *metrics.Reader
 	// MetricsRecorder, when set, exposes the async metrics writer's
 	// dropped-event counter on /v1/health. Optional — nil omits the
 	// field from the response.
 	MetricsRecorder *metrics.Recorder
 	AutoApproval    *autoapproval.Service
-	OAuth        *oauth.Service
+	OAuth           *oauth.Service
 	// Lake, when set, enables /v1/lake/* — read-only query, named queries
 	// from the embedded queries/ tree, manifest, bootstrap kick-off, ad-hoc
 	// SELECT for the explorer tab. nil disables the routes cleanly.
@@ -137,36 +139,42 @@ type Options struct {
 	// Notes, when set, enables /v1/notes/* — markdown workspace +
 	// background MemPalace sync. The Service itself nil-checks so an
 	// unwired install just returns 503 from the routes.
-	Notes                    *notes.Service
-	SessionKey               []byte
-	Security                 SecurityOptions
+	Notes *notes.Service
+	// Skills, when set, holds the centralised Claude Code skills workspace
+	// + background MemPalace sync. No /v1/skills/* HTTP routes in v1 —
+	// the field is present so the dashboard can consume snapshots later
+	// without another Options refactor.
+	Skills     *skills.Service
+	SessionKey []byte
+	Security   SecurityOptions
 }
 
 func New(opts Options) *Server {
 	s := &Server{
-		identity:     opts.Identity,
-		approval:     opts.Approval,
-		audit:        opts.Audit,
-		memory:       opts.Memory,
-		push:         opts.Push,
-		hub:          opts.Hub,
-		gateway:      opts.Gateway,
-		upstreams:    opts.Upstreams,
-		settings:     opts.Settings,
-		usage:        opts.Usage,
-		metrics:         opts.Metrics,
-		metricsRecorder: opts.MetricsRecorder,
-		autoApproval: opts.AutoApproval,
+		identity:                 opts.Identity,
+		approval:                 opts.Approval,
+		audit:                    opts.Audit,
+		memory:                   opts.Memory,
+		push:                     opts.Push,
+		hub:                      opts.Hub,
+		gateway:                  opts.Gateway,
+		upstreams:                opts.Upstreams,
+		settings:                 opts.Settings,
+		usage:                    opts.Usage,
+		metrics:                  opts.Metrics,
+		metricsRecorder:          opts.MetricsRecorder,
+		autoApproval:             opts.AutoApproval,
 		oauth:                    opts.OAuth,
 		lake:                     opts.Lake,
 		grafanaRuntimeEnvPath:    opts.GrafanaRuntimeEnvPath,
 		clickhouseRuntimeEnvPath: opts.ClickhouseRuntimeEnvPath,
 		mempalace:                opts.Mempalace,
 		notes:                    opts.Notes,
+		skills:                   opts.Skills,
 		sessionKey:               opts.SessionKey,
-		security:     opts.Security,
-		loginLimit:   newLoginThrottle(5, 15*time.Minute),
-		unauthLimit:  newLoginThrottle(0, time.Hour), // max/window passed per-call via AllowN
+		security:                 opts.Security,
+		loginLimit:               newLoginThrottle(5, 15*time.Minute),
+		unauthLimit:              newLoginThrottle(0, time.Hour), // max/window passed per-call via AllowN
 	}
 	go func() {
 		t := time.NewTicker(2 * time.Minute)
@@ -257,11 +265,11 @@ func (s *Server) health(w http.ResponseWriter, r *http.Request) {
 	// async writer's buffer overflowed — typically because SQLite is
 	// stalled on a long transaction.
 	body := map[string]any{
-		"ok":              true,
-		"service":         "toolyard",
-		"version":         "0.1.0",
-		"goroutines":      runtime.NumGoroutine(),
-		"inflight_calls":  s.gateway.InFlight(),
+		"ok":             true,
+		"service":        "toolyard",
+		"version":        "0.1.0",
+		"goroutines":     runtime.NumGoroutine(),
+		"inflight_calls": s.gateway.InFlight(),
 	}
 	if s.metricsRecorder != nil {
 		body["metrics_dropped"] = s.metricsRecorder.DroppedCount()

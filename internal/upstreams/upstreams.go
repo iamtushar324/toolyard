@@ -125,7 +125,7 @@ func validate(srv Server) error {
 		return fmt.Errorf("%w: name must not contain spaces or dots", ErrInvalid)
 	}
 	switch srv.Name {
-	case "builtin", "fixture", "memory", "tools", "mempalace", "notes":
+	case "builtin", "fixture", "memory", "tools", "mempalace", "notes", "skills":
 		return ErrReserved
 	}
 	switch srv.Transport {
