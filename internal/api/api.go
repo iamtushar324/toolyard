@@ -252,8 +252,11 @@ func (s *Server) Routes(mux *http.ServeMux) {
 	mux.HandleFunc("/v1/insights/purge-agent", s.insightsPurgeAgent)
 	mux.HandleFunc("/v1/insights/export", s.insightsExport)
 
+	mux.HandleFunc("/v1/diagnostics/crashes", s.diagnosticsCrashes)
+
 	s.oauthRoutes(mux)
 	s.lakeRoutes(mux)
+	s.cliRoutes(mux)
 }
 
 // ---- helpers ----------------------------------------------------------------
@@ -264,13 +267,17 @@ func (s *Server) health(w http.ResponseWriter, r *http.Request) {
 	// climbs into the thousands while inflight stays low, leak. If both
 	// climb together, upstream pile-up. metrics_dropped > 0 means the
 	// async writer's buffer overflowed — typically because SQLite is
-	// stalled on a long transaction.
+	// stalled on a long transaction. upstreams_live vs _max tells the
+	// operator whether the LRU pool is at saturation.
 	body := map[string]any{
-		"ok":             true,
-		"service":        "toolyard",
-		"version":        "0.1.0",
-		"goroutines":     runtime.NumGoroutine(),
-		"inflight_calls": s.gateway.InFlight(),
+		"ok":              true,
+		"service":         "toolyard",
+		"version":         "0.1.0",
+		"goroutines":      runtime.NumGoroutine(),
+		"inflight_calls":  s.gateway.InFlight(),
+		"upstreams_live":  s.gateway.LiveUpstreamCount(),
+		"upstreams_idle":  s.gateway.SuspendedUpstreamCount(),
+		"upstreams_max":   s.gateway.MaxLiveUpstreams(),
 	}
 	if s.metricsRecorder != nil {
 		body["metrics_dropped"] = s.metricsRecorder.DroppedCount()

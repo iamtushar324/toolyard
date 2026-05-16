@@ -107,6 +107,12 @@ NOTES="${NOTES:-auto}"
 NOTES_DIR_DEFAULT="$DATA_DIR/notes"
 NOTES_DIR="${NOTES_DIR:-$NOTES_DIR_DEFAULT}"
 IMPORT_FROM=""
+# --client-only short-circuits the install: build ONLY the CLI binary
+# (cmd/toolyard) and drop it at $CLI_BINARY_PATH; skip user creation,
+# data dir, systemd, ClickHouse, Grafana, etc. Use this on a remote
+# server that talks to a gateway elsewhere.
+CLIENT_ONLY=false
+CLI_BINARY_PATH="/usr/local/bin/toolyard"
 # Idle timeout for stdio subprocesses. When non-empty, passed as
 # -stdio-idle-timeout to the gateway; the subprocess is killed after this
 # period of inactivity and restarted on the next tool call. Recommended:
@@ -121,6 +127,7 @@ while [[ $# -gt 0 ]]; do
     --mempalace)          MEMPALACE="$2"; shift 2 ;;
     --notes)              NOTES="$2"; shift 2 ;;
     --stdio-idle-timeout) STDIO_IDLE_TIMEOUT="$2"; shift 2 ;;
+    --client-only)        CLIENT_ONLY=true; shift ;;
     -h|--help)            sed -n '2,52p' "$0"; exit 0 ;;
     *) echo "unknown flag: $1" >&2; exit 1 ;;
   esac
@@ -135,16 +142,51 @@ case "$NOTES" in
   *) echo "NOTES must be one of: on, off, auto (got: $NOTES)" >&2; exit 1 ;;
 esac
 
-if [[ $EUID -ne 0 ]]; then
-  echo "must run as root (use sudo)" >&2
-  exit 1
-fi
 if [[ ! -f cmd/gateway/main.go ]]; then
   echo "must run from the toolyard repo root" >&2
   exit 1
 fi
 if ! command -v go >/dev/null 2>&1; then
   echo "go (1.21+) is required to build" >&2
+  exit 1
+fi
+
+# Client-only short-circuit: build the CLI binary, install it, done.
+# Useful on a remote server that only consumes a remote toolyard gateway
+# via HTTPS. No data dir, no systemd, no docker, no users.
+if [[ "$CLIENT_ONLY" == "true" ]]; then
+  if [[ ! -f cmd/toolyard/main.go ]]; then
+    echo "cmd/toolyard not present; checkout is too old for --client-only" >&2
+    exit 1
+  fi
+  BUILDER="${SUDO_USER:-${USER:-$(id -un)}}"
+  printf '==> building toolyard CLI as %s\n' "$BUILDER"
+  TMP_CLI="$(mktemp /tmp/toolyard-cli.XXXXXX)"
+  chown "$BUILDER":"$(id -gn "$BUILDER")" "$TMP_CLI" 2>/dev/null || true
+  sudo -u "$BUILDER" env \
+      GOTOOLCHAIN=auto \
+      GOSUMDB=sum.golang.org \
+      GOPROXY="https://proxy.golang.org,direct" \
+    bash -c "cd '$(pwd)' && go build -trimpath -ldflags '-s -w' -o '$TMP_CLI' ./cmd/toolyard"
+  if [[ $EUID -eq 0 ]]; then
+    install -m 0755 "$TMP_CLI" "$CLI_BINARY_PATH"
+  else
+    cp "$TMP_CLI" "$CLI_BINARY_PATH" 2>/dev/null || {
+      mkdir -p "$HOME/.local/bin"
+      CLI_BINARY_PATH="$HOME/.local/bin/toolyard"
+      cp "$TMP_CLI" "$CLI_BINARY_PATH"
+      chmod 0755 "$CLI_BINARY_PATH"
+      echo "installed (no root): $CLI_BINARY_PATH"
+      echo "ensure ~/.local/bin is on PATH"
+    }
+  fi
+  rm -f "$TMP_CLI"
+  printf '==> done. Next: toolyard auth login --server https://your-gateway <code>\n'
+  exit 0
+fi
+
+if [[ $EUID -ne 0 ]]; then
+  echo "must run as root (use sudo)" >&2
   exit 1
 fi
 

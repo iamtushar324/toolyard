@@ -291,7 +291,8 @@ func (s *Server) HardenAPI(next http.Handler) http.Handler {
 // unbounded data on a small handler.
 func perRouteBodyCap(path string) int64 {
 	switch {
-	case strings.HasPrefix(path, "/v1/tools/run"):
+	case strings.HasPrefix(path, "/v1/tools/run"),
+		strings.HasPrefix(path, "/v1/agents/tools/run"):
 		return 4 << 20 // 4 MiB — tool arguments can be substantial
 	case strings.HasPrefix(path, "/v1/memory"):
 		return 1 << 20 // 1 MiB — memory.set values
@@ -328,7 +329,10 @@ func exemptFromCSRFHeader(path string) bool {
 		// origin, so the CSRF custom-header check doesn't apply.
 		"/v1/mempalace/ingest",
 		"/v1/notes/sync",
-		"/v1/notes/publish":
+		"/v1/notes/publish",
+		// CLI is bearer-authenticated and called from servers / scripts,
+		// not the dashboard. No cookie to protect.
+		"/v1/agents/tools/run":
 		return true
 	}
 	return false
