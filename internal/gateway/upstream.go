@@ -38,6 +38,11 @@ type UpstreamConfig struct {
 type upstream struct {
 	cfg UpstreamConfig
 
+	// pool is a back-pointer to the owning Gateway, used for admission
+	// control on resume() (LRU eviction when the live-upstream cap is
+	// hit). May be nil in tests that construct upstreams directly.
+	pool *Gateway
+
 	// mu guards the client field for all lifecycle transitions:
 	// connect, suspend, resume, and close. It is NOT held during
 	// tool RPCs — mcp-go transports are explicitly goroutine-safe.
@@ -186,11 +191,19 @@ func (u *upstream) suspend() {
 // resume reconnects a suspended upstream. Safe to call concurrently: the
 // lock ensures only one goroutine does the work; subsequent callers return
 // immediately once the connection is live.
+//
+// Before reconnecting we ask the pool for a slot — if the live-upstream
+// cap is full, the least-recently-used live upstream is suspended to make
+// room. This is the load-bearing piece of the pool: any upstream can be
+// transparently re-dialed on next use, so eviction is free.
 func (u *upstream) resume(ctx context.Context) error {
 	u.mu.Lock()
 	defer u.mu.Unlock()
 	if u.client != nil {
 		return nil // already running
+	}
+	if u.pool != nil {
+		u.pool.acquireSlot(u)
 	}
 	fresh, err := newUpstream(ctx, u.cfg)
 	if err != nil {

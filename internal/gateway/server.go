@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"math"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -123,6 +124,15 @@ type Gateway struct {
 	inLineWait          time.Duration
 	maxPendingPerAgent  int
 	upstreamCallTimeout time.Duration
+
+	// maxLiveUpstreams caps how many upstream connections are alive
+	// simultaneously. 0 = unbounded. When the cap is hit and a new
+	// upstream needs a slot, the least-recently-used live upstream is
+	// suspended (catalog stays populated, re-dialed transparently on
+	// next call). poolMu serializes admission decisions so two
+	// concurrent resumes can't both think they have a slot.
+	maxLiveUpstreams int
+	poolMu           sync.Mutex
 
 	// inFlight is the live count of routeEntry calls currently executing
 	// (not yet returned). Surfaced via /v1/health and the dashboard so a
@@ -316,10 +326,15 @@ func (g *Gateway) AddUpstream(ctx context.Context, cfg UpstreamConfig) error {
 	if cfg.Name == builtinUpstream || cfg.Name == "fixture" {
 		return fmt.Errorf("name %q is reserved", cfg.Name)
 	}
+	// Pre-allocate a pool slot: if the live cap is full this suspends the
+	// LRU upstream first so the new one doesn't push us over.
+	probe := &upstream{cfg: cfg, pool: g}
+	g.acquireSlot(probe)
 	u, err := newUpstream(ctx, cfg)
 	if err != nil {
 		return err
 	}
+	u.pool = g // so resume() after future idle-kill knows the pool
 	tools, err := u.listTools(ctx)
 	if err != nil {
 		_ = u.close()
@@ -387,20 +402,22 @@ func (g *Gateway) RemoveUpstream(name string) error {
 	return nil
 }
 
-// SweepIdleStdioUpstreams suspends any stdio upstream whose last tool call
-// is older than idleAfter. The upstream's tool catalog entry remains intact
-// so agents can still discover the tools; the subprocess restarts
-// automatically on the next callTool. Returns the number of upstreams
-// suspended.
+// SweepIdleStdioUpstreams suspends any upstream (stdio or http) whose last
+// tool call is older than idleAfter. The upstream's tool catalog entry
+// remains intact so agents can still discover the tools; the transport
+// restarts automatically on the next callTool. Returns the number of
+// upstreams suspended.
+//
+// Despite the name, this covers HTTP too — kept for backwards compat with
+// the old flag (-stdio-idle-timeout). New callers should treat it as
+// "SweepIdleUpstreams".
 func (g *Gateway) SweepIdleStdioUpstreams(idleAfter time.Duration) int {
 	// Snapshot the upstream slice under a short read-lock to avoid holding
 	// g.mu while performing the (potentially slow) suspend.
 	g.mu.RLock()
 	candidates := make([]*upstream, 0, len(g.upstreams))
 	for _, u := range g.upstreams {
-		if u.cfg.Transport == "stdio" {
-			candidates = append(candidates, u)
-		}
+		candidates = append(candidates, u)
 	}
 	g.mu.RUnlock()
 
@@ -409,11 +426,115 @@ func (g *Gateway) SweepIdleStdioUpstreams(idleAfter time.Duration) int {
 		idle := u.idleSince()
 		if !u.suspended() && idle >= idleAfter {
 			u.suspend()
-			log.Printf("idle-kill: suspended %q (idle %s)", u.cfg.Name, idle.Round(time.Second))
+			log.Printf("idle-kill: suspended %q (idle %s, transport=%s)",
+				u.cfg.Name, idle.Round(time.Second), u.cfg.Transport)
 			count++
 		}
 	}
 	return count
+}
+
+// SetMaxLiveUpstreams configures the cap on simultaneously-live upstreams.
+// 0 = unbounded. Safe to call before or after AddUpstream — eviction
+// applies on the next acquireSlot.
+func (g *Gateway) SetMaxLiveUpstreams(n int) {
+	if n < 0 {
+		n = 0
+	}
+	g.poolMu.Lock()
+	g.maxLiveUpstreams = n
+	g.poolMu.Unlock()
+}
+
+// MaxLiveUpstreams returns the configured cap (0 = unbounded). Useful for
+// /v1/health output.
+func (g *Gateway) MaxLiveUpstreams() int {
+	g.poolMu.Lock()
+	defer g.poolMu.Unlock()
+	return g.maxLiveUpstreams
+}
+
+// LiveUpstreamCount returns how many upstreams currently hold a live
+// transport. Counterpart to SuspendedUpstreamCount.
+func (g *Gateway) LiveUpstreamCount() int {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	n := 0
+	for _, u := range g.upstreams {
+		if !u.suspended() {
+			n++
+		}
+	}
+	return n
+}
+
+// SuspendedUpstreamCount returns how many upstreams are currently
+// idle-killed or LRU-evicted (catalog still served from cache).
+func (g *Gateway) SuspendedUpstreamCount() int {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	n := 0
+	for _, u := range g.upstreams {
+		if u.suspended() {
+			n++
+		}
+	}
+	return n
+}
+
+// acquireSlot is called immediately before an upstream opens (or
+// reopens) a transport. If the live cap would be exceeded by counting
+// `self` in, the least-recently-used OTHER live upstream is suspended.
+// Holding poolMu serializes admission across concurrent resumes; the
+// actual suspend() takes only u.mu so there is no deadlock risk.
+func (g *Gateway) acquireSlot(self *upstream) {
+	victim, live, limit := g.pickEvictionCandidate(self)
+	if victim != nil {
+		victim.suspend()
+		log.Printf("lru-evict: suspended %q to make room for %q (live=%d cap=%d)",
+			victim.cfg.Name, self.cfg.Name, live, limit)
+	}
+}
+
+// pickEvictionCandidate returns the LRU upstream that should be suspended
+// to admit `self`, along with the observed live count and cap. Returns
+// (nil, _, _) when no eviction is needed (cap=0 or count<cap).
+// Separated from acquireSlot so unit tests can exercise the selection
+// without needing real mcp-go clients to .Close().
+func (g *Gateway) pickEvictionCandidate(self *upstream) (*upstream, int, int) {
+	g.poolMu.Lock()
+	limit := g.maxLiveUpstreams
+	g.poolMu.Unlock()
+	if limit <= 0 {
+		return nil, 0, 0
+	}
+	g.mu.RLock()
+	candidates := make([]*upstream, 0, len(g.upstreams))
+	for _, u := range g.upstreams {
+		if u != self {
+			candidates = append(candidates, u)
+		}
+	}
+	g.mu.RUnlock()
+
+	var lru *upstream
+	live := 0
+	var oldest int64 = math.MaxInt64
+	for _, u := range candidates {
+		if u.suspended() {
+			continue
+		}
+		live++
+		t := u.lastUsed.Load()
+		if t < oldest {
+			oldest = t
+			lru = u
+		}
+	}
+	if live >= limit && lru != nil {
+		return lru, live, limit
+	}
+	return nil, live, limit
 }
 
 // UpstreamToolCount returns the number of registered tools for the named
