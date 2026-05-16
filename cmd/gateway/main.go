@@ -38,9 +38,11 @@ import (
 	"github.com/tusharbhardwaj/toolyard/internal/approval"
 	"github.com/tusharbhardwaj/toolyard/internal/audit"
 	"github.com/tusharbhardwaj/toolyard/internal/autoapproval"
+	"github.com/tusharbhardwaj/toolyard/internal/crashdump"
 	"github.com/tusharbhardwaj/toolyard/internal/gateway"
 	"github.com/tusharbhardwaj/toolyard/internal/identity"
 	"github.com/tusharbhardwaj/toolyard/internal/lake"
+	"github.com/tusharbhardwaj/toolyard/internal/logx"
 	"github.com/tusharbhardwaj/toolyard/internal/memory"
 	"github.com/tusharbhardwaj/toolyard/internal/mempalace"
 	"github.com/tusharbhardwaj/toolyard/internal/metrics"
@@ -138,8 +140,44 @@ func runServe(argv []string) error {
 	skillsDir := fs.String("skills-dir", "", "Directory the skills filesystem upstream exposes (defaults to <data-dir>/skills). Lives under <data-dir> so the existing data-dir backup captures it.")
 	skillsSyncEvery := fs.Duration("skills-sync-interval", skillspkg.DefaultScanEvery, "How often the skills->mempalace background sync walks the skills dir. Use a negative value to disable scanning (skills.publish still works).")
 	claudeSkillsDir := fs.String("claude-skills-dir", "", "Default parent directory `skills.install` symlinks/copies into when the caller doesn't pass `target`. Empty means callers must pass `target` explicitly; a typical value is `~/.claude/skills`.")
-	stdioIdleTimeout := fs.Duration("stdio-idle-timeout", 0, "kill stdio subprocess upstreams that have been idle for this long, and restart them automatically on the next tool call. 0 disables. Recommended: 15m. Reduces memory when no agents are active.")
+	stdioIdleTimeout := fs.Duration("stdio-idle-timeout", 0, "DEPRECATED: alias for -upstream-idle-timeout. Kept for backwards compat.")
+	upstreamIdleTimeout := fs.Duration("upstream-idle-timeout", 0, "kill upstream MCP connections idle for this long; transparently re-dial on next call. 0 disables. Recommended: 15m. Covers both stdio (kills subprocess) and http (closes client). Reduces RSS + FDs when no agents are active.")
+	upstreamMaxLive := fs.Int("upstream-max-live", 8, "max simultaneously-live upstream connections. When the cap is hit, the least-recently-used upstream is suspended (catalog stays populated, transparently resumed on next call). 0 = unbounded.")
+	logLevel := fs.String("log-level", "info", "log level: debug | info | warn | error")
+	logFormat := fs.String("log-format", "json", "log format: json | text. Text is friendlier in a terminal; json is what journalctl + jq want.")
 	_ = fs.Parse(argv)
+
+	// Initialize structured logging first so every subsequent log line
+	// flows through slog. The stdlib `log` package gets re-routed too via
+	// logx.Bridge() so existing log.Printf callers don't need to migrate
+	// before everything benefits.
+	logx.Init(logx.Format(*logFormat), logx.ParseLevel(*logLevel))
+	log.SetFlags(0)
+	log.SetOutput(logx.Bridge())
+	rootLog := logx.For("gateway")
+
+	// Crash dumps go next to the data dir so the same backup that
+	// captures toolyard.db captures the crash archive too.
+	crashesDir := filepath.Join(*dataDir, "crashes")
+	if err := crashdump.Configure(crashesDir); err != nil {
+		rootLog.Warn("crashdump configure failed", "dir", crashesDir, "err", err.Error())
+	}
+	// If a previous run died unexpectedly, surface it on the next start.
+	if prev, _ := crashdump.List(); len(prev) > 0 {
+		rootLog.Warn("previous crash dumps present",
+			"count", len(prev), "latest", prev[0].Path)
+	}
+	// Auto-prune old crash dumps.
+	if n, _ := crashdump.PruneOlderThan(30 * 24 * time.Hour); n > 0 {
+		rootLog.Info("pruned old crash dumps", "count", n)
+	}
+
+	// Resolve the idle-timeout: new flag wins, old flag is a fallback.
+	idleTimeout := *upstreamIdleTimeout
+	if idleTimeout == 0 && *stdioIdleTimeout > 0 {
+		idleTimeout = *stdioIdleTimeout
+		rootLog.Warn("--stdio-idle-timeout is deprecated; use --upstream-idle-timeout")
+	}
 
 	// Public mode auto-enables matching safeguards.
 	if *publicURL != "" {
@@ -698,6 +736,10 @@ func runServe(argv []string) error {
 	handler = apiSrv.HardenAPI(handler)
 	handler = apiSrv.EnforceOriginOnMutations(handler)
 	handler = apiSrv.SecurityHeaders(handler)
+	// Outermost: recover from panics so one bad handler (or middleware)
+	// can't kill the gateway. Wrap LAST so it sees every other layer's
+	// panic too.
+	handler = api.Recover(handler)
 
 	httpSrv := &http.Server{
 		Addr:              *addr,
@@ -728,22 +770,27 @@ func runServe(argv []string) error {
 		}
 	}()
 
-	if *stdioIdleTimeout > 0 {
+	if idleTimeout > 0 {
 		go func() {
-			tick := time.NewTicker(*stdioIdleTimeout / 2)
+			tick := time.NewTicker(idleTimeout / 2)
 			defer tick.Stop()
 			for {
 				select {
 				case <-ctx.Done():
 					return
 				case <-tick.C:
-					if n := gw.SweepIdleStdioUpstreams(*stdioIdleTimeout); n > 0 {
-						log.Printf("idle-kill: suspended %d stdio upstream(s) idle > %s", n, *stdioIdleTimeout)
+					if n := gw.SweepIdleStdioUpstreams(idleTimeout); n > 0 {
+						rootLog.Info("idle-kill swept",
+							"count", n, "threshold", idleTimeout.String())
 					}
 				}
 			}
 		}()
 	}
+	gw.SetMaxLiveUpstreams(*upstreamMaxLive)
+	rootLog.Info("upstream pool configured",
+		"max_live", *upstreamMaxLive,
+		"idle_timeout", idleTimeout.String())
 
 	go func() {
 		log.Printf("toolyard: HTTP listening on %s (dashboard + /mcp + /v1/*)", *addr)
