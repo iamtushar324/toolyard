@@ -252,8 +252,11 @@ func (s *Server) Routes(mux *http.ServeMux) {
 	mux.HandleFunc("/v1/insights/purge-agent", s.insightsPurgeAgent)
 	mux.HandleFunc("/v1/insights/export", s.insightsExport)
 
+	mux.HandleFunc("/v1/diagnostics/crashes", s.diagnosticsCrashes)
+
 	s.oauthRoutes(mux)
 	s.lakeRoutes(mux)
+	s.cliRoutes(mux)
 }
 
 // ---- helpers ----------------------------------------------------------------
