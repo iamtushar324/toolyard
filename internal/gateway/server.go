@@ -387,6 +387,35 @@ func (g *Gateway) RemoveUpstream(name string) error {
 	return nil
 }
 
+// SweepIdleStdioUpstreams suspends any stdio upstream whose last tool call
+// is older than idleAfter. The upstream's tool catalog entry remains intact
+// so agents can still discover the tools; the subprocess restarts
+// automatically on the next callTool. Returns the number of upstreams
+// suspended.
+func (g *Gateway) SweepIdleStdioUpstreams(idleAfter time.Duration) int {
+	// Snapshot the upstream slice under a short read-lock to avoid holding
+	// g.mu while performing the (potentially slow) suspend.
+	g.mu.RLock()
+	candidates := make([]*upstream, 0, len(g.upstreams))
+	for _, u := range g.upstreams {
+		if u.cfg.Transport == "stdio" {
+			candidates = append(candidates, u)
+		}
+	}
+	g.mu.RUnlock()
+
+	count := 0
+	for _, u := range candidates {
+		idle := u.idleSince()
+		if !u.suspended() && idle >= idleAfter {
+			u.suspend()
+			log.Printf("idle-kill: suspended %q (idle %s)", u.cfg.Name, idle.Round(time.Second))
+			count++
+		}
+	}
+	return count
+}
+
 // UpstreamToolCount returns the number of registered tools for the named
 // upstream (0 if unknown).
 func (g *Gateway) UpstreamToolCount(name string) int {

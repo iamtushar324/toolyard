@@ -62,6 +62,7 @@ LISTEN_ADDR="0.0.0.0:18787"
 # lives in the repo; data + password env file persist under DATA_DIR so
 # the same backup of /var/lib/toolyard/ captures everything.
 CH_COMPOSE="$(pwd)/deploy/clickhouse/docker-compose.yaml"
+GF_COMPOSE="$(pwd)/deploy/grafana/docker-compose.yaml"
 CH_DATA_DIR="$DATA_DIR/clickhouse"
 CH_ENV_FILE="$DATA_DIR/clickhouse-runtime.env"
 # uid:gid the clickhouse-server image runs as internally. Bind mounts
@@ -106,6 +107,11 @@ NOTES="${NOTES:-auto}"
 NOTES_DIR_DEFAULT="$DATA_DIR/notes"
 NOTES_DIR="${NOTES_DIR:-$NOTES_DIR_DEFAULT}"
 IMPORT_FROM=""
+# Idle timeout for stdio subprocesses. When non-empty, passed as
+# -stdio-idle-timeout to the gateway; the subprocess is killed after this
+# period of inactivity and restarted on the next tool call. Recommended:
+# 15m — saves ~300-500 MB when no agents are connected.
+STDIO_IDLE_TIMEOUT="${STDIO_IDLE_TIMEOUT:-15m}"
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
@@ -114,6 +120,7 @@ while [[ $# -gt 0 ]]; do
     --no-stdio-upstreams) NO_STDIO_UPSTREAMS=true; shift ;;
     --mempalace)          MEMPALACE="$2"; shift 2 ;;
     --notes)              NOTES="$2"; shift 2 ;;
+    --stdio-idle-timeout) STDIO_IDLE_TIMEOUT="$2"; shift 2 ;;
     -h|--help)            sed -n '2,52p' "$0"; exit 0 ;;
     *) echo "unknown flag: $1" >&2; exit 1 ;;
   esac
@@ -348,6 +355,7 @@ EXEC_FLAGS=(
 [[ -n "$PUBLIC_URL" ]] && EXEC_FLAGS+=( -public-url "$PUBLIC_URL" )
 [[ "$NO_STDIO_UPSTREAMS" == "true" ]] && EXEC_FLAGS+=( -no-stdio-upstreams )
 [[ "$STATELESS_MCP" == "true" ]] && EXEC_FLAGS+=( -stateless-mcp )
+[[ -n "$STDIO_IDLE_TIMEOUT" && "$STDIO_IDLE_TIMEOUT" != "0" ]] && EXEC_FLAGS+=( -stdio-idle-timeout "$STDIO_IDLE_TIMEOUT" )
 
 # Sandbox tier picked by stdio upstream policy.
 #
@@ -406,6 +414,11 @@ EnvironmentFile=-$ENV_FILE
 # than waiting for "command not found" on the first stdio upstream.
 Environment=PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/snap/bin
 Environment=HOME=$DATA_DIR
+# Go runtime: collect at half the default heap-growth threshold and release
+# freed pages to the OS promptly. GOMEMLIMIT is a soft GC ceiling — it
+# does not kill the process, it just triggers GC sooner.
+Environment=GOMEMLIMIT=200MiB
+Environment=GOGC=50
 
 # Restart on crash with backoff.
 Restart=on-failure
@@ -633,6 +646,46 @@ if [[ "$ch_status" == "up" ]]; then
   done
 fi
 
+# ----- Grafana stack ---------------------------------------------------
+#
+# Visualisation layer. Reads the same /var/lib/toolyard/clickhouse-runtime.env
+# the CH stack does — when toolyard mints a new password on this boot, the
+# CH compose recreate above picks it up but Grafana's container would
+# still hold the OLD env in memory (docker compose env_file is loaded at
+# container creation, not on restart). `up -d --force-recreate` reloads
+# the env so the provisioned CH datasource lands with current creds.
+#
+# Soft-required: skipped with a warning if docker compose plugin or the
+# compose file is missing, same posture as the CH section.
+gf_status="skipped"
+if [[ "$ch_status" == "up" ]] && [[ -f "$GF_COMPOSE" ]]; then
+  if ! docker network inspect "$LAKE_NETWORK" >/dev/null 2>&1; then
+    docker network create "$LAKE_NETWORK" >/dev/null
+  fi
+  say "grafana: bringing up the compose stack (force-recreate so it re-reads CH password)"
+  if docker compose -f "$GF_COMPOSE" up -d --force-recreate >/dev/null; then
+    say "grafana: waiting for /api/health"
+    gf_ok="no"
+    for i in {1..60}; do
+      if curl -sf http://127.0.0.1:3030/api/health >/dev/null 2>&1; then
+        gf_ok="yes"
+        break
+      fi
+      sleep 1
+    done
+    if [[ "$gf_ok" == "yes" ]]; then
+      echo "    grafana healthy"
+      gf_status="up"
+    else
+      echo "    grafana did not respond on 127.0.0.1:3030 within 60s — check 'docker logs toolyard-grafana'"
+      gf_status="degraded"
+    fi
+  else
+    echo "    docker compose up failed — check 'docker compose -f $GF_COMPOSE logs'"
+    gf_status="failed"
+  fi
+fi
+
 # Detect first-run vs. existing setup.
 need_setup="no"
 if curl -sf http://127.0.0.1:18787/v1/auth/me 2>/dev/null | grep -q '"setup_required":true'; then
@@ -662,6 +715,14 @@ toolyard is up.
     password  : managed by toolyard (settings key 'clickhouse_password')
                 rendered to $CH_ENV_FILE for the compose stack
                 reveal/rotate from the dashboard's Settings tab
+
+  grafana     : $gf_status
+    compose   : $GF_COMPOSE
+    logs      : docker logs toolyard-grafana
+    bind      : 127.0.0.1:3030 (UI)
+    datasource: provisioned at boot from
+                deploy/grafana/provisioning/datasources/datasources.yaml
+                reads TOOLYARD_CH_PASSWORD from $CH_ENV_FILE
 
   reminders:
     - RESTART your MCP agents (Claude Code, etc.) after this. Their MCP

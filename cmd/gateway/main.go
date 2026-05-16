@@ -138,6 +138,7 @@ func runServe(argv []string) error {
 	skillsDir := fs.String("skills-dir", "", "Directory the skills filesystem upstream exposes (defaults to <data-dir>/skills). Lives under <data-dir> so the existing data-dir backup captures it.")
 	skillsSyncEvery := fs.Duration("skills-sync-interval", skillspkg.DefaultScanEvery, "How often the skills->mempalace background sync walks the skills dir. Use a negative value to disable scanning (skills.publish still works).")
 	claudeSkillsDir := fs.String("claude-skills-dir", "", "Default parent directory `skills.install` symlinks/copies into when the caller doesn't pass `target`. Empty means callers must pass `target` explicitly; a typical value is `~/.claude/skills`.")
+	stdioIdleTimeout := fs.Duration("stdio-idle-timeout", 0, "kill stdio subprocess upstreams that have been idle for this long, and restart them automatically on the next tool call. 0 disables. Recommended: 15m. Reduces memory when no agents are active.")
 	_ = fs.Parse(argv)
 
 	// Public mode auto-enables matching safeguards.
@@ -726,6 +727,23 @@ func runServe(argv []string) error {
 			_ = runtimepprof.Lookup("goroutine").WriteTo(os.Stderr, 2)
 		}
 	}()
+
+	if *stdioIdleTimeout > 0 {
+		go func() {
+			tick := time.NewTicker(*stdioIdleTimeout / 2)
+			defer tick.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-tick.C:
+					if n := gw.SweepIdleStdioUpstreams(*stdioIdleTimeout); n > 0 {
+						log.Printf("idle-kill: suspended %d stdio upstream(s) idle > %s", n, *stdioIdleTimeout)
+					}
+				}
+			}
+		}()
+	}
 
 	go func() {
 		log.Printf("toolyard: HTTP listening on %s (dashboard + /mcp + /v1/*)", *addr)

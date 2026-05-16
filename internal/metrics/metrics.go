@@ -116,7 +116,7 @@ type Recorder struct {
 func New(db *store.DB) *Recorder {
 	r := &Recorder{
 		db:        db,
-		in:        make(chan Event, 4096),
+		in:        make(chan Event, 512),
 		stop:      make(chan struct{}),
 		done:      make(chan struct{}),
 		flushSize: 200,
