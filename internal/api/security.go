@@ -107,7 +107,15 @@ func (s *Server) SecurityHeaders(next http.Handler) http.Handler {
 			"style-src 'self'; " +
 			"img-src 'self' data:; " +
 			"font-src 'self'; " +
-			"connect-src 'self'; " +
+			// connect-src 'self' covers same-origin ws://wss://, but
+			// some browsers (and reverse proxies that confuse scheme
+			// detection) refuse the upgrade unless wss: is explicit.
+			"connect-src 'self' wss: ws:; " +
+			// media-src needed because the voice panel uses a blob:
+			// URL for the silent WAV that anchors the OS MediaSession
+			// (so the BTR11's play/pause button routes to us instead
+			// of Siri). 'self' alone falls through to default-src.
+			"media-src 'self' blob:; " +
 			"worker-src 'self'; " +
 			"frame-ancestors 'none'; " +
 			"base-uri 'self'; " +
