@@ -2,6 +2,8 @@
 /toolyard
 /cmd/gateway/gateway
 /gateway-darwin
+/gateway-linux
+/gateway-linux-arm64
 *.exe
 *.so
 
