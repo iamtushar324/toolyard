@@ -166,9 +166,16 @@ func (s *Service) HandleWS(ctx context.Context, w http.ResponseWriter, r *http.R
 	s.mu.Unlock()
 
 	conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{
-		// Same-origin only — we never want cross-origin browsers opening
-		// a voice channel to this gateway.
-		OriginPatterns: nil,
+		// InsecureSkipVerify disables coder/websocket's built-in Origin
+		// check, which compares the Origin header to the request's Host.
+		// Reverse proxies (nginx-proxy-manager, Caddy, etc.) frequently
+		// rewrite Host to the backend address while leaving Origin as
+		// the public hostname — the mismatch makes the library reject
+		// with 403 before we even see the upgrade. CSRF protection
+		// for this endpoint comes from the same JWT session cookie
+		// the rest of /v1/* relies on, with SameSite enforced on the
+		// cookie itself; the Origin check would be redundant.
+		InsecureSkipVerify: true,
 		// Skip permessage-deflate; the payload is mostly already-compressed
 		// PCM-encoded audio, so deflate just burns CPU.
 		CompressionMode: websocket.CompressionDisabled,
