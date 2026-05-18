@@ -1,6 +1,7 @@
 # Binaries
 /toolyard
 /cmd/gateway/gateway
+/gateway-darwin
 *.exe
 *.so
 

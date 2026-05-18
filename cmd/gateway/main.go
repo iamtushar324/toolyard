@@ -32,6 +32,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/joho/godotenv"
 	"github.com/mark3labs/mcp-go/server"
 
 	"github.com/tusharbhardwaj/toolyard/internal/api"
@@ -57,6 +58,7 @@ import (
 	"github.com/tusharbhardwaj/toolyard/internal/upstreams"
 	usagepkg "github.com/tusharbhardwaj/toolyard/internal/usage"
 	"github.com/tusharbhardwaj/toolyard/internal/visibility"
+	"github.com/tusharbhardwaj/toolyard/internal/voice"
 	dashboard "github.com/tusharbhardwaj/toolyard/web/dashboard"
 	weblake "github.com/tusharbhardwaj/toolyard/web/lake"
 )
@@ -64,6 +66,12 @@ import (
 const version = "0.1.0"
 
 func main() {
+	// Auto-load .env from CWD (and, if present, a .env next to the
+	// binary) before any os.Getenv lookup runs. Real exported env vars
+	// still win — godotenv.Load only fills *unset* keys — so a CI/prod
+	// systemd unit can override .env without editing the file.
+	loadDotenv()
+
 	if len(os.Args) < 2 {
 		usage()
 		os.Exit(2)
@@ -92,6 +100,23 @@ func main() {
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
 		os.Exit(1)
+	}
+}
+
+// loadDotenv pulls keys from a .env in the current working directory and,
+// failing that, a .env next to the binary. Real env vars always win — we
+// pass the file as the second arg of godotenv.Load which only sets keys
+// that aren't already in the environment. Missing files are silently OK;
+// this is opt-in by file presence, not a hard dependency.
+func loadDotenv() {
+	candidates := []string{".env"}
+	if exe, err := os.Executable(); err == nil {
+		candidates = append(candidates, filepath.Join(filepath.Dir(exe), ".env"))
+	}
+	for _, p := range candidates {
+		if _, err := os.Stat(p); err == nil {
+			_ = godotenv.Load(p) // already-set env wins; safe to ignore parse errors
+		}
 	}
 }
 
@@ -140,6 +165,10 @@ func runServe(argv []string) error {
 	skillsDir := fs.String("skills-dir", "", "Directory the skills filesystem upstream exposes (defaults to <data-dir>/skills). Lives under <data-dir> so the existing data-dir backup captures it.")
 	skillsSyncEvery := fs.Duration("skills-sync-interval", skillspkg.DefaultScanEvery, "How often the skills->mempalace background sync walks the skills dir. Use a negative value to disable scanning (skills.publish still works).")
 	claudeSkillsDir := fs.String("claude-skills-dir", "", "Default parent directory `skills.install` symlinks/copies into when the caller doesn't pass `target`. Empty means callers must pass `target` explicitly; a typical value is `~/.claude/skills`.")
+	voiceFlag := fs.String("voice", "auto", "Voice (live call dashboard panel) mode: on|off|auto. auto=enable iff GEMINI_API_KEY is set in the environment; on=fail boot when the key is missing; off=expose no /v1/voice/* routes.")
+	voiceDir := fs.String("voice-dir", "", "Directory holding the voice persona file (soul.md). Defaults to <data-dir>/voice. Seeded on first run with Maestro's embedded default persona.")
+	voiceModel := fs.String("voice-model", os.Getenv("MAESTRO_MODEL"), "Gemini Live model to use for voice calls. Falls back to $MAESTRO_MODEL, then maestro's default (gemini-2.5-flash-preview-native-audio-dialog).")
+	voiceSessionPrefix := fs.String("voice-tmux-prefix", "mae-", "Tmux session prefix Maestro uses when it spawns claude sessions. Must end with '-'.")
 	stdioIdleTimeout := fs.Duration("stdio-idle-timeout", 0, "DEPRECATED: alias for -upstream-idle-timeout. Kept for backwards compat.")
 	upstreamIdleTimeout := fs.Duration("upstream-idle-timeout", 0, "kill upstream MCP connections idle for this long; transparently re-dial on next call. 0 disables. Recommended: 15m. Covers both stdio (kills subprocess) and http (closes client). Reduces RSS + FDs when no agents are active.")
 	upstreamMaxLive := fs.Int("upstream-max-live", 8, "max simultaneously-live upstream connections. When the cap is hit, the least-recently-used upstream is suspended (catalog stays populated, transparently resumed on next call). 0 = unbounded.")
@@ -599,6 +628,47 @@ func runServe(argv []string) error {
 		log.Printf("skills-sync: scanner started (interval=%s, dir=%s)", *skillsSyncEvery, resolvedSkillsDir)
 	}
 
+	// Voice ("live call" dashboard panel). Mirrors notes/skills: present a
+	// Service object regardless of whether the GEMINI_API_KEY is set, so the
+	// /v1/voice/* routes can return a clear 503 rather than 404 when the
+	// operator hasn't configured the key yet.
+	var voiceSvc *voice.Service
+	voiceMode := strings.ToLower(strings.TrimSpace(*voiceFlag))
+	if voiceMode != "off" {
+		apiKey := strings.TrimSpace(os.Getenv("GEMINI_API_KEY"))
+		switch voiceMode {
+		case "on":
+			if apiKey == "" {
+				return errors.New("voice: -voice=on requires GEMINI_API_KEY in the environment")
+			}
+		case "auto", "":
+			// fall through; service still constructed even with no key so
+			// routes return a clean 503 instead of 404.
+		default:
+			log.Printf("voice: unknown mode %q; treating as auto", voiceMode)
+		}
+		resolvedVoiceDir := *voiceDir
+		if resolvedVoiceDir == "" {
+			resolvedVoiceDir = filepath.Join(*dataDir, "voice")
+		}
+		voiceSvc = voice.New(voice.Config{
+			APIKey:        apiKey,
+			Model:         *voiceModel,
+			SessionPrefix: *voiceSessionPrefix,
+			PersonaPath:   filepath.Join(resolvedVoiceDir, "soul.md"),
+			Hub:           hub,
+			Logger:        logx.For("voice"),
+		})
+		if err := voiceSvc.SeedPersona(); err != nil {
+			log.Printf("voice: seed persona at %s: %v (continuing)", resolvedVoiceDir, err)
+		}
+		if apiKey == "" {
+			log.Printf("voice: GEMINI_API_KEY not set — /v1/voice/ws will return 503 until configured")
+		} else {
+			log.Printf("voice: enabled (persona=%s)", filepath.Join(resolvedVoiceDir, "soul.md"))
+		}
+	}
+
 	secOpts := api.SecurityOptions{
 		PublicURL:      *publicURL,
 		TrustedProxies: parseCIDRs(*trustedProxies),
@@ -626,6 +696,7 @@ func runServe(argv []string) error {
 		Mempalace:                mpSvc,
 		Notes:                    notesSvc,
 		Skills:                   skillsSvc,
+		Voice:                    voiceSvc,
 		SessionKey:               loadOrCreateSessionKey(*dataDir),
 		Security:                 secOpts,
 	})

@@ -4,5 +4,5 @@ package dashboard
 
 import "embed"
 
-//go:embed index.html app.js style.css sw.js manifest.webmanifest icon-192.svg icon-512.svg
+//go:embed index.html app.js style.css sw.js manifest.webmanifest icon-192.svg icon-512.svg voice-worklet.js
 var Assets embed.FS

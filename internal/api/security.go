@@ -94,7 +94,11 @@ func (s *Server) SecurityHeaders(next http.Handler) http.Handler {
 		h.Set("X-Content-Type-Options", "nosniff")
 		h.Set("X-Frame-Options", "DENY")
 		h.Set("Referrer-Policy", "strict-origin-when-cross-origin")
-		h.Set("Permissions-Policy", "geolocation=(), camera=(), microphone=(), payment=()")
+		// microphone=(self) is what unlocks the "Call" panel — without
+		// it, getUserMedia rejects with NotAllowedError before the
+		// browser even prompts for permission. Camera/payment stay
+		// closed; we don't surface them anywhere in the dashboard.
+		h.Set("Permissions-Policy", "geolocation=(), camera=(), microphone=(self), payment=()")
 		h.Set("Cross-Origin-Opener-Policy", "same-origin")
 		// CSP — same-origin everything, no inline. data: allowed for SVG icons.
 		// Workers + ServiceWorker explicitly allowed for the push SW.

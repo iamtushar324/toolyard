@@ -59,6 +59,7 @@ import (
 	"github.com/tusharbhardwaj/toolyard/internal/skills"
 	"github.com/tusharbhardwaj/toolyard/internal/upstreams"
 	"github.com/tusharbhardwaj/toolyard/internal/usage"
+	"github.com/tusharbhardwaj/toolyard/internal/voice"
 )
 
 const (
@@ -93,6 +94,7 @@ type Server struct {
 	mempalace                *mempalace.Service
 	notes                    *notes.Service
 	skills                   *skills.Service
+	voice                    *voice.Service
 	sessionKey               []byte
 	security                 SecurityOptions
 	loginLimit               *loginThrottle
@@ -144,7 +146,12 @@ type Options struct {
 	// + background MemPalace sync. No /v1/skills/* HTTP routes in v1 —
 	// the field is present so the dashboard can consume snapshots later
 	// without another Options refactor.
-	Skills     *skills.Service
+	Skills *skills.Service
+	// Voice, when set, enables /v1/voice/* — the dashboard "live call"
+	// panel. Requires GEMINI_API_KEY to be wired into the voice.Service
+	// itself; the api layer just gates auth and reverse-checks
+	// concurrency.
+	Voice      *voice.Service
 	SessionKey []byte
 	Security   SecurityOptions
 }
@@ -171,6 +178,7 @@ func New(opts Options) *Server {
 		mempalace:                opts.Mempalace,
 		notes:                    opts.Notes,
 		skills:                   opts.Skills,
+		voice:                    opts.Voice,
 		sessionKey:               opts.SessionKey,
 		security:                 opts.Security,
 		loginLimit:               newLoginThrottle(5, 15*time.Minute),
@@ -257,6 +265,7 @@ func (s *Server) Routes(mux *http.ServeMux) {
 	s.oauthRoutes(mux)
 	s.lakeRoutes(mux)
 	s.cliRoutes(mux)
+	s.voiceRoutes(mux)
 }
 
 // ---- helpers ----------------------------------------------------------------

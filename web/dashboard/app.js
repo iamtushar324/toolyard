@@ -68,6 +68,31 @@ const state = {
     explorerError: null,
     echartsLoaded: false,
   },
+  // Voice "live call" panel. The actual WS, AudioContext, MediaStream
+  // live in module-scope handles (see voiceClient below) — they aren't
+  // serialisable and must survive re-renders, so they can't sit in this
+  // state object. This block is the renderable mirror.
+  call: {
+    active: false,
+    callId: null,
+    phase: 'idle',    // 'idle' | 'connecting' | 'listening' | 'thinking' | 'speaking' | 'error'
+    error: '',
+    mute: false,
+    transcript: [],   // [{ role: 'user'|'assistant', text }]
+    toolCalls: [],    // [{ name, args }]
+    permission: 'unknown', // 'unknown' | 'granted' | 'denied'
+    activeCallElsewhere: null, // {call_id} when server returns 409
+    // hardwareReady reflects whether we've successfully claimed the OS
+    // Now Playing slot. If false, BTR11 play/pause falls through to
+    // Siri / system handling instead of toggling mute.
+    hardwareReady: false,
+    hardwareWhy: '',
+    // Music ducking via Path A: a low-level pink-noise loop in our
+    // audio output trips the OS audio session, so cooperating apps
+    // (Spotify, Music with auto-pause prefs on) voluntarily pause.
+    // Persisted in localStorage; default on. No server involvement.
+    duck: (localStorage.getItem('toolyard.call.duck') ?? '1') === '1',
+  },
 };
 
 // ---- helpers ----------------------------------------------------------------
@@ -2106,6 +2131,7 @@ function shell(content) {
       el('div', { class: 'brand' }, el('span', { class: 'dot' }), 'toolyard'),
       el('nav', {},
         navBtn('approvals',    'Approvals'),
+        navBtn('call',         'Call' + (state.call.active ? ' ●' : '')),
         navBtn('lake',         'Lake'),
         navBtn('insights',     'Insights'),
         navBtn('notifications', 'Alerts' + (alertCount ? ' (' + alertCount + ')' : '')),
@@ -2162,6 +2188,7 @@ function renderMoreSheet() {
   return el('div', { class: 'modal-bg', on: { click: (e) => { if (e.target === e.currentTarget) { state.moreSheet = false; render(); } }}},
     el('div', { class: 'modal', style: 'display: flex; flex-direction: column; gap: 6px;' },
       el('h3', {}, 'More'),
+      item('call',     'Call',     'Talk to Claude through Maestro — voice in, voice out'),
       item('lake',     'Lake',     'Personal data warehouse — finance, ops, daily memory'),
       item('insights', 'Insights', 'Per-tool, per-agent, cost breakdowns'),
       item('audit',    'Audit',    'Append-only event log'),
@@ -2190,6 +2217,7 @@ function render() {
     case 'settings':      body = viewSettings();      break;
     case 'insights':      body = viewInsights();      break;
     case 'lake':          body = viewLake();          break;
+    case 'call':          body = viewCall();          break;
     case 'notifications': body = viewNotifications(); break;
     default:              body = viewApprovals();
   }
@@ -2800,6 +2828,713 @@ async function pollDevice(f) {
   };
   setTimeout(tick, 1000);
 }
+
+// ---- Call (voice live agent) ------------------------------------------------
+//
+// Browser side of the /v1/voice/ws WebSocket. Module-scope handles
+// (voiceClient) hold the WS, AudioContext, MediaStream and AudioWorklet
+// node so they survive re-render. state.call mirrors what the panel
+// needs to show.
+
+const voiceClient = {
+  ws: null,
+  ctx: null,                // AudioContext (output, 24 kHz to match Gemini)
+  micCtx: null,             // AudioContext (input — separate, runs at hardware rate)
+  micStream: null,          // MediaStream from getUserMedia
+  workletNode: null,
+  micSource: null,
+  nextPlaybackAt: 0,        // scheduling clock for AudioBufferSource chain
+  // BTR11 / Bluetooth-headset hardware button support. macOS Now
+  // Playing only recognises HTMLMediaElement playback from a real file
+  // source (URL/Blob), not a MediaStream — so we synthesize a silent
+  // WAV blob and loop it through a hidden <audio> tag. That puts us on
+  // the OS media-key bus where BTR11's play/pause posts events.
+  silentAudioEl: null,      // <audio> tag playing the silent blob loop
+  silentAudioURL: null,     // object URL we created — revoked on teardown
+  // Music ducking ("Path A"): an audible pink-noise loop routed through
+  // the AudioContext destination during mic-live. The level is well
+  // below speech (~-50 dBFS) so it sits under conversation, but it's
+  // measurable enough that the OS treats us as "playing media" and
+  // cooperative apps (Spotify, Apple Music with their auto-pause prefs
+  // on) voluntarily pause themselves while we're hot. Muted → gain
+  // ramps to 0; unmuted → ramps back up.
+  duckNoiseSrc: null,       // AudioBufferSourceNode (looping)
+  duckGain: null,           // GainNode whose .gain we ramp on mute
+  // Downstream audio arrives as 24 kHz mono int16 (Gemini's native rate).
+  // We schedule chunks back-to-back on the AudioContext clock so playback
+  // never gaps; the engine resamples to whatever the output hardware
+  // wants (LDAC over BTR11 typically targets 96 kHz).
+};
+
+async function startCall() {
+  if (state.call.active) return;
+  state.call.error = '';
+  state.call.activeCallElsewhere = null;
+  state.call.phase = 'connecting';
+  state.call.transcript = [];
+  state.call.toolCalls = [];
+  render();
+
+  // 0) Preflight: the WebSocket constructor swallows HTTP response
+  //    bodies, so a 409 from the WS upgrade can't carry the active
+  //    call ID back to us. Hit /v1/voice/sessions first; if anything
+  //    is open, surface the "hang up the other one?" prompt without
+  //    even touching the mic.
+  try {
+    const r = await api('/v1/voice/sessions');
+    if (r && r.sessions && r.sessions.length > 0) {
+      state.call.phase = 'idle';
+      state.call.activeCallElsewhere = { call_id: r.sessions[0].id };
+      render();
+      return;
+    }
+  } catch (e) {
+    // 503 from voice-disabled or auth failure — surface the message and
+    // bail without prompting for mic.
+    state.call.phase = 'error';
+    state.call.error = e.message;
+    render();
+    return;
+  }
+
+  // 1) Mic permission + capture.
+  //
+  // BTR11 (and any closed-back Bluetooth amp/DAC) has no acoustic
+  // feedback path — output goes to wired headphones plugged into the
+  // amp, mic is the device's built-in MEMS or the user's inline mic.
+  // So echoCancellation actively hurts: it adds latency and can carve
+  // out frequencies that aren't echoing in the first place. We ask the
+  // browser to skip it, keeping NS+AGC because those still help voice.
+  // sampleRate hint nudges Chrome toward 16 kHz capture (matches what
+  // Gemini wants on the wire); browsers free to ignore.
+  //
+  // navigator.mediaDevices is undefined on iOS Safari (and stricter
+  // Chrome builds) when the page isn't a "secure context" — i.e. not
+  // HTTPS and not localhost. We detect that explicitly so the user
+  // sees an actionable hint instead of the cryptic stock error.
+  if (!window.isSecureContext || !navigator.mediaDevices ||
+      typeof navigator.mediaDevices.getUserMedia !== 'function') {
+    state.call.phase = 'error';
+    state.call.permission = 'denied';
+    state.call.error =
+      'microphone API unavailable on this origin (' + location.origin + '). ' +
+      'iOS Safari and most browsers refuse mic access unless the page is ' +
+      'served over HTTPS or from localhost. Open the dashboard over an ' +
+      'HTTPS tunnel (Tailscale Serve, Cloudflare Tunnel, or a local cert) ' +
+      'and try again.';
+    render();
+    return;
+  }
+  let stream;
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({ audio: {
+      channelCount: 1,
+      echoCancellation: false,
+      noiseSuppression: true,
+      autoGainControl: true,
+      sampleRate: { ideal: 16000 },
+      sampleSize: 16,
+    }, video: false });
+  } catch (e) {
+    state.call.phase = 'error';
+    state.call.permission = 'denied';
+    state.call.error = 'microphone permission denied: ' + e.message;
+    render();
+    return;
+  }
+  voiceClient.micStream = stream;
+  state.call.permission = 'granted';
+
+  // 2) AudioContext for capture + worklet. Native rate (usually 48 kHz);
+  //    the worklet downsamples to 16 kHz.
+  const InputCtx = window.AudioContext || window.webkitAudioContext;
+  voiceClient.micCtx = new InputCtx();
+  try {
+    await voiceClient.micCtx.audioWorklet.addModule('/voice-worklet.js');
+  } catch (e) {
+    state.call.phase = 'error';
+    state.call.error = 'audio worklet load failed: ' + e.message;
+    hangUpLocal();
+    render();
+    return;
+  }
+  voiceClient.micSource = voiceClient.micCtx.createMediaStreamSource(stream);
+  voiceClient.workletNode = new AudioWorkletNode(voiceClient.micCtx, 'voice-capture');
+  voiceClient.micSource.connect(voiceClient.workletNode);
+  // Worklet doesn't have an audio output we care about, but Chrome
+  // requires a sink for the graph to actually pump. Connect to a muted
+  // gain so the loop spins without echoing the mic back.
+  const muted = voiceClient.micCtx.createGain();
+  muted.gain.value = 0;
+  voiceClient.workletNode.connect(muted);
+  muted.connect(voiceClient.micCtx.destination);
+
+  // 3) Output AudioContext. 24 kHz matches Gemini's native output rate
+  //    so we can hand AudioBuffers in unchanged; the engine resamples up
+  //    to whatever the output device wants (BTR11 over LDAC typically
+  //    runs 96 kHz/24-bit, so we hand off as much upstream fidelity as
+  //    possible).
+  const OutputCtx = window.AudioContext || window.webkitAudioContext;
+  voiceClient.ctx = new OutputCtx({ sampleRate: 24000, latencyHint: 'interactive' });
+  voiceClient.nextPlaybackAt = 0;
+
+  // 3a) Anchor a MediaSession so the BTR11's play/pause button (and any
+  //     other Bluetooth headset's transport buttons) route to us. We
+  //     attach a silent looping AudioBufferSource to an <audio> element
+  //     via MediaStreamDestination — the browser sees a media element
+  //     "playing audio" and registers our app on the OS media key bus.
+  setupMediaSessionAnchor();
+  // 3b) Audible duck anchor: low-level pink noise routed through the
+  //     output graph. Tickles the OS audio session so cooperating apps
+  //     auto-pause. Honors state.call.duck (default on).
+  if (state.call.duck) setupDuckAnchor();
+
+  // 4) WebSocket — same origin, same cookie auth as the rest of the API.
+  const wsProto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  const ws = new WebSocket(wsProto + '//' + location.host + '/v1/voice/ws');
+  ws.binaryType = 'arraybuffer';
+  voiceClient.ws = ws;
+
+  // Mic frames from the worklet → WS binary frames. Drop frames if the
+  // socket isn't open yet (a few are normal during the handshake).
+  voiceClient.workletNode.port.onmessage = (e) => {
+    if (state.call.mute) return;
+    if (ws.readyState === WebSocket.OPEN) {
+      ws.send(e.data);
+    }
+  };
+
+  ws.onopen = () => {
+    ws.send(JSON.stringify({ type: 'start' }));
+  };
+  ws.onmessage = (e) => {
+    if (e.data instanceof ArrayBuffer) {
+      scheduleVoicePlayback(e.data);
+      return;
+    }
+    try {
+      const msg = JSON.parse(e.data);
+      handleVoiceServerMsg(msg);
+    } catch (_) { /* ignore */ }
+  };
+  ws.onerror = () => {
+    state.call.error = 'websocket error';
+  };
+  ws.onclose = (e) => {
+    // Server hangs up after 409 with code 1008 (policy violation). The
+    // ws.onmessage handler will already have populated activeCallElsewhere.
+    if (e.code === 1008 && !state.call.activeCallElsewhere) {
+      state.call.error = e.reason || 'duplicate session';
+    }
+    hangUpLocal();
+    render();
+  };
+
+  state.call.active = true;
+}
+
+function handleVoiceServerMsg(msg) {
+  switch (msg.type) {
+    case 'state':
+      state.call.phase = msg.value || 'listening';
+      if (msg.call_id) state.call.callId = msg.call_id;
+      break;
+    case 'transcript':
+      state.call.transcript.push({ role: msg.role || 'assistant', text: msg.text || '' });
+      // Cap transcript so a long call doesn't bloat the DOM.
+      if (state.call.transcript.length > 200) {
+        state.call.transcript = state.call.transcript.slice(-200);
+      }
+      break;
+    case 'tool_call':
+      state.call.toolCalls.push({ name: msg.name, args: msg.args });
+      if (state.call.toolCalls.length > 50) {
+        state.call.toolCalls = state.call.toolCalls.slice(-50);
+      }
+      break;
+    case 'error':
+      state.call.error = msg.message || 'unknown error';
+      state.call.phase = 'error';
+      break;
+    case 'hangup':
+      state.call.error = msg.reason || '';
+      break;
+  }
+  render();
+}
+
+// setupMediaSessionAnchor anchors a Now Playing session so the BTR11's
+// hardware play/pause routes to our MediaSession handlers instead of
+// falling through to Siri / the OS media-key default. Async because we
+// only want to claim the anchor was successful after the <audio>
+// element actually fires 'playing' — the macOS Now Playing service is
+// registered at that point, not at .play() invocation. Idempotent.
+//
+// macOS specifics that bit us:
+//   * Stream-sourced media (createMediaStreamDestination) is NOT enough
+//     — Safari and Chrome both refuse to register Now Playing for it.
+//   * Pure-zero silent WAVs sometimes register, sometimes don't —
+//     Chrome's media-focus tracker uses a "really playing audio?"
+//     heuristic. We dither the buffer at -78 dBFS so it's literally
+//     inaudible (one LSB worth of signal) but unambiguously non-silent.
+//   * The metadata must be set BEFORE play() on Safari; setting it
+//     after play() works in Chrome but Safari silently no-ops.
+//   * Some macOS releases keep routing media keys to the previously-
+//     active media app (Music, Spotify) until *they* are paused. If
+//     hardwareReady stays false even after the anchor reports playing,
+//     that's the path to check.
+async function setupMediaSessionAnchor() {
+  if (voiceClient.silentAudioEl) return;
+
+  // 1) Tell the OS who we are *before* play() — Safari requirement.
+  //    Register action handlers in the same gesture frame so the
+  //    Now Playing slot is fully armed the instant the audio starts.
+  if ('mediaSession' in navigator) {
+    try {
+      navigator.mediaSession.metadata = new MediaMetadata({
+        title:  'toolyard live call',
+        artist: 'maestro',
+        album:  'voice control',
+      });
+      navigator.mediaSession.setActionHandler('pause', () => toggleMuteFromHardware('muted'));
+      navigator.mediaSession.setActionHandler('play',  () => toggleMuteFromHardware('live'));
+      navigator.mediaSession.setActionHandler('stop',  () => endCall());
+    } catch { /* older browsers — fall back silently */ }
+  }
+
+  // 2) Synthesize a 5-second 8 kHz mono WAV with 1-LSB dither so it
+  //    reads as "real audio" to every browser's media-focus heuristic.
+  const blob = createSilentWavBlob(5.0);
+  const url = URL.createObjectURL(blob);
+  const audio = document.createElement('audio');
+  audio.src = url;
+  audio.loop = true;
+  audio.preload = 'auto';
+  audio.autoplay = true;
+  audio.controls = false;
+  audio.style.display = 'none';
+  // Inaudible to a human but non-zero amplitude. Setting volume=0 or
+  // .muted=true makes Safari skip Now Playing registration.
+  audio.volume = 0.02;
+  audio.disableRemotePlayback = true;
+  document.body.appendChild(audio);
+  voiceClient.silentAudioEl = audio;
+  voiceClient.silentAudioURL = url;
+
+  // 3) Listen for the actual 'playing' event so we know the OS has
+  //    registered our Now Playing slot. If we don't see it within
+  //    1.5 s, surface that in the UI so the user can investigate
+  //    (autoplay blocked, another app holding focus, etc.).
+  let playingFired = false;
+  audio.addEventListener('playing', () => {
+    playingFired = true;
+    state.call.hardwareReady = true;
+    state.call.hardwareWhy = '';
+    if ('mediaSession' in navigator) {
+      try { navigator.mediaSession.playbackState = 'playing'; } catch {}
+    }
+    render();
+  });
+
+  try {
+    await audio.play();
+  } catch (e) {
+    state.call.hardwareReady = false;
+    state.call.hardwareWhy = 'autoplay blocked: ' + (e.message || e.name || 'unknown');
+    render();
+    return;
+  }
+  // If play() resolved but 'playing' didn't fire within 1.5s, something
+  // else is in the way (e.g. another app owns Now Playing on macOS).
+  setTimeout(() => {
+    if (!playingFired) {
+      state.call.hardwareReady = false;
+      state.call.hardwareWhy = 'Now Playing not claimed — quit Music/Spotify if open, or try Cmd-Shift-R to hard-refresh.';
+      render();
+    }
+  }, 1500);
+}
+
+function teardownMediaSessionAnchor() {
+  if ('mediaSession' in navigator) {
+    try {
+      navigator.mediaSession.setActionHandler('play',  null);
+      navigator.mediaSession.setActionHandler('pause', null);
+      navigator.mediaSession.setActionHandler('stop',  null);
+      navigator.mediaSession.playbackState = 'none';
+      navigator.mediaSession.metadata = null;
+    } catch {}
+  }
+  if (voiceClient.silentAudioEl) {
+    try { voiceClient.silentAudioEl.pause(); } catch {}
+    try { voiceClient.silentAudioEl.removeAttribute('src'); } catch {}
+    try { voiceClient.silentAudioEl.load(); } catch {}
+    try { voiceClient.silentAudioEl.remove(); } catch {}
+    voiceClient.silentAudioEl = null;
+  }
+  if (voiceClient.silentAudioURL) {
+    try { URL.revokeObjectURL(voiceClient.silentAudioURL); } catch {}
+    voiceClient.silentAudioURL = null;
+  }
+}
+
+// createSilentWavBlob returns a tiny mono 8 kHz 16-bit silent WAV. Used
+// solely as the Now Playing anchor — content is 0-valued samples so it's
+// inaudible even at volume 1.0; we still play it at volume ~0.001 for
+// extra paranoia on browsers that scan the buffer.
+function createSilentWavBlob(durationSec) {
+  const rate = 8000;
+  const numFrames = Math.max(1, Math.floor(rate * durationSec));
+  const dataBytes = numFrames * 2;
+  const buf = new ArrayBuffer(44 + dataBytes);
+  const view = new DataView(buf);
+  let p = 0;
+  const wstr = (s) => { for (let i = 0; i < s.length; i++) view.setUint8(p++, s.charCodeAt(i)); };
+  const u32 = (n) => { view.setUint32(p, n, true); p += 4; };
+  const u16 = (n) => { view.setUint16(p, n, true); p += 2; };
+  wstr('RIFF'); u32(36 + dataBytes); wstr('WAVE');
+  wstr('fmt '); u32(16); u16(1); u16(1); u32(rate); u32(rate * 2); u16(2); u16(16);
+  wstr('data'); u32(dataBytes);
+  // Dither the samples at 1 LSB so the buffer reads as "real audio" to
+  // browser media-focus heuristics without being audible (1 LSB at 16-
+  // bit is ~-96 dBFS; combined with our 2% gain that's ~-130 dBFS at
+  // the speakers — well below the noise floor of any DAC).
+  for (let i = 0; i < numFrames; i++) {
+    view.setInt16(44 + i * 2, (i & 1) ? 1 : -1, true);
+  }
+  return new Blob([buf], { type: 'audio/wav' });
+}
+
+// toggleMuteFromHardware is the MediaSession-side handler. The optional
+// `intent` argument matches what the user pressed: 'muted' means "they
+// pressed pause", 'live' means "they pressed play". On a BTR11 single-
+// button toggle, only one of the two fires per press depending on the
+// browser's current playbackState — we flip state.call.mute accordingly
+// and play the appropriate cue.
+function toggleMuteFromHardware(intent) {
+  if (!state.call.active) return;
+  const wantMuted = intent === 'muted' ? true : intent === 'live' ? false : !state.call.mute;
+  if (state.call.mute === wantMuted) return;
+  state.call.mute = wantMuted;
+  if (voiceClient.ws && voiceClient.ws.readyState === WebSocket.OPEN) {
+    try { voiceClient.ws.send(JSON.stringify({ type: 'mute', mute: wantMuted })); } catch {}
+  }
+  // Ramp the duck anchor down on mute → music auto-resumes; back up
+  // on unmute → music auto-pauses.
+  rampDuckGain(wantMuted ? 0 : DUCK_LIVE_GAIN);
+  playMuteCue(wantMuted ? 'muted' : 'live');
+  // Keep MediaSession state coherent so the next button press fires the
+  // opposite handler (the BTR11's single button toggles).
+  if ('mediaSession' in navigator) {
+    try {
+      navigator.mediaSession.playbackState = wantMuted ? 'paused' : 'playing';
+    } catch {}
+  }
+  render();
+}
+
+// playMuteCue emits a short two-tone chirp through the output graph so
+// the user gets unambiguous audible confirmation that the mic state
+// changed — important on a hardware button press where there's no
+// visual cue if the dashboard isn't in front.
+//
+//   'muted': descending (880 → 440 Hz) — "going to sleep"
+//   'live' : ascending  (440 → 880 Hz) — "waking up, you're hot"
+function playMuteCue(state) {
+  const ctx = voiceClient.ctx;
+  if (!ctx) return;
+  const tones = state === 'muted' ? [880, 440] : [440, 880];
+  const each = 0.06; // 60 ms per tone
+  const now = ctx.currentTime;
+  tones.forEach((freq, i) => {
+    const osc = ctx.createOscillator();
+    const gain = ctx.createGain();
+    osc.type = 'sine';
+    osc.frequency.value = freq;
+    const t0 = now + i * each;
+    // Short attack + release envelope so the cue doesn't click.
+    gain.gain.setValueAtTime(0, t0);
+    gain.gain.linearRampToValueAtTime(0.18, t0 + 0.008);
+    gain.gain.setValueAtTime(0.18, t0 + each - 0.012);
+    gain.gain.linearRampToValueAtTime(0, t0 + each);
+    osc.connect(gain);
+    gain.connect(ctx.destination);
+    osc.start(t0);
+    osc.stop(t0 + each + 0.02);
+  });
+}
+
+// Target gain for the duck anchor when mic is live. -50 dBFS ≈ 0.003.
+// Subjectively well below speech but unambiguously non-silent so the OS
+// audio session activates. Bumping this higher makes more apps notice
+// (some have a higher threshold) at the cost of perceptible hiss.
+const DUCK_LIVE_GAIN = 0.003;
+
+// setupDuckAnchor creates the pink-noise source + gain node and wires
+// it into ctx.destination. Idempotent; bails if already running or the
+// AudioContext isn't ready.
+function setupDuckAnchor() {
+  const ctx = voiceClient.ctx;
+  if (!ctx || voiceClient.duckNoiseSrc) return;
+
+  // 3 seconds of pink noise (Voss-McCartney approximation) baked into a
+  // looping buffer. 3 s is long enough that the loop seam isn't a
+  // perceptible click; short enough that buffer alloc is instant.
+  const seconds = 3;
+  const buf = ctx.createBuffer(1, ctx.sampleRate * seconds, ctx.sampleRate);
+  const data = buf.getChannelData(0);
+  let b0 = 0, b1 = 0, b2 = 0, b3 = 0, b4 = 0, b5 = 0, b6 = 0;
+  for (let i = 0; i < data.length; i++) {
+    const w = Math.random() * 2 - 1;
+    b0 = 0.99886 * b0 + w * 0.0555179;
+    b1 = 0.99332 * b1 + w * 0.0750759;
+    b2 = 0.96900 * b2 + w * 0.1538520;
+    b3 = 0.86650 * b3 + w * 0.3104856;
+    b4 = 0.55000 * b4 + w * 0.5329522;
+    b5 = -0.7616 * b5 - w * 0.0168980;
+    data[i] = (b0 + b1 + b2 + b3 + b4 + b5 + b6 + w * 0.5362) * 0.11;
+    b6 = w * 0.115926;
+  }
+
+  const src = ctx.createBufferSource();
+  src.buffer = buf;
+  src.loop = true;
+  const gain = ctx.createGain();
+  gain.gain.value = state.call.mute ? 0 : DUCK_LIVE_GAIN;
+  src.connect(gain);
+  gain.connect(ctx.destination);
+  src.start();
+  voiceClient.duckNoiseSrc = src;
+  voiceClient.duckGain = gain;
+}
+
+function teardownDuckAnchor() {
+  if (voiceClient.duckNoiseSrc) {
+    try { voiceClient.duckNoiseSrc.stop(); } catch {}
+    try { voiceClient.duckNoiseSrc.disconnect(); } catch {}
+    voiceClient.duckNoiseSrc = null;
+  }
+  if (voiceClient.duckGain) {
+    try { voiceClient.duckGain.disconnect(); } catch {}
+    voiceClient.duckGain = null;
+  }
+}
+
+// rampDuckGain transitions the duck noise volume smoothly. Linear over
+// 50 ms — long enough to avoid a click, short enough that the cue +
+// gain change feel simultaneous from the user's perspective.
+function rampDuckGain(target) {
+  if (!voiceClient.duckGain || !voiceClient.ctx) return;
+  const t = voiceClient.ctx.currentTime;
+  const g = voiceClient.duckGain.gain;
+  try {
+    g.cancelScheduledValues(t);
+    g.setValueAtTime(g.value, t);
+    g.linearRampToValueAtTime(target, t + 0.05);
+  } catch {
+    g.value = target;
+  }
+}
+
+function scheduleVoicePlayback(buf) {
+  const ctx = voiceClient.ctx;
+  if (!ctx) return;
+  const i16 = new Int16Array(buf);
+  if (i16.length === 0) return;
+  // int16 → float32 [-1, 1]
+  const f32 = new Float32Array(i16.length);
+  for (let i = 0; i < i16.length; i++) {
+    f32[i] = i16[i] < 0 ? i16[i] / 0x8000 : i16[i] / 0x7fff;
+  }
+  const ab = ctx.createBuffer(1, f32.length, 24000);
+  ab.copyToChannel(f32, 0);
+  const src = ctx.createBufferSource();
+  src.buffer = ab;
+  src.connect(ctx.destination);
+  // Schedule back-to-back. If we've slipped behind real time (network
+  // hiccup), restart from "now" so we don't lag forever; the user will
+  // hear a tiny gap once.
+  const now = ctx.currentTime;
+  if (voiceClient.nextPlaybackAt < now) voiceClient.nextPlaybackAt = now;
+  src.start(voiceClient.nextPlaybackAt);
+  voiceClient.nextPlaybackAt += f32.length / 24000;
+}
+
+async function endCall() {
+  if (voiceClient.ws && voiceClient.ws.readyState === WebSocket.OPEN) {
+    try { voiceClient.ws.send(JSON.stringify({ type: 'hangup' })); } catch {}
+    try { voiceClient.ws.close(1000, 'user'); } catch {}
+  } else {
+    // No live WS but flag may be stale (server-side); call hangup REST
+    // so a leftover server-side session is cleaned up cleanly.
+    try { await api('/v1/voice/hangup', { method: 'POST', body: {} }); } catch {}
+  }
+  hangUpLocal();
+  render();
+}
+
+function hangUpLocal() {
+  teardownMediaSessionAnchor();
+  teardownDuckAnchor();
+  if (voiceClient.workletNode) {
+    try { voiceClient.workletNode.port.onmessage = null; } catch {}
+    try { voiceClient.workletNode.disconnect(); } catch {}
+    voiceClient.workletNode = null;
+  }
+  if (voiceClient.micSource) {
+    try { voiceClient.micSource.disconnect(); } catch {}
+    voiceClient.micSource = null;
+  }
+  if (voiceClient.micStream) {
+    voiceClient.micStream.getTracks().forEach((t) => t.stop());
+    voiceClient.micStream = null;
+  }
+  if (voiceClient.micCtx) {
+    try { voiceClient.micCtx.close(); } catch {}
+    voiceClient.micCtx = null;
+  }
+  if (voiceClient.ctx) {
+    try { voiceClient.ctx.close(); } catch {}
+    voiceClient.ctx = null;
+  }
+  voiceClient.ws = null;
+  voiceClient.nextPlaybackAt = 0;
+  state.call.active = false;
+  state.call.phase = 'idle';
+  state.call.callId = null;
+  state.call.mute = false;
+  state.call.hardwareReady = false;
+  state.call.hardwareWhy = '';
+}
+
+async function hangUpOtherAndStart() {
+  try { await api('/v1/voice/hangup', { method: 'POST', body: {} }); } catch (e) {
+    state.call.error = e.message; render(); return;
+  }
+  state.call.activeCallElsewhere = null;
+  await startCall();
+}
+
+function viewCall() {
+  const c = state.call;
+  const phaseColor = {
+    idle:        '#888',
+    connecting:  '#f0c75e',
+    listening:   '#4caf50',
+    thinking:    '#5b8def',
+    speaking:    '#b87bff',
+    error:       '#e06060',
+  }[c.phase] || '#888';
+
+  const intro = el('p', { class: 'meta' },
+    'Talk to Claude through Maestro. Mic goes from this device to the gateway, ' +
+    'through Gemini Live, into a tmux+claude session named mae-*. End the call ' +
+    'and the session keeps running — `tmux attach -t mae-<name>` to take over. ' +
+    'Bluetooth headset play/pause (e.g. FiiO BTR11) toggles mute; you\'ll hear ' +
+    'a descending chirp when muted, ascending when live again. With music auto-' +
+    'pause on, a faint masking tone plays while you\'re live so cooperating ' +
+    'apps (Spotify, Music) auto-pause themselves; muting silences the tone ' +
+    'and they resume.');
+
+  const phasePill = el('div', { class: 'row', style: 'align-items: center; gap: 8px; margin: 8px 0; flex-wrap: wrap;' },
+    el('span', { class: 'mic-dot', style: 'background:' + phaseColor }),
+    el('strong', {}, c.phase.toUpperCase()),
+    c.callId ? el('span', { class: 'meta' }, '· ' + c.callId.slice(0, 8)) : null,
+    c.active && c.duck ? el('span', { class: 'meta' }, '🎵 masking on') : null,
+    c.active ? el('span', { class: 'meta', style: 'margin-left: auto;' },
+      c.hardwareReady
+        ? '🎛 BTR11 button armed'
+        : (c.hardwareWhy ? '⚠ ' + c.hardwareWhy : '⚠ BTR11 button not armed yet')
+    ) : null,
+  );
+
+  // Duck preference toggle. Honored at next call start — toggling
+  // mid-call won't switch the anchor on/off (cheap restart by ending
+  // and re-calling if you really want to).
+  const duckRow = c.active ? null : el('label', {
+    class: 'row',
+    style: 'gap: 8px; align-items: center; margin: 6px 0 0;',
+  },
+    el('input', {
+      type: 'checkbox',
+      checked: !!c.duck,
+      on: { change: (e) => {
+        state.call.duck = e.target.checked;
+        try { localStorage.setItem('toolyard.call.duck', e.target.checked ? '1' : '0'); } catch {}
+      }},
+    }),
+    el('span', {}, 'Auto-pause background music while my mic is live (plays a soft masking tone)'),
+  );
+
+  const errBox = c.error
+    ? el('div', { class: 'err', style: 'margin: 8px 0;' }, c.error)
+    : null;
+
+  // 409 — server says another call is active for this user.
+  const dupBox = c.activeCallElsewhere
+    ? el('div', { class: 'card', style: 'border-color: #c2853f;' },
+        el('h3', {}, 'A call is already active'),
+        el('p', { class: 'meta' }, 'You\'ve got an open call elsewhere (call ' + c.activeCallElsewhere.call_id.slice(0,8) + '). End it and start fresh?'),
+        el('div', { class: 'row' },
+          el('button', { class: 'primary', on: { click: hangUpOtherAndStart } }, 'Hang up & start new'),
+          el('button', { on: { click: () => { state.call.activeCallElsewhere = null; render(); }}}, 'Cancel'),
+        ),
+      )
+    : null;
+
+  const buttons = c.active
+    ? el('div', { class: 'row' },
+        el('button', {
+          class: c.mute ? 'primary' : '',
+          on: { click: () => toggleMuteFromHardware(c.mute ? 'live' : 'muted') },
+        }, c.mute ? 'Unmute' : 'Mute'),
+        el('button', { class: 'danger', on: { click: endCall } }, 'End call'),
+      )
+    : el('div', { class: 'row' },
+        el('button', {
+          class: 'primary',
+          style: 'min-height: 56px; min-width: 180px; font-size: 16px;',
+          on: { click: startCall },
+        }, '🎙 Start call'),
+      );
+
+  const transcriptBlock = c.transcript.length === 0
+    ? null
+    : el('div', { class: 'card' },
+        el('h3', {}, 'Transcript'),
+        el('div', { class: 'transcript' },
+          c.transcript.map((row) => el('div', { class: 'transcript-row ' + (row.role === 'user' ? 'user' : 'assistant') },
+            el('span', { class: 'meta' }, row.role + ': '),
+            el('span', {}, row.text),
+          )),
+        ),
+      );
+
+  const toolsBlock = c.toolCalls.length === 0
+    ? null
+    : el('div', { class: 'card' },
+        el('h3', {}, 'Tool calls'),
+        el('ul', {}, c.toolCalls.map((t) => el('li', {},
+          el('code', {}, t.name),
+          t.args ? el('span', { class: 'meta' }, ' ' + t.args) : null,
+        ))),
+      );
+
+  return el('div', {},
+    el('div', { class: 'card' },
+      el('h2', {}, 'Live call'),
+      intro,
+      phasePill,
+      errBox,
+      buttons,
+      duckRow,
+    ),
+    dupBox,
+    transcriptBlock,
+    toolsBlock,
+  );
+}
+
 
 // Pre-load OAuth status for any visible upstreams.
 async function preloadOAuthStatus() {
