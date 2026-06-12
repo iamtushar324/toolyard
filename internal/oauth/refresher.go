@@ -64,11 +64,15 @@ func (s *Service) RunRefresher(ctx context.Context) {
 }
 
 func (s *Service) refreshTick(ctx context.Context) {
+	// refresh_token_enc IS NOT NULL: long-lived tokens with no refresh
+	// token (e.g. Linear) must be left alone — refreshing them can only
+	// fail and would wrongly flip the upstream to needs_reauth. A real
+	// 401 from the upstream still triggers reauth via MarkReauthExternal.
 	rows, err := s.db.QueryContext(ctx, `
         SELECT upstream_name, COALESCE(access_expires_at,0), COALESCE(last_refresh_at,0),
                refresh_failures, state, is_pat
         FROM oauth_tokens
-        WHERE state IN (?, ?)
+        WHERE state IN (?, ?) AND is_pat = 0 AND refresh_token_enc IS NOT NULL
     `, StateActive, StateRefreshing)
 	if err != nil {
 		log.Printf("oauth refresher: query: %v", err)

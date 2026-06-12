@@ -17,6 +17,45 @@ type EnvVar struct {
 	Default string `json:"default,omitempty"`
 }
 
+// AuthChoice is one selectable value for an AuthOption.
+type AuthChoice struct {
+	Value       string `json:"value"`
+	Label       string `json:"label"`
+	Description string `json:"description,omitempty"`
+}
+
+// AuthOption is a user-facing toggle in the install modal that maps to a
+// single extra authorize-URL query param (e.g. Linear's actor=app|user).
+type AuthOption struct {
+	Param   string       `json:"param"`
+	Label   string       `json:"label"`
+	Default string       `json:"default"`
+	Choices []AuthChoice `json:"choices"`
+}
+
+// AuthPreset describes how a catalog entry authenticates. Endpoints are
+// compiled in so fresh deployments can complete OAuth with zero discovery.
+type AuthPreset struct {
+	Issuer                string `json:"issuer,omitempty"`
+	AuthorizationEndpoint string `json:"authorization_endpoint"`
+	TokenEndpoint         string `json:"token_endpoint"`
+	// Scope is the exact value of the authorize scope param. Opaque to
+	// toolyard and MUST NOT contain spaces (Linear separates with commas).
+	Scope   string       `json:"scope,omitempty"`
+	Options []AuthOption `json:"options,omitempty"`
+	// ClientSetupURL is where the operator creates their own OAuth app.
+	ClientSetupURL string `json:"client_setup_url,omitempty"`
+	// SupportsManaged: the provider supports discovery + dynamic client
+	// registration via the existing /oauth/discover flow.
+	SupportsManaged bool `json:"supports_managed"`
+	// SupportsPAT: a personal API key works via the /oauth/pat flow.
+	SupportsPAT bool   `json:"supports_pat"`
+	PATHint     string `json:"pat_hint,omitempty"`
+	// MultiInstance: it makes sense to install this entry several times
+	// (one per account/workspace); the dashboard keeps offering "Add".
+	MultiInstance bool `json:"multi_instance"`
+}
+
 // Entry is one curated MCP server recipe.
 type Entry struct {
 	ID          string   `json:"id"`
@@ -35,6 +74,8 @@ type Entry struct {
 	SuggestedName string `json:"suggested_name"`
 	// Notes is shown beneath the description in the dashboard.
 	Notes string `json:"notes,omitempty"`
+	// Auth, when set, drives the OAuth section of the install modal.
+	Auth *AuthPreset `json:"auth,omitempty"`
 }
 
 // Catalog returns the curated list. Built once per call so it stays
@@ -128,13 +169,33 @@ func Catalog() []Entry {
 			ID:            "linear",
 			Name:          "Linear (hosted)",
 			Tagline:       "Linear's official MCP server",
-			Description:   "Linear runs a hosted MCP endpoint with full OAuth. Toolyard treats it like any other streamable-HTTP upstream.",
+			Description:   "Linear runs a hosted MCP endpoint at mcp.linear.app. Authorize with Linear-managed OAuth, your own Linear OAuth app (optionally as the app itself, service-account style), or a plain API key.",
 			Category:      "Productivity",
-			Homepage:      "https://linear.app/changelog/2025-mcp",
+			Homepage:      "https://linear.app/docs/mcp",
 			Transport:     "http",
 			URL:           "https://mcp.linear.app/mcp",
 			SuggestedName: "linear",
-			Notes:         "Linear handles auth — open the URL in a browser to grant access.",
+			Notes:         "Install once per Linear account/workspace — each instance keeps its own credentials. With \"Authorize as: App\", issues and comments are attributed to your OAuth app instead of a user.",
+			Auth: &AuthPreset{
+				Issuer:                "https://linear.app",
+				AuthorizationEndpoint: "https://linear.app/oauth/authorize",
+				TokenEndpoint:         "https://api.linear.app/oauth/token",
+				Scope:                 "read,write,issues:create,comments:create",
+				Options: []AuthOption{{
+					Param:   "actor",
+					Label:   "Authorize as",
+					Default: "app",
+					Choices: []AuthChoice{
+						{Value: "app", Label: "App", Description: "Issues/comments attributed to the OAuth app (service account)"},
+						{Value: "user", Label: "User", Description: "Attributed to the authorizing user"},
+					},
+				}},
+				ClientSetupURL:  "https://linear.app/settings/api/applications",
+				SupportsManaged: true,
+				SupportsPAT:     true,
+				PATHint:         "Linear API key (lin_api_…) from linear.app/settings/api",
+				MultiInstance:   true,
+			},
 		},
 		{
 			ID:          "slack",

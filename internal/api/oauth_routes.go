@@ -129,15 +129,17 @@ func (s *Server) oauthManualClient(w http.ResponseWriter, r *http.Request, name 
 		return
 	}
 	var body struct {
-		ClientID                    string   `json:"client_id"`
-		ClientSecret                string   `json:"client_secret"`
-		RedirectURI                 string   `json:"redirect_uri"`
-		Scopes                      []string `json:"scopes"`
-		AuthorizationEndpoint       string   `json:"authorization_endpoint"`
-		TokenEndpoint               string   `json:"token_endpoint"`
-		RevocationEndpoint          string   `json:"revocation_endpoint"`
-		DeviceAuthorizationEndpoint string   `json:"device_authorization_endpoint"`
-		Issuer                      string   `json:"issuer"`
+		ClientID                    string            `json:"client_id"`
+		ClientSecret                string            `json:"client_secret"`
+		RedirectURI                 string            `json:"redirect_uri"`
+		Scopes                      []string          `json:"scopes"`
+		AuthorizationEndpoint       string            `json:"authorization_endpoint"`
+		TokenEndpoint               string            `json:"token_endpoint"`
+		RevocationEndpoint          string            `json:"revocation_endpoint"`
+		DeviceAuthorizationEndpoint string            `json:"device_authorization_endpoint"`
+		Issuer                      string            `json:"issuer"`
+		TokenEndpointAuthMethod     string            `json:"token_endpoint_auth_method"`
+		ExtraAuthorizeParams        map[string]string `json:"extra_authorize_params"`
 	}
 	if err := decode(r, &body); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
@@ -180,6 +182,15 @@ func (s *Server) oauthManualClient(w http.ResponseWriter, r *http.Request, name 
 	if body.ClientSecret != "" {
 		authMethod = "client_secret_post"
 	}
+	if body.TokenEndpointAuthMethod != "" {
+		switch body.TokenEndpointAuthMethod {
+		case "none", "client_secret_post", "client_secret_basic":
+			authMethod = body.TokenEndpointAuthMethod
+		default:
+			writeError(w, http.StatusBadRequest, "token_endpoint_auth_method must be none, client_secret_post or client_secret_basic")
+			return
+		}
+	}
 	rec := oauth.ClientRecord{
 		UpstreamName:                name,
 		Issuer:                      body.Issuer,
@@ -192,6 +203,7 @@ func (s *Server) oauthManualClient(w http.ResponseWriter, r *http.Request, name 
 		RedirectURI:                 body.RedirectURI,
 		Scopes:                      body.Scopes,
 		TokenEndpointAuthMethod:     authMethod,
+		ExtraAuthorizeParams:        body.ExtraAuthorizeParams,
 	}
 	if err := s.oauth.PutClient(r.Context(), rec); err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
@@ -534,6 +546,9 @@ func (s *Server) oauthStatus(w http.ResponseWriter, r *http.Request, name string
 		out["redirect_uri"] = cli.RedirectURI
 		out["device_supported"] = cli.DeviceAuthorizationEndpoint != ""
 		out["client_id"] = cli.ClientID
+		if len(cli.ExtraAuthorizeParams) > 0 {
+			out["extra_authorize_params"] = cli.ExtraAuthorizeParams
+		}
 	}
 	if tok != nil {
 		out["state"] = tok.State

@@ -59,9 +59,21 @@ type fakeIdP struct {
 	// don't need to wait long.
 	shortLifetime atomic.Bool
 
+	// noRefreshNoExpiry makes issueToken omit refresh_token and expires_in,
+	// mimicking long-lived tokens (e.g. Linear) that must not be refreshed.
+	noRefreshNoExpiry atomic.Bool
+
 	// lastTokenAuth captures whether the last /token request had a code_verifier
 	// and a refresh_token grant. The PKCE assertion test reads it.
 	lastTokenAuth string
+
+	// lastAuthorizeQuery is the raw query of the most recent /authorize hit
+	// (mu-guarded). Extra-param tests read it.
+	lastAuthorizeQuery url.Values
+
+	// lastClientSecret is the client_secret form value of the most recent
+	// /token hit (mu-guarded).
+	lastClientSecret string
 
 	// counters — exposed for assertions.
 	tokenHits   atomic.Int64
@@ -148,6 +160,7 @@ func (f *fakeIdP) handleAuthorize(w http.ResponseWriter, r *http.Request) {
 	code := "code-" + randHex(8)
 	f.mu.Lock()
 	f.codes[code] = q.Get("client_id")
+	f.lastAuthorizeQuery = q
 	f.mu.Unlock()
 	redirect := q.Get("redirect_uri") + "?code=" + url.QueryEscape(code) + "&state=" + url.QueryEscape(q.Get("state"))
 	http.Redirect(w, r, redirect, http.StatusFound)
@@ -159,6 +172,9 @@ func (f *fakeIdP) handleToken(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	f.tokenHits.Add(1)
+	f.mu.Lock()
+	f.lastClientSecret = r.PostForm.Get("client_secret")
+	f.mu.Unlock()
 	grant := r.PostForm.Get("grant_type")
 	switch grant {
 	case "authorization_code":
@@ -226,6 +242,9 @@ func (f *fakeIdP) issueToken(w http.ResponseWriter, clientID, scope string, incl
 	if f.shortLifetime.Load() {
 		ttl = 2
 	}
+	if f.noRefreshNoExpiry.Load() {
+		includeRefresh = false
+	}
 	exp := time.Now().Add(time.Duration(ttl) * time.Second)
 	tok := &fakeToken{clientID: clientID, scope: scope, expiresAt: exp}
 	f.mu.Lock()
@@ -238,8 +257,10 @@ func (f *fakeIdP) issueToken(w http.ResponseWriter, clientID, scope string, incl
 	out := map[string]any{
 		"access_token": at,
 		"token_type":   "Bearer",
-		"expires_in":   ttl,
 		"scope":        scope,
+	}
+	if !f.noRefreshNoExpiry.Load() {
+		out["expires_in"] = ttl
 	}
 	if rt != "" {
 		out["refresh_token"] = rt
@@ -701,6 +722,171 @@ func TestE2EOAuthManualClient(t *testing.T) {
 	st := oauthStatus(t, h, name)
 	if cid, _ := st["client_id"].(string); cid != "my-static-client" {
 		t.Errorf("manual client_id not persisted: %v", st)
+	}
+}
+
+// manualClientPreset seeds a BYO client the way the marketplace install
+// modal does: explicit endpoints (no discovery), client secret, opaque
+// comma-separated scope and extra authorize params.
+func manualClientPreset(t *testing.T, h *httpClient, name string, idp *fakeIdP, clientID string, extra map[string]string) {
+	t.Helper()
+	h.raw(t, "POST", "/v1/servers/"+url.PathEscape(name)+"/oauth/manual-client",
+		map[string]any{
+			"client_id":              clientID,
+			"client_secret":          "sec-" + clientID,
+			"issuer":                 idp.URL(),
+			"authorization_endpoint": idp.URL() + "/authorize",
+			"token_endpoint":         idp.URL() + "/token",
+			"scopes":                 []string{"read,write,issues:create"},
+			"extra_authorize_params": extra,
+		}, nil)
+}
+
+// TestE2EOAuthManualClientExtraParams: a preset BYO client (Linear-style)
+// carries actor=app into the authorize URL, keeps the comma-separated scope
+// opaque, drops the legacy access_type/prompt params, and exchanges the
+// code with the client_secret.
+func TestE2EOAuthManualClientExtraParams(t *testing.T) {
+	flag.Parse()
+	h := &httpClient{base: *toolyardURL}
+	mustLogin(t, h)
+	idp := newFakeIdP(t)
+	name := uniqueName("idp-actor")
+	addUpstream(t, h, name, idp.URL()+"/mcp")
+	defer removeUpstream(t, h, name)
+
+	manualClientPreset(t, h, name, idp, "linear-byo-client", map[string]string{"actor": "app"})
+
+	st := oauthStatus(t, h, name)
+	if cid, _ := st["client_id"].(string); cid != "linear-byo-client" {
+		t.Fatalf("manual client_id not persisted: %v", st)
+	}
+	if ext, _ := st["extra_authorize_params"].(map[string]any); ext == nil || ext["actor"] != "app" {
+		t.Errorf("extra_authorize_params not surfaced in status: %v", st)
+	}
+
+	authURL, _ := beginOAuth(t, h, name, "callback")
+	if !strings.Contains(authURL, "actor=app") {
+		t.Errorf("authorize URL missing actor=app: %s", authURL)
+	}
+	if !strings.Contains(authURL, "scope=read%2Cwrite%2Cissues%3Acreate") {
+		t.Errorf("authorize URL did not carry comma scope verbatim: %s", authURL)
+	}
+	if strings.Contains(authURL, "access_type=") || strings.Contains(authURL, "prompt=") {
+		t.Errorf("preset extras should replace legacy access_type/prompt params: %s", authURL)
+	}
+
+	code, state := driveAuthorize(t, h, authURL)
+	resp, err := http.Get(*toolyardURL + "/v1/mcp-oauth/callback?code=" +
+		url.QueryEscape(code) + "&state=" + url.QueryEscape(state))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resp.Body.Close()
+
+	st = oauthStatus(t, h, name)
+	if got, _ := st["state"].(string); got != "active" {
+		t.Errorf("expected active after callback, got %v", st)
+	}
+	idp.mu.Lock()
+	gotSecret := idp.lastClientSecret
+	idp.mu.Unlock()
+	if gotSecret != "sec-linear-byo-client" {
+		t.Errorf("token exchange did not send the client_secret, got %q", gotSecret)
+	}
+}
+
+// TestE2EOAuthNoRefreshTokenStaysActive: long-lived tokens with neither
+// refresh_token nor expires_in (Linear-style) must be left alone by the
+// background refresher rather than flipped to needs_reauth.
+func TestE2EOAuthNoRefreshTokenStaysActive(t *testing.T) {
+	flag.Parse()
+	if testing.Short() {
+		t.Skip("waits >2 refresher ticks")
+	}
+	h := &httpClient{base: *toolyardURL}
+	mustLogin(t, h)
+	idp := newFakeIdP(t)
+	idp.noRefreshNoExpiry.Store(true)
+	name := uniqueName("idp-norefresh")
+	addUpstream(t, h, name, idp.URL()+"/mcp")
+	defer removeUpstream(t, h, name)
+
+	manualClientPreset(t, h, name, idp, "norefresh-client", map[string]string{"actor": "app"})
+	authURL, _ := beginOAuth(t, h, name, "callback")
+	code, state := driveAuthorize(t, h, authURL)
+	resp, _ := http.Get(*toolyardURL + "/v1/mcp-oauth/callback?code=" + url.QueryEscape(code) +
+		"&state=" + url.QueryEscape(state))
+	resp.Body.Close()
+
+	if got, _ := oauthStatus(t, h, name)["state"].(string); got != "active" {
+		t.Fatalf("setup: expected active, got %v", got)
+	}
+
+	// Wait past two refresher ticks (RefresherTickEvery=30s). Before the
+	// refresh_token_enc IS NOT NULL guard, the refresher would have tried —
+	// and failed — to refresh this token by now.
+	time.Sleep(65 * time.Second)
+
+	st := oauthStatus(t, h, name)
+	if got, _ := st["state"].(string); got != "active" {
+		t.Errorf("no-refresh token flipped out of active: %v", st)
+	}
+	if rf, _ := st["refresh_failures"].(float64); rf != 0 {
+		t.Errorf("refresher touched a token without refresh_token: failures=%v (full: %v)", rf, st)
+	}
+	if hits := idp.refreshHits.Load(); hits != 0 {
+		t.Errorf("refresher hit the IdP %d times for a token with no refresh_token", hits)
+	}
+}
+
+// TestE2EOAuthTwoInstances: two upstreams of the same provider (multi-account
+// Linear case) run concurrent flows on the shared redirect URI and keep
+// independent clients + tokens.
+func TestE2EOAuthTwoInstances(t *testing.T) {
+	flag.Parse()
+	h := &httpClient{base: *toolyardURL}
+	mustLogin(t, h)
+	idp := newFakeIdP(t)
+	nameA := uniqueName("linear-a")
+	nameB := uniqueName("linear-b")
+	addUpstream(t, h, nameA, idp.URL()+"/mcp")
+	addUpstream(t, h, nameB, idp.URL()+"/mcp")
+	defer removeUpstream(t, h, nameA)
+	defer removeUpstream(t, h, nameB)
+
+	manualClientPreset(t, h, nameA, idp, "acct-a", map[string]string{"actor": "app"})
+	manualClientPreset(t, h, nameB, idp, "acct-b", map[string]string{"actor": "user"})
+
+	// Begin BOTH flows before completing either — two oauth_pending rows
+	// routed by state on the same callback URL.
+	authA, _ := beginOAuth(t, h, nameA, "callback")
+	authB, _ := beginOAuth(t, h, nameB, "callback")
+
+	codeA, stateA := driveAuthorize(t, h, authA)
+	codeB, stateB := driveAuthorize(t, h, authB)
+	for _, cs := range [][2]string{{codeA, stateA}, {codeB, stateB}} {
+		resp, err := http.Get(*toolyardURL + "/v1/mcp-oauth/callback?code=" +
+			url.QueryEscape(cs[0]) + "&state=" + url.QueryEscape(cs[1]))
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+	}
+
+	stA := oauthStatus(t, h, nameA)
+	stB := oauthStatus(t, h, nameB)
+	if got, _ := stA["state"].(string); got != "active" {
+		t.Errorf("instance A not active: %v", stA)
+	}
+	if got, _ := stB["state"].(string); got != "active" {
+		t.Errorf("instance B not active: %v", stB)
+	}
+	if cidA, _ := stA["client_id"].(string); cidA != "acct-a" {
+		t.Errorf("instance A client_id = %q, want acct-a", cidA)
+	}
+	if cidB, _ := stB["client_id"].(string); cidB != "acct-b" {
+		t.Errorf("instance B client_id = %q, want acct-b", cidB)
 	}
 }
 

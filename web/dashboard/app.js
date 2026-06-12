@@ -187,7 +187,7 @@ async function loadAll() {
       api('/v1/memory'),
       api('/v1/servers').catch(() => []),
       api('/v1/tools').catch(() => []),
-      api('/v1/marketplace').catch(() => []),
+      api('/v1/marketplace').catch(() => null),
       api('/v1/settings').catch(() => ({})),
       api('/v1/usage').catch(() => ({ per_tool: {}, rows: [] })),
       api('/v1/push/vapid_key').catch(() => null),
@@ -200,7 +200,10 @@ async function loadAll() {
     state.memory = memos || [];
     state.servers = servers || [];
     state.tools = tools || [];
-    state.marketplace = market || [];
+    // /v1/marketplace returns { entries, oauth_redirect_uri }; tolerate the
+    // legacy bare-array shape so a stale dashboard doesn't blank the tab.
+    state.marketplace = Array.isArray(market) ? market : ((market && market.entries) || []);
+    state.oauthRedirectURI = (market && market.oauth_redirect_uri) || '';
     state.vapidKey = vapid && vapid.public_key ? vapid.public_key : null;
     // Fire-and-forget — the badges fill in once the responses land.
     preloadOAuthStatus().then(() => render()).catch(() => {});
@@ -239,6 +242,9 @@ function handleOAuthDone(payload) {
   if (!name) return;
   if (state.oauthFlow && state.oauthFlow.name === name) {
     state.oauthFlow = null;
+  }
+  if (state.marketModal && state.marketModal.installedName === name) {
+    state.marketModal = null;
   }
   toast(name + ': authorized.');
   reloadServers().then(() => loadOAuthStatus(name)).then(render);
@@ -770,6 +776,11 @@ function viewServers() {
             const existing = installedByName.get(m.suggested_name);
             const needsEnv = (m.env || []).some((v) => v.required);
             const failed = existing && existing.last_status && existing.last_status !== 'ok';
+            const multi = !!(m.auth && m.auth.multi_instance);
+            const addBtn = el('button', {
+              class: 'primary',
+              on: { click: () => openMarketAdd(m, needsEnv) },
+            }, existing ? 'Add another' : ((needsEnv || m.auth) ? 'Configure & add' : 'Add'));
             return el('div', { class: 'market-card' + (existing && !failed ? ' installed' : '') },
               el('div', { class: 'title' },
                 el('span', { class: 'grow' }, m.name),
@@ -787,11 +798,11 @@ function viewServers() {
                           el('button', { on: { click: () => reconnectServer(existing.name) }}, 'Retry'),
                           el('button', { class: 'danger', on: { click: () => removeServer(existing.name) }}, 'Remove'),
                         )
-                      : el('span', { class: 'badge allowed' }, 'installed'))
-                  : el('button', {
-                      class: 'primary',
-                      on: { click: () => openMarketAdd(m, needsEnv) },
-                    }, needsEnv ? 'Configure & add' : 'Add'),
+                      : el('div', { class: 'row' },
+                          el('span', { class: 'badge allowed' }, 'installed'),
+                          multi ? addBtn : null,
+                        ))
+                  : addBtn,
               ),
             );
           })),
@@ -897,14 +908,38 @@ async function addServer() {
   } catch (e) { toast(e.message, 'error'); }
 }
 
+function uniqueServerName(base) {
+  const taken = new Set(state.servers.map((s) => s.name));
+  if (!taken.has(base)) return base;
+  for (let i = 2; ; i++) {
+    const candidate = base + '-' + i;
+    if (!taken.has(candidate)) return candidate;
+  }
+}
+
 function openMarketAdd(entry, needsEnv) {
-  if (!needsEnv) {
+  if (!needsEnv && !entry.auth) {
     installFromMarket(entry, {});
     return;
   }
-  state.marketModal = { entry, env: {}, name: entry.suggested_name, error: '' };
+  state.marketModal = { entry, env: {}, name: uniqueServerName(entry.suggested_name), error: '' };
   for (const v of entry.env || []) {
     state.marketModal.env[v.name] = v.default || '';
+  }
+  if (entry.auth) {
+    const options = {};
+    for (const o of entry.auth.options || []) options[o.param] = o.default || '';
+    Object.assign(state.marketModal, {
+      authMode: entry.auth.supports_managed ? 'managed' : 'byo',
+      clientId: '',
+      clientSecret: '',
+      options,
+      pat: '',
+      paste: '',
+      phase: 'form', // 'form' | 'waiting' (authorize tab open, awaiting callback)
+      installedName: '',
+      busy: false,
+    });
   }
   render();
 }
@@ -915,7 +950,35 @@ function closeMarketModal() {
 }
 
 function renderMarketModal() {
-  const { entry, env, name, error } = state.marketModal;
+  const modal = state.marketModal;
+  const { entry, env, name, error } = modal;
+
+  if (entry.auth && modal.phase === 'waiting') {
+    return el('div', { class: 'modal-bg', on: { click: (e) => { if (e.target === e.currentTarget) closeMarketModal(); } } },
+      el('div', { class: 'modal' },
+        el('h3', {}, 'Authorize ', modal.installedName),
+        el('div', { class: 'meta' }, 'Authorization page opened in a new tab — complete it there.'),
+        el('div', { class: 'meta' }, 'This dialog closes automatically once the provider redirects back.'),
+        el('label', { style: 'margin-top: 8px;' },
+          el('div', { class: 'meta' }, 'Different browser? Paste the post-redirect URL here:'),
+          el('textarea', {
+            placeholder: 'https://your-callback/cb?code=…&state=…',
+            rows: 3,
+            on: { input: (e) => { modal.paste = e.target.value; } },
+          }),
+          el('div', { class: 'row', style: 'margin-top: 4px;' },
+            el('button', { class: 'primary', disabled: modal.busy, on: { click: () => marketSubmitPaste() } },
+              modal.busy ? 'Submitting…' : 'Submit pasted URL'),
+          ),
+        ),
+        error ? el('div', { class: 'err' }, error) : null,
+        el('div', { class: 'row', style: 'margin-top: 16px; justify-content: flex-end;' },
+          el('button', { on: { click: closeMarketModal } }, 'Close'),
+        ),
+      ),
+    );
+  }
+
   return el('div', { class: 'modal-bg', on: { click: (e) => { if (e.target === e.currentTarget) closeMarketModal(); } } },
     el('div', { class: 'modal' },
       el('h3', {}, 'Add ', entry.name),
@@ -938,10 +1001,11 @@ function renderMarketModal() {
         }),
         v.description ? el('div', { class: 'meta', style: 'margin-top: 2px;' }, v.description) : null,
       )),
+      entry.auth ? renderMarketAuthSection(modal) : null,
       error ? el('div', { class: 'err' }, error) : null,
       el('div', { class: 'row', style: 'margin-top: 16px; justify-content: flex-end;' },
         el('button', { on: { click: closeMarketModal } }, 'Cancel'),
-        el('button', { class: 'primary', on: { click: () => {
+        el('button', { class: 'primary', disabled: modal.busy, on: { click: () => {
           // Validate required env now.
           for (const v of entry.env || []) {
             if (v.required && !((state.marketModal.env[v.name] || '').trim())) {
@@ -950,14 +1014,132 @@ function renderMarketModal() {
               return;
             }
           }
+          if (entry.auth) {
+            if (modal.authMode === 'byo' && !modal.clientId.trim()) {
+              modal.error = 'client_id is required'; render(); return;
+            }
+            if (modal.authMode === 'pat' && !modal.pat.trim()) {
+              modal.error = 'API key is required'; render(); return;
+            }
+          }
           installFromMarket(entry, state.marketModal.env, state.marketModal.name);
-        }}}, 'Install'),
+        }}}, modal.busy ? 'Working…' : (entry.auth && modal.authMode !== 'pat' ? 'Install & authorize' : 'Install')),
       ),
     ),
   );
 }
 
+function marketAuthRadio(label, value, modal) {
+  return el('label', { style: 'display: flex; align-items: center; gap: 6px; cursor: pointer;' },
+    el('input', {
+      type: 'radio', name: 'market-auth-mode', value,
+      checked: modal.authMode === value,
+      on: { change: () => { modal.authMode = value; render(); } },
+    }),
+    label,
+  );
+}
+
+function renderMarketAuthSection(modal) {
+  const a = modal.entry.auth;
+  const sections = [
+    el('div', { class: 'meta', style: 'margin-top: 12px;' }, 'Authentication'),
+    el('div', { class: 'row', style: 'gap: 16px;' },
+      a.supports_managed ? marketAuthRadio('Provider-managed (recommended)', 'managed', modal) : null,
+      marketAuthRadio('Your own OAuth app', 'byo', modal),
+      a.supports_pat ? marketAuthRadio('API key', 'pat', modal) : null,
+    ),
+  ];
+
+  if (modal.authMode === 'byo') {
+    sections.push(
+      a.client_setup_url
+        ? el('div', { class: 'meta' }, 'Create an OAuth app at ',
+            el('a', { href: a.client_setup_url, target: '_blank' }, a.client_setup_url.replace(/^https?:\/\//, '')),
+            ' and register this callback URL:')
+        : null,
+      state.oauthRedirectURI
+        ? el('div', { class: 'row' },
+            el('code', { style: 'word-break: break-all;' }, state.oauthRedirectURI),
+            el('button', { on: { click: () => {
+              navigator.clipboard && navigator.clipboard.writeText(state.oauthRedirectURI);
+              toast('Callback URL copied.');
+            }}}, 'Copy'),
+          )
+        : null,
+      el('label', {},
+        el('div', { class: 'meta' }, 'client_id *'),
+        el('input', {
+          value: modal.clientId,
+          autocomplete: 'off',
+          on: { input: (e) => { modal.clientId = e.target.value; } },
+        }),
+      ),
+      el('label', {},
+        el('div', { class: 'meta' }, 'client_secret'),
+        el('input', {
+          type: 'password',
+          value: modal.clientSecret,
+          autocomplete: 'off',
+          on: { input: (e) => { modal.clientSecret = e.target.value; } },
+        }),
+      ),
+      ...(a.options || []).map((o) => el('div', {},
+        el('div', { class: 'meta' }, o.label),
+        el('div', { class: 'row', style: 'gap: 16px;' },
+          ...o.choices.map((c) => el('label', { style: 'display: flex; align-items: center; gap: 6px; cursor: pointer;', title: c.description || '' },
+            el('input', {
+              type: 'radio', name: 'market-auth-opt-' + o.param, value: c.value,
+              checked: (modal.options[o.param] || '') === c.value,
+              on: { change: () => { modal.options[o.param] = c.value; render(); } },
+            }),
+            c.label,
+          )),
+        ),
+        (() => {
+          const sel = (o.choices || []).find((c) => c.value === (modal.options[o.param] || ''));
+          return sel && sel.description ? el('div', { class: 'meta', style: 'margin-top: 2px;' }, sel.description) : null;
+        })(),
+      )),
+      a.scope ? el('div', { class: 'meta' }, 'Scopes: ', el('code', {}, a.scope)) : null,
+    );
+  } else if (modal.authMode === 'pat') {
+    sections.push(
+      el('label', {},
+        el('div', { class: 'meta' }, 'API key *'),
+        el('input', {
+          type: 'password',
+          value: modal.pat,
+          placeholder: a.pat_hint || '',
+          autocomplete: 'off',
+          on: { input: (e) => { modal.pat = e.target.value; } },
+        }),
+      ),
+    );
+  } else {
+    sections.push(el('div', { class: 'meta' },
+      'The provider registers a client automatically (OAuth discovery + dynamic registration); you just approve in the browser.'));
+  }
+  return el('div', {}, ...sections.filter(Boolean));
+}
+
+async function marketSubmitPaste() {
+  const modal = state.marketModal;
+  if (!modal || !(modal.paste || '').trim()) return;
+  modal.busy = true; modal.error = ''; render();
+  try {
+    await api('/v1/mcp-oauth/paste', { method: 'POST', body: { url: modal.paste.trim() } });
+    // mcp_oauth_done fires via SSE and closes the modal.
+  } catch (e) {
+    modal.error = e.message;
+  }
+  if (state.marketModal) state.marketModal.busy = false;
+  render();
+}
+
 async function installFromMarket(entry, env, overrideName) {
+  const modal = state.marketModal;
+  const authFlow = !!(entry.auth && modal && modal.authMode);
   const args = (entry.args || []).map((a) =>
     a.replace(/\$\{([A-Z0-9_]+)\}/g, (_, key) => env[key] || '')
   );
@@ -974,6 +1156,7 @@ async function installFromMarket(entry, env, overrideName) {
   for (const k of Object.keys(env)) {
     if (!env[k]) delete body.env[k];
   }
+  if (modal) { modal.busy = true; modal.error = ''; render(); }
   try {
     const resp = await fetch('/v1/servers', {
       method: 'POST', credentials: 'include',
@@ -981,20 +1164,66 @@ async function installFromMarket(entry, env, overrideName) {
       body: JSON.stringify(body),
     });
     const out = await resp.json();
-    if (resp.status === 202) {
+    if (resp.status === 202 && !authFlow) {
+      // Saved but couldn't connect — for plain entries that's a failure
+      // worth shouting about; for auth entries a 401 here is expected
+      // (no token yet) and the flow below fixes it.
       toast('Saved, but failed to connect: ' + (out.warning || 'unknown'), 'error');
-    } else if (!resp.ok) {
+    } else if (!resp.ok && resp.status !== 202) {
       throw new Error(out.error || ('HTTP ' + resp.status));
-    } else {
-      toast(entry.name + ' installed.');
     }
+    if (!authFlow) {
+      if (resp.ok && resp.status !== 202) toast(entry.name + ' installed.');
+      state.marketModal = null;
+      await reloadServers();
+      render();
+      return;
+    }
+    await marketAuthorize(entry, modal, body.name);
+  } catch (e) {
+    if (state.marketModal) { state.marketModal.busy = false; state.marketModal.error = e.message; render(); }
+    else toast(e.message, 'error');
+  }
+}
+
+// marketAuthorize chains the existing OAuth endpoints right after a
+// marketplace install: seed the client (preset BYO creds or discovery+DCR),
+// then open the authorize page. PATs short-circuit. Completion is driven by
+// the mcp_oauth_done SSE event, which reconnects the upstream server-side.
+async function marketAuthorize(entry, modal, name) {
+  const base = '/v1/servers/' + encodeURIComponent(name) + '/oauth';
+  if (modal.authMode === 'pat') {
+    await api(base + '/pat', { method: 'POST', body: { token: modal.pat.trim() } });
+    toast(name + ' connected.');
     state.marketModal = null;
     await reloadServers();
     render();
-  } catch (e) {
-    if (state.marketModal) { state.marketModal.error = e.message; render(); }
-    else toast(e.message, 'error');
+    return;
   }
+  if (modal.authMode === 'byo') {
+    const extra = {};
+    for (const o of entry.auth.options || []) {
+      if (modal.options[o.param]) extra[o.param] = modal.options[o.param];
+    }
+    await api(base + '/manual-client', { method: 'POST', body: {
+      client_id:              modal.clientId.trim(),
+      client_secret:          modal.clientSecret,
+      issuer:                 entry.auth.issuer || '',
+      authorization_endpoint: entry.auth.authorization_endpoint,
+      token_endpoint:         entry.auth.token_endpoint,
+      scopes:                 entry.auth.scope ? [entry.auth.scope] : [],
+      extra_authorize_params: extra,
+    }});
+  } else {
+    await api(base + '/discover', { method: 'POST', body: {} });
+  }
+  const begun = await api(base + '/begin', { method: 'POST', body: { mode: 'callback' } });
+  window.open(begun.authorize_url, '_blank', 'noopener');
+  modal.installedName = name;
+  modal.phase = 'waiting';
+  modal.busy = false;
+  await reloadServers();
+  render();
 }
 
 async function reconnectServer(name) {

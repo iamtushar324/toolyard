@@ -84,6 +84,10 @@ type ClientRecord struct {
 	Scopes                      []string
 	TokenEndpointAuthMethod     string
 	Metadata                    *ASMetadata
+	// ExtraAuthorizeParams are appended to the authorize URL verbatim
+	// (e.g. Linear's actor=app). When non-nil they REPLACE the legacy
+	// access_type=offline / prompt=consent defaults; nil keeps them.
+	ExtraAuthorizeParams map[string]string
 }
 
 // TokenRecord is the persisted token row, decrypted.
@@ -409,14 +413,19 @@ func (s *Service) PutClient(ctx context.Context, rec ClientRecord) error {
 		b, _ := json.Marshal(rec.Metadata)
 		mdJSON = string(b)
 	}
+	extraJSON := ""
+	if rec.ExtraAuthorizeParams != nil {
+		b, _ := json.Marshal(rec.ExtraAuthorizeParams)
+		extraJSON = string(b)
+	}
 	now := time.Now().UnixMilli()
 	scopes := strings.Join(rec.Scopes, " ")
 	_, err = s.db.ExecContext(ctx, `
         INSERT INTO oauth_clients(upstream_name, issuer, authorization_endpoint, token_endpoint,
             registration_endpoint, revocation_endpoint, device_authorization_endpoint,
             client_id, client_secret_enc, redirect_uri, scopes,
-            token_endpoint_auth_method, metadata_json, registered_at, updated_at)
-        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            token_endpoint_auth_method, metadata_json, authorize_extra_json, registered_at, updated_at)
+        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         ON CONFLICT(upstream_name) DO UPDATE SET
             issuer = excluded.issuer,
             authorization_endpoint = excluded.authorization_endpoint,
@@ -430,13 +439,14 @@ func (s *Service) PutClient(ctx context.Context, rec ClientRecord) error {
             scopes = excluded.scopes,
             token_endpoint_auth_method = excluded.token_endpoint_auth_method,
             metadata_json = excluded.metadata_json,
+            authorize_extra_json = excluded.authorize_extra_json,
             updated_at = excluded.updated_at
     `,
 		rec.UpstreamName, rec.Issuer, rec.AuthorizationEndpoint, rec.TokenEndpoint,
 		nullStr(rec.RegistrationEndpoint), nullStr(rec.RevocationEndpoint),
 		nullStr(rec.DeviceAuthorizationEndpoint),
 		rec.ClientID, nullStr(secEnc), rec.RedirectURI, scopes,
-		rec.TokenEndpointAuthMethod, nullStr(mdJSON), now, now)
+		rec.TokenEndpointAuthMethod, nullStr(mdJSON), nullStr(extraJSON), now, now)
 	return err
 }
 
@@ -447,14 +457,14 @@ func (s *Service) GetClient(ctx context.Context, upstream string) (*ClientRecord
                COALESCE(registration_endpoint,''), COALESCE(revocation_endpoint,''),
                COALESCE(device_authorization_endpoint,''),
                client_id, COALESCE(client_secret_enc,''), redirect_uri, scopes,
-               token_endpoint_auth_method, COALESCE(metadata_json,'')
+               token_endpoint_auth_method, COALESCE(metadata_json,''), COALESCE(authorize_extra_json,'')
         FROM oauth_clients WHERE upstream_name = ?
     `, upstream)
 	var rec ClientRecord
-	var secEnc, mdJSON, scopes string
+	var secEnc, mdJSON, scopes, extraJSON string
 	if err := row.Scan(&rec.UpstreamName, &rec.Issuer, &rec.AuthorizationEndpoint, &rec.TokenEndpoint,
 		&rec.RegistrationEndpoint, &rec.RevocationEndpoint, &rec.DeviceAuthorizationEndpoint,
-		&rec.ClientID, &secEnc, &rec.RedirectURI, &scopes, &rec.TokenEndpointAuthMethod, &mdJSON); err != nil {
+		&rec.ClientID, &secEnc, &rec.RedirectURI, &scopes, &rec.TokenEndpointAuthMethod, &mdJSON, &extraJSON); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, ErrClientNotFound
 		}
@@ -474,6 +484,12 @@ func (s *Service) GetClient(ctx context.Context, upstream string) (*ClientRecord
 		md := &ASMetadata{}
 		if json.Unmarshal([]byte(mdJSON), md) == nil {
 			rec.Metadata = md
+		}
+	}
+	if extraJSON != "" {
+		m := map[string]string{}
+		if json.Unmarshal([]byte(extraJSON), &m) == nil {
+			rec.ExtraAuthorizeParams = m
 		}
 	}
 	return &rec, nil
@@ -539,12 +555,26 @@ func (s *Service) BeginCallback(ctx context.Context, upstream, userID, mode stri
 		scopes = cli.Scopes
 	}
 	if len(scopes) > 0 {
+		// Scopes joined with spaces; providers with non-space separators
+		// (e.g. Linear's comma-separated "read,write") are handled by
+		// passing the whole scope string as a single element.
 		q.Set("scope", strings.Join(scopes, " "))
 	}
-	// Encourage IdPs to issue a refresh_token without forcing reconsent
-	// on every connect — both keys are commonly accepted, harmless when ignored.
-	q.Set("access_type", "offline")
-	q.Set("prompt", "consent")
+	if cli.ExtraAuthorizeParams != nil {
+		// Preset-driven params (e.g. Linear's actor=app) replace the
+		// legacy defaults below — they are Google-isms that some IdPs
+		// reject or misinterpret.
+		for k, v := range cli.ExtraAuthorizeParams {
+			if v != "" {
+				q.Set(k, v)
+			}
+		}
+	} else {
+		// Encourage IdPs to issue a refresh_token without forcing reconsent
+		// on every connect — both keys are commonly accepted, harmless when ignored.
+		q.Set("access_type", "offline")
+		q.Set("prompt", "consent")
+	}
 
 	sep := "?"
 	if strings.Contains(cli.AuthorizationEndpoint, "?") {

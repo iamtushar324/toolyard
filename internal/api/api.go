@@ -1295,7 +1295,13 @@ func (s *Server) marketplaceList(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusUnauthorized, "unauthorized")
 		return
 	}
-	writeJSON(w, http.StatusOK, marketplace.Catalog())
+	// oauth_redirect_uri rides along so BYO-OAuth install forms can show
+	// the exact callback URL to register with the provider (server-computed
+	// — respects PublicURL, unlike the browser's location.origin).
+	writeJSON(w, http.StatusOK, map[string]any{
+		"entries":            marketplace.Catalog(),
+		"oauth_redirect_uri": s.oauthRedirectURI(r),
+	})
 }
 
 func (s *Server) toolsList(w http.ResponseWriter, r *http.Request) {
