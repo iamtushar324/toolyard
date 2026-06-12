@@ -13,9 +13,8 @@ import (
 // SecurityOptions tunes the public-host hardening middleware.
 type SecurityOptions struct {
 	// PublicURL, when set, switches the dashboard into "public" posture:
-	// cookies get Secure, HSTS is emitted, the setup route 404s for
-	// non-loopback callers, and Origin checks are enforced. Form:
-	// "https://toolyard.example.com".
+	// cookies get Secure, HSTS is emitted, and Origin checks are enforced.
+	// Form: "https://toolyard.example.com".
 	PublicURL string
 	// TrustedProxies is a CIDR allowlist for X-Forwarded-* trust. When
 	// behind a reverse proxy (Cloudflare, Caddy, nginx) put its IP here so
@@ -235,7 +234,7 @@ func (s *Server) HardenAPI(next http.Handler) http.Handler {
 			// likewise. Cross-site form POSTs cannot add this header,
 			// even when Same-Origin is bypassed by a downgrade attack.
 			//
-			// Exempt: /v1/auth/setup (one-shot, loopback-only) and
+			// Exempt: /v1/auth/setup (one-shot; closes after first user) and
 			// /v1/auth/login (cookie isn't issued yet) and
 			// /v1/agents/exchange (Bearer-bootstrap path) and
 			// /v1/approvals/decide-by-token (push-tap path; signed token
@@ -378,7 +377,7 @@ type unauthRouteRule struct {
 // unauthRouteLimit picks a rate-limit rule for unauthenticated routes that
 // would otherwise be infinitely abusable (no cookie required, and either
 // fast or DB-backed). /v1/auth/setup is intentionally NOT here — it has
-// stronger guards (loopback-only + 404 after the first success) and the
+// a stronger guard (one-shot: 404 after the first success) and the
 // rate limit there mostly hurts test harnesses that re-bootstrap.
 func unauthRouteLimit(path string) *unauthRouteRule {
 	switch {

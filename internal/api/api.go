@@ -487,14 +487,9 @@ func (s *Server) authSetup(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusMethodNotAllowed, "POST only")
 		return
 	}
-	// Bootstrap is only safe over the loopback (or trusted-proxy localhost),
-	// otherwise an attacker on the public internet can race the legit
-	// operator and claim the admin account.
-	if !s.security.IsLoopback(r) {
-		writeError(w, http.StatusForbidden, "first-time setup must be performed from localhost")
-		return
-	}
-	// One-shot: once any user exists the route closes entirely.
+	// One-shot: once any user exists the route closes entirely. This is the
+	// sole guard on the bootstrap window — it stays open to any caller
+	// (including non-loopback) until the first account is created, then 404s.
 	if exists, err := s.identity.HasUser(r.Context()); err == nil && exists {
 		http.NotFound(w, r)
 		return
