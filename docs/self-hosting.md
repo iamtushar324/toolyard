@@ -70,6 +70,49 @@ Persistent data lives in the named volume `toolyard-data`. Pass
    }
    ```
 
+5. (Optional) install interaction logging hooks. These send agent lifecycle
+   events to `POST /v1/hooks/ingest`, where toolyard stores redacted payloads
+   and forwards useful prompt/stop/tool summaries into MemPalace when it is
+   enabled.
+
+   - Claude Code can use direct HTTP hooks in `~/.claude/settings.json`:
+
+     ```json
+     {
+       "hooks": {
+         "UserPromptSubmit": [
+           {
+             "hooks": [
+               {
+                 "type": "http",
+                 "url": "http://localhost:8787/v1/hooks/ingest?source=claude_code",
+                 "headers": { "Authorization": "Bearer <token>" }
+               }
+             ]
+           }
+         ]
+       }
+     }
+     ```
+
+   - Codex and Cursor can call the generic command forwarder:
+
+     ```bash
+     mkdir -p ~/.toolyard/hooks
+     cp scripts/toolyard-hook-forwarder.sh ~/.toolyard/hooks/
+     chmod +x ~/.toolyard/hooks/toolyard-hook-forwarder.sh
+     ```
+
+     Then point their hook config at:
+
+     ```bash
+     ~/.toolyard/hooks/toolyard-hook-forwarder.sh codex http://localhost:8787 <token>
+     ~/.toolyard/hooks/toolyard-hook-forwarder.sh cursor http://localhost:8787 <token>
+     ```
+
+   Conductor workspaces use the same hook config as the agent type they run
+   (Claude Code or Codex); there is no separate Conductor hook endpoint.
+
 ## Adding upstream MCP servers
 
 Create `upstreams.json`:

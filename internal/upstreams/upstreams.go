@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/tusharbhardwaj/toolyard/internal/gateway"
+	"github.com/tusharbhardwaj/toolyard/internal/secrets"
 	"github.com/tusharbhardwaj/toolyard/internal/store"
 )
 
@@ -27,18 +28,27 @@ var (
 
 // Server is one persisted upstream config and its current connection status.
 type Server struct {
-	Name       string            `json:"name"`
-	Transport  string            `json:"transport"`
-	Command    string            `json:"command,omitempty"`
-	Args       []string          `json:"args,omitempty"`
-	URL        string            `json:"url,omitempty"`
-	Env        map[string]string `json:"env,omitempty"`
+	Name      string            `json:"name"`
+	Transport string            `json:"transport"`
+	Command   string            `json:"command,omitempty"`
+	Args      []string          `json:"args,omitempty"`
+	URL       string            `json:"url,omitempty"`
+	Env       map[string]string `json:"env,omitempty"`
+	// Headers are static HTTP headers for http transports, persisted in
+	// headers_json. Values may be secret:// refs (resolved at dial time)
+	// and are merged with OAuth-provided headers — OAuth wins on a clash
+	// (e.g. Authorization).
+	Headers    map[string]string `json:"headers,omitempty"`
 	Enabled    bool              `json:"enabled"`
 	LastStatus string            `json:"last_status,omitempty"`
 	LastError  string            `json:"last_error,omitempty"`
 	ToolCount  int               `json:"tool_count"`
 	CreatedAt  int64             `json:"created_at"`
 	UpdatedAt  int64             `json:"updated_at"`
+	// EnvPlaintextKeys is populated only by Masked(): the env keys whose
+	// values were masked (i.e. plaintext, not secret:// refs) so the UI can
+	// offer a "convert to secret" action. Never persisted.
+	EnvPlaintextKeys []string `json:"env_plaintext_keys,omitempty"`
 }
 
 // Policy gates which upstream configurations are admissible. Used to
@@ -58,12 +68,24 @@ type HeaderProvider interface {
 	HasClient(ctx context.Context, upstream string) (bool, error)
 }
 
+// SecretResolver is the secrets-broker dependency. Decoupled via interface so
+// internal/upstreams doesn't import internal/secrets. Implemented by
+// *internal/secrets.Service.
+type SecretResolver interface {
+	// ResolveMap returns a copy of in with every secret:// ref replaced by
+	// its decrypted value; non-refs pass through. Errors name the ref.
+	ResolveMap(ctx context.Context, in map[string]string) (map[string]string, error)
+	// Exists reports whether a stored secret with this name is present.
+	Exists(ctx context.Context, name string) (bool, error)
+}
+
 // Service owns the upstream_servers table and keeps the live gateway in sync.
 type Service struct {
-	db     *store.DB
-	gw     *gateway.Gateway
-	policy Policy
-	auth   HeaderProvider // optional
+	db      *store.DB
+	gw      *gateway.Gateway
+	policy  Policy
+	auth    HeaderProvider // optional
+	secrets SecretResolver // optional
 
 	mu sync.Mutex // serializes connect/disconnect side-effects
 }
@@ -78,6 +100,11 @@ func (s *Service) SetPolicy(p Policy) { s.policy = p }
 // SetAuth installs the OAuth header provider. Calling this with nil
 // disables the wiring (useful for tests).
 func (s *Service) SetAuth(a HeaderProvider) { s.auth = a }
+
+// SetSecrets installs the secrets broker so secret:// refs in env/headers
+// resolve at dial time. Nil disables the wiring (refs would then fail the
+// dial as missing secrets).
+func (s *Service) SetSecrets(r SecretResolver) { s.secrets = r }
 
 // envDenied returns the first env key in the supplied map that the policy
 // forbids. Empty string means clean.
@@ -106,15 +133,63 @@ func (s *Service) toCfg(srv Server) gateway.UpstreamConfig {
 		URL:       srv.URL,
 		Env:       srv.Env,
 	}
-	// Wire OAuth bearer headers for http upstreams that have a registered
-	// client. We always install the closure when the auth provider is
-	// present; it returns an empty map when no token is stored, which
-	// means the first connect attempt may 401 — the dashboard can then
-	// kick off the OAuth dance.
-	if s.auth != nil && (cfg.Transport == "http" || cfg.Transport == "streamable-http" || cfg.Transport == "") {
-		cfg.HeaderFunc = gateway.HeaderFunc(s.auth.HeaderFunc(srv.Name))
+	isHTTP := cfg.Transport == "http" || cfg.Transport == "streamable-http" || cfg.Transport == ""
+
+	// stdio: resolve secret:// refs in Env at dial time via EnvFunc. The
+	// closure captures a copy of srv.Env so a later edit doesn't race.
+	if cfg.Transport == "stdio" && s.secrets != nil {
+		envCopy := copyMap(srv.Env)
+		resolver := s.secrets
+		cfg.EnvFunc = func(ctx context.Context) (map[string]string, error) {
+			return resolver.ResolveMap(ctx, envCopy)
+		}
+	}
+
+	// http: compose static (secret-resolved) headers with the OAuth bearer
+	// header. OAuth wins on a clash (e.g. Authorization) so a stored bearer
+	// always takes precedence over a hand-set header.
+	if isHTTP {
+		staticHeaders := copyMap(srv.Headers)
+		resolver := s.secrets
+		var oauthFn func(ctx context.Context) map[string]string
+		if s.auth != nil {
+			oauthFn = s.auth.HeaderFunc(srv.Name)
+		}
+		if len(staticHeaders) > 0 || oauthFn != nil {
+			cfg.HeaderFunc = func(ctx context.Context) map[string]string {
+				out := map[string]string{}
+				if len(staticHeaders) > 0 {
+					resolved := staticHeaders
+					if resolver != nil {
+						if r, err := resolver.ResolveMap(ctx, staticHeaders); err == nil {
+							resolved = r
+						}
+					}
+					for k, v := range resolved {
+						out[k] = v
+					}
+				}
+				if oauthFn != nil {
+					for k, v := range oauthFn(ctx) {
+						out[k] = v // OAuth wins
+					}
+				}
+				return out
+			}
+		}
 	}
 	return cfg
+}
+
+func copyMap(in map[string]string) map[string]string {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(in))
+	for k, v := range in {
+		out[k] = v
+	}
+	return out
 }
 
 func validate(srv Server) error {
@@ -168,7 +243,7 @@ func (s *Service) LoadAll(ctx context.Context) error {
 func (s *Service) list(ctx context.Context) ([]Server, error) {
 	rows, err := s.db.QueryContext(ctx,
 		`SELECT name, transport, COALESCE(command,''), COALESCE(args_json,''),
-            COALESCE(url,''), COALESCE(env_json,''), enabled,
+            COALESCE(url,''), COALESCE(env_json,''), COALESCE(headers_json,''), enabled,
             COALESCE(last_status,''), COALESCE(last_error,''), tool_count,
             created_at, updated_at
          FROM upstream_servers ORDER BY name`)
@@ -179,10 +254,10 @@ func (s *Service) list(ctx context.Context) ([]Server, error) {
 	var out []Server
 	for rows.Next() {
 		var srv Server
-		var argsRaw, envRaw string
+		var argsRaw, envRaw, headersRaw string
 		var enabled int
 		if err := rows.Scan(&srv.Name, &srv.Transport, &srv.Command, &argsRaw,
-			&srv.URL, &envRaw, &enabled, &srv.LastStatus, &srv.LastError,
+			&srv.URL, &envRaw, &headersRaw, &enabled, &srv.LastStatus, &srv.LastError,
 			&srv.ToolCount, &srv.CreatedAt, &srv.UpdatedAt); err != nil {
 			return nil, err
 		}
@@ -192,6 +267,9 @@ func (s *Service) list(ctx context.Context) ([]Server, error) {
 		}
 		if envRaw != "" {
 			_ = json.Unmarshal([]byte(envRaw), &srv.Env)
+		}
+		if headersRaw != "" {
+			_ = json.Unmarshal([]byte(headersRaw), &srv.Headers)
 		}
 		out = append(out, srv)
 	}
@@ -219,6 +297,9 @@ func (s *Service) Add(ctx context.Context, srv Server) (*Server, error) {
 	if denied := s.policy.envDenied(srv.Env); denied != "" {
 		return nil, fmt.Errorf("%w: env key %q is on the denylist", ErrInvalid, denied)
 	}
+	if err := s.validateSecretRefs(ctx, srv); err != nil {
+		return nil, err
+	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -229,13 +310,14 @@ func (s *Service) Add(ctx context.Context, srv Server) (*Server, error) {
 
 	argsBlob, _ := json.Marshal(srv.Args)
 	envBlob, _ := json.Marshal(srv.Env)
+	headersBlob, _ := json.Marshal(srv.Headers)
 
 	_, err := s.db.ExecContext(ctx,
 		`INSERT INTO upstream_servers(name, transport, command, args_json, url,
-            env_json, enabled, created_at, updated_at)
-         VALUES(?,?,?,?,?,?,?,?,?)`,
+            env_json, headers_json, enabled, created_at, updated_at)
+         VALUES(?,?,?,?,?,?,?,?,?,?)`,
 		srv.Name, srv.Transport, nullStr(srv.Command), string(argsBlob),
-		nullStr(srv.URL), string(envBlob), 1, now, now)
+		nullStr(srv.URL), string(envBlob), string(headersBlob), 1, now, now)
 	if err != nil {
 		// SQLite reports unique constraint as "UNIQUE constraint failed".
 		if strings.Contains(strings.ToLower(err.Error()), "unique") {
@@ -327,15 +409,15 @@ func (s *Service) connect(ctx context.Context, srv Server) error {
 func (s *Service) get(ctx context.Context, name string) (*Server, error) {
 	row := s.db.QueryRowContext(ctx,
 		`SELECT name, transport, COALESCE(command,''), COALESCE(args_json,''),
-            COALESCE(url,''), COALESCE(env_json,''), enabled,
+            COALESCE(url,''), COALESCE(env_json,''), COALESCE(headers_json,''), enabled,
             COALESCE(last_status,''), COALESCE(last_error,''), tool_count,
             created_at, updated_at
          FROM upstream_servers WHERE name = ?`, name)
 	var srv Server
-	var argsRaw, envRaw string
+	var argsRaw, envRaw, headersRaw string
 	var enabled int
 	if err := row.Scan(&srv.Name, &srv.Transport, &srv.Command, &argsRaw,
-		&srv.URL, &envRaw, &enabled, &srv.LastStatus, &srv.LastError,
+		&srv.URL, &envRaw, &headersRaw, &enabled, &srv.LastStatus, &srv.LastError,
 		&srv.ToolCount, &srv.CreatedAt, &srv.UpdatedAt); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, ErrNotFound
@@ -348,6 +430,9 @@ func (s *Service) get(ctx context.Context, name string) (*Server, error) {
 	}
 	if envRaw != "" {
 		_ = json.Unmarshal([]byte(envRaw), &srv.Env)
+	}
+	if headersRaw != "" {
+		_ = json.Unmarshal([]byte(headersRaw), &srv.Headers)
 	}
 	return &srv, nil
 }
@@ -416,23 +501,25 @@ func (s *Service) UpsertBuiltin(ctx context.Context, srv Server) (*Server, error
 
 	argsBlob, _ := json.Marshal(srv.Args)
 	envBlob, _ := json.Marshal(srv.Env)
+	headersBlob, _ := json.Marshal(srv.Headers)
 
 	// INSERT … ON CONFLICT keeps the existing created_at while updating the
 	// rest. SQLite's "excluded" pseudo-table refers to the would-be-inserted row.
 	_, err := s.db.ExecContext(ctx,
 		`INSERT INTO upstream_servers(name, transport, command, args_json, url,
-            env_json, enabled, created_at, updated_at)
-         VALUES(?,?,?,?,?,?,?,?,?)
+            env_json, headers_json, enabled, created_at, updated_at)
+         VALUES(?,?,?,?,?,?,?,?,?,?)
          ON CONFLICT(name) DO UPDATE SET
             transport = excluded.transport,
             command   = excluded.command,
             args_json = excluded.args_json,
             url       = excluded.url,
             env_json  = excluded.env_json,
+            headers_json = excluded.headers_json,
             enabled   = 1,
             updated_at = excluded.updated_at`,
 		srv.Name, srv.Transport, nullStr(srv.Command), string(argsBlob),
-		nullStr(srv.URL), string(envBlob), 1, srv.CreatedAt, now)
+		nullStr(srv.URL), string(envBlob), string(headersBlob), 1, srv.CreatedAt, now)
 	if err != nil {
 		return nil, err
 	}
@@ -447,6 +534,118 @@ func (s *Service) UpsertBuiltin(ctx context.Context, srv Server) (*Server, error
 		return final, err
 	}
 	return s.get(ctx, srv.Name)
+}
+
+// validateSecretRefs checks every secret:// reference in the server's env and
+// headers: shape must be valid and the named secret must already exist, so a
+// typo fails at save time rather than silently failing the dial later. A nil
+// secrets resolver means refs are permitted unchecked (the dial will still
+// fail loudly if the broker isn't wired).
+func (s *Service) validateSecretRefs(ctx context.Context, srv Server) error {
+	if s.secrets == nil {
+		return nil
+	}
+	check := func(kind string, m map[string]string) error {
+		for k, v := range m {
+			if !secrets.IsRef(v) {
+				continue
+			}
+			name, ok := secrets.ParseRef(v)
+			if !ok {
+				return fmt.Errorf("%w: %s %q has malformed secret ref %q", ErrInvalid, kind, k, v)
+			}
+			exists, err := s.secrets.Exists(ctx, name)
+			if err != nil {
+				return err
+			}
+			if !exists {
+				return fmt.Errorf("%w: %s %q references unknown secret %q", ErrInvalid, kind, k, name)
+			}
+		}
+		return nil
+	}
+	if err := check("env", srv.Env); err != nil {
+		return err
+	}
+	return check("header", srv.Headers)
+}
+
+// Masked returns a copy of srv safe to serialize to the dashboard / API:
+// secret:// refs pass through verbatim (they're not sensitive), but every
+// other non-empty env / header value is replaced with a bullet placeholder.
+// EnvPlaintextKeys lists the keys whose value was masked so the UI can offer
+// a "convert to secret" action.
+func Masked(srv Server) Server {
+	out := srv
+	out.Env, out.EnvPlaintextKeys = maskValues(srv.Env)
+	out.Headers, _ = maskValues(srv.Headers)
+	return out
+}
+
+func maskValues(in map[string]string) (map[string]string, []string) {
+	if len(in) == 0 {
+		return in, nil
+	}
+	masked := make(map[string]string, len(in))
+	var plaintext []string
+	for k, v := range in {
+		switch {
+		case v == "":
+			masked[k] = ""
+		case secrets.IsRef(v):
+			masked[k] = v
+		default:
+			masked[k] = "•••"
+			plaintext = append(plaintext, k)
+		}
+	}
+	sort.Strings(plaintext)
+	return masked, plaintext
+}
+
+// ConvertEnvToSecret extracts the plaintext value of env[envKey] on the named
+// server, creates a secret from it via create, rewrites the env entry to a
+// secret:// ref, persists, and reconnects so the live upstream picks up the
+// ref. create is supplied by the caller (the API layer) so this package stays
+// decoupled from internal/secrets' write side.
+func (s *Service) ConvertEnvToSecret(ctx context.Context, serverName, envKey, secretName string,
+	create func(ctx context.Context, name, value, description string) error) (*Server, error) {
+	if !secrets.ValidName(secretName) {
+		return nil, fmt.Errorf("%w: secret name must match ^[A-Z][A-Z0-9_]{0,63}$", ErrInvalid)
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	srv, err := s.get(ctx, serverName)
+	if err != nil {
+		return nil, err
+	}
+	val, ok := srv.Env[envKey]
+	if !ok || val == "" {
+		return nil, fmt.Errorf("%w: env key %q not set on %q", ErrInvalid, envKey, serverName)
+	}
+	if secrets.IsRef(val) {
+		return nil, fmt.Errorf("%w: env key %q is already a secret reference", ErrInvalid, envKey)
+	}
+	if err := create(ctx, secretName, val, "converted from "+serverName+" env "+envKey); err != nil {
+		return nil, err
+	}
+	srv.Env[envKey] = secrets.RefPrefix + secretName
+	envBlob, _ := json.Marshal(srv.Env)
+	if _, err := s.db.ExecContext(ctx,
+		`UPDATE upstream_servers SET env_json=?, updated_at=? WHERE name=?`,
+		string(envBlob), time.Now().UnixMilli(), serverName); err != nil {
+		return nil, err
+	}
+	// Reconnect so the running upstream re-dials with the ref (resolved at
+	// dial time). Best-effort: a connect failure is recorded on the row.
+	_ = s.gw.RemoveUpstream(serverName)
+	if err := s.connect(ctx, *srv); err != nil {
+		s.recordStatus(ctx, serverName, "", err.Error(), 0)
+		final, _ := s.get(ctx, serverName)
+		return final, err
+	}
+	return s.get(ctx, serverName)
 }
 
 // SortedNames is a small helper for the API layer.

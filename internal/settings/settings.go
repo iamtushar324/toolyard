@@ -57,6 +57,10 @@ const (
 	// MetricsRetentionDays: how many days of call_events to keep before the
 	// retention compactor purges. Default 90.
 	MetricsRetentionDays = "metrics_retention_days"
+	// EventsRetentionDays: how many days of Events Hub rows to keep before the
+	// events retention purger removes acked+synced rows (hard floor at 4×).
+	// Default 90.
+	EventsRetentionDays = "events_retention_days"
 	// AnomalyRateZScore: how many standard deviations above the trailing
 	// 7-day baseline triggers a rate_spike anomaly. Default 3.
 	AnomalyRateZScore = "anomaly_rate_z_score"
@@ -76,6 +80,20 @@ const (
 	// directive so the toolyard /lake/ page can iframe Grafana panels
 	// from this origin (e.g. http://localhost:3030).
 	GrafanaOrigin = "grafana_origin"
+	// Telegram chat-approval channel keys. TelegramBotToken stores the
+	// sealbox-encrypted bot token (classified secret: write-only via the
+	// chat/configure endpoint, never returned by All/Patch). The rest are
+	// plain operational state managed by the channel + poller.
+	TelegramEnabled      = "telegram_enabled"
+	TelegramBotToken     = "telegram_bot_token"
+	TelegramBotUsername  = "telegram_bot_username"
+	TelegramChatID       = "telegram_chat_id"
+	TelegramUserID       = "telegram_user_id"
+	TelegramUpdateOffset = "telegram_update_offset"
+	// ChatIncludeDetails gates whether approval reason + args appear in chat
+	// messages (default true).
+	ChatIncludeDetails = "chat_include_details"
+
 	// ClickhousePassword is the password for the `default` user of the
 	// toolyard-clickhouse docker stack. Generated on first gateway start
 	// if empty; rotatable from the UI. Toolyard renders it into a
@@ -93,6 +111,7 @@ const (
 var secretKeys = map[string]struct{}{
 	LakeAPIToken:       {},
 	ClickhousePassword: {},
+	TelegramBotToken:   {},
 }
 
 // IsSecretKey reports whether key is classified as a secret.
@@ -403,6 +422,22 @@ func (s *Service) GetBool(key string) bool {
 	var b bool
 	if err := json.Unmarshal(v, &b); err != nil {
 		return false
+	}
+	return b
+}
+
+// GetBoolDefault reads a boolean setting, returning def when the key is unset
+// (plain GetBool can't distinguish "unset" from "false").
+func (s *Service) GetBoolDefault(key string, def bool) bool {
+	s.mu.RLock()
+	v, ok := s.cache[key]
+	s.mu.RUnlock()
+	if !ok {
+		return def
+	}
+	var b bool
+	if err := json.Unmarshal(v, &b); err != nil {
+		return def
 	}
 	return b
 }

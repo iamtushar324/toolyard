@@ -44,11 +44,11 @@ type Dispatcher interface {
 
 // Service owns the notes-dir lifecycle and the in-process sync state.
 type Service struct {
-	db        *store.DB
-	gw        Dispatcher
-	notesDir  string
-	interval  time.Duration
-	enabled   bool
+	db       *store.DB
+	gw       Dispatcher
+	notesDir string
+	interval time.Duration
+	enabled  bool
 
 	// Tool names we dispatch to. Hardcoded here rather than imported from
 	// internal/mempalace to keep this package free of that dependency —
@@ -62,10 +62,10 @@ type Service struct {
 
 // Defaults used when callers don't override.
 const (
-	DefaultDiaryTool   = "mempalace.mempalace_diary_write"
-	DefaultWriteTool   = "notes.write_file"
-	DefaultScanEvery   = 30 * time.Second
-	maxIngestBytes     = 64 << 10 // 64 KiB per file — entries larger than this are truncated for the diary; the file on disk is untouched
+	DefaultDiaryTool = "mempalace.mempalace_diary_write"
+	DefaultWriteTool = "notes.write_file"
+	DefaultScanEvery = 30 * time.Second
+	maxIngestBytes   = 64 << 10 // 64 KiB per file — entries larger than this are truncated for the diary; the file on disk is untouched
 )
 
 // Options controls Service construction.
@@ -173,9 +173,9 @@ func (s *Service) safeJoin(rel string) (abs, relClean string, err error) {
 
 // PublishResult is what notes.publish returns to the caller.
 type PublishResult struct {
-	Path       string `json:"path"`        // relative to notes dir
+	Path       string `json:"path"` // relative to notes dir
 	Bytes      int    `json:"bytes"`
-	Indexed    bool   `json:"indexed"`     // whether mempalace ingested it
+	Indexed    bool   `json:"indexed"` // whether mempalace ingested it
 	PalaceID   string `json:"palace_id,omitempty"`
 	IndexError string `json:"index_error,omitempty"`
 }

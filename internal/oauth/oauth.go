@@ -151,6 +151,12 @@ type Service struct {
 	mu      sync.RWMutex
 	bearers map[string]*atomic.Value // upstream -> *atomic.Value holding string
 
+	// lastAttempt tracks the last time the refresher attempted a refresh
+	// for an upstream (success OR failure). Unlike last_refresh_at, which
+	// only advances on success, this lets backoff space out retries across
+	// an IdP outage instead of firing every tick.
+	lastAttempt map[string]time.Time
+
 	// reauthHook is invoked once per upstream when state flips to
 	// needs_reauth so the upstreams.Service can drop the dead connection.
 	reauthHook func(upstream string)
@@ -167,7 +173,8 @@ func New(db *store.DB, cipher *Cipher, bus EventBus, notifier Notifier, idents I
 		httpc: &http.Client{
 			Timeout: 30 * time.Second,
 		},
-		bearers: map[string]*atomic.Value{},
+		bearers:     map[string]*atomic.Value{},
+		lastAttempt: map[string]time.Time{},
 	}
 }
 

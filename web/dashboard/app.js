@@ -17,6 +17,15 @@ const state = {
   marketModal: null,
   agentModal: null,        // { stage: 'name'|'done', name, agent, snippetTab }
   toolFilter: '',
+  // Audit tab: client-side filters + pagination cursor state.
+  auditFilter: { q: '', event_type: '', decision: '', agent: '' },
+  auditPaged: false,      // true once "Load older" has pulled extra rows
+  auditEnd: false,        // true when a "Load older" returned nothing
+  hooks: { events: [], loading: false, end: false, loaded: false },
+  hookFilter: { q: '', source: '', event_name: '', agent: '', session_id: '' },
+  // Memory tab: filter text + which row is being inline-edited.
+  memoryFilter: '',
+  memEdit: null,          // { scope, key, value } while editing a row
   settings: { surface_mode: 'full', top_n_count: 20, top_n_personalize_after: 100, router_only_mode: false },
   usage: { per_tool: {}, rows: [] },
   workbench: {
@@ -37,10 +46,12 @@ const state = {
     loading: false,
   },
   anomalies: [],
+  policies: [],            // explicit tool/upstream policies (Feature A)
   enrollment: null,
   errors: {},
   notice: '',
-  streamLive: false,
+  // SSE health. status: connecting | live | reconnecting | offline.
+  stream: { status: 'connecting', lastEventAt: 0, wasDown: false },
   vapidKey: null,
   pushReady: false,
   // oauthStatus is keyed by upstream name -> {has_client, has_token, state,
@@ -52,6 +63,16 @@ const state = {
   pushTestResult: null,  // /v1/push/test last response
   jwtPreview: null,      // /v1/push/jwt-preview last response
   moreSheet: false,      // bottom-nav "More" sheet open?
+  // Secrets broker (Settings card): metadata only, never values.
+  secrets: [],
+  secretsLoaded: false,
+  // Chat-notification channel status (Settings card).
+  chat: null,
+  chatLoaded: false,
+  // Events Hub: feed rows + source configs + filters + unacked badge.
+  events: { rows: [], unacked: 0, sources: [], loaded: false, nextBefore: 0 },
+  eventFilter: { source_id: '', type: '', q: '', unacked: false },
+  eventSourceModal: null,  // { kind, name, ... } while adding a source
   // Personal data lake (TUS-104). Manifest + per-panel cached results so
   // a tab switch is instant after first visit. Errors per panel are kept
   // local so one bad query doesn't break the rest of the page.
@@ -131,7 +152,10 @@ async function api(path, opts = {}) {
   let body = null;
   try { body = await r.json(); } catch (_) {}
   if (!r.ok) {
-    throw new Error((body && body.error) || `HTTP ${r.status}`);
+    const err = new Error((body && body.error) || `HTTP ${r.status}`);
+    err.status = r.status;
+    err.body = body; // on 409 this is the current approval row
+    throw err;
   }
   return body;
 }
@@ -158,6 +182,18 @@ function toast(msg, type = 'info') {
   setTimeout(() => { t.style.opacity = '0'; setTimeout(() => t.remove(), 300); }, 3500);
 }
 
+// staleNote shows a neutral, dismissible banner — used when an approval was
+// already decided (possibly on another device) or expired, so the operator
+// gets honest feedback instead of a false success/error toast.
+function staleNote(msg) {
+  document.querySelectorAll('.toast').forEach((n) => n.remove());
+  const t = el('div', { class: 'toast stale' },
+    el('span', { class: 'grow' }, msg),
+    el('button', { class: 'link', on: { click: () => t.remove() } }, 'Dismiss'),
+  );
+  document.body.appendChild(t);
+}
+
 // ---- bootstrap -------------------------------------------------------------
 
 async function refreshUser() {
@@ -180,7 +216,7 @@ async function refreshUser() {
 async function loadAll() {
   if (!state.user) return;
   try {
-    const [pendings, audits, agents, memos, servers, tools, market, settingsRes, usageRes, vapid] = await Promise.all([
+    const [pendings, audits, agents, memos, servers, tools, market, settingsRes, usageRes, vapid, policies] = await Promise.all([
       api('/v1/approvals?status=pending'),
       api('/v1/audit?limit=50'),
       api('/v1/agents'),
@@ -191,7 +227,9 @@ async function loadAll() {
       api('/v1/settings').catch(() => ({})),
       api('/v1/usage').catch(() => ({ per_tool: {}, rows: [] })),
       api('/v1/push/vapid_key').catch(() => null),
+      api('/v1/policies').catch(() => []),
     ]);
+    state.policies = policies || [];
     state.settings = Object.assign({}, state.settings, settingsRes || {});
     state.usage = usageRes || state.usage;
     state.approvals = pendings || [];
@@ -225,16 +263,99 @@ async function reloadServers() {
 }
 
 let evtSrc = null;
+let streamWatchdog = null;
+
+// markStreamEvent records that the stream is alive (any event, including the
+// server's `ping` keepalive). On recovery from a down state it refetches
+// core data so we don't miss events that fired while the socket was dead.
+function markStreamEvent() {
+  state.stream.lastEventAt = Date.now();
+  if (state.stream.status !== 'live') {
+    const recovered = state.stream.wasDown;
+    state.stream.status = 'live';
+    state.stream.wasDown = false;
+    render();
+    if (recovered) refetchCore();
+  }
+}
+
 function startStream() {
   if (evtSrc) try { evtSrc.close(); } catch {}
+  state.stream.status = state.stream.lastEventAt ? 'reconnecting' : 'connecting';
+  render();
   evtSrc = new EventSource('/v1/events/stream');
-  evtSrc.addEventListener('open', () => { state.streamLive = true; render(); });
-  evtSrc.onerror = () => { state.streamLive = false; render(); };
-  evtSrc.addEventListener('approval', (e) => { handleApprovalEvent(JSON.parse(e.data)); });
-  evtSrc.addEventListener('audit', (e) => { handleAuditEvent(JSON.parse(e.data)); });
-  evtSrc.addEventListener('mcp_oauth_done', (e) => { handleOAuthDone(JSON.parse(e.data)); });
-  evtSrc.addEventListener('mcp_oauth_refreshed', () => { reloadServers(); render(); });
-  evtSrc.addEventListener('mcp_oauth_needs_reauth', (e) => { handleOAuthReauth(JSON.parse(e.data)); });
+  evtSrc.addEventListener('open', () => { markStreamEvent(); });
+  evtSrc.addEventListener('ping', () => { markStreamEvent(); });
+  evtSrc.onerror = () => {
+    // EventSource auto-reconnects on its own, but surface the gap so the
+    // user sees "Offline" rather than a stale-but-confident UI.
+    state.stream.status = 'offline';
+    state.stream.wasDown = true;
+    render();
+  };
+  evtSrc.addEventListener('approval', (e) => { markStreamEvent(); handleApprovalEvent(JSON.parse(e.data)); });
+  evtSrc.addEventListener('audit', (e) => { markStreamEvent(); handleAuditEvent(JSON.parse(e.data)); });
+  evtSrc.addEventListener('event', (e) => { markStreamEvent(); handleHubEvent(JSON.parse(e.data)); });
+  evtSrc.addEventListener('mcp_oauth_done', (e) => { markStreamEvent(); handleOAuthDone(JSON.parse(e.data)); });
+  evtSrc.addEventListener('mcp_oauth_refreshed', () => { markStreamEvent(); reloadServers(); render(); });
+  evtSrc.addEventListener('mcp_oauth_needs_reauth', (e) => { markStreamEvent(); handleOAuthReauth(JSON.parse(e.data)); });
+
+  // Watchdog: the server sends a `ping` every 15s. If we see nothing for
+  // 45s the socket is wedged even though onerror never fired — common on
+  // mobile Safari — so force a reconnect.
+  if (!streamWatchdog) {
+    streamWatchdog = setInterval(() => {
+      if (!state.user || !state.stream.lastEventAt) return;
+      if (Date.now() - state.stream.lastEventAt > 45000) {
+        state.stream.wasDown = true;
+        startStream();
+      }
+    }, 20000);
+  }
+}
+
+// refetchCore re-pulls the data that SSE normally keeps live, after a
+// stream outage. Pendings are authoritative; audit is dedupe-merged by id.
+async function refetchCore() {
+  try {
+    const [pendings, audits] = await Promise.all([
+      api('/v1/approvals?status=pending'),
+      api('/v1/audit?limit=50'),
+    ]);
+    state.approvals = pendings || [];
+    const fresh = audits || [];
+    const seen = new Set(fresh.map((a) => a.id));
+    state.audit = fresh.concat((state.audit || []).filter((a) => !seen.has(a.id))).slice(0, 200);
+    render();
+  } catch (_) { /* best-effort; the watchdog will retry */ }
+}
+
+function reconnectStream() {
+  state.stream.wasDown = true;
+  startStream();
+}
+
+// renderStreamPill is the tappable Live / Reconnecting… / Offline status in
+// the header. Tapping (or Enter/Space) forces a reconnect when not live.
+function renderStreamPill() {
+  const s = state.stream || { status: 'connecting', lastEventAt: 0 };
+  const live = s.status === 'live';
+  const cls = live ? 'live' : (s.status === 'offline' ? 'offline' : 'reconnecting');
+  const label = live ? 'Live' : (s.status === 'offline' ? 'Offline' : 'Reconnecting…');
+  const ago = s.lastEventAt ? ` · last event ${relTime(s.lastEventAt)}` : '';
+  return el('span', {
+    class: 'stream-status ' + cls,
+    title: (live ? 'Realtime stream connected' : 'Realtime stream ' + label.toLowerCase() + ' — tap to reconnect') + ago,
+    role: 'button',
+    tabindex: 0,
+    on: {
+      click: () => { if (!live) reconnectStream(); },
+      keydown: (e) => { if (!live && (e.key === 'Enter' || e.key === ' ')) { e.preventDefault(); reconnectStream(); } },
+    },
+  },
+    el('span', { class: 'stream-pill ' + cls }),
+    ' ' + label,
+  );
 }
 
 function handleOAuthDone(payload) {
@@ -278,9 +399,24 @@ function handleApprovalEvent(req) {
   render();
 }
 
+// handleHubEvent receives a live Events Hub event. When the operator is on the
+// Events route we prepend it; otherwise we just bump the unacked badge so the
+// nav label reflects the new arrival without a full reload.
+function handleHubEvent(ev) {
+  state.events.unacked = (state.events.unacked || 0) + 1;
+  if (state.route === 'events') {
+    state.events.rows.unshift(ev);
+    if (state.events.rows.length > 300) state.events.rows.length = 300;
+  }
+  render();
+}
+
+const AUDIT_CAP = 1000;
 function handleAuditEvent(ev) {
   state.audit.unshift(ev);
-  if (state.audit.length > 200) state.audit.length = 200;
+  // Cap higher than the old 200 so live events don't evict rows the user
+  // pulled in via "Load older" pagination.
+  if (state.audit.length > AUDIT_CAP) state.audit.length = AUDIT_CAP;
   render();
 }
 
@@ -289,13 +425,14 @@ async function loadInsights() {
   render();
   const range = state.insights.range;
   try {
-    const [overview, tools, agents, cost, rules, anomalies] = await Promise.all([
+    const [overview, tools, agents, cost, rules, anomalies, policies] = await Promise.all([
       api('/v1/insights/overview?range=' + range).catch(() => null),
       api('/v1/insights/tools?range=' + range).catch(() => []),
       api('/v1/insights/agents?range=' + range).catch(() => []),
       api('/v1/insights/cost?range=' + range).catch(() => ({ rows: [] })),
       api('/v1/insights/auto/rules').catch(() => []),
       api('/v1/insights/anomalies?limit=50').catch(() => []),
+      api('/v1/policies').catch(() => []),
     ]);
     state.insights.overview = overview;
     state.insights.tools = tools || [];
@@ -303,6 +440,7 @@ async function loadInsights() {
     state.insights.cost = cost || { rows: [] };
     state.insights.autoRules = rules || [];
     state.anomalies = anomalies || [];
+    state.policies = policies || [];
   } catch (e) { toast(e.message, 'error'); }
   state.insights.loading = false;
   render();
@@ -395,10 +533,30 @@ function viewApprovals() {
   }));
 }
 
+// renderArgs makes tool arguments phone-scannable: a flat object renders as
+// a key/value table; anything nested falls back to pretty JSON.
+function renderArgs(args) {
+  if (!args || typeof args !== 'object' || Array.isArray(args)) {
+    return el('pre', { class: 'json' }, JSON.stringify(args == null ? {} : args, null, 2));
+  }
+  const keys = Object.keys(args);
+  if (keys.length === 0) return el('div', { class: 'meta' }, '(no arguments)');
+  const flat = keys.every((k) => args[k] == null || typeof args[k] !== 'object');
+  if (!flat) return el('pre', { class: 'json' }, JSON.stringify(args, null, 2));
+  return el('table', { class: 'args-table' }, el('tbody', {}, keys.map((k) =>
+    el('tr', {},
+      el('td', { class: 'meta', style: 'vertical-align: top; padding-right: 10px; white-space: nowrap;' }, k),
+      el('td', { style: 'word-break: break-word;' }, String(args[k])),
+    ))));
+}
+
 function renderApprovalBatch(agentKey, items) {
+  const now = Date.now();
   const ids = items.map((a) => a.id);
+  const liveIds = items.filter((a) => a.expires_at > now).map((a) => a.id);
   const earliest = Math.min(...items.map((a) => a.expires_at));
   const isBatch = items.length > 1;
+  const allExpired = liveIds.length === 0;
   const labelAgent = agentKey === '__anon__' ? 'anonymous (no agent token)' : agentKey;
 
   // Compact summary line: "fs.write_file · github.create_issue · …"
@@ -414,33 +572,41 @@ function renderApprovalBatch(agentKey, items) {
       isBatch ? el('div', { class: 'meta', style: 'margin-top: 4px; font-family: ui-monospace, monospace;' }, toolSummary) : null,
     ),
     isBatch ? el('div', { class: 'row' },
-      el('button', { class: 'primary', on: { click: () => decideBatch(ids, 'allowed') }}, `Allow all (${items.length})`),
-      el('button', { class: 'danger',  on: { click: () => decideBatch(ids, 'denied')  }}, `Deny all`),
+      el('button', { class: 'primary', disabled: allExpired, on: { click: () => decideBatch(liveIds, 'allowed') }}, `Allow all (${liveIds.length})`),
+      el('button', { class: 'danger', disabled: allExpired, on: { click: () => decideBatch(liveIds, 'denied')  }}, `Deny all`),
     ) : null,
   );
 
-  const rows = items.map((a) => el('div', {
-    style: 'border-top: 1px solid var(--border); padding: 12px 0; margin-top: 8px;',
-  },
-    el('div', { class: 'row' },
-      el('span', { class: 'grow', style: 'font-weight: 500;' }, `${a.upstream_name} · ${a.tool_name}`),
-      a.intent_category ? el('span', { class: 'badge' }, a.intent_category) : null,
-      badge(a.status),
-    ),
-    el('div', { class: 'meta', style: 'margin: 4px 0 6px;' },
-      `created ${relTime(a.created_at)} · expires ${relTime(a.expires_at)}`),
-    el('div', { style: 'background: var(--bg); border: 1px solid var(--border); border-radius: 4px; padding: 8px; margin: 4px 0;' },
-      el('div', { class: 'meta' }, 'reasoning'),
-      a.reason || '(none provided)'),
-    el('details', {},
-      el('summary', {}, 'arguments'),
-      el('pre', { class: 'json' }, JSON.stringify(a.arguments || {}, null, 2)),
-    ),
-    el('div', { class: 'row', style: 'margin-top: 8px;' },
-      el('button', { class: 'primary', on: { click: () => decideApproval(a.id, 'allowed') } }, 'Allow'),
-      el('button', { class: 'danger',  on: { click: () => decideApproval(a.id, 'denied')  } }, 'Deny'),
-    ),
-  ));
+  const rows = items.map((a) => {
+    const expired = a.expires_at <= now;
+    const card = el('div', {
+      class: 'approval-card',
+      tabindex: 0,
+      'data-approval-id': a.id,
+      style: 'border-top: 1px solid var(--border); padding: 12px 0; margin-top: 8px;' + (expired ? ' opacity: 0.55;' : ''),
+    },
+      el('div', { class: 'row' },
+        el('span', { class: 'grow', style: 'font-weight: 500;' }, `${a.upstream_name} · ${a.tool_name}`),
+        a.intent_category ? el('span', { class: 'badge' }, a.intent_category) : null,
+        badge(expired ? 'expired' : a.status),
+      ),
+      el('div', { class: 'meta', style: 'margin: 4px 0 6px;' },
+        `created ${relTime(a.created_at)} · ` + (expired ? 'expired' : `expires ${relTime(a.expires_at)}`)),
+      el('div', { style: 'background: var(--bg); border: 1px solid var(--border); border-radius: 4px; padding: 8px; margin: 4px 0;' },
+        el('div', { class: 'meta' }, 'reasoning'),
+        a.reason || '(none provided)'),
+      el('details', {},
+        el('summary', {}, 'arguments'),
+        renderArgs(a.arguments),
+      ),
+      el('div', { class: 'row', style: 'margin-top: 8px;' },
+        el('button', { class: 'primary', disabled: expired, on: { click: () => decideApproval(a.id, 'allowed') } }, 'Allow'),
+        el('button', { class: 'danger', disabled: expired, on: { click: () => decideApproval(a.id, 'denied')  } }, 'Deny'),
+        expired ? null : el('span', { class: 'meta', style: 'margin-left: auto;' }, 'focus + a/d to decide'),
+      ),
+    );
+    return card;
+  });
 
   return el('div', { class: 'card' }, header, ...rows);
 }
@@ -451,7 +617,20 @@ async function decideApproval(id, action) {
     state.approvals = state.approvals.filter((a) => a.id !== id);
     toast(action === 'allowed' ? 'Approved' : 'Denied');
     render();
-  } catch (e) { toast(e.message, 'error'); }
+  } catch (e) {
+    if (e.status === 409 || e.status === 404 || e.status === 410) {
+      // Already decided (maybe on another device) or expired. Drop the
+      // card and show a neutral banner — not a false success or a scary
+      // error. e.body is the current row on a 409.
+      state.approvals = state.approvals.filter((a) => a.id !== id);
+      const st = e.body && e.body.status;
+      staleNote(st ? `Already ${st} — decided on another device or expired.`
+                   : 'Already decided on another device or expired.');
+      render();
+      return;
+    }
+    toast(e.message, 'error');
+  }
 }
 
 async function decideBatch(ids, action) {
@@ -459,8 +638,220 @@ async function decideBatch(ids, action) {
   try {
     const out = await api('/v1/approvals/decide-batch', { method: 'POST', body: { ids, action }});
     const flipped = (out || []).filter((r) => r.status === action).length;
+    const stale = ids.length - flipped;
     state.approvals = state.approvals.filter((a) => !ids.includes(a.id));
-    toast(`${action === 'allowed' ? 'Approved' : 'Denied'} ${flipped} of ${ids.length}`);
+    if (flipped === 0) {
+      staleNote(`All ${ids.length} were already decided on another device or expired.`);
+    } else {
+      toast(`${action === 'allowed' ? 'Approved' : 'Denied'} ${flipped} of ${ids.length}` +
+            (stale ? ` · ${stale} already settled` : ''));
+    }
+    render();
+  } catch (e) { toast(e.message, 'error'); }
+}
+
+// ---- Feature A: explicit tool/upstream policies ----------------------------
+
+// toolPolicyMode resolves the effective 5-way mode for a tool: an explicit
+// policy (allow/ask/deny) wins; otherwise auto (learned) or default.
+function toolPolicyMode(toolName, autoApprove) {
+  const p = (state.policies || []).find((x) => x.scope === 'tool' && x.target === toolName);
+  if (p) return p.action;
+  return autoApprove ? 'auto' : 'default';
+}
+
+const POLICY_MODES = [
+  ['default', 'Default'],
+  ['auto', 'Auto'],
+  ['allow', 'Allow'],
+  ['ask', 'Ask'],
+  ['deny', 'Deny'],
+];
+
+// renderPolicyControl is the 5-segment pill: Default | Auto | Allow | Ask | Deny.
+function renderPolicyControl(t) {
+  const cur = toolPolicyMode(t.tool_name, t.auto_approve);
+  return el('div', { class: 'policy-seg' }, ...POLICY_MODES.map(([m, label]) =>
+    el('button', {
+      class: 'seg' + (cur === m ? ' active' : '') + (m === 'deny' ? ' deny' : '') + (m === 'allow' ? ' allow' : ''),
+      title: t.is_destructive && (m === 'auto' || m === 'allow')
+        ? 'Destructive tool — Auto is still vetoed; Allow needs an explicit confirm.'
+        : m,
+      on: { click: () => setToolPolicyMode(t.tool_name, m) },
+    }, label)));
+}
+
+async function setToolPolicyMode(toolName, mode, force) {
+  try {
+    const resp = await api('/v1/insights/tools/' + encodeURIComponent(toolName) + '/policy', {
+      method: 'POST', body: { mode, force: !!force },
+    });
+    if (resp && resp.destructive_veto) {
+      toast(toolName + ': saved, but destructive tools still require human review.', 'warn');
+    } else {
+      toast(toolName + ' → ' + mode);
+    }
+    // Refresh both the explicit-policy list and the insights table.
+    state.policies = await api('/v1/policies').catch(() => state.policies);
+    if (state.route === 'insights') loadInsights(); else render();
+  } catch (err) {
+    if (err.status === 409 && err.body && err.body.needs_force) {
+      if (confirm(toolName + ' looks destructive. Allowing it bypasses the destructive veto — are you sure?')) {
+        return setToolPolicyMode(toolName, mode, true);
+      }
+      return;
+    }
+    toast(err.message, 'error');
+  }
+}
+
+// renderPolicyRulesCard lists explicit policies with a delete control.
+function renderPolicyRulesCard() {
+  const rules = state.policies || [];
+  return el('div', { class: 'card' },
+    el('h2', {}, 'Policy rules'),
+    el('p', { class: 'meta' }, 'Explicit per-tool / per-upstream gates. These beat learned auto-approval (an explicit “Ask” always waits for you).'),
+    rules.length === 0
+      ? el('div', { class: 'empty' }, 'No explicit policies — tools fall back to the heuristic.')
+      : el('table', {},
+          el('thead', {}, el('tr', {}, el('th', {}, 'Scope'), el('th', {}, 'Target'), el('th', {}, 'Action'), el('th', {}, ''))),
+          el('tbody', {}, rules.map((p) => el('tr', {},
+            el('td', {}, p.scope),
+            el('td', {}, el('code', {}, p.target)),
+            el('td', {}, el('span', { class: 'badge ' + p.action }, p.action)),
+            el('td', {}, el('button', { class: 'danger', on: { click: async () => {
+              try { await api('/v1/policies/' + encodeURIComponent(p.id), { method: 'DELETE' });
+                state.policies = await api('/v1/policies').catch(() => []);
+                render();
+              } catch (e) { toast(e.message, 'error'); }
+            } } }, 'Delete')),
+          ))),
+        ),
+  );
+}
+
+// setUpstreamPolicy is the per-server policy select handler (Servers tab).
+async function setUpstreamPolicy(upstream, action) {
+  try {
+    if (action === 'default') {
+      const p = (state.policies || []).find((x) => x.scope === 'upstream' && x.target === upstream);
+      if (p) await api('/v1/policies/' + encodeURIComponent(p.id), { method: 'DELETE' });
+    } else {
+      await api('/v1/policies', { method: 'POST', body: { scope: 'upstream', target: upstream, action } });
+    }
+    state.policies = await api('/v1/policies').catch(() => state.policies);
+    toast(upstream + ' → ' + action);
+    render();
+  } catch (e) { toast(e.message, 'error'); }
+}
+
+function upstreamPolicyMode(upstream) {
+  const p = (state.policies || []).find((x) => x.scope === 'upstream' && x.target === upstream);
+  return p ? p.action : 'default';
+}
+
+function filteredAudit() {
+  const f = state.auditFilter;
+  const q = (f.q || '').toLowerCase();
+  return (state.audit || []).filter((e) => {
+    if (f.event_type && e.event_type !== f.event_type) return false;
+    if (f.decision && (e.decision || '') !== f.decision) return false;
+    if (f.agent && (e.agent_id || '') !== f.agent) return false;
+    if (!q) return true;
+    return [e.tool_name, e.upstream_name, e.reason, e.agent_id, e.result_summary, e.event_type]
+      .some((v) => (v || '').toLowerCase().includes(q));
+  });
+}
+
+function uniqueSorted(vals) {
+  return Array.from(new Set(vals.filter(Boolean))).sort();
+}
+
+function csvCell(v) {
+  const s = v == null ? '' : String(v);
+  // Quote when the cell contains a comma, quote, or newline; double inner quotes.
+  return /[",\n\r]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s;
+}
+
+// auditExportURL builds a server-side export link honoring the structured
+// dropdown filters (the free-text q filter is client-only).
+function auditExportURL(format) {
+  const f = state.auditFilter;
+  const p = new URLSearchParams({ format });
+  if (f.event_type) p.set('event_type', f.event_type);
+  if (f.decision) p.set('decision', f.decision);
+  if (f.agent) p.set('agent_id', f.agent);
+  return '/v1/audit/export?' + p.toString();
+}
+
+function hookQueryParams(extra = {}) {
+  const f = state.hookFilter || {};
+  const p = new URLSearchParams(extra);
+  if (f.agent) p.set('agent_id', f.agent);
+  if (f.source) p.set('source', f.source);
+  if (f.event_name) p.set('event_name', f.event_name);
+  if (f.session_id) p.set('session_id', f.session_id);
+  if (f.q) p.set('q', f.q);
+  return p;
+}
+
+async function loadHooks(reset = false) {
+  if (state.hooks.loading) return;
+  state.hooks.loading = true;
+  if (reset) {
+    state.hooks.events = [];
+    state.hooks.end = false;
+  }
+  render();
+  try {
+    const p = hookQueryParams({ limit: '100' });
+    if (!reset && state.hooks.events.length) {
+      p.set('before', String(state.hooks.events[state.hooks.events.length - 1].ts));
+    }
+    const rows = await api('/v1/hooks/events?' + p.toString());
+    if (!rows || rows.length === 0) {
+      state.hooks.end = true;
+    } else if (reset) {
+      state.hooks.events = rows;
+    } else {
+      const seen = new Set(state.hooks.events.map((e) => e.id));
+      state.hooks.events = state.hooks.events.concat(rows.filter((e) => !seen.has(e.id)));
+    }
+    state.hooks.loaded = true;
+  } catch (e) { toast(e.message, 'error'); }
+  state.hooks.loading = false;
+  render();
+}
+
+function hooksExportURL(format) {
+  return '/v1/hooks/export?' + hookQueryParams({ format }).toString();
+}
+
+function exportAuditCSV() {
+  const rows = filteredAudit();
+  const header = ['when_iso', 'event_type', 'upstream', 'tool', 'decision', 'agent_id', 'reason', 'result_summary'];
+  const lines = [header.join(',')];
+  for (const e of rows) {
+    lines.push([
+      new Date(e.ts).toISOString(), e.event_type, e.upstream_name, e.tool_name,
+      e.decision, e.agent_id, e.reason, e.result_summary,
+    ].map(csvCell).join(','));
+  }
+  const blob = new Blob([lines.join('\n')], { type: 'text/csv' });
+  const a = el('a', { href: URL.createObjectURL(blob), download: `toolyard-audit-${Date.now()}.csv` });
+  document.body.appendChild(a); a.click();
+  setTimeout(() => { URL.revokeObjectURL(a.href); a.remove(); }, 0);
+}
+
+async function loadOlderAudit() {
+  if (!state.audit.length) return;
+  const oldest = state.audit[state.audit.length - 1].ts;
+  try {
+    const older = await api(`/v1/audit?before=${oldest}&limit=100`);
+    if (!older || !older.length) { state.auditEnd = true; render(); return; }
+    const seen = new Set(state.audit.map((a) => a.id));
+    state.audit = state.audit.concat(older.filter((a) => !seen.has(a.id)));
+    state.auditPaged = true;
     render();
   } catch (e) { toast(e.message, 'error'); }
 }
@@ -469,25 +860,143 @@ function viewAudit() {
   if (!state.audit.length) {
     return el('div', { class: 'card empty' }, 'No events yet.');
   }
+  const f = state.auditFilter;
+  const setF = (k) => (ev) => { f[k] = ev.target.value; render(); };
+  const eventTypes = uniqueSorted(state.audit.map((e) => e.event_type));
+  const decisions = uniqueSorted(state.audit.map((e) => e.decision));
+  const agents = uniqueSorted(state.audit.map((e) => e.agent_id));
+
+  const opt = (v, label) => el('option', { value: v, selected: false }, label);
+  const sel = (key, all, vals) => {
+    const s = el('select', { on: { change: setF(key) } }, opt('', all), ...vals.map((v) => opt(v, v)));
+    s.value = f[key] || '';
+    return s;
+  };
+
+  const filterBar = el('div', { class: 'row audit-filters', style: 'gap: 8px; margin-bottom: 12px; flex-wrap: wrap;' },
+    (() => { const i = el('input', { id: 'audit-q', type: 'search', placeholder: 'Filter tool / reason / agent / result…', class: 'grow', on: { input: setF('q') } }); i.value = f.q || ''; return i; })(),
+    sel('event_type', 'All events', eventTypes),
+    sel('decision', 'All decisions', decisions),
+    sel('agent', 'All agents', agents),
+    el('button', { on: { click: exportAuditCSV }, title: 'Export the rows currently shown (includes the text filter)' }, 'Export shown'),
+    el('a', { href: auditExportURL('csv'), target: '_blank', title: 'Server-side export of the full log honoring the dropdown filters' }, 'Full CSV'),
+    el('a', { href: auditExportURL('json'), target: '_blank' }, 'Full JSON'),
+  );
+
+  const rows = filteredAudit();
   const tbl = el('table', {},
     el('thead', {}, el('tr', {},
       el('th', {}, 'When'),
       el('th', {}, 'Event'),
       el('th', {}, 'Tool'),
+      el('th', {}, 'Agent'),
       el('th', {}, 'Decision'),
       el('th', {}, 'Reasoning / Result'),
     )),
-    el('tbody', {}, state.audit.map((e) => el('tr', {},
+    el('tbody', {}, rows.map((e) => el('tr', {},
       el('td', { class: 'meta' }, relTime(e.ts)),
       el('td', {}, e.event_type),
       el('td', {}, e.tool_name ? `${e.upstream_name || ''} · ${e.tool_name}` : '—'),
+      el('td', { class: 'meta' }, e.agent_id || '—'),
       el('td', {}, e.decision || '—'),
       el('td', {}, e.reason ? el('div', {}, el('div', {}, e.reason),
         e.result_summary ? el('div', { class: 'meta', style: 'margin-top: 4px;' }, e.result_summary) : null)
         : (e.result_summary || '—')),
     ))),
   );
-  return el('div', { class: 'card' }, tbl);
+
+  const footer = el('div', { class: 'row', style: 'margin-top: 12px; align-items: center; gap: 12px;' },
+    el('span', { class: 'meta' }, `${rows.length} of ${state.audit.length} loaded`),
+    state.auditEnd
+      ? el('span', { class: 'meta' }, 'No older events.')
+      : el('button', { on: { click: loadOlderAudit } }, 'Load older'),
+  );
+
+  return el('div', { class: 'card' }, filterBar, tbl, footer);
+}
+
+function viewHooks() {
+  const rows = state.hooks.events || [];
+  const f = state.hookFilter;
+  const setF = (k) => (ev) => {
+    f[k] = ev.target.value;
+    state.hooks.loaded = false;
+    loadHooks(true);
+  };
+  const opt = (v, label) => el('option', { value: v }, label);
+  const sel = (key, all, vals) => {
+    const s = el('select', { on: { change: setF(key) } }, opt('', all), ...vals.map((v) => opt(v, v)));
+    s.value = f[key] || '';
+    return s;
+  };
+  const agents = uniqueSorted([...(state.agents || []).map((a) => a.id), ...rows.map((e) => e.agent_id)]);
+  const sources = uniqueSorted(rows.map((e) => e.source).concat(['claude_code', 'codex', 'cursor', 'generic']));
+  const events = uniqueSorted(rows.map((e) => e.event_name));
+  const sessions = uniqueSorted(rows.map((e) => e.session_id)).slice(0, 100);
+  const counts = rows.reduce((m, e) => {
+    if (e.agent_id) m[e.agent_id] = (m[e.agent_id] || 0) + 1;
+    return m;
+  }, {});
+  const countLine = Object.entries(counts).slice(0, 4).map(([agent, n]) => `${agent.slice(0, 10)}: ${n}`).join(' · ');
+
+  const filterBar = el('div', { class: 'row audit-filters', style: 'gap: 8px; margin-bottom: 12px; flex-wrap: wrap;' },
+    (() => { const i = el('input', { id: 'hooks-q', type: 'search', placeholder: 'Search text / tool / event / session…', class: 'grow', on: { change: setF('q'), keydown: (e) => { if (e.key === 'Enter') setF('q')(e); } } }); i.value = f.q || ''; return i; })(),
+    sel('source', 'All sources', sources),
+    sel('event_name', 'All events', events),
+    sel('agent', 'All agents', agents),
+    sel('session_id', 'All sessions', sessions),
+    el('button', { on: { click: () => loadHooks(true) }, disabled: state.hooks.loading }, state.hooks.loading ? 'Loading…' : 'Refresh'),
+    el('a', { href: hooksExportURL('csv'), target: '_blank' }, 'CSV'),
+    el('a', { href: hooksExportURL('json'), target: '_blank' }, 'JSON'),
+  );
+
+  const recipes = el('div', { class: 'card' },
+    el('h2', {}, 'Hook recipes'),
+    el('p', { class: 'meta' },
+      'Use the same ingest endpoint for interaction logging, memory ingest, approval resume, tool-call auditing, notifications, guardrails, and turn summaries.'),
+    el('div', { class: 'meta' }, countLine || 'No per-agent hook counts loaded yet.'),
+  );
+
+  const table = rows.length === 0
+    ? el('div', { class: 'card empty' }, state.hooks.loading ? 'Loading hook events…' : 'No hook events match these filters yet.')
+    : el('div', { class: 'card' },
+        filterBar,
+        el('table', {},
+          el('thead', {}, el('tr', {},
+            el('th', {}, 'When'),
+            el('th', {}, 'Source'),
+            el('th', {}, 'Event'),
+            el('th', {}, 'Agent'),
+            el('th', {}, 'Session'),
+            el('th', {}, 'Text / Tool'),
+          )),
+          el('tbody', {}, rows.map((e) => el('tr', {},
+            el('td', { class: 'meta' }, relTime(e.ts)),
+            el('td', {}, e.source || 'generic'),
+            el('td', {}, e.event_name || 'unknown'),
+            el('td', { class: 'meta' }, e.agent_id || '—'),
+            el('td', { class: 'meta' }, e.session_id ? el('code', {}, e.session_id.slice(0, 18)) : '—'),
+            el('td', {}, [
+              e.tool_name ? el('div', {}, el('code', {}, e.tool_name)) : null,
+              e.text ? el('div', { class: 'meta', style: 'white-space: pre-wrap; margin-top: 4px;' }, e.text.slice(0, 500)) : null,
+              e.memory_ingested ? el('div', { class: 'badge allowed', style: 'margin-top: 4px;' }, 'memory') : null,
+              e.payload ? el('details', { style: 'margin-top: 6px;' },
+                el('summary', {}, 'payload'),
+                el('pre', { class: 'mem-value', style: 'max-height: 220px; overflow: auto; white-space: pre-wrap;' },
+                  JSON.stringify(e.payload, null, 2).slice(0, 4000)),
+              ) : null,
+            ]),
+          ))),
+        ),
+        el('div', { class: 'row', style: 'margin-top: 12px; align-items: center; gap: 12px;' },
+          el('span', { class: 'meta' }, `${rows.length} loaded`),
+          state.hooks.end
+            ? el('span', { class: 'meta' }, 'No older events.')
+            : el('button', { on: { click: () => loadHooks(false) }, disabled: state.hooks.loading }, state.hooks.loading ? 'Loading…' : 'Load older'),
+        ),
+      );
+
+  return el('div', {}, rows.length === 0 ? el('div', { class: 'card' }, filterBar) : null, table, recipes);
 }
 
 function viewAgents() {
@@ -506,14 +1015,54 @@ function viewAgents() {
       state.agents.length === 0
         ? el('div', { class: 'empty' }, 'No agents yet. Click "Add new agent" to enrol your first one.')
         : el('table', {}, el('thead', {}, el('tr', {},
-            el('th', {}, 'Name'), el('th', {}, 'ID'), el('th', {}, 'Last seen'))),
-            el('tbody', {}, state.agents.map((a) => el('tr', {},
+            el('th', {}, 'Name'), el('th', {}, 'ID'), el('th', {}, 'Last seen'), el('th', {}, 'Status'), el('th', {}, ''))),
+            el('tbody', {}, state.agents.map((a) => el('tr', { style: a.disabled ? 'opacity: 0.6;' : '' },
               el('td', {}, a.name),
               el('td', {}, el('code', {}, a.id)),
               el('td', { class: 'meta' }, a.last_seen ? relTime(a.last_seen) : 'never'),
+              el('td', {}, a.disabled
+                ? el('span', { class: 'badge denied' }, 'disabled')
+                : el('span', { class: 'badge allowed' }, 'active')),
+              el('td', {}, el('div', { class: 'row' },
+                el('button', { on: { click: () => rotateAgent(a) } }, 'Rotate'),
+                a.disabled
+                  ? el('button', { on: { click: () => setAgentDisabled(a, false) } }, 'Enable')
+                  : el('button', { on: { click: () => setAgentDisabled(a, true) } }, 'Disable'),
+                el('button', { class: 'danger', on: { click: () => deleteAgent(a) } }, 'Delete'),
+              )),
             )))),
     ),
   );
+}
+
+async function rotateAgent(a) {
+  if (!confirm(`Rotate ${a.name}'s token? The old token keeps working for a 10-minute grace window, then stops.`)) return;
+  try {
+    const resp = await api(`/v1/agents/${encodeURIComponent(a.id)}/rotate`, { method: 'POST', body: {} });
+    // Reuse the enrollment "token + setup snippets" modal to reveal the new token.
+    state.agentModal = { stage: 'done', name: a.name, agent: { id: a.id, token: resp.token }, snippetTab: 'cli' };
+    await reloadAgents();
+    render();
+  } catch (e) { toast(e.message, 'error'); }
+}
+
+async function setAgentDisabled(a, disabled) {
+  try {
+    await api(`/v1/agents/${encodeURIComponent(a.id)}/${disabled ? 'disable' : 'enable'}`, { method: 'POST', body: {} });
+    toast(`${a.name} ${disabled ? 'disabled' : 'enabled'}`);
+    await reloadAgents();
+    render();
+  } catch (e) { toast(e.message, 'error'); }
+}
+
+async function deleteAgent(a) {
+  if (!confirm(`Permanently delete ${a.name}? Its token stops working immediately and can't be recovered.`)) return;
+  try {
+    await api(`/v1/agents/${encodeURIComponent(a.id)}`, { method: 'DELETE' });
+    toast(`${a.name} deleted`);
+    await reloadAgents();
+    render();
+  } catch (e) { toast(e.message, 'error'); }
 }
 
 function renderAgentModal() {
@@ -582,6 +1131,10 @@ function renderAgentDoneStep(m) {
     { id: 'cli',     label: 'Claude Code CLI' },
     { id: 'project', label: '.mcp.json (project)' },
     { id: 'global',  label: '~/.claude.json (global)' },
+    { id: 'hook-claude', label: 'Claude hooks' },
+    { id: 'hook-codex',  label: 'Codex hooks' },
+    { id: 'hook-cursor', label: 'Cursor hooks' },
+    { id: 'hook-conductor', label: 'Conductor' },
   ];
 
   const cli =
@@ -608,9 +1161,66 @@ ${JSON.stringify({
   },
 }, null, 2)}`;
 
+  const hookURL = baseUrlNoMcp + '/v1/hooks/ingest?source=claude_code';
+  const claudeHooks = JSON.stringify({
+    hooks: {
+      UserPromptSubmit: [{ hooks: [{ type: 'http', url: hookURL, headers: { Authorization: `Bearer ${tok}` } }] }],
+      PostToolUse: [{ hooks: [{ type: 'http', url: hookURL, headers: { Authorization: `Bearer ${tok}` } }] }],
+      PostToolUseFailure: [{ hooks: [{ type: 'http', url: hookURL, headers: { Authorization: `Bearer ${tok}` } }] }],
+      Stop: [{ hooks: [{ type: 'http', url: hookURL, headers: { Authorization: `Bearer ${tok}` } }] }],
+      SubagentStart: [{ hooks: [{ type: 'http', url: hookURL, headers: { Authorization: `Bearer ${tok}` } }] }],
+      SubagentStop: [{ hooks: [{ type: 'http', url: hookURL, headers: { Authorization: `Bearer ${tok}` } }] }],
+    },
+  }, null, 2);
+
+  const forwarderInstall =
+`mkdir -p ~/.toolyard/hooks
+cp scripts/toolyard-hook-forwarder.sh ~/.toolyard/hooks/
+chmod +x ~/.toolyard/hooks/toolyard-hook-forwarder.sh`;
+
+  const codexHooks = forwarderInstall + '\n\n# ~/.codex/hooks.json\n' + JSON.stringify({
+    hooks: {
+      UserPromptSubmit: [{ hooks: [{ type: 'command', command: `~/.toolyard/hooks/toolyard-hook-forwarder.sh codex ${baseUrlNoMcp} ${tok}` }] }],
+      PreToolUse: [{ matcher: '*', hooks: [{ type: 'command', command: `~/.toolyard/hooks/toolyard-hook-forwarder.sh codex ${baseUrlNoMcp} ${tok}` }] }],
+      PostToolUse: [{ matcher: '*', hooks: [{ type: 'command', command: `~/.toolyard/hooks/toolyard-hook-forwarder.sh codex ${baseUrlNoMcp} ${tok}` }] }],
+      Stop: [{ hooks: [{ type: 'command', command: `~/.toolyard/hooks/toolyard-hook-forwarder.sh codex ${baseUrlNoMcp} ${tok}` }] }],
+      SubagentStart: [{ matcher: '*', hooks: [{ type: 'command', command: `~/.toolyard/hooks/toolyard-hook-forwarder.sh codex ${baseUrlNoMcp} ${tok}` }] }],
+      SubagentStop: [{ matcher: '*', hooks: [{ type: 'command', command: `~/.toolyard/hooks/toolyard-hook-forwarder.sh codex ${baseUrlNoMcp} ${tok}` }] }],
+    },
+  }, null, 2);
+
+  const cursorHooks = forwarderInstall + '\n\n# ~/.cursor/hooks.json or <project>/.cursor/hooks.json\n' + JSON.stringify({
+    version: 1,
+    hooks: {
+      beforeSubmitPrompt: [{ command: `~/.toolyard/hooks/toolyard-hook-forwarder.sh cursor ${baseUrlNoMcp} ${tok}` }],
+      beforeMCPExecution: [{ command: `~/.toolyard/hooks/toolyard-hook-forwarder.sh cursor ${baseUrlNoMcp} ${tok}` }],
+      afterMCPExecution: [{ command: `~/.toolyard/hooks/toolyard-hook-forwarder.sh cursor ${baseUrlNoMcp} ${tok}` }],
+      afterFileEdit: [{ command: `~/.toolyard/hooks/toolyard-hook-forwarder.sh cursor ${baseUrlNoMcp} ${tok}` }],
+      stop: [{ command: `~/.toolyard/hooks/toolyard-hook-forwarder.sh cursor ${baseUrlNoMcp} ${tok}` }],
+    },
+  }, null, 2);
+
+  const conductorHooks =
+`Conductor runs Claude Code or Codex inside each workspace.
+
+For a Conductor Claude Code workspace:
+1. Use the "Claude hooks" snippet in the workspace or user Claude settings.
+2. Keep the MCP snippet above for Toolyard tools and approvals.
+
+For a Conductor Codex workspace:
+1. Install scripts/toolyard-hook-forwarder.sh with the command shown in the Codex tab.
+2. Use the "Codex hooks" hooks.json shape in the workspace .codex/ layer or user ~/.codex/hooks.json.
+
+There is no separate Conductor hook endpoint for v1; the selected agent client emits the lifecycle events.`;
+
   const snippet = m.snippetTab === 'cli' ? cli :
-                  m.snippetTab === 'project' ? project : global;
-  const snippetLang = m.snippetTab === 'cli' ? 'bash' : 'json';
+                  m.snippetTab === 'project' ? project :
+                  m.snippetTab === 'global' ? global :
+                  m.snippetTab === 'hook-claude' ? claudeHooks :
+                  m.snippetTab === 'hook-codex' ? codexHooks :
+                  m.snippetTab === 'hook-cursor' ? cursorHooks : conductorHooks;
+  const snippetLang = (m.snippetTab === 'cli' || m.snippetTab === 'hook-codex' || m.snippetTab === 'hook-cursor') ? 'bash' :
+                      m.snippetTab === 'hook-conductor' ? 'text' : 'json';
 
   return el('div', { class: 'modal-bg', on: { click: (e) => { if (e.target === e.currentTarget) closeAgentModal(); } } },
     el('div', { class: 'modal modal-wide' },
@@ -642,7 +1252,15 @@ ${JSON.stringify({
             ? 'Run this in your terminal'
             : m.snippetTab === 'project'
               ? 'Save as .mcp.json at the root of any project'
-              : 'Open ~/.claude.json and merge under mcpServers'),
+              : m.snippetTab === 'global'
+                ? 'Open ~/.claude.json and merge under mcpServers'
+                : m.snippetTab === 'hook-claude'
+                  ? 'Merge into Claude Code settings.json'
+                  : m.snippetTab === 'hook-codex'
+                    ? 'Install the forwarder, then merge into Codex hooks.json'
+                    : m.snippetTab === 'hook-cursor'
+                      ? 'Install the forwarder, then merge into Cursor hooks.json'
+                      : 'Use the hook snippet for the agent type Conductor runs'),
           el('button', { class: 'copy-btn', on: { click: (e) => copyToButton(e.target, snippet) }}, 'Copy'),
         ),
         el('pre', { 'data-lang': snippetLang }, snippet),
@@ -696,25 +1314,76 @@ function viewMemory() {
       ),
     ),
     el('div', { class: 'card' },
-      el('h2', {}, 'Entries'),
-      state.memory.length === 0
-        ? el('div', { class: 'empty' }, 'Memory is empty.')
-        : el('table', {}, el('thead', {}, el('tr', {},
-            el('th', {}, 'Scope'), el('th', {}, 'Key'), el('th', {}, 'Value'), el('th', {}, 'Updated'), el('th', {}, ''))),
-            el('tbody', {}, state.memory.map((m) => el('tr', {},
-              el('td', {}, m.scope),
-              el('td', {}, el('code', {}, m.key)),
-              el('td', {}, m.value),
-              el('td', { class: 'meta' }, relTime(m.updated_at)),
-              el('td', {}, el('button', { class: 'danger', on: { click: async () => {
-                try {
-                  await api(`/v1/memory?scope=${encodeURIComponent(m.scope)}&key=${encodeURIComponent(m.key)}`, { method: 'DELETE' });
-                  await loadAll(); render();
-                } catch (e) { toast(e.message, 'error'); }
-              }}}, 'Delete')),
-            )))),
+      el('div', { class: 'row', style: 'align-items: center;' },
+        el('h2', { class: 'grow', style: 'margin: 0;' }, 'Entries'),
+        (() => {
+          const i = el('input', { id: 'mem-filter', type: 'search', placeholder: 'Filter memories…', on: { input: (e) => { state.memoryFilter = e.target.value; render(); } } });
+          i.value = state.memoryFilter || '';
+          return i;
+        })(),
+      ),
+      renderMemoryEntries(),
     ),
   );
+}
+
+function renderMemoryEntries() {
+  const q = (state.memoryFilter || '').toLowerCase();
+  const rows = (state.memory || []).filter((m) => !q ||
+    [m.scope, m.key, m.value].some((v) => (v || '').toLowerCase().includes(q)));
+  if (!rows.length) {
+    return el('div', { class: 'empty', style: 'margin-top: 12px;' },
+      state.memory.length ? 'No memories match your filter.' : 'No memories yet.');
+  }
+  return el('table', { style: 'margin-top: 12px;' },
+    el('thead', {}, el('tr', {},
+      el('th', {}, 'Scope'), el('th', {}, 'Key'), el('th', {}, 'Value'), el('th', {}, 'Updated'), el('th', {}, ''))),
+    el('tbody', {}, rows.map((m) => {
+      const editing = state.memEdit && state.memEdit.scope === m.scope && state.memEdit.key === m.key;
+      const valueCell = editing
+        ? (() => {
+            const ta = el('textarea', {
+              style: 'width: 100%; min-height: 60px;',
+              on: { keydown: (e) => {
+                if (e.key === 'Escape') { state.memEdit = null; render(); }
+                else if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) { saveMemoryEdit(m, ta.value); }
+              } },
+            }, state.memEdit.value);
+            return el('div', {}, ta,
+              el('div', { class: 'row', style: 'margin-top: 6px;' },
+                el('button', { class: 'primary', on: { click: () => saveMemoryEdit(m, ta.value) } }, 'Save'),
+                el('button', { on: { click: () => { state.memEdit = null; render(); } } }, 'Cancel'),
+                el('span', { class: 'meta' }, '⌘/Ctrl+Enter saves · Esc cancels'),
+              ),
+            );
+          })()
+        : el('div', { class: 'mem-value', title: 'Tap to edit',
+            on: { click: () => { state.memEdit = { scope: m.scope, key: m.key, value: m.value || '' }; render(); } } },
+            m.value || el('span', { class: 'meta' }, '(empty)'));
+      return el('tr', {},
+        el('td', {}, m.scope),
+        el('td', {}, el('code', {}, m.key)),
+        el('td', {}, valueCell),
+        el('td', { class: 'meta' }, relTime(m.updated_at)),
+        el('td', {}, el('button', { class: 'danger', on: { click: async () => {
+          try {
+            await api(`/v1/memory?scope=${encodeURIComponent(m.scope)}&key=${encodeURIComponent(m.key)}`, { method: 'DELETE' });
+            await loadAll(); render();
+          } catch (e) { toast(e.message, 'error'); }
+        }}}, 'Delete')),
+      );
+    })),
+  );
+}
+
+async function saveMemoryEdit(m, value) {
+  try {
+    await api('/v1/memory', { method: 'POST', body: { Scope: m.scope, Key: m.key, Value: value } });
+    state.memEdit = null;
+    await loadAll();
+    render();
+    toast('Saved');
+  } catch (e) { toast(e.message, 'error'); }
 }
 
 function viewServers() {
@@ -758,9 +1427,14 @@ function viewServers() {
       );
 
   const envRow = el('label', {},
-    el('div', { class: 'meta' }, 'Environment (KEY=VALUE per line, optional)'),
-    el('textarea', { id: 'srv-env', placeholder: 'GITHUB_PERSONAL_ACCESS_TOKEN=ghp_…', value: draftEnvAsText(draft) }),
+    el('div', { class: 'meta' }, 'Environment (KEY=VALUE per line, optional). Use ', el('code', {}, 'KEY=secret://NAME'), ' to reference a stored secret.'),
+    el('textarea', { id: 'srv-env', placeholder: 'GITHUB_PERSONAL_ACCESS_TOKEN=secret://GITHUB_TOKEN', value: draftEnvAsText(draft) }),
   );
+
+  const headersRow = transport !== 'stdio' ? el('label', {},
+    el('div', { class: 'meta' }, 'HTTP headers (Header: value per line, optional). Values may be ', el('code', {}, 'secret://NAME'), '.'),
+    el('textarea', { id: 'srv-headers', placeholder: 'X-Api-Key: secret://MY_API_KEY', value: '' }),
+  ) : null;
 
   const installedByName = new Map(state.servers.map((s) => [s.name, s]));
 
@@ -815,6 +1489,7 @@ function viewServers() {
       transportRow,
       transportFields,
       envRow,
+      headersRow,
       el('div', { class: 'row', style: 'margin-top: 12px;' },
         el('button', { class: 'primary', on: { click: () => addServer() }}, 'Add server'),
         el('button', { on: { click: () => { state._serverDraft = { transport: 'stdio' }; render(); } } }, 'Reset'),
@@ -830,18 +1505,32 @@ function viewServers() {
             el('th', {}, 'Tools'),
             el('th', {}, 'Status'),
             el('th', {}, 'Auth'),
+            el('th', {}, 'Policy'),
             el('th', {}, ''))),
             el('tbody', {}, state.servers.map((s) => el('tr', {},
-              el('td', {}, el('code', {}, s.name)),
+              el('td', {}, el('code', {}, s.name),
+                serverUsesSecret(s) ? el('span', { title: 'references a stored secret', style: 'margin-left:6px;' }, '🔒') : null),
               el('td', {}, transportLabel(s)),
               el('td', {}, String(s.tool_count || 0)),
               el('td', {}, s.last_status === 'ok'
                 ? el('span', { class: 'badge allowed' }, 'connected')
                 : el('span', { class: 'badge denied', title: s.last_error || '' }, s.last_status || 'error')),
               el('td', {}, oauthBadge(s)),
+              el('td', {}, (() => {
+                const cur = upstreamPolicyMode(s.name);
+                const sel = el('select', { title: 'Per-upstream gate (applies to all this server’s tools unless a tool has its own policy)',
+                  on: { change: (e) => setUpstreamPolicy(s.name, e.target.value) } },
+                  ...[['default', 'Default'], ['allow', 'Allow'], ['ask', 'Ask'], ['deny', 'Deny']].map(([v, l]) =>
+                    el('option', { value: v }, l)));
+                sel.value = cur;
+                return sel;
+              })()),
               el('td', {},
                 el('div', { class: 'row' },
                   isHTTPUpstream(s) ? el('button', { on: { click: () => openOAuthPanel(s.name) }}, 'Auth…') : null,
+                  (s.env_plaintext_keys && s.env_plaintext_keys.length)
+                    ? el('button', { title: 'Move a plaintext env value into the encrypted secrets store', on: { click: () => convertEnvToSecret(s.name, s.env_plaintext_keys) }}, '🔑 Secret')
+                    : null,
                   el('button', { on: { click: () => reconnectServer(s.name) }}, 'Reconnect'),
                   el('button', { class: 'danger', on: { click: () => removeServer(s.name) }}, 'Remove'),
                 ),
@@ -855,6 +1544,33 @@ function viewServers() {
 function transportLabel(s) {
   if (s.transport === 'stdio') return s.command + (s.args && s.args.length ? ' ' + s.args.join(' ') : '');
   return s.url || '';
+}
+
+// serverUsesSecret reports whether any env/header value on a (masked) server
+// is a secret:// reference, so the list can show a lock badge.
+function serverUsesSecret(s) {
+  const refs = (m) => Object.values(m || {}).some((v) => typeof v === 'string' && v.startsWith('secret://'));
+  return refs(s.env) || refs(s.headers);
+}
+
+// convertEnvToSecret moves a plaintext env value into the encrypted secrets
+// store and rewrites the server's env to a secret:// reference.
+async function convertEnvToSecret(serverName, plaintextKeys) {
+  const envKey = plaintextKeys.length === 1
+    ? plaintextKeys[0]
+    : prompt('Which env key to convert? (' + plaintextKeys.join(', ') + ')', plaintextKeys[0]);
+  if (!envKey || !plaintextKeys.includes(envKey)) return;
+  const suggested = envKey.toUpperCase().replace(/[^A-Z0-9_]/g, '_').replace(/^[^A-Z]+/, '');
+  const secretName = prompt('Name for the stored secret:', suggested || 'SECRET');
+  if (!secretName) return;
+  try {
+    await api('/v1/servers/' + encodeURIComponent(serverName) + '/convert-env', {
+      method: 'POST', body: { env_key: envKey, secret_name: secretName },
+    });
+    toast('Converted ' + envKey + ' → secret://' + secretName);
+    reloadServers(); render();
+    state.secretsLoaded = false;
+  } catch (e) { toast(e.message, 'error'); }
 }
 
 function draftEnvAsText(d) {
@@ -874,6 +1590,19 @@ function parseEnvText(t) {
   return out;
 }
 
+// parseHeadersText parses "Header: value" lines into a map.
+function parseHeadersText(t) {
+  const out = {};
+  (t || '').split(/\r?\n/).forEach((line) => {
+    const trimmed = line.trim();
+    if (!trimmed || trimmed.startsWith('#')) return;
+    const i = trimmed.indexOf(':');
+    if (i <= 0) return;
+    out[trimmed.slice(0, i).trim()] = trimmed.slice(i + 1).trim();
+  });
+  return out;
+}
+
 async function addServer() {
   const draft = state._serverDraft || {};
   const body = {
@@ -885,6 +1614,8 @@ async function addServer() {
     body.args = $('srv-args').value.split(/\r?\n/).map((s) => s.trim()).filter(Boolean);
   } else {
     body.url = $('srv-url').value.trim();
+    const hdrEl = $('srv-headers');
+    if (hdrEl && hdrEl.value.trim()) body.headers = parseHeadersText(hdrEl.value);
   }
   body.env = parseEnvText($('srv-env').value);
   if (!body.name) { toast('name required', 'error'); return; }
@@ -1619,12 +2350,59 @@ function viewSettings() {
     ),
     renderLakeIntegrationCard(),
     renderPushCard(),
+    renderChatCard(),
+    renderSecretsCard(),
     el('div', { class: 'card' },
       el('h2', {}, 'About'),
       el('p', {}, 'toolyard v0.1.0 — Apache-2.0.'),
       el('p', { class: 'meta' }, 'Single Go binary + SQLite. Source: ', el('code', {}, 'github.com/tusharbhardwaj/toolyard')),
     ),
+    renderBackupCard(),
   );
+}
+
+// renderBackupCard offers full-store exports and a memory import.
+function renderBackupCard() {
+  return el('div', { class: 'card' },
+    el('h2', {}, 'Backup & export'),
+    el('p', { class: 'meta' }, 'Download the full audit log, approvals (decision tokens excluded), and memory store. Memory can be re-imported.'),
+    el('div', { class: 'row', style: 'flex-wrap: wrap; gap: 8px;' },
+      el('a', { href: '/v1/audit/export?format=csv', target: '_blank' }, 'Audit CSV'),
+      el('a', { href: '/v1/audit/export?format=json', target: '_blank' }, 'Audit JSON'),
+      el('a', { href: '/v1/approvals/export?format=csv', target: '_blank' }, 'Approvals CSV'),
+      el('a', { href: '/v1/approvals/export?format=json', target: '_blank' }, 'Approvals JSON'),
+      el('a', { href: '/v1/memory/export', target: '_blank' }, 'Memory JSON'),
+    ),
+    el('div', { class: 'row', style: 'margin-top: 12px; align-items: center; gap: 8px;' },
+      el('span', { class: 'meta' }, 'Import memory:'),
+      (() => {
+        const sel = el('select', { id: 'mem-import-mode' },
+          el('option', { value: 'merge' }, 'Merge'),
+          el('option', { value: 'replace' }, 'Replace all'));
+        return sel;
+      })(),
+      el('input', { id: 'mem-import-file', type: 'file', accept: 'application/json,.json' }),
+      el('button', { class: 'primary', on: { click: importMemoryFile } }, 'Import'),
+    ),
+  );
+}
+
+async function importMemoryFile() {
+  const fileEl = $('mem-import-file');
+  const mode = ($('mem-import-mode') || {}).value || 'merge';
+  const file = fileEl && fileEl.files && fileEl.files[0];
+  if (!file) { toast('Choose a memory JSON file first.', 'error'); return; }
+  if (mode === 'replace' && !confirm('Replace ALL memory entries with the imported file? This deletes everything not in the file.')) return;
+  try {
+    const text = await file.text();
+    const doc = JSON.parse(text);
+    // Accept either the versioned envelope or a bare entries array.
+    const body = Array.isArray(doc) ? { mode, entries: doc } : Object.assign({}, doc, { mode });
+    const resp = await api('/v1/memory/import', { method: 'POST', body });
+    toast(`Imported ${resp.imported} memories (${mode}).`);
+    await loadAll();
+    render();
+  } catch (e) { toast('Import failed: ' + e.message, 'error'); }
 }
 
 // renderLakeIntegrationCard shows the Lake API token + Grafana origin
@@ -1755,6 +2533,305 @@ function showSecretBox(label, value, hint) {
   setTimeout(close, 60000);
 }
 
+// renderChatCard is the "Chat Notifications" settings card (Telegram).
+// Modeled on the Web Push section: status pill, token save, pairing link,
+// Test/Unpair, last error.
+function renderChatCard() {
+  if (!state.chatLoaded) { loadChatStatus(); }
+  const tg = (state.chat && state.chat.telegram) || {};
+  const pill = (txt, ok) => el('span', {
+    style: 'display:inline-block; padding:2px 8px; border-radius:10px; font-size:12px; margin-left:8px; '
+      + (ok ? 'background:var(--ok-bg,#16331f); color:var(--ok,#5fd07a);' : 'background:var(--bg); border:1px solid var(--border); color:var(--muted);'),
+  }, txt);
+  let statusText = 'Not configured', statusOk = false;
+  if (tg.paired) { statusText = 'Paired'; statusOk = true; }
+  else if (tg.configured) { statusText = 'Token set — pair your chat'; }
+
+  let tokenInput = '';
+  const saveToken = async () => {
+    if (!tokenInput.trim()) { toast('Paste a BotFather token', 'error'); return; }
+    try {
+      const r = await api('/v1/chat/telegram/configure', { method: 'POST', body: { token: tokenInput.trim() } });
+      toast('Connected @' + (r.bot_username || 'bot'));
+      state.chatLoaded = false; loadChatStatus();
+    } catch (e) { toast(e.message, 'error'); }
+  };
+  const pair = async () => {
+    try {
+      const r = await api('/v1/chat/telegram/pair', { method: 'POST', body: {} });
+      showSecretBox('Pair Telegram', r.deep_link, 'Open this link on the device with Telegram, then tap Start. The link expires in 10 minutes.');
+    } catch (e) { toast(e.message, 'error'); }
+  };
+
+  return el('div', { class: 'card' },
+    el('h2', {}, 'Chat notifications', pill(statusText, statusOk)),
+    el('p', { class: 'meta' },
+      'Get pending approvals in Telegram with inline Approve / Deny buttons — usable from anywhere, no public URL needed (the bot uses outbound long-polling).'),
+    el('div', { style: 'display:flex; gap:8px; align-items:center; margin-top:8px;' },
+      el('input', {
+        type: 'password', placeholder: 'BotFather token (123456:ABC-DEF…)',
+        style: 'flex:1; padding:6px 8px;',
+        on: { input: (e) => { tokenInput = e.target.value; } },
+      }),
+      el('button', { class: 'btn', on: { click: saveToken } }, tg.configured ? 'Replace token' : 'Save token'),
+    ),
+    tg.configured ? el('div', { style: 'margin-top:12px; display:flex; gap:8px; flex-wrap:wrap;' },
+      el('button', { class: 'btn', on: { click: pair } }, tg.paired ? 'Re-pair chat' : 'Generate pairing link'),
+      tg.paired ? el('button', { class: 'btn', on: { click: async () => {
+        try { await api('/v1/chat/telegram/test', { method: 'POST', body: {} }); toast('Test sent'); }
+        catch (e) { toast(e.message, 'error'); }
+      }}}, 'Send test') : null,
+      tg.paired ? el('button', { class: 'btn', on: { click: async () => {
+        try { await api('/v1/chat/telegram/unpair', { method: 'POST', body: {} }); toast('Unpaired'); state.chatLoaded = false; loadChatStatus(); }
+        catch (e) { toast(e.message, 'error'); }
+      }}}, 'Unpair') : null,
+    ) : null,
+    tg.bot_username ? el('div', { class: 'meta', style: 'margin-top:8px;' }, 'Bot: @' + tg.bot_username) : null,
+  );
+}
+
+async function loadChatStatus() {
+  state.chatLoaded = true;
+  try { state.chat = await api('/v1/chat/status'); render(); } catch (_) {}
+}
+
+// renderSecretsCard is the secrets-broker settings card: a write-only store of
+// credentials referenced as secret://NAME in upstream env/headers. Values are
+// never shown.
+function renderSecretsCard() {
+  if (!state.secretsLoaded) { loadSecrets(); }
+  let nName = '', nVal = '', nDesc = '';
+  const create = async () => {
+    if (!/^[A-Z][A-Z0-9_]{0,63}$/.test(nName)) { toast('Name must be UPPER_SNAKE (e.g. API_KEY)', 'error'); return; }
+    if (!nVal) { toast('Value required', 'error'); return; }
+    try {
+      await api('/v1/secrets', { method: 'POST', body: { name: nName, value: nVal, description: nDesc } });
+      toast('Stored ' + nName);
+      loadSecrets();
+    } catch (e) { toast(e.message, 'error'); }
+  };
+  const rows = (state.secrets || []).map((s) => el('tr', {},
+    el('td', {}, el('code', {}, s.name)),
+    el('td', { class: 'meta' }, s.description || '—'),
+    el('td', { class: 'meta' }, (s.used_by && s.used_by.length) ? s.used_by.join(', ') : '—'),
+    el('td', {},
+      el('button', { class: 'btn', style: 'font-size:12px;', on: { click: () => rotateSecret(s.name) } }, 'Rotate'),
+      ' ',
+      el('button', { class: 'btn', style: 'font-size:12px;', on: { click: () => deleteSecret(s.name, s.used_by || []) } }, 'Delete'),
+    ),
+  ));
+  return el('div', { class: 'card' },
+    el('h2', {}, 'Secrets'),
+    el('p', { class: 'meta' },
+      'Store API keys once, encrypted. Reference them in a server\'s env/headers as ',
+      el('code', {}, 'secret://NAME'), '. Values are resolved only at dial time and never returned by the API.'),
+    state.secrets && state.secrets.length ? el('table', { class: 'tbl', style: 'width:100%; margin-top:8px;' },
+      el('thead', {}, el('tr', {},
+        el('th', {}, 'Name'), el('th', {}, 'Description'), el('th', {}, 'Used by'), el('th', {}, ''))),
+      el('tbody', {}, ...rows),
+    ) : el('p', { class: 'meta' }, 'No secrets yet.'),
+    el('div', { style: 'margin-top:12px; display:grid; grid-template-columns: 1fr 1fr; gap:8px;' },
+      el('input', { placeholder: 'NAME', style: 'padding:6px 8px;', on: { input: (e) => { nName = e.target.value.toUpperCase(); e.target.value = nName; } } }),
+      el('input', { type: 'password', placeholder: 'value', style: 'padding:6px 8px;', on: { input: (e) => { nVal = e.target.value; } } }),
+    ),
+    el('div', { style: 'margin-top:8px; display:flex; gap:8px;' },
+      el('input', { placeholder: 'description (optional)', style: 'flex:1; padding:6px 8px;', on: { input: (e) => { nDesc = e.target.value; } } }),
+      el('button', { class: 'btn', on: { click: create } }, 'Add secret'),
+    ),
+  );
+}
+
+async function loadSecrets() {
+  state.secretsLoaded = true;
+  try { state.secrets = await api('/v1/secrets'); render(); } catch (_) {}
+}
+async function rotateSecret(name) {
+  const v = prompt('New value for ' + name + ' (rotates + reconnects referencing servers):');
+  if (v == null || v === '') return;
+  try { await api('/v1/secrets/' + encodeURIComponent(name) + '?reconnect=1', { method: 'PUT', body: { value: v } }); toast('Rotated ' + name); loadSecrets(); }
+  catch (e) { toast(e.message, 'error'); }
+}
+async function deleteSecret(name, usedBy) {
+  if (usedBy.length && !confirm(name + ' is used by ' + usedBy.join(', ') + '. Force delete anyway?')) return;
+  const q = usedBy.length ? '?force=1' : '';
+  try { await api('/v1/secrets/' + encodeURIComponent(name) + q, { method: 'DELETE' }); toast('Deleted ' + name); loadSecrets(); }
+  catch (e) { toast(e.message, 'error'); }
+}
+
+// ---- Events Hub ------------------------------------------------------------
+
+async function loadEvents() {
+  state.events.loaded = true;
+  const f = state.eventFilter;
+  const p = new URLSearchParams();
+  if (f.source_id) p.set('source_id', f.source_id);
+  if (f.type) p.set('type', f.type);
+  if (f.q) p.set('q', f.q);
+  if (f.unacked) p.set('unacked', '1');
+  p.set('limit', '100');
+  try {
+    const [feed, sources] = await Promise.all([
+      api('/v1/events?' + p.toString()),
+      api('/v1/event-sources').catch(() => []),
+    ]);
+    state.events.rows = feed.events || [];
+    state.events.unacked = feed.unacked || 0;
+    state.events.nextBefore = feed.next_before || 0;
+    state.events.sources = sources || [];
+    render();
+  } catch (e) { toast(e.message, 'error'); }
+}
+
+function eventRelTime(ms) {
+  const d = (Date.now() - ms) / 1000;
+  if (d < 60) return 'just now';
+  if (d < 3600) return Math.floor(d / 60) + 'm ago';
+  if (d < 86400) return Math.floor(d / 3600) + 'h ago';
+  return Math.floor(d / 86400) + 'd ago';
+}
+
+async function ackEvents(ids) {
+  if (!ids.length) return;
+  try {
+    await api('/v1/events/ack', { method: 'POST', body: { ids } });
+    loadEvents();
+  } catch (e) { toast(e.message, 'error'); }
+}
+
+function viewEvents() {
+  if (!state.events.loaded) loadEvents();
+  const f = state.eventFilter;
+  const ev = state.events;
+
+  const filterBar = el('div', { class: 'card', style: 'display:flex; gap:8px; flex-wrap:wrap; align-items:center;' },
+    el('select', { style: 'padding:6px 8px;', on: { change: (e) => { f.source_id = e.target.value; loadEvents(); } } },
+      el('option', { value: '' }, 'All sources'),
+      ...(ev.sources || []).map((s) => el('option', { value: s.id, selected: f.source_id === s.id }, s.name)),
+    ),
+    el('input', { placeholder: 'type', value: f.type, style: 'padding:6px 8px; width:120px;', on: { change: (e) => { f.type = e.target.value; loadEvents(); } } }),
+    el('input', { placeholder: 'search summary…', value: f.q, style: 'padding:6px 8px; flex:1;', on: { change: (e) => { f.q = e.target.value; loadEvents(); } } }),
+    el('label', { style: 'display:flex; gap:6px; align-items:center;' },
+      el('input', { type: 'checkbox', checked: f.unacked, on: { change: (e) => { f.unacked = e.target.checked; loadEvents(); } } }),
+      'Unacked only',
+    ),
+    el('button', { class: 'btn', on: { click: () => ackEvents((ev.rows || []).filter((r) => !r.acked_at).map((r) => r.id)) } }, 'Ack all visible'),
+  );
+
+  const rows = (ev.rows || []).map((r) => el('div', {
+    class: 'card', style: 'padding:10px 14px; ' + (r.acked_at ? 'opacity:0.6;' : ''),
+  },
+    el('div', { style: 'display:flex; gap:10px; align-items:baseline; flex-wrap:wrap;' },
+      el('span', { class: 'meta', style: 'min-width:64px;' }, eventRelTime(r.received_at)),
+      el('span', { style: 'font-weight:500;' }, r.source_name),
+      el('span', { style: 'padding:1px 7px; border-radius:9px; background:var(--bg); border:1px solid var(--border); font-size:12px;' }, r.type),
+      el('span', { style: 'flex:1;' }, r.summary),
+      r.acked_at ? el('span', { class: 'meta' }, '✓ acked')
+        : el('button', { class: 'btn', style: 'font-size:12px;', on: { click: () => ackEvents([r.id]) } }, 'Ack'),
+    ),
+    r.payload ? el('details', { style: 'margin-top:6px;' },
+      el('summary', { class: 'meta', style: 'cursor:pointer;' }, 'payload'),
+      el('pre', { style: 'white-space:pre-wrap; word-break:break-all; font-size:12px; margin:6px 0 0;' },
+        (() => { try { return JSON.stringify(JSON.parse(r.payload), null, 2); } catch { return String(r.payload); } })()),
+    ) : null,
+  ));
+
+  return el('div', {},
+    el('div', { class: 'card' },
+      el('h2', {}, 'Events',
+        ev.unacked ? el('span', { style: 'margin-left:8px; font-size:14px; color:var(--muted);' }, '(' + ev.unacked + ' unacked)') : null),
+      el('p', { class: 'meta' }, 'The shared activity feed across agents and external systems. Webhooks push events in, pollers watch URLs, and agents publish to each other. Every event has a natural-language summary; agents read them with the events.brief tool.')),
+    filterBar,
+    rows.length ? el('div', {}, ...rows) : el('div', { class: 'card' }, el('p', { class: 'meta' }, 'No events. Create a source below and push one in.')),
+    renderEventSourcesCard(),
+    state.eventSourceModal ? renderEventSourceModal() : null,
+  );
+}
+
+function renderEventSourcesCard() {
+  const sources = state.events.sources || [];
+  const rows = sources.map((s) => el('tr', {},
+    el('td', {}, s.name, ' ', el('span', { class: 'meta' }, '(' + s.kind + ')')),
+    el('td', {},
+      el('label', { style: 'display:inline-flex; gap:4px; align-items:center; margin-right:10px;' },
+        el('input', { type: 'checkbox', checked: s.enabled, on: { change: (e) => patchSource(s.id, { enabled: e.target.checked }) } }), 'on'),
+      el('label', { style: 'display:inline-flex; gap:4px; align-items:center;' },
+        el('input', { type: 'checkbox', checked: s.notify, on: { change: (e) => patchSource(s.id, { notify: e.target.checked }) } }), 'notify'),
+    ),
+    el('td', { class: 'meta' }, s.last_error ? ('⚠ ' + s.last_error) : (s.poller_state && s.poller_state.last_polled_at ? 'polled ' + eventRelTime(s.poller_state.last_polled_at) : '—')),
+    el('td', {},
+      s.kind === 'webhook' ? el('button', { class: 'btn', style: 'font-size:12px;', on: { click: () => rotateSourceToken(s.id) } }, 'Token') : null,
+      ' ',
+      el('button', { class: 'btn', style: 'font-size:12px;', on: { click: () => deleteSource(s.id, s.name) } }, 'Delete'),
+    ),
+  ));
+  return el('div', { class: 'card' },
+    el('h2', {}, 'Sources',
+      el('button', { class: 'btn', style: 'float:right; font-size:12px;', on: { click: () => { state.eventSourceModal = { kind: 'webhook', name: '', url: '', interval: 300, mode: 'hash', json_path: '' }; render(); } } }, '+ Add source')),
+    sources.length ? el('table', { class: 'tbl', style: 'width:100%; margin-top:8px;' },
+      el('thead', {}, el('tr', {}, el('th', {}, 'Name'), el('th', {}, 'State'), el('th', {}, 'Last'), el('th', {}, ''))),
+      el('tbody', {}, ...rows),
+    ) : el('p', { class: 'meta' }, 'No sources yet. Add a webhook to receive events or a poller to watch a URL.'),
+  );
+}
+
+function renderEventSourceModal() {
+  const m = state.eventSourceModal;
+  const close = () => { state.eventSourceModal = null; render(); };
+  const create = async () => {
+    const body = { name: m.name, kind: m.kind, notify: false };
+    if (m.kind === 'poller') {
+      body.poller_config = { url: m.url, interval_sec: Number(m.interval) || 300, mode: m.mode, json_path: m.json_path };
+    }
+    try {
+      const r = await api('/v1/event-sources', { method: 'POST', body });
+      close();
+      loadEvents();
+      if (r.token) showSecretBox('Webhook token for ' + m.name, r.token, r.curl_example || 'Send events with: Authorization: Bearer <token>');
+    } catch (e) { toast(e.message, 'error'); }
+  };
+  return el('div', { class: 'modal-bg', on: { click: (e) => { if (e.target === e.currentTarget) close(); } } },
+    el('div', { class: 'modal' },
+      el('h3', {}, 'Add event source'),
+      el('div', { style: 'display:flex; gap:8px; margin:8px 0;' },
+        ...['webhook', 'poller', 'agent'].map((k) => el('label', { style: 'display:flex; gap:4px; align-items:center;' },
+          el('input', { type: 'radio', name: 'evkind', checked: m.kind === k, on: { change: () => { m.kind = k; render(); } } }), k)),
+      ),
+      el('input', { placeholder: 'source name', value: m.name, style: 'width:100%; padding:6px 8px; margin-bottom:8px;', on: { input: (e) => { m.name = e.target.value; } } }),
+      m.kind === 'poller' ? el('div', {},
+        el('input', { placeholder: 'https://url-to-watch', value: m.url, style: 'width:100%; padding:6px 8px; margin-bottom:8px;', on: { input: (e) => { m.url = e.target.value; } } }),
+        el('div', { style: 'display:flex; gap:8px; margin-bottom:8px;' },
+          el('input', { type: 'number', min: 60, placeholder: 'interval (s)', value: m.interval, style: 'width:120px; padding:6px 8px;', on: { input: (e) => { m.interval = e.target.value; } } }),
+          el('select', { style: 'padding:6px 8px;', on: { change: (e) => { m.mode = e.target.value; render(); } } },
+            el('option', { value: 'hash', selected: m.mode === 'hash' }, 'whole-page hash'),
+            el('option', { value: 'json_field', selected: m.mode === 'json_field' }, 'JSON field'),
+          ),
+        ),
+        m.mode === 'json_field' ? el('input', { placeholder: 'json path e.g. data.price', value: m.json_path, style: 'width:100%; padding:6px 8px; margin-bottom:8px;', on: { input: (e) => { m.json_path = e.target.value; } } }) : null,
+      ) : null,
+      el('div', { style: 'display:flex; gap:8px; justify-content:flex-end; margin-top:8px;' },
+        el('button', { class: 'btn', on: { click: close } }, 'Cancel'),
+        el('button', { class: 'btn primary', on: { click: create } }, 'Create'),
+      ),
+    ),
+  );
+}
+
+async function patchSource(id, body) {
+  try { await api('/v1/event-sources/' + encodeURIComponent(id), { method: 'PATCH', body }); loadEvents(); }
+  catch (e) { toast(e.message, 'error'); }
+}
+async function rotateSourceToken(id) {
+  try {
+    const r = await api('/v1/event-sources/' + encodeURIComponent(id) + '/rotate-token', { method: 'POST', body: {} });
+    showSecretBox('New webhook token', r.token, r.curl_example);
+  } catch (e) { toast(e.message, 'error'); }
+}
+async function deleteSource(id, name) {
+  if (!confirm('Delete source ' + name + ' and all its events?')) return;
+  try { await api('/v1/event-sources/' + encodeURIComponent(id), { method: 'DELETE' }); toast('Deleted'); loadEvents(); }
+  catch (e) { toast(e.message, 'error'); }
+}
+
 function renderPushCard() {
   const ios = isIOS();
   const standalone = isStandalonePWA();
@@ -1803,8 +2880,8 @@ function renderPushCard() {
         ? el('div', { class: 'warn-pill' }, '⚠  Looks like Safari thinks push is available, but iOS only delivers when run from the Home Screen icon. If Enable fails, follow the install steps below.')
         : null,
       el('div', { class: 'row' },
-        el('button', { class: 'primary', on: { click: enablePush }},
-          state.pushReady ? 'Push enabled ✓ (re-enroll)' : 'Enable push'),
+        el('button', { class: 'primary', disabled: !!state.pushEnabling, on: { click: enablePush }},
+          state.pushEnabling ? 'Enabling…' : (state.pushReady ? 'Push enabled ✓ (re-enroll)' : 'Enable push')),
         el('button', { on: { click: testPush }}, 'Send test push'),
         el('button', { on: { click: showPushDiag }}, 'Diagnostics'),
         el('button', { class: 'danger', on: { click: wipeAndReenroll }}, 'Wipe & re-enroll'),
@@ -1988,6 +3065,9 @@ function renderPushDiag() {
 }
 
 async function enablePush() {
+  if (state.pushEnabling) return;
+  state.pushEnabling = true;
+  render();
   try {
     const support = pushSupportStatus();
     if (!support.ok) {
@@ -2011,8 +3091,12 @@ async function enablePush() {
     await api('/v1/push/subscribe', { method: 'POST', body: json });
     state.pushReady = true;
     toast('Push enabled on this device.');
+  } catch (e) {
+    toast(e.message, 'error');
+  } finally {
+    state.pushEnabling = false;
     render();
-  } catch (e) { toast(e.message, 'error'); }
+  }
 }
 
 function urlBase64ToUint8Array(b64) {
@@ -2070,35 +3154,7 @@ function viewInsights() {
   // calls POST /v1/insights/tools/{name}/policy and re-loads on success.
   // Destructive tools are still hard-vetoed by the engine even when toggled
   // on; the UI shows a "(destructive)" hint so the operator isn't surprised.
-  const renderPolicyToggle = (t) => {
-    const on = !!t.auto_approve;
-    const destructive = !!t.is_destructive;
-    return el('label', {
-      class: 'policy-toggle' + (on ? ' on' : '') + (destructive ? ' veto' : ''),
-      title: destructive
-        ? 'Destructive tools always require human review — the engine ignores the rule.'
-        : (on ? 'Auto-approves on every call.' : 'Holds for human review.'),
-    },
-      el('input', { type: 'checkbox', checked: on, on: { change: async (e) => {
-        const want = e.target.checked;
-        try {
-          const resp = await api('/v1/insights/tools/' + encodeURIComponent(t.tool_name) + '/policy', {
-            method: 'POST', body: { auto_approve: want },
-          });
-          if (resp && resp.destructive_veto) {
-            toast(t.tool_name + ': rule saved, but destructive tools still require human review.', 'warn');
-          } else {
-            toast(t.tool_name + ' → ' + (want ? 'auto-approve' : 'needs approval'));
-          }
-          loadInsights();
-        } catch (err) {
-          toast(err.message, 'error');
-          render(); // revert the checkbox visually
-        }
-      }}}),
-      el('span', { class: 'policy-pill' }, on ? 'Auto' : 'Ask'),
-    );
-  };
+  const renderPolicyToggle = (t) => renderPolicyControl({ tool_name: t.tool_name, auto_approve: !!t.auto_approve, is_destructive: !!t.is_destructive });
 
   const toolRows = (state.insights.tools || []).map((t) =>
     el('tr', {},
@@ -2259,7 +3315,7 @@ function viewInsights() {
       el('span', { class: 'meta' }, 'Rates: input $' + state.insights.cost.input_usd_per_m + '/M · output $' + state.insights.cost.output_usd_per_m + '/M · estimated total: '),
       el('strong', {}, '$' + totalUsd.toFixed(4)),
     ),
-    costRows.length === 0 ? el('div', { class: 'empty' }, 'No data.') :
+    costRows.length === 0 ? el('div', { class: 'empty' }, 'No cost data in this range yet.') :
       el('table', {},
         el('thead', {}, el('tr', {}, el('th', {}, 'Tool'), el('th', {}, 'Tokens in'), el('th', {}, 'Tokens out'), el('th', {}, 'USD'))),
         el('tbody', {}, ...costRows.slice(0, 30).map((r) => el('tr', {},
@@ -2277,6 +3333,7 @@ function viewInsights() {
   return el('div', {},
     overviewCard,
     toolCard,
+    renderPolicyRulesCard(),
     agentCard,
     autoCard,
     costCard,
@@ -2328,6 +3385,9 @@ function navigate(route) {
   if ((route === 'insights' || route === 'notifications') && !state.insights.loading) {
     loadInsights();
   }
+  if (route === 'hooks' && !state.hooks.loaded && !state.hooks.loading) {
+    loadHooks(true);
+  }
   if (route === 'lake' && !state.lake.manifest && !state.lake.loading) {
     loadLakeManifest();
   }
@@ -2362,9 +3422,11 @@ function shell(content) {
         navBtn('approvals',    'Approvals'),
         navBtn('call',         'Call' + (state.call.active ? ' ●' : '')),
         navBtn('lake',         'Lake'),
+        navBtn('events',       'Events' + (state.events.unacked ? ' (' + state.events.unacked + ')' : '')),
         navBtn('insights',     'Insights'),
         navBtn('notifications', 'Alerts' + (alertCount ? ' (' + alertCount + ')' : '')),
         navBtn('audit',        'Audit'),
+        navBtn('hooks',        'Hooks'),
         navBtn('servers',      'Servers'),
         navBtn('tools',        'Tools'),
         navBtn('memory',       'Memory'),
@@ -2372,7 +3434,7 @@ function shell(content) {
         navBtn('settings',     'Settings'),
       ),
       el('span', { class: 'user' },
-        el('span', { class: 'stream-pill ' + (state.streamLive ? 'live' : '') }),
+        renderStreamPill(),
         ' ', state.user ? state.user.username : '',
       ),
       state.user ? el('button', { on: { click: async () => {
@@ -2392,7 +3454,7 @@ function shell(content) {
       bottomItem('servers',   '⌘', 'Servers'),
       bottomItem('notifications', '◔', 'Alerts', alertCount),
       el('button', {
-        class: ['audit','memory','agents','settings','insights'].includes(state.route) ? 'active' : '',
+        class: ['audit','hooks','memory','agents','settings','insights'].includes(state.route) ? 'active' : '',
         on: { click: () => { state.moreSheet = true; render(); } }
       },
         el('span', { class: 'icon' }, '☰'),
@@ -2417,10 +3479,11 @@ function renderMoreSheet() {
   return el('div', { class: 'modal-bg', on: { click: (e) => { if (e.target === e.currentTarget) { state.moreSheet = false; render(); } }}},
     el('div', { class: 'modal', style: 'display: flex; flex-direction: column; gap: 6px;' },
       el('h3', {}, 'More'),
-      item('call',     'Call',     'Talk to Claude through Maestro — voice in, voice out'),
+      item('call',     'Call',     'Talk to Toolyard through Gemini Live'),
       item('lake',     'Lake',     'Personal data warehouse — finance, ops, daily memory'),
       item('insights', 'Insights', 'Per-tool, per-agent, cost breakdowns'),
       item('audit',    'Audit',    'Append-only event log'),
+      item('hooks',    'Hooks',    'Agent lifecycle events and memory ingest'),
       item('memory',   'Memory',   'Scope/key-value store'),
       item('agents',   'Agents',   'Manage enrolled agents'),
       item('settings', 'Settings', 'Surface mode, auto-approval, retention'),
@@ -2431,14 +3494,75 @@ function renderMoreSheet() {
   );
 }
 
+// captureFocus/restoreFocus survive the innerHTML='' teardown in render(),
+// so a live SSE re-render doesn't yank focus out of the field you're typing
+// in or the approval card you're keyboard-driving.
+function captureFocus() {
+  const a = document.activeElement;
+  if (!a || a === document.body) return null;
+  const f = {};
+  if (a.id) f.id = a.id;
+  const card = a.closest && a.closest('[data-approval-id]');
+  if (card) f.approvalId = card.getAttribute('data-approval-id');
+  if ('selectionStart' in a && a.selectionStart != null) { f.selStart = a.selectionStart; f.selEnd = a.selectionEnd; }
+  return (f.id || f.approvalId) ? f : null;
+}
+
+function restoreFocus(f) {
+  if (!f) return;
+  let target = f.id ? document.getElementById(f.id) : null;
+  if (!target && f.approvalId) {
+    try { target = document.querySelector(`[data-approval-id="${CSS.escape(f.approvalId)}"]`); } catch (_) {}
+  }
+  if (target && target.focus) {
+    target.focus();
+    if (f.selStart != null && target.setSelectionRange) {
+      try { target.setSelectionRange(f.selStart, f.selEnd); } catch (_) {}
+    }
+  }
+}
+
+// closeTopmostOverlay dismisses the highest-priority open overlay/edit and
+// returns true if it handled the Escape.
+function closeTopmostOverlay() {
+  if (state.memEdit) { state.memEdit = null; render(); return true; }
+  if (state.agentModal) { state.agentModal = null; render(); return true; }
+  if (state.marketModal) { state.marketModal = null; render(); return true; }
+  if (state.jwtPreview || state.pushDiag || state.pushTestResult) {
+    state.jwtPreview = null; state.pushDiag = null; state.pushTestResult = null; render(); return true;
+  }
+  if (state.moreSheet) { state.moreSheet = false; render(); return true; }
+  const stale = document.querySelector('.toast.stale');
+  if (stale) { stale.remove(); return true; }
+  return false;
+}
+
+// Global keyboard shortcuts: Escape closes the topmost overlay; a/d decide
+// the *focused* approval card (no first-card fallback — that would make an
+// accidental keypress approve something).
+document.addEventListener('keydown', (e) => {
+  if (e.key === 'Escape') { if (closeTopmostOverlay()) e.preventDefault(); return; }
+  const t = e.target;
+  if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.tagName === 'SELECT' || t.isContentEditable)) return;
+  if (e.key === 'a' || e.key === 'd') {
+    const card = document.activeElement && document.activeElement.closest && document.activeElement.closest('[data-approval-id]');
+    if (card && !e.metaKey && !e.ctrlKey && !e.altKey) {
+      e.preventDefault();
+      decideApproval(card.getAttribute('data-approval-id'), e.key === 'a' ? 'allowed' : 'denied');
+    }
+  }
+});
+
 function render() {
   const root = $('app') || document.body;
+  const focus = captureFocus();
   root.innerHTML = '';
   if (state.setupRequired) { root.appendChild(viewSetup()); return; }
   if (!state.user) { root.appendChild(viewLogin()); return; }
   let body;
   switch (state.route) {
     case 'audit':         body = viewAudit();         break;
+    case 'hooks':         body = viewHooks();         break;
     case 'memory':        body = viewMemory();        break;
     case 'agents':        body = viewAgents();        break;
     case 'servers':       body = viewServers();       break;
@@ -2447,10 +3571,12 @@ function render() {
     case 'insights':      body = viewInsights();      break;
     case 'lake':          body = viewLake();          break;
     case 'call':          body = viewCall();          break;
+    case 'events':        body = viewEvents();        break;
     case 'notifications': body = viewNotifications(); break;
     default:              body = viewApprovals();
   }
   root.appendChild(shell(body));
+  restoreFocus(focus);
 }
 
 // ---- Lake (personal data warehouse, TUS-104) -------------------------------
@@ -3322,7 +4448,7 @@ async function setupMediaSessionAnchor() {
     try {
       navigator.mediaSession.metadata = new MediaMetadata({
         title:  'toolyard live call',
-        artist: 'maestro',
+        artist: 'toolyard',
         album:  'voice control',
       });
       navigator.mediaSession.setActionHandler('pause', () => toggleMuteFromHardware('muted'));
@@ -3656,10 +4782,9 @@ function viewCall() {
   }[c.phase] || '#888';
 
   const intro = el('p', { class: 'meta' },
-    'Talk to Claude through Maestro. Mic goes from this device to the gateway, ' +
-    'through Gemini Live, into a tmux+claude session named mae-*. End the call ' +
-    'and the session keeps running — `tmux attach -t mae-<name>` to take over. ' +
-    'Bluetooth headset play/pause (e.g. FiiO BTR11) toggles mute; you\'ll hear ' +
+    'Talk to Toolyard through Gemini Live. Mic audio streams from this device ' +
+    'to the gateway, and tool calls run through the same policy, approval, and ' +
+    'audit path as enrolled agents. Bluetooth headset play/pause (e.g. FiiO BTR11) toggles mute; you\'ll hear ' +
     'a descending chirp when muted, ascending when live again. With music auto-' +
     'pause on, a faint masking tone plays while you\'re live so cooperating ' +
     'apps (Spotify, Music) auto-pause themselves; muting silences the tone ' +
@@ -3776,6 +4901,16 @@ async function preloadOAuthStatus() {
     try { navigator.serviceWorker.register('/sw.js'); } catch {}
   }
   if (location.hash) state.route = location.hash.slice(1) || 'approvals';
+  // Push deep link: notifications open /?approval=<id>. Land on the
+  // approvals view so the card (or its expired/decided state) is visible.
+  const approvalParam = new URLSearchParams(location.search).get('approval');
+  if (approvalParam) {
+    state.route = 'approvals';
+    state.focusApprovalId = approvalParam;
+  }
+  // Events push deep link: notifications open /?route=events.
+  const routeParam = new URLSearchParams(location.search).get('route');
+  if (routeParam) state.route = routeParam;
   await refreshUser();
   if (state.user) {
     await loadAll(); startStream();
@@ -3787,4 +4922,33 @@ async function preloadOAuthStatus() {
     }
   }
   render();
+
+  // Push deep link: focus (and scroll to) the targeted approval card.
+  if (state.focusApprovalId) {
+    const id = state.focusApprovalId;
+    state.focusApprovalId = null;
+    setTimeout(() => {
+      let card = null;
+      try { card = document.querySelector(`[data-approval-id="${CSS.escape(id)}"]`); } catch (_) {}
+      if (card) { card.scrollIntoView({ block: 'center' }); card.focus(); }
+    }, 0);
+  }
+
+  // While approvals are on screen, re-render every 30s so countdowns stay
+  // fresh and cards that cross their expiry get disabled even if no SSE
+  // event has arrived yet.
+  setInterval(() => {
+    if (state.user && state.route === 'approvals' && (state.approvals || []).length) {
+      render();
+    }
+  }, 30000);
+
+  // iOS-PWA resume path: WebKit kills the SSE socket on background without
+  // firing onerror, so on re-show we proactively reconnect if the stream
+  // isn't demonstrably live.
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState !== 'visible' || !state.user) return;
+    const stale = !state.stream.lastEventAt || Date.now() - state.stream.lastEventAt > 30000;
+    if (state.stream.status !== 'live' || stale) reconnectStream();
+  });
 })();

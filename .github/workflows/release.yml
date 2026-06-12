@@ -1,0 +1,98 @@
+# Release pipeline: push a tag like v0.1.0 and this builds the gateway
+# binary for the four supported platforms, checksums everything, and
+# publishes a GitHub Release. install.sh at the repo root consumes the
+# artifacts by exact name: toolyard_<tag>_<os>_<arch>.tar.gz + SHA256SUMS.
+#
+# CGO is required (mattn/go-sqlite3), which dictates the runner matrix:
+#   darwin/arm64  macos-latest (native)
+#   darwin/amd64  macos-latest (clang -arch x86_64 cross)
+#   linux/amd64   ubuntu-latest (native gcc)
+#   linux/arm64   ubuntu-24.04-arm (native; free for public repos only)
+name: release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { goos: darwin, goarch: arm64, runner: macos-latest }
+          - { goos: darwin, goarch: amd64, runner: macos-latest,
+              cgo_cflags: "-arch x86_64", cgo_ldflags: "-arch x86_64" }
+          - { goos: linux, goarch: amd64, runner: ubuntu-latest }
+          - { goos: linux, goarch: arm64, runner: ubuntu-24.04-arm }
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Build
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.goarch }}
+          CGO_ENABLED: "1"
+          CGO_CFLAGS: ${{ matrix.cgo_cflags }}
+          CGO_LDFLAGS: ${{ matrix.cgo_ldflags }}
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          mkdir -p dist
+          go build -trimpath -ldflags "-s -w -X main.version=${TAG#v}" \
+            -o dist/toolyard ./cmd/gateway
+          file dist/toolyard
+
+      # Cross-compiled legs can't execute their binary; sanity-check the
+      # native ones so a broken ldflags stamp fails the release, not the
+      # user's install.
+      - name: Smoke test (native legs)
+        if: matrix.cgo_cflags == ''
+        run: |
+          ./dist/toolyard version
+          ./dist/toolyard version | grep -q "${GITHUB_REF_NAME#v}"
+
+      - name: Package
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          cp LICENSE dist/ 2>/dev/null || true
+          cp README.md dist/ 2>/dev/null || true
+          tar -C dist -czf "toolyard_${TAG}_${{ matrix.goos }}_${{ matrix.goarch }}.tar.gz" \
+            toolyard $( [ -f dist/LICENSE ] && echo LICENSE ) $( [ -f dist/README.md ] && echo README.md )
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: toolyard_${{ github.ref_name }}_${{ matrix.goos }}_${{ matrix.goarch }}
+          path: toolyard_*.tar.gz
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+          path: dist
+
+      - name: Checksums
+        run: |
+          cd dist
+          sha256sum toolyard_*.tar.gz > SHA256SUMS
+          cat SHA256SUMS
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
+          prerelease: ${{ contains(github.ref_name, '-') }}

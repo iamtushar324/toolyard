@@ -128,13 +128,108 @@ func nullRaw(b json.RawMessage) any {
 
 // Recent returns up to limit recent events, newest first.
 func (l *Logger) Recent(ctx context.Context, limit int) ([]Event, error) {
+	return l.RecentBefore(ctx, limit, 0)
+}
+
+// Filter narrows an audit Query. Zero-value fields are ignored. Timestamps
+// are ms-UTC.
+type Filter struct {
+	Since     int64
+	Until     int64
+	Before    int64 // ts < Before, pagination cursor
+	AgentID   string
+	EventType string
+	Tool      string
+	Decision  string
+	Limit     int
+}
+
+// Query returns events matching the filter, newest first. Backs both the
+// audit export and the filtered audit list so the UI and export agree.
+func (l *Logger) Query(ctx context.Context, f Filter) ([]Event, error) {
+	q := `SELECT id, ts, agent_id, upstream_name, tool_name, event_type, decision,
+            reason, arguments, result_summary, approval_id
+         FROM audit_events WHERE 1=1`
+	var args []any
+	if f.Since > 0 {
+		q += ` AND ts >= ?`
+		args = append(args, f.Since)
+	}
+	if f.Until > 0 {
+		q += ` AND ts <= ?`
+		args = append(args, f.Until)
+	}
+	if f.Before > 0 {
+		q += ` AND ts < ?`
+		args = append(args, f.Before)
+	}
+	if f.AgentID != "" {
+		q += ` AND agent_id = ?`
+		args = append(args, f.AgentID)
+	}
+	if f.EventType != "" {
+		q += ` AND event_type = ?`
+		args = append(args, f.EventType)
+	}
+	if f.Tool != "" {
+		q += ` AND tool_name = ?`
+		args = append(args, f.Tool)
+	}
+	if f.Decision != "" {
+		q += ` AND decision = ?`
+		args = append(args, f.Decision)
+	}
+	q += ` ORDER BY ts DESC`
+	if f.Limit > 0 {
+		q += ` LIMIT ?`
+		args = append(args, f.Limit)
+	}
+	rows, err := l.db.QueryContext(ctx, q, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []Event{}
+	for rows.Next() {
+		var e Event
+		var agent, upstream, tool, decision, reason, eargs, summary, approval sql.NullString
+		if err := rows.Scan(&e.ID, &e.TS, &agent, &upstream, &tool, &e.EventType,
+			&decision, &reason, &eargs, &summary, &approval); err != nil {
+			return nil, err
+		}
+		e.AgentID = agent.String
+		e.UpstreamName = upstream.String
+		e.ToolName = tool.String
+		e.Decision = decision.String
+		e.Reason = reason.String
+		if eargs.Valid && eargs.String != "" {
+			e.Arguments = json.RawMessage(eargs.String)
+		}
+		e.ResultSummary = summary.String
+		e.ApprovalID = approval.String
+		out = append(out, e)
+	}
+	return out, rows.Err()
+}
+
+// RecentBefore returns up to limit events older than the `before` ts_ms
+// cursor, newest first. before<=0 means "from the newest". Backs the
+// dashboard's "Load older" pagination; uses idx_audit_ts.
+func (l *Logger) RecentBefore(ctx context.Context, limit int, before int64) ([]Event, error) {
 	if limit <= 0 || limit > 500 {
 		limit = 100
 	}
-	rows, err := l.db.QueryContext(ctx,
-		`SELECT id, ts, agent_id, upstream_name, tool_name, event_type, decision,
-            reason, arguments, result_summary, approval_id
-         FROM audit_events ORDER BY ts DESC LIMIT ?`, limit)
+	const cols = `id, ts, agent_id, upstream_name, tool_name, event_type, decision,
+            reason, arguments, result_summary, approval_id`
+	var rows *sql.Rows
+	var err error
+	if before > 0 {
+		rows, err = l.db.QueryContext(ctx,
+			`SELECT `+cols+` FROM audit_events WHERE ts < ? ORDER BY ts DESC LIMIT ?`, before, limit)
+	} else {
+		rows, err = l.db.QueryContext(ctx,
+			`SELECT `+cols+` FROM audit_events ORDER BY ts DESC LIMIT ?`, limit)
+	}
 	if err != nil {
 		return nil, err
 	}

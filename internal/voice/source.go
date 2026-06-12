@@ -4,24 +4,38 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"sync/atomic"
+	"time"
 
 	"github.com/coder/websocket"
 )
 
-// wsSource turns the binary side of a WebSocket into the <-chan []byte
-// that maestro.New expects on the mic side. Text frames are JSON control
-// messages that surface on the control channel.
+// errReadRateExceeded is surfaced on errCh when the inbound byte rate
+// trips the read-rate cap in readLoop.
+var errReadRateExceeded = errors.New("voice: inbound read rate exceeded")
+
+// wsSource turns the binary side of a WebSocket into the mic channel consumed
+// by the live Gemini client. Text frames are JSON control messages that
+// surface on the control channel.
 //
 // The reader runs in a goroutine started by start(); it returns when the
 // peer closes, ctx is cancelled, or a transport error fires. The mic
-// channel is closed when the reader exits so the maestro session unwinds
-// cleanly.
+// channel is closed when the reader exits so the live session unwinds cleanly.
 type wsSource struct {
 	conn    *websocket.Conn
 	mic     chan []byte
 	control chan clientMsg
 	errCh   chan error
+
+	// muted, when set, makes readLoop drain inbound audio frames instead
+	// of forwarding them to the mic channel — a true server-side mute, so
+	// audio stops reaching Gemini even if the client keeps streaming.
+	muted atomic.Bool
 }
+
+// SetMuted toggles server-side mic muting. The client-side mute alone
+// can't be trusted to actually stop the upstream audio bill.
+func (s *wsSource) SetMuted(m bool) { s.muted.Store(m) }
 
 func newWSSource(conn *websocket.Conn) *wsSource {
 	return &wsSource{
@@ -59,6 +73,18 @@ func (s *wsSource) readLoop(ctx context.Context) {
 	defer close(s.mic)
 	defer close(s.control)
 
+	// Read-rate cap: a token bucket refilled at ~128 KiB/s with a 1 MiB
+	// burst. Real 16 kHz mono int16 mic audio is ~32 KiB/s, so this is
+	// ~4× headroom; a client (or a hijacked socket) that floods us far
+	// past mic rate trips StatusPolicyViolation instead of pinning a CPU
+	// core and ballooning memory.
+	const (
+		rateBytesPerSec = 128 * 1024
+		burstBytes      = 1024 * 1024
+	)
+	tokens := float64(burstBytes)
+	last := time.Now()
+
 	for {
 		mt, data, err := s.conn.Read(ctx)
 		if err != nil {
@@ -70,8 +96,32 @@ func (s *wsSource) readLoop(ctx context.Context) {
 			}
 			return
 		}
+
+		// Refill then charge the bucket for this frame. Both binary and
+		// text frames cost us to read, so both are metered.
+		now := time.Now()
+		tokens += now.Sub(last).Seconds() * rateBytesPerSec
+		if tokens > burstBytes {
+			tokens = burstBytes
+		}
+		last = now
+		tokens -= float64(len(data))
+		if tokens < 0 {
+			select {
+			case s.errCh <- errReadRateExceeded:
+			default:
+			}
+			s.conn.Close(websocket.StatusPolicyViolation, "read rate exceeded")
+			return
+		}
+
 		switch mt {
 		case websocket.MessageBinary:
+			if s.muted.Load() {
+				// Muted: drain the frame without forwarding so audio
+				// genuinely stops reaching Gemini.
+				continue
+			}
 			// Copy is implicit — coder/websocket returns a fresh slice
 			// per Read, so we can hand it to the channel directly.
 			select {

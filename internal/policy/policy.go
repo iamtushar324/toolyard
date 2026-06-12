@@ -1,8 +1,23 @@
 // Package policy decides whether a tool call is allowed, must be approved, or
-// denied. v0.1 ships a hardcoded rule: writes need approval, reads pass.
+// denied. The evaluation order is:
+//
+//	forcedAction (builtins, handled by the gateway) →
+//	explicit tool-scope policy → explicit upstream-scope policy →
+//	intent category → read-name heuristic → default (writes need approval)
+//
+// Explicit policies live in the tool_policies table and are set from the UI.
 package policy
 
-import "strings"
+import (
+	"context"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/google/uuid"
+
+	"github.com/tusharbhardwaj/toolyard/internal/store"
+)
 
 type Action string
 
@@ -16,34 +31,110 @@ type Decision struct {
 	Action Action
 	Reason string // human-readable rationale for the decision
 	RuleID string
+	// RequireHuman is set when an explicit `ask` policy decided this call.
+	// The bus uses it to skip the auto-approver so a learned auto rule can't
+	// override the operator's explicit "always ask me".
+	RequireHuman bool
 }
 
 type Request struct {
 	AgentID        string
 	UpstreamName   string
-	ToolName       string
-	IntentCategory string // optional v0.1
+	ToolName       string // WRAPPED catalog name (e.g. "github.create_issue")
+	IntentCategory string
 	Arguments      map[string]any
 	UserReason     string
 }
 
-// Engine is the policy evaluator. v0.1 has no rules table; it uses heuristics.
-type Engine struct{}
+// ToolPolicy is one stored explicit gate. Scope is "tool" (target is the
+// wrapped tool name) or "upstream" (target is the upstream name). Action is
+// "allow" | "ask" | "deny".
+type ToolPolicy struct {
+	ID        string `json:"id"`
+	Scope     string `json:"scope"`
+	Target    string `json:"target"`
+	Action    string `json:"action"`
+	Note      string `json:"note,omitempty"`
+	CreatedAt int64  `json:"created_at"`
+	UpdatedAt int64  `json:"updated_at"`
+}
 
-func New() *Engine { return &Engine{} }
+const (
+	ScopeTool     = "tool"
+	ScopeUpstream = "upstream"
+)
 
-// Eval returns the decision for req. The hardcoded rule:
-//   - meta-tools on the synthetic "tools" upstream pass through (their inner
-//     call is policy-evaluated independently)
-//   - explicit category "read" -> allow
-//   - explicit category "write" / "destructive" / "external_communication" /
-//     "financial" / "privileged_admin" -> approve
-//   - otherwise infer from tool name (read-ish prefixes pass; everything else
-//     gets approval).
+// Engine is the policy evaluator. It is nil-tolerant: built with a nil db
+// (probe/tests) it falls back to the heuristic-only behaviour with no stored
+// policies, which is exactly the pre-feature behaviour.
+type Engine struct {
+	db     *store.DB
+	mu     sync.RWMutex
+	byTool map[string]ToolPolicy
+	byUp   map[string]ToolPolicy
+}
+
+// New constructs the engine and primes its policy cache from the db. Pass a
+// nil db for the heuristic-only engine used by probes and tests.
+func New(db *store.DB) *Engine {
+	e := &Engine{db: db, byTool: map[string]ToolPolicy{}, byUp: map[string]ToolPolicy{}}
+	if db != nil {
+		_ = e.reload(context.Background())
+	}
+	return e
+}
+
+func (e *Engine) reload(ctx context.Context) error {
+	rows, err := e.db.QueryContext(ctx,
+		`SELECT id, scope, target, action, COALESCE(note,''), created_at, updated_at FROM tool_policies`)
+	if err != nil {
+		return err
+	}
+	defer rows.Close()
+	byTool := map[string]ToolPolicy{}
+	byUp := map[string]ToolPolicy{}
+	for rows.Next() {
+		var p ToolPolicy
+		if err := rows.Scan(&p.ID, &p.Scope, &p.Target, &p.Action, &p.Note, &p.CreatedAt, &p.UpdatedAt); err != nil {
+			return err
+		}
+		if p.Scope == ScopeUpstream {
+			byUp[p.Target] = p
+		} else {
+			byTool[p.Target] = p
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	e.mu.Lock()
+	e.byTool, e.byUp = byTool, byUp
+	e.mu.Unlock()
+	return nil
+}
+
+// Eval returns the decision for req.
 func (e *Engine) Eval(req Request) Decision {
 	if req.UpstreamName == "tools" {
 		return Decision{Action: ActionAllow, Reason: "meta-tool routes inner call", RuleID: "v0.1-meta-tool"}
 	}
+
+	// Explicit policies: tool scope beats upstream scope.
+	e.mu.RLock()
+	tp, okT := e.byTool[req.ToolName]
+	up, okU := e.byUp[req.UpstreamName]
+	e.mu.RUnlock()
+	if okT {
+		if d, ok := decisionFromPolicy(tp); ok {
+			return d
+		}
+	}
+	if okU {
+		if d, ok := decisionFromPolicy(up); ok {
+			return d
+		}
+	}
+
 	switch req.IntentCategory {
 	case "read":
 		return Decision{Action: ActionAllow, Reason: "category=read", RuleID: "v0.1-category"}
@@ -64,6 +155,121 @@ func (e *Engine) Eval(req Request) Decision {
 	}
 }
 
+func decisionFromPolicy(p ToolPolicy) (Decision, bool) {
+	switch p.Action {
+	case "allow":
+		return Decision{Action: ActionAllow, Reason: "explicit " + p.Scope + "-policy: allow", RuleID: p.ID}, true
+	case "deny":
+		return Decision{Action: ActionDeny, Reason: "explicit " + p.Scope + "-policy: deny", RuleID: p.ID}, true
+	case "ask":
+		return Decision{Action: ActionApprove, Reason: "explicit " + p.Scope + "-policy: ask", RuleID: p.ID, RequireHuman: true}, true
+	}
+	return Decision{}, false
+}
+
+// ---- CRUD -------------------------------------------------------------------
+
+// ErrForceRequired is returned when allowing a destructive-looking tool
+// without force=true. Allowing such a tool bypasses the destructive veto, so
+// it must be an explicit operator override.
+var ErrForceRequired = errString("allowing a destructive tool requires force=true")
+
+// ErrNoDB is returned by CRUD methods on a heuristic-only (nil-db) engine.
+var ErrNoDB = errString("policy engine has no database")
+
+type errString string
+
+func (e errString) Error() string { return string(e) }
+
+// List returns all stored policies (cache snapshot).
+func (e *Engine) List() []ToolPolicy {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	out := make([]ToolPolicy, 0, len(e.byTool)+len(e.byUp))
+	for _, p := range e.byTool {
+		out = append(out, p)
+	}
+	for _, p := range e.byUp {
+		out = append(out, p)
+	}
+	return out
+}
+
+// Get returns the stored policy for a (scope,target), if any.
+func (e *Engine) Get(scope, target string) (ToolPolicy, bool) {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	if scope == ScopeUpstream {
+		p, ok := e.byUp[target]
+		return p, ok
+	}
+	p, ok := e.byTool[target]
+	return p, ok
+}
+
+// Set upserts a policy. action must be allow|ask|deny. Allowing a
+// destructive-looking tool requires force=true.
+func (e *Engine) Set(ctx context.Context, scope, target, action, note string, force bool) (*ToolPolicy, error) {
+	if e.db == nil {
+		return nil, ErrNoDB
+	}
+	if scope != ScopeTool && scope != ScopeUpstream {
+		return nil, errString("scope must be tool or upstream")
+	}
+	if action != "allow" && action != "ask" && action != "deny" {
+		return nil, errString("action must be allow, ask, or deny")
+	}
+	if action == "allow" && scope == ScopeTool && IsDestructiveName(target) && !force {
+		return nil, ErrForceRequired
+	}
+	now := time.Now().UnixMilli()
+	id := "tp_" + uuid.NewString()
+	// Upsert keyed on (scope,target). Keep the existing id/created_at on update.
+	_, err := e.db.ExecContext(ctx,
+		`INSERT INTO tool_policies(id, scope, target, action, note, created_at, updated_at)
+         VALUES(?,?,?,?,?,?,?)
+         ON CONFLICT(scope,target) DO UPDATE SET action=excluded.action, note=excluded.note, updated_at=excluded.updated_at`,
+		id, scope, target, action, nullStr(note), now, now)
+	if err != nil {
+		return nil, err
+	}
+	if err := e.reload(ctx); err != nil {
+		return nil, err
+	}
+	p, _ := e.Get(scope, target)
+	return &p, nil
+}
+
+// Delete removes a policy by id.
+func (e *Engine) Delete(ctx context.Context, id string) error {
+	if e.db == nil {
+		return ErrNoDB
+	}
+	if _, err := e.db.ExecContext(ctx, `DELETE FROM tool_policies WHERE id = ?`, id); err != nil {
+		return err
+	}
+	return e.reload(ctx)
+}
+
+// DeleteTarget removes a policy by (scope,target). Used by the insights
+// "default" mode to clear an explicit policy.
+func (e *Engine) DeleteTarget(ctx context.Context, scope, target string) error {
+	if e.db == nil {
+		return ErrNoDB
+	}
+	if _, err := e.db.ExecContext(ctx, `DELETE FROM tool_policies WHERE scope = ? AND target = ?`, scope, target); err != nil {
+		return err
+	}
+	return e.reload(ctx)
+}
+
+func nullStr(s string) any {
+	if s == "" {
+		return nil
+	}
+	return s
+}
+
 // readVerbs are the leading verb-words that mark a tool as read-only when
 // matched against the first segment of a tool name (split on . _ /).
 var readVerbs = map[string]bool{
@@ -78,13 +284,9 @@ var readVerbs = map[string]bool{
 // eval.
 func IsReadOnlyName(name string) bool {
 	low := strings.ToLower(name)
-	// Strip an upstream prefix ("github.", "linear/", ...). We deliberately
-	// do not strip on `_` because plenty of raw tool names look like
-	// "read_file" with no upstream prefix.
 	if i := strings.IndexAny(low, "./"); i >= 0 {
 		low = low[i+1:]
 	}
-	// First word of the snake/dash-separated remainder.
 	first := low
 	for i := 0; i < len(low); i++ {
 		if low[i] == '_' || low[i] == '-' {
@@ -93,4 +295,19 @@ func IsReadOnlyName(name string) bool {
 		}
 	}
 	return readVerbs[first]
+}
+
+// destructiveMarkers flag tool names whose explicit `allow` policy bypasses
+// the destructive veto and therefore needs force=true.
+var destructiveMarkers = []string{"delete", "destroy", "drop", "remove", "purge", "wipe", "truncate"}
+
+// IsDestructiveName reports whether a tool name looks destructive.
+func IsDestructiveName(name string) bool {
+	low := strings.ToLower(name)
+	for _, m := range destructiveMarkers {
+		if strings.Contains(low, m) {
+			return true
+		}
+	}
+	return false
 }

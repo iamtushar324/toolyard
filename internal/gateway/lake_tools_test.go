@@ -69,7 +69,7 @@ func newTestGatewayWithLake(t *testing.T) *Gateway {
 	})
 
 	gw := New(Options{
-		Policy:   policy.New(),
+		Policy:   policy.New(nil),
 		Approval: bus,
 		Audit:    audit.New(db),
 		Hub:      realtime.NewHub(),
