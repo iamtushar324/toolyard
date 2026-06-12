@@ -151,6 +151,27 @@ if ! command -v go >/dev/null 2>&1; then
   exit 1
 fi
 
+# atomic_install <src> <dest> [mode]
+# Installs a binary via write-to-temp + rename(2) so re-installing over a
+# *running* executable doesn't trip ETXTBSY ("Text file busy"). A plain
+# `install`/`cp` opens the destination with O_TRUNC, which the kernel
+# refuses while the old binary is still being executed (the toolyard.service
+# is up during this step — the systemctl restart happens later). The temp
+# file is staged IN THE DESTINATION DIRECTORY so the rename is guaranteed
+# same-filesystem and therefore atomic; a cross-fs mv would fall back to a
+# copy-in-place and hit the same busy-file error. rename(2) just swaps the
+# directory entry, so the running process keeps executing the old, now
+# unlinked inode until it restarts.
+atomic_install() {
+  local src="$1" dest="$2" mode="${3:-0755}" tmp
+  tmp="$(mktemp "$(dirname "$dest")/.$(basename "$dest").XXXXXX")" || return 1
+  if ! install -m "$mode" "$src" "$tmp"; then
+    rm -f "$tmp"
+    return 1
+  fi
+  mv -f "$tmp" "$dest"
+}
+
 # Client-only short-circuit: build the CLI binary, install it, done.
 # Useful on a remote server that only consumes a remote toolyard gateway
 # via HTTPS. No data dir, no systemd, no docker, no users.
@@ -169,13 +190,12 @@ if [[ "$CLIENT_ONLY" == "true" ]]; then
       GOPROXY="https://proxy.golang.org,direct" \
     bash -c "cd '$(pwd)' && go build -trimpath -ldflags '-s -w' -o '$TMP_CLI' ./cmd/toolyard"
   if [[ $EUID -eq 0 ]]; then
-    install -m 0755 "$TMP_CLI" "$CLI_BINARY_PATH"
+    atomic_install "$TMP_CLI" "$CLI_BINARY_PATH"
   else
-    cp "$TMP_CLI" "$CLI_BINARY_PATH" 2>/dev/null || {
+    atomic_install "$TMP_CLI" "$CLI_BINARY_PATH" 2>/dev/null || {
       mkdir -p "$HOME/.local/bin"
       CLI_BINARY_PATH="$HOME/.local/bin/toolyard"
-      cp "$TMP_CLI" "$CLI_BINARY_PATH"
-      chmod 0755 "$CLI_BINARY_PATH"
+      atomic_install "$TMP_CLI" "$CLI_BINARY_PATH"
       echo "installed (no root): $CLI_BINARY_PATH"
       echo "ensure ~/.local/bin is on PATH"
     }
@@ -214,7 +234,7 @@ sudo -u "$BUILDER" env \
   bash -c "cd '$(pwd)' && CGO_ENABLED=1 go build -trimpath -ldflags '-s -w' -o '$TMP_BIN' ./cmd/gateway"
 
 say "installing binary -> $BINARY_PATH"
-install -m 0755 "$TMP_BIN" "$BINARY_PATH"
+atomic_install "$TMP_BIN" "$BINARY_PATH"
 rm -f "$TMP_BIN"
 
 say "ensuring system user $USER_NAME"
@@ -778,7 +798,8 @@ EOF
 if [[ "$need_setup" == "yes" ]]; then
 cat <<'EOF'
 
-  first-time setup (loopback-only — must run from this server):
+  first-time setup (one-shot — the route closes after the first account):
+    open the dashboard and fill in the "Welcome to toolyard" form, or:
     curl -X POST http://127.0.0.1:18787/v1/auth/setup \
          -H 'Content-Type: application/json' \
          -d '{"Username":"<you>","Password":"<a long passphrase>"}'
