@@ -26,7 +26,8 @@ import (
 	"os"
 )
 
-const version = "0.1.0"
+// version is stamped by the release build via -ldflags "-X main.version=<tag>".
+var version = "dev"
 
 func main() {
 	if len(os.Args) < 2 {

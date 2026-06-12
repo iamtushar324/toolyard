@@ -15,6 +15,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"log/slog"
 	"sort"
 	"strings"
 	"sync/atomic"
@@ -22,8 +23,14 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/tusharbhardwaj/toolyard/internal/logx"
 	"github.com/tusharbhardwaj/toolyard/internal/store"
 )
+
+// dropLogEvery controls how often a full-buffer drop is logged: the first
+// drop, then every Nth drop thereafter. Keeps the log readable under a
+// sustained overflow without going fully silent.
+const dropLogEvery = 500
 
 // Outcome values stored on call_events.outcome.
 const (
@@ -102,6 +109,7 @@ func (Noop) Close(ctx context.Context) error { return nil }
 // Recorder is the production Sink — buffered channel + background flusher.
 type Recorder struct {
 	db        *store.DB
+	log       *slog.Logger
 	in        chan Event
 	stop      chan struct{}
 	done      chan struct{}
@@ -116,6 +124,7 @@ type Recorder struct {
 func New(db *store.DB) *Recorder {
 	r := &Recorder{
 		db:        db,
+		log:       logx.For("metrics"),
 		in:        make(chan Event, 512),
 		stop:      make(chan struct{}),
 		done:      make(chan struct{}),
@@ -138,8 +147,23 @@ func (r *Recorder) Record(e Event) {
 	select {
 	case r.in <- e:
 	default:
-		atomic.AddUint64(&r.dropped, 1)
+		// Buffer full: drop the event (analytics loss is non-fatal) but make
+		// the drop observable. Log the first drop, then every dropLogEvery'th
+		// thereafter so a sustained overflow stays visible without flooding.
+		dropped := atomic.AddUint64(&r.dropped, 1)
+		if dropped == 1 || dropped%dropLogEvery == 0 {
+			r.logger().Warn("metrics buffer full, dropping event", "dropped_total", dropped)
+		}
 	}
+}
+
+// logger returns the recorder's logger, falling back to the package default
+// for zero-value / hand-built Recorders that skipped New (e.g. tests).
+func (r *Recorder) logger() *slog.Logger {
+	if r.log != nil {
+		return r.log
+	}
+	return logx.For("metrics")
 }
 
 // DroppedCount returns the cumulative number of events dropped due to full

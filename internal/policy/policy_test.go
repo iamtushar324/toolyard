@@ -3,7 +3,7 @@ package policy
 import "testing"
 
 func TestEvalCategories(t *testing.T) {
-	e := New()
+	e := New(nil) // heuristic-only: no stored policies (regression = pre-feature behaviour)
 	cases := []struct {
 		name string
 		req  Request

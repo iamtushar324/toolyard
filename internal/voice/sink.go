@@ -8,12 +8,11 @@ import (
 	"github.com/coder/websocket"
 )
 
-// wsSink implements maestro.AudioSink: Gemini's 24 kHz mono int16 PCM is
-// pushed into Send, and we ship binary WebSocket frames to the browser
-// unchanged. The browser AudioContext handles up-resampling to whatever
-// the output device wants (LDAC over BTR11 → 96 kHz; built-in speakers →
-// 48 kHz; etc.). Send must not block for long (it runs on the model
-// receive loop), so we queue chunks to a writer goroutine and drop
+// wsSink receives Gemini's 24 kHz mono int16 PCM and ships binary WebSocket
+// frames to the browser unchanged. The browser AudioContext handles
+// up-resampling to whatever the output device wants (LDAC over BTR11 -> 96 kHz;
+// built-in speakers -> 48 kHz; etc.). Send must not block for long (it runs on
+// the model receive loop), so we queue chunks to a writer goroutine and drop
 // silently when that goroutine can't keep up.
 type wsSink struct {
 	conn   *websocket.Conn

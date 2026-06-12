@@ -77,6 +77,14 @@ var PinnedTools = map[string]struct{}{
 	"lake.insert":         {},
 	"lake.create_table":   {},
 	"lake.ingest":         {},
+	// Events Hub — the common-language layer. Pinned so every agent type
+	// always sees the brief/query/publish/ack entry points without reaching
+	// through tools.search.
+	"events.brief":   {},
+	"events.query":   {},
+	"events.get":     {},
+	"events.ack":     {},
+	"events.publish": {},
 }
 
 // IsPinned reports whether toolName is in the always-visible set.
@@ -109,18 +117,18 @@ type toolEntry struct {
 // Gateway stitches the MCP server, policy, approval bus, memory, and upstream
 // pool into one coordinated unit.
 type Gateway struct {
-	mcp                *server.MCPServer
-	policy             *policy.Engine
-	approval           *approval.Bus
-	audit              *audit.Logger
-	hub                *realtime.Hub
-	memory             *memory.Service
-	lake               *lake.Service
-	visibility         VisibilityProvider
-	usage              UsageRecorder
-	metrics            MetricsRecorder
-	metricsReader      MetricsLatencyReader
-	surface            SurfaceModeProvider
+	mcp                 *server.MCPServer
+	policy              *policy.Engine
+	approval            *approval.Bus
+	audit               *audit.Logger
+	hub                 *realtime.Hub
+	memory              *memory.Service
+	lake                *lake.Service
+	visibility          VisibilityProvider
+	usage               UsageRecorder
+	metrics             MetricsRecorder
+	metricsReader       MetricsLatencyReader
+	surface             SurfaceModeProvider
 	inLineWait          time.Duration
 	maxPendingPerAgent  int
 	upstreamCallTimeout time.Duration
@@ -155,13 +163,13 @@ type VisibilityProvider interface {
 }
 
 type Options struct {
-	Name       string
-	Version    string
-	Policy     *policy.Engine
-	Approval   *approval.Bus
-	Audit      *audit.Logger
-	Hub        *realtime.Hub
-	Memory     *memory.Service
+	Name     string
+	Version  string
+	Policy   *policy.Engine
+	Approval *approval.Bus
+	Audit    *audit.Logger
+	Hub      *realtime.Hub
+	Memory   *memory.Service
 	// Lake, when non-nil, gives the gateway a DuckDB-backed personal data
 	// lake. The lake.* MCP tools are registered against it during
 	// RegisterBuiltins. Nil keeps the gateway working without a lake (e.g.,
@@ -482,6 +490,22 @@ func (g *Gateway) SuspendedUpstreamCount() int {
 	return n
 }
 
+// UpstreamsInBackoff returns how many upstreams are currently in
+// circuit-breaker backoff — a recent dial failed and the retry window
+// hasn't elapsed, so calls to them fail fast. Surfaced via /v1/health so
+// a wedged upstream is visible without reading logs.
+func (g *Gateway) UpstreamsInBackoff() int {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	n := 0
+	for _, u := range g.upstreams {
+		if u.inBackoff() {
+			n++
+		}
+	}
+	return n
+}
+
 // acquireSlot is called immediately before an upstream opens (or
 // reopens) a transport. If the live cap would be exceeded by counting
 // `self` in, the least-recently-used OTHER live upstream is suspended.
@@ -778,9 +802,11 @@ func (g *Gateway) routeEntry(ctx context.Context, entry toolEntry, args map[stri
 		}
 	} else {
 		decision = g.policy.Eval(policy.Request{
-			AgentID:        agentID,
-			UpstreamName:   entry.upstream,
-			ToolName:       entry.originalName,
+			AgentID:      agentID,
+			UpstreamName: entry.upstream,
+			// Wrapped catalog name — matches tool_policies targets and the
+			// IsReadOnlyName/IsWrite computation used everywhere else.
+			ToolName:       entry.tool.Name,
 			IntentCategory: intent,
 			Arguments:      cleanArgs,
 			UserReason:     reason,
@@ -812,7 +838,7 @@ func (g *Gateway) routeEntry(ctx context.Context, entry toolEntry, args map[stri
 		ev.ErrorClass = "policy"
 		return mcp.NewToolResultError("denied by policy: " + decision.Reason), nil
 	case policy.ActionApprove:
-		return g.holdAndWait(ctx, entry, cleanArgs, agentID, reason, intent, &ev)
+		return g.holdAndWait(ctx, entry, cleanArgs, agentID, reason, intent, decision.RequireHuman, &ev)
 	default:
 		ev.Outcome = metrics.OutcomeError
 		ev.ErrorClass = "policy"
@@ -856,7 +882,7 @@ func (g *Gateway) handlerFor(toolName string) server.ToolHandlerFunc {
 }
 
 func (g *Gateway) holdAndWait(ctx context.Context, entry toolEntry, args map[string]any,
-	agentID, reason, intent string, ev *metrics.Event) (*mcp.CallToolResult, error) {
+	agentID, reason, intent string, requireHuman bool, ev *metrics.Event) (*mcp.CallToolResult, error) {
 
 	// Per-agent budget: too many concurrent pendings from one agent can
 	// drown the human reviewer. Reject before persisting so a runaway
@@ -888,6 +914,7 @@ func (g *Gateway) holdAndWait(ctx context.Context, entry toolEntry, args map[str
 		Arguments:      args,
 		Reason:         reason,
 		IntentCategory: intent,
+		RequireHuman:   requireHuman,
 	}, g.inLineWait)
 	if err != nil {
 		ev.Outcome = metrics.OutcomeError
@@ -920,7 +947,24 @@ func (g *Gateway) holdAndWait(ctx context.Context, entry toolEntry, args map[str
 		} else {
 			ev.ApprovalOutcome = metrics.ApprovalApproved
 		}
-		return g.dispatch(ctx, entry, args, agentID, reason, req.ID, ev)
+		if req.AutoDecidedBy != "" {
+			// Inline auto-approve: decideInline ran with runExec=false, so
+			// NO background executor was scheduled — we dispatch here. We
+			// MUST then persist the result, otherwise the row stays
+			// allowed with result_executed_at IS NULL and SweepUnexecuted
+			// re-fires the executor (re-running the write) on the next
+			// gateway restart.
+			res, derr := g.dispatch(ctx, entry, args, agentID, reason, req.ID, ev)
+			g.persistApprovalResult(ctx, req.ID, res, derr)
+			return res, derr
+		}
+		// Legacy `-in-line-wait > 0` path: a human tapped Allow during the
+		// wait, so Decide already fired the background executor, which
+		// dispatches AND persists. Dispatching again here would double-run
+		// the tool. Surface the executor's result (or an "executing"
+		// envelope if it hasn't finished) via the same rehydrate path the
+		// deferred `_approval_id` re-call uses.
+		return g.resumeDeferred(ctx, entry, req.ID, ev)
 	case approval.StatusDenied:
 		_ = g.audit.Write(ctx, audit.Event{
 			EventType:    audit.EventCallDenied,
@@ -1258,7 +1302,7 @@ func (g *Gateway) deferredResponse(ctx context.Context, req *approval.Request, e
 		// a backwards-compat path but is strictly slower and offers no
 		// new behaviour.
 		"auto_execute_on_approve": true,
-		"how_to_get_the_result": "Poll this approval_id with tools.poll_approval (or block with tools.wait_for_approval). The response will carry the executed tool's result under `result` once the executor finishes. Do NOT re-call the original tool — toolyard already runs it for you on approve.",
+		"how_to_get_the_result":   "Poll this approval_id with tools.poll_approval (or block with tools.wait_for_approval). The response will carry the executed tool's result under `result` once the executor finishes. Do NOT re-call the original tool — toolyard already runs it for you on approve.",
 		"next_steps_for_agent": map[string]any{
 			"poll_status_and_result": map[string]any{
 				"tool":     "tools.poll_approval",
@@ -1464,10 +1508,24 @@ func (g *Gateway) Execute(ctx context.Context, req *approval.Request) {
 	if g.metrics != nil {
 		g.metrics.Record(*ev)
 	}
+	g.persistApprovalResult(ctx, req.ID, res, dispatchErr)
+}
 
+// persistApprovalResult encodes a dispatched tool result and stores it on
+// the approval row via bus.SetResult, so pollers (and the legacy
+// `_approval_id` re-call) can rehydrate it and SweepUnexecuted won't
+// re-fire the executor after a restart. Shared by the bus-driven Execute
+// hook and holdAndWait's inline auto-approve path. SetResult is gated on
+// result_executed_at IS NULL, so a racing second call is a harmless no-op.
+func (g *Gateway) persistApprovalResult(ctx context.Context, approvalID string, res *mcp.CallToolResult, dispatchErr error) {
+	if g.approval == nil {
+		return
+	}
 	envelope, encErr := encodeApprovalResult(res)
 	if encErr != nil {
-		_ = g.approval.SetResult(ctx, req.ID, "", false, "encode result: "+encErr.Error())
+		if err := g.approval.SetResult(ctx, approvalID, "", false, "encode result: "+encErr.Error()); err != nil {
+			log.Printf("approval-persist: %s: %v", approvalID, err)
+		}
 		return
 	}
 	var execErr string
@@ -1475,8 +1533,8 @@ func (g *Gateway) Execute(ctx context.Context, req *approval.Request) {
 		execErr = dispatchErr.Error()
 	}
 	isErr := res != nil && res.IsError
-	if err := g.approval.SetResult(ctx, req.ID, envelope, isErr, execErr); err != nil {
-		log.Printf("auto-execute: persist result %s: %v", req.ID, err)
+	if err := g.approval.SetResult(ctx, approvalID, envelope, isErr, execErr); err != nil {
+		log.Printf("approval-persist: %s: %v", approvalID, err)
 	}
 }
 

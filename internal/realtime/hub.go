@@ -84,7 +84,12 @@ func (h *Hub) ServeSSE(w http.ResponseWriter, r *http.Request) {
 		case <-r.Context().Done():
 			return
 		case <-keepalive.C:
-			_, _ = w.Write([]byte(": keepalive\n\n"))
+			// A real `event: ping` (not an SSE comment): comments are
+			// invisible to EventSource, so the client can't use them for
+			// staleness detection. A named event fires an addEventListener
+			// handler, letting the dashboard's watchdog tell "alive but
+			// quiet" from "dead socket".
+			_, _ = w.Write([]byte("event: ping\ndata: {}\n\n"))
 			flusher.Flush()
 		case evt, ok := <-ch:
 			if !ok {

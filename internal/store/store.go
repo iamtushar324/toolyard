@@ -44,6 +44,18 @@ func Open(path string) (*DB, error) {
 	return db, nil
 }
 
+// Close checkpoints the WAL (best-effort) and closes the underlying database.
+// The TRUNCATE checkpoint folds the -wal sidecar back into the main file so a
+// file-copy backup of the .db is complete on its own. A checkpoint failure is
+// non-fatal: we still close so callers don't leak the handle.
+func (db *DB) Close() error {
+	if _, err := db.Exec(`PRAGMA wal_checkpoint(TRUNCATE)`); err != nil {
+		// Best-effort; the WAL is replayed on next open regardless.
+		_ = err
+	}
+	return db.DB.Close()
+}
+
 func (db *DB) migrate() error {
 	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS schema_migrations (
         name TEXT PRIMARY KEY,

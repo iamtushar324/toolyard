@@ -39,8 +39,13 @@ import (
 	"github.com/tusharbhardwaj/toolyard/internal/approval"
 	"github.com/tusharbhardwaj/toolyard/internal/audit"
 	"github.com/tusharbhardwaj/toolyard/internal/autoapproval"
+	"github.com/tusharbhardwaj/toolyard/internal/chatnotify"
+	"github.com/tusharbhardwaj/toolyard/internal/chatnotify/telegram"
 	"github.com/tusharbhardwaj/toolyard/internal/crashdump"
+	"github.com/tusharbhardwaj/toolyard/internal/events"
 	"github.com/tusharbhardwaj/toolyard/internal/gateway"
+	"github.com/tusharbhardwaj/toolyard/internal/goroutines"
+	hookspkg "github.com/tusharbhardwaj/toolyard/internal/hooks"
 	"github.com/tusharbhardwaj/toolyard/internal/identity"
 	"github.com/tusharbhardwaj/toolyard/internal/lake"
 	"github.com/tusharbhardwaj/toolyard/internal/logx"
@@ -52,6 +57,8 @@ import (
 	"github.com/tusharbhardwaj/toolyard/internal/policy"
 	"github.com/tusharbhardwaj/toolyard/internal/push"
 	"github.com/tusharbhardwaj/toolyard/internal/realtime"
+	"github.com/tusharbhardwaj/toolyard/internal/sealbox"
+	"github.com/tusharbhardwaj/toolyard/internal/secrets"
 	"github.com/tusharbhardwaj/toolyard/internal/settings"
 	skillspkg "github.com/tusharbhardwaj/toolyard/internal/skills"
 	"github.com/tusharbhardwaj/toolyard/internal/store"
@@ -63,7 +70,9 @@ import (
 	weblake "github.com/tusharbhardwaj/toolyard/web/lake"
 )
 
-const version = "0.1.0"
+// version is stamped by the release build via
+// -ldflags "-X main.version=<tag>"; "dev" means a local/untagged build.
+var version = "dev"
 
 func main() {
 	// Auto-load .env from CWD (and, if present, a .env next to the
@@ -166,9 +175,10 @@ func runServe(argv []string) error {
 	skillsSyncEvery := fs.Duration("skills-sync-interval", skillspkg.DefaultScanEvery, "How often the skills->mempalace background sync walks the skills dir. Use a negative value to disable scanning (skills.publish still works).")
 	claudeSkillsDir := fs.String("claude-skills-dir", "", "Default parent directory `skills.install` symlinks/copies into when the caller doesn't pass `target`. Empty means callers must pass `target` explicitly; a typical value is `~/.claude/skills`.")
 	voiceFlag := fs.String("voice", "auto", "Voice (live call dashboard panel) mode: on|off|auto. auto=enable iff GEMINI_API_KEY is set in the environment; on=fail boot when the key is missing; off=expose no /v1/voice/* routes.")
-	voiceDir := fs.String("voice-dir", "", "Directory holding the voice persona file (soul.md). Defaults to <data-dir>/voice. Seeded on first run with Maestro's embedded default persona.")
-	voiceModel := fs.String("voice-model", os.Getenv("MAESTRO_MODEL"), "Gemini Live model to use for voice calls. Falls back to $MAESTRO_MODEL, then maestro's default (gemini-2.5-flash-preview-native-audio-dialog).")
-	voiceSessionPrefix := fs.String("voice-tmux-prefix", "mae-", "Tmux session prefix Maestro uses when it spawns claude sessions. Must end with '-'.")
+	voiceDir := fs.String("voice-dir", "", "Directory holding the voice persona file (soul.md). Defaults to <data-dir>/voice. Seeded on first run with toolyard's embedded default persona.")
+	voiceModelDefault := os.Getenv("TOOLYARD_VOICE_MODEL")
+	voiceModel := fs.String("voice-model", voiceModelDefault, "Gemini Live model to use for voice calls. Falls back to $TOOLYARD_VOICE_MODEL, then "+voice.DefaultModel+".")
+	voiceMaxCall := fs.Duration("voice-max-call", 60*time.Minute, "hard cap on a single voice call's duration; the server hangs up when reached. Bounds the worst-case Gemini Live bill from an abandoned tab.")
 	stdioIdleTimeout := fs.Duration("stdio-idle-timeout", 0, "DEPRECATED: alias for -upstream-idle-timeout. Kept for backwards compat.")
 	upstreamIdleTimeout := fs.Duration("upstream-idle-timeout", 0, "kill upstream MCP connections idle for this long; transparently re-dial on next call. 0 disables. Recommended: 15m. Covers both stdio (kills subprocess) and http (closes client). Reduces RSS + FDs when no agents are active.")
 	upstreamMaxLive := fs.Int("upstream-max-live", 8, "max simultaneously-live upstream connections. When the cap is hit, the least-recently-used upstream is suspended (catalog stays populated, transparently resumed on next call). 0 = unbounded.")
@@ -283,6 +293,9 @@ func runServe(argv []string) error {
 				"approval_id":    req.ID,
 				"decision_token": req.DecisionToken,
 				"tag":            req.ID,
+				// Non-secret label (upstream · tool, same as the body) so
+				// the service worker can show "✓ Approved — github · …".
+				"tool": req.UpstreamName + " · " + req.ToolName,
 			}
 			_ = pushSvc.Notify(ctx, user.ID, payload)
 		}
@@ -362,10 +375,14 @@ func runServe(argv []string) error {
 	go runReasonScorer(ctx, metricsReader)
 	go runRetentionCompactor(ctx, metricsReader, settingsSvc)
 
+	// Shared policy engine: the gateway evaluates with it, the API exposes
+	// CRUD on the same instance so cache updates are seen immediately.
+	policyEngine := policy.New(db)
+
 	gw := gateway.New(gateway.Options{
 		Name:                "toolyard",
 		Version:             version,
-		Policy:              policy.New(),
+		Policy:              policyEngine,
 		Approval:            bus,
 		Audit:               auditSvc,
 		Hub:                 hub,
@@ -427,6 +444,90 @@ func runServe(argv []string) error {
 		log.Printf("oauth: prime bearers: %v", err)
 	}
 	go oauthSvc.RunRefresher(ctx)
+
+	// Secrets broker. Separate secrets.key (blast-radius partitioning, same
+	// rationale as oauth.key vs session.key). Wired into upstreams so
+	// secret:// refs in env/headers resolve at dial time, never reaching
+	// agents or API responses.
+	secretsKey, err := sealbox.LoadOrCreateKey(*dataDir, "secrets.key")
+	if err != nil {
+		return fmt.Errorf("secrets key: %w", err)
+	}
+	secretsCipher, err := sealbox.NewCipher(secretsKey)
+	if err != nil {
+		return fmt.Errorf("secrets cipher: %w", err)
+	}
+	secretsSvc := secrets.New(db, secretsCipher, auditSvc)
+	upstreamSvc.SetSecrets(secretsSvc)
+
+	// Chat-approval notifications (Telegram). The Registry fans approval-bus
+	// events out to configured chat channels and reconciles after restarts;
+	// the telegram Service is the first Channel. The bot token is sealed with
+	// the secrets cipher under a distinct AAD. Long-poll + reconciler run
+	// under Supervise so a panic restarts them.
+	chatRegistry := chatnotify.NewRegistry(db, bus, func() bool {
+		return settingsSvc.GetBoolDefault(settings.ChatIncludeDetails, true)
+	})
+	telegramSvc := telegram.New(telegram.Options{
+		Settings: settingsSvc,
+		Cipher:   secretsCipher,
+		Decide: func(ctx context.Context, id, action, decidedBy string) (string, bool, error) {
+			req, derr := bus.Decide(ctx, id, action, decidedBy)
+			if derr != nil {
+				if errors.Is(derr, approval.ErrNotPending) {
+					return "", true, nil
+				}
+				return "", false, derr
+			}
+			return req.Status, false, nil
+		},
+	})
+	chatRegistry.Register(telegramSvc)
+	bus.AddNotifier(chatRegistry)
+	goroutines.Supervise(ctx, "telegram-poller", 30*time.Second, telegramSvc.RunPoller)
+	goroutines.Supervise(ctx, "chat-reconciler", 5*time.Minute, func(ctx context.Context) error {
+		return chatRegistry.RunReconciler(ctx, 2*time.Minute)
+	})
+
+	// Events Hub. SQLite-backed hot store (always available, independent of
+	// ClickHouse). Notifier mirrors the approval push notifier: every event
+	// fans out on the realtime hub; events from notify-enabled sources also
+	// fire a content-minimal push. Pollers, the lake sink (when CH is up),
+	// and retention run under Supervise. The events.* MCP tools give every
+	// agent type the same NL activity feed.
+	evSvc := events.New(db)
+	evSvc.AddNotifierFunc(func(ctx context.Context, ev *events.Event, src *events.Source) {
+		hub.Publish(realtime.Event{Type: "event", Data: ev})
+		if !src.Notify {
+			return
+		}
+		if len(src.NotifyTypes) > 0 && !containsStr(src.NotifyTypes, ev.Type) {
+			return
+		}
+		user, uerr := idSvc.PrimaryUser(ctx)
+		if uerr != nil {
+			return
+		}
+		_ = pushSvc.Notify(ctx, user.ID, map[string]any{
+			"title": "toolyard event: " + src.Name,
+			"body":  ev.Summary,
+			"url":   "/?route=events",
+			"tag":   "event-" + ev.ID,
+		})
+	})
+	gw.RegisterEventsTools(evSvc)
+	goroutines.Supervise(ctx, "events-poller", 60*time.Second, evSvc.RunPollers)
+	if lakeSvc != nil {
+		goroutines.Supervise(ctx, "events-lake-sink", 60*time.Second, func(ctx context.Context) error {
+			return evSvc.RunLakeSink(ctx, lakeSvc)
+		})
+	}
+	hasLake := lakeSvc != nil
+	goroutines.Supervise(ctx, "events-retention", time.Hour, func(ctx context.Context) error {
+		return evSvc.RunRetention(ctx,
+			func() int { return settingsSvc.GetInt(settings.EventsRetentionDays, 90) },
+			func() bool { return hasLake })
+	})
 
 	if err := upstreamSvc.LoadAll(ctx); err != nil {
 		log.Printf("upstreams: load: %v", err)
@@ -495,6 +596,7 @@ func runServe(argv []string) error {
 	} else {
 		log.Printf("mempalace: disabled (-mempalace=off)")
 	}
+	hooksSvc := hookspkg.New(db, mpSvc)
 
 	// Notes workspace: a markdown scratchpad agents read/write through the
 	// official @modelcontextprotocol/server-filesystem MCP. The upstream is
@@ -652,12 +754,17 @@ func runServe(argv []string) error {
 			resolvedVoiceDir = filepath.Join(*dataDir, "voice")
 		}
 		voiceSvc = voice.New(voice.Config{
-			APIKey:        apiKey,
-			Model:         *voiceModel,
-			SessionPrefix: *voiceSessionPrefix,
-			PersonaPath:   filepath.Join(resolvedVoiceDir, "soul.md"),
-			Hub:           hub,
-			Logger:        logx.For("voice"),
+			APIKey:      apiKey,
+			Model:       *voiceModel,
+			PersonaPath: filepath.Join(resolvedVoiceDir, "soul.md"),
+			// The whole gateway catalog: memory, approvals/events meta
+			// tools, lake, and every connected upstream. Calls route
+			// through the same policy → approval → audit pipeline as any
+			// enrolled agent, attributed to "voice:<user>".
+			Tools:           gw,
+			Hub:             hub,
+			MaxCallDuration: *voiceMaxCall,
+			Logger:          logx.For("voice"),
 		})
 		if err := voiceSvc.SeedPersona(); err != nil {
 			log.Printf("voice: seed persona at %s: %v (continuing)", resolvedVoiceDir, err)
@@ -675,7 +782,7 @@ func runServe(argv []string) error {
 	}
 
 	// REST API + dashboard.
-	apiSrv := api.New(api.Options{
+	apiSrv := api.New(ctx, api.Options{
 		Identity:                 idSvc,
 		Approval:                 bus,
 		Audit:                    auditSvc,
@@ -689,14 +796,19 @@ func runServe(argv []string) error {
 		Metrics:                  metricsReader,
 		MetricsRecorder:          metricsRec,
 		AutoApproval:             autoApprover,
+		Policy:                   policyEngine,
 		OAuth:                    oauthSvc,
 		Lake:                     lakeSvc,
+		Hooks:                    hooksSvc,
 		GrafanaRuntimeEnvPath:    *grafanaRuntimeEnvPath,
 		ClickhouseRuntimeEnvPath: *clickhouseRuntimeEnvPath,
 		Mempalace:                mpSvc,
 		Notes:                    notesSvc,
 		Skills:                   skillsSvc,
 		Voice:                    voiceSvc,
+		Secrets:                  secretsSvc,
+		ChatTelegram:             telegramSvc,
+		Events:                   evSvc,
 		SessionKey:               loadOrCreateSessionKey(*dataDir),
 		Security:                 secOpts,
 	})
@@ -959,7 +1071,7 @@ func runProbe(argv []string) error {
 		return err
 	}
 	gw := gateway.New(gateway.Options{
-		Policy: policy.New(), Approval: bus,
+		Policy: policy.New(db), Approval: bus,
 		Audit: audit.New(db), Memory: memory.New(db), Hub: realtime.NewHub(),
 	})
 	defer gw.Close()
@@ -1113,6 +1225,16 @@ func parseCIDRs(csv string) []*net.IPNet {
 		out = append(out, c)
 	}
 	return out
+}
+
+// containsStr reports whether s is in list.
+func containsStr(list []string, s string) bool {
+	for _, x := range list {
+		if x == s {
+			return true
+		}
+	}
+	return false
 }
 
 // splitCSV is a tiny helper for the env-key denylist flag.

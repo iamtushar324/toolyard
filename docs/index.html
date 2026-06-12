@@ -1,0 +1,395 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>toolyard — every agent, one gateway, your approval</title>
+  <meta name="description" content="toolyard is a self-hosted MCP gateway that gives Claude Code, Codex, Hermes, OpenClaw — and every agent that speaks MCP — one common language: per-call human approval, shared memory, and a single audit trail.">
+  <meta name="theme-color" content="#07090d">
+  <link rel="icon" href="assets/img/logo.svg" type="image/svg+xml">
+
+  <meta property="og:title" content="toolyard — mission control for your agents">
+  <meta property="og:description" content="Self-hosted MCP gateway: per-call human approval, policy engine, audit trail, shared memory. One Go binary, no SaaS.">
+  <meta property="og:type" content="website">
+  <meta property="og:url" content="https://iamtushar324.github.io/toolyard/">
+
+  <link rel="preconnect" href="https://api.fontshare.com" crossorigin>
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://api.fontshare.com/v2/css?f[]=clash-display@500,600,700&f[]=satoshi@400,500,700&display=swap" rel="stylesheet">
+  <link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
+
+  <link rel="stylesheet" href="assets/css/landing.css">
+</head>
+<body>
+  <div class="grain" aria-hidden="true"></div>
+
+  <!-- ============================= NAV ============================== -->
+  <header class="nav" id="nav">
+    <div class="nav-inner">
+      <a class="brand" href="#top" aria-label="toolyard home">
+        <img src="assets/img/logo.svg" alt="" width="28" height="28">
+        <span class="brand-name">toolyard</span>
+      </a>
+      <nav class="nav-links" aria-label="Primary">
+        <a href="#features">Features</a>
+        <a href="#how">How it works</a>
+        <a href="#install">Install</a>
+        <a href="architecture.md">Docs</a>
+      </nav>
+      <a class="btn btn-ghost btn-nav" href="https://github.com/iamtushar324/toolyard" target="_blank" rel="noopener">
+        <svg viewBox="0 0 16 16" width="16" height="16" aria-hidden="true"><path fill="currentColor" d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27s1.36.09 2 .27c1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.01 8.01 0 0 0 16 8c0-4.42-3.58-8-8-8Z"/></svg>
+        <span>GitHub</span>
+      </a>
+    </div>
+  </header>
+
+  <main id="top">
+
+    <!-- ============================ HERO ============================ -->
+    <section class="hero">
+      <canvas id="hero-canvas" aria-hidden="true"></canvas>
+      <div class="hero-fallback" aria-hidden="true"></div>
+      <div class="hero-scrim" aria-hidden="true"></div>
+
+      <div class="hero-content">
+        <p class="hero-eyebrow reveal">
+          <span class="dot dot-green"></span> Self-hosted MCP gateway · Apache-2.0
+        </p>
+        <h1 class="hero-title reveal">
+          Every agent.<br>
+          One gateway.<br>
+          <span class="hero-accent">Your approval.</span>
+        </h1>
+        <p class="hero-sub reveal">
+          toolyard gives Claude&nbsp;Code, Codex, Hermes, OpenClaw — and every agent
+          that speaks MCP — one common language: per-call human approval,
+          a shared memory, and a single audit trail. One Go binary,
+          on your hardware. No SaaS.
+        </p>
+
+        <div class="hero-install reveal">
+          <code class="install-line" id="hero-install-cmd">curl -fsSL https://raw.githubusercontent.com/iamtushar324/toolyard/main/install.sh | bash</code>
+          <button class="copy-btn" type="button" data-copy="#hero-install-cmd" aria-label="Copy install command">
+            <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path fill="currentColor" d="M5 1.5A1.5 1.5 0 0 1 6.5 0h8A1.5 1.5 0 0 1 16 1.5v8A1.5 1.5 0 0 1 14.5 11H13v1.5A1.5 1.5 0 0 1 11.5 14h-8A1.5 1.5 0 0 1 2 12.5v-8A1.5 1.5 0 0 1 3.5 3H5V1.5Zm1.5 0V3h5A1.5 1.5 0 0 1 13 4.5v5h1.5v-8h-8Zm-3 3v8h8v-8h-8Z" transform="translate(0 1)"/></svg>
+          </button>
+        </div>
+
+        <div class="hero-ctas reveal">
+          <a class="btn btn-primary" href="#install">Install toolyard</a>
+          <a class="btn btn-ghost" href="https://github.com/iamtushar324/toolyard" target="_blank" rel="noopener">Star on GitHub</a>
+        </div>
+
+        <div class="hero-legend reveal" aria-hidden="true">
+          <span><span class="dot dot-green"></span>allowed</span>
+          <span><span class="dot dot-amber"></span>pending your approval</span>
+          <span><span class="dot dot-red"></span>denied</span>
+        </div>
+      </div>
+
+      <a class="scroll-hint" href="#agents" aria-label="Scroll to content">
+        <span></span>
+      </a>
+    </section>
+
+    <!-- ======================= AGENTS STRIP ======================== -->
+    <section class="agents" id="agents">
+      <p class="agents-label">One protocol, every agent</p>
+      <ul class="agents-list">
+        <li><span class="dot dot-green"></span>claude-code</li>
+        <li><span class="dot dot-green"></span>codex</li>
+        <li><span class="dot dot-green"></span>cursor</li>
+        <li><span class="dot dot-green"></span>hermes</li>
+        <li><span class="dot dot-green"></span>openclaw</li>
+        <li><span class="dot dot-green"></span>web-claude</li>
+        <li><span class="dot dot-amber"></span>anything-mcp</li>
+      </ul>
+    </section>
+
+    <!-- ===================== PROBLEM / SOLUTION ==================== -->
+    <section class="problem">
+      <div class="section-inner split">
+        <div class="split-left reveal">
+          <p class="kicker kicker-red">The problem</p>
+          <h2>Five agents, five config files,<br>zero oversight.</h2>
+          <p class="lede">
+            Every coding agent reinvents MCP configuration, approval UX, and
+            audit logging — or worse, ships with <code>--dangerously-skip-permissions</code>.
+            Your GitHub token lives in four JSON files. Nobody remembers
+            which agent deleted that branch.
+          </p>
+        </div>
+        <div class="split-right reveal">
+          <p class="kicker kicker-green">The fix</p>
+          <h2>One control plane,<br>between agents and the world.</h2>
+          <p class="lede">
+            Point every agent at toolyard instead. Upstream MCP servers get
+            configured once. Every call flows through the same policy engine,
+            waits for the same approval tap, and lands in the same audit log
+            — no matter which agent made it.
+          </p>
+        </div>
+      </div>
+    </section>
+
+    <!-- ========================= FEATURES ========================== -->
+    <section class="features" id="features">
+      <div class="section-inner">
+        <p class="kicker reveal">Capabilities</p>
+        <h2 class="section-title reveal">Mission control for your agents</h2>
+
+        <div class="feature-grid">
+          <article class="feature-card reveal">
+            <div class="feature-icon icon-amber">
+              <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true"><path fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" d="M12 3a5 5 0 0 1 5 5v3.5c0 1 .5 2 1.5 2.8.6.5.2 1.7-.6 1.7H6.1c-.8 0-1.2-1.2-.6-1.7C6.5 13.5 7 12.5 7 11.5V8a5 5 0 0 1 5-5Zm-2.5 15a2.5 2.5 0 0 0 5 0"/></svg>
+            </div>
+            <h3>Approve from your pocket</h3>
+            <p>Writes pause for a human. A push notification hits your phone with the agent's <em>reason</em> — Allow or Deny in one tap, signed Ed25519 decision tokens under the hood.</p>
+          </article>
+
+          <article class="feature-card reveal">
+            <div class="feature-icon icon-green">
+              <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true"><path fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" d="M12 3 4 7v5c0 4.5 3.2 8 8 9 4.8-1 8-4.5 8-9V7l-8-4Zm-3.5 9 2.5 2.5 4.5-5"/></svg>
+            </div>
+            <h3>A policy engine that learns</h3>
+            <p>Explicit rules, intent categories, and read-heuristics decide allow / approve / deny. Auto-approval learns your taps — with cool-offs after denials and a hard veto on destructive tools.</p>
+          </article>
+
+          <article class="feature-card reveal">
+            <div class="feature-icon icon-green">
+              <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true"><path fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" d="M4 19V5m0 14h16M8 16v-5m4 5V8m4 8v-3"/></svg>
+            </div>
+            <h3>One audit trail</h3>
+            <p>Every call from every agent in one append-only log — who, what, why, and what happened — streamed live to the dashboard over SSE. Anomaly scoring flags what doesn't fit.</p>
+          </article>
+
+          <article class="feature-card reveal">
+            <div class="feature-icon icon-green">
+              <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true"><path fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" d="M12 8c4.4 0 8-1.1 8-2.5S16.4 3 12 3 4 4.1 4 5.5 7.6 8 12 8Zm8-2.5v13c0 1.4-3.6 2.5-8 2.5s-8-1.1-8-2.5v-13M20 12c0 1.4-3.6 2.5-8 2.5S4 13.4 4 12"/></svg>
+            </div>
+            <h3>Shared memory</h3>
+            <p><code>memory.set</code> in Claude Code, <code>memory.get</code> in Codex. A built-in scoped KV store every connected agent can reach — through the same approval policy as everything else.</p>
+          </article>
+
+          <article class="feature-card reveal">
+            <div class="feature-icon icon-green">
+              <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true"><path fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" d="M3 12c2-4.5 5-7 9-7s7 2.5 9 7c-2 4.5-5 7-9 7s-7-2.5-9-7Zm9 3a3 3 0 1 0 0-6 3 3 0 0 0 0 6Z"/></svg>
+            </div>
+            <h3>A personal data lake</h3>
+            <p>ClickHouse-backed warehouse with read tools agents can query and approve-gated mutation tools. Manifest-driven dashboards: a SQL file becomes a chart.</p>
+          </article>
+
+          <article class="feature-card reveal">
+            <div class="feature-icon icon-green">
+              <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true"><path fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" d="M5 4h14a1 1 0 0 1 1 1v4H4V5a1 1 0 0 1 1-1Zm-1 9h16v6a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1v-6Zm4-6.5h.01M8 16.5h.01"/></svg>
+            </div>
+            <h3>Single binary, zero SaaS</h3>
+            <p>Go + SQLite + a PWA dashboard. Runs on a laptop or a $5 VPS behind systemd sandboxing. Your tokens, your audit log, your hardware — nothing phones home.</p>
+          </article>
+        </div>
+      </div>
+    </section>
+
+    <!-- ======================= HOW IT WORKS ======================== -->
+    <section class="how" id="how">
+      <div class="section-inner">
+        <p class="kicker reveal">The common language</p>
+        <h2 class="section-title reveal">Policy → approval → audit.<br>Every call, every agent.</h2>
+
+        <div class="flow reveal" role="img" aria-label="Agents connect to toolyard, which applies policy, approval and audit before reaching MCP servers">
+          <div class="flow-col">
+            <div class="flow-node">claude-code</div>
+            <div class="flow-node">codex</div>
+            <div class="flow-node">hermes</div>
+            <div class="flow-node">openclaw</div>
+          </div>
+          <div class="flow-wire" aria-hidden="true"><span class="pulse pulse-1"></span><span class="pulse pulse-2"></span></div>
+          <div class="flow-core">
+            <div class="flow-core-name">toolyard</div>
+            <div class="flow-stage"><span class="dot dot-green"></span>policy</div>
+            <div class="flow-stage"><span class="dot dot-amber"></span>approval</div>
+            <div class="flow-stage"><span class="dot dot-green"></span>audit</div>
+          </div>
+          <div class="flow-wire" aria-hidden="true"><span class="pulse pulse-3"></span></div>
+          <div class="flow-col">
+            <div class="flow-node">github</div>
+            <div class="flow-node">filesystem</div>
+            <div class="flow-node">memory + lake</div>
+            <div class="flow-node">any mcp server</div>
+          </div>
+        </div>
+
+        <div class="how-grid">
+          <div class="how-text reveal">
+            <h3>Every call carries a reason</h3>
+            <p>
+              toolyard wraps every upstream tool schema with a required
+              <code>_reason</code> field. Agents must say <em>why</em> —
+              in words a human reviews on the approval card and in the audit log.
+            </p>
+            <h3>Approvals don't block agents</h3>
+            <p>
+              A write that needs your tap returns a deferred envelope instead
+              of hanging the connection. The agent moves on and polls
+              <code>tools.poll_approval</code>; you decide on your own time.
+            </p>
+          </div>
+          <div class="code-panel reveal">
+            <div class="code-panel-bar">
+              <span class="dot dot-red"></span><span class="dot dot-amber"></span><span class="dot dot-green"></span>
+              <span class="code-panel-title">github.create_issue → deferred</span>
+            </div>
+<pre><code><span class="c">// agent calls github.create_issue with its reason</span>
+{
+  "title": "Flaky test in oauth refresher",
+  <span class="g">"_reason"</span>: "User asked me to file the bug we
+              just reproduced in CI run #4188"
+}
+
+<span class="c">// toolyard holds the write and answers immediately</span>
+{
+  "_meta": { "toolyard": {
+    <span class="a">"deferred"</span>: true,
+    "approval_id": "ap_7f3ac21d",
+    "expires_at": "2026-06-11T12:40:00Z"
+  }}
+}
+
+<span class="c">// you tap Allow on your phone → agent polls the result</span>
+tools.poll_approval { "approval_id": "ap_7f3ac21d" }</code></pre>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ===================== APPROVAL SHOWCASE ===================== -->
+    <section class="showcase">
+      <div class="section-inner split">
+        <div class="split-left reveal">
+          <p class="kicker">The moment that matters</p>
+          <h2>An agent wants to write.<br>You're in the loop.</h2>
+          <p class="lede">
+            The dashboard is a PWA — install it on your phone and approval
+            cards arrive as push notifications. Reason on top, arguments
+            underneath, two buttons. That's the whole UX.
+          </p>
+        </div>
+        <div class="split-right reveal">
+          <div class="approval-card" id="approval-demo">
+            <div class="approval-head">
+              <span class="approval-status"><span class="dot dot-amber"></span><em>pending</em></span>
+              <span class="approval-agent">codex · 2s ago</span>
+            </div>
+            <div class="approval-tool">github.create_issue</div>
+            <p class="approval-reason">"User asked me to file the bug we just reproduced in CI run #4188"</p>
+            <div class="approval-args">
+              <span>repo: toolyard</span>
+              <span>title: Flaky test in oauth refresher</span>
+            </div>
+            <div class="approval-actions">
+              <button type="button" class="btn-deny">Deny</button>
+              <button type="button" class="btn-allow">Allow</button>
+            </div>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- ========================== INSTALL ========================== -->
+    <section class="install" id="install">
+      <div class="section-inner">
+        <p class="kicker reveal">Get started</p>
+        <h2 class="section-title reveal">Running in under a minute</h2>
+
+        <div class="terminal reveal">
+          <div class="terminal-bar">
+            <span class="dot dot-red"></span><span class="dot dot-amber"></span><span class="dot dot-green"></span>
+            <div class="terminal-tabs" role="tablist" aria-label="Install methods">
+              <button role="tab" aria-selected="true" data-tab="oneliner">one-liner</button>
+              <button role="tab" aria-selected="false" data-tab="docker">docker</button>
+              <button role="tab" aria-selected="false" data-tab="systemd">linux / systemd</button>
+              <button role="tab" aria-selected="false" data-tab="source">from source</button>
+            </div>
+          </div>
+
+          <div class="terminal-body" data-panel="oneliner" aria-hidden="false">
+<pre><code><span class="p">$</span> <span id="typed-cmd"></span><span class="cursor" id="typed-cursor"></span>
+<span class="ok" id="typed-out" hidden>==&gt; resolving latest release
+==&gt; verifying checksum
+toolyard installed: /usr/local/bin/toolyard
+
+<span class="p">$</span> toolyard serve -addr :8787 -data ~/.toolyard
+<span class="muted">open http://localhost:8787 — create your admin account,
+enroll your agents, add upstreams.</span></span></code></pre>
+            <button class="copy-btn" type="button" data-copy-text="curl -fsSL https://raw.githubusercontent.com/iamtushar324/toolyard/main/install.sh | bash" aria-label="Copy one-liner">copy</button>
+          </div>
+
+          <div class="terminal-body" data-panel="docker" hidden aria-hidden="true">
+<pre><code><span class="p">$</span> git clone https://github.com/iamtushar324/toolyard
+<span class="p">$</span> cd toolyard
+<span class="p">$</span> docker compose -f deploy/docker-compose.yml up -d
+<span class="muted"># dashboard on http://localhost:8787, data in the
+# toolyard-data volume</span></code></pre>
+            <button class="copy-btn" type="button" data-copy-text="git clone https://github.com/iamtushar324/toolyard && cd toolyard && docker compose -f deploy/docker-compose.yml up -d" aria-label="Copy docker commands">copy</button>
+          </div>
+
+          <div class="terminal-body" data-panel="systemd" hidden aria-hidden="true">
+<pre><code><span class="p">$</span> git clone https://github.com/iamtushar324/toolyard
+<span class="p">$</span> cd toolyard
+<span class="p">$</span> sudo ./deploy/install.sh
+<span class="muted"># builds from source, installs a sandboxed systemd unit,
+# and (with docker present) brings up ClickHouse + Grafana
+# for the personal data lake</span></code></pre>
+            <button class="copy-btn" type="button" data-copy-text="git clone https://github.com/iamtushar324/toolyard && cd toolyard && sudo ./deploy/install.sh" aria-label="Copy systemd install commands">copy</button>
+          </div>
+
+          <div class="terminal-body" data-panel="source" hidden aria-hidden="true">
+<pre><code><span class="p">$</span> git clone https://github.com/iamtushar324/toolyard
+<span class="p">$</span> cd toolyard
+<span class="p">$</span> make build          <span class="muted"># needs Go 1.25+ (CGO)</span>
+<span class="p">$</span> ./gateway-darwin serve -addr :8787 -data ~/.toolyard</code></pre>
+            <button class="copy-btn" type="button" data-copy-text="git clone https://github.com/iamtushar324/toolyard && cd toolyard && make build" aria-label="Copy build commands">copy</button>
+          </div>
+        </div>
+
+        <div class="connect-strip reveal">
+          <p>Then point your agents at it:</p>
+          <code>claude mcp add toolyard --transport http http://localhost:8787/mcp</code>
+        </div>
+      </div>
+    </section>
+
+    <!-- =========================== CTA ============================= -->
+    <section class="cta">
+      <div class="section-inner reveal">
+        <h2>Your agents are already talking.<br><span class="hero-accent">Put them on the record.</span></h2>
+        <div class="hero-ctas">
+          <a class="btn btn-primary" href="https://github.com/iamtushar324/toolyard" target="_blank" rel="noopener">View on GitHub</a>
+          <a class="btn btn-ghost" href="self-hosting.md">Self-hosting guide</a>
+        </div>
+      </div>
+    </section>
+  </main>
+
+  <!-- ========================== FOOTER ============================= -->
+  <footer class="footer">
+    <div class="section-inner footer-inner">
+      <div class="footer-brand">
+        <img src="assets/img/logo.svg" alt="" width="22" height="22">
+        <span>toolyard</span>
+        <span class="footer-tag">self-hosted MCP gateway</span>
+      </div>
+      <nav class="footer-links" aria-label="Footer">
+        <a href="https://github.com/iamtushar324/toolyard" target="_blank" rel="noopener">GitHub</a>
+        <a href="architecture.md">Architecture</a>
+        <a href="self-hosting.md">Self-hosting</a>
+        <a href="adr/">ADRs</a>
+        <a href="https://github.com/iamtushar324/toolyard/blob/main/LICENSE" target="_blank" rel="noopener">Apache-2.0</a>
+      </nav>
+      <p class="footer-note">No telemetry. No accounts. No cloud. <span id="footer-year"></span></p>
+    </div>
+  </footer>
+
+  <script type="module" src="assets/js/hero.js"></script>
+  <script defer src="assets/js/landing.js"></script>
+</body>
+</html>

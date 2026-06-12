@@ -22,8 +22,9 @@ const (
 
 // MaxRefreshFailures is how many consecutive refresh errors we tolerate
 // before flipping the upstream to needs_reauth — the IdP almost certainly
-// considers the refresh token dead at this point.
-const MaxRefreshFailures = 4
+// considers the refresh token dead at this point. Six gives a multi-minute
+// IdP blip enough room to recover without forcing a manual re-auth.
+const MaxRefreshFailures = 6
 
 // refresherBackoff returns the delay between retries on N consecutive
 // failures. 1m, 5m, 15m, 1h, then capped.
@@ -40,6 +41,40 @@ func refresherBackoff(failures int) time.Duration {
 	default:
 		return time.Duration(math.Min(60, float64(15+15*(failures-3)))) * time.Minute
 	}
+}
+
+// backoffSatisfied reports whether enough time has elapsed since the most
+// recent refresh activity to attempt another refresh. It gates on
+// max(lastSuccess, lastAttempt): lastSuccess advances only on a successful
+// refresh, while lastAttempt advances on every attempt (success OR failure).
+// Using the later of the two spaces retries out across an IdP outage instead
+// of burning every tick against a still-failing IdP.
+func backoffSatisfied(now, lastSuccess, lastAttempt time.Time, failures int) bool {
+	d := refresherBackoff(failures)
+	if d <= 0 {
+		return true
+	}
+	ref := lastSuccess
+	if lastAttempt.After(ref) {
+		ref = lastAttempt
+	}
+	return now.Sub(ref) >= d
+}
+
+// recordAttempt stamps the last refresh attempt time for an upstream. Called
+// for every attempt regardless of outcome so backoff is attempt-based.
+func (s *Service) recordAttempt(upstream string, t time.Time) {
+	s.mu.Lock()
+	s.lastAttempt[upstream] = t
+	s.mu.Unlock()
+}
+
+// lastAttemptAt returns the last recorded refresh attempt time for an
+// upstream, or the zero time if none has been recorded this process.
+func (s *Service) lastAttemptAt(upstream string) time.Time {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.lastAttempt[upstream]
 }
 
 // RunRefresher loops every RefresherTickEvery, scans tokens that are
@@ -120,9 +155,10 @@ func (s *Service) refreshTick(ctx context.Context) {
 		} else if !shouldRefresh(now, c.lastRefresh, c.exp) {
 			continue
 		}
-		if d := refresherBackoff(c.failures); d > 0 && now.Sub(c.lastRefresh) < d {
+		if !backoffSatisfied(now, c.lastRefresh, s.lastAttemptAt(c.upstream), c.failures) {
 			continue
 		}
+		s.recordAttempt(c.upstream, now)
 		if _, err := s.Refresh(ctx, c.upstream); err != nil {
 			s.handleRefreshFailure(ctx, c.upstream, c.failures+1, err)
 		}

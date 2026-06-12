@@ -1,6 +1,9 @@
 // Package voice exposes the dashboard's "live call" feature: a WebSocket
 // from the browser carrying mic audio in / synthesized audio out, with a
-// Maestro session wired up server-side to drive a tmux+claude workflow.
+// Gemini Live session wired up server-side. The model gets toolyard's own
+// system prompt plus the full gateway tool catalog — memory, approvals,
+// lake, upstreams — dispatched through the same policy → approval → audit
+// pipeline as any enrolled agent.
 //
 // One Service per gateway. One active call per user (extra attempts get a
 // 409 from HandleWS so the dashboard can offer "hang up the other one").
@@ -22,8 +25,7 @@ import (
 	"github.com/coder/websocket"
 	"github.com/google/uuid"
 
-	"github.com/tusharbhardwaj/maestro/pkg/maestro"
-
+	"github.com/tusharbhardwaj/toolyard/internal/gateway"
 	"github.com/tusharbhardwaj/toolyard/internal/realtime"
 )
 
@@ -47,21 +49,33 @@ func (e *ErrAlreadyActive) Error() string {
 // Config wires the Service. APIKey is required; everything else has a
 // sensible default.
 type Config struct {
-	APIKey        string
-	Model         string // optional; falls back to maestro.DefaultModel
-	SessionPrefix string // optional; falls back to maestro.DefaultSessionPrefix
-	// PersonaPath, if set, is read once per call and passed to the Maestro
-	// session as the system instruction. Missing file → embedded default.
-	// Toolyard's wiring layer seeds ~/.toolyard/voice/soul.md on first run.
+	APIKey string
+	Model  string // optional; falls back to DefaultModel
+	// PersonaPath, if set, is read once per call and used as the system
+	// instruction. Missing file → embedded default. Toolyard's wiring
+	// layer seeds ~/.toolyard/voice/soul.md on first run.
 	PersonaPath string
+	// Tools, when set, exposes the gateway's catalog to the model. Calls
+	// are routed through the gateway's normal policy → approval → audit
+	// path under a per-call "voice:<user>" identity. Nil = no tools.
+	Tools ToolBackend
 	// Hub, when set, receives "voice.call.started" and "voice.call.ended"
 	// events so other dashboard tabs see the call indicator.
 	Hub *realtime.Hub
+	// MaxCallDuration caps how long a single call may run before the
+	// server hangs it up. Bounds the worst-case Gemini Live bill from a
+	// forgotten/abandoned tab. <=0 falls back to defaultMaxCallDuration.
+	// (No inactivity timer: the mic streams even during silence, so it
+	// would never fire — a hard duration cap is the real cost bound.)
+	MaxCallDuration time.Duration
 	// Logger receives session events. Optional.
 	Logger *slog.Logger
 }
 
-// Service owns the per-user active-call map and constructs Maestro
+// defaultMaxCallDuration is the fallback hard cap on a single voice call.
+const defaultMaxCallDuration = 60 * time.Minute
+
+// Service owns the per-user active-call map and constructs Gemini Live
 // sessions on demand.
 type Service struct {
 	cfg Config
@@ -145,7 +159,7 @@ func (s *Service) unregisterCall(userID, callID string) {
 	}
 }
 
-// HandleWS upgrades the request, starts a Maestro session, and blocks
+// HandleWS upgrades the request, starts a Gemini Live session, and blocks
 // until either side closes. Caller has already authenticated userID. The
 // caller MUST NOT write to w after this returns: the upgrade has taken
 // it over (or, on the 409 path, the function returned an error and the
@@ -236,7 +250,7 @@ func (s *Service) HandleWS(ctx context.Context, w http.ResponseWriter, r *http.R
 	return err
 }
 
-// runCall sets up the source/sink, constructs the Maestro session, and
+// runCall sets up the source/sink, constructs the Gemini Live client, and
 // blocks until either side exits.
 func (s *Service) runCall(ctx context.Context, conn *websocket.Conn, call *Call) error {
 	src := newWSSource(conn)
@@ -251,33 +265,54 @@ func (s *Service) runCall(ctx context.Context, conn *websocket.Conn, call *Call)
 		Type: "state", Value: stateConnecting, CallID: call.ID,
 	}))
 
-	persona := s.loadPersona()
-
-	sess, err := maestro.New(maestro.Config{
-		APIKey:        s.cfg.APIKey,
-		Model:         s.cfg.Model,
-		SessionPrefix: s.cfg.SessionPrefix,
-		Persona:       persona,
-		Logger:        slogToMaestro{s.log.With("call_id", call.ID)},
-	}, src.Mic(), sink)
-	if err != nil {
-		_ = conn.Write(ctx, websocket.MessageText, mustJSON(serverMsg{
-			Type: "error", Message: err.Error(), CallID: call.ID,
-		}))
-		return fmt.Errorf("maestro new: %w", err)
+	// notify pushes control messages (state/transcript/tool_call) to the
+	// browser. coder/websocket serialises concurrent writers internally,
+	// so this is safe alongside the sink's binary writeLoop.
+	notify := func(m serverMsg) {
+		m.CallID = call.ID
+		wctx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		defer cancel()
+		_ = conn.Write(wctx, websocket.MessageText, mustJSON(m))
 	}
 
-	// Maestro runs on its own goroutine; we watch the control channel on
-	// the main one so we can react to hangup / mute promptly.
-	maestroDone := make(chan error, 1)
-	go func() { maestroDone <- sess.Run(ctx) }()
+	lc := &liveClient{
+		apiKey:  s.cfg.APIKey,
+		model:   s.cfg.Model,
+		persona: s.loadPersona() + toolProtocolAppendix,
+		audio:   sink,
+		mic:     src.Mic(),
+		log:     s.log.With("call_id", call.ID),
+		notify:  notify,
+	}
+	if s.cfg.Tools != nil {
+		toolCtx := gateway.WithAgentID(ctx, "voice:"+call.UserID)
+		catalog := s.cfg.Tools.Catalog()
+		lc.tools = buildGenaiTools(catalog, s.log)
+		lc.dispatch = func(_ context.Context, name string, args map[string]any) (string, error) {
+			// Deliberately use toolCtx (the call's lifetime + identity),
+			// not the recv-loop's ctx: both share the same cancellation
+			// root, and toolCtx carries the agent identity.
+			return dispatchTool(toolCtx, s.cfg.Tools, name, args)
+		}
+		s.log.Info("voice tools declared", "call_id", call.ID, "count", len(catalog))
+	}
 
-	// State: tell the browser we've connected. Internal state transitions
-	// (listening/thinking/speaking) would need a hook into the live client
-	// that doesn't exist yet — TODO once maestro grows transcript callbacks.
-	_ = conn.Write(ctx, websocket.MessageText, mustJSON(serverMsg{
-		Type: "state", Value: stateListening, CallID: call.ID,
-	}))
+	// The live client runs on its own goroutine; we watch the control
+	// channel on the main one so we can react to hangup / mute promptly.
+	liveDone := make(chan error, 1)
+	go func() { liveDone <- lc.run(ctx) }()
+
+	// Hard cap on call duration — bounds the worst-case Gemini Live bill
+	// from an abandoned tab.
+	maxDur := s.cfg.MaxCallDuration
+	if maxDur <= 0 {
+		maxDur = defaultMaxCallDuration
+	}
+	maxTimer := time.NewTimer(maxDur)
+	defer maxTimer.Stop()
+
+	// State transitions (listening/thinking/speaking) and transcripts are
+	// pushed by the live client itself via notify.
 
 	// Music ducking is handled entirely on the client (audible pink-
 	// noise anchor → OS audio session activation → cooperating apps
@@ -291,8 +326,15 @@ func (s *Service) runCall(ctx context.Context, conn *websocket.Conn, call *Call)
 		select {
 		case <-ctx.Done():
 			return ctx.Err()
-		case err := <-maestroDone:
+		case err := <-liveDone:
 			return err
+		case <-maxTimer.C:
+			s.log.Info("voice call hit max duration; hanging up",
+				"call_id", call.ID, "max", maxDur)
+			_ = conn.Write(ctx, websocket.MessageText, mustJSON(serverMsg{
+				Type: "hangup", Reason: "max call duration reached", CallID: call.ID,
+			}))
+			return nil
 		case msg, ok := <-src.Control():
 			if !ok {
 				// Reader exited → peer hung up.
@@ -302,31 +344,31 @@ func (s *Service) runCall(ctx context.Context, conn *websocket.Conn, call *Call)
 			case "hangup":
 				return nil
 			case "mute":
-				// Best-effort: drop mic frames until unmuted. We don't
-				// have a mute-aware mic chan today, so we just log it
-				// and let the model handle silence naturally.
+				// Server-side mute: stop forwarding mic frames to Gemini
+				// (the client-side mute alone can't be trusted to halt
+				// the upstream audio bill).
+				src.SetMuted(msg.Mute)
 				s.log.Debug("voice mute toggle", "call_id", call.ID, "mute", msg.Mute)
 			}
 		}
 	}
 }
 
+// loadPersona reads the operator's soul.md, falling back to the embedded
+// default. The tool-protocol appendix is composed in by the caller so an
+// operator edit can't strip the call mechanics.
 func (s *Service) loadPersona() string {
-	if s.cfg.PersonaPath == "" {
-		return ""
+	if s.cfg.PersonaPath != "" {
+		if data, err := os.ReadFile(s.cfg.PersonaPath); err == nil {
+			return string(data)
+		}
 	}
-	data, err := os.ReadFile(s.cfg.PersonaPath)
-	if err != nil {
-		// Missing or unreadable → fall back to the embedded default by
-		// passing an empty Persona to maestro.New.
-		return ""
-	}
-	return string(data)
+	return DefaultPersona()
 }
 
-// SeedPersona writes maestro's embedded default persona to PersonaPath if
-// no file is there yet. Toolyard's wiring calls this once at startup so
-// the operator has a file to edit later.
+// SeedPersona writes the embedded default persona to PersonaPath if no
+// file is there yet. Toolyard's wiring calls this once at startup so the
+// operator has a file to edit later.
 func (s *Service) SeedPersona() error {
 	if s.cfg.PersonaPath == "" {
 		return nil
@@ -339,16 +381,8 @@ func (s *Service) SeedPersona() error {
 	if err := os.MkdirAll(filepath.Dir(s.cfg.PersonaPath), 0o755); err != nil {
 		return err
 	}
-	return os.WriteFile(s.cfg.PersonaPath, []byte(maestro.DefaultPersona()), 0o644)
+	return os.WriteFile(s.cfg.PersonaPath, []byte(DefaultPersona()), 0o644)
 }
-
-// slogToMaestro adapts *slog.Logger to maestro.Logger.
-type slogToMaestro struct{ l *slog.Logger }
-
-func (s slogToMaestro) Debugf(f string, args ...any) { s.l.Debug(fmt.Sprintf(f, args...)) }
-func (s slogToMaestro) Infof(f string, args ...any)  { s.l.Info(fmt.Sprintf(f, args...)) }
-func (s slogToMaestro) Warnf(f string, args ...any)  { s.l.Warn(fmt.Sprintf(f, args...)) }
-func (s slogToMaestro) Errorf(f string, args ...any) { s.l.Error(fmt.Sprintf(f, args...)) }
 
 func mustJSON(v serverMsg) []byte {
 	b, _ := json.Marshal(v) // small struct, can't fail

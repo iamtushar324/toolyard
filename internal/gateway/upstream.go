@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"log"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -33,6 +35,14 @@ type UpstreamConfig struct {
 	// request to obtain Authorization (and any other) headers. Populated
 	// by the upstreams.Service when an OAuth client is registered.
 	HeaderFunc HeaderFunc `json:"-"`
+
+	// EnvFunc, when non-nil on a stdio transport, is invoked at dial time
+	// to build the subprocess environment. It mirrors HeaderFunc: the
+	// upstreams package installs a closure that resolves secret:// refs in
+	// Env to their decrypted values. A resolution error fails the dial
+	// (naming the missing secret). Because resume() re-dials with the
+	// stored cfg, secret rotation applies automatically on next reconnect.
+	EnvFunc func(ctx context.Context) (map[string]string, error) `json:"-"`
 }
 
 type upstream struct {
@@ -60,6 +70,15 @@ type upstream struct {
 	// the subprocess is idle-killed.
 	cachedToolsMu sync.RWMutex
 	cachedTools   []mcp.Tool
+
+	// Circuit-breaker state, guarded by mu. When a dial fails we refuse
+	// to re-dial until nextRetryAt, so a wedged stdio command (or a dead
+	// remote) fails fast in microseconds instead of eating the 180s
+	// connect timeout on every single call. Backoff resets on a
+	// successful resume.
+	consecutiveFailures int
+	nextRetryAt         time.Time
+	lastDialErr         error
 }
 
 // newUpstream connects to one upstream MCP server using the configured transport.
@@ -70,8 +89,20 @@ func newUpstream(ctx context.Context, cfg UpstreamConfig) (*upstream, error) {
 		if cfg.Command == "" {
 			return nil, errors.New("stdio upstream requires command")
 		}
-		envSlice := make([]string, 0, len(cfg.Env))
-		for k, v := range cfg.Env {
+		// Resolve the subprocess environment. When EnvFunc is set (secrets
+		// broker wired) it yields the env with secret:// refs decrypted; a
+		// resolution failure fails the dial naming the missing secret. When
+		// unset we fall back to the raw cfg.Env.
+		env := cfg.Env
+		if cfg.EnvFunc != nil {
+			resolved, err := cfg.EnvFunc(ctx)
+			if err != nil {
+				return nil, fmt.Errorf("stdio upstream %s: resolve env: %w", cfg.Name, err)
+			}
+			env = resolved
+		}
+		envSlice := make([]string, 0, len(env))
+		for k, v := range env {
 			envSlice = append(envSlice, k+"="+v)
 		}
 		stdio, err := client.NewStdioMCPClient(cfg.Command, envSlice, cfg.Args...)
@@ -181,10 +212,32 @@ func (u *upstream) callTool(ctx context.Context, name string, args map[string]an
 // tool cache intact. The upstream restarts automatically on the next callTool.
 func (u *upstream) suspend() {
 	u.mu.Lock()
-	defer u.mu.Unlock()
-	if u.client != nil {
-		_ = u.client.Close()
-		u.client = nil
+	c := u.client
+	u.client = nil
+	u.mu.Unlock()
+	if c != nil {
+		// Close OUTSIDE u.mu: a hung stdio child would otherwise block
+		// this upstream's callers and — when suspend() is the LRU
+		// eviction victim — the whole admission path in acquireSlot.
+		closeWithTimeout(u.cfg.Name, c, 5*time.Second)
+	}
+}
+
+// closeWithTimeout closes a transport off the caller's goroutine (and
+// off the upstream lock). A wedged stdio child or a remote that never
+// ACKs shutdown would otherwise block indefinitely. On timeout we log a
+// WARN and abandon the goroutine; the OS reaps any child when the
+// gateway process exits.
+func closeWithTimeout(name string, c io.Closer, timeout time.Duration) {
+	done := make(chan error, 1)
+	go func() { done <- c.Close() }()
+	select {
+	case err := <-done:
+		if err != nil {
+			log.Printf("upstream-close: %q close error: %v", name, err)
+		}
+	case <-time.After(timeout):
+		log.Printf("upstream-close-timeout: WARN %q did not close within %s; abandoning", name, timeout)
 	}
 }
 
@@ -202,16 +255,58 @@ func (u *upstream) resume(ctx context.Context) error {
 	if u.client != nil {
 		return nil // already running
 	}
+	// Circuit breaker: while a recent dial failure's backoff window is
+	// still open, fail fast with the last error rather than re-dialing.
+	if !u.nextRetryAt.IsZero() && time.Now().Before(u.nextRetryAt) {
+		return fmt.Errorf("upstream %s in backoff for %s after %d failures: %w",
+			u.cfg.Name, time.Until(u.nextRetryAt).Round(time.Second),
+			u.consecutiveFailures, u.lastDialErr)
+	}
 	if u.pool != nil {
 		u.pool.acquireSlot(u)
 	}
 	fresh, err := newUpstream(ctx, u.cfg)
 	if err != nil {
+		u.consecutiveFailures++
+		u.lastDialErr = err
+		u.nextRetryAt = time.Now().Add(upstreamBackoff(u.consecutiveFailures))
 		return err
 	}
 	u.client = fresh.client
+	u.consecutiveFailures = 0
+	u.nextRetryAt = time.Time{}
+	u.lastDialErr = nil
 	u.lastUsed.Store(time.Now().UnixNano()) // reset idle clock after reconnect
 	return nil
+}
+
+// upstreamBackoff returns how long to wait before re-dialing an upstream
+// after N consecutive dial failures: 10s, 30s, 2m, 10m, then capped at
+// 30m. Mirrors the refresher backoff idiom in internal/oauth.
+func upstreamBackoff(failures int) time.Duration {
+	switch failures {
+	case 0:
+		return 0
+	case 1:
+		return 10 * time.Second
+	case 2:
+		return 30 * time.Second
+	case 3:
+		return 2 * time.Minute
+	case 4:
+		return 10 * time.Minute
+	default:
+		return 30 * time.Minute
+	}
+}
+
+// inBackoff reports whether the upstream is currently suspended and within
+// its circuit-breaker backoff window (a recent dial failed and the retry
+// window hasn't elapsed). Surfaced via /v1/health.
+func (u *upstream) inBackoff() bool {
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	return u.client == nil && !u.nextRetryAt.IsZero() && time.Now().Before(u.nextRetryAt)
 }
 
 // suspended reports whether the upstream's subprocess is currently killed.
@@ -228,10 +323,16 @@ func (u *upstream) idleSince() time.Duration {
 }
 
 func (u *upstream) close() error {
-	if u == nil || u.client == nil {
+	if u == nil {
 		return nil
 	}
 	u.mu.Lock()
-	defer u.mu.Unlock()
-	return u.client.Close()
+	c := u.client
+	u.client = nil
+	u.mu.Unlock()
+	if c == nil {
+		return nil
+	}
+	closeWithTimeout(u.cfg.Name, c, 5*time.Second)
+	return nil
 }

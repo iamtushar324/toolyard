@@ -1,6 +1,6 @@
-// Package voice bridges browser-mic WebSocket connections to embedded
-// Maestro sessions so the dashboard can run a "live call" with Claude
-// without any local audio device on the server.
+// Package voice bridges browser-mic WebSocket connections to Gemini Live so the
+// dashboard can run a live voice call without any local audio device on the
+// server.
 //
 // Wire protocol over the single /v1/voice/ws WebSocket:
 //

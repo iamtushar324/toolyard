@@ -45,6 +45,7 @@ import (
 	"github.com/tusharbhardwaj/toolyard/internal/audit"
 	"github.com/tusharbhardwaj/toolyard/internal/autoapproval"
 	"github.com/tusharbhardwaj/toolyard/internal/gateway"
+	"github.com/tusharbhardwaj/toolyard/internal/hooks"
 	"github.com/tusharbhardwaj/toolyard/internal/identity"
 	"github.com/tusharbhardwaj/toolyard/internal/lake"
 	"github.com/tusharbhardwaj/toolyard/internal/marketplace"
@@ -53,8 +54,10 @@ import (
 	"github.com/tusharbhardwaj/toolyard/internal/metrics"
 	"github.com/tusharbhardwaj/toolyard/internal/notes"
 	"github.com/tusharbhardwaj/toolyard/internal/oauth"
+	"github.com/tusharbhardwaj/toolyard/internal/policy"
 	"github.com/tusharbhardwaj/toolyard/internal/push"
 	"github.com/tusharbhardwaj/toolyard/internal/realtime"
+	"github.com/tusharbhardwaj/toolyard/internal/secrets"
 	"github.com/tusharbhardwaj/toolyard/internal/settings"
 	"github.com/tusharbhardwaj/toolyard/internal/skills"
 	"github.com/tusharbhardwaj/toolyard/internal/upstreams"
@@ -87,14 +90,19 @@ type Server struct {
 	// dashboard noticeably hangs.
 	metricsRecorder          *metrics.Recorder
 	autoApproval             *autoapproval.Service
+	policy                   *policy.Engine
 	oauth                    *oauth.Service
 	lake                     *lake.Service
+	hooks                    *hooks.Service
 	grafanaRuntimeEnvPath    string
 	clickhouseRuntimeEnvPath string
 	mempalace                *mempalace.Service
 	notes                    *notes.Service
 	skills                   *skills.Service
 	voice                    *voice.Service
+	secrets                  *secrets.Service
+	chatTelegram             ChatTelegram
+	events                   EventsAPI
 	sessionKey               []byte
 	security                 SecurityOptions
 	loginLimit               *loginThrottle
@@ -118,11 +126,15 @@ type Options struct {
 	// field from the response.
 	MetricsRecorder *metrics.Recorder
 	AutoApproval    *autoapproval.Service
+	Policy          *policy.Engine
 	OAuth           *oauth.Service
 	// Lake, when set, enables /v1/lake/* — read-only query, named queries
 	// from the embedded queries/ tree, manifest, bootstrap kick-off, ad-hoc
 	// SELECT for the explorer tab. nil disables the routes cleanly.
 	Lake *lake.Service
+	// Hooks, when set, enables /v1/hooks/*: bearer-authenticated lifecycle
+	// hook ingest for agents plus dashboard browsing/export.
+	Hooks *hooks.Service
 	// GrafanaRuntimeEnvPath, when non-empty, is the path on disk where
 	// toolyard maintains a TOOLYARD_LAKE_TOKEN=... line for the Grafana
 	// container's docker-compose `env_file:` to consume. Updated on
@@ -151,12 +163,21 @@ type Options struct {
 	// panel. Requires GEMINI_API_KEY to be wired into the voice.Service
 	// itself; the api layer just gates auth and reverse-checks
 	// concurrency.
-	Voice      *voice.Service
+	Voice *voice.Service
+	// Secrets, when set, enables /v1/secrets/* and the convert-env action,
+	// and is what masks secret values in /v1/servers responses.
+	Secrets *secrets.Service
+	// ChatTelegram, when set, enables /v1/chat/telegram/*. nil leaves the
+	// routes returning 503 (status still reports from settings).
+	ChatTelegram ChatTelegram
+	// Events, when set, enables the Events Hub: /v1/ingest, /v1/events*,
+	// /v1/event-sources*. nil leaves them returning 503/empty.
+	Events     EventsAPI
 	SessionKey []byte
 	Security   SecurityOptions
 }
 
-func New(opts Options) *Server {
+func New(ctx context.Context, opts Options) *Server {
 	s := &Server{
 		identity:                 opts.Identity,
 		approval:                 opts.Approval,
@@ -171,25 +192,38 @@ func New(opts Options) *Server {
 		metrics:                  opts.Metrics,
 		metricsRecorder:          opts.MetricsRecorder,
 		autoApproval:             opts.AutoApproval,
+		policy:                   opts.Policy,
 		oauth:                    opts.OAuth,
 		lake:                     opts.Lake,
+		hooks:                    opts.Hooks,
 		grafanaRuntimeEnvPath:    opts.GrafanaRuntimeEnvPath,
 		clickhouseRuntimeEnvPath: opts.ClickhouseRuntimeEnvPath,
 		mempalace:                opts.Mempalace,
 		notes:                    opts.Notes,
 		skills:                   opts.Skills,
 		voice:                    opts.Voice,
+		secrets:                  opts.Secrets,
+		chatTelegram:             opts.ChatTelegram,
+		events:                   opts.Events,
 		sessionKey:               opts.SessionKey,
 		security:                 opts.Security,
 		loginLimit:               newLoginThrottle(5, 15*time.Minute),
 		unauthLimit:              newLoginThrottle(0, time.Hour), // max/window passed per-call via AllowN
 	}
+	// Sweep stale throttle buckets periodically. Tied to ctx so the
+	// goroutine exits on shutdown instead of leaking (precedent:
+	// approval.New).
 	go func() {
 		t := time.NewTicker(2 * time.Minute)
 		defer t.Stop()
-		for range t.C {
-			s.loginLimit.Sweep()
-			s.unauthLimit.Sweep()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				s.loginLimit.Sweep()
+				s.unauthLimit.Sweep()
+			}
 		}
 	}()
 	return s
@@ -215,12 +249,20 @@ func (s *Server) Routes(mux *http.ServeMux) {
 	mux.HandleFunc("/v1/approvals/", s.approvalsOne)
 	mux.HandleFunc("/v1/approvals/decide-by-token", s.approvalsDecideByToken)
 	mux.HandleFunc("/v1/approvals/decide-batch", s.approvalsDecideBatch)
+	mux.HandleFunc("/v1/approvals/export", s.approvalsExport)
 
 	mux.HandleFunc("/v1/audit", s.auditList)
+	mux.HandleFunc("/v1/audit/export", s.auditExport)
 	mux.HandleFunc("/v1/events/stream", s.eventsStream)
+
+	mux.HandleFunc("/v1/hooks/ingest", s.hooksIngest)
+	mux.HandleFunc("/v1/hooks/events", s.hooksEvents)
+	mux.HandleFunc("/v1/hooks/export", s.hooksExport)
 
 	mux.HandleFunc("/v1/memory", s.memoryHandler)
 	mux.HandleFunc("/v1/memory/list", s.memoryList)
+	mux.HandleFunc("/v1/memory/export", s.memoryExport)
+	mux.HandleFunc("/v1/memory/import", s.memoryImport)
 
 	mux.HandleFunc("/v1/mempalace/ingest", s.mempalaceIngest)
 	mux.HandleFunc("/v1/mempalace/status", s.mempalaceStatus)
@@ -239,6 +281,8 @@ func (s *Server) Routes(mux *http.ServeMux) {
 
 	mux.HandleFunc("/v1/servers", s.serversCollection)
 	mux.HandleFunc("/v1/servers/", s.serversItem)
+	mux.HandleFunc("/v1/secrets", s.secretsCollection)
+	mux.HandleFunc("/v1/secrets/", s.secretsItem)
 	mux.HandleFunc("/v1/tools", s.toolsList)
 	mux.HandleFunc("/v1/tools/run", s.toolsRun)
 	mux.HandleFunc("/v1/marketplace", s.marketplaceList)
@@ -246,6 +290,9 @@ func (s *Server) Routes(mux *http.ServeMux) {
 	mux.HandleFunc("/v1/settings/reveal", s.settingsReveal)
 	mux.HandleFunc("/v1/settings/rotate", s.settingsRotate)
 	mux.HandleFunc("/v1/usage", s.usageHandler)
+
+	mux.HandleFunc("/v1/policies", s.policiesCollection)
+	mux.HandleFunc("/v1/policies/", s.policiesItem)
 
 	mux.HandleFunc("/v1/insights/overview", s.insightsOverview)
 	mux.HandleFunc("/v1/insights/tools", s.insightsTools)
@@ -261,6 +308,9 @@ func (s *Server) Routes(mux *http.ServeMux) {
 	mux.HandleFunc("/v1/insights/export", s.insightsExport)
 
 	mux.HandleFunc("/v1/diagnostics/crashes", s.diagnosticsCrashes)
+
+	s.chatRoutes(mux)
+	s.eventsRoutes(mux)
 
 	s.oauthRoutes(mux)
 	s.lakeRoutes(mux)
@@ -279,14 +329,15 @@ func (s *Server) health(w http.ResponseWriter, r *http.Request) {
 	// stalled on a long transaction. upstreams_live vs _max tells the
 	// operator whether the LRU pool is at saturation.
 	body := map[string]any{
-		"ok":              true,
-		"service":         "toolyard",
-		"version":         "0.1.0",
-		"goroutines":      runtime.NumGoroutine(),
-		"inflight_calls":  s.gateway.InFlight(),
-		"upstreams_live":  s.gateway.LiveUpstreamCount(),
-		"upstreams_idle":  s.gateway.SuspendedUpstreamCount(),
-		"upstreams_max":   s.gateway.MaxLiveUpstreams(),
+		"ok":                true,
+		"service":           "toolyard",
+		"version":           "0.1.0",
+		"goroutines":        runtime.NumGoroutine(),
+		"inflight_calls":    s.gateway.InFlight(),
+		"upstreams_live":    s.gateway.LiveUpstreamCount(),
+		"upstreams_idle":    s.gateway.SuspendedUpstreamCount(),
+		"upstreams_max":     s.gateway.MaxLiveUpstreams(),
+		"upstreams_backoff": s.gateway.UpstreamsInBackoff(),
 	}
 	if s.metricsRecorder != nil {
 		body["metrics_dropped"] = s.metricsRecorder.DroppedCount()
@@ -646,7 +697,17 @@ func (s *Server) agentsItem(w http.ResponseWriter, r *http.Request) {
 	}
 	switch {
 	case subpath == "rotate" && r.Method == http.MethodPost:
-		tok, err := s.identity.RotateAgentToken(r.Context(), uid, id)
+		// Optional grace_seconds: how long the old token keeps working.
+		// Omitted → DefaultRotateGrace; explicit 0 → immediate kill.
+		grace := identity.DefaultRotateGrace
+		var body struct {
+			GraceSeconds *int `json:"grace_seconds"`
+		}
+		_ = decode(r, &body)
+		if body.GraceSeconds != nil {
+			grace = time.Duration(*body.GraceSeconds) * time.Second
+		}
+		tok, err := s.identity.RotateAgentToken(r.Context(), uid, id, grace)
 		if err != nil {
 			writeError(w, http.StatusNotFound, err.Error())
 			return
@@ -654,7 +715,17 @@ func (s *Server) agentsItem(w http.ResponseWriter, r *http.Request) {
 		_ = s.audit.Write(r.Context(), audit.Event{
 			EventType: "agent.rotate", AgentID: id, ResultSummary: "user:" + uid,
 		})
-		writeJSON(w, http.StatusOK, map[string]any{"agent_id": id, "token": tok})
+		writeJSON(w, http.StatusOK, map[string]any{"agent_id": id, "token": tok, "grace_seconds": int(grace.Seconds())})
+	case (subpath == "disable" || subpath == "enable") && r.Method == http.MethodPost:
+		disable := subpath == "disable"
+		if err := s.identity.SetAgentDisabled(r.Context(), uid, id, disable); err != nil {
+			writeError(w, http.StatusNotFound, err.Error())
+			return
+		}
+		_ = s.audit.Write(r.Context(), audit.Event{
+			EventType: "agent." + subpath, AgentID: id, ResultSummary: "user:" + uid,
+		})
+		writeJSON(w, http.StatusOK, map[string]any{"agent_id": id, "disabled": disable})
 	case subpath == "" && r.Method == http.MethodDelete:
 		if err := s.identity.DeleteAgent(r.Context(), uid, id); err != nil {
 			writeError(w, http.StatusNotFound, err.Error())
@@ -665,7 +736,7 @@ func (s *Server) agentsItem(w http.ResponseWriter, r *http.Request) {
 		})
 		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 	default:
-		writeError(w, http.StatusMethodNotAllowed, "POST /rotate or DELETE")
+		writeError(w, http.StatusMethodNotAllowed, "POST /rotate, /disable, /enable, or DELETE")
 	}
 }
 
@@ -764,8 +835,18 @@ func (s *Server) approvalsDecide(w http.ResponseWriter, r *http.Request, id stri
 		return
 	}
 	req, err := s.approval.Decide(r.Context(), id, body.Action, uid)
-	if err != nil && !errors.Is(err, approval.ErrNotPending) {
-		writeError(w, http.StatusBadRequest, err.Error())
+	if err != nil {
+		switch {
+		case errors.Is(err, approval.ErrNotFound):
+			writeError(w, http.StatusNotFound, "approval not found")
+		case errors.Is(err, approval.ErrNotPending):
+			// Already decided/expired/cancelled — 409 with the current row
+			// so the dashboard shows the real state instead of a false
+			// success toast.
+			writeJSON(w, http.StatusConflict, req)
+		default:
+			writeError(w, http.StatusBadRequest, err.Error())
+		}
 		return
 	}
 	writeJSON(w, http.StatusOK, req)
@@ -837,7 +918,15 @@ func (s *Server) approvalsDecideByToken(w http.ResponseWriter, r *http.Request) 
 	}
 	req, err := s.approval.DecideByToken(r.Context(), body.Token, body.Action)
 	if err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
+		switch {
+		case errors.Is(err, approval.ErrNotFound):
+			writeError(w, http.StatusNotFound, "approval not found")
+		case errors.Is(err, approval.ErrNotPending):
+			writeJSON(w, http.StatusConflict, req)
+		default:
+			// Bad/forged token, bad action, etc.
+			writeError(w, http.StatusBadRequest, err.Error())
+		}
 		return
 	}
 	writeJSON(w, http.StatusOK, req)
@@ -850,8 +939,12 @@ func (s *Server) auditList(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusUnauthorized, "unauthorized")
 		return
 	}
-	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
-	out, err := s.audit.Recent(r.Context(), limit)
+	f := auditFilterFromQuery(r)
+	f.Limit, _ = strconv.Atoi(r.URL.Query().Get("limit"))
+	if f.Limit <= 0 {
+		f.Limit = 100
+	}
+	out, err := s.audit.Query(r.Context(), f)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -1191,13 +1284,16 @@ func (s *Server) serversCollection(w http.ResponseWriter, r *http.Request) {
 		if out == nil {
 			out = []upstreams.Server{}
 		}
-		// annotate live tool counts so the dashboard does not need a second call
+		// annotate live tool counts so the dashboard does not need a second
+		// call, and mask secret/plaintext env+header values so a raw API key
+		// never flows back through /v1/servers (the pre-broker leak).
 		for i := range out {
 			if s.gateway != nil {
 				if c := s.gateway.UpstreamToolCount(out[i].Name); c > 0 {
 					out[i].ToolCount = c
 				}
 			}
+			out[i] = upstreams.Masked(out[i])
 		}
 		writeJSON(w, http.StatusOK, out)
 	case http.MethodPost:
@@ -1250,6 +1346,10 @@ func (s *Server) serversItem(w http.ResponseWriter, r *http.Request) {
 		if s.dispatchOAuth(w, r, name, subpath) {
 			return
 		}
+	}
+	if subpath == "convert-env" {
+		s.serversConvertEnv(w, r, name)
+		return
 	}
 	if subpath == "reconnect" {
 		if r.Method != http.MethodPost {

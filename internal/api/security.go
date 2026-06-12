@@ -310,20 +310,30 @@ func perRouteBodyCap(path string) int64 {
 		return 1 << 20 // 1 MiB — memory.set values
 	case strings.HasPrefix(path, "/v1/mempalace/ingest"):
 		return 1 << 20 // 1 MiB — chat-interaction entries can be sizeable
+	case strings.HasPrefix(path, "/v1/hooks/ingest"):
+		return 1 << 20 // 1 MiB — raw agent hook payloads
+	case strings.HasPrefix(path, "/v1/ingest"):
+		return 256 << 10 // 256 KiB — webhook event bodies (payload capped to 64 KiB inside)
+	case strings.HasPrefix(path, "/v1/events"),
+		strings.HasPrefix(path, "/v1/event-sources"):
+		return 64 << 10 // 64 KiB — event queries + source config
 	case strings.HasPrefix(path, "/v1/notes/publish"):
 		return 1 << 20 // 1 MiB — markdown documents
 	case strings.HasPrefix(path, "/v1/notes/sync"):
 		return 4 << 10 // tiny — no body needed
 	case strings.HasPrefix(path, "/v1/push/subscribe"):
 		return 8 << 10 // 8 KiB — subscription metadata
+	case strings.HasPrefix(path, "/v1/chat/"):
+		return 8 << 10 // 8 KiB — bot token + config
 	case strings.HasPrefix(path, "/v1/auth/login"),
 		strings.HasPrefix(path, "/v1/auth/setup"):
 		return 4 << 10 // 4 KiB — username + password is tiny
 	case strings.HasPrefix(path, "/v1/agents"),
 		strings.HasPrefix(path, "/v1/approvals"),
 		strings.HasPrefix(path, "/v1/servers"),
+		strings.HasPrefix(path, "/v1/secrets"),
 		strings.HasPrefix(path, "/v1/insights"):
-		return 64 << 10 // 64 KiB — config rows + decision payloads
+		return 64 << 10 // 64 KiB — config rows + decision payloads + secret values
 	default:
 		return 16 << 10 // 16 KiB
 	}
@@ -333,6 +343,12 @@ func perRouteBodyCap(path string) int64 {
 // because the caller is either (a) bootstrapping with no cookie / dashboard
 // origin in the picture, or (b) a third-party token-tap path.
 func exemptFromCSRFHeader(path string) bool {
+	// Webhook event ingest is bearer-authenticated (source token); no cookie
+	// or dashboard origin, so the CSRF custom-header check doesn't apply. The
+	// path-token form lives under the /v1/ingest/ subtree.
+	if path == "/v1/ingest" || strings.HasPrefix(path, "/v1/ingest/") {
+		return true
+	}
 	switch path {
 	case "/v1/auth/setup", "/v1/auth/login",
 		"/v1/agents/exchange",
@@ -340,6 +356,7 @@ func exemptFromCSRFHeader(path string) bool {
 		// Agent-authenticated (Bearer) ingest — no cookie, no dashboard
 		// origin, so the CSRF custom-header check doesn't apply.
 		"/v1/mempalace/ingest",
+		"/v1/hooks/ingest",
 		"/v1/notes/sync",
 		"/v1/notes/publish",
 		// CLI is bearer-authenticated and called from servers / scripts,
@@ -374,6 +391,10 @@ func unauthRouteLimit(path string) *unauthRouteRule {
 		// Push-tap path. A real user taps approve maybe a few times per
 		// minute at peak.
 		return &unauthRouteRule{"decide", 120, time.Hour}
+	case path == "/v1/ingest" || strings.HasPrefix(path, "/v1/ingest/"):
+		// Webhook ingest. Generous per-IP budget for legitimate high-volume
+		// senders; a bad token still fails auth, this just caps spray.
+		return &unauthRouteRule{"ingest", 1200, time.Hour}
 	}
 	return nil
 }

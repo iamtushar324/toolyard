@@ -59,7 +59,12 @@ type Agent struct {
 	Name     string    `json:"name"`
 	Owner    string    `json:"owner"`
 	LastSeen time.Time `json:"last_seen"`
+	Disabled bool      `json:"disabled"`
 }
+
+// DefaultRotateGrace is how long a rotated-away token keeps authenticating
+// so a running agent isn't killed mid-task by a rotation.
+const DefaultRotateGrace = 10 * time.Minute
 
 // ---- argon2id password hashing -----------------------------------------------
 
@@ -288,16 +293,32 @@ func (s *Service) VerifyAgentToken(ctx context.Context, token string) (*Agent, e
 	id := token[:idx]
 	var ag Agent
 	var hash string
+	var prevHash sql.NullString
+	var prevExp sql.NullInt64
+	var disabled int
 	err := s.db.QueryRowContext(ctx,
-		`SELECT id, name, owner_user, token_hash FROM agents WHERE id = ?`, id).
-		Scan(&ag.ID, &ag.Name, &ag.Owner, &hash)
+		`SELECT id, name, owner_user, token_hash, COALESCE(disabled,0), prev_token_hash, prev_token_expires
+         FROM agents WHERE id = ?`, id).
+		Scan(&ag.ID, &ag.Name, &ag.Owner, &hash, &disabled, &prevHash, &prevExp)
 	if err == sql.ErrNoRows {
 		return nil, ErrAgentTokenInvalid
 	}
 	if err != nil {
 		return nil, err
 	}
-	if hash == "" || subtle.ConstantTimeCompare([]byte(hash), []byte(hashToken(token))) != 1 {
+	if disabled != 0 {
+		return nil, ErrAgentTokenInvalid
+	}
+	want := hashToken(token)
+	ok := hash != "" && subtle.ConstantTimeCompare([]byte(hash), []byte(want)) == 1
+	if !ok && prevHash.Valid && prevHash.String != "" {
+		// Accept the previous token within its grace window.
+		withinGrace := !prevExp.Valid || prevExp.Int64 == 0 || time.Now().UnixMilli() < prevExp.Int64
+		if withinGrace && subtle.ConstantTimeCompare([]byte(prevHash.String), []byte(want)) == 1 {
+			ok = true
+		}
+	}
+	if !ok {
 		return nil, ErrAgentTokenInvalid
 	}
 	_, _ = s.db.ExecContext(ctx, `UPDATE agents SET last_seen = ? WHERE id = ?`,
@@ -308,7 +329,10 @@ func (s *Service) VerifyAgentToken(ctx context.Context, token string) (*Agent, e
 // RotateAgentToken issues a fresh token for an existing agent and invalidates
 // the old hash. Returned plaintext token must be re-distributed by the
 // operator; the old token is dead the instant this returns.
-func (s *Service) RotateAgentToken(ctx context.Context, ownerUserID, agentID string) (string, error) {
+// RotateAgentToken issues a fresh token. When grace > 0 the previous token
+// keeps authenticating until now+grace (so a running agent isn't killed
+// mid-task); grace <= 0 kills the old token immediately.
+func (s *Service) RotateAgentToken(ctx context.Context, ownerUserID, agentID string, grace time.Duration) (string, error) {
 	if agentID == "" {
 		return "", ErrAgentTokenInvalid
 	}
@@ -318,10 +342,19 @@ func (s *Service) RotateAgentToken(ctx context.Context, ownerUserID, agentID str
 	}
 	token := agentID + "." + rawToken
 	hash := hashToken(token)
-	res, err := s.db.ExecContext(ctx,
-		`UPDATE agents SET token_hash = ?, last_seen = ?
-         WHERE id = ? AND owner_user = ?`,
-		hash, time.Now().UnixMilli(), agentID, ownerUserID)
+	now := time.Now().UnixMilli()
+	var res sql.Result
+	if grace > 0 {
+		res, err = s.db.ExecContext(ctx,
+			`UPDATE agents SET prev_token_hash = token_hash, prev_token_expires = ?, token_hash = ?, last_seen = ?
+             WHERE id = ? AND owner_user = ?`,
+			now+grace.Milliseconds(), hash, now, agentID, ownerUserID)
+	} else {
+		res, err = s.db.ExecContext(ctx,
+			`UPDATE agents SET prev_token_hash = NULL, prev_token_expires = NULL, token_hash = ?, last_seen = ?
+             WHERE id = ? AND owner_user = ?`,
+			hash, now, agentID, ownerUserID)
+	}
 	if err != nil {
 		return "", err
 	}
@@ -330,6 +363,28 @@ func (s *Service) RotateAgentToken(ctx context.Context, ownerUserID, agentID str
 		return "", ErrAgentTokenInvalid
 	}
 	return token, nil
+}
+
+// SetAgentDisabled hard-revokes (or re-enables) an agent. A disabled agent's
+// token — current and previous — stops authenticating immediately. Owner-scoped.
+func (s *Service) SetAgentDisabled(ctx context.Context, ownerUserID, agentID string, disabled bool) error {
+	if agentID == "" {
+		return ErrAgentTokenInvalid
+	}
+	d := 0
+	if disabled {
+		d = 1
+	}
+	res, err := s.db.ExecContext(ctx,
+		`UPDATE agents SET disabled = ? WHERE id = ? AND owner_user = ?`, d, agentID, ownerUserID)
+	if err != nil {
+		return err
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return ErrAgentTokenInvalid
+	}
+	return nil
 }
 
 // DeleteAgent removes the agent row entirely so any outstanding bearer
@@ -428,7 +483,7 @@ func nullStr(s string) any {
 
 func (s *Service) ListAgents(ctx context.Context, ownerUserID string) ([]Agent, error) {
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT id, name, owner_user, COALESCE(last_seen, 0)
+		`SELECT id, name, owner_user, COALESCE(last_seen, 0), COALESCE(disabled, 0)
          FROM agents WHERE owner_user = ? ORDER BY created_at DESC`, ownerUserID)
 	if err != nil {
 		return nil, err
@@ -438,12 +493,14 @@ func (s *Service) ListAgents(ctx context.Context, ownerUserID string) ([]Agent, 
 	for rows.Next() {
 		var ag Agent
 		var seen int64
-		if err := rows.Scan(&ag.ID, &ag.Name, &ag.Owner, &seen); err != nil {
+		var disabled int
+		if err := rows.Scan(&ag.ID, &ag.Name, &ag.Owner, &seen, &disabled); err != nil {
 			return nil, err
 		}
 		if seen > 0 {
 			ag.LastSeen = time.UnixMilli(seen)
 		}
+		ag.Disabled = disabled != 0
 		out = append(out, ag)
 	}
 	return out, rows.Err()

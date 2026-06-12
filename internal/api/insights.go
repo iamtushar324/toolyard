@@ -1,6 +1,7 @@
 package api
 
 import (
+	"errors"
 	"net/http"
 	"strconv"
 	"strings"
@@ -8,6 +9,7 @@ import (
 
 	"github.com/tusharbhardwaj/toolyard/internal/autoapproval"
 	"github.com/tusharbhardwaj/toolyard/internal/metrics"
+	"github.com/tusharbhardwaj/toolyard/internal/policy"
 	"github.com/tusharbhardwaj/toolyard/internal/settings"
 )
 
@@ -123,23 +125,78 @@ func (s *Server) insightsToolPolicy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var body struct {
-		AutoApprove bool `json:"auto_approve"`
+		// Mode is the 5-way control: default | auto | allow | ask | deny.
+		// Empty falls back to the legacy auto_approve bool for back-compat.
+		Mode        string `json:"mode"`
+		AutoApprove bool   `json:"auto_approve"`
+		Force       bool   `json:"force"`
 	}
 	if err := decode(r, &body); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	if err := s.autoApproval.SetToolPolicy(r.Context(), tool, body.AutoApprove); err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
+	mode := body.Mode
+	if mode == "" {
+		if body.AutoApprove {
+			mode = "auto"
+		} else {
+			mode = "default"
+		}
+	}
+
+	// Explicit allow/ask/deny require the policy engine.
+	explicit := mode == "allow" || mode == "ask" || mode == "deny"
+	if explicit && s.policy == nil {
+		writeError(w, http.StatusServiceUnavailable, "policy engine not wired")
 		return
 	}
-	resp := map[string]any{
-		"ok":           true,
-		"tool_name":    tool,
-		"auto_approve": body.AutoApprove,
+
+	ctx := r.Context()
+	switch mode {
+	case "default":
+		// Heuristic only: clear any explicit policy AND any learned auto rule.
+		if s.policy != nil {
+			_ = s.policy.DeleteTarget(ctx, policy.ScopeTool, tool)
+		}
+		if err := s.autoApproval.SetToolPolicy(ctx, tool, false); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+	case "auto":
+		// Learned auto-approve (still vetoed/rate-limited inside the pipeline).
+		// Clear any explicit policy so it doesn't shadow the learned rule.
+		if s.policy != nil {
+			_ = s.policy.DeleteTarget(ctx, policy.ScopeTool, tool)
+		}
+		if err := s.autoApproval.SetToolPolicy(ctx, tool, true); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+	case "allow", "ask", "deny":
+		if _, err := s.policy.Set(ctx, policy.ScopeTool, tool, mode, "", body.Force); err != nil {
+			if errors.Is(err, policy.ErrForceRequired) {
+				writeJSON(w, http.StatusConflict, map[string]any{"error": err.Error(), "needs_force": true})
+				return
+			}
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		// Anti-fight: any explicit policy disables a learned auto rule for it.
+		_ = s.autoApproval.SetToolPolicy(ctx, tool, false)
+	default:
+		writeError(w, http.StatusBadRequest, "mode must be default, auto, allow, ask, or deny")
+		return
 	}
-	if body.AutoApprove && s.autoApproval.IsDestructive(r.Context(), tool) {
-		resp["destructive_veto"] = true
+
+	resp := map[string]any{
+		"ok":        true,
+		"tool_name": tool,
+		"mode":      mode,
+		// auto_approve kept for back-compat with older dashboard builds.
+		"auto_approve": mode == "auto",
+	}
+	if (mode == "auto" || mode == "allow") && s.autoApproval.IsDestructive(ctx, tool) {
+		resp["destructive_veto"] = mode == "auto" // allow with force bypasses the veto intentionally
 	}
 	writeJSON(w, http.StatusOK, resp)
 }

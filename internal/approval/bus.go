@@ -220,7 +220,7 @@ func (b *Bus) Hold(ctx context.Context, in NewRequest, maxWait time.Duration) (*
 	// it in-line (status -> allowed) before any notifier sees it as pending.
 	// Coalesced rows that landed on an existing pending request are skipped
 	// — their fate is tied to the original.
-	if b.auto != nil && !req.Coalesced && req.Status == StatusPending {
+	if b.auto != nil && !req.Coalesced && req.Status == StatusPending && !in.RequireHuman {
 		destructive := b.auto.IsDestructive(ctx, req.ToolName)
 		if m := b.auto.Match(req.AgentID, req.UpstreamName, req.ToolName, req.Fingerprint, destructive); m != nil {
 			decided, derr := b.decideInline(ctx, req.ID, StatusAllowed, "rule:"+m.ID)
@@ -278,6 +278,9 @@ type NewRequest struct {
 	Arguments      map[string]any
 	Reason         string
 	IntentCategory string
+	// RequireHuman, when true, suppresses the auto-approval short-circuit so
+	// the request always waits for a human. Set by an explicit `ask` policy.
+	RequireHuman bool
 }
 
 func (b *Bus) create(ctx context.Context, in NewRequest) (*Request, error) {
@@ -285,11 +288,16 @@ func (b *Bus) create(ctx context.Context, in NewRequest) (*Request, error) {
 	// (agent, upstream, tool, args) fingerprint, return it. This stops a
 	// retrying hook or a model that re-issues the same call from piling up
 	// identical approval cards on the dashboard.
+	//
+	// Bounded retry handles the race between parallel identical Holds: both
+	// SELECT no pending row, both INSERT, one wins and the other hits the
+	// partial UNIQUE(fingerprint WHERE pending) index. The loser re-SELECTs
+	// — if the winner is still pending we coalesce onto it; if the winner
+	// was decided in the gap (so the re-SELECT misses it) we loop and INSERT
+	// a fresh row, which now succeeds because the partial index only covers
+	// pending rows. Without the retry the agent would get a raw constraint
+	// error in that narrow window.
 	fp := ComputeFingerprint(in.AgentID, in.UpstreamName, in.ToolName, in.Arguments)
-	if existing, err := b.findPendingByFingerprint(ctx, fp); err == nil && existing != nil {
-		existing.Coalesced = true
-		return existing, nil
-	}
 
 	id := "ap_" + uuid.NewString()
 	now := time.Now()
@@ -308,25 +316,37 @@ func (b *Bus) create(ctx context.Context, in NewRequest) (*Request, error) {
 	}
 	req.DecisionToken = b.signToken(req.ID)
 	args, _ := json.Marshal(in.Arguments)
-	_, err := b.db.ExecContext(ctx,
-		`INSERT INTO approval_requests(id, agent_id, upstream_name, tool_name, arguments,
+
+	const maxCreateAttempts = 3
+	var lastErr error
+	for attempt := 0; attempt < maxCreateAttempts; attempt++ {
+		if existing, err := b.findPendingByFingerprint(ctx, fp); err == nil && existing != nil {
+			existing.Coalesced = true
+			return existing, nil
+		}
+		_, err := b.db.ExecContext(ctx,
+			`INSERT INTO approval_requests(id, agent_id, upstream_name, tool_name, arguments,
             reason, intent_category, status, decision_token, created_at, expires_at, fingerprint)
          VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`,
-		req.ID, req.AgentID, req.UpstreamName, req.ToolName, string(args),
-		req.Reason, nullStr(req.IntentCategory), req.Status, req.DecisionToken,
-		req.CreatedAt, req.ExpiresAt, fp)
-	if err != nil {
-		// SQLite's UNIQUE constraint on the partial fingerprint index can fire
-		// if a parallel request landed first; fall back to coalescing.
-		if isUniqueViolation(err) {
-			if existing, lookupErr := b.findPendingByFingerprint(ctx, fp); lookupErr == nil && existing != nil {
-				existing.Coalesced = true
-				return existing, nil
-			}
+			req.ID, req.AgentID, req.UpstreamName, req.ToolName, string(args),
+			req.Reason, nullStr(req.IntentCategory), req.Status, req.DecisionToken,
+			req.CreatedAt, req.ExpiresAt, fp)
+		if err == nil {
+			return req, nil
 		}
-		return nil, err
+		if !isUniqueViolation(err) {
+			return nil, err
+		}
+		lastErr = err
+		// A rival pending row landed first. Coalesce onto it if it's still
+		// pending; otherwise loop and INSERT a fresh row (the rival was
+		// decided, so the partial unique index no longer blocks us).
+		if existing, lookupErr := b.findPendingByFingerprint(ctx, fp); lookupErr == nil && existing != nil {
+			existing.Coalesced = true
+			return existing, nil
+		}
 	}
-	return req, nil
+	return nil, lastErr
 }
 
 // ComputeFingerprint is sha256(agent_id||0x1f||upstream||0x1f||tool||0x1f||canonical-args).
@@ -541,19 +561,28 @@ func (b *Bus) decide(ctx context.Context, id, action, userID string, runExec boo
 // failure if the executor disappears mid-flight without persisting a
 // result.
 func (b *Bus) runExecutor(req *Request) {
+	// A single deferred recover handles BOTH failure modes: a panicking
+	// executor, and an executor that returns (or panics) without ever
+	// persisting a result. Either way we record a terminal result so
+	// pollers don't spin forever. SetResult is gated on
+	// result_executed_at IS NULL, so when the executor DID persist these
+	// are no-ops.
 	defer func() {
 		if r := recover(); r != nil {
 			log.Printf("approval executor: panic on %s: %v", req.ID, r)
-			_ = b.SetResult(b.bgCtx, req.ID, "", false, fmt.Sprintf("executor panic: %v", r))
+			if err := b.SetResult(b.bgCtx, req.ID, "", false, fmt.Sprintf("executor panic: %v", r)); err != nil {
+				log.Printf("approval executor: persist panic result %s: %v", req.ID, err)
+			}
+			return
+		}
+		cur, err := b.Get(b.bgCtx, req.ID)
+		if err == nil && cur.Status == StatusAllowed && cur.ResultExecutedAt == 0 {
+			if serr := b.SetResult(b.bgCtx, req.ID, "", false, "executor returned without persisting result"); serr != nil {
+				log.Printf("approval executor: persist fallback result %s: %v", req.ID, serr)
+			}
 		}
 	}()
 	b.exec.Execute(b.bgCtx, req)
-	// Defensive: if the executor returned without persisting a result,
-	// mark the row as failed so pollers don't spin forever.
-	cur, err := b.Get(b.bgCtx, req.ID)
-	if err == nil && cur.Status == StatusAllowed && cur.ResultExecutedAt == 0 {
-		_ = b.SetResult(b.bgCtx, req.ID, "", false, "executor returned without persisting result")
-	}
 }
 
 // SetResult persists the executed tool's outcome and wakes any pollers
@@ -747,6 +776,37 @@ func (b *Bus) ListPending(ctx context.Context) ([]Request, error) {
 }
 
 // Recent returns up to limit approvals (any status).
+// Export returns approval rows for backup, newest first, optionally bounded
+// by a created_at window (ms-UTC; 0 = unbounded). Uncapped — callers strip
+// the decision_token before serialising.
+func (b *Bus) Export(ctx context.Context, since, until int64) ([]Request, error) {
+	q := `SELECT ` + requestSelectColumns + ` FROM approval_requests WHERE 1=1`
+	var args []any
+	if since > 0 {
+		q += ` AND created_at >= ?`
+		args = append(args, since)
+	}
+	if until > 0 {
+		q += ` AND created_at <= ?`
+		args = append(args, until)
+	}
+	q += ` ORDER BY created_at DESC`
+	rows, err := b.db.QueryContext(ctx, q, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []Request{}
+	for rows.Next() {
+		req, err := scanRequest(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, *req)
+	}
+	return out, rows.Err()
+}
+
 func (b *Bus) Recent(ctx context.Context, limit int) ([]Request, error) {
 	if limit <= 0 || limit > 500 {
 		limit = 100
@@ -769,9 +829,35 @@ func (b *Bus) Recent(ctx context.Context, limit int) ([]Request, error) {
 	return out, rows.Err()
 }
 
-// SweepExpired marks pending requests past their expiry as expired.
+// SweepExpired marks pending requests past their expiry as expired and
+// fans out a per-row event so dashboard clients drop the stale cards
+// without polling.
 func (b *Bus) SweepExpired(ctx context.Context) (int, error) {
 	now := time.Now().UnixMilli()
+
+	// Capture the rows we're about to expire before the UPDATE so we can
+	// fan them out individually afterward.
+	rows, err := b.db.QueryContext(ctx,
+		`SELECT `+requestSelectColumns+`
+         FROM approval_requests WHERE status = ? AND expires_at <= ?`,
+		StatusPending, now)
+	if err != nil {
+		return 0, err
+	}
+	var expiring []*Request
+	for rows.Next() {
+		req, serr := scanRequest(rows)
+		if serr != nil {
+			rows.Close()
+			return 0, serr
+		}
+		expiring = append(expiring, req)
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		return 0, err
+	}
+
 	res, err := b.db.ExecContext(ctx,
 		`UPDATE approval_requests SET status = ? WHERE status = ? AND expires_at <= ?`,
 		StatusExpired, StatusPending, now)
@@ -790,6 +876,14 @@ func (b *Bus) SweepExpired(ctx context.Context) (int, error) {
 			}
 		}
 		b.mu.Unlock()
+		// Fan out per row so SSE clients remove the expired cards. Re-Get
+		// confirms the row actually expired (vs. a decision that landed in
+		// the gap between our SELECT and the UPDATE).
+		for _, req := range expiring {
+			if cur, gerr := b.Get(ctx, req.ID); gerr == nil && cur.Status == StatusExpired {
+				b.fanOut(ctx, cur, "approval.expire")
+			}
+		}
 	}
 	return int(n), nil
 }
