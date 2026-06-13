@@ -73,22 +73,6 @@ const state = {
   events: { rows: [], unacked: 0, sources: [], loaded: false, nextBefore: 0 },
   eventFilter: { source_id: '', type: '', q: '', unacked: false },
   eventSourceModal: null,  // { kind, name, ... } while adding a source
-  // Personal data lake (TUS-104). Manifest + per-panel cached results so
-  // a tab switch is instant after first visit. Errors per panel are kept
-  // local so one bad query doesn't break the rest of the page.
-  lake: {
-    manifest: null,        // { tabs: [...] } from /v1/lake/manifest
-    activeTab: null,       // tab id
-    panelData: {},         // "<tab>/<panelId>" -> result object
-    panelErrors: {},       // "<tab>/<panelId>" -> error string
-    chartInstances: {},    // "<tab>/<panelId>" -> echarts instance (for resize)
-    loading: false,
-    error: null,
-    explorerSQL: '',       // last SQL the user typed in the explorer tab
-    explorerResult: null,
-    explorerError: null,
-    echartsLoaded: false,
-  },
   // Voice "live call" panel. The actual WS, AudioContext, MediaStream
   // live in module-scope handles (see voiceClient below) — they aren't
   // serialisable and must survive re-renders, so they can't sit in this
@@ -2367,7 +2351,6 @@ function viewSettings() {
         ),
       ) : null,
     ),
-    renderLakeIntegrationCard(),
     renderPushCard(),
     renderChatCard(),
     renderSecretsCard(),
@@ -2422,100 +2405,6 @@ async function importMemoryFile() {
     await loadAll();
     render();
   } catch (e) { toast('Import failed: ' + e.message, 'error'); }
-}
-
-// renderLakeIntegrationCard shows the Lake API token + Grafana origin
-// controls. The token's actual value never lands in any GET response —
-// it's auto-generated on first gateway boot and only revealed via the
-// explicit one-shot reveal endpoint. Rotation issues a fresh value and
-// returns it once for copy. The Grafana origin field updates the CSP
-// frame-src directive live (no gateway restart) so /lake/ can iframe
-// the named Grafana instance.
-function renderLakeIntegrationCard() {
-  const tokenSet = !!state.settings.lake_api_token_present;
-  const grafanaOrigin = state.settings.grafana_origin || '';
-
-  // Reveal flow: POST /v1/settings/reveal {key: lake_api_token}, show
-  // the value in a toast-like box with a one-tap copy button. The DOM
-  // node clears itself after 60s so a logged-in laptop left unattended
-  // doesn't keep the token on screen.
-  const reveal = async () => {
-    try {
-      const r = await api('/v1/settings/reveal', { method: 'POST', body: { key: 'lake_api_token' }});
-      showSecretBox('Lake API Token', r.value);
-    } catch (err) { toast(err.message, 'error'); }
-  };
-
-  const rotate = async () => {
-    if (!confirm('Rotate the lake API token? Existing Grafana datasources keep using the old value until you restart the Grafana container.')) {
-      return;
-    }
-    try {
-      const r = await api('/v1/settings/rotate', { method: 'POST', body: { key: 'lake_api_token' }});
-      state.settings.lake_api_token_present = true;
-      if (r.warning) toast(r.warning, 'error');
-      showSecretBox('New lake API token', r.value, 'Run: sudo docker compose -f deploy/grafana/docker-compose.yaml restart grafana');
-      render();
-    } catch (err) { toast(err.message, 'error'); }
-  };
-
-  let originDraft = grafanaOrigin;
-  const saveOrigin = async () => {
-    try {
-      await api('/v1/settings', { method: 'PATCH', body: { grafana_origin: originDraft }});
-      state.settings.grafana_origin = originDraft;
-      toast('Grafana origin saved');
-      render();
-    } catch (err) { toast(err.message, 'error'); }
-  };
-
-  return el('div', { class: 'card' },
-    el('h2', {}, 'Lake & Grafana integration'),
-    el('p', { class: 'meta' },
-      'Configures how external read-only consumers (Grafana Infinity, scripts) reach ',
-      el('code', {}, '/v1/lake/*'), ', and which origin the toolyard ',
-      el('code', {}, '/lake/'), ' page is allowed to iframe.',
-    ),
-    // --- Lake API token row ---
-    el('div', { style: 'display: grid; grid-template-columns: 1fr auto auto; gap: 8px; align-items: center; margin-top: 8px; padding-top: 12px; border-top: 1px solid var(--border);' },
-      el('div', {},
-        el('div', { style: 'font-weight: 500;' }, 'Lake API token'),
-        el('div', { class: 'meta', style: 'margin-top: 4px;' },
-          tokenSet
-            ? 'Set. Reveal once to copy into Grafana, or rotate to invalidate the existing value.'
-            : 'Not set — toolyard will mint one on the next gateway start.',
-        ),
-      ),
-      el('button', {
-        class: 'btn',
-        disabled: !tokenSet,
-        on: { click: reveal },
-      }, 'Reveal once'),
-      el('button', {
-        class: 'btn',
-        on: { click: rotate },
-      }, tokenSet ? 'Rotate' : 'Generate'),
-    ),
-    // --- Grafana origin row ---
-    el('div', { style: 'display: grid; grid-template-columns: 1fr auto; gap: 8px; align-items: center; margin-top: 12px; padding-top: 12px; border-top: 1px solid var(--border);' },
-      el('label', {},
-        el('div', { style: 'font-weight: 500;' }, 'Grafana origin'),
-        el('div', { class: 'meta', style: 'margin: 4px 0;' },
-          'Added to the CSP ', el('code', {}, 'frame-src'),
-          ' so the toolyard ', el('code', {}, '/lake/'),
-          ' page can embed Grafana panels. Empty keeps the strict default.',
-        ),
-        el('input', {
-          type: 'url',
-          placeholder: 'http://localhost:3030',
-          value: grafanaOrigin,
-          style: 'width: 100%;',
-          on: { input: (e) => { originDraft = e.target.value; } },
-        }),
-      ),
-      el('button', { class: 'btn', on: { click: saveOrigin } }, 'Save'),
-    ),
-  );
 }
 
 // showSecretBox displays a sensitive value with a copy-to-clipboard
@@ -3407,9 +3296,6 @@ function navigate(route) {
   if (route === 'hooks' && !state.hooks.loaded && !state.hooks.loading) {
     loadHooks(true);
   }
-  if (route === 'lake' && !state.lake.manifest && !state.lake.loading) {
-    loadLakeManifest();
-  }
   render();
 }
 
@@ -3440,7 +3326,6 @@ function shell(content) {
       el('nav', {},
         navBtn('approvals',    'Approvals'),
         navBtn('call',         'Call' + (state.call.active ? ' ●' : '')),
-        navBtn('lake',         'Lake'),
         navBtn('events',       'Events' + (state.events.unacked ? ' (' + state.events.unacked + ')' : '')),
         navBtn('insights',     'Insights'),
         navBtn('notifications', 'Alerts' + (alertCount ? ' (' + alertCount + ')' : '')),
@@ -3499,7 +3384,6 @@ function renderMoreSheet() {
     el('div', { class: 'modal', style: 'display: flex; flex-direction: column; gap: 6px;' },
       el('h3', {}, 'More'),
       item('call',     'Call',     'Talk to Toolyard through Gemini Live'),
-      item('lake',     'Lake',     'Personal data warehouse — finance, ops, daily memory'),
       item('insights', 'Insights', 'Per-tool, per-agent, cost breakdowns'),
       item('audit',    'Audit',    'Append-only event log'),
       item('hooks',    'Hooks',    'Agent lifecycle events and memory ingest'),
@@ -3588,7 +3472,6 @@ function render() {
     case 'tools':         body = viewTools();         break;
     case 'settings':      body = viewSettings();      break;
     case 'insights':      body = viewInsights();      break;
-    case 'lake':          body = viewLake();          break;
     case 'call':          body = viewCall();          break;
     case 'events':        body = viewEvents();        break;
     case 'notifications': body = viewNotifications(); break;
@@ -3596,301 +3479,6 @@ function render() {
   }
   root.appendChild(shell(body));
   restoreFocus(focus);
-}
-
-// ---- Lake (personal data warehouse, TUS-104) -------------------------------
-//
-// The lake lives at /v1/lake/* on this same gateway. We render its manifest
-// inline as a `lake` route inside this dashboard so login state, push, and
-// nav are all shared. ECharts is loaded lazily on first visit so users who
-// never click Lake don't pay the 1MB bundle cost.
-
-async function loadLakeManifest() {
-  state.lake.loading = true; state.lake.error = null; render();
-  try {
-    const m = await api('/v1/lake/manifest');
-    state.lake.manifest = m;
-    if (!state.lake.activeTab && m.tabs && m.tabs.length) {
-      state.lake.activeTab = m.tabs[0].id;
-    }
-  } catch (e) {
-    state.lake.error = e.message;
-  }
-  state.lake.loading = false;
-  render();
-  // Kick the panels for the active tab and lazy-load ECharts.
-  if (state.lake.manifest && state.lake.activeTab) {
-    ensureECharts().then(() => loadLakeTabData(state.lake.activeTab));
-  }
-}
-
-function ensureECharts() {
-  if (state.lake.echartsLoaded || (typeof window !== 'undefined' && window.echarts)) {
-    state.lake.echartsLoaded = true;
-    return Promise.resolve();
-  }
-  return new Promise((resolve) => {
-    const s = document.createElement('script');
-    s.src = '/lake/vendor/echarts.min.js';
-    s.async = true;
-    s.onload = () => { state.lake.echartsLoaded = true; resolve(); };
-    s.onerror = () => {
-      // ECharts not vendored — chart panels will fall back to a clean
-      // error state but tables / KPIs / SQL editor still work.
-      state.lake.echartsLoaded = false;
-      resolve();
-    };
-    document.head.appendChild(s);
-  });
-}
-
-async function loadLakeTabData(tabId) {
-  const tab = (state.lake.manifest && state.lake.manifest.tabs || []).find((t) => t.id === tabId);
-  if (!tab) return;
-  for (const p of tab.panels || []) {
-    const key = tabId + '/' + p.id;
-    if (state.lake.panelData[key]) continue; // cached
-    if (p.type === 'sql_editor') continue;   // no remote fetch for editor
-    if (!p.query) continue;
-    const qid = p.query.split('/').pop().replace(/\.sql$/, '');
-    try {
-      const res = await api('/v1/lake/run/' + encodeURIComponent(tabId) + '/' + encodeURIComponent(qid));
-      state.lake.panelData[key] = res;
-      delete state.lake.panelErrors[key];
-    } catch (e) {
-      state.lake.panelErrors[key] = e.message;
-    }
-    render();
-  }
-}
-
-function lakeSetTab(id) {
-  state.lake.activeTab = id;
-  render();
-  ensureECharts().then(() => loadLakeTabData(id));
-}
-
-function viewLake() {
-  if (state.lake.loading && !state.lake.manifest) {
-    return el('div', { class: 'card' }, el('div', { class: 'empty' }, 'Loading lake…'));
-  }
-  if (state.lake.error) {
-    return el('div', { class: 'card' },
-      el('h2', {}, 'Lake'),
-      el('div', { class: 'err' }, 'Failed to load: ' + state.lake.error),
-      el('button', { on: { click: () => loadLakeManifest() } }, 'Retry'),
-    );
-  }
-  if (!state.lake.manifest) {
-    // First-paint hit when navigation fired but loadLakeManifest hasn't returned.
-    setTimeout(() => loadLakeManifest(), 0);
-    return el('div', { class: 'card' }, el('div', { class: 'empty' }, 'Loading lake…'));
-  }
-  const tabs = state.lake.manifest.tabs || [];
-  const active = tabs.find((t) => t.id === state.lake.activeTab) || tabs[0];
-
-  const tabBar = el('div', { class: 'row', style: 'gap: 4px; margin-bottom: 12px;' },
-    ...tabs.map((t) => el('button', {
-      class: t.id === active.id ? 'primary' : '',
-      on: { click: () => lakeSetTab(t.id) },
-    }, t.label || t.id)),
-  );
-
-  const grid = el('div', { class: 'lake-grid' },
-    ...((active.panels || []).map((p) => renderLakePanel(active.id, p))),
-  );
-
-  return el('div', {}, tabBar, grid);
-}
-
-function renderLakePanel(tabId, panel) {
-  const key = tabId + '/' + panel.id;
-  const sizeCls = 'lake-panel-' + (panel.size || 'medium');
-  const head = el('div', { class: 'row', style: 'justify-content: space-between; margin-bottom: 8px;' },
-    el('span', {}, panel.title || panel.id),
-    el('span', { class: 'meta' }, panel.type || ''),
-  );
-  let body;
-  if (panel.type === 'sql_editor') {
-    body = renderLakeSqlEditor();
-  } else if (state.lake.panelErrors[key]) {
-    body = el('div', { class: 'err' }, state.lake.panelErrors[key]);
-  } else if (!state.lake.panelData[key]) {
-    body = el('div', { class: 'meta' }, 'Loading…');
-  } else {
-    const res = state.lake.panelData[key];
-    switch (panel.type) {
-      case 'table':       body = renderLakeTable(res); break;
-      case 'kpi':         body = renderLakeKPI(res, panel); break;
-      case 'line_chart':  body = renderLakeChartHolder(key, res, panel, 'line'); break;
-      case 'bar_chart':   body = renderLakeChartHolder(key, res, panel, 'bar'); break;
-      case 'pie_chart':   body = renderLakeChartHolder(key, res, panel, 'pie'); break;
-      default:            body = el('div', { class: 'err' }, 'Unknown panel type: ' + panel.type);
-    }
-  }
-  return el('div', { class: 'card lake-panel ' + sizeCls }, head, body);
-}
-
-function renderLakeTable(res) {
-  if (!res.rows || res.rows.length === 0) return el('div', { class: 'empty' }, 'No rows.');
-  const thead = el('thead', {}, el('tr', {}, ...res.columns.map((c) => el('th', {}, c.name))));
-  const tbody = el('tbody', {}, ...res.rows.map((row) => el('tr', {},
-    ...row.map((v) => el('td', {}, lakeFormatCell(v))))));
-  const meta = res.truncated
-    ? el('div', { class: 'meta', style: 'margin-top: 6px;' }, 'Truncated at ' + res.row_count + ' rows.')
-    : null;
-  return el('div', {}, el('table', {}, thead, tbody), meta);
-}
-
-function renderLakeKPI(res, panel) {
-  const valCol = res.columns.findIndex((c) => c.name === panel.value);
-  const row = res.rows[0] || [];
-  const raw = valCol >= 0 ? row[valCol] : null;
-  const fmt = panel.format || lakeInferFormat(panel.value);
-  return el('div', { style: 'padding: 10px 4px;' },
-    el('div', { style: 'font-size: 28px; font-weight: 600;' }, lakeFormatWithKind(raw, fmt)),
-    el('div', { class: 'meta', style: 'margin-top: 4px;' }, panel.value),
-  );
-}
-
-// renderLakeChartHolder mounts a div + queues an ECharts setOption call
-// after the DOM is in. We schedule via requestAnimationFrame because el()
-// nodes aren't in the live DOM until shell() appends them.
-function renderLakeChartHolder(key, res, panel, kind) {
-  const holder = el('div', { class: 'lake-chart-holder', style: 'height: 280px;' });
-  requestAnimationFrame(() => {
-    if (!window.echarts) {
-      holder.innerHTML = '<div class="meta" style="padding:10px;">ECharts vendor missing — chart unavailable. Tables and KPIs are unaffected.</div>';
-      return;
-    }
-    // Reuse existing instance for this panel if present, else init.
-    let chart = state.lake.chartInstances[key];
-    if (!chart || chart.isDisposed && chart.isDisposed()) {
-      chart = echarts.init(holder, null, { renderer: 'canvas' });
-      state.lake.chartInstances[key] = chart;
-    }
-    const opt = lakeChartOption(res, panel, kind);
-    chart.setOption(opt, true);
-    // ResizeObserver keeps the chart sharp on container resize.
-    if (!holder._lakeResizeObs) {
-      const ro = new ResizeObserver(() => chart.resize());
-      ro.observe(holder);
-      holder._lakeResizeObs = ro;
-    }
-  });
-  return holder;
-}
-
-function lakeChartOption(res, panel, kind) {
-  const cssText = (cssVar, fallback) => {
-    try {
-      const v = getComputedStyle(document.body).getPropertyValue(cssVar).trim();
-      return v || fallback;
-    } catch { return fallback; }
-  };
-  const fg = cssText('--fg', '#e8eaed');
-  const muted = cssText('--muted', '#8a93a3');
-  if (kind === 'pie') {
-    const labelCol = res.columns.findIndex((c) => c.name === panel.label);
-    const valueCol = res.columns.findIndex((c) => c.name === panel.value);
-    const data = res.rows.map((r) => ({
-      name: String(r[labelCol]),
-      value: r[valueCol],
-    }));
-    return {
-      backgroundColor: 'transparent',
-      textStyle: { color: fg },
-      tooltip: { trigger: 'item' },
-      series: [{ type: 'pie', radius: '70%', data, label: { color: fg } }],
-    };
-  }
-  // line/bar share xs+series shape
-  const xCol = res.columns.findIndex((c) => c.name === panel.x);
-  const yKeys = Array.isArray(panel.y) ? panel.y : [panel.y];
-  const xs = res.rows.map((r) => String(r[xCol]));
-  const series = yKeys.map((y) => {
-    const yi = res.columns.findIndex((c) => c.name === y);
-    return {
-      name: y,
-      type: kind,
-      smooth: kind === 'line',
-      stack: kind === 'bar' && panel.stacked ? 'total' : null,
-      data: res.rows.map((r) => yi < 0 ? null : r[yi]),
-    };
-  });
-  return {
-    backgroundColor: 'transparent',
-    textStyle: { color: fg },
-    tooltip: { trigger: 'axis' },
-    legend: { data: yKeys, textStyle: { color: fg } },
-    grid: { left: 50, right: 20, top: 30, bottom: 40 },
-    xAxis: { type: 'category', data: xs, axisLine: { lineStyle: { color: muted } } },
-    yAxis: { type: 'value', axisLine: { lineStyle: { color: muted } } },
-    series,
-  };
-}
-
-function renderLakeSqlEditor() {
-  const ta = el('textarea', {
-    style: 'width: 100%; min-height: 120px;',
-    placeholder: 'SELECT 1; -- read-only. SELECT/WITH/SHOW/PRAGMA only.',
-  });
-  ta.value = state.lake.explorerSQL || '';
-  ta.addEventListener('input', () => { state.lake.explorerSQL = ta.value; });
-
-  const runBtn = el('button', {
-    class: 'primary',
-    on: { click: async () => {
-      state.lake.explorerError = null;
-      state.lake.explorerResult = null;
-      try {
-        const r = await api('/v1/lake/exec', { method: 'POST', body: { sql: ta.value, max_rows: 500 } });
-        state.lake.explorerResult = r;
-      } catch (e) {
-        state.lake.explorerError = e.message;
-      }
-      render();
-    } },
-  }, 'Run');
-
-  const out = el('div', { style: 'margin-top: 10px;' });
-  if (state.lake.explorerError) {
-    out.appendChild(el('div', { class: 'err' }, state.lake.explorerError));
-  } else if (state.lake.explorerResult) {
-    const res = state.lake.explorerResult;
-    out.appendChild(el('div', { class: 'meta' },
-      res.row_count + ' rows · ' + res.elapsed_ms + ' ms' + (res.truncated ? ' · TRUNCATED' : '')));
-    out.appendChild(renderLakeTable(res));
-  }
-  return el('div', {}, ta, el('div', { class: 'row', style: 'margin-top: 6px;' }, runBtn), out);
-}
-
-function lakeFormatCell(v) {
-  if (v == null) return '';
-  if (typeof v === 'number') return v.toLocaleString();
-  return String(v);
-}
-
-function lakeInferFormat(name) {
-  if (!name) return 'plain';
-  const n = String(name).toLowerCase();
-  if (/(balance|worth|asset|liabilit|amount|paid|billed|value|pnl|outstanding)/.test(n)) return 'currency_inr';
-  if (/(count|n_|num_|qty)/.test(n)) return 'count';
-  return 'plain';
-}
-
-function lakeFormatWithKind(v, kind) {
-  if (v == null) return '—';
-  if (kind === 'currency_inr') {
-    const n = Number(v); if (!isFinite(n)) return '—';
-    try {
-      return new Intl.NumberFormat('en-IN', {
-        style: 'currency', currency: 'INR', maximumFractionDigits: 0,
-      }).format(n);
-    } catch { return '₹' + Math.round(n).toLocaleString(); }
-  }
-  if (kind === 'count') return Number(v).toLocaleString();
-  return lakeFormatCell(v);
 }
 
 // ---- OAuth integration (remote MCPs) ---------------------------------------

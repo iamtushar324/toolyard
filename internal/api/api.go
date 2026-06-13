@@ -47,7 +47,6 @@ import (
 	"github.com/tusharbhardwaj/toolyard/internal/gateway"
 	"github.com/tusharbhardwaj/toolyard/internal/hooks"
 	"github.com/tusharbhardwaj/toolyard/internal/identity"
-	"github.com/tusharbhardwaj/toolyard/internal/lake"
 	"github.com/tusharbhardwaj/toolyard/internal/marketplace"
 	"github.com/tusharbhardwaj/toolyard/internal/memory"
 	"github.com/tusharbhardwaj/toolyard/internal/mempalace"
@@ -92,9 +91,7 @@ type Server struct {
 	autoApproval             *autoapproval.Service
 	policy                   *policy.Engine
 	oauth                    *oauth.Service
-	lake                     *lake.Service
 	hooks                    *hooks.Service
-	grafanaRuntimeEnvPath    string
 	clickhouseRuntimeEnvPath string
 	mempalace                *mempalace.Service
 	notes                    *notes.Service
@@ -128,20 +125,9 @@ type Options struct {
 	AutoApproval    *autoapproval.Service
 	Policy          *policy.Engine
 	OAuth           *oauth.Service
-	// Lake, when set, enables /v1/lake/* — read-only query, named queries
-	// from the embedded queries/ tree, manifest, bootstrap kick-off, ad-hoc
-	// SELECT for the explorer tab. nil disables the routes cleanly.
-	Lake *lake.Service
 	// Hooks, when set, enables /v1/hooks/*: bearer-authenticated lifecycle
 	// hook ingest for agents plus dashboard browsing/export.
 	Hooks *hooks.Service
-	// GrafanaRuntimeEnvPath, when non-empty, is the path on disk where
-	// toolyard maintains a TOOLYARD_LAKE_TOKEN=... line for the Grafana
-	// container's docker-compose `env_file:` to consume. Updated on
-	// initial token bootstrap and on every rotation so the operator
-	// only needs to `docker compose restart grafana` after a rotate
-	// instead of re-syncing config files manually.
-	GrafanaRuntimeEnvPath string
 	// ClickhouseRuntimeEnvPath, when non-empty, is the path on disk
 	// where toolyard maintains a TOOLYARD_CH_PASSWORD=... line for the
 	// toolyard-clickhouse docker-compose `env_file:` to consume.
@@ -194,9 +180,7 @@ func New(ctx context.Context, opts Options) *Server {
 		autoApproval:             opts.AutoApproval,
 		policy:                   opts.Policy,
 		oauth:                    opts.OAuth,
-		lake:                     opts.Lake,
 		hooks:                    opts.Hooks,
-		grafanaRuntimeEnvPath:    opts.GrafanaRuntimeEnvPath,
 		clickhouseRuntimeEnvPath: opts.ClickhouseRuntimeEnvPath,
 		mempalace:                opts.Mempalace,
 		notes:                    opts.Notes,
@@ -313,7 +297,6 @@ func (s *Server) Routes(mux *http.ServeMux) {
 	s.eventsRoutes(mux)
 
 	s.oauthRoutes(mux)
-	s.lakeRoutes(mux)
 	s.cliRoutes(mux)
 	s.voiceRoutes(mux)
 }
@@ -1532,7 +1515,7 @@ func (s *Server) settingsHandler(w http.ResponseWriter, r *http.Request) {
 // the explicit one-shot path for the rotation/copy flow, and every call
 // is audit-logged.
 //
-// POST /v1/settings/reveal {"key":"lake_api_token"} -> {"value":"..."}
+// POST /v1/settings/reveal {"key":"clickhouse_password"} -> {"value":"..."}
 func (s *Server) settingsReveal(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeError(w, http.StatusMethodNotAllowed, "POST only")
@@ -1571,11 +1554,11 @@ func (s *Server) settingsReveal(w http.ResponseWriter, r *http.Request) {
 
 // settingsRotate generates a fresh value for a known rotatable secret
 // key and returns it once for the operator to copy. Side effect: any
-// downstream files (the Grafana runtime env that the docker-compose
+// downstream files (the ClickHouse runtime env that the docker-compose
 // stack reads) get re-rendered so the new value reaches its consumers
 // without manual file edits.
 //
-// POST /v1/settings/rotate {"key":"lake_api_token"} -> {"value":"..."}
+// POST /v1/settings/rotate {"key":"clickhouse_password"} -> {"value":"..."}
 func (s *Server) settingsRotate(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeError(w, http.StatusMethodNotAllowed, "POST only")
@@ -1596,33 +1579,6 @@ func (s *Server) settingsRotate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	switch body.Key {
-	case settings.LakeAPIToken:
-		tok, err := s.settings.RotateLakeAPIToken(r.Context())
-		if err != nil {
-			writeError(w, http.StatusInternalServerError, err.Error())
-			return
-		}
-		// Re-render the Grafana runtime env file. If the write fails
-		// the new token is still live for /v1/lake/* (settings already
-		// won), but Grafana keeps the old value until the env file is
-		// reconciled. Surface the warning so the operator knows.
-		envWriteWarning := ""
-		if err := WriteGrafanaRuntimeEnv(s.grafanaRuntimeEnvPath, tok); err != nil {
-			envWriteWarning = "token rotated but grafana runtime env file write failed: " + err.Error()
-		}
-		summary := body.Key
-		if envWriteWarning != "" {
-			summary += " (env write warned)"
-		}
-		_ = s.audit.Write(r.Context(), audit.Event{
-			EventType: "settings.rotate", AgentID: "user:" + uid,
-			ResultSummary: summary,
-		})
-		out := map[string]any{"key": body.Key, "value": tok}
-		if envWriteWarning != "" {
-			out["warning"] = envWriteWarning
-		}
-		writeJSON(w, http.StatusOK, out)
 	case settings.ClickhousePassword:
 		pw, err := s.settings.RotateClickhousePassword(r.Context())
 		if err != nil {

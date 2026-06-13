@@ -12,8 +12,6 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
-	"net/url"
-	"strings"
 	"sync"
 	"time"
 
@@ -70,16 +68,6 @@ const (
 	// CostOutputUsdPerM: USD per 1M output tokens (default 0).
 	CostOutputUsdPerM = "cost_output_usd_per_m"
 
-	// LakeAPIToken is the static Bearer token external read-only consumers
-	// (Grafana Infinity datasource, ad-hoc scripts) present to /v1/lake/*.
-	// Generated on first gateway start if empty; rotatable from the UI.
-	// Classified as a secret — never returned by All(), only by an
-	// explicit reveal call.
-	LakeAPIToken = "lake_api_token"
-	// GrafanaOrigin, when non-empty, is added to the CSP frame-src
-	// directive so the toolyard /lake/ page can iframe Grafana panels
-	// from this origin (e.g. http://localhost:3030).
-	GrafanaOrigin = "grafana_origin"
 	// Telegram chat-approval channel keys. TelegramBotToken stores the
 	// sealbox-encrypted bot token (classified secret: write-only via the
 	// chat/configure endpoint, never returned by All/Patch). The rest are
@@ -109,7 +97,6 @@ const (
 // rotation flow with audit logging instead of a static token sitting in
 // every page response.
 var secretKeys = map[string]struct{}{
-	LakeAPIToken:       {},
 	ClickhousePassword: {},
 	TelegramBotToken:   {},
 }
@@ -236,48 +223,8 @@ func (s *Service) Reveal(_ context.Context, key string) (string, error) {
 	return str, nil
 }
 
-// EnsureLakeAPIToken makes sure lake_api_token is set, generating a fresh
-// 32-byte random value on first boot. Returns the (current or newly
-// minted) token plus a flag indicating whether a generation happened —
-// the caller logs / surfaces this so the operator knows a one-time
-// secret was created on their behalf.
-func (s *Service) EnsureLakeAPIToken(ctx context.Context) (string, bool, error) {
-	s.mu.RLock()
-	v, ok := s.cache[LakeAPIToken]
-	s.mu.RUnlock()
-	if ok && len(v) > 2 {
-		var existing string
-		if err := json.Unmarshal(v, &existing); err == nil && existing != "" {
-			return existing, false, nil
-		}
-	}
-	tok, err := randomHex(32)
-	if err != nil {
-		return "", false, err
-	}
-	if err := s.Set(ctx, LakeAPIToken, tok); err != nil {
-		return "", false, err
-	}
-	return tok, true, nil
-}
-
-// RotateLakeAPIToken replaces the existing token with a freshly generated
-// one and returns it. Callers must follow up with whatever side effects
-// the token's consumers expect (e.g. writing the runtime env file the
-// Grafana container reads).
-func (s *Service) RotateLakeAPIToken(ctx context.Context) (string, error) {
-	tok, err := randomHex(32)
-	if err != nil {
-		return "", err
-	}
-	if err := s.Set(ctx, LakeAPIToken, tok); err != nil {
-		return "", err
-	}
-	return tok, nil
-}
-
-// EnsureClickhousePassword mirrors EnsureLakeAPIToken for the CH stack:
-// reads the existing password if any, mints one on first call, returns
+// EnsureClickhousePassword makes sure clickhouse_password is set for the CH
+// stack: reads the existing password if any, mints one on first call, returns
 // (current_or_new, was_generated, error). Hex output (64 chars) keeps it
 // safe for shell-style env files — no quoting concerns.
 func (s *Service) EnsureClickhousePassword(ctx context.Context) (string, bool, error) {
@@ -301,9 +248,9 @@ func (s *Service) EnsureClickhousePassword(ctx context.Context) (string, bool, e
 }
 
 // RotateClickhousePassword replaces the existing CH password with a
-// freshly generated one. Same caveat as RotateLakeAPIToken: the caller
-// is responsible for re-rendering the runtime env file (and operationally
-// for restarting the CH container so it re-reads it).
+// freshly generated one. The caller is responsible for re-rendering the
+// runtime env file (and operationally for restarting the CH container so
+// it re-reads it).
 func (s *Service) RotateClickhousePassword(ctx context.Context) (string, error) {
 	pw, err := randomHex(32)
 	if err != nil {
@@ -315,34 +262,8 @@ func (s *Service) RotateClickhousePassword(ctx context.Context) (string, error) 
 	return pw, nil
 }
 
-// SetGrafanaOrigin validates and persists grafana_origin. We accept
-// http(s):// origins only, with no path / query / fragment, so a stray
-// trailing slash or full panel URL doesn't end up in the CSP header
-// where it would either silently fail or mis-broaden the allow-list.
-func (s *Service) SetGrafanaOrigin(ctx context.Context, raw string) error {
-	raw = strings.TrimSpace(raw)
-	if raw == "" {
-		return s.Set(ctx, GrafanaOrigin, "")
-	}
-	u, err := url.Parse(raw)
-	if err != nil {
-		return errors.New("not a valid URL")
-	}
-	if u.Scheme != "http" && u.Scheme != "https" {
-		return errors.New("origin must use http or https")
-	}
-	if u.Host == "" {
-		return errors.New("origin must include a host")
-	}
-	if u.Path != "" && u.Path != "/" || u.RawQuery != "" || u.Fragment != "" {
-		return errors.New("origin must not include path/query/fragment")
-	}
-	canonical := u.Scheme + "://" + u.Host
-	return s.Set(ctx, GrafanaOrigin, canonical)
-}
-
-// randomHex returns 2*n hex chars from crypto/rand. Used for the lake
-// API token (n=32 -> 64 hex chars, 256 bits of entropy).
+// randomHex returns 2*n hex chars from crypto/rand. Used for the
+// ClickHouse password (n=32 -> 64 hex chars, 256 bits of entropy).
 func randomHex(n int) (string, error) {
 	b := make([]byte, n)
 	if _, err := rand.Read(b); err != nil {
@@ -467,22 +388,11 @@ func (s *Service) Set(ctx context.Context, key string, value any) error {
 // router_only_mode is normalised into surface_mode at write time so older
 // callers continue working. Secret keys are rejected here — they have to
 // flow through Rotate/Reveal so the audit trail and reveal-once UX stay
-// consistent. grafana_origin is normalised through SetGrafanaOrigin to
-// keep CSP-incompatible inputs out of the table.
+// consistent.
 func (s *Service) Patch(ctx context.Context, updates map[string]any) error {
 	for k := range updates {
 		if IsSecretKey(k) {
 			return errors.New("secret keys are write-only via the rotate endpoint")
-		}
-	}
-	if v, ok := updates[GrafanaOrigin]; ok {
-		raw, _ := v.(string)
-		if err := s.SetGrafanaOrigin(ctx, raw); err != nil {
-			return err
-		}
-		delete(updates, GrafanaOrigin)
-		if len(updates) == 0 {
-			return nil
 		}
 	}
 	updates = normalise(updates)

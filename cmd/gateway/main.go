@@ -67,7 +67,6 @@ import (
 	"github.com/tusharbhardwaj/toolyard/internal/visibility"
 	"github.com/tusharbhardwaj/toolyard/internal/voice"
 	dashboard "github.com/tusharbhardwaj/toolyard/web/dashboard"
-	weblake "github.com/tusharbhardwaj/toolyard/web/lake"
 )
 
 // version is stamped by the release build via
@@ -159,7 +158,6 @@ func runServe(argv []string) error {
 	approvalTTL := fs.Duration("approval-ttl", 3*time.Hour, "how long a pending approval stays decidable before auto-expiring")
 	publicURL := fs.String("public-url", "", "public origin (e.g. https://toolyard.example.com). When set, enables HSTS, secure cookies, and Origin enforcement.")
 	trustedProxies := fs.String("trusted-proxy", "", "comma-separated CIDRs to trust for X-Forwarded-* headers (e.g. 127.0.0.1/32,::1/128,10.0.0.0/8)")
-	grafanaRuntimeEnvPath := fs.String("grafana-runtime-env", "/var/lib/toolyard/grafana-runtime.env", "path where toolyard maintains a TOOLYARD_LAKE_TOKEN=... line for the Grafana container's docker-compose env_file to consume. Updated on bootstrap and on every rotate. Empty disables the write (useful in tests).")
 	clickhouseRuntimeEnvPath := fs.String("clickhouse-runtime-env", "/var/lib/toolyard/clickhouse-runtime.env", "path where toolyard maintains a TOOLYARD_CH_PASSWORD=... line for the toolyard-clickhouse container's docker-compose env_file to consume. Updated on bootstrap and on every rotate. Empty disables the write (useful in tests).")
 	requireAuthMCP := fs.Bool("require-auth-on-mcp", false, "reject anonymous /mcp calls (no Authorization header). Auto-enabled when -public-url is set.")
 	statelessMCP := fs.Bool("stateless-mcp", false, "skip MCP session-ID tracking. Every request stands alone — no server-initiated notifications, but agents that don't auto-reconnect on session-invalid (e.g., hermes) survive a toolyard restart without manual intervention.")
@@ -314,11 +312,10 @@ func runServe(argv []string) error {
 		return err
 	}
 
-	// ClickHouse password lives in the settings DB (same pattern as
-	// lake_api_token): toolyard is the source of truth, the env file
-	// the docker stack reads is a rendered view. Auto-mint on first
-	// boot so a fresh install + `docker compose up` Just Works. The
-	// rendered file is mode 0600 toolyard:toolyard.
+	// ClickHouse password lives in the settings DB: toolyard is the
+	// source of truth, the env file the docker stack reads is a rendered
+	// view. Auto-mint on first boot so a fresh install + `docker compose
+	// up` Just Works. The rendered file is mode 0600 toolyard:toolyard.
 	chPass, chGenerated, err := settingsSvc.EnsureClickhousePassword(ctx)
 	if err != nil {
 		return fmt.Errorf("ensure clickhouse password: %w", err)
@@ -540,26 +537,6 @@ func runServe(argv []string) error {
 			log.Printf("import upstreams: %v", err)
 		}
 	}
-
-	// Lake API token + Grafana origin used to live in env vars; they're
-	// now persisted in the settings DB and managed via the dashboard. On
-	// first boot we mint a token if there isn't one (so a fresh install
-	// just works) and write it to the runtime env file the Grafana
-	// docker-compose stack reads. Operators rotate from the UI; the
-	// runtime env file gets re-rendered automatically.
-	lakeTok, generated, err := settingsSvc.EnsureLakeAPIToken(ctx)
-	if err != nil {
-		return fmt.Errorf("ensure lake api token: %w", err)
-	}
-	if generated {
-		log.Printf("toolyard: minted a new lake_api_token; reveal it once from the dashboard's Settings tab")
-	}
-	if err := api.WriteGrafanaRuntimeEnv(*grafanaRuntimeEnvPath, lakeTok); err != nil {
-		log.Printf("warning: could not write grafana runtime env file at %s: %v", *grafanaRuntimeEnvPath, err)
-	}
-
-	// (CH password is ensured + rendered earlier, right after settings
-	// init, because the lake.Open() call also needs the password.)
 
 	// MemPalace: install (if needed), initialize palace dir, and register
 	// the built-in stdio upstream so its 29 tools surface as `mempalace.*`.
@@ -798,9 +775,7 @@ func runServe(argv []string) error {
 		AutoApproval:             autoApprover,
 		Policy:                   policyEngine,
 		OAuth:                    oauthSvc,
-		Lake:                     lakeSvc,
 		Hooks:                    hooksSvc,
-		GrafanaRuntimeEnvPath:    *grafanaRuntimeEnvPath,
 		ClickhouseRuntimeEnvPath: *clickhouseRuntimeEnvPath,
 		Mempalace:                mpSvc,
 		Notes:                    notesSvc,
@@ -899,9 +874,6 @@ func runServe(argv []string) error {
 		})
 	}
 	mux.Handle("/debug/pprof/", loopbackOnly(pprofMux))
-
-	// Lake dashboard static assets at /lake/*.
-	mux.Handle("/lake/", http.StripPrefix("/lake/", lakeStaticHandler()))
 
 	// Dashboard static assets.
 	mux.Handle("/", staticHandler())
@@ -1353,44 +1325,6 @@ func staticHandler() http.Handler {
 		case ".js":
 			w.Header().Set("Content-Type", "application/javascript; charset=utf-8")
 			w.Header().Set("Cache-Control", "no-cache")
-		}
-		fileServer.ServeHTTP(w, r)
-	})
-}
-
-// lakeStaticHandler serves the embedded /lake/ dashboard. Strict-by-default:
-// any unknown path falls back to index.html so the SPA can handle hash
-// routing, and we set Cache-Control:no-cache so a redeploy lands cleanly.
-func lakeStaticHandler() http.Handler {
-	sub, err := fs.Sub(weblake.Assets, ".")
-	if err != nil {
-		panic(err)
-	}
-	fileServer := http.FileServer(http.FS(sub))
-	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Strip-prefix has already removed /lake/. The empty path is the
-		// SPA root; unknown paths fall back to index.html.
-		p := strings.TrimPrefix(r.URL.Path, "/")
-		if p == "" || !assetExists(sub, p) {
-			body, err := fs.ReadFile(weblake.Assets, "index.html")
-			if err != nil {
-				http.Error(w, "missing lake index", http.StatusInternalServerError)
-				return
-			}
-			w.Header().Set("Content-Type", "text/html; charset=utf-8")
-			w.Header().Set("Cache-Control", "no-cache")
-			_, _ = w.Write(body)
-			return
-		}
-		switch filepath.Ext(p) {
-		case ".css":
-			w.Header().Set("Content-Type", "text/css; charset=utf-8")
-			w.Header().Set("Cache-Control", "no-cache")
-		case ".js":
-			w.Header().Set("Content-Type", "application/javascript; charset=utf-8")
-			w.Header().Set("Cache-Control", "no-cache")
-		case ".json":
-			w.Header().Set("Content-Type", "application/json")
 		}
 		fileServer.ServeHTTP(w, r)
 	})
