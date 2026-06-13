@@ -1131,6 +1131,7 @@ function renderAgentDoneStep(m) {
     { id: 'cli',     label: 'Claude Code CLI' },
     { id: 'project', label: '.mcp.json (project)' },
     { id: 'global',  label: '~/.claude.json (global)' },
+    { id: 'hermes',  label: 'hermes' },
     { id: 'hook-claude', label: 'Claude hooks' },
     { id: 'hook-codex',  label: 'Codex hooks' },
     { id: 'hook-cursor', label: 'Cursor hooks' },
@@ -1160,6 +1161,20 @@ ${JSON.stringify({
     headers: { Authorization: `Bearer ${tok}` },
   },
 }, null, 2)}`;
+
+  // hermes (NousResearch hermes-agent). The `mcp add` one-liner registers the
+  // HTTP server; auth headers aren't a CLI flag there, so the bearer token is
+  // set in ~/.hermes/config.yaml under mcp_servers — both shown here.
+  const hermes =
+`# 1) register the server:
+hermes mcp add toolyard --url ${url}
+
+# 2) add the auth header — merge into ~/.hermes/config.yaml under mcp_servers:
+mcp_servers:
+  toolyard:
+    url: "${url}"
+    headers:
+      Authorization: "Bearer ${tok}"`;
 
   const hookURL = baseUrlNoMcp + '/v1/hooks/ingest?source=claude_code';
   const claudeHooks = JSON.stringify({
@@ -1216,10 +1231,12 @@ There is no separate Conductor hook endpoint for v1; the selected agent client e
   const snippet = m.snippetTab === 'cli' ? cli :
                   m.snippetTab === 'project' ? project :
                   m.snippetTab === 'global' ? global :
+                  m.snippetTab === 'hermes' ? hermes :
                   m.snippetTab === 'hook-claude' ? claudeHooks :
                   m.snippetTab === 'hook-codex' ? codexHooks :
                   m.snippetTab === 'hook-cursor' ? cursorHooks : conductorHooks;
   const snippetLang = (m.snippetTab === 'cli' || m.snippetTab === 'hook-codex' || m.snippetTab === 'hook-cursor') ? 'bash' :
+                      m.snippetTab === 'hermes' ? 'yaml' :
                       m.snippetTab === 'hook-conductor' ? 'text' : 'json';
 
   return el('div', { class: 'modal-bg', on: { click: (e) => { if (e.target === e.currentTarget) closeAgentModal(); } } },
@@ -1254,6 +1271,8 @@ There is no separate Conductor hook endpoint for v1; the selected agent client e
               ? 'Save as .mcp.json at the root of any project'
               : m.snippetTab === 'global'
                 ? 'Open ~/.claude.json and merge under mcpServers'
+                : m.snippetTab === 'hermes'
+                  ? 'Run the add command, then merge the header into ~/.hermes/config.yaml'
                 : m.snippetTab === 'hook-claude'
                   ? 'Merge into Claude Code settings.json'
                   : m.snippetTab === 'hook-codex'
