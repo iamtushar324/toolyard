@@ -758,13 +758,24 @@ function filteredAudit() {
     if (f.decision && (e.decision || '') !== f.decision) return false;
     if (f.agent && (e.agent_id || '') !== f.agent) return false;
     if (!q) return true;
-    return [e.tool_name, e.upstream_name, e.reason, e.agent_id, e.result_summary, e.event_type]
+    return [e.tool_name, e.upstream_name, e.reason, e.agent_id, agentLabel(e.agent_id), e.result_summary, e.event_type]
       .some((v) => (v || '').toLowerCase().includes(q));
   });
 }
 
 function uniqueSorted(vals) {
   return Array.from(new Set(vals.filter(Boolean))).sort();
+}
+
+// agentLabel resolves an agent_id to a human-readable label using the agent
+// roster loaded into state.agents. Falls back to a shortened id for agents that
+// are no longer in the roster (deleted/forgotten), and '—' for empty ids. The
+// full id stays available via the cell title attribute at the call site.
+function agentLabel(id) {
+  if (!id) return '—';
+  const a = (state.agents || []).find((x) => x.id === id);
+  if (a) return a.name || a.id;
+  return id.length > 12 ? id.slice(0, 12) + '…' : id;
 }
 
 function csvCell(v) {
@@ -829,12 +840,12 @@ function hooksExportURL(format) {
 
 function exportAuditCSV() {
   const rows = filteredAudit();
-  const header = ['when_iso', 'event_type', 'upstream', 'tool', 'decision', 'agent_id', 'reason', 'result_summary'];
+  const header = ['when_iso', 'event_type', 'upstream', 'tool', 'decision', 'agent_id', 'agent', 'reason', 'result_summary'];
   const lines = [header.join(',')];
   for (const e of rows) {
     lines.push([
       new Date(e.ts).toISOString(), e.event_type, e.upstream_name, e.tool_name,
-      e.decision, e.agent_id, e.reason, e.result_summary,
+      e.decision, e.agent_id, agentLabel(e.agent_id), e.reason, e.result_summary,
     ].map(csvCell).join(','));
   }
   const blob = new Blob([lines.join('\n')], { type: 'text/csv' });
@@ -872,12 +883,19 @@ function viewAudit() {
     s.value = f[key] || '';
     return s;
   };
+  // Agent dropdown shows names but keeps the agent_id as the option value so
+  // filtering (filteredAudit compares e.agent_id) and server export keep working.
+  const selAgent = () => {
+    const s = el('select', { on: { change: setF('agent') } }, opt('', 'All agents'), ...agents.map((id) => opt(id, agentLabel(id))));
+    s.value = f.agent || '';
+    return s;
+  };
 
   const filterBar = el('div', { class: 'row audit-filters', style: 'gap: 8px; margin-bottom: 12px; flex-wrap: wrap;' },
     (() => { const i = el('input', { id: 'audit-q', type: 'search', placeholder: 'Filter tool / reason / agent / result…', class: 'grow', on: { input: setF('q') } }); i.value = f.q || ''; return i; })(),
     sel('event_type', 'All events', eventTypes),
     sel('decision', 'All decisions', decisions),
-    sel('agent', 'All agents', agents),
+    selAgent(),
     el('button', { on: { click: exportAuditCSV }, title: 'Export the rows currently shown (includes the text filter)' }, 'Export shown'),
     el('a', { href: auditExportURL('csv'), target: '_blank', title: 'Server-side export of the full log honoring the dropdown filters' }, 'Full CSV'),
     el('a', { href: auditExportURL('json'), target: '_blank' }, 'Full JSON'),
@@ -897,7 +915,7 @@ function viewAudit() {
       el('td', { class: 'meta' }, relTime(e.ts)),
       el('td', {}, e.event_type),
       el('td', {}, e.tool_name ? `${e.upstream_name || ''} · ${e.tool_name}` : '—'),
-      el('td', { class: 'meta' }, e.agent_id || '—'),
+      el('td', { class: 'meta', title: e.agent_id || '' }, agentLabel(e.agent_id)),
       el('td', {}, e.decision || '—'),
       el('td', {}, e.reason ? el('div', {}, el('div', {}, e.reason),
         e.result_summary ? el('div', { class: 'meta', style: 'margin-top: 4px;' }, e.result_summary) : null)
@@ -933,17 +951,24 @@ function viewHooks() {
   const sources = uniqueSorted(rows.map((e) => e.source).concat(['claude_code', 'codex', 'cursor', 'generic']));
   const events = uniqueSorted(rows.map((e) => e.event_name));
   const sessions = uniqueSorted(rows.map((e) => e.session_id)).slice(0, 100);
+  // Agent dropdown shows names but keeps the agent_id as the option value; the
+  // hooks agent filter is server-side (hookQueryParams sends agent_id).
+  const selAgent = () => {
+    const s = el('select', { on: { change: setF('agent') } }, opt('', 'All agents'), ...agents.map((id) => opt(id, agentLabel(id))));
+    s.value = f.agent || '';
+    return s;
+  };
   const counts = rows.reduce((m, e) => {
     if (e.agent_id) m[e.agent_id] = (m[e.agent_id] || 0) + 1;
     return m;
   }, {});
-  const countLine = Object.entries(counts).slice(0, 4).map(([agent, n]) => `${agent.slice(0, 10)}: ${n}`).join(' · ');
+  const countLine = Object.entries(counts).slice(0, 4).map(([agent, n]) => `${agentLabel(agent)}: ${n}`).join(' · ');
 
   const filterBar = el('div', { class: 'row audit-filters', style: 'gap: 8px; margin-bottom: 12px; flex-wrap: wrap;' },
     (() => { const i = el('input', { id: 'hooks-q', type: 'search', placeholder: 'Search text / tool / event / session…', class: 'grow', on: { change: setF('q'), keydown: (e) => { if (e.key === 'Enter') setF('q')(e); } } }); i.value = f.q || ''; return i; })(),
     sel('source', 'All sources', sources),
     sel('event_name', 'All events', events),
-    sel('agent', 'All agents', agents),
+    selAgent(),
     sel('session_id', 'All sessions', sessions),
     el('button', { on: { click: () => loadHooks(true) }, disabled: state.hooks.loading }, state.hooks.loading ? 'Loading…' : 'Refresh'),
     el('a', { href: hooksExportURL('csv'), target: '_blank' }, 'CSV'),
@@ -974,7 +999,7 @@ function viewHooks() {
             el('td', { class: 'meta' }, relTime(e.ts)),
             el('td', {}, e.source || 'generic'),
             el('td', {}, e.event_name || 'unknown'),
-            el('td', { class: 'meta' }, e.agent_id || '—'),
+            el('td', { class: 'meta', title: e.agent_id || '' }, agentLabel(e.agent_id)),
             el('td', { class: 'meta' }, e.session_id ? el('code', {}, e.session_id.slice(0, 18)) : '—'),
             el('td', {}, [
               e.tool_name ? el('div', {}, el('code', {}, e.tool_name)) : null,
