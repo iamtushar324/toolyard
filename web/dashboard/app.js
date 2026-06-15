@@ -1510,6 +1510,25 @@ function viewServers() {
           })),
     ),
     el('div', { class: 'card' },
+      el('h2', {}, 'Import from JSON'),
+      el('p', { class: 'meta' },
+        'Paste a standard ', el('code', {}, 'mcpServers'), ' config block (or a single server entry) and it will be parsed and added automatically. ',
+        'Secrets paste as plaintext — move them into the encrypted store afterward with the ', el('strong', {}, '🔑 Secret'), ' button on each row.'),
+      el('label', {},
+        el('textarea', {
+          id: 'srv-import-json',
+          rows: 8,
+          placeholder: '"my-server": {\n  "command": "npx",\n  "args": ["-y", "some-mcp"],\n  "env": { "API_KEY": "..." }\n}',
+          value: state._importJson || '',
+          on: { input: (e) => { state._importJson = e.target.value; } },
+        }),
+      ),
+      el('div', { class: 'row', style: 'margin-top: 12px;' },
+        el('button', { class: 'primary', on: { click: () => importServersFromJson() }}, 'Import'),
+        el('button', { on: { click: () => { state._importJson = ''; render(); } } }, 'Clear'),
+      ),
+    ),
+    el('div', { class: 'card' },
       el('h2', {}, 'Add custom MCP server'),
       el('p', { class: 'meta' },
         'Connect an upstream MCP server. Its tools are wrapped with the required _reason field, fed through the policy engine, and surface in the catalog as ',
@@ -1629,6 +1648,158 @@ function parseHeadersText(t) {
     out[trimmed.slice(0, i).trim()] = trimmed.slice(i + 1).trim();
   });
   return out;
+}
+
+// RESERVED_SERVER_NAMES mirrors the backend's reserved list in
+// internal/upstreams/upstreams.go so we can reject doomed imports early.
+const RESERVED_SERVER_NAMES = new Set(['builtin', 'fixture', 'memory', 'tools', 'mempalace', 'notes', 'skills']);
+
+// normalizeTransport maps a Claude-format `type` (or an inferred kind) onto the
+// transport values the backend accepts. Returns '' for unsupported transports.
+function normalizeTransport(type) {
+  switch (String(type || '').toLowerCase().replace(/[_-]/g, '')) {
+    case 'stdio': return 'stdio';
+    case 'http':
+    case 'streamablehttp':
+    case 'httpstream': return 'http';
+    case 'sse': return ''; // not supported by the backend
+    default: return '';
+  }
+}
+
+// parseMcpJson tolerantly parses a pasted MCP config block (the standard
+// Claude Desktop / .mcp.json `mcpServers` format, a bare name→config map, or a
+// single entry) and normalizes each entry into a POST /v1/servers body.
+// Returns { servers: [...], errors: [...] } — errors are human-readable strings.
+function parseMcpJson(text) {
+  const errors = [];
+  const raw = (text || '').trim();
+  if (!raw) return { servers: [], errors: ['Paste a JSON config first.'] };
+
+  // Tolerant load: try as-is, then wrapped in braces (for bare comma-separated
+  // "name": {…} fragments) and with trailing commas stripped.
+  let parsed = null;
+  const attempts = [raw];
+  if (!raw.startsWith('{')) attempts.push('{' + raw + '}');
+  for (const candidate of attempts) {
+    const cleaned = candidate.replace(/,\s*([}\]])/g, '$1');
+    try { parsed = JSON.parse(cleaned); break; } catch (e) { /* try next */ }
+  }
+  if (parsed === null || typeof parsed !== 'object') {
+    return { servers: [], errors: ['Could not parse JSON. Paste a valid mcpServers block or a single server entry.'] };
+  }
+
+  // Locate the name→config map.
+  let entries;
+  const isObj = (v) => v && typeof v === 'object' && !Array.isArray(v);
+  if (isObj(parsed.mcpServers)) {
+    entries = Object.entries(parsed.mcpServers);
+  } else if (isObj(parsed) && (parsed.command || parsed.url || parsed.type)) {
+    entries = [[null, parsed]]; // single unnamed entry
+  } else if (isObj(parsed)) {
+    entries = Object.entries(parsed);
+  } else {
+    return { servers: [], errors: ['Unrecognized config shape.'] };
+  }
+
+  const servers = [];
+  for (const [key, cfg] of entries) {
+    if (!isObj(cfg)) { errors.push(`"${key}": skipped (not a server object)`); continue; }
+
+    // Derive a name: explicit field, the object key, or the command basename.
+    let name = (cfg.name || key || '').trim();
+    if (!name && cfg.command) name = String(cfg.command).split(/[\\/]/).pop().replace(/\.[^.]+$/, '');
+    if (!name) { errors.push('An entry is missing a server name — give it a key.'); continue; }
+    if (/[ \t\n.]/.test(name)) { errors.push(`"${name}": skipped (name must not contain spaces or dots)`); continue; }
+    if (RESERVED_SERVER_NAMES.has(name)) { errors.push(`"${name}": skipped (reserved name)`); continue; }
+
+    // Resolve transport: explicit type wins, else infer from command/url.
+    let transport;
+    if (cfg.type) {
+      transport = normalizeTransport(cfg.type);
+      if (!transport) { errors.push(`"${name}": skipped (transport "${cfg.type}" not supported)`); continue; }
+    } else if (cfg.command) {
+      transport = 'stdio';
+    } else if (cfg.url) {
+      transport = 'http';
+    } else {
+      errors.push(`"${name}": skipped (no command or url)`); continue;
+    }
+
+    const body = { name, transport };
+    if (transport === 'stdio') {
+      if (!cfg.command) { errors.push(`"${name}": skipped (stdio requires a command)`); continue; }
+      body.command = String(cfg.command);
+      if (Array.isArray(cfg.args)) body.args = cfg.args.map(String);
+    } else {
+      if (!cfg.url) { errors.push(`"${name}": skipped (http requires a url)`); continue; }
+      body.url = String(cfg.url);
+      if (isObj(cfg.headers)) {
+        body.headers = {};
+        for (const [k, v] of Object.entries(cfg.headers)) body.headers[k] = String(v);
+      }
+    }
+    if (isObj(cfg.env)) {
+      body.env = {};
+      for (const [k, v] of Object.entries(cfg.env)) body.env[k] = String(v);
+    }
+    servers.push(body);
+  }
+
+  if (servers.length === 0 && errors.length === 0) errors.push('No server entries found in the pasted JSON.');
+  return { servers, errors };
+}
+
+// importServersFromJson parses the pasted config and POSTs each entry to the
+// existing /v1/servers endpoint, then reports a per-server summary.
+async function importServersFromJson() {
+  const elInput = $('srv-import-json');
+  const { servers, errors } = parseMcpJson(elInput ? elInput.value : '');
+  if (servers.length === 0) { toast(errors[0] || 'Nothing to import', 'error'); return; }
+
+  let connected = 0, savedNotConnected = 0, skipped = 0, failed = 0;
+  const notes = [...errors];
+  for (const body of servers) {
+    try {
+      const resp = await fetch('/v1/servers', {
+        method: 'POST', credentials: 'include',
+        headers: { 'Content-Type': 'application/json', 'X-Requested-With': 'toolyard' },
+        body: JSON.stringify(body),
+      });
+      let out = {};
+      try { out = await resp.json(); } catch (e) { /* ignore */ }
+      if (resp.status === 202) {
+        savedNotConnected++;
+        notes.push(`${body.name}: saved but not connected (${out.warning || 'unknown'})`);
+      } else if (resp.status === 409) {
+        skipped++;
+        notes.push(`${body.name}: already exists`);
+      } else if (!resp.ok) {
+        failed++;
+        notes.push(`${body.name}: ${out.error || ('HTTP ' + resp.status)}`);
+      } else {
+        connected++;
+      }
+    } catch (e) {
+      failed++;
+      notes.push(`${body.name}: ${e.message}`);
+    }
+  }
+
+  const parts = [];
+  if (connected) parts.push(`${connected} connected`);
+  if (savedNotConnected) parts.push(`${savedNotConnected} saved (not connected)`);
+  if (skipped) parts.push(`${skipped} skipped`);
+  if (failed) parts.push(`${failed} failed`);
+  const summary = parts.length ? parts.join(', ') : 'nothing imported';
+  toast('Import: ' + summary, (failed || errors.length) ? 'error' : 'success');
+  if (notes.length) console.warn('MCP import notes:\n' + notes.join('\n'));
+
+  if (connected || savedNotConnected) {
+    state._importJson = '';
+    await reloadServers();
+  }
+  render();
 }
 
 async function addServer() {
