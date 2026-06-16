@@ -343,7 +343,7 @@ func (s *Service) Ingest(ctx context.Context, wh *Webhook, in IngestRequest) (*R
 		return res, ErrMemUnavailable
 	}
 
-	ir, err := s.mem.IngestTagged(ctx, entry, topic, wh.Wing, "webhook:"+wh.Name)
+	ir, err := s.mem.IngestTagged(ctx, entry, topic, wh.Wing, safeAgentName("webhook", wh.Name))
 	if err != nil {
 		res.Status = statusFailed
 		res.Detail = err.Error()
@@ -433,6 +433,34 @@ func (s *Service) audit2(ctx context.Context, eventType, toolName, summary strin
 }
 
 // ---- token helpers (mirrors internal/events) --------------------------------
+
+func safeAgentName(prefix, name string) string {
+	var b strings.Builder
+	writeSafe := func(s string) {
+		lastUnderscore := false
+		for _, r := range s {
+			if (r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') || (r >= '0' && r <= '9') || r == '-' || r == '_' {
+				b.WriteRune(r)
+				lastUnderscore = false
+				continue
+			}
+			if !lastUnderscore && b.Len() > 0 {
+				b.WriteByte('_')
+				lastUnderscore = true
+			}
+		}
+	}
+	writeSafe(strings.TrimSpace(prefix))
+	if b.Len() > 0 {
+		b.WriteByte('_')
+	}
+	writeSafe(strings.TrimSpace(name))
+	out := strings.Trim(b.String(), "_")
+	if out == "" {
+		return "webhook"
+	}
+	return out
+}
 
 func mintToken(id string) (plaintext, hash string, err error) {
 	code, err := randCode(32)

@@ -157,8 +157,8 @@ func TestWingIsLockedAtIngest(t *testing.T) {
 	if ing.calls[0].wing != "meetings" {
 		t.Fatalf("upstream wing = %q, want the locked wing 'meetings'", ing.calls[0].wing)
 	}
-	if ing.calls[0].agent != "webhook:lock" {
-		t.Fatalf("agent tag = %q, want webhook:lock", ing.calls[0].agent)
+	if ing.calls[0].agent != "webhook_lock" {
+		t.Fatalf("agent tag = %q, want webhook_lock", ing.calls[0].agent)
 	}
 }
 

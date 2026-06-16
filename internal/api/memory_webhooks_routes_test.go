@@ -22,6 +22,7 @@ type stubMemIngester struct {
 	available bool
 	lastWing  string
 	lastEntry string
+	lastAgent string
 	calls     int
 }
 
@@ -31,6 +32,7 @@ func (s *stubMemIngester) IngestTagged(_ context.Context, entry, topic, wing, ag
 	s.calls++
 	s.lastWing = wing
 	s.lastEntry = entry
+	s.lastAgent = agent
 	return &mempalace.IngestResult{OK: true, Detail: "stored"}, nil
 }
 
@@ -209,6 +211,19 @@ func TestMemWebhookWingCannotBeOverridden(t *testing.T) {
 	}
 	if ing.lastWing != "meetings" {
 		t.Fatalf("wing override succeeded: upstream wing = %q, want meetings", ing.lastWing)
+	}
+}
+
+func TestMemWebhookUsesMemPalaceSafeAgentName(t *testing.T) {
+	h, cookie, ing, _ := newMemWebhookAPITestServer(t, 1<<20)
+	_, token := createWebhook(t, h, cookie, `{"name":"from n8n Google Meeting Transcript To Linear Ticket","wing":"meetings"}`)
+
+	rec := mwIngest(t, h, token, `{"transcript":"safe agent name regression"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("ingest: status %d body %s", rec.Code, rec.Body.String())
+	}
+	if got, want := ing.lastAgent, "webhook_from_n8n_Google_Meeting_Transcript_To_Linear_Ticket"; got != want {
+		t.Fatalf("agent name = %q, want %q", got, want)
 	}
 }
 
