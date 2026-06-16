@@ -50,6 +50,7 @@ import (
 	"github.com/tusharbhardwaj/toolyard/internal/marketplace"
 	"github.com/tusharbhardwaj/toolyard/internal/memory"
 	"github.com/tusharbhardwaj/toolyard/internal/mempalace"
+	"github.com/tusharbhardwaj/toolyard/internal/memwebhook"
 	"github.com/tusharbhardwaj/toolyard/internal/metrics"
 	"github.com/tusharbhardwaj/toolyard/internal/notes"
 	"github.com/tusharbhardwaj/toolyard/internal/oauth"
@@ -100,10 +101,15 @@ type Server struct {
 	secrets                  *secrets.Service
 	chatTelegram             ChatTelegram
 	events                   EventsAPI
-	sessionKey               []byte
-	security                 SecurityOptions
-	loginLimit               *loginThrottle
-	unauthLimit              *loginThrottle
+	memWebhooks              *memwebhook.Service
+	// webhookMaxBytes caps the /v1/memory/webhooks/ingest body. Large by
+	// design (n8n meeting transcripts); enforced via MaxBytesReader for a
+	// clean 413. Other routes keep their tight per-route caps.
+	webhookMaxBytes int64
+	sessionKey      []byte
+	security        SecurityOptions
+	loginLimit      *loginThrottle
+	unauthLimit     *loginThrottle
 }
 
 type Options struct {
@@ -158,9 +164,16 @@ type Options struct {
 	ChatTelegram ChatTelegram
 	// Events, when set, enables the Events Hub: /v1/ingest, /v1/events*,
 	// /v1/event-sources*. nil leaves them returning 503/empty.
-	Events     EventsAPI
-	SessionKey []byte
-	Security   SecurityOptions
+	Events EventsAPI
+	// MemWebhooks, when set, enables TEC-481: wing-locked memory-ingestion
+	// webhooks (/v1/memory/webhooks*, /v1/memory/metrics). nil leaves them
+	// returning 503/empty.
+	MemWebhooks *memwebhook.Service
+	// WebhookMaxBytes caps the memory-webhook ingest body. 0 falls back to
+	// the default (25 MiB).
+	WebhookMaxBytes int64
+	SessionKey      []byte
+	Security        SecurityOptions
 }
 
 func New(ctx context.Context, opts Options) *Server {
@@ -189,10 +202,15 @@ func New(ctx context.Context, opts Options) *Server {
 		secrets:                  opts.Secrets,
 		chatTelegram:             opts.ChatTelegram,
 		events:                   opts.Events,
+		memWebhooks:              opts.MemWebhooks,
+		webhookMaxBytes:          opts.WebhookMaxBytes,
 		sessionKey:               opts.SessionKey,
 		security:                 opts.Security,
 		loginLimit:               newLoginThrottle(5, 15*time.Minute),
 		unauthLimit:              newLoginThrottle(0, time.Hour), // max/window passed per-call via AllowN
+	}
+	if s.webhookMaxBytes <= 0 {
+		s.webhookMaxBytes = DefaultWebhookMaxBytes
 	}
 	// Sweep stale throttle buckets periodically. Tied to ctx so the
 	// goroutine exits on shutdown instead of leaking (precedent:
@@ -251,6 +269,8 @@ func (s *Server) Routes(mux *http.ServeMux) {
 	mux.HandleFunc("/v1/mempalace/ingest", s.mempalaceIngest)
 	mux.HandleFunc("/v1/mempalace/status", s.mempalaceStatus)
 	mux.HandleFunc("/v1/mempalace/agents", s.mempalaceAgents)
+
+	s.memoryWebhookRoutes(mux)
 
 	mux.HandleFunc("/v1/notes/sync", s.notesSync)
 	mux.HandleFunc("/v1/notes/status", s.notesStatus)

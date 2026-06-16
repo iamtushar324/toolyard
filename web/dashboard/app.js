@@ -73,6 +73,9 @@ const state = {
   events: { rows: [], unacked: 0, sources: [], loaded: false, nextBefore: 0 },
   eventFilter: { source_id: '', type: '', q: '', unacked: false },
   eventSourceModal: null,  // { kind, name, ... } while adding a source
+  // MemPalace panel (TEC-481): memory metrics + wing-locked ingestion webhooks.
+  mempalace: { loaded: false, metrics: null, webhooks: [], wings: [] },
+  mwModal: null,           // { name, wing, source, mode, entry_field, entry_template, topic, required, json_schema } while adding a webhook
   // Voice "live call" panel. The actual WS, AudioContext, MediaStream
   // live in module-scope handles (see voiceClient below) — they aren't
   // serialisable and must survive re-renders, so they can't sit in this
@@ -2802,6 +2805,232 @@ async function ackEvents(ids) {
   } catch (e) { toast(e.message, 'error'); }
 }
 
+// ---- MemPalace panel (TEC-481) ---------------------------------------------
+
+async function loadMempalace() {
+  state.mempalace.loaded = true;
+  try {
+    const [metrics, webhooks, wings] = await Promise.all([
+      api('/v1/memory/metrics').catch(() => null),
+      api('/v1/memory/webhooks').catch(() => []),
+      api('/v1/memory/webhooks/wings').catch(() => ({ wings: [] })),
+    ]);
+    state.mempalace.metrics = metrics;
+    state.mempalace.webhooks = webhooks || [];
+    state.mempalace.wings = (wings && wings.wings) || [];
+    render();
+  } catch (e) { toast(e.message, 'error'); }
+}
+
+function fmtBytes(n) {
+  n = Number(n) || 0;
+  if (n < 1024) return n + ' B';
+  if (n < 1024 * 1024) return (n / 1024).toFixed(1) + ' KB';
+  return (n / (1024 * 1024)).toFixed(1) + ' MB';
+}
+
+function viewMempalace() {
+  if (!state.mempalace.loaded) loadMempalace();
+  const m = state.mempalace.metrics;
+  const mp = (m && m.mempalace) || {};
+  const ledger = (m && m.ledger) || {};
+  const totals = ledger.totals || {};
+  const fmtNum = (n) => (n == null ? '0' : Number(n).toLocaleString());
+
+  const cardNum = (label, value, sub) => el('div', {
+    style: 'background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 10px 12px; flex: 1; min-width: 120px;',
+  },
+    el('div', { class: 'meta', style: 'font-size: 11px; text-transform: uppercase; letter-spacing: 0.04em;' }, label),
+    el('div', { style: 'font-size: 22px; font-weight: 600; margin-top: 2px;' }, String(value)),
+    sub ? el('div', { class: 'meta', style: 'font-size: 11px;' }, sub) : null,
+  );
+
+  const statusBadge = mp.available
+    ? el('span', { class: 'badge allowed' }, 'available')
+    : (mp.enabled ? el('span', { class: 'badge pending' }, 'not connected') : el('span', { class: 'badge denied' }, 'disabled'));
+
+  const statusCard = el('div', { class: 'card' },
+    el('div', { class: 'row', style: 'justify-content: space-between; align-items: center;' },
+      el('h2', { style: 'margin: 0;' }, 'MemPalace'),
+      statusBadge,
+    ),
+    el('p', { class: 'meta' }, 'Memory backed by the MemPalace upstream. Authenticated, wing-locked webhooks let n8n automations ingest memory (e.g. meeting transcripts) into a single bound wing.'),
+    el('div', { class: 'row', style: 'gap: 10px; margin-top: 12px; flex-wrap: wrap;' },
+      cardNum('Mode', mp.mode || '—', mp.installed ? 'installed' : 'not installed'),
+      cardNum('Ingestions', fmtNum(totals.total), 'all time'),
+      cardNum('Last 24h', fmtNum(totals.last_24h), fmtNum(totals.last_7d) + ' in 7d'),
+      cardNum('OK', fmtNum(totals.ok)),
+      cardNum('Failures', fmtNum((totals.failed || 0) + (totals.rejected || 0) + (totals.too_large || 0)),
+        `${fmtNum(totals.rejected)} rejected · ${fmtNum(totals.too_large)} too big`),
+      cardNum('Webhooks', fmtNum(ledger.webhook_count), fmtNum(ledger.enabled_count) + ' enabled'),
+      cardNum('Agents', fmtNum(mp.agent_count)),
+    ),
+    mp.palace_dir ? el('div', { class: 'meta', style: 'margin-top: 8px;' }, 'palace: ' + mp.palace_dir) : null,
+  );
+
+  const perWing = ledger.per_wing || [];
+  const wingCard = el('div', { class: 'card' },
+    el('h2', {}, 'Ingestion by wing'),
+    perWing.length ? el('table', { class: 'tbl', style: 'width:100%; margin-top:8px;' },
+      el('thead', {}, el('tr', {}, el('th', {}, 'Wing'), el('th', {}, 'Total'), el('th', {}, 'OK'), el('th', {}, 'Failed'), el('th', {}, 'Last'))),
+      el('tbody', {}, ...perWing.map((wv) => el('tr', {},
+        el('td', {}, el('span', { class: 'badge allow' }, wv.wing)),
+        el('td', {}, fmtNum(wv.count)),
+        el('td', {}, fmtNum(wv.ok)),
+        el('td', {}, wv.failed ? el('span', { class: 'badge denied' }, fmtNum(wv.failed)) : '0'),
+        el('td', { class: 'meta' }, wv.last_at ? relTime(wv.last_at) : '—'),
+      ))),
+    ) : el('p', { class: 'meta' }, 'No ingestions yet.'),
+  );
+
+  const recent = ledger.recent || [];
+  const statusPill = (s) => {
+    const cls = s === 'ok' ? 'allowed' : (s === 'rejected' || s === 'too_large' ? 'pending' : 'denied');
+    return el('span', { class: 'badge ' + cls }, s);
+  };
+  const recentCard = el('div', { class: 'card' },
+    el('h2', {}, 'Recent ingestion activity'),
+    recent.length ? el('table', { class: 'tbl', style: 'width:100%; margin-top:8px;' },
+      el('thead', {}, el('tr', {}, el('th', {}, 'When'), el('th', {}, 'Webhook'), el('th', {}, 'Wing'), el('th', {}, 'Size'), el('th', {}, 'Status'), el('th', {}, 'Request'))),
+      el('tbody', {}, ...recent.map((ig) => el('tr', { title: ig.detail || '' },
+        el('td', { class: 'meta' }, relTime(ig.received_at)),
+        el('td', {}, ig.webhook_name, ig.source ? el('span', { class: 'meta' }, ' · ' + ig.source) : null),
+        el('td', {}, el('span', { class: 'badge allow' }, ig.wing)),
+        el('td', { class: 'meta' }, fmtBytes(ig.payload_size)),
+        el('td', {}, statusPill(ig.status)),
+        el('td', { class: 'meta', style: 'font-family: monospace; font-size: 11px;' }, ig.id),
+      ))),
+    ) : el('p', { class: 'meta' }, 'No activity yet. Create a webhook and POST to it.'),
+  );
+
+  return el('div', {},
+    statusCard,
+    renderMemWebhooksCard(),
+    wingCard,
+    recentCard,
+    state.mwModal ? renderMemWebhookModal() : null,
+  );
+}
+
+function renderMemWebhooksCard() {
+  const hooks = state.mempalace.webhooks || [];
+  const rows = hooks.map((h) => el('tr', {},
+    el('td', {}, h.name, h.notes ? el('div', { class: 'meta' }, h.notes) : null),
+    el('td', {}, el('span', { class: 'badge allow' }, h.wing)),
+    el('td', { class: 'meta' }, (h.payload_spec && h.payload_spec.mode) || 'whole'),
+    el('td', { class: 'meta' }, fmtNumSafe(h.ingest_count) + ' in' + (h.fail_count ? ' · ' + fmtNumSafe(h.fail_count) + ' fail' : '')),
+    el('td', {},
+      el('label', { style: 'display:inline-flex; gap:4px; align-items:center;' },
+        el('input', { type: 'checkbox', checked: h.enabled, on: { change: (e) => patchMemWebhook(h.id, { enabled: e.target.checked }) } }), 'on'),
+    ),
+    el('td', {},
+      el('button', { class: 'btn', style: 'font-size:12px;', on: { click: () => rotateMemWebhookToken(h.id) } }, 'Token'),
+      ' ',
+      el('button', { class: 'btn', style: 'font-size:12px;', on: { click: () => deleteMemWebhook(h.id, h.name) } }, 'Revoke'),
+    ),
+  ));
+  return el('div', { class: 'card' },
+    el('h2', {}, 'Ingestion webhooks',
+      el('button', { class: 'btn', style: 'float:right; font-size:12px;', on: { click: () => {
+        state.mwModal = { name: '', wing: '', source: '', mode: 'whole', entry_field: '', entry_template: '', topic: '', required: '', json_schema: '' };
+        render();
+      } } }, '+ Add webhook')),
+    el('p', { class: 'meta' }, 'Each webhook is locked to one wing at creation. Callers authenticate with a bearer token and can never change the target wing.'),
+    hooks.length ? el('table', { class: 'tbl', style: 'width:100%; margin-top:8px;' },
+      el('thead', {}, el('tr', {}, el('th', {}, 'Name'), el('th', {}, 'Wing'), el('th', {}, 'Mode'), el('th', {}, 'Volume'), el('th', {}, 'State'), el('th', {}, ''))),
+      el('tbody', {}, ...rows),
+    ) : el('p', { class: 'meta' }, 'No webhooks yet. Add one to start ingesting memory from n8n.'),
+  );
+}
+
+function fmtNumSafe(n) { return n == null ? '0' : Number(n).toLocaleString(); }
+
+function renderMemWebhookModal() {
+  const m = state.mwModal;
+  const close = () => { state.mwModal = null; render(); };
+  return el('div', { class: 'modal-bg', on: { click: (e) => { if (e.target === e.currentTarget) close(); } } },
+    el('div', { class: 'modal modal-wide' },
+      el('h3', {}, 'Add ingestion webhook'),
+      el('p', { class: 'meta' }, 'The wing is locked at creation and cannot be changed by callers.'),
+      el('label', {}, el('div', { class: 'meta' }, 'Name'),
+        el('input', { placeholder: 'meeting-transcripts', value: m.name, style: 'width:100%; padding:6px 8px; margin-bottom:8px;', on: { input: (e) => { m.name = e.target.value; } } })),
+      el('label', {}, el('div', { class: 'meta' }, 'Wing (locked)'),
+        el('input', { placeholder: 'meetings', value: m.wing, list: 'mw-wings', style: 'width:100%; padding:6px 8px; margin-bottom:8px;', on: { input: (e) => { m.wing = e.target.value; } } })),
+      el('datalist', { id: 'mw-wings' }, ...(state.mempalace.wings || []).map((wg) => el('option', { value: wg }))),
+      el('label', {}, el('div', { class: 'meta' }, 'Source automation label (optional)'),
+        el('input', { placeholder: 'n8n-meeting-job', value: m.source, style: 'width:100%; padding:6px 8px; margin-bottom:8px;', on: { input: (e) => { m.source = e.target.value; } } })),
+      el('label', {}, el('div', { class: 'meta' }, 'Entry mode'),
+        el('select', { style: 'padding:6px 8px; margin-bottom:8px;', on: { change: (e) => { m.mode = e.target.value; render(); } } },
+          el('option', { value: 'whole', selected: m.mode === 'whole' }, 'whole — store the full JSON payload'),
+          el('option', { value: 'field', selected: m.mode === 'field' }, 'field — store one payload field'),
+          el('option', { value: 'template', selected: m.mode === 'template' }, 'template — render {{field}} placeholders'),
+        )),
+      m.mode === 'field' ? el('label', {}, el('div', { class: 'meta' }, 'Entry field (dot-path)'),
+        el('input', { placeholder: 'transcript', value: m.entry_field, style: 'width:100%; padding:6px 8px; margin-bottom:8px;', on: { input: (e) => { m.entry_field = e.target.value; } } })) : null,
+      m.mode === 'template' ? el('label', {}, el('div', { class: 'meta' }, 'Entry template'),
+        el('textarea', { placeholder: '{{title}}\n\n{{transcript}}', value: m.entry_template, style: 'width:100%; padding:6px 8px; margin-bottom:8px; min-height:64px;', on: { input: (e) => { m.entry_template = e.target.value; } } })) : null,
+      el('label', {}, el('div', { class: 'meta' }, 'Topic within the wing (optional)'),
+        el('input', { placeholder: 'standup', value: m.topic, style: 'width:100%; padding:6px 8px; margin-bottom:8px;', on: { input: (e) => { m.topic = e.target.value; } } })),
+      el('label', {}, el('div', { class: 'meta' }, 'Required fields (comma-separated dot-paths, optional)'),
+        el('input', { placeholder: 'title, transcript', value: m.required, style: 'width:100%; padding:6px 8px; margin-bottom:8px;', on: { input: (e) => { m.required = e.target.value; } } })),
+      el('label', {}, el('div', { class: 'meta' }, 'JSON Schema (optional, draft 2020-12)'),
+        el('textarea', { placeholder: '{"type":"object","required":["transcript"]}', value: m.json_schema, style: 'width:100%; padding:6px 8px; margin-bottom:8px; min-height:64px; font-family: monospace;', on: { input: (e) => { m.json_schema = e.target.value; } } })),
+      el('div', { style: 'display:flex; gap:8px; justify-content:flex-end; margin-top:8px;' },
+        el('button', { class: 'btn', on: { click: close } }, 'Cancel'),
+        el('button', { class: 'btn primary', on: { click: createMemWebhook } }, 'Create'),
+      ),
+    ),
+  );
+}
+
+function buildPayloadSpec(m) {
+  const spec = { mode: m.mode || 'whole' };
+  if (m.mode === 'field') spec.entry_field = m.entry_field.trim();
+  if (m.mode === 'template') spec.entry_template = m.entry_template;
+  if (m.topic && m.topic.trim()) spec.topic = m.topic.trim();
+  const req = (m.required || '').split(',').map((s) => s.trim()).filter(Boolean);
+  if (req.length) spec.required_fields = req;
+  if (m.json_schema && m.json_schema.trim()) {
+    spec.json_schema = JSON.parse(m.json_schema); // throws → caught by caller
+  }
+  return spec;
+}
+
+async function createMemWebhook() {
+  const m = state.mwModal;
+  if (!m.name.trim() || !m.wing.trim()) { toast('Name and wing are required', 'error'); return; }
+  let spec;
+  try { spec = buildPayloadSpec(m); }
+  catch (e) { toast('Invalid JSON Schema: ' + e.message, 'error'); return; }
+  try {
+    const r = await api('/v1/memory/webhooks', { method: 'POST', body: {
+      name: m.name.trim(), wing: m.wing.trim(), source: m.source.trim(), payload_spec: spec,
+    } });
+    state.mwModal = null;
+    await loadMempalace();
+    if (r.token) showSecretBox('Webhook token for ' + r.webhook.name, r.token, r.curl_example || 'POST to /v1/memory/webhooks/ingest with Authorization: Bearer <token>');
+  } catch (e) { toast(e.message, 'error'); }
+}
+
+async function rotateMemWebhookToken(id) {
+  if (!confirm('Rotate this token? The current token stops working immediately.')) return;
+  try {
+    const r = await api('/v1/memory/webhooks/' + encodeURIComponent(id) + '/rotate-token', { method: 'POST', body: {} });
+    showSecretBox('New webhook token', r.token, r.curl_example || 'POST to /v1/memory/webhooks/ingest with Authorization: Bearer <token>');
+  } catch (e) { toast(e.message, 'error'); }
+}
+
+async function patchMemWebhook(id, body) {
+  try { await api('/v1/memory/webhooks/' + encodeURIComponent(id), { method: 'PATCH', body }); loadMempalace(); }
+  catch (e) { toast(e.message, 'error'); }
+}
+
+async function deleteMemWebhook(id, name) {
+  if (!confirm('Revoke webhook ' + name + '? Its token stops working immediately.')) return;
+  try { await api('/v1/memory/webhooks/' + encodeURIComponent(id), { method: 'DELETE' }); toast('Revoked'); loadMempalace(); }
+  catch (e) { toast(e.message, 'error'); }
+}
+
 function viewEvents() {
   if (!state.events.loaded) loadEvents();
   const f = state.eventFilter;
@@ -3530,6 +3759,7 @@ function shell(content) {
         navBtn('servers',      'Servers'),
         navBtn('tools',        'Tools'),
         navBtn('memory',       'Memory'),
+        navBtn('mempalace',    'MemPalace'),
         navBtn('agents',       'Agents'),
         navBtn('settings',     'Settings'),
       ),
@@ -3663,6 +3893,7 @@ function render() {
     case 'audit':         body = viewAudit();         break;
     case 'hooks':         body = viewHooks();         break;
     case 'memory':        body = viewMemory();        break;
+    case 'mempalace':     body = viewMempalace();     break;
     case 'agents':        body = viewAgents();        break;
     case 'servers':       body = viewServers();       break;
     case 'tools':         body = viewTools();         break;
