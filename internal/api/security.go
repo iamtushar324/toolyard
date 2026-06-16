@@ -145,6 +145,15 @@ func (s *Server) EnforceOriginOnMutations(next http.Handler) http.Handler {
 				next.ServeHTTP(w, r)
 				return
 			}
+			// Bearer-authenticated memory-webhook ingest from n8n skips this
+			// too: server-to-server callers send no Origin/Referer, and the
+			// webhook token (not a cookie) is the credential, so it isn't
+			// CSRF-replayable.
+			if r.URL.Path == MemoryWebhookIngestPath &&
+				strings.HasPrefix(r.Header.Get("Authorization"), "Bearer ") {
+				next.ServeHTTP(w, r)
+				return
+			}
 			origin := r.Header.Get("Origin")
 			if origin == "" {
 				// Some browsers omit Origin on same-origin POSTs; fall back
@@ -177,6 +186,25 @@ func LimitBody(next http.Handler, maxBytes int64) http.Handler {
 	})
 }
 
+// LimitBodyByPath is the universal body ceiling with per-path overrides. Every
+// request gets defaultMax unless its path exactly matches an override key, in
+// which case that (larger) limit applies. This lets the memory-webhook ingest
+// route accept large payloads while every other route stays clamped tight —
+// without the override the outer ceiling would bind below the configured
+// webhook cap.
+func LimitBodyByPath(next http.Handler, defaultMax int64, overrides map[string]int64) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		max := defaultMax
+		if v, ok := overrides[r.URL.Path]; ok && v > 0 {
+			max = v
+		}
+		if r.Body != nil {
+			r.Body = http.MaxBytesReader(w, r.Body, max)
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
 // HardenAPI is the application-layer security envelope around every /v1/*
 // route. It is the load-bearing defense in our chosen posture: kernel
 // sandbox is loose so subprocesses can run; this middleware compensates by
@@ -202,8 +230,15 @@ func (s *Server) HardenAPI(next http.Handler) http.Handler {
 			return
 		}
 
-		// 1) Per-route body cap.
+		// 1) Per-route body cap. The memory-webhook ingest path is the one
+		// route that intentionally takes a large body (n8n transcripts), so
+		// it uses the configured webhookMaxBytes instead of the tight
+		// per-route default (which would otherwise clamp it via the /v1/memory
+		// prefix).
 		cap := perRouteBodyCap(path)
+		if path == MemoryWebhookIngestPath && s.webhookMaxBytes > 0 {
+			cap = s.webhookMaxBytes
+		}
 		if r.Body != nil {
 			r.Body = http.MaxBytesReader(w, r.Body, cap)
 		}
@@ -327,6 +362,10 @@ func exemptFromCSRFHeader(path string) bool {
 		// Agent-authenticated (Bearer) ingest — no cookie, no dashboard
 		// origin, so the CSRF custom-header check doesn't apply.
 		"/v1/mempalace/ingest",
+		// Webhook-token (Bearer) memory ingest from n8n — no cookie, no
+		// dashboard origin. Management routes (/v1/memory/webhooks*) stay
+		// CSRF-protected because they are cookie-authenticated.
+		MemoryWebhookIngestPath,
 		"/v1/hooks/ingest",
 		"/v1/notes/sync",
 		"/v1/notes/publish",
@@ -366,6 +405,10 @@ func unauthRouteLimit(path string) *unauthRouteRule {
 		// Webhook ingest. Generous per-IP budget for legitimate high-volume
 		// senders; a bad token still fails auth, this just caps spray.
 		return &unauthRouteRule{"ingest", 1200, time.Hour}
+	case path == MemoryWebhookIngestPath:
+		// Memory-webhook ingest (n8n). Same generous per-IP budget; a bad
+		// token still fails auth, this just caps spray on the unauth surface.
+		return &unauthRouteRule{"mem-ingest", 1200, time.Hour}
 	}
 	return nil
 }

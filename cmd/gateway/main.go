@@ -51,6 +51,7 @@ import (
 	"github.com/tusharbhardwaj/toolyard/internal/logx"
 	"github.com/tusharbhardwaj/toolyard/internal/memory"
 	"github.com/tusharbhardwaj/toolyard/internal/mempalace"
+	"github.com/tusharbhardwaj/toolyard/internal/memwebhook"
 	"github.com/tusharbhardwaj/toolyard/internal/metrics"
 	notespkg "github.com/tusharbhardwaj/toolyard/internal/notes"
 	"github.com/tusharbhardwaj/toolyard/internal/oauth"
@@ -165,6 +166,7 @@ func runServe(argv []string) error {
 	envDenylistFlag := fs.String("upstream-env-denylist", "LD_PRELOAD,LD_LIBRARY_PATH,DYLD_INSERT_LIBRARIES,DYLD_LIBRARY_PATH,PATH", "comma-separated env var keys forbidden in upstream stdio configs")
 	upstreamCallTimeout := fs.Duration("upstream-call-timeout", 120*time.Second, "per-tool-call deadline applied to every dispatch (built-in, fixture, and external upstreams). 0 disables the cap. Without it, a hung upstream pins a goroutine indefinitely and queues every other caller behind it.")
 	mempalaceFlag := fs.String("mempalace", "auto", "MemPalace integration mode: on|off|auto. auto=install via `uv tool install mempalace` if missing and proceed; on=fail boot when install fails; off=skip the integration entirely.")
+	webhookMaxBytes := fs.Int64("webhook-max-bytes", api.DefaultWebhookMaxBytes, "max body (bytes) accepted by the memory-webhook ingest endpoint (/v1/memory/webhooks/ingest). n8n transcript payloads can be large; bodies above this get a clean 413. Every other route keeps its tight cap.")
 	notesFlag := fs.String("notes", "auto", "Notes (markdown workspace) upstream mode: on|off|auto. auto=register the filesystem MCP if npx is on PATH; on=fail boot when npx missing; off=skip the integration entirely.")
 	notesDir := fs.String("notes-dir", "", "Directory the notes filesystem upstream exposes (defaults to <data-dir>/notes). Lives under <data-dir> so the existing data-dir backup captures it.")
 	notesSyncEvery := fs.Duration("notes-sync-interval", notespkg.DefaultScanEvery, "How often the notes->mempalace background sync walks the notes dir. Use a negative value to disable scanning (notes.publish still works).")
@@ -575,6 +577,11 @@ func runServe(argv []string) error {
 	}
 	hooksSvc := hookspkg.New(db, mpSvc)
 
+	// TEC-481: wing-locked memory-ingestion webhooks for n8n. mpSvc satisfies
+	// memwebhook.MemIngester directly; even when MemPalace is disabled the
+	// service still manages webhooks (ingestion then returns 503).
+	memWebhookSvc := memwebhook.New(db, mpSvc, auditSvc)
+
 	// Notes workspace: a markdown scratchpad agents read/write through the
 	// official @modelcontextprotocol/server-filesystem MCP. The upstream is
 	// scoped to a single directory so agents can only touch the notes dir,
@@ -784,6 +791,8 @@ func runServe(argv []string) error {
 		Secrets:                  secretsSvc,
 		ChatTelegram:             telegramSvc,
 		Events:                   evSvc,
+		MemWebhooks:              memWebhookSvc,
+		WebhookMaxBytes:          *webhookMaxBytes,
 		SessionKey:               loadOrCreateSessionKey(*dataDir),
 		Security:                 secOpts,
 	})
@@ -887,7 +896,13 @@ func runServe(argv []string) error {
 	// bootstrap routes. It only applies to /v1/* — /mcp keeps its
 	// dedicated bearer-token guard above.
 	var handler http.Handler = mux
-	handler = api.LimitBody(handler, 4<<20) // 4 MiB universal ceiling
+	// 4 MiB universal ceiling, with one override: the memory-webhook ingest
+	// route (TEC-481) intentionally accepts large n8n payloads, so it gets the
+	// configured webhook cap. Without the override this outer ceiling would
+	// bind below that cap.
+	handler = api.LimitBodyByPath(handler, 4<<20, map[string]int64{
+		api.MemoryWebhookIngestPath: *webhookMaxBytes,
+	})
 	handler = apiSrv.HardenAPI(handler)
 	handler = apiSrv.EnforceOriginOnMutations(handler)
 	handler = apiSrv.SecurityHeaders(handler)

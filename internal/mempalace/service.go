@@ -282,6 +282,18 @@ func (s *Service) Available() bool {
 // a human tap, and the call is sourced from an authenticated agent via the
 // trusted /v1/mempalace/ingest endpoint.
 func (s *Service) Ingest(ctx context.Context, agentID, entry, topic, wing string) (*IngestResult, error) {
+	return s.IngestTagged(ctx, entry, topic, wing, agentID)
+}
+
+// IngestTagged is the general ingest path: it forwards an entry to
+// mempalace.diary_write with an explicit agent_name tag, decoupling "who
+// authored this" from the gateway's authenticated agent ID. The webhook
+// ingestion path (TEC-481) uses it with a "webhook:<name>" tag so n8n-driven
+// entries are attributable in MemPalace search without minting agent tokens.
+//
+// The agentName tag is also the key recorded in mempalace_agents so the
+// dashboard's active-source list reflects webhook traffic too.
+func (s *Service) IngestTagged(ctx context.Context, entry, topic, wing, agentName string) (*IngestResult, error) {
 	if s.Disabled() {
 		return nil, ErrDisabled
 	}
@@ -301,11 +313,11 @@ func (s *Service) Ingest(ctx context.Context, agentID, entry, topic, wing string
 	if wing != "" {
 		args["wing"] = wing
 	}
-	if agentID != "" {
+	if agentName != "" {
 		// MemPalace's diary primitive accepts an agent_name tag that gets
 		// stored alongside each entry so search results can be filtered by
 		// who said what.
-		args["agent_name"] = agentID
+		args["agent_name"] = agentName
 	}
 
 	res, err := s.gw.CallInternal(ctx, "mempalace.ingest", DiaryWriteTool, args)
@@ -313,16 +325,12 @@ func (s *Service) Ingest(ctx context.Context, agentID, entry, topic, wing string
 		return nil, err
 	}
 	out := &IngestResult{OK: !res.IsError}
-	if !out.OK {
-		out.Detail = summariseToolResult(res)
-	} else {
-		out.Detail = summariseToolResult(res)
-	}
+	out.Detail = summariseToolResult(res)
 	if res.StructuredContent != nil {
 		out.Raw = res.StructuredContent
 	}
 	if out.OK {
-		s.recordAgent(ctx, agentID)
+		s.recordAgent(ctx, agentName)
 	}
 	return out, nil
 }
@@ -407,6 +415,37 @@ func (s *Service) Snapshot(ctx context.Context) Status {
 			`SELECT COUNT(*) FROM mempalace_agents`).Scan(&st.AgentCount)
 	}
 	return st
+}
+
+// WingStats returns best-effort storage/index health from the MemPalace
+// upstream: the list of wings and the knowledge-graph stats. Both are fetched
+// via the gateway's internal call path. Any error (upstream down, tool
+// missing) is swallowed and reported as a nil section so a metrics page never
+// blocks on MemPalace being live.
+func (s *Service) WingStats(ctx context.Context) map[string]any {
+	out := map[string]any{}
+	if s == nil || s.gw == nil || !s.Available() {
+		return out
+	}
+	if s.gw.HasTool(ToolPrefix + ".mempalace_list_wings") {
+		if res, err := s.gw.CallInternal(ctx, "mempalace.metrics", ToolPrefix+".mempalace_list_wings", map[string]any{}); err == nil && res != nil && !res.IsError {
+			if res.StructuredContent != nil {
+				out["wings"] = res.StructuredContent
+			} else if txt := summariseToolResult(res); txt != "" {
+				out["wings_text"] = txt
+			}
+		}
+	}
+	if s.gw.HasTool(ToolPrefix + ".mempalace_graph_stats") {
+		if res, err := s.gw.CallInternal(ctx, "mempalace.metrics", ToolPrefix+".mempalace_graph_stats", map[string]any{}); err == nil && res != nil && !res.IsError {
+			if res.StructuredContent != nil {
+				out["graph_stats"] = res.StructuredContent
+			} else if txt := summariseToolResult(res); txt != "" {
+				out["graph_stats_text"] = txt
+			}
+		}
+	}
+	return out
 }
 
 func (s *Service) binaryInstalled() bool {
