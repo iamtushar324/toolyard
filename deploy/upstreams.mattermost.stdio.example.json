@@ -1,0 +1,20 @@
+[
+  {
+    "name": "mattermost",
+    "transport": "stdio",
+    "command": "uv",
+    "args": [
+      "run",
+      "--frozen",
+      "--project",
+      "/home/ubuntu/repos/mcp-server-mattermost",
+      "mcp-server-mattermost"
+    ],
+    "env": {
+      "MATTERMOST_URL": "https://chat.beknown.live",
+      "MATTERMOST_TOKEN": "secret://MATTERMOST_TOKEN",
+      "MATTERMOST_AUTH_MODE": "static_token",
+      "MATTERMOST_LOG_LEVEL": "WARNING"
+    }
+  }
+]

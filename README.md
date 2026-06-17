@@ -58,6 +58,10 @@ The full self-hosting guide is in [`docs/self-hosting.md`](docs/self-hosting.md)
 - `scripts/claude-code-hook.sh` reference implementation of the
   PostToolUse hook that resumes deferred approvals.
 - Multi-stage `deploy/Dockerfile` + `deploy/docker-compose.yml`.
+- Mattermost messaging via the `mattermost.*` upstream
+  ([`cloud-ru-tech/mcp-server-mattermost`](https://github.com/cloud-ru-tech/mcp-server-mattermost)):
+  any agent can send/read internal Mattermost; sends and destructive ops hold
+  for approval. See [docs/mattermost.md](docs/mattermost.md).
 
 ## Personal data lake (TUS-104)
 

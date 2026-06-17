@@ -143,6 +143,27 @@ Then:
 Upstreams' tool catalogs are fetched at startup, schema-wrapped, and
 registered under `<upstream-name>.<original-tool-name>`.
 
+### Mattermost (`mattermost.*`)
+
+Internal Mattermost messaging is provided by registering the
+[`cloud-ru-tech/mcp-server-mattermost`](https://github.com/cloud-ru-tech/mcp-server-mattermost)
+server as an upstream. Because the systemd `toolyard` user runs with
+`ProtectHome=true` it cannot spawn a stdio command under `/home`, so run the
+server as a localhost **HTTP** service (`deploy/mcp-server-mattermost.service`)
+and register the `http` upstream:
+
+```json
+[
+  { "name": "mattermost", "transport": "http", "url": "http://127.0.0.1:8000/mcp" }
+]
+```
+
+For a dev gateway that can read the checkout, the stdio form works too
+(`deploy/upstreams.mattermost.stdio.example.json`). Store the bot token in the
+secrets broker as `MATTERMOST_TOKEN` and run `scripts/setup-mattermost.sh` to
+register the upstream plus the recommended `deny` policies. Full guide:
+[docs/mattermost.md](mattermost.md).
+
 ## Web Push (PWA notifications)
 
 1. Open the dashboard and visit **Settings → Enable push**.
