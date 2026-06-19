@@ -146,6 +146,15 @@ func (s *Service) GetJob(ctx context.Context, id string) (*Job, error) {
 // RunWorker is the supervised background loop (goroutines.Supervise entrypoint).
 // It only returns on context cancellation; per-job errors are recorded on the
 // job/ledger and never crash the loop.
+//
+// Jobs are processed strictly one at a time. There is exactly one RunWorker
+// goroutine (a single goroutines.Supervise call in cmd/gateway, which never runs
+// two invocations concurrently), and its drain loop runs each job to completion
+// before claiming the next. This is deliberate: MemPalace is the throttled
+// bottleneck this ticket is about, so we never fan out parallel embeds that
+// would worsen memory pressure, and it matches SQLite's single-writer model.
+// The atomic claim (UPDATE ... WHERE status='queued') is belt-and-suspenders in
+// case that single-worker invariant is ever violated.
 func (s *Service) RunWorker(ctx context.Context) error {
 	s.recoverRunningJobs(ctx)
 	s.drain(ctx)

@@ -5,8 +5,11 @@ import (
 	"encoding/json"
 	"fmt"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
+	"github.com/tusharbhardwaj/toolyard/internal/audit"
 	"github.com/tusharbhardwaj/toolyard/internal/mempalace"
 )
 
@@ -195,6 +198,74 @@ func TestRecoverRunningOnBoot(t *testing.T) {
 	drainJobs(t, s)
 	if got, _ = s.GetJob(ctx, job.ID); got.Status != jobSucceeded {
 		t.Fatalf("post-recovery status = %q, want succeeded", got.Status)
+	}
+}
+
+// serialProbe is a MemIngester that detects any concurrent IngestTagged call:
+// it tracks how many calls are in flight at once and records the peak.
+type serialProbe struct {
+	mu        sync.Mutex
+	active    int
+	maxActive int
+	total     int
+}
+
+func (p *serialProbe) Available() bool { return true }
+
+func (p *serialProbe) IngestTagged(_ context.Context, _, _, _, _ string) (*mempalace.IngestResult, error) {
+	p.mu.Lock()
+	p.active++
+	if p.active > p.maxActive {
+		p.maxActive = p.active
+	}
+	p.mu.Unlock()
+
+	// Hold the "embed" open so an overlapping job would be caught red-handed.
+	time.Sleep(5 * time.Millisecond)
+
+	p.mu.Lock()
+	p.active--
+	p.total++
+	p.mu.Unlock()
+	return &mempalace.IngestResult{OK: true, Detail: "stored"}, nil
+}
+
+func (p *serialProbe) peak() int  { p.mu.Lock(); defer p.mu.Unlock(); return p.maxActive }
+func (p *serialProbe) calls() int { p.mu.Lock(); defer p.mu.Unlock(); return p.total }
+
+// TestWorkerProcessesJobsSerially proves the background worker never runs two
+// jobs at once: even with many jobs queued and a deliberately slow MemPalace,
+// at most one IngestTagged call is ever in flight.
+func TestWorkerProcessesJobsSerially(t *testing.T) {
+	db := tempDB(t)
+	probe := &serialProbe{}
+	s := New(db, probe, audit.New(db))
+
+	wh, _ := mustCreate(t, s, CreateInput{Name: "serial", Wing: "w",
+		Spec: &PayloadSpec{Mode: ModeField, EntryField: "transcript"}})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = s.RunWorker(ctx) }()
+
+	const n = 8
+	for i := 0; i < n; i++ {
+		if _, err := enqueue(t, s, wh, fmt.Sprintf("req_serial_%d", i), `{"transcript":"hello"}`); err != nil {
+			t.Fatalf("enqueue %d: %v", i, err)
+		}
+	}
+
+	// Wait for all jobs to be processed by the worker.
+	deadline := time.Now().Add(5 * time.Second)
+	for probe.calls() < n {
+		if time.Now().After(deadline) {
+			t.Fatalf("worker processed only %d/%d jobs in time", probe.calls(), n)
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	if peak := probe.peak(); peak != 1 {
+		t.Fatalf("jobs ran %d-at-a-time; the worker must process one at a time", peak)
 	}
 }
 
