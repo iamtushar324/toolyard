@@ -53,12 +53,23 @@ const (
 	maxDetail  = 500
 )
 
-// Ledger statuses.
+// Ledger statuses (memory_webhook_ingestions). These are the terminal audit
+// outcomes and are unchanged from TEC-481 so the dashboard panel + Metrics keep
+// working byte-for-byte.
 const (
 	statusOK       = "ok"
 	statusFailed   = "failed"
 	statusRejected = "rejected"
 	statusTooLarge = "too_large"
+)
+
+// Job lifecycle statuses (memory_webhook_jobs). Distinct from the ledger:
+// callers poll these via the status endpoint while the background worker runs.
+const (
+	jobQueued    = "queued"
+	jobRunning   = "running"
+	jobSucceeded = "succeeded"
+	jobFailed    = "failed"
 )
 
 // MemIngester is the narrow slice of mempalace.Service this package needs.
@@ -85,18 +96,23 @@ type Webhook struct {
 	UpdatedAt   int64        `json:"updated_at"`
 }
 
-// Service owns the memory_webhooks + memory_webhook_ingestions tables.
+// Service owns the memory_webhooks, memory_webhook_ingestions, and
+// memory_webhook_jobs tables.
 type Service struct {
 	db    *store.DB
 	mem   MemIngester
 	audit *audit.Logger
+	// wake nudges the background job worker (RunWorker) to claim a freshly
+	// enqueued job without waiting for the next tick. Buffered (cap 1) and sent
+	// non-blocking, so Enqueue never stalls on a busy worker.
+	wake chan struct{}
 }
 
 // New builds a Service. mem may be a *mempalace.Service that is currently
 // disabled — ingestion then returns ErrMemUnavailable while management keeps
 // working.
 func New(db *store.DB, mem MemIngester, auditLog *audit.Logger) *Service {
-	return &Service{db: db, mem: mem, audit: auditLog}
+	return &Service{db: db, mem: mem, audit: auditLog, wake: make(chan struct{}, 1)}
 }
 
 // ---- CRUD -------------------------------------------------------------------
@@ -298,84 +314,10 @@ type IngestRequest struct {
 	Source      string
 }
 
-// Result is the ingest outcome envelope returned to the caller.
-type Result struct {
-	RequestID string `json:"request_id"`
-	Wing      string `json:"wing"`
-	Bytes     int64  `json:"bytes"`
-	Status    string `json:"status"`
-	Detail    string `json:"detail,omitempty"`
-	OK        bool   `json:"ok"`
-}
-
-// Ingest maps the payload per the webhook's spec and writes it into MemPalace
-// under the webhook's LOCKED wing. The wing comes only from wh.Wing; the
-// request body/headers are never consulted for it. Every outcome is recorded in
-// the ledger and audited.
-func (s *Service) Ingest(ctx context.Context, wh *Webhook, in IngestRequest) (*Result, error) {
-	source := strings.TrimSpace(in.Source)
-	if source == "" {
-		source = wh.Source
-	}
-	res := &Result{RequestID: in.RequestID, Wing: wh.Wing, Bytes: in.PayloadSize}
-
-	entry, topic, err := buildEntry(wh.Spec, in.Payload, entryMeta{
-		WebhookName: wh.Name,
-		RequestID:   in.RequestID,
-		Source:      source,
-		Bytes:       in.PayloadSize,
-	})
-	if err != nil {
-		res.Status = statusRejected
-		res.Detail = err.Error()
-		s.recordIngestion(ctx, wh, in.RequestID, source, in.PayloadSize, statusRejected, err.Error(), false)
-		s.bumpCounters(ctx, wh.ID, false)
-		s.audit2(ctx, "memory_webhook.ingest_failed", wh.Name, "rejected req="+in.RequestID)
-		return res, err
-	}
-
-	if s.mem == nil || !s.mem.Available() {
-		res.Status = statusFailed
-		res.Detail = "mempalace unavailable"
-		s.recordIngestion(ctx, wh, in.RequestID, source, in.PayloadSize, statusFailed, res.Detail, false)
-		s.bumpCounters(ctx, wh.ID, false)
-		s.audit2(ctx, "memory_webhook.ingest_failed", wh.Name, "mempalace_unavailable req="+in.RequestID)
-		return res, ErrMemUnavailable
-	}
-
-	ir, err := s.mem.IngestTagged(ctx, entry, topic, wh.Wing, safeAgentName("webhook", wh.Name))
-	if err != nil {
-		res.Status = statusFailed
-		res.Detail = err.Error()
-		s.recordIngestion(ctx, wh, in.RequestID, source, in.PayloadSize, statusFailed, err.Error(), false)
-		s.bumpCounters(ctx, wh.ID, false)
-		s.audit2(ctx, "memory_webhook.ingest_failed", wh.Name, "req="+in.RequestID)
-		if errors.Is(err, mempalace.ErrDisabled) || errors.Is(err, mempalace.ErrNotReady) {
-			return res, ErrMemUnavailable
-		}
-		return res, err
-	}
-
-	ok := ir != nil && ir.OK
-	if ir != nil {
-		res.Detail = ir.Detail
-	}
-	if !ok {
-		res.Status = statusFailed
-		s.recordIngestion(ctx, wh, in.RequestID, source, in.PayloadSize, statusFailed, res.Detail, false)
-		s.bumpCounters(ctx, wh.ID, false)
-		s.audit2(ctx, "memory_webhook.ingest_failed", wh.Name, "upstream_error req="+in.RequestID)
-		return res, ErrUpstreamRejected
-	}
-
-	res.Status = statusOK
-	res.OK = true
-	s.recordIngestion(ctx, wh, in.RequestID, source, in.PayloadSize, statusOK, res.Detail, true)
-	s.bumpCounters(ctx, wh.ID, true)
-	s.audit2(ctx, "memory_webhook.ingest_ok", wh.Name,
-		fmt.Sprintf("wing=%s req=%s bytes=%d", wh.Wing, in.RequestID, in.PayloadSize))
-	return res, nil
-}
+// The ingest path is asynchronous (TEC-482): Enqueue (in jobs.go) validates and
+// maps the payload, persists a queued job, and returns immediately; the
+// background worker performs the MemPalace write and records the terminal
+// ledger outcome. See jobs.go.
 
 // RecordTooLarge logs an oversized-payload rejection against a verified webhook.
 // Called by the HTTP handler when the body exceeds the configured limit.
@@ -395,13 +337,20 @@ func (s *Service) AuditAuthFailure(ctx context.Context, detail string) {
 }
 
 func (s *Service) recordIngestion(ctx context.Context, wh *Webhook, requestID, source string, size int64, status, detail string, mempalaceOK bool) {
+	s.recordIngestionRow(ctx, requestID, wh.ID, wh.Name, wh.Wing, source, size, status, detail, mempalaceOK)
+}
+
+// recordIngestionRow writes one terminal audit row to the ledger from
+// denormalized fields. The background job worker uses it (it carries a job row,
+// not a *Webhook); recordIngestion is the *Webhook convenience wrapper.
+func (s *Service) recordIngestionRow(ctx context.Context, id, webhookID, webhookName, wing, source string, size int64, status, detail string, mempalaceOK bool) {
 	if s.db == nil {
 		return
 	}
 	_, _ = s.db.ExecContext(ctx,
 		`INSERT INTO memory_webhook_ingestions(id, webhook_id, webhook_name, wing, source, received_at, payload_size, status, detail, mempalace_ok)
 		 VALUES(?,?,?,?,?,?,?,?,?,?)`,
-		requestID, wh.ID, wh.Name, wh.Wing, nullStr(source), time.Now().UnixMilli(), size, status, nullStr(truncate(detail, maxDetail)), boolToInt(mempalaceOK))
+		id, webhookID, webhookName, wing, nullStr(source), time.Now().UnixMilli(), size, status, nullStr(truncate(detail, maxDetail)), boolToInt(mempalaceOK))
 }
 
 func (s *Service) bumpCounters(ctx context.Context, id string, ok bool) {

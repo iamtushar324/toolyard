@@ -164,6 +164,71 @@ func buildEntry(spec *PayloadSpec, raw json.RawMessage, meta entryMeta) (entry, 
 	return entry, topic, nil
 }
 
+// splitEntry breaks a mapped entry into chunks no larger than maxBytes so the
+// background worker can write a big transcript to MemPalace as several smaller
+// diary_write calls instead of one slow embed (TEC-482). Splits happen on line
+// boundaries; a single line longer than the cap is hard-split on rune
+// boundaries so the cap is always respected and UTF-8 is never broken. An entry
+// at or under the cap (or maxBytes<=0) returns a single chunk, preserving the
+// exact single-write behavior for the common small payload.
+func splitEntry(entry string, maxBytes int) []string {
+	if maxBytes <= 0 || len(entry) <= maxBytes {
+		return []string{entry}
+	}
+	var chunks []string
+	var b strings.Builder
+	flush := func() {
+		if b.Len() > 0 {
+			chunks = append(chunks, strings.TrimRight(b.String(), "\n"))
+			b.Reset()
+		}
+	}
+	for _, ln := range strings.SplitAfter(entry, "\n") {
+		if ln == "" {
+			continue
+		}
+		if len(ln) > maxBytes {
+			flush()
+			for _, piece := range hardSplit(ln, maxBytes) {
+				chunks = append(chunks, strings.TrimRight(piece, "\n"))
+			}
+			continue
+		}
+		if b.Len()+len(ln) > maxBytes {
+			flush()
+		}
+		b.WriteString(ln)
+	}
+	flush()
+	if len(chunks) == 0 {
+		return []string{entry}
+	}
+	return chunks
+}
+
+// hardSplit splits s into pieces no larger than maxBytes on rune boundaries.
+func hardSplit(s string, maxBytes int) []string {
+	var out []string
+	var b strings.Builder
+	for _, r := range s {
+		if b.Len() > 0 && b.Len()+len(string(r)) > maxBytes {
+			out = append(out, b.String())
+			b.Reset()
+		}
+		b.WriteRune(r)
+	}
+	if b.Len() > 0 {
+		out = append(out, b.String())
+	}
+	return out
+}
+
+// chunkMarker is the provenance line prepended to chunks after the first (the
+// first chunk already carries the buildEntry metadata header).
+func chunkMarker(name, reqID string, i, n int) string {
+	return fmt.Sprintf("[via webhook %s · req %s · chunk %d/%d]", name, reqID, i, n)
+}
+
 func metadataHeader(m entryMeta) string {
 	src := m.Source
 	if src == "" {

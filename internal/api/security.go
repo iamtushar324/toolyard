@@ -409,6 +409,11 @@ func unauthRouteLimit(path string) *unauthRouteRule {
 		// Memory-webhook ingest (n8n). Same generous per-IP budget; a bad
 		// token still fails auth, this just caps spray on the unauth surface.
 		return &unauthRouteRule{"mem-ingest", 1200, time.Hour}
+	case strings.HasPrefix(path, MemoryWebhookJobsPrefix):
+		// Async job-status polling (TEC-482). Higher budget than ingest so
+		// once-per-second polling of an in-flight job is comfortable, while
+		// still capping spray on this bearer-authenticated DB-backed lookup.
+		return &unauthRouteRule{"mem-job", 6000, time.Hour}
 	}
 	return nil
 }
