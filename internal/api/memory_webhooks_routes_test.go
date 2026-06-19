@@ -4,11 +4,14 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/tusharbhardwaj/toolyard/internal/audit"
 	"github.com/tusharbhardwaj/toolyard/internal/identity"
@@ -17,28 +20,48 @@ import (
 	"github.com/tusharbhardwaj/toolyard/internal/store"
 )
 
-// stubMemIngester satisfies memwebhook.MemIngester without a live MemPalace.
+// stubMemIngester satisfies memwebhook.MemIngester without a live MemPalace. It
+// is read by the background job worker (a goroutine) and by the test, so its
+// mutable state is guarded by a mutex.
 type stubMemIngester struct {
-	available bool
+	mu        sync.Mutex
+	available bool // set once at construction; not mutated after the worker starts
+	failErr   error
+	reject    bool
+	calls     int
 	lastWing  string
 	lastEntry string
 	lastAgent string
-	calls     int
 }
 
 func (s *stubMemIngester) Available() bool { return s.available }
 
 func (s *stubMemIngester) IngestTagged(_ context.Context, entry, topic, wing, agent string) (*mempalace.IngestResult, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
 	s.calls++
 	s.lastWing = wing
 	s.lastEntry = entry
 	s.lastAgent = agent
+	if s.failErr != nil {
+		return nil, s.failErr
+	}
+	if s.reject {
+		return &mempalace.IngestResult{OK: false, Detail: "upstream rejected"}, nil
+	}
 	return &mempalace.IngestResult{OK: true, Detail: "stored"}, nil
 }
 
+func (s *stubMemIngester) setFailErr(err error) { s.mu.Lock(); s.failErr = err; s.mu.Unlock() }
+func (s *stubMemIngester) Calls() int           { s.mu.Lock(); defer s.mu.Unlock(); return s.calls }
+func (s *stubMemIngester) LastWing() string     { s.mu.Lock(); defer s.mu.Unlock(); return s.lastWing }
+func (s *stubMemIngester) LastEntry() string    { s.mu.Lock(); defer s.mu.Unlock(); return s.lastEntry }
+func (s *stubMemIngester) LastAgent() string    { s.mu.Lock(); defer s.mu.Unlock(); return s.lastAgent }
+
 // newMemWebhookAPITestServer composes the api.Server with the production-like
-// body-cap middleware chain (so the 413 path is exercised), logs a user in, and
-// returns the handler + session cookie + ingester stub + webhook service.
+// body-cap middleware chain (so the 413 path is exercised), starts the async
+// ingest worker, logs a user in, and returns the handler + session cookie +
+// ingester stub + audit logger.
 func newMemWebhookAPITestServer(t *testing.T, webhookMax int64) (http.Handler, *http.Cookie, *stubMemIngester, *audit.Logger) {
 	t.Helper()
 	db, err := store.Open(filepath.Join(t.TempDir(), "mw-api.db"))
@@ -54,6 +77,11 @@ func newMemWebhookAPITestServer(t *testing.T, webhookMax int64) (http.Handler, *
 	auditLog := audit.New(db)
 	ing := &stubMemIngester{available: true}
 	mwSvc := memwebhook.New(db, ing, auditLog)
+
+	// Run the async ingest worker for the lifetime of the test.
+	workerCtx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	go func() { _ = mwSvc.RunWorker(workerCtx) }()
 
 	srv := New(context.Background(), Options{
 		Identity:        id,
@@ -115,7 +143,64 @@ func mwIngest(t *testing.T, h http.Handler, token, body string) *httptest.Respon
 	return rec
 }
 
-// createWebhook POSTs a webhook and returns its plaintext token.
+// mwIngestAsync POSTs and asserts the 202 envelope, returning the job id.
+func mwIngestAsync(t *testing.T, h http.Handler, token, body string) string {
+	t.Helper()
+	rec := mwIngest(t, h, token, body)
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("ingest: status %d, want 202; body %s", rec.Code, truncateForLog(rec.Body.String()))
+	}
+	var res map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &res); err != nil {
+		t.Fatalf("decode 202: %v", err)
+	}
+	if res["status"] != "queued" {
+		t.Fatalf("202 status = %v, want queued", res["status"])
+	}
+	id, _ := res["job_id"].(string)
+	if !strings.HasPrefix(id, "req_") {
+		t.Fatalf("missing job_id in 202: %v", res)
+	}
+	if su, _ := res["status_url"].(string); su != MemoryWebhookJobsPrefix+id {
+		t.Fatalf("status_url = %q, want %q", su, MemoryWebhookJobsPrefix+id)
+	}
+	return id
+}
+
+// mwGetJob fetches a job's status with a bearer token.
+func mwGetJob(t *testing.T, h http.Handler, token, jobID string) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodGet, MemoryWebhookJobsPrefix+jobID, nil)
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, req)
+	return rec
+}
+
+// mwWaitJob polls the status endpoint until the job reaches want, then returns it.
+func mwWaitJob(t *testing.T, h http.Handler, token, jobID, want string) map[string]any {
+	t.Helper()
+	deadline := time.Now().Add(3 * time.Second)
+	var last map[string]any
+	for time.Now().Before(deadline) {
+		rec := mwGetJob(t, h, token, jobID)
+		if rec.Code == http.StatusOK {
+			var j map[string]any
+			_ = json.Unmarshal(rec.Body.Bytes(), &j)
+			last = j
+			if j["status"] == want {
+				return j
+			}
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("job %s did not reach status %q in time (last=%v)", jobID, want, last)
+	return nil
+}
+
+// createWebhook POSTs a webhook and returns its id + plaintext token.
 func createWebhook(t *testing.T, h http.Handler, cookie *http.Cookie, body string) (id, token string) {
 	t.Helper()
 	rec := mwAuthed(t, h, cookie, http.MethodPost, "/v1/memory/webhooks", body)
@@ -139,29 +224,23 @@ func TestMemWebhookIngestHappyPath(t *testing.T) {
 	h, cookie, ing, _ := newMemWebhookAPITestServer(t, 1<<20)
 	_, token := createWebhook(t, h, cookie, `{"name":"meetings","wing":"meetings","payload_spec":{"mode":"field","entry_field":"transcript"}}`)
 
-	rec := mwIngest(t, h, token, `{"transcript":"we shipped TEC-481"}`)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("ingest: status %d body %s", rec.Code, rec.Body.String())
+	// Async: 202 quickly, then poll to success.
+	jobID := mwIngestAsync(t, h, token, `{"transcript":"we shipped TEC-482"}`)
+	job := mwWaitJob(t, h, token, jobID, "succeeded")
+	if job["wing"] != "meetings" || job["mempalace_ok"] != true {
+		t.Fatalf("unexpected job: %v", job)
 	}
-	var res map[string]any
-	_ = json.Unmarshal(rec.Body.Bytes(), &res)
-	if res["ok"] != true || res["wing"] != "meetings" {
-		t.Fatalf("unexpected result: %v", res)
+	if ing.Calls() != 1 || ing.LastWing() != "meetings" {
+		t.Fatalf("ingester calls=%d wing=%q", ing.Calls(), ing.LastWing())
 	}
-	if res["request_id"] == nil || !strings.HasPrefix(res["request_id"].(string), "req_") {
-		t.Fatalf("missing request_id: %v", res)
-	}
-	if ing.calls != 1 || ing.lastWing != "meetings" {
-		t.Fatalf("ingester calls=%d wing=%q", ing.calls, ing.lastWing)
-	}
-	if ing.lastEntry != strings.TrimSpace(ing.lastEntry) || !strings.Contains(ing.lastEntry, "we shipped TEC-481") {
-		t.Fatalf("entry not mapped: %q", ing.lastEntry)
+	if got := ing.LastEntry(); got != strings.TrimSpace(got) || !strings.Contains(got, "we shipped TEC-482") {
+		t.Fatalf("entry not mapped: %q", got)
 	}
 }
 
 func TestMemWebhookIngestBearerNoCookieNoCSRF(t *testing.T) {
 	// The ingest path must work with only a bearer token: no session cookie,
-	// no X-Requested-With (it is CSRF-exempt).
+	// no X-Requested-With (it is CSRF-exempt). It now returns 202.
 	h, cookie, _, _ := newMemWebhookAPITestServer(t, 1<<20)
 	_, token := createWebhook(t, h, cookie, `{"name":"w","wing":"meetings"}`)
 
@@ -170,7 +249,7 @@ func TestMemWebhookIngestBearerNoCookieNoCSRF(t *testing.T) {
 	req.Header.Set("Content-Type", "application/json")
 	rec := httptest.NewRecorder()
 	h.ServeHTTP(rec, req)
-	if rec.Code != http.StatusOK {
+	if rec.Code != http.StatusAccepted {
 		t.Fatalf("bearer-only ingest: status %d body %s", rec.Code, rec.Body.String())
 	}
 }
@@ -187,8 +266,8 @@ func TestMemWebhookBadAuthRejected(t *testing.T) {
 	if rec := mwIngest(t, h, "mwh_bogus.nope", `{"x":1}`); rec.Code != http.StatusUnauthorized {
 		t.Fatalf("bogus token: status %d", rec.Code)
 	}
-	if ing.calls != 0 {
-		t.Fatalf("auth failures must not reach mempalace, got %d calls", ing.calls)
+	if ing.Calls() != 0 {
+		t.Fatalf("auth failures must not reach mempalace, got %d calls", ing.Calls())
 	}
 
 	// Both auth failures must be audited.
@@ -205,12 +284,10 @@ func TestMemWebhookWingCannotBeOverridden(t *testing.T) {
 	h, cookie, ing, _ := newMemWebhookAPITestServer(t, 1<<20)
 	_, token := createWebhook(t, h, cookie, `{"name":"locked","wing":"meetings"}`)
 
-	rec := mwIngest(t, h, token, `{"wing":"attacker-wing","closet":"x","transcript":"sneaky"}`)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("ingest: status %d body %s", rec.Code, rec.Body.String())
-	}
-	if ing.lastWing != "meetings" {
-		t.Fatalf("wing override succeeded: upstream wing = %q, want meetings", ing.lastWing)
+	jobID := mwIngestAsync(t, h, token, `{"wing":"attacker-wing","closet":"x","transcript":"sneaky"}`)
+	mwWaitJob(t, h, token, jobID, "succeeded")
+	if ing.LastWing() != "meetings" {
+		t.Fatalf("wing override succeeded: upstream wing = %q, want meetings", ing.LastWing())
 	}
 }
 
@@ -218,11 +295,9 @@ func TestMemWebhookUsesMemPalaceSafeAgentName(t *testing.T) {
 	h, cookie, ing, _ := newMemWebhookAPITestServer(t, 1<<20)
 	_, token := createWebhook(t, h, cookie, `{"name":"from n8n Google Meeting Transcript To Linear Ticket","wing":"meetings"}`)
 
-	rec := mwIngest(t, h, token, `{"transcript":"safe agent name regression"}`)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("ingest: status %d body %s", rec.Code, rec.Body.String())
-	}
-	if got, want := ing.lastAgent, "webhook_from_n8n_Google_Meeting_Transcript_To_Linear_Ticket"; got != want {
+	jobID := mwIngestAsync(t, h, token, `{"transcript":"safe agent name regression"}`)
+	mwWaitJob(t, h, token, jobID, "succeeded")
+	if got, want := ing.LastAgent(), "webhook_from_n8n_Google_Meeting_Transcript_To_Linear_Ticket"; got != want {
 		t.Fatalf("agent name = %q, want %q", got, want)
 	}
 }
@@ -234,34 +309,131 @@ func TestMemWebhookOversizedPayload413(t *testing.T) {
 	h, cookie, ing, _ := newMemWebhookAPITestServer(t, cap)
 	_, token := createWebhook(t, h, cookie, `{"name":"big","wing":"meetings","payload_spec":{"mode":"field","entry_field":"transcript"}}`)
 
-	// 1.5 MiB payload (> 1 MiB) must succeed under the 2 MiB cap.
+	// 1.5 MiB payload (> 1 MiB) must be accepted (202) under the 2 MiB cap. The
+	// worker chunks it, so it reaches MemPalace as one or more writes.
 	big := `{"transcript":"` + strings.Repeat("x", 1500*1024) + `"}`
-	if rec := mwIngest(t, h, token, big); rec.Code != http.StatusOK {
-		t.Fatalf("1.5MiB payload: status %d (want 200) body %s", rec.Code, truncateForLog(rec.Body.String()))
-	}
-	if ing.calls != 1 {
-		t.Fatalf("expected the large payload to be ingested, calls=%d", ing.calls)
+	jobID := mwIngestAsync(t, h, token, big)
+	mwWaitJob(t, h, token, jobID, "succeeded")
+	afterFirst := ing.Calls()
+	if afterFirst < 1 {
+		t.Fatalf("expected the large payload to be ingested, calls=%d", afterFirst)
 	}
 
-	// 2.5 MiB payload (> 2 MiB cap) must be rejected with 413.
+	// 2.5 MiB payload (> 2 MiB cap) must be rejected with 413, synchronously,
+	// before any job is queued.
 	tooBig := `{"transcript":"` + strings.Repeat("y", 2500*1024) + `"}`
 	rec := mwIngest(t, h, token, tooBig)
 	if rec.Code != http.StatusRequestEntityTooLarge {
 		t.Fatalf("oversized payload: status %d, want 413; body %s", rec.Code, truncateForLog(rec.Body.String()))
 	}
-	if ing.calls != 1 {
-		t.Fatalf("oversized payload must not reach mempalace, calls=%d", ing.calls)
+	if ing.Calls() != afterFirst {
+		t.Fatalf("oversized payload must not reach mempalace, calls=%d (was %d)", ing.Calls(), afterFirst)
+	}
+}
+
+func TestMemWebhookLargePayloadChunkedAsync(t *testing.T) {
+	const cap = 2 << 20
+	h, cookie, ing, _ := newMemWebhookAPITestServer(t, cap)
+	_, token := createWebhook(t, h, cookie, `{"name":"chunky","wing":"meetings","payload_spec":{"mode":"field","entry_field":"transcript"}}`)
+
+	// A large, multi-line transcript so the worker splits it into chunks.
+	transcript := strings.Repeat("meeting transcript line with several words here\n", 40000)
+	body, _ := json.Marshal(map[string]string{"transcript": transcript})
+
+	jobID := mwIngestAsync(t, h, token, string(body))
+	job := mwWaitJob(t, h, token, jobID, "succeeded")
+
+	cc, _ := job["chunk_count"].(float64)
+	if cc < 2 {
+		t.Fatalf("large payload should be chunked, chunk_count=%v", job["chunk_count"])
+	}
+	if ing.Calls() < 2 {
+		t.Fatalf("expected multiple chunk writes, got %d", ing.Calls())
+	}
+	if ing.LastWing() != "meetings" {
+		t.Fatalf("chunks must stay in the locked wing, got %q", ing.LastWing())
+	}
+}
+
+func TestMemWebhookJobMemPalaceFailure(t *testing.T) {
+	h, cookie, ing, _ := newMemWebhookAPITestServer(t, 1<<20)
+	ing.setFailErr(errors.New("embed exploded"))
+	_, token := createWebhook(t, h, cookie, `{"name":"f","wing":"meetings","payload_spec":{"mode":"field","entry_field":"transcript"}}`)
+
+	jobID := mwIngestAsync(t, h, token, `{"transcript":"will fail downstream"}`)
+	job := mwWaitJob(t, h, token, jobID, "failed")
+	if job["mempalace_ok"] != false {
+		t.Fatalf("mempalace_ok should be false: %v", job)
+	}
+	if e, _ := job["error"].(string); e == "" {
+		t.Fatalf("failed job must carry an error reason: %v", job)
+	}
+}
+
+func TestMemWebhookJobScopedToWebhook(t *testing.T) {
+	h, cookie, _, _ := newMemWebhookAPITestServer(t, 1<<20)
+	_, tokenA := createWebhook(t, h, cookie, `{"name":"a","wing":"wa"}`)
+	_, tokenB := createWebhook(t, h, cookie, `{"name":"b","wing":"wb"}`)
+
+	jobID := mwIngestAsync(t, h, tokenA, `{"x":1}`)
+	mwWaitJob(t, h, tokenA, jobID, "succeeded")
+
+	// Webhook B's token must not read webhook A's job — 404, no existence leak.
+	if rec := mwGetJob(t, h, tokenB, jobID); rec.Code != http.StatusNotFound {
+		t.Fatalf("cross-webhook job read: status %d, want 404", rec.Code)
+	}
+	// Missing / bogus token → 401.
+	if rec := mwGetJob(t, h, "", jobID); rec.Code != http.StatusUnauthorized {
+		t.Fatalf("no token: status %d, want 401", rec.Code)
+	}
+	if rec := mwGetJob(t, h, "mwh_bogus.nope", jobID); rec.Code != http.StatusUnauthorized {
+		t.Fatalf("bad token: status %d, want 401", rec.Code)
+	}
+	// Unknown job id for a valid webhook → 404.
+	if rec := mwGetJob(t, h, tokenA, "req_does-not-exist"); rec.Code != http.StatusNotFound {
+		t.Fatalf("unknown job: status %d, want 404", rec.Code)
+	}
+}
+
+func TestMemWebhookJobStatusNeverLeaksToken(t *testing.T) {
+	h, cookie, _, _ := newMemWebhookAPITestServer(t, 1<<20)
+	_, token := createWebhook(t, h, cookie, `{"name":"leak","wing":"meetings","payload_spec":{"mode":"field","entry_field":"transcript"}}`)
+
+	// The 202 envelope must not contain the token.
+	rec := mwIngest(t, h, token, `{"transcript":"secret words"}`)
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("ingest: status %d, want 202", rec.Code)
+	}
+	if strings.Contains(rec.Body.String(), token) {
+		t.Fatalf("202 envelope leaked the token: %s", rec.Body.String())
+	}
+	var env map[string]any
+	_ = json.Unmarshal(rec.Body.Bytes(), &env)
+	jobID := env["job_id"].(string)
+
+	// Neither must the status body — nor the mapped entry text.
+	job := mwWaitJob(t, h, token, jobID, "succeeded")
+	b, _ := json.Marshal(job)
+	if strings.Contains(string(b), token) {
+		t.Fatalf("job status leaked the token: %s", b)
+	}
+	if strings.Contains(string(b), "secret words") || strings.Contains(string(b), "\"entry\"") {
+		t.Fatalf("job status leaked the entry text: %s", b)
 	}
 }
 
 func TestMemWebhookSchemaViolation422(t *testing.T) {
-	h, cookie, _, _ := newMemWebhookAPITestServer(t, 1<<20)
+	h, cookie, ing, _ := newMemWebhookAPITestServer(t, 1<<20)
 	_, token := createWebhook(t, h, cookie,
 		`{"name":"req","wing":"w","payload_spec":{"mode":"whole","required_fields":["transcript"]}}`)
 
+	// Schema violations are rejected synchronously (422), before any job queues.
 	rec := mwIngest(t, h, token, `{"title":"no transcript"}`)
 	if rec.Code != http.StatusUnprocessableEntity {
 		t.Fatalf("schema violation: status %d, want 422; body %s", rec.Code, rec.Body.String())
+	}
+	if ing.Calls() != 0 {
+		t.Fatalf("rejected payload must not reach mempalace, calls=%d", ing.Calls())
 	}
 }
 
@@ -307,7 +479,8 @@ func TestMemWebhookListAndDeleteNeverLeakToken(t *testing.T) {
 func TestMemWebhookMetricsShape(t *testing.T) {
 	h, cookie, _, _ := newMemWebhookAPITestServer(t, 1<<20)
 	_, token := createWebhook(t, h, cookie, `{"name":"m","wing":"meetings"}`)
-	mwIngest(t, h, token, `{"x":1}`)
+	jobID := mwIngestAsync(t, h, token, `{"x":1}`)
+	mwWaitJob(t, h, token, jobID, "succeeded")
 
 	rec := mwAuthed(t, h, cookie, http.MethodGet, "/v1/memory/metrics", "")
 	if rec.Code != http.StatusOK {
@@ -326,8 +499,9 @@ func TestMemWebhookMetricsShape(t *testing.T) {
 	if resp.Ledger.WebhookCount != 1 {
 		t.Fatalf("expected webhook_count 1, got %d", resp.Ledger.WebhookCount)
 	}
-	if resp.Ledger.Totals["total"] == nil {
-		t.Fatalf("metrics missing totals: %s", rec.Body.String())
+	// The completed job wrote a terminal ledger row.
+	if tot, _ := resp.Ledger.Totals["total"].(float64); tot != 1 {
+		t.Fatalf("metrics total = %v, want 1: %s", resp.Ledger.Totals["total"], rec.Body.String())
 	}
 }
 

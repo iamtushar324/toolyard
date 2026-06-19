@@ -581,6 +581,10 @@ func runServe(argv []string) error {
 	// memwebhook.MemIngester directly; even when MemPalace is disabled the
 	// service still manages webhooks (ingestion then returns 503).
 	memWebhookSvc := memwebhook.New(db, mpSvc, auditSvc)
+	// TEC-482: ingest is asynchronous — this worker drains queued jobs and
+	// performs the slow MemPalace embed/index/store off the HTTP request path.
+	// It exits on ctx cancellation; in-flight jobs resume on next boot.
+	goroutines.Supervise(ctx, "memwebhook-jobs", time.Minute, memWebhookSvc.RunWorker)
 
 	// Notes workspace: a markdown scratchpad agents read/write through the
 	// official @modelcontextprotocol/server-filesystem MCP. The upstream is

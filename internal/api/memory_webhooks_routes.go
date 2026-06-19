@@ -23,8 +23,16 @@ const DefaultWebhookMaxBytes int64 = 25 << 20 // 25 MiB
 // and by cmd/gateway when widening the universal body ceiling.
 const MemoryWebhookIngestPath = "/v1/memory/webhooks/ingest"
 
+// MemoryWebhookJobsPrefix is the bearer-authenticated job-status subtree:
+// GET /v1/memory/webhooks/ingest/jobs/{job_id}. It is registered as a longer
+// (more specific) prefix than the session-auth /v1/memory/webhooks/ subtree, so
+// http.ServeMux routes job-status requests here and never to the management
+// handler.
+const MemoryWebhookJobsPrefix = "/v1/memory/webhooks/ingest/jobs/"
+
 func (s *Server) memoryWebhookRoutes(mux *http.ServeMux) {
 	mux.HandleFunc(MemoryWebhookIngestPath, s.memoryWebhookIngest)
+	mux.HandleFunc(MemoryWebhookJobsPrefix, s.memoryWebhookIngestJob)
 	mux.HandleFunc("/v1/memory/webhooks/wings", s.memoryWebhookWings)
 	mux.HandleFunc("/v1/memory/webhooks", s.memoryWebhooksCollection)
 	mux.HandleFunc("/v1/memory/webhooks/", s.memoryWebhooksItem)
@@ -37,6 +45,12 @@ func (s *Server) memoryWebhookRoutes(mux *http.ServeMux) {
 // the wing is the webhook's bound wing (never from the request). The body cap
 // is webhookMaxBytes, applied by the security middleware; exceeding it surfaces
 // as a clean 413.
+//
+// TEC-482: ingest is asynchronous. The request is validated and mapped
+// synchronously (so bad payloads still get a fast 401/413/422), then a job is
+// queued and the handler returns 202 with a job id; callers poll the status
+// endpoint (memoryWebhookIngestJob) for the eventual MemPalace result. The slow
+// embed/index/store never holds the HTTP request open.
 func (s *Server) memoryWebhookIngest(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeError(w, http.StatusMethodNotAllowed, "POST only")
@@ -79,24 +93,78 @@ func (s *Server) memoryWebhookIngest(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	res, err := s.memWebhooks.Ingest(r.Context(), wh, memwebhook.IngestRequest{
+	job, err := s.memWebhooks.Enqueue(r.Context(), wh, memwebhook.IngestRequest{
 		RequestID:   requestID,
 		Payload:     json.RawMessage(body),
 		PayloadSize: int64(len(body)),
 		Source:      source,
 	})
 	if err != nil {
-		status := http.StatusBadGateway
 		switch {
 		case errors.Is(err, memwebhook.ErrSchemaViolation):
-			status = http.StatusUnprocessableEntity
+			writeJSON(w, http.StatusUnprocessableEntity, map[string]any{
+				"error": err.Error(), "request_id": requestID, "status": "rejected",
+			})
 		case errors.Is(err, memwebhook.ErrMemUnavailable):
-			status = http.StatusServiceUnavailable
+			writeJSON(w, http.StatusServiceUnavailable, map[string]any{
+				"error": "mempalace unavailable", "request_id": requestID, "status": "unavailable",
+			})
+		default:
+			writeError(w, http.StatusInternalServerError, "failed to queue ingest job")
 		}
-		writeJSON(w, status, res)
 		return
 	}
-	writeJSON(w, http.StatusOK, res)
+	// 202 Accepted: the job is queued; the caller polls status_url for the
+	// eventual MemPalace result. job_id == request_id (== the ledger row id).
+	writeJSON(w, http.StatusAccepted, map[string]any{
+		"job_id":     job.ID,
+		"status":     job.Status,
+		"wing":       job.Wing,
+		"bytes":      job.PayloadSize,
+		"status_url": MemoryWebhookJobsPrefix + job.ID,
+	})
+}
+
+// memoryWebhookIngestJob is the bearer-authenticated job-status endpoint:
+// GET /v1/memory/webhooks/ingest/jobs/{job_id}. It authenticates with the same
+// webhook token as ingest and only returns jobs that belong to that webhook —
+// a job for another webhook (or a missing one) is a 404, so callers can neither
+// read across webhooks nor probe for job existence. No token material is ever
+// echoed, and the Job view carries no payload text.
+func (s *Server) memoryWebhookIngestJob(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "GET only")
+		return
+	}
+	if s.memWebhooks == nil {
+		writeError(w, http.StatusServiceUnavailable, "memory webhooks are disabled")
+		return
+	}
+	token := strings.TrimSpace(strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer "))
+	if token == "" {
+		s.memWebhooks.AuditAuthFailure(r.Context(), "missing bearer token from "+s.security.ClientIP(r))
+		writeError(w, http.StatusUnauthorized, "webhook token required")
+		return
+	}
+	wh, err := s.memWebhooks.VerifyToken(r.Context(), token)
+	if err != nil {
+		s.memWebhooks.AuditAuthFailure(r.Context(), "rejected token from "+s.security.ClientIP(r))
+		writeError(w, http.StatusUnauthorized, "invalid webhook token")
+		return
+	}
+
+	jobID := strings.TrimPrefix(r.URL.Path, MemoryWebhookJobsPrefix)
+	if jobID == "" || strings.Contains(jobID, "/") {
+		http.NotFound(w, r)
+		return
+	}
+	job, err := s.memWebhooks.GetJob(r.Context(), jobID)
+	if err != nil || job.WebhookID != wh.ID {
+		// 404 for both not-found and cross-webhook access: no existence leak.
+		writeError(w, http.StatusNotFound, "job not found")
+		return
+	}
+	writeJSON(w, http.StatusOK, job)
 }
 
 // ---- session-auth management ------------------------------------------------
@@ -302,9 +370,13 @@ func memWebhookCurl(publicURL, token string) string {
 		"title":      "Weekly sync",
 		"transcript": "…meeting transcript text…",
 	})
+	// Ingest is async: this POST returns 202 with {job_id, status_url}; poll
+	// status_url (GET, same Bearer token) until status is succeeded/failed.
 	return "curl -X POST " + base + MemoryWebhookIngestPath +
 		" -H 'Authorization: Bearer " + token + "'" +
 		" -H 'Content-Type: application/json'" +
 		" -H 'X-Toolyard-Source: n8n-meeting-job'" +
-		" -d '" + string(body) + "'"
+		" -d '" + string(body) + "'" +
+		"   # -> 202 {\"job_id\":\"req_…\",\"status\":\"queued\",\"status_url\":\"" + MemoryWebhookJobsPrefix + "req_…\"}" +
+		"; then: curl " + base + MemoryWebhookJobsPrefix + "req_… -H 'Authorization: Bearer " + token + "'"
 }

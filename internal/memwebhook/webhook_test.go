@@ -62,13 +62,41 @@ func mustCreate(t *testing.T, s *Service, in CreateInput) (*Webhook, string) {
 	return wh, token
 }
 
-func ingest(t *testing.T, s *Service, wh *Webhook, reqID, body string) (*Result, error) {
+// ingest enqueues a payload and, when it is accepted, drains the worker so the
+// job reaches a terminal state — collapsing the async path into a synchronous
+// helper for tests. It returns the terminal job (nil when Enqueue rejected the
+// payload outright) and the Enqueue error.
+func ingest(t *testing.T, s *Service, wh *Webhook, reqID, body string) (*Job, error) {
 	t.Helper()
-	return s.Ingest(context.Background(), wh, IngestRequest{
+	job, err := s.Enqueue(context.Background(), wh, IngestRequest{
 		RequestID:   reqID,
 		Payload:     json.RawMessage(body),
 		PayloadSize: int64(len(body)),
 	})
+	if err != nil {
+		return nil, err
+	}
+	drainJobs(t, s)
+	final, gerr := s.GetJob(context.Background(), job.ID)
+	if gerr != nil {
+		t.Fatalf("get job %s: %v", job.ID, gerr)
+	}
+	return final, nil
+}
+
+// drainJobs runs the worker's claim+process step until no job is immediately
+// claimable (a job requeued with a future backoff is intentionally left).
+func drainJobs(t *testing.T, s *Service) {
+	t.Helper()
+	for {
+		processed, err := s.processOnce(context.Background())
+		if err != nil {
+			t.Fatalf("processOnce: %v", err)
+		}
+		if !processed {
+			return
+		}
+	}
 }
 
 func TestCreateAndTokenLifecycle(t *testing.T) {
@@ -144,12 +172,12 @@ func TestWingIsLockedAtIngest(t *testing.T) {
 	wh, _ := mustCreate(t, s, CreateInput{Name: "lock", Wing: "meetings"})
 
 	// Payload tries to override the wing — must be ignored.
-	res, err := ingest(t, s, wh, "req_1", `{"wing":"attacker","closet":"secret","transcript":"hi"}`)
+	job, err := ingest(t, s, wh, "req_1", `{"wing":"attacker","closet":"secret","transcript":"hi"}`)
 	if err != nil {
 		t.Fatalf("ingest: %v", err)
 	}
-	if !res.OK || res.Wing != "meetings" {
-		t.Fatalf("result wing should be the bound wing, got %+v", res)
+	if job.Status != jobSucceeded || job.Wing != "meetings" {
+		t.Fatalf("job wing should be the bound wing, got %+v", job)
 	}
 	if len(ing.calls) != 1 {
 		t.Fatalf("expected 1 upstream call, got %d", len(ing.calls))
@@ -226,15 +254,20 @@ func TestRequiredFieldsRejected(t *testing.T) {
 	wh, _ := mustCreate(t, s, CreateInput{Name: "req", Wing: "w",
 		Spec: &PayloadSpec{Mode: ModeWhole, RequiredFields: []string{"transcript"}}})
 
-	res, err := ingest(t, s, wh, "r1", `{"title":"no transcript here"}`)
+	job, err := ingest(t, s, wh, "r1", `{"title":"no transcript here"}`)
 	if !errors.Is(err, ErrSchemaViolation) {
 		t.Fatalf("missing required field: want ErrSchemaViolation, got %v", err)
 	}
-	if res == nil || res.Status != statusRejected {
-		t.Fatalf("result status = %+v, want rejected", res)
+	if job != nil {
+		t.Fatalf("a rejected payload must not be queued, got job %+v", job)
 	}
 	if len(ing.calls) != 0 {
 		t.Fatalf("rejected payload must not reach mempalace, got %d calls", len(ing.calls))
+	}
+	// The rejection is still recorded in the ledger as 'rejected'.
+	m, err := s.Metrics(context.Background(), 10)
+	if err != nil || m.Totals.Rejected != 1 {
+		t.Fatalf("ledger should record one rejection: %+v (%v)", m.Totals, err)
 	}
 }
 
@@ -266,25 +299,42 @@ func TestInvalidSchemaRejectedAtCreate(t *testing.T) {
 }
 
 func TestIngestMemUnavailable(t *testing.T) {
+	// When MemPalace is entirely disabled, Enqueue fails fast (no doomed job is
+	// queued) and the attempt is recorded in the ledger as 'failed'.
 	ing := &fakeIngester{available: false}
 	s := newService(t, ing)
 	wh, _ := mustCreate(t, s, CreateInput{Name: "down", Wing: "w"})
-	res, err := ingest(t, s, wh, "r1", `{"x":1}`)
+	job, err := ingest(t, s, wh, "r1", `{"x":1}`)
 	if !errors.Is(err, ErrMemUnavailable) {
 		t.Fatalf("want ErrMemUnavailable, got %v", err)
 	}
-	if res.Status != statusFailed {
-		t.Fatalf("status = %q, want failed", res.Status)
+	if job != nil {
+		t.Fatalf("no job should be queued when mempalace is disabled, got %+v", job)
+	}
+	if len(ing.calls) != 0 {
+		t.Fatalf("disabled mempalace must not be called, got %d", len(ing.calls))
+	}
+	m, err := s.Metrics(context.Background(), 10)
+	if err != nil || m.Totals.Failed != 1 {
+		t.Fatalf("ledger should record one failure: %+v (%v)", m.Totals, err)
 	}
 }
 
 func TestIngestUpstreamRejection(t *testing.T) {
+	// A content rejection from MemPalace (OK=false) is discovered in the worker,
+	// so the request is accepted (queued) and the job ends up 'failed'.
 	ing := &fakeIngester{available: true, fail: true}
 	s := newService(t, ing)
 	wh, _ := mustCreate(t, s, CreateInput{Name: "rej", Wing: "w"})
-	_, err := ingest(t, s, wh, "r1", `{"x":1}`)
-	if !errors.Is(err, ErrUpstreamRejected) {
-		t.Fatalf("want ErrUpstreamRejected, got %v", err)
+	job, err := ingest(t, s, wh, "r1", `{"x":1}`)
+	if err != nil {
+		t.Fatalf("enqueue should accept the payload, got %v", err)
+	}
+	if job.Status != jobFailed || job.Error == "" {
+		t.Fatalf("job should be failed with a reason, got %+v", job)
+	}
+	if job.MempalaceOK {
+		t.Fatalf("mempalace_ok must be false on rejection")
 	}
 }
 
