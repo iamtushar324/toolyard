@@ -1,4 +1,4 @@
--- 0012: track which skills have been ingested into mempalace so the
+-- 0013: track which skills have been ingested into mempalace so the
 -- background scanner (and skills.publish) don't re-ingest unchanged SKILL.md
 -- files.
 --
