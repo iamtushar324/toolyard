@@ -1,20 +1,54 @@
 # toolyard
 
-Self-hosted MCP gateway with **per-tool-call human approval pushed to your
-phone** and built-in shared memory. One Go binary + SQLite + a PWA dashboard.
+**An approval gateway for AI agents.** toolyard sits between your coding
+agents and the MCP servers they use. Reads pass straight through; writes
+stop and wait for you, with an approval card on your phone that shows what
+the agent wants to do and why.
 
-Every coding agent today (Claude Code, Cursor, Codex CLI, web Claude)
-reimplements its own MCP config, approval UX, and audit log. `toolyard` sits
-between any number of agents and any number of upstream MCP servers, gives
-you a single place to enroll servers and approve writes, and pushes approval
-cards to your phone with the model's reasoning visible.
+One Go binary, SQLite, and a PWA dashboard. Self-hosted.
 
-## Status
+```
+ Claude Code ─┐                                  ┌─► GitHub MCP
+ Cursor      ─┤   ┌──────────┐    ┌──────────┐   ├─► Filesystem MCP
+ Codex CLI   ─┼──►│ toolyard │───►│  policy  │───┼─► your own MCPs
+ Web Claude  ─┘   └────┬─────┘    └────┬─────┘   │
+                       │               ▼
+                  audit log     approval ──► phone push (allow / deny)
+```
 
-**v0.1 — works end-to-end.** Reads pass, writes hold for human approval,
-audit log streams live to the dashboard, Web Push lights up your phone, and
-the Claude Code hook lets long approvals resume cleanly. See
-[`docs/architecture.md`](docs/architecture.md).
+## Why
+
+Every agent (Claude Code, Cursor, Codex CLI, web Claude) ships its own MCP
+config, its own approval prompts, and its own audit trail, or none at all.
+toolyard gives you one place to:
+
+- **Enroll MCP servers once** and share them with every agent.
+- **Approve writes from your phone.** Each call carries the model's
+  `_reason`, so you see intent, not just arguments.
+- **Keep one audit log** of every tool call from every agent.
+
+## How approval works
+
+1. The agent calls a tool through toolyard over stdio or streamable HTTP
+   (`/mcp`).
+2. toolyard adds a required `_reason` field (and an optional
+   `_intent_category`) to every upstream tool's schema, so the model has to
+   explain itself.
+3. The policy engine decides: **allow**, **ask**, or **deny**. Explicit
+   per-tool and per-server rules set in the dashboard win; otherwise
+   read-shaped tools (`get`, `list`, `search`, ...) pass and everything else
+   asks.
+4. An "ask" is held on the approval bus, pushed to your phone via Web Push,
+   and shown live in the dashboard. Decisions are Ed25519-signed and durable
+   in SQLite.
+5. Long approvals degrade gracefully: the call returns a deferred response
+   and the Claude Code hook (`scripts/claude-code-hook.sh`) resumes it once
+   you decide.
+
+Optional **auto-approval** learns from your history: calls you have approved
+repeatedly with no denials can be auto-allowed per agent. Destructive tools
+never auto-approve, a single denial puts a rule on cool-off, and there is a
+per-agent hourly cap.
 
 ## Quickstart
 
@@ -23,98 +57,51 @@ go build -o toolyard ./cmd/gateway
 ./toolyard serve -addr :8787 -data ~/.toolyard
 ```
 
-Open <http://localhost:8787>, create the local admin account, and:
+Open <http://localhost:8787>, create the local admin account, then:
 
-1. **Agents → Generate code**, get a one-time enrollment code.
-2. From your terminal:
+1. **Agents → Generate code** to get a one-time enrollment code.
+2. Exchange it for a token:
    ```bash
    ./toolyard exchange -url http://localhost:8787 -code <code>
    ```
-   Save the returned `token`.
 3. Point your MCP-aware agent at `http://localhost:8787/mcp` with
-   `Authorization: Bearer <token>`. Or run the gateway with `-stdio` for
+   `Authorization: Bearer <token>`, or run the gateway with `-stdio` for
    stdio-only hosts.
-4. (Optional) **Settings → Enable push** in the dashboard to get notifications
-   on this device.
+4. **Settings → Enable push** on your phone to get approval cards.
+5. Add upstream MCP servers from the dashboard (you can paste an existing
+   MCP JSON config).
 
-The full self-hosting guide is in [`docs/self-hosting.md`](docs/self-hosting.md).
+The full guide, including Docker and wiring each agent, is in
+[`docs/self-hosting.md`](docs/self-hosting.md).
 
-## What's in v0.1
+## What's included
 
-- Stdio + streamable HTTP MCP server, agent enrollment via short-lived
-  codes, sha256-hashed long-lived tokens.
-- Schema-wrap that injects a required `_reason` field (20–2000 chars) and
-  optional `_intent_category` enum into every upstream tool's input schema.
-- Hardcoded policy: `read|get|list|search|...` pass through, everything
-  else holds for human approval.
-- Approval bus with Ed25519-signed decision tokens, durable to SQLite,
-  with hybrid in-line wait + deferred-response degradation per the
-  architecture plan.
-- Built-in memory MCP (`memory.set`, `memory.get`, `memory.list`,
-  `memory.delete`) backed by the same SQLite DB.
-- Live SSE dashboard: pending approvals, audit feed, agent enrollment,
-  memory browser, push setup.
-- Web Push (VAPID) with one-tap allow/deny actions in the notification.
-- `scripts/claude-code-hook.sh` reference implementation of the
-  PostToolUse hook that resumes deferred approvals.
-- Multi-stage `deploy/Dockerfile` + `deploy/docker-compose.yml`.
+- Stdio and streamable HTTP MCP server; agent enrollment via short-lived
+  codes and sha256-hashed long-lived tokens.
+- Policy engine with dashboard-managed allow / ask / deny rules per tool and
+  per upstream server.
+- Approval bus with signed decision tokens, in-line wait, and deferred
+  resume.
+- Web Push (VAPID) with one-tap allow / deny in the notification.
+- Live SSE dashboard: pending approvals, audit feed, agents, upstream
+  servers, push setup.
+- Built-in shared memory tools (`memory.set`, `memory.get`, `memory.list`,
+  `memory.delete`) so agents can hand context to each other.
+- Multi-stage `deploy/Dockerfile` and `deploy/docker-compose.yml`.
 
-## Personal data lake (TUS-104)
-
-toolyard ships a DuckDB-backed warehouse so any "data not modified per row"
-— finance JSONs, daily memory markdowns, Nova SQLite stores, ingest logs —
-can land in one queryable place. File: `~/.toolyard/lake.duckdb`.
-
-**Tools agents can call (no approval, additive):**
-
-- `lake.query` — read-only SQL (SELECT/WITH/SHOW/PRAGMA only).
-- `lake.list_tables`, `lake.describe_table` — catalog introspection.
-- `lake.insert` — append rows (structured or raw INSERT).
-- `lake.create_table` — CREATE TABLE/VIEW/INDEX. CREATE OR REPLACE allowed.
-- `lake.ingest` — bulk load CSV/Parquet/JSON/JSONL/SQLite/HTTP into a target.
-
-**Tools agents can call (phone approval required):**
-
-- `lake.update`, `lake.delete` — WHERE is mandatory.
-- `lake.alter`, `lake.drop`.
-
-**Schema layout:**
-
-- `raw.*` — immutable mirrors of source files; lineage record only.
-- `mart.*` — Kimball dimensional model: `dim_*` (account, category,
-  investment, physical_asset, learning_goal, exercise, date) and
-  `fact_*` (account_balance, investment_valuation, credit_card_bill,
-  net_worth_snapshot, recurring_schedule, workout, exercise_set,
-  chat_interaction, daily_memory, deployment_plan).
-- `app.*` — agent's free-form scratch space.
-
-**Ingest:** drop new files in `~/.toolyard/inbox/`, then call
-`lake.ingest` (CSV/Parquet/JSON/JSONL/SQLite/HTTP). DuckDB is the
-sole source of truth; there is no scheduled refresh from any external
-location.
-
-**Backup:** `toolyard lake backup` runs `EXPORT DATABASE` to
-`<data>/backups/lake-<ts>/`.
-
-**Dashboard:** [/lake/](http://192.168.1.179:18787/lake/) — manifest-
-driven, vanilla JS + ECharts. Adding a new chart = drop a `.sql` file in
-`web/lake/queries/<tab>/` and append a panel to
-`web/lake/manifest.json`. No JS change required.
-
-Architectural decisions live in
-[`docs/adr/0004-lake-engine.md`](docs/adr/0004-lake-engine.md).
+Architecture details are in [`docs/architecture.md`](docs/architecture.md).
 
 ## Verification
 
-End-to-end smoke test (run while the binary is up on `:18787`):
+End-to-end smoke test, run while the gateway is up:
 
 ```bash
-go test -tags=e2e ./scripts -run TestEndToEnd -toolyard=http://localhost:18787 -v
+go test -tags=e2e ./scripts -run TestEndToEnd -toolyard=http://localhost:8787 -v
 ```
 
-It covers the full happy path: enroll, list tools, read passes, write
-holds, dashboard approves, write completes, audit log fills.
+It covers the full happy path: enroll, list tools, a read passes, a write
+holds, the dashboard approves, the write completes, and the audit log fills.
 
 ## License
 
-Apache 2.0 — see [`LICENSE`](LICENSE).
+Apache 2.0. See [`LICENSE`](LICENSE).
