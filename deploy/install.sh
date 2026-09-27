@@ -62,17 +62,14 @@ LISTEN_ADDR="0.0.0.0:18787"
 # lives in the repo; data + password env file persist under DATA_DIR so
 # the same backup of /var/lib/toolyard/ captures everything.
 CH_COMPOSE="$(pwd)/deploy/clickhouse/docker-compose.yaml"
-GF_COMPOSE="$(pwd)/deploy/grafana/docker-compose.yaml"
 CH_DATA_DIR="$DATA_DIR/clickhouse"
 CH_ENV_FILE="$DATA_DIR/clickhouse-runtime.env"
 # uid:gid the clickhouse-server image runs as internally. Bind mounts
 # need to be owned by this so CH can write to them.
 CH_UID=101
 CH_GID=101
-# Shared docker network for the lake stack. ClickHouse and Grafana both
-# attach to it so Grafana can resolve `clickhouse:9000` without exposing
-# the native protocol on the host. Declared external in both compose
-# files; created here so neither compose owns its lifecycle.
+# Shared docker network for the lake stack. Declared external in the
+# ClickHouse compose file; created here so compose doesn't own its lifecycle.
 LAKE_NETWORK="toolyard_lake_net"
 # Operator-managed env file. systemd reads it on every (re)start, so secrets
 # like TOOLYARD_LAKE_TOKEN can change without re-rendering the unit. The
@@ -109,7 +106,7 @@ NOTES_DIR="${NOTES_DIR:-$NOTES_DIR_DEFAULT}"
 IMPORT_FROM=""
 # --client-only short-circuits the install: build ONLY the CLI binary
 # (cmd/toolyard) and drop it at $CLI_BINARY_PATH; skip user creation,
-# data dir, systemd, ClickHouse, Grafana, etc. Use this on a remote
+# data dir, systemd, ClickHouse, etc. Use this on a remote
 # server that talks to a gateway elsewhere.
 CLIENT_ONLY=false
 CLI_BINARY_PATH="/usr/local/bin/toolyard"
@@ -257,17 +254,9 @@ if [[ ! -f "$ENV_FILE" ]]; then
 # toolyard runtime environment. Read by systemd via EnvironmentFile=.
 # Edit and `sudo systemctl restart toolyard` to apply.
 #
-# Toolyard's own runtime config (lake API token, Grafana origin) lives
-# in the settings DB and is managed from the dashboard's Settings tab —
-# no env vars needed here for the gateway itself. The lake token is
-# auto-generated on first boot; reveal/rotate from the UI.
-#
-# This file is also the env_file for the deploy/grafana docker-compose
-# stack, so any GF_*-prefixed variables below are consumed by the
-# Grafana container at boot. Only the admin credentials really benefit
-# from being here; structural config lives in compose.
-#GF_SECURITY_ADMIN_USER=admin
-#GF_SECURITY_ADMIN_PASSWORD=changeme
+# Toolyard's own runtime config lives in the settings DB and is managed
+# from the dashboard's Settings tab — no env vars needed here for the
+# gateway itself.
 EOF
   chown root:"$USER_NAME" "$ENV_FILE"
   chmod 0640 "$ENV_FILE"
@@ -466,9 +455,8 @@ User=$USER_NAME
 Group=$USER_NAME
 ExecStart=$BINARY_PATH ${EXEC_FLAGS[*]}
 
-# Operator-managed runtime env (TOOLYARD_LAKE_TOKEN, TOOLYARD_GRAFANA_ORIGIN,
-# etc). The leading `-` means "ignore if the file doesn't exist" so a fresh
-# install boots even before the file is written.
+# Operator-managed runtime env. The leading `-` means "ignore if the file
+# doesn't exist" so a fresh install boots even before the file is written.
 EnvironmentFile=-$ENV_FILE
 
 # systemd's default PATH for services is just /usr/local/sbin:/usr/local/bin:
@@ -601,7 +589,7 @@ fi
 #
 # Soft-required: if docker isn't installed we warn and skip rather than
 # fail the whole install. The gateway works fine without CH; this stack
-# is the analytical SQL surface we'll wire Grafana onto.
+# is the analytical SQL surface the lake.* MCP tools query.
 ch_status="skipped"
 if ! command -v docker >/dev/null 2>&1; then
   say "clickhouse: docker not found; skipping (install docker + re-run to enable)"
@@ -708,46 +696,6 @@ if [[ "$ch_status" == "up" ]]; then
   done
 fi
 
-# ----- Grafana stack ---------------------------------------------------
-#
-# Visualisation layer. Reads the same /var/lib/toolyard/clickhouse-runtime.env
-# the CH stack does — when toolyard mints a new password on this boot, the
-# CH compose recreate above picks it up but Grafana's container would
-# still hold the OLD env in memory (docker compose env_file is loaded at
-# container creation, not on restart). `up -d --force-recreate` reloads
-# the env so the provisioned CH datasource lands with current creds.
-#
-# Soft-required: skipped with a warning if docker compose plugin or the
-# compose file is missing, same posture as the CH section.
-gf_status="skipped"
-if [[ "$ch_status" == "up" ]] && [[ -f "$GF_COMPOSE" ]]; then
-  if ! docker network inspect "$LAKE_NETWORK" >/dev/null 2>&1; then
-    docker network create "$LAKE_NETWORK" >/dev/null
-  fi
-  say "grafana: bringing up the compose stack (force-recreate so it re-reads CH password)"
-  if docker compose -f "$GF_COMPOSE" up -d --force-recreate >/dev/null; then
-    say "grafana: waiting for /api/health"
-    gf_ok="no"
-    for i in {1..60}; do
-      if curl -sf http://127.0.0.1:3030/api/health >/dev/null 2>&1; then
-        gf_ok="yes"
-        break
-      fi
-      sleep 1
-    done
-    if [[ "$gf_ok" == "yes" ]]; then
-      echo "    grafana healthy"
-      gf_status="up"
-    else
-      echo "    grafana did not respond on 127.0.0.1:3030 within 60s — check 'docker logs toolyard-grafana'"
-      gf_status="degraded"
-    fi
-  else
-    echo "    docker compose up failed — check 'docker compose -f $GF_COMPOSE logs'"
-    gf_status="failed"
-  fi
-fi
-
 # Detect first-run vs. existing setup.
 need_setup="no"
 if curl -sf http://127.0.0.1:18787/v1/auth/me 2>/dev/null | grep -q '"setup_required":true'; then
@@ -777,14 +725,6 @@ toolyard is up.
     password  : managed by toolyard (settings key 'clickhouse_password')
                 rendered to $CH_ENV_FILE for the compose stack
                 reveal/rotate from the dashboard's Settings tab
-
-  grafana     : $gf_status
-    compose   : $GF_COMPOSE
-    logs      : docker logs toolyard-grafana
-    bind      : 127.0.0.1:3030 (UI)
-    datasource: provisioned at boot from
-                deploy/grafana/provisioning/datasources/datasources.yaml
-                reads TOOLYARD_CH_PASSWORD from $CH_ENV_FILE
 
   reminders:
     - RESTART your MCP agents (Claude Code, etc.) after this. Their MCP
