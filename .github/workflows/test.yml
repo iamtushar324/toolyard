@@ -1,0 +1,33 @@
+# Runs vet and the full test suite on pushes to main and on every pull
+# request (branch pushes with an open PR are covered by pull_request, so
+# they don't run twice).
+# CGO is on by default on ubuntu runners, which mattn/go-sqlite3 needs.
+name: test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: test-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Test
+        run: go test -race ./...
