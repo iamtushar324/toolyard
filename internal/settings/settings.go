@@ -12,6 +12,8 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -107,6 +109,31 @@ const (
 	// InboxHostingNote tells agents where to host files (inbox.guide
 	// topic "hosting").
 	InboxHostingNote = "inbox_hosting_note"
+
+	// Inbox attention (when the phone buzzes; inbox-spec.md §6).
+	//
+	// InboxNowPerHour is each agent's budget of `now` requests per hour;
+	// beyond it requests are lowered to `soon`. Default 3.
+	InboxNowPerHour = "inbox_now_per_hour"
+	// InboxQuietHours is "HH:MM-HH:MM" in InboxTimezone, or "" for none.
+	InboxQuietHours = "inbox_quiet_hours"
+	// InboxQuietAllow lists tools (comma-separated; "deploy.*" matches a
+	// prefix) whose `now` requests may break through quiet hours.
+	InboxQuietAllow = "inbox_quiet_allow"
+	// InboxDigestTimes is a comma-separated list of "HH:MM" digest slots.
+	InboxDigestTimes = "inbox_digest_times"
+	// InboxTimezone is the owner's IANA time zone for quiet hours and
+	// digests. Empty means the server's.
+	InboxTimezone = "inbox_timezone"
+	// InboxPushDetails puts request titles and summaries in pushes (they
+	// transit third-party push services). Default false.
+	InboxPushDetails = "inbox_push_details"
+	// InboxVoiceEnabled makes toolyard record each request's voice note
+	// server-side (Gemini TTS; needs GEMINI_API_KEY). Default false: the
+	// browser speaks the script.
+	InboxVoiceEnabled = "inbox_voice_enabled"
+	// InboxVoiceName is the Gemini prebuilt voice (default "Kore").
+	InboxVoiceName = "inbox_voice_name"
 )
 
 // Approval modes.
@@ -225,6 +252,27 @@ func (s *Service) All(ctx context.Context) (map[string]any, error) {
 	}
 	if _, ok := out[InboxJudgeEnabled]; !ok {
 		out[InboxJudgeEnabled] = false
+	}
+	if _, ok := out[InboxNowPerHour]; !ok {
+		out[InboxNowPerHour] = float64(3)
+	}
+	if _, ok := out[InboxQuietHours]; !ok {
+		out[InboxQuietHours] = ""
+	}
+	if _, ok := out[InboxQuietAllow]; !ok {
+		out[InboxQuietAllow] = ""
+	}
+	if _, ok := out[InboxDigestTimes]; !ok {
+		out[InboxDigestTimes] = "09:30,13:30,18:30"
+	}
+	if _, ok := out[InboxTimezone]; !ok {
+		out[InboxTimezone] = ""
+	}
+	if _, ok := out[InboxPushDetails]; !ok {
+		out[InboxPushDetails] = false
+	}
+	if _, ok := out[InboxVoiceEnabled]; !ok {
+		out[InboxVoiceEnabled] = false
 	}
 	// Virtual alias: keep router_only_mode boolean in sync for older callers.
 	if mode, _ := out[SurfaceMode].(string); mode == SurfaceRouterOnly {
@@ -502,6 +550,57 @@ func normalise(in map[string]any) map[string]any {
 			out[ApprovalMode] = ApprovalModeExecute
 		}
 	}
+	// Inbox attention settings: clamp or drop malformed values so a bad
+	// patch can't silence or flood the owner's phone.
+	if v, ok := out[InboxNowPerHour]; ok {
+		n := toInt(v)
+		if n < 1 {
+			n = 1
+		}
+		if n > 60 {
+			n = 60
+		}
+		out[InboxNowPerHour] = n
+	}
+	if v, ok := out[InboxQuietHours]; ok {
+		s, _ := v.(string)
+		s = strings.TrimSpace(s)
+		if s != "" && !validClockRange(s) {
+			delete(out, InboxQuietHours)
+		} else {
+			out[InboxQuietHours] = s
+		}
+	}
+	if v, ok := out[InboxDigestTimes]; ok {
+		s, _ := v.(string)
+		var keep []string
+		for _, p := range strings.Split(s, ",") {
+			if p = strings.TrimSpace(p); validClock(p) && len(keep) < 8 {
+				keep = append(keep, p)
+			}
+		}
+		out[InboxDigestTimes] = strings.Join(keep, ",")
+	}
+	if v, ok := out[InboxTimezone]; ok {
+		s, _ := v.(string)
+		s = strings.TrimSpace(s)
+		if s != "" {
+			if _, err := time.LoadLocation(s); err != nil {
+				delete(out, InboxTimezone)
+				s = ""
+			}
+		}
+		if _, still := out[InboxTimezone]; still {
+			out[InboxTimezone] = s
+		}
+	}
+	if v, ok := out[InboxQuietAllow]; ok {
+		s, _ := v.(string)
+		if len(s) > 1000 {
+			s = s[:1000]
+		}
+		out[InboxQuietAllow] = strings.TrimSpace(s)
+	}
 	// Clamp top_n_count to [1, 200].
 	if v, ok := out[TopNCount]; ok {
 		n := toInt(v)
@@ -545,3 +644,20 @@ func toInt(v any) int {
 // Compile-time check that the package compiles even if sql.ErrNoRows isn't
 // referenced anywhere.
 var _ = sql.ErrNoRows
+
+// validClock accepts "H:MM" / "HH:MM".
+func validClock(v string) bool {
+	h, m, ok := strings.Cut(v, ":")
+	if !ok || len(h) < 1 || len(h) > 2 || len(m) != 2 {
+		return false
+	}
+	hh, err1 := strconv.Atoi(h)
+	mm, err2 := strconv.Atoi(m)
+	return err1 == nil && err2 == nil && hh >= 0 && hh <= 23 && mm >= 0 && mm <= 59
+}
+
+// validClockRange accepts "HH:MM-HH:MM" with distinct ends.
+func validClockRange(v string) bool {
+	a, b, ok := strings.Cut(v, "-")
+	return ok && validClock(strings.TrimSpace(a)) && validClock(strings.TrimSpace(b)) && strings.TrimSpace(a) != strings.TrimSpace(b)
+}

@@ -457,28 +457,53 @@ func runServe(argv []string) error {
 		AllowPrivateMedia: *inboxFetchPrivate,
 		Publish:           func(t string, d any) { hub.Publish(realtime.Event{Type: t, Data: d}) },
 		AgentName:         agentName,
-		Notify: func(ctx context.Context, r *inbox.Request) {
+		Notify: func(ctx context.Context, p inbox.Push) {
 			user, err := idSvc.PrimaryUser(ctx)
 			if err != nil {
 				return
 			}
-			// Same privacy rule as approval pushes: no agent-written text
-			// in the payload, which transits third-party push services.
-			who := agentName(ctx, r.AgentID)
-			if who == "" {
-				who = "An agent"
+			// Agent-written text is only in p when the owner turned on
+			// push details (inbox_push_details); see inbox/attention.go.
+			payload := map[string]any{"title": p.Title, "body": p.Body, "url": p.URL, "tag": p.Tag, "kind": "inbox"}
+			if p.RequestID != "" {
+				payload["request_id"] = p.RequestID
 			}
-			label := map[string]string{inbox.KindAccess: "is asking for access", inbox.KindQuestion: "has a question", inbox.KindBlocker: "is stuck"}[r.Kind]
-			body := "Tap to review."
-			if r.Kind == inbox.KindAccess {
-				body = fmt.Sprintf("%d tool%s. Tap to review.", len(r.Tools), map[bool]string{true: "", false: "s"}[len(r.Tools) == 1])
+			if p.TapToken != "" {
+				payload["inbox_token"] = p.TapToken
 			}
-			_ = pushSvc.Notify(ctx, user.ID, map[string]any{
-				"title": who + " " + label,
-				"body":  body,
-				"url":   "/#inbox/" + r.ID,
-				"tag":   r.ID,
-			})
+			acts := make([]map[string]string, 0, len(p.Actions))
+			for _, a := range p.Actions {
+				acts = append(acts, map[string]string{"action": a.Action, "title": a.Title})
+			}
+			payload["actions"] = acts
+			_ = pushSvc.Notify(ctx, user.ID, payload)
+		},
+		Attention: func() inbox.AttentionConfig {
+			c := inbox.AttentionConfig{
+				NowPerHour: settingsSvc.GetInt(settings.InboxNowPerHour, inbox.DefaultNowPerHour),
+				QuietHours: settingsSvc.GetString(settings.InboxQuietHours, ""),
+				Details:    settingsSvc.GetBool(settings.InboxPushDetails),
+			}
+			for _, t := range strings.Split(settingsSvc.GetString(settings.InboxQuietAllow, ""), ",") {
+				if t = strings.TrimSpace(t); t != "" {
+					c.QuietAllow = append(c.QuietAllow, t)
+				}
+			}
+			// Unset → default slots; set to "" → no digest.
+			if v := settingsSvc.GetString(settings.InboxDigestTimes, "\x00"); v != "\x00" {
+				c.DigestTimes = []string{}
+				for _, t := range strings.Split(v, ",") {
+					if t = strings.TrimSpace(t); t != "" {
+						c.DigestTimes = append(c.DigestTimes, t)
+					}
+				}
+			}
+			if tz := settingsSvc.GetString(settings.InboxTimezone, ""); tz != "" {
+				if loc, err := time.LoadLocation(tz); err == nil {
+					c.Location = loc
+				}
+			}
+			return c
 		},
 	})
 	if err != nil {
@@ -494,6 +519,7 @@ func runServe(argv []string) error {
 	})
 	gw.RegisterInboxTools()
 	go inboxSvc.RunSweeper(ctx, time.Minute)
+	go inboxSvc.RunAttention(ctx, 15*time.Second)
 	log.Printf("toolyard: inbox ready (approval_mode=%s, judge=%v)",
 		settingsSvc.GetString(settings.ApprovalMode, settings.ApprovalModeExecute), inboxJudge != nil)
 

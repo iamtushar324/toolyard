@@ -24,6 +24,8 @@ import (
 )
 
 type inboxAPIFixture struct {
+	srv    *Server
+	pushes *[]inbox.Push
 	mux    *http.ServeMux
 	cookie *http.Cookie
 	svc    *inbox.Service
@@ -54,7 +56,9 @@ func newInboxAPIFixture(t *testing.T) *inboxAPIFixture {
 	gw := gateway.New(gateway.Options{Policy: policy.New(db), Approval: bus, Audit: auditLog, Memory: memory.New(db), Hub: realtime.NewHub()})
 	gw.RegisterBuiltins()
 	t.Cleanup(func() { _ = gw.Close() })
-	svc, err := inbox.New(ctx, inbox.Options{DB: db, Catalog: gw})
+	pushes := &[]inbox.Push{}
+	svc, err := inbox.New(ctx, inbox.Options{DB: db, Catalog: gw,
+		Notify: func(_ context.Context, p inbox.Push) { *pushes = append(*pushes, p) }})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -83,7 +87,7 @@ func newInboxAPIFixture(t *testing.T) *inboxAPIFixture {
 	if cookie == nil {
 		t.Fatalf("login failed: %d %s", rec.Code, rec.Body.String())
 	}
-	return &inboxAPIFixture{mux: mux, cookie: cookie, svc: svc, token: tok, agent: ag.ID}
+	return &inboxAPIFixture{srv: srv, pushes: pushes, mux: mux, cookie: cookie, svc: svc, token: tok, agent: ag.ID}
 }
 
 func (f *inboxAPIFixture) owner(t *testing.T, method, path string, body any) (int, map[string]any) {
@@ -254,3 +258,41 @@ func TestGuideEndpoints(t *testing.T) {
 }
 
 var _ = mcp.NewToolResultText // keep the mcp import for readers of this file's helpers
+
+// A notification tap works without a cookie or the CSRF header, only for
+// the actions the notification offered, and never approves.
+func TestInboxDecideByToken(t *testing.T) {
+	f := newInboxAPIFixture(t)
+	ctx := context.Background()
+	res, err := f.svc.Submit(ctx, f.agent, &inbox.Submission{Kind: inbox.KindQuestion, Title: "Retire v1?", Summary: "s", Message: "m",
+		Audio: inbox.Audio{Script: "Retire it?"}, Urgency: inbox.UrgencyNow, Options: []inbox.Option{{Label: "Yes"}, {Label: "No"}}})
+	if err != nil || !res.OK {
+		t.Fatalf("submit: %v %+v", err, res)
+	}
+	if len(*f.pushes) != 1 || (*f.pushes)[0].TapToken == "" {
+		t.Fatalf("push: %+v", *f.pushes)
+	}
+	tok := (*f.pushes)[0].TapToken
+	h := f.srv.HardenAPI(f.mux)
+	tap := func(action string) int {
+		b, _ := json.Marshal(map[string]string{"token": tok, "action": action})
+		req := httptest.NewRequest(http.MethodPost, "/v1/inbox/decide-by-token", bytes.NewReader(b))
+		req.Header.Set("Content-Type", "application/json")
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		return rec.Code
+	}
+	if c := tap("deny"); c != http.StatusGone {
+		t.Fatalf("an action the notification didn't offer: %d", c)
+	}
+	if c := tap("snooze"); c != http.StatusOK {
+		t.Fatalf("snooze: %d", c)
+	}
+	if c := tap("snooze"); c != http.StatusOK {
+		t.Fatalf("snooze again: %d", c)
+	}
+	r, _ := f.svc.Get(ctx, res.RequestID)
+	if r.Status != inbox.StatusPending || r.SnoozedUntil == 0 {
+		t.Fatalf("after snooze: %+v", r)
+	}
+}

@@ -62,9 +62,11 @@ type Options struct {
 	AllowPrivateMedia bool
 	// Publish sends a realtime event to the dashboard.
 	Publish func(eventType string, data any)
-	// Notify is called once when a request that needs the owner arrives,
-	// for push notifications.
-	Notify func(ctx context.Context, r *Request)
+	// Notify delivers a push notification to the owner's devices. The
+	// attention loop (Tick) decides when; see attention.go.
+	Notify func(ctx context.Context, p Push)
+	// Attention returns the owner's notification settings.
+	Attention func() AttentionConfig
 	// AgentName resolves an agent ID to a display name.
 	AgentName func(ctx context.Context, agentID string) string
 	Now       func() time.Time
@@ -255,6 +257,9 @@ func (s *Service) Submit(ctx context.Context, agentID string, sub *Submission) (
 		}
 	}
 
+	if w := s.capUrgency(ctx, r); w != nil {
+		res.Warnings = append(res.Warnings, *w)
+	}
 	now := s.now()
 	r.ID = "rq_" + strings.ReplaceAll(uuid.NewString(), "-", "")[:16]
 	r.Status = StatusPending
@@ -269,6 +274,9 @@ func (s *Service) Submit(ctx context.Context, agentID string, sub *Submission) (
 	if r.DryRunCount > 0 {
 		r.addActivity(r.CreatedAt, fmt.Sprintf("%d dry run%s before sending", r.DryRunCount, plural(r.DryRunCount)))
 	}
+	if r.Downgraded != "" {
+		r.addActivity(r.CreatedAt, "Urgency lowered from now to soon: "+r.Downgraded)
+	}
 	if err := s.insert(ctx, r); err != nil {
 		return nil, err
 	}
@@ -276,8 +284,10 @@ func (s *Service) Submit(ctx context.Context, agentID string, sub *Submission) (
 	res.OK, res.RequestID, res.Status, res.ExpiresAt = true, r.ID, r.Status, r.ExpiresAt
 
 	s.publish("inbox", s.cardView(ctx, r))
-	if r.Kind != KindUpdate && s.opts.Notify != nil && (r.Urgency == UrgencyNow || r.Urgency == UrgencySoon) {
-		s.opts.Notify(ctx, r)
+	s.enqueueArrival(ctx, r)
+	if r.Urgency == UrgencyNow {
+		// Don't wait for the next tick for the one urgency that means it.
+		s.dispatchPushes(ctx)
 	}
 	s.bg.Add(1)
 	go func(id string) {
@@ -537,6 +547,9 @@ func (s *Service) Decide(ctx context.Context, id string, d Decision) (*Request, 
 		return nil, err
 	}
 	s.wake(id)
+	if d.Action == "snooze" {
+		s.enqueuePush(ctx, out, "snooze_end", out.ID, time.UnixMilli(out.SnoozedUntil))
+	}
 	s.publish("inbox", s.cardView(ctx, out))
 	return out, nil
 }
@@ -1062,6 +1075,8 @@ func (s *Service) Sweep(ctx context.Context) {
 		log.Printf("inbox: expire grants: %v", err)
 	}
 	_, _ = s.db.ExecContext(ctx, `DELETE FROM inbox_dry_runs WHERE created_at < ?`, s.now().Add(-48*time.Hour).UnixMilli())
+	_, _ = s.db.ExecContext(ctx, `DELETE FROM inbox_pushes WHERE sent_at IS NOT NULL AND sent_at < ?`, s.now().Add(-7*24*time.Hour).UnixMilli())
+	_, _ = s.db.ExecContext(ctx, `DELETE FROM inbox_digests WHERE sent_at < ?`, s.now().Add(-30*24*time.Hour).UnixMilli())
 }
 
 // RunSweeper runs Sweep on an interval until ctx is done.

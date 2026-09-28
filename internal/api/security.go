@@ -359,6 +359,7 @@ func exemptFromCSRFHeader(path string) bool {
 	case "/v1/auth/setup", "/v1/auth/login",
 		"/v1/agents/exchange",
 		"/v1/approvals/decide-by-token",
+		"/v1/inbox/decide-by-token",
 		// Agent-authenticated (Bearer) ingest — no cookie, no dashboard
 		// origin, so the CSRF custom-header check doesn't apply.
 		"/v1/mempalace/ingest",
@@ -397,7 +398,7 @@ func unauthRouteLimit(path string) *unauthRouteRule {
 		// hit it once per agent enrollment. 120/hour leaves room for a
 		// fleet of agents and for the e2e suite to spin up many in burst.
 		return &unauthRouteRule{"exchange", 120, time.Hour}
-	case path == "/v1/approvals/decide-by-token":
+	case path == "/v1/approvals/decide-by-token", path == "/v1/inbox/decide-by-token":
 		// Push-tap path. A real user taps approve maybe a few times per
 		// minute at peak.
 		return &unauthRouteRule{"decide", 120, time.Hour}

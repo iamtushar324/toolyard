@@ -27,11 +27,13 @@ import (
 //	POST /v1/inbox/grants/{id}/revoke          revoke one grant
 //	POST /v1/inbox/grants/revoke-all           kill switch
 //	GET  /v1/inbox/blobs/{sha256}              a copied attachment
+//	POST /v1/inbox/decide-by-token             a notification action (signed token; no cookie)
 //	GET  /v1/guide[?topic=]                    the agent protocol (bearer or session)
 //	GET  /v1/guide/skill                       the toolyard-inbox SKILL.md
 func (s *Server) inboxRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/v1/inbox", s.inboxList)
 	mux.HandleFunc("/v1/inbox/", s.inboxItem)
+	mux.HandleFunc("/v1/inbox/decide-by-token", s.inboxDecideByToken)
 	mux.HandleFunc("/v1/guide", s.guideHandler)
 	mux.HandleFunc("/v1/guide/skill", s.guideSkill)
 }
@@ -421,6 +423,47 @@ func (s *Server) inboxBlob(w http.ResponseWriter, r *http.Request, sha string) {
 	}
 	w.Header().Set("Content-Security-Policy", "default-src 'none'; img-src 'self'; media-src 'self'; sandbox")
 	http.ServeContent(w, r, "", st.ModTime(), f)
+}
+
+// inboxDecideByToken handles a tap on a notification action. The signed
+// token names one request and the actions its notification offered; none
+// of them allow tools.
+func (s *Server) inboxDecideByToken(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "POST only")
+		return
+	}
+	if s.inbox == nil {
+		writeError(w, http.StatusServiceUnavailable, "inbox not enabled")
+		return
+	}
+	var body struct {
+		Token  string `json:"token"`
+		Action string `json:"action"`
+	}
+	if err := decode(r, &body); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	req, err := s.inbox.DecideByTap(r.Context(), body.Token, body.Action)
+	if err != nil {
+		if errors.Is(err, inbox.ErrTapToken) {
+			writeError(w, http.StatusGone, err.Error())
+			return
+		}
+		writeInboxErr(w, err)
+		return
+	}
+	if s.audit != nil {
+		_ = s.audit.Write(r.Context(), audit.Event{
+			EventType:  "inbox.decide",
+			AgentID:    req.AgentID,
+			Decision:   body.Action,
+			Reason:     "notification",
+			ApprovalID: req.ID,
+		})
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"status": req.Status, "snoozed_until": req.SnoozedUntil, "answer": req.Answer})
 }
 
 func writeInboxErr(w http.ResponseWriter, err error) {

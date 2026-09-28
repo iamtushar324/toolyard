@@ -15,18 +15,23 @@ self.addEventListener('push', (event) => {
   const body  = data.body  || 'A tool call needs your decision.';
   const tag   = data.tag   || data.approval_id || 'toolyard';
   const url   = data.url   || (data.approval_id ? `/?approval=${data.approval_id}` : '/');
+  // Inbox pushes name their own actions (never "approve": allowing tools
+  // happens on the review page). Legacy approval pushes get Allow / Deny.
+  const isInbox = data.kind === 'inbox';
+  const actions = isInbox
+    ? (Array.isArray(data.actions) ? data.actions.slice(0, 2) : [])
+    : [{ action: 'allow', title: 'Allow' }, { action: 'deny', title: 'Deny' }];
 
   event.waitUntil(self.registration.showNotification(title, {
     body,
     tag,
     icon: '/icon-192.svg',
     badge: '/icon-192.svg',
-    data: { url, approval_id: data.approval_id, decision_token: data.decision_token, tool: data.tool },
-    actions: [
-      { action: 'allow', title: 'Allow' },
-      { action: 'deny',  title: 'Deny'  },
-    ],
-    requireInteraction: true,
+    data: { url, tag, kind: data.kind, approval_id: data.approval_id, decision_token: data.decision_token,
+      inbox_token: data.inbox_token, tool: data.tool, actions },
+    actions,
+    renotify: isInbox,
+    requireInteraction: !isInbox || data.reason === 'reminder',
   }));
 });
 
@@ -48,6 +53,10 @@ self.addEventListener('notificationclick', (event) => {
   event.notification.close();
 
   const deepLink = data.url || (data.approval_id ? `/?approval=${data.approval_id}` : '/');
+  if (data.kind === 'inbox') {
+    event.waitUntil(inboxTap(event.action, data, deepLink));
+    return;
+  }
   const isDecision = (event.action === 'allow' || event.action === 'deny') && data.decision_token;
   if (!isDecision) {
     // Plain tap (or an action with no token) → focus/open the dashboard.
@@ -85,3 +94,30 @@ self.addEventListener('notificationclick', (event) => {
     }
   })());
 });
+
+// inboxTap delivers an inbox notification action (deny, snooze, or an
+// answer option) and replaces the notification with the outcome.
+async function inboxTap(action, data, deepLink) {
+  if (!action || !data.inbox_token) return focusOrOpen(deepLink);
+  const label = ((data.actions || []).find((a) => a.action === action) || {}).title || action;
+  const note = (title, body, extra) => self.registration.showNotification(title, Object.assign({
+    tag: data.tag || 'toolyard', body, icon: '/icon-192.svg', badge: '/icon-192.svg', data: { url: deepLink },
+  }, extra || {}));
+  try {
+    const res = await fetch('/v1/inbox/decide-by-token', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ token: data.inbox_token, action }),
+    });
+    if (res.ok) {
+      const done = action === 'snooze' ? 'Snoozed for an hour' : action === 'deny' ? 'Denied' : 'Answered: ' + label;
+      await note('✓ ' + done, 'The agent has been told.');
+    } else if (res.status === 404 || res.status === 409 || res.status === 410) {
+      await note('Already decided or expired', 'Tap to open the inbox.');
+    } else {
+      throw new Error('http ' + res.status);
+    }
+  } catch (_) {
+    await note('Couldn’t deliver that', 'Network error — tap to open the inbox.', { requireInteraction: true });
+  }
+}

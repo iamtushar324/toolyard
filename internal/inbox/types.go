@@ -174,21 +174,27 @@ type Request struct {
 	TTLSeconds  int           `json:"ttl_seconds,omitempty"`
 
 	// Set by toolyard.
-	Flags        []Flag     `json:"flags,omitempty"` // request-level (questions, blockers)
-	Checked      bool       `json:"checked"`         // background checks finished
-	ToolyardSum  string     `json:"toolyard_summary,omitempty"`
-	DryRunCount  int        `json:"dry_run_count"`
-	DroppedFlags []string   `json:"dropped_flags,omitempty"`
-	OwnerNote    string     `json:"owner_note,omitempty"`
-	Answer       string     `json:"answer,omitempty"`
-	SnoozedUntil int64      `json:"snoozed_until,omitempty"`
-	DecidedBy    string     `json:"decided_by,omitempty"`
-	DecidedAt    int64      `json:"decided_at,omitempty"`
-	CreatedAt    int64      `json:"created_at"`
-	UpdatedAt    int64      `json:"updated_at"`
-	ExpiresAt    int64      `json:"expires_at"`
-	GrantsExpire int64      `json:"grants_expire_at,omitempty"`
-	Activity     []Activity `json:"activity,omitempty"`
+	Flags        []Flag   `json:"flags,omitempty"` // request-level (questions, blockers)
+	Checked      bool     `json:"checked"`         // background checks finished
+	ToolyardSum  string   `json:"toolyard_summary,omitempty"`
+	DryRunCount  int      `json:"dry_run_count"`
+	DroppedFlags []string `json:"dropped_flags,omitempty"`
+	OwnerNote    string   `json:"owner_note,omitempty"`
+	Answer       string   `json:"answer,omitempty"`
+	SnoozedUntil int64    `json:"snoozed_until,omitempty"`
+	// RequestedUrgency is what the agent asked for when toolyard lowered
+	// it; Downgraded says why.
+	RequestedUrgency string     `json:"requested_urgency,omitempty"`
+	Downgraded       string     `json:"downgraded,omitempty"`
+	RemindedAt       int64      `json:"reminded_at,omitempty"`
+	DigestedAt       int64      `json:"digested_at,omitempty"`
+	DecidedBy        string     `json:"decided_by,omitempty"`
+	DecidedAt        int64      `json:"decided_at,omitempty"`
+	CreatedAt        int64      `json:"created_at"`
+	UpdatedAt        int64      `json:"updated_at"`
+	ExpiresAt        int64      `json:"expires_at"`
+	GrantsExpire     int64      `json:"grants_expire_at,omitempty"`
+	Activity         []Activity `json:"activity,omitempty"`
 }
 
 // AllFlags returns request-level flags plus every tool's flags.
