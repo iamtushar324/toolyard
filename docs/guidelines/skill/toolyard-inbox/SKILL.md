@@ -50,6 +50,8 @@ then reading your evidence, and deciding at the end.
 - Each allowed tool comes with a grant. Call the tool with `_grant: "tyg_…"`,
   inside the parameters you asked for. The token is shown once; never log it,
   commit it or share it.
+- If a tool says `"narrowed": true`, your owner tightened it: call it with
+  the values in its `params`, not the ones you asked for.
 - Follow the `owner_note`.
 - If the request comes back as `returned`, a required tool was refused. Replan,
   and say what changed.
@@ -61,6 +63,7 @@ then reading your evidence, and deciding at the end.
 - Never get around a restricted tool (other credentials, direct API calls,
   another agent).
 - Never split a risky action to avoid a flag, or claim urgency you don't have.
+  `now` is limited per agent per hour; past the limit it becomes `soon`.
 
 Full details: `inbox.guide()`, or `inbox.guide({ topic: "examples" })` for
 worked examples.

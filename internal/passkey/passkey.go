@@ -89,13 +89,25 @@ func (s *Service) SetClock(now func() time.Time) { s.now = now }
 
 // RelyingParty derives the WebAuthn relying-party ID and origin from the
 // Origin header of a dashboard request. The origin must be https, or
-// http on localhost (browsers only allow WebAuthn in secure contexts).
-func RelyingParty(originHeader, host string) (rpID, origin string, err error) {
+// http on localhost (browsers only allow WebAuthn in secure contexts), and
+// its host must be one of hosts (the request's Host, a proxy's
+// X-Forwarded-Host, or the configured public URL's host) when any are given.
+func RelyingParty(originHeader string, hosts ...string) (rpID, origin string, err error) {
 	u, err := url.Parse(strings.TrimSpace(originHeader))
 	if err != nil || u.Host == "" || (u.Scheme != "https" && u.Scheme != "http") {
 		return "", "", ErrOrigin
 	}
-	if host != "" && !strings.EqualFold(u.Host, host) {
+	ok := true
+	for i, h := range hosts {
+		if i == 0 {
+			ok = false
+		}
+		if h != "" && strings.EqualFold(u.Host, h) {
+			ok = true
+			break
+		}
+	}
+	if !ok {
 		return "", "", ErrOrigin
 	}
 	name := u.Hostname()
@@ -197,8 +209,8 @@ func (s *Service) take(id, kind string) (*ceremony, error) {
 
 // BeginRegistration starts adding a passkey. It returns the ceremony ID
 // and the options for navigator.credentials.create.
-func (s *Service) BeginRegistration(ctx context.Context, u User, originHeader, host string) (string, *protocol.CredentialCreation, error) {
-	rpID, origin, err := RelyingParty(originHeader, host)
+func (s *Service) BeginRegistration(ctx context.Context, u User, originHeader string, hosts ...string) (string, *protocol.CredentialCreation, error) {
+	rpID, origin, err := RelyingParty(originHeader, hosts...)
 	if err != nil {
 		return "", nil, err
 	}
@@ -284,8 +296,8 @@ func purposeTag(purpose string) []byte {
 // BeginAssertion starts a confirmation for purpose ("decide:<digest>" or
 // "remove:<passkey id>"). It returns the ceremony ID and the options for
 // navigator.credentials.get.
-func (s *Service) BeginAssertion(ctx context.Context, u User, purpose, originHeader, host string) (string, *protocol.CredentialAssertion, error) {
-	rpID, origin, err := RelyingParty(originHeader, host)
+func (s *Service) BeginAssertion(ctx context.Context, u User, purpose, originHeader string, hosts ...string) (string, *protocol.CredentialAssertion, error) {
+	rpID, origin, err := RelyingParty(originHeader, hosts...)
 	if err != nil {
 		return "", nil, err
 	}

@@ -214,15 +214,22 @@ Everything above is implemented, with these specifics and differences:
 | Attachments | Inline: markdown, table, chart, diff, code, log, link. Media by link, copied once with an SSRF guard (dial-time IP check, no proxy, 3 redirects max, type and size caps). |
 | Flags | Rule flags always; judge flags ("Doesn't match the request") only when the owner enables the Gemini judge. Dry runs return both and are logged; the review page shows the dry-run count and any flags that disappeared between the dry runs and the final request. |
 | Toolyard's own reading | "Summarize with toolyard" / "Ask toolyard" use the judge when it's on, otherwise a rule-based reading that says so. |
-| Voice notes | Spoken by the browser (Web Speech API) from the agent's script; no server-side audio yet. |
+| Voice notes | Recorded on the server with Gemini text-to-speech when the owner turns it on (`inbox_voice_enabled`, needs `GEMINI_API_KEY`) and stored with the attachments; otherwise, or if recording fails, spoken by the browser (Web Speech API). Agents only ever send the script. |
 | Sessions | `session.start` / `session.update`; the Sessions tab derives blocked / waiting / stale (no heartbeat for 15 min) / working, shows live permissions per agent, "told to ask N× today" from coaching events, and a revoke-all kill switch. |
-| Confirmation | Approving production-flagged or red-flagged tools asks for a second tap. A biometric (WebAuthn/Face ID) step is not built yet. |
-| Notifications | Push for `now`/`soon` access requests, questions and blockers; content-free (agent name + kind). No scheduled digest yet: `digest` items simply don't push. Snoozing hides the badge count until the snooze ends but doesn't re-notify. |
+| Scope editor | Before approving, the owner can narrow any tool: fewer `in` values, an exact value for a `limit` or `any`, a longer `prefix`, a tighter range, and a shorter TTL. The server refuses anything wider than the request. The agent sees `"narrowed": true` and the granted `params`. |
+| Confirmation | Approving production-flagged or red-flagged tools asks for a second tap. Once the owner registers a passkey (Settings → Inbox & permissions), it needs a passkey assertion (Face ID) whose challenge commits to the exact decision (tools, narrowed parameters, TTL). Removing a passkey needs a passkey; `-inbox-reset-passkeys` is the operator's recovery path. |
+| Notifications | inbox-spec §6: `now` pushes at once (3 per agent per hour, then lowered to `soon` with a warning), `soon` is grouped per session after 90 s, `digest` goes into the owner's digest (default 09:30 / 13:30 / 18:30, owner's time zone), `fyi` never pushes. Quiet hours hold everything except `now` requests whose tools are all on the allow list. A request whose session is `blocked_on_owner` (or a blocker) gets one reminder after max(15 min, the owner's median decision time). Snoozed requests push again when the snooze ends. Pushes carry no agent text unless the owner turns on `inbox_push_details`. Notification actions are Deny / Snooze 1 h, and the answer options for a two-option question; **no notification ever approves tools**. |
 | Expiry | Pending requests expire after 24 h, updates after 7 days. |
 | CLI | `toolyard guide`, `check`, `request --from file.json [--dry-run]`, `wait`, `skills install toolyard-inbox`. |
+| Batch | `POST /v1/inbox/batch` reads, denies or snoozes many requests at once ("Mark all read" on Updates). Approving is never batched. |
+| Hook | `scripts/claude-code-hook.sh` adds a one-line next step for `permission_required` / `grant_invalid` and never blocks; the old polling path only runs for execute-mode deferred responses. |
 
 Tests: `internal/inbox` (validation, flags, grants incl. concurrent
-redemption, snapshots, judge parsing, guide/doc drift), `internal/gateway`
+redemption, narrowing, attention policy incl. quiet hours / grouping /
+digest / reminder / snooze, notification taps, voice notes, snapshots,
+judge parsing, guide/doc drift), `internal/passkey` (registration and
+assertions against a software authenticator, decision binding, replay,
+wrong origin, forged signature, expiry), `internal/gateway`
 (coaching, grant lifecycle through routing, deny beats grant),
 `internal/api` (owner routes, auth, guide), and `scripts/e2e_inbox_test.go`
 against a running gateway with a real MCP client.

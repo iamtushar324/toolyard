@@ -79,8 +79,15 @@ single-use permission (a grant) tied to the exact parameters you saw.
   contradict the agent's own description. "Summarize with toolyard" and
   "Ask toolyard" give its own reading on demand.
 - **You** see the Inbox tab: the agent's message and voice note first,
-  evidence next, the decision last. The Sessions tab shows what each agent
-  is doing, its live permissions, and a kill switch.
+  evidence next, the decision last. You can narrow any tool's parameters and
+  shorten how long permissions last before approving, and production or
+  red-flagged tools need your passkey (Face ID) once you've added one. The
+  Sessions tab shows what each agent is doing, its timeline, its live
+  permissions, and a kill switch.
+- **Your phone** buzzes by urgency: `now` at once (rate-limited per agent),
+  `soon` grouped per session, `digest` in scheduled digests, never for
+  updates, and not during quiet hours. Details in
+  [docs/self-hosting.md](docs/self-hosting.md#inbox-and-permissions).
 
 `approval_mode` (Settings → Inbox & permissions) decides what happens when
 an agent calls a restricted tool without a grant: `execute` (default)

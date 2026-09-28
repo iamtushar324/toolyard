@@ -156,7 +156,8 @@ stuck, rather than choosing between options.
 ## 5. The voice note
 
 Your owner often listens before reading. Toolyard turns your script into
-speech; you never handle audio files.
+speech (recorded on the server, or read by the owner's browser); you never
+handle audio files. The script is read aloud exactly as written.
 
 - **75 words at most** (about 30 seconds).
 - **First person**: "I'd like to…", "I need…".
@@ -208,7 +209,15 @@ voice note uses for it.
 | `digest` | You need it today, not this hour. |
 | `fyi` | No action needed. Updates only. |
 
-Toolyard rate-limits `now` and lowers the urgency of agents that overuse it.
+Your owner decides when their phone buzzes, not you: `now` pushes at once,
+`soon` is grouped with your session's other requests for a minute and a half,
+`digest` waits for the owner's next digest (by default 09:30, 13:30 and
+18:30), and `fyi` never pushes. Quiet hours hold everything except the tools
+your owner allows through.
+
+Each agent gets **3 `now` requests an hour** (your owner can change this).
+Past that, toolyard lowers the request to `soon`, shows your owner it was
+lowered, and returns a warning with `path: "urgency"`.
 
 ## 8. Dry run
 
@@ -255,6 +264,8 @@ A decision looks like this:
 { "request_id": "rq_…", "kind": "access", "status": "approved",
   "tools": [
     { "tool": "github.merge_pull_request", "decision": "allowed", "grant_id": "gr_…", "grant": "tyg_…" },
+    { "tool": "deploy.run", "decision": "allowed", "grant_id": "gr_…", "grant": "tyg_…",
+      "narrowed": true, "params": { "env": { "eq": "prod" }, "ref": { "eq": "7c1d2e9" } } },
     { "tool": "flags.set",                 "decision": "refused" }
   ],
   "owner_note": "Don't touch the flag; I'll roll it out myself.",
@@ -269,6 +280,10 @@ A decision looks like this:
   or PRs, and never pass it to another agent. It only works for you anyway.
 - Call the tool with `_grant` added to its arguments. Stay inside the
   parameters you asked for, or the call is blocked.
+- Your owner can **narrow** a tool before allowing it: fewer values, an
+  exact value instead of a `limit`, a tighter range, or a shorter
+  `grants_expire_at`. They can never widen it. A narrowed tool has
+  `"narrowed": true` and its `params` are what the grant allows: use those.
 - Read `owner_note`, and honour it even for tools that were allowed.
 - If `status` is `returned`, a required tool was refused. Replan, and say in
   your next request what changed.

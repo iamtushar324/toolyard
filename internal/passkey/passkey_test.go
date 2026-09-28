@@ -81,6 +81,13 @@ func TestRelyingParty(t *testing.T) {
 			t.Errorf("%s on %s: err=%v", c.origin, c.host, err)
 		}
 	}
+	// Behind a proxy that rewrites Host, X-Forwarded-Host (the second host) matches.
+	if _, _, err := RelyingParty("https://yard.example.com", "127.0.0.1:8787", "yard.example.com"); err != nil {
+		t.Errorf("forwarded host refused: %v", err)
+	}
+	if _, _, err := RelyingParty("https://evil.example.com", "127.0.0.1:8787", "yard.example.com"); err == nil {
+		t.Error("an origin matching neither host was accepted")
+	}
 }
 
 func TestRegisterAssertAndBinding(t *testing.T) {

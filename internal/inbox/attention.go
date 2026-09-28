@@ -273,8 +273,10 @@ type pushRow struct {
 // Tick runs one round of the attention loop: due pushes, reminders and
 // the digest. RunAttention calls it on an interval; tests call it directly.
 func (s *Service) Tick(ctx context.Context) {
+	s.attnMu.Lock()
+	defer s.attnMu.Unlock()
 	s.scanReminders(ctx)
-	s.dispatchPushes(ctx)
+	s.dispatchLocked(ctx)
 	s.runDigest(ctx)
 }
 
@@ -296,7 +298,15 @@ func (s *Service) markPush(ctx context.Context, id int64, outcome string) {
 	_, _ = s.db.ExecContext(ctx, `UPDATE inbox_pushes SET sent_at = ?, outcome = ? WHERE id = ?`, s.now().UnixMilli(), outcome, id)
 }
 
+// dispatchPushes sends due notifications. One dispatcher runs at a time,
+// so a row is never sent twice.
 func (s *Service) dispatchPushes(ctx context.Context) {
+	s.attnMu.Lock()
+	defer s.attnMu.Unlock()
+	s.dispatchLocked(ctx)
+}
+
+func (s *Service) dispatchLocked(ctx context.Context) {
 	now := s.now()
 	rows, err := s.db.QueryContext(ctx, `SELECT id, request_id, group_key, reason, urgency FROM inbox_pushes
 		WHERE sent_at IS NULL AND due_at <= ? ORDER BY due_at, id`, now.UnixMilli())

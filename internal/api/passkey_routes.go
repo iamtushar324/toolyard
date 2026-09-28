@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"net/url"
 	"strings"
 
 	"github.com/tusharbhardwaj/toolyard/internal/audit"
@@ -74,7 +75,7 @@ func (s *Server) passkeysItem(w http.ResponseWriter, r *http.Request) {
 	origin := r.Header.Get("Origin")
 	switch {
 	case rest == "register/begin":
-		id, opts, err := s.passkeys.BeginRegistration(ctx, u, origin, r.Host)
+		id, opts, err := s.passkeys.BeginRegistration(ctx, u, origin, s.passkeyHosts(r)...)
 		if err != nil {
 			writeError(w, http.StatusBadRequest, err.Error())
 			return
@@ -98,7 +99,7 @@ func (s *Server) passkeysItem(w http.ResponseWriter, r *http.Request) {
 		s.auditPasskey(r, "passkey.register", pk.Name)
 		writeJSON(w, http.StatusOK, map[string]any{"passkey": pk})
 	case len(parts) == 3 && parts[1] == "remove" && parts[2] == "begin":
-		id, opts, err := s.passkeys.BeginAssertion(ctx, u, "remove:"+parts[0], origin, r.Host)
+		id, opts, err := s.passkeys.BeginAssertion(ctx, u, "remove:"+parts[0], origin, s.passkeyHosts(r)...)
 		if err != nil {
 			writeError(w, http.StatusBadRequest, err.Error())
 			return
@@ -143,7 +144,7 @@ func (s *Server) inboxPasskeyBegin(w http.ResponseWriter, r *http.Request, id st
 		return
 	}
 	body.Decision.Passkey = nil
-	sid, opts, err := s.passkeys.BeginAssertion(r.Context(), u, "decide:"+inbox.DecisionDigest(id, body.Decision), r.Header.Get("Origin"), r.Host)
+	sid, opts, err := s.passkeys.BeginAssertion(r.Context(), u, "decide:"+inbox.DecisionDigest(id, body.Decision), r.Header.Get("Origin"), s.passkeyHosts(r)...)
 	if err != nil {
 		status := http.StatusBadRequest
 		if errors.Is(err, passkey.ErrNone) {
@@ -153,6 +154,22 @@ func (s *Server) inboxPasskeyBegin(w http.ResponseWriter, r *http.Request, id st
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"session_id": sid, "options": opts})
+}
+
+// passkeyHosts are the hosts a passkey ceremony may run on: the public
+// URL's when one is configured, else this request's Host or the proxy's
+// X-Forwarded-Host.
+func (s *Server) passkeyHosts(r *http.Request) []string {
+	if s.security.PublicURL != "" {
+		if u, err := url.Parse(s.security.PublicURL); err == nil && u.Host != "" {
+			return []string{u.Host}
+		}
+	}
+	hosts := []string{r.Host}
+	if fh := strings.TrimSpace(strings.Split(r.Header.Get("X-Forwarded-Host"), ",")[0]); fh != "" {
+		hosts = append(hosts, fh)
+	}
+	return hosts
 }
 
 func (s *Server) auditPasskey(r *http.Request, ev, detail string) {

@@ -1,9 +1,20 @@
 # toolyard — owner inbox and scoped grants: design spec
 
-Status: **implemented (v1)**. Where this early spec differs from the code
-(table layout, tool names in §7, digest scheduling, biometric confirmation),
-[agent-onboarding.md → What shipped in v1](agent-onboarding.md#what-shipped-in-v1)
-and [agent-protocol.md](agent-protocol.md) are authoritative. Decision records: [ADR 0005](../adr/0005-scoped-grants.md), [ADR 0006](../adr/0006-coach-dont-queue.md). How agents learn the protocol: [agent-onboarding.md](agent-onboarding.md).
+Status: **implemented through Phase 4** (§11). Phase 5 (broker mode) is not
+built. Where this early spec differs from the code, [agent-onboarding.md →
+What shipped in v1](agent-onboarding.md#what-shipped-in-v1) and
+[agent-protocol.md](agent-protocol.md) are authoritative. Deliberate changes
+from this draft:
+
+- Table layout and tool names (§4, §7): see the onboarding doc.
+- **Notifications never approve** (§8.3). Allowing tools happens on the review
+  page, after the owner has read or heard the request. Notifications offer
+  Deny and Snooze 1 h, and one action per option on a two-option question.
+- Pushes carry agent text only when the owner turns on push details.
+- Grants are always single use, so the scope editor narrows parameters and
+  the TTL but has no "fewer uses" control.
+- A passkey confirmation applies once the owner has registered a passkey; until
+  then high-risk approvals take a second tap. Decision records: [ADR 0005](../adr/0005-scoped-grants.md), [ADR 0006](../adr/0006-coach-dont-queue.md). How agents learn the protocol: [agent-onboarding.md](agent-onboarding.md).
 Principles: [principles.md](principles.md). Agent rules:
 [agent-protocol.md](agent-protocol.md).
 

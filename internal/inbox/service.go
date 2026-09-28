@@ -90,6 +90,7 @@ type Service struct {
 	bg      sync.WaitGroup
 	watchMu sync.Mutex
 	watch   map[string]chan struct{}
+	attnMu  sync.Mutex // one attention round (Tick / dispatch) at a time
 }
 
 // New creates the service and loads (or creates) the grant signing key.
@@ -295,8 +296,13 @@ func (s *Service) Submit(ctx context.Context, agentID string, sub *Submission) (
 	s.publish("inbox", s.cardView(ctx, r))
 	s.enqueueArrival(ctx, r)
 	if r.Urgency == UrgencyNow {
-		// Don't wait for the next tick for the one urgency that means it.
-		s.dispatchPushes(ctx)
+		// Don't wait for the next tick for the one urgency that means it,
+		// and don't hold the agent's call while the push goes out.
+		s.bg.Add(1)
+		go func() {
+			defer s.bg.Done()
+			s.dispatchPushes(context.Background())
+		}()
 	}
 	s.bg.Add(1)
 	go func(id string) {

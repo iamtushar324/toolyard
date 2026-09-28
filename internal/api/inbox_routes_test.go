@@ -274,6 +274,7 @@ func TestInboxDecideByToken(t *testing.T) {
 	if err != nil || !res.OK {
 		t.Fatalf("submit: %v %+v", err, res)
 	}
+	f.svc.Flush() // the `now` push goes out in the background
 	if len(*f.pushes) != 1 || (*f.pushes)[0].TapToken == "" {
 		t.Fatalf("push: %+v", *f.pushes)
 	}
