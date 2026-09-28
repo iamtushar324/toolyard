@@ -10,6 +10,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/go-webauthn/webauthn/protocol"
 	"github.com/mark3labs/mcp-go/mcp"
 
 	"github.com/tusharbhardwaj/toolyard/internal/approval"
@@ -18,6 +19,8 @@ import (
 	"github.com/tusharbhardwaj/toolyard/internal/identity"
 	"github.com/tusharbhardwaj/toolyard/internal/inbox"
 	"github.com/tusharbhardwaj/toolyard/internal/memory"
+	"github.com/tusharbhardwaj/toolyard/internal/passkey"
+	"github.com/tusharbhardwaj/toolyard/internal/passkey/passkeytest"
 	"github.com/tusharbhardwaj/toolyard/internal/policy"
 	"github.com/tusharbhardwaj/toolyard/internal/realtime"
 	"github.com/tusharbhardwaj/toolyard/internal/store"
@@ -57,7 +60,8 @@ func newInboxAPIFixture(t *testing.T) *inboxAPIFixture {
 	gw.RegisterBuiltins()
 	t.Cleanup(func() { _ = gw.Close() })
 	pushes := &[]inbox.Push{}
-	svc, err := inbox.New(ctx, inbox.Options{DB: db, Catalog: gw,
+	pks := passkey.New(db)
+	svc, err := inbox.New(ctx, inbox.Options{DB: db, Catalog: gw, Passkeys: pks,
 		Notify: func(_ context.Context, p inbox.Push) { *pushes = append(*pushes, p) }})
 	if err != nil {
 		t.Fatal(err)
@@ -68,7 +72,7 @@ func newInboxAPIFixture(t *testing.T) *inboxAPIFixture {
 	gw.RegisterInboxTools()
 	snaps, _ := inbox.NewSnapshotter(db, filepath.Join(dir, "blobs"))
 
-	srv := New(ctx, Options{Identity: id, Audit: auditLog, Approval: bus, Gateway: gw, Inbox: svc, Snapshots: snaps, Guide: guide,
+	srv := New(ctx, Options{Identity: id, Audit: auditLog, Approval: bus, Gateway: gw, Inbox: svc, Snapshots: snaps, Guide: guide, Passkeys: pks,
 		SessionKey: []byte("0123456789abcdef0123456789abcdef")})
 	mux := http.NewServeMux()
 	srv.Routes(mux)
@@ -102,6 +106,7 @@ func (f *inboxAPIFixture) owner(t *testing.T, method, path string, body any) (in
 	req := httptest.NewRequest(method, path, rd)
 	req.AddCookie(f.cookie)
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Origin", "https://example.com") // httptest's Host is example.com
 	rec := httptest.NewRecorder()
 	f.mux.ServeHTTP(rec, req)
 	var out map[string]any
@@ -295,4 +300,100 @@ func TestInboxDecideByToken(t *testing.T) {
 	if r.Status != inbox.StatusPending || r.SnoozedUntil == 0 {
 		t.Fatalf("after snooze: %+v", r)
 	}
+}
+
+// The passkey flow over HTTP: register, high-risk approve refused without
+// it, confirm, approve; removal needs a passkey too.
+func TestPasskeyAPIFlow(t *testing.T) {
+	f := newInboxAPIFixture(t)
+	ctx := context.Background()
+	auth := passkeytest.New("https://example.com")
+
+	code, out := f.owner(t, http.MethodPost, "/v1/passkeys/register/begin", map[string]any{})
+	if code != http.StatusOK {
+		t.Fatalf("register begin: %d %v", code, out)
+	}
+	var creation protocol.CredentialCreation
+	remarshal(t, out["options"], &creation)
+	cred, err := auth.Create(&creation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	code, out = f.owner(t, http.MethodPost, "/v1/passkeys/register/finish",
+		map[string]any{"session_id": out["session_id"], "name": "iPhone", "credential": json.RawMessage(cred)})
+	if code != http.StatusOK {
+		t.Fatalf("register finish: %d %v", code, out)
+	}
+	pkID := out["passkey"].(map[string]any)["id"].(string)
+	if code, out = f.owner(t, http.MethodGet, "/v1/passkeys", nil); code != http.StatusOK || len(out["passkeys"].([]any)) != 1 {
+		t.Fatalf("list: %d %v", code, out)
+	}
+
+	res, err := f.svc.Submit(ctx, f.agent, &inbox.Submission{Kind: inbox.KindAccess, Title: "Deploy api", Summary: "s",
+		Message: "I'd like to deploy the api to production.", Audio: inbox.Audio{Script: "Deploy?"}, Urgency: inbox.UrgencySoon,
+		Facts: &inbox.Facts{WhyNow: "w", IfItGoesWrong: "g", Undo: "u"},
+		Tools: []inbox.SubmissionTool{{Tool: "memory.delete", Required: true, Summary: "Delete the prod key.", Params: map[string]any{"key": "prod-cache"}}}})
+	if err != nil || !res.OK {
+		t.Fatalf("submit: %v %+v", err, res)
+	}
+	f.svc.Flush()
+	r, _ := f.svc.Get(ctx, res.RequestID)
+	if !inbox.HighRisk(r) {
+		t.Fatalf("expected a high-risk request, flags: %+v", r.AllFlags())
+	}
+	decision := map[string]any{"action": "approve", "allow": []bool{true}}
+	code, out = f.owner(t, http.MethodPost, "/v1/inbox/"+r.ID+"/decide", decision)
+	if code != http.StatusPreconditionRequired || out["code"] != "passkey_required" {
+		t.Fatalf("approve without passkey: %d %v", code, out)
+	}
+	code, out = f.owner(t, http.MethodPost, "/v1/inbox/"+r.ID+"/passkey", map[string]any{"decision": decision})
+	if code != http.StatusOK {
+		t.Fatalf("passkey begin: %d %v", code, out)
+	}
+	var assertion protocol.CredentialAssertion
+	remarshal(t, out["options"], &assertion)
+	resp, err := auth.Get(&assertion, f.ownerID(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	decision["passkey"] = map[string]any{"session_id": out["session_id"], "response": json.RawMessage(resp)}
+	code, out = f.owner(t, http.MethodPost, "/v1/inbox/"+r.ID+"/decide", decision)
+	if code != http.StatusOK {
+		t.Fatalf("approve with passkey: %d %v", code, out)
+	}
+
+	// Removing needs a passkey confirmation for that removal.
+	if code, _ = f.owner(t, http.MethodPost, "/v1/passkeys/"+pkID+"/remove", map[string]any{"session_id": "nope", "response": json.RawMessage(`{}`)}); code != http.StatusForbidden {
+		t.Fatalf("remove without confirmation: %d", code)
+	}
+	code, out = f.owner(t, http.MethodPost, "/v1/passkeys/"+pkID+"/remove/begin", map[string]any{})
+	if code != http.StatusOK {
+		t.Fatalf("remove begin: %d %v", code, out)
+	}
+	remarshal(t, out["options"], &assertion)
+	resp, _ = auth.Get(&assertion, f.ownerID(t))
+	if code, out = f.owner(t, http.MethodPost, "/v1/passkeys/"+pkID+"/remove", map[string]any{"session_id": out["session_id"], "response": json.RawMessage(resp)}); code != http.StatusOK {
+		t.Fatalf("remove: %d %v", code, out)
+	}
+}
+
+func remarshal(t *testing.T, in, out any) {
+	t.Helper()
+	b, _ := json.Marshal(in)
+	if err := json.Unmarshal(b, out); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func (f *inboxAPIFixture) ownerID(t *testing.T) string {
+	t.Helper()
+	uid, err := f.srv.requireUser(func() *http.Request {
+		r := httptest.NewRequest(http.MethodGet, "/", nil)
+		r.AddCookie(f.cookie)
+		return r
+	}())
+	if err != nil {
+		t.Fatal(err)
+	}
+	return uid
 }

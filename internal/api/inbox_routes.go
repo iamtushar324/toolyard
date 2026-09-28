@@ -159,6 +159,8 @@ func (s *Server) inboxItem(w http.ResponseWriter, r *http.Request) {
 		s.inboxGet(w, r, uid, parts[0])
 	case len(parts) == 2 && parts[1] == "decide":
 		s.inboxDecide(w, r, uid, parts[0])
+	case len(parts) == 2 && parts[1] == "passkey":
+		s.inboxPasskeyBegin(w, r, parts[0])
 	case len(parts) == 2 && parts[1] == "summarize":
 		s.inboxSummarize(w, r, parts[0])
 	case len(parts) == 2 && parts[1] == "explain":
@@ -472,7 +474,11 @@ func writeInboxErr(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusNotFound, "not found")
 	case errors.Is(err, inbox.ErrNotPending):
 		writeError(w, http.StatusConflict, err.Error())
-	case errors.Is(err, inbox.ErrRequiredRefused), errors.Is(err, inbox.ErrNothingAllowed), errors.Is(err, inbox.ErrBadDecision):
+	case errors.Is(err, inbox.ErrPasskeyRequired):
+		writeJSON(w, http.StatusPreconditionRequired, map[string]any{"error": err.Error(), "code": "passkey_required"})
+	case errors.Is(err, inbox.ErrPasskeyFailed):
+		writeJSON(w, http.StatusForbidden, map[string]any{"error": err.Error(), "code": "passkey_failed"})
+	case errors.Is(err, inbox.ErrRequiredRefused), errors.Is(err, inbox.ErrNothingAllowed), errors.Is(err, inbox.ErrBadDecision), errors.Is(err, inbox.ErrWiden):
 		writeError(w, http.StatusBadRequest, err.Error())
 	default:
 		writeError(w, http.StatusBadRequest, err.Error())

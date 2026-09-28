@@ -381,3 +381,74 @@ func sortedKeys(m map[string]any) []string {
 	sort.Strings(out)
 	return out
 }
+
+// Within reports whether c allows nothing that req doesn't: every value c
+// accepts, req accepts too. The owner can narrow a request's parameters
+// with it but never widen them.
+func (c Constraint) Within(req Constraint) bool {
+	if req.Op == "any" {
+		return true
+	}
+	if c.Op == "eq" {
+		// A single value is within req exactly when req matches it.
+		return req.Matches(c.Eq, true)
+	}
+	switch req.Op {
+	case "in":
+		if c.Op != "in" {
+			return false
+		}
+		for _, v := range c.In {
+			if !req.Matches(v, true) {
+				return false
+			}
+		}
+		return true
+	case "prefix":
+		return c.Op == "prefix" && strings.HasPrefix(c.Prefix, req.Prefix)
+	case "range":
+		if c.Op != "range" {
+			return false
+		}
+		if req.Gte != nil && (c.Gte == nil || *c.Gte < *req.Gte) {
+			return false
+		}
+		if req.Lte != nil && (c.Lte == nil || *c.Lte > *req.Lte) {
+			return false
+		}
+		return true
+	case "limit":
+		return c.Op == "limit" && c.Pattern == req.Pattern
+	}
+	return false
+}
+
+// Narrow applies the owner's tighter constraints to a parameter set. Every
+// key must already be in params and every constraint must be Within the
+// original.
+func Narrow(params map[string]Constraint, tighter map[string]Constraint) (map[string]Constraint, error) {
+	out := make(map[string]Constraint, len(params))
+	for k, v := range params {
+		out[k] = v
+	}
+	for _, k := range sortedKeysC(tighter) {
+		orig, ok := params[k]
+		if !ok {
+			return nil, fmt.Errorf("parameter %q wasn't in the request", k)
+		}
+		if !tighter[k].Within(orig) {
+			return nil, fmt.Errorf("parameter %q: %s is wider than the request (%s)", k, tighter[k].Describe(), orig.Describe())
+		}
+		out[k] = tighter[k]
+	}
+	return out, nil
+}
+
+func sortedKeysC(m map[string]Constraint) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
+}

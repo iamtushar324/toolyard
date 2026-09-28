@@ -137,6 +137,10 @@ type ToolRequest struct {
 	Params   map[string]Constraint `json:"params"`
 	After    []string              `json:"after,omitempty"`
 
+	// Requested holds the agent's original parameters when the owner
+	// narrowed them; Params is then what was granted.
+	Requested map[string]Constraint `json:"requested_params,omitempty"`
+
 	// Set by toolyard.
 	Upstream string `json:"upstream,omitempty"`
 	Flags    []Flag `json:"flags,omitempty"`

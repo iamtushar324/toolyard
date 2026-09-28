@@ -55,6 +55,7 @@ import (
 	"github.com/tusharbhardwaj/toolyard/internal/metrics"
 	"github.com/tusharbhardwaj/toolyard/internal/notes"
 	"github.com/tusharbhardwaj/toolyard/internal/oauth"
+	"github.com/tusharbhardwaj/toolyard/internal/passkey"
 	"github.com/tusharbhardwaj/toolyard/internal/policy"
 	"github.com/tusharbhardwaj/toolyard/internal/push"
 	"github.com/tusharbhardwaj/toolyard/internal/realtime"
@@ -98,6 +99,7 @@ type Server struct {
 	mempalace                *mempalace.Service
 	inbox                    *inbox.Service
 	snapshots                *inbox.Snapshotter
+	passkeys                 *passkey.Service
 	guide                    *inbox.Guide
 	notes                    *notes.Service
 	skills                   *skills.Service
@@ -178,6 +180,8 @@ type Options struct {
 	Inbox     *inbox.Service
 	Snapshots *inbox.Snapshotter
 	Guide     *inbox.Guide
+	// Passkeys confirm high-risk approvals (/v1/passkeys/*). Optional.
+	Passkeys *passkey.Service
 	// WebhookMaxBytes caps the memory-webhook ingest body. 0 falls back to
 	// the default (25 MiB).
 	WebhookMaxBytes int64
@@ -214,6 +218,7 @@ func New(ctx context.Context, opts Options) *Server {
 		memWebhooks:              opts.MemWebhooks,
 		inbox:                    opts.Inbox,
 		snapshots:                opts.Snapshots,
+		passkeys:                 opts.Passkeys,
 		guide:                    opts.Guide,
 		webhookMaxBytes:          opts.WebhookMaxBytes,
 		sessionKey:               opts.SessionKey,
@@ -332,6 +337,7 @@ func (s *Server) Routes(mux *http.ServeMux) {
 	s.cliRoutes(mux)
 	s.voiceRoutes(mux)
 	s.inboxRoutes(mux)
+	s.passkeyRoutes(mux)
 }
 
 // ---- helpers ----------------------------------------------------------------

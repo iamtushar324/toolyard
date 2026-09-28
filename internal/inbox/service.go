@@ -35,6 +35,7 @@ var (
 	ErrRequiredRefused = errors.New("a required tool was refused; send the request back to the agent instead")
 	ErrNothingAllowed  = errors.New("allow at least one tool, or deny the request")
 	ErrBadDecision     = errors.New("that action doesn't apply to this kind of request")
+	ErrWiden           = errors.New("you can narrow a request but not widen it")
 	ErrTooManyPending  = fmt.Errorf("you already have %d requests waiting for your owner; cancel or wait for some first", MaxPendingPerAgent)
 	ErrDryRunRateLimit = fmt.Errorf("dry-run limit reached (%d per hour)", DryRunsPerHour)
 	ErrSessionNotYours = errors.New("that session doesn't belong to you")
@@ -67,6 +68,9 @@ type Options struct {
 	Notify func(ctx context.Context, p Push)
 	// Attention returns the owner's notification settings.
 	Attention func() AttentionConfig
+	// Passkeys, when set, gates high-risk approvals on a passkey once the
+	// owner has registered one.
+	Passkeys PasskeyGate
 	// AgentName resolves an agent ID to a display name.
 	AgentName func(ctx context.Context, agentID string) string
 	Now       func() time.Time
@@ -441,12 +445,36 @@ type Decision struct {
 	Note          string `json:"note,omitempty"`
 	Option        *int   `json:"option,omitempty"`
 	SnoozeMinutes int    `json:"snooze_minutes,omitempty"`
-	By            string `json:"-"`
+	// Params narrows allowed tools' parameters, by tool index: each
+	// constraint must be within what the agent asked for.
+	Params map[int]map[string]Constraint `json:"params,omitempty"`
+	// TTLSeconds shortens how long the grants last (never lengthens).
+	TTLSeconds int `json:"ttl_seconds,omitempty"`
+	// Passkey is a WebAuthn assertion, required to allow high-risk tools
+	// once the owner has registered a passkey (see passkey.go).
+	Passkey *PasskeyAssertion `json:"passkey,omitempty"`
+	By      string            `json:"-"`
 }
 
 // Decide applies an owner decision.
 func (s *Service) Decide(ctx context.Context, id string, d Decision) (*Request, error) {
 	now := s.now().UnixMilli()
+	// Passkey check happens before the transaction (verification writes
+	// the credential's sign count) and is re-checked inside it, in case
+	// the judge flagged a tool in between.
+	passkeyOn, verified := false, false
+	if d.Action == "approve" && s.opts.Passkeys != nil && s.opts.Passkeys.Enabled(ctx) {
+		passkeyOn = true
+		if pre, err := s.Get(ctx, id); err == nil && pre.IsOpen() && NeedsPasskey(pre, d.Allow) {
+			if d.Passkey == nil {
+				return nil, ErrPasskeyRequired
+			}
+			if err := s.opts.Passkeys.Verify(ctx, DecisionDigest(id, d), d.Passkey); err != nil {
+				return nil, fmt.Errorf("%w: %v", ErrPasskeyFailed, err)
+			}
+			verified = true
+		}
+	}
 	var out *Request
 	err := s.mutateTx(ctx, id, func(tx *sql.Tx, r *Request) error {
 		if d.Action != "snooze" && r.Status != StatusPending {
@@ -473,12 +501,38 @@ func (s *Service) Decide(ctx context.Context, id string, d Decision) (*Request, 
 			if n == 0 {
 				return ErrNothingAllowed
 			}
+			if passkeyOn && !verified && NeedsPasskey(r, d.Allow) {
+				return ErrPasskeyRequired
+			}
+			var narrowed []string
+			for i, tighter := range d.Params {
+				if i < 0 || i >= len(r.Tools) || !d.Allow[i] || len(tighter) == 0 {
+					continue
+				}
+				np, err := Narrow(r.Tools[i].Params, tighter)
+				if err != nil {
+					return fmt.Errorf("%w: %s: %v", ErrWiden, r.Tools[i].Tool, err)
+				}
+				r.Tools[i].Requested = r.Tools[i].Params
+				r.Tools[i].Params = np
+				narrowed = append(narrowed, r.Tools[i].Tool)
+			}
+			if d.TTLSeconds != 0 {
+				if d.TTLSeconds < MinTTL || d.TTLSeconds > r.TTLSeconds {
+					return fmt.Errorf("%w: ttl_seconds must be between %d and the requested %d", ErrWiden, MinTTL, r.TTLSeconds)
+				}
+				r.TTLSeconds = d.TTLSeconds
+			}
 			for i := range r.Tools {
 				if d.Allow[i] {
 					r.Tools[i].Decision = ToolAllowed
 				} else {
 					r.Tools[i].Decision = ToolRefused
 				}
+			}
+			if len(narrowed) > 0 {
+				sort.Strings(narrowed)
+				r.addActivity(now, "You narrowed "+strings.Join(narrowed, ", "))
 			}
 			ids, err := s.issueGrants(ctx, tx, r, now)
 			if err != nil {
@@ -580,11 +634,15 @@ type AgentView struct {
 // AgentToolView is one tool's outcome, with the grant token the first time
 // the agent sees it.
 type AgentToolView struct {
-	Tool      string `json:"tool"`
-	Decision  string `json:"decision"` // pending | allowed | refused
-	GrantID   string `json:"grant_id,omitempty"`
-	Grant     string `json:"grant,omitempty"`
-	GrantNote string `json:"grant_note,omitempty"`
+	Tool     string `json:"tool"`
+	Decision string `json:"decision"` // pending | allowed | refused
+	// Narrowed is set when the owner tightened the parameters; Params is
+	// then what the grant allows.
+	Narrowed  bool                  `json:"narrowed,omitempty"`
+	Params    map[string]Constraint `json:"params,omitempty"`
+	GrantID   string                `json:"grant_id,omitempty"`
+	Grant     string                `json:"grant,omitempty"`
+	GrantNote string                `json:"grant_note,omitempty"`
 }
 
 // Status returns the agent's view of its requests. Grant tokens are handed
@@ -611,6 +669,9 @@ func (s *Service) Status(ctx context.Context, agentID string, ids []string) ([]A
 			if tv.Decision == "" {
 				tv.Decision = "pending"
 			}
+			if t.Requested != nil {
+				tv.Narrowed, tv.Params = true, t.Params
+			}
 			if t.GrantID != "" {
 				if tok, ok := toks[t.GrantID]; ok {
 					tv.Grant = tok
@@ -635,7 +696,7 @@ func nextStep(r *Request, freshTokens bool) string {
 		return "Waiting for your owner. Keep working on anything that doesn't depend on it; inbox.wait blocks for up to 5 minutes."
 	case StatusApproved:
 		if freshTokens {
-			return "Call each allowed tool with its grant as `_grant`, exactly within the parameters you asked for. Each grant works once. Keep the tokens out of logs. Follow owner_note if there is one."
+			return "Call each allowed tool with its grant as `_grant`, exactly within the parameters you asked for (or `params`, where your owner narrowed them). Each grant works once. Keep the tokens out of logs. Follow owner_note if there is one."
 		}
 		return "Approved. Use the grant tokens you already collected."
 	case StatusDenied:

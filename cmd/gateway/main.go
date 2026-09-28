@@ -56,6 +56,7 @@ import (
 	"github.com/tusharbhardwaj/toolyard/internal/metrics"
 	notespkg "github.com/tusharbhardwaj/toolyard/internal/notes"
 	"github.com/tusharbhardwaj/toolyard/internal/oauth"
+	"github.com/tusharbhardwaj/toolyard/internal/passkey"
 	"github.com/tusharbhardwaj/toolyard/internal/policy"
 	"github.com/tusharbhardwaj/toolyard/internal/push"
 	"github.com/tusharbhardwaj/toolyard/internal/realtime"
@@ -161,6 +162,7 @@ func runServe(argv []string) error {
 	publicURL := fs.String("public-url", "", "public origin (e.g. https://toolyard.example.com). When set, enables HSTS, secure cookies, and Origin enforcement.")
 	trustedProxies := fs.String("trusted-proxy", "", "comma-separated CIDRs to trust for X-Forwarded-* headers (e.g. 127.0.0.1/32,::1/128,10.0.0.0/8)")
 	clickhouseRuntimeEnvPath := fs.String("clickhouse-runtime-env", "/var/lib/toolyard/clickhouse-runtime.env", "path where toolyard maintains a TOOLYARD_CH_PASSWORD=... line for the toolyard-clickhouse container's docker-compose env_file to consume. Updated on bootstrap and on every rotate. Empty disables the write (useful in tests).")
+	inboxResetPasskeys := fs.Bool("inbox-reset-passkeys", false, "delete every registered passkey at startup (recovery when the owner has lost all their devices), then continue normally")
 	inboxFetchPrivate := fs.Bool("inbox-fetch-private-networks", false, "let the inbox copy attachment links that point at loopback or private-network addresses (e.g. evidence hosted on your LAN). Off by default: agent-chosen URLs could otherwise reach internal services.")
 	requireAuthMCP := fs.Bool("require-auth-on-mcp", false, "reject anonymous /mcp calls (no Authorization header). Auto-enabled when -public-url is set.")
 	statelessMCP := fs.Bool("stateless-mcp", false, "skip MCP session-ID tracking. Every request stands alone — no server-initiated notifications, but agents that don't auto-reconnect on session-invalid (e.g., hermes) survive a toolyard restart without manual intervention.")
@@ -447,7 +449,16 @@ func runServe(argv []string) error {
 		}
 		return ""
 	}
+	passkeySvc := passkey.New(db)
+	if *inboxResetPasskeys {
+		n, err := passkeySvc.Reset(ctx)
+		if err != nil {
+			return fmt.Errorf("reset passkeys: %w", err)
+		}
+		log.Printf("inbox: removed %d passkey(s) (-inbox-reset-passkeys)", n)
+	}
 	inboxSvc, err := inbox.New(ctx, inbox.Options{
+		Passkeys:          passkeySvc,
 		DB:                db,
 		Catalog:           gw,
 		Judge:             inboxJudge,
@@ -910,6 +921,7 @@ func runServe(argv []string) error {
 		MemWebhooks:              memWebhookSvc,
 		Inbox:                    inboxSvc,
 		Snapshots:                inboxSnaps,
+		Passkeys:                 passkeySvc,
 		Guide:                    inboxGuide,
 		WebhookMaxBytes:          *webhookMaxBytes,
 		SessionKey:               loadOrCreateSessionKey(*dataDir),
