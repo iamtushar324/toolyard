@@ -5766,15 +5766,19 @@ function ibParamsEl(r, t, k, editable) {
   const rows = params.map((p) => {
     const orig = t.params[p], cur = narrowed[p];
     const editing = state.inbox.editing[key + ':' + p];
-    const kind = orig && orig.limit !== undefined ? el('span', { class: 'ib-lim' }, 'Limit') : el('span', { class: 'ib-ex' }, 'Exact');
+    const shown = cur || orig;
+    const kind = !shown || typeof shown !== 'object' || 'eq' in shown ? el('span', { class: 'ib-ex' }, 'Exact')
+      : 'limit' in shown ? el('span', { class: 'ib-lim' }, 'Limit')
+        : 'any' in shown ? el('span', { class: 'ib-lim' }, 'Any value') : el('span', { class: 'ib-ex' }, 'Bounded');
     const value = cur ? el('span', {}, el('b', {}, ibDescribe(cur)), el('small', { class: 'ib-was' }, ' was ' + ibDescribe(orig)))
       : req && req[p] && JSON.stringify(req[p]) !== JSON.stringify(orig) ? el('span', {}, el('b', {}, ibDescribe(orig)), el('small', { class: 'ib-was' }, ' narrowed from ' + ibDescribe(req[p])))
         : ibDescribe(orig);
-    const tools = editable && ibNarrowable(orig) ? el('td', { class: 'ib-ptools' },
-      cur ? el('button', { class: 'ib-link', on: { click: () => ibSetNarrow(r, k, p, null) } }, 'Reset')
-        : el('button', { class: 'ib-link', on: { click: () => { state.inbox.editing[key + ':' + p] = !editing; ibRegion('decide', ibDecideEl(r, state.inbox.detail.grants || [])); } } }, editing ? 'Cancel' : 'Narrow')) : el('td', {});
-    const out = [el('tr', {}, el('td', {}, p), el('td', {}, value), el('td', {}, kind), tools)];
-    if (editing && !cur) out.push(el('tr', { class: 'ib-nrow' }, el('td', { colspan: '4' }, ibNarrowEditor(r, k, p, orig, () => { delete state.inbox.editing[key + ':' + p]; }))));
+    const action = editable && ibNarrowable(orig)
+      ? (cur ? el('button', { class: 'ib-link', on: { click: () => ibSetNarrow(r, k, p, null) } }, 'Reset')
+        : el('button', { class: 'ib-link', on: { click: () => { state.inbox.editing[key + ':' + p] = !editing; ibRegion('decide', ibDecideEl(r, state.inbox.detail.grants || [])); } } }, editing ? 'Cancel' : 'Narrow'))
+      : null;
+    const out = [el('tr', {}, el('td', {}, p), el('td', {}, el('div', {}, value), el('div', { class: 'ib-pmeta' }, kind, action)))];
+    if (editing && !cur) out.push(el('tr', { class: 'ib-nrow' }, el('td', { colspan: '2' }, ibNarrowEditor(r, k, p, orig, () => { delete state.inbox.editing[key + ':' + p]; }))));
     return out;
   }).flat();
   return el('div', { class: 'ib-params' }, el('table', {}, el('tbody', {}, ...rows)),
@@ -5895,10 +5899,9 @@ function ibTTLEl(r) {
   const opts = [...new Set([req, 3600, 1800, 900, 300, 120].filter((v) => v <= req))].sort((a, b) => b - a);
   const cur = state.inbox.ttl[r.id] || req;
   const lbl = (v) => (v >= 3600 ? (v / 3600) + ' h' : Math.round(v / 60) + ' min') + (v === req ? ' (asked for)' : '');
-  return el('label', { class: 'ib-ttl' }, el('span', {}, 'Permissions expire'),
+  return el('label', { class: 'ib-ttl' }, el('span', {}, 'Permissions last'),
     el('select', { on: { change: (e) => { state.inbox.ttl[r.id] = +e.target.value; } } },
-      ...opts.map((v) => el('option', { value: String(v), selected: v === cur }, lbl(v)))),
-    el('span', {}, 'after you approve'));
+      ...opts.map((v) => el('option', { value: String(v), selected: v === cur }, lbl(v)))));
 }
 
 function ibApproveBody(r, allow) {
@@ -6137,9 +6140,8 @@ function ibSessionTimeline(x) {
     el('button', { class: 'ib-link', 'aria-expanded': String(open), on: { click: () => { state.inbox.sessOpen[x.id] = !open; render(); } } },
       open ? 'Hide timeline' : `Timeline · ${items.length} item${items.length === 1 ? '' : 's'}`),
     open ? el('ol', { class: 'ib-stlist' }, ...items.map((r) => el('li', {},
-      el('button', { class: 'ib-stitem', on: { click: () => openInboxRequest(r.id) } },
+      el('button', { class: 'ib-stitem', title: IB_KIND[r.kind] || r.kind, on: { click: () => openInboxRequest(r.id) } },
         el('span', { class: 'meta' }, ibClock(r.created_at)),
-        el('span', { class: 'ib-kind' }, IB_KIND[r.kind] || r.kind),
         el('b', {}, r.title), ibStatusPill(r))))) : null);
 }
 
@@ -6207,7 +6209,7 @@ function ibAttentionSettings(s, patch) {
       el('input', { type: 'text', value: s.inbox_digest_times === undefined ? '09:30,13:30,18:30' : s.inbox_digest_times, placeholder: 'none', class: 'ib-txt',
         on: { change: (e) => patch({ inbox_digest_times: e.target.value }) } })),
     el('div', { class: 'ib-setrow' }, el('span', {}, 'Time zone'),
-      el('span', { class: 'ib-inline' }, el('code', {}, tz || info.timezone || 'server'),
+      el('span', { class: 'ib-inline' }, el('code', {}, tz || (info.timezone && info.timezone !== 'Local' ? info.timezone : 'server time')),
         browserTZ && browserTZ !== tz ? el('button', { on: { click: () => patch({ inbox_timezone: browserTZ }) } }, 'Use ' + browserTZ) : null)),
     el('p', { class: 'meta' }, (info.quiet_now ? `Quiet until ${clock(info.quiet_until)}. ` : '') + `Next digest: ${clock(info.next_digest)}.` +
       (info.pending_pushes ? ` ${info.pending_pushes} notification(s) queued.` : '')),

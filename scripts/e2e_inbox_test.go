@@ -16,8 +16,11 @@
 package scripts
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"flag"
+	"io"
 	"net/http"
 	"strings"
 	"testing"
@@ -231,4 +234,139 @@ func textContent(res *mcp.CallToolResult) string {
 		}
 	}
 	return b.String()
+}
+
+// TestE2EInboxNarrowAndAttention: the owner narrows a request before
+// approving (the grant then only covers the narrowed values and the
+// shorter TTL), `now` is rate-limited per agent, and updates can be
+// batch-read.
+func TestE2EInboxNarrowAndAttention(t *testing.T) {
+	flag.Parse()
+	h := &httpClient{base: *toolyardURL}
+	mustLogin(t, h)
+	var dummy map[string]any
+	h.raw(t, "PATCH", "/v1/settings", map[string]any{"approval_mode": "inbox", "inbox_now_per_hour": 1}, &dummy)
+	t.Cleanup(func() {
+		h.raw(t, "PATCH", "/v1/settings", map[string]any{"approval_mode": "execute", "inbox_now_per_hour": 3}, &dummy)
+	})
+	token := enrollAgent(t, h, "inbox-narrow-e2e")
+	c := mcpClient(t, *toolyardURL, token)
+	defer c.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	stamp := time.Now().Format("150405.000")
+	k1, k2 := "narrow-a-"+stamp, "narrow-b-"+stamp
+	_, sent := callTool(t, c, ctx, "inbox.request", map[string]any{
+		"title": "Write one of two cache keys", "summary": "One memory write.",
+		"message": "I need to write a cache key; I don't know yet which of the two.",
+		"facts":   map[string]any{"why_now": "The cache is cold.", "if_it_goes_wrong": "One key is wrong.", "undo": "Delete it."},
+		"audio":   map[string]any{"script": "I'd like to write one cache key."}, "urgency": "soon", "ttl_seconds": 600,
+		"tools": []any{map[string]any{"tool": "memory.set", "required": true, "summary": "Write the key.",
+			"params": map[string]any{"key": map[string]any{"in": []any{k1, k2}}, "value": map[string]any{"any": true}}}},
+	})
+	reqID, _ := sent["request_id"].(string)
+	if sent["ok"] != true {
+		t.Fatalf("request: %v", sent)
+	}
+
+	// Widening is refused; narrowing works.
+	var out map[string]any
+	code := h.rawStatus(t, "POST", "/v1/inbox/"+reqID+"/decide", map[string]any{"action": "approve", "allow": []bool{true},
+		"params": map[string]any{"0": map[string]any{"key": "other"}}}, &out)
+	if code != http.StatusBadRequest {
+		t.Fatalf("widening should be refused, got %d %v", code, out)
+	}
+	code = h.rawStatus(t, "POST", "/v1/inbox/"+reqID+"/decide", map[string]any{"action": "approve", "allow": []bool{true}, "ttl_seconds": 120,
+		"params": map[string]any{"0": map[string]any{"key": k1, "value": "warm"}}}, &out)
+	if code != http.StatusOK {
+		t.Fatalf("narrowed approve: %d %v", code, out)
+	}
+	_, waited := callTool(t, c, ctx, "inbox.wait", map[string]any{"ids": []any{reqID}, "timeout_seconds": 5})
+	view := waited["requests"].([]any)[0].(map[string]any)
+	tv := view["tools"].([]any)[0].(map[string]any)
+	grant, _ := tv["grant"].(string)
+	if tv["narrowed"] != true || tv["params"] == nil || grant == "" {
+		t.Fatalf("agent view of the narrowed tool: %v", tv)
+	}
+	if exp, cr := view["grants_expire_at"].(float64), time.Now().Add(125*time.Second).UnixMilli(); int64(exp) > cr {
+		t.Fatalf("grants outlive the shortened TTL: %v", view)
+	}
+	if res, sc := callTool(t, c, ctx, "memory.set", map[string]any{"key": k2, "value": "warm", "_grant": grant}); !res.IsError || sc["status"] != "grant_invalid" {
+		t.Fatalf("a value the owner narrowed away was accepted: %v", sc)
+	}
+	if res, sc := callTool(t, c, ctx, "memory.set", map[string]any{"key": k1, "value": "warm", "_grant": grant}); res.IsError {
+		t.Fatalf("narrowed call failed: %v", sc)
+	}
+
+	// `now` budget of 1 per hour: the second is lowered and the agent told.
+	ask := func(title string) map[string]any {
+		_, r := callTool(t, c, ctx, "inbox.ask", map[string]any{"title": title, "summary": "s", "message": "m",
+			"audio": map[string]any{"script": "Quick question."}, "urgency": "now",
+			"options": []any{map[string]any{"label": "Yes"}, map[string]any{"label": "No"}}})
+		return r
+	}
+	ask("First urgent question " + stamp)
+	second := ask("Second urgent question " + stamp)
+	warned := false
+	for _, w := range asSlice(second["warnings"]) {
+		if w.(map[string]any)["path"] == "urgency" {
+			warned = true
+		}
+	}
+	if !warned {
+		t.Fatalf("second now request wasn't lowered: %v", second)
+	}
+	var one map[string]any
+	h.raw(t, "GET", "/v1/inbox/"+second["request_id"].(string), nil, &one)
+	if r := one["request"].(map[string]any); r["urgency"] != "soon" || r["requested_urgency"] != "now" || r["downgraded"] == nil {
+		t.Fatalf("owner view of the lowered request: %v", r)
+	}
+
+	// Updates can be batch-read; approving is never batched.
+	_, up := callTool(t, c, ctx, "inbox.post", map[string]any{"title": "Cache warmed", "summary": "Done.", "message": "Done.",
+		"audio": map[string]any{"script": "Done."}, "urgency": "fyi"})
+	upID := up["request_id"].(string)
+	if code := h.rawStatus(t, "POST", "/v1/inbox/batch", map[string]any{"ids": []any{upID}, "action": "approve"}, &out); code != http.StatusBadRequest {
+		t.Fatalf("batch approve: %d", code)
+	}
+	if code := h.rawStatus(t, "POST", "/v1/inbox/batch", map[string]any{"ids": []any{upID}, "action": "read"}, &out); code != http.StatusOK || out["done"].(float64) != 1 {
+		t.Fatalf("batch read: %d %v", code, out)
+	}
+	var info map[string]any
+	h.raw(t, "GET", "/v1/inbox/info", nil, &info)
+	if info["info"].(map[string]any)["next_digest"] == nil {
+		t.Fatalf("info: %v", info)
+	}
+}
+
+func asSlice(v any) []any {
+	s, _ := v.([]any)
+	return s
+}
+
+// rawStatus is raw without failing on 4xx: it returns the status code and
+// decodes the body (error or not) into dst.
+func (h *httpClient) rawStatus(t *testing.T, method, path string, body any, dst any) int {
+	t.Helper()
+	b, _ := json.Marshal(body)
+	req, err := http.NewRequest(method, h.base+path, bytes.NewReader(b))
+	if err != nil {
+		t.Fatal(err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("X-Requested-With", "toolyard")
+	for _, c := range h.cookies {
+		req.AddCookie(c)
+	}
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	all, _ := io.ReadAll(resp.Body)
+	if dst != nil && len(all) > 0 {
+		_ = json.Unmarshal(all, dst)
+	}
+	return resp.StatusCode
 }
