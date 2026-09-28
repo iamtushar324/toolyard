@@ -811,7 +811,8 @@ code { background: var(--bg); padding: 1px 4px; border-radius: 3px; font-size: 1
 .ib-tag.narrowed { border-color: var(--link); color: var(--link); }
 .ib-was { display: block; color: var(--muted); font-weight: 400; font-size: 12px; overflow-wrap: anywhere; }
 .ib-params { overflow-x: auto; }
-.ib-params table { width: 100%; }
+.ib-params table { width: 100%; min-width: 0; table-layout: fixed; }
+.ib-params td:first-child { width: 7.5em; white-space: normal; }
 .ib-pmeta { display: flex; gap: 14px; align-items: center; margin-top: 3px; }
 .ib-pmeta .ib-link { font-size: 13px; }
 .ib-nrow td { padding-top: 0; }
