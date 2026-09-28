@@ -77,6 +77,9 @@ type Facts struct {
 // speech; the agent never handles audio.
 type Audio struct {
 	Script string `json:"script"`
+	// Set by toolyard when it records the script server-side.
+	Blob        string `json:"blob,omitempty"`
+	ContentType string `json:"content_type,omitempty"`
 }
 
 // Option is one choice on a question or blocker.

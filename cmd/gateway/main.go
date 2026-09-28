@@ -449,6 +449,16 @@ func runServe(argv []string) error {
 		}
 		return ""
 	}
+	var inboxVoice inbox.Voice
+	if key := os.Getenv("GEMINI_API_KEY"); key != "" {
+		if v, verr := inbox.NewGeminiVoice(ctx, key, os.Getenv("TOOLYARD_INBOX_VOICE_MODEL"), func() string {
+			return settingsSvc.GetString(settings.InboxVoiceName, "")
+		}); verr != nil {
+			log.Printf("inbox: voice notes unavailable: %v", verr)
+		} else {
+			inboxVoice = v
+		}
+	}
 	passkeySvc := passkey.New(db)
 	if *inboxResetPasskeys {
 		n, err := passkeySvc.Reset(ctx)
@@ -459,6 +469,9 @@ func runServe(argv []string) error {
 	}
 	inboxSvc, err := inbox.New(ctx, inbox.Options{
 		Passkeys:          passkeySvc,
+		Voice:             inboxVoice,
+		VoiceEnabled:      func() bool { return settingsSvc.GetBool(settings.InboxVoiceEnabled) },
+		Blobs:             inboxSnaps,
 		DB:                db,
 		Catalog:           gw,
 		Judge:             inboxJudge,

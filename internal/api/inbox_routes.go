@@ -415,8 +415,8 @@ func (s *Server) inboxBlob(w http.ResponseWriter, r *http.Request, sha string) {
 	w.Header().Set("Content-Type", ct)
 	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.Header().Set("Cache-Control", "private, max-age=86400, immutable")
-	// Only images and video render inline; everything else downloads.
-	if !strings.HasPrefix(ct, "image/") && !strings.HasPrefix(ct, "video/") {
+	// Only images, video and audio render inline; everything else downloads.
+	if !strings.HasPrefix(ct, "image/") && !strings.HasPrefix(ct, "video/") && !strings.HasPrefix(ct, "audio/") {
 		name := r.URL.Query().Get("name")
 		if name == "" || strings.ContainsAny(name, "\"\r\n/\\") {
 			name = sha[:12]

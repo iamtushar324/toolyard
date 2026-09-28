@@ -68,6 +68,11 @@ type Options struct {
 	Notify func(ctx context.Context, p Push)
 	// Attention returns the owner's notification settings.
 	Attention func() AttentionConfig
+	// Voice records voice notes server-side when VoiceEnabled returns
+	// true; Blobs stores them. Otherwise the browser speaks the script.
+	Voice        Voice
+	VoiceEnabled func() bool
+	Blobs        BlobStore
 	// Passkeys, when set, gates high-risk approvals on a passkey once the
 	// owner has registered one.
 	Passkeys PasskeyGate
@@ -317,9 +322,14 @@ func (s *Service) backgroundCheck(ctx context.Context, id string) {
 		rv, judgeErr = s.opts.Judge.Review(jctx, r)
 		cancel()
 	}
+	audio, voiceNote := s.recordVoice(ctx, r)
 	dryLabels, _ := s.dryRunLabels(ctx, r.AgentID, r.Title)
 	err = s.mutate(ctx, id, func(cur *Request) error {
 		cur.Attachments = r.Attachments
+		cur.Audio = audio
+		if voiceNote != "" {
+			cur.addActivity(s.now().UnixMilli(), voiceNote)
+		}
 		applyReview(cur, rv)
 		cur.Checked = true
 		final := map[string]bool{}
