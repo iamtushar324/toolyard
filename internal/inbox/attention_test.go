@@ -14,7 +14,11 @@ type pushLog struct {
 	items []Push
 }
 
-func (l *pushLog) add(_ context.Context, p Push) { l.mu.Lock(); l.items = append(l.items, p); l.mu.Unlock() }
+func (l *pushLog) add(_ context.Context, p Push) {
+	l.mu.Lock()
+	l.items = append(l.items, p)
+	l.mu.Unlock()
+}
 func (l *pushLog) take() []Push {
 	l.mu.Lock()
 	defer l.mu.Unlock()
@@ -329,7 +333,9 @@ func TestPushPrivacyAndActions(t *testing.T) {
 	}
 
 	// With details on, the watch gets the title, summary and scope line.
-	e.svc.opts.Attention = func() AttentionConfig { return AttentionConfig{Details: true, Location: time.UTC, DigestTimes: []string{}} }
+	e.svc.opts.Attention = func() AttentionConfig {
+		return AttentionConfig{Details: true, Location: time.UTC, DigestTimes: []string{}}
+	}
 	_, q := mustSubmit(t, e, "ag_1", questionSubmission(UrgencyNow))
 	p = log.take()[0]
 	if p.Title != q.Title || len(p.Actions) != 2 || p.Actions[1].Title != "Wait a week" {
