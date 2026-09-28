@@ -89,6 +89,30 @@ const (
 	// CH reads it at process start via the from_env="TOOLYARD_CH_PASSWORD"
 	// reference in users.d/toolyard.xml.
 	ClickhousePassword = "clickhouse_password"
+
+	// ApprovalMode decides what happens when an agent calls a restricted
+	// tool without a grant. "execute" (default) queues an approval and runs
+	// the call when the owner approves. "inbox" runs nothing and coaches
+	// the agent to send an inbox.request instead.
+	ApprovalMode = "approval_mode"
+	// InboxJudgeEnabled turns on the judge model that compares each tool
+	// call with the agent's own description. Default false; needs
+	// GEMINI_API_KEY.
+	InboxJudgeEnabled = "inbox_judge_enabled"
+	// InboxJudgeModel overrides the judge's Gemini model.
+	InboxJudgeModel = "inbox_judge_model"
+	// InboxSnapshotEnabled makes toolyard copy linked media when a request
+	// is sent. Default true.
+	InboxSnapshotEnabled = "inbox_snapshot_enabled"
+	// InboxHostingNote tells agents where to host files (inbox.guide
+	// topic "hosting").
+	InboxHostingNote = "inbox_hosting_note"
+)
+
+// Approval modes.
+const (
+	ApprovalModeExecute = "execute"
+	ApprovalModeInbox   = "inbox"
 )
 
 // secretKeys lists settings whose values must not flow back through the
@@ -192,6 +216,15 @@ func (s *Service) All(ctx context.Context) (map[string]any, error) {
 	}
 	if _, ok := out[TopNPersonalizeAfter]; !ok {
 		out[TopNPersonalizeAfter] = float64(100)
+	}
+	if _, ok := out[ApprovalMode]; !ok {
+		out[ApprovalMode] = ApprovalModeExecute
+	}
+	if _, ok := out[InboxSnapshotEnabled]; !ok {
+		out[InboxSnapshotEnabled] = true
+	}
+	if _, ok := out[InboxJudgeEnabled]; !ok {
+		out[InboxJudgeEnabled] = false
 	}
 	// Virtual alias: keep router_only_mode boolean in sync for older callers.
 	if mode, _ := out[SurfaceMode].(string); mode == SurfaceRouterOnly {
@@ -461,6 +494,12 @@ func normalise(in map[string]any) map[string]any {
 		case SurfaceFull, SurfaceTopN, SurfaceRouterOnly:
 		default:
 			out[SurfaceMode] = SurfaceFull
+		}
+	}
+	// Clamp approval_mode to a known value.
+	if v, ok := out[ApprovalMode]; ok {
+		if s, _ := v.(string); s != ApprovalModeInbox {
+			out[ApprovalMode] = ApprovalModeExecute
 		}
 	}
 	// Clamp top_n_count to [1, 200].

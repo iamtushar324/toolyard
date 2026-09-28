@@ -114,6 +114,7 @@ inbox.request({
 | `attachments` | no | Up to 12. Strongly recommended. |
 | `ttl_seconds` | no | How long grants last once approved. Default 1800, max 86400. Ask for the shortest that works. |
 | `session_id` | no | From `session.start`. Groups your requests in your owner's Sessions view. |
+| `request_id` | no | On `inbox.post` updates: the request this update closes. |
 
 For a decision rather than a permission, use `inbox.ask` with the same
 `title`, `summary`, `message`, `audio` and `attachments`, plus `options`
@@ -129,7 +130,7 @@ stuck, rather than choosing between options.
   "params": {
     "service": { "eq": "api" },
     "env":     { "eq": "prod" },
-    "ref":     { "limit": "merge_commit_of", "pr": 218 }
+    "ref":     { "limit": "merge commit of PR #218", "pattern": "^[0-9a-f]{7,40}$" }
   },
   "after": ["db.migrate"] }
 ```
@@ -139,13 +140,16 @@ stuck, rather than choosing between options.
 - **`required`**: without this tool, the task fails. If your owner unticks a
   required tool, the whole request comes back to you to replan. Optional
   tools can be dropped individually.
-- **`params`**: give every argument you'll pass.
-  - `eq` is an exact value. Prefer it.
-  - `in`, `prefix`, `lte` and `gte` narrow a value.
-  - `limit` is for a value that doesn't exist yet (a commit a merge will
-    create). Toolyard checks it when you make the call.
-  - Arguments you leave out are pinned to what you'd pass by default. Your
-    grant won't cover anything else.
+- **`params`**: give every argument you'll pass. **Your grant covers only
+  the arguments you list**; a call that passes anything else is blocked.
+  - `{"eq": value}` is an exact value. Prefer it. A bare value (`"env": "prod"`)
+    means the same.
+  - `{"in": [...]}`, `{"prefix": "..."}`, `{"gte": n, "lte": n}` narrow a value.
+  - `{"limit": "what it will be", "pattern": "regex"}` is for a value that
+    doesn't exist yet (a commit a merge will create). Toolyard checks the
+    actual value against `pattern` when you make the call. Without a pattern
+    it records the value but can't check it, and your owner sees that.
+  - `{"any": true}` allows any value. It's always flagged; avoid it.
 - **`after`**: the order you'll run things in. It's shown to your owner as
   a plan.
 
@@ -217,6 +221,7 @@ Toolyard rate-limits `now` and lowers the urgency of agents that overuse it.
     { "path": "audio.script", "message": "112 words; max 75. Keep the ask and one number." },
     { "path": "attachments[1].url", "message": "localhost isn't reachable from toolyard." }
   ],
+  "warnings": [],
   "flags": [
     { "tool": "flags.set", "level": "red", "label": "Doesn't match the request",
       "why": "Your message says the flag stays off. This call turns it on." }
@@ -226,7 +231,11 @@ Toolyard rate-limits `now` and lowers the urgency of agents that overuse it.
 ```
 
 - **Fix every problem.** A request with problems is rejected.
-- **Flags aren't errors.** They're what your owner will see. Where a flag is
+- **Read the warnings.** They don't block sending, but your owner will notice
+  what they point at.
+- **Flags aren't errors.** They're what your owner will see. Judge flags
+  ("Doesn't match the request") only appear when your owner has the judge
+  model switched on. Where a flag is
   fair, add evidence for it. Where it's caused by a mistake, fix the mistake.
 - **Don't reword a request to make a flag go away.** Dry runs are logged, and
   your owner sees how many you ran.
@@ -243,14 +252,18 @@ Toolyard rate-limits `now` and lowers the urgency of agents that overuse it.
 A decision looks like this:
 
 ```json
-{ "request_id": "rq_…", "status": "decided",
+{ "request_id": "rq_…", "kind": "access", "status": "approved",
   "tools": [
-    { "tool": "github.merge_pull_request", "allowed": true,  "grant": "tyg_…" },
-    { "tool": "flags.set",                 "allowed": false }
+    { "tool": "github.merge_pull_request", "decision": "allowed", "grant_id": "gr_…", "grant": "tyg_…" },
+    { "tool": "flags.set",                 "decision": "refused" }
   ],
   "owner_note": "Don't touch the flag; I'll roll it out myself.",
-  "expires_at": "2026-09-28T19:12:00Z" }
+  "grants_expire_at": 1790621520000,
+  "next": "Call each allowed tool with its grant as `_grant`, …" }
 ```
+
+`status` is one of `pending`, `approved`, `denied`, `returned`, `answered`,
+`cancelled`, `expired`. Always read `next`: it says what to do.
 
 - Each grant **token is shown once**. Keep it in memory, never in logs, commits
   or PRs, and never pass it to another agent. It only works for you anyway.
@@ -282,3 +295,77 @@ Withdraw requests you no longer need with `inbox.cancel`.
 - Never split one risky action into small requests to avoid a flag.
 - Never tune your wording across dry runs to hide what a call does.
 - Never claim urgency you don't have.
+
+## 12. Examples
+
+**An access request.** Evidence first, every tool in one request, and the
+voice note in the first person.
+
+```json
+inbox.request({
+  "title": "Ship billing v2 to production",
+  "summary": "I need 3 tools to merge PR #218, add one table, and deploy.",
+  "message": "PR #218 is approved and all 42 checks are green, so I'd like to ship the billing v2 webhook handler. It goes out behind the billing_v2 flag, which stays off.",
+  "facts": {
+    "why_now": "The invoice migration is waiting on this handler.",
+    "if_it_goes_wrong": "The API service only. With the flag off there's no user-visible change.",
+    "undo": "I redeploy 9f1e2d0, the current prod build. About 4 minutes."
+  },
+  "audio": { "script": "Hi, it's the billing agent. I'd like to ship billing v2 to production. I need to merge the approved pull request, add one new table, and deploy. The new code sits behind a flag that stays off. All 42 checks passed. I'm asking for one merge, one migration and one deploy, valid for 30 minutes." },
+  "urgency": "soon",
+  "tools": [
+    { "tool": "github.merge_pull_request", "required": true,
+      "summary": "Squash-merge PR #218 into main.",
+      "params": { "repo": "acme/api", "pull_number": 218, "merge_method": "squash" } },
+    { "tool": "db.migrate", "required": true,
+      "summary": "Apply migration 0042, which adds the webhook_events table.",
+      "params": { "env": "prod", "migration": "0042_webhook_events", "direction": "up" } },
+    { "tool": "deploy.run", "required": true,
+      "summary": "Deploy the api service to prod at the merge commit.",
+      "params": { "service": "api", "env": "prod",
+                  "ref": { "limit": "merge commit of PR #218", "pattern": "^[0-9a-f]{7,40}$" } },
+      "after": ["github.merge_pull_request", "db.migrate"] }
+  ],
+  "attachments": [
+    { "type": "table", "title": "Checks", "columns": ["Check", "Result"],
+      "rows": [["Unit tests", "1,284 passed"], ["Integration", "212 passed"]] },
+    { "type": "chart", "chart": "line", "title": "Error rate, canary vs prod", "unit": "%",
+      "x": ["-30m", "-15m", "now"],
+      "series": [{ "name": "canary", "values": [0.19, 0.21, 0.2] }, { "name": "prod", "values": [0.2, 0.2, 0.2] }],
+      "spoken": "the canary has been flat for 30 minutes" },
+    { "type": "diff", "file": "handlers/webhook.go", "patch": "@@ -41,4 +41,6 @@\n-\treturn err\n+\treturn h.retry(ev)\n",
+      "caption": "The core of the change: failed deliveries now retry." },
+    { "type": "link", "label": "PR #218", "url": "https://github.com/acme/api/pull/218" }
+  ],
+  "ttl_seconds": 1800
+})
+```
+
+**A question.**
+
+```json
+inbox.ask({
+  "title": "Retire /v1/invoices now, or in 30 days?",
+  "summary": "Traffic to the old endpoint fell about 80% in two weeks. Three callers are left.",
+  "message": "The migration to /v2/invoices is done on our side. Three callers are left; the biggest is our own reporting job, which I can update myself.",
+  "audio": { "script": "I need a decision on the old invoices endpoint. Its traffic fell by about 80 percent in two weeks. Should I retire it now, or give it 30 more days?" },
+  "urgency": "soon",
+  "options": [
+    { "label": "Retire now", "detail": "Returns 410 Gone. I update the reporting job first." },
+    { "label": "Deprecate, retire in 30 days", "detail": "Adds a Sunset header and emails the 2 external callers." }
+  ]
+})
+```
+
+**An update that closes a request.**
+
+```json
+inbox.post({
+  "kind": "update", "request_id": "rq_…",
+  "title": "Billing v2 is live in prod, flag still off",
+  "summary": "Merged, migrated and deployed. Errors are flat.",
+  "message": "Done. PR #218 is merged, the webhook_events table exists, and the API is deployed. Error rate has been flat since.",
+  "audio": { "script": "All done. The pull request is merged, the new table is in place, and the API is deployed. Errors have been flat since." },
+  "urgency": "fyi"
+})
+```

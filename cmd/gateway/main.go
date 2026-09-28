@@ -47,6 +47,7 @@ import (
 	"github.com/tusharbhardwaj/toolyard/internal/goroutines"
 	hookspkg "github.com/tusharbhardwaj/toolyard/internal/hooks"
 	"github.com/tusharbhardwaj/toolyard/internal/identity"
+	"github.com/tusharbhardwaj/toolyard/internal/inbox"
 	"github.com/tusharbhardwaj/toolyard/internal/lake"
 	"github.com/tusharbhardwaj/toolyard/internal/logx"
 	"github.com/tusharbhardwaj/toolyard/internal/memory"
@@ -410,6 +411,85 @@ func runServe(argv []string) error {
 	} else if n > 0 {
 		log.Printf("auto-execute: startup sweep re-fired %d allowed-but-not-executed approvals", n)
 	}
+
+	// Owner inbox + scoped grants. Agents ask for restricted tools with
+	// inbox.request; the owner decides on their phone; each allowed tool
+	// gets a single-use grant the agent passes as _grant. approval_mode
+	// (Settings) decides whether a restricted call without a grant is
+	// queued the old way ("execute", default) or coached ("inbox").
+	inboxSnaps, err := inbox.NewSnapshotter(db, filepath.Join(*dataDir, "inbox", "blobs"))
+	if err != nil {
+		return fmt.Errorf("inbox snapshots: %w", err)
+	}
+	var inboxJudge inbox.Judge
+	if key := strings.TrimSpace(os.Getenv("GEMINI_API_KEY")); key != "" {
+		if j, jerr := inbox.NewGeminiJudge(ctx, key, settingsSvc.GetString(settings.InboxJudgeModel, "")); jerr != nil {
+			log.Printf("inbox: judge model unavailable: %v", jerr)
+		} else {
+			inboxJudge = j
+		}
+	}
+	agentName := func(ctx context.Context, id string) string {
+		u, err := idSvc.PrimaryUser(ctx)
+		if err != nil {
+			return ""
+		}
+		ags, err := idSvc.ListAgents(ctx, u.ID)
+		if err != nil {
+			return ""
+		}
+		for _, a := range ags {
+			if a.ID == id {
+				return a.Name
+			}
+		}
+		return ""
+	}
+	inboxSvc, err := inbox.New(ctx, inbox.Options{
+		DB:              db,
+		Catalog:         gw,
+		Judge:           inboxJudge,
+		JudgeEnabled:    func() bool { return settingsSvc.GetBool(settings.InboxJudgeEnabled) },
+		Fetcher:         inboxSnaps,
+		SnapshotEnabled: func() bool { return settingsSvc.GetBoolDefault(settings.InboxSnapshotEnabled, true) },
+		Publish:         func(t string, d any) { hub.Publish(realtime.Event{Type: t, Data: d}) },
+		AgentName:       agentName,
+		Notify: func(ctx context.Context, r *inbox.Request) {
+			user, err := idSvc.PrimaryUser(ctx)
+			if err != nil {
+				return
+			}
+			// Same privacy rule as approval pushes: no agent-written text
+			// in the payload, which transits third-party push services.
+			who := agentName(ctx, r.AgentID)
+			if who == "" {
+				who = "An agent"
+			}
+			label := map[string]string{inbox.KindAccess: "is asking for access", inbox.KindQuestion: "has a question", inbox.KindBlocker: "is stuck"}[r.Kind]
+			body := "Tap to review."
+			if r.Kind == inbox.KindAccess {
+				body = fmt.Sprintf("%d tool%s. Tap to review.", len(r.Tools), map[bool]string{true: "", false: "s"}[len(r.Tools) == 1])
+			}
+			_ = pushSvc.Notify(ctx, user.ID, map[string]any{
+				"title": who + " " + label,
+				"body":  body,
+				"url":   "/#inbox/" + r.ID,
+				"tag":   r.ID,
+			})
+		},
+	})
+	if err != nil {
+		return fmt.Errorf("inbox: %w", err)
+	}
+	defer inboxSvc.Flush()
+	inboxGuide := inbox.NewGuide(func() string { return settingsSvc.GetString(settings.InboxHostingNote, "") })
+	gw.SetInbox(inboxSvc, inboxGuide, func() string {
+		return settingsSvc.GetString(settings.ApprovalMode, settings.ApprovalModeExecute)
+	})
+	gw.RegisterInboxTools()
+	go inboxSvc.RunSweeper(ctx, time.Minute)
+	log.Printf("toolyard: inbox ready (approval_mode=%s, judge=%v)",
+		settingsSvc.GetString(settings.ApprovalMode, settings.ApprovalModeExecute), inboxJudge != nil)
 
 	upstreamSvc := upstreams.New(db, gw)
 	upstreamSvc.SetPolicy(upstreams.Policy{
@@ -796,6 +876,9 @@ func runServe(argv []string) error {
 		ChatTelegram:             telegramSvc,
 		Events:                   evSvc,
 		MemWebhooks:              memWebhookSvc,
+		Inbox:                    inboxSvc,
+		Snapshots:                inboxSnaps,
+		Guide:                    inboxGuide,
 		WebhookMaxBytes:          *webhookMaxBytes,
 		SessionKey:               loadOrCreateSessionKey(*dataDir),
 		Security:                 secOpts,

@@ -46,6 +46,16 @@ func main() {
 		err = runList(args)
 	case "call":
 		err = runCall(args)
+	case "guide":
+		err = runGuide(args)
+	case "check":
+		err = runCheck(args)
+	case "request":
+		err = runRequest(args)
+	case "wait":
+		err = runWait(args)
+	case "skills":
+		err = runSkills(args)
 	case "version", "-v", "--version":
 		fmt.Println("toolyard", version)
 	case "help", "-h", "--help":
@@ -71,6 +81,13 @@ Commands:
   server <url>         set the configured gateway URL
   list                 list available tools (name + description)
   call <tool> [...]    run a tool one-shot
+
+Asking your owner for permission (the toolyard inbox):
+  guide [topic]                     read the agent protocol
+  check <tool>...                   which planned calls are restricted
+  request --from req.json [--dry-run] [--kind access|question|blocker|update]
+  wait <request_id>... [--timeout 5m]
+  skills install toolyard-inbox     install the Claude Code skill
 
 Run 'toolyard <command> -h' for command-specific flags.
 

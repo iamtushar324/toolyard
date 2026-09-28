@@ -17,6 +17,7 @@ import (
 
 	"github.com/tusharbhardwaj/toolyard/internal/approval"
 	"github.com/tusharbhardwaj/toolyard/internal/audit"
+	"github.com/tusharbhardwaj/toolyard/internal/inbox"
 	"github.com/tusharbhardwaj/toolyard/internal/lake"
 	"github.com/tusharbhardwaj/toolyard/internal/memory"
 	"github.com/tusharbhardwaj/toolyard/internal/metrics"
@@ -132,6 +133,13 @@ type Gateway struct {
 	inLineWait          time.Duration
 	maxPendingPerAgent  int
 	upstreamCallTimeout time.Duration
+
+	// inbox, when set, backs the inbox.* tools and grant redemption.
+	// approvalMode returns "inbox" (restricted calls are coached towards
+	// inbox.request) or anything else (the legacy queue-and-run flow).
+	inbox        *inbox.Service
+	guide        *inbox.Guide
+	approvalMode func() string
 
 	// maxLiveUpstreams caps how many upstream connections are alive
 	// simultaneously. 0 = unbounded. When the cap is hit and a new
@@ -331,7 +339,7 @@ func (g *Gateway) AddUpstream(ctx context.Context, cfg UpstreamConfig) error {
 	if cfg.Name == "" {
 		return errors.New("upstream needs a name")
 	}
-	if cfg.Name == builtinUpstream || cfg.Name == "fixture" {
+	if cfg.Name == builtinUpstream || cfg.Name == "fixture" || cfg.Name == inboxUpstream || cfg.Name == sessionUpstream {
 		return fmt.Errorf("name %q is reserved", cfg.Name)
 	}
 	// Pre-allocate a pool slot: if the live cap is full this suspends the
@@ -761,6 +769,7 @@ func (g *Gateway) routeEntry(ctx context.Context, entry toolEntry, args map[stri
 		return g.resumeDeferred(ctx, entry, approvalID, &ev)
 	}
 
+	grantToken, _ := args[GrantField].(string)
 	reason, intent, cleanArgs, rerr := extractReason(args, entry.reasonField)
 	if rerr != nil {
 		_ = g.audit.Write(ctx, audit.Event{
@@ -813,6 +822,12 @@ func (g *Gateway) routeEntry(ctx context.Context, entry toolEntry, args map[stri
 		})
 	}
 
+	// A grant only matters for calls that would otherwise need approval:
+	// an explicit deny still wins, and an open tool doesn't use one up.
+	if grantToken != "" && decision.Action == policy.ActionApprove && g.inbox != nil {
+		return g.redeemAndDispatch(ctx, entry, cleanArgs, agentID, reason, grantToken, &ev)
+	}
+
 	switch decision.Action {
 	case policy.ActionAllow:
 		_ = g.audit.Write(ctx, audit.Event{
@@ -838,6 +853,11 @@ func (g *Gateway) routeEntry(ctx context.Context, entry toolEntry, args map[stri
 		ev.ErrorClass = "policy"
 		return mcp.NewToolResultError("denied by policy: " + decision.Reason), nil
 	case policy.ActionApprove:
+		// Inbox mode needs an agent identity: grants are bound to it.
+		// Anonymous callers keep the legacy flow.
+		if g.inboxMode() && agentID != "" {
+			return g.coach(ctx, entry, cleanArgs, agentID, reason, &ev), nil
+		}
 		return g.holdAndWait(ctx, entry, cleanArgs, agentID, reason, intent, decision.RequireHuman, &ev)
 	default:
 		ev.Outcome = metrics.OutcomeError
@@ -1436,6 +1456,7 @@ func buildInstructions(bus *approval.Bus, inLineWait time.Duration) string {
 	var b strings.Builder
 	b.WriteString("toolyard gateway. ")
 	b.WriteString("Every tool call REQUIRES a `_reason` field (20-2000 chars) explaining why you are calling it; this string is shown verbatim to the human reviewer. ")
+	b.WriteString("PERMISSIONS: some tools are restricted and need your owner's approval. Before a task, run `inbox.check` on the calls you plan, then ask for every restricted tool in ONE `inbox.request` (call `inbox.guide` first to learn the format: a first-person message, a short voice-note script, evidence attachments, and each tool with its parameters). When approved, call each tool with `_grant` set to its token. If a call returns status `permission_required`, nothing ran: fill in the draft it gives you and send it with inbox.request. ")
 	b.WriteString("Reads pass through silently; writes hold for human approval. ")
 	b.WriteString(fmt.Sprintf("Approvals expire after %s if no decision arrives. ", ttl.Round(time.Minute)))
 	b.WriteString("AUTO-EXECUTE ON APPROVE: when a write needs human review the gateway returns a deferred response containing `approval_id`. The moment the human (or an auto-approval rule) flips the request to allowed, toolyard fires the original tool itself with your persisted arguments and stashes the result. ")

@@ -47,6 +47,7 @@ import (
 	"github.com/tusharbhardwaj/toolyard/internal/gateway"
 	"github.com/tusharbhardwaj/toolyard/internal/hooks"
 	"github.com/tusharbhardwaj/toolyard/internal/identity"
+	"github.com/tusharbhardwaj/toolyard/internal/inbox"
 	"github.com/tusharbhardwaj/toolyard/internal/marketplace"
 	"github.com/tusharbhardwaj/toolyard/internal/memory"
 	"github.com/tusharbhardwaj/toolyard/internal/mempalace"
@@ -95,6 +96,9 @@ type Server struct {
 	hooks                    *hooks.Service
 	clickhouseRuntimeEnvPath string
 	mempalace                *mempalace.Service
+	inbox                    *inbox.Service
+	snapshots                *inbox.Snapshotter
+	guide                    *inbox.Guide
 	notes                    *notes.Service
 	skills                   *skills.Service
 	voice                    *voice.Service
@@ -169,6 +173,11 @@ type Options struct {
 	// webhooks (/v1/memory/webhooks*, /v1/memory/metrics). nil leaves them
 	// returning 503/empty.
 	MemWebhooks *memwebhook.Service
+	// Inbox, Snapshots and Guide back the owner inbox (/v1/inbox/*) and
+	// the agent protocol (/v1/guide). All optional.
+	Inbox     *inbox.Service
+	Snapshots *inbox.Snapshotter
+	Guide     *inbox.Guide
 	// WebhookMaxBytes caps the memory-webhook ingest body. 0 falls back to
 	// the default (25 MiB).
 	WebhookMaxBytes int64
@@ -203,6 +212,9 @@ func New(ctx context.Context, opts Options) *Server {
 		chatTelegram:             opts.ChatTelegram,
 		events:                   opts.Events,
 		memWebhooks:              opts.MemWebhooks,
+		inbox:                    opts.Inbox,
+		snapshots:                opts.Snapshots,
+		guide:                    opts.Guide,
 		webhookMaxBytes:          opts.WebhookMaxBytes,
 		sessionKey:               opts.SessionKey,
 		security:                 opts.Security,
@@ -319,6 +331,7 @@ func (s *Server) Routes(mux *http.ServeMux) {
 	s.oauthRoutes(mux)
 	s.cliRoutes(mux)
 	s.voiceRoutes(mux)
+	s.inboxRoutes(mux)
 }
 
 // ---- helpers ----------------------------------------------------------------

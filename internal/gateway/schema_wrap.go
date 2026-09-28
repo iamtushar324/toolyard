@@ -20,6 +20,7 @@ const (
 	ReasonField     = "_reason"
 	IntentField     = "_intent_category"
 	ApprovalIDField = "_approval_id"
+	GrantField      = "_grant"
 	FallbackField   = "__toolyard_reason"
 
 	minReasonLen = 20
@@ -28,7 +29,8 @@ const (
 	reasonPropDescription     = "One short sentence on why you are calling this tool. Shown verbatim to the human approver. Required, 20-2000 chars."
 	intentPropDescription     = "Coarse intent category: read | write | destructive | external_communication | financial | privileged_admin."
 	approvalIDPropDescription = "If a previous call to this tool returned a deferred response with an `approval_id`, set this to that value to resume the held call instead of creating a new approval."
-	descriptionBanner         = "[toolyard-gated · _reason required · writes need approval · safe to batch with parallel tool calls so the human reviews them together · resume a deferred call by passing _approval_id] "
+	grantPropDescription      = "A grant token (tyg_…) your owner issued for this exact call through inbox.request. Restricted tools run only with a valid grant; the call must stay within the parameters you asked for."
+	descriptionBanner         = "[toolyard-gated · _reason required · restricted tools need your owner's permission: check with inbox.check, ask with inbox.request, then pass the grant as _grant] "
 )
 
 var intentEnum = []string{
@@ -51,6 +53,9 @@ func metaProps() map[string]any {
 		},
 		ApprovalIDField: map[string]any{
 			"type": "string", "description": approvalIDPropDescription,
+		},
+		GrantField: map[string]any{
+			"type": "string", "description": grantPropDescription,
 		},
 	}
 }
@@ -127,6 +132,12 @@ func wrapSchema(t mcp.Tool) (mcp.Tool, string) {
 			"description": approvalIDPropDescription,
 		}
 	}
+	if _, has := props[GrantField]; !has {
+		props[GrantField] = map[string]any{
+			"type":        "string",
+			"description": grantPropDescription,
+		}
+	}
 	required = appendUnique(required, field)
 
 	out := t
@@ -183,7 +194,7 @@ func extractReason(args map[string]any, fieldName string) (string, string, map[s
 
 	out := make(map[string]any, len(args))
 	for k, v := range args {
-		if k == fieldName || k == IntentField || k == ApprovalIDField {
+		if k == fieldName || k == IntentField || k == ApprovalIDField || k == GrantField {
 			continue
 		}
 		out[k] = v
