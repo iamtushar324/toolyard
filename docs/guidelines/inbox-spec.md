@@ -1,6 +1,6 @@
 # toolyard — owner inbox and scoped grants: design spec
 
-Status: **draft**. Decision record: [ADR 0005](../adr/0005-scoped-grants.md).
+Status: **draft**. Decision records: [ADR 0005](../adr/0005-scoped-grants.md), [ADR 0006](../adr/0006-coach-dont-queue.md). How agents learn the protocol: [agent-onboarding.md](agent-onboarding.md).
 Principles: [principles.md](principles.md). Agent rules:
 [agent-protocol.md](agent-protocol.md).
 
@@ -280,24 +280,13 @@ for `now`.
 
 ## 7. Agent-facing tools (MCP)
 
-All tools live under the synthetic `tools` upstream, next to the existing
-approval meta-tools, and are always visible.
-
-| tool | args (plus `_reason`) | returns |
-|---|---|---|
-| `session.start` | `title, repo?, branch?, host?` | `session_id` |
-| `session.update` | `session_id, status, note?` | ok |
-| `tools.request_grant` | `session_id?, title, summary, why, scope, blast_radius, rollback, links[], urgency, ttl_seconds, max_uses` | `approval_id, inbox_item_id, expected_decision_in_seconds` |
-| `inbox.post` | `session_id?, kind (question\|review\|blocker\|update), title, summary, body_md?, links[]?, options[]?, urgency, grant_id?` | `inbox_item_id` |
-| `inbox.wait` | `item_ids[], mode any\|all, timeout_seconds ≤ 300` | status per item + `answer` / `grant` |
-| `grants.release` | `grant_id` | ok |
-
-**Implicit path is kept.** Calling a restricted tool without `_grant`
-still returns today's deferred response. The request it creates is
-turned into an `approval` inbox item whose `title`/`summary` come from
-`_reason`, and approving it issues a grant scoped to exactly those
-arguments with `max_uses = 1`. `tools.request_grant` is the richer path
-the protocol recommends.
+**Superseded.** The agent-facing tools are now the `inbox.*` set in
+[agent-onboarding.md](agent-onboarding.md#new-tools-all-under-inbox), with the
+request format in [agent-protocol.md](agent-protocol.md). The main change from
+the earlier draft ([ADR 0006](../adr/0006-coach-dont-queue.md)): calling a
+restricted tool without a grant **no longer creates a request**. It returns a
+`permission_required` result with a pre-filled draft, and only
+`inbox.request` / `inbox.ask` reach the owner's inbox.
 
 **Session binding.** If an agent passes no `session_id`, items attach to
 that agent's most recent live session, or an automatic
@@ -394,10 +383,10 @@ Today, approving runs the call immediately (migration 0010,
 
 1. Ship grants **alongside** the current behaviour, behind a setting
    `approval_mode = execute | grant` (default `execute`).
-2. In `grant` mode, the implicit path issues an exact-args, single-use
-   grant. The agent redeems it by calling the tool again with `_grant`.
-   `_approval_id` keeps working as an alias: redeem the matching grant if
-   there is one.
+2. In `grant` mode, a restricted call without a grant returns the
+   `permission_required` coaching result (ADR 0006) instead of queuing an
+   approval. Grants come only from `inbox.request`, and the agent redeems
+   them by calling the tool with `_grant`.
 3. Update `scripts/claude-code-hook.sh` and the tool descriptions
    (`descriptionBanner`, the wait/poll tools) for the grant flow.
 4. Change the default to `grant`. Remove `execute` after one release.
