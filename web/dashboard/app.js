@@ -4960,19 +4960,23 @@ state.inbox = {
   loaded: false, loading: false, filter: 'needs', tab: 'inbox', items: [],
   openId: null, detail: null, sessions: null,
   allow: {}, openParams: {}, explain: {}, summary: {}, panel: null, busy: null, killOpen: false,
+  narrow: {}, ttl: {}, editing: {}, sessOpen: {}, info: null,
 };
 
 const IB_KIND = { access: 'Access request', question: 'Question', blocker: 'Blocked', update: 'Update' };
 const IB_VERB = { access: 'is asking for access', question: 'has a question', blocker: 'is stuck', update: 'sent an update' };
 const IB_URG = { now: 0, soon: 1, digest: 2, fyi: 3 };
 const IB_NEEDS = ['access', 'question', 'blocker'];
+const IB_FILTERS = ['needs', 'updates', 'done'];
 
 async function loadInbox() {
   if (state.inbox.loading) return;
   state.inbox.loading = true;
   try {
-    const [open, done] = await Promise.all([api('/v1/inbox?view=open'), api('/v1/inbox?view=done')]);
+    const [open, done, info] = await Promise.all([api('/v1/inbox?view=open'), api('/v1/inbox?view=done'),
+      api('/v1/inbox/info').catch(() => null)]);
     state.inbox.items = ((open && open.requests) || []).concat((done && done.requests) || []);
+    if (info) state.inbox.info = Object.assign({}, info.info, { passkeys: info.passkeys });
     state.inbox.loaded = true;
   } catch (e) {
     if (e.status !== 401) toast('Inbox: ' + e.message, 'error');
@@ -5049,29 +5053,79 @@ function ibStatusPill(r) {
   return el('span', { class: 'ib-pill ' + m[0] }, m[1]);
 }
 
+// ibAttnPills: what toolyard's attention rules did to this request.
+function ibAttnPills(r) {
+  if (r.status !== 'pending') return [];
+  const out = [];
+  if (r.reminded_at) out.push(el('span', { class: 'ib-pill amber', title: 'The agent is blocked on this; toolyard reminded you once.' }, 'Agent blocked'));
+  if (r.downgraded) out.push(el('span', { class: 'ib-pill mute', title: 'Lowered from now: ' + r.downgraded }, 'Lowered from now'));
+  return out;
+}
+
 // ---- voice notes (browser speech stands in for toolyard's TTS) ------------
 
-const ibVoice = { id: null, i: 0, playing: false, rate: 1, sim: false, timer: null, token: 0, t0: 0, est: 0, raf: 0, script: {} };
+const ibVoice = { id: null, i: 0, playing: false, rate: 1, sim: false, timer: null, token: 0, t0: 0, est: 0, raf: 0, script: {}, audio: null, audioId: null };
 function ibSplit(t) { return (t || '').replace(/([.!?])\s+(?=[A-Z])/g, '$1\u0000').split('\u0000').filter(Boolean); }
 function ibSecs(s) { return s.trim().split(/\s+/).length / 2.6 + 0.35; }
+function ibReq(id) {
+  return state.inbox.items.find((x) => x.id === id) || (state.inbox.detail && state.inbox.detail.request.id === id ? state.inbox.detail.request : null);
+}
 function ibSents(id) {
-  const r = state.inbox.items.find((x) => x.id === id) || (state.inbox.detail && state.inbox.detail.request.id === id ? state.inbox.detail.request : null);
+  const r = ibReq(id);
   const script = r ? (r.audio && r.audio.script) || '' : (ibVoice.script[id] || '');
   ibVoice.script[id] = script;
   return ibSplit(script);
 }
-function ibTotal(id) { return ibSents(id).reduce((a, s) => a + ibSecs(s), 0); }
+// ibRec is the recorded voice note (toolyard's server-side TTS), if any.
+function ibRec(id) { const r = ibReq(id); return r && r.audio && r.audio.blob ? '/v1/inbox/blobs/' + r.audio.blob : ''; }
+function ibAudioOn(id) { return !!(ibVoice.audio && ibVoice.audioId === id); }
+function ibEstTotal(id) { return ibSents(id).reduce((a, s) => a + ibSecs(s), 0); }
+function ibTotal(id) {
+  if (ibAudioOn(id) && isFinite(ibVoice.audio.duration) && ibVoice.audio.duration > 0) return ibVoice.audio.duration;
+  return ibEstTotal(id);
+}
 function ibFmt(s) { s = Math.max(0, Math.round(s)); return Math.floor(s / 60) + ':' + String(s % 60).padStart(2, '0'); }
 function ibHalt() {
   ibVoice.token++; clearTimeout(ibVoice.timer); ibVoice.playing = false;
+  if (ibVoice.audio) { try { ibVoice.audio.pause(); } catch (_) {} }
   if ('speechSynthesis' in window) { try { speechSynthesis.cancel(); } catch (_) {} }
 }
 function ibPlay(id) {
   if (ibVoice.id !== id) { ibHalt(); ibVoice.id = id; ibVoice.i = 0; }
+  const rec = ibRec(id);
+  if (rec) {
+    if (!ibAudioOn(id)) {
+      if (ibVoice.audio) { try { ibVoice.audio.pause(); } catch (_) {} }
+      const a = new Audio(rec);
+      a.preload = 'auto';
+      a.addEventListener('ended', ibFinish);
+      a.addEventListener('loadedmetadata', ibSyncProgress);
+      a.addEventListener('error', () => {
+        // Recording unavailable: fall back to the browser's voice.
+        if (ibVoice.audio === a) { ibVoice.audio = null; ibVoice.audioId = null; }
+        const r = ibReq(id); if (r && r.audio) r.audio.blob = '';
+        if (ibVoice.playing && ibVoice.id === id) { ibVoice.i = 0; ibSpeak(); ibLoop(); ibSync(); }
+      });
+      ibVoice.audio = a; ibVoice.audioId = id;
+    }
+    const a = ibVoice.audio;
+    if (a.ended || (a.duration && a.currentTime >= a.duration)) a.currentTime = 0;
+    a.playbackRate = ibVoice.rate;
+    ibVoice.playing = true;
+    const p = a.play(); if (p && p.catch) p.catch(() => { ibVoice.playing = false; ibSync(); });
+    ibLoop(); ibSync();
+    return;
+  }
   if (ibVoice.i >= ibSents(id).length) ibVoice.i = 0;
   ibVoice.playing = true; ibSpeak(); ibLoop(); ibSync();
 }
 function ibToggle(id) { if (ibVoice.playing && ibVoice.id === id) { ibHalt(); ibSync(); } else ibPlay(id); }
+function ibSetRate(rate) {
+  ibVoice.rate = rate;
+  if (ibVoice.audio) ibVoice.audio.playbackRate = rate;
+  else if (ibVoice.playing) { ibHalt(); ibVoice.playing = true; ibSpeak(); ibLoop(); }
+  ibSync();
+}
 function ibSpeak() {
   const tok = ++ibVoice.token, ss = ibSents(ibVoice.id);
   if (ibVoice.i >= ss.length) { ibFinish(); return; }
@@ -5095,21 +5149,40 @@ function ibSpeak() {
 function ibFinish() { ibVoice.playing = false; ibVoice.token++; clearTimeout(ibVoice.timer); ibVoice.i = ibSents(ibVoice.id).length; ibSync(); }
 function ibProgress(id) {
   if (ibVoice.id !== id) return 0;
-  const ss = ibSents(id), tot = ibTotal(id) || 1;
+  if (ibAudioOn(id)) {
+    const a = ibVoice.audio;
+    if (a.ended) return 1;
+    return a.duration > 0 && isFinite(a.duration) ? Math.min(1, a.currentTime / a.duration) : 0;
+  }
+  const ss = ibSents(id), tot = ibEstTotal(id) || 1;
   let before = 0;
   for (let k = 0; k < Math.min(ibVoice.i, ss.length); k++) before += ibSecs(ss[k]);
   const part = (ibVoice.playing && ibVoice.i < ss.length) ? Math.min(1, (performance.now() - ibVoice.t0) / ibVoice.est) * ibSecs(ss[ibVoice.i]) : 0;
   return Math.min(1, (before + part) / tot);
 }
+// ibAudioSentence maps recording progress onto the transcript, weighting
+// sentences by length.
+function ibAudioSentence(id) {
+  const ss = ibSents(id), tot = ibEstTotal(id) || 1, p = ibProgress(id);
+  if (p >= 1) return ss.length;
+  let acc = 0;
+  for (let k = 0; k < ss.length; k++) { acc += ibSecs(ss[k]) / tot; if (p < acc) return k; }
+  return ss.length;
+}
 function ibLoop() { cancelAnimationFrame(ibVoice.raf); const f = () => { ibSyncProgress(); if (ibVoice.playing) ibVoice.raf = requestAnimationFrame(f); }; ibVoice.raf = requestAnimationFrame(f); }
 function ibSyncProgress() {
+  if (ibVoice.id && ibAudioOn(ibVoice.id)) {
+    const k = ibAudioSentence(ibVoice.id);
+    if (k !== ibVoice.i) { ibVoice.i = k; ibSync(); return; }
+  }
   document.querySelectorAll('[data-ib-prog]').forEach((n) => { n.style.width = (ibProgress(n.dataset.ibProg) * 100).toFixed(1) + '%'; });
   document.querySelectorAll('[data-ib-wave]').forEach((n) => {
     const p = ibProgress(n.dataset.ibWave), c = n.children.length;
     for (let k = 0; k < c; k++) n.children[k].classList.toggle('on', k < Math.round(p * c));
   });
   document.querySelectorAll('[data-ib-time]').forEach((n) => {
-    const id = n.dataset.ibTime, tot = ibTotal(id) / (ibVoice.id === id ? ibVoice.rate : 1), p = ibProgress(id);
+    const id = n.dataset.ibTime, rate = ibVoice.id === id && !ibAudioOn(id) ? ibVoice.rate : 1;
+    const tot = ibTotal(id) / rate, p = ibProgress(id);
     n.textContent = (ibVoice.id === id && (ibVoice.playing || (p > 0 && p < 1))) ? '−' + ibFmt(tot * (1 - p)) : ibFmt(tot);
   });
 }
@@ -5125,7 +5198,7 @@ function ibSync() {
     n.classList.toggle('past', act && i < ibVoice.i);
   });
   document.querySelectorAll('[data-ib-rate]').forEach((n) => { n.textContent = ibVoice.rate + '×'; });
-  document.querySelectorAll('[data-ib-sim]').forEach((n) => { n.hidden = !ibVoice.sim; });
+  document.querySelectorAll('[data-ib-sim]').forEach((n) => { n.hidden = !ibVoice.sim || !!ibRec(ibVoice.id); });
   ibSyncProgress();
 }
 function ibPlayIcon() { return el('span', { class: 'ib-playicon' }); }
@@ -5153,6 +5226,19 @@ function viewInbox() {
     el('b', {}, state.inbox.filter === 'needs' ? 'Nothing needs you' : 'Nothing here'),
     el('span', {}, state.inbox.filter === 'needs' ? 'Your agents are working. Requests they send will show up here.' : ''));
   else body = el('div', { class: 'ib-list' }, ...cur.map(ibCard));
+  let tools = null;
+  if (state.inbox.filter === 'updates' && state.inbox.loaded) {
+    const info = state.inbox.info || {};
+    tools = el('div', { class: 'ib-bar' },
+      el('span', { class: 'meta' }, info.next_digest ? 'Next digest ' + new Date(info.next_digest).toLocaleString([], { weekday: 'short', hour: '2-digit', minute: '2-digit' }) : 'Updates never buzz your phone.'),
+      cur.length ? el('button', { on: { click: async () => {
+        try {
+          const out = await api('/v1/inbox/batch', { method: 'POST', body: { ids: cur.map((r) => r.id), action: 'read' } });
+          toast(`Marked ${out.done} as read.`);
+        } catch (e) { toast(e.message, 'error'); }
+        loadInbox();
+      } } }, 'Mark all read') : null);
+  }
   return el('div', { class: 'ib' },
     tabs,
     el('div', { class: 'ib-head' },
@@ -5163,6 +5249,7 @@ function viewInbox() {
       mode !== 'inbox' ? el('span', { class: 'ib-modehint', title: 'Settings → Inbox & permissions' }, 'approval mode: execute') : null,
     ),
     el('div', { class: 'ib-chips' }, chip('needs', 'Needs you'), chip('updates', 'Updates'), chip('done', 'Done')),
+    tools,
     body,
   );
 }
@@ -5170,7 +5257,7 @@ function viewInbox() {
 function ibCard(r) {
   const fs = ibFlagSummary(r);
   const card = el('div', {
-    class: 'ib-card', tabindex: '0', role: 'button',
+    class: 'ib-card' + (r.reminded_at && r.status === 'pending' ? ' amber' : ''), tabindex: '0', role: 'button',
     on: {
       click: () => openInboxRequest(r.id),
       keydown: (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); openInboxRequest(r.id); } },
@@ -5179,7 +5266,7 @@ function ibCard(r) {
     el('div', { class: 'ib-sender' }, ibAvatar(r.agent_name), el('b', {}, r.agent_name),
       el('span', { class: 's' }, r.session_title || ''), el('span', { class: 't' }, ibAge(r.created_at))),
     el('div', { class: 'ib-kindrow' }, el('span', { class: 'ib-kind' }, (IB_KIND[r.kind] || r.kind) + (r.kind === 'access' ? ` · ${(r.tools || []).length} tool${(r.tools || []).length === 1 ? '' : 's'}` : '')), ibStatusPill(r),
-      r.checked ? null : el('span', { class: 'ib-pill mute' }, 'Checking…')),
+      ...ibAttnPills(r), r.checked ? null : el('span', { class: 'ib-pill mute' }, 'Checking…')),
     el('h3', {}, r.title),
     el('p', { class: 'sum' }, r.summary),
     fs.length ? el('div', { class: 'ib-flags' }, ...fs.map(ibFlagChip)) : null,
@@ -5305,7 +5392,7 @@ function ibHeadEl(r) {
       el('div', {}, el('b', {}, r.agent_name), el('span', {}, IB_VERB[r.kind] + (ses ? ' · ' + ses : '')))),
     el('div', { class: 'ib-kindrow' },
       el('span', { class: 'ib-kind' }, (IB_KIND[r.kind] || r.kind) + (r.kind === 'access' ? ` · ${r.tools.length} tool${r.tools.length === 1 ? '' : 's'}` : '')),
-      ibStatusPill(r), el('span', { class: 'meta' }, relTime(r.created_at))),
+      ibStatusPill(r), ...ibAttnPills(r), el('span', { class: 'meta' }, relTime(r.created_at))),
     el('h2', {}, r.title),
   );
 }
@@ -5342,10 +5429,9 @@ function ibVoiceEl(r) {
     ...sents.map((s, k) => el('span', { 'data-ib-sent': r.id + ':' + k }, s + ' ')));
   return el('div', { class: 'ib-player' },
     el('div', { class: 'ib-plabel' }, el('span', {}, 'Voice note from ' + r.agent_name),
+      el('span', { class: 'ib-vsrc' }, r.audio && r.audio.blob ? 'recorded by toolyard' : 'read by your browser'),
       el('button', { class: 'ib-rate', 'data-ib-rate': '1', on: { click: () => {
-        ibVoice.rate = ibVoice.rate === 1 ? 1.25 : ibVoice.rate === 1.25 ? 1.5 : 1;
-        if (ibVoice.playing) { ibHalt(); ibVoice.playing = true; ibSpeak(); ibLoop(); }
-        ibSync();
+        ibSetRate(ibVoice.rate === 1 ? 1.25 : ibVoice.rate === 1.25 ? 1.5 : 1);
       } } }, ibVoice.rate + '×')),
     el('div', { class: 'ib-prow' },
       el('button', { class: 'ib-bigplay', 'data-ib-play': r.id, 'aria-label': 'Play voice note', on: { click: () => ibToggle(r.id) } }, ibPlayIcon()),
@@ -5577,8 +5663,10 @@ function ibDecideEl(r, grants) {
         el('div', { class: 'ib-btns' },
           el('button', { class: 'danger', disabled: !!busy, on: { click: () => { state.inbox.panel = 'deny'; ibRegion('decide', ibDecideEl(r, grants)); } } }, 'Deny'),
           el('button', { disabled: !!busy, on: { click: () => { state.inbox.panel = 'snooze'; ibRegion('decide', ibDecideEl(r, grants)); } } }, 'Later'),
-          el('button', { class: 'primary grow', disabled: !!busy || !nOn, on: { click: () => ibApprove(r, allow) } }, busy === 'approve' ? 'Issuing permissions…' : `Approve ${nOn} of ${n}`)),
-        el('p', { class: 'meta' }, `Each allowed tool gets its own permission, limited to the parameters shown and to one use. They expire ${Math.round((r.ttl_seconds || 1800) / 60)} min after you approve.`));
+          el('button', { class: 'primary grow', disabled: !!busy || !nOn, on: { click: () => ibApprove(r, allow) } },
+            busy === 'approve' ? 'Issuing permissions…' : busy === 'passkey' ? 'Confirm with your passkey…' : `Approve ${nOn} of ${n}`)),
+        ibTTLEl(r),
+        el('p', { class: 'meta' }, `Each allowed tool gets its own permission, limited to the parameters shown and to one use.`));
     }
     return el('div', { class: 'ib-sec' },
       el('div', { class: 'ib-eyebrow' }, 'Your decision'),
@@ -5635,6 +5723,7 @@ function ibToolRow(r, t, k, allow, grant, editable) {
       el('div', { class: 'ib-tmain' },
         el('div', { class: 'ib-tline' }, el('code', { class: 'ib-tn' }, t.tool),
           el('span', { class: 'ib-tag' + (t.required ? ' req' : '') }, t.required ? 'Required' : 'Optional'),
+          Object.keys(ibNarrowed(r, k)).length || t.requested_params ? el('span', { class: 'ib-tag narrowed' }, 'Narrowed') : null,
           state_ ? el('span', { class: 'ib-tstate ' + state_[0] }, state_[1]) : null),
         el('p', { class: 'ib-tsum' }, t.summary),
         (t.flags || []).length ? el('div', { class: 'ib-flags' }, ...t.flags.map(ibFlagChip)) : null,
@@ -5645,11 +5734,107 @@ function ibToolRow(r, t, k, allow, grant, editable) {
           ex ? null : el('button', { class: 'ib-tylink', on: { click: () => ibExplain(r, k) } }, '✦ Ask toolyard')),
       )),
     exEl,
-    state.inbox.openParams[key] ? el('div', { class: 'ib-params' }, el('table', {}, el('tbody', {},
-      ...params.map((p) => el('tr', {}, el('td', {}, p), el('td', {}, ibDescribe(t.params[p])),
-        el('td', {}, t.params[p] && t.params[p].limit !== undefined ? el('span', { class: 'ib-lim' }, 'Limit') : el('span', { class: 'ib-ex' }, 'Exact')))))),
-      params.some((p) => t.params[p] && t.params[p].limit !== undefined) ? el('p', { class: 'meta' }, 'Limit values are checked (or, without a pattern, recorded) when the call is made.') : null) : null,
+    state.inbox.openParams[key] ? ibParamsEl(r, t, k, editable && on) : null,
   );
+}
+
+// ---- scope editor: the owner can narrow parameters, never widen them ----
+
+function ibNarrowed(r, k) { return (state.inbox.narrow[r.id] || {})[k] || {}; }
+function ibSetNarrow(r, k, p, c) {
+  const all = state.inbox.narrow[r.id] = state.inbox.narrow[r.id] || {};
+  const tool = all[k] = all[k] || {};
+  if (c === null) delete tool[p]; else tool[p] = c;
+  if (!Object.keys(tool).length) delete all[k];
+  ibRegion('decide', ibDecideEl(r, state.inbox.detail.grants || []));
+}
+function ibParseVal(v) {
+  const t = String(v).trim();
+  if (/^-?\d+(\.\d+)?$/.test(t) || t === 'true' || t === 'false') return JSON.parse(t);
+  return t;
+}
+// ibNarrowable: which constraint kinds can be tightened.
+function ibNarrowable(c) {
+  if (!c || typeof c !== 'object') return false;
+  return 'in' in c || 'prefix' in c || 'limit' in c || 'any' in c || 'gte' in c || 'lte' in c;
+}
+function ibParamsEl(r, t, k, editable) {
+  const key = r.id + ':' + k;
+  const params = Object.keys(t.params || {}).sort();
+  const narrowed = ibNarrowed(r, k);
+  const req = t.requested_params || null; // set once the owner narrowed (after approval)
+  const rows = params.map((p) => {
+    const orig = t.params[p], cur = narrowed[p];
+    const editing = state.inbox.editing[key + ':' + p];
+    const kind = orig && orig.limit !== undefined ? el('span', { class: 'ib-lim' }, 'Limit') : el('span', { class: 'ib-ex' }, 'Exact');
+    const value = cur ? el('span', {}, el('b', {}, ibDescribe(cur)), el('small', { class: 'ib-was' }, ' was ' + ibDescribe(orig)))
+      : req && req[p] && JSON.stringify(req[p]) !== JSON.stringify(orig) ? el('span', {}, el('b', {}, ibDescribe(orig)), el('small', { class: 'ib-was' }, ' narrowed from ' + ibDescribe(req[p])))
+        : ibDescribe(orig);
+    const tools = editable && ibNarrowable(orig) ? el('td', { class: 'ib-ptools' },
+      cur ? el('button', { class: 'ib-link', on: { click: () => ibSetNarrow(r, k, p, null) } }, 'Reset')
+        : el('button', { class: 'ib-link', on: { click: () => { state.inbox.editing[key + ':' + p] = !editing; ibRegion('decide', ibDecideEl(r, state.inbox.detail.grants || [])); } } }, editing ? 'Cancel' : 'Narrow')) : el('td', {});
+    const out = [el('tr', {}, el('td', {}, p), el('td', {}, value), el('td', {}, kind), tools)];
+    if (editing && !cur) out.push(el('tr', { class: 'ib-nrow' }, el('td', { colspan: '4' }, ibNarrowEditor(r, k, p, orig, () => { delete state.inbox.editing[key + ':' + p]; }))));
+    return out;
+  }).flat();
+  return el('div', { class: 'ib-params' }, el('table', {}, el('tbody', {}, ...rows)),
+    params.some((p) => t.params[p] && t.params[p].limit !== undefined) ? el('p', { class: 'meta' }, 'Limit values are checked (or, without a pattern, recorded) when the call is made.') : null,
+    editable && params.some((p) => ibNarrowable(t.params[p])) ? el('p', { class: 'meta' }, 'You can narrow a parameter (fewer values, an exact value, a tighter range) but not widen it.') : null);
+}
+function ibNarrowEditor(r, k, p, orig, done) {
+  const apply = (c) => { done(); ibSetNarrow(r, k, p, c); };
+  const err = el('p', { class: 'ib-nerr', hidden: true });
+  const fail = (m) => { err.textContent = m; err.hidden = false; };
+  if ('in' in orig) {
+    const picked = new Set(orig.in.map((v) => JSON.stringify(v)));
+    return el('div', { class: 'ib-narrow' },
+      el('div', { class: 'meta' }, 'Allow only:'),
+      el('div', { class: 'ib-nchips' }, ...orig.in.map((v) => {
+        const id = JSON.stringify(v);
+        return el('label', { class: 'ib-check' }, el('input', { type: 'checkbox', checked: true, on: { change: (e) => { if (e.target.checked) picked.add(id); else picked.delete(id); } } }),
+          el('span', {}, typeof v === 'string' ? v : id));
+      })),
+      err,
+      el('button', { class: 'primary', on: { click: () => {
+        const vals = orig.in.filter((v) => picked.has(JSON.stringify(v)));
+        if (!vals.length) return fail('Keep at least one value, or untick the tool instead.');
+        apply(vals.length === 1 ? { eq: vals[0] } : { in: vals });
+      } } }, 'Use these'));
+  }
+  if ('gte' in orig || 'lte' in orig) {
+    const lo = el('input', { type: 'number', value: orig.gte !== undefined ? String(orig.gte) : '', placeholder: 'min' });
+    const hi = el('input', { type: 'number', value: orig.lte !== undefined ? String(orig.lte) : '', placeholder: 'max' });
+    return el('div', { class: 'ib-narrow' },
+      el('div', { class: 'ib-nrange' }, lo, el('span', {}, 'to'), hi),
+      err,
+      el('button', { class: 'primary', on: { click: () => {
+        const c = {};
+        if (lo.value !== '') c.gte = Number(lo.value);
+        if (hi.value !== '') c.lte = Number(hi.value);
+        if ((orig.gte !== undefined && (c.gte === undefined || c.gte < orig.gte)) || (orig.lte !== undefined && (c.lte === undefined || c.lte > orig.lte)))
+          return fail('Stay within ' + ibDescribe(orig) + '.');
+        if (c.gte !== undefined && c.lte !== undefined && c.gte > c.lte) return fail('The minimum is above the maximum.');
+        apply(c.gte !== undefined && c.gte === c.lte ? { eq: c.gte } : c);
+      } } }, 'Use this range'));
+  }
+  const input = el('input', { type: 'text', value: 'prefix' in orig ? orig.prefix : '', placeholder: 'limit' in orig ? 'the exact value, e.g. a commit SHA' : 'exact value' });
+  const asPrefix = 'prefix' in orig;
+  let prefixMode = asPrefix;
+  return el('div', { class: 'ib-narrow' },
+    el('div', { class: 'meta' }, asPrefix ? 'A longer prefix, or an exact value:' : 'Pin it to one exact value:'),
+    input,
+    asPrefix ? el('label', { class: 'ib-check' }, el('input', { type: 'checkbox', checked: true, on: { change: (e) => { prefixMode = e.target.checked; } } }), el('span', {}, 'Treat as a prefix')) : null,
+    err,
+    el('button', { class: 'primary', on: { click: () => {
+      const v = input.value.trim();
+      if (!v) return fail('Enter a value.');
+      if (asPrefix && !v.startsWith(orig.prefix)) return fail('It has to start with ' + orig.prefix);
+      if ('limit' in orig && orig.pattern) {
+        let ok = true; try { ok = new RegExp(orig.pattern).test(v); } catch (_) {}
+        if (!ok) return fail('That doesn’t match the pattern the agent gave (' + orig.pattern + ').');
+      }
+      apply(asPrefix && prefixMode ? { prefix: v } : { eq: asPrefix || 'limit' in orig ? v : ibParseVal(v) });
+    } } }, 'Use this'));
 }
 
 function ibDescribe(c) {
@@ -5704,18 +5889,109 @@ function ibPanelEl(r) {
     el('button', { class: 'ib-link', on: { click: back } }, 'Cancel'));
 }
 
+// ibTTLEl: how long the permissions last. The owner can shorten it.
+function ibTTLEl(r) {
+  const req = r.ttl_seconds || 1800;
+  const opts = [...new Set([req, 3600, 1800, 900, 300, 120].filter((v) => v <= req))].sort((a, b) => b - a);
+  const cur = state.inbox.ttl[r.id] || req;
+  const lbl = (v) => (v >= 3600 ? (v / 3600) + ' h' : Math.round(v / 60) + ' min') + (v === req ? ' (asked for)' : '');
+  return el('label', { class: 'ib-ttl' }, el('span', {}, 'Permissions expire'),
+    el('select', { on: { change: (e) => { state.inbox.ttl[r.id] = +e.target.value; } } },
+      ...opts.map((v) => el('option', { value: String(v), selected: v === cur }, lbl(v)))),
+    el('span', {}, 'after you approve'));
+}
+
+function ibApproveBody(r, allow) {
+  const body = { action: 'approve', allow: allow.slice() };
+  const nar = state.inbox.narrow[r.id] || {};
+  const params = {};
+  for (const k of Object.keys(nar)) if (allow[+k] && Object.keys(nar[k]).length) params[k] = nar[k];
+  if (Object.keys(params).length) body.params = params;
+  const ttl = state.inbox.ttl[r.id];
+  if (ttl && ttl !== (r.ttl_seconds || 1800)) body.ttl_seconds = ttl;
+  return body;
+}
+
+function ibIsRisky(t) { return (t.flags || []).some((f) => f.level === 'red' || f.label === 'Production'); }
+
 function ibApprove(r, allow) {
-  const risky = r.tools.filter((t, k) => allow[k] && (t.flags || []).some((f) => f.level === 'red' || f.label === 'Production'));
-  if (!risky.length) { ibDecide(r, { action: 'approve', allow }); return; }
+  const body = ibApproveBody(r, allow);
+  const risky = r.tools.filter((t, k) => allow[k] && ibIsRisky(t));
+  if (!risky.length) { ibDecide(r, body); return; }
+  const hasPasskey = state.inbox.info && state.inbox.info.passkeys > 0;
   const sheet = el('div', { class: 'modal-bg', on: { click: (e) => { if (e.target === e.currentTarget) sheet.remove(); } } },
     el('div', { class: 'modal ib-confirm' },
       el('h3', {}, 'Allow production or flagged changes?'),
       el('p', {}, `You’re allowing ${allow.filter(Boolean).length} tool(s), including:`),
       el('ul', {}, ...risky.map((t) => el('li', {}, el('code', {}, t.tool), ' · ', (t.flags || []).map((f) => f.label).join(', ')))),
+      hasPasskey ? el('p', { class: 'meta' }, 'Your passkey (Face ID) confirms exactly this decision.')
+        : el('p', { class: 'meta' }, 'Tip: add a passkey in Settings → Inbox & permissions to confirm these with Face ID.'),
       el('div', { class: 'ib-btns' },
         el('button', { on: { click: () => sheet.remove() } }, 'Cancel'),
-        el('button', { class: 'primary grow', on: { click: () => { sheet.remove(); ibDecide(r, { action: 'approve', allow }); } } }, 'Yes, approve'))));
+        el('button', { class: 'primary grow', on: { click: () => { sheet.remove(); hasPasskey ? ibPasskeyDecide(r, body) : ibDecide(r, body); } } },
+          hasPasskey ? 'Confirm with passkey' : 'Yes, approve'))));
   document.body.appendChild(sheet);
+}
+
+// ---- passkeys (WebAuthn) ---------------------------------------------------
+
+function pkDec(s) {
+  s = s.replace(/-/g, '+').replace(/_/g, '/');
+  while (s.length % 4) s += '=';
+  const b = atob(s), out = new Uint8Array(b.length);
+  for (let i = 0; i < b.length; i++) out[i] = b.charCodeAt(i);
+  return out.buffer;
+}
+function pkEnc(buf) {
+  const b = new Uint8Array(buf); let s = '';
+  for (let i = 0; i < b.length; i++) s += String.fromCharCode(b[i]);
+  return btoa(s).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+}
+function pkSupported() { return !!(window.PublicKeyCredential && navigator.credentials && window.isSecureContext); }
+async function pkGet(options) {
+  const p = Object.assign({}, options.publicKey);
+  p.challenge = pkDec(p.challenge);
+  if (p.allowCredentials) p.allowCredentials = p.allowCredentials.map((c) => Object.assign({}, c, { id: pkDec(c.id) }));
+  const c = await navigator.credentials.get({ publicKey: p });
+  return {
+    id: c.id, rawId: pkEnc(c.rawId), type: c.type,
+    response: {
+      clientDataJSON: pkEnc(c.response.clientDataJSON), authenticatorData: pkEnc(c.response.authenticatorData),
+      signature: pkEnc(c.response.signature), userHandle: c.response.userHandle ? pkEnc(c.response.userHandle) : null,
+    },
+  };
+}
+async function pkCreate(options) {
+  const p = Object.assign({}, options.publicKey);
+  p.challenge = pkDec(p.challenge);
+  p.user = Object.assign({}, p.user, { id: pkDec(p.user.id) });
+  if (p.excludeCredentials) p.excludeCredentials = p.excludeCredentials.map((c) => Object.assign({}, c, { id: pkDec(c.id) }));
+  const c = await navigator.credentials.create({ publicKey: p });
+  return {
+    id: c.id, rawId: pkEnc(c.rawId), type: c.type,
+    response: {
+      clientDataJSON: pkEnc(c.response.clientDataJSON), attestationObject: pkEnc(c.response.attestationObject),
+      transports: c.response.getTransports ? c.response.getTransports() : [],
+    },
+  };
+}
+
+async function ibPasskeyDecide(r, body) {
+  if (!pkSupported()) { toast('This browser can’t use passkeys here. Open toolyard over https (or localhost).', 'error'); return; }
+  state.inbox.busy = 'passkey';
+  ibRegion('decide', ibDecideEl(r, state.inbox.detail.grants || []));
+  let assertion;
+  try {
+    const begin = await api('/v1/inbox/' + r.id + '/passkey', { method: 'POST', body: { decision: body } });
+    const response = await pkGet(begin.options);
+    assertion = { session_id: begin.session_id, response };
+  } catch (e) {
+    state.inbox.busy = null;
+    ibRegion('decide', ibDecideEl(r, state.inbox.detail.grants || []));
+    toast(e && e.name === 'NotAllowedError' ? 'Passkey check cancelled. Nothing was approved.' : (e.message || 'Passkey check failed'), 'error');
+    return;
+  }
+  ibDecide(r, Object.assign({}, body, { passkey: assertion }));
 }
 
 async function ibDecide(r, body) {
@@ -5724,6 +6000,7 @@ async function ibDecide(r, body) {
   try {
     await api('/v1/inbox/' + r.id + '/decide', { method: 'POST', body });
     state.inbox.panel = null;
+    delete state.inbox.narrow[r.id]; delete state.inbox.ttl[r.id];
     toast({ approve: 'Approved. The agent can continue.', deny: 'Sent. The agent has been told.', return: 'Sent back for a new plan.',
       answer: 'Answer sent.', snooze: 'Snoozed.', read: 'Marked as read.' }[body.action] || 'Done');
     state.inbox.busy = null;
@@ -5731,6 +6008,14 @@ async function ibDecide(r, body) {
     loadInbox();
   } catch (e) {
     state.inbox.busy = null;
+    if (e.status === 428 && !body.passkey) {
+      // A passkey became necessary (one was registered elsewhere, or the
+      // background check flagged a tool): confirm and retry.
+      if (state.inbox.info) state.inbox.info.passkeys = Math.max(1, state.inbox.info.passkeys || 0);
+      await loadInboxDetail(r.id, false);
+      ibPasskeyDecide(r, body);
+      return;
+    }
     if (e.status === 409) staleNote('Already decided, possibly on another device.');
     else toast(e.message, 'error');
     await loadInboxDetail(r.id, false);
@@ -5828,7 +6113,8 @@ function viewInboxSessions() {
       el('div', { class: 'meta' }, 'Last heartbeat ' + relTime(x.last_heartbeat_at) + (x.note ? ' · “' + x.note + '”' : '') +
         (x.coached_24h ? ` · told to ask ${x.coached_24h}× today` : '')),
       x.open_count ? el('div', { class: 'meta' }, `${x.open_count} open request${x.open_count === 1 ? '' : 's'}`) : null,
-      ...(grantsBy[x.agent_id] || []).map(grantRow))),
+      ...(grantsBy[x.agent_id] || []).map(grantRow),
+      ibSessionTimeline(x))),
     orphanGrants.length ? el('div', { class: 'ib-sess' }, el('h3', {}, 'Permissions for agents without a session'), ...orphanGrants.map(grantRow)) : null,
     el('div', { class: 'ib-kill' }, state.inbox.killOpen
       ? el('div', {}, el('p', {}, 'Revoke every live permission? Agents using one stop at their next call.'),
@@ -5842,12 +6128,32 @@ function viewInboxSessions() {
   );
 }
 
+// ibSessionTimeline: the session's requests, newest first, on demand.
+function ibSessionTimeline(x) {
+  const items = state.inbox.items.filter((r) => r.session_id === x.id).sort((a, b) => b.created_at - a.created_at);
+  if (!items.length) return null;
+  const open = !!state.inbox.sessOpen[x.id];
+  return el('div', { class: 'ib-stl' },
+    el('button', { class: 'ib-link', 'aria-expanded': String(open), on: { click: () => { state.inbox.sessOpen[x.id] = !open; render(); } } },
+      open ? 'Hide timeline' : `Timeline · ${items.length} item${items.length === 1 ? '' : 's'}`),
+    open ? el('ol', { class: 'ib-stlist' }, ...items.map((r) => el('li', {},
+      el('button', { class: 'ib-stitem', on: { click: () => openInboxRequest(r.id) } },
+        el('span', { class: 'meta' }, ibClock(r.created_at)),
+        el('span', { class: 'ib-kind' }, IB_KIND[r.kind] || r.kind),
+        el('b', {}, r.title), ibStatusPill(r))))) : null);
+}
+
 // ---- settings card --------------------------------------------------------
 
 function renderInboxSettingsCard() {
   const s = state.settings;
+  if (!state.inbox.info && !state.inbox.infoLoading) {
+    state.inbox.infoLoading = true;
+    api('/v1/inbox/info').then((out) => { state.inbox.info = Object.assign({}, out.info, { passkeys: out.passkeys }); render(); })
+      .catch(() => {}).finally(() => { state.inbox.infoLoading = false; });
+  }
   const patch = async (body) => {
-    try { await api('/v1/settings', { method: 'PATCH', body }); Object.assign(state.settings, body); toast('Saved'); render(); }
+    try { const out = await api('/v1/settings', { method: 'PATCH', body }); Object.assign(state.settings, body, out || {}); state.inbox.info = null; toast('Saved'); render(); }
     catch (e) { toast(e.message, 'error'); }
   };
   const mode = s.approval_mode || 'execute';
@@ -5866,6 +6172,109 @@ function renderInboxSettingsCard() {
     el('label', { class: 'meta', for: 'ib-hosting' }, 'Where agents should host files (shown to them in the guide):'),
     el('textarea', { id: 'ib-hosting', rows: 2, value: s.inbox_hosting_note || '', placeholder: 'e.g. Upload to the evidence bucket and link it',
       on: { change: (e) => patch({ inbox_hosting_note: e.target.value }) } }),
+    ibAttentionSettings(s, patch),
+    ibVoiceSettings(s, patch),
+    ibPasskeySettings(),
+  );
+}
+
+function ibAttentionSettings(s, patch) {
+  const info = state.inbox.info || {};
+  const browserTZ = (() => { try { return Intl.DateTimeFormat().resolvedOptions().timeZone; } catch (_) { return ''; } })();
+  const tz = s.inbox_timezone || '';
+  const clock = (ms) => ms ? new Date(ms).toLocaleString([], { weekday: 'short', hour: '2-digit', minute: '2-digit' }) : '—';
+  const [qs, qe] = (s.inbox_quiet_hours || '').split('-');
+  const qStart = el('input', { type: 'time', value: qs || '', 'aria-label': 'Quiet hours start' });
+  const qEnd = el('input', { type: 'time', value: qe || '', 'aria-label': 'Quiet hours end' });
+  const saveQuiet = () => {
+    if (!qStart.value && !qEnd.value) return patch({ inbox_quiet_hours: '' });
+    if (!qStart.value || !qEnd.value || qStart.value === qEnd.value) return toast('Set both a start and an end time.', 'error');
+    patch({ inbox_quiet_hours: qStart.value + '-' + qEnd.value });
+  };
+  return el('div', { class: 'ib-set' },
+    el('h4', {}, 'When your phone buzzes'),
+    el('p', { class: 'meta' }, '“Now” requests push at once; “soon” ones are grouped per session after 90 seconds; “digest” ones wait for the next digest; updates never push. An agent that’s blocked on you gets one reminder.'),
+    el('div', { class: 'ib-setrow' }, el('span', {}, 'Urgent (“now”) requests per agent per hour'),
+      el('input', { type: 'number', min: '1', max: '60', value: String(s.inbox_now_per_hour || 3), class: 'ib-num',
+        on: { change: (e) => patch({ inbox_now_per_hour: Math.max(1, Math.min(60, +e.target.value || 3)) }) } })),
+    el('div', { class: 'ib-setrow' }, el('span', {}, 'Quiet hours'), el('span', { class: 'ib-inline' }, qStart, '–', qEnd,
+      el('button', { on: { click: saveQuiet } }, 'Save'),
+      s.inbox_quiet_hours ? el('button', { class: 'ib-link', on: { click: () => patch({ inbox_quiet_hours: '' }) } }, 'Off') : null)),
+    el('label', { class: 'meta', for: 'ib-qallow' }, 'Tools whose “now” requests may break through quiet hours (comma-separated; deploy.* matches a prefix):'),
+    el('input', { id: 'ib-qallow', type: 'text', value: s.inbox_quiet_allow || '', placeholder: 'e.g. deploy.rollback, pagerduty.*',
+      on: { change: (e) => patch({ inbox_quiet_allow: e.target.value }) } }),
+    el('div', { class: 'ib-setrow' }, el('span', {}, 'Digest times'),
+      el('input', { type: 'text', value: s.inbox_digest_times === undefined ? '09:30,13:30,18:30' : s.inbox_digest_times, placeholder: 'none', class: 'ib-txt',
+        on: { change: (e) => patch({ inbox_digest_times: e.target.value }) } })),
+    el('div', { class: 'ib-setrow' }, el('span', {}, 'Time zone'),
+      el('span', { class: 'ib-inline' }, el('code', {}, tz || info.timezone || 'server'),
+        browserTZ && browserTZ !== tz ? el('button', { on: { click: () => patch({ inbox_timezone: browserTZ }) } }, 'Use ' + browserTZ) : null)),
+    el('p', { class: 'meta' }, (info.quiet_now ? `Quiet until ${clock(info.quiet_until)}. ` : '') + `Next digest: ${clock(info.next_digest)}.` +
+      (info.pending_pushes ? ` ${info.pending_pushes} notification(s) queued.` : '')),
+    el('label', { class: 'ib-check' }, el('input', { type: 'checkbox', checked: !!s.inbox_push_details, on: { change: (e) => patch({ inbox_push_details: e.target.checked }) } }),
+      el('span', {}, 'Show titles and summaries in notifications (and on your watch). Off: notifications only say which agent wants what. Text in notifications passes through Apple’s or Google’s push service, encrypted.')),
+  );
+}
+
+function ibVoiceSettings(s, patch) {
+  const info = state.inbox.info || {};
+  return el('div', { class: 'ib-set' },
+    el('h4', {}, 'Voice notes'),
+    el('label', { class: 'ib-check' }, el('input', { type: 'checkbox', checked: !!s.inbox_voice_enabled, disabled: !info.voice_available && !s.inbox_voice_enabled,
+      on: { change: (e) => patch({ inbox_voice_enabled: e.target.checked }) } }),
+      el('span', {}, 'Record voice notes on the server (Gemini text-to-speech), so every note sounds the same and plays with the screen locked. Off: your browser reads the script.' +
+        (info.voice_available ? '' : ' Needs GEMINI_API_KEY on the gateway.'))),
+    s.inbox_voice_enabled ? el('div', { class: 'ib-setrow' }, el('span', {}, 'Voice'),
+      el('select', { on: { change: (e) => patch({ inbox_voice_name: e.target.value }) } },
+        ...['Kore', 'Puck', 'Charon', 'Aoede', 'Leda', 'Orus', 'Zephyr', 'Fenrir'].map((v) => el('option', { value: v, selected: (s.inbox_voice_name || 'Kore') === v }, v)))) : null,
+  );
+}
+
+function ibPasskeySettings() {
+  const st = state.passkeys || (state.passkeys = { list: null, busy: false });
+  if (st.list === null && !st.loading) {
+    st.loading = true;
+    api('/v1/passkeys').then((out) => { st.list = out.passkeys || []; }).catch(() => { st.list = []; })
+      .finally(() => { st.loading = false; if (state.route === 'settings') render(); });
+  }
+  const add = async () => {
+    if (!pkSupported()) return toast('Passkeys need toolyard on https (or localhost).', 'error');
+    st.busy = true; render();
+    try {
+      const begin = await api('/v1/passkeys/register/begin', { method: 'POST', body: {} });
+      const credential = await pkCreate(begin.options);
+      const name = /iPhone/.test(navigator.userAgent) ? 'iPhone' : /iPad/.test(navigator.userAgent) ? 'iPad' : /Mac/.test(navigator.userAgent) ? 'Mac' : 'This device';
+      await api('/v1/passkeys/register/finish', { method: 'POST', body: { session_id: begin.session_id, name, credential } });
+      toast('Passkey added. High-risk approvals now ask for it.');
+      st.list = null;
+      if (state.inbox.info) state.inbox.info.passkeys = (state.inbox.info.passkeys || 0) + 1;
+    } catch (e) {
+      toast(e && e.name === 'NotAllowedError' ? 'Cancelled.' : (e.message || 'Couldn’t add a passkey'), 'error');
+    }
+    st.busy = false; render();
+  };
+  const remove = async (pk) => {
+    st.busy = true; render();
+    try {
+      const begin = await api('/v1/passkeys/' + encodeURIComponent(pk.id) + '/remove/begin', { method: 'POST', body: {} });
+      const response = await pkGet(begin.options);
+      await api('/v1/passkeys/' + encodeURIComponent(pk.id) + '/remove', { method: 'POST', body: { session_id: begin.session_id, response } });
+      toast('Passkey removed.');
+      st.list = null;
+      if (state.inbox.info) state.inbox.info.passkeys = Math.max(0, (state.inbox.info.passkeys || 1) - 1);
+    } catch (e) {
+      toast(e && e.name === 'NotAllowedError' ? 'Cancelled.' : (e.message || 'Couldn’t remove it'), 'error');
+    }
+    st.busy = false; render();
+  };
+  return el('div', { class: 'ib-set' },
+    el('h4', {}, 'Passkeys'),
+    el('p', { class: 'meta' }, 'With a passkey, allowing production or red-flagged tools needs Face ID (or Touch ID, or your security key), bound to exactly what you approve. Removing a passkey needs a passkey too; if you lose every device, restart the gateway once with -inbox-reset-passkeys.'),
+    st.list === null ? el('p', { class: 'meta' }, 'Loading…') : st.list.length ? el('div', { class: 'ib-pklist' },
+      ...st.list.map((pk) => el('div', { class: 'ib-pkrow' },
+        el('span', {}, el('b', {}, pk.name), el('small', { class: 'meta' }, ' added ' + relTime(pk.created_at) + (pk.last_used_at ? ' · used ' + relTime(pk.last_used_at) : ''))),
+        el('button', { class: 'danger', disabled: st.busy, on: { click: () => remove(pk) } }, 'Remove')))) : el('p', { class: 'meta' }, 'No passkeys yet.'),
+    el('button', { class: 'primary', disabled: st.busy, on: { click: add } }, st.busy ? 'Waiting for your passkey…' : 'Add a passkey on this device'),
   );
 }
 
@@ -5897,6 +6306,7 @@ Read the full rules with inbox.guide().`;
   if (location.hash) state.route = location.hash.slice(1) || 'approvals';
   let deepInbox = null;
   if (state.route.startsWith('inbox/')) { deepInbox = state.route.slice(6); state.route = 'inbox'; }
+  if (IB_FILTERS.includes(deepInbox)) { state.inbox.filter = deepInbox; deepInbox = null; }
   // Push deep link: notifications open /?approval=<id>. Land on the
   // approvals view so the card (or its expired/decided state) is visible.
   const approvalParam = new URLSearchParams(location.search).get('approval');
@@ -5948,7 +6358,10 @@ Read the full rules with inbox.guide().`;
     const h = location.hash.slice(1);
     if (h.startsWith('inbox/')) {
       const id = h.slice(6);
-      if (id && state.inbox.openId !== id) openInboxRequest(id);
+      if (IB_FILTERS.includes(id)) {
+        if (state.inbox.openId) closeInboxRequest();
+        state.inbox.filter = id; state.inbox.tab = 'inbox'; navigate('inbox');
+      } else if (id && state.inbox.openId !== id) openInboxRequest(id);
     } else if (h && h !== state.route) {
       navigate(h);
     }

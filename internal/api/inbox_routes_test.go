@@ -397,3 +397,28 @@ func (f *inboxAPIFixture) ownerID(t *testing.T) string {
 	}
 	return uid
 }
+
+func TestInboxBatchAndInfo(t *testing.T) {
+	f := newInboxAPIFixture(t)
+	ctx := context.Background()
+	var ids []string
+	for i := 0; i < 3; i++ {
+		res, err := f.svc.Submit(ctx, f.agent, &inbox.Submission{Kind: inbox.KindUpdate, Title: "Done", Summary: "s", Message: "m",
+			Audio: inbox.Audio{Script: "Done."}, Urgency: inbox.UrgencyFYI})
+		if err != nil || !res.OK {
+			t.Fatal(err, res)
+		}
+		ids = append(ids, res.RequestID)
+	}
+	if code, out := f.owner(t, http.MethodPost, "/v1/inbox/batch", map[string]any{"ids": ids, "action": "approve"}); code != http.StatusBadRequest {
+		t.Fatalf("batch approve must be refused: %d %v", code, out)
+	}
+	code, out := f.owner(t, http.MethodPost, "/v1/inbox/batch", map[string]any{"ids": append(ids, "rq_missing"), "action": "read"})
+	if code != http.StatusOK || out["done"].(float64) != 3 || len(out["failed"].(map[string]any)) != 1 {
+		t.Fatalf("batch read: %d %v", code, out)
+	}
+	code, out = f.owner(t, http.MethodGet, "/v1/inbox/info", nil)
+	if code != http.StatusOK || out["info"].(map[string]any)["next_digest"] == nil {
+		t.Fatalf("info: %d %v", code, out)
+	}
+}

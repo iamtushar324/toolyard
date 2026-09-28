@@ -27,6 +27,8 @@ import (
 //	POST /v1/inbox/grants/{id}/revoke          revoke one grant
 //	POST /v1/inbox/grants/revoke-all           kill switch
 //	GET  /v1/inbox/blobs/{sha256}              a copied attachment
+//	GET  /v1/inbox/info                        judge/voice availability, quiet hours, next digest
+//	POST /v1/inbox/batch                       {ids, action: read|deny|snooze} (never approve)
 //	POST /v1/inbox/decide-by-token             a notification action (signed token; no cookie)
 //	GET  /v1/guide[?topic=]                    the agent protocol (bearer or session)
 //	GET  /v1/guide/skill                       the toolyard-inbox SKILL.md
@@ -149,6 +151,21 @@ func (s *Server) inboxItem(w http.ResponseWriter, r *http.Request) {
 		s.inboxSessions(w, r, uid)
 	case rest == "grants":
 		s.inboxGrants(w, r)
+	case rest == "info":
+		if r.Method != http.MethodGet {
+			writeError(w, http.StatusMethodNotAllowed, "GET only")
+			return
+		}
+		info := s.inbox.Info(r.Context())
+		pk := 0
+		if s.passkeys != nil {
+			if l, err := s.passkeys.List(r.Context(), uid); err == nil {
+				pk = len(l)
+			}
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"info": info, "passkeys": pk})
+	case rest == "batch":
+		s.inboxBatch(w, r, uid)
 	case len(parts) == 2 && parts[0] == "grants" && parts[1] == "revoke-all":
 		s.inboxRevokeAll(w, r)
 	case len(parts) == 3 && parts[0] == "grants" && parts[2] == "revoke":
@@ -425,6 +442,52 @@ func (s *Server) inboxBlob(w http.ResponseWriter, r *http.Request, sha string) {
 	}
 	w.Header().Set("Content-Security-Policy", "default-src 'none'; img-src 'self'; media-src 'self'; sandbox")
 	http.ServeContent(w, r, "", st.ModTime(), f)
+}
+
+// inboxBatch applies one action to many requests. Approving is never
+// batched: each access request is read and decided on its own.
+func (s *Server) inboxBatch(w http.ResponseWriter, r *http.Request, uid string) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "POST only")
+		return
+	}
+	var body struct {
+		IDs           []string `json:"ids"`
+		Action        string   `json:"action"`
+		Note          string   `json:"note"`
+		SnoozeMinutes int      `json:"snooze_minutes"`
+	}
+	if err := decode(r, &body); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	switch body.Action {
+	case "read", "deny", "snooze":
+	default:
+		writeError(w, http.StatusBadRequest, "batch action must be read, deny or snooze")
+		return
+	}
+	if len(body.IDs) == 0 || len(body.IDs) > 200 {
+		writeError(w, http.StatusBadRequest, "ids: 1 to 200 request IDs")
+		return
+	}
+	by := "owner"
+	if u, err := s.identity.GetUserByID(r.Context(), uid); err == nil && u != nil {
+		by = u.Username
+	}
+	done, failed := 0, map[string]string{}
+	for _, id := range body.IDs {
+		req, err := s.inbox.Decide(r.Context(), id, inbox.Decision{Action: body.Action, Note: body.Note, SnoozeMinutes: body.SnoozeMinutes, By: by})
+		if err != nil {
+			failed[id] = err.Error()
+			continue
+		}
+		done++
+		if s.audit != nil {
+			_ = s.audit.Write(r.Context(), audit.Event{EventType: "inbox.decide", AgentID: req.AgentID, Decision: body.Action, Reason: "batch", ApprovalID: req.ID})
+		}
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"done": done, "failed": failed})
 }
 
 // inboxDecideByToken handles a tap on a notification action. The signed

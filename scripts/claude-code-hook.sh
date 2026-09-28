@@ -14,8 +14,15 @@
 #     },
 #     "content": [{ "type": "text", "text": "Approval pending. …" }] }
 #
-# This hook detects that response, polls the toolyard REST API for the
-# approval's status, and once it resolves either:
+# In approval_mode = inbox (see docs/guidelines/agent-onboarding.md) a
+# restricted call without a grant instead returns `permission_required`
+# (`_meta["toolyard.permission_required"]`) with a pre-filled draft, and a
+# rejected grant returns `grant_invalid`. Nothing is queued, so there is
+# nothing to wait for: the hook adds a one-line reminder of the next step
+# and lets the agent carry on with other work. It never blocks.
+#
+# For deferred (execute-mode) responses, the hook polls the toolyard REST
+# API for the approval's status, and once it resolves either:
 #   - re-issues the tool call with `_approval_id=...` so the gateway
 #     short-circuits straight to dispatch, or
 #   - reports a denial back to Claude Code.
@@ -52,6 +59,32 @@ is_deferred() {
     grep -q '"toolyard.deferred"[[:space:]]*:[[:space:]]*true' <<<"$payload"
   fi
 }
+
+has_meta() {
+  if [[ $have_jq -eq 1 ]]; then
+    jq -e --arg k "$1" '.tool_response._meta[$k] == true' >/dev/null 2>&1 <<<"$payload"
+  else
+    grep -q "\"$1\"[[:space:]]*:[[:space:]]*true" <<<"$payload"
+  fi
+}
+
+# Inbox mode: coach, don't wait.
+if has_meta "toolyard.permission_required"; then
+  cat <<'EOF'
+{
+  "additionalContext": "toolyard: nothing ran. Put this call (and any other restricted tools the task needs) into ONE inbox.request using the draft in the result: dry_run first, then send. Keep working while your owner decides; call the tool with _grant once it's allowed."
+}
+EOF
+  exit 0
+fi
+if has_meta "toolyard.grant_invalid"; then
+  cat <<'EOF'
+{
+  "additionalContext": "toolyard: the grant was refused and nothing ran. Read `reason` in the result; call again within the granted parameters, or ask again with inbox.request if you need something different."
+}
+EOF
+  exit 0
+fi
 
 if ! is_deferred; then
   exit 0   # not a deferred toolyard response; let Claude Code continue normally

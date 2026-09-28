@@ -799,3 +799,48 @@ func (s *Service) PendingPushes(ctx context.Context) (int, error) {
 	}
 	return n, err
 }
+
+// Info is what the owner's settings screen shows about the inbox.
+type Info struct {
+	JudgeAvailable bool   `json:"judge_available"`
+	VoiceAvailable bool   `json:"voice_available"`
+	PendingPushes  int    `json:"pending_pushes"`
+	QuietNow       bool   `json:"quiet_now"`
+	QuietUntil     int64  `json:"quiet_until,omitempty"`
+	NextDigest     int64  `json:"next_digest,omitempty"`
+	Timezone       string `json:"timezone"`
+}
+
+// Info reports the inbox's current attention state.
+func (s *Service) Info(ctx context.Context) Info {
+	c := s.attention()
+	now := s.now()
+	in := Info{JudgeAvailable: s.opts.Judge != nil, VoiceAvailable: s.opts.Voice != nil && s.opts.Blobs != nil, Timezone: c.Location.String()}
+	in.PendingPushes, _ = s.PendingPushes(ctx)
+	if q, end := quietWindow(c, now); q {
+		in.QuietNow, in.QuietUntil = true, end.UnixMilli()
+	}
+	if next, ok := nextDigest(c, now); ok {
+		in.NextDigest = next.UnixMilli()
+	}
+	return in
+}
+
+// nextDigest is the first digest slot after t.
+func nextDigest(c AttentionConfig, t time.Time) (time.Time, bool) {
+	t = t.In(c.Location)
+	var best time.Time
+	for _, day := range []time.Time{t, t.AddDate(0, 0, 1)} {
+		for _, v := range c.DigestTimes {
+			m, ok := ParseClock(v)
+			if !ok {
+				continue
+			}
+			at := atClock(day, m)
+			if at.After(t) && (best.IsZero() || at.Before(best)) {
+				best = at
+			}
+		}
+	}
+	return best, !best.IsZero()
+}
