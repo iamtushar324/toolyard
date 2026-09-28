@@ -161,6 +161,7 @@ func runServe(argv []string) error {
 	publicURL := fs.String("public-url", "", "public origin (e.g. https://toolyard.example.com). When set, enables HSTS, secure cookies, and Origin enforcement.")
 	trustedProxies := fs.String("trusted-proxy", "", "comma-separated CIDRs to trust for X-Forwarded-* headers (e.g. 127.0.0.1/32,::1/128,10.0.0.0/8)")
 	clickhouseRuntimeEnvPath := fs.String("clickhouse-runtime-env", "/var/lib/toolyard/clickhouse-runtime.env", "path where toolyard maintains a TOOLYARD_CH_PASSWORD=... line for the toolyard-clickhouse container's docker-compose env_file to consume. Updated on bootstrap and on every rotate. Empty disables the write (useful in tests).")
+	inboxFetchPrivate := fs.Bool("inbox-fetch-private-networks", false, "let the inbox copy attachment links that point at loopback or private-network addresses (e.g. evidence hosted on your LAN). Off by default: agent-chosen URLs could otherwise reach internal services.")
 	requireAuthMCP := fs.Bool("require-auth-on-mcp", false, "reject anonymous /mcp calls (no Authorization header). Auto-enabled when -public-url is set.")
 	statelessMCP := fs.Bool("stateless-mcp", false, "skip MCP session-ID tracking. Every request stands alone — no server-initiated notifications, but agents that don't auto-reconnect on session-invalid (e.g., hermes) survive a toolyard restart without manual intervention.")
 	noStdioUpstreams := fs.Bool("no-stdio-upstreams", false, "refuse to start any stdio (subprocess) MCP upstream. Use when the dashboard is exposed publicly so a compromised session can't spawn arbitrary commands.")
@@ -421,6 +422,7 @@ func runServe(argv []string) error {
 	if err != nil {
 		return fmt.Errorf("inbox snapshots: %w", err)
 	}
+	inboxSnaps.AllowPrivateNetworks(*inboxFetchPrivate)
 	var inboxJudge inbox.Judge
 	if key := strings.TrimSpace(os.Getenv("GEMINI_API_KEY")); key != "" {
 		if j, jerr := inbox.NewGeminiJudge(ctx, key, settingsSvc.GetString(settings.InboxJudgeModel, "")); jerr != nil {
@@ -446,14 +448,15 @@ func runServe(argv []string) error {
 		return ""
 	}
 	inboxSvc, err := inbox.New(ctx, inbox.Options{
-		DB:              db,
-		Catalog:         gw,
-		Judge:           inboxJudge,
-		JudgeEnabled:    func() bool { return settingsSvc.GetBool(settings.InboxJudgeEnabled) },
-		Fetcher:         inboxSnaps,
-		SnapshotEnabled: func() bool { return settingsSvc.GetBoolDefault(settings.InboxSnapshotEnabled, true) },
-		Publish:         func(t string, d any) { hub.Publish(realtime.Event{Type: t, Data: d}) },
-		AgentName:       agentName,
+		DB:                db,
+		Catalog:           gw,
+		Judge:             inboxJudge,
+		JudgeEnabled:      func() bool { return settingsSvc.GetBool(settings.InboxJudgeEnabled) },
+		Fetcher:           inboxSnaps,
+		SnapshotEnabled:   func() bool { return settingsSvc.GetBoolDefault(settings.InboxSnapshotEnabled, true) },
+		AllowPrivateMedia: *inboxFetchPrivate,
+		Publish:           func(t string, d any) { hub.Publish(realtime.Event{Type: t, Data: d}) },
+		AgentName:         agentName,
 		Notify: func(ctx context.Context, r *inbox.Request) {
 			user, err := idSvc.PrimaryUser(ctx)
 			if err != nil {
@@ -481,7 +484,10 @@ func runServe(argv []string) error {
 	if err != nil {
 		return fmt.Errorf("inbox: %w", err)
 	}
-	defer inboxSvc.Flush()
+	defer inboxSvc.Close(20 * time.Second)
+	if n := inboxSvc.RecheckUnchecked(ctx); n > 0 {
+		log.Printf("inbox: re-running background checks for %d request(s)", n)
+	}
 	inboxGuide := inbox.NewGuide(func() string { return settingsSvc.GetString(settings.InboxHostingNote, "") })
 	gw.SetInbox(inboxSvc, inboxGuide, func() string {
 		return settingsSvc.GetString(settings.ApprovalMode, settings.ApprovalModeExecute)

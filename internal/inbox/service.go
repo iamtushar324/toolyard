@@ -20,6 +20,7 @@ import (
 // Tunables.
 const (
 	RequestTTL         = 24 * time.Hour
+	UpdateTTL          = 7 * 24 * time.Hour
 	MaxPendingPerAgent = 16
 	DryRunsPerHour     = 20
 	dryRunWindow       = 2 * time.Hour
@@ -56,6 +57,9 @@ type Options struct {
 	// linked media when a request is sent.
 	Fetcher         Fetcher
 	SnapshotEnabled func() bool
+	// AllowPrivateMedia accepts media links on private networks. The
+	// Fetcher must be configured to match (Snapshotter.AllowPrivateNetworks).
+	AllowPrivateMedia bool
 	// Publish sends a realtime event to the dashboard.
 	Publish func(eventType string, data any)
 	// Notify is called once when a request that needs the owner arrives,
@@ -94,8 +98,43 @@ func New(ctx context.Context, opts Options) (*Service, error) {
 // inbox depend on each other).
 func (s *Service) SetCatalog(c Catalog) { s.opts.Catalog = c }
 
-// Flush waits for background checks to finish. Used by tests and shutdown.
+// Flush waits for background checks to finish. Used by tests.
 func (s *Service) Flush() { s.bg.Wait() }
+
+// Close waits up to timeout for background checks, so shutdown isn't held
+// hostage by a slow download. Unfinished checks are redone at the next
+// start by RecheckUnchecked.
+func (s *Service) Close(timeout time.Duration) {
+	done := make(chan struct{})
+	go func() { s.bg.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(timeout):
+		log.Printf("inbox: shutdown with background checks still running; they'll be redone at next start")
+	}
+}
+
+// RecheckUnchecked restarts the background check for pending requests
+// whose check never finished (e.g. the gateway stopped mid-check).
+func (s *Service) RecheckUnchecked(ctx context.Context) int {
+	open, err := s.List(ctx, ListFilter{Open: true, Limit: 500})
+	if err != nil {
+		return 0
+	}
+	n := 0
+	for _, r := range open {
+		if r.Checked {
+			continue
+		}
+		n++
+		s.bg.Add(1)
+		go func(id string) {
+			defer s.bg.Done()
+			s.backgroundCheck(context.Background(), id)
+		}(r.ID)
+	}
+	return n
+}
 
 func (s *Service) publish(t string, data any) {
 	if s.opts.Publish != nil {
@@ -155,7 +194,7 @@ func (s *Service) Submit(ctx context.Context, agentID string, sub *Submission) (
 	if sub.Kind == "" {
 		sub.Kind = KindAccess
 	}
-	r, probs, warns := Validate(ctx, s.opts.Catalog, agentID, sub)
+	r, probs, warns := Validate(ctx, s.opts.Catalog, agentID, sub, ValidateOptions{AllowPrivateMedia: s.opts.AllowPrivateMedia})
 	r.AgentID = agentID
 	for i := range r.Tools {
 		r.Tools[i].Flags = RuleFlags(r.Tools[i])
@@ -222,6 +261,9 @@ func (s *Service) Submit(ctx context.Context, agentID string, sub *Submission) (
 	r.CreatedAt = now.UnixMilli()
 	r.UpdatedAt = r.CreatedAt
 	r.ExpiresAt = now.Add(RequestTTL).UnixMilli()
+	if r.Kind == KindUpdate {
+		r.ExpiresAt = now.Add(UpdateTTL).UnixMilli()
+	}
 	r.DryRunCount, _ = s.countDryRunsTitled(ctx, agentID, r.Title)
 	r.addActivity(r.CreatedAt, "Sent by "+s.agentName(ctx, agentID))
 	if r.DryRunCount > 0 {

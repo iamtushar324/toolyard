@@ -109,10 +109,21 @@ var (
 	idLike    = regexp.MustCompile(`\b[a-z]{2,4}_[A-Za-z0-9]{6,}\b`)
 )
 
+// ValidateOptions tune validation.
+type ValidateOptions struct {
+	// AllowPrivateMedia accepts media links on private networks (an
+	// operator opt-in for home/LAN setups).
+	AllowPrivateMedia bool
+}
+
 // Validate checks a submission and converts it into a Request. The request
 // is returned even when there are problems, so dry runs can still compute
 // flags and a preview.
-func Validate(ctx context.Context, cat Catalog, agentID string, s *Submission) (*Request, []Problem, []Problem) {
+func Validate(ctx context.Context, cat Catalog, agentID string, s *Submission, opt ...ValidateOptions) (*Request, []Problem, []Problem) {
+	var vo ValidateOptions
+	if len(opt) > 0 {
+		vo = opt[0]
+	}
 	var probs, warns []Problem
 	add := func(path, format string, a ...any) { probs = append(probs, Problem{path, fmt.Sprintf(format, a...)}) }
 	warn := func(path, format string, a ...any) { warns = append(warns, Problem{path, fmt.Sprintf(format, a...)}) }
@@ -268,7 +279,7 @@ func Validate(ctx context.Context, cat Catalog, agentID string, s *Submission) (
 	for i, a := range s.Attachments {
 		p := fmt.Sprintf("attachments[%d]", i)
 		a.Blob, a.PosterBlob, a.ContentType, a.Size, a.FetchError = "", "", "", 0, ""
-		validateAttachment(add, p, &a)
+		validateAttachment(add, p, &a, vo.AllowPrivateMedia)
 		r.Attachments = append(r.Attachments, a)
 	}
 	return r, probs, warns
@@ -288,7 +299,7 @@ func checkText(add func(string, string, ...any), path, v string, max int, hint s
 	}
 }
 
-func validateAttachment(add func(string, string, ...any), p string, a *Attachment) {
+func validateAttachment(add func(string, string, ...any), p string, a *Attachment, allowPrivate bool) {
 	if utf8.RuneCountInString(a.Caption) > MaxCaption {
 		add(p+".caption", "max %d characters", MaxCaption)
 	}
@@ -353,12 +364,12 @@ func validateAttachment(add func(string, string, ...any), p string, a *Attachmen
 	case "log":
 		bodyLimit("body", a.Body, MaxCodeBody)
 	case "image", "video", "file":
-		checkMediaURL(add, p+".url", a.URL)
+		checkMediaURL(add, p+".url", a.URL, allowPrivate)
 		if a.Type == "file" && a.Name == "" {
 			add(p+".name", "missing")
 		}
 		if a.Type == "video" && a.PosterURL != "" {
-			checkMediaURL(add, p+".poster_url", a.PosterURL)
+			checkMediaURL(add, p+".poster_url", a.PosterURL, allowPrivate)
 		}
 	case "link":
 		if a.Label == "" {
@@ -376,10 +387,13 @@ func validateAttachment(add func(string, string, ...any), p string, a *Attachmen
 
 // checkMediaURL rejects URLs toolyard can't or mustn't fetch. The fetcher
 // repeats the network-level check after DNS resolution.
-func checkMediaURL(add func(string, string, ...any), path, raw string) {
+func checkMediaURL(add func(string, string, ...any), path, raw string, allowPrivate bool) {
 	u, err := url.Parse(raw)
 	if err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Host == "" {
 		add(path, "must be an http(s) URL toolyard can reach")
+		return
+	}
+	if allowPrivate {
 		return
 	}
 	host := strings.ToLower(u.Hostname())

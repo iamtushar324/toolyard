@@ -1,6 +1,9 @@
 # toolyard — owner inbox and scoped grants: design spec
 
-Status: **draft**. Decision records: [ADR 0005](../adr/0005-scoped-grants.md), [ADR 0006](../adr/0006-coach-dont-queue.md). How agents learn the protocol: [agent-onboarding.md](agent-onboarding.md).
+Status: **implemented (v1)**. Where this early spec differs from the code
+(table layout, tool names in §7, digest scheduling, biometric confirmation),
+[agent-onboarding.md → What shipped in v1](agent-onboarding.md#what-shipped-in-v1)
+and [agent-protocol.md](agent-protocol.md) are authoritative. Decision records: [ADR 0005](../adr/0005-scoped-grants.md), [ADR 0006](../adr/0006-coach-dont-queue.md). How agents learn the protocol: [agent-onboarding.md](agent-onboarding.md).
 Principles: [principles.md](principles.md). Agent rules:
 [agent-protocol.md](agent-protocol.md).
 

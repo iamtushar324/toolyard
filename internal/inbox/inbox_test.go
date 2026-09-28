@@ -898,3 +898,32 @@ func TestSnapshotStoresAndLimits(t *testing.T) {
 		t.Fatal("404 accepted")
 	}
 }
+
+func TestRecheckUncheckedAfterRestart(t *testing.T) {
+	e := newEnv(t)
+	ctx := context.Background()
+	r := submitDeploy(t, e, "ag_1")
+	// Simulate a gateway that stopped mid-check.
+	if err := e.svc.mutate(ctx, r.ID, func(x *Request) error { x.Checked = false; return nil }); err != nil {
+		t.Fatal(err)
+	}
+	if n := e.svc.RecheckUnchecked(ctx); n != 1 {
+		t.Fatalf("want 1 request re-checked, got %d", n)
+	}
+	e.svc.Flush()
+	got, _ := e.svc.Get(ctx, r.ID)
+	if !got.Checked {
+		t.Fatal("request still unchecked")
+	}
+	e.svc.Close(time.Second)
+}
+
+func TestUpdatesLastLongerThanRequests(t *testing.T) {
+	e := newEnv(t)
+	res, _ := e.svc.Submit(context.Background(), "ag_1", &Submission{Kind: KindUpdate, Title: "Done", Summary: "s", Message: "m",
+		Audio: Audio{Script: "All done."}, Urgency: UrgencyFYI})
+	r, _ := e.svc.Get(context.Background(), res.RequestID)
+	if time.Duration(r.ExpiresAt-r.CreatedAt)*time.Millisecond != UpdateTTL {
+		t.Fatalf("update expiry %v, want %v", time.Duration(r.ExpiresAt-r.CreatedAt)*time.Millisecond, UpdateTTL)
+	}
+}

@@ -39,10 +39,11 @@ func (s *Server) inboxRoutes(mux *http.ServeMux) {
 // inboxCard is a request plus the names the dashboard shows next to it.
 type inboxCard struct {
 	*inbox.Request
-	AgentName    string `json:"agent_name"`
-	SessionTitle string `json:"session_title,omitempty"`
-	SessionRepo  string `json:"session_repo,omitempty"`
-	SessionHost  string `json:"session_host,omitempty"`
+	AttachmentCount int    `json:"attachment_count"`
+	AgentName       string `json:"agent_name"`
+	SessionTitle    string `json:"session_title,omitempty"`
+	SessionRepo     string `json:"session_repo,omitempty"`
+	SessionHost     string `json:"session_host,omitempty"`
 }
 
 func (s *Server) agentNames(ctx context.Context, uid string) map[string]string {
@@ -59,7 +60,7 @@ func (s *Server) agentNames(ctx context.Context, uid string) map[string]string {
 }
 
 func (s *Server) cardFor(ctx context.Context, r *inbox.Request, names map[string]string, sessions map[string]*inbox.Session) inboxCard {
-	c := inboxCard{Request: r, AgentName: names[r.AgentID]}
+	c := inboxCard{Request: r, AttachmentCount: len(r.Attachments), AgentName: names[r.AgentID]}
 	if c.AgentName == "" {
 		c.AgentName = "agent " + shortAgent(r.AgentID)
 	}
@@ -97,13 +98,17 @@ func (s *Server) inboxList(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{"requests": []any{}})
 		return
 	}
-	f := inbox.ListFilter{Limit: 200}
+	f := inbox.ListFilter{Limit: 500}
 	switch r.URL.Query().Get("view") {
 	case "done":
-		f.Closed = true
+		f.Closed, f.Limit = true, 100
 	case "all":
+		f.Limit = 200
 	default:
 		f.Open = true
+	}
+	if n, err := strconv.Atoi(r.URL.Query().Get("limit")); err == nil && n > 0 && n < f.Limit {
+		f.Limit = n
 	}
 	reqs, err := s.inbox.List(r.Context(), f)
 	if err != nil {
@@ -114,7 +119,13 @@ func (s *Server) inboxList(w http.ResponseWriter, r *http.Request) {
 	sessions := map[string]*inbox.Session{}
 	out := make([]inboxCard, 0, len(reqs))
 	for i := range reqs {
-		out = append(out, s.cardFor(r.Context(), &reqs[i], names, sessions))
+		c := s.cardFor(r.Context(), &reqs[i], names, sessions)
+		// The list only needs what the cards show; attachments and the
+		// timeline come with GET /v1/inbox/{id}.
+		slim := *c.Request
+		slim.Attachments, slim.Activity = nil, nil
+		c.Request = &slim
+		out = append(out, c)
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"requests": out})
 }

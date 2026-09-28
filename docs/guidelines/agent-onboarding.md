@@ -43,20 +43,23 @@ served as:
    bearer token.
 3. **The MCP resource `toolyard://guide`**, for clients that read resources.
 4. **The built-in skill `toolyard-inbox`**, a short version that points to
-   `inbox.guide` for detail. It's published into the skills store at startup
-   through the existing `skills.publish` path.
+   `inbox.guide` for detail. Served at `GET /v1/guide/skill` and as the MCP
+   resource `toolyard://skill/toolyard-inbox`; `toolyard skills install
+   toolyard-inbox` writes it to `~/.claude/skills/`.
 
-A test checks that the skill and the protocol agree on field names and
-limits, so the two can't drift apart.
+Both files are embedded from `docs/` (package `docs`), so the gateway
+serves exactly what's in the repo. Tests check that the protocol's worked
+examples pass validation and that the protocol and the skill state the same
+limits as the code.
 
 ## Layer 0: enrolment
 
 The dashboard's agent-enrolment modal already shows setup snippets per client
 (CLI, hermes, Claude Code). Each one gets a second step:
 
-- **Claude Code:** `toolyard skills install toolyard-inbox` (new CLI command,
-  wrapping the existing install logic). It writes
-  `~/.claude/skills/toolyard-inbox`.
+- **Claude Code:** a `curl` of `/v1/guide/skill` into
+  `~/.claude/skills/toolyard-inbox/SKILL.md` (shown with the agent's token),
+  or `toolyard skills install toolyard-inbox`.
 - **Codex, Cursor, others:** a 10-line AGENTS.md / rules block to paste. It
   says restricted tools exist, names `inbox.check` and `inbox.request`, and
   points to `inbox.guide`.
@@ -68,12 +71,15 @@ layers 1–5 if the agent skips it.
 
 ## Layer 1: the connection instructions
 
-This replaces the long paragraph `buildInstructions` returns today
-(`internal/gateway/server.go:1431`):
+`buildInstructions` (`internal/gateway/server.go`) now opens with a
+PERMISSIONS paragraph, ahead of the existing approval text (which still
+applies in `execute` mode):
 
-> toolyard gateway. Every call needs `_reason`. Some tools are restricted and
-> need your owner's approval: check with `inbox.check`, then ask for all of
-> them in one `inbox.request`. Call `inbox.guide` before your first request.
+> PERMISSIONS: some tools are restricted and need your owner's approval.
+> Before a task, run `inbox.check` on the calls you plan, then ask for every
+> restricted tool in ONE `inbox.request` (call `inbox.guide` first …). When
+> approved, call each tool with `_grant` set to its token. If a call returns
+> status `permission_required`, nothing ran: fill in the draft it gives you.
 
 ## Layer 2: the coaching result
 
@@ -171,13 +177,13 @@ The CLI mirrors them for agents without MCP: `toolyard guide [topic]`,
 
 | where | change |
 |---|---|
-| `internal/gateway/server.go:1431` `buildInstructions` | Replace with the three-line version. |
+| `internal/gateway/server.go` `buildInstructions` | Prepend the PERMISSIONS paragraph. |
 | `internal/gateway/server.go:1237` `deferredResponse` | Replace for restricted tools with the `permission_required` coaching result. Keep the old path behind `approval_mode = execute` for one release. |
 | `internal/gateway/schema_wrap.go` | Add the optional `_grant` field. Update `descriptionBanner` to name `inbox.check` / `inbox.request`. |
 | `internal/gateway/approval_tools.go` | Keep as aliases. Point descriptions at the `inbox.*` tools. |
 | **new** `internal/inbox/` | Requests, validation, the dry-run log, the attachment fetcher and store, rule flags. Judge flags come later, behind an interface. |
-| **new** `internal/inbox/guide/` | Embeds `agent-protocol.md` and the skill, splits topics, and has a drift test. |
-| `internal/skills/` | Publish `toolyard-inbox` at startup. |
+| **new** `docs/embed.go`, `internal/inbox/guide.go` | Embed `agent-protocol.md` and the skill, split topics; drift tests in `internal/inbox`. |
+| `internal/api/inbox_routes.go` | Owner inbox, sessions, grants, blobs, `/v1/guide`, `/v1/guide/skill`. |
 | `cmd/toolyard/` | `guide`, `check`, `request`, `wait`, `skills install`. |
 | `web/dashboard/` | The inbox from the prototype. The enrolment modal gets the skill / AGENTS.md step. |
 | `scripts/claude-code-hook.sh` | Retire once `approval_mode = execute` goes. |
@@ -195,3 +201,28 @@ The CLI mirrors them for agents without MCP: `toolyard guide [topic]`,
 toolyard with one restricted tool and no instructions beyond the task, and
 check that it gets from "permission_required" to a valid request unaided.
 Repeat this with each client we support whenever the protocol changes.
+
+## What shipped in v1
+
+Everything above is implemented, with these specifics and differences:
+
+| area | v1 behaviour |
+|---|---|
+| Mode switch | `approval_mode` setting. `execute` (default) keeps the queue-and-run flow; `inbox` coaches. The `inbox.*` tools and `_grant` work in both. Anonymous (tokenless) callers always get the legacy flow, since grants are bound to an agent. |
+| Grants | One per allowed tool, single use, Ed25519-signed, bound to the agent, expire after the request's `ttl_seconds` (default 30 min). The token is handed to the agent once, by the first `inbox.status`/`inbox.wait` after approval. Explicit deny policies beat grants. |
+| Parameters | `eq` (or a bare value), `in`, `prefix`, `gte`/`lte`, `limit` with optional `pattern`, `any`. A call may not pass arguments the request didn't list. `limit` without a pattern is recorded, not checked. |
+| Attachments | Inline: markdown, table, chart, diff, code, log, link. Media by link, copied once with an SSRF guard (dial-time IP check, no proxy, 3 redirects max, type and size caps). |
+| Flags | Rule flags always; judge flags ("Doesn't match the request") only when the owner enables the Gemini judge. Dry runs return both and are logged; the review page shows the dry-run count and any flags that disappeared between the dry runs and the final request. |
+| Toolyard's own reading | "Summarize with toolyard" / "Ask toolyard" use the judge when it's on, otherwise a rule-based reading that says so. |
+| Voice notes | Spoken by the browser (Web Speech API) from the agent's script; no server-side audio yet. |
+| Sessions | `session.start` / `session.update`; the Sessions tab derives blocked / waiting / stale (no heartbeat for 15 min) / working, shows live permissions per agent, "told to ask N× today" from coaching events, and a revoke-all kill switch. |
+| Confirmation | Approving production-flagged or red-flagged tools asks for a second tap. A biometric (WebAuthn/Face ID) step is not built yet. |
+| Notifications | Push for `now`/`soon` access requests, questions and blockers; content-free (agent name + kind). No scheduled digest yet: `digest` items simply don't push. Snoozing hides the badge count until the snooze ends but doesn't re-notify. |
+| Expiry | Pending requests expire after 24 h, updates after 7 days. |
+| CLI | `toolyard guide`, `check`, `request --from file.json [--dry-run]`, `wait`, `skills install toolyard-inbox`. |
+
+Tests: `internal/inbox` (validation, flags, grants incl. concurrent
+redemption, snapshots, judge parsing, guide/doc drift), `internal/gateway`
+(coaching, grant lifecycle through routing, deny beats grant),
+`internal/api` (owner routes, auth, guide), and `scripts/e2e_inbox_test.go`
+against a running gateway with a real MCP client.

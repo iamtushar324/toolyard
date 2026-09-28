@@ -143,6 +143,32 @@ Then:
 Upstreams' tool catalogs are fetched at startup, schema-wrapped, and
 registered under `<upstream-name>.<original-tool-name>`.
 
+## Inbox and permissions
+
+Settings → **Inbox & permissions**:
+
+- **approval_mode**: `execute` (default) queues restricted calls in
+  Approvals as before; `inbox` coaches agents to send an `inbox.request`
+  instead. Switch when your agents have the `toolyard-inbox` skill or the
+  AGENTS.md block from the enrolment modal's "Teach it the rules" tab.
+- **Copy linked media** (default on): images, videos and files an agent
+  links to are downloaded once when the request arrives and served from
+  toolyard, under `<data-dir>/inbox/blobs/`. Limits: image 10 MB, video
+  50 MB, file 25 MB. Links to loopback or private-network addresses are
+  refused unless you start the gateway with
+  `-inbox-fetch-private-networks` (for evidence hosted on your own LAN).
+  The fetcher connects directly, never through `HTTP(S)_PROXY`.
+- **Judge model** (default off): needs `GEMINI_API_KEY`. Request text is
+  sent to Gemini to check each tool call against the agent's own words.
+  `inbox_judge_model` overrides the model (default `gemini-2.5-flash`;
+  read at startup).
+- **Where agents should host files**: shown to agents by
+  `inbox.guide({"topic": "hosting"})`.
+
+Push notifications for new requests carry only the agent's name and the
+kind of request, never the agent's text (same rule as approval pushes).
+`digest` and `fyi` requests don't push.
+
 ## Web Push (PWA notifications)
 
 1. Open the dashboard and visit **Settings → Enable push**.

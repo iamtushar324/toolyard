@@ -1,7 +1,8 @@
 # ADR 0005 — approval issues a scoped grant instead of running the call
 
-Status: **accepted (design)**. Implementation is tracked in
-[inbox-spec.md](../guidelines/inbox-spec.md) §10–11.
+Status: **accepted, implemented** (`internal/inbox/grants.go`). Grants work
+in both approval modes. Details and differences from the original spec:
+[agent-onboarding.md](../guidelines/agent-onboarding.md#what-shipped-in-v1).
 
 ## Context
 

@@ -146,6 +146,10 @@ func typeAllowed(kind, ct string) bool {
 	}
 }
 
+// AllowPrivateNetworks lets the fetcher reach loopback and private
+// addresses. Only for operators who host evidence on their own LAN.
+func (s *Snapshotter) AllowPrivateNetworks(allow bool) { s.allowPrivate = allow }
+
 // Snapshot fetches rawURL and returns the stored copy's sha256.
 func (s *Snapshotter) Snapshot(ctx context.Context, rawURL, kind string) (string, string, int64, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, rawURL, nil)

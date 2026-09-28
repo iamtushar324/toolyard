@@ -239,6 +239,7 @@ func (s *Service) noteGrantUse(ctx context.Context, g *Grant, args map[string]an
 		r.addActivity(s.now().UnixMilli(), text)
 		return nil
 	})
+	s.publish("grant", map[string]any{"id": g.ID, "request_id": g.RequestID, "status": g.Status})
 }
 
 func (s *Service) getGrantWithHash(ctx context.Context, id string) (*Grant, string, error) {

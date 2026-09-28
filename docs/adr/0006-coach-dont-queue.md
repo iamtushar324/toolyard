@@ -1,6 +1,7 @@
 # ADR 0006 — restricted calls coach the agent instead of queuing an approval
 
-Status: **accepted (design)**. Details:
+Status: **accepted, implemented** behind `approval_mode = inbox` (the
+default stays `execute` so existing agents keep working). Details:
 [agent-onboarding.md](../guidelines/agent-onboarding.md).
 
 ## Context

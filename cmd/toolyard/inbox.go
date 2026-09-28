@@ -91,17 +91,33 @@ func runGuide(argv []string) error {
 	return nil
 }
 
+// parseInterspersed parses flags that may come before or after positional
+// arguments (Go's flag package stops at the first positional) and returns
+// the positionals in order.
+func parseInterspersed(fs *flag.FlagSet, argv []string) []string {
+	var pos []string
+	for {
+		_ = fs.Parse(argv)
+		argv = fs.Args()
+		if len(argv) == 0 {
+			return pos
+		}
+		pos = append(pos, argv[0])
+		argv = argv[1:]
+	}
+}
+
 func runCheck(argv []string) error {
 	fs := flag.NewFlagSet("check", flag.ExitOnError)
 	raw := fs.String("json", "", `calls as JSON: [{"tool":"deploy.run","args":{...}}]`)
-	_ = fs.Parse(argv)
+	tools := parseInterspersed(fs, argv)
 	var calls []any
 	if *raw != "" {
 		if err := json.Unmarshal([]byte(*raw), &calls); err != nil {
 			return fmt.Errorf("parse --json: %w", err)
 		}
 	}
-	for _, t := range fs.Args() {
+	for _, t := range tools {
 		calls = append(calls, map[string]any{"tool": t})
 	}
 	if len(calls) == 0 {
@@ -171,8 +187,7 @@ func runWait(argv []string) error {
 	fs := flag.NewFlagSet("wait", flag.ExitOnError)
 	timeout := fs.Duration("timeout", 5*time.Minute, "how long to wait (max 5m)")
 	mode := fs.String("mode", "any", "any: return on the first decision; all: wait for every request")
-	_ = fs.Parse(argv)
-	ids := fs.Args()
+	ids := parseInterspersed(fs, argv)
 	if len(ids) == 0 {
 		return errors.New("usage: toolyard wait <request_id>... [--timeout 5m] [--mode any|all]")
 	}
