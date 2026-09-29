@@ -40,6 +40,7 @@ import (
 	"github.com/tusharbhardwaj/toolyard/internal/api"
 	"github.com/tusharbhardwaj/toolyard/internal/approval"
 	"github.com/tusharbhardwaj/toolyard/internal/audit"
+	"github.com/tusharbhardwaj/toolyard/internal/auditlink"
 	"github.com/tusharbhardwaj/toolyard/internal/autoapproval"
 	"github.com/tusharbhardwaj/toolyard/internal/chatnotify"
 	"github.com/tusharbhardwaj/toolyard/internal/chatnotify/telegram"
@@ -333,6 +334,10 @@ func runServe(argv []string) error {
 	}
 	bus.SetTTL(*approvalTTL)
 	log.Printf("toolyard: approval TTL %s (in-line wait %s)", bus.TTL(), *inLineWait)
+	// Every approval event (create, decide, expire, cancel, executed)
+	// leaves an audit row naming who raised the call and who decided it,
+	// whichever path the decision took.
+	bus.AddNotifier(auditlink.Notifier(auditSvc))
 	go bus.RunSweeper(ctx, 30*time.Second)
 
 	pushSvc, err := push.New(ctx, db, *pushSubject)
@@ -362,12 +367,14 @@ func runServe(argv []string) error {
 				Approval: req.ID,
 				Tag:      req.ID,
 			}
+			// The decision token is minted for this recipient, so a tap
+			// through it is recorded as their decision.
 			payload := map[string]any{
 				"title":          n.Title,
 				"body":           n.Body,
 				"url":            n.URL,
 				"approval_id":    req.ID,
-				"decision_token": req.DecisionToken,
+				"decision_token": bus.DecisionTokenFor(req.ID, user.ID),
 				"tag":            req.ID,
 				// Non-secret label (upstream · tool, same as the body) so
 				// the service worker can show "✓ Approved — github · …".
@@ -584,8 +591,10 @@ func runServe(argv []string) error {
 			if p.RequestID != "" {
 				payload["request_id"] = p.RequestID
 			}
-			if p.TapToken != "" {
-				payload["inbox_token"] = p.TapToken
+			// The tap token is bound to this recipient when the inbox can
+			// mint one, so a tap is recorded as their decision.
+			if tok := inboxTapToken(p, user.ID); tok != "" {
+				payload["inbox_token"] = tok
 			}
 			acts := make([]map[string]string, 0, len(p.Actions))
 			for _, a := range p.Actions {
@@ -711,7 +720,15 @@ func runServe(argv []string) error {
 		Settings: settingsSvc,
 		Cipher:   secretsCipher,
 		Decide: func(ctx context.Context, id, action, decidedBy string) (string, bool, error) {
-			req, derr := bus.Decide(ctx, id, action, decidedBy)
+			// The paired Telegram user is the instrument; the person is
+			// the owner when -owner-email names one with an account.
+			var owner *identity.User
+			if *ownerEmail != "" {
+				if u, err := idSvc.GetUserByEmail(ctx, *ownerEmail); err == nil {
+					owner = u
+				}
+			}
+			req, derr := bus.DecideAs(ctx, id, action, telegramDecider(decidedBy, owner))
 			if derr != nil {
 				if errors.Is(derr, approval.ErrNotPending) {
 					return "", true, nil
@@ -1057,7 +1074,11 @@ func runServe(argv []string) error {
 	// HTTP over stdio. Auth via Authorization: Bearer <agent-token>, or
 	// x-bf-vk: <token> from a proxy that strips Authorization (bkt3's
 	// Bifrost proxy sends a person's Beknown key that way); see
-	// mcpCredential.
+	// mcpCredential. The token is verified once per request, by the
+	// guard, which also works out who raised the call (agent, owner,
+	// client, session) for the audit log. -require-auth-on-mcp
+	// (auto-enabled with -public-url) rejects anonymous traffic too.
+	mcpAuthn := mcpAuth{verify: idSvc.VerifyAgentToken, requireAuth: *requireAuthMCP, sec: secOpts}
 	streamable := server.NewStreamableHTTPServer(gw.MCPServer(),
 		server.WithEndpointPath("/mcp"),
 		// Stateless mode is opt-in via -stateless-mcp. The default
@@ -1076,46 +1097,14 @@ func runServe(argv []string) error {
 		// stateless mode lets those clients immediately fall back to
 		// POST-only operation, which works fine.
 		server.WithDisableStreaming(*statelessMCP),
-		server.WithHTTPContextFunc(func(ctx context.Context, r *http.Request) context.Context {
-			if tok, ok := mcpCredential(r); ok {
-				if ag, err := idSvc.VerifyAgentToken(ctx, tok); err == nil {
-					ctx = gateway.WithAgentID(ctx, ag.ID)
-				}
-			}
-			return ctx
-		}),
+		// The guard below verified the token once and put the agent and
+		// its raiser on the request context; this hands them to every
+		// tool call's context. See actors.go.
+		server.WithHTTPContextFunc(mcpAuthn.contextFunc),
 	)
-	// Reject calls that carry a Bearer token we can't verify, so a stale
-	// token surfaces as a clear 401 instead of silently falling through to
-	// the anonymous bucket. When -require-auth-on-mcp is on (auto-enabled
-	// when -public-url is set), we *also* reject anonymous traffic — the
-	// dashboard is exposed publicly so we can't trust unauthenticated
-	// callers to have any business calling our tools.
-	mcpAuthGuard := func(next http.Handler) http.Handler {
-		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			raw, ok := mcpCredential(r)
-			if !ok {
-				if *requireAuthMCP {
-					w.Header().Set("Content-Type", "application/json")
-					w.WriteHeader(http.StatusUnauthorized)
-					_, _ = w.Write([]byte(`{"jsonrpc":"2.0","error":{"code":-32001,"message":"toolyard: bearer token required"}}`))
-					return
-				}
-				next.ServeHTTP(w, r)
-				return
-			}
-			if _, err := idSvc.VerifyAgentToken(r.Context(), raw); err != nil {
-				w.Header().Set("Content-Type", "application/json")
-				w.WriteHeader(http.StatusUnauthorized)
-				_, _ = w.Write([]byte(`{"jsonrpc":"2.0","error":{"code":-32001,"message":"toolyard: invalid agent token; re-enroll via the dashboard"}}`))
-				return
-			}
-			next.ServeHTTP(w, r)
-		})
-	}
 	// /mcp gets a larger body limit because tool-call args can be a few MB.
-	mux.Handle("/mcp", api.LimitBody(mcpAuthGuard(streamable), 16<<20))
-	mux.Handle("/mcp/", api.LimitBody(mcpAuthGuard(streamable), 16<<20))
+	mux.Handle("/mcp", api.LimitBody(mcpAuthn.guard(streamable), 16<<20))
+	mux.Handle("/mcp/", api.LimitBody(mcpAuthn.guard(streamable), 16<<20))
 
 	// pprof endpoints, gated to loopback. When toolyard hangs, run
 	//   curl -s http://127.0.0.1:<port>/debug/pprof/goroutine?debug=2

@@ -719,6 +719,19 @@ func (b *Bus) DecideByTokenAs(ctx context.Context, token, action string) (*Reque
 	return req, d, err
 }
 
+// VerifyDecisionToken checks a decision token's signature and returns the
+// approval it names and, for a bound token, the recipient it was minted
+// for (empty for an id-only token). It decides nothing: the API uses it
+// when the tap arrives with a signed-in session, so the decision is
+// recorded as that person rather than the token's recipient.
+func (b *Bus) VerifyDecisionToken(token string) (approvalID, recipientUserID string, err error) {
+	c, err := b.verifyToken(token)
+	if err != nil {
+		return "", "", err
+	}
+	return c.approvalID, c.userID, nil
+}
+
 // DecideByToken is DecideByTokenAs without the recorded Decider.
 func (b *Bus) DecideByToken(ctx context.Context, token, action string) (*Request, error) {
 	req, _, err := b.DecideByTokenAs(ctx, token, action)

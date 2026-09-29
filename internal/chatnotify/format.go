@@ -6,6 +6,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/tusharbhardwaj/toolyard/internal/actor"
 	"github.com/tusharbhardwaj/toolyard/internal/approval"
 )
 
@@ -57,8 +58,10 @@ func render(req *approval.Request, includeDetails bool) string {
 			fmt.Fprintf(&b, "expires in %s\n", left)
 		}
 	}
-	if req.Status != approval.StatusPending && req.DecidedBy != "" {
-		fmt.Fprintf(&b, "decided by %s\n", req.DecidedBy)
+	if req.Status != approval.StatusPending {
+		if who := deciderLabel(req.Decider()); who != "" {
+			fmt.Fprintf(&b, "decided by %s\n", who)
+		}
 	}
 	// Append the executed result line when present.
 	if req.ResultExecutedAt > 0 {
@@ -71,6 +74,60 @@ func render(req *approval.Request, includeDetails bool) string {
 		}
 	}
 	return strings.TrimRight(b.String(), "\n")
+}
+
+// deciderLabel says who decided and how, for a chat line: the person
+// (name, else email, else user id) and the route when it was not a plain
+// dashboard click; the instrument alone when no person is recorded.
+// Empty for an expired request, which nobody decided.
+func deciderLabel(d actor.Decider) string {
+	who := d.Name
+	if who == "" {
+		who = d.Email
+	}
+	if who == "" {
+		who = d.UserID
+	}
+	var how string
+	switch d.Via {
+	case actor.ViaExpiry:
+		return ""
+	case "", actor.ViaDashboard:
+		if who == "" {
+			return d.Legacy()
+		}
+	case actor.ViaDashboardBatch:
+		how = "dashboard, batch"
+	case actor.ViaPushToken:
+		how = "notification tap"
+	case actor.ViaPasskey:
+		how = "passkey"
+	case actor.ViaTelegram:
+		how = "Telegram"
+		if who == "" && d.Ref != "" {
+			how += " user " + d.Ref
+		}
+	case actor.ViaAutoRule:
+		how = "auto-approval rule " + d.Ref
+	case actor.ViaPolicy:
+		how = "policy " + d.Ref
+	case actor.ViaInboxGrant:
+		how = "inbox grant " + d.Ref
+	case actor.ViaAgentCancel:
+		how = "agent " + d.Ref + " (cancelled)"
+	default:
+		how = d.Via
+		if d.Ref != "" {
+			how += " " + d.Ref
+		}
+	}
+	switch {
+	case who != "" && how != "":
+		return who + " via " + how
+	case who != "":
+		return who
+	}
+	return strings.TrimSpace(how)
 }
 
 func argsPreview(args map[string]any) string {

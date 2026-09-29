@@ -96,6 +96,16 @@ type User struct {
 	LastSeenAt  int64  `json:"last_seen_at,omitempty"`
 }
 
+// Label is how the person is shown: their display name, else their
+// username. Audit rows and approvals record it as the decider's or
+// owner's name.
+func (u *User) Label() string {
+	if u.DisplayName != "" {
+		return u.DisplayName
+	}
+	return u.Username
+}
+
 // ClerkProfile is what a verified Clerk sign-in tells us about the person.
 type ClerkProfile struct {
 	ClerkUserID string
@@ -155,6 +165,22 @@ type Agent struct {
 	// Kind is AgentKindAgent for an enrolled agent, AgentKindIdentity for
 	// the owner's identity key.
 	Kind string `json:"kind"`
+	// OwnerEmail, OwnerDisplayName and OwnerUsername describe the owner
+	// row. VerifyAgentToken fills them from the same lookup that checks
+	// the owner's status, so an ingress can name the person behind a call
+	// without a second query. Empty when the owner row is gone.
+	OwnerEmail       string `json:"owner_email,omitempty"`
+	OwnerDisplayName string `json:"owner_display_name,omitempty"`
+	OwnerUsername    string `json:"owner_username,omitempty"`
+}
+
+// OwnerName is how the owner is shown: their display name, else their
+// username.
+func (a *Agent) OwnerName() string {
+	if a.OwnerDisplayName != "" {
+		return a.OwnerDisplayName
+	}
+	return a.OwnerUsername
 }
 
 // DefaultRotateGrace is how long a rotated-away token keeps authenticating
@@ -272,6 +298,24 @@ func (s *Service) Authenticate(ctx context.Context, username, password string) (
 func (s *Service) GetUserByID(ctx context.Context, id string) (*User, error) {
 	u, err := scanUser(s.db.QueryRowContext(ctx,
 		`SELECT `+userColumns+` FROM users u WHERE u.id = ?`, id))
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrNoUser
+	}
+	if err != nil {
+		return nil, err
+	}
+	return u, nil
+}
+
+// GetUserByEmail returns the user with that email (case-insensitive), or
+// ErrNoUser. Emails are not unique in the schema; the oldest row wins.
+func (s *Service) GetUserByEmail(ctx context.Context, email string) (*User, error) {
+	email = strings.TrimSpace(email)
+	if email == "" {
+		return nil, ErrNoUser
+	}
+	u, err := scanUser(s.db.QueryRowContext(ctx,
+		`SELECT `+userColumns+` FROM users u WHERE LOWER(u.email) = LOWER(?) ORDER BY u.created_at, u.id LIMIT 1`, email))
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNoUser
 	}
@@ -664,12 +708,15 @@ func (s *Service) VerifyAgentToken(ctx context.Context, token string) (*Agent, e
 	var ownerStatus string
 	// LEFT JOIN: an agent whose owner row is gone keeps working (other
 	// packages' tests enrol agents under fake owners); an agent whose owner
-	// is blocked stops with the owner.
+	// is blocked stops with the owner. The owner's email and names come
+	// back in the same row so the caller can attribute the call to the
+	// person without a second lookup.
 	err := s.db.QueryRowContext(ctx,
 		`SELECT a.id, a.name, a.owner_user, a.kind, a.token_hash, COALESCE(a.disabled,0), a.prev_token_hash, a.prev_token_expires,
-                COALESCE(u.status, ?)
+                COALESCE(u.status, ?), COALESCE(u.email,''), COALESCE(u.display_name,''), COALESCE(u.username,'')
          FROM agents a LEFT JOIN users u ON u.id = a.owner_user WHERE a.id = ?`, StatusActive, id).
-		Scan(&ag.ID, &ag.Name, &ag.Owner, &ag.Kind, &hash, &disabled, &prevHash, &prevExp, &ownerStatus)
+		Scan(&ag.ID, &ag.Name, &ag.Owner, &ag.Kind, &hash, &disabled, &prevHash, &prevExp, &ownerStatus,
+			&ag.OwnerEmail, &ag.OwnerDisplayName, &ag.OwnerUsername)
 	if err == sql.ErrNoRows {
 		return nil, ErrAgentTokenInvalid
 	}

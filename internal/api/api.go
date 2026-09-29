@@ -49,6 +49,7 @@ import (
 	"github.com/golang-jwt/jwt/v5"
 
 	"github.com/tusharbhardwaj/toolyard/internal/access"
+	"github.com/tusharbhardwaj/toolyard/internal/actor"
 	"github.com/tusharbhardwaj/toolyard/internal/approval"
 	"github.com/tusharbhardwaj/toolyard/internal/audit"
 	"github.com/tusharbhardwaj/toolyard/internal/autoapproval"
@@ -969,7 +970,7 @@ func (s *Server) approvalsDecide(w http.ResponseWriter, r *http.Request, id stri
 		writeError(w, http.StatusMethodNotAllowed, "POST only")
 		return
 	}
-	uid, err := s.requireUser(r)
+	u, err := s.requireUserFull(r)
 	if err != nil {
 		writeError(w, http.StatusUnauthorized, "unauthorized")
 		return
@@ -979,7 +980,7 @@ func (s *Server) approvalsDecide(w http.ResponseWriter, r *http.Request, id stri
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	req, err := s.approval.Decide(r.Context(), id, body.Action, uid)
+	req, err := s.approval.DecideAs(r.Context(), id, body.Action, s.dashboardDecider(r, u, actor.ViaDashboard))
 	if err != nil {
 		switch {
 		case errors.Is(err, approval.ErrNotFound):
@@ -1006,7 +1007,7 @@ func (s *Server) approvalsDecideBatch(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusMethodNotAllowed, "POST only")
 		return
 	}
-	uid, err := s.requireUser(r)
+	u, err := s.requireUserFull(r)
 	if err != nil {
 		writeError(w, http.StatusUnauthorized, "unauthorized")
 		return
@@ -1032,9 +1033,11 @@ func (s *Server) approvalsDecideBatch(w http.ResponseWriter, r *http.Request) {
 		Status string `json:"status"`
 		Error  string `json:"error,omitempty"`
 	}
+	// One batch id on every row this click decides.
+	decider := s.batchDecider(r, u)
 	out := make([]result, 0, len(body.IDs))
 	for _, id := range body.IDs {
-		req, err := s.approval.Decide(r.Context(), id, body.Action, uid)
+		req, err := s.approval.DecideAs(r.Context(), id, body.Action, decider)
 		switch {
 		case err == nil:
 			out = append(out, result{ID: id, Status: req.Status})
@@ -1061,7 +1064,25 @@ func (s *Server) approvalsDecideByToken(w http.ResponseWriter, r *http.Request) 
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	req, err := s.approval.DecideByToken(r.Context(), body.Token, body.Action)
+	// The token is the credential: it must verify and it names the
+	// approval. Who gets recorded: the signed-in session's user when the
+	// tap arrived with one (whoever the token was minted for), else the
+	// recipient a bound token was minted for, else an anonymous push tap
+	// (a legacy id-only token).
+	id, recipient, verr := s.approval.VerifyDecisionToken(body.Token)
+	if verr != nil {
+		writeError(w, http.StatusBadRequest, verr.Error())
+		return
+	}
+	decider := actor.Decider{UserID: recipient, Via: actor.ViaPushToken}
+	if u, ok := s.sessionUser(r); ok {
+		decider = s.dashboardDecider(r, u, actor.ViaPushToken)
+	} else if recipient != "" {
+		if u, err := s.identity.GetUserByID(r.Context(), recipient); err == nil {
+			decider.Email, decider.Name = u.Email, u.Label()
+		}
+	}
+	req, err := s.approval.DecideAs(r.Context(), id, body.Action, decider)
 	if err != nil {
 		switch {
 		case errors.Is(err, approval.ErrNotFound):
@@ -1577,7 +1598,7 @@ func (s *Server) toolsRun(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusMethodNotAllowed, "POST only")
 		return
 	}
-	uid, err := s.requireUser(r)
+	u, err := s.requireUserFull(r)
 	if err != nil {
 		writeError(w, http.StatusUnauthorized, "unauthorized")
 		return
@@ -1601,10 +1622,11 @@ func (s *Server) toolsRun(w http.ResponseWriter, r *http.Request) {
 	if body.Arguments == nil {
 		body.Arguments = map[string]any{}
 	}
-	// Tag the call as coming from the dashboard so audit/approval rows show
-	// the actual operator instead of an empty agent_id.
-	ctx := gateway.WithAgentID(r.Context(), "dashboard:"+uid)
-	res, err := s.gateway.RouteCall(ctx, "dashboard", body.Tool, body.Arguments)
+	// Tag the call as coming from the dashboard, raised by this person,
+	// so audit and approval rows name the operator (id, email, name)
+	// instead of an empty agent_id.
+	ctx := actor.WithRaiser(gateway.WithAgentID(r.Context(), "dashboard:"+u.ID), s.dashboardRaiser(r, u))
+	res, err := s.gateway.RouteCall(ctx, viaDashboard, body.Tool, body.Arguments)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -1824,15 +1846,8 @@ func (s *Server) usageHandler(w http.ResponseWriter, r *http.Request) {
 // true on success; on failure writes a 401 and returns false so the handler
 // can return immediately.
 func (s *Server) requireAgent(w http.ResponseWriter, r *http.Request) (string, bool) {
-	authz := r.Header.Get("Authorization")
-	if !strings.HasPrefix(authz, "Bearer ") {
-		writeError(w, http.StatusUnauthorized, "bearer token required")
-		return "", false
-	}
-	raw := strings.TrimPrefix(authz, "Bearer ")
-	ag, err := s.identity.VerifyAgentToken(r.Context(), raw)
-	if err != nil {
-		writeError(w, http.StatusUnauthorized, "invalid agent token")
+	ag, ok := s.requireAgentFull(w, r)
+	if !ok {
 		return "", false
 	}
 	return ag.ID, true

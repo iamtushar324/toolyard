@@ -57,6 +57,12 @@ func (o SecurityOptions) ClientIP(r *http.Request) string {
 	return host
 }
 
+// TrustsProxy reports whether the request's immediate peer is one of
+// TrustedProxies: only then are X-Forwarded-* and the session headers a
+// proxy stamps (x-t3-session-id, x-bk-agent-session) the proxy's word
+// rather than the caller's claim.
+func (o SecurityOptions) TrustsProxy(r *http.Request) bool { return o.proxyTrusted(r) }
+
 func (o SecurityOptions) proxyTrusted(r *http.Request) bool {
 	if len(o.TrustedProxies) == 0 {
 		return false
