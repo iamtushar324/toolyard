@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -85,6 +86,11 @@ type upstream struct {
 	consecutiveFailures int
 	nextRetryAt         time.Time
 	lastDialErr         error
+
+	// recoveries counts the times the remote forgot our session and we
+	// re-established it under a tool call (see callTool). Surfaced through
+	// Gateway.SessionRecoveries.
+	recoveries atomic.Int64
 }
 
 // withoutForwardedKey drops any forwarded identity key from ctx. The
@@ -196,34 +202,129 @@ func (u *upstream) listTools(ctx context.Context) ([]mcp.Tool, error) {
 // call is dispatched. mcp-go transports multiplex concurrent requests
 // internally, so we do not serialize callers — multiple agents can hit the
 // same upstream in parallel.
+//
+// A stateful streamable-HTTP server can forget the shared session (idle
+// timeout, max age, a restart) and then reject every request on it before
+// any tool runs. That is recovered here: the dead session is replaced and
+// the call retried once. Only a session rejection qualifies; a tool error,
+// a timeout or any other transport failure is returned as is, since the
+// tool may already have run.
 func (u *upstream) callTool(ctx context.Context, name string, args map[string]any) (*mcp.CallToolResult, error) {
 	u.lastUsed.Store(time.Now().UnixNano())
 
-	u.mu.Lock()
-	c := u.client
-	u.mu.Unlock()
-
-	if c == nil {
-		// Upstream was idle-killed; restart it. Use a background context so
-		// a short per-call deadline doesn't abort the reconnect — npm needs
-		// up to a minute on a warm cache, longer on a cold one.
-		resumeCtx, cancel := context.WithTimeout(context.Background(), 180*time.Second)
-		defer cancel()
-		if err := u.resume(resumeCtx); err != nil {
-			return nil, fmt.Errorf("reconnect upstream %s: %w", u.cfg.Name, err)
-		}
-		u.mu.Lock()
-		c = u.client
-		u.mu.Unlock()
-		if c == nil {
-			return nil, fmt.Errorf("upstream %s: client unavailable after reconnect", u.cfg.Name)
-		}
+	c, err := u.liveClient()
+	if err != nil {
+		return nil, err
 	}
-
 	req := mcp.CallToolRequest{}
 	req.Params.Name = name
 	req.Params.Arguments = args
+	res, err := c.CallTool(ctx, req)
+	if err == nil {
+		return res, nil
+	}
+	reason, ok := sessionErrorReason(err)
+	if !ok {
+		return nil, err
+	}
+	if rerr := u.recoverSession(c, reason); rerr != nil {
+		return nil, fmt.Errorf("upstream %s: session lost (%s) and reconnect failed: %w", u.cfg.Name, reason, rerr)
+	}
+	c, err = u.liveClient()
+	if err != nil {
+		return nil, err
+	}
+	// Same ctx as the first attempt: the forwarded identity key (if any)
+	// rides on this retry exactly as it did on the rejected request.
 	return c.CallTool(ctx, req)
+}
+
+// liveClient returns the connected client, re-dialing first when the
+// upstream is suspended (idle-killed, or retired by recoverSession).
+func (u *upstream) liveClient() (*client.Client, error) {
+	u.mu.Lock()
+	c := u.client
+	u.mu.Unlock()
+	if c != nil {
+		return c, nil
+	}
+	// Use a background context so a short per-call deadline doesn't abort
+	// the reconnect — npm needs up to a minute on a warm cache, longer on
+	// a cold one.
+	resumeCtx, cancel := context.WithTimeout(context.Background(), 180*time.Second)
+	defer cancel()
+	if err := u.resume(resumeCtx); err != nil {
+		return nil, fmt.Errorf("reconnect upstream %s: %w", u.cfg.Name, err)
+	}
+	u.mu.Lock()
+	c = u.client
+	u.mu.Unlock()
+	if c == nil {
+		return nil, fmt.Errorf("upstream %s: client unavailable after reconnect", u.cfg.Name)
+	}
+	return c, nil
+}
+
+// sessionErrorMarkers are the phrases a streamable-HTTP server uses when
+// it no longer knows the session: the mcp-go server's own 404 texts, and
+// the JSON-RPC -32000 the beknown-services mcp-server sends with HTTP 400.
+// Matched case-insensitively against the whole error chain's text.
+var sessionErrorMarkers = []string{
+	"invalid session",
+	"session not found",
+	"missing initialization",
+	"session terminated",
+}
+
+// sessionErrorReason reports whether err means the upstream rejected the
+// request because our session is invalid or gone, i.e. before running the
+// tool. The reason is a fixed phrase safe to log.
+func sessionErrorReason(err error) (string, bool) {
+	if err == nil {
+		return "", false
+	}
+	if errors.Is(err, transport.ErrSessionTerminated) {
+		return "session terminated (404)", true
+	}
+	msg := strings.ToLower(err.Error())
+	for _, m := range sessionErrorMarkers {
+		if strings.Contains(msg, m) {
+			return m, true
+		}
+	}
+	return "", false
+}
+
+// sessionRetireGrace is how long a retired client stays open after its
+// session was found dead. Closing it at once would cancel the requests
+// other callers still have in flight on it; they must get the upstream's
+// own rejection (and recover the same way) or, if one is genuinely
+// executing, finish. Nothing new is sent on a retired client.
+const sessionRetireGrace = 30 * time.Second
+
+// recoverSession replaces the client whose session the upstream no longer
+// recognises. Callers that failed on the same client at the same time
+// collapse into one re-dial: the first to arrive retires it (so resume has
+// something to do), the rest find it already retired and just join the
+// resume, which serialises on u.mu and returns as soon as the connection
+// is live. The re-dial runs through the same circuit breaker and backoff
+// as an idle-kill restart; no lock is held while the old client closes.
+func (u *upstream) recoverSession(dead *client.Client, reason string) error {
+	u.mu.Lock()
+	retire := u.client == dead
+	if retire {
+		u.client = nil
+	}
+	u.mu.Unlock()
+	if retire {
+		u.recoveries.Add(1)
+		log.Printf("upstream-session-recover: %q re-establishing session: %s", u.cfg.Name, reason)
+		name := u.cfg.Name
+		time.AfterFunc(sessionRetireGrace, func() { closeWithTimeout(name, dead, 5*time.Second) })
+	}
+	resumeCtx, cancel := context.WithTimeout(context.Background(), 180*time.Second)
+	defer cancel()
+	return u.resume(resumeCtx)
 }
 
 // suspend closes the subprocess but keeps the upstream's catalog entry and
