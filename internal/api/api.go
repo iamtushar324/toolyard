@@ -56,6 +56,7 @@ import (
 	"github.com/tusharbhardwaj/toolyard/internal/gateway"
 	"github.com/tusharbhardwaj/toolyard/internal/hooks"
 	"github.com/tusharbhardwaj/toolyard/internal/identity"
+	"github.com/tusharbhardwaj/toolyard/internal/identitykeys"
 	"github.com/tusharbhardwaj/toolyard/internal/inbox"
 	"github.com/tusharbhardwaj/toolyard/internal/marketplace"
 	"github.com/tusharbhardwaj/toolyard/internal/memory"
@@ -109,6 +110,7 @@ type Server struct {
 	inbox                    *inbox.Service
 	snapshots                *inbox.Snapshotter
 	passkeys                 *passkey.Service
+	identityKeys             *identitykeys.Service
 	guide                    *inbox.Guide
 	notes                    *notes.Service
 	skills                   *skills.Service
@@ -201,6 +203,9 @@ type Options struct {
 	Guide     *inbox.Guide
 	// Passkeys confirm high-risk approvals (/v1/passkeys/*). Optional.
 	Passkeys *passkey.Service
+	// IdentityKeys, when set, enables the per-person identity key routes
+	// (issue, reveal once, rotate, revoke, registry status). Optional.
+	IdentityKeys *identitykeys.Service
 	// WebhookMaxBytes caps the memory-webhook ingest body. 0 falls back to
 	// the default (25 MiB).
 	WebhookMaxBytes int64
@@ -249,6 +254,7 @@ func New(ctx context.Context, opts Options) *Server {
 		inbox:                    opts.Inbox,
 		snapshots:                opts.Snapshots,
 		passkeys:                 opts.Passkeys,
+		identityKeys:             opts.IdentityKeys,
 		guide:                    opts.Guide,
 		webhookMaxBytes:          opts.WebhookMaxBytes,
 		sessionKey:               opts.SessionKey,
@@ -383,6 +389,7 @@ func (s *Server) Routes(mux *http.ServeMux) {
 	s.voiceRoutes(mux)
 	s.inboxRoutes(mux)
 	s.passkeyRoutes(mux)
+	s.identityKeyRoutes(mux)
 }
 
 // ---- helpers ----------------------------------------------------------------
@@ -736,7 +743,9 @@ func (s *Server) agentsCollection(w http.ResponseWriter, r *http.Request) {
 		}
 		out := make([]map[string]any, 0, len(agents))
 		for _, a := range agents {
-			row := map[string]any{"id": a.ID, "name": a.Name}
+			// kind "identity" is the user's Beknown key: shown, but managed
+			// through the identity key routes, never the actions below.
+			row := map[string]any{"id": a.ID, "name": a.Name, "kind": a.Kind, "disabled": a.Disabled}
 			if !a.LastSeen.IsZero() {
 				row["last_seen"] = a.LastSeen.UnixMilli()
 			}
@@ -801,6 +810,9 @@ func (s *Server) agentsEnroll(w http.ResponseWriter, r *http.Request) {
 //
 // Owner-scoped via identity.{Rotate,Delete}AgentToken — callers can't reach
 // agents owned by other users (relevant the day toolyard goes multi-user).
+// The owner's identity agent (their Beknown key) is refused here with 409
+// identity_agent: its token and registry move together through the
+// identity key routes.
 func (s *Server) agentsItem(w http.ResponseWriter, r *http.Request) {
 	uid, err := s.requireUser(r)
 	if err != nil {
@@ -832,7 +844,7 @@ func (s *Server) agentsItem(w http.ResponseWriter, r *http.Request) {
 		}
 		tok, err := s.identity.RotateAgentToken(r.Context(), uid, id, grace)
 		if err != nil {
-			writeError(w, http.StatusNotFound, err.Error())
+			writeAgentActionError(w, err)
 			return
 		}
 		_ = s.audit.Write(r.Context(), audit.Event{
@@ -842,7 +854,7 @@ func (s *Server) agentsItem(w http.ResponseWriter, r *http.Request) {
 	case (subpath == "disable" || subpath == "enable") && r.Method == http.MethodPost:
 		disable := subpath == "disable"
 		if err := s.identity.SetAgentDisabled(r.Context(), uid, id, disable); err != nil {
-			writeError(w, http.StatusNotFound, err.Error())
+			writeAgentActionError(w, err)
 			return
 		}
 		_ = s.audit.Write(r.Context(), audit.Event{
@@ -851,7 +863,7 @@ func (s *Server) agentsItem(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{"agent_id": id, "disabled": disable})
 	case subpath == "" && r.Method == http.MethodDelete:
 		if err := s.identity.DeleteAgent(r.Context(), uid, id); err != nil {
-			writeError(w, http.StatusNotFound, err.Error())
+			writeAgentActionError(w, err)
 			return
 		}
 		_ = s.audit.Write(r.Context(), audit.Event{
@@ -861,6 +873,16 @@ func (s *Server) agentsItem(w http.ResponseWriter, r *http.Request) {
 	default:
 		writeError(w, http.StatusMethodNotAllowed, "POST /rotate, /disable, /enable, or DELETE")
 	}
+}
+
+// writeAgentActionError: an identity agent is 409 identity_agent; anything
+// else (unknown id, someone else's agent) stays the 404 it always was.
+func writeAgentActionError(w http.ResponseWriter, err error) {
+	if errors.Is(err, identity.ErrIdentityAgent) {
+		writeError(w, http.StatusConflict, "identity_agent")
+		return
+	}
+	writeError(w, http.StatusNotFound, err.Error())
 }
 
 func (s *Server) agentsExchange(w http.ResponseWriter, r *http.Request) {
@@ -1493,6 +1515,10 @@ func (s *Server) serversItem(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, srv)
 		return
 	}
+	if subpath == "" && r.Method == http.MethodPatch {
+		s.serversPatch(w, r, name)
+		return
+	}
 	if r.Method == http.MethodDelete {
 		if err := s.upstreams.Remove(r.Context(), name); err != nil {
 			switch {
@@ -1508,7 +1534,7 @@ func (s *Server) serversItem(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 		return
 	}
-	writeError(w, http.StatusMethodNotAllowed, "DELETE")
+	writeError(w, http.StatusMethodNotAllowed, "PATCH or DELETE")
 }
 
 // marketplaceList returns the curated MCP recipes. We require a logged-in

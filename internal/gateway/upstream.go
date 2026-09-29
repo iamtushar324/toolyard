@@ -43,6 +43,12 @@ type UpstreamConfig struct {
 	// (naming the missing secret). Because resume() re-dials with the
 	// stored cfg, secret rotation applies automatically on next reconnect.
 	EnvFunc func(ctx context.Context) (map[string]string, error) `json:"-"`
+
+	// IdentityHeader, when non-empty on an http transport, names the header
+	// that carries the caller's per-person identity key (see
+	// IdentityResolver) on every tools/call. A call whose caller has no key
+	// is refused. initialize, tools/list and reconnects never carry it.
+	IdentityHeader string `json:"identity_header,omitempty"`
 }
 
 type upstream struct {
@@ -81,8 +87,20 @@ type upstream struct {
 	lastDialErr         error
 }
 
+// withoutForwardedKey drops any forwarded identity key from ctx. The
+// upstream's own protocol traffic (initialize, tools/list, a re-dial after
+// an idle suspend) runs under the gateway's shared credentials only; a
+// caller's key rides on that caller's tools/call and nothing else.
+func withoutForwardedKey(ctx context.Context) context.Context {
+	if _, ok := ForwardedKey(ctx); !ok {
+		return ctx
+	}
+	return context.WithValue(ctx, forwardedKeyKey{}, "")
+}
+
 // newUpstream connects to one upstream MCP server using the configured transport.
 func newUpstream(ctx context.Context, cfg UpstreamConfig) (*upstream, error) {
+	ctx = withoutForwardedKey(ctx)
 	var c *client.Client
 	switch cfg.Transport {
 	case "stdio":
@@ -163,7 +181,7 @@ func (u *upstream) listTools(ctx context.Context) ([]mcp.Tool, error) {
 		return nil, errors.New("upstream is suspended and has no cached tools")
 	}
 
-	res, err := c.ListTools(ctx, mcp.ListToolsRequest{})
+	res, err := c.ListTools(withoutForwardedKey(ctx), mcp.ListToolsRequest{})
 	if err != nil {
 		return nil, err
 	}

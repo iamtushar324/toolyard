@@ -12,8 +12,12 @@ const state = {
   showPasswordLogin: false, // login card: password form revealed under "Sign in with Google"
   myServers: [],           // /v1/me/servers: the groups the signed-in user may use
   // Users page (admin): /v1/users rows + the grantable groups.
-  users: { rows: [], groups: [], loaded: false, loading: false, error: '' },
+  users: { rows: [], groups: [], loaded: false, loading: false, error: '', keyBusy: '', keyOpen: {} },
   userAccessModal: null,   // { id, name, selected: {group: bool}, dropped: [], error, saving } while editing access
+  // "Your Beknown key" card: /v1/me/identity-key status, plus the raw key
+  // held only in memory from a reveal until the owner dismisses it.
+  myKey: freshMyKey(),
+  serverEditModal: null,   // { name, http, url, headersText, identityOn, header, register, enabled, orig, error, saving } while editing a server
   route: 'approvals',
   approvals: [],
   audit: [],
@@ -260,6 +264,8 @@ async function refreshUser() {
 
 async function loadAll() {
   if (!state.user) return;
+  // Fire-and-forget: the "Your Beknown key" card fills in once it lands.
+  loadMyKey();
   // Members only reach their own agents and granted servers; every other
   // route would answer 403 admin_only.
   if (!isAdmin()) {
@@ -1127,9 +1133,177 @@ function viewHooks() {
   return el('div', {}, rows.length === 0 ? el('div', { class: 'card' }, filterBar) : null, table, recipes);
 }
 
+// ---- "Your Beknown key" -----------------------------------------------------
+//
+// Each person holds at most one Beknown key: toolyard forwards it to Beknown
+// services (BkCoreServices, BkDocsServices) so their change logs name the
+// person. An admin provisions it; only its owner ever sees it, once, on
+// reveal. The raw key stays in state.myKey.reveal (memory only) until the
+// owner hides it, so a live re-render doesn't lose it mid-copy.
+
+function freshMyKey() {
+  return { loaded: false, loading: false, data: null, error: '', reveal: null, revealing: false, revealError: '' };
+}
+
+let myKeySeq = 0;
+async function loadMyKey() {
+  const k = state.myKey;
+  const seq = ++myKeySeq;
+  k.loading = true;
+  try {
+    const r = await api('/v1/me/identity-key');
+    if (seq !== myKeySeq || state.myKey !== k) return; // a newer load (or a logout) owns the card
+    k.data = r || { has_key: false };
+    k.error = '';
+  } catch (e) {
+    if (seq !== myKeySeq || state.myKey !== k) return;
+    k.error = e.message;
+  }
+  k.loading = false;
+  k.loaded = true;
+  render();
+}
+
+async function revealMyKey() {
+  const k = state.myKey;
+  if (k.revealing) return;
+  k.revealing = true; k.revealError = ''; render();
+  try {
+    const r = await api('/v1/me/identity-key/reveal', { method: 'POST', body: {} });
+    if (r && r.key) k.reveal = { key: r.key, fingerprint: r.fingerprint || '' };
+    else k.revealError = 'toolyard didn\'t return a key. Ask a toolyard admin to rotate it.';
+  } catch (e) {
+    const code = e.body && e.body.error;
+    k.revealError = code === 'already_revealed'
+      ? 'This key was already revealed and can\'t be shown again. If you didn\'t save it, ask a toolyard admin to rotate it.'
+      : code === 'no_key'
+        ? 'You have no Beknown key yet. Ask a toolyard admin to provision one.'
+        : e.message;
+  }
+  k.revealing = false;
+  await loadMyKey(); // renders
+}
+
+function hideRevealedKey() {
+  if (!confirm('Hide your key? toolyard will not show it again, so make sure it is pasted into T3 first.')) return;
+  state.myKey.reveal = null;
+  render();
+}
+
+// shortFingerprint trims the 64-hex sha256 to "1a2b3c4d…9f0e"; callers put
+// the full value in the title for hover.
+function shortFingerprint(fp) {
+  return fp && fp.length > 16 ? fp.slice(0, 8) + '…' + fp.slice(-4) : (fp || '—');
+}
+
+function regStatusBadge(st) {
+  const cls = st === 'registered' ? 'allowed' : st === 'error' ? 'denied' : 'expired';
+  return el('span', { class: 'badge ' + cls }, st || 'unknown');
+}
+
+function renderRegistrations(regs) {
+  if (!regs || !regs.length) return el('div', { class: 'meta' }, 'Not registered with any Beknown service yet.');
+  return el('table', { class: 'reg-table' },
+    el('thead', {}, el('tr', {}, el('th', {}, 'Service'), el('th', {}, 'Status'), el('th', {}, 'Details'))),
+    el('tbody', {}, regs.map((r) => el('tr', {},
+      el('td', {}, el('code', {}, r.upstream)),
+      el('td', {}, regStatusBadge(r.status)),
+      r.error
+        ? el('td', { class: 'reg-error' }, r.error)
+        : el('td', { class: 'meta' }, r.updated_at ? relTime(toMs(r.updated_at)) : ''),
+    ))));
+}
+
+// renderOwnerPendingRemovals: old or revoked fingerprints a Beknown registry
+// still holds. toolyard retries the removal in the background.
+function renderOwnerPendingRemovals(list) {
+  if (!list || !list.length) return null;
+  const ups = [...new Set(list.map((p) => p.upstream))];
+  return el('div', { class: 'key-pending' },
+    el('ul', {}, ups.map((up) => el('li', {
+      title: list.filter((p) => p.upstream === up).map((p) => p.error).filter(Boolean).join('\n'),
+    }, '⚠ An old key is still being removed from ', el('code', {}, up), '.'))),
+    el('div', { class: 'meta' }, 'toolyard keeps retrying this on its own; there is nothing for you to do.'),
+  );
+}
+
+function renderRevealedKey(rv) {
+  return el('div', {},
+    el('div', { class: 'warn-pill' }, '⚠  Copy your key now. toolyard will not show it again.'),
+    el('div', { class: 'snippet' },
+      el('div', { class: 'head' },
+        el('span', {}, 'Beknown key'),
+        el('button', { class: 'copy-btn', on: { click: (e) => copyToButton(e.target, rv.key) } }, 'Copy'),
+      ),
+      el('pre', { class: 'key-value' }, rv.key),
+    ),
+    el('h4', {}, 'Paste it into T3'),
+    el('ol', { class: 'key-steps' },
+      el('li', {}, 'Click ', el('strong', {}, 'Copy'), ' above.'),
+      el('li', {}, 'In T3, open ', el('strong', {}, 'Settings → Experiments'), '.'),
+      el('li', {}, 'Under ', el('strong', {}, 'My managed MCP integrations'), ', choose ', el('strong', {}, 'Add Bifrost'), '.'),
+      el('li', {}, 'Paste the key where your Bifrost key used to go, then save.'),
+    ),
+    el('p', { class: 'meta' },
+      'The key takes effect only once your T3 points at toolyard. That switch is rolling out one person at a time.'),
+    rv.fingerprint
+      ? el('div', { class: 'meta' }, 'Fingerprint ', el('code', { title: rv.fingerprint }, shortFingerprint(rv.fingerprint)))
+      : null,
+    el('div', { class: 'row key-actions' },
+      el('button', { on: { click: hideRevealedKey } }, 'I\'ve saved it, hide the key'),
+    ),
+  );
+}
+
+function renderKeyStatus(d) {
+  const created = toMs(d.created_at);
+  return el('div', {},
+    el('div', { class: 'key-facts' },
+      el('span', { class: 'badge allowed' }, 'active'),
+      el('span', { class: 'meta' }, 'Fingerprint ', el('code', { title: d.fingerprint || '' }, shortFingerprint(d.fingerprint))),
+      created
+        ? el('span', { class: 'meta', title: new Date(created).toLocaleString() }, 'Created ' + new Date(created).toLocaleDateString())
+        : null,
+    ),
+    el('h4', {}, 'Registered with'),
+    renderRegistrations(d.registrations),
+    el('p', { class: 'meta' }, 'Lost the key? Ask a toolyard admin to rotate it, then reveal the new one here.'),
+  );
+}
+
+// renderIdentityKeyCard is "Your Beknown key", shown to every signed-in
+// person on Agents (and on My servers for members).
+function renderIdentityKeyCard() {
+  const k = state.myKey;
+  const d = k.data || {};
+  let body;
+  if (k.reveal) body = renderRevealedKey(k.reveal);
+  else if (!k.loaded) body = el('div', { class: 'meta' }, 'Loading…');
+  else if (!k.data) body = el('div', {},
+    el('div', { class: 'err' }, 'Couldn\'t load your key: ' + (k.error || 'unknown error')),
+    el('button', { disabled: k.loading, on: { click: () => loadMyKey() } }, 'Retry'),
+  );
+  else if (!d.has_key) body = el('div', { class: 'empty' }, 'Ask a toolyard admin to provision your Beknown key.');
+  else if (!d.revealed) body = el('div', {},
+    el('p', { class: 'meta' }, 'Your key is ready. It is shown only once, so have T3 open to paste it straight in.'),
+    el('button', { class: 'primary', disabled: k.revealing, on: { click: revealMyKey } },
+      k.revealing ? 'Revealing…' : 'Reveal key (shown once)'),
+  );
+  else body = renderKeyStatus(d);
+  return el('div', { class: 'card key-card' },
+    el('h2', {}, 'Your Beknown key'),
+    el('p', { class: 'meta' },
+      'Beknown services (BkCoreServices, BkDocsServices) use this key to record who made each change. It replaces your Bifrost virtual key.'),
+    k.revealError ? el('div', { class: 'err' }, k.revealError) : null,
+    body,
+    k.data && !k.reveal ? renderOwnerPendingRemovals(d.pending_removals) : null,
+  );
+}
+
 function viewAgents() {
   return el('div', {},
     state.agentModal ? renderAgentModal() : null,
+    renderIdentityKeyCard(),
     el('div', { class: 'card' },
       el('div', { class: 'agent-add-bar' },
         el('h2', { style: 'margin: 0;' }, 'Agents'),
@@ -1144,20 +1318,26 @@ function viewAgents() {
         ? el('div', { class: 'empty' }, 'No agents yet. Click "Add new agent" to enrol your first one.')
         : el('table', {}, el('thead', {}, el('tr', {},
             el('th', {}, 'Name'), el('th', {}, 'ID'), el('th', {}, 'Last seen'), el('th', {}, 'Status'), el('th', {}, ''))),
+            // kind "identity" is the person's Beknown key: the generic
+            // rotate/disable/delete routes refuse it (409 identity_agent),
+            // so it gets no buttons, only a pointer to the key card.
             el('tbody', {}, state.agents.map((a) => el('tr', { style: a.disabled ? 'opacity: 0.6;' : '' },
-              el('td', {}, a.name),
+              el('td', {}, a.name,
+                a.kind === 'identity' ? el('span', { class: 'badge identity inline-badge' }, 'Beknown key') : null),
               el('td', {}, el('code', {}, a.id)),
               el('td', { class: 'meta' }, a.last_seen ? relTime(a.last_seen) : 'never'),
-              el('td', {}, a.disabled
+              el('td', {}, a.disabled === true
                 ? el('span', { class: 'badge denied' }, 'disabled')
                 : el('span', { class: 'badge allowed' }, 'active')),
-              el('td', {}, el('div', { class: 'row' },
-                el('button', { on: { click: () => rotateAgent(a) } }, 'Rotate'),
-                a.disabled
-                  ? el('button', { on: { click: () => setAgentDisabled(a, false) } }, 'Enable')
-                  : el('button', { on: { click: () => setAgentDisabled(a, true) } }, 'Disable'),
-                el('button', { class: 'danger', on: { click: () => deleteAgent(a) } }, 'Delete'),
-              )),
+              el('td', {}, a.kind === 'identity'
+                ? el('span', { class: 'meta' }, 'Managed on the Beknown key card above')
+                : el('div', { class: 'row' },
+                    el('button', { on: { click: () => rotateAgent(a) } }, 'Rotate'),
+                    a.disabled
+                      ? el('button', { on: { click: () => setAgentDisabled(a, false) } }, 'Enable')
+                      : el('button', { on: { click: () => setAgentDisabled(a, true) } }, 'Disable'),
+                    el('button', { class: 'danger', on: { click: () => deleteAgent(a) } }, 'Delete'),
+                  )),
             )))),
     ),
   );
@@ -1572,6 +1752,7 @@ function groupStatusBadge(st) {
 function viewMyServers() {
   const rows = state.myServers || [];
   return el('div', {},
+    renderIdentityKeyCard(),
     el('div', { class: 'card' },
       el('h2', {}, 'My servers'),
       el('p', { class: 'meta', style: 'margin: 4px 0 12px;' },
@@ -1665,6 +1846,170 @@ async function revokeUserSessions(u) {
   await loadUsers();
 }
 
+// ---- Beknown keys (Users page) ----
+//
+// POST issues a key (or rotates the one there), DELETE revokes it, and
+// POST …/register retries the fingerprint registration. POST answers the
+// key's status object, so a registration that failed shows up at once.
+
+function userKeyState(k) {
+  if (!k || !k.has_key) return 'none';
+  return k.revealed ? 'active' : 'not revealed';
+}
+
+// keyNeedsRetry: a registration that isn't "registered", or a registry
+// server ("register keys here") the key has no row for yet. Pending
+// removals are retried by the same POST …/register (see keyRetryLabel).
+function keyNeedsRetry(k) {
+  if (!k || !k.has_key) return false;
+  const regs = k.registrations || [];
+  if (regs.some((r) => r.status !== 'registered')) return true;
+  return (state.servers || []).some((s) => s.identity && s.identity.register && !regs.some((r) => r.upstream === s.name));
+}
+
+function keyPending(k) {
+  return (k && k.pending_removals) || [];
+}
+
+// keyRetryLabel names the POST …/register button, or '' when there is
+// nothing to retry: it re-registers the key and retries pending removals,
+// and with no key left it only cleans up.
+function keyRetryLabel(k) {
+  if (keyNeedsRetry(k)) return 'Retry registration';
+  if (keyPending(k).length) return 'Retry cleanup';
+  return '';
+}
+
+function renderPendingRemovals(list) {
+  if (!list || !list.length) return null;
+  return el('div', { class: 'key-pending' },
+    el('div', { class: 'meta' }, 'Old keys still being removed'),
+    el('ul', {}, list.map((p) => el('li', {},
+      el('code', {}, p.upstream), ' ',
+      el('code', { title: p.fingerprint || '' }, shortFingerprint(p.fingerprint)),
+      p.error ? [' ', el('span', { class: 'reg-error' }, p.error)] : null,
+      p.updated_at ? el('span', { class: 'meta' }, ' · ' + relTime(toMs(p.updated_at))) : null,
+    ))),
+  );
+}
+
+async function userKeyAction(u, method, suffix, okMsg) {
+  if (state.users.keyBusy) return;
+  const name = userLabel(u);
+  state.users.keyBusy = u.id; render();
+  try {
+    const opts = method === 'DELETE' ? { method } : { method, body: {} };
+    const r = await api(`/v1/users/${encodeURIComponent(u.id)}/identity-key${suffix}`, opts);
+    state.users.error = '';
+    const failed = ((r && r.registrations) || []).filter((x) => x.status === 'error');
+    const pending = keyPending(r);
+    const notes = [];
+    if (failed.length) notes.push(`Registration failed on ${failed.map((x) => x.upstream).join(', ')}: ${failed[0].error || 'error'}.`);
+    if (pending.length) {
+      notes.push(`An old key is still being removed from ${[...new Set(pending.map((x) => x.upstream))].join(', ')}` +
+        (pending[0].error ? `: ${pending[0].error}.` : '.'));
+    }
+    toast(notes.length ? `${okMsg} ${notes.join(' ')}` : okMsg, notes.length ? 'error' : 'info');
+  } catch (e) {
+    const code = e.body && e.body.error;
+    if (code === 'no_key' && suffix === '/register') {
+      // Nothing left to register or remove.
+      state.users.error = '';
+      toast(`Nothing left to clean up for ${name}.`);
+    } else {
+      usersFail(code === 'no_clerk_identity'
+        ? new Error(`${name} has no Google sign-in yet. They must sign in with Google once first.`)
+        : e);
+    }
+  }
+  state.users.keyBusy = '';
+  if (state.user && u.id === state.user.id) loadMyKey();
+  await loadUsers();
+}
+
+async function provisionUserKey(u) {
+  const name = userLabel(u);
+  const rotate = !!(u.identity_key && u.identity_key.has_key);
+  if (rotate && !confirm(`Rotate ${name}'s Beknown key?\n\nThe current key is retired. ${name} gets a new key to reveal once on their Agents page and must paste it into T3 again.`)) return;
+  await userKeyAction(u, 'POST', '', rotate
+    ? `New Beknown key issued for ${name}. They reveal it once on their Agents page.`
+    : `Beknown key provisioned for ${name}. They reveal it once on their Agents page.`);
+}
+
+async function revokeUserKey(u) {
+  const name = userLabel(u);
+  if (!confirm(`Revoke ${name}'s Beknown key?\n\nServers that forward identity will refuse ${name}'s calls until a new key is provisioned.`)) return;
+  await userKeyAction(u, 'DELETE', '', `${name}'s Beknown key revoked.`);
+}
+
+async function retryUserKeyRegistration(u) {
+  const has = !!(u.identity_key && u.identity_key.has_key);
+  await userKeyAction(u, 'POST', '/register', has
+    ? `Registration retried for ${userLabel(u)}.`
+    : `Cleanup retried for ${userLabel(u)}.`);
+}
+
+// userKeyCell is the Users page "Beknown key" column: state chip, a warning
+// when a registration failed, the actions, and the registrations on demand.
+function userKeyCell(row) {
+  const k = row.identity_key || { has_key: false };
+  const regs = k.registrations || [];
+  const st = userKeyState(k);
+  const busy = !!state.users.keyBusy;
+  const failed = regs.filter((r) => r.status === 'error');
+  const pending = keyPending(k);
+  const retryLabel = keyRetryLabel(k);
+  return el('div', { class: 'stack' },
+    el('div', { class: 'chips' },
+      st === 'active' ? el('span', { class: 'badge allowed' }, 'active')
+        : st === 'not revealed' ? el('span', { class: 'badge pending', title: 'Provisioned; the person hasn\'t revealed it yet' }, 'not revealed')
+        : el('span', { class: 'badge' }, 'none'),
+      failed.length
+        ? el('span', {
+            class: 'badge denied',
+            title: failed.map((r) => r.upstream + ': ' + (r.error || 'error')).join('\n'),
+          }, '⚠ registration error')
+        : null,
+      pending.length
+        ? el('span', {
+            class: 'badge pending',
+            title: 'Old keys still being removed from ' + [...new Set(pending.map((p) => p.upstream))].join(', '),
+          }, '⚠ cleanup pending')
+        : null,
+    ),
+    st === 'none' && row.auth === 'password'
+      ? el('span', { class: 'meta' }, 'Needs one Google sign-in first')
+      : null,
+    st === 'none'
+      ? el('button', { disabled: busy, on: { click: () => provisionUserKey(row) } }, 'Provision')
+      : el('div', { class: 'row' },
+          el('button', { disabled: busy, on: { click: () => provisionUserKey(row) } }, 'Rotate'),
+          el('button', { class: 'danger', disabled: busy, on: { click: () => revokeUserKey(row) } }, 'Revoke'),
+        ),
+    retryLabel
+      ? el('button', { disabled: busy, on: { click: () => retryUserKeyRegistration(row) } }, retryLabel)
+      : null,
+    k.has_key || pending.length
+      ? el('details', {
+          class: 'key-regs', open: !!state.users.keyOpen[row.id],
+          on: { toggle: (e) => { state.users.keyOpen[row.id] = e.target.open; } },
+        },
+          el('summary', {}, [
+            k.has_key ? (regs.length === 1 ? '1 registration' : `${regs.length} registrations`) : null,
+            pending.length ? `${pending.length} pending removal${pending.length === 1 ? '' : 's'}` : null,
+          ].filter(Boolean).join(' · ')),
+          k.has_key
+            ? [
+                el('div', { class: 'meta' }, 'Fingerprint ', el('code', { title: k.fingerprint || '' }, shortFingerprint(k.fingerprint))),
+                renderRegistrations(regs),
+              ]
+            : null,
+          renderPendingRemovals(pending),
+        )
+      : null,
+  );
+}
+
 function openUserAccess(u) {
   const known = new Set((state.users.groups || []).map((g) => g.name));
   const selected = {};
@@ -1752,7 +2097,7 @@ function viewUsers() {
     : el('table', { class: 'users-table' },
         el('thead', {}, el('tr', {},
           el('th', {}, 'User'), el('th', {}, 'Email'), el('th', {}, 'Role'), el('th', {}, 'Status'),
-          el('th', {}, 'Servers'), el('th', {}, 'Agents'), el('th', {}, 'Last seen'), el('th', {}, ''))),
+          el('th', {}, 'Servers'), el('th', {}, 'Beknown key'), el('th', {}, 'Agents'), el('th', {}, 'Last seen'), el('th', {}, ''))),
         el('tbody', {}, u.rows.map((row) => {
           const self = row.id === me.id;
           const admin = row.role === 'admin';
@@ -1798,6 +2143,7 @@ function viewUsers() {
                 on: { click: () => openUserAccess(row) },
               }, 'Edit access'),
             )),
+            el('td', {}, userKeyCell(row)),
             el('td', { class: 'meta' }, String(row.agent_count || 0)),
             el('td', { class: 'meta' }, row.last_seen_at ? relTime(toMs(row.last_seen_at)) : 'never'),
             el('td', {}, el('button', { on: { click: () => revokeUserSessions(row) } }, 'Sign out everywhere')),
@@ -1869,10 +2215,15 @@ function viewServers() {
     el('textarea', { id: 'srv-headers', placeholder: 'X-Api-Key: secret://MY_API_KEY', value: '' }),
   ) : null;
 
+  // Identity forwarding is per HTTP server; its fields live on the draft.
+  if (draft.header == null) draft.header = IDENTITY_HEADER_DEFAULT;
+  const identityRow = transport !== 'stdio' ? identityFields(draft, 'srv-id') : null;
+
   const installedByName = new Map(state.servers.map((s) => [s.name, s]));
 
   return el('div', {},
     state.marketModal ? renderMarketModal() : null,
+    state.serverEditModal ? renderServerEditModal() : null,
     el('div', { class: 'card' },
       el('h2', {}, 'Browse popular MCP servers'),
       el('p', { class: 'meta' },
@@ -1942,6 +2293,7 @@ function viewServers() {
       transportFields,
       envRow,
       headersRow,
+      identityRow,
       el('div', { class: 'row', style: 'margin-top: 12px;' },
         el('button', { class: 'primary', on: { click: () => addServer() }}, 'Add server'),
         el('button', { on: { click: () => { state._serverDraft = { transport: 'stdio' }; render(); } } }, 'Reset'),
@@ -1961,7 +2313,8 @@ function viewServers() {
             el('th', {}, ''))),
             el('tbody', {}, state.servers.map((s) => el('tr', {},
               el('td', {}, el('code', {}, s.name),
-                serverUsesSecret(s) ? el('span', { title: 'references a stored secret', style: 'margin-left:6px;' }, '🔒') : null),
+                serverUsesSecret(s) ? el('span', { title: 'references a stored secret', style: 'margin-left:6px;' }, '🔒') : null,
+                identityBadges(s)),
               el('td', {}, transportLabel(s)),
               el('td', {}, String(s.tool_count || 0)),
               el('td', {}, s.last_status === 'ok'
@@ -1983,6 +2336,7 @@ function viewServers() {
                   (s.env_plaintext_keys && s.env_plaintext_keys.length)
                     ? el('button', { title: 'Move a plaintext env value into the encrypted secrets store', on: { click: () => convertEnvToSecret(s.name, s.env_plaintext_keys) }}, '🔑 Secret')
                     : null,
+                  el('button', { on: { click: () => openServerEdit(s) }}, 'Edit'),
                   el('button', { on: { click: () => reconnectServer(s.name) }}, 'Reconnect'),
                   el('button', { class: 'danger', on: { click: () => removeServer(s.name) }}, 'Remove'),
                 ),
@@ -2003,6 +2357,227 @@ function transportLabel(s) {
 function serverUsesSecret(s) {
   const refs = (m) => Object.values(m || {}).some((v) => typeof v === 'string' && v.startsWith('secret://'));
   return refs(s.env) || refs(s.headers);
+}
+
+// ---- per-server identity forwarding ----
+//
+// A server with identity set gets the caller's Beknown key in `header` on
+// every tool call (toolyard refuses callers without one); `register` marks
+// a server where toolyard registers each key's fingerprint.
+
+const IDENTITY_HEADER_DEFAULT = 'x-bk-bifrost-vk';
+const HEADER_NAME_RE = /^[A-Za-z0-9!#$%&'*+.^_`|~-]+$/;
+// Masked() shows plaintext header/env values as this; sending it back would
+// overwrite the real value.
+const MASKED_VALUE = '•••';
+
+function identityDraftError(d) {
+  const h = (d.header || '').trim() || IDENTITY_HEADER_DEFAULT;
+  return HEADER_NAME_RE.test(h) ? '' : `"${h}" isn't a valid header name.`;
+}
+
+function identityFromDraft(d) {
+  return { header: (d.header || '').trim() || IDENTITY_HEADER_DEFAULT, register: !!d.register };
+}
+
+// identityFields renders the "Identity" controls onto d { identityOn,
+// header, register }. Ticking the box enables its fields in place rather
+// than re-rendering, so the rest of the add form keeps what was typed.
+function identityFields(d, idPrefix) {
+  const dep = (node) => { node.disabled = !d.identityOn; return node; };
+  const box = el('div', { class: 'identity-fields' },
+    el('h4', {}, 'Identity'),
+    el('label', { class: 'check-row' },
+      el('input', {
+        type: 'checkbox', id: idPrefix + '-on', checked: !!d.identityOn,
+        on: { change: (e) => {
+          d.identityOn = e.target.checked;
+          box.querySelectorAll('.id-dep').forEach((n) => { n.disabled = !d.identityOn; });
+        } },
+      }),
+      el('span', {}, 'Forward each person\'s Beknown key'),
+    ),
+    el('div', { class: 'meta' },
+      'toolyard sends the caller\'s key on every tool call, and refuses calls from people who have no key.'),
+    el('label', {},
+      el('div', { class: 'meta' }, 'Header name'),
+      dep(el('input', {
+        id: idPrefix + '-header', class: 'id-dep', value: d.header == null ? IDENTITY_HEADER_DEFAULT : d.header,
+        placeholder: IDENTITY_HEADER_DEFAULT,
+        on: { input: (e) => { d.header = e.target.value; } },
+      })),
+    ),
+    el('label', { class: 'check-row' },
+      dep(el('input', {
+        type: 'checkbox', id: idPrefix + '-register', class: 'id-dep', checked: !!d.register,
+        on: { change: (e) => { d.register = e.target.checked; } },
+      })),
+      el('span', {}, 'Register keys here'),
+    ),
+    el('div', { class: 'meta' },
+      'Tick on a server that exposes the key registry tools (', el('code', {}, 'upsert-bifrost-virtual-key-actor'),
+      '). toolyard registers each person\'s key fingerprint in prime-service through it.'),
+  );
+  return box;
+}
+
+function identityBadges(s) {
+  const id = s.identity;
+  if (!id || !id.header) return null;
+  return [
+    el('span', { class: 'badge identity inline-badge', title: 'Forwards each caller\'s Beknown key in ' + id.header }, 'identity'),
+    id.register
+      ? el('span', { class: 'badge identity inline-badge', title: 'toolyard registers key fingerprints here' }, 'key registry')
+      : null,
+  ];
+}
+
+// ---- edit server (PATCH /v1/servers/{name}) ----
+
+function headersAsText(h) {
+  return Object.entries(h || {}).map(([k, v]) => k + ': ' + v).join('\n');
+}
+
+function openServerEdit(s) {
+  const id = s.identity && s.identity.header ? s.identity : null;
+  const m = {
+    name: s.name,
+    http: !!isHTTPUpstream(s),
+    url: s.url || '',
+    headersText: headersAsText(s.headers),
+    identityOn: !!id,
+    header: id ? id.header : IDENTITY_HEADER_DEFAULT,
+    register: !!(id && id.register),
+    enabled: s.enabled !== false,
+    error: '',
+    saving: false,
+  };
+  m.orig = { url: m.url, headersText: m.headersText, identityOn: m.identityOn, header: m.header, register: m.register, enabled: m.enabled };
+  state.serverEditModal = m;
+  render();
+}
+
+function closeServerEdit() {
+  if (state.serverEditModal && state.serverEditModal.saving) return;
+  state.serverEditModal = null;
+  render();
+}
+
+// serverEditBody is the partial PATCH body: only the fields that changed.
+// Returns { error } when the form can't be sent.
+function serverEditBody(m) {
+  const o = m.orig;
+  const body = {};
+  if (m.http) {
+    const url = m.url.trim();
+    if (!url) return { error: 'URL is required.' };
+    if (url !== o.url) body.url = url;
+    if (m.headersText !== o.headersText) {
+      const headers = parseHeadersText(m.headersText);
+      const masked = Object.keys(headers).filter((k) => headers[k] === MASKED_VALUE);
+      if (masked.length) {
+        return { error: `Re-enter the value for ${masked.join(', ')}: saved values show as ${MASKED_VALUE} and can't be sent back. Use secret://NAME for secrets, or delete the line to drop the header.` };
+      }
+      body.headers = headers;
+    }
+    if (m.identityOn) {
+      const idErr = identityDraftError(m);
+      if (idErr) return { error: idErr };
+    }
+    const next = identityFromDraft(m);
+    const changed = m.identityOn !== o.identityOn ||
+      (m.identityOn && (next.header !== o.header || next.register !== o.register));
+    if (changed) body.identity = m.identityOn ? next : null;
+  }
+  if (m.enabled !== o.enabled) body.enabled = m.enabled;
+  return { body };
+}
+
+async function saveServerEdit() {
+  const m = state.serverEditModal;
+  if (!m || m.saving) return;
+  const { body, error } = serverEditBody(m);
+  if (error) { m.error = error; render(); return; }
+  if (!Object.keys(body).length) { state.serverEditModal = null; toast('No changes'); render(); return; }
+  m.saving = true; m.error = ''; render();
+  try {
+    // 200 is the masked server; 202 is { server, warning } when the row was
+    // saved but the reconnect failed.
+    // Either may carry oauth_reset: the URL moved to another origin, so the
+    // stored OAuth client and tokens were dropped.
+    const out = await api('/v1/servers/' + encodeURIComponent(m.name), { method: 'PATCH', body });
+    if (state.serverEditModal === m) state.serverEditModal = null;
+    const srv = (out && out.server) || out || {};
+    const warning = out && out.warning;
+    if (srv.oauth_reset || (out && out.oauth_reset)) oauthResetNote(m.name, warning);
+    else if (warning) toast(`Saved ${m.name}, but it failed to reconnect: ${warning}`, 'error');
+    else toast(`Saved ${m.name}`);
+    await reloadServers();
+    await loadOAuthStatus(m.name);
+    render();
+  } catch (e) {
+    m.saving = false;
+    m.error = e.status === 403
+      ? (e.message === 'admin_only' ? 'Only admins can edit servers.' : `${m.name} is a reserved built-in server and can't be edited.`)
+      : e.status === 404 ? `${m.name} no longer exists. It may have been removed.`
+      : e.message;
+    if (e.status === 404) reloadServers().then(render);
+    render();
+  }
+}
+
+// oauthResetNote is a banner that stays until dismissed (a toast fades):
+// the server must be authorised again before its tools work.
+function oauthResetNote(name, warning) {
+  document.querySelectorAll('.toast').forEach((n) => n.remove());
+  const t = el('div', { class: 'toast stale' },
+    el('span', { class: 'grow' },
+      `Saved ${name}. OAuth was reset — authorise this server again.`,
+      warning ? ` Reconnect failed: ${warning}` : ''),
+    el('button', { class: 'link', on: { click: () => { t.remove(); openOAuthPanel(name); } } }, 'Authorise…'),
+    el('button', { class: 'link', on: { click: () => t.remove() } }, 'Dismiss'),
+  );
+  document.body.appendChild(t);
+}
+
+function renderServerEditModal() {
+  const m = state.serverEditModal;
+  return el('div', { class: 'modal-bg', on: { click: (e) => { if (e.target === e.currentTarget) closeServerEdit(); } } },
+    el('div', { class: 'modal modal-wide server-edit' },
+      el('h3', {}, 'Edit server · ' + m.name),
+      m.http ? [
+        el('label', {},
+          el('div', { class: 'meta' }, 'URL'),
+          el('input', {
+            id: 'srv-edit-url', value: m.url, placeholder: 'https://example.com/mcp',
+            on: { input: (e) => { m.url = e.target.value; } },
+          }),
+        ),
+        el('label', {},
+          el('div', { class: 'meta' },
+            'HTTP headers (Header: value per line). Values may be ', el('code', {}, 'secret://NAME'),
+            `. Saved plaintext values show as ${MASKED_VALUE}: leave this box as it is to keep them, or re-enter them if you edit it.`),
+          el('textarea', {
+            id: 'srv-edit-headers', placeholder: 'X-Api-Key: secret://MY_API_KEY', value: m.headersText,
+            on: { input: (e) => { m.headersText = e.target.value; } },
+          }),
+        ),
+        identityFields(m, 'srv-edit-id'),
+      ] : el('div', { class: 'meta' }, 'URL, headers and identity forwarding apply to HTTP servers only.'),
+      el('label', { class: 'check-row' },
+        el('input', {
+          type: 'checkbox', id: 'srv-edit-enabled', checked: m.enabled,
+          on: { change: (e) => { m.enabled = e.target.checked; } },
+        }),
+        el('span', {}, 'Enabled'),
+      ),
+      m.error ? el('div', { class: 'err' }, m.error) : null,
+      el('div', { class: 'row modal-actions' },
+        el('button', { disabled: m.saving, on: { click: closeServerEdit } }, 'Cancel'),
+        el('button', { class: 'primary', disabled: m.saving, on: { click: saveServerEdit } }, m.saving ? 'Saving…' : 'Save'),
+      ),
+    ),
+  );
 }
 
 // convertEnvToSecret moves a plaintext env value into the encrypted secrets
@@ -2220,6 +2795,11 @@ async function addServer() {
     body.url = $('srv-url').value.trim();
     const hdrEl = $('srv-headers');
     if (hdrEl && hdrEl.value.trim()) body.headers = parseHeadersText(hdrEl.value);
+    if (draft.identityOn) {
+      const idErr = identityDraftError(draft);
+      if (idErr) { toast(idErr, 'error'); return; }
+      body.identity = identityFromDraft(draft);
+    }
   }
   body.env = parseEnvText($('srv-env').value);
   if (!body.name) { toast('name required', 'error'); return; }
@@ -4131,6 +4711,7 @@ function navigate(route) {
   }
   if (route === 'users') loadUsers(true);
   if (route === 'myservers') loadMyServers();
+  if (route === 'agents' || route === 'myservers') loadMyKey();
   render();
 }
 
@@ -4189,6 +4770,7 @@ function shell(content) {
       ),
       state.user ? el('button', { on: { click: async () => {
         const viaClerk = state.user.auth === 'clerk';
+        state.myKey = freshMyKey(); // never leave a revealed key for the next person
         try { await api('/v1/auth/logout', { method: 'POST' }); } catch {}
         if (evtSrc) try { evtSrc.close(); } catch {}
         // A Google user also leaves Clerk, or "Sign in with Google" would
@@ -4293,6 +4875,7 @@ function closeTopmostOverlay() {
   if (state.memEdit) { state.memEdit = null; render(); return true; }
   if (state.agentModal) { state.agentModal = null; render(); return true; }
   if (state.userAccessModal) { closeUserAccess(); return true; }
+  if (state.serverEditModal) { closeServerEdit(); return true; }
   if (state.marketModal) { state.marketModal = null; render(); return true; }
   if (state.jwtPreview || state.pushDiag || state.pushTestResult) {
     state.jwtPreview = null; state.pushDiag = null; state.pushTestResult = null; render(); return true;

@@ -78,6 +78,11 @@ func (s *Server) runClerkSync(ctx context.Context) int {
 		if s.access != nil {
 			s.access.Invalidate(u.ID)
 		}
+		// Their Beknown key must stop being forwarded now, not when the
+		// resolver's cache expires (as usersPatch does on a block).
+		if s.identityKeys != nil {
+			s.identityKeys.Invalidate(u.ID)
+		}
 		_ = s.audit.Write(ctx, audit.Event{
 			EventType: "user.status", AgentID: "system:clerk-sync", Reason: "left_org",
 			ResultSummary: u.Username + " status=blocked",

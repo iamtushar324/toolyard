@@ -4,11 +4,14 @@
 package upstreams
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
+	"net/url"
 	"sort"
 	"strings"
 	"sync"
@@ -26,6 +29,16 @@ var (
 	ErrReserved    = errors.New("server name is reserved")
 )
 
+// IdentityForwarding is a server's per-person identity setting.
+type IdentityForwarding struct {
+	// Header carries the caller's raw identity key on tools/call only,
+	// e.g. "x-bk-bifrost-vk" for BkCoreServices and BkDocsServices.
+	Header string `json:"header"`
+	// Register marks the server where toolyard registers each key's
+	// fingerprint (it exposes upsert-/delete-bifrost-virtual-key-actor).
+	Register bool `json:"register,omitempty"`
+}
+
 // Server is one persisted upstream config and its current connection status.
 type Server struct {
 	Name      string            `json:"name"`
@@ -38,17 +51,26 @@ type Server struct {
 	// headers_json. Values may be secret:// refs (resolved at dial time)
 	// and are merged with OAuth-provided headers — OAuth wins on a clash
 	// (e.g. Authorization).
-	Headers    map[string]string `json:"headers,omitempty"`
-	Enabled    bool              `json:"enabled"`
-	LastStatus string            `json:"last_status,omitempty"`
-	LastError  string            `json:"last_error,omitempty"`
-	ToolCount  int               `json:"tool_count"`
-	CreatedAt  int64             `json:"created_at"`
-	UpdatedAt  int64             `json:"updated_at"`
+	Headers map[string]string `json:"headers,omitempty"`
+	// Identity, when set on an http server, forwards the caller's
+	// per-person identity key on every tool call. Persisted in
+	// identity_json.
+	Identity   *IdentityForwarding `json:"identity,omitempty"`
+	Enabled    bool                `json:"enabled"`
+	LastStatus string              `json:"last_status,omitempty"`
+	LastError  string              `json:"last_error,omitempty"`
+	ToolCount  int                 `json:"tool_count"`
+	CreatedAt  int64               `json:"created_at"`
+	UpdatedAt  int64               `json:"updated_at"`
 	// EnvPlaintextKeys is populated only by Masked(): the env keys whose
 	// values were masked (i.e. plaintext, not secret:// refs) so the UI can
 	// offer a "convert to secret" action. Never persisted.
 	EnvPlaintextKeys []string `json:"env_plaintext_keys,omitempty"`
+	// OAuthReset is set only on the Server returned by Update, when the
+	// edit moved the url to another origin and the server's OAuth client
+	// and tokens were dropped as a result: the operator has to authorise
+	// it again. Never persisted.
+	OAuthReset bool `json:"oauth_reset,omitempty"`
 }
 
 // Policy gates which upstream configurations are admissible. Used to
@@ -65,7 +87,13 @@ type Policy struct {
 // request. Decoupled so we don't import oauth here.
 type HeaderProvider interface {
 	HeaderFunc(upstream string) func(ctx context.Context) map[string]string
+	// HasClient reports whether the upstream holds OAuth state (a client
+	// registration, or the placeholder client a stored PAT gets).
 	HasClient(ctx context.Context, upstream string) (bool, error)
+	// Disconnect revokes (best-effort) and deletes the upstream's OAuth
+	// client and tokens. Update calls it before moving a server to another
+	// origin so a bearer minted for one host is never sent to another.
+	Disconnect(ctx context.Context, upstream string) error
 }
 
 // SecretResolver is the secrets-broker dependency. Decoupled via interface so
@@ -146,32 +174,58 @@ func (s *Service) toCfg(srv Server) gateway.UpstreamConfig {
 	}
 
 	// http: compose static (secret-resolved) headers with the OAuth bearer
-	// header. OAuth wins on a clash (e.g. Authorization) so a stored bearer
-	// always takes precedence over a hand-set header.
+	// header, then the caller's identity key. OAuth wins on a clash (e.g.
+	// Authorization) so a stored bearer always takes precedence over a
+	// hand-set header; the identity header wins over both.
 	if isHTTP {
+		name := srv.Name
 		staticHeaders := copyMap(srv.Headers)
 		resolver := s.secrets
 		var oauthFn func(ctx context.Context) map[string]string
 		if s.auth != nil {
 			oauthFn = s.auth.HeaderFunc(srv.Name)
 		}
-		if len(staticHeaders) > 0 || oauthFn != nil {
+		var identityHeader string
+		if srv.Identity != nil {
+			identityHeader = srv.Identity.Header
+		}
+		cfg.IdentityHeader = identityHeader
+		if len(staticHeaders) > 0 || oauthFn != nil || identityHeader != "" {
 			cfg.HeaderFunc = func(ctx context.Context) map[string]string {
 				out := map[string]string{}
-				if len(staticHeaders) > 0 {
-					resolved := staticHeaders
-					if resolver != nil {
-						if r, err := resolver.ResolveMap(ctx, staticHeaders); err == nil {
-							resolved = r
-						}
-					}
-					for k, v := range resolved {
+				for k, v := range staticHeaders {
+					if !secrets.IsRef(v) {
 						out[k] = v
+						continue
 					}
+					// A ref that doesn't resolve is dropped for this
+					// request, never sent as the literal "secret://NAME".
+					resolved, err := resolveHeaderRef(ctx, resolver, k, v)
+					if err != nil {
+						log.Printf("upstream %q: header %q dropped: %v", name, k, err)
+						continue
+					}
+					out[k] = resolved
 				}
 				if oauthFn != nil {
 					for k, v := range oauthFn(ctx) {
 						out[k] = v // OAuth wins
+					}
+				}
+				// The identity header carries the caller's key or nothing
+				// at all. Whatever static config or OAuth put under that
+				// name (in any letter case) is discarded, so a fixed
+				// identity can't be pinned on a forwarding server; a
+				// request without a key (initialize, tools/list, a
+				// reconnect) goes out under the shared credentials only.
+				if identityHeader != "" {
+					for k := range out {
+						if strings.EqualFold(k, identityHeader) {
+							delete(out, k)
+						}
+					}
+					if key, ok := gateway.ForwardedKey(ctx); ok {
+						out[identityHeader] = key
 					}
 				}
 				return out
@@ -179,6 +233,20 @@ func (s *Service) toCfg(srv Server) gateway.UpstreamConfig {
 		}
 	}
 	return cfg
+}
+
+// resolveHeaderRef resolves one secret:// header value through the broker.
+// It fails when no broker is wired or the secret can't be produced; the
+// error names the ref, never a value.
+func resolveHeaderRef(ctx context.Context, r SecretResolver, key, ref string) (string, error) {
+	if r == nil {
+		return "", fmt.Errorf("%s: secrets broker not wired", ref)
+	}
+	out, err := r.ResolveMap(ctx, map[string]string{key: ref})
+	if err != nil {
+		return "", err
+	}
+	return out[key], nil
 }
 
 func copyMap(in map[string]string) map[string]string {
@@ -218,7 +286,125 @@ func validate(srv Server) error {
 	default:
 		return fmt.Errorf("%w: unsupported transport %q", ErrInvalid, srv.Transport)
 	}
+	if err := rejectMasked("header", srv.Headers); err != nil {
+		return err
+	}
+	if err := rejectMasked("env", srv.Env); err != nil {
+		return err
+	}
+	return validateIdentity(srv)
+}
+
+// rejectMasked refuses the placeholder Masked() puts in place of a value.
+// A client that edits the masked GET view and sends it back would
+// otherwise overwrite a real credential with dots.
+func rejectMasked(kind string, m map[string]string) error {
+	for k, v := range m {
+		if v == MaskedValue {
+			return fmt.Errorf("%w: %s %q: masked value — send the real value, a secret:// reference, or leave the key out", ErrInvalid, kind, k)
+		}
+	}
 	return nil
+}
+
+// sameOrigin reports whether two urls share scheme and host (with port).
+// Anything that doesn't parse counts as a different origin, so an odd url
+// errs on the side of resetting OAuth.
+func sameOrigin(a, b string) bool {
+	ua, errA := url.Parse(a)
+	ub, errB := url.Parse(b)
+	if errA != nil || errB != nil {
+		return false
+	}
+	return strings.EqualFold(ua.Scheme, ub.Scheme) && strings.EqualFold(ua.Host, ub.Host)
+}
+
+// identityHeaderDenylist names headers that can never carry an identity
+// key: they belong to the HTTP transport, the MCP session or another
+// credential. Lower-case; compared case-insensitively.
+var identityHeaderDenylist = map[string]bool{
+	"authorization":        true,
+	"cookie":               true,
+	"host":                 true,
+	"content-type":         true,
+	"content-length":       true,
+	"accept":               true,
+	"mcp-session-id":       true,
+	"mcp-protocol-version": true,
+	"last-event-id":        true,
+}
+
+// validHeaderToken reports whether name is an RFC 7230 token, the only
+// thing an HTTP header field name may be.
+func validHeaderToken(name string) bool {
+	if name == "" {
+		return false
+	}
+	for i := 0; i < len(name); i++ {
+		c := name[i]
+		switch {
+		case c >= 'a' && c <= 'z', c >= 'A' && c <= 'Z', c >= '0' && c <= '9':
+		case strings.IndexByte("!#$%&'*+-.^_`|~", c) >= 0:
+		default:
+			return false
+		}
+	}
+	return true
+}
+
+// validateIdentity checks a server's identity-forwarding setting: http
+// transports only, a real header name that isn't reserved, and no static
+// header of the same name, so an admin can't pin a fixed identity on a
+// server that is meant to act as the caller.
+func validateIdentity(srv Server) error {
+	id := srv.Identity
+	if id == nil {
+		return nil
+	}
+	if srv.Transport == "stdio" {
+		return fmt.Errorf("%w: identity forwarding needs an http transport", ErrInvalid)
+	}
+	if !validHeaderToken(id.Header) {
+		return fmt.Errorf("%w: identity header %q is not a valid HTTP header name", ErrInvalid, id.Header)
+	}
+	if identityHeaderDenylist[strings.ToLower(id.Header)] {
+		return fmt.Errorf("%w: identity header %q is reserved", ErrInvalid, id.Header)
+	}
+	for k := range srv.Headers {
+		if strings.EqualFold(k, id.Header) {
+			return fmt.Errorf("%w: static header %q clashes with the identity header; the caller's key must not be pinned", ErrInvalid, k)
+		}
+	}
+	return nil
+}
+
+// identityJSON is the identity_json column value: NULL when forwarding is
+// off, the JSON object otherwise.
+func identityJSON(id *IdentityForwarding) any {
+	if id == nil {
+		return nil
+	}
+	b, _ := json.Marshal(id)
+	return string(b)
+}
+
+// decodeServerJSON fills the JSON-encoded columns of a scanned row.
+func decodeServerJSON(srv *Server, argsRaw, envRaw, headersRaw, identityRaw string) {
+	if argsRaw != "" {
+		_ = json.Unmarshal([]byte(argsRaw), &srv.Args)
+	}
+	if envRaw != "" {
+		_ = json.Unmarshal([]byte(envRaw), &srv.Env)
+	}
+	if headersRaw != "" {
+		_ = json.Unmarshal([]byte(headersRaw), &srv.Headers)
+	}
+	if identityRaw != "" && identityRaw != "null" {
+		var id IdentityForwarding
+		if err := json.Unmarshal([]byte(identityRaw), &id); err == nil {
+			srv.Identity = &id
+		}
+	}
 }
 
 // LoadAll reads all enabled servers from the DB and connects them in
@@ -250,7 +436,8 @@ func (s *Service) LoadAll(ctx context.Context) error {
 func (s *Service) list(ctx context.Context) ([]Server, error) {
 	rows, err := s.db.QueryContext(ctx,
 		`SELECT name, transport, COALESCE(command,''), COALESCE(args_json,''),
-            COALESCE(url,''), COALESCE(env_json,''), COALESCE(headers_json,''), enabled,
+            COALESCE(url,''), COALESCE(env_json,''), COALESCE(headers_json,''),
+            COALESCE(identity_json,''), enabled,
             COALESCE(last_status,''), COALESCE(last_error,''), tool_count,
             created_at, updated_at
          FROM upstream_servers ORDER BY name`)
@@ -261,23 +448,15 @@ func (s *Service) list(ctx context.Context) ([]Server, error) {
 	var out []Server
 	for rows.Next() {
 		var srv Server
-		var argsRaw, envRaw, headersRaw string
+		var argsRaw, envRaw, headersRaw, identityRaw string
 		var enabled int
 		if err := rows.Scan(&srv.Name, &srv.Transport, &srv.Command, &argsRaw,
-			&srv.URL, &envRaw, &headersRaw, &enabled, &srv.LastStatus, &srv.LastError,
+			&srv.URL, &envRaw, &headersRaw, &identityRaw, &enabled, &srv.LastStatus, &srv.LastError,
 			&srv.ToolCount, &srv.CreatedAt, &srv.UpdatedAt); err != nil {
 			return nil, err
 		}
 		srv.Enabled = enabled != 0
-		if argsRaw != "" {
-			_ = json.Unmarshal([]byte(argsRaw), &srv.Args)
-		}
-		if envRaw != "" {
-			_ = json.Unmarshal([]byte(envRaw), &srv.Env)
-		}
-		if headersRaw != "" {
-			_ = json.Unmarshal([]byte(headersRaw), &srv.Headers)
-		}
+		decodeServerJSON(&srv, argsRaw, envRaw, headersRaw, identityRaw)
 		out = append(out, srv)
 	}
 	return out, rows.Err()
@@ -321,10 +500,10 @@ func (s *Service) Add(ctx context.Context, srv Server) (*Server, error) {
 
 	_, err := s.db.ExecContext(ctx,
 		`INSERT INTO upstream_servers(name, transport, command, args_json, url,
-            env_json, headers_json, enabled, created_at, updated_at)
-         VALUES(?,?,?,?,?,?,?,?,?,?)`,
+            env_json, headers_json, identity_json, enabled, created_at, updated_at)
+         VALUES(?,?,?,?,?,?,?,?,?,?,?)`,
 		srv.Name, srv.Transport, nullStr(srv.Command), string(argsBlob),
-		nullStr(srv.URL), string(envBlob), string(headersBlob), 1, now, now)
+		nullStr(srv.URL), string(envBlob), string(headersBlob), identityJSON(srv.Identity), 1, now, now)
 	if err != nil {
 		// SQLite reports unique constraint as "UNIQUE constraint failed".
 		if strings.Contains(strings.ToLower(err.Error()), "unique") {
@@ -427,15 +606,16 @@ func (s *Service) connect(ctx context.Context, srv Server) error {
 func (s *Service) get(ctx context.Context, name string) (*Server, error) {
 	row := s.db.QueryRowContext(ctx,
 		`SELECT name, transport, COALESCE(command,''), COALESCE(args_json,''),
-            COALESCE(url,''), COALESCE(env_json,''), COALESCE(headers_json,''), enabled,
+            COALESCE(url,''), COALESCE(env_json,''), COALESCE(headers_json,''),
+            COALESCE(identity_json,''), enabled,
             COALESCE(last_status,''), COALESCE(last_error,''), tool_count,
             created_at, updated_at
          FROM upstream_servers WHERE name = ?`, name)
 	var srv Server
-	var argsRaw, envRaw, headersRaw string
+	var argsRaw, envRaw, headersRaw, identityRaw string
 	var enabled int
 	if err := row.Scan(&srv.Name, &srv.Transport, &srv.Command, &argsRaw,
-		&srv.URL, &envRaw, &headersRaw, &enabled, &srv.LastStatus, &srv.LastError,
+		&srv.URL, &envRaw, &headersRaw, &identityRaw, &enabled, &srv.LastStatus, &srv.LastError,
 		&srv.ToolCount, &srv.CreatedAt, &srv.UpdatedAt); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, ErrNotFound
@@ -443,15 +623,7 @@ func (s *Service) get(ctx context.Context, name string) (*Server, error) {
 		return nil, err
 	}
 	srv.Enabled = enabled != 0
-	if argsRaw != "" {
-		_ = json.Unmarshal([]byte(argsRaw), &srv.Args)
-	}
-	if envRaw != "" {
-		_ = json.Unmarshal([]byte(envRaw), &srv.Env)
-	}
-	if headersRaw != "" {
-		_ = json.Unmarshal([]byte(headersRaw), &srv.Headers)
-	}
+	decodeServerJSON(&srv, argsRaw, envRaw, headersRaw, identityRaw)
 	return &srv, nil
 }
 
@@ -525,8 +697,8 @@ func (s *Service) UpsertBuiltin(ctx context.Context, srv Server) (*Server, error
 	// rest. SQLite's "excluded" pseudo-table refers to the would-be-inserted row.
 	_, err := s.db.ExecContext(ctx,
 		`INSERT INTO upstream_servers(name, transport, command, args_json, url,
-            env_json, headers_json, enabled, created_at, updated_at)
-         VALUES(?,?,?,?,?,?,?,?,?,?)
+            env_json, headers_json, identity_json, enabled, created_at, updated_at)
+         VALUES(?,?,?,?,?,?,?,?,?,?,?)
          ON CONFLICT(name) DO UPDATE SET
             transport = excluded.transport,
             command   = excluded.command,
@@ -534,10 +706,11 @@ func (s *Service) UpsertBuiltin(ctx context.Context, srv Server) (*Server, error
             url       = excluded.url,
             env_json  = excluded.env_json,
             headers_json = excluded.headers_json,
+            identity_json = excluded.identity_json,
             enabled   = 1,
             updated_at = excluded.updated_at`,
 		srv.Name, srv.Transport, nullStr(srv.Command), string(argsBlob),
-		nullStr(srv.URL), string(envBlob), string(headersBlob), 1, srv.CreatedAt, now)
+		nullStr(srv.URL), string(envBlob), string(headersBlob), identityJSON(srv.Identity), 1, srv.CreatedAt, now)
 	if err != nil {
 		return nil, err
 	}
@@ -600,6 +773,10 @@ func Masked(srv Server) Server {
 	return out
 }
 
+// MaskedValue stands in for every plaintext env / header value in API
+// responses. It is also refused on save (see rejectMasked).
+const MaskedValue = "•••"
+
 func maskValues(in map[string]string) (map[string]string, []string) {
 	if len(in) == 0 {
 		return in, nil
@@ -613,12 +790,147 @@ func maskValues(in map[string]string) (map[string]string, []string) {
 		case secrets.IsRef(v):
 			masked[k] = v
 		default:
-			masked[k] = "•••"
+			masked[k] = MaskedValue
 			plaintext = append(plaintext, k)
 		}
 	}
 	sort.Strings(plaintext)
 	return masked, plaintext
+}
+
+// Patch is a partial edit for Update. A nil pointer leaves that field as it
+// is; Headers and Env replace the whole map when present ({} clears it).
+// Identity is tri-state so the dashboard can send "identity": null to turn
+// forwarding off. Transport, command and args are not editable: changing
+// the process an upstream runs is a remove-and-add.
+type Patch struct {
+	URL      *string            `json:"url"`
+	Headers  *map[string]string `json:"headers"`
+	Env      *map[string]string `json:"env"`
+	Identity OptionalIdentity   `json:"identity"`
+	Enabled  *bool              `json:"enabled"`
+}
+
+// OptionalIdentity tells "not in the body" (Set false) apart from an
+// explicit null (Set true, Value nil) and an object (Set true, Value set).
+type OptionalIdentity struct {
+	Set   bool
+	Value *IdentityForwarding
+}
+
+// UnmarshalJSON runs for a present field only, including a JSON null,
+// which is what makes the tri-state work.
+func (o *OptionalIdentity) UnmarshalJSON(b []byte) error {
+	o.Set = true
+	o.Value = nil
+	if bytes.Equal(bytes.TrimSpace(b), []byte("null")) {
+		return nil
+	}
+	dec := json.NewDecoder(bytes.NewReader(b))
+	dec.DisallowUnknownFields()
+	var v IdentityForwarding
+	if err := dec.Decode(&v); err != nil {
+		return fmt.Errorf("identity: %w", err)
+	}
+	o.Value = &v
+	return nil
+}
+
+// Update applies patch to a saved server and reconnects it in place. The
+// row is updated, never deleted and re-inserted, so the server's OAuth
+// client and tokens (which cascade on delete) survive an edit. Validation
+// runs on the merged config, so a patch can't sneak an identity header
+// past an existing static header or vice versa. On a connect failure the
+// new config is still saved and the error recorded on the row, as in Add.
+func (s *Service) Update(ctx context.Context, name string, patch Patch) (*Server, error) {
+	if isReservedBuiltin(name) {
+		return nil, ErrReserved
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	cur, err := s.get(ctx, name)
+	if err != nil {
+		return nil, err
+	}
+	next := *cur
+	if patch.URL != nil {
+		next.URL = strings.TrimSpace(*patch.URL)
+	}
+	if patch.Headers != nil {
+		next.Headers = copyMap(*patch.Headers)
+	}
+	if patch.Env != nil {
+		next.Env = copyMap(*patch.Env)
+	}
+	if patch.Identity.Set {
+		next.Identity = patch.Identity.Value
+	}
+	if patch.Enabled != nil {
+		next.Enabled = *patch.Enabled
+	}
+	if err := validate(next); err != nil {
+		return nil, err
+	}
+	if next.Enabled && s.stdioRefused(next) {
+		return nil, errStdioDisabled
+	}
+	if denied := s.policy.envDenied(next.Env); denied != "" {
+		return nil, fmt.Errorf("%w: env key %q is on the denylist", ErrInvalid, denied)
+	}
+	if err := s.validateSecretRefs(ctx, next); err != nil {
+		return nil, err
+	}
+
+	// A bearer belongs to the host it was issued for. Before the url moves
+	// to another origin, drop the server's OAuth client and tokens (the
+	// header func is keyed by server name and would otherwise send the old
+	// token to the new host on the first initialize). This happens before
+	// the row changes, so a failed reset leaves the server as it was.
+	oauthReset := false
+	if patch.URL != nil && s.auth != nil && !sameOrigin(cur.URL, next.URL) {
+		has, err := s.auth.HasClient(ctx, name)
+		if err != nil {
+			return nil, err
+		}
+		if has {
+			if err := s.auth.Disconnect(ctx, name); err != nil {
+				return nil, fmt.Errorf("reset oauth for %s before url change: %w", name, err)
+			}
+			oauthReset = true
+		}
+	}
+
+	envBlob, _ := json.Marshal(next.Env)
+	headersBlob, _ := json.Marshal(next.Headers)
+	enabled := 0
+	if next.Enabled {
+		enabled = 1
+	}
+	if _, err := s.db.ExecContext(ctx,
+		`UPDATE upstream_servers SET url=?, env_json=?, headers_json=?, identity_json=?, enabled=?, updated_at=?
+         WHERE name=?`,
+		nullStr(next.URL), string(envBlob), string(headersBlob), identityJSON(next.Identity),
+		enabled, time.Now().UnixMilli(), name); err != nil {
+		return nil, err
+	}
+
+	// Reconnect in place so the live upstream runs the new config. A
+	// disabled server is just taken down; LoadAll skips it on restart.
+	_ = s.gw.RemoveUpstream(name)
+	var connectErr error
+	if !next.Enabled {
+		s.recordStatus(ctx, name, "disabled", "", 0)
+		s.gw.NotifyToolListChanged()
+	} else if connectErr = s.connect(ctx, next); connectErr != nil {
+		s.recordStatus(ctx, name, "", connectErr.Error(), 0)
+	}
+	final, err := s.get(ctx, name)
+	if err != nil {
+		return nil, err
+	}
+	final.OAuthReset = oauthReset
+	return final, connectErr
 }
 
 // ConvertEnvToSecret extracts the plaintext value of env[envKey] on the named

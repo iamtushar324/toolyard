@@ -135,6 +135,7 @@ type Gateway struct {
 	maxPendingPerAgent  int
 	upstreamCallTimeout time.Duration
 	access              access.Resolver
+	identity            IdentityResolver
 
 	// inbox, when set, backs the inbox.* tools and grant redemption.
 	// approvalMode returns "inbox" (restricted calls are coached towards
@@ -219,6 +220,10 @@ type Options struct {
 	// Access, when set, limits each caller to the tool groups its dashboard
 	// user may use (admins: everything). nil leaves every tool reachable.
 	Access access.Resolver
+	// Identity, when set, supplies the caller's per-person key for
+	// upstreams whose UpstreamConfig sets IdentityHeader. nil refuses every
+	// call to such an upstream.
+	Identity IdentityResolver
 }
 
 // UsageRecorder is satisfied by *internal/usage.Service. The gateway only
@@ -278,6 +283,7 @@ func New(opts Options) *Gateway {
 		maxPendingPerAgent:  opts.MaxPendingPerAgent,
 		upstreamCallTimeout: opts.UpstreamCallTimeout,
 		access:              opts.Access,
+		identity:            opts.Identity,
 		tools:               map[string]toolEntry{},
 		upstreams:           map[string]*upstream{},
 	}
@@ -1353,11 +1359,13 @@ func budgetExceededResponse(agentID string, current, max int) *mcp.CallToolResul
 func (g *Gateway) dispatch(ctx context.Context, entry toolEntry, args map[string]any,
 	agentID, reason, approvalID string, ev *metrics.Event) (*mcp.CallToolResult, error) {
 
+	// u is the live upstream behind this entry; nil for built-ins, the
+	// fixture and anything else that isn't in the pool.
+	g.mu.RLock()
+	u := g.upstreams[entry.upstream]
+	g.mu.RUnlock()
 	if entry.handle == nil {
 		// Upstream-backed tool — route through the upstream pool.
-		g.mu.RLock()
-		u := g.upstreams[entry.upstream]
-		g.mu.RUnlock()
 		if u == nil {
 			ev.Outcome = metrics.OutcomeError
 			ev.ErrorClass = "upstream_not_connected"
@@ -1373,6 +1381,20 @@ func (g *Gateway) dispatch(ctx context.Context, entry toolEntry, args map[string
 		var cancel context.CancelFunc
 		callCtx, cancel = context.WithTimeout(ctx, g.upstreamCallTimeout)
 		defer cancel()
+	}
+	// Identity forwarding: a tool on an upstream that names an identity
+	// header runs as the caller or not at all. This is the one place every
+	// execution path (direct call, tools.execute, auto-approve, inbox
+	// grant, the approval bus and CallInternal) passes through, so it is
+	// the one place the rule lives. The key travels on callCtx to the
+	// transport's per-request header function; only this tools/call sees
+	// it.
+	if u != nil && u.cfg.IdentityHeader != "" {
+		key, err := g.forwardKey(ctx, agentID)
+		if err != nil {
+			return g.refuseWithoutIdentity(ctx, entry, agentID, reason, approvalID, err, ev), nil
+		}
+		callCtx = WithForwardedKey(callCtx, key)
 	}
 	res, err := entry.handle(callCtx, args)
 	ev.UpstreamLatencyMs = int(time.Since(upstreamStart).Milliseconds())
@@ -1418,6 +1440,45 @@ func (g *Gateway) dispatch(ctx context.Context, entry toolEntry, args map[string
 		}
 	}
 	return res, nil
+}
+
+// forwardKey resolves the caller's identity key for an identity-forwarding
+// upstream. Without a resolver there is no key for anyone, so every such
+// call is refused rather than made under the gateway's shared credentials.
+func (g *Gateway) forwardKey(ctx context.Context, callerID string) (string, error) {
+	if g.identity == nil {
+		return "", errors.New("identity forwarding is not configured on this gateway")
+	}
+	return g.identity.ForwardKey(ctx, callerID)
+}
+
+// refuseWithoutIdentity is the terminal outcome of a call to an
+// identity-forwarding upstream whose caller has no usable key: the
+// upstream is never contacted, the audit row and the metric say why, and
+// the agent gets a message it can act on. Key material never appears in
+// any of them.
+func (g *Gateway) refuseWithoutIdentity(ctx context.Context, entry toolEntry, agentID, reason, approvalID string,
+	cause error, ev *metrics.Event) *mcp.CallToolResult {
+	var msg string
+	if errors.Is(cause, ErrNoIdentityKey) {
+		msg = fmt.Sprintf("%s records who made each change, and your toolyard user has no Beknown key yet. "+
+			"Ask a toolyard admin to provision one (Users page).", entry.upstream)
+	} else {
+		msg = fmt.Sprintf("%s needs your identity key and toolyard could not resolve it; the call was not made.", entry.upstream)
+		log.Printf("identity-forward: tool=%s upstream=%s agent=%s refused: %v", entry.tool.Name, entry.upstream, agentID, cause)
+	}
+	_ = g.audit.Write(ctx, audit.Event{
+		EventType:     audit.EventCallFailed,
+		AgentID:       agentID,
+		UpstreamName:  entry.upstream,
+		ToolName:      entry.tool.Name,
+		Reason:        reason,
+		ApprovalID:    approvalID,
+		ResultSummary: "identity: " + cause.Error(),
+	})
+	ev.Outcome = metrics.OutcomeError
+	ev.ErrorClass = "identity"
+	return mcp.NewToolResultError(msg)
 }
 
 // approxResultSize estimates the byte size of a tool result for the cost
