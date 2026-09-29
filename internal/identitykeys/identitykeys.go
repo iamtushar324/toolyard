@@ -14,15 +14,18 @@
 //
 //	Issue    mint, store sealed, register the fingerprint everywhere
 //	Reveal   the owner sees the raw key once (revealed_at); again needs Rotate
-//	Rotate   mint anew, register the new fingerprint, delete the old one,
+//	Rotate   mint anew, register the new fingerprint, retire the old one,
 //	         then swap the agent token so the old key dies at once
-//	Revoke   delete the fingerprint everywhere, then the key and the agent
-//	Register retry the (idempotent) upsert after a failure or bootstrap
+//	Revoke   retire the fingerprint everywhere, then delete the key and agent
+//	Register retry the (idempotent) upsert and any pending removals
 //
-// A registration row's status is toolyard's best knowledge of the registry:
-// "registered" (the row's hash is there; error may carry a note such as a
-// stale previous fingerprint), "error" (the upsert failed; the key is kept
-// and the admin retries) or "revoked" (deleted).
+// A registration row's status is toolyard's best knowledge of the current
+// key at that registry: "registered", "error" (the upsert failed; the key
+// is kept and the admin retries) or "revoked". A fingerprint that must
+// leave a registry (superseded or revoked) is a pending removal until
+// delete-bifrost-virtual-key-actor succeeds there, or the registry's list
+// no longer shows it; Register and a background ticker retry them, so no
+// fingerprint that may still be registered is ever forgotten.
 package identitykeys
 
 import (
@@ -40,6 +43,7 @@ import (
 	"github.com/tusharbhardwaj/toolyard/internal/audit"
 	"github.com/tusharbhardwaj/toolyard/internal/gateway"
 	"github.com/tusharbhardwaj/toolyard/internal/identity"
+	"github.com/tusharbhardwaj/toolyard/internal/logx"
 	"github.com/tusharbhardwaj/toolyard/internal/sealbox"
 	"github.com/tusharbhardwaj/toolyard/internal/store"
 )
@@ -52,9 +56,14 @@ const (
 	// the gateway as "<upstream>.<tool>".
 	ToolUpsert = "upsert-bifrost-virtual-key-actor"
 	ToolDelete = "delete-bifrost-virtual-key-actor"
+	ToolList   = "list-bifrost-virtual-key-actors"
 
 	// ViaTool tags the internal registry calls in audit and metrics.
 	ViaTool = "identity_key"
+
+	// DefaultRetryInterval is how often the background pass retries
+	// pending removals.
+	DefaultRetryInterval = time.Hour
 
 	// cacheTTL bounds how stale a forwarded key can be when a write skips
 	// Invalidate (mirrors access.cacheTTL).
@@ -73,9 +82,18 @@ const (
 	StatusRevoked    = "revoked"
 )
 
+// Removal outcomes, the Decision of an identity_key.register audit row
+// written for a pending removal.
+const (
+	RemovalRemoved = "removed"       // the registry deleted it
+	RemovalAbsent  = "absent"        // the registry's list no longer shows it
+	RemovalError   = "removal_error" // still pending
+)
+
 // Audit event types. AgentID is the actor ("user:<uid>"), ResultSummary
 // names the target user; register events also carry the upstream, the
-// status as Decision and the error as Reason. The key never appears.
+// status or removal outcome as Decision and the error as Reason. The key
+// never appears.
 const (
 	EventIssue    = "identity_key.issue"
 	EventRotate   = "identity_key.rotate"
@@ -85,7 +103,7 @@ const (
 )
 
 var (
-	// ErrNoKey: the user has no identity key.
+	// ErrNoKey: the user has no identity key (and nothing pending).
 	ErrNoKey = errors.New("no identity key")
 	// ErrKeyExists: Issue on a user who already has one (use Rotate).
 	ErrKeyExists = errors.New("identity key already issued")
@@ -95,8 +113,10 @@ var (
 	// ErrNoClerkIdentity: registration needs the person's Clerk user id
 	// and email, so the user must sign in with Google once first.
 	ErrNoClerkIdentity = errors.New("user has no Clerk identity; they must sign in with Google once")
-	// ErrNotWired: the registry caller or lister isn't set.
+	// ErrNotWired: the registry caller isn't set.
 	ErrNotWired = errors.New("identity key registry not wired")
+	// errNoActor: a pending removal has nobody to run as.
+	errNoActor = errors.New("no admin recorded to run the removal as")
 )
 
 // RegistryLister names the upstreams where fingerprints are registered:
@@ -117,7 +137,7 @@ type InternalCaller interface {
 	CallInternal(ctx context.Context, viaTool, target string, args map[string]any) (*mcp.CallToolResult, error)
 }
 
-// Registration is one registry upstream's view of the user's key.
+// Registration is one registry upstream's view of the user's current key.
 type Registration struct {
 	Upstream  string `json:"upstream"`
 	Status    string `json:"status"`
@@ -128,18 +148,29 @@ type Registration struct {
 	keyHash string
 }
 
-// Status is what the dashboard shows for a user's identity key. The
-// fingerprint is not secret (the registry stores it); the bootstrap admin
-// registers it by hand.
-type Status struct {
-	HasKey        bool           `json:"has_key"`
-	Revealed      bool           `json:"revealed"`
-	Fingerprint   string         `json:"fingerprint,omitempty"`
-	CreatedAt     int64          `json:"created_at,omitempty"`
-	Registrations []Registration `json:"registrations"`
+// PendingRemoval is a fingerprint that must still leave a registry.
+type PendingRemoval struct {
+	Upstream    string `json:"upstream"`
+	Fingerprint string `json:"fingerprint"`
+	Error       string `json:"error"`
+	UpdatedAt   int64  `json:"updated_at"`
+	userID      string
+	byUser      string
 }
 
-// Service owns identity keys and their registrations.
+// Status is what the dashboard shows for a user's identity key. The
+// fingerprint is not secret (the registry stores it); the bootstrap admin
+// registers it by hand. Both arrays are always present.
+type Status struct {
+	HasKey          bool             `json:"has_key"`
+	Revealed        bool             `json:"revealed"`
+	Fingerprint     string           `json:"fingerprint,omitempty"`
+	CreatedAt       int64            `json:"created_at,omitempty"`
+	Registrations   []Registration   `json:"registrations"`
+	PendingRemovals []PendingRemoval `json:"pending_removals"`
+}
+
+// Service owns identity keys, their registrations and pending removals.
 type Service struct {
 	db         *store.DB
 	cipher     *sealbox.Cipher
@@ -198,7 +229,7 @@ type rowQuerier interface {
 	QueryRowContext(ctx context.Context, query string, args ...any) *sql.Row
 }
 
-// keyRow returns the user's key row, or nil when there is none.
+// keyRowFor returns the user's key row, or nil when there is none.
 func keyRowFor(ctx context.Context, q rowQuerier, userID string) (*keyRow, error) {
 	var k keyRow
 	var revealed sql.NullInt64
@@ -239,9 +270,35 @@ func (s *Service) registrations(ctx context.Context, userID string) ([]Registrat
 	return out, rows.Err()
 }
 
-// Status reports the user's key and where it is registered. A user with no
-// key gets HasKey=false and whatever registry rows remain (revoked, or a
-// stale fingerprint a failed revoke could not remove).
+// pendingRemovals lists retired fingerprints not yet deleted, for one user
+// or (userID == "") for everyone, ordered by upstream then fingerprint.
+func (s *Service) pendingRemovals(ctx context.Context, userID string) ([]PendingRemoval, error) {
+	q := `SELECT upstream, key_hash, user_id, COALESCE(by_user,''), COALESCE(error,''), updated_at
+          FROM identity_key_retired`
+	var args []any
+	if userID != "" {
+		q += ` WHERE user_id = ?`
+		args = append(args, userID)
+	}
+	rows, err := s.db.QueryContext(ctx, q+` ORDER BY upstream, key_hash`, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := []PendingRemoval{}
+	for rows.Next() {
+		var p PendingRemoval
+		if err := rows.Scan(&p.Upstream, &p.Fingerprint, &p.userID, &p.byUser, &p.Error, &p.UpdatedAt); err != nil {
+			return nil, err
+		}
+		out = append(out, p)
+	}
+	return out, rows.Err()
+}
+
+// Status reports the user's key, where it is registered and which of
+// their fingerprints still await removal. A user with no key gets
+// HasKey=false and whatever rows remain.
 func (s *Service) Status(ctx context.Context, userID string) (*Status, error) {
 	k, err := keyRowFor(ctx, s.db, userID)
 	if err != nil {
@@ -251,7 +308,11 @@ func (s *Service) Status(ctx context.Context, userID string) (*Status, error) {
 	if err != nil {
 		return nil, err
 	}
-	st := &Status{Registrations: regs}
+	pending, err := s.pendingRemovals(ctx, userID)
+	if err != nil {
+		return nil, err
+	}
+	st := &Status{Registrations: regs, PendingRemovals: pending}
 	if k != nil {
 		st.HasKey = true
 		st.Revealed = k.RevealedAt > 0
@@ -290,7 +351,7 @@ func (s *Service) user(ctx context.Context, userID string) (*userInfo, error) {
 }
 
 // registrableUser is user plus the Clerk identity check every registry
-// call needs.
+// upsert needs.
 func (s *Service) registrableUser(ctx context.Context, userID string) (*userInfo, error) {
 	u, err := s.user(ctx, userID)
 	if err != nil {
@@ -368,9 +429,11 @@ func (s *Service) Issue(ctx context.Context, actorID, userID string) (*Status, e
 	return s.Status(ctx, userID)
 }
 
-// Rotate mints a new key, registers the new fingerprint, deletes the old
-// one from each registry, then swaps the identity agent's token so the old
-// key stops authenticating at once. The new key is unrevealed.
+// Rotate mints a new key, registers the new fingerprint (retiring the old
+// one at every registry that holds or may hold it, and deleting it where
+// that succeeds), then swaps the identity agent's token so the old key
+// stops authenticating at once. The new key is unrevealed. A removal that
+// fails stays pending; it is retried by Register and the background pass.
 func (s *Service) Rotate(ctx context.Context, actorID, userID string) (*Status, error) {
 	u, err := s.registrableUser(ctx, userID)
 	if err != nil {
@@ -451,11 +514,11 @@ func (s *Service) Reveal(ctx context.Context, userID string) (key, fingerprint s
 	return string(raw), k.KeyHash, nil
 }
 
-// Revoke deletes the fingerprint from every registry it is in, then
-// removes the key and the identity agent. The local removal happens even
-// when a registry delete fails: the key must die now. Such a row keeps
-// status "registered" with the failure in error, and the next Issue for
-// the user removes the stale fingerprint before registering the new one.
+// Revoke retires the fingerprint at every registry that holds or may hold
+// it, deletes it where that succeeds now, then removes the key and the
+// identity agent. The local removal happens even when a registry delete
+// fails: the key must die now, and the removal stays pending for Register
+// (which works without a key) and the background pass.
 func (s *Service) Revoke(ctx context.Context, actorID, userID string) (*Status, error) {
 	k, err := keyRowFor(ctx, s.db, userID)
 	if err != nil {
@@ -468,34 +531,21 @@ func (s *Service) Revoke(ctx context.Context, actorID, userID string) (*Status, 
 	if err != nil {
 		return nil, err
 	}
-	callCtx := gateway.WithAgentID(ctx, "dashboard:"+actorID)
-	failed := 0
 	for _, r := range regs {
-		switch r.Status {
-		case StatusRevoked:
-			continue
-		case StatusError:
-			// Never registered as far as we know: nothing to delete.
-			if _, err := s.db.ExecContext(ctx,
-				`DELETE FROM identity_key_registrations WHERE user_id = ? AND upstream = ?`, userID, r.Upstream); err != nil {
-				return nil, err
-			}
+		if r.Status == StatusRevoked {
 			continue
 		}
-		if derr := s.call(callCtx, r.Upstream+"."+ToolDelete, map[string]any{
-			"virtualKeyHash": r.keyHash, "confirm": true,
-		}); derr != nil {
-			failed++
-			if err := s.setRegistration(ctx, userID, r.Upstream, r.keyHash, StatusRegistered, "revoke: "+derr.Error(), actorID); err != nil {
-				return nil, err
-			}
-			s.event(ctx, EventRegister, actorID, userID, r.Upstream, StatusRegistered, derr.Error(), "revoke failed")
-			continue
+		if err := s.retire(ctx, r.Upstream, r.keyHash, userID, actorID, "revoked"); err != nil {
+			return nil, err
 		}
 		if err := s.setRegistration(ctx, userID, r.Upstream, r.keyHash, StatusRevoked, "", actorID); err != nil {
 			return nil, err
 		}
 		s.event(ctx, EventRegister, actorID, userID, r.Upstream, StatusRevoked, "", "")
+	}
+	_, failed, err := s.retryRemovals(ctx, actorID, userID)
+	if err != nil {
+		return nil, err
 	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -512,25 +562,37 @@ func (s *Service) Revoke(ctx context.Context, actorID, userID string) (*Status, 
 		return nil, err
 	}
 	s.Invalidate(userID)
-	s.event(ctx, EventRevoke, actorID, userID, "", "", "", fmt.Sprintf("registry_failures=%d", failed))
+	s.event(ctx, EventRevoke, actorID, userID, "", "", "", fmt.Sprintf("pending_removals=%d", failed))
 	return s.Status(ctx, userID)
 }
 
 // Register (re)registers the user's current fingerprint in every registry
-// upstream as actorID. The upsert is idempotent, so this is the retry
-// after an error and the bootstrap step after the first admin's
-// fingerprint was registered by hand.
+// upstream as actorID and retries their pending removals. The upsert is
+// idempotent, so this is the retry after an error and the bootstrap step
+// after the first admin's fingerprint was registered by hand. Without a
+// key it still runs the pending removals (a revoke whose registry delete
+// failed); with nothing to do it is ErrNoKey.
 func (s *Service) Register(ctx context.Context, actorID, userID string) (*Status, error) {
-	u, err := s.registrableUser(ctx, userID)
-	if err != nil {
-		return nil, err
-	}
 	k, err := keyRowFor(ctx, s.db, userID)
 	if err != nil {
 		return nil, err
 	}
 	if k == nil {
-		return nil, ErrNoKey
+		pending, err := s.pendingRemovals(ctx, userID)
+		if err != nil {
+			return nil, err
+		}
+		if len(pending) == 0 {
+			return nil, ErrNoKey
+		}
+		if _, _, err := s.retryRemovals(ctx, actorID, userID); err != nil {
+			return nil, err
+		}
+		return s.Status(ctx, userID)
+	}
+	u, err := s.registrableUser(ctx, userID)
+	if err != nil {
+		return nil, err
 	}
 	if err := s.registerAll(ctx, actorID, userID, u, k.KeyHash); err != nil {
 		return nil, err
@@ -538,11 +600,11 @@ func (s *Service) Register(ctx context.Context, actorID, userID string) (*Status
 	return s.Status(ctx, userID)
 }
 
-// registerAll upserts hash in every registry upstream as actorID and
-// records one row per upstream. Where the upstream still holds a different
-// fingerprint of this user's (a rotate, or a stale one from a failed
-// revoke), that one is deleted after the upsert succeeds; a failed delete
-// leaves a note in error but the row stays registered. Only store errors
+// registerAll makes hash the user's registered fingerprint everywhere:
+// any other fingerprint a registration row still names is retired first
+// (a rotate, or a row left by a crash), then hash is upserted in every
+// registry upstream as actorID and one row per upstream records the
+// outcome, then the user's pending removals are retried. Only store errors
 // are returned; registry failures are recorded on the rows.
 func (s *Service) registerAll(ctx context.Context, actorID, userID string, u *userInfo, hash string) error {
 	var upstreams []string
@@ -558,9 +620,14 @@ func (s *Service) registerAll(ctx context.Context, actorID, userID string, u *us
 	if err != nil {
 		return err
 	}
-	prev := make(map[string]Registration, len(regs))
+	// Retire before touching the registry so a crash can't lose the old
+	// fingerprint. Rows for upstreams no longer configured count too.
 	for _, r := range regs {
-		prev[r.Upstream] = r
+		if r.Status != StatusRevoked && r.keyHash != hash {
+			if err := s.retire(ctx, r.Upstream, r.keyHash, userID, actorID, "superseded"); err != nil {
+				return err
+			}
+		}
 	}
 	callCtx := gateway.WithAgentID(ctx, "dashboard:"+actorID)
 	args := map[string]any{
@@ -578,20 +645,13 @@ func (s *Service) registerAll(ctx context.Context, actorID, userID string, u *us
 			s.event(ctx, EventRegister, actorID, userID, up, StatusError, uerr.Error(), "")
 			continue
 		}
-		note := ""
-		if p, ok := prev[up]; ok && p.Status == StatusRegistered && p.keyHash != hash {
-			if derr := s.call(callCtx, up+"."+ToolDelete, map[string]any{
-				"virtualKeyHash": p.keyHash, "confirm": true,
-			}); derr != nil {
-				note = "previous fingerprint not removed: " + derr.Error()
-			}
-		}
-		if err := s.setRegistration(ctx, userID, up, hash, StatusRegistered, note, actorID); err != nil {
+		if err := s.setRegistration(ctx, userID, up, hash, StatusRegistered, "", actorID); err != nil {
 			return err
 		}
-		s.event(ctx, EventRegister, actorID, userID, up, StatusRegistered, note, "")
+		s.event(ctx, EventRegister, actorID, userID, up, StatusRegistered, "", "")
 	}
-	return nil
+	_, _, err = s.retryRemovals(ctx, actorID, userID)
+	return err
 }
 
 func (s *Service) setRegistration(ctx context.Context, userID, upstream, hash, status, errText, actorID string) error {
@@ -606,27 +666,162 @@ func (s *Service) setRegistration(ctx context.Context, userID, upstream, hash, s
 	return err
 }
 
+// ---- pending removals ----------------------------------------------------------
+
+// retire records that hash must leave upstream's registry. Idempotent; a
+// later retire keeps the first admin unless a new one is given.
+func (s *Service) retire(ctx context.Context, upstream, hash, userID, byUser, note string) error {
+	_, err := s.db.ExecContext(ctx,
+		`INSERT INTO identity_key_retired(upstream, key_hash, user_id, by_user, error, updated_at)
+         VALUES(?,?,?,?,?,?)
+         ON CONFLICT(upstream, key_hash) DO UPDATE SET
+           user_id = excluded.user_id, by_user = COALESCE(excluded.by_user, by_user),
+           error = excluded.error, updated_at = excluded.updated_at`,
+		upstream, hash, userID, nullStr(byUser), nullStr(note), s.now().UnixMilli())
+	return err
+}
+
+func (s *Service) unretire(ctx context.Context, upstream, hash string) error {
+	_, err := s.db.ExecContext(ctx,
+		`DELETE FROM identity_key_retired WHERE upstream = ? AND key_hash = ?`, upstream, hash)
+	return err
+}
+
+func (s *Service) noteRemovalError(ctx context.Context, upstream, hash, errText string) error {
+	_, err := s.db.ExecContext(ctx,
+		`UPDATE identity_key_retired SET error = ?, updated_at = ? WHERE upstream = ? AND key_hash = ?`,
+		nullStr(truncate(errText, maxErrorLen)), s.now().UnixMilli(), upstream, hash)
+	return err
+}
+
+// retryRemovals tries every pending removal, for one user or (userID ==
+// "") all, as actorID, falling back to the admin recorded on the entry.
+// An entry is dropped when the registry deletes it, or when a delete
+// fails but the registry's list no longer shows the fingerprint (prime
+// answers "not found" for a hash that was never registered, so a
+// fingerprint retired from an "error" row would otherwise stay pending
+// forever). Returns how many were resolved and how many remain.
+func (s *Service) retryRemovals(ctx context.Context, actorID, userID string) (resolved, remaining int, err error) {
+	pending, err := s.pendingRemovals(ctx, userID)
+	if err != nil {
+		return 0, 0, err
+	}
+	for _, p := range pending {
+		actor := actorID
+		if actor == "" {
+			actor = p.byUser
+		}
+		outcome, rerr := s.remove(ctx, actor, p.Upstream, p.Fingerprint)
+		if rerr == nil {
+			if err := s.unretire(ctx, p.Upstream, p.Fingerprint); err != nil {
+				return resolved, remaining, err
+			}
+			resolved++
+			s.event(ctx, EventRegister, actor, p.userID, p.Upstream, outcome, "", "removed "+p.Fingerprint)
+			continue
+		}
+		remaining++
+		if err := s.noteRemovalError(ctx, p.Upstream, p.Fingerprint, rerr.Error()); err != nil {
+			return resolved, remaining, err
+		}
+		s.event(ctx, EventRegister, actor, p.userID, p.Upstream, RemovalError, rerr.Error(), "pending "+p.Fingerprint)
+	}
+	return resolved, remaining, nil
+}
+
+// remove deletes hash from upstream's registry as actor. On a failed
+// delete it consults the registry's list: an absent hash counts as
+// removed. The outcome names which path succeeded.
+func (s *Service) remove(ctx context.Context, actor, upstream, hash string) (outcome string, err error) {
+	if actor == "" {
+		return "", errNoActor
+	}
+	callCtx := gateway.WithAgentID(ctx, "dashboard:"+actor)
+	derr := s.call(callCtx, upstream+"."+ToolDelete, map[string]any{"virtualKeyHash": hash, "confirm": true})
+	if derr == nil {
+		return RemovalRemoved, nil
+	}
+	text, lerr := s.callText(callCtx, upstream+"."+ToolList, map[string]any{})
+	if lerr == nil && !strings.Contains(strings.ToLower(text), hash) {
+		return RemovalAbsent, nil
+	}
+	return "", derr
+}
+
+// RetryRemovals is the background pass: every pending removal, each as
+// the admin recorded on it, with the outcome logged. It does nothing when
+// no registry upstream is configured.
+func (s *Service) RetryRemovals(ctx context.Context) (resolved, remaining int, err error) {
+	if s.registries == nil {
+		return 0, 0, nil
+	}
+	upstreams, err := s.registries.RegistryUpstreams(ctx)
+	if err != nil {
+		return 0, 0, err
+	}
+	if len(upstreams) == 0 {
+		return 0, 0, nil
+	}
+	return s.retryRemovals(ctx, "", "")
+}
+
+// StartRemovalRetry runs RetryRemovals every interval until ctx ends. The
+// first pass waits one interval so upstreams have connected.
+func (s *Service) StartRemovalRetry(ctx context.Context, every time.Duration) {
+	if every <= 0 {
+		every = DefaultRetryInterval
+	}
+	lg := logx.For("identity-keys")
+	go func() {
+		t := time.NewTicker(every)
+		defer t.Stop()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case <-t.C:
+				resolved, remaining, err := s.RetryRemovals(ctx)
+				switch {
+				case err != nil:
+					lg.Warn("pending fingerprint removals: pass failed", "err", err.Error())
+				case resolved > 0 || remaining > 0:
+					lg.Info("pending fingerprint removals", "resolved", resolved, "remaining", remaining)
+				}
+			}
+		}
+	}()
+}
+
+// ---- registry calls ------------------------------------------------------------
+
 // call runs one registry tool through the gateway and turns a tool-level
 // error (isError) into a Go error carrying the result text.
 func (s *Service) call(ctx context.Context, target string, args map[string]any) error {
+	_, err := s.callText(ctx, target, args)
+	return err
+}
+
+// callText is call plus the result's text content on success.
+func (s *Service) callText(ctx context.Context, target string, args map[string]any) (string, error) {
 	if s.caller == nil {
-		return ErrNotWired
+		return "", ErrNotWired
 	}
 	res, err := s.caller.CallInternal(ctx, ViaTool, target, args)
 	if err != nil {
-		return err
+		return "", err
 	}
 	if res == nil {
-		return errors.New("empty result")
+		return "", errors.New("empty result")
 	}
+	text := resultText(res)
 	if res.IsError {
-		msg := strings.TrimSpace(resultText(res))
+		msg := strings.TrimSpace(text)
 		if msg == "" {
 			msg = "tool returned an error"
 		}
-		return errors.New(msg)
+		return "", errors.New(msg)
 	}
-	return nil
+	return text, nil
 }
 
 func resultText(res *mcp.CallToolResult) string {

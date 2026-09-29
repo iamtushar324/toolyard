@@ -3,9 +3,11 @@ package identitykeys
 import (
 	"context"
 	"crypto/rand"
+	"encoding/json"
 	"errors"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 	"sync"
 	"testing"
@@ -29,13 +31,17 @@ type fakeCall struct {
 	Via    string
 }
 
-// fakeCaller records CallInternal calls and answers per target: an error
-// string makes the tool return isError with that text; "" succeeds.
+// fakeCaller stands in for the gateway in front of prime's registry: it
+// records every CallInternal, keeps the registered fingerprints per
+// upstream (upsert adds, delete removes and answers "not found" for an
+// unknown hash exactly as prime does, list returns them), and answers a
+// target marked failing with isError and that text.
 type fakeCaller struct {
-	mu    sync.Mutex
-	calls []fakeCall
-	fail  map[string]string // target -> error text
-	err   error             // transport error for every call
+	mu       sync.Mutex
+	calls    []fakeCall
+	fail     map[string]string // target -> error text
+	err      error             // transport error for every call
+	registry map[string]map[string]bool
 }
 
 func (f *fakeCaller) CallInternal(ctx context.Context, via, target string, args map[string]any) (*mcp.CallToolResult, error) {
@@ -48,7 +54,49 @@ func (f *fakeCaller) CallInternal(ctx context.Context, via, target string, args 
 	if msg, ok := f.fail[target]; ok {
 		return mcp.NewToolResultError(msg), nil
 	}
-	return mcp.NewToolResultText(`{"ok":true}`), nil
+	up, tool, _ := strings.Cut(target, ".")
+	if f.registry == nil {
+		f.registry = map[string]map[string]bool{}
+	}
+	if f.registry[up] == nil {
+		f.registry[up] = map[string]bool{}
+	}
+	hash, _ := args["virtualKeyHash"].(string)
+	switch tool {
+	case ToolUpsert:
+		f.registry[up][hash] = true
+		return mcp.NewToolResultText(`{"ok":true}`), nil
+	case ToolDelete:
+		if !f.registry[up][hash] {
+			return mcp.NewToolResultError("Virtual Key mapping not found"), nil
+		}
+		delete(f.registry[up], hash)
+		return mcp.NewToolResultText(`{"deleted":true}`), nil
+	case ToolList:
+		var out []map[string]string
+		for _, h := range f.hashesLocked(up) {
+			out = append(out, map[string]string{"virtualKeyHash": h})
+		}
+		b, _ := json.Marshal(out)
+		return mcp.NewToolResultText(string(b)), nil
+	}
+	return mcp.NewToolResultError("unknown tool " + target), nil
+}
+
+func (f *fakeCaller) hashesLocked(up string) []string {
+	var out []string
+	for h := range f.registry[up] {
+		out = append(out, h)
+	}
+	sort.Strings(out)
+	return out
+}
+
+// hashes is what the fake registry holds for up, sorted.
+func (f *fakeCaller) hashes(up string) []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.hashesLocked(up)
 }
 
 func (f *fakeCaller) setFail(target, msg string) {
@@ -64,12 +112,27 @@ func (f *fakeCaller) setFail(target, msg string) {
 	f.fail[target] = msg
 }
 
+// down marks every registry tool of up failing with msg ("" restores it).
+func (f *fakeCaller) down(up, msg string) {
+	for _, tool := range []string{ToolUpsert, ToolDelete, ToolList} {
+		f.setFail(up+"."+tool, msg)
+	}
+}
+
 // take returns the calls so far and clears them.
 func (f *fakeCaller) take() []fakeCall {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	out := f.calls
 	f.calls = nil
+	return out
+}
+
+func targetsOf(calls []fakeCall) []string {
+	out := make([]string, 0, len(calls))
+	for _, c := range calls {
+		out = append(out, c.Target)
+	}
 	return out
 }
 
@@ -143,6 +206,16 @@ func (e *env) auditRows(t *testing.T, eventType string) int {
 	return n
 }
 
+// auditDecisions counts identity_key.register rows with one decision.
+func (e *env) auditDecisions(t *testing.T, decision string) int {
+	t.Helper()
+	var n int
+	if err := e.db.QueryRow(`SELECT count(*) FROM audit_events WHERE event_type = ? AND decision = ?`, EventRegister, decision).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	return n
+}
+
 // auditMentions reports whether any audit row carries s in any text column.
 func (e *env) auditMentions(t *testing.T, s string) bool {
 	t.Helper()
@@ -165,6 +238,25 @@ func regByUpstream(st *Status) map[string]Registration {
 	return out
 }
 
+// pendingKeys renders pending removals as "upstream:fingerprint" sorted.
+func pendingKeys(st *Status) []string {
+	out := []string{}
+	for _, p := range st.PendingRemovals {
+		out = append(out, p.Upstream+":"+p.Fingerprint)
+	}
+	sort.Strings(out)
+	return out
+}
+
+func eq(a, b []string) bool { return strings.Join(a, ",") == strings.Join(b, ",") }
+
+// sorted returns a sorted copy (fingerprints compare lexicographically).
+func sorted(v ...string) []string {
+	out := append([]string(nil), v...)
+	sort.Strings(out)
+	return out
+}
+
 func TestIssueRevealRotateRevoke(t *testing.T) {
 	e := newEnv(t)
 	ctx := context.Background()
@@ -172,7 +264,7 @@ func TestIssueRevealRotateRevoke(t *testing.T) {
 
 	// Nothing yet.
 	st, err := e.svc.Status(ctx, uid)
-	if err != nil || st.HasKey || len(st.Registrations) != 0 {
+	if err != nil || st.HasKey || len(st.Registrations) != 0 || len(st.PendingRemovals) != 0 {
 		t.Fatalf("empty status = %+v, %v", st, err)
 	}
 	if _, err := e.svc.ForwardKey(ctx, "dashboard:"+uid); !errors.Is(err, gateway.ErrNoIdentityKey) {
@@ -199,9 +291,11 @@ func TestIssueRevealRotateRevoke(t *testing.T) {
 		t.Errorf("registrations not sorted: %+v", st.Registrations)
 	}
 	fp1 := st.Fingerprint
-	calls := e.caller.take()
-	if len(calls) != 2 || calls[0].Target != "BkCoreServices."+ToolUpsert || calls[1].Target != "BkCoreServicesProd."+ToolUpsert {
-		t.Fatalf("issue calls = %+v", calls)
+	if got := targetsOf(e.caller.take()); !eq(got, []string{"BkCoreServices." + ToolUpsert, "BkCoreServicesProd." + ToolUpsert}) {
+		t.Fatalf("issue calls = %v", got)
+	}
+	if !eq(e.caller.hashes("BkCoreServices"), []string{fp1}) || !eq(e.caller.hashes("BkCoreServicesProd"), []string{fp1}) {
+		t.Errorf("registry after issue: dev=%v prod=%v", e.caller.hashes("BkCoreServices"), e.caller.hashes("BkCoreServicesProd"))
 	}
 	if e.auditRows(t, EventIssue) != 1 || e.auditRows(t, EventRegister) != 2 {
 		t.Errorf("audit: issue=%d register=%d", e.auditRows(t, EventIssue), e.auditRows(t, EventRegister))
@@ -250,28 +344,29 @@ func TestIssueRevealRotateRevoke(t *testing.T) {
 		t.Error("raw key found in audit rows")
 	}
 
-	// Rotate: new fingerprint registered first, then the old one deleted,
-	// then the token swapped; the old key is dead at once.
+	// Rotate: the new fingerprint is registered everywhere, then the old
+	// one is deleted everywhere, then the token swapped; the old key is
+	// dead at once and nothing is pending.
 	st, err = e.svc.Provision(ctx, e.admin.ID, uid)
 	if err != nil {
 		t.Fatalf("rotate: %v", err)
 	}
-	if !st.HasKey || st.Revealed || st.Fingerprint == fp1 || !hexRE.MatchString(st.Fingerprint) {
+	if !st.HasKey || st.Revealed || st.Fingerprint == fp1 || !hexRE.MatchString(st.Fingerprint) || len(st.PendingRemovals) != 0 {
 		t.Errorf("rotated status = %+v", st)
 	}
 	fp2 := st.Fingerprint
-	calls = e.caller.take()
-	if len(calls) != 4 {
-		t.Fatalf("rotate calls = %+v", calls)
+	calls := e.caller.take()
+	if got := targetsOf(calls); !eq(got, []string{
+		"BkCoreServices." + ToolUpsert, "BkCoreServicesProd." + ToolUpsert,
+		"BkCoreServices." + ToolDelete, "BkCoreServicesProd." + ToolDelete,
+	}) {
+		t.Fatalf("rotate calls = %v", got)
 	}
-	for i, up := range []string{"BkCoreServices", "BkCoreServicesProd"} {
-		u, d := calls[2*i], calls[2*i+1]
-		if u.Target != up+"."+ToolUpsert || u.Args["virtualKeyHash"] != fp2 {
-			t.Errorf("rotate upsert %d = %+v", i, u)
-		}
-		if d.Target != up+"."+ToolDelete || d.Args["virtualKeyHash"] != fp1 || d.Args["confirm"] != true {
-			t.Errorf("rotate delete %d = %+v", i, d)
-		}
+	if calls[0].Args["virtualKeyHash"] != fp2 || calls[2].Args["virtualKeyHash"] != fp1 || calls[2].Args["confirm"] != true {
+		t.Errorf("rotate args = %+v", calls)
+	}
+	if !eq(e.caller.hashes("BkCoreServices"), []string{fp2}) || !eq(e.caller.hashes("BkCoreServicesProd"), []string{fp2}) {
+		t.Errorf("registry after rotate: dev=%v prod=%v", e.caller.hashes("BkCoreServices"), e.caller.hashes("BkCoreServicesProd"))
 	}
 	if _, err := e.id.VerifyAgentToken(ctx, key); !errors.Is(err, identity.ErrAgentTokenInvalid) {
 		t.Errorf("old key still authenticates after rotate: %v", err)
@@ -295,7 +390,7 @@ func TestIssueRevealRotateRevoke(t *testing.T) {
 	if err != nil {
 		t.Fatalf("revoke: %v", err)
 	}
-	if st.HasKey || st.Fingerprint != "" {
+	if st.HasKey || st.Fingerprint != "" || len(st.PendingRemovals) != 0 {
 		t.Errorf("revoked status = %+v", st)
 	}
 	regs = regByUpstream(st)
@@ -303,9 +398,11 @@ func TestIssueRevealRotateRevoke(t *testing.T) {
 		t.Errorf("registrations after revoke = %+v", st.Registrations)
 	}
 	calls = e.caller.take()
-	if len(calls) != 2 || calls[0].Target != "BkCoreServices."+ToolDelete || calls[0].Args["virtualKeyHash"] != fp2 ||
-		calls[1].Target != "BkCoreServicesProd."+ToolDelete {
+	if got := targetsOf(calls); !eq(got, []string{"BkCoreServices." + ToolDelete, "BkCoreServicesProd." + ToolDelete}) || calls[0].Args["virtualKeyHash"] != fp2 {
 		t.Errorf("revoke calls = %+v", calls)
+	}
+	if len(e.caller.hashes("BkCoreServices")) != 0 || len(e.caller.hashes("BkCoreServicesProd")) != 0 {
+		t.Errorf("registry not empty after revoke")
 	}
 	if _, err := e.id.VerifyAgentToken(ctx, key2); !errors.Is(err, identity.ErrAgentTokenInvalid) {
 		t.Errorf("revoked key still authenticates: %v", err)
@@ -321,6 +418,9 @@ func TestIssueRevealRotateRevoke(t *testing.T) {
 	}
 	if _, _, err := e.svc.Reveal(ctx, uid); !errors.Is(err, ErrNoKey) {
 		t.Errorf("reveal without key: %v", err)
+	}
+	if _, err := e.svc.Register(ctx, e.admin.ID, uid); !errors.Is(err, ErrNoKey) {
+		t.Errorf("register with nothing to do: %v", err)
 	}
 	if e.auditRows(t, EventRevoke) != 1 {
 		t.Error("revoke not audited")
@@ -417,10 +517,13 @@ func TestRegistrationErrorThenRetry(t *testing.T) {
 	if p := regs["BkCoreServicesProd"]; p.Status != StatusError || p.Error != "caller is not a BkAdmin" {
 		t.Errorf("prod = %+v", p)
 	}
+	if len(st.PendingRemovals) != 0 {
+		t.Errorf("pending removals after a first issue = %+v", st.PendingRemovals)
+	}
 	e.caller.take()
 
-	// Retry as another admin: idempotent upsert of the same fingerprint on
-	// every registry; the error clears.
+	// Retry: idempotent upsert of the same fingerprint on every registry;
+	// the error clears.
 	e.caller.setFail("BkCoreServicesProd."+ToolUpsert, "")
 	st2, err := e.svc.Register(ctx, e.admin.ID, uid)
 	if err != nil {
@@ -443,8 +546,8 @@ func TestRegistrationErrorThenRetry(t *testing.T) {
 		}
 	}
 
-	// A transport error is recorded the same way, and a retry without a
-	// key is ErrNoKey.
+	// A transport error is recorded the same way, and a retry with
+	// nothing to do is ErrNoKey.
 	e.caller.err = errors.New("upstream BkCoreServices: dial tcp: connection refused")
 	st3, err := e.svc.Register(ctx, e.admin.ID, uid)
 	if err != nil {
@@ -468,10 +571,138 @@ func TestRegistrationErrorThenRetry(t *testing.T) {
 	}
 }
 
-func TestRevokeRegistryFailureKeepsStaleRowAndCleansUpLater(t *testing.T) {
+// The reviewer's case: a rotate while one registry is down must not
+// orphan the old fingerprint there, through the retry, a revoke while it
+// is still down, and the eventual cleanup without a key.
+func TestRotateWithFailingUpsertNeverLosesOldFingerprint(t *testing.T) {
 	e := newEnv(t)
 	ctx := context.Background()
 	uid := e.member.ID
+	const dev, prod = "BkCoreServices", "BkCoreServicesProd"
+
+	st, err := e.svc.Issue(ctx, e.admin.ID, uid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fp1 := st.Fingerprint
+	key1, _, _ := e.svc.Reveal(ctx, uid)
+	e.caller.take()
+
+	// Prod goes away entirely.
+	e.caller.down(prod, "prod unreachable")
+	st, err = e.svc.Rotate(ctx, e.admin.ID, uid)
+	if err != nil {
+		t.Fatalf("rotate: %v", err)
+	}
+	fp2 := st.Fingerprint
+	if fp2 == fp1 {
+		t.Fatal("rotate did not change the fingerprint")
+	}
+	// Dev moved on; prod still holds fp1, which is now a pending removal
+	// with the failure recorded; the prod row says the new key isn't
+	// registered there.
+	if !eq(e.caller.hashes(dev), []string{fp2}) || !eq(e.caller.hashes(prod), []string{fp1}) {
+		t.Errorf("registry: dev=%v prod=%v", e.caller.hashes(dev), e.caller.hashes(prod))
+	}
+	regs := regByUpstream(st)
+	if regs[dev].Status != StatusRegistered || regs[prod].Status != StatusError || regs[prod].Error != "prod unreachable" {
+		t.Errorf("rows after rotate = %+v", st.Registrations)
+	}
+	if !eq(pendingKeys(st), []string{prod + ":" + fp1}) {
+		t.Fatalf("pending after rotate = %+v", st.PendingRemovals)
+	}
+	if p := st.PendingRemovals[0]; p.Error != "prod unreachable" || p.UpdatedAt == 0 {
+		t.Errorf("pending entry = %+v", p)
+	}
+	// The token swap is immediate regardless.
+	if _, err := e.id.VerifyAgentToken(ctx, key1); !errors.Is(err, identity.ErrAgentTokenInvalid) {
+		t.Error("old key still authenticates after a rotate with a registry failure")
+	}
+	if got, err := e.svc.ForwardKey(ctx, "dashboard:"+uid); err != nil || identity.HashToken(got) != fp2 {
+		t.Errorf("ForwardKey after rotate: hash match=%v err=%v", identity.HashToken(got) == fp2, err)
+	}
+
+	// Retry while prod is still down: the entry stays, nothing is lost.
+	st, err = e.svc.Register(ctx, e.admin.ID, uid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !eq(pendingKeys(st), []string{prod + ":" + fp1}) || regByUpstream(st)[prod].Status != StatusError {
+		t.Errorf("after retry while down: pending=%v rows=%+v", pendingKeys(st), st.Registrations)
+	}
+
+	// Revoke while prod is still down: the key dies locally; both prod
+	// fingerprints are pending; dev is clean.
+	st, err = e.svc.Revoke(ctx, e.admin.ID, uid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.HasKey {
+		t.Error("key kept after revoke")
+	}
+	if !eq(pendingKeys(st), sorted(prod+":"+fp1, prod+":"+fp2)) {
+		t.Errorf("pending after revoke = %v", pendingKeys(st))
+	}
+	if len(e.caller.hashes(dev)) != 0 {
+		t.Errorf("dev after revoke = %v", e.caller.hashes(dev))
+	}
+	for _, r := range st.Registrations {
+		if r.Status != StatusRevoked {
+			t.Errorf("row after revoke = %+v", r)
+		}
+	}
+	e.caller.take()
+
+	// Prod is back: Register with no key runs the pending removals as the
+	// retrying admin; fp1 and fp2 are gone from prod and nothing remains.
+	e.caller.down(prod, "")
+	st, err = e.svc.Register(ctx, e.admin.ID, uid)
+	if err != nil {
+		t.Fatalf("register without key: %v", err)
+	}
+	if st.HasKey || len(st.PendingRemovals) != 0 {
+		t.Errorf("after cleanup = %+v", st)
+	}
+	if len(e.caller.hashes(prod)) != 0 {
+		t.Errorf("prod still holds %v", e.caller.hashes(prod))
+	}
+	// fp1 was there and is deleted; fp2 never reached prod (its upsert
+	// failed), so its delete is "not found" and the list confirms it is
+	// absent. Both run as the retrying admin.
+	calls := e.caller.take()
+	deletes, lists := 0, 0
+	for _, c := range calls {
+		switch c.Target {
+		case prod + "." + ToolDelete:
+			deletes++
+		case prod + "." + ToolList:
+			lists++
+		default:
+			t.Errorf("unexpected cleanup call %s", c.Target)
+		}
+		if c.Caller != "dashboard:"+e.admin.ID {
+			t.Errorf("cleanup ran %s as %q", c.Target, c.Caller)
+		}
+	}
+	if deletes != 2 || lists != 1 {
+		t.Errorf("cleanup calls = %v", targetsOf(calls))
+	}
+	// Nothing left to do now.
+	if _, err := e.svc.Register(ctx, e.admin.ID, uid); !errors.Is(err, ErrNoKey) {
+		t.Errorf("register after cleanup: %v", err)
+	}
+	if e.auditDecisions(t, RemovalRemoved) != 3 || e.auditDecisions(t, RemovalAbsent) != 1 || e.auditDecisions(t, RemovalError) < 2 {
+		t.Errorf("removal audit: removed=%d absent=%d errors=%d",
+			e.auditDecisions(t, RemovalRemoved), e.auditDecisions(t, RemovalAbsent), e.auditDecisions(t, RemovalError))
+	}
+}
+
+func TestFailedOldHashDeleteIsRetried(t *testing.T) {
+	e := newEnv(t)
+	ctx := context.Background()
+	uid := e.member.ID
+	const dev, prod = "BkCoreServices", "BkCoreServicesProd"
+
 	st, err := e.svc.Issue(ctx, e.admin.ID, uid)
 	if err != nil {
 		t.Fatal(err)
@@ -479,60 +710,256 @@ func TestRevokeRegistryFailureKeepsStaleRowAndCleansUpLater(t *testing.T) {
 	fp1 := st.Fingerprint
 	e.caller.take()
 
-	e.caller.setFail("BkCoreServicesProd."+ToolDelete, "prod is read-only right now")
+	// Only the delete fails on dev: the new key is registered, the old
+	// fingerprint stays pending (the list still shows it).
+	e.caller.setFail(dev+"."+ToolDelete, "write lock timeout")
+	st, err = e.svc.Rotate(ctx, e.admin.ID, uid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fp2 := st.Fingerprint
+	if r := regByUpstream(st)[dev]; r.Status != StatusRegistered || r.Error != "" {
+		t.Errorf("dev row = %+v", r)
+	}
+	if !eq(pendingKeys(st), []string{dev + ":" + fp1}) || st.PendingRemovals[0].Error != "write lock timeout" {
+		t.Errorf("pending = %+v", st.PendingRemovals)
+	}
+	if got := targetsOf(e.caller.take()); !eq(got, []string{
+		dev + "." + ToolUpsert, prod + "." + ToolUpsert,
+		dev + "." + ToolDelete, dev + "." + ToolList, prod + "." + ToolDelete,
+	}) {
+		t.Errorf("rotate calls = %v", got)
+	}
+	if !eq(e.caller.hashes(dev), sorted(fp1, fp2)) {
+		t.Errorf("dev registry = %v", e.caller.hashes(dev))
+	}
+
+	// The retry deletes it.
+	e.caller.setFail(dev+"."+ToolDelete, "")
+	st, err = e.svc.Register(ctx, e.admin.ID, uid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(st.PendingRemovals) != 0 || !eq(e.caller.hashes(dev), []string{fp2}) {
+		t.Errorf("after retry: pending=%+v dev=%v", st.PendingRemovals, e.caller.hashes(dev))
+	}
+	e.caller.take()
+
+	// A fingerprint retired from an "error" row was never registered:
+	// prime answers "not found", the list confirms it is absent, and the
+	// entry resolves instead of pending forever.
+	e.caller.setFail(prod+"."+ToolUpsert, "caller is not a BkAdmin")
+	st, err = e.svc.Rotate(ctx, e.admin.ID, uid) // prod: row error(fp3); fp2 removed from prod
+	if err != nil {
+		t.Fatal(err)
+	}
+	fp3 := st.Fingerprint
+	if len(st.PendingRemovals) != 0 || len(e.caller.hashes(prod)) != 0 {
+		t.Fatalf("precondition: pending=%+v prod=%v", st.PendingRemovals, e.caller.hashes(prod))
+	}
+	e.caller.take()
+	st, err = e.svc.Rotate(ctx, e.admin.ID, uid) // prod: fp3 retired though never registered
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(st.PendingRemovals) != 0 {
+		t.Errorf("never-registered fingerprint left pending: %+v", st.PendingRemovals)
+	}
+	calls := e.caller.take()
+	var sawList bool
+	for _, c := range calls {
+		if c.Target == prod+"."+ToolList {
+			sawList = true
+		}
+		if c.Target == prod+"."+ToolDelete && c.Args["virtualKeyHash"] != fp3 {
+			t.Errorf("unexpected prod delete of %v", c.Args["virtualKeyHash"])
+		}
+	}
+	if !sawList {
+		t.Errorf("registry list not consulted after a failed delete: %v", targetsOf(calls))
+	}
+	if e.auditDecisions(t, RemovalAbsent) != 1 {
+		t.Errorf("absent outcome audited %d times", e.auditDecisions(t, RemovalAbsent))
+	}
+}
+
+func TestRevokeWithFailingDeleteThenRetryWithoutKey(t *testing.T) {
+	e := newEnv(t)
+	ctx := context.Background()
+	uid := e.member.ID
+	const dev, prod = "BkCoreServices", "BkCoreServicesProd"
+
+	st, err := e.svc.Issue(ctx, e.admin.ID, uid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fp1 := st.Fingerprint
+	e.caller.take()
+
+	e.caller.setFail(prod+"."+ToolDelete, "prod is read-only right now")
 	st, err = e.svc.Revoke(ctx, e.admin.ID, uid)
 	if err != nil {
 		t.Fatalf("revoke: %v", err)
 	}
-	// The key is gone locally whatever the registry said.
 	if st.HasKey {
 		t.Error("key kept after revoke")
 	}
 	if agents, _ := e.id.ListAgents(ctx, uid); len(agents) != 0 {
 		t.Error("identity agent kept after revoke")
 	}
-	regs := regByUpstream(st)
-	if regs["BkCoreServices"].Status != StatusRevoked {
-		t.Errorf("dev = %+v", regs["BkCoreServices"])
+	if !eq(pendingKeys(st), []string{prod + ":" + fp1}) || !strings.Contains(st.PendingRemovals[0].Error, "read-only") {
+		t.Errorf("pending after revoke = %+v", st.PendingRemovals)
 	}
-	if p := regs["BkCoreServicesProd"]; p.Status != StatusRegistered || !strings.HasPrefix(p.Error, "revoke: prod is read-only") {
-		t.Errorf("prod = %+v", p)
+	if len(e.caller.hashes(dev)) != 0 || !eq(e.caller.hashes(prod), []string{fp1}) {
+		t.Errorf("registry: dev=%v prod=%v", e.caller.hashes(dev), e.caller.hashes(prod))
 	}
 	e.caller.take()
 
-	// The next issue registers the new fingerprint and removes the stale
-	// one on prod; dev (revoked) needs no delete.
-	e.caller.setFail("BkCoreServicesProd."+ToolDelete, "")
+	// Retry without a key: not ErrNoKey while something is pending.
+	e.caller.setFail(prod+"."+ToolDelete, "")
+	st, err = e.svc.Register(ctx, e.admin.ID, uid)
+	if err != nil {
+		t.Fatalf("register without key: %v", err)
+	}
+	if st.HasKey || len(st.PendingRemovals) != 0 || len(e.caller.hashes(prod)) != 0 {
+		t.Errorf("after retry: status=%+v prod=%v", st, e.caller.hashes(prod))
+	}
+	if got := targetsOf(e.caller.take()); !eq(got, []string{prod + "." + ToolDelete}) {
+		t.Errorf("retry calls = %v", got)
+	}
+	if _, err := e.svc.Register(ctx, e.admin.ID, uid); !errors.Is(err, ErrNoKey) {
+		t.Errorf("register with nothing pending: %v", err)
+	}
+	// And a fresh issue afterwards starts clean.
 	st, err = e.svc.Issue(ctx, e.admin.ID, uid)
 	if err != nil {
 		t.Fatal(err)
 	}
-	calls := e.caller.take()
-	var targets []string
-	for _, c := range calls {
-		targets = append(targets, c.Target)
+	if !st.HasKey || len(st.PendingRemovals) != 0 || !eq(e.caller.hashes(prod), []string{st.Fingerprint}) {
+		t.Errorf("re-issue = %+v prod=%v", st, e.caller.hashes(prod))
 	}
-	want := []string{"BkCoreServices." + ToolUpsert, "BkCoreServicesProd." + ToolUpsert, "BkCoreServicesProd." + ToolDelete}
-	if strings.Join(targets, ",") != strings.Join(want, ",") {
-		t.Errorf("re-issue calls = %v, want %v", targets, want)
-	}
-	if calls[2].Args["virtualKeyHash"] != fp1 {
-		t.Errorf("stale delete hash = %v, want %s", calls[2].Args["virtualKeyHash"], fp1)
-	}
-	regs = regByUpstream(st)
-	if p := regs["BkCoreServicesProd"]; p.Status != StatusRegistered || p.Error != "" {
-		t.Errorf("prod after re-issue = %+v", p)
-	}
+}
 
-	// A failed stale delete leaves a note but the new key stays registered.
-	e.caller.take()
-	e.caller.setFail("BkCoreServices."+ToolDelete, "not found")
-	st, err = e.svc.Rotate(ctx, e.admin.ID, uid)
+func TestStatusJSONShape(t *testing.T) {
+	e := newEnv(t)
+	ctx := context.Background()
+	st, err := e.svc.Status(ctx, e.member.ID)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if p := regByUpstream(st)["BkCoreServices"]; p.Status != StatusRegistered || !strings.Contains(p.Error, "previous fingerprint not removed: not found") {
-		t.Errorf("dev after rotate with failed delete = %+v", p)
+	b, _ := json.Marshal(st)
+	var m map[string]any
+	if err := json.Unmarshal(b, &m); err != nil {
+		t.Fatal(err)
+	}
+	if regs, ok := m["registrations"].([]any); !ok || len(regs) != 0 {
+		t.Errorf("registrations = %v (want [])", m["registrations"])
+	}
+	if p, ok := m["pending_removals"].([]any); !ok || len(p) != 0 {
+		t.Errorf("pending_removals = %v (want [])", m["pending_removals"])
+	}
+	// With one pending entry the fields are exactly these.
+	if _, err := e.svc.Issue(ctx, e.admin.ID, e.member.ID); err != nil {
+		t.Fatal(err)
+	}
+	e.caller.setFail("BkCoreServices."+ToolDelete, "nope")
+	if _, err := e.svc.Revoke(ctx, e.admin.ID, e.member.ID); err != nil {
+		t.Fatal(err)
+	}
+	st, _ = e.svc.Status(ctx, e.member.ID)
+	b, _ = json.Marshal(st)
+	_ = json.Unmarshal(b, &m)
+	p, _ := m["pending_removals"].([]any)
+	if len(p) != 1 {
+		t.Fatalf("pending_removals = %v", m["pending_removals"])
+	}
+	entry, _ := p[0].(map[string]any)
+	for _, k := range []string{"upstream", "fingerprint", "error", "updated_at"} {
+		if _, ok := entry[k]; !ok {
+			t.Errorf("pending removal lacks %q: %v", k, entry)
+		}
+	}
+	if len(entry) != 4 || entry["upstream"] != "BkCoreServices" || entry["error"] != "nope" {
+		t.Errorf("pending removal = %v", entry)
+	}
+}
+
+func TestBackgroundRetryUsesRecordedAdmin(t *testing.T) {
+	e := newEnv(t)
+	ctx := context.Background()
+	uid := e.member.ID
+	const dev, prod = "BkCoreServices", "BkCoreServicesProd"
+	if _, err := e.svc.Issue(ctx, e.admin.ID, uid); err != nil {
+		t.Fatal(err)
+	}
+	// A second admin revokes while prod's delete fails: the pending entry
+	// records them.
+	e.caller.setFail(prod+"."+ToolDelete, "busy")
+	st, err := e.svc.Revoke(ctx, "u_admin2", uid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fp := st.PendingRemovals[0].Fingerprint
+	e.caller.take()
+
+	// No registries configured: the pass does nothing at all.
+	e.svc.SetRegistries(nil)
+	if resolved, remaining, err := e.svc.RetryRemovals(ctx); err != nil || resolved != 0 || remaining != 0 || len(e.caller.take()) != 0 {
+		t.Errorf("pass without registries: %d %d %v", resolved, remaining, err)
+	}
+	e.svc.SetRegistries(RegistryListerFunc(func(context.Context) ([]string, error) { return []string{}, nil }))
+	if _, _, _ = e.svc.RetryRemovals(ctx); len(e.caller.take()) != 0 {
+		t.Error("pass with an empty registry list called the gateway")
+	}
+	e.svc.SetRegistries(RegistryListerFunc(func(context.Context) ([]string, error) { return []string{dev, prod}, nil }))
+
+	// Still failing: the pass reports it and keeps the entry.
+	resolved, remaining, err := e.svc.RetryRemovals(ctx)
+	if err != nil || resolved != 0 || remaining != 1 {
+		t.Errorf("pass while failing = %d %d %v", resolved, remaining, err)
+	}
+	calls := e.caller.take()
+	for _, c := range calls {
+		if c.Caller != "dashboard:u_admin2" {
+			t.Errorf("background pass ran %s as %q, want the recorded admin", c.Target, c.Caller)
+		}
+	}
+	// Recovered: the ticker's pass resolves it as that admin.
+	e.caller.setFail(prod+"."+ToolDelete, "")
+	tctx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	e.svc.StartRemovalRetry(tctx, 10*time.Millisecond)
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if st, _ := e.svc.Status(ctx, uid); len(st.PendingRemovals) == 0 {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	cancel()
+	if st, _ := e.svc.Status(ctx, uid); len(st.PendingRemovals) != 0 {
+		t.Fatalf("background retry did not resolve the removal: %+v", st.PendingRemovals)
+	}
+	if e.caller.registry[prod][fp] {
+		t.Error("prod still holds the revoked fingerprint")
+	}
+	for _, c := range e.caller.take() {
+		if c.Caller != "dashboard:u_admin2" {
+			t.Errorf("ticker pass ran %s as %q", c.Target, c.Caller)
+		}
+	}
+	// An entry without a recorded admin is left alone, with the reason.
+	if err := e.svc.retire(ctx, dev, strings.Repeat("a", 64), uid, "", "orphan"); err != nil {
+		t.Fatal(err)
+	}
+	if _, remaining, _ := e.svc.RetryRemovals(ctx); remaining != 1 {
+		t.Errorf("entry without admin: remaining=%d", remaining)
+	}
+	if st, _ := e.svc.Status(ctx, uid); len(st.PendingRemovals) != 1 || !errors.Is(errNoActor, errNoActor) || st.PendingRemovals[0].Error != errNoActor.Error() {
+		t.Errorf("entry without admin = %+v", st.PendingRemovals)
+	}
+	if len(e.caller.take()) != 0 {
+		t.Error("gateway called for an entry with no admin")
 	}
 }
 

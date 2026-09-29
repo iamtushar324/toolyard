@@ -4,12 +4,15 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/json"
+	"errors"
 	"net/http"
+	"strings"
 	"sync"
 	"testing"
 
 	"github.com/mark3labs/mcp-go/mcp"
 
+	"github.com/tusharbhardwaj/toolyard/internal/clerk"
 	"github.com/tusharbhardwaj/toolyard/internal/gateway"
 	"github.com/tusharbhardwaj/toolyard/internal/identity"
 	"github.com/tusharbhardwaj/toolyard/internal/identitykeys"
@@ -17,16 +20,18 @@ import (
 )
 
 // registryFake stands in for the gateway behind the identity key service:
-// it records each registry call's target and caller and succeeds unless a
-// target is marked failing.
+// it records each registry call's target and caller, keeps the registered
+// fingerprints (delete of an unknown hash is "not found", list returns
+// them, as prime does) and fails a target that is marked failing.
 type registryFake struct {
 	mu      sync.Mutex
 	targets []string
 	callers []string
 	fail    map[string]bool
+	hashes  map[string]bool
 }
 
-func (f *registryFake) CallInternal(ctx context.Context, _, target string, _ map[string]any) (*mcp.CallToolResult, error) {
+func (f *registryFake) CallInternal(ctx context.Context, _, target string, args map[string]any) (*mcp.CallToolResult, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.targets = append(f.targets, target)
@@ -34,7 +39,33 @@ func (f *registryFake) CallInternal(ctx context.Context, _, target string, _ map
 	if f.fail[target] {
 		return mcp.NewToolResultError("registry says no"), nil
 	}
+	if f.hashes == nil {
+		f.hashes = map[string]bool{}
+	}
+	hash, _ := args["virtualKeyHash"].(string)
+	_, tool, _ := strings.Cut(target, ".")
+	switch tool {
+	case identitykeys.ToolUpsert:
+		f.hashes[hash] = true
+	case identitykeys.ToolDelete:
+		if !f.hashes[hash] {
+			return mcp.NewToolResultError("Virtual Key mapping not found"), nil
+		}
+		delete(f.hashes, hash)
+	case identitykeys.ToolList:
+		var b strings.Builder
+		for h := range f.hashes {
+			b.WriteString(`{"virtualKeyHash":"` + h + `"},`)
+		}
+		return mcp.NewToolResultText("[" + strings.TrimSuffix(b.String(), ",") + "]"), nil
+	}
 	return mcp.NewToolResultText(`{"ok":true}`), nil
+}
+
+func (f *registryFake) has(hash string) bool {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.hashes[hash]
 }
 
 func (f *registryFake) take() (targets, callers []string) {
@@ -358,5 +389,89 @@ func TestAgentsListShowsIdentityAgentAndRefusesActions(t *testing.T) {
 	}
 	if rec := e.do(t, mCookie, http.MethodGet, "/v1/me/identity-key", ""); !decodeStatus(t, rec.Body.Bytes()).HasKey {
 		t.Error("identity key lost after refused agent actions")
+	}
+}
+
+// A revoke whose registry delete failed leaves a pending removal; the
+// admin's Retry runs it even though the user has no key any more.
+func TestIdentityKeyRegisterRunsPendingRemovalsWithoutKey(t *testing.T) {
+	e := newAccessTestServer(t)
+	reg := withIdentityKeys(t, e)
+	admin := e.cookieFor(t, e.admin.ID)
+	m := e.member(t, "user_m", "mira@beknown.work")
+	path := "/v1/users/" + m.ID + "/identity-key"
+
+	rec := e.do(t, admin, http.MethodPost, path, "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("provision: %d %s", rec.Code, rec.Body.String())
+	}
+	fp := decodeStatus(t, rec.Body.Bytes()).Fingerprint
+	if st := decodeStatus(t, rec.Body.Bytes()); st.PendingRemovals == nil || len(st.PendingRemovals) != 0 {
+		t.Errorf("pending_removals after issue = %s", rec.Body.String())
+	}
+
+	reg.fail["BkCoreServices."+identitykeys.ToolDelete] = true
+	if rec := e.do(t, admin, http.MethodDelete, path, ""); rec.Code != http.StatusOK {
+		t.Fatalf("revoke: %d %s", rec.Code, rec.Body.String())
+	}
+	rec = e.do(t, e.cookieFor(t, m.ID), http.MethodGet, "/v1/me/identity-key", "")
+	st := decodeStatus(t, rec.Body.Bytes())
+	if st.HasKey || len(st.PendingRemovals) != 1 || st.PendingRemovals[0].Upstream != "BkCoreServices" ||
+		st.PendingRemovals[0].Fingerprint != fp || st.PendingRemovals[0].Error != "registry says no" || st.PendingRemovals[0].UpdatedAt == 0 {
+		t.Fatalf("status after failed revoke = %s", rec.Body.String())
+	}
+	if !reg.has(fp) {
+		t.Fatal("precondition: registry no longer holds the fingerprint")
+	}
+	for _, row := range e.listUsers(t, admin).Users {
+		if row["id"] != m.ID {
+			continue
+		}
+		ik, _ := row["identity_key"].(map[string]any)
+		if p, _ := ik["pending_removals"].([]any); len(p) != 1 {
+			t.Errorf("Users page pending_removals = %v", ik["pending_removals"])
+		}
+	}
+
+	// Retry with no key: 200, and the fingerprint leaves the registry.
+	delete(reg.fail, "BkCoreServices."+identitykeys.ToolDelete)
+	rec = e.do(t, admin, http.MethodPost, path+"/register", "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("register without key: %d %s", rec.Code, rec.Body.String())
+	}
+	if st := decodeStatus(t, rec.Body.Bytes()); st.HasKey || len(st.PendingRemovals) != 0 {
+		t.Errorf("status after cleanup = %s", rec.Body.String())
+	}
+	if reg.has(fp) {
+		t.Error("registry still holds the revoked fingerprint")
+	}
+	// Nothing pending and no key: back to no_key.
+	if rec := e.do(t, admin, http.MethodPost, path+"/register", ""); rec.Code != http.StatusNotFound || decodeJSON(t, rec)["error"] != "no_key" {
+		t.Errorf("register with nothing to do: %d %s", rec.Code, rec.Body.String())
+	}
+}
+
+// The Clerk org sync blocking a leaver must stop their key being forwarded
+// at once, not when the resolver's cache expires.
+func TestClerkSyncBlockInvalidatesIdentityKeyCache(t *testing.T) {
+	e := newAccessTestServer(t)
+	withIdentityKeys(t, e)
+	ctx := context.Background()
+	left := e.member(t, "user_left", "left@beknown.work")
+	if _, err := e.srv.identityKeys.Issue(ctx, e.admin.ID, left.ID); err != nil {
+		t.Fatal(err)
+	}
+	// Prime the cache the way a tool call would.
+	if _, err := e.srv.identityKeys.ForwardKey(ctx, "dashboard:"+left.ID); err != nil {
+		t.Fatalf("precondition: %v", err)
+	}
+	e.clerk.set(func(f *fakeClerk) {
+		f.members = map[string]clerk.Member{"user_stay": {IsMember: true}}
+	})
+	if n := e.srv.runClerkSync(ctx); n != 1 {
+		t.Fatalf("blocked = %d, want 1", n)
+	}
+	if _, err := e.srv.identityKeys.ForwardKey(ctx, "dashboard:"+left.ID); !errors.Is(err, gateway.ErrNoIdentityKey) {
+		t.Errorf("leaver's key still forwarded right after the sync: %v", err)
 	}
 }

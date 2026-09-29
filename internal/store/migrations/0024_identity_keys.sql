@@ -34,5 +34,22 @@ CREATE TABLE IF NOT EXISTS identity_key_registrations (
     PRIMARY KEY (user_id, upstream)
 );
 
+-- Fingerprints that must leave a registry: superseded by a rotate or
+-- revoked, but not yet deleted there. A row leaves this table only once
+-- delete-bifrost-virtual-key-actor succeeded (or the registry's list no
+-- longer shows the hash); Register and the background retry keep trying as
+-- the retrying admin or the recorded by_user. No cascade on user_id: a
+-- removed user's fingerprint still has to go.
+CREATE TABLE IF NOT EXISTS identity_key_retired (
+    upstream   TEXT NOT NULL,
+    key_hash   TEXT NOT NULL,
+    user_id    TEXT NOT NULL,
+    by_user    TEXT,
+    error      TEXT,
+    updated_at INTEGER NOT NULL,
+    PRIMARY KEY (upstream, key_hash)
+);
+CREATE INDEX IF NOT EXISTS idx_identity_key_retired_user ON identity_key_retired(user_id);
+
 -- Per-server identity forwarding: {"header": "x-bk-bifrost-vk", "register": true}.
 ALTER TABLE upstream_servers ADD COLUMN identity_json TEXT;

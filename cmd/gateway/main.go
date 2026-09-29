@@ -653,6 +653,9 @@ func runServe(argv []string) error {
 		}
 		return registryUpstreams(servers), nil
 	}))
+	// Fingerprints retired by a rotate or revoke whose registry delete
+	// failed are retried hourly, each as the admin who retired it.
+	identityKeysSvc.StartRemovalRetry(ctx, identitykeys.DefaultRetryInterval)
 	if *noStdioUpstreams {
 		log.Printf("toolyard: stdio upstreams disabled (--no-stdio-upstreams)")
 	}
