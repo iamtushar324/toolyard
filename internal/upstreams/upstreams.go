@@ -26,6 +26,16 @@ var (
 	ErrReserved    = errors.New("server name is reserved")
 )
 
+// IdentityForwarding is a server's per-person identity setting.
+type IdentityForwarding struct {
+	// Header carries the caller's raw identity key on tools/call only,
+	// e.g. "x-bk-bifrost-vk" for BkCoreServices and BkDocsServices.
+	Header string `json:"header"`
+	// Register marks the server where toolyard registers each key's
+	// fingerprint (it exposes upsert-/delete-bifrost-virtual-key-actor).
+	Register bool `json:"register,omitempty"`
+}
+
 // Server is one persisted upstream config and its current connection status.
 type Server struct {
 	Name      string            `json:"name"`
@@ -38,13 +48,17 @@ type Server struct {
 	// headers_json. Values may be secret:// refs (resolved at dial time)
 	// and are merged with OAuth-provided headers — OAuth wins on a clash
 	// (e.g. Authorization).
-	Headers    map[string]string `json:"headers,omitempty"`
-	Enabled    bool              `json:"enabled"`
-	LastStatus string            `json:"last_status,omitempty"`
-	LastError  string            `json:"last_error,omitempty"`
-	ToolCount  int               `json:"tool_count"`
-	CreatedAt  int64             `json:"created_at"`
-	UpdatedAt  int64             `json:"updated_at"`
+	Headers map[string]string `json:"headers,omitempty"`
+	// Identity, when set on an http server, forwards the caller's
+	// per-person identity key on every tool call. Persisted in
+	// identity_json.
+	Identity   *IdentityForwarding `json:"identity,omitempty"`
+	Enabled    bool                `json:"enabled"`
+	LastStatus string              `json:"last_status,omitempty"`
+	LastError  string              `json:"last_error,omitempty"`
+	ToolCount  int                 `json:"tool_count"`
+	CreatedAt  int64               `json:"created_at"`
+	UpdatedAt  int64               `json:"updated_at"`
 	// EnvPlaintextKeys is populated only by Masked(): the env keys whose
 	// values were masked (i.e. plaintext, not secret:// refs) so the UI can
 	// offer a "convert to secret" action. Never persisted.

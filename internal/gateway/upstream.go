@@ -43,6 +43,12 @@ type UpstreamConfig struct {
 	// (naming the missing secret). Because resume() re-dials with the
 	// stored cfg, secret rotation applies automatically on next reconnect.
 	EnvFunc func(ctx context.Context) (map[string]string, error) `json:"-"`
+
+	// IdentityHeader, when non-empty on an http transport, names the header
+	// that carries the caller's per-person identity key (see
+	// IdentityResolver) on every tools/call. A call whose caller has no key
+	// is refused. initialize, tools/list and reconnects never carry it.
+	IdentityHeader string `json:"identity_header,omitempty"`
 }
 
 type upstream struct {

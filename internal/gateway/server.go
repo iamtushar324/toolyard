@@ -135,6 +135,7 @@ type Gateway struct {
 	maxPendingPerAgent  int
 	upstreamCallTimeout time.Duration
 	access              access.Resolver
+	identity            IdentityResolver
 
 	// inbox, when set, backs the inbox.* tools and grant redemption.
 	// approvalMode returns "inbox" (restricted calls are coached towards
@@ -219,6 +220,10 @@ type Options struct {
 	// Access, when set, limits each caller to the tool groups its dashboard
 	// user may use (admins: everything). nil leaves every tool reachable.
 	Access access.Resolver
+	// Identity, when set, supplies the caller's per-person key for
+	// upstreams whose UpstreamConfig sets IdentityHeader. nil refuses every
+	// call to such an upstream.
+	Identity IdentityResolver
 }
 
 // UsageRecorder is satisfied by *internal/usage.Service. The gateway only
@@ -278,6 +283,7 @@ func New(opts Options) *Gateway {
 		maxPendingPerAgent:  opts.MaxPendingPerAgent,
 		upstreamCallTimeout: opts.UpstreamCallTimeout,
 		access:              opts.Access,
+		identity:            opts.Identity,
 		tools:               map[string]toolEntry{},
 		upstreams:           map[string]*upstream{},
 	}

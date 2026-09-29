@@ -56,6 +56,7 @@ import (
 	"github.com/tusharbhardwaj/toolyard/internal/gateway"
 	"github.com/tusharbhardwaj/toolyard/internal/hooks"
 	"github.com/tusharbhardwaj/toolyard/internal/identity"
+	"github.com/tusharbhardwaj/toolyard/internal/identitykeys"
 	"github.com/tusharbhardwaj/toolyard/internal/inbox"
 	"github.com/tusharbhardwaj/toolyard/internal/marketplace"
 	"github.com/tusharbhardwaj/toolyard/internal/memory"
@@ -109,6 +110,7 @@ type Server struct {
 	inbox                    *inbox.Service
 	snapshots                *inbox.Snapshotter
 	passkeys                 *passkey.Service
+	identityKeys             *identitykeys.Service
 	guide                    *inbox.Guide
 	notes                    *notes.Service
 	skills                   *skills.Service
@@ -201,6 +203,9 @@ type Options struct {
 	Guide     *inbox.Guide
 	// Passkeys confirm high-risk approvals (/v1/passkeys/*). Optional.
 	Passkeys *passkey.Service
+	// IdentityKeys, when set, enables the per-person identity key routes
+	// (issue, reveal once, rotate, revoke, registry status). Optional.
+	IdentityKeys *identitykeys.Service
 	// WebhookMaxBytes caps the memory-webhook ingest body. 0 falls back to
 	// the default (25 MiB).
 	WebhookMaxBytes int64
@@ -249,6 +254,7 @@ func New(ctx context.Context, opts Options) *Server {
 		inbox:                    opts.Inbox,
 		snapshots:                opts.Snapshots,
 		passkeys:                 opts.Passkeys,
+		identityKeys:             opts.IdentityKeys,
 		guide:                    opts.Guide,
 		webhookMaxBytes:          opts.WebhookMaxBytes,
 		sessionKey:               opts.SessionKey,
@@ -383,6 +389,7 @@ func (s *Server) Routes(mux *http.ServeMux) {
 	s.voiceRoutes(mux)
 	s.inboxRoutes(mux)
 	s.passkeyRoutes(mux)
+	s.identityKeyRoutes(mux)
 }
 
 // ---- helpers ----------------------------------------------------------------
