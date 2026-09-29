@@ -126,6 +126,8 @@ func TestDecide_LegacyStringMapping(t *testing.T) {
 		{"tester", actor.Decider{UserID: "tester", Via: actor.ViaDashboard}},
 		{"agent_cancel:ag_2", actor.Decider{Via: actor.ViaAgentCancel, Ref: "ag_2"}},
 		{"auto_rule:ar_2", actor.Decider{Via: actor.ViaAutoRule, Ref: "ar_2"}},
+		{"policy:pol_1", actor.Decider{Via: actor.ViaPolicy, Ref: "pol_1"}},
+		{"expiry", actor.Decider{Via: actor.ViaExpiry}},
 	}
 	for _, c := range cases {
 		if got := DeciderFromLegacy(c.in); got != c.want {
@@ -176,8 +178,12 @@ func (ownedAuto) MarkHit(ctx context.Context, ruleID, agentID string)           
 func (ownedAuto) MarkDenial(ctx context.Context, agentID, toolName, fingerprint string) {}
 func (ownedAuto) IsDestructive(ctx context.Context, toolName string) bool               { return false }
 
-func TestAutoRule_DeciderCarriesRuleAndCreator(t *testing.T) {
+// An auto-approval is decided by the rule, never by the person who
+// installed it: decided_by keeps the historical "rule:<id>" whether or not
+// the rule has a creator, and AutoDecidedBy is set on every read.
+func TestAutoRule_DeciderIsTheRuleNotItsCreator(t *testing.T) {
 	ctx := context.Background()
+	want := actor.Decider{Via: actor.ViaAutoRule, Ref: "rule-owned"}
 	for _, creator := range []string{"u_creator", ""} {
 		bus := newTestBus(t)
 		bus.SetAutoApprover(ownedAuto{createdBy: creator})
@@ -185,17 +191,82 @@ func TestAutoRule_DeciderCarriesRuleAndCreator(t *testing.T) {
 		if req.Status != StatusAllowed || req.AutoDecidedBy != "rule-owned" {
 			t.Fatalf("creator=%q: status=%q auto=%q, want allowed by rule-owned", creator, req.Status, req.AutoDecidedBy)
 		}
-		want := actor.Decider{UserID: creator, Via: actor.ViaAutoRule, Ref: "rule-owned"}
-		if req.Decider() != want {
-			t.Errorf("creator=%q: Hold Decider() = %+v, want %+v", creator, req.Decider(), want)
+		if req.Decider() != want || req.DecidedBy != "rule:rule-owned" {
+			t.Errorf("creator=%q: Hold Decider() = %+v decided_by=%q, want %+v / rule:rule-owned", creator, req.Decider(), req.DecidedBy, want)
 		}
-		got, _ := bus.Get(ctx, req.ID)
-		if got.Decider() != want || got.DecidedBy != want.Legacy() {
-			t.Errorf("creator=%q: Get Decider() = %+v (decided_by %q), want %+v", creator, got.Decider(), got.DecidedBy, want)
+		for name, get := range map[string]func() (*Request, error){
+			"Get": func() (*Request, error) { return bus.Get(ctx, req.ID) },
+			"Recent": func() (*Request, error) {
+				rows, err := bus.Recent(ctx, 10)
+				if err != nil || len(rows) != 1 {
+					return nil, err
+				}
+				return &rows[0], nil
+			},
+		} {
+			got, err := get()
+			if err != nil || got == nil {
+				t.Fatalf("creator=%q: %s: %v", creator, name, err)
+			}
+			if got.Decider() != want || got.DecidedBy != "rule:rule-owned" || got.AutoDecidedBy != "rule-owned" {
+				t.Errorf("creator=%q: %s: decider=%+v decided_by=%q auto=%q", creator, name, got.Decider(), got.DecidedBy, got.AutoDecidedBy)
+			}
+			if got.RaisedBy == nil || got.RaisedBy.OwnerUserID != "u_owner" {
+				t.Errorf("creator=%q: %s: RaisedBy lost on auto decide", creator, name)
+			}
 		}
-		if got.RaisedBy == nil || got.RaisedBy.OwnerUserID != "u_owner" {
-			t.Errorf("creator=%q: RaisedBy lost on auto decide", creator)
+	}
+}
+
+// Rows written before the decider columns existed carry "rule:<id>" in
+// decided_by; reads derive AutoDecidedBy from that too. Human decisions
+// never set it.
+func TestAutoDecidedBy_DerivedOnReadForLegacyAndHumanRows(t *testing.T) {
+	bus := newTestBus(t)
+	ctx := context.Background()
+	legacy := holdPending(t, bus, "tool.legacy.rule")
+	if _, err := bus.db.ExecContext(ctx,
+		`UPDATE approval_requests SET status = ?, decided_by = 'rule:ar_old', decided_via = NULL, decider_ref = NULL WHERE id = ?`,
+		StatusAllowed, legacy.ID); err != nil {
+		t.Fatalf("seed legacy row: %v", err)
+	}
+	got, err := bus.Get(ctx, legacy.ID)
+	if err != nil {
+		t.Fatalf("get: %v", err)
+	}
+	if got.AutoDecidedBy != "ar_old" || got.Decider() != (actor.Decider{Via: actor.ViaAutoRule, Ref: "ar_old"}) {
+		t.Errorf("legacy rule row: auto=%q decider=%+v", got.AutoDecidedBy, got.Decider())
+	}
+
+	human := holdPending(t, bus, "tool.human")
+	if _, err := bus.DecideAs(ctx, human.ID, StatusAllowed, actor.Decider{UserID: "u_1", Via: actor.ViaDashboard}); err != nil {
+		t.Fatalf("decide: %v", err)
+	}
+	if got, _ := bus.Get(ctx, human.ID); got.AutoDecidedBy != "" {
+		t.Errorf("human decision reads as auto: %q", got.AutoDecidedBy)
+	}
+}
+
+// Machine instruments round-trip through the legacy column exactly; a
+// person instrument keeps the user id (its Via lives in decided_via).
+func TestDecide_LegacyRoundTrip(t *testing.T) {
+	for _, d := range []actor.Decider{
+		{Via: actor.ViaAutoRule, Ref: "ar_1"},
+		{Via: actor.ViaAgentCancel, Ref: "ag_1"},
+		{Via: actor.ViaPolicy, Ref: "pol_1"},
+		{Via: actor.ViaExpiry},
+		{Via: actor.ViaTelegram, Ref: "123"},
+		{Via: actor.ViaPushToken},
+		{UserID: "u_1", Via: actor.ViaDashboard},
+	} {
+		if got := DeciderFromLegacy(d.Legacy()); got != d {
+			t.Errorf("DeciderFromLegacy(%q) = %+v, want %+v", d.Legacy(), got, d)
 		}
+	}
+	// The creator on an auto-rule Decider is dropped by the legacy column.
+	withCreator := actor.Decider{UserID: "u_c", Via: actor.ViaAutoRule, Ref: "ar_1"}
+	if got := DeciderFromLegacy(withCreator.Legacy()); got != (actor.Decider{Via: actor.ViaAutoRule, Ref: "ar_1"}) {
+		t.Errorf("auto rule with creator: %+v", got)
 	}
 }
 

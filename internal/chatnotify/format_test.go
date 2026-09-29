@@ -23,6 +23,7 @@ func TestDeciderLabel(t *testing.T) {
 		{"passkey", actor.Decider{Name: "Ada", Via: actor.ViaPasskey, Ref: "cred_1"}, "Ada via passkey"},
 		{"telegram, mapped to a person", actor.Decider{Name: "Ada", Via: actor.ViaTelegram, Ref: "12345"}, "Ada via Telegram"},
 		{"telegram, unmapped", actor.Decider{Via: actor.ViaTelegram, Ref: "12345"}, "Telegram user 12345"},
+		{"telegram, named by the gateway", actor.Decider{Name: "Telegram user 12345", Via: actor.ViaTelegram, Ref: "12345"}, "Telegram user 12345"},
 		{"auto rule", actor.Decider{Via: actor.ViaAutoRule, Ref: "ar_9"}, "auto-approval rule ar_9"},
 		{"auto rule with creator", actor.Decider{UserID: "u_1", Via: actor.ViaAutoRule, Ref: "ar_9"}, "u_1 via auto-approval rule ar_9"},
 		{"policy", actor.Decider{Via: actor.ViaPolicy, Ref: "v0.1-default-write"}, "policy v0.1-default-write"},

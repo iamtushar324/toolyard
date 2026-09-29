@@ -22,11 +22,13 @@ func DeciderFromLegacy(decidedBy string) actor.Decider {
 		return actor.Decider{Via: actor.ViaExpiry}
 	}
 	if via, ref, ok := strings.Cut(decidedBy, ":"); ok {
+		switch via + ":" {
+		case actor.LegacyAutoRulePrefix:
+			return actor.Decider{Via: actor.ViaAutoRule, Ref: ref}
+		}
 		switch via {
 		case "telegram":
 			return actor.Decider{Via: actor.ViaTelegram, Ref: ref}
-		case "rule":
-			return actor.Decider{Via: actor.ViaAutoRule, Ref: ref}
 		case "agent":
 			return actor.Decider{Via: actor.ViaAgentCancel, Ref: ref}
 		case actor.ViaDashboard, actor.ViaDashboardBatch, actor.ViaPushToken, actor.ViaPasskey,

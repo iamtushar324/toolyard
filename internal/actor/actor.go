@@ -68,12 +68,34 @@ const (
 	ViaExpiry         = "expiry"
 )
 
-// Legacy is the value for the historical free-text decided_by column: the
-// user id when a person decided, else "<via>:<ref>" (or just "<via>").
+// LegacyAutoRulePrefix is the historical decided_by form of an
+// auto-approval rule decision, "rule:<rule id>".
+const LegacyAutoRulePrefix = "rule:"
+
+// Legacy is the value for the historical free-text decided_by column. A
+// person instrument (dashboard, dashboard_batch, push_token, passkey,
+// telegram, inbox_grant) yields the user id when one is known, else
+// "<via>:<ref>" or "<via>". A machine instrument (auto_rule, policy,
+// agent_cancel, expiry) never yields a user id, so an auto-approval is
+// not mistaken for a person's click: auto_rule keeps the historical
+// "rule:<id>", the others are "<via>:<ref>" or "<via>".
 func (d Decider) Legacy() string {
+	switch d.Via {
+	case ViaAutoRule:
+		if d.Ref != "" {
+			return LegacyAutoRulePrefix + d.Ref
+		}
+		return d.Via
+	case ViaPolicy, ViaAgentCancel, ViaExpiry:
+		return d.viaRef()
+	}
 	if d.UserID != "" {
 		return d.UserID
 	}
+	return d.viaRef()
+}
+
+func (d Decider) viaRef() string {
 	if d.Ref != "" {
 		return d.Via + ":" + d.Ref
 	}

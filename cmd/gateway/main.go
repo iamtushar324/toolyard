@@ -720,15 +720,11 @@ func runServe(argv []string) error {
 		Settings: settingsSvc,
 		Cipher:   secretsCipher,
 		Decide: func(ctx context.Context, id, action, decidedBy string) (string, bool, error) {
-			// The paired Telegram user is the instrument; the person is
-			// the owner when -owner-email names one with an account.
-			var owner *identity.User
-			if *ownerEmail != "" {
-				if u, err := idSvc.GetUserByEmail(ctx, *ownerEmail); err == nil {
-					owner = u
-				}
-			}
-			req, derr := bus.DecideAs(ctx, id, action, telegramDecider(decidedBy, owner))
+			// The paired Telegram user is the instrument and the only
+			// identity recorded: nothing links a Telegram id to a
+			// toolyard user, so no person is attributed. See
+			// telegramDecider.
+			req, derr := bus.DecideAs(ctx, id, action, telegramDecider(decidedBy))
 			if derr != nil {
 				if errors.Is(derr, approval.ErrNotPending) {
 					return "", true, nil

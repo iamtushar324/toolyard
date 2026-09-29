@@ -77,7 +77,9 @@ func TestMCPAuthVerifiesOnceAndBuildsRaiser(t *testing.T) {
 	p := newMCPAuthProbe(false, "10.0.0.0/8")
 
 	// Bearer through the trusted proxy: the forwarded IP is the client,
-	// the T3 session header is the proxy's word.
+	// but the T3 session header is still the caller's claim (Traefik and
+	// socat pass client headers through unchanged, so any public caller
+	// could set it).
 	rec := p.do(mcpReq("10.0.0.7:5000", map[string]string{
 		"Authorization":     "Bearer ag_1.good",
 		"X-Forwarded-For":   "203.0.113.9, 10.0.0.7",
@@ -94,7 +96,7 @@ func TestMCPAuthVerifiesOnceAndBuildsRaiser(t *testing.T) {
 	want := actor.Raiser{
 		CallerID: "ag_1", AgentName: "claude-cloud-3", AgentKind: "agent",
 		OwnerUserID: "u_1", OwnerEmail: "ada@beknown.work", OwnerName: "Ada Lovelace",
-		MCPSessionID: "mcp_abc", ClientSessionID: "thr_42", ClientSessionClaimed: false,
+		MCPSessionID: "mcp_abc", ClientSessionID: "thr_42", ClientSessionClaimed: true,
 		ClientKind: "t3", ClientIP: "203.0.113.9",
 	}
 	if p.raiser != want {
@@ -202,18 +204,24 @@ func TestInboxTapToken(t *testing.T) {
 	}
 }
 
+// A Telegram button records the paired Telegram user as the instrument
+// and names it as such; no toolyard user is attributed, because the
+// pairing stores no link from a Telegram id to a person.
 func TestTelegramDecider(t *testing.T) {
-	unmapped := telegramDecider("telegram:12345", nil)
-	if unmapped != (actor.Decider{Via: actor.ViaTelegram, Ref: "12345"}) {
-		t.Fatalf("unmapped = %+v", unmapped)
+	got := telegramDecider("telegram:12345")
+	want := actor.Decider{Name: "Telegram user 12345", Via: actor.ViaTelegram, Ref: "12345"}
+	if got != want {
+		t.Fatalf("telegramDecider = %+v, want %+v", got, want)
 	}
-	owner := &identity.User{ID: "u_1", Username: "ada", Email: "ada@beknown.work", DisplayName: "Ada Lovelace"}
-	mapped := telegramDecider("telegram:12345", owner)
-	want := actor.Decider{UserID: "u_1", Email: "ada@beknown.work", Name: "Ada Lovelace", Via: actor.ViaTelegram, Ref: "12345"}
-	if mapped != want {
-		t.Fatalf("mapped = %+v, want %+v", mapped, want)
+	if got.UserID != "" || got.Email != "" {
+		t.Fatalf("a Telegram tap must not be attributed to a toolyard user: %+v", got)
 	}
-	if mapped.Legacy() != "u_1" || unmapped.Legacy() != "telegram:12345" {
-		t.Fatalf("legacy decided_by: %q / %q", mapped.Legacy(), unmapped.Legacy())
+	if got.Legacy() != "telegram:12345" {
+		t.Fatalf("legacy decided_by = %q", got.Legacy())
+	}
+	// A malformed value still records the route without inventing a
+	// person or a name.
+	if odd := telegramDecider("telegram:"); odd.UserID != "" || odd.Name != "" || odd.Via != actor.ViaTelegram {
+		t.Fatalf("malformed = %+v", odd)
 	}
 }

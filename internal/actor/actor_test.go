@@ -8,12 +8,23 @@ import (
 
 func TestLegacy(t *testing.T) {
 	cases := map[Decider]string{
-		{UserID: "u_1", Via: ViaDashboard}: "u_1",
-		{Via: ViaAutoRule, Ref: "ar_9"}:    "auto_rule:ar_9",
-		{Via: ViaTelegram, Ref: "12345"}:   "telegram:12345",
-		{Via: ViaExpiry}:                   "expiry",
-		{UserID: "u_2", Via: ViaPushToken}: "u_2",
-		{Via: ViaAgentCancel, Ref: "ag_x"}: "agent_cancel:ag_x",
+		// Person instruments: the user id when known.
+		{UserID: "u_1", Via: ViaDashboard}:                 "u_1",
+		{UserID: "u_2", Via: ViaPushToken}:                 "u_2",
+		{UserID: "u_3", Via: ViaPasskey, Ref: "cred_1"}:    "u_3",
+		{UserID: "u_4", Via: ViaTelegram, Ref: "12345"}:    "u_4",
+		{UserID: "u_5", Via: ViaInboxGrant, Ref: "gr_1"}:   "u_5",
+		{UserID: "u_6", Via: ViaDashboardBatch, Ref: "b1"}: "u_6",
+		{Via: ViaTelegram, Ref: "12345"}:                   "telegram:12345",
+		{Via: ViaPushToken}:                                "push_token",
+		// Machine instruments: never a user id, even when one is set.
+		{Via: ViaAutoRule, Ref: "ar_9"}:                      "rule:ar_9",
+		{UserID: "u_creator", Via: ViaAutoRule, Ref: "ar_9"}: "rule:ar_9",
+		{Via: ViaAutoRule}:                                   "auto_rule",
+		{Via: ViaPolicy, Ref: "pol_1"}:                       "policy:pol_1",
+		{UserID: "u_x", Via: ViaAgentCancel, Ref: "ag_x"}:    "agent_cancel:ag_x",
+		{Via: ViaAgentCancel, Ref: "ag_x"}:                   "agent_cancel:ag_x",
+		{Via: ViaExpiry}:                                     "expiry",
 	}
 	for d, want := range cases {
 		if got := d.Legacy(); got != want {

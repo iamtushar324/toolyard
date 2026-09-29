@@ -114,8 +114,9 @@ func writeMCPUnauthorized(w http.ResponseWriter, msg string) {
 
 // mcpRaiser is who raised an /mcp call: the verified agent and its owner,
 // the client IP (X-Forwarded-For only behind a trusted proxy), the MCP
-// session, the client's own session id, and the client kind when the
-// request says. Via is left for the gateway, which knows the path in.
+// session, the client's own session id (always the caller's claim), and
+// the client kind when the request says. Via is left for the gateway,
+// which knows the path in.
 func mcpRaiser(r *http.Request, ag *identity.Agent, sec api.SecurityOptions) actor.Raiser {
 	raiser := actor.Raiser{
 		CallerID:     ag.ID,
@@ -134,8 +135,12 @@ func mcpRaiser(r *http.Request, ag *identity.Agent, sec api.SecurityOptions) act
 	}
 	if sid = actor.Clean(sid); sid != "" {
 		raiser.ClientSessionID = sid
-		// Claimed unless a trusted proxy stamped it.
-		raiser.ClientSessionClaimed = !sec.TrustsProxy(r)
+		// Always the caller's word. Our trusted proxies (Traefik, socat)
+		// pass client headers through unchanged, so sitting behind one
+		// says nothing about who set this header; a verified mode would
+		// need T3 to sign it (future work). X-Forwarded-For is different:
+		// the proxy writes that itself, so ClientIP still trusts it.
+		raiser.ClientSessionClaimed = true
 	}
 	return cleanRaiser(raiser)
 }
@@ -208,13 +213,15 @@ func inboxTapToken(p inbox.Push, recipientID string) string {
 
 // telegramDecider is who decided through a Telegram button. decidedBy is
 // the poller's "telegram:<telegram user id>" (the paired identity it
-// verified), which becomes the instrument; owner, when the install maps
-// the paired chat to a person, is the person.
-func telegramDecider(decidedBy string, owner *identity.User) actor.Decider {
+// verified), which is the instrument and the only identity we have: the
+// pairing settings store a Telegram chat id and user id, never a link to
+// a toolyard user, so UserID stays empty rather than guessing a person.
+// The name says what the row knows.
+func telegramDecider(decidedBy string) actor.Decider {
 	d := approval.DeciderFromLegacy(decidedBy)
-	d.Via = actor.ViaTelegram
-	if owner != nil {
-		d.UserID, d.Email, d.Name = owner.ID, owner.Email, owner.Label()
+	d.UserID, d.Email, d.Via = "", "", actor.ViaTelegram
+	if d.Ref != "" {
+		d.Name = "Telegram user " + d.Ref
 	}
 	return d
 }

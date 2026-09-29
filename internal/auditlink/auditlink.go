@@ -33,11 +33,23 @@ func (n *notifier) OnApproval(ctx context.Context, req *approval.Request, eventT
 	if n.log == nil || req == nil {
 		return
 	}
+	ctx = context.WithoutCancel(ctx)
+	// An auto-approved request never fans out approval.create: the bus
+	// decides it before the create fan-out so the push notifier stays
+	// quiet. Its decide event is the first the log hears of it, so the
+	// create row is written here, first.
+	if eventType == "approval.decide" && req.DecidedVia == actor.ViaAutoRule {
+		n.write(ctx, req, "approval.create")
+	}
+	n.write(ctx, req, eventType)
+}
+
+func (n *notifier) write(ctx context.Context, req *approval.Request, eventType string) {
 	ev, ok := EventFor(req, eventType)
 	if !ok {
 		return
 	}
-	if err := n.log.Write(context.WithoutCancel(ctx), ev); err != nil {
+	if err := n.log.Write(ctx, ev); err != nil {
 		log.Printf("auditlink: %s %s: %v", eventType, req.ID, err)
 	}
 }
@@ -60,6 +72,9 @@ func EventFor(req *approval.Request, eventType string) (ev audit.Event, ok bool)
 	case "approval.create":
 		ev.EventType = audit.EventApprovalCreate
 		ev.Reason = req.Reason
+		// Stamp the approval's own creation time so the row sorts before
+		// its decision even when both are written together.
+		ev.TS = req.CreatedAt
 	case "approval.decide":
 		ev.EventType = audit.EventApprovalDecide
 		ev.Decision = req.Status

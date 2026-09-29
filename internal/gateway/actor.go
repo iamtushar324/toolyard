@@ -20,6 +20,7 @@ import (
 	"time"
 
 	"github.com/mark3labs/mcp-go/mcp"
+	"github.com/mark3labs/mcp-go/server"
 
 	"github.com/tusharbhardwaj/toolyard/internal/actor"
 	"github.com/tusharbhardwaj/toolyard/internal/approval"
@@ -80,10 +81,36 @@ type clientInfo struct {
 	kind string
 }
 
+// maxClientCache bounds the clientInfo cache; a stateful gateway gets a
+// new MCP session per client connection. Past the bound it starts over,
+// and a client is simply unnamed until its next initialize.
+const maxClientCache = 4096
+
+// clientKey is the cache key for one client of an agent. Two clients can
+// share an agent token (T3 and Claude Code on the same machine), so the
+// key includes the MCP session when there is one, else the client's own
+// session id (a T3 thread) when it sends one, and only then falls back
+// to the agent alone.
+func clientKey(agentID, mcpSession, clientSession string) string {
+	switch {
+	case mcpSession != "":
+		return agentID + "\x00mcp:" + mcpSession
+	case clientSession != "":
+		return agentID + "\x00client:" + clientSession
+	}
+	return agentID
+}
+
 // rememberClient caches the clientInfo from an initialize request under
-// the agent that sent it. It is the server.Hooks AfterInitialize hook.
+// the agent and session that sent it. It is the server.Hooks
+// AfterInitialize hook. Anonymous callers are never cached: with no agent
+// there is nothing to tell them apart by.
 func (g *Gateway) rememberClient(ctx context.Context, _ any, req *mcp.InitializeRequest, _ *mcp.InitializeResult) {
 	if req == nil {
+		return
+	}
+	agentID := agentIDFromContext(ctx)
+	if agentID == "" {
 		return
 	}
 	name := actor.Clean(req.Params.ClientInfo.Name)
@@ -94,20 +121,43 @@ func (g *Gateway) rememberClient(ctx context.Context, _ any, req *mcp.Initialize
 	if v := actor.Clean(req.Params.ClientInfo.Version); v != "" {
 		ci.name = name + "/" + v
 	}
+	// The MCP session mcp-go just created for this initialize is the id
+	// the client will send back as Mcp-Session-Id (empty under
+	// -stateless-mcp). The ingress raiser carries the client's own
+	// session id, if it sent one.
+	ingress, _ := actor.RaiserFrom(ctx)
+	mcpSession := ingress.MCPSessionID
+	if cs := server.ClientSessionFromContext(ctx); cs != nil && cs.SessionID() != "" {
+		mcpSession = cs.SessionID()
+	}
+	key := clientKey(agentID, actor.Clean(mcpSession), ingress.ClientSessionID)
 	g.clientMu.Lock()
-	if g.clients == nil {
+	if g.clients == nil || len(g.clients) >= maxClientCache {
 		g.clients = map[string]clientInfo{}
 	}
-	g.clients[agentIDFromContext(ctx)] = ci
+	g.clients[key] = ci
 	g.clientMu.Unlock()
 }
 
-// clientFor returns the cached clientInfo for an agent.
-func (g *Gateway) clientFor(agentID string) (clientInfo, bool) {
+// clientFor returns the cached clientInfo for the client a raiser
+// describes: the entry for its MCP session, else for its client session,
+// else the agent's session-less entry.
+func (g *Gateway) clientFor(r actor.Raiser) (clientInfo, bool) {
+	if r.CallerID == "" {
+		return clientInfo{}, false
+	}
 	g.clientMu.Lock()
 	defer g.clientMu.Unlock()
-	ci, ok := g.clients[agentID]
-	return ci, ok
+	for _, key := range []string{
+		clientKey(r.CallerID, r.MCPSessionID, ""),
+		clientKey(r.CallerID, "", r.ClientSessionID),
+		clientKey(r.CallerID, "", ""),
+	} {
+		if ci, ok := g.clients[key]; ok {
+			return ci, true
+		}
+	}
+	return clientInfo{}, false
 }
 
 // sessionCacheTTL bounds how often a `_session_id` is re-checked against
@@ -131,7 +181,7 @@ func (g *Gateway) resolveRaiser(ctx context.Context, callerID, via string) actor
 	if via != "" {
 		r.Via = via
 	}
-	if ci, ok := g.clientFor(r.CallerID); ok {
+	if ci, ok := g.clientFor(r); ok {
 		r = r.Merge(actor.Raiser{ClientName: ci.name, ClientKind: ci.kind})
 	} else if r.ClientKind == "" && r.ClientName != "" {
 		r.ClientKind = ClientKindOf(r.ClientName)
@@ -255,14 +305,23 @@ func approvalDecider(req *approval.Request) actor.Decider {
 
 // approvalMetrics fills the approval columns of a metrics event from the
 // decided request: how it was decided, by whom, and how long it waited.
-// Auto-rule decisions keep the historical "auto" via so existing analytics
-// still group them.
+// Everything derives from the request's decider, so a request answered
+// in-line by Hold and the same request re-read from the database
+// (resumeDeferred, Execute) record the same values. Auto-rule decisions
+// keep the historical via "auto" and the rule id as the decider, so
+// existing analytics still group them.
 func approvalMetrics(ev *metrics.Event, req *approval.Request) {
 	d := approvalDecider(req)
 	switch {
-	case req.AutoDecidedBy != "":
+	case d.Via == actor.ViaAutoRule:
 		ev.ApprovalVia = "auto"
-		ev.ApprovalDecider = req.AutoDecidedBy
+		ev.ApprovalDecider = d.Ref
+		if ev.ApprovalDecider == "" {
+			ev.ApprovalDecider = req.AutoDecidedBy
+		}
+		if req.Status == approval.StatusAllowed {
+			ev.ApprovalOutcome = metrics.ApprovalAuto
+		}
 	case !d.IsZero():
 		ev.ApprovalVia = d.Via
 		ev.ApprovalDecider = d.Legacy()

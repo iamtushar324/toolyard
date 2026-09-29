@@ -522,3 +522,171 @@ func TestSchemaAdvertisesAndStripsSessionField(t *testing.T) {
 		t.Fatalf("clean args: %v", clean)
 	}
 }
+
+// fakeAuto is an approval.AutoApprover that allows everything under one
+// rule, created by one person.
+type fakeAuto struct{ rule, creator string }
+
+func (a fakeAuto) Match(string, string, string, string, bool) *approval.AutoMatch {
+	return &approval.AutoMatch{ID: a.rule, Kind: "tool", CreatedBy: a.creator}
+}
+func (fakeAuto) MarkHit(context.Context, string, string)            {}
+func (fakeAuto) MarkDenial(context.Context, string, string, string) {}
+func (fakeAuto) IsDestructive(context.Context, string) bool         { return false }
+
+// A request decided by an auto-rule records via "auto" and the rule id
+// whether the gateway holds the fresh response from Hold or re-reads the
+// row later (resumeDeferred, Execute); the audit row names the rule (the
+// rule decided, not the person who created it).
+func TestApprovalMetricsAgreeInlineAndReread(t *testing.T) {
+	f := newActorFixture(t)
+	f.bus.SetAutoApprover(fakeAuto{rule: "rule_1", creator: "u_creator"})
+	ctx := WithAgentID(context.Background(), "ag_1")
+	f.drainAudit()
+
+	res := f.call(t, ctx, "test", "t.run", map[string]any{"env": "prod"})
+	if res.IsError {
+		t.Fatalf("inline auto-approve: %+v", res)
+	}
+	inline := f.lastMetric(t, "t.run")
+	if inline.ApprovalVia != "auto" || inline.ApprovalDecider != "rule_1" || inline.ApprovalOutcome != metrics.ApprovalAuto || inline.ApprovalID == "" {
+		t.Fatalf("inline metric: %+v", inline)
+	}
+	row, ok := findAudit(f.drainAudit(), audit.EventCallAllowed, "t.run")
+	if !ok || row.DecidedVia != actor.ViaAutoRule || row.DeciderRef != "rule_1" || row.DecidedByUserID != "" {
+		t.Fatalf("inline allow row: %+v", row)
+	}
+
+	// The legacy `_approval_id` re-call reads the row back.
+	res = f.call(t, ctx, "test", "t.run", map[string]any{ApprovalIDField: inline.ApprovalID})
+	if res.IsError {
+		t.Fatalf("resume: %+v", res)
+	}
+	resumed := f.lastMetric(t, "t.run")
+	if resumed.ApprovalVia != inline.ApprovalVia || resumed.ApprovalDecider != inline.ApprovalDecider || resumed.ApprovalOutcome != metrics.ApprovalAuto {
+		t.Fatalf("resume metric %+v disagrees with inline %+v", resumed, inline)
+	}
+
+	// So does the executor, given the row from the database.
+	req, err := f.bus.Get(context.Background(), inline.ApprovalID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.gw.Execute(context.Background(), req)
+	executed := f.lastMetric(t, "t.run")
+	if executed.Via != "auto-execute" || executed.ApprovalVia != inline.ApprovalVia || executed.ApprovalDecider != inline.ApprovalDecider ||
+		executed.ApprovalOutcome != inline.ApprovalOutcome {
+		t.Fatalf("execute metric %+v disagrees with inline %+v", executed, inline)
+	}
+}
+
+func TestApprovalMetricsFromDecider(t *testing.T) {
+	cases := []struct {
+		name         string
+		req          approval.Request
+		via, decider string
+	}{
+		{"auto, fresh from Hold", approval.Request{AutoDecidedBy: "rule_1", DecidedVia: actor.ViaAutoRule, DeciderRef: "rule_1", DecidedBy: "u_creator"}, "auto", "rule_1"},
+		{"auto, re-read", approval.Request{DecidedVia: actor.ViaAutoRule, DeciderRef: "rule_1", DecidedBy: "u_creator"}, "auto", "rule_1"},
+		{"auto, legacy row", approval.Request{DecidedBy: "rule:rule_1"}, "auto", "rule_1"},
+		{"auto, response only", approval.Request{AutoDecidedBy: "rule_1"}, "auto", "rule_1"},
+		{"person on the dashboard", approval.Request{DecidedVia: actor.ViaDashboard, DecidedBy: "u_1", DeciderName: "Ann"}, actor.ViaDashboard, "u_1"},
+		{"push token", approval.Request{DecidedVia: actor.ViaPushToken, DecidedBy: "u_1"}, actor.ViaPushToken, "u_1"},
+		{"telegram, no user", approval.Request{DecidedVia: actor.ViaTelegram, DeciderRef: "12345", DecidedBy: "telegram:12345"}, actor.ViaTelegram, "telegram:12345"},
+		{"undecided", approval.Request{}, "", ""},
+	}
+	for _, c := range cases {
+		var ev metrics.Event
+		c.req.CreatedAt, c.req.DecidedAt = 1000, 3500
+		approvalMetrics(&ev, &c.req)
+		if ev.ApprovalVia != c.via || ev.ApprovalDecider != c.decider || ev.ApprovalLatencyMs != 2500 {
+			t.Errorf("%s: via=%q decider=%q latency=%d, want %q %q 2500", c.name, ev.ApprovalVia, ev.ApprovalDecider, ev.ApprovalLatencyMs, c.via, c.decider)
+		}
+	}
+}
+
+// fakeSession is the mcp-go client session a stateful transport puts on
+// ctx before handling initialize.
+type fakeSession struct {
+	id string
+	ch chan mcp.JSONRPCNotification
+}
+
+func (s *fakeSession) Initialize()                                         {}
+func (s *fakeSession) Initialized() bool                                   { return true }
+func (s *fakeSession) NotificationChannel() chan<- mcp.JSONRPCNotification { return s.ch }
+func (s *fakeSession) SessionID() string                                   { return s.id }
+
+// The clientInfo cache tells two clients on one agent token apart by MCP
+// session, then by the client's own session id under -stateless-mcp, and
+// only then falls back to the agent; anonymous callers are never cached.
+func TestClientInfoKeyedBySession(t *testing.T) {
+	f := newActorFixture(t)
+	agent := WithAgentID(context.Background(), "ag_1")
+	withSession := func(id string) context.Context {
+		return f.gw.MCPServer().WithContext(agent, &fakeSession{id: id, ch: make(chan mcp.JSONRPCNotification, 8)})
+	}
+	client := func(r actor.Raiser) actor.Raiser {
+		r.CallerID = "ag_1"
+		f.call(t, actor.WithRaiser(agent, r), "test", "t.get_status", nil)
+		got, _ := f.lastRaiser(t)
+		return got
+	}
+
+	// Stateful: one token, two connections, two clients.
+	mcpInitialize(t, f.gw, withSession("mcp-A"), "claude-code", "1.0")
+	mcpInitialize(t, f.gw, withSession("mcp-B"), "t3-code", "2.0")
+	if r := client(actor.Raiser{MCPSessionID: "mcp-A"}); r.ClientName != "claude-code/1.0" || r.ClientKind != "claude_code" {
+		t.Fatalf("session A: %+v", r)
+	}
+	if r := client(actor.Raiser{MCPSessionID: "mcp-B"}); r.ClientName != "t3-code/2.0" || r.ClientKind != "t3" {
+		t.Fatalf("session B: %+v", r)
+	}
+	// A session the cache never saw, and nothing session-less to fall
+	// back on: unnamed rather than guessed.
+	if r := client(actor.Raiser{MCPSessionID: "mcp-C"}); r.ClientName != "" || r.ClientKind != "" {
+		t.Fatalf("unknown session named a client: %+v", r)
+	}
+
+	// Stateless: no MCP session; the client's own session id (a T3
+	// thread from the ingress raiser) keeps two clients apart.
+	mcpInitialize(t, f.gw, actor.WithRaiser(agent, actor.Raiser{CallerID: "ag_1", ClientSessionID: "thread-1"}), "cursor", "0.5")
+	mcpInitialize(t, f.gw, actor.WithRaiser(agent, actor.Raiser{CallerID: "ag_1", ClientSessionID: "thread-2"}), "opencode", "3")
+	if r := client(actor.Raiser{ClientSessionID: "thread-1"}); r.ClientName != "cursor/0.5" || r.ClientKind != "cursor" {
+		t.Fatalf("thread-1: %+v", r)
+	}
+	if r := client(actor.Raiser{ClientSessionID: "thread-2"}); r.ClientName != "opencode/3" || r.ClientKind != "opencode" {
+		t.Fatalf("thread-2: %+v", r)
+	}
+	// A call that names both sessions prefers the MCP one.
+	if r := client(actor.Raiser{MCPSessionID: "mcp-A", ClientSessionID: "thread-2"}); r.ClientName != "claude-code/1.0" {
+		t.Fatalf("mcp session should win: %+v", r)
+	}
+
+	// Neither session id anywhere: the agent alone.
+	if r := client(actor.Raiser{}); r.ClientName != "" {
+		t.Fatalf("no session-less entry yet: %+v", r)
+	}
+	mcpInitialize(t, f.gw, agent, "codex", "9")
+	if r := client(actor.Raiser{}); r.ClientName != "codex/9" || r.ClientKind != "codex" {
+		t.Fatalf("agent-only: %+v", r)
+	}
+	// An ingress client kind (a trusted header) wins over the client's
+	// self-description; the name is still filled in.
+	if r := client(actor.Raiser{ClientKind: "cli"}); r.ClientKind != "cli" || r.ClientName != "codex/9" {
+		t.Fatalf("ingress kind: %+v", r)
+	}
+
+	// Anonymous: initialize is not cached and never named.
+	mcpInitialize(t, f.gw, context.Background(), "hermes", "1")
+	f.call(t, context.Background(), "test", "t.get_status", nil)
+	if r, _ := f.lastRaiser(t); r.ClientName != "" || r.ClientKind != "" {
+		t.Fatalf("anonymous caller named: %+v", r)
+	}
+	f.gw.clientMu.Lock()
+	_, cached := f.gw.clients[""]
+	f.gw.clientMu.Unlock()
+	if cached {
+		t.Fatal("anonymous clientInfo cached")
+	}
+}

@@ -71,8 +71,8 @@ type Request struct {
 	Fingerprint    string         `json:"fingerprint,omitempty"`
 	Coalesced      bool           `json:"coalesced,omitempty"` // true if Hold returned an existing pending row instead of creating a new one
 	// AutoDecidedBy is the auto-approval rule id that decided this request,
-	// or empty if a human (or the rule engine wasn't consulted). Set on
-	// Status=allowed responses produced via the AutoApprover hook.
+	// or empty if a human (or the rule engine wasn't consulted). Derived
+	// on every read from the decider (Via auto_rule, Ref rule id).
 	AutoDecidedBy string `json:"auto_decided_by,omitempty"`
 
 	// ResultEnvelope is the JSON-encoded executed tool result; populated
@@ -133,9 +133,10 @@ type AutoApprover interface {
 }
 
 // AutoMatch is the return value from AutoApprover.Match. ID is the rule's
-// stable identifier — it becomes decider_ref (Via auto_rule) on the
-// resulting approved approval, and CreatedBy, the user who installed the
-// rule when known, its decided_by.
+// stable identifier — it becomes decider_ref (Via auto_rule) and the
+// historical decided_by "rule:<id>" on the resulting approved approval.
+// CreatedBy, the user who installed the rule when known, is informational:
+// the decision record names the rule, never its creator.
 type AutoMatch struct {
 	ID        string
 	Kind      string
@@ -239,10 +240,12 @@ func (b *Bus) Hold(ctx context.Context, in NewRequest, maxWait time.Duration) (*
 	if b.auto != nil && !req.Coalesced && req.Status == StatusPending && !in.RequireHuman {
 		destructive := b.auto.IsDestructive(ctx, req.ToolName)
 		if m := b.auto.Match(req.AgentID, req.UpstreamName, req.ToolName, req.Fingerprint, destructive); m != nil {
-			d := actor.Decider{UserID: m.CreatedBy, Via: actor.ViaAutoRule, Ref: m.ID}
+			// The rule is the decider; its creator is on the rule row,
+			// not on the decision, so an auto-approval never reads as a
+			// person's click. scanRequest derives AutoDecidedBy from it.
+			d := actor.Decider{Via: actor.ViaAutoRule, Ref: m.ID}
 			decided, derr := b.decideInline(ctx, req.ID, StatusAllowed, d)
 			if derr == nil && decided != nil {
-				decided.AutoDecidedBy = m.ID
 				b.auto.MarkHit(ctx, m.ID, req.AgentID)
 				return decided, nil
 			}
@@ -486,6 +489,11 @@ func scanRequest(s rowScanner) (*Request, error) {
 		if err := json.Unmarshal([]byte(raisedBy), &r); err == nil {
 			req.RaisedBy = &r
 		}
+	}
+	// Derived, not stored, so every read agrees with the inline
+	// auto-approval path (and with rows written as "rule:<id>").
+	if d := req.Decider(); d.Via == actor.ViaAutoRule {
+		req.AutoDecidedBy = d.Ref
 	}
 	return &req, nil
 }

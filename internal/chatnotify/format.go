@@ -103,10 +103,15 @@ func deciderLabel(d actor.Decider) string {
 	case actor.ViaPasskey:
 		how = "passkey"
 	case actor.ViaTelegram:
-		how = "Telegram"
+		// Unmapped Telegram deciders are named "Telegram user <id>"; that
+		// name is the whole label.
 		if who == "" && d.Ref != "" {
-			how += " user " + d.Ref
+			who = "Telegram user " + d.Ref
 		}
+		if strings.HasPrefix(who, "Telegram user ") {
+			return who
+		}
+		how = "Telegram"
 	case actor.ViaAutoRule:
 		how = "auto-approval rule " + d.Ref
 	case actor.ViaPolicy:

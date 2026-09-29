@@ -58,7 +58,11 @@ UPDATE audit_events
    SET owner_email = (SELECT u.email FROM users u WHERE u.id = audit_events.owner_user_id),
        owner_name  = (SELECT COALESCE(u.display_name, u.username) FROM users u WHERE u.id = audit_events.owner_user_id)
  WHERE owner_user_id IS NOT NULL;
+-- Only the rows that record the decision (call.allowed / call.denied) name
+-- the person who made it, and only when a person did (decided_by is a
+-- user id, not rule:<id>, agent:<id>, telegram:<id> or token).
 UPDATE audit_events
    SET decided_by_user_id = (SELECT r.decided_by FROM approval_requests r
                               WHERE r.id = audit_events.approval_id AND r.decided_by LIKE 'u\_%' ESCAPE '\')
- WHERE approval_id IS NOT NULL AND approval_id <> '';
+ WHERE approval_id IS NOT NULL AND approval_id <> ''
+   AND event_type IN ('call.allowed', 'call.denied');

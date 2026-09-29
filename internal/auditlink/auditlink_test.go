@@ -116,6 +116,51 @@ func TestAuditLink_CreateAndDecideRows(t *testing.T) {
 	if executed.ResultSummary != "executed" || executed.DecidedByUserID != "u_dec" {
 		t.Errorf("executed row: summary=%q decided_by=%q", executed.ResultSummary, executed.DecidedByUserID)
 	}
+	// A human decision must not synthesise a second create row.
+	if rows, _ := f.log.Query(context.Background(), audit.Filter{ApprovalID: req.ID, EventType: audit.EventApprovalCreate}); len(rows) != 1 {
+		t.Errorf("create rows after human decide = %d, want 1", len(rows))
+	}
+}
+
+// ruleAuto auto-approves everything as rule "ar_auto".
+type ruleAuto struct{}
+
+func (ruleAuto) Match(agentID, upstream, toolName, fingerprint string, isDestructive bool) *approval.AutoMatch {
+	return &approval.AutoMatch{ID: "ar_auto", Kind: "tool", CreatedBy: "u_creator"}
+}
+func (ruleAuto) MarkHit(ctx context.Context, ruleID, agentID string)                   {}
+func (ruleAuto) MarkDenial(ctx context.Context, agentID, toolName, fingerprint string) {}
+func (ruleAuto) IsDestructive(ctx context.Context, toolName string) bool               { return false }
+
+// The bus never fans out approval.create for an auto-approval (that would
+// push the phone), so the notifier writes the create row itself, before
+// the decide row, and the decide row names the rule and no person.
+func TestAuditLink_AutoRuleWritesCreateThenDecide(t *testing.T) {
+	f := newFixture(t)
+	f.bus.SetAutoApprover(ruleAuto{})
+	req := f.hold(t, "github.auto")
+	if req.Status != approval.StatusAllowed || req.AutoDecidedBy != "ar_auto" {
+		t.Fatalf("status=%q auto=%q, want allowed by ar_auto", req.Status, req.AutoDecidedBy)
+	}
+	created := f.waitRow(t, req.ID, audit.EventApprovalCreate)
+	decided := f.waitRow(t, req.ID, audit.EventApprovalDecide)
+	checkRaiser(t, created, req)
+	checkRaiser(t, decided, req)
+	if created.Reason != "needs a ticket" || created.DecidedVia != "" || created.Decision != "" {
+		t.Errorf("create row: reason=%q via=%q decision=%q", created.Reason, created.DecidedVia, created.Decision)
+	}
+	if created.TS != req.CreatedAt || created.TS > decided.TS {
+		t.Errorf("create ts %d (approval created %d) must not sort after decide ts %d", created.TS, req.CreatedAt, decided.TS)
+	}
+	if decided.Decision != approval.StatusAllowed || decided.DecidedVia != actor.ViaAutoRule || decided.DeciderRef != "ar_auto" {
+		t.Errorf("decide row: decision=%q via=%q ref=%q", decided.Decision, decided.DecidedVia, decided.DeciderRef)
+	}
+	if decided.DecidedByUserID != "" || decided.DecidedByEmail != "" {
+		t.Errorf("auto-rule decide row names a person: %q %q", decided.DecidedByUserID, decided.DecidedByEmail)
+	}
+	if rows, _ := f.log.Query(context.Background(), audit.Filter{ApprovalID: req.ID}); len(rows) != 2 {
+		t.Errorf("rows for auto-approval = %d, want create + decide", len(rows))
+	}
 }
 
 func TestAuditLink_DeniedByToken(t *testing.T) {
