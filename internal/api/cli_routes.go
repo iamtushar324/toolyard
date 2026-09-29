@@ -91,7 +91,11 @@ func (s *Server) cliApprovalsOne(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	writeJSON(w, http.StatusOK, req)
+	// The decision token is the human's one-tap approval credential and
+	// decide-by-token is unauthenticated: never hand it to the agent.
+	out := *req
+	out.DecisionToken = ""
+	writeJSON(w, http.StatusOK, out)
 }
 
 // POST /v1/agents/tools/run — bearer-auth one-shot tool execution.
