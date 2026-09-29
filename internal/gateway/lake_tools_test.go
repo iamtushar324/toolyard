@@ -187,7 +187,7 @@ func TestLakeQueryThroughGateway(t *testing.T) {
 		ReasonField: "smoke test for lake.query through the gateway",
 		"sql":       `SELECT COUNT(*) AS n FROM app.t`,
 	}
-	res, err := gw.routeEntry(context.Background(), entry, args)
+	res, err := gw.routeEntry(context.Background(), entry, "test", args)
 	if err != nil {
 		t.Fatalf("routeEntry: %v", err)
 	}
@@ -208,7 +208,7 @@ func TestLakeQueryRejectsWrites(t *testing.T) {
 		ReasonField: "deliberately attempt write through query path",
 		"sql":       `INSERT INTO app.bad VALUES (1)`,
 	}
-	res, err := gw.routeEntry(context.Background(), entry, args)
+	res, err := gw.routeEntry(context.Background(), entry, "test", args)
 	if err != nil {
 		t.Fatalf("routeEntry: %v", err)
 	}
@@ -249,7 +249,7 @@ func TestLakeInsertNoApproval(t *testing.T) {
 			map[string]any{"name": "beta", "qty": int32(2)},
 		},
 	}
-	res, err := gw.routeEntry(context.Background(), entry, args)
+	res, err := gw.routeEntry(context.Background(), entry, "test", args)
 	if err != nil {
 		t.Fatalf("routeEntry: %v", err)
 	}
@@ -280,7 +280,7 @@ func TestLakeCreateTableNoApproval(t *testing.T) {
 		ReasonField: "smoke test for lake.create_table",
 		"sql":       `CREATE TABLE app.zz (id Int32, name String) ENGINE = MergeTree() ORDER BY id`,
 	}
-	res, err := gw.routeEntry(context.Background(), entry, args)
+	res, err := gw.routeEntry(context.Background(), entry, "test", args)
 	if err != nil {
 		t.Fatalf("routeEntry: %v", err)
 	}

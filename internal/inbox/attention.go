@@ -12,6 +12,8 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/tusharbhardwaj/toolyard/internal/actor"
 )
 
 // Attention decides when the owner's phone buzzes (inbox-spec.md §6).
@@ -66,8 +68,14 @@ type Push struct {
 	Actions   []PushAction `json:"actions,omitempty"`
 	// TapToken lets the service worker act on a notification without a
 	// session cookie. It names one request and the actions offered.
+	// It is the unbound (legacy) form; the sender should prefer
+	// TapTokenFor, which also names the person the notification went to,
+	// so a tap is attributed to them.
 	TapToken string `json:"inbox_token,omitempty"`
-	Reason   string `json:"reason"` // new | grouped | reminder | snooze_end | digest
+	// TapTokenFor mints the token for one recipient (a user id). nil
+	// when the notification offers no actions.
+	TapTokenFor func(userID string) string `json:"-"`
+	Reason      string                     `json:"reason"` // new | grouped | reminder | snooze_end | digest
 }
 
 // PushAction is one notification button.
@@ -451,7 +459,10 @@ func (s *Service) itemPush(ctx context.Context, c AttentionConfig, r *Request, r
 		}
 	}
 	if len(actions) > 0 {
-		p.TapToken = s.tapToken(r.ID, actions, time.UnixMilli(r.ExpiresAt))
+		exp := time.UnixMilli(r.ExpiresAt)
+		id := r.ID
+		p.TapToken = s.tapToken(id, actions, exp)
+		p.TapTokenFor = func(userID string) string { return s.tapTokenFor(id, actions, exp, userID) }
 	}
 	return p
 }
@@ -729,11 +740,19 @@ func capitalize(s string) string {
 // ErrTapToken is returned for a bad, expired or mismatched tap token.
 var ErrTapToken = errors.New("this notification has expired; open the request to decide")
 
+// Tap tokens come in two formats. v1 (three fields) named the request,
+// the actions and the expiry; v2 adds the recipient's user id, so the tap
+// is attributed to the person the notification went to. v1 tokens already
+// on phones stay valid until they expire.
 func tapMessage(id, actions string, exp int64) []byte {
 	return []byte("toolyard-inbox-tap-v1\n" + id + "\n" + actions + "\n" + strconv.FormatInt(exp, 10))
 }
 
-// tapToken signs "this request, these actions, until then".
+func tapMessageFor(id, actions string, exp int64, userID string) []byte {
+	return []byte("toolyard-inbox-tap-v2\n" + id + "\n" + actions + "\n" + strconv.FormatInt(exp, 10) + "\n" + userID)
+}
+
+// tapToken signs "this request, these actions, until then" (v1).
 func (s *Service) tapToken(id string, actions []string, exp time.Time) string {
 	acts := strings.Join(actions, ",")
 	e := exp.UnixMilli()
@@ -742,47 +761,81 @@ func (s *Service) tapToken(id string, actions []string, exp time.Time) string {
 	return tapTokenPrefix + base64.RawURLEncoding.EncodeToString([]byte(body)) + "." + base64.RawURLEncoding.EncodeToString(sig)
 }
 
-func (s *Service) verifyTap(tok, action string) (string, error) {
+// tapTokenFor signs "this request, these actions, until then, for this
+// person" (v2). A userID containing '|' is refused (empty token) rather
+// than producing an ambiguous body.
+func (s *Service) tapTokenFor(id string, actions []string, exp time.Time, userID string) string {
+	userID = strings.TrimSpace(userID)
+	if userID == "" || strings.ContainsAny(userID, "|\n") {
+		return ""
+	}
+	acts := strings.Join(actions, ",")
+	e := exp.UnixMilli()
+	sig := ed25519.Sign(s.signer.priv, tapMessageFor(id, acts, e, userID))
+	body := id + "|" + acts + "|" + strconv.FormatInt(e, 10) + "|" + userID
+	return tapTokenPrefix + base64.RawURLEncoding.EncodeToString([]byte(body)) + "." + base64.RawURLEncoding.EncodeToString(sig)
+}
+
+// verifyTap returns the request id the token names and, for a v2 token,
+// the user it was issued to.
+func (s *Service) verifyTap(tok, action string) (id, userID string, err error) {
 	tok = strings.TrimSpace(tok)
 	if !strings.HasPrefix(tok, tapTokenPrefix) {
-		return "", ErrTapToken
+		return "", "", ErrTapToken
 	}
 	b, sigs, ok := strings.Cut(strings.TrimPrefix(tok, tapTokenPrefix), ".")
 	if !ok {
-		return "", ErrTapToken
+		return "", "", ErrTapToken
 	}
 	body, err1 := base64.RawURLEncoding.DecodeString(b)
 	sig, err2 := base64.RawURLEncoding.DecodeString(sigs)
 	if err1 != nil || err2 != nil || len(sig) != ed25519.SignatureSize {
-		return "", ErrTapToken
+		return "", "", ErrTapToken
 	}
 	parts := strings.Split(string(body), "|")
-	if len(parts) != 3 {
-		return "", ErrTapToken
+	var msg []byte
+	switch len(parts) {
+	case 3:
+		exp, perr := strconv.ParseInt(parts[2], 10, 64)
+		if perr != nil {
+			return "", "", ErrTapToken
+		}
+		msg = tapMessage(parts[0], parts[1], exp)
+	case 4:
+		exp, perr := strconv.ParseInt(parts[2], 10, 64)
+		if perr != nil || parts[3] == "" {
+			return "", "", ErrTapToken
+		}
+		msg = tapMessageFor(parts[0], parts[1], exp, parts[3])
+		userID = parts[3]
+	default:
+		return "", "", ErrTapToken
 	}
-	exp, err := strconv.ParseInt(parts[2], 10, 64)
-	if err != nil || !ed25519.Verify(s.signer.pub, tapMessage(parts[0], parts[1], exp), sig) {
-		return "", ErrTapToken
+	if !ed25519.Verify(s.signer.pub, msg, sig) {
+		return "", "", ErrTapToken
 	}
+	exp, _ := strconv.ParseInt(parts[2], 10, 64)
 	if s.now().UnixMilli() >= exp {
-		return "", ErrTapToken
+		return "", "", ErrTapToken
 	}
 	for _, a := range strings.Split(parts[1], ",") {
 		if a == action {
-			return parts[0], nil
+			return parts[0], userID, nil
 		}
 	}
-	return "", ErrTapToken
+	return "", "", ErrTapToken
 }
 
 // DecideByTap applies a notification action. Only the actions the
-// notification offered are accepted, and none of them allow tools.
+// notification offered are accepted, and none of them allow tools. The
+// decision is recorded as made through the push token, by the person the
+// token was issued to when it is a bound (v2) token.
 func (s *Service) DecideByTap(ctx context.Context, token, action string) (*Request, error) {
-	id, err := s.verifyTap(token, action)
+	id, userID, err := s.verifyTap(token, action)
 	if err != nil {
 		return nil, err
 	}
-	d := Decision{By: "notification"}
+	d := Decision{By: "notification", Decider: actor.Decider{UserID: userID, Via: actor.ViaPushToken}}
 	switch {
 	case action == TapDeny:
 		d.Action = "deny"

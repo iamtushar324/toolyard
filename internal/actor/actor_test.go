@@ -8,12 +8,12 @@ import (
 
 func TestLegacy(t *testing.T) {
 	cases := map[Decider]string{
-		{UserID: "u_1", Via: ViaDashboard}:     "u_1",
-		{Via: ViaAutoRule, Ref: "ar_9"}:        "auto_rule:ar_9",
-		{Via: ViaTelegram, Ref: "12345"}:       "telegram:12345",
-		{Via: ViaExpiry}:                       "expiry",
-		{UserID: "u_2", Via: ViaPushToken}:     "u_2",
-		{Via: ViaAgentCancel, Ref: "ag_x"}:     "agent_cancel:ag_x",
+		{UserID: "u_1", Via: ViaDashboard}: "u_1",
+		{Via: ViaAutoRule, Ref: "ar_9"}:    "auto_rule:ar_9",
+		{Via: ViaTelegram, Ref: "12345"}:   "telegram:12345",
+		{Via: ViaExpiry}:                   "expiry",
+		{UserID: "u_2", Via: ViaPushToken}: "u_2",
+		{Via: ViaAgentCancel, Ref: "ag_x"}: "agent_cancel:ag_x",
 	}
 	for d, want := range cases {
 		if got := d.Legacy(); got != want {
