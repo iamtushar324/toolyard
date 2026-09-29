@@ -20,6 +20,7 @@ const state = {
   serverEditModal: null,   // { name, http, url, headersText, identityOn, header, register, enabled, orig, error, saving } while editing a server
   route: 'approvals',
   approvals: [],
+  recentApprovals: [],     // /v1/approvals: the latest decided rows, for "Recently decided"
   audit: [],
   agents: [],
   memory: [],
@@ -29,8 +30,12 @@ const state = {
   marketModal: null,
   agentModal: null,        // { stage: 'name'|'done', name, agent, snippetTab }
   toolFilter: '',
-  // Audit tab: client-side filters + pagination cursor state.
-  auditFilter: { q: '', event_type: '', decision: '', agent: '' },
+  // Audit tab: client-side filters + pagination cursor state. owner,
+  // decided_by, client_kind and session also go to the server
+  // (AUDIT_SERVER_FILTERS); sessionDraft is the session box while typing.
+  auditFilter: { q: '', event_type: '', decision: '', agent: '', owner: '', decided_by: '', client_kind: '', session: '', sessionDraft: null },
+  auditOpen: {},          // audit row id -> "Raised by" details toggle open
+  auditLoading: false,    // a server-filtered reload is in flight
   auditPaged: false,      // true once "Load older" has pulled extra rows
   auditEnd: false,        // true when a "Load older" returned nothing
   hooks: { events: [], loading: false, end: false, loaded: false },
@@ -282,9 +287,9 @@ async function loadAll() {
     return;
   }
   try {
-    const [pendings, audits, agents, memos, servers, tools, market, settingsRes, usageRes, vapid, policies] = await Promise.all([
+    const [pendings, audits, agents, memos, servers, tools, market, settingsRes, usageRes, vapid, policies, recent] = await Promise.all([
       api('/v1/approvals?status=pending'),
-      api('/v1/audit?limit=50'),
+      api('/v1/audit?' + auditServerParams({ limit: '50' }).toString()),
       api('/v1/agents'),
       api('/v1/memory'),
       api('/v1/servers').catch(() => []),
@@ -294,11 +299,13 @@ async function loadAll() {
       api('/v1/usage').catch(() => ({ per_tool: {}, rows: [] })),
       api('/v1/push/vapid_key').catch(() => null),
       api('/v1/policies').catch(() => []),
+      api('/v1/approvals?limit=20').catch(() => []),
     ]);
     state.policies = policies || [];
     state.settings = Object.assign({}, state.settings, settingsRes || {});
     state.usage = usageRes || state.usage;
     state.approvals = pendings || [];
+    state.recentApprovals = (Array.isArray(recent) ? recent : []).filter((a) => a && a.status && a.status !== 'pending');
     state.audit = audits || [];
     state.agents = agents || [];
     state.memory = memos || [];
@@ -312,6 +319,7 @@ async function loadAll() {
     // Fire-and-forget — the badges fill in once the responses land.
     preloadOAuthStatus().then(() => render()).catch(() => {});
     loadInbox();
+    ensureUserDir();
   } catch (e) {
     toast(e.message, 'error');
   }
@@ -392,7 +400,7 @@ async function refetchCore() {
   try {
     const [pendings, audits] = await Promise.all([
       api('/v1/approvals?status=pending'),
-      api('/v1/audit?limit=50'),
+      api('/v1/audit?' + auditServerParams({ limit: '50' }).toString()),
     ]);
     state.approvals = pendings || [];
     loadInbox();
@@ -468,8 +476,17 @@ function handleApprovalEvent(req) {
     else state.approvals.unshift(req);
   } else {
     if (i >= 0) state.approvals.splice(i, 1);
+    noteDecidedApproval(req);
   }
   render();
+}
+
+// noteDecidedApproval puts a decided row at the top of "Recently decided".
+const RECENT_APPROVALS_CAP = 20;
+function noteDecidedApproval(req) {
+  if (!req || !req.id || !req.status || req.status === 'pending') return;
+  const rest = (state.recentApprovals || []).filter((a) => a.id !== req.id);
+  state.recentApprovals = [req].concat(rest).slice(0, RECENT_APPROVALS_CAP);
 }
 
 // handleHubEvent receives a live Events Hub event. When the operator is on the
@@ -617,7 +634,7 @@ async function submitPasswordLogin() {
 
 function viewApprovals() {
   if (!state.approvals.length) {
-    return el('div', { class: 'card empty' }, 'No pending approvals.');
+    return el('div', {}, el('div', { class: 'card empty' }, 'No pending approvals.'), renderRecentDecisions());
   }
   // Group by agent_id. Within each group, sort by created_at ascending so
   // the user reads the batch in chronological order. Anonymous calls fall
@@ -639,7 +656,30 @@ function viewApprovals() {
   return el('div', {}, ordered.map(([key, items]) => {
     items.sort((a, b) => a.created_at - b.created_at);
     return renderApprovalBatch(key, items);
-  }));
+  }), renderRecentDecisions());
+}
+
+// renderRecentDecisions lists the latest decided approvals with who decided
+// each and how. Nothing renders until the server has decided rows to show.
+function renderRecentDecisions() {
+  const rows = (state.recentApprovals || []).filter((a) => a.status !== 'pending').slice(0, 10);
+  if (!rows.length) return null;
+  return el('div', { class: 'card recent-decisions' },
+    el('h2', {}, 'Recently decided'),
+    ...rows.map((a) => {
+      const d = approvalDecider(a);
+      const decided = deciderText(d);
+      const raised = raiserLine(raiserOf(a.raised_by, a.agent_id));
+      return el('div', { class: 'recent-row', 'data-recent-approval-id': a.id },
+        el('div', { class: 'row' },
+          el('span', { class: 'grow recent-tool' }, `${a.upstream_name || ''} · ${a.tool_name || ''}`),
+          badge(a.status)),
+        el('div', { class: 'meta', title: deciderTitle(d) },
+          [decided, relTime(a.decided_at || a.created_at)].filter(Boolean).join(' · ')),
+        raised ? el('div', { class: 'meta' }, raised) : null,
+      );
+    }),
+  );
 }
 
 // renderArgs makes tool arguments phone-scannable: a flat object renders as
@@ -666,7 +706,11 @@ function renderApprovalBatch(agentKey, items) {
   const earliest = Math.min(...items.map((a) => a.expires_at));
   const isBatch = items.length > 1;
   const allExpired = liveIds.length === 0;
-  const labelAgent = agentKey === '__anon__' ? 'anonymous (no agent token)' : agentKey;
+  // The group shares an agent id; the first row that recorded a raiser
+  // names it. Rows from before raised_by keep showing the raw id.
+  const groupRaiser = items.find((a) => a.raised_by);
+  const labelAgent = agentKey === '__anon__' ? 'anonymous (no agent token)'
+    : (groupRaiser && groupRaiser.raised_by.agent_name) || agentKey;
 
   // Compact summary line: "fs.write_file · github.create_issue · …"
   const toolSummary = items.map((a) => `${a.upstream_name}·${a.tool_name}`).join('  ·  ');
@@ -676,7 +720,7 @@ function renderApprovalBatch(agentKey, items) {
       el('div', { style: 'font-weight: 600; font-size: 14px;' },
         isBatch ? `Batch: ${items.length} pending writes` : `${items[0].upstream_name} · ${items[0].tool_name}`),
       el('div', { class: 'meta', style: 'margin-top: 2px;' },
-        `agent: `, el('code', {}, labelAgent),
+        `agent: `, el('code', { title: agentKey === '__anon__' ? '' : agentKey }, labelAgent),
         ` · earliest expires ${relTime(earliest)}`),
       isBatch ? el('div', { class: 'meta', style: 'margin-top: 4px; font-family: ui-monospace, monospace;' }, toolSummary) : null,
     ),
@@ -688,6 +732,8 @@ function renderApprovalBatch(agentKey, items) {
 
   const rows = items.map((a) => {
     const expired = a.expires_at <= now;
+    const raiser = raiserOf(a.raised_by, a.agent_id);
+    const raised = raiserLine(raiser);
     const card = el('div', {
       class: 'approval-card',
       tabindex: 0,
@@ -699,6 +745,7 @@ function renderApprovalBatch(agentKey, items) {
         a.intent_category ? el('span', { class: 'badge' }, a.intent_category) : null,
         badge(expired ? 'expired' : a.status),
       ),
+      raised ? el('div', { class: 'meta raised-by', title: raiserFacts(raiser).map(([k, v]) => `${k}: ${v}`).join('\n') }, raised) : null,
       el('div', { class: 'meta', style: 'margin: 4px 0 6px;' },
         `created ${relTime(a.created_at)} · ` + (expired ? 'expired' : `expires ${relTime(a.expires_at)}`)),
       el('div', { style: 'background: var(--bg); border: 1px solid var(--border); border-radius: 4px; padding: 8px; margin: 4px 0;' },
@@ -722,8 +769,9 @@ function renderApprovalBatch(agentKey, items) {
 
 async function decideApproval(id, action) {
   try {
-    await api(`/v1/approvals/${id}/decide`, { method: 'POST', body: { Action: action } });
+    const out = await api(`/v1/approvals/${id}/decide`, { method: 'POST', body: { Action: action } });
     state.approvals = state.approvals.filter((a) => a.id !== id);
+    noteDecidedApproval(out);
     toast(action === 'allowed' ? 'Approved' : 'Denied');
     render();
   } catch (e) {
@@ -749,6 +797,7 @@ async function decideBatch(ids, action) {
     const flipped = (out || []).filter((r) => r.status === action).length;
     const stale = ids.length - flipped;
     state.approvals = state.approvals.filter((a) => !ids.includes(a.id));
+    (Array.isArray(out) ? out : []).forEach(noteDecidedApproval);
     if (flipped === 0) {
       staleNote(`All ${ids.length} were already decided on another device or expired.`);
     } else {
@@ -866,10 +915,51 @@ function filteredAudit() {
     if (f.event_type && e.event_type !== f.event_type) return false;
     if (f.decision && (e.decision || '') !== f.decision) return false;
     if (f.agent && (e.agent_id || '') !== f.agent) return false;
+    // The server already applied these to the loaded page; repeating them
+    // keeps rows that arrive live on the stream in line.
+    if (f.owner && (e.owner_user_id || '') !== f.owner) return false;
+    if (f.decided_by && (e.decided_by_user_id || '') !== f.decided_by) return false;
+    if (f.client_kind && (e.client_kind || '') !== f.client_kind) return false;
+    if (f.session && (e.agent_session_id || '') !== f.session) return false;
     if (!q) return true;
-    return [e.tool_name, e.upstream_name, e.reason, e.agent_id, agentLabel(e.agent_id), e.result_summary, e.event_type]
+    return [e.tool_name, e.upstream_name, e.reason, e.agent_id, agentLabel(e.agent_id), e.result_summary, e.event_type,
+      e.agent_name, e.owner_name, e.owner_email, e.decided_by_name, e.decided_by_email, e.client_name,
+      e.agent_session_id, e.client_session_id]
       .some((v) => (v || '').toLowerCase().includes(q));
   });
+}
+
+// AUDIT_SERVER_FILTERS are the actor filters sent to /v1/audit and the
+// export as query params (the keys are the param names).
+const AUDIT_SERVER_FILTERS = ['owner', 'decided_by', 'client_kind', 'session'];
+function auditServerParams(extra = {}) {
+  const p = new URLSearchParams(extra);
+  for (const k of AUDIT_SERVER_FILTERS) if (state.auditFilter[k]) p.set(k, state.auditFilter[k]);
+  return p;
+}
+function auditServerFiltered() {
+  return AUDIT_SERVER_FILTERS.some((k) => state.auditFilter[k]);
+}
+
+// reloadAudit refetches the first page after an actor filter changed, so
+// the table covers matching rows beyond what was already loaded.
+let auditSeq = 0;
+async function reloadAudit() {
+  const seq = ++auditSeq;
+  state.auditLoading = true;
+  render();
+  try {
+    const rows = await api('/v1/audit?' + auditServerParams({ limit: '100' }).toString());
+    if (seq !== auditSeq) return;
+    state.audit = rows || [];
+    state.auditEnd = false;
+    state.auditPaged = false;
+  } catch (e) {
+    if (seq === auditSeq) toast(e.message, 'error');
+  }
+  if (seq !== auditSeq) return;
+  state.auditLoading = false;
+  render();
 }
 
 function uniqueSorted(vals) {
@@ -887,6 +977,196 @@ function agentLabel(id) {
   return id.length > 12 ? id.slice(0, 12) + '…' : id;
 }
 
+// ---- who raised a call, who decided it --------------------------------------
+//
+// Audit rows carry the raiser fields inline, approvals under raised_by, inbox
+// docs and grants their own decider fields. Rows written before the server
+// recorded them have none of it: every helper falls back to the bare agent id
+// or returns '' / null so the views show what they showed before.
+
+const CLIENT_KIND_LABEL = {
+  t3: 'T3', claude_code: 'Claude Code', codex: 'Codex', cursor: 'Cursor', opencode: 'opencode',
+  cli: 'CLI', browser: 'Browser', unknown: 'Unknown',
+};
+const AGENT_KIND_LABEL = { dashboard: 'Dashboard', voice: 'Voice', cli: 'CLI', system: 'System', identity: 'Beknown key' };
+const DECIDED_VIA_LABEL = {
+  dashboard: 'dashboard', dashboard_batch: 'batch', push_token: 'notification tap', passkey: 'passkey',
+  telegram: 'Telegram', auto_rule: 'auto-rule', policy: 'policy rule', inbox_grant: 'inbox grant',
+  agent_cancel: 'cancelled by agent', expiry: 'expired',
+};
+
+function shortId(id, n = 12) {
+  if (!id) return '';
+  return id.length > n + 2 ? id.slice(0, n) + '…' : id;
+}
+
+// userNameById resolves a user id through the signed-in user and the /v1/users
+// directory (ensureUserDir), falling back to the short id.
+function userNameById(id) {
+  if (!id) return '';
+  if (state.user && state.user.id === id) return userLabel(state.user);
+  const u = (state.users.rows || []).find((x) => x.id === id);
+  return u ? userLabel(u) : shortId(id);
+}
+
+// ensureUserDir loads the users directory once (admin only) so owner and
+// decider ids resolve to names and the audit owner filter can list people.
+let userDirAsked = false;
+function ensureUserDir() {
+  if (userDirAsked || !isAdmin() || state.users.loaded || state.users.loading) return;
+  userDirAsked = true;
+  loadUsers().then(() => { if (state.inbox.openId) ibRefreshRegions(); });
+}
+
+// raiserOf normalises who raised a call. src is an audit row or an approval's
+// raised_by; fallbackId is the approval's agent_id for rows without one.
+function raiserOf(src, fallbackId) {
+  const r = src || {};
+  return {
+    id: r.caller_id || r.agent_id || fallbackId || '',
+    name: r.agent_name || '',
+    kind: r.agent_kind || '',
+    ownerId: r.owner_user_id || '', ownerName: r.owner_name || '', ownerEmail: r.owner_email || '',
+    mcpSession: r.mcp_session_id || '', agentSession: r.agent_session_id || '',
+    clientSession: r.client_session_id || '', claimed: !!r.client_session_claimed,
+    clientKind: r.client_kind || '', clientName: r.client_name || '', clientIP: r.client_ip || '',
+    via: r.via || '',
+  };
+}
+
+function raiserName(r) { return r.name || (r.id ? agentLabel(r.id) : ''); }
+function raiserOwner(r) { return r.ownerName || r.ownerEmail || userNameById(r.ownerId); }
+
+// raiserChip is one short label for where the call came from: the entry
+// point for dashboard / voice / CLI calls, else the MCP client.
+function raiserChip(r) {
+  if (['dashboard', 'voice', 'cli', 'system'].includes(r.kind)) return AGENT_KIND_LABEL[r.kind];
+  if (r.clientKind && r.clientKind !== 'unknown') return CLIENT_KIND_LABEL[r.clientKind] || r.clientKind;
+  if (r.kind === 'identity') return AGENT_KIND_LABEL.identity;
+  return '';
+}
+
+// raiserFacts are the details behind the one-line summary, [label, value].
+function raiserFacts(r) {
+  const owner = raiserOwner(r);
+  return [
+    ['Agent', r.name && r.id ? `${r.name} (${r.id})` : (r.id || r.name)],
+    ['Kind', r.kind],
+    ['Owner', owner && r.ownerEmail && r.ownerEmail !== owner ? `${owner} <${r.ownerEmail}>` : owner],
+    ['Client', r.clientName ? r.clientName + (r.clientKind ? ` (${r.clientKind})` : '') : r.clientKind],
+    ['IP', r.clientIP],
+    ['Via', r.via],
+    ['Toolyard session', r.agentSession],
+    ['MCP session', r.mcpSession],
+    ['Client session', r.clientSession ? r.clientSession + (r.claimed ? ' (claimed)' : '') : ''],
+  ].filter(([, v]) => v);
+}
+
+// raiserLine is the approvals summary: "Raised by <agent> · <owner> · <client>".
+function raiserLine(r) {
+  const parts = [raiserName(r), raiserOwner(r), raiserChip(r) || r.clientName].filter(Boolean);
+  return parts.length ? 'Raised by ' + parts.join(' · ') : '';
+}
+
+// raiserEl is the audit "Raised by" cell: agent + chip, owner, and a
+// details toggle for sessions, client, IP and via. openKey keeps the toggle
+// open across the re-render every live event triggers.
+function raiserEl(r, openKey) {
+  const name = raiserName(r);
+  if (!name && !r.ownerId && !r.ownerEmail) return '—';
+  const chip = raiserChip(r);
+  const owner = raiserOwner(r);
+  const facts = raiserFacts(r);
+  const more = facts.filter(([k]) => !['Agent', 'Owner'].includes(k));
+  return el('div', { class: 'actor', title: facts.map(([k, v]) => `${k}: ${v}`).join('\n') },
+    el('div', { class: 'actor-who' }, el('span', {}, name || '—'),
+      chip ? el('span', { class: 'chip actor-chip' }, chip) : null),
+    owner ? el('div', { class: 'meta' }, owner) : null,
+    more.length ? el('details', {
+      class: 'actor-more', open: !!(openKey && state.auditOpen[openKey]),
+      on: { toggle: (ev) => { if (openKey) state.auditOpen[openKey] = ev.target.open; } },
+    },
+      el('summary', {}, 'details'),
+      el('dl', { class: 'actor-facts' }, ...more.flatMap(([k, v]) => [
+        el('dt', {}, k),
+        el('dd', {}, k === 'Client session' && r.claimed
+          ? [r.clientSession, el('span', { class: 'badge claimed inline-badge', title: 'The client’s own unverified claim' }, 'claimed')]
+          : v),
+      ])),
+    ) : null,
+  );
+}
+
+function decidedViaLabel(via, ref) {
+  if (!via) return '';
+  if (via === 'auto_rule') return ref ? 'auto-rule ' + shortId(ref) : 'auto-rule';
+  return DECIDED_VIA_LABEL[via] || via;
+}
+
+// A decider is { name, email, userId, via, ref }; deciderWho is the person.
+function deciderWho(d) { return d.name || d.email || userNameById(d.userId); }
+
+function deciderTitle(d) {
+  const who = deciderWho(d);
+  return [
+    who && d.email && d.email !== who ? `${who} <${d.email}>` : who,
+    d.userId ? 'user ' + d.userId : '',
+    d.via ? 'via ' + d.via : '',
+    d.ref ? 'ref ' + d.ref : '',
+  ].filter(Boolean).join('\n');
+}
+
+// deciderText: "Decided by <person> via <label>", the instrument alone when
+// no person decided (policy, auto-rule), or '' when nothing is recorded.
+function deciderText(d) {
+  const who = deciderWho(d);
+  const via = decidedViaLabel(d.via, d.ref);
+  if (who) return 'Decided by ' + who + (via ? ' via ' + via : '');
+  if (d.via === 'expiry') return 'Expired';
+  if (d.via === 'agent_cancel') return 'Cancelled by agent';
+  return via ? 'Decided by ' + via : '';
+}
+
+// deciderEl is the audit "Decided by" cell: the person, then "via <label>".
+function deciderEl(d) {
+  const who = deciderWho(d);
+  const via = decidedViaLabel(d.via, d.ref);
+  if (!who && !via) return '—';
+  return el('div', { class: 'actor', title: deciderTitle(d) },
+    el('div', { class: 'actor-who' }, who || via),
+    who && via ? el('div', { class: 'meta' }, 'via ' + via) : null);
+}
+
+function auditDecider(e) {
+  return { name: e.decided_by_name, email: e.decided_by_email, userId: e.decided_by_user_id, via: e.decided_via, ref: e.decider_ref };
+}
+
+// approvalDecider reads the typed decider fields, else the legacy decided_by
+// (a user id, or "<via>:<ref>") and auto_decided_by (an auto-rule id).
+function approvalDecider(a) {
+  let via = a.decided_via || '', ref = a.decider_ref || '', userId = '';
+  const legacy = a.decided_by || '';
+  if (!via && a.auto_decided_by) { via = 'auto_rule'; ref = a.auto_decided_by; }
+  if (legacy) {
+    const i = legacy.indexOf(':');
+    const head = i > 0 ? legacy.slice(0, i) : legacy;
+    if (DECIDED_VIA_LABEL[head]) {
+      if (!via) { via = head; ref = ref || (i > 0 ? legacy.slice(i + 1) : ''); }
+    } else userId = legacy;
+  }
+  return { name: a.decider_name, email: a.decider_email, userId, via, ref };
+}
+
+// inboxDecider: decided_by is the display label the server stored; it is a
+// raw id or "<via>:<ref>" when no person decided, so it only stands in for
+// the name when it looks like one.
+function inboxDecider(r) {
+  const label = r.decided_by || '';
+  const raw = !label || label === r.decider_user_id ||
+    (r.decider_via && (label === r.decider_via || label.startsWith(r.decider_via + ':')));
+  return { name: r.decider_name || (raw ? '' : label), email: r.decider_email, userId: r.decider_user_id, via: r.decider_via, ref: r.decider_ref };
+}
+
 function csvCell(v) {
   const s = v == null ? '' : String(v);
   // Quote when the cell contains a comma, quote, or newline; double inner quotes.
@@ -897,7 +1177,7 @@ function csvCell(v) {
 // dropdown filters (the free-text q filter is client-only).
 function auditExportURL(format) {
   const f = state.auditFilter;
-  const p = new URLSearchParams({ format });
+  const p = auditServerParams({ format });
   if (f.event_type) p.set('event_type', f.event_type);
   if (f.decision) p.set('decision', f.decision);
   if (f.agent) p.set('agent_id', f.agent);
@@ -949,12 +1229,23 @@ function hooksExportURL(format) {
 
 function exportAuditCSV() {
   const rows = filteredAudit();
-  const header = ['when_iso', 'event_type', 'upstream', 'tool', 'decision', 'agent_id', 'agent', 'reason', 'result_summary'];
+  // The first nine columns keep their old order; who raised and who
+  // decided follow.
+  const header = ['when_iso', 'event_type', 'upstream', 'tool', 'decision', 'agent_id', 'agent', 'reason', 'result_summary',
+    'agent_name', 'agent_kind', 'owner_user_id', 'owner_name', 'owner_email',
+    'client_kind', 'client_name', 'client_ip', 'via',
+    'agent_session_id', 'mcp_session_id', 'client_session_id', 'client_session_claimed', 'approval_id',
+    'decided_by_user_id', 'decided_by_name', 'decided_by_email', 'decided_via', 'decider_ref'];
   const lines = [header.join(',')];
   for (const e of rows) {
     lines.push([
       new Date(e.ts).toISOString(), e.event_type, e.upstream_name, e.tool_name,
-      e.decision, e.agent_id, agentLabel(e.agent_id), e.reason, e.result_summary,
+      e.decision, e.agent_id, raiserName(raiserOf(e)), e.reason, e.result_summary,
+      e.agent_name, e.agent_kind, e.owner_user_id, e.owner_name, e.owner_email,
+      e.client_kind, e.client_name, e.client_ip, e.via,
+      e.agent_session_id, e.mcp_session_id, e.client_session_id,
+      e.client_session_id ? String(!!e.client_session_claimed) : '', e.approval_id,
+      e.decided_by_user_id, e.decided_by_name, e.decided_by_email, e.decided_via, e.decider_ref,
     ].map(csvCell).join(','));
   }
   const blob = new Blob([lines.join('\n')], { type: 'text/csv' });
@@ -967,7 +1258,7 @@ async function loadOlderAudit() {
   if (!state.audit.length) return;
   const oldest = state.audit[state.audit.length - 1].ts;
   try {
-    const older = await api(`/v1/audit?before=${oldest}&limit=100`);
+    const older = await api('/v1/audit?' + auditServerParams({ before: String(oldest), limit: '100' }).toString());
     if (!older || !older.length) { state.auditEnd = true; render(); return; }
     const seen = new Set(state.audit.map((a) => a.id));
     state.audit = state.audit.concat(older.filter((a) => !seen.has(a.id)));
@@ -977,14 +1268,20 @@ async function loadOlderAudit() {
 }
 
 function viewAudit() {
-  if (!state.audit.length) {
+  const f = state.auditFilter;
+  // With an actor filter on, an empty page still shows the filter bar so
+  // the filter can be changed back.
+  if (!state.audit.length && !auditServerFiltered() && !state.auditLoading) {
     return el('div', { class: 'card empty' }, 'No events yet.');
   }
-  const f = state.auditFilter;
   const setF = (k) => (ev) => { f[k] = ev.target.value; render(); };
+  // Actor filters reload the page from the server (AUDIT_SERVER_FILTERS).
+  const setServerF = (k) => (ev) => { f[k] = ev.target.value; reloadAudit(); };
   const eventTypes = uniqueSorted(state.audit.map((e) => e.event_type));
   const decisions = uniqueSorted(state.audit.map((e) => e.decision));
   const agents = uniqueSorted(state.audit.map((e) => e.agent_id));
+  const agentNames = {};
+  for (const e of state.audit) if (e.agent_id && e.agent_name && !agentNames[e.agent_id]) agentNames[e.agent_id] = e.agent_name;
 
   const opt = (v, label) => el('option', { value: v, selected: false }, label);
   const sel = (key, all, vals) => {
@@ -995,48 +1292,100 @@ function viewAudit() {
   // Agent dropdown shows names but keeps the agent_id as the option value so
   // filtering (filteredAudit compares e.agent_id) and server export keep working.
   const selAgent = () => {
-    const s = el('select', { on: { change: setF('agent') } }, opt('', 'All agents'), ...agents.map((id) => opt(id, agentLabel(id))));
+    const s = el('select', { on: { change: setF('agent') } }, opt('', 'All agents'),
+      ...agents.map((id) => opt(id, agentNames[id] || agentLabel(id))));
     s.value = f.agent || '';
     return s;
   };
+  // Owner and decider dropdowns list the users directory plus anyone the
+  // loaded rows name, keyed by user id (the server filters on ids).
+  const people = new Map();
+  for (const u of state.users.rows || []) if (u.id) people.set(u.id, userLabel(u));
+  const notePerson = (id, name, email) => { if (id && !people.has(id)) people.set(id, name || email || shortId(id)); };
+  for (const e of state.audit) {
+    notePerson(e.owner_user_id, e.owner_name, e.owner_email);
+    notePerson(e.decided_by_user_id, e.decided_by_name, e.decided_by_email);
+  }
+  for (const k of ['owner', 'decided_by']) notePerson(f[k], userNameById(f[k]));
+  const peopleOpts = [...people.entries()].sort((a, b) => a[1].localeCompare(b[1]));
+  const selPerson = (key, all, title) => {
+    const s = el('select', { class: 'audit-actor-filter', title, on: { change: setServerF(key) } },
+      opt('', all), ...peopleOpts.map(([id, label]) => opt(id, label)));
+    s.value = f[key] || '';
+    return s;
+  };
+  const kinds = Object.keys(CLIENT_KIND_LABEL);
+  for (const k of uniqueSorted(state.audit.map((e) => e.client_kind).concat([f.client_kind]))) if (!kinds.includes(k)) kinds.push(k);
+  const selClient = () => {
+    const s = el('select', { class: 'audit-actor-filter', title: 'Client the call came from', on: { change: setServerF('client_kind') } },
+      opt('', 'All clients'), ...kinds.map((k) => opt(k, CLIENT_KIND_LABEL[k] || k)));
+    s.value = f.client_kind || '';
+    return s;
+  };
+  // The session box commits on Enter or blur; sessionDraft keeps what's
+  // typed across live re-renders until then.
+  const commitSession = (ev) => {
+    const v = ev.target.value.trim();
+    f.sessionDraft = null;
+    if (v !== f.session) { f.session = v; reloadAudit(); }
+  };
+  const sessionBox = el('input', {
+    id: 'audit-session', type: 'search', class: 'audit-session', placeholder: 'Session (ses_…)',
+    title: 'Toolyard agent session id',
+    on: {
+      input: (ev) => { f.sessionDraft = ev.target.value; },
+      change: commitSession,
+      keydown: (ev) => { if (ev.key === 'Enter') commitSession(ev); },
+    },
+  });
+  sessionBox.value = f.sessionDraft != null ? f.sessionDraft : (f.session || '');
 
   const filterBar = el('div', { class: 'row audit-filters', style: 'gap: 8px; margin-bottom: 12px; flex-wrap: wrap;' },
     (() => { const i = el('input', { id: 'audit-q', type: 'search', placeholder: 'Filter tool / reason / agent / result…', class: 'grow', on: { input: setF('q') } }); i.value = f.q || ''; return i; })(),
     sel('event_type', 'All events', eventTypes),
     sel('decision', 'All decisions', decisions),
     selAgent(),
+    selPerson('owner', 'All owners', 'Owner of the calling agent'),
+    selPerson('decided_by', 'Any decider', 'Person who approved or denied'),
+    selClient(),
+    sessionBox,
     el('button', { on: { click: exportAuditCSV }, title: 'Export the rows currently shown (includes the text filter)' }, 'Export shown'),
     el('a', { href: auditExportURL('csv'), target: '_blank', title: 'Server-side export of the full log honoring the dropdown filters' }, 'Full CSV'),
     el('a', { href: auditExportURL('json'), target: '_blank' }, 'Full JSON'),
   );
 
   const rows = filteredAudit();
-  const tbl = el('table', {},
+  const tbl = el('table', { class: 'audit-table' },
     el('thead', {}, el('tr', {},
       el('th', {}, 'When'),
       el('th', {}, 'Event'),
       el('th', {}, 'Tool'),
-      el('th', {}, 'Agent'),
+      el('th', {}, 'Raised by'),
       el('th', {}, 'Decision'),
+      el('th', {}, 'Decided by'),
       el('th', {}, 'Reasoning / Result'),
     )),
-    el('tbody', {}, rows.map((e) => el('tr', {},
+    el('tbody', {}, rows.length ? rows.map((e) => el('tr', {},
       el('td', { class: 'meta' }, relTime(e.ts)),
       el('td', {}, e.event_type),
       el('td', {}, e.tool_name ? `${e.upstream_name || ''} · ${e.tool_name}` : '—'),
-      el('td', { class: 'meta', title: e.agent_id || '' }, agentLabel(e.agent_id)),
+      el('td', { class: 'audit-raiser' }, raiserEl(raiserOf(e), e.id)),
       el('td', {}, e.decision || '—'),
+      el('td', { class: 'audit-decider' }, deciderEl(auditDecider(e))),
       el('td', {}, e.reason ? el('div', {}, el('div', {}, e.reason),
         e.result_summary ? el('div', { class: 'meta', style: 'margin-top: 4px;' }, e.result_summary) : null)
         : (e.result_summary || '—')),
-    ))),
+    )) : el('tr', {}, el('td', { class: 'empty', colSpan: 7 },
+      state.auditLoading ? 'Loading…' : 'No events match these filters.'))),
   );
 
   const footer = el('div', { class: 'row', style: 'margin-top: 12px; align-items: center; gap: 12px;' },
-    el('span', { class: 'meta' }, `${rows.length} of ${state.audit.length} loaded`),
-    state.auditEnd
-      ? el('span', { class: 'meta' }, 'No older events.')
-      : el('button', { on: { click: loadOlderAudit } }, 'Load older'),
+    el('span', { class: 'meta' }, `${rows.length} of ${state.audit.length} loaded` +
+      (auditServerFiltered() ? ' · filtered by owner, decider, client or session' : '')),
+    state.auditLoading ? el('span', { class: 'meta' }, 'Loading…')
+      : state.auditEnd
+        ? el('span', { class: 'meta' }, 'No older events.')
+        : el('button', { disabled: !state.audit.length, on: { click: loadOlderAudit } }, 'Load older'),
   );
 
   return el('div', { class: 'card' }, filterBar, tbl, footer);
@@ -4512,8 +4861,14 @@ function viewInsights() {
   // Agents
   const agentRows = (state.insights.agents || []).map((a) => {
     const idShort = a.agent_id ? a.agent_id.slice(0, 12) : '(anonymous)';
+    // The name leads when metrics recorded one (or the roster knows the id);
+    // the short id stays underneath for "Forget" and cross-checking.
+    const known = a.agent_id && (state.agents || []).find((x) => x.id === a.agent_id);
+    const name = a.agent_name || (known && known.name) || '';
     return el('tr', {},
-      el('td', {}, el('code', {}, idShort), a.agent_name ? el('div', { class: 'meta' }, a.agent_name) : null),
+      el('td', { title: a.agent_id || '' }, name
+        ? [el('div', {}, name), el('div', { class: 'meta' }, el('code', {}, idShort))]
+        : el('code', {}, idShort)),
       el('td', {}, fmtNum(a.calls)),
       el('td', {}, a.distinct_tools),
       el('td', { style: a.error_rate > 0.1 ? 'color: var(--danger);' : '' }, pct(a.error_rate)),
@@ -4549,7 +4904,7 @@ function viewInsights() {
     const parts = [];
     if (r.kind) parts.push(r.kind);
     if (r.tool_name) parts.push('tool=' + r.tool_name);
-    if (r.agent_id) parts.push('agent=' + r.agent_id.slice(0, 10));
+    if (r.agent_id) parts.push('agent=' + (r.agent_name || agentLabel(r.agent_id)));
     if (r.fingerprint) parts.push('fp=' + r.fingerprint.slice(0, 8));
     return parts.join(' · ');
   };
@@ -4681,7 +5036,7 @@ function viewNotifications() {
           el('tbody', {}, ...items.map((a) => el('tr', {},
             el('td', {}, relTime(a.ts)),
             el('td', { style: 'color: ' + sevColor(a.severity) + ';' }, a.kind),
-            el('td', {}, [a.agent_id ? el('div', {}, el('code', {}, (a.agent_id || '').slice(0, 12))) : null,
+            el('td', {}, [a.agent_id ? el('div', { title: a.agent_id }, el('code', {}, a.agent_name || agentLabel(a.agent_id))) : null,
                           a.tool_name ? el('div', {}, el('code', {}, a.tool_name)) : null]),
             el('td', {}, a.summary),
             el('td', {}, el('button', {
@@ -6279,6 +6634,7 @@ function ibCard(r) {
     el('h3', {}, r.title),
     el('p', { class: 'sum' }, r.summary),
     fs.length ? el('div', { class: 'ib-flags' }, ...fs.map(ibFlagChip)) : null,
+    ibDeciderEl(r),
     el('div', { class: 'ib-minirow' },
       el('button', {
         class: 'ib-miniplay', 'data-ib-play': r.id, 'aria-label': 'Play voice note',
@@ -6735,6 +7091,7 @@ function ibToolRow(r, t, k, allow, grant, editable) {
           Object.keys(ibNarrowed(r, k)).length || t.requested_params ? el('span', { class: 'ib-tag narrowed' }, 'Narrowed') : null,
           state_ ? el('span', { class: 'ib-tstate ' + state_[0] }, state_[1]) : null),
         el('p', { class: 'ib-tsum' }, t.summary),
+        state_ && ibGrantBy(grant) ? el('p', { class: 'ib-grantby' }, ibGrantBy(grant)) : null,
         (t.flags || []).length ? el('div', { class: 'ib-flags' }, ...t.flags.map(ibFlagChip)) : null,
         red && r.status === 'pending' ? el('p', { class: 'ib-flagwhy' }, red.why) : null,
         el('div', { class: 'ib-rowlinks' },
@@ -7043,7 +7400,26 @@ function ibResultEl(r) {
   }[r.status] || r.status;
   const detail = r.status === 'approved' && r.grants_expire_at ? `Permissions expire at ${ibClock(r.grants_expire_at)}.` : '';
   return el('div', { class: 'ib-result ' + cls }, el('b', {}, title),
-    r.owner_note ? el('span', {}, 'Your note: “' + r.owner_note + '”') : null, detail ? el('span', {}, detail) : null);
+    r.owner_note ? el('span', {}, 'Your note: “' + r.owner_note + '”') : null, detail ? el('span', {}, detail) : null,
+    ibDeciderEl(r));
+}
+
+// ibDeciderEl: "Decided by <name> via <label>" on a closed request, or null
+// while it's open or when the doc recorded nobody (older docs, expiry).
+function ibDeciderEl(r) {
+  if (!r || r.status === 'pending') return null;
+  const d = inboxDecider(r);
+  // The status line already says it expired or the agent withdrew it.
+  if (!deciderWho(d) && (d.via === 'expiry' || d.via === 'agent_cancel')) return null;
+  const text = deciderText(d);
+  return text ? el('span', { class: 'ib-decider', title: deciderTitle(d) }, text) : null;
+}
+
+// ibGrantBy: "issued by X · revoked by Y" for a grant, '' when unrecorded.
+function ibGrantBy(g) {
+  if (!g) return '';
+  return [g.issued_by ? 'issued by ' + userNameById(g.issued_by) : '',
+    g.revoked_by ? 'revoked by ' + userNameById(g.revoked_by) : ''].filter(Boolean).join(' · ');
 }
 
 function ibActivityEl(r) {
@@ -7107,7 +7483,8 @@ function viewInboxSessions() {
   const agentsWithSessions = new Set(sessions.map((x) => x.agent_id));
   const orphanGrants = (s.grants || []).filter((g) => !agentsWithSessions.has(g.agent_id));
   const grantRow = (g) => el('div', { class: 'ib-grantrow' },
-    el('span', {}, el('b', {}, 'Live'), ' · ', el('code', {}, g.tool), ' · ', Math.max(0, Math.round((g.expires_at - Date.now()) / 60000)) + ' min left'),
+    el('span', {}, el('b', {}, 'Live'), ' · ', el('code', {}, g.tool), ' · ', Math.max(0, Math.round((g.expires_at - Date.now()) / 60000)) + ' min left',
+      g.issued_by ? el('span', { class: 'meta' }, ' · issued by ' + userNameById(g.issued_by)) : null),
     el('button', { class: 'danger', on: { click: async () => {
       try { await api('/v1/inbox/grants/' + g.id + '/revoke', { method: 'POST', body: {} }); toast('Revoked. The agent stops at its next call.'); loadInboxSessions(); }
       catch (e) { toast(e.message, 'error'); }

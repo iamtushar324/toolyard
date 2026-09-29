@@ -932,3 +932,23 @@ a.btn.primary:hover { background: var(--accent-hover); }
 .key-pending { margin-top: 10px; }
 .key-pending ul { list-style: none; margin: 4px 0; padding: 0; font-size: 12px; color: var(--warn); display: flex; flex-direction: column; gap: 3px; }
 .key-pending .reg-error { font-size: 12px; }
+
+/* ---- who raised a call, who decided it: audit, approvals, inbox ---- */
+.audit-filters select, .audit-filters .audit-session { width: auto; min-width: 0; max-width: 100%; }
+.audit-filters .audit-session { flex: 0 1 180px; }
+.audit-table .audit-raiser { min-width: 150px; }
+.actor { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.actor-who { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; word-break: break-word; }
+.actor-chip { color: var(--link); border-color: var(--link); background: transparent; }
+.actor-more summary { cursor: pointer; color: var(--muted); font-size: 11px; list-style-position: inside; }
+.actor-facts { display: grid; grid-template-columns: auto 1fr; gap: 2px 8px; margin: 4px 0 0; font-size: 11px; }
+.actor-facts dt { color: var(--muted); white-space: nowrap; }
+.actor-facts dd { margin: 0; font-family: ui-monospace, SFMono-Regular, Menlo, monospace; word-break: break-all; }
+.badge.claimed { color: var(--warn); border-color: var(--warn); font-family: inherit; }
+.raised-by { margin-top: 4px; }
+.recent-row { border-top: 1px solid var(--border); padding: 10px 0; display: flex; flex-direction: column; gap: 3px; }
+.recent-row:first-of-type { border-top: 0; }
+.recent-tool { font-weight: 500; }
+.ib-decider { font-size: 13px; color: var(--muted); }
+.ib-result .ib-decider { color: inherit; opacity: 0.85; }
+.ib-grantby { margin: 0; font-size: 12.5px; color: var(--muted); }
