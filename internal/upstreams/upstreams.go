@@ -233,6 +233,13 @@ func (s *Service) LoadAll(ctx context.Context) error {
 		if !srv.Enabled {
 			continue
 		}
+		// A stdio row saved before -no-stdio-upstreams was turned on must
+		// not start either. Built-ins that are switched on re-attach through
+		// UpsertBuiltin right after this, which overwrites the status.
+		if s.stdioRefused(srv) {
+			s.recordStatus(ctx, srv.Name, "", errStdioDisabled.Error(), 0)
+			continue
+		}
 		if err := s.connect(ctx, srv); err != nil {
 			s.recordStatus(ctx, srv.Name, "", err.Error(), 0)
 		}
@@ -291,8 +298,8 @@ func (s *Service) Add(ctx context.Context, srv Server) (*Server, error) {
 	if err := validate(srv); err != nil {
 		return nil, err
 	}
-	if srv.Transport == "stdio" && !s.policy.AllowStdio {
-		return nil, fmt.Errorf("%w: stdio upstreams disabled by -no-stdio-upstreams", ErrInvalid)
+	if s.stdioRefused(srv) {
+		return nil, errStdioDisabled
 	}
 	if denied := s.policy.envDenied(srv.Env); denied != "" {
 		return nil, fmt.Errorf("%w: env key %q is on the denylist", ErrInvalid, denied)
@@ -386,6 +393,10 @@ func (s *Service) Reconnect(ctx context.Context, name string) (*Server, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Built-ins run a command the binary chose, not dashboard input.
+	if s.stdioRefused(*srv) && !isReservedBuiltin(name) {
+		return nil, errStdioDisabled
+	}
 	_ = s.gw.RemoveUpstream(name)
 	if err := s.connect(ctx, *srv); err != nil {
 		s.recordStatus(ctx, name, "", err.Error(), 0)
@@ -393,6 +404,13 @@ func (s *Service) Reconnect(ctx context.Context, name string) (*Server, error) {
 		return final, err
 	}
 	return s.get(ctx, name)
+}
+
+var errStdioDisabled = fmt.Errorf("%w: stdio upstreams disabled by -no-stdio-upstreams", ErrInvalid)
+
+// stdioRefused reports whether -no-stdio-upstreams forbids starting srv.
+func (s *Service) stdioRefused(srv Server) bool {
+	return srv.Transport == "stdio" && !s.policy.AllowStdio
 }
 
 // connect attaches the upstream to the gateway and records status. Caller
