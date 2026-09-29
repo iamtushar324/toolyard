@@ -129,8 +129,9 @@ func (s *Server) SecurityHeaders(next http.Handler) http.Handler {
 
 // EnforceOriginOnMutations checks Origin/Referer on state-changing methods
 // when PublicURL is set. Cookie-authenticated POST/PATCH/DELETE that don't
-// match the public origin are 403'd. Bearer-authenticated /mcp traffic is
-// excluded — Authorization header alone is not CSRF-replayable.
+// match the public origin are 403'd. Bearer-authenticated /mcp traffic and
+// the token-authenticated agent routes (exemptFromOriginCheck) are excluded —
+// a credential that isn't a cookie is not CSRF-replayable.
 func (s *Server) EnforceOriginOnMutations(next http.Handler) http.Handler {
 	if s.security.PublicURL == "" {
 		return next
@@ -151,6 +152,15 @@ func (s *Server) EnforceOriginOnMutations(next http.Handler) http.Handler {
 			// CSRF-replayable.
 			if r.URL.Path == MemoryWebhookIngestPath &&
 				strings.HasPrefix(r.Header.Get("Authorization"), "Bearer ") {
+				next.ServeHTTP(w, r)
+				return
+			}
+			// Routes authenticated by an agent bearer token, enrollment code
+			// or signed tap token (the CSRF-header exemptions) are called by
+			// CLIs, hooks and webhooks that send no Origin. Without a cookie
+			// they aren't CSRF-replayable. Login and setup are browser-only
+			// forms, so they keep the check.
+			if exemptFromOriginCheck(r.URL.Path) {
 				next.ServeHTTP(w, r)
 				return
 			}
@@ -376,6 +386,17 @@ func exemptFromCSRFHeader(path string) bool {
 		return true
 	}
 	return false
+}
+
+// exemptFromOriginCheck is exemptFromCSRFHeader minus the browser-only
+// bootstrap forms (setup, login), which have no cookie to protect yet but
+// should still only be posted from the dashboard's own origin.
+func exemptFromOriginCheck(path string) bool {
+	switch path {
+	case "/v1/auth/setup", "/v1/auth/login":
+		return false
+	}
+	return exemptFromCSRFHeader(path)
 }
 
 // unauthRouteRule describes a per-(route, IP) budget for the unauth-route

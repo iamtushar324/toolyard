@@ -160,19 +160,31 @@ func (d *AnomalyDetector) detectErrorSpikes(ctx context.Context) error {
 		return err
 	}
 	defer rows.Close()
+	type toolStats struct {
+		tool                                             string
+		recentCalls, recentErrors, histCalls, histErrors int64
+	}
+	var stats []toolStats
 	for rows.Next() {
-		var tool string
-		var recentCalls, recentErrors, histCalls, histErrors int64
-		if err := rows.Scan(&tool, &recentCalls, &recentErrors, &histCalls, &histErrors); err != nil {
+		var s toolStats
+		if err := rows.Scan(&s.tool, &s.recentCalls, &s.recentErrors, &s.histCalls, &s.histErrors); err != nil {
 			return err
 		}
-		if recentCalls < 20 {
+		stats = append(stats, s)
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	// The store has one connection: close the cursor before querying again.
+	rows.Close()
+	for _, s := range stats {
+		if s.recentCalls < 20 {
 			continue
 		}
-		recentRate := float64(recentErrors) / float64(recentCalls)
+		recentRate := float64(s.recentErrors) / float64(s.recentCalls)
 		var histRate float64
-		if histCalls > 0 {
-			histRate = float64(histErrors) / float64(histCalls)
+		if s.histCalls > 0 {
+			histRate = float64(s.histErrors) / float64(s.histCalls)
 		}
 		if recentRate < 0.05 {
 			continue
@@ -180,17 +192,17 @@ func (d *AnomalyDetector) detectErrorSpikes(ctx context.Context) error {
 		if histRate > 0 && recentRate < histRate*3 {
 			continue
 		}
-		if d.recentlyRecorded(ctx, "error_spike", "", tool, hourStart) {
+		if d.recentlyRecorded(ctx, "error_spike", "", s.tool, hourStart) {
 			continue
 		}
-		_ = d.r.RecordAnomaly(ctx, "error_spike", "warn", "", tool,
-			formatErrorSummary(tool, recentRate, histRate),
+		_ = d.r.RecordAnomaly(ctx, "error_spike", "warn", "", s.tool,
+			formatErrorSummary(s.tool, recentRate, histRate),
 			map[string]any{
 				"recent_rate": recentRate, "hist_rate": histRate,
-				"recent_calls": recentCalls, "recent_errors": recentErrors,
+				"recent_calls": s.recentCalls, "recent_errors": s.recentErrors,
 			})
 	}
-	return rows.Err()
+	return nil
 }
 
 // detectArgsOutliers flags a single call whose args size is way over the
@@ -248,28 +260,41 @@ func (d *AnomalyDetector) detectArgsOutliers(ctx context.Context) error {
 		return err
 	}
 	defer rows2.Close()
+	type outlier struct {
+		tool, agent     string
+		size, threshold int
+		ts              int64
+	}
+	var outliers []outlier
 	for rows2.Next() {
-		var tname, agent string
-		var size int
-		var ts int64
-		if err := rows2.Scan(&tname, &agent, &size, &ts); err != nil {
+		var o outlier
+		if err := rows2.Scan(&o.tool, &o.agent, &o.size, &o.ts); err != nil {
 			return err
 		}
-		threshold, ok := p99[tname]
+		threshold, ok := p99[o.tool]
 		if !ok || threshold <= 0 {
 			continue
 		}
-		if size < threshold*3 {
+		if o.size < threshold*3 {
 			continue
 		}
-		if d.recentlyRecorded(ctx, "args_outlier", agent, tname, hourStart) {
-			continue
-		}
-		_ = d.r.RecordAnomaly(ctx, "args_outlier", "info", agent, tname,
-			formatArgsSummary(tname, size, threshold),
-			map[string]any{"size": size, "p99_baseline": threshold, "ts": ts})
+		o.threshold = threshold
+		outliers = append(outliers, o)
 	}
-	return rows2.Err()
+	if err := rows2.Err(); err != nil {
+		return err
+	}
+	// The store has one connection: close the cursor before querying again.
+	rows2.Close()
+	for _, o := range outliers {
+		if d.recentlyRecorded(ctx, "args_outlier", o.agent, o.tool, hourStart) {
+			continue
+		}
+		_ = d.r.RecordAnomaly(ctx, "args_outlier", "info", o.agent, o.tool,
+			formatArgsSummary(o.tool, o.size, o.threshold),
+			map[string]any{"size": o.size, "p99_baseline": o.threshold, "ts": o.ts})
+	}
+	return nil
 }
 
 // detectReasonRepeats flags an agent re-using the same reason text many
@@ -289,24 +314,36 @@ func (d *AnomalyDetector) detectReasonRepeats(ctx context.Context) error {
 		return err
 	}
 	defer rows.Close()
+	type repeat struct {
+		agent, reason string
+		n             int64
+	}
+	var repeats []repeat
 	for rows.Next() {
-		var agent, reason string
-		var n int64
-		if err := rows.Scan(&agent, &reason, &n); err != nil {
+		var r repeat
+		if err := rows.Scan(&r.agent, &r.reason, &r.n); err != nil {
 			return err
 		}
-		if d.recentlyRecorded(ctx, "reason_repeat", agent, "", hourStart) {
+		repeats = append(repeats, r)
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	// The store has one connection: close the cursor before querying again.
+	rows.Close()
+	for _, r := range repeats {
+		if d.recentlyRecorded(ctx, "reason_repeat", r.agent, "", hourStart) {
 			continue
 		}
-		snippet := reason
+		snippet := r.reason
 		if len(snippet) > 80 {
 			snippet = snippet[:80] + "…"
 		}
-		_ = d.r.RecordAnomaly(ctx, "reason_repeat", "info", agent, "",
-			"agent reused the same _reason "+itoa(n)+" times in 1h: "+snippet,
-			map[string]any{"reason": reason, "count": n})
+		_ = d.r.RecordAnomaly(ctx, "reason_repeat", "info", r.agent, "",
+			"agent reused the same _reason "+itoa(r.n)+" times in 1h: "+snippet,
+			map[string]any{"reason": r.reason, "count": r.n})
 	}
-	return rows.Err()
+	return nil
 }
 
 func (d *AnomalyDetector) recentlyRecorded(ctx context.Context, kind, agent, tool string, hourStart time.Time) bool {
