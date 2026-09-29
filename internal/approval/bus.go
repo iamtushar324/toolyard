@@ -28,6 +28,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/tusharbhardwaj/toolyard/internal/actor"
 	"github.com/tusharbhardwaj/toolyard/internal/store"
 )
 
@@ -87,6 +88,17 @@ type Request struct {
 	// that prevented the tool from being invoked at all (e.g., the
 	// upstream disappeared between approval and execution).
 	ResultError string `json:"result_error,omitempty"`
+
+	// RaisedBy snapshots who raised the call (persisted as raised_by
+	// JSON), so a call executed after approval on a background context is
+	// still attributed to its agent, owner, client and session.
+	RaisedBy *actor.Raiser `json:"raised_by,omitempty"`
+	// Decider fields say who decided and how; DecidedBy keeps its legacy
+	// value (actor.Decider.Legacy).
+	DecidedVia   string `json:"decided_via,omitempty"`
+	DeciderEmail string `json:"decider_email,omitempty"`
+	DeciderName  string `json:"decider_name,omitempty"`
+	DeciderRef   string `json:"decider_ref,omitempty"`
 }
 
 // Notifier is implemented by the push and realtime services so the bus can
@@ -281,6 +293,8 @@ type NewRequest struct {
 	// RequireHuman, when true, suppresses the auto-approval short-circuit so
 	// the request always waits for a human. Set by an explicit `ask` policy.
 	RequireHuman bool
+	// RaisedBy is who raised the call; stored on the request.
+	RaisedBy actor.Raiser
 }
 
 func (b *Bus) create(ctx context.Context, in NewRequest) (*Request, error) {

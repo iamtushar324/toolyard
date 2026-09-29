@@ -10,6 +10,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/tusharbhardwaj/toolyard/internal/actor"
 	"github.com/tusharbhardwaj/toolyard/internal/store"
 )
 
@@ -39,6 +40,23 @@ type Event struct {
 	Arguments     json.RawMessage `json:"arguments,omitempty"`
 	ResultSummary string          `json:"result_summary,omitempty"`
 	ApprovalID    string          `json:"approval_id,omitempty"`
+
+	// Raiser is who raised the call. Write fills empty fields from the
+	// actor.Raiser on ctx, so call sites needn't repeat it.
+	actor.Raiser
+	// Decider is who approved or denied, and how (empty when no decision
+	// is part of this event).
+	DecidedByUserID string `json:"decided_by_user_id,omitempty"`
+	DecidedByEmail  string `json:"decided_by_email,omitempty"`
+	DecidedByName   string `json:"decided_by_name,omitempty"`
+	DecidedVia      string `json:"decided_via,omitempty"`
+	DeciderRef      string `json:"decider_ref,omitempty"`
+}
+
+// SetDecider copies d into the event's decider fields.
+func (e *Event) SetDecider(d actor.Decider) {
+	e.DecidedByUserID, e.DecidedByEmail, e.DecidedByName = d.UserID, d.Email, d.Name
+	e.DecidedVia, e.DeciderRef = d.Via, d.Ref
 }
 
 type Logger struct {
