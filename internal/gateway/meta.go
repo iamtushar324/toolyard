@@ -83,7 +83,9 @@ func (g *Gateway) handleSearchTools() directHandler {
 		}
 		needle := strings.ToLower(strings.TrimSpace(q))
 
-		entries := g.Catalog()
+		// Only the tools this caller may use: a member searching for a
+		// server they were never granted finds nothing, as if it weren't there.
+		entries := g.CatalogFor(ctx)
 		// Hide the meta-tools themselves from search results so the model can't
 		// recursively call tools.execute -> tools.execute.
 		filtered := entries[:0]

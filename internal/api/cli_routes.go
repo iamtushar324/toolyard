@@ -45,20 +45,23 @@ func (s *Server) cliWhoami(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// GET /v1/agents/tools — bearer-auth catalog listing for the CLI.
+// GET /v1/agents/tools — bearer-auth catalog listing for the CLI, limited
+// to the tool groups the agent's owner may use.
 func (s *Server) cliToolsList(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		writeError(w, http.StatusMethodNotAllowed, "GET only")
 		return
 	}
-	if _, ok := s.requireAgent(w, r); !ok {
+	agentID, ok := s.requireAgent(w, r)
+	if !ok {
 		return
 	}
 	if s.gateway == nil {
 		writeJSON(w, http.StatusOK, []any{})
 		return
 	}
-	writeJSON(w, http.StatusOK, s.gateway.Catalog())
+	ctx := gateway.WithAgentID(r.Context(), agentID)
+	writeJSON(w, http.StatusOK, s.gateway.CatalogFor(ctx))
 }
 
 // GET /v1/agents/approvals/{id} — bearer-auth approval status polling

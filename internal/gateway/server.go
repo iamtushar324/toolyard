@@ -262,23 +262,7 @@ func New(opts Options) *Gateway {
 	if opts.MaxPendingPerAgent <= 0 {
 		opts.MaxPendingPerAgent = DefaultMaxPendingPerAgent
 	}
-	serverOpts := []server.ServerOption{
-		server.WithToolCapabilities(true),
-		server.WithLogging(),
-		server.WithRecovery(),
-		server.WithInstructions(buildInstructions(opts.Approval, opts.InLineWait)),
-	}
-	if opts.Visibility != nil {
-		vp := opts.Visibility
-		serverOpts = append(serverOpts, server.WithToolFilter(
-			func(ctx context.Context, tools []mcp.Tool) []mcp.Tool {
-				return vp.List(ctx, tools)
-			},
-		))
-	}
-	mcpSrv := server.NewMCPServer(opts.Name, opts.Version, serverOpts...)
-	return &Gateway{
-		mcp:                 mcpSrv,
+	g := &Gateway{
 		policy:              opts.Policy,
 		approval:            opts.Approval,
 		audit:               opts.Audit,
@@ -297,6 +281,92 @@ func New(opts Options) *Gateway {
 		tools:               map[string]toolEntry{},
 		upstreams:           map[string]*upstream{},
 	}
+	serverOpts := []server.ServerOption{
+		server.WithToolCapabilities(true),
+		server.WithLogging(),
+		server.WithRecovery(),
+		server.WithInstructions(buildInstructions(opts.Approval, opts.InLineWait)),
+	}
+	// Filters run in registration order: access first, so the visibility
+	// provider only ever ranks tools the caller may use.
+	if opts.Access != nil {
+		serverOpts = append(serverOpts, server.WithToolFilter(g.accessToolFilter))
+	}
+	if opts.Visibility != nil {
+		vp := opts.Visibility
+		serverOpts = append(serverOpts, server.WithToolFilter(
+			func(ctx context.Context, tools []mcp.Tool) []mcp.Tool {
+				return vp.List(ctx, tools)
+			},
+		))
+	}
+	g.mcp = server.NewMCPServer(opts.Name, opts.Version, serverOpts...)
+	return g
+}
+
+// accessDeniedReason is the audit reason on every call refused because the
+// caller's dashboard user was never granted the tool's group.
+const accessDeniedReason = "access: server not granted"
+
+// scopeFor resolves the caller's access scope. Without a resolver every
+// caller has the run of the catalog, exactly as before access existed.
+func (g *Gateway) scopeFor(ctx context.Context, callerID string) access.Scope {
+	if g.access == nil {
+		return access.Scope{All: true}
+	}
+	return g.access.ScopeFor(ctx, callerID)
+}
+
+// allowsEntry reports whether callerID may see and call entry.
+func (g *Gateway) allowsEntry(ctx context.Context, callerID string, entry toolEntry) bool {
+	if g.access == nil {
+		return true
+	}
+	return g.scopeFor(ctx, callerID).AllowsTool(entry.upstream, entry.tool.Name)
+}
+
+// accessToolFilter is the tools/list filter installed when a resolver is
+// configured. It drops every tool whose group the caller's scope doesn't
+// reach; a tool the gateway doesn't know is dropped too (fail closed).
+func (g *Gateway) accessToolFilter(ctx context.Context, tools []mcp.Tool) []mcp.Tool {
+	scope := g.scopeFor(ctx, agentIDFromContext(ctx))
+	if scope.All {
+		return tools
+	}
+	out := make([]mcp.Tool, 0, len(tools))
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	for _, t := range tools {
+		if e, ok := g.tools[t.Name]; ok && scope.AllowsTool(e.upstream, e.tool.Name) {
+			out = append(out, t)
+		}
+	}
+	return out
+}
+
+// notFoundResult is the answer for an unknown tool. Calls to a tool the
+// caller was never granted return the same result, so probing names
+// doesn't reveal which servers exist.
+func notFoundResult(toolName string) *mcp.CallToolResult {
+	return mcp.NewToolResultErrorf("tool %q not found in catalog", toolName)
+}
+
+// denyUngranted answers a call to a tool outside the caller's scope. The
+// agent sees an unknown-tool result; the audit log and metrics record the
+// real reason so an admin can grant the server if that was the intent.
+func (g *Gateway) denyUngranted(ctx context.Context, entry toolEntry, agentID, approvalID string, ev *metrics.Event) *mcp.CallToolResult {
+	_ = g.audit.Write(ctx, audit.Event{
+		EventType:    audit.EventCallDenied,
+		AgentID:      agentID,
+		UpstreamName: entry.upstream,
+		ToolName:     entry.tool.Name,
+		Decision:     "deny",
+		Reason:       accessDeniedReason,
+		ApprovalID:   approvalID,
+	})
+	ev.Outcome = metrics.OutcomeDenied
+	ev.ErrorClass = "access"
+	return notFoundResult(entry.tool.Name)
 }
 
 // InFlight returns the number of tool calls currently being routed. Used
@@ -599,12 +669,34 @@ type CatalogEntry struct {
 	InputSchema map[string]any `json:"input_schema"`
 }
 
-// Catalog returns the flat list of registered tools.
+// Catalog returns the flat list of registered tools, unfiltered. It is for
+// admin surfaces (the dashboard's /v1/tools); anything an agent or member
+// reads goes through CatalogFor.
 func (g *Gateway) Catalog() []CatalogEntry {
+	return g.catalog(func(toolEntry) bool { return true })
+}
+
+// CatalogFor returns the catalog limited to the tool groups the ctx caller
+// (agentIDFromContext) may use. Without a resolver it equals Catalog.
+func (g *Gateway) CatalogFor(ctx context.Context) []CatalogEntry {
+	if g.access == nil {
+		return g.Catalog()
+	}
+	scope := g.scopeFor(ctx, agentIDFromContext(ctx))
+	if scope.All {
+		return g.Catalog()
+	}
+	return g.catalog(func(e toolEntry) bool { return scope.AllowsTool(e.upstream, e.tool.Name) })
+}
+
+func (g *Gateway) catalog(keep func(toolEntry) bool) []CatalogEntry {
 	g.mu.RLock()
 	defer g.mu.RUnlock()
 	out := make([]CatalogEntry, 0, len(g.tools))
 	for _, e := range g.tools {
+		if !keep(e) {
+			continue
+		}
 		schema := map[string]any{
 			"type":       e.tool.InputSchema.Type,
 			"properties": e.tool.InputSchema.Properties,
@@ -635,10 +727,11 @@ func (g *Gateway) HasTool(name string) bool {
 // integration's purpose. The audit trail still records the call so it is
 // reviewable after the fact, with `viaTool` recorded as the dispatcher.
 //
-// Approval, policy.Eval, and the per-agent budget are all skipped — callers
-// must already be confident the operation is safe. Schema-wrap reason
-// extraction is also skipped; the caller is responsible for whatever shape
-// the underlying tool expects.
+// Approval, policy.Eval, the per-agent budget and the per-user access check
+// are all skipped — callers must already be confident the operation is
+// safe, and the ctx here carries toolyard's own identity, not a member's.
+// Schema-wrap reason extraction is also skipped; the caller is responsible
+// for whatever shape the underlying tool expects.
 //
 // Returns the tool result (possibly with IsError=true) just like a regular
 // call. Errors surface dispatch / upstream connection failures only.
@@ -647,7 +740,7 @@ func (g *Gateway) CallInternal(ctx context.Context, viaTool, targetName string, 
 	entry, ok := g.tools[targetName]
 	g.mu.RUnlock()
 	if !ok {
-		return mcp.NewToolResultErrorf("tool %q not found in catalog", targetName), nil
+		return notFoundResult(targetName), nil
 	}
 
 	started := time.Now()
@@ -693,7 +786,8 @@ func (g *Gateway) CallInternal(ctx context.Context, viaTool, targetName string, 
 // stack. The args map should already have _reason / _intent_category fields.
 //
 // Behaviour:
-//   - Unknown tool -> error CallToolResult.
+//   - Unknown tool, or a tool outside the caller's access scope -> the same
+//     not-found error CallToolResult.
 //   - Reads pass straight through.
 //   - Writes hold for approval (in-line then deferred), exactly like a direct
 //     call would.
@@ -705,7 +799,7 @@ func (g *Gateway) RouteCall(ctx context.Context, viaTool, targetName string, arg
 	entry, ok := g.tools[targetName]
 	g.mu.RUnlock()
 	if !ok {
-		return mcp.NewToolResultErrorf("tool %q not found in catalog", targetName), nil
+		return notFoundResult(targetName), nil
 	}
 	if targetName == viaTool {
 		return mcp.NewToolResultError("tools.execute cannot target itself"), nil
@@ -768,6 +862,13 @@ func (g *Gateway) routeEntry(ctx context.Context, entry toolEntry, args map[stri
 			g.metrics.Record(ev)
 		}
 	}()
+
+	// Per-user access comes first: a member whose admin never granted this
+	// tool's server can't resume, redeem a grant for, or even be told about
+	// a tool there. The result matches an unknown tool.
+	if !g.allowsEntry(ctx, agentID, entry) {
+		return g.denyUngranted(ctx, entry, agentID, "", &ev), nil
+	}
 
 	// Deferred-resume short-circuit.
 	if approvalID, ok := args["_approval_id"].(string); ok && approvalID != "" {
@@ -887,7 +988,9 @@ func (g *Gateway) registerEntry(e toolEntry) {
 // tools.search/execute when router_only_mode is on) are rejected here with
 // a clear pointer at tools.execute. RouteCall — which is what tools.execute
 // itself uses — bypasses this check, so the meta-tool can still reach the
-// hidden tool.
+// hidden tool. A caller outside the tool's access scope skips the hint and
+// falls through to routeEntry's not-found answer, so the hint never
+// confirms that an ungranted server exists.
 func (g *Gateway) handlerFor(toolName string) server.ToolHandlerFunc {
 	return func(ctx context.Context, request mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		g.mu.RLock()
@@ -896,7 +999,8 @@ func (g *Gateway) handlerFor(toolName string) server.ToolHandlerFunc {
 		if !ok {
 			return mcp.NewToolResultErrorf("tool %q not registered", toolName), nil
 		}
-		if g.visibility != nil && !g.visibility.IsVisible(ctx, entry.tool.Name) {
+		if g.visibility != nil && !g.visibility.IsVisible(ctx, entry.tool.Name) &&
+			g.allowsEntry(ctx, agentIDFromContext(ctx), entry) {
 			return mcp.NewToolResultErrorf(
 				"tool %q is hidden by the current agent-surface mode. Use tools.execute with tool=%q to invoke it.",
 				toolName, toolName,
@@ -1490,9 +1594,12 @@ func (g *Gateway) SetUpstreamLogger(l *log.Logger) {
 // request that flipped the approval to allowed.
 //
 // We bypass policy/approval here because the row is already in
-// Status=allowed — the gating decision is final. We still go through
-// dispatch() so audit, metrics, the upstream-call timeout, and the
-// slow-call watchdog all apply just like a normal call.
+// Status=allowed — the gating decision is final. Per-user access is the
+// one check that runs again: an admin may have withdrawn the agent's
+// owner from this server while the request waited, and the approval must
+// not outlive that. We still go through dispatch() so audit, metrics, the
+// upstream-call timeout, and the slow-call watchdog all apply just like a
+// normal call.
 func (g *Gateway) Execute(ctx context.Context, req *approval.Request) {
 	if g == nil || req == nil || g.approval == nil {
 		return
@@ -1514,6 +1621,22 @@ func (g *Gateway) Execute(ctx context.Context, req *approval.Request) {
 	// reason; here we just need to fire the tool with the recorded
 	// arguments.
 	started := time.Now()
+	if !g.allowsEntry(execCtx, req.AgentID, entry) {
+		ev := &metrics.Event{
+			TS: started.UnixMilli(), AgentID: req.AgentID, Upstream: entry.upstream, ShortName: entry.originalName,
+			ToolName: entry.tool.Name, IsWrite: !policy.IsReadOnlyName(entry.tool.Name), PinnedTool: IsPinned(entry.tool.Name),
+			Via: "auto-execute", ApprovalID: req.ID, Fingerprint: req.Fingerprint, ApprovalOutcome: metrics.ApprovalApproved,
+		}
+		g.denyUngranted(execCtx, entry, req.AgentID, req.ID, ev)
+		ev.TotalLatencyMs = int(time.Since(started).Milliseconds())
+		if g.metrics != nil {
+			g.metrics.Record(*ev)
+		}
+		res := mcp.NewToolResultErrorf("access to %s was removed while this approval waited; nothing ran",
+			access.GroupOf(entry.upstream, entry.tool.Name))
+		g.persistApprovalResult(ctx, req.ID, res, nil)
+		return
+	}
 	ev := &metrics.Event{
 		TS:              started.UnixMilli(),
 		AgentID:         req.AgentID,

@@ -12,12 +12,13 @@ import (
 	"github.com/tusharbhardwaj/toolyard/internal/gateway"
 )
 
-// ToolBackend is the slice of the gateway a voice call needs: the catalog
-// (declared to Gemini as callable functions) and the routed call path, so
-// a voice tool call goes through the exact policy → approval → audit
-// pipeline every enrolled agent does. *gateway.Gateway satisfies it.
+// ToolBackend is the slice of the gateway a voice call needs: the caller's
+// catalog (declared to Gemini as callable functions, limited to the servers
+// the signed-in user may use) and the routed call path, so a voice tool
+// call goes through the exact policy → approval → audit pipeline every
+// enrolled agent does. *gateway.Gateway satisfies it.
 type ToolBackend interface {
-	Catalog() []gateway.CatalogEntry
+	CatalogFor(ctx context.Context) []gateway.CatalogEntry
 	RouteCall(ctx context.Context, viaTool, targetName string, args map[string]any) (*mcp.CallToolResult, error)
 }
 

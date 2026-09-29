@@ -22,7 +22,7 @@ type fakeBackend struct {
 	err       error
 }
 
-func (f *fakeBackend) Catalog() []gateway.CatalogEntry { return f.catalog }
+func (f *fakeBackend) CatalogFor(context.Context) []gateway.CatalogEntry { return f.catalog }
 
 func (f *fakeBackend) RouteCall(_ context.Context, viaTool, targetName string, args map[string]any) (*mcp.CallToolResult, error) {
 	f.gotVia, f.gotTarget, f.gotArgs = viaTool, targetName, args
