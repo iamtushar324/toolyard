@@ -4,6 +4,7 @@ import (
 	"errors"
 	"net/http"
 
+	"github.com/tusharbhardwaj/toolyard/internal/audit"
 	"github.com/tusharbhardwaj/toolyard/internal/upstreams"
 )
 
@@ -14,9 +15,11 @@ import (
 //
 // A field that is absent stays as it is; "identity": null switches
 // forwarding off. The row is updated, never deleted and re-added, so the
-// server's OAuth client and tokens survive the edit. Responds with the
-// masked server, 404 for an unknown name, 400 for invalid input and 403
-// for a reserved built-in.
+// server's OAuth client and tokens survive the edit, except when the url
+// moves to another origin: then they are dropped first (a bearer must not
+// follow the server to a new host) and the response carries
+// "oauth_reset": true. Responds with the masked server, 404 for an
+// unknown name, 400 for invalid input and 403 for a reserved built-in.
 func (s *Server) serversPatch(w http.ResponseWriter, r *http.Request, name string) {
 	if _, err := s.requireAdmin(r); err != nil {
 		writeAuthError(w, err)
@@ -28,6 +31,12 @@ func (s *Server) serversPatch(w http.ResponseWriter, r *http.Request, name strin
 		return
 	}
 	srv, err := s.upstreams.Update(r.Context(), name, patch)
+	if srv != nil && srv.OAuthReset {
+		_ = s.audit.Write(r.Context(), audit.Event{
+			EventType:     "oauth.disconnect",
+			ResultSummary: name + " (url moved to another origin)",
+		})
+	}
 	if err != nil {
 		switch {
 		case errors.Is(err, upstreams.ErrNotFound):

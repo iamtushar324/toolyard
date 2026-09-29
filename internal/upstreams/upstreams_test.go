@@ -176,6 +176,32 @@ func (f fakeAuth) HeaderFunc(string) func(ctx context.Context) map[string]string
 	return func(context.Context) map[string]string { return f.headers }
 }
 func (f fakeAuth) HasClient(context.Context, string) (bool, error) { return true, nil }
+func (f fakeAuth) Disconnect(context.Context, string) error        { return nil }
+
+// TestValidateRejectsMaskedValues: the "•••" placeholder that Masked()
+// returns is never accepted as a real value, so a client that round-trips
+// the masked view back into a save can't overwrite a credential with dots.
+func TestValidateRejectsMaskedValues(t *testing.T) {
+	base := Server{Name: "bk", Transport: "http", URL: "https://example.com/mcp"}
+	h := base
+	h.Headers = map[string]string{"X-Api-Key": MaskedValue}
+	err := validate(h)
+	if !errors.Is(err, ErrInvalid) || !strings.Contains(err.Error(), "X-Api-Key") || !strings.Contains(err.Error(), "masked value") {
+		t.Fatalf("masked header: err = %v", err)
+	}
+	e := base
+	e.Env = map[string]string{"TOKEN": MaskedValue}
+	err = validate(e)
+	if !errors.Is(err, ErrInvalid) || !strings.Contains(err.Error(), "TOKEN") || !strings.Contains(err.Error(), "masked value") {
+		t.Fatalf("masked env: err = %v", err)
+	}
+	// Refs and plaintext still pass.
+	ok := base
+	ok.Headers = map[string]string{"X-Api-Key": "secret://KEY", "X-Plain": "value"}
+	if err := validate(ok); err != nil {
+		t.Fatalf("ref/plaintext headers: %v", err)
+	}
+}
 
 // TestToCfgIdentityHeader: the identity header carries the key from the
 // call context or nothing at all. Whatever static headers or OAuth put

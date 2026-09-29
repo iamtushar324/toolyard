@@ -11,6 +11,7 @@ import (
 	"errors"
 	"fmt"
 	"log"
+	"net/url"
 	"sort"
 	"strings"
 	"sync"
@@ -65,6 +66,11 @@ type Server struct {
 	// values were masked (i.e. plaintext, not secret:// refs) so the UI can
 	// offer a "convert to secret" action. Never persisted.
 	EnvPlaintextKeys []string `json:"env_plaintext_keys,omitempty"`
+	// OAuthReset is set only on the Server returned by Update, when the
+	// edit moved the url to another origin and the server's OAuth client
+	// and tokens were dropped as a result: the operator has to authorise
+	// it again. Never persisted.
+	OAuthReset bool `json:"oauth_reset,omitempty"`
 }
 
 // Policy gates which upstream configurations are admissible. Used to
@@ -81,7 +87,13 @@ type Policy struct {
 // request. Decoupled so we don't import oauth here.
 type HeaderProvider interface {
 	HeaderFunc(upstream string) func(ctx context.Context) map[string]string
+	// HasClient reports whether the upstream holds OAuth state (a client
+	// registration, or the placeholder client a stored PAT gets).
 	HasClient(ctx context.Context, upstream string) (bool, error)
+	// Disconnect revokes (best-effort) and deletes the upstream's OAuth
+	// client and tokens. Update calls it before moving a server to another
+	// origin so a bearer minted for one host is never sent to another.
+	Disconnect(ctx context.Context, upstream string) error
 }
 
 // SecretResolver is the secrets-broker dependency. Decoupled via interface so
@@ -274,7 +286,37 @@ func validate(srv Server) error {
 	default:
 		return fmt.Errorf("%w: unsupported transport %q", ErrInvalid, srv.Transport)
 	}
+	if err := rejectMasked("header", srv.Headers); err != nil {
+		return err
+	}
+	if err := rejectMasked("env", srv.Env); err != nil {
+		return err
+	}
 	return validateIdentity(srv)
+}
+
+// rejectMasked refuses the placeholder Masked() puts in place of a value.
+// A client that edits the masked GET view and sends it back would
+// otherwise overwrite a real credential with dots.
+func rejectMasked(kind string, m map[string]string) error {
+	for k, v := range m {
+		if v == MaskedValue {
+			return fmt.Errorf("%w: %s %q: masked value — send the real value, a secret:// reference, or leave the key out", ErrInvalid, kind, k)
+		}
+	}
+	return nil
+}
+
+// sameOrigin reports whether two urls share scheme and host (with port).
+// Anything that doesn't parse counts as a different origin, so an odd url
+// errs on the side of resetting OAuth.
+func sameOrigin(a, b string) bool {
+	ua, errA := url.Parse(a)
+	ub, errB := url.Parse(b)
+	if errA != nil || errB != nil {
+		return false
+	}
+	return strings.EqualFold(ua.Scheme, ub.Scheme) && strings.EqualFold(ua.Host, ub.Host)
 }
 
 // identityHeaderDenylist names headers that can never carry an identity
@@ -731,6 +773,10 @@ func Masked(srv Server) Server {
 	return out
 }
 
+// MaskedValue stands in for every plaintext env / header value in API
+// responses. It is also refused on save (see rejectMasked).
+const MaskedValue = "•••"
+
 func maskValues(in map[string]string) (map[string]string, []string) {
 	if len(in) == 0 {
 		return in, nil
@@ -744,7 +790,7 @@ func maskValues(in map[string]string) (map[string]string, []string) {
 		case secrets.IsRef(v):
 			masked[k] = v
 		default:
-			masked[k] = "•••"
+			masked[k] = MaskedValue
 			plaintext = append(plaintext, k)
 		}
 	}
@@ -836,6 +882,25 @@ func (s *Service) Update(ctx context.Context, name string, patch Patch) (*Server
 		return nil, err
 	}
 
+	// A bearer belongs to the host it was issued for. Before the url moves
+	// to another origin, drop the server's OAuth client and tokens (the
+	// header func is keyed by server name and would otherwise send the old
+	// token to the new host on the first initialize). This happens before
+	// the row changes, so a failed reset leaves the server as it was.
+	oauthReset := false
+	if patch.URL != nil && s.auth != nil && !sameOrigin(cur.URL, next.URL) {
+		has, err := s.auth.HasClient(ctx, name)
+		if err != nil {
+			return nil, err
+		}
+		if has {
+			if err := s.auth.Disconnect(ctx, name); err != nil {
+				return nil, fmt.Errorf("reset oauth for %s before url change: %w", name, err)
+			}
+			oauthReset = true
+		}
+	}
+
 	envBlob, _ := json.Marshal(next.Env)
 	headersBlob, _ := json.Marshal(next.Headers)
 	enabled := 0
@@ -853,17 +918,19 @@ func (s *Service) Update(ctx context.Context, name string, patch Patch) (*Server
 	// Reconnect in place so the live upstream runs the new config. A
 	// disabled server is just taken down; LoadAll skips it on restart.
 	_ = s.gw.RemoveUpstream(name)
+	var connectErr error
 	if !next.Enabled {
 		s.recordStatus(ctx, name, "disabled", "", 0)
 		s.gw.NotifyToolListChanged()
-		return s.get(ctx, name)
+	} else if connectErr = s.connect(ctx, next); connectErr != nil {
+		s.recordStatus(ctx, name, "", connectErr.Error(), 0)
 	}
-	if err := s.connect(ctx, next); err != nil {
-		s.recordStatus(ctx, name, "", err.Error(), 0)
-		final, _ := s.get(ctx, name)
-		return final, err
+	final, err := s.get(ctx, name)
+	if err != nil {
+		return nil, err
 	}
-	return s.get(ctx, name)
+	final.OAuthReset = oauthReset
+	return final, connectErr
 }
 
 // ConvertEnvToSecret extracts the plaintext value of env[envKey] on the named

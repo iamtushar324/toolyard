@@ -47,6 +47,28 @@ func newServiceFixture(t *testing.T) (*Service, *store.DB, *gateway.Gateway) {
 	return New(db, gw), db, gw
 }
 
+// recAuth is a HeaderProvider that reports OAuth state per server and
+// records Disconnect calls; err makes Disconnect fail.
+type recAuth struct {
+	clients     map[string]bool
+	disconnects []string
+	err         error
+}
+
+func (r *recAuth) HeaderFunc(string) func(ctx context.Context) map[string]string {
+	return func(context.Context) map[string]string { return map[string]string{"Authorization": "Bearer live"} }
+}
+func (r *recAuth) HasClient(_ context.Context, name string) (bool, error) {
+	return r.clients[name], nil
+}
+func (r *recAuth) Disconnect(_ context.Context, name string) error {
+	if r.err != nil {
+		return r.err
+	}
+	r.disconnects = append(r.disconnects, name)
+	return nil
+}
+
 func strp(s string) *string                       { return &s }
 func boolp(b bool) *bool                          { return &b }
 func mapp(m map[string]string) *map[string]string { return &m }
@@ -273,5 +295,104 @@ func TestUpdateRejects(t *testing.T) {
 	}
 	if got == nil || got.URL != dead.URL || got.LastStatus == "ok" || !strings.Contains(got.LastError, "bk") {
 		t.Fatalf("after failed reconnect: %+v", got)
+	}
+}
+
+// TestUpdateResetsOAuthOnOriginChange: moving a server to another
+// scheme+host drops its OAuth client and tokens first, so the stored
+// bearer is never sent to the new host. A path change on the same origin,
+// or a move on a server with no OAuth state, keeps everything.
+func TestUpdateResetsOAuthOnOriginChange(t *testing.T) {
+	ctx := context.Background()
+	svc, _, gw := newServiceFixture(t)
+	auth := &recAuth{clients: map[string]bool{"bk": true}}
+	svc.SetAuth(auth)
+	ts1 := newMCPTestServer(t)
+	ts2 := newMCPTestServer(t) // another port: another origin
+	if _, err := svc.Add(ctx, Server{Name: "bk", Transport: "http", URL: ts1.URL}); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+
+	// Same origin, new path: OAuth untouched.
+	got, err := svc.Update(ctx, "bk", Patch{URL: strp(ts1.URL + "/v2")})
+	if err != nil {
+		t.Fatalf("same-origin update: %v", err)
+	}
+	if got.OAuthReset || len(auth.disconnects) != 0 || got.URL != ts1.URL+"/v2" || got.LastStatus != "ok" {
+		t.Fatalf("same-origin update: reset=%v disconnects=%v url=%q status=%q", got.OAuthReset, auth.disconnects, got.URL, got.LastStatus)
+	}
+	// Only the scheme/host matter, not letter case or an unchanged path.
+	upper := "HTTP://" + strings.TrimPrefix(ts1.URL, "http://") + "/v2"
+	if got, err = svc.Update(ctx, "bk", Patch{URL: strp(upper)}); err != nil || got.OAuthReset || len(auth.disconnects) != 0 {
+		t.Fatalf("case-only origin change: err=%v reset=%v disconnects=%v", err, got.OAuthReset, auth.disconnects)
+	}
+	// Non-url patches never reset, whatever the origin.
+	if got, err = svc.Update(ctx, "bk", Patch{Headers: mapp(map[string]string{"X-Other": "v"})}); err != nil || got.OAuthReset || len(auth.disconnects) != 0 {
+		t.Fatalf("headers patch: err=%v reset=%v disconnects=%v", err, got.OAuthReset, auth.disconnects)
+	}
+
+	// New origin with OAuth state: reset, reported, reconnected.
+	got, err = svc.Update(ctx, "bk", Patch{URL: strp(ts2.URL)})
+	if err != nil {
+		t.Fatalf("cross-origin update: %v", err)
+	}
+	if !got.OAuthReset || len(auth.disconnects) != 1 || auth.disconnects[0] != "bk" {
+		t.Fatalf("cross-origin update: reset=%v disconnects=%v", got.OAuthReset, auth.disconnects)
+	}
+	if got.URL != ts2.URL || got.LastStatus != "ok" || gw.UpstreamToolCount("bk") != 1 {
+		t.Fatalf("after cross-origin update: url=%q status=%q tools=%d", got.URL, got.LastStatus, gw.UpstreamToolCount("bk"))
+	}
+	// The flag is a response detail, not a stored one.
+	if again, _ := svc.Get(ctx, "bk"); again.OAuthReset {
+		t.Fatal("oauth_reset persisted on the row")
+	}
+
+	// No OAuth state: a move is just a move.
+	auth.clients["bk"] = false
+	got, err = svc.Update(ctx, "bk", Patch{URL: strp(ts1.URL)})
+	if err != nil || got.OAuthReset || len(auth.disconnects) != 1 {
+		t.Fatalf("move without oauth state: err=%v reset=%v disconnects=%v", err, got.OAuthReset, auth.disconnects)
+	}
+
+	// A failed reset blocks the change: url stays, upstream stays up.
+	auth.clients["bk"] = true
+	auth.err = errors.New("db locked")
+	if _, err := svc.Update(ctx, "bk", Patch{URL: strp(ts2.URL)}); err == nil || !strings.Contains(err.Error(), "db locked") {
+		t.Fatalf("failed reset: err = %v", err)
+	}
+	if cur, _ := svc.Get(ctx, "bk"); cur.URL != ts1.URL || gw.UpstreamToolCount("bk") != 1 {
+		t.Fatalf("failed reset changed state: url=%q tools=%d", cur.URL, gw.UpstreamToolCount("bk"))
+	}
+}
+
+// TestMaskedValuesRejectedOnSave: neither Add nor Update accepts the mask
+// placeholder as a header or env value, and a rejected Update leaves the
+// real value in place.
+func TestMaskedValuesRejectedOnSave(t *testing.T) {
+	ctx := context.Background()
+	svc, _, _ := newServiceFixture(t)
+	ts := newMCPTestServer(t)
+
+	_, err := svc.Add(ctx, Server{Name: "bk", Transport: "http", URL: ts.URL, Headers: map[string]string{"X-Api-Key": MaskedValue}})
+	if !errors.Is(err, ErrInvalid) || !strings.Contains(err.Error(), "masked value") {
+		t.Fatalf("Add with masked header: err = %v", err)
+	}
+	if _, err := svc.Get(ctx, "bk"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("rejected Add saved a row: %v", err)
+	}
+
+	if _, err := svc.Add(ctx, Server{Name: "bk", Transport: "http", URL: ts.URL, Headers: map[string]string{"X-Api-Key": "real"}}); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+	// The round-trip an API client would do: PATCH the masked GET view back.
+	masked := Masked(Server{Headers: map[string]string{"X-Api-Key": "real"}, Env: map[string]string{"TOKEN": "t"}})
+	if _, err := svc.Update(ctx, "bk", Patch{Headers: mapp(masked.Headers)}); !errors.Is(err, ErrInvalid) || !strings.Contains(err.Error(), "X-Api-Key") {
+		t.Fatalf("Update with masked header: err = %v", err)
+	}
+	if _, err := svc.Update(ctx, "bk", Patch{Env: mapp(masked.Env)}); !errors.Is(err, ErrInvalid) || !strings.Contains(err.Error(), "TOKEN") {
+		t.Fatalf("Update with masked env: err = %v", err)
+	}
+	if cur, _ := svc.Get(ctx, "bk"); cur.Headers["X-Api-Key"] != "real" || len(cur.Env) != 0 {
+		t.Fatalf("rejected Update changed the row: %+v", cur)
 	}
 }

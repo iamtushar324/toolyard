@@ -12,6 +12,7 @@ import (
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
 
+	"github.com/tusharbhardwaj/toolyard/internal/oauth"
 	"github.com/tusharbhardwaj/toolyard/internal/sealbox"
 	"github.com/tusharbhardwaj/toolyard/internal/secrets"
 	"github.com/tusharbhardwaj/toolyard/internal/upstreams"
@@ -85,16 +86,17 @@ func TestServersPatchEditsInPlace(t *testing.T) {
 	e := newAccessTestServer(t)
 	admin := e.cookieFor(t, e.admin.ID)
 	ts1 := newPatchMCPServer(t)
-	ts2 := newPatchMCPServer(t)
 	addPatchServer(t, e, "bk", ts1)
 	seedOAuth(t, e, "bk")
 	if e.gw.UpstreamToolCount("bk") != 1 {
 		t.Fatalf("tool count after add = %d", e.gw.UpstreamToolCount("bk"))
 	}
 
-	// url
-	got := decodeServer(t, e.do(t, admin, http.MethodPatch, "/v1/servers/bk", `{"url":"`+ts2.URL+`"}`))
-	if got.URL != ts2.URL || got.LastStatus != "ok" || !got.Enabled {
+	// url: a new path on the same origin keeps OAuth (the cross-origin
+	// case is TestServersPatchURLOriginChangeResetsOAuth).
+	newURL := ts1.URL + "/v2"
+	got := decodeServer(t, e.do(t, admin, http.MethodPatch, "/v1/servers/bk", `{"url":"`+newURL+`"}`))
+	if got.URL != newURL || got.LastStatus != "ok" || !got.Enabled || got.OAuthReset {
 		t.Fatalf("after url patch: %+v", got)
 	}
 	if e.gw.UpstreamToolCount("bk") != 1 {
@@ -107,10 +109,10 @@ func TestServersPatchEditsInPlace(t *testing.T) {
 	// headers: masked in the response, raw in the store
 	rec := e.do(t, admin, http.MethodPatch, "/v1/servers/bk", `{"headers":{"X-Api-Key":"raw-shared-key"}}`)
 	got = decodeServer(t, rec)
-	if got.Headers["X-Api-Key"] != "•••" || strings.Contains(rec.Body.String(), "raw-shared-key") {
+	if got.Headers["X-Api-Key"] != upstreams.MaskedValue || strings.Contains(rec.Body.String(), "raw-shared-key") {
 		t.Fatalf("header value leaked or missing: %s", rec.Body.String())
 	}
-	if stored, _ := e.srv.upstreams.Get(context.Background(), "bk"); stored.Headers["X-Api-Key"] != "raw-shared-key" || stored.URL != ts2.URL {
+	if stored, _ := e.srv.upstreams.Get(context.Background(), "bk"); stored.Headers["X-Api-Key"] != "raw-shared-key" || stored.URL != newURL {
 		t.Fatalf("stored = %+v", stored)
 	}
 
@@ -120,7 +122,7 @@ func TestServersPatchEditsInPlace(t *testing.T) {
 	if got.Identity == nil || got.Identity.Header != "x-bk-bifrost-vk" || !got.Identity.Register {
 		t.Fatalf("identity after patch = %+v", got.Identity)
 	}
-	if got.Headers["X-Api-Key"] != "•••" || got.URL != ts2.URL {
+	if got.Headers["X-Api-Key"] != upstreams.MaskedValue || got.URL != newURL {
 		t.Fatalf("identity patch disturbed other fields: %+v", got)
 	}
 	rec = e.do(t, admin, http.MethodPatch, "/v1/servers/bk", `{"identity":null}`)
@@ -185,11 +187,16 @@ func TestServersPatchRejects(t *testing.T) {
 		"identity extra":  `{"identity":{"header":"x-id","bogus":1}}`,
 		"not json":        `{"url":`,
 		"empty body":      ``,
+		"masked header":   `{"headers":{"X-Api-Key":"` + upstreams.MaskedValue + `"}}`,
+		"masked env":      `{"env":{"TOKEN":"` + upstreams.MaskedValue + `"}}`,
 	}
 	for name, body := range bad {
 		rec := e.do(t, admin, http.MethodPatch, "/v1/servers/bk", body)
 		if rec.Code != http.StatusBadRequest {
 			t.Errorf("%s: status %d, want 400: %s", name, rec.Code, rec.Body.String())
+		}
+		if strings.HasPrefix(name, "masked") && !strings.Contains(rec.Body.String(), "masked value") {
+			t.Errorf("%s: body should explain the mask: %s", name, rec.Body.String())
 		}
 	}
 	if stored, _ := e.srv.upstreams.Get(context.Background(), "bk"); stored.URL != ts.URL || stored.Identity != nil || len(stored.Headers) != 0 {
@@ -237,5 +244,50 @@ func TestServersPatchRequireAdminWithoutGuard(t *testing.T) {
 	mux.ServeHTTP(rec, req)
 	if rec.Code != http.StatusForbidden || !strings.Contains(rec.Body.String(), "admin_only") {
 		t.Fatalf("member without RoleGuard: %d %s", rec.Code, rec.Body.String())
+	}
+}
+
+// TestServersPatchURLOriginChangeResetsOAuth: with the real OAuth service
+// wired, moving a server to another origin drops its client and token
+// rows, says so in the response and the audit log, and still reconnects.
+// A path change on the same origin keeps them.
+func TestServersPatchURLOriginChangeResetsOAuth(t *testing.T) {
+	e := newAccessTestServer(t)
+	admin := e.cookieFor(t, e.admin.ID)
+	key, _ := sealbox.LoadOrCreateKey(t.TempDir(), "oauth.key")
+	cipher, _ := oauth.NewCipher(key)
+	e.srv.upstreams.SetAuth(oauth.New(e.db, cipher, nil, nil, nil))
+	ts1 := newPatchMCPServer(t)
+	ts2 := newPatchMCPServer(t)
+	addPatchServer(t, e, "bk", ts1)
+	seedOAuth(t, e, "bk")
+
+	rec := e.do(t, admin, http.MethodPatch, "/v1/servers/bk", `{"url":"`+ts1.URL+`/v2"}`)
+	got := decodeServer(t, rec)
+	if got.OAuthReset || strings.Contains(rec.Body.String(), "oauth_reset") {
+		t.Fatalf("same-origin move reported a reset: %s", rec.Body.String())
+	}
+	if c, k := oauthRows(t, e, "bk"); c != 1 || k != 1 {
+		t.Fatalf("oauth rows after same-origin move: clients=%d tokens=%d", c, k)
+	}
+
+	rec = e.do(t, admin, http.MethodPatch, "/v1/servers/bk", `{"url":"`+ts2.URL+`"}`)
+	got = decodeServer(t, rec)
+	if !got.OAuthReset || !strings.Contains(rec.Body.String(), `"oauth_reset":true`) {
+		t.Fatalf("cross-origin move not reported: %s", rec.Body.String())
+	}
+	if got.URL != ts2.URL || got.LastStatus != "ok" || e.gw.UpstreamToolCount("bk") != 1 {
+		t.Fatalf("after cross-origin move: %+v tools=%d", got, e.gw.UpstreamToolCount("bk"))
+	}
+	if c, k := oauthRows(t, e, "bk"); c != 0 || k != 0 {
+		t.Fatalf("oauth rows after cross-origin move: clients=%d tokens=%d, want 0/0", c, k)
+	}
+	if n := e.auditRows(t, "oauth.disconnect", ""); n != 1 {
+		t.Fatalf("oauth.disconnect audit rows = %d, want 1", n)
+	}
+	// A later GET doesn't carry the flag.
+	rec = e.do(t, admin, http.MethodGet, "/v1/servers", "")
+	if strings.Contains(rec.Body.String(), "oauth_reset") {
+		t.Fatalf("oauth_reset leaked into GET: %s", rec.Body.String())
 	}
 }
