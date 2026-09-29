@@ -11,10 +11,12 @@
 package approval
 
 import (
+	"bytes"
 	"context"
 	"crypto/ed25519"
 	"crypto/rand"
 	"crypto/sha256"
+	"crypto/subtle"
 	"database/sql"
 	"encoding/base64"
 	"encoding/hex"
@@ -131,11 +133,13 @@ type AutoApprover interface {
 }
 
 // AutoMatch is the return value from AutoApprover.Match. ID is the rule's
-// stable identifier — it appears as decided_by="rule:<id>" on the resulting
-// approved approval.
+// stable identifier — it becomes decider_ref (Via auto_rule) on the
+// resulting approved approval, and CreatedBy, the user who installed the
+// rule when known, its decided_by.
 type AutoMatch struct {
-	ID   string
-	Kind string
+	ID        string
+	Kind      string
+	CreatedBy string
 }
 
 type Bus struct {
@@ -235,7 +239,8 @@ func (b *Bus) Hold(ctx context.Context, in NewRequest, maxWait time.Duration) (*
 	if b.auto != nil && !req.Coalesced && req.Status == StatusPending && !in.RequireHuman {
 		destructive := b.auto.IsDestructive(ctx, req.ToolName)
 		if m := b.auto.Match(req.AgentID, req.UpstreamName, req.ToolName, req.Fingerprint, destructive); m != nil {
-			decided, derr := b.decideInline(ctx, req.ID, StatusAllowed, "rule:"+m.ID)
+			d := actor.Decider{UserID: m.CreatedBy, Via: actor.ViaAutoRule, Ref: m.ID}
+			decided, derr := b.decideInline(ctx, req.ID, StatusAllowed, d)
 			if derr == nil && decided != nil {
 				decided.AutoDecidedBy = m.ID
 				b.auto.MarkHit(ctx, m.ID, req.AgentID)
@@ -330,6 +335,14 @@ func (b *Bus) create(ctx context.Context, in NewRequest) (*Request, error) {
 	}
 	req.DecisionToken = b.signToken(req.ID)
 	args, _ := json.Marshal(in.Arguments)
+	var raisedBy any
+	if in.RaisedBy != (actor.Raiser{}) {
+		rb := in.RaisedBy
+		req.RaisedBy = &rb
+		if blob, err := json.Marshal(rb); err == nil {
+			raisedBy = string(blob)
+		}
+	}
 
 	const maxCreateAttempts = 3
 	var lastErr error
@@ -340,11 +353,12 @@ func (b *Bus) create(ctx context.Context, in NewRequest) (*Request, error) {
 		}
 		_, err := b.db.ExecContext(ctx,
 			`INSERT INTO approval_requests(id, agent_id, upstream_name, tool_name, arguments,
-            reason, intent_category, status, decision_token, created_at, expires_at, fingerprint)
-         VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`,
+            reason, intent_category, status, decision_token, created_at, expires_at, fingerprint,
+            raised_by)
+         VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 			req.ID, req.AgentID, req.UpstreamName, req.ToolName, string(args),
 			req.Reason, nullStr(req.IntentCategory), req.Status, req.DecisionToken,
-			req.CreatedAt, req.ExpiresAt, fp)
+			req.CreatedAt, req.ExpiresAt, fp, raisedBy)
 		if err == nil {
 			return req, nil
 		}
@@ -437,7 +451,9 @@ const requestSelectColumns = `id, agent_id, upstream_name, tool_name, arguments,
             COALESCE(decided_by,''), COALESCE(decided_at,0), created_at, expires_at,
             COALESCE(fingerprint,''),
             COALESCE(result_envelope,''), COALESCE(result_is_error,0),
-            COALESCE(result_executed_at,0), COALESCE(result_error,'')`
+            COALESCE(result_executed_at,0), COALESCE(result_error,''),
+            COALESCE(decided_via,''), COALESCE(decider_email,''), COALESCE(decider_name,''),
+            COALESCE(decider_ref,''), COALESCE(raised_by,'')`
 
 // rowScanner is the subset shared by *sql.Row and *sql.Rows; lets the
 // helper hydrate either with the same code.
@@ -447,21 +463,29 @@ type rowScanner interface {
 
 // scanRequest reads one approval row from any source that SELECTed
 // requestSelectColumns. The resulting Request is fully hydrated,
-// including the Arguments map decoded from its JSON column.
+// including the Arguments map and RaisedBy decoded from their JSON
+// columns.
 func scanRequest(s rowScanner) (*Request, error) {
 	var req Request
-	var args string
+	var args, raisedBy string
 	var isErr int
 	if err := s.Scan(&req.ID, &req.AgentID, &req.UpstreamName, &req.ToolName, &args,
 		&req.Reason, &req.IntentCategory, &req.Status, &req.DecisionToken,
 		&req.DecidedBy, &req.DecidedAt, &req.CreatedAt, &req.ExpiresAt,
 		&req.Fingerprint,
-		&req.ResultEnvelope, &isErr, &req.ResultExecutedAt, &req.ResultError); err != nil {
+		&req.ResultEnvelope, &isErr, &req.ResultExecutedAt, &req.ResultError,
+		&req.DecidedVia, &req.DeciderEmail, &req.DeciderName, &req.DeciderRef, &raisedBy); err != nil {
 		return nil, err
 	}
 	req.ResultIsError = isErr != 0
 	if args != "" {
 		_ = json.Unmarshal([]byte(args), &req.Arguments)
+	}
+	if raisedBy != "" {
+		var r actor.Raiser
+		if err := json.Unmarshal([]byte(raisedBy), &r); err == nil {
+			req.RaisedBy = &r
+		}
 	}
 	return &req, nil
 }
@@ -509,19 +533,28 @@ func stringIndex(s, needle string) int {
 	return -1
 }
 
-// Decide is the public decision entrypoint used by the dashboard and
-// the signed-token tap path. On allow it kicks the registered Executor
-// on a background goroutine; pollers wake when SetResult lands.
-func (b *Bus) Decide(ctx context.Context, id, action, userID string) (*Request, error) {
-	return b.decide(ctx, id, action, userID, true)
+// DecideAs is the decision entrypoint: it records who decided and how
+// (decided_by keeps d.Legacy(); decided_via, decider_email, decider_name
+// and decider_ref carry the rest). On allow it kicks the registered
+// Executor on a background goroutine; pollers wake when SetResult lands.
+func (b *Bus) DecideAs(ctx context.Context, id, action string, d actor.Decider) (*Request, error) {
+	return b.decide(ctx, id, action, d, true)
+}
+
+// Decide is the historical entrypoint taking the free-text decided_by:
+// a user id, "token", "telegram:<id>", "rule:<id>" or "agent:<id>". It
+// maps that to an actor.Decider (see DeciderFromLegacy) and calls
+// DecideAs; new callers should call DecideAs with the person they know.
+func (b *Bus) Decide(ctx context.Context, id, action, decidedBy string) (*Request, error) {
+	return b.DecideAs(ctx, id, action, DeciderFromLegacy(decidedBy))
 }
 
 // decideInline is the in-process variant used by Hold's auto-approval
 // short-circuit. Hold's caller (gateway.holdAndWait) dispatches the
 // approved tool synchronously in its own goroutine, so we MUST NOT
 // also fire the background executor or the tool would run twice.
-func (b *Bus) decideInline(ctx context.Context, id, action, userID string) (*Request, error) {
-	return b.decide(ctx, id, action, userID, false)
+func (b *Bus) decideInline(ctx context.Context, id, action string, d actor.Decider) (*Request, error) {
+	return b.decide(ctx, id, action, d, false)
 }
 
 // decide is the shared implementation. runExec controls whether an
@@ -535,14 +568,17 @@ func (b *Bus) decideInline(ctx context.Context, id, action, userID string) (*Req
 //
 // On deny / cancel / expire / allow-without-executor: signal() fires
 // immediately because there is nothing to wait for.
-func (b *Bus) decide(ctx context.Context, id, action, userID string, runExec bool) (*Request, error) {
+func (b *Bus) decide(ctx context.Context, id, action string, d actor.Decider, runExec bool) (*Request, error) {
 	if action != StatusAllowed && action != StatusDenied {
 		return nil, fmt.Errorf("invalid action %q", action)
 	}
 	res, err := b.db.ExecContext(ctx,
-		`UPDATE approval_requests SET status = ?, decided_by = ?, decided_at = ?
+		`UPDATE approval_requests SET status = ?, decided_by = ?, decided_at = ?,
+            decided_via = ?, decider_email = ?, decider_name = ?, decider_ref = ?
          WHERE id = ? AND status = ?`,
-		action, userID, time.Now().UnixMilli(), id, StatusPending)
+		action, d.Legacy(), time.Now().UnixMilli(),
+		nullStr(d.Via), nullStr(d.Email), nullStr(d.Name), nullStr(d.Ref),
+		id, StatusPending)
 	if err != nil {
 		return nil, err
 	}
@@ -667,15 +703,26 @@ func (b *Bus) SweepUnexecuted(ctx context.Context) (int, error) {
 	return len(pending), nil
 }
 
-// DecideByToken verifies a signed decision token and resolves the approval.
-// Used for one-tap approval from a phone tap that may not carry the user
-// session cookie. Returns the verified approval ID on success.
-func (b *Bus) DecideByToken(ctx context.Context, token, action string) (*Request, error) {
-	id, err := b.verifyToken(token)
+// DecideByTokenAs verifies a signed decision token and resolves the
+// approval it names. Used for one-tap approval from a phone tap that may
+// not carry the user session cookie. A token minted by DecisionTokenFor
+// attributes the decision to its recipient; an id-only token (Request.
+// DecisionToken) decides as an anonymous push tap. The returned Decider
+// is what was recorded.
+func (b *Bus) DecideByTokenAs(ctx context.Context, token, action string) (*Request, actor.Decider, error) {
+	c, err := b.verifyToken(token)
 	if err != nil {
-		return nil, err
+		return nil, actor.Decider{}, err
 	}
-	return b.Decide(ctx, id, action, "token")
+	d := actor.Decider{UserID: c.userID, Via: actor.ViaPushToken}
+	req, err := b.DecideAs(ctx, c.approvalID, action, d)
+	return req, d, err
+}
+
+// DecideByToken is DecideByTokenAs without the recorded Decider.
+func (b *Bus) DecideByToken(ctx context.Context, token, action string) (*Request, error) {
+	req, _, err := b.DecideByTokenAs(ctx, token, action)
+	return req, err
 }
 
 // Get fetches an approval by ID, regardless of status.
@@ -698,10 +745,13 @@ func (b *Bus) Get(ctx context.Context, id string) (*Request, error) {
 // ErrNotPending if the approval is already decided/expired/cancelled,
 // or ErrNotFound on missing/wrong-agent.
 func (b *Bus) CancelByAgent(ctx context.Context, id, agentID string) (*Request, error) {
+	d := actor.Decider{Via: actor.ViaAgentCancel, Ref: agentID}
 	res, err := b.db.ExecContext(ctx,
-		`UPDATE approval_requests SET status = ?, decided_by = ?, decided_at = ?
+		`UPDATE approval_requests SET status = ?, decided_by = ?, decided_at = ?,
+            decided_via = ?, decider_ref = ?
          WHERE id = ? AND status = ? AND agent_id = ?`,
-		StatusCancelled, "agent:"+agentID, time.Now().UnixMilli(), id, StatusPending, agentID)
+		StatusCancelled, d.Legacy(), time.Now().UnixMilli(), d.Via, d.Ref,
+		id, StatusPending, agentID)
 	if err != nil {
 		return nil, err
 	}
@@ -872,9 +922,11 @@ func (b *Bus) SweepExpired(ctx context.Context) (int, error) {
 		return 0, err
 	}
 
+	// decided_via says how the row closed; decided_by stays empty because
+	// nobody decided.
 	res, err := b.db.ExecContext(ctx,
-		`UPDATE approval_requests SET status = ? WHERE status = ? AND expires_at <= ?`,
-		StatusExpired, StatusPending, now)
+		`UPDATE approval_requests SET status = ?, decided_via = ? WHERE status = ? AND expires_at <= ?`,
+		StatusExpired, actor.ViaExpiry, StatusPending, now)
 	if err != nil {
 		return 0, err
 	}
@@ -945,28 +997,74 @@ func (b *Bus) fanOut(ctx context.Context, req *Request, eventType string) {
 }
 
 // ---- Ed25519 token plumbing -------------------------------------------------
+//
+// A decision token is base64url(sig ‖ payload). Two payload formats:
+//
+//   - id-only (Request.DecisionToken, minted at create): payload = id.
+//     A tap through it is recorded as an anonymous push tap.
+//   - bound (DecisionTokenFor): payload = boundTokenPrefix ‖ id ‖ 0x1f ‖
+//     recipient user id. The signature covers the recipient, so a tap is
+//     attributed to that user and a token minted for one person cannot
+//     be re-labelled for another.
+//
+// Ids are "ap_<uuid>", so an id-only payload never starts with the bound
+// prefix. Both formats are accepted until the approvals they name expire.
 
-// signToken returns a base64url(sig || id) so the dashboard/phone can carry an
+const (
+	boundTokenPrefix = "b1\x1f"
+	tokenSep         = 0x1f
+)
+
+// tokenClaims is what a verified token asserts.
+type tokenClaims struct {
+	approvalID string
+	userID     string // empty for an id-only token
+}
+
+// signToken returns the id-only token so the dashboard/phone can carry an
 // approval ID that the server can verify without a session round-trip.
 func (b *Bus) signToken(id string) string {
-	sig := ed25519.Sign(b.signKey, []byte(id))
-	out := make([]byte, 0, len(sig)+len(id))
+	return b.sign([]byte(id))
+}
+
+// DecisionTokenFor mints a decision token for one recipient: a tap
+// through it is recorded as that user's push_token decision. An empty
+// recipient yields the id-only token.
+func (b *Bus) DecisionTokenFor(approvalID, recipientUserID string) string {
+	if recipientUserID == "" {
+		return b.signToken(approvalID)
+	}
+	return b.sign([]byte(boundTokenPrefix + approvalID + string(rune(tokenSep)) + recipientUserID))
+}
+
+func (b *Bus) sign(payload []byte) string {
+	sig := ed25519.Sign(b.signKey, payload)
+	out := make([]byte, 0, len(sig)+len(payload))
 	out = append(out, sig...)
-	out = append(out, []byte(id)...)
+	out = append(out, payload...)
 	return base64.RawURLEncoding.EncodeToString(out)
 }
 
-func (b *Bus) verifyToken(token string) (string, error) {
+func (b *Bus) verifyToken(token string) (tokenClaims, error) {
 	raw, err := base64.RawURLEncoding.DecodeString(token)
 	if err != nil || len(raw) < ed25519.SignatureSize+1 {
-		return "", errors.New("malformed approval token")
+		return tokenClaims{}, errors.New("malformed approval token")
 	}
 	sig := raw[:ed25519.SignatureSize]
-	id := raw[ed25519.SignatureSize:]
-	if !ed25519.Verify(b.verifyKey, id, sig) {
-		return "", errors.New("invalid approval signature")
+	payload := raw[ed25519.SignatureSize:]
+	if !ed25519.Verify(b.verifyKey, payload, sig) {
+		return tokenClaims{}, errors.New("invalid approval signature")
 	}
-	return string(id), nil
+	prefix := []byte(boundTokenPrefix)
+	if len(payload) > len(prefix) && subtle.ConstantTimeCompare(payload[:len(prefix)], prefix) == 1 {
+		rest := payload[len(prefix):]
+		i := bytes.IndexByte(rest, tokenSep)
+		if i <= 0 || i == len(rest)-1 {
+			return tokenClaims{}, errors.New("malformed approval token")
+		}
+		return tokenClaims{approvalID: string(rest[:i]), userID: string(rest[i+1:])}, nil
+	}
+	return tokenClaims{approvalID: string(payload)}, nil
 }
 
 func loadOrCreateSigningKey(ctx context.Context, db *store.DB) (ed25519.PrivateKey, ed25519.PublicKey, error) {

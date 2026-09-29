@@ -5,6 +5,8 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"fmt"
+	"strings"
 	"sync"
 	"time"
 
@@ -16,16 +18,18 @@ import (
 
 // Event types we record.
 const (
-	EventCallStart      = "call.start"
-	EventCallAllowed    = "call.allowed"
-	EventCallDenied     = "call.denied"
-	EventCallSucceeded  = "call.succeeded"
-	EventCallFailed     = "call.failed"
-	EventApprovalCreate = "approval.create"
-	EventApprovalDecide = "approval.decide"
-	EventApprovalExpire = "approval.expire"
-	EventAgentEnroll    = "agent.enroll"
-	EventUserLogin      = "user.login"
+	EventCallStart        = "call.start"
+	EventCallAllowed      = "call.allowed"
+	EventCallDenied       = "call.denied"
+	EventCallSucceeded    = "call.succeeded"
+	EventCallFailed       = "call.failed"
+	EventApprovalCreate   = "approval.create"
+	EventApprovalDecide   = "approval.decide"
+	EventApprovalExpire   = "approval.expire"
+	EventApprovalCancel   = "approval.cancel"
+	EventApprovalExecuted = "approval.executed"
+	EventAgentEnroll      = "agent.enroll"
+	EventUserLogin        = "user.login"
 )
 
 type Event struct {
@@ -42,7 +46,8 @@ type Event struct {
 	ApprovalID    string          `json:"approval_id,omitempty"`
 
 	// Raiser is who raised the call. Write fills empty fields from the
-	// actor.Raiser on ctx, so call sites needn't repeat it.
+	// actor.Raiser on ctx, so call sites needn't repeat it. CallerID is
+	// stored in, and read back from, the agent_id column.
 	actor.Raiser
 	// Decider is who approved or denied, and how (empty when no decision
 	// is part of this event).
@@ -100,8 +105,25 @@ func (l *Logger) fanOut(e Event) {
 	}
 }
 
-// Write appends an event. ID and TS are filled in if zero. Reason and
-// arguments are passed through RedactString / RedactJSONBytes first so a
+// eventColumns is the one column list for INSERT and SELECT on
+// audit_events. eventArgs and scanEvent follow its order exactly; a
+// column added here is added to both, and the round-trip test catches a
+// slip.
+const eventColumns = `id, ts, agent_id, upstream_name, tool_name, event_type, decision,
+            reason, arguments, result_summary, approval_id,
+            agent_name, agent_kind, owner_user_id, owner_email, owner_name,
+            mcp_session_id, agent_session_id, client_session_id, client_session_claimed,
+            client_kind, client_name, client_ip, via,
+            decided_by_user_id, decided_by_email, decided_by_name, decided_via, decider_ref`
+
+var eventPlaceholders = strings.TrimSuffix(strings.Repeat("?,", strings.Count(eventColumns, ",")+1), ",")
+
+// Write appends an event. ID and TS are filled in if zero. Empty Raiser
+// fields are filled from the actor.Raiser on ctx, so a call site that
+// only names the agent still records owner, client and session. Identity
+// strings go through actor.Clean; they are ids and names, never secrets,
+// and the redactor would wipe any 40-hex id. Reason, result summary and
+// arguments are passed through RedactString / RedactJSONBytes so a
 // fat-fingered API key in a tool argument doesn't become a permanent leak
 // in the audit log.
 func (l *Logger) Write(ctx context.Context, e Event) error {
@@ -111,23 +133,99 @@ func (l *Logger) Write(ctx context.Context, e Event) error {
 	if e.TS == 0 {
 		e.TS = time.Now().UnixMilli()
 	}
+	if r, ok := actor.RaiserFrom(ctx); ok {
+		e.Raiser = e.Raiser.Merge(r)
+	}
+	e.Raiser = cleanRaiser(e.Raiser)
+	// agent_id is the caller id column; Raiser.CallerID has no column of
+	// its own. An explicit AgentID wins, else the caller on the Raiser.
+	if e.AgentID == "" {
+		e.AgentID = e.CallerID
+	}
+	for _, p := range []*string{&e.DecidedByUserID, &e.DecidedByEmail, &e.DecidedByName, &e.DecidedVia, &e.DeciderRef} {
+		*p = actor.Clean(*p)
+	}
 	e.Reason = RedactString(e.Reason)
 	e.ResultSummary = RedactString(e.ResultSummary)
 	e.Arguments = RedactJSONBytes(e.Arguments)
 	_, err := l.db.ExecContext(ctx,
-		`INSERT INTO audit_events(id, ts, agent_id, upstream_name, tool_name, event_type,
-            decision, reason, arguments, result_summary, approval_id)
-         VALUES(?,?,?,?,?,?,?,?,?,?,?)`,
-		e.ID, e.TS,
-		nullStr(e.AgentID), nullStr(e.UpstreamName), nullStr(e.ToolName),
-		e.EventType, nullStr(e.Decision), nullStr(e.Reason),
-		nullRaw(e.Arguments), nullStr(e.ResultSummary), nullStr(e.ApprovalID),
-	)
+		`INSERT INTO audit_events(`+eventColumns+`) VALUES(`+eventPlaceholders+`)`,
+		eventArgs(e)...)
 	if err != nil {
 		return err
 	}
 	l.fanOut(e)
 	return nil
+}
+
+// eventArgs returns e's column values in eventColumns order.
+func eventArgs(e Event) []any {
+	return []any{
+		e.ID, e.TS, nullStr(e.AgentID), nullStr(e.UpstreamName), nullStr(e.ToolName),
+		e.EventType, nullStr(e.Decision), nullStr(e.Reason),
+		nullRaw(e.Arguments), nullStr(e.ResultSummary), nullStr(e.ApprovalID),
+		nullStr(e.AgentName), nullStr(e.AgentKind), nullStr(e.OwnerUserID), nullStr(e.OwnerEmail), nullStr(e.OwnerName),
+		nullStr(e.MCPSessionID), nullStr(e.AgentSessionID), nullStr(e.ClientSessionID), boolInt(e.ClientSessionClaimed),
+		nullStr(e.ClientKind), nullStr(e.ClientName), nullStr(e.ClientIP), nullStr(e.Via),
+		nullStr(e.DecidedByUserID), nullStr(e.DecidedByEmail), nullStr(e.DecidedByName), nullStr(e.DecidedVia), nullStr(e.DeciderRef),
+	}
+}
+
+// rowScanner is the subset shared by *sql.Row and *sql.Rows.
+type rowScanner interface {
+	Scan(dest ...any) error
+}
+
+// scanEvent reads one row SELECTed with eventColumns.
+func scanEvent(s rowScanner) (Event, error) {
+	var e Event
+	var args string
+	var claimed int
+	if err := s.Scan(&e.ID, &e.TS, nstr{&e.AgentID}, nstr{&e.UpstreamName}, nstr{&e.ToolName},
+		&e.EventType, nstr{&e.Decision}, nstr{&e.Reason},
+		nstr{&args}, nstr{&e.ResultSummary}, nstr{&e.ApprovalID},
+		nstr{&e.AgentName}, nstr{&e.AgentKind}, nstr{&e.OwnerUserID}, nstr{&e.OwnerEmail}, nstr{&e.OwnerName},
+		nstr{&e.MCPSessionID}, nstr{&e.AgentSessionID}, nstr{&e.ClientSessionID}, &claimed,
+		nstr{&e.ClientKind}, nstr{&e.ClientName}, nstr{&e.ClientIP}, nstr{&e.Via},
+		nstr{&e.DecidedByUserID}, nstr{&e.DecidedByEmail}, nstr{&e.DecidedByName}, nstr{&e.DecidedVia}, nstr{&e.DeciderRef},
+	); err != nil {
+		return Event{}, err
+	}
+	if args != "" {
+		e.Arguments = json.RawMessage(args)
+	}
+	e.ClientSessionClaimed = claimed != 0
+	e.CallerID = e.AgentID
+	return e, nil
+}
+
+// nstr scans a nullable TEXT column into a string, NULL as "".
+type nstr struct{ s *string }
+
+func (n nstr) Scan(v any) error {
+	switch x := v.(type) {
+	case nil:
+		*n.s = ""
+	case string:
+		*n.s = x
+	case []byte:
+		*n.s = string(x)
+	default:
+		return fmt.Errorf("audit: cannot scan %T into string", v)
+	}
+	return nil
+}
+
+// cleanRaiser applies actor.Clean to every Raiser field.
+func cleanRaiser(r actor.Raiser) actor.Raiser {
+	for _, p := range []*string{
+		&r.CallerID, &r.AgentName, &r.AgentKind, &r.OwnerUserID, &r.OwnerEmail, &r.OwnerName,
+		&r.MCPSessionID, &r.AgentSessionID, &r.ClientSessionID, &r.ClientKind, &r.ClientName,
+		&r.ClientIP, &r.Via,
+	} {
+		*p = actor.Clean(*p)
+	}
+	return r
 }
 
 func nullStr(s string) any {
@@ -142,6 +240,13 @@ func nullRaw(b json.RawMessage) any {
 		return nil
 	}
 	return string(b)
+}
+
+func boolInt(b bool) int {
+	if b {
+		return 1
+	}
+	return 0
 }
 
 // Recent returns up to limit recent events, newest first.
@@ -159,15 +264,21 @@ type Filter struct {
 	EventType string
 	Tool      string
 	Decision  string
-	Limit     int
+	// Actor filters: the owner of the calling agent, the person who
+	// decided, the agent session the call was tagged with, the approval
+	// the event belongs to, and the client kind (t3, claude_code, cli…).
+	OwnerUserID     string
+	DecidedByUserID string
+	AgentSessionID  string
+	ApprovalID      string
+	ClientKind      string
+	Limit           int
 }
 
 // Query returns events matching the filter, newest first. Backs both the
 // audit export and the filtered audit list so the UI and export agree.
 func (l *Logger) Query(ctx context.Context, f Filter) ([]Event, error) {
-	q := `SELECT id, ts, agent_id, upstream_name, tool_name, event_type, decision,
-            reason, arguments, result_summary, approval_id
-         FROM audit_events WHERE 1=1`
+	q := `SELECT ` + eventColumns + ` FROM audit_events WHERE 1=1`
 	var args []any
 	if f.Since > 0 {
 		q += ` AND ts >= ?`
@@ -181,21 +292,21 @@ func (l *Logger) Query(ctx context.Context, f Filter) ([]Event, error) {
 		q += ` AND ts < ?`
 		args = append(args, f.Before)
 	}
-	if f.AgentID != "" {
-		q += ` AND agent_id = ?`
-		args = append(args, f.AgentID)
-	}
-	if f.EventType != "" {
-		q += ` AND event_type = ?`
-		args = append(args, f.EventType)
-	}
-	if f.Tool != "" {
-		q += ` AND tool_name = ?`
-		args = append(args, f.Tool)
-	}
-	if f.Decision != "" {
-		q += ` AND decision = ?`
-		args = append(args, f.Decision)
+	for _, eq := range []struct{ col, val string }{
+		{"agent_id", f.AgentID},
+		{"event_type", f.EventType},
+		{"tool_name", f.Tool},
+		{"decision", f.Decision},
+		{"owner_user_id", f.OwnerUserID},
+		{"decided_by_user_id", f.DecidedByUserID},
+		{"agent_session_id", f.AgentSessionID},
+		{"approval_id", f.ApprovalID},
+		{"client_kind", f.ClientKind},
+	} {
+		if eq.val != "" {
+			q += ` AND ` + eq.col + ` = ?`
+			args = append(args, eq.val)
+		}
 	}
 	q += ` ORDER BY ts DESC`
 	if f.Limit > 0 {
@@ -209,22 +320,10 @@ func (l *Logger) Query(ctx context.Context, f Filter) ([]Event, error) {
 	defer rows.Close()
 	out := []Event{}
 	for rows.Next() {
-		var e Event
-		var agent, upstream, tool, decision, reason, eargs, summary, approval sql.NullString
-		if err := rows.Scan(&e.ID, &e.TS, &agent, &upstream, &tool, &e.EventType,
-			&decision, &reason, &eargs, &summary, &approval); err != nil {
+		e, err := scanEvent(rows)
+		if err != nil {
 			return nil, err
 		}
-		e.AgentID = agent.String
-		e.UpstreamName = upstream.String
-		e.ToolName = tool.String
-		e.Decision = decision.String
-		e.Reason = reason.String
-		if eargs.Valid && eargs.String != "" {
-			e.Arguments = json.RawMessage(eargs.String)
-		}
-		e.ResultSummary = summary.String
-		e.ApprovalID = approval.String
 		out = append(out, e)
 	}
 	return out, rows.Err()
@@ -237,16 +336,14 @@ func (l *Logger) RecentBefore(ctx context.Context, limit int, before int64) ([]E
 	if limit <= 0 || limit > 500 {
 		limit = 100
 	}
-	const cols = `id, ts, agent_id, upstream_name, tool_name, event_type, decision,
-            reason, arguments, result_summary, approval_id`
 	var rows *sql.Rows
 	var err error
 	if before > 0 {
 		rows, err = l.db.QueryContext(ctx,
-			`SELECT `+cols+` FROM audit_events WHERE ts < ? ORDER BY ts DESC LIMIT ?`, before, limit)
+			`SELECT `+eventColumns+` FROM audit_events WHERE ts < ? ORDER BY ts DESC LIMIT ?`, before, limit)
 	} else {
 		rows, err = l.db.QueryContext(ctx,
-			`SELECT `+cols+` FROM audit_events ORDER BY ts DESC LIMIT ?`, limit)
+			`SELECT `+eventColumns+` FROM audit_events ORDER BY ts DESC LIMIT ?`, limit)
 	}
 	if err != nil {
 		return nil, err
@@ -254,22 +351,10 @@ func (l *Logger) RecentBefore(ctx context.Context, limit int, before int64) ([]E
 	defer rows.Close()
 	var out []Event
 	for rows.Next() {
-		var e Event
-		var agent, upstream, tool, decision, reason, args, summary, approval sql.NullString
-		if err := rows.Scan(&e.ID, &e.TS, &agent, &upstream, &tool, &e.EventType,
-			&decision, &reason, &args, &summary, &approval); err != nil {
+		e, err := scanEvent(rows)
+		if err != nil {
 			return nil, err
 		}
-		e.AgentID = agent.String
-		e.UpstreamName = upstream.String
-		e.ToolName = tool.String
-		e.Decision = decision.String
-		e.Reason = reason.String
-		if args.Valid && args.String != "" {
-			e.Arguments = json.RawMessage(args.String)
-		}
-		e.ResultSummary = summary.String
-		e.ApprovalID = approval.String
 		out = append(out, e)
 	}
 	return out, rows.Err()
