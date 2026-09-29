@@ -31,7 +31,12 @@ func (s *Server) hooksIngest(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusRequestEntityTooLarge, "hook payload too large")
 		return
 	}
-	ev, err := s.hooks.IngestRaw(r.Context(), agentID, body, r.URL.Query().Get("source"))
+	// The hook event is always recorded. The MemPalace forward is a write
+	// into the mempalace tool group, so it needs the same grant the tool
+	// itself would: without one the event lands, the memory does not.
+	ev, err := s.hooks.IngestRawOpts(r.Context(), agentID, body, r.URL.Query().Get("source"), hooks.IngestOptions{
+		SkipMemory: !s.agentMayUse(r.Context(), agentID, mempalaceGroup),
+	})
 	if err != nil {
 		switch {
 		case errors.Is(err, hooks.ErrInvalidJSON):

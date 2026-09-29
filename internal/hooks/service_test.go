@@ -124,3 +124,31 @@ func TestDirectClientPayloadStoresWholeBody(t *testing.T) {
 		t.Fatalf("expected original payload, got %v", payload)
 	}
 }
+
+func TestIngestRawOptsSkipMemoryStillRecords(t *testing.T) {
+	mp := &stubMemPalace{ok: true}
+	svc := New(tempHooksDB(t), mp)
+	ctx := context.Background()
+	body := []byte(`{"source":"codex","event_name":"UserPromptSubmit","text":"remember this"}`)
+
+	ev, err := svc.IngestRawOpts(ctx, "ag_1", body, "", IngestOptions{SkipMemory: true})
+	if err != nil {
+		t.Fatalf("IngestRawOpts: %v", err)
+	}
+	if ev.MemoryIngested || mp.calls != 0 {
+		t.Fatalf("memory forwarded despite SkipMemory: ingested=%v calls=%d", ev.MemoryIngested, mp.calls)
+	}
+	rows, err := svc.List(ctx, Query{AgentID: "ag_1"})
+	if err != nil || len(rows) != 1 || rows[0].ID != ev.ID || rows[0].MemoryIngested {
+		t.Fatalf("event not recorded as expected: %v %+v", err, rows)
+	}
+
+	// Default options keep forwarding.
+	ev, err = svc.IngestRaw(ctx, "ag_1", body, "")
+	if err != nil {
+		t.Fatalf("IngestRaw: %v", err)
+	}
+	if !ev.MemoryIngested || mp.calls != 1 {
+		t.Fatalf("default ingest did not forward: ingested=%v calls=%d", ev.MemoryIngested, mp.calls)
+	}
+}

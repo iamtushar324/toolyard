@@ -46,11 +46,14 @@ func (g *Gateway) inboxMode() bool {
 }
 
 // Access implements inbox.Catalog: how would a call to tool be treated?
+// A tool outside agentID's access scope reads as unknown, the same as a
+// tool that doesn't exist, so inbox.check, request validation and the
+// nearby-restricted hints never name a server the agent wasn't granted.
 func (g *Gateway) Access(ctx context.Context, agentID, tool string, args map[string]any) (string, string) {
 	g.mu.RLock()
 	entry, ok := g.tools[tool]
 	g.mu.RUnlock()
-	if !ok {
+	if !ok || !g.allowsEntry(ctx, agentID, entry) {
 		return inbox.AccessUnknown, ""
 	}
 	var action policy.Action

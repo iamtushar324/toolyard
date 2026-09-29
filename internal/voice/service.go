@@ -286,7 +286,7 @@ func (s *Service) runCall(ctx context.Context, conn *websocket.Conn, call *Call)
 	}
 	if s.cfg.Tools != nil {
 		toolCtx := gateway.WithAgentID(ctx, "voice:"+call.UserID)
-		catalog := s.cfg.Tools.Catalog()
+		catalog := s.cfg.Tools.CatalogFor(toolCtx)
 		lc.tools = buildGenaiTools(catalog, s.log)
 		lc.dispatch = func(_ context.Context, name string, args map[string]any) (string, error) {
 			// Deliberately use toolCtx (the call's lifetime + identity),

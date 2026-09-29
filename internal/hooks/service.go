@@ -76,10 +76,23 @@ type Query struct {
 	Limit     int
 }
 
+// IngestOptions tunes one ingest.
+type IngestOptions struct {
+	// SkipMemory records the event but never forwards it to MemPalace. The
+	// API sets it for agents whose user may not use the mempalace tool
+	// group: the hook trail is still kept, the memory write is not made.
+	SkipMemory bool
+}
+
 // IngestRaw accepts either Toolyard's normalized hook shape or raw client hook
 // JSON. For raw client JSON, the full body is stored as payload and the common
 // fields are best-effort extracted from known client keys.
 func (s *Service) IngestRaw(ctx context.Context, agentID string, body []byte, sourceHint string) (*Event, error) {
+	return s.IngestRawOpts(ctx, agentID, body, sourceHint, IngestOptions{})
+}
+
+// IngestRawOpts is IngestRaw with options.
+func (s *Service) IngestRawOpts(ctx context.Context, agentID string, body []byte, sourceHint string, opts IngestOptions) (*Event, error) {
 	if strings.TrimSpace(agentID) == "" {
 		return nil, ErrAgentRequired
 	}
@@ -114,7 +127,9 @@ func (s *Service) IngestRaw(ctx context.Context, agentID string, body []byte, so
 	if err := s.insert(ctx, ev); err != nil {
 		return nil, err
 	}
-	ev.MemoryIngested = s.tryMemoryIngest(ctx, ev)
+	if !opts.SkipMemory {
+		ev.MemoryIngested = s.tryMemoryIngest(ctx, ev)
+	}
 	if ev.MemoryIngested {
 		_, _ = s.db.ExecContext(ctx, `UPDATE hook_events SET memory_ingested = 1 WHERE id = ?`, ev.ID)
 	}

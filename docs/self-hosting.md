@@ -204,3 +204,44 @@ A new pending approval pushes a notification with **Allow** / **Deny**
 buttons. Tapping one POSTs to `/v1/approvals/decide-by-token` with the
 Ed25519-signed token from the payload, so a deciding tap doesn't even need
 your dashboard session.
+
+## Sign in with Google (Clerk)
+
+Staff can sign in with their Google account through [Clerk](https://clerk.com).
+"Internal user" means a member of one Clerk organisation; nobody else gets
+past the login page, whatever their email domain. The local password account
+stays as the break-glass login.
+
+1. In the Clerk dashboard, enable Google as a social connection and note
+   the instance's **secret key**, **publishable key** and the
+   **organisation ID** (`org_…`) whose members may sign in.
+2. Put the three values in the systemd `EnvironmentFile` (or the `.env`
+   next to the binary). They must never be passed on the command line:
+
+   ```bash
+   TOOLYARD_CLERK_SECRET_KEY=sk_live_…
+   TOOLYARD_CLERK_PUBLISHABLE_KEY=pk_live_…
+   TOOLYARD_CLERK_ORGANIZATION_ID=org_…
+   ```
+
+   Clerk sign-in is on only when all three are set; setting one or two is
+   a startup error. It also requires `-public-url`, because a Clerk session
+   token is only accepted when it was minted for that exact origin.
+3. Start with the owner's email so the first Google sign-in with that
+   address attaches to the existing password account (keeping its admin
+   role, agents, passkeys and push subscriptions):
+
+   ```bash
+   ./toolyard serve -public-url https://toolyard.example.com \
+     -owner-email you@example.com
+   ```
+
+Everyone else who signs in becomes a **member**: they see their own profile,
+manage their own agents, and their agents reach only the servers and data
+groups (memory, lake, events, notes, skills) an admin grants them on the
+**Users** page. Every approval and inbox decision stays with admins.
+
+Once an hour (`-clerk-sync-interval`) toolyard lists the organisation's
+members; anyone who left is blocked (`left_org`), their dashboard sessions
+are revoked and their agents stop authenticating. A Clerk outage never
+blocks anyone: on any error the sync logs and changes nothing.
