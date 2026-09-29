@@ -15,6 +15,7 @@ import (
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
 
+	"github.com/tusharbhardwaj/toolyard/internal/access"
 	"github.com/tusharbhardwaj/toolyard/internal/approval"
 	"github.com/tusharbhardwaj/toolyard/internal/audit"
 	"github.com/tusharbhardwaj/toolyard/internal/inbox"
@@ -133,6 +134,7 @@ type Gateway struct {
 	inLineWait          time.Duration
 	maxPendingPerAgent  int
 	upstreamCallTimeout time.Duration
+	access              access.Resolver
 
 	// inbox, when set, backs the inbox.* tools and grant redemption.
 	// approvalMode returns "inbox" (restricted calls are coached towards
@@ -214,6 +216,9 @@ type Options struct {
 	// and external upstreams alike). Without a cap, a hung upstream
 	// pinned a goroutine forever and piled up everyone behind it.
 	UpstreamCallTimeout time.Duration
+	// Access, when set, limits each caller to the tool groups its dashboard
+	// user may use (admins: everything). nil leaves every tool reachable.
+	Access access.Resolver
 }
 
 // UsageRecorder is satisfied by *internal/usage.Service. The gateway only
@@ -288,6 +293,7 @@ func New(opts Options) *Gateway {
 		inLineWait:          opts.InLineWait,
 		maxPendingPerAgent:  opts.MaxPendingPerAgent,
 		upstreamCallTimeout: opts.UpstreamCallTimeout,
+		access:              opts.Access,
 		tools:               map[string]toolEntry{},
 		upstreams:           map[string]*upstream{},
 	}
