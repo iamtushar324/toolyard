@@ -1356,6 +1356,8 @@ func (s *Server) pushSubscribe(w http.ResponseWriter, r *http.Request) {
 				P256dh string `json:"p256dh"`
 				Auth   string `json:"auth"`
 			} `json:"keys"`
+			// Sent by PushSubscription.toJSON() (null in Safari); unused.
+			ExpirationTime *float64 `json:"expirationTime"`
 		}
 		if err := decode(r, &body); err != nil {
 			writeError(w, http.StatusBadRequest, err.Error())
