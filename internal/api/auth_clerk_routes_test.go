@@ -207,3 +207,66 @@ func TestPasswordLoginBlocked(t *testing.T) {
 		t.Errorf("blocked user's cookie: %d, want 401", rec.Code)
 	}
 }
+
+// A Clerk sign-in before anyone ran the password setup must still leave an
+// admin behind, or the Users page is unreachable forever (setup closes as
+// soon as a user exists).
+func TestAuthClerkSessionBootstrapsAdminOnEmptyStore(t *testing.T) {
+	emptyStore := func(t *testing.T, e *accessTestEnv) {
+		t.Helper()
+		if _, err := e.db.Exec(`DELETE FROM users`); err != nil {
+			t.Fatal(err)
+		}
+	}
+	signIn := func(t *testing.T, e *accessTestEnv) map[string]any {
+		t.Helper()
+		rec := e.do(t, nil, http.MethodPost, "/v1/auth/clerk/session", `{"token":"good-token"}`)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("sign-in: %d %s", rec.Code, rec.Body.String())
+		}
+		return decodeJSON(t, rec)
+	}
+
+	t.Run("org admin becomes admin", func(t *testing.T) {
+		e := newAccessTestServer(t)
+		emptyStore(t, e)
+		e.clerk.set(func(f *fakeClerk) { f.member.Role = "org:admin"; f.member.Email = "someone@beknown.work" })
+		u := signIn(t, e)
+		if u["role"] != identity.RoleAdmin {
+			t.Fatalf("org admin on empty store = %v", u)
+		}
+		// Setup is closed as before, but an admin exists to run the show.
+		if rec := e.do(t, nil, http.MethodPost, "/v1/auth/setup", `{"Username":"x","Password":"long-enough-password"}`); rec.Code != http.StatusNotFound {
+			t.Errorf("setup after clerk bootstrap: %d", rec.Code)
+		}
+		if rec := e.do(t, sessionCookie(t, e.do(t, nil, http.MethodPost, "/v1/auth/clerk/session", `{"token":"good-token"}`)), http.MethodGet, "/v1/users", ""); rec.Code != http.StatusOK {
+			t.Errorf("bootstrapped admin GET /v1/users: %d %s", rec.Code, rec.Body.String())
+		}
+	})
+
+	t.Run("owner email becomes admin", func(t *testing.T) {
+		e := newAccessTestServer(t)
+		emptyStore(t, e)
+		e.clerk.set(func(f *fakeClerk) { f.member.Role = "org:member"; f.member.Email = "OWNER@beknown.work" })
+		if u := signIn(t, e); u["role"] != identity.RoleAdmin {
+			t.Fatalf("owner on empty store = %v", u)
+		}
+	})
+
+	t.Run("plain member stays a member", func(t *testing.T) {
+		e := newAccessTestServer(t)
+		emptyStore(t, e)
+		e.clerk.set(func(f *fakeClerk) { f.member.Role = "org:member"; f.member.Email = "someone@beknown.work" })
+		if u := signIn(t, e); u["role"] != identity.RoleMember {
+			t.Fatalf("plain member on empty store = %v", u)
+		}
+	})
+
+	t.Run("org admin with an existing admin stays a member", func(t *testing.T) {
+		e := newAccessTestServer(t)
+		e.clerk.set(func(f *fakeClerk) { f.member.Role = "org:admin"; f.member.Email = "someone@beknown.work" })
+		if u := signIn(t, e); u["role"] != identity.RoleMember {
+			t.Fatalf("org admin with password admin present = %v", u)
+		}
+	})
+}

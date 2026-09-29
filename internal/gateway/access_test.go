@@ -1,6 +1,7 @@
 package gateway
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -207,8 +208,19 @@ func mcpToolsList(t *testing.T, g *Gateway, ctx context.Context) []string {
 	return names
 }
 
-// mcpToolsCall runs tools/call through the MCP server's registered handler.
-func mcpToolsCall(t *testing.T, g *Gateway, ctx context.Context, tool string) (isError bool, text string) {
+// rpcReply is a decoded raw JSON-RPC tools/call response: either a tool
+// result (isError/text) or a protocol error (code/message).
+type rpcReply struct {
+	raw     []byte
+	rpcErr  bool
+	code    int
+	message string
+	isError bool
+	text    string
+}
+
+// mcpToolsCall runs tools/call through the MCP server, as a raw client would.
+func mcpToolsCall(t *testing.T, g *Gateway, ctx context.Context, tool string) rpcReply {
 	t.Helper()
 	msg, _ := json.Marshal(map[string]any{
 		"jsonrpc": "2.0", "id": 2, "method": "tools/call",
@@ -217,22 +229,38 @@ func mcpToolsCall(t *testing.T, g *Gateway, ctx context.Context, tool string) (i
 	raw := g.MCPServer().HandleMessage(ctx, json.RawMessage(msg))
 	b, _ := json.Marshal(raw)
 	var out struct {
-		Result struct {
+		Result *struct {
 			IsError bool `json:"isError"`
 			Content []struct {
 				Text string `json:"text"`
 			} `json:"content"`
 		} `json:"result"`
-		Error any `json:"error"`
+		Error *struct {
+			Code    int    `json:"code"`
+			Message string `json:"message"`
+		} `json:"error"`
 	}
-	if err := json.Unmarshal(b, &out); err != nil || out.Error != nil {
+	if err := json.Unmarshal(b, &out); err != nil || (out.Result == nil) == (out.Error == nil) {
 		t.Fatalf("tools/call %s: %v %s", tool, err, b)
 	}
+	r := rpcReply{raw: b}
+	if out.Error != nil {
+		r.rpcErr, r.code, r.message = true, out.Error.Code, out.Error.Message
+		return r
+	}
+	r.isError = out.Result.IsError
 	var sb strings.Builder
 	for _, c := range out.Result.Content {
 		sb.WriteString(c.Text)
 	}
-	return out.Result.IsError, sb.String()
+	r.text = sb.String()
+	return r
+}
+
+// rpcNotFoundMessage is mcp-go's own message for a tools/call naming a tool
+// it doesn't have (server/server.go handleToolCall, v0.52.0).
+func rpcNotFoundMessage(tool string) string {
+	return fmt.Sprintf("tool '%s' not found: tool not found", tool)
 }
 
 func has(names []string, want string) bool {
@@ -303,15 +331,14 @@ func TestAccessToolsListFiltersByScope(t *testing.T) {
 		t.Fatalf("unknown caller should see nothing, got %v", unknown)
 	}
 
-	// A direct MCP call to a hidden, ungranted tool answers not-found, not
-	// the surface-mode hint (which would confirm the tool exists).
-	isErr, text := mcpToolsCall(t, f.gw, f.member, "beta.get_status")
-	if !isErr || text != notFoundText("beta.get_status") {
-		t.Fatalf("hidden+ungranted direct call: isError=%v text=%q", isErr, text)
+	// A direct MCP call to a hidden, ungranted tool answers as an unknown
+	// tool, not with the surface-mode hint (which would confirm it exists).
+	if r := mcpToolsCall(t, f.gw, f.member, "beta.get_status"); !r.rpcErr || r.message != rpcNotFoundMessage("beta.get_status") {
+		t.Fatalf("hidden+ungranted direct call: %s", r.raw)
 	}
 	// The same hidden tool for an admin still gets the surface-mode hint.
-	if isErr, text := mcpToolsCall(t, f.gw, f.admin, "beta.get_status"); !isErr || !strings.Contains(text, "hidden by the current agent-surface mode") {
-		t.Fatalf("admin hidden direct call: isError=%v text=%q", isErr, text)
+	if r := mcpToolsCall(t, f.gw, f.admin, "beta.get_status"); r.rpcErr || !r.isError || !strings.Contains(r.text, "hidden by the current agent-surface mode") {
+		t.Fatalf("admin hidden direct call: %s", r.raw)
 	}
 	if f.calls.Load() != 0 {
 		t.Fatal("no handler should have run")
@@ -321,9 +348,10 @@ func TestAccessToolsListFiltersByScope(t *testing.T) {
 func TestAccessCallsToUngrantedGroupLookLikeUnknownTools(t *testing.T) {
 	f := newAccessFixture(t, nil)
 
-	// Direct MCP handler.
-	if isErr, text := mcpToolsCall(t, f.gw, f.member, "beta.get_status"); !isErr || text != notFoundText("beta.get_status") {
-		t.Fatalf("mcp direct: isError=%v text=%q", isErr, text)
+	// Raw MCP tools/call: a protocol-level not-found (see
+	// TestAccessRawMCPCallMatchesUnknownTool for the byte comparison).
+	if r := mcpToolsCall(t, f.gw, f.member, "beta.get_status"); !r.rpcErr || r.message != rpcNotFoundMessage("beta.get_status") {
+		t.Fatalf("mcp direct: %s", r.raw)
 	}
 	// RouteCall.
 	res := f.call(t, f.member, "beta.get_status", nil)
@@ -384,6 +412,81 @@ func TestAccessCallsToUngrantedGroupLookLikeUnknownTools(t *testing.T) {
 	}
 	if !f.met.find("beta.get_status", metrics.OutcomeDenied, "access") {
 		t.Fatalf("expected a denied/access metrics event, got %+v", f.met.events)
+	}
+}
+
+// TestAccessRawMCPCallMatchesUnknownTool: mcp-go answers tools/call for a
+// name it doesn't have with a JSON-RPC error, not a tool result, so an
+// ungranted tool must produce that same error or a member could tell the
+// two apart and map which servers exist.
+func TestAccessRawMCPCallMatchesUnknownTool(t *testing.T) {
+	f := newAccessFixture(t, nil)
+
+	ungranted := mcpToolsCall(t, f.gw, f.member, "beta.get_status")
+	unknown := mcpToolsCall(t, f.gw, f.member, "nope.tool")
+	if !ungranted.rpcErr || !unknown.rpcErr {
+		t.Fatalf("both must be JSON-RPC errors:\n%s\n%s", ungranted.raw, unknown.raw)
+	}
+	normalised := bytes.ReplaceAll(ungranted.raw, []byte("beta.get_status"), []byte("nope.tool"))
+	if !bytes.Equal(normalised, unknown.raw) {
+		t.Fatalf("ungranted and unknown responses differ:\n%s\n%s", normalised, unknown.raw)
+	}
+	if ungranted.message != rpcNotFoundMessage("beta.get_status") {
+		t.Fatalf("message should keep mcp-go's shape: %q", ungranted.message)
+	}
+	// A Denied caller gets the same answer for an always-on tool.
+	blocked := mcpToolsCall(t, f.gw, f.blocked, "tools.search")
+	if !blocked.rpcErr || blocked.code != unknown.code || blocked.message != rpcNotFoundMessage("tools.search") {
+		t.Fatalf("blocked raw call: %s", blocked.raw)
+	}
+	if f.calls.Load() != 0 {
+		t.Fatal("no handler should have run")
+	}
+
+	// The denial is still on record even though the agent saw "not found".
+	evs, err := f.aud.Recent(context.Background(), 50)
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, e := range evs {
+		if e.EventType == audit.EventCallDenied && e.Reason == accessDeniedReason && e.ToolName == "beta.get_status" && e.AgentID == memberID {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("raw MCP denial should be audited")
+	}
+	if !f.met.find("beta.get_status", metrics.OutcomeDenied, "access") {
+		t.Fatalf("raw MCP denial should record a denied/access metrics event: %+v", f.met.events)
+	}
+
+	// Granted and admin callers still get real results over raw MCP.
+	if r := mcpToolsCall(t, f.gw, f.member, "alpha.get_status"); r.rpcErr || r.isError || f.calls.Load() != 1 {
+		t.Fatalf("member alpha.get_status: %s", r.raw)
+	}
+	if r := mcpToolsCall(t, f.gw, f.admin, "beta.get_status"); r.rpcErr || r.isError || f.calls.Load() != 2 {
+		t.Fatalf("admin beta.get_status: %s", r.raw)
+	}
+}
+
+func TestAddUpstreamReservesAccessGroupNames(t *testing.T) {
+	f := newAccessFixture(t, nil)
+	// The synthetic upstreams, the always-on meta-tool group, and the data
+	// groups whose tools live under the "builtin" upstream.
+	for _, name := range []string{"builtin", "fixture", "inbox", "session", "tools", "memory", "lake", "events"} {
+		err := f.gw.AddUpstream(context.Background(), UpstreamConfig{Name: name})
+		if err == nil || !strings.Contains(err.Error(), "reserved") {
+			t.Errorf("upstream %q should be reserved, got %v", name, err)
+		}
+	}
+	// notes and skills are real upstreams that startup registers under
+	// those names, and any plain name, get past the reservation (and fail
+	// later, on dial).
+	for _, name := range []string{"notes", "skills", "deploy"} {
+		if err := f.gw.AddUpstream(context.Background(), UpstreamConfig{Name: name}); err != nil && strings.Contains(err.Error(), "reserved") {
+			t.Errorf("%q must not be reserved at the gateway: %v", name, err)
+		}
 	}
 }
 
@@ -558,5 +661,12 @@ func TestAccessNilResolverIsUnrestricted(t *testing.T) {
 	}
 	if a, up := f.gw.Access(context.Background(), "ag_nobody", "deploy.run", nil); a != inbox.AccessRestricted || up != "deploy" {
 		t.Fatalf("without a resolver inbox Access is unchanged: %s %s", a, up)
+	}
+	// Raw MCP keeps mcp-go's own unknown-tool answer (INVALID_PARAMS).
+	if r := mcpToolsCall(t, f.gw, unknown, "nope.tool"); !r.rpcErr || r.code != mcp.INVALID_PARAMS || r.message != rpcNotFoundMessage("nope.tool") {
+		t.Fatalf("without a resolver unknown tools are mcp-go's business: %s", r.raw)
+	}
+	if r := mcpToolsCall(t, f.gw, unknown, "deploy.get_status"); r.rpcErr || r.isError {
+		t.Fatalf("without a resolver raw MCP calls run: %s", r.raw)
 	}
 }

@@ -3,8 +3,11 @@ package identity
 import (
 	"context"
 	"errors"
+	"path/filepath"
 	"testing"
 	"time"
+
+	"github.com/tusharbhardwaj/toolyard/internal/store"
 )
 
 func clerkUser(t *testing.T, s *Service, id, email, owner string) *User {
@@ -305,4 +308,71 @@ func TestVerifyAgentTokenBlockedOwner(t *testing.T) {
 	if _, err := s.VerifyAgentToken(ctx, tok2); err != nil {
 		t.Errorf("orphan agent token rejected: %v", err)
 	}
+}
+
+// newEmptyIdentity is a store with no users at all: nobody ran the
+// password setup before the first Clerk sign-in.
+func newEmptyIdentity(t *testing.T) *Service {
+	t.Helper()
+	db, err := store.Open(filepath.Join(t.TempDir(), "empty.db"))
+	if err != nil {
+		t.Fatalf("open db: %v", err)
+	}
+	t.Cleanup(func() { db.Close() })
+	return New(db)
+}
+
+func TestUpsertClerkUserBootstrapsFirstAdmin(t *testing.T) {
+	ctx := context.Background()
+	upsert := func(t *testing.T, s *Service, id, email, orgRole, owner string) *User {
+		t.Helper()
+		u, err := s.UpsertClerkUser(ctx, ClerkProfile{ClerkUserID: id, Email: email, OrgRole: orgRole}, owner)
+		if err != nil {
+			t.Fatalf("UpsertClerkUser(%s): %v", id, err)
+		}
+		return u
+	}
+
+	t.Run("owner email on an empty store", func(t *testing.T) {
+		s := newEmptyIdentity(t)
+		u := upsert(t, s, "user_owner", "Owner@Beknown.work", "org:member", "owner@beknown.work")
+		if u.Role != RoleAdmin || u.Status != StatusActive || u.Auth != AuthClerk {
+			t.Fatalf("owner on empty store = %+v", u)
+		}
+		// With an active admin present, later org admins are members, and
+		// a returning user never changes role.
+		if u2 := upsert(t, s, "user_2", "two@beknown.work", "org:admin", "owner@beknown.work"); u2.Role != RoleMember {
+			t.Errorf("org admin after bootstrap = %+v", u2)
+		}
+		if again := upsert(t, s, "user_2", "two@beknown.work", "org:admin", "owner@beknown.work"); again.Role != RoleMember {
+			t.Errorf("returning user changed role: %+v", again)
+		}
+	})
+
+	t.Run("org admin on an empty store without owner email", func(t *testing.T) {
+		for _, role := range []string{"org:admin", "admin", " ORG:ADMIN "} {
+			s := newEmptyIdentity(t)
+			if u := upsert(t, s, "user_a", "a@beknown.work", role, ""); u.Role != RoleAdmin {
+				t.Errorf("org role %q on empty store = %+v", role, u)
+			}
+		}
+	})
+
+	t.Run("plain member on an empty store stays a member", func(t *testing.T) {
+		s := newEmptyIdentity(t)
+		if u := upsert(t, s, "user_m", "m@beknown.work", "org:member", "owner@beknown.work"); u.Role != RoleMember {
+			t.Errorf("plain member on empty store = %+v", u)
+		}
+		// The next org admin still bootstraps: there is no active admin yet.
+		if u := upsert(t, s, "user_a", "a@beknown.work", "org:admin", ""); u.Role != RoleAdmin {
+			t.Errorf("org admin after a member on empty store = %+v", u)
+		}
+	})
+
+	t.Run("password admin present means no bootstrap", func(t *testing.T) {
+		s, _ := newTestIdentity(t)
+		if u := upsert(t, s, "user_a", "a@beknown.work", "org:admin", ""); u.Role != RoleMember {
+			t.Errorf("org admin with a password admin present = %+v", u)
+		}
+	})
 }

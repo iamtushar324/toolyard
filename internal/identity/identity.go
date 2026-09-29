@@ -91,6 +91,17 @@ type ClerkProfile struct {
 	Email       string
 	DisplayName string
 	AvatarURL   string
+	// OrgRole is the person's role in the Clerk organisation (org:admin,
+	// org:member, …). It only matters for a brand-new user on a store with
+	// no active admin; see UpsertClerkUser.
+	OrgRole string
+}
+
+// IsOrgAdminRole reports whether a Clerk organisation role is an admin
+// role: "org:admin", or the legacy "admin" (bkt3's rule).
+func IsOrgAdminRole(role string) bool {
+	r := strings.ToLower(strings.TrimSpace(role))
+	return r == "org:admin" || r == "admin"
 }
 
 // UserSummary is a User plus the counts the Users admin page shows.
@@ -276,8 +287,12 @@ func (s *Service) PrimaryUser(ctx context.Context) (*User, error) {
 // Clerk id whose email equals ownerEmail (case-insensitive) attaches to the
 // primary user when that row isn't linked yet, so the owner keeps their
 // admin role, agents, passkeys and push subscriptions. Anyone else becomes
-// a member with a username derived from their email. Blocked users are
-// returned as they are; the caller decides what that means.
+// a member with a username derived from their email — except that while
+// the store has no active admin at all (a fresh install where nobody ran
+// the password setup, or every admin blocked), the owner or an admin of
+// the Clerk organisation becomes admin, so someone can always reach the
+// Users page: /v1/auth/setup closes as soon as any user exists. Blocked
+// users are returned as they are; the caller decides what that means.
 func (s *Service) UpsertClerkUser(ctx context.Context, p ClerkProfile, ownerEmail string) (*User, error) {
 	p.ClerkUserID = strings.TrimSpace(p.ClerkUserID)
 	if p.ClerkUserID == "" {
@@ -304,7 +319,8 @@ func (s *Service) UpsertClerkUser(ctx context.Context, p ClerkProfile, ownerEmai
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return nil, err
 	}
-	if id == "" && ownerEmail != "" && p.Email != "" && strings.EqualFold(p.Email, ownerEmail) {
+	isOwner := ownerEmail != "" && p.Email != "" && strings.EqualFold(p.Email, ownerEmail)
+	if id == "" && isOwner {
 		var pid string
 		var linked sql.NullString
 		err := tx.QueryRowContext(ctx,
@@ -331,6 +347,16 @@ func (s *Service) UpsertClerkUser(ctx context.Context, p ClerkProfile, ownerEmai
 		if err != nil {
 			return nil, err
 		}
+		role := RoleMember
+		if isOwner || IsOrgAdminRole(p.OrgRole) {
+			bootstrap, err := noActiveAdmin(ctx, tx)
+			if err != nil {
+				return nil, err
+			}
+			if bootstrap {
+				role = RoleAdmin
+			}
+		}
 		id = "u_" + uuid.NewString()
 		if _, err := tx.ExecContext(ctx,
 			`INSERT INTO users(id, username, password_hash, created_at, updated_at,
@@ -338,7 +364,7 @@ func (s *Service) UpsertClerkUser(ctx context.Context, p ClerkProfile, ownerEmai
              VALUES(?,?,'',?,?,?,?,?,?,?,?,?)`,
 			id, username, now, now,
 			nullStr(p.Email), nullStr(p.DisplayName), nullStr(p.AvatarURL),
-			RoleMember, StatusActive, p.ClerkUserID, now); err != nil {
+			role, StatusActive, p.ClerkUserID, now); err != nil {
 			return nil, err
 		}
 	}
@@ -492,6 +518,16 @@ func roleStatus(ctx context.Context, tx *sql.Tx, id string) (role, status string
 		return "", "", ErrNoUser
 	}
 	return role, status, err
+}
+
+// noActiveAdmin reports whether the store has no admin who could sign in.
+func noActiveAdmin(ctx context.Context, tx *sql.Tx) (bool, error) {
+	var n int
+	if err := tx.QueryRowContext(ctx,
+		`SELECT count(*) FROM users WHERE role = ? AND status = ?`, RoleAdmin, StatusActive).Scan(&n); err != nil {
+		return false, err
+	}
+	return n == 0, nil
 }
 
 // ensureOtherActiveAdmin is the last-admin rule: at least one active admin

@@ -10,17 +10,46 @@ import (
 	"testing"
 	"time"
 
+	"github.com/mark3labs/mcp-go/mcp"
+
 	"github.com/tusharbhardwaj/toolyard/internal/access"
 	"github.com/tusharbhardwaj/toolyard/internal/audit"
 	"github.com/tusharbhardwaj/toolyard/internal/clerk"
 	"github.com/tusharbhardwaj/toolyard/internal/gateway"
+	"github.com/tusharbhardwaj/toolyard/internal/hooks"
 	"github.com/tusharbhardwaj/toolyard/internal/identity"
 	"github.com/tusharbhardwaj/toolyard/internal/memory"
+	"github.com/tusharbhardwaj/toolyard/internal/mempalace"
+	"github.com/tusharbhardwaj/toolyard/internal/notes"
 	"github.com/tusharbhardwaj/toolyard/internal/policy"
 	"github.com/tusharbhardwaj/toolyard/internal/realtime"
 	"github.com/tusharbhardwaj/toolyard/internal/store"
 	"github.com/tusharbhardwaj/toolyard/internal/upstreams"
 )
+
+// fakeDispatcher stands in for the gateway behind the mempalace, notes and
+// hooks services. Only mempalace.* tools "exist" (so notes.publish writes
+// its file to disk directly) and every call succeeds; targets are recorded
+// so a test can prove a write did or did not happen.
+type fakeDispatcher struct {
+	mu    sync.Mutex
+	calls []string
+}
+
+func (d *fakeDispatcher) HasTool(name string) bool { return strings.HasPrefix(name, "mempalace.") }
+
+func (d *fakeDispatcher) CallInternal(_ context.Context, _, target string, _ map[string]any) (*mcp.CallToolResult, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.calls = append(d.calls, target)
+	return mcp.NewToolResultText(`{"ok":true}`), nil
+}
+
+func (d *fakeDispatcher) Calls() []string {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return append([]string(nil), d.calls...)
+}
 
 // fakeClerk satisfies clerkDirectory with programmable answers.
 type fakeClerk struct {
@@ -80,6 +109,11 @@ type accessTestEnv struct {
 	gw      *gateway.Gateway
 	clerk   *fakeClerk
 	admin   *identity.User
+	// disp backs the mempalace, notes and hooks services; notesDir is
+	// where notes.publish writes.
+	disp     *fakeDispatcher
+	notesDir string
+	hooks    *hooks.Service
 }
 
 func newAccessTestServer(t *testing.T) *accessTestEnv {
@@ -109,6 +143,15 @@ func newAccessTestServer(t *testing.T) *accessTestEnv {
 		member: clerk.Member{IsMember: true, Role: "org:member", Email: "ada@beknown.work", FirstName: "Ada", LastName: "Lovelace", ImageURL: "https://img.clerk.com/ada"},
 	}
 
+	// Bearer REST services on a fake dispatcher: mempalace "on" and
+	// reachable, notes enabled on a temp dir with its scanner off, hooks
+	// forwarding into that mempalace.
+	disp := &fakeDispatcher{}
+	mpSvc := mempalace.New(db, disp, auditLog, t.TempDir(), mempalace.ModeOn)
+	notesDir := t.TempDir()
+	notesSvc := notes.New(notes.Options{DB: db, Gateway: disp, NotesDir: notesDir, Interval: -1})
+	hooksSvc := hooks.New(db, mpSvc)
+
 	srvCtx, cancel := context.WithCancel(ctx)
 	t.Cleanup(cancel)
 	srv := New(srvCtx, Options{
@@ -117,6 +160,9 @@ func newAccessTestServer(t *testing.T) *accessTestEnv {
 		Access:     acc,
 		Gateway:    gw,
 		Upstreams:  upSvc,
+		Mempalace:  mpSvc,
+		Notes:      notesSvc,
+		Hooks:      hooksSvc,
 		SessionKey: []byte("0123456789abcdef0123456789abcdef"),
 		OwnerEmail: "owner@beknown.work",
 	})
@@ -128,7 +174,34 @@ func newAccessTestServer(t *testing.T) *accessTestEnv {
 	srv.Routes(mux)
 	var h http.Handler = srv.RoleGuard(mux)
 	h = srv.HardenAPI(h)
-	return &accessTestEnv{srv: srv, handler: h, db: db, id: id, access: acc, audit: auditLog, gw: gw, clerk: fc, admin: admin}
+	return &accessTestEnv{
+		srv: srv, handler: h, db: db, id: id, access: acc, audit: auditLog, gw: gw, clerk: fc, admin: admin,
+		disp: disp, notesDir: notesDir, hooks: hooksSvc,
+	}
+}
+
+// agentFor enrols an agent owned by uid and returns its bearer token and id.
+func (e *accessTestEnv) agentFor(t *testing.T, uid string) (string, string) {
+	t.Helper()
+	tok, ag, err := e.id.CreateAgentWithToken(context.Background(), uid, "bot")
+	if err != nil {
+		t.Fatalf("create agent: %v", err)
+	}
+	return tok, ag.ID
+}
+
+// bearer sends an agent-authenticated request (the toolyard CLI / hook
+// shape: bearer token, JSON body, no cookie, no CSRF header).
+func (e *accessTestEnv) bearer(t *testing.T, token, method, path, body string) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(method, path, strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer "+token)
+	if body != "" {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	rec := httptest.NewRecorder()
+	e.handler.ServeHTTP(rec, req)
+	return rec
 }
 
 // seedServer inserts an upstream server row without dialling anything.

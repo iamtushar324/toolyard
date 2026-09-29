@@ -1418,8 +1418,10 @@ There is no separate Conductor hook endpoint for v1; the selected agent client e
       ),
       m.snippetTab === 'cli' ? el('div', { class: 'meta', style: 'margin-top: 8px;' },
         'After running, restart your Claude Code session and run ', el('code', {}, '/mcp'),
-        '. You should see ', el('code', {}, 'toolyard ✔ connected'), ' with ',
-        el('code', {}, String(state.tools.length || '...')), ' tools.',
+        '. You should see ', el('code', {}, 'toolyard ✔ connected'),
+        isAdmin()
+          ? [' with ', el('code', {}, String(state.tools.length || '...')), ' tools.']
+          : ' with the tools of the servers you have access to.',
       ) : null,
       el('div', { class: 'meta', style: 'margin-top: 6px; font-size: 11px;' },
         'Endpoint: ', el('code', {}, url),

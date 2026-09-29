@@ -44,9 +44,13 @@ var (
 const (
 	defaultAPIBase = "https://api.clerk.com/v1"
 	// jwksRefetchMinInterval bounds how often an unknown kid may trigger a
-	// JWKS round trip, so a flood of forged tokens can't turn into a flood
-	// of requests to Clerk.
+	// JWKS round trip after a successful fetch, so a flood of forged tokens
+	// can't turn into a flood of requests to Clerk.
 	jwksRefetchMinInterval = time.Minute
+	// jwksFailureBackoff is how long a failed JWKS fetch is trusted to
+	// still be failing: verifications that need the keys answer
+	// ErrUnavailable meanwhile instead of hammering Clerk, then retry.
+	jwksFailureBackoff = 5 * time.Second
 	// tokenLeeway absorbs clock skew between us and Clerk. Session tokens
 	// live about 60 s, so keep it small.
 	tokenLeeway = 10 * time.Second
@@ -125,10 +129,10 @@ type Client struct {
 	issuer         string
 	now            func() time.Time
 
-	mu        sync.Mutex
-	keys      map[string]*rsa.PublicKey
-	lastFetch time.Time // zero until the first successful fetch attempt
-	fetched   bool
+	mu          sync.Mutex
+	keys        map[string]*rsa.PublicKey
+	lastSuccess time.Time // last JWKS fetch that returned keys; zero before the first
+	lastFailure time.Time // last JWKS fetch that failed; zero when the last attempt succeeded
 }
 
 // New validates cfg and returns a Client. No network call is made here; the
@@ -255,7 +259,10 @@ func (c *Client) VerifySessionToken(ctx context.Context, token string) (Claims, 
 // keyFor returns the RSA public key for kid, fetching the JWKS on first use
 // and refetching at most once a minute when the kid is unknown (Clerk
 // rotates keys rarely; a burst of forged tokens must not turn into a burst
-// of requests to Clerk).
+// of requests to Clerk). Only a successful fetch starts that minute: after
+// a failed one we don't know whether the kid is bad or Clerk is down, so
+// the answer is ErrUnavailable and the fetch is retried after a short
+// backoff. Keys already cached keep verifying throughout.
 func (c *Client) keyFor(ctx context.Context, kid string) (*rsa.PublicKey, error) {
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -263,15 +270,19 @@ func (c *Client) keyFor(ctx context.Context, kid string) (*rsa.PublicKey, error)
 		return k, nil
 	}
 	now := c.now()
-	if c.fetched && now.Sub(c.lastFetch) < jwksRefetchMinInterval {
+	if !c.lastFailure.IsZero() && now.Sub(c.lastFailure) < jwksFailureBackoff {
+		return nil, fmt.Errorf("%w: jwks fetch failed recently; retrying shortly", ErrUnavailable)
+	}
+	if c.lastFailure.IsZero() && !c.lastSuccess.IsZero() && now.Sub(c.lastSuccess) < jwksRefetchMinInterval {
 		return nil, fmt.Errorf("%w: unknown kid %q", ErrInvalidToken, kid)
 	}
-	c.fetched = true
-	c.lastFetch = now
 	keys, err := c.fetchJWKS(ctx)
 	if err != nil {
+		c.lastFailure = now
 		return nil, err
 	}
+	c.lastFailure = time.Time{}
+	c.lastSuccess = now
 	c.keys = keys
 	if k, ok := c.keys[kid]; ok {
 		return k, nil

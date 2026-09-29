@@ -1810,6 +1810,32 @@ func (s *Server) requireAgent(w http.ResponseWriter, r *http.Request) (string, b
 	return ag.ID, true
 }
 
+// Tool groups the bearer REST routes stand in for. Derived from the same
+// registrations the gateway enforces on (mempalace.* upstream tools, the
+// built-in notes.publish), so a grant means the same thing over REST as it
+// does over MCP.
+var (
+	mempalaceGroup = access.GroupOf(mempalace.ToolPrefix, mempalace.DiaryWriteTool)
+	notesGroup     = access.GroupOf("builtin", "notes.publish")
+)
+
+// agentMayUse reports whether the agent's owner may use group. Without an
+// access resolver (single-user installs, tests) every agent may. The scope
+// is the owner's: an admin's agents reach everything, a member's agents
+// only what an admin granted that member.
+func (s *Server) agentMayUse(ctx context.Context, agentID, group string) bool {
+	if s.access == nil {
+		return true
+	}
+	return s.access.ScopeFor(ctx, agentID).Allows(group)
+}
+
+// writeNotGranted is the bearer-route twin of the gateway's per-caller
+// denial: the agent is real, its user just hasn't been granted the group.
+func writeNotGranted(w http.ResponseWriter) {
+	writeError(w, http.StatusForbidden, "server not granted")
+}
+
 // mempalaceIngest accepts a chat-memory entry from an authenticated agent
 // and forwards it to mempalace.diary_write via the gateway's internal call
 // path (no human approval — chat capture must not block).
@@ -1824,6 +1850,10 @@ func (s *Server) mempalaceIngest(w http.ResponseWriter, r *http.Request) {
 	}
 	agentID, ok := s.requireAgent(w, r)
 	if !ok {
+		return
+	}
+	if !s.agentMayUse(r.Context(), agentID, mempalaceGroup) {
+		writeNotGranted(w)
 		return
 	}
 	var body struct {
@@ -1915,7 +1945,12 @@ func (s *Server) notesSync(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, "notes service is disabled")
 		return
 	}
-	if _, ok := s.requireAgent(w, r); !ok {
+	agentID, ok := s.requireAgent(w, r)
+	if !ok {
+		return
+	}
+	if !s.agentMayUse(r.Context(), agentID, notesGroup) {
+		writeNotGranted(w)
 		return
 	}
 	n, err := s.notes.Sync(r.Context())
@@ -1954,6 +1989,10 @@ func (s *Server) notesPublish(w http.ResponseWriter, r *http.Request) {
 	}
 	agentID, ok := s.requireAgent(w, r)
 	if !ok {
+		return
+	}
+	if !s.agentMayUse(r.Context(), agentID, notesGroup) {
+		writeNotGranted(w)
 		return
 	}
 	var body struct {

@@ -117,6 +117,7 @@ func (s *Server) authClerkSession(w http.ResponseWriter, r *http.Request) {
 		Email:       member.Email,
 		DisplayName: clerkDisplayName(member),
 		AvatarURL:   member.ImageURL,
+		OrgRole:     member.Role,
 	}, s.ownerEmail)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())

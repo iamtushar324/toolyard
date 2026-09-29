@@ -62,6 +62,7 @@ type fakeClerk struct {
 	kid        string
 	srv        *httptest.Server
 	jwksFetch  atomic.Int32
+	jwksDown   atomic.Bool // when set, the JWKS endpoint answers 503
 	membership func(w http.ResponseWriter, r *http.Request)
 	members    func(w http.ResponseWriter, r *http.Request)
 }
@@ -76,6 +77,10 @@ func newFakeClerk(t *testing.T) *fakeClerk {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/.well-known/jwks.json", func(w http.ResponseWriter, r *http.Request) {
 		f.jwksFetch.Add(1)
+		if f.jwksDown.Load() {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			return
+		}
 		pub := key.Public().(*rsa.PublicKey)
 		_ = json.NewEncoder(w).Encode(map[string]any{
 			"keys": []map[string]any{{
@@ -341,6 +346,97 @@ func TestVerifySessionTokenJWKSDown(t *testing.T) {
 	c.jwksURL = f.srv.URL + "/missing"
 	if _, err := c.VerifySessionToken(context.Background(), f.token(nil, f.kid)); !errors.Is(err, ErrUnavailable) {
 		t.Errorf("JWKS 404: err = %v, want ErrUnavailable", err)
+	}
+}
+
+// A failed JWKS fetch must not be mistaken for a bad token: while Clerk is
+// down, verifications that need the keys say ErrUnavailable (the login page
+// retries) and the fetch is retried after a few seconds, not a minute. Only
+// a successful fetch starts the one-minute unknown-kid rate limit.
+func TestVerifySessionTokenJWKSFailureBackoff(t *testing.T) {
+	f := newFakeClerk(t)
+	c := f.client(t)
+	ctx := context.Background()
+	now := time.Now()
+	c.now = func() time.Time { return now }
+	fetches := func() int32 { return f.jwksFetch.Load() }
+	// Tokens are minted against the fake clock, which this test moves
+	// well past a real token's 60 s life.
+	tok := func(kid string) string {
+		return f.token(jwt.MapClaims{"iat": now.Unix(), "nbf": now.Unix(), "exp": now.Add(time.Minute).Unix()}, kid)
+	}
+
+	// Clerk is down before we ever hold a key.
+	f.jwksDown.Store(true)
+	if _, err := c.VerifySessionToken(ctx, tok(f.kid)); !errors.Is(err, ErrUnavailable) {
+		t.Fatalf("first verify with JWKS down: %v, want ErrUnavailable", err)
+	}
+	if n := fetches(); n != 1 {
+		t.Fatalf("fetches = %d, want 1", n)
+	}
+	// Inside the backoff: still unavailable, no extra round trip.
+	now = now.Add(2 * time.Second)
+	if _, err := c.VerifySessionToken(ctx, tok(f.kid)); !errors.Is(err, ErrUnavailable) {
+		t.Errorf("inside backoff: %v, want ErrUnavailable (not ErrInvalidToken)", err)
+	}
+	if n := fetches(); n != 1 {
+		t.Errorf("fetches inside backoff = %d, want 1", n)
+	}
+	// After the backoff: retried (still down), still unavailable.
+	now = now.Add(4 * time.Second)
+	if _, err := c.VerifySessionToken(ctx, tok(f.kid)); !errors.Is(err, ErrUnavailable) {
+		t.Errorf("after backoff, still down: %v", err)
+	}
+	if n := fetches(); n != 2 {
+		t.Errorf("fetches after backoff = %d, want 2", n)
+	}
+	// Clerk recovers: the next attempt after the backoff succeeds.
+	f.jwksDown.Store(false)
+	now = now.Add(6 * time.Second)
+	if _, err := c.VerifySessionToken(ctx, tok(f.kid)); err != nil {
+		t.Fatalf("after recovery: %v", err)
+	}
+	if n := fetches(); n != 3 {
+		t.Errorf("fetches after recovery = %d, want 3", n)
+	}
+	// Now the success-based rule applies: an unknown kid within the minute
+	// is refused as invalid without a round trip.
+	if _, err := c.VerifySessionToken(ctx, tok("ins_key_2")); !errors.Is(err, ErrInvalidToken) {
+		t.Errorf("unknown kid after success: %v, want ErrInvalidToken", err)
+	}
+	if n := fetches(); n != 3 {
+		t.Errorf("fetches after unknown kid inside the minute = %d, want 3", n)
+	}
+
+	// A minute later Clerk rotates but is down again: the unknown kid is
+	// "unavailable" not "invalid", known kids keep verifying from the
+	// cache, and the retry comes after seconds.
+	now = now.Add(61 * time.Second)
+	f.jwksDown.Store(true)
+	if _, err := c.VerifySessionToken(ctx, tok("ins_key_2")); !errors.Is(err, ErrUnavailable) {
+		t.Errorf("rotation with JWKS down: %v, want ErrUnavailable", err)
+	}
+	if n := fetches(); n != 4 {
+		t.Errorf("fetches at rotation = %d, want 4", n)
+	}
+	if _, err := c.VerifySessionToken(ctx, tok(f.kid)); err != nil {
+		t.Errorf("known kid during outage: %v", err)
+	}
+	now = now.Add(2 * time.Second)
+	if _, err := c.VerifySessionToken(ctx, tok("ins_key_2")); !errors.Is(err, ErrUnavailable) {
+		t.Errorf("inside backoff at rotation: %v", err)
+	}
+	if n := fetches(); n != 4 {
+		t.Errorf("fetches inside backoff at rotation = %d, want 4", n)
+	}
+	f.jwksDown.Store(false)
+	f.kid = "ins_key_2"
+	now = now.Add(4 * time.Second)
+	if _, err := c.VerifySessionToken(ctx, tok("ins_key_2")); err != nil {
+		t.Errorf("rotated key after recovery: %v", err)
+	}
+	if n := fetches(); n != 5 {
+		t.Errorf("fetches after rotation recovery = %d, want 5", n)
 	}
 }
 

@@ -288,9 +288,14 @@ func New(opts Options) *Gateway {
 		server.WithInstructions(buildInstructions(opts.Approval, opts.InLineWait)),
 	}
 	// Filters run in registration order: access first, so the visibility
-	// provider only ever ranks tools the caller may use.
+	// provider only ever ranks tools the caller may use. The request hook
+	// answers raw tools/call for ungranted tools before mcp-go looks the
+	// tool up, so the wire response matches an unknown tool.
 	if opts.Access != nil {
 		serverOpts = append(serverOpts, server.WithToolFilter(g.accessToolFilter))
+		hooks := &server.Hooks{}
+		hooks.AddOnRequestInitialization(g.accessRequestHook)
+		serverOpts = append(serverOpts, server.WithHooks(hooks))
 	}
 	if opts.Visibility != nil {
 		vp := opts.Visibility
@@ -351,6 +356,61 @@ func notFoundResult(toolName string) *mcp.CallToolResult {
 	return mcp.NewToolResultErrorf("tool %q not found in catalog", toolName)
 }
 
+// accessRequestHook runs before mcp-go dispatches any request. For a raw
+// tools/call it answers "tool not found" when the caller's scope doesn't
+// reach the tool, and for a genuinely unknown tool too, so both come back
+// as the same JSON-RPC error and a member can't map which servers exist by
+// probing names. mcp-go's own unknown-tool answer is a protocol error, not
+// a tool result, and the only pre-lookup seam it offers is this hook (the
+// error is rendered by createErrorResponse with INVALID_REQUEST), so the
+// hook has to own both cases. Only installed when a resolver is configured;
+// without one mcp-go answers unknown tools itself, as before.
+func (g *Gateway) accessRequestHook(ctx context.Context, _ any, message any) error {
+	raw, ok := message.(json.RawMessage)
+	if !ok {
+		return nil
+	}
+	var req struct {
+		Method string `json:"method"`
+		Params struct {
+			Name string `json:"name"`
+		} `json:"params"`
+	}
+	if err := json.Unmarshal(raw, &req); err != nil || req.Method != string(mcp.MethodToolsCall) {
+		return nil
+	}
+	g.mu.RLock()
+	entry, known := g.tools[req.Params.Name]
+	g.mu.RUnlock()
+	if known {
+		agentID := agentIDFromContext(ctx)
+		if g.allowsEntry(ctx, agentID, entry) {
+			return nil
+		}
+		started := time.Now()
+		ev := metrics.Event{
+			TS:         started.UnixMilli(),
+			AgentID:    agentID,
+			Upstream:   entry.upstream,
+			ShortName:  entry.originalName,
+			ToolName:   entry.tool.Name,
+			IsWrite:    !policy.IsReadOnlyName(entry.tool.Name),
+			PinnedTool: IsPinned(entry.tool.Name),
+			Via:        "direct",
+		}
+		if g.surface != nil {
+			ev.SurfaceMode = g.surface.SurfaceMode(ctx)
+		}
+		g.denyUngranted(ctx, entry, agentID, "", &ev)
+		ev.TotalLatencyMs = int(time.Since(started).Milliseconds())
+		if g.metrics != nil {
+			g.metrics.Record(ev)
+		}
+	}
+	// Same text mcp-go uses in handleToolCall for a name it doesn't have.
+	return fmt.Errorf("tool '%s' not found: %w", req.Params.Name, server.ErrToolNotFound)
+}
+
 // denyUngranted answers a call to a tool outside the caller's scope. The
 // agent sees an unknown-tool result; the audit log and metrics record the
 // real reason so an admin can grant the server if that was the intent.
@@ -409,13 +469,32 @@ func (g *Gateway) RegisterBuiltins() {
 	}
 }
 
+// reservedUpstreamName reports whether name belongs to the gateway itself:
+// the synthetic upstreams (builtin, fixture, inbox, session), the meta-tool
+// group "tools", and the built-in data groups whose tools are registered
+// under the "builtin" upstream (memory, lake, events). An upstream with one
+// of these names would register tools under the same prefix as the
+// built-ins and share their access group: "tools" is always-on, so a server
+// called tools would be reachable by every member without a grant.
+//
+// notes and skills are deliberately not here: they are real upstreams that
+// startup registers under those names (upstreams.UpsertBuiltin), and their
+// access group is the upstream name like any other server's.
+func reservedUpstreamName(name string) bool {
+	switch name {
+	case builtinUpstream, "fixture", inboxUpstream, sessionUpstream, "tools", "memory", "lake", "events":
+		return true
+	}
+	return false
+}
+
 // AddUpstream connects to one upstream MCP server, fetches its tool list, and
 // wraps each one into the gateway's catalog.
 func (g *Gateway) AddUpstream(ctx context.Context, cfg UpstreamConfig) error {
 	if cfg.Name == "" {
 		return errors.New("upstream needs a name")
 	}
-	if cfg.Name == builtinUpstream || cfg.Name == "fixture" || cfg.Name == inboxUpstream || cfg.Name == sessionUpstream {
+	if reservedUpstreamName(cfg.Name) {
 		return fmt.Errorf("name %q is reserved", cfg.Name)
 	}
 	// Pre-allocate a pool slot: if the live cap is full this suspends the
