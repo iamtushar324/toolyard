@@ -909,3 +909,23 @@ a.btn.primary:hover { background: var(--accent-hover); }
 .access-opt { display: flex; align-items: center; gap: 8px; padding: 6px 8px; border-radius: 6px; cursor: pointer; }
 .access-opt:hover { background: var(--bg-elev-2); }
 .access-opt input[type="checkbox"] { width: auto; min-height: 0; margin: 0; }
+
+/* ---- Beknown keys: key card, Users column, server identity ---- */
+.key-card h4, .identity-fields h4 { margin: 14px 0 6px; font-size: 13px; }
+.key-card > .meta { margin: 4px 0 12px; }
+.key-card .snippet pre.key-value { white-space: pre-wrap; word-break: break-all; }
+.key-steps { margin: 4px 0 8px; padding-left: 20px; font-size: 13px; line-height: 1.7; }
+.key-facts { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; }
+.key-actions { margin-top: 12px; justify-content: flex-end; }
+.reg-table { margin-top: 4px; }
+.reg-table th, .reg-table td { padding: 6px; }
+.reg-error { color: var(--danger); font-size: 12px; }
+.badge.identity { color: var(--link); border-color: var(--link); }
+.inline-badge { margin-left: 6px; }
+.key-regs { font-size: 12px; }
+.key-regs .meta { margin: 6px 0 2px; }
+.identity-fields { margin-top: 12px; border-top: 1px solid var(--border); }
+.check-row { display: flex; align-items: center; gap: 8px; margin-top: 8px; cursor: pointer; }
+.check-row input[type="checkbox"] { width: auto; min-height: 0; margin: 0; }
+.modal-actions { margin-top: 16px; justify-content: flex-end; }
+.modal.server-edit { max-height: calc(100vh - 32px); overflow-y: auto; }
