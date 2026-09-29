@@ -4,8 +4,16 @@
 // route. SSE feed reconciles approvals + audit live.
 
 const state = {
-  user: null,
+  user: null,              // /v1/auth/me; user.role 'admin'|'member' drives the shell
   setupRequired: false,
+  // /v1/auth/config: { clerk: { publishable_key, frontend_api } | null, password_login }.
+  // null when the fetch failed, which falls back to the password form.
+  authConfig: null,
+  showPasswordLogin: false, // login card: password form revealed under "Sign in with Google"
+  myServers: [],           // /v1/me/servers: the groups the signed-in user may use
+  // Users page (admin): /v1/users rows + the grantable groups.
+  users: { rows: [], groups: [], loaded: false, loading: false, error: '' },
+  userAccessModal: null,   // { id, name, selected: {group: bool}, dropped: [], error, saving } while editing access
   route: 'approvals',
   approvals: [],
   audit: [],
@@ -181,7 +189,57 @@ function staleNote(msg) {
   document.body.appendChild(t);
 }
 
+// ---- roles -----------------------------------------------------------------
+
+// isAdmin: members only manage their own agents; everything else is admin.
+// A user row without a role (older server) keeps today's full dashboard.
+function isAdmin() {
+  return !!state.user && state.user.role !== 'member';
+}
+
+const MEMBER_ROUTES = ['agents', 'myservers'];
+
+function defaultRoute() {
+  return isAdmin() ? 'approvals' : 'agents';
+}
+
+function routeAllowed(route) {
+  return isAdmin() || MEMBER_ROUTES.includes(route);
+}
+
+function userLabel(u) {
+  return (u && (u.display_name || u.username || u.email || u.id)) || '';
+}
+
+// userAvatar is the account picture, or the first letter of the name when
+// there's no picture (or it fails to load).
+// Avatar URLs that failed once (blocked, 404) go straight to the initial on
+// later renders instead of re-requesting on every redraw.
+const failedAvatars = new Set();
+function userAvatar(u, big) {
+  const cls = 'user-av' + (big ? ' big' : '');
+  const initial = () => el('span', { class: cls, 'aria-hidden': 'true' }, (userLabel(u).trim()[0] || '?').toUpperCase());
+  if (!u || !u.avatar_url || failedAvatars.has(u.avatar_url)) return initial();
+  return el('img', {
+    class: cls, referrerpolicy: 'no-referrer', alt: '', src: u.avatar_url,
+    on: { error: (e) => { failedAvatars.add(u.avatar_url); e.target.replaceWith(initial()); } },
+  });
+}
+
+// toMs normalises the users table's integer timestamps (ms, or seconds from
+// older rows) and ISO strings to epoch milliseconds for relTime().
+function toMs(v) {
+  if (!v) return 0;
+  if (typeof v === 'number') return v < 1e12 ? v * 1000 : v;
+  const t = Date.parse(v);
+  return isNaN(t) ? 0 : t;
+}
+
 // ---- bootstrap -------------------------------------------------------------
+
+async function loadAuthConfig() {
+  try { state.authConfig = await api('/v1/auth/config'); } catch (_) { state.authConfig = null; }
+}
 
 async function refreshUser() {
   try {
@@ -202,6 +260,21 @@ async function refreshUser() {
 
 async function loadAll() {
   if (!state.user) return;
+  // Members only reach their own agents and granted servers; every other
+  // route would answer 403 admin_only.
+  if (!isAdmin()) {
+    try {
+      const [agents, mine] = await Promise.all([
+        api('/v1/agents'),
+        api('/v1/me/servers').catch(() => []),
+      ]);
+      state.agents = agents || [];
+      state.myServers = normGroups(mine);
+    } catch (e) {
+      toast(e.message, 'error');
+    }
+    return;
+  }
   try {
     const [pendings, audits, agents, memos, servers, tools, market, settingsRes, usageRes, vapid, policies] = await Promise.all([
       api('/v1/approvals?status=pending'),
@@ -268,6 +341,8 @@ function markStreamEvent() {
 }
 
 function startStream() {
+  // The event stream is admin-only; a member would only collect 403s.
+  if (!isAdmin()) return;
   if (evtSrc) try { evtSrc.close(); } catch {}
   state.stream.status = state.stream.lastEventAt ? 'reconnecting' : 'connecting';
   render();
@@ -469,33 +544,69 @@ function viewSetup() {
   );
 }
 
+// viewLogin: with Clerk configured, "Sign in with Google" (the /login page)
+// leads and the username/password form sits behind a toggle; without Clerk,
+// or when the config didn't load, or on /?password=1, the form shows directly.
 function viewLogin() {
+  const cfg = state.authConfig;
+  const clerk = !!(cfg && cfg.clerk);
+  // password_login:false hides the form, but only when there's Google
+  // sign-in to fall back on.
+  const passwordAllowed = !clerk || cfg.password_login !== false;
+  const showForm = passwordAllowed && (!clerk || state.showPasswordLogin);
+
+  const form = [
+    el('label', {}, 'Username'),
+    el('input', {
+      id: 'lg-user', autocomplete: 'username',
+      on: { keydown: (e) => { if (e.key === 'Enter') submitPasswordLogin(); } },
+    }),
+    el('label', {}, 'Password'),
+    el('input', {
+      id: 'lg-pass', type: 'password', autocomplete: 'current-password',
+      on: { keydown: (e) => { if (e.key === 'Enter') submitPasswordLogin(); } },
+    }),
+    el('div', { class: 'err' }, state.errors.login || ''),
+    el('div', { class: 'row', style: 'margin-top: 12px;' },
+      el('button', { class: clerk ? '' : 'primary', on: { click: submitPasswordLogin } }, 'Sign in'),
+    ),
+  ];
+
   return el('div', { class: 'login-wrap' },
     el('div', { class: 'card' },
       el('h2', {}, 'toolyard'),
-      el('label', {}, 'Username'),
-      el('input', { id: 'lg-user', autocomplete: 'username' }),
-      el('label', {}, 'Password'),
-      el('input', { id: 'lg-pass', type: 'password', autocomplete: 'current-password' }),
-      el('div', { class: 'err' }, state.errors.login || ''),
-      el('div', { class: 'row', style: 'margin-top: 12px;' },
-        el('button', {
-          class: 'primary',
-          on: { click: async () => {
-            state.errors.login = '';
-            try {
-              await api('/v1/auth/login', { method: 'POST', body: {
-                Username: $('lg-user').value.trim(),
-                Password: $('lg-pass').value,
-              }});
-              await refreshUser(); await loadAll(); startStream();
-              navigate('approvals');
-            } catch (e) { state.errors.login = e.message; render(); }
-          }},
-        }, 'Sign in'),
-      ),
+      clerk ? [
+        el('p', { class: 'meta' }, 'Sign in with your Beknown workspace Google account.'),
+        el('a', { class: 'btn primary login-google', href: '/login' }, 'Sign in with Google'),
+        showForm ? el('div', { class: 'login-or' }, 'or use your toolyard password') : null,
+      ] : null,
+      showForm ? form : null,
+      clerk && passwordAllowed ? el('button', {
+        class: 'login-toggle',
+        on: { click: () => {
+          state.showPasswordLogin = !state.showPasswordLogin;
+          render();
+          if (state.showPasswordLogin) { const u = $('lg-user'); if (u) u.focus(); }
+        } },
+      }, state.showPasswordLogin ? 'Hide password sign-in' : 'Use password instead') : null,
     ),
   );
+}
+
+let passwordLoginBusy = false;
+async function submitPasswordLogin() {
+  if (passwordLoginBusy) return;
+  passwordLoginBusy = true;
+  state.errors.login = '';
+  try {
+    await api('/v1/auth/login', { method: 'POST', body: {
+      Username: $('lg-user').value.trim(),
+      Password: $('lg-pass').value,
+    }});
+    await refreshUser(); await loadAll(); startStream();
+    navigate(defaultRoute());
+  } catch (e) { state.errors.login = e.message; render(); }
+  finally { passwordLoginBusy = false; }
 }
 
 function viewApprovals() {
@@ -1424,6 +1535,286 @@ async function saveMemoryEdit(m, value) {
     render();
     toast('Saved');
   } catch (e) { toast(e.message, 'error'); }
+}
+
+// ---- My servers (every user) and Users (admin) ------------------------------
+
+// normGroups accepts the documented [{name, kind, tool_count, status}] and
+// tolerates a wrapped object or bare group names.
+function normGroups(r) {
+  const list = Array.isArray(r) ? r : (r && (r.servers || r.groups)) || [];
+  return list.map((g) => (typeof g === 'string' ? { name: g } : g));
+}
+
+async function loadMyServers() {
+  try {
+    const mine = await api('/v1/me/servers');
+    state.myServers = normGroups(mine);
+  } catch (e) { toast(e.message, 'error'); }
+  render();
+}
+
+function groupKindBadge(kind) {
+  return kind === 'builtin'
+    ? el('span', { class: 'badge kind-builtin' }, 'built-in')
+    : el('span', { class: 'badge' }, 'server');
+}
+
+function groupStatusBadge(st) {
+  if (!st) return el('span', { class: 'meta' }, '—');
+  const good = ['ok', 'active', 'connected', 'ready'].includes(st);
+  const bad = ['error', 'failed', 'down', 'disconnected'].includes(st);
+  return el('span', { class: 'badge ' + (good ? 'allowed' : bad ? 'denied' : 'pending') }, st);
+}
+
+function viewMyServers() {
+  const rows = state.myServers || [];
+  return el('div', {},
+    el('div', { class: 'card' },
+      el('h2', {}, 'My servers'),
+      el('p', { class: 'meta', style: 'margin: 4px 0 12px;' },
+        'The MCP servers and built-in data tools your agents can reach through toolyard.'),
+      rows.length === 0
+        ? el('div', { class: 'empty' }, 'No servers granted to you yet.')
+        : el('table', {},
+            el('thead', {}, el('tr', {},
+              el('th', {}, 'Name'), el('th', {}, 'Kind'), el('th', {}, 'Tools'), el('th', {}, 'Status'))),
+            el('tbody', {}, rows.map((g) => el('tr', {},
+              el('td', {}, el('code', {}, g.name)),
+              el('td', {}, groupKindBadge(g.kind)),
+              el('td', { class: 'meta' }, g.tool_count != null ? String(g.tool_count) : '—'),
+              el('td', {}, groupStatusBadge(g.status)),
+            )))),
+      el('p', { class: 'meta', style: 'margin: 12px 0 0;' }, 'Ask an admin for access to more servers.'),
+    ),
+  );
+}
+
+// loadUsers refetches the Users page. clearError drops the last error line;
+// the reload after a failed change keeps it so the reason stays visible.
+let usersSeq = 0;
+async function loadUsers(clearError) {
+  const seq = ++usersSeq;
+  state.users.loading = true;
+  if (clearError) state.users.error = '';
+  try {
+    const r = await api('/v1/users');
+    if (seq !== usersSeq) return; // a newer load owns the page
+    state.users.rows = (r && r.users) || [];
+    state.users.groups = (r && r.groups) || [];
+  } catch (e) {
+    if (seq !== usersSeq) return;
+    state.users.error = e.message;
+  }
+  state.users.loading = false;
+  state.users.loaded = true;
+  render();
+}
+
+// usersFail keeps a 400/409 reason on the page (the toast fades) until the
+// next change goes through.
+function usersFail(e) {
+  state.users.error = e.message;
+  toast(e.message, 'error');
+}
+
+async function patchUser(u, patch, okMsg) {
+  try {
+    await api(`/v1/users/${encodeURIComponent(u.id)}`, { method: 'PATCH', body: patch });
+    state.users.error = '';
+    if (okMsg) toast(okMsg);
+  } catch (e) { usersFail(e); }
+  await loadUsers();
+}
+
+async function setUserRole(u, role) {
+  const name = userLabel(u);
+  const msg = role === 'admin'
+    ? `Make ${name} an admin? Admins see every approval, audit row and server, and manage users.`
+    : `Make ${name} a member? They keep their own agents and only reach the servers granted to them.`;
+  if (!confirm(msg)) { render(); return; } // re-render resets the <select>
+  await patchUser(u, { role }, `${name} is now ${role === 'admin' ? 'an admin' : 'a member'}`);
+}
+
+async function blockUser(u) {
+  const name = userLabel(u);
+  const reason = prompt(`Block ${name}? They can't sign in and their agents stop authenticating.\n\nReason (optional, shown on the Users page):`, '');
+  if (reason === null) return;
+  await patchUser(u, { status: 'blocked', blocked_reason: reason.trim() }, `${name} blocked`);
+}
+
+async function unblockUser(u) {
+  await patchUser(u, { status: 'active' }, `${userLabel(u)} unblocked`);
+}
+
+async function revokeUserSessions(u) {
+  const name = userLabel(u);
+  const self = state.user && u.id === state.user.id;
+  if (!confirm(self
+    ? 'Sign yourself out everywhere? Every browser session you have open ends now, including this one.'
+    : `Sign ${name} out everywhere? Every browser session they have open ends now.`)) return;
+  try {
+    await api(`/v1/users/${encodeURIComponent(u.id)}/revoke-sessions`, { method: 'POST', body: {} });
+    // Your own row ends this session too: reload onto the sign-in screen.
+    if (state.user && u.id === state.user.id) { history.replaceState(null, '', '/'); location.reload(); return; }
+    state.users.error = '';
+    toast(`${name} signed out everywhere`);
+  } catch (e) { usersFail(e); }
+  await loadUsers();
+}
+
+function openUserAccess(u) {
+  const known = new Set((state.users.groups || []).map((g) => g.name));
+  const selected = {};
+  for (const s of (u.servers || [])) if (known.has(s)) selected[s] = true;
+  state.userAccessModal = {
+    id: u.id,
+    name: userLabel(u),
+    selected,
+    // Grants for groups that no longer exist; saving drops them (sending
+    // them back would be a 400 unknown server).
+    dropped: (u.servers || []).filter((s) => !known.has(s)),
+    error: '',
+    saving: false,
+  };
+  render();
+}
+
+function closeUserAccess() {
+  if (state.userAccessModal && state.userAccessModal.saving) return;
+  state.userAccessModal = null;
+  render();
+}
+
+async function saveUserAccess() {
+  const m = state.userAccessModal;
+  if (!m || m.saving) return;
+  const servers = (state.users.groups || []).map((g) => g.name).filter((n) => m.selected[n]);
+  m.saving = true; m.error = ''; render();
+  try {
+    await api(`/v1/users/${encodeURIComponent(m.id)}`, { method: 'PATCH', body: { servers } });
+    if (state.userAccessModal === m) state.userAccessModal = null;
+    state.users.error = '';
+    toast(`Access saved for ${m.name}`);
+    await loadUsers();
+  } catch (e) {
+    m.saving = false;
+    m.error = e.message;
+    if (state.userAccessModal !== m) usersFail(e);
+    render();
+  }
+}
+
+function renderUserAccessModal() {
+  const m = state.userAccessModal;
+  const groups = state.users.groups || [];
+  const option = (g) => el('label', { class: 'access-opt' },
+    el('input', {
+      type: 'checkbox', checked: !!m.selected[g.name],
+      on: { change: (e) => { m.selected[g.name] = e.target.checked; } },
+    }),
+    el('code', {}, g.name),
+    el('span', { class: 'grow' }),
+    el('span', { class: 'meta' }, g.tool_count != null ? `${g.tool_count} tools` : ''),
+  );
+  const section = (title, note, list) => el('div', { class: 'access-section' },
+    el('h4', {}, title),
+    note ? el('div', { class: 'meta' }, note) : null,
+    list.length
+      ? el('div', { class: 'access-list' }, list.map(option))
+      : el('div', { class: 'meta' }, 'None available.'),
+  );
+  return el('div', { class: 'modal-bg', on: { click: (e) => { if (e.target === e.currentTarget) closeUserAccess(); } } },
+    el('div', { class: 'modal' },
+      el('h3', {}, 'Edit access · ' + m.name),
+      el('div', { class: 'meta' }, `Pick what ${m.name}'s agents may use. Meta-tools and the inbox are always available.`),
+      section('Servers', null, groups.filter((g) => g.kind !== 'builtin')),
+      section('Built-in data tools', 'Shared across all agents.', groups.filter((g) => g.kind === 'builtin')),
+      m.dropped.length
+        ? el('div', { class: 'meta', style: 'margin-top: 12px;' }, 'No longer configured, dropped on save: ' + m.dropped.join(', '))
+        : null,
+      m.error ? el('div', { class: 'err' }, m.error) : null,
+      el('div', { class: 'row', style: 'margin-top: 16px; justify-content: flex-end;' },
+        el('button', { disabled: m.saving, on: { click: closeUserAccess } }, 'Cancel'),
+        el('button', { class: 'primary', disabled: m.saving, on: { click: saveUserAccess } }, m.saving ? 'Saving…' : 'Save'),
+      ),
+    ),
+  );
+}
+
+function viewUsers() {
+  const u = state.users;
+  const me = state.user || {};
+  const table = u.rows.length === 0
+    ? (u.error ? null : el('div', { class: 'empty' }, u.loaded ? 'No users yet.' : 'Loading users…'))
+    : el('table', { class: 'users-table' },
+        el('thead', {}, el('tr', {},
+          el('th', {}, 'User'), el('th', {}, 'Email'), el('th', {}, 'Role'), el('th', {}, 'Status'),
+          el('th', {}, 'Servers'), el('th', {}, 'Agents'), el('th', {}, 'Last seen'), el('th', {}, ''))),
+        el('tbody', {}, u.rows.map((row) => {
+          const self = row.id === me.id;
+          const admin = row.role === 'admin';
+          const blocked = row.status === 'blocked';
+          return el('tr', { style: blocked ? 'opacity: 0.75;' : '' },
+            el('td', {}, el('div', { class: 'user-cell' },
+              userAvatar(row, true),
+              el('div', { class: 'who' },
+                el('span', {}, userLabel(row), self ? el('span', { class: 'meta' }, ' (you)') : null),
+                el('span', { class: 'meta' },
+                  row.auth === 'clerk' ? 'Google' : row.auth === 'password' ? 'password' : (row.username || '')),
+              ),
+            )),
+            el('td', { class: 'meta' }, row.email || '—'),
+            el('td', {}, el('select', {
+              disabled: self,
+              title: self ? "You can't change your own role" : '',
+              on: { change: (e) => setUserRole(row, e.target.value) },
+            },
+              el('option', { value: 'admin',  selected: admin }, 'admin'),
+              el('option', { value: 'member', selected: !admin }, 'member'),
+            )),
+            el('td', {}, el('div', { class: 'stack' },
+              blocked ? el('span', { class: 'badge denied' }, 'blocked') : el('span', { class: 'badge allowed' }, 'active'),
+              blocked && row.blocked_reason ? el('span', { class: 'meta' }, row.blocked_reason) : null,
+              blocked
+                ? el('button', { on: { click: () => unblockUser(row) } }, 'Unblock')
+                : el('button', {
+                    class: 'danger', disabled: self,
+                    title: self ? "You can't block yourself" : '',
+                    on: { click: () => blockUser(row) },
+                  }, 'Block'),
+            )),
+            el('td', {}, el('div', { class: 'stack' },
+              admin
+                ? el('div', { class: 'chips' }, el('span', { class: 'chip all' }, 'All servers'))
+                : (row.servers || []).length
+                  ? el('div', { class: 'chips' }, row.servers.map((s) => el('span', { class: 'chip' }, s)))
+                  : el('span', { class: 'meta' }, 'No servers'),
+              el('button', {
+                disabled: admin,
+                title: admin ? 'Admins can use every server' : '',
+                on: { click: () => openUserAccess(row) },
+              }, 'Edit access'),
+            )),
+            el('td', { class: 'meta' }, String(row.agent_count || 0)),
+            el('td', { class: 'meta' }, row.last_seen_at ? relTime(toMs(row.last_seen_at)) : 'never'),
+            el('td', {}, el('button', { on: { click: () => revokeUserSessions(row) } }, 'Sign out everywhere')),
+          );
+        })));
+
+  return el('div', {},
+    state.userAccessModal ? renderUserAccessModal() : null,
+    el('div', { class: 'card' },
+      el('div', { class: 'agent-add-bar' },
+        el('h2', { style: 'margin: 0;' }, 'Users'),
+        el('button', { disabled: u.loading, on: { click: () => loadUsers(true) } }, u.loading ? 'Refreshing…' : 'Refresh'),
+      ),
+      el('p', { class: 'meta', style: 'margin: 4px 0 12px;' },
+        'Members manage only their own agents, and those agents reach only the servers granted here. Admins see and manage everything.'),
+      u.error ? el('div', { class: 'err', style: 'margin: 0 0 12px;' }, u.error) : null,
+      table,
+    ),
+  );
 }
 
 function viewServers() {
@@ -3723,6 +4114,7 @@ function viewNotifications() {
 // ---- shell -----------------------------------------------------------------
 
 function navigate(route) {
+  if (!routeAllowed(route)) route = defaultRoute();
   if (route === 'inbox' || state.route === 'inbox') {
     if (state.inbox.openId) { ibHalt(); state.inbox.openId = null; state.inbox.detail = null; ibNode = null; }
     if (route === 'inbox') loadInbox();
@@ -3735,6 +4127,8 @@ function navigate(route) {
   if (route === 'hooks' && !state.hooks.loaded && !state.hooks.loading) {
     loadHooks(true);
   }
+  if (route === 'users') loadUsers(true);
+  if (route === 'myservers') loadMyServers();
   render();
 }
 
@@ -3759,10 +4153,13 @@ function shell(content) {
     badge > 0 ? el('span', { class: 'badge-count' }, String(badge)) : null,
   );
 
+  const admin = isAdmin();
+
   return el('div', {},
     el('header', {},
       el('div', { class: 'brand' }, el('span', { class: 'dot' }), 'toolyard'),
-      el('nav', {},
+      // Members see only their agents and the servers granted to them.
+      admin ? el('nav', {},
         navBtn('inbox',        'Inbox' + (inboxBadgeCount() ? ' (' + inboxBadgeCount() + ')' : '')),
         navBtn('approvals',    'Approvals'),
         navBtn('call',         'Call' + (state.call.active ? ' ●' : '')),
@@ -3776,15 +4173,25 @@ function shell(content) {
         navBtn('memory',       'Memory'),
         navBtn('mempalace',    'MemPalace'),
         navBtn('agents',       'Agents'),
+        navBtn('users',        'Users'),
         navBtn('settings',     'Settings'),
+      ) : el('nav', {},
+        navBtn('agents',       'Agents'),
+        navBtn('myservers',    'My servers'),
       ),
       el('span', { class: 'user' },
-        renderStreamPill(),
-        ' ', state.user ? state.user.username : '',
+        admin ? renderStreamPill() : null,
+        ' ',
+        state.user ? el('span', { class: 'user-chip', title: state.user.email || '' },
+          userAvatar(state.user), userLabel(state.user)) : '',
       ),
       state.user ? el('button', { on: { click: async () => {
+        const viaClerk = state.user.auth === 'clerk';
         try { await api('/v1/auth/logout', { method: 'POST' }); } catch {}
         if (evtSrc) try { evtSrc.close(); } catch {}
+        // A Google user also leaves Clerk, or "Sign in with Google" would
+        // silently sign the same account straight back in.
+        if (viaClerk) { location.replace('/login?signout=1'); return; }
         state.user = null; render();
       }}}, 'Logout') : null,
     ),
@@ -3793,18 +4200,21 @@ function shell(content) {
     // The "More" item opens a sheet rather than navigating, so its active
     // state mirrors whatever the current route is when it isn't one of
     // the four primary routes.
-    el('div', { class: 'bottom-nav' }, el('div', { class: 'row' },
+    el('div', { class: 'bottom-nav' }, admin ? el('div', { class: 'row' },
       bottomItem('inbox',     '✉', 'Inbox', inboxBadgeCount()),
       bottomItem('approvals', '✓', 'Approvals', pendingCount),
       bottomItem('servers',   '⌘', 'Servers'),
       bottomItem('notifications', '◔', 'Alerts', alertCount),
       el('button', {
-        class: ['audit','hooks','memory','agents','settings','insights','tools'].includes(state.route) ? 'active' : '',
+        class: ['audit','hooks','memory','agents','users','settings','insights','tools'].includes(state.route) ? 'active' : '',
         on: { click: () => { state.moreSheet = true; render(); } }
       },
         el('span', { class: 'icon' }, '☰'),
         el('span', {}, 'More'),
       ),
+    ) : el('div', { class: 'row' },
+      bottomItem('agents',    '◎', 'Agents'),
+      bottomItem('myservers', '⌘', 'My servers'),
     )),
     state.moreSheet ? renderMoreSheet() : null,
   );
@@ -3824,14 +4234,20 @@ function renderMoreSheet() {
   return el('div', { class: 'modal-bg', on: { click: (e) => { if (e.target === e.currentTarget) { state.moreSheet = false; render(); } }}},
     el('div', { class: 'modal', style: 'display: flex; flex-direction: column; gap: 6px;' },
       el('h3', {}, 'More'),
-      item('tools',    'Tools',    'Run any tool from the catalog'),
-      item('call',     'Call',     'Talk to Toolyard through Gemini Live'),
-      item('insights', 'Insights', 'Per-tool, per-agent, cost breakdowns'),
-      item('audit',    'Audit',    'Append-only event log'),
-      item('hooks',    'Hooks',    'Agent lifecycle events and memory ingest'),
-      item('memory',   'Memory',   'Scope/key-value store'),
-      item('agents',   'Agents',   'Manage enrolled agents'),
-      item('settings', 'Settings', 'Surface mode, auto-approval, retention'),
+      isAdmin() ? [
+        item('tools',    'Tools',    'Run any tool from the catalog'),
+        item('call',     'Call',     'Talk to Toolyard through Gemini Live'),
+        item('insights', 'Insights', 'Per-tool, per-agent, cost breakdowns'),
+        item('audit',    'Audit',    'Append-only event log'),
+        item('hooks',    'Hooks',    'Agent lifecycle events and memory ingest'),
+        item('memory',   'Memory',   'Scope/key-value store'),
+        item('agents',   'Agents',   'Manage enrolled agents'),
+        item('users',    'Users',    'Roles, blocking and server access'),
+        item('settings', 'Settings', 'Surface mode, auto-approval, retention'),
+      ] : [
+        item('agents',    'Agents',     'Manage your enrolled agents'),
+        item('myservers', 'My servers', 'Servers your agents may use'),
+      ],
       el('div', { class: 'row', style: 'margin-top: 12px; justify-content: flex-end;' },
         el('button', { on: { click: () => { state.moreSheet = false; render(); } }}, 'Close'),
       ),
@@ -3874,6 +4290,7 @@ function closeTopmostOverlay() {
   if (lb) { lb.remove(); return true; }
   if (state.memEdit) { state.memEdit = null; render(); return true; }
   if (state.agentModal) { state.agentModal = null; render(); return true; }
+  if (state.userAccessModal) { closeUserAccess(); return true; }
   if (state.marketModal) { state.marketModal = null; render(); return true; }
   if (state.jwtPreview || state.pushDiag || state.pushTestResult) {
     state.jwtPreview = null; state.pushDiag = null; state.pushTestResult = null; render(); return true;
@@ -3906,8 +4323,15 @@ function render() {
   root.innerHTML = '';
   if (state.setupRequired) { root.appendChild(viewSetup()); return; }
   if (!state.user) { root.appendChild(viewLogin()); return; }
+  // A member on an admin route (stale hash, old bookmark) lands on Agents.
+  if (!routeAllowed(state.route)) {
+    state.route = defaultRoute();
+    history.replaceState(null, '', '#' + state.route);
+  }
   let body;
   switch (state.route) {
+    case 'users':         body = viewUsers();         break;
+    case 'myservers':     body = viewMyServers();     break;
     case 'audit':         body = viewAudit();         break;
     case 'hooks':         body = viewHooks();         break;
     case 'memory':        body = viewMemory();        break;
@@ -6319,9 +6743,18 @@ Read the full rules with inbox.guide().`;
   // Events push deep link: notifications open /?route=events.
   const routeParam = new URLSearchParams(location.search).get('route');
   if (routeParam) state.route = routeParam;
-  await refreshUser();
-  if (state.user) {
+  // /?password=1 (from /login's "Use password instead") opens the password
+  // form straight away instead of behind the Google button.
+  if (new URLSearchParams(location.search).get('password') === '1') state.showPasswordLogin = true;
+  await Promise.all([refreshUser(), loadAuthConfig()]);
+  if (state.user && !isAdmin()) {
+    // Members: their agents and granted servers only. No event stream and
+    // no admin fetches (they'd all be 403 admin_only).
+    await loadAll();
+  } else if (state.user) {
     await loadAll(); startStream();
+    if (state.route === 'users') loadUsers(true);
+    if (state.route === 'myservers') loadMyServers();
     if (!location.hash && !approvalParam && !routeParam && state.settings.approval_mode === 'inbox') state.route = 'inbox';
     if (deepInbox) openInboxRequest(deepInbox);
     if (state.route === 'insights' || state.route === 'notifications') {
@@ -6358,6 +6791,8 @@ Read the full rules with inbox.guide().`;
   window.addEventListener('hashchange', () => {
     if (!state.user) return;
     const h = location.hash.slice(1);
+    // Members have no inbox; navigate() sends them to an allowed route.
+    if (!isAdmin()) { if (h !== state.route) navigate(h); return; }
     if (h.startsWith('inbox/')) {
       const id = h.slice(6);
       if (IB_FILTERS.includes(id)) {

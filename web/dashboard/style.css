@@ -859,3 +859,53 @@ code { background: var(--bg); padding: 1px 4px; border-radius: 3px; font-size: 1
   .ib-dbody { padding-bottom: 140px; }
   .ib-jump { bottom: calc(84px + env(safe-area-inset-bottom, 0px)); }
 }
+
+/* ---- sign-in: /login (login.html) and the dashboard's login card ---- */
+/* An <a> that looks like a button (Google sign-in lives on another page). */
+a.btn {
+  display: inline-flex; align-items: center; justify-content: center; gap: 8px;
+  font: inherit; background: var(--bg-elev-2); color: var(--text);
+  border: 1px solid var(--border); border-radius: 6px; padding: 6px 12px;
+  cursor: pointer;
+}
+a.btn:hover { border-color: #4f5760; text-decoration: none; }
+a.btn.primary { background: var(--accent); border-color: var(--accent); color: white; }
+a.btn.primary:hover { background: var(--accent-hover); }
+.login-google { width: 100%; min-height: 40px; margin-top: 12px; font-weight: 500; }
+.login-or { display: flex; align-items: center; gap: 10px; margin: 16px 0 0; color: var(--muted); font-size: 12px; }
+.login-or::before, .login-or::after { content: ""; flex: 1; border-top: 1px solid var(--border); }
+.login-toggle { display: block; margin: 14px auto 0; background: transparent; border: 0; padding: 4px; color: var(--link); font-size: 13px; }
+.login-toggle:hover { text-decoration: underline; }
+.login-clerk { max-width: 440px; margin: 64px auto; padding: 0 12px; display: flex; flex-direction: column; gap: 16px; }
+.login-brand { font-weight: 600; font-size: 18px; text-align: center; }
+.login-brand .dot { display: inline-block; width: 10px; height: 10px; background: var(--accent); border-radius: 50%; margin-right: 6px; vertical-align: middle; }
+.login-status { text-align: center; padding: 24px 0; font-size: 13px; margin: 0; }
+.login-panel { text-align: center; }
+.login-panel p.meta { font-size: 13px; margin: 6px 0; }
+.login-actions { justify-content: center; margin-top: 16px; }
+.clerk-mount { display: flex; justify-content: center; }
+.login-alt { text-align: center; font-size: 13px; margin: 0; }
+
+/* ---- signed-in user: header chip, Users page, access modal ---- */
+.user-chip { display: inline-flex; align-items: center; gap: 6px; vertical-align: middle; }
+.user-av {
+  width: 22px; height: 22px; flex: none; border-radius: 50%; object-fit: cover;
+  background: rgba(88, 166, 255, 0.16); color: var(--link);
+  display: inline-grid; place-items: center; font-weight: 700; font-size: 11px;
+}
+.user-av.big { width: 32px; height: 32px; font-size: 13px; }
+.user-cell { display: flex; align-items: center; gap: 10px; min-width: 160px; }
+.user-cell .who { display: flex; flex-direction: column; min-width: 0; }
+.chips { display: flex; flex-wrap: wrap; gap: 4px; margin-bottom: 6px; }
+.chip { display: inline-block; padding: 1px 8px; border-radius: 999px; font-size: 11px; border: 1px solid var(--border); background: var(--bg-elev-2); white-space: nowrap; }
+.chip.all { color: var(--accent); border-color: var(--accent); background: transparent; }
+.badge.kind-builtin { color: var(--link); border-color: var(--link); }
+.users-table select { width: auto; min-width: 104px; }
+.users-table .stack { display: flex; flex-direction: column; align-items: flex-start; gap: 6px; }
+.access-section { margin-top: 14px; }
+.access-section h4 { margin: 0; font-size: 13px; }
+.access-section .meta { margin: 2px 0 0; }
+.access-list { display: flex; flex-direction: column; gap: 2px; margin-top: 6px; max-height: 32vh; overflow-y: auto; }
+.access-opt { display: flex; align-items: center; gap: 8px; padding: 6px 8px; border-radius: 6px; cursor: pointer; }
+.access-opt:hover { background: var(--bg-elev-2); }
+.access-opt input[type="checkbox"] { width: auto; min-height: 0; margin: 0; }
