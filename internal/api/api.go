@@ -4,8 +4,15 @@
 //
 //	POST /v1/auth/setup           one-time create the local user
 //	POST /v1/auth/login           username + password -> session cookie
+//	POST /v1/auth/clerk/session   Clerk session JWT -> session cookie
+//	GET  /v1/auth/config          which sign-in methods are on (public)
 //	POST /v1/auth/logout
-//	GET  /v1/auth/me              current user
+//	GET  /v1/auth/me              current user, with role
+//
+//	GET  /v1/users                admin: every user + grantable groups
+//	PATCH /v1/users/{id}          admin: role / status / servers
+//	POST /v1/users/{id}/revoke-sessions
+//	GET  /v1/me/servers           groups the caller may use
 //
 //	GET  /v1/agents
 //	POST /v1/agents/enroll        creates a code (op uses it on the agent)
@@ -41,9 +48,11 @@ import (
 
 	"github.com/golang-jwt/jwt/v5"
 
+	"github.com/tusharbhardwaj/toolyard/internal/access"
 	"github.com/tusharbhardwaj/toolyard/internal/approval"
 	"github.com/tusharbhardwaj/toolyard/internal/audit"
 	"github.com/tusharbhardwaj/toolyard/internal/autoapproval"
+	"github.com/tusharbhardwaj/toolyard/internal/clerk"
 	"github.com/tusharbhardwaj/toolyard/internal/gateway"
 	"github.com/tusharbhardwaj/toolyard/internal/hooks"
 	"github.com/tusharbhardwaj/toolyard/internal/identity"
@@ -116,6 +125,16 @@ type Server struct {
 	security        SecurityOptions
 	loginLimit      *loginThrottle
 	unauthLimit     *loginThrottle
+	// access resolves roles and per-user tool-group grants; the Users
+	// admin routes write through it and drop its cache after a change.
+	access *access.Service
+	// clerk is nil when Sign in with Google is off. The publishable key
+	// and Frontend API host are copied out so /v1/auth/config and the CSP
+	// don't need the client.
+	clerk               clerkDirectory
+	clerkPublishableKey string
+	clerkFrontendAPI    string
+	ownerEmail          string
 }
 
 type Options struct {
@@ -187,6 +206,17 @@ type Options struct {
 	WebhookMaxBytes int64
 	SessionKey      []byte
 	Security        SecurityOptions
+	// Access backs the Users admin API (per-user server grants) and
+	// /v1/me/servers. Optional; without it members have no grants.
+	Access *access.Service
+	// Clerk, when set, turns on Sign in with Google through Clerk:
+	// /v1/auth/clerk/session accepts Clerk session tokens and
+	// /v1/auth/config advertises the publishable key. nil = off.
+	Clerk *clerk.Client
+	// OwnerEmail: the first Clerk sign-in with this email (case-insensitive)
+	// attaches to the existing primary password user instead of creating a
+	// new member, so the owner keeps their admin role, agents and passkeys.
+	OwnerEmail string
 }
 
 func New(ctx context.Context, opts Options) *Server {
@@ -225,9 +255,18 @@ func New(ctx context.Context, opts Options) *Server {
 		security:                 opts.Security,
 		loginLimit:               newLoginThrottle(5, 15*time.Minute),
 		unauthLimit:              newLoginThrottle(0, time.Hour), // max/window passed per-call via AllowN
+		access:                   opts.Access,
+		ownerEmail:               strings.TrimSpace(opts.OwnerEmail),
 	}
 	if s.webhookMaxBytes <= 0 {
 		s.webhookMaxBytes = DefaultWebhookMaxBytes
+	}
+	// Guarded assignment: a nil *clerk.Client stored in the interface would
+	// be a non-nil interface, and "Clerk is on" is tested with s.clerk != nil.
+	if opts.Clerk != nil {
+		s.clerk = opts.Clerk
+		s.clerkPublishableKey = opts.Clerk.PublishableKey()
+		s.clerkFrontendAPI = opts.Clerk.FrontendAPI()
 	}
 	// Sweep stale throttle buckets periodically. Tied to ctx so the
 	// goroutine exits on shutdown instead of leaking (precedent:
@@ -258,6 +297,12 @@ func (s *Server) Routes(mux *http.ServeMux) {
 	mux.HandleFunc("/v1/auth/login", s.authLogin)
 	mux.HandleFunc("/v1/auth/logout", s.authLogout)
 	mux.HandleFunc("/v1/auth/me", s.authMe)
+	mux.HandleFunc("/v1/auth/config", s.authConfig)
+	mux.HandleFunc("/v1/auth/clerk/session", s.authClerkSession)
+
+	mux.HandleFunc("/v1/users", s.usersList)
+	mux.HandleFunc("/v1/users/", s.usersItem)
+	mux.HandleFunc("/v1/me/servers", s.meServers)
 
 	mux.HandleFunc("/v1/agents", s.agentsCollection)
 	mux.HandleFunc("/v1/agents/enroll", s.agentsEnroll)
@@ -496,12 +541,62 @@ func (s *Server) currentSessionID(r *http.Request) string {
 	return ""
 }
 
-func (s *Server) requireUser(r *http.Request) (string, error) {
+// ctxUserKey carries the resolved session user from RoleGuard to the
+// handler so the users row is read once per request.
+type ctxKey int
+
+const ctxUserKey ctxKey = iota + 1
+
+var errAdminOnly = errors.New("admin_only")
+
+// sessionUser resolves the session cookie to its user: the RoleGuard's
+// per-request cache first, else cookie -> session row -> users row. A
+// blocked user never resolves, whatever their cookie says.
+func (s *Server) sessionUser(r *http.Request) (*identity.User, bool) {
+	if u, ok := r.Context().Value(ctxUserKey).(*identity.User); ok && u != nil {
+		return u, true
+	}
 	id, ok := s.verifySession(r)
+	if !ok {
+		return nil, false
+	}
+	u, err := s.identity.GetUserByID(r.Context(), id)
+	if err != nil || u.Status != identity.StatusActive {
+		return nil, false
+	}
+	return u, true
+}
+
+func (s *Server) requireUser(r *http.Request) (string, error) {
+	u, ok := s.sessionUser(r)
 	if !ok {
 		return "", errors.New("unauthorized")
 	}
-	return id, nil
+	return u.ID, nil
+}
+
+// requireAdmin is requireUser plus the admin role; it returns the user so
+// handlers can record the actor. RoleGuard already keeps members off every
+// route that isn't on its allowlist, but admin-only handlers call this too
+// so the rule holds without the middleware in front.
+func (s *Server) requireAdmin(r *http.Request) (*identity.User, error) {
+	u, ok := s.sessionUser(r)
+	if !ok {
+		return nil, errors.New("unauthorized")
+	}
+	if u.Role != identity.RoleAdmin {
+		return nil, errAdminOnly
+	}
+	return u, nil
+}
+
+// writeAuthError maps requireUser/requireAdmin failures to 401 or 403.
+func writeAuthError(w http.ResponseWriter, err error) {
+	if errors.Is(err, errAdminOnly) {
+		writeError(w, http.StatusForbidden, "admin_only")
+		return
+	}
+	writeError(w, http.StatusUnauthorized, "unauthorized")
 }
 
 func (s *Server) authSetup(w http.ResponseWriter, r *http.Request) {
@@ -554,6 +649,15 @@ func (s *Server) authLogin(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	u, err := s.identity.Authenticate(r.Context(), body.Username, body.Password)
+	if errors.Is(err, identity.ErrUserBlocked) {
+		// Only reachable with the right password, so this reveals nothing
+		// to a guesser that the account owner doesn't already know.
+		_ = s.audit.Write(r.Context(), audit.Event{
+			EventType: audit.EventUserLogin, Decision: "denied", Reason: "blocked", ResultSummary: body.Username,
+		})
+		writeError(w, http.StatusForbidden, "blocked")
+		return
+	}
 	if err != nil {
 		writeError(w, http.StatusUnauthorized, "invalid credentials")
 		return
@@ -564,7 +668,9 @@ func (s *Server) authLogin(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	_ = s.audit.Write(r.Context(), audit.Event{EventType: audit.EventUserLogin, ResultSummary: u.Username})
+	_ = s.audit.Write(r.Context(), audit.Event{
+		EventType: audit.EventUserLogin, AgentID: "user:" + u.ID, Reason: "password", ResultSummary: u.Username,
+	})
 	writeJSON(w, http.StatusOK, u)
 }
 

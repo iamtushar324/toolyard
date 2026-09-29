@@ -22,6 +22,7 @@ import (
 	"net"
 	"net/http"
 	httppprof "net/http/pprof"
+	"net/url"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -35,12 +36,14 @@ import (
 	"github.com/joho/godotenv"
 	"github.com/mark3labs/mcp-go/server"
 
+	"github.com/tusharbhardwaj/toolyard/internal/access"
 	"github.com/tusharbhardwaj/toolyard/internal/api"
 	"github.com/tusharbhardwaj/toolyard/internal/approval"
 	"github.com/tusharbhardwaj/toolyard/internal/audit"
 	"github.com/tusharbhardwaj/toolyard/internal/autoapproval"
 	"github.com/tusharbhardwaj/toolyard/internal/chatnotify"
 	"github.com/tusharbhardwaj/toolyard/internal/chatnotify/telegram"
+	"github.com/tusharbhardwaj/toolyard/internal/clerk"
 	"github.com/tusharbhardwaj/toolyard/internal/crashdump"
 	"github.com/tusharbhardwaj/toolyard/internal/events"
 	"github.com/tusharbhardwaj/toolyard/internal/gateway"
@@ -131,6 +134,57 @@ func loadDotenv() {
 	}
 }
 
+// clerkFromEnv builds the Clerk client from TOOLYARD_CLERK_SECRET_KEY,
+// TOOLYARD_CLERK_PUBLISHABLE_KEY and TOOLYARD_CLERK_ORGANIZATION_ID. All
+// three set: Clerk sign-in is on. None: off. One or two: a startup error,
+// as is Clerk without -public-url — a Clerk session token is accepted only
+// when its azp claim is the dashboard's own origin. Returns the client (nil
+// when off) and the instance's Frontend API host for the login-page CSP.
+func clerkFromEnv(publicURL string) (*clerk.Client, string, error) {
+	vars := []struct{ key, val string }{
+		{"TOOLYARD_CLERK_SECRET_KEY", strings.TrimSpace(os.Getenv("TOOLYARD_CLERK_SECRET_KEY"))},
+		{"TOOLYARD_CLERK_PUBLISHABLE_KEY", strings.TrimSpace(os.Getenv("TOOLYARD_CLERK_PUBLISHABLE_KEY"))},
+		{"TOOLYARD_CLERK_ORGANIZATION_ID", strings.TrimSpace(os.Getenv("TOOLYARD_CLERK_ORGANIZATION_ID"))},
+	}
+	var missing []string
+	for _, v := range vars {
+		if v.val == "" {
+			missing = append(missing, v.key)
+		}
+	}
+	if len(missing) == len(vars) {
+		return nil, "", nil
+	}
+	if len(missing) > 0 {
+		return nil, "", fmt.Errorf("clerk: set all of TOOLYARD_CLERK_SECRET_KEY, TOOLYARD_CLERK_PUBLISHABLE_KEY and TOOLYARD_CLERK_ORGANIZATION_ID, or none of them; missing: %s",
+			strings.Join(missing, ", "))
+	}
+	if publicURL == "" {
+		return nil, "", errors.New("clerk: -public-url is required when Clerk sign-in is configured (session tokens are bound to the dashboard origin)")
+	}
+	u, err := url.Parse(publicURL)
+	if err != nil || u.Scheme == "" || u.Host == "" {
+		return nil, "", fmt.Errorf("clerk: -public-url %q is not an absolute URL", publicURL)
+	}
+	c, err := clerk.New(clerk.Config{
+		SecretKey:         vars[0].val,
+		PublishableKey:    vars[1].val,
+		OrganizationID:    vars[2].val,
+		AuthorizedParties: []string{u.Scheme + "://" + u.Host},
+	})
+	if err != nil {
+		return nil, "", err
+	}
+	return c, c.FrontendAPI(), nil
+}
+
+func orDefault(v, def string) string {
+	if strings.TrimSpace(v) == "" {
+		return def
+	}
+	return v
+}
+
 func usage() {
 	fmt.Println(`toolyard ` + version + `
 
@@ -160,6 +214,8 @@ func runServe(argv []string) error {
 	inLineWait := fs.Duration("in-line-wait", 0, "if non-zero, hold an approval-required call open for up to this long waiting for a human decision before returning the deferred-response envelope. The new default 0s returns the envelope immediately and lets the agent poll via tools.poll_approval or block via tools.wait_for_approval.")
 	approvalTTL := fs.Duration("approval-ttl", 3*time.Hour, "how long a pending approval stays decidable before auto-expiring")
 	publicURL := fs.String("public-url", "", "public origin (e.g. https://toolyard.example.com). When set, enables HSTS, secure cookies, and Origin enforcement.")
+	ownerEmail := fs.String("owner-email", "", "email of the local owner account. The first Clerk (Google) sign-in with this address attaches to the existing password admin instead of creating a new member. Case-insensitive.")
+	clerkSyncEvery := fs.Duration("clerk-sync-interval", time.Hour, "how often to list the Clerk organisation's members and block users who left (sessions revoked, agents stopped). Only runs when the TOOLYARD_CLERK_* env vars are set.")
 	trustedProxies := fs.String("trusted-proxy", "", "comma-separated CIDRs to trust for X-Forwarded-* headers (e.g. 127.0.0.1/32,::1/128,10.0.0.0/8)")
 	clickhouseRuntimeEnvPath := fs.String("clickhouse-runtime-env", "/var/lib/toolyard/clickhouse-runtime.env", "path where toolyard maintains a TOOLYARD_CH_PASSWORD=... line for the toolyard-clickhouse container's docker-compose env_file to consume. Updated on bootstrap and on every rotate. Empty disables the write (useful in tests).")
 	inboxResetPasskeys := fs.Bool("inbox-reset-passkeys", false, "delete every registered passkey at startup (recovery when the owner has lost all their devices), then continue normally")
@@ -227,6 +283,18 @@ func runServe(argv []string) error {
 		*requireAuthMCP = true
 	}
 
+	// Clerk (Google) sign-in: on only when all three TOOLYARD_CLERK_* env
+	// vars are set (they come from the systemd EnvironmentFile or .env,
+	// never argv). A partial set, or Clerk without -public-url, refuses to
+	// start rather than run half-configured.
+	clerkClient, clerkFAPI, cerr := clerkFromEnv(*publicURL)
+	if cerr != nil {
+		return cerr
+	}
+	if clerkClient != nil {
+		log.Printf("clerk: sign-in enabled (frontend api %s; owner email %s)", clerkFAPI, orDefault(*ownerEmail, "unset"))
+	}
+
 	if err := os.MkdirAll(*dataDir, 0o700); err != nil {
 		return err
 	}
@@ -246,6 +314,9 @@ func runServe(argv []string) error {
 	idSvc := identity.New(db)
 	auditSvc := audit.New(db)
 	memSvc := memory.New(db)
+	// Roles and per-user tool-group grants. The gateway asks it on every
+	// tool list/call; the Users admin API writes through it.
+	accessSvc := access.New(db)
 
 	// Personal data lake (ClickHouse). Opened below, once settings are
 	// loaded — see the `lake: opened …` log line right after the CH
@@ -398,6 +469,7 @@ func runServe(argv []string) error {
 		MetricsReader:       metricsReader,
 		Surface:             vis,
 		UpstreamCallTimeout: *upstreamCallTimeout,
+		Access:              accessSvc,
 	})
 	gw.RegisterBuiltins()
 	defer gw.Close()
@@ -901,8 +973,9 @@ func runServe(argv []string) error {
 	}
 
 	secOpts := api.SecurityOptions{
-		PublicURL:      *publicURL,
-		TrustedProxies: parseCIDRs(*trustedProxies),
+		PublicURL:        *publicURL,
+		TrustedProxies:   parseCIDRs(*trustedProxies),
+		ClerkFrontendAPI: clerkFAPI,
 	}
 
 	// REST API + dashboard.
@@ -939,6 +1012,9 @@ func runServe(argv []string) error {
 		WebhookMaxBytes:          *webhookMaxBytes,
 		SessionKey:               loadOrCreateSessionKey(*dataDir),
 		Security:                 secOpts,
+		Access:                   accessSvc,
+		Clerk:                    clerkClient,
+		OwnerEmail:               *ownerEmail,
 	})
 
 	mux := http.NewServeMux()
@@ -1032,14 +1108,18 @@ func runServe(argv []string) error {
 	mux.Handle("/", staticHandler())
 
 	// Compose the public-facing handler:
-	//   security headers → origin enforcement → API hardening → body cap → mux
+	//   security headers → origin enforcement → API hardening → body cap → role guard → mux
 	//
 	// HardenAPI is the load-bearing application-layer defense: per-route
 	// body caps, anti-CSRF custom-header check on cookie mutations,
 	// strict content-type, and per-IP rate limits on the unauthenticated
 	// bootstrap routes. It only applies to /v1/* — /mcp keeps its
 	// dedicated bearer-token guard above.
-	var handler http.Handler = mux
+	//
+	// RoleGuard sits innermost: once a request has passed every transport
+	// check, a member's session may only reach the short allowlist of
+	// member routes; every other /v1 route is admin-only by default.
+	var handler http.Handler = apiSrv.RoleGuard(mux)
 	// 4 MiB universal ceiling, with one override: the memory-webhook ingest
 	// route (TEC-481) intentionally accepts large n8n payloads, so it gets the
 	// configured webhook cap. Without the override this outer ceiling would
@@ -1054,6 +1134,14 @@ func runServe(argv []string) error {
 	// can't kill the gateway. Wrap LAST so it sees every other layer's
 	// panic too.
 	handler = api.Recover(handler)
+
+	// Hourly offboarding: Clerk-linked users who left the org get blocked
+	// (sessions revoked, agents stopped). No-op when Clerk is off; a Clerk
+	// outage changes nothing.
+	if clerkClient != nil {
+		apiSrv.StartClerkSync(ctx, *clerkSyncEvery)
+		log.Printf("clerk: org membership sync every %s", clerkSyncEvery.String())
+	}
 
 	httpSrv := &http.Server{
 		Addr:              *addr,
@@ -1416,10 +1504,30 @@ func staticHandler() http.Handler {
 	appHash := assetHash(sub, "app.js")
 	cssHash := assetHash(sub, "style.css")
 	swHash := assetHash(sub, "sw.js")
+	loginHash := assetHash(sub, "login.js")
 	rewriteIndex := func(body []byte) []byte {
 		out := strings.ReplaceAll(string(body), `src="/app.js"`, `src="/app.js?v=`+appHash+`"`)
 		out = strings.ReplaceAll(out, `href="/style.css"`, `href="/style.css?v=`+cssHash+`"`)
 		return []byte(out)
+	}
+	rewriteLogin := func(body []byte) []byte {
+		out := strings.ReplaceAll(string(body), `src="/login.js"`, `src="/login.js?v=`+loginHash+`"`)
+		out = strings.ReplaceAll(out, `href="/style.css"`, `href="/style.css?v=`+cssHash+`"`)
+		return []byte(out)
+	}
+	// serveDocument writes an HTML document with the revalidate-always
+	// caching the SPA shell uses: no-cache + a content ETag so reloads are
+	// a cheap 304 but a redeploy is picked up immediately.
+	serveDocument := func(w http.ResponseWriter, r *http.Request, body []byte) {
+		w.Header().Set("Content-Type", "text/html; charset=utf-8")
+		w.Header().Set("Cache-Control", "no-cache")
+		etag := contentETag(body)
+		w.Header().Set("ETag", etag)
+		if r.Header.Get("If-None-Match") == etag {
+			w.WriteHeader(http.StatusNotModified)
+			return
+		}
+		_, _ = w.Write(body)
 	}
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -1440,6 +1548,20 @@ func staticHandler() http.Handler {
 			http.NotFound(w, r)
 			return
 		}
+		// The login page is its own document, not the SPA shell: it alone
+		// loads Clerk and gets the Clerk-compatible CSP (see
+		// api.SecurityHeaders). Any query string (?signout=1) rides along.
+		// A build whose embed lacks login.html answers 404 here rather
+		// than falling through to the SPA.
+		if r.URL.Path == "/login" || r.URL.Path == "/login.html" {
+			raw, err := fs.ReadFile(dashboard.Assets, "login.html")
+			if err != nil {
+				http.NotFound(w, r)
+				return
+			}
+			serveDocument(w, r, rewriteLogin(raw))
+			return
+		}
 		// Serve index.html for the root and any unknown path so the SPA can
 		// pick up via #hash routing.
 		if r.URL.Path == "/" || !assetExists(sub, strings.TrimPrefix(r.URL.Path, "/")) {
@@ -1448,16 +1570,7 @@ func staticHandler() http.Handler {
 				http.Error(w, "missing index", http.StatusInternalServerError)
 				return
 			}
-			body := rewriteIndex(raw)
-			w.Header().Set("Content-Type", "text/html; charset=utf-8")
-			w.Header().Set("Cache-Control", "no-cache")
-			etag := contentETag(body)
-			w.Header().Set("ETag", etag)
-			if r.Header.Get("If-None-Match") == etag {
-				w.WriteHeader(http.StatusNotModified)
-				return
-			}
-			_, _ = w.Write(body)
+			serveDocument(w, r, rewriteIndex(raw))
 			return
 		}
 		_ = swHash // referenced for completeness; sw.js is loaded once and updates via SW lifecycle

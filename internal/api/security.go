@@ -18,6 +18,11 @@ type SecurityOptions struct {
 	// behind a reverse proxy (Cloudflare, Caddy, nginx) put its IP here so
 	// rate-limiting and TLS-detection see the real client IP / scheme.
 	TrustedProxies []*net.IPNet
+	// ClerkFrontendAPI, when set (e.g. "clerk.example.com"), relaxes the
+	// CSP on the /login document just enough for Clerk's hosted sign-in
+	// components: scripts and API calls to the Clerk instance, its bot
+	// check, and avatar images. Every other path keeps the strict policy.
+	ClerkFrontendAPI string
 }
 
 // IsBehindHTTPS reports whether this request is effectively HTTPS — either
@@ -97,26 +102,10 @@ func (s *Server) SecurityHeaders(next http.Handler) http.Handler {
 		// closed; we don't surface them anywhere in the dashboard.
 		h.Set("Permissions-Policy", "geolocation=(), camera=(), microphone=(self), payment=()")
 		h.Set("Cross-Origin-Opener-Policy", "same-origin")
-		// CSP — same-origin everything, no inline. data: allowed for SVG icons.
-		// Workers + ServiceWorker explicitly allowed for the push SW.
-		csp := "default-src 'self'; " +
-			"script-src 'self'; " +
-			"style-src 'self'; " +
-			"img-src 'self' data:; " +
-			"font-src 'self'; " +
-			// connect-src 'self' covers same-origin ws://wss://, but
-			// some browsers (and reverse proxies that confuse scheme
-			// detection) refuse the upgrade unless wss: is explicit.
-			"connect-src 'self' wss: ws:; " +
-			// media-src needed because the voice panel uses a blob:
-			// URL for the silent WAV that anchors the OS MediaSession
-			// (so the BTR11's play/pause button routes to us instead
-			// of Siri). 'self' alone falls through to default-src.
-			"media-src 'self' blob:; " +
-			"worker-src 'self'; " +
-			"frame-ancestors 'none'; " +
-			"base-uri 'self'; " +
-			"form-action 'self'"
+		csp := strictCSP
+		if s.security.ClerkFrontendAPI != "" && isLoginDocument(r.URL.Path) {
+			csp = clerkCSP(s.security.ClerkFrontendAPI)
+		}
 		h.Set("Content-Security-Policy", csp)
 		// HSTS only when actually behind HTTPS so HTTP browser dev doesn't
 		// get pinned to a non-existent TLS endpoint.
@@ -125,6 +114,57 @@ func (s *Server) SecurityHeaders(next http.Handler) http.Handler {
 		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+// strictCSP — same-origin everything, no inline. data: allowed for SVG icons;
+// img.clerk.com for the signed-in user's Google avatar (an image host only:
+// no script, connect or frame allowance leaves the /login document).
+// Workers + ServiceWorker explicitly allowed for the push SW.
+const strictCSP = "default-src 'self'; " +
+	"script-src 'self'; " +
+	"style-src 'self'; " +
+	"img-src 'self' data: https://img.clerk.com; " +
+	"font-src 'self'; " +
+	// connect-src 'self' covers same-origin ws://wss://, but
+	// some browsers (and reverse proxies that confuse scheme
+	// detection) refuse the upgrade unless wss: is explicit.
+	"connect-src 'self' wss: ws:; " +
+	// media-src needed because the voice panel uses a blob:
+	// URL for the silent WAV that anchors the OS MediaSession
+	// (so the BTR11's play/pause button routes to us instead
+	// of Siri). 'self' alone falls through to default-src.
+	"media-src 'self' blob:; " +
+	"worker-src 'self'; " +
+	"frame-ancestors 'none'; " +
+	"base-uri 'self'; " +
+	"form-action 'self'"
+
+// isLoginDocument: the one page that loads Clerk. Hash routing keeps the
+// sign-in flow (including Clerk's SSO callback) on this document.
+func isLoginDocument(path string) bool {
+	return path == "/login" || path == "/login.html"
+}
+
+// clerkCSP is strictCSP opened up per Clerk's CSP guidance: clerk-js and
+// its API from the instance's Frontend API host, Cloudflare Turnstile and
+// Clerk's fraud-protection hosts for the bot check, avatars from
+// img.clerk.com, inline styles (Clerk styles at runtime) and blob: workers.
+// The ":*" on the protect host matters: a CSP source without a port
+// matches 443 only, and those hosts answer on others.
+func clerkCSP(frontendAPI string) string {
+	fapi := "https://" + frontendAPI
+	return "default-src 'self'; " +
+		"script-src 'self' " + fapi + " https://challenges.cloudflare.com https://*.protect.clerk.com; " +
+		"style-src 'self' 'unsafe-inline'; " +
+		"img-src 'self' data: https://img.clerk.com; " +
+		"font-src 'self'; " +
+		"connect-src 'self' wss: ws: " + fapi + " https://*.protect.clerk.com:*; " +
+		"media-src 'self' blob:; " +
+		"frame-src https://challenges.cloudflare.com https://*.protect.clerk.com; " +
+		"worker-src 'self' blob:; " +
+		"frame-ancestors 'none'; " +
+		"base-uri 'self'; " +
+		"form-action 'self'"
 }
 
 // EnforceOriginOnMutations checks Origin/Referer on state-changing methods
