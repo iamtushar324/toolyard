@@ -1214,6 +1214,19 @@ function renderRegistrations(regs) {
     ))));
 }
 
+// renderOwnerPendingRemovals: old or revoked fingerprints a Beknown registry
+// still holds. toolyard retries the removal in the background.
+function renderOwnerPendingRemovals(list) {
+  if (!list || !list.length) return null;
+  const ups = [...new Set(list.map((p) => p.upstream))];
+  return el('div', { class: 'key-pending' },
+    el('ul', {}, ups.map((up) => el('li', {
+      title: list.filter((p) => p.upstream === up).map((p) => p.error).filter(Boolean).join('\n'),
+    }, '⚠ An old key is still being removed from ', el('code', {}, up), '.'))),
+    el('div', { class: 'meta' }, 'toolyard keeps retrying this on its own; there is nothing for you to do.'),
+  );
+}
+
 function renderRevealedKey(rv) {
   return el('div', {},
     el('div', { class: 'warn-pill' }, '⚠  Copy your key now. toolyard will not show it again.'),
@@ -1283,6 +1296,7 @@ function renderIdentityKeyCard() {
       'Beknown services (BkCoreServices, BkDocsServices) use this key to record who made each change. It replaces your Bifrost virtual key.'),
     k.revealError ? el('div', { class: 'err' }, k.revealError) : null,
     body,
+    k.data && !k.reveal ? renderOwnerPendingRemovals(d.pending_removals) : null,
   );
 }
 
@@ -1844,12 +1858,39 @@ function userKeyState(k) {
 }
 
 // keyNeedsRetry: a registration that isn't "registered", or a registry
-// server ("register keys here") the key has no row for yet.
+// server ("register keys here") the key has no row for yet. Pending
+// removals are retried by the same POST …/register (see keyRetryLabel).
 function keyNeedsRetry(k) {
   if (!k || !k.has_key) return false;
   const regs = k.registrations || [];
   if (regs.some((r) => r.status !== 'registered')) return true;
   return (state.servers || []).some((s) => s.identity && s.identity.register && !regs.some((r) => r.upstream === s.name));
+}
+
+function keyPending(k) {
+  return (k && k.pending_removals) || [];
+}
+
+// keyRetryLabel names the POST …/register button, or '' when there is
+// nothing to retry: it re-registers the key and retries pending removals,
+// and with no key left it only cleans up.
+function keyRetryLabel(k) {
+  if (keyNeedsRetry(k)) return 'Retry registration';
+  if (keyPending(k).length) return 'Retry cleanup';
+  return '';
+}
+
+function renderPendingRemovals(list) {
+  if (!list || !list.length) return null;
+  return el('div', { class: 'key-pending' },
+    el('div', { class: 'meta' }, 'Old keys still being removed'),
+    el('ul', {}, list.map((p) => el('li', {},
+      el('code', {}, p.upstream), ' ',
+      el('code', { title: p.fingerprint || '' }, shortFingerprint(p.fingerprint)),
+      p.error ? [' ', el('span', { class: 'reg-error' }, p.error)] : null,
+      p.updated_at ? el('span', { class: 'meta' }, ' · ' + relTime(toMs(p.updated_at))) : null,
+    ))),
+  );
 }
 
 async function userKeyAction(u, method, suffix, okMsg) {
@@ -1861,13 +1902,25 @@ async function userKeyAction(u, method, suffix, okMsg) {
     const r = await api(`/v1/users/${encodeURIComponent(u.id)}/identity-key${suffix}`, opts);
     state.users.error = '';
     const failed = ((r && r.registrations) || []).filter((x) => x.status === 'error');
-    if (failed.length) {
-      toast(`${okMsg} Registration failed on ${failed.map((x) => x.upstream).join(', ')}: ${failed[0].error || 'error'}`, 'error');
-    } else toast(okMsg);
+    const pending = keyPending(r);
+    const notes = [];
+    if (failed.length) notes.push(`Registration failed on ${failed.map((x) => x.upstream).join(', ')}: ${failed[0].error || 'error'}.`);
+    if (pending.length) {
+      notes.push(`An old key is still being removed from ${[...new Set(pending.map((x) => x.upstream))].join(', ')}` +
+        (pending[0].error ? `: ${pending[0].error}.` : '.'));
+    }
+    toast(notes.length ? `${okMsg} ${notes.join(' ')}` : okMsg, notes.length ? 'error' : 'info');
   } catch (e) {
-    usersFail(e.body && e.body.error === 'no_clerk_identity'
-      ? new Error(`${name} has no Google sign-in yet. They must sign in with Google once first.`)
-      : e);
+    const code = e.body && e.body.error;
+    if (code === 'no_key' && suffix === '/register') {
+      // Nothing left to register or remove.
+      state.users.error = '';
+      toast(`Nothing left to clean up for ${name}.`);
+    } else {
+      usersFail(code === 'no_clerk_identity'
+        ? new Error(`${name} has no Google sign-in yet. They must sign in with Google once first.`)
+        : e);
+    }
   }
   state.users.keyBusy = '';
   if (state.user && u.id === state.user.id) loadMyKey();
@@ -1890,7 +1943,10 @@ async function revokeUserKey(u) {
 }
 
 async function retryUserKeyRegistration(u) {
-  await userKeyAction(u, 'POST', '/register', `Registration retried for ${userLabel(u)}.`);
+  const has = !!(u.identity_key && u.identity_key.has_key);
+  await userKeyAction(u, 'POST', '/register', has
+    ? `Registration retried for ${userLabel(u)}.`
+    : `Cleanup retried for ${userLabel(u)}.`);
 }
 
 // userKeyCell is the Users page "Beknown key" column: state chip, a warning
@@ -1901,6 +1957,8 @@ function userKeyCell(row) {
   const st = userKeyState(k);
   const busy = !!state.users.keyBusy;
   const failed = regs.filter((r) => r.status === 'error');
+  const pending = keyPending(k);
+  const retryLabel = keyRetryLabel(k);
   return el('div', { class: 'stack' },
     el('div', { class: 'chips' },
       st === 'active' ? el('span', { class: 'badge allowed' }, 'active')
@@ -1912,6 +1970,12 @@ function userKeyCell(row) {
             title: failed.map((r) => r.upstream + ': ' + (r.error || 'error')).join('\n'),
           }, '⚠ registration error')
         : null,
+      pending.length
+        ? el('span', {
+            class: 'badge pending',
+            title: 'Old keys still being removed from ' + [...new Set(pending.map((p) => p.upstream))].join(', '),
+          }, '⚠ cleanup pending')
+        : null,
     ),
     st === 'none' && row.auth === 'password'
       ? el('span', { class: 'meta' }, 'Needs one Google sign-in first')
@@ -1922,17 +1986,25 @@ function userKeyCell(row) {
           el('button', { disabled: busy, on: { click: () => provisionUserKey(row) } }, 'Rotate'),
           el('button', { class: 'danger', disabled: busy, on: { click: () => revokeUserKey(row) } }, 'Revoke'),
         ),
-    keyNeedsRetry(k)
-      ? el('button', { disabled: busy, on: { click: () => retryUserKeyRegistration(row) } }, 'Retry registration')
+    retryLabel
+      ? el('button', { disabled: busy, on: { click: () => retryUserKeyRegistration(row) } }, retryLabel)
       : null,
-    k.has_key
+    k.has_key || pending.length
       ? el('details', {
           class: 'key-regs', open: !!state.users.keyOpen[row.id],
           on: { toggle: (e) => { state.users.keyOpen[row.id] = e.target.open; } },
         },
-          el('summary', {}, regs.length === 1 ? '1 registration' : `${regs.length} registrations`),
-          el('div', { class: 'meta' }, 'Fingerprint ', el('code', { title: k.fingerprint || '' }, shortFingerprint(k.fingerprint))),
-          renderRegistrations(regs),
+          el('summary', {}, [
+            k.has_key ? (regs.length === 1 ? '1 registration' : `${regs.length} registrations`) : null,
+            pending.length ? `${pending.length} pending removal${pending.length === 1 ? '' : 's'}` : null,
+          ].filter(Boolean).join(' · ')),
+          k.has_key
+            ? [
+                el('div', { class: 'meta' }, 'Fingerprint ', el('code', { title: k.fingerprint || '' }, shortFingerprint(k.fingerprint))),
+                renderRegistrations(regs),
+              ]
+            : null,
+          renderPendingRemovals(pending),
         )
       : null,
   );
@@ -2431,11 +2503,17 @@ async function saveServerEdit() {
   try {
     // 200 is the masked server; 202 is { server, warning } when the row was
     // saved but the reconnect failed.
+    // Either may carry oauth_reset: the URL moved to another origin, so the
+    // stored OAuth client and tokens were dropped.
     const out = await api('/v1/servers/' + encodeURIComponent(m.name), { method: 'PATCH', body });
     if (state.serverEditModal === m) state.serverEditModal = null;
-    if (out && out.warning) toast(`Saved ${m.name}, but it failed to reconnect: ${out.warning}`, 'error');
+    const srv = (out && out.server) || out || {};
+    const warning = out && out.warning;
+    if (srv.oauth_reset || (out && out.oauth_reset)) oauthResetNote(m.name, warning);
+    else if (warning) toast(`Saved ${m.name}, but it failed to reconnect: ${warning}`, 'error');
     else toast(`Saved ${m.name}`);
     await reloadServers();
+    await loadOAuthStatus(m.name);
     render();
   } catch (e) {
     m.saving = false;
@@ -2446,6 +2524,20 @@ async function saveServerEdit() {
     if (e.status === 404) reloadServers().then(render);
     render();
   }
+}
+
+// oauthResetNote is a banner that stays until dismissed (a toast fades):
+// the server must be authorised again before its tools work.
+function oauthResetNote(name, warning) {
+  document.querySelectorAll('.toast').forEach((n) => n.remove());
+  const t = el('div', { class: 'toast stale' },
+    el('span', { class: 'grow' },
+      `Saved ${name}. OAuth was reset — authorise this server again.`,
+      warning ? ` Reconnect failed: ${warning}` : ''),
+    el('button', { class: 'link', on: { click: () => { t.remove(); openOAuthPanel(name); } } }, 'Authorise…'),
+    el('button', { class: 'link', on: { click: () => t.remove() } }, 'Dismiss'),
+  );
+  document.body.appendChild(t);
 }
 
 function renderServerEditModal() {

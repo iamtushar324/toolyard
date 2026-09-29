@@ -929,3 +929,6 @@ a.btn.primary:hover { background: var(--accent-hover); }
 .check-row input[type="checkbox"] { width: auto; min-height: 0; margin: 0; }
 .modal-actions { margin-top: 16px; justify-content: flex-end; }
 .modal.server-edit { max-height: calc(100vh - 32px); overflow-y: auto; }
+.key-pending { margin-top: 10px; }
+.key-pending ul { list-style: none; margin: 4px 0; padding: 0; font-size: 12px; color: var(--warn); display: flex; flex-direction: column; gap: 3px; }
+.key-pending .reg-error { font-size: 12px; }
