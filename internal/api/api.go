@@ -1500,6 +1500,10 @@ func (s *Server) serversItem(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, srv)
 		return
 	}
+	if subpath == "" && r.Method == http.MethodPatch {
+		s.serversPatch(w, r, name)
+		return
+	}
 	if r.Method == http.MethodDelete {
 		if err := s.upstreams.Remove(r.Context(), name); err != nil {
 			switch {
@@ -1515,7 +1519,7 @@ func (s *Server) serversItem(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 		return
 	}
-	writeError(w, http.StatusMethodNotAllowed, "DELETE")
+	writeError(w, http.StatusMethodNotAllowed, "PATCH or DELETE")
 }
 
 // marketplaceList returns the curated MCP recipes. We require a logged-in
