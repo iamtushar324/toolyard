@@ -265,20 +265,33 @@ func (u *upstream) liveClient() (*client.Client, error) {
 	return c, nil
 }
 
-// sessionErrorMarkers are the phrases a streamable-HTTP server uses when
-// it no longer knows the session: the mcp-go server's own 404 texts, and
-// the JSON-RPC -32000 the beknown-services mcp-server sends with HTTP 400.
-// Matched case-insensitively against the whole error chain's text.
-var sessionErrorMarkers = []string{
-	"invalid session",
-	"session not found",
-	"missing initialization",
-	"session terminated",
+// sessionRejections are the exact messages a streamable-HTTP transport
+// sends, as JSON-RPC -32000 with HTTP 400, when it turns a request away
+// for want of a live session, before any tool runs. mcp-go maps no code
+// for -32000 and hands the message over as a bare error, so the message
+// is compared whole (case-insensitively), never as a substring. A tool's
+// own error can't reach this list: a handler error is -32603, and any
+// standard code is excluded first (see standardRPCErrors).
+var sessionRejections = map[string]bool{
+	"invalid session or missing initialization":      true, // beknown-services mcp-server
+	"bad request: server not initialized":            true, // @modelcontextprotocol/sdk
+	"bad request: mcp-session-id header is required": true, // @modelcontextprotocol/sdk
+}
+
+// standardRPCErrors are the sentinels mcp-go wraps a JSON-RPC error in
+// when its code is one of the standard ones (-32700…-32603 and its own
+// -32800/-32002). Those are method- or handler-level failures: the tool
+// may already have run, so none of them is ever a reason to retry.
+var standardRPCErrors = []error{
+	mcp.ErrParseError, mcp.ErrInvalidRequest, mcp.ErrMethodNotFound, mcp.ErrInvalidParams,
+	mcp.ErrInternalError, mcp.ErrRequestInterrupted, mcp.ErrResourceNotFound,
 }
 
 // sessionErrorReason reports whether err means the upstream rejected the
-// request because our session is invalid or gone, i.e. before running the
-// tool. The reason is a fixed phrase safe to log.
+// request at the transport because our session is invalid or gone, i.e.
+// before running the tool: mcp-go's sentinel for a 404 on a session
+// request, or one of the exact -32000 rejections. The reason is a fixed
+// phrase safe to log.
 func sessionErrorReason(err error) (string, bool) {
 	if err == nil {
 		return "", false
@@ -286,13 +299,31 @@ func sessionErrorReason(err error) (string, bool) {
 	if errors.Is(err, transport.ErrSessionTerminated) {
 		return "session terminated (404)", true
 	}
-	msg := strings.ToLower(err.Error())
-	for _, m := range sessionErrorMarkers {
-		if strings.Contains(msg, m) {
-			return m, true
+	for _, std := range standardRPCErrors {
+		if errors.Is(err, std) {
+			return "", false
 		}
 	}
+	var elicit mcp.URLElicitationRequiredError
+	if errors.As(err, &elicit) {
+		return "", false
+	}
+	if sessionRejections[rejectionMessage(err)] {
+		return "session rejected (400)", true
+	}
 	return "", false
+}
+
+// rejectionMessage strips what mcp-go wraps around a rejected request so
+// the upstream's own message can be compared whole. A parsed JSON-RPC
+// error body arrives bare; a plain-text 400 body arrives as "transport
+// error: request failed with status 400: <body>". Any other status keeps
+// its prefix and so never matches.
+func rejectionMessage(err error) string {
+	s := strings.ToLower(strings.TrimSpace(err.Error()))
+	s = strings.TrimPrefix(s, "transport error: ")
+	s = strings.TrimPrefix(s, "request failed with status 400: ")
+	return strings.TrimSpace(s)
 }
 
 // sessionRetireGrace is how long a retired client stays open after its

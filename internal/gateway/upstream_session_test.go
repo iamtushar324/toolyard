@@ -35,8 +35,16 @@ type forgetfulUpstream struct {
 	current   string          // the session id the client is using
 	forgotten map[string]bool // ids the server no longer recognises
 	fail500   int             // reject this many tools/call with a 500 first
+	// injectRPC, when set, answers the next tools/call itself with HTTP 200
+	// and this JSON-RPC error: an upstream whose tool reports a custom code.
+	injectRPC *rpcInject
 	counts    map[string]int
 	identity  map[string][]string // method -> identity header per request ("" = absent)
+}
+
+type rpcInject struct {
+	code    int
+	message string
 }
 
 func newForgetfulUpstream(t *testing.T, mode string) *forgetfulUpstream {
@@ -47,6 +55,10 @@ func newForgetfulUpstream(t *testing.T, mode string) *forgetfulUpstream {
 	})
 	m.AddTool(mcp.NewTool("get_fail"), func(context.Context, mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		return mcp.NewToolResultError("nope"), nil
+	})
+	// A handler error: mcp-go reports it as JSON-RPC -32603 with this text.
+	m.AddTool(mcp.NewTool("get_handler_error"), func(context.Context, mcp.CallToolRequest) (*mcp.CallToolResult, error) {
+		return nil, errors.New("session not found")
 	})
 	inner := server.NewStreamableHTTPServer(m)
 	f := &forgetfulUpstream{mode: mode, forgotten: map[string]bool{}, counts: map[string]int{}, identity: map[string][]string{}}
@@ -78,6 +90,10 @@ func newForgetfulUpstream(t *testing.T, mode string) *forgetfulUpstream {
 			f.fail500--
 			fail = true
 		}
+		var inject *rpcInject
+		if method == "tools/call" && f.injectRPC != nil {
+			inject, f.injectRPC = f.injectRPC, nil
+		}
 		f.mu.Unlock()
 
 		switch {
@@ -85,16 +101,17 @@ func newForgetfulUpstream(t *testing.T, mode string) *forgetfulUpstream {
 			http.Error(w, "Session not found", http.StatusNotFound)
 			return
 		case dead:
+			// Byte-for-byte what beknown-services mcp-server sends.
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusBadRequest)
-			id := msg.ID
-			if len(id) == 0 {
-				id = json.RawMessage("null")
-			}
-			_, _ = fmt.Fprintf(w, `{"jsonrpc":"2.0","id":%s,"error":{"code":-32000,"message":"Invalid session or missing initialization"}}`, id)
+			_, _ = io.WriteString(w, `{"jsonrpc":"2.0","error":{"code":-32000,"message":"Invalid session or missing initialization"},"id":null}`)
 			return
 		case fail:
 			http.Error(w, "boom", http.StatusInternalServerError)
+			return
+		case inject != nil:
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = fmt.Fprintf(w, `{"jsonrpc":"2.0","id":%s,"error":{"code":%d,"message":%q}}`, msg.ID, inject.code, inject.message)
 			return
 		}
 		inner.ServeHTTP(w, r)
@@ -279,6 +296,45 @@ func TestSessionRecoveryNotForToolErrors(t *testing.T) {
 	}
 }
 
+// TestSessionRecoveryNotForToolJSONRPCErrors: a JSON-RPC error produced by
+// the tool itself is not a session rejection, whatever its message says.
+// The tool may have run, so there is no re-dial and no retry: neither for
+// the standard -32603 mcp-go reports a handler error as, nor for an
+// upstream that answers a custom -32000 from a tool.
+func TestSessionRecoveryNotForToolJSONRPCErrors(t *testing.T) {
+	f := newForgetfulUpstream(t, "400")
+	u := dialForgetful(t, f)
+
+	_, err := u.callTool(context.Background(), "get_handler_error", nil)
+	if err == nil || !strings.Contains(err.Error(), "session not found") {
+		t.Fatalf("handler error should surface, got %v", err)
+	}
+	if f.count("initialize") != 1 || f.count("tools/call") != 1 || u.recoveries.Load() != 0 {
+		t.Fatalf("-32603 handler error was retried: initialize=%d tools/call=%d recoveries=%d",
+			f.count("initialize"), f.count("tools/call"), u.recoveries.Load())
+	}
+
+	f.mu.Lock()
+	f.injectRPC = &rpcInject{code: -32000, message: "session not found"}
+	f.mu.Unlock()
+	_, err = u.callTool(context.Background(), "get_ok", nil)
+	if err == nil || err.Error() != "session not found" {
+		t.Fatalf("custom-code tool error should surface as is, got %v", err)
+	}
+	if f.count("initialize") != 1 || f.count("tools/call") != 2 || u.recoveries.Load() != 0 {
+		t.Fatalf("custom -32000 tool error was retried: initialize=%d tools/call=%d recoveries=%d",
+			f.count("initialize"), f.count("tools/call"), u.recoveries.Load())
+	}
+	if u.suspended() {
+		t.Fatal("client was dropped on a tool-level JSON-RPC error")
+	}
+	// The session is still fine: a real rejection afterwards still recovers.
+	f.forget(t)
+	if res, err := u.callTool(context.Background(), "get_ok", nil); err != nil || resultText(res) != "ok" || f.count("initialize") != 2 {
+		t.Fatalf("recovery after tool errors: err=%v initialize=%d", err, f.count("initialize"))
+	}
+}
+
 // TestSessionRecoveryKeepsIdentityOnRetryOnly: the caller's key is on the
 // retried tools/call, and the re-initialize goes out without it.
 func TestSessionRecoveryKeepsIdentityOnRetryOnly(t *testing.T) {
@@ -310,17 +366,23 @@ func TestSessionRecoveryKeepsIdentityOnRetryOnly(t *testing.T) {
 	}
 }
 
-// TestIsSessionError pins the classification: mcp-go's terminated-session
-// sentinel and the upstream's own wording, in any case; nothing else.
+// TestIsSessionError pins the classification. Yes: mcp-go's
+// terminated-session sentinel (the 404 path) and, whole and in any case,
+// the exact -32000 rejections a transport sends with HTTP 400 (which
+// mcp-go hands over as a bare error, since it maps no code for -32000).
+// No: any error carrying a standard JSON-RPC code (mcp-go wraps those in
+// its sentinels; a tool handler's error is -32603), a rejection phrase
+// with extra text around it, or a wrong HTTP status.
 func TestIsSessionError(t *testing.T) {
 	yes := []error{
 		transport.ErrSessionTerminated,
 		fmt.Errorf("failed to send request: %w", transport.ErrSessionTerminated),
 		transport.NewError(fmt.Errorf("failed to send request: %w", transport.ErrSessionTerminated)),
-		errors.New("Invalid session or missing initialization"),
-		errors.New("request failed with status 400: SESSION NOT FOUND"),
-		errors.New("Invalid session ID"),
-		errors.New("session terminated"),
+		errors.New("Invalid session or missing initialization"), // beknown, parsed -32000 body
+		errors.New("invalid session or missing initialization"),
+		transport.NewError(errors.New("request failed with status 400: Invalid session or missing initialization\n")),
+		errors.New("Bad Request: Server not initialized"),            // @modelcontextprotocol/sdk
+		errors.New("Bad Request: Mcp-Session-Id header is required"), // @modelcontextprotocol/sdk
 	}
 	for _, err := range yes {
 		if _, ok := sessionErrorReason(err); !ok {
@@ -329,6 +391,16 @@ func TestIsSessionError(t *testing.T) {
 	}
 	no := []error{
 		nil,
+		fmt.Errorf("%w: %s", mcp.ErrInternalError, "session not found"),                         // tool handler error (-32603)
+		fmt.Errorf("%w: %s", mcp.ErrInternalError, "Invalid session or missing initialization"), // handler echoing the phrase
+		fmt.Errorf("%w: %s", mcp.ErrInvalidParams, "invalid session"),
+		errors.New("session not found"),
+		errors.New("Invalid session ID"),
+		errors.New("session terminated"),
+		errors.New("Invalid session or missing initialization: details"),
+		errors.New("tool: Invalid session or missing initialization"),
+		transport.NewError(errors.New("request failed with status 500: Invalid session or missing initialization")),
+		transport.NewError(errors.New("request failed with status 400: boom")),
 		errors.New("request failed with status 500: boom"),
 		context.DeadlineExceeded,
 		errors.New("tool failed: session_id must be a string"),
