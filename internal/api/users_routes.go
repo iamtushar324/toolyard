@@ -11,6 +11,7 @@ import (
 	"github.com/tusharbhardwaj/toolyard/internal/access"
 	"github.com/tusharbhardwaj/toolyard/internal/audit"
 	"github.com/tusharbhardwaj/toolyard/internal/identity"
+	"github.com/tusharbhardwaj/toolyard/internal/identitykeys"
 )
 
 // groupInfo is one grantable tool group: an upstream server or a built-in
@@ -28,6 +29,9 @@ type groupInfo struct {
 type userView struct {
 	identity.UserSummary
 	Servers []string `json:"servers"`
+	// IdentityKey is the user's Beknown key status; absent when identity
+	// keys aren't wired.
+	IdentityKey *identitykeys.Status `json:"identity_key,omitempty"`
 }
 
 // toolGroups lists every grantable group, sorted by name: each upstream
@@ -99,12 +103,16 @@ func (s *Server) userViewFor(ctx context.Context, u *identity.User) (*userView, 
 	if err != nil {
 		return nil, err
 	}
-	return &userView{UserSummary: identity.UserSummary{User: *u, AgentCount: len(agents)}, Servers: servers}, nil
+	ik, err := s.identityKeyStatus(ctx, u.ID)
+	if err != nil {
+		return nil, err
+	}
+	return &userView{UserSummary: identity.UserSummary{User: *u, AgentCount: len(agents)}, Servers: servers, IdentityKey: ik}, nil
 }
 
 // usersList — admin only.
 //
-//	GET /v1/users -> {"users":[User + "servers":[…] + "agent_count":n], "groups":[groupInfo]}
+//	GET /v1/users -> {"users":[User + "servers":[…] + "agent_count":n + "identity_key":status], "groups":[groupInfo]}
 func (s *Server) usersList(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		writeError(w, http.StatusMethodNotAllowed, "GET only")
@@ -132,15 +140,23 @@ func (s *Server) usersList(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusInternalServerError, err.Error())
 			return
 		}
-		out = append(out, userView{UserSummary: u, Servers: servers})
+		ik, err := s.identityKeyStatus(ctx, u.ID)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		out = append(out, userView{UserSummary: u, Servers: servers, IdentityKey: ik})
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"users": out, "groups": groups})
 }
 
 // usersItem dispatches the per-user admin actions:
 //
-//	PATCH /v1/users/{id}                  {"role"?, "status"?, "blocked_reason"?, "servers"?:[…]}
-//	POST  /v1/users/{id}/revoke-sessions
+//	PATCH  /v1/users/{id}                       {"role"?, "status"?, "blocked_reason"?, "servers"?:[…]}
+//	POST   /v1/users/{id}/revoke-sessions
+//	POST   /v1/users/{id}/identity-key          issue or rotate the Beknown key
+//	DELETE /v1/users/{id}/identity-key          revoke it
+//	POST   /v1/users/{id}/identity-key/register retry its registry upsert
 func (s *Server) usersItem(w http.ResponseWriter, r *http.Request) {
 	caller, err := s.requireAdmin(r)
 	if err != nil {
@@ -173,8 +189,10 @@ func (s *Server) usersItem(w http.ResponseWriter, r *http.Request) {
 			EventType: "user.revoke_sessions", AgentID: "user:" + caller.ID, ResultSummary: target.Username,
 		})
 		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
+	case sub == "identity-key" || sub == "identity-key/register":
+		s.usersIdentityKey(w, r, caller, target, sub)
 	default:
-		writeError(w, http.StatusMethodNotAllowed, "PATCH, or POST /revoke-sessions")
+		writeError(w, http.StatusMethodNotAllowed, "PATCH, POST /revoke-sessions, POST or DELETE /identity-key, or POST /identity-key/register")
 	}
 }
 
@@ -290,6 +308,11 @@ func (s *Server) usersPatch(w http.ResponseWriter, r *http.Request, caller, targ
 	}
 	if s.access != nil {
 		s.access.Invalidate(target.ID)
+	}
+	// A block must stop the user's identity key being forwarded at once,
+	// not after the resolver's cache expires.
+	if s.identityKeys != nil && changeStatus {
+		s.identityKeys.Invalidate(target.ID)
 	}
 
 	updated, err := s.identity.GetUserByID(ctx, target.ID)

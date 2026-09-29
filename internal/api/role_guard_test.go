@@ -103,6 +103,7 @@ func memberAllowlist() map[string]bool {
 		"POST /v1/agents/x/rotate", "POST /v1/agents/x/disable", "POST /v1/agents/x/enable",
 		"DELETE /v1/agents/x",
 		"GET /v1/me/servers",
+		"GET /v1/me/identity-key", "POST /v1/me/identity-key/reveal",
 	} {
 		allowed[mp] = true
 	}

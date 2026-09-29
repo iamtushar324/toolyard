@@ -58,6 +58,10 @@ var memberRoutes = map[string]string{
 	"/v1/agents/enroll": http.MethodPost,
 	// Which servers and data groups this member may use.
 	"/v1/me/servers": http.MethodGet,
+	// The member's own Beknown key: see its status, reveal it once.
+	// Provisioning, rotating and revoking are admin routes under /v1/users/.
+	"/v1/me/identity-key":        http.MethodGet,
+	"/v1/me/identity-key/reveal": http.MethodPost,
 	// Bearer-token agent routes ignore cookies, so a member's browser
 	// cookie riding along must not lock them out.
 	"/v1/agents/exchange":  "*",

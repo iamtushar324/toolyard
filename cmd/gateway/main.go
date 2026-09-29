@@ -50,6 +50,7 @@ import (
 	"github.com/tusharbhardwaj/toolyard/internal/goroutines"
 	hookspkg "github.com/tusharbhardwaj/toolyard/internal/hooks"
 	"github.com/tusharbhardwaj/toolyard/internal/identity"
+	"github.com/tusharbhardwaj/toolyard/internal/identitykeys"
 	"github.com/tusharbhardwaj/toolyard/internal/inbox"
 	"github.com/tusharbhardwaj/toolyard/internal/lake"
 	"github.com/tusharbhardwaj/toolyard/internal/logx"
@@ -453,6 +454,23 @@ func runServe(argv []string) error {
 	// CRUD on the same instance so cache updates are seen immediately.
 	policyEngine := policy.New(db)
 
+	// Per-person identity keys ("Beknown keys"). Their own identity.key
+	// (blast-radius partitioning, as oauth.key and secrets.key): the raw
+	// keys are sealed under it so they can be forwarded to upstreams that
+	// name an identity header. The gateway asks this service for the
+	// caller's key on every such call; the registry lister and the
+	// internal caller are wired below once the upstreams service exists.
+	identityKey, err := sealbox.LoadOrCreateKey(*dataDir, "identity.key")
+	if err != nil {
+		return fmt.Errorf("identity key: %w", err)
+	}
+	identityCipher, err := sealbox.NewCipher(identityKey)
+	if err != nil {
+		return fmt.Errorf("identity cipher: %w", err)
+	}
+	identityKeysSvc := identitykeys.New(db, identityCipher)
+	identityKeysSvc.SetAudit(auditSvc)
+
 	gw := gateway.New(gateway.Options{
 		Name:                "toolyard",
 		Version:             version,
@@ -470,9 +488,11 @@ func runServe(argv []string) error {
 		Surface:             vis,
 		UpstreamCallTimeout: *upstreamCallTimeout,
 		Access:              accessSvc,
+		Identity:            identityKeysSvc,
 	})
 	gw.RegisterBuiltins()
 	defer gw.Close()
+	identityKeysSvc.SetCaller(gw)
 
 	// Auto-execute on approve: when the human (or an auto-rule) flips
 	// an approval to allowed, the bus invokes Gateway.Execute on a
@@ -624,6 +644,15 @@ func runServe(argv []string) error {
 		AllowStdio:  !*noStdioUpstreams,
 		EnvDenylist: splitCSV(*envDenylistFlag),
 	})
+	// Registry upstreams: servers whose identity setting has register =
+	// true expose the upsert-/delete-bifrost-virtual-key-actor tools.
+	identityKeysSvc.SetRegistries(identitykeys.RegistryListerFunc(func(ctx context.Context) ([]string, error) {
+		servers, err := upstreamSvc.List(ctx)
+		if err != nil {
+			return nil, err
+		}
+		return registryUpstreams(servers), nil
+	}))
 	if *noStdioUpstreams {
 		log.Printf("toolyard: stdio upstreams disabled (--no-stdio-upstreams)")
 	}
@@ -1008,6 +1037,7 @@ func runServe(argv []string) error {
 		Inbox:                    inboxSvc,
 		Snapshots:                inboxSnaps,
 		Passkeys:                 passkeySvc,
+		IdentityKeys:             identityKeysSvc,
 		Guide:                    inboxGuide,
 		WebhookMaxBytes:          *webhookMaxBytes,
 		SessionKey:               loadOrCreateSessionKey(*dataDir),
@@ -1021,7 +1051,10 @@ func runServe(argv []string) error {
 	apiSrv.Routes(mux)
 
 	// Streamable HTTP MCP transport at /mcp. Agents use this if they prefer
-	// HTTP over stdio. Auth via Authorization: Bearer <agent-token>.
+	// HTTP over stdio. Auth via Authorization: Bearer <agent-token>, or
+	// x-bf-vk: <token> from a proxy that strips Authorization (bkt3's
+	// Bifrost proxy sends a person's Beknown key that way); see
+	// mcpCredential.
 	streamable := server.NewStreamableHTTPServer(gw.MCPServer(),
 		server.WithEndpointPath("/mcp"),
 		// Stateless mode is opt-in via -stateless-mcp. The default
@@ -1041,9 +1074,8 @@ func runServe(argv []string) error {
 		// POST-only operation, which works fine.
 		server.WithDisableStreaming(*statelessMCP),
 		server.WithHTTPContextFunc(func(ctx context.Context, r *http.Request) context.Context {
-			tok := r.Header.Get("Authorization")
-			if strings.HasPrefix(tok, "Bearer ") {
-				if ag, err := idSvc.VerifyAgentToken(ctx, strings.TrimPrefix(tok, "Bearer ")); err == nil {
+			if tok, ok := mcpCredential(r); ok {
+				if ag, err := idSvc.VerifyAgentToken(ctx, tok); err == nil {
 					ctx = gateway.WithAgentID(ctx, ag.ID)
 				}
 			}
@@ -1058,8 +1090,8 @@ func runServe(argv []string) error {
 	// callers to have any business calling our tools.
 	mcpAuthGuard := func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			tok := r.Header.Get("Authorization")
-			if !strings.HasPrefix(tok, "Bearer ") {
+			raw, ok := mcpCredential(r)
+			if !ok {
 				if *requireAuthMCP {
 					w.Header().Set("Content-Type", "application/json")
 					w.WriteHeader(http.StatusUnauthorized)
@@ -1069,7 +1101,6 @@ func runServe(argv []string) error {
 				next.ServeHTTP(w, r)
 				return
 			}
-			raw := strings.TrimPrefix(tok, "Bearer ")
 			if _, err := idSvc.VerifyAgentToken(r.Context(), raw); err != nil {
 				w.Header().Set("Content-Type", "application/json")
 				w.WriteHeader(http.StatusUnauthorized)
@@ -1636,6 +1667,39 @@ func (h hubEventBus) Publish(eventType string, data any) {
 }
 
 // identityResolver adapts identity.Service.PrimaryUser → oauth.IdentityResolver.
+// mcpCredential is the agent token an /mcp request presents: the
+// Authorization bearer when there is one, else the x-bf-vk header (the
+// Bifrost virtual-key slot: bkt3's proxy strips Authorization and sends a
+// person's Beknown key there). Authorization always wins when both are
+// present, so a stale bearer never falls through to a different key. ok
+// is false when neither carries a token.
+func mcpCredential(r *http.Request) (token string, ok bool) {
+	if auth := r.Header.Get("Authorization"); strings.HasPrefix(auth, "Bearer ") {
+		return strings.TrimPrefix(auth, "Bearer "), true
+	}
+	if auth := r.Header.Get("Authorization"); auth != "" {
+		// A non-bearer Authorization is not ours: never read x-bf-vk
+		// behind it.
+		return "", false
+	}
+	if vk := strings.TrimSpace(r.Header.Get("x-bf-vk")); vk != "" {
+		return vk, true
+	}
+	return "", false
+}
+
+// registryUpstreams names the servers where identity key fingerprints are
+// registered: those whose identity setting has register = true.
+func registryUpstreams(servers []upstreams.Server) []string {
+	var out []string
+	for _, sv := range servers {
+		if sv.Identity != nil && sv.Identity.Register {
+			out = append(out, sv.Name)
+		}
+	}
+	return out
+}
+
 type identityResolver struct{ id *identity.Service }
 
 func (r identityResolver) PrimaryUserID(ctx context.Context) (string, error) {

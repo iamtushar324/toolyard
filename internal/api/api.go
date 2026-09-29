@@ -743,7 +743,9 @@ func (s *Server) agentsCollection(w http.ResponseWriter, r *http.Request) {
 		}
 		out := make([]map[string]any, 0, len(agents))
 		for _, a := range agents {
-			row := map[string]any{"id": a.ID, "name": a.Name}
+			// kind "identity" is the user's Beknown key: shown, but managed
+			// through the identity key routes, never the actions below.
+			row := map[string]any{"id": a.ID, "name": a.Name, "kind": a.Kind, "disabled": a.Disabled}
 			if !a.LastSeen.IsZero() {
 				row["last_seen"] = a.LastSeen.UnixMilli()
 			}
@@ -808,6 +810,9 @@ func (s *Server) agentsEnroll(w http.ResponseWriter, r *http.Request) {
 //
 // Owner-scoped via identity.{Rotate,Delete}AgentToken — callers can't reach
 // agents owned by other users (relevant the day toolyard goes multi-user).
+// The owner's identity agent (their Beknown key) is refused here with 409
+// identity_agent: its token and registry move together through the
+// identity key routes.
 func (s *Server) agentsItem(w http.ResponseWriter, r *http.Request) {
 	uid, err := s.requireUser(r)
 	if err != nil {
@@ -839,7 +844,7 @@ func (s *Server) agentsItem(w http.ResponseWriter, r *http.Request) {
 		}
 		tok, err := s.identity.RotateAgentToken(r.Context(), uid, id, grace)
 		if err != nil {
-			writeError(w, http.StatusNotFound, err.Error())
+			writeAgentActionError(w, err)
 			return
 		}
 		_ = s.audit.Write(r.Context(), audit.Event{
@@ -849,7 +854,7 @@ func (s *Server) agentsItem(w http.ResponseWriter, r *http.Request) {
 	case (subpath == "disable" || subpath == "enable") && r.Method == http.MethodPost:
 		disable := subpath == "disable"
 		if err := s.identity.SetAgentDisabled(r.Context(), uid, id, disable); err != nil {
-			writeError(w, http.StatusNotFound, err.Error())
+			writeAgentActionError(w, err)
 			return
 		}
 		_ = s.audit.Write(r.Context(), audit.Event{
@@ -858,7 +863,7 @@ func (s *Server) agentsItem(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{"agent_id": id, "disabled": disable})
 	case subpath == "" && r.Method == http.MethodDelete:
 		if err := s.identity.DeleteAgent(r.Context(), uid, id); err != nil {
-			writeError(w, http.StatusNotFound, err.Error())
+			writeAgentActionError(w, err)
 			return
 		}
 		_ = s.audit.Write(r.Context(), audit.Event{
@@ -868,6 +873,16 @@ func (s *Server) agentsItem(w http.ResponseWriter, r *http.Request) {
 	default:
 		writeError(w, http.StatusMethodNotAllowed, "POST /rotate, /disable, /enable, or DELETE")
 	}
+}
+
+// writeAgentActionError: an identity agent is 409 identity_agent; anything
+// else (unknown id, someone else's agent) stays the 404 it always was.
+func writeAgentActionError(w http.ResponseWriter, err error) {
+	if errors.Is(err, identity.ErrIdentityAgent) {
+		writeError(w, http.StatusConflict, "identity_agent")
+		return
+	}
+	writeError(w, http.StatusNotFound, err.Error())
 }
 
 func (s *Server) agentsExchange(w http.ResponseWriter, r *http.Request) {

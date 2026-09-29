@@ -46,6 +46,17 @@ var (
 	ErrInvalidStatus     = errors.New("status must be active or blocked")
 	ErrEnrollNotFound    = errors.New("enrollment code not found or expired")
 	ErrAgentTokenInvalid = errors.New("agent token invalid")
+	// ErrIdentityAgent: the generic agent actions (rotate, disable, enable,
+	// delete) refuse a user's identity agent; identitykeys owns its
+	// lifecycle so the registry stays in step with the token.
+	ErrIdentityAgent = errors.New("identity agent: manage it through the identity key")
+)
+
+// Agent kinds, mirroring the CHECK constraint on agents.kind. An identity
+// agent is the one per user whose token is that person's identity key.
+const (
+	AgentKindAgent    = "agent"
+	AgentKindIdentity = "identity"
 )
 
 // Roles and statuses, mirroring the CHECK constraints on users.
@@ -141,6 +152,9 @@ type Agent struct {
 	Owner    string    `json:"owner"`
 	LastSeen time.Time `json:"last_seen"`
 	Disabled bool      `json:"disabled"`
+	// Kind is AgentKindAgent for an enrolled agent, AgentKindIdentity for
+	// the owner's identity key.
+	Kind string `json:"kind"`
 }
 
 // DefaultRotateGrace is how long a rotated-away token keeps authenticating
@@ -569,7 +583,7 @@ func (s *Service) CreateEnrollment(ctx context.Context, ownerUserID, agentName s
 		id, agentName, ownerUserID, code, exp, now.UnixMilli()); err != nil {
 		return "", nil, err
 	}
-	return code, &Agent{ID: id, Name: agentName, Owner: ownerUserID}, nil
+	return code, &Agent{ID: id, Name: agentName, Owner: ownerUserID, Kind: AgentKindAgent}, nil
 }
 
 // CreateAgentWithToken provisions a new agent and returns its long-lived
@@ -598,7 +612,7 @@ func (s *Service) CreateAgentWithToken(ctx context.Context, ownerUserID, agentNa
 		id, agentName, ownerUserID, hash, now.UnixMilli(), now.UnixMilli()); err != nil {
 		return "", nil, err
 	}
-	return token, &Agent{ID: id, Name: agentName, Owner: ownerUserID}, nil
+	return token, &Agent{ID: id, Name: agentName, Owner: ownerUserID, Kind: AgentKindAgent}, nil
 }
 
 // ExchangeEnrollment swaps a one-time enrollment code for a long-lived token.
@@ -608,9 +622,9 @@ func (s *Service) ExchangeEnrollment(ctx context.Context, code string) (string, 
 	var ag Agent
 	var exp int64
 	err := s.db.QueryRowContext(ctx,
-		`SELECT id, name, owner_user, enroll_expires
+		`SELECT id, name, owner_user, enroll_expires, kind
          FROM agents WHERE enroll_code = ?`, code).
-		Scan(&ag.ID, &ag.Name, &ag.Owner, &exp)
+		Scan(&ag.ID, &ag.Name, &ag.Owner, &exp, &ag.Kind)
 	if err == sql.ErrNoRows {
 		return "", nil, ErrEnrollNotFound
 	}
@@ -652,10 +666,10 @@ func (s *Service) VerifyAgentToken(ctx context.Context, token string) (*Agent, e
 	// packages' tests enrol agents under fake owners); an agent whose owner
 	// is blocked stops with the owner.
 	err := s.db.QueryRowContext(ctx,
-		`SELECT a.id, a.name, a.owner_user, a.token_hash, COALESCE(a.disabled,0), a.prev_token_hash, a.prev_token_expires,
+		`SELECT a.id, a.name, a.owner_user, a.kind, a.token_hash, COALESCE(a.disabled,0), a.prev_token_hash, a.prev_token_expires,
                 COALESCE(u.status, ?)
          FROM agents a LEFT JOIN users u ON u.id = a.owner_user WHERE a.id = ?`, StatusActive, id).
-		Scan(&ag.ID, &ag.Name, &ag.Owner, &hash, &disabled, &prevHash, &prevExp, &ownerStatus)
+		Scan(&ag.ID, &ag.Name, &ag.Owner, &ag.Kind, &hash, &disabled, &prevHash, &prevExp, &ownerStatus)
 	if err == sql.ErrNoRows {
 		return nil, ErrAgentTokenInvalid
 	}
@@ -689,15 +703,13 @@ func (s *Service) VerifyAgentToken(ctx context.Context, token string) (*Agent, e
 // keeps authenticating until now+grace (so a running agent isn't killed
 // mid-task); grace <= 0 kills the old token immediately.
 func (s *Service) RotateAgentToken(ctx context.Context, ownerUserID, agentID string, grace time.Duration) (string, error) {
-	if agentID == "" {
-		return "", ErrAgentTokenInvalid
+	if err := s.requirePlainAgent(ctx, ownerUserID, agentID); err != nil {
+		return "", err
 	}
-	rawToken, err := randCode(32)
+	token, hash, err := NewAgentToken(agentID)
 	if err != nil {
 		return "", err
 	}
-	token := agentID + "." + rawToken
-	hash := hashToken(token)
 	now := time.Now().UnixMilli()
 	var res sql.Result
 	if grace > 0 {
@@ -724,8 +736,8 @@ func (s *Service) RotateAgentToken(ctx context.Context, ownerUserID, agentID str
 // SetAgentDisabled hard-revokes (or re-enables) an agent. A disabled agent's
 // token — current and previous — stops authenticating immediately. Owner-scoped.
 func (s *Service) SetAgentDisabled(ctx context.Context, ownerUserID, agentID string, disabled bool) error {
-	if agentID == "" {
-		return ErrAgentTokenInvalid
+	if err := s.requirePlainAgent(ctx, ownerUserID, agentID); err != nil {
+		return err
 	}
 	d := 0
 	if disabled {
@@ -747,8 +759,8 @@ func (s *Service) SetAgentDisabled(ctx context.Context, ownerUserID, agentID str
 // token stops authenticating. Owner-scoped — callers can't delete agents
 // belonging to other users.
 func (s *Service) DeleteAgent(ctx context.Context, ownerUserID, agentID string) error {
-	if agentID == "" {
-		return ErrAgentTokenInvalid
+	if err := s.requirePlainAgent(ctx, ownerUserID, agentID); err != nil {
+		return err
 	}
 	res, err := s.db.ExecContext(ctx,
 		`DELETE FROM agents WHERE id = ? AND owner_user = ?`, agentID, ownerUserID)
@@ -758,6 +770,29 @@ func (s *Service) DeleteAgent(ctx context.Context, ownerUserID, agentID string) 
 	n, _ := res.RowsAffected()
 	if n == 0 {
 		return ErrAgentTokenInvalid
+	}
+	return nil
+}
+
+// requirePlainAgent is the guard in front of the generic agent actions:
+// the agent must exist under ownerUserID (else ErrAgentTokenInvalid, the
+// same answer as for an unknown id so nothing leaks) and must not be the
+// owner's identity agent (ErrIdentityAgent).
+func (s *Service) requirePlainAgent(ctx context.Context, ownerUserID, agentID string) error {
+	if agentID == "" {
+		return ErrAgentTokenInvalid
+	}
+	var kind string
+	err := s.db.QueryRowContext(ctx,
+		`SELECT kind FROM agents WHERE id = ? AND owner_user = ?`, agentID, ownerUserID).Scan(&kind)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ErrAgentTokenInvalid
+	}
+	if err != nil {
+		return err
+	}
+	if kind == AgentKindIdentity {
+		return ErrIdentityAgent
 	}
 	return nil
 }
@@ -850,7 +885,7 @@ func nullStr(s string) any {
 
 func (s *Service) ListAgents(ctx context.Context, ownerUserID string) ([]Agent, error) {
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT id, name, owner_user, COALESCE(last_seen, 0), COALESCE(disabled, 0)
+		`SELECT id, name, owner_user, COALESCE(last_seen, 0), COALESCE(disabled, 0), kind
          FROM agents WHERE owner_user = ? ORDER BY created_at DESC`, ownerUserID)
 	if err != nil {
 		return nil, err
@@ -861,7 +896,7 @@ func (s *Service) ListAgents(ctx context.Context, ownerUserID string) ([]Agent, 
 		var ag Agent
 		var seen int64
 		var disabled int
-		if err := rows.Scan(&ag.ID, &ag.Name, &ag.Owner, &seen, &disabled); err != nil {
+		if err := rows.Scan(&ag.ID, &ag.Name, &ag.Owner, &seen, &disabled, &ag.Kind); err != nil {
 			return nil, err
 		}
 		if seen > 0 {
@@ -874,6 +909,29 @@ func (s *Service) ListAgents(ctx context.Context, ownerUserID string) ([]Agent, 
 }
 
 // ---- helpers ----------------------------------------------------------------
+
+// NewAgentToken mints a token for agentID without touching the store:
+// "<agent id>.<base64url 32 random bytes>" and the sha256 hex that
+// agents.token_hash stores for it. identitykeys uses it to mint a user's
+// identity key and register the hash before the token goes live.
+func NewAgentToken(agentID string) (token, hash string, err error) {
+	if agentID == "" {
+		return "", "", ErrAgentTokenInvalid
+	}
+	raw, err := randCode(32)
+	if err != nil {
+		return "", "", err
+	}
+	token = agentID + "." + raw
+	return token, hashToken(token), nil
+}
+
+// NewAgentID returns a fresh "ag_<uuid>" agent id.
+func NewAgentID() string { return "ag_" + uuid.NewString() }
+
+// HashToken is the stored form of an agent token: sha256 hex. For an
+// identity key it is the fingerprint registered with Beknown services.
+func HashToken(token string) string { return hashToken(token) }
 
 func hashToken(token string) string {
 	sum := sha256.Sum256([]byte(token))

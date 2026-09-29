@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -101,5 +102,108 @@ func TestDisabledRejects(t *testing.T) {
 	}
 	if _, err := s.VerifyAgentToken(ctx, tok); err != nil {
 		t.Errorf("re-enabled agent's token rejected: %v", err)
+	}
+}
+
+// seedIdentityAgent inserts owner's identity agent the way identitykeys
+// does (kind = 'identity') and returns its token.
+func seedIdentityAgent(t *testing.T, s *Service, owner string) (string, string) {
+	t.Helper()
+	id := NewAgentID()
+	tok, hash, err := NewAgentToken(id)
+	if err != nil {
+		t.Fatalf("mint: %v", err)
+	}
+	if _, err := s.db.Exec(
+		`INSERT INTO agents(id, name, owner_user, token_hash, kind, created_at) VALUES(?,?,?,?,?,?)`,
+		id, "Beknown key", owner, hash, AgentKindIdentity, time.Now().UnixMilli()); err != nil {
+		t.Fatalf("insert identity agent: %v", err)
+	}
+	return tok, id
+}
+
+func TestNewAgentToken(t *testing.T) {
+	tok, hash, err := NewAgentToken("ag_x")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(tok, "ag_x.") || len(tok) <= len("ag_x.") {
+		t.Errorf("token shape %q", tok)
+	}
+	if hash != HashToken(tok) || len(hash) != 64 {
+		t.Errorf("hash %q does not match HashToken", hash)
+	}
+	if _, _, err := NewAgentToken(""); !errors.Is(err, ErrAgentTokenInvalid) {
+		t.Errorf("empty id: %v", err)
+	}
+	if !strings.HasPrefix(NewAgentID(), "ag_") {
+		t.Error("NewAgentID prefix")
+	}
+}
+
+func TestIdentityAgentAuthenticatesAndKind(t *testing.T) {
+	s, owner := newTestIdentity(t)
+	ctx := context.Background()
+	tok, id := seedIdentityAgent(t, s, owner)
+	_, plain, _ := s.CreateAgentWithToken(ctx, owner, "bot")
+
+	got, err := s.VerifyAgentToken(ctx, tok)
+	if err != nil || got.ID != id || got.Kind != AgentKindIdentity || got.Owner != owner {
+		t.Fatalf("verify identity token = %+v, %v", got, err)
+	}
+	if got, _ := s.VerifyAgentToken(ctx, mustToken(t, s, owner, plain.ID)); got != nil && got.Kind != AgentKindAgent {
+		t.Errorf("plain agent kind = %q", got.Kind)
+	}
+	list, err := s.ListAgents(ctx, owner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	kinds := map[string]string{}
+	for _, a := range list {
+		kinds[a.ID] = a.Kind
+	}
+	if kinds[id] != AgentKindIdentity || kinds[plain.ID] != AgentKindAgent {
+		t.Errorf("ListAgents kinds = %v", kinds)
+	}
+}
+
+// mustToken rotates a plain agent to get a token for it (the create token
+// was discarded by the caller).
+func mustToken(t *testing.T, s *Service, owner, agentID string) string {
+	t.Helper()
+	tok, err := s.RotateAgentToken(context.Background(), owner, agentID, 0)
+	if err != nil {
+		t.Fatalf("rotate: %v", err)
+	}
+	return tok
+}
+
+func TestGenericActionsRefuseIdentityAgent(t *testing.T) {
+	s, owner := newTestIdentity(t)
+	ctx := context.Background()
+	tok, id := seedIdentityAgent(t, s, owner)
+
+	if _, err := s.RotateAgentToken(ctx, owner, id, 0); !errors.Is(err, ErrIdentityAgent) {
+		t.Errorf("rotate: %v, want ErrIdentityAgent", err)
+	}
+	if err := s.SetAgentDisabled(ctx, owner, id, true); !errors.Is(err, ErrIdentityAgent) {
+		t.Errorf("disable: %v, want ErrIdentityAgent", err)
+	}
+	if err := s.SetAgentDisabled(ctx, owner, id, false); !errors.Is(err, ErrIdentityAgent) {
+		t.Errorf("enable: %v, want ErrIdentityAgent", err)
+	}
+	if err := s.DeleteAgent(ctx, owner, id); !errors.Is(err, ErrIdentityAgent) {
+		t.Errorf("delete: %v, want ErrIdentityAgent", err)
+	}
+	// Nothing changed: the key still authenticates.
+	if _, err := s.VerifyAgentToken(ctx, tok); err != nil {
+		t.Errorf("identity token after refused actions: %v", err)
+	}
+	// Someone else's agent, or an unknown one, is still "invalid" (no leak).
+	if _, err := s.RotateAgentToken(ctx, "u_other", id, 0); !errors.Is(err, ErrAgentTokenInvalid) {
+		t.Errorf("rotate as other owner: %v", err)
+	}
+	if err := s.DeleteAgent(ctx, owner, "ag_missing"); !errors.Is(err, ErrAgentTokenInvalid) {
+		t.Errorf("delete missing: %v", err)
 	}
 }
