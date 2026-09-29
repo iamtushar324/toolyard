@@ -59,6 +59,49 @@ The full self-hosting guide is in [`docs/self-hosting.md`](docs/self-hosting.md)
   PostToolUse hook that resumes deferred approvals.
 - Multi-stage `deploy/Dockerfile` + `deploy/docker-compose.yml`.
 
+## Inbox and scoped permissions
+
+Agents ask for restricted tools the way a colleague would: one request per
+task, in their own words, with a voice note and evidence. You review it on
+your phone and allow some or all of the tools; each allowed tool gets a
+single-use permission (a grant) tied to the exact parameters you saw.
+
+- **Agents** call `inbox.check` to see which planned calls are restricted,
+  then one `inbox.request` with a first-person message, a ≤75-word voice-note
+  script, attachments (tables, charts, diffs, logs, links; images, video and
+  files as links toolyard copies), and every tool with its parameters. When
+  you approve, `inbox.wait` hands each allowed tool a `tyg_…` token; the
+  agent passes it as `_grant` on the call. Questions and blockers go through
+  `inbox.ask`, outcomes through `inbox.post`.
+- **Toolyard** checks each request in the background and adds only flags
+  (Production, Can't be undone, Deletes data, Value not known yet, …).
+  An optional judge model (Gemini, off by default) flags calls that
+  contradict the agent's own description. "Summarize with toolyard" and
+  "Ask toolyard" give its own reading on demand.
+- **You** see the Inbox tab: the agent's message and voice note first,
+  evidence next, the decision last. You can narrow any tool's parameters and
+  shorten how long permissions last before approving, and production or
+  red-flagged tools need your passkey (Face ID) once you've added one. The
+  Sessions tab shows what each agent is doing, its timeline, its live
+  permissions, and a kill switch.
+- **Your phone** buzzes by urgency: `now` at once (rate-limited per agent),
+  `soon` grouped per session, `digest` in scheduled digests, never for
+  updates, and not during quiet hours. Details in
+  [docs/self-hosting.md](docs/self-hosting.md#inbox-and-permissions).
+
+`approval_mode` (Settings → Inbox & permissions) decides what happens when
+an agent calls a restricted tool without a grant: `execute` (default)
+keeps the existing queue-and-run approvals; `inbox` runs nothing and
+returns `permission_required` with a pre-filled draft request, so agents
+learn the protocol from their first mistake. Grants work in both modes.
+
+Agents learn the rules from `inbox.guide` (served from
+[`docs/guidelines/agent-protocol.md`](docs/guidelines/agent-protocol.md)),
+the `toolyard://guide` MCP resource, `GET /v1/guide`, or the
+`toolyard-inbox` skill (`toolyard skills install toolyard-inbox`, or the
+"Teach it the rules" tab when you enroll an agent). The design is in
+[`docs/guidelines/`](docs/guidelines/).
+
 ## Personal data lake (TUS-104)
 
 toolyard ships a DuckDB-backed warehouse so any "data not modified per row"
@@ -114,6 +157,14 @@ go test -tags=e2e ./scripts -run TestEndToEnd -toolyard=http://localhost:18787 -
 
 It covers the full happy path: enroll, list tools, read passes, write
 holds, dashboard approves, write completes, audit log fills.
+
+The inbox flow (coaching, dry run, request, approval, single-use grant,
+closing update) has its own test; `-media` optionally points at a server
+with `shot.jpg` and `rec.mp4` to check attachment copying:
+
+```bash
+go test -tags=e2e ./scripts -run TestE2EInbox -toolyard=http://localhost:18787 -v
+```
 
 ## License
 

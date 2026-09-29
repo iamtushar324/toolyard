@@ -22,6 +22,8 @@ import (
 	"github.com/mark3labs/mcp-go/client"
 	"github.com/mark3labs/mcp-go/client/transport"
 	"github.com/mark3labs/mcp-go/mcp"
+
+	"github.com/tusharbhardwaj/toolyard/internal/gateway"
 )
 
 var toolyardURL = flag.String("toolyard", "http://localhost:18787", "toolyard base URL")
@@ -424,8 +426,11 @@ func TestE2EMarketplace(t *testing.T) {
 	h := &httpClient{base: *toolyardURL}
 	mustLogin(t, h)
 
-	var catalog []map[string]any
-	h.raw(t, "GET", "/v1/marketplace", nil, &catalog)
+	var market struct {
+		Entries []map[string]any `json:"entries"`
+	}
+	h.raw(t, "GET", "/v1/marketplace", nil, &market)
+	catalog := market.Entries
 	if len(catalog) < 5 {
 		t.Fatalf("expected at least 5 marketplace entries, got %d", len(catalog))
 	}
@@ -588,6 +593,9 @@ func TestE2ERouterOnlyMode(t *testing.T) {
 	if len(full.Tools) <= 2 {
 		t.Fatalf("expected >2 tools when router_only_mode is off, got %d", len(full.Tools))
 	}
+	// The pinned set is every registered tool the gateway pins (it grows
+	// as features add always-visible tools, e.g. the inbox.* set).
+	expectPinned := visiblePinned(full.Tools)
 
 	// Turn it on; tools/list must shrink to just the pinned set.
 	var on map[string]any
@@ -615,8 +623,8 @@ func TestE2ERouterOnlyMode(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(min.Tools) != len(pinned) {
-		t.Fatalf("router-only should expose the pinned set (%d), got %d", len(pinned), len(min.Tools))
+	if len(min.Tools) != len(expectPinned) {
+		t.Fatalf("router-only should expose the pinned set (%d), got %d", len(expectPinned), len(min.Tools))
 	}
 	gotNames := map[string]bool{}
 	for _, tl := range min.Tools {
@@ -725,6 +733,19 @@ func TestE2EUsageAndTopN(t *testing.T) {
 	}
 	t.Logf("per_tool counts: %v", per)
 
+	// The pinned set, from a full-mode listing (it grows as features add
+	// always-visible tools).
+	fullTok := enrollAgent(t, h, "topn-full")
+	cf := mcpClient(t, *toolyardURL, fullTok)
+	fctx, fcancel := context.WithTimeout(context.Background(), 20*time.Second)
+	fullList, err := cf.ListTools(fctx, mcp.ListToolsRequest{})
+	fcancel()
+	cf.Close()
+	if err != nil {
+		t.Fatal(err)
+	}
+	expectPinned := visiblePinned(fullList.Tools)
+
 	// Switch to top_n mode with N=2 and a high threshold so cold-start
 	// (overall top-N) applies.
 	h.raw(t, "PATCH", "/v1/settings", map[string]any{
@@ -757,9 +778,9 @@ func TestE2EUsageAndTopN(t *testing.T) {
 			t.Errorf("pinned tool %q not visible in top_n cold-start; got %v", p, keysOf(gotNames))
 		}
 	}
-	// At most 12 pinned + 2 ranked tail = 14.
-	if len(tools.Tools) > len(pinned)+2 {
-		t.Errorf("expected ≤%d tools in top_n with N=2, got %d", len(pinned)+2, len(tools.Tools))
+	// At most the pinned set + 2 ranked tail.
+	if len(tools.Tools) > len(expectPinned)+2 {
+		t.Errorf("expected ≤%d tools in top_n with N=2, got %d", len(expectPinned)+2, len(tools.Tools))
 	}
 	// memory.set is in the pinned set, so it'll be there regardless. Check
 	// at least one *non-pinned* tool came in via the ranked tail (if there
@@ -774,8 +795,8 @@ func TestE2EUsageAndTopN(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if len(ro.Tools) != len(pinned) {
-		t.Errorf("router_only should expose exactly the pinned set (%d), got %d", len(pinned), len(ro.Tools))
+	if len(ro.Tools) != len(expectPinned) {
+		t.Errorf("router_only should expose exactly the pinned set (%d), got %d", len(expectPinned), len(ro.Tools))
 	}
 
 	// Restore default for other tests.
@@ -1599,15 +1620,25 @@ func TestE2EAgentRotateAndDelete(t *testing.T) {
 		t.Fatalf("freshly created token did not authenticate")
 	}
 
-	// Rotate.
+	// Rotate with the default grace: the old token keeps working for a
+	// while so a running agent isn't cut off mid-task.
 	var rot map[string]any
 	h.raw(t, "POST", "/v1/agents/"+agentID+"/rotate", nil, &rot)
-	newToken, _ := rot["token"].(string)
-	if newToken == "" || newToken == oldToken {
+	graceToken, _ := rot["token"].(string)
+	if graceToken == "" || graceToken == oldToken {
 		t.Fatalf("rotate returned bogus token: %v", rot)
 	}
-	if mcpAuthsAs(t, oldToken) {
-		t.Errorf("old token should be dead after rotate")
+	if !mcpAuthsAs(t, oldToken) {
+		t.Errorf("old token should still work during the rotate grace period")
+	}
+	// Rotate with grace_seconds: 0: the previous token dies at once.
+	h.raw(t, "POST", "/v1/agents/"+agentID+"/rotate", map[string]any{"grace_seconds": 0}, &rot)
+	newToken, _ := rot["token"].(string)
+	if newToken == "" || newToken == graceToken {
+		t.Fatalf("rotate returned bogus token: %v", rot)
+	}
+	if mcpAuthsAs(t, graceToken) || mcpAuthsAs(t, oldToken) {
+		t.Errorf("old tokens should be dead after an immediate rotate")
 	}
 	if !mcpAuthsAs(t, newToken) {
 		t.Errorf("new token should authenticate")
@@ -1678,4 +1709,16 @@ func TestE2ELogoutInvalidatesSession(t *testing.T) {
 	if r.StatusCode == http.StatusOK && bytes.Contains(all, []byte(`"id"`)) {
 		t.Errorf("auth/me without cookie returned a logged-in user: %s", string(all))
 	}
+}
+
+// visiblePinned returns the names in a full tools/list that the gateway
+// pins (always visible in router_only and top_n modes).
+func visiblePinned(tools []mcp.Tool) map[string]bool {
+	out := map[string]bool{}
+	for _, tl := range tools {
+		if gateway.IsPinned(tl.Name) {
+			out[tl.Name] = true
+		}
+	}
+	return out
 }

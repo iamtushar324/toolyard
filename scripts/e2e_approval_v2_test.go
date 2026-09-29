@@ -103,8 +103,8 @@ func TestE2EDeferredEnvelope(t *testing.T) {
 		t.Fatalf("poll2: %v", err)
 	}
 	pollSC2, _ := pollRes2.StructuredContent.(map[string]any)
-	if pollSC2 == nil || pollSC2["status"] != "allowed" {
-		t.Fatalf("expected poll status=allowed after approve, got %v", pollSC2)
+	if pollSC2 == nil || !approvedStatus(pollSC2["status"]) {
+		t.Fatalf("expected poll status=allowed/executed after approve, got %v", pollSC2)
 	}
 
 	// Re-call original tool with _approval_id to actually execute.
@@ -167,8 +167,8 @@ func TestE2EWaitForApproval(t *testing.T) {
 		t.Errorf("wait_for_approval took %v — should have unblocked when approval landed at ~800ms", elapsed)
 	}
 	sc, _ := waitRes.StructuredContent.(map[string]any)
-	if sc == nil || sc["status"] != "allowed" {
-		t.Fatalf("expected wait status=allowed, got %v", sc)
+	if sc == nil || !approvedStatus(sc["status"]) {
+		t.Fatalf("expected wait status=allowed/executed, got %v", sc)
 	}
 }
 
@@ -226,8 +226,8 @@ func TestE2EPollApprovalsBatch(t *testing.T) {
 		st, _ := row["status"].(string)
 		statusByID[id] = st
 	}
-	if statusByID[ids[1]] != "allowed" {
-		t.Errorf("middle id should be allowed, got %v", statusByID[ids[1]])
+	if !approvedStatus(statusByID[ids[1]]) {
+		t.Errorf("middle id should be allowed/executed, got %v", statusByID[ids[1]])
 	}
 	if statusByID[ids[0]] != "pending" || statusByID[ids[2]] != "pending" {
 		t.Errorf("flanking ids should still be pending, got %v / %v", statusByID[ids[0]], statusByID[ids[2]])
@@ -428,4 +428,12 @@ func TestE2EAgentBudgetExceeded(t *testing.T) {
 		var dummy map[string]any
 		h.raw(t, "POST", "/v1/approvals/"+id+"/decide", map[string]string{"Action": "denied"}, &dummy)
 	}
+}
+
+// approvedStatus accepts both "allowed" and "executed": since the gateway
+// runs an approved call itself (migration 0010), a poll right after the
+// decision may already report the call as executed.
+func approvedStatus(v any) bool {
+	st, _ := v.(string)
+	return st == "allowed" || st == "executed"
 }
