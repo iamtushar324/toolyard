@@ -94,9 +94,21 @@ func runScript(ctx context.Context, start startMsg, s sink, stopNote string) scr
 	if err != nil {
 		return scriptResult{errKind: "runtime", errMsg: "result cannot be returned: " + err.Error()}
 	}
+	tooBig := func(n int) scriptResult {
+		return scriptResult{errKind: "runtime", errMsg: fmt.Sprintf(
+			"result is %d bytes; a returned value may be at most %d MiB (the response is truncated there anyway). Return less, or print a summary and return the key fields",
+			n, maxResultBytes>>20)}
+	}
+	// A huge string is the common case; refuse it before encoding a copy.
+	if str, ok := goValue.(string); ok && len(str) > maxResultBytes {
+		return tooBig(len(str))
+	}
 	raw, err := jsonText(goValue, "")
 	if err != nil {
 		return scriptResult{errKind: "runtime", errMsg: "result cannot be encoded as JSON: " + err.Error()}
+	}
+	if len(raw) > maxResultBytes {
+		return tooBig(len(raw))
 	}
 	return scriptResult{result: json.RawMessage(raw), hasResult: true}
 }
@@ -126,6 +138,12 @@ func toolBuiltin(server, member string, s sink) *starlark.Builtin {
 		callArgs, err := callArguments(fn.Name(), args, kwargs)
 		if err != nil {
 			return nil, err
+		}
+		if encoded, err := json.Marshal(callArgs); err != nil {
+			return nil, fmt.Errorf("arguments to %s.%s cannot be encoded as JSON: %v", server, member, err)
+		} else if len(encoded) > maxArgsBytes {
+			return nil, fmt.Errorf("arguments to %s.%s are %d bytes; one call may pass at most %d MiB. Pass less, or split the work across calls",
+				server, member, len(encoded), maxArgsBytes>>20)
 		}
 		reply := s.call(server, member, callArgs)
 		if reply.Error != "" {

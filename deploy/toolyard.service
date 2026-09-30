@@ -70,14 +70,20 @@ MemoryDenyWriteExecute=true
 SystemCallArchitectures=native
 SystemCallFilter=@system-service
 SystemCallFilter=~@privileged @resources
+# The code-mode script worker caps its own memory with setrlimit, which
+# @resources denies; allow the two calls back or every script fails.
+SystemCallFilter=setrlimit prlimit64
 
 # Allow the binary to write only here.
 ReadWritePaths=/var/lib/toolyard /var/log/toolyard
 
-# Cap resources so a runaway process can't take the box down.
+# Cap resources so a runaway process can't take the box down. Code-mode
+# scripts run in worker processes, up to four at 160 MiB each, inside this
+# limit; size it for the gateway plus those (install.sh uses the same).
 LimitNOFILE=8192
 TasksMax=512
-MemoryMax=512M
+MemoryMax=1G
+MemoryHigh=768M
 
 # Graceful shutdown: SIGINT triggers context cancel + 5s drain in main.go.
 KillSignal=SIGINT

@@ -17,6 +17,15 @@
 // only asks the parent, over its stdin and stdout, to make tool calls, and
 // the parent makes them. A child that dies, for any reason, costs one
 // script its run and nothing else.
+//
+// The worker is a resource boundary, not a privilege boundary. It runs as
+// the same user, in the same namespaces and with the same filesystem view
+// as the gateway; what keeps a script inside its box is the Starlark
+// interpreter (no filesystem, network or load()), the memory, CPU, step
+// and output caps, and the bare environment. A flaw in starlark-go itself
+// would let a script read what the gateway can read, including the data
+// directory. Deployments that need more isolate the whole service (a
+// container, or systemd's DynamicUser and ProtectSystem=strict).
 package codemode
 
 import (
@@ -100,7 +109,11 @@ type Worker struct {
 	Env []string
 	// MemoryMiB caps the child's data segment (RLIMIT_DATA); its Go heap
 	// target is three quarters of it. An allocation past the cap ends the
-	// child, and the script, with a clean error. Default 512.
+	// child, and the script, with a clean error. The Go runtime maps heap
+	// in 64 MiB arenas, so the live data a script can hold is about the
+	// cap minus 64 MiB. Default 160, sized with MaxConcurrent so all
+	// workers together (640 MiB) leave a gateway under a 1 GiB service
+	// limit some 300 MiB of headroom.
 	MemoryMiB int
 	// MaxConcurrent caps scripts running at once. A run past the cap waits
 	// AcquireWait for a slot, then fails as busy. Defaults 4 and 2s.
@@ -117,7 +130,7 @@ func DefaultWorker() Worker {
 // withDefaults fills zero fields.
 func (w Worker) withDefaults() Worker {
 	if w.MemoryMiB <= 0 {
-		w.MemoryMiB = 512
+		w.MemoryMiB = 160
 	}
 	if w.MaxConcurrent <= 0 {
 		w.MaxConcurrent = 4
@@ -154,6 +167,9 @@ func New(caller Caller, limits Limits) *Runtime {
 	}
 	if limits.MaxOutputBytes <= 0 {
 		limits.MaxOutputBytes = def.MaxOutputBytes
+	}
+	if limits.MaxOutputBytes > maxOutputCap {
+		limits.MaxOutputBytes = maxOutputCap
 	}
 	if limits.MaxSteps == 0 {
 		limits.MaxSteps = def.MaxSteps

@@ -12,6 +12,11 @@ import (
 // then sends prints and call requests, the parent answers each call with a
 // result, and the worker ends with done or error and exits. Nothing else
 // crosses: no reasons, no credentials, no catalog beyond identifiers.
+//
+// Sizes are bounded at the source, so no message can approach the line
+// limit and leave a side blocked on a pipe: the worker caps a returned
+// value and a call's arguments before writing, the parent caps a tool
+// result before replying, and a print is cut to one megabyte.
 
 const (
 	msgStart  = "start"
@@ -21,9 +26,22 @@ const (
 	msgError  = "error"
 	msgResult = "result"
 
-	// maxLineBytes bounds one message either way. A tool result or a call's
-	// arguments can be large; anything past this is a protocol failure.
-	maxLineBytes = 64 << 20
+	// maxLineBytes bounds one message either way; anything past it is a
+	// protocol failure that ends the run.
+	maxLineBytes = 8 << 20
+	// maxResultBytes caps the JSON of a script's returned value. The
+	// response is truncated to about this size anyway.
+	maxResultBytes = 1 << 20
+	// maxArgsBytes caps the JSON of one call's arguments.
+	maxArgsBytes = 4 << 20
+	// maxCallResultBytes caps the JSON string of one tool result on its way
+	// to the script.
+	maxCallResultBytes = 6 << 20
+	// maxPrintBytes caps one print() line.
+	maxPrintBytes = 1 << 20
+	// maxOutputCap is the most Limits.MaxOutputBytes may be set to, so the
+	// print log stays well inside the line limit.
+	maxOutputCap = 2 << 20
 )
 
 // startMsg is the parent's opening message.
@@ -71,7 +89,7 @@ type parentMsg struct {
 }
 
 // errLineTooLong is a message past maxLineBytes.
-var errLineTooLong = errors.New("message exceeds the 64 MiB line limit")
+var errLineTooLong = fmt.Errorf("message exceeds the %d MiB line limit", maxLineBytes>>20)
 
 // readLine returns the next newline-terminated message without the newline.
 func readLine(r *bufio.Reader) ([]byte, error) {

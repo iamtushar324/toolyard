@@ -438,7 +438,10 @@ RestrictNamespaces=true
 ProtectProc=invisible
 SystemCallArchitectures=native
 SystemCallFilter=@system-service
-SystemCallFilter=~@privileged @resources"
+SystemCallFilter=~@privileged @resources
+# The code-mode script worker caps its own memory with setrlimit, which
+# @resources denies; allow the two calls back or every script fails.
+SystemCallFilter=setrlimit prlimit64"
 else
   # Loose tier — stdio upstreams compatible.
   # Dropped vs strict tier:

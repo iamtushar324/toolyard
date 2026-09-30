@@ -35,6 +35,7 @@ func WorkerMain(stdin io.Reader, stdout, stderr io.Writer) int {
 		return 1
 	}
 	debug.SetMemoryLimit(int64(mib) << 20 * 3 / 4)
+	preferOOMKill()
 
 	r := bufio.NewReaderSize(stdin, 64<<10)
 	line, err := readLine(r)
@@ -89,6 +90,9 @@ func (p *pipeSink) print(text string) {
 	defer p.mu.Unlock()
 	if p.capped {
 		return
+	}
+	if len(text) > maxPrintBytes {
+		text = text[:maxPrintBytes] + "… [print truncated]"
 	}
 	if p.sent+len(text) > p.limits.MaxOutputBytes {
 		p.capped = true

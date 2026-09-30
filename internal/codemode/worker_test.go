@@ -228,12 +228,182 @@ func TestWorkerEnvironmentIsBare(t *testing.T) {
 
 func TestLimitsText(t *testing.T) {
 	rt := New(newFake(), Limits{})
-	if got := rt.LimitsText(); got != "Limits per run: 5 minutes wall clock, 100 tool calls, 1 MiB of output, 512 MiB of memory." {
+	if got := rt.LimitsText(); got != "Limits per run: 5 minutes wall clock, 100 tool calls, 1 MiB of output, 160 MiB of memory." {
 		t.Fatalf("LimitsText = %q", got)
 	}
+	// MaxOutputBytes is clamped to the 2 MiB cap and the text says so.
 	rt = New(newFake(), Limits{ScriptTimeout: 90 * time.Second, MaxCalls: 7, MaxOutputBytes: 3 << 20})
 	rt.SetWorker(Worker{MemoryMiB: 128})
-	if got := rt.LimitsText(); got != "Limits per run: 1m30s wall clock, 7 tool calls, 3 MiB of output, 128 MiB of memory." {
+	if got := rt.LimitsText(); got != "Limits per run: 1m30s wall clock, 7 tool calls, 2 MiB of output, 128 MiB of memory." {
 		t.Fatalf("LimitsText = %q", got)
+	}
+}
+
+// shWorker is a fake worker: a shell script standing in for the child.
+func shWorker(script string) func(*Worker) {
+	return func(w *Worker) {
+		w.Path = "/bin/sh"
+		w.Args = []string{"-c", script}
+		w.Env = nil
+	}
+}
+
+// expectClean checks that a run that went wrong left nothing behind: the
+// worker is gone and its concurrency slot is free.
+func expectClean(t *testing.T, rt *Runtime, took time.Duration) {
+	t.Helper()
+	if took > 5*time.Second {
+		t.Fatalf("run took %s", took)
+	}
+	if pid := int(rt.lastPID.Load()); pid != 0 && !processGone(pid) {
+		t.Fatalf("worker %d is still alive", pid)
+	}
+	if n := len(rt.sem); n != 0 {
+		t.Fatalf("%d concurrency slots still held", n)
+	}
+}
+
+// TestWorkerOversizedResultIsError: the review's repro. A huge returned
+// value is refused in the worker before it is written, so neither side
+// ever blocks on the pipe, and the run ends at once with the slot free.
+func TestWorkerOversizedResultIsError(t *testing.T) {
+	f := newFake()
+	bothWays(t, f, Limits{}, func(t *testing.T, rt *Runtime) {
+		if !rt.inProcess {
+			rt.SetWorker(testWorker())
+		}
+		start := time.Now()
+		text, failed := rt.ExecuteToolCode(context.Background(), `result = "x" * (66 << 20)`, "")
+		if !failed || !strings.Contains(text, "result is 69206016 bytes; a returned value may be at most 1 MiB") {
+			t.Fatalf("oversized result (failed=%v):\n%s", failed, text)
+		}
+		expectClean(t, rt, time.Since(start))
+		// The structured form is measured after encoding.
+		text, failed = rt.ExecuteToolCode(context.Background(), `result = {"k": ["y" * 1000] * 2000}`, "")
+		if !failed || !strings.Contains(text, "a returned value may be at most 1 MiB") {
+			t.Fatalf("oversized structured result (failed=%v):\n%s", failed, text)
+		}
+		// Just under the cap is fine.
+		text, failed = rt.ExecuteToolCode(context.Background(), `result = "z" * 1000000`, "")
+		if failed || !strings.Contains(text, "Return value: \"zzz") {
+			t.Fatalf("result under the cap (failed=%v):\n%.200s", failed, text)
+		}
+	})
+}
+
+func TestOversizedCallArgumentsAndResultsAreErrors(t *testing.T) {
+	f := newFake()
+	f.handlers["BkCoreServices.get-all-clients"] = func(map[string]any) (*mcp.CallToolResult, error) {
+		return mcp.NewToolResultText(strings.Repeat("r", 7<<20)), nil
+	}
+	bothWays(t, f, Limits{}, func(t *testing.T, rt *Runtime) {
+		f.reset()
+		text, failed := rt.ExecuteToolCode(context.Background(), `result = BkCoreServices.get_client(clientId="a" * (5 << 20))`, "")
+		if !failed || !strings.Contains(text, "arguments to BkCoreServices.get_client are 5242895 bytes; one call may pass at most 4 MiB") {
+			t.Fatalf("oversized arguments (failed=%v):\n%.400s", failed, text)
+		}
+		if len(f.seen()) != 0 {
+			t.Fatalf("an oversized call reached RouteCall: %d calls", len(f.seen()))
+		}
+		text, failed = rt.ExecuteToolCode(context.Background(), `result = BkCoreServices.get_all_clients()`, "")
+		if !failed || !strings.Contains(text, "tool call failed for BkCoreServices.get_all_clients: the result is 7340032 bytes, more than code mode passes to a script (limit 6 MiB)") {
+			t.Fatalf("oversized tool result (failed=%v):\n%.400s", failed, text)
+		}
+		expectClean(t, rt, 0)
+	})
+}
+
+// TestWorkerOverlongLineIsKilled: a child that writes past the line limit
+// is blocked on a pipe the parent stopped reading. The parent kills it and
+// reports, instead of waiting for it.
+func TestWorkerOverlongLineIsKilled(t *testing.T) {
+	rt := workerRuntime(newFake(), Limits{}, shWorker(`head -c 20000000 /dev/zero | tr "\0" x; echo; sleep 30`))
+	start := time.Now()
+	text, failed := rt.ExecuteToolCode(context.Background(), "result = 1", "")
+	if !failed || !strings.Contains(text, "script worker crashed (it sent a message over the 8 MiB line limit)") {
+		t.Fatalf("overlong line (failed=%v):\n%s", failed, text)
+	}
+	expectClean(t, rt, time.Since(start))
+}
+
+// TestWorkerNotReadingStdinDoesNotHang: a child that asks for a call and
+// never reads the answer cannot hold the parent on the pipe; the deadline
+// ends the run and the child.
+func TestWorkerNotReadingStdinDoesNotHang(t *testing.T) {
+	f := newFake()
+	f.handlers["BkCoreServices.get_client"] = func(map[string]any) (*mcp.CallToolResult, error) {
+		return mcp.NewToolResultText(strings.Repeat("big", 100000)), nil
+	}
+	call := `{"type":"call","id":1,"server":"BkCoreServices","member":"get_client","args":{"clientId":"x"}}`
+	rt := workerRuntime(f, Limits{ScriptTimeout: 400 * time.Millisecond}, shWorker(`echo '`+call+`'; sleep 30`))
+	start := time.Now()
+	text, failed := rt.ExecuteToolCode(context.Background(), "result = 1", "")
+	if !failed || !strings.Contains(text, "script stopped: context deadline exceeded (limit 400ms)") {
+		t.Fatalf("stuck stdin (failed=%v):\n%s", failed, text)
+	}
+	expectClean(t, rt, time.Since(start))
+	// Same for a child that never reads the start message.
+	rt = workerRuntime(f, Limits{ScriptTimeout: 400 * time.Millisecond}, shWorker(`sleep 30`))
+	start = time.Now()
+	text, failed = rt.ExecuteToolCode(context.Background(), "result = 1", "")
+	if !failed || !strings.Contains(text, "script stopped: context deadline exceeded (limit 400ms)") {
+		t.Fatalf("silent child (failed=%v):\n%s", failed, text)
+	}
+	expectClean(t, rt, time.Since(start))
+}
+
+// TestWorkerSlotsSurviveFailures: four bad runs in a row leave code mode
+// as available as before.
+func TestWorkerSlotsSurviveFailures(t *testing.T) {
+	rt := workerRuntime(newFake(), Limits{ScriptTimeout: 300 * time.Millisecond}, func(w *Worker) { w.MaxConcurrent = 2; w.AcquireWait = 100 * time.Millisecond })
+	for i := 0; i < 4; i++ {
+		rt.SetWorker(func() Worker {
+			w := testWorker()
+			w.MaxConcurrent, w.AcquireWait = 2, 100*time.Millisecond
+			if i%2 == 1 {
+				shWorker(`head -c 20000000 /dev/zero | tr "\0" x; echo; sleep 30`)(&w)
+			}
+			return w
+		}())
+		code := `result = "x" * (66 << 20)`
+		text, failed := rt.ExecuteToolCode(context.Background(), code, "")
+		if !failed {
+			t.Fatalf("run %d should fail:\n%s", i, text)
+		}
+		expectClean(t, rt, 0)
+	}
+	rt.SetWorker(testWorker())
+	if text, failed := rt.ExecuteToolCode(context.Background(), "result = 1", ""); failed {
+		t.Fatalf("after four failures:\n%s", text)
+	}
+}
+
+// TestWorkerCapSetupFailureIsClear: a worker that cannot apply its memory
+// cap, or is killed by a syscall filter trying, is reported as exactly that.
+func TestWorkerCapSetupFailureIsClear(t *testing.T) {
+	rt := workerRuntime(newFake(), Limits{}, shWorker(`echo "codemode-worker: memory cap: operation not permitted" >&2; exit 1`))
+	text, failed := rt.ExecuteToolCode(context.Background(), "result = 1", "")
+	want := "code mode worker could not apply its memory cap (codemode-worker: memory cap: operation not permitted); if toolyard runs under systemd with SystemCallFilter, allow setrlimit and prlimit64"
+	if !failed || !strings.Contains(text, want) {
+		t.Fatalf("cap failure (failed=%v):\n%s", failed, text)
+	}
+	rt = workerRuntime(newFake(), Limits{}, shWorker(`kill -SYS $$`))
+	text, failed = rt.ExecuteToolCode(context.Background(), "result = 1", "")
+	if !failed || !strings.Contains(text, "code mode worker could not apply its memory cap (signal: bad system call") {
+		t.Fatalf("SIGSYS (failed=%v):\n%s", failed, text)
+	}
+	expectClean(t, rt, 0)
+}
+
+func TestOutputLimitIsClamped(t *testing.T) {
+	rt := New(newFake(), Limits{MaxOutputBytes: 100 << 20})
+	if rt.Limits().MaxOutputBytes != maxOutputCap {
+		t.Fatalf("MaxOutputBytes = %d, want the %d cap", rt.Limits().MaxOutputBytes, maxOutputCap)
+	}
+	// A single print past a megabyte is cut, never a protocol failure.
+	rt = workerRuntime(newFake(), Limits{MaxOutputBytes: maxOutputCap}, nil)
+	text, failed := rt.ExecuteToolCode(context.Background(), `print("p" * (3 << 20))`+"\nresult = 1", "")
+	if failed || !strings.Contains(text, "… [print truncated]") {
+		t.Fatalf("huge print (failed=%v):\n%.300s", failed, text)
 	}
 }

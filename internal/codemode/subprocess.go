@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os/exec"
 	"strings"
@@ -16,15 +17,34 @@ import (
 // environment, feed it the start message, answer its calls through the
 // session, collect prints and the outcome, and turn any death of the child
 // into a clean script error.
+//
+// Every wait on the child is bounded. A child whose stdout ends without an
+// outcome is killed whatever it is doing (a message past the line limit
+// leaves it blocked on a pipe nobody reads any more); every write to the
+// child gives up at the script deadline; Wait has exec.Cmd.WaitDelay
+// behind it. Nothing here holds the handler, the concurrency slot, the
+// process or its pipes past the script's clock.
 
-// stderrCap bounds how much of the worker's stderr is kept for diagnostics.
-const stderrCap = 64 << 10
+const (
+	// stderrCap bounds how much of the worker's stderr is kept for
+	// diagnostics.
+	stderrCap = 64 << 10
+	// exitGrace is how long a worker that reported its outcome gets to
+	// exit on its own before it is killed.
+	exitGrace = 2 * time.Second
+	// waitDelay bounds Wait once the process is gone (pipes a stray
+	// grandchild might still hold open).
+	waitDelay = 3 * time.Second
+)
 
 // runInWorker executes start in a child process. The session performs the
 // nested calls; the returned result carries the script's outcome or the
 // reason the worker did not deliver one.
 func (r *Runtime) runInWorker(ctx context.Context, s *session, start startMsg, stopNote string) scriptResult {
 	runtimeErr := func(msg string) scriptResult { return scriptResult{errKind: "runtime", errMsg: msg} }
+	stopped := func() scriptResult {
+		return runtimeErr(fmt.Sprintf("script stopped: %v (%s)", ctx.Err(), stopNote))
+	}
 
 	// A slot, or busy.
 	select {
@@ -32,7 +52,7 @@ func (r *Runtime) runInWorker(ctx context.Context, s *session, start startMsg, s
 	case <-time.After(r.worker.AcquireWait):
 		return runtimeErr(fmt.Sprintf("code mode is busy: %d scripts are already running; try again in a moment", r.worker.MaxConcurrent))
 	case <-ctx.Done():
-		return runtimeErr(fmt.Sprintf("script stopped: %v (%s)", ctx.Err(), stopNote))
+		return stopped()
 	}
 	defer func() { <-r.sem }()
 
@@ -41,7 +61,9 @@ func (r *Runtime) runInWorker(ctx context.Context, s *session, start startMsg, s
 		return runtimeErr("could not start the script worker: " + err.Error())
 	}
 	mib := r.worker.MemoryMiB
-	cmd := exec.Command(path, r.worker.Args...)
+	cmd := exec.CommandContext(ctx, path, r.worker.Args...)
+	cmd.Cancel = func() error { killGroup(cmd); return nil }
+	cmd.WaitDelay = waitDelay
 	cmd.Env = append(append([]string(nil), r.worker.Env...),
 		fmt.Sprintf("%s=%d", MemoryEnv, mib),
 		fmt.Sprintf("GOMEMLIMIT=%dMiB", mib*3/4),
@@ -65,16 +87,19 @@ func (r *Runtime) runInWorker(ctx context.Context, s *session, start startMsg, s
 	}
 	r.lastPID.Store(int64(cmd.Process.Pid))
 
-	// The reader hands messages over until the child's stdout closes.
+	// The reader hands messages over until the child's stdout ends or a
+	// message breaks the line limit; readErr says which.
 	msgs := make(chan childMsg)
 	readerDone := make(chan struct{})
 	stop := make(chan struct{})
+	var readErr error
 	go func() {
 		defer close(readerDone)
 		br := bufio.NewReaderSize(stdout, 64<<10)
 		for {
 			line, err := readLine(br)
 			if err != nil {
+				readErr = err
 				return
 			}
 			var m childMsg
@@ -89,43 +114,66 @@ func (r *Runtime) runInWorker(ctx context.Context, s *session, start startMsg, s
 		}
 	}()
 
-	// finish tears the child down: stop the reader, make sure the process
-	// is gone, reap it. Called once on every path out.
+	// finish tears the child down. Without an outcome the child is killed
+	// at once; with one it gets exitGrace to leave on its own. Wait is
+	// bounded by WaitDelay. Called once on every path out.
 	var once sync.Once
 	var waitErr error
-	finish := func(kill bool) {
+	finish := func(gotOutcome bool) {
 		once.Do(func() {
 			close(stop)
 			_ = stdin.Close()
-			if kill {
+			if !gotOutcome {
 				killGroup(cmd)
 			}
 			select {
 			case <-readerDone:
-			case <-time.After(3 * time.Second):
+			case <-time.After(exitGrace):
 				killGroup(cmd)
-				<-readerDone
+				select {
+				case <-readerDone:
+				case <-time.After(exitGrace):
+				}
 			}
 			waitErr = cmd.Wait()
 		})
 	}
-	defer finish(true)
+	defer finish(false)
 
-	enc := json.NewEncoder(stdin)
-	if err := enc.Encode(start); err != nil {
-		finish(true)
-		return runtimeErr("could not start the script worker: " + err.Error())
+	// write sends one message, giving up at the deadline: a child that has
+	// stopped reading cannot hold the parent on a full pipe.
+	write := func(v any) error {
+		b, err := json.Marshal(v)
+		if err != nil {
+			return err
+		}
+		b = append(b, '\n')
+		errc := make(chan error, 1)
+		go func() {
+			_, err := stdin.Write(b)
+			errc <- err
+		}()
+		select {
+		case err := <-errc:
+			return err
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+	if err := write(start); err != nil {
+		finish(false)
+		if ctx.Err() != nil {
+			return stopped()
+		}
+		return r.workerDied(ctx, stopNote, waitErr, readErr, stderr.String())
 	}
 
 	for {
 		select {
 		case <-ctx.Done():
-			finish(true)
-			return runtimeErr(fmt.Sprintf("script stopped: %v (%s)", ctx.Err(), stopNote))
-		case m, ok := <-msgs:
-			if !ok {
-				continue
-			}
+			finish(false)
+			return stopped()
+		case m := <-msgs:
 			switch m.Type {
 			case msgPrint:
 				s.print(m.Text)
@@ -141,47 +189,65 @@ func (r *Runtime) runInWorker(ctx context.Context, s *session, start startMsg, s
 				select {
 				case reply = <-replies:
 				case <-ctx.Done():
-					finish(true)
-					return runtimeErr(fmt.Sprintf("script stopped: %v (%s)", ctx.Err(), stopNote))
+					finish(false)
+					return stopped()
 				}
 				reply.Type, reply.ID = msgResult, m.ID
-				if err := enc.Encode(reply); err != nil {
-					finish(true)
-					return r.workerDied(ctx, stopNote, waitErr, stderr.String())
+				if err := write(reply); err != nil {
+					finish(false)
+					if ctx.Err() != nil {
+						return stopped()
+					}
+					return r.workerDied(ctx, stopNote, waitErr, readErr, stderr.String())
 				}
 			case msgDone:
-				finish(false)
+				finish(true)
 				return scriptResult{result: m.Result, hasResult: m.HasResult}
 			case msgError:
-				finish(false)
+				finish(true)
 				return scriptResult{errKind: m.Kind, errMsg: m.Message}
 			}
 		case <-readerDone:
-			// The child ended without an outcome.
+			// The child ended, or broke the protocol, without an outcome.
 			finish(false)
-			return r.workerDied(ctx, stopNote, waitErr, stderr.String())
+			return r.workerDied(ctx, stopNote, waitErr, readErr, stderr.String())
 		}
 	}
 }
 
-// workerDied explains a child that exited without reporting an outcome.
-func (r *Runtime) workerDied(ctx context.Context, stopNote string, waitErr error, stderr string) scriptResult {
+// workerDied explains a child that delivered no outcome.
+func (r *Runtime) workerDied(ctx context.Context, stopNote string, waitErr, readErr error, stderr string) scriptResult {
+	fail := func(msg string) scriptResult { return scriptResult{errKind: "runtime", errMsg: msg} }
 	if ctx.Err() != nil {
-		return scriptResult{errKind: "runtime", errMsg: fmt.Sprintf("script stopped: %v (%s)", ctx.Err(), stopNote)}
+		return fail(fmt.Sprintf("script stopped: %v (%s)", ctx.Err(), stopNote))
 	}
-	if strings.Contains(stderr, "out of memory") || strings.Contains(stderr, "cannot allocate memory") {
-		return scriptResult{errKind: "runtime", errMsg: fmt.Sprintf(
+	waitText := ""
+	if waitErr != nil {
+		waitText = waitErr.Error()
+	}
+	switch {
+	case strings.Contains(stderr, "codemode-worker: memory cap") || strings.Contains(waitText, "bad system call"):
+		detail := firstLine(stderr)
+		if detail == "" {
+			detail = waitText
+		}
+		return fail("code mode worker could not apply its memory cap (" + detail + "); " +
+			"if toolyard runs under systemd with SystemCallFilter, allow setrlimit and prlimit64")
+	case strings.Contains(stderr, "out of memory") || strings.Contains(stderr, "cannot allocate memory"):
+		return fail(fmt.Sprintf(
 			"script exceeded the memory limit (%d MiB) and was stopped; work on less data at a time, or let the tool filter before returning",
-			r.worker.MemoryMiB)}
+			r.worker.MemoryMiB))
+	case errors.Is(readErr, errLineTooLong):
+		return fail("script worker crashed (it sent a message over the " + errLineTooLong.Error()[len("message exceeds the "):] + ")")
 	}
 	detail := "exited without a result"
-	if waitErr != nil {
-		detail = waitErr.Error()
+	if waitText != "" {
+		detail = waitText
 	}
 	if line := firstLine(stderr); line != "" {
 		detail += ": " + line
 	}
-	return scriptResult{errKind: "runtime", errMsg: "script worker crashed (" + detail + ")"}
+	return fail("script worker crashed (" + detail + ")")
 }
 
 func firstLine(s string) string {

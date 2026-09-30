@@ -14,6 +14,8 @@ func applyMemoryCap(int) error { return errors.New("no memory cap available on t
 
 func applyCPUCap(time.Duration) {}
 
+func preferOOMKill() {}
+
 func ownProcessGroup(*exec.Cmd) {}
 
 func killGroup(cmd *exec.Cmd) {

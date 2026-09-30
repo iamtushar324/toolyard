@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"math/big"
+	"sort"
 	"strings"
 
 	"go.starlark.net/starlark"
@@ -52,9 +53,16 @@ func toStarlark(v any) starlark.Value {
 		}
 		return starlark.NewList(items)
 	case map[string]any:
+		// Sorted keys: Starlark dicts keep insertion order, so a decoded
+		// result prints the same way every run (Bifrost marshals sorted too).
+		keys := make([]string, 0, len(val))
+		for k := range val {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
 		d := starlark.NewDict(len(val))
-		for k, item := range val {
-			_ = d.SetKey(starlark.String(k), toStarlark(item))
+		for _, k := range keys {
+			_ = d.SetKey(starlark.String(k), toStarlark(val[k]))
 		}
 		return d
 	}

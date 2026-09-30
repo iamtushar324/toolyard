@@ -127,7 +127,13 @@ func (s *session) handleCall(serverIdent, member string, args map[string]any) pa
 		s.log(fmt.Sprintf("[TOOL] %s error result: %s", label, text))
 		return fail(fmt.Sprintf("tool call failed for %s: %s", label, text))
 	}
-	quoted, _ := jsonText(text, "")
+	quoted, err := jsonText(text, "")
+	if err != nil || len(quoted) > maxCallResultBytes {
+		msg := fmt.Sprintf("the result is %d bytes, more than code mode passes to a script (limit %d MiB); ask the tool for less data, or page through it",
+			len(text), maxCallResultBytes>>20)
+		s.log(fmt.Sprintf("[TOOL] %s error: %s", label, msg))
+		return fail(fmt.Sprintf("tool call failed for %s: %s", label, msg))
+	}
 	s.log(fmt.Sprintf("[TOOL] %s raw response: %s", label, quoted))
 	return parentMsg{Text: text}
 }
