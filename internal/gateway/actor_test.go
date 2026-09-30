@@ -350,7 +350,8 @@ func TestPolicyDeciderOnAuditRows(t *testing.T) {
 }
 
 // A call run under an inbox grant records the grant as the instrument and
-// the owner who issued it as the decider.
+// the owner who issued it as the decider, by user id, email and name, the
+// same person the inbox.decide row names.
 func TestGrantUseDecider(t *testing.T) {
 	f := newActorFixture(t)
 	ctx := context.Background()
@@ -364,7 +365,7 @@ func TestGrantUseDecider(t *testing.T) {
 		t.Fatalf("submit: %v %+v", err, sub)
 	}
 	f.svc.Flush()
-	alice := actor.Decider{UserID: "u_alice", Name: "Alice", Via: actor.ViaDashboard}
+	alice := actor.Decider{UserID: "u_alice", Email: "alice@example.com", Name: "Alice", Via: actor.ViaDashboard}
 	if _, err := f.svc.Decide(ctx, sub.RequestID, inbox.Decision{Action: "approve", Allow: []bool{true}, Decider: alice}); err != nil {
 		t.Fatal(err)
 	}
@@ -381,6 +382,9 @@ func TestGrantUseDecider(t *testing.T) {
 	row, ok := findAudit(f.drainAudit(), audit.EventCallAllowed, "t.run")
 	if !ok || row.Decision != "grant" || row.DecidedVia != actor.ViaInboxGrant || row.DeciderRef != grantID || row.DecidedByUserID != "u_alice" {
 		t.Fatalf("grant row: %+v", row)
+	}
+	if row.DecidedByEmail != "alice@example.com" || row.DecidedByName != "Alice" {
+		t.Fatalf("grant row decider email/name = %q/%q, want alice@example.com/Alice", row.DecidedByEmail, row.DecidedByName)
 	}
 	ev := f.lastMetric(t, "t.run")
 	if ev.ApprovalVia != "grant" || ev.ApprovalDecider != "u_alice" || ev.ApprovalID != grantID {

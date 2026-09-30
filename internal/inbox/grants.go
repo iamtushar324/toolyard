@@ -61,6 +61,17 @@ type Grant struct {
 	// grants from before they were recorded).
 	IssuedBy  string `json:"issued_by,omitempty"`
 	RevokedBy string `json:"revoked_by,omitempty"`
+	// IssuedByEmail and IssuedByName are the issuing owner's email and
+	// name as recorded on the request they decided, the record the
+	// inbox.decide audit row names. Only Redeem fills them.
+	IssuedByEmail string `json:"-"`
+	IssuedByName  string `json:"-"`
+}
+
+// Decider is who authorised a call run under g: the grant is the
+// instrument and the owner who issued it is the person.
+func (g *Grant) Decider() actor.Decider {
+	return actor.Decider{UserID: g.IssuedBy, Email: g.IssuedByEmail, Name: g.IssuedByName, Via: actor.ViaInboxGrant, Ref: g.ID}
 }
 
 // Redemption failures. The gateway turns these into a grant_invalid result
@@ -180,7 +191,8 @@ func (s *Service) issueGrants(ctx context.Context, tx *sql.Tx, r *Request, now i
 
 // Redeem checks a grant token for one call and, if it's valid, uses it up.
 // The use counter is incremented with a conditional UPDATE, so two
-// concurrent calls can't both redeem a single-use grant.
+// concurrent calls can't both redeem a single-use grant. The returned
+// grant carries the issuer's email and name (see Grant.Decider).
 func (s *Service) Redeem(ctx context.Context, token, agentID, tool string, args map[string]any) (*Grant, error) {
 	id, sig, err := parseToken(token)
 	if err != nil {
@@ -234,9 +246,17 @@ func (s *Service) Redeem(ctx context.Context, token, agentID, tool string, args 
 	return g, nil
 }
 
-// noteGrantUse records the use on the request's activity timeline.
+// noteGrantUse records the use on the request's activity timeline, and
+// copies the issuer's email and name onto g from the request it loads for
+// that, so naming the decider costs no extra query.
 func (s *Service) noteGrantUse(ctx context.Context, g *Grant, args map[string]any) {
 	_ = s.mutate(ctx, g.RequestID, func(r *Request) error {
+		// issued_by was stamped from this request's decider; a different
+		// user id means the request no longer names the grant's issuer, so
+		// leave the fields empty rather than name someone else.
+		if d := r.Decider(); d.UserID == g.IssuedBy {
+			g.IssuedByEmail, g.IssuedByName = d.Email, d.Name
+		}
 		text := "Used " + g.Tool
 		for k, c := range g.Params {
 			if c.Op == "limit" {

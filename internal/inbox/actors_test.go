@@ -73,6 +73,43 @@ func TestDecisionRecordsDecider(t *testing.T) {
 	}
 }
 
+// A redeemed grant names its issuer by user id, email and name, read off
+// the request they decided (the record the inbox.decide audit row uses),
+// so the gateway's call row can say who authorised the call. When the
+// request doesn't name the grant's issuer, the grant names no one else.
+func TestRedeemNamesIssuer(t *testing.T) {
+	e := newEnv(t)
+	ctx := context.Background()
+	r := submitDeploy(t, e, "ag_1")
+	alice := actor.Decider{UserID: "u_alice", Email: "alice@example.com", Name: "Alice", Via: actor.ViaDashboard}
+	if _, err := e.svc.Decide(ctx, r.ID, Decision{Action: "approve", Allow: []bool{true, true, false}, Decider: alice}); err != nil {
+		t.Fatal(err)
+	}
+	views, err := e.svc.Status(ctx, "ag_1", []string{r.ID})
+	if err != nil || len(views) != 1 || views[0].Tools[0].Grant == "" || views[0].Tools[1].Grant == "" {
+		t.Fatalf("status: %v %+v", err, views)
+	}
+	g, err := e.svc.Redeem(ctx, views[0].Tools[0].Grant, "ag_1", "db.migrate", map[string]any{"env": "prod", "migration": "0042"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := actor.Decider{UserID: "u_alice", Email: "alice@example.com", Name: "Alice", Via: actor.ViaInboxGrant, Ref: g.ID}
+	if g.Decider() != want {
+		t.Fatalf("grant decider = %+v, want %+v", g.Decider(), want)
+	}
+
+	if _, err := e.svc.db.ExecContext(ctx, `UPDATE inbox_grants SET issued_by = ? WHERE id = ?`, "u_other", views[0].Tools[1].GrantID); err != nil {
+		t.Fatal(err)
+	}
+	g, err = e.svc.Redeem(ctx, views[0].Tools[1].Grant, "ag_1", "deploy.run", map[string]any{"service": "api", "env": "prod", "ref": "7c1d2e9"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d := g.Decider(); d.UserID != "u_other" || d.Email != "" || d.Name != "" {
+		t.Fatalf("mismatched issuer decider = %+v, want u_other with no email or name", d)
+	}
+}
+
 // Without a structured decider, By (a username) still names the person
 // and the instrument defaults to the dashboard; with nothing at all the
 // wording stays "You".
