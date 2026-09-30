@@ -99,3 +99,39 @@ func TestEnforceOriginOnMutationsAgentRoutes(t *testing.T) {
 		}
 	}
 }
+
+// /mcp authenticated by a token header skips the Origin check whether the
+// token arrives as a bearer or in x-bf-vk (the header T3's Bifrost proxy
+// sends, with no Origin): neither is a cookie, so neither is
+// CSRF-replayable. /mcp with neither header, or a cookie, still needs a
+// matching Origin.
+func TestEnforceOriginOnMutationsMCPTokenHeaders(t *testing.T) {
+	const public = "https://toolyard.example.com"
+	s := &Server{security: SecurityOptions{PublicURL: public}}
+	h := s.EnforceOriginOnMutations(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+
+	cases := []struct {
+		name    string
+		headers map[string]string
+		want    int
+	}{
+		{"bearer", map[string]string{"Authorization": "Bearer ag_x.y"}, http.StatusNoContent},
+		{"x-bf-vk", map[string]string{"x-bf-vk": "ag_x.y"}, http.StatusNoContent},
+		{"empty x-bf-vk", map[string]string{"x-bf-vk": "  "}, http.StatusForbidden},
+		{"no token", nil, http.StatusForbidden},
+		{"cookie only", map[string]string{"Cookie": "toolyard_session=abc"}, http.StatusForbidden},
+	}
+	for _, c := range cases {
+		req := httptest.NewRequest(http.MethodPost, "/mcp", nil)
+		for k, v := range c.headers {
+			req.Header.Set(k, v)
+		}
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if rec.Code != c.want {
+			t.Errorf("POST /mcp %s: got %d, want %d", c.name, rec.Code, c.want)
+		}
+	}
+}
