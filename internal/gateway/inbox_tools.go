@@ -12,7 +12,6 @@ import (
 	"github.com/mark3labs/mcp-go/mcp"
 
 	"github.com/tusharbhardwaj/toolyard/docs"
-	"github.com/tusharbhardwaj/toolyard/internal/actor"
 	"github.com/tusharbhardwaj/toolyard/internal/audit"
 	"github.com/tusharbhardwaj/toolyard/internal/inbox"
 	"github.com/tusharbhardwaj/toolyard/internal/metrics"
@@ -198,8 +197,9 @@ func (g *Gateway) redeemAndDispatch(ctx context.Context, entry toolEntry, args m
 		ev.ErrorClass = "grant_invalid"
 		return grantInvalidResponse(entry, args, re), nil
 	}
-	// The grant is the instrument; the owner who issued it is the decider.
-	decider := actor.Decider{Via: actor.ViaInboxGrant, Ref: gr.ID, UserID: gr.IssuedBy}
+	// The grant is the instrument; the owner who issued it is the decider,
+	// named by the email and name Redeem read off their decision.
+	decider := gr.Decider()
 	allowed := audit.Event{
 		EventType:    audit.EventCallAllowed,
 		AgentID:      agentID,
