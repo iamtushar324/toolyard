@@ -113,6 +113,51 @@ Persistent data lives in the named volume `toolyard-data`. Pass
    Conductor workspaces use the same hook config as the agent type they run
    (Claude Code or Codex); there is no separate Conductor hook endpoint.
 
+## Code mode (Bifrost-compatible)
+
+Agents and skills written for the Bifrost MCP gateway's code mode work
+unchanged against toolyard: the four tools `listToolFiles`, `readToolFile`,
+`getToolDocs` and `executeToolCode` are always on, need no `_reason`, and
+use the same stub format and output shapes. In code a server is its upstream
+name (`BkCoreServices.get_client(clientId="vai-us")`); every call a script
+makes goes through the normal pipeline (access, policy, approvals, identity
+forwarding, audit) under via `code_mode`, so a held or denied call aborts the
+script with the gateway's answer. Names that are not Starlark identifiers are
+bound under a sanitised one (`bk-core` becomes `bk_core`; the stubs say so).
+
+### The script worker
+
+Each `executeToolCode` run happens in a child process: the gateway starts its
+own binary again as `toolyard codemode-worker`, with an empty environment
+(no `.env`, no tokens), and talks to it over stdin and stdout. The child only
+asks the parent to make tool calls; the parent makes them. The child caps its
+own memory (`RLIMIT_DATA`, default 256 MiB, four workers at once), marks itself
+first in line for the kernel's OOM killer, and is killed at the script's wall
+clock (5 minutes). A script that allocates past the cap, spins, or crashes the
+interpreter costs itself the run and nothing else. Defaults are in
+`internal/codemode` (`DefaultLimits`, `DefaultWorker`); the executeToolCode
+tool description states the limits that are enforced.
+
+Two things to know when hardening the unit:
+
+- **It is a resource boundary, not a privilege boundary.** The worker runs
+  as the same user, in the same namespaces, with the same filesystem view
+  as the gateway. Starlark has no filesystem or network access, but a flaw in
+  the interpreter itself would let a script read what the gateway can read,
+  including the data directory. If that matters, isolate the whole service
+  (a container, or `DynamicUser=` and `ProtectSystem=strict`).
+- **`SystemCallFilter` must allow `setrlimit` and `prlimit64`.** The shipped
+  units (`deploy/toolyard.service`, the strict tier in `deploy/install.sh`)
+  deny `@resources` and then allow these two back. Without them the worker
+  dies with `SIGSYS` and every script fails with "code mode worker could not
+  apply its memory cap".
+
+Size `MemoryMax=` for the gateway plus the workers: four at 256 MiB is
+1 GiB, and the shipped units use `MemoryMax=1536M` / `MemoryHigh=1280M`.
+Decoding a tool result into script values takes many times the JSON's size;
+256 MiB is what lets a result at the 6 MiB cap decode, so lowering the cap
+means smaller results, not just fewer of them.
+
 ## Adding upstream MCP servers
 
 Create `upstreams.json`:

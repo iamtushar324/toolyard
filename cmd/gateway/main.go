@@ -45,6 +45,7 @@ import (
 	"github.com/tusharbhardwaj/toolyard/internal/chatnotify"
 	"github.com/tusharbhardwaj/toolyard/internal/chatnotify/telegram"
 	"github.com/tusharbhardwaj/toolyard/internal/clerk"
+	"github.com/tusharbhardwaj/toolyard/internal/codemode"
 	"github.com/tusharbhardwaj/toolyard/internal/crashdump"
 	"github.com/tusharbhardwaj/toolyard/internal/events"
 	"github.com/tusharbhardwaj/toolyard/internal/gateway"
@@ -82,6 +83,14 @@ import (
 var version = "dev"
 
 func main() {
+	// The code-mode script worker: the gateway starts this binary again,
+	// with a bare environment, to run one agent script in a process of its
+	// own (internal/codemode). It runs before loadDotenv so no secret from
+	// a .env reaches the process that executes agent code.
+	if len(os.Args) > 1 && os.Args[1] == "codemode-worker" {
+		os.Exit(codemode.WorkerMain(os.Stdin, os.Stdout, os.Stderr))
+	}
+
 	// Auto-load .env from CWD (and, if present, a .env next to the
 	// binary) before any os.Getenv lookup runs. Real exported env vars
 	// still win — godotenv.Load only fills *unset* keys — so a CI/prod

@@ -438,7 +438,10 @@ RestrictNamespaces=true
 ProtectProc=invisible
 SystemCallArchitectures=native
 SystemCallFilter=@system-service
-SystemCallFilter=~@privileged @resources"
+SystemCallFilter=~@privileged @resources
+# The code-mode script worker caps its own memory with setrlimit, which
+# @resources denies; allow the two calls back or every script fails.
+SystemCallFilter=setrlimit prlimit64"
 else
   # Loose tier — stdio upstreams compatible.
   # Dropped vs strict tier:
@@ -511,11 +514,13 @@ RestrictSUIDSGID=true
 $TIER_FLAGS
 ReadWritePaths=$DATA_DIR
 
-# Resource caps.
+# Resource caps. Code-mode scripts run in worker processes, up to four at
+# 256 MiB each (1 GiB together), inside this limit; size it for the gateway
+# (a few hundred MiB) plus those.
 LimitNOFILE=8192
 TasksMax=1024
-MemoryMax=1G
-MemoryHigh=768M
+MemoryMax=1536M
+MemoryHigh=1280M
 
 # Graceful stop: SIGINT triggers context cancel + 5s drain in main.go.
 KillSignal=SIGINT

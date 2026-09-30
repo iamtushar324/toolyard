@@ -19,6 +19,7 @@ import (
 	"github.com/tusharbhardwaj/toolyard/internal/actor"
 	"github.com/tusharbhardwaj/toolyard/internal/approval"
 	"github.com/tusharbhardwaj/toolyard/internal/audit"
+	"github.com/tusharbhardwaj/toolyard/internal/codemode"
 	"github.com/tusharbhardwaj/toolyard/internal/inbox"
 	"github.com/tusharbhardwaj/toolyard/internal/lake"
 	"github.com/tusharbhardwaj/toolyard/internal/memory"
@@ -115,6 +116,14 @@ type toolEntry struct {
 	// auto-allowed). The intent_category supplied by the agent is ignored
 	// when forcedAction is set.
 	forcedAction *policy.Action
+	// reasonOptional lets a call omit _reason. Set on the code-mode tools,
+	// whose clients are configured for Bifrost and never send one; the
+	// nested calls a script makes still carry a reason.
+	reasonOptional bool
+	// noCallTimeout exempts the dispatch from upstreamCallTimeout for a
+	// tool that enforces its own, longer deadline (executeToolCode). The
+	// calls it makes in turn are still capped through their own dispatch.
+	noCallTimeout bool
 }
 
 // Gateway stitches the MCP server, policy, approval bus, memory, and upstream
@@ -144,6 +153,10 @@ type Gateway struct {
 	inbox        *inbox.Service
 	guide        *inbox.Guide
 	approvalMode func() string
+
+	// codeMode backs the Bifrost-compatible listToolFiles / readToolFile /
+	// getToolDocs / executeToolCode tools (codemode_tools.go).
+	codeMode *codemode.Runtime
 
 	// maxLiveUpstreams caps how many upstream connections are alive
 	// simultaneously. 0 = unbounded. When the cap is hit and a new
@@ -472,13 +485,15 @@ func (g *Gateway) NotifyToolListChanged() {
 func (g *Gateway) MCPServer() *server.MCPServer { return g.mcp }
 
 // RegisterBuiltins wires the built-in memory tools, the meta-tools
-// (tools.search / tools.execute), the fixture echo tool, and (if a Lake is
-// configured) the lake.* personal-data-warehouse tools into the MCP server.
+// (tools.search / tools.execute), the Bifrost-compatible code-mode tools,
+// the fixture echo tool, and (if a Lake is configured) the lake.*
+// personal-data-warehouse tools into the MCP server.
 func (g *Gateway) RegisterBuiltins() {
 	entries := g.builtinMemoryTools()
 	entries = append(entries, g.staticFixtureTool())
 	entries = append(entries, g.metaTools()...)
 	entries = append(entries, g.approvalMetaTools()...)
+	entries = append(entries, g.codeModeTools()...)
 	if g.lake != nil {
 		entries = append(entries, g.lakeTools()...)
 	}
@@ -1001,7 +1016,7 @@ func (g *Gateway) routeEntry(ctx context.Context, entry toolEntry, via string, a
 	}
 
 	grantToken, _ := args[GrantField].(string)
-	reason, intent, cleanArgs, rerr := extractReason(args, entry.reasonField)
+	reason, intent, cleanArgs, rerr := extractReasonOpt(args, entry.reasonField, entry.reasonOptional)
 	if rerr != nil {
 		_ = g.audit.Write(ctx, audit.Event{
 			EventType:     audit.EventCallFailed,
@@ -1429,7 +1444,7 @@ func (g *Gateway) dispatch(ctx context.Context, entry toolEntry, args map[string
 	}
 	upstreamStart := time.Now()
 	callCtx := ctx
-	if g.upstreamCallTimeout > 0 {
+	if g.upstreamCallTimeout > 0 && !entry.noCallTimeout {
 		var cancel context.CancelFunc
 		callCtx, cancel = context.WithTimeout(ctx, g.upstreamCallTimeout)
 		defer cancel()
@@ -1448,6 +1463,10 @@ func (g *Gateway) dispatch(ctx context.Context, entry toolEntry, args map[string
 		}
 		callCtx = WithForwardedKey(callCtx, key)
 	}
+	// The validated reason rides along for handlers that make calls of
+	// their own (tools.execute, executeToolCode): extractReason stripped it
+	// from args, and the nested call must carry it again.
+	callCtx = withCallReason(callCtx, reason)
 	res, err := entry.handle(callCtx, args)
 	ev.UpstreamLatencyMs = int(time.Since(upstreamStart).Milliseconds())
 	if errors.Is(err, context.DeadlineExceeded) {
