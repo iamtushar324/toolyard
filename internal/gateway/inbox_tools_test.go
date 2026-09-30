@@ -106,6 +106,37 @@ func TestExecuteModeKeepsLegacyFlow(t *testing.T) {
 	}
 }
 
+// A caller-declared _intent_category can only escalate. Declaring "read"
+// on a write doesn't skip the approval (execute mode) or the permission
+// check (inbox mode); declaring "write" on a read makes it need one.
+func TestDeclaredIntentOnlyEscalates(t *testing.T) {
+	f := newInboxFixture(t)
+	withIntent := func(intent string) map[string]any {
+		a := deployArgs()
+		a[IntentField] = intent
+		return a
+	}
+	for _, c := range []struct{ tool, intent string }{{"deploy.run", "read"}, {"deploy.get_status", "write"}} {
+		if s := structured(t, f.call(t, f.agent, c.tool, withIntent(c.intent))); s["status"] != "pending_approval" {
+			t.Fatalf("execute mode: %s declared %s should queue an approval, got %v", c.tool, c.intent, s["status"])
+		}
+	}
+	f.mode = ApprovalModeInbox
+	for _, c := range []struct{ tool, intent string }{{"deploy.rollback", "read"}, {"deploy.get_status", "write"}} {
+		res := f.call(t, f.agent, c.tool, withIntent(c.intent))
+		if s := structured(t, res); !res.IsError || s["status"] != "permission_required" {
+			t.Fatalf("inbox mode: %s declared %s should need permission, got %v", c.tool, c.intent, s)
+		}
+	}
+	if n := f.calls.Load(); n != 0 {
+		t.Fatalf("%d call(s) ran without approval", n)
+	}
+	// A read declared read still runs, as it would with no intent.
+	if res := f.call(t, f.agent, "deploy.get_status", withIntent("read")); res.IsError || f.calls.Load() != 1 {
+		t.Fatalf("read declared read should run: %+v", res)
+	}
+}
+
 func TestInboxModeCoaches(t *testing.T) {
 	f := newInboxFixture(t)
 	f.mode = ApprovalModeInbox

@@ -32,9 +32,13 @@ a vanilla SPA dashboard served from the same process.
 3. Schema-wrap layer extracts `_reason` and `_intent_category`, strips them,
    leaves the rest of the args alone.
 4. Audit row written: `event_type=call.start`.
-5. Policy engine evaluates `(agent, tool, params, intent)`. v0.1 rule:
-   `category=read` or names starting with `get/list/search/...` pass; the
-   rest go to approval.
+5. Policy engine evaluates `(agent, tool, params, intent)`. Explicit tool
+   and upstream rules decide first; otherwise names starting with
+   `get/list/search/...` pass and the rest go to approval. The declared
+   `_intent_category` can only escalate: `write`, `destructive`,
+   `external_communication`, `financial` and `privileged_admin` force
+   approval even on a read-looking name, while `read` is ignored, so an
+   agent can't skip approval by declaring a write a read.
 6. **Allow** path: forward to upstream MCP client / built-in handler,
    write `event_type=call.succeeded`, return result.
 7. **Approve** path: persist an `approval_requests` row, fan out to push +

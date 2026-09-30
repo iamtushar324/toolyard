@@ -31,7 +31,7 @@ const (
 	maxReasonLen = 2000
 
 	reasonPropDescription     = "One short sentence on why you are calling this tool. Shown verbatim to the human approver. Required, 20-2000 chars."
-	intentPropDescription     = "Coarse intent category: read | write | destructive | external_communication | financial | privileged_admin."
+	intentPropDescription     = "Coarse intent category: read | write | destructive | external_communication | financial | privileged_admin. Any category but read makes the call need approval; declaring read never lets a call skip approval."
 	approvalIDPropDescription = "If a previous call to this tool returned a deferred response with an `approval_id`, set this to that value to resume the held call instead of creating a new approval."
 	grantPropDescription      = "A grant token (tyg_…) your owner issued for this exact call through inbox.request. Restricted tools run only with a valid grant; the call must stay within the parameters you asked for."
 	sessionPropDescription    = "Optional: the id session.start gave you (ses_…), so this call is recorded under that piece of work."

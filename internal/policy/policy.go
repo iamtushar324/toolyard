@@ -2,8 +2,15 @@
 // denied. The evaluation order is:
 //
 //	forcedAction (builtins, handled by the gateway) →
-//	explicit tool-scope policy → explicit upstream-scope policy →
-//	intent category → read-name heuristic → default (writes need approval)
+//	explicit tool-scope policy → meta-tool shortcut (tools.*) →
+//	explicit upstream-scope policy → escalating intent category →
+//	read-name heuristic → default (writes need approval)
+//
+// The intent category is the caller's own `_intent_category` argument, so it
+// may only make a decision stricter, never looser: write, destructive,
+// external_communication, financial and privileged_admin force approval,
+// while read (or any other value) is ignored and the call is judged by its
+// name exactly as if no intent was given.
 //
 // Explicit policies live in the tool_policies table and are set from the UI.
 package policy
@@ -38,9 +45,11 @@ type Decision struct {
 }
 
 type Request struct {
-	AgentID        string
-	UpstreamName   string
-	ToolName       string // WRAPPED catalog name (e.g. "github.create_issue")
+	AgentID      string
+	UpstreamName string
+	ToolName     string // WRAPPED catalog name (e.g. "github.create_issue")
+	// IntentCategory is the caller-declared `_intent_category`. It can
+	// force approval but never allows a call on its own (see Eval).
 	IntentCategory string
 	Arguments      map[string]any
 	UserReason     string
@@ -138,9 +147,11 @@ func (e *Engine) Eval(req Request) Decision {
 		}
 	}
 
+	// A declared intent only escalates. "read" is the caller's word, not a
+	// fact, so it falls through to the name heuristic and the default like
+	// any unknown value; trusting it would let an agent skip approval on a
+	// write just by saying so.
 	switch req.IntentCategory {
-	case "read":
-		return Decision{Action: ActionAllow, Reason: "category=read", RuleID: "v0.1-category"}
 	case "write", "destructive", "external_communication", "financial", "privileged_admin":
 		return Decision{
 			Action: ActionApprove,
