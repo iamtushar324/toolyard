@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"fmt"
 	"net"
 	"net/url"
@@ -79,15 +80,29 @@ func privateHost(host string) bool {
 }
 
 // displayURL is safe to print: no userinfo, no query, and any path segment
-// long enough to be a token replaced by "…".
+// of 8 or more characters, which could be a token, replaced by "…".
 func displayURL(u *url.URL) string {
 	segs := strings.Split(u.EscapedPath(), "/")
 	for i, s := range segs {
-		if len(s) >= 20 {
+		if len(s) >= 8 {
 			segs[i] = "…"
 		}
 	}
 	return u.Scheme + "://" + u.Host + strings.Join(segs, "/")
+}
+
+// tokenLike is a path segment that reads like a key rather than a word:
+// long, or mixing letters and digits.
+func tokenLike(seg string) bool {
+	if len(seg) >= 20 {
+		return true
+	}
+	if len(seg) < 12 {
+		return false
+	}
+	letters := strings.IndexFunc(seg, func(r rune) bool { return r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' }) >= 0
+	digits := strings.IndexFunc(seg, func(r rune) bool { return r >= '0' && r <= '9' }) >= 0
+	return letters && digits
 }
 
 func urlCarriesCredentials(u *url.URL) bool {
@@ -95,7 +110,7 @@ func urlCarriesCredentials(u *url.URL) bool {
 		return true
 	}
 	for _, s := range strings.Split(u.EscapedPath(), "/") {
-		if len(s) >= 20 {
+		if tokenLike(s) {
 			return true
 		}
 	}
@@ -239,15 +254,37 @@ func without(list []string, drop string) []string {
 // scrub hides anything in text that could be one of p's credentials: its
 // header values and its URL, whole or in parts. toolyard's connect warnings
 // quote the upstream URL, and sometimes the upstream's own reply.
+//
+// Each value is hidden whole, word by word (an upstream may echo the token
+// without its "Bearer "), and in its JSON-escaped form.
 func (p planItem) scrub(text string) string {
 	var hide []string
+	words := func(v string) {
+		hide = append(hide, v)
+		for _, w := range strings.FieldsFunc(v, func(r rune) bool {
+			return r == ' ' || r == ',' || r == ';' || r == '"' || r == '\''
+		}) {
+			if len(w) >= 8 {
+				hide = append(hide, w)
+			}
+		}
+	}
 	for _, s := range p.Secrets {
-		hide = append(hide, s.Value)
+		words(s.Value)
 	}
 	if u, err := url.Parse(p.Server.URL); err == nil && p.Server.URL != "" {
 		hide = append(hide, p.Server.URL, u.String(), u.RawQuery)
 		if u.User != nil {
-			hide = append(hide, u.User.String())
+			hide = append(hide, u.User.String(), u.User.Username())
+			if pw, ok := u.User.Password(); ok {
+				hide = append(hide, pw)
+			}
+		}
+		for _, vals := range u.Query() {
+			for _, v := range vals {
+				words(v)
+				hide = append(hide, url.QueryEscape(v))
+			}
 		}
 		for _, path := range []string{u.Path, u.EscapedPath()} {
 			for _, seg := range strings.Split(path, "/") {
@@ -255,6 +292,12 @@ func (p planItem) scrub(text string) string {
 					hide = append(hide, seg)
 				}
 			}
+		}
+	}
+	plain := append([]string(nil), hide...)
+	for _, h := range plain {
+		if b, err := json.Marshal(h); err == nil {
+			hide = append(hide, strings.Trim(string(b), `"`))
 		}
 	}
 	sort.Slice(hide, func(i, j int) bool { return len(hide[i]) > len(hide[j]) })

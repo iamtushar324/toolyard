@@ -61,7 +61,16 @@ func (t *toolyardAPI) do(method, path string, body, out any) (int, error) {
 	defer resp.Body.Close()
 	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if resp.StatusCode >= 300 {
-		msg := strings.Join(strings.Fields(string(raw)), " ")
+		// toolyard errors are {"error": "..."}; decode them so the text is
+		// plain (no \u0026-style escapes) before anyone scrubs it.
+		msg := string(raw)
+		var e struct {
+			Error string `json:"error"`
+		}
+		if json.Unmarshal(raw, &e) == nil && e.Error != "" {
+			msg = e.Error
+		}
+		msg = strings.Join(strings.Fields(msg), " ")
 		if len(msg) > 300 {
 			msg = msg[:300] + "…"
 		}

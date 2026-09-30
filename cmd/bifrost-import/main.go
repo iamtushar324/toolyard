@@ -207,7 +207,8 @@ func applyPlan(w io.Writer, api *toolyardAPI, plan []planItem, existingSecrets m
 		// the server may exist, and then its secrets are in use.
 		if err != nil && code == 0 {
 			if names, lerr := api.serverNames(); lerr == nil && names[p.Name] {
-				fmt.Fprintf(w, "  %s: created, but the reply was lost (%s); check it on toolyard's Servers page\n", p.Name, p.scrub(err.Error()))
+				fmt.Fprintf(w, "  %s: probably created, but the reply was lost (%s); check it on toolyard's Servers page\n", p.Name, p.scrub(err.Error()))
+				failed++
 				continue
 			}
 		}
@@ -229,7 +230,7 @@ func applyPlan(w io.Writer, api *toolyardAPI, plan []planItem, existingSecrets m
 		}
 	}
 	if failed > 0 {
-		return fmt.Errorf("%d server(s) not created", failed)
+		return fmt.Errorf("%d server(s) not created or not confirmed", failed)
 	}
 	return nil
 }

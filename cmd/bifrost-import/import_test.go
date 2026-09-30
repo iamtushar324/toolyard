@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"database/sql"
+	"net/url"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -220,5 +221,41 @@ func TestScrubHidesCredentials(t *testing.T) {
 	}
 	if !strings.Contains(out, "dial tcp: timeout") {
 		t.Fatalf("scrub removed the useful part: %s", out)
+	}
+}
+
+// The re-review's cases: a token echoed without its "Bearer ", a bare query
+// value, a JSON-escaped URL, and a short token in the path.
+func TestScrubEchoesAndEscapes(t *testing.T) {
+	p := planOne(bifrostClient{Name: "Echo", ConnType: "http", ToolsListed: true, ToolsToExecute: []string{"*"},
+		URL:     "https://x.example.com/mcp?a=1&key=qsecret99",
+		Headers: map[string]string{"Authorization": "Bearer sk-live-TOKEN123456"}},
+		planOptions{SecretPrefix: "BIFROST", AllowURLCredentials: true})
+	if p.Skip != "" {
+		t.Fatal(p.Skip)
+	}
+	for _, text := range []string{
+		"request failed with status 401: invalid token sk-live-TOKEN123456",
+		"upstream said: bad key qsecret99",
+		`Post "https://x.example.com/mcp?a=1\u0026key=qsecret99": dial tcp: timeout`,
+	} {
+		out := p.scrub(text)
+		for _, secret := range []string{"sk-live-TOKEN123456", "qsecret99"} {
+			if strings.Contains(out, secret) {
+				t.Errorf("scrub left %q in: %s", secret, out)
+			}
+		}
+	}
+
+	short, _ := url.Parse("https://x.example.com/mcp/a1b2c3d4e5f6g7h8")
+	if !urlCarriesCredentials(short) {
+		t.Error("a 16-character letters-and-digits path segment was not flagged")
+	}
+	if d := displayURL(short); strings.Contains(d, "a1b2c3d4") {
+		t.Errorf("displayURL printed the path token: %s", d)
+	}
+	plain, _ := url.Parse("https://mcp.example.com/api/mcp")
+	if urlCarriesCredentials(plain) {
+		t.Error("an ordinary path was flagged")
 	}
 }
