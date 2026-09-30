@@ -272,6 +272,24 @@ func approvalSnapshot(req *approval.Request, includeArgs bool) map[string]any {
 	return out
 }
 
+// approvalVisibleTo reports whether caller (the gateway caller id, "" for
+// an anonymous connection) may read or resume req. An agent sees only the
+// approvals it raised, and an anonymous caller is no exception: it sees
+// only the approvals anonymous callers raised.
+//
+// A row with no agent_id is visible to every caller, as in the
+// /v1/agents/approvals/{id} route (cliApprovalsOne). Such rows come from
+// anonymous calls (a local gateway without -require-auth-on-mcp, or one
+// that ran before auth was turned on), so there is no owner to compare
+// against; refusing them would strand those approvals for the caller that
+// raised them.
+//
+// Every caller of this answers a mismatch exactly as it answers an unknown
+// id, so an agent can't use it to confirm that another agent's id exists.
+func approvalVisibleTo(req *approval.Request, caller string) bool {
+	return req.AgentID == "" || req.AgentID == caller
+}
+
 func (g *Gateway) handlePollApproval() directHandler {
 	return func(ctx context.Context, args map[string]any) (*mcp.CallToolResult, error) {
 		id, _ := args["approval_id"].(string)
@@ -279,15 +297,13 @@ func (g *Gateway) handlePollApproval() directHandler {
 			return mcp.NewToolResultError("approval_id is required"), nil
 		}
 		req, err := g.approval.Get(ctx, id)
-		if err != nil {
-			if errors.Is(err, approval.ErrNotFound) {
-				return mcp.NewToolResultError("unknown approval_id"), nil
-			}
-			return mcp.NewToolResultErrorFromErr("lookup approval", err), nil
+		// Scope check: agents only see their own approvals, and another
+		// agent's id reads as unknown.
+		if errors.Is(err, approval.ErrNotFound) || (err == nil && !approvalVisibleTo(req, agentIDFromContext(ctx))) {
+			return mcp.NewToolResultError("unknown approval_id"), nil
 		}
-		// Scope check: agents only see their own approvals.
-		if agentID := agentIDFromContext(ctx); agentID != "" && req.AgentID != "" && agentID != req.AgentID {
-			return mcp.NewToolResultError("approval_id does not belong to the calling agent"), nil
+		if err != nil {
+			return mcp.NewToolResultErrorFromErr("lookup approval", err), nil
 		}
 		return jsonResultMap(approvalSnapshot(req, false))
 	}
@@ -311,12 +327,8 @@ func (g *Gateway) handlePollApprovals() directHandler {
 				continue
 			}
 			req, err := g.approval.Get(ctx, id)
-			if err != nil {
+			if err != nil || !approvalVisibleTo(req, callerAgent) {
 				out = append(out, map[string]any{"approval_id": id, "status": "unknown"})
-				continue
-			}
-			if callerAgent != "" && req.AgentID != "" && callerAgent != req.AgentID {
-				out = append(out, map[string]any{"approval_id": id, "status": "forbidden"})
 				continue
 			}
 			out = append(out, approvalSnapshot(req, false))
@@ -342,14 +354,11 @@ func (g *Gateway) handleWaitForApproval() directHandler {
 			timeoutSec = maxSec
 		}
 		req, err := g.approval.Get(ctx, id)
-		if err != nil {
-			if errors.Is(err, approval.ErrNotFound) {
-				return mcp.NewToolResultError("unknown approval_id"), nil
-			}
-			return mcp.NewToolResultErrorFromErr("lookup approval", err), nil
+		if errors.Is(err, approval.ErrNotFound) || (err == nil && !approvalVisibleTo(req, agentIDFromContext(ctx))) {
+			return mcp.NewToolResultError("unknown approval_id"), nil
 		}
-		if callerAgent := agentIDFromContext(ctx); callerAgent != "" && req.AgentID != "" && callerAgent != req.AgentID {
-			return mcp.NewToolResultError("approval_id does not belong to the calling agent"), nil
+		if err != nil {
+			return mcp.NewToolResultErrorFromErr("lookup approval", err), nil
 		}
 		// Already in a terminal state (denied/expired/cancelled, or
 		// allowed-and-executed) — return immediately. Allowed-but-
@@ -451,23 +460,17 @@ func (g *Gateway) handleWaitForApprovals() directHandler {
 			anyTerm, allTerm := false, true
 			for _, id := range ids {
 				req, err := g.approval.Get(ctx, id)
-				if err != nil {
-					if errors.Is(err, approval.ErrNotFound) {
-						snapshots = append(snapshots, map[string]any{
-							"approval_id": id, "status": "unknown",
-						})
-						// "unknown" is terminal — there's nothing to wait for.
-						anyTerm = true
-						continue
-					}
-					return mcp.NewToolResultErrorFromErr("lookup approval", err), nil
-				}
-				if callerAgent != "" && req.AgentID != "" && callerAgent != req.AgentID {
+				if errors.Is(err, approval.ErrNotFound) || (err == nil && !approvalVisibleTo(req, callerAgent)) {
+					// Another agent's id reads as unknown too.
 					snapshots = append(snapshots, map[string]any{
-						"approval_id": id, "status": "forbidden",
+						"approval_id": id, "status": "unknown",
 					})
+					// "unknown" is terminal — there's nothing to wait for.
 					anyTerm = true
 					continue
+				}
+				if err != nil {
+					return mcp.NewToolResultErrorFromErr("lookup approval", err), nil
 				}
 				if isTerminal(req) {
 					anyTerm = true

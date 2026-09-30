@@ -1287,9 +1287,15 @@ func (g *Gateway) holdAndWait(ctx context.Context, entry toolEntry, args map[str
 // and tools.wait_for_approval surface the same cached result. We keep
 // `_approval_id` working only for backwards-compat with already-deployed
 // agent code.
+//
+// The approval must belong to the caller (approvalVisibleTo) and must
+// have been raised for this tool on this upstream. Otherwise any agent
+// that can reach one tool could read another agent's cached result, or
+// the result of a tool it can't reach, by id. Both mismatches answer
+// exactly like an unknown id, so ids can't be probed.
 func (g *Gateway) resumeDeferred(ctx context.Context, entry toolEntry, approvalID string, ev *metrics.Event) (*mcp.CallToolResult, error) {
 	req, err := g.approval.Get(ctx, approvalID)
-	if err != nil {
+	if err != nil || !approvalVisibleTo(req, agentIDFromContext(ctx)) || !approvalRaisedFor(req, entry) {
 		ev.Outcome = metrics.OutcomeError
 		ev.ErrorClass = "approval"
 		return mcp.NewToolResultErrorf("unknown approval %q", approvalID), nil
@@ -1363,6 +1369,12 @@ func (g *Gateway) resumeDeferred(ctx context.Context, entry toolEntry, approvalI
 		ev.Outcome = metrics.OutcomeDeferred
 		return g.deferredResponse(ctx, req, entry, req.Arguments), nil
 	}
+}
+
+// approvalRaisedFor reports whether req was raised for entry: the same
+// upstream and the same wrapped catalog name holdAndWait stores.
+func approvalRaisedFor(req *approval.Request, entry toolEntry) bool {
+	return req.UpstreamName == entry.upstream && req.ToolName == entry.tool.Name
 }
 
 // executingResponse is the envelope returned when the agent re-calls
