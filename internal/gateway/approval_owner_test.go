@@ -203,3 +203,151 @@ func TestApprovalPollersHideOtherAgentsApprovals(t *testing.T) {
 		}
 	}
 }
+
+// A top-level _approval_id on tools.execute resumes against the real
+// target: the owner gets the result whether or not the call names the
+// target, the forwarded call keeps the caller's identity, and anyone else,
+// or a wrong target, gets the unknown-approval answer.
+func TestResumeThroughExecute(t *testing.T) {
+	f := newActorFixture(t)
+	ctxA := WithAgentID(context.Background(), "ag_a")
+	id := raiseExecuted(t, f, ctxA)
+	runs := f.runCount()
+	unknown := fmt.Sprintf("unknown approval %q", id)
+
+	for _, c := range []struct {
+		name string
+		args map[string]any
+	}{
+		{"owner names the target", map[string]any{"tool": "t.run", ApprovalIDField: id}},
+		{"owner names only the id", map[string]any{ApprovalIDField: id}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			res := f.call(t, ctxA, "test", MetaExecuteTool, c.args)
+			if res.IsError || textOf(res) != "ran" {
+				t.Fatalf("got %q (error %v), want the cached result", textOf(res), res.IsError)
+			}
+			if m := f.lastMetric(t, "t.run"); m.AgentID != "ag_a" || m.Via != MetaExecuteTool || m.ApprovalID != id {
+				t.Fatalf("forwarded resume metric %+v, want agent ag_a via %s for %s", m, MetaExecuteTool, id)
+			}
+		})
+	}
+
+	for _, c := range []struct {
+		name string
+		ctx  context.Context
+		args map[string]any
+	}{
+		{"owner names another target", ctxA, map[string]any{"tool": "t.get_status", ApprovalIDField: id}},
+		{"other agent names the target", WithAgentID(context.Background(), "ag_b"), map[string]any{"tool": "t.run", ApprovalIDField: id}},
+		{"other agent names only the id", WithAgentID(context.Background(), "ag_b"), map[string]any{ApprovalIDField: id}},
+		{"anonymous names only the id", context.Background(), map[string]any{ApprovalIDField: id}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			res := f.call(t, c.ctx, "test", MetaExecuteTool, c.args)
+			if !res.IsError || textOf(res) != unknown {
+				t.Fatalf("got %q (error %v), want %q", textOf(res), res.IsError, unknown)
+			}
+		})
+	}
+	if f.runCount() != runs {
+		t.Fatal("a resume through tools.execute ran the tool")
+	}
+
+	// An approval raised for tools.execute itself (an operator gated it)
+	// still resumes on tools.execute, for its owner only.
+	t.Run("approval raised for tools.execute", func(t *testing.T) {
+		held, err := f.bus.Hold(context.Background(), approval.NewRequest{
+			AgentID: "ag_a", UpstreamName: "tools", ToolName: MetaExecuteTool,
+			Arguments: map[string]any{"tool": "t.run"}, Reason: testReason, RequireHuman: true,
+		}, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		res := f.call(t, ctxA, "test", MetaExecuteTool, map[string]any{ApprovalIDField: held.ID})
+		sc, _ := res.StructuredContent.(map[string]any)
+		if res.IsError || sc["status"] != "pending_approval" || sc["approval_id"] != held.ID {
+			t.Fatalf("owner: got %q (error %v, structured %v), want the pending envelope", textOf(res), res.IsError, sc)
+		}
+		res = f.call(t, WithAgentID(context.Background(), "ag_b"), "test", MetaExecuteTool, map[string]any{ApprovalIDField: held.ID})
+		if want := fmt.Sprintf("unknown approval %q", held.ID); !res.IsError || textOf(res) != want {
+			t.Fatalf("other agent: got %q (error %v), want %q", textOf(res), res.IsError, want)
+		}
+	})
+}
+
+// A resume through tools.execute runs the target's access check: a member
+// whose approval is on a server it can no longer reach is told the tool
+// doesn't exist, as on a direct call.
+func TestResumeThroughExecuteChecksTargetAccess(t *testing.T) {
+	f := newAccessFixture(t, nil)
+	hold := func(up string) string {
+		t.Helper()
+		req, err := f.bus.Hold(context.Background(), approval.NewRequest{
+			AgentID: memberID, UpstreamName: up, ToolName: up + ".run",
+			Arguments: map[string]any{}, Reason: testReason, RequireHuman: true,
+		}, 0)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return req.ID
+	}
+	beta := hold("beta")
+	for _, args := range []map[string]any{
+		{ApprovalIDField: beta},
+		{"tool": "beta.run", ApprovalIDField: beta},
+	} {
+		res := f.call(t, f.member, MetaExecuteTool, args)
+		if !res.IsError || textOf(res) != notFoundText("beta.run") {
+			t.Fatalf("ungranted target %v: got %q (error %v)", args, textOf(res), res.IsError)
+		}
+	}
+	alpha := hold("alpha")
+	res := f.call(t, f.member, MetaExecuteTool, map[string]any{ApprovalIDField: alpha})
+	if sc, _ := res.StructuredContent.(map[string]any); res.IsError || sc["approval_id"] != alpha {
+		t.Fatalf("granted target: got %q (error %v)", textOf(res), res.IsError)
+	}
+	if f.calls.Load() != 0 {
+		t.Fatal("no handler should have run")
+	}
+}
+
+// The approval coordination tools read approvals by their own arguments,
+// so a stray _approval_id next to them is ignored rather than treated as a
+// resume of the coordination call. Their own owner check still applies.
+func TestApprovalToolsIgnoreStrayApprovalIDField(t *testing.T) {
+	f := newActorFixture(t)
+	ctxA := WithAgentID(context.Background(), "ag_a")
+	ctxB := WithAgentID(context.Background(), "ag_b")
+	id := raiseExecuted(t, f, ctxA)
+
+	for _, tool := range []string{MetaPollApproval, MetaWaitForApproval} {
+		t.Run(tool, func(t *testing.T) {
+			args := map[string]any{"approval_id": id, ApprovalIDField: id, "timeout_seconds": float64(1)}
+			got := decodeResult(t, f.call(t, ctxA, "test", tool, args))
+			if got["status"] != "executed" || !strings.Contains(fmt.Sprint(got["result"]), "ran") {
+				t.Fatalf("owner: %v", got)
+			}
+			if res := f.call(t, ctxB, "test", tool, args); !res.IsError || textOf(res) != "unknown approval_id" {
+				t.Fatalf("other agent: got %q (error %v)", textOf(res), res.IsError)
+			}
+		})
+	}
+	for _, tool := range []string{MetaPollApprovals, MetaWaitForApprovals} {
+		t.Run(tool, func(t *testing.T) {
+			args := map[string]any{"approval_ids": []any{id}, ApprovalIDField: id, "timeout_seconds": float64(1)}
+			results, _ := decodeResult(t, f.call(t, ctxA, "test", tool, args))["results"].([]any)
+			if len(results) != 1 || results[0].(map[string]any)["status"] != "executed" {
+				t.Fatalf("owner: %v", results)
+			}
+		})
+	}
+	for _, tool := range []string{MetaListPendingApprovals, MetaCancelMyApproval, MetaApprovalStats} {
+		t.Run(tool, func(t *testing.T) {
+			res := f.call(t, ctxA, "test", tool, map[string]any{"approval_id": id, ApprovalIDField: id})
+			if res.IsError {
+				t.Fatalf("got error %q", textOf(res))
+			}
+		})
+	}
+}

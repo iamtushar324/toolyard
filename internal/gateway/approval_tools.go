@@ -27,6 +27,14 @@ const (
 	MetaApprovalStats        = "tools.approval_stats"
 )
 
+// approvalCoordinationTools names the tools approvalMetaTools returns.
+// routeEntry does not treat _approval_id on them as a resume.
+var approvalCoordinationTools = map[string]bool{
+	MetaPollApproval: true, MetaPollApprovals: true,
+	MetaWaitForApproval: true, MetaWaitForApprovals: true,
+	MetaListPendingApprovals: true, MetaCancelMyApproval: true, MetaApprovalStats: true,
+}
+
 // approvalMetaTools returns the read-only approval coordination tools
 // the gateway exposes to every agent. None of them require approval
 // themselves — they only operate on the calling agent's own queue (or

@@ -145,9 +145,9 @@ func (g *Gateway) handleExecuteTool() directHandler {
 		if _, ok := inner["_reason"]; !ok {
 			inner["_reason"] = callReasonFromContext(ctx)
 		}
-		if apID, ok := args["_approval_id"].(string); ok && apID != "" {
-			inner["_approval_id"] = apID
-		}
+		// A top-level _approval_id never gets here: routeEntry resumes it
+		// against the target (resumeViaExecute) and strips it from args.
+		// One inside arguments reaches the target with the rest of inner.
 		return g.RouteCall(ctx, MetaExecuteTool, target, inner)
 	}
 }
