@@ -3,6 +3,7 @@ package codemode
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"math/big"
@@ -15,7 +16,15 @@ import (
 // Value conversions. Adapted from maximhq/bifrost core/mcp/codemode
 // (starlark/utils.go, Apache-2.0): a tool result that is JSON text becomes
 // Starlark dicts and lists, anything else a string; script values convert
-// back to JSON for the "Return value" line.
+// back to JSON for tool arguments and the "Return value" line.
+//
+// The Starlark-to-Go direction is defensive where Bifrost's is not: a list
+// or dict that contains itself, or a value nested absurdly deep, is an
+// error rather than a stack overflow, and a value JSON cannot carry (an
+// integer past 64 bits, bytes) is an error rather than a surprise string.
+
+// maxDepth is how deep a script value may nest before conversion refuses.
+const maxDepth = 64
 
 // toStarlark converts a decoded JSON value (or a plain Go value) to Starlark.
 func toStarlark(v any) starlark.Value {
@@ -77,63 +86,139 @@ func numberToStarlark(n json.Number) starlark.Value {
 	return starlark.String(s)
 }
 
-// fromStarlark converts a Starlark value to a JSON-ready Go value.
-func fromStarlark(v starlark.Value) any {
+// toGo converts a script value to a JSON-ready Go value, or explains why
+// it cannot be sent.
+func toGo(v starlark.Value) (any, error) {
+	c := converter{seen: map[any]bool{}}
+	return c.value(v)
+}
+
+// converter walks one value, tracking the path of containers it is inside
+// (so a container reached twice on one path is a cycle, while the same
+// list appearing in two places is fine) and how deep it is.
+type converter struct {
+	depth int
+	seen  map[any]bool
+}
+
+func (c *converter) enter(id any) error {
+	if c.seen[id] {
+		return errors.New("value contains a cycle (a list or dict that contains itself) and cannot be sent as JSON")
+	}
+	if c.depth >= maxDepth {
+		return fmt.Errorf("value nests deeper than %d levels and cannot be sent as JSON", maxDepth)
+	}
+	c.seen[id] = true
+	c.depth++
+	return nil
+}
+
+func (c *converter) leave(id any) {
+	delete(c.seen, id)
+	c.depth--
+}
+
+func (c *converter) value(v starlark.Value) (any, error) {
 	switch val := v.(type) {
 	case starlark.NoneType:
-		return nil
+		return nil, nil
 	case starlark.Bool:
-		return bool(val)
+		return bool(val), nil
 	case starlark.Int:
 		if i, ok := val.Int64(); ok {
-			return i
+			return i, nil
 		}
 		if u, ok := val.Uint64(); ok {
-			return u
+			return u, nil
 		}
-		return val.String()
+		return nil, fmt.Errorf("integer %s is too large to send as JSON (64-bit limit); send it as a string", val.String())
 	case starlark.Float:
-		return float64(val)
+		return float64(val), nil
 	case starlark.String:
-		return string(val)
+		return string(val), nil
+	case starlark.Bytes:
+		return nil, errors.New("bytes values cannot be sent as JSON; convert them to a string first")
 	case *starlark.List:
+		if err := c.enter(val); err != nil {
+			return nil, err
+		}
+		defer c.leave(val)
 		out := make([]any, val.Len())
 		for i := 0; i < val.Len(); i++ {
-			out[i] = fromStarlark(val.Index(i))
+			item, err := c.value(val.Index(i))
+			if err != nil {
+				return nil, err
+			}
+			out[i] = item
 		}
-		return out
+		return out, nil
 	case starlark.Tuple:
+		if c.depth >= maxDepth {
+			return nil, fmt.Errorf("value nests deeper than %d levels and cannot be sent as JSON", maxDepth)
+		}
+		c.depth++
+		defer func() { c.depth-- }()
 		out := make([]any, len(val))
 		for i, item := range val {
-			out[i] = fromStarlark(item)
+			converted, err := c.value(item)
+			if err != nil {
+				return nil, err
+			}
+			out[i] = converted
 		}
-		return out
+		return out, nil
 	case *starlark.Set:
+		if err := c.enter(val); err != nil {
+			return nil, err
+		}
+		defer c.leave(val)
 		out := make([]any, 0, val.Len())
 		for item := range val.Elements() {
-			out = append(out, fromStarlark(item))
+			converted, err := c.value(item)
+			if err != nil {
+				return nil, err
+			}
+			out = append(out, converted)
 		}
-		return out
+		return out, nil
 	case *starlark.Dict:
+		if err := c.enter(val); err != nil {
+			return nil, err
+		}
+		defer c.leave(val)
 		out := make(map[string]any, val.Len())
 		for _, item := range val.Items() {
+			key := item[0].String()
 			if k, ok := item[0].(starlark.String); ok {
-				out[string(k)] = fromStarlark(item[1])
-			} else {
-				out[item[0].String()] = fromStarlark(item[1])
+				key = string(k)
 			}
+			converted, err := c.value(item[1])
+			if err != nil {
+				return nil, err
+			}
+			out[key] = converted
 		}
-		return out
+		return out, nil
 	case *starlarkstruct.Struct:
+		if err := c.enter(val); err != nil {
+			return nil, err
+		}
+		defer c.leave(val)
 		out := map[string]any{}
 		for _, name := range val.AttrNames() {
-			if attr, err := val.Attr(name); err == nil {
-				out[name] = fromStarlark(attr)
+			attr, err := val.Attr(name)
+			if err != nil {
+				continue
 			}
+			converted, err := c.value(attr)
+			if err != nil {
+				return nil, err
+			}
+			out[name] = converted
 		}
-		return out
+		return out, nil
 	}
-	return v.String()
+	return v.String(), nil
 }
 
 // decodeResult turns a tool's text into a script value: JSON when it parses,

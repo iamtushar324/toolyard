@@ -115,11 +115,9 @@ func (e *Engine) reload(ctx context.Context) error {
 
 // Eval returns the decision for req.
 func (e *Engine) Eval(req Request) Decision {
-	if req.UpstreamName == "tools" {
-		return Decision{Action: ActionAllow, Reason: "meta-tool routes inner call", RuleID: "v0.1-meta-tool"}
-	}
-
-	// Explicit policies: tool scope beats upstream scope.
+	// Explicit policies: tool scope beats upstream scope, and it beats the
+	// meta-tool shortcut below, so an operator can deny or gate one tools.*
+	// tool (executeToolCode) while the group stays open by default.
 	e.mu.RLock()
 	tp, okT := e.byTool[req.ToolName]
 	up, okU := e.byUp[req.UpstreamName]
@@ -129,6 +127,11 @@ func (e *Engine) Eval(req Request) Decision {
 			return d
 		}
 	}
+
+	if req.UpstreamName == "tools" {
+		return Decision{Action: ActionAllow, Reason: "meta-tool routes inner call", RuleID: "v0.1-meta-tool"}
+	}
+
 	if okU {
 		if d, ok := decisionFromPolicy(up); ok {
 			return d

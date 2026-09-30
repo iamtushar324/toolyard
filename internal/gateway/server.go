@@ -120,6 +120,10 @@ type toolEntry struct {
 	// whose clients are configured for Bifrost and never send one; the
 	// nested calls a script makes still carry a reason.
 	reasonOptional bool
+	// noCallTimeout exempts the dispatch from upstreamCallTimeout for a
+	// tool that enforces its own, longer deadline (executeToolCode). The
+	// calls it makes in turn are still capped through their own dispatch.
+	noCallTimeout bool
 }
 
 // Gateway stitches the MCP server, policy, approval bus, memory, and upstream
@@ -1440,7 +1444,7 @@ func (g *Gateway) dispatch(ctx context.Context, entry toolEntry, args map[string
 	}
 	upstreamStart := time.Now()
 	callCtx := ctx
-	if g.upstreamCallTimeout > 0 {
+	if g.upstreamCallTimeout > 0 && !entry.noCallTimeout {
 		var cancel context.CancelFunc
 		callCtx, cancel = context.WithTimeout(ctx, g.upstreamCallTimeout)
 		defer cancel()

@@ -38,23 +38,36 @@ func init() {
 	}
 }
 
+// defaultCodeModeWorker is the process scripts run in: this binary's
+// codemode-worker subcommand. Tests point it at the test binary.
+var defaultCodeModeWorker = codemode.DefaultWorker
+
 // SetCodeModeLimits replaces the limits one executeToolCode run gets. Call
-// it before RegisterBuiltins, or after: the handlers read the runtime
-// through the gateway on every call.
+// it before RegisterBuiltins so the executeToolCode description advertises
+// the limits that are enforced; the handlers read the runtime through the
+// gateway on every call either way.
 func (g *Gateway) SetCodeModeLimits(l codemode.Limits) {
+	worker := g.codeModeRuntime().Worker()
 	g.codeMode = codemode.New(codeModeCaller{g}, l)
+	g.codeMode.SetWorker(worker)
+}
+
+// SetCodeModeWorker replaces how scripts are run.
+func (g *Gateway) SetCodeModeWorker(w codemode.Worker) {
+	g.codeModeRuntime().SetWorker(w)
 }
 
 func (g *Gateway) codeModeRuntime() *codemode.Runtime {
 	if g.codeMode == nil {
 		g.codeMode = codemode.New(codeModeCaller{g}, codemode.DefaultLimits())
+		g.codeMode.SetWorker(defaultCodeModeWorker())
 	}
 	return g.codeMode
 }
 
 // codeModeTools returns the four code-mode entries.
 func (g *Gateway) codeModeTools() []toolEntry {
-	g.codeModeRuntime()
+	rt := g.codeModeRuntime()
 	optional := func(props map[string]any, required ...string) mcp.ToolInputSchema {
 		return mcp.ToolInputSchema{Type: "object", Required: required, Properties: addMetaProps(props)}
 	}
@@ -106,7 +119,8 @@ func (g *Gateway) codeModeTools() []toolEntry {
 			"each call runs in a FRESH ISOLATED SCOPE with no state carried between calls. " +
 			"SYNTAX: synchronous calls, keyword arguments (server.tool(param=\"value\")), dict access with brackets (result[\"key\"]), print() for logging, assign the value to return to `result`. " +
 			"toolyard code mode: each tool call your code makes goes through toolyard's access, policy and approval rules; a call that is held for approval or needs a permission request aborts the script with the gateway's answer, so poll or ask as it says, then rerun. " +
-			"Limits per run: 5 minutes, 100 tool calls, 1 MiB of output.",
+			"Your code runs in an isolated process with no credentials and no network; it can only call tools. " +
+			rt.LimitsText(),
 		InputSchema: optional(map[string]any{
 			"code": map[string]any{
 				"type": "string",
@@ -115,17 +129,23 @@ func (g *Gateway) codeModeTools() []toolEntry {
 			},
 		}, "code"),
 	}
-	entry := func(t mcp.Tool, h directHandler) toolEntry {
+	// Policy evaluates these like any tool: the "tools" group is allowed by
+	// default, and an explicit tool-scope rule (deny, or ask to hold the
+	// whole run for approval) still applies. executeToolCode keeps its own
+	// clock: the per-dispatch upstream timeout would cut the advertised
+	// script limit short, and every nested call gets that timeout through
+	// its own dispatch anyway.
+	entry := func(t mcp.Tool, h directHandler, ownClock bool) toolEntry {
 		return toolEntry{
 			tool: t, upstream: codeModeGroup, originalName: t.Name, reasonField: ReasonField,
-			handle: h, forcedAction: &actionAllow, reasonOptional: true,
+			handle: h, reasonOptional: true, noCallTimeout: ownClock,
 		}
 	}
 	return []toolEntry{
-		entry(list, g.handleListToolFiles()),
-		entry(read, g.handleReadToolFile()),
-		entry(docs, g.handleGetToolDocs()),
-		entry(exec, g.handleExecuteToolCode()),
+		entry(list, g.handleListToolFiles(), false),
+		entry(read, g.handleReadToolFile(), false),
+		entry(docs, g.handleGetToolDocs(), false),
+		entry(exec, g.handleExecuteToolCode(), true),
 	}
 }
 

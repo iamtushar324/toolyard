@@ -1,20 +1,17 @@
 package codemode
 
 import (
+	"bytes"
 	"context"
-	"errors"
+	"encoding/json"
 	"fmt"
 	"regexp"
-	"sort"
 	"strings"
 	"sync"
 	"time"
 	"unicode/utf8"
 
 	"github.com/mark3labs/mcp-go/mcp"
-	"go.starlark.net/starlark"
-	"go.starlark.net/starlarkstruct"
-	"go.starlark.net/syntax"
 )
 
 // heldMarkers are the result metadata keys the gateway sets when a call
@@ -24,14 +21,11 @@ import (
 // text (approval id, next steps) into the error output.
 var heldMarkers = []string{"toolyard.deferred", "toolyard.executing", "toolyard.permission_required"}
 
-// scriptName is the file name Starlark reports positions against.
-const scriptName = "code.star"
-
 // ExecuteToolCode runs a script for the ctx caller. reason is the outer
 // call's _reason, or "" when the client sent none (Bifrost clients never
 // do); nested calls carry it, or one derived from the script. failed is
-// true for a syntax error, a runtime error or a tool call that did not
-// succeed.
+// true for a syntax error, a runtime error, a tool call that did not
+// succeed, or a worker that did not survive the script.
 func (r *Runtime) ExecuteToolCode(ctx context.Context, code, reason string) (text string, failed bool) {
 	code = strings.TrimSpace(code)
 	if code == "" {
@@ -40,34 +34,33 @@ func (r *Runtime) ExecuteToolCode(ctx context.Context, code, reason string) (tex
 	if strings.TrimSpace(reason) == "" {
 		reason = deriveReason(code)
 	}
-	servers := buildServers(r.caller.Tools(ctx))
-	res := r.execute(ctx, code, reason, servers)
-	return r.render(res)
+	cat := buildCatalog(r.caller.Tools(ctx))
+
+	stopNote := fmt.Sprintf("limit %s", r.limits.ScriptTimeout)
+	if dl, ok := ctx.Deadline(); ok && time.Until(dl) < r.limits.ScriptTimeout {
+		stopNote = "the caller's deadline"
+	}
+	runCtx, cancel := context.WithTimeout(ctx, r.limits.ScriptTimeout)
+	defer cancel()
+
+	s := &session{r: r, ctx: runCtx, reason: reason, cat: cat}
+	start := startMsg{Type: msgStart, Code: code, Servers: cat.wire(), Limits: r.limits}
+	var res scriptResult
+	if r.inProcess {
+		res = runScript(runCtx, start, s, stopNote)
+	} else {
+		res = r.runInWorker(runCtx, s, start, stopNote)
+	}
+	return r.render(code, cat.idents(), s.snapshotLogs(), res)
 }
 
-// execOutcome is what one script run produced.
-type execOutcome struct {
-	result  any
-	hasRes  bool
-	logs    []string
-	err     *execError
-	servers []string
-}
-
-// execError is a failed run: kind is "syntax" or "runtime".
-type execError struct {
-	kind    string
-	message string
-	hints   []string
-}
-
-// run is the mutable state of one script: its print log and call budget.
-type run struct {
+// session is the parent's state for one script: the print log, the call
+// budget, and how nested calls are made.
+type session struct {
 	r      *Runtime
 	ctx    context.Context
 	reason string
-	// stopNote names the deadline that ends the script when it runs out.
-	stopNote string
+	cat    *catalog
 
 	mu        sync.Mutex
 	logs      []string
@@ -76,171 +69,96 @@ type run struct {
 	calls     int
 }
 
-// execute binds the servers and runs the script under the limits.
-func (r *Runtime) execute(ctx context.Context, code, reason string, servers []*server) execOutcome {
-	stopNote := fmt.Sprintf("limit %s", r.limits.ScriptTimeout)
-	if dl, ok := ctx.Deadline(); ok && time.Until(dl) < r.limits.ScriptTimeout {
-		stopNote = "the caller's deadline"
+// handleCall performs one nested call for the script. Every failure is
+// returned as the message that aborts the script, naming the tool and
+// carrying the gateway's text.
+func (s *session) handleCall(serverIdent, member string, args map[string]any) parentMsg {
+	fail := func(msg string) parentMsg { return parentMsg{Error: msg} }
+	srv := s.cat.byIdent(serverIdent)
+	if srv == nil {
+		return fail(fmt.Sprintf("tool call failed: unknown server %q", serverIdent))
 	}
-	runCtx, cancel := context.WithTimeout(ctx, r.limits.ScriptTimeout)
-	defer cancel()
-	rn := &run{r: r, ctx: runCtx, reason: reason, stopNote: stopNote}
+	b, ok := srv.byIdent[member]
+	if !ok {
+		if names, amb := srv.ambiguous[canonicalName(member)]; amb {
+			return fail(ambiguityError(srv.ident, member, names).Error())
+		}
+		return fail(fmt.Sprintf("tool call failed: %s has no tool %q", srv.ident, member))
+	}
+	t := b.tool
+	label := srv.ident + "." + strings.ReplaceAll(t.Name, "-", "_")
+	if args == nil {
+		args = map[string]any{}
+	}
 
-	keys := make([]string, 0, len(servers))
-	predeclared := starlark.StringDict{}
-	for _, s := range servers {
-		keys = append(keys, s.name)
-		predeclared[s.name] = rn.serverStruct(s)
+	s.mu.Lock()
+	s.calls++
+	n := s.calls
+	s.mu.Unlock()
+	if n > s.r.limits.MaxCalls {
+		msg := fmt.Sprintf("this script already made %d tool calls, the limit for one executeToolCode run; split the work across runs", s.r.limits.MaxCalls)
+		s.log(fmt.Sprintf("[TOOL] %s error: %s", label, msg))
+		return fail(fmt.Sprintf("tool call failed for %s: %s", label, msg))
 	}
-	sort.Strings(keys)
-
-	thread := &starlark.Thread{
-		Name:  "codemode",
-		Print: func(_ *starlark.Thread, msg string) { rn.log(msg) },
-	}
-	thread.SetMaxExecutionSteps(r.limits.MaxSteps)
-	// The wall clock stops the interpreter too, not only the next nested
-	// call: a script spinning without calling anything still ends.
-	done := make(chan struct{})
-	defer close(done)
-	go func() {
-		select {
-		case <-runCtx.Done():
-			thread.Cancel(fmt.Sprintf("script stopped: %v (%s)", runCtx.Err(), stopNote))
-		case <-done:
-		}
-	}()
-
-	opts := &syntax.FileOptions{
-		TopLevelControl: true,
-		While:           true,
-		Set:             true,
-		GlobalReassign:  true,
-		Recursion:       true,
-	}
-	globals, err := starlark.ExecFileOptions(opts, thread, scriptName, code, predeclared)
-	out := execOutcome{logs: rn.snapshotLogs(), servers: keys}
-	if err != nil {
-		msg := err.Error()
-		var evalErr *starlark.EvalError
-		if errors.As(err, &evalErr) {
-			msg = evalErr.Backtrace()
-		}
-		// starlark-go's parse errors read `got ':', want ')'` with no
-		// "syntax error" in them, so the kind comes from the error type.
-		kind := "runtime"
-		var synErr syntax.Error
-		if errors.As(err, &synErr) || strings.Contains(msg, "syntax error") {
-			kind = "syntax"
-		}
-		out.err = &execError{kind: kind, message: msg, hints: errorHints(kind, msg, usesExceptions(code), keys)}
-		return out
-	}
-	if v, ok := globals["result"]; ok && v != starlark.None {
-		out.result = fromStarlark(v)
-		out.hasRes = true
-	}
-	return out
-}
-
-// serverStruct is the Starlark object a server key names: one method per
-// bound identifier (and alias), plus a refusing method per ambiguous one.
-func (rn *run) serverStruct(s *server) *starlarkstruct.Struct {
-	members := starlark.StringDict{}
-	for ident, b := range s.byIdent {
-		members[ident] = rn.toolFunc(s.name, ident, b.tool)
-	}
-	for ident, names := range s.ambiguous {
-		if _, taken := members[ident]; taken {
-			continue
-		}
-		err := ambiguityError(s.name, ident, names)
-		members[ident] = starlark.NewBuiltin(ident, func(*starlark.Thread, *starlark.Builtin, starlark.Tuple, []starlark.Tuple) (starlark.Value, error) {
-			return nil, err
-		})
-	}
-	return starlarkstruct.FromStringDict(starlark.String(s.name), members)
-}
-
-// toolFunc binds one tool as a Starlark function taking keyword arguments
-// (or a single dict).
-func (rn *run) toolFunc(serverName, ident string, t Tool) *starlark.Builtin {
-	return starlark.NewBuiltin(ident, func(_ *starlark.Thread, fn *starlark.Builtin, args starlark.Tuple, kwargs []starlark.Tuple) (starlark.Value, error) {
-		callArgs, err := callArguments(fn.Name(), args, kwargs)
-		if err != nil {
-			return nil, err
-		}
-		return rn.call(serverName, t, callArgs)
-	})
-}
-
-// callArguments turns a call's kwargs (or one positional dict) into the
-// tool's argument map.
-func callArguments(name string, args starlark.Tuple, kwargs []starlark.Tuple) (map[string]any, error) {
-	out := map[string]any{}
-	for _, kv := range kwargs {
-		if len(kv) != 2 {
-			continue
-		}
-		k, _ := kv[0].(starlark.String)
-		out[string(k)] = fromStarlark(kv[1])
-	}
-	switch {
-	case len(args) == 0:
-	case len(args) == 1 && len(kwargs) == 0:
-		d, ok := args[0].(*starlark.Dict)
-		if !ok {
-			return nil, fmt.Errorf("%s() takes keyword arguments: %s(param=value), or a single dict of them", name, name)
-		}
-		for _, item := range d.Items() {
-			k, ok := item[0].(starlark.String)
-			if !ok {
-				return nil, fmt.Errorf("%s(): argument names must be strings, got %s", name, item[0].Type())
-			}
-			out[string(k)] = fromStarlark(item[1])
-		}
-	default:
-		return nil, fmt.Errorf("%s() takes keyword arguments: %s(param=value)", name, name)
-	}
-	return out, nil
-}
-
-// call routes one nested tool call through the gateway and converts the
-// answer. Every failure aborts the script with a message that names the
-// tool and carries the gateway's text.
-func (rn *run) call(serverName string, t Tool, args map[string]any) (starlark.Value, error) {
-	label := serverName + "." + strings.ReplaceAll(t.Name, "-", "_")
-	rn.mu.Lock()
-	rn.calls++
-	n := rn.calls
-	rn.mu.Unlock()
-	if n > rn.r.limits.MaxCalls {
-		msg := fmt.Sprintf("this script already made %d tool calls, the limit for one executeToolCode run; split the work across runs", rn.r.limits.MaxCalls)
-		rn.log(fmt.Sprintf("[TOOL] %s error: %s", label, msg))
-		return nil, fmt.Errorf("tool call failed for %s: %s", label, msg)
-	}
-	if err := rn.ctx.Err(); err != nil {
-		return nil, fmt.Errorf("tool call failed for %s: script stopped: %v (%s)", label, err, rn.stopNote)
+	if err := s.ctx.Err(); err != nil {
+		return fail(fmt.Sprintf("tool call failed for %s: script stopped: %v", label, err))
 	}
 	if field := t.ReasonField; field != "" {
-		if given, _ := args[field].(string); strings.TrimSpace(given) == "" {
-			args[field] = rn.reason
+		switch given := args[field].(type) {
+		case nil:
+			args[field] = s.reason
+		case string:
+			if strings.TrimSpace(given) == "" {
+				args[field] = s.reason
+			}
+		default:
+			s.log(fmt.Sprintf("[TOOL] %s error: %s must be a string", label, field))
+			return fail(fmt.Sprintf("tool call failed for %s: %s must be a string", label, field))
 		}
 	}
 
-	res, err := rn.r.caller.RouteCall(rn.ctx, Via, t.Target, args)
+	res, err := s.r.caller.RouteCall(s.ctx, Via, t.Target, args)
 	if err != nil {
-		rn.log(fmt.Sprintf("[TOOL] %s error: %v", label, err))
-		return nil, fmt.Errorf("tool call failed for %s: %v", label, err)
+		s.log(fmt.Sprintf("[TOOL] %s error: %v", label, err))
+		return fail(fmt.Sprintf("tool call failed for %s: %v", label, err))
 	}
 	text := resultText(res, t.Name)
 	if res != nil && (res.IsError || held(res)) {
-		rn.log(fmt.Sprintf("[TOOL] %s error result: %s", label, text))
-		return nil, fmt.Errorf("tool call failed for %s: %s", label, text)
+		s.log(fmt.Sprintf("[TOOL] %s error result: %s", label, text))
+		return fail(fmt.Sprintf("tool call failed for %s: %s", label, text))
 	}
 	quoted, _ := jsonText(text, "")
-	rn.log(fmt.Sprintf("[TOOL] %s raw response: %s", label, quoted))
-	return decodeResult(text), nil
+	s.log(fmt.Sprintf("[TOOL] %s raw response: %s", label, quoted))
+	return parentMsg{Text: text}
+}
+
+// call and print make a session the in-process script's sink.
+func (s *session) call(server, member string, args map[string]any) parentMsg {
+	return s.handleCall(server, member, args)
+}
+
+func (s *session) print(text string) { s.log(text) }
+
+// log appends one line, up to the output limit.
+func (s *session) log(msg string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.truncated {
+		return
+	}
+	if s.logBytes+len(msg) > s.r.limits.MaxOutputBytes {
+		s.truncated = true
+		s.logs = append(s.logs, fmt.Sprintf("[print output truncated: %d byte limit reached]", s.r.limits.MaxOutputBytes))
+		return
+	}
+	s.logBytes += len(msg) + 1
+	s.logs = append(s.logs, msg)
+}
+
+func (s *session) snapshotLogs() []string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([]string(nil), s.logs...)
 }
 
 // held reports a result whose call did not run.
@@ -291,43 +209,22 @@ func resultText(res *mcp.CallToolResult, toolName string) string {
 	return strings.TrimSpace(b.String())
 }
 
-// log appends one print line, up to the output limit.
-func (rn *run) log(msg string) {
-	rn.mu.Lock()
-	defer rn.mu.Unlock()
-	if rn.truncated {
-		return
-	}
-	if rn.logBytes+len(msg) > rn.r.limits.MaxOutputBytes {
-		rn.truncated = true
-		rn.logs = append(rn.logs, fmt.Sprintf("[print output truncated: %d byte limit reached]", rn.r.limits.MaxOutputBytes))
-		return
-	}
-	rn.logBytes += len(msg) + 1
-	rn.logs = append(rn.logs, msg)
-}
-
-func (rn *run) snapshotLogs() []string {
-	rn.mu.Lock()
-	defer rn.mu.Unlock()
-	return append([]string(nil), rn.logs...)
-}
-
 // render is Bifrost's response text for each outcome.
-func (r *Runtime) render(o execOutcome) (string, bool) {
-	keys := strings.Join(o.servers, ", ")
+func (r *Runtime) render(code string, serverKeys, logs []string, res scriptResult) (string, bool) {
+	keys := strings.Join(serverKeys, ", ")
 	var text string
 	failed := false
 	switch {
-	case o.err != nil:
+	case res.errKind != "":
 		failed = true
-		logs := ""
-		if len(o.logs) > 0 {
-			logs = fmt.Sprintf("\n\nPrint Output:\n%s\n", strings.Join(o.logs, "\n"))
+		hints := errorHints(res.errKind, res.errMsg, usesExceptions(code), serverKeys)
+		logText := ""
+		if len(logs) > 0 {
+			logText = fmt.Sprintf("\n\nPrint Output:\n%s\n", strings.Join(logs, "\n"))
 		}
 		text = fmt.Sprintf("Execution %s error:\n\n%s\n\nHints:\n%s%s\n\nEnvironment:\n  Available server keys: %s",
-			o.err.kind, o.err.message, strings.Join(o.err.hints, "\n"), logs, keys)
-	case len(o.logs) == 0 && !o.hasRes:
+			res.errKind, res.errMsg, strings.Join(hints, "\n"), logText, keys)
+	case len(logs) == 0 && !res.hasResult:
 		hints := []string{
 			"Add print() statements throughout your code to debug and see what's happening at each step",
 			"Assign the final value to 'result' variable if you want to return it: result = computed_value",
@@ -337,16 +234,17 @@ func (r *Runtime) render(o execOutcome) (string, bool) {
 			"The code executed without errors but returned no output (no print output and no result variable).\n\n"+
 			"Hints:\n%s\n\nEnvironment:\n  Available server keys: %s", strings.Join(hints, "\n"), keys)
 	default:
-		if len(o.logs) > 0 {
-			text = fmt.Sprintf("Print output:\n%s\n\nExecution completed successfully.", strings.Join(o.logs, "\n"))
+		if len(logs) > 0 {
+			text = fmt.Sprintf("Print output:\n%s\n\nExecution completed successfully.", strings.Join(logs, "\n"))
 		} else {
 			text = "Execution completed successfully."
 		}
-		if o.hasRes {
-			if js, err := jsonText(o.result, "  "); err == nil {
-				text += "\nReturn value: " + js
+		if res.hasResult {
+			var pretty bytes.Buffer
+			if err := json.Indent(&pretty, res.result, "", "  "); err == nil {
+				text += "\nReturn value: " + pretty.String()
 			} else {
-				text += fmt.Sprintf("\nReturn value: %v", o.result)
+				text += "\nReturn value: " + string(res.result)
 			}
 		}
 		text += "\n\nEnvironment:\n  Available server keys: " + keys

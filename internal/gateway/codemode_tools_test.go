@@ -8,6 +8,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/mark3labs/mcp-go/mcp"
 
@@ -57,8 +58,11 @@ func TestCodeModeToolsAlwaysOnPinnedAndReasonOptional(t *testing.T) {
 			t.Errorf("%s should be pinned", n)
 		}
 		e := f.gw.tools[n]
-		if !e.reasonOptional || e.upstream != "tools" || e.forcedAction == nil || *e.forcedAction != policy.ActionAllow {
+		if !e.reasonOptional || e.upstream != "tools" || e.forcedAction != nil {
 			t.Errorf("%s entry = upstream %q optional %v forced %v", n, e.upstream, e.reasonOptional, e.forcedAction)
+		}
+		if e.noCallTimeout != (n == CodeModeExecuteToolCode) {
+			t.Errorf("%s noCallTimeout = %v", n, e.noCallTimeout)
 		}
 		for _, r := range e.tool.InputSchema.Required {
 			if r == ReasonField {
@@ -674,4 +678,149 @@ BkCoreServices.seller_central_proxy(accountId="njg-us",
 			t.Fatalf("output:\n%s", out)
 		}
 	})
+}
+
+// TestCodeModeExplicitPolicyApplies: the code-mode tools are open by
+// default, but an operator's explicit rule on executeToolCode still
+// decides it: deny refuses the run, ask holds the whole run for approval.
+// Nested calls keep their own policy either way.
+func TestCodeModeExplicitPolicyApplies(t *testing.T) {
+	f := newAccessFixture(t, nil)
+	ctx := context.Background()
+	if _, err := f.gw.policy.Set(ctx, policy.ScopeTool, CodeModeExecuteToolCode, "deny", "", false); err != nil {
+		t.Fatal(err)
+	}
+	res := route(t, f.gw, f.member, CodeModeExecuteToolCode, map[string]any{"code": "result = alpha.get_status()"})
+	if !res.IsError || !strings.Contains(textOf(res), "denied by policy: explicit tool-policy: deny") {
+		t.Fatalf("denied run: %v %s", res.IsError, textOf(res))
+	}
+	if f.calls.Load() != 0 {
+		t.Fatal("the script ran despite the deny")
+	}
+	if ev, _ := lastEvent(f.met, CodeModeExecuteToolCode); ev.Outcome != metrics.OutcomeDenied || ev.ErrorClass != "policy" {
+		t.Fatalf("denied metric = %+v", ev)
+	}
+	// Siblings and direct calls are untouched.
+	if res := route(t, f.gw, f.member, CodeModeListToolFiles, map[string]any{}); res.IsError {
+		t.Fatalf("listToolFiles under an executeToolCode deny: %s", textOf(res))
+	}
+	if res := f.call(t, f.member, "alpha.get_status", nil); res.IsError {
+		t.Fatalf("direct call: %s", textOf(res))
+	}
+
+	if _, err := f.gw.policy.Set(ctx, policy.ScopeTool, CodeModeExecuteToolCode, "ask", "", false); err != nil {
+		t.Fatal(err)
+	}
+	res = route(t, f.gw, f.member, CodeModeExecuteToolCode, map[string]any{"code": "result = alpha.get_status()"})
+	if res.IsError || !strings.Contains(textOf(res), "Tool execution requires human approval") || res.Meta == nil || res.Meta.AdditionalFields["toolyard.deferred"] != true {
+		t.Fatalf("ask should hold the run: %v %s", res.IsError, textOf(res))
+	}
+	if f.calls.Load() != 1 {
+		t.Fatalf("the held script ran (calls=%d)", f.calls.Load())
+	}
+	pending, err := f.bus.ListPendingByAgent(ctx, memberID)
+	if err != nil || len(pending) != 1 || pending[0].ToolName != CodeModeExecuteToolCode {
+		t.Fatalf("pending = %+v (err %v)", pending, err)
+	}
+
+	if err := f.gw.policy.DeleteTarget(ctx, policy.ScopeTool, CodeModeExecuteToolCode); err != nil {
+		t.Fatal(err)
+	}
+	res = route(t, f.gw, f.member, CodeModeExecuteToolCode, map[string]any{"code": "result = alpha.get_status()"})
+	if res.IsError || !strings.Contains(textOf(res), "Execution completed successfully") {
+		t.Fatalf("after the rule is gone: %s", textOf(res))
+	}
+}
+
+// TestCodeModeScriptOutlivesUpstreamCallTimeout: the per-dispatch upstream
+// timeout does not cut a script short; it still applies to each nested
+// call through that call's own dispatch.
+func TestCodeModeScriptOutlivesUpstreamCallTimeout(t *testing.T) {
+	db, err := store.Open(filepath.Join(t.TempDir(), "t.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	bus, err := approval.New(context.Background(), db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	met := &fakeMetrics{}
+	gw := New(Options{Policy: policy.New(db), Approval: bus, Audit: audit.New(db), Hub: realtime.NewHub(), Memory: memory.New(db),
+		Metrics: met, UpstreamCallTimeout: 250 * time.Millisecond})
+	gw.RegisterBuiltins()
+	t.Cleanup(func() { _ = gw.Close() })
+	sleeper := func(d time.Duration) directHandler {
+		return func(ctx context.Context, _ map[string]any) (*mcp.CallToolResult, error) {
+			select {
+			case <-time.After(d):
+				return mcp.NewToolResultText(`"slept"`), nil
+			case <-ctx.Done():
+				return nil, ctx.Err()
+			}
+		}
+	}
+	for short, d := range map[string]time.Duration{"get_quick": 120 * time.Millisecond, "get_slow": 600 * time.Millisecond} {
+		gw.registerEntry(toolEntry{
+			tool:     mcp.Tool{Name: "up." + short, InputSchema: mcp.ToolInputSchema{Type: "object", Properties: addMetaProps(map[string]any{})}},
+			upstream: "up", originalName: short, reasonField: ReasonField, handle: sleeper(d),
+		})
+	}
+	ctx := WithAgentID(context.Background(), "ag_t")
+
+	// Three 120ms calls: 360ms of script under a 250ms per-call timeout.
+	res, err := gw.RouteCall(ctx, "test", CodeModeExecuteToolCode, map[string]any{"code": "result = [up.get_quick(), up.get_quick(), up.get_quick()]"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.IsError || !strings.Contains(textOf(res), "Execution completed successfully") {
+		t.Fatalf("script cut short by the per-call timeout:\n%s", textOf(res))
+	}
+	if ev, ok := lastEvent(met, CodeModeExecuteToolCode); !ok || ev.Outcome != metrics.OutcomeOK {
+		t.Fatalf("script metric = %+v", ev)
+	}
+	// One 600ms call: the nested dispatch still enforces 250ms.
+	res, err = gw.RouteCall(ctx, "test", CodeModeExecuteToolCode, map[string]any{"code": "result = up.get_slow()"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !res.IsError || !strings.Contains(textOf(res), "tool call failed for up.get_slow: tool failed: context deadline exceeded") {
+		t.Fatalf("nested call should keep the upstream timeout:\n%s", textOf(res))
+	}
+	if ev, _ := lastEvent(met, "up.get_slow"); ev.Outcome != metrics.OutcomeError || ev.Via != codemode.Via {
+		t.Fatalf("nested metric = %+v", ev)
+	}
+	// And the description advertises what is enforced.
+	desc := gw.tools[CodeModeExecuteToolCode].tool.Description
+	if !strings.Contains(desc, gw.codeModeRuntime().LimitsText()) || !strings.Contains(desc, "5 minutes wall clock") {
+		t.Fatalf("description does not carry the limits: %s", desc)
+	}
+}
+
+// TestCodeModeWorkerDeathLeavesGatewayUp: a script that allocates past the
+// worker's memory cap fails cleanly and the gateway keeps serving.
+func TestCodeModeWorkerDeathLeavesGatewayUp(t *testing.T) {
+	f := newAccessFixture(t, nil)
+	res := route(t, f.gw, f.member, CodeModeExecuteToolCode, map[string]any{
+		"code": "print(\"start\")\nbig = [0] * (1 << 28)\nresult = len(big)",
+	})
+	if !res.IsError || !strings.Contains(textOf(res), "script exceeded the memory limit (256 MiB)") || !strings.Contains(textOf(res), "Print Output:\nstart") {
+		t.Fatalf("huge allocation: %v\n%s", res.IsError, textOf(res))
+	}
+	if ev, _ := lastEvent(f.met, CodeModeExecuteToolCode); ev.Outcome != metrics.OutcomeError {
+		t.Fatalf("metric after worker death = %+v", ev)
+	}
+	// Self-referencing values are errors, not crashes, in the worker too.
+	res = route(t, f.gw, f.member, CodeModeExecuteToolCode, map[string]any{"code": "l = []\nl.append(l)\nresult = l"})
+	if !res.IsError || !strings.Contains(textOf(res), "value contains a cycle") {
+		t.Fatalf("cycle: %s", textOf(res))
+	}
+	// Still up: listing works and a fresh worker runs the next script.
+	if res := route(t, f.gw, f.member, CodeModeListToolFiles, map[string]any{}); res.IsError {
+		t.Fatalf("listToolFiles after the crash: %s", textOf(res))
+	}
+	res = route(t, f.gw, f.member, CodeModeExecuteToolCode, map[string]any{"code": "result = alpha.get_status()"})
+	if res.IsError || !strings.Contains(textOf(res), "Return value: \"ran\"") {
+		t.Fatalf("script after the crash: %s", textOf(res))
+	}
 }

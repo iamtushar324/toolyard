@@ -19,23 +19,24 @@ const noServersText = "No servers are available to you. There are no virtual .py
 // ListToolFiles renders the servers/<Server>/<tool>.pyi tree for the ctx
 // caller.
 func (r *Runtime) ListToolFiles(ctx context.Context) string {
-	servers := buildServers(r.caller.Tools(ctx))
+	cat := buildCatalog(r.caller.Tools(ctx))
 	var files []string
-	for _, s := range servers {
+	for _, s := range cat.servers {
 		for _, b := range s.bound {
-			files = append(files, fmt.Sprintf("servers/%s/%s.pyi", s.name, b.ident))
+			files = append(files, fmt.Sprintf("servers/%s/%s.pyi", s.ident, b.ident))
 		}
 	}
 	if len(files) == 0 {
 		return noServersText
 	}
-	return strings.Join([]string{
+	lines := []string{
 		"# Workflow: listToolFiles -> readToolFile -> (optional) getToolDocs -> executeToolCode",
 		"# Filenames below use the exact canonical tool identifiers available in executeToolCode.",
 		"# Still call readToolFile before executeToolCode to confirm parameters and return shape.",
-		"",
-		renderTree(files),
-	}, "\n")
+	}
+	lines = append(lines, cat.refusedNotes()...)
+	lines = append(lines, "", renderTree(files))
+	return strings.Join(lines, "\n")
 }
 
 // renderTree lays a sorted list of slash paths out as an indented tree,
@@ -86,12 +87,15 @@ func renderTree(files []string) string {
 // (1-based, inclusive) slice the result; out-of-range values are clamped.
 // ok is false when the answer is an explanation rather than a file.
 func (r *Runtime) ReadToolFile(ctx context.Context, fileName string, startLine, endLine *int) (text string, ok bool) {
-	servers := buildServers(r.caller.Tools(ctx))
+	cat := buildCatalog(r.caller.Tools(ctx))
 	serverName, toolName, toolLevel, valid := parseFilePath(fileName)
 	if !valid {
 		return fmt.Sprintf("Invalid filename '%s'. Use servers/<serverName>/<toolName>.pyi as listed by listToolFiles.", fileName), false
 	}
-	srv, several := findServer(servers, serverName)
+	srv, several, refused := findServer(cat, serverName)
+	if len(refused) > 0 {
+		return refusedServerText(serverName, refused), false
+	}
 	if len(several) > 0 {
 		var b strings.Builder
 		fmt.Fprintf(&b, "Multiple servers match filename '%s':\n", fileName)
@@ -104,9 +108,9 @@ func (r *Runtime) ReadToolFile(ctx context.Context, fileName string, startLine, 
 	if srv == nil {
 		var b strings.Builder
 		fmt.Fprintf(&b, "No server found matching '%s'. Available virtual files are:\n", serverName)
-		for _, s := range servers {
+		for _, s := range cat.servers {
 			for _, bd := range s.bound {
-				fmt.Fprintf(&b, "  - servers/%s/%s.pyi\n", s.name, bd.ident)
+				fmt.Fprintf(&b, "  - servers/%s/%s.pyi\n", s.ident, bd.ident)
 			}
 		}
 		return b.String(), false
@@ -116,13 +120,13 @@ func (r *Runtime) ReadToolFile(ctx context.Context, fileName string, startLine, 
 	if toolLevel {
 		b, names := srv.lookup(toolName)
 		if len(names) > 0 {
-			return ambiguityError(srv.name, toolName, names).Error(), false
+			return ambiguityError(srv.ident, toolName, names).Error(), false
 		}
 		if b == nil {
 			var sb strings.Builder
-			fmt.Fprintf(&sb, "Tool '%s' not found in server '%s'. Available tools in this server are:\n", toolName, srv.name)
+			fmt.Fprintf(&sb, "Tool '%s' not found in server '%s'. Available tools in this server are:\n", toolName, srv.ident)
 			for _, bd := range srv.bound {
-				fmt.Fprintf(&sb, "  - servers/%s/%s.pyi\n", srv.name, bd.ident)
+				fmt.Fprintf(&sb, "  - servers/%s/%s.pyi\n", srv.ident, bd.ident)
 			}
 			return sb.String(), false
 		}
@@ -191,14 +195,17 @@ func parseFilePath(fileName string) (serverName, toolName string, toolLevel, val
 func compactSignatures(srv *server, tools []binding, toolLevel bool) string {
 	var b strings.Builder
 	if toolLevel && len(tools) == 1 {
-		fmt.Fprintf(&b, "# %s.%s tool\n", srv.name, tools[0].ident)
+		fmt.Fprintf(&b, "# %s.%s tool\n", srv.ident, tools[0].ident)
 	} else {
-		fmt.Fprintf(&b, "# %s server tools\n", srv.name)
+		fmt.Fprintf(&b, "# %s server tools\n", srv.ident)
 	}
-	fmt.Fprintf(&b, "# Usage: %s.tool_name(param=value)\n", srv.name)
+	if srv.ident != srv.name {
+		fmt.Fprintf(&b, "# Server %q is called %s in code.\n", srv.name, srv.ident)
+	}
+	fmt.Fprintf(&b, "# Usage: %s.tool_name(param=value)\n", srv.ident)
 	b.WriteString("# The def names below are the exact callable names to use in executeToolCode.\n")
 	b.WriteString("# Read this file before executeToolCode to confirm parameters and return shape.\n")
-	fmt.Fprintf(&b, "# For detailed docs: use getToolDocs(server=%q, tool=\"tool_name\")\n", srv.name)
+	fmt.Fprintf(&b, "# For detailed docs: use getToolDocs(server=%q, tool=\"tool_name\")\n", srv.ident)
 	b.WriteString("# Note: Descriptions may be truncated. Use getToolDocs for full details.\n")
 	if !toolLevel && len(srv.ambiguous) > 0 {
 		idents := make([]string, 0, len(srv.ambiguous))
@@ -220,14 +227,6 @@ func compactSignatures(srv *server, tools []binding, toolLevel bool) string {
 		}
 	}
 	return b.String()
-}
-
-func quoteAll(names []string) []string {
-	out := make([]string, len(names))
-	for i, n := range names {
-		out[i] = fmt.Sprintf("%q", n)
-	}
-	return out
 }
 
 // shortDescription is the first sentence when it ends within 80 bytes,
@@ -319,8 +318,11 @@ func literal(v any) string {
 // GetToolDocs renders the full documentation of one tool. ok is false when
 // the answer is an explanation rather than documentation.
 func (r *Runtime) GetToolDocs(ctx context.Context, serverName, toolName string) (text string, ok bool) {
-	servers := buildServers(r.caller.Tools(ctx))
-	srv, several := findServer(servers, serverName)
+	cat := buildCatalog(r.caller.Tools(ctx))
+	srv, several, refused := findServer(cat, serverName)
+	if len(refused) > 0 {
+		return refusedServerText(serverName, refused), false
+	}
 	if len(several) > 0 {
 		return fmt.Sprintf("Multiple servers match '%s': %s. Use the exact display name from listToolFiles.",
 			serverName, strings.Join(several, ", ")), false
@@ -328,24 +330,24 @@ func (r *Runtime) GetToolDocs(ctx context.Context, serverName, toolName string) 
 	if srv == nil {
 		var b strings.Builder
 		fmt.Fprintf(&b, "Server '%s' not found. Available servers are:\n", serverName)
-		for _, s := range servers {
-			fmt.Fprintf(&b, "  - %s\n", s.name)
+		for _, s := range cat.servers {
+			fmt.Fprintf(&b, "  - %s\n", s.ident)
 		}
 		return b.String(), false
 	}
 	bd, names := srv.lookup(toolName)
 	if len(names) > 0 {
-		return ambiguityError(srv.name, toolName, names).Error(), false
+		return ambiguityError(srv.ident, toolName, names).Error(), false
 	}
 	if bd == nil {
 		var b strings.Builder
-		fmt.Fprintf(&b, "Tool '%s' not found in server '%s'. Available tools are:\n", toolName, srv.name)
+		fmt.Fprintf(&b, "Tool '%s' not found in server '%s'. Available tools are:\n", toolName, srv.ident)
 		for _, x := range srv.bound {
 			fmt.Fprintf(&b, "  - %s\n", x.ident)
 		}
 		return b.String(), false
 	}
-	return toolDocs(srv.name, *bd), true
+	return toolDocs(srv.ident, *bd), true
 }
 
 // toolDocs is the getToolDocs body: header, signature and a docstring.
@@ -443,4 +445,14 @@ func exampleParams(props map[string]any, required []string) string {
 		}
 	}
 	return fmt.Sprintf("%s=\"...\"", names[0])
+}
+
+// refusedServerText explains a server key that has no identifier of its
+// own.
+func refusedServerText(name string, keys []string) string {
+	if len(keys) == 1 {
+		return fmt.Sprintf("Server '%s' cannot be called from code: no Starlark identifier can be made of its name. Use tools.execute with the exact catalog name instead.", name)
+	}
+	return fmt.Sprintf("Server '%s' is ambiguous in code: %s all map to the same identifier. toolyard does not guess; use tools.execute with the exact catalog name instead.",
+		name, strings.Join(quoteAll(keys), ", "))
 }

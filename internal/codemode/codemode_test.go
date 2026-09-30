@@ -45,6 +45,12 @@ func (f *fakeCaller) seen() []call {
 	return append([]call(nil), f.calls...)
 }
 
+func (f *fakeCaller) reset() {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls = nil
+}
+
 func jsonResult(v any) (*mcp.CallToolResult, error) {
 	b, _ := json.Marshal(v)
 	return mcp.NewToolResultText(string(b)), nil
@@ -101,6 +107,23 @@ func newFake() *fakeCaller {
 	return f
 }
 
+// inProcess is the fast path for unit tests: same script engine, no child.
+func inProcess(f Caller, l Limits) *Runtime {
+	rt := New(f, l)
+	rt.inProcess = true
+	return rt
+}
+
+// bothWays runs a test against the in-process engine and the real worker.
+func bothWays(t *testing.T, f Caller, l Limits, fn func(t *testing.T, rt *Runtime)) {
+	t.Run("in-process", func(t *testing.T) { fn(t, inProcess(f, l)) })
+	t.Run("worker", func(t *testing.T) {
+		rt := New(f, l)
+		rt.SetWorker(testWorker())
+		fn(t, rt)
+	})
+}
+
 func TestCanonicalAndAliasNames(t *testing.T) {
 	cases := []struct{ in, canon, alias string }{
 		{"get-all-clients", "get_all_clients", ""},
@@ -111,6 +134,8 @@ func TestCanonicalAndAliasNames(t *testing.T) {
 		{"9lives", "_9lives", ""},
 		{"foo.bar", "foobar", ""},
 		{"trailing_", "trailing", "trailing_"},
+		{"load", "load_", ""},
+		{"Import", "import_", "Import"},
 		{"", "tool", ""},
 	}
 	for _, c := range cases {
@@ -123,6 +148,84 @@ func TestCanonicalAndAliasNames(t *testing.T) {
 	}
 }
 
+func TestServerIdentifiers(t *testing.T) {
+	cases := []struct{ in, want string }{
+		{"BkCoreServices", "BkCoreServices"},
+		{"memory", "memory"},
+		{"bk-core", "bk_core"},
+		{"9lives", "_9lives"},
+		{"load", "load_"},
+		{"my.server", "my_server"},
+		{"Bk Core", "Bk_Core"},
+		{"---", "___"},
+		{"!!!", ""},
+	}
+	for _, c := range cases {
+		if got := serverIdent(c.in); got != c.want {
+			t.Errorf("serverIdent(%q) = %q, want %q", c.in, got, c.want)
+		}
+	}
+
+	ping := func(server string) Tool {
+		return Tool{Server: server, Name: "ping", Target: server + ".ping", Description: "Ping.", Properties: map[string]any{}, ReasonField: "_reason"}
+	}
+	f := &fakeCaller{handlers: map[string]func(map[string]any) (*mcp.CallToolResult, error){}}
+	f.tools = []Tool{ping("BkCoreServices"), ping("bk-core"), ping("9lives"), ping("load"), ping("!!!")}
+	for _, s := range []string{"BkCoreServices", "bk-core", "9lives", "load"} {
+		srv := s
+		f.handlers[srv+".ping"] = func(map[string]any) (*mcp.CallToolResult, error) { return jsonResult(map[string]any{"from": srv}) }
+	}
+	rt := inProcess(f, Limits{})
+	ctx := context.Background()
+
+	list := rt.ListToolFiles(ctx)
+	wantTree := "servers/\n  BkCoreServices/\n    ping.pyi\n  _9lives/\n    ping.pyi\n  bk_core/\n    ping.pyi\n  load_/\n    ping.pyi"
+	if !strings.HasSuffix(list, wantTree) || !strings.Contains(list, `# Not callable: server "!!!" (no identifier can be made of the name)`) {
+		t.Fatalf("listing:\n%s", list)
+	}
+	for _, name := range []string{"servers/bk_core/ping.pyi", "servers/bk-core/ping.pyi", "servers/BK-CORE/ping"} {
+		stub, ok := rt.ReadToolFile(ctx, name, nil, nil)
+		if !ok || !strings.Contains(stub, "# bk_core.ping tool\n# Server \"bk-core\" is called bk_core in code.\n# Usage: bk_core.tool_name(param=value)") ||
+			!strings.Contains(stub, `getToolDocs(server="bk_core", tool="tool_name")`) {
+			t.Fatalf("%s (ok=%v):\n%s", name, ok, stub)
+		}
+	}
+	if stub, ok := rt.ReadToolFile(ctx, "servers/BkCoreServices/ping.pyi", nil, nil); !ok || strings.Contains(stub, "is called") {
+		t.Fatalf("an identifier-shaped key gets no rename note:\n%s", stub)
+	}
+	if doc, ok := rt.GetToolDocs(ctx, "9lives", "ping"); !ok || !strings.Contains(doc, "# Documentation for _9lives.ping tool") || !strings.Contains(doc, "result = _9lives.ping()") {
+		t.Fatalf("docs by key:\n%s", doc)
+	}
+	if bad, ok := rt.ReadToolFile(ctx, "servers/!!!/ping.pyi", nil, nil); ok || !strings.Contains(bad, "cannot be called from code") {
+		t.Fatalf("unbindable key: ok=%v %s", ok, bad)
+	}
+
+	text, failed := rt.ExecuteToolCode(ctx, "result = [BkCoreServices.ping()[\"from\"], bk_core.ping()[\"from\"], _9lives.ping()[\"from\"], load_.ping()[\"from\"]]", "")
+	if failed || !strings.Contains(text, "Available server keys: BkCoreServices, _9lives, bk_core, load_") ||
+		!strings.Contains(text, "[TOOL] bk_core.ping raw response:") || !strings.Contains(text, `"9lives"`) {
+		t.Fatalf("calls through sanitised identifiers (failed=%v):\n%s", failed, text)
+	}
+	if got := f.seen(); len(got) != 4 || got[1].target != "bk-core.ping" || got[2].target != "9lives.ping" || got[3].target != "load.ping" {
+		t.Fatalf("targets = %+v", got)
+	}
+
+	// Two keys that sanitise alike are both refused.
+	f = &fakeCaller{tools: []Tool{ping("bk-core"), ping("bk_core"), ping("ok")}, handlers: map[string]func(map[string]any) (*mcp.CallToolResult, error){}}
+	rt = inProcess(f, Limits{})
+	list = rt.ListToolFiles(ctx)
+	if !strings.Contains(list, `# Not callable: server bk_core (ambiguous, could be "bk-core" or "bk_core")`) || strings.Contains(list, "  bk_core/") {
+		t.Fatalf("collision listing:\n%s", list)
+	}
+	for _, name := range []string{"servers/bk_core/ping.pyi", "servers/bk-core/ping.pyi"} {
+		if bad, ok := rt.ReadToolFile(ctx, name, nil, nil); ok || !strings.Contains(bad, "is ambiguous in code") {
+			t.Fatalf("%s: ok=%v %s", name, ok, bad)
+		}
+	}
+	if text, failed := rt.ExecuteToolCode(ctx, "result = bk_core.ping()", ""); !failed || !strings.Contains(text, "undefined: bk_core") || !strings.Contains(text, "Available server keys: ok") {
+		t.Fatalf("collided key in code:\n%s", text)
+	}
+}
+
 func TestCollidingNamesAreRefused(t *testing.T) {
 	tools := []Tool{
 		{Server: "S", Name: "get-client", Target: "S.get-client"},
@@ -131,11 +234,11 @@ func TestCollidingNamesAreRefused(t *testing.T) {
 		{Server: "S", Name: "save_issue", Target: "S.save_issue"},
 		{Server: "S", Name: "list_all", Target: "S.list_all"},
 	}
-	servers := buildServers(tools)
-	if len(servers) != 1 {
-		t.Fatalf("servers = %d", len(servers))
+	cat := buildCatalog(tools)
+	if len(cat.servers) != 1 {
+		t.Fatalf("servers = %d", len(cat.servers))
 	}
-	s := servers[0]
+	s := cat.servers[0]
 	var idents []string
 	for _, b := range s.bound {
 		idents = append(idents, b.ident)
@@ -163,7 +266,7 @@ func TestCollidingNamesAreRefused(t *testing.T) {
 	}
 
 	f := &fakeCaller{tools: tools, handlers: map[string]func(map[string]any) (*mcp.CallToolResult, error){}}
-	rt := New(f, Limits{})
+	rt := inProcess(f, Limits{})
 	text, failed := rt.ExecuteToolCode(context.Background(), `result = S.get_client(clientId="x")`, "")
 	if !failed || !strings.Contains(text, `S.get_client is ambiguous: it could be "get-client" or "get_client"`) {
 		t.Fatalf("ambiguous call output:\n%s", text)
@@ -182,7 +285,7 @@ func TestCollidingNamesAreRefused(t *testing.T) {
 }
 
 func TestListToolFilesTree(t *testing.T) {
-	rt := New(newFake(), Limits{})
+	rt := inProcess(newFake(), Limits{})
 	got := rt.ListToolFiles(context.Background())
 	want := strings.Join([]string{
 		"# Workflow: listToolFiles -> readToolFile -> (optional) getToolDocs -> executeToolCode",
@@ -201,14 +304,14 @@ func TestListToolFilesTree(t *testing.T) {
 		t.Fatalf("listToolFiles:\n%s\nwant:\n%s", got, want)
 	}
 
-	empty := New(&fakeCaller{}, Limits{})
+	empty := inProcess(&fakeCaller{}, Limits{})
 	if got := empty.ListToolFiles(context.Background()); got != noServersText {
 		t.Fatalf("empty catalog: %q", got)
 	}
 }
 
 func TestReadToolFileStub(t *testing.T) {
-	rt := New(newFake(), Limits{})
+	rt := inProcess(newFake(), Limits{})
 	ctx := context.Background()
 	want := strings.Join([]string{
 		"# Total lines: 10 (this is the complete file, no need to paginate)",
@@ -309,7 +412,7 @@ func TestPythonTypes(t *testing.T) {
 }
 
 func TestGetToolDocs(t *testing.T) {
-	rt := New(newFake(), Limits{})
+	rt := inProcess(newFake(), Limits{})
 	ctx := context.Background()
 	doc, ok := rt.GetToolDocs(ctx, "bkcoreservices", "upsert_bifrost_virtual_key_actor")
 	if !ok {
@@ -337,10 +440,7 @@ func TestGetToolDocs(t *testing.T) {
 	}
 }
 
-func TestExecuteMultiCallScript(t *testing.T) {
-	f := newFake()
-	rt := New(f, Limits{})
-	code := `
+const multiCallScript = `
 # pick the biggest client and read its record
 clients = BkCoreServices.get_all_clients()
 print("clients:", len(clients))
@@ -349,56 +449,62 @@ detail = BkCoreServices.get_client(clientId=best["id"])
 note = memory.get(key="x")
 result = {"id": detail["data"]["id"], "seller": detail["data"]["amz_seller_id"], "n": best["n"], "note": note, "ids": [c["id"] for c in clients]}
 `
-	text, failed := rt.ExecuteToolCode(context.Background(), code, "outer reason from the client, long enough")
-	if failed {
-		t.Fatalf("script failed:\n%s", text)
-	}
-	want := strings.Join([]string{
-		"Print output:",
-		`[TOOL] BkCoreServices.get_all_clients raw response: "[{\"id\":\"vai-us\",\"n\":3},{\"id\":\"ols-us\",\"n\":12345678901234567}]"`,
-		"clients: 2",
-		`[TOOL] BkCoreServices.get_client raw response: "{\"data\":{\"amz_seller_id\":\"A1B2\",\"id\":\"ols-us\"}}"`,
-		`[TOOL] memory.get raw response: "plain text, not json"`,
-		"",
-		"Execution completed successfully.",
-		"Return value: {",
-		`  "id": "ols-us",`,
-		`  "ids": [`,
-		`    "vai-us",`,
-		`    "ols-us"`,
-		`  ],`,
-		`  "n": 12345678901234567,`,
-		`  "note": "plain text, not json",`,
-		`  "seller": "A1B2"`,
-		"}",
-		"",
-		"Environment:",
-		"  Available server keys: BkCoreServices, memory",
-		"Note: This is a Starlark (Python subset) environment. Use MCP tools for external interactions.",
-	}, "\n")
-	if text != want {
-		t.Fatalf("output:\n%s\nwant:\n%s", text, want)
-	}
 
-	calls := f.seen()
-	if len(calls) != 3 {
-		t.Fatalf("calls = %+v", calls)
-	}
-	for i, want := range []string{"BkCoreServices.get-all-clients", "BkCoreServices.get_client", "memory.get"} {
-		if calls[i].target != want || calls[i].via != Via {
-			t.Fatalf("call %d = %+v, want %s via %s", i, calls[i], want, Via)
+var multiCallWant = strings.Join([]string{
+	"Print output:",
+	`[TOOL] BkCoreServices.get_all_clients raw response: "[{\"id\":\"vai-us\",\"n\":3},{\"id\":\"ols-us\",\"n\":12345678901234567}]"`,
+	"clients: 2",
+	`[TOOL] BkCoreServices.get_client raw response: "{\"data\":{\"amz_seller_id\":\"A1B2\",\"id\":\"ols-us\"}}"`,
+	`[TOOL] memory.get raw response: "plain text, not json"`,
+	"",
+	"Execution completed successfully.",
+	"Return value: {",
+	`  "id": "ols-us",`,
+	`  "ids": [`,
+	`    "vai-us",`,
+	`    "ols-us"`,
+	`  ],`,
+	`  "n": 12345678901234567,`,
+	`  "note": "plain text, not json",`,
+	`  "seller": "A1B2"`,
+	"}",
+	"",
+	"Environment:",
+	"  Available server keys: BkCoreServices, memory",
+	"Note: This is a Starlark (Python subset) environment. Use MCP tools for external interactions.",
+}, "\n")
+
+func TestExecuteMultiCallScript(t *testing.T) {
+	f := newFake()
+	bothWays(t, f, Limits{}, func(t *testing.T, rt *Runtime) {
+		f.reset()
+		text, failed := rt.ExecuteToolCode(context.Background(), multiCallScript, "outer reason from the client, long enough")
+		if failed {
+			t.Fatalf("script failed:\n%s", text)
 		}
-		if calls[i].args["_reason"] != "outer reason from the client, long enough" {
-			t.Fatalf("call %d reason = %v", i, calls[i].args["_reason"])
+		if text != multiCallWant {
+			t.Fatalf("output:\n%s\nwant:\n%s", text, multiCallWant)
 		}
-	}
-	if calls[1].args["clientId"] != "ols-us" {
-		t.Fatalf("get_client args = %v", calls[1].args)
-	}
+		calls := f.seen()
+		if len(calls) != 3 {
+			t.Fatalf("calls = %+v", calls)
+		}
+		for i, want := range []string{"BkCoreServices.get-all-clients", "BkCoreServices.get_client", "memory.get"} {
+			if calls[i].target != want || calls[i].via != Via {
+				t.Fatalf("call %d = %+v, want %s via %s", i, calls[i], want, Via)
+			}
+			if calls[i].args["_reason"] != "outer reason from the client, long enough" {
+				t.Fatalf("call %d reason = %v", i, calls[i].args["_reason"])
+			}
+		}
+		if calls[1].args["clientId"] != "ols-us" {
+			t.Fatalf("get_client args = %v", calls[1].args)
+		}
+	})
 }
 
 func TestExecuteReturnValueOnlyAndNoData(t *testing.T) {
-	rt := New(newFake(), Limits{})
+	rt := inProcess(newFake(), Limits{})
 	ctx := context.Background()
 	text, failed := rt.ExecuteToolCode(ctx, `result = [1, 2.5, None, True, "s", {"k": (1, 2)}]`, "")
 	if failed || text != "Execution completed successfully.\nReturn value: [\n  1,\n  2.5,\n  null,\n  true,\n  \"s\",\n  {\n    \"k\": [\n      1,\n      2\n    ]\n  }\n]\n\nEnvironment:\n  Available server keys: BkCoreServices, memory\nNote: This is a Starlark (Python subset) environment. Use MCP tools for external interactions." {
@@ -419,7 +525,7 @@ func TestExecuteReturnValueOnlyAndNoData(t *testing.T) {
 }
 
 func TestExecuteSyntaxError(t *testing.T) {
-	rt := New(newFake(), Limits{})
+	rt := inProcess(newFake(), Limits{})
 	text, failed := rt.ExecuteToolCode(context.Background(), "def broken(:\n  pass", "")
 	if !failed || !strings.HasPrefix(text, "Execution syntax error:\n\ncode.star:1:13: got ':', want ')'") {
 		t.Fatalf("syntax error:\n%s", text)
@@ -435,7 +541,7 @@ func TestExecuteSyntaxError(t *testing.T) {
 }
 
 func TestExecuteRuntimeError(t *testing.T) {
-	rt := New(newFake(), Limits{})
+	rt := inProcess(newFake(), Limits{})
 	code := `
 print("before")
 d = BkCoreServices.get_client(clientId="vai-us")
@@ -467,7 +573,7 @@ result = d["missing"]
 	if !strings.Contains(text, "get_client() takes keyword arguments: get_client(param=value)") {
 		t.Fatalf("positional args:\n%s", text)
 	}
-	text, _ = rt.ExecuteToolCode(context.Background(), `load("x.star", "y")`, "")
+	text, failed = rt.ExecuteToolCode(context.Background(), `load("x.star", "y")`, "")
 	if !failed || !strings.Contains(text, "Execution runtime error") {
 		t.Fatalf("load must not work:\n%s", text)
 	}
@@ -478,32 +584,35 @@ func TestExecuteToolErrorAborts(t *testing.T) {
 	f.handlers["BkCoreServices.get_client"] = func(map[string]any) (*mcp.CallToolResult, error) {
 		return mcp.NewToolResultError("upstream said no: client not found"), nil
 	}
-	rt := New(f, Limits{})
 	code := `
 a = BkCoreServices.get_all_clients()
 b = BkCoreServices.get_client(clientId="zzz")
 print("never printed")
 result = b
 `
-	text, failed := rt.ExecuteToolCode(context.Background(), code, "")
-	if !failed || !strings.HasPrefix(text, "Execution runtime error:\n\n") {
-		t.Fatalf("tool error:\n%s", text)
-	}
-	if !strings.Contains(text, "Error in get_client: tool call failed for BkCoreServices.get_client: upstream said no: client not found") {
-		t.Fatalf("tool error message:\n%s", text)
-	}
-	if !strings.Contains(text, "[TOOL] BkCoreServices.get_client error result: upstream said no: client not found") || strings.Contains(text, "never printed") {
-		t.Fatalf("tool error log:\n%s", text)
-	}
-	if len(f.seen()) != 2 {
-		t.Fatalf("script continued after the failure: %+v", f.seen())
-	}
+	bothWays(t, f, Limits{}, func(t *testing.T, rt *Runtime) {
+		f.reset()
+		text, failed := rt.ExecuteToolCode(context.Background(), code, "")
+		if !failed || !strings.HasPrefix(text, "Execution runtime error:\n\n") {
+			t.Fatalf("tool error:\n%s", text)
+		}
+		if !strings.Contains(text, "Error in get_client: tool call failed for BkCoreServices.get_client: upstream said no: client not found") {
+			t.Fatalf("tool error message:\n%s", text)
+		}
+		if !strings.Contains(text, "[TOOL] BkCoreServices.get_client error result: upstream said no: client not found") || strings.Contains(text, "never printed") {
+			t.Fatalf("tool error log:\n%s", text)
+		}
+		if len(f.seen()) != 2 {
+			t.Fatalf("script continued after the failure: %+v", f.seen())
+		}
+	})
 
 	// A Go error from the route is a tool error too.
 	f.handlers["BkCoreServices.get_client"] = func(map[string]any) (*mcp.CallToolResult, error) {
 		return nil, fmt.Errorf("transport exploded")
 	}
-	text, failed = rt.ExecuteToolCode(context.Background(), `result = BkCoreServices.get_client(clientId="x")`, "")
+	rt := inProcess(f, Limits{})
+	text, failed := rt.ExecuteToolCode(context.Background(), `result = BkCoreServices.get_client(clientId="x")`, "")
 	if !failed || !strings.Contains(text, "tool call failed for BkCoreServices.get_client: transport exploded") ||
 		!strings.Contains(text, "[TOOL] BkCoreServices.get_client error: transport exploded") {
 		t.Fatalf("route error:\n%s", text)
@@ -518,7 +627,7 @@ func TestExecuteHeldResultAborts(t *testing.T) {
 			res.Meta = &mcp.Meta{AdditionalFields: map[string]any{marker: true}}
 			return res, nil
 		}
-		rt := New(f, Limits{})
+		rt := inProcess(f, Limits{})
 		code := `
 r = BkCoreServices.upsert_bifrost_virtual_key_actor(email="a@b", userId="u", virtualKeyHash="h")
 print("continued with", r)
@@ -539,7 +648,7 @@ func TestExecuteLimits(t *testing.T) {
 	ctx := context.Background()
 
 	// Nested call budget.
-	rt := New(f, Limits{MaxCalls: 3})
+	rt := inProcess(f, Limits{MaxCalls: 3})
 	text, failed := rt.ExecuteToolCode(ctx, "for i in range(10):\n  BkCoreServices.get_all_clients()\nresult = 1", "")
 	if !failed || !strings.Contains(text, "this script already made 3 tool calls, the limit for one executeToolCode run") {
 		t.Fatalf("call limit:\n%s", text)
@@ -549,7 +658,7 @@ func TestExecuteLimits(t *testing.T) {
 	}
 
 	// Output cap: the log stops growing and the response is bounded.
-	rt = New(f, Limits{MaxOutputBytes: 2000})
+	rt = inProcess(f, Limits{MaxOutputBytes: 2000})
 	text, failed = rt.ExecuteToolCode(ctx, "for i in range(500):\n  print(\"x\" * 100)\nresult = \"y\" * 3000", "")
 	if failed {
 		t.Fatalf("output cap failed the script:\n%s", text)
@@ -559,7 +668,7 @@ func TestExecuteLimits(t *testing.T) {
 	}
 
 	// Step limit stops a spin long before the wall clock.
-	rt = New(f, Limits{MaxSteps: 10_000})
+	rt = inProcess(f, Limits{MaxSteps: 10_000})
 	text, failed = rt.ExecuteToolCode(ctx, "i = 0\nwhile True:\n  i += 1\nresult = i", "")
 	if !failed || !strings.Contains(text, "too many steps") {
 		t.Fatalf("step limit:\n%s", text)
@@ -571,7 +680,7 @@ func TestExecuteLimits(t *testing.T) {
 		time.Sleep(50 * time.Millisecond)
 		return jsonResult([]any{})
 	}
-	rt = New(slow, Limits{ScriptTimeout: 120 * time.Millisecond})
+	rt = inProcess(slow, Limits{ScriptTimeout: 120 * time.Millisecond})
 	start := time.Now()
 	text, failed = rt.ExecuteToolCode(ctx, "for i in range(100):\n  BkCoreServices.get_all_clients()\nresult = 1", "")
 	if !failed || !strings.Contains(text, "script stopped: context deadline exceeded (limit 120ms)") {
@@ -583,10 +692,60 @@ func TestExecuteLimits(t *testing.T) {
 	// The caller's own deadline applies when shorter.
 	short, cancel := context.WithTimeout(ctx, 60*time.Millisecond)
 	defer cancel()
-	rt = New(slow, Limits{})
+	rt = inProcess(slow, Limits{})
 	text, failed = rt.ExecuteToolCode(short, "for i in range(100):\n  BkCoreServices.get_all_clients()\nresult = 1", "")
 	if !failed || !strings.Contains(text, "script stopped: context deadline exceeded (the caller's deadline)") {
 		t.Fatalf("caller deadline:\n%s", text)
+	}
+}
+
+func TestCyclicAndDeepValuesAreErrorsNotCrashes(t *testing.T) {
+	f := newFake()
+	bothWays(t, f, Limits{}, func(t *testing.T, rt *Runtime) {
+		ctx := context.Background()
+		cases := []struct{ name, code, want string }{
+			{"self list as result", "l = []\nl.append(l)\nresult = l", "result cannot be returned: value contains a cycle"},
+			{"self dict as argument", "d = {}\nd[\"x\"] = d\nresult = BkCoreServices.get_client(clientId=d)", "argument clientId: value contains a cycle"},
+			{"mutual lists", "a = []\nb = [a]\na.append(b)\nresult = {\"a\": a}", "value contains a cycle"},
+			{"too deep", "v = 1\nfor i in range(80):\n  v = [v]\nresult = v", "nests deeper than 64 levels"},
+			{"too deep argument", "v = {}\nfor i in range(80):\n  v = {\"k\": v}\nresult = BkCoreServices.get_client(clientId=v)", "nests deeper than 64 levels"},
+		}
+		for _, c := range cases {
+			text, failed := rt.ExecuteToolCode(ctx, c.code, "")
+			if !failed || !strings.Contains(text, c.want) {
+				t.Errorf("%s: failed=%v\n%s", c.name, failed, text)
+			}
+		}
+		// Sharing without a cycle is fine, and printing a cycle is Starlark's
+		// own business.
+		text, failed := rt.ExecuteToolCode(ctx, "a = [1]\nl = []\nl.append(l)\nprint(l)\nresult = [a, a, {\"x\": a}]", "")
+		if failed || !strings.Contains(text, "[[...]]") || !strings.Contains(text, "Return value: [") {
+			t.Fatalf("shared values (failed=%v):\n%s", failed, text)
+		}
+	})
+}
+
+func TestUnsendableValuesAreErrors(t *testing.T) {
+	rt := inProcess(newFake(), Limits{})
+	ctx := context.Background()
+	// Starlark integers are unbounded (no ** operator, so literals).
+	cases := []struct{ code, want string }{
+		{"result = 1180591620717411303424", "integer 1180591620717411303424 is too large to send as JSON (64-bit limit)"},
+		{"result = {\"n\": -18446744073709551616}", "too large to send as JSON"},
+		{"result = BkCoreServices.get_client(clientId=1180591620717411303424)", "argument clientId: integer 1180591620717411303424 is too large"},
+		{"result = b\"abc\"", "bytes values cannot be sent as JSON"},
+		{"result = BkCoreServices.get_client(clientId=b\"x\")", "argument clientId: bytes values cannot be sent as JSON"},
+	}
+	for _, c := range cases {
+		text, failed := rt.ExecuteToolCode(ctx, c.code, "")
+		if !failed || !strings.Contains(text, c.want) {
+			t.Errorf("%s: failed=%v\n%s", c.code, failed, text)
+		}
+	}
+	// The 64-bit edges still travel.
+	text, failed := rt.ExecuteToolCode(ctx, "result = [9223372036854775807, -9223372036854775808, 18446744073709551615]", "")
+	if failed || !strings.Contains(text, "9223372036854775807") || !strings.Contains(text, "-9223372036854775808") || !strings.Contains(text, "18446744073709551615") {
+		t.Fatalf("64-bit edges:\n%s", text)
 	}
 }
 
@@ -615,7 +774,7 @@ func TestDeriveReason(t *testing.T) {
 
 	// The derived reason rides on nested calls; a per-call _reason wins.
 	f := newFake()
-	rt := New(f, Limits{})
+	rt := inProcess(f, Limits{})
 	code := "# resolve vai-us before the sync\na = BkCoreServices.get_client(clientId=\"vai-us\")\nb = BkCoreServices.get_client(clientId=\"ols-us\", _reason=\"the script's own reason for this one\")\nresult = 1"
 	if text, failed := rt.ExecuteToolCode(context.Background(), code, ""); failed {
 		t.Fatalf("script failed:\n%s", text)
@@ -638,6 +797,34 @@ func TestDeriveReason(t *testing.T) {
 	}
 }
 
+func TestNonStringReasonIsRejected(t *testing.T) {
+	f := newFake()
+	bothWays(t, f, Limits{}, func(t *testing.T, rt *Runtime) {
+		f.reset()
+		for _, code := range []string{
+			`result = BkCoreServices.get_client(clientId="x", _reason=5)`,
+			`result = BkCoreServices.get_client(clientId="x", _reason=["a"])`,
+			`result = BkCoreServices.get_client(clientId="x", _reason=None)`,
+		} {
+			text, failed := rt.ExecuteToolCode(context.Background(), code, "")
+			if code == `result = BkCoreServices.get_client(clientId="x", _reason=None)` {
+				// None reads as absent: the derived reason is used.
+				if failed {
+					t.Fatalf("None reason:\n%s", text)
+				}
+				continue
+			}
+			if !failed || !strings.Contains(text, "tool call failed for BkCoreServices.get_client: _reason must be a string") ||
+				!strings.Contains(text, "[TOOL] BkCoreServices.get_client error: _reason must be a string") {
+				t.Fatalf("%s: failed=%v\n%s", code, failed, text)
+			}
+		}
+		if n := len(f.seen()); n != 1 {
+			t.Fatalf("RouteCall reached %d times, want 1 (the None case)", n)
+		}
+	})
+}
+
 func TestConversions(t *testing.T) {
 	cases := []struct{ text, want string }{
 		{`{"a": 1, "b": [true, null, 2.5], "c": {"d": "e"}}`, `{"a": 1, "b": [True, None, 2.5], "c": {"d": "e"}}`},
@@ -653,7 +840,7 @@ func TestConversions(t *testing.T) {
 		}
 	}
 	// Round trip: Starlark -> Go -> JSON keeps ints exact and sets as lists.
-	rt := New(newFake(), Limits{})
+	rt := inProcess(newFake(), Limits{})
 	text, failed := rt.ExecuteToolCode(context.Background(), `result = {"big": 12345678901234567890, "set": sorted(set([3, 1])), "f": 1.5, "t": (1, "a")}`, "")
 	if failed || !strings.Contains(text, `"big": 12345678901234567890`) || !strings.Contains(text, "\"set\": [\n    1,\n    3\n  ]") {
 		t.Fatalf("round trip:\n%s", text)
