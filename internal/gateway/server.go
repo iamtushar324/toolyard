@@ -675,6 +675,19 @@ func (g *Gateway) UpstreamsInBackoff() int {
 	return n
 }
 
+// SessionRecoveries is the number of times an upstream forgot the shared
+// session and it was re-established under a tool call, summed over the
+// live catalog. Surfaced via /v1/health.
+func (g *Gateway) SessionRecoveries() int64 {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	var n int64
+	for _, u := range g.upstreams {
+		n += u.recoveries.Load()
+	}
+	return n
+}
+
 // acquireSlot is called immediately before an upstream opens (or
 // reopens) a transport. If the live cap would be exceeded by counting
 // `self` in, the least-recently-used OTHER live upstream is suspended.

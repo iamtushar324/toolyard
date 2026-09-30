@@ -412,6 +412,9 @@ func (s *Server) health(w http.ResponseWriter, r *http.Request) {
 		"upstreams_idle":    s.gateway.SuspendedUpstreamCount(),
 		"upstreams_max":     s.gateway.MaxLiveUpstreams(),
 		"upstreams_backoff": s.gateway.UpstreamsInBackoff(),
+		// upstreams_recovered counts upstream MCP sessions re-established
+		// after the server dropped them (expiry, restart).
+		"upstreams_recovered": s.gateway.SessionRecoveries(),
 	}
 	if s.metricsRecorder != nil {
 		body["metrics_dropped"] = s.metricsRecorder.DroppedCount()
