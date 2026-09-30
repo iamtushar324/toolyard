@@ -138,10 +138,12 @@ func (g *Gateway) handleExecuteTool() directHandler {
 		if inner == nil {
 			inner = map[string]any{}
 		}
-		// Forward the outer reason if the model didn't supply one for the inner
-		// call. The router will validate length either way.
+		// Forward the outer reason if the model didn't supply one for the
+		// inner call. routeEntry stripped it from args before this handler
+		// ran, so it is read back off the context. The router validates
+		// length either way.
 		if _, ok := inner["_reason"]; !ok {
-			inner["_reason"] = pickReason(args)
+			inner["_reason"] = callReasonFromContext(ctx)
 		}
 		if apID, ok := args["_approval_id"].(string); ok && apID != "" {
 			inner["_approval_id"] = apID
@@ -150,11 +152,17 @@ func (g *Gateway) handleExecuteTool() directHandler {
 	}
 }
 
-// pickReason returns the outer call's _reason if present (already validated
-// by the meta-tool's own schema-wrap path).
-func pickReason(args map[string]any) any {
-	if r, ok := args[ReasonField]; ok {
-		return r
-	}
-	return ""
+// callReasonKey carries a call's validated _reason from dispatch to its
+// handler.
+type callReasonKey struct{}
+
+func withCallReason(ctx context.Context, reason string) context.Context {
+	return context.WithValue(ctx, callReasonKey{}, reason)
+}
+
+// callReasonFromContext returns the reason the current call was made with,
+// or "" when it had none (a code-mode call from a Bifrost client).
+func callReasonFromContext(ctx context.Context) string {
+	r, _ := ctx.Value(callReasonKey{}).(string)
+	return r
 }

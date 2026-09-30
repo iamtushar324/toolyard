@@ -179,24 +179,35 @@ func appendUnique(xs []string, s string) []string {
 // length, and returns (reason, intentCategory, strippedArgs, error). The
 // returned map is a new copy; the caller may safely forward it upstream.
 func extractReason(args map[string]any, fieldName string) (string, string, map[string]any, error) {
+	return extractReasonOpt(args, fieldName, false)
+}
+
+// extractReasonOpt is extractReason for a tool whose reason may be omitted:
+// with optional set, a missing field yields an empty reason instead of an
+// error. A reason that is present is validated either way.
+func extractReasonOpt(args map[string]any, fieldName string, optional bool) (string, string, map[string]any, error) {
 	if args == nil {
 		args = map[string]any{}
 	}
+	var reason string
 	rv, ok := args[fieldName]
-	if !ok {
+	switch {
+	case !ok && optional:
+	case !ok:
 		return "", "", nil, fmt.Errorf("%s is required: provide a one-sentence rationale (%d-%d chars)",
 			fieldName, minReasonLen, maxReasonLen)
-	}
-	reason, ok := rv.(string)
-	if !ok {
-		return "", "", nil, fmt.Errorf("%s must be a string", fieldName)
-	}
-	reason = strings.TrimSpace(reason)
-	if len(reason) < minReasonLen {
-		return "", "", nil, fmt.Errorf("%s too short (got %d chars, need %d)", fieldName, len(reason), minReasonLen)
-	}
-	if len(reason) > maxReasonLen {
-		return "", "", nil, fmt.Errorf("%s too long (got %d chars, max %d)", fieldName, len(reason), maxReasonLen)
+	default:
+		s, isStr := rv.(string)
+		if !isStr {
+			return "", "", nil, fmt.Errorf("%s must be a string", fieldName)
+		}
+		reason = strings.TrimSpace(s)
+		if len(reason) < minReasonLen {
+			return "", "", nil, fmt.Errorf("%s too short (got %d chars, need %d)", fieldName, len(reason), minReasonLen)
+		}
+		if len(reason) > maxReasonLen {
+			return "", "", nil, fmt.Errorf("%s too long (got %d chars, max %d)", fieldName, len(reason), maxReasonLen)
+		}
 	}
 
 	var intent string
