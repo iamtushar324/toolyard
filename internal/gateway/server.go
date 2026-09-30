@@ -1009,9 +1009,16 @@ func (g *Gateway) routeEntry(ctx context.Context, entry toolEntry, via string, a
 		return g.denyUngranted(ctx, entry, agentID, "", &ev), nil
 	}
 
-	// Deferred-resume short-circuit.
-	if approvalID, ok := args["_approval_id"].(string); ok && approvalID != "" {
+	// Deferred-resume short-circuit. The approval coordination tools take
+	// approval ids as their own arguments and have no held call of their
+	// own to resume, so a stray _approval_id there (a model mixing it up
+	// with approval_id) is dropped with the other meta fields and the tool
+	// runs, checking the caller against the ids it was given.
+	if approvalID, ok := args[ApprovalIDField].(string); ok && approvalID != "" && !approvalCoordinationTools[entry.tool.Name] {
 		ev.ApprovalID = approvalID
+		if entry.tool.Name == MetaExecuteTool {
+			return g.resumeViaExecute(ctx, entry, args, approvalID, &ev)
+		}
 		return g.resumeDeferred(ctx, entry, approvalID, &ev)
 	}
 
@@ -1287,9 +1294,15 @@ func (g *Gateway) holdAndWait(ctx context.Context, entry toolEntry, args map[str
 // and tools.wait_for_approval surface the same cached result. We keep
 // `_approval_id` working only for backwards-compat with already-deployed
 // agent code.
+//
+// The approval must belong to the caller (approvalVisibleTo) and must
+// have been raised for this tool on this upstream. Otherwise any agent
+// that can reach one tool could read another agent's cached result, or
+// the result of a tool it can't reach, by id. Both mismatches answer
+// exactly like an unknown id, so ids can't be probed.
 func (g *Gateway) resumeDeferred(ctx context.Context, entry toolEntry, approvalID string, ev *metrics.Event) (*mcp.CallToolResult, error) {
 	req, err := g.approval.Get(ctx, approvalID)
-	if err != nil {
+	if err != nil || !approvalVisibleTo(req, agentIDFromContext(ctx)) || !approvalRaisedFor(req, entry) {
 		ev.Outcome = metrics.OutcomeError
 		ev.ErrorClass = "approval"
 		return mcp.NewToolResultErrorf("unknown approval %q", approvalID), nil
@@ -1363,6 +1376,34 @@ func (g *Gateway) resumeDeferred(ctx context.Context, entry toolEntry, approvalI
 		ev.Outcome = metrics.OutcomeDeferred
 		return g.deferredResponse(ctx, req, entry, req.Arguments), nil
 	}
+}
+
+// approvalRaisedFor reports whether req was raised for entry: the same
+// upstream and the same wrapped catalog name holdAndWait stores.
+func approvalRaisedFor(req *approval.Request, entry toolEntry) bool {
+	return req.UpstreamName == entry.upstream && req.ToolName == entry.tool.Name
+}
+
+// resumeViaExecute handles a top-level _approval_id on tools.execute.
+// tools.execute only proxies, so the id is normally one its target raised:
+// the resume is routed to that target, where the target's access check and
+// resumeDeferred's owner and tool checks apply against the real tool. The
+// target is the call's `tool`, or the approval's own tool when the call
+// names only the id, as the e2e helper and older agents re-call
+// tools.execute. An id raised for tools.execute itself (an operator gated
+// it with a tool rule) resumes here, and so does an unknown id or another
+// agent's, which resumeDeferred answers as unknown.
+func (g *Gateway) resumeViaExecute(ctx context.Context, entry toolEntry, args map[string]any, approvalID string, ev *metrics.Event) (*mcp.CallToolResult, error) {
+	req, err := g.approval.Get(ctx, approvalID)
+	if err != nil || !approvalVisibleTo(req, agentIDFromContext(ctx)) || approvalRaisedFor(req, entry) {
+		return g.resumeDeferred(ctx, entry, approvalID, ev)
+	}
+	target, _ := args["tool"].(string)
+	if strings.TrimSpace(target) == "" {
+		target = req.ToolName
+	}
+	// ctx still carries the caller's agent id and raiser.
+	return g.RouteCall(ctx, MetaExecuteTool, target, map[string]any{ApprovalIDField: approvalID})
 }
 
 // executingResponse is the envelope returned when the agent re-calls
