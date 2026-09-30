@@ -31,7 +31,9 @@ func testWorker() Worker {
 	if err != nil {
 		panic(err)
 	}
-	return Worker{Path: exe, Env: []string{testWorkerEnv + "=1"}, MemoryMiB: 256, AcquireWait: 200 * time.Millisecond}
+	// MemoryMiB is left at the production default on purpose: the tests
+	// must run at the cap that ships.
+	return Worker{Path: exe, Env: []string{testWorkerEnv + "=1"}, AcquireWait: 200 * time.Millisecond}
 }
 
 func workerRuntime(f Caller, l Limits, adjust func(*Worker)) *Runtime {
@@ -228,7 +230,7 @@ func TestWorkerEnvironmentIsBare(t *testing.T) {
 
 func TestLimitsText(t *testing.T) {
 	rt := New(newFake(), Limits{})
-	if got := rt.LimitsText(); got != "Limits per run: 5 minutes wall clock, 100 tool calls, 1 MiB of output, 160 MiB of memory." {
+	if got := rt.LimitsText(); got != "Limits per run: 5 minutes wall clock, 100 tool calls, 1 MiB of output, 256 MiB of memory." {
 		t.Fatalf("LimitsText = %q", got)
 	}
 	// MaxOutputBytes is clamped to the 2 MiB cap and the text says so.
@@ -306,7 +308,7 @@ func TestOversizedCallArgumentsAndResultsAreErrors(t *testing.T) {
 			t.Fatalf("an oversized call reached RouteCall: %d calls", len(f.seen()))
 		}
 		text, failed = rt.ExecuteToolCode(context.Background(), `result = BkCoreServices.get_all_clients()`, "")
-		if !failed || !strings.Contains(text, "tool call failed for BkCoreServices.get_all_clients: the result is 7340032 bytes, more than code mode passes to a script (limit 6 MiB)") {
+		if !failed || !strings.Contains(text, "tool call failed for BkCoreServices.get_all_clients: the result is 7340032 bytes (7340034 as JSON text), more than code mode passes to a script (limit 6 MiB)") {
 			t.Fatalf("oversized tool result (failed=%v):\n%.400s", failed, text)
 		}
 		expectClean(t, rt, 0)
@@ -406,4 +408,80 @@ func TestOutputLimitIsClamped(t *testing.T) {
 	if failed || !strings.Contains(text, "… [print truncated]") {
 		t.Fatalf("huge print (failed=%v):\n%.300s", failed, text)
 	}
+}
+
+// TestWorkerDecodesLargeResultsAtDefaultCap runs at the memory cap that
+// ships: a structured tool result near the 6 MiB cap decodes into script
+// values and can be worked on, and tens of thousands of small dicts fit.
+func TestWorkerDecodesLargeResultsAtDefaultCap(t *testing.T) {
+	f := newFake()
+	var rows []any
+	for i := 0; i < 128000; i++ {
+		rows = append(rows, map[string]any{"id": 1234567 + i, "name": "abcdefghijklmnop"})
+	}
+	f.handlers["BkCoreServices.get-all-clients"] = func(map[string]any) (*mcp.CallToolResult, error) {
+		return jsonResult(rows)
+	}
+	rt := workerRuntime(f, Limits{}, nil)
+	if got, want := rt.Worker().MemoryMiB, DefaultWorker().withDefaults().MemoryMiB; got != want || got != 256 {
+		t.Fatalf("test worker cap %d, production default %d", got, want)
+	}
+	body, _ := jsonResult(rows)
+	if n := len(resultText(body, "x")); n < 5<<20 || n > maxCallResultBytes {
+		t.Fatalf("fixture result is %d bytes; want between 5 MiB and the %d cap", n, maxCallResultBytes)
+	}
+	text, failed := rt.ExecuteToolCode(context.Background(), `
+rows = BkCoreServices.get_all_clients()
+result = {"rows": len(rows), "first": rows[0]["name"], "last_id": rows[-1]["id"], "sum_tail": rows[-1]["id"] + rows[-2]["id"]}
+`, "")
+	if failed {
+		t.Fatalf("5 MiB result at the default cap:\n%.600s", text)
+	}
+	for _, want := range []string{`"rows": 128000`, `"first": "abcdefghijklmnop"`, `"last_id": 1362566`, `"sum_tail": 2725131`, "[print output truncated: 1048576 byte limit reached]"} {
+		if !strings.Contains(text, want) {
+			t.Errorf("output missing %q:\n%.600s", want, text)
+		}
+	}
+	text, failed = rt.ExecuteToolCode(context.Background(), `result = len([{"i": i, "n": "x" * 8} for i in range(50000)])`, "")
+	if failed || !strings.Contains(text, "Return value: 50000") {
+		t.Fatalf("50k dicts at the default cap (failed=%v):\n%.400s", failed, text)
+	}
+	expectClean(t, rt, 0)
+}
+
+// TestOversizedErrorTextsAreBounded: an error message the script raises,
+// and a failed or held tool result the parent relays, are cut to 64 KiB
+// before they cross the pipe, so they abort the script instead of
+// breaking the protocol.
+func TestOversizedErrorTextsAreBounded(t *testing.T) {
+	f := newFake()
+	f.handlers["BkCoreServices.get_client"] = func(map[string]any) (*mcp.CallToolResult, error) {
+		return mcp.NewToolResultError(strings.Repeat("e", 9<<20)), nil
+	}
+	f.handlers["BkCoreServices.upsert_bifrost_virtual_key_actor"] = func(map[string]any) (*mcp.CallToolResult, error) {
+		res := mcp.NewToolResultText("held: " + strings.Repeat("h", 9<<20))
+		res.Meta = &mcp.Meta{AdditionalFields: map[string]any{"toolyard.deferred": true}}
+		return res, nil
+	}
+	bothWays(t, f, Limits{}, func(t *testing.T, rt *Runtime) {
+		text, failed := rt.ExecuteToolCode(context.Background(), `fail("m" * (9 << 20))`, "")
+		if !failed || strings.Contains(text, "worker crashed") || !strings.Contains(text, "… [error message truncated at 64 KiB]") ||
+			!strings.HasPrefix(text, "Execution runtime error:\n\nTraceback") {
+			t.Fatalf("huge fail() (failed=%v):\n%.300s …\n%s", failed, text, text[len(text)-400:])
+		}
+		text, failed = rt.ExecuteToolCode(context.Background(), `result = BkCoreServices.get_client(clientId="x")`, "")
+		if !failed || strings.Contains(text, "worker crashed") ||
+			!strings.Contains(text, "tool call failed for BkCoreServices.get_client: eeee") || !strings.Contains(text, "… [error text truncated at 64 KiB]") {
+			t.Fatalf("huge error result (failed=%v):\n%.300s", failed, text)
+		}
+		text, failed = rt.ExecuteToolCode(context.Background(), `result = BkCoreServices.upsert_bifrost_virtual_key_actor(email="a", userId="b", virtualKeyHash="c")`, "")
+		if !failed || strings.Contains(text, "worker crashed") ||
+			!strings.Contains(text, "tool call failed for BkCoreServices.upsert_bifrost_virtual_key_actor: held: hhh") || !strings.Contains(text, "… [error text truncated at 64 KiB]") {
+			t.Fatalf("huge held result (failed=%v):\n%.300s", failed, text)
+		}
+		if len(text) > 2*maxOutputCap {
+			t.Fatalf("response is %d bytes", len(text))
+		}
+		expectClean(t, rt, 0)
+	})
 }

@@ -111,9 +111,11 @@ type Worker struct {
 	// target is three quarters of it. An allocation past the cap ends the
 	// child, and the script, with a clean error. The Go runtime maps heap
 	// in 64 MiB arenas, so the live data a script can hold is about the
-	// cap minus 64 MiB. Default 160, sized with MaxConcurrent so all
-	// workers together (640 MiB) leave a gateway under a 1 GiB service
-	// limit some 300 MiB of headroom.
+	// cap minus 64 MiB; decoding a tool result into Starlark values takes
+	// many times the JSON's size, and 256 MiB is what lets a result at the
+	// 6 MiB cap decode. Default 256, sized with MaxConcurrent so all
+	// workers together (1 GiB) fit a 1.5 GiB service limit with the
+	// gateway's own few hundred MiB beside them.
 	MemoryMiB int
 	// MaxConcurrent caps scripts running at once. A run past the cap waits
 	// AcquireWait for a slot, then fails as busy. Defaults 4 and 2s.
@@ -130,7 +132,7 @@ func DefaultWorker() Worker {
 // withDefaults fills zero fields.
 func (w Worker) withDefaults() Worker {
 	if w.MemoryMiB <= 0 {
-		w.MemoryMiB = 160
+		w.MemoryMiB = 256
 	}
 	if w.MaxConcurrent <= 0 {
 		w.MaxConcurrent = 4

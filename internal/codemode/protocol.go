@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"unicode/utf8"
 )
 
 // The parent and the worker speak newline-delimited JSON over the worker's
@@ -39,6 +40,9 @@ const (
 	maxCallResultBytes = 6 << 20
 	// maxPrintBytes caps one print() line.
 	maxPrintBytes = 1 << 20
+	// maxErrorBytes caps the text of an error either side reports: a
+	// script's failure message, or a failed tool result the parent relays.
+	maxErrorBytes = 64 << 10
 	// maxOutputCap is the most Limits.MaxOutputBytes may be set to, so the
 	// print log stays well inside the line limit.
 	maxOutputCap = 2 << 20
@@ -86,6 +90,17 @@ type parentMsg struct {
 	ID    int    `json:"id"`
 	Text  string `json:"text,omitempty"`
 	Error string `json:"error,omitempty"`
+}
+
+// cut bounds s to max bytes (on a rune boundary), marking the cut.
+func cut(s string, max int, note string) string {
+	if len(s) <= max {
+		return s
+	}
+	for max > 0 && !utf8.RuneStart(s[max]) {
+		max--
+	}
+	return s[:max] + note
 }
 
 // errLineTooLong is a message past maxLineBytes.

@@ -124,13 +124,18 @@ func (s *session) handleCall(serverIdent, member string, args map[string]any) pa
 	}
 	text := resultText(res, t.Name)
 	if res != nil && (res.IsError || held(res)) {
+		// The failure text aborts the script; bound it before it is logged
+		// or sent, so a huge error result is still a clean abort.
+		text = cut(text, maxErrorBytes, "… [error text truncated at 64 KiB]")
 		s.log(fmt.Sprintf("[TOOL] %s error result: %s", label, text))
 		return fail(fmt.Sprintf("tool call failed for %s: %s", label, text))
 	}
 	quoted, err := jsonText(text, "")
 	if err != nil || len(quoted) > maxCallResultBytes {
-		msg := fmt.Sprintf("the result is %d bytes, more than code mode passes to a script (limit %d MiB); ask the tool for less data, or page through it",
-			len(text), maxCallResultBytes>>20)
+		// The cap is on the JSON text the wire carries, which escaping can
+		// make larger than the result itself; say both sizes.
+		msg := fmt.Sprintf("the result is %d bytes (%d as JSON text), more than code mode passes to a script (limit %d MiB); ask the tool for less data, or page through it",
+			len(text), len(quoted), maxCallResultBytes>>20)
 		s.log(fmt.Sprintf("[TOOL] %s error: %s", label, msg))
 		return fail(fmt.Sprintf("tool call failed for %s: %s", label, msg))
 	}

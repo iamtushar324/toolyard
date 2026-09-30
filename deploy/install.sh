@@ -514,11 +514,13 @@ RestrictSUIDSGID=true
 $TIER_FLAGS
 ReadWritePaths=$DATA_DIR
 
-# Resource caps.
+# Resource caps. Code-mode scripts run in worker processes, up to four at
+# 256 MiB each (1 GiB together), inside this limit; size it for the gateway
+# (a few hundred MiB) plus those.
 LimitNOFILE=8192
 TasksMax=1024
-MemoryMax=1G
-MemoryHigh=768M
+MemoryMax=1536M
+MemoryHigh=1280M
 
 # Graceful stop: SIGINT triggers context cancel + 5s drain in main.go.
 KillSignal=SIGINT

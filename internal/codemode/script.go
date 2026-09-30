@@ -84,7 +84,8 @@ func runScript(ctx context.Context, start startMsg, s sink, stopNote string) scr
 	globals, err := starlark.ExecFileOptions(opts, thread, scriptName, start.Code, predeclared)
 	if err != nil {
 		kind, msg := classifyError(err)
-		return scriptResult{errKind: kind, errMsg: msg}
+		// fail("m" * (9 << 20)) must not become a message no pipe carries.
+		return scriptResult{errKind: kind, errMsg: cut(msg, maxErrorBytes, "… [error message truncated at 64 KiB]")}
 	}
 	v, ok := globals["result"]
 	if !ok || v == starlark.None {

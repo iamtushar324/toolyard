@@ -78,12 +78,13 @@ SystemCallFilter=setrlimit prlimit64
 ReadWritePaths=/var/lib/toolyard /var/log/toolyard
 
 # Cap resources so a runaway process can't take the box down. Code-mode
-# scripts run in worker processes, up to four at 160 MiB each, inside this
-# limit; size it for the gateway plus those (install.sh uses the same).
+# scripts run in worker processes, up to four at 256 MiB each (1 GiB
+# together), inside this limit; size it for the gateway (a few hundred MiB)
+# plus those. install.sh writes the same values.
 LimitNOFILE=8192
 TasksMax=512
-MemoryMax=1G
-MemoryHigh=768M
+MemoryMax=1536M
+MemoryHigh=1280M
 
 # Graceful shutdown: SIGINT triggers context cancel + 5s drain in main.go.
 KillSignal=SIGINT

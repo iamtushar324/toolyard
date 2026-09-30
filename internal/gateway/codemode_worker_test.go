@@ -22,7 +22,7 @@ func TestMain(m *testing.M) {
 		panic(err)
 	}
 	defaultCodeModeWorker = func() codemode.Worker {
-		return codemode.Worker{Path: exe, Env: []string{testWorkerEnv + "=1"}, MemoryMiB: 256}
+		return codemode.Worker{Path: exe, Env: []string{testWorkerEnv + "=1"}}
 	}
 	os.Exit(m.Run())
 }

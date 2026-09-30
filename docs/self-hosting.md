@@ -131,7 +131,7 @@ Each `executeToolCode` run happens in a child process: the gateway starts its
 own binary again as `toolyard codemode-worker`, with an empty environment
 (no `.env`, no tokens), and talks to it over stdin and stdout. The child only
 asks the parent to make tool calls; the parent makes them. The child caps its
-own memory (`RLIMIT_DATA`, default 160 MiB, four workers at once), marks itself
+own memory (`RLIMIT_DATA`, default 256 MiB, four workers at once), marks itself
 first in line for the kernel's OOM killer, and is killed at the script's wall
 clock (5 minutes). A script that allocates past the cap, spins, or crashes the
 interpreter costs itself the run and nothing else. Defaults are in
@@ -152,8 +152,11 @@ Two things to know when hardening the unit:
   dies with `SIGSYS` and every script fails with "code mode worker could not
   apply its memory cap".
 
-Size `MemoryMax=` for the gateway plus the workers: four at 160 MiB is
-640 MiB, and the shipped units use 1 GiB.
+Size `MemoryMax=` for the gateway plus the workers: four at 256 MiB is
+1 GiB, and the shipped units use `MemoryMax=1536M` / `MemoryHigh=1280M`.
+Decoding a tool result into script values takes many times the JSON's size;
+256 MiB is what lets a result at the 6 MiB cap decode, so lowering the cap
+means smaller results, not just fewer of them.
 
 ## Adding upstream MCP servers
 
