@@ -259,3 +259,15 @@ func TestScrubEchoesAndEscapes(t *testing.T) {
 		t.Error("an ordinary path was flagged")
 	}
 }
+
+// A long reply is shortened only after scrubbing, so no part of a secret
+// that sits on the cut survives.
+func TestScrubBeforeClip(t *testing.T) {
+	p := planOne(bifrostClient{Name: "Long", ConnType: "http", URL: "https://x.example.com/mcp", ToolsListed: true,
+		ToolsToExecute: []string{"*"}, Headers: map[string]string{"X-API-KEY": "sk-live-ABCDEFGHIJKLMNOP"}},
+		planOptions{SecretPrefix: "BIFROST"})
+	out := p.scrub(strings.Repeat("x", 395) + " sk-live-ABCDEFGHIJKLMNOP")
+	if strings.Contains(out, "sk-live") {
+		t.Fatalf("part of the secret survived: %s", out[len(out)-40:])
+	}
+}

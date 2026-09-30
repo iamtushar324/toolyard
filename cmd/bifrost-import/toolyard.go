@@ -70,10 +70,9 @@ func (t *toolyardAPI) do(method, path string, body, out any) (int, error) {
 		if json.Unmarshal(raw, &e) == nil && e.Error != "" {
 			msg = e.Error
 		}
+		// Not shortened here: a cut inside a secret would leave part of it
+		// for scrub to miss. Callers scrub, then clip.
 		msg = strings.Join(strings.Fields(msg), " ")
-		if len(msg) > 300 {
-			msg = msg[:300] + "…"
-		}
 		return resp.StatusCode, fmt.Errorf("%s %s: %d %s", method, path, resp.StatusCode, msg)
 	}
 	if out != nil && len(raw) > 0 {

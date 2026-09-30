@@ -306,5 +306,8 @@ func (p planItem) scrub(text string) string {
 			text = strings.ReplaceAll(text, h, "[redacted]")
 		}
 	}
+	if len(text) > 400 {
+		text = text[:400] + "…"
+	}
 	return text
 }
