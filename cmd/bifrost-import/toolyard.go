@@ -24,7 +24,13 @@ func newToolyardAPI(base string) *toolyardAPI {
 	jar, _ := cookiejar.New(nil)
 	return &toolyardAPI{
 		base: strings.TrimRight(base, "/"),
-		hc:   &http.Client{Timeout: 90 * time.Second, Jar: jar},
+		hc: &http.Client{
+			Timeout: 90 * time.Second,
+			Jar:     jar,
+			// A redirect would resend the password or a secret elsewhere,
+			// or turn a POST into a GET that "succeeds" on an HTML page.
+			CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
+		},
 	}
 }
 
@@ -123,12 +129,12 @@ type serverResult struct {
 
 // createServer adds one server. toolyard answers 200 with the server when it
 // connected, and 202 with {server, warning} when the row was saved but the
-// first connect failed.
-func (t *toolyardAPI) createServer(s toolyardServer) (serverResult, string, error) {
+// first connect failed; code is 0 when no reply came back at all.
+func (t *toolyardAPI) createServer(s toolyardServer) (serverResult, string, int, error) {
 	var reply json.RawMessage
 	code, err := t.do(http.MethodPost, "/v1/servers", s, &reply)
 	if err != nil {
-		return serverResult{}, "", err
+		return serverResult{}, "", code, err
 	}
 	if code == http.StatusAccepted {
 		var w struct {
@@ -136,9 +142,9 @@ func (t *toolyardAPI) createServer(s toolyardServer) (serverResult, string, erro
 			Warning string       `json:"warning"`
 		}
 		_ = json.Unmarshal(reply, &w)
-		return w.Server, w.Warning, nil
+		return w.Server, w.Warning, code, nil
 	}
 	var r serverResult
 	_ = json.Unmarshal(reply, &r)
-	return r, "", nil
+	return r, "", code, nil
 }

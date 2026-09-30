@@ -44,8 +44,8 @@ type planOptions struct {
 	Existing            map[string]bool // server names already in toolyard; nil when not checked
 	URLMap              map[string]string
 	SecretPrefix        string
-	CreateDisabled      bool
 	AllowURLCredentials bool
+	AllowToolSubset     bool
 }
 
 var nonAlnum = regexp.MustCompile(`[^A-Z0-9]+`)
@@ -142,6 +142,22 @@ func planOne(c bifrostClient, opt planOptions) planItem {
 	if c.ReadErr != "" {
 		return skip("could not read it: %s", c.ReadErr)
 	}
+	// toolyard switches every new server on, so one that is off in Bifrost
+	// stays behind rather than going live.
+	if c.Disabled {
+		return skip("disabled in Bifrost")
+	}
+	// Bifrost's tools_to_execute: ["*"] is every tool, a list is only those,
+	// and empty or unset is none. toolyard lists every tool a server has.
+	switch {
+	case !c.ToolsListed || len(c.ToolsToExecute) == 0:
+		return skip("Bifrost exposes none of its tools")
+	case !(len(c.ToolsToExecute) == 1 && c.ToolsToExecute[0] == "*"):
+		if !opt.AllowToolSubset {
+			return skip("Bifrost exposes only %d chosen tools and toolyard would list all of them. Rerun with -allow-tool-subset to import it anyway", len(c.ToolsToExecute))
+		}
+		p.Notes = append(p.Notes, fmt.Sprintf("Bifrost exposed only %d chosen tools; toolyard lists all of them", len(c.ToolsToExecute)))
+	}
 	if opt.Existing != nil && opt.Existing[c.Name] {
 		return skip("a server with this name is already in toolyard")
 	}
@@ -168,23 +184,11 @@ func planOne(c bifrostClient, opt planOptions) planItem {
 	if c.HasTLSConfig {
 		p.Notes = append(p.Notes, "custom TLS settings in Bifrost are not copied")
 	}
-	if c.ToolsListed {
-		all := len(c.ToolsToExecute) == 1 && c.ToolsToExecute[0] == "*"
-		switch {
-		case len(c.ToolsToExecute) == 0:
-			p.Notes = append(p.Notes, "Bifrost exposed none of its tools; toolyard will list all of them")
-		case !all:
-			p.Notes = append(p.Notes, fmt.Sprintf("Bifrost exposed only %d chosen tools; toolyard will list all of them", len(c.ToolsToExecute)))
-		}
-	}
 	if extra := without(c.AllowedExtraHeaders, virtualKeyHeader); len(extra) > 0 {
 		p.Notes = append(p.Notes, "Bifrost passed caller headers through ("+strings.Join(extra, ", ")+"); toolyard does not")
 	}
 
-	srv := toolyardServer{Name: c.Name, Transport: "http", URL: raw, Enabled: !c.Disabled && !opt.CreateDisabled}
-	if c.Disabled {
-		p.Notes = append(p.Notes, "disabled in Bifrost, so created disabled")
-	}
+	srv := toolyardServer{Name: c.Name, Transport: "http", URL: raw, Enabled: true}
 	names := make([]string, 0, len(c.Headers))
 	for k := range c.Headers {
 		names = append(names, k)
@@ -196,6 +200,12 @@ func planOne(c bifrostClient, opt planOptions) planItem {
 		if strings.EqualFold(h, virtualKeyHeader) && v == virtualKeyMarker {
 			srv.Identity = &identity{Header: virtualKeyHeader}
 			p.Notes = append(p.Notes, "forwards each caller's own key ("+virtualKeyHeader+")")
+			continue
+		}
+		// Bifrost sends a stored Authorization only for header auth; for
+		// OAuth and "none" it never reaches the wire (StaticConfigHeaders).
+		if strings.EqualFold(h, "Authorization") && c.AuthType != "" && c.AuthType != "headers" {
+			p.Notes = append(p.Notes, "stored Authorization header not copied: Bifrost doesn't send it for auth type "+c.AuthType)
 			continue
 		}
 		if strings.Contains(v, "{{") {
@@ -224,4 +234,34 @@ func without(list []string, drop string) []string {
 		}
 	}
 	return out
+}
+
+// scrub hides anything in text that could be one of p's credentials: its
+// header values and its URL, whole or in parts. toolyard's connect warnings
+// quote the upstream URL, and sometimes the upstream's own reply.
+func (p planItem) scrub(text string) string {
+	var hide []string
+	for _, s := range p.Secrets {
+		hide = append(hide, s.Value)
+	}
+	if u, err := url.Parse(p.Server.URL); err == nil && p.Server.URL != "" {
+		hide = append(hide, p.Server.URL, u.String(), u.RawQuery)
+		if u.User != nil {
+			hide = append(hide, u.User.String())
+		}
+		for _, path := range []string{u.Path, u.EscapedPath()} {
+			for _, seg := range strings.Split(path, "/") {
+				if len(seg) >= 8 {
+					hide = append(hide, seg)
+				}
+			}
+		}
+	}
+	sort.Slice(hide, func(i, j int) bool { return len(hide[i]) > len(hide[j]) })
+	for _, h := range hide {
+		if len(h) >= 4 {
+			text = strings.ReplaceAll(text, h, "[redacted]")
+		}
+	}
+	return text
 }

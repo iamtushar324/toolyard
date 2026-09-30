@@ -98,6 +98,7 @@ func TestReadBifrostDecryptsAndResolves(t *testing.T) {
 }
 
 func TestPlanRules(t *testing.T) {
+	all := []string{"*"}
 	opt := planOptions{SecretPrefix: "BIFROST", Existing: map[string]bool{"BkCoreServices": true},
 		URLMap: map[string]string{"Mapped": "https://public.example.com/mcp"}}
 	cases := []struct {
@@ -106,21 +107,27 @@ func TestPlanRules(t *testing.T) {
 		identity bool
 		secrets  int
 	}{
-		{c: bifrostClient{Name: "Shared", ConnType: "http", AuthType: "headers", URL: "https://api.example.com/mcp",
+		{c: bifrostClient{Name: "Shared", ToolsListed: true, ToolsToExecute: all, ConnType: "http", AuthType: "headers", URL: "https://api.example.com/mcp",
 			Headers: map[string]string{"X-API-KEY": "k"}}, secrets: 1},
-		{c: bifrostClient{Name: "PerPerson", ConnType: "http", AuthType: "headers", URL: "https://mcp.example.com/mcp",
+		{c: bifrostClient{Name: "PerPerson", ToolsListed: true, ToolsToExecute: all, ConnType: "http", AuthType: "headers", URL: "https://mcp.example.com/mcp",
 			Headers: map[string]string{"x-api-key": "k", "x-bk-bifrost-vk": virtualKeyMarker}}, identity: true, secrets: 1},
-		{c: bifrostClient{Name: "BkCoreServices", ConnType: "http", URL: "https://mcp.example.com/mcp"}, skip: "already in toolyard"},
+		{c: bifrostClient{Name: "BkCoreServices", ToolsListed: true, ToolsToExecute: all, ConnType: "http", URL: "https://mcp.example.com/mcp"}, skip: "already in toolyard"},
 		{c: bifrostClient{Name: "Sheets", ConnType: "stdio", StdioCommand: "mcp-google-sheets"}, skip: "local program"},
 		{c: bifrostClient{Name: "Old", ConnType: "sse", URL: "https://x.example.com/sse"}, skip: "SSE"},
 		{c: bifrostClient{Name: "LinearForUsers", ConnType: "http", AuthType: "per_user_oauth", URL: "https://mcp.linear.app/mcp"}, skip: "own account"},
-		{c: bifrostClient{Name: "Hermes", ConnType: "http", URL: "http://hermes-mattermost-tool:8000/mcp"}, skip: "private address"},
-		{c: bifrostClient{Name: "Mapped", ConnType: "http", URL: "http://mcp-server:3100/mcp"}},
-		{c: bifrostClient{Name: "Keyed", ConnType: "http", URL: "https://x.example.com/mcp?key=abc"}, skip: "carry a credential"},
-		{c: bifrostClient{Name: "PathToken", ConnType: "http", URL: "https://x.example.com/s/abcdefghijklmnopqrstuvwxyz/mcp"}, skip: "carry a credential"},
-		{c: bifrostClient{Name: "Tmpl", ConnType: "http", URL: "https://x.example.com/mcp",
+		{c: bifrostClient{Name: "Hermes", ToolsListed: true, ToolsToExecute: all, ConnType: "http", URL: "http://hermes-mattermost-tool:8000/mcp"}, skip: "private address"},
+		{c: bifrostClient{Name: "Mapped", ToolsListed: true, ToolsToExecute: all, ConnType: "http", URL: "http://mcp-server:3100/mcp"}},
+		{c: bifrostClient{Name: "Keyed", ToolsListed: true, ToolsToExecute: all, ConnType: "http", URL: "https://x.example.com/mcp?key=abc"}, skip: "carry a credential"},
+		{c: bifrostClient{Name: "PathToken", ToolsListed: true, ToolsToExecute: all, ConnType: "http", URL: "https://x.example.com/s/abcdefghijklmnopqrstuvwxyz/mcp"}, skip: "carry a credential"},
+		{c: bifrostClient{Name: "Tmpl", ToolsListed: true, ToolsToExecute: all, ConnType: "http", URL: "https://x.example.com/mcp",
 			Headers: map[string]string{"X-User": "{{bifrost.user_id}}"}}, skip: "template"},
 		{c: bifrostClient{Name: "Broken", ConnType: "http", URL: "https://x.example.com/mcp", ReadErr: "headers: decrypt failed"}, skip: "could not read"},
+		{c: bifrostClient{Name: "Off", ConnType: "http", URL: "https://x.example.com/mcp", Disabled: true, ToolsListed: true, ToolsToExecute: all}, skip: "disabled in Bifrost"},
+		{c: bifrostClient{Name: "NoTools", ConnType: "http", URL: "https://x.example.com/mcp", ToolsListed: true}, skip: "none of its tools"},
+		{c: bifrostClient{Name: "UnsetTools", ConnType: "http", URL: "https://x.example.com/mcp"}, skip: "none of its tools"},
+		{c: bifrostClient{Name: "Subset", ConnType: "http", URL: "https://x.example.com/mcp", ToolsListed: true, ToolsToExecute: []string{"a", "b"}}, skip: "-allow-tool-subset"},
+		{c: bifrostClient{Name: "OAuthBearer", ConnType: "http", AuthType: "oauth", URL: "https://x.example.com/mcp", ToolsListed: true, ToolsToExecute: all,
+			Headers: map[string]string{"Authorization": "Bearer stale", "X-Team": "t1"}}, secrets: 1},
 	}
 	for _, tc := range cases {
 		p := planOne(tc.c, opt)
@@ -146,6 +153,15 @@ func TestPlanRules(t *testing.T) {
 	if p := planOne(cases[7].c, opt); p.Server.URL != "https://public.example.com/mcp" {
 		t.Errorf("url-map not applied: %q", p.Server.URL)
 	}
+	if p := planOne(cases[len(cases)-1].c, opt); p.Server.Headers["Authorization"] != "" {
+		t.Error("an Authorization header Bifrost never sends was copied")
+	}
+	subset := opt
+	subset.AllowToolSubset = true
+	if p := planOne(bifrostClient{Name: "Subset", ConnType: "http", URL: "https://x.example.com/mcp", ToolsListed: true,
+		ToolsToExecute: []string{"a"}}, subset); p.Skip != "" {
+		t.Errorf("-allow-tool-subset: still skipped: %s", p.Skip)
+	}
 }
 
 func TestSecretName(t *testing.T) {
@@ -167,8 +183,9 @@ func TestSecretName(t *testing.T) {
 // The plan never prints a header value or a URL's query.
 func TestPlanPrintsNoSecrets(t *testing.T) {
 	plan := buildPlan([]bifrostClient{
-		{Name: "Shared", ConnType: "http", URL: "https://api.example.com/mcp", Headers: map[string]string{"X-API-KEY": "super-secret-value"}},
-		{Name: "Keyed", ConnType: "http", URL: "https://x.example.com/mcp?key=query-secret"},
+		{Name: "Shared", ConnType: "http", URL: "https://api.example.com/mcp", ToolsListed: true, ToolsToExecute: []string{"*"},
+			Headers: map[string]string{"X-API-KEY": "super-secret-value"}},
+		{Name: "Keyed", ConnType: "http", URL: "https://x.example.com/mcp?key=query-secret", ToolsListed: true, ToolsToExecute: []string{"*"}},
 	}, planOptions{SecretPrefix: "BIFROST"})
 	var buf bytes.Buffer
 	printPlan(&buf, plan, false)
@@ -180,5 +197,28 @@ func TestPlanPrintsNoSecrets(t *testing.T) {
 	}
 	if !strings.Contains(out, "secret://BIFROST_SHARED_X_API_KEY") {
 		t.Fatalf("plan missing the secret ref:\n%s", out)
+	}
+}
+
+// Connect warnings quote the upstream URL and sometimes its reply; none of
+// the server's credentials survive scrub.
+func TestScrubHidesCredentials(t *testing.T) {
+	p := planOne(bifrostClient{Name: "Keyed", ConnType: "http", ToolsListed: true, ToolsToExecute: []string{"*"},
+		URL:     "https://user:pw12345@x.example.com/s/shorttok9/mcp?key=query-secret",
+		Headers: map[string]string{"X-API-KEY": "header-secret-1"}},
+		planOptions{SecretPrefix: "BIFROST", AllowURLCredentials: true})
+	if p.Skip != "" {
+		t.Fatal(p.Skip)
+	}
+	warning := `init upstream Keyed: failed to send request: Post "https://user:pw12345@x.example.com/s/shorttok9/mcp?key=query-secret": ` +
+		`dial tcp: timeout; request failed with status 401: {"error":"bad key header-secret-1","path":"/s/shorttok9/mcp"}`
+	out := p.scrub(warning)
+	for _, secret := range []string{"pw12345", "query-secret", "shorttok9", "header-secret-1"} {
+		if strings.Contains(out, secret) {
+			t.Fatalf("scrub left %q in: %s", secret, out)
+		}
+	}
+	if !strings.Contains(out, "dial tcp: timeout") {
+		t.Fatalf("scrub removed the useful part: %s", out)
 	}
 }

@@ -24,6 +24,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
 	"strings"
 	"time"
@@ -48,10 +49,15 @@ func run(args []string, stdin io.Reader, stdout io.Writer) error {
 	only := fs.String("only", "", "comma-separated Bifrost server names to import (default: all)")
 	urlMapPath := fs.String("url-map", "", `JSON file {"ServerName": "https://public/url"} for servers Bifrost reaches on a private address`)
 	prefix := fs.String("secret-prefix", "BIFROST", "prefix of the toolyard secret names")
-	createDisabled := fs.Bool("create-disabled", false, "create every server disabled")
 	allowURLCreds := fs.Bool("allow-url-credentials", false, "import servers whose URL seems to carry a credential")
+	allowToolSubset := fs.Bool("allow-tool-subset", false, "import servers Bifrost limits to chosen tools (toolyard lists all of them)")
 	if err := fs.Parse(args); err != nil {
 		return err
+	}
+	// The password and every secret travel to this address.
+	if u, err := url.Parse(*base); err != nil || u.Host == "" ||
+		(u.Scheme != "https" && !(u.Scheme == "http" && privateHost(u.Hostname()))) {
+		return errors.New("-toolyard must be an https URL (plain http only for a private test address)")
 	}
 
 	urlMap := map[string]string{}
@@ -101,7 +107,7 @@ func run(args []string, stdin io.Reader, stdout io.Writer) error {
 
 	// With a password, even the plan checks toolyard for names it already has.
 	var api *toolyardAPI
-	opt := planOptions{URLMap: urlMap, SecretPrefix: *prefix, CreateDisabled: *createDisabled, AllowURLCredentials: *allowURLCreds}
+	opt := planOptions{URLMap: urlMap, SecretPrefix: *prefix, AllowURLCredentials: *allowURLCreds, AllowToolSubset: *allowToolSubset}
 	var existingSecrets map[string]bool
 	if password != "" {
 		api = newToolyardAPI(*base)
@@ -135,11 +141,12 @@ func printPlan(w io.Writer, plan []planItem, checkedToolyard bool) {
 	if !checkedToolyard {
 		fmt.Fprintln(w, "(toolyard not checked: names it already has are skipped when applying)")
 	}
+	fmt.Fprintln(w, "Not copied: Bifrost's per-key limits on who may use which server; in toolyard, grant servers to people on the People page.")
 	for _, p := range plan {
 		if p.Skip != "" {
 			continue
 		}
-		fmt.Fprintf(w, "\nIMPORT %s  %s  enabled=%v\n", p.Name, p.Where, p.Server.Enabled)
+		fmt.Fprintf(w, "\nIMPORT %s  %s\n", p.Name, p.Where)
 		for _, s := range p.Secrets {
 			fmt.Fprintf(w, "  header %s -> secret://%s\n", s.Header, s.Name)
 		}
@@ -192,24 +199,31 @@ func applyPlan(w io.Writer, api *toolyardAPI, plan []planItem, existingSecrets m
 		}
 		var res serverResult
 		var warning string
+		code := -1
 		if err == nil {
-			res, warning, err = api.createServer(p.Server)
+			res, warning, code, err = api.createServer(p.Server)
+		}
+		// No reply at all (a timeout while toolyard was still connecting):
+		// the server may exist, and then its secrets are in use.
+		if err != nil && code == 0 {
+			if names, lerr := api.serverNames(); lerr == nil && names[p.Name] {
+				fmt.Fprintf(w, "  %s: created, but the reply was lost (%s); check it on toolyard's Servers page\n", p.Name, p.scrub(err.Error()))
+				continue
+			}
 		}
 		if err != nil {
 			for _, n := range made {
 				if derr := api.deleteSecret(n); derr != nil {
-					fmt.Fprintf(w, "  %s: could not remove secret %s after the failure: %v\n", p.Name, n, derr)
+					fmt.Fprintf(w, "  %s: could not remove secret %s after the failure: %s\n", p.Name, n, p.scrub(derr.Error()))
 				}
 			}
-			fmt.Fprintf(w, "  %s: FAILED: %v\n", p.Name, err)
+			fmt.Fprintf(w, "  %s: FAILED: %s\n", p.Name, p.scrub(err.Error()))
 			failed++
 			continue
 		}
 		switch {
 		case warning != "":
-			fmt.Fprintf(w, "  %s: saved, first connect failed: %s\n", p.Name, warning)
-		case !p.Server.Enabled:
-			fmt.Fprintf(w, "  %s: saved, disabled\n", p.Name)
+			fmt.Fprintf(w, "  %s: saved, first connect failed: %s\n", p.Name, p.scrub(warning))
 		default:
 			fmt.Fprintf(w, "  %s: connected, %d tools\n", p.Name, res.ToolCount)
 		}
