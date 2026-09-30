@@ -61,6 +61,33 @@ type Rule struct {
 	CoolOffUntil  int64  `json:"cool_off_until,omitempty"`
 	HitCount      int64  `json:"hit_count"`
 	LastHitTS     int64  `json:"last_hit_ts,omitempty"`
+	// CreatedBy is the user who installed the rule ("" for the proposer);
+	// EnabledBy the user who last enabled it. Both are user ids.
+	CreatedBy string `json:"created_by,omitempty"`
+	EnabledBy string `json:"enabled_by,omitempty"`
+}
+
+// ruleColumns is the SELECT list scanRule reads.
+const ruleColumns = `id, kind, COALESCE(agent_id,''),
+        COALESCE(fingerprint,''), COALESCE(tool_name,''),
+        enabled, source, COALESCE(rationale_json,''),
+        created_at, COALESCE(cooloff_until,0), hit_count, COALESCE(last_hit_ts,0),
+        COALESCE(created_by,''), COALESCE(enabled_by,'')`
+
+type rowScanner interface {
+	Scan(dest ...any) error
+}
+
+func scanRule(s rowScanner) (Rule, error) {
+	var r Rule
+	var enabled int
+	if err := s.Scan(&r.ID, &r.Kind, &r.AgentID, &r.Fingerprint, &r.ToolName,
+		&enabled, &r.Source, &r.RationaleJSON, &r.CreatedAt, &r.CoolOffUntil,
+		&r.HitCount, &r.LastHitTS, &r.CreatedBy, &r.EnabledBy); err != nil {
+		return Rule{}, err
+	}
+	r.Enabled = enabled == 1
+	return r, nil
 }
 
 // Service wires the rules table, the metrics reader (for the rule proposer)
@@ -99,10 +126,7 @@ func New(db *store.DB, reader *metrics.Reader, set *settings.Service) *Service {
 
 // reload reloads the in-memory rule cache from SQLite.
 func (s *Service) reload(ctx context.Context) error {
-	rows, err := s.db.QueryContext(ctx, `SELECT id, kind, COALESCE(agent_id,''),
-        COALESCE(fingerprint,''), COALESCE(tool_name,''),
-        enabled, source, COALESCE(rationale_json,''),
-        created_at, COALESCE(cooloff_until,0), hit_count, COALESCE(last_hit_ts,0)
+	rows, err := s.db.QueryContext(ctx, `SELECT `+ruleColumns+`
         FROM auto_approval_rules ORDER BY created_at DESC`)
 	if err != nil {
 		return err
@@ -110,14 +134,10 @@ func (s *Service) reload(ctx context.Context) error {
 	defer rows.Close()
 	var out []Rule
 	for rows.Next() {
-		var r Rule
-		var enabled int
-		if err := rows.Scan(&r.ID, &r.Kind, &r.AgentID, &r.Fingerprint, &r.ToolName,
-			&enabled, &r.Source, &r.RationaleJSON, &r.CreatedAt, &r.CoolOffUntil,
-			&r.HitCount, &r.LastHitTS); err != nil {
+		r, err := scanRule(rows)
+		if err != nil {
 			return err
 		}
-		r.Enabled = enabled == 1
 		out = append(out, r)
 	}
 	s.mu.Lock()
@@ -135,7 +155,7 @@ func (s *Service) Match(agentID, upstream, toolName, fingerprint string, isDestr
 	if r == nil {
 		return nil
 	}
-	return &approval.AutoMatch{ID: r.ID, Kind: r.Kind}
+	return &approval.AutoMatch{ID: r.ID, Kind: r.Kind, CreatedBy: r.CreatedBy}
 }
 
 // matchRule is the private workhorse that evaluates rules in static → pattern
@@ -288,6 +308,9 @@ func (s *Service) MarkDenial(ctx context.Context, agentID, toolName, fingerprint
 }
 
 // CreateOrUpdate writes a rule. If id is empty a new one is allocated.
+// CreatedBy names the acting user on a create (an existing rule keeps
+// its creator); an enabled rule records EnabledBy, defaulting to
+// CreatedBy.
 func (s *Service) CreateOrUpdate(ctx context.Context, r Rule) (*Rule, error) {
 	if r.ID == "" {
 		r.ID = "ar_" + uuid.NewString()
@@ -301,17 +324,24 @@ func (s *Service) CreateOrUpdate(ctx context.Context, r Rule) (*Rule, error) {
 	enabled := 0
 	if r.Enabled {
 		enabled = 1
+		if r.EnabledBy == "" {
+			r.EnabledBy = r.CreatedBy
+		}
+	} else {
+		r.EnabledBy = ""
 	}
 	_, err := s.db.ExecContext(ctx, `INSERT INTO auto_approval_rules(
         id, kind, agent_id, fingerprint, tool_name, enabled, source, rationale_json,
-        created_at, cooloff_until, hit_count, last_hit_ts
-    ) VALUES(?,?,?,?,?,?,?,?,?,?,0,0)
+        created_at, cooloff_until, hit_count, last_hit_ts, created_by, enabled_by
+    ) VALUES(?,?,?,?,?,?,?,?,?,?,0,0,?,?)
     ON CONFLICT(id) DO UPDATE SET kind=excluded.kind, agent_id=excluded.agent_id,
         fingerprint=excluded.fingerprint, tool_name=excluded.tool_name,
         enabled=excluded.enabled, rationale_json=excluded.rationale_json,
-        cooloff_until=excluded.cooloff_until`,
+        cooloff_until=excluded.cooloff_until,
+        enabled_by=COALESCE(excluded.enabled_by, enabled_by)`,
 		r.ID, r.Kind, nullStr(r.AgentID), nullStr(r.Fingerprint), nullStr(r.ToolName),
-		enabled, r.Source, nullStr(r.RationaleJSON), r.CreatedAt, nullInt(r.CoolOffUntil))
+		enabled, r.Source, nullStr(r.RationaleJSON), r.CreatedAt, nullInt(r.CoolOffUntil),
+		nullStr(r.CreatedBy), nullStr(r.EnabledBy))
 	if err != nil {
 		return nil, err
 	}
@@ -322,10 +352,12 @@ func (s *Service) CreateOrUpdate(ctx context.Context, r Rule) (*Rule, error) {
 }
 
 // Enable sets enabled=1 on the rule and clears any existing cool-off so the
-// operator's intent ("yes, this is fine") is unambiguous.
-func (s *Service) Enable(ctx context.Context, id string) error {
+// operator's intent ("yes, this is fine") is unambiguous. by is the acting
+// user's id, kept as enabled_by.
+func (s *Service) Enable(ctx context.Context, id, by string) error {
 	if _, err := s.db.ExecContext(ctx, `UPDATE auto_approval_rules
-        SET enabled = 1, cooloff_until = NULL WHERE id = ?`, id); err != nil {
+        SET enabled = 1, cooloff_until = NULL, enabled_by = COALESCE(?, enabled_by)
+        WHERE id = ?`, nullStr(by), id); err != nil {
 		return err
 	}
 	return s.reload(ctx)
@@ -363,22 +395,15 @@ func (s *Service) List(ctx context.Context) ([]Rule, error) {
 
 // Get returns one rule by ID.
 func (s *Service) Get(ctx context.Context, id string) (*Rule, error) {
-	row := s.db.QueryRowContext(ctx, `SELECT id, kind, COALESCE(agent_id,''),
-        COALESCE(fingerprint,''), COALESCE(tool_name,''),
-        enabled, source, COALESCE(rationale_json,''),
-        created_at, COALESCE(cooloff_until,0), hit_count, COALESCE(last_hit_ts,0)
+	row := s.db.QueryRowContext(ctx, `SELECT `+ruleColumns+`
         FROM auto_approval_rules WHERE id = ?`, id)
-	var r Rule
-	var enabled int
-	if err := row.Scan(&r.ID, &r.Kind, &r.AgentID, &r.Fingerprint, &r.ToolName,
-		&enabled, &r.Source, &r.RationaleJSON, &r.CreatedAt, &r.CoolOffUntil,
-		&r.HitCount, &r.LastHitTS); err != nil {
+	r, err := scanRule(row)
+	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, fmt.Errorf("rule %q not found", id)
 		}
 		return nil, err
 	}
-	r.Enabled = enabled == 1
 	return &r, nil
 }
 
@@ -547,6 +572,12 @@ func (s *Service) ruleExistsForTool(ctx context.Context, tool string) (bool, err
 // gets written but the engine refuses to fire it. The handler surfaces this
 // to the caller as a normal success; the API layer flags it for the UI.
 func (s *Service) SetToolPolicy(ctx context.Context, toolName string, autoApprove bool) error {
+	return s.SetToolPolicyBy(ctx, toolName, autoApprove, "")
+}
+
+// SetToolPolicyBy is SetToolPolicy recording the acting user: by becomes
+// created_by on a new rule and enabled_by when a rule is (re-)enabled.
+func (s *Service) SetToolPolicyBy(ctx context.Context, toolName string, autoApprove bool, by string) error {
 	if strings.TrimSpace(toolName) == "" {
 		return errors.New("tool_name required")
 	}
@@ -562,12 +593,7 @@ func (s *Service) SetToolPolicy(ctx context.Context, toolName string, autoApprov
 		}
 		s.mu.RUnlock()
 		if existingID != "" {
-			if _, err := s.db.ExecContext(ctx,
-				`UPDATE auto_approval_rules SET enabled=1, cooloff_until=NULL WHERE id=?`,
-				existingID); err != nil {
-				return err
-			}
-			return s.reload(ctx)
+			return s.Enable(ctx, existingID, by)
 		}
 		rationale, _ := json.Marshal(map[string]any{
 			"basis":  "manual",
@@ -579,6 +605,7 @@ func (s *Service) SetToolPolicy(ctx context.Context, toolName string, autoApprov
 			Enabled:       true,
 			Source:        "user",
 			RationaleJSON: string(rationale),
+			CreatedBy:     by,
 		})
 		return err
 	}

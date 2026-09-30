@@ -102,7 +102,8 @@ func (s *Server) insightsTools(w http.ResponseWriter, r *http.Request) {
 // a `destructive_veto` flag so the UI can warn the user that auto-approval
 // will still block at decision time.
 func (s *Server) insightsToolPolicy(w http.ResponseWriter, r *http.Request) {
-	if _, err := s.requireUser(r); err != nil {
+	uid, err := s.requireUser(r)
+	if err != nil {
 		writeError(w, http.StatusUnauthorized, "unauthorized")
 		return
 	}
@@ -168,7 +169,7 @@ func (s *Server) insightsToolPolicy(w http.ResponseWriter, r *http.Request) {
 		if s.policy != nil {
 			_ = s.policy.DeleteTarget(ctx, policy.ScopeTool, tool)
 		}
-		if err := s.autoApproval.SetToolPolicy(ctx, tool, true); err != nil {
+		if err := s.autoApproval.SetToolPolicyBy(ctx, tool, true, uid); err != nil {
 			writeError(w, http.StatusBadRequest, err.Error())
 			return
 		}
@@ -336,7 +337,8 @@ func (s *Server) insightsCost(w http.ResponseWriter, r *http.Request) {
 // autoRulesCollection handles GET (list all rules) and POST (operator-created
 // static rule).
 func (s *Server) autoRulesCollection(w http.ResponseWriter, r *http.Request) {
-	if _, err := s.requireUser(r); err != nil {
+	uid, err := s.requireUser(r)
+	if err != nil {
 		writeError(w, http.StatusUnauthorized, "unauthorized")
 		return
 	}
@@ -366,6 +368,8 @@ func (s *Server) autoRulesCollection(w http.ResponseWriter, r *http.Request) {
 		}
 		body.Source = "user"
 		body.Enabled = true
+		body.CreatedBy = uid
+		body.EnabledBy = uid
 		out, err := s.autoApproval.CreateOrUpdate(r.Context(), body)
 		if err != nil {
 			writeError(w, http.StatusBadRequest, err.Error())
@@ -383,7 +387,8 @@ func (s *Server) autoRulesCollection(w http.ResponseWriter, r *http.Request) {
 //	POST /v1/insights/auto/rules/{id}/disable
 //	DELETE /v1/insights/auto/rules/{id}
 func (s *Server) autoRulesItem(w http.ResponseWriter, r *http.Request) {
-	if _, err := s.requireUser(r); err != nil {
+	uid, err := s.requireUser(r)
+	if err != nil {
 		writeError(w, http.StatusUnauthorized, "unauthorized")
 		return
 	}
@@ -404,7 +409,7 @@ func (s *Server) autoRulesItem(w http.ResponseWriter, r *http.Request) {
 	}
 	switch {
 	case subpath == "enable" && r.Method == http.MethodPost:
-		if err := s.autoApproval.Enable(r.Context(), id); err != nil {
+		if err := s.autoApproval.Enable(r.Context(), id, uid); err != nil {
 			writeError(w, http.StatusBadRequest, err.Error())
 			return
 		}

@@ -12,6 +12,7 @@ import (
 	"github.com/mark3labs/mcp-go/mcp"
 
 	"github.com/tusharbhardwaj/toolyard/docs"
+	"github.com/tusharbhardwaj/toolyard/internal/actor"
 	"github.com/tusharbhardwaj/toolyard/internal/audit"
 	"github.com/tusharbhardwaj/toolyard/internal/inbox"
 	"github.com/tusharbhardwaj/toolyard/internal/metrics"
@@ -197,7 +198,9 @@ func (g *Gateway) redeemAndDispatch(ctx context.Context, entry toolEntry, args m
 		ev.ErrorClass = "grant_invalid"
 		return grantInvalidResponse(entry, args, re), nil
 	}
-	_ = g.audit.Write(ctx, audit.Event{
+	// The grant is the instrument; the owner who issued it is the decider.
+	decider := actor.Decider{Via: actor.ViaInboxGrant, Ref: gr.ID, UserID: gr.IssuedBy}
+	allowed := audit.Event{
 		EventType:    audit.EventCallAllowed,
 		AgentID:      agentID,
 		UpstreamName: entry.upstream,
@@ -205,10 +208,16 @@ func (g *Gateway) redeemAndDispatch(ctx context.Context, entry toolEntry, args m
 		Decision:     "grant",
 		Reason:       reason,
 		ApprovalID:   gr.ID,
-	})
+	}
+	allowed.SetDecider(decider)
+	_ = g.audit.Write(ctx, allowed)
 	ev.ApprovalOutcome = metrics.ApprovalApproved
 	ev.ApprovalVia = "grant"
+	ev.ApprovalDecider = decider.Legacy()
 	ev.ApprovalID = gr.ID
+	if gr.CreatedAt > 0 {
+		ev.ApprovalLatencyMs = int(time.Now().UnixMilli() - gr.CreatedAt)
+	}
 	return g.dispatch(ctx, entry, args, agentID, reason, gr.ID, ev)
 }
 

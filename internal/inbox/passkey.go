@@ -25,8 +25,10 @@ type PasskeyAssertion struct {
 type PasskeyGate interface {
 	// Enabled reports whether the owner has registered a passkey.
 	Enabled(ctx context.Context) bool
-	// Verify checks an assertion made for the decision with this digest.
-	Verify(ctx context.Context, digest string, a *PasskeyAssertion) error
+	// VerifyCredential checks an assertion made for the decision with
+	// this digest and returns the id of the credential that signed it, so
+	// the decision can record which passkey confirmed it.
+	VerifyCredential(ctx context.Context, digest string, a *PasskeyAssertion) (credentialID string, err error)
 }
 
 // Passkey errors.

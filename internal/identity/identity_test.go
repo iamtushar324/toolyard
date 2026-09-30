@@ -207,3 +207,67 @@ func TestGenericActionsRefuseIdentityAgent(t *testing.T) {
 		t.Errorf("delete missing: %v", err)
 	}
 }
+
+// VerifyAgentToken names the owner in the same lookup that checks their
+// status, so the MCP ingress can attribute a call to a person without a
+// second query.
+func TestVerifyAgentTokenCarriesOwnerDetails(t *testing.T) {
+	s, owner := newTestIdentity(t)
+	ctx := context.Background()
+	tok, ag, err := s.CreateAgentWithToken(ctx, owner, "bot")
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.VerifyAgentToken(ctx, tok)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// A password-only admin has a username and nothing else.
+	if got.Owner != owner || got.OwnerUsername != "admin" || got.OwnerEmail != "" || got.OwnerDisplayName != "" {
+		t.Fatalf("owner fields = %+v", got)
+	}
+	if got.OwnerName() != "admin" {
+		t.Fatalf("OwnerName without display name = %q", got.OwnerName())
+	}
+	if _, err := s.db.ExecContext(ctx, `UPDATE users SET email = ?, display_name = ? WHERE id = ?`,
+		"ada@beknown.work", "Ada Lovelace", owner); err != nil {
+		t.Fatal(err)
+	}
+	got, err = s.VerifyAgentToken(ctx, tok)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.ID != ag.ID || got.OwnerEmail != "ada@beknown.work" || got.OwnerDisplayName != "Ada Lovelace" || got.OwnerUsername != "admin" {
+		t.Fatalf("owner fields = %+v", got)
+	}
+	if got.OwnerName() != "Ada Lovelace" {
+		t.Fatalf("OwnerName = %q", got.OwnerName())
+	}
+	// An agent whose owner row is gone still authenticates, with no owner
+	// details.
+	if _, err := s.db.ExecContext(ctx, `UPDATE agents SET owner_user = 'u_gone' WHERE id = ?`, ag.ID); err != nil {
+		t.Fatal(err)
+	}
+	got, err = s.VerifyAgentToken(ctx, tok)
+	if err != nil || got.Owner != "u_gone" || got.OwnerEmail != "" || got.OwnerUsername != "" {
+		t.Fatalf("orphaned agent = %+v, %v", got, err)
+	}
+}
+
+func TestGetUserByEmail(t *testing.T) {
+	s, owner := newTestIdentity(t)
+	ctx := context.Background()
+	if _, err := s.GetUserByEmail(ctx, "nobody@beknown.work"); !errors.Is(err, ErrNoUser) {
+		t.Fatalf("unknown email err = %v, want ErrNoUser", err)
+	}
+	if _, err := s.GetUserByEmail(ctx, "  "); !errors.Is(err, ErrNoUser) {
+		t.Fatalf("blank email err = %v, want ErrNoUser", err)
+	}
+	if _, err := s.db.ExecContext(ctx, `UPDATE users SET email = ? WHERE id = ?`, "Ada@BeKnown.work", owner); err != nil {
+		t.Fatal(err)
+	}
+	u, err := s.GetUserByEmail(ctx, "ada@beknown.work")
+	if err != nil || u.ID != owner {
+		t.Fatalf("GetUserByEmail = %+v, %v", u, err)
+	}
+}

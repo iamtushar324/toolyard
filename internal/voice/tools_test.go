@@ -8,6 +8,7 @@ import (
 	"github.com/mark3labs/mcp-go/mcp"
 	"google.golang.org/genai"
 
+	"github.com/tusharbhardwaj/toolyard/internal/actor"
 	"github.com/tusharbhardwaj/toolyard/internal/gateway"
 )
 
@@ -27,6 +28,19 @@ func (f *fakeBackend) CatalogFor(context.Context) []gateway.CatalogEntry { retur
 func (f *fakeBackend) RouteCall(_ context.Context, viaTool, targetName string, args map[string]any) (*mcp.CallToolResult, error) {
 	f.gotVia, f.gotTarget, f.gotArgs = viaTool, targetName, args
 	return f.result, f.err
+}
+
+// Every tool call from a voice session carries the caller id and a raiser
+// naming the signed-in user, so audit rows and approvals attribute it.
+func TestToolContextCarriesVoiceRaiser(t *testing.T) {
+	ctx := toolContext(context.Background(), "u_9")
+	if got := gateway.AgentIDFromContext(ctx); got != "voice:u_9" {
+		t.Fatalf("agent id = %q", got)
+	}
+	r, ok := actor.RaiserFrom(ctx)
+	if !ok || r.CallerID != "voice:u_9" || r.AgentKind != "voice" || r.OwnerUserID != "u_9" || r.Via != voiceVia || r.ClientKind != "browser" {
+		t.Fatalf("raiser = %+v (ok=%v)", r, ok)
+	}
 }
 
 func TestBuildGenaiTools(t *testing.T) {

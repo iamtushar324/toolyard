@@ -25,6 +25,7 @@ import (
 	"github.com/coder/websocket"
 	"github.com/google/uuid"
 
+	"github.com/tusharbhardwaj/toolyard/internal/actor"
 	"github.com/tusharbhardwaj/toolyard/internal/gateway"
 	"github.com/tusharbhardwaj/toolyard/internal/realtime"
 )
@@ -94,6 +95,16 @@ type Call struct {
 
 	cancel context.CancelFunc
 	done   chan struct{}
+}
+
+// toolContext is the identity every tool call from a live voice session
+// carries: the per-call "voice:<user>" caller, and a raiser naming the
+// signed-in user as owner, the voice path in, and the browser as client.
+func toolContext(ctx context.Context, userID string) context.Context {
+	callerID := "voice:" + userID
+	return actor.WithRaiser(gateway.WithAgentID(ctx, callerID), actor.Raiser{
+		CallerID: callerID, AgentKind: "voice", OwnerUserID: userID, ClientKind: "browser", Via: voiceVia,
+	})
 }
 
 // New builds a Service. Returns nil only on a nil-cfg call.
@@ -285,7 +296,7 @@ func (s *Service) runCall(ctx context.Context, conn *websocket.Conn, call *Call)
 		notify:  notify,
 	}
 	if s.cfg.Tools != nil {
-		toolCtx := gateway.WithAgentID(ctx, "voice:"+call.UserID)
+		toolCtx := toolContext(ctx, call.UserID)
 		catalog := s.cfg.Tools.CatalogFor(toolCtx)
 		lc.tools = buildGenaiTools(catalog, s.log)
 		lc.dispatch = func(_ context.Context, name string, args map[string]any) (string, error) {

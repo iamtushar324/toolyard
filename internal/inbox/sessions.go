@@ -120,6 +120,12 @@ func (s *Service) ListSessions(ctx context.Context) ([]Session, error) {
 	return out, rows.Err()
 }
 
+// HeartbeatSession bumps a session's last-seen time. The gateway calls it
+// when a tool call is tagged with the session (`_session_id`).
+func (s *Service) HeartbeatSession(ctx context.Context, sessionID string) {
+	s.heartbeat(ctx, sessionID)
+}
+
 // Heartbeat bumps a session's last-seen time; called whenever the agent
 // sends something tied to it.
 func (s *Service) heartbeat(ctx context.Context, sessionID string) {

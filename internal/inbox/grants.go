@@ -17,6 +17,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/tusharbhardwaj/toolyard/internal/actor"
 	"github.com/tusharbhardwaj/toolyard/internal/store"
 )
 
@@ -55,6 +56,11 @@ type Grant struct {
 	ExpiresAt  int64                 `json:"expires_at"`
 	RevokedAt  int64                 `json:"revoked_at,omitempty"`
 	LastUsedAt int64                 `json:"last_used_at,omitempty"`
+	// IssuedBy and RevokedBy are the user ids of the owner who allowed the
+	// request and who revoked the grant (empty when not a person, or for
+	// grants from before they were recorded).
+	IssuedBy  string `json:"issued_by,omitempty"`
+	RevokedBy string `json:"revoked_by,omitempty"`
 }
 
 // Redemption failures. The gateway turns these into a grant_invalid result
@@ -146,7 +152,8 @@ func hashToken(tok string) string {
 }
 
 // issueGrants creates one grant per allowed tool inside tx. It returns the
-// grant IDs by tool index.
+// grant IDs by tool index. r.DeciderUserID (set by Decide before it calls
+// this) is stored as issued_by.
 func (s *Service) issueGrants(ctx context.Context, tx *sql.Tx, r *Request, now int64) (map[int]string, error) {
 	out := map[int]string{}
 	expires := now + int64(r.TTLSeconds)*1000
@@ -161,9 +168,9 @@ func (s *Service) issueGrants(ctx context.Context, tx *sql.Tx, r *Request, now i
 			return nil, err
 		}
 		if _, err := tx.ExecContext(ctx, `INSERT INTO inbox_grants
-			(id, request_id, tool_index, agent_id, tool, params, max_uses, uses, status, token_hash, pending_token, created_at, expires_at)
-			VALUES (?,?,?,?,?,?,?,0,?,?,?,?,?)`,
-			id, r.ID, i, r.AgentID, t.Tool, string(params), 1, GrantActive, hashToken(tok), tok, now, expires); err != nil {
+			(id, request_id, tool_index, agent_id, tool, params, max_uses, uses, status, token_hash, pending_token, created_at, expires_at, issued_by)
+			VALUES (?,?,?,?,?,?,?,0,?,?,?,?,?,?)`,
+			id, r.ID, i, r.AgentID, t.Tool, string(params), 1, GrantActive, hashToken(tok), tok, now, expires, nullStr(r.DeciderUserID)); err != nil {
 			return nil, err
 		}
 		out[i] = id
@@ -244,11 +251,12 @@ func (s *Service) noteGrantUse(ctx context.Context, g *Grant, args map[string]an
 
 func (s *Service) getGrantWithHash(ctx context.Context, id string) (*Grant, string, error) {
 	row := s.db.QueryRowContext(ctx, `SELECT id, request_id, tool_index, agent_id, tool, params, max_uses, uses, status,
-		created_at, expires_at, COALESCE(revoked_at,0), COALESCE(last_used_at,0), token_hash FROM inbox_grants WHERE id = ?`, id)
+		created_at, expires_at, COALESCE(revoked_at,0), COALESCE(last_used_at,0), COALESCE(issued_by,''), COALESCE(revoked_by,''), token_hash
+		FROM inbox_grants WHERE id = ?`, id)
 	var g Grant
 	var params, hash string
 	if err := row.Scan(&g.ID, &g.RequestID, &g.ToolIndex, &g.AgentID, &g.Tool, &params, &g.MaxUses, &g.Uses, &g.Status,
-		&g.CreatedAt, &g.ExpiresAt, &g.RevokedAt, &g.LastUsedAt, &hash); err != nil {
+		&g.CreatedAt, &g.ExpiresAt, &g.RevokedAt, &g.LastUsedAt, &g.IssuedBy, &g.RevokedBy, &hash); err != nil {
 		return nil, "", err
 	}
 	if err := json.Unmarshal([]byte(params), &g.Params); err != nil {
@@ -263,7 +271,7 @@ func (s *Service) ListGrants(ctx context.Context, status, agentID string, limit 
 		limit = 200
 	}
 	q := `SELECT id, request_id, tool_index, agent_id, tool, params, max_uses, uses, status, created_at, expires_at,
-		COALESCE(revoked_at,0), COALESCE(last_used_at,0) FROM inbox_grants WHERE 1=1`
+		COALESCE(revoked_at,0), COALESCE(last_used_at,0), COALESCE(issued_by,''), COALESCE(revoked_by,'') FROM inbox_grants WHERE 1=1`
 	var args []any
 	if status != "" {
 		q += ` AND status = ?`
@@ -285,7 +293,7 @@ func (s *Service) ListGrants(ctx context.Context, status, agentID string, limit 
 		var g Grant
 		var params string
 		if err := rows.Scan(&g.ID, &g.RequestID, &g.ToolIndex, &g.AgentID, &g.Tool, &params, &g.MaxUses, &g.Uses, &g.Status,
-			&g.CreatedAt, &g.ExpiresAt, &g.RevokedAt, &g.LastUsedAt); err != nil {
+			&g.CreatedAt, &g.ExpiresAt, &g.RevokedAt, &g.LastUsedAt, &g.IssuedBy, &g.RevokedBy); err != nil {
 			return nil, err
 		}
 		_ = json.Unmarshal([]byte(params), &g.Params)
@@ -294,11 +302,19 @@ func (s *Service) ListGrants(ctx context.Context, status, agentID string, limit 
 	return out, rows.Err()
 }
 
-// RevokeGrant revokes one active grant.
+// RevokeGrant revokes one active grant; by is the display label for the
+// activity line. RevokeGrantBy also records who did it.
 func (s *Service) RevokeGrant(ctx context.Context, id, by string) error {
+	return s.RevokeGrantBy(ctx, id, actor.Decider{Name: strings.TrimSpace(by), Via: actor.ViaDashboard})
+}
+
+// RevokeGrantBy revokes one active grant and records the revoking user
+// (by.UserID) as revoked_by. The activity line names them.
+func (s *Service) RevokeGrantBy(ctx context.Context, id string, by actor.Decider) error {
 	now := s.now().UnixMilli()
-	res, err := s.db.ExecContext(ctx, `UPDATE inbox_grants SET status = ?, revoked_at = ?, pending_token = NULL WHERE id = ? AND status = ?`,
-		GrantRevoked, now, id, GrantActive)
+	res, err := s.db.ExecContext(ctx, `UPDATE inbox_grants SET status = ?, revoked_at = ?, revoked_by = ?, pending_token = NULL
+		WHERE id = ? AND status = ?`,
+		GrantRevoked, now, nullStr(by.UserID), id, GrantActive)
 	if err != nil {
 		return err
 	}
@@ -307,8 +323,12 @@ func (s *Service) RevokeGrant(ctx context.Context, id, by string) error {
 	}
 	g, _, err := s.getGrantWithHash(ctx, id)
 	if err == nil {
+		who := by.Name
+		if who == "" {
+			who = by.Email
+		}
 		_ = s.mutate(ctx, g.RequestID, func(r *Request) error {
-			r.addActivity(now, fmt.Sprintf("%s revoked the permission for %s", nonEmpty(by, "Owner"), g.Tool))
+			r.addActivity(now, fmt.Sprintf("%s revoked the permission for %s", nonEmpty(who, "Owner"), g.Tool))
 			return nil
 		})
 	}
@@ -317,11 +337,17 @@ func (s *Service) RevokeGrant(ctx context.Context, id, by string) error {
 }
 
 // RevokeAll revokes every active grant (optionally for one agent) and
-// returns how many it revoked. This is the kill switch.
+// returns how many it revoked. This is the kill switch. RevokeAllBy also
+// records who pulled it.
 func (s *Service) RevokeAll(ctx context.Context, agentID string) (int, error) {
+	return s.RevokeAllBy(ctx, agentID, actor.Decider{})
+}
+
+// RevokeAllBy is RevokeAll recording by.UserID as revoked_by.
+func (s *Service) RevokeAllBy(ctx context.Context, agentID string, by actor.Decider) (int, error) {
 	now := s.now().UnixMilli()
-	q := `UPDATE inbox_grants SET status = ?, revoked_at = ?, pending_token = NULL WHERE status = ?`
-	args := []any{GrantRevoked, now, GrantActive}
+	q := `UPDATE inbox_grants SET status = ?, revoked_at = ?, revoked_by = ?, pending_token = NULL WHERE status = ?`
+	args := []any{GrantRevoked, now, nullStr(by.UserID), GrantActive}
 	if agentID != "" {
 		q += ` AND agent_id = ?`
 		args = append(args, agentID)

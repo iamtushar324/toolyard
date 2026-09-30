@@ -4,6 +4,7 @@ import (
 	"net/http"
 	"strings"
 
+	"github.com/tusharbhardwaj/toolyard/internal/actor"
 	"github.com/tusharbhardwaj/toolyard/internal/audit"
 	"github.com/tusharbhardwaj/toolyard/internal/gateway"
 )
@@ -111,7 +112,7 @@ func (s *Server) cliToolsRun(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusMethodNotAllowed, "POST only")
 		return
 	}
-	agentID, ok := s.requireAgent(w, r)
+	ag, ok := s.requireAgentFull(w, r)
 	if !ok {
 		return
 	}
@@ -134,13 +135,16 @@ func (s *Server) cliToolsRun(w http.ResponseWriter, r *http.Request) {
 	if body.Arguments == nil {
 		body.Arguments = map[string]any{}
 	}
-	_ = s.audit.Write(r.Context(), audit.Event{
-		EventType:     audit.EventAgentEnroll,
-		AgentID:       agentID,
+	// The raiser (agent, owner, client) rides on ctx: the call.cli row
+	// below and every row the gateway writes for this call carry it.
+	ctx := actor.WithRaiser(gateway.WithAgentID(r.Context(), ag.ID), s.agentRaiser(r, ag, clientKindCLI, viaCLI))
+	_ = s.audit.Write(ctx, audit.Event{
+		EventType:     "call.cli",
+		AgentID:       ag.ID,
+		ToolName:      body.Tool,
 		ResultSummary: "cli:" + body.Tool,
 	})
-	ctx := gateway.WithAgentID(r.Context(), agentID)
-	res, err := s.gateway.RouteCall(ctx, "cli", body.Tool, body.Arguments)
+	res, err := s.gateway.RouteCall(ctx, viaCLI, body.Tool, body.Arguments)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return

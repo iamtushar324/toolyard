@@ -420,12 +420,18 @@ func (s *Service) Enabled(ctx context.Context) bool {
 	return n > 0
 }
 
-// Verify implements inbox.PasskeyGate.
-func (s *Service) Verify(ctx context.Context, digest string, a *inbox.PasskeyAssertion) error {
+// VerifyCredential implements inbox.PasskeyGate: it checks the assertion
+// and returns the id of the credential that signed it.
+func (s *Service) VerifyCredential(ctx context.Context, digest string, a *inbox.PasskeyAssertion) (string, error) {
 	if a == nil {
-		return inbox.ErrPasskeyRequired
+		return "", inbox.ErrPasskeyRequired
 	}
-	_, err := s.FinishAssertion(ctx, a.SessionID, "decide:"+digest, a.Response)
+	return s.FinishAssertion(ctx, a.SessionID, "decide:"+digest, a.Response)
+}
+
+// Verify is VerifyCredential for callers that only need the verdict.
+func (s *Service) Verify(ctx context.Context, digest string, a *inbox.PasskeyAssertion) error {
+	_, err := s.VerifyCredential(ctx, digest, a)
 	return err
 }
 

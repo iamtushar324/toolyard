@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/tusharbhardwaj/toolyard/internal/actor"
 	"github.com/tusharbhardwaj/toolyard/internal/audit"
 	"github.com/tusharbhardwaj/toolyard/internal/hooks"
 )
@@ -22,20 +23,25 @@ func (s *Server) hooksIngest(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, "hooks service is disabled")
 		return
 	}
-	agentID, ok := s.requireAgent(w, r)
+	ag, ok := s.requireAgentFull(w, r)
 	if !ok {
 		return
 	}
+	agentID := ag.ID
 	body, err := io.ReadAll(http.MaxBytesReader(w, r.Body, hooks.MaxBodyBytes))
 	if err != nil {
 		writeError(w, http.StatusRequestEntityTooLarge, "hook payload too large")
 		return
 	}
+	// The raiser (agent, owner, client) rides on ctx so the hook.ingest
+	// row names the person behind the agent.
+	ctx := actor.WithRaiser(r.Context(), s.agentRaiser(r, ag, "", viaHook))
+	r = r.WithContext(ctx)
 	// The hook event is always recorded. The MemPalace forward is a write
 	// into the mempalace tool group, so it needs the same grant the tool
 	// itself would: without one the event lands, the memory does not.
-	ev, err := s.hooks.IngestRawOpts(r.Context(), agentID, body, r.URL.Query().Get("source"), hooks.IngestOptions{
-		SkipMemory: !s.agentMayUse(r.Context(), agentID, mempalaceGroup),
+	ev, err := s.hooks.IngestRawOpts(ctx, agentID, body, r.URL.Query().Get("source"), hooks.IngestOptions{
+		SkipMemory: !s.agentMayUse(ctx, agentID, mempalaceGroup),
 	})
 	if err != nil {
 		switch {

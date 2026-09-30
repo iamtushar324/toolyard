@@ -15,6 +15,8 @@
 // package implements it.
 package inbox
 
+import "github.com/tusharbhardwaj/toolyard/internal/actor"
+
 // Request kinds.
 const (
 	KindAccess   = "access"
@@ -191,17 +193,26 @@ type Request struct {
 	SnoozedUntil int64    `json:"snoozed_until,omitempty"`
 	// RequestedUrgency is what the agent asked for when toolyard lowered
 	// it; Downgraded says why.
-	RequestedUrgency string     `json:"requested_urgency,omitempty"`
-	Downgraded       string     `json:"downgraded,omitempty"`
-	RemindedAt       int64      `json:"reminded_at,omitempty"`
-	DigestedAt       int64      `json:"digested_at,omitempty"`
-	DecidedBy        string     `json:"decided_by,omitempty"`
-	DecidedAt        int64      `json:"decided_at,omitempty"`
-	CreatedAt        int64      `json:"created_at"`
-	UpdatedAt        int64      `json:"updated_at"`
-	ExpiresAt        int64      `json:"expires_at"`
-	GrantsExpire     int64      `json:"grants_expire_at,omitempty"`
-	Activity         []Activity `json:"activity,omitempty"`
+	RequestedUrgency string `json:"requested_urgency,omitempty"`
+	Downgraded       string `json:"downgraded,omitempty"`
+	RemindedAt       int64  `json:"reminded_at,omitempty"`
+	DigestedAt       int64  `json:"digested_at,omitempty"`
+	// DecidedBy is the display label of who decided (kept for older
+	// docs and the dashboard); the Decider* fields say who and how.
+	DecidedBy     string `json:"decided_by,omitempty"`
+	DeciderUserID string `json:"decider_user_id,omitempty"`
+	DeciderEmail  string `json:"decider_email,omitempty"`
+	DeciderName   string `json:"decider_name,omitempty"`
+	// DeciderVia is the instrument: dashboard | push_token | passkey …
+	// (actor.Via*); DeciderRef identifies it (passkey credential id).
+	DeciderVia   string     `json:"decider_via,omitempty"`
+	DeciderRef   string     `json:"decider_ref,omitempty"`
+	DecidedAt    int64      `json:"decided_at,omitempty"`
+	CreatedAt    int64      `json:"created_at"`
+	UpdatedAt    int64      `json:"updated_at"`
+	ExpiresAt    int64      `json:"expires_at"`
+	GrantsExpire int64      `json:"grants_expire_at,omitempty"`
+	Activity     []Activity `json:"activity,omitempty"`
 }
 
 // AllFlags returns request-level flags plus every tool's flags.
@@ -218,4 +229,28 @@ func (r *Request) IsOpen() bool { return r.Status == StatusPending }
 
 func (r *Request) addActivity(at int64, text string) {
 	r.Activity = append(r.Activity, Activity{At: at, Text: text})
+}
+
+// Decider returns who decided the request, as recorded by setDecider.
+func (r *Request) Decider() actor.Decider {
+	return actor.Decider{UserID: r.DeciderUserID, Email: r.DeciderEmail, Name: r.DeciderName, Via: r.DeciderVia, Ref: r.DeciderRef}
+}
+
+// setDecider records the decision's actor. label is the caller's display
+// value for DecidedBy; when empty the person's name, email or the
+// instrument (actor.Decider.Legacy) stands in.
+func (r *Request) setDecider(d actor.Decider, label string, at int64) {
+	r.DeciderUserID, r.DeciderEmail, r.DeciderName = d.UserID, d.Email, d.Name
+	r.DeciderVia, r.DeciderRef = d.Via, d.Ref
+	r.DecidedAt = at
+	switch {
+	case label != "":
+		r.DecidedBy = label
+	case d.Name != "":
+		r.DecidedBy = d.Name
+	case d.Email != "":
+		r.DecidedBy = d.Email
+	default:
+		r.DecidedBy = d.Legacy()
+	}
 }

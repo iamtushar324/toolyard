@@ -89,7 +89,7 @@ func (r *Reader) approvalLatencyByUpstream(ctx context.Context, upstream string,
            AND approval_latency_ms > 0
            AND approval_outcome = 'approved'
            AND ts >= ? AND ts < ?
-           AND upstream_name = ?`,
+           AND upstream = ?`,
 		"upstream", []any{from, to, upstream})
 }
 

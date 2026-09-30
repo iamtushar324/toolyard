@@ -7,6 +7,7 @@ import (
 	"strconv"
 	"time"
 
+	"github.com/tusharbhardwaj/toolyard/internal/actor"
 	"github.com/tusharbhardwaj/toolyard/internal/audit"
 	"github.com/tusharbhardwaj/toolyard/internal/memory"
 )
@@ -20,13 +21,34 @@ func qInt(r *http.Request, key string) int64 {
 func auditFilterFromQuery(r *http.Request) audit.Filter {
 	q := r.URL.Query()
 	return audit.Filter{
-		Since:     qInt(r, "since"),
-		Until:     qInt(r, "until"),
-		Before:    qInt(r, "before"),
-		AgentID:   q.Get("agent_id"),
-		EventType: q.Get("event_type"),
-		Tool:      q.Get("tool"),
-		Decision:  q.Get("decision"),
+		Since:           qInt(r, "since"),
+		Until:           qInt(r, "until"),
+		Before:          qInt(r, "before"),
+		AgentID:         q.Get("agent_id"),
+		EventType:       q.Get("event_type"),
+		Tool:            q.Get("tool"),
+		Decision:        q.Get("decision"),
+		OwnerUserID:     q.Get("owner"),
+		DecidedByUserID: q.Get("decided_by"),
+		AgentSessionID:  q.Get("session"),
+		ApprovalID:      q.Get("approval_id"),
+		ClientKind:      q.Get("client_kind"),
+	}
+}
+
+// auditCSVHeader is the audit export's column order; auditCSVRow follows it.
+var auditCSVHeader = []string{
+	"id", "ts_iso", "event_type", "agent_id", "upstream", "tool", "decision", "reason", "result_summary", "approval_id",
+	"agent_name", "owner_email", "client_kind", "client_session_id", "agent_session_id", "via",
+	"decided_by_email", "decided_via", "decider_ref",
+}
+
+func auditCSVRow(e audit.Event) []string {
+	return []string{
+		e.ID, time.UnixMilli(e.TS).UTC().Format(time.RFC3339), e.EventType,
+		e.AgentID, e.UpstreamName, e.ToolName, e.Decision, e.Reason, e.ResultSummary, e.ApprovalID,
+		e.AgentName, e.OwnerEmail, e.ClientKind, e.ClientSessionID, e.AgentSessionID, e.Via,
+		e.DecidedByEmail, e.DecidedVia, e.DeciderRef,
 	}
 }
 
@@ -52,12 +74,9 @@ func (s *Server) auditExport(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Disposition", `attachment; filename="toolyard-audit.csv"`)
 	cw := csv.NewWriter(w)
 	defer cw.Flush()
-	_ = cw.Write([]string{"id", "ts_iso", "event_type", "agent_id", "upstream", "tool", "decision", "reason", "result_summary", "approval_id"})
+	_ = cw.Write(auditCSVHeader)
 	for _, e := range rows {
-		_ = cw.Write([]string{
-			e.ID, time.UnixMilli(e.TS).UTC().Format(time.RFC3339), e.EventType,
-			e.AgentID, e.UpstreamName, e.ToolName, e.Decision, e.Reason, e.ResultSummary, e.ApprovalID,
-		})
+		_ = cw.Write(auditCSVRow(e))
 	}
 }
 
@@ -76,24 +95,31 @@ func (s *Server) approvalsExport(w http.ResponseWriter, r *http.Request) {
 	if r.URL.Query().Get("format") == "json" {
 		// Re-marshal through a token-free view so decision_token never leaks.
 		type safeApproval struct {
-			ID             string `json:"id"`
-			AgentID        string `json:"agent_id"`
-			UpstreamName   string `json:"upstream_name"`
-			ToolName       string `json:"tool_name"`
-			Status         string `json:"status"`
-			IntentCategory string `json:"intent_category,omitempty"`
-			Reason         string `json:"reason,omitempty"`
-			DecidedBy      string `json:"decided_by,omitempty"`
-			CreatedAt      int64  `json:"created_at"`
-			DecidedAt      int64  `json:"decided_at,omitempty"`
-			ExpiresAt      int64  `json:"expires_at"`
+			ID             string        `json:"id"`
+			AgentID        string        `json:"agent_id"`
+			UpstreamName   string        `json:"upstream_name"`
+			ToolName       string        `json:"tool_name"`
+			Status         string        `json:"status"`
+			IntentCategory string        `json:"intent_category,omitempty"`
+			Reason         string        `json:"reason,omitempty"`
+			DecidedBy      string        `json:"decided_by,omitempty"`
+			DecidedVia     string        `json:"decided_via,omitempty"`
+			DeciderEmail   string        `json:"decider_email,omitempty"`
+			DeciderName    string        `json:"decider_name,omitempty"`
+			DeciderRef     string        `json:"decider_ref,omitempty"`
+			RaisedBy       *actor.Raiser `json:"raised_by,omitempty"`
+			CreatedAt      int64         `json:"created_at"`
+			DecidedAt      int64         `json:"decided_at,omitempty"`
+			ExpiresAt      int64         `json:"expires_at"`
 		}
 		out := make([]safeApproval, 0, len(rows))
 		for _, a := range rows {
 			out = append(out, safeApproval{
 				ID: a.ID, AgentID: a.AgentID, UpstreamName: a.UpstreamName, ToolName: a.ToolName,
 				Status: a.Status, IntentCategory: a.IntentCategory, Reason: a.Reason,
-				DecidedBy: a.DecidedBy, CreatedAt: a.CreatedAt, DecidedAt: a.DecidedAt, ExpiresAt: a.ExpiresAt,
+				DecidedBy: a.DecidedBy, DecidedVia: a.DecidedVia, DeciderEmail: a.DeciderEmail,
+				DeciderName: a.DeciderName, DeciderRef: a.DeciderRef, RaisedBy: a.RaisedBy,
+				CreatedAt: a.CreatedAt, DecidedAt: a.DecidedAt, ExpiresAt: a.ExpiresAt,
 			})
 		}
 		w.Header().Set("Content-Type", "application/json")
@@ -105,7 +131,8 @@ func (s *Server) approvalsExport(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Disposition", `attachment; filename="toolyard-approvals.csv"`)
 	cw := csv.NewWriter(w)
 	defer cw.Flush()
-	_ = cw.Write([]string{"id", "created_iso", "agent_id", "upstream", "tool", "status", "intent_category", "reason", "decided_by", "decided_iso", "expires_iso"})
+	_ = cw.Write([]string{"id", "created_iso", "agent_id", "upstream", "tool", "status", "intent_category", "reason",
+		"decided_by", "decided_iso", "expires_iso", "decided_via", "decider_email", "decider_ref", "agent_name", "owner_email"})
 	iso := func(ms int64) string {
 		if ms == 0 {
 			return ""
@@ -113,9 +140,14 @@ func (s *Server) approvalsExport(w http.ResponseWriter, r *http.Request) {
 		return time.UnixMilli(ms).UTC().Format(time.RFC3339)
 	}
 	for _, a := range rows {
+		var raiser actor.Raiser
+		if a.RaisedBy != nil {
+			raiser = *a.RaisedBy
+		}
 		_ = cw.Write([]string{
 			a.ID, iso(a.CreatedAt), a.AgentID, a.UpstreamName, a.ToolName, a.Status,
 			a.IntentCategory, a.Reason, a.DecidedBy, iso(a.DecidedAt), iso(a.ExpiresAt),
+			a.DecidedVia, a.DeciderEmail, a.DeciderRef, raiser.AgentName, raiser.OwnerEmail,
 		})
 	}
 }

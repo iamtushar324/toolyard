@@ -21,7 +21,11 @@ const (
 	IntentField     = "_intent_category"
 	ApprovalIDField = "_approval_id"
 	GrantField      = "_grant"
-	FallbackField   = "__toolyard_reason"
+	// SessionField names the toolyard agent session (session.start) a
+	// call belongs to. Stripped before the tool sees it; honoured only
+	// when the session belongs to the calling agent.
+	SessionField  = "_session_id"
+	FallbackField = "__toolyard_reason"
 
 	minReasonLen = 20
 	maxReasonLen = 2000
@@ -30,6 +34,7 @@ const (
 	intentPropDescription     = "Coarse intent category: read | write | destructive | external_communication | financial | privileged_admin."
 	approvalIDPropDescription = "If a previous call to this tool returned a deferred response with an `approval_id`, set this to that value to resume the held call instead of creating a new approval."
 	grantPropDescription      = "A grant token (tyg_…) your owner issued for this exact call through inbox.request. Restricted tools run only with a valid grant; the call must stay within the parameters you asked for."
+	sessionPropDescription    = "Optional: the id session.start gave you (ses_…), so this call is recorded under that piece of work."
 	descriptionBanner         = "[toolyard-gated · _reason required · restricted tools need your owner's permission: check with inbox.check, ask with inbox.request, then pass the grant as _grant] "
 )
 
@@ -38,10 +43,10 @@ var intentEnum = []string{
 	"financial", "privileged_admin",
 }
 
-// metaProps returns the three toolyard-injected schema properties:
-// _reason (required), _intent_category, and _approval_id. Built-in tool
-// schemas merge these into their hand-rolled property maps so direct
-// upstream calls and meta-tools stay consistent.
+// metaProps returns the toolyard-injected schema properties: _reason
+// (required), _intent_category, _approval_id, _grant and _session_id.
+// Built-in tool schemas merge these into their hand-rolled property maps
+// so direct upstream calls and meta-tools stay consistent.
 func metaProps() map[string]any {
 	return map[string]any{
 		ReasonField: map[string]any{
@@ -56,6 +61,9 @@ func metaProps() map[string]any {
 		},
 		GrantField: map[string]any{
 			"type": "string", "description": grantPropDescription,
+		},
+		SessionField: map[string]any{
+			"type": "string", "description": sessionPropDescription,
 		},
 	}
 }
@@ -138,6 +146,12 @@ func wrapSchema(t mcp.Tool) (mcp.Tool, string) {
 			"description": grantPropDescription,
 		}
 	}
+	if _, has := props[SessionField]; !has {
+		props[SessionField] = map[string]any{
+			"type":        "string",
+			"description": sessionPropDescription,
+		}
+	}
 	required = appendUnique(required, field)
 
 	out := t
@@ -194,7 +208,7 @@ func extractReason(args map[string]any, fieldName string) (string, string, map[s
 
 	out := make(map[string]any, len(args))
 	for k, v := range args {
-		if k == fieldName || k == IntentField || k == ApprovalIDField || k == GrantField {
+		if k == fieldName || k == IntentField || k == ApprovalIDField || k == GrantField || k == SessionField {
 			continue
 		}
 		out[k] = v

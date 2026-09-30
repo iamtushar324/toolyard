@@ -16,6 +16,7 @@ import (
 	"github.com/mark3labs/mcp-go/server"
 
 	"github.com/tusharbhardwaj/toolyard/internal/access"
+	"github.com/tusharbhardwaj/toolyard/internal/actor"
 	"github.com/tusharbhardwaj/toolyard/internal/approval"
 	"github.com/tusharbhardwaj/toolyard/internal/audit"
 	"github.com/tusharbhardwaj/toolyard/internal/inbox"
@@ -158,6 +159,11 @@ type Gateway struct {
 	// runaway upstream is visible without dumping goroutines.
 	inFlight atomic.Int64
 
+	// clientCache remembers each agent's MCP clientInfo; sessionCache
+	// remembers which agent owns a `_session_id` (actor.go).
+	clientCache
+	sessionCache
+
 	mu        sync.RWMutex
 	tools     map[string]toolEntry
 	upstreams map[string]*upstream
@@ -293,16 +299,19 @@ func New(opts Options) *Gateway {
 		server.WithRecovery(),
 		server.WithInstructions(buildInstructions(opts.Approval, opts.InLineWait)),
 	}
-	// Filters run in registration order: access first, so the visibility
-	// provider only ever ranks tools the caller may use. The request hook
-	// answers raw tools/call for ungranted tools before mcp-go looks the
-	// tool up, so the wire response matches an unknown tool.
+	// The initialize hook remembers what each client says it is, so audit
+	// rows can name the client software. Filters run in registration
+	// order: access first, so the visibility provider only ever ranks
+	// tools the caller may use. The request hook answers raw tools/call
+	// for ungranted tools before mcp-go looks the tool up, so the wire
+	// response matches an unknown tool.
+	hooks := &server.Hooks{}
+	hooks.AddAfterInitialize(g.rememberClient)
 	if opts.Access != nil {
 		serverOpts = append(serverOpts, server.WithToolFilter(g.accessToolFilter))
-		hooks := &server.Hooks{}
 		hooks.AddOnRequestInitialization(g.accessRequestHook)
-		serverOpts = append(serverOpts, server.WithHooks(hooks))
 	}
+	serverOpts = append(serverOpts, server.WithHooks(hooks))
 	if opts.Visibility != nil {
 		vp := opts.Visibility
 		serverOpts = append(serverOpts, server.WithToolFilter(
@@ -394,6 +403,8 @@ func (g *Gateway) accessRequestHook(ctx context.Context, _ any, message any) err
 			return nil
 		}
 		started := time.Now()
+		raiser := g.resolveRaiser(ctx, agentID, viaDirect)
+		ctx = actor.WithRaiser(ctx, raiser)
 		ev := metrics.Event{
 			TS:         started.UnixMilli(),
 			AgentID:    agentID,
@@ -402,8 +413,9 @@ func (g *Gateway) accessRequestHook(ctx context.Context, _ any, message any) err
 			ToolName:   entry.tool.Name,
 			IsWrite:    !policy.IsReadOnlyName(entry.tool.Name),
 			PinnedTool: IsPinned(entry.tool.Name),
-			Via:        "direct",
+			Via:        viaDirect,
 		}
+		stampRaiser(&ev, raiser)
 		if g.surface != nil {
 			ev.SurfaceMode = g.surface.SurfaceMode(ctx)
 		}
@@ -843,6 +855,8 @@ func (g *Gateway) CallInternal(ctx context.Context, viaTool, targetName string, 
 
 	started := time.Now()
 	agentID := agentIDFromContext(ctx)
+	raiser := g.resolveRaiser(ctx, agentID, viaTool)
+	ctx = actor.WithRaiser(ctx, raiser)
 	ev := &metrics.Event{
 		TS:         started.UnixMilli(),
 		AgentID:    agentID,
@@ -853,6 +867,7 @@ func (g *Gateway) CallInternal(ctx context.Context, viaTool, targetName string, 
 		PinnedTool: IsPinned(entry.tool.Name),
 		Via:        viaTool,
 	}
+	stampRaiser(ev, raiser)
 	if g.surface != nil {
 		ev.SurfaceMode = g.surface.SurfaceMode(ctx)
 	}
@@ -890,8 +905,9 @@ func (g *Gateway) CallInternal(ctx context.Context, viaTool, targetName string, 
 //   - Writes hold for approval (in-line then deferred), exactly like a direct
 //     call would.
 //
-// `viaTool` is the meta-tool name we record in the audit log so it's clear
-// the call was reached through tools.execute.
+// `viaTool` is the path in, recorded on the audit rows, the approval and
+// the metric as Via: the meta-tool name for tools.execute, "dashboard",
+// "cli" or "voice" for those callers.
 func (g *Gateway) RouteCall(ctx context.Context, viaTool, targetName string, args map[string]any) (*mcp.CallToolResult, error) {
 	g.mu.RLock()
 	entry, ok := g.tools[targetName]
@@ -902,16 +918,25 @@ func (g *Gateway) RouteCall(ctx context.Context, viaTool, targetName string, arg
 	if targetName == viaTool {
 		return mcp.NewToolResultError("tools.execute cannot target itself"), nil
 	}
-	return g.routeEntry(ctx, entry, args)
+	return g.routeEntry(ctx, entry, viaTool, args)
 }
 
 // routeEntry is the shared path used by both the MCP-side handler and
 // tools.execute. It assumes entry is a registered toolEntry. The metric
 // Event captured here is emitted to the metrics sink (if any) once the
-// terminal outcome of this call is known.
-func (g *Gateway) routeEntry(ctx context.Context, entry toolEntry, args map[string]any) (res *mcp.CallToolResult, err error) {
+// terminal outcome of this call is known. via is the path in ("direct"
+// from the MCP handler).
+func (g *Gateway) routeEntry(ctx context.Context, entry toolEntry, via string, args map[string]any) (res *mcp.CallToolResult, err error) {
 	started := time.Now()
 	agentID := agentIDFromContext(ctx)
+
+	// Who is calling: the ingress raiser (or the caller id alone), the
+	// client that introduced itself at initialize, and the agent session
+	// the call names. It rides on ctx so every audit row below, the
+	// approval and the upstream handler see the same answer.
+	raiser := g.resolveRaiser(ctx, agentID, via)
+	g.attachSession(ctx, &raiser, args)
+	ctx = actor.WithRaiser(ctx, raiser)
 
 	// In-flight tracking + slow-call watchdog. The watchdog goroutine
 	// logs at 5s / 30s / 2m elapsed if the call is still routing, so a
@@ -932,8 +957,9 @@ func (g *Gateway) routeEntry(ctx context.Context, entry toolEntry, args map[stri
 		ToolName:   entry.tool.Name,
 		IsWrite:    !policy.IsReadOnlyName(entry.tool.Name),
 		PinnedTool: IsPinned(entry.tool.Name),
-		Via:        "direct",
+		Via:        via,
 	}
+	stampRaiser(&ev, raiser)
 	if g.surface != nil {
 		ev.SurfaceMode = g.surface.SurfaceMode(ctx)
 	}
@@ -979,6 +1005,7 @@ func (g *Gateway) routeEntry(ctx context.Context, entry toolEntry, args map[stri
 	if rerr != nil {
 		_ = g.audit.Write(ctx, audit.Event{
 			EventType:     audit.EventCallFailed,
+			AgentID:       agentID,
 			UpstreamName:  entry.upstream,
 			ToolName:      entry.tool.Name,
 			ResultSummary: "rejected: " + rerr.Error(),
@@ -1033,27 +1060,33 @@ func (g *Gateway) routeEntry(ctx context.Context, entry toolEntry, args map[stri
 		return g.redeemAndDispatch(ctx, entry, cleanArgs, agentID, reason, grantToken, &ev)
 	}
 
+	// The policy rule is the decider of an allow or deny row.
+	policyDecider := actor.Decider{Via: actor.ViaPolicy, Ref: decision.RuleID}
 	switch decision.Action {
 	case policy.ActionAllow:
-		_ = g.audit.Write(ctx, audit.Event{
+		allowed := audit.Event{
 			EventType:    audit.EventCallAllowed,
 			AgentID:      agentID,
 			UpstreamName: entry.upstream,
 			ToolName:     entry.tool.Name,
 			Decision:     string(decision.Action),
 			Reason:       reason,
-		})
+		}
+		allowed.SetDecider(policyDecider)
+		_ = g.audit.Write(ctx, allowed)
 		ev.ApprovalOutcome = metrics.ApprovalNone
 		return g.dispatch(ctx, entry, cleanArgs, agentID, reason, "", &ev)
 	case policy.ActionDeny:
-		_ = g.audit.Write(ctx, audit.Event{
+		denied := audit.Event{
 			EventType:    audit.EventCallDenied,
 			AgentID:      agentID,
 			UpstreamName: entry.upstream,
 			ToolName:     entry.tool.Name,
 			Decision:     string(decision.Action),
 			Reason:       reason,
-		})
+		}
+		denied.SetDecider(policyDecider)
+		_ = g.audit.Write(ctx, denied)
 		ev.Outcome = metrics.OutcomeDenied
 		ev.ErrorClass = "policy"
 		return mcp.NewToolResultError("denied by policy: " + decision.Reason), nil
@@ -1105,7 +1138,7 @@ func (g *Gateway) handlerFor(toolName string) server.ToolHandlerFunc {
 			), nil
 		}
 		args := argsAsMap(request.Params.Arguments)
-		return g.routeEntry(ctx, entry, args)
+		return g.routeEntry(ctx, entry, viaDirect, args)
 	}
 }
 
@@ -1143,6 +1176,7 @@ func (g *Gateway) holdAndWait(ctx context.Context, entry toolEntry, args map[str
 		Reason:         reason,
 		IntentCategory: intent,
 		RequireHuman:   requireHuman,
+		RaisedBy:       raiserOnCtx(ctx, agentID),
 	}, g.inLineWait)
 	if err != nil {
 		ev.Outcome = metrics.OutcomeError
@@ -1150,17 +1184,19 @@ func (g *Gateway) holdAndWait(ctx context.Context, entry toolEntry, args map[str
 		return mcp.NewToolResultErrorFromErr("approval hold failed", err), nil
 	}
 	ev.ApprovalID = req.ID
-	if req.AutoDecidedBy != "" {
-		ev.ApprovalVia = "auto"
-		ev.ApprovalDecider = req.AutoDecidedBy
-	}
 	if req.Coalesced {
 		ev.CoalescedInto = req.ID
+	}
+	// Decided during the hold (an auto-rule, or a person within the
+	// in-line wait): the row and the metric say by whom.
+	decider := approvalDecider(req)
+	if req.Status == approval.StatusAllowed || req.Status == approval.StatusDenied {
+		approvalMetrics(ev, req)
 	}
 
 	switch req.Status {
 	case approval.StatusAllowed:
-		_ = g.audit.Write(ctx, audit.Event{
+		allowed := audit.Event{
 			EventType:    audit.EventCallAllowed,
 			AgentID:      agentID,
 			UpstreamName: entry.upstream,
@@ -1168,7 +1204,9 @@ func (g *Gateway) holdAndWait(ctx context.Context, entry toolEntry, args map[str
 			Decision:     "allow",
 			ApprovalID:   req.ID,
 			Reason:       reason,
-		})
+		}
+		allowed.SetDecider(decider)
+		_ = g.audit.Write(ctx, allowed)
 		ev.ApprovalLatencyMs = int(time.Since(holdStart).Milliseconds())
 		if req.AutoDecidedBy != "" {
 			ev.ApprovalOutcome = metrics.ApprovalAuto
@@ -1194,7 +1232,7 @@ func (g *Gateway) holdAndWait(ctx context.Context, entry toolEntry, args map[str
 		// deferred `_approval_id` re-call uses.
 		return g.resumeDeferred(ctx, entry, req.ID, ev)
 	case approval.StatusDenied:
-		_ = g.audit.Write(ctx, audit.Event{
+		denied := audit.Event{
 			EventType:    audit.EventCallDenied,
 			AgentID:      agentID,
 			UpstreamName: entry.upstream,
@@ -1202,7 +1240,9 @@ func (g *Gateway) holdAndWait(ctx context.Context, entry toolEntry, args map[str
 			Decision:     "deny",
 			ApprovalID:   req.ID,
 			Reason:       reason,
-		})
+		}
+		denied.SetDecider(decider)
+		_ = g.audit.Write(ctx, denied)
 		ev.ApprovalOutcome = metrics.ApprovalDenied
 		ev.ApprovalLatencyMs = int(time.Since(holdStart).Milliseconds())
 		ev.Outcome = metrics.OutcomeDenied
@@ -1270,12 +1310,11 @@ func (g *Gateway) resumeDeferred(ctx context.Context, entry toolEntry, approvalI
 	case approval.StatusAllowed:
 		if req.AutoDecidedBy != "" {
 			ev.ApprovalOutcome = metrics.ApprovalAuto
-			ev.ApprovalVia = "auto"
-			ev.ApprovalDecider = req.AutoDecidedBy
 		} else {
 			ev.ApprovalOutcome = metrics.ApprovalApproved
 		}
 		ev.ApprovalLatencyMs = int(time.Now().UnixMilli() - req.CreatedAt)
+		approvalMetrics(ev, req)
 		if req.ResultExecutedAt > 0 {
 			res, rerr := rehydrateApprovalResult(req.ResultEnvelope)
 			if rerr != nil {
@@ -1731,7 +1770,8 @@ func buildInstructions(bus *approval.Bus, inLineWait time.Duration) string {
 	b.WriteString("• `tools.wait_for_approvals(approval_ids=[…], mode='all'|'any', timeout_seconds=60)` — block server-side on several ids at once. mode='all' (default) returns when every id is terminal; mode='any' returns as soon as one is. Strictly more efficient than firing N parallel `tools.wait_for_approval` calls. ")
 	b.WriteString("Re-calling the original tool with `_approval_id` still works for backwards compat, but returns the same cached result the polling tools already surface — strictly slower, no extra capability. ")
 	b.WriteString("BATCHING: when a task needs several writes (e.g. create issue + comment + assign), invoke them in parallel from one turn rather than serially. The dashboard groups concurrent calls from the same agent into a single approval card so the human approves the whole batch with one tap. Per-call `_reason` strings are surfaced in that summary, so write each one to be readable on its own. After approving, toolyard executes each tool independently — `tools.wait_for_approvals(mode='all')` is the natural way to collect all the results in one round-trip. ")
-	b.WriteString("Use `tools.search` and `tools.execute` to discover and proxy tools that aren't directly visible in your catalog.")
+	b.WriteString("Use `tools.search` and `tools.execute` to discover and proxy tools that aren't directly visible in your catalog. ")
+	b.WriteString("SESSIONS: after `session.start`, pass its id as `_session_id` on your tool calls so the audit log ties each call to that piece of work; it is stripped before the tool sees it and ignored if the session isn't yours.")
 	return b.String()
 }
 
@@ -1765,9 +1805,16 @@ func (g *Gateway) Execute(ctx context.Context, req *approval.Request) {
 			fmt.Sprintf("tool %q is no longer registered (was the upstream removed?)", req.ToolName))
 		return
 	}
-	// Stamp the agent ID so audit / usage rows attribute the call to
-	// the originating agent rather than to a phantom anonymous caller.
-	execCtx := WithAgentID(ctx, req.AgentID)
+	// Stamp the agent ID and the raiser snapshot the request kept, so
+	// audit / usage rows attribute the call to the originating agent,
+	// owner, client and session rather than to a phantom anonymous
+	// caller on the bus's background context.
+	var raiser actor.Raiser
+	if req.RaisedBy != nil {
+		raiser = *req.RaisedBy
+	}
+	raiser = g.resolveRaiser(actor.WithRaiser(ctx, raiser), req.AgentID, "")
+	execCtx := actor.WithRaiser(WithAgentID(ctx, req.AgentID), raiser)
 
 	// Build a metrics.Event and run dispatch directly. The original
 	// routeEntry already evaluated policy and consumed the human's
@@ -1780,6 +1827,8 @@ func (g *Gateway) Execute(ctx context.Context, req *approval.Request) {
 			ToolName: entry.tool.Name, IsWrite: !policy.IsReadOnlyName(entry.tool.Name), PinnedTool: IsPinned(entry.tool.Name),
 			Via: "auto-execute", ApprovalID: req.ID, Fingerprint: req.Fingerprint, ApprovalOutcome: metrics.ApprovalApproved,
 		}
+		stampRaiser(ev, raiser)
+		approvalMetrics(ev, req)
 		g.denyUngranted(execCtx, entry, req.AgentID, req.ID, ev)
 		ev.TotalLatencyMs = int(time.Since(started).Milliseconds())
 		if g.metrics != nil {
@@ -1806,6 +1855,8 @@ func (g *Gateway) Execute(ctx context.Context, req *approval.Request) {
 		IntentCategory:  req.IntentCategory,
 		ApprovalOutcome: metrics.ApprovalApproved,
 	}
+	stampRaiser(ev, raiser)
+	approvalMetrics(ev, req)
 	res, dispatchErr := g.dispatch(execCtx, entry, req.Arguments, req.AgentID, req.Reason, req.ID, ev)
 	ev.TotalLatencyMs = int(time.Since(started).Milliseconds())
 	if g.metrics != nil {

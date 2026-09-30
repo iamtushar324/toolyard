@@ -14,6 +14,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/tusharbhardwaj/toolyard/internal/actor"
 	"github.com/tusharbhardwaj/toolyard/internal/store"
 )
 
@@ -469,12 +470,48 @@ type Decision struct {
 	// Passkey is a WebAuthn assertion, required to allow high-risk tools
 	// once the owner has registered a passkey (see passkey.go).
 	Passkey *PasskeyAssertion `json:"passkey,omitempty"`
-	By      string            `json:"-"`
+	// By is the display label for DecidedBy (a username). Decider says
+	// who decided and how; when it is empty By stands in as the name.
+	By      string        `json:"-"`
+	Decider actor.Decider `json:"-"`
+}
+
+// decider is the structured actor of the decision: Decider when set, else
+// By as a dashboard user's name.
+func (d Decision) decider() actor.Decider {
+	if !d.Decider.IsZero() {
+		return d.Decider
+	}
+	return actor.Decider{Name: d.By, Via: actor.ViaDashboard}
+}
+
+// deciderLabel is how activity lines name the person: their name, else
+// their email, else "You" (the single-owner wording).
+func deciderLabel(d actor.Decider) string {
+	switch {
+	case d.Name != "":
+		return d.Name
+	case d.Email != "":
+		return d.Email
+	}
+	return "You"
+}
+
+// deciderSuffix says how the decision was made when that matters.
+func deciderSuffix(d actor.Decider) string {
+	switch d.Via {
+	case actor.ViaPushToken:
+		return " from a notification"
+	case actor.ViaPasskey:
+		return " with a passkey"
+	}
+	return ""
 }
 
 // Decide applies an owner decision.
 func (s *Service) Decide(ctx context.Context, id string, d Decision) (*Request, error) {
 	now := s.now().UnixMilli()
+	dec := d.decider()
 	// Passkey check happens before the transaction (verification writes
 	// the credential's sign count) and is re-checked inside it, in case
 	// the judge flagged a tool in between.
@@ -485,18 +522,26 @@ func (s *Service) Decide(ctx context.Context, id string, d Decision) (*Request, 
 			if d.Passkey == nil {
 				return nil, ErrPasskeyRequired
 			}
-			if err := s.opts.Passkeys.Verify(ctx, DecisionDigest(id, d), d.Passkey); err != nil {
+			credID, err := s.opts.Passkeys.VerifyCredential(ctx, DecisionDigest(id, d), d.Passkey)
+			if err != nil {
 				return nil, fmt.Errorf("%w: %v", ErrPasskeyFailed, err)
 			}
 			verified = true
+			// The passkey is the instrument that authorised this decision.
+			dec.Via, dec.Ref = actor.ViaPasskey, credID
 		}
 	}
+	who, how := deciderLabel(dec), deciderSuffix(dec)
 	var out *Request
 	err := s.mutateTx(ctx, id, func(tx *sql.Tx, r *Request) error {
 		if d.Action != "snooze" && r.Status != StatusPending {
 			return ErrNotPending
 		}
 		note := strings.TrimSpace(d.Note)
+		if d.Action != "snooze" {
+			// Before the switch: issueGrants stamps issued_by from it.
+			r.setDecider(dec, d.By, now)
+		}
 		switch d.Action {
 		case "approve":
 			if r.Kind != KindAccess {
@@ -559,13 +604,13 @@ func (s *Service) Decide(ctx context.Context, id string, d Decision) (*Request, 
 			}
 			r.Status = StatusApproved
 			r.GrantsExpire = now + int64(r.TTLSeconds)*1000
-			r.addActivity(now, fmt.Sprintf("You allowed %d of %d tool%s", n, len(r.Tools), plural(len(r.Tools))))
+			r.addActivity(now, fmt.Sprintf("%s allowed %d of %d tool%s%s", who, n, len(r.Tools), plural(len(r.Tools)), how))
 		case "deny":
 			for i := range r.Tools {
 				r.Tools[i].Decision = ToolRefused
 			}
 			r.Status = StatusDenied
-			r.addActivity(now, "You denied it"+withNote(note))
+			r.addActivity(now, who+" denied it"+how+withNote(note))
 		case "return":
 			if r.Kind != KindAccess {
 				return ErrBadDecision
@@ -574,7 +619,7 @@ func (s *Service) Decide(ctx context.Context, id string, d Decision) (*Request, 
 				r.Tools[i].Decision = ToolRefused
 			}
 			r.Status = StatusReturned
-			r.addActivity(now, "You sent it back to replan"+withNote(note))
+			r.addActivity(now, who+" sent it back to replan"+how+withNote(note))
 		case "answer":
 			if r.Kind != KindQuestion && r.Kind != KindBlocker {
 				return ErrBadDecision
@@ -584,7 +629,7 @@ func (s *Service) Decide(ctx context.Context, id string, d Decision) (*Request, 
 			}
 			r.Answer = r.Options[*d.Option].Label
 			r.Status = StatusAnswered
-			r.addActivity(now, "You answered: "+r.Answer)
+			r.addActivity(now, who+" answered"+how+": "+r.Answer)
 		case "read":
 			if r.Kind != KindUpdate {
 				return ErrBadDecision
@@ -605,10 +650,6 @@ func (s *Service) Decide(ctx context.Context, id string, d Decision) (*Request, 
 		}
 		if note != "" {
 			r.OwnerNote = note
-		}
-		if d.Action != "snooze" {
-			r.DecidedAt = now
-			r.DecidedBy = d.By
 		}
 		out = r
 		return nil

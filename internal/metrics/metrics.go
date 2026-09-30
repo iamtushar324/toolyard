@@ -55,9 +55,15 @@ const (
 type Event struct {
 	TS        int64
 	RequestID string
+	// SessionID is the toolyard agent session ("ses_…") the call was
+	// tagged with, else the MCP session id.
 	SessionID string
 	AgentID   string
 	AgentName string
+	// OwnerUserID and ClientKind come from the call's actor.Raiser: the
+	// person the agent works for and the client software that raised it.
+	OwnerUserID string
+	ClientKind  string
 
 	Upstream      string
 	ShortName     string
@@ -66,7 +72,7 @@ type Event struct {
 	IsDestructive bool
 	PinnedTool    bool
 
-	Via         string // direct | tools.execute | dashboard
+	Via         string // direct | tools.execute | dashboard | cli | voice | auto-execute
 	SurfaceMode string
 	InTopN      *bool
 
@@ -245,8 +251,9 @@ func (r *Recorder) insertBatch(evs []Event) error {
         approval_decider, coalesced_into,
         outcome, error_class, queue_latency_ms, upstream_latency_ms,
         total_latency_ms, result_size_bytes,
-        token_estimate_in, token_estimate_out
-    ) VALUES(?,?,?,?,?, ?,?,?,?,?,?, ?,?,?, ?,?,?, ?,?,?, ?,?,?,?,?,?, ?,?,?,?, ?,?, ?,?)`)
+        token_estimate_in, token_estimate_out,
+        owner_user_id, client_kind
+    ) VALUES(?,?,?,?,?, ?,?,?,?,?,?, ?,?,?, ?,?,?, ?,?,?, ?,?,?,?,?,?, ?,?,?,?, ?,?, ?,?, ?,?)`)
 	if err != nil {
 		_ = tx.Rollback()
 		return err
@@ -269,6 +276,7 @@ func (r *Recorder) insertBatch(evs []Event) error {
 			e.Outcome, nullStr(e.ErrorClass), nullIntZero(e.QueueLatencyMs), nullIntZero(e.UpstreamLatencyMs),
 			nullIntZero(e.TotalLatencyMs), nullIntZero(e.ResultSizeBytes),
 			tokenEstimate(e.ArgsSizeBytes), tokenEstimate(e.ResultSizeBytes),
+			nullStr(e.OwnerUserID), nullStr(e.ClientKind),
 		)
 		if err != nil {
 			_ = tx.Rollback()

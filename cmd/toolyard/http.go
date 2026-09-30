@@ -50,6 +50,10 @@ func (c *httpClient) doJSON(method, path string, in, out any) error {
 	if in != nil {
 		req.Header.Set("Content-Type", "application/json")
 	}
+	// Name the client so the gateway's audit rows record "cli" rather
+	// than Go's default agent string.
+	req.Header.Set("User-Agent", "toolyard-cli/"+version)
+	req.Header.Set("x-toolyard-client", "cli")
 	resp, err := c.hc.Do(req)
 	if err != nil {
 		return err

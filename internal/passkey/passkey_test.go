@@ -9,6 +9,7 @@ import (
 
 	"github.com/go-webauthn/webauthn/protocol"
 
+	"github.com/tusharbhardwaj/toolyard/internal/actor"
 	"github.com/tusharbhardwaj/toolyard/internal/inbox"
 	"github.com/tusharbhardwaj/toolyard/internal/passkey/passkeytest"
 	"github.com/tusharbhardwaj/toolyard/internal/store"
@@ -219,7 +220,7 @@ func TestInboxGate(t *testing.T) {
 	}
 
 	a := newSoftAuth(testOrigin)
-	register(t, s, a)
+	pk := register(t, s, a)
 	r = submit()
 	d := inbox.Decision{Action: "approve", Allow: []bool{true, true}}
 	if _, err := svc.Decide(ctx, r.ID, d); !errors.Is(err, inbox.ErrPasskeyRequired) {
@@ -242,5 +243,12 @@ func TestInboxGate(t *testing.T) {
 	got, err := svc.Decide(ctx, r.ID, d)
 	if err != nil || got.Status != inbox.StatusApproved {
 		t.Fatalf("confirmed approve: %v %+v", err, got)
+	}
+	// The decision records the passkey that confirmed it.
+	if got.DeciderVia != actor.ViaPasskey || got.DeciderRef != pk.ID {
+		t.Fatalf("decider via=%q ref=%q, want passkey %s", got.DeciderVia, got.DeciderRef, pk.ID)
+	}
+	if got.DecidedBy != actor.ViaPasskey+":"+pk.ID {
+		t.Fatalf("legacy decided_by = %q", got.DecidedBy)
 	}
 }

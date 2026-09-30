@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/tusharbhardwaj/toolyard/docs"
+	"github.com/tusharbhardwaj/toolyard/internal/actor"
 	"github.com/tusharbhardwaj/toolyard/internal/audit"
 	"github.com/tusharbhardwaj/toolyard/internal/inbox"
 )
@@ -218,23 +219,30 @@ func (s *Server) inboxDecide(w http.ResponseWriter, r *http.Request, uid, id str
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	body.By = "owner"
-	if u, err := s.identity.GetUserByID(r.Context(), uid); err == nil && u != nil {
-		body.By = u.Username
+	u, err := s.requireUserFull(r)
+	if err != nil {
+		writeError(w, http.StatusUnauthorized, "unauthorized")
+		return
 	}
+	body.By = u.Label()
+	body.Decider = s.dashboardDecider(r, u, actor.ViaDashboard)
 	req, err := s.inbox.Decide(r.Context(), id, body)
 	if err != nil {
 		writeInboxErr(w, err)
 		return
 	}
 	if s.audit != nil {
-		_ = s.audit.Write(r.Context(), audit.Event{
+		// The recorded decider: the person, and passkey when one signed
+		// the decision.
+		ev := audit.Event{
 			EventType:  "inbox.decide",
 			AgentID:    req.AgentID,
 			Decision:   body.Action,
 			Reason:     body.Note,
 			ApprovalID: req.ID,
-		})
+		}
+		ev.SetDecider(req.Decider())
+		_ = s.audit.Write(r.Context(), ev)
 	}
 	card := s.cardFor(r.Context(), req, s.agentNames(r.Context(), uid), map[string]*inbox.Session{})
 	writeJSON(w, http.StatusOK, map[string]any{"request": card})
@@ -380,7 +388,12 @@ func (s *Server) inboxRevoke(w http.ResponseWriter, r *http.Request, id string) 
 		writeError(w, http.StatusMethodNotAllowed, "POST only")
 		return
 	}
-	if err := s.inbox.RevokeGrant(r.Context(), id, "You"); err != nil {
+	u, err := s.requireUserFull(r)
+	if err != nil {
+		writeError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+	if err := s.inbox.RevokeGrantBy(r.Context(), id, s.dashboardDecider(r, u, actor.ViaDashboard)); err != nil {
 		writeInboxErr(w, err)
 		return
 	}
@@ -401,7 +414,12 @@ func (s *Server) inboxRevokeAll(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	n, err := s.inbox.RevokeAll(r.Context(), body.AgentID)
+	u, err := s.requireUserFull(r)
+	if err != nil {
+		writeError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+	n, err := s.inbox.RevokeAllBy(r.Context(), body.AgentID, s.dashboardDecider(r, u, actor.ViaDashboard))
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -471,20 +489,25 @@ func (s *Server) inboxBatch(w http.ResponseWriter, r *http.Request, uid string) 
 		writeError(w, http.StatusBadRequest, "ids: 1 to 200 request IDs")
 		return
 	}
-	by := "owner"
-	if u, err := s.identity.GetUserByID(r.Context(), uid); err == nil && u != nil {
-		by = u.Username
+	u, err := s.requireUserFull(r)
+	if err != nil {
+		writeError(w, http.StatusUnauthorized, "unauthorized")
+		return
 	}
+	// One batch id on every request this click decides.
+	decider := s.batchDecider(r, u)
 	done, failed := 0, map[string]string{}
 	for _, id := range body.IDs {
-		req, err := s.inbox.Decide(r.Context(), id, inbox.Decision{Action: body.Action, Note: body.Note, SnoozeMinutes: body.SnoozeMinutes, By: by})
+		req, err := s.inbox.Decide(r.Context(), id, inbox.Decision{Action: body.Action, Note: body.Note, SnoozeMinutes: body.SnoozeMinutes, By: u.Label(), Decider: decider})
 		if err != nil {
 			failed[id] = err.Error()
 			continue
 		}
 		done++
 		if s.audit != nil {
-			_ = s.audit.Write(r.Context(), audit.Event{EventType: "inbox.decide", AgentID: req.AgentID, Decision: body.Action, Reason: "batch", ApprovalID: req.ID})
+			ev := audit.Event{EventType: "inbox.decide", AgentID: req.AgentID, Decision: body.Action, Reason: "batch", ApprovalID: req.ID}
+			ev.SetDecider(req.Decider())
+			_ = s.audit.Write(r.Context(), ev)
 		}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"done": done, "failed": failed})
@@ -520,13 +543,17 @@ func (s *Server) inboxDecideByToken(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if s.audit != nil {
-		_ = s.audit.Write(r.Context(), audit.Event{
+		// The token's bound recipient (or an anonymous push tap), as the
+		// inbox recorded it.
+		ev := audit.Event{
 			EventType:  "inbox.decide",
 			AgentID:    req.AgentID,
 			Decision:   body.Action,
 			Reason:     "notification",
 			ApprovalID: req.ID,
-		})
+		}
+		ev.SetDecider(req.Decider())
+		_ = s.audit.Write(r.Context(), ev)
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"status": req.Status, "snoozed_until": req.SnoozedUntil, "answer": req.Answer})
 }
