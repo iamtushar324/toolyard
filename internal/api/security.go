@@ -175,7 +175,7 @@ func clerkCSP(frontendAPI string) string {
 
 // EnforceOriginOnMutations checks Origin/Referer on state-changing methods
 // when PublicURL is set. Cookie-authenticated POST/PATCH/DELETE that don't
-// match the public origin are 403'd. Bearer-authenticated /mcp traffic and
+// match the public origin are 403'd. Token-authenticated /mcp traffic (Bearer or x-bf-vk) and
 // the token-authenticated agent routes (exemptFromOriginCheck) are excluded —
 // a credential that isn't a cookie is not CSRF-replayable.
 func (s *Server) EnforceOriginOnMutations(next http.Handler) http.Handler {
@@ -186,9 +186,12 @@ func (s *Server) EnforceOriginOnMutations(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
 		case http.MethodPost, http.MethodPatch, http.MethodPut, http.MethodDelete:
-			// Bearer-authenticated MCP traffic skips this — no cookie auth in play.
+			// Token-authenticated MCP traffic skips this — no cookie auth in
+			// play. The token arrives as a bearer or in x-bf-vk, which T3's
+			// Bifrost proxy sends server-to-server with no Origin.
 			if strings.HasPrefix(r.URL.Path, "/mcp") &&
-				strings.HasPrefix(r.Header.Get("Authorization"), "Bearer ") {
+				(strings.HasPrefix(r.Header.Get("Authorization"), "Bearer ") ||
+					strings.TrimSpace(r.Header.Get("x-bf-vk")) != "") {
 				next.ServeHTTP(w, r)
 				return
 			}
