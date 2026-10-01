@@ -15,6 +15,8 @@ type Config struct {
 	Token   string `json:"token"`
 	AgentID string `json:"agent_id,omitempty"`
 	Name    string `json:"name,omitempty"`
+	// OperatorToken (tyop_…) authenticates `toolyard admin` and `toolyard api`.
+	OperatorToken string `json:"operator_token,omitempty"`
 }
 
 func configPath() (string, error) {

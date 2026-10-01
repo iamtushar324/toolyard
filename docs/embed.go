@@ -14,3 +14,9 @@ var AgentProtocol string
 //
 //go:embed guidelines/skill/toolyard-inbox/SKILL.md
 var InboxSkill string
+
+// OperatorGuide is docs/guidelines/operator.md, served at /v1/operator/guide
+// and printed by `toolyard admin guide`.
+//
+//go:embed guidelines/operator.md
+var OperatorGuide string

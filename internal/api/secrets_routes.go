@@ -7,6 +7,7 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/tusharbhardwaj/toolyard/internal/identity"
 	"github.com/tusharbhardwaj/toolyard/internal/secrets"
 	"github.com/tusharbhardwaj/toolyard/internal/upstreams"
 )
@@ -42,6 +43,10 @@ func (s *Server) secretsCollection(w http.ResponseWriter, r *http.Request) {
 			if m.LastUsedAt > 0 {
 				row["last_used_at"] = m.LastUsedAt
 			}
+			if m.Pending {
+				row["pending"] = true
+				row["requested_by"] = m.RequestedBy
+			}
 			out = append(out, row)
 		}
 		writeJSON(w, http.StatusOK, out)
@@ -50,9 +55,26 @@ func (s *Server) secretsCollection(w http.ResponseWriter, r *http.Request) {
 			Name        string `json:"name"`
 			Value       string `json:"value"`
 			Description string `json:"description"`
+			// Request creates a value-less placeholder for the owner to fill.
+			Request bool `json:"request"`
 		}
 		if err := decode(r, &body); err != nil {
 			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		if body.Request {
+			if body.Value != "" {
+				writeError(w, http.StatusBadRequest, "a secret request carries no value")
+				return
+			}
+			s.secretsRequest(w, r, body.Name, body.Description)
+			return
+		}
+		if t := operatorFromContext(r.Context()); t != nil && !t.HasScope(identity.ScopeOwner) {
+			writeJSON(w, http.StatusForbidden, map[string]any{
+				"error": "operator_scope", "required_scope": identity.ScopeOwner,
+				"hint": `secret values come from the owner: POST {"name":..., "description":..., "request":true} and ask them to fill it in`,
+			})
 			return
 		}
 		m, err := s.secrets.Create(r.Context(), body.Name, body.Value, body.Description)
@@ -96,6 +118,10 @@ func (s *Server) secretsItem(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, err.Error())
 			return
 		}
+		wasPending := false
+		if prev, perr := s.secrets.Get(r.Context(), name); perr == nil {
+			wasPending = prev.Pending
+		}
 		m, err := s.secrets.Update(r.Context(), name, body.Value, body.Description)
 		if err != nil {
 			status := http.StatusBadRequest
@@ -108,7 +134,9 @@ func (s *Server) secretsItem(w http.ResponseWriter, r *http.Request) {
 		// Optional: reconnect every upstream that references this secret so
 		// the rotated value takes effect without a manual reconnect click.
 		reconnected := []string{}
-		if r.URL.Query().Get("reconnect") == "1" && s.upstreams != nil {
+		// Filling a requested secret always reconnects: the servers that
+		// reference it have been waiting for exactly this value.
+		if (wasPending || r.URL.Query().Get("reconnect") == "1") && s.upstreams != nil {
 			for _, srvName := range s.secretUsage(r)[name] {
 				if _, rerr := s.upstreams.Reconnect(r.Context(), srvName); rerr == nil {
 					reconnected = append(reconnected, srvName)
@@ -153,7 +181,8 @@ func (s *Server) secretUsage(r *http.Request) map[string][]string {
 	}
 	add := func(server string, m map[string]string) {
 		for _, v := range m {
-			if n, ok := secrets.ParseRef(v); ok {
+			names, _ := secrets.Refs(v)
+			for _, n := range names {
 				if !contains(out[n], server) {
 					out[n] = append(out[n], server)
 				}
@@ -217,4 +246,35 @@ func (s *Server) serversConvertEnv(w http.ResponseWriter, r *http.Request, name 
 		return
 	}
 	writeJSON(w, http.StatusOK, upstreams.Masked(*srv))
+}
+
+// secretsRequest creates a value-less secret the owner fills in from the
+// dashboard. Agents use it to wire servers to credentials they never see:
+// reference secret://NAME (or ${secret://NAME}) straight away; the server
+// connects once the owner sets the value.
+func (s *Server) secretsRequest(w http.ResponseWriter, r *http.Request, name, description string) {
+	requestedBy := ""
+	if t := operatorFromContext(r.Context()); t != nil {
+		requestedBy = "operator: " + t.Name
+	} else if u, ok := s.sessionUser(r); ok {
+		requestedBy = u.Label()
+	}
+	m, err := s.secrets.Request(r.Context(), name, description, requestedBy)
+	if err != nil {
+		status := http.StatusBadRequest
+		if errors.Is(err, secrets.ErrExists) {
+			status = http.StatusConflict
+		}
+		writeError(w, status, err.Error())
+		return
+	}
+	out := map[string]any{
+		"secret": m,
+		"ref":    secrets.RefPrefix + m.Name,
+		"next":   "reference the ref in a server's env or headers now; ask the owner to set the value in Settings → Secrets",
+	}
+	if base := strings.TrimRight(s.security.PublicURL, "/"); base != "" {
+		out["fill_url"] = base + "/#settings"
+	}
+	writeJSON(w, http.StatusOK, out)
 }

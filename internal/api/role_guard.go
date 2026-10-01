@@ -24,6 +24,15 @@ func (s *Server) RoleGuard(next http.Handler) http.Handler {
 			next.ServeHTTP(w, r)
 			return
 		}
+		// An operator token (no cookie) acts as its user, within its scopes.
+		if isOperatorRequest(r) {
+			r2, ok := s.operatorGuard(w, r)
+			if !ok {
+				return
+			}
+			s.serveOperator(next, w, r2)
+			return
+		}
 		if _, err := r.Cookie(sessionCookieName); err != nil {
 			next.ServeHTTP(w, r)
 			return

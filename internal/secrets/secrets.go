@@ -21,13 +21,20 @@ import (
 )
 
 // RefPrefix marks a config value as a reference to a stored secret rather
-// than a literal. v1 supports whole-value match only — no interpolation.
+// than a literal. A value is either a whole-value ref ("secret://API_KEY") or
+// carries embedded refs ("Bearer ${secret://API_KEY}").
 const RefPrefix = "secret://"
+
+// embedOpen starts an embedded reference inside a larger value.
+const embedOpen = "${" + RefPrefix
 
 var (
 	ErrNotFound = errors.New("secret not found")
 	ErrExists   = errors.New("secret already exists")
 	ErrInvalid  = errors.New("invalid secret")
+	// ErrPending means the secret was requested but the owner hasn't set
+	// its value yet.
+	ErrPending = errors.New("secret is waiting for its value")
 
 	// nameRe is the permitted secret-name shape: an uppercase env-var-style
 	// identifier. Keeps refs unambiguous and shell-safe.
@@ -51,6 +58,10 @@ type Meta struct {
 	CreatedAt   int64  `json:"created_at"`
 	UpdatedAt   int64  `json:"updated_at"`
 	LastUsedAt  int64  `json:"last_used_at,omitempty"`
+	// Pending is true for a requested secret whose value the owner hasn't
+	// set yet; RequestedBy names who asked for it.
+	Pending     bool   `json:"pending,omitempty"`
+	RequestedBy string `json:"requested_by,omitempty"`
 }
 
 // Service owns the secrets table.
@@ -98,6 +109,29 @@ func (s *Service) Create(ctx context.Context, name, value, description string) (
 	return &Meta{Name: name, Description: description, CreatedAt: now, UpdatedAt: now}, nil
 }
 
+// Request creates a named placeholder with no value. Upstreams may reference
+// it straight away; it resolves (and they can connect) only after the owner
+// sets the value with Update. requestedBy is recorded for the dashboard.
+func (s *Service) Request(ctx context.Context, name, description, requestedBy string) (*Meta, error) {
+	name = strings.TrimSpace(name)
+	if !ValidName(name) {
+		return nil, fmt.Errorf("%w: name must match ^[A-Z][A-Z0-9_]{0,63}$", ErrInvalid)
+	}
+	now := time.Now().UnixMilli()
+	_, err := s.db.ExecContext(ctx,
+		`INSERT INTO secrets(name, value_enc, description, created_at, updated_at, pending, requested_by)
+         VALUES(?,'',?,?,?,1,?)`,
+		name, nullStr(description), now, now, nullStr(requestedBy))
+	if err != nil {
+		if strings.Contains(strings.ToLower(err.Error()), "unique") {
+			return nil, ErrExists
+		}
+		return nil, err
+	}
+	s.writeAudit(ctx, "secret.request", name)
+	return &Meta{Name: name, Description: description, CreatedAt: now, UpdatedAt: now, Pending: true, RequestedBy: requestedBy}, nil
+}
+
 // Update rotates an existing secret's value (and optionally its description).
 // Pass description == nil to leave the description untouched.
 func (s *Service) Update(ctx context.Context, name, value string, description *string) (*Meta, error) {
@@ -116,11 +150,11 @@ func (s *Service) Update(ctx context.Context, name, value string, description *s
 	var res sql.Result
 	if description != nil {
 		res, err = s.db.ExecContext(ctx,
-			`UPDATE secrets SET value_enc=?, description=?, updated_at=? WHERE name=?`,
+			`UPDATE secrets SET value_enc=?, description=?, updated_at=?, pending=0 WHERE name=?`,
 			enc, nullStr(*description), now, name)
 	} else {
 		res, err = s.db.ExecContext(ctx,
-			`UPDATE secrets SET value_enc=?, updated_at=? WHERE name=?`,
+			`UPDATE secrets SET value_enc=?, updated_at=?, pending=0 WHERE name=?`,
 			enc, now, name)
 	}
 	if err != nil {
@@ -151,10 +185,11 @@ func (s *Service) Delete(ctx context.Context, name string) error {
 // Get returns the value-free metadata for one secret.
 func (s *Service) Get(ctx context.Context, name string) (*Meta, error) {
 	row := s.db.QueryRowContext(ctx,
-		`SELECT name, COALESCE(description,''), created_at, updated_at, COALESCE(last_used_at,0)
+		`SELECT name, COALESCE(description,''), created_at, updated_at, COALESCE(last_used_at,0),
+                pending, COALESCE(requested_by,'')
          FROM secrets WHERE name=?`, name)
 	var m Meta
-	if err := row.Scan(&m.Name, &m.Description, &m.CreatedAt, &m.UpdatedAt, &m.LastUsedAt); err != nil {
+	if err := row.Scan(&m.Name, &m.Description, &m.CreatedAt, &m.UpdatedAt, &m.LastUsedAt, &m.Pending, &m.RequestedBy); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, ErrNotFound
 		}
@@ -166,7 +201,8 @@ func (s *Service) Get(ctx context.Context, name string) (*Meta, error) {
 // List returns every secret's metadata (never values), name-sorted.
 func (s *Service) List(ctx context.Context) ([]Meta, error) {
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT name, COALESCE(description,''), created_at, updated_at, COALESCE(last_used_at,0)
+		`SELECT name, COALESCE(description,''), created_at, updated_at, COALESCE(last_used_at,0),
+                pending, COALESCE(requested_by,'')
          FROM secrets ORDER BY name`)
 	if err != nil {
 		return nil, err
@@ -175,7 +211,7 @@ func (s *Service) List(ctx context.Context) ([]Meta, error) {
 	out := []Meta{}
 	for rows.Next() {
 		var m Meta
-		if err := rows.Scan(&m.Name, &m.Description, &m.CreatedAt, &m.UpdatedAt, &m.LastUsedAt); err != nil {
+		if err := rows.Scan(&m.Name, &m.Description, &m.CreatedAt, &m.UpdatedAt, &m.LastUsedAt, &m.Pending, &m.RequestedBy); err != nil {
 			return nil, err
 		}
 		out = append(out, m)
@@ -201,13 +237,17 @@ func (s *Service) Exists(ctx context.Context, name string) (bool, error) {
 // and (rate-limited) writing a secret.use audit event. This is the only path
 // that ever returns plaintext.
 func (s *Service) Resolve(ctx context.Context, name string) (string, error) {
-	row := s.db.QueryRowContext(ctx, `SELECT value_enc FROM secrets WHERE name=?`, name)
+	row := s.db.QueryRowContext(ctx, `SELECT value_enc, pending FROM secrets WHERE name=?`, name)
 	var enc string
-	if err := row.Scan(&enc); err != nil {
+	var pending bool
+	if err := row.Scan(&enc, &pending); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return "", ErrNotFound
 		}
 		return "", err
+	}
+	if pending {
+		return "", fmt.Errorf("%w: ask the owner to set %s in Toolyard (Settings → Secrets)", ErrPending, name)
 	}
 	plain, err := s.cipher.Open(enc, aad(name))
 	if err != nil {
@@ -219,9 +259,8 @@ func (s *Service) Resolve(ctx context.Context, name string) (string, error) {
 	return string(plain), nil
 }
 
-// ParseRef returns (name, true) when value is a whole-value secret reference.
-// No interpolation in v1: "secret://API_KEY" matches, "Bearer secret://X"
-// does not.
+// ParseRef returns (name, true) when value is a whole-value secret reference
+// ("secret://API_KEY"). Embedded refs are handled by Refs and Expand.
 func ParseRef(value string) (string, bool) {
 	if !strings.HasPrefix(value, RefPrefix) {
 		return "", false
@@ -233,30 +272,96 @@ func ParseRef(value string) (string, bool) {
 	return name, true
 }
 
-// IsRef reports whether value is a secret reference of any (even malformed)
-// shape. Used by masking so a malformed ref is still hidden, not echoed.
+// IsRef reports whether value refers to a secret in any shape, even a
+// malformed one: whole-value or embedded. Masking uses it so a value that
+// names a secret is shown as written (the ref isn't sensitive) and is
+// resolved at dial time rather than sent literally.
 func IsRef(value string) bool {
-	return strings.HasPrefix(value, RefPrefix)
+	return strings.HasPrefix(value, RefPrefix) || strings.Contains(value, embedOpen)
 }
 
-// ResolveMap returns a copy of in where every secret:// reference is replaced
+// Refs returns every secret name value refers to. ok is false when a ref is
+// malformed (bad name, or an unclosed "${secret://").
+func Refs(value string) (names []string, ok bool) {
+	if strings.HasPrefix(value, RefPrefix) {
+		name, ok := ParseRef(value)
+		if !ok {
+			return nil, false
+		}
+		return []string{name}, true
+	}
+	rest := value
+	for {
+		i := strings.Index(rest, embedOpen)
+		if i < 0 {
+			return names, true
+		}
+		rest = rest[i+len(embedOpen):]
+		j := strings.IndexByte(rest, '}')
+		if j < 0 || !ValidName(rest[:j]) {
+			return nil, false
+		}
+		names = append(names, rest[:j])
+		rest = rest[j+1:]
+	}
+}
+
+// Expand returns value with every secret reference replaced by the secret's
+// plaintext. Values without refs pass through unchanged. Errors name the
+// reference, never a value.
+func (s *Service) Expand(ctx context.Context, value string) (string, error) {
+	if name, ok := ParseRef(value); ok {
+		return s.Resolve(ctx, name)
+	}
+	if !strings.Contains(value, embedOpen) {
+		return value, nil
+	}
+	var b strings.Builder
+	rest := value
+	for {
+		i := strings.Index(rest, embedOpen)
+		if i < 0 {
+			b.WriteString(rest)
+			return b.String(), nil
+		}
+		b.WriteString(rest[:i])
+		rest = rest[i+len(embedOpen):]
+		j := strings.IndexByte(rest, '}')
+		if j < 0 || !ValidName(rest[:j]) {
+			return "", fmt.Errorf("%w: malformed secret reference", ErrInvalid)
+		}
+		plain, err := s.Resolve(ctx, rest[:j])
+		if err != nil {
+			return "", err
+		}
+		b.WriteString(plain)
+		rest = rest[j+1:]
+	}
+}
+
+// ResolveMap returns a copy of in where every secret reference is replaced
 // by its decrypted value. Non-ref values pass through verbatim. Errors name
-// the offending ref but never echo any value.
+// the offending key but never echo any value.
 func (s *Service) ResolveMap(ctx context.Context, in map[string]string) (map[string]string, error) {
 	if len(in) == 0 {
 		return map[string]string{}, nil
 	}
 	out := make(map[string]string, len(in))
 	for k, v := range in {
-		if name, ok := ParseRef(v); ok {
-			resolved, err := s.Resolve(ctx, name)
-			if err != nil {
-				return nil, fmt.Errorf("resolving %s for key %q: %w", v, k, err)
-			}
-			out[k] = resolved
+		if !IsRef(v) {
+			out[k] = v
 			continue
 		}
-		out[k] = v
+		resolved, err := s.Expand(ctx, v)
+		if err != nil {
+			names, _ := Refs(v)
+			refs := make([]string, len(names))
+			for i, n := range names {
+				refs[i] = RefPrefix + n
+			}
+			return nil, fmt.Errorf("resolving %s for key %q: %w", strings.Join(refs, ", "), k, err)
+		}
+		out[k] = resolved
 	}
 	return out, nil
 }

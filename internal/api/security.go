@@ -209,7 +209,7 @@ func (s *Server) EnforceOriginOnMutations(next http.Handler) http.Handler {
 			// CLIs, hooks and webhooks that send no Origin. Without a cookie
 			// they aren't CSRF-replayable. Login and setup are browser-only
 			// forms, so they keep the check.
-			if exemptFromOriginCheck(r.URL.Path) {
+			if exemptFromOriginCheck(r.URL.Path) || isOperatorRequest(r) {
 				next.ServeHTTP(w, r)
 				return
 			}
@@ -319,7 +319,7 @@ func (s *Server) HardenAPI(next http.Handler) http.Handler {
 			// /v1/agents/exchange (Bearer-bootstrap path) and
 			// /v1/approvals/decide-by-token (push-tap path; signed token
 			// is the auth, no cookie present).
-			if !exemptFromCSRFHeader(path) {
+			if !exemptFromCSRFHeader(path) && !isOperatorRequest(r) {
 				if r.Header.Get("X-Requested-With") == "" {
 					writeError(w, http.StatusForbidden,
 						"X-Requested-With header required on mutating requests")

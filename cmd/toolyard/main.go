@@ -56,6 +56,10 @@ func main() {
 		err = runWait(args)
 	case "skills":
 		err = runSkills(args)
+	case "admin":
+		err = runAdmin(args)
+	case "api":
+		err = runAPI(args)
 	case "version", "-v", "--version":
 		fmt.Println("toolyard", version)
 	case "help", "-h", "--help":
@@ -88,6 +92,10 @@ Asking your owner for permission (the toolyard inbox):
   request --from req.json [--dry-run] [--kind access|question|blocker|update]
   wait <request_id>... [--timeout 5m]
   skills install toolyard-inbox     install the Claude Code skill
+
+Operating toolyard (operator token; see 'toolyard admin guide'):
+  admin <command>                   servers, secrets, agents, tokens, tools, settings, audit
+  api METHOD /v1/PATH [-d JSON]     call any dashboard API route
 
 Run 'toolyard <command> -h' for command-specific flags.
 

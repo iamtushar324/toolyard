@@ -3885,6 +3885,7 @@ function viewSettings() {
     renderPushCard(),
     renderChatCard(),
     renderSecretsCard(),
+    renderOperatorTokensCard(),
     el('div', { class: 'card' },
       el('h2', {}, 'About'),
       el('p', {}, 'toolyard v0.1.0 — Apache-2.0.'),
@@ -4049,12 +4050,14 @@ function renderSecretsCard() {
       loadSecrets();
     } catch (e) { toast(e.message, 'error'); }
   };
+  const pendingCount = (state.secrets || []).filter((s) => s.pending).length;
   const rows = (state.secrets || []).map((s) => el('tr', {},
-    el('td', {}, el('code', {}, s.name)),
-    el('td', { class: 'meta' }, s.description || '—'),
+    el('td', {}, el('code', {}, s.name),
+      s.pending ? el('span', { class: 'badge pending', title: 'Requested by ' + (s.requested_by || 'an agent') + '; servers using it connect once you set it', style: 'margin-left:6px;' }, 'needs value') : null),
+    el('td', { class: 'meta' }, (s.description || '—') + (s.pending && s.requested_by ? ' · requested by ' + s.requested_by : '')),
     el('td', { class: 'meta' }, (s.used_by && s.used_by.length) ? s.used_by.join(', ') : '—'),
     el('td', {},
-      el('button', { class: 'btn', style: 'font-size:12px;', on: { click: () => rotateSecret(s.name) } }, 'Rotate'),
+      el('button', { class: s.pending ? 'btn primary' : 'btn', style: 'font-size:12px;', on: { click: () => rotateSecret(s.name, s.pending) } }, s.pending ? 'Set value' : 'Rotate'),
       ' ',
       el('button', { class: 'btn', style: 'font-size:12px;', on: { click: () => deleteSecret(s.name, s.used_by || []) } }, 'Delete'),
     ),
@@ -4063,7 +4066,8 @@ function renderSecretsCard() {
     el('h2', {}, 'Secrets'),
     el('p', { class: 'meta' },
       'Store API keys once, encrypted. Reference them in a server\'s env/headers as ',
-      el('code', {}, 'secret://NAME'), '. Values are resolved only at dial time and never returned by the API.'),
+      el('code', {}, 'secret://NAME'), ' (or ', el('code', {}, 'Bearer ${secret://NAME}'), '). Values are resolved only at dial time and never returned by the API. Agents can request a secret by name; you type the value here.'),
+    pendingCount ? el('p', { style: 'margin-top:6px; color: var(--pending);' }, pendingCount + (pendingCount === 1 ? ' secret is' : ' secrets are') + ' waiting for a value.') : null,
     state.secrets && state.secrets.length ? el('table', { class: 'tbl', style: 'width:100%; margin-top:8px;' },
       el('thead', {}, el('tr', {},
         el('th', {}, 'Name'), el('th', {}, 'Description'), el('th', {}, 'Used by'), el('th', {}, ''))),
@@ -4080,12 +4084,49 @@ function renderSecretsCard() {
   );
 }
 
+// renderOperatorTokensCard lists the CLI operator tokens (toolyard admin /
+// toolyard api) and lets the owner revoke them. New tokens are minted with
+// `toolyard operator-token create` on the host or POST /v1/operator-tokens.
+function renderOperatorTokensCard() {
+  if (!state.opTokensLoaded) { loadOperatorTokens(); }
+  const fmt = (ms) => ms ? new Date(ms).toLocaleString() : '—';
+  const rows = (state.opTokens || []).map((t) => el('tr', {},
+    el('td', {}, t.name, el('div', { class: 'meta' }, el('code', {}, t.id))),
+    el('td', {}, (t.scopes || []).join(' ')),
+    el('td', { class: 'meta' }, fmt(t.last_used_at)),
+    el('td', {}, t.revoked_at ? el('span', { class: 'meta' }, 'revoked')
+      : el('button', { class: 'btn', style: 'font-size:12px;', on: { click: () => revokeOperatorToken(t.id, t.name) } }, 'Revoke')),
+  ));
+  return el('div', { class: 'card' },
+    el('h2', {}, 'Operator tokens'),
+    el('p', { class: 'meta' },
+      'CLI agents use these with ', el('code', {}, 'toolyard admin'), ' and ', el('code', {}, 'toolyard api'),
+      ' to do what this dashboard does. The owner scope (approvals, policies, users, secret values) is never granted by default; secret values are never readable. Every change they make is in the audit log.'),
+    rows.length ? el('table', { class: 'tbl', style: 'width:100%; margin-top:8px;' },
+      el('thead', {}, el('tr', {}, el('th', {}, 'Name'), el('th', {}, 'Scopes'), el('th', {}, 'Last used'), el('th', {}, ''))),
+      el('tbody', {}, ...rows),
+    ) : el('p', { class: 'meta' }, 'No operator tokens.'),
+  );
+}
+
+async function loadOperatorTokens() {
+  state.opTokensLoaded = true;
+  try { state.opTokens = await api('/v1/operator-tokens'); render(); } catch (_) {}
+}
+async function revokeOperatorToken(id, name) {
+  if (!confirm('Revoke operator token "' + name + '"? Agents using it lose access immediately.')) return;
+  try { await api('/v1/operator-tokens/' + encodeURIComponent(id), { method: 'DELETE' }); toast('Revoked ' + name); loadOperatorTokens(); }
+  catch (e) { toast(e.message, 'error'); }
+}
+
 async function loadSecrets() {
   state.secretsLoaded = true;
   try { state.secrets = await api('/v1/secrets'); render(); } catch (_) {}
 }
-async function rotateSecret(name) {
-  const v = prompt('New value for ' + name + ' (rotates + reconnects referencing servers):');
+async function rotateSecret(name, pending) {
+  const v = prompt(pending
+    ? 'Value for ' + name + ' (servers that reference it reconnect automatically):'
+    : 'New value for ' + name + ' (rotates + reconnects referencing servers):');
   if (v == null || v === '') return;
   try { await api('/v1/secrets/' + encodeURIComponent(name) + '?reconnect=1', { method: 'PUT', body: { value: v } }); toast('Rotated ' + name); loadSecrets(); }
   catch (e) { toast(e.message, 'error'); }

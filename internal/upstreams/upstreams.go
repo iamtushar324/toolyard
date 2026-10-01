@@ -741,16 +741,18 @@ func (s *Service) validateSecretRefs(ctx context.Context, srv Server) error {
 			if !secrets.IsRef(v) {
 				continue
 			}
-			name, ok := secrets.ParseRef(v)
+			names, ok := secrets.Refs(v)
 			if !ok {
-				return fmt.Errorf("%w: %s %q has malformed secret ref %q", ErrInvalid, kind, k, v)
+				return fmt.Errorf("%w: %s %q has a malformed secret ref (use secret://NAME or ${secret://NAME})", ErrInvalid, kind, k)
 			}
-			exists, err := s.secrets.Exists(ctx, name)
-			if err != nil {
-				return err
-			}
-			if !exists {
-				return fmt.Errorf("%w: %s %q references unknown secret %q", ErrInvalid, kind, k, name)
+			for _, name := range names {
+				exists, err := s.secrets.Exists(ctx, name)
+				if err != nil {
+					return err
+				}
+				if !exists {
+					return fmt.Errorf("%w: %s %q references unknown secret %q (request it with POST /v1/secrets {\"name\":%q,\"request\":true})", ErrInvalid, kind, k, name, name)
+				}
 			}
 		}
 		return nil

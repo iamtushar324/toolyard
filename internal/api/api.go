@@ -387,6 +387,7 @@ func (s *Server) Routes(mux *http.ServeMux) {
 
 	s.oauthRoutes(mux)
 	s.cliRoutes(mux)
+	s.operatorRoutes(mux)
 	s.voiceRoutes(mux)
 	s.inboxRoutes(mux)
 	s.passkeyRoutes(mux)
@@ -536,6 +537,9 @@ func (s *Server) verifySession(r *http.Request) (string, bool) {
 // currentSessionID extracts the sid claim if the cookie is present and
 // valid. Used by logout so we revoke this JWT specifically.
 func (s *Server) currentSessionID(r *http.Request) string {
+	if t := operatorFromContext(r.Context()); t != nil {
+		return "operator:" + t.ID
+	}
 	cookie, err := r.Cookie(sessionCookieName)
 	if err != nil {
 		return ""
@@ -1671,6 +1675,9 @@ func (s *Server) settingsHandler(w http.ResponseWriter, r *http.Request) {
 		var body map[string]any
 		if err := decode(r, &body); err != nil {
 			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		if !s.operatorSettingsCheck(w, r, body) {
 			return
 		}
 		if err := s.settings.Patch(r.Context(), body); err != nil {

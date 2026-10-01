@@ -612,7 +612,7 @@ func (s *Server) guideSkill(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) agentOrUser(w http.ResponseWriter, r *http.Request) bool {
-	if strings.HasPrefix(r.Header.Get("Authorization"), "Bearer ") {
+	if _, isOp := operatorBearer(r); !isOp && strings.HasPrefix(r.Header.Get("Authorization"), "Bearer ") {
 		_, ok := s.requireAgent(w, r)
 		return ok
 	}

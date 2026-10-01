@@ -113,6 +113,8 @@ func main() {
 		err = runProbe(args)
 	case "lake":
 		err = runLake(args)
+	case "operator-token":
+		err = runOperatorToken(args)
 	case "version", "-v", "--version":
 		fmt.Println("toolyard", version)
 	case "help", "-h", "--help":
@@ -204,6 +206,7 @@ Commands:
   exchange    swap an enrollment code for an agent token
   probe       dry-run a tool against an upstream MCP server
   lake        manage the personal data lake (backup | tables)
+  operator-token  create | list | revoke CLI operator tokens (local, from -data)
   version     print version
 
 Run 'toolyard <command> -h' for command flags.`)
