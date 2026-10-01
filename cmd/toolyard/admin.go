@@ -158,11 +158,13 @@ func redactJSON(data []byte) []byte {
 		}
 		return x
 	}
-	out, err := json.Marshal(walk(v))
-	if err != nil {
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(walk(v)); err != nil {
 		return data
 	}
-	return out
+	return bytes.TrimRight(buf.Bytes(), "\n")
 }
 
 // takeToken writes resp["token"] to path (0600, no overwrite), removes it

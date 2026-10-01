@@ -94,7 +94,7 @@ func (s *Server) dashboardRaiser(r *http.Request, u *identity.User) actor.Raiser
 	// Raised by a CLI agent with an operator token: same owner and the same
 	// approval path, but named as the CLI so the approval card says so.
 	if t := operatorFromContext(r.Context()); t != nil {
-		rs.AgentKind, rs.AgentName = "cli", "operator: "+t.Name
+		rs.AgentName = "operator: " + t.Name
 		rs.ClientKind, rs.ClientName, rs.Via = "cli", t.ID, "cli"
 	}
 	return rs
