@@ -9,6 +9,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/tusharbhardwaj/toolyard/internal/identity"
 	"github.com/tusharbhardwaj/toolyard/internal/settings"
 	"github.com/tusharbhardwaj/toolyard/internal/store"
 )
@@ -66,22 +67,10 @@ func TestInboxVoiceKeyRejectsOperatorTokens(t *testing.T) {
 
 func TestInboxVoiceKeyRejectsMember(t *testing.T) {
 	f := newInboxAPIFixture(t)
-	_, err := f.srv.identity.CreateUser(context.Background(), "member", "long-member-password")
-	if err != nil {
-		t.Fatal(err)
-	}
-	r := httptest.NewRequest("POST", "/v1/auth/login", strings.NewReader(`{"Username":"member","Password":"long-member-password"}`))
+	r := httptest.NewRequest("POST", "/v1/inbox/voice-key", strings.NewReader(`{"api_key":"bad"}`))
+	// RoleGuard supplies the resolved user; the handler must also deny members.
+	r = r.WithContext(context.WithValue(r.Context(), ctxUserKey, &identity.User{ID: "member", Role: identity.RoleMember, Status: identity.StatusActive}))
 	w := httptest.NewRecorder()
-	f.mux.ServeHTTP(w, r)
-	cookies := w.Result().Cookies()
-	if len(cookies) == 0 {
-		t.Fatalf("member login failed: %d", w.Code)
-	}
-	r = httptest.NewRequest("POST", "/v1/inbox/voice-key", strings.NewReader(`{"api_key":"bad"}`))
-	for _, cookie := range cookies {
-		r.AddCookie(cookie)
-	}
-	w = httptest.NewRecorder()
 	f.mux.ServeHTTP(w, r)
 	if w.Code != http.StatusForbidden {
 		t.Fatalf("member credential write: %d", w.Code)
