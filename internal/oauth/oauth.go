@@ -640,12 +640,30 @@ func (s *Service) beginCallback(ctx context.Context, upstream, userID, mode stri
 		q.Set("prompt", "consent")
 	}
 
-	sep := "?"
-	if strings.Contains(cli.AuthorizationEndpoint, "?") {
-		sep = "&"
+	authURL, err = joinAuthorizeURL(cli.AuthorizationEndpoint, q)
+	if err != nil {
+		return "", "", err
 	}
-	authURL = cli.AuthorizationEndpoint + sep + q.Encode()
 	return authURL, state, nil
+}
+
+// joinAuthorizeURL adds q to the authorization endpoint. A parameter the
+// endpoint already carries is replaced, not repeated: an endpoint stored
+// as ".../auth?access_type=offline&prompt=consent" (as Bifrost keeps
+// Google's) plus our own access_type would otherwise send it twice, and
+// Google rejects that with "OAuth 2 parameters can only have a single
+// value".
+func joinAuthorizeURL(endpoint string, q url.Values) (string, error) {
+	u, err := url.Parse(endpoint)
+	if err != nil {
+		return "", fmt.Errorf("oauth: bad authorization endpoint: %w", err)
+	}
+	merged := u.Query()
+	for k, vs := range q {
+		merged[k] = vs
+	}
+	u.RawQuery = merged.Encode()
+	return u.String(), nil
 }
 
 // LoadPending fetches a pending row by state. Returns ErrPendingNotFound
