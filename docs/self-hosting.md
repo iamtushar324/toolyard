@@ -124,6 +124,12 @@ makes goes through the normal pipeline (access, policy, approvals, identity
 forwarding, audit) under via `code_mode`, so a held or denied call aborts the
 script with the gateway's answer. Names that are not Starlark identifiers are
 bound under a sanitised one (`bk-core` becomes `bk_core`; the stubs say so).
+toolyard's own tools (inbox, memory, events, session, the `tools.*` helpers,
+and the access tools) are one server, `toolyard`, called as
+`toolyard.<group>_<name>(...)`; see
+[guidelines/access-tools.md](guidelines/access-tools.md), which also explains
+what an agent may change about tool policies (into ask, or between allow and
+deny; never out of ask) and who may change them.
 
 ### The script worker
 

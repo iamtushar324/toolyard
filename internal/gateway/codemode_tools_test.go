@@ -84,25 +84,34 @@ func TestCodeModeListingIsScopedToCaller(t *testing.T) {
 	f := newAccessFixture(t, nil)
 	ctx := context.Background()
 
+	// Upstreams are their own servers; every internal tool hangs off the
+	// one virtual server toolyard, as <group>_<name>.
 	member := textOf(route(t, f.gw, f.member, CodeModeListToolFiles, map[string]any{}))
-	want := "servers/\n  alpha/\n    get_status.pyi\n    run.pyi\n  inbox/\n"
+	want := "servers/\n  alpha/\n    get_status.pyi\n    run.pyi\n  toolyard/\n"
 	if !strings.Contains(member, want) {
 		t.Fatalf("member listing:\n%s", member)
 	}
-	for _, leak := range []string{"beta", "memory/", "tools/", "tools.search", "listToolFiles.pyi", "execute.pyi", "fixture"} {
+	for _, want := range []string{"    inbox_request.pyi\n", "    session_start.pyi\n", "    tools_search.pyi\n", "    policies_explain.pyi\n", "    access_whoami.pyi\n"} {
+		if !strings.Contains(member, want) {
+			t.Errorf("member listing missing %q:\n%s", want, member)
+		}
+	}
+	// (The header comments name the code-mode tools; a bound one would be
+	// a lowercased tools_… file.)
+	for _, leak := range []string{"beta", "memory", "  tools/", "  inbox/", "tools.search", "listtoolfiles", "readtoolfile", "gettooldocs", "executetoolcode", "fixture"} {
 		if strings.Contains(member, leak) {
 			t.Errorf("member listing leaks %q:\n%s", leak, member)
 		}
 	}
 
 	admin := textOf(route(t, f.gw, f.admin, CodeModeListToolFiles, map[string]any{}))
-	for _, want := range []string{"  alpha/\n", "  beta/\n    get_status.pyi\n    run.pyi\n", "  memory/\n    delete.pyi\n    get.pyi\n", "  fixture/\n    echo.pyi\n"} {
+	for _, want := range []string{"  alpha/\n", "  beta/\n    get_status.pyi\n    run.pyi\n", "  fixture/\n    echo.pyi\n", "  toolyard/\n", "    memory_delete.pyi\n    memory_get.pyi\n"} {
 		if !strings.Contains(admin, want) {
 			t.Errorf("admin listing missing %q:\n%s", want, admin)
 		}
 	}
-	if strings.Contains(admin, "tools/") {
-		t.Errorf("the meta-tool group must never be bound:\n%s", admin)
+	if strings.Contains(admin, "  tools/") || strings.Contains(admin, "  memory/") {
+		t.Errorf("internal groups must only be bound under toolyard:\n%s", admin)
 	}
 
 	// A blocked caller is refused before any handler runs, like everywhere.
@@ -110,11 +119,20 @@ func TestCodeModeListingIsScopedToCaller(t *testing.T) {
 	if !blocked.IsError || textOf(blocked) != notFoundText(CodeModeListToolFiles) {
 		t.Fatalf("blocked listing: %v %s", blocked.IsError, textOf(blocked))
 	}
-	// A member with no grants sees only the always-on groups.
+	// A member with no grants sees only the always-on groups: toolyard is
+	// the one server, with the inbox, session, meta and access tools.
 	f.res.set("ag_nogrants", groups())
 	nogrants := textOf(route(t, f.gw, WithAgentID(context.Background(), "ag_nogrants"), CodeModeListToolFiles, map[string]any{}))
-	if !strings.HasSuffix(nogrants, "servers/\n  inbox/\n    ask.pyi\n    cancel.pyi\n    check.pyi\n    guide.pyi\n    post.pyi\n    request.pyi\n    status.pyi\n    wait.pyi\n  session/\n    start.pyi\n    update.pyi") {
-		t.Fatalf("no-grants listing:\n%s", nogrants)
+	if dirs := topLevelServers(nogrants); !reflect.DeepEqual(dirs, []string{"toolyard"}) {
+		t.Fatalf("no-grants servers = %v:\n%s", dirs, nogrants)
+	}
+	for _, want := range []string{"    inbox_ask.pyi\n", "    session_update.pyi\n", "    tools_poll_approval.pyi\n", "    policies_set.pyi\n", "    servers_list.pyi\n", "    audit_mine.pyi\n"} {
+		if !strings.Contains(nogrants, want) {
+			t.Errorf("no-grants listing missing %q:\n%s", want, nogrants)
+		}
+	}
+	if strings.Contains(nogrants, "memory_") || strings.Contains(nogrants, "alpha") {
+		t.Fatalf("no-grants listing leaks a granted-only group:\n%s", nogrants)
 	}
 
 	// A member asking about an ungranted server learns nothing about it.
@@ -129,13 +147,24 @@ func TestCodeModeListingIsScopedToCaller(t *testing.T) {
 
 	// And in code, beta is simply not a name.
 	res = route(t, f.gw, f.member, CodeModeExecuteToolCode, map[string]any{"code": "result = beta.get_status()"})
-	if !res.IsError || !strings.Contains(textOf(res), "undefined: beta") || !strings.Contains(textOf(res), "Available server keys: alpha, inbox, session") {
+	if !res.IsError || !strings.Contains(textOf(res), "undefined: beta") || !strings.Contains(textOf(res), "Available server keys: alpha, toolyard") {
 		t.Fatalf("member calling beta in code: %s", textOf(res))
 	}
 	if f.calls.Load() != 0 {
 		t.Fatal("a handler ran for an ungranted server")
 	}
 	_ = ctx
+}
+
+// topLevelServers reads the server directories out of a listToolFiles tree.
+func topLevelServers(listing string) []string {
+	var out []string
+	for _, line := range strings.Split(listing, "\n") {
+		if strings.HasPrefix(line, "  ") && !strings.HasPrefix(line, "    ") && strings.HasSuffix(line, "/") {
+			out = append(out, strings.TrimSuffix(strings.TrimSpace(line), "/"))
+		}
+	}
+	return out
 }
 
 func TestCodeModeStubsHideGatewayFields(t *testing.T) {
@@ -153,19 +182,20 @@ func TestCodeModeStubsHideGatewayFields(t *testing.T) {
 			t.Errorf("stub shows gateway field %q:\n%s", hidden, stub)
 		}
 	}
-	// A built-in with real parameters renders them, without the banner.
-	res = route(t, f.gw, f.admin, CodeModeReadToolFile, map[string]any{"fileName": "servers/memory/get.pyi", "startLine": 9.0, "endLine": 9.0})
-	if res.IsError || textOf(res) != "def get(key: str, scope: str = None) -> dict:  # Read a value from toolyard shared memory by key." {
-		t.Fatalf("memory.get stub line 9: %v %q", res.IsError, textOf(res))
+	// A built-in with real parameters renders them, without the banner,
+	// under the toolyard server as <group>_<name>.
+	res = route(t, f.gw, f.admin, CodeModeReadToolFile, map[string]any{"fileName": "servers/toolyard/memory_get.pyi", "startLine": 9.0, "endLine": 9.0})
+	if res.IsError || textOf(res) != "def memory_get(key: str, scope: str = None) -> dict:  # Read a value from toolyard shared memory by key." {
+		t.Fatalf("memory_get stub line 9: %v %q", res.IsError, textOf(res))
 	}
-	res = route(t, f.gw, f.admin, CodeModeGetToolDocs, map[string]any{"server": "memory", "tool": "get"})
-	if res.IsError || !strings.Contains(textOf(res), "# Documentation for memory.get tool") || !strings.Contains(textOf(res), "        key (str): key parameter (required)") {
-		t.Fatalf("memory.get docs: %s", textOf(res))
+	res = route(t, f.gw, f.admin, CodeModeGetToolDocs, map[string]any{"server": "toolyard", "tool": "memory_get"})
+	if res.IsError || !strings.Contains(textOf(res), "# Documentation for toolyard.memory_get tool") || !strings.Contains(textOf(res), "        key (str): key parameter (required)") {
+		t.Fatalf("memory_get docs: %s", textOf(res))
 	}
 	if res := route(t, f.gw, f.admin, CodeModeReadToolFile, map[string]any{}); !res.IsError || !strings.Contains(textOf(res), "fileName parameter is required") {
 		t.Fatalf("missing fileName: %s", textOf(res))
 	}
-	if res := route(t, f.gw, f.admin, CodeModeGetToolDocs, map[string]any{"server": "memory"}); !res.IsError || !strings.Contains(textOf(res), "tool parameter is required") {
+	if res := route(t, f.gw, f.admin, CodeModeGetToolDocs, map[string]any{"server": "toolyard"}); !res.IsError || !strings.Contains(textOf(res), "tool parameter is required") {
 		t.Fatalf("missing tool: %s", textOf(res))
 	}
 	if res := route(t, f.gw, f.admin, CodeModeExecuteToolCode, map[string]any{}); !res.IsError || !strings.Contains(textOf(res), "code parameter is required") {

@@ -544,20 +544,18 @@ func (g *Gateway) changePolicy(ctx context.Context, args map[string]any, clear b
 			"owner_user_id": raiser.OwnerUserID, "owner_email": raiser.OwnerEmail, "reason": reason,
 		}})
 	}
+	text := summary + "."
+	if len(changes) == 0 {
+		text += " Every affected tool keeps the access it had; the explicit policy is on record."
+	}
 	out := map[string]any{
-		"status": "applied", "scope": scope, "target": target, "access": decision,
+		"status": "applied", "scope": scope, "target": target, "access": decision, "message": text,
 		"changed": changes, "affected_tools": len(targets), "before": before,
 	}
 	if pol != nil {
 		out["policy"] = pol
 	}
-	text := summary + "."
-	if len(changes) == 0 {
-		text += " Every affected tool keeps the access it had; the explicit policy is on record."
-	}
-	res := mcp.NewToolResultText(text)
-	res.StructuredContent = out
-	return res, nil
+	return inboxJSON(out), nil
 }
 
 // auditPolicyChange records who asked for what and what it did to every
