@@ -325,7 +325,11 @@ Turn it on by listing bkt3's origins (Clerk sign-in must be on):
 - It is a server-to-server call: no cookie, Origin or `X-Requested-With`
   is needed (the Clerk token is the credential), but the body must be sent
   as `Content-Type: application/json`.
-- Each call checks the token (signature, expiry, issuer, `azp`) and the
+- Each call checks the token (signature, expiry, issuer, `azp`) and that
+  it is a fresh Clerk session token: it carries a `sid`, was issued
+  (`iat`) at most 2 minutes ago and not in the future (10 s clock-skew
+  leeway either way), and has no `aud` claim (JWT templates do). bkt3
+  should mint a token right before each call. Then it checks the
   organisation membership, creates or refreshes the person's toolyard user
   exactly as a Google sign-in does, issues their Beknown identity key if
   they have none (never rotating an existing one), and creates their one
@@ -336,6 +340,10 @@ Turn it on by listing bkt3's origins (Clerk sign-in must be on):
   `403 agent_disabled` (the person disabled their `T3 Code (bkt3)` agent;
   re-enable it on the Agents page), `429 rate_limited` (per client IP and
   per person), `503 clerk_unavailable` (retry later).
+- Follow-up, not built: a shared secret between bkt3's server and
+  toolyard (for example an `Authorization` header checked alongside the
+  Clerk token), so a session token lifted from a bkt3 browser within its
+  2-minute window can't be swapped for an agent token by anyone else.
 - Every attempt is one `connect.t3` audit row (outcome `created` or
   `rotated`, or `denied` with the code) naming the person, the `azp`
   origin and the agent. No token is ever logged or audited.

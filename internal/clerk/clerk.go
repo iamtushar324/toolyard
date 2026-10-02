@@ -54,6 +54,10 @@ const (
 	// tokenLeeway absorbs clock skew between us and Clerk. Session tokens
 	// live about 60 s, so keep it small.
 	tokenLeeway = 10 * time.Second
+	// connectMaxTokenAge bounds how long ago (by iat, plus tokenLeeway) a
+	// token VerifySessionTokenFor accepts was issued: the connect flow
+	// sends a freshly minted token, and anything older is a replay.
+	connectMaxTokenAge = 2 * time.Minute
 	// membershipPageSize is the page size for a user's own memberships (a
 	// person is in a handful of orgs at most).
 	membershipPageSize = 100
@@ -196,6 +200,11 @@ type Claims struct {
 type sessionClaims struct {
 	SessionID       string `json:"sid"`
 	AuthorizedParty string `json:"azp"`
+	// Aud is the raw aud claim, kept only so VerifySessionTokenFor can
+	// notice one is present (Clerk session tokens carry none; JWT
+	// templates usually do). It shadows RegisteredClaims.Audience, which
+	// nothing here checks: no parser option asks for an audience.
+	Aud json.RawMessage `json:"aud,omitempty"`
 	jwt.RegisteredClaims
 }
 
@@ -221,7 +230,8 @@ func partySet(origins []string) map[string]bool {
 // ErrInvalidToken; a JWKS fetch failure is ErrUnavailable. The azp must be
 // one of the dashboard origins the Client was built with.
 func (c *Client) VerifySessionToken(ctx context.Context, token string) (Claims, error) {
-	return c.verify(ctx, token, c.azp)
+	claims, _, err := c.verify(ctx, token, c.azp)
+	return claims, err
 }
 
 // VerifySessionTokenFor is VerifySessionToken against a caller-given set
@@ -231,19 +241,46 @@ func (c *Client) VerifySessionToken(ctx context.Context, token string) (Claims, 
 // accepted here, whatever the caller passes, so a token that would open a
 // dashboard session can't be replayed into this flow; and VerifySessionToken
 // keeps refusing these origins. Same JWKS cache and refetch limits.
+//
+// Because the answer here is a long-lived credential, the token must also
+// look like a fresh Clerk session token: a non-empty sid, an iat no more
+// than connectMaxTokenAge ago and not in the future (both give or take
+// tokenLeeway), and no aud claim at all.
 func (c *Client) VerifySessionTokenFor(ctx context.Context, token string, authorizedParties []string) (Claims, error) {
 	allowed := partySet(authorizedParties)
 	for o := range c.azp {
 		delete(allowed, o)
 	}
-	return c.verify(ctx, token, allowed)
+	claims, sc, err := c.verify(ctx, token, allowed)
+	if err != nil {
+		return Claims{}, err
+	}
+	if strings.TrimSpace(sc.SessionID) == "" {
+		return Claims{}, fmt.Errorf("%w: missing sid", ErrInvalidToken)
+	}
+	if len(sc.Aud) > 0 {
+		return Claims{}, fmt.Errorf("%w: aud present (not a session token)", ErrInvalidToken)
+	}
+	if sc.IssuedAt == nil {
+		return Claims{}, fmt.Errorf("%w: missing iat", ErrInvalidToken)
+	}
+	now, iat := c.now(), sc.IssuedAt.Time
+	if iat.After(now.Add(tokenLeeway)) {
+		return Claims{}, fmt.Errorf("%w: iat in the future", ErrInvalidToken)
+	}
+	if now.Sub(iat) > connectMaxTokenAge+tokenLeeway {
+		return Claims{}, fmt.Errorf("%w: issued %s ago, more than %s", ErrInvalidToken, now.Sub(iat).Round(time.Second), connectMaxTokenAge)
+	}
+	return claims, nil
 }
 
 // verify is the shared check; allowed is the azp set the token must match.
-func (c *Client) verify(ctx context.Context, token string, allowed map[string]bool) (Claims, error) {
+// It also returns the parsed claims for VerifySessionTokenFor's extra
+// rules.
+func (c *Client) verify(ctx context.Context, token string, allowed map[string]bool) (Claims, *sessionClaims, error) {
 	token = strings.TrimSpace(token)
 	if token == "" || len(token) > 16<<10 {
-		return Claims{}, ErrInvalidToken
+		return Claims{}, nil, ErrInvalidToken
 	}
 	parser := jwt.NewParser(
 		jwt.WithValidMethods([]string{jwt.SigningMethodRS256.Alg()}),
@@ -265,27 +302,27 @@ func (c *Client) verify(ctx context.Context, token string, allowed map[string]bo
 		return key, kerr
 	})
 	if unavailable != nil {
-		return Claims{}, unavailable
+		return Claims{}, nil, unavailable
 	}
 	if err != nil || !parsed.Valid {
-		return Claims{}, fmt.Errorf("%w: %v", ErrInvalidToken, err)
+		return Claims{}, nil, fmt.Errorf("%w: %v", ErrInvalidToken, err)
 	}
 	sc, ok := parsed.Claims.(*sessionClaims)
 	if !ok {
-		return Claims{}, ErrInvalidToken
+		return Claims{}, nil, ErrInvalidToken
 	}
 	sub := strings.TrimSpace(sc.Subject)
 	if sub == "" {
-		return Claims{}, fmt.Errorf("%w: missing sub", ErrInvalidToken)
+		return Claims{}, nil, fmt.Errorf("%w: missing sub", ErrInvalidToken)
 	}
 	// Clerk sets azp to the Origin that requested the token. bkt3 skips
 	// this check; we don't — a token minted for another Clerk-backed app
 	// on the same instance must not open a toolyard session.
 	azp := NormalizeOrigin(sc.AuthorizedParty)
 	if azp == "" || !allowed[azp] {
-		return Claims{}, fmt.Errorf("%w: azp %q not authorized", ErrInvalidToken, sc.AuthorizedParty)
+		return Claims{}, nil, fmt.Errorf("%w: azp %q not authorized", ErrInvalidToken, sc.AuthorizedParty)
 	}
-	return Claims{Subject: sub, SessionID: sc.SessionID, AuthorizedParty: azp}, nil
+	return Claims{Subject: sub, SessionID: sc.SessionID, AuthorizedParty: azp}, sc, nil
 }
 
 // keyFor returns the RSA public key for kid, fetching the JWKS on first use

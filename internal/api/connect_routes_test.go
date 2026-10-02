@@ -402,6 +402,10 @@ func TestConnectT3Refusals(t *testing.T) {
 		{"bad signature", connectBody(e.fc.tokenWith(other, nil)), http.StatusUnauthorized, "invalid_token"},
 		{"wrong issuer", connectBody(e.fc.token(jwt.MapClaims{"iss": "https://clerk.other.test"})), http.StatusUnauthorized, "invalid_token"},
 		{"no sub", connectBody(e.fc.token(jwt.MapClaims{"sub": nil})), http.StatusUnauthorized, "invalid_token"},
+		// Still within exp, but minted long ago: a replay, not a fresh token.
+		{"old iat", connectBody(e.fc.token(jwt.MapClaims{"iat": past.Unix(), "nbf": past.Unix(), "exp": time.Now().Add(time.Hour).Unix()})), http.StatusUnauthorized, "invalid_token"},
+		{"no sid", connectBody(e.fc.token(jwt.MapClaims{"sid": nil})), http.StatusUnauthorized, "invalid_token"},
+		{"aud (JWT template)", connectBody(e.fc.token(jwt.MapClaims{"aud": "bkt3"})), http.StatusUnauthorized, "invalid_token"},
 		{"garbage token", connectBody("not-a-jwt"), http.StatusUnauthorized, "invalid_token"},
 		{"empty token", `{"token":"  "}`, http.StatusBadRequest, "bad_request"},
 		{"no token", `{}`, http.StatusBadRequest, "bad_request"},
@@ -412,8 +416,8 @@ func TestConnectT3Refusals(t *testing.T) {
 	for _, c := range cases {
 		expectConnectError(t, c.name, e.post(t, c.body), c.status, c.code)
 	}
-	if n := e.auditRows(t, connectT3EventType, "invalid_token"); n != 8 {
-		t.Errorf("invalid_token audit rows = %d, want 8", n)
+	if n := e.auditRows(t, connectT3EventType, "invalid_token"); n != 11 {
+		t.Errorf("invalid_token audit rows = %d, want 11", n)
 	}
 	if n := e.auditRows(t, connectT3EventType, "bad_request"); n != 5 {
 		t.Errorf("bad_request audit rows = %d, want 5", n)
