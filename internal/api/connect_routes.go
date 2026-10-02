@@ -24,9 +24,10 @@ import (
 //	POST /v1/connect/t3 {"token":"<clerk session JWT>"}
 //	200 {"token":"<agent token>","email":"…","agent_id":"ag_…","user_id":"u_…"}
 //
-// verify (RS256, exp/nbf, iss, azp in -connect-azp) -> org membership ->
-// local user upsert (as the dashboard sign-in does) -> identity key issued
-// if missing -> create or rotate the person's one "T3 Code (bkt3)" agent.
+// verify (RS256, exp/nbf, iss, azp in -connect-azp, a fresh session
+// token) -> org membership -> local user upsert (as the dashboard sign-in
+// does) -> identity key issued if the person never had one -> create or
+// rotate the person's one "T3 Code (bkt3)" agent.
 // Errors are {"error":"<code>"}: 400 bad_request, 401 invalid_token,
 // 403 not_org_member, 403 user_disabled, 403 agent_disabled (the person
 // disabled that agent), 429 rate_limited, 503 clerk_unavailable, 404
@@ -215,11 +216,16 @@ func (s *Server) connectT3(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-// connectIdentityKey makes sure the person has a Beknown identity key: it
-// is issued here (as connect:t3) when missing and never rotated. A
-// registry failure inside Issue is recorded there and is not an error; a
-// person without a Clerk email can't be registered, so their key is left
-// for an admin. It reports what it did for the audit row.
+// connectIdentityKey gives a person who never had a Beknown identity key
+// their first one, issued as connect:t3. It never rotates a key and never
+// replaces one: a person whose key was revoked (any registration or
+// pending-removal row left, see identitykeys.HadKey) is "missing" until an
+// admin issues them a new one, and for them connect makes no registry call
+// at all, so it neither undoes the revoke nor retries their pending
+// removals as connect:t3. A registry failure inside Issue is recorded
+// there and is not an error; a person without a Clerk email can't be
+// registered, so their key is left for an admin. It reports what it did
+// for the audit row; connect succeeds either way.
 func (s *Server) connectIdentityKey(ctx context.Context, userID string) (string, error) {
 	if s.identityKeys == nil {
 		return "off", nil
@@ -230,6 +236,13 @@ func (s *Server) connectIdentityKey(ctx context.Context, userID string) (string,
 	}
 	if has {
 		return "present", nil
+	}
+	had, err := s.identityKeys.HadKey(ctx, userID)
+	if err != nil {
+		return "", err
+	}
+	if had {
+		return "missing", nil
 	}
 	_, err = s.identityKeys.Issue(ctx, connectT3Actor, userID)
 	switch {

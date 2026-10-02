@@ -332,7 +332,9 @@ Turn it on by listing bkt3's origins (Clerk sign-in must be on):
   should mint a token right before each call. Then it checks the
   organisation membership, creates or refreshes the person's toolyard user
   exactly as a Google sign-in does, issues their Beknown identity key if
-  they have none (never rotating an existing one), and creates their one
+  they never had one (never rotating or replacing one: a person whose key
+  an admin revoked stays without a key, `identity_key=missing` in the
+  audit row, until an admin issues a new one), and creates their one
   `T3 Code (bkt3)` agent or rotates its token. The previous token stops
   working on `/mcp` at once, so bkt3 must keep only the latest.
 - Errors are `{"error":"<code>"}`: `400 bad_request`, `401 invalid_token`,

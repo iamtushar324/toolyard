@@ -1088,3 +1088,46 @@ func TestNoRegistriesStillIssues(t *testing.T) {
 		t.Errorf("lister error not surfaced: %v", err)
 	}
 }
+
+// HadKey is true from the first issue on: while the key lives, after a
+// revoke (the registration rows stay, as revoked) and while a removal is
+// pending; never for someone who never had one.
+func TestHadKey(t *testing.T) {
+	e := newEnv(t)
+	ctx := context.Background()
+	had := func(uid string) bool {
+		t.Helper()
+		ok, err := e.svc.HadKey(ctx, uid)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return ok
+	}
+	if had(e.member.ID) || had(e.admin.ID) {
+		t.Fatal("HadKey before any issue")
+	}
+	if _, err := e.svc.Issue(ctx, e.admin.ID, e.member.ID); err != nil {
+		t.Fatal(err)
+	}
+	if !had(e.member.ID) || had(e.admin.ID) {
+		t.Error("HadKey after issue: want the member only")
+	}
+	// Revoke with a failing delete: key gone, removal pending.
+	e.caller.setFail("BkCoreServicesProd."+ToolDelete, "read-only")
+	if _, err := e.svc.Revoke(ctx, e.admin.ID, e.member.ID); err != nil {
+		t.Fatal(err)
+	}
+	if has, _ := e.svc.HasKey(ctx, e.member.ID); has || !had(e.member.ID) {
+		t.Errorf("after revoke: HasKey=%v HadKey=%v, want false/true", has, had(e.member.ID))
+	}
+	// Removal done: only the revoked registration rows remain, still history.
+	e.caller.setFail("BkCoreServicesProd."+ToolDelete, "")
+	if _, err := e.svc.Register(ctx, e.admin.ID, e.member.ID); err != nil {
+		t.Fatal(err)
+	}
+	var retired int
+	_ = e.db.QueryRow(`SELECT count(*) FROM identity_key_retired WHERE user_id = ?`, e.member.ID).Scan(&retired)
+	if retired != 0 || !had(e.member.ID) {
+		t.Errorf("after removals: retired=%d HadKey=%v, want 0/true", retired, had(e.member.ID))
+	}
+}

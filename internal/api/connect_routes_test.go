@@ -744,3 +744,72 @@ func TestConnectT3ConcurrentSamePerson(t *testing.T) {
 		t.Errorf("identity keys issued = %d, want 1", n)
 	}
 }
+
+// An admin's revoke sticks: connect doesn't issue a new key to someone
+// who had one, and makes no registry call for them (no upsert, and no
+// retry of their pending removals as connect:t3). It still connects.
+func TestConnectT3DoesNotUndoRevoke(t *testing.T) {
+	e := newConnectEnv(t)
+	ctx := context.Background()
+	first := e.connect(t, e.fc.token(nil))
+	if has, _ := e.srv.identityKeys.HasKey(ctx, first.UserID); !has {
+		t.Fatal("precondition: first connect issued no key")
+	}
+
+	// The admin revokes; prime refuses the delete, so a removal stays
+	// pending (and a registration row stays as revoked).
+	e.reg.mu.Lock()
+	e.reg.fail["BkCoreServices."+identitykeys.ToolDelete] = true
+	e.reg.mu.Unlock()
+	if _, err := e.srv.identityKeys.Revoke(ctx, e.admin.ID, first.UserID); err != nil {
+		t.Fatal(err)
+	}
+	st, _ := e.srv.identityKeys.Status(ctx, first.UserID)
+	if st.HasKey || len(st.PendingRemovals) != 1 {
+		t.Fatalf("precondition after revoke: %+v", st)
+	}
+	_, _ = e.reg.take()
+	e.reg.mu.Lock()
+	e.reg.fail = map[string]bool{}
+	e.reg.mu.Unlock()
+
+	again := e.connect(t, e.fc.token(jwt.MapClaims{"sid": "sess_after_revoke"}))
+	if again.AgentID != first.AgentID || again.Token == "" {
+		t.Errorf("connect after revoke = %+v", again)
+	}
+	if ag, err := e.id.VerifyAgentToken(ctx, again.Token); err != nil || ag.ID != first.AgentID {
+		t.Errorf("token after revoke: %+v, %v", ag, err)
+	}
+	st, _ = e.srv.identityKeys.Status(ctx, first.UserID)
+	if st.HasKey {
+		t.Error("connect re-issued a revoked key")
+	}
+	if len(st.PendingRemovals) != 1 {
+		t.Errorf("pending removals touched: %+v", st.PendingRemovals)
+	}
+	if targets, callers := e.reg.take(); len(targets) != 0 {
+		t.Errorf("registry calls after revoke: %v as %v", targets, callers)
+	}
+	if n := e.auditRows(t, identitykeys.EventIssue, ""); n != 1 {
+		t.Errorf("identity_key.issue rows = %d, want 1 (the first connect)", n)
+	}
+	var summary string
+	if err := e.db.QueryRow(`SELECT result_summary FROM audit_events WHERE event_type = ? AND reason = 'rotated'`,
+		connectT3EventType).Scan(&summary); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(summary, "identity_key=missing") {
+		t.Errorf("rotated row summary = %q, want identity_key=missing", summary)
+	}
+
+	// Someone who never had a key still gets one on their first connect.
+	e.fc.set(func(f *connectClerkServer) { f.orgs["user_grace"] = []string{connectOrg} })
+	grace := e.connect(t, e.fc.token(jwt.MapClaims{"sub": "user_grace"}))
+	if has, _ := e.srv.identityKeys.HasKey(ctx, grace.UserID); !has {
+		t.Error("never-had-a-key person got no key")
+	}
+	if targets, callers := e.reg.take(); len(targets) != 1 || targets[0] != "BkCoreServices."+identitykeys.ToolUpsert ||
+		callers[0] != "dashboard:"+connectT3Actor {
+		t.Errorf("registry calls for the new person = %v as %v", targets, callers)
+	}
+}
