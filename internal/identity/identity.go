@@ -935,10 +935,13 @@ func nullStr(s string) any {
 	return s
 }
 
+// ListAgents returns the owner's agents, newest first. created_at is in
+// milliseconds, so rowid (insertion order) breaks ties: "newest" must be
+// well defined for callers that pick the first match.
 func (s *Service) ListAgents(ctx context.Context, ownerUserID string) ([]Agent, error) {
 	rows, err := s.db.QueryContext(ctx,
 		`SELECT id, name, owner_user, COALESCE(last_seen, 0), COALESCE(disabled, 0), kind
-         FROM agents WHERE owner_user = ? ORDER BY created_at DESC`, ownerUserID)
+         FROM agents WHERE owner_user = ? ORDER BY created_at DESC, rowid DESC`, ownerUserID)
 	if err != nil {
 		return nil, err
 	}

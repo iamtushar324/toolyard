@@ -309,3 +309,30 @@ func TestRotateClearsPendingEnrollment(t *testing.T) {
 		}
 	}
 }
+
+// Agents created in the same millisecond still list newest first.
+func TestListAgentsNewestFirstOnTies(t *testing.T) {
+	s, owner := newTestIdentity(t)
+	ctx := context.Background()
+	var ids []string
+	for i := 0; i < 5; i++ {
+		_, ag, err := s.CreateAgentWithToken(ctx, owner, "bot")
+		if err != nil {
+			t.Fatal(err)
+		}
+		ids = append(ids, ag.ID)
+	}
+	// Force a tie on created_at.
+	if _, err := s.db.Exec(`UPDATE agents SET created_at = 1 WHERE owner_user = ?`, owner); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.ListAgents(ctx, owner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, a := range got {
+		if want := ids[len(ids)-1-i]; a.ID != want {
+			t.Fatalf("ListAgents[%d] = %s, want %s (newest first)", i, a.ID, want)
+		}
+	}
+}
