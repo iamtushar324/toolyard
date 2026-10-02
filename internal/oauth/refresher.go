@@ -94,6 +94,7 @@ func (s *Service) RunRefresher(ctx context.Context) {
 		case <-t.C:
 			s.refreshTick(ctx)
 			_, _ = s.PurgeExpiredPending(ctx)
+			_, _ = s.PurgeExpiredConnectTickets(ctx)
 		}
 	}
 }
@@ -151,12 +152,7 @@ func (s *Service) refreshTick(ctx context.Context) {
 		if c.pat {
 			continue
 		}
-		if c.exp.IsZero() {
-			// IdP didn't tell us TTL — treat as 1h and refresh aggressively.
-			if now.Sub(c.lastRefresh) < 30*time.Minute {
-				continue
-			}
-		} else if !shouldRefresh(now, c.lastRefresh, c.exp) {
+		if !refreshDue(now, c.lastRefresh, c.exp) {
 			continue
 		}
 		if !backoffSatisfied(now, c.lastRefresh, s.lastAttemptAt(c.upstream), c.failures) {
@@ -165,6 +161,78 @@ func (s *Service) refreshTick(ctx context.Context) {
 		s.recordAttempt(c.upstream, now)
 		if _, err := s.Refresh(ctx, c.upstream); err != nil {
 			s.handleRefreshFailure(ctx, c.upstream, c.failures+1, err)
+		}
+	}
+	s.refreshUserTokens(ctx, now)
+}
+
+// refreshDue applies the shared schedule to one token: an IdP that gave
+// no TTL is treated as an hour and refreshed every 30 minutes; otherwise
+// shouldRefresh decides on the lead fraction and minimum lead.
+func refreshDue(now, lastRefresh, exp time.Time) bool {
+	if exp.IsZero() {
+		return now.Sub(lastRefresh) >= 30*time.Minute
+	}
+	return shouldRefresh(now, lastRefresh, exp)
+}
+
+// refreshUserTokens is the per-user pass of a tick: the same schedule and
+// backoff as the shared pass, keyed by (upstream, user) so one person's
+// failing refresh never delays another's. Only rows on upstreams that are
+// currently per_user are walked: a row left behind by a server switched
+// back to shared is not in use, so it is not kept alive either.
+func (s *Service) refreshUserTokens(ctx context.Context, now time.Time) {
+	rows, err := s.db.QueryContext(ctx, `
+        SELECT t.upstream_name, t.user_id, COALESCE(t.access_expires_at,0), COALESCE(t.last_refresh_at,0),
+               t.refresh_failures
+        FROM oauth_user_tokens t JOIN upstream_servers u ON u.name = t.upstream_name
+        WHERE t.state IN (?, ?) AND t.refresh_token_enc IS NOT NULL AND u.auth_mode = 'per_user'
+    `, StateActive, StateRefreshing)
+	if err != nil {
+		log.Printf("oauth refresher: user query: %v", err)
+		return
+	}
+	type cand struct {
+		upstream, user   string
+		exp, lastRefresh time.Time
+		failures         int
+	}
+	var cs []cand
+	for rows.Next() {
+		var c cand
+		var exp, lr int64
+		if err := rows.Scan(&c.upstream, &c.user, &exp, &lr, &c.failures); err != nil {
+			rows.Close()
+			log.Printf("oauth refresher: user scan: %v", err)
+			return
+		}
+		if exp > 0 {
+			c.exp = time.UnixMilli(exp)
+		}
+		if lr > 0 {
+			c.lastRefresh = time.UnixMilli(lr)
+		}
+		cs = append(cs, c)
+	}
+	if err := rows.Err(); err != nil {
+		log.Printf("oauth refresher: user rows: %v", err)
+		return
+	}
+	rows.Close()
+
+	for _, c := range cs {
+		if !refreshDue(now, c.lastRefresh, c.exp) {
+			continue
+		}
+		key := userKey(c.upstream, c.user)
+		if !backoffSatisfied(now, c.lastRefresh, s.lastAttemptAt(key), c.failures) {
+			continue
+		}
+		s.recordAttempt(key, now)
+		// A superseded write means the row changed while the provider was
+		// answering (a reconnect or disconnect): nothing failed.
+		if _, err := s.RefreshUser(ctx, c.upstream, c.user); err != nil && !errors.Is(err, ErrSuperseded) {
+			s.handleUserRefreshFailure(ctx, c.upstream, c.user, c.failures+1, err)
 		}
 	}
 }
@@ -209,5 +277,23 @@ func (s *Service) handleRefreshFailure(ctx context.Context, upstream string, new
         WHERE upstream_name = ?`, newFailures, err.Error(), upstream)
 	if dberr != nil && !errors.Is(dberr, sql.ErrNoRows) {
 		log.Printf("oauth refresher: persist failure for %s: %v", upstream, dberr)
+	}
+}
+
+// handleUserRefreshFailure is handleRefreshFailure for one person's row.
+func (s *Service) handleUserRefreshFailure(ctx context.Context, upstream, userID string, newFailures int, err error) {
+	if errors.Is(err, ErrNeedsReauth) {
+		return // RefreshUser already marked the row
+	}
+	if newFailures >= MaxRefreshFailures {
+		s.markUserNeedsReauth(ctx, upstream, userID, err.Error())
+		return
+	}
+	_, dberr := s.db.ExecContext(ctx, `
+        UPDATE oauth_user_tokens
+        SET refresh_failures = ?, last_error = ?
+        WHERE upstream_name = ? AND user_id = ?`, newFailures, err.Error(), upstream, userID)
+	if dberr != nil && !errors.Is(dberr, sql.ErrNoRows) {
+		log.Printf("oauth refresher: persist failure for %s user %s: %v", upstream, userID, dberr)
 	}
 }

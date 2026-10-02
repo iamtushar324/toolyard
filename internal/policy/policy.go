@@ -81,6 +81,10 @@ type Engine struct {
 	mu     sync.RWMutex
 	byTool map[string]ToolPolicy
 	byUp   map[string]ToolPolicy
+	// writeMu serialises Set, Delete, DeleteTarget and Change, from the
+	// dashboard and from agents alike, so a guarded Change sees no other
+	// write land between its check and its own write.
+	writeMu sync.Mutex
 }
 
 // New constructs the engine and primes its policy cache from the db. Pass a
@@ -209,6 +213,39 @@ func (e *Engine) List() []ToolPolicy {
 	return out
 }
 
+// WithChange returns a detached copy of the engine's rule set with one
+// change applied: action allow|ask|deny upserts the (scope,target) rule,
+// "" removes it. The copy has no database, so it can only Eval; nothing
+// is persisted. It is how the agent-facing policies.set works out what a
+// change would do to every tool's effective access before making it.
+func (e *Engine) WithChange(scope, target, action string) *Engine {
+	e.mu.RLock()
+	byTool := make(map[string]ToolPolicy, len(e.byTool)+1)
+	for k, v := range e.byTool {
+		byTool[k] = v
+	}
+	byUp := make(map[string]ToolPolicy, len(e.byUp)+1)
+	for k, v := range e.byUp {
+		byUp[k] = v
+	}
+	e.mu.RUnlock()
+	m := byTool
+	if scope == ScopeUpstream {
+		m = byUp
+	}
+	if action == "" {
+		delete(m, target)
+	} else {
+		p, ok := m[target]
+		if !ok {
+			p = ToolPolicy{ID: "tp_simulated", Scope: scope, Target: target}
+		}
+		p.Action = action
+		m[target] = p
+	}
+	return &Engine{byTool: byTool, byUp: byUp}
+}
+
 // Get returns the stored policy for a (scope,target), if any.
 func (e *Engine) Get(scope, target string) (ToolPolicy, bool) {
 	e.mu.RLock()
@@ -227,6 +264,49 @@ func (e *Engine) Set(ctx context.Context, scope, target, action, note string, fo
 	if e.db == nil {
 		return nil, ErrNoDB
 	}
+	e.writeMu.Lock()
+	defer e.writeMu.Unlock()
+	return e.setLocked(ctx, scope, target, action, note, force)
+}
+
+// Change applies one change, action allow|ask|deny upserting the
+// (scope,target) rule and "" removing it, after guard has approved it:
+// guard sees the engine as it is (before) and a detached copy with the
+// change applied (after), and a non-nil error aborts without writing and
+// is returned as is. Check and write happen under the write lock, so no
+// Set or Delete from anywhere lands in between. guard must not call Set,
+// Delete or Change itself. existed reports, for a removal, whether there
+// was a rule to remove; p is the stored rule after an upsert.
+func (e *Engine) Change(ctx context.Context, scope, target, action, note string, force bool,
+	guard func(before, after *Engine) error) (p *ToolPolicy, existed bool, err error) {
+	if e.db == nil {
+		return nil, false, ErrNoDB
+	}
+	if scope != ScopeTool && scope != ScopeUpstream {
+		return nil, false, errString("scope must be tool or upstream")
+	}
+	if action != "" && action != "allow" && action != "ask" && action != "deny" {
+		return nil, false, errString("action must be allow, ask, or deny")
+	}
+	e.writeMu.Lock()
+	defer e.writeMu.Unlock()
+	if guard != nil {
+		if err := guard(e, e.WithChange(scope, target, action)); err != nil {
+			return nil, false, err
+		}
+	}
+	if action == "" {
+		if _, ok := e.Get(scope, target); !ok {
+			return nil, false, nil
+		}
+		return nil, true, e.deleteTargetLocked(ctx, scope, target)
+	}
+	p, err = e.setLocked(ctx, scope, target, action, note, force)
+	return p, true, err
+}
+
+// setLocked is Set with writeMu held.
+func (e *Engine) setLocked(ctx context.Context, scope, target, action, note string, force bool) (*ToolPolicy, error) {
 	if scope != ScopeTool && scope != ScopeUpstream {
 		return nil, errString("scope must be tool or upstream")
 	}
@@ -259,6 +339,8 @@ func (e *Engine) Delete(ctx context.Context, id string) error {
 	if e.db == nil {
 		return ErrNoDB
 	}
+	e.writeMu.Lock()
+	defer e.writeMu.Unlock()
 	if _, err := e.db.ExecContext(ctx, `DELETE FROM tool_policies WHERE id = ?`, id); err != nil {
 		return err
 	}
@@ -271,6 +353,13 @@ func (e *Engine) DeleteTarget(ctx context.Context, scope, target string) error {
 	if e.db == nil {
 		return ErrNoDB
 	}
+	e.writeMu.Lock()
+	defer e.writeMu.Unlock()
+	return e.deleteTargetLocked(ctx, scope, target)
+}
+
+// deleteTargetLocked is DeleteTarget with writeMu held.
+func (e *Engine) deleteTargetLocked(ctx context.Context, scope, target string) error {
 	if _, err := e.db.ExecContext(ctx, `DELETE FROM tool_policies WHERE scope = ? AND target = ?`, scope, target); err != nil {
 		return err
 	}

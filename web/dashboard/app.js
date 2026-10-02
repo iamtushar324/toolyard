@@ -11,6 +11,10 @@ const state = {
   authConfig: null,
   showPasswordLogin: false, // login card: password form revealed under "Sign in with Google"
   myServers: [],           // /v1/me/servers: the groups the signed-in user may use
+  // My connections: /v1/me/connections rows for the signed-in person, plus
+  // the server whose sign-in they just started (polled until it lands).
+  connections: { rows: [], loaded: false, loading: false, error: '', busy: '', pending: null, pendingSince: 0 },
+  serverConnectionsModal: null, // { name, loading, data, error } while an admin looks at who signed in to a server
   // Users page (admin): /v1/users rows + the grantable groups.
   users: { rows: [], groups: [], loaded: false, loading: false, error: '', keyBusy: '', keyOpen: {} },
   userAccessModal: null,   // { id, name, selected: {group: bool}, dropped: [], error, saving } while editing access
@@ -206,7 +210,7 @@ function isAdmin() {
   return !!state.user && state.user.role !== 'member';
 }
 
-const MEMBER_ROUTES = ['agents', 'myservers'];
+const MEMBER_ROUTES = ['agents', 'myservers', 'connections'];
 
 function defaultRoute() {
   return isAdmin() ? 'approvals' : 'agents';
@@ -379,6 +383,8 @@ function startStream() {
   evtSrc.addEventListener('mcp_oauth_done', (e) => { markStreamEvent(); handleOAuthDone(JSON.parse(e.data)); });
   evtSrc.addEventListener('mcp_oauth_refreshed', () => { markStreamEvent(); reloadServers(); render(); });
   evtSrc.addEventListener('mcp_oauth_needs_reauth', (e) => { markStreamEvent(); handleOAuthReauth(JSON.parse(e.data)); });
+  evtSrc.addEventListener('mcp_oauth_user_done', (e) => { markStreamEvent(); handleUserOAuthEvent(JSON.parse(e.data), 'done'); });
+  evtSrc.addEventListener('mcp_oauth_user_needs_reauth', (e) => { markStreamEvent(); handleUserOAuthEvent(JSON.parse(e.data), 'reauth'); });
 
   // Watchdog: the server sends a `ping` every 15s. If we see nothing for
   // 45s the socket is wedged even though onerror never fired — common on
@@ -459,6 +465,21 @@ function handleOAuthReauth(payload) {
   state.oauthStatus = state.oauthStatus || {};
   state.oauthStatus[name] = { ...(state.oauthStatus[name] || {}), state: 'needs_reauth', last_error: payload.error || '' };
   render();
+}
+
+// handleUserOAuthEvent: somebody connected ('done') or lost ('reauth')
+// their own sign-in to a per_user server. Only admins have the stream; the
+// event names the person, so this tab speaks up only when it is theirs,
+// and the Servers page refreshes its counts either way.
+function handleUserOAuthEvent(payload, kind) {
+  const name = payload && payload.upstream;
+  if (!name) return;
+  if (state.user && payload.user_id === state.user.id) {
+    if (kind === 'done') toast(name + ': connected.');
+    else toast(name + ' needs you to sign in again (My connections)', 'error');
+    loadConnections();
+  }
+  if (state.route === 'servers') reloadServers().then(render);
 }
 
 async function loadOAuthStatus(name) {
@@ -2122,6 +2143,159 @@ function viewMyServers() {
   );
 }
 
+// ---- My connections (every user) --------------------------------------------
+//
+// A server whose "Who signs in" is "Each person" acts as each person's own
+// account. This page is where a person connects theirs: Connect opens the
+// provider's authorize page in a new tab (as the admin OAuth modal does),
+// the callback stores the token on their row, and the list is re-read
+// until it shows up. Members have no event stream, so a short poll plus a
+// refresh on focus does the job; admins get the SSE event as well.
+
+let connectionsSeq = 0;
+async function loadConnections(clearError) {
+  const seq = ++connectionsSeq;
+  const c = state.connections;
+  c.loading = true;
+  if (clearError) c.error = '';
+  render();
+  try {
+    const rows = await api('/v1/me/connections');
+    if (seq !== connectionsSeq) return; // a newer load owns the page
+    c.rows = rows || [];
+    c.error = '';
+    if (c.pending) {
+      const p = c.rows.find((r) => r.server === c.pending);
+      if (p && p.state === 'connected' && (p.connected_at || 0) >= c.pendingSince) {
+        toast(c.pending + ': connected.');
+        c.pending = null;
+      }
+    }
+  } catch (e) {
+    if (seq !== connectionsSeq) return;
+    c.error = e.message;
+  }
+  c.loading = false;
+  c.loaded = true;
+  render();
+}
+
+// pollConnections re-reads the list every few seconds while a sign-in is
+// in flight, for as long as the pending flow lives (ten minutes).
+let connectionsPoll = null;
+function pollConnections() {
+  if (connectionsPoll) clearInterval(connectionsPoll);
+  const started = Date.now();
+  connectionsPoll = setInterval(() => {
+    const c = state.connections;
+    if (!c.pending || !state.user || Date.now() - started > 10 * 60 * 1000) {
+      clearInterval(connectionsPoll); connectionsPoll = null;
+      if (c.pending) { c.pending = null; render(); }
+      return;
+    }
+    loadConnections();
+  }, 3000);
+}
+window.addEventListener('focus', () => {
+  if (state.user && state.route === 'connections') loadConnections();
+});
+
+async function connectServer(name) {
+  const c = state.connections;
+  c.busy = name; c.error = ''; render();
+  try {
+    const out = await api('/v1/me/connections/' + encodeURIComponent(name) + '/begin', { method: 'POST', body: {} });
+    c.pending = name;
+    c.pendingSince = Date.now() - 60 * 1000; // allow for clock skew between browser and server
+    window.open(out.authorize_url, '_blank', 'noopener');
+    pollConnections();
+  } catch (e) { c.error = e.message; }
+  c.busy = ''; render();
+}
+
+async function disconnectServer(name) {
+  if (!confirm(`Disconnect your ${name} account? Your agents stop reaching ${name} until you connect again.`)) return;
+  const c = state.connections;
+  c.busy = name; c.error = ''; render();
+  try {
+    await api('/v1/me/connections/' + encodeURIComponent(name), { method: 'DELETE' });
+    toast(name + ' disconnected.');
+  } catch (e) { c.error = e.message; }
+  c.busy = '';
+  await loadConnections();
+}
+
+function connectionStateBadge(st, lastError) {
+  switch (st) {
+    case 'connected':    return el('span', { class: 'badge allowed' }, 'connected');
+    case 'needs_reauth': return el('span', { class: 'badge denied', title: lastError || '' }, 'needs sign-in again');
+    case 'expired':      return el('span', { class: 'badge expired' }, 'expired');
+    default:             return el('span', { class: 'badge pending' }, 'not connected');
+  }
+}
+
+function renderConnectionCard(r) {
+  const c = state.connections;
+  const busy = c.busy === r.server;
+  const waiting = c.pending === r.server;
+  const connected = r.state === 'connected';
+  const facts = [connectionStateBadge(r.state, r.last_error)];
+  if (r.account_label) facts.push(el('span', { class: 'meta' }, 'as ', el('code', {}, r.account_label)));
+  if (connected && r.last_refresh_at) {
+    facts.push(el('span', { class: 'meta', title: new Date(r.last_refresh_at).toLocaleString() }, 'refreshed ' + relTime(r.last_refresh_at)));
+  } else if (connected && r.connected_at) {
+    facts.push(el('span', { class: 'meta', title: new Date(r.connected_at).toLocaleString() }, 'connected ' + relTime(r.connected_at)));
+  }
+  if (!r.enabled) facts.push(el('span', { class: 'badge' }, 'server disabled'));
+  else if (r.server_status === 'waiting_signin') facts.push(el('span', { class: 'meta' }, 'nobody has connected this server yet'));
+
+  let actions;
+  if (!r.ready) {
+    actions = el('p', { class: 'meta' }, 'An admin still has to finish this server\'s OAuth setup before anyone can connect.');
+  } else if (waiting) {
+    actions = el('div', { class: 'row key-actions' },
+      el('span', { class: 'meta grow' }, 'Finish signing in in the tab that just opened; this page updates on its own.'),
+      el('button', { on: { click: () => { c.pending = null; render(); } } }, 'Cancel'),
+    );
+  } else {
+    actions = el('div', { class: 'row key-actions' },
+      el('button', {
+        class: connected ? '' : 'primary', disabled: busy || !r.enabled,
+        on: { click: () => connectServer(r.server) },
+      }, busy ? 'Working…' : (r.state === 'needs_signin' ? 'Connect' : 'Reconnect')),
+      r.state !== 'needs_signin'
+        ? el('button', { class: 'danger', disabled: busy, on: { click: () => disconnectServer(r.server) } }, 'Disconnect')
+        : null,
+    );
+  }
+  return el('div', { class: 'card key-card' },
+    el('h2', {}, r.server),
+    r.host ? el('p', { class: 'meta' }, r.host) : null,
+    el('div', { class: 'key-facts' }, facts),
+    r.state === 'needs_reauth' && r.last_error ? el('div', { class: 'err' }, r.last_error) : null,
+    actions,
+  );
+}
+
+function viewConnections() {
+  const c = state.connections;
+  let body;
+  if (!c.loaded) body = el('div', { class: 'card' }, el('div', { class: 'meta' }, 'Loading…'));
+  else if (c.rows.length === 0) body = el('div', { class: 'card' }, el('div', { class: 'empty' }, isAdmin()
+    ? 'No server is set to "Each person" under Who signs in yet (Servers page).'
+    : 'None of the servers granted to you asks each person to sign in.'));
+  else body = c.rows.map(renderConnectionCard);
+  return el('div', {},
+    el('div', { class: 'card' },
+      el('h2', {}, 'My connections'),
+      el('p', { class: 'meta', style: 'margin: 4px 0 0;' },
+        'These servers act as each person\'s own account. Connect yours and your agents\' calls to them run as you; toolyard keeps the sign-in refreshed. Your sign-in is never used for anyone else.'),
+      c.error ? el('div', { class: 'err' }, c.error) : null,
+    ),
+    body,
+  );
+}
+
 // loadUsers refetches the Users page. clearError drops the last error line;
 // the reload after a failed change keeps it so the reason stays visible.
 let usersSeq = 0;
@@ -2567,12 +2741,14 @@ function viewServers() {
   // Identity forwarding is per HTTP server; its fields live on the draft.
   if (draft.header == null) draft.header = IDENTITY_HEADER_DEFAULT;
   const identityRow = transport !== 'stdio' ? identityFields(draft, 'srv-id') : null;
+  const whoRow = transport !== 'stdio' ? whoSignsInField(draft, 'srv-auth') : null;
 
   const installedByName = new Map(state.servers.map((s) => [s.name, s]));
 
   return el('div', {},
     state.marketModal ? renderMarketModal() : null,
     state.serverEditModal ? renderServerEditModal() : null,
+    state.serverConnectionsModal ? renderServerConnectionsModal() : null,
     el('div', { class: 'card' },
       el('h2', {}, 'Browse popular MCP servers'),
       el('p', { class: 'meta' },
@@ -2642,6 +2818,7 @@ function viewServers() {
       transportFields,
       envRow,
       headersRow,
+      whoRow,
       identityRow,
       el('div', { class: 'row', style: 'margin-top: 12px;' },
         el('button', { class: 'primary', on: { click: () => addServer() }}, 'Add server'),
@@ -2658,6 +2835,7 @@ function viewServers() {
             el('th', {}, 'Tools'),
             el('th', {}, 'Status'),
             el('th', {}, 'Auth'),
+            el('th', {}, 'Who signs in'),
             el('th', {}, 'Policy'),
             el('th', {}, ''))),
             el('tbody', {}, state.servers.map((s) => el('tr', {},
@@ -2666,10 +2844,9 @@ function viewServers() {
                 identityBadges(s)),
               el('td', {}, transportLabel(s)),
               el('td', {}, String(s.tool_count || 0)),
-              el('td', {}, s.last_status === 'ok'
-                ? el('span', { class: 'badge allowed' }, 'connected')
-                : el('span', { class: 'badge denied', title: s.last_error || '' }, s.last_status || 'error')),
+              el('td', {}, serverStatusBadge(s)),
               el('td', {}, oauthBadge(s)),
+              el('td', {}, whoSignsInCell(s)),
               el('td', {}, (() => {
                 const cur = upstreamPolicyMode(s.name);
                 const sel = el('select', { title: 'Per-upstream gate (applies to all this server’s tools unless a tool has its own policy)',
@@ -2699,6 +2876,124 @@ function viewServers() {
 function transportLabel(s) {
   if (s.transport === 'stdio') return s.command + (s.args && s.args.length ? ' ' + s.args.join(' ') : '');
   return s.url || '';
+}
+
+// serverStatusBadge: connected, or the recorded failure. A per_user server
+// nobody has connected yet is not failing: its tools arrive with the first
+// sign-in.
+function serverStatusBadge(s) {
+  if (s.last_status === 'ok') return el('span', { class: 'badge allowed' }, 'connected');
+  if (s.last_status === 'waiting_signin') {
+    return el('span', { class: 'badge pending', title: 'No one has connected this server yet; its tools appear after the first sign-in on My connections.' },
+      'waiting for a first sign-in');
+  }
+  return el('span', { class: 'badge denied', title: s.last_error || '' }, s.last_status || 'error');
+}
+
+// ---- who signs in (auth_mode) ----
+//
+// shared: one account for everyone (the OAuth token on the Auth… panel);
+// per_user: each person connects their own on My connections, and an
+// agent's calls use its owner's account, never a shared one.
+
+const AUTH_MODE_LABEL = { shared: 'One shared account', per_user: 'Each person' };
+
+function isPerUserServer(s) { return s && s.auth_mode === 'per_user'; }
+
+// whoSignsInField is the add/edit form control, bound to d.auth_mode.
+function whoSignsInField(d, id) {
+  if (!d.auth_mode) d.auth_mode = 'shared';
+  const sel = el('select', { id, on: { change: (e) => { d.auth_mode = e.target.value; } } },
+    el('option', { value: 'shared' }, AUTH_MODE_LABEL.shared),
+    el('option', { value: 'per_user' }, AUTH_MODE_LABEL.per_user));
+  sel.value = d.auth_mode;
+  return el('label', {},
+    el('div', { class: 'meta' }, 'Who signs in'),
+    sel,
+    el('div', { class: 'meta' },
+      'One shared account: every change goes as that account (set it up under Auth…). ',
+      'Each person: people connect their own account on My connections and their agents act as them; nothing ever falls back to a shared account.'),
+  );
+}
+
+// whoSignsInCell is the per-row control on the Servers table: a select
+// that PATCHes auth_mode, and for per_user servers a look at who has
+// connected.
+function whoSignsInCell(s) {
+  if (!isHTTPUpstream(s)) return el('span', { class: 'meta' }, '—');
+  const cur = s.auth_mode || 'shared';
+  const sel = el('select', {
+    title: 'Who signs in to this server',
+    on: { change: (e) => setServerAuthMode(s, e.target.value) },
+  },
+    el('option', { value: 'shared' }, AUTH_MODE_LABEL.shared),
+    el('option', { value: 'per_user' }, AUTH_MODE_LABEL.per_user));
+  sel.value = cur;
+  return el('div', { class: 'row' },
+    sel,
+    cur === 'per_user'
+      ? el('button', { title: 'Who has connected their account to this server', on: { click: () => openServerConnections(s.name) } }, 'Who\'s connected…')
+      : null,
+  );
+}
+
+async function setServerAuthMode(s, mode) {
+  if (mode === (s.auth_mode || 'shared')) return;
+  const msg = mode === 'per_user'
+    ? `Make ${s.name} act as each person's own account? Agents whose owner has not connected on My connections get a clear refusal instead of running as the shared account. The shared account's token, if any, stays stored but is not used.`
+    : `Make ${s.name} act as one shared account for everyone? People's own sign-ins stay stored but stop being used (and refreshed) until you switch back.`;
+  if (!confirm(msg)) { render(); return; } // re-render resets the <select>
+  try {
+    const out = await api('/v1/servers/' + encodeURIComponent(s.name), { method: 'PATCH', body: { auth_mode: mode } });
+    const warning = out && out.warning;
+    if (warning) toast(`Saved ${s.name}, but it failed to reconnect: ${warning}`, 'error');
+    else toast(`${s.name}: ${AUTH_MODE_LABEL[mode].toLowerCase()}`);
+  } catch (e) { toast(e.message, 'error'); }
+  await reloadServers();
+  await loadOAuthStatus(s.name);
+  render();
+}
+
+// openServerConnections shows the admin who has connected a per_user
+// server (GET /v1/servers/{name}/connections): names and states, never
+// tokens.
+async function openServerConnections(name) {
+  const m = { name, loading: true, data: null, error: '' };
+  state.serverConnectionsModal = m;
+  render();
+  try {
+    m.data = await api('/v1/servers/' + encodeURIComponent(name) + '/connections');
+  } catch (e) { m.error = e.message; }
+  m.loading = false;
+  if (state.serverConnectionsModal === m) render();
+}
+
+function renderServerConnectionsModal() {
+  const m = state.serverConnectionsModal;
+  const close = () => { state.serverConnectionsModal = null; render(); };
+  const rows = (m.data && m.data.connections) || [];
+  let body;
+  if (m.loading) body = el('div', { class: 'meta' }, 'Loading…');
+  else if (m.error) body = el('div', { class: 'err' }, m.error);
+  else if (!rows.length) body = el('div', { class: 'empty' }, 'Nobody has connected yet. The server gets its tools from the first person who signs in on My connections.');
+  else body = el('table', {},
+    el('thead', {}, el('tr', {}, el('th', {}, 'Person'), el('th', {}, 'State'), el('th', {}, 'Account'), el('th', {}, 'Last refresh'))),
+    el('tbody', {}, rows.map((r) => el('tr', {},
+      el('td', {}, r.label || r.email || r.user_id, r.email && r.label ? el('div', { class: 'meta' }, r.email) : null),
+      el('td', {}, connectionStateBadge(r.state, r.last_error)),
+      el('td', { class: 'meta' }, r.account_label || '—'),
+      el('td', { class: 'meta' }, r.last_refresh_at ? relTime(r.last_refresh_at) : (r.connected_at ? 'connected ' + relTime(r.connected_at) : '—')),
+    ))));
+  return el('div', { class: 'modal-bg', on: { click: (e) => { if (e.target === e.currentTarget) close(); } } },
+    el('div', { class: 'modal modal-wide' },
+      el('h3', {}, 'Who signs in to ', m.name),
+      m.data && m.data.waiting_sign_in ? el('div', { class: 'meta' }, 'Waiting for a first sign-in.') : null,
+      body,
+      el('div', { class: 'row modal-actions', style: 'justify-content: flex-end;' },
+        el('button', { on: { click: close } }, 'Close'),
+      ),
+    ),
+  );
 }
 
 // serverUsesSecret reports whether any env/header value on a (masked) server
@@ -2797,11 +3092,12 @@ function openServerEdit(s) {
     identityOn: !!id,
     header: id ? id.header : IDENTITY_HEADER_DEFAULT,
     register: !!(id && id.register),
+    auth_mode: s.auth_mode || 'shared',
     enabled: s.enabled !== false,
     error: '',
     saving: false,
   };
-  m.orig = { url: m.url, headersText: m.headersText, identityOn: m.identityOn, header: m.header, register: m.register, enabled: m.enabled };
+  m.orig = { url: m.url, headersText: m.headersText, identityOn: m.identityOn, header: m.header, register: m.register, auth_mode: m.auth_mode, enabled: m.enabled };
   state.serverEditModal = m;
   render();
 }
@@ -2837,6 +3133,7 @@ function serverEditBody(m) {
     const changed = m.identityOn !== o.identityOn ||
       (m.identityOn && (next.header !== o.header || next.register !== o.register));
     if (changed) body.identity = m.identityOn ? next : null;
+    if (m.auth_mode !== o.auth_mode) body.auth_mode = m.auth_mode;
   }
   if (m.enabled !== o.enabled) body.enabled = m.enabled;
   return { body };
@@ -2911,8 +3208,9 @@ function renderServerEditModal() {
             on: { input: (e) => { m.headersText = e.target.value; } },
           }),
         ),
+        whoSignsInField(m, 'srv-edit-auth'),
         identityFields(m, 'srv-edit-id'),
-      ] : el('div', { class: 'meta' }, 'URL, headers and identity forwarding apply to HTTP servers only.'),
+      ] : el('div', { class: 'meta' }, 'URL, headers, who signs in and identity forwarding apply to HTTP servers only.'),
       el('label', { class: 'check-row' },
         el('input', {
           type: 'checkbox', id: 'srv-edit-enabled', checked: m.enabled,
@@ -3149,6 +3447,7 @@ async function addServer() {
       if (idErr) { toast(idErr, 'error'); return; }
       body.identity = identityFromDraft(draft);
     }
+    body.auth_mode = draft.auth_mode || 'shared';
   }
   body.env = parseEnvText($('srv-env').value);
   if (!body.name) { toast('name required', 'error'); return; }
@@ -3163,6 +3462,8 @@ async function addServer() {
       toast('Saved, but failed to connect: ' + (out.warning || 'unknown'), 'error');
     } else if (!resp.ok) {
       throw new Error(out.error || ('HTTP ' + resp.status));
+    } else if (out && out.last_status === 'waiting_signin') {
+      toast('Saved. Its tools appear once the first person connects on My connections.');
     } else {
       toast('Connected.');
     }
@@ -5107,6 +5408,7 @@ function navigate(route) {
   }
   if (route === 'users') loadUsers(true);
   if (route === 'myservers') loadMyServers();
+  if (route === 'connections') loadConnections(true);
   if (route === 'agents' || route === 'myservers') loadMyKey();
   render();
 }
@@ -5152,11 +5454,13 @@ function shell(content) {
         navBtn('memory',       'Memory'),
         navBtn('mempalace',    'MemPalace'),
         navBtn('agents',       'Agents'),
+        navBtn('connections',  'My connections'),
         navBtn('users',        'Users'),
         navBtn('settings',     'Settings'),
       ) : el('nav', {},
         navBtn('agents',       'Agents'),
         navBtn('myservers',    'My servers'),
+        navBtn('connections',  'My connections'),
       ),
       el('span', { class: 'user' },
         admin ? renderStreamPill() : null,
@@ -5186,15 +5490,16 @@ function shell(content) {
       bottomItem('servers',   '⌘', 'Servers'),
       bottomItem('notifications', '◔', 'Alerts', alertCount),
       el('button', {
-        class: ['audit','hooks','memory','agents','users','settings','insights','tools'].includes(state.route) ? 'active' : '',
+        class: ['audit','hooks','memory','agents','users','settings','insights','tools','connections'].includes(state.route) ? 'active' : '',
         on: { click: () => { state.moreSheet = true; render(); } }
       },
         el('span', { class: 'icon' }, '☰'),
         el('span', {}, 'More'),
       ),
     ) : el('div', { class: 'row' },
-      bottomItem('agents',    '◎', 'Agents'),
-      bottomItem('myservers', '⌘', 'My servers'),
+      bottomItem('agents',      '◎', 'Agents'),
+      bottomItem('myservers',   '⌘', 'My servers'),
+      bottomItem('connections', '⚿', 'Connections'),
     )),
     state.moreSheet ? renderMoreSheet() : null,
   );
@@ -5222,11 +5527,13 @@ function renderMoreSheet() {
         item('hooks',    'Hooks',    'Agent lifecycle events and memory ingest'),
         item('memory',   'Memory',   'Scope/key-value store'),
         item('agents',   'Agents',   'Manage enrolled agents'),
+        item('connections', 'My connections', 'Sign in to servers that act as you'),
         item('users',    'Users',    'Roles, blocking and server access'),
         item('settings', 'Settings', 'Surface mode, auto-approval, retention'),
       ] : [
         item('agents',    'Agents',     'Manage your enrolled agents'),
         item('myservers', 'My servers', 'Servers your agents may use'),
+        item('connections', 'My connections', 'Sign in to servers that act as you'),
       ],
       el('div', { class: 'row', style: 'margin-top: 12px; justify-content: flex-end;' },
         el('button', { on: { click: () => { state.moreSheet = false; render(); } }}, 'Close'),
@@ -5271,6 +5578,7 @@ function closeTopmostOverlay() {
   if (state.memEdit) { state.memEdit = null; render(); return true; }
   if (state.agentModal) { state.agentModal = null; render(); return true; }
   if (state.userAccessModal) { closeUserAccess(); return true; }
+  if (state.serverConnectionsModal) { state.serverConnectionsModal = null; render(); return true; }
   if (state.serverEditModal) { closeServerEdit(); return true; }
   if (state.marketModal) { state.marketModal = null; render(); return true; }
   if (state.jwtPreview || state.pushDiag || state.pushTestResult) {
@@ -5313,6 +5621,7 @@ function render() {
   switch (state.route) {
     case 'users':         body = viewUsers();         break;
     case 'myservers':     body = viewMyServers();     break;
+    case 'connections':   body = viewConnections();   break;
     case 'audit':         body = viewAudit();         break;
     case 'hooks':         body = viewHooks();         break;
     case 'memory':        body = viewMemory();        break;
@@ -5342,13 +5651,25 @@ function oauthBadge(s) {
   if (!isHTTPUpstream(s)) return el('span', { class: 'meta' }, '—');
   const st = (state.oauthStatus || {})[s.name];
   if (!st) return el('span', { class: 'meta' }, 'unknown');
+  if (isPerUserServer(s)) {
+    // The one OAuth client is shared; the tokens are each person's own.
+    return st.has_client
+      ? el('span', { class: 'badge identity', title: 'Each person connects their own account on My connections' }, 'each person')
+      : el('span', { class: 'badge denied', title: 'Register the OAuth client under Auth… (Discover) before people can connect' }, 'setup needed');
+  }
   if (st.is_pat) return el('span', { class: 'badge allowed', title: 'personal access token' }, 'PAT');
   if (!st.has_client) return el('span', { class: 'meta' }, 'none');
   if (!st.has_token) return el('span', { class: 'badge', title: 'client registered, no token yet' }, 'no token');
   if (st.state === 'active') {
     let title = 'authorized';
     if (st.access_expires_at) title += ' — expires ' + new Date(st.access_expires_at).toLocaleString();
-    return el('span', { class: 'badge allowed', title }, 'active');
+    // A shared server acts as one account for everyone: say which when
+    // the provider told us.
+    return el('span', {},
+      el('span', { class: 'badge allowed', title }, 'active'),
+      el('div', { class: 'meta', title: 'every change through this server goes as this account' },
+        st.account_label ? ['acts as ', el('code', {}, st.account_label)] : 'shared account'),
+    );
   }
   if (st.state === 'needs_reauth') {
     return el('span', { class: 'badge denied', title: st.last_error || '' }, 'needs reauth');
@@ -5433,14 +5754,27 @@ function renderOAuthModal() {
     ),
   );
 
+  // A per_user server only needs the client registered here; the sign-ins
+  // themselves happen on each person's My connections page.
+  const perUser = isPerUserServer(state.servers.find((x) => x.name === f.name));
+  const sectionPerUser = el('div', { class: 'card', style: 'margin: 0 0 12px 0;' },
+    el('div', {}, 'OAuth client registered. This server acts as each person\'s own account: people connect theirs on My connections.'),
+    el('div', { class: 'row', style: 'margin-top: 8px;' },
+      el('button', { on: { click: () => { closeOAuthPanel(); navigate('connections'); } } }, 'Open My connections'),
+      el('button', { on: { click: () => { closeOAuthPanel(); openServerConnections(f.name); } } }, 'Who\'s connected…'),
+      el('button', { class: 'danger', title: 'Drop the OAuth client and every person\'s sign-in to this server', on: { click: () => oauthDisconnectClick() } }, 'Remove client'),
+    ),
+  );
+
   let body;
   if (!st.has_client && !st.is_pat) body = sectionDiscover;
+  else if (perUser) body = sectionPerUser;
   else if (st.state === 'active' && !f.authorize_url) body = sectionConnected;
   else body = sectionAuthorize;
 
   return el('div', { class: 'modal-bg', on: { click: (e) => { if (e.target === e.currentTarget) closeOAuthPanel(); } }},
     el('div', { class: 'modal' },
-      el('h3', {}, 'Authorize ', f.name),
+      el('h3', {}, perUser ? 'OAuth setup for ' : 'Authorize ', f.name),
       st.issuer ? el('div', { class: 'meta' }, 'Provider: ' + st.issuer) : null,
       body,
       f.error ? el('div', { class: 'err' }, f.error) : null,
@@ -7800,10 +8134,12 @@ Read the full rules with inbox.guide().`;
     // Members: their agents and granted servers only. No event stream and
     // no admin fetches (they'd all be 403 admin_only).
     await loadAll();
+    if (state.route === 'connections') loadConnections(true);
   } else if (state.user) {
     await loadAll(); startStream();
     if (state.route === 'users') loadUsers(true);
     if (state.route === 'myservers') loadMyServers();
+    if (state.route === 'connections') loadConnections(true);
     if (!location.hash && !approvalParam && !routeParam && state.settings.approval_mode === 'inbox') state.route = 'inbox';
     if (deepInbox) openInboxRequest(deepInbox);
     if (state.route === 'insights' || state.route === 'notifications') {

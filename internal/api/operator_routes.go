@@ -67,6 +67,7 @@ var operatorNeverPaths = map[string]bool{
 	"/v1/auth/login":         true,
 	"/v1/auth/logout":        true,
 	"/v1/auth/clerk/session": true,
+	"/v1/connect/t3":         true,
 }
 
 // operatorOwnerPrefixes need the owner scope for any non-GET method.
@@ -93,7 +94,9 @@ func operatorScopeFor(method, path string) (scope string, ok bool) {
 	if strings.HasPrefix(path, "/v1/inbox/") && strings.HasSuffix(path, "/audio") {
 		return "", false
 	}
-	if operatorNeverPaths[path] || strings.Contains(path, "/reveal") {
+	// A connect link is opened by a person's browser; the ticket in its
+	// path is the credential, so no token may redeem one.
+	if operatorNeverPaths[path] || strings.Contains(path, "/reveal") || strings.HasPrefix(path, connectLinkPath) {
 		return "", false
 	}
 	switch method {
@@ -396,6 +399,8 @@ var operatorCatalog = []operatorCatalogEntry{
 	{"/v1/auth/me", "GET", "the authenticated user"},
 	{"/v1/auth/config", "GET", "login methods"},
 	{"/v1/auth/clerk/session", "POST", "Clerk login (browser only)"},
+	{"/v1/connect/t3", "POST", "bkt3 server: Clerk session token -> the person's agent token (never via operator token)"},
+	{"/v1/connect/link/{id}", "GET POST", "one-time connect link an agent gave the person: GET shows the confirm page, its POST redeems the ticket and starts their sign-in to a server (browser only; never via operator token)"},
 	{"/v1/operator-tokens", "GET POST", "list or mint operator tokens {name, scopes, ttl_hours}"},
 	{"/v1/operator-tokens/{id}", "DELETE", "revoke an operator token"},
 	{"/v1/operator/routes", "GET", "this catalog"},
@@ -403,6 +408,8 @@ var operatorCatalog = []operatorCatalogEntry{
 	{"/v1/users", "GET POST", "users: list, create"},
 	{"/v1/users/{id}", "GET PATCH DELETE POST", "one user: role, status, access, identity key"},
 	{"/v1/me/servers", "GET", "servers and data groups the caller may use"},
+	{"/v1/me/connections", "GET", "per-user servers the caller may connect, with their sign-in state (never tokens)"},
+	{"/v1/me/connections/{id}", "POST DELETE", "POST /begin starts the caller's own sign-in -> {authorize_url}; DELETE disconnects their account"},
 	{"/v1/me/identity-key", "GET POST", "the caller's identity key status"},
 	{"/v1/me/identity-key/reveal", "POST", "reveal the identity key once (never via operator token)"},
 	{"/v1/agents", "GET POST", "agents: list, create {name} (returns the agent token once)"},
@@ -422,8 +429,8 @@ var operatorCatalog = []operatorCatalogEntry{
 	{"/v1/audit/export", "GET", "audit export"},
 	{"/v1/tools", "GET", "full tool catalog"},
 	{"/v1/tools/run", "POST", "run a tool as the user {tool, arguments}; writes still need approval"},
-	{"/v1/servers", "GET POST", "MCP upstream servers: list, add {name, transport, command, args, url, env, headers, enabled}"},
-	{"/v1/servers/{id}", "PATCH DELETE POST", "one server; POST /reconnect, /convert-env, /oauth/*"},
+	{"/v1/servers", "GET POST", "MCP upstream servers: list, add {name, transport, command, args, url, env, headers, identity, auth_mode: shared|per_user, enabled}"},
+	{"/v1/servers/{id}", "GET PATCH DELETE POST", "one server; PATCH {url, headers, env, identity, auth_mode, enabled}; POST /reconnect, /convert-env, /oauth/*; GET /connections (who signed in to a per_user server)"},
 	{"/v1/mcp-oauth/callback", "GET", "OAuth redirect target for upstream servers"},
 	{"/v1/mcp-oauth/paste", "POST", "paste an OAuth code for an upstream server"},
 	{"/v1/marketplace", "GET", "curated server recipes"},

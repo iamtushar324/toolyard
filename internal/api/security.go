@@ -3,6 +3,7 @@ package api
 import (
 	"net"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -183,6 +184,7 @@ func (s *Server) EnforceOriginOnMutations(next http.Handler) http.Handler {
 		return next
 	}
 	allowed := strings.TrimRight(s.security.PublicURL, "/")
+	allowedOrigin := originOf(allowed)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
 		case http.MethodPost, http.MethodPatch, http.MethodPut, http.MethodDelete:
@@ -216,9 +218,10 @@ func (s *Server) EnforceOriginOnMutations(next http.Handler) http.Handler {
 			origin := r.Header.Get("Origin")
 			if origin == "" {
 				// Some browsers omit Origin on same-origin POSTs; fall back
-				// to Referer with a prefix match.
-				ref := r.Header.Get("Referer")
-				if ref == "" || !strings.HasPrefix(ref, allowed) {
+				// to the Referer's origin, compared whole (scheme, host and
+				// port): a prefix match would let toolyard.example.evil
+				// through.
+				if ro := originOf(r.Header.Get("Referer")); ro == "" || ro != allowedOrigin {
 					writeError(w, http.StatusForbidden, "missing or untrusted origin")
 					return
 				}
@@ -229,6 +232,16 @@ func (s *Server) EnforceOriginOnMutations(next http.Handler) http.Handler {
 		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+// originOf is the lowercased scheme://host[:port] of a URL, "" when it does
+// not parse or lacks either part.
+func originOf(raw string) string {
+	u, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil || u.Scheme == "" || u.Host == "" {
+		return ""
+	}
+	return strings.ToLower(u.Scheme + "://" + u.Host)
 }
 
 // LimitBody wraps every request body with http.MaxBytesReader so a single
@@ -329,8 +342,11 @@ func (s *Server) HardenAPI(next http.Handler) http.Handler {
 
 			// Strict Content-Type for JSON bodies. Anything carrying a
 			// body must declare application/json. Empty body (e.g.
-			// agent rotate POST with no payload) skips this check.
-			if r.ContentLength != 0 {
+			// agent rotate POST with no payload) skips this check. The
+			// one browser form on the API, a connect link's Continue
+			// button (connect_link_routes.go), posts form-encoded and
+			// proves itself with a nonce cookie instead.
+			if r.ContentLength != 0 && !strings.HasPrefix(path, connectLinkPath) {
 				ct := r.Header.Get("Content-Type")
 				if ct == "" {
 					writeError(w, http.StatusUnsupportedMediaType, "Content-Type required")
@@ -414,6 +430,13 @@ func exemptFromCSRFHeader(path string) bool {
 	if path == "/v1/ingest" || strings.HasPrefix(path, "/v1/ingest/") {
 		return true
 	}
+	// A connect link's Continue button is a plain browser form: it cannot
+	// set a header, so it carries a nonce the page's response set as a
+	// SameSite=Strict cookie (connect_link_routes.go). The Origin check
+	// still applies (exemptFromOriginCheck).
+	if strings.HasPrefix(path, connectLinkPath) {
+		return true
+	}
 	switch path {
 	case "/v1/auth/setup", "/v1/auth/login",
 		"/v1/agents/exchange",
@@ -431,7 +454,10 @@ func exemptFromCSRFHeader(path string) bool {
 		"/v1/notes/publish",
 		// CLI is bearer-authenticated and called from servers / scripts,
 		// not the dashboard. No cookie to protect.
-		"/v1/agents/tools/run":
+		"/v1/agents/tools/run",
+		// bkt3's server swaps a Clerk session token (in the body) for an
+		// agent token: no cookie, no Origin, so not CSRF-replayable.
+		"/v1/connect/t3":
 		return true
 	}
 	return false
@@ -443,6 +469,10 @@ func exemptFromCSRFHeader(path string) bool {
 func exemptFromOriginCheck(path string) bool {
 	switch path {
 	case "/v1/auth/setup", "/v1/auth/login":
+		return false
+	}
+	// The connect link's form is posted from its own confirm page only.
+	if strings.HasPrefix(path, connectLinkPath) {
 		return false
 	}
 	return exemptFromCSRFHeader(path)
@@ -485,6 +515,10 @@ func unauthRouteLimit(path string) *unauthRouteRule {
 		// once-per-second polling of an in-flight job is comfortable, while
 		// still capping spray on this bearer-authenticated DB-backed lookup.
 		return &unauthRouteRule{"mem-job", 6000, time.Hour}
+	case strings.HasPrefix(path, connectLinkPath):
+		// Connect links: a person opens a handful per hour at most. The
+		// ticket is 256 random bits, so this caps spray, not guessing.
+		return &unauthRouteRule{"connect-link", 120, time.Hour}
 	}
 	return nil
 }

@@ -392,6 +392,7 @@ func TestPythonTypes(t *testing.T) {
 		{prop("array", ""), "list[Any]"},
 		{map[string]any{"type": "array", "items": prop("string", "")}, "list[str]"},
 		{map[string]any{"type": "string", "enum": []any{"SP", "SB"}}, `Literal["SP", "SB"]`},
+		{map[string]any{"type": "string", "enum": []string{"allow", "ask", "deny"}}, `Literal["allow", "ask", "deny"]`},
 		{map[string]any{"enum": []any{1.0, 2.0}}, "Literal[1, 2]"},
 		{map[string]any{"const": "fixed"}, `Literal["fixed"]`},
 		{map[string]any{"type": []any{"string", "null"}}, "Any"},

@@ -87,6 +87,7 @@ func concretePaths(patterns []string) []string {
 	for _, action := range []string{"rotate", "disable", "enable"} {
 		add("/v1/agents/x/" + action)
 	}
+	add("/v1/me/connections/x/begin")
 	sort.Strings(out)
 	return out
 }
@@ -99,11 +100,19 @@ func memberAllowlist() map[string]bool {
 		"GET /v1/health",
 		"GET /v1/auth/me", "GET /v1/auth/config",
 		"POST /v1/auth/logout", "POST /v1/auth/login", "POST /v1/auth/clerk/session",
+		"POST /v1/connect/t3",
 		"GET /v1/agents", "POST /v1/agents", "POST /v1/agents/enroll",
 		"POST /v1/agents/x/rotate", "POST /v1/agents/x/disable", "POST /v1/agents/x/enable",
 		"DELETE /v1/agents/x",
 		"GET /v1/me/servers",
 		"GET /v1/me/identity-key", "POST /v1/me/identity-key/reveal",
+		// My connections, and the OAuth return routes a member's own
+		// sign-in comes back through (the handlers check whose flow it is).
+		"GET /v1/me/connections", "POST /v1/me/connections/x/begin", "DELETE /v1/me/connections/x",
+		"GET /v1/mcp-oauth/callback", "POST /v1/mcp-oauth/paste",
+		// A one-time connect link an agent gave the member (the ticket is
+		// the credential; the handler starts only their own sign-in).
+		"GET /v1/connect/link/x", "POST /v1/connect/link/x",
 	} {
 		allowed[mp] = true
 	}

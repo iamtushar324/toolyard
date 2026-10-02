@@ -61,6 +61,9 @@ var memberRoutes = map[string]string{
 	"/v1/auth/logout":        http.MethodPost,
 	"/v1/auth/login":         http.MethodPost,
 	"/v1/auth/clerk/session": http.MethodPost,
+	// Authenticated by the Clerk token in its body; a cookie riding along
+	// must not change the answer.
+	"/v1/connect/t3": http.MethodPost,
 	// Own agents: list, create, enrolment code. Per-agent actions are the
 	// pattern below; identity scopes them to the caller's own agents.
 	"/v1/agents":        http.MethodGet + " " + http.MethodPost,
@@ -71,6 +74,14 @@ var memberRoutes = map[string]string{
 	// Provisioning, rotating and revoking are admin routes under /v1/users/.
 	"/v1/me/identity-key":        http.MethodGet,
 	"/v1/me/identity-key/reveal": http.MethodPost,
+	// The member's own sign-ins to per_user servers (My connections); the
+	// per-server begin/disconnect actions are the pattern below. The OAuth
+	// return routes must be reachable too: the provider sends the member's
+	// browser back to the callback, and the handler itself checks that the
+	// flow is theirs (a shared flow stays admin-only there).
+	"/v1/me/connections":     http.MethodGet,
+	"/v1/mcp-oauth/callback": http.MethodGet,
+	"/v1/mcp-oauth/paste":    http.MethodPost,
 	// Bearer-token agent routes ignore cookies, so a member's browser
 	// cookie riding along must not lock them out.
 	"/v1/agents/exchange":  "*",
@@ -106,6 +117,28 @@ func memberAllowed(method, path string) bool {
 	// Bearer-token approval polling for the CLI.
 	if strings.HasPrefix(path, "/v1/agents/approvals/") {
 		return true
+	}
+	// A one-time connect link an agent gave the member: GET shows the
+	// confirm page, POST (from that page) redeems the ticket and starts
+	// only that member's own sign-in (connect_link_routes.go).
+	if ticket, ok := strings.CutPrefix(path, connectLinkPath); ok {
+		return (method == http.MethodGet || method == http.MethodPost) && ticket != "" && !strings.Contains(ticket, "/")
+	}
+	// Own connections:
+	//   POST   /v1/me/connections/{server}/begin
+	//   DELETE /v1/me/connections/{server}
+	if rest, ok := strings.CutPrefix(path, "/v1/me/connections/"); ok {
+		server, sub, _ := strings.Cut(rest, "/")
+		if server == "" {
+			return false
+		}
+		switch {
+		case sub == "" && method == http.MethodDelete:
+			return true
+		case sub == "begin" && method == http.MethodPost:
+			return true
+		}
+		return false
 	}
 	// Own-agent actions:
 	//   POST   /v1/agents/{id}/rotate|disable|enable

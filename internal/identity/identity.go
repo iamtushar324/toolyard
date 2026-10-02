@@ -29,8 +29,9 @@ import (
 var usernameRE = regexp.MustCompile(`^[A-Za-z0-9._-]{2,64}$`)
 
 // agentNameRE allows a slightly broader set since agent names show up in UI
-// and audit only, never in shells.
-var agentNameRE = regexp.MustCompile(`^[A-Za-z0-9 ._:-]{1,64}$`)
+// and audit only, never in shells. Parentheses let a name carry a short
+// qualifier, e.g. the "T3 Code (bkt3)" agent /v1/connect/t3 creates.
+var agentNameRE = regexp.MustCompile(`^[A-Za-z0-9 ._:()-]{1,64}$`)
 
 // MinPasswordLen — picked to match the OWASP "memorized secret" baseline.
 // Stronger ones welcome; we don't enforce upper cap to allow passphrases.
@@ -612,7 +613,7 @@ func (s *Service) CreateEnrollment(ctx context.Context, ownerUserID, agentName s
 		agentName = "agent"
 	}
 	if !agentNameRE.MatchString(agentName) {
-		return "", nil, errors.New("agent name must be 1-64 chars of [A-Za-z0-9 ._:-]")
+		return "", nil, errors.New("agent name must be 1-64 chars of [A-Za-z0-9 ._:()-]")
 	}
 	code, err := randCode(8)
 	if err != nil {
@@ -640,7 +641,7 @@ func (s *Service) CreateAgentWithToken(ctx context.Context, ownerUserID, agentNa
 		agentName = "agent"
 	}
 	if !agentNameRE.MatchString(agentName) {
-		return "", nil, errors.New("agent name must be 1-64 chars of [A-Za-z0-9 ._:-]")
+		return "", nil, errors.New("agent name must be 1-64 chars of [A-Za-z0-9 ._:()-]")
 	}
 	id := "ag_" + uuid.NewString()
 	now := time.Now()
@@ -748,7 +749,9 @@ func (s *Service) VerifyAgentToken(ctx context.Context, token string) (*Agent, e
 // operator; the old token is dead the instant this returns.
 // RotateAgentToken issues a fresh token. When grace > 0 the previous token
 // keeps authenticating until now+grace (so a running agent isn't killed
-// mid-task); grace <= 0 kills the old token immediately.
+// mid-task); grace <= 0 kills the old token immediately. A pending
+// enrollment code for the agent is cleared too: exchanging it later would
+// silently replace the token just issued.
 func (s *Service) RotateAgentToken(ctx context.Context, ownerUserID, agentID string, grace time.Duration) (string, error) {
 	if err := s.requirePlainAgent(ctx, ownerUserID, agentID); err != nil {
 		return "", err
@@ -761,12 +764,14 @@ func (s *Service) RotateAgentToken(ctx context.Context, ownerUserID, agentID str
 	var res sql.Result
 	if grace > 0 {
 		res, err = s.db.ExecContext(ctx,
-			`UPDATE agents SET prev_token_hash = token_hash, prev_token_expires = ?, token_hash = ?, last_seen = ?
+			`UPDATE agents SET prev_token_hash = token_hash, prev_token_expires = ?, token_hash = ?, last_seen = ?,
+                    enroll_code = NULL, enroll_expires = NULL
              WHERE id = ? AND owner_user = ?`,
 			now+grace.Milliseconds(), hash, now, agentID, ownerUserID)
 	} else {
 		res, err = s.db.ExecContext(ctx,
-			`UPDATE agents SET prev_token_hash = NULL, prev_token_expires = NULL, token_hash = ?, last_seen = ?
+			`UPDATE agents SET prev_token_hash = NULL, prev_token_expires = NULL, token_hash = ?, last_seen = ?,
+                    enroll_code = NULL, enroll_expires = NULL
              WHERE id = ? AND owner_user = ?`,
 			hash, now, agentID, ownerUserID)
 	}
@@ -930,10 +935,13 @@ func nullStr(s string) any {
 	return s
 }
 
+// ListAgents returns the owner's agents, newest first. created_at is in
+// milliseconds, so rowid (insertion order) breaks ties: "newest" must be
+// well defined for callers that pick the first match.
 func (s *Service) ListAgents(ctx context.Context, ownerUserID string) ([]Agent, error) {
 	rows, err := s.db.QueryContext(ctx,
 		`SELECT id, name, owner_user, COALESCE(last_seen, 0), COALESCE(disabled, 0), kind
-         FROM agents WHERE owner_user = ? ORDER BY created_at DESC`, ownerUserID)
+         FROM agents WHERE owner_user = ? ORDER BY created_at DESC, rowid DESC`, ownerUserID)
 	if err != nil {
 		return nil, err
 	}

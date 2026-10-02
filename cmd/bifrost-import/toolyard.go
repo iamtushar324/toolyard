@@ -102,6 +102,22 @@ func (t *toolyardAPI) serverNames() (map[string]bool, error) {
 	return out, nil
 }
 
+// serverURLs maps each toolyard server name to its URL.
+func (t *toolyardAPI) serverURLs() (map[string]string, error) {
+	var list []struct {
+		Name string `json:"name"`
+		URL  string `json:"url"`
+	}
+	if _, err := t.do(http.MethodGet, "/v1/servers", nil, &list); err != nil {
+		return nil, err
+	}
+	out := make(map[string]string, len(list))
+	for _, s := range list {
+		out[s.Name] = s.URL
+	}
+	return out, nil
+}
+
 func (t *toolyardAPI) secretNames() (map[string]bool, error) {
 	var list []struct {
 		Name string `json:"name"`
@@ -155,4 +171,23 @@ func (t *toolyardAPI) createServer(s toolyardServer) (serverResult, string, int,
 	var r serverResult
 	_ = json.Unmarshal(reply, &r)
 	return r, "", code, nil
+}
+
+// hasOAuthClient reports whether toolyard already holds an OAuth app for a
+// server.
+func (t *toolyardAPI) hasOAuthClient(name string) (bool, error) {
+	var st struct {
+		HasClient bool `json:"has_client"`
+	}
+	if _, err := t.do(http.MethodGet, "/v1/servers/"+url.PathEscape(name)+"/oauth", nil, &st); err != nil {
+		return false, err
+	}
+	return st.HasClient, nil
+}
+
+// putManualClient stores an OAuth app for a server. toolyard fills in its own
+// redirect URI.
+func (t *toolyardAPI) putManualClient(name string, body map[string]any) error {
+	_, err := t.do(http.MethodPost, "/v1/servers/"+url.PathEscape(name)+"/oauth/manual-client", body, nil)
+	return err
 }

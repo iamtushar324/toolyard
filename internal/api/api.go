@@ -6,6 +6,7 @@
 //	POST /v1/auth/login           username + password -> session cookie
 //	POST /v1/auth/clerk/session   Clerk session JWT -> session cookie
 //	GET  /v1/auth/config          which sign-in methods are on (public)
+//	POST /v1/connect/t3           bkt3: Clerk session JWT -> the person's agent token
 //	POST /v1/auth/logout
 //	GET  /v1/auth/me              current user, with role
 //
@@ -13,6 +14,10 @@
 //	PATCH /v1/users/{id}          admin: role / status / servers
 //	POST /v1/users/{id}/revoke-sessions
 //	GET  /v1/me/servers           groups the caller may use
+//	GET  /v1/me/connections       per_user servers the caller may connect, with state
+//	POST /v1/me/connections/{server}/begin   start the caller's own sign-in
+//	DELETE /v1/me/connections/{server}       drop the caller's token
+//	GET  /v1/servers/{name}/connections      admin: who has connected a per_user server
 //
 //	GET  /v1/agents
 //	POST /v1/agents/enroll        creates a code (op uses it on the agent)
@@ -139,6 +144,8 @@ type Server struct {
 	clerkFrontendAPI    string
 	ownerEmail          string
 	clerkOwnerOnly      bool
+	// connect is POST /v1/connect/t3 (connect_routes.go); nil = off.
+	connect *connectConfig
 }
 
 type Options struct {
@@ -225,6 +232,10 @@ type Options struct {
 	// new member, so the owner keeps their admin role, agents and passkeys.
 	OwnerEmail     string
 	ClerkOwnerOnly bool
+	// ConnectAZP (-connect-azp) lists the bkt3 browser origins whose Clerk
+	// session tokens POST /v1/connect/t3 swaps for the person's agent
+	// token. Empty, or Clerk off, leaves the endpoint off (404).
+	ConnectAZP []string
 }
 
 func New(ctx context.Context, opts Options) *Server {
@@ -278,6 +289,7 @@ func New(ctx context.Context, opts Options) *Server {
 		s.clerkPublishableKey = opts.Clerk.PublishableKey()
 		s.clerkFrontendAPI = opts.Clerk.FrontendAPI()
 	}
+	s.connect = newConnectT3(opts.Clerk, opts.ConnectAZP)
 	// Sweep stale throttle buckets periodically. Tied to ctx so the
 	// goroutine exits on shutdown instead of leaking (precedent:
 	// approval.New).
@@ -309,10 +321,13 @@ func (s *Server) Routes(mux *http.ServeMux) {
 	mux.HandleFunc("/v1/auth/me", s.authMe)
 	mux.HandleFunc("/v1/auth/config", s.authConfig)
 	mux.HandleFunc("/v1/auth/clerk/session", s.authClerkSession)
+	mux.HandleFunc("/v1/connect/t3", s.connectT3)
+	s.connectLinkRoutes(mux)
 
 	mux.HandleFunc("/v1/users", s.usersList)
 	mux.HandleFunc("/v1/users/", s.usersItem)
 	mux.HandleFunc("/v1/me/servers", s.meServers)
+	s.connectionRoutes(mux)
 
 	mux.HandleFunc("/v1/agents", s.agentsCollection)
 	mux.HandleFunc("/v1/agents/enroll", s.agentsEnroll)
@@ -417,6 +432,9 @@ func (s *Server) health(w http.ResponseWriter, r *http.Request) {
 		"upstreams_idle":    s.gateway.SuspendedUpstreamCount(),
 		"upstreams_max":     s.gateway.MaxLiveUpstreams(),
 		"upstreams_backoff": s.gateway.UpstreamsInBackoff(),
+		// Per-user connections (per_user servers) have their own pool.
+		"upstreams_per_user_live": s.gateway.PerUserLiveCount(),
+		"upstreams_per_user_max":  s.gateway.MaxLivePerUser(),
 		// upstreams_recovered counts upstream MCP sessions re-established
 		// after the server dropped them (expiry, restart).
 		"upstreams_recovered": s.gateway.SessionRecoveries(),
@@ -1533,6 +1551,10 @@ func (s *Server) serversItem(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
+	if subpath == "connections" {
+		s.serversConnections(w, r, name)
+		return
+	}
 	if subpath == "convert-env" {
 		s.serversConvertEnv(w, r, name)
 		return
@@ -1644,6 +1666,12 @@ func (s *Server) toolsRun(w http.ResponseWriter, r *http.Request) {
 	// so audit and approval rows name the operator (id, email, name)
 	// instead of an empty agent_id.
 	ctx := actor.WithRaiser(gateway.WithAgentID(r.Context(), "dashboard:"+u.ID), s.dashboardRaiser(r, u))
+	// An operator token is a credential in a script, not the person's
+	// browser: a connect link it obtained could be opened by anyone
+	// holding the token, so none is minted on its calls.
+	if operatorFromContext(r.Context()) != nil {
+		ctx = gateway.WithoutConnectLinks(ctx)
+	}
 	res, err := s.gateway.RouteCall(ctx, viaDashboard, body.Tool, body.Arguments)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())

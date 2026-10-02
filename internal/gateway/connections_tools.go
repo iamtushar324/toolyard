@@ -1,0 +1,658 @@
+package gateway
+
+// connections_tools.go: signing in to a server without leaving the chat.
+//
+// When a call cannot run because the agent's owner has not signed in (their
+// own account on a per_user server, or the shared account of a shared OAuth
+// server), the refusal carries a one-time connect link the agent shows the
+// person. The link (oauth.ConnectLinkPath) redeems a ticket, starts the
+// sign-in for that very person and server in their browser, and brings
+// them back to a page that says "tell your agent to retry". Nobody signs in
+// to toolyard's dashboard on the way.
+//
+// connections.status lists the OAuth servers the owner may use with their
+// sign-in state and a fresh link where one is needed; connections.link
+// mints one for a named server. A shared server's link is given only to an
+// admin owner; a member is told which admins to ask. Both tools are in the
+// always-on "connections" access group (access.alwaysOn), as the inbox
+// tools are, so a member's agent can always fetch its owner's own links.
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"sort"
+	"strings"
+
+	"github.com/mark3labs/mcp-go/mcp"
+
+	"github.com/tusharbhardwaj/toolyard/internal/actor"
+	"github.com/tusharbhardwaj/toolyard/internal/audit"
+	"github.com/tusharbhardwaj/toolyard/internal/metrics"
+	"github.com/tusharbhardwaj/toolyard/internal/oauth"
+	"github.com/tusharbhardwaj/toolyard/internal/policy"
+)
+
+// connectionsGroup is the synthetic upstream the connections.* tools are
+// registered under, and their access group.
+const connectionsGroup = "connections"
+
+// The connections tools.
+const (
+	ConnectionsStatusTool = "connections.status"
+	ConnectionsLinkTool   = "connections.link"
+)
+
+// Audit event types written here.
+const (
+	// EventConnectLinkIssued: a connect link was minted for an owner. The
+	// row names the server, the agent and the owner, never the ticket.
+	EventConnectLinkIssued = "connect.link_issued"
+)
+
+func init() {
+	for _, n := range []string{ConnectionsStatusTool, ConnectionsLinkTool} {
+		PinnedTools[n] = struct{}{}
+	}
+}
+
+// ConnectProvider is what the connections tools and the sign-in refusals
+// need from the OAuth store. *oauth.Service satisfies it.
+type ConnectProvider interface {
+	// IssueConnectTicket mints the ticket a connect link carries, for
+	// userID to connect upstream for purpose (oauth.ConnectPurpose*),
+	// noting the agent that asked. Returned once; stored hashed.
+	IssueConnectTicket(ctx context.Context, userID, upstream, purpose, agentID string) (string, error)
+	// OAuthServers lists every server with an OAuth client and its auth
+	// mode.
+	OAuthServers(ctx context.Context) ([]oauth.OAuthServer, error)
+	// SharedConnection reports a shared server's sign-in; nil when the
+	// server has no OAuth client.
+	SharedConnection(ctx context.Context, upstream string) (*oauth.SharedConnection, error)
+	// UserConnectionOf reports one person's sign-in to a per_user server;
+	// nil when they never connected it.
+	UserConnectionOf(ctx context.Context, upstream, userID string) (*oauth.UserConnection, error)
+}
+
+// ConnectDirectory names the people who can sign a shared server in.
+// *identity.Service satisfies it.
+type ConnectDirectory interface {
+	// AdminEmails lists the active admins' emails.
+	AdminEmails(ctx context.Context) ([]string, error)
+}
+
+// SetConnect wires connect links. Until it is called the connections tools
+// answer that links are not available and the refusals point at the
+// dashboard, as before.
+func (g *Gateway) SetConnect(p ConnectProvider, d ConnectDirectory) {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	g.connect = p
+	g.directory = d
+}
+
+func (g *Gateway) connectProvider() ConnectProvider {
+	g.mu.RLock()
+	defer g.mu.RUnlock()
+	return g.connect
+}
+
+type noConnectLinksKey struct{}
+
+// WithoutConnectLinks marks a call whose caller must not be handed a
+// connect link: the API sets it on tool runs made with an operator token,
+// which is a credential in a script and not the person's browser, so a
+// link it obtained could be opened by anyone holding the token. Refusals
+// then fall back to naming the dashboard, and connections.link says why.
+func WithoutConnectLinks(ctx context.Context) context.Context {
+	return context.WithValue(ctx, noConnectLinksKey{}, true)
+}
+
+func connectLinksAllowed(ctx context.Context) bool {
+	v, _ := ctx.Value(noConnectLinksKey{}).(bool)
+	return !v
+}
+
+// connectionsTools returns the two entries; registered by RegisterBuiltins.
+func (g *Gateway) connectionsTools() []toolEntry {
+	allow := policy.ActionAllow
+	entry := func(name, desc string, props map[string]any, required ...string) toolEntry {
+		return toolEntry{
+			tool: mcp.Tool{
+				Name:        name,
+				Description: desc,
+				InputSchema: mcp.ToolInputSchema{Type: "object", Required: append([]string{ReasonField}, required...), Properties: addMetaProps(props)},
+			},
+			upstream:     connectionsGroup,
+			originalName: strings.TrimPrefix(name, connectionsGroup+"."),
+			reasonField:  ReasonField,
+			forcedAction: &allow,
+		}
+	}
+	status := entry(ConnectionsStatusTool,
+		"Which servers your owner has signed in to, and how to get them connected without leaving the chat. "+
+			"Lists every OAuth server your owner may use (their own account on per_user servers, the shared account on shared ones) with its state "+
+			"(connected, needs_signin, needs_reauth), the account it acts as, and for each one that needs a sign-in a one-time connect link (10 minutes). "+
+			connectGuidance,
+		map[string]any{})
+	status.handle = g.handleConnectionsStatus
+	link := entry(ConnectionsLinkTool,
+		"Get a fresh one-time connect link for one server (input: server), or the reason none can be made. "+
+			"A per_user server's link signs your owner's own account in; a shared server's link is only given to an admin owner, and a member is told which admins to ask. "+
+			"A server that is already connected gets no link: for a per_user server pass replace: true only when the person has asked to switch accounts; a shared account is switched by an admin in the dashboard. "+
+			connectGuidance,
+		map[string]any{
+			"server":  map[string]any{"type": "string", "description": "The server name as it appears in tool names (the part before the dot)."},
+			"replace": map[string]any{"type": "boolean", "description": "per_user servers only: also hand out a link when the owner is already connected, because they asked to switch accounts."},
+		},
+		"server")
+	link.handle = g.handleConnectionsLink
+	return []toolEntry{status, link}
+}
+
+// connectGuidance is the agent's instruction on every connect link, here
+// and in the refusals: how to hand it to the person.
+const connectGuidance = "Show the person the link as a clickable Markdown link and retry after they say they are done; the sign-in happens at the provider, in their browser. Never ask them for a password, token or one-time code."
+
+// connectCaller resolves who is asking: the caller id, the dashboard user
+// behind it, whether that user is an admin (the access scope says), and
+// the scope itself. errRes is the tool error to return when there is no
+// user or no provider.
+func (g *Gateway) connectCaller(ctx context.Context) (callerID, uid string, admin bool, errRes *mcp.CallToolResult) {
+	callerID = agentIDFromContext(ctx)
+	if g.connectProvider() == nil {
+		return callerID, "", false, mcp.NewToolResultError("connect links are not available on this gateway; connect servers from the toolyard dashboard")
+	}
+	uid, err := g.ownerUser(ctx, callerID)
+	if err != nil {
+		return callerID, "", false, mcp.NewToolResultErrorFromErr("resolve caller's user", err)
+	}
+	if uid == "" {
+		return callerID, "", false, mcp.NewToolResultError("the connections tools need an enrolled agent with an owner: connect with an agent token (Authorization: Bearer …)")
+	}
+	// Scope.All is an active admin (or a local anonymous caller, who has
+	// no user and was refused above).
+	return callerID, uid, g.scopeFor(ctx, callerID).All, nil
+}
+
+// connectionView is one server on connections.status.
+type connectionView struct {
+	Server string `json:"server"`
+	// Mode: per_user (the owner's own account) or shared.
+	Mode string `json:"mode"`
+	// State: connected | needs_signin | needs_reauth | needs_setup.
+	State string `json:"state"`
+	// Account is the account the server acts as, when the provider said.
+	Account string `json:"account,omitempty"`
+	// ConnectLink is a fresh one-time link, only when a sign-in is needed
+	// and this owner may do it.
+	ConnectLink string `json:"connect_link,omitempty"`
+	// LinkExpiresIn is how long the link can be opened, in seconds.
+	LinkExpiresIn int `json:"link_expires_in,omitempty"`
+	// Note says what to do when there is no link, or what the link does.
+	Note string `json:"note,omitempty"`
+}
+
+// Connection states as the tools report them. connected and needs_reauth
+// are oauth's; needs_signin covers no token at all; needs_setup means an
+// admin has not finished the server's OAuth setup.
+const (
+	connStateConnected   = oauth.ConnConnected
+	connStateNeedsSignIn = oauth.ConnNeedsSignIn
+	connStateNeedsReauth = oauth.StateNeedsReauth
+	connStateNeedsSetup  = "needs_setup"
+)
+
+func (g *Gateway) handleConnectionsStatus(ctx context.Context, _ map[string]any) (*mcp.CallToolResult, error) {
+	callerID, uid, admin, errRes := g.connectCaller(ctx)
+	if errRes != nil {
+		return errRes, nil
+	}
+	views, err := g.connectionViews(ctx, callerID, uid, admin)
+	if err != nil {
+		return mcp.NewToolResultErrorFromErr("connections.status", err), nil
+	}
+	var b strings.Builder
+	if len(views) == 0 {
+		b.WriteString("No server your owner may use needs a sign-in, and none is signed in through OAuth.")
+	}
+	for _, v := range views {
+		fmt.Fprintf(&b, "%s (%s): %s", v.Server, v.Mode, v.State)
+		if v.Account != "" {
+			fmt.Fprintf(&b, " as %s", v.Account)
+		}
+		if v.ConnectLink != "" {
+			fmt.Fprintf(&b, " — connect link (one-time, %d minutes): %s", v.LinkExpiresIn/60, v.ConnectLink)
+		}
+		if v.Note != "" {
+			fmt.Fprintf(&b, " — %s", v.Note)
+		}
+		b.WriteString("\n")
+	}
+	b.WriteString("\n" + connectGuidance)
+	res := mcp.NewToolResultText(b.String())
+	res.StructuredContent = map[string]any{"servers": views, "guidance": connectGuidance}
+	return res, nil
+}
+
+// connectionViews builds the owner's list: every OAuth server (and every
+// per_user server, client or not) within the caller's access scope.
+func (g *Gateway) connectionViews(ctx context.Context, callerID, uid string, admin bool) ([]connectionView, error) {
+	p := g.connectProvider()
+	scope := g.scopeFor(ctx, callerID)
+	servers, err := p.OAuthServers(ctx)
+	if err != nil {
+		return nil, err
+	}
+	seen := map[string]bool{}
+	type cand struct {
+		name    string
+		perUser bool
+		client  bool
+	}
+	var cands []cand
+	for _, s := range servers {
+		seen[s.Name] = true
+		if !s.Enabled {
+			continue
+		}
+		cands = append(cands, cand{name: s.Name, perUser: s.AuthMode == oauth.ConnectPurposePerUser, client: true})
+	}
+	// A per_user server registered on the gateway but without an OAuth
+	// client yet: listed so the agent can say what is missing.
+	g.mu.RLock()
+	for name := range g.perUser {
+		if !seen[name] {
+			cands = append(cands, cand{name: name, perUser: true})
+		}
+	}
+	g.mu.RUnlock()
+	sort.Slice(cands, func(i, j int) bool { return cands[i].name < cands[j].name })
+
+	var out []connectionView
+	for _, c := range cands {
+		if !scope.Allows(c.name) {
+			continue
+		}
+		v := connectionView{Server: c.name, Mode: "shared"}
+		if c.perUser {
+			v.Mode = oauth.ConnectPurposePerUser
+		}
+		switch {
+		case c.perUser && !c.client:
+			v.State = connStateNeedsSetup
+			v.Note = "an admin still has to finish this server's OAuth setup in the dashboard (Servers → Auth)"
+		case c.perUser:
+			conn, err := p.UserConnectionOf(ctx, c.name, uid)
+			if err != nil {
+				return nil, err
+			}
+			v.State, v.Account = perUserState(conn)
+			if v.State != connStateConnected {
+				g.fillLink(ctx, &v, uid, c.name, oauth.ConnectPurposePerUser, callerID, "opening it signs your owner's own account in")
+			}
+		default:
+			conn, err := p.SharedConnection(ctx, c.name)
+			if err != nil {
+				return nil, err
+			}
+			if conn == nil {
+				continue
+			}
+			v.State, v.Account = sharedState(conn)
+			if v.State != connStateConnected {
+				switch {
+				case !admin:
+					v.Note = g.askAdminNote(ctx, c.name)
+				case !conn.CanAuthorize:
+					v.Note = "this server uses a pasted token; an admin sets a new one in the dashboard (Servers → Auth)"
+				default:
+					g.fillLink(ctx, &v, uid, c.name, oauth.ConnectPurposeShared, callerID, sharedSignInAs(conn))
+				}
+			}
+		}
+		out = append(out, v)
+	}
+	return out, nil
+}
+
+// fillLink mints a link onto v, or explains why none could be made.
+func (g *Gateway) fillLink(ctx context.Context, v *connectionView, uid, upstream, purpose, callerID, note string) {
+	link, err := g.connectLink(ctx, uid, upstream, purpose, callerID)
+	if err != nil {
+		v.Note = err.Error()
+		return
+	}
+	v.ConnectLink = link
+	v.LinkExpiresIn = int(oauth.ConnectTicketTTL.Seconds())
+	v.Note = note
+}
+
+// perUserState maps a person's row to the reported state and account.
+func perUserState(c *oauth.UserConnection) (state, account string) {
+	if c == nil {
+		return connStateNeedsSignIn, ""
+	}
+	switch c.State {
+	case oauth.ConnConnected:
+		return connStateConnected, c.AccountLabel
+	case oauth.StateNeedsReauth, oauth.ConnExpired:
+		return connStateNeedsReauth, c.AccountLabel
+	}
+	return connStateNeedsSignIn, c.AccountLabel
+}
+
+// sharedState maps a shared server's token to the reported state and
+// account.
+func sharedState(c *oauth.SharedConnection) (state, account string) {
+	switch {
+	case c.Usable():
+		return connStateConnected, c.AccountLabel
+	case c.HasToken && c.State == oauth.StateNeedsReauth:
+		return connStateNeedsReauth, c.AccountLabel
+	}
+	return connStateNeedsSignIn, c.AccountLabel
+}
+
+// sharedSignInAs tells an admin which account a shared server's link
+// should be signed in with, when the last one is known.
+func sharedSignInAs(c *oauth.SharedConnection) string {
+	if c.AccountLabel != "" {
+		return "sign in as " + c.AccountLabel
+	}
+	return "opening it signs the server's shared account in"
+}
+
+func (g *Gateway) handleConnectionsLink(ctx context.Context, args map[string]any) (*mcp.CallToolResult, error) {
+	callerID, uid, admin, errRes := g.connectCaller(ctx)
+	if errRes != nil {
+		return errRes, nil
+	}
+	server := strings.TrimSpace(stringArg(args, "server"))
+	if server == "" {
+		return mcp.NewToolResultError("server is required"), nil
+	}
+	if !g.scopeFor(ctx, callerID).Allows(server) {
+		// Same answer as a server that does not exist: an owner learns
+		// nothing about servers not granted to them.
+		return mcp.NewToolResultErrorf("unknown server %q", server), nil
+	}
+	p := g.connectProvider()
+	servers, err := p.OAuthServers(ctx)
+	if err != nil {
+		return mcp.NewToolResultErrorFromErr("connections.link", err), nil
+	}
+	var found *oauth.OAuthServer
+	for i := range servers {
+		if servers[i].Name == server {
+			found = &servers[i]
+			break
+		}
+	}
+	switch {
+	case found == nil && g.IsPerUser(server):
+		return mcp.NewToolResultErrorf("%s has no sign-in set up yet: an admin still has to finish its OAuth setup in the dashboard (Servers → Auth). Nothing to open.", server), nil
+	case found == nil:
+		return mcp.NewToolResultErrorf("unknown server %q, or it does not use an OAuth sign-in (nothing to connect)", server), nil
+	case !found.Enabled:
+		return mcp.NewToolResultErrorf("%s is disabled; an admin has to enable it before anyone signs in", server), nil
+	}
+	v := connectionView{Server: server, Mode: "shared"}
+	if found.AuthMode == oauth.ConnectPurposePerUser {
+		v.Mode = oauth.ConnectPurposePerUser
+		conn, err := p.UserConnectionOf(ctx, server, uid)
+		if err != nil {
+			return mcp.NewToolResultErrorFromErr("connections.link", err), nil
+		}
+		v.State, v.Account = perUserState(conn)
+		note := "opening it signs your owner's own account in"
+		if v.State == connStateConnected {
+			// A working sign-in is not replaced on an agent's say-so: the
+			// person asks for the switch, and the agent passes that on.
+			if !boolArg(args, "replace") {
+				return mcp.NewToolResultErrorf("%s is already connected%s; nothing to do. If the person wants to switch accounts, call again with replace: true (or they disconnect it from My connections first).",
+					server, accountSuffix(v.Account)), nil
+			}
+			note = "the owner asked to switch accounts; opening it signs in again and replaces the current sign-in"
+		}
+		g.fillLink(ctx, &v, uid, server, oauth.ConnectPurposePerUser, callerID, note)
+	} else {
+		conn, err := p.SharedConnection(ctx, server)
+		if err != nil {
+			return mcp.NewToolResultErrorFromErr("connections.link", err), nil
+		}
+		if conn == nil {
+			return mcp.NewToolResultErrorf("%s does not use an OAuth sign-in (nothing to connect)", server), nil
+		}
+		v.State, v.Account = sharedState(conn)
+		switch {
+		case !admin:
+			return mcp.NewToolResultErrorf("%s uses one shared account, and only an admin can sign it in: %s. Nothing to open.", server, g.askAdminNote(ctx, server)), nil
+		case !conn.CanAuthorize:
+			return mcp.NewToolResultErrorf("%s uses a pasted token; set a new one in the dashboard (Servers → Auth). Nothing to open.", server), nil
+		case v.State == connStateConnected:
+			// The org-wide account is never replaced through a link: a
+			// link can be forwarded, and whoever opens it would bind the
+			// account everyone's agents use.
+			return mcp.NewToolResultErrorf("%s is already signed in%s; nothing to do. Switching the shared account is done by an admin in the dashboard (Servers → Auth).",
+				server, accountSuffix(v.Account)), nil
+		}
+		g.fillLink(ctx, &v, uid, server, oauth.ConnectPurposeShared, callerID, sharedSignInAs(conn))
+	}
+	if v.ConnectLink == "" {
+		return mcp.NewToolResultErrorf("no connect link for %s: %s", server, v.Note), nil
+	}
+	text := fmt.Sprintf("%s (%s, %s): connect link (one-time, %d minutes): %s — %s.\n\n%s",
+		v.Server, v.Mode, v.State, v.LinkExpiresIn/60, v.ConnectLink, v.Note, connectGuidance)
+	res := mcp.NewToolResultText(text)
+	res.StructuredContent = map[string]any{"server": v, "guidance": connectGuidance}
+	return res, nil
+}
+
+// accountSuffix is " as <account>" when the account is known.
+func accountSuffix(account string) string {
+	if account == "" {
+		return ""
+	}
+	return " as " + account
+}
+
+// askAdminNote tells a member's agent who can sign a shared server in.
+func (g *Gateway) askAdminNote(ctx context.Context, upstream string) string {
+	emails := g.adminEmails(ctx)
+	if len(emails) == 0 {
+		return fmt.Sprintf("%s needs an admin to sign it in; ask a toolyard admin", upstream)
+	}
+	return fmt.Sprintf("%s needs an admin to sign it in; ask an admin (%s)", upstream, strings.Join(emails, ", "))
+}
+
+func (g *Gateway) adminEmails(ctx context.Context) []string {
+	g.mu.RLock()
+	d := g.directory
+	g.mu.RUnlock()
+	if d == nil {
+		return nil
+	}
+	emails, err := d.AdminEmails(ctx)
+	if err != nil {
+		return nil
+	}
+	return emails
+}
+
+// connectLink mints a one-time connect link for uid on upstream. It needs
+// the provider and the public URL; the error says which is missing in
+// words the agent can pass on.
+func (g *Gateway) connectLink(ctx context.Context, uid, upstream, purpose, callerID string) (string, error) {
+	p := g.connectProvider()
+	if p == nil {
+		return "", errors.New("connect links are not available on this gateway; connect from the toolyard dashboard")
+	}
+	if !connectLinksAllowed(ctx) {
+		return "", errors.New("connect links are not handed out on a tool run made with an operator token; ask from your own agent, or connect from the toolyard dashboard")
+	}
+	base := strings.TrimRight(g.publicURL, "/")
+	if base == "" {
+		return "", errors.New("toolyard has no public URL, so it cannot make a connect link; connect from the toolyard dashboard")
+	}
+	ticket, err := p.IssueConnectTicket(ctx, uid, upstream, purpose, callerID)
+	if err != nil {
+		return "", fmt.Errorf("could not make a connect link: %w", err)
+	}
+	_ = g.audit.Write(ctx, audit.Event{
+		EventType:     EventConnectLinkIssued,
+		AgentID:       callerID,
+		UpstreamName:  upstream,
+		ResultSummary: purpose + " connect link for " + upstream,
+		Raiser:        actor.Raiser{OwnerUserID: uid},
+	})
+	return base + oauth.ConnectLinkPath + ticket, nil
+}
+
+// perUserConnectMessage words the refusal of a per_user call whose owner
+// is not signed in (or whose sign-in cannot be used), with a fresh connect
+// link when one can be made; without one it falls back to the dashboard's
+// My connections page, as before.
+func (g *Gateway) perUserConnectMessage(ctx context.Context, upstream, uid, callerID string, cause error) string {
+	link, lerr := g.connectLink(ctx, uid, upstream, oauth.ConnectPurposePerUser, callerID)
+	if lerr != nil {
+		if errors.Is(cause, ErrUserSignInUnusable) {
+			return fmt.Sprintf("%s runs as each person's own account, and the sign-in of the person who owns this agent could not be used right now (%v). "+
+				"If this keeps happening, open %s and reconnect %s. The call was not made.", upstream, cause, g.connectionsURL(), upstream)
+		}
+		return fmt.Sprintf("%s runs as each person's own account, and the person who owns this agent has not connected theirs yet. "+
+			"Open %s, connect %s, then retry. The call was not made.", upstream, g.connectionsURL(), upstream)
+	}
+	minutes := int(oauth.ConnectTicketTTL.Minutes())
+	switch {
+	case errors.Is(cause, ErrUserSignInUnusable):
+		return fmt.Sprintf("%s runs as you, and your sign-in could not be used right now (%v). "+
+			"Open this link to sign in again (one-time, %d minutes): %s — then ask me to retry. Nothing was run.", upstream, cause, minutes, link)
+	case g.perUserNeedsReauth(ctx, upstream, uid):
+		return fmt.Sprintf("%s runs as you, and your sign-in to it has expired. "+
+			"Open this link to sign in again (one-time, %d minutes): %s — then ask me to retry. Nothing was run.", upstream, minutes, link)
+	}
+	return fmt.Sprintf("%s runs as you and isn't connected yet. "+
+		"Open this link to connect it (one-time, %d minutes): %s — then ask me to retry. Nothing was run.", upstream, minutes, link)
+}
+
+// perUserNeedsReauth reports whether uid's row on upstream says a new
+// sign-in is needed (as opposed to never having connected).
+func (g *Gateway) perUserNeedsReauth(ctx context.Context, upstream, uid string) bool {
+	p := g.connectProvider()
+	if p == nil {
+		return false
+	}
+	conn, err := p.UserConnectionOf(ctx, upstream, uid)
+	if err != nil || conn == nil {
+		return false
+	}
+	state, _ := perUserState(conn)
+	return state == connStateNeedsReauth
+}
+
+// refuseSharedSignIn is the terminal outcome of a call to a shared OAuth
+// server that has no usable token: before a dial, when the connection is
+// down, the request would carry no Authorization at all and the token row
+// says its sign-in died; or after a call, when the upstream answered 401
+// (cause). nil means "not that case, carry on": the server is not an OAuth
+// server, links are not wired, or the connection is live and can answer
+// for itself. The audit row says why, and the agent gets a link (an admin
+// owner) or the admins to ask (a member).
+func (g *Gateway) refuseSharedSignIn(ctx context.Context, u *upstream, entry toolEntry, agentID, reason, approvalID string,
+	cause error, ev *metrics.Event) *mcp.CallToolResult {
+	p := g.connectProvider()
+	if p == nil {
+		return nil
+	}
+	if cause == nil {
+		// Before the dial only. A live connection costs nothing extra: a
+		// dead token comes back as 401 and lands here with a cause. A
+		// connection about to be dialled is looked at only when the
+		// request would go out with no Authorization at all (a cached
+		// bearer, a static key or a PAT proceeds as it always did), and
+		// is refused only when a token row says its sign-in died; a
+		// server never signed in, or a row that says active with no
+		// bearer in the cache, is left to the dial, whose 401 says the
+		// same thing.
+		if !u.suspended() || u.cfg.HeaderFunc == nil || hasAuthorization(u.cfg.HeaderFunc(ctx)) {
+			return nil
+		}
+	}
+	conn, err := p.SharedConnection(ctx, entry.upstream)
+	if err != nil || conn == nil {
+		return nil
+	}
+	if cause == nil && (!conn.HasToken || conn.Usable()) {
+		return nil
+	}
+	uid, _ := g.ownerUser(ctx, agentID)
+	msg := g.sharedConnectMessage(ctx, entry.upstream, uid, agentID, conn, cause)
+	summary := "shared_signin: " + sharedWhy(conn, cause)
+	if cause != nil {
+		summary += ": " + cause.Error()
+	}
+	_ = g.audit.Write(ctx, audit.Event{
+		EventType:     audit.EventCallFailed,
+		AgentID:       agentID,
+		UpstreamName:  entry.upstream,
+		ToolName:      entry.tool.Name,
+		Reason:        reason,
+		ApprovalID:    approvalID,
+		ResultSummary: summary,
+		Raiser:        actor.Raiser{OwnerUserID: uid},
+	})
+	ev.Outcome = metrics.OutcomeError
+	ev.ErrorClass = "shared_signin"
+	return mcp.NewToolResultError(msg)
+}
+
+// sharedWhy is the short reason for the audit row and the message: what
+// the token row says first, the upstream's 401 when the row looked fine.
+func sharedWhy(conn *oauth.SharedConnection, cause error) string {
+	switch {
+	case !conn.HasToken:
+		return "it was never signed in"
+	case conn.State == oauth.StateNeedsReauth:
+		return "its sign-in needs to be renewed"
+	case cause != nil:
+		return "the upstream rejected its token (401)"
+	}
+	return "its token is not usable (" + conn.State + ")"
+}
+
+// sharedConnectMessage words the refusal for the agent: an admin owner
+// gets a link (and the account to sign in as, when known); a member is
+// told which admins can do it.
+func (g *Gateway) sharedConnectMessage(ctx context.Context, upstream, uid, callerID string, conn *oauth.SharedConnection, cause error) string {
+	why := sharedWhy(conn, cause)
+	admin := uid != "" && g.scopeFor(ctx, callerID).All
+	if !admin {
+		return fmt.Sprintf("%s uses one shared account and %s; %s, then ask me to retry. Nothing was run.",
+			upstream, why, g.askAdminNote(ctx, upstream))
+	}
+	if !conn.CanAuthorize {
+		return fmt.Sprintf("%s uses a pasted token and %s. Set a new token in the dashboard (Servers → Auth), then ask me to retry. Nothing was run.", upstream, why)
+	}
+	link, err := g.connectLink(ctx, uid, upstream, oauth.ConnectPurposeShared, callerID)
+	if err != nil {
+		return fmt.Sprintf("%s uses one shared account and %s. Sign it in from the dashboard (Servers → Auth), then ask me to retry. Nothing was run.", upstream, why)
+	}
+	as := ""
+	if conn.AccountLabel != "" {
+		as = fmt.Sprintf(" Sign in as %s.", conn.AccountLabel)
+	}
+	return fmt.Sprintf("%s uses one shared account and %s. You're an admin: open this link to sign it in (one-time, %d minutes): %s —%s then ask me to retry. Nothing was run.",
+		upstream, why, int(oauth.ConnectTicketTTL.Minutes()), link, as)
+}
+
+// hasAuthorization reports whether the headers carry an Authorization
+// value, in any letter case.
+func hasAuthorization(h map[string]string) bool {
+	for k, v := range h {
+		if strings.EqualFold(k, "Authorization") && v != "" {
+			return true
+		}
+	}
+	return false
+}

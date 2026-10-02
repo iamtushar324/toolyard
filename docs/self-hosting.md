@@ -124,6 +124,12 @@ makes goes through the normal pipeline (access, policy, approvals, identity
 forwarding, audit) under via `code_mode`, so a held or denied call aborts the
 script with the gateway's answer. Names that are not Starlark identifiers are
 bound under a sanitised one (`bk-core` becomes `bk_core`; the stubs say so).
+toolyard's own tools (inbox, memory, events, session, the `tools.*` helpers,
+and the access tools) are one server, `toolyard`, called as
+`toolyard.<group>_<name>(...)`; see
+[guidelines/access-tools.md](guidelines/access-tools.md), which also explains
+what an agent may change about tool policies (into ask, or between allow and
+deny; never out of ask) and who may change them.
 
 ### The script worker
 
@@ -328,10 +334,11 @@ in the server environment; a key saved through the dashboard takes precedence.
 
 Set a **Voice ID** from your ElevenLabs account, or leave it blank for George
 (`JBFqnCBsd6RMkjVDRZzb`). **Speech model** defaults to `eleven_multilingual_v2`;
-`ELEVENLABS_TTS_MODEL` supplies a server default. Enable **Record new inbox voice
-notes on the server** to send new voice-note scripts to ElevenLabs. Synthesis
-uses your account credits and returns MP3 audio, which Toolyard stores once for
-playback on every device. Provider, key and voice changes apply without restart.
+`ELEVENLABS_TTS_MODEL` supplies a server default. Enable **Generate voice notes
+only when I click Listen** to send a script to ElevenLabs on its first Listen
+click. Synthesis uses your account credits and returns MP3 audio, which Toolyard
+stores for playback on every device. Provider, key and voice changes apply
+without restart.
 Existing recordings are retained. Failed, unavailable or quota-limited synthesis
 falls back to browser speech, with a timeline note for failed attempts. It never
 automatically sends a script to another cloud provider. The existing Gemini
@@ -352,3 +359,72 @@ share one generation. In-flight generation finishes and caches even if the brows
 leaves the page. Agent and operator tokens cannot trigger this action.
 Free ElevenLabs accounts cannot use shared library voices through the API; use an
 included voice such as Sarah (`EXAVITQu4vr4xnSDxMaL`) or resolve the account plan.
+
+### Connecting bkt3 (T3 Code)
+
+bkt3 signs people in through the same Clerk instance and organisation, and
+can connect each of them to toolyard without a copy-pasted token. Its
+server posts a fresh Clerk session token that its browser minted (so the
+token's `azp` is the bkt3 origin) and gets back that person's agent token,
+which it then sends as `Authorization: Bearer` on `/mcp`:
+
+```http
+POST /v1/connect/t3
+Content-Type: application/json
+
+{"token": "<Clerk session JWT>"}
+```
+
+```json
+{"token": "ag_….…", "email": "ada@example.com", "agent_id": "ag_…", "user_id": "u_…"}
+```
+
+Turn it on by listing bkt3's origins (Clerk sign-in must be on):
+
+```bash
+./toolyard serve -public-url https://toolyard.example.com \
+  -connect-azp https://stagebkt3.dev.beknown.live
+```
+
+- Comma-separated `https` origins (plain `http` only for `localhost`,
+  `127.0.0.1` or `::1`); compared lowercase without a trailing slash. Empty
+  (the default) leaves the endpoint off: `404 {"error":"connect_disabled"}`.
+  The dashboard's own origin is refused at startup, and the two flows stay
+  apart: a bkt3 token never opens a dashboard session, and a token minted
+  for the dashboard never connects.
+- It is a server-to-server call: no cookie, Origin or `X-Requested-With`
+  is needed (the Clerk token is the credential), but the body must be sent
+  as `Content-Type: application/json`.
+- Each call checks the token (signature, expiry, issuer, `azp`) and that
+  it is a fresh Clerk session token: it carries a `sid`, was issued
+  (`iat`) at most 2 minutes ago and not in the future (10 s clock-skew
+  leeway either way), and has no `aud` claim (JWT templates do). bkt3
+  should mint a token right before each call. Then it checks the
+  organisation membership, creates or refreshes the person's toolyard user
+  exactly as a Google sign-in does, issues their Beknown identity key if
+  they never had one (never rotating or replacing one: a person whose key
+  an admin revoked stays without a key, `identity_key=missing` in the
+  audit row, until an admin issues a new one), and creates their one
+  `T3 Code (bkt3)` agent or rotates its token. The previous token stops
+  working on `/mcp` at once, so bkt3 must keep only the latest.
+- Errors are `{"error":"<code>"}`: `400 bad_request`, `401 invalid_token`,
+  `403 not_org_member`, `403 user_disabled` (blocked in toolyard),
+  `403 agent_disabled` (the person disabled their `T3 Code (bkt3)` agent;
+  re-enable it on the Agents page), `429 rate_limited` (per client IP and
+  per person), `503 clerk_unavailable` (retry later).
+- Follow-up, not built: a shared secret between bkt3's server and
+  toolyard (for example an `Authorization` header checked alongside the
+  Clerk token), so a session token lifted from a bkt3 browser within its
+  2-minute window can't be swapped for an agent token by anyone else.
+- Every attempt is one `connect.t3` audit row (outcome `created` or
+  `rotated`, or `denied` with the code) naming the person, the `azp`
+  origin and the agent. No token is ever logged or audited.
+
+The identity key it issues is registered in each registry upstream as
+`connect:t3`, not as an admin, so in production prime-service's actor
+registry will usually refuse it: the key shows a registry error on the
+**Users** page. Registering a new person's key there stays a human step,
+as it is for keys an admin issues: an admin opens the person on the
+**Users** page and presses **Retry registration**
+(`POST /v1/users/{id}/identity-key/register`, which runs as that admin),
+or registers the fingerprint by hand.

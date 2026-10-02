@@ -22,8 +22,17 @@ import (
 	"github.com/tusharbhardwaj/toolyard/internal/store"
 )
 
-// alwaysOn groups stay available to every active caller.
-var alwaysOn = map[string]bool{"tools": true, "inbox": true, "session": true}
+// alwaysOn groups stay available to every active caller: the meta-tools,
+// the inbox/session tools an agent uses to ask for access, the
+// self-scoped access tools (policies, servers, audit, access) that tell an
+// agent what it may do and why (the ones that change anything check the
+// owner's role themselves), and the connections tools it finds its owner's
+// sign-in links with.
+var alwaysOn = map[string]bool{
+	"tools": true, "inbox": true, "session": true,
+	"policies": true, "servers": true, "audit": true, "access": true,
+	"connections": true,
+}
 
 // BuiltinGroups are the built-in data tools an admin grants like servers.
 // They are shared across all agents, so members don't get them by default.
@@ -36,6 +45,16 @@ var ErrInvalidGroup = errors.New("invalid server name")
 
 // AlwaysOn reports whether group is available to every active caller.
 func AlwaysOn(group string) bool { return alwaysOn[group] }
+
+// AlwaysOnGroups lists the always-on groups, sorted.
+func AlwaysOnGroups() []string {
+	out := make([]string, 0, len(alwaysOn))
+	for g := range alwaysOn {
+		out = append(out, g)
+	}
+	sort.Strings(out)
+	return out
+}
 
 // IsBuiltinGroup reports whether group is one of BuiltinGroups.
 func IsBuiltinGroup(group string) bool {
@@ -141,6 +160,21 @@ func (s *Service) ScopeFor(ctx context.Context, callerID string) Scope {
 		return s.UserScope(ctx, owner)
 	}
 	return Scope{Denied: true}
+}
+
+// OwnerUser implements gateway.OwnerResolver: the dashboard user behind a
+// caller id, "" when there is none (an unknown agent, a local anonymous
+// caller). Agents resolve through the same short owner cache as ScopeFor.
+func (s *Service) OwnerUser(ctx context.Context, callerID string) (string, error) {
+	switch {
+	case strings.HasPrefix(callerID, "dashboard:"):
+		return strings.TrimPrefix(callerID, "dashboard:"), nil
+	case strings.HasPrefix(callerID, "voice:"):
+		return strings.TrimPrefix(callerID, "voice:"), nil
+	case strings.HasPrefix(callerID, "ag_"):
+		return s.agentOwner(ctx, callerID)
+	}
+	return "", nil
 }
 
 // UserScope returns a dashboard user's scope. Lookup errors fail closed.

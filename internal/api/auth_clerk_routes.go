@@ -117,13 +117,7 @@ func (s *Server) authClerkSession(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusForbidden, "not_org_member")
 		return
 	}
-	u, err := s.identity.UpsertClerkUser(ctx, identity.ClerkProfile{
-		ClerkUserID: claims.Subject,
-		Email:       member.Email,
-		DisplayName: clerkDisplayName(member),
-		AvatarURL:   member.ImageURL,
-		OrgRole:     member.Role,
-	}, s.ownerEmail)
+	u, err := s.upsertClerkMember(ctx, claims.Subject, member)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
@@ -145,6 +139,19 @@ func (s *Server) authClerkSession(w http.ResponseWriter, r *http.Request) {
 		EventType: audit.EventUserLogin, AgentID: "user:" + u.ID, Reason: "clerk", ResultSummary: u.Username,
 	})
 	writeJSON(w, http.StatusOK, u)
+}
+
+// upsertClerkMember records a verified Clerk user who is a member of the
+// organisation as a local user (profile and org role from the membership),
+// the one way every Clerk-authenticated route creates or refreshes users.
+func (s *Server) upsertClerkMember(ctx context.Context, clerkUserID string, member clerk.Member) (*identity.User, error) {
+	return s.identity.UpsertClerkUser(ctx, identity.ClerkProfile{
+		ClerkUserID: clerkUserID,
+		Email:       member.Email,
+		DisplayName: clerkDisplayName(member),
+		AvatarURL:   member.ImageURL,
+		OrgRole:     member.Role,
+	}, s.ownerEmail)
 }
 
 // clerkDisplayName is "First Last", falling back to the email when Clerk

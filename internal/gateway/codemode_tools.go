@@ -78,7 +78,8 @@ func (g *Gateway) codeModeTools() []toolEntry {
 			"Workflow: listToolFiles -> readToolFile -> (optional) getToolDocs -> executeToolCode. " +
 			"In code, access tools via: server_name.tool_name(param=value). " +
 			"CALL THIS TOOL FIRST whenever a server, tool or capability is not visible in your current tool list; do not tell the user something is unavailable until you have called listToolFiles and confirmed it is absent. " +
-			"toolyard code mode: _reason is optional here; every call your code makes still goes through toolyard's access, policy and approval rules.",
+			"toolyard code mode: _reason is optional here; every call your code makes still goes through toolyard's access, policy and approval rules. " +
+			"toolyard's own tools (inbox.*, memory.*, events.*, session.*, tools.*, policies.*, servers.*, audit.*, access.*) are one server, toolyard, called as toolyard.<group>_<name>(...), e.g. toolyard.inbox_request(...) or toolyard.policies_explain(tool=\"github.create_issue\").",
 		InputSchema: optional(map[string]any{}),
 	}
 	read := mcp.Tool{
@@ -222,10 +223,38 @@ func intArg(args map[string]any, key string) *int {
 // catalog, and RouteCall.
 type codeModeCaller struct{ g *Gateway }
 
-// Tools lists what the ctx caller may use, as code mode sees it: grouped
-// by server key (the upstream name, or a built-in group such as memory),
-// without the meta-tool group, and with the gateway's injected schema
-// fields removed so stubs show the tool's own parameters.
+// toolyardServer is the one code-mode server every internal toolyard tool
+// is bound under, as toolyard.<group>_<name>: toolyard.inbox_request,
+// toolyard.memory_get, toolyard.tools_poll_approval, toolyard.policies_set.
+// Upstream servers keep their own key (BkCoreServices.get_client). The
+// binding is derived from the registered entries, so an internal tool
+// added later appears without a change here.
+const toolyardServer = "toolyard"
+
+// internalEntry reports whether e is a toolyard tool rather than an
+// upstream's: it is registered under one of the gateway's reserved
+// synthetic upstreams. The fixture echo tool is left out (it stands in
+// for an upstream in tests).
+func internalEntry(e toolEntry) bool {
+	return e.upstream != "fixture" && reservedUpstreamName(e.upstream)
+}
+
+// isCodeModeTool reports whether name is one of the four code-mode tools.
+func isCodeModeTool(name string) bool {
+	for _, n := range CodeModeToolNames {
+		if n == name {
+			return true
+		}
+	}
+	return false
+}
+
+// Tools lists what the ctx caller may use, as code mode sees it: upstream
+// tools under their server key (the upstream name), every internal tool
+// under toolyardServer as <group>_<name>, and the gateway's injected
+// schema fields removed so stubs show the tool's own parameters. The
+// code-mode tools themselves are the one thing a script cannot reach:
+// they would only recurse.
 func (c codeModeCaller) Tools(ctx context.Context) []codemode.Tool {
 	g := c.g
 	scope := g.scopeFor(ctx, agentIDFromContext(ctx))
@@ -233,14 +262,18 @@ func (c codeModeCaller) Tools(ctx context.Context) []codemode.Tool {
 	defer g.mu.RUnlock()
 	out := make([]codemode.Tool, 0, len(g.tools))
 	for _, e := range g.tools {
-		group := access.GroupOf(e.upstream, e.tool.Name)
-		if group == codeModeGroup || !scope.AllowsTool(e.upstream, e.tool.Name) {
+		if isCodeModeTool(e.tool.Name) || !scope.AllowsTool(e.upstream, e.tool.Name) {
 			continue
+		}
+		group := access.GroupOf(e.upstream, e.tool.Name)
+		server, name := group, strings.TrimPrefix(e.tool.Name, group+".")
+		if internalEntry(e) {
+			server, name = toolyardServer, group+"_"+name
 		}
 		props, required := codeModeSchema(e)
 		out = append(out, codemode.Tool{
-			Server:      group,
-			Name:        strings.TrimPrefix(e.tool.Name, group+"."),
+			Server:      server,
+			Name:        name,
 			Target:      e.tool.Name,
 			Description: strings.TrimPrefix(e.tool.Description, descriptionBanner),
 			Properties:  props,
