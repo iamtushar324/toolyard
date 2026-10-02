@@ -3,6 +3,7 @@ package main
 import (
 	"errors"
 	"fmt"
+	"net"
 	"net/url"
 	"strings"
 
@@ -11,8 +12,9 @@ import (
 
 // connectAZP parses -connect-azp: the comma-separated browser origins of
 // bkt3 (our T3 Code fork) whose Clerk session tokens POST /v1/connect/t3
-// swaps for the person's agent token. Each must be an http(s) origin with
-// no path, query or credentials; they come back normalised the way the
+// swaps for the person's agent token. Each must be an https origin with
+// no path, query or credentials (plain http only on loopback, for local
+// testing); they come back normalised the way the
 // clerk package compares azp (lowercase, no trailing slash). Empty means
 // the endpoint is off. Set without Clerk sign-in, or naming the
 // dashboard's own origin (-public-url), is a startup error: dashboard
@@ -29,6 +31,9 @@ func connectAZP(raw, publicURL string, clerkOn bool) ([]string, error) {
 		if err != nil || (u.Scheme != "https" && u.Scheme != "http") || u.Host == "" ||
 			strings.TrimRight(u.Path, "/") != "" || u.RawQuery != "" || u.Fragment != "" || u.User != nil {
 			return nil, fmt.Errorf("-connect-azp: %q is not an origin like https://bkt3.example.com", part)
+		}
+		if strings.EqualFold(u.Scheme, "http") && !isLoopbackHost(u.Hostname()) {
+			return nil, fmt.Errorf("-connect-azp: %q must be https (plain http is allowed only for localhost, 127.0.0.1 or ::1)", part)
 		}
 		o := clerk.NormalizeOrigin(u.Scheme + "://" + u.Host)
 		if !seen[o] {
@@ -49,4 +54,13 @@ func connectAZP(raw, publicURL string, clerkOn bool) ([]string, error) {
 		}
 	}
 	return out, nil
+}
+
+// isLoopbackHost: localhost, or a loopback IP (127.0.0.0/8, ::1).
+func isLoopbackHost(host string) bool {
+	if strings.EqualFold(host, "localhost") {
+		return true
+	}
+	ip := net.ParseIP(host)
+	return ip != nil && ip.IsLoopback()
 }

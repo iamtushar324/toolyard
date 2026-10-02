@@ -317,7 +317,8 @@ Turn it on by listing bkt3's origins (Clerk sign-in must be on):
   -connect-azp https://stagebkt3.dev.beknown.live
 ```
 
-- Comma-separated; compared lowercase without a trailing slash. Empty
+- Comma-separated `https` origins (plain `http` only for `localhost`,
+  `127.0.0.1` or `::1`); compared lowercase without a trailing slash. Empty
   (the default) leaves the endpoint off: `404 {"error":"connect_disabled"}`.
   The dashboard's own origin is refused at startup, and the two flows stay
   apart: a bkt3 token never opens a dashboard session, and a token minted
