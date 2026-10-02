@@ -165,7 +165,12 @@ type Gateway struct {
 	// next call). poolMu serializes admission decisions so two
 	// concurrent resumes can't both think they have a slot.
 	maxLiveUpstreams int
-	poolMu           sync.Mutex
+	// maxLivePerUser is the same cap for the per-user connections of
+	// per_user upstreams, which form their own pool: people signing in
+	// never evict a shared (often stdio) server, and a shared server
+	// never evicts a person's session. 0 = unbounded.
+	maxLivePerUser int
+	poolMu         sync.Mutex
 
 	// inFlight is the live count of routeEntry calls currently executing
 	// (not yet returned). Surfaced via /v1/health and the dashboard so a
@@ -177,9 +182,18 @@ type Gateway struct {
 	clientCache
 	sessionCache
 
+	// owners resolves a caller to its dashboard user for per_user
+	// upstreams; publicURL is where their My connections page lives.
+	owners    OwnerResolver
+	publicURL string
+
 	mu        sync.RWMutex
 	tools     map[string]toolEntry
 	upstreams map[string]*upstream
+	// perUser holds the per_user upstreams (peruser.go): one group per
+	// upstream name, one connection per user inside it. A name is in
+	// either upstreams or perUser, never both.
+	perUser map[string]*perUserGroup
 }
 
 // VisibilityProvider gives the gateway a way to compute, per request, which
@@ -243,6 +257,14 @@ type Options struct {
 	// upstreams whose UpstreamConfig sets IdentityHeader. nil refuses every
 	// call to such an upstream.
 	Identity IdentityResolver
+	// Owners, when set, resolves a caller to its dashboard user for
+	// per_user upstreams (peruser.go). Without it the user the ingress put
+	// on the raiser is used.
+	Owners OwnerResolver
+	// PublicURL is the dashboard's public origin, used to point an agent
+	// at the My connections page when its owner has not connected a
+	// per_user upstream. Optional.
+	PublicURL string
 }
 
 // UsageRecorder is satisfied by *internal/usage.Service. The gateway only
@@ -303,8 +325,11 @@ func New(opts Options) *Gateway {
 		upstreamCallTimeout: opts.UpstreamCallTimeout,
 		access:              opts.Access,
 		identity:            opts.Identity,
+		owners:              opts.Owners,
+		publicURL:           opts.PublicURL,
 		tools:               map[string]toolEntry{},
 		upstreams:           map[string]*upstream{},
+		perUser:             map[string]*perUserGroup{},
 	}
 	serverOpts := []server.ServerOption{
 		server.WithToolCapabilities(true),
@@ -530,6 +555,9 @@ func (g *Gateway) AddUpstream(ctx context.Context, cfg UpstreamConfig) error {
 	if reservedUpstreamName(cfg.Name) {
 		return fmt.Errorf("name %q is reserved", cfg.Name)
 	}
+	if cfg.PerUser {
+		return g.addPerUserUpstream(ctx, cfg)
+	}
 	// Pre-allocate a pool slot: if the live cap is full this suspends the
 	// LRU upstream first so the new one doesn't push us over.
 	probe := &upstream{cfg: cfg, pool: g}
@@ -547,48 +575,78 @@ func (g *Gateway) AddUpstream(ctx context.Context, cfg UpstreamConfig) error {
 	g.mu.Lock()
 	g.upstreams[cfg.Name] = u
 	g.mu.Unlock()
-
-	upstreamRef := u
-	for _, t := range tools {
-		original := t.Name
-		wrapped, field := wrapSchema(t)
-		wrapped.Name = cfg.Name + "." + original
-		entry := toolEntry{
-			tool:         wrapped,
-			upstream:     cfg.Name,
-			originalName: original,
-			reasonField:  field,
-			handle: func(name string) directHandler {
-				return func(ctx context.Context, args map[string]any) (*mcp.CallToolResult, error) {
-					return upstreamRef.callTool(ctx, name, args)
-				}
-			}(original),
-		}
-		g.registerEntry(entry)
-	}
+	g.registerUpstreamTools(cfg.Name, tools, u)
 	return nil
 }
 
-// Close shuts down all upstream connections.
-func (g *Gateway) Close() error {
-	g.mu.Lock()
-	defer g.mu.Unlock()
+// registerUpstreamTools wraps an upstream's tools into the catalog under
+// "<name>.<tool>". With ref set, each tool's handler calls that
+// connection; with ref nil (a per_user upstream) the handler is left
+// empty and dispatch picks the caller's connection.
+func (g *Gateway) registerUpstreamTools(name string, tools []mcp.Tool, ref *upstream) {
+	for _, t := range tools {
+		original := t.Name
+		wrapped, field := wrapSchema(t)
+		wrapped.Name = name + "." + original
+		entry := toolEntry{
+			tool:         wrapped,
+			upstream:     name,
+			originalName: original,
+			reasonField:  field,
+		}
+		if ref != nil {
+			entry.handle = func(name string) directHandler {
+				return func(ctx context.Context, args map[string]any) (*mcp.CallToolResult, error) {
+					return ref.callTool(ctx, name, args)
+				}
+			}(original)
+		}
+		g.registerEntry(entry)
+	}
+}
+
+// allUpstreams snapshots every connection in the pool: the shared
+// upstreams and each per_user upstream's per-person connections. Idle
+// sweeps, the live cap and the health counters treat them alike.
+func (g *Gateway) allUpstreams() []*upstream {
+	g.mu.RLock()
+	out := make([]*upstream, 0, len(g.upstreams))
 	for _, u := range g.upstreams {
-		_ = u.close()
+		out = append(out, u)
+	}
+	groups := make([]*perUserGroup, 0, len(g.perUser))
+	for _, pu := range g.perUser {
+		groups = append(groups, pu)
+	}
+	g.mu.RUnlock()
+	for _, pu := range groups {
+		out = append(out, pu.all()...)
+	}
+	return out
+}
+
+// Close shuts down all upstream connections for good: each is retired, so
+// a dial still in flight closes what it opens instead of keeping it.
+func (g *Gateway) Close() error {
+	for _, u := range g.allUpstreams() {
+		u.retire()
 	}
 	return nil
 }
 
 // RemoveUpstream disconnects an upstream and removes all of its registered
-// tools from the gateway catalog (and from the underlying MCP server).
+// tools from the gateway catalog (and from the underlying MCP server). For
+// a per_user upstream every person's connection is closed.
 func (g *Gateway) RemoveUpstream(name string) error {
 	g.mu.Lock()
 	u, ok := g.upstreams[name]
-	if !ok {
+	pu, okPU := g.perUser[name]
+	if !ok && !okPU {
 		g.mu.Unlock()
 		return ErrUpstreamNotFound
 	}
 	delete(g.upstreams, name)
+	delete(g.perUser, name)
 	// Collect the wrapped tool names to remove.
 	var toRemove []string
 	for k, e := range g.tools {
@@ -602,7 +660,15 @@ func (g *Gateway) RemoveUpstream(name string) error {
 	g.mu.Unlock()
 
 	g.mcp.DeleteTools(toRemove...)
-	_ = u.close()
+	if u != nil {
+		// Retire, not just close: a resume dialling right now (an idle
+		// stdio server waking up) would otherwise install a client on an
+		// upstream nothing tracks any more.
+		u.retire()
+	}
+	if pu != nil {
+		pu.closeAll()
+	}
 	return nil
 }
 
@@ -618,12 +684,7 @@ func (g *Gateway) RemoveUpstream(name string) error {
 func (g *Gateway) SweepIdleStdioUpstreams(idleAfter time.Duration) int {
 	// Snapshot the upstream slice under a short read-lock to avoid holding
 	// g.mu while performing the (potentially slow) suspend.
-	g.mu.RLock()
-	candidates := make([]*upstream, 0, len(g.upstreams))
-	for _, u := range g.upstreams {
-		candidates = append(candidates, u)
-	}
-	g.mu.RUnlock()
+	candidates := g.allUpstreams()
 
 	count := 0
 	for _, u := range candidates {
@@ -631,7 +692,7 @@ func (g *Gateway) SweepIdleStdioUpstreams(idleAfter time.Duration) int {
 		if !u.suspended() && idle >= idleAfter {
 			u.suspend()
 			log.Printf("idle-kill: suspended %q (idle %s, transport=%s)",
-				u.cfg.Name, idle.Round(time.Second), u.cfg.Transport)
+				u.label(), idle.Round(time.Second), u.cfg.Transport)
 			count++
 		}
 	}
@@ -658,13 +719,41 @@ func (g *Gateway) MaxLiveUpstreams() int {
 	return g.maxLiveUpstreams
 }
 
+// SetMaxLivePerUser configures the cap on simultaneously-live per-user
+// connections (the per_user upstreams' pool). 0 = unbounded.
+func (g *Gateway) SetMaxLivePerUser(n int) {
+	if n < 0 {
+		n = 0
+	}
+	g.poolMu.Lock()
+	g.maxLivePerUser = n
+	g.poolMu.Unlock()
+}
+
+// MaxLivePerUser returns the per-user pool's cap (0 = unbounded).
+func (g *Gateway) MaxLivePerUser() int {
+	g.poolMu.Lock()
+	defer g.poolMu.Unlock()
+	return g.maxLivePerUser
+}
+
+// PerUserLiveCount returns how many per-user connections currently hold a
+// live transport. Surfaced via /v1/health.
+func (g *Gateway) PerUserLiveCount() int {
+	n := 0
+	for _, u := range g.allUpstreams() {
+		if u.userID != "" && !u.suspended() {
+			n++
+		}
+	}
+	return n
+}
+
 // LiveUpstreamCount returns how many upstreams currently hold a live
 // transport. Counterpart to SuspendedUpstreamCount.
 func (g *Gateway) LiveUpstreamCount() int {
-	g.mu.RLock()
-	defer g.mu.RUnlock()
 	n := 0
-	for _, u := range g.upstreams {
+	for _, u := range g.allUpstreams() {
 		if !u.suspended() {
 			n++
 		}
@@ -675,10 +764,8 @@ func (g *Gateway) LiveUpstreamCount() int {
 // SuspendedUpstreamCount returns how many upstreams are currently
 // idle-killed or LRU-evicted (catalog still served from cache).
 func (g *Gateway) SuspendedUpstreamCount() int {
-	g.mu.RLock()
-	defer g.mu.RUnlock()
 	n := 0
-	for _, u := range g.upstreams {
+	for _, u := range g.allUpstreams() {
 		if u.suspended() {
 			n++
 		}
@@ -691,10 +778,8 @@ func (g *Gateway) SuspendedUpstreamCount() int {
 // hasn't elapsed, so calls to them fail fast. Surfaced via /v1/health so
 // a wedged upstream is visible without reading logs.
 func (g *Gateway) UpstreamsInBackoff() int {
-	g.mu.RLock()
-	defer g.mu.RUnlock()
 	n := 0
-	for _, u := range g.upstreams {
+	for _, u := range g.allUpstreams() {
 		if u.inBackoff() {
 			n++
 		}
@@ -706,10 +791,8 @@ func (g *Gateway) UpstreamsInBackoff() int {
 // session and it was re-established under a tool call, summed over the
 // live catalog. Surfaced via /v1/health.
 func (g *Gateway) SessionRecoveries() int64 {
-	g.mu.RLock()
-	defer g.mu.RUnlock()
 	var n int64
-	for _, u := range g.upstreams {
+	for _, u := range g.allUpstreams() {
 		n += u.recoveries.Load()
 	}
 	return n
@@ -725,30 +808,34 @@ func (g *Gateway) acquireSlot(self *upstream) {
 	if victim != nil {
 		victim.suspend()
 		log.Printf("lru-evict: suspended %q to make room for %q (live=%d cap=%d)",
-			victim.cfg.Name, self.cfg.Name, live, limit)
+			victim.label(), self.label(), live, limit)
 	}
 }
 
 // pickEvictionCandidate returns the LRU upstream that should be suspended
 // to admit `self`, along with the observed live count and cap. Returns
-// (nil, _, _) when no eviction is needed (cap=0 or count<cap).
-// Separated from acquireSlot so unit tests can exercise the selection
-// without needing real mcp-go clients to .Close().
+// (nil, _, _) when no eviction is needed (cap=0 or count<cap). A per-user
+// connection (self.userID set) is admitted against the per-user pool and
+// its cap, a shared upstream against the shared pool: neither ever evicts
+// from the other. Separated from acquireSlot so unit tests can exercise
+// the selection without needing real mcp-go clients to .Close().
 func (g *Gateway) pickEvictionCandidate(self *upstream) (*upstream, int, int) {
+	perUser := self.userID != ""
 	g.poolMu.Lock()
 	limit := g.maxLiveUpstreams
+	if perUser {
+		limit = g.maxLivePerUser
+	}
 	g.poolMu.Unlock()
 	if limit <= 0 {
 		return nil, 0, 0
 	}
-	g.mu.RLock()
-	candidates := make([]*upstream, 0, len(g.upstreams))
-	for _, u := range g.upstreams {
-		if u != self {
+	var candidates []*upstream
+	for _, u := range g.allUpstreams() {
+		if u != self && (u.userID != "") == perUser {
 			candidates = append(candidates, u)
 		}
 	}
-	g.mu.RUnlock()
 
 	var lru *upstream
 	live := 0
@@ -1468,19 +1555,44 @@ func (g *Gateway) dispatch(ctx context.Context, entry toolEntry, args map[string
 	agentID, reason, approvalID string, ev *metrics.Event) (*mcp.CallToolResult, error) {
 
 	// u is the live upstream behind this entry; nil for built-ins, the
-	// fixture and anything else that isn't in the pool.
+	// fixture and anything else that isn't in the pool. pu is set instead
+	// when the entry's upstream is per_user: the connection is the
+	// caller's own.
 	g.mu.RLock()
 	u := g.upstreams[entry.upstream]
+	pu := g.perUser[entry.upstream]
 	g.mu.RUnlock()
+	// asUser is the person whose account a per_user call runs as. The
+	// audit rows below carry it as the owner, so the trail says whose
+	// token did the work even when the ingress named nobody.
+	var asUser string
+	var cfg *UpstreamConfig
+	switch {
+	case u != nil:
+		cfg = &u.cfg
+	case pu != nil:
+		cfg = &pu.cfg
+	}
 	if entry.handle == nil {
 		// Upstream-backed tool — route through the upstream pool.
-		if u == nil {
+		switch {
+		case pu != nil:
+			// Per-user: the owner's connection or nothing. Never a shared
+			// token, never somebody else's.
+			handle, uid, err := g.perUserHandle(ctx, pu, entry, agentID)
+			if err != nil {
+				return g.refusePerUser(ctx, entry, agentID, reason, approvalID, uid, err, ev), nil
+			}
+			entry.handle = handle
+			asUser = uid
+		case u == nil:
 			ev.Outcome = metrics.OutcomeError
 			ev.ErrorClass = "upstream_not_connected"
 			return mcp.NewToolResultErrorf("upstream %q not connected", entry.upstream), nil
-		}
-		entry.handle = func(ctx context.Context, args map[string]any) (*mcp.CallToolResult, error) {
-			return u.callTool(ctx, entry.originalName, args)
+		default:
+			entry.handle = func(ctx context.Context, args map[string]any) (*mcp.CallToolResult, error) {
+				return u.callTool(ctx, entry.originalName, args)
+			}
 		}
 	}
 	upstreamStart := time.Now()
@@ -1497,7 +1609,7 @@ func (g *Gateway) dispatch(ctx context.Context, entry toolEntry, args map[string
 	// the one place the rule lives. The key travels on callCtx to the
 	// transport's per-request header function; only this tools/call sees
 	// it.
-	if u != nil && u.cfg.IdentityHeader != "" {
+	if cfg != nil && cfg.IdentityHeader != "" {
 		key, err := g.forwardKey(ctx, agentID)
 		if err != nil {
 			return g.refuseWithoutIdentity(ctx, entry, agentID, reason, approvalID, err, ev), nil
@@ -1524,6 +1636,7 @@ func (g *Gateway) dispatch(ctx context.Context, entry toolEntry, args map[string
 			Reason:        reason,
 			ApprovalID:    approvalID,
 			ResultSummary: err.Error(),
+			Raiser:        actor.Raiser{OwnerUserID: asUser},
 		})
 		ev.Outcome = metrics.OutcomeError
 		ev.ErrorClass = "upstream"
@@ -1537,6 +1650,7 @@ func (g *Gateway) dispatch(ctx context.Context, entry toolEntry, args map[string
 		Reason:        reason,
 		ApprovalID:    approvalID,
 		ResultSummary: summariseResult(res),
+		Raiser:        actor.Raiser{OwnerUserID: asUser},
 	})
 	if g.usage != nil && !res.IsError {
 		// We treat IsError=true (e.g., "key not found") as a logical

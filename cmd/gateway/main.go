@@ -256,6 +256,7 @@ func runServe(argv []string) error {
 	stdioIdleTimeout := fs.Duration("stdio-idle-timeout", 0, "DEPRECATED: alias for -upstream-idle-timeout. Kept for backwards compat.")
 	upstreamIdleTimeout := fs.Duration("upstream-idle-timeout", 0, "kill upstream MCP connections idle for this long; transparently re-dial on next call. 0 disables. Recommended: 15m. Covers both stdio (kills subprocess) and http (closes client). Reduces RSS + FDs when no agents are active.")
 	upstreamMaxLive := fs.Int("upstream-max-live", 8, "max simultaneously-live upstream connections. When the cap is hit, the least-recently-used upstream is suspended (catalog stays populated, transparently resumed on next call). 0 = unbounded.")
+	perUserMaxLive := fs.Int("per-user-max-live", 64, "max simultaneously-live per-person connections to servers where each person signs in (auth_mode per_user). Their own pool: they never evict a shared server and a shared server never evicts them. LRU-suspended past the cap, resumed on next call. 0 = unbounded.")
 	logLevel := fs.String("log-level", "info", "log level: debug | info | warn | error")
 	logFormat := fs.String("log-format", "json", "log format: json | text. Text is friendlier in a terminal; json is what journalctl + jq want.")
 	_ = fs.Parse(argv)
@@ -508,6 +509,8 @@ func runServe(argv []string) error {
 		UpstreamCallTimeout: *upstreamCallTimeout,
 		Access:              accessSvc,
 		Identity:            identityKeysSvc,
+		Owners:              accessSvc,
+		PublicURL:           *publicURL,
 	})
 	gw.RegisterBuiltins()
 	defer gw.Close()
@@ -700,6 +703,11 @@ func runServe(argv []string) error {
 		identityResolver{id: idSvc},
 	)
 	upstreamSvc.SetAuth(oauthSvc)
+	// Per-user sign-in: each person's bearer on their own connection, and
+	// a token the upstream or IdP rejects closes only that person's
+	// connection.
+	upstreamSvc.SetPerUserAuth(oauthSvc)
+	oauthSvc.SetUserReauthHook(upstreamSvc.DropUserConnection)
 	if err := oauthSvc.PrimeBearers(ctx); err != nil {
 		log.Printf("oauth: prime bearers: %v", err)
 	}
@@ -1221,8 +1229,10 @@ func runServe(argv []string) error {
 		}()
 	}
 	gw.SetMaxLiveUpstreams(*upstreamMaxLive)
+	gw.SetMaxLivePerUser(*perUserMaxLive)
 	rootLog.Info("upstream pool configured",
 		"max_live", *upstreamMaxLive,
+		"per_user_max_live", *perUserMaxLive,
 		"idle_timeout", idleTimeout.String())
 
 	go func() {

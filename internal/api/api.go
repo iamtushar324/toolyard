@@ -13,6 +13,10 @@
 //	PATCH /v1/users/{id}          admin: role / status / servers
 //	POST /v1/users/{id}/revoke-sessions
 //	GET  /v1/me/servers           groups the caller may use
+//	GET  /v1/me/connections       per_user servers the caller may connect, with state
+//	POST /v1/me/connections/{server}/begin   start the caller's own sign-in
+//	DELETE /v1/me/connections/{server}       drop the caller's token
+//	GET  /v1/servers/{name}/connections      admin: who has connected a per_user server
 //
 //	GET  /v1/agents
 //	POST /v1/agents/enroll        creates a code (op uses it on the agent)
@@ -310,6 +314,7 @@ func (s *Server) Routes(mux *http.ServeMux) {
 	mux.HandleFunc("/v1/users", s.usersList)
 	mux.HandleFunc("/v1/users/", s.usersItem)
 	mux.HandleFunc("/v1/me/servers", s.meServers)
+	s.connectionRoutes(mux)
 
 	mux.HandleFunc("/v1/agents", s.agentsCollection)
 	mux.HandleFunc("/v1/agents/enroll", s.agentsEnroll)
@@ -414,6 +419,9 @@ func (s *Server) health(w http.ResponseWriter, r *http.Request) {
 		"upstreams_idle":    s.gateway.SuspendedUpstreamCount(),
 		"upstreams_max":     s.gateway.MaxLiveUpstreams(),
 		"upstreams_backoff": s.gateway.UpstreamsInBackoff(),
+		// Per-user connections (per_user servers) have their own pool.
+		"upstreams_per_user_live": s.gateway.PerUserLiveCount(),
+		"upstreams_per_user_max":  s.gateway.MaxLivePerUser(),
 		// upstreams_recovered counts upstream MCP sessions re-established
 		// after the server dropped them (expiry, restart).
 		"upstreams_recovered": s.gateway.SessionRecoveries(),
@@ -1521,6 +1529,10 @@ func (s *Server) serversItem(w http.ResponseWriter, r *http.Request) {
 		if s.dispatchOAuth(w, r, name, subpath) {
 			return
 		}
+	}
+	if subpath == "connections" {
+		s.serversConnections(w, r, name)
+		return
 	}
 	if subpath == "convert-env" {
 		s.serversConvertEnv(w, r, name)

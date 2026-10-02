@@ -105,6 +105,9 @@ type TokenRecord struct {
 	State            string
 	LastError        string
 	IsPAT            bool
+	// AccountLabel names the account the token belongs to when the IdP
+	// said (the id_token email); empty otherwise. Display only.
+	AccountLabel string
 }
 
 // PendingRecord is one in-flight OAuth dance.
@@ -120,6 +123,16 @@ type PendingRecord struct {
 	VerificationURI string
 	ExpiresAt       time.Time
 	CreatedAt       time.Time
+	// PerUser marks a flow started from "My connections": the token goes
+	// to UserID's oauth_user_tokens row, and only that user's browser may
+	// complete it.
+	PerUser bool
+	// BrowserBound marks a callback flow started from a dashboard session:
+	// the API set a flow cookie on that browser, and the callback accepts
+	// the flow only from a browser that presents it (or a session for
+	// UserID). A flow started without a browser (operator token) is not
+	// bound.
+	BrowserBound bool
 }
 
 // EventBus is the minimum the OAuth service needs from the realtime hub.
@@ -150,16 +163,29 @@ type Service struct {
 
 	mu      sync.RWMutex
 	bearers map[string]*atomic.Value // upstream -> *atomic.Value holding string
+	// userBearers is the same cache for per-user tokens, keyed by
+	// userKey(upstream, userID).
+	userBearers map[string]*atomic.Value
 
 	// lastAttempt tracks the last time the refresher attempted a refresh
 	// for an upstream (success OR failure). Unlike last_refresh_at, which
 	// only advances on success, this lets backoff space out retries across
-	// an IdP outage instead of firing every tick.
+	// an IdP outage instead of firing every tick. Per-user tokens are keyed
+	// by userKey(upstream, userID), so each person backs off on their own.
 	lastAttempt map[string]time.Time
 
 	// reauthHook is invoked once per upstream when state flips to
 	// needs_reauth so the upstreams.Service can drop the dead connection.
 	reauthHook func(upstream string)
+	// userReauthHook is the per-user counterpart: that user's connection
+	// to the upstream is dropped, nobody else's.
+	userReauthHook func(upstream, userID string)
+
+	// userLocks serialises everything that reads-then-writes one person's
+	// row (exchange, refresh, disconnect, a 401 mark), keyed by
+	// userKey(upstream, userID), so a refresh that waited on the provider
+	// cannot resurrect a row a disconnect deleted meanwhile.
+	userLocks map[string]*sync.Mutex
 }
 
 // New wires the service. dataDir is where we read/create oauth.key.
@@ -174,7 +200,9 @@ func New(db *store.DB, cipher *Cipher, bus EventBus, notifier Notifier, idents I
 			Timeout: 30 * time.Second,
 		},
 		bearers:     map[string]*atomic.Value{},
+		userBearers: map[string]*atomic.Value{},
 		lastAttempt: map[string]time.Time{},
+		userLocks:   map[string]*sync.Mutex{},
 	}
 }
 
@@ -183,6 +211,14 @@ func (s *Service) SetReauthHook(fn func(upstream string)) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.reauthHook = fn
+}
+
+// SetUserReauthHook installs the callback fired when one user's token on a
+// per_user upstream becomes invalid.
+func (s *Service) SetUserReauthHook(fn func(upstream, userID string)) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.userReauthHook = fn
 }
 
 // SetHTTPClient lets tests inject a transport pointed at an httptest.Server.
@@ -502,18 +538,22 @@ func (s *Service) GetClient(ctx context.Context, upstream string) (*ClientRecord
 	return &rec, nil
 }
 
-// DeleteClient drops the OAuth client + token rows for an upstream. Used
-// when the upstream itself is removed.
+// DeleteClient drops the OAuth client + token rows for an upstream, the
+// per-user token rows included (they were issued by the same client, for
+// the same host). Used when the upstream itself is removed or moves to
+// another origin.
 func (s *Service) DeleteClient(ctx context.Context, upstream string) error {
 	_, err := s.db.ExecContext(ctx, `DELETE FROM oauth_clients WHERE upstream_name = ?`, upstream)
 	if err != nil {
 		return err
 	}
-	_, err = s.db.ExecContext(ctx, `DELETE FROM oauth_tokens WHERE upstream_name = ?`, upstream)
+	if _, err := s.db.ExecContext(ctx, `DELETE FROM oauth_tokens WHERE upstream_name = ?`, upstream); err != nil {
+		return err
+	}
 	s.mu.Lock()
 	delete(s.bearers, upstream)
 	s.mu.Unlock()
-	return err
+	return s.deleteUserTokens(ctx, upstream)
 }
 
 // ---------------------------------------------------------------------------
@@ -524,7 +564,17 @@ func (s *Service) DeleteClient(ctx context.Context, upstream string) error {
 // PKCE; B just receives the code via a paste form rather than a direct
 // browser redirect). Returns the authorization URL the dashboard should
 // open.
-func (s *Service) BeginCallback(ctx context.Context, upstream, userID, mode string, scopes []string) (authURL, state string, err error) {
+//
+// browserBound says the flow was started from a browser session the API
+// has bound a flow cookie to (see PendingRecord.BrowserBound).
+func (s *Service) BeginCallback(ctx context.Context, upstream, userID, mode string, scopes []string, browserBound bool) (authURL, state string, err error) {
+	return s.beginCallback(ctx, upstream, userID, mode, scopes, false, browserBound)
+}
+
+// beginCallback is BeginCallback with the per_user flag: a per-user flow
+// stores its token on userID's own row (see ExchangeCodeForUser) instead
+// of the upstream's shared one.
+func (s *Service) beginCallback(ctx context.Context, upstream, userID, mode string, scopes []string, perUser, browserBound bool) (authURL, state string, err error) {
 	if mode != ModeCallback && mode != ModePaste {
 		return "", "", fmt.Errorf("oauth: bad mode %q", mode)
 	}
@@ -542,11 +592,18 @@ func (s *Service) BeginCallback(ctx context.Context, upstream, userID, mode stri
 	}
 	challenge := codeChallenge(verifier)
 	now := time.Now()
+	pu, bound := 0, 0
+	if perUser {
+		pu = 1
+	}
+	if browserBound {
+		bound = 1
+	}
 	_, err = s.db.ExecContext(ctx, `
         INSERT INTO oauth_pending(state, upstream_name, user_id, mode, code_verifier,
-            expires_at, created_at)
-        VALUES(?,?,?,?,?,?,?)
-    `, state, upstream, userID, mode, verifier, now.Add(PendingTTL).UnixMilli(), now.UnixMilli())
+            expires_at, created_at, per_user, browser_bound)
+        VALUES(?,?,?,?,?,?,?,?,?)
+    `, state, upstream, userID, mode, verifier, now.Add(PendingTTL).UnixMilli(), now.UnixMilli(), pu, bound)
 	if err != nil {
 		return "", "", err
 	}
@@ -598,13 +655,14 @@ func (s *Service) LoadPending(ctx context.Context, state string) (*PendingRecord
         SELECT state, upstream_name, user_id, mode, COALESCE(code_verifier,''),
                COALESCE(device_code,''), COALESCE(user_code,''),
                COALESCE(interval_s,0), COALESCE(verification_uri,''),
-               expires_at, created_at
+               expires_at, created_at, per_user, browser_bound
         FROM oauth_pending WHERE state = ?
     `, state)
 	var p PendingRecord
 	var exp, created int64
+	var perUser, bound int
 	if err := row.Scan(&p.State, &p.UpstreamName, &p.UserID, &p.Mode, &p.CodeVerifier,
-		&p.DeviceCode, &p.UserCode, &p.IntervalS, &p.VerificationURI, &exp, &created); err != nil {
+		&p.DeviceCode, &p.UserCode, &p.IntervalS, &p.VerificationURI, &exp, &created, &perUser, &bound); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, ErrPendingNotFound
 		}
@@ -612,6 +670,8 @@ func (s *Service) LoadPending(ctx context.Context, state string) (*PendingRecord
 	}
 	p.ExpiresAt = time.UnixMilli(exp)
 	p.CreatedAt = time.UnixMilli(created)
+	p.PerUser = perUser == 1
+	p.BrowserBound = bound == 1
 	if time.Now().After(p.ExpiresAt) {
 		// Expired — clean up and report as not found so the API layer
 		// returns a uniform 400 either way.
@@ -674,6 +734,7 @@ func (s *Service) ExchangeCode(ctx context.Context, upstream, code, verifier str
 		return nil, err
 	}
 	rec := tokenRecordFromResponse(upstream, tr)
+	rec.AccountLabel = accountLabelFromIDToken(tr.IDToken)
 	if err := s.PutToken(ctx, rec); err != nil {
 		return nil, err
 	}
@@ -722,6 +783,10 @@ func (s *Service) Refresh(ctx context.Context, upstream string) (*TokenRecord, e
 	if rec.RefreshToken == "" {
 		rec.RefreshToken = cur.RefreshToken
 		rec.RefreshExpiresAt = cur.RefreshExpiresAt
+	}
+	// A refresh response rarely carries an id_token; the label stays.
+	if rec.AccountLabel = accountLabelFromIDToken(tr.IDToken); rec.AccountLabel == "" {
+		rec.AccountLabel = cur.AccountLabel
 	}
 	rec.LastRefreshAt = time.Now()
 	if err := s.PutToken(ctx, rec); err != nil {
@@ -807,8 +872,8 @@ func (s *Service) PutToken(ctx context.Context, rec *TokenRecord) error {
 	_, err = s.db.ExecContext(ctx, `
         INSERT INTO oauth_tokens(upstream_name, access_token_enc, refresh_token_enc,
             token_type, scope, obtained_at, access_expires_at, refresh_expires_at,
-            last_refresh_at, refresh_failures, state, last_error, is_pat)
-        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)
+            last_refresh_at, refresh_failures, state, last_error, is_pat, account_label)
+        VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)
         ON CONFLICT(upstream_name) DO UPDATE SET
             access_token_enc = excluded.access_token_enc,
             refresh_token_enc = excluded.refresh_token_enc,
@@ -821,12 +886,14 @@ func (s *Service) PutToken(ctx context.Context, rec *TokenRecord) error {
             refresh_failures = excluded.refresh_failures,
             state = excluded.state,
             last_error = excluded.last_error,
-            is_pat = excluded.is_pat
+            is_pat = excluded.is_pat,
+            account_label = excluded.account_label
     `,
 		rec.UpstreamName, nullStr(atEnc), nullStr(rtEnc),
 		nullStr(rec.TokenType), nullStr(rec.Scope),
 		nullTimeMS(rec.ObtainedAt), nullTimeMS(rec.AccessExpiresAt), nullTimeMS(rec.RefreshExpiresAt),
-		nullTimeMS(rec.LastRefreshAt), rec.RefreshFailures, state, nullStr(rec.LastError), pat)
+		nullTimeMS(rec.LastRefreshAt), rec.RefreshFailures, state, nullStr(rec.LastError), pat,
+		nullStr(rec.AccountLabel))
 	return err
 }
 
@@ -837,7 +904,7 @@ func (s *Service) GetToken(ctx context.Context, upstream string) (*TokenRecord, 
                COALESCE(token_type,''), COALESCE(scope,''),
                COALESCE(obtained_at,0), COALESCE(access_expires_at,0),
                COALESCE(refresh_expires_at,0), COALESCE(last_refresh_at,0),
-               refresh_failures, state, COALESCE(last_error,''), is_pat
+               refresh_failures, state, COALESCE(last_error,''), is_pat, COALESCE(account_label,'')
         FROM oauth_tokens WHERE upstream_name = ?
     `, upstream)
 	var rec TokenRecord
@@ -845,7 +912,7 @@ func (s *Service) GetToken(ctx context.Context, upstream string) (*TokenRecord, 
 	var ob, ax, rx, lr int64
 	var pat int
 	if err := row.Scan(&rec.UpstreamName, &atEnc, &rtEnc, &rec.TokenType, &rec.Scope,
-		&ob, &ax, &rx, &lr, &rec.RefreshFailures, &rec.State, &rec.LastError, &pat); err != nil {
+		&ob, &ax, &rx, &lr, &rec.RefreshFailures, &rec.State, &rec.LastError, &pat, &rec.AccountLabel); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, nil
 		}
@@ -943,27 +1010,36 @@ func (s *Service) MarkReauthExternal(ctx context.Context, upstream, msg string) 
 // token + client rows. Used by /v1/upstreams/{id}/oauth DELETE.
 func (s *Service) Disconnect(ctx context.Context, upstream string) error {
 	cli, _ := s.GetClient(ctx, upstream)
-	tok, _ := s.GetToken(ctx, upstream)
-	if cli != nil && cli.RevocationEndpoint != "" && tok != nil && (tok.RefreshToken != "" || tok.AccessToken != "") {
-		form := url.Values{}
-		token := tok.RefreshToken
-		hint := "refresh_token"
-		if token == "" {
-			token = tok.AccessToken
-			hint = "access_token"
-		}
-		form.Set("token", token)
-		form.Set("token_type_hint", hint)
-		form.Set("client_id", cli.ClientID)
-		req, _ := http.NewRequestWithContext(ctx, http.MethodPost, cli.RevocationEndpoint,
-			strings.NewReader(form.Encode()))
-		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-		// Best-effort.
-		if resp, err := s.httpc.Do(req); err == nil {
-			resp.Body.Close()
-		}
+	if tok, _ := s.GetToken(ctx, upstream); tok != nil {
+		s.revoke(ctx, cli, tok.RefreshToken, tok.AccessToken)
 	}
 	return s.DeleteClient(ctx, upstream)
+}
+
+// revoke tells the IdP a token is no longer wanted, when it has a
+// revocation endpoint: the refresh token when there is one (which revokes
+// the grant), else the access token. Best-effort: the row is deleted
+// whatever the IdP says.
+func (s *Service) revoke(ctx context.Context, cli *ClientRecord, refreshToken, accessToken string) {
+	if cli == nil || cli.RevocationEndpoint == "" || (refreshToken == "" && accessToken == "") {
+		return
+	}
+	form := url.Values{}
+	token, hint := refreshToken, "refresh_token"
+	if token == "" {
+		token, hint = accessToken, "access_token"
+	}
+	form.Set("token", token)
+	form.Set("token_type_hint", hint)
+	form.Set("client_id", cli.ClientID)
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, cli.RevocationEndpoint, strings.NewReader(form.Encode()))
+	if err != nil {
+		return
+	}
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	if resp, err := s.httpc.Do(req); err == nil {
+		resp.Body.Close()
+	}
 }
 
 // ---------------------------------------------------------------------------

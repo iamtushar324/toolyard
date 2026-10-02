@@ -55,13 +55,18 @@ type Server struct {
 	// Identity, when set on an http server, forwards the caller's
 	// per-person identity key on every tool call. Persisted in
 	// identity_json.
-	Identity   *IdentityForwarding `json:"identity,omitempty"`
-	Enabled    bool                `json:"enabled"`
-	LastStatus string              `json:"last_status,omitempty"`
-	LastError  string              `json:"last_error,omitempty"`
-	ToolCount  int                 `json:"tool_count"`
-	CreatedAt  int64               `json:"created_at"`
-	UpdatedAt  int64               `json:"updated_at"`
+	Identity *IdentityForwarding `json:"identity,omitempty"`
+	// AuthMode says who signs in to the server: AuthShared (one account for
+	// everyone, the default) or AuthPerUser (each person connects their own
+	// account from My connections; an agent's calls use its owner's token
+	// and never a shared one). http servers only.
+	AuthMode   string `json:"auth_mode"`
+	Enabled    bool   `json:"enabled"`
+	LastStatus string `json:"last_status,omitempty"`
+	LastError  string `json:"last_error,omitempty"`
+	ToolCount  int    `json:"tool_count"`
+	CreatedAt  int64  `json:"created_at"`
+	UpdatedAt  int64  `json:"updated_at"`
 	// EnvPlaintextKeys is populated only by Masked(): the env keys whose
 	// values were masked (i.e. plaintext, not secret:// refs) so the UI can
 	// offer a "convert to secret" action. Never persisted.
@@ -72,6 +77,12 @@ type Server struct {
 	// it again. Never persisted.
 	OAuthReset bool `json:"oauth_reset,omitempty"`
 }
+
+// AuthMode values.
+const (
+	AuthShared  = "shared"
+	AuthPerUser = "per_user"
+)
 
 // Policy gates which upstream configurations are admissible. Used to
 // implement -no-stdio-upstreams and -upstream-env-denylist on the public
@@ -96,6 +107,16 @@ type HeaderProvider interface {
 	Disconnect(ctx context.Context, upstream string) error
 }
 
+// PerUserAuth is the per-user token store a per_user server needs: who has
+// connected it (gateway.PerUserAuth) and each person's bearer header.
+// *oauth.Service satisfies it.
+type PerUserAuth interface {
+	gateway.PerUserAuth
+	// UserHeaderFunc returns the per-request header function for upstream,
+	// given the user whose connection the request belongs to.
+	UserHeaderFunc(upstream string) func(ctx context.Context, userID string) map[string]string
+}
+
 // SecretResolver is the secrets-broker dependency. Decoupled via interface so
 // internal/upstreams doesn't import internal/secrets. Implemented by
 // *internal/secrets.Service.
@@ -113,6 +134,7 @@ type Service struct {
 	gw      *gateway.Gateway
 	policy  Policy
 	auth    HeaderProvider // optional
+	perUser PerUserAuth    // optional; without it per_user servers cannot connect
 	secrets SecretResolver // optional
 
 	mu sync.Mutex // serializes connect/disconnect side-effects
@@ -128,6 +150,10 @@ func (s *Service) SetPolicy(p Policy) { s.policy = p }
 // SetAuth installs the OAuth header provider. Calling this with nil
 // disables the wiring (useful for tests).
 func (s *Service) SetAuth(a HeaderProvider) { s.auth = a }
+
+// SetPerUserAuth installs the per-user token store. nil leaves per_user
+// servers unable to connect ("per-user sign-in is not wired").
+func (s *Service) SetPerUserAuth(a PerUserAuth) { s.perUser = a }
 
 // SetSecrets installs the secrets broker so secret:// refs in env/headers
 // resolve at dial time. Nil disables the wiring (refs would then fail the
@@ -177,12 +203,29 @@ func (s *Service) toCfg(srv Server) gateway.UpstreamConfig {
 	// header, then the caller's identity key. OAuth wins on a clash (e.g.
 	// Authorization) so a stored bearer always takes precedence over a
 	// hand-set header; the identity header wins over both.
+	//
+	// On a per_user server the bearer is the one of the user the gateway
+	// names on the request context (its connection's owner): the shared
+	// token is never consulted, so such a server can never act as the
+	// shared account by accident.
 	if isHTTP {
 		name := srv.Name
 		staticHeaders := copyMap(srv.Headers)
 		resolver := s.secrets
 		var oauthFn func(ctx context.Context) map[string]string
-		if s.auth != nil {
+		perUser := srv.AuthMode == AuthPerUser
+		switch {
+		case perUser:
+			cfg.PerUser = true
+			if s.perUser != nil {
+				cfg.PerUserAuth = s.perUser
+				userFn := s.perUser.UserHeaderFunc(srv.Name)
+				oauthFn = func(ctx context.Context) map[string]string {
+					uid, _ := gateway.UpstreamUser(ctx)
+					return userFn(ctx, uid)
+				}
+			}
+		case s.auth != nil:
 			oauthFn = s.auth.HeaderFunc(srv.Name)
 		}
 		var identityHeader string
@@ -206,6 +249,21 @@ func (s *Service) toCfg(srv Server) gateway.UpstreamConfig {
 						continue
 					}
 					out[k] = resolved
+				}
+				if perUser {
+					// Nothing static may stand in for the person. validate
+					// refuses a static Authorization on a per_user server;
+					// this keeps it out even on a row saved before that
+					// rule, in any letter case (Header.Set would merge
+					// them, so map order must not decide). With no bearer
+					// for the person the request carries no Authorization
+					// at all, and the gateway refuses the call before
+					// sending it (bearerOnFile).
+					for k := range out {
+						if strings.EqualFold(k, "Authorization") {
+							delete(out, k)
+						}
+					}
 				}
 				if oauthFn != nil {
 					for k, v := range oauthFn(ctx) {
@@ -292,7 +350,41 @@ func validate(srv Server) error {
 	if err := rejectMasked("env", srv.Env); err != nil {
 		return err
 	}
+	if err := validateAuthMode(srv); err != nil {
+		return err
+	}
 	return validateIdentity(srv)
+}
+
+// validateAuthMode checks the sign-in mode: shared (or unset) is always
+// fine; per_user needs an http transport, since it works through the
+// OAuth bearer on each person's connection, and no static Authorization
+// header, which would otherwise be sent as the person.
+func validateAuthMode(srv Server) error {
+	switch srv.AuthMode {
+	case "", AuthShared:
+		return nil
+	case AuthPerUser:
+		if srv.Transport == "stdio" {
+			return fmt.Errorf("%w: per-user sign-in needs an http transport", ErrInvalid)
+		}
+		for k := range srv.Headers {
+			if strings.EqualFold(k, "Authorization") {
+				return fmt.Errorf("%w: header %q cannot be set on a server where each person signs in; the person's own token is the Authorization", ErrInvalid, k)
+			}
+		}
+		return nil
+	}
+	return fmt.Errorf("%w: auth_mode must be %q or %q", ErrInvalid, AuthShared, AuthPerUser)
+}
+
+// normalizeAuthMode fills the default so rows and configs always carry an
+// explicit mode.
+func normalizeAuthMode(mode string) string {
+	if mode == "" {
+		return AuthShared
+	}
+	return mode
 }
 
 // rejectMasked refuses the placeholder Masked() puts in place of a value.
@@ -437,7 +529,7 @@ func (s *Service) list(ctx context.Context) ([]Server, error) {
 	rows, err := s.db.QueryContext(ctx,
 		`SELECT name, transport, COALESCE(command,''), COALESCE(args_json,''),
             COALESCE(url,''), COALESCE(env_json,''), COALESCE(headers_json,''),
-            COALESCE(identity_json,''), enabled,
+            COALESCE(identity_json,''), COALESCE(auth_mode,'shared'), enabled,
             COALESCE(last_status,''), COALESCE(last_error,''), tool_count,
             created_at, updated_at
          FROM upstream_servers ORDER BY name`)
@@ -451,7 +543,7 @@ func (s *Service) list(ctx context.Context) ([]Server, error) {
 		var argsRaw, envRaw, headersRaw, identityRaw string
 		var enabled int
 		if err := rows.Scan(&srv.Name, &srv.Transport, &srv.Command, &argsRaw,
-			&srv.URL, &envRaw, &headersRaw, &identityRaw, &enabled, &srv.LastStatus, &srv.LastError,
+			&srv.URL, &envRaw, &headersRaw, &identityRaw, &srv.AuthMode, &enabled, &srv.LastStatus, &srv.LastError,
 			&srv.ToolCount, &srv.CreatedAt, &srv.UpdatedAt); err != nil {
 			return nil, err
 		}
@@ -493,6 +585,7 @@ func (s *Service) Add(ctx context.Context, srv Server) (*Server, error) {
 	srv.CreatedAt = now
 	srv.UpdatedAt = now
 	srv.Enabled = true
+	srv.AuthMode = normalizeAuthMode(srv.AuthMode)
 
 	argsBlob, _ := json.Marshal(srv.Args)
 	envBlob, _ := json.Marshal(srv.Env)
@@ -500,10 +593,10 @@ func (s *Service) Add(ctx context.Context, srv Server) (*Server, error) {
 
 	_, err := s.db.ExecContext(ctx,
 		`INSERT INTO upstream_servers(name, transport, command, args_json, url,
-            env_json, headers_json, identity_json, enabled, created_at, updated_at)
-         VALUES(?,?,?,?,?,?,?,?,?,?,?)`,
+            env_json, headers_json, identity_json, auth_mode, enabled, created_at, updated_at)
+         VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`,
 		srv.Name, srv.Transport, nullStr(srv.Command), string(argsBlob),
-		nullStr(srv.URL), string(envBlob), string(headersBlob), identityJSON(srv.Identity), 1, now, now)
+		nullStr(srv.URL), string(envBlob), string(headersBlob), identityJSON(srv.Identity), srv.AuthMode, 1, now, now)
 	if err != nil {
 		// SQLite reports unique constraint as "UNIQUE constraint failed".
 		if strings.Contains(strings.ToLower(err.Error()), "unique") {
@@ -564,6 +657,42 @@ func (s *Service) ReconnectAfterAuth(ctx context.Context, name string) {
 	s.mu.Unlock()
 }
 
+// ReconnectAfterUserAuth is called after one person connects a per_user
+// upstream. Other people's connections are left alone; what changes is
+// that an upstream nobody had connected yet now gets its tool list (over
+// this person's session). The person's own connection opens on their
+// first call. Best-effort, as ReconnectAfterAuth.
+func (s *Service) ReconnectAfterUserAuth(ctx context.Context, name, userID string) {
+	srv, err := s.get(ctx, name)
+	if err != nil || !srv.Enabled || srv.AuthMode != AuthPerUser {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	err = s.gw.RefreshPerUser(ctx, name)
+	switch {
+	case errors.Is(err, gateway.ErrUpstreamNotFound):
+		// Not registered (an earlier connect failed outright): a full
+		// connect registers it and loads the tools.
+		if err := s.connect(ctx, *srv); err != nil {
+			s.recordStatus(ctx, name, "", err.Error(), 0)
+		}
+	case errors.Is(err, gateway.ErrWaitingForSignIn):
+		s.recordStatus(ctx, name, gateway.StatusWaitingSignIn, "", 0)
+	case err != nil:
+		s.recordStatus(ctx, name, "", err.Error(), 0)
+	default:
+		s.recordStatus(ctx, name, "ok", "", s.gw.UpstreamToolCount(name))
+		s.gw.NotifyToolListChanged()
+	}
+}
+
+// DropUserConnection closes one person's connection to a per_user
+// upstream: after they disconnect, or after their token was rejected.
+func (s *Service) DropUserConnection(name, userID string) {
+	s.gw.DropUserConnection(name, userID)
+}
+
 // Reconnect drops any existing connection and re-tries.
 func (s *Service) Reconnect(ctx context.Context, name string) (*Server, error) {
 	s.mu.Lock()
@@ -593,9 +722,17 @@ func (s *Service) stdioRefused(srv Server) bool {
 }
 
 // connect attaches the upstream to the gateway and records status. Caller
-// holds s.mu.
+// holds s.mu. A per_user upstream nobody has connected yet is registered
+// without tools and recorded as waiting for a first sign-in; that is not
+// a failure.
 func (s *Service) connect(ctx context.Context, srv Server) error {
-	if err := s.gw.AddUpstream(ctx, s.toCfg(srv)); err != nil {
+	err := s.gw.AddUpstream(ctx, s.toCfg(srv))
+	if errors.Is(err, gateway.ErrWaitingForSignIn) {
+		s.recordStatus(ctx, srv.Name, gateway.StatusWaitingSignIn, "", 0)
+		s.gw.NotifyToolListChanged()
+		return nil
+	}
+	if err != nil {
 		return err
 	}
 	s.recordStatus(ctx, srv.Name, "ok", "", s.gw.UpstreamToolCount(srv.Name))
@@ -607,7 +744,7 @@ func (s *Service) get(ctx context.Context, name string) (*Server, error) {
 	row := s.db.QueryRowContext(ctx,
 		`SELECT name, transport, COALESCE(command,''), COALESCE(args_json,''),
             COALESCE(url,''), COALESCE(env_json,''), COALESCE(headers_json,''),
-            COALESCE(identity_json,''), enabled,
+            COALESCE(identity_json,''), COALESCE(auth_mode,'shared'), enabled,
             COALESCE(last_status,''), COALESCE(last_error,''), tool_count,
             created_at, updated_at
          FROM upstream_servers WHERE name = ?`, name)
@@ -615,7 +752,7 @@ func (s *Service) get(ctx context.Context, name string) (*Server, error) {
 	var argsRaw, envRaw, headersRaw, identityRaw string
 	var enabled int
 	if err := row.Scan(&srv.Name, &srv.Transport, &srv.Command, &argsRaw,
-		&srv.URL, &envRaw, &headersRaw, &identityRaw, &enabled, &srv.LastStatus, &srv.LastError,
+		&srv.URL, &envRaw, &headersRaw, &identityRaw, &srv.AuthMode, &enabled, &srv.LastStatus, &srv.LastError,
 		&srv.ToolCount, &srv.CreatedAt, &srv.UpdatedAt); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, ErrNotFound
@@ -805,11 +942,20 @@ func maskValues(in map[string]string) (map[string]string, []string) {
 // Identity is tri-state so the dashboard can send "identity": null to turn
 // forwarding off. Transport, command and args are not editable: changing
 // the process an upstream runs is a remove-and-add.
+//
+// AuthMode switches who signs in. Neither direction drops any token:
+// shared -> per_user keeps the shared token row (nothing on a per_user
+// server ever uses it, and the admin can disconnect it from Auth…), and
+// per_user -> shared keeps every person's row (unused and no longer
+// refreshed while the server is shared, back in use if it is switched
+// again). Correctness only needs the live connections replaced, which
+// Update does by reconnecting.
 type Patch struct {
 	URL      *string            `json:"url"`
 	Headers  *map[string]string `json:"headers"`
 	Env      *map[string]string `json:"env"`
 	Identity OptionalIdentity   `json:"identity"`
+	AuthMode *string            `json:"auth_mode"`
 	Enabled  *bool              `json:"enabled"`
 }
 
@@ -868,6 +1014,9 @@ func (s *Service) Update(ctx context.Context, name string, patch Patch) (*Server
 	if patch.Identity.Set {
 		next.Identity = patch.Identity.Value
 	}
+	if patch.AuthMode != nil {
+		next.AuthMode = normalizeAuthMode(strings.TrimSpace(*patch.AuthMode))
+	}
 	if patch.Enabled != nil {
 		next.Enabled = *patch.Enabled
 	}
@@ -910,10 +1059,10 @@ func (s *Service) Update(ctx context.Context, name string, patch Patch) (*Server
 		enabled = 1
 	}
 	if _, err := s.db.ExecContext(ctx,
-		`UPDATE upstream_servers SET url=?, env_json=?, headers_json=?, identity_json=?, enabled=?, updated_at=?
+		`UPDATE upstream_servers SET url=?, env_json=?, headers_json=?, identity_json=?, auth_mode=?, enabled=?, updated_at=?
          WHERE name=?`,
 		nullStr(next.URL), string(envBlob), string(headersBlob), identityJSON(next.Identity),
-		enabled, time.Now().UnixMilli(), name); err != nil {
+		normalizeAuthMode(next.AuthMode), enabled, time.Now().UnixMilli(), name); err != nil {
 		return nil, err
 	}
 

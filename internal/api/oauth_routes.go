@@ -9,7 +9,9 @@ import (
 	"strings"
 	"time"
 
+	"github.com/tusharbhardwaj/toolyard/internal/actor"
 	"github.com/tusharbhardwaj/toolyard/internal/audit"
+	"github.com/tusharbhardwaj/toolyard/internal/identity"
 	"github.com/tusharbhardwaj/toolyard/internal/oauth"
 )
 
@@ -242,10 +244,18 @@ func (s *Server) oauthBegin(w http.ResponseWriter, r *http.Request, name string)
 		writeError(w, http.StatusBadRequest, "use /device-begin for the device flow")
 		return
 	}
-	authURL, state, err := s.oauth.BeginCallback(r.Context(), name, uid, body.Mode, body.Scopes)
+	// A flow started from a browser is bound to it: the begin response
+	// sets a flow cookie the callback checks (see oauth_flow_cookie.go).
+	// An operator token has no browser to bind, so its flow stays open
+	// to whoever opens the authorize URL, as before.
+	bound := body.Mode == oauth.ModeCallback && operatorFromContext(r.Context()) == nil
+	authURL, state, err := s.oauth.BeginCallback(r.Context(), name, uid, body.Mode, body.Scopes, bound)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
+	}
+	if bound {
+		s.setOAuthFlowCookie(w, r, state, uid)
 	}
 	_ = s.audit.Write(r.Context(), audit.Event{
 		EventType:     "oauth.begin",
@@ -358,6 +368,14 @@ func (s *Server) oauthCallback(w http.ResponseWriter, r *http.Request) {
 		oauthHTMLError(w, "Wrong mode for this state. Use 'paste' instead.")
 		return
 	}
+	if p.PerUser {
+		s.oauthUserCallback(w, r, p, code)
+		return
+	}
+	s.clearOAuthFlowCookie(w, r, state)
+	if !s.sharedFlowBrowserOK(w, r, p) {
+		return
+	}
 	rec, err := s.oauth.ExchangeCode(r.Context(), p.UpstreamName, code, p.CodeVerifier)
 	if err != nil {
 		oauthHTMLError(w, "Token exchange failed: "+err.Error())
@@ -372,6 +390,100 @@ func (s *Server) oauthCallback(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
 	_, _ = w.Write([]byte(oauthSuccessHTML(p.UpstreamName, rec.AccessExpiresAt)))
+}
+
+// sharedFlowBrowserOK decides whether this browser may finish an admin's
+// shared-account flow. An admin's session passes (same-site in dev, where
+// the session cookie is Lax). Without a session, a browser-bound flow
+// needs the flow cookie for (state, the admin who started it), and that
+// admin must still be an active admin. An unbound flow (started with an
+// operator token, no browser to bind) passes as before. A member's
+// session, or a bound flow without its cookie, is refused and the flow
+// burnt: the code it carried was consumed by the redirect anyway, so
+// nothing legitimate is lost and nothing can be replayed.
+func (s *Server) sharedFlowBrowserOK(w http.ResponseWriter, r *http.Request, p *oauth.PendingRecord) bool {
+	if u, ok := s.sessionUser(r); ok {
+		if u.Role != identity.RoleAdmin {
+			_ = s.oauth.DeletePending(r.Context(), p.State)
+			oauthHTMLError(w, "This authorization was started by an admin for the server's shared account; only an admin can finish it.")
+			return false
+		}
+		return true
+	}
+	if !p.BrowserBound {
+		return true
+	}
+	if s.oauthFlowCookieValid(r, p.State, p.UserID) {
+		if u, err := s.identity.GetUserByID(r.Context(), p.UserID); err == nil && u.Status == identity.StatusActive && u.Role == identity.RoleAdmin {
+			return true
+		}
+	}
+	_ = s.oauth.DeletePending(r.Context(), p.State)
+	oauthHTMLError(w, "This authorization did not come back to the browser that started it (or its cookie is missing). Nothing was stored. Start it again from the dashboard.")
+	return false
+}
+
+// oauthUserCallback finishes a per-user flow: the browser coming back must
+// be the one that started it, for the same person, or no token is stored
+// and the pending row is burnt. In production the session cookie is
+// SameSite=Strict and absent on this cross-site return, so the proof is
+// the flow cookie set at begin; a session for the same user (dev, Lax)
+// passes too. The token lands on that person's own row; the server's tool
+// list is loaded if this was its first sign-in.
+func (s *Server) oauthUserCallback(w http.ResponseWriter, r *http.Request, p *oauth.PendingRecord, code string) {
+	s.clearOAuthFlowCookie(w, r, p.State)
+	u, ok := s.sessionUser(r)
+	switch {
+	case ok && u.ID == p.UserID:
+		// The person's own session.
+	case !ok && s.oauthFlowCookieValid(r, p.State, p.UserID):
+		owner, err := s.identity.GetUserByID(r.Context(), p.UserID)
+		if err != nil || owner.Status != identity.StatusActive {
+			_ = s.oauth.DeletePending(r.Context(), p.State)
+			oauthHTMLError(w, "Your toolyard account is not active. Nothing was stored.")
+			return
+		}
+		u = owner
+	default:
+		// Another user's session, or no proof at all: burn the flow. The
+		// authorization code was consumed by the redirect that brought
+		// us here, so the real person cannot finish it either way and
+		// must start over; deleting closes any replay window.
+		_ = s.oauth.DeletePending(r.Context(), p.State)
+		_ = s.audit.Write(r.Context(), audit.Event{
+			EventType: "oauth.user_mismatch", UpstreamName: p.UpstreamName,
+			ResultSummary: "sign-in for " + p.UpstreamName + " came back in a browser that is not the person's; no token stored",
+			Raiser:        actor.Raiser{OwnerUserID: p.UserID},
+		})
+		if ok {
+			oauthHTMLError(w, "This sign-in was started by a different toolyard user. Nothing was stored. Start your own from My connections.")
+			return
+		}
+		oauthHTMLError(w, "This sign-in did not come back to the browser that started it (or its cookie is missing). Nothing was stored. Start again from My connections, in the same browser.")
+		return
+	}
+	rec, err := s.oauth.ExchangeCodeForUser(r.Context(), p.UpstreamName, u.ID, code, p.CodeVerifier)
+	if err != nil {
+		oauthHTMLError(w, "Token exchange failed: "+err.Error())
+		return
+	}
+	_ = s.oauth.DeletePending(r.Context(), p.State)
+	go s.upstreams.ReconnectAfterUserAuth(context.Background(), p.UpstreamName, u.ID)
+	_ = s.audit.Write(r.Context(), audit.Event{
+		EventType: "oauth.user_success", AgentID: "user:" + u.ID, UpstreamName: p.UpstreamName,
+		ResultSummary: p.UpstreamName + " connected as " + nonEmpty(rec.AccountLabel, "(account not named)"),
+		Raiser:        actor.Raiser{OwnerUserID: u.ID, OwnerEmail: u.Email, OwnerName: u.Label()},
+	})
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	_, _ = w.Write([]byte(oauthUserSuccessHTML(p.UpstreamName, rec.AccountLabel)))
+}
+
+func nonEmpty(s, fallback string) string {
+	if s == "" {
+		return fallback
+	}
+	return s
 }
 
 // oauthPaste accepts the post-redirect URL pasted by the user when the
@@ -413,6 +525,38 @@ func (s *Server) oauthPaste(w http.ResponseWriter, r *http.Request) {
 	p, err := s.oauth.LoadPending(r.Context(), state)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	u, _ := s.sessionUser(r)
+	if p.PerUser {
+		// The same rule as the callback: the person who started it, or
+		// nothing is stored.
+		if u == nil || u.ID != p.UserID {
+			_ = s.oauth.DeletePending(r.Context(), state)
+			writeError(w, http.StatusForbidden, "this sign-in was started by a different toolyard user; nothing was stored")
+			return
+		}
+		rec, err := s.oauth.ExchangeCodeForUser(r.Context(), p.UpstreamName, u.ID, code, p.CodeVerifier)
+		if err != nil {
+			writeError(w, http.StatusBadGateway, err.Error())
+			return
+		}
+		_ = s.oauth.DeletePending(r.Context(), state)
+		go s.upstreams.ReconnectAfterUserAuth(context.Background(), p.UpstreamName, u.ID)
+		_ = s.audit.Write(r.Context(), audit.Event{
+			EventType: "oauth.user_success", AgentID: "user:" + u.ID, UpstreamName: p.UpstreamName,
+			ResultSummary: p.UpstreamName + " connected (paste) as " + nonEmpty(rec.AccountLabel, "(account not named)"),
+			Raiser:        actor.Raiser{OwnerUserID: u.ID, OwnerEmail: u.Email, OwnerName: u.Label()},
+		})
+		writeJSON(w, http.StatusOK, map[string]any{
+			"upstream":          p.UpstreamName,
+			"access_expires_at": nullableMS(rec.AccessExpiresAt),
+			"account_label":     rec.AccountLabel,
+		})
+		return
+	}
+	if u != nil && u.Role != identity.RoleAdmin {
+		writeError(w, http.StatusForbidden, "admin_only")
 		return
 	}
 	rec, err := s.oauth.ExchangeCode(r.Context(), p.UpstreamName, code, p.CodeVerifier)
@@ -555,6 +699,9 @@ func (s *Server) oauthStatus(w http.ResponseWriter, r *http.Request, name string
 		out["scope_granted"] = tok.Scope
 		out["is_pat"] = tok.IsPAT
 		out["last_error"] = tok.LastError
+		if tok.AccountLabel != "" {
+			out["account_label"] = tok.AccountLabel
+		}
 		if !tok.AccessExpiresAt.IsZero() {
 			out["access_expires_at"] = tok.AccessExpiresAt.UnixMilli()
 		}
@@ -689,6 +836,22 @@ func oauthSuccessHTML(name string, expires time.Time) string {
 <h1>✓ Authorized</h1>
 <p><strong>` + htmlEscape(name) + `</strong> is now connected to toolyard. You can close this tab.</p>` + exp + `
 <p style="color:#888;font-size:12px;margin-top:24px">If the dashboard tab does not auto-update, reload it.</p>
+</div></body></html>`
+}
+
+// oauthUserSuccessHTML is the page a person sees after connecting their own
+// account; the dashboard tab picks the change up on its own.
+func oauthUserSuccessHTML(name, account string) string {
+	as := ""
+	if account != "" {
+		as = " as <strong>" + htmlEscape(account) + "</strong>"
+	}
+	return `<!doctype html><html><head><meta charset="utf-8"><title>Connected — toolyard</title>
+<style>body{font:14px system-ui,sans-serif;color:#222;background:#f6f8fa;display:flex;align-items:center;justify-content:center;height:100vh;margin:0}div{background:#fff;border-radius:8px;padding:32px;box-shadow:0 4px 12px rgba(0,0,0,0.08);max-width:400px}h1{margin:0 0 8px;font-size:18px;color:#0a7}</style>
+</head><body><div>
+<h1>✓ Connected</h1>
+<p>Your agents now use <strong>` + htmlEscape(name) + `</strong>` + as + `. You can close this tab.</p>
+<p style="color:#888;font-size:12px;margin-top:24px">If My connections does not update on its own, reload it.</p>
 </div></body></html>`
 }
 
