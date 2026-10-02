@@ -136,3 +136,43 @@ func TestEnforceOriginOnMutationsMCPTokenHeaders(t *testing.T) {
 		}
 	}
 }
+
+// TestEnforceOriginRefererExactOrigin: when a browser sends no Origin, the
+// Referer's origin (scheme, host and port) must equal the public origin
+// exactly; a host that merely starts with it, another scheme or another
+// port is refused.
+func TestEnforceOriginRefererExactOrigin(t *testing.T) {
+	s := &Server{security: SecurityOptions{PublicURL: "https://toolyard.example/"}}
+	h := s.EnforceOriginOnMutations(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	cases := []struct {
+		referer string
+		want    int
+	}{
+		{"https://toolyard.example/", http.StatusNoContent},
+		{"https://toolyard.example/#/servers", http.StatusNoContent},
+		{"HTTPS://Toolyard.Example/page", http.StatusNoContent},
+		{"https://toolyard.example.evil.test/", http.StatusForbidden},
+		{"https://toolyard.example.evil.test/v1/servers", http.StatusForbidden},
+		{"https://toolyard.example:8443/", http.StatusForbidden},
+		{"http://toolyard.example/", http.StatusForbidden},
+		{"https://evil.test/?u=https://toolyard.example", http.StatusForbidden},
+		{"toolyard.example", http.StatusForbidden},
+		{"", http.StatusForbidden},
+	}
+	for _, c := range cases {
+		req := httptest.NewRequest(http.MethodPost, "/v1/servers", nil)
+		if c.referer != "" {
+			req.Header.Set("Referer", c.referer)
+		}
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if rec.Code != c.want {
+			t.Errorf("Referer %q: got %d, want %d", c.referer, rec.Code, c.want)
+		}
+	}
+	if got := originOf("https://toolyard.example:8443/x?y#z"); got != "https://toolyard.example:8443" {
+		t.Fatalf("originOf = %q", got)
+	}
+}

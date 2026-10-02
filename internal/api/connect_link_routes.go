@@ -251,10 +251,13 @@ func (s *Server) connectLinkConfirm(w http.ResponseWriter, r *http.Request) {
 		writeConnectPage(w, http.StatusInternalServerError, "Not available", "<h1>Not available</h1><p>Please try again.</p>")
 		return
 	}
+	// Behind HTTPS the cookie is __Host- (see hostCookie): only this host
+	// can have set it.
+	name, path := s.hostCookie(r, connectNonceName(l.ticket), connectLinkPath)
 	http.SetCookie(w, &http.Cookie{
-		Name:     connectNonceName(l.ticket),
+		Name:     name,
 		Value:    nonce,
-		Path:     connectLinkPath,
+		Path:     path,
 		HttpOnly: true,
 		Secure:   s.security.IsBehindHTTPS(r),
 		SameSite: http.SameSiteStrictMode,
@@ -314,7 +317,8 @@ func (s *Server) connectLinkContinue(w http.ResponseWriter, r *http.Request) {
 		s.connectLinkRefuse(w, r, "", nil, &connectLinkRefusal{reason: "bad_form", text: "The form could not be read. Open the link again."})
 		return
 	}
-	nonceCookie, err := r.Cookie(connectNonceName(ticket))
+	nonceName, _ := s.hostCookie(r, connectNonceName(ticket), connectLinkPath)
+	nonceCookie, err := r.Cookie(nonceName)
 	formNonce := r.PostForm.Get("nonce")
 	if err != nil || formNonce == "" || !hmac.Equal([]byte(nonceCookie.Value), []byte(formNonce)) {
 		s.connectLinkRefuse(w, r, "", nil, &connectLinkRefusal{reason: "nonce", text: "This page is stale or did not come from toolyard's confirm page. Open the link again."})
@@ -457,8 +461,9 @@ func randomNonce() (string, error) {
 
 // clearConnectNonce drops the nonce once the form came back.
 func (s *Server) clearConnectNonce(w http.ResponseWriter, r *http.Request, ticket string) {
+	name, path := s.hostCookie(r, connectNonceName(ticket), connectLinkPath)
 	http.SetCookie(w, &http.Cookie{
-		Name: connectNonceName(ticket), Value: "", Path: connectLinkPath, HttpOnly: true,
+		Name: name, Value: "", Path: path, HttpOnly: true,
 		Secure: s.security.IsBehindHTTPS(r), SameSite: http.SameSiteStrictMode, MaxAge: -1,
 	})
 }

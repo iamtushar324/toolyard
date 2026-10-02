@@ -3,6 +3,7 @@ package api
 import (
 	"context"
 	"crypto/rand"
+	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -101,9 +102,10 @@ func (e *accessTestEnv) confirmLink(t *testing.T, ticket string, cookies ...*htt
 // nonceOf pulls the nonce cookie and the form nonce out of a confirm page.
 func nonceOf(t *testing.T, page *httptest.ResponseRecorder) (*http.Cookie, string) {
 	t.Helper()
+	// Plain over http, __Host- prefixed over https.
 	var cookie *http.Cookie
 	for _, c := range page.Result().Cookies() {
-		if strings.HasPrefix(c.Name, connectNoncePrefix) {
+		if strings.Contains(c.Name, connectNoncePrefix) {
 			cookie = c
 		}
 	}
@@ -781,6 +783,51 @@ func TestConnectLinkWithMemberSession(t *testing.T) {
 	}
 	if rows := userTokenRows(t, e, "linear"); len(rows) != 1 {
 		t.Fatalf("token rows = %v", rows)
+	}
+}
+
+// TestConnectLinkNonceUsesHostPrefixOverHTTPS: behind HTTPS the confirm
+// page's nonce cookie is __Host- (Secure, Path=/, no Domain) and only that
+// name is read on Continue: a cookie by the plain name, planted from a
+// sibling host with the genuine value, is ignored. The flow cookie set by
+// a successful Continue is __Host- too.
+func TestConnectLinkNonceUsesHostPrefixOverHTTPS(t *testing.T) {
+	c := newConnectLinkEnv(t)
+	e, ada := c.e, c.ada
+	ticket := c.ticket(t, ada.ID, "linear", oauth.ConnectPurposePerUser)
+
+	get := httptest.NewRequest(http.MethodGet, connectLinkPath+ticket, nil)
+	get.TLS = &tls.ConnectionState{}
+	page := httptest.NewRecorder()
+	e.handler.ServeHTTP(page, get)
+	if page.Code != http.StatusOK {
+		t.Fatalf("confirm over https: %d %s", page.Code, page.Body.String())
+	}
+	nonceCookie, nonce := nonceOf(t, page)
+	if nonceCookie.Name != hostPrefix+connectNonceName(ticket) || nonceCookie.Path != "/" || !nonceCookie.Secure || nonceCookie.Domain != "" {
+		t.Fatalf("nonce cookie over https = %+v", nonceCookie)
+	}
+	post := func(cookie *http.Cookie) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodPost, connectLinkPath+ticket, strings.NewReader(url.Values{"nonce": {nonce}}.Encode()))
+		req.TLS = &tls.ConnectionState{}
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		req.Header.Set("Sec-Fetch-Site", "same-origin")
+		req.AddCookie(cookie)
+		rec := httptest.NewRecorder()
+		e.handler.ServeHTTP(rec, req)
+		return rec
+	}
+	planted := &http.Cookie{Name: connectNonceName(ticket), Value: nonce}
+	if rec := post(planted); rec.Code != http.StatusForbidden || !c.live(t, ticket) {
+		t.Fatalf("continue with a plain-named nonce cookie over https: %d live=%v", rec.Code, c.live(t, ticket))
+	}
+	rec := post(nonceCookie)
+	if rec.Code != http.StatusSeeOther {
+		t.Fatalf("continue with the __Host- nonce cookie: %d %s", rec.Code, rec.Body.String())
+	}
+	state := stateOf(t, rec.Header().Get("Location"))
+	if fc := flowCookieFrom(t, rec); fc.Name != hostPrefix+oauthFlowCookieName(state) || fc.Path != "/" || !fc.Secure {
+		t.Fatalf("flow cookie from a https Continue = %+v", fc)
 	}
 }
 

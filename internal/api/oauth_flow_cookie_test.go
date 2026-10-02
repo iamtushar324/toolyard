@@ -23,8 +23,9 @@ import (
 // flowCookieFrom returns the flow cookie a begin response set.
 func flowCookieFrom(t *testing.T, rec *httptest.ResponseRecorder) *http.Cookie {
 	t.Helper()
+	// Plain over http, __Host- prefixed over https.
 	for _, c := range rec.Result().Cookies() {
-		if strings.HasPrefix(c.Name, oauthFlowCookiePrefix) {
+		if strings.Contains(c.Name, oauthFlowCookiePrefix) {
 			return c
 		}
 	}
@@ -83,23 +84,94 @@ func TestOAuthFlowCookieAttributes(t *testing.T) {
 	if c.Value != e.srv.oauthFlowMAC(state, ada.ID) || strings.Contains(c.Value, ada.ID) || strings.Contains(c.Value, state) {
 		t.Fatalf("flow cookie value is not the bare MAC: %q", c.Value)
 	}
-	// Over TLS the cookie is Secure; the clear is too.
+	// Over TLS the cookie is Secure and takes the __Host- name (Path=/, no
+	// Domain), so no sibling host can plant one; the clear matches.
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/v1/me/connections/linear/begin", nil)
 	req.TLS = &tls.ConnectionState{}
 	e.srv.setOAuthFlowCookie(rec, req, state, ada.ID)
-	if got := rec.Result().Cookies(); len(got) != 1 || !got[0].Secure || got[0].SameSite != http.SameSiteLaxMode {
+	if got := rec.Result().Cookies(); len(got) != 1 || !got[0].Secure || got[0].SameSite != http.SameSiteLaxMode ||
+		got[0].Name != hostPrefix+oauthFlowCookieName(state) || got[0].Path != "/" || got[0].Domain != "" {
 		t.Fatalf("flow cookie over https = %+v", got)
 	}
 	rec = httptest.NewRecorder()
 	e.srv.clearOAuthFlowCookie(rec, req, state)
-	if got := rec.Result().Cookies(); len(got) != 1 || got[0].MaxAge != -1 || got[0].Path != oauthFlowCookiePath || !got[0].Secure {
+	if got := rec.Result().Cookies(); len(got) != 1 || got[0].MaxAge != -1 || got[0].Name != hostPrefix+oauthFlowCookieName(state) || got[0].Path != "/" || !got[0].Secure {
 		t.Fatalf("flow cookie clear = %+v", got)
 	}
 	// Two flows in one browser get two cookies.
 	state2, c2 := beginFor(t, e, e.cookieFor(t, ada.ID), "linear")
 	if c2.Name == c.Name || state2 == state {
 		t.Fatalf("second flow reused the first cookie: %s", c2.Name)
+	}
+}
+
+// TestFlowCookieHostPrefixOverHTTPS: behind HTTPS the callback honours
+// only the __Host- flow cookie. A cookie by the plain name, even with the
+// right value (what a sibling host could plant with Domain=), is ignored:
+// nothing is stored and the flow is burnt.
+func TestFlowCookieHostPrefixOverHTTPS(t *testing.T) {
+	e := newAccessTestServer(t)
+	oe := withOAuth(t, e)
+	ts := newPatchMCPServer(t)
+	addPerUserServer(t, e, "linear", ts)
+	oe.client(t, "linear")
+	ada := e.member(t, "user_ada", "ada@beknown.work")
+	if err := e.access.SetGroups(t.Context(), ada.ID, []string{"linear"}, e.admin.ID); err != nil {
+		t.Fatal(err)
+	}
+	// Begin over TLS, as production does.
+	beginTLS := func() (string, *http.Cookie) {
+		t.Helper()
+		req := httptest.NewRequest(http.MethodPost, "/v1/me/connections/linear/begin", strings.NewReader("{}"))
+		req.TLS = &tls.ConnectionState{}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("X-Requested-With", "toolyard")
+		req.AddCookie(e.cookieFor(t, ada.ID))
+		rec := httptest.NewRecorder()
+		e.handler.ServeHTTP(rec, req)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("begin over https: %d %s", rec.Code, rec.Body.String())
+		}
+		var begun struct {
+			State string `json:"state"`
+		}
+		_ = json.Unmarshal(rec.Body.Bytes(), &begun)
+		c := flowCookieFrom(t, rec)
+		if c.Name != hostPrefix+oauthFlowCookieName(begun.State) || c.Path != "/" || !c.Secure {
+			t.Fatalf("flow cookie over https = %+v", c)
+		}
+		return begun.State, c
+	}
+	callbackTLS := func(state, code string, c *http.Cookie) *httptest.ResponseRecorder {
+		t.Helper()
+		req := httptest.NewRequest(http.MethodGet, "/v1/mcp-oauth/callback?state="+url.QueryEscape(state)+"&code="+url.QueryEscape(code), nil)
+		req.TLS = &tls.ConnectionState{}
+		req.AddCookie(c)
+		rec := httptest.NewRecorder()
+		e.handler.ServeHTTP(rec, req)
+		return rec
+	}
+
+	// A planted cookie: the plain name with the genuine value.
+	state, c := beginTLS()
+	planted := &http.Cookie{Name: oauthFlowCookieName(state), Value: c.Value}
+	if rec := callbackTLS(state, "ada", planted); rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "Nothing was stored") {
+		t.Fatalf("callback with a plain-named cookie over https: %d %s", rec.Code, rec.Body.String())
+	}
+	if rows := userTokenRows(t, e, "linear"); len(rows) != 0 {
+		t.Fatalf("token stored on a planted cookie: %v", rows)
+	}
+	if _, err := oe.oa.LoadPending(context.Background(), state); err == nil {
+		t.Fatal("flow survived a refused callback")
+	}
+	// The real cookie works.
+	state, c = beginTLS()
+	if rec := callbackTLS(state, "ada", c); rec.Code != http.StatusOK {
+		t.Fatalf("callback with the __Host- cookie: %d %s", rec.Code, rec.Body.String())
+	}
+	if rows := userTokenRows(t, e, "linear"); rows[ada.ID] != "active" {
+		t.Fatalf("token rows = %v", rows)
 	}
 }
 

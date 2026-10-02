@@ -3,6 +3,7 @@ package api
 import (
 	"net"
 	"net/http"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -183,6 +184,7 @@ func (s *Server) EnforceOriginOnMutations(next http.Handler) http.Handler {
 		return next
 	}
 	allowed := strings.TrimRight(s.security.PublicURL, "/")
+	allowedOrigin := originOf(allowed)
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.Method {
 		case http.MethodPost, http.MethodPatch, http.MethodPut, http.MethodDelete:
@@ -216,9 +218,10 @@ func (s *Server) EnforceOriginOnMutations(next http.Handler) http.Handler {
 			origin := r.Header.Get("Origin")
 			if origin == "" {
 				// Some browsers omit Origin on same-origin POSTs; fall back
-				// to Referer with a prefix match.
-				ref := r.Header.Get("Referer")
-				if ref == "" || !strings.HasPrefix(ref, allowed) {
+				// to the Referer's origin, compared whole (scheme, host and
+				// port): a prefix match would let toolyard.example.evil
+				// through.
+				if ro := originOf(r.Header.Get("Referer")); ro == "" || ro != allowedOrigin {
 					writeError(w, http.StatusForbidden, "missing or untrusted origin")
 					return
 				}
@@ -229,6 +232,16 @@ func (s *Server) EnforceOriginOnMutations(next http.Handler) http.Handler {
 		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+// originOf is the lowercased scheme://host[:port] of a URL, "" when it does
+// not parse or lacks either part.
+func originOf(raw string) string {
+	u, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil || u.Scheme == "" || u.Host == "" {
+		return ""
+	}
+	return strings.ToLower(u.Scheme + "://" + u.Host)
 }
 
 // LimitBody wraps every request body with http.MaxBytesReader so a single
