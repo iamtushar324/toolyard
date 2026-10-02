@@ -333,13 +333,13 @@ func stdioSummary(c bifrostClient) string {
 	afterFlag := false
 	for _, a := range c.StdioArgs {
 		switch m := flagWithVal.FindStringSubmatch(a); {
-		case m != nil:
-			a, afterFlag = m[1]+"=…", false
-		case flagName.MatchString(a):
-			afterFlag = true
 		case afterFlag:
-			// The previous flag's value.
+			// The previous flag's value, even when it starts with "-".
 			a, afterFlag = "…", false
+		case m != nil && !tokenLike(strings.TrimLeft(m[1], "-")):
+			a = m[1] + "=…"
+		case flagName.MatchString(a) && !tokenLike(strings.TrimLeft(a, "-")):
+			afterFlag = true
 		case packageName.MatchString(a) && !tokenLike(a) && len(a) <= 64:
 		default:
 			a = "…"

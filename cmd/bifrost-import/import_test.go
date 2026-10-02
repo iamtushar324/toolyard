@@ -363,10 +363,11 @@ func TestStdioSummaryHidesValues(t *testing.T) {
 	out := stdioSummary(bifrostClient{StdioCommand: "uvx",
 		StdioArgs: []string{"mcp-grafana", "--api-key=glsa_abcdefgh12345678", "-t", "abcdef1234567890xyz",
 			"Authorization: Basic dXNlcjpwYXNzd29yZA==", "postgres://app:S3cretPass@db.internal/app?sslmode=require",
-			"-k=hunter2", "--password", "correcthorse", "--api-key", "ABCDEFGHIJKLMNOPQRS", "serve", "--debug"},
+			"-k=hunter2", "--password", "correcthorse", "--api-key", "ABCDEFGHIJKLMNOPQRS", "--token", "-Abc123def456ghi789",
+			"--Zx9Yq8Wv7Ut6Sr5", "serve", "--debug"},
 		StdioEnvs: []string{"GRAFANA_URL", "GRAFANA_API_KEY=glsa_secret_value"}})
 	for _, secret := range []string{"glsa_abcdefgh12345678", "abcdef1234567890xyz", "dXNlcjpwYXNzd29yZA", "S3cretPass",
-		"hunter2", "correcthorse", "ABCDEFGHIJKLMNOPQRS", "glsa_secret_value"} {
+		"hunter2", "correcthorse", "ABCDEFGHIJKLMNOPQRS", "Abc123def456ghi789", "Zx9Yq8Wv7Ut6Sr5", "glsa_secret_value"} {
 		if strings.Contains(out, secret) {
 			t.Fatalf("stdio summary printed %q: %s", secret, out)
 		}
