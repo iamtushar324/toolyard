@@ -6603,6 +6603,11 @@ function ibSyncProgress() {
   });
 }
 function ibSync() {
+  document.querySelectorAll('[data-ib-vsrc]').forEach((n) => {
+    const id = n.dataset.ibVsrc;
+    n.textContent = ibRec(id) ? 'saved recording' : (ibVoice.loading === id ? 'generating audio' :
+      (ibVoice.playing && ibVoice.id === id ? 'read by your browser' : 'not recorded yet'));
+  });
   document.querySelectorAll('[data-ib-play]').forEach((n) => {
     const on = ibVoice.playing && ibVoice.id === n.dataset.ibPlay;
     const loading = ibVoice.loading === n.dataset.ibPlay;
@@ -6848,7 +6853,7 @@ function ibVoiceEl(r) {
     ...sents.map((s, k) => el('span', { 'data-ib-sent': r.id + ':' + k }, s + ' ')));
   return el('div', { class: 'ib-player' },
     el('div', { class: 'ib-plabel' }, el('span', {}, 'Voice note from ' + r.agent_name),
-      el('span', { class: 'ib-vsrc' }, r.audio && r.audio.blob ? 'recorded by toolyard' : 'read by your browser'),
+      el('span', { class: 'ib-vsrc', 'data-ib-vsrc': r.id }, r.audio && r.audio.blob ? 'saved recording' : 'not recorded yet'),
       el('button', { class: 'ib-rate', 'data-ib-rate': '1', on: { click: () => {
         ibSetRate(ibVoice.rate === 1 ? 1.25 : ibVoice.rate === 1.25 ? 1.5 : 1);
       } } }, ibVoice.rate + '×')),
