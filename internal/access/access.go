@@ -143,6 +143,21 @@ func (s *Service) ScopeFor(ctx context.Context, callerID string) Scope {
 	return Scope{Denied: true}
 }
 
+// OwnerUser implements gateway.OwnerResolver: the dashboard user behind a
+// caller id, "" when there is none (an unknown agent, a local anonymous
+// caller). Agents resolve through the same short owner cache as ScopeFor.
+func (s *Service) OwnerUser(ctx context.Context, callerID string) (string, error) {
+	switch {
+	case strings.HasPrefix(callerID, "dashboard:"):
+		return strings.TrimPrefix(callerID, "dashboard:"), nil
+	case strings.HasPrefix(callerID, "voice:"):
+		return strings.TrimPrefix(callerID, "voice:"), nil
+	case strings.HasPrefix(callerID, "ag_"):
+		return s.agentOwner(ctx, callerID)
+	}
+	return "", nil
+}
+
 // UserScope returns a dashboard user's scope. Lookup errors fail closed.
 func (s *Service) UserScope(ctx context.Context, userID string) Scope {
 	if userID == "" {

@@ -50,10 +50,23 @@ type UpstreamConfig struct {
 	// IdentityResolver) on every tools/call. A call whose caller has no key
 	// is refused. initialize, tools/list and reconnects never carry it.
 	IdentityHeader string `json:"identity_header,omitempty"`
+
+	// PerUser marks an http upstream whose users each sign in with their
+	// own account (see peruser.go). The gateway opens one connection per
+	// (upstream, user); HeaderFunc is called with the user on ctx
+	// (UpstreamUser) and must return that person's bearer or nothing.
+	PerUser bool `json:"per_user,omitempty"`
+	// PerUserAuth answers who has connected a PerUser upstream. Required
+	// when PerUser is set; populated by the upstreams package.
+	PerUserAuth PerUserAuth `json:"-"`
 }
 
 type upstream struct {
 	cfg UpstreamConfig
+
+	// userID is set on a per_user upstream's connections: the one person
+	// whose bearer this connection carries. Empty on a shared upstream.
+	userID string
 
 	// pool is a back-pointer to the owning Gateway, used for admission
 	// control on resume() (LRU eviction when the live-upstream cap is
@@ -168,6 +181,25 @@ func newUpstream(ctx context.Context, cfg UpstreamConfig) (*upstream, error) {
 	u := &upstream{cfg: cfg, client: c}
 	u.lastUsed.Store(time.Now().UnixNano())
 	return u, nil
+}
+
+// label names the upstream in log lines: the server, plus the user on a
+// per_user connection.
+func (u *upstream) label() string {
+	if u.userID == "" {
+		return u.cfg.Name
+	}
+	return u.cfg.Name + "[user " + u.userID + "]"
+}
+
+// listToolsLive dials the upstream if it is not connected and fetches its
+// tool catalog over the live session. Used for a per_user connection that
+// was created suspended and has no cache yet.
+func (u *upstream) listToolsLive(ctx context.Context) ([]mcp.Tool, error) {
+	if _, err := u.liveClient(); err != nil {
+		return nil, err
+	}
+	return u.listTools(ctx)
 }
 
 // listTools fetches the upstream's tool catalog. When the upstream is
