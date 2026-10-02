@@ -25,18 +25,30 @@ type fakeIdP struct {
 	srv      *httptest.Server
 	mu       sync.Mutex
 	rejected map[string]bool
+	failing  map[string]bool // refresh tokens answered with a 500
 	seq      int
 	refreshd []string // refresh tokens presented, in order
 	revoked  []string
 	noExpiry bool
+	// gate, when set, makes every refresh wait until it is closed: a
+	// provider that is slow to answer.
+	gate chan struct{}
 }
 
 func newFakeIdP(t *testing.T) *fakeIdP {
 	t.Helper()
-	f := &fakeIdP{rejected: map[string]bool{}}
+	f := &fakeIdP{rejected: map[string]bool{}, failing: map[string]bool{}}
 	mux := http.NewServeMux()
 	mux.HandleFunc("/token", func(w http.ResponseWriter, r *http.Request) {
 		_ = r.ParseForm()
+		if r.Form.Get("grant_type") == "refresh_token" {
+			f.mu.Lock()
+			gate := f.gate
+			f.mu.Unlock()
+			if gate != nil {
+				<-gate
+			}
+		}
 		f.mu.Lock()
 		defer f.mu.Unlock()
 		w.Header().Set("Content-Type", "application/json")
@@ -54,6 +66,11 @@ func newFakeIdP(t *testing.T) *fakeIdP {
 		case "refresh_token":
 			rt := r.Form.Get("refresh_token")
 			f.refreshd = append(f.refreshd, rt)
+			if f.failing[rt] {
+				w.WriteHeader(http.StatusInternalServerError)
+				_, _ = w.Write([]byte("idp down"))
+				return
+			}
 			if f.rejected[rt] {
 				w.WriteHeader(http.StatusBadRequest)
 				_ = json.NewEncoder(w).Encode(map[string]any{"error": "invalid_grant", "error_description": "revoked"})
@@ -92,6 +109,24 @@ func (f *fakeIdP) reject(rt string) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.rejected[rt] = true
+}
+
+func (f *fakeIdP) fail500(rt string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.failing[rt] = true
+}
+
+func (f *fakeIdP) unfail(rt string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	delete(f.failing, rt)
+}
+
+func (f *fakeIdP) gateRefresh(gate chan struct{}) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.gate = gate
 }
 
 func (f *fakeIdP) refreshed() []string {

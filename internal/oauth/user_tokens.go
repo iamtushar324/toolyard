@@ -14,6 +14,7 @@ import (
 	"errors"
 	"net/url"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -35,6 +36,10 @@ const (
 // user) that has no token row.
 var ErrNoUserToken = errors.New("oauth: user has not connected this server")
 
+// ErrSuperseded means a refresh found the row changed (a reconnect or a
+// disconnect) between its read and its write, so it wrote nothing.
+var ErrSuperseded = errors.New("oauth: token row changed under the refresh; nothing written")
+
 // UserTokenRecord is one person's token row on a per_user upstream,
 // decrypted.
 type UserTokenRecord struct {
@@ -52,6 +57,24 @@ type UserTokenRecord struct {
 	RefreshFailures  int
 	State            string
 	LastError        string
+	// refreshEnc is the refresh_token_enc ciphertext as read; a refresh
+	// writes back only while the row still carries it.
+	refreshEnc string
+}
+
+// lockUser serialises the read-then-write operations on one person's row
+// (exchange, refresh, disconnect, a 401 mark). The returned func unlocks.
+func (s *Service) lockUser(upstream, userID string) func() {
+	k := userKey(upstream, userID)
+	s.mu.Lock()
+	m := s.userLocks[k]
+	if m == nil {
+		m = &sync.Mutex{}
+		s.userLocks[k] = m
+	}
+	s.mu.Unlock()
+	m.Lock()
+	return m.Unlock
 }
 
 // UserConnection is what the API shows about one (upstream, user): the
@@ -231,6 +254,7 @@ func (s *Service) scanUserToken(row rowScanner) (*UserTokenRecord, error) {
 			return nil, err
 		}
 		rec.RefreshToken = string(pt)
+		rec.refreshEnc = rtEnc
 	}
 	if ob > 0 {
 		rec.ObtainedAt = time.UnixMilli(ob)
@@ -392,18 +416,21 @@ func (s *Service) deleteUserTokens(ctx context.Context, upstream string) error {
 // ---------------------------------------------------------------------------
 
 // BeginForUser starts a Mode A flow whose token will belong to userID.
-// Returns the authorization URL the person's browser should open.
+// Returns the authorization URL the person's browser should open. The flow
+// is always browser-bound: a per-user token is stored only for a browser
+// the API can tie to the person.
 func (s *Service) BeginForUser(ctx context.Context, upstream, userID string) (authURL, state string, err error) {
 	if strings.TrimSpace(userID) == "" {
 		return "", "", errors.New("oauth: per-user flow needs a user")
 	}
-	return s.beginCallback(ctx, upstream, userID, ModeCallback, nil, true)
+	return s.beginCallback(ctx, upstream, userID, ModeCallback, nil, true, true)
 }
 
 // ExchangeCodeForUser swaps the authorization code for tokens and stores
 // them on userID's row. The caller has already checked that the browser
-// completing the flow is signed in as userID.
+// completing the flow is the person's.
 func (s *Service) ExchangeCodeForUser(ctx context.Context, upstream, userID, code, verifier string) (*UserTokenRecord, error) {
+	defer s.lockUser(upstream, userID)()
 	cli, err := s.GetClient(ctx, upstream)
 	if err != nil {
 		return nil, err
@@ -438,12 +465,9 @@ func (s *Service) ExchangeCodeForUser(ctx context.Context, upstream, userID, cod
 
 // RefreshUser swaps one person's refresh_token for a fresh access_token.
 // invalid_grant marks that person's row needs_reauth and returns
-// ErrNeedsReauth.
+// ErrNeedsReauth; a row that changed meanwhile is ErrSuperseded.
 func (s *Service) RefreshUser(ctx context.Context, upstream, userID string) (*UserTokenRecord, error) {
-	cli, err := s.GetClient(ctx, upstream)
-	if err != nil {
-		return nil, err
-	}
+	defer s.lockUser(upstream, userID)()
 	cur, err := s.GetUserToken(ctx, upstream, userID)
 	if err != nil {
 		return nil, err
@@ -453,6 +477,74 @@ func (s *Service) RefreshUser(ctx context.Context, upstream, userID string) (*Us
 	}
 	if cur.RefreshToken == "" {
 		return nil, errors.New("oauth: no refresh token available")
+	}
+	return s.refreshUserLocked(ctx, upstream, userID, cur)
+}
+
+// RefreshUserToken is what the gateway calls when the upstream answered a
+// per-user call with 401: the access token may simply have expired. It
+// refreshes once; nil means a new token is in place and the call can be
+// retried. The row is marked needs_reauth only when there is nothing to
+// refresh with (no refresh token, or the IdP says invalid_grant); a
+// transient IdP failure leaves it alone and is returned as is.
+func (s *Service) RefreshUserToken(ctx context.Context, upstream, userID string) error {
+	defer s.lockUser(upstream, userID)()
+	cur, err := s.GetUserToken(ctx, upstream, userID)
+	if err != nil {
+		return err
+	}
+	if cur == nil {
+		return ErrNoUserToken
+	}
+	if cur.State == StateNeedsReauth {
+		return ErrNeedsReauth
+	}
+	if cur.RefreshToken == "" {
+		s.markUserNeedsReauth(ctx, upstream, userID, "upstream rejected the token (401) and there is no refresh token")
+		return ErrNeedsReauth
+	}
+	_, err = s.refreshUserLocked(ctx, upstream, userID, cur)
+	return err
+}
+
+// FreshenUserToken runs before the gateway dials a person's connection: an
+// access token whose expiry has already passed is refreshed first, so a
+// restart longer than the token's lifetime does not turn into a 401 (and
+// a needless re-auth) for everyone. A token still within its lifetime is
+// left to the refresher's schedule. ErrNeedsReauth means the person must
+// sign in again; any other error is transient.
+func (s *Service) FreshenUserToken(ctx context.Context, upstream, userID string) error {
+	defer s.lockUser(upstream, userID)()
+	cur, err := s.GetUserToken(ctx, upstream, userID)
+	if err != nil {
+		return err
+	}
+	if cur == nil {
+		return ErrNoUserToken
+	}
+	if cur.State == StateNeedsReauth {
+		return ErrNeedsReauth
+	}
+	if cur.AccessExpiresAt.IsZero() || time.Now().Before(cur.AccessExpiresAt) {
+		return nil
+	}
+	if cur.RefreshToken == "" {
+		s.markUserNeedsReauth(ctx, upstream, userID, "access token expired and there is no refresh token")
+		return ErrNeedsReauth
+	}
+	_, err = s.refreshUserLocked(ctx, upstream, userID, cur)
+	return err
+}
+
+// refreshUserLocked is the refresh itself; the caller holds the user's
+// lock and has read cur. The write goes through only while the row still
+// carries the refresh token that was read, so a disconnect or a fresh
+// sign-in that happened while the provider was answering is never
+// overwritten.
+func (s *Service) refreshUserLocked(ctx context.Context, upstream, userID string, cur *UserTokenRecord) (*UserTokenRecord, error) {
+	cli, err := s.GetClient(ctx, upstream)
+	if err != nil {
+		return nil, err
 	}
 	form := url.Values{}
 	form.Set("grant_type", "refresh_token")
@@ -478,11 +570,44 @@ func (s *Service) RefreshUser(ctx context.Context, upstream, userID string) (*Us
 		rec.AccountLabel = cur.AccountLabel
 	}
 	rec.LastRefreshAt = time.Now()
-	if err := s.PutUserToken(ctx, rec); err != nil {
+	if err := s.updateUserTokenIfUnchanged(ctx, rec, cur.refreshEnc); err != nil {
 		return nil, err
 	}
 	s.setUserBearer(upstream, userID, rec.AccessToken)
 	return rec, nil
+}
+
+// updateUserTokenIfUnchanged writes a refreshed token over the existing
+// row only while that row still carries refreshEnc, the refresh token
+// ciphertext the refresh started from. No row updated means the row was
+// deleted or replaced meanwhile: ErrSuperseded, nothing written, cache
+// untouched.
+func (s *Service) updateUserTokenIfUnchanged(ctx context.Context, rec *UserTokenRecord, refreshEnc string) error {
+	atEnc, err := s.cipher.Seal([]byte(rec.AccessToken), UserAAD(rec.UpstreamName, rec.UserID, "access"))
+	if err != nil {
+		return err
+	}
+	rtEnc, err := s.cipher.Seal([]byte(rec.RefreshToken), UserAAD(rec.UpstreamName, rec.UserID, "refresh"))
+	if err != nil {
+		return err
+	}
+	res, err := s.db.ExecContext(ctx, `
+        UPDATE oauth_user_tokens
+        SET access_token_enc = ?, refresh_token_enc = ?, token_type = ?, scope = ?, account_label = ?,
+            obtained_at = ?, access_expires_at = ?, refresh_expires_at = ?, last_refresh_at = ?,
+            refresh_failures = 0, state = ?, last_error = NULL
+        WHERE upstream_name = ? AND user_id = ? AND refresh_token_enc = ?`,
+		nullStr(atEnc), nullStr(rtEnc), nullStr(rec.TokenType), nullStr(rec.Scope), nullStr(rec.AccountLabel),
+		nullTimeMS(rec.ObtainedAt), nullTimeMS(rec.AccessExpiresAt), nullTimeMS(rec.RefreshExpiresAt),
+		nullTimeMS(rec.LastRefreshAt), StateActive,
+		rec.UpstreamName, rec.UserID, refreshEnc)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ErrSuperseded
+	}
+	return nil
 }
 
 func userTokenRecordFromResponse(upstream, userID string, tr *tokenResponse) *UserTokenRecord {
@@ -539,10 +664,12 @@ func (s *Service) markUserNeedsReauth(ctx context.Context, upstream, userID, msg
 	}
 }
 
-// MarkUserUnauthorized is the public entry point for the gateway when a
-// per-user call comes back 401: that person's token is dead as far as the
-// upstream is concerned. Idempotent; a user with no row is a no-op.
+// MarkUserUnauthorized is the public entry point for the gateway when the
+// upstream still answers 401 after a refresh: that person's token is dead
+// as far as the upstream is concerned. Idempotent; a user with no row is a
+// no-op.
 func (s *Service) MarkUserUnauthorized(ctx context.Context, upstream, userID, msg string) {
+	defer s.lockUser(upstream, userID)()
 	if tok, err := s.GetUserToken(ctx, upstream, userID); err != nil || tok == nil || tok.State == StateNeedsReauth {
 		return
 	}
@@ -551,8 +678,11 @@ func (s *Service) MarkUserUnauthorized(ctx context.Context, upstream, userID, ms
 
 // DisconnectUser revokes one person's token at the IdP (best-effort, when
 // it has a revocation endpoint) and deletes their row. The client record
-// and everyone else's rows stay.
+// and everyone else's rows stay. It takes the person's lock, so a refresh
+// that is waiting on the provider finishes (and then finds its write
+// superseded) before the row goes.
 func (s *Service) DisconnectUser(ctx context.Context, upstream, userID string) error {
+	defer s.lockUser(upstream, userID)()
 	tok, err := s.GetUserToken(ctx, upstream, userID)
 	if err != nil {
 		return err

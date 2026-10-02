@@ -213,8 +213,9 @@ func (s *Service) toCfg(srv Server) gateway.UpstreamConfig {
 		staticHeaders := copyMap(srv.Headers)
 		resolver := s.secrets
 		var oauthFn func(ctx context.Context) map[string]string
+		perUser := srv.AuthMode == AuthPerUser
 		switch {
-		case srv.AuthMode == AuthPerUser:
+		case perUser:
 			cfg.PerUser = true
 			if s.perUser != nil {
 				cfg.PerUserAuth = s.perUser
@@ -248,6 +249,21 @@ func (s *Service) toCfg(srv Server) gateway.UpstreamConfig {
 						continue
 					}
 					out[k] = resolved
+				}
+				if perUser {
+					// Nothing static may stand in for the person. validate
+					// refuses a static Authorization on a per_user server;
+					// this keeps it out even on a row saved before that
+					// rule, in any letter case (Header.Set would merge
+					// them, so map order must not decide). With no bearer
+					// for the person the request carries no Authorization
+					// at all, and the gateway refuses the call before
+					// sending it (bearerOnFile).
+					for k := range out {
+						if strings.EqualFold(k, "Authorization") {
+							delete(out, k)
+						}
+					}
 				}
 				if oauthFn != nil {
 					for k, v := range oauthFn(ctx) {
@@ -342,7 +358,8 @@ func validate(srv Server) error {
 
 // validateAuthMode checks the sign-in mode: shared (or unset) is always
 // fine; per_user needs an http transport, since it works through the
-// OAuth bearer on each person's connection.
+// OAuth bearer on each person's connection, and no static Authorization
+// header, which would otherwise be sent as the person.
 func validateAuthMode(srv Server) error {
 	switch srv.AuthMode {
 	case "", AuthShared:
@@ -350,6 +367,11 @@ func validateAuthMode(srv Server) error {
 	case AuthPerUser:
 		if srv.Transport == "stdio" {
 			return fmt.Errorf("%w: per-user sign-in needs an http transport", ErrInvalid)
+		}
+		for k := range srv.Headers {
+			if strings.EqualFold(k, "Authorization") {
+				return fmt.Errorf("%w: header %q cannot be set on a server where each person signs in; the person's own token is the Authorization", ErrInvalid, k)
+			}
 		}
 		return nil
 	}

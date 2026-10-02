@@ -127,6 +127,12 @@ type PendingRecord struct {
 	// to UserID's oauth_user_tokens row, and only that user's browser may
 	// complete it.
 	PerUser bool
+	// BrowserBound marks a callback flow started from a dashboard session:
+	// the API set a flow cookie on that browser, and the callback accepts
+	// the flow only from a browser that presents it (or a session for
+	// UserID). A flow started without a browser (operator token) is not
+	// bound.
+	BrowserBound bool
 }
 
 // EventBus is the minimum the OAuth service needs from the realtime hub.
@@ -174,6 +180,12 @@ type Service struct {
 	// userReauthHook is the per-user counterpart: that user's connection
 	// to the upstream is dropped, nobody else's.
 	userReauthHook func(upstream, userID string)
+
+	// userLocks serialises everything that reads-then-writes one person's
+	// row (exchange, refresh, disconnect, a 401 mark), keyed by
+	// userKey(upstream, userID), so a refresh that waited on the provider
+	// cannot resurrect a row a disconnect deleted meanwhile.
+	userLocks map[string]*sync.Mutex
 }
 
 // New wires the service. dataDir is where we read/create oauth.key.
@@ -190,6 +202,7 @@ func New(db *store.DB, cipher *Cipher, bus EventBus, notifier Notifier, idents I
 		bearers:     map[string]*atomic.Value{},
 		userBearers: map[string]*atomic.Value{},
 		lastAttempt: map[string]time.Time{},
+		userLocks:   map[string]*sync.Mutex{},
 	}
 }
 
@@ -551,14 +564,17 @@ func (s *Service) DeleteClient(ctx context.Context, upstream string) error {
 // PKCE; B just receives the code via a paste form rather than a direct
 // browser redirect). Returns the authorization URL the dashboard should
 // open.
-func (s *Service) BeginCallback(ctx context.Context, upstream, userID, mode string, scopes []string) (authURL, state string, err error) {
-	return s.beginCallback(ctx, upstream, userID, mode, scopes, false)
+//
+// browserBound says the flow was started from a browser session the API
+// has bound a flow cookie to (see PendingRecord.BrowserBound).
+func (s *Service) BeginCallback(ctx context.Context, upstream, userID, mode string, scopes []string, browserBound bool) (authURL, state string, err error) {
+	return s.beginCallback(ctx, upstream, userID, mode, scopes, false, browserBound)
 }
 
 // beginCallback is BeginCallback with the per_user flag: a per-user flow
 // stores its token on userID's own row (see ExchangeCodeForUser) instead
 // of the upstream's shared one.
-func (s *Service) beginCallback(ctx context.Context, upstream, userID, mode string, scopes []string, perUser bool) (authURL, state string, err error) {
+func (s *Service) beginCallback(ctx context.Context, upstream, userID, mode string, scopes []string, perUser, browserBound bool) (authURL, state string, err error) {
 	if mode != ModeCallback && mode != ModePaste {
 		return "", "", fmt.Errorf("oauth: bad mode %q", mode)
 	}
@@ -576,15 +592,18 @@ func (s *Service) beginCallback(ctx context.Context, upstream, userID, mode stri
 	}
 	challenge := codeChallenge(verifier)
 	now := time.Now()
-	pu := 0
+	pu, bound := 0, 0
 	if perUser {
 		pu = 1
 	}
+	if browserBound {
+		bound = 1
+	}
 	_, err = s.db.ExecContext(ctx, `
         INSERT INTO oauth_pending(state, upstream_name, user_id, mode, code_verifier,
-            expires_at, created_at, per_user)
-        VALUES(?,?,?,?,?,?,?,?)
-    `, state, upstream, userID, mode, verifier, now.Add(PendingTTL).UnixMilli(), now.UnixMilli(), pu)
+            expires_at, created_at, per_user, browser_bound)
+        VALUES(?,?,?,?,?,?,?,?,?)
+    `, state, upstream, userID, mode, verifier, now.Add(PendingTTL).UnixMilli(), now.UnixMilli(), pu, bound)
 	if err != nil {
 		return "", "", err
 	}
@@ -636,14 +655,14 @@ func (s *Service) LoadPending(ctx context.Context, state string) (*PendingRecord
         SELECT state, upstream_name, user_id, mode, COALESCE(code_verifier,''),
                COALESCE(device_code,''), COALESCE(user_code,''),
                COALESCE(interval_s,0), COALESCE(verification_uri,''),
-               expires_at, created_at, per_user
+               expires_at, created_at, per_user, browser_bound
         FROM oauth_pending WHERE state = ?
     `, state)
 	var p PendingRecord
 	var exp, created int64
-	var perUser int
+	var perUser, bound int
 	if err := row.Scan(&p.State, &p.UpstreamName, &p.UserID, &p.Mode, &p.CodeVerifier,
-		&p.DeviceCode, &p.UserCode, &p.IntervalS, &p.VerificationURI, &exp, &created, &perUser); err != nil {
+		&p.DeviceCode, &p.UserCode, &p.IntervalS, &p.VerificationURI, &exp, &created, &perUser, &bound); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, ErrPendingNotFound
 		}
@@ -652,6 +671,7 @@ func (s *Service) LoadPending(ctx context.Context, state string) (*PendingRecord
 	p.ExpiresAt = time.UnixMilli(exp)
 	p.CreatedAt = time.UnixMilli(created)
 	p.PerUser = perUser == 1
+	p.BrowserBound = bound == 1
 	if time.Now().After(p.ExpiresAt) {
 		// Expired — clean up and report as not found so the API layer
 		// returns a uniform 400 either way.

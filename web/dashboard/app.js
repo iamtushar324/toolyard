@@ -2270,7 +2270,7 @@ function renderConnectionCard(r) {
   }
   return el('div', { class: 'card key-card' },
     el('h2', {}, r.server),
-    r.url ? el('p', { class: 'meta' }, r.url) : null,
+    r.host ? el('p', { class: 'meta' }, r.host) : null,
     el('div', { class: 'key-facts' }, facts),
     r.state === 'needs_reauth' && r.last_error ? el('div', { class: 'err' }, r.last_error) : null,
     actions,

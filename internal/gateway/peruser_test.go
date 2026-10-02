@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -151,16 +152,32 @@ func (b *bearerUpstream) denyBearer(v string) {
 }
 
 // fakeUserTokens is the per-user token store: connected users and their
-// bearers per upstream, plus the 401 marks the gateway reported.
+// bearers per upstream, the 401 marks the gateway reported, and what a
+// refresh does: switch to the next bearer when one is queued (a refresh
+// token that works), else fail the way the store does when there is
+// nothing to refresh with (the row is marked, errNoRefresh returned).
 type fakeUserTokens struct {
 	mu      sync.Mutex
 	tokens  map[string]map[string]string // upstream -> user -> bearer
+	next    map[string]map[string]string // upstream -> user -> bearer a refresh switches to
+	expired map[string]bool              // "upstream/user" whose access token has expired (FreshenUserToken refreshes)
 	marked  []string                     // "upstream/user"
+	refresh []string                     // "upstream/user" per RefreshUserToken call
+	freshen []string                     // "upstream/user" per FreshenUserToken call
 	listErr error
+	// empty, when set, makes UserHeaderFunc return nothing for that
+	// "upstream/user" although UserConnected still says yes (a read or
+	// decrypt failure, or a flip between the check and the request).
+	empty map[string]bool
 }
 
+var errNoRefresh = errors.New("fake: nothing to refresh with")
+
 func newFakeUserTokens() *fakeUserTokens {
-	return &fakeUserTokens{tokens: map[string]map[string]string{}}
+	return &fakeUserTokens{
+		tokens: map[string]map[string]string{}, next: map[string]map[string]string{},
+		expired: map[string]bool{}, empty: map[string]bool{},
+	}
 }
 
 func (f *fakeUserTokens) connect(upstream, uid, bearer string) {
@@ -170,6 +187,58 @@ func (f *fakeUserTokens) connect(upstream, uid, bearer string) {
 		f.tokens[upstream] = map[string]string{}
 	}
 	f.tokens[upstream][uid] = bearer
+}
+
+// canRefreshTo queues the bearer a refresh for (upstream, uid) yields.
+func (f *fakeUserTokens) canRefreshTo(upstream, uid, bearer string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.next[upstream] == nil {
+		f.next[upstream] = map[string]string{}
+	}
+	f.next[upstream][uid] = bearer
+}
+
+// refreshLocked applies a queued refresh or marks the row. Caller holds f.mu.
+func (f *fakeUserTokens) refreshLocked(upstream, uid string) error {
+	if nb, ok := f.next[upstream][uid]; ok {
+		delete(f.next[upstream], uid)
+		f.tokens[upstream][uid] = nb
+		return nil
+	}
+	f.marked = append(f.marked, upstream+"/"+uid)
+	delete(f.tokens[upstream], uid)
+	return errNoRefresh
+}
+
+func (f *fakeUserTokens) FreshenUserToken(_ context.Context, upstream, uid string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.freshen = append(f.freshen, upstream+"/"+uid)
+	if !f.expired[upstream+"/"+uid] {
+		return nil
+	}
+	delete(f.expired, upstream+"/"+uid)
+	return f.refreshLocked(upstream, uid)
+}
+
+func (f *fakeUserTokens) RefreshUserToken(_ context.Context, upstream, uid string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.refresh = append(f.refresh, upstream+"/"+uid)
+	return f.refreshLocked(upstream, uid)
+}
+
+func (f *fakeUserTokens) refreshes() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.refresh...)
+}
+
+func (f *fakeUserTokens) freshens() []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.freshen...)
 }
 
 func (f *fakeUserTokens) ConnectedUsers(_ context.Context, upstream string) ([]string, error) {
@@ -205,7 +274,7 @@ func (f *fakeUserTokens) UserHeaderFunc(upstream string) func(ctx context.Contex
 		f.mu.Lock()
 		defer f.mu.Unlock()
 		tok, ok := f.tokens[upstream][uid]
-		if !ok {
+		if !ok || f.empty[upstream+"/"+uid] {
 			return nil
 		}
 		return map[string]string{"Authorization": "Bearer " + tok}
@@ -533,11 +602,22 @@ func TestPerUserIdleSweepAndCap(t *testing.T) {
 		}
 	}
 
-	// Cap of one: alice's call evicts bob's connection.
+	// Per-user cap of one: alice's call evicts bob's connection. The
+	// shared cap does not touch per-user connections (their own pool).
 	f.gw.SetMaxLiveUpstreams(1)
 	f.call(t, agAlice, "linear.get_whoami")
-	if n := f.gw.LiveUpstreamCount(); n != 1 {
-		t.Fatalf("live under cap 1 = %d", n)
+	if n := f.gw.PerUserLiveCount(); n != 2 {
+		t.Fatalf("per-user live under a shared cap of 1 = %d, want 2 (separate pool)", n)
+	}
+	// Admission runs on a dial: drop alice's live connection so her next
+	// call dials, and that dial evicts bob (the pool is at its cap).
+	f.gw.SetMaxLivePerUser(1)
+	f.svc.DropUserConnection("linear", uAlice)
+	if res := f.call(t, agAlice, "linear.get_whoami"); res.IsError || text(res) != "Bearer tok-alice" {
+		t.Fatalf("alice under per-user cap 1 ran as %q", text(res))
+	}
+	if n := f.gw.PerUserLiveCount(); n != 1 {
+		t.Fatalf("per-user live under per-user cap 1 = %d", n)
 	}
 }
 

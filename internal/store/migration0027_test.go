@@ -86,9 +86,9 @@ func TestMigration0027AppliesToExistingDB(t *testing.T) {
 	if err := db.QueryRow(`SELECT auth_mode FROM upstream_servers WHERE name = 'linear'`).Scan(&mode); err != nil || mode != "shared" {
 		t.Fatalf("existing server auth_mode = %q (err %v), want shared", mode, err)
 	}
-	var perUser int
-	if err := db.QueryRow(`SELECT per_user FROM oauth_pending WHERE state = 'st1'`).Scan(&perUser); err != nil || perUser != 0 {
-		t.Fatalf("existing pending per_user = %d (err %v), want 0", perUser, err)
+	var perUser, bound int
+	if err := db.QueryRow(`SELECT per_user, browser_bound FROM oauth_pending WHERE state = 'st1'`).Scan(&perUser, &bound); err != nil || perUser != 0 || bound != 0 {
+		t.Fatalf("existing pending per_user = %d browser_bound = %d (err %v), want 0 0", perUser, bound, err)
 	}
 	var label sql.NullString
 	if err := db.QueryRow(`SELECT account_label FROM oauth_tokens WHERE upstream_name = 'linear'`).Scan(&label); err != nil || label.Valid {

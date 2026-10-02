@@ -244,10 +244,18 @@ func (s *Server) oauthBegin(w http.ResponseWriter, r *http.Request, name string)
 		writeError(w, http.StatusBadRequest, "use /device-begin for the device flow")
 		return
 	}
-	authURL, state, err := s.oauth.BeginCallback(r.Context(), name, uid, body.Mode, body.Scopes)
+	// A flow started from a browser is bound to it: the begin response
+	// sets a flow cookie the callback checks (see oauth_flow_cookie.go).
+	// An operator token has no browser to bind, so its flow stays open
+	// to whoever opens the authorize URL, as before.
+	bound := body.Mode == oauth.ModeCallback && operatorFromContext(r.Context()) == nil
+	authURL, state, err := s.oauth.BeginCallback(r.Context(), name, uid, body.Mode, body.Scopes, bound)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
+	}
+	if bound {
+		s.setOAuthFlowCookie(w, r, state, uid)
 	}
 	_ = s.audit.Write(r.Context(), audit.Event{
 		EventType:     "oauth.begin",
@@ -364,11 +372,8 @@ func (s *Server) oauthCallback(w http.ResponseWriter, r *http.Request) {
 		s.oauthUserCallback(w, r, p, code)
 		return
 	}
-	// A shared flow is an admin's. Members can reach this route (their
-	// own flows come back here too), so make sure one isn't finishing
-	// somebody else's.
-	if u, ok := s.sessionUser(r); ok && u.Role != identity.RoleAdmin {
-		oauthHTMLError(w, "This authorization was started by an admin for the server's shared account; only an admin can finish it.")
+	s.clearOAuthFlowCookie(w, r, state)
+	if !s.sharedFlowBrowserOK(w, r, p) {
 		return
 	}
 	rec, err := s.oauth.ExchangeCode(r.Context(), p.UpstreamName, code, p.CodeVerifier)
@@ -387,24 +392,74 @@ func (s *Server) oauthCallback(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write([]byte(oauthSuccessHTML(p.UpstreamName, rec.AccessExpiresAt)))
 }
 
+// sharedFlowBrowserOK decides whether this browser may finish an admin's
+// shared-account flow. An admin's session passes (same-site in dev, where
+// the session cookie is Lax). Without a session, a browser-bound flow
+// needs the flow cookie for (state, the admin who started it), and that
+// admin must still be an active admin. An unbound flow (started with an
+// operator token, no browser to bind) passes as before. A member's
+// session, or a bound flow without its cookie, is refused and the flow
+// burnt: the code it carried was consumed by the redirect anyway, so
+// nothing legitimate is lost and nothing can be replayed.
+func (s *Server) sharedFlowBrowserOK(w http.ResponseWriter, r *http.Request, p *oauth.PendingRecord) bool {
+	if u, ok := s.sessionUser(r); ok {
+		if u.Role != identity.RoleAdmin {
+			_ = s.oauth.DeletePending(r.Context(), p.State)
+			oauthHTMLError(w, "This authorization was started by an admin for the server's shared account; only an admin can finish it.")
+			return false
+		}
+		return true
+	}
+	if !p.BrowserBound {
+		return true
+	}
+	if s.oauthFlowCookieValid(r, p.State, p.UserID) {
+		if u, err := s.identity.GetUserByID(r.Context(), p.UserID); err == nil && u.Status == identity.StatusActive && u.Role == identity.RoleAdmin {
+			return true
+		}
+	}
+	_ = s.oauth.DeletePending(r.Context(), p.State)
+	oauthHTMLError(w, "This authorization did not come back to the browser that started it (or its cookie is missing). Nothing was stored. Start it again from the dashboard.")
+	return false
+}
+
 // oauthUserCallback finishes a per-user flow: the browser coming back must
-// be signed in as the person who started it, or no token is stored and the
-// pending row is burnt. The token lands on that person's own row; the
-// server's tool list is loaded if this was its first sign-in.
+// be the one that started it, for the same person, or no token is stored
+// and the pending row is burnt. In production the session cookie is
+// SameSite=Strict and absent on this cross-site return, so the proof is
+// the flow cookie set at begin; a session for the same user (dev, Lax)
+// passes too. The token lands on that person's own row; the server's tool
+// list is loaded if this was its first sign-in.
 func (s *Server) oauthUserCallback(w http.ResponseWriter, r *http.Request, p *oauth.PendingRecord, code string) {
+	s.clearOAuthFlowCookie(w, r, p.State)
 	u, ok := s.sessionUser(r)
-	if !ok || u.ID != p.UserID {
+	switch {
+	case ok && u.ID == p.UserID:
+		// The person's own session.
+	case !ok && s.oauthFlowCookieValid(r, p.State, p.UserID):
+		owner, err := s.identity.GetUserByID(r.Context(), p.UserID)
+		if err != nil || owner.Status != identity.StatusActive {
+			_ = s.oauth.DeletePending(r.Context(), p.State)
+			oauthHTMLError(w, "Your toolyard account is not active. Nothing was stored.")
+			return
+		}
+		u = owner
+	default:
+		// Another user's session, or no proof at all: burn the flow. The
+		// authorization code was consumed by the redirect that brought
+		// us here, so the real person cannot finish it either way and
+		// must start over; deleting closes any replay window.
 		_ = s.oauth.DeletePending(r.Context(), p.State)
 		_ = s.audit.Write(r.Context(), audit.Event{
 			EventType: "oauth.user_mismatch", UpstreamName: p.UpstreamName,
-			ResultSummary: "sign-in for " + p.UpstreamName + " came back in another user's browser; no token stored",
+			ResultSummary: "sign-in for " + p.UpstreamName + " came back in a browser that is not the person's; no token stored",
 			Raiser:        actor.Raiser{OwnerUserID: p.UserID},
 		})
-		if !ok {
-			oauthHTMLError(w, "You are not signed in to toolyard in this browser. Sign in, then start the connection again from My connections.")
+		if ok {
+			oauthHTMLError(w, "This sign-in was started by a different toolyard user. Nothing was stored. Start your own from My connections.")
 			return
 		}
-		oauthHTMLError(w, "This sign-in was started by a different toolyard user. Nothing was stored. Start your own from My connections.")
+		oauthHTMLError(w, "This sign-in did not come back to the browser that started it (or its cookie is missing). Nothing was stored. Start again from My connections, in the same browser.")
 		return
 	}
 	rec, err := s.oauth.ExchangeCodeForUser(r.Context(), p.UpstreamName, u.ID, code, p.CodeVerifier)

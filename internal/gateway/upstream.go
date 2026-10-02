@@ -73,11 +73,25 @@ type upstream struct {
 	// hit). May be nil in tests that construct upstreams directly.
 	pool *Gateway
 
-	// mu guards the client field for all lifecycle transitions:
-	// connect, suspend, resume, and close. It is NOT held during
-	// tool RPCs — mcp-go transports are explicitly goroutine-safe.
+	// mu guards the client field and the circuit-breaker state. It is
+	// held only for short reads and writes, never across a dial or while
+	// looking at another connection, so no two connection locks are ever
+	// nested (pool admission reads every connection's state). It is NOT
+	// held during tool RPCs — mcp-go transports are explicitly
+	// goroutine-safe.
 	mu     sync.Mutex
 	client *client.Client // nil when suspended
+
+	// dialMu serialises resume(): one goroutine dials while the others
+	// wait and find the connection live. It is held across the dial and
+	// across pool admission, with mu released.
+	dialMu sync.Mutex
+
+	// retired is set when the connection was dropped from its pool (a
+	// per-user connection whose person disconnected, re-authenticated or
+	// was rejected). A retired connection never dials again; a call that
+	// still holds it gets errRetired and resolves the replacement.
+	retired atomic.Bool
 
 	// lastUsed is unix nanos of the most recent callTool (or the time
 	// the upstream connected, whichever is later). The idle sweeper
@@ -423,36 +437,66 @@ func closeWithTimeout(name string, c io.Closer, timeout time.Duration) {
 	}
 }
 
-// resume reconnects a suspended upstream. Safe to call concurrently: the
-// lock ensures only one goroutine does the work; subsequent callers return
-// immediately once the connection is live.
+// errRetired is what a dropped connection answers instead of dialling.
+var errRetired = errors.New("upstream connection retired")
+
+// retire marks the connection dropped from its pool and closes it.
+func (u *upstream) retire() {
+	u.retired.Store(true)
+	_ = u.close()
+}
+
+// resume reconnects a suspended upstream. Safe to call concurrently:
+// dialMu ensures only one goroutine does the work; subsequent callers
+// return once the connection is live.
 //
 // Before reconnecting we ask the pool for a slot — if the live-upstream
 // cap is full, the least-recently-used live upstream is suspended to make
 // room. This is the load-bearing piece of the pool: any upstream can be
-// transparently re-dialed on next use, so eviction is free.
+// transparently re-dialed on next use, so eviction is free. Admission
+// reads other connections' state, so it runs with this connection's mu
+// released: two connections resuming at once never wait on each other's
+// locks.
 func (u *upstream) resume(ctx context.Context) error {
+	u.dialMu.Lock()
+	defer u.dialMu.Unlock()
+	if u.retired.Load() {
+		return errRetired
+	}
 	u.mu.Lock()
-	defer u.mu.Unlock()
 	if u.client != nil {
+		u.mu.Unlock()
 		return nil // already running
 	}
 	// Circuit breaker: while a recent dial failure's backoff window is
 	// still open, fail fast with the last error rather than re-dialing.
 	if !u.nextRetryAt.IsZero() && time.Now().Before(u.nextRetryAt) {
-		return fmt.Errorf("upstream %s in backoff for %s after %d failures: %w",
+		err := fmt.Errorf("upstream %s in backoff for %s after %d failures: %w",
 			u.cfg.Name, time.Until(u.nextRetryAt).Round(time.Second),
 			u.consecutiveFailures, u.lastDialErr)
+		u.mu.Unlock()
+		return err
 	}
+	u.mu.Unlock()
+
 	if u.pool != nil {
 		u.pool.acquireSlot(u)
 	}
 	fresh, err := newUpstream(ctx, u.cfg)
+
+	u.mu.Lock()
+	defer u.mu.Unlock()
 	if err != nil {
 		u.consecutiveFailures++
 		u.lastDialErr = err
 		u.nextRetryAt = time.Now().Add(upstreamBackoff(u.consecutiveFailures))
 		return err
+	}
+	if u.retired.Load() {
+		// Dropped while dialling: do not keep a connection the pool no
+		// longer tracks.
+		closeWithTimeout(u.label(), fresh.client, 5*time.Second)
+		return errRetired
 	}
 	u.client = fresh.client
 	u.consecutiveFailures = 0

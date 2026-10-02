@@ -248,8 +248,11 @@ func TestConnectionsMemberFlow(t *testing.T) {
 	// A fresh flow with no browser session is refused too.
 	rec = e.do(t, adaCookie, http.MethodPost, "/v1/me/connections/linear/begin", "{}")
 	_ = json.Unmarshal(rec.Body.Bytes(), &begun)
-	if rec := e.callback(t, nil, begun.State, "ada"); rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "not signed in") {
+	if rec := e.callback(t, nil, begun.State, "ada"); rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "did not come back to the browser") {
 		t.Fatalf("anonymous on a per-user callback: %d %s", rec.Code, rec.Body.String())
+	}
+	if rows := userTokenRows(t, e, "linear"); len(rows) != 0 {
+		t.Fatalf("token rows after an anonymous callback = %v", rows)
 	}
 
 	// Ada's own browser finishes her flow: token stored on her row, the
@@ -371,7 +374,13 @@ func TestConnectionsSharedFlowStaysAdminOnly(t *testing.T) {
 	if tokens != 0 {
 		t.Fatal("member's browser stored the shared token")
 	}
-	// The flow is still the admin's to finish.
+	// The member's attempt burnt the flow; the admin starts over and, in
+	// their own browser (session cookie, as in dev), finishes it.
+	if rec := e.callback(t, adminCookie, begun.State, "bot"); rec.Code != http.StatusBadRequest || !strings.Contains(rec.Body.String(), "expired or was already used") {
+		t.Fatalf("admin on the burnt flow: %d %s", rec.Code, rec.Body.String())
+	}
+	rec = e.do(t, adminCookie, http.MethodPost, "/v1/servers/shared/oauth/begin", `{"mode":"callback"}`)
+	_ = json.Unmarshal(rec.Body.Bytes(), &begun)
 	rec = e.callback(t, adminCookie, begun.State, "bot")
 	if rec.Code != http.StatusOK || !strings.Contains(rec.Body.String(), "Authorized") {
 		t.Fatalf("admin on the shared callback: %d %s", rec.Code, rec.Body.String())

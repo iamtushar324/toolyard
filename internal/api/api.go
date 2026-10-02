@@ -419,6 +419,9 @@ func (s *Server) health(w http.ResponseWriter, r *http.Request) {
 		"upstreams_idle":    s.gateway.SuspendedUpstreamCount(),
 		"upstreams_max":     s.gateway.MaxLiveUpstreams(),
 		"upstreams_backoff": s.gateway.UpstreamsInBackoff(),
+		// Per-user connections (per_user servers) have their own pool.
+		"upstreams_per_user_live": s.gateway.PerUserLiveCount(),
+		"upstreams_per_user_max":  s.gateway.MaxLivePerUser(),
 		// upstreams_recovered counts upstream MCP sessions re-established
 		// after the server dropped them (expiry, restart).
 		"upstreams_recovered": s.gateway.SessionRecoveries(),

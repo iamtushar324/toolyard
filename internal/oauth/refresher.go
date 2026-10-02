@@ -228,7 +228,9 @@ func (s *Service) refreshUserTokens(ctx context.Context, now time.Time) {
 			continue
 		}
 		s.recordAttempt(key, now)
-		if _, err := s.RefreshUser(ctx, c.upstream, c.user); err != nil {
+		// A superseded write means the row changed while the provider was
+		// answering (a reconnect or disconnect): nothing failed.
+		if _, err := s.RefreshUser(ctx, c.upstream, c.user); err != nil && !errors.Is(err, ErrSuperseded) {
 			s.handleUserRefreshFailure(ctx, c.upstream, c.user, c.failures+1, err)
 		}
 	}

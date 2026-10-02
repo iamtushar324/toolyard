@@ -165,7 +165,12 @@ type Gateway struct {
 	// next call). poolMu serializes admission decisions so two
 	// concurrent resumes can't both think they have a slot.
 	maxLiveUpstreams int
-	poolMu           sync.Mutex
+	// maxLivePerUser is the same cap for the per-user connections of
+	// per_user upstreams, which form their own pool: people signing in
+	// never evict a shared (often stdio) server, and a shared server
+	// never evicts a person's session. 0 = unbounded.
+	maxLivePerUser int
+	poolMu         sync.Mutex
 
 	// inFlight is the live count of routeEntry calls currently executing
 	// (not yet returned). Surfaced via /v1/health and the dashboard so a
@@ -710,6 +715,36 @@ func (g *Gateway) MaxLiveUpstreams() int {
 	return g.maxLiveUpstreams
 }
 
+// SetMaxLivePerUser configures the cap on simultaneously-live per-user
+// connections (the per_user upstreams' pool). 0 = unbounded.
+func (g *Gateway) SetMaxLivePerUser(n int) {
+	if n < 0 {
+		n = 0
+	}
+	g.poolMu.Lock()
+	g.maxLivePerUser = n
+	g.poolMu.Unlock()
+}
+
+// MaxLivePerUser returns the per-user pool's cap (0 = unbounded).
+func (g *Gateway) MaxLivePerUser() int {
+	g.poolMu.Lock()
+	defer g.poolMu.Unlock()
+	return g.maxLivePerUser
+}
+
+// PerUserLiveCount returns how many per-user connections currently hold a
+// live transport. Surfaced via /v1/health.
+func (g *Gateway) PerUserLiveCount() int {
+	n := 0
+	for _, u := range g.allUpstreams() {
+		if u.userID != "" && !u.suspended() {
+			n++
+		}
+	}
+	return n
+}
+
 // LiveUpstreamCount returns how many upstreams currently hold a live
 // transport. Counterpart to SuspendedUpstreamCount.
 func (g *Gateway) LiveUpstreamCount() int {
@@ -775,19 +810,25 @@ func (g *Gateway) acquireSlot(self *upstream) {
 
 // pickEvictionCandidate returns the LRU upstream that should be suspended
 // to admit `self`, along with the observed live count and cap. Returns
-// (nil, _, _) when no eviction is needed (cap=0 or count<cap).
-// Separated from acquireSlot so unit tests can exercise the selection
-// without needing real mcp-go clients to .Close().
+// (nil, _, _) when no eviction is needed (cap=0 or count<cap). A per-user
+// connection (self.userID set) is admitted against the per-user pool and
+// its cap, a shared upstream against the shared pool: neither ever evicts
+// from the other. Separated from acquireSlot so unit tests can exercise
+// the selection without needing real mcp-go clients to .Close().
 func (g *Gateway) pickEvictionCandidate(self *upstream) (*upstream, int, int) {
+	perUser := self.userID != ""
 	g.poolMu.Lock()
 	limit := g.maxLiveUpstreams
+	if perUser {
+		limit = g.maxLivePerUser
+	}
 	g.poolMu.Unlock()
 	if limit <= 0 {
 		return nil, 0, 0
 	}
 	var candidates []*upstream
 	for _, u := range g.allUpstreams() {
-		if u != self {
+		if u != self && (u.userID != "") == perUser {
 			candidates = append(candidates, u)
 		}
 	}

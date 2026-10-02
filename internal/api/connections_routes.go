@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"net/http"
+	"net/url"
 	"sort"
 	"strings"
 	"time"
@@ -32,7 +33,9 @@ func (s *Server) connectionRoutes(mux *http.ServeMux) {
 // connectionView is one row of My connections.
 type connectionView struct {
 	Server string `json:"server"`
-	URL    string `json:"url,omitempty"`
+	// Host is the server URL's host only: a URL can embed a key in its
+	// path or query, and this list is for members.
+	Host string `json:"host,omitempty"`
 	// State: connected | needs_signin | expired | needs_reauth.
 	State        string `json:"state"`
 	AccountLabel string `json:"account_label,omitempty"`
@@ -120,6 +123,15 @@ func ms(t time.Time) int64 {
 	return t.UnixMilli()
 }
 
+// urlHost is the host of a server URL, or "" when it does not parse.
+func urlHost(raw string) string {
+	u, err := url.Parse(raw)
+	if err != nil {
+		return ""
+	}
+	return u.Host
+}
+
 // meConnections — any signed-in user.
 //
 //	GET /v1/me/connections -> [connectionView]
@@ -151,7 +163,7 @@ func (s *Server) meConnections(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		v := connectionView{
-			Server: sv.Name, URL: sv.URL, State: oauth.ConnNeedsSignIn, Ready: ready,
+			Server: sv.Name, Host: urlHost(sv.URL), State: oauth.ConnNeedsSignIn, Ready: ready,
 			ServerStatus: sv.LastStatus, Enabled: sv.Enabled, ToolCount: sv.ToolCount,
 		}
 		if !sv.Enabled {
@@ -232,6 +244,13 @@ func (s *Server) meConnectionBegin(w http.ResponseWriter, r *http.Request, u *id
 		writeError(w, http.StatusConflict, "this server is disabled")
 		return
 	}
+	// The token is stored only for a browser the callback can tie to the
+	// person (the flow cookie set below). An operator token is not a
+	// browser, so there is nothing to bind the return to.
+	if operatorFromContext(ctx) != nil {
+		writeError(w, http.StatusConflict, "a personal sign-in has to be started from the dashboard's My connections page, in the browser that will finish it")
+		return
+	}
 	authURL, state, err := s.oauth.BeginForUser(ctx, name, u.ID)
 	if err != nil {
 		if errors.Is(err, oauth.ErrClientNotFound) {
@@ -241,6 +260,7 @@ func (s *Server) meConnectionBegin(w http.ResponseWriter, r *http.Request, u *id
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	s.setOAuthFlowCookie(w, r, state, u.ID)
 	_ = s.audit.Write(ctx, audit.Event{
 		EventType: "oauth.user_begin", AgentID: "user:" + u.ID, UpstreamName: name, ResultSummary: name,
 		Raiser: actor.Raiser{OwnerUserID: u.ID, OwnerEmail: u.Email, OwnerName: u.Label()},
