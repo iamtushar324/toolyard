@@ -11,7 +11,7 @@ import (
 func TestValidateRefusesGatewayNames(t *testing.T) {
 	for _, name := range []string{
 		"builtin", "fixture", "memory", "tools", "mempalace", "notes", "skills",
-		"inbox", "session", "lake", "events", "policies", "servers", "audit", "access", "toolyard",
+		"inbox", "session", "lake", "events", "policies", "servers", "audit", "access", "toolyard", "connections",
 	} {
 		err := validate(Server{Name: name, Transport: "http", URL: "http://127.0.0.1:1/mcp"})
 		if !errors.Is(err, ErrReserved) {

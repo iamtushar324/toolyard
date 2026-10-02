@@ -526,6 +526,49 @@ func TestConnectionsStatusAndLink(t *testing.T) {
 	}
 }
 
+// TestConnectionsToolsInCodeMode: code mode binds the connections tools
+// under the one toolyard server, as toolyard.connections_status and
+// toolyard.connections_link, for a member too; a script's call hands back
+// the same redeemable link.
+func TestConnectionsToolsInCodeMode(t *testing.T) {
+	f := newConnectFixture(t)
+	up := newBearerUpstream(t)
+	f.add(t, "linear", upstreams.AuthPerUser, up)
+	f.client(t, "linear")
+
+	listing := text(f.call(t, f.agBob, gateway.CodeModeListToolFiles, nil))
+	for _, want := range []string{"  toolyard/\n", "    connections_link.pyi\n", "    connections_status.pyi\n"} {
+		if !strings.Contains(listing, want) {
+			t.Errorf("member listing missing %q:\n%s", want, listing)
+		}
+	}
+	if strings.Contains(listing, "  connections/") {
+		t.Fatalf("connections bound as its own server instead of under toolyard:\n%s", listing)
+	}
+	stub := text(f.call(t, f.agBob, gateway.CodeModeReadToolFile, map[string]any{"fileName": "servers/toolyard/connections_link.pyi"}))
+	if !strings.Contains(stub, "def connections_link(") || !strings.Contains(stub, "server: str") {
+		t.Fatalf("connections_link stub:\n%s", stub)
+	}
+
+	res := f.call(t, f.agBob, gateway.CodeModeExecuteToolCode, map[string]any{"code": "result = toolyard.connections_status()"})
+	if res.IsError {
+		t.Fatalf("status script: %s", text(res))
+	}
+	// A script receives the tool's text; the link is in it.
+	_, ret, ok := strings.Cut(text(res), "Return value: ")
+	if !ok || !strings.Contains(ret, "linear (per_user): needs_signin") || !strings.Contains(ret, "clickable Markdown link") {
+		t.Fatalf("status script return:\n%s", text(res))
+	}
+	f.redeem(t, linkIn(t, ret), cfBob, "linear", oauth.ConnectPurposePerUser, f.agBob)
+
+	res = f.call(t, f.agBob, gateway.CodeModeExecuteToolCode, map[string]any{"code": `result = toolyard.connections_link(server="linear")`})
+	if res.IsError {
+		t.Fatalf("link script: %s", text(res))
+	}
+	_, ret, _ = strings.Cut(text(res), "Return value: ")
+	f.redeem(t, linkIn(t, ret), cfBob, "linear", oauth.ConnectPurposePerUser, f.agBob)
+}
+
 // stubConnect is a ConnectProvider with one per_user server nobody has
 // connected, for the wiring test.
 type stubConnect struct{}

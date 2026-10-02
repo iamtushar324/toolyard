@@ -657,7 +657,7 @@ func TestAccessWhoami(t *testing.T) {
 		t.Fatalf("client = %v", client)
 	}
 	always, _ := m["always_on"].([]any)
-	if !reflect.DeepEqual(always, []any{"access", "audit", "inbox", "policies", "servers", "session", "tools"}) {
+	if !reflect.DeepEqual(always, []any{"access", "audit", "connections", "inbox", "policies", "servers", "session", "tools"}) {
 		t.Fatalf("always_on = %v", always)
 	}
 	a := whoami(f.admin)

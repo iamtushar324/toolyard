@@ -539,7 +539,7 @@ func (g *Gateway) RegisterBuiltins() {
 
 // reservedUpstreamName reports whether name belongs to the gateway itself:
 // the synthetic upstreams (builtin, fixture, inbox, session, policies,
-// servers, audit, access), the meta-tool group "tools", the built-in data
+// servers, audit, access, connections), the meta-tool group "tools", the built-in data
 // groups whose tools are registered under the "builtin" upstream (memory,
 // lake, events), and "toolyard", the code-mode server every internal tool
 // is bound under. An upstream with one of these names would register tools
