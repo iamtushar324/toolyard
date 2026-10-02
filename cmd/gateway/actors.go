@@ -10,6 +10,8 @@ package main
 
 import (
 	"context"
+	"errors"
+	"log"
 	"net/http"
 	"strings"
 
@@ -83,8 +85,15 @@ func (a mcpAuth) guard(next http.Handler) http.Handler {
 			return
 		}
 		ag, err := a.verify(r.Context(), raw)
-		if err != nil {
+		if errors.Is(err, identity.ErrAgentTokenInvalid) {
 			writeMCPUnauthorized(w, "toolyard: invalid agent token; re-enroll via the dashboard")
+			return
+		}
+		if err != nil {
+			// Not a verdict on the token (the database could not answer):
+			// a 401 here would tell clients to throw away a good token.
+			log.Printf("mcp-auth: WARN token check failed: %v", err)
+			writeMCPUnavailable(w, "toolyard: could not check the agent token right now; retry")
 			return
 		}
 		in := mcpIngress{agent: ag, raiser: mcpRaiser(r, ag, a.sec)}
@@ -104,6 +113,13 @@ func (a mcpAuth) contextFunc(ctx context.Context, r *http.Request) context.Conte
 		return ctx
 	}
 	return actor.WithRaiser(gateway.WithAgentID(ctx, in.agent.ID), in.raiser)
+}
+
+func writeMCPUnavailable(w http.ResponseWriter, msg string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.Header().Set("Retry-After", "5")
+	w.WriteHeader(http.StatusServiceUnavailable)
+	_, _ = w.Write([]byte(`{"jsonrpc":"2.0","error":{"code":-32002,"message":"` + msg + `"}}`))
 }
 
 func writeMCPUnauthorized(w http.ResponseWriter, msg string) {
