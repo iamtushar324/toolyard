@@ -181,6 +181,9 @@ type Gateway struct {
 	// remembers which agent owns a `_session_id` (actor.go).
 	clientCache
 	sessionCache
+	// accessToolsState backs the policies.*, servers.*, audit.* and
+	// access.* tools (access_tools.go).
+	accessToolsState
 
 	// owners resolves a caller to its dashboard user for per_user
 	// upstreams; publicURL is where their My connections page lives.
@@ -519,6 +522,7 @@ func (g *Gateway) RegisterBuiltins() {
 	entries = append(entries, g.metaTools()...)
 	entries = append(entries, g.approvalMetaTools()...)
 	entries = append(entries, g.codeModeTools()...)
+	entries = append(entries, g.accessTools()...)
 	if g.lake != nil {
 		entries = append(entries, g.lakeTools()...)
 	}
@@ -528,19 +532,22 @@ func (g *Gateway) RegisterBuiltins() {
 }
 
 // reservedUpstreamName reports whether name belongs to the gateway itself:
-// the synthetic upstreams (builtin, fixture, inbox, session), the meta-tool
-// group "tools", and the built-in data groups whose tools are registered
-// under the "builtin" upstream (memory, lake, events). An upstream with one
-// of these names would register tools under the same prefix as the
-// built-ins and share their access group: "tools" is always-on, so a server
-// called tools would be reachable by every member without a grant.
+// the synthetic upstreams (builtin, fixture, inbox, session, policies,
+// servers, audit, access), the meta-tool group "tools", the built-in data
+// groups whose tools are registered under the "builtin" upstream (memory,
+// lake, events), and "toolyard", the code-mode server every internal tool
+// is bound under. An upstream with one of these names would register tools
+// under the same prefix as the built-ins and share their access group:
+// "tools" is always-on, so a server called tools would be reachable by
+// every member without a grant.
 //
 // notes and skills are deliberately not here: they are real upstreams that
 // startup registers under those names (upstreams.UpsertBuiltin), and their
 // access group is the upstream name like any other server's.
 func reservedUpstreamName(name string) bool {
 	switch name {
-	case builtinUpstream, "fixture", inboxUpstream, sessionUpstream, "tools", "memory", "lake", "events":
+	case builtinUpstream, "fixture", inboxUpstream, sessionUpstream, "tools", "memory", "lake", "events",
+		policiesUpstream, serversUpstream, auditUpstream, accessUpstream, toolyardServer:
 		return true
 	}
 	return false

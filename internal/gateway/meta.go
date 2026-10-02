@@ -7,6 +7,9 @@ import (
 	"strings"
 
 	"github.com/mark3labs/mcp-go/mcp"
+
+	"github.com/tusharbhardwaj/toolyard/internal/actor"
+	"github.com/tusharbhardwaj/toolyard/internal/codemode"
 )
 
 // Meta-tool names. They live under the synthetic upstream "tools" so the
@@ -133,6 +136,12 @@ func (g *Gateway) handleExecuteTool() directHandler {
 		target, _ := args["tool"].(string)
 		if strings.TrimSpace(target) == "" {
 			return mcp.NewToolResultError("tool is required"), nil
+		}
+		// A script may reach tools.execute (toolyard.tools_execute) but
+		// not code mode itself: a nested executeToolCode would only
+		// recurse, one worker slot per level.
+		if r, ok := actor.RaiserFrom(ctx); ok && r.Via == codemode.Via && isCodeModeTool(target) {
+			return mcp.NewToolResultErrorf("%s cannot be called from code mode: call the tools you need directly in the script", target), nil
 		}
 		inner, _ := args["arguments"].(map[string]any)
 		if inner == nil {

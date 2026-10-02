@@ -209,6 +209,39 @@ func (e *Engine) List() []ToolPolicy {
 	return out
 }
 
+// WithChange returns a detached copy of the engine's rule set with one
+// change applied: action allow|ask|deny upserts the (scope,target) rule,
+// "" removes it. The copy has no database, so it can only Eval; nothing
+// is persisted. It is how the agent-facing policies.set works out what a
+// change would do to every tool's effective access before making it.
+func (e *Engine) WithChange(scope, target, action string) *Engine {
+	e.mu.RLock()
+	byTool := make(map[string]ToolPolicy, len(e.byTool)+1)
+	for k, v := range e.byTool {
+		byTool[k] = v
+	}
+	byUp := make(map[string]ToolPolicy, len(e.byUp)+1)
+	for k, v := range e.byUp {
+		byUp[k] = v
+	}
+	e.mu.RUnlock()
+	m := byTool
+	if scope == ScopeUpstream {
+		m = byUp
+	}
+	if action == "" {
+		delete(m, target)
+	} else {
+		p, ok := m[target]
+		if !ok {
+			p = ToolPolicy{ID: "tp_simulated", Scope: scope, Target: target}
+		}
+		p.Action = action
+		m[target] = p
+	}
+	return &Engine{byTool: byTool, byUp: byUp}
+}
+
 // Get returns the stored policy for a (scope,target), if any.
 func (e *Engine) Get(scope, target string) (ToolPolicy, bool) {
 	e.mu.RLock()

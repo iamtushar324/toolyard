@@ -523,6 +523,9 @@ func runServe(argv []string) error {
 	gw.RegisterBuiltins()
 	defer gw.Close()
 	identityKeysSvc.SetCaller(gw)
+	// policies.set by an agent disables a tool's learned auto-approval
+	// rule on ask/deny, as the dashboard's policy editor does.
+	gw.SetAutoApproval(autoApprover)
 
 	// Auto-execute on approve: when the human (or an auto-rule) flips
 	// an approval to allowed, the bus invokes Gateway.Execute on a
@@ -716,6 +719,8 @@ func runServe(argv []string) error {
 	// connection.
 	upstreamSvc.SetPerUserAuth(oauthSvc)
 	oauthSvc.SetUserReauthHook(upstreamSvc.DropUserConnection)
+	// servers.list / servers.reconnect for agents (access_tools.go).
+	gw.SetServersProvider(serversAdapter{upstreams: upstreamSvc, oauth: oauthSvc})
 	if err := oauthSvc.PrimeBearers(ctx); err != nil {
 		log.Printf("oauth: prime bearers: %v", err)
 	}
