@@ -156,3 +156,22 @@ func (t *toolyardAPI) createServer(s toolyardServer) (serverResult, string, int,
 	_ = json.Unmarshal(reply, &r)
 	return r, "", code, nil
 }
+
+// hasOAuthClient reports whether toolyard already holds an OAuth app for a
+// server.
+func (t *toolyardAPI) hasOAuthClient(name string) (bool, error) {
+	var st struct {
+		HasClient bool `json:"has_client"`
+	}
+	if _, err := t.do(http.MethodGet, "/v1/servers/"+url.PathEscape(name)+"/oauth", nil, &st); err != nil {
+		return false, err
+	}
+	return st.HasClient, nil
+}
+
+// putManualClient stores an OAuth app for a server. toolyard fills in its own
+// redirect URI.
+func (t *toolyardAPI) putManualClient(name string, body map[string]any) error {
+	_, err := t.do(http.MethodPost, "/v1/servers/"+url.PathEscape(name)+"/oauth/manual-client", body, nil)
+	return err
+}

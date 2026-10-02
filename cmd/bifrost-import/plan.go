@@ -68,11 +68,15 @@ func secretName(prefix, server, header string) string {
 	return n
 }
 
+// tailnet is 100.64.0.0/10 (carrier-grade NAT), where Tailscale addresses
+// live; net.IP.IsPrivate does not cover it.
+var tailnet = &net.IPNet{IP: net.IPv4(100, 64, 0, 0), Mask: net.CIDRMask(10, 32)}
+
 // privateHost reports whether toolyard, outside Bifrost's network, cannot
-// reach host: Swarm service names, localhost and private address ranges.
+// reach host: Swarm service names, localhost, private and tailnet ranges.
 func privateHost(host string) bool {
 	if ip := net.ParseIP(host); ip != nil {
-		return ip.IsPrivate() || ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsUnspecified()
+		return ip.IsPrivate() || ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsUnspecified() || tailnet.Contains(ip)
 	}
 	h := strings.ToLower(host)
 	return !strings.Contains(h, ".") || strings.HasSuffix(h, ".internal") ||
@@ -135,7 +139,7 @@ func planOne(c bifrostClient, opt planOptions) planItem {
 	switch c.ConnType {
 	case "http":
 	case "stdio":
-		return skip("runs as a local program (%s) inside the Bifrost container; toolyard's public instance refuses local programs", c.StdioCommand)
+		return skip("runs as a local program inside the Bifrost container (%s); toolyard's public instance refuses local programs", stdioSummary(c))
 	case "sse":
 		return skip("SSE transport; toolyard speaks streamable HTTP only")
 	case "inprocess":
@@ -310,4 +314,99 @@ func (p planItem) scrub(text string) string {
 		text = text[:400] + "…"
 	}
 	return text
+}
+
+// stdioSummary shows a local program's command line with anything that
+// could be a credential hidden, and its environment variable names only.
+func stdioSummary(c bifrostClient) string {
+	parts := []string{c.StdioCommand}
+	for _, a := range c.StdioArgs {
+		if k, v, ok := strings.Cut(a, "="); ok && len(v) >= 8 {
+			a = k + "=…"
+		} else if !ok && (tokenLike(a) || len(a) >= 32) {
+			a = "…"
+		}
+		parts = append(parts, a)
+	}
+	out := strings.Join(parts, " ")
+	var envs []string
+	for _, e := range c.StdioEnvs {
+		name, _, _ := strings.Cut(e, "=")
+		envs = append(envs, name)
+	}
+	if len(envs) > 0 {
+		out += "; env: " + strings.Join(envs, ", ")
+	}
+	return out
+}
+
+// oauthItem is one OAuth app to copy into toolyard for a server it already
+// has. Client is a credential: never print its secret.
+type oauthItem struct {
+	Server string
+	Skip   string
+	Client *bifrostOAuthClient
+	Body   map[string]any // POST /v1/servers/{name}/oauth/manual-client
+	Host   string         // token endpoint host, safe to print
+}
+
+// planOAuth picks the OAuth apps to copy. Only hand-made apps qualify: one
+// Bifrost registered itself (registration_url set) is tied to Bifrost's own
+// callback URL, so toolyard registers its own instead (oauth/discover).
+func planOAuth(clients []bifrostClient, inToolyard, hasClient map[string]bool) []oauthItem {
+	var out []oauthItem
+	for _, c := range clients {
+		if c.AuthType != "oauth" && c.AuthType != "per_user_oauth" {
+			continue
+		}
+		it := oauthItem{Server: c.Name, Client: c.OAuth}
+		switch o := c.OAuth; {
+		case o == nil:
+			it.Skip = "Bifrost has no OAuth app for it"
+		case o.ReadErr != "":
+			it.Skip = "could not read its OAuth app: " + o.ReadErr
+		case o.RegistrationURL != "":
+			it.Skip = "Bifrost registered this app for its own callback; let toolyard register its own (oauth/discover)"
+		case o.ClientID == "" || o.AuthorizeURL == "" || o.TokenURL == "":
+			it.Skip = "its OAuth app is missing a client id or an endpoint"
+		case !inToolyard[c.Name]:
+			it.Skip = "not in toolyard yet; add the server first"
+		case hasClient[c.Name]:
+			it.Skip = "toolyard already has an OAuth app for it"
+		}
+		if it.Skip == "" {
+			o := c.OAuth
+			if u, err := url.Parse(o.TokenURL); err == nil {
+				it.Host = u.Host
+			}
+			body := map[string]any{
+				"client_id":              o.ClientID,
+				"authorization_endpoint": o.AuthorizeURL,
+				"token_endpoint":         o.TokenURL,
+			}
+			if o.ClientSecret != "" {
+				body["client_secret"] = o.ClientSecret
+			}
+			if len(o.Scopes) > 0 {
+				body["scopes"] = o.Scopes
+			}
+			// Google issues a refresh token only for offline access, and
+			// toolyard has to keep the sign-in alive.
+			if u, err := url.Parse(o.AuthorizeURL); err == nil && u.Hostname() == "accounts.google.com" {
+				body["extra_authorize_params"] = map[string]string{"access_type": "offline", "prompt": "consent"}
+			}
+			it.Body = body
+		}
+		out = append(out, it)
+	}
+	return out
+}
+
+// scrubOAuth hides an OAuth app's credentials from text toolyard returned.
+func (it oauthItem) scrub(text string) string {
+	if it.Client == nil {
+		return text
+	}
+	p := planItem{Secrets: []secretItem{{Value: it.Client.ClientSecret}, {Value: it.Client.ClientID}}}
+	return p.scrub(text)
 }

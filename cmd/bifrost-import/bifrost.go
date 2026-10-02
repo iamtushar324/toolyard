@@ -83,6 +83,10 @@ type bifrostClient struct {
 	URL                 string
 	Headers             map[string]string
 	StdioCommand        string
+	StdioArgs           []string
+	StdioEnvs           []string
+	OAuthConfigID       string
+	OAuth               *bifrostOAuthClient
 	ToolsToExecute      []string
 	ToolsListed         bool
 	AllowedExtraHeaders []string
@@ -105,20 +109,20 @@ func readBifrost(dbPath, passphrase string) ([]bifrostClient, error) {
 		COALESCE(tools_to_execute_json, ''), COALESCE(headers_json, ''),
 		COALESCE(allowed_extra_headers_json, ''), COALESCE(auth_type, ''),
 		COALESCE(per_user_header_keys_json, ''), COALESCE(disabled, 0),
-		COALESCE(encryption_status, '')
+		COALESCE(encryption_status, ''), COALESCE(oauth_config_id, '')
 		FROM config_mcp_clients ORDER BY name`)
 	if err != nil {
 		return nil, fmt.Errorf("read config_mcp_clients: %w", err)
 	}
 	type rawRow struct {
-		name, connType, connString, stdio, tls, tools, headers, extra, auth, perUser, encStatus string
-		disabled                                                                                int64
+		name, connType, connString, stdio, tls, tools, headers, extra, auth, perUser, encStatus, oauthID string
+		disabled                                                                                         int64
 	}
 	var raws []rawRow
 	for rows.Next() {
 		var r rawRow
 		if err := rows.Scan(&r.name, &r.connType, &r.connString, &r.stdio, &r.tls, &r.tools,
-			&r.headers, &r.extra, &r.auth, &r.perUser, &r.disabled, &r.encStatus); err != nil {
+			&r.headers, &r.extra, &r.auth, &r.perUser, &r.disabled, &r.encStatus, &r.oauthID); err != nil {
 			rows.Close()
 			return nil, err
 		}
@@ -135,6 +139,10 @@ func readBifrost(dbPath, passphrase string) ([]bifrostClient, error) {
 	if passphrase != "" {
 		key = bifrostKey(passphrase)
 	}
+	oauthClients, err := readOAuthClients(db, key)
+	if err != nil {
+		return nil, err
+	}
 	out := make([]bifrostClient, 0, len(raws))
 	for _, r := range raws {
 		c := bifrostClient{
@@ -142,6 +150,10 @@ func readBifrost(dbPath, passphrase string) ([]bifrostClient, error) {
 			ConnType: r.connType,
 			AuthType: r.auth,
 			Disabled: r.disabled != 0,
+		}
+		if r.oauthID != "" {
+			c.OAuthConfigID = r.oauthID
+			c.OAuth = oauthClients[r.oauthID]
 		}
 		encrypted := r.encStatus == "encrypted"
 		var errs []string
@@ -193,10 +205,12 @@ func readBifrost(dbPath, passphrase string) ([]bifrostClient, error) {
 
 		if r.stdio != "" && r.stdio != "null" {
 			var s struct {
-				Command string `json:"command"`
+				Command string   `json:"command"`
+				Args    []string `json:"args"`
+				Envs    []string `json:"envs"`
 			}
 			_ = json.Unmarshal([]byte(r.stdio), &s)
-			c.StdioCommand = s.Command
+			c.StdioCommand, c.StdioArgs, c.StdioEnvs = s.Command, s.Args, s.Envs
 		}
 		c.HasTLSConfig = r.tls != "" && r.tls != "null" && r.tls != "{}"
 		if r.tools != "" && r.tools != "null" {
@@ -211,6 +225,82 @@ func readBifrost(dbPath, passphrase string) ([]bifrostClient, error) {
 		}
 		c.ReadErr = strings.Join(errs, "; ")
 		out = append(out, c)
+	}
+	return out, nil
+}
+
+// bifrostOAuthClient is one oauth_configs row: the OAuth app Bifrost signs
+// in with, not anyone's token. ClientSecret is a credential: never print it.
+type bifrostOAuthClient struct {
+	ClientID        string
+	ClientSecret    string
+	AuthorizeURL    string
+	TokenURL        string
+	RegistrationURL string
+	Scopes          []string
+	Status          string
+	ReadErr         string
+}
+
+// readOAuthClients reads every oauth_configs row by id. client_secret is
+// encrypted when it is a literal and encryption is on; client_id and the
+// URLs are plain, and either may be an env. reference. Rows whose sign-in
+// was "revoked" still hold the client settings, so none are skipped here.
+func readOAuthClients(db *sql.DB, key []byte) (map[string]*bifrostOAuthClient, error) {
+	var n int
+	if err := db.QueryRow(`SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'oauth_configs'`).Scan(&n); err != nil || n == 0 {
+		return map[string]*bifrostOAuthClient{}, err
+	}
+	rows, err := db.Query(`SELECT id, COALESCE(client_id, ''), COALESCE(client_secret, ''),
+		COALESCE(authorize_url, ''), COALESCE(token_url, ''), COALESCE(registration_url, ''),
+		COALESCE(scopes, ''), COALESCE(status, ''), COALESCE(encryption_status, '')
+		FROM oauth_configs`)
+	if err != nil {
+		return nil, fmt.Errorf("read oauth_configs: %w", err)
+	}
+	type rawRow struct{ id, clientID, secret, authURL, tokenURL, regURL, scopes, status, encStatus string }
+	var raws []rawRow
+	for rows.Next() {
+		var r rawRow
+		if err := rows.Scan(&r.id, &r.clientID, &r.secret, &r.authURL, &r.tokenURL, &r.regURL,
+			&r.scopes, &r.status, &r.encStatus); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		raws = append(raws, r)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, err
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	out := make(map[string]*bifrostOAuthClient, len(raws))
+	for _, r := range raws {
+		o := &bifrostOAuthClient{AuthorizeURL: r.authURL, TokenURL: r.tokenURL, RegistrationURL: r.regURL, Status: r.status}
+		var errs []string
+		var err error
+		if o.ClientID, err = resolveRef(strings.Trim(r.clientID, `"`)); err != nil {
+			errs = append(errs, "client_id: "+err.Error())
+		}
+		switch sec := r.secret; {
+		case sec == "":
+		case strings.HasPrefix(sec, "env.") || strings.HasPrefix(sec, "vault."):
+			if o.ClientSecret, err = resolveRef(sec); err != nil {
+				errs = append(errs, "client_secret: "+err.Error())
+			}
+		case r.encStatus == "encrypted":
+			if o.ClientSecret, err = bifrostDecrypt(key, strings.Trim(sec, `"`)); err != nil {
+				errs = append(errs, "client_secret: "+err.Error())
+			}
+		default:
+			o.ClientSecret = strings.Trim(sec, `"`)
+		}
+		if r.scopes != "" && r.scopes != "null" {
+			_ = json.Unmarshal([]byte(r.scopes), &o.Scopes)
+		}
+		o.ReadErr = strings.Join(errs, "; ")
+		out[r.id] = o
 	}
 	return out, nil
 }

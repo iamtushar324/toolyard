@@ -47,7 +47,7 @@ func bifrostDB(t *testing.T, rows [][]any) string {
 	if _, err := db.Exec(`CREATE TABLE config_mcp_clients (id INTEGER PRIMARY KEY, name TEXT, connection_type TEXT,
 		connection_string TEXT, stdio_config_json TEXT, tls_config_json TEXT, tools_to_execute_json TEXT,
 		headers_json TEXT, allowed_extra_headers_json TEXT, auth_type TEXT, per_user_header_keys_json TEXT,
-		disabled NUMERIC, encryption_status TEXT)`); err != nil {
+		disabled NUMERIC, encryption_status TEXT, oauth_config_id TEXT)`); err != nil {
 		t.Fatal(err)
 	}
 	for _, r := range rows {
@@ -269,5 +269,94 @@ func TestScrubBeforeClip(t *testing.T) {
 	out := p.scrub(strings.Repeat("x", 395) + " sk-live-ABCDEFGHIJKLMNOP")
 	if strings.Contains(out, "sk-live") {
 		t.Fatalf("part of the secret survived: %s", out[len(out)-40:])
+	}
+}
+
+func TestReadOAuthClients(t *testing.T) {
+	t.Setenv("BK_TEST_CLIENT_ID", "client-from-env")
+	path := bifrostDB(t, [][]any{
+		{"GoogleDriveForAgent", "http", "https://drivemcp.googleapis.com/mcp/v1", nil, nil, `["*"]`, `{}`, nil, "oauth", nil, 0, "plain_text"},
+	})
+	db, err := sql.Open("sqlite3", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`UPDATE config_mcp_clients SET oauth_config_id = 'cfg-1'`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`CREATE TABLE oauth_configs (id TEXT PRIMARY KEY, client_id TEXT, client_secret TEXT, authorize_url TEXT,
+		token_url TEXT, registration_url TEXT, redirect_uri TEXT, scopes TEXT, status TEXT, encryption_status TEXT)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO oauth_configs VALUES ('cfg-1', 'env.BK_TEST_CLIENT_ID', ?, 'https://accounts.google.com/o/oauth2/v2/auth',
+		'https://oauth2.googleapis.com/token', '', 'https://bifrost/api/oauth/callback', '["drive.readonly"]', 'revoked', 'encrypted')`, vectorURL); err != nil {
+		t.Fatal(err)
+	}
+	db.Close()
+	got, err := readBifrost(path, vectorPassphrase)
+	if err != nil {
+		t.Fatal(err)
+	}
+	o := got[0].OAuth
+	if o == nil || o.ReadErr != "" || o.ClientID != "client-from-env" || o.ClientSecret != "https://example.com/mcp" ||
+		o.TokenURL != "https://oauth2.googleapis.com/token" || len(o.Scopes) != 1 || o.Status != "revoked" {
+		t.Fatalf("oauth client: %+v", o)
+	}
+}
+
+func TestPlanOAuth(t *testing.T) {
+	manual := &bifrostOAuthClient{ClientID: "cid", ClientSecret: "csecret-123456", AuthorizeURL: "https://accounts.google.com/o/oauth2/v2/auth",
+		TokenURL: "https://oauth2.googleapis.com/token", Scopes: []string{"s1"}}
+	dcr := &bifrostOAuthClient{ClientID: "dyn", AuthorizeURL: "https://mcp.linear.app/authorize", TokenURL: "https://mcp.linear.app/token",
+		RegistrationURL: "https://mcp.linear.app/register"}
+	clients := []bifrostClient{
+		{Name: "Drive", AuthType: "oauth", OAuth: manual},
+		{Name: "Sheets", AuthType: "oauth", OAuth: manual},
+		{Name: "Linear", AuthType: "per_user_oauth", OAuth: dcr},
+		{Name: "Missing", AuthType: "oauth", OAuth: manual},
+		{Name: "NoApp", AuthType: "oauth"},
+		{Name: "Plain", AuthType: "headers"},
+	}
+	items := planOAuth(clients, map[string]bool{"Drive": true, "Sheets": true, "Linear": true, "NoApp": true},
+		map[string]bool{"Sheets": true})
+	want := map[string]string{"Drive": "", "Sheets": "already has", "Linear": "registered this app", "Missing": "not in toolyard", "NoApp": "no OAuth app"}
+	if len(items) != len(want) {
+		t.Fatalf("items: %d", len(items))
+	}
+	for _, it := range items {
+		w := want[it.Server]
+		if w == "" && it.Skip != "" || w != "" && !strings.Contains(it.Skip, w) {
+			t.Errorf("%s: skip %q, want %q", it.Server, it.Skip, w)
+		}
+	}
+	d := items[0]
+	extra, _ := d.Body["extra_authorize_params"].(map[string]string)
+	if d.Body["client_secret"] != "csecret-123456" || extra["access_type"] != "offline" || d.Host != "oauth2.googleapis.com" {
+		t.Fatalf("drive body: %v host %s", d.Body, d.Host)
+	}
+	if out := d.scrub("bad client csecret-123456"); strings.Contains(out, "csecret-123456") {
+		t.Fatalf("scrub left the client secret: %s", out)
+	}
+}
+
+func TestTailnetIsPrivate(t *testing.T) {
+	for host, want := range map[string]bool{"100.70.17.52": true, "100.64.0.1": true, "100.127.255.254": true,
+		"100.63.0.1": false, "100.128.0.1": false, "13.127.140.53": false} {
+		if got := privateHost(host); got != want {
+			t.Errorf("%s: %v, want %v", host, got, want)
+		}
+	}
+}
+
+func TestStdioSummaryHidesValues(t *testing.T) {
+	out := stdioSummary(bifrostClient{StdioCommand: "uvx", StdioArgs: []string{"mcp-grafana", "--api-key=glsa_abcdefgh12345678", "-t", "abcdef1234567890xyz"},
+		StdioEnvs: []string{"GRAFANA_URL", "GRAFANA_API_KEY=glsa_secret_value"}})
+	for _, secret := range []string{"glsa_abcdefgh12345678", "abcdef1234567890xyz", "glsa_secret_value"} {
+		if strings.Contains(out, secret) {
+			t.Fatalf("stdio summary printed %q: %s", secret, out)
+		}
+	}
+	if !strings.Contains(out, "uvx mcp-grafana --api-key=…") || !strings.Contains(out, "env: GRAFANA_URL, GRAFANA_API_KEY") {
+		t.Fatalf("stdio summary: %s", out)
 	}
 }
