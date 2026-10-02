@@ -2,9 +2,12 @@ package main
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"sync/atomic"
 	"testing"
 
@@ -223,5 +226,31 @@ func TestTelegramDecider(t *testing.T) {
 	// person or a name.
 	if odd := telegramDecider("telegram:"); odd.UserID != "" || odd.Name != "" || odd.Via != actor.ViaTelegram {
 		t.Fatalf("malformed = %+v", odd)
+	}
+}
+
+// TestMCPAuthOnlyRejectsBadTokens: a token the check says is invalid gets
+// a 401; a check that could not run (a database error) gets a 503, so a
+// client never discards a good token over a transient failure.
+func TestMCPAuthOnlyRejectsBadTokens(t *testing.T) {
+	for _, tc := range []struct {
+		err  error
+		want int
+	}{
+		{identity.ErrAgentTokenInvalid, http.StatusUnauthorized},
+		{fmt.Errorf("wrapped: %w", identity.ErrAgentTokenInvalid), http.StatusUnauthorized},
+		{errors.New("database is locked"), http.StatusServiceUnavailable},
+		{context.DeadlineExceeded, http.StatusServiceUnavailable},
+	} {
+		auth := mcpAuth{verify: func(context.Context, string) (*identity.Agent, error) { return nil, tc.err }}
+		reached := false
+		h := auth.guard(http.HandlerFunc(func(http.ResponseWriter, *http.Request) { reached = true }))
+		req := httptest.NewRequest(http.MethodPost, "/mcp", strings.NewReader(`{}`))
+		req.Header.Set("Authorization", "Bearer ag_x.y")
+		rec := httptest.NewRecorder()
+		h.ServeHTTP(rec, req)
+		if rec.Code != tc.want || reached {
+			t.Errorf("verify err %v: status %d reached=%v, want %d", tc.err, rec.Code, reached, tc.want)
+		}
 	}
 }
