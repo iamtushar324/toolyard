@@ -9,7 +9,9 @@ import (
 	"strings"
 	"time"
 
+	"github.com/tusharbhardwaj/toolyard/internal/actor"
 	"github.com/tusharbhardwaj/toolyard/internal/audit"
+	"github.com/tusharbhardwaj/toolyard/internal/identity"
 	"github.com/tusharbhardwaj/toolyard/internal/oauth"
 )
 
@@ -358,6 +360,17 @@ func (s *Server) oauthCallback(w http.ResponseWriter, r *http.Request) {
 		oauthHTMLError(w, "Wrong mode for this state. Use 'paste' instead.")
 		return
 	}
+	if p.PerUser {
+		s.oauthUserCallback(w, r, p, code)
+		return
+	}
+	// A shared flow is an admin's. Members can reach this route (their
+	// own flows come back here too), so make sure one isn't finishing
+	// somebody else's.
+	if u, ok := s.sessionUser(r); ok && u.Role != identity.RoleAdmin {
+		oauthHTMLError(w, "This authorization was started by an admin for the server's shared account; only an admin can finish it.")
+		return
+	}
 	rec, err := s.oauth.ExchangeCode(r.Context(), p.UpstreamName, code, p.CodeVerifier)
 	if err != nil {
 		oauthHTMLError(w, "Token exchange failed: "+err.Error())
@@ -372,6 +385,50 @@ func (s *Server) oauthCallback(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
 	_, _ = w.Write([]byte(oauthSuccessHTML(p.UpstreamName, rec.AccessExpiresAt)))
+}
+
+// oauthUserCallback finishes a per-user flow: the browser coming back must
+// be signed in as the person who started it, or no token is stored and the
+// pending row is burnt. The token lands on that person's own row; the
+// server's tool list is loaded if this was its first sign-in.
+func (s *Server) oauthUserCallback(w http.ResponseWriter, r *http.Request, p *oauth.PendingRecord, code string) {
+	u, ok := s.sessionUser(r)
+	if !ok || u.ID != p.UserID {
+		_ = s.oauth.DeletePending(r.Context(), p.State)
+		_ = s.audit.Write(r.Context(), audit.Event{
+			EventType: "oauth.user_mismatch", UpstreamName: p.UpstreamName,
+			ResultSummary: "sign-in for " + p.UpstreamName + " came back in another user's browser; no token stored",
+			Raiser:        actor.Raiser{OwnerUserID: p.UserID},
+		})
+		if !ok {
+			oauthHTMLError(w, "You are not signed in to toolyard in this browser. Sign in, then start the connection again from My connections.")
+			return
+		}
+		oauthHTMLError(w, "This sign-in was started by a different toolyard user. Nothing was stored. Start your own from My connections.")
+		return
+	}
+	rec, err := s.oauth.ExchangeCodeForUser(r.Context(), p.UpstreamName, u.ID, code, p.CodeVerifier)
+	if err != nil {
+		oauthHTMLError(w, "Token exchange failed: "+err.Error())
+		return
+	}
+	_ = s.oauth.DeletePending(r.Context(), p.State)
+	go s.upstreams.ReconnectAfterUserAuth(context.Background(), p.UpstreamName, u.ID)
+	_ = s.audit.Write(r.Context(), audit.Event{
+		EventType: "oauth.user_success", AgentID: "user:" + u.ID, UpstreamName: p.UpstreamName,
+		ResultSummary: p.UpstreamName + " connected as " + nonEmpty(rec.AccountLabel, "(account not named)"),
+		Raiser:        actor.Raiser{OwnerUserID: u.ID, OwnerEmail: u.Email, OwnerName: u.Label()},
+	})
+	w.Header().Set("Content-Type", "text/html; charset=utf-8")
+	w.Header().Set("Cache-Control", "no-store")
+	_, _ = w.Write([]byte(oauthUserSuccessHTML(p.UpstreamName, rec.AccountLabel)))
+}
+
+func nonEmpty(s, fallback string) string {
+	if s == "" {
+		return fallback
+	}
+	return s
 }
 
 // oauthPaste accepts the post-redirect URL pasted by the user when the
@@ -413,6 +470,38 @@ func (s *Server) oauthPaste(w http.ResponseWriter, r *http.Request) {
 	p, err := s.oauth.LoadPending(r.Context(), state)
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	u, _ := s.sessionUser(r)
+	if p.PerUser {
+		// The same rule as the callback: the person who started it, or
+		// nothing is stored.
+		if u == nil || u.ID != p.UserID {
+			_ = s.oauth.DeletePending(r.Context(), state)
+			writeError(w, http.StatusForbidden, "this sign-in was started by a different toolyard user; nothing was stored")
+			return
+		}
+		rec, err := s.oauth.ExchangeCodeForUser(r.Context(), p.UpstreamName, u.ID, code, p.CodeVerifier)
+		if err != nil {
+			writeError(w, http.StatusBadGateway, err.Error())
+			return
+		}
+		_ = s.oauth.DeletePending(r.Context(), state)
+		go s.upstreams.ReconnectAfterUserAuth(context.Background(), p.UpstreamName, u.ID)
+		_ = s.audit.Write(r.Context(), audit.Event{
+			EventType: "oauth.user_success", AgentID: "user:" + u.ID, UpstreamName: p.UpstreamName,
+			ResultSummary: p.UpstreamName + " connected (paste) as " + nonEmpty(rec.AccountLabel, "(account not named)"),
+			Raiser:        actor.Raiser{OwnerUserID: u.ID, OwnerEmail: u.Email, OwnerName: u.Label()},
+		})
+		writeJSON(w, http.StatusOK, map[string]any{
+			"upstream":          p.UpstreamName,
+			"access_expires_at": nullableMS(rec.AccessExpiresAt),
+			"account_label":     rec.AccountLabel,
+		})
+		return
+	}
+	if u != nil && u.Role != identity.RoleAdmin {
+		writeError(w, http.StatusForbidden, "admin_only")
 		return
 	}
 	rec, err := s.oauth.ExchangeCode(r.Context(), p.UpstreamName, code, p.CodeVerifier)
@@ -555,6 +644,9 @@ func (s *Server) oauthStatus(w http.ResponseWriter, r *http.Request, name string
 		out["scope_granted"] = tok.Scope
 		out["is_pat"] = tok.IsPAT
 		out["last_error"] = tok.LastError
+		if tok.AccountLabel != "" {
+			out["account_label"] = tok.AccountLabel
+		}
 		if !tok.AccessExpiresAt.IsZero() {
 			out["access_expires_at"] = tok.AccessExpiresAt.UnixMilli()
 		}
@@ -689,6 +781,22 @@ func oauthSuccessHTML(name string, expires time.Time) string {
 <h1>✓ Authorized</h1>
 <p><strong>` + htmlEscape(name) + `</strong> is now connected to toolyard. You can close this tab.</p>` + exp + `
 <p style="color:#888;font-size:12px;margin-top:24px">If the dashboard tab does not auto-update, reload it.</p>
+</div></body></html>`
+}
+
+// oauthUserSuccessHTML is the page a person sees after connecting their own
+// account; the dashboard tab picks the change up on its own.
+func oauthUserSuccessHTML(name, account string) string {
+	as := ""
+	if account != "" {
+		as = " as <strong>" + htmlEscape(account) + "</strong>"
+	}
+	return `<!doctype html><html><head><meta charset="utf-8"><title>Connected — toolyard</title>
+<style>body{font:14px system-ui,sans-serif;color:#222;background:#f6f8fa;display:flex;align-items:center;justify-content:center;height:100vh;margin:0}div{background:#fff;border-radius:8px;padding:32px;box-shadow:0 4px 12px rgba(0,0,0,0.08);max-width:400px}h1{margin:0 0 8px;font-size:18px;color:#0a7}</style>
+</head><body><div>
+<h1>✓ Connected</h1>
+<p>Your agents now use <strong>` + htmlEscape(name) + `</strong>` + as + `. You can close this tab.</p>
+<p style="color:#888;font-size:12px;margin-top:24px">If My connections does not update on its own, reload it.</p>
 </div></body></html>`
 }
 

@@ -13,6 +13,10 @@
 //	PATCH /v1/users/{id}          admin: role / status / servers
 //	POST /v1/users/{id}/revoke-sessions
 //	GET  /v1/me/servers           groups the caller may use
+//	GET  /v1/me/connections       per_user servers the caller may connect, with state
+//	POST /v1/me/connections/{server}/begin   start the caller's own sign-in
+//	DELETE /v1/me/connections/{server}       drop the caller's token
+//	GET  /v1/servers/{name}/connections      admin: who has connected a per_user server
 //
 //	GET  /v1/agents
 //	POST /v1/agents/enroll        creates a code (op uses it on the agent)
@@ -310,6 +314,7 @@ func (s *Server) Routes(mux *http.ServeMux) {
 	mux.HandleFunc("/v1/users", s.usersList)
 	mux.HandleFunc("/v1/users/", s.usersItem)
 	mux.HandleFunc("/v1/me/servers", s.meServers)
+	s.connectionRoutes(mux)
 
 	mux.HandleFunc("/v1/agents", s.agentsCollection)
 	mux.HandleFunc("/v1/agents/enroll", s.agentsEnroll)
@@ -1521,6 +1526,10 @@ func (s *Server) serversItem(w http.ResponseWriter, r *http.Request) {
 		if s.dispatchOAuth(w, r, name, subpath) {
 			return
 		}
+	}
+	if subpath == "connections" {
+		s.serversConnections(w, r, name)
+		return
 	}
 	if subpath == "convert-env" {
 		s.serversConvertEnv(w, r, name)

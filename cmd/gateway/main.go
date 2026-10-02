@@ -508,6 +508,8 @@ func runServe(argv []string) error {
 		UpstreamCallTimeout: *upstreamCallTimeout,
 		Access:              accessSvc,
 		Identity:            identityKeysSvc,
+		Owners:              accessSvc,
+		PublicURL:           *publicURL,
 	})
 	gw.RegisterBuiltins()
 	defer gw.Close()
@@ -700,6 +702,11 @@ func runServe(argv []string) error {
 		identityResolver{id: idSvc},
 	)
 	upstreamSvc.SetAuth(oauthSvc)
+	// Per-user sign-in: each person's bearer on their own connection, and
+	// a token the upstream or IdP rejects closes only that person's
+	// connection.
+	upstreamSvc.SetPerUserAuth(oauthSvc)
+	oauthSvc.SetUserReauthHook(upstreamSvc.DropUserConnection)
 	if err := oauthSvc.PrimeBearers(ctx); err != nil {
 		log.Printf("oauth: prime bearers: %v", err)
 	}
