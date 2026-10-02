@@ -98,7 +98,7 @@ type bifrostClient struct {
 	ReadErr string
 }
 
-func readBifrost(dbPath, passphrase string) ([]bifrostClient, error) {
+func readBifrost(dbPath, passphrase string, withOAuth bool) ([]bifrostClient, error) {
 	db, err := sql.Open("sqlite3", "file:"+dbPath+"?mode=ro&_busy_timeout=5000")
 	if err != nil {
 		return nil, err
@@ -139,9 +139,11 @@ func readBifrost(dbPath, passphrase string) ([]bifrostClient, error) {
 	if passphrase != "" {
 		key = bifrostKey(passphrase)
 	}
-	oauthClients, err := readOAuthClients(db, key)
-	if err != nil {
-		return nil, err
+	oauthClients := map[string]*bifrostOAuthClient{}
+	if withOAuth {
+		if oauthClients, err = readOAuthClients(db, key); err != nil {
+			return nil, err
+		}
 	}
 	out := make([]bifrostClient, 0, len(raws))
 	for _, r := range raws {
@@ -280,8 +282,14 @@ func readOAuthClients(db *sql.DB, key []byte) (map[string]*bifrostOAuthClient, e
 		o := &bifrostOAuthClient{AuthorizeURL: r.authURL, TokenURL: r.tokenURL, RegistrationURL: r.regURL, Status: r.status}
 		var errs []string
 		var err error
-		if o.ClientID, err = resolveRef(strings.Trim(r.clientID, `"`)); err != nil {
-			errs = append(errs, "client_id: "+err.Error())
+		// As SecretVar.Scan: a ref is recognised on the raw value, so a
+		// quoted "env.X" stays a literal.
+		if strings.HasPrefix(r.clientID, "env.") || strings.HasPrefix(r.clientID, "vault.") {
+			if o.ClientID, err = resolveRef(r.clientID); err != nil {
+				errs = append(errs, "client_id: "+err.Error())
+			}
+		} else {
+			o.ClientID = strings.Trim(r.clientID, `"`)
 		}
 		switch sec := r.secret; {
 		case sec == "":

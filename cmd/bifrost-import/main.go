@@ -32,6 +32,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net"
 	"net/url"
 	"os"
 	"strings"
@@ -65,7 +66,7 @@ func run(args []string, stdin io.Reader, stdout io.Writer) error {
 	}
 	// The password and every secret travel to this address.
 	if u, err := url.Parse(*base); err != nil || u.Host == "" ||
-		(u.Scheme != "https" && !(u.Scheme == "http" && privateHost(u.Hostname()))) {
+		(u.Scheme != "https" && !(u.Scheme == "http" && localTestHost(u.Hostname()))) {
 		return errors.New("-toolyard must be an https URL (plain http only for a private test address)")
 	}
 
@@ -92,7 +93,7 @@ func run(args []string, stdin io.Reader, stdout io.Writer) error {
 		return errors.New("-apply needs the toolyard password: -password-stdin or $TOOLYARD_PASSWORD")
 	}
 
-	clients, err := readBifrost(*dbPath, os.Getenv("BIFROST_ENCRYPTION_KEY"))
+	clients, err := readBifrost(*dbPath, os.Getenv("BIFROST_ENCRYPTION_KEY"), *oauthClients)
 	if err != nil {
 		return err
 	}
@@ -136,7 +137,7 @@ func run(args []string, stdin io.Reader, stdout io.Writer) error {
 		if *oauthClients {
 			if api == nil {
 				fmt.Fprintln(stdout, "\nOAuth apps: not checked (needs the toolyard password).")
-			} else if err := runOAuth(stdout, api, clients, plan, false); err != nil {
+			} else if err := runOAuth(stdout, api, clients, plan, opt.URLMap, false); err != nil {
 				return err
 			}
 		}
@@ -145,7 +146,7 @@ func run(args []string, stdin io.Reader, stdout io.Writer) error {
 	}
 	err = applyPlan(stdout, api, plan, existingSecrets)
 	if *oauthClients {
-		if oerr := runOAuth(stdout, api, clients, plan, true); oerr != nil && err == nil {
+		if oerr := runOAuth(stdout, api, clients, plan, opt.URLMap, true); oerr != nil && err == nil {
 			err = oerr
 		}
 	}
@@ -154,28 +155,38 @@ func run(args []string, stdin io.Reader, stdout io.Writer) error {
 
 // runOAuth plans, and with apply copies, the OAuth apps of OAuth servers that
 // are in toolyard, including ones created earlier in this run.
-func runOAuth(w io.Writer, api *toolyardAPI, clients []bifrostClient, plan []planItem, apply bool) error {
-	inToolyard, err := api.serverNames()
+func runOAuth(w io.Writer, api *toolyardAPI, clients []bifrostClient, plan []planItem, urlMap map[string]string, apply bool) error {
+	urls, err := api.serverURLs()
 	if err != nil {
 		return err
+	}
+	targets := map[string]oauthTarget{}
+	for name, u := range urls {
+		targets[name] = oauthTarget{URL: u}
 	}
 	if !apply {
 		// The plan counts servers this run is about to create.
 		for _, p := range plan {
 			if p.Skip == "" {
-				inToolyard[p.Name] = true
+				targets[p.Name] = oauthTarget{URL: p.Server.URL}
 			}
 		}
 	}
-	hasClient := map[string]bool{}
 	for _, c := range clients {
-		if (c.AuthType == "oauth" || c.AuthType == "per_user_oauth") && inToolyard[c.Name] {
-			if has, err := api.hasOAuthClient(c.Name); err == nil {
-				hasClient[c.Name] = has
+		t, ok := targets[c.Name]
+		if !ok || (c.AuthType != "oauth" && c.AuthType != "per_user_oauth") {
+			continue
+		}
+		if _, existing := urls[c.Name]; existing {
+			has, err := api.hasOAuthClient(c.Name)
+			if err != nil {
+				t.CheckErr = shortErr(err)
 			}
+			t.HasClient = has
+			targets[c.Name] = t
 		}
 	}
-	items := planOAuth(clients, inToolyard, hasClient)
+	items := planOAuth(clients, targets, urlMap)
 	fmt.Fprintf(w, "\nOAuth apps (never tokens): %d OAuth servers in Bifrost.\n", len(items))
 	var failed, copied int
 	for _, it := range items {
@@ -307,4 +318,21 @@ func applyPlan(w io.Writer, api *toolyardAPI, plan []planItem, existingSecrets m
 		return fmt.Errorf("%d server(s) not created or not confirmed", failed)
 	}
 	return nil
+}
+
+// shortErr shortens an error for a skip reason; toolyard's OAuth status errors
+// carry no request values.
+func shortErr(err error) string {
+	msg := err.Error()
+	if len(msg) > 200 {
+		msg = msg[:200] + "…"
+	}
+	return msg
+}
+
+// localTestHost is where plain http to toolyard is allowed: loopback and
+// RFC 1918 addresses only (a throwaway test instance), never the tailnet.
+func localTestHost(host string) bool {
+	ip := net.ParseIP(host)
+	return ip != nil && (ip.IsLoopback() || ip.IsPrivate())
 }

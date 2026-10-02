@@ -68,7 +68,7 @@ func TestReadBifrostDecryptsAndResolves(t *testing.T) {
 		{"Local", "stdio", nil, `{"command":"mcp-google-sheets","args":[],"envs":[]}`, nil, `["*"]`, `{}`, nil, "none", nil, 0, "encrypted"},
 	})
 	t.Setenv("BK_TEST_URL", "https://env.example.com/mcp")
-	got, err := readBifrost(path, vectorPassphrase)
+	got, err := readBifrost(path, vectorPassphrase, true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -89,7 +89,7 @@ func TestReadBifrostDecryptsAndResolves(t *testing.T) {
 	}
 
 	// Without the key, encrypted rows say so instead of failing the run.
-	got, err = readBifrost(path, "")
+	got, err = readBifrost(path, "", true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -293,7 +293,7 @@ func TestReadOAuthClients(t *testing.T) {
 		t.Fatal(err)
 	}
 	db.Close()
-	got, err := readBifrost(path, vectorPassphrase)
+	got, err := readBifrost(path, vectorPassphrase, true)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -309,17 +309,28 @@ func TestPlanOAuth(t *testing.T) {
 		TokenURL: "https://oauth2.googleapis.com/token", Scopes: []string{"s1"}}
 	dcr := &bifrostOAuthClient{ClientID: "dyn", AuthorizeURL: "https://mcp.linear.app/authorize", TokenURL: "https://mcp.linear.app/token",
 		RegistrationURL: "https://mcp.linear.app/register"}
+	drive := "https://drivemcp.googleapis.com/mcp/v1"
 	clients := []bifrostClient{
-		{Name: "Drive", AuthType: "oauth", OAuth: manual},
-		{Name: "Sheets", AuthType: "oauth", OAuth: manual},
-		{Name: "Linear", AuthType: "per_user_oauth", OAuth: dcr},
-		{Name: "Missing", AuthType: "oauth", OAuth: manual},
-		{Name: "NoApp", AuthType: "oauth"},
-		{Name: "Plain", AuthType: "headers"},
+		{Name: "Drive", ConnType: "http", URL: drive, AuthType: "oauth", OAuth: manual},
+		{Name: "Sheets", ConnType: "http", URL: drive, AuthType: "oauth", OAuth: manual},
+		{Name: "Linear", ConnType: "http", URL: "https://mcp.linear.app/mcp", AuthType: "per_user_oauth", OAuth: dcr},
+		{Name: "Missing", ConnType: "http", URL: drive, AuthType: "oauth", OAuth: manual},
+		{Name: "NoApp", ConnType: "http", URL: drive, AuthType: "oauth"},
+		{Name: "Elsewhere", ConnType: "http", URL: drive, AuthType: "oauth", OAuth: manual},
+		{Name: "Unchecked", ConnType: "http", URL: drive, AuthType: "oauth", OAuth: manual},
+		{Name: "Local", ConnType: "stdio", AuthType: "oauth", OAuth: manual},
+		{Name: "Mapped", ConnType: "http", URL: "http://mcp-server:3100/mcp", AuthType: "oauth", OAuth: manual},
+		{Name: "Plain", ConnType: "http", URL: drive, AuthType: "headers"},
 	}
-	items := planOAuth(clients, map[string]bool{"Drive": true, "Sheets": true, "Linear": true, "NoApp": true},
-		map[string]bool{"Sheets": true})
-	want := map[string]string{"Drive": "", "Sheets": "already has", "Linear": "registered this app", "Missing": "not in toolyard", "NoApp": "no OAuth app"}
+	targets := map[string]oauthTarget{
+		"Drive": {URL: drive}, "Sheets": {URL: drive, HasClient: true}, "Linear": {URL: "https://mcp.linear.app/mcp"},
+		"NoApp": {URL: drive}, "Elsewhere": {URL: "https://someone-else.example.com/mcp"},
+		"Unchecked": {URL: drive, CheckErr: "GET /v1/servers/Unchecked/oauth: 500"}, "Local": {URL: drive},
+		"Mapped": {URL: "https://mcp.beknown.live/mcp"},
+	}
+	items := planOAuth(clients, targets, map[string]string{"Mapped": "https://mcp.beknown.live/mcp"})
+	want := map[string]string{"Drive": "", "Sheets": "already has", "Linear": "registration endpoint", "Missing": "not in toolyard",
+		"NoApp": "no OAuth app", "Elsewhere": "points somewhere else", "Unchecked": "could not check", "Local": "not an HTTP server", "Mapped": ""}
 	if len(items) != len(want) {
 		t.Fatalf("items: %d", len(items))
 	}
@@ -349,14 +360,52 @@ func TestTailnetIsPrivate(t *testing.T) {
 }
 
 func TestStdioSummaryHidesValues(t *testing.T) {
-	out := stdioSummary(bifrostClient{StdioCommand: "uvx", StdioArgs: []string{"mcp-grafana", "--api-key=glsa_abcdefgh12345678", "-t", "abcdef1234567890xyz"},
+	out := stdioSummary(bifrostClient{StdioCommand: "uvx",
+		StdioArgs: []string{"mcp-grafana", "--api-key=glsa_abcdefgh12345678", "-t", "abcdef1234567890xyz",
+			"Authorization: Basic dXNlcjpwYXNzd29yZA==", "postgres://app:S3cretPass@db.internal/app?sslmode=require",
+			"-k=hunter2", "--password", "correcthorse", "--api-key", "ABCDEFGHIJKLMNOPQRS", "serve", "--debug"},
 		StdioEnvs: []string{"GRAFANA_URL", "GRAFANA_API_KEY=glsa_secret_value"}})
-	for _, secret := range []string{"glsa_abcdefgh12345678", "abcdef1234567890xyz", "glsa_secret_value"} {
+	for _, secret := range []string{"glsa_abcdefgh12345678", "abcdef1234567890xyz", "dXNlcjpwYXNzd29yZA", "S3cretPass",
+		"hunter2", "correcthorse", "ABCDEFGHIJKLMNOPQRS", "glsa_secret_value"} {
 		if strings.Contains(out, secret) {
 			t.Fatalf("stdio summary printed %q: %s", secret, out)
 		}
 	}
-	if !strings.Contains(out, "uvx mcp-grafana --api-key=…") || !strings.Contains(out, "env: GRAFANA_URL, GRAFANA_API_KEY") {
-		t.Fatalf("stdio summary: %s", out)
+	for _, keep := range []string{"uvx mcp-grafana --api-key=…", "-k=…", "--password …", "serve --debug", "env: GRAFANA_URL, GRAFANA_API_KEY"} {
+		if !strings.Contains(out, keep) {
+			t.Fatalf("stdio summary lost %q: %s", keep, out)
+		}
+	}
+}
+
+func TestQuotedEnvClientIDIsLiteral(t *testing.T) {
+	t.Setenv("BK_TEST_CID", "from-env")
+	path := bifrostDB(t, nil)
+	db, err := sql.Open("sqlite3", path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if _, err := db.Exec(`CREATE TABLE oauth_configs (id TEXT PRIMARY KEY, client_id TEXT, client_secret TEXT, authorize_url TEXT,
+		token_url TEXT, registration_url TEXT, redirect_uri TEXT, scopes TEXT, status TEXT, encryption_status TEXT)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.Exec(`INSERT INTO oauth_configs (id, client_id) VALUES ('a', '"env.BK_TEST_CID"'), ('b', 'env.BK_TEST_CID')`); err != nil {
+		t.Fatal(err)
+	}
+	got, err := readOAuthClients(db, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got["a"].ClientID != "env.BK_TEST_CID" || got["b"].ClientID != "from-env" {
+		t.Fatalf("quoted %q, ref %q", got["a"].ClientID, got["b"].ClientID)
+	}
+}
+
+func TestPlainHTTPOnlyForLocalTest(t *testing.T) {
+	for host, want := range map[string]bool{"172.23.0.1": true, "127.0.0.1": true, "100.70.17.52": false, "toolyard.dev.beknown.live": false} {
+		if got := localTestHost(host); got != want {
+			t.Errorf("%s: %v, want %v", host, got, want)
+		}
 	}
 }

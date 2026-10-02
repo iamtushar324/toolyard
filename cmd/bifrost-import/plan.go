@@ -316,14 +316,32 @@ func (p planItem) scrub(text string) string {
 	return text
 }
 
-// stdioSummary shows a local program's command line with anything that
-// could be a credential hidden, and its environment variable names only.
+var (
+	flagName    = regexp.MustCompile(`^--?[A-Za-z][\w-]*$`)
+	flagWithVal = regexp.MustCompile(`^(--?[A-Za-z][\w-]*)=`)
+	// packageName is a bare package or subcommand, e.g. "mcp-grafana",
+	// "@scope/pkg@1.2" or "serve"; anything else could be a value.
+	packageName = regexp.MustCompile(`^@?[a-z][a-z0-9._-]*(/[a-z0-9._-]+)?(@[A-Za-z0-9._-]+)?$`)
+)
+
+// stdioSummary shows a local program's command, its flag names and the bare
+// package or subcommand names it runs. Every value (a flag's, or anything
+// that is not a package-like word) is shown as "…", and environment
+// variables by name only.
 func stdioSummary(c bifrostClient) string {
 	parts := []string{c.StdioCommand}
+	afterFlag := false
 	for _, a := range c.StdioArgs {
-		if k, v, ok := strings.Cut(a, "="); ok && len(v) >= 8 {
-			a = k + "=…"
-		} else if !ok && (tokenLike(a) || len(a) >= 32) {
+		switch m := flagWithVal.FindStringSubmatch(a); {
+		case m != nil:
+			a, afterFlag = m[1]+"=…", false
+		case flagName.MatchString(a):
+			afterFlag = true
+		case afterFlag:
+			// The previous flag's value.
+			a, afterFlag = "…", false
+		case packageName.MatchString(a) && !tokenLike(a) && len(a) <= 64:
+		default:
 			a = "…"
 		}
 		parts = append(parts, a)
@@ -350,28 +368,57 @@ type oauthItem struct {
 	Host   string         // token endpoint host, safe to print
 }
 
-// planOAuth picks the OAuth apps to copy. Only hand-made apps qualify: one
-// Bifrost registered itself (registration_url set) is tied to Bifrost's own
-// callback URL, so toolyard registers its own instead (oauth/discover).
-func planOAuth(clients []bifrostClient, inToolyard, hasClient map[string]bool) []oauthItem {
+// oauthTarget is what toolyard has for a server name, as far as the OAuth
+// copy cares.
+type oauthTarget struct {
+	URL       string
+	HasClient bool
+	CheckErr  string // the OAuth state could not be read: never copy then
+}
+
+// sameOrigin reports whether two URLs share scheme, host and port.
+func sameOrigin(a, b string) bool {
+	ua, ea := url.Parse(a)
+	ub, eb := url.Parse(b)
+	return ea == nil && eb == nil && ua.Scheme != "" && ua.Scheme == ub.Scheme && strings.EqualFold(ua.Host, ub.Host)
+}
+
+// planOAuth picks the OAuth apps to copy. Only hand-made apps qualify: when
+// Bifrost recorded a registration endpoint the app may be registered to
+// Bifrost's own callback URL, so toolyard registers its own instead
+// (oauth/discover). A toolyard server qualifies only when it points at the
+// same origin as the Bifrost server (or its -url-map entry), so a different
+// server that merely shares the name never gets the app.
+func planOAuth(clients []bifrostClient, targets map[string]oauthTarget, urlMap map[string]string) []oauthItem {
 	var out []oauthItem
 	for _, c := range clients {
 		if c.AuthType != "oauth" && c.AuthType != "per_user_oauth" {
 			continue
 		}
 		it := oauthItem{Server: c.Name, Client: c.OAuth}
+		want := c.URL
+		if mapped, ok := urlMap[c.Name]; ok {
+			want = mapped
+		}
+		target, inToolyard := targets[c.Name]
 		switch o := c.OAuth; {
+		case c.ConnType != "http":
+			it.Skip = "not an HTTP server in Bifrost"
 		case o == nil:
 			it.Skip = "Bifrost has no OAuth app for it"
 		case o.ReadErr != "":
 			it.Skip = "could not read its OAuth app: " + o.ReadErr
 		case o.RegistrationURL != "":
-			it.Skip = "Bifrost registered this app for its own callback; let toolyard register its own (oauth/discover)"
+			it.Skip = "Bifrost recorded a registration endpoint, so this app may be registered to Bifrost's own callback; let toolyard register its own (oauth/discover)"
 		case o.ClientID == "" || o.AuthorizeURL == "" || o.TokenURL == "":
 			it.Skip = "its OAuth app is missing a client id or an endpoint"
-		case !inToolyard[c.Name]:
+		case !inToolyard:
 			it.Skip = "not in toolyard yet; add the server first"
-		case hasClient[c.Name]:
+		case !sameOrigin(target.URL, want):
+			it.Skip = "toolyard's server with this name points somewhere else"
+		case target.CheckErr != "":
+			it.Skip = "could not check toolyard's OAuth state: " + target.CheckErr
+		case target.HasClient:
 			it.Skip = "toolyard already has an OAuth app for it"
 		}
 		if it.Skip == "" {
