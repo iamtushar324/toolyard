@@ -405,12 +405,11 @@ func (g *Gateway) refusePerUser(ctx context.Context, entry toolEntry, agentID, r
 	cause error, ev *metrics.Event) *mcp.CallToolResult {
 	var msg string
 	switch {
-	case errors.Is(cause, ErrNoUserConnection):
-		msg = fmt.Sprintf("%s runs as each person's own account, and the person who owns this agent has not connected theirs yet. "+
-			"Open %s, connect %s, then retry. The call was not made.", entry.upstream, g.connectionsURL(), entry.upstream)
-	case errors.Is(cause, ErrUserSignInUnusable):
-		msg = fmt.Sprintf("%s runs as each person's own account, and the sign-in of the person who owns this agent could not be used right now (%v). "+
-			"If this keeps happening, open %s and reconnect %s. The call was not made.", entry.upstream, cause, g.connectionsURL(), entry.upstream)
+	case errors.Is(cause, ErrNoUserConnection), errors.Is(cause, ErrUserSignInUnusable):
+		// With connect links wired, the message carries a one-time link
+		// the agent shows the person (connections_tools.go); without
+		// them it names the My connections page.
+		msg = g.perUserConnectMessage(ctx, entry.upstream, uid, agentID, cause)
 	default:
 		msg = fmt.Sprintf("%s runs as each person's own account and toolyard could not tell whose agent this is; the call was not made.", entry.upstream)
 		log.Printf("per-user: tool=%s upstream=%s agent=%s refused: %v", entry.tool.Name, entry.upstream, agentID, cause)

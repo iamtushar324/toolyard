@@ -133,6 +133,19 @@ type PendingRecord struct {
 	// UserID). A flow started without a browser (operator token) is not
 	// bound.
 	BrowserBound bool
+	// ViaTicket marks a flow a one-time connect link started (see
+	// connect_tickets.go): the person came from their agent, not the
+	// dashboard. On a per_user flow the callback checks the provider's
+	// account against the person's email; the success page sends them
+	// back to the agent.
+	ViaTicket bool
+}
+
+// pendingFlags are the marks a flow is stored with on oauth_pending.
+type pendingFlags struct {
+	perUser      bool
+	browserBound bool
+	viaTicket    bool
 }
 
 // EventBus is the minimum the OAuth service needs from the realtime hub.
@@ -568,13 +581,13 @@ func (s *Service) DeleteClient(ctx context.Context, upstream string) error {
 // browserBound says the flow was started from a browser session the API
 // has bound a flow cookie to (see PendingRecord.BrowserBound).
 func (s *Service) BeginCallback(ctx context.Context, upstream, userID, mode string, scopes []string, browserBound bool) (authURL, state string, err error) {
-	return s.beginCallback(ctx, upstream, userID, mode, scopes, false, browserBound)
+	return s.beginFlow(ctx, upstream, userID, mode, scopes, pendingFlags{browserBound: browserBound})
 }
 
-// beginCallback is BeginCallback with the per_user flag: a per-user flow
-// stores its token on userID's own row (see ExchangeCodeForUser) instead
-// of the upstream's shared one.
-func (s *Service) beginCallback(ctx context.Context, upstream, userID, mode string, scopes []string, perUser, browserBound bool) (authURL, state string, err error) {
+// beginFlow is BeginCallback with every flag: perUser stores the token on
+// userID's own row (see ExchangeCodeForUser) instead of the upstream's
+// shared one; viaTicket marks a flow a connect link started.
+func (s *Service) beginFlow(ctx context.Context, upstream, userID, mode string, scopes []string, f pendingFlags) (authURL, state string, err error) {
 	if mode != ModeCallback && mode != ModePaste {
 		return "", "", fmt.Errorf("oauth: bad mode %q", mode)
 	}
@@ -592,18 +605,12 @@ func (s *Service) beginCallback(ctx context.Context, upstream, userID, mode stri
 	}
 	challenge := codeChallenge(verifier)
 	now := time.Now()
-	pu, bound := 0, 0
-	if perUser {
-		pu = 1
-	}
-	if browserBound {
-		bound = 1
-	}
 	_, err = s.db.ExecContext(ctx, `
         INSERT INTO oauth_pending(state, upstream_name, user_id, mode, code_verifier,
-            expires_at, created_at, per_user, browser_bound)
-        VALUES(?,?,?,?,?,?,?,?,?)
-    `, state, upstream, userID, mode, verifier, now.Add(PendingTTL).UnixMilli(), now.UnixMilli(), pu, bound)
+            expires_at, created_at, per_user, browser_bound, via_ticket)
+        VALUES(?,?,?,?,?,?,?,?,?,?)
+    `, state, upstream, userID, mode, verifier, now.Add(PendingTTL).UnixMilli(), now.UnixMilli(),
+		boolInt(f.perUser), boolInt(f.browserBound), boolInt(f.viaTicket))
 	if err != nil {
 		return "", "", err
 	}
@@ -673,14 +680,14 @@ func (s *Service) LoadPending(ctx context.Context, state string) (*PendingRecord
         SELECT state, upstream_name, user_id, mode, COALESCE(code_verifier,''),
                COALESCE(device_code,''), COALESCE(user_code,''),
                COALESCE(interval_s,0), COALESCE(verification_uri,''),
-               expires_at, created_at, per_user, browser_bound
+               expires_at, created_at, per_user, browser_bound, via_ticket
         FROM oauth_pending WHERE state = ?
     `, state)
 	var p PendingRecord
 	var exp, created int64
-	var perUser, bound int
+	var perUser, bound, ticket int
 	if err := row.Scan(&p.State, &p.UpstreamName, &p.UserID, &p.Mode, &p.CodeVerifier,
-		&p.DeviceCode, &p.UserCode, &p.IntervalS, &p.VerificationURI, &exp, &created, &perUser, &bound); err != nil {
+		&p.DeviceCode, &p.UserCode, &p.IntervalS, &p.VerificationURI, &exp, &created, &perUser, &bound, &ticket); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, ErrPendingNotFound
 		}
@@ -690,6 +697,7 @@ func (s *Service) LoadPending(ctx context.Context, state string) (*PendingRecord
 	p.CreatedAt = time.UnixMilli(created)
 	p.PerUser = perUser == 1
 	p.BrowserBound = bound == 1
+	p.ViaTicket = ticket == 1
 	if time.Now().After(p.ExpiresAt) {
 		// Expired — clean up and report as not found so the API layer
 		// returns a uniform 400 either way.
@@ -1227,4 +1235,11 @@ func maxInt(a, b int) int {
 		return a
 	}
 	return b
+}
+
+func boolInt(b bool) int {
+	if b {
+		return 1
+	}
+	return 0
 }

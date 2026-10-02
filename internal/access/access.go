@@ -23,13 +23,15 @@ import (
 )
 
 // alwaysOn groups stay available to every active caller: the meta-tools,
-// the inbox/session tools an agent uses to ask for access, and the
+// the inbox/session tools an agent uses to ask for access, the
 // self-scoped access tools (policies, servers, audit, access) that tell an
-// agent what it may do and why; the ones that change anything check the
-// owner's role themselves.
+// agent what it may do and why (the ones that change anything check the
+// owner's role themselves), and the connections tools it finds its owner's
+// sign-in links with.
 var alwaysOn = map[string]bool{
 	"tools": true, "inbox": true, "session": true,
 	"policies": true, "servers": true, "audit": true, "access": true,
+	"connections": true,
 }
 
 // BuiltinGroups are the built-in data tools an admin grants like servers.

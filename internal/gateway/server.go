@@ -189,6 +189,11 @@ type Gateway struct {
 	// upstreams; publicURL is where their My connections page lives.
 	owners    OwnerResolver
 	publicURL string
+	// connect and directory back the connections.* tools and the connect
+	// links in sign-in refusals (connections_tools.go); nil until
+	// SetConnect. Guarded by mu.
+	connect   ConnectProvider
+	directory ConnectDirectory
 
 	mu        sync.RWMutex
 	tools     map[string]toolEntry
@@ -523,6 +528,7 @@ func (g *Gateway) RegisterBuiltins() {
 	entries = append(entries, g.approvalMetaTools()...)
 	entries = append(entries, g.codeModeTools()...)
 	entries = append(entries, g.accessTools()...)
+	entries = append(entries, g.connectionsTools()...)
 	if g.lake != nil {
 		entries = append(entries, g.lakeTools()...)
 	}
@@ -547,7 +553,7 @@ func (g *Gateway) RegisterBuiltins() {
 func reservedUpstreamName(name string) bool {
 	switch name {
 	case builtinUpstream, "fixture", inboxUpstream, sessionUpstream, "tools", "memory", "lake", "events",
-		policiesUpstream, serversUpstream, auditUpstream, accessUpstream, toolyardServer:
+		policiesUpstream, serversUpstream, auditUpstream, accessUpstream, toolyardServer, connectionsGroup:
 		return true
 	}
 	return false
@@ -1580,6 +1586,13 @@ func (g *Gateway) dispatch(ctx context.Context, entry toolEntry, args map[string
 	case pu != nil:
 		cfg = &pu.cfg
 	}
+	// A shared OAuth server with no usable token is refused before the
+	// dial, with a connect link for an admin owner (connections_tools.go).
+	if u != nil {
+		if res := g.refuseSharedSignIn(ctx, u, entry, agentID, reason, approvalID, nil, ev); res != nil {
+			return res, nil
+		}
+	}
 	if entry.handle == nil {
 		// Upstream-backed tool — route through the upstream pool.
 		switch {
@@ -1635,6 +1648,13 @@ func (g *Gateway) dispatch(ctx context.Context, entry toolEntry, args map[string
 			time.Since(upstreamStart).Round(time.Millisecond), g.upstreamCallTimeout)
 	}
 	if err != nil {
+		// A shared OAuth server that answered 401: the token is dead, so
+		// the agent gets the sign-in guidance instead of a bare failure.
+		if u != nil && isUnauthorized(err) {
+			if res := g.refuseSharedSignIn(ctx, u, entry, agentID, reason, approvalID, err, ev); res != nil {
+				return res, nil
+			}
+		}
 		_ = g.audit.Write(ctx, audit.Event{
 			EventType:     audit.EventCallFailed,
 			AgentID:       agentID,

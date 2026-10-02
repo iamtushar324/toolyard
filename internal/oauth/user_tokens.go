@@ -423,44 +423,14 @@ func (s *Service) BeginForUser(ctx context.Context, upstream, userID string) (au
 	if strings.TrimSpace(userID) == "" {
 		return "", "", errors.New("oauth: per-user flow needs a user")
 	}
-	return s.beginCallback(ctx, upstream, userID, ModeCallback, nil, true, true)
+	return s.beginFlow(ctx, upstream, userID, ModeCallback, nil, pendingFlags{perUser: true, browserBound: true})
 }
 
 // ExchangeCodeForUser swaps the authorization code for tokens and stores
 // them on userID's row. The caller has already checked that the browser
 // completing the flow is the person's.
 func (s *Service) ExchangeCodeForUser(ctx context.Context, upstream, userID, code, verifier string) (*UserTokenRecord, error) {
-	defer s.lockUser(upstream, userID)()
-	cli, err := s.GetClient(ctx, upstream)
-	if err != nil {
-		return nil, err
-	}
-	form := url.Values{}
-	form.Set("grant_type", "authorization_code")
-	form.Set("code", code)
-	form.Set("redirect_uri", cli.RedirectURI)
-	form.Set("client_id", cli.ClientID)
-	form.Set("code_verifier", verifier)
-	if cli.TokenEndpointAuthMethod == "client_secret_post" && cli.ClientSecret != "" {
-		form.Set("client_secret", cli.ClientSecret)
-	}
-	tr, err := s.postToken(ctx, cli, form)
-	if err != nil {
-		return nil, err
-	}
-	rec := userTokenRecordFromResponse(upstream, userID, tr)
-	if err := s.PutUserToken(ctx, rec); err != nil {
-		return nil, err
-	}
-	s.setUserBearer(upstream, userID, rec.AccessToken)
-	if s.bus != nil {
-		s.bus.Publish("mcp_oauth_user_done", map[string]any{
-			"upstream":      upstream,
-			"user_id":       userID,
-			"account_label": rec.AccountLabel,
-		})
-	}
-	return rec, nil
+	return s.exchangeCodeForUser(ctx, upstream, userID, code, verifier, nil)
 }
 
 // RefreshUser swaps one person's refresh_token for a fresh access_token.
