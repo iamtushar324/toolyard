@@ -613,3 +613,173 @@ func TestOrgMembers(t *testing.T) {
 		}
 	})
 }
+
+// VerifySessionTokenFor checks the same signature, expiry and issuer rules
+// against the caller's azp set; the dashboard's own origin is never in it,
+// and VerifySessionToken keeps refusing the caller's origins.
+func TestVerifySessionTokenFor(t *testing.T) {
+	f := newFakeClerk(t)
+	ctx := context.Background()
+	const stage = "https://stagebkt3.dev.beknown.live"
+	connect := []string{" HTTPS://StageBKT3.dev.beknown.live/ ", "https://bkt3.example.com"}
+	stageTok := f.token(jwt.MapClaims{"azp": stage}, f.kid)
+
+	t.Run("connect origin accepted", func(t *testing.T) {
+		c := f.client(t)
+		got, err := c.VerifySessionTokenFor(ctx, stageTok, connect)
+		if err != nil {
+			t.Fatalf("verify: %v", err)
+		}
+		if got.Subject != "user_123" || got.AuthorizedParty != stage {
+			t.Errorf("claims = %+v", got)
+		}
+		// Trailing slash and case on the token's azp are normalised too.
+		if _, err := c.VerifySessionTokenFor(ctx, f.token(jwt.MapClaims{"azp": "https://BKT3.example.com/"}, f.kid), connect); err != nil {
+			t.Errorf("normalised azp: %v", err)
+		}
+	})
+
+	t.Run("dashboard refuses connect origin", func(t *testing.T) {
+		c := f.client(t)
+		if _, err := c.VerifySessionToken(ctx, stageTok); !errors.Is(err, ErrInvalidToken) {
+			t.Errorf("dashboard verify of a connect token: err = %v, want ErrInvalidToken", err)
+		}
+	})
+
+	t.Run("dashboard origin never accepted", func(t *testing.T) {
+		c := f.client(t)
+		dash := f.token(nil, f.kid) // azp https://toolyard.example.com
+		if _, err := c.VerifySessionTokenFor(ctx, dash, connect); !errors.Is(err, ErrInvalidToken) {
+			t.Errorf("dashboard token on connect: err = %v, want ErrInvalidToken", err)
+		}
+		// Even when the caller lists it.
+		if _, err := c.VerifySessionTokenFor(ctx, dash, append(connect, "https://toolyard.example.com/")); !errors.Is(err, ErrInvalidToken) {
+			t.Errorf("dashboard origin passed by caller: err = %v, want ErrInvalidToken", err)
+		}
+	})
+
+	t.Run("empty set refuses everything", func(t *testing.T) {
+		c := f.client(t)
+		if _, err := c.VerifySessionTokenFor(ctx, stageTok, nil); !errors.Is(err, ErrInvalidToken) {
+			t.Errorf("no origins: err = %v", err)
+		}
+	})
+
+	t.Run("expired and wrong key", func(t *testing.T) {
+		c := f.client(t)
+		expired := f.token(jwt.MapClaims{"azp": stage, "exp": time.Now().Add(-2 * time.Minute).Unix(), "nbf": time.Now().Add(-3 * time.Minute).Unix()}, f.kid)
+		if _, err := c.VerifySessionTokenFor(ctx, expired, connect); !errors.Is(err, ErrInvalidToken) {
+			t.Errorf("expired: err = %v", err)
+		}
+		other, _ := rsa.GenerateKey(rand.Reader, 2048)
+		tok := jwt.NewWithClaims(jwt.SigningMethodRS256, jwt.MapClaims{
+			"iss": "https://clerk.example.test", "sub": "user_123", "azp": stage,
+			"exp": time.Now().Add(time.Minute).Unix(),
+		})
+		tok.Header["kid"] = f.kid
+		s, _ := tok.SignedString(other)
+		if _, err := c.VerifySessionTokenFor(ctx, s, connect); !errors.Is(err, ErrInvalidToken) {
+			t.Errorf("wrong key: err = %v", err)
+		}
+		if _, err := c.VerifySessionTokenFor(ctx, f.token(jwt.MapClaims{"azp": stage, "iss": "https://other.example.test"}, f.kid), connect); !errors.Is(err, ErrInvalidToken) {
+			t.Errorf("wrong iss: err = %v", err)
+		}
+	})
+
+	t.Run("jwks down", func(t *testing.T) {
+		c := f.client(t)
+		c.jwksURL = f.srv.URL + "/missing"
+		if _, err := c.VerifySessionTokenFor(ctx, stageTok, connect); !errors.Is(err, ErrUnavailable) {
+			t.Errorf("JWKS 404: err = %v, want ErrUnavailable", err)
+		}
+	})
+}
+
+func TestNormalizeOrigin(t *testing.T) {
+	for in, want := range map[string]string{
+		" HTTPS://StageBKT3.dev.beknown.live/ ": "https://stagebkt3.dev.beknown.live",
+		"https://a.example//":                   "https://a.example",
+		"":                                      "",
+	} {
+		if got := NormalizeOrigin(in); got != want {
+			t.Errorf("NormalizeOrigin(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+// The connect flow hands out a long-lived credential, so its tokens must
+// be fresh Clerk session tokens: a sid, a recent iat, no aud. The
+// dashboard path keeps its old rules.
+func TestVerifySessionTokenForFreshness(t *testing.T) {
+	f := newFakeClerk(t)
+	ctx := context.Background()
+	const stage = "https://stagebkt3.dev.beknown.live"
+	connect := []string{stage}
+	now := time.Now()
+	c := f.client(t)
+	c.now = func() time.Time { return now }
+	// iat at now+d, valid nbf/exp around it so only iat decides.
+	at := func(d time.Duration, extra jwt.MapClaims) string {
+		cl := jwt.MapClaims{"azp": stage, "iat": now.Add(d).Unix(), "nbf": now.Add(-time.Hour).Unix(), "exp": now.Add(time.Hour).Unix()}
+		for k, v := range extra {
+			cl[k] = v
+		}
+		return f.token(cl, f.kid)
+	}
+
+	accept := []struct {
+		name string
+		tok  string
+	}{
+		{"fresh", at(0, nil)},
+		{"two minutes old", at(-2*time.Minute, nil)},
+		{"two minutes old plus leeway", at(-(2*time.Minute + tokenLeeway - time.Second), nil)},
+		{"slightly in the future (skew)", at(tokenLeeway-time.Second, nil)},
+	}
+	for _, a := range accept {
+		if _, err := c.VerifySessionTokenFor(ctx, a.tok, connect); err != nil {
+			t.Errorf("%s: %v", a.name, err)
+		}
+	}
+
+	reject := []struct {
+		name string
+		tok  string
+	}{
+		{"too old", at(-(2*time.Minute + tokenLeeway + time.Second), nil)},
+		{"hours old", at(-3*time.Hour, jwt.MapClaims{"nbf": now.Add(-4 * time.Hour).Unix()})},
+		{"iat in the future", at(tokenLeeway+2*time.Second, nil)},
+		{"no iat", at(0, jwt.MapClaims{"iat": nil})},
+		{"no sid", at(0, jwt.MapClaims{"sid": nil})},
+		{"blank sid", at(0, jwt.MapClaims{"sid": "  "})},
+		{"aud string", at(0, jwt.MapClaims{"aud": "bkt3"})},
+		{"aud list", at(0, jwt.MapClaims{"aud": []string{"bkt3", "toolyard"}})},
+		{"aud empty string", at(0, jwt.MapClaims{"aud": ""})},
+		{"aud empty list", at(0, jwt.MapClaims{"aud": []string{}})},
+	}
+	for _, r := range reject {
+		if _, err := c.VerifySessionTokenFor(ctx, r.tok, connect); !errors.Is(err, ErrInvalidToken) {
+			t.Errorf("%s: err = %v, want ErrInvalidToken", r.name, err)
+		}
+	}
+
+	// Dashboard path unchanged: an old iat, no sid or an aud don't matter
+	// there (its tokens are for the dashboard origin).
+	dash := func(extra jwt.MapClaims) string {
+		cl := jwt.MapClaims{"iat": now.Add(-3 * time.Hour).Unix(), "nbf": now.Add(-4 * time.Hour).Unix(), "exp": now.Add(time.Hour).Unix()}
+		for k, v := range extra {
+			cl[k] = v
+		}
+		return f.token(cl, f.kid)
+	}
+	for name, tok := range map[string]string{
+		"old iat": dash(nil),
+		"no sid":  dash(jwt.MapClaims{"sid": nil}),
+		"aud":     dash(jwt.MapClaims{"aud": "anything"}),
+		"no iat":  dash(jwt.MapClaims{"iat": nil}),
+	} {
+		if _, err := c.VerifySessionToken(ctx, tok); err != nil {
+			t.Errorf("dashboard %s: %v", name, err)
+		}
+	}
+}

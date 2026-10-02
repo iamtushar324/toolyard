@@ -271,3 +271,68 @@ func TestGetUserByEmail(t *testing.T) {
 		t.Fatalf("GetUserByEmail = %+v, %v", u, err)
 	}
 }
+
+func TestAgentNameRule(t *testing.T) {
+	s, owner := newTestIdentity(t)
+	ctx := context.Background()
+	for _, name := range []string{"T3 Code (bkt3)", "bot", "claude-code: laptop_1.2"} {
+		if _, _, err := s.CreateAgentWithToken(ctx, owner, name); err != nil {
+			t.Errorf("CreateAgentWithToken(%q): %v", name, err)
+		}
+	}
+	for _, name := range []string{"bad;name", "a$b", "<script>", "x`y`", strings.Repeat("a", 65)} {
+		if _, _, err := s.CreateAgentWithToken(ctx, owner, name); err == nil {
+			t.Errorf("CreateAgentWithToken(%q) accepted", name)
+		}
+	}
+}
+
+// A rotate kills a pending enrollment code for the agent: exchanging it
+// afterwards must not replace the token the rotate issued.
+func TestRotateClearsPendingEnrollment(t *testing.T) {
+	for _, grace := range []time.Duration{0, time.Minute} {
+		s, owner := newTestIdentity(t)
+		ctx := context.Background()
+		code, ag, err := s.CreateEnrollment(ctx, owner, "T3 Code (bkt3)", time.Hour)
+		if err != nil {
+			t.Fatal(err)
+		}
+		tok, err := s.RotateAgentToken(ctx, owner, ag.ID, grace)
+		if err != nil {
+			t.Fatalf("grace %s: rotate: %v", grace, err)
+		}
+		if _, _, err := s.ExchangeEnrollment(ctx, code); !errors.Is(err, ErrEnrollNotFound) {
+			t.Errorf("grace %s: exchange after rotate: err = %v, want ErrEnrollNotFound", grace, err)
+		}
+		if got, err := s.VerifyAgentToken(ctx, tok); err != nil || got.ID != ag.ID {
+			t.Errorf("grace %s: rotated token: %+v, %v", grace, got, err)
+		}
+	}
+}
+
+// Agents created in the same millisecond still list newest first.
+func TestListAgentsNewestFirstOnTies(t *testing.T) {
+	s, owner := newTestIdentity(t)
+	ctx := context.Background()
+	var ids []string
+	for i := 0; i < 5; i++ {
+		_, ag, err := s.CreateAgentWithToken(ctx, owner, "bot")
+		if err != nil {
+			t.Fatal(err)
+		}
+		ids = append(ids, ag.ID)
+	}
+	// Force a tie on created_at.
+	if _, err := s.db.Exec(`UPDATE agents SET created_at = 1 WHERE owner_user = ?`, owner); err != nil {
+		t.Fatal(err)
+	}
+	got, err := s.ListAgents(ctx, owner)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, a := range got {
+		if want := ids[len(ids)-1-i]; a.ID != want {
+			t.Fatalf("ListAgents[%d] = %s, want %s (newest first)", i, a.ID, want)
+		}
+	}
+}

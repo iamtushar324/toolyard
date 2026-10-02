@@ -100,6 +100,7 @@ func memberAllowlist() map[string]bool {
 		"GET /v1/health",
 		"GET /v1/auth/me", "GET /v1/auth/config",
 		"POST /v1/auth/logout", "POST /v1/auth/login", "POST /v1/auth/clerk/session",
+		"POST /v1/connect/t3",
 		"GET /v1/agents", "POST /v1/agents", "POST /v1/agents/enroll",
 		"POST /v1/agents/x/rotate", "POST /v1/agents/x/disable", "POST /v1/agents/x/enable",
 		"DELETE /v1/agents/x",

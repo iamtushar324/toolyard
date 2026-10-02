@@ -328,6 +328,22 @@ func (s *Service) HasKey(ctx context.Context, userID string) (bool, error) {
 	return k != nil, err
 }
 
+// HadKey reports whether the user holds an identity key or ever held
+// one: a key row, any registration row (they outlive a revoke, as
+// "revoked") or a fingerprint still awaiting removal. A key issued and
+// revoked while no registry upstream was configured leaves no such row.
+// Automatic issuers (POST /v1/connect/t3) issue only when this is false,
+// so they never undo an admin's revoke.
+func (s *Service) HadKey(ctx context.Context, userID string) (bool, error) {
+	var had bool
+	err := s.db.QueryRowContext(ctx,
+		`SELECT EXISTS(SELECT 1 FROM user_identity_keys WHERE user_id = ?)
+             OR EXISTS(SELECT 1 FROM identity_key_registrations WHERE user_id = ?)
+             OR EXISTS(SELECT 1 FROM identity_key_retired WHERE user_id = ?)`,
+		userID, userID, userID).Scan(&had)
+	return had, err
+}
+
 // userInfo is what registration needs to know about the person.
 type userInfo struct {
 	Username    string

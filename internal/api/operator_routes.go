@@ -66,6 +66,7 @@ var operatorNeverPaths = map[string]bool{
 	"/v1/auth/login":         true,
 	"/v1/auth/logout":        true,
 	"/v1/auth/clerk/session": true,
+	"/v1/connect/t3":         true,
 }
 
 // operatorOwnerPrefixes need the owner scope for any non-GET method.
@@ -392,6 +393,7 @@ var operatorCatalog = []operatorCatalogEntry{
 	{"/v1/auth/me", "GET", "the authenticated user"},
 	{"/v1/auth/config", "GET", "login methods"},
 	{"/v1/auth/clerk/session", "POST", "Clerk login (browser only)"},
+	{"/v1/connect/t3", "POST", "bkt3 server: Clerk session token -> the person's agent token (never via operator token)"},
 	{"/v1/operator-tokens", "GET POST", "list or mint operator tokens {name, scopes, ttl_hours}"},
 	{"/v1/operator-tokens/{id}", "DELETE", "revoke an operator token"},
 	{"/v1/operator/routes", "GET", "this catalog"},

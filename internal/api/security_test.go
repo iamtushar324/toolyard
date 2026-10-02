@@ -81,6 +81,7 @@ func TestEnforceOriginOnMutationsAgentRoutes(t *testing.T) {
 		{"/v1/agents/tools/run", "", http.StatusNoContent},
 		{"/v1/ingest/tok", "", http.StatusNoContent},
 		{"/v1/inbox/decide-by-token", "", http.StatusNoContent},
+		{"/v1/connect/t3", "", http.StatusNoContent},
 		{"/v1/auth/login", "", http.StatusForbidden},
 		{"/v1/auth/setup", "", http.StatusForbidden},
 		{"/v1/settings", "", http.StatusForbidden},

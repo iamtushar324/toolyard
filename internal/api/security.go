@@ -431,7 +431,10 @@ func exemptFromCSRFHeader(path string) bool {
 		"/v1/notes/publish",
 		// CLI is bearer-authenticated and called from servers / scripts,
 		// not the dashboard. No cookie to protect.
-		"/v1/agents/tools/run":
+		"/v1/agents/tools/run",
+		// bkt3's server swaps a Clerk session token (in the body) for an
+		// agent token: no cookie, no Origin, so not CSRF-replayable.
+		"/v1/connect/t3":
 		return true
 	}
 	return false
