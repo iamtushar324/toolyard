@@ -271,3 +271,18 @@ func TestGetUserByEmail(t *testing.T) {
 		t.Fatalf("GetUserByEmail = %+v, %v", u, err)
 	}
 }
+
+func TestAgentNameRule(t *testing.T) {
+	s, owner := newTestIdentity(t)
+	ctx := context.Background()
+	for _, name := range []string{"T3 Code (bkt3)", "bot", "claude-code: laptop_1.2"} {
+		if _, _, err := s.CreateAgentWithToken(ctx, owner, name); err != nil {
+			t.Errorf("CreateAgentWithToken(%q): %v", name, err)
+		}
+	}
+	for _, name := range []string{"bad;name", "a$b", "<script>", "x`y`", strings.Repeat("a", 65)} {
+		if _, _, err := s.CreateAgentWithToken(ctx, owner, name); err == nil {
+			t.Errorf("CreateAgentWithToken(%q) accepted", name)
+		}
+	}
+}

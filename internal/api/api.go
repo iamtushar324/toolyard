@@ -6,6 +6,7 @@
 //	POST /v1/auth/login           username + password -> session cookie
 //	POST /v1/auth/clerk/session   Clerk session JWT -> session cookie
 //	GET  /v1/auth/config          which sign-in methods are on (public)
+//	POST /v1/connect/t3           bkt3: Clerk session JWT -> the person's agent token
 //	POST /v1/auth/logout
 //	GET  /v1/auth/me              current user, with role
 //
@@ -142,6 +143,8 @@ type Server struct {
 	clerkPublishableKey string
 	clerkFrontendAPI    string
 	ownerEmail          string
+	// connect is POST /v1/connect/t3 (connect_routes.go); nil = off.
+	connect *connectConfig
 }
 
 type Options struct {
@@ -227,6 +230,10 @@ type Options struct {
 	// attaches to the existing primary password user instead of creating a
 	// new member, so the owner keeps their admin role, agents and passkeys.
 	OwnerEmail string
+	// ConnectAZP (-connect-azp) lists the bkt3 browser origins whose Clerk
+	// session tokens POST /v1/connect/t3 swaps for the person's agent
+	// token. Empty, or Clerk off, leaves the endpoint off (404).
+	ConnectAZP []string
 }
 
 func New(ctx context.Context, opts Options) *Server {
@@ -279,6 +286,7 @@ func New(ctx context.Context, opts Options) *Server {
 		s.clerkPublishableKey = opts.Clerk.PublishableKey()
 		s.clerkFrontendAPI = opts.Clerk.FrontendAPI()
 	}
+	s.connect = newConnectT3(opts.Clerk, opts.ConnectAZP)
 	// Sweep stale throttle buckets periodically. Tied to ctx so the
 	// goroutine exits on shutdown instead of leaking (precedent:
 	// approval.New).
@@ -310,6 +318,7 @@ func (s *Server) Routes(mux *http.ServeMux) {
 	mux.HandleFunc("/v1/auth/me", s.authMe)
 	mux.HandleFunc("/v1/auth/config", s.authConfig)
 	mux.HandleFunc("/v1/auth/clerk/session", s.authClerkSession)
+	mux.HandleFunc("/v1/connect/t3", s.connectT3)
 
 	mux.HandleFunc("/v1/users", s.usersList)
 	mux.HandleFunc("/v1/users/", s.usersItem)

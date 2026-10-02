@@ -229,6 +229,7 @@ func runServe(argv []string) error {
 	approvalTTL := fs.Duration("approval-ttl", 3*time.Hour, "how long a pending approval stays decidable before auto-expiring")
 	publicURL := fs.String("public-url", "", "public origin (e.g. https://toolyard.example.com). When set, enables HSTS, secure cookies, and Origin enforcement.")
 	ownerEmail := fs.String("owner-email", "", "email of the local owner account. The first Clerk (Google) sign-in with this address attaches to the existing password admin instead of creating a new member. Case-insensitive.")
+	connectAZPFlag := fs.String("connect-azp", "", "comma-separated bkt3 (T3 Code) browser origins, e.g. https://stagebkt3.dev.beknown.live, whose Clerk session tokens POST /v1/connect/t3 swaps for the person's agent token. Needs Clerk sign-in; must not include -public-url's origin. Empty disables the endpoint (404).")
 	clerkSyncEvery := fs.Duration("clerk-sync-interval", time.Hour, "how often to list the Clerk organisation's members and block users who left (sessions revoked, agents stopped). Only runs when the TOOLYARD_CLERK_* env vars are set.")
 	trustedProxies := fs.String("trusted-proxy", "", "comma-separated CIDRs to trust for X-Forwarded-* headers (e.g. 127.0.0.1/32,::1/128,10.0.0.0/8)")
 	clickhouseRuntimeEnvPath := fs.String("clickhouse-runtime-env", "/var/lib/toolyard/clickhouse-runtime.env", "path where toolyard maintains a TOOLYARD_CH_PASSWORD=... line for the toolyard-clickhouse container's docker-compose env_file to consume. Updated on bootstrap and on every rotate. Empty disables the write (useful in tests).")
@@ -308,6 +309,13 @@ func runServe(argv []string) error {
 	}
 	if clerkClient != nil {
 		log.Printf("clerk: sign-in enabled (frontend api %s; owner email %s)", clerkFAPI, orDefault(*ownerEmail, "unset"))
+	}
+	connectOrigins, connErr := connectAZP(*connectAZPFlag, *publicURL, clerkClient != nil)
+	if connErr != nil {
+		return connErr
+	}
+	if len(connectOrigins) > 0 {
+		log.Printf("connect: POST /v1/connect/t3 accepts Clerk tokens minted for %s", strings.Join(connectOrigins, ", "))
 	}
 
 	if err := os.MkdirAll(*dataDir, 0o700); err != nil {
@@ -1081,6 +1089,7 @@ func runServe(argv []string) error {
 		Access:                   accessSvc,
 		Clerk:                    clerkClient,
 		OwnerEmail:               *ownerEmail,
+		ConnectAZP:               connectOrigins,
 	})
 
 	mux := http.NewServeMux()

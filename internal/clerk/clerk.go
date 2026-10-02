@@ -148,13 +148,7 @@ func New(cfg Config) (*Client, error) {
 	if err != nil {
 		return nil, err
 	}
-	azp := map[string]bool{}
-	for _, p := range cfg.AuthorizedParties {
-		p = strings.TrimRight(strings.TrimSpace(p), "/")
-		if p != "" {
-			azp[strings.ToLower(p)] = true
-		}
-	}
+	azp := partySet(cfg.AuthorizedParties)
 	if len(azp) == 0 {
 		return nil, errors.New("clerk: at least one authorized party (the dashboard origin) is required")
 	}
@@ -205,10 +199,48 @@ type sessionClaims struct {
 	jwt.RegisteredClaims
 }
 
+// NormalizeOrigin is the form an azp origin is compared in: trimmed,
+// lowercase, without a trailing slash.
+func NormalizeOrigin(origin string) string {
+	return strings.ToLower(strings.TrimRight(strings.TrimSpace(origin), "/"))
+}
+
+// partySet is the normalised set of origins; empty entries are dropped.
+func partySet(origins []string) map[string]bool {
+	set := map[string]bool{}
+	for _, o := range origins {
+		if o = NormalizeOrigin(o); o != "" {
+			set[o] = true
+		}
+	}
+	return set
+}
+
 // VerifySessionToken checks signature (RS256 against the instance JWKS),
 // exp/nbf, iss, azp and sub. Anything short of a fully valid token is
-// ErrInvalidToken; a JWKS fetch failure is ErrUnavailable.
+// ErrInvalidToken; a JWKS fetch failure is ErrUnavailable. The azp must be
+// one of the dashboard origins the Client was built with.
 func (c *Client) VerifySessionToken(ctx context.Context, token string) (Claims, error) {
+	return c.verify(ctx, token, c.azp)
+}
+
+// VerifySessionTokenFor is VerifySessionToken against a caller-given set
+// of allowed azp origins instead of the dashboard's own: a server-to-server
+// flow (POST /v1/connect/t3) accepts tokens another Clerk-backed app on the
+// same instance minted in its browser. The dashboard's origins are never
+// accepted here, whatever the caller passes, so a token that would open a
+// dashboard session can't be replayed into this flow; and VerifySessionToken
+// keeps refusing these origins. Same JWKS cache and refetch limits.
+func (c *Client) VerifySessionTokenFor(ctx context.Context, token string, authorizedParties []string) (Claims, error) {
+	allowed := partySet(authorizedParties)
+	for o := range c.azp {
+		delete(allowed, o)
+	}
+	return c.verify(ctx, token, allowed)
+}
+
+// verify is the shared check; allowed is the azp set the token must match.
+func (c *Client) verify(ctx context.Context, token string, allowed map[string]bool) (Claims, error) {
 	token = strings.TrimSpace(token)
 	if token == "" || len(token) > 16<<10 {
 		return Claims{}, ErrInvalidToken
@@ -249,8 +281,8 @@ func (c *Client) VerifySessionToken(ctx context.Context, token string) (Claims, 
 	// Clerk sets azp to the Origin that requested the token. bkt3 skips
 	// this check; we don't — a token minted for another Clerk-backed app
 	// on the same instance must not open a toolyard session.
-	azp := strings.ToLower(strings.TrimRight(strings.TrimSpace(sc.AuthorizedParty), "/"))
-	if azp == "" || !c.azp[azp] {
+	azp := NormalizeOrigin(sc.AuthorizedParty)
+	if azp == "" || !allowed[azp] {
 		return Claims{}, fmt.Errorf("%w: azp %q not authorized", ErrInvalidToken, sc.AuthorizedParty)
 	}
 	return Claims{Subject: sub, SessionID: sc.SessionID, AuthorizedParty: azp}, nil

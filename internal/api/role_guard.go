@@ -61,6 +61,9 @@ var memberRoutes = map[string]string{
 	"/v1/auth/logout":        http.MethodPost,
 	"/v1/auth/login":         http.MethodPost,
 	"/v1/auth/clerk/session": http.MethodPost,
+	// Authenticated by the Clerk token in its body; a cookie riding along
+	// must not change the answer.
+	"/v1/connect/t3": http.MethodPost,
 	// Own agents: list, create, enrolment code. Per-agent actions are the
 	// pattern below; identity scopes them to the caller's own agents.
 	"/v1/agents":        http.MethodGet + " " + http.MethodPost,

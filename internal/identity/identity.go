@@ -29,8 +29,9 @@ import (
 var usernameRE = regexp.MustCompile(`^[A-Za-z0-9._-]{2,64}$`)
 
 // agentNameRE allows a slightly broader set since agent names show up in UI
-// and audit only, never in shells.
-var agentNameRE = regexp.MustCompile(`^[A-Za-z0-9 ._:-]{1,64}$`)
+// and audit only, never in shells. Parentheses let a name carry a short
+// qualifier, e.g. the "T3 Code (bkt3)" agent /v1/connect/t3 creates.
+var agentNameRE = regexp.MustCompile(`^[A-Za-z0-9 ._:()-]{1,64}$`)
 
 // MinPasswordLen — picked to match the OWASP "memorized secret" baseline.
 // Stronger ones welcome; we don't enforce upper cap to allow passphrases.
@@ -612,7 +613,7 @@ func (s *Service) CreateEnrollment(ctx context.Context, ownerUserID, agentName s
 		agentName = "agent"
 	}
 	if !agentNameRE.MatchString(agentName) {
-		return "", nil, errors.New("agent name must be 1-64 chars of [A-Za-z0-9 ._:-]")
+		return "", nil, errors.New("agent name must be 1-64 chars of [A-Za-z0-9 ._:()-]")
 	}
 	code, err := randCode(8)
 	if err != nil {
@@ -640,7 +641,7 @@ func (s *Service) CreateAgentWithToken(ctx context.Context, ownerUserID, agentNa
 		agentName = "agent"
 	}
 	if !agentNameRE.MatchString(agentName) {
-		return "", nil, errors.New("agent name must be 1-64 chars of [A-Za-z0-9 ._:-]")
+		return "", nil, errors.New("agent name must be 1-64 chars of [A-Za-z0-9 ._:()-]")
 	}
 	id := "ag_" + uuid.NewString()
 	now := time.Now()
