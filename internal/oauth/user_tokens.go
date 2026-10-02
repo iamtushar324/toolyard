@@ -43,13 +43,18 @@ var ErrSuperseded = errors.New("oauth: token row changed under the refresh; noth
 // UserTokenRecord is one person's token row on a per_user upstream,
 // decrypted.
 type UserTokenRecord struct {
-	UpstreamName     string
-	UserID           string
-	AccessToken      string
-	RefreshToken     string
-	TokenType        string
-	Scope            string
-	AccountLabel     string
+	UpstreamName string
+	UserID       string
+	AccessToken  string
+	RefreshToken string
+	TokenType    string
+	Scope        string
+	AccountLabel string
+	// AccountVerified says whether the provider vouched for AccountLabel:
+	// an id_token whose email_verified claim is false makes it unverified;
+	// a missing claim counts as verified. Not stored; only the exchange that
+	// produced the record (and its accept hook) sees it.
+	AccountVerified  bool
 	ObtainedAt       time.Time
 	AccessExpiresAt  time.Time
 	RefreshExpiresAt time.Time
@@ -589,10 +594,10 @@ func userTokenRecordFromResponse(upstream, userID string, tr *tokenResponse) *Us
 		RefreshToken: tr.RefreshToken,
 		TokenType:    tr.TokenType,
 		Scope:        tr.Scope,
-		AccountLabel: accountLabelFromIDToken(tr.IDToken),
 		ObtainedAt:   now,
 		State:        StateActive,
 	}
+	rec.AccountLabel, rec.AccountVerified = accountFromIDToken(tr.IDToken)
 	if tr.ExpiresIn > 0 {
 		rec.AccessExpiresAt = now.Add(time.Duration(tr.ExpiresIn) * time.Second)
 	}
@@ -671,25 +676,36 @@ func (s *Service) DisconnectUser(ctx context.Context, upstream, userID string) e
 
 // accountLabelFromIDToken is the best-effort account name: the email claim
 // of an OIDC id_token when the IdP sent one. The token is only decoded,
-// never verified; the label is display-only and nothing trusts it.
+// never verified; the label is display-only, and the one check that
+// reads it (a connect link's account rule) treats it as the provider's
+// word, not proof.
 func accountLabelFromIDToken(idToken string) string {
+	email, _ := accountFromIDToken(idToken)
+	return email
+}
+
+// accountFromIDToken decodes the email claim and whether the provider says
+// it is verified: email_verified false means unverified; a missing claim
+// counts as verified, as most providers that name an email vouch for it.
+func accountFromIDToken(idToken string) (email string, verified bool) {
 	parts := strings.Split(idToken, ".")
 	if len(parts) != 3 {
-		return ""
+		return "", false
 	}
 	raw, err := base64.RawURLEncoding.DecodeString(strings.TrimRight(parts[1], "="))
 	if err != nil {
-		return ""
+		return "", false
 	}
 	var claims struct {
-		Email string `json:"email"`
+		Email         string `json:"email"`
+		EmailVerified *bool  `json:"email_verified"`
 	}
 	if json.Unmarshal(raw, &claims) != nil {
-		return ""
+		return "", false
 	}
-	email := strings.TrimSpace(claims.Email)
-	if len(email) > 254 {
-		return ""
+	email = strings.TrimSpace(claims.Email)
+	if email == "" || len(email) > 254 {
+		return "", false
 	}
-	return email
+	return email, claims.EmailVerified == nil || *claims.EmailVerified
 }

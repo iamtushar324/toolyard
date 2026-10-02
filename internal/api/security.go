@@ -329,8 +329,11 @@ func (s *Server) HardenAPI(next http.Handler) http.Handler {
 
 			// Strict Content-Type for JSON bodies. Anything carrying a
 			// body must declare application/json. Empty body (e.g.
-			// agent rotate POST with no payload) skips this check.
-			if r.ContentLength != 0 {
+			// agent rotate POST with no payload) skips this check. The
+			// one browser form on the API, a connect link's Continue
+			// button (connect_link_routes.go), posts form-encoded and
+			// proves itself with a nonce cookie instead.
+			if r.ContentLength != 0 && !strings.HasPrefix(path, connectLinkPath) {
 				ct := r.Header.Get("Content-Type")
 				if ct == "" {
 					writeError(w, http.StatusUnsupportedMediaType, "Content-Type required")
@@ -414,6 +417,13 @@ func exemptFromCSRFHeader(path string) bool {
 	if path == "/v1/ingest" || strings.HasPrefix(path, "/v1/ingest/") {
 		return true
 	}
+	// A connect link's Continue button is a plain browser form: it cannot
+	// set a header, so it carries a nonce the page's response set as a
+	// SameSite=Strict cookie (connect_link_routes.go). The Origin check
+	// still applies (exemptFromOriginCheck).
+	if strings.HasPrefix(path, connectLinkPath) {
+		return true
+	}
 	switch path {
 	case "/v1/auth/setup", "/v1/auth/login",
 		"/v1/agents/exchange",
@@ -446,6 +456,10 @@ func exemptFromCSRFHeader(path string) bool {
 func exemptFromOriginCheck(path string) bool {
 	switch path {
 	case "/v1/auth/setup", "/v1/auth/login":
+		return false
+	}
+	// The connect link's form is posted from its own confirm page only.
+	if strings.HasPrefix(path, connectLinkPath) {
 		return false
 	}
 	return exemptFromCSRFHeader(path)

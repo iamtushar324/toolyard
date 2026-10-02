@@ -2015,7 +2015,10 @@ func (g *Gateway) Execute(ctx context.Context, req *approval.Request) {
 		raiser = *req.RaisedBy
 	}
 	raiser = g.resolveRaiser(actor.WithRaiser(ctx, raiser), req.AgentID, "")
-	execCtx := actor.WithRaiser(WithAgentID(ctx, req.AgentID), raiser)
+	// Nobody is reading this result live: it is persisted and polled, so a
+	// connect link minted here would sit in a row admins and operator
+	// tokens can read. Refusals name the dashboard instead.
+	execCtx := WithoutConnectLinks(actor.WithRaiser(WithAgentID(ctx, req.AgentID), raiser))
 
 	// Build a metrics.Event and run dispatch directly. The original
 	// routeEntry already evaluated policy and consumed the human's

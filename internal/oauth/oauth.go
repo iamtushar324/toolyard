@@ -139,13 +139,19 @@ type PendingRecord struct {
 	// account against the person's email; the success page sends them
 	// back to the agent.
 	ViaTicket bool
+	// OpenerVerified marks a ticket flow whose link was redeemed from a
+	// browser holding a toolyard session for the flow's user. The callback
+	// may then store a token whose account the provider did not name;
+	// otherwise only an account email that is the person's own is stored.
+	OpenerVerified bool
 }
 
 // pendingFlags are the marks a flow is stored with on oauth_pending.
 type pendingFlags struct {
-	perUser      bool
-	browserBound bool
-	viaTicket    bool
+	perUser        bool
+	browserBound   bool
+	viaTicket      bool
+	openerVerified bool
 }
 
 // EventBus is the minimum the OAuth service needs from the realtime hub.
@@ -607,10 +613,10 @@ func (s *Service) beginFlow(ctx context.Context, upstream, userID, mode string, 
 	now := time.Now()
 	_, err = s.db.ExecContext(ctx, `
         INSERT INTO oauth_pending(state, upstream_name, user_id, mode, code_verifier,
-            expires_at, created_at, per_user, browser_bound, via_ticket)
-        VALUES(?,?,?,?,?,?,?,?,?,?)
+            expires_at, created_at, per_user, browser_bound, via_ticket, opener_verified)
+        VALUES(?,?,?,?,?,?,?,?,?,?,?)
     `, state, upstream, userID, mode, verifier, now.Add(PendingTTL).UnixMilli(), now.UnixMilli(),
-		boolInt(f.perUser), boolInt(f.browserBound), boolInt(f.viaTicket))
+		boolInt(f.perUser), boolInt(f.browserBound), boolInt(f.viaTicket), boolInt(f.openerVerified))
 	if err != nil {
 		return "", "", err
 	}
@@ -680,14 +686,14 @@ func (s *Service) LoadPending(ctx context.Context, state string) (*PendingRecord
         SELECT state, upstream_name, user_id, mode, COALESCE(code_verifier,''),
                COALESCE(device_code,''), COALESCE(user_code,''),
                COALESCE(interval_s,0), COALESCE(verification_uri,''),
-               expires_at, created_at, per_user, browser_bound, via_ticket
+               expires_at, created_at, per_user, browser_bound, via_ticket, opener_verified
         FROM oauth_pending WHERE state = ?
     `, state)
 	var p PendingRecord
 	var exp, created int64
-	var perUser, bound, ticket int
+	var perUser, bound, ticket, opener int
 	if err := row.Scan(&p.State, &p.UpstreamName, &p.UserID, &p.Mode, &p.CodeVerifier,
-		&p.DeviceCode, &p.UserCode, &p.IntervalS, &p.VerificationURI, &exp, &created, &perUser, &bound, &ticket); err != nil {
+		&p.DeviceCode, &p.UserCode, &p.IntervalS, &p.VerificationURI, &exp, &created, &perUser, &bound, &ticket, &opener); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, ErrPendingNotFound
 		}
@@ -698,6 +704,7 @@ func (s *Service) LoadPending(ctx context.Context, state string) (*PendingRecord
 	p.PerUser = perUser == 1
 	p.BrowserBound = bound == 1
 	p.ViaTicket = ticket == 1
+	p.OpenerVerified = opener == 1
 	if time.Now().After(p.ExpiresAt) {
 		// Expired — clean up and report as not found so the API layer
 		// returns a uniform 400 either way.
@@ -742,9 +749,22 @@ type tokenResponse struct {
 // ExchangeCode performs the authorization-code -> tokens swap. On success
 // the encrypted token row is persisted and the in-memory bearer is updated.
 func (s *Service) ExchangeCode(ctx context.Context, upstream, code, verifier string) (*TokenRecord, error) {
+	return s.exchangeCode(ctx, upstream, code, verifier, nil)
+}
+
+// exchangeCode is ExchangeCode with an optional look at the token before
+// it replaces the shared row (see ExchangeCodeChecked).
+func (s *Service) exchangeCode(ctx context.Context, upstream, code, verifier string,
+	accept func(prevLabel string, rec *TokenRecord) error) (*TokenRecord, error) {
 	cli, err := s.GetClient(ctx, upstream)
 	if err != nil {
 		return nil, err
+	}
+	prevLabel := ""
+	if accept != nil {
+		if cur, err := s.GetToken(ctx, upstream); err == nil && cur != nil {
+			prevLabel = cur.AccountLabel
+		}
 	}
 	form := url.Values{}
 	form.Set("grant_type", "authorization_code")
@@ -761,6 +781,12 @@ func (s *Service) ExchangeCode(ctx context.Context, upstream, code, verifier str
 	}
 	rec := tokenRecordFromResponse(upstream, tr)
 	rec.AccountLabel = accountLabelFromIDToken(tr.IDToken)
+	if accept != nil {
+		if aerr := accept(prevLabel, rec); aerr != nil {
+			s.revoke(ctx, cli, rec.RefreshToken, rec.AccessToken)
+			return nil, fmt.Errorf("%w: %v", ErrAccountMismatch, aerr)
+		}
+	}
 	if err := s.PutToken(ctx, rec); err != nil {
 		return nil, err
 	}

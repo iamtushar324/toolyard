@@ -112,7 +112,7 @@ func memberAllowlist() map[string]bool {
 		"GET /v1/mcp-oauth/callback", "POST /v1/mcp-oauth/paste",
 		// A one-time connect link an agent gave the member (the ticket is
 		// the credential; the handler starts only their own sign-in).
-		"GET /v1/connect/link/x",
+		"GET /v1/connect/link/x", "POST /v1/connect/link/x",
 	} {
 		allowed[mp] = true
 	}

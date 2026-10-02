@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"regexp"
 	"sort"
 	"strings"
 	"testing"
@@ -19,12 +20,14 @@ import (
 )
 
 // The connect link: the page an agent sends the person to when a server
-// needs their sign-in. These tests open it the way a browser does (a plain
-// GET, no CSRF header, no toolyard session) and finish the flow the way
-// the provider's redirect does.
+// needs their sign-in. These tests open it the way a browser does (a GET
+// for the confirm page, then the page's own form POST with its nonce, no
+// CSRF header, no toolyard session unless stated) and finish the flow the
+// way the provider's redirect does.
 
 // connectLinkIdP is a token endpoint whose code decides the account: code
-// "as:<email>" yields an id_token naming that email, "noemail" yields no
+// "as:<email>" yields an id_token naming that email, "unverified:<email>"
+// one that names it with email_verified false, "noemail" yields no
 // id_token, anything else names <code>@example.test.
 func connectLinkIdP(t *testing.T) *httptest.Server {
 	t.Helper()
@@ -33,21 +36,25 @@ func connectLinkIdP(t *testing.T) *httptest.Server {
 		_ = r.ParseForm()
 		code := r.Form.Get("code")
 		out := map[string]any{"access_token": "at-" + code, "refresh_token": "rt-" + code, "token_type": "Bearer", "expires_in": 3600}
-		email := code + "@example.test"
+		claims := map[string]any{"email": code + "@example.test"}
 		switch {
 		case code == "noemail":
-			email = ""
+			claims = nil
 		case strings.HasPrefix(code, "as:"):
-			email = strings.TrimPrefix(code, "as:")
+			claims["email"] = strings.TrimPrefix(code, "as:")
+		case strings.HasPrefix(code, "unverified:"):
+			claims["email"] = strings.TrimPrefix(code, "unverified:")
+			claims["email_verified"] = false
 		}
-		if email != "" {
+		if claims != nil {
 			hdr := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"none"}`))
-			pl, _ := json.Marshal(map[string]string{"email": email})
+			pl, _ := json.Marshal(claims)
 			out["id_token"] = hdr + "." + base64.RawURLEncoding.EncodeToString(pl) + ".s"
 		}
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(out)
 	})
+	mux.HandleFunc("/revoke", func(w http.ResponseWriter, r *http.Request) { w.WriteHeader(http.StatusOK) })
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
 	return srv
@@ -74,9 +81,11 @@ func withConnectOAuth(t *testing.T, e *accessTestEnv) *oauthEnv {
 	return &oauthEnv{oa: oa, idp: idp}
 }
 
-// openLink GETs a connect link the way a browser does: no CSRF header, only
-// the given cookies.
-func (e *accessTestEnv) openLink(t *testing.T, ticket string, cookies ...*http.Cookie) *httptest.ResponseRecorder {
+var nonceFieldRE = regexp.MustCompile(`name="nonce" value="([^"]+)"`)
+
+// confirmLink GETs the confirm page the way a browser does: no CSRF
+// header, only the given cookies.
+func (e *accessTestEnv) confirmLink(t *testing.T, ticket string, cookies ...*http.Cookie) *httptest.ResponseRecorder {
 	t.Helper()
 	req := httptest.NewRequest(http.MethodGet, connectLinkPath+ticket, nil)
 	for _, c := range cookies {
@@ -89,12 +98,66 @@ func (e *accessTestEnv) openLink(t *testing.T, ticket string, cookies ...*http.C
 	return rec
 }
 
-// redirectState checks the 302 points at the IdP's authorize endpoint with
+// nonceOf pulls the nonce cookie and the form nonce out of a confirm page.
+func nonceOf(t *testing.T, page *httptest.ResponseRecorder) (*http.Cookie, string) {
+	t.Helper()
+	var cookie *http.Cookie
+	for _, c := range page.Result().Cookies() {
+		if strings.HasPrefix(c.Name, connectNoncePrefix) {
+			cookie = c
+		}
+	}
+	m := nonceFieldRE.FindStringSubmatch(page.Body.String())
+	if cookie == nil || m == nil {
+		t.Fatalf("confirm page without nonce: cookies=%v body=%s", page.Header().Values("Set-Cookie"), page.Body.String())
+	}
+	return cookie, m[1]
+}
+
+// continueLink POSTs the confirm page's form the way the browser does:
+// form-encoded, the page's nonce cookie and field, Sec-Fetch-Site
+// same-origin, no CSRF header, plus the given cookies (a session).
+func (e *accessTestEnv) continueLink(t *testing.T, ticket string, page *httptest.ResponseRecorder, cookies ...*http.Cookie) *httptest.ResponseRecorder {
+	t.Helper()
+	nonceCookie, nonce := nonceOf(t, page)
+	return e.postLink(t, ticket, url.Values{"nonce": {nonce}}, "same-origin", append(cookies, nonceCookie)...)
+}
+
+// postLink is the raw form POST.
+func (e *accessTestEnv) postLink(t *testing.T, ticket string, form url.Values, fetchSite string, cookies ...*http.Cookie) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodPost, connectLinkPath+ticket, strings.NewReader(form.Encode()))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	if fetchSite != "" {
+		req.Header.Set("Sec-Fetch-Site", fetchSite)
+	}
+	for _, c := range cookies {
+		if c != nil {
+			req.AddCookie(c)
+		}
+	}
+	rec := httptest.NewRecorder()
+	e.handler.ServeHTTP(rec, req)
+	return rec
+}
+
+// followLink is the person's two clicks: open the link, press Continue.
+// The given cookies ride on both requests.
+func (e *accessTestEnv) followLink(t *testing.T, ticket string, cookies ...*http.Cookie) *httptest.ResponseRecorder {
+	t.Helper()
+	page := e.confirmLink(t, ticket, cookies...)
+	if page.Code != http.StatusOK {
+		t.Fatalf("confirm page: %d %s", page.Code, page.Body.String())
+	}
+	return e.continueLink(t, ticket, page, cookies...)
+}
+
+// redirectState checks the 303 points at the IdP's authorize endpoint with
 // toolyard's callback as redirect_uri, and returns the state.
 func redirectState(t *testing.T, rec *httptest.ResponseRecorder, idp *httptest.Server) string {
 	t.Helper()
-	if rec.Code != http.StatusFound {
-		t.Fatalf("status %d, want 302: %s", rec.Code, rec.Body.String())
+	if rec.Code != http.StatusSeeOther {
+		t.Fatalf("status %d, want 303: %s", rec.Code, rec.Body.String())
 	}
 	loc, err := url.Parse(rec.Header().Get("Location"))
 	if err != nil || loc.String() == "" {
@@ -109,6 +172,9 @@ func redirectState(t *testing.T, rec *httptest.ResponseRecorder, idp *httptest.S
 	}
 	if cc := rec.Header().Get("Cache-Control"); cc != "no-store" {
 		t.Fatalf("Cache-Control = %q", cc)
+	}
+	if csp := rec.Header().Get("Content-Security-Policy"); !strings.Contains(csp, "form-action 'self' "+idp.URL) {
+		t.Fatalf("POST response CSP form-action does not allow the provider: %q", csp)
 	}
 	return q.Get("state")
 }
@@ -142,10 +208,19 @@ func (e *accessTestEnv) auditReasons(t *testing.T, eventType string) []string {
 	return out
 }
 
+func (e *accessTestEnv) pendingFlows(t *testing.T) int {
+	t.Helper()
+	var n int
+	if err := e.db.QueryRow(`SELECT count(*) FROM oauth_pending`).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	return n
+}
+
 type connectLinkEnv struct {
 	e   *accessTestEnv
 	oe  *oauthEnv
-	ada *identity.User // member with an email
+	ada *identity.User // member with an email, granted linear
 }
 
 func newConnectLinkEnv(t *testing.T) *connectLinkEnv {
@@ -171,18 +246,80 @@ func (c *connectLinkEnv) ticket(t *testing.T, uid, server, purpose string) strin
 	return tk
 }
 
-// TestConnectLinkStartsPerUserSignIn: opening the link redeems the ticket,
-// sets the flow cookie for that state and person, and redirects to the
-// provider with toolyard's callback; the provider's return in that browser
-// stores the token on the person's row (case-insensitive email match) and
-// shows the "back to your agent" page. The link works once, and the ticket
-// never reaches the audit log.
-func TestConnectLinkStartsPerUserSignIn(t *testing.T) {
+// live reports whether a ticket can still be redeemed.
+func (c *connectLinkEnv) live(t *testing.T, ticket string) bool {
+	t.Helper()
+	_, err := c.oe.oa.PeekConnectTicket(context.Background(), ticket)
+	return err == nil
+}
+
+// admin makes a Clerk-linked admin with an email.
+func (c *connectLinkEnv) admin(t *testing.T, clerkID, email string) *identity.User {
+	t.Helper()
+	u := c.e.member(t, clerkID, email)
+	if err := c.e.id.SetRole(context.Background(), u.ID, identity.RoleAdmin); err != nil {
+		t.Fatal(err)
+	}
+	u.Role = identity.RoleAdmin
+	return u
+}
+
+// TestConnectLinkConfirmPageHasNoSideEffects: opening a link shows whose
+// it is and what Continue does, sets the nonce cookie and a CSP that lets
+// the form's redirect reach the provider, and changes nothing: the ticket
+// stays live, no flow starts, nothing is audited. HEAD does nothing.
+func TestConnectLinkConfirmPageHasNoSideEffects(t *testing.T) {
 	c := newConnectLinkEnv(t)
 	e, ada := c.e, c.ada
 	ticket := c.ticket(t, ada.ID, "linear", oauth.ConnectPurposePerUser)
 
-	rec := e.openLink(t, ticket)
+	for i := 0; i < 3; i++ {
+		page := e.confirmLink(t, ticket)
+		if page.Code != http.StatusOK {
+			t.Fatalf("confirm %d: %d %s", i, page.Code, page.Body.String())
+		}
+		body := page.Body.String()
+		for _, want := range []string{"Connect linear for ada@beknown.work", `<form method="post" action="` + connectLinkPath + ticket + `"`, "Continue", `<link rel="stylesheet" href="/style.css">`} {
+			if !strings.Contains(body, want) {
+				t.Errorf("confirm page lacks %q:\n%s", want, body)
+			}
+		}
+		if strings.Contains(body, "<style") || strings.Contains(body, " style=") {
+			t.Fatalf("confirm page styles inline (blocked by the CSP):\n%s", body)
+		}
+		cookie, nonce := nonceOf(t, page)
+		if cookie.Value != nonce || !cookie.HttpOnly || cookie.SameSite != http.SameSiteStrictMode || cookie.Path != connectLinkPath || cookie.MaxAge != int(oauth.ConnectTicketTTL.Seconds()) {
+			t.Fatalf("nonce cookie = %+v (form nonce %q)", cookie, nonce)
+		}
+		if csp := page.Header().Get("Content-Security-Policy"); !strings.Contains(csp, "form-action 'self' "+c.oe.idp.URL) || !strings.Contains(csp, "script-src 'self'") {
+			t.Fatalf("confirm page CSP = %q", csp)
+		}
+	}
+	head := httptest.NewRequest(http.MethodHead, connectLinkPath+ticket, nil)
+	hrec := httptest.NewRecorder()
+	e.handler.ServeHTTP(hrec, head)
+	if hrec.Code != http.StatusOK || hrec.Body.Len() != 0 {
+		t.Fatalf("HEAD: %d %q", hrec.Code, hrec.Body.String())
+	}
+	if !c.live(t, ticket) || e.pendingFlows(t) != 0 || e.auditRows(t, connectLinkUsed, "") != 0 || e.auditRows(t, connectLinkRefused, "") != 0 {
+		t.Fatal("showing the confirm page had side effects")
+	}
+}
+
+// TestConnectLinkContinueStartsPerUserSignIn: Continue redeems the ticket,
+// sets the flow cookie for that state and person, and redirects to the
+// provider with toolyard's callback; the provider's return in that browser
+// stores the token on the person's row (case-insensitive email match) and
+// shows the "back to your agent" page. The link works once, the person's
+// other live links for the server close with it, and the ticket never
+// reaches the audit log.
+func TestConnectLinkContinueStartsPerUserSignIn(t *testing.T) {
+	c := newConnectLinkEnv(t)
+	e, ada := c.e, c.ada
+	ticket := c.ticket(t, ada.ID, "linear", oauth.ConnectPurposePerUser)
+	spare := c.ticket(t, ada.ID, "linear", oauth.ConnectPurposePerUser)
+
+	rec := e.followLink(t, ticket)
 	state := redirectState(t, rec, c.oe.idp)
 	cookie := flowCookieFrom(t, rec)
 	if cookie.Name != oauthFlowCookieName(state) || cookie.Path != oauthFlowCookiePath || !cookie.HttpOnly || cookie.SameSite != http.SameSiteLaxMode {
@@ -190,6 +327,9 @@ func TestConnectLinkStartsPerUserSignIn(t *testing.T) {
 	}
 	if !e.srv.oauthFlowCookieValid(&http.Request{Header: http.Header{"Cookie": {cookie.String()}}}, state, ada.ID) {
 		t.Fatal("flow cookie is not bound to (state, ada)")
+	}
+	if c.live(t, ticket) {
+		t.Fatal("Continue did not redeem the ticket")
 	}
 	if e.auditRows(t, connectLinkUsed, "") != 1 || e.auditMentions(t, ticket) != 0 {
 		t.Fatalf("link_used rows = %d, ticket mentions = %d", e.auditRows(t, connectLinkUsed, ""), e.auditMentions(t, ticket))
@@ -202,7 +342,7 @@ func TestConnectLinkStartsPerUserSignIn(t *testing.T) {
 
 	// The provider sends the browser back; the email differs only in case.
 	cb := e.callbackCookies(t, state, "as:Ada@Beknown.work", cookie)
-	if cb.Code != http.StatusOK || !strings.Contains(cb.Body.String(), "Go back to T3 Code") || !strings.Contains(cb.Body.String(), "tell your agent to retry") {
+	if cb.Code != http.StatusOK || !strings.Contains(cb.Body.String(), "Go back to T3 Code") || !strings.Contains(cb.Body.String(), "tell your agent to retry") || strings.Contains(cb.Body.String(), "<style") {
 		t.Fatalf("callback: %d %s", cb.Code, cb.Body.String())
 	}
 	if rows := userTokenRows(t, e, "linear"); rows[ada.ID] != "active" || len(rows) != 1 {
@@ -216,64 +356,106 @@ func TestConnectLinkStartsPerUserSignIn(t *testing.T) {
 	if e.auditRows(t, connectUnverifiedAccount, "") != 0 || e.auditRows(t, connectAccountMismatch, "") != 0 {
 		t.Fatal("a verified match was audited as unverified or mismatched")
 	}
-
-	// Once only.
-	again := e.openLink(t, ticket)
-	if again.Code != http.StatusGone || !strings.Contains(again.Body.String(), "expired or was already used") || !strings.Contains(again.Body.String(), "ask your agent for a new one") {
-		t.Fatalf("second open: %d %s", again.Code, again.Body.String())
+	// The spare link closed with the sign-in.
+	if c.live(t, spare) {
+		t.Fatal("another live link for the same person and server survived the sign-in")
 	}
-	if got := e.auditReasons(t, connectLinkRefused); len(got) != 1 || got[0] != "used" {
-		t.Fatalf("link_refused reasons = %v", got)
+
+	// Once only: the page says so, Continue is refused.
+	if page := e.confirmLink(t, ticket); page.Code != http.StatusGone || !strings.Contains(page.Body.String(), "expired or was already used") {
+		t.Fatalf("confirm after use: %d %s", page.Code, page.Body.String())
+	}
+	if again := e.postLink(t, ticket, url.Values{"nonce": {"x"}}, "same-origin"); again.Code != http.StatusForbidden {
+		t.Fatalf("continue after use without a nonce: %d", again.Code)
 	}
 	if e.auditMentions(t, ticket) != 0 {
 		t.Fatal("ticket reached the audit log")
 	}
 }
 
-// TestConnectLinkRefusesStaleTickets: unknown, expired and malformed
-// tickets get the plain page and an audit row naming the reason; the
-// route is GET-only and never reachable with an operator token.
+// TestConnectLinkContinueNeedsNonceAndSameOrigin: a POST that did not come
+// from the confirm page (no nonce cookie, a nonce that does not match, or
+// a cross-site Sec-Fetch-Site) is refused and audited, and the ticket
+// stays live for the real click.
+func TestConnectLinkContinueNeedsNonceAndSameOrigin(t *testing.T) {
+	c := newConnectLinkEnv(t)
+	e, ada := c.e, c.ada
+	ticket := c.ticket(t, ada.ID, "linear", oauth.ConnectPurposePerUser)
+	page := e.confirmLink(t, ticket)
+	nonceCookie, nonce := nonceOf(t, page)
+
+	// No cookie at all (a form forged elsewhere).
+	if rec := e.postLink(t, ticket, url.Values{"nonce": {nonce}}, "same-origin"); rec.Code != http.StatusForbidden || !strings.Contains(rec.Body.String(), "Open the link again") {
+		t.Fatalf("no nonce cookie: %d %s", rec.Code, rec.Body.String())
+	}
+	// Cookie present, field wrong.
+	if rec := e.postLink(t, ticket, url.Values{"nonce": {"not-it"}}, "same-origin", nonceCookie); rec.Code != http.StatusForbidden {
+		t.Fatalf("wrong nonce: %d", rec.Code)
+	}
+	// Right nonce, but the browser says the request came from elsewhere.
+	if rec := e.postLink(t, ticket, url.Values{"nonce": {nonce}}, "cross-site", nonceCookie); rec.Code != http.StatusForbidden {
+		t.Fatalf("cross-site: %d", rec.Code)
+	}
+	if !c.live(t, ticket) || e.pendingFlows(t) != 0 {
+		t.Fatal("a refused Continue redeemed the ticket or started a flow")
+	}
+	if got := e.auditReasons(t, connectLinkRefused); strings.Join(got, " ") != "cross_site nonce nonce" {
+		t.Fatalf("link_refused reasons = %v", got)
+	}
+	// A browser that sends no Sec-Fetch-Site (older) still passes on the nonce alone.
+	if rec := e.postLink(t, ticket, url.Values{"nonce": {nonce}}, "", nonceCookie); rec.Code != http.StatusSeeOther {
+		t.Fatalf("real click: %d %s", rec.Code, rec.Body.String())
+	}
+}
+
+// TestConnectLinkRefusesStaleTickets: unknown and expired tickets get the
+// plain page on GET (no audit: showing a page changes nothing) and an
+// audited refusal on Continue; the route takes GET and POST only and is
+// never reachable with an operator token.
 func TestConnectLinkRefusesStaleTickets(t *testing.T) {
 	c := newConnectLinkEnv(t)
 	e := c.e
 	if connectLinkPath != oauth.ConnectLinkPath {
 		t.Fatalf("route %q and oauth.ConnectLinkPath %q differ", connectLinkPath, oauth.ConnectLinkPath)
 	}
-
-	rec := e.openLink(t, "not-a-ticket")
-	if rec.Code != http.StatusGone || !strings.Contains(rec.Body.String(), "expired or was already used") {
-		t.Fatalf("unknown: %d %s", rec.Code, rec.Body.String())
+	if page := e.confirmLink(t, "not-a-ticket"); page.Code != http.StatusGone || !strings.Contains(page.Body.String(), "expired or was already used") {
+		t.Fatalf("unknown: %d %s", page.Code, page.Body.String())
 	}
 	stale := c.ticket(t, c.ada.ID, "linear", oauth.ConnectPurposePerUser)
+	page := e.confirmLink(t, stale)
 	if _, err := e.db.Exec(`UPDATE connect_tickets SET expires_at = ?`, time.Now().Add(-time.Minute).UnixMilli()); err != nil {
 		t.Fatal(err)
 	}
-	if rec := e.openLink(t, stale); rec.Code != http.StatusGone {
-		t.Fatalf("expired: %d %s", rec.Code, rec.Body.String())
+	if rec := e.confirmLink(t, stale); rec.Code != http.StatusGone {
+		t.Fatalf("expired page: %d", rec.Code)
 	}
-	if rec := e.openLink(t, ""); rec.Code != http.StatusGone {
-		t.Fatalf("empty: %d", rec.Code)
+	if rec := e.continueLink(t, stale, page); rec.Code != http.StatusGone {
+		t.Fatalf("expired continue: %d %s", rec.Code, rec.Body.String())
 	}
-	if got := e.auditReasons(t, connectLinkRefused); strings.Join(got, " ") != "expired unknown unknown" {
-		t.Fatalf("link_refused reasons = %v", got)
+	if got := e.auditReasons(t, connectLinkRefused); strings.Join(got, " ") != "expired" {
+		t.Fatalf("link_refused reasons = %v (GETs must not audit)", got)
 	}
 	if e.auditRows(t, connectLinkUsed, "") != 0 {
 		t.Fatal("a refused link was audited as used")
 	}
 
-	req := httptest.NewRequest(http.MethodPost, connectLinkPath+"x", nil)
+	req := httptest.NewRequest(http.MethodPut, connectLinkPath+"x", nil)
 	req.Header.Set("X-Requested-With", "toolyard")
 	w := httptest.NewRecorder()
 	e.handler.ServeHTTP(w, req)
 	if w.Code != http.StatusMethodNotAllowed {
-		t.Fatalf("POST: %d", w.Code)
+		t.Fatalf("PUT: %d", w.Code)
 	}
-	if _, ok := operatorScopeFor(http.MethodGet, connectLinkPath+"abc"); ok {
-		t.Fatal("an operator token may redeem a connect link")
+	for _, m := range []string{http.MethodGet, http.MethodPost} {
+		if _, ok := operatorScopeFor(m, connectLinkPath+"abc"); ok {
+			t.Fatalf("an operator token may %s a connect link", m)
+		}
+		if !memberAllowed(m, connectLinkPath+"abc") {
+			t.Fatalf("member allowlist refuses %s of one ticket", m)
+		}
 	}
-	if !memberAllowed(http.MethodGet, connectLinkPath+"abc") || memberAllowed(http.MethodPost, connectLinkPath+"abc") ||
-		memberAllowed(http.MethodGet, connectLinkPath) || memberAllowed(http.MethodGet, connectLinkPath+"a/b") {
-		t.Fatal("member allowlist: GET of one ticket must pass; POST, an empty ticket and extra segments must not")
+	if memberAllowed(http.MethodPut, connectLinkPath+"abc") || memberAllowed(http.MethodGet, connectLinkPath) || memberAllowed(http.MethodGet, connectLinkPath+"a/b") {
+		t.Fatal("member allowlist: PUT, an empty ticket and extra segments must not pass")
 	}
 }
 
@@ -286,12 +468,15 @@ func TestConnectLinkRechecksAccessAndSignInKind(t *testing.T) {
 	ctx := context.Background()
 
 	ticket := c.ticket(t, ada.ID, "linear", oauth.ConnectPurposePerUser)
+	page := e.confirmLink(t, ticket)
 	if err := e.access.SetGroups(ctx, ada.ID, nil, e.admin.ID); err != nil {
 		t.Fatal(err)
 	}
-	rec := e.openLink(t, ticket)
-	if rec.Code != http.StatusForbidden || !strings.Contains(rec.Body.String(), "no longer have access") {
-		t.Fatalf("revoked grant: %d %s", rec.Code, rec.Body.String())
+	if rec := e.confirmLink(t, ticket); rec.Code != http.StatusForbidden || !strings.Contains(rec.Body.String(), "no longer has access") {
+		t.Fatalf("revoked grant page: %d %s", rec.Code, rec.Body.String())
+	}
+	if rec := e.continueLink(t, ticket, page); rec.Code != http.StatusForbidden {
+		t.Fatalf("revoked grant continue: %d", rec.Code)
 	}
 
 	addPatchServer(t, e, "patsrv", newPatchMCPServer(t))
@@ -301,21 +486,15 @@ func TestConnectLinkRechecksAccessAndSignInKind(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	root := e.member(t, "user_root", "root@beknown.work")
-	if err := e.id.SetRole(ctx, root.ID, identity.RoleAdmin); err != nil {
-		t.Fatal(err)
-	}
-	rec = e.openLink(t, c.ticket(t, root.ID, "patsrv", oauth.ConnectPurposeShared))
-	if rec.Code != http.StatusGone || !strings.Contains(rec.Body.String(), "pasted token") {
+	root := c.admin(t, "user_root", "root@beknown.work")
+	if rec := e.confirmLink(t, c.ticket(t, root.ID, "patsrv", oauth.ConnectPurposeShared)); rec.Code != http.StatusGone || !strings.Contains(rec.Body.String(), "pasted token") {
 		t.Fatalf("pat server: %d %s", rec.Code, rec.Body.String())
 	}
-	if got := e.auditReasons(t, connectLinkRefused); strings.Join(got, " ") != "not_granted token_only" {
+	if got := e.auditReasons(t, connectLinkRefused); strings.Join(got, " ") != "not_granted" {
 		t.Fatalf("link_refused reasons = %v", got)
 	}
-	var pending int
-	_ = e.db.QueryRow(`SELECT count(*) FROM oauth_pending`).Scan(&pending)
-	if pending != 0 {
-		t.Fatalf("%d pending flows left by refused links", pending)
+	if e.pendingFlows(t) != 0 {
+		t.Fatal("pending flows left by refused links")
 	}
 }
 
@@ -337,8 +516,7 @@ func TestConnectLinksNotHandedToOperatorTokens(t *testing.T) {
 		t.Fatalf("tools/run with operator token: %d %s", rec.Code, rec.Body.String())
 	}
 	var out struct {
-		IsError bool              `json:"is_error"`
-		Content []json.RawMessage `json:"content"`
+		IsError bool `json:"is_error"`
 	}
 	if err := json.Unmarshal(rec.Body.Bytes(), &out); err != nil {
 		t.Fatal(err)
@@ -359,13 +537,14 @@ func TestConnectLinksNotHandedToOperatorTokens(t *testing.T) {
 	}
 }
 
-// TestConnectLinkMismatchedAccountStoresNothing: the person signed in to
+// TestConnectLinkMismatchedAccountStoresNothing: the opener signed in to
 // the provider as somebody else. No token is stored, the flow is burnt,
-// and the page names both accounts.
+// and the page names neither account (the opener may not be the person
+// the link was made for).
 func TestConnectLinkMismatchedAccountStoresNothing(t *testing.T) {
 	c := newConnectLinkEnv(t)
 	e, ada := c.e, c.ada
-	rec := e.openLink(t, c.ticket(t, ada.ID, "linear", oauth.ConnectPurposePerUser))
+	rec := e.followLink(t, c.ticket(t, ada.ID, "linear", oauth.ConnectPurposePerUser))
 	state := redirectState(t, rec, c.oe.idp)
 	cookie := flowCookieFrom(t, rec)
 
@@ -374,56 +553,79 @@ func TestConnectLinkMismatchedAccountStoresNothing(t *testing.T) {
 		t.Fatalf("callback: %d %s", cb.Code, cb.Body.String())
 	}
 	body := cb.Body.String()
-	if !strings.Contains(body, "This link was made for ada@beknown.work; you signed in as bob@beknown.work. Sign in with the right account.") {
-		t.Fatalf("mismatch page: %s", body)
+	if !strings.Contains(body, "You signed in with a different account than this link is for") || strings.Contains(body, "ada@") || strings.Contains(body, "bob@") {
+		t.Fatalf("mismatch page must name neither account: %s", body)
 	}
 	if rows := userTokenRows(t, e, "linear"); len(rows) != 0 {
 		t.Fatalf("token stored after a mismatch: %v", rows)
 	}
-	if e.auditRows(t, connectAccountMismatch, "") != 1 || e.auditRows(t, "oauth.user_success", "") != 0 {
-		t.Fatalf("audit: mismatch=%d success=%d", e.auditRows(t, connectAccountMismatch, ""), e.auditRows(t, "oauth.user_success", ""))
-	}
-	if e.auditMentions(t, "bob@beknown.work") != 0 {
-		t.Fatal("the other account's email was written to the audit log")
+	if e.auditRows(t, connectAccountMismatch, "") != 1 || e.auditRows(t, "oauth.user_success", "") != 0 || e.auditMentions(t, "bob@beknown.work") != 0 {
+		t.Fatal("mismatch audit: wrong rows, or the other account's email was written")
 	}
 	if _, err := c.oe.oa.LoadPending(context.Background(), state); !errors.Is(err, oauth.ErrPendingNotFound) {
 		t.Fatalf("pending flow survives a mismatch: %v", err)
 	}
-	// The code is spent and the flow gone: a retry with the right account
-	// cannot resurrect it.
 	if cb := e.callbackCookies(t, state, "as:ada@beknown.work", cookie); cb.Code != http.StatusBadRequest {
 		t.Fatalf("replay after mismatch: %d", cb.Code)
 	}
 }
 
-// TestConnectLinkUnverifiedAccountIsStoredAndAudited: a provider that
-// names no account cannot be checked; the token is stored and the audit
-// log says the match was not verified.
-func TestConnectLinkUnverifiedAccountIsStoredAndAudited(t *testing.T) {
+// TestConnectLinkUnverifiedAccountNeedsOpenerSession: when the provider's
+// account cannot be checked (no email, email_verified false, a non-ASCII
+// label), nothing is stored unless the browser that pressed Continue held
+// the person's own toolyard session; then it is stored and audited as
+// unverified.
+func TestConnectLinkUnverifiedAccountNeedsOpenerSession(t *testing.T) {
 	c := newConnectLinkEnv(t)
 	e, ada := c.e, c.ada
-	rec := e.openLink(t, c.ticket(t, ada.ID, "linear", oauth.ConnectPurposePerUser))
+
+	for _, code := range []string{"noemail", "unverified:ada@beknown.work", "as:\u00e4da@beknown.work"} {
+		rec := e.followLink(t, c.ticket(t, ada.ID, "linear", oauth.ConnectPurposePerUser))
+		state := redirectState(t, rec, c.oe.idp)
+		cb := e.callbackCookies(t, state, code, flowCookieFrom(t, rec))
+		if cb.Code != http.StatusForbidden || !strings.Contains(cb.Body.String(), "can't be verified automatically") || !strings.Contains(cb.Body.String(), "Sign in to toolyard") {
+			t.Fatalf("%s without a session: %d %s", code, cb.Code, cb.Body.String())
+		}
+		if rows := userTokenRows(t, e, "linear"); len(rows) != 0 {
+			t.Fatalf("%s: token stored without a session: %v", code, rows)
+		}
+		if _, err := c.oe.oa.LoadPending(context.Background(), state); !errors.Is(err, oauth.ErrPendingNotFound) {
+			t.Fatalf("%s: pending flow survives: %v", code, err)
+		}
+	}
+	var decision string
+	_ = e.db.QueryRow(`SELECT COALESCE(decision,'') FROM audit_events WHERE event_type = ? LIMIT 1`, connectAccountMismatch).Scan(&decision)
+	if e.auditRows(t, connectAccountMismatch, "") != 3 || decision != "unverifiable" {
+		t.Fatalf("unverifiable refusals audited %d times, decision %q", e.auditRows(t, connectAccountMismatch, ""), decision)
+	}
+
+	// Continue pressed in a browser signed in to toolyard as ada: the
+	// callback (no session, as cross-site) stores it and says so.
+	rec := e.followLink(t, c.ticket(t, ada.ID, "linear", oauth.ConnectPurposePerUser), e.cookieFor(t, ada.ID))
 	state := redirectState(t, rec, c.oe.idp)
+	if p, err := c.oe.oa.LoadPending(context.Background(), state); err != nil || !p.OpenerVerified {
+		t.Fatalf("pending after a session Continue = %+v %v", p, err)
+	}
 	cb := e.callbackCookies(t, state, "noemail", flowCookieFrom(t, rec))
 	if cb.Code != http.StatusOK || !strings.Contains(cb.Body.String(), "tell your agent to retry") {
-		t.Fatalf("callback: %d %s", cb.Code, cb.Body.String())
+		t.Fatalf("callback with verified opener: %d %s", cb.Code, cb.Body.String())
 	}
 	if rows := userTokenRows(t, e, "linear"); rows[ada.ID] != "active" {
 		t.Fatalf("token rows = %v", rows)
 	}
-	var decision string
-	if err := e.db.QueryRow(`SELECT COALESCE(decision,'') FROM audit_events WHERE event_type = ?`, connectUnverifiedAccount).Scan(&decision); err != nil || decision != "unverified_account" {
-		t.Fatalf("unverified_account audit: %q %v", decision, err)
+	_ = e.db.QueryRow(`SELECT COALESCE(decision,'') FROM audit_events WHERE event_type = ?`, connectUnverifiedAccount).Scan(&decision)
+	if decision != "unverified_account" {
+		t.Fatalf("unverified_account audit decision = %q", decision)
 	}
 }
 
 // TestConnectLinkDashboardFlowKeepsItsPage: a per-user flow the dashboard
-// started is not a ticket flow: no account check, the My connections page.
+// started is not a ticket flow: no account rule, the My connections page.
 func TestConnectLinkDashboardFlowKeepsItsPage(t *testing.T) {
 	c := newConnectLinkEnv(t)
 	e, ada := c.e, c.ada
 	state, cookie := beginFor(t, e, e.cookieFor(t, ada.ID), "linear")
-	cb := e.callbackCookies(t, state, "as:somebody@else.test", cookie)
+	cb := e.callbackCookies(t, state, "noemail", cookie)
 	if cb.Code != http.StatusOK || !strings.Contains(cb.Body.String(), "My connections") || strings.Contains(cb.Body.String(), "T3 Code") {
 		t.Fatalf("dashboard callback: %d %s", cb.Code, cb.Body.String())
 	}
@@ -431,26 +633,61 @@ func TestConnectLinkDashboardFlowKeepsItsPage(t *testing.T) {
 		t.Fatalf("token rows = %v", rows)
 	}
 	if e.auditRows(t, connectUnverifiedAccount, "") != 0 || e.auditRows(t, connectAccountMismatch, "") != 0 {
-		t.Fatal("a dashboard flow was put through the ticket account check")
+		t.Fatal("a dashboard flow was put through the ticket account rule")
 	}
 }
 
-// TestConnectLinkSharedNeedsAdmin: a shared-purpose link signs the
-// server's shared account in, for an admin only; a member's shared link and
-// a link whose purpose no longer matches the server are refused.
-func TestConnectLinkSharedNeedsAdmin(t *testing.T) {
+// TestConnectLinkSharedNeedsAdminSession: a shared-account link signs the
+// server's shared account in only from a browser signed in to toolyard as
+// an admin (the flow is then that admin's); it is never honoured once the
+// shared account works, and a sign-in from a link cannot move the shared
+// account to a different one than the one on file.
+func TestConnectLinkSharedNeedsAdminSession(t *testing.T) {
 	c := newConnectLinkEnv(t)
-	e := c.e
+	e, ada := c.e, c.ada
 	ctx := context.Background()
 	addPatchServer(t, e, "gh", newPatchMCPServer(t))
 	c.oe.client(t, "gh")
-	root := e.member(t, "user_root", "root@beknown.work")
-	if err := e.id.SetRole(ctx, root.ID, identity.RoleAdmin); err != nil {
+	root := c.admin(t, "user_root", "root@beknown.work")
+	rootCookie := e.cookieFor(t, root.ID)
+	if err := e.access.SetGroups(ctx, ada.ID, []string{"linear", "gh"}, e.admin.ID); err != nil {
 		t.Fatal(err)
 	}
 
-	rec := e.openLink(t, c.ticket(t, root.ID, "gh", oauth.ConnectPurposeShared))
+	// Nobody signed in to toolyard in this browser: the page still shows
+	// (a cross-site click never carries the Strict session cookie), but
+	// Continue is refused with the sign-in hint and the ticket stays live.
+	ticket := c.ticket(t, root.ID, "gh", oauth.ConnectPurposeShared)
+	page := e.confirmLink(t, ticket)
+	if page.Code != http.StatusOK || !strings.Contains(page.Body.String(), "signed in to toolyard as an admin") || !strings.Contains(page.Body.String(), `href="/`) {
+		t.Fatalf("shared confirm without session: %d %s", page.Code, page.Body.String())
+	}
+	rec := e.continueLink(t, ticket, page)
+	if rec.Code != http.StatusForbidden || !strings.Contains(rec.Body.String(), "Sign in to toolyard as an admin to continue") || !strings.Contains(rec.Body.String(), "Sign in to toolyard</a>") {
+		t.Fatalf("shared continue without session: %d %s", rec.Code, rec.Body.String())
+	}
+	if !c.live(t, ticket) || e.pendingFlows(t) != 0 {
+		t.Fatal("a refused shared Continue redeemed the ticket or started a flow")
+	}
+	// A member's session is not enough, on the page or on Continue.
+	adaCookie := e.cookieFor(t, ada.ID)
+	if page := e.confirmLink(t, ticket, adaCookie); page.Code != http.StatusForbidden || !strings.Contains(page.Body.String(), "Sign in to toolyard as an admin") {
+		t.Fatalf("shared confirm with member session: %d %s", page.Code, page.Body.String())
+	}
+	if rec := e.continueLink(t, ticket, e.confirmLink(t, ticket), adaCookie); rec.Code != http.StatusForbidden {
+		t.Fatalf("shared continue with member session: %d", rec.Code)
+	}
+	if got := e.auditReasons(t, connectLinkRefused); strings.Join(got, " ") != "admin_session admin_session" {
+		t.Fatalf("link_refused reasons = %v", got)
+	}
+
+	// An admin's session: the flow is the admin's and the shared account
+	// is signed in.
+	rec = e.followLink(t, ticket, rootCookie)
 	state := redirectState(t, rec, c.oe.idp)
+	if !e.srv.oauthFlowCookieValid(&http.Request{Header: http.Header{"Cookie": {flowCookieFrom(t, rec).String()}}}, state, root.ID) {
+		t.Fatal("shared flow not bound to the admin who pressed Continue")
+	}
 	cb := e.callbackCookies(t, state, "ops", flowCookieFrom(t, rec))
 	if cb.Code != http.StatusOK || !strings.Contains(cb.Body.String(), "tell your agent to retry") {
 		t.Fatalf("shared callback: %d %s", cb.Code, cb.Body.String())
@@ -460,41 +697,62 @@ func TestConnectLinkSharedNeedsAdmin(t *testing.T) {
 		t.Fatalf("shared token = %q %q %v", st, label, err)
 	}
 
-	// A member's shared link, even for a server granted to them: refused,
-	// nothing started.
-	if err := e.access.SetGroups(ctx, c.ada.ID, []string{"linear", "gh"}, e.admin.ID); err != nil {
-		t.Fatal(err)
+	// The shared account works: a link does nothing, even for an admin.
+	working := c.ticket(t, root.ID, "gh", oauth.ConnectPurposeShared)
+	if rec := e.followLink(t, working, rootCookie); rec.Code != http.StatusForbidden || !strings.Contains(rec.Body.String(), "already signed in as ops@example.test") {
+		t.Fatalf("link for a working shared account: %d %s", rec.Code, rec.Body.String())
 	}
-	rec = e.openLink(t, c.ticket(t, c.ada.ID, "gh", oauth.ConnectPurposeShared))
-	if rec.Code != http.StatusForbidden || !strings.Contains(rec.Body.String(), "Only an admin") {
-		t.Fatalf("member shared link: %d %s", rec.Code, rec.Body.String())
+	if !c.live(t, working) {
+		t.Fatal("refused link was redeemed")
 	}
-	// A per_user link for a shared server, and a shared link for a
-	// per_user server: the server changed since the link was made.
-	if rec := e.openLink(t, c.ticket(t, c.ada.ID, "gh", oauth.ConnectPurposePerUser)); rec.Code != http.StatusGone || !strings.Contains(rec.Body.String(), "changed since the link was made") {
-		t.Fatalf("mode mismatch: %d %s", rec.Code, rec.Body.String())
+
+	// The sign-in died: a link may renew it, but only as the same account.
+	c.oe.oa.MarkReauthExternal(ctx, "gh", "revoked")
+	rec = e.followLink(t, c.ticket(t, root.ID, "gh", oauth.ConnectPurposeShared), rootCookie)
+	state = redirectState(t, rec, c.oe.idp)
+	cb = e.callbackCookies(t, state, "intruder", flowCookieFrom(t, rec))
+	if cb.Code != http.StatusForbidden || !strings.Contains(cb.Body.String(), "signed in as <strong>ops@example.test</strong>") || !strings.Contains(cb.Body.String(), "nothing changed") {
+		t.Fatalf("different shared account: %d %s", cb.Code, cb.Body.String())
 	}
-	if rec := e.openLink(t, c.ticket(t, root.ID, "linear", oauth.ConnectPurposeShared)); rec.Code != http.StatusGone {
-		t.Fatalf("shared link for a per_user server: %d", rec.Code)
+	if err := e.db.QueryRow(`SELECT state, COALESCE(account_label,'') FROM oauth_tokens WHERE upstream_name = 'gh'`).Scan(&st, &label); err != nil || st != "needs_reauth" || label != "ops@example.test" {
+		t.Fatalf("shared token after refused switch = %q %q %v, want the old row untouched", st, label, err)
 	}
-	if got := e.auditReasons(t, connectLinkRefused); strings.Join(got, " ") != "mode_changed mode_changed not_admin" {
-		t.Fatalf("link_refused reasons = %v", got)
+	rec = e.followLink(t, c.ticket(t, root.ID, "gh", oauth.ConnectPurposeShared), rootCookie)
+	state = redirectState(t, rec, c.oe.idp)
+	if cb := e.callbackCookies(t, state, "ops", flowCookieFrom(t, rec)); cb.Code != http.StatusOK {
+		t.Fatalf("same shared account: %d %s", cb.Code, cb.Body.String())
 	}
-	var pending int
-	_ = e.db.QueryRow(`SELECT count(*) FROM oauth_pending`).Scan(&pending)
-	if pending != 0 {
-		t.Fatalf("%d pending flows left by refused links", pending)
+	if err := e.db.QueryRow(`SELECT state FROM oauth_tokens WHERE upstream_name = 'gh'`).Scan(&st); err != nil || st != "active" {
+		t.Fatalf("shared token after renewal = %q %v", st, err)
+	}
+
+	// A shared ticket minted for a member, and links whose purpose no
+	// longer fits the server, are refused whoever opens them.
+	c.oe.oa.MarkReauthExternal(ctx, "gh", "revoked again")
+	memberTicket := c.ticket(t, ada.ID, "gh", oauth.ConnectPurposeShared)
+	if page := e.confirmLink(t, memberTicket, rootCookie); page.Code != http.StatusForbidden || !strings.Contains(page.Body.String(), "Only an admin") {
+		t.Fatalf("member's shared ticket page: %d %s", page.Code, page.Body.String())
+	}
+	if rec := e.postLink(t, memberTicket, url.Values{"nonce": {"x"}}, "same-origin"); rec.Code != http.StatusForbidden || !c.live(t, memberTicket) {
+		t.Fatalf("member's shared ticket continue: %d live=%v", rec.Code, c.live(t, memberTicket))
+	}
+	if page := e.confirmLink(t, c.ticket(t, ada.ID, "gh", oauth.ConnectPurposePerUser)); page.Code != http.StatusGone || !strings.Contains(page.Body.String(), "changed since the link was made") {
+		t.Fatalf("mode mismatch: %d %s", page.Code, page.Body.String())
+	}
+	if page := e.confirmLink(t, c.ticket(t, root.ID, "linear", oauth.ConnectPurposeShared)); page.Code != http.StatusGone {
+		t.Fatalf("shared link for a per_user server: %d", page.Code)
 	}
 }
 
 // TestConnectLinkWithMemberSession: a member whose browser also holds a
-// toolyard session passes RoleGuard and gets the same redirect; their own
-// session finishes the flow too.
+// toolyard session passes RoleGuard on both requests and gets the same
+// redirect; another person's session is refused on the page and on
+// Continue, and cannot finish the flow either.
 func TestConnectLinkWithMemberSession(t *testing.T) {
 	c := newConnectLinkEnv(t)
 	e, ada := c.e, c.ada
 	session := e.cookieFor(t, ada.ID)
-	rec := e.openLink(t, c.ticket(t, ada.ID, "linear", oauth.ConnectPurposePerUser), session)
+	rec := e.followLink(t, c.ticket(t, ada.ID, "linear", oauth.ConnectPurposePerUser), session)
 	state := redirectState(t, rec, c.oe.idp)
 	cb := e.callbackCookies(t, state, "as:ada@beknown.work", session)
 	if cb.Code != http.StatusOK || !strings.Contains(cb.Body.String(), "tell your agent to retry") {
@@ -503,14 +761,60 @@ func TestConnectLinkWithMemberSession(t *testing.T) {
 	if rows := userTokenRows(t, e, "linear"); rows[ada.ID] != "active" {
 		t.Fatalf("token rows = %v", rows)
 	}
-	// Another person's session cannot finish ada's link flow.
+
 	bob := e.member(t, "user_bob", "bob@beknown.work")
-	rec = e.openLink(t, c.ticket(t, ada.ID, "linear", oauth.ConnectPurposePerUser))
+	bobCookie := e.cookieFor(t, bob.ID)
+	ticket := c.ticket(t, ada.ID, "linear", oauth.ConnectPurposePerUser)
+	if page := e.confirmLink(t, ticket, bobCookie); page.Code != http.StatusForbidden || !strings.Contains(page.Body.String(), "for someone else") {
+		t.Fatalf("confirm with another user's session: %d %s", page.Code, page.Body.String())
+	}
+	if rec := e.continueLink(t, ticket, e.confirmLink(t, ticket), bobCookie); rec.Code != http.StatusForbidden {
+		t.Fatalf("continue with another user's session: %d", rec.Code)
+	}
+	if !c.live(t, ticket) {
+		t.Fatal("another user's Continue redeemed the ticket")
+	}
+	rec = e.followLink(t, ticket)
 	state = redirectState(t, rec, c.oe.idp)
-	if cb := e.callbackCookies(t, state, "as:ada@beknown.work", e.cookieFor(t, bob.ID)); cb.Code != http.StatusBadRequest {
+	if cb := e.callbackCookies(t, state, "as:ada@beknown.work", bobCookie); cb.Code != http.StatusBadRequest {
 		t.Fatalf("another user's session finished the flow: %d", cb.Code)
 	}
 	if rows := userTokenRows(t, e, "linear"); len(rows) != 1 {
 		t.Fatalf("token rows = %v", rows)
+	}
+}
+
+// TestConnectAccountCheck: the account rule compares ASCII-lowercased
+// emails, and cannot run on a missing or unvouched-for email or anything
+// non-ASCII.
+func TestConnectAccountCheck(t *testing.T) {
+	ada := &identity.User{Email: "Ada@Beknown.work"}
+	cases := []struct {
+		label    string
+		verified bool
+		user     *identity.User
+		want     string
+	}{
+		{"ada@beknown.work", true, ada, accountMatch},
+		{"ADA@BEKNOWN.WORK", true, ada, accountMatch},
+		{" ada@beknown.work ", true, ada, accountMatch},
+		{"bob@beknown.work", true, ada, accountMismatch},
+		{"ada@beknown.work", false, ada, accountUnverifiable},
+		{"", true, ada, accountUnverifiable},
+		{"ada@beknown.work", true, &identity.User{}, accountUnverifiable},
+		{"\u00e4da@beknown.work", true, ada, accountUnverifiable},
+		{"ada@beknown.work", true, &identity.User{Email: "\u00e4da@beknown.work"}, accountUnverifiable},
+	}
+	for _, c := range cases {
+		got := connectAccountCheck(c.user, &oauth.UserTokenRecord{AccountLabel: c.label, AccountVerified: c.verified})
+		if got != c.want {
+			t.Errorf("check(%q, verified=%v, user %q) = %s, want %s", c.label, c.verified, c.user.Email, got, c.want)
+		}
+	}
+	if same, ok := sameEmail("Ops@Example.test", "ops@example.test"); !same || !ok {
+		t.Fatal("sameEmail should match case-insensitively")
+	}
+	if _, ok := sameEmail("", "ops@example.test"); ok {
+		t.Fatal("sameEmail should not compare an empty label")
 	}
 }

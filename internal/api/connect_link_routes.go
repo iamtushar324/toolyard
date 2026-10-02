@@ -1,8 +1,14 @@
 package api
 
 import (
+	"crypto/hmac"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/base64"
+	"encoding/hex"
 	"errors"
 	"net/http"
+	"net/url"
 	"strings"
 
 	"github.com/tusharbhardwaj/toolyard/internal/actor"
@@ -12,20 +18,40 @@ import (
 	"github.com/tusharbhardwaj/toolyard/internal/upstreams"
 )
 
-// GET /v1/connect/link/{ticket} is the link an agent shows the person when
-// a server needs their sign-in (gateway/connections_tools.go). It needs no
-// toolyard session: the ticket, minted for one (user, server, purpose) and
-// redeemable once within ten minutes, is the credential. Redeeming it
-// starts the ordinary OAuth flow for that user and server, binds the flow
-// to this browser with the flow cookie (oauth_flow_cookie.go), and sends
-// the browser to the provider; the callback then stores the token and
-// says "go back to your agent". A link that is unknown, used or expired
-// gets a plain page saying so.
+// /v1/connect/link/{ticket} is the link an agent shows the person when a
+// server needs their sign-in (gateway/connections_tools.go). The ticket,
+// minted for one (user, server, purpose) and redeemable once within ten
+// minutes, is the credential; no toolyard session is needed to open it.
 //
-// Public GET: no CSRF header or Origin check applies (both are for
-// mutations); a member's session cookie riding along is allowed through
-// RoleGuard; an operator token can never use it; the unauthenticated
-// per-IP throttle applies (security.go).
+//	GET   renders a confirm page ("Connect <server> for <person>") with a
+//	      Continue button and changes nothing, so a link previewer or a
+//	      drive-by fetch cannot use the ticket up. The response sets a
+//	      SameSite=Strict nonce cookie whose value the form carries.
+//	POST  (the Continue button) checks the nonce cookie against the form
+//	      and Sec-Fetch-Site when the browser sends it, then redeems the
+//	      ticket, starts the OAuth flow for that user and server, binds the
+//	      flow to this browser with the flow cookie (oauth_flow_cookie.go)
+//	      and sends the browser to the provider with a 303. The callback
+//	      stores the token and says "go back to your agent".
+//	HEAD  answers headers only and never redeems.
+//
+// Who may continue: a shared-account link needs this browser to hold a
+// toolyard session for an active admin (the flow is then theirs), and is
+// never honoured for a server whose shared account already works. A
+// per-user link is refused in a browser signed in to toolyard as somebody
+// else; whether the browser held the person's own session is recorded on
+// the flow (opener_verified), because the callback stores a token whose
+// account the provider did not name only then.
+//
+// The confirm page's Content-Security-Policy widens form-action to the
+// provider's authorize origin: browsers apply the page's form-action to
+// the redirect the POST answers with. The pages use the dashboard's
+// stylesheet, since the policy allows no inline style.
+//
+// Public route: the CSRF header and JSON-body rules of HardenAPI are
+// lifted for it (the nonce is the CSRF proof), the Origin check stays, a
+// member's session passes RoleGuard, an operator token can never use it,
+// and the unauthenticated per-IP throttle applies (security.go).
 
 // connectLinkPath is the route prefix; the ticket is the rest of the path.
 // It is oauth.ConnectLinkPath, which the gateway builds links with (a test
@@ -33,44 +59,92 @@ import (
 // catalog test reads mux.HandleFunc registrations as string literals.
 const connectLinkPath = "/v1/connect/link/"
 
+// connectNoncePrefix names the per-ticket nonce cookie; the rest of the
+// name is a prefix of the ticket's hash, so two links open in one browser
+// do not clobber each other.
+const connectNoncePrefix = "toolyard_connect_"
+
 // Audit event types.
 const (
 	// connectLinkUsed: a link was redeemed and the sign-in started.
 	connectLinkUsed = "connect.link_used"
-	// connectLinkRefused: a link was not honoured; Reason says why.
+	// connectLinkRefused: a Continue was not honoured; Reason says why.
+	// Showing the confirm page (GET) is never audited: it changes nothing.
 	connectLinkRefused = "connect.link_refused"
-	// connectAccountMismatch: a per_user sign-in from a link came back
-	// with another account than the person's; nothing was stored.
+	// connectAccountMismatch: a sign-in from a link came back with another
+	// account than the rule allows; nothing was stored.
 	connectAccountMismatch = "connect.account_mismatch"
-	// connectUnverifiedAccount: a per_user sign-in from a link could not
-	// be checked against the person's email (the provider named no
-	// account, or the person has no email on file) and was accepted.
+	// connectUnverifiedAccount: a per-user sign-in from a link could not
+	// be checked against the person's email and was accepted because the
+	// browser that redeemed the link held the person's toolyard session.
 	connectUnverifiedAccount = "connect.unverified_account"
+)
+
+// Outcomes of connectAccountCheck.
+const (
+	accountMatch        = "match"
+	accountMismatch     = "mismatch"
+	accountUnverifiable = "unverifiable"
 )
 
 func (s *Server) connectLinkRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/v1/connect/link/", s.connectLink)
 }
 
-// connectLink redeems the ticket in the path and starts the sign-in.
-func (s *Server) connectLink(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodGet {
-		writeError(w, http.StatusMethodNotAllowed, "GET only")
-		return
-	}
-	w.Header().Set("Cache-Control", "no-store")
-	if s.oauth == nil || s.upstreams == nil {
-		connectHTMLPage(w, http.StatusServiceUnavailable, "Not available",
-			"toolyard is not set up for sign-in links. Ask an admin to connect the server from the dashboard.")
-		return
-	}
-	ctx := r.Context()
-	ticket := strings.TrimPrefix(r.URL.Path, connectLinkPath)
+// connectTicketFromPath returns the ticket in the path, "" when the path
+// is not exactly one segment under the prefix.
+func connectTicketFromPath(path string) string {
+	ticket := strings.TrimPrefix(path, connectLinkPath)
 	if ticket == "" || strings.ContainsAny(ticket, "/?#") {
-		s.connectLinkRefuse(w, r, "unknown", "", nil, connectLinkDeadText)
-		return
+		return ""
 	}
-	tk, err := s.oauth.RedeemConnectTicket(ctx, ticket)
+	return ticket
+}
+
+func (s *Server) connectLink(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
+	switch r.Method {
+	case http.MethodGet:
+		s.connectLinkConfirm(w, r)
+	case http.MethodHead:
+		// Previewers and link checkers: nothing to see, nothing changes.
+		w.WriteHeader(http.StatusOK)
+	case http.MethodPost:
+		s.connectLinkContinue(w, r)
+	default:
+		writeError(w, http.StatusMethodNotAllowed, "GET or POST")
+	}
+}
+
+// connectLinkLookup is what both the page and the Continue need to know
+// about a ticket: its row, the person, the server and its OAuth client.
+type connectLinkLookup struct {
+	ticket string
+	tk     *oauth.ConnectTicket
+	user   *identity.User
+	server *upstreams.Server
+	client *oauth.ClientRecord
+}
+
+// connectLinkRefusal is a precondition that failed: the audit reason, the
+// text for the person, and whether a toolyard sign-in would help.
+type connectLinkRefusal struct {
+	reason string
+	text   string
+	signIn bool
+}
+
+// lookupConnectLink reads the ticket without redeeming it and checks
+// everything about it that does not depend on who is asking: the person
+// is active, the server exists, is enabled, still granted to the person,
+// has a real browser sign-in, and the ticket's purpose fits its mode.
+func (s *Server) lookupConnectLink(r *http.Request) (*connectLinkLookup, *connectLinkRefusal) {
+	ctx := r.Context()
+	ticket := connectTicketFromPath(r.URL.Path)
+	if ticket == "" {
+		return nil, &connectLinkRefusal{reason: "unknown", text: connectLinkDeadText}
+	}
+	tk, err := s.oauth.PeekConnectTicket(ctx, ticket)
 	if err != nil {
 		reason := "error"
 		switch {
@@ -81,112 +155,384 @@ func (s *Server) connectLink(w http.ResponseWriter, r *http.Request) {
 		case errors.Is(err, oauth.ErrTicketExpired):
 			reason = "expired"
 		}
-		s.connectLinkRefuse(w, r, reason, "", nil, connectLinkDeadText)
-		return
+		return nil, &connectLinkRefusal{reason: reason, text: connectLinkDeadText}
 	}
+	l := &connectLinkLookup{ticket: ticket, tk: tk}
 	u, err := s.identity.GetUserByID(ctx, tk.UserID)
 	if err != nil || u.Status != identity.StatusActive {
-		s.connectLinkRefuse(w, r, "user_inactive", tk.Upstream, nil,
-			"Your toolyard account is not active, so this link can't be used. Ask a toolyard admin.")
-		return
+		return l, &connectLinkRefusal{reason: "user_inactive", text: "The toolyard account this link was made for is not active, so it can't be used. Ask a toolyard admin."}
 	}
+	l.user = u
 	sv, err := s.upstreams.Get(ctx, tk.Upstream)
 	if err != nil {
 		if errors.Is(err, upstreams.ErrNotFound) {
-			s.connectLinkRefuse(w, r, "server_missing", tk.Upstream, u, "That server no longer exists in toolyard. Ask your agent what it needs now.")
-			return
+			return l, &connectLinkRefusal{reason: "server_missing", text: "That server no longer exists in toolyard. Ask your agent what it needs now."}
 		}
-		s.connectLinkRefuse(w, r, "error", tk.Upstream, u, "Something went wrong looking the server up. Ask your agent for a new link.")
-		return
+		return l, &connectLinkRefusal{reason: "error", text: "Something went wrong looking the server up. Ask your agent for a new link."}
 	}
+	l.server = sv
 	if !sv.Enabled {
-		s.connectLinkRefuse(w, r, "server_disabled", tk.Upstream, u, "That server is disabled in toolyard. Ask an admin to enable it, then ask your agent for a new link.")
-		return
+		return l, &connectLinkRefusal{reason: "server_disabled", text: "That server is disabled in toolyard. Ask an admin to enable it, then ask your agent for a new link."}
 	}
 	// The grant may have gone since the link was minted.
 	allowed, err := s.mayUseServer(ctx, u, tk.Upstream)
 	if err != nil {
-		s.connectLinkRefuse(w, r, "error", tk.Upstream, u, "Something went wrong checking your access. Ask your agent for a new link.")
-		return
+		return l, &connectLinkRefusal{reason: "error", text: "Something went wrong checking access. Ask your agent for a new link."}
 	}
 	if !allowed {
-		s.connectLinkRefuse(w, r, "not_granted", tk.Upstream, u, "You no longer have access to that server in toolyard. Ask an admin, then ask your agent for a new link.")
-		return
+		return l, &connectLinkRefusal{reason: "not_granted", text: "The person this link was made for no longer has access to that server in toolyard. Ask an admin, then ask your agent for a new link."}
 	}
 	// A pasted token has no browser sign-in to start.
 	cli, err := s.oauth.GetClient(ctx, tk.Upstream)
 	if err != nil {
 		if errors.Is(err, oauth.ErrClientNotFound) {
-			s.connectLinkRefuse(w, r, "no_client", tk.Upstream, u, "An admin still has to finish this server's OAuth setup in the toolyard dashboard (Servers → Auth). Ask them, then ask your agent for a new link.")
-			return
+			return l, &connectLinkRefusal{reason: "no_client", text: "An admin still has to finish this server's OAuth setup in the toolyard dashboard (Servers → Auth). Ask them, then ask your agent for a new link."}
 		}
-		s.connectLinkRefuse(w, r, "error", tk.Upstream, u, "Something went wrong looking the server's sign-in up. Ask your agent for a new link.")
-		return
+		return l, &connectLinkRefusal{reason: "error", text: "Something went wrong looking the server's sign-in up. Ask your agent for a new link."}
 	}
 	if cli.AuthorizationEndpoint == "" || cli.AuthorizationEndpoint == "(pat)" {
-		s.connectLinkRefuse(w, r, "token_only", tk.Upstream, u, "That server uses a pasted token, not a browser sign-in. An admin sets a new token in the toolyard dashboard (Servers → Auth).")
-		return
+		return l, &connectLinkRefusal{reason: "token_only", text: "That server uses a pasted token, not a browser sign-in. An admin sets a new token in the toolyard dashboard (Servers → Auth)."}
 	}
-	var perUser bool
+	l.client = cli
 	switch tk.Purpose {
 	case oauth.ConnectPurposePerUser:
 		if sv.AuthMode != upstreams.AuthPerUser {
-			s.connectLinkRefuse(w, r, "mode_changed", tk.Upstream, u, "That server's sign-in changed since the link was made. Ask your agent for a new link.")
-			return
+			return l, &connectLinkRefusal{reason: "mode_changed", text: "That server's sign-in changed since the link was made. Ask your agent for a new link."}
 		}
-		perUser = true
 	case oauth.ConnectPurposeShared:
 		if sv.AuthMode == upstreams.AuthPerUser {
-			s.connectLinkRefuse(w, r, "mode_changed", tk.Upstream, u, "That server's sign-in changed since the link was made. Ask your agent for a new link.")
-			return
+			return l, &connectLinkRefusal{reason: "mode_changed", text: "That server's sign-in changed since the link was made. Ask your agent for a new link."}
 		}
+		// The gateway mints shared links for admin owners only; a ticket
+		// for anyone else is not honoured whoever opens it.
 		if u.Role != identity.RoleAdmin {
-			s.connectLinkRefuse(w, r, "not_admin", tk.Upstream, u, "Only an admin can sign in this server's shared account. Ask a toolyard admin to connect it.")
-			return
+			return l, &connectLinkRefusal{reason: "not_admin", text: "Only an admin can sign in this server's shared account, and this link was not made for one. Ask a toolyard admin to connect it."}
 		}
 	default:
-		s.connectLinkRefuse(w, r, "bad_purpose", tk.Upstream, u, connectLinkDeadText)
+		return l, &connectLinkRefusal{reason: "bad_purpose", text: connectLinkDeadText}
+	}
+	return l, nil
+}
+
+// connectLinkConfirm (GET) shows whose link this is and what Continue
+// does. It redeems nothing and audits nothing.
+func (s *Server) connectLinkConfirm(w http.ResponseWriter, r *http.Request) {
+	if s.oauth == nil || s.upstreams == nil {
+		writeConnectPage(w, http.StatusServiceUnavailable, "Not available",
+			"<h1>Not available</h1><p>toolyard is not set up for sign-in links. Ask an admin to connect the server from the dashboard.</p>")
 		return
 	}
-	authURL, state, err := s.oauth.BeginFromTicket(ctx, tk.Upstream, u.ID, perUser)
+	l, refusal := s.lookupConnectLink(r)
+	if refusal != nil {
+		writeConnectPage(w, connectRefusalStatus(refusal.reason), "This link can't be used",
+			"<h1>This link can't be used</h1><p>"+htmlEscape(refusal.text)+"</p>"+s.signInHTML(refusal.signIn))
+		return
+	}
+	sess, hasSess := s.sessionUser(r)
+	shared := l.tk.Purpose == oauth.ConnectPurposeShared
+	// What the browser's own session says already: a member cannot
+	// continue a shared link, and a per-user link is somebody else's.
+	// Without a session nothing is known yet (the dashboard's session
+	// cookie is SameSite=Strict, so a click from the chat does not carry
+	// it; the Continue POST, same-site, will).
+	switch {
+	case shared && hasSess && (sess.Role != identity.RoleAdmin || sess.Status != identity.StatusActive):
+		writeConnectPage(w, http.StatusForbidden, "Admin sign-in needed",
+			"<h1>Sign in to toolyard as an admin to continue</h1><p>This link signs in the shared account of <strong>"+htmlEscape(l.tk.Upstream)+
+				"</strong> that everyone's agents use, and only an admin may do that. This browser is signed in to toolyard as a member.</p>"+s.signInHTML(true))
+		return
+	case !shared && hasSess && sess.ID != l.user.ID:
+		writeConnectPage(w, http.StatusForbidden, "This link is for someone else",
+			"<h1>This link is for someone else</h1><p>This browser is signed in to toolyard as a different person than the one this link was made for. Nothing happened. Ask your agent for a link of your own.</p>")
+		return
+	}
+	nonce, err := randomNonce()
 	if err != nil {
-		s.connectLinkRefuse(w, r, "begin_failed", tk.Upstream, u, "The sign-in could not be started. Ask your agent for a new link; if it keeps failing, tell a toolyard admin.")
+		writeConnectPage(w, http.StatusInternalServerError, "Not available", "<h1>Not available</h1><p>Please try again.</p>")
+		return
+	}
+	http.SetCookie(w, &http.Cookie{
+		Name:     connectNonceName(l.ticket),
+		Value:    nonce,
+		Path:     connectLinkPath,
+		HttpOnly: true,
+		Secure:   s.security.IsBehindHTTPS(r),
+		SameSite: http.SameSiteStrictMode,
+		MaxAge:   int(oauth.ConnectTicketTTL.Seconds()),
+	})
+	w.Header().Set("Content-Security-Policy", connectCSP(l.client.AuthorizationEndpoint))
+	writeConnectPage(w, http.StatusOK, "Connect "+l.tk.Upstream, s.connectConfirmHTML(l, nonce, shared, hasSess))
+}
+
+// connectConfirmHTML is the confirm page's body.
+func (s *Server) connectConfirmHTML(l *connectLinkLookup, nonce string, shared, hasSess bool) string {
+	server := htmlEscape(l.tk.Upstream)
+	person := htmlEscape(nonEmpty(l.user.Email, l.user.Label()))
+	provider := ""
+	if u, err := url.Parse(l.client.AuthorizationEndpoint); err == nil && u.Host != "" {
+		provider = " at <strong>" + htmlEscape(u.Host) + "</strong>"
+	}
+	var b strings.Builder
+	b.WriteString("<h1>Connect " + server + " for " + person + "</h1>")
+	if shared {
+		b.WriteString("<p>This signs in the <strong>shared account</strong> of " + server + " that everyone's agents use.</p>")
+		if !hasSess {
+			b.WriteString("<p>Continue works only in a browser signed in to toolyard as an admin. Not signed in here? " +
+				`<a href="` + htmlEscape(s.signInHref()) + `">Sign in to toolyard</a> first, then open this link again.</p>`)
+		}
+	} else {
+		b.WriteString("<p>This signs in the account only " + person + "'s agents use.</p>")
+	}
+	b.WriteString("<p>You'll be sent" + provider + " to sign in, then come back here. Afterwards, tell your agent to retry.</p>")
+	b.WriteString(`<form method="post" action="` + htmlEscape(connectLinkPath+l.ticket) + `">` +
+		`<input type="hidden" name="nonce" value="` + htmlEscape(nonce) + `">` +
+		`<button type="submit">Continue</button></form>`)
+	return b.String()
+}
+
+// connectLinkContinue (POST) redeems the ticket and starts the sign-in.
+func (s *Server) connectLinkContinue(w http.ResponseWriter, r *http.Request) {
+	if s.oauth == nil || s.upstreams == nil {
+		writeConnectPage(w, http.StatusServiceUnavailable, "Not available",
+			"<h1>Not available</h1><p>toolyard is not set up for sign-in links. Ask an admin to connect the server from the dashboard.</p>")
+		return
+	}
+	ctx := r.Context()
+	ticket := connectTicketFromPath(r.URL.Path)
+	if ticket == "" {
+		s.connectLinkRefuse(w, r, "", nil, &connectLinkRefusal{reason: "unknown", text: connectLinkDeadText})
+		return
+	}
+	// The form came from this origin's confirm page: the browser says so
+	// (Sec-Fetch-Site), and the nonce it carries is the one that page's
+	// response set as a cookie.
+	if site := r.Header.Get("Sec-Fetch-Site"); site != "" && site != "same-origin" {
+		s.connectLinkRefuse(w, r, "", nil, &connectLinkRefusal{reason: "cross_site", text: "This page only works from toolyard's own confirm page. Open the link again."})
+		return
+	}
+	if err := r.ParseForm(); err != nil {
+		s.connectLinkRefuse(w, r, "", nil, &connectLinkRefusal{reason: "bad_form", text: "The form could not be read. Open the link again."})
+		return
+	}
+	nonceCookie, err := r.Cookie(connectNonceName(ticket))
+	formNonce := r.PostForm.Get("nonce")
+	if err != nil || formNonce == "" || !hmac.Equal([]byte(nonceCookie.Value), []byte(formNonce)) {
+		s.connectLinkRefuse(w, r, "", nil, &connectLinkRefusal{reason: "nonce", text: "This page is stale or did not come from toolyard's confirm page. Open the link again."})
+		return
+	}
+	s.clearConnectNonce(w, r, ticket)
+
+	l, refusal := s.lookupConnectLink(r)
+	if refusal != nil {
+		upstream := ""
+		var u *identity.User
+		if l != nil && l.tk != nil {
+			upstream = l.tk.Upstream
+			u = l.user
+		}
+		s.connectLinkRefuse(w, r, upstream, u, refusal)
+		return
+	}
+	sess, hasSess := s.sessionUser(r)
+	flowUser := l.user
+	perUser := l.tk.Purpose == oauth.ConnectPurposePerUser
+	openerVerified := false
+	if perUser {
+		if hasSess && sess.ID != l.user.ID {
+			s.connectLinkRefuse(w, r, l.tk.Upstream, l.user, &connectLinkRefusal{reason: "other_user",
+				text: "This browser is signed in to toolyard as a different person than the one this link was made for. Nothing happened. Ask your agent for a link of your own."})
+			return
+		}
+		openerVerified = hasSess && sess.ID == l.user.ID
+	} else {
+		// The org-wide account: an admin, here, now. The flow is theirs.
+		if !hasSess || sess.Role != identity.RoleAdmin || sess.Status != identity.StatusActive {
+			s.connectLinkRefuse(w, r, l.tk.Upstream, l.user, &connectLinkRefusal{reason: "admin_session",
+				text: "Sign in to toolyard as an admin to continue. This link signs in the shared account of " + l.tk.Upstream + " that everyone's agents use.", signIn: true})
+			return
+		}
+		conn, err := s.oauth.SharedConnection(ctx, l.tk.Upstream)
+		if err != nil {
+			s.connectLinkRefuse(w, r, l.tk.Upstream, sess, &connectLinkRefusal{reason: "error", text: "Something went wrong looking the server's sign-in up. Ask your agent for a new link."})
+			return
+		}
+		if conn.Usable() {
+			// Never replaced through a link: a link can be forwarded.
+			as := ""
+			if conn.AccountLabel != "" {
+				as = " as " + conn.AccountLabel
+			}
+			s.connectLinkRefuse(w, r, l.tk.Upstream, sess, &connectLinkRefusal{reason: "already_connected",
+				text: l.tk.Upstream + " is already signed in" + as + ", so this link does nothing. Switching the shared account is done by an admin in the toolyard dashboard (Servers → Auth)."})
+			return
+		}
+		flowUser = sess
+		openerVerified = true
+	}
+	// Everything checked: the ticket is spent now, once.
+	if _, err := s.oauth.RedeemConnectTicket(ctx, ticket); err != nil {
+		reason := "error"
+		switch {
+		case errors.Is(err, oauth.ErrTicketUnknown):
+			reason = "unknown"
+		case errors.Is(err, oauth.ErrTicketUsed):
+			reason = "used"
+		case errors.Is(err, oauth.ErrTicketExpired):
+			reason = "expired"
+		}
+		s.connectLinkRefuse(w, r, l.tk.Upstream, l.user, &connectLinkRefusal{reason: reason, text: connectLinkDeadText})
+		return
+	}
+	authURL, state, err := s.oauth.BeginFromTicket(ctx, l.tk.Upstream, flowUser.ID, perUser, openerVerified)
+	if err != nil {
+		s.connectLinkRefuse(w, r, l.tk.Upstream, flowUser, &connectLinkRefusal{reason: "begin_failed",
+			text: "The sign-in could not be started. Ask your agent for a new link; if it keeps failing, tell a toolyard admin."})
 		return
 	}
 	// The return from the provider proves itself with this cookie, as a
 	// dashboard-started flow does.
-	s.setOAuthFlowCookie(w, r, state, u.ID)
+	s.setOAuthFlowCookie(w, r, state, flowUser.ID)
+	summary := l.tk.Purpose + " sign-in to " + l.tk.Upstream + " started from a connect link"
+	if flowUser.ID != l.tk.UserID {
+		summary += " minted for another admin"
+	}
 	_ = s.audit.Write(ctx, audit.Event{
-		EventType: connectLinkUsed, AgentID: tk.AgentID, UpstreamName: tk.Upstream,
-		ResultSummary: tk.Purpose + " sign-in to " + tk.Upstream + " started from a connect link",
-		Raiser:        actor.Raiser{OwnerUserID: u.ID, OwnerEmail: u.Email, OwnerName: u.Label()},
+		EventType: connectLinkUsed, AgentID: l.tk.AgentID, UpstreamName: l.tk.Upstream,
+		ResultSummary: summary,
+		Raiser:        actor.Raiser{OwnerUserID: flowUser.ID, OwnerEmail: flowUser.Email, OwnerName: flowUser.Label()},
 	})
-	http.Redirect(w, r, authURL, http.StatusFound)
+	w.Header().Set("Content-Security-Policy", connectCSP(l.client.AuthorizationEndpoint))
+	http.Redirect(w, r, authURL, http.StatusSeeOther)
 }
 
 // connectLinkDeadText is what the person reads for a link that cannot be
 // told apart from a stale one.
 const connectLinkDeadText = "This link has expired or was already used — ask your agent for a new one."
 
-// connectLinkRefuse audits why a link was not honoured and shows the page.
-// The ticket itself is never recorded.
-func (s *Server) connectLinkRefuse(w http.ResponseWriter, r *http.Request, reason, upstream string, u *identity.User, text string) {
+// connectLinkRefuse audits why a Continue was not honoured and shows the
+// page. The ticket itself is never recorded.
+func (s *Server) connectLinkRefuse(w http.ResponseWriter, r *http.Request, upstream string, u *identity.User, ref *connectLinkRefusal) {
 	ev := audit.Event{
-		EventType: connectLinkRefused, UpstreamName: upstream, Reason: reason,
-		ResultSummary: "connect link refused: " + reason,
+		EventType: connectLinkRefused, UpstreamName: upstream, Reason: ref.reason,
+		ResultSummary: "connect link refused: " + ref.reason,
 	}
 	if u != nil {
 		ev.Raiser = actor.Raiser{OwnerUserID: u.ID, OwnerEmail: u.Email, OwnerName: u.Label()}
 	}
 	_ = s.audit.Write(r.Context(), ev)
-	status := http.StatusGone
-	switch reason {
-	case "not_admin", "user_inactive", "not_granted":
-		status = http.StatusForbidden
-	case "error", "begin_failed":
-		status = http.StatusBadGateway
+	title := "This link can't be used"
+	if ref.reason == "admin_session" {
+		title = "Admin sign-in needed"
 	}
-	connectHTMLPage(w, status, "This link can't be used", text)
+	writeConnectPage(w, connectRefusalStatus(ref.reason), title,
+		"<h1>"+htmlEscape(title)+"</h1><p>"+htmlEscape(ref.text)+"</p>"+s.signInHTML(ref.signIn))
+}
+
+// connectRefusalStatus maps a refusal reason to the page's status.
+func connectRefusalStatus(reason string) int {
+	switch reason {
+	case "not_admin", "admin_session", "user_inactive", "not_granted", "other_user", "nonce", "cross_site", "already_connected":
+		return http.StatusForbidden
+	case "error", "begin_failed":
+		return http.StatusBadGateway
+	case "bad_form":
+		return http.StatusBadRequest
+	}
+	return http.StatusGone
+}
+
+// connectNonceName is the nonce cookie for one ticket.
+func connectNonceName(ticket string) string {
+	sum := sha256.Sum256([]byte(ticket))
+	return connectNoncePrefix + hex.EncodeToString(sum[:8])
+}
+
+func randomNonce() (string, error) {
+	b := make([]byte, 24)
+	if _, err := rand.Read(b); err != nil {
+		return "", err
+	}
+	return base64.RawURLEncoding.EncodeToString(b), nil
+}
+
+// clearConnectNonce drops the nonce once the form came back.
+func (s *Server) clearConnectNonce(w http.ResponseWriter, r *http.Request, ticket string) {
+	http.SetCookie(w, &http.Cookie{
+		Name: connectNonceName(ticket), Value: "", Path: connectLinkPath, HttpOnly: true,
+		Secure: s.security.IsBehindHTTPS(r), SameSite: http.SameSiteStrictMode, MaxAge: -1,
+	})
+}
+
+// connectCSP is strictCSP with form-action widened to the provider's
+// authorize origin: the browser applies the confirm page's form-action to
+// the redirect that answers the form's POST.
+func connectCSP(authorizeEndpoint string) string {
+	formAction := "form-action 'self'"
+	if u, err := url.Parse(authorizeEndpoint); err == nil && (u.Scheme == "https" || u.Scheme == "http") && u.Host != "" {
+		formAction += " " + u.Scheme + "://" + u.Host
+	}
+	return strings.Replace(strictCSP, "form-action 'self'", formAction, 1)
+}
+
+// signInHref is where a person signs in to toolyard: the Clerk page when
+// Sign in with Google is on, else the dashboard's own login.
+func (s *Server) signInHref() string {
+	if s.clerk != nil {
+		return "/login"
+	}
+	return "/"
+}
+
+// signInHTML is the sign-in link paragraph, or nothing.
+func (s *Server) signInHTML(show bool) string {
+	if !show {
+		return ""
+	}
+	return `<p><a href="` + htmlEscape(s.signInHref()) + `">Sign in to toolyard</a>, then open the link again.</p>`
+}
+
+// connectAccountCheck applies a connect link's account rule to a per-user
+// token: the account the provider reports must be the person's own email.
+// Both sides are compared ASCII-lowercased. A label the provider did not
+// vouch for (email_verified false), no email on either side, or anything
+// non-ASCII on either side leaves the rule unable to run.
+func connectAccountCheck(u *identity.User, rec *oauth.UserTokenRecord) string {
+	label, email := strings.TrimSpace(rec.AccountLabel), strings.TrimSpace(u.Email)
+	if label == "" || email == "" || !rec.AccountVerified || !isASCII(label) || !isASCII(email) {
+		return accountUnverifiable
+	}
+	if asciiLower(label) == asciiLower(email) {
+		return accountMatch
+	}
+	return accountMismatch
+}
+
+// sameEmail compares two account labels the way connectAccountCheck does;
+// comparable is false when either is empty or non-ASCII.
+func sameEmail(a, b string) (same, comparable bool) {
+	a, b = strings.TrimSpace(a), strings.TrimSpace(b)
+	if a == "" || b == "" || !isASCII(a) || !isASCII(b) {
+		return false, false
+	}
+	return asciiLower(a) == asciiLower(b), true
+}
+
+func isASCII(s string) bool {
+	for i := 0; i < len(s); i++ {
+		if s[i] >= 0x80 {
+			return false
+		}
+	}
+	return true
+}
+
+func asciiLower(s string) string {
+	return strings.Map(func(r rune) rune {
+		if r >= 'A' && r <= 'Z' {
+			return r + ('a' - 'A')
+		}
+		return r
+	}, s)
 }
 
 // userFlowError shows a per-user callback failure in words that fit how
@@ -194,53 +540,70 @@ func (s *Server) connectLinkRefuse(w http.ResponseWriter, r *http.Request, reaso
 // link-started flow back at the agent.
 func (s *Server) userFlowError(w http.ResponseWriter, viaTicket bool, dashboardMsg, linkMsg string) {
 	if viaTicket {
-		connectHTMLPage(w, http.StatusBadRequest, "Sign-in not completed", linkMsg)
+		writeConnectPage(w, http.StatusBadRequest, "Sign-in not completed",
+			"<h1>Sign-in not completed</h1><p>"+htmlEscape(linkMsg)+"</p>")
 		return
 	}
 	oauthHTMLError(w, dashboardMsg)
 }
 
-// connectAccountMatches is the rule for a per_user sign-in from a link:
-// the account the provider reports must be the person's own email,
-// case-insensitively. With nothing to compare (no email reported, or none
-// on file for the person) it passes; the caller audits that.
-func connectAccountMatches(u *identity.User, account string) bool {
-	if account == "" || u.Email == "" {
-		return true
-	}
-	return strings.EqualFold(strings.TrimSpace(account), strings.TrimSpace(u.Email))
-}
-
-// connectAccountVerified reports whether the match above was a real
-// comparison.
-func connectAccountVerified(u *identity.User, account string) bool {
-	return account != "" && u.Email != ""
-}
-
 // connectAccountMismatchPage is shown when the person signed in to the
-// provider as somebody else; nothing was stored.
-func (s *Server) connectAccountMismatchPage(w http.ResponseWriter, r *http.Request, u *identity.User, upstream, other string) {
+// provider as somebody else; nothing was stored. It names neither account:
+// the opener may not be the person the link was made for.
+func (s *Server) connectAccountMismatchPage(w http.ResponseWriter, r *http.Request, u *identity.User, upstream string) {
 	_ = s.audit.Write(r.Context(), audit.Event{
 		EventType: connectAccountMismatch, AgentID: "user:" + u.ID, UpstreamName: upstream,
 		ResultSummary: upstream + ": the provider reported a different account than the person's email; no token stored",
 		Raiser:        actor.Raiser{OwnerUserID: u.ID, OwnerEmail: u.Email, OwnerName: u.Label()},
 	})
-	connectHTMLPage(w, http.StatusBadRequest, "Wrong account",
-		"This link was made for "+u.Email+"; you signed in as "+other+". Sign in with the right account. "+
-			"Nothing was stored. Ask your agent for a new link and sign in as "+u.Email+".")
+	writeConnectPage(w, http.StatusBadRequest, "Wrong account",
+		"<h1>Wrong account</h1><p>You signed in with a different account than this link is for. Nothing was stored. Ask your agent for a new link and sign in with your own account.</p>")
 }
 
-// connectAuditUnverified records a per_user sign-in from a link that
-// could not be checked against the person's email.
+// connectUnverifiedPage is shown when the provider's account could not be
+// checked against the person's email and the browser that redeemed the
+// link had no toolyard session for them; nothing was stored.
+func (s *Server) connectUnverifiedPage(w http.ResponseWriter, r *http.Request, u *identity.User, upstream string) {
+	_ = s.audit.Write(r.Context(), audit.Event{
+		EventType: connectAccountMismatch, AgentID: "user:" + u.ID, UpstreamName: upstream,
+		Decision:      "unverifiable",
+		ResultSummary: upstream + ": the provider named no checkable account and the browser held no toolyard session for the person; no token stored",
+		Raiser:        actor.Raiser{OwnerUserID: u.ID, OwnerEmail: u.Email, OwnerName: u.Label()},
+	})
+	writeConnectPage(w, http.StatusForbidden, "Sign-in not verified",
+		"<h1>This sign-in can't be verified automatically</h1><p>The provider did not say which account you used, so nothing was stored. "+
+			"Sign in to toolyard once in this browser, then open the link again.</p>"+s.signInHTML(true))
+}
+
+// connectSharedMismatchPage is shown when a shared-account sign-in from a
+// link used a different account than the one on file; nothing changed.
+func (s *Server) connectSharedMismatchPage(w http.ResponseWriter, r *http.Request, u *identity.User, upstream, prev string) {
+	_ = s.audit.Write(r.Context(), audit.Event{
+		EventType: connectAccountMismatch, AgentID: "user:" + u.ID, UpstreamName: upstream,
+		Decision:      "shared",
+		ResultSummary: upstream + ": a connect link signed the shared account in as a different account than the one on file; nothing changed",
+		Raiser:        actor.Raiser{OwnerUserID: u.ID, OwnerEmail: u.Email, OwnerName: u.Label()},
+	})
+	writeConnectPage(w, http.StatusForbidden, "Different account",
+		"<h1>Different account</h1><p>"+htmlEscape(upstream)+" is signed in as <strong>"+htmlEscape(prev)+
+			"</strong>, and this sign-in used a different account, so nothing changed. Switching the shared account is done by an admin in the toolyard dashboard (Servers → Auth).</p>")
+}
+
+// connectAuditUnverified records a per-user sign-in from a link that
+// could not be checked against the person's email and was accepted on the
+// strength of the person's own toolyard session.
 func (s *Server) connectAuditUnverified(r *http.Request, u *identity.User, upstream, account string) {
 	why := "the provider named no account"
-	if account != "" {
+	switch {
+	case account != "" && u.Email == "":
 		why = "the person has no email on file"
+	case account != "":
+		why = "the provider did not vouch for the account, or it could not be compared"
 	}
 	_ = s.audit.Write(r.Context(), audit.Event{
 		EventType: connectUnverifiedAccount, AgentID: "user:" + u.ID, UpstreamName: upstream,
 		Decision:      "unverified_account",
-		ResultSummary: upstream + " connected from a link without an account check: " + why,
+		ResultSummary: upstream + " connected from a link on the person's own toolyard session; the account was not checked: " + why,
 		Raiser:        actor.Raiser{OwnerUserID: u.ID, OwnerEmail: u.Email, OwnerName: u.Label()},
 	})
 }
@@ -252,28 +615,19 @@ func connectDonePage(w http.ResponseWriter, upstream, account string) {
 	if account != "" {
 		as = " as <strong>" + htmlEscape(account) + "</strong>"
 	}
-	w.Header().Set("Content-Type", "text/html; charset=utf-8")
-	w.Header().Set("Cache-Control", "no-store")
-	w.WriteHeader(http.StatusOK)
-	_, _ = w.Write([]byte(`<!doctype html><html><head><meta charset="utf-8"><title>Connected — toolyard</title>
-<style>body{font:14px system-ui,sans-serif;color:#222;background:#f6f8fa;display:flex;align-items:center;justify-content:center;height:100vh;margin:0}div{background:#fff;border-radius:8px;padding:32px;box-shadow:0 4px 12px rgba(0,0,0,0.08);max-width:420px}h1{margin:0 0 8px;font-size:18px;color:#0a7}</style>
-</head><body><div>
-<h1>✓ Connected</h1>
-<p><strong>` + htmlEscape(upstream) + `</strong> is connected` + as + `.</p>
-<p>Go back to T3 Code and tell your agent to retry. You can close this tab.</p>
-</div></body></html>`))
+	writeConnectPage(w, http.StatusOK, "Connected",
+		"<h1>Connected</h1><p><strong>"+htmlEscape(upstream)+"</strong> is connected"+as+".</p>"+
+			"<p>Go back to T3 Code and tell your agent to retry. You can close this tab.</p>")
 }
 
-// connectHTMLPage is the small plain page for anything that is not a
-// success: a stale link, a refusal, a wrong account.
-func connectHTMLPage(w http.ResponseWriter, status int, title, text string) {
+// writeConnectPage renders one of the connect pages. body is HTML the
+// caller built with htmlEscape on every dynamic part. The dashboard's
+// stylesheet is linked rather than styling inline, which the
+// Content-Security-Policy forbids.
+func writeConnectPage(w http.ResponseWriter, status int, title, body string) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(status)
-	_, _ = w.Write([]byte(`<!doctype html><html><head><meta charset="utf-8"><title>` + htmlEscape(title) + ` — toolyard</title>
-<style>body{font:14px system-ui,sans-serif;color:#222;background:#fff5f5;display:flex;align-items:center;justify-content:center;height:100vh;margin:0}div{background:#fff;border:1px solid #f99;border-radius:8px;padding:32px;max-width:420px}h1{margin:0 0 8px;font-size:18px;color:#c33}</style>
-</head><body><div>
-<h1>` + htmlEscape(title) + `</h1>
-<p>` + htmlEscape(text) + `</p>
-</div></body></html>`))
+	_, _ = w.Write([]byte(`<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">` +
+		`<title>` + htmlEscape(title) + ` — toolyard</title><link rel="stylesheet" href="/style.css"></head><body><main>` + body + `</main></body></html>`))
 }

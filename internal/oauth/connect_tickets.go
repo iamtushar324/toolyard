@@ -88,34 +88,71 @@ func (s *Service) IssueConnectTicket(ctx context.Context, userID, upstream, purp
 	if purpose != ConnectPurposePerUser && purpose != ConnectPurposeShared {
 		return "", fmt.Errorf("oauth: bad connect purpose %q", purpose)
 	}
-	now := time.Now()
-	var live int
-	if err := s.db.QueryRowContext(ctx,
-		`SELECT count(*) FROM connect_tickets WHERE user_id = ? AND upstream = ? AND used_at IS NULL AND expires_at > ?`,
-		userID, upstream, now.UnixMilli()).Scan(&live); err != nil {
-		return "", err
-	}
-	if live >= MaxLiveConnectTickets {
-		return "", ErrTooManyTickets
-	}
 	ticket, err := randomString(32)
 	if err != nil {
 		return "", err
 	}
-	_, err = s.db.ExecContext(ctx, `
+	now := time.Now()
+	// The cap and the insert are one statement, so two refusals racing
+	// cannot both slip under it.
+	res, err := s.db.ExecContext(ctx, `
         INSERT INTO connect_tickets(id_hash, user_id, upstream, purpose, agent_id, created_at, expires_at)
-        VALUES(?,?,?,?,?,?,?)`,
+        SELECT ?,?,?,?,?,?,?
+        WHERE (SELECT count(*) FROM connect_tickets
+               WHERE user_id = ? AND upstream = ? AND used_at IS NULL AND expires_at > ?) < ?`,
 		hashConnectTicket(ticket), userID, upstream, purpose, nullStr(agentID),
-		now.UnixMilli(), now.Add(ConnectTicketTTL).UnixMilli())
+		now.UnixMilli(), now.Add(ConnectTicketTTL).UnixMilli(),
+		userID, upstream, now.UnixMilli(), MaxLiveConnectTickets)
 	if err != nil {
 		return "", err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return "", ErrTooManyTickets
 	}
 	return ticket, nil
 }
 
+// loadConnectTicket reads a ticket's row by hash, with its used_at.
+func (s *Service) loadConnectTicket(ctx context.Context, hash string) (*ConnectTicket, sql.NullInt64, error) {
+	var t ConnectTicket
+	var created, exp int64
+	var usedAt sql.NullInt64
+	err := s.db.QueryRowContext(ctx,
+		`SELECT user_id, upstream, purpose, COALESCE(agent_id,''), created_at, expires_at, used_at FROM connect_tickets WHERE id_hash = ?`, hash).
+		Scan(&t.UserID, &t.Upstream, &t.Purpose, &t.AgentID, &created, &exp, &usedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, usedAt, ErrTicketUnknown
+	}
+	if err != nil {
+		return nil, usedAt, err
+	}
+	t.CreatedAt = time.UnixMilli(created)
+	t.ExpiresAt = time.UnixMilli(exp)
+	return &t, usedAt, nil
+}
+
+// PeekConnectTicket reads a live ticket's row without redeeming it: the
+// confirm page shows whose link it is before anything happens. Unknown,
+// used and expired tickets are told apart as RedeemConnectTicket does.
+func (s *Service) PeekConnectTicket(ctx context.Context, ticket string) (*ConnectTicket, error) {
+	if ticket == "" {
+		return nil, ErrTicketUnknown
+	}
+	t, usedAt, err := s.loadConnectTicket(ctx, hashConnectTicket(ticket))
+	switch {
+	case err != nil:
+		return nil, err
+	case usedAt.Valid:
+		return nil, ErrTicketUsed
+	case !time.Now().Before(t.ExpiresAt):
+		return nil, ErrTicketExpired
+	}
+	return t, nil
+}
+
 // RedeemConnectTicket marks the ticket used and returns its row. A ticket
 // is redeemed at most once: the conditional UPDATE is the whole check, so
-// two browsers opening the same link race for one row. Unknown, already
+// two browsers submitting the same link race for one row. Unknown, already
 // used and expired tickets are told apart (ErrTicketUnknown, ErrTicketUsed,
 // ErrTicketExpired).
 func (s *Service) RedeemConnectTicket(ctx context.Context, ticket string) (*ConnectTicket, error) {
@@ -129,34 +166,36 @@ func (s *Service) RedeemConnectTicket(ctx context.Context, ticket string) (*Conn
 	if err != nil {
 		return nil, err
 	}
-	if n, _ := res.RowsAffected(); n == 1 {
-		var t ConnectTicket
-		var created, exp int64
-		if err := s.db.QueryRowContext(ctx,
-			`SELECT user_id, upstream, purpose, COALESCE(agent_id,''), created_at, expires_at FROM connect_tickets WHERE id_hash = ?`, h).
-			Scan(&t.UserID, &t.Upstream, &t.Purpose, &t.AgentID, &created, &exp); err != nil {
-			return nil, err
-		}
-		t.CreatedAt = time.UnixMilli(created)
-		t.ExpiresAt = time.UnixMilli(exp)
-		return &t, nil
-	}
-	var usedAt sql.NullInt64
-	var exp int64
-	err = s.db.QueryRowContext(ctx, `SELECT used_at, expires_at FROM connect_tickets WHERE id_hash = ?`, h).Scan(&usedAt, &exp)
-	switch {
-	case errors.Is(err, sql.ErrNoRows):
-		return nil, ErrTicketUnknown
-	case err != nil:
+	t, usedAt, err := s.loadConnectTicket(ctx, h)
+	if err != nil {
 		return nil, err
-	case usedAt.Valid:
+	}
+	if n, _ := res.RowsAffected(); n == 1 {
+		return t, nil
+	}
+	switch {
+	case usedAt.Valid && usedAt.Int64 < now:
 		return nil, ErrTicketUsed
-	case exp <= now:
+	case t.ExpiresAt.UnixMilli() <= now:
 		return nil, ErrTicketExpired
 	default:
-		// Redeemed between the UPDATE and this read.
+		// Redeemed between the UPDATE and the read.
 		return nil, ErrTicketUsed
 	}
+}
+
+// ConsumeConnectTickets marks every live ticket for (userID, upstream)
+// used: the person just connected, so the links still floating in chat
+// must not start another sign-in. Returns how many were closed.
+func (s *Service) ConsumeConnectTickets(ctx context.Context, userID, upstream string) (int, error) {
+	res, err := s.db.ExecContext(ctx,
+		`UPDATE connect_tickets SET used_at = ? WHERE user_id = ? AND upstream = ? AND used_at IS NULL`,
+		time.Now().UnixMilli(), userID, upstream)
+	if err != nil {
+		return 0, err
+	}
+	n, _ := res.RowsAffected()
+	return int(n), nil
 }
 
 // PurgeExpiredConnectTickets drops tickets past their expiry (used or
@@ -174,14 +213,26 @@ func (s *Service) PurgeExpiredConnectTickets(ctx context.Context) (int, error) {
 // BeginFromTicket starts the flow a redeemed connect link asked for, for
 // userID: their own token when perUser, the server's shared token
 // otherwise. The flow is browser-bound (the API sets the flow cookie on the
-// browser that opened the link) and marked as ticket-started, so the
-// callback applies the account check and shows the "back to your agent"
-// page. Returns the provider's authorize URL and the state.
-func (s *Service) BeginFromTicket(ctx context.Context, upstream, userID string, perUser bool) (authURL, state string, err error) {
+// browser that redeemed the link) and marked as ticket-started, so the
+// callback applies the account rule and shows the "back to your agent"
+// page; openerVerified says that browser held a toolyard session for
+// userID. Returns the provider's authorize URL and the state.
+func (s *Service) BeginFromTicket(ctx context.Context, upstream, userID string, perUser, openerVerified bool) (authURL, state string, err error) {
 	if userID == "" {
 		return "", "", errors.New("oauth: a connect link flow needs a user")
 	}
-	return s.beginFlow(ctx, upstream, userID, ModeCallback, nil, pendingFlags{perUser: perUser, browserBound: true, viaTicket: true})
+	return s.beginFlow(ctx, upstream, userID, ModeCallback, nil,
+		pendingFlags{perUser: perUser, browserBound: true, viaTicket: true, openerVerified: openerVerified})
+}
+
+// ExchangeCodeChecked is ExchangeCode with a look at the token before it
+// replaces the shared row: accept sees the account label on file (empty
+// when none) and the record the provider returned, and may refuse it. On
+// refusal nothing changes, the new token is revoked at the provider, and
+// the error is returned wrapped in ErrAccountMismatch.
+func (s *Service) ExchangeCodeChecked(ctx context.Context, upstream, code, verifier string,
+	accept func(prevLabel string, rec *TokenRecord) error) (*TokenRecord, error) {
+	return s.exchangeCode(ctx, upstream, code, verifier, accept)
 }
 
 // ExchangeCodeForUserChecked is ExchangeCodeForUser with a look at the

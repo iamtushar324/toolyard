@@ -139,8 +139,12 @@ func (g *Gateway) connectionsTools() []toolEntry {
 	link := entry(ConnectionsLinkTool,
 		"Get a fresh one-time connect link for one server (input: server), or the reason none can be made. "+
 			"A per_user server's link signs your owner's own account in; a shared server's link is only given to an admin owner, and a member is told which admins to ask. "+
+			"A server that is already connected gets no link: for a per_user server pass replace: true only when the person has asked to switch accounts; a shared account is switched by an admin in the dashboard. "+
 			connectGuidance,
-		map[string]any{"server": map[string]any{"type": "string", "description": "The server name as it appears in tool names (the part before the dot)."}},
+		map[string]any{
+			"server":  map[string]any{"type": "string", "description": "The server name as it appears in tool names (the part before the dot)."},
+			"replace": map[string]any{"type": "boolean", "description": "per_user servers only: also hand out a link when the owner is already connected, because they asked to switch accounts."},
+		},
 		"server")
 	link.handle = g.handleConnectionsLink
 	return []toolEntry{status, link}
@@ -403,7 +407,13 @@ func (g *Gateway) handleConnectionsLink(ctx context.Context, args map[string]any
 		v.State, v.Account = perUserState(conn)
 		note := "opening it signs your owner's own account in"
 		if v.State == connStateConnected {
-			note = "already connected; opening it signs in again and replaces the current sign-in"
+			// A working sign-in is not replaced on an agent's say-so: the
+			// person asks for the switch, and the agent passes that on.
+			if !boolArg(args, "replace") {
+				return mcp.NewToolResultErrorf("%s is already connected%s; nothing to do. If the person wants to switch accounts, call again with replace: true (or they disconnect it from My connections first).",
+					server, accountSuffix(v.Account)), nil
+			}
+			note = "the owner asked to switch accounts; opening it signs in again and replaces the current sign-in"
 		}
 		g.fillLink(ctx, &v, uid, server, oauth.ConnectPurposePerUser, callerID, note)
 	} else {
@@ -420,12 +430,14 @@ func (g *Gateway) handleConnectionsLink(ctx context.Context, args map[string]any
 			return mcp.NewToolResultErrorf("%s uses one shared account, and only an admin can sign it in: %s. Nothing to open.", server, g.askAdminNote(ctx, server)), nil
 		case !conn.CanAuthorize:
 			return mcp.NewToolResultErrorf("%s uses a pasted token; set a new one in the dashboard (Servers → Auth). Nothing to open.", server), nil
+		case v.State == connStateConnected:
+			// The org-wide account is never replaced through a link: a
+			// link can be forwarded, and whoever opens it would bind the
+			// account everyone's agents use.
+			return mcp.NewToolResultErrorf("%s is already signed in%s; nothing to do. Switching the shared account is done by an admin in the dashboard (Servers → Auth).",
+				server, accountSuffix(v.Account)), nil
 		}
-		note := sharedSignInAs(conn)
-		if v.State == connStateConnected {
-			note = "already signed in; opening it signs in again and replaces the current sign-in (" + note + ")"
-		}
-		g.fillLink(ctx, &v, uid, server, oauth.ConnectPurposeShared, callerID, note)
+		g.fillLink(ctx, &v, uid, server, oauth.ConnectPurposeShared, callerID, sharedSignInAs(conn))
 	}
 	if v.ConnectLink == "" {
 		return mcp.NewToolResultErrorf("no connect link for %s: %s", server, v.Note), nil
@@ -435,6 +447,14 @@ func (g *Gateway) handleConnectionsLink(ctx context.Context, args map[string]any
 	res := mcp.NewToolResultText(text)
 	res.StructuredContent = map[string]any{"server": v, "guidance": connectGuidance}
 	return res, nil
+}
+
+// accountSuffix is " as <account>" when the account is known.
+func accountSuffix(account string) string {
+	if account == "" {
+		return ""
+	}
+	return " as " + account
 }
 
 // askAdminNote tells a member's agent who can sign a shared server in.

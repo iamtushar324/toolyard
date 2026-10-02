@@ -396,7 +396,7 @@ var operatorCatalog = []operatorCatalogEntry{
 	{"/v1/auth/config", "GET", "login methods"},
 	{"/v1/auth/clerk/session", "POST", "Clerk login (browser only)"},
 	{"/v1/connect/t3", "POST", "bkt3 server: Clerk session token -> the person's agent token (never via operator token)"},
-	{"/v1/connect/link/{id}", "GET", "one-time connect link an agent gave the person: redeems the ticket and starts their sign-in to a server (browser only; never via operator token)"},
+	{"/v1/connect/link/{id}", "GET POST", "one-time connect link an agent gave the person: GET shows the confirm page, its POST redeems the ticket and starts their sign-in to a server (browser only; never via operator token)"},
 	{"/v1/operator-tokens", "GET POST", "list or mint operator tokens {name, scopes, ttl_hours}"},
 	{"/v1/operator-tokens/{id}", "DELETE", "revoke an operator token"},
 	{"/v1/operator/routes", "GET", "this catalog"},

@@ -68,6 +68,8 @@ type connectFixture struct {
 	oa     *oauth.Service
 	ids    *identity.Service
 	idp    *httptest.Server
+	bus    *approval.Bus
+	pol    *policy.Engine
 	agRoot string
 	agBob  string
 }
@@ -105,8 +107,9 @@ func newConnectFixture(t *testing.T) *connectFixture {
 	if err != nil {
 		t.Fatal(err)
 	}
+	pol := policy.New(db)
 	gw := gateway.New(gateway.Options{
-		Policy: policy.New(db), Approval: bus, Audit: audit.New(db), Memory: memory.New(db), Hub: realtime.NewHub(),
+		Policy: pol, Approval: bus, Audit: audit.New(db), Memory: memory.New(db), Hub: realtime.NewHub(),
 		Access: acc, Owners: acc, PublicURL: cfPub + "/",
 	})
 	gw.RegisterBuiltins()
@@ -126,7 +129,17 @@ func newConnectFixture(t *testing.T) *connectFixture {
 	svc.SetAuth(oa)
 	svc.SetPerUserAuth(oa)
 	oa.SetUserReauthHook(svc.DropUserConnection)
-	return &connectFixture{db: db, gw: gw, svc: svc, oa: oa, ids: ids, idp: idp, agRoot: agRoot.ID, agBob: agBob.ID}
+	return &connectFixture{db: db, gw: gw, svc: svc, oa: oa, ids: ids, idp: idp, bus: bus, pol: pol, agRoot: agRoot.ID, agBob: agBob.ID}
+}
+
+// liveTickets counts the unused tickets for one person and server.
+func (f *connectFixture) liveTickets(t *testing.T, uid, upstream string) int {
+	t.Helper()
+	var n int
+	if err := f.db.QueryRow(`SELECT count(*) FROM connect_tickets WHERE user_id = ? AND upstream = ? AND used_at IS NULL`, uid, upstream).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	return n
 }
 
 // add registers an http server in the given mode.
@@ -513,6 +526,29 @@ func TestConnectionsStatusAndLink(t *testing.T) {
 		t.Fatalf("root link secret: isError=%v %q", res.IsError, text(res))
 	}
 	f.redeem(t, linkIn(t, text(res)), cfRoot, "secret", oauth.ConnectPurposeShared, f.agRoot)
+	// A working sign-in gets no link: the shared account never through a
+	// link, the owner's own only when they asked to switch.
+	before := f.liveTickets(t, cfRoot, "gh") + f.liveTickets(t, cfRoot, "linear")
+	res = f.call(t, f.agRoot, gateway.ConnectionsLinkTool, map[string]any{"server": "gh"})
+	if !res.IsError || !strings.Contains(text(res), "already signed in as ops@example.test") || !strings.Contains(text(res), "dashboard") || connectLinkRE.MatchString(text(res)) {
+		t.Fatalf("root link for a working shared server: isError=%v %q", res.IsError, text(res))
+	}
+	res = f.call(t, f.agRoot, gateway.ConnectionsLinkTool, map[string]any{"server": "gh", "replace": true})
+	if !res.IsError || connectLinkRE.MatchString(text(res)) {
+		t.Fatalf("replace must not mint a shared link: isError=%v %q", res.IsError, text(res))
+	}
+	res = f.call(t, f.agRoot, gateway.ConnectionsLinkTool, map[string]any{"server": "linear"})
+	if !res.IsError || !strings.Contains(text(res), "already connected as root@example.test") || !strings.Contains(text(res), "replace: true") || connectLinkRE.MatchString(text(res)) {
+		t.Fatalf("root link for a connected per_user server: isError=%v %q", res.IsError, text(res))
+	}
+	if f.liveTickets(t, cfRoot, "gh")+f.liveTickets(t, cfRoot, "linear") != before {
+		t.Fatal("a refused link request minted a ticket")
+	}
+	res = f.call(t, f.agRoot, gateway.ConnectionsLinkTool, map[string]any{"server": "linear", "replace": true})
+	if res.IsError || !strings.Contains(text(res), "asked to switch accounts") {
+		t.Fatalf("root link linear with replace: isError=%v %q", res.IsError, text(res))
+	}
+	f.redeem(t, linkIn(t, text(res)), cfRoot, "linear", oauth.ConnectPurposePerUser, f.agRoot)
 	res = f.call(t, f.agRoot, gateway.ConnectionsLinkTool, map[string]any{"server": "plain"})
 	if !res.IsError || !strings.Contains(text(res), "does not use an OAuth sign-in") {
 		t.Fatalf("root link plain: isError=%v %q", res.IsError, text(res))
@@ -523,6 +559,50 @@ func TestConnectionsStatusAndLink(t *testing.T) {
 	// Every link handed out was audited without its ticket.
 	if f.auditCount(t, `event_type = ?`, gateway.EventConnectLinkIssued) == 0 || f.auditMentions(t, oauth.ConnectLinkPath) != 0 {
 		t.Fatal("link audit rows missing, or a link was written to the audit log")
+	}
+}
+
+// TestApprovedCallRefusalMintsNoLink: a per_user call held for approval
+// and then executed by the bus has no live reader; its persisted refusal
+// names the dashboard and carries no link, and no ticket is minted.
+func TestApprovedCallRefusalMintsNoLink(t *testing.T) {
+	f := newConnectFixture(t)
+	ctx := context.Background()
+	up := newBearerUpstream(t)
+	f.add(t, "linear", upstreams.AuthPerUser, up)
+	f.client(t, "linear")
+	f.connectUser(t, "linear", cfRoot, "root")
+	if _, err := f.pol.Set(ctx, "tool", "linear.get_whoami", "ask", "test: hold it for approval", false); err != nil {
+		t.Fatal(err)
+	}
+
+	// Bob's call waits for approval instead of being refused outright.
+	res := f.call(t, f.agBob, "linear.get_whoami", nil)
+	sc, _ := res.StructuredContent.(map[string]any)
+	id, _ := sc["approval_id"].(string)
+	if sc["status"] != "pending_approval" || id == "" {
+		t.Fatalf("expected a queued approval, got isError=%v %q %v", res.IsError, text(res), sc)
+	}
+	if f.liveTickets(t, cfBob, "linear") != 0 {
+		t.Fatal("holding a call for approval minted a ticket")
+	}
+	req, err := f.bus.Get(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.gw.Execute(ctx, req)
+	after, err := f.bus.Get(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.ResultExecutedAt == 0 || !after.ResultIsError {
+		t.Fatalf("expected a persisted refusal, got %+v", after)
+	}
+	if strings.Contains(after.ResultEnvelope, oauth.ConnectLinkPath) || !strings.Contains(after.ResultEnvelope, "#connections") || !strings.Contains(after.ResultEnvelope, "not connected") {
+		t.Fatalf("persisted refusal = %s", after.ResultEnvelope)
+	}
+	if f.liveTickets(t, cfBob, "linear") != 0 {
+		t.Fatal("an approval-executed refusal minted a ticket")
 	}
 }
 
