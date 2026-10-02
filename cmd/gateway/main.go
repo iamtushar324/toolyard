@@ -580,15 +580,27 @@ func runServe(argv []string) error {
 		}
 		return ""
 	}
-	var inboxVoice inbox.Voice
+	var geminiInboxVoice inbox.Voice
 	if key := os.Getenv("GEMINI_API_KEY"); key != "" {
 		if v, verr := inbox.NewGeminiVoice(ctx, key, os.Getenv("TOOLYARD_INBOX_VOICE_MODEL"), func() string {
 			return settingsSvc.GetString(settings.InboxVoiceName, "")
 		}); verr != nil {
 			log.Printf("inbox: voice notes unavailable: %v", verr)
 		} else {
-			inboxVoice = v
+			geminiInboxVoice = v
 		}
+	}
+	inboxVoice := &inbox.VoiceSelector{
+		Provider: func() string { return settingsSvc.GetString(settings.InboxVoiceProvider, "gemini") },
+		Gemini:   geminiInboxVoice,
+		ElevenLabs: inbox.NewElevenLabsVoice(
+			func() string {
+				return settingsSvc.GetString(settings.ElevenLabsAPIKey, os.Getenv("ELEVENLABS_API_KEY"))
+			},
+			func() string { return settingsSvc.GetString(settings.InboxElevenLabsVoiceID, "") },
+			func() string {
+				return settingsSvc.GetString(settings.InboxElevenLabsModel, os.Getenv("ELEVENLABS_TTS_MODEL"))
+			}),
 	}
 	passkeySvc := passkey.New(db)
 	if *inboxResetPasskeys {

@@ -878,7 +878,7 @@ type Info struct {
 func (s *Service) Info(ctx context.Context) Info {
 	c := s.attention()
 	now := s.now()
-	in := Info{JudgeAvailable: s.opts.Judge != nil, VoiceAvailable: s.opts.Voice != nil && s.opts.Blobs != nil, Timezone: c.Location.String()}
+	in := Info{JudgeAvailable: s.opts.Judge != nil, VoiceAvailable: s.voiceAvailable(), Timezone: c.Location.String()}
 	in.PendingPushes, _ = s.PendingPushes(ctx)
 	if q, end := quietWindow(c, now); q {
 		in.QuietNow, in.QuietUntil = true, end.UnixMilli()

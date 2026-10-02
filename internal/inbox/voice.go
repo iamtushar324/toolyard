@@ -40,7 +40,17 @@ const (
 )
 
 func (s *Service) voiceOn() bool {
-	return s.opts.Voice != nil && s.opts.Blobs != nil && s.opts.VoiceEnabled != nil && s.opts.VoiceEnabled()
+	return s.voiceAvailable() && s.opts.VoiceEnabled != nil && s.opts.VoiceEnabled()
+}
+
+func (s *Service) voiceAvailable() bool {
+	if s.opts.Voice == nil || s.opts.Blobs == nil {
+		return false
+	}
+	if v, ok := s.opts.Voice.(interface{ Available() bool }); ok {
+		return v.Available()
+	}
+	return true
 }
 
 // recordVoice synthesizes the voice note. Failure leaves the browser

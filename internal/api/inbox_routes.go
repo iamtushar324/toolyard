@@ -34,6 +34,7 @@ import (
 //	GET  /v1/guide[?topic=]                    the agent protocol (bearer or session)
 //	GET  /v1/guide/skill                       the toolyard-inbox SKILL.md
 func (s *Server) inboxRoutes(mux *http.ServeMux) {
+	mux.HandleFunc("/v1/inbox/voice-key", s.inboxVoiceKey)
 	mux.HandleFunc("/v1/inbox", s.inboxList)
 	mux.HandleFunc("/v1/inbox/", s.inboxItem)
 	mux.HandleFunc("/v1/inbox/decide-by-token", s.inboxDecideByToken)

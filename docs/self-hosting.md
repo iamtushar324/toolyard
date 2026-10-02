@@ -315,3 +315,26 @@ alone do not authorize existing accounts. Store keys outside Git and argv.
 
 Rollback: remove `-clerk-owner-only` and the Clerk environment variables,
 and restore the prior image/configuration. No database migration is added.
+
+## Inbox voice notes with ElevenLabs
+
+In **Settings → Inbox & permissions → Voice notes**, select **ElevenLabs**,
+enter the API key and click **Save API key**. Only an admin browser session can
+save it; agent and operator tokens are rejected. Generic settings responses
+return only `elevenlabs_api_key_present`, never the key. The key is stored in the
+protected server database, outside source control. Protect the state volume and
+its backups like other credentials. Alternatively provide `ELEVENLABS_API_KEY`
+in the server environment; a key saved through the dashboard takes precedence.
+
+Set a **Voice ID** from your ElevenLabs account, or leave it blank for George
+(`JBFqnCBsd6RMkjVDRZzb`). **Speech model** defaults to `eleven_multilingual_v2`;
+`ELEVENLABS_TTS_MODEL` supplies a server default. Enable **Record new inbox voice
+notes on the server** to send new voice-note scripts to ElevenLabs. Synthesis
+uses your account credits and returns MP3 audio, which Toolyard stores once for
+playback on every device. Provider, key and voice changes apply without restart.
+Existing recordings are retained. Failed, unavailable or quota-limited synthesis
+falls back to browser speech, with a timeline note for failed attempts. It never
+automatically sends a script to another cloud provider. The existing Gemini
+provider and its voice settings remain available.
+
+API: https://elevenlabs.io/docs/api-reference/text-to-speech/convert

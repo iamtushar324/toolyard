@@ -7647,13 +7647,41 @@ function ibAttentionSettings(s, patch) {
 
 function ibVoiceSettings(s, patch) {
   const info = state.inbox.info || {};
+  const provider = s.inbox_voice_provider || 'gemini';
+  const eleven = provider === 'elevenlabs';
+  const keyInput = el('input', { type: 'password', autocomplete: 'off', placeholder: 'Enter ElevenLabs API key', 'aria-label': 'ElevenLabs API key' });
+  const saveKey = async () => {
+    const api_key = keyInput.value.trim();
+    if (!api_key) return toast('Enter your ElevenLabs API key.', 'error');
+    try {
+      const out = await api('/v1/inbox/voice-key', { method: 'POST', body: { api_key } });
+      keyInput.value = '';
+      Object.assign(state.settings, out);
+      state.inbox.info = null;
+      toast('ElevenLabs key saved'); render();
+    } catch (e) { toast(e.message, 'error'); }
+  };
   return el('div', { class: 'ib-set' },
     el('h4', {}, 'Voice notes'),
+    el('div', { class: 'ib-setrow' }, el('label', { for: 'ib-voice-provider' }, 'Speech provider'),
+      el('select', { id: 'ib-voice-provider', on: { change: (e) => patch({ inbox_voice_provider: e.target.value }) } },
+        el('option', { value: 'gemini', selected: !eleven }, 'Gemini'),
+        el('option', { value: 'elevenlabs', selected: eleven }, 'ElevenLabs'))),
+    eleven ? el('div', {},
+      el('p', { class: 'meta' }, (s.elevenlabs_api_key_present || info.voice_available ? 'API key configured. Enter a new key to replace it.' : 'Add an ElevenLabs API key to enable recordings.')),
+      el('div', { class: 'ib-setrow' }, keyInput, el('button', { on: { click: saveKey } }, 'Save API key')),
+      el('div', { class: 'ib-setrow' }, el('label', { for: 'ib-eleven-voice' }, 'Voice ID'),
+        el('input', { id: 'ib-eleven-voice', type: 'text', value: s.inbox_elevenlabs_voice_id || '', placeholder: 'George · JBFqnCBsd6RMkjVDRZzb',
+          on: { change: (e) => patch({ inbox_elevenlabs_voice_id: e.target.value.trim() }) } })),
+      el('div', { class: 'ib-setrow' }, el('label', { for: 'ib-eleven-model' }, 'Speech model'),
+        el('input', { id: 'ib-eleven-model', type: 'text', value: s.inbox_elevenlabs_model || '', placeholder: 'eleven_multilingual_v2',
+          on: { change: (e) => patch({ inbox_elevenlabs_model: e.target.value.trim() }) } }))) : null,
     el('label', { class: 'ib-check' }, el('input', { type: 'checkbox', checked: !!s.inbox_voice_enabled, disabled: !info.voice_available && !s.inbox_voice_enabled,
       on: { change: (e) => patch({ inbox_voice_enabled: e.target.checked }) } }),
-      el('span', {}, 'Record voice notes on the server (Gemini text-to-speech), so every note sounds the same and plays with the screen locked. Off: your browser reads the script.' +
-        (info.voice_available ? '' : ' Needs GEMINI_API_KEY on the gateway.'))),
-    s.inbox_voice_enabled ? el('div', { class: 'ib-setrow' }, el('span', {}, 'Voice'),
+      el('span', {}, 'Record new inbox voice notes on the server, so they play with the screen locked. Off: your browser reads the script.' +
+        (info.voice_available ? '' : (eleven ? ' Needs an ElevenLabs API key.' : ' Needs GEMINI_API_KEY on the gateway.')))),
+    el('p', { class: 'meta' }, 'When recording is enabled, voice-note scripts are sent to ' + (eleven ? 'ElevenLabs using your API credits.' : 'Gemini.') + ' Existing recordings keep their original voice. If recording fails, your browser reads the script.'),
+    !eleven && s.inbox_voice_enabled ? el('div', { class: 'ib-setrow' }, el('span', {}, 'Voice'),
       el('select', { on: { change: (e) => patch({ inbox_voice_name: e.target.value }) } },
         ...['Kore', 'Puck', 'Charon', 'Aoede', 'Leda', 'Orus', 'Zephyr', 'Fenrir'].map((v) => el('option', { value: v, selected: (s.inbox_voice_name || 'Kore') === v }, v)))) : null,
   );

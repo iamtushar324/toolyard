@@ -129,11 +129,15 @@ const (
 	// transit third-party push services). Default false.
 	InboxPushDetails = "inbox_push_details"
 	// InboxVoiceEnabled makes toolyard record each request's voice note
-	// server-side (Gemini TTS; needs GEMINI_API_KEY). Default false: the
+	// server-side with the selected provider. Default false: the
 	// browser speaks the script.
 	InboxVoiceEnabled = "inbox_voice_enabled"
 	// InboxVoiceName is the Gemini prebuilt voice (default "Kore").
-	InboxVoiceName = "inbox_voice_name"
+	InboxVoiceName         = "inbox_voice_name"
+	InboxVoiceProvider     = "inbox_voice_provider"
+	InboxElevenLabsVoiceID = "inbox_elevenlabs_voice_id"
+	InboxElevenLabsModel   = "inbox_elevenlabs_model"
+	ElevenLabsAPIKey       = "elevenlabs_api_key"
 )
 
 // Approval modes.
@@ -150,6 +154,7 @@ const (
 var secretKeys = map[string]struct{}{
 	ClickhousePassword: {},
 	TelegramBotToken:   {},
+	ElevenLabsAPIKey:   {},
 }
 
 // IsSecretKey reports whether key is classified as a secret.

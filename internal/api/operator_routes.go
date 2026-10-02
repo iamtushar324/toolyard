@@ -62,6 +62,7 @@ func isOperatorRequest(r *http.Request) bool {
 
 // operatorNeverPaths can't be reached with an operator token at all.
 var operatorNeverPaths = map[string]bool{
+	"/v1/inbox/voice-key":    true,
 	"/v1/auth/setup":         true,
 	"/v1/auth/login":         true,
 	"/v1/auth/logout":        true,
@@ -444,6 +445,7 @@ var operatorCatalog = []operatorCatalogEntry{
 	{"/v1/insights/export", "GET", "insights export"},
 	{"/v1/insights/purge-agent", "POST", "delete an agent's metrics"},
 	{"/v1/inbox", "GET", "owner inbox"},
+	{"/v1/inbox/voice-key", "POST", "save ElevenLabs API key (owner browser only)"},
 	{"/v1/inbox/{id}", "GET POST", "inbox item; /decide, /summarize, /explain, grants, sessions, batch"},
 	{"/v1/inbox/decide-by-token", "POST", "push-tap inbox decision (signed token)"},
 	{"/v1/guide", "GET", "agent protocol"},
