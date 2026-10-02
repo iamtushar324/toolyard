@@ -749,7 +749,9 @@ func (s *Service) VerifyAgentToken(ctx context.Context, token string) (*Agent, e
 // operator; the old token is dead the instant this returns.
 // RotateAgentToken issues a fresh token. When grace > 0 the previous token
 // keeps authenticating until now+grace (so a running agent isn't killed
-// mid-task); grace <= 0 kills the old token immediately.
+// mid-task); grace <= 0 kills the old token immediately. A pending
+// enrollment code for the agent is cleared too: exchanging it later would
+// silently replace the token just issued.
 func (s *Service) RotateAgentToken(ctx context.Context, ownerUserID, agentID string, grace time.Duration) (string, error) {
 	if err := s.requirePlainAgent(ctx, ownerUserID, agentID); err != nil {
 		return "", err
@@ -762,12 +764,14 @@ func (s *Service) RotateAgentToken(ctx context.Context, ownerUserID, agentID str
 	var res sql.Result
 	if grace > 0 {
 		res, err = s.db.ExecContext(ctx,
-			`UPDATE agents SET prev_token_hash = token_hash, prev_token_expires = ?, token_hash = ?, last_seen = ?
+			`UPDATE agents SET prev_token_hash = token_hash, prev_token_expires = ?, token_hash = ?, last_seen = ?,
+                    enroll_code = NULL, enroll_expires = NULL
              WHERE id = ? AND owner_user = ?`,
 			now+grace.Milliseconds(), hash, now, agentID, ownerUserID)
 	} else {
 		res, err = s.db.ExecContext(ctx,
-			`UPDATE agents SET prev_token_hash = NULL, prev_token_expires = NULL, token_hash = ?, last_seen = ?
+			`UPDATE agents SET prev_token_hash = NULL, prev_token_expires = NULL, token_hash = ?, last_seen = ?,
+                    enroll_code = NULL, enroll_expires = NULL
              WHERE id = ? AND owner_user = ?`,
 			hash, now, agentID, ownerUserID)
 	}

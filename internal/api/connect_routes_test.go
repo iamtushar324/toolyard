@@ -813,3 +813,25 @@ func TestConnectT3DoesNotUndoRevoke(t *testing.T) {
 		t.Errorf("registry calls for the new person = %v as %v", targets, callers)
 	}
 }
+
+// A pending enrollment code on the newest "T3 Code (bkt3)" agent dies when
+// connect rotates that agent, so exchanging it can't replace bkt3's token.
+func TestConnectT3RotationKillsPendingEnrollment(t *testing.T) {
+	e := newConnectEnv(t)
+	ctx := context.Background()
+	first := e.connect(t, e.fc.token(nil))
+	code, pending, err := e.id.CreateEnrollment(ctx, first.UserID, connectT3AgentName, time.Hour)
+	if err != nil {
+		t.Fatal(err)
+	}
+	again := e.connect(t, e.fc.token(jwt.MapClaims{"sid": "sess_again"}))
+	if again.AgentID != pending.ID {
+		t.Fatalf("connect rotated %s, want the newest bkt3 agent %s", again.AgentID, pending.ID)
+	}
+	if _, _, err := e.id.ExchangeEnrollment(ctx, code); !errors.Is(err, identity.ErrEnrollNotFound) {
+		t.Errorf("exchange after connect rotation: err = %v, want ErrEnrollNotFound", err)
+	}
+	if ag, err := e.id.VerifyAgentToken(ctx, again.Token); err != nil || ag.ID != pending.ID {
+		t.Errorf("bkt3 token after the attempted exchange: %+v, %v", ag, err)
+	}
+}
