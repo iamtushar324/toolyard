@@ -29,6 +29,12 @@ How agents are taught this, and why it's layered, is in
    `_grant: "tyg_…"`, exactly within its parameters.
 7. When you're done, `inbox.post` an update, also in the first person.
 8. A denial is an answer. Ask again only with new information.
+9. When a call answers that a server isn't connected (your owner has to
+   sign in), show the person the connect link it gives you as a clickable
+   Markdown link, and retry after they say they're done; `connections.status`
+   lists every sign-in and `connections.link` gets a fresh link. Never ask
+   them for a password, token or one-time code: the sign-in happens at the
+   provider, in their browser.
 
 ---
 
@@ -310,6 +316,8 @@ Withdraw requests you no longer need with `inbox.cancel`.
 - Never split one risky action into small requests to avoid a flag.
 - Never tune your wording across dry runs to hide what a call does.
 - Never claim urgency you don't have.
+- Never ask your owner for a password, token or one-time code to get past a
+  sign-in; give them the connect link and wait.
 
 ## 12. Examples
 

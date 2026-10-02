@@ -319,6 +319,7 @@ func (s *Server) Routes(mux *http.ServeMux) {
 	mux.HandleFunc("/v1/auth/config", s.authConfig)
 	mux.HandleFunc("/v1/auth/clerk/session", s.authClerkSession)
 	mux.HandleFunc("/v1/connect/t3", s.connectT3)
+	s.connectLinkRoutes(mux)
 
 	mux.HandleFunc("/v1/users", s.usersList)
 	mux.HandleFunc("/v1/users/", s.usersItem)
@@ -1654,6 +1655,12 @@ func (s *Server) toolsRun(w http.ResponseWriter, r *http.Request) {
 	// so audit and approval rows name the operator (id, email, name)
 	// instead of an empty agent_id.
 	ctx := actor.WithRaiser(gateway.WithAgentID(r.Context(), "dashboard:"+u.ID), s.dashboardRaiser(r, u))
+	// An operator token is a credential in a script, not the person's
+	// browser: a connect link it obtained could be opened by anyone
+	// holding the token, so none is minted on its calls.
+	if operatorFromContext(r.Context()) != nil {
+		ctx = gateway.WithoutConnectLinks(ctx)
+	}
 	res, err := s.gateway.RouteCall(ctx, viaDashboard, body.Tool, body.Arguments)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())

@@ -33,6 +33,26 @@ const (
 	oauthFlowCookieState  = 16 // chars of the state carried in the cookie name
 )
 
+// hostPrefix is the cookie-name prefix browsers reserve for a cookie that
+// is Secure, has Path=/ and carries no Domain: a cookie by such a name can
+// only have been set by this very host over HTTPS, never planted from a
+// sibling host (a page on another *.example.com setting Domain=.example.com
+// in somebody else's browser). Every per-flow cookie (the OAuth flow
+// cookie, a connect link's nonce) uses it behind HTTPS; over plain http
+// (tests, loopback) the plain name and its narrow path stay, since
+// browsers refuse __Host- without Secure.
+const hostPrefix = "__Host-"
+
+// hostCookie returns the name and path a per-flow cookie takes on r: the
+// __Host- form behind HTTPS, the plain form otherwise. Setting, reading
+// and clearing all go through it, so they agree.
+func (s *Server) hostCookie(r *http.Request, name, path string) (string, string) {
+	if s.security.IsBehindHTTPS(r) {
+		return hostPrefix + name, "/"
+	}
+	return name, path
+}
+
 // oauthFlowCookieName is the cookie for one flow. The state is base64url,
 // so every character is valid in a cookie name.
 func oauthFlowCookieName(state string) string {
@@ -53,10 +73,11 @@ func (s *Server) oauthFlowMAC(state, userID string) string {
 // setOAuthFlowCookie binds the flow identified by state to the browser
 // that made this request, as userID.
 func (s *Server) setOAuthFlowCookie(w http.ResponseWriter, r *http.Request, state, userID string) {
+	name, path := s.hostCookie(r, oauthFlowCookieName(state), oauthFlowCookiePath)
 	http.SetCookie(w, &http.Cookie{
-		Name:     oauthFlowCookieName(state),
+		Name:     name,
 		Value:    s.oauthFlowMAC(state, userID),
-		Path:     oauthFlowCookiePath,
+		Path:     path,
 		HttpOnly: true,
 		Secure:   s.security.IsBehindHTTPS(r),
 		SameSite: http.SameSiteLaxMode,
@@ -65,9 +86,11 @@ func (s *Server) setOAuthFlowCookie(w http.ResponseWriter, r *http.Request, stat
 }
 
 // oauthFlowCookieValid reports whether the request carries the flow
-// cookie for (state, userID).
+// cookie for (state, userID). Behind HTTPS only the __Host- name counts:
+// a plain-named cookie could have been planted from a sibling host.
 func (s *Server) oauthFlowCookieValid(r *http.Request, state, userID string) bool {
-	c, err := r.Cookie(oauthFlowCookieName(state))
+	name, _ := s.hostCookie(r, oauthFlowCookieName(state), oauthFlowCookiePath)
+	c, err := r.Cookie(name)
 	if err != nil || c.Value == "" {
 		return false
 	}
@@ -77,10 +100,11 @@ func (s *Server) oauthFlowCookieValid(r *http.Request, state, userID string) boo
 // clearOAuthFlowCookie removes the flow cookie once the callback has run,
 // whatever the outcome.
 func (s *Server) clearOAuthFlowCookie(w http.ResponseWriter, r *http.Request, state string) {
+	name, path := s.hostCookie(r, oauthFlowCookieName(state), oauthFlowCookiePath)
 	http.SetCookie(w, &http.Cookie{
-		Name:     oauthFlowCookieName(state),
+		Name:     name,
 		Value:    "",
-		Path:     oauthFlowCookiePath,
+		Path:     path,
 		HttpOnly: true,
 		Secure:   s.security.IsBehindHTTPS(r),
 		SameSite: http.SameSiteLaxMode,

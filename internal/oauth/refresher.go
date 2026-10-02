@@ -94,6 +94,7 @@ func (s *Service) RunRefresher(ctx context.Context) {
 		case <-t.C:
 			s.refreshTick(ctx)
 			_, _ = s.PurgeExpiredPending(ctx)
+			_, _ = s.PurgeExpiredConnectTickets(ctx)
 		}
 	}
 }

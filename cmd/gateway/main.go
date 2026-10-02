@@ -721,6 +721,9 @@ func runServe(argv []string) error {
 	oauthSvc.SetUserReauthHook(upstreamSvc.DropUserConnection)
 	// servers.list / servers.reconnect for agents (access_tools.go).
 	gw.SetServersProvider(serversAdapter{upstreams: upstreamSvc, oauth: oauthSvc})
+	// Connect links: an agent whose owner has not signed in to a server
+	// gets a one-time link to show them (connections.* tools, refusals).
+	gw.SetConnect(oauthSvc, idSvc)
 	if err := oauthSvc.PrimeBearers(ctx); err != nil {
 		log.Printf("oauth: prime bearers: %v", err)
 	}

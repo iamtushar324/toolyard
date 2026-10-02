@@ -474,7 +474,7 @@ func TestAddUpstreamReservesAccessGroupNames(t *testing.T) {
 	f := newAccessFixture(t, nil)
 	// The synthetic upstreams, the always-on meta-tool group, and the data
 	// groups whose tools live under the "builtin" upstream.
-	for _, name := range []string{"builtin", "fixture", "inbox", "session", "tools", "memory", "lake", "events"} {
+	for _, name := range []string{"builtin", "fixture", "inbox", "session", "connections", "tools", "memory", "lake", "events"} {
 		err := f.gw.AddUpstream(context.Background(), UpstreamConfig{Name: name})
 		if err == nil || !strings.Contains(err.Error(), "reserved") {
 			t.Errorf("upstream %q should be reserved, got %v", name, err)

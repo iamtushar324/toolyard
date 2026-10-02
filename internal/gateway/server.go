@@ -189,6 +189,11 @@ type Gateway struct {
 	// upstreams; publicURL is where their My connections page lives.
 	owners    OwnerResolver
 	publicURL string
+	// connect and directory back the connections.* tools and the connect
+	// links in sign-in refusals (connections_tools.go); nil until
+	// SetConnect. Guarded by mu.
+	connect   ConnectProvider
+	directory ConnectDirectory
 
 	mu        sync.RWMutex
 	tools     map[string]toolEntry
@@ -523,6 +528,7 @@ func (g *Gateway) RegisterBuiltins() {
 	entries = append(entries, g.approvalMetaTools()...)
 	entries = append(entries, g.codeModeTools()...)
 	entries = append(entries, g.accessTools()...)
+	entries = append(entries, g.connectionsTools()...)
 	if g.lake != nil {
 		entries = append(entries, g.lakeTools()...)
 	}
@@ -533,7 +539,7 @@ func (g *Gateway) RegisterBuiltins() {
 
 // reservedUpstreamName reports whether name belongs to the gateway itself:
 // the synthetic upstreams (builtin, fixture, inbox, session, policies,
-// servers, audit, access), the meta-tool group "tools", the built-in data
+// servers, audit, access, connections), the meta-tool group "tools", the built-in data
 // groups whose tools are registered under the "builtin" upstream (memory,
 // lake, events), and "toolyard", the code-mode server every internal tool
 // is bound under. An upstream with one of these names would register tools
@@ -547,7 +553,7 @@ func (g *Gateway) RegisterBuiltins() {
 func reservedUpstreamName(name string) bool {
 	switch name {
 	case builtinUpstream, "fixture", inboxUpstream, sessionUpstream, "tools", "memory", "lake", "events",
-		policiesUpstream, serversUpstream, auditUpstream, accessUpstream, toolyardServer:
+		policiesUpstream, serversUpstream, auditUpstream, accessUpstream, toolyardServer, connectionsGroup:
 		return true
 	}
 	return false
@@ -1580,6 +1586,13 @@ func (g *Gateway) dispatch(ctx context.Context, entry toolEntry, args map[string
 	case pu != nil:
 		cfg = &pu.cfg
 	}
+	// A shared OAuth server with no usable token is refused before the
+	// dial, with a connect link for an admin owner (connections_tools.go).
+	if u != nil {
+		if res := g.refuseSharedSignIn(ctx, u, entry, agentID, reason, approvalID, nil, ev); res != nil {
+			return res, nil
+		}
+	}
 	if entry.handle == nil {
 		// Upstream-backed tool — route through the upstream pool.
 		switch {
@@ -1635,6 +1648,13 @@ func (g *Gateway) dispatch(ctx context.Context, entry toolEntry, args map[string
 			time.Since(upstreamStart).Round(time.Millisecond), g.upstreamCallTimeout)
 	}
 	if err != nil {
+		// A shared OAuth server that answered 401: the token is dead, so
+		// the agent gets the sign-in guidance instead of a bare failure.
+		if u != nil && isUnauthorized(err) {
+			if res := g.refuseSharedSignIn(ctx, u, entry, agentID, reason, approvalID, err, ev); res != nil {
+				return res, nil
+			}
+		}
 		_ = g.audit.Write(ctx, audit.Event{
 			EventType:     audit.EventCallFailed,
 			AgentID:       agentID,
@@ -1995,7 +2015,10 @@ func (g *Gateway) Execute(ctx context.Context, req *approval.Request) {
 		raiser = *req.RaisedBy
 	}
 	raiser = g.resolveRaiser(actor.WithRaiser(ctx, raiser), req.AgentID, "")
-	execCtx := actor.WithRaiser(WithAgentID(ctx, req.AgentID), raiser)
+	// Nobody is reading this result live: it is persisted and polled, so a
+	// connect link minted here would sit in a row admins and operator
+	// tokens can read. Refusals name the dashboard instead.
+	execCtx := WithoutConnectLinks(actor.WithRaiser(WithAgentID(ctx, req.AgentID), raiser))
 
 	// Build a metrics.Event and run dispatch directly. The original
 	// routeEntry already evaluated policy and consumed the human's
@@ -2089,7 +2112,17 @@ func encodeApprovalResult(res *mcp.CallToolResult) (string, error) {
 	if res == nil {
 		return "", nil
 	}
-	env := approvalResultEnvelope{IsError: res.IsError, StructuredContent: res.StructuredContent}
+	env := approvalResultEnvelope{IsError: res.IsError}
+	// The row is read by admins and operator tokens and replayed on every
+	// poll, so a connect link (minted for the one person the call was
+	// refused for) is taken out; everything else is stored verbatim.
+	if res.StructuredContent != nil {
+		if raw, err := json.Marshal(res.StructuredContent); err == nil {
+			env.StructuredContent = json.RawMessage(audit.RedactConnectLinks(string(raw)))
+		} else {
+			env.StructuredContent = res.StructuredContent
+		}
+	}
 	if res.Meta != nil {
 		env.Meta = res.Meta.AdditionalFields
 	}
@@ -2099,7 +2132,7 @@ func encodeApprovalResult(res *mcp.CallToolResult) (string, error) {
 			text.WriteString(t.Text)
 		}
 	}
-	env.TextContent = text.String()
+	env.TextContent = audit.RedactConnectLinks(text.String())
 	out, err := json.Marshal(env)
 	if err != nil {
 		return "", err

@@ -376,7 +376,27 @@ func (s *Server) oauthCallback(w http.ResponseWriter, r *http.Request) {
 	if !s.sharedFlowBrowserOK(w, r, p) {
 		return
 	}
-	rec, err := s.oauth.ExchangeCode(r.Context(), p.UpstreamName, code, p.CodeVerifier)
+	// A flow a connect link started may not move the shared account to a
+	// different one than the one on file: that choice is the dashboard's
+	// (an admin signing in again there is explicit). A dashboard flow
+	// keeps its behaviour: no hook.
+	var accept func(prev string, rec *oauth.TokenRecord) error
+	var prevLabel string
+	if p.ViaTicket {
+		accept = func(prev string, rec *oauth.TokenRecord) error {
+			prevLabel = prev
+			if same, comparable := sameEmail(prev, rec.AccountLabel); comparable && !same {
+				return errors.New("a different account than the one on file")
+			}
+			return nil
+		}
+	}
+	rec, err := s.oauth.ExchangeCodeChecked(r.Context(), p.UpstreamName, code, p.CodeVerifier, accept)
+	if errors.Is(err, oauth.ErrAccountMismatch) {
+		_ = s.oauth.DeletePending(r.Context(), state)
+		s.connectSharedMismatchPage(w, r, s.flowUser(r, p), p.UpstreamName, prevLabel)
+		return
+	}
 	if err != nil {
 		oauthHTMLError(w, "Token exchange failed: "+err.Error())
 		return
@@ -387,6 +407,13 @@ func (s *Server) oauthCallback(w http.ResponseWriter, r *http.Request) {
 		EventType:     "oauth.success",
 		ResultSummary: p.UpstreamName,
 	})
+	if p.ViaTicket {
+		// The admin came from an agent's connect link, not the dashboard.
+		// Links still floating in chat for this sign-in are closed.
+		_, _ = s.oauth.ConsumeConnectTickets(r.Context(), p.UserID, p.UpstreamName)
+		connectDonePage(w, p.UpstreamName, rec.AccountLabel)
+		return
+	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
 	_, _ = w.Write([]byte(oauthSuccessHTML(p.UpstreamName, rec.AccessExpiresAt)))
@@ -440,7 +467,8 @@ func (s *Server) oauthUserCallback(w http.ResponseWriter, r *http.Request, p *oa
 		owner, err := s.identity.GetUserByID(r.Context(), p.UserID)
 		if err != nil || owner.Status != identity.StatusActive {
 			_ = s.oauth.DeletePending(r.Context(), p.State)
-			oauthHTMLError(w, "Your toolyard account is not active. Nothing was stored.")
+			s.userFlowError(w, p.ViaTicket, "Your toolyard account is not active. Nothing was stored.",
+				"Your toolyard account is not active, so nothing was stored. Ask a toolyard admin.")
 			return
 		}
 		u = owner
@@ -456,15 +484,52 @@ func (s *Server) oauthUserCallback(w http.ResponseWriter, r *http.Request, p *oa
 			Raiser:        actor.Raiser{OwnerUserID: p.UserID},
 		})
 		if ok {
-			oauthHTMLError(w, "This sign-in was started by a different toolyard user. Nothing was stored. Start your own from My connections.")
+			s.userFlowError(w, p.ViaTicket,
+				"This sign-in was started by a different toolyard user. Nothing was stored. Start your own from My connections.",
+				"This link belongs to a different toolyard user than the one signed in to this browser. Nothing was stored. Ask your agent for a new link.")
 			return
 		}
-		oauthHTMLError(w, "This sign-in did not come back to the browser that started it (or its cookie is missing). Nothing was stored. Start again from My connections, in the same browser.")
+		s.userFlowError(w, p.ViaTicket,
+			"This sign-in did not come back to the browser that started it (or its cookie is missing). Nothing was stored. Start again from My connections, in the same browser.",
+			"This sign-in did not come back to the browser that opened the link (or its cookie is missing). Nothing was stored. Ask your agent for a new link and finish the sign-in in the same browser.")
 		return
 	}
-	rec, err := s.oauth.ExchangeCodeForUser(r.Context(), p.UpstreamName, u.ID, code, p.CodeVerifier)
+	// A flow a connect link started stores the token only when the
+	// account the provider reports is the person's own, or, when that
+	// cannot be checked, when the browser that redeemed the link (or this
+	// one) holds the person's toolyard session (connect_link_routes.go).
+	// The rule runs before anything is written; a refused token is
+	// revoked at the provider.
+	var accept func(*oauth.UserTokenRecord) error
+	outcome := accountMatch
+	if p.ViaTicket {
+		sessionIsPerson := ok && u.ID == p.UserID
+		accept = func(rec *oauth.UserTokenRecord) error {
+			switch outcome = connectAccountCheck(u, rec); outcome {
+			case accountMatch:
+				return nil
+			case accountMismatch:
+				return errors.New("the provider account is not the person's")
+			}
+			if p.OpenerVerified || sessionIsPerson {
+				return nil
+			}
+			return errors.New("the provider account could not be checked and no toolyard session vouches for the person")
+		}
+	}
+	rec, err := s.oauth.ExchangeCodeForUserChecked(r.Context(), p.UpstreamName, u.ID, code, p.CodeVerifier, accept)
+	if errors.Is(err, oauth.ErrAccountMismatch) {
+		_ = s.oauth.DeletePending(r.Context(), p.State)
+		if outcome == accountMismatch {
+			s.connectAccountMismatchPage(w, r, u, p.UpstreamName)
+		} else {
+			s.connectUnverifiedPage(w, r, u, p.UpstreamName)
+		}
+		return
+	}
 	if err != nil {
-		oauthHTMLError(w, "Token exchange failed: "+err.Error())
+		s.userFlowError(w, p.ViaTicket, "Token exchange failed: "+err.Error(),
+			"The provider did not complete the sign-in ("+err.Error()+"). Nothing was stored. Ask your agent for a new link.")
 		return
 	}
 	_ = s.oauth.DeletePending(r.Context(), p.State)
@@ -474,6 +539,15 @@ func (s *Server) oauthUserCallback(w http.ResponseWriter, r *http.Request, p *oa
 		ResultSummary: p.UpstreamName + " connected as " + nonEmpty(rec.AccountLabel, "(account not named)"),
 		Raiser:        actor.Raiser{OwnerUserID: u.ID, OwnerEmail: u.Email, OwnerName: u.Label()},
 	})
+	if p.ViaTicket {
+		if outcome == accountUnverifiable {
+			s.connectAuditUnverified(r, u, p.UpstreamName, rec.AccountLabel)
+		}
+		// Links still floating in chat for this sign-in are closed.
+		_, _ = s.oauth.ConsumeConnectTickets(r.Context(), u.ID, p.UpstreamName)
+		connectDonePage(w, p.UpstreamName, rec.AccountLabel)
+		return
+	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
 	_, _ = w.Write([]byte(oauthUserSuccessHTML(p.UpstreamName, rec.AccountLabel)))
@@ -484,6 +558,18 @@ func nonEmpty(s, fallback string) string {
 		return fallback
 	}
 	return s
+}
+
+// flowUser is the person a shared flow belongs to, for an audit row: the
+// browser's session user when there is one, else the flow's user.
+func (s *Server) flowUser(r *http.Request, p *oauth.PendingRecord) *identity.User {
+	if u, ok := s.sessionUser(r); ok {
+		return u
+	}
+	if u, err := s.identity.GetUserByID(r.Context(), p.UserID); err == nil {
+		return u
+	}
+	return &identity.User{ID: p.UserID}
 }
 
 // oauthPaste accepts the post-redirect URL pasted by the user when the
@@ -536,7 +622,24 @@ func (s *Server) oauthPaste(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusForbidden, "this sign-in was started by a different toolyard user; nothing was stored")
 			return
 		}
-		rec, err := s.oauth.ExchangeCodeForUser(r.Context(), p.UpstreamName, u.ID, code, p.CodeVerifier)
+		// A link-started flow finished by paste keeps the link's account
+		// rule (connect_link_routes.go); the person's own session is what
+		// got here, so an account the provider did not name is accepted.
+		var accept func(*oauth.UserTokenRecord) error
+		if p.ViaTicket {
+			accept = func(rec *oauth.UserTokenRecord) error {
+				if connectAccountCheck(u, rec) == accountMismatch {
+					return errors.New("the provider account is not the person's")
+				}
+				return nil
+			}
+		}
+		rec, err := s.oauth.ExchangeCodeForUserChecked(r.Context(), p.UpstreamName, u.ID, code, p.CodeVerifier, accept)
+		if errors.Is(err, oauth.ErrAccountMismatch) {
+			_ = s.oauth.DeletePending(r.Context(), state)
+			writeError(w, http.StatusForbidden, "the provider signed in a different account than this link is for; nothing was stored")
+			return
+		}
 		if err != nil {
 			writeError(w, http.StatusBadGateway, err.Error())
 			return

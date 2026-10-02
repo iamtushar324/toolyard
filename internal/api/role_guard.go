@@ -118,6 +118,12 @@ func memberAllowed(method, path string) bool {
 	if strings.HasPrefix(path, "/v1/agents/approvals/") {
 		return true
 	}
+	// A one-time connect link an agent gave the member: GET shows the
+	// confirm page, POST (from that page) redeems the ticket and starts
+	// only that member's own sign-in (connect_link_routes.go).
+	if ticket, ok := strings.CutPrefix(path, connectLinkPath); ok {
+		return (method == http.MethodGet || method == http.MethodPost) && ticket != "" && !strings.Contains(ticket, "/")
+	}
 	// Own connections:
 	//   POST   /v1/me/connections/{server}/begin
 	//   DELETE /v1/me/connections/{server}
