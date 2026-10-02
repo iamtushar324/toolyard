@@ -22,8 +22,15 @@ import (
 	"github.com/tusharbhardwaj/toolyard/internal/store"
 )
 
-// alwaysOn groups stay available to every active caller.
-var alwaysOn = map[string]bool{"tools": true, "inbox": true, "session": true}
+// alwaysOn groups stay available to every active caller: the meta-tools,
+// the inbox/session tools an agent uses to ask for access, and the
+// self-scoped access tools (policies, servers, audit, access) that tell an
+// agent what it may do and why; the ones that change anything check the
+// owner's role themselves.
+var alwaysOn = map[string]bool{
+	"tools": true, "inbox": true, "session": true,
+	"policies": true, "servers": true, "audit": true, "access": true,
+}
 
 // BuiltinGroups are the built-in data tools an admin grants like servers.
 // They are shared across all agents, so members don't get them by default.
@@ -36,6 +43,16 @@ var ErrInvalidGroup = errors.New("invalid server name")
 
 // AlwaysOn reports whether group is available to every active caller.
 func AlwaysOn(group string) bool { return alwaysOn[group] }
+
+// AlwaysOnGroups lists the always-on groups, sorted.
+func AlwaysOnGroups() []string {
+	out := make([]string, 0, len(alwaysOn))
+	for g := range alwaysOn {
+		out = append(out, g)
+	}
+	sort.Strings(out)
+	return out
+}
 
 // IsBuiltinGroup reports whether group is one of BuiltinGroups.
 func IsBuiltinGroup(group string) bool {

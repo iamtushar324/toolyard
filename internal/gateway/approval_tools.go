@@ -348,6 +348,24 @@ func (g *Gateway) handlePollApprovals() directHandler {
 	}
 }
 
+// clampToDeadline caps a wait, in seconds, at what is left of the
+// caller's deadline: a wait inside a code-mode script ends with the
+// script's clock, a wait under the dispatch timeout with that, and the
+// answer is the normal timed-out snapshot rather than a cancelled context.
+func clampToDeadline(ctx context.Context, timeoutSec int) int {
+	dl, ok := ctx.Deadline()
+	if !ok {
+		return timeoutSec
+	}
+	if rem := int(time.Until(dl).Seconds()); rem < timeoutSec {
+		if rem < 1 {
+			return 1
+		}
+		return rem
+	}
+	return timeoutSec
+}
+
 func (g *Gateway) handleWaitForApproval() directHandler {
 	return func(ctx context.Context, args map[string]any) (*mcp.CallToolResult, error) {
 		id, _ := args["approval_id"].(string)
@@ -361,6 +379,7 @@ func (g *Gateway) handleWaitForApproval() directHandler {
 		if maxSec := int(WaitForApprovalMaxTimeout.Seconds()); timeoutSec > maxSec {
 			timeoutSec = maxSec
 		}
+		timeoutSec = clampToDeadline(ctx, timeoutSec)
 		req, err := g.approval.Get(ctx, id)
 		if errors.Is(err, approval.ErrNotFound) || (err == nil && !approvalVisibleTo(req, agentIDFromContext(ctx))) {
 			return mcp.NewToolResultError("unknown approval_id"), nil
@@ -448,6 +467,7 @@ func (g *Gateway) handleWaitForApprovals() directHandler {
 		if maxSec := int(WaitForApprovalMaxTimeout.Seconds()); timeoutSec > maxSec {
 			timeoutSec = maxSec
 		}
+		timeoutSec = clampToDeadline(ctx, timeoutSec)
 		ids := make([]string, 0, len(raw))
 		for _, item := range raw {
 			id, _ := item.(string)

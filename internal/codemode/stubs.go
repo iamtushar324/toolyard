@@ -275,7 +275,18 @@ func pythonType(prop any) string {
 	if !ok {
 		return "Any"
 	}
-	if enum, ok := p["enum"].([]any); ok && len(enum) > 0 {
+	// An enum decoded from JSON is []any; one a built-in tool declares in
+	// Go is []string.
+	var enum []any
+	switch v := p["enum"].(type) {
+	case []any:
+		enum = v
+	case []string:
+		for _, s := range v {
+			enum = append(enum, s)
+		}
+	}
+	if len(enum) > 0 {
 		vals := make([]string, len(enum))
 		for i, e := range enum {
 			vals[i] = literal(e)
