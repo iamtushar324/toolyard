@@ -12,6 +12,14 @@
 // can't run the same way (local programs, per-person sign-in, private
 // addresses) are skipped with the reason.
 //
+// -oauth-clients also copies the OAuth app (client id, secret, endpoints,
+// scopes; never anyone's token) of each OAuth server toolyard already has,
+// so a person only has to sign in there.
+//
+// The container runs as a non-root user, so the binary must be executable
+// by everyone before it is copied in:
+//
+//	chmod 755 bifrost-import
 //	docker cp bifrost-import "$CTR":/tmp/bifrost-import
 //	docker exec "$CTR" /tmp/bifrost-import                       # plan only
 //	docker exec -i "$CTR" /tmp/bifrost-import -apply -password-stdin <<<"$PW"
@@ -24,6 +32,7 @@ import (
 	"flag"
 	"fmt"
 	"io"
+	"net"
 	"net/url"
 	"os"
 	"strings"
@@ -51,12 +60,13 @@ func run(args []string, stdin io.Reader, stdout io.Writer) error {
 	prefix := fs.String("secret-prefix", "BIFROST", "prefix of the toolyard secret names")
 	allowURLCreds := fs.Bool("allow-url-credentials", false, "import servers whose URL seems to carry a credential")
 	allowToolSubset := fs.Bool("allow-tool-subset", false, "import servers Bifrost limits to chosen tools (toolyard lists all of them)")
+	oauthClients := fs.Bool("oauth-clients", false, "also copy the OAuth app of each OAuth server toolyard has (not tokens)")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	// The password and every secret travel to this address.
 	if u, err := url.Parse(*base); err != nil || u.Host == "" ||
-		(u.Scheme != "https" && !(u.Scheme == "http" && privateHost(u.Hostname()))) {
+		(u.Scheme != "https" && !(u.Scheme == "http" && localTestHost(u.Hostname()))) {
 		return errors.New("-toolyard must be an https URL (plain http only for a private test address)")
 	}
 
@@ -83,7 +93,7 @@ func run(args []string, stdin io.Reader, stdout io.Writer) error {
 		return errors.New("-apply needs the toolyard password: -password-stdin or $TOOLYARD_PASSWORD")
 	}
 
-	clients, err := readBifrost(*dbPath, os.Getenv("BIFROST_ENCRYPTION_KEY"))
+	clients, err := readBifrost(*dbPath, os.Getenv("BIFROST_ENCRYPTION_KEY"), *oauthClients)
 	if err != nil {
 		return err
 	}
@@ -124,10 +134,85 @@ func run(args []string, stdin io.Reader, stdout io.Writer) error {
 	plan := buildPlan(clients, opt)
 	printPlan(stdout, plan, opt.Existing != nil)
 	if !*apply {
+		if *oauthClients {
+			if api == nil {
+				fmt.Fprintln(stdout, "\nOAuth apps: not checked (needs the toolyard password).")
+			} else if err := runOAuth(stdout, api, clients, plan, opt.URLMap, false); err != nil {
+				return err
+			}
+		}
 		fmt.Fprintln(stdout, "\nPlan only. Rerun with -apply to create these in toolyard.")
 		return nil
 	}
-	return applyPlan(stdout, api, plan, existingSecrets)
+	err = applyPlan(stdout, api, plan, existingSecrets)
+	if *oauthClients {
+		if oerr := runOAuth(stdout, api, clients, plan, opt.URLMap, true); oerr != nil && err == nil {
+			err = oerr
+		}
+	}
+	return err
+}
+
+// runOAuth plans, and with apply copies, the OAuth apps of OAuth servers that
+// are in toolyard, including ones created earlier in this run.
+func runOAuth(w io.Writer, api *toolyardAPI, clients []bifrostClient, plan []planItem, urlMap map[string]string, apply bool) error {
+	urls, err := api.serverURLs()
+	if err != nil {
+		return err
+	}
+	targets := map[string]oauthTarget{}
+	for name, u := range urls {
+		targets[name] = oauthTarget{URL: u}
+	}
+	if !apply {
+		// The plan counts servers this run is about to create.
+		for _, p := range plan {
+			if p.Skip == "" {
+				targets[p.Name] = oauthTarget{URL: p.Server.URL}
+			}
+		}
+	}
+	for _, c := range clients {
+		t, ok := targets[c.Name]
+		if !ok || (c.AuthType != "oauth" && c.AuthType != "per_user_oauth") {
+			continue
+		}
+		if _, existing := urls[c.Name]; existing {
+			has, err := api.hasOAuthClient(c.Name)
+			if err != nil {
+				t.CheckErr = shortErr(err)
+			}
+			t.HasClient = has
+			targets[c.Name] = t
+		}
+	}
+	items := planOAuth(clients, targets, urlMap)
+	fmt.Fprintf(w, "\nOAuth apps (never tokens): %d OAuth servers in Bifrost.\n", len(items))
+	var failed, copied int
+	for _, it := range items {
+		if it.Skip != "" {
+			fmt.Fprintf(w, "  SKIP %s: %s\n", it.Server, it.Skip)
+			continue
+		}
+		if !apply {
+			fmt.Fprintf(w, "  COPY %s: app for %s\n", it.Server, it.Host)
+			continue
+		}
+		if err := api.putManualClient(it.Server, it.Body); err != nil {
+			fmt.Fprintf(w, "  %s: FAILED: %s\n", it.Server, it.scrub(err.Error()))
+			failed++
+			continue
+		}
+		fmt.Fprintf(w, "  %s: app copied (%s)\n", it.Server, it.Host)
+		copied++
+	}
+	if copied > 0 {
+		fmt.Fprintf(w, "\nAdd %s/v1/mcp-oauth/callback to each copied app's allowed redirect URIs at its provider, then sign in on toolyard's Servers page.\n", api.base)
+	}
+	if failed > 0 {
+		return fmt.Errorf("%d OAuth app(s) not copied", failed)
+	}
+	return nil
 }
 
 func printPlan(w io.Writer, plan []planItem, checkedToolyard bool) {
@@ -233,4 +318,21 @@ func applyPlan(w io.Writer, api *toolyardAPI, plan []planItem, existingSecrets m
 		return fmt.Errorf("%d server(s) not created or not confirmed", failed)
 	}
 	return nil
+}
+
+// shortErr shortens an error for a skip reason; toolyard's OAuth status errors
+// carry no request values.
+func shortErr(err error) string {
+	msg := err.Error()
+	if len(msg) > 200 {
+		msg = msg[:200] + "…"
+	}
+	return msg
+}
+
+// localTestHost is where plain http to toolyard is allowed: loopback and
+// RFC 1918 addresses only (a throwaway test instance), never the tailnet.
+func localTestHost(host string) bool {
+	ip := net.ParseIP(host)
+	return ip != nil && (ip.IsLoopback() || ip.IsPrivate())
 }
