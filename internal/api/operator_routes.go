@@ -90,7 +90,9 @@ var operatorOwnerPrefixes = []string{
 // operatorScopeFor returns the scope an operator token needs for method on
 // path, or ok=false when operator tokens may never call it.
 func operatorScopeFor(method, path string) (scope string, ok bool) {
-	if operatorNeverPaths[path] || strings.Contains(path, "/reveal") {
+	// A connect link is opened by a person's browser; the ticket in its
+	// path is the credential, so no token may redeem one.
+	if operatorNeverPaths[path] || strings.Contains(path, "/reveal") || strings.HasPrefix(path, connectLinkPath) {
 		return "", false
 	}
 	switch method {
@@ -394,6 +396,7 @@ var operatorCatalog = []operatorCatalogEntry{
 	{"/v1/auth/config", "GET", "login methods"},
 	{"/v1/auth/clerk/session", "POST", "Clerk login (browser only)"},
 	{"/v1/connect/t3", "POST", "bkt3 server: Clerk session token -> the person's agent token (never via operator token)"},
+	{"/v1/connect/link/{id}", "GET", "one-time connect link an agent gave the person: redeems the ticket and starts their sign-in to a server (browser only; never via operator token)"},
 	{"/v1/operator-tokens", "GET POST", "list or mint operator tokens {name, scopes, ttl_hours}"},
 	{"/v1/operator-tokens/{id}", "DELETE", "revoke an operator token"},
 	{"/v1/operator/routes", "GET", "this catalog"},

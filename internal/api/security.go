@@ -488,6 +488,10 @@ func unauthRouteLimit(path string) *unauthRouteRule {
 		// once-per-second polling of an in-flight job is comfortable, while
 		// still capping spray on this bearer-authenticated DB-backed lookup.
 		return &unauthRouteRule{"mem-job", 6000, time.Hour}
+	case strings.HasPrefix(path, connectLinkPath):
+		// Connect links: a person opens a handful per hour at most. The
+		// ticket is 256 random bits, so this caps spray, not guessing.
+		return &unauthRouteRule{"connect-link", 120, time.Hour}
 	}
 	return nil
 }

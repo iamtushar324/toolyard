@@ -48,6 +48,14 @@ var (
 	ErrTicketExpired = errors.New("oauth: connect link expired")
 )
 
+// MaxLiveConnectTickets caps the unused, unexpired tickets one (user,
+// server) can have at once: every refusal mints one, so an agent retrying
+// in a loop would otherwise fill the table with links nobody opens.
+const MaxLiveConnectTickets = 20
+
+// ErrTooManyTickets is returned by IssueConnectTicket at that cap.
+var ErrTooManyTickets = errors.New("oauth: too many connect links are already outstanding for this person and server; use one of them, or wait a few minutes")
+
 // ErrAccountMismatch is returned by ExchangeCodeForUserChecked when the
 // caller's accept hook rejected the account the provider signed in: nothing
 // was stored.
@@ -80,11 +88,20 @@ func (s *Service) IssueConnectTicket(ctx context.Context, userID, upstream, purp
 	if purpose != ConnectPurposePerUser && purpose != ConnectPurposeShared {
 		return "", fmt.Errorf("oauth: bad connect purpose %q", purpose)
 	}
+	now := time.Now()
+	var live int
+	if err := s.db.QueryRowContext(ctx,
+		`SELECT count(*) FROM connect_tickets WHERE user_id = ? AND upstream = ? AND used_at IS NULL AND expires_at > ?`,
+		userID, upstream, now.UnixMilli()).Scan(&live); err != nil {
+		return "", err
+	}
+	if live >= MaxLiveConnectTickets {
+		return "", ErrTooManyTickets
+	}
 	ticket, err := randomString(32)
 	if err != nil {
 		return "", err
 	}
-	now := time.Now()
 	_, err = s.db.ExecContext(ctx, `
         INSERT INTO connect_tickets(id_hash, user_id, upstream, purpose, agent_id, created_at, expires_at)
         VALUES(?,?,?,?,?,?,?)`,

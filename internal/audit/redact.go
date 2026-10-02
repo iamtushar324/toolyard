@@ -29,10 +29,24 @@ var secretPatterns = []*regexp.Regexp{
 	regexp.MustCompile(`(?i)bearer\s+[A-Za-z0-9._-]{20,}`),
 	// 32+ char hex blob (sha-style hashes / hex secrets)
 	regexp.MustCompile(`\b[a-f0-9]{40,}\b`),
+	connectLinkRE,
 }
+
+// connectLinkRE matches a toolyard connect link's ticket (the path is
+// oauth.ConnectLinkPath): a one-time credential an agent shows the person
+// once, which must not land in result_summary or any other stored text.
+var connectLinkRE = regexp.MustCompile(`/v1/connect/link/[A-Za-z0-9_-]{16,}`)
 
 // redactionPlaceholder is the literal substituted in for matched secrets.
 const redactionPlaceholder = "«redacted»"
+
+// RedactConnectLinks replaces only connect-link tickets in s, for text
+// that is otherwise stored verbatim and read back by an agent (a persisted
+// approval result), where the broad patterns above would damage legitimate
+// values such as commit hashes.
+func RedactConnectLinks(s string) string {
+	return connectLinkRE.ReplaceAllString(s, redactionPlaceholder)
+}
 
 // RedactString runs every pattern over s, replacing matches with the
 // placeholder. Idempotent — running it twice on the same string is safe.

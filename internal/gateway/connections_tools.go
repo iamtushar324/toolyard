@@ -97,6 +97,22 @@ func (g *Gateway) connectProvider() ConnectProvider {
 	return g.connect
 }
 
+type noConnectLinksKey struct{}
+
+// WithoutConnectLinks marks a call whose caller must not be handed a
+// connect link: the API sets it on tool runs made with an operator token,
+// which is a credential in a script and not the person's browser, so a
+// link it obtained could be opened by anyone holding the token. Refusals
+// then fall back to naming the dashboard, and connections.link says why.
+func WithoutConnectLinks(ctx context.Context) context.Context {
+	return context.WithValue(ctx, noConnectLinksKey{}, true)
+}
+
+func connectLinksAllowed(ctx context.Context) bool {
+	v, _ := ctx.Value(noConnectLinksKey{}).(bool)
+	return !v
+}
+
 // connectionsTools returns the two entries; registered by RegisterBuiltins.
 func (g *Gateway) connectionsTools() []toolEntry {
 	allow := policy.ActionAllow
@@ -232,11 +248,11 @@ func (g *Gateway) connectionViews(ctx context.Context, callerID, uid string, adm
 	}
 	var cands []cand
 	for _, s := range servers {
+		seen[s.Name] = true
 		if !s.Enabled {
 			continue
 		}
-		seen[s.Name] = true
-		cands = append(cands, cand{name: s.Name, perUser: s.AuthMode == "per_user", client: true})
+		cands = append(cands, cand{name: s.Name, perUser: s.AuthMode == oauth.ConnectPurposePerUser, client: true})
 	}
 	// A per_user server registered on the gateway but without an OAuth
 	// client yet: listed so the agent can say what is missing.
@@ -378,7 +394,7 @@ func (g *Gateway) handleConnectionsLink(ctx context.Context, args map[string]any
 		return mcp.NewToolResultErrorf("%s is disabled; an admin has to enable it before anyone signs in", server), nil
 	}
 	v := connectionView{Server: server, Mode: "shared"}
-	if found.AuthMode == "per_user" {
+	if found.AuthMode == oauth.ConnectPurposePerUser {
 		v.Mode = oauth.ConnectPurposePerUser
 		conn, err := p.UserConnectionOf(ctx, server, uid)
 		if err != nil {
@@ -452,6 +468,9 @@ func (g *Gateway) connectLink(ctx context.Context, uid, upstream, purpose, calle
 	if p == nil {
 		return "", errors.New("connect links are not available on this gateway; connect from the toolyard dashboard")
 	}
+	if !connectLinksAllowed(ctx) {
+		return "", errors.New("connect links are not handed out on a tool run made with an operator token; ask from your own agent, or connect from the toolyard dashboard")
+	}
 	base := strings.TrimRight(g.publicURL, "/")
 	if base == "" {
 		return "", errors.New("toolyard has no public URL, so it cannot make a connect link; connect from the toolyard dashboard")
@@ -513,13 +532,13 @@ func (g *Gateway) perUserNeedsReauth(ctx context.Context, upstream, uid string) 
 }
 
 // refuseSharedSignIn is the terminal outcome of a call to a shared OAuth
-// server that has no usable token: before the dial, when the request
-// would carry no Authorization at all and the token row says why; or
-// after it, when the upstream answered 401 (cause). nil means "not that
-// case, carry on": the server is not an OAuth server, or links are not
-// wired. The upstream is never contacted with nothing in hand, the audit
-// row says why, and the agent gets a link (an admin owner) or the admins
-// to ask (a member).
+// server that has no usable token: before a dial, when the connection is
+// down, the request would carry no Authorization at all and the token row
+// says its sign-in died; or after a call, when the upstream answered 401
+// (cause). nil means "not that case, carry on": the server is not an OAuth
+// server, links are not wired, or the connection is live and can answer
+// for itself. The audit row says why, and the agent gets a link (an admin
+// owner) or the admins to ask (a member).
 func (g *Gateway) refuseSharedSignIn(ctx context.Context, u *upstream, entry toolEntry, agentID, reason, approvalID string,
 	cause error, ev *metrics.Event) *mcp.CallToolResult {
 	p := g.connectProvider()
@@ -527,10 +546,16 @@ func (g *Gateway) refuseSharedSignIn(ctx context.Context, u *upstream, entry too
 		return nil
 	}
 	if cause == nil {
-		// Only a request that would go out with no Authorization at all
-		// is looked at: a cached bearer, a static key or a PAT means the
-		// call proceeds as it always did, without a database read.
-		if u.cfg.HeaderFunc == nil || hasAuthorization(u.cfg.HeaderFunc(ctx)) {
+		// Before the dial only. A live connection costs nothing extra: a
+		// dead token comes back as 401 and lands here with a cause. A
+		// connection about to be dialled is looked at only when the
+		// request would go out with no Authorization at all (a cached
+		// bearer, a static key or a PAT proceeds as it always did), and
+		// is refused only when a token row says its sign-in died; a
+		// server never signed in, or a row that says active with no
+		// bearer in the cache, is left to the dial, whose 401 says the
+		// same thing.
+		if !u.suspended() || u.cfg.HeaderFunc == nil || hasAuthorization(u.cfg.HeaderFunc(ctx)) {
 			return nil
 		}
 	}
@@ -538,15 +563,15 @@ func (g *Gateway) refuseSharedSignIn(ctx context.Context, u *upstream, entry too
 	if err != nil || conn == nil {
 		return nil
 	}
-	if cause == nil && conn.Usable() {
-		// The row says active but no bearer came out (a cold cache that
-		// failed to load, a decrypt error): let the call fail on its own
-		// terms rather than send the person to sign in for nothing.
+	if cause == nil && (!conn.HasToken || conn.Usable()) {
 		return nil
 	}
 	uid, _ := g.ownerUser(ctx, agentID)
 	msg := g.sharedConnectMessage(ctx, entry.upstream, uid, agentID, conn, cause)
-	summary := "shared_signin: no usable token (" + sharedWhy(conn, cause) + ")"
+	summary := "shared_signin: " + sharedWhy(conn, cause)
+	if cause != nil {
+		summary += ": " + cause.Error()
+	}
 	_ = g.audit.Write(ctx, audit.Event{
 		EventType:     audit.EventCallFailed,
 		AgentID:       agentID,
@@ -562,17 +587,18 @@ func (g *Gateway) refuseSharedSignIn(ctx context.Context, u *upstream, entry too
 	return mcp.NewToolResultError(msg)
 }
 
-// sharedWhy is the short reason for the audit row and the message.
+// sharedWhy is the short reason for the audit row and the message: what
+// the token row says first, the upstream's 401 when the row looked fine.
 func sharedWhy(conn *oauth.SharedConnection, cause error) string {
 	switch {
+	case !conn.HasToken:
+		return "it was never signed in"
+	case conn.State == oauth.StateNeedsReauth:
+		return "its sign-in needs to be renewed"
 	case cause != nil:
 		return "the upstream rejected its token (401)"
-	case conn.HasToken && conn.State == oauth.StateNeedsReauth:
-		return "its sign-in needs to be renewed"
-	case conn.HasToken:
-		return "its token is not usable (" + conn.State + ")"
 	}
-	return "it was never signed in"
+	return "its token is not usable (" + conn.State + ")"
 }
 
 // sharedConnectMessage words the refusal for the agent: an admin owner

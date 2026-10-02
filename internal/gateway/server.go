@@ -2109,7 +2109,17 @@ func encodeApprovalResult(res *mcp.CallToolResult) (string, error) {
 	if res == nil {
 		return "", nil
 	}
-	env := approvalResultEnvelope{IsError: res.IsError, StructuredContent: res.StructuredContent}
+	env := approvalResultEnvelope{IsError: res.IsError}
+	// The row is read by admins and operator tokens and replayed on every
+	// poll, so a connect link (minted for the one person the call was
+	// refused for) is taken out; everything else is stored verbatim.
+	if res.StructuredContent != nil {
+		if raw, err := json.Marshal(res.StructuredContent); err == nil {
+			env.StructuredContent = json.RawMessage(audit.RedactConnectLinks(string(raw)))
+		} else {
+			env.StructuredContent = res.StructuredContent
+		}
+	}
 	if res.Meta != nil {
 		env.Meta = res.Meta.AdditionalFields
 	}
@@ -2119,7 +2129,7 @@ func encodeApprovalResult(res *mcp.CallToolResult) (string, error) {
 			text.WriteString(t.Text)
 		}
 	}
-	env.TextContent = text.String()
+	env.TextContent = audit.RedactConnectLinks(text.String())
 	out, err := json.Marshal(env)
 	if err != nil {
 		return "", err

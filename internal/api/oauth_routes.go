@@ -387,6 +387,11 @@ func (s *Server) oauthCallback(w http.ResponseWriter, r *http.Request) {
 		EventType:     "oauth.success",
 		ResultSummary: p.UpstreamName,
 	})
+	if p.ViaTicket {
+		// The admin came from an agent's connect link, not the dashboard.
+		connectDonePage(w, p.UpstreamName, rec.AccountLabel)
+		return
+	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
 	_, _ = w.Write([]byte(oauthSuccessHTML(p.UpstreamName, rec.AccessExpiresAt)))
@@ -440,7 +445,8 @@ func (s *Server) oauthUserCallback(w http.ResponseWriter, r *http.Request, p *oa
 		owner, err := s.identity.GetUserByID(r.Context(), p.UserID)
 		if err != nil || owner.Status != identity.StatusActive {
 			_ = s.oauth.DeletePending(r.Context(), p.State)
-			oauthHTMLError(w, "Your toolyard account is not active. Nothing was stored.")
+			s.userFlowError(w, p.ViaTicket, "Your toolyard account is not active. Nothing was stored.",
+				"Your toolyard account is not active, so nothing was stored. Ask a toolyard admin.")
 			return
 		}
 		u = owner
@@ -456,15 +462,40 @@ func (s *Server) oauthUserCallback(w http.ResponseWriter, r *http.Request, p *oa
 			Raiser:        actor.Raiser{OwnerUserID: p.UserID},
 		})
 		if ok {
-			oauthHTMLError(w, "This sign-in was started by a different toolyard user. Nothing was stored. Start your own from My connections.")
+			s.userFlowError(w, p.ViaTicket,
+				"This sign-in was started by a different toolyard user. Nothing was stored. Start your own from My connections.",
+				"This link belongs to a different toolyard user than the one signed in to this browser. Nothing was stored. Ask your agent for a new link.")
 			return
 		}
-		oauthHTMLError(w, "This sign-in did not come back to the browser that started it (or its cookie is missing). Nothing was stored. Start again from My connections, in the same browser.")
+		s.userFlowError(w, p.ViaTicket,
+			"This sign-in did not come back to the browser that started it (or its cookie is missing). Nothing was stored. Start again from My connections, in the same browser.",
+			"This sign-in did not come back to the browser that opened the link (or its cookie is missing). Nothing was stored. Ask your agent for a new link and finish the sign-in in the same browser.")
 		return
 	}
-	rec, err := s.oauth.ExchangeCodeForUser(r.Context(), p.UpstreamName, u.ID, code, p.CodeVerifier)
+	// A flow a connect link started stores the token only when the
+	// account the provider reports is the person's own
+	// (connect_link_routes.go); the check runs before anything is
+	// written, and a refused token is revoked at the provider.
+	var accept func(*oauth.UserTokenRecord) error
+	var other string
+	if p.ViaTicket {
+		accept = func(rec *oauth.UserTokenRecord) error {
+			if !connectAccountMatches(u, rec.AccountLabel) {
+				other = rec.AccountLabel
+				return errors.New("the provider account is not the person's")
+			}
+			return nil
+		}
+	}
+	rec, err := s.oauth.ExchangeCodeForUserChecked(r.Context(), p.UpstreamName, u.ID, code, p.CodeVerifier, accept)
+	if errors.Is(err, oauth.ErrAccountMismatch) {
+		_ = s.oauth.DeletePending(r.Context(), p.State)
+		s.connectAccountMismatchPage(w, r, u, p.UpstreamName, other)
+		return
+	}
 	if err != nil {
-		oauthHTMLError(w, "Token exchange failed: "+err.Error())
+		s.userFlowError(w, p.ViaTicket, "Token exchange failed: "+err.Error(),
+			"The provider did not complete the sign-in ("+err.Error()+"). Nothing was stored. Ask your agent for a new link.")
 		return
 	}
 	_ = s.oauth.DeletePending(r.Context(), p.State)
@@ -474,6 +505,13 @@ func (s *Server) oauthUserCallback(w http.ResponseWriter, r *http.Request, p *oa
 		ResultSummary: p.UpstreamName + " connected as " + nonEmpty(rec.AccountLabel, "(account not named)"),
 		Raiser:        actor.Raiser{OwnerUserID: u.ID, OwnerEmail: u.Email, OwnerName: u.Label()},
 	})
+	if p.ViaTicket {
+		if !connectAccountVerified(u, rec.AccountLabel) {
+			s.connectAuditUnverified(r, u, p.UpstreamName, rec.AccountLabel)
+		}
+		connectDonePage(w, p.UpstreamName, rec.AccountLabel)
+		return
+	}
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
 	_, _ = w.Write([]byte(oauthUserSuccessHTML(p.UpstreamName, rec.AccountLabel)))
@@ -536,7 +574,23 @@ func (s *Server) oauthPaste(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusForbidden, "this sign-in was started by a different toolyard user; nothing was stored")
 			return
 		}
-		rec, err := s.oauth.ExchangeCodeForUser(r.Context(), p.UpstreamName, u.ID, code, p.CodeVerifier)
+		// A link-started flow finished by paste keeps the link's account
+		// rule (connect_link_routes.go).
+		var accept func(*oauth.UserTokenRecord) error
+		if p.ViaTicket {
+			accept = func(rec *oauth.UserTokenRecord) error {
+				if !connectAccountMatches(u, rec.AccountLabel) {
+					return errors.New("the provider account is not the person's")
+				}
+				return nil
+			}
+		}
+		rec, err := s.oauth.ExchangeCodeForUserChecked(r.Context(), p.UpstreamName, u.ID, code, p.CodeVerifier, accept)
+		if errors.Is(err, oauth.ErrAccountMismatch) {
+			_ = s.oauth.DeletePending(r.Context(), state)
+			writeError(w, http.StatusForbidden, "this link was made for "+u.Email+" and the provider signed in another account; nothing was stored")
+			return
+		}
 		if err != nil {
 			writeError(w, http.StatusBadGateway, err.Error())
 			return

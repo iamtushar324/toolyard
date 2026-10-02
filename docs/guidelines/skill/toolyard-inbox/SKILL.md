@@ -64,6 +64,9 @@ then reading your evidence, and deciding at the end.
   another agent).
 - Never split a risky action to avoid a flag, or claim urgency you don't have.
   `now` is limited per agent per hour; past the limit it becomes `soon`.
+- Never ask for a password, token or one-time code when a server isn't
+  connected: show the connect link the call gives you (or `connections.link`)
+  as a clickable Markdown link, and retry after the person says they're done.
 
 Full details: `inbox.guide()`, or `inbox.guide({ topic: "examples" })` for
 worked examples.
