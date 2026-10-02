@@ -1,10 +1,19 @@
 package gateway
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
+	"io"
+	"net/http"
+	"net/http/httptest"
+	"net/http/httputil"
+	"net/url"
 	"testing"
 	"time"
+
+	"github.com/mark3labs/mcp-go/server"
 )
 
 // TestPickEvictionCandidate_PerUserPool: per-user connections and shared
@@ -74,5 +83,62 @@ func TestRetiredConnectionNeverDials(t *testing.T) {
 	}
 	if !c3.suspended() {
 		t.Fatal("retired connection holds a client")
+	}
+}
+
+// TestRemoveUpstreamDuringResume: a shared upstream removed while it is
+// re-dialling (an idle server waking up) must not end up holding a client
+// that nothing tracks: the dial finishes, sees the upstream retired and
+// closes what it opened.
+func TestRemoveUpstreamDuringResume(t *testing.T) {
+	f := newForgetfulUpstream(t, "400")
+	target, _ := url.Parse(f.srv.URL)
+	proxy := httputil.NewSingleHostReverseProxy(target)
+	seen := make(chan struct{}, 1)
+	release := make(chan struct{})
+	gate := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		r.Body = io.NopCloser(bytes.NewReader(body))
+		var msg struct {
+			Method string `json:"method"`
+		}
+		_ = json.Unmarshal(body, &msg)
+		if msg.Method == "initialize" {
+			select {
+			case seen <- struct{}{}:
+			default:
+			}
+			<-release
+		}
+		proxy.ServeHTTP(w, r)
+	}))
+	defer gate.Close()
+
+	g := &Gateway{upstreams: map[string]*upstream{}, perUser: map[string]*perUserGroup{},
+		tools: map[string]toolEntry{}, mcp: server.NewMCPServer("t", "1")}
+	u := &upstream{cfg: UpstreamConfig{Name: "bk", Transport: "http", URL: gate.URL}}
+	g.upstreams["bk"] = u
+
+	errc := make(chan error, 1)
+	go func() { errc <- u.resume(context.Background()) }()
+	select {
+	case <-seen:
+	case <-time.After(10 * time.Second):
+		t.Fatal("resume never reached the upstream")
+	}
+	if err := g.RemoveUpstream("bk"); err != nil {
+		t.Fatalf("RemoveUpstream: %v", err)
+	}
+	close(release)
+	select {
+	case err := <-errc:
+		if !errors.Is(err, errRetired) {
+			t.Fatalf("resume after removal = %v, want errRetired", err)
+		}
+	case <-time.After(15 * time.Second):
+		t.Fatal("resume did not return")
+	}
+	if !u.suspended() {
+		t.Fatal("removed upstream kept the client its in-flight dial opened")
 	}
 }

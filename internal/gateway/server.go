@@ -625,10 +625,11 @@ func (g *Gateway) allUpstreams() []*upstream {
 	return out
 }
 
-// Close shuts down all upstream connections.
+// Close shuts down all upstream connections for good: each is retired, so
+// a dial still in flight closes what it opens instead of keeping it.
 func (g *Gateway) Close() error {
 	for _, u := range g.allUpstreams() {
-		_ = u.close()
+		u.retire()
 	}
 	return nil
 }
@@ -660,7 +661,10 @@ func (g *Gateway) RemoveUpstream(name string) error {
 
 	g.mcp.DeleteTools(toRemove...)
 	if u != nil {
-		_ = u.close()
+		// Retire, not just close: a resume dialling right now (an idle
+		// stdio server waking up) would otherwise install a client on an
+		// upstream nothing tracks any more.
+		u.retire()
 	}
 	if pu != nil {
 		pu.closeAll()
