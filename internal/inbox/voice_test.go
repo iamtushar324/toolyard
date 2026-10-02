@@ -6,6 +6,8 @@ import (
 	"errors"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 )
 
@@ -46,7 +48,7 @@ func TestToWAV(t *testing.T) {
 	}
 }
 
-func TestVoiceRecordedInBackground(t *testing.T) {
+func TestVoiceGeneratedOnlyOnListen(t *testing.T) {
 	e := newEnv(t)
 	snaps, err := NewSnapshotter(nil, filepath.Join(t.TempDir(), "blobs"))
 	if err != nil {
@@ -62,6 +64,13 @@ func TestVoiceRecordedInBackground(t *testing.T) {
 	}
 	on = true
 	r = submitDeploy(t, e, "ag_1")
+	if fv.called != 0 || r.Audio.Blob != "" {
+		t.Fatal("submission spent voice credits")
+	}
+	if _, err := e.svc.ListenAudio(context.Background(), r.ID); err != nil {
+		t.Fatal(err)
+	}
+	r, _ = e.svc.Get(context.Background(), r.ID)
 	if fv.called != 1 || r.Audio.Blob == "" || r.Audio.ContentType != "audio/wav" {
 		t.Fatalf("voice note not recorded: %+v", r.Audio)
 	}
@@ -73,9 +82,16 @@ func TestVoiceRecordedInBackground(t *testing.T) {
 		t.Fatalf("stored voice note can't be opened: %v", err)
 	}
 	f.Close()
+	if _, err := e.svc.ListenAudio(context.Background(), r.ID); err != nil || fv.called != 1 {
+		t.Fatal("replay spent credits")
+	}
 
 	fv.err = errors.New("quota exceeded")
 	r = submitDeploy(t, e, "ag_1")
+	if _, err := e.svc.ListenAudio(context.Background(), r.ID); err == nil {
+		t.Fatal("generation error omitted")
+	}
+	r, _ = e.svc.Get(context.Background(), r.ID)
 	if r.Audio.Blob != "" || !strings.Contains(activityText(r), "browser will read it instead") {
 		t.Fatalf("failure should fall back and say so: %+v %s", r.Audio, activityText(r))
 	}
@@ -101,5 +117,67 @@ func TestGeminiVoicePrompt(t *testing.T) {
 	}
 	if !strings.HasPrefix(got, "Read the following text aloud exactly as written") || !strings.HasSuffix(got, "say yes.") {
 		t.Fatalf("prompt: %q", got)
+	}
+}
+
+// A cancelled browser and concurrent listeners must not bill again.
+type blockedVoice struct {
+	calls            atomic.Int32
+	started, release chan struct{}
+}
+
+func (v *blockedVoice) Speak(ctx context.Context, script string) ([]byte, string, error) {
+	v.calls.Add(1)
+	close(v.started)
+	select {
+	case <-ctx.Done():
+		return nil, "", ctx.Err()
+	case <-v.release:
+	}
+	return []byte("ID3-test"), "audio/mpeg", nil
+}
+func TestListenConcurrentAndCancelledBrowserCachesOnce(t *testing.T) {
+	e := newEnv(t)
+	snaps, err := NewSnapshotter(nil, filepath.Join(t.TempDir(), "blobs"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	v := &blockedVoice{started: make(chan struct{}), release: make(chan struct{})}
+	e.svc.opts.Voice, e.svc.opts.Blobs, e.svc.opts.VoiceEnabled = v, snaps, func() bool { return true }
+	r := submitDeploy(t, e, "ag_1")
+	if v.calls.Load() != 0 {
+		t.Fatal("background synthesis")
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	var wg sync.WaitGroup
+	errs := make(chan error, 9)
+	wg.Add(1)
+	go func() { defer wg.Done(); _, err := e.svc.ListenAudio(ctx, r.ID); errs <- err }()
+	<-v.started
+	cancel()
+	for i := 0; i < 8; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			a, err := e.svc.ListenAudio(context.Background(), r.ID)
+			if err == nil && a.Blob == "" {
+				err = errors.New("missing recording")
+			}
+			errs <- err
+		}()
+	}
+	close(v.release)
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	if v.calls.Load() != 1 {
+		t.Fatalf("billed %d generations", v.calls.Load())
+	}
+	if _, err := e.svc.ListenAudio(context.Background(), r.ID); err != nil || v.calls.Load() != 1 {
+		t.Fatal("replay generated again")
 	}
 }

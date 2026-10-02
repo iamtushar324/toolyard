@@ -344,3 +344,11 @@ Shared-library voices may need to be added to your ElevenLabs account first.
 
 API: https://elevenlabs.io/docs/api-reference/text-to-speech/convert
 v4 API: https://elevenlabs.io/docs/api-reference/text-to-dialogue/convert
+
+Inbox speech is generated only on the first **Listen** click. Receiving, checking,
+opening, or rechecking a request does not synthesize speech. The owner browser's
+POST audio action stores the recording for subsequent plays; concurrent clicks
+share one generation. In-flight generation finishes and caches even if the browser
+leaves the page. Agent and operator tokens cannot trigger this action.
+Free ElevenLabs accounts cannot use shared library voices through the API; use an
+included voice such as Sarah (`EXAVITQu4vr4xnSDxMaL`) or resolve the account plan.

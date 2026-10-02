@@ -178,6 +178,8 @@ func (s *Server) inboxItem(w http.ResponseWriter, r *http.Request) {
 		s.inboxGet(w, r, uid, parts[0])
 	case len(parts) == 2 && parts[1] == "decide":
 		s.inboxDecide(w, r, uid, parts[0])
+	case len(parts) == 2 && parts[1] == "audio":
+		s.inboxListenAudio(w, r, parts[0])
 	case len(parts) == 2 && parts[1] == "passkey":
 		s.inboxPasskeyBegin(w, r, parts[0])
 	case len(parts) == 2 && parts[1] == "summarize":
@@ -187,6 +189,28 @@ func (s *Server) inboxItem(w http.ResponseWriter, r *http.Request) {
 	default:
 		http.NotFound(w, r)
 	}
+}
+
+func (s *Server) inboxListenAudio(w http.ResponseWriter, r *http.Request, id string) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "POST only")
+		return
+	}
+	if operatorFromContext(r.Context()) != nil {
+		writeError(w, http.StatusForbidden, "listen in the owner dashboard")
+		return
+	}
+	if _, err := s.requireAdmin(r); err != nil {
+		writeAuthError(w, err)
+		return
+	}
+	audio, err := s.inbox.ListenAudio(r.Context(), id)
+	if err != nil {
+		writeInboxErr(w, err)
+		return
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	writeJSON(w, http.StatusOK, map[string]any{"audio": audio})
 }
 
 func (s *Server) inboxGet(w http.ResponseWriter, r *http.Request, uid, id string) {

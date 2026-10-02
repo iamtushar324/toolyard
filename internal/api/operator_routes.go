@@ -90,6 +90,9 @@ var operatorOwnerPrefixes = []string{
 // operatorScopeFor returns the scope an operator token needs for method on
 // path, or ok=false when operator tokens may never call it.
 func operatorScopeFor(method, path string) (scope string, ok bool) {
+	if strings.HasPrefix(path, "/v1/inbox/") && strings.HasSuffix(path, "/audio") {
+		return "", false
+	}
 	if operatorNeverPaths[path] || strings.Contains(path, "/reveal") {
 		return "", false
 	}

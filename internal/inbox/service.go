@@ -84,14 +84,16 @@ type Options struct {
 
 // Service is the inbox.
 type Service struct {
-	db      *store.DB
-	opts    Options
-	signer  *grantSigner
-	now     func() time.Time
-	bg      sync.WaitGroup
-	watchMu sync.Mutex
-	watch   map[string]chan struct{}
-	attnMu  sync.Mutex // one attention round (Tick / dispatch) at a time
+	db           *store.DB
+	opts         Options
+	signer       *grantSigner
+	now          func() time.Time
+	bg           sync.WaitGroup
+	watchMu      sync.Mutex
+	watch        map[string]chan struct{}
+	attnMu       sync.Mutex // one attention round (Tick / dispatch) at a time
+	voiceMu      sync.Mutex
+	voiceFlights map[string]*voiceFlight
 }
 
 // New creates the service and loads (or creates) the grant signing key.
@@ -329,14 +331,9 @@ func (s *Service) backgroundCheck(ctx context.Context, id string) {
 		rv, judgeErr = s.opts.Judge.Review(jctx, r)
 		cancel()
 	}
-	audio, voiceNote := s.recordVoice(ctx, r)
 	dryLabels, _ := s.dryRunLabels(ctx, r.AgentID, r.Title)
 	err = s.mutate(ctx, id, func(cur *Request) error {
 		cur.Attachments = r.Attachments
-		cur.Audio = audio
-		if voiceNote != "" {
-			cur.addActivity(s.now().UnixMilli(), voiceNote)
-		}
 		applyReview(cur, rv)
 		cur.Checked = true
 		final := map[string]bool{}

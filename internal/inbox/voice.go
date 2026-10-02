@@ -16,8 +16,8 @@ import (
 
 // Voice notes are the agent's script (Audio.Script). By default the
 // dashboard speaks it with the browser's speech engine. With a Voice
-// configured and turned on, toolyard records it once, in the background
-// check, and the review page plays the recording (same voice every time,
+// configured and turned on, toolyard records it once on an explicit Listen
+// request, and the review page plays the recording (same voice every time,
 // works with the screen locked). The script is spoken as written: the
 // synthesizer is told to read it, not to follow it.
 
@@ -32,6 +32,75 @@ type BlobStore interface {
 }
 
 const voiceTimeout = 40 * time.Second
+
+type voiceFlight struct {
+	done  chan struct{}
+	audio Audio
+	err   error
+}
+
+// ListenAudio generates only on explicit owner playback. Concurrent listeners
+// share one generation; later plays reuse the stored blob even after a restart.
+func (s *Service) ListenAudio(ctx context.Context, id string) (Audio, error) {
+	s.voiceMu.Lock()
+	if f := s.voiceFlights[id]; f != nil {
+		s.voiceMu.Unlock()
+		select {
+		case <-ctx.Done():
+			return Audio{}, ctx.Err()
+		case <-f.done:
+			return f.audio, f.err
+		}
+	}
+	f := &voiceFlight{done: make(chan struct{})}
+	if s.voiceFlights == nil {
+		s.voiceFlights = make(map[string]*voiceFlight)
+	}
+	s.voiceFlights[id] = f
+	s.voiceMu.Unlock()
+	defer func() {
+		s.voiceMu.Lock()
+		close(f.done)
+		delete(s.voiceFlights, id)
+		s.voiceMu.Unlock()
+	}()
+	// Once Listen starts a billed generation, finish and cache it even if the
+	// browser leaves the page. The provider call still has a bounded timeout.
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), voiceTimeout)
+	defer cancel()
+	r, err := s.Get(ctx, id)
+	if err != nil {
+		f.err = err
+		return Audio{}, err
+	}
+	if r.Audio.Blob != "" || !s.voiceOn() || strings.TrimSpace(r.Audio.Script) == "" {
+		f.audio = r.Audio
+		return f.audio, nil
+	}
+	audio, note := s.recordVoice(ctx, r)
+	err = s.mutate(ctx, id, func(cur *Request) error {
+		if audio.Blob != "" {
+			cur.Audio = audio
+		}
+		if note != "" {
+			cur.addActivity(s.now().UnixMilli(), note)
+		}
+		return nil
+	})
+	if err != nil {
+		f.err = err
+		return Audio{}, err
+	}
+	if cur, err := s.Get(ctx, id); err == nil {
+		s.publish("inbox", s.cardView(ctx, cur))
+	}
+	if note != "" {
+		f.err = errors.New(note)
+		return Audio{}, f.err
+	}
+	f.audio = audio
+	return audio, nil
+}
 
 // DefaultVoiceModel and DefaultVoiceName are Gemini's TTS defaults.
 const (

@@ -6495,8 +6495,19 @@ function ibHalt() {
   if (ibVoice.audio) { try { ibVoice.audio.pause(); } catch (_) {} }
   if ('speechSynthesis' in window) { try { speechSynthesis.cancel(); } catch (_) {} }
 }
-function ibPlay(id) {
+async function ibPlay(id) {
   if (ibVoice.id !== id) { ibHalt(); ibVoice.id = id; ibVoice.i = 0; }
+  if (ibVoice.loading === id) return;
+  if (!ibRec(id)) {
+    const token = ++ibVoice.token;
+    ibVoice.loading = id; ibSync();
+    try {
+      const out = await api('/v1/inbox/' + encodeURIComponent(id) + '/audio', { method: 'POST', body: {} });
+      const r = ibReq(id); if (r && out.audio) r.audio = out.audio;
+    } catch (e) { toast(e.message + ' Using browser speech.', 'error'); }
+    finally { if (ibVoice.loading === id) ibVoice.loading = null; ibSync(); }
+    if (token !== ibVoice.token || ibVoice.id !== id) return;
+  }
   const rec = ibRec(id);
   if (rec) {
     if (!ibAudioOn(id)) {
@@ -6594,8 +6605,10 @@ function ibSyncProgress() {
 function ibSync() {
   document.querySelectorAll('[data-ib-play]').forEach((n) => {
     const on = ibVoice.playing && ibVoice.id === n.dataset.ibPlay;
+    const loading = ibVoice.loading === n.dataset.ibPlay;
+    n.disabled = loading;
     n.classList.toggle('playing', on);
-    n.setAttribute('aria-label', on ? 'Pause voice note' : 'Play voice note');
+    n.setAttribute('aria-label', loading ? 'Generating voice note' : (on ? 'Pause voice note' : 'Play voice note'));
   });
   document.querySelectorAll('[data-ib-sent]').forEach((n) => {
     const [id, k] = n.dataset.ibSent.split(':'); const i = +k, act = ibVoice.id === id;
@@ -7678,9 +7691,9 @@ function ibVoiceSettings(s, patch) {
           on: { change: (e) => patch({ inbox_elevenlabs_model: e.target.value.trim() }) } }))) : null,
     el('label', { class: 'ib-check' }, el('input', { type: 'checkbox', checked: !!s.inbox_voice_enabled, disabled: !info.voice_available && !s.inbox_voice_enabled,
       on: { change: (e) => patch({ inbox_voice_enabled: e.target.checked }) } }),
-      el('span', {}, 'Record new inbox voice notes on the server, so they play with the screen locked. Off: your browser reads the script.' +
+      el('span', {}, 'Generate voice notes only when I click Listen, then reuse the saved recording. Off: your browser reads the script.' +
         (info.voice_available ? '' : (eleven ? ' Needs an ElevenLabs API key.' : ' Needs GEMINI_API_KEY on the gateway.')))),
-    el('p', { class: 'meta' }, 'When recording is enabled, voice-note scripts are sent to ' + (eleven ? 'ElevenLabs using your API credits.' : 'Gemini.') + ' Existing recordings keep their original voice. If recording fails, your browser reads the script.'),
+    el('p', { class: 'meta' }, 'The first Listen sends that voice-note script to ' + (eleven ? 'ElevenLabs using your API credits.' : 'Gemini.') + ' Replays use the saved audio without another generation. Receiving or opening an inbox item does not generate speech. If generation fails, your browser reads the script.'),
     !eleven && s.inbox_voice_enabled ? el('div', { class: 'ib-setrow' }, el('span', {}, 'Voice'),
       el('select', { on: { change: (e) => patch({ inbox_voice_name: e.target.value }) } },
         ...['Kore', 'Puck', 'Charon', 'Aoede', 'Leda', 'Orus', 'Zephyr', 'Fenrir'].map((v) => el('option', { value: v, selected: (s.inbox_voice_name || 'Kore') === v }, v)))) : null,

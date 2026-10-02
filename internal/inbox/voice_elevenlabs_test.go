@@ -128,6 +128,10 @@ func TestElevenLabsRecordingAndAvailability(t *testing.T) {
 		t.Fatal("saved key not picked up")
 	}
 	r = submitDeploy(t, e, "ag_1")
+	if _, err := e.svc.ListenAudio(context.Background(), r.ID); err != nil {
+		t.Fatal(err)
+	}
+	r, _ = e.svc.Get(context.Background(), r.ID)
 	if r.Audio.Blob == "" || r.Audio.ContentType != "audio/mpeg" {
 		t.Fatalf("MP3 not saved: %+v", r.Audio)
 	}
