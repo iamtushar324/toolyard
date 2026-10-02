@@ -290,3 +290,28 @@ Once an hour (`-clerk-sync-interval`) toolyard lists the organisation's
 members; anyone who left is blocked (`left_org`), their dashboard sessions
 are revoked and their agents stop authenticating. A Clerk outage never
 blocks anyone: on any error the sync logs and changes nothing.
+
+### Personal Google account only
+
+For a personal deployment, set the Clerk secret and publishable keys (an
+organization ID is unnecessary), then start with:
+
+```bash
+./toolyard serve -public-url https://toolyard.example.com \
+  -owner-email you@gmail.com -clerk-owner-only
+```
+
+This mode checks the Clerk Backend API for a verified primary email and a
+verified Google external account with exactly that address. It disables
+local password login/setup and organization offboarding sync. Non-owner
+browser sessions cannot access the dashboard API. The first permitted
+login links to the existing owner account, retaining its agents, grants,
+passkeys, and data. Agent and operator token authentication is preserved.
+
+Enable only Google in the dedicated Clerk app. Restrict Clerk signups to
+the same email, using an allowlist or invite-only access as available on
+your plan. The Toolyard server check remains mandatory: signup restrictions
+alone do not authorize existing accounts. Store keys outside Git and argv.
+
+Rollback: remove `-clerk-owner-only` and the Clerk environment variables,
+and restore the prior image/configuration. No database migration is added.

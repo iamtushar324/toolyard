@@ -48,7 +48,8 @@ func (s *Server) authConfig(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"clerk": clerkCfg,
 		// The local password account stays as the break-glass login.
-		"password_login": true,
+		"password_login": !s.clerkOwnerOnly,
+		"owner_only":     s.clerkOwnerOnly,
 	})
 }
 
@@ -110,6 +111,10 @@ func (s *Server) authClerkSession(w http.ResponseWriter, r *http.Request) {
 		// ErrUnavailable and anything unexpected: fail closed without
 		// telling the browser more than "try again".
 		writeError(w, http.StatusServiceUnavailable, "clerk_unavailable")
+		return
+	}
+	if s.clerkOwnerOnly && (s.ownerEmail == "" || !strings.EqualFold(member.Email, s.ownerEmail)) {
+		writeError(w, http.StatusForbidden, "not_org_member")
 		return
 	}
 	u, err := s.identity.UpsertClerkUser(ctx, identity.ClerkProfile{

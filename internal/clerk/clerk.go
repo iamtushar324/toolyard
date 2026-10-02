@@ -103,6 +103,8 @@ type Config struct {
 	SecretKey      string
 	PublishableKey string
 	OrganizationID string
+	// AllowedGoogleEmail selects personal access instead of organization membership.
+	AllowedGoogleEmail string
 	// AuthorizedParties is the set of browser origins whose tokens we
 	// accept (the azp claim). In production this is the dashboard's
 	// public URL origin.
@@ -118,16 +120,17 @@ type Config struct {
 
 // Client talks to one Clerk instance.
 type Client struct {
-	secretKey      string
-	publishableKey string
-	frontendAPI    string
-	orgID          string
-	azp            map[string]bool
-	http           *http.Client
-	apiBase        string
-	jwksURL        string
-	issuer         string
-	now            func() time.Time
+	secretKey          string
+	publishableKey     string
+	frontendAPI        string
+	orgID              string
+	allowedGoogleEmail string
+	azp                map[string]bool
+	http               *http.Client
+	apiBase            string
+	jwksURL            string
+	issuer             string
+	now                func() time.Time
 
 	mu          sync.Mutex
 	keys        map[string]*rsa.PublicKey
@@ -141,7 +144,7 @@ func New(cfg Config) (*Client, error) {
 	if strings.TrimSpace(cfg.SecretKey) == "" {
 		return nil, errors.New("clerk: secret key is required")
 	}
-	if strings.TrimSpace(cfg.OrganizationID) == "" {
+	if strings.TrimSpace(cfg.OrganizationID) == "" && strings.TrimSpace(cfg.AllowedGoogleEmail) == "" {
 		return nil, errors.New("clerk: organization id is required")
 	}
 	fapi, err := FrontendAPI(cfg.PublishableKey)
@@ -159,17 +162,18 @@ func New(cfg Config) (*Client, error) {
 		return nil, errors.New("clerk: at least one authorized party (the dashboard origin) is required")
 	}
 	c := &Client{
-		secretKey:      cfg.SecretKey,
-		publishableKey: cfg.PublishableKey,
-		frontendAPI:    fapi,
-		orgID:          cfg.OrganizationID,
-		azp:            azp,
-		http:           cfg.HTTPClient,
-		apiBase:        strings.TrimRight(cfg.APIBase, "/"),
-		jwksURL:        cfg.JWKSURL,
-		issuer:         cfg.Issuer,
-		now:            time.Now,
-		keys:           map[string]*rsa.PublicKey{},
+		secretKey:          cfg.SecretKey,
+		publishableKey:     cfg.PublishableKey,
+		frontendAPI:        fapi,
+		orgID:              cfg.OrganizationID,
+		allowedGoogleEmail: strings.TrimSpace(cfg.AllowedGoogleEmail),
+		azp:                azp,
+		http:               cfg.HTTPClient,
+		apiBase:            strings.TrimRight(cfg.APIBase, "/"),
+		jwksURL:            cfg.JWKSURL,
+		issuer:             cfg.Issuer,
+		now:                time.Now,
+		keys:               map[string]*rsa.PublicKey{},
 	}
 	if c.http == nil {
 		c.http = &http.Client{Timeout: 10 * time.Second}
@@ -407,6 +411,9 @@ func deref(s *string) string {
 // ErrNotMember when they don't (or the user id is unknown), ErrUnavailable
 // when Clerk can't be asked.
 func (c *Client) OrgMembership(ctx context.Context, clerkUserID string) (Member, error) {
+	if c.allowedGoogleEmail != "" {
+		return c.googleOwner(ctx, clerkUserID)
+	}
 	clerkUserID = strings.TrimSpace(clerkUserID)
 	if clerkUserID == "" {
 		return Member{}, ErrNotMember

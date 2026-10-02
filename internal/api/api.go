@@ -138,6 +138,7 @@ type Server struct {
 	clerkPublishableKey string
 	clerkFrontendAPI    string
 	ownerEmail          string
+	clerkOwnerOnly      bool
 }
 
 type Options struct {
@@ -222,7 +223,8 @@ type Options struct {
 	// OwnerEmail: the first Clerk sign-in with this email (case-insensitive)
 	// attaches to the existing primary password user instead of creating a
 	// new member, so the owner keeps their admin role, agents and passkeys.
-	OwnerEmail string
+	OwnerEmail     string
+	ClerkOwnerOnly bool
 }
 
 func New(ctx context.Context, opts Options) *Server {
@@ -264,6 +266,7 @@ func New(ctx context.Context, opts Options) *Server {
 		unauthLimit:              newLoginThrottle(0, time.Hour), // max/window passed per-call via AllowN
 		access:                   opts.Access,
 		ownerEmail:               strings.TrimSpace(opts.OwnerEmail),
+		clerkOwnerOnly:           opts.ClerkOwnerOnly,
 	}
 	if s.webhookMaxBytes <= 0 {
 		s.webhookMaxBytes = DefaultWebhookMaxBytes
@@ -576,7 +579,7 @@ func (s *Server) sessionUser(r *http.Request) (*identity.User, bool) {
 		return nil, false
 	}
 	u, err := s.identity.GetUserByID(r.Context(), id)
-	if err != nil || u.Status != identity.StatusActive {
+	if err != nil || u.Status != identity.StatusActive || (s.clerkOwnerOnly && (u.Auth != identity.AuthClerk || !strings.EqualFold(u.Email, s.ownerEmail))) {
 		return nil, false
 	}
 	return u, true
@@ -615,6 +618,10 @@ func writeAuthError(w http.ResponseWriter, err error) {
 }
 
 func (s *Server) authSetup(w http.ResponseWriter, r *http.Request) {
+	if s.clerkOwnerOnly {
+		writeError(w, http.StatusForbidden, "google_login_required")
+		return
+	}
 	if r.Method != http.MethodPost {
 		writeError(w, http.StatusMethodNotAllowed, "POST only")
 		return
@@ -648,6 +655,10 @@ func (s *Server) authSetup(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) authLogin(w http.ResponseWriter, r *http.Request) {
+	if s.clerkOwnerOnly {
+		writeError(w, http.StatusForbidden, "google_login_required")
+		return
+	}
 	if r.Method != http.MethodPost {
 		writeError(w, http.StatusMethodNotAllowed, "POST only")
 		return

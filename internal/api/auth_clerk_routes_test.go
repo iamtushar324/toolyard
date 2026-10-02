@@ -270,3 +270,38 @@ func TestAuthClerkSessionBootstrapsAdminOnEmptyStore(t *testing.T) {
 		}
 	})
 }
+
+func TestPersonalClerkOnly(t *testing.T) {
+	e := newAccessTestServer(t)
+	e.srv.clerkOwnerOnly = true
+	cfg := decodeJSON(t, e.do(t, nil, http.MethodGet, "/v1/auth/config", ""))
+	if cfg["password_login"] != false || cfg["owner_only"] != true {
+		t.Fatalf("config %v", cfg)
+	}
+	for _, p := range []string{"/v1/auth/login", "/v1/auth/setup"} {
+		rec := e.do(t, nil, http.MethodPost, p, `{"Username":"admin","Password":"long-enough-password"}`)
+		if rec.Code != http.StatusForbidden {
+			t.Fatalf("%s: %d %s", p, rec.Code, rec.Body.String())
+		}
+	}
+	rec := e.do(t, nil, http.MethodPost, "/v1/auth/clerk/session", `{"token":"good-token"}`)
+	if rec.Code != http.StatusForbidden || len(rec.Result().Cookies()) != 0 {
+		t.Fatalf("other email: %d %s", rec.Code, rec.Body.String())
+	}
+	old := e.cookieFor(t, e.admin.ID)
+	if rec := e.do(t, old, http.MethodGet, "/v1/auth/me", ""); rec.Code != http.StatusUnauthorized {
+		t.Fatalf("unlinked session: %d", rec.Code)
+	}
+	e.clerk.set(func(f *fakeClerk) { f.member.Email = e.srv.ownerEmail; f.claims.Subject = "user_owner" })
+	rec = e.do(t, nil, http.MethodPost, "/v1/auth/clerk/session", `{"token":"good-token"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("owner: %d %s", rec.Code, rec.Body.String())
+	}
+	u := decodeJSON(t, rec)
+	if u["id"] != e.admin.ID || u["role"] != identity.RoleAdmin {
+		t.Fatalf("owner changed: %v", u)
+	}
+	if me := e.do(t, sessionCookie(t, rec), http.MethodGet, "/v1/auth/me", ""); me.Code != http.StatusOK {
+		t.Fatalf("owner session %d %s", me.Code, me.Body.String())
+	}
+}

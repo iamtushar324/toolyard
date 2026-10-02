@@ -153,7 +153,7 @@ func loadDotenv() {
 // as is Clerk without -public-url — a Clerk session token is accepted only
 // when its azp claim is the dashboard's own origin. Returns the client (nil
 // when off) and the instance's Frontend API host for the login-page CSP.
-func clerkFromEnv(publicURL string) (*clerk.Client, string, error) {
+func clerkFromEnv(publicURL, ownerEmail string, ownerOnly bool) (*clerk.Client, string, error) {
 	vars := []struct{ key, val string }{
 		{"TOOLYARD_CLERK_SECRET_KEY", strings.TrimSpace(os.Getenv("TOOLYARD_CLERK_SECRET_KEY"))},
 		{"TOOLYARD_CLERK_PUBLISHABLE_KEY", strings.TrimSpace(os.Getenv("TOOLYARD_CLERK_PUBLISHABLE_KEY"))},
@@ -163,6 +163,20 @@ func clerkFromEnv(publicURL string) (*clerk.Client, string, error) {
 	for _, v := range vars {
 		if v.val == "" {
 			missing = append(missing, v.key)
+		}
+	}
+	if ownerOnly {
+		if strings.TrimSpace(ownerEmail) == "" {
+			return nil, "", errors.New("clerk: -clerk-owner-only requires -owner-email")
+		}
+		missing = nil
+		for _, v := range vars[:2] {
+			if v.val == "" {
+				missing = append(missing, v.key)
+			}
+		}
+		if len(missing) > 0 {
+			return nil, "", fmt.Errorf("clerk: personal sign-in requires keys; missing: %s", strings.Join(missing, ", "))
 		}
 	}
 	if len(missing) == len(vars) {
@@ -179,11 +193,16 @@ func clerkFromEnv(publicURL string) (*clerk.Client, string, error) {
 	if err != nil || u.Scheme == "" || u.Host == "" {
 		return nil, "", fmt.Errorf("clerk: -public-url %q is not an absolute URL", publicURL)
 	}
+	allowedEmail := ""
+	if ownerOnly {
+		allowedEmail = ownerEmail
+	}
 	c, err := clerk.New(clerk.Config{
-		SecretKey:         vars[0].val,
-		PublishableKey:    vars[1].val,
-		OrganizationID:    vars[2].val,
-		AuthorizedParties: []string{u.Scheme + "://" + u.Host},
+		SecretKey:          vars[0].val,
+		PublishableKey:     vars[1].val,
+		OrganizationID:     vars[2].val,
+		AllowedGoogleEmail: allowedEmail,
+		AuthorizedParties:  []string{u.Scheme + "://" + u.Host},
 	})
 	if err != nil {
 		return nil, "", err
@@ -228,6 +247,7 @@ func runServe(argv []string) error {
 	inLineWait := fs.Duration("in-line-wait", 0, "if non-zero, hold an approval-required call open for up to this long waiting for a human decision before returning the deferred-response envelope. The new default 0s returns the envelope immediately and lets the agent poll via tools.poll_approval or block via tools.wait_for_approval.")
 	approvalTTL := fs.Duration("approval-ttl", 3*time.Hour, "how long a pending approval stays decidable before auto-expiring")
 	publicURL := fs.String("public-url", "", "public origin (e.g. https://toolyard.example.com). When set, enables HSTS, secure cookies, and Origin enforcement.")
+	clerkOwnerOnly := fs.Bool("clerk-owner-only", false, "allow only the verified Google account at -owner-email; disable local password login and organization sync")
 	ownerEmail := fs.String("owner-email", "", "email of the local owner account. The first Clerk (Google) sign-in with this address attaches to the existing password admin instead of creating a new member. Case-insensitive.")
 	clerkSyncEvery := fs.Duration("clerk-sync-interval", time.Hour, "how often to list the Clerk organisation's members and block users who left (sessions revoked, agents stopped). Only runs when the TOOLYARD_CLERK_* env vars are set.")
 	trustedProxies := fs.String("trusted-proxy", "", "comma-separated CIDRs to trust for X-Forwarded-* headers (e.g. 127.0.0.1/32,::1/128,10.0.0.0/8)")
@@ -301,7 +321,7 @@ func runServe(argv []string) error {
 	// vars are set (they come from the systemd EnvironmentFile or .env,
 	// never argv). A partial set, or Clerk without -public-url, refuses to
 	// start rather than run half-configured.
-	clerkClient, clerkFAPI, cerr := clerkFromEnv(*publicURL)
+	clerkClient, clerkFAPI, cerr := clerkFromEnv(*publicURL, *ownerEmail, *clerkOwnerOnly)
 	if cerr != nil {
 		return cerr
 	}
@@ -1072,6 +1092,7 @@ func runServe(argv []string) error {
 		Security:                 secOpts,
 		Access:                   accessSvc,
 		Clerk:                    clerkClient,
+		ClerkOwnerOnly:           *clerkOwnerOnly,
 		OwnerEmail:               *ownerEmail,
 	})
 
@@ -1169,7 +1190,7 @@ func runServe(argv []string) error {
 	// Hourly offboarding: Clerk-linked users who left the org get blocked
 	// (sessions revoked, agents stopped). No-op when Clerk is off; a Clerk
 	// outage changes nothing.
-	if clerkClient != nil {
+	if clerkClient != nil && !*clerkOwnerOnly {
 		apiSrv.StartClerkSync(ctx, *clerkSyncEvery)
 		log.Printf("clerk: org membership sync every %s", clerkSyncEvery.String())
 	}

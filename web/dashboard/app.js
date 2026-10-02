@@ -599,7 +599,7 @@ function viewLogin() {
     el('div', { class: 'card' },
       el('h2', {}, 'toolyard'),
       clerk ? [
-        el('p', { class: 'meta' }, 'Sign in with your Beknown workspace Google account.'),
+        el('p', { class: 'meta' }, cfg.owner_only ? 'Sign in with your personal Google account.' : 'Sign in with your workspace Google account.'),
         el('a', { class: 'btn primary login-google', href: '/login' }, 'Sign in with Google'),
         showForm ? el('div', { class: 'login-or' }, 'or use your toolyard password') : null,
       ] : null,

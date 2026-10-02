@@ -613,3 +613,10 @@ func TestOrgMembers(t *testing.T) {
 		}
 	})
 }
+
+func TestPersonalConfigWithoutOrganization(t *testing.T) {
+	c, err := New(Config{SecretKey: "sk", PublishableKey: testPublishableKey(t, "clerk.example.test"), AllowedGoogleEmail: "owner@example.com", AuthorizedParties: []string{"https://toolyard.example.com"}})
+	if err != nil || c == nil {
+		t.Fatalf("personal config: %v", err)
+	}
+}

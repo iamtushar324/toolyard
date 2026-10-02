@@ -125,8 +125,8 @@
 
   function showDenied() {
     setBody(panel('Access denied', [
-      'This account is not a member of the Beknown workspace.',
-      'Ask an admin to invite you, or sign in with a Beknown workspace account.',
+      'This Google account is not allowed to access toolyard.',
+      'Sign in with the account authorized by the owner.',
     ], [
       actionButton('Try a different account', signOutAndRestart, true),
     ]));
