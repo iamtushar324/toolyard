@@ -156,7 +156,7 @@ func TestPoliciesSetAskRuleToolScope(t *testing.T) {
 		t.Fatal(err)
 	}
 	res = f.setPolicy(t, f.admin, "tool", "alpha.delete_thing", "allow")
-	if !res.IsError || !strings.Contains(textOf(res), "looks destructive") {
+	if !res.IsError || !strings.Contains(textOf(res), "destructive-looking tool(s)") || !strings.Contains(textOf(res), "alpha.delete_thing (deny → allow)") {
 		t.Fatalf("destructive allow: %v %s", res.IsError, textOf(res))
 	}
 	if p, _ := f.gw.policy.Get(policy.ScopeTool, "alpha.delete_thing"); p.Action != "deny" {
@@ -194,8 +194,10 @@ func TestPoliciesSetAskRuleUpstreamScope(t *testing.T) {
 
 	// The whole server into ask: fine, and the read moves allow → ask.
 	sc := mustApply(t, f.setPolicy(t, f.admin, "upstream", "alpha", "ask"))
+	// Two registered tools and the three probes are judged; the read moves
+	// allow → ask, and every ask is now one a person decides.
 	changed, _ := json.Marshal(sc["changed"])
-	if !strings.Contains(string(changed), `{"tool":"alpha.get_status","before":"allow","after":"ask"}`) || sc["affected_tools"] != 2 {
+	if !strings.Contains(string(changed), `{"tool":"alpha.get_status","before":"allow","after":"ask","require_human_after":true}`) || sc["affected_tools"] != 5 {
 		t.Fatalf("upstream ask: changed=%s affected=%v", changed, sc["affected_tools"])
 	}
 	if a, _ := f.gw.Access(ctx, adminID, "alpha.get_status", nil); a != inbox.AccessRestricted {
@@ -296,7 +298,7 @@ func TestPoliciesChangeIsScopedToAdminsAndAudited(t *testing.T) {
 		t.Fatalf("applied row = %+v", applied)
 	}
 	if !strings.Contains(string(applied.Arguments), `"scope":"tool"`) || !strings.Contains(string(applied.Arguments), `"target":"alpha.run"`) ||
-		!strings.Contains(applied.ResultSummary, "policies.set tool alpha.run → ask: 0 of 1 affected tool(s) change") {
+		!strings.Contains(applied.ResultSummary, "policies.set tool alpha.run → ask: 1 of 1 affected tool(s) change") {
 		t.Fatalf("applied row details = %s / %s", applied.Arguments, applied.ResultSummary)
 	}
 	// (The audit redactor re-encodes arguments, so keys come back sorted.)
@@ -493,7 +495,7 @@ func TestServersListIsScopedAndCarriesNoSecrets(t *testing.T) {
 		t.Fatalf("admin servers = %+v", out)
 	}
 	text := textOf(res)
-	if strings.Contains(text, "SECRET") || strings.Contains(text, "api_key") || !strings.Contains(out.Servers[2].Error, "https://mcp.example.com/mcp?… failed: 401 Unauthorized") {
+	if strings.Contains(text, "SECRET") || strings.Contains(text, "api_key") || strings.Contains(text, "/mcp/") || !strings.Contains(out.Servers[2].Error, "POST https://mcp.example.com failed: 401 Unauthorized") {
 		t.Fatalf("error text not sanitised: %s", out.Servers[2].Error)
 	}
 	for _, forbidden := range []string{`"url"`, `"headers"`, `"env"`, `"command"`, `"token"`, "Authorization"} {

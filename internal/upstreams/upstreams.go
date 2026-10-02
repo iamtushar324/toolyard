@@ -325,8 +325,14 @@ func validate(srv Server) error {
 	if strings.ContainsAny(srv.Name, " \t\n.") {
 		return fmt.Errorf("%w: name must not contain spaces or dots", ErrInvalid)
 	}
+	// Names the gateway owns: its synthetic upstreams and built-in groups
+	// (a server by one of these names would share their prefix and access
+	// group) and toolyard, the code-mode server for every internal tool.
+	// Built-ins (mempalace, notes, skills) are registered by startup, not
+	// from the dashboard.
 	switch srv.Name {
-	case "builtin", "fixture", "memory", "tools", "mempalace", "notes", "skills":
+	case "builtin", "fixture", "memory", "tools", "mempalace", "notes", "skills",
+		"inbox", "session", "lake", "events", "policies", "servers", "audit", "access", "toolyard":
 		return ErrReserved
 	}
 	switch srv.Transport {

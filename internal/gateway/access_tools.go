@@ -22,7 +22,6 @@ import (
 	"regexp"
 	"sort"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/mark3labs/mcp-go/mcp"
@@ -68,12 +67,10 @@ func init() {
 	}
 }
 
-// accessToolsState lives on the Gateway (server.go embeds it).
+// accessToolsState lives on the Gateway (server.go embeds it). Agent
+// policy changes are serialised with every other policy write by the
+// engine's own write lock (policy.Engine.Change).
 type accessToolsState struct {
-	// accessMu serialises agent policy changes: the what-if evaluation and
-	// the write happen under it, so two agents cannot each pass the check
-	// against a rule set the other is changing.
-	accessMu     sync.Mutex
 	servers      ServersProvider
 	autoApproval AutoApprovalPolicies
 }
@@ -158,8 +155,9 @@ func (g *Gateway) accessTools() []toolEntry {
 			g.handlePoliciesExplain()),
 		accessEntry("policies.set", policiesUpstream,
 			"Set an explicit policy: allow, ask or deny for one tool (scope tool) or a whole server (scope upstream). Takes effect immediately. "+
-				"Only an admin's agent may change policies. THE RULE: a change may put tools into ask, or move them between allow and deny, but is rejected if it would take ANY affected tool out of ask; "+
-				"only a person on the dashboard can relax an ask. Allowing a destructive-looking tool (delete, remove, drop, …) is refused.",
+				"Only an admin's agent may change policies. THE RULE: a change may put tools into ask, or move them between allow and deny, but is rejected if it would take ANY affected tool out of ask "+
+				"(an ask by policy, where a person must decide, may not become an ask by default either); only a person on the dashboard can relax an ask. "+
+				"allow only lifts a deny on one tool; a server-wide allow, and anything that would open a destructive-looking tool (delete, remove, drop, …), is refused.",
 			obj([]string{"scope", "target", "access"}, map[string]any{
 				"scope":  scopeProp,
 				"target": targetProp,
@@ -223,16 +221,34 @@ func accessWord(a policy.Action) string {
 	return AccessAsk
 }
 
+// accessState is a tool's effective access as the ask rule sees it: the
+// word, and whether an explicit ask policy decided it. That flag is
+// Decision.RequireHuman: the approval bus then skips the learned
+// auto-approval rules, so a person decides. Losing it while the word
+// stays "ask" is a relaxation too.
+type accessState struct {
+	Word  string
+	Human bool
+}
+
+// String is the state as a rejection names it.
+func (s accessState) String() string {
+	if s.Word == AccessAsk && s.Human {
+		return "ask by policy"
+	}
+	return s.Word
+}
+
 // effectiveAccess is a tool's static access under engine: a built-in's
 // forced action, else the engine's decision for a call with no declared
 // intent and no arguments, exactly as routeEntry would start from.
-func effectiveAccess(engine *policy.Engine, t policyTarget) (string, policy.Decision) {
+func effectiveAccess(engine *policy.Engine, t policyTarget) (accessState, policy.Decision) {
 	if t.forced != nil {
 		d := policy.Decision{Action: *t.forced, Reason: "built-in tool policy", RuleID: "builtin-forced-" + string(*t.forced)}
-		return accessWord(d.Action), d
+		return accessState{Word: accessWord(d.Action)}, d
 	}
 	d := engine.Eval(policy.Request{UpstreamName: t.upstream, ToolName: t.name})
-	return accessWord(d.Action), d
+	return accessState{Word: accessWord(d.Action), Human: d.RequireHuman}, d
 }
 
 // explainRule says in plain words which rule decided d.
@@ -266,11 +282,18 @@ func accessPhrase(word string) string {
 	return "needs approval (ask)"
 }
 
+// upstreamProbes are the synthetic tools every upstream-scope change is
+// judged by, beside the tools registered right now: a read (allow by
+// default), a write (ask by default) and a destructive write. They stand
+// for the tools the server does not have yet, or has not re-registered
+// yet (a reconnect loads tools one by one), so a server-wide rule can
+// never be relaxed on the strength of what happens to be loaded.
+var upstreamProbes = []string{"get_probe", "probe", "delete_probe"}
+
 // policyTargets lists the tools a (scope,target) change touches. Tool
 // scope: that tool; an unregistered name is judged by the name alone, as
 // the engine would judge it once it appears. Upstream scope: every tool
-// registered for that upstream; an upstream with none (not connected yet,
-// or a typo) is judged by what its tools would be, one read and one write.
+// registered for that upstream, plus the probes.
 func (g *Gateway) policyTargets(scope, target string) []policyTarget {
 	g.mu.RLock()
 	defer g.mu.RUnlock()
@@ -285,23 +308,111 @@ func (g *Gateway) policyTargets(scope, target string) []policyTarget {
 		return []policyTarget{{name: target, upstream: up}}
 	}
 	var out []policyTarget
+	seen := map[string]bool{}
 	for _, e := range g.tools {
 		if e.upstream == target {
 			out = append(out, targetOf(e))
+			seen[e.tool.Name] = true
 		}
 	}
-	if len(out) == 0 {
-		out = []policyTarget{{name: target + ".get_probe", upstream: target}, {name: target + ".probe", upstream: target}}
+	for _, p := range upstreamProbes {
+		if name := target + "." + p; !seen[name] {
+			out = append(out, policyTarget{name: name, upstream: target})
+		}
 	}
 	sort.Slice(out, func(i, j int) bool { return out[i].name < out[j].name })
 	return out
 }
 
 // policyDelta is one tool whose effective access a change moves.
+// RequireHuman says an explicit ask decided the state.
 type policyDelta struct {
-	Tool   string `json:"tool"`
-	Before string `json:"before"`
-	After  string `json:"after"`
+	Tool               string `json:"tool"`
+	Before             string `json:"before"`
+	After              string `json:"after"`
+	RequireHumanBefore bool   `json:"require_human_before,omitempty"`
+	RequireHumanAfter  bool   `json:"require_human_after,omitempty"`
+}
+
+// errPolicyChangeRejected is what the ask-rule guard returns; the
+// message is the agent's answer.
+type errPolicyChangeRejected struct {
+	msg     string
+	reason  string
+	changes []policyDelta
+}
+
+func (e *errPolicyChangeRejected) Error() string { return e.msg }
+
+// policyChangeGuard is the rule an agent's change must pass, evaluated
+// under the engine's write lock against the engine as it is and as it
+// would be. It returns the per-tool changes and the before states for
+// the audit row, or an *errPolicyChangeRejected naming the tools.
+//
+//   - Out of ask is never allowed: a tool at ask (by default or by
+//     policy) may not end at allow or deny.
+//   - An ask decided by a policy may not become an ask by default: the
+//     word is the same, but a person no longer has to decide (learned
+//     auto-approval rules apply again).
+//   - No destructive-looking tool (delete, remove, drop, …) may be
+//     opened: one that was not allow may not end at allow, whatever
+//     verb and scope got it there.
+//   - A tool-scope allow only lifts a deny. On a tool that already runs
+//     it would change nothing today and pin the tool open against a
+//     later server-wide ask.
+func policyChangeGuard(verb, scope, want string, targets []policyTarget) (
+	guard func(before, after *policy.Engine) error, changes *[]policyDelta, before map[string]string) {
+	changes = &[]policyDelta{}
+	before = map[string]string{}
+	guard = func(cur, next *policy.Engine) error {
+		var leaving, opened []string
+		*changes = (*changes)[:0]
+		for _, t := range targets {
+			b, _ := effectiveAccess(cur, t)
+			a, _ := effectiveAccess(next, t)
+			before[t.name] = b.String()
+			if scope == policy.ScopeTool && want == AccessAllow && b.Word == AccessAllow {
+				return &errPolicyChangeRejected{
+					reason: "allow_only_lifts_deny",
+					msg: fmt.Sprintf("%s rejected: %s is %s already, so an explicit allow would change nothing today and only pin it open against a later server-wide ask. "+
+						"Agents use allow only to lift a deny; leave a tool that runs alone.", verb, t.name, b),
+				}
+			}
+			if b == a {
+				continue
+			}
+			*changes = append(*changes, policyDelta{Tool: t.name, Before: b.Word, After: a.Word, RequireHumanBefore: b.Human, RequireHumanAfter: a.Human})
+			switch {
+			case b.Word == AccessAsk && a.Word != AccessAsk:
+				leaving = append(leaving, fmt.Sprintf("%s (ask → %s)", t.name, a.Word))
+			case b.Word == AccessAsk && b.Human && !a.Human:
+				leaving = append(leaving, fmt.Sprintf("%s (ask by policy → ask by default, where an auto-approval rule may decide)", t.name))
+			}
+			if policy.IsDestructiveName(t.name) && a.Word == AccessAllow && b.Word != AccessAllow {
+				opened = append(opened, fmt.Sprintf("%s (%s → allow)", t.name, b))
+			}
+		}
+		if len(leaving) > 0 {
+			return &errPolicyChangeRejected{
+				reason:  "ask_is_final_for_agents",
+				changes: append([]policyDelta(nil), *changes...),
+				msg: fmt.Sprintf("%s rejected: it would take %d tool(s) out of ask: %s. "+
+					"Agents may put tools into ask, or move them between allow and deny; only a person on the dashboard can relax an ask.",
+					verb, len(leaving), strings.Join(leaving, ", ")),
+			}
+		}
+		if len(opened) > 0 {
+			return &errPolicyChangeRejected{
+				reason:  "destructive_never_opened",
+				changes: append([]policyDelta(nil), *changes...),
+				msg: fmt.Sprintf("%s rejected: it would open %d destructive-looking tool(s) (delete, remove, drop, …): %s. "+
+					"Agents never allow such a tool, by any rule; a person can do it from the dashboard.",
+					verb, len(opened), strings.Join(opened, ", ")),
+			}
+		}
+		return nil
+	}
+	return guard, changes, before
 }
 
 // ---- policies.* -------------------------------------------------------------
@@ -310,11 +421,14 @@ type effectiveRow struct {
 	Tool   string `json:"tool"`
 	Server string `json:"server"`
 	Access string `json:"access"`
-	RuleID string `json:"rule_id"`
-	Rule   string `json:"rule"`
+	// RequireHuman: an explicit ask decided it, so a person must decide
+	// each call (learned auto-approval rules do not apply).
+	RequireHuman bool   `json:"require_human,omitempty"`
+	RuleID       string `json:"rule_id"`
+	Rule         string `json:"rule"`
 }
 
-const policyChangeHint = "An admin's agent can put a tool into ask, or move it between allow and deny, with policies.set; only a person on the dashboard can take a tool out of ask."
+const policyChangeHint = "An admin's agent can put a tool into ask, move it between allow and deny, or lift a deny on one tool with policies.set; only a person on the dashboard can take a tool out of ask, allow a whole server, or open a destructive-looking tool."
 
 func (g *Gateway) handlePoliciesList() directHandler {
 	return func(ctx context.Context, args map[string]any) (*mcp.CallToolResult, error) {
@@ -341,8 +455,8 @@ func (g *Gateway) handlePoliciesList() directHandler {
 			if server != "" && server != e.upstream && server != group {
 				continue
 			}
-			word, d := effectiveAccess(g.policy, targetOf(e))
-			rows = append(rows, effectiveRow{Tool: e.tool.Name, Server: group, Access: word, RuleID: d.RuleID, Rule: explainRule(d)})
+			st, d := effectiveAccess(g.policy, targetOf(e))
+			rows = append(rows, effectiveRow{Tool: e.tool.Name, Server: group, Access: st.Word, RequireHuman: st.Human, RuleID: d.RuleID, Rule: explainRule(d)})
 		}
 		sort.Slice(rows, func(i, j int) bool { return rows[i].Tool < rows[j].Tool })
 
@@ -401,23 +515,26 @@ func (g *Gateway) handlePoliciesExplain() directHandler {
 		if !ok || !g.allowsEntry(ctx, agentIDFromContext(ctx), e) {
 			return notFoundResult(tool), nil
 		}
-		word, d := effectiveAccess(g.policy, targetOf(e))
+		st, d := effectiveAccess(g.policy, targetOf(e))
 		var b strings.Builder
-		fmt.Fprintf(&b, "%s %s: %s.", tool, accessPhrase(word), explainRule(d))
+		fmt.Fprintf(&b, "%s %s: %s.", tool, accessPhrase(st.Word), explainRule(d))
 		switch {
-		case word == AccessAllow && e.forcedAction == nil:
+		case st.Word == AccessAllow && e.forcedAction == nil:
 			b.WriteString(" A call that declares _intent_category write, destructive, external_communication, financial or privileged_admin still needs approval.")
-		case word == AccessAsk:
-			b.WriteString(" In inbox mode, ask your owner with inbox.request; in execute mode the call is queued and runs when a person allows it.")
+		case st.Word == AccessAsk && st.Human:
+			b.WriteString(" In inbox mode, ask your owner with inbox.request; in execute mode the call is queued and runs only when a person allows it (learned auto-approval rules do not apply).")
+		case st.Word == AccessAsk:
+			b.WriteString(" In inbox mode, ask your owner with inbox.request; in execute mode the call is queued and runs when a person, or a learned auto-approval rule, allows it.")
 		}
 		b.WriteString(" " + policyChangeHint)
 		out := map[string]any{
-			"tool":        tool,
-			"server":      access.GroupOf(e.upstream, e.tool.Name),
-			"access":      word,
-			"rule_id":     d.RuleID,
-			"rule":        explainRule(d),
-			"explanation": b.String(),
+			"tool":          tool,
+			"server":        access.GroupOf(e.upstream, e.tool.Name),
+			"access":        st.Word,
+			"require_human": st.Human,
+			"rule_id":       d.RuleID,
+			"rule":          explainRule(d),
+			"explanation":   b.String(),
 		}
 		if p, ok := g.policy.Get(policy.ScopeTool, tool); ok {
 			out["tool_policy"] = p
@@ -456,74 +573,59 @@ func (g *Gateway) changePolicy(ctx context.Context, args map[string]any, clear b
 		return mcp.NewToolResultError("access must be allow, ask or deny"), nil
 	}
 	change := map[string]any{"scope": scope, "target": target, "access": want, "note": note}
-
-	// Policies are global to this toolyard: only an admin's agent changes
-	// them. A member's agent is told so, and the attempt is on record.
-	if !g.scopeFor(ctx, agentID).All {
-		msg := fmt.Sprintf("%s refused: policies apply to every agent on this toolyard, so only an admin's agent may change them, and your owner is a member. "+
-			"Ask an admin, or use policies.explain to tell your owner why a call needs approval.", verb)
+	refuse := func(reasonCode, msg string) (*mcp.CallToolResult, error) {
 		g.auditPolicyChange(ctx, agentID, scope, target, "refused", reason, msg, change, nil)
 		res := mcp.NewToolResultError(msg)
-		res.StructuredContent = map[string]any{"status": "refused", "reason": "admin_only"}
+		res.StructuredContent = map[string]any{"status": "refused", "reason": reasonCode}
 		return res, nil
 	}
 
-	g.accessMu.Lock()
-	defer g.accessMu.Unlock()
+	// Who may change: an enrolled agent (a local unauthenticated caller
+	// and the dashboard's own callers have the Policies page), and only
+	// one whose owner is an admin, since policies are global to this
+	// toolyard. A member's agent is told so, and the attempt is on record.
+	if !enrolledAgent(agentID) {
+		return refuse("agent_required", fmt.Sprintf("%s needs an enrolled agent: connect with an agent token (Authorization: Bearer …). People change policies on the dashboard's Policies page.", verb))
+	}
+	if !g.scopeFor(ctx, agentID).All {
+		return refuse("admin_only", fmt.Sprintf("%s refused: policies apply to every agent on this toolyard, so only an admin's agent may change them, and your owner is a member. "+
+			"Ask an admin, or use policies.explain to tell your owner why a call needs approval.", verb))
+	}
 
-	// What the change does, tool by tool, before anything is written.
+	// What the change does, tool by tool, judged and written under the
+	// engine's write lock so no dashboard edit lands in between.
 	targets := g.policyTargets(scope, target)
-	after := g.policy.WithChange(scope, target, want)
-	var changes []policyDelta
-	var leaving []string
-	before := map[string]string{}
-	for _, t := range targets {
-		b, _ := effectiveAccess(g.policy, t)
-		a, _ := effectiveAccess(after, t)
-		before[t.name] = b
-		if b == a {
-			continue
-		}
-		changes = append(changes, policyDelta{Tool: t.name, Before: b, After: a})
-		if b == AccessAsk {
-			leaving = append(leaving, fmt.Sprintf("%s (ask → %s)", t.name, a))
-		}
-	}
-	change["changes"] = changes
-	if len(leaving) > 0 {
-		msg := fmt.Sprintf("%s rejected: it would take %d tool(s) out of ask: %s. "+
-			"Agents may put tools into ask, or move them between allow and deny; only a person on the dashboard can relax an ask.",
-			verb, len(leaving), strings.Join(leaving, ", "))
-		g.auditPolicyChange(ctx, agentID, scope, target, "rejected", reason, msg, change, changes)
-		res := mcp.NewToolResultError(msg)
-		res.StructuredContent = map[string]any{"status": "rejected", "reason": "ask_is_final_for_agents", "would_leave_ask": changes}
-		return res, nil
-	}
-
-	var pol *policy.ToolPolicy
-	var err error
-	if clear {
-		if _, ok := g.policy.Get(scope, target); !ok {
-			res := mcp.NewToolResultText(fmt.Sprintf("no explicit %s policy for %s; nothing to clear", scope, target))
-			res.StructuredContent = map[string]any{"status": "unchanged", "scope": scope, "target": target}
+	guard, changes, before := policyChangeGuard(verb, scope, want, targets)
+	pol, existed, err := g.policy.Change(ctx, scope, target, want, note, false, guard)
+	change["changes"] = *changes
+	if err != nil {
+		var rej *errPolicyChangeRejected
+		if errors.As(err, &rej) {
+			g.auditPolicyChange(ctx, agentID, scope, target, "rejected", reason, rej.msg, change, rej.changes)
+			res := mcp.NewToolResultError(rej.msg)
+			res.StructuredContent = map[string]any{"status": "rejected", "reason": rej.reason, "would_change": rej.changes}
 			return res, nil
 		}
-		err = g.policy.DeleteTarget(ctx, scope, target)
-	} else {
-		pol, err = g.policy.Set(ctx, scope, target, want, note, false)
-	}
-	if err != nil {
 		msg := verb + " failed: " + err.Error()
 		if errors.Is(err, policy.ErrForceRequired) {
 			msg = fmt.Sprintf("%s refused: %q looks destructive (delete, remove, drop, …) and agents never force-allow such a tool. A person can do it from the dashboard.", verb, target)
 		}
-		g.auditPolicyChange(ctx, agentID, scope, target, "refused", reason, msg, change, changes)
+		g.auditPolicyChange(ctx, agentID, scope, target, "refused", reason, msg, change, *changes)
 		return mcp.NewToolResultError(msg), nil
 	}
-	// Anti-fight, as the dashboard does: an explicit ask or deny on a tool
-	// disables its learned auto-approval rule.
-	if !clear && scope == policy.ScopeTool && want != AccessAllow && g.autoApproval != nil {
-		_ = g.autoApproval.SetToolPolicy(ctx, target, false)
+	if clear && !existed {
+		res := mcp.NewToolResultText(fmt.Sprintf("no explicit %s policy for %s; nothing to clear", scope, target))
+		res.StructuredContent = map[string]any{"status": "unchanged", "scope": scope, "target": target}
+		return res, nil
+	}
+	// Anti-fight, as the dashboard does: an explicit ask or deny disables
+	// the learned auto-approval rule of every tool it covers.
+	if !clear && want != AccessAllow && g.autoApproval != nil {
+		for _, t := range targets {
+			if !strings.HasSuffix(t.name, ".get_probe") && !strings.HasSuffix(t.name, ".probe") && !strings.HasSuffix(t.name, ".delete_probe") {
+				_ = g.autoApproval.SetToolPolicy(ctx, t.name, false)
+			}
+		}
 	}
 
 	decision := want
@@ -534,28 +636,34 @@ func (g *Gateway) changePolicy(ctx context.Context, args map[string]any, clear b
 	if !clear {
 		summary += " → " + want
 	}
-	summary += fmt.Sprintf(": %d of %d affected tool(s) change", len(changes), len(targets))
-	g.auditPolicyChange(ctx, agentID, scope, target, decision, reason, summary, change, changes)
+	summary += fmt.Sprintf(": %d of %d affected tool(s) change", len(*changes), len(targets))
+	g.auditPolicyChange(ctx, agentID, scope, target, decision, reason, summary, change, *changes)
 	if g.hub != nil {
 		raiser := raiserOnCtx(ctx, agentID)
 		g.hub.Publish(realtime.Event{Type: hubEventPolicy, Data: map[string]any{
 			"ts": time.Now().UnixMilli(), "scope": scope, "target": target, "access": decision,
-			"policy": pol, "changes": changes, "agent_id": agentID, "agent_name": raiser.AgentName,
+			"policy": pol, "changes": *changes, "agent_id": agentID, "agent_name": raiser.AgentName,
 			"owner_user_id": raiser.OwnerUserID, "owner_email": raiser.OwnerEmail, "reason": reason,
 		}})
 	}
 	text := summary + "."
-	if len(changes) == 0 {
+	if len(*changes) == 0 {
 		text += " Every affected tool keeps the access it had; the explicit policy is on record."
 	}
 	out := map[string]any{
 		"status": "applied", "scope": scope, "target": target, "access": decision, "message": text,
-		"changed": changes, "affected_tools": len(targets), "before": before,
+		"changed": *changes, "affected_tools": len(targets), "before": before,
 	}
 	if pol != nil {
 		out["policy"] = pol
 	}
 	return inboxJSON(out), nil
+}
+
+// enrolledAgent reports whether callerID is an enrolled agent ("ag_…"), as
+// opposed to a local unauthenticated caller or a dashboard/voice session.
+func enrolledAgent(callerID string) bool {
+	return strings.HasPrefix(callerID, "ag_") && len(callerID) > len("ag_")
 }
 
 // auditPolicyChange records who asked for what and what it did to every
@@ -608,13 +716,16 @@ func (g *Gateway) ownerOf(ctx context.Context, callerID string) string {
 	return ""
 }
 
-var queryStringRE = regexp.MustCompile(`\?[^\s"']*`)
+// urlRE matches a URL: scheme, optional userinfo, host (with port), and
+// the rest up to whitespace, leaving trailing punctuation (": refused",
+// "." at a sentence end) to the surrounding text.
+var urlRE = regexp.MustCompile(`([A-Za-z][A-Za-z0-9+.\-]*://)(?:[^\s/@"'<>]*@)?([^\s/?#"'<>]+)(?:[^\s"'<>:.,;)]|[:.,;)]+[^\s"'<>:.,;)])*`)
 
-// sanitizeServerError shortens a connection error for an agent: query
-// strings (where a key would sit) are dropped, the redactor runs, and the
-// text is capped.
+// sanitizeServerError shortens a connection error for an agent: every URL
+// is reduced to scheme://host (no userinfo, path, query or fragment, where
+// a key or token would sit), the redactor runs, and the text is capped.
 func sanitizeServerError(s string) string {
-	s = strings.TrimSpace(queryStringRE.ReplaceAllString(s, "?…"))
+	s = strings.TrimSpace(urlRE.ReplaceAllString(s, "${1}${2}"))
 	s = audit.RedactString(s)
 	if rs := []rune(s); len(rs) > 240 {
 		s = string(rs[:237]) + "…"
@@ -702,10 +813,15 @@ func (g *Gateway) handleServersReconnect() directHandler {
 		if name == "" {
 			return mcp.NewToolResultError("server is required"), nil
 		}
-		if !g.scopeFor(ctx, agentID).All {
-			msg := "servers.reconnect refused: only an admin's agent may reconnect a server, and your owner is a member. Tell your owner the server's status from servers.list instead."
+		refuse := func(msg string) (*mcp.CallToolResult, error) {
 			_ = g.audit.Write(ctx, audit.Event{EventType: EventServerReconnect, AgentID: agentID, UpstreamName: name, Decision: "refused", Reason: reason, ResultSummary: msg})
 			return mcp.NewToolResultError(msg), nil
+		}
+		if !enrolledAgent(agentID) {
+			return refuse("servers.reconnect needs an enrolled agent: connect with an agent token (Authorization: Bearer …). People reconnect servers on the dashboard's Servers page.")
+		}
+		if !g.scopeFor(ctx, agentID).All {
+			return refuse("servers.reconnect refused: only an admin's agent may reconnect a server, and your owner is a member. Tell your owner the server's status from servers.list instead.")
 		}
 		if g.servers == nil {
 			return mcp.NewToolResultError("servers.reconnect is not available on this gateway (no upstream service wired)"), nil
