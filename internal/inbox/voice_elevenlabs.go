@@ -62,11 +62,24 @@ func (v *ElevenLabsVoice) Speak(ctx context.Context, script string) ([]byte, str
 	if strings.TrimSpace(script) == "" || len(script) > 5000 {
 		return nil, "", errors.New("invalid voice-note script length")
 	}
-	body, err := json.Marshal(map[string]string{"text": script, "model_id": voiceSetting(v.model, DefaultElevenLabsModel)})
+	model := voiceSetting(v.model, DefaultElevenLabsModel)
+	endpoint := "/v1/text-to-speech/" + url.PathEscape(name)
+	var payload any = map[string]string{"text": script, "model_id": model}
+	switch model {
+	case "eleven_v4":
+		if len(script) > 2000 {
+			return nil, "", errors.New("Eleven v4 inbox scripts must stay under 2000 bytes")
+		}
+		endpoint = "/v1/text-to-dialogue"
+		payload = map[string]any{"model_id": model, "inputs": []map[string]string{{"text": script, "voice_id": name}}}
+	case "eleven_v4_turbo":
+		return nil, "", errors.New("Eleven v4 Turbo requires the realtime API; use eleven_v4 for inbox notes")
+	}
+	body, err := json.Marshal(payload)
 	if err != nil {
 		return nil, "", err
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, v.baseURL+"/v1/text-to-speech/"+url.PathEscape(name)+"?output_format=mp3_44100_128", bytes.NewReader(body))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, v.baseURL+endpoint+"?output_format=mp3_44100_128", bytes.NewReader(body))
 	if err != nil {
 		return nil, "", errors.New("could not create ElevenLabs request")
 	}

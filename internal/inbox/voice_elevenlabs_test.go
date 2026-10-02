@@ -137,3 +137,40 @@ func TestElevenLabsRecordingAndAvailability(t *testing.T) {
 	}
 	f.Close()
 }
+
+func TestElevenV4UsesDialogueAPI(t *testing.T) {
+	calls := 0
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		calls++
+		var body struct {
+			Model  string `json:"model_id"`
+			Inputs []struct {
+				Text  string `json:"text"`
+				Voice string `json:"voice_id"`
+			} `json:"inputs"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Error(err)
+		}
+		if r.URL.Path != "/v1/text-to-dialogue" || r.URL.Query().Get("output_format") != "mp3_44100_128" || body.Model != "eleven_v4" || len(body.Inputs) != 1 || body.Inputs[0].Text != "Your inbox update is ready." || body.Inputs[0].Voice != "custom_voice" {
+			t.Errorf("wrong v4 request: %+v", body)
+		}
+		w.Header().Set("Content-Type", "audio/mpeg")
+		_, _ = w.Write([]byte("ID3-v4"))
+	}))
+	defer ts.Close()
+	model := "eleven_v4"
+	v := NewElevenLabsVoice(func() string { return "test-key" }, func() string { return "custom_voice" }, func() string { return model })
+	v.baseURL = ts.URL
+	b, ct, err := v.Speak(context.Background(), "Your inbox update is ready.")
+	if err != nil || string(b) != "ID3-v4" || ct != "audio/mpeg" || calls != 1 {
+		t.Fatalf("v4 synthesis: %v", err)
+	}
+	if _, _, err := v.Speak(context.Background(), strings.Repeat("a", 2001)); err == nil || calls != 1 {
+		t.Fatal("oversized v4 input sent")
+	}
+	model = "eleven_v4_turbo"
+	if _, _, err := v.Speak(context.Background(), "script"); err == nil || calls != 1 {
+		t.Fatal("realtime model sent to batch API")
+	}
+}

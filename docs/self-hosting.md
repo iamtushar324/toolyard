@@ -337,4 +337,10 @@ falls back to browser speech, with a timeline note for failed attempts. It never
 automatically sends a script to another cloud provider. The existing Gemini
 provider and its voice settings remain available.
 
+For Eleven v4, enter `eleven_v4` in Speech model. Toolyard sends one text/voice
+pair to the Text to Dialogue API (up to 2,000 bytes per note). `eleven_v4_turbo`
+requires realtime WebSocket synthesis and is not supported for these recordings.
+Shared-library voices may need to be added to your ElevenLabs account first.
+
 API: https://elevenlabs.io/docs/api-reference/text-to-speech/convert
+v4 API: https://elevenlabs.io/docs/api-reference/text-to-dialogue/convert
