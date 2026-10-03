@@ -82,3 +82,17 @@ func TestConnectAZPTailnetAndWildcard(t *testing.T) {
 		}
 	}
 }
+
+// TestConnectAZPRefusesPublicSuffixesAndBadNames: wildcards on a public
+// suffix, trailing dots, empty labels and malformed tailnet names are
+// startup errors.
+func TestConnectAZPRefusesPublicSuffixesAndBadNames(t *testing.T) {
+	for _, raw := range []string{
+		"https://*.co.uk", "https://*.github.io", "https://*.ts.net", "https://*.com.",
+		"https://*.a..beknown.live", "tailnet:http://x.ts.net", "tailnet:*.ts.net", "tailnet: x .ts.net",
+	} {
+		if got, err := connectAZP(raw, "https://toolyard.dev.beknown.live", true); err == nil {
+			t.Errorf("connectAZP(%q) = %q, want error", raw, got)
+		}
+	}
+}

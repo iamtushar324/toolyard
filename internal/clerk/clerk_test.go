@@ -847,3 +847,27 @@ func TestVerifySessionTokenForWildcardNeverAdmitsDashboard(t *testing.T) {
 		t.Fatalf("dashboard sign-in admitted a connect origin: %v", err)
 	}
 }
+
+// TestPartiesDropMalformedEntries: a malformed or too-wide entry is
+// dropped, never widened: no IP match from a broken tailnet entry, no
+// public-suffix or trailing-dot wildcard.
+func TestPartiesDropMalformedEntries(t *testing.T) {
+	for _, e := range []string{"tailnet:beknown.live", "tailnet:http://x.ts.net", "https://*.com", "https://*.github.io", "https://*.live."} {
+		p := newParties([]string{e})
+		for _, azp := range []string{"http://100.65.42.49:3000", "https://evil.live.", "https://x.github.io", "https://x.com"} {
+			if p.allows(azp) {
+				t.Errorf("entry %q admitted %q", e, azp)
+			}
+		}
+	}
+}
+
+// TestVerifySessionTokenForDashboardHostAnyPort: the dashboard's host is
+// refused through a wildcard even with an explicit port.
+func TestVerifySessionTokenForDashboardHostAnyPort(t *testing.T) {
+	f := newFakeClerk(t)
+	c := f.client(t)
+	if _, err := c.VerifySessionTokenFor(context.Background(), f.token(jwt.MapClaims{"azp": "https://toolyard.example.com:443"}, f.kid), []string{"https://*.example.com"}); !errors.Is(err, ErrInvalidToken) {
+		t.Fatalf("dashboard host with a port admitted: %v", err)
+	}
+}

@@ -33,12 +33,9 @@ func connectAZP(raw, publicURL string, clerkOn bool) ([]string, error) {
 		if part == "" {
 			continue
 		}
-		if name, ok := strings.CutPrefix(strings.ToLower(part), clerk.TailnetPartyPrefix); ok {
-			name = strings.Trim(name, ".")
-			labels := strings.Split(name, ".")
-			// Only a tailnet name (<tailnet>.ts.net): a wider suffix such as
-			// a company domain would admit every host under it.
-			if !strings.HasSuffix(name, ".ts.net") || len(labels) != 3 || labels[0] == "" {
+		if strings.HasPrefix(strings.ToLower(part), clerk.TailnetPartyPrefix) {
+			name, ok := clerk.ParseTailnetParty(part)
+			if !ok {
 				return nil, fmt.Errorf("-connect-azp: %q must name one tailnet, like tailnet:example-tailnet.ts.net", part)
 			}
 			o := clerk.TailnetPartyPrefix + name
@@ -49,14 +46,11 @@ func connectAZP(raw, publicURL string, clerkOn bool) ([]string, error) {
 			continue
 		}
 		if strings.Contains(part, "*") {
-			// A domain wildcard: https://*.<domain> only, and the domain must
-			// have at least two labels (never *.com or *.co).
-			scheme, rest, _ := strings.Cut(strings.ToLower(part), "://")
-			domain, ok := strings.CutPrefix(rest, "*.")
-			domain = strings.TrimRight(domain, "/")
-			if scheme != "https" || !ok || strings.ContainsAny(domain, "/:@?#*") ||
-				len(strings.Split(domain, ".")) < 2 || strings.HasPrefix(domain, ".") {
-				return nil, fmt.Errorf("-connect-azp: %q must be a wildcard like https://*.example.com (https only)", part)
+			// A domain wildcard: https://*.<domain>, where the domain is a
+			// registrable domain or below one (never a public suffix).
+			_, domain, ok := clerk.ParseWildcardParty(part)
+			if !ok {
+				return nil, fmt.Errorf("-connect-azp: %q must be a wildcard like https://*.example.com (https only, no public suffix)", part)
 			}
 			o := "https://*." + domain
 			if !seen[o] {

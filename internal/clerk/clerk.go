@@ -28,6 +28,7 @@ import (
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
+	"golang.org/x/net/publicsuffix"
 )
 
 var (
@@ -262,32 +263,59 @@ type parties struct {
 
 type wildcardParty struct{ scheme, suffix string }
 
-// parseWildcardParty reads "scheme://*.domain" (no port, path or
-// credentials); ok is false for anything else.
-func parseWildcardParty(e string) (wildcardParty, bool) {
-	scheme, rest, ok := strings.Cut(e, "://")
-	if !ok || (scheme != "https" && scheme != "http") {
-		return wildcardParty{}, false
+var tailnetNameRE = regexp.MustCompile(`^[a-z0-9-]+\.ts\.net$`)
+
+// ParseTailnetParty reads "tailnet:<name>.ts.net"; name is the lowercase
+// tailnet name, ok false for anything else (including ts.net itself).
+func ParseTailnetParty(e string) (name string, ok bool) {
+	rest, ok := strings.CutPrefix(strings.ToLower(strings.TrimSpace(e)), TailnetPartyPrefix)
+	if !ok || !tailnetNameRE.MatchString(rest) {
+		return "", false
 	}
-	suffix, ok := strings.CutPrefix(rest, "*.")
-	if !ok || suffix == "" || strings.ContainsAny(suffix, "/:@?#*") {
-		return wildcardParty{}, false
+	return rest, true
+}
+
+// ParseWildcardParty reads "https://*.<domain>": https only, no port, path
+// or credentials, no empty label or trailing dot, and the domain must be
+// a registrable domain or below one (never a public suffix such as
+// co.uk, github.io or ts.net). ok is false for anything else.
+func ParseWildcardParty(e string) (scheme, domain string, ok bool) {
+	e = strings.ToLower(strings.TrimRight(strings.TrimSpace(e), "/"))
+	scheme, rest, found := strings.Cut(e, "://")
+	if !found || scheme != "https" {
+		return "", "", false
 	}
-	return wildcardParty{scheme: scheme, suffix: suffix}, true
+	domain, found = strings.CutPrefix(rest, "*.")
+	if !found || domain == "" || strings.ContainsAny(domain, "/:@?#*\\% ") {
+		return "", "", false
+	}
+	for _, label := range strings.Split(domain, ".") {
+		if label == "" {
+			return "", "", false
+		}
+	}
+	etld1, err := publicsuffix.EffectiveTLDPlusOne(domain)
+	if err != nil || (domain != etld1 && !strings.HasSuffix(domain, "."+etld1)) {
+		return "", "", false
+	}
+	return scheme, domain, true
 }
 
 func newParties(entries []string) parties {
 	p := parties{exact: map[string]bool{}}
 	for _, e := range entries {
 		e = NormalizeOrigin(e)
-		if suffix, ok := strings.CutPrefix(e, TailnetPartyPrefix); ok {
-			if suffix = strings.Trim(suffix, "."); suffix != "" {
-				p.tailnets = append(p.tailnets, suffix)
+		if strings.HasPrefix(e, TailnetPartyPrefix) {
+			// Malformed tailnet entries are dropped, never widened.
+			if name, ok := ParseTailnetParty(e); ok {
+				p.tailnets = append(p.tailnets, name)
 			}
 			continue
 		}
-		if w, ok := parseWildcardParty(e); ok {
-			p.wildcards = append(p.wildcards, w)
+		if strings.Contains(e, "*") {
+			if scheme, domain, ok := ParseWildcardParty(e); ok {
+				p.wildcards = append(p.wildcards, wildcardParty{scheme: scheme, suffix: domain})
+			}
 			continue
 		}
 		if e != "" {
@@ -353,9 +381,20 @@ func (c *Client) VerifySessionToken(ctx context.Context, token string) (Claims, 
 // tokenLeeway), and no aud claim at all.
 func (c *Client) VerifySessionTokenFor(ctx context.Context, token string, authorizedParties []string) (Claims, error) {
 	allowed := newParties(authorizedParties)
-	// The dashboard's own origins never pass here, even when a tailnet
-	// entry would cover them.
-	claims, sc, err := c.verify(ctx, token, func(azp string) bool { return !c.azp[azp] && allowed.allows(azp) })
+	// The dashboard's own hosts never pass here, on any scheme or port,
+	// even when a tailnet or wildcard entry would cover them.
+	dashboardHosts := map[string]bool{}
+	for o := range c.azp {
+		if u, err := url.Parse(o); err == nil && u.Hostname() != "" {
+			dashboardHosts[strings.ToLower(u.Hostname())] = true
+		}
+	}
+	claims, sc, err := c.verify(ctx, token, func(azp string) bool {
+		if u, err := url.Parse(azp); err == nil && dashboardHosts[strings.ToLower(u.Hostname())] {
+			return false
+		}
+		return !c.azp[azp] && allowed.allows(azp)
+	})
 	if err != nil {
 		return Claims{}, err
 	}
