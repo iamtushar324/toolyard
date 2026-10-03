@@ -15,7 +15,13 @@ import (
 // swaps for the person's agent token. Each must be an https origin with
 // no path, query or credentials (plain http only on loopback, for local
 // testing); they come back normalised the way the
-// clerk package compares azp (lowercase, no trailing slash). Empty means
+// clerk package compares azp (lowercase, no trailing slash). An entry
+// "tailnet:<name>.ts.net" admits a whole Tailscale tailnet instead: any
+// http or https origin, any port, on a host under that name or a
+// Tailscale address (see clerk.TailnetPartyPrefix); "https://*.<domain>"
+// admits any https origin under that domain. The Clerk checks
+// (signature, freshness, org membership) still apply, and the
+// dashboard's own origin never passes. Empty means
 // the endpoint is off. Set without Clerk sign-in, or naming the
 // dashboard's own origin (-public-url), is a startup error: dashboard
 // tokens must never connect.
@@ -25,6 +31,32 @@ func connectAZP(raw, publicURL string, clerkOn bool) ([]string, error) {
 	for _, part := range strings.Split(raw, ",") {
 		part = strings.TrimSpace(part)
 		if part == "" {
+			continue
+		}
+		if strings.HasPrefix(strings.ToLower(part), clerk.TailnetPartyPrefix) {
+			name, ok := clerk.ParseTailnetParty(part)
+			if !ok {
+				return nil, fmt.Errorf("-connect-azp: %q must name one tailnet, like tailnet:example-tailnet.ts.net", part)
+			}
+			o := clerk.TailnetPartyPrefix + name
+			if !seen[o] {
+				seen[o] = true
+				out = append(out, o)
+			}
+			continue
+		}
+		if strings.Contains(part, "*") {
+			// A domain wildcard: https://*.<domain>, where the domain is a
+			// registrable domain or below one (never a public suffix).
+			_, domain, ok := clerk.ParseWildcardParty(part)
+			if !ok {
+				return nil, fmt.Errorf("-connect-azp: %q must be a wildcard like https://*.example.com (https only, no public suffix)", part)
+			}
+			o := "https://*." + domain
+			if !seen[o] {
+				seen[o] = true
+				out = append(out, o)
+			}
 			continue
 		}
 		u, err := url.Parse(part)
