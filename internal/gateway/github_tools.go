@@ -170,6 +170,11 @@ func (g *Gateway) prepareGitHub(ctx context.Context, entry toolEntry, args map[s
 		return err
 	}
 	if !entry.requireHuman {
+		owner, err := g.ownerUser(ctx, agentIDFromContext(ctx))
+		if err != nil || owner == "" {
+			return errors.New("GitHub requires an agent with a user owner")
+		}
+		args[approval.PersonalGitHubField] = map[string]any{"owner_user_id": owner}
 		return nil
 	}
 	g.mu.RLock()

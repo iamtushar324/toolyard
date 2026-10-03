@@ -42,6 +42,9 @@ func Unauthorized(err error) bool {
 // Do does not retry writes. Response errors omit provider bodies, which can
 // contain submitted text or credentials. Redirects never carry the bearer.
 func (c *Client) Do(ctx context.Context, method, path string, body any, out any) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if c.token == "" || !strings.HasPrefix(path, "/") || strings.HasPrefix(path, "//") {
 		return errors.New("GitHub requires a user connection and a relative API path")
 	}

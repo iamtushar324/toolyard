@@ -274,3 +274,52 @@ func TestGitHubInlineCommentBindsCommitAndLine(t *testing.T) {
 		t.Fatal("inline comment lost its approved location")
 	}
 }
+
+func TestGitHubApprovalCannotExpireWhileWaitingToWrite(t *testing.T) {
+	f, _, h, alice, _ := githubFixture(t)
+	f.bus.SetTTL(500 * time.Millisecond)
+	r := githubPending(t, f, alice, "create_pull_request_comment")
+	// Simulate another GitHub write occupying the serialized write path.
+	f.gw.githubWriteMu.Lock()
+	if _, err := f.bus.DecideAs(context.Background(), r.ID, approval.StatusAllowed, actor.Decider{UserID: "alice", Via: actor.ViaDashboard}); err != nil {
+		f.gw.githubWriteMu.Unlock()
+		t.Fatal(err)
+	}
+	time.Sleep(600 * time.Millisecond)
+	f.gw.githubWriteMu.Unlock()
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		out, _ := f.bus.Get(context.Background(), r.ID)
+		if out.ResultExecutedAt > 0 {
+			if !out.ResultIsError || h.posts != 0 {
+				t.Fatal("expired queued write executed")
+			}
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatal("expired request did not finish")
+}
+
+func TestGitHubRestrictedReadsKeepResultsPrivate(t *testing.T) {
+	f, _, _, alice, bob := githubFixture(t)
+	if _, err := f.gw.policy.Set(context.Background(), policy.ScopeTool, "github.get_pull_request", "ask", "", false); err != nil {
+		t.Fatal(err)
+	}
+	f.gw.approvalMode = func() string { return ApprovalModeInbox }
+	args := githubCallArgs()
+	delete(args, "body")
+	res := f.call(t, alice, "github.get_pull_request", args)
+	if res.IsError {
+		t.Fatal(res)
+	}
+	rows, _ := f.bus.ListPending(context.Background())
+	if len(rows) != 1 || rows[0].PersonalOwner() != "alice" {
+		t.Fatal("restricted read lost its owner")
+	}
+	r, _ := f.bus.Get(context.Background(), rows[0].ID)
+	out := githubDecide(t, f, r)
+	if out.ResultIsError || f.gw.approvalVisible(bob, out) {
+		t.Fatal("restricted read exposed its result")
+	}
+}

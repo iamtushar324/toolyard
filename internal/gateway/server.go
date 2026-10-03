@@ -1201,9 +1201,13 @@ func (g *Gateway) routeEntry(ctx context.Context, entry toolEntry, via string, a
 		decision.RequireHuman = true
 	}
 
+	if entry.personalGitHub && decision.Action == policy.ActionApprove {
+		decision.RequireHuman = true
+	}
+
 	// A grant only matters for calls that would otherwise need approval:
 	// an explicit deny still wins, and an open tool doesn't use one up.
-	if !entry.requireHuman && grantToken != "" && decision.Action == policy.ActionApprove && g.inbox != nil {
+	if !entry.personalGitHub && grantToken != "" && decision.Action == policy.ActionApprove && g.inbox != nil {
 		return g.redeemAndDispatch(ctx, entry, cleanArgs, agentID, reason, grantToken, &ev)
 	}
 
@@ -1240,7 +1244,7 @@ func (g *Gateway) routeEntry(ctx context.Context, entry toolEntry, via string, a
 	case policy.ActionApprove:
 		// Inbox mode needs an agent identity: grants are bound to it.
 		// Anonymous callers keep the legacy flow.
-		if !entry.requireHuman && g.inboxMode() && agentID != "" {
+		if !entry.personalGitHub && g.inboxMode() && agentID != "" {
 			return g.coach(ctx, entry, cleanArgs, agentID, reason, &ev), nil
 		}
 		return g.holdAndWait(ctx, entry, cleanArgs, agentID, reason, intent, decision.RequireHuman, &ev)
@@ -2051,6 +2055,11 @@ func (g *Gateway) Execute(ctx context.Context, req *approval.Request) {
 	// connect link minted here would sit in a row admins and operator
 	// tokens can read. Refusals name the dashboard instead.
 	execCtx := WithoutConnectLinks(actor.WithRaiser(WithAgentID(ctx, req.AgentID), raiser))
+	if req.PersonalOwner() != "" {
+		var cancel context.CancelFunc
+		execCtx, cancel = context.WithDeadline(execCtx, time.UnixMilli(req.ExpiresAt))
+		defer cancel()
+	}
 
 	// Build a metrics.Event and run dispatch directly. The original
 	// routeEntry already evaluated policy and consumed the human's

@@ -784,7 +784,7 @@ function renderApprovalBatch(agentKey, items) {
         a.reason || '(none provided)'),
       el('details', {},
         el('summary', {}, 'arguments'),
-        a.arguments && a.arguments._toolyard_github ? el('p', { class: 'meta' }, 'GitHub account: ' + a.arguments._toolyard_github.github_login + ' · Commit: ' + a.arguments._toolyard_github.head_sha.slice(0, 12)) : null,
+        a.arguments && a.arguments._toolyard_github && a.arguments._toolyard_github.github_login && a.arguments._toolyard_github.head_sha ? el('p', { class: 'meta' }, 'GitHub account: ' + a.arguments._toolyard_github.github_login + ' · Commit: ' + a.arguments._toolyard_github.head_sha.slice(0, 12)) : null,
         renderArgs(a.arguments),
       ),
       el('div', { class: 'row', style: 'margin-top: 8px;' },
