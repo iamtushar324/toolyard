@@ -178,6 +178,7 @@ func shortID(id string) string {
 // SubmitResult is what the agent gets back from inbox.request/ask/post.
 type SubmitResult struct {
 	OK        bool       `json:"ok"`
+	Replayed  bool       `json:"replayed,omitempty"`
 	DryRun    bool       `json:"dry_run,omitempty"`
 	RequestID string     `json:"request_id,omitempty"`
 	Status    string     `json:"status,omitempty"`
@@ -208,6 +209,23 @@ type Preview struct {
 func (s *Service) Submit(ctx context.Context, agentID string, sub *Submission) (*SubmitResult, error) {
 	if sub.Kind == "" {
 		sub.Kind = KindAccess
+	}
+	var hash string
+	if sub.IdempotencyKey != "" && !sub.DryRun {
+		// Normalize without consulting mutable catalog permissions. A retry
+		// returns the existing request even if permissions have since changed.
+		// New submissions still pass the full authorization checks below.
+		canonical, problems, _ := Validate(ctx, nil, agentID, sub, ValidateOptions{AllowPrivateMedia: s.opts.AllowPrivateMedia})
+		if len(problems) == 0 {
+			var err error
+			hash, err = submissionHash(canonical)
+			if err != nil {
+				return nil, err
+			}
+		}
+		if replay, err := s.replaySubmission(ctx, agentID, sub.IdempotencyKey, hash); replay != nil || err != nil {
+			return replay, err
+		}
 	}
 	r, probs, warns := Validate(ctx, s.opts.Catalog, agentID, sub, ValidateOptions{AllowPrivateMedia: s.opts.AllowPrivateMedia})
 	r.AgentID = agentID
@@ -266,6 +284,11 @@ func (s *Service) Submit(ctx context.Context, agentID string, sub *Submission) (
 			return nil, err
 		}
 		if n >= MaxPendingPerAgent {
+			if sub.IdempotencyKey != "" {
+				if replay, err := s.replaySubmission(ctx, agentID, sub.IdempotencyKey, hash); replay != nil || err != nil {
+					return replay, err
+				}
+			}
 			return nil, ErrTooManyPending
 		}
 	}
@@ -290,14 +313,17 @@ func (s *Service) Submit(ctx context.Context, agentID string, sub *Submission) (
 	if r.Downgraded != "" {
 		r.addActivity(r.CreatedAt, "Urgency lowered from now to soon: "+r.Downgraded)
 	}
-	if err := s.insert(ctx, r); err != nil {
+	inserted, err := s.insert(ctx, r, sub.IdempotencyKey, hash)
+	if err != nil {
 		return nil, err
+	}
+	if !inserted {
+		return s.replaySubmission(ctx, agentID, sub.IdempotencyKey, hash)
 	}
 	s.heartbeat(ctx, r.SessionID)
 	res.OK, res.RequestID, res.Status, res.ExpiresAt = true, r.ID, r.Status, r.ExpiresAt
 
 	s.publish("inbox", s.cardView(ctx, r))
-	s.enqueueArrival(ctx, r)
 	if r.Urgency == UrgencyNow {
 		// Don't wait for the next tick for the one urgency that means it,
 		// and don't hold the agent's call while the push goes out.
@@ -1210,15 +1236,32 @@ func (s *Service) RunSweeper(ctx context.Context, every time.Duration) {
 
 // ---- storage ---------------------------------------------------------------------
 
-func (s *Service) insert(ctx context.Context, r *Request) error {
+func (s *Service) insert(ctx context.Context, r *Request, key, hash string) (bool, error) {
 	doc, err := json.Marshal(r)
 	if err != nil {
-		return err
+		return false, err
 	}
-	_, err = s.db.ExecContext(ctx, `INSERT INTO inbox_requests(id, agent_id, session_id, kind, status, urgency, related_id, doc, created_at, updated_at, expires_at)
-		VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
-		r.ID, r.AgentID, nullStr(r.SessionID), r.Kind, r.Status, r.Urgency, nullStr(r.RelatedID), string(doc), r.CreatedAt, r.UpdatedAt, r.ExpiresAt)
-	return err
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	result, err := tx.ExecContext(ctx, `INSERT INTO inbox_requests(id, agent_id, session_id, kind, status, urgency, related_id, doc, created_at, updated_at, expires_at, idempotency_key, submission_hash)
+		VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(agent_id, idempotency_key) DO NOTHING`,
+		r.ID, r.AgentID, nullStr(r.SessionID), r.Kind, r.Status, r.Urgency, nullStr(r.RelatedID), string(doc), r.CreatedAt, r.UpdatedAt, r.ExpiresAt, nullStr(key), nullStr(hash))
+	if err != nil {
+		return false, err
+	}
+	n, err := result.RowsAffected()
+	if err != nil || n == 0 {
+		return false, err
+	}
+	// Commit the notification with the request: after a lost response or a
+	// crash, replay must not leave a durable request without an arrival push.
+	if err := s.enqueueArrival(ctx, tx, r); err != nil {
+		return false, err
+	}
+	return true, tx.Commit()
 }
 
 func (s *Service) mutate(ctx context.Context, id string, fn func(*Request) error) error {

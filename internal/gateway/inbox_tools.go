@@ -327,8 +327,9 @@ var (
 		"description": "The voice note your owner hears first. At most 75 words, first person, written to be heard: no IDs, hashes or URLs.",
 		"properties":  map[string]any{"script": map[string]any{"type": "string"}},
 	}
-	schemaUrgency     = map[string]any{"type": "string", "enum": []string{"now", "soon", "digest", "fyi"}}
-	schemaAttachments = map[string]any{
+	schemaUrgency        = map[string]any{"type": "string", "enum": []string{"now", "soon", "digest", "fyi"}}
+	schemaIdempotencyKey = map[string]any{"type": "string", "minLength": 1, "maxLength": inbox.MaxIdempotencyKey, "description": "Optional retry key scoped to your agent. Reuse the key and the same payload to recover the original record. A changed payload conflicts. Dry runs do not reserve keys."}
+	schemaAttachments    = map[string]any{
 		"type":     "array",
 		"maxItems": inbox.MaxAttachments,
 		"description": "Evidence, shown before the decision. Send data where you can: markdown{body}, table{title,columns,rows}, " +
@@ -346,14 +347,15 @@ var (
 	}
 	commonProps = func() map[string]any {
 		return map[string]any{
-			"title":       map[string]any{"type": "string", "maxLength": inbox.MaxTitle, "description": "Verb + object + target, ≤60 characters."},
-			"summary":     map[string]any{"type": "string", "maxLength": inbox.MaxSummary, "description": "One line for the inbox card, ≤200 characters."},
-			"message":     map[string]any{"type": "string", "description": "First person: what you want and why."},
-			"audio":       schemaAudio,
-			"urgency":     schemaUrgency,
-			"attachments": schemaAttachments,
-			"session_id":  map[string]any{"type": "string", "description": "From session.start (optional)."},
-			"dry_run":     map[string]any{"type": "boolean", "description": "Check the request and see its flags without sending it."},
+			"idempotency_key": schemaIdempotencyKey,
+			"title":           map[string]any{"type": "string", "maxLength": inbox.MaxTitle, "description": "Verb + object + target, ≤60 characters."},
+			"summary":         map[string]any{"type": "string", "maxLength": inbox.MaxSummary, "description": "One line for the inbox card, ≤200 characters."},
+			"message":         map[string]any{"type": "string", "description": "First person: what you want and why."},
+			"audio":           schemaAudio,
+			"urgency":         schemaUrgency,
+			"attachments":     schemaAttachments,
+			"session_id":      map[string]any{"type": "string", "description": "From session.start (optional)."},
+			"dry_run":         map[string]any{"type": "boolean", "description": "Check the request and see its flags without sending it."},
 		}
 	}
 )
@@ -547,10 +549,11 @@ func (g *Gateway) inboxTools() []toolEntry {
 		inboxEntry("session.start", sessionUpstream,
 			"Name the piece of work you're doing, so your owner can see it among their other agents. Pass the returned session_id on your inbox requests.",
 			obj([]string{"title"}, map[string]any{
-				"title":  map[string]any{"type": "string", "description": "What you're working on, as a person would say it."},
-				"repo":   map[string]any{"type": "string"},
-				"branch": map[string]any{"type": "string"},
-				"host":   map[string]any{"type": "string", "description": "Where you're running, e.g. laptop, cloud, ci."},
+				"idempotency_key": schemaIdempotencyKey,
+				"title":           map[string]any{"type": "string", "description": "What you're working on, as a person would say it."},
+				"repo":            map[string]any{"type": "string"},
+				"branch":          map[string]any{"type": "string"},
+				"host":            map[string]any{"type": "string", "description": "Where you're running, e.g. laptop, cloud, ci."},
 			}),
 			func(ctx context.Context, args map[string]any) (*mcp.CallToolResult, error) {
 				agentID, errRes := requireAgentID(ctx)
@@ -561,7 +564,11 @@ func (g *Gateway) inboxTools() []toolEntry {
 				repo, _ := args["repo"].(string)
 				branch, _ := args["branch"].(string)
 				host, _ := args["host"].(string)
-				ss, err := svc.StartSession(ctx, agentID, title, repo, branch, host)
+				key, validKey := args["idempotency_key"].(string)
+				if _, provided := args["idempotency_key"]; provided && !validKey {
+					return mcp.NewToolResultError("idempotency_key must be a string"), nil
+				}
+				ss, err := svc.StartSessionWithKey(ctx, agentID, title, repo, branch, host, key)
 				if err != nil {
 					return mcp.NewToolResultError(err.Error()), nil
 				}
@@ -606,6 +613,8 @@ func submitResult(res *inbox.SubmitResult) *mcp.CallToolResult {
 		b.WriteString("Dry run passed. Nothing was sent. Review the flags (they're what your owner will see), then send it without dry_run.")
 	case res.DryRun:
 		fmt.Fprintf(&b, "Dry run found %d problem(s). Nothing was sent. Fix them and try again.", len(res.Problems))
+	case res.Replayed:
+		fmt.Fprintf(&b, "Existing request %s has status %s. Use inbox.status for its outcome.", res.RequestID, res.Status)
 	case res.OK:
 		fmt.Fprintf(&b, "Sent to your owner as %s. Keep working on anything that doesn't depend on it; use inbox.wait when you run out.", res.RequestID)
 	default:

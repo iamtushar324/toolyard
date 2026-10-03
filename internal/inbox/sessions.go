@@ -39,18 +39,46 @@ type Session struct {
 
 // StartSession registers a new session for an agent.
 func (s *Service) StartSession(ctx context.Context, agentID, title, repo, branch, host string) (*Session, error) {
+	return s.StartSessionWithKey(ctx, agentID, title, repo, branch, host, "")
+}
+
+// StartSessionWithKey registers a session once per agent/key. A retry returns
+// the current session without resetting its status or heartbeat.
+func (s *Service) StartSessionWithKey(ctx context.Context, agentID, title, repo, branch, host, key string) (*Session, error) {
+	if err := validateIdempotencyKey(key); err != nil {
+		return nil, fmt.Errorf("idempotency_key: %w", err)
+	}
 	title = strings.TrimSpace(title)
 	if title == "" || utf8.RuneCountInString(title) > 120 {
 		return nil, errors.New("title is required (at most 120 characters): what you're working on, as a person would say it")
 	}
+	repo, branch, host = strings.TrimSpace(repo), strings.TrimSpace(branch), strings.TrimSpace(host)
+	var hash string
+	if key != "" {
+		var err error
+		hash, err = submissionHash([]string{title, repo, branch, host})
+		if err != nil {
+			return nil, err
+		}
+		if replay, err := s.replaySession(ctx, agentID, key, hash); replay != nil || err != nil {
+			return replay, err
+		}
+	}
 	now := s.now().UnixMilli()
 	ss := &Session{ID: "ses_" + strings.ReplaceAll(uuid.NewString(), "-", "")[:16], AgentID: agentID, Title: title,
-		Repo: strings.TrimSpace(repo), Branch: strings.TrimSpace(branch), Host: strings.TrimSpace(host),
+		Repo: repo, Branch: branch, Host: host,
 		Status: SessionWorking, StartedAt: now, LastHeartbeatAt: now}
-	_, err := s.db.ExecContext(ctx, `INSERT INTO agent_sessions(id, agent_id, title, repo, branch, host, status, note, started_at, last_heartbeat_at)
-		VALUES (?,?,?,?,?,?,?,?,?,?)`, ss.ID, agentID, ss.Title, nullStr(ss.Repo), nullStr(ss.Branch), nullStr(ss.Host), ss.Status, nil, now, now)
+	result, err := s.db.ExecContext(ctx, `INSERT INTO agent_sessions(id, agent_id, title, repo, branch, host, status, note, started_at, last_heartbeat_at, idempotency_key, submission_hash)
+		VALUES (?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(agent_id, idempotency_key) DO NOTHING`, ss.ID, agentID, ss.Title, nullStr(ss.Repo), nullStr(ss.Branch), nullStr(ss.Host), ss.Status, nil, now, now, nullStr(key), nullStr(hash))
 	if err != nil {
 		return nil, err
+	}
+	n, err := result.RowsAffected()
+	if err != nil {
+		return nil, err
+	}
+	if n == 0 {
+		return s.replaySession(ctx, agentID, key, hash)
 	}
 	s.publish("session", ss)
 	return ss, nil

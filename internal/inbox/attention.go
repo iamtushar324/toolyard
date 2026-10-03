@@ -257,18 +257,22 @@ func (s *Service) enqueuePush(ctx context.Context, r *Request, reason, group str
 	}
 }
 
-// enqueueArrival queues the push for a newly stored request.
-func (s *Service) enqueueArrival(ctx context.Context, r *Request) {
+// enqueueArrival queues the push in the new request's transaction.
+func (s *Service) enqueueArrival(ctx context.Context, tx *sql.Tx, r *Request) error {
 	if r.Kind == KindUpdate {
-		return
+		return nil
 	}
-	now := s.now()
+	due, group := time.UnixMilli(r.CreatedAt), r.ID
 	switch r.Urgency {
 	case UrgencyNow:
-		s.enqueuePush(ctx, r, "new", r.ID, now)
 	case UrgencySoon:
-		s.enqueuePush(ctx, r, "new", groupKey(r), now.Add(GroupWindow))
+		due, group = due.Add(GroupWindow), groupKey(r)
+	default:
+		return nil
 	}
+	_, err := tx.ExecContext(ctx, `INSERT INTO inbox_pushes(request_id, agent_id, group_key, reason, urgency, due_at) VALUES (?,?,?,?,?,?)`,
+		r.ID, r.AgentID, group, "new", r.Urgency, due.UnixMilli())
+	return err
 }
 
 // ---- dispatch --------------------------------------------------------------------

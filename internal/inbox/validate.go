@@ -79,6 +79,8 @@ type Submission struct {
 	Attachments []Attachment     `json:"attachments,omitempty"`
 	TTLSeconds  int              `json:"ttl_seconds,omitempty"`
 	DryRun      bool             `json:"dry_run,omitempty"`
+
+	IdempotencyKey string `json:"idempotency_key,omitempty"`
 }
 
 // SubmissionTool is one tool in a Submission.
@@ -127,6 +129,9 @@ func Validate(ctx context.Context, cat Catalog, agentID string, s *Submission, o
 	var probs, warns []Problem
 	add := func(path, format string, a ...any) { probs = append(probs, Problem{path, fmt.Sprintf(format, a...)}) }
 	warn := func(path, format string, a ...any) { warns = append(warns, Problem{path, fmt.Sprintf(format, a...)}) }
+	if err := validateIdempotencyKey(s.IdempotencyKey); err != nil {
+		add("idempotency_key", "%s", err)
+	}
 
 	r := &Request{
 		Kind:       s.Kind,
