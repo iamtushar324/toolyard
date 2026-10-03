@@ -52,6 +52,7 @@ const (
 var (
 	ErrNotPending = errors.New("approval not pending")
 	ErrNotFound   = errors.New("approval not found")
+	ErrWrongOwner = errors.New("only the account owner can decide this GitHub request")
 )
 
 type Request struct {
@@ -580,13 +581,26 @@ func (b *Bus) decide(ctx context.Context, id, action string, d actor.Decider, ru
 	if action != StatusAllowed && action != StatusDenied {
 		return nil, fmt.Errorf("invalid action %q", action)
 	}
+	existing, err := b.Get(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	personal := existing.PersonalOwner() != ""
+	if personal {
+		if d.UserID != existing.PersonalOwner() || (d.Via != actor.ViaDashboard && d.Via != actor.ViaDashboardBatch && d.Via != actor.ViaPushToken && d.Via != actor.ViaPasskey) {
+			return nil, ErrWrongOwner
+		}
+		if existing.ExpiresAt <= time.Now().UnixMilli() {
+			return existing, ErrNotPending
+		}
+	}
 	res, err := b.db.ExecContext(ctx,
 		`UPDATE approval_requests SET status = ?, decided_by = ?, decided_at = ?,
             decided_via = ?, decider_email = ?, decider_name = ?, decider_ref = ?
-         WHERE id = ? AND status = ?`,
+         WHERE id = ? AND status = ? AND (? = 0 OR expires_at > ?)`,
 		action, d.Legacy(), time.Now().UnixMilli(),
 		nullStr(d.Via), nullStr(d.Email), nullStr(d.Name), nullStr(d.Ref),
-		id, StatusPending)
+		id, StatusPending, boolInt(personal), time.Now().UnixMilli())
 	if err != nil {
 		return nil, err
 	}
@@ -767,6 +781,19 @@ func (b *Bus) Get(ctx context.Context, id string) (*Request, error) {
 // or ErrNotFound on missing/wrong-agent.
 func (b *Bus) CancelByAgent(ctx context.Context, id, agentID string) (*Request, error) {
 	d := actor.Decider{Via: actor.ViaAgentCancel, Ref: agentID}
+	existing, err := b.Get(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	personal := existing.PersonalOwner() != ""
+	if personal {
+		if d.UserID != existing.PersonalOwner() || (d.Via != actor.ViaDashboard && d.Via != actor.ViaDashboardBatch && d.Via != actor.ViaPushToken && d.Via != actor.ViaPasskey) {
+			return nil, ErrWrongOwner
+		}
+		if existing.ExpiresAt <= time.Now().UnixMilli() {
+			return existing, ErrNotPending
+		}
+	}
 	res, err := b.db.ExecContext(ctx,
 		`UPDATE approval_requests SET status = ?, decided_by = ?, decided_at = ?,
             decided_via = ?, decider_ref = ?

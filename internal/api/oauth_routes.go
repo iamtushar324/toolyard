@@ -151,6 +151,14 @@ func (s *Server) oauthManualClient(w http.ResponseWriter, r *http.Request, name 
 		writeError(w, http.StatusBadRequest, "client_id is required")
 		return
 	}
+	if sv, err := s.upstreams.Get(r.Context(), name); err == nil && sv.Transport == "github" {
+		if body.Issuer != "https://github.com" || body.AuthorizationEndpoint != "https://github.com/login/oauth/authorize" || body.TokenEndpoint != "https://github.com/login/oauth/access_token" || body.ClientSecret == "" {
+			writeError(w, http.StatusBadRequest, "GitHub requires its App client and the fixed GitHub OAuth endpoints")
+			return
+		}
+		body.Scopes = nil
+		body.ExtraAuthorizeParams = map[string]string{}
+	}
 	existing, _ := s.oauth.GetClient(r.Context(), name)
 	if existing != nil {
 		// Merge: preserve discovery info if caller didn't include it.

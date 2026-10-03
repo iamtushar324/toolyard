@@ -201,13 +201,14 @@ func (g *Gateway) accessTools() []toolEntry {
 
 // policyTarget is one tool the ask rule evaluates.
 type policyTarget struct {
-	name     string
-	upstream string
-	forced   *policy.Action
+	requireHuman bool
+	name         string
+	upstream     string
+	forced       *policy.Action
 }
 
 func targetOf(e toolEntry) policyTarget {
-	return policyTarget{name: e.tool.Name, upstream: e.upstream, forced: e.forcedAction}
+	return policyTarget{name: e.tool.Name, upstream: e.upstream, forced: e.forcedAction, requireHuman: e.requireHuman}
 }
 
 // accessWord maps an action to the word policies.* report.
@@ -248,6 +249,11 @@ func effectiveAccess(engine *policy.Engine, t policyTarget) (accessState, policy
 		return accessState{Word: accessWord(d.Action)}, d
 	}
 	d := engine.Eval(policy.Request{UpstreamName: t.upstream, ToolName: t.name})
+	if t.requireHuman && d.Action != policy.ActionDeny {
+		d.Action = policy.ActionApprove
+		d.RequireHuman = true
+		d.Reason = "GitHub account owner approval"
+	}
 	return accessState{Word: accessWord(d.Action), Human: d.RequireHuman}, d
 }
 
@@ -919,10 +925,17 @@ func (g *Gateway) handleAuditMine() directHandler {
 		if err != nil {
 			return mcp.NewToolResultErrorFromErr("audit.mine", err), nil
 		}
+		owner, _ := g.ownerUser(ctx, agentID)
 		rows := make([]auditMineRow, 0, len(evs))
 		for _, e := range evs {
 			if e.AgentID != agentID {
 				continue // belt and braces: never another agent's row
+			}
+			g.mu.RLock()
+			entry := g.tools[e.ToolName]
+			g.mu.RUnlock()
+			if entry.personalGitHub && e.OwnerUserID != owner {
+				continue
 			}
 			r := auditMineRow{
 				TS: time.UnixMilli(e.TS).UTC().Format(time.RFC3339Nano), Tool: e.ToolName, Server: e.UpstreamName,

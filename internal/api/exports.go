@@ -54,7 +54,8 @@ func auditCSVRow(e audit.Event) []string {
 
 // auditExport streams the filtered audit log as CSV (default) or JSON.
 func (s *Server) auditExport(w http.ResponseWriter, r *http.Request) {
-	if _, err := s.requireUser(r); err != nil {
+	uid, err := s.requireUser(r)
+	if err != nil {
 		writeError(w, http.StatusUnauthorized, "unauthorized")
 		return
 	}
@@ -64,6 +65,7 @@ func (s *Server) auditExport(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	rows = visibleAudit(rows, uid)
 	if r.URL.Query().Get("format") == "json" {
 		w.Header().Set("Content-Type", "application/json")
 		w.Header().Set("Content-Disposition", `attachment; filename="toolyard-audit.json"`)
@@ -83,7 +85,8 @@ func (s *Server) auditExport(w http.ResponseWriter, r *http.Request) {
 // approvalsExport streams approval rows as CSV (default) or JSON. The
 // decision_token (a capability token) is always excluded.
 func (s *Server) approvalsExport(w http.ResponseWriter, r *http.Request) {
-	if _, err := s.requireUser(r); err != nil {
+	u, err := s.requireUserFull(r)
+	if err != nil {
 		writeError(w, http.StatusUnauthorized, "unauthorized")
 		return
 	}
@@ -92,6 +95,7 @@ func (s *Server) approvalsExport(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	rows = visibleApprovals(rows, u)
 	if r.URL.Query().Get("format") == "json" {
 		// Re-marshal through a token-free view so decision_token never leaks.
 		type safeApproval struct {

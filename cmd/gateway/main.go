@@ -393,6 +393,9 @@ func runServe(argv []string) error {
 		hub.Publish(realtime.Event{Type: "approval", Data: req})
 		if eventType == "approval.create" {
 			user, err := idSvc.PrimaryUser(ctx)
+			if uid := req.PersonalOwner(); uid != "" {
+				user, err = idSvc.GetUserByID(ctx, uid)
+			}
 			if err != nil {
 				return
 			}

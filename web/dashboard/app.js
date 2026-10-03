@@ -210,7 +210,7 @@ function isAdmin() {
   return !!state.user && state.user.role !== 'member';
 }
 
-const MEMBER_ROUTES = ['agents', 'myservers', 'connections'];
+const MEMBER_ROUTES = ['approvals', 'agents', 'myservers', 'connections'];
 
 function defaultRoute() {
   return isAdmin() ? 'approvals' : 'agents';
@@ -279,12 +279,18 @@ async function loadAll() {
   // route would answer 403 admin_only.
   if (!isAdmin()) {
     try {
-      const [agents, mine] = await Promise.all([
+      const [agents, mine, pendings, recent, vapid] = await Promise.all([
         api('/v1/agents'),
         api('/v1/me/servers').catch(() => []),
+        api('/v1/approvals?status=pending'),
+        api('/v1/approvals?limit=100'),
+        api('/v1/push/vapid_key'),
       ]);
       state.agents = agents || [];
       state.myServers = normGroups(mine);
+      state.approvals = pendings || [];
+      state.recentApprovals = (recent || []).filter(a => a.status !== 'pending');
+      state.vapidKey = vapid && vapid.public_key;
     } catch (e) {
       toast(e.message, 'error');
     }
@@ -359,8 +365,8 @@ function markStreamEvent() {
 }
 
 function startStream() {
-  // The event stream is admin-only; a member would only collect 403s.
-  if (!isAdmin()) return;
+  // The server filters every event for the current user.
+  if (!state.user) return;
   if (evtSrc) try { evtSrc.close(); } catch {}
   state.stream.status = state.stream.lastEventAt ? 'reconnecting' : 'connecting';
   render();
@@ -406,10 +412,10 @@ async function refetchCore() {
   try {
     const [pendings, audits] = await Promise.all([
       api('/v1/approvals?status=pending'),
-      api('/v1/audit?' + auditServerParams({ limit: '50' }).toString()),
+      isAdmin() ? api('/v1/audit?' + auditServerParams({ limit: '50' }).toString()) : Promise.resolve([]),
     ]);
     state.approvals = pendings || [];
-    loadInbox();
+    if (isAdmin()) loadInbox();
     const fresh = audits || [];
     const seen = new Set(fresh.map((a) => a.id));
     state.audit = fresh.concat((state.audit || []).filter((a) => !seen.has(a.id))).slice(0, 200);
@@ -654,8 +660,12 @@ async function submitPasswordLogin() {
 }
 
 function viewApprovals() {
+  const notifications = !isAdmin() && state.vapidKey ? el('div', { class: 'card' },
+    el('h2', {}, 'Your approvals'),
+    el('p', { class: 'meta' }, 'Only you can permit a write from your GitHub account.'),
+    el('button', { disabled: state.pushEnabling, on: { click: enablePush } }, 'Enable approval notifications')) : null;
   if (!state.approvals.length) {
-    return el('div', {}, el('div', { class: 'card empty' }, 'No pending approvals.'), renderRecentDecisions());
+    return el('div', {}, notifications, el('div', { class: 'card empty' }, 'No pending approvals.'), renderRecentDecisions());
   }
   // Group by agent_id. Within each group, sort by created_at ascending so
   // the user reads the batch in chronological order. Anonymous calls fall
@@ -674,7 +684,7 @@ function viewApprovals() {
     return yMax - xMax;
   });
 
-  return el('div', {}, ordered.map(([key, items]) => {
+  return el('div', {}, notifications, ordered.map(([key, items]) => {
     items.sort((a, b) => a.created_at - b.created_at);
     return renderApprovalBatch(key, items);
   }), renderRecentDecisions());
@@ -709,7 +719,7 @@ function renderArgs(args) {
   if (!args || typeof args !== 'object' || Array.isArray(args)) {
     return el('pre', { class: 'json' }, JSON.stringify(args == null ? {} : args, null, 2));
   }
-  const keys = Object.keys(args);
+  const keys = Object.keys(args).filter(k => k !== '_toolyard_github');
   if (keys.length === 0) return el('div', { class: 'meta' }, '(no arguments)');
   const flat = keys.every((k) => args[k] == null || typeof args[k] !== 'object');
   if (!flat) return el('pre', { class: 'json' }, JSON.stringify(args, null, 2));
@@ -774,6 +784,7 @@ function renderApprovalBatch(agentKey, items) {
         a.reason || '(none provided)'),
       el('details', {},
         el('summary', {}, 'arguments'),
+        a.arguments && a.arguments._toolyard_github && a.arguments._toolyard_github.github_login && a.arguments._toolyard_github.head_sha ? el('p', { class: 'meta' }, 'GitHub account: ' + a.arguments._toolyard_github.github_login + ' · Commit: ' + a.arguments._toolyard_github.head_sha.slice(0, 12)) : null,
         renderArgs(a.arguments),
       ),
       el('div', { class: 'row', style: 'margin-top: 8px;' },
@@ -2234,6 +2245,18 @@ function connectionStateBadge(st, lastError) {
   }
 }
 
+async function setupGitHubApp(server) {
+  try {
+    const out = await api('/v1/github/setup/begin', { method: 'POST', body: { server } });
+    const form = document.createElement('form');
+    form.method = 'POST'; form.action = out.action_url; form.target = '_blank';
+    form.rel = 'noopener';
+    const input = document.createElement('input');
+    input.type = 'hidden'; input.name = 'manifest'; input.value = JSON.stringify(out.manifest);
+    form.appendChild(input); document.body.appendChild(form); form.submit(); form.remove();
+  } catch (e) { toast(e.message, 'error'); }
+}
+
 function renderConnectionCard(r) {
   const c = state.connections;
   const busy = c.busy === r.server;
@@ -2251,7 +2274,9 @@ function renderConnectionCard(r) {
 
   let actions;
   if (!r.ready) {
-    actions = el('p', { class: 'meta' }, 'An admin still has to finish this server\'s OAuth setup before anyone can connect.');
+    actions = r.transport === 'github' && isAdmin()
+      ? el('div', {}, el('p', { class: 'meta' }, 'Register the GitHub App once. Each user then connects their own account.'), el('button', { class: 'primary', on: { click: () => setupGitHubApp(r.server) } }, 'Register GitHub App'))
+      : el('p', { class: 'meta' }, 'An admin must finish the OAuth setup before anyone can connect.');
   } else if (waiting) {
     actions = el('div', { class: 'row key-actions' },
       el('span', { class: 'meta grow' }, 'Finish signing in in the tab that just opened; this page updates on its own.'),
@@ -3566,7 +3591,7 @@ function renderMarketModal() {
         }),
         v.description ? el('div', { class: 'meta', style: 'margin-top: 2px;' }, v.description) : null,
       )),
-      entry.auth ? renderMarketAuthSection(modal) : null,
+      entry.auth && entry.transport !== 'github' ? renderMarketAuthSection(modal) : null,
       error ? el('div', { class: 'err' }, error) : null,
       el('div', { class: 'row', style: 'margin-top: 16px; justify-content: flex-end;' },
         el('button', { on: { click: closeMarketModal } }, 'Cancel'),
@@ -3579,7 +3604,7 @@ function renderMarketModal() {
               return;
             }
           }
-          if (entry.auth) {
+          if (entry.auth && entry.transport !== 'github') {
             if (modal.authMode === 'byo' && !modal.clientId.trim()) {
               modal.error = 'client_id is required'; render(); return;
             }
@@ -3588,7 +3613,7 @@ function renderMarketModal() {
             }
           }
           installFromMarket(entry, state.marketModal.env, state.marketModal.name);
-        }}}, modal.busy ? 'Working…' : (entry.auth && modal.authMode !== 'pat' ? 'Install & authorize' : 'Install')),
+        }}}, modal.busy ? 'Working…' : (entry.auth && entry.transport !== 'github' && modal.authMode !== 'pat' ? 'Install & authorize' : 'Install')),
       ),
     ),
   );
@@ -3704,13 +3729,14 @@ async function marketSubmitPaste() {
 
 async function installFromMarket(entry, env, overrideName) {
   const modal = state.marketModal;
-  const authFlow = !!(entry.auth && modal && modal.authMode);
+  const authFlow = entry.transport !== 'github' && !!(entry.auth && modal && modal.authMode);
   const args = (entry.args || []).map((a) =>
     a.replace(/\$\{([A-Z0-9_]+)\}/g, (_, key) => env[key] || '')
   );
   const body = {
     name:      (overrideName || entry.suggested_name).trim(),
     transport: entry.transport,
+    auth_mode: entry.auth_mode || 'shared',
     command:   entry.command,
     args,
     url:       entry.url,
@@ -3739,6 +3765,7 @@ async function installFromMarket(entry, env, overrideName) {
     }
     if (!authFlow) {
       if (resp.ok && resp.status !== 202) toast(entry.name + ' installed.');
+      if (entry.transport === 'github') { state.marketModal = null; await reloadServers(); navigate('connections'); await loadConnections(); render(); return; }
       state.marketModal = null;
       await reloadServers();
       render();
@@ -5458,6 +5485,7 @@ function shell(content) {
         navBtn('users',        'Users'),
         navBtn('settings',     'Settings'),
       ) : el('nav', {},
+        navBtn('approvals', 'Approvals'),
         navBtn('agents',       'Agents'),
         navBtn('myservers',    'My servers'),
         navBtn('connections',  'My connections'),
@@ -5497,6 +5525,7 @@ function shell(content) {
         el('span', {}, 'More'),
       ),
     ) : el('div', { class: 'row' },
+      bottomItem('approvals', '✓', 'Approvals', pendingCount),
       bottomItem('agents',      '◎', 'Agents'),
       bottomItem('myservers',   '⌘', 'My servers'),
       bottomItem('connections', '⚿', 'Connections'),
@@ -5644,7 +5673,7 @@ function render() {
 // ---- OAuth integration (remote MCPs) ---------------------------------------
 
 function isHTTPUpstream(s) {
-  return s.transport === 'http' || s.transport === 'streamable-http' || (!s.transport && s.url);
+  return s.transport === 'github' || s.transport === 'http' || s.transport === 'streamable-http' || (!s.transport && s.url);
 }
 
 function oauthBadge(s) {

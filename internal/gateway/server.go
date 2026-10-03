@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log"
 	"math"
+	"net/http"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -104,11 +105,13 @@ type directHandler func(ctx context.Context, args map[string]any) (*mcp.CallTool
 
 // toolEntry is what the gateway tracks for each registered tool.
 type toolEntry struct {
-	tool         mcp.Tool
-	upstream     string // "builtin", "fixture", or upstream config name
-	originalName string // upstream-side name (without prefix)
-	reasonField  string // "_reason" (or "__toolyard_reason" if a clash forced a rename)
-	handle       directHandler
+	personalGitHub bool
+	requireHuman   bool
+	tool           mcp.Tool
+	upstream       string // "builtin", "fixture", or upstream config name
+	originalName   string // upstream-side name (without prefix)
+	reasonField    string // "_reason" (or "__toolyard_reason" if a clash forced a rename)
+	handle         directHandler
 	// forcedAction, when non-nil, short-circuits policy.Eval for this tool
 	// and uses the provided action instead. Used by built-in tools that
 	// need a deterministic policy decision regardless of the name-heuristic
@@ -129,6 +132,8 @@ type toolEntry struct {
 // Gateway stitches the MCP server, policy, approval bus, memory, and upstream
 // pool into one coordinated unit.
 type Gateway struct {
+	githubHTTP          *http.Client
+	githubWriteMu       sync.Mutex
 	mcp                 *server.MCPServer
 	policy              *policy.Engine
 	approval            *approval.Bus
@@ -467,6 +472,9 @@ func (g *Gateway) accessRequestHook(ctx context.Context, _ any, message any) err
 		}
 		g.denyUngranted(ctx, entry, agentID, "", &ev)
 		ev.TotalLatencyMs = int(time.Since(started).Milliseconds())
+		if entry.personalGitHub {
+			ev.ReasonText = ""
+		}
 		if g.metrics != nil {
 			g.metrics.Record(ev)
 		}
@@ -567,6 +575,9 @@ func (g *Gateway) AddUpstream(ctx context.Context, cfg UpstreamConfig) error {
 	}
 	if reservedUpstreamName(cfg.Name) {
 		return fmt.Errorf("name %q is reserved", cfg.Name)
+	}
+	if cfg.Transport == "github" {
+		return g.addGitHubUpstream(cfg)
 	}
 	if cfg.PerUser {
 		return g.addPerUserUpstream(ctx, cfg)
@@ -1002,6 +1013,9 @@ func (g *Gateway) CallInternal(ctx context.Context, viaTool, targetName string, 
 	ev.ApprovalOutcome = metrics.ApprovalNone
 	res, err := g.dispatch(ctx, entry, args, agentID, "internal:"+viaTool, "", ev)
 	ev.TotalLatencyMs = int(time.Since(started).Milliseconds())
+	if entry.personalGitHub {
+		ev.ReasonText = ""
+	}
 	if g.metrics != nil {
 		g.metrics.Record(*ev)
 	}
@@ -1137,6 +1151,12 @@ func (g *Gateway) routeEntry(ctx context.Context, entry toolEntry, via string, a
 		return mcp.NewToolResultError(rerr.Error()), nil
 	}
 
+	if entry.personalGitHub {
+		if err := g.prepareGitHub(ctx, entry, cleanArgs); err != nil {
+			return mcp.NewToolResultError(err.Error()), nil
+		}
+	}
+
 	keys, sizeBytes := metrics.ArgsShape(cleanArgs)
 	ev.ArgsTopKeys = keys
 	ev.ArgsSizeBytes = sizeBytes
@@ -1176,9 +1196,18 @@ func (g *Gateway) routeEntry(ctx context.Context, entry toolEntry, via string, a
 		})
 	}
 
+	if entry.requireHuman && decision.Action != policy.ActionDeny {
+		decision.Action = policy.ActionApprove
+		decision.RequireHuman = true
+	}
+
+	if entry.personalGitHub && decision.Action == policy.ActionApprove {
+		decision.RequireHuman = true
+	}
+
 	// A grant only matters for calls that would otherwise need approval:
 	// an explicit deny still wins, and an open tool doesn't use one up.
-	if grantToken != "" && decision.Action == policy.ActionApprove && g.inbox != nil {
+	if !entry.personalGitHub && grantToken != "" && decision.Action == policy.ActionApprove && g.inbox != nil {
 		return g.redeemAndDispatch(ctx, entry, cleanArgs, agentID, reason, grantToken, &ev)
 	}
 
@@ -1215,7 +1244,7 @@ func (g *Gateway) routeEntry(ctx context.Context, entry toolEntry, via string, a
 	case policy.ActionApprove:
 		// Inbox mode needs an agent identity: grants are bound to it.
 		// Anonymous callers keep the legacy flow.
-		if g.inboxMode() && agentID != "" {
+		if !entry.personalGitHub && g.inboxMode() && agentID != "" {
 			return g.coach(ctx, entry, cleanArgs, agentID, reason, &ev), nil
 		}
 		return g.holdAndWait(ctx, entry, cleanArgs, agentID, reason, intent, decision.RequireHuman, &ev)
@@ -1402,7 +1431,7 @@ func (g *Gateway) holdAndWait(ctx context.Context, entry toolEntry, args map[str
 // exactly like an unknown id, so ids can't be probed.
 func (g *Gateway) resumeDeferred(ctx context.Context, entry toolEntry, approvalID string, ev *metrics.Event) (*mcp.CallToolResult, error) {
 	req, err := g.approval.Get(ctx, approvalID)
-	if err != nil || !approvalVisibleTo(req, agentIDFromContext(ctx)) || !approvalRaisedFor(req, entry) {
+	if err != nil || !g.approvalVisible(ctx, req) || !approvalRaisedFor(req, entry) {
 		ev.Outcome = metrics.OutcomeError
 		ev.ErrorClass = "approval"
 		return mcp.NewToolResultErrorf("unknown approval %q", approvalID), nil
@@ -1495,7 +1524,7 @@ func approvalRaisedFor(req *approval.Request, entry toolEntry) bool {
 // agent's, which resumeDeferred answers as unknown.
 func (g *Gateway) resumeViaExecute(ctx context.Context, entry toolEntry, args map[string]any, approvalID string, ev *metrics.Event) (*mcp.CallToolResult, error) {
 	req, err := g.approval.Get(ctx, approvalID)
-	if err != nil || !approvalVisibleTo(req, agentIDFromContext(ctx)) || approvalRaisedFor(req, entry) {
+	if err != nil || !g.approvalVisible(ctx, req) || approvalRaisedFor(req, entry) {
 		return g.resumeDeferred(ctx, entry, approvalID, ev)
 	}
 	target, _ := args["tool"].(string)
@@ -1579,6 +1608,9 @@ func (g *Gateway) dispatch(ctx context.Context, entry toolEntry, args map[string
 	// audit rows below carry it as the owner, so the trail says whose
 	// token did the work even when the ingress named nobody.
 	var asUser string
+	if entry.personalGitHub {
+		asUser, _ = g.ownerUser(ctx, agentID)
+	}
 	var cfg *UpstreamConfig
 	switch {
 	case u != nil:
@@ -1960,7 +1992,7 @@ func buildInstructions(bus *approval.Bus, inLineWait time.Duration) string {
 	b.WriteString("toolyard gateway. ")
 	b.WriteString("Every tool call REQUIRES a `_reason` field (20-2000 chars) explaining why you are calling it; this string is shown verbatim to the human reviewer. ")
 	b.WriteString("PERMISSIONS: some tools are restricted and need your owner's approval. Before a task, run `inbox.check` on the calls you plan, then ask for every restricted tool in ONE `inbox.request` (call `inbox.guide` first to learn the format: a first-person message, a short voice-note script, evidence attachments, and each tool with its parameters). When approved, call each tool with `_grant` set to its token. If a call returns status `permission_required`, nothing ran: fill in the draft it gives you and send it with inbox.request. ")
-	b.WriteString("Reads pass through silently; writes hold for human approval. ")
+	b.WriteString("Reads pass through silently; writes hold for human approval. GitHub writes always require the account owner's explicit approval: call the GitHub tool directly to create the request, then collect its approval result. Inbox grants and auto-approval rules cannot permit these writes. Approving GitHub reviews are human-only. ")
 	b.WriteString(fmt.Sprintf("Approvals expire after %s if no decision arrives. ", ttl.Round(time.Minute)))
 	b.WriteString("AUTO-EXECUTE ON APPROVE: when a write needs human review the gateway returns a deferred response containing `approval_id`. The moment the human (or an auto-approval rule) flips the request to allowed, toolyard fires the original tool itself with your persisted arguments and stashes the result. ")
 	b.WriteString("Collecting that result is OPTIONAL — the tool runs (and its side effect happens) regardless of whether you fetch the result. Skip the collect step for fire-and-forget writes (logging, notifications, anything you don't need to read back). ")
@@ -1998,6 +2030,10 @@ func (g *Gateway) Execute(ctx context.Context, req *approval.Request) {
 	if g == nil || req == nil || g.approval == nil {
 		return
 	}
+	if owner := req.PersonalOwner(); owner != "" && (req.Status != approval.StatusAllowed || req.DecidedBy != owner || req.ExpiresAt <= time.Now().UnixMilli()) {
+		g.persistApprovalResult(ctx, req.ID, mcp.NewToolResultError("GitHub approval is no longer valid; request fresh approval"), nil)
+		return
+	}
 	g.mu.RLock()
 	entry, ok := g.tools[req.ToolName]
 	g.mu.RUnlock()
@@ -2019,6 +2055,11 @@ func (g *Gateway) Execute(ctx context.Context, req *approval.Request) {
 	// connect link minted here would sit in a row admins and operator
 	// tokens can read. Refusals name the dashboard instead.
 	execCtx := WithoutConnectLinks(actor.WithRaiser(WithAgentID(ctx, req.AgentID), raiser))
+	if req.PersonalOwner() != "" {
+		var cancel context.CancelFunc
+		execCtx, cancel = context.WithDeadline(execCtx, time.UnixMilli(req.ExpiresAt))
+		defer cancel()
+	}
 
 	// Build a metrics.Event and run dispatch directly. The original
 	// routeEntry already evaluated policy and consumed the human's

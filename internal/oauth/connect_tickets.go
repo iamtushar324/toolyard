@@ -20,6 +20,8 @@ import (
 	"fmt"
 	"net/url"
 	"time"
+
+	"github.com/tusharbhardwaj/toolyard/internal/githubapi"
 )
 
 // ConnectLinkPath is the public route a connect link opens:
@@ -269,6 +271,15 @@ func (s *Service) exchangeCodeForUser(ctx context.Context, upstream, userID, cod
 		return nil, err
 	}
 	rec := userTokenRecordFromResponse(upstream, userID, tr)
+	if cli.Issuer == "https://github.com" {
+		u, err := githubapi.New(s.httpc, rec.AccessToken).User(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("verify GitHub account: %w", err)
+		}
+		rec.AccountLabel = fmt.Sprintf("%s (#%d)", u.Login, u.ID)
+		// A GitHub login is verified, but is not a verified email claim.
+	}
+
 	if accept != nil {
 		if aerr := accept(rec); aerr != nil {
 			s.revoke(ctx, cli, rec.RefreshToken, rec.AccessToken)

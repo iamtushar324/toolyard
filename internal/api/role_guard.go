@@ -55,12 +55,18 @@ func (s *Server) RoleGuard(next http.Handler) http.Handler {
 // or "*" for any. Keep this list short and obvious; it is the whole of
 // what a member can do through the API.
 var memberRoutes = map[string]string{
-	"/v1/health":             http.MethodGet,
-	"/v1/auth/me":            http.MethodGet,
-	"/v1/auth/config":        http.MethodGet,
-	"/v1/auth/logout":        http.MethodPost,
-	"/v1/auth/login":         http.MethodPost,
-	"/v1/auth/clerk/session": http.MethodPost,
+	"/v1/push/vapid_key":            http.MethodGet,
+	"/v1/push/subscribe":            http.MethodPost + " " + http.MethodDelete,
+	"/v1/approvals":                 http.MethodGet,
+	"/v1/approvals/decide-batch":    http.MethodPost,
+	"/v1/approvals/decide-by-token": http.MethodPost,
+	"/v1/events/stream":             http.MethodGet,
+	"/v1/health":                    http.MethodGet,
+	"/v1/auth/me":                   http.MethodGet,
+	"/v1/auth/config":               http.MethodGet,
+	"/v1/auth/logout":               http.MethodPost,
+	"/v1/auth/login":                http.MethodPost,
+	"/v1/auth/clerk/session":        http.MethodPost,
 	// Authenticated by the Clerk token in its body; a cookie riding along
 	// must not change the answer.
 	"/v1/connect/t3": http.MethodPost,
@@ -123,6 +129,13 @@ func memberAllowed(method, path string) bool {
 	// only that member's own sign-in (connect_link_routes.go).
 	if ticket, ok := strings.CutPrefix(path, connectLinkPath); ok {
 		return (method == http.MethodGet || method == http.MethodPost) && ticket != "" && !strings.Contains(ticket, "/")
+	}
+	if rest, ok := strings.CutPrefix(path, "/v1/approvals/"); ok {
+		id, sub, _ := strings.Cut(rest, "/")
+		if id == "" || id == "export" || id == "decide-batch" || id == "decide-by-token" {
+			return false
+		}
+		return (sub == "" && method == http.MethodGet) || (sub == "decide" && method == http.MethodPost)
 	}
 	// Own connections:
 	//   POST   /v1/me/connections/{server}/begin

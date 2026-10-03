@@ -1,0 +1,48 @@
+name: GitHub connector
+on:
+  pull_request:
+    paths:
+      - 'internal/**'
+      - 'cmd/gateway/**'
+      - 'web/dashboard/**'
+      - 'go.*'
+      - '.github/workflows/github-connector.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'internal/**'
+      - 'cmd/gateway/**'
+      - 'web/dashboard/**'
+      - 'go.*'
+      - '.github/workflows/github-connector.yml'
+permissions:
+  contents: read
+jobs:
+  validate:
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 15
+    env:
+      GOMAXPROCS: '2'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Check formatting and dashboard syntax
+        run: |
+          test -z "$(gofmt -l internal cmd)"
+          node --check web/dashboard/app.js
+      - name: Test connector and access boundaries
+        run: go test -p 2 -parallel 2 ./internal/githubapi ./internal/gateway ./internal/oauth ./internal/upstreams ./internal/api ./internal/approval ./internal/realtime ./internal/chatnotify -run 'GitHub|RoleGuard|PerUser|UserToken|User.*Refresh|Approval|Export|Actor|Connection|Decide' -count=1 -timeout=180s
+      - name: Check GitHub concurrency
+        run: go test -race -p 2 -parallel 2 ./internal/githubapi ./internal/gateway ./internal/oauth ./internal/upstreams ./internal/api ./internal/approval -run GitHub -count=1 -timeout=180s
+      - name: Build deployment binary
+        run: |
+          mkdir -p dist
+          go build -p 2 -trimpath -ldflags "-s -w -X main.version=github-${GITHUB_SHA}" -o dist/toolyard ./cmd/gateway
+          ./dist/toolyard version
+      - uses: actions/upload-artifact@v4
+        with:
+          name: toolyard-github-${{ github.sha }}
+          path: dist/toolyard
+          retention-days: 7
