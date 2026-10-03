@@ -52,3 +52,33 @@ func TestConnectAZP(t *testing.T) {
 		t.Error("connect origins without Clerk accepted")
 	}
 }
+
+// TestConnectAZPTailnetAndWildcard: "tailnet:<name>.ts.net" and
+// "https://*.<domain>" entries parse and normalise; wider or plain-http
+// forms are refused at startup.
+func TestConnectAZPTailnetAndWildcard(t *testing.T) {
+	const public = "https://toolyard.dev.beknown.live"
+	got, err := connectAZP("https://stagebkt3.dev.beknown.live, Tailnet:TailAB6257.ts.net , HTTPS://*.Beknown.Live/", public, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(got, ",") != "https://stagebkt3.dev.beknown.live,tailnet:tailab6257.ts.net,https://*.beknown.live" {
+		t.Errorf("entries = %q", got)
+	}
+	for _, raw := range []string{
+		"tailnet:beknown.live",          // not a tailnet name
+		"tailnet:ts.net",                // every tailnet
+		"tailnet:a.b.tailab6257.ts.net", // not one tailnet
+		"tailnet:",                      // empty
+		"http://*.beknown.live",         // wildcard must be https
+		"https://*.live",                // too wide
+		"https://*.beknown.live/app",    // path
+		"https://*.beknown.live:8443",   // port in a wildcard
+		"https://a.*.beknown.live",      // wildcard not leading
+		"*.beknown.live",                // no scheme
+	} {
+		if got, err := connectAZP(raw, public, true); err == nil {
+			t.Errorf("connectAZP(%q) = %q, want error", raw, got)
+		}
+	}
+}

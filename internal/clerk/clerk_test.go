@@ -790,3 +790,60 @@ func TestPersonalConfigWithoutOrganization(t *testing.T) {
 		t.Fatalf("personal config: %v", err)
 	}
 }
+
+// TestPartiesTailnetAndWildcard: a "tailnet:<name>.ts.net" entry admits any
+// http or https origin under that tailnet or on a Tailscale address; an
+// "https://*.<domain>" entry admits https origins under the domain only.
+// Neither stretches past a dot boundary or to other ranges.
+func TestPartiesTailnetAndWildcard(t *testing.T) {
+	p := newParties([]string{"tailnet:tailab6257.ts.net", "https://*.beknown.live", "https://bkt3.example.com"})
+	for azp, want := range map[string]bool{
+		"https://bkt3.example.com":                    true,
+		"http://dev-server-1.tailab6257.ts.net:18082": true,
+		"https://mac.tailab6257.ts.net":               true,
+		"http://100.65.42.49:3000":                    true,
+		"http://[fd7a:115c:a1e0::b536:2a32]:8080":     true,
+		"https://bkt3.dev.beknown.live":               true,
+		"https://a.b.beknown.live:8443":               true,
+		"http://evil-tailab6257.ts.net":               false,
+		"http://tailab6257.ts.net.evil.com":           false,
+		"http://tailab6257.ts.net":                    false,
+		"http://100.128.0.1":                          false,
+		"http://10.0.0.1":                             false,
+		"ftp://x.tailab6257.ts.net":                   false,
+		"http://bkt3.dev.beknown.live":                false,
+		"https://beknown.live":                        false,
+		"https://evilbeknown.live":                    false,
+		"https://beknown.live.evil.com":               false,
+		"https://bkt3.example.com.evil":               false,
+		"":                                            false,
+	} {
+		if got := p.allows(NormalizeOrigin(azp)); got != want {
+			t.Errorf("allows(%q) = %v, want %v", azp, got, want)
+		}
+	}
+	// Tailscale addresses need a tailnet entry; a domain wildcard alone
+	// admits no IP.
+	if newParties([]string{"https://*.beknown.live"}).allows("http://100.65.42.49:3000") {
+		t.Error("a wildcard alone admitted a tailnet IP")
+	}
+}
+
+// TestVerifySessionTokenForWildcardNeverAdmitsDashboard: a wildcard that
+// covers the dashboard's own origin still never admits it here.
+func TestVerifySessionTokenForWildcardNeverAdmitsDashboard(t *testing.T) {
+	f := newFakeClerk(t)
+	c := f.client(t)
+	ctx := context.Background()
+	parties := []string{"https://*.example.com"}
+	if _, err := c.VerifySessionTokenFor(ctx, f.token(jwt.MapClaims{"azp": "https://bkt3.example.com"}, f.kid), parties); err != nil {
+		t.Fatalf("wildcard origin refused: %v", err)
+	}
+	if _, err := c.VerifySessionTokenFor(ctx, f.token(jwt.MapClaims{"azp": "https://toolyard.example.com"}, f.kid), parties); !errors.Is(err, ErrInvalidToken) {
+		t.Fatalf("dashboard origin admitted through a wildcard: %v", err)
+	}
+	// And the dashboard sign-in keeps refusing wildcard origins.
+	if _, err := c.VerifySessionToken(ctx, f.token(jwt.MapClaims{"azp": "https://bkt3.example.com"}, f.kid)); !errors.Is(err, ErrInvalidToken) {
+		t.Fatalf("dashboard sign-in admitted a connect origin: %v", err)
+	}
+}

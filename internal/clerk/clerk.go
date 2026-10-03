@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"io"
 	"math/big"
+	"net"
 	"net/http"
 	"net/url"
 	"regexp"
@@ -229,12 +230,112 @@ func partySet(origins []string) map[string]bool {
 	return set
 }
 
+// TailnetPartyPrefix marks an authorized-party entry that admits a whole
+// Tailscale tailnet instead of one origin: "tailnet:<tailnet>.ts.net"
+// accepts any http or https origin, on any port, whose host is a name
+// under that tailnet or a Tailscale address (100.64.0.0/10,
+// fd7a:115c:a1e0::/48). Traffic inside a tailnet is encrypted by
+// WireGuard, so plain http is accepted there.
+const TailnetPartyPrefix = "tailnet:"
+
+var (
+	tailnetV4 = mustCIDR("100.64.0.0/10")
+	tailnetV6 = mustCIDR("fd7a:115c:a1e0::/48")
+)
+
+func mustCIDR(s string) *net.IPNet {
+	_, n, err := net.ParseCIDR(s)
+	if err != nil {
+		panic(err)
+	}
+	return n
+}
+
+// parties is an authorized-party matcher: exact origins, whole tailnets,
+// and domain wildcards ("https://*.example.com": any host under
+// example.com, at any depth and on any port, with that scheme only).
+type parties struct {
+	exact     map[string]bool
+	tailnets  []string // lowercase tailnet DNS suffixes, e.g. "tailab6257.ts.net"
+	wildcards []wildcardParty
+}
+
+type wildcardParty struct{ scheme, suffix string }
+
+// parseWildcardParty reads "scheme://*.domain" (no port, path or
+// credentials); ok is false for anything else.
+func parseWildcardParty(e string) (wildcardParty, bool) {
+	scheme, rest, ok := strings.Cut(e, "://")
+	if !ok || (scheme != "https" && scheme != "http") {
+		return wildcardParty{}, false
+	}
+	suffix, ok := strings.CutPrefix(rest, "*.")
+	if !ok || suffix == "" || strings.ContainsAny(suffix, "/:@?#*") {
+		return wildcardParty{}, false
+	}
+	return wildcardParty{scheme: scheme, suffix: suffix}, true
+}
+
+func newParties(entries []string) parties {
+	p := parties{exact: map[string]bool{}}
+	for _, e := range entries {
+		e = NormalizeOrigin(e)
+		if suffix, ok := strings.CutPrefix(e, TailnetPartyPrefix); ok {
+			if suffix = strings.Trim(suffix, "."); suffix != "" {
+				p.tailnets = append(p.tailnets, suffix)
+			}
+			continue
+		}
+		if w, ok := parseWildcardParty(e); ok {
+			p.wildcards = append(p.wildcards, w)
+			continue
+		}
+		if e != "" {
+			p.exact[e] = true
+		}
+	}
+	return p
+}
+
+// allows reports whether a normalised azp origin is admitted.
+func (p parties) allows(azp string) bool {
+	if azp == "" {
+		return false
+	}
+	if p.exact[azp] {
+		return true
+	}
+	if len(p.tailnets) == 0 && len(p.wildcards) == 0 {
+		return false
+	}
+	u, err := url.Parse(azp)
+	if err != nil || (u.Scheme != "http" && u.Scheme != "https") || u.Host == "" ||
+		u.User != nil || u.RawQuery != "" || u.Fragment != "" || strings.Trim(u.Path, "/") != "" {
+		return false
+	}
+	host := strings.ToLower(u.Hostname())
+	if ip := net.ParseIP(host); ip != nil {
+		return len(p.tailnets) > 0 && (tailnetV4.Contains(ip) || tailnetV6.Contains(ip))
+	}
+	for _, w := range p.wildcards {
+		if u.Scheme == w.scheme && strings.HasSuffix(host, "."+w.suffix) {
+			return true
+		}
+	}
+	for _, suffix := range p.tailnets {
+		if strings.HasSuffix(host, "."+suffix) {
+			return true
+		}
+	}
+	return false
+}
+
 // VerifySessionToken checks signature (RS256 against the instance JWKS),
 // exp/nbf, iss, azp and sub. Anything short of a fully valid token is
 // ErrInvalidToken; a JWKS fetch failure is ErrUnavailable. The azp must be
 // one of the dashboard origins the Client was built with.
 func (c *Client) VerifySessionToken(ctx context.Context, token string) (Claims, error) {
-	claims, _, err := c.verify(ctx, token, c.azp)
+	claims, _, err := c.verify(ctx, token, func(azp string) bool { return c.azp[azp] })
 	return claims, err
 }
 
@@ -251,11 +352,10 @@ func (c *Client) VerifySessionToken(ctx context.Context, token string) (Claims, 
 // than connectMaxTokenAge ago and not in the future (both give or take
 // tokenLeeway), and no aud claim at all.
 func (c *Client) VerifySessionTokenFor(ctx context.Context, token string, authorizedParties []string) (Claims, error) {
-	allowed := partySet(authorizedParties)
-	for o := range c.azp {
-		delete(allowed, o)
-	}
-	claims, sc, err := c.verify(ctx, token, allowed)
+	allowed := newParties(authorizedParties)
+	// The dashboard's own origins never pass here, even when a tailnet
+	// entry would cover them.
+	claims, sc, err := c.verify(ctx, token, func(azp string) bool { return !c.azp[azp] && allowed.allows(azp) })
 	if err != nil {
 		return Claims{}, err
 	}
@@ -278,10 +378,10 @@ func (c *Client) VerifySessionTokenFor(ctx context.Context, token string, author
 	return claims, nil
 }
 
-// verify is the shared check; allowed is the azp set the token must match.
-// It also returns the parsed claims for VerifySessionTokenFor's extra
-// rules.
-func (c *Client) verify(ctx context.Context, token string, allowed map[string]bool) (Claims, *sessionClaims, error) {
+// verify is the shared check; allowed decides whether the token's
+// (normalised) azp is admitted. It also returns the parsed claims for
+// VerifySessionTokenFor's extra rules.
+func (c *Client) verify(ctx context.Context, token string, allowed func(azp string) bool) (Claims, *sessionClaims, error) {
 	token = strings.TrimSpace(token)
 	if token == "" || len(token) > 16<<10 {
 		return Claims{}, nil, ErrInvalidToken
@@ -323,7 +423,7 @@ func (c *Client) verify(ctx context.Context, token string, allowed map[string]bo
 	// this check; we don't — a token minted for another Clerk-backed app
 	// on the same instance must not open a toolyard session.
 	azp := NormalizeOrigin(sc.AuthorizedParty)
-	if azp == "" || !allowed[azp] {
+	if azp == "" || !allowed(azp) {
 		return Claims{}, nil, fmt.Errorf("%w: azp %q not authorized", ErrInvalidToken, sc.AuthorizedParty)
 	}
 	return Claims{Subject: sub, SessionID: sc.SessionID, AuthorizedParty: azp}, sc, nil
