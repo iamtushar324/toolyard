@@ -62,6 +62,9 @@ func (g *Gateway) Access(ctx context.Context, agentID, tool string, args map[str
 	} else {
 		action = g.policy.Eval(policy.Request{AgentID: agentID, UpstreamName: entry.upstream, ToolName: entry.tool.Name, Arguments: args}).Action
 	}
+	if entry.requireHuman && action != policy.ActionDeny {
+		action = policy.ActionApprove
+	}
 	switch action {
 	case policy.ActionAllow:
 		return inbox.AccessOpen, entry.upstream

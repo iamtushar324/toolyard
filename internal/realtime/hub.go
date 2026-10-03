@@ -58,6 +58,11 @@ func (h *Hub) unsubscribe(ch chan Event) {
 
 // ServeSSE writes the SSE stream until the client closes the connection.
 func (h *Hub) ServeSSE(w http.ResponseWriter, r *http.Request) {
+	h.ServeSSEFiltered(w, r, nil)
+}
+
+// ServeSSEFiltered applies recipient authorization before serialization.
+func (h *Hub) ServeSSEFiltered(w http.ResponseWriter, r *http.Request, allow func(Event) bool) {
 	flusher, ok := w.(http.Flusher)
 	if !ok {
 		http.Error(w, "streaming unsupported", http.StatusInternalServerError)
@@ -94,6 +99,9 @@ func (h *Hub) ServeSSE(w http.ResponseWriter, r *http.Request) {
 		case evt, ok := <-ch:
 			if !ok {
 				return
+			}
+			if allow != nil && !allow(evt) {
+				continue
 			}
 			body, err := json.Marshal(evt.Data)
 			if err != nil {

@@ -65,6 +65,7 @@ type Entry struct {
 	Category    string   `json:"category"`
 	Homepage    string   `json:"homepage"`
 	Transport   string   `json:"transport"`
+	AuthMode    string   `json:"auth_mode,omitempty"`
 	Command     string   `json:"command,omitempty"`
 	Args        []string `json:"args,omitempty"`
 	URL         string   `json:"url,omitempty"`
@@ -123,19 +124,12 @@ func Catalog() []Entry {
 			Notes:         "ROOT is substituted into the args; the FS server itself does not read it from env.",
 		},
 		{
-			ID:          "github",
-			Name:        "GitHub",
-			Tagline:     "Repos, issues, PRs, code search",
-			Description: "Reads and writes against your GitHub account using a Personal Access Token. Toolyard holds writes for approval so the model can draft a PR but you decide whether it ships.",
-			Category:    "Dev",
-			Homepage:    "https://github.com/modelcontextprotocol/servers/tree/main/src/github",
-			Transport:   "stdio",
-			Command:     "npx",
-			Args:        []string{"-y", "@modelcontextprotocol/server-github"},
-			Env: []EnvVar{
-				{Name: "GITHUB_PERSONAL_ACCESS_TOKEN", Description: "Fine-grained PAT with at least repo + read:org", Required: true, Secret: true},
-			},
-			SuggestedName: "github",
+			ID: "github", Name: "GitHub", Tagline: "Your GitHub account with approval for each write",
+			Description: "Read pull requests, add comments, and submit COMMENT or REQUEST_CHANGES reviews. Each user connects their own GitHub account. Only that user can permit a write.",
+			Category:    "Dev", Homepage: "https://docs.github.com/en/apps/creating-github-apps/authenticating-with-a-github-app/authenticating-with-a-github-app-on-behalf-of-a-user",
+			Transport: "github", URL: "https://api.github.com", AuthMode: "per_user", SuggestedName: "GitHubForUsers",
+			Notes: "Install the connector, register the GitHub App, and select its repositories. Each user then connects in My connections. Approving reviews remain human-only.",
+			Auth:  &AuthPreset{Issuer: "https://github.com", AuthorizationEndpoint: "https://github.com/login/oauth/authorize", TokenEndpoint: "https://github.com/login/oauth/access_token", ClientSetupURL: "https://github.com/settings/apps/new"},
 		},
 		{
 			ID:          "brave-search",

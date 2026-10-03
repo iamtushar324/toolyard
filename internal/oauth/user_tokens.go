@@ -601,6 +601,9 @@ func userTokenRecordFromResponse(upstream, userID string, tr *tokenResponse) *Us
 	if tr.ExpiresIn > 0 {
 		rec.AccessExpiresAt = now.Add(time.Duration(tr.ExpiresIn) * time.Second)
 	}
+	if tr.RefreshTokenExpiresIn > 0 {
+		tr.RefreshExpiresIn = tr.RefreshTokenExpiresIn
+	}
 	if tr.RefreshExpiresIn > 0 {
 		rec.RefreshExpiresAt = now.Add(time.Duration(tr.RefreshExpiresIn) * time.Second)
 	}

@@ -1,0 +1,276 @@
+package gateway
+
+import (
+	"context"
+	"encoding/json"
+	"io"
+	"net/http"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/tusharbhardwaj/toolyard/internal/actor"
+	"github.com/tusharbhardwaj/toolyard/internal/approval"
+	"github.com/tusharbhardwaj/toolyard/internal/policy"
+)
+
+type githubAuth struct {
+	connected map[string]bool
+	tokens    map[string]string
+}
+
+func (a *githubAuth) ConnectedUsers(context.Context, string) ([]string, error) {
+	return []string{"alice", "bob"}, nil
+}
+func (a *githubAuth) UserConnected(_ context.Context, _, uid string) (bool, error) {
+	return a.connected[uid], nil
+}
+func (*githubAuth) FreshenUserToken(context.Context, string, string) error { return nil }
+func (*githubAuth) RefreshUserToken(context.Context, string, string) error { return nil }
+func (a *githubAuth) MarkUserUnauthorized(_ context.Context, _, uid, _ string) {
+	a.connected[uid] = false
+}
+
+type githubTransport struct {
+	mu      sync.Mutex
+	head    string
+	posts   int
+	tokens  []string
+	rows    []map[string]any
+	revoked bool
+}
+
+func (h *githubTransport) RoundTrip(r *http.Request) (*http.Response, error) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if r.URL.Host != "api.github.com" {
+		panic("token sent outside GitHub")
+	}
+	token := r.Header.Get("Authorization")
+	h.tokens = append(h.tokens, token)
+	code := 200
+	var data any = map[string]any{"state": "open", "head": map[string]string{"sha": h.head}}
+	id := int64(41)
+	login := "alice-gh"
+	if token == "Bearer bob-token" {
+		id = 42
+		login = "bob-gh"
+	}
+	switch {
+	case h.revoked:
+		code = 401
+		data = map[string]string{"message": "revoked"}
+	case r.URL.Path == "/user":
+		data = map[string]any{"id": id, "login": login}
+	case r.Method == http.MethodPost:
+		h.posts++
+		var payload map[string]any
+		_ = json.NewDecoder(r.Body).Decode(&payload)
+		payload["id"], payload["user"], payload["html_url"] = h.posts, map[string]any{"id": id}, "https://github.com/o/r/pull/7#comment"
+		h.rows = append(h.rows, payload)
+		data = payload
+		code = 201
+	case strings.HasSuffix(r.URL.Path, "/comments") || strings.HasSuffix(r.URL.Path, "/reviews"):
+		data = h.rows
+	}
+	b, _ := json.Marshal(data)
+	return &http.Response{StatusCode: code, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(string(b))), Request: r}, nil
+}
+
+func githubFixture(t *testing.T) (*accessFixture, *githubAuth, *githubTransport, context.Context, context.Context) {
+	t.Helper()
+	f := newAccessFixture(t, nil)
+	a := &githubAuth{connected: map[string]bool{"alice": true, "bob": true}, tokens: map[string]string{"alice": "alice-token", "bob": "bob-token"}}
+	h := &githubTransport{head: "aaa"}
+	f.gw.SetGitHubHTTPClient(&http.Client{Transport: h})
+	if err := f.gw.AddUpstream(context.Background(), UpstreamConfig{Name: "github", Transport: "github", URL: "https://api.github.com", PerUser: true, PerUserAuth: a, HeaderFunc: func(ctx context.Context) map[string]string {
+		uid, _ := UpstreamUser(ctx)
+		return map[string]string{"Authorization": "Bearer " + a.tokens[uid]}
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	f.bus.SetExecutor(f.gw)
+	alice := actor.WithRaiser(f.admin, actor.Raiser{CallerID: adminID, OwnerUserID: "alice"})
+	bob := actor.WithRaiser(f.admin, actor.Raiser{CallerID: adminID, OwnerUserID: "bob"})
+	return f, a, h, alice, bob
+}
+
+func githubCallArgs() map[string]any {
+	return map[string]any{ReasonField: "Explain the proposed pull request feedback to its author", "owner": "o", "repo": "r", "pull_number": float64(7), "body": "Please add a regression test."}
+}
+
+func githubPending(t *testing.T, f *accessFixture, ctx context.Context, tool string) *approval.Request {
+	t.Helper()
+	args := githubCallArgs()
+	if tool == "submit_pull_request_review" {
+		args["event"] = "REQUEST_CHANGES"
+	}
+	res := f.call(t, ctx, "github."+tool, args)
+	if res.IsError {
+		t.Fatalf("call failed: %+v", res)
+	}
+	rows, err := f.bus.ListPending(context.Background())
+	if err != nil || len(rows) != 1 {
+		t.Fatalf("pending=%+v err=%v", rows, err)
+	}
+	r, err := f.bus.Get(context.Background(), rows[0].ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return r
+}
+
+func githubDecide(t *testing.T, f *accessFixture, r *approval.Request) *approval.Request {
+	t.Helper()
+	if _, err := f.bus.DecideAs(context.Background(), r.ID, approval.StatusAllowed, actor.Decider{UserID: r.PersonalOwner(), Via: actor.ViaDashboard}); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		out, err := f.bus.Get(context.Background(), r.ID)
+		if err == nil && out.ResultExecutedAt > 0 {
+			return out
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatal("executor did not finish")
+	return nil
+}
+
+func TestGitHubAlwaysAsksOwnerAndExecutesOnce(t *testing.T) {
+	f, _, h, alice, _ := githubFixture(t)
+	if _, err := f.gw.policy.Set(context.Background(), policy.ScopeUpstream, "github", "allow", "", false); err != nil {
+		t.Fatal(err)
+	}
+	f.gw.approvalMode = func() string { return ApprovalModeInbox }
+	args := githubCallArgs()
+	args[IntentField] = "read"
+	args[GrantField] = "fake-grant"
+	res := f.call(t, alice, "github.create_pull_request_comment", args)
+	if res.IsError {
+		t.Fatal(res)
+	}
+	rows, _ := f.bus.ListPending(context.Background())
+	if len(rows) != 1 || h.posts != 0 {
+		t.Fatalf("pending %d posts %d", len(rows), h.posts)
+	}
+	req, _ := f.bus.Get(context.Background(), rows[0].ID)
+	if _, err := f.bus.DecideAs(context.Background(), req.ID, approval.StatusAllowed, actor.Decider{UserID: "bob", Via: actor.ViaDashboard}); err != approval.ErrWrongOwner {
+		t.Fatalf("wrong owner: %v", err)
+	}
+	out := githubDecide(t, f, req)
+	if out.ResultIsError || h.posts != 1 {
+		t.Fatalf("result=%+v posts=%d", out, h.posts)
+	}
+	// A deferred result fetch cannot rerun the write.
+	f.call(t, alice, "github.create_pull_request_comment", map[string]any{ApprovalIDField: req.ID})
+	if h.posts != 1 {
+		t.Fatal("resume duplicated write")
+	}
+	// Crash recovery reconciles the same persisted operation on GitHub.
+	f.gw.Execute(context.Background(), out)
+	if h.posts != 1 {
+		t.Fatal("recovery duplicated write")
+	}
+}
+
+func TestGitHubWritesFailAfterConnectionOrCommitChanges(t *testing.T) {
+	for _, change := range []string{"disconnect", "token", "head", "revoked"} {
+		t.Run(change, func(t *testing.T) {
+			f, a, h, alice, _ := githubFixture(t)
+			r := githubPending(t, f, alice, "create_pull_request_comment")
+			switch change {
+			case "disconnect":
+				a.connected["alice"] = false
+			case "token":
+				a.tokens["alice"] = "another-token"
+			case "head":
+				h.head = "bbb"
+			case "revoked":
+				h.revoked = true
+			}
+			out := githubDecide(t, f, r)
+			if !out.ResultIsError || h.posts != 0 {
+				t.Fatalf("unsafe write: %+v posts=%d", out, h.posts)
+			}
+		})
+	}
+}
+
+func TestGitHubReadsUseEachUsersToken(t *testing.T) {
+	f, _, h, alice, bob := githubFixture(t)
+	args := githubCallArgs()
+	delete(args, "body")
+	for _, ctx := range []context.Context{alice, bob} {
+		res := f.call(t, ctx, "github.get_pull_request", args)
+		if res.IsError {
+			t.Fatal(res)
+		}
+	}
+	if len(h.tokens) != 2 || h.tokens[0] != "Bearer alice-token" || h.tokens[1] != "Bearer bob-token" {
+		t.Fatalf("tokens=%v", h.tokens)
+	}
+}
+
+func TestGitHubReviewBindsCommitAndForbidsApprove(t *testing.T) {
+	f, _, h, alice, _ := githubFixture(t)
+	args := githubCallArgs()
+	args["event"] = "APPROVE"
+	if res := f.call(t, alice, "github.submit_pull_request_review", args); !res.IsError {
+		t.Fatal("agent approval accepted")
+	}
+	args = githubCallArgs()
+	args[approval.PersonalGitHubField] = map[string]any{"owner_user_id": "bob"}
+	if res := f.call(t, alice, "github.create_pull_request_comment", args); !res.IsError {
+		t.Fatal("forged snapshot accepted")
+	}
+	r := githubPending(t, f, alice, "submit_pull_request_review")
+	out := githubDecide(t, f, r)
+	if out.ResultIsError || h.posts != 1 || h.rows[0]["commit_id"] != "aaa" || h.rows[0]["event"] != "REQUEST_CHANGES" {
+		t.Fatalf("bad review: %+v", out)
+	}
+}
+
+func TestGitHubDeniedRequestSendsNoWrite(t *testing.T) {
+	f, _, h, alice, _ := githubFixture(t)
+	r := githubPending(t, f, alice, "create_pull_request_comment")
+	if _, err := f.bus.DecideAs(context.Background(), r.ID, approval.StatusDenied, actor.Decider{UserID: "alice", Via: actor.ViaDashboard}); err != nil {
+		t.Fatal(err)
+	}
+	f.call(t, alice, "github.create_pull_request_comment", map[string]any{ApprovalIDField: r.ID})
+	if h.posts != 0 {
+		t.Fatal("denied request executed")
+	}
+}
+
+func TestGitHubResultsStayWithOriginalOwner(t *testing.T) {
+	f, _, _, alice, bob := githubFixture(t)
+	r := githubPending(t, f, alice, "create_pull_request_comment")
+	// The same caller ID can acquire a different owner after account changes.
+	// The approval's original owner still controls its contents and results.
+	if f.gw.approvalVisible(bob, r) {
+		t.Fatal("new owner can inspect former owner's request")
+	}
+	if res, _ := f.gw.handlePollApproval()(bob, map[string]any{"approval_id": r.ID}); !res.IsError {
+		t.Fatal("poll leaked former owner's request")
+	}
+}
+
+func TestGitHubInlineCommentBindsCommitAndLine(t *testing.T) {
+	f, _, h, alice, _ := githubFixture(t)
+	args := githubCallArgs()
+	args["path"], args["line"], args["side"] = "src/main.go", float64(12), "RIGHT"
+	if res := f.call(t, alice, "github.create_review_comment", args); res.IsError {
+		t.Fatal(res)
+	}
+	rows, _ := f.bus.ListPending(context.Background())
+	if len(rows) != 1 || h.posts != 0 {
+		t.Fatal("inline comment did not wait")
+	}
+	r, _ := f.bus.Get(context.Background(), rows[0].ID)
+	out := githubDecide(t, f, r)
+	if out.ResultIsError || h.posts != 1 || h.rows[0]["commit_id"] != "aaa" || h.rows[0]["path"] != "src/main.go" || h.rows[0]["line"] != float64(12) {
+		t.Fatal("inline comment lost its approved location")
+	}
+}

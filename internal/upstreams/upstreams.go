@@ -187,7 +187,7 @@ func (s *Service) toCfg(srv Server) gateway.UpstreamConfig {
 		URL:       srv.URL,
 		Env:       srv.Env,
 	}
-	isHTTP := cfg.Transport == "http" || cfg.Transport == "streamable-http" || cfg.Transport == ""
+	isHTTP := cfg.Transport == "github" || cfg.Transport == "http" || cfg.Transport == "streamable-http" || cfg.Transport == ""
 
 	// stdio: resolve secret:// refs in Env at dial time via EnvFunc. The
 	// closure captures a copy of srv.Env so a later edit doesn't race.
@@ -336,6 +336,10 @@ func validate(srv Server) error {
 		return ErrReserved
 	}
 	switch srv.Transport {
+	case "github":
+		if srv.URL != "https://api.github.com" || srv.AuthMode != AuthPerUser || len(srv.Headers) != 0 || len(srv.Env) != 0 || srv.Command != "" || len(srv.Args) != 0 || srv.Identity != nil {
+			return fmt.Errorf("%w: GitHub requires per-user OAuth, the fixed GitHub API URL, and no shared credentials", ErrInvalid)
+		}
 	case "stdio":
 		if srv.Command == "" {
 			return fmt.Errorf("%w: stdio requires command", ErrInvalid)
