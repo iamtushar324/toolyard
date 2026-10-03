@@ -33,7 +33,9 @@ jobs:
           test -z "$(gofmt -l internal cmd)"
           node --check web/dashboard/app.js
       - name: Test connector and access boundaries
-        run: go test -race -p 2 -parallel 2 ./internal/githubapi ./internal/gateway ./internal/oauth ./internal/upstreams ./internal/api ./internal/approval ./internal/realtime ./internal/chatnotify -run 'GitHub|RoleGuard|PerUser|UserToken|User.*Refresh|Approval|Export|Actor|Connection|Decide' -count=1 -timeout=180s
+        run: go test -p 2 -parallel 2 ./internal/githubapi ./internal/gateway ./internal/oauth ./internal/upstreams ./internal/api ./internal/approval ./internal/realtime ./internal/chatnotify -run 'GitHub|RoleGuard|PerUser|UserToken|User.*Refresh|Approval|Export|Actor|Connection|Decide' -count=1 -timeout=180s
+      - name: Check GitHub concurrency
+        run: go test -race -p 2 -parallel 2 ./internal/githubapi ./internal/gateway ./internal/oauth ./internal/upstreams ./internal/api ./internal/approval -run GitHub -count=1 -timeout=180s
       - name: Build deployment binary
         run: |
           mkdir -p dist
