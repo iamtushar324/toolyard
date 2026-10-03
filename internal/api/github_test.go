@@ -153,6 +153,7 @@ func TestGitHubOperatorCannotActAsHumanDecider(t *testing.T) {
 		}
 		request := httptest.NewRequest("POST", path, strings.NewReader(body))
 		request.Header.Set("Authorization", "Bearer "+token)
+		request.Header.Set("Content-Type", "application/json")
 		rec := httptest.NewRecorder()
 		e.handler.ServeHTTP(rec, request)
 		if rec.Code != 403 {
