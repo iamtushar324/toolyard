@@ -1093,6 +1093,7 @@ func runServe(argv []string) error {
 
 	// REST API + dashboard.
 	apiSrv := api.New(ctx, api.Options{
+		BuildVersion: version, Environment: os.Getenv("TOOLYARD_ENVIRONMENT"),
 		Identity:                 idSvc,
 		Approval:                 bus,
 		Audit:                    auditSvc,

@@ -114,18 +114,58 @@ inbox.request({
 | `summary` | yes | ≤ 200 characters. The line on the inbox card. |
 | `message` | yes | First person. What you want to do, and the context your owner needs. |
 | `facts` | yes | `why_now`, `if_it_goes_wrong`, `undo`. Concrete; numbers over adjectives. |
-| `audio.script` | yes | See §5. |
+| `audio.script` | no | Optional audio summary. See §5 for limits. |
 | `urgency` | yes | `now` \| `soon` \| `digest` \| `fyi`. See §7. |
 | `tools` | yes | 1–12 entries. |
 | `attachments` | no | Up to 12. Strongly recommended. |
 | `ttl_seconds` | no | How long grants last once approved. Default 1800, max 86400. Ask for the shortest that works. |
-| `session_id` | no | From `session.start`. Groups your requests in your owner's Sessions view. |
+| `session_id` | no | From `session.start`. Attaches task context to related requests. |
 | `request_id` | no | On `inbox.post` updates: the request this update closes. |
 
-For a decision rather than a permission, use `inbox.ask` with the same
-`title`, `summary`, `message`, `audio` and `attachments`, plus `options`
-(2–4 entries of `{ "label", "detail" }`). Set `kind: "blocker"` if you're
-stuck, rather than choosing between options.
+For a question, use the version 2 `inbox.ask` contract. Audio is optional.
+
+```json
+{
+  "schema_version": 2,
+  "client_request_id": "stable-key-for-this-question",
+  "prompt": "Which checks must run?",
+  "context": "Choose the checks for this stage release.",
+  "question": {
+    "type": "multiple_choice",
+    "min_selections": 1,
+    "max_selections": 2,
+    "options": [
+      {"id": "mobile", "label": "Mobile layout"},
+      {"id": "keyboard", "label": "Keyboard access"},
+      {"id": "none", "label": "Neither", "exclusive": true}
+    ]
+  },
+  "task": {"title": "Review stage"},
+  "blocking": false
+}
+```
+
+Question types are `free_text`, `single_choice`, and `multiple_choice`.
+Free-text questions have no options. Choice questions accept 2–12 options with
+unique stable IDs and labels. An exclusive option cannot accompany another
+selection. A recommendation is a label, never a default selection.
+The owner can always submit custom text without a selection. Text can also
+accompany selected options. Selection alone never sends an answer.
+
+`inbox.status` and `inbox.wait` return `response.selected_option_ids`,
+`response.selected_labels`, and the exact `response.text`. The legacy `answer`
+string remains available. A saved answer becomes retrieved when the agent reads
+it through those tools. An answer grants no tool permission.
+
+The dashboard submits a `request_revision`, a stable `submission_id`, and
+`response` through the decision endpoint. A retry of the same answer from the
+same actor returns the saved result. A conflicting retry returns 409. Expired
+requests return 410. Drafts remain local to the user and browser tab for up to
+24 hours, and logout clears them.
+
+Older `inbox.ask` submissions with `title`, `summary`, `message`, and 2–4
+`options` remain supported. They appear as single-choice questions with a
+custom text field. Set `kind: "blocker"` when the question blocks progress.
 
 ## 4. Tools and parameters
 

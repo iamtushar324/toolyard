@@ -31,6 +31,8 @@ const (
 
 // Errors returned to callers.
 var (
+	ErrExpired         = errors.New("this request has expired")
+	ErrConflict        = errors.New("this request or submission has changed")
 	ErrNotFound        = errors.New("not found")
 	ErrNotPending      = errors.New("this request has already been decided")
 	ErrRequiredRefused = errors.New("a required tool was refused; send the request back to the agent instead")
@@ -89,6 +91,7 @@ type Service struct {
 	signer       *grantSigner
 	now          func() time.Time
 	bg           sync.WaitGroup
+	submitMu     sync.Mutex
 	watchMu      sync.Mutex
 	watch        map[string]chan struct{}
 	attnMu       sync.Mutex // one attention round (Tick / dispatch) at a time
@@ -209,8 +212,29 @@ func (s *Service) Submit(ctx context.Context, agentID string, sub *Submission) (
 	if sub.Kind == "" {
 		sub.Kind = KindAccess
 	}
+	s.submitMu.Lock()
+	defer s.submitMu.Unlock()
+	fingerprint := hashJSON(sub)
+	if sub.ClientRequestID != "" && !sub.DryRun {
+		var doc string
+		err := s.db.QueryRowContext(ctx, `SELECT doc FROM inbox_requests WHERE agent_id=? AND json_extract(doc,'$.client_request_id')=?`, agentID, sub.ClientRequestID).Scan(&doc)
+		if err == nil {
+			var prev Request
+			if err = json.Unmarshal([]byte(doc), &prev); err != nil {
+				return nil, err
+			}
+			if prev.SubmissionFingerprint != fingerprint {
+				return nil, ErrConflict
+			}
+			return &SubmitResult{OK: true, RequestID: prev.ID, Status: prev.Status, ExpiresAt: prev.ExpiresAt}, nil
+		}
+		if !errors.Is(err, sql.ErrNoRows) {
+			return nil, err
+		}
+	}
 	r, probs, warns := Validate(ctx, s.opts.Catalog, agentID, sub, ValidateOptions{AllowPrivateMedia: s.opts.AllowPrivateMedia})
 	r.AgentID = agentID
+	r.SubmissionFingerprint = fingerprint
 	for i := range r.Tools {
 		r.Tools[i].Flags = RuleFlags(r.Tools[i])
 	}
@@ -454,6 +478,10 @@ func preview(r *Request) *Preview {
 
 // Decision is what the owner chose.
 type Decision struct {
+	Response        *Response `json:"response,omitempty"`
+	RequestRevision int       `json:"request_revision,omitempty"`
+	SubmissionID    string    `json:"submission_id,omitempty"`
+
 	Action        string `json:"action"` // approve | deny | return | answer | snooze | read
 	Allow         []bool `json:"allow,omitempty"`
 	Note          string `json:"note,omitempty"`
@@ -513,8 +541,14 @@ func (s *Service) Decide(ctx context.Context, id string, d Decision) (*Request, 
 	// the credential's sign count) and is re-checked inside it, in case
 	// the judge flagged a tool in between.
 	passkeyOn, verified := false, false
-	if d.Action == "approve" && s.opts.Passkeys != nil && s.opts.Passkeys.Enabled(ctx) {
-		passkeyOn = true
+	if d.Action == "approve" && s.opts.Passkeys != nil {
+		var err error
+		passkeyOn, err = s.opts.Passkeys.CheckEnabled(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("%w: cannot check registered passkeys", ErrPasskeyFailed)
+		}
+	}
+	if passkeyOn {
 		if pre, err := s.Get(ctx, id); err == nil && pre.IsOpen() && NeedsPasskey(pre, d.Allow) {
 			if d.Passkey == nil {
 				return nil, ErrPasskeyRequired
@@ -531,6 +565,17 @@ func (s *Service) Decide(ctx context.Context, id string, d Decision) (*Request, 
 	who, how := deciderLabel(dec), deciderSuffix(dec)
 	var out *Request
 	err := s.mutateTx(ctx, id, func(tx *sql.Tx, r *Request) error {
+		if d.Action == "answer" && d.SubmissionID != "" && r.AnswerSubmissionID == d.SubmissionID {
+			if r.AnswerFingerprint != answerFingerprint(d) {
+				return ErrConflict
+			}
+			r.Replayed = true
+			out = r
+			return nil
+		}
+		if r.ExpiresAt > 0 && s.now().UnixMilli() >= r.ExpiresAt {
+			return ErrExpired
+		}
 		if d.Action != "snooze" && r.Status != StatusPending {
 			return ErrNotPending
 		}
@@ -621,10 +666,9 @@ func (s *Service) Decide(ctx context.Context, id string, d Decision) (*Request, 
 			if r.Kind != KindQuestion && r.Kind != KindBlocker {
 				return ErrBadDecision
 			}
-			if d.Option == nil || *d.Option < 0 || *d.Option >= len(r.Options) {
-				return errors.New("pick one of the options")
+			if err := answerQuestion(r, d, now); err != nil {
+				return err
 			}
-			r.Answer = r.Options[*d.Option].Label
 			r.Status = StatusAnswered
 			r.addActivity(now, who+" answered"+how+": "+r.Answer)
 		case "read":
@@ -654,6 +698,9 @@ func (s *Service) Decide(ctx context.Context, id string, d Decision) (*Request, 
 	if err != nil {
 		return nil, err
 	}
+	if out.Replayed {
+		return out, nil
+	}
 	s.wake(id)
 	if d.Action == "snooze" {
 		s.enqueuePush(ctx, out, "snooze_end", out.ID, time.UnixMilli(out.SnoozedUntil))
@@ -673,6 +720,7 @@ func withNote(n string) string {
 
 // AgentView is what an agent sees about one of its requests.
 type AgentView struct {
+	Response     *AnswerResponse `json:"response,omitempty"`
 	RequestID    string          `json:"request_id"`
 	Kind         string          `json:"kind"`
 	Status       string          `json:"status"`
@@ -709,8 +757,21 @@ func (s *Service) Status(ctx context.Context, agentID string, ids []string) ([]A
 			out = append(out, AgentView{RequestID: id, Status: "not_found", Next: "No request with this ID belongs to you."})
 			continue
 		}
+		if r.Status == StatusAnswered && r.RetrievedAt == 0 {
+			if err := s.mutate(ctx, id, func(current *Request) error {
+				if current.RetrievedAt == 0 {
+					current.RetrievedAt = s.now().UnixMilli()
+					current.addActivity(current.RetrievedAt, "Agent retrieved the answer")
+				}
+				r = current
+				return nil
+			}); err != nil {
+				return nil, err
+			}
+			s.publish("inbox", s.cardView(ctx, r))
+		}
 		v := AgentView{RequestID: r.ID, Kind: r.Kind, Status: r.Status, SnoozedUntil: r.SnoozedUntil, OwnerNote: r.OwnerNote,
-			Answer: r.Answer, ExpiresAt: r.ExpiresAt, GrantsExpire: r.GrantsExpire}
+			Answer: r.Answer, Response: r.Response, ExpiresAt: r.ExpiresAt, GrantsExpire: r.GrantsExpire}
 		var toks map[string]string
 		if r.Status == StatusApproved {
 			toks, err = s.collectTokens(ctx, r.ID, agentID)

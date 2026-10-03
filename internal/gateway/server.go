@@ -12,6 +12,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/google/uuid"
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
 
@@ -1640,6 +1641,15 @@ func (g *Gateway) dispatch(ctx context.Context, entry toolEntry, args map[string
 	// their own (tools.execute, executeToolCode): extractReason stripped it
 	// from args, and the nested call must carry it again.
 	callCtx = withCallReason(callCtx, reason)
+	// Each dispatch has a durable intent before the handler can change anything.
+	dispatchID := "dispatch_" + uuid.NewString()
+	auditArgs, _ := json.Marshal(args)
+	intent := audit.Event{ID: dispatchID + ".started", EventType: "call.dispatch", AgentID: agentID, UpstreamName: entry.upstream, ToolName: entry.tool.Name, Reason: reason, ApprovalID: approvalID, Arguments: auditArgs, Raiser: actor.Raiser{OwnerUserID: asUser}}
+	if err := g.audit.Write(ctx, intent); err != nil {
+		ev.Outcome = metrics.OutcomeError
+		ev.ErrorClass = "audit_unavailable"
+		return mcp.NewToolResultError("Audit unavailable. The tool did not run."), nil
+	}
 	res, err := entry.handle(callCtx, args)
 	ev.UpstreamLatencyMs = int(time.Since(upstreamStart).Milliseconds())
 	if errors.Is(err, context.DeadlineExceeded) {
@@ -1647,38 +1657,42 @@ func (g *Gateway) dispatch(ctx context.Context, entry toolEntry, args map[string
 			entry.tool.Name, entry.upstream, agentID,
 			time.Since(upstreamStart).Round(time.Millisecond), g.upstreamCallTimeout)
 	}
+	if res == nil && err == nil {
+		err = errors.New("upstream returned no result")
+	}
+	outcome := intent
+	outcome.ID = dispatchID + ".completed"
+	outcome.Arguments = nil
+	outcome.EventType = audit.EventCallSucceeded
 	if err != nil {
-		// A shared OAuth server that answered 401: the token is dead, so
-		// the agent gets the sign-in guidance instead of a bare failure.
-		if u != nil && isUnauthorized(err) {
-			if res := g.refuseSharedSignIn(ctx, u, entry, agentID, reason, approvalID, err, ev); res != nil {
-				return res, nil
-			}
+		outcome.EventType = audit.EventCallFailed
+		outcome.ResultSummary = err.Error()
+	} else {
+		outcome.ResultSummary = summariseResult(res)
+		if res.IsError {
+			outcome.EventType = audit.EventCallFailed
 		}
-		_ = g.audit.Write(ctx, audit.Event{
-			EventType:     audit.EventCallFailed,
-			AgentID:       agentID,
-			UpstreamName:  entry.upstream,
-			ToolName:      entry.tool.Name,
-			Reason:        reason,
-			ApprovalID:    approvalID,
-			ResultSummary: err.Error(),
-			Raiser:        actor.Raiser{OwnerUserID: asUser},
-		})
+	}
+	// A caller disconnect must not erase the final audit record.
+	auditCtx, auditCancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+	auditErr := g.audit.Write(auditCtx, outcome)
+	auditCancel()
+	if auditErr != nil {
+		ev.Outcome = metrics.OutcomeError
+		ev.ErrorClass = "audit_outcome_unknown"
+		return mcp.NewToolResultError("Tool outcome unknown: completion audit failed. Do not retry. Review dispatch " + dispatchID + " before another action."), nil
+	}
+	if err != nil {
 		ev.Outcome = metrics.OutcomeError
 		ev.ErrorClass = "upstream"
+		if u != nil && isUnauthorized(err) {
+			if result := g.refuseSharedSignIn(ctx, u, entry, agentID, reason, approvalID, err, ev); result != nil {
+				return result, nil
+			}
+		}
 		return mcp.NewToolResultErrorFromErr("tool failed", err), nil
 	}
-	_ = g.audit.Write(ctx, audit.Event{
-		EventType:     audit.EventCallSucceeded,
-		AgentID:       agentID,
-		UpstreamName:  entry.upstream,
-		ToolName:      entry.tool.Name,
-		Reason:        reason,
-		ApprovalID:    approvalID,
-		ResultSummary: summariseResult(res),
-		Raiser:        actor.Raiser{OwnerUserID: asUser},
-	})
+
 	if g.usage != nil && !res.IsError {
 		// We treat IsError=true (e.g., "key not found") as a logical
 		// failure even though the call dispatched cleanly, so it does

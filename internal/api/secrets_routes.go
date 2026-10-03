@@ -235,7 +235,7 @@ func (s *Server) serversConvertEnv(w http.ResponseWriter, r *http.Request, name 
 		})
 	if err != nil {
 		if srv != nil {
-			writeJSON(w, http.StatusAccepted, map[string]any{"server": upstreams.Masked(*srv), "warning": err.Error()})
+			writeJSON(w, http.StatusAccepted, map[string]any{"server": upstreams.Masked(*srv), "warning": serverWarning(err, *srv)})
 			return
 		}
 		status := http.StatusBadRequest

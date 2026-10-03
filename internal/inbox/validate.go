@@ -65,6 +65,14 @@ const (
 // inbox.post. Params stay raw here so a bad constraint is reported with
 // its path instead of failing the whole decode.
 type Submission struct {
+	SchemaVersion   int          `json:"schema_version,omitempty"`
+	ClientRequestID string       `json:"client_request_id,omitempty"`
+	Prompt          string       `json:"prompt,omitempty"`
+	Context         string       `json:"context,omitempty"`
+	Question        *Question    `json:"question,omitempty"`
+	Task            *TaskContext `json:"task,omitempty"`
+	Blocking        bool         `json:"blocking,omitempty"`
+
 	Kind        string           `json:"kind,omitempty"`
 	SessionID   string           `json:"session_id,omitempty"`
 	RelatedID   string           `json:"request_id,omitempty"`
@@ -120,6 +128,7 @@ type ValidateOptions struct {
 // is returned even when there are problems, so dry runs can still compute
 // flags and a preview.
 func Validate(ctx context.Context, cat Catalog, agentID string, s *Submission, opt ...ValidateOptions) (*Request, []Problem, []Problem) {
+	s = normalizeQuestion(s)
 	var vo ValidateOptions
 	if len(opt) > 0 {
 		vo = opt[0]
@@ -129,6 +138,7 @@ func Validate(ctx context.Context, cat Catalog, agentID string, s *Submission, o
 	warn := func(path, format string, a ...any) { warns = append(warns, Problem{path, fmt.Sprintf(format, a...)}) }
 
 	r := &Request{
+		SchemaVersion: s.SchemaVersion, Revision: 1, ClientRequestID: s.ClientRequestID, Question: s.Question, Task: s.Task, Blocking: s.Blocking,
 		Kind:       s.Kind,
 		SessionID:  strings.TrimSpace(s.SessionID),
 		RelatedID:  strings.TrimSpace(s.RelatedID),
@@ -166,9 +176,7 @@ func Validate(ctx context.Context, cat Catalog, agentID string, s *Submission, o
 
 	// Voice note.
 	script := r.Audio.Script
-	if script == "" {
-		add("audio.script", "missing. Every request needs a voice note: at most %d words, first person, written to be heard.", MaxAudioWords)
-	} else {
+	if script != "" {
 		if n := len(strings.Fields(script)); n > MaxAudioWords {
 			add("audio.script", "%d words; max %d. Keep what you want, why it's safe, one number, and the exact ask.", n, MaxAudioWords)
 		}
@@ -253,17 +261,7 @@ func Validate(ctx context.Context, cat Catalog, agentID string, s *Submission, o
 		if len(s.Tools) > 0 {
 			add("tools", "a question can't carry tools; send an access request for permissions")
 		}
-		if len(s.Options) < MinOptions || len(s.Options) > MaxOptions {
-			add("options", "give %d to %d options", MinOptions, MaxOptions)
-		}
-		for i := range r.Options {
-			r.Options[i].Label = strings.TrimSpace(r.Options[i].Label)
-			r.Options[i].Detail = strings.TrimSpace(r.Options[i].Detail)
-			checkText(add, fmt.Sprintf("options[%d].label", i), r.Options[i].Label, MaxOptionLabel, "")
-			if utf8.RuneCountInString(r.Options[i].Detail) > MaxOptionDetail {
-				add(fmt.Sprintf("options[%d].detail", i), "too long; max %d characters", MaxOptionDetail)
-			}
-		}
+		validateQuestion(r, s, add)
 		r.TTLSeconds = 0
 	case KindUpdate:
 		if len(s.Tools) > 0 || len(s.Options) > 0 {

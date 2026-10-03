@@ -415,9 +415,14 @@ func (s *Service) Reset(ctx context.Context) (int64, error) {
 
 // Enabled implements inbox.PasskeyGate: any passkey registered.
 func (s *Service) Enabled(ctx context.Context) bool {
+	on, err := s.CheckEnabled(ctx)
+	return err != nil || on
+}
+
+func (s *Service) CheckEnabled(ctx context.Context) (bool, error) {
 	var n int
-	_ = s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM inbox_passkeys`).Scan(&n)
-	return n > 0
+	err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM inbox_passkeys`).Scan(&n)
+	return n > 0, err
 }
 
 // VerifyCredential implements inbox.PasskeyGate: it checks the assertion

@@ -422,7 +422,7 @@ func TestDryRunRateLimit(t *testing.T) {
 func TestSubmitWithProblemsIsNotStored(t *testing.T) {
 	e := newEnv(t)
 	s := deploySubmission()
-	s.Audio.Script = ""
+	s.Title = ""
 	res, err := e.svc.Submit(context.Background(), "ag_1", s)
 	if err != nil {
 		t.Fatal(err)

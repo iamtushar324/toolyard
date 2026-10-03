@@ -22,7 +22,7 @@ const state = {
   // held only in memory from a reveal until the owner dismisses it.
   myKey: freshMyKey(),
   serverEditModal: null,   // { name, http, url, headersText, identityOn, header, register, enabled, orig, error, saving } while editing a server
-  route: 'approvals',
+  route: 'inbox',
   approvals: [],
   recentApprovals: [],     // /v1/approvals: the latest decided rows, for "Recently decided"
   audit: [],
@@ -213,7 +213,7 @@ function isAdmin() {
 const MEMBER_ROUTES = ['agents', 'myservers', 'connections'];
 
 function defaultRoute() {
-  return isAdmin() ? 'approvals' : 'agents';
+  return isAdmin() ? 'inbox' : 'agents';
 }
 
 function routeAllowed(route) {
@@ -2689,8 +2689,9 @@ function viewUsers() {
 }
 
 function viewServers() {
-  const transport = (state._serverDraft && state._serverDraft.transport) || 'stdio';
-  const draft = state._serverDraft || (state._serverDraft = { transport: 'stdio' });
+  const defaultTransport = state.authConfig?.environment === 'stage' ? 'http' : 'stdio';
+  const transport = (state._serverDraft && state._serverDraft.transport) || defaultTransport;
+  const draft = state._serverDraft || (state._serverDraft = { transport: defaultTransport });
 
   const setDraft = (k, v) => { draft[k] = v; render(); };
 
@@ -2700,13 +2701,13 @@ function viewServers() {
       el('select', {
         on: { change: (e) => setDraft('transport', e.target.value) }
       },
-        el('option', { value: 'stdio',           selected: transport === 'stdio'           }, 'stdio (subprocess)'),
+        state.authConfig?.environment !== 'stage' ? el('option', { value: 'stdio', selected: transport === 'stdio' }, 'stdio (subprocess)') : null,
         el('option', { value: 'http',            selected: transport === 'http'            }, 'streamable HTTP'),
       ),
     ),
     el('label', { style: 'flex: 1;' },
       el('div', { class: 'meta' }, 'Server name'),
-      el('input', { id: 'srv-name', placeholder: 'e.g. github', value: draft.name || '' }),
+      el('input', { id: 'srv-name', on: { input: (e) => { draft.name = e.target.value; } }, placeholder: 'e.g. github', value: draft.name || '' }),
     ),
   );
 
@@ -2715,27 +2716,27 @@ function viewServers() {
         el('div', { class: 'row' },
           el('label', { style: 'flex: 1;' },
             el('div', { class: 'meta' }, 'Command'),
-            el('input', { id: 'srv-cmd', placeholder: 'e.g. uvx', value: draft.command || '' }),
+            el('input', { id: 'srv-cmd', on: { input: (e) => { draft.command = e.target.value; } }, placeholder: 'e.g. uvx', value: draft.command || '' }),
           ),
           el('label', { style: 'flex: 2;' },
             el('div', { class: 'meta' }, 'Args (one per line)'),
-            el('textarea', { id: 'srv-args', placeholder: 'mcp-server-github', value: (draft.args || []).join('\n') }),
+            el('textarea', { id: 'srv-args', on: { input: (e) => { draft.args = e.target.value.split('\n'); } }, placeholder: 'mcp-server-github', value: (draft.args || []).join('\n') }),
           ),
         ),
       )
     : el('label', {},
         el('div', { class: 'meta' }, 'URL'),
-        el('input', { id: 'srv-url', placeholder: 'https://example.com/mcp', value: draft.url || '' }),
+        el('input', { id: 'srv-url', on: { input: (e) => { draft.url = e.target.value; } }, placeholder: 'https://example.com/mcp', value: draft.url || '' }),
       );
 
   const envRow = el('label', {},
     el('div', { class: 'meta' }, 'Environment (KEY=VALUE per line, optional). Use ', el('code', {}, 'KEY=secret://NAME'), ' to reference a stored secret.'),
-    el('textarea', { id: 'srv-env', placeholder: 'GITHUB_PERSONAL_ACCESS_TOKEN=secret://GITHUB_TOKEN', value: draftEnvAsText(draft) }),
+    el('textarea', { id: 'srv-env', on: { input: (e) => { draft._envText = e.target.value; } }, placeholder: 'GITHUB_PERSONAL_ACCESS_TOKEN=secret://GITHUB_TOKEN', value: draft._envText ?? draftEnvAsText(draft) }),
   );
 
   const headersRow = transport !== 'stdio' ? el('label', {},
     el('div', { class: 'meta' }, 'HTTP headers (Header: value per line, optional). Values may be ', el('code', {}, 'secret://NAME'), '.'),
-    el('textarea', { id: 'srv-headers', placeholder: 'X-Api-Key: secret://MY_API_KEY', value: '' }),
+    el('textarea', { id: 'srv-headers', on: { input: (e) => { draft._headersText = e.target.value; } }, placeholder: 'X-Api-Key: secret://MY_API_KEY', value: draft._headersText || '' }),
   ) : null;
 
   // Identity forwarding is per HTTP server; its fields live on the draft.
@@ -2822,7 +2823,7 @@ function viewServers() {
       identityRow,
       el('div', { class: 'row', style: 'margin-top: 12px;' },
         el('button', { class: 'primary', on: { click: () => addServer() }}, 'Add server'),
-        el('button', { on: { click: () => { state._serverDraft = { transport: 'stdio' }; render(); } } }, 'Reset'),
+        el('button', { on: { click: () => { state._serverDraft = { transport: defaultTransport }; render(); } } }, 'Reset'),
       ),
     ),
     el('div', { class: 'card' },
@@ -2874,8 +2875,8 @@ function viewServers() {
 }
 
 function transportLabel(s) {
-  if (s.transport === 'stdio') return s.command + (s.args && s.args.length ? ' ' + s.args.join(' ') : '');
-  return s.url || '';
+ if (s.transport === 'stdio') return s.command;
+ try { const u = new URL(s.url); return u.host + u.pathname; } catch { return 'HTTP'; }
 }
 
 // serverStatusBadge: connected, or the recorded failure. A per_user server
@@ -4082,6 +4083,19 @@ function pushSupportStatus() {
 }
 
 function viewSettings() {
+  const page = viewSettingsContent();
+  const heading = el('div', { class: 'page-heading' }, el('h2', {}, 'Settings'), el('p', { class: 'meta' }, 'Control workspace access, permissions, and notifications.'));
+  for (const card of [...page.children]) {
+    if (!card.classList.contains('card')) continue;
+    const title = card.querySelector('h2,h3')?.textContent || 'More settings';
+    const details = el('details', { class: 'connection-setup' }, el('summary', {}, title));
+    card.replaceWith(details); details.appendChild(card);
+  }
+  page.prepend(heading);
+  return page;
+}
+
+function viewSettingsContent() {
   const mode = state.settings.surface_mode || 'full';
   const N    = Number(state.settings.top_n_count || 20);
   const T    = Number(state.settings.top_n_personalize_after || 100);
@@ -4184,12 +4198,12 @@ function viewSettings() {
     ),
     renderInboxSettingsCard(),
     renderPushCard(),
-    renderChatCard(),
+    state.authConfig?.environment !== 'stage' ? renderChatCard() : null,
     renderSecretsCard(),
     renderOperatorTokensCard(),
     el('div', { class: 'card' },
       el('h2', {}, 'About'),
-      el('p', {}, 'toolyard v0.1.0 — Apache-2.0.'),
+      el('p', {}, 'Toolyard ' + (state.authConfig?.version || '') + ' · ' + (state.authConfig?.environment || 'Workspace')),
       el('p', { class: 'meta' }, 'Single Go binary + SQLite. Source: ', el('code', {}, 'github.com/tusharbhardwaj/toolyard')),
     ),
     renderBackupCard(),
@@ -5399,7 +5413,7 @@ function navigate(route) {
     if (route === 'inbox') loadInbox();
   }
   state.route = route;
-  history.replaceState(null, '', '#' + route);
+  if (location.hash !== '#' + route) history.pushState(null, '', '#' + route);
   if ((route === 'insights' || route === 'notifications') && !state.insights.loading) {
     loadInsights();
   }
@@ -5414,8 +5428,9 @@ function navigate(route) {
 }
 
 function shell(content) {
+  const selectedNav = key => key === state.route || ({servers:['connections'],agents:['users'],audit:['hooks','insights'],tools:['approvals']}[key] || []).includes(state.route);
   const navBtn = (key, label) => el('button', {
-    class: state.route === key ? 'active' : '',
+    class: selectedNav(key) ? 'active' : '', 'aria-current': selectedNav(key) ? 'page' : 'false',
     on: { click: () => navigate(key) }
   }, label);
 
@@ -5436,31 +5451,22 @@ function shell(content) {
 
   const admin = isAdmin();
 
-  return el('div', {},
+  return el('div', { class: 'app-shell' },
     el('header', {},
-      el('div', { class: 'brand' }, el('span', { class: 'dot' }), 'toolyard'),
+      el('div', { class: 'brand' }, el('span', { class: 'brand-symbol' }, 't'), 'Toolyard'),
+      state.authConfig?.environment === 'stage' ? el('div', { class: 'stage-label', title: state.authConfig.version }, 'STAGE', el('span', {}, state.authConfig.version || 'Test workspace')) : null,
       // Members see only their agents and the servers granted to them.
-      admin ? el('nav', {},
-        navBtn('inbox',        'Inbox' + (inboxBadgeCount() ? ' (' + inboxBadgeCount() + ')' : '')),
-        navBtn('approvals',    'Approvals'),
-        navBtn('call',         'Call' + (state.call.active ? ' ●' : '')),
-        navBtn('events',       'Events' + (state.events.unacked ? ' (' + state.events.unacked + ')' : '')),
-        navBtn('insights',     'Insights'),
-        navBtn('notifications', 'Alerts' + (alertCount ? ' (' + alertCount + ')' : '')),
-        navBtn('audit',        'Audit'),
-        navBtn('hooks',        'Hooks'),
-        navBtn('servers',      'Servers'),
-        navBtn('tools',        'Tools'),
-        navBtn('memory',       'Memory'),
-        navBtn('mempalace',    'MemPalace'),
-        navBtn('agents',       'Agents'),
-        navBtn('connections',  'My connections'),
-        navBtn('users',        'Users'),
-        navBtn('settings',     'Settings'),
-      ) : el('nav', {},
-        navBtn('agents',       'Agents'),
-        navBtn('myservers',    'My servers'),
-        navBtn('connections',  'My connections'),
+      admin ? el('nav', { 'aria-label': 'Main navigation' },
+        el('span', { class: 'nav-label' }, 'Workspace'),
+        navBtn('inbox', 'Inbox' + (inboxBadgeCount() ? '  ' + inboxBadgeCount() : '')),
+        navBtn('servers', 'Connections'),
+        navBtn('audit', 'Activity'),
+        el('span', { class: 'nav-label' }, 'Manage'),
+        navBtn('agents', 'People & agents'),
+        navBtn('tools', 'Tools & policies'),
+        navBtn('settings', 'Settings'),
+      ) : el('nav', { 'aria-label': 'Main navigation' },
+        navBtn('agents', 'Agents'), navBtn('myservers', 'Available services'), navBtn('connections', 'Connections'),
       ),
       el('span', { class: 'user' },
         admin ? renderStreamPill() : null,
@@ -5470,6 +5476,7 @@ function shell(content) {
       ),
       state.user ? el('button', { on: { click: async () => {
         const viaClerk = state.user.auth === 'clerk';
+        ibClearDrafts();
         state.myKey = freshMyKey(); // never leave a revealed key for the next person
         try { await api('/v1/auth/logout', { method: 'POST' }); } catch {}
         if (evtSrc) try { evtSrc.close(); } catch {}
@@ -5486,9 +5493,8 @@ function shell(content) {
     // the four primary routes.
     el('div', { class: 'bottom-nav' }, admin ? el('div', { class: 'row' },
       bottomItem('inbox',     '✉', 'Inbox', inboxBadgeCount()),
-      bottomItem('approvals', '✓', 'Approvals', pendingCount),
-      bottomItem('servers',   '⌘', 'Servers'),
-      bottomItem('notifications', '◔', 'Alerts', alertCount),
+      bottomItem('servers', '⌘', 'Connections'),
+      bottomItem('audit', '≡', 'Activity'),
       el('button', {
         class: ['audit','hooks','memory','agents','users','settings','insights','tools','connections'].includes(state.route) ? 'active' : '',
         on: { click: () => { state.moreSheet = true; render(); } }
@@ -5520,16 +5526,9 @@ function renderMoreSheet() {
     el('div', { class: 'modal', style: 'display: flex; flex-direction: column; gap: 6px;' },
       el('h3', {}, 'More'),
       isAdmin() ? [
-        item('tools',    'Tools',    'Run any tool from the catalog'),
-        item('call',     'Call',     'Talk to Toolyard through Gemini Live'),
-        item('insights', 'Insights', 'Per-tool, per-agent, cost breakdowns'),
-        item('audit',    'Audit',    'Append-only event log'),
-        item('hooks',    'Hooks',    'Agent lifecycle events and memory ingest'),
-        item('memory',   'Memory',   'Scope/key-value store'),
-        item('agents',   'Agents',   'Manage enrolled agents'),
-        item('connections', 'My connections', 'Sign in to servers that act as you'),
-        item('users',    'Users',    'Roles, blocking and server access'),
-        item('settings', 'Settings', 'Surface mode, auto-approval, retention'),
+        item('agents', 'People & agents', 'Manage access and enrolled agents'),
+        item('tools', 'Tools & policies', 'Review tool access'),
+        item('settings', 'Settings', 'Workspace preferences'),
       ] : [
         item('agents',    'Agents',     'Manage your enrolled agents'),
         item('myservers', 'My servers', 'Servers your agents may use'),
@@ -5627,7 +5626,7 @@ function render() {
     case 'memory':        body = viewMemory();        break;
     case 'mempalace':     body = viewMempalace();     break;
     case 'agents':        body = viewAgents();        break;
-    case 'servers':       body = viewServers();       break;
+    case 'servers':       body = viewConnectionHub();       break;
     case 'tools':         body = viewTools();         break;
     case 'settings':      body = viewSettings();      break;
     case 'insights':      body = viewInsights();      break;
@@ -5637,7 +5636,7 @@ function render() {
     case 'inbox':         body = viewInbox();         break;
     default:              body = viewApprovals();
   }
-  root.appendChild(shell(body));
+  root.appendChild(shell(withSectionTabs(body)));
   restoreFocus(focus);
 }
 
@@ -6689,6 +6688,106 @@ async function preloadOAuthStatus() {
 }
 
 
+
+function withSectionTabs(body) {
+  if (!isAdmin()) return body;
+  const groups = [
+    [['servers', 'Services'], ['connections', 'My accounts']],
+    [['agents', 'Agents'], ['users', 'People']],
+    [['audit', 'Calls'], ['hooks', 'Agent events'], ['insights', 'Usage']],
+    [['tools', 'Tool policies'], ['approvals', 'Earlier approvals']],
+  ];
+  const group = groups.find(g => g.some(([key]) => key === state.route));
+  if (!group) return body;
+  return el('div', {}, el('div', { class: 'section-tabs' }, ...group.map(([key,label]) => el('button', {
+    class: state.route === key ? 'active' : '', on: { click: () => navigate(key) }
+  }, label))), body);
+}
+function viewConnectionHub() {
+  const page = viewServers();
+  const cards = [...page.children].filter(n => n.classList.contains('card'));
+  const connected = cards.find(n => n.querySelector('h2')?.textContent === 'Connected servers');
+  if (connected) {
+    connected.querySelector('h2').textContent = 'Connections'; page.prepend(connected);
+    const table = connected.querySelector('table');
+    if (table) {
+      const rows = [...table.querySelectorAll('tbody > tr')];
+      const list = el('div', { class:'connection-list' }, ...state.servers.map((srv,i) => {
+        const cells = rows[i] ? [...rows[i].children] : [];
+        const controls = el('div', { class:'connection-controls' });
+        for (const [index,label] of [[5,'Account access'],[6,'Permission policy'],[7,'Actions']]) {
+          if (cells[index]) controls.appendChild(el('div', {}, el('span', { class:'meta' }, label), ...[...cells[index].childNodes]));
+        }
+        return el('div', { class:'connection-row' },
+          el('div', { class:'connection-name' }, el('strong', {}, srv.name),
+            el('span', { class:'meta' }, (srv.auth_mode === 'per_user' ? 'Personal accounts' : 'Shared connection') + ' · ' + (srv.tool_count || 0) + ' tools')),
+          serverStatusBadge(srv),
+          el('details', { class:'connection-manage' }, el('summary', { 'aria-label':'Manage ' + srv.name }, 'Manage'),
+            el('div', { class:'connection-panel' }, el('p', { class:'meta' }, transportLabel(srv)), controls)));
+      }));
+      table.replaceWith(list);
+    }
+  }
+  for (const card of cards.filter(n => n !== connected)) {
+    const title = card.querySelector('h2')?.textContent || 'Add a service';
+    const details = el('details', { class: 'connection-setup' }, el('summary', {}, title));
+    card.replaceWith(details); details.appendChild(card);
+  }
+  return page;
+}
+const ibDrafts = new Map();
+function ibDraftKey(r) { return 'toolyard.answer.' + (state.user?.id || '') + '.' + r.id + '.' + (r.revision || 0); }
+function ibDraft(r) {
+  const key = ibDraftKey(r);
+  if (!ibDrafts.has(key)) {
+    let d;
+    try { d = JSON.parse(sessionStorage.getItem(key)); } catch {}
+    if (!d || Date.now() - d.at > 24 * 3600000) d = { selected: [], text: '', submission: crypto.randomUUID(), at: Date.now() };
+    ibDrafts.set(key, d);
+  }
+  return ibDrafts.get(key);
+}
+function ibSaveDraft(r, d) { d.at = Date.now(); try { sessionStorage.setItem(ibDraftKey(r), JSON.stringify(d)); } catch {} }
+function ibDropDraft(r) { const key=ibDraftKey(r); ibDrafts.delete(key); try { sessionStorage.removeItem(key); } catch {} }
+function ibClearDrafts() { ibDrafts.clear(); state.inbox.notes = {};  try { Object.keys(sessionStorage).filter(k => k.startsWith('toolyard.answer.')).forEach(k => sessionStorage.removeItem(k)); } catch {} }
+function ibAnswerForm(r) {
+  if (r.status !== 'pending') return el('div', { class: 'ib-sec answer-section' }, ibResultEl(r));
+  const d = ibDraft(r), q = r.question || { type: 'single_choice', max_selections: 1 };
+  const options = (q.options || r.options || []).map((o,i) => ({ ...o, id: o.id || 'option_' + (i+1) }));
+  const busy = !!state.inbox.busy, multi = q.type === 'multiple_choice';
+  const fieldset = el('fieldset', { class: 'answer-options', disabled: busy },
+    el('legend', {}, q.type === 'free_text' ? 'Write your answer' : multi ? 'Select all that apply, or write your own answer' : 'Choose one, or write your own answer'),
+    ...options.map((o,i) => el('label', { class: 'answer-option' + (d.selected.includes(o.id) ? ' selected' : '') },
+      el('input', { id: 'answer-option-' + i, type: multi ? 'checkbox' : 'radio', name: 'answer-choice', checked: d.selected.includes(o.id), on: { change: e => {
+        d.submission = crypto.randomUUID();
+        if (!multi || o.exclusive) d.selected = e.target.checked ? [o.id] : [];
+        else { const excluded = options.filter(x => x.exclusive).map(x => x.id); d.selected = d.selected.filter(id => !excluded.includes(id) && id !== o.id); if (e.target.checked) d.selected.push(o.id); }
+        ibSaveDraft(r,d); ibRegion('decide',ibAnswerForm(r));
+      } } }),
+      el('span', {}, el('strong', {}, o.label), o.recommended ? el('small', { class: 'option-recommended' }, 'Suggested') : null, o.detail ? el('small', {}, o.detail) : null)
+    )));
+  const error = el('p', { class: 'answer-error', role: 'alert', id: 'answer-error' });
+  const text = el('textarea', { id: 'answer-text', rows: 4, maxlength: 10000, value: d.text, disabled: busy,
+    placeholder: 'Write your answer or add context…', 'aria-describedby': 'answer-help answer-error',
+    on: { input: e => { d.text = e.target.value; d.submission = crypto.randomUUID(); ibSaveDraft(r,d); error.textContent = ''; } }
+  });
+  return el('form', { class: 'ib-sec answer-section', on: { submit: e => {
+    e.preventDefault(); if (busy) return;
+    if (!d.selected.length && !d.text.trim()) { error.textContent = 'Write an answer or choose an option.'; text.focus(); return; }
+    if (q.max_selections && d.selected.length > q.max_selections) { error.textContent = 'Choose at most ' + q.max_selections + ' options.'; return; }
+    if (d.selected.length && d.selected.length < (q.min_selections || 0)) { error.textContent = 'Choose at least ' + q.min_selections + ' options, or clear the choices and write an answer.'; return; }
+    ibSaveDraft(r,d);
+    ibDecide(r, { action:'answer', request_revision:r.revision || 0, submission_id:d.submission, response:{ selected_option_ids:[...d.selected], text:d.text } });
+  } } },
+    el('div', { class: 'ib-eyebrow' }, 'Your answer'), fieldset,
+    d.selected.length ? el('button', { type:'button', class:'ib-link', disabled:busy, on:{click:()=>{d.selected=[];d.submission=crypto.randomUUID();ibSaveDraft(r,d);ibRegion('decide',ibAnswerForm(r));}} }, 'Clear choices') : null,
+    el('label', { for: 'answer-text' }, options.length ? 'Your answer or additional context' : 'Answer'), text,
+    el('p', { id:'answer-help', class:'meta' }, 'Your draft stays on this device until you send it. Selections never submit automatically.'), error,
+    el('div', { class:'ib-btns' },
+      el('button', { type:'button', disabled:busy, on:{click:()=>ibDecide(r,{action:'snooze',snooze_minutes:60})} }, 'Snooze for 1 hour'),
+      el('button', { type:'submit', class:'primary', disabled:busy }, busy ? 'Save answer…' : 'Send answer')));
+}
+
 // ---- Inbox: agents ask, toolyard flags, the owner decides at the end --------
 //
 // The list is ordinary render() output. The open request is a persistent DOM
@@ -6706,7 +6805,7 @@ const IB_KIND = { access: 'Access request', question: 'Question', blocker: 'Bloc
 const IB_VERB = { access: 'is asking for access', question: 'has a question', blocker: 'is stuck', update: 'sent an update' };
 const IB_URG = { now: 0, soon: 1, digest: 2, fyi: 3 };
 const IB_NEEDS = ['access', 'question', 'blocker'];
-const IB_FILTERS = ['needs', 'updates', 'done'];
+const IB_FILTERS = ['needs', 'snoozed', 'updates', 'done'];
 
 async function loadInbox() {
   if (state.inbox.loading) return;
@@ -6734,7 +6833,7 @@ function renderNavBadges() {
 
 function inboxOpenItems() { return state.inbox.items.filter((r) => r.status === 'pending'); }
 function inboxNeeds() {
-  return inboxOpenItems().filter((r) => IB_NEEDS.includes(r.kind))
+  return inboxOpenItems().filter((r) => IB_NEEDS.includes(r.kind) && !(r.snoozed_until > Date.now()))
     .sort((a, b) => (IB_URG[a.urgency] - IB_URG[b.urgency]) || (b.created_at - a.created_at));
 }
 function inboxUpdates() { return inboxOpenItems().filter((r) => r.kind === 'update').sort((a, b) => b.created_at - a.created_at); }
@@ -6964,12 +7063,7 @@ function ibPlayIcon() { return el('span', { class: 'ib-playicon' }); }
 
 function viewInbox() {
   if (state.inbox.openId) return inboxDetailNode();
-  const tabs = el('div', { class: 'ib-tabs' },
-    el('button', { class: state.inbox.tab === 'inbox' ? 'active' : '', on: { click: () => { state.inbox.tab = 'inbox'; render(); } } }, 'Inbox'),
-    el('button', { class: state.inbox.tab === 'sessions' ? 'active' : '', on: { click: () => { state.inbox.tab = 'sessions'; loadInboxSessions(); render(); } } }, 'Sessions'),
-  );
-  if (state.inbox.tab === 'sessions') return el('div', { class: 'ib' }, tabs, viewInboxSessions());
-  const lists = { needs: inboxNeeds(), updates: inboxUpdates(), done: inboxDone() };
+  const lists = { needs: inboxNeeds(), snoozed: inboxOpenItems().filter(r => r.snoozed_until > Date.now()), updates: inboxUpdates(), done: inboxDone() };
   const cur = lists[state.inbox.filter];
   const chip = (k, label) => el('button', {
     class: 'ib-chip' + (state.inbox.filter === k ? ' on' : ''),
@@ -6997,7 +7091,6 @@ function viewInbox() {
       } } }, 'Mark all read') : null);
   }
   return el('div', { class: 'ib' },
-    tabs,
     el('div', { class: 'ib-head' },
       el('div', {},
         el('h2', {}, 'Inbox'),
@@ -7005,7 +7098,7 @@ function viewInbox() {
       ),
       mode !== 'inbox' ? el('span', { class: 'ib-modehint', title: 'Settings → Inbox & permissions' }, 'approval mode: execute') : null,
     ),
-    el('div', { class: 'ib-chips' }, chip('needs', 'Needs you'), chip('updates', 'Updates'), chip('done', 'Done')),
+    el('div', { class: 'ib-chips' }, chip('needs', 'Needs you'), chip('snoozed', 'Snoozed'), chip('updates', 'Updates'), chip('done', 'Resolved')),
     tools,
     body,
   );
@@ -7025,16 +7118,16 @@ function ibCard(r) {
     el('div', { class: 'ib-kindrow' }, el('span', { class: 'ib-kind' }, (IB_KIND[r.kind] || r.kind) + (r.kind === 'access' ? ` · ${(r.tools || []).length} tool${(r.tools || []).length === 1 ? '' : 's'}` : '')), ibStatusPill(r),
       ...ibAttnPills(r), r.checked ? null : el('span', { class: 'ib-pill mute' }, 'Checking…')),
     el('h3', {}, r.title),
-    el('p', { class: 'sum' }, r.summary),
+    r.summary !== r.title ? el('p', { class: 'sum' }, r.summary) : null,
     fs.length ? el('div', { class: 'ib-flags' }, ...fs.map(ibFlagChip)) : null,
     ibDeciderEl(r),
-    el('div', { class: 'ib-minirow' },
+    r.audio?.script ? el('div', { class: 'ib-minirow' },
       el('button', {
         class: 'ib-miniplay', 'data-ib-play': r.id, 'aria-label': 'Play voice note',
         on: { click: (e) => { e.stopPropagation(); ibToggle(r.id); } },
       }, ibPlayIcon(), el('span', { 'data-ib-time': r.id }, ibFmt(ibTotal(r.id)))),
       el('div', { class: 'ib-minibar' }, el('i', { 'data-ib-prog': r.id })),
-    ),
+    ) : null,
   );
   return card;
 }
@@ -7046,7 +7139,7 @@ function openInboxRequest(id) {
   state.inbox.panel = null;
   state.inbox.busy = null;
   state.route = 'inbox';
-  history.replaceState(null, '', '#inbox/' + id);
+  if (location.hash !== '#inbox/' + id) history.pushState(null, '', '#inbox/' + id);
   ibNode = null;
   render();
   window.scrollTo(0, 0);
@@ -7059,7 +7152,7 @@ function closeInboxRequest() {
   state.inbox.detail = null;
   ibNode = null;
   ibObserver && ibObserver.disconnect();
-  history.replaceState(null, '', '#inbox');
+  if (location.hash !== '#inbox') history.pushState(null, '', '#inbox');
   render();
   loadInbox();
 }
@@ -7113,8 +7206,10 @@ function ibRegion(name, ...children) {
   if (!ibNode) return;
   const r = ibNode.querySelector(`[data-region="${name}"]`);
   if (!r) return;
+  const focus = captureFocus();
   r.innerHTML = '';
   for (const c of children.flat()) if (c) r.appendChild(c);
+  restoreFocus(focus);
 }
 
 function ibBuildDetail() {
@@ -7123,7 +7218,7 @@ function ibBuildDetail() {
   if (!state.inbox.allow[r.id] && r.tools) state.inbox.allow[r.id] = r.tools.map(() => true);
   ibRegion('head', ibHeadEl(r));
   ibRegion('flags', ibFlagsEl(r));
-  ibRegion('voice', ibVoiceEl(r));
+  ibRegion('voice', r.audio?.script ? el('details', { class: 'optional-audio' }, el('summary', {}, 'Listen to the summary'), ibVoiceEl(r)) : null);
   ibRegion('msg', ibMsgEl(r));
   ibRegion('att', ibAttEl(r));
   const dec = ibNode.querySelector('#ib-decide'); dec.hidden = false;
@@ -7138,7 +7233,7 @@ function ibRefreshRegions() {
   const r = d.request;
   ibRegion('head', ibHeadEl(r));
   ibRegion('flags', ibFlagsEl(r));
-  ibRegion('decide', ibDecideEl(r, d.grants || []));
+  if (!(r.status === 'pending' && ibNode.querySelector('[data-region=decide]')?.contains(document.activeElement))) ibRegion('decide', ibDecideEl(r, d.grants || []));
   ibRegion('activity', ibActivityEl(r));
   ibObserveDecision(r);
 }
@@ -7152,6 +7247,7 @@ function ibHeadEl(r) {
       el('span', { class: 'ib-kind' }, (IB_KIND[r.kind] || r.kind) + (r.kind === 'access' ? ` · ${r.tools.length} tool${r.tools.length === 1 ? '' : 's'}` : '')),
       ibStatusPill(r), ...ibAttnPills(r), el('span', { class: 'meta' }, relTime(r.created_at))),
     el('h2', {}, r.title),
+    r.task ? el('div', { class: 'meta task-context' }, 'Task · ', r.task.url ? el('a', { href: r.task.url, target: '_blank', rel: 'noopener noreferrer' }, r.task.title || 'Open task') : r.task.title) : null,
   );
 }
 
@@ -7161,6 +7257,7 @@ function ibFlagsEl(r) {
   const extra = [];
   if (r.dry_run_count > 0) extra.push(el('span', { class: 'ib-note' }, `${r.dry_run_count} dry run${r.dry_run_count === 1 ? '' : 's'} before sending`));
   if ((r.dropped_flags || []).length) extra.push(el('span', { class: 'ib-note red' }, 'Flags gone since the dry runs: ' + r.dropped_flags.join(', ')));
+  if (!all.length && r.kind !== 'access') return el('div');
   if (!all.length) return el('div', {}, el('p', { class: 'ib-clean' }, '✓ Toolyard checked this in the background. Nothing to flag.'), ...extra);
   const open = !!state.inbox.flagsOpen;
   return el('div', { class: 'ib-tystrip' },
@@ -7211,6 +7308,7 @@ function ibMsgEl(r) {
   const renderTy = () => {
     holder.innerHTML = '';
     const s = state.inbox.summary[r.id];
+    if (!s && !state.inbox.info?.judge_available) return;
     if (!s) {
       holder.appendChild(el('button', { class: 'ib-tybtn', on: { click: async () => {
         state.inbox.summary[r.id] = { loading: true }; renderTy();
@@ -7412,7 +7510,7 @@ function ibDecideEl(r, grants) {
       else if (reqOff.length) actions = el('div', { class: 'ib-actions' },
         el('p', { class: 'ib-warn' }, `${r.agent_name} marked `, ...reqOff.flatMap((t, i) => [i ? ', ' : '', el('code', {}, t.tool)]),
           ` as required. Without ${reqOff.length > 1 ? 'them' : 'it'} it can’t do this task, so this sends the request back for a new plan.`),
-        el('textarea', { id: 'ib-note', placeholder: 'Tell the agent what to change', rows: 3 }),
+        el('textarea', { id: 'ib-note', value: state.inbox.notes?.[r.id] || '', on: { input: e => { (state.inbox.notes ||= {})[r.id] = e.target.value; } }, placeholder: 'Tell the agent what to change', rows: 3 }),
         el('div', { class: 'ib-btns' },
           el('button', { on: { click: setAll(() => true) } }, 'Undo'),
           el('button', { class: 'danger', disabled: !!busy, on: { click: () => ibDecide(r, { action: 'return', note: ibNote() }) } }, busy ? 'Sending…' : 'Send back to agent')));
@@ -7437,19 +7535,7 @@ function ibDecideEl(r, grants) {
       el('div', { class: 'ib-trows' }, ...rows),
       actions);
   }
-  if (r.kind === 'question' || r.kind === 'blocker') {
-    return el('div', { class: 'ib-sec' },
-      el('div', { class: 'ib-eyebrow' }, 'Your answer'),
-      el('h3', {}, r.kind === 'blocker' ? 'How should it continue?' : 'What should it do?'),
-      open ? null : result,
-      el('div', { class: 'ib-opts' }, ...r.options.map((o, k) => el('button', {
-        class: 'ib-opt' + (r.answer === o.label ? ' chosen' : ''), disabled: !open || !!busy,
-        on: { click: () => ibDecide(r, { action: 'answer', option: k }) },
-      }, el('span', {}, o.label, o.detail ? el('small', {}, o.detail) : null)))),
-      open ? (state.inbox.panel ? ibPanelEl(r) : el('div', { class: 'ib-btns' },
-        el('button', { class: 'danger', on: { click: () => { state.inbox.panel = 'deny'; ibRegion('decide', ibDecideEl(r, grants)); } } }, 'Dismiss'),
-        el('button', { on: { click: () => { state.inbox.panel = 'snooze'; ibRegion('decide', ibDecideEl(r, grants)); } } }, 'Later'))) : null);
-  }
+  if (r.kind === 'question' || r.kind === 'blocker') return ibAnswerForm(r);
   return el('div', { class: 'ib-sec' },
     el('div', { class: 'ib-eyebrow' }, 'Done reading?'),
     open ? el('button', { class: 'primary', disabled: !!busy, on: { click: () => ibDecide(r, { action: 'read' }) } }, 'Mark as read') : result);
@@ -7635,7 +7721,7 @@ function ibPanelEl(r) {
   if (state.inbox.panel === 'deny') {
     return el('div', { class: 'ib-actions' },
       el('label', { class: 'meta', for: 'ib-note' }, `Tell ${r.agent_name} why (optional). It reads this before trying again.`),
-      el('textarea', { id: 'ib-note', rows: 3, placeholder: 'e.g. Don’t touch the flag; I’ll roll it out myself' }),
+      el('textarea', { id: 'ib-note', value: state.inbox.notes?.[r.id] || '', on: { input: e => { (state.inbox.notes ||= {})[r.id] = e.target.value; } }, rows: 3, placeholder: 'e.g. Don’t touch the flag; I’ll roll it out myself' }),
       el('div', { class: 'ib-btns' }, el('button', { on: { click: back } }, 'Cancel'),
         el('button', { class: 'danger', disabled: !!busy, on: { click: () => ibDecide(r, { action: 'deny', note: ibNote() }) } }, busy ? 'Sending…' : (r.kind === 'access' ? 'Deny whole request' : 'Dismiss'))));
   }
@@ -7761,10 +7847,11 @@ async function ibDecide(r, body) {
   ibRegion('decide', ibDecideEl(r, state.inbox.detail.grants || []));
   try {
     await api('/v1/inbox/' + r.id + '/decide', { method: 'POST', body });
+    if (body.action === 'answer') ibDropDraft(r);
     state.inbox.panel = null;
     delete state.inbox.narrow[r.id]; delete state.inbox.ttl[r.id];
-    toast({ approve: 'Approved. The agent can continue.', deny: 'Sent. The agent has been told.', return: 'Sent back for a new plan.',
-      answer: 'Answer sent.', snooze: 'Snoozed.', read: 'Marked as read.' }[body.action] || 'Done');
+    toast({ approve: 'Approved. The agent can continue.', deny: 'Decision saved.', return: 'Sent back for a new plan.',
+      answer: 'Answer saved. The agent can retrieve it.', snooze: 'Snoozed.', read: 'Marked as read.' }[body.action] || 'Done');
     state.inbox.busy = null;
     await loadInboxDetail(r.id, false);
     loadInbox();
@@ -7788,7 +7875,7 @@ function ibResultEl(r) {
   const cls = { approved: 'good', answered: 'good', read: 'mute', denied: 'bad', returned: 'bad', cancelled: 'mute', expired: 'mute' }[r.status] || 'mute';
   const title = {
     approved: `Allowed ${(r.tools || []).filter((t) => t.decision === 'allowed').length} of ${(r.tools || []).length}`,
-    answered: 'Answered: ' + r.answer, read: 'Marked as read', denied: r.kind === 'access' ? 'Denied' : 'Dismissed',
+    answered: (r.retrieved_at ? 'Retrieved by agent: ' : 'Answer saved: ') + r.answer, read: 'Marked as read', denied: r.kind === 'access' ? 'Denied' : 'Dismissed',
     returned: 'Sent back to replan', cancelled: 'Withdrawn by the agent', expired: 'Expired without a decision',
   }[r.status] || r.status;
   const detail = r.status === 'approved' && r.grants_expire_at ? `Permissions expire at ${ibClock(r.grants_expire_at)}.` : '';
@@ -7945,16 +8032,16 @@ function renderInboxSettingsCard() {
       el('label', {}, el('input', { type: 'radio', name: 'approval_mode', checked: mode === 'execute', on: { change: () => patch({ approval_mode: 'execute' }) } }),
         el('span', {}, el('b', {}, 'Queue it (current behaviour). '), 'The call waits in Approvals and runs when you approve it.')),
       el('label', {}, el('input', { type: 'radio', name: 'approval_mode', checked: mode === 'inbox', on: { change: () => patch({ approval_mode: 'inbox' }) } }),
-        el('span', {}, el('b', {}, 'Coach the agent. '), 'Nothing runs. The agent is told to send one inbox request with its reasons, a voice note and evidence; you decide per tool in the Inbox.'))),
+        el('span', {}, el('b', {}, 'Coach the agent. '), 'Nothing runs. The agent is told to send one inbox request with its reasons and evidence; you decide per tool in the Inbox.'))),
     el('label', { class: 'ib-check' }, el('input', { type: 'checkbox', checked: s.inbox_snapshot_enabled !== false, on: { change: (e) => patch({ inbox_snapshot_enabled: e.target.checked }) } }),
       el('span', {}, 'Copy linked media (images, videos, files) when a request arrives, so it still works after the agent’s sandbox is gone.')),
-    el('label', { class: 'ib-check' }, el('input', { type: 'checkbox', checked: !!s.inbox_judge_enabled, on: { change: (e) => patch({ inbox_judge_enabled: e.target.checked }) } }),
-      el('span', {}, 'Judge model: compare each tool call with the agent’s own words and flag contradictions (uses GEMINI_API_KEY; request text is sent to Gemini).')),
+    (state.inbox.info?.judge_available || s.inbox_judge_enabled) ? el('label', { class: 'ib-check' }, el('input', { type: 'checkbox', checked: !!s.inbox_judge_enabled, on: { change: (e) => patch({ inbox_judge_enabled: e.target.checked }) } }),
+      el('span', {}, 'Judge model: compare each tool call with the agent’s own words and flag contradictions (uses GEMINI_API_KEY; request text is sent to Gemini).')) : null,
     el('label', { class: 'meta', for: 'ib-hosting' }, 'Where agents should host files (shown to them in the guide):'),
     el('textarea', { id: 'ib-hosting', rows: 2, value: s.inbox_hosting_note || '', placeholder: 'e.g. Upload to the evidence bucket and link it',
       on: { change: (e) => patch({ inbox_hosting_note: e.target.value }) } }),
     ibAttentionSettings(s, patch),
-    ibVoiceSettings(s, patch),
+    (state.inbox.info?.voice_available || s.inbox_voice_enabled) ? ibVoiceSettings(s, patch) : null,
     ibPasskeySettings(),
   );
 }
@@ -8112,7 +8199,7 @@ Read the full rules with inbox.guide().`;
   if ('serviceWorker' in navigator) {
     try { navigator.serviceWorker.register('/sw.js'); } catch {}
   }
-  if (location.hash) state.route = location.hash.slice(1) || 'approvals';
+  if (location.hash) state.route = location.hash.slice(1) || 'inbox';
   let deepInbox = null;
   if (state.route.startsWith('inbox/')) { deepInbox = state.route.slice(6); state.route = 'inbox'; }
   if (IB_FILTERS.includes(deepInbox)) { state.inbox.filter = deepInbox; deepInbox = null; }
@@ -8184,6 +8271,8 @@ Read the full rules with inbox.guide().`;
         if (state.inbox.openId) closeInboxRequest();
         state.inbox.filter = id; state.inbox.tab = 'inbox'; navigate('inbox');
       } else if (id && state.inbox.openId !== id) openInboxRequest(id);
+    } else if (h === 'inbox' && state.inbox.openId) {
+      closeInboxRequest();
     } else if (h && h !== state.route) {
       navigate(h);
     }

@@ -256,7 +256,7 @@ func (s *Server) inboxDecide(w http.ResponseWriter, r *http.Request, uid, id str
 		writeInboxErr(w, err)
 		return
 	}
-	if s.audit != nil {
+	if s.audit != nil && !req.Replayed {
 		// The recorded decider: the person, and passkey when one signed
 		// the decision.
 		ev := audit.Event{
@@ -587,7 +587,9 @@ func writeInboxErr(w http.ResponseWriter, err error) {
 	switch {
 	case errors.Is(err, inbox.ErrNotFound):
 		writeError(w, http.StatusNotFound, "not found")
-	case errors.Is(err, inbox.ErrNotPending):
+	case errors.Is(err, inbox.ErrExpired):
+		writeError(w, http.StatusGone, err.Error())
+	case errors.Is(err, inbox.ErrConflict), errors.Is(err, inbox.ErrNotPending):
 		writeError(w, http.StatusConflict, err.Error())
 	case errors.Is(err, inbox.ErrPasskeyRequired):
 		writeJSON(w, http.StatusPreconditionRequired, map[string]any{"error": err.Error(), "code": "passkey_required"})

@@ -298,12 +298,13 @@ func init() {
 func inboxEntry(name, upstream, desc string, schema mcp.ToolInputSchema, h directHandler) toolEntry {
 	allow := policy.ActionAllow
 	return toolEntry{
-		tool:         mcp.Tool{Name: name, Description: desc, InputSchema: schema},
-		upstream:     upstream,
-		originalName: strings.TrimPrefix(name, upstream+"."),
-		reasonField:  ReasonField,
-		handle:       h,
-		forcedAction: &allow,
+		tool:          mcp.Tool{Name: name, Description: desc, InputSchema: schema},
+		upstream:      upstream,
+		originalName:  strings.TrimPrefix(name, upstream+"."),
+		reasonField:   ReasonField,
+		handle:        h,
+		forcedAction:  &allow,
+		noCallTimeout: name == "inbox.wait",
 	}
 }
 
@@ -392,6 +393,18 @@ func (g *Gateway) inboxTools() []toolEntry {
 			"label": map[string]any{"type": "string"}, "detail": map[string]any{"type": "string"},
 		}},
 	}
+	askProps["schema_version"] = map[string]any{"type": "integer", "enum": []int{1, 2}}
+	askProps["client_request_id"] = map[string]any{"type": "string", "maxLength": 128, "description": "Stable retry key, unique per agent and question."}
+	askProps["prompt"] = map[string]any{"type": "string", "maxLength": 1000}
+	askProps["context"] = map[string]any{"type": "string", "maxLength": 3000}
+	askProps["blocking"] = map[string]any{"type": "boolean"}
+	askProps["task"] = map[string]any{"type": "object", "properties": map[string]any{"title": map[string]any{"type": "string"}, "url": map[string]any{"type": "string"}}}
+	askProps["question"] = map[string]any{"type": "object", "required": []string{"type"}, "properties": map[string]any{
+		"type":           map[string]any{"type": "string", "enum": []string{"free_text", "single_choice", "multiple_choice"}},
+		"min_selections": map[string]any{"type": "integer", "minimum": 0}, "max_selections": map[string]any{"type": "integer", "minimum": 0},
+		"options": map[string]any{"type": "array", "maxItems": 12, "items": map[string]any{"type": "object", "required": []string{"id", "label"}, "properties": map[string]any{
+			"id": map[string]any{"type": "string"}, "label": map[string]any{"type": "string"}, "detail": map[string]any{"type": "string"}, "exclusive": map[string]any{"type": "boolean"}, "recommended": map[string]any{"type": "boolean"},
+		}}}}}
 	postProps := commonProps()
 	delete(postProps, "dry_run")
 	postProps["request_id"] = map[string]any{"type": "string", "description": "The request this update closes (optional)."}
@@ -470,16 +483,15 @@ func (g *Gateway) inboxTools() []toolEntry {
 			"Ask your owner for permission to use restricted tools: one request per task, with every tool it needs. "+
 				"Write it as yourself: a first-person message, facts (why_now, if_it_goes_wrong, undo), a ≤75-word voice-note script, and evidence attachments. "+
 				"Run it with dry_run: true first. Returns request_id; then keep working and use inbox.wait. Read inbox.guide for the format.",
-			obj([]string{"title", "summary", "message", "facts", "audio", "urgency", "tools"}, requestProps),
+			obj([]string{"title", "summary", "message", "facts", "urgency", "tools"}, requestProps),
 			submit(inbox.KindAccess)),
 		inboxEntry("inbox.ask", inboxUpstream,
-			"Ask your owner to choose between 2-4 options (kind: question), or tell them you're stuck and how you could move forward (kind: blocker). "+
-				"Same message, voice note and attachments as inbox.request.",
-			obj([]string{"title", "summary", "message", "audio", "urgency", "options"}, askProps),
+			"Ask a question. Prefer schema_version:2 with prompt and question.type (free_text, single_choice, multiple_choice). Options need stable IDs. Your owner can always write a custom answer. Audio is optional. Legacy title/summary/message/options remain supported.",
+			obj(nil, askProps),
 			submit(inbox.KindQuestion)),
 		inboxEntry("inbox.post", inboxUpstream,
 			"Tell your owner what happened, e.g. when a task you asked permission for is done. First person, with a short voice note and evidence. Set request_id to close that request's loop.",
-			obj([]string{"title", "summary", "message", "audio"}, postProps),
+			obj([]string{"title", "summary", "message"}, postProps),
 			submit(inbox.KindUpdate)),
 		inboxEntry("inbox.status", inboxUpstream,
 			"Check your requests without blocking. Approved requests include a grant token per allowed tool, shown once: keep it in memory and pass it as _grant.",

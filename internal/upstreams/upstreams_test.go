@@ -351,3 +351,10 @@ func TestPatchIdentityTriState(t *testing.T) {
 		t.Fatal("unknown identity field accepted")
 	}
 }
+
+func TestStageMaskedURLHidesCredentials(t *testing.T) {
+	got := Masked(Server{URL: "https://person:password@example.com/mcp?api_key=secret-value&tenant=private#fragment"})
+	if got.URL != "https://example.com/mcp?api_key=REDACTED&tenant=REDACTED" {
+		t.Fatalf("unsafe URL: %s", got.URL)
+	}
+}

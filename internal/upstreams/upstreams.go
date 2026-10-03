@@ -319,6 +319,9 @@ func copyMap(in map[string]string) map[string]string {
 }
 
 func validate(srv Server) error {
+	if strings.Contains(srv.URL, "=REDACTED") {
+		return fmt.Errorf("%w: replace the complete URL; masked query values cannot be saved", ErrInvalid)
+	}
 	if strings.TrimSpace(srv.Name) == "" {
 		return fmt.Errorf("%w: name required", ErrInvalid)
 	}
@@ -912,6 +915,21 @@ func (s *Service) validateSecretRefs(ctx context.Context, srv Server) error {
 // EnvPlaintextKeys lists the keys whose value was masked so the UI can offer
 // a "convert to secret" action.
 func Masked(srv Server) Server {
+	if srv.URL != "" {
+		originalURL := srv.URL
+		if u, err := url.Parse(srv.URL); err == nil {
+			u.User = nil
+			u.Fragment = ""
+			q := u.Query()
+			for k := range q {
+				q.Set(k, "REDACTED")
+			}
+			u.RawQuery = q.Encode()
+			srv.URL = u.String()
+			srv.LastError = strings.ReplaceAll(srv.LastError, originalURL, srv.URL)
+		}
+	}
+
 	out := srv
 	out.Env, out.EnvPlaintextKeys = maskValues(srv.Env)
 	out.Headers, _ = maskValues(srv.Headers)

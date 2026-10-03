@@ -3,6 +3,7 @@ package api
 import (
 	"errors"
 	"net/http"
+	"strings"
 
 	"github.com/tusharbhardwaj/toolyard/internal/audit"
 	"github.com/tusharbhardwaj/toolyard/internal/upstreams"
@@ -48,11 +49,23 @@ func (s *Server) serversPatch(w http.ResponseWriter, r *http.Request, name strin
 		case srv != nil:
 			// Saved, but the reconnect failed: hand back the row with its
 			// recorded error, as POST /v1/servers does.
-			writeJSON(w, http.StatusAccepted, map[string]any{"server": upstreams.Masked(*srv), "warning": err.Error()})
+			writeJSON(w, http.StatusAccepted, map[string]any{"server": upstreams.Masked(*srv), "warning": serverWarning(err, *srv)})
 		default:
 			writeError(w, http.StatusInternalServerError, err.Error())
 		}
 		return
 	}
 	writeJSON(w, http.StatusOK, upstreams.Masked(*srv))
+}
+
+// serverWarning must not put a credential-bearing endpoint into a response.
+func serverWarning(err error, srv upstreams.Server) string {
+	if err == nil {
+		return ""
+	}
+	message := err.Error()
+	if srv.URL != "" {
+		message = strings.ReplaceAll(message, srv.URL, upstreams.Masked(srv).URL)
+	}
+	return audit.RedactString(message)
 }
