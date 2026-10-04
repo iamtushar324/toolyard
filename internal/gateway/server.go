@@ -163,8 +163,8 @@ type Gateway struct {
 	// simultaneously. 0 = unbounded. When the cap is hit and a new
 	// upstream needs a slot, the least-recently-used live upstream is
 	// suspended (catalog stays populated, re-dialed transparently on
-	// next call). poolMu serializes admission decisions so two
-	// concurrent resumes can't both think they have a slot.
+	// next call). Active RPCs remain pinned: simultaneous calls can exceed
+	// this idle-pool cap, and release trims the excess idle transports.
 	maxLiveUpstreams int
 	// maxLivePerUser is the same cap for the per-user connections of
 	// per_user upstreams, which form their own pool: people signing in
@@ -590,6 +590,9 @@ func (g *Gateway) AddUpstream(ctx context.Context, cfg UpstreamConfig) error {
 	g.upstreams[cfg.Name] = u
 	g.mu.Unlock()
 	g.registerUpstreamTools(cfg.Name, tools, u)
+	// Concurrent adds dial through untracked probes. Once their catalogs
+	// are registered, reclaim any idle overflow in the shared pool.
+	g.trimIdlePool(u)
 	return nil
 }
 
@@ -703,8 +706,7 @@ func (g *Gateway) SweepIdleStdioUpstreams(idleAfter time.Duration) int {
 	count := 0
 	for _, u := range candidates {
 		idle := u.idleSince()
-		if !u.suspended() && idle >= idleAfter {
-			u.suspend()
+		if idle >= idleAfter && u.suspend() {
 			log.Printf("idle-kill: suspended %q (idle %s, transport=%s)",
 				u.label(), idle.Round(time.Second), u.cfg.Transport)
 			count++
@@ -815,14 +817,25 @@ func (g *Gateway) SessionRecoveries() int64 {
 // acquireSlot is called immediately before an upstream opens (or
 // reopens) a transport. If the live cap would be exceeded by counting
 // `self` in, the least-recently-used OTHER live upstream is suspended.
-// Holding poolMu serializes admission across concurrent resumes; the
-// actual suspend() takes only u.mu so there is no deadlock risk.
+// Only idle transports are eligible. Concurrent active admissions may
+// exceed the cap until their leases finish; no in-flight RPC is canceled.
 func (g *Gateway) acquireSlot(self *upstream) {
 	victim, live, limit := g.pickEvictionCandidate(self)
-	if victim != nil {
-		victim.suspend()
+	if victim != nil && victim.suspend() {
 		log.Printf("lru-evict: suspended %q to make room for %q (live=%d cap=%d)",
 			victim.label(), self.label(), live, limit)
+	}
+}
+
+// trimIdlePool reclaims temporary active overflow when a lease finishes.
+// A concurrent new lease can make a selected victim busy; suspend checks
+// again under the victim's lock, and the next release completes cleanup.
+func (g *Gateway) trimIdlePool(self *upstream) {
+	for {
+		victim, _, _ := g.pickPoolCandidate(self, false)
+		if victim == nil || !victim.suspend() {
+			return
+		}
 	}
 }
 
@@ -834,6 +847,10 @@ func (g *Gateway) acquireSlot(self *upstream) {
 // from the other. Separated from acquireSlot so unit tests can exercise
 // the selection without needing real mcp-go clients to .Close().
 func (g *Gateway) pickEvictionCandidate(self *upstream) (*upstream, int, int) {
+	return g.pickPoolCandidate(self, true)
+}
+
+func (g *Gateway) pickPoolCandidate(self *upstream, admission bool) (*upstream, int, int) {
 	perUser := self.userID != ""
 	g.poolMu.Lock()
 	limit := g.maxLiveUpstreams
@@ -846,7 +863,7 @@ func (g *Gateway) pickEvictionCandidate(self *upstream) (*upstream, int, int) {
 	}
 	var candidates []*upstream
 	for _, u := range g.allUpstreams() {
-		if u != self && (u.userID != "") == perUser {
+		if (!admission || u != self) && (u.userID != "") == perUser {
 			candidates = append(candidates, u)
 		}
 	}
@@ -855,17 +872,20 @@ func (g *Gateway) pickEvictionCandidate(self *upstream) (*upstream, int, int) {
 	live := 0
 	var oldest int64 = math.MaxInt64
 	for _, u := range candidates {
-		if u.suspended() {
+		u.mu.Lock()
+		liveClient, active := u.client != nil, u.active
+		u.mu.Unlock()
+		if !liveClient {
 			continue
 		}
 		live++
 		t := u.lastUsed.Load()
-		if t < oldest {
+		if active == 0 && t < oldest {
 			oldest = t
 			lru = u
 		}
 	}
-	if live >= limit && lru != nil {
+	if (admission && live >= limit || !admission && live > limit) && lru != nil {
 		return lru, live, limit
 	}
 	return nil, live, limit
