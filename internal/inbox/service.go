@@ -11,6 +11,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
 
@@ -574,6 +575,35 @@ func (s *Service) Decide(ctx context.Context, id string, d Decision) (*Request, 
 		for i, t := range pre.Tools {
 			d.Allow[i] = d.Verdicts[t.CallID].Verdict == VerdictAccepted
 		}
+	}
+	// Apply the shared callback contract before passkey verification can
+	// change credential counters, or any decision transaction starts.
+	if utf8.RuneCountInString(d.Note) > 10000 {
+		// Old answers/denials could contain larger notes. A matching retry
+		// reads the committed result without rewriting that history.
+		if d.SubmissionID != "" {
+			r, err := s.Get(ctx, id)
+			if err != nil {
+				return nil, err
+			}
+			if r.Status != StatusPending {
+				switch {
+				case r.Kind == KindAccess && r.DecisionSubmissionID == d.SubmissionID:
+					if r.DecisionFingerprint != decisionFingerprint(d) {
+						return nil, ErrConflict
+					}
+					r.Replayed = true
+					return r, nil
+				case d.Action == "answer" && (r.Kind == KindQuestion || r.Kind == KindBlocker) && r.AnswerSubmissionID == d.SubmissionID:
+					if r.AnswerFingerprint != answerFingerprint(d) {
+						return nil, ErrConflict
+					}
+					r.Replayed = true
+					return r, nil
+				}
+			}
+		}
+		return nil, fmt.Errorf("note: max 10000 characters")
 	}
 	dec := d.decider()
 	// Passkey check happens before the transaction (verification writes
