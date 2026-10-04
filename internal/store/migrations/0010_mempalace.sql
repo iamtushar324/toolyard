@@ -1,4 +1,4 @@
--- 0009: MemPalace integration.
+-- 0010: MemPalace integration.
 --
 -- The palace itself (Chroma vectors + KG SQLite) lives under
 -- <data-dir>/palace and is owned by the mempalace-mcp subprocess. Toolyard

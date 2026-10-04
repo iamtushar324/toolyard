@@ -56,11 +56,56 @@ func (db *DB) Close() error {
 	return db.DB.Close()
 }
 
+// legacyMigrationNames maps migration files that were renumbered to their
+// current names. Migrations 0009 and 0013 were each used twice, so
+// everything from 0009_mempalace on moved up to give every file a unique
+// number (order unchanged). Databases that applied the old names get their
+// schema_migrations rows rewritten so nothing is re-applied.
+var legacyMigrationNames = map[string]string{
+	"0009_mempalace.sql":              "0010_mempalace.sql",
+	"0010_approval_results.sql":       "0011_approval_results.sql",
+	"0011_notes_sync.sql":             "0012_notes_sync.sql",
+	"0012_skills_sync.sql":            "0013_skills_sync.sql",
+	"0013_oauth_authorize_params.sql": "0014_oauth_authorize_params.sql",
+	"0013_tool_policies.sql":          "0015_tool_policies.sql",
+	"0014_agent_revocation.sql":       "0016_agent_revocation.sql",
+	"0015_hook_events.sql":            "0017_hook_events.sql",
+	"0016_secrets.sql":                "0018_secrets.sql",
+	"0017_chat_messages.sql":          "0019_chat_messages.sql",
+	"0018_events.sql":                 "0020_events.sql",
+	"0019_memory_webhooks.sql":        "0021_memory_webhooks.sql",
+	"0020_memory_webhook_jobs.sql":    "0022_memory_webhook_jobs.sql",
+}
+
+// renameLegacyMigrations rewrites old migration names in schema_migrations to
+// their renumbered names in one transaction. Old and new names never collide
+// (each keeps its slug), so the updates are order-independent.
+func (db *DB) renameLegacyMigrations() error {
+	tx, err := db.Begin()
+	if err != nil {
+		return err
+	}
+	for oldName, newName := range legacyMigrationNames {
+		if _, err := tx.Exec(`UPDATE OR IGNORE schema_migrations SET name = ? WHERE name = ?`, newName, oldName); err != nil {
+			_ = tx.Rollback()
+			return fmt.Errorf("rename migration %s: %w", oldName, err)
+		}
+		if _, err := tx.Exec(`DELETE FROM schema_migrations WHERE name = ?`, oldName); err != nil {
+			_ = tx.Rollback()
+			return fmt.Errorf("rename migration %s: %w", oldName, err)
+		}
+	}
+	return tx.Commit()
+}
+
 func (db *DB) migrate() error {
 	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS schema_migrations (
         name TEXT PRIMARY KEY,
         applied_at INTEGER NOT NULL
     )`); err != nil {
+		return err
+	}
+	if err := db.renameLegacyMigrations(); err != nil {
 		return err
 	}
 	entries, err := migrations.ReadDir("migrations")

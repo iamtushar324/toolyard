@@ -1,4 +1,4 @@
--- 0010: cache the executed tool result on the approval row so an
+-- 0011: cache the executed tool result on the approval row so an
 -- approved tool fires immediately on the human's tap and the agent
 -- collects the result via tools.poll_approval / tools.wait_for_approval
 -- (or the legacy _approval_id re-call path) without ever re-dispatching

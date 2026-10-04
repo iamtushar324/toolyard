@@ -1,4 +1,4 @@
--- 0011: track which notes have been ingested into mempalace so the
+-- 0012: track which notes have been ingested into mempalace so the
 -- background scanner (and notes.publish) don't re-ingest unchanged files.
 --
 -- One row per relative path under $NOTES_DIR. mtime is the file mtime at
