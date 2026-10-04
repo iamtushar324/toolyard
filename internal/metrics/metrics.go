@@ -741,18 +741,18 @@ func (r *Reader) AgentHeatmap(ctx context.Context, agentID string, days int) ([]
 	return out, rows.Err()
 }
 
-// CostRow is one row in the cost panel: per-tool token estimate × rate.
+// CostRow describes tool payload estimates. Toolyard does not observe the
+// client's model or provider token counts, so USD must remain unknown.
 type CostRow struct {
-	ToolName     string  `json:"tool_name"`
-	Upstream     string  `json:"upstream"`
-	TokensIn     int64   `json:"tokens_in"`
-	TokensOut    int64   `json:"tokens_out"`
-	UsdEstimated float64 `json:"usd_estimated"`
+	ToolName     string   `json:"tool_name"`
+	Upstream     string   `json:"upstream"`
+	TokensIn     int64    `json:"tokens_in"`
+	TokensOut    int64    `json:"tokens_out"`
+	UsdEstimated *float64 `json:"usd_estimated"`
 }
 
-// Cost returns the per-tool token totals over the range, multiplied by the
-// supplied per-million rates (any default falls back to 0).
-func (r *Reader) Cost(ctx context.Context, rg Range, inUsdPerM, outUsdPerM float64) ([]CostRow, error) {
+// Cost returns per-tool payload token approximations, never billable tokens.
+func (r *Reader) Cost(ctx context.Context, rg Range) ([]CostRow, error) {
 	from, to := rg.bounds()
 	rows, err := r.db.QueryContext(ctx, `SELECT tool_name, upstream,
         COALESCE(SUM(token_estimate_in),0),
@@ -770,7 +770,6 @@ func (r *Reader) Cost(ctx context.Context, rg Range, inUsdPerM, outUsdPerM float
 		if err := rows.Scan(&c.ToolName, &c.Upstream, &c.TokensIn, &c.TokensOut); err != nil {
 			return nil, err
 		}
-		c.UsdEstimated = float64(c.TokensIn)*inUsdPerM/1e6 + float64(c.TokensOut)*outUsdPerM/1e6
 		out = append(out, c)
 	}
 	return out, rows.Err()

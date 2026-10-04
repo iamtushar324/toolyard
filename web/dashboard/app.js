@@ -22,12 +22,11 @@ const state = {
   // held only in memory from a reveal until the owner dismisses it.
   myKey: freshMyKey(),
   serverEditModal: null,   // { name, http, url, headersText, identityOn, header, register, enabled, orig, error, saving } while editing a server
-  route: 'approvals',
+  route: 'inbox',
   approvals: [],
   recentApprovals: [],     // /v1/approvals: the latest decided rows, for "Recently decided"
   audit: [],
   agents: [],
-  memory: [],
   servers: [],
   tools: [],
   marketplace: [],
@@ -42,11 +41,6 @@ const state = {
   auditLoading: false,    // a server-filtered reload is in flight
   auditPaged: false,      // true once "Load older" has pulled extra rows
   auditEnd: false,        // true when a "Load older" returned nothing
-  hooks: { events: [], loading: false, end: false, loaded: false },
-  hookFilter: { q: '', source: '', event_name: '', agent: '', session_id: '' },
-  // Memory tab: filter text + which row is being inline-edited.
-  memoryFilter: '',
-  memEdit: null,          // { scope, key, value } while editing a row
   settings: { surface_mode: 'full', top_n_count: 20, top_n_personalize_after: 100, router_only_mode: false },
   usage: { per_tool: {}, rows: [] },
   workbench: {
@@ -62,7 +56,6 @@ const state = {
     overview: null,
     tools: [],
     agents: [],
-    cost: { rows: [], input_usd_per_m: 0, output_usd_per_m: 0 },
     autoRules: [],
     loading: false,
   },
@@ -90,38 +83,6 @@ const state = {
   // Chat-notification channel status (Settings card).
   chat: null,
   chatLoaded: false,
-  // Events Hub: feed rows + source configs + filters + unacked badge.
-  events: { rows: [], unacked: 0, sources: [], loaded: false, nextBefore: 0 },
-  eventFilter: { source_id: '', type: '', q: '', unacked: false },
-  eventSourceModal: null,  // { kind, name, ... } while adding a source
-  // MemPalace panel (TEC-481): memory metrics + wing-locked ingestion webhooks.
-  mempalace: { loaded: false, metrics: null, webhooks: [], wings: [] },
-  mwModal: null,           // { name, wing, source, mode, entry_field, entry_template, topic, required, json_schema } while adding a webhook
-  // Voice "live call" panel. The actual WS, AudioContext, MediaStream
-  // live in module-scope handles (see voiceClient below) — they aren't
-  // serialisable and must survive re-renders, so they can't sit in this
-  // state object. This block is the renderable mirror.
-  call: {
-    active: false,
-    callId: null,
-    phase: 'idle',    // 'idle' | 'connecting' | 'listening' | 'thinking' | 'speaking' | 'error'
-    error: '',
-    mute: false,
-    transcript: [],   // [{ role: 'user'|'assistant', text }]
-    toolCalls: [],    // [{ name, args }]
-    permission: 'unknown', // 'unknown' | 'granted' | 'denied'
-    activeCallElsewhere: null, // {call_id} when server returns 409
-    // hardwareReady reflects whether we've successfully claimed the OS
-    // Now Playing slot. If false, BTR11 play/pause falls through to
-    // Siri / system handling instead of toggling mute.
-    hardwareReady: false,
-    hardwareWhy: '',
-    // Music ducking via Path A: a low-level pink-noise loop in our
-    // audio output trips the OS audio session, so cooperating apps
-    // (Spotify, Music with auto-pause prefs on) voluntarily pause.
-    // Persisted in localStorage; default on. No server involvement.
-    duck: (localStorage.getItem('toolyard.call.duck') ?? '1') === '1',
-  },
 };
 
 // ---- helpers ----------------------------------------------------------------
@@ -213,7 +174,7 @@ function isAdmin() {
 const MEMBER_ROUTES = ['approvals', 'agents', 'myservers', 'connections'];
 
 function defaultRoute() {
-  return isAdmin() ? 'approvals' : 'agents';
+  return isAdmin() ? 'inbox' : 'agents';
 }
 
 function routeAllowed(route) {
@@ -297,15 +258,14 @@ async function loadAll() {
     return;
   }
   try {
-    const [pendings, audits, agents, memos, servers, tools, market, settingsRes, usageRes, vapid, policies, recent] = await Promise.all([
+    const [pendings, audits, agents, servers, tools, market, settingsRes, usageRes, vapid, policies, recent] = await Promise.all([
       api('/v1/approvals?status=pending'),
       api('/v1/audit?' + auditServerParams({ limit: '50' }).toString()),
       api('/v1/agents'),
-      api('/v1/memory'),
       api('/v1/servers').catch(() => []),
       api('/v1/tools').catch(() => []),
       api('/v1/marketplace').catch(() => null),
-      api('/v1/settings').catch(() => ({})),
+      api('/v1/settings').catch(e => { state.settingsError = e.message; return {}; }),
       api('/v1/usage').catch(() => ({ per_tool: {}, rows: [] })),
       api('/v1/push/vapid_key').catch(() => null),
       api('/v1/policies').catch(() => []),
@@ -318,7 +278,6 @@ async function loadAll() {
     state.recentApprovals = (Array.isArray(recent) ? recent : []).filter((a) => a && a.status && a.status !== 'pending');
     state.audit = audits || [];
     state.agents = agents || [];
-    state.memory = memos || [];
     state.servers = servers || [];
     state.tools = tools || [];
     // /v1/marketplace returns { entries, oauth_redirect_uri }; tolerate the
@@ -382,10 +341,8 @@ function startStream() {
   };
   evtSrc.addEventListener('approval', (e) => { markStreamEvent(); handleApprovalEvent(JSON.parse(e.data)); });
   evtSrc.addEventListener('audit', (e) => { markStreamEvent(); handleAuditEvent(JSON.parse(e.data)); });
-  evtSrc.addEventListener('event', (e) => { markStreamEvent(); handleHubEvent(JSON.parse(e.data)); });
   evtSrc.addEventListener('inbox', (e) => { markStreamEvent(); handleInboxEvent(JSON.parse(e.data)); });
   evtSrc.addEventListener('grant', () => { markStreamEvent(); handleGrantEvent(); });
-  evtSrc.addEventListener('session', () => { markStreamEvent(); if (state.inbox.tab === 'sessions') loadInboxSessions(); });
   evtSrc.addEventListener('mcp_oauth_done', (e) => { markStreamEvent(); handleOAuthDone(JSON.parse(e.data)); });
   evtSrc.addEventListener('mcp_oauth_refreshed', () => { markStreamEvent(); reloadServers(); render(); });
   evtSrc.addEventListener('mcp_oauth_needs_reauth', (e) => { markStreamEvent(); handleOAuthReauth(JSON.parse(e.data)); });
@@ -519,15 +476,6 @@ function noteDecidedApproval(req) {
 // handleHubEvent receives a live Events Hub event. When the operator is on the
 // Events route we prepend it; otherwise we just bump the unacked badge so the
 // nav label reflects the new arrival without a full reload.
-function handleHubEvent(ev) {
-  state.events.unacked = (state.events.unacked || 0) + 1;
-  if (state.route === 'events') {
-    state.events.rows.unshift(ev);
-    if (state.events.rows.length > 300) state.events.rows.length = 300;
-  }
-  render();
-}
-
 const AUDIT_CAP = 1000;
 function handleAuditEvent(ev) {
   state.audit.unshift(ev);
@@ -542,11 +490,10 @@ async function loadInsights() {
   render();
   const range = state.insights.range;
   try {
-    const [overview, tools, agents, cost, rules, anomalies, policies] = await Promise.all([
+    const [overview, tools, agents, rules, anomalies, policies] = await Promise.all([
       api('/v1/insights/overview?range=' + range).catch(() => null),
       api('/v1/insights/tools?range=' + range).catch(() => []),
       api('/v1/insights/agents?range=' + range).catch(() => []),
-      api('/v1/insights/cost?range=' + range).catch(() => ({ rows: [] })),
       api('/v1/insights/auto/rules').catch(() => []),
       api('/v1/insights/anomalies?limit=50').catch(() => []),
       api('/v1/policies').catch(() => []),
@@ -554,7 +501,6 @@ async function loadInsights() {
     state.insights.overview = overview;
     state.insights.tools = tools || [];
     state.insights.agents = agents || [];
-    state.insights.cost = cost || { rows: [] };
     state.insights.autoRules = rules || [];
     state.anomalies = anomalies || [];
     state.policies = policies || [];
@@ -1216,49 +1162,6 @@ function auditExportURL(format) {
   return '/v1/audit/export?' + p.toString();
 }
 
-function hookQueryParams(extra = {}) {
-  const f = state.hookFilter || {};
-  const p = new URLSearchParams(extra);
-  if (f.agent) p.set('agent_id', f.agent);
-  if (f.source) p.set('source', f.source);
-  if (f.event_name) p.set('event_name', f.event_name);
-  if (f.session_id) p.set('session_id', f.session_id);
-  if (f.q) p.set('q', f.q);
-  return p;
-}
-
-async function loadHooks(reset = false) {
-  if (state.hooks.loading) return;
-  state.hooks.loading = true;
-  if (reset) {
-    state.hooks.events = [];
-    state.hooks.end = false;
-  }
-  render();
-  try {
-    const p = hookQueryParams({ limit: '100' });
-    if (!reset && state.hooks.events.length) {
-      p.set('before', String(state.hooks.events[state.hooks.events.length - 1].ts));
-    }
-    const rows = await api('/v1/hooks/events?' + p.toString());
-    if (!rows || rows.length === 0) {
-      state.hooks.end = true;
-    } else if (reset) {
-      state.hooks.events = rows;
-    } else {
-      const seen = new Set(state.hooks.events.map((e) => e.id));
-      state.hooks.events = state.hooks.events.concat(rows.filter((e) => !seen.has(e.id)));
-    }
-    state.hooks.loaded = true;
-  } catch (e) { toast(e.message, 'error'); }
-  state.hooks.loading = false;
-  render();
-}
-
-function hooksExportURL(format) {
-  return '/v1/hooks/export?' + hookQueryParams({ format }).toString();
-}
-
 function exportAuditCSV() {
   const rows = filteredAudit();
   // The first nine columns keep their old order; who raised and who
@@ -1421,97 +1324,6 @@ function viewAudit() {
   );
 
   return el('div', { class: 'card' }, filterBar, tbl, footer);
-}
-
-function viewHooks() {
-  const rows = state.hooks.events || [];
-  const f = state.hookFilter;
-  const setF = (k) => (ev) => {
-    f[k] = ev.target.value;
-    state.hooks.loaded = false;
-    loadHooks(true);
-  };
-  const opt = (v, label) => el('option', { value: v }, label);
-  const sel = (key, all, vals) => {
-    const s = el('select', { on: { change: setF(key) } }, opt('', all), ...vals.map((v) => opt(v, v)));
-    s.value = f[key] || '';
-    return s;
-  };
-  const agents = uniqueSorted([...(state.agents || []).map((a) => a.id), ...rows.map((e) => e.agent_id)]);
-  const sources = uniqueSorted(rows.map((e) => e.source).concat(['claude_code', 'codex', 'cursor', 'generic']));
-  const events = uniqueSorted(rows.map((e) => e.event_name));
-  const sessions = uniqueSorted(rows.map((e) => e.session_id)).slice(0, 100);
-  // Agent dropdown shows names but keeps the agent_id as the option value; the
-  // hooks agent filter is server-side (hookQueryParams sends agent_id).
-  const selAgent = () => {
-    const s = el('select', { on: { change: setF('agent') } }, opt('', 'All agents'), ...agents.map((id) => opt(id, agentLabel(id))));
-    s.value = f.agent || '';
-    return s;
-  };
-  const counts = rows.reduce((m, e) => {
-    if (e.agent_id) m[e.agent_id] = (m[e.agent_id] || 0) + 1;
-    return m;
-  }, {});
-  const countLine = Object.entries(counts).slice(0, 4).map(([agent, n]) => `${agentLabel(agent)}: ${n}`).join(' · ');
-
-  const filterBar = el('div', { class: 'row audit-filters', style: 'gap: 8px; margin-bottom: 12px; flex-wrap: wrap;' },
-    (() => { const i = el('input', { id: 'hooks-q', type: 'search', placeholder: 'Search text / tool / event / session…', class: 'grow', on: { change: setF('q'), keydown: (e) => { if (e.key === 'Enter') setF('q')(e); } } }); i.value = f.q || ''; return i; })(),
-    sel('source', 'All sources', sources),
-    sel('event_name', 'All events', events),
-    selAgent(),
-    sel('session_id', 'All sessions', sessions),
-    el('button', { on: { click: () => loadHooks(true) }, disabled: state.hooks.loading }, state.hooks.loading ? 'Loading…' : 'Refresh'),
-    el('a', { href: hooksExportURL('csv'), target: '_blank' }, 'CSV'),
-    el('a', { href: hooksExportURL('json'), target: '_blank' }, 'JSON'),
-  );
-
-  const recipes = el('div', { class: 'card' },
-    el('h2', {}, 'Hook recipes'),
-    el('p', { class: 'meta' },
-      'Use the same ingest endpoint for interaction logging, memory ingest, approval resume, tool-call auditing, notifications, guardrails, and turn summaries.'),
-    el('div', { class: 'meta' }, countLine || 'No per-agent hook counts loaded yet.'),
-  );
-
-  const table = rows.length === 0
-    ? el('div', { class: 'card empty' }, state.hooks.loading ? 'Loading hook events…' : 'No hook events match these filters yet.')
-    : el('div', { class: 'card' },
-        filterBar,
-        el('table', {},
-          el('thead', {}, el('tr', {},
-            el('th', {}, 'When'),
-            el('th', {}, 'Source'),
-            el('th', {}, 'Event'),
-            el('th', {}, 'Agent'),
-            el('th', {}, 'Session'),
-            el('th', {}, 'Text / Tool'),
-          )),
-          el('tbody', {}, rows.map((e) => el('tr', {},
-            el('td', { class: 'meta' }, relTime(e.ts)),
-            el('td', {}, e.source || 'generic'),
-            el('td', {}, e.event_name || 'unknown'),
-            el('td', { class: 'meta', title: e.agent_id || '' }, agentLabel(e.agent_id)),
-            el('td', { class: 'meta' }, e.session_id ? el('code', {}, e.session_id.slice(0, 18)) : '—'),
-            el('td', {}, [
-              e.tool_name ? el('div', {}, el('code', {}, e.tool_name)) : null,
-              e.text ? el('div', { class: 'meta', style: 'white-space: pre-wrap; margin-top: 4px;' }, e.text.slice(0, 500)) : null,
-              e.memory_ingested ? el('div', { class: 'badge allowed', style: 'margin-top: 4px;' }, 'memory') : null,
-              e.payload ? el('details', { style: 'margin-top: 6px;' },
-                el('summary', {}, 'payload'),
-                el('pre', { class: 'mem-value', style: 'max-height: 220px; overflow: auto; white-space: pre-wrap;' },
-                  JSON.stringify(e.payload, null, 2).slice(0, 4000)),
-              ) : null,
-            ]),
-          ))),
-        ),
-        el('div', { class: 'row', style: 'margin-top: 12px; align-items: center; gap: 12px;' },
-          el('span', { class: 'meta' }, `${rows.length} loaded`),
-          state.hooks.end
-            ? el('span', { class: 'meta' }, 'No older events.')
-            : el('button', { on: { click: () => loadHooks(false) }, disabled: state.hooks.loading }, state.hooks.loading ? 'Loading…' : 'Load older'),
-        ),
-      );
-
-  return el('div', {}, rows.length === 0 ? el('div', { class: 'card' }, filterBar) : null, table, recipes);
 }
 
 // ---- "Your Beknown key" -----------------------------------------------------
@@ -1822,10 +1634,6 @@ function renderAgentDoneStep(m) {
     { id: 'global',  label: '~/.claude.json (global)' },
     { id: 'hermes',  label: 'hermes' },
     { id: 'rules',   label: 'Teach it the rules' },
-    { id: 'hook-claude', label: 'Claude hooks' },
-    { id: 'hook-codex',  label: 'Codex hooks' },
-    { id: 'hook-cursor', label: 'Cursor hooks' },
-    { id: 'hook-conductor', label: 'Conductor' },
   ];
 
   const cli =
@@ -1866,69 +1674,9 @@ mcp_servers:
     headers:
       Authorization: "Bearer ${tok}"`;
 
-  const hookURL = baseUrlNoMcp + '/v1/hooks/ingest?source=claude_code';
-  const claudeHooks = JSON.stringify({
-    hooks: {
-      UserPromptSubmit: [{ hooks: [{ type: 'http', url: hookURL, headers: { Authorization: `Bearer ${tok}` } }] }],
-      PostToolUse: [{ hooks: [{ type: 'http', url: hookURL, headers: { Authorization: `Bearer ${tok}` } }] }],
-      PostToolUseFailure: [{ hooks: [{ type: 'http', url: hookURL, headers: { Authorization: `Bearer ${tok}` } }] }],
-      Stop: [{ hooks: [{ type: 'http', url: hookURL, headers: { Authorization: `Bearer ${tok}` } }] }],
-      SubagentStart: [{ hooks: [{ type: 'http', url: hookURL, headers: { Authorization: `Bearer ${tok}` } }] }],
-      SubagentStop: [{ hooks: [{ type: 'http', url: hookURL, headers: { Authorization: `Bearer ${tok}` } }] }],
-    },
-  }, null, 2);
-
-  const forwarderInstall =
-`mkdir -p ~/.toolyard/hooks
-cp scripts/toolyard-hook-forwarder.sh ~/.toolyard/hooks/
-chmod +x ~/.toolyard/hooks/toolyard-hook-forwarder.sh`;
-
-  const codexHooks = forwarderInstall + '\n\n# ~/.codex/hooks.json\n' + JSON.stringify({
-    hooks: {
-      UserPromptSubmit: [{ hooks: [{ type: 'command', command: `~/.toolyard/hooks/toolyard-hook-forwarder.sh codex ${baseUrlNoMcp} ${tok}` }] }],
-      PreToolUse: [{ matcher: '*', hooks: [{ type: 'command', command: `~/.toolyard/hooks/toolyard-hook-forwarder.sh codex ${baseUrlNoMcp} ${tok}` }] }],
-      PostToolUse: [{ matcher: '*', hooks: [{ type: 'command', command: `~/.toolyard/hooks/toolyard-hook-forwarder.sh codex ${baseUrlNoMcp} ${tok}` }] }],
-      Stop: [{ hooks: [{ type: 'command', command: `~/.toolyard/hooks/toolyard-hook-forwarder.sh codex ${baseUrlNoMcp} ${tok}` }] }],
-      SubagentStart: [{ matcher: '*', hooks: [{ type: 'command', command: `~/.toolyard/hooks/toolyard-hook-forwarder.sh codex ${baseUrlNoMcp} ${tok}` }] }],
-      SubagentStop: [{ matcher: '*', hooks: [{ type: 'command', command: `~/.toolyard/hooks/toolyard-hook-forwarder.sh codex ${baseUrlNoMcp} ${tok}` }] }],
-    },
-  }, null, 2);
-
-  const cursorHooks = forwarderInstall + '\n\n# ~/.cursor/hooks.json or <project>/.cursor/hooks.json\n' + JSON.stringify({
-    version: 1,
-    hooks: {
-      beforeSubmitPrompt: [{ command: `~/.toolyard/hooks/toolyard-hook-forwarder.sh cursor ${baseUrlNoMcp} ${tok}` }],
-      beforeMCPExecution: [{ command: `~/.toolyard/hooks/toolyard-hook-forwarder.sh cursor ${baseUrlNoMcp} ${tok}` }],
-      afterMCPExecution: [{ command: `~/.toolyard/hooks/toolyard-hook-forwarder.sh cursor ${baseUrlNoMcp} ${tok}` }],
-      afterFileEdit: [{ command: `~/.toolyard/hooks/toolyard-hook-forwarder.sh cursor ${baseUrlNoMcp} ${tok}` }],
-      stop: [{ command: `~/.toolyard/hooks/toolyard-hook-forwarder.sh cursor ${baseUrlNoMcp} ${tok}` }],
-    },
-  }, null, 2);
-
-  const conductorHooks =
-`Conductor runs Claude Code or Codex inside each workspace.
-
-For a Conductor Claude Code workspace:
-1. Use the "Claude hooks" snippet in the workspace or user Claude settings.
-2. Keep the MCP snippet above for Toolyard tools and approvals.
-
-For a Conductor Codex workspace:
-1. Install scripts/toolyard-hook-forwarder.sh with the command shown in the Codex tab.
-2. Use the "Codex hooks" hooks.json shape in the workspace .codex/ layer or user ~/.codex/hooks.json.
-
-There is no separate Conductor hook endpoint for v1; the selected agent client emits the lifecycle events.`;
-
-  const snippet = m.snippetTab === 'cli' ? cli :
-                  m.snippetTab === 'project' ? project :
-                  m.snippetTab === 'global' ? global :
-                  m.snippetTab === 'hermes' ? hermes :
-                  m.snippetTab === 'rules' ? agentRulesSnippet(baseUrlNoMcp, tok) :
-                  m.snippetTab === 'hook-claude' ? claudeHooks :
-                  m.snippetTab === 'hook-codex' ? codexHooks :
-                  m.snippetTab === 'hook-cursor' ? cursorHooks : conductorHooks;
-  const snippetLang = (m.snippetTab === 'cli' || m.snippetTab === 'rules' || m.snippetTab === 'hook-codex' || m.snippetTab === 'hook-cursor') ? 'bash' :
-                      m.snippetTab === 'hermes' ? 'yaml' :
-                      m.snippetTab === 'hook-conductor' ? 'text' : 'json';
+  const snippets = { cli, project, global, hermes, rules: agentRulesSnippet(baseUrlNoMcp, tok) };
+  const snippet = snippets[m.snippetTab] || cli;
+  const snippetLang = m.snippetTab === 'hermes' ? 'yaml' : ['cli', 'rules'].includes(m.snippetTab) ? 'bash' : 'json';
 
   return el('div', { class: 'modal-bg', on: { click: (e) => { if (e.target === e.currentTarget) closeAgentModal(); } } },
     el('div', { class: 'modal modal-wide' },
@@ -1966,13 +1714,7 @@ There is no separate Conductor hook endpoint for v1; the selected agent client e
                   ? 'Teach the agent how to ask you for permission'
                 : m.snippetTab === 'hermes'
                   ? 'Run the add command, then merge the header into ~/.hermes/config.yaml'
-                : m.snippetTab === 'hook-claude'
-                  ? 'Merge into Claude Code settings.json'
-                  : m.snippetTab === 'hook-codex'
-                    ? 'Install the forwarder, then merge into Codex hooks.json'
-                    : m.snippetTab === 'hook-cursor'
-                      ? 'Install the forwarder, then merge into Cursor hooks.json'
-                      : 'Use the hook snippet for the agent type Conductor runs'),
+                  : 'Run this in your terminal'),
           el('button', { class: 'copy-btn', on: { click: (e) => copyToButton(e.target, snippet) }}, 'Copy'),
         ),
         el('pre', { 'data-lang': snippetLang }, snippet),
@@ -2006,98 +1748,6 @@ async function copyToButton(btn, text) {
     // Fallback: select the next sibling pre's text.
     toast('Copy failed: ' + e.message, 'error');
   }
-}
-
-function viewMemory() {
-  return el('div', {},
-    el('div', { class: 'card' },
-      el('h2', {}, 'Set value'),
-      el('div', { class: 'row' },
-        el('input', { id: 'mem-scope', placeholder: 'scope (default: global)' }),
-        el('input', { id: 'mem-key', placeholder: 'key', class: 'grow' }),
-      ),
-      el('textarea', { id: 'mem-val', placeholder: 'value', style: 'margin-top: 8px;' }),
-      el('div', { class: 'row', style: 'margin-top: 8px;' },
-        el('button', { class: 'primary', on: { click: async () => {
-          try {
-            await api('/v1/memory', { method: 'POST', body: {
-              Scope: $('mem-scope').value, Key: $('mem-key').value, Value: $('mem-val').value }});
-            await loadAll(); render();
-          } catch (e) { toast(e.message, 'error'); }
-        }}}, 'Save'),
-      ),
-    ),
-    el('div', { class: 'card' },
-      el('div', { class: 'row', style: 'align-items: center;' },
-        el('h2', { class: 'grow', style: 'margin: 0;' }, 'Entries'),
-        (() => {
-          const i = el('input', { id: 'mem-filter', type: 'search', placeholder: 'Filter memories…', on: { input: (e) => { state.memoryFilter = e.target.value; render(); } } });
-          i.value = state.memoryFilter || '';
-          return i;
-        })(),
-      ),
-      renderMemoryEntries(),
-    ),
-  );
-}
-
-function renderMemoryEntries() {
-  const q = (state.memoryFilter || '').toLowerCase();
-  const rows = (state.memory || []).filter((m) => !q ||
-    [m.scope, m.key, m.value].some((v) => (v || '').toLowerCase().includes(q)));
-  if (!rows.length) {
-    return el('div', { class: 'empty', style: 'margin-top: 12px;' },
-      state.memory.length ? 'No memories match your filter.' : 'No memories yet.');
-  }
-  return el('table', { style: 'margin-top: 12px;' },
-    el('thead', {}, el('tr', {},
-      el('th', {}, 'Scope'), el('th', {}, 'Key'), el('th', {}, 'Value'), el('th', {}, 'Updated'), el('th', {}, ''))),
-    el('tbody', {}, rows.map((m) => {
-      const editing = state.memEdit && state.memEdit.scope === m.scope && state.memEdit.key === m.key;
-      const valueCell = editing
-        ? (() => {
-            const ta = el('textarea', {
-              style: 'width: 100%; min-height: 60px;',
-              on: { keydown: (e) => {
-                if (e.key === 'Escape') { state.memEdit = null; render(); }
-                else if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) { saveMemoryEdit(m, ta.value); }
-              } },
-            }, state.memEdit.value);
-            return el('div', {}, ta,
-              el('div', { class: 'row', style: 'margin-top: 6px;' },
-                el('button', { class: 'primary', on: { click: () => saveMemoryEdit(m, ta.value) } }, 'Save'),
-                el('button', { on: { click: () => { state.memEdit = null; render(); } } }, 'Cancel'),
-                el('span', { class: 'meta' }, '⌘/Ctrl+Enter saves · Esc cancels'),
-              ),
-            );
-          })()
-        : el('div', { class: 'mem-value', title: 'Tap to edit',
-            on: { click: () => { state.memEdit = { scope: m.scope, key: m.key, value: m.value || '' }; render(); } } },
-            m.value || el('span', { class: 'meta' }, '(empty)'));
-      return el('tr', {},
-        el('td', {}, m.scope),
-        el('td', {}, el('code', {}, m.key)),
-        el('td', {}, valueCell),
-        el('td', { class: 'meta' }, relTime(m.updated_at)),
-        el('td', {}, el('button', { class: 'danger', on: { click: async () => {
-          try {
-            await api(`/v1/memory?scope=${encodeURIComponent(m.scope)}&key=${encodeURIComponent(m.key)}`, { method: 'DELETE' });
-            await loadAll(); render();
-          } catch (e) { toast(e.message, 'error'); }
-        }}}, 'Delete')),
-      );
-    })),
-  );
-}
-
-async function saveMemoryEdit(m, value) {
-  try {
-    await api('/v1/memory', { method: 'POST', body: { Scope: m.scope, Key: m.key, Value: value } });
-    state.memEdit = null;
-    await loadAll();
-    render();
-    toast('Saved');
-  } catch (e) { toast(e.message, 'error'); }
 }
 
 // ---- My servers (every user) and Users (admin) ------------------------------
@@ -2307,14 +1957,14 @@ function viewConnections() {
   let body;
   if (!c.loaded) body = el('div', { class: 'card' }, el('div', { class: 'meta' }, 'Loading…'));
   else if (c.rows.length === 0) body = el('div', { class: 'card' }, el('div', { class: 'empty' }, isAdmin()
-    ? 'No server is set to "Each person" under Who signs in yet (Servers page).'
-    : 'None of the servers granted to you asks each person to sign in.'));
+    ? 'No services require a personal account yet. Choose personal account access in Connections.'
+    : 'Your available services do not require a personal account.'));
   else body = c.rows.map(renderConnectionCard);
   return el('div', {},
     el('div', { class: 'card' },
-      el('h2', {}, 'My connections'),
+      el('h2', {}, 'My accounts'),
       el('p', { class: 'meta', style: 'margin: 4px 0 0;' },
-        'These servers act as each person\'s own account. Connect yours and your agents\' calls to them run as you; toolyard keeps the sign-in refreshed. Your sign-in is never used for anyone else.'),
+        'Connect your account so your agents can act on your behalf. Each person uses their own account.'),
       c.error ? el('div', { class: 'err' }, c.error) : null,
     ),
     body,
@@ -2702,7 +2352,7 @@ function viewUsers() {
     state.userAccessModal ? renderUserAccessModal() : null,
     el('div', { class: 'card' },
       el('div', { class: 'agent-add-bar' },
-        el('h2', { style: 'margin: 0;' }, 'Users'),
+        el('h2', { style: 'margin: 0;' }, 'People'),
         el('button', { disabled: u.loading, on: { click: () => loadUsers(true) } }, u.loading ? 'Refreshing…' : 'Refresh'),
       ),
       el('p', { class: 'meta', style: 'margin: 4px 0 12px;' },
@@ -2714,8 +2364,9 @@ function viewUsers() {
 }
 
 function viewServers() {
-  const transport = (state._serverDraft && state._serverDraft.transport) || 'stdio';
-  const draft = state._serverDraft || (state._serverDraft = { transport: 'stdio' });
+  const defaultTransport = state.authConfig?.environment === 'stage' ? 'http' : 'stdio';
+  const transport = (state._serverDraft && state._serverDraft.transport) || defaultTransport;
+  const draft = state._serverDraft || (state._serverDraft = { transport: defaultTransport });
 
   const setDraft = (k, v) => { draft[k] = v; render(); };
 
@@ -2725,13 +2376,13 @@ function viewServers() {
       el('select', {
         on: { change: (e) => setDraft('transport', e.target.value) }
       },
-        el('option', { value: 'stdio',           selected: transport === 'stdio'           }, 'stdio (subprocess)'),
+        state.authConfig?.environment !== 'stage' ? el('option', { value: 'stdio', selected: transport === 'stdio' }, 'stdio (subprocess)') : null,
         el('option', { value: 'http',            selected: transport === 'http'            }, 'streamable HTTP'),
       ),
     ),
     el('label', { style: 'flex: 1;' },
       el('div', { class: 'meta' }, 'Server name'),
-      el('input', { id: 'srv-name', placeholder: 'e.g. github', value: draft.name || '' }),
+      el('input', { id: 'srv-name', on: { input: (e) => { draft.name = e.target.value; } }, placeholder: 'e.g. github', value: draft.name || '' }),
     ),
   );
 
@@ -2740,27 +2391,27 @@ function viewServers() {
         el('div', { class: 'row' },
           el('label', { style: 'flex: 1;' },
             el('div', { class: 'meta' }, 'Command'),
-            el('input', { id: 'srv-cmd', placeholder: 'e.g. uvx', value: draft.command || '' }),
+            el('input', { id: 'srv-cmd', on: { input: (e) => { draft.command = e.target.value; } }, placeholder: 'e.g. uvx', value: draft.command || '' }),
           ),
           el('label', { style: 'flex: 2;' },
             el('div', { class: 'meta' }, 'Args (one per line)'),
-            el('textarea', { id: 'srv-args', placeholder: 'mcp-server-github', value: (draft.args || []).join('\n') }),
+            el('textarea', { id: 'srv-args', on: { input: (e) => { draft.args = e.target.value.split('\n'); } }, placeholder: 'mcp-server-github', value: (draft.args || []).join('\n') }),
           ),
         ),
       )
     : el('label', {},
         el('div', { class: 'meta' }, 'URL'),
-        el('input', { id: 'srv-url', placeholder: 'https://example.com/mcp', value: draft.url || '' }),
+        el('input', { id: 'srv-url', on: { input: (e) => { draft.url = e.target.value; } }, placeholder: 'https://example.com/mcp', value: draft.url || '' }),
       );
 
   const envRow = el('label', {},
     el('div', { class: 'meta' }, 'Environment (KEY=VALUE per line, optional). Use ', el('code', {}, 'KEY=secret://NAME'), ' to reference a stored secret.'),
-    el('textarea', { id: 'srv-env', placeholder: 'GITHUB_PERSONAL_ACCESS_TOKEN=secret://GITHUB_TOKEN', value: draftEnvAsText(draft) }),
+    el('textarea', { id: 'srv-env', on: { input: (e) => { draft._envText = e.target.value; } }, placeholder: 'GITHUB_PERSONAL_ACCESS_TOKEN=secret://GITHUB_TOKEN', value: draft._envText ?? draftEnvAsText(draft) }),
   );
 
   const headersRow = transport !== 'stdio' ? el('label', {},
     el('div', { class: 'meta' }, 'HTTP headers (Header: value per line, optional). Values may be ', el('code', {}, 'secret://NAME'), '.'),
-    el('textarea', { id: 'srv-headers', placeholder: 'X-Api-Key: secret://MY_API_KEY', value: '' }),
+    el('textarea', { id: 'srv-headers', on: { input: (e) => { draft._headersText = e.target.value; } }, placeholder: 'X-Api-Key: secret://MY_API_KEY', value: draft._headersText || '' }),
   ) : null;
 
   // Identity forwarding is per HTTP server; its fields live on the draft.
@@ -2847,7 +2498,7 @@ function viewServers() {
       identityRow,
       el('div', { class: 'row', style: 'margin-top: 12px;' },
         el('button', { class: 'primary', on: { click: () => addServer() }}, 'Add server'),
-        el('button', { on: { click: () => { state._serverDraft = { transport: 'stdio' }; render(); } } }, 'Reset'),
+        el('button', { on: { click: () => { state._serverDraft = { transport: defaultTransport }; render(); } } }, 'Reset'),
       ),
     ),
     el('div', { class: 'card' },
@@ -2899,8 +2550,8 @@ function viewServers() {
 }
 
 function transportLabel(s) {
-  if (s.transport === 'stdio') return s.command + (s.args && s.args.length ? ' ' + s.args.join(' ') : '');
-  return s.url || '';
+ if (s.transport === 'stdio') return s.command;
+ try { const u = new URL(s.url); return u.host + u.pathname; } catch { return 'HTTP'; }
 }
 
 // serverStatusBadge: connected, or the recorded failure. A per_user server
@@ -3872,7 +3523,8 @@ function viewTools() {
       el('p', { class: 'meta' },
         'Search across every connected MCP server and try a tool right here. Calls run through the gateway exactly like an agent would: writes hold for approval, reads pass through. Stuck-pending calls show up in the Approvals tab — approve in another tab and the result lands here.'),
       el('input', {
-        placeholder: 'filter by name, description, or upstream (e.g. "github", "search", "context7")…',
+        id: 'tool-search', 'aria-label': 'Search tools',
+        placeholder: 'Search by name, description, or service (e.g. "github", "search", "context7")…',
         value: filter,
         on: { input: (e) => { state.toolFilter = e.target.value; render(); } },
       }),
@@ -3880,12 +3532,13 @@ function viewTools() {
         `${tools.length} of ${state.tools.length} tools`),
     ),
     tools.length === 0
-      ? el('div', { class: 'card empty' }, state.tools.length === 0 ? 'No tools yet — install an MCP server in the Servers tab.' : 'No tools match your filter.')
+      ? el('div', { class: 'card empty' }, state.tools.length === 0 ? 'Add a connection to make its tools available here.' : 'No tools match your filter.')
       : el('div', { class: 'workbench' },
           el('div', { class: 'tool-list' },
             tools.map((t) => {
               const c = counts[t.name] || 0;
-              return el('div', {
+              return el('button', {
+                type: 'button', 'aria-pressed': t.name === state.workbench.selected ? 'true' : 'false',
                 class: 'item' + (t.name === state.workbench.selected ? ' active' : ''),
                 on: { click: () => { state.workbench.selected = t.name; state.workbench.result = null; render(); } },
               },
@@ -3952,7 +3605,7 @@ function renderToolPane(t) {
     el('div', { class: 'row', style: 'margin-top: 12px;' },
       el('button', {
         class: 'primary',
-        disabled: wb.running ? '' : null,
+        disabled: !!wb.running,
         on: { click: () => runTool(t) },
       }, wb.running ? 'Running…' : 'Run'),
       el('button', {
@@ -4108,165 +3761,6 @@ function pushSupportStatus() {
   return { ok: true };
 }
 
-function viewSettings() {
-  const mode = state.settings.surface_mode || 'full';
-  const N    = Number(state.settings.top_n_count || 20);
-  const T    = Number(state.settings.top_n_personalize_after || 100);
-
-  // Pinned set (must mirror gateway.PinnedTools).
-  const pinned = new Set(['tools.search', 'tools.execute', 'memory.get', 'memory.set', 'memory.list', 'memory.delete']);
-  const totalTools = state.tools.length;
-  const pinnedCount = state.tools.filter((t) => pinned.has(t.name)).length;
-
-  // Approximate "what each NEW agent currently sees" — pinned + top-N
-  // selected globally because no agent has crossed the personalisation
-  // threshold for them.
-  const globalTop = Object.entries(state.usage.per_tool || {})
-    .filter(([name]) => !pinned.has(name))
-    .sort((a, b) => b[1] - a[1])
-    .slice(0, N)
-    .map(([name]) => name);
-  const exposedInTopN = pinnedCount + globalTop.length;
-
-  const exposedCount =
-    mode === 'full' ? totalTools :
-    mode === 'router_only' ? pinnedCount :
-    exposedInTopN;
-
-  const setMode = async (next) => {
-    try {
-      await api('/v1/settings', { method: 'PATCH', body: { surface_mode: next }});
-      state.settings.surface_mode = next;
-      toast('Mode: ' + next);
-      render();
-    } catch (err) { toast(err.message, 'error'); }
-  };
-
-  const radio = (val, label, sub) => el('label', {
-    style: 'display: flex; gap: 12px; align-items: flex-start; cursor: pointer; padding: 8px 0; border-top: 1px solid var(--border);',
-  },
-    el('input', {
-      type: 'radio',
-      name: 'surface_mode',
-      checked: mode === val,
-      style: 'margin-top: 4px;',
-      on: { change: () => setMode(val) },
-    }),
-    el('div', {},
-      el('div', { style: 'font-weight: 500;' }, label),
-      el('div', { class: 'meta', style: 'margin-top: 4px;' }, sub),
-    ),
-  );
-
-  return el('div', {},
-    el('div', { class: 'card' },
-      el('h2', {}, 'Agent surface'),
-      el('p', { class: 'meta' },
-        'Controls which tools each agent sees in its tools/list. Pinned tools (',
-        el('code', {}, 'tools.search'), ', ', el('code', {}, 'tools.execute'), ', ', el('code', {}, 'memory.*'),
-        ') are always visible regardless of mode. Approximate exposure for a new agent: ',
-        el('code', {}, exposedCount + ' / ' + totalTools + ' tools'), '.'),
-      radio('full', 'Full catalog',
-        'Every wrapped tool. Simple, but the agent\'s prompt carries every schema — pricey when you have many servers connected.'),
-      radio('top_n', 'Top-N most used (recommended)',
-        'Pinned tools + the agent\'s top-N most-used real tools. New agents fall back to the overall top-N until they\'ve made enough calls of their own to personalise.'),
-      radio('router_only', 'Router only',
-        'Pinned tools only. The model uses tools.search to discover anything else and tools.execute to invoke. Smallest possible prompt; one extra hop per call.'),
-      mode === 'top_n' ? el('div', { style: 'margin-top: 12px; display: grid; grid-template-columns: 1fr 1fr; gap: 12px;' },
-        el('label', {},
-          el('div', { class: 'meta' }, 'Top-N count'),
-          el('input', {
-            type: 'number', min: 1, max: 200,
-            value: String(N),
-            on: { change: async (e) => {
-              const v = Math.max(1, Math.min(200, parseInt(e.target.value, 10) || 20));
-              try {
-                await api('/v1/settings', { method: 'PATCH', body: { top_n_count: v }});
-                state.settings.top_n_count = v;
-                toast('top_n_count = ' + v);
-                render();
-              } catch (err) { toast(err.message, 'error'); }
-            }},
-          }),
-          el('div', { class: 'meta', style: 'margin-top: 4px;' }, 'Extra tools beyond the pinned set.'),
-        ),
-        el('label', {},
-          el('div', { class: 'meta' }, 'Personalise after (calls)'),
-          el('input', {
-            type: 'number', min: 0, max: 1000000,
-            value: String(T),
-            on: { change: async (e) => {
-              const v = Math.max(0, parseInt(e.target.value, 10) || 0);
-              try {
-                await api('/v1/settings', { method: 'PATCH', body: { top_n_personalize_after: v }});
-                state.settings.top_n_personalize_after = v;
-                toast('top_n_personalize_after = ' + v);
-                render();
-              } catch (err) { toast(err.message, 'error'); }
-            }},
-          }),
-          el('div', { class: 'meta', style: 'margin-top: 4px;' }, 'Until an agent has made this many successful calls, it sees the overall top-N rather than its own.'),
-        ),
-      ) : null,
-    ),
-    renderInboxSettingsCard(),
-    renderPushCard(),
-    renderChatCard(),
-    renderSecretsCard(),
-    renderOperatorTokensCard(),
-    el('div', { class: 'card' },
-      el('h2', {}, 'About'),
-      el('p', {}, 'toolyard v0.1.0 — Apache-2.0.'),
-      el('p', { class: 'meta' }, 'Single Go binary + SQLite. Source: ', el('code', {}, 'github.com/tusharbhardwaj/toolyard')),
-    ),
-    renderBackupCard(),
-  );
-}
-
-// renderBackupCard offers full-store exports and a memory import.
-function renderBackupCard() {
-  return el('div', { class: 'card' },
-    el('h2', {}, 'Backup & export'),
-    el('p', { class: 'meta' }, 'Download the full audit log, approvals (decision tokens excluded), and memory store. Memory can be re-imported.'),
-    el('div', { class: 'row', style: 'flex-wrap: wrap; gap: 8px;' },
-      el('a', { href: '/v1/audit/export?format=csv', target: '_blank' }, 'Audit CSV'),
-      el('a', { href: '/v1/audit/export?format=json', target: '_blank' }, 'Audit JSON'),
-      el('a', { href: '/v1/approvals/export?format=csv', target: '_blank' }, 'Approvals CSV'),
-      el('a', { href: '/v1/approvals/export?format=json', target: '_blank' }, 'Approvals JSON'),
-      el('a', { href: '/v1/memory/export', target: '_blank' }, 'Memory JSON'),
-    ),
-    el('div', { class: 'row', style: 'margin-top: 12px; align-items: center; gap: 8px;' },
-      el('span', { class: 'meta' }, 'Import memory:'),
-      (() => {
-        const sel = el('select', { id: 'mem-import-mode' },
-          el('option', { value: 'merge' }, 'Merge'),
-          el('option', { value: 'replace' }, 'Replace all'));
-        return sel;
-      })(),
-      el('input', { id: 'mem-import-file', type: 'file', accept: 'application/json,.json' }),
-      el('button', { class: 'primary', on: { click: importMemoryFile } }, 'Import'),
-    ),
-  );
-}
-
-async function importMemoryFile() {
-  const fileEl = $('mem-import-file');
-  const mode = ($('mem-import-mode') || {}).value || 'merge';
-  const file = fileEl && fileEl.files && fileEl.files[0];
-  if (!file) { toast('Choose a memory JSON file first.', 'error'); return; }
-  if (mode === 'replace' && !confirm('Replace ALL memory entries with the imported file? This deletes everything not in the file.')) return;
-  try {
-    const text = await file.text();
-    const doc = JSON.parse(text);
-    // Accept either the versioned envelope or a bare entries array.
-    const body = Array.isArray(doc) ? { mode, entries: doc } : Object.assign({}, doc, { mode });
-    const resp = await api('/v1/memory/import', { method: 'POST', body });
-    toast(`Imported ${resp.imported} memories (${mode}).`);
-    await loadAll();
-    render();
-  } catch (e) { toast('Import failed: ' + e.message, 'error'); }
-}
-
 // showSecretBox displays a sensitive value with a copy-to-clipboard
 // button and an explicit dismiss. Auto-clears the DOM node after 60s
 // so an unattended browser tab doesn't keep the secret on screen.
@@ -4363,55 +3857,6 @@ async function loadChatStatus() {
   try { state.chat = await api('/v1/chat/status'); render(); } catch (_) {}
 }
 
-// renderSecretsCard is the secrets-broker settings card: a write-only store of
-// credentials referenced as secret://NAME in upstream env/headers. Values are
-// never shown.
-function renderSecretsCard() {
-  if (!state.secretsLoaded) { loadSecrets(); }
-  let nName = '', nVal = '', nDesc = '';
-  const create = async () => {
-    if (!/^[A-Z][A-Z0-9_]{0,63}$/.test(nName)) { toast('Name must be UPPER_SNAKE (e.g. API_KEY)', 'error'); return; }
-    if (!nVal) { toast('Value required', 'error'); return; }
-    try {
-      await api('/v1/secrets', { method: 'POST', body: { name: nName, value: nVal, description: nDesc } });
-      toast('Stored ' + nName);
-      loadSecrets();
-    } catch (e) { toast(e.message, 'error'); }
-  };
-  const pendingCount = (state.secrets || []).filter((s) => s.pending).length;
-  const rows = (state.secrets || []).map((s) => el('tr', {},
-    el('td', {}, el('code', {}, s.name),
-      s.pending ? el('span', { class: 'badge pending', title: 'Requested by ' + (s.requested_by || 'an agent') + '; servers using it connect once you set it', style: 'margin-left:6px;' }, 'needs value') : null),
-    el('td', { class: 'meta' }, (s.description || '—') + (s.pending && s.requested_by ? ' · requested by ' + s.requested_by : '')),
-    el('td', { class: 'meta' }, (s.used_by && s.used_by.length) ? s.used_by.join(', ') : '—'),
-    el('td', {},
-      el('button', { class: s.pending ? 'btn primary' : 'btn', style: 'font-size:12px;', on: { click: () => rotateSecret(s.name, s.pending) } }, s.pending ? 'Set value' : 'Rotate'),
-      ' ',
-      el('button', { class: 'btn', style: 'font-size:12px;', on: { click: () => deleteSecret(s.name, s.used_by || []) } }, 'Delete'),
-    ),
-  ));
-  return el('div', { class: 'card' },
-    el('h2', {}, 'Secrets'),
-    el('p', { class: 'meta' },
-      'Store API keys once, encrypted. Reference them in a server\'s env/headers as ',
-      el('code', {}, 'secret://NAME'), ' (or ', el('code', {}, 'Bearer ${secret://NAME}'), '). Values are resolved only at dial time and never returned by the API. Agents can request a secret by name; you type the value here.'),
-    pendingCount ? el('p', { style: 'margin-top:6px; color: var(--pending);' }, pendingCount + (pendingCount === 1 ? ' secret is' : ' secrets are') + ' waiting for a value.') : null,
-    state.secrets && state.secrets.length ? el('table', { class: 'tbl', style: 'width:100%; margin-top:8px;' },
-      el('thead', {}, el('tr', {},
-        el('th', {}, 'Name'), el('th', {}, 'Description'), el('th', {}, 'Used by'), el('th', {}, ''))),
-      el('tbody', {}, ...rows),
-    ) : el('p', { class: 'meta' }, 'No secrets yet.'),
-    el('div', { style: 'margin-top:12px; display:grid; grid-template-columns: 1fr 1fr; gap:8px;' },
-      el('input', { placeholder: 'NAME', style: 'padding:6px 8px;', on: { input: (e) => { nName = e.target.value.toUpperCase(); e.target.value = nName; } } }),
-      el('input', { type: 'password', placeholder: 'value', style: 'padding:6px 8px;', on: { input: (e) => { nVal = e.target.value; } } }),
-    ),
-    el('div', { style: 'margin-top:8px; display:flex; gap:8px;' },
-      el('input', { placeholder: 'description (optional)', style: 'flex:1; padding:6px 8px;', on: { input: (e) => { nDesc = e.target.value; } } }),
-      el('button', { class: 'btn', on: { click: create } }, 'Add secret'),
-    ),
-  );
-}
-
 // renderOperatorTokensCard lists the CLI operator tokens (toolyard admin /
 // toolyard api) and lets the owner revoke them. New tokens are minted with
 // `toolyard operator-token create` on the host or POST /v1/operator-tokens.
@@ -4426,11 +3871,11 @@ function renderOperatorTokensCard() {
       : el('button', { class: 'btn', style: 'font-size:12px;', on: { click: () => revokeOperatorToken(t.id, t.name) } }, 'Revoke')),
   ));
   return el('div', { class: 'card' },
-    el('h2', {}, 'Operator tokens'),
+    el('h2', {}, 'Command line access'),
     el('p', { class: 'meta' },
-      'CLI agents use these with ', el('code', {}, 'toolyard admin'), ' and ', el('code', {}, 'toolyard api'),
+      'Tokens permit command line access through ', el('code', {}, 'toolyard admin'), ' and ', el('code', {}, 'toolyard api'),
       ' to do what this dashboard does. The owner scope (approvals, policies, users, secret values) is never granted by default; secret values are never readable. Every change they make is in the audit log.'),
-    rows.length ? el('table', { class: 'tbl', style: 'width:100%; margin-top:8px;' },
+    state.opTokensLoading ? el('p', { class: 'meta' }, 'Load in progress…') : state.opTokensError ? el('div', { class: 'settings-notice error' }, state.opTokensError, el('button', { on: { click: loadOperatorTokens } }, 'Try again')) : rows.length ? el('table', { class: 'tbl', style: 'width:100%; margin-top:8px;' },
       el('thead', {}, el('tr', {}, el('th', {}, 'Name'), el('th', {}, 'Scopes'), el('th', {}, 'Last used'), el('th', {}, ''))),
       el('tbody', {}, ...rows),
     ) : el('p', { class: 'meta' }, 'No operator tokens.'),
@@ -4438,8 +3883,9 @@ function renderOperatorTokensCard() {
 }
 
 async function loadOperatorTokens() {
-  state.opTokensLoaded = true;
-  try { state.opTokens = await api('/v1/operator-tokens'); render(); } catch (_) {}
+  state.opTokensLoaded = true; state.opTokensLoading = true; state.opTokensError = '';
+  try { state.opTokens = await api('/v1/operator-tokens'); } catch (e) { state.opTokensError = e.message; }
+  state.opTokensLoading = false; if (state.route === 'settings') render();
 }
 async function revokeOperatorToken(id, name) {
   if (!confirm('Revoke operator token "' + name + '"? Agents using it lose access immediately.')) return;
@@ -4448,421 +3894,17 @@ async function revokeOperatorToken(id, name) {
 }
 
 async function loadSecrets() {
-  state.secretsLoaded = true;
-  try { state.secrets = await api('/v1/secrets'); render(); } catch (_) {}
+  state.secretsLoaded = true; state.secretsLoading = true; state.secretsError = '';
+  try { state.secrets = await api('/v1/secrets'); } catch (e) { state.secretsError = e.message; }
+  finally { state.secretsLoading = false; if (state.route === 'settings') render(); }
 }
-async function rotateSecret(name, pending) {
-  const v = prompt(pending
-    ? 'Value for ' + name + ' (servers that reference it reconnect automatically):'
-    : 'New value for ' + name + ' (rotates + reconnects referencing servers):');
-  if (v == null || v === '') return;
-  try { await api('/v1/secrets/' + encodeURIComponent(name) + '?reconnect=1', { method: 'PUT', body: { value: v } }); toast('Rotated ' + name); loadSecrets(); }
-  catch (e) { toast(e.message, 'error'); }
+function rotateSecret(name, pending) {
+  settingsUI.secretEdit = { name, pending, value: '', busy: false, error: '' }; render();
 }
 async function deleteSecret(name, usedBy) {
-  if (usedBy.length && !confirm(name + ' is used by ' + usedBy.join(', ') + '. Force delete anyway?')) return;
+  if (!confirm('Delete ' + name + '?' + (usedBy.length ? ' Connections that use it will lose access: ' + usedBy.join(', ') + '.' : ' You cannot restore its value.'))) return;
   const q = usedBy.length ? '?force=1' : '';
   try { await api('/v1/secrets/' + encodeURIComponent(name) + q, { method: 'DELETE' }); toast('Deleted ' + name); loadSecrets(); }
-  catch (e) { toast(e.message, 'error'); }
-}
-
-// ---- Events Hub ------------------------------------------------------------
-
-async function loadEvents() {
-  state.events.loaded = true;
-  const f = state.eventFilter;
-  const p = new URLSearchParams();
-  if (f.source_id) p.set('source_id', f.source_id);
-  if (f.type) p.set('type', f.type);
-  if (f.q) p.set('q', f.q);
-  if (f.unacked) p.set('unacked', '1');
-  p.set('limit', '100');
-  try {
-    const [feed, sources] = await Promise.all([
-      api('/v1/events?' + p.toString()),
-      api('/v1/event-sources').catch(() => []),
-    ]);
-    state.events.rows = feed.events || [];
-    state.events.unacked = feed.unacked || 0;
-    state.events.nextBefore = feed.next_before || 0;
-    state.events.sources = sources || [];
-    render();
-  } catch (e) { toast(e.message, 'error'); }
-}
-
-function eventRelTime(ms) {
-  const d = (Date.now() - ms) / 1000;
-  if (d < 60) return 'just now';
-  if (d < 3600) return Math.floor(d / 60) + 'm ago';
-  if (d < 86400) return Math.floor(d / 3600) + 'h ago';
-  return Math.floor(d / 86400) + 'd ago';
-}
-
-async function ackEvents(ids) {
-  if (!ids.length) return;
-  try {
-    await api('/v1/events/ack', { method: 'POST', body: { ids } });
-    loadEvents();
-  } catch (e) { toast(e.message, 'error'); }
-}
-
-// ---- MemPalace panel (TEC-481) ---------------------------------------------
-
-async function loadMempalace() {
-  state.mempalace.loaded = true;
-  try {
-    const [metrics, webhooks, wings] = await Promise.all([
-      api('/v1/memory/metrics').catch(() => null),
-      api('/v1/memory/webhooks').catch(() => []),
-      api('/v1/memory/webhooks/wings').catch(() => ({ wings: [] })),
-    ]);
-    state.mempalace.metrics = metrics;
-    state.mempalace.webhooks = webhooks || [];
-    state.mempalace.wings = (wings && wings.wings) || [];
-    render();
-  } catch (e) { toast(e.message, 'error'); }
-}
-
-function fmtBytes(n) {
-  n = Number(n) || 0;
-  if (n < 1024) return n + ' B';
-  if (n < 1024 * 1024) return (n / 1024).toFixed(1) + ' KB';
-  return (n / (1024 * 1024)).toFixed(1) + ' MB';
-}
-
-function viewMempalace() {
-  if (!state.mempalace.loaded) loadMempalace();
-  const m = state.mempalace.metrics;
-  const mp = (m && m.mempalace) || {};
-  const ledger = (m && m.ledger) || {};
-  const totals = ledger.totals || {};
-  const fmtNum = (n) => (n == null ? '0' : Number(n).toLocaleString());
-
-  const cardNum = (label, value, sub) => el('div', {
-    style: 'background: var(--bg); border: 1px solid var(--border); border-radius: 6px; padding: 10px 12px; flex: 1; min-width: 120px;',
-  },
-    el('div', { class: 'meta', style: 'font-size: 11px; text-transform: uppercase; letter-spacing: 0.04em;' }, label),
-    el('div', { style: 'font-size: 22px; font-weight: 600; margin-top: 2px;' }, String(value)),
-    sub ? el('div', { class: 'meta', style: 'font-size: 11px;' }, sub) : null,
-  );
-
-  const statusBadge = mp.available
-    ? el('span', { class: 'badge allowed' }, 'available')
-    : (mp.enabled ? el('span', { class: 'badge pending' }, 'not connected') : el('span', { class: 'badge denied' }, 'disabled'));
-
-  const statusCard = el('div', { class: 'card' },
-    el('div', { class: 'row', style: 'justify-content: space-between; align-items: center;' },
-      el('h2', { style: 'margin: 0;' }, 'MemPalace'),
-      statusBadge,
-    ),
-    el('p', { class: 'meta' }, 'Memory backed by the MemPalace upstream. Authenticated, wing-locked webhooks let n8n automations ingest memory (e.g. meeting transcripts) into a single bound wing.'),
-    el('div', { class: 'row', style: 'gap: 10px; margin-top: 12px; flex-wrap: wrap;' },
-      cardNum('Mode', mp.mode || '—', mp.installed ? 'installed' : 'not installed'),
-      cardNum('Ingestions', fmtNum(totals.total), 'all time'),
-      cardNum('Last 24h', fmtNum(totals.last_24h), fmtNum(totals.last_7d) + ' in 7d'),
-      cardNum('OK', fmtNum(totals.ok)),
-      cardNum('Failures', fmtNum((totals.failed || 0) + (totals.rejected || 0) + (totals.too_large || 0)),
-        `${fmtNum(totals.rejected)} rejected · ${fmtNum(totals.too_large)} too big`),
-      cardNum('Webhooks', fmtNum(ledger.webhook_count), fmtNum(ledger.enabled_count) + ' enabled'),
-      cardNum('Agents', fmtNum(mp.agent_count)),
-    ),
-    mp.palace_dir ? el('div', { class: 'meta', style: 'margin-top: 8px;' }, 'palace: ' + mp.palace_dir) : null,
-  );
-
-  const perWing = ledger.per_wing || [];
-  const wingCard = el('div', { class: 'card' },
-    el('h2', {}, 'Ingestion by wing'),
-    perWing.length ? el('table', { class: 'tbl', style: 'width:100%; margin-top:8px;' },
-      el('thead', {}, el('tr', {}, el('th', {}, 'Wing'), el('th', {}, 'Total'), el('th', {}, 'OK'), el('th', {}, 'Failed'), el('th', {}, 'Last'))),
-      el('tbody', {}, ...perWing.map((wv) => el('tr', {},
-        el('td', {}, el('span', { class: 'badge allow' }, wv.wing)),
-        el('td', {}, fmtNum(wv.count)),
-        el('td', {}, fmtNum(wv.ok)),
-        el('td', {}, wv.failed ? el('span', { class: 'badge denied' }, fmtNum(wv.failed)) : '0'),
-        el('td', { class: 'meta' }, wv.last_at ? relTime(wv.last_at) : '—'),
-      ))),
-    ) : el('p', { class: 'meta' }, 'No ingestions yet.'),
-  );
-
-  const recent = ledger.recent || [];
-  const statusPill = (s) => {
-    const cls = s === 'ok' ? 'allowed' : (s === 'rejected' || s === 'too_large' ? 'pending' : 'denied');
-    return el('span', { class: 'badge ' + cls }, s);
-  };
-  const recentCard = el('div', { class: 'card' },
-    el('h2', {}, 'Recent ingestion activity'),
-    recent.length ? el('table', { class: 'tbl', style: 'width:100%; margin-top:8px;' },
-      el('thead', {}, el('tr', {}, el('th', {}, 'When'), el('th', {}, 'Webhook'), el('th', {}, 'Wing'), el('th', {}, 'Size'), el('th', {}, 'Status'), el('th', {}, 'Request'))),
-      el('tbody', {}, ...recent.map((ig) => el('tr', { title: ig.detail || '' },
-        el('td', { class: 'meta' }, relTime(ig.received_at)),
-        el('td', {}, ig.webhook_name, ig.source ? el('span', { class: 'meta' }, ' · ' + ig.source) : null),
-        el('td', {}, el('span', { class: 'badge allow' }, ig.wing)),
-        el('td', { class: 'meta' }, fmtBytes(ig.payload_size)),
-        el('td', {}, statusPill(ig.status)),
-        el('td', { class: 'meta', style: 'font-family: monospace; font-size: 11px;' }, ig.id),
-      ))),
-    ) : el('p', { class: 'meta' }, 'No activity yet. Create a webhook and POST to it.'),
-  );
-
-  return el('div', {},
-    statusCard,
-    renderMemWebhooksCard(),
-    wingCard,
-    recentCard,
-    state.mwModal ? renderMemWebhookModal() : null,
-  );
-}
-
-function renderMemWebhooksCard() {
-  const hooks = state.mempalace.webhooks || [];
-  const rows = hooks.map((h) => el('tr', {},
-    el('td', {}, h.name, h.notes ? el('div', { class: 'meta' }, h.notes) : null),
-    el('td', {}, el('span', { class: 'badge allow' }, h.wing)),
-    el('td', { class: 'meta' }, (h.payload_spec && h.payload_spec.mode) || 'whole'),
-    el('td', { class: 'meta' }, fmtNumSafe(h.ingest_count) + ' in' + (h.fail_count ? ' · ' + fmtNumSafe(h.fail_count) + ' fail' : '')),
-    el('td', {},
-      el('label', { style: 'display:inline-flex; gap:4px; align-items:center;' },
-        el('input', { type: 'checkbox', checked: h.enabled, on: { change: (e) => patchMemWebhook(h.id, { enabled: e.target.checked }) } }), 'on'),
-    ),
-    el('td', {},
-      el('button', { class: 'btn', style: 'font-size:12px;', on: { click: () => rotateMemWebhookToken(h.id) } }, 'Token'),
-      ' ',
-      el('button', { class: 'btn', style: 'font-size:12px;', on: { click: () => deleteMemWebhook(h.id, h.name) } }, 'Revoke'),
-    ),
-  ));
-  return el('div', { class: 'card' },
-    el('h2', {}, 'Ingestion webhooks',
-      el('button', { class: 'btn', style: 'float:right; font-size:12px;', on: { click: () => {
-        state.mwModal = { name: '', wing: '', source: '', mode: 'whole', entry_field: '', entry_template: '', topic: '', required: '', json_schema: '' };
-        render();
-      } } }, '+ Add webhook')),
-    el('p', { class: 'meta' }, 'Each webhook is locked to one wing at creation. Callers authenticate with a bearer token and can never change the target wing.'),
-    hooks.length ? el('table', { class: 'tbl', style: 'width:100%; margin-top:8px;' },
-      el('thead', {}, el('tr', {}, el('th', {}, 'Name'), el('th', {}, 'Wing'), el('th', {}, 'Mode'), el('th', {}, 'Volume'), el('th', {}, 'State'), el('th', {}, ''))),
-      el('tbody', {}, ...rows),
-    ) : el('p', { class: 'meta' }, 'No webhooks yet. Add one to start ingesting memory from n8n.'),
-  );
-}
-
-function fmtNumSafe(n) { return n == null ? '0' : Number(n).toLocaleString(); }
-
-function renderMemWebhookModal() {
-  const m = state.mwModal;
-  const close = () => { state.mwModal = null; render(); };
-  return el('div', { class: 'modal-bg', on: { click: (e) => { if (e.target === e.currentTarget) close(); } } },
-    el('div', { class: 'modal modal-wide' },
-      el('h3', {}, 'Add ingestion webhook'),
-      el('p', { class: 'meta' }, 'The wing is locked at creation and cannot be changed by callers.'),
-      el('label', {}, el('div', { class: 'meta' }, 'Name'),
-        el('input', { placeholder: 'meeting-transcripts', value: m.name, style: 'width:100%; padding:6px 8px; margin-bottom:8px;', on: { input: (e) => { m.name = e.target.value; } } })),
-      el('label', {}, el('div', { class: 'meta' }, 'Wing (locked)'),
-        el('input', { placeholder: 'meetings', value: m.wing, list: 'mw-wings', style: 'width:100%; padding:6px 8px; margin-bottom:8px;', on: { input: (e) => { m.wing = e.target.value; } } })),
-      el('datalist', { id: 'mw-wings' }, ...(state.mempalace.wings || []).map((wg) => el('option', { value: wg }))),
-      el('label', {}, el('div', { class: 'meta' }, 'Source automation label (optional)'),
-        el('input', { placeholder: 'n8n-meeting-job', value: m.source, style: 'width:100%; padding:6px 8px; margin-bottom:8px;', on: { input: (e) => { m.source = e.target.value; } } })),
-      el('label', {}, el('div', { class: 'meta' }, 'Entry mode'),
-        el('select', { style: 'padding:6px 8px; margin-bottom:8px;', on: { change: (e) => { m.mode = e.target.value; render(); } } },
-          el('option', { value: 'whole', selected: m.mode === 'whole' }, 'whole — store the full JSON payload'),
-          el('option', { value: 'field', selected: m.mode === 'field' }, 'field — store one payload field'),
-          el('option', { value: 'template', selected: m.mode === 'template' }, 'template — render {{field}} placeholders'),
-        )),
-      m.mode === 'field' ? el('label', {}, el('div', { class: 'meta' }, 'Entry field (dot-path)'),
-        el('input', { placeholder: 'transcript', value: m.entry_field, style: 'width:100%; padding:6px 8px; margin-bottom:8px;', on: { input: (e) => { m.entry_field = e.target.value; } } })) : null,
-      m.mode === 'template' ? el('label', {}, el('div', { class: 'meta' }, 'Entry template'),
-        el('textarea', { placeholder: '{{title}}\n\n{{transcript}}', value: m.entry_template, style: 'width:100%; padding:6px 8px; margin-bottom:8px; min-height:64px;', on: { input: (e) => { m.entry_template = e.target.value; } } })) : null,
-      el('label', {}, el('div', { class: 'meta' }, 'Topic within the wing (optional)'),
-        el('input', { placeholder: 'standup', value: m.topic, style: 'width:100%; padding:6px 8px; margin-bottom:8px;', on: { input: (e) => { m.topic = e.target.value; } } })),
-      el('label', {}, el('div', { class: 'meta' }, 'Required fields (comma-separated dot-paths, optional)'),
-        el('input', { placeholder: 'title, transcript', value: m.required, style: 'width:100%; padding:6px 8px; margin-bottom:8px;', on: { input: (e) => { m.required = e.target.value; } } })),
-      el('label', {}, el('div', { class: 'meta' }, 'JSON Schema (optional, draft 2020-12)'),
-        el('textarea', { placeholder: '{"type":"object","required":["transcript"]}', value: m.json_schema, style: 'width:100%; padding:6px 8px; margin-bottom:8px; min-height:64px; font-family: monospace;', on: { input: (e) => { m.json_schema = e.target.value; } } })),
-      el('div', { style: 'display:flex; gap:8px; justify-content:flex-end; margin-top:8px;' },
-        el('button', { class: 'btn', on: { click: close } }, 'Cancel'),
-        el('button', { class: 'btn primary', on: { click: createMemWebhook } }, 'Create'),
-      ),
-    ),
-  );
-}
-
-function buildPayloadSpec(m) {
-  const spec = { mode: m.mode || 'whole' };
-  if (m.mode === 'field') spec.entry_field = m.entry_field.trim();
-  if (m.mode === 'template') spec.entry_template = m.entry_template;
-  if (m.topic && m.topic.trim()) spec.topic = m.topic.trim();
-  const req = (m.required || '').split(',').map((s) => s.trim()).filter(Boolean);
-  if (req.length) spec.required_fields = req;
-  if (m.json_schema && m.json_schema.trim()) {
-    spec.json_schema = JSON.parse(m.json_schema); // throws → caught by caller
-  }
-  return spec;
-}
-
-async function createMemWebhook() {
-  const m = state.mwModal;
-  if (!m.name.trim() || !m.wing.trim()) { toast('Name and wing are required', 'error'); return; }
-  let spec;
-  try { spec = buildPayloadSpec(m); }
-  catch (e) { toast('Invalid JSON Schema: ' + e.message, 'error'); return; }
-  try {
-    const r = await api('/v1/memory/webhooks', { method: 'POST', body: {
-      name: m.name.trim(), wing: m.wing.trim(), source: m.source.trim(), payload_spec: spec,
-    } });
-    state.mwModal = null;
-    await loadMempalace();
-    if (r.token) showSecretBox('Webhook token for ' + r.webhook.name, r.token, r.curl_example || 'POST to /v1/memory/webhooks/ingest with Authorization: Bearer <token>');
-  } catch (e) { toast(e.message, 'error'); }
-}
-
-async function rotateMemWebhookToken(id) {
-  if (!confirm('Rotate this token? The current token stops working immediately.')) return;
-  try {
-    const r = await api('/v1/memory/webhooks/' + encodeURIComponent(id) + '/rotate-token', { method: 'POST', body: {} });
-    showSecretBox('New webhook token', r.token, r.curl_example || 'POST to /v1/memory/webhooks/ingest with Authorization: Bearer <token>');
-  } catch (e) { toast(e.message, 'error'); }
-}
-
-async function patchMemWebhook(id, body) {
-  try { await api('/v1/memory/webhooks/' + encodeURIComponent(id), { method: 'PATCH', body }); loadMempalace(); }
-  catch (e) { toast(e.message, 'error'); }
-}
-
-async function deleteMemWebhook(id, name) {
-  if (!confirm('Revoke webhook ' + name + '? Its token stops working immediately.')) return;
-  try { await api('/v1/memory/webhooks/' + encodeURIComponent(id), { method: 'DELETE' }); toast('Revoked'); loadMempalace(); }
-  catch (e) { toast(e.message, 'error'); }
-}
-
-function viewEvents() {
-  if (!state.events.loaded) loadEvents();
-  const f = state.eventFilter;
-  const ev = state.events;
-
-  const filterBar = el('div', { class: 'card', style: 'display:flex; gap:8px; flex-wrap:wrap; align-items:center;' },
-    el('select', { style: 'padding:6px 8px;', on: { change: (e) => { f.source_id = e.target.value; loadEvents(); } } },
-      el('option', { value: '' }, 'All sources'),
-      ...(ev.sources || []).map((s) => el('option', { value: s.id, selected: f.source_id === s.id }, s.name)),
-    ),
-    el('input', { placeholder: 'type', value: f.type, style: 'padding:6px 8px; width:120px;', on: { change: (e) => { f.type = e.target.value; loadEvents(); } } }),
-    el('input', { placeholder: 'search summary…', value: f.q, style: 'padding:6px 8px; flex:1;', on: { change: (e) => { f.q = e.target.value; loadEvents(); } } }),
-    el('label', { style: 'display:flex; gap:6px; align-items:center;' },
-      el('input', { type: 'checkbox', checked: f.unacked, on: { change: (e) => { f.unacked = e.target.checked; loadEvents(); } } }),
-      'Unacked only',
-    ),
-    el('button', { class: 'btn', on: { click: () => ackEvents((ev.rows || []).filter((r) => !r.acked_at).map((r) => r.id)) } }, 'Ack all visible'),
-  );
-
-  const rows = (ev.rows || []).map((r) => el('div', {
-    class: 'card', style: 'padding:10px 14px; ' + (r.acked_at ? 'opacity:0.6;' : ''),
-  },
-    el('div', { style: 'display:flex; gap:10px; align-items:baseline; flex-wrap:wrap;' },
-      el('span', { class: 'meta', style: 'min-width:64px;' }, eventRelTime(r.received_at)),
-      el('span', { style: 'font-weight:500;' }, r.source_name),
-      el('span', { style: 'padding:1px 7px; border-radius:9px; background:var(--bg); border:1px solid var(--border); font-size:12px;' }, r.type),
-      el('span', { style: 'flex:1;' }, r.summary),
-      r.acked_at ? el('span', { class: 'meta' }, '✓ acked')
-        : el('button', { class: 'btn', style: 'font-size:12px;', on: { click: () => ackEvents([r.id]) } }, 'Ack'),
-    ),
-    r.payload ? el('details', { style: 'margin-top:6px;' },
-      el('summary', { class: 'meta', style: 'cursor:pointer;' }, 'payload'),
-      el('pre', { style: 'white-space:pre-wrap; word-break:break-all; font-size:12px; margin:6px 0 0;' },
-        (() => { try { return JSON.stringify(JSON.parse(r.payload), null, 2); } catch { return String(r.payload); } })()),
-    ) : null,
-  ));
-
-  return el('div', {},
-    el('div', { class: 'card' },
-      el('h2', {}, 'Events',
-        ev.unacked ? el('span', { style: 'margin-left:8px; font-size:14px; color:var(--muted);' }, '(' + ev.unacked + ' unacked)') : null),
-      el('p', { class: 'meta' }, 'The shared activity feed across agents and external systems. Webhooks push events in, pollers watch URLs, and agents publish to each other. Every event has a natural-language summary; agents read them with the events.brief tool.')),
-    filterBar,
-    rows.length ? el('div', {}, ...rows) : el('div', { class: 'card' }, el('p', { class: 'meta' }, 'No events. Create a source below and push one in.')),
-    renderEventSourcesCard(),
-    state.eventSourceModal ? renderEventSourceModal() : null,
-  );
-}
-
-function renderEventSourcesCard() {
-  const sources = state.events.sources || [];
-  const rows = sources.map((s) => el('tr', {},
-    el('td', {}, s.name, ' ', el('span', { class: 'meta' }, '(' + s.kind + ')')),
-    el('td', {},
-      el('label', { style: 'display:inline-flex; gap:4px; align-items:center; margin-right:10px;' },
-        el('input', { type: 'checkbox', checked: s.enabled, on: { change: (e) => patchSource(s.id, { enabled: e.target.checked }) } }), 'on'),
-      el('label', { style: 'display:inline-flex; gap:4px; align-items:center;' },
-        el('input', { type: 'checkbox', checked: s.notify, on: { change: (e) => patchSource(s.id, { notify: e.target.checked }) } }), 'notify'),
-    ),
-    el('td', { class: 'meta' }, s.last_error ? ('⚠ ' + s.last_error) : (s.poller_state && s.poller_state.last_polled_at ? 'polled ' + eventRelTime(s.poller_state.last_polled_at) : '—')),
-    el('td', {},
-      s.kind === 'webhook' ? el('button', { class: 'btn', style: 'font-size:12px;', on: { click: () => rotateSourceToken(s.id) } }, 'Token') : null,
-      ' ',
-      el('button', { class: 'btn', style: 'font-size:12px;', on: { click: () => deleteSource(s.id, s.name) } }, 'Delete'),
-    ),
-  ));
-  return el('div', { class: 'card' },
-    el('h2', {}, 'Sources',
-      el('button', { class: 'btn', style: 'float:right; font-size:12px;', on: { click: () => { state.eventSourceModal = { kind: 'webhook', name: '', url: '', interval: 300, mode: 'hash', json_path: '' }; render(); } } }, '+ Add source')),
-    sources.length ? el('table', { class: 'tbl', style: 'width:100%; margin-top:8px;' },
-      el('thead', {}, el('tr', {}, el('th', {}, 'Name'), el('th', {}, 'State'), el('th', {}, 'Last'), el('th', {}, ''))),
-      el('tbody', {}, ...rows),
-    ) : el('p', { class: 'meta' }, 'No sources yet. Add a webhook to receive events or a poller to watch a URL.'),
-  );
-}
-
-function renderEventSourceModal() {
-  const m = state.eventSourceModal;
-  const close = () => { state.eventSourceModal = null; render(); };
-  const create = async () => {
-    const body = { name: m.name, kind: m.kind, notify: false };
-    if (m.kind === 'poller') {
-      body.poller_config = { url: m.url, interval_sec: Number(m.interval) || 300, mode: m.mode, json_path: m.json_path };
-    }
-    try {
-      const r = await api('/v1/event-sources', { method: 'POST', body });
-      close();
-      loadEvents();
-      if (r.token) showSecretBox('Webhook token for ' + m.name, r.token, r.curl_example || 'Send events with: Authorization: Bearer <token>');
-    } catch (e) { toast(e.message, 'error'); }
-  };
-  return el('div', { class: 'modal-bg', on: { click: (e) => { if (e.target === e.currentTarget) close(); } } },
-    el('div', { class: 'modal' },
-      el('h3', {}, 'Add event source'),
-      el('div', { style: 'display:flex; gap:8px; margin:8px 0;' },
-        ...['webhook', 'poller', 'agent'].map((k) => el('label', { style: 'display:flex; gap:4px; align-items:center;' },
-          el('input', { type: 'radio', name: 'evkind', checked: m.kind === k, on: { change: () => { m.kind = k; render(); } } }), k)),
-      ),
-      el('input', { placeholder: 'source name', value: m.name, style: 'width:100%; padding:6px 8px; margin-bottom:8px;', on: { input: (e) => { m.name = e.target.value; } } }),
-      m.kind === 'poller' ? el('div', {},
-        el('input', { placeholder: 'https://url-to-watch', value: m.url, style: 'width:100%; padding:6px 8px; margin-bottom:8px;', on: { input: (e) => { m.url = e.target.value; } } }),
-        el('div', { style: 'display:flex; gap:8px; margin-bottom:8px;' },
-          el('input', { type: 'number', min: 60, placeholder: 'interval (s)', value: m.interval, style: 'width:120px; padding:6px 8px;', on: { input: (e) => { m.interval = e.target.value; } } }),
-          el('select', { style: 'padding:6px 8px;', on: { change: (e) => { m.mode = e.target.value; render(); } } },
-            el('option', { value: 'hash', selected: m.mode === 'hash' }, 'whole-page hash'),
-            el('option', { value: 'json_field', selected: m.mode === 'json_field' }, 'JSON field'),
-          ),
-        ),
-        m.mode === 'json_field' ? el('input', { placeholder: 'json path e.g. data.price', value: m.json_path, style: 'width:100%; padding:6px 8px; margin-bottom:8px;', on: { input: (e) => { m.json_path = e.target.value; } } }) : null,
-      ) : null,
-      el('div', { style: 'display:flex; gap:8px; justify-content:flex-end; margin-top:8px;' },
-        el('button', { class: 'btn', on: { click: close } }, 'Cancel'),
-        el('button', { class: 'btn primary', on: { click: create } }, 'Create'),
-      ),
-    ),
-  );
-}
-
-async function patchSource(id, body) {
-  try { await api('/v1/event-sources/' + encodeURIComponent(id), { method: 'PATCH', body }); loadEvents(); }
-  catch (e) { toast(e.message, 'error'); }
-}
-async function rotateSourceToken(id) {
-  try {
-    const r = await api('/v1/event-sources/' + encodeURIComponent(id) + '/rotate-token', { method: 'POST', body: {} });
-    showSecretBox('New webhook token', r.token, r.curl_example);
-  } catch (e) { toast(e.message, 'error'); }
-}
-async function deleteSource(id, name) {
-  if (!confirm('Delete source ' + name + ' and all its events?')) return;
-  try { await api('/v1/event-sources/' + encodeURIComponent(id), { method: 'DELETE' }); toast('Deleted'); loadEvents(); }
   catch (e) { toast(e.message, 'error'); }
 }
 
@@ -4889,7 +3931,7 @@ function renderPushCard() {
 
   let body;
   if (!state.vapidKey) {
-    body = el('div', { class: 'meta' }, 'No VAPID key on the server.');
+    body = el('div', { class: 'settings-notice' }, 'Device notifications are not configured for this workspace.');
   } else if (!support.ok) {
     if (ios && !standalone) {
       // Most common iOS case: PushManager hidden inside Safari tabs.
@@ -4913,19 +3955,20 @@ function renderPushCard() {
       ios && !standalone
         ? el('div', { class: 'warn-pill' }, '⚠  Looks like Safari thinks push is available, but iOS only delivers when run from the Home Screen icon. If Enable fails, follow the install steps below.')
         : null,
-      el('div', { class: 'row' },
-        el('button', { class: 'primary', disabled: !!state.pushEnabling, on: { click: enablePush }},
-          state.pushEnabling ? 'Enabling…' : (state.pushReady ? 'Push enabled ✓ (re-enroll)' : 'Enable push')),
-        el('button', { on: { click: testPush }}, 'Send test push'),
-        el('button', { on: { click: showPushDiag }}, 'Diagnostics'),
-        el('button', { class: 'danger', on: { click: wipeAndReenroll }}, 'Wipe & re-enroll'),
-      ),
-      el('div', { class: 'row', style: 'margin-top: 6px;' },
-        el('button', { on: { click: showJWTPreview }}, 'Show JWT details'),
-        el('button', { class: 'danger', on: { click: rotateVapidKeypair }}, 'Rotate VAPID keys'),
-      ),
-      el('div', { class: 'meta', style: 'margin-top: 4px;' },
-        'BadJwtToken from Apple? Tap "Rotate VAPID keys" — that regenerates the keypair using the upstream library (eliminating any format ambiguity), wipes all subscriptions, and lets you re-enroll fresh. Tap "Show JWT details" to inspect the exact claims toolyard signs into the Authorization header.'),
+      el('div', { class: 'settings-row' },
+        el('div', { class: 'settings-row-copy' }, el('div', { class: 'settings-row-title' }, 'This device'),
+          el('p', { class: 'meta' }, state.pushReady ? 'Device notifications are enabled.' : 'Enable notifications to receive requests on this device.')),
+        el('div', { class: 'row' },
+          el('button', { class: 'primary', disabled: !!state.pushEnabling, on: { click: enablePush } }, state.pushEnabling ? 'Enable in progress…' : state.pushReady ? 'Reconnect device' : 'Enable notifications'),
+          el('button', { disabled: !state.pushReady, on: { click: testPush } }, 'Send test'))),
+      el('details', { class: 'settings-advanced', 'data-disclosure-key': 'notification-diagnostics' },
+        el('summary', {}, 'Advanced notification controls'),
+        el('p', { class: 'meta' }, 'Use these controls to diagnose a device or reset notification keys.'),
+        el('div', { class: 'row' },
+          el('button', { on: { click: showPushDiag } }, 'Diagnostics'),
+          el('button', { on: { click: showJWTPreview } }, 'Token details'),
+          el('button', { on: { click: wipeAndReenroll } }, 'Reset subscriptions'),
+          el('button', { class: 'danger', on: { click: rotateVapidKeypair } }, 'Reset workspace push keys'))),
       state.jwtPreview ? renderJWTPreview() : null,
       state.pushDiag ? renderPushDiag() : null,
       state.pushTestResult ? renderPushTestResult() : null,
@@ -4934,9 +3977,9 @@ function renderPushCard() {
   }
 
   return el('div', { class: 'card' },
-    el('h2', {}, 'Web Push'),
+    el('h3', {}, 'Device notifications'),
     el('p', { class: 'meta' },
-      'Get a notification on this device when an approval is pending. The notification has Allow / Deny actions tied to the approval\'s signed token, so you can decide right from the lock screen.'),
+      'Receive a notification when an agent requires your attention.'),
     body,
   );
 }
@@ -5343,40 +4386,12 @@ function viewInsights() {
       ),
   );
 
-  // Cost panel
-  const costRows = state.insights.cost.rows || [];
-  const totalUsd = costRows.reduce((acc, r) => acc + (r.usd_estimated || 0), 0);
-  const costCard = el('div', { class: 'card' },
-    el('h2', {}, 'Cost (estimated)'),
-    el('p', { class: 'meta' },
-      'Token estimate: 1 token ≈ 4 bytes. Edit the per-million USD rates in Settings — they default to 0 (i.e. cost panel is dark) so we don\'t pretend to know what your stack costs.',
-    ),
-    el('div', { class: 'row', style: 'gap: 6px; margin-bottom: 8px;' },
-      el('span', { class: 'meta' }, 'Rates: input $' + state.insights.cost.input_usd_per_m + '/M · output $' + state.insights.cost.output_usd_per_m + '/M · estimated total: '),
-      el('strong', {}, '$' + totalUsd.toFixed(4)),
-    ),
-    costRows.length === 0 ? el('div', { class: 'empty' }, 'No cost data in this range yet.') :
-      el('table', {},
-        el('thead', {}, el('tr', {}, el('th', {}, 'Tool'), el('th', {}, 'Tokens in'), el('th', {}, 'Tokens out'), el('th', {}, 'USD'))),
-        el('tbody', {}, ...costRows.slice(0, 30).map((r) => el('tr', {},
-          el('td', {}, el('code', {}, r.tool_name)),
-          el('td', {}, fmtNum(r.tokens_in)),
-          el('td', {}, fmtNum(r.tokens_out)),
-          el('td', {}, '$' + r.usd_estimated.toFixed(4)),
-        ))),
-      ),
-    el('div', { class: 'row', style: 'margin-top: 8px;' },
-      el('a', { href: '/v1/insights/export?range=' + state.insights.range, target: '_blank' }, 'Download CSV (range)'),
-    ),
-  );
-
   return el('div', {},
     overviewCard,
     toolCard,
     renderPolicyRulesCard(),
     agentCard,
     autoCard,
-    costCard,
   );
 }
 
@@ -5419,19 +4434,75 @@ function viewNotifications() {
 
 // ---- shell -----------------------------------------------------------------
 
+function uiIcon(name) {
+  const paths = {
+    inbox: 'M3 4h14l3 9v7H0v-7z M0 13h6l2 3h4l2-3h6',
+    plug: 'M6 2v5 M14 2v5 M4 7h12v3a6 6 0 0 1-12 0z M10 16v4',
+    activity: 'M1 10h4l3-7 4 14 3-7h4',
+    people: 'M7 10a4 4 0 1 0 0-8 4 4 0 0 0 0 8 M0 19v-2a6 6 0 0 1 12 0v2 M14 3a4 4 0 0 1 0 7 M15 13a5 5 0 0 1 5 5v1',
+    tools: 'M7 2H2v5h5z M18 2h-5v5h5z M7 13H2v5h5z M18 13h-5v5h5z',
+    sliders: 'M3 2v16 M10 2v16 M17 2v16 M0 7h6 M7 13h6 M14 6h6',
+    shield: 'M10 1l8 3v6c0 5-8 9-8 9s-8-4-8-9V4z M6 10l3 3 5-6',
+    bell: 'M4 8a6 6 0 0 1 12 0v5l2 3H2l2-3z M8 19h4',
+    lock: 'M5 8V5a5 5 0 0 1 10 0v3 M3 8h14v11H3z M10 12v3',
+    key: 'M7 12a5 5 0 1 1 4-4l8 8-3 3-3-3v-3h-3z',
+    download: 'M10 1v12 M5 8l5 5 5-5 M2 15v4h16v-4',
+    info: 'M10 9v6 M10 5h.01 M19 10a9 9 0 1 1-18 0 9 9 0 0 1 18 0',
+    plus: 'M10 3v14 M3 10h14',
+    menu: 'M2 5h16 M2 10h16 M2 15h16',
+    logout: 'M8 2H2v16h6 M7 10h12 M15 6l4 4-4 4',
+    chevron: 'M7 4l6 6-6 6',
+  };
+  const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
+  for (const [key, value] of Object.entries({ viewBox: '-1 -1 22 22', width: '18', height: '18', fill: 'none', stroke: 'currentColor', 'stroke-width': '1.5', 'stroke-linecap': 'round', 'stroke-linejoin': 'round', 'aria-hidden': 'true', class: 'ui-icon' })) svg.setAttribute(key, value);
+  const path = document.createElementNS('http://www.w3.org/2000/svg', 'path'); path.setAttribute('d', paths[name] || paths.tools); svg.appendChild(path);
+  return svg;
+}
+
+async function logoutWorkspace() {
+  const viaClerk = state.user.auth === 'clerk';
+  ibClearDrafts(); state.myKey = freshMyKey();
+  try { await api('/v1/auth/logout', { method: 'POST' }); } catch (_) {}
+  if (evtSrc) try { evtSrc.close(); } catch (_) {}
+  if (viaClerk) { location.replace('/login?signout=1'); return; }
+  state.user = null; render();
+}
+
+const disclosureState = new Map();
+function disclosureKey(d) { return d.dataset.disclosureKey || d.querySelector('summary')?.textContent; }
+function captureDisclosures(root) {
+  const route = root.querySelector('.app-shell')?.dataset.route;
+  if (!route) return;
+  const values = new Map();
+  for (const d of root.querySelectorAll('details')) values.set(disclosureKey(d), d.open);
+  disclosureState.set(route, values);
+}
+function restoreDisclosures(root) {
+  const values = disclosureState.get(state.route);
+  if (!values) return;
+  for (const d of root.querySelectorAll('details')) if (values.has(disclosureKey(d))) d.open = values.get(disclosureKey(d));
+}
+
+function workspaceRoute(route) {
+  // Retired dashboards are redirected without deleting their stored data or APIs.
+  return ({ hooks: 'audit', events: 'audit', memory: 'settings/data', mempalace: 'settings/data', call: 'inbox', sessions: 'inbox', 'inbox/sessions': 'inbox' })[route] || route;
+}
+
 function navigate(route) {
+  route = workspaceRoute(route);
+  let hashRoute = route;
+  if (route.startsWith('settings/')) route = settingsRoute(route);
+  else if (route === 'settings') hashRoute = 'settings/' + settingsUI.page;
   if (!routeAllowed(route)) route = defaultRoute();
   if (route === 'inbox' || state.route === 'inbox') {
     if (state.inbox.openId) { ibHalt(); state.inbox.openId = null; state.inbox.detail = null; ibNode = null; }
     if (route === 'inbox') loadInbox();
   }
   state.route = route;
-  history.replaceState(null, '', '#' + route);
-  if ((route === 'insights' || route === 'notifications') && !state.insights.loading) {
+  if (!routeAllowed(hashRoute.split('/')[0])) hashRoute = route;
+  if (location.hash !== '#' + hashRoute) history.pushState(null, '', '#' + hashRoute);
+  if ((route === 'insights' || route === 'policies' || route === 'notifications') && !state.insights.loading) {
     loadInsights();
-  }
-  if (route === 'hooks' && !state.hooks.loaded && !state.hooks.loading) {
-    loadHooks(true);
   }
   if (route === 'users') loadUsers(true);
   if (route === 'myservers') loadMyServers();
@@ -5441,97 +4512,45 @@ function navigate(route) {
 }
 
 function shell(content) {
-  const navBtn = (key, label) => el('button', {
-    class: state.route === key ? 'active' : '',
+  const selectedNav = key => key === state.route || ({ servers: ['connections'], agents: ['users'], audit: ['insights'], tools: ['policies','approvals'] }[key] || []).includes(state.route);
+  const navBtn = (key, label, icon, count) => el('button', {
+    class: selectedNav(key) ? 'active' : '', 'aria-current': selectedNav(key) ? 'page' : 'false',
     on: { click: () => navigate(key) }
-  }, label);
-
-  // Bottom-nav routes for mobile. We surface the 5 most-used routes
-  // directly and put the rest behind a "More" sheet so the bar isn't
-  // cramped. Approvals + Tools are the bread-and-butter; Servers and
-  // Notifications get badges when there's something to act on.
-  const pendingCount = (state.approvals || []).filter((a) => a.status === 'pending').length;
-  const alertCount   = (state.anomalies || []).length;
-  const bottomItem = (key, icon, label, badge) => el('button', {
-    class: state.route === key ? 'active' : '',
+  }, uiIcon(icon), el('span', { class: 'nav-text' }, label), count ? el('span', { class: 'nav-count' }, count) : null);
+  const bottomItem = (key, icon, label, count) => el('button', {
+    class: selectedNav(key) ? 'active' : '', 'aria-current': selectedNav(key) ? 'page' : 'false',
     on: { click: () => navigate(key) }
-  },
-    el('span', { class: 'icon' }, icon),
-    el('span', {}, label),
-    badge > 0 ? el('span', { class: 'badge-count' }, String(badge)) : null,
-  );
-
+  }, uiIcon(icon), el('span', {}, label), count > 0 ? el('span', { class: 'badge-count' }, String(count)) : null);
   const admin = isAdmin();
-
-  return el('div', {},
-    el('header', {},
-      el('div', { class: 'brand' }, el('span', { class: 'dot' }), 'toolyard'),
-      // Members see only their agents and the servers granted to them.
-      admin ? el('nav', {},
-        navBtn('inbox',        'Inbox' + (inboxBadgeCount() ? ' (' + inboxBadgeCount() + ')' : '')),
-        navBtn('approvals',    'Approvals'),
-        navBtn('call',         'Call' + (state.call.active ? ' ●' : '')),
-        navBtn('events',       'Events' + (state.events.unacked ? ' (' + state.events.unacked + ')' : '')),
-        navBtn('insights',     'Insights'),
-        navBtn('notifications', 'Alerts' + (alertCount ? ' (' + alertCount + ')' : '')),
-        navBtn('audit',        'Audit'),
-        navBtn('hooks',        'Hooks'),
-        navBtn('servers',      'Servers'),
-        navBtn('tools',        'Tools'),
-        navBtn('memory',       'Memory'),
-        navBtn('mempalace',    'MemPalace'),
-        navBtn('agents',       'Agents'),
-        navBtn('connections',  'My connections'),
-        navBtn('users',        'Users'),
-        navBtn('settings',     'Settings'),
-      ) : el('nav', {},
-        navBtn('approvals', 'Approvals'),
-        navBtn('agents',       'Agents'),
-        navBtn('myservers',    'My servers'),
-        navBtn('connections',  'My connections'),
-      ),
-      el('span', { class: 'user' },
-        admin ? renderStreamPill() : null,
-        ' ',
-        state.user ? el('span', { class: 'user-chip', title: state.user.email || '' },
-          userAvatar(state.user), userLabel(state.user)) : '',
-      ),
-      state.user ? el('button', { on: { click: async () => {
-        const viaClerk = state.user.auth === 'clerk';
-        state.myKey = freshMyKey(); // never leave a revealed key for the next person
-        try { await api('/v1/auth/logout', { method: 'POST' }); } catch {}
-        if (evtSrc) try { evtSrc.close(); } catch {}
-        // A Google user also leaves Clerk, or "Sign in with Google" would
-        // silently sign the same account straight back in.
-        if (viaClerk) { location.replace('/login?signout=1'); return; }
-        state.user = null; render();
-      }}}, 'Logout') : null,
-    ),
-    el('main', {}, content),
-    // Bottom nav is rendered for everyone but CSS hides it above 768px.
-    // The "More" item opens a sheet rather than navigating, so its active
-    // state mirrors whatever the current route is when it isn't one of
-    // the four primary routes.
-    el('div', { class: 'bottom-nav' }, admin ? el('div', { class: 'row' },
-      bottomItem('inbox',     '✉', 'Inbox', inboxBadgeCount()),
-      bottomItem('approvals', '✓', 'Approvals', pendingCount),
-      bottomItem('servers',   '⌘', 'Servers'),
-      bottomItem('notifications', '◔', 'Alerts', alertCount),
-      el('button', {
-        class: ['audit','hooks','memory','agents','users','settings','insights','tools','connections'].includes(state.route) ? 'active' : '',
-        on: { click: () => { state.moreSheet = true; render(); } }
-      },
-        el('span', { class: 'icon' }, '☰'),
-        el('span', {}, 'More'),
-      ),
-    ) : el('div', { class: 'row' },
-      bottomItem('approvals', '✓', 'Approvals', pendingCount),
-      bottomItem('agents',      '◎', 'Agents'),
-      bottomItem('myservers',   '⌘', 'My servers'),
-      bottomItem('connections', '⚿', 'Connections'),
-    )),
-    state.moreSheet ? renderMoreSheet() : null,
-  );
+  const moreActive = !['inbox','servers','connections','audit','insights'].includes(state.route);
+  return el('div', { class: 'app-shell', 'data-route': state.route },
+    el('header', { class: 'workspace-sidebar' },
+      el('button', { class: 'brand', 'aria-label': 'Toolyard home', on: { click: () => navigate(defaultRoute()) } },
+        el('span', { class: 'brand-symbol', 'aria-hidden': 'true' }, 't'), el('span', {}, 'Toolyard')),
+      state.authConfig?.environment === 'stage' ? el('div', { class: 'stage-label', title: state.authConfig.version },
+        el('span', { class: 'stage-dot' }), 'Stage workspace') : null,
+      admin ? el('nav', { 'aria-label': 'Main navigation' },
+        el('span', { class: 'nav-label' }, 'Workspace'),
+        navBtn('inbox', 'Inbox', 'inbox', inboxBadgeCount()),
+        navBtn('servers', 'Connections', 'plug'),
+        navBtn('audit', 'Activity', 'activity'),
+        el('span', { class: 'nav-label' }, 'Manage'),
+        navBtn('agents', 'People & agents', 'people'),
+        navBtn('tools', 'Tools', 'tools'),
+        navBtn('settings', 'Settings', 'sliders')) : el('nav', { 'aria-label': 'Main navigation' },
+        navBtn('approvals', 'Approvals', 'shield', state.approvals.length),
+        navBtn('agents', 'Agents', 'people'), navBtn('myservers', 'Available services', 'tools'), navBtn('connections', 'Connections', 'plug')),
+      el('div', { class: 'sidebar-footer' }, admin ? renderStreamPill() : null,
+        el('div', { class: 'sidebar-account' }, el('span', { class: 'user-chip', title: state.user.email || '' },
+          userAvatar(state.user), el('span', { class: 'account-copy' }, userLabel(state.user), el('small', {}, admin ? 'Administrator' : 'Member'))),
+          el('button', { class: 'icon-button', 'aria-label': 'Sign out', title: 'Sign out', on: { click: logoutWorkspace } }, uiIcon('logout'))))),
+    el('main', { id: 'workspace-main' }, content),
+    el('nav', { class: 'bottom-nav', 'aria-label': 'Mobile navigation' }, admin ? el('div', { class: 'row' },
+      bottomItem('inbox', 'inbox', 'Inbox', inboxBadgeCount()), bottomItem('servers', 'plug', 'Connections'), bottomItem('audit', 'activity', 'Activity'),
+      el('button', { class: moreActive ? 'active' : '', 'aria-expanded': String(state.moreSheet), on: { click: () => { state.moreSheet = true; render(); } } }, uiIcon('menu'), el('span', {}, 'More'))) :
+      el('div', { class: 'row' }, bottomItem('approvals', 'shield', 'Approvals', state.approvals.length),
+        bottomItem('agents', 'people', 'Agents'), bottomItem('myservers', 'tools', 'Services'), bottomItem('connections', 'plug', 'Connections'))),
+    state.moreSheet ? renderMoreSheet() : null);
 }
 
 function renderMoreSheet() {
@@ -5549,21 +4568,15 @@ function renderMoreSheet() {
     el('div', { class: 'modal', style: 'display: flex; flex-direction: column; gap: 6px;' },
       el('h3', {}, 'More'),
       isAdmin() ? [
-        item('tools',    'Tools',    'Run any tool from the catalog'),
-        item('call',     'Call',     'Talk to Toolyard through Gemini Live'),
-        item('insights', 'Insights', 'Per-tool, per-agent, cost breakdowns'),
-        item('audit',    'Audit',    'Append-only event log'),
-        item('hooks',    'Hooks',    'Agent lifecycle events and memory ingest'),
-        item('memory',   'Memory',   'Scope/key-value store'),
-        item('agents',   'Agents',   'Manage enrolled agents'),
-        item('connections', 'My connections', 'Sign in to servers that act as you'),
-        item('users',    'Users',    'Roles, blocking and server access'),
-        item('settings', 'Settings', 'Surface mode, auto-approval, retention'),
+        item('agents', 'People & agents', 'Manage access and enrolled agents'),
+        item('tools', 'Tools', 'Browse tools and review access policies'),
+        item('settings', 'Settings', 'Workspace preferences'),
       ] : [
         item('agents',    'Agents',     'Manage your enrolled agents'),
         item('myservers', 'My servers', 'Servers your agents may use'),
         item('connections', 'My connections', 'Sign in to servers that act as you'),
       ],
+      el('div', { class: 'mobile-account' }, userAvatar(state.user), el('span', {}, userLabel(state.user)), el('button', { on: { click: logoutWorkspace } }, 'Sign out')),
       el('div', { class: 'row', style: 'margin-top: 12px; justify-content: flex-end;' },
         el('button', { on: { click: () => { state.moreSheet = false; render(); } }}, 'Close'),
       ),
@@ -5592,7 +4605,7 @@ function restoreFocus(f) {
     try { target = document.querySelector(`[data-approval-id="${CSS.escape(f.approvalId)}"]`); } catch (_) {}
   }
   if (target && target.focus) {
-    target.focus();
+    target.focus({ preventScroll: true });
     if (f.selStart != null && target.setSelectionRange) {
       try { target.setSelectionRange(f.selStart, f.selEnd); } catch (_) {}
     }
@@ -5604,12 +4617,13 @@ function restoreFocus(f) {
 function closeTopmostOverlay() {
   const lb = document.querySelector('.ib-lightbox');
   if (lb) { lb.remove(); return true; }
-  if (state.memEdit) { state.memEdit = null; render(); return true; }
   if (state.agentModal) { state.agentModal = null; render(); return true; }
   if (state.userAccessModal) { closeUserAccess(); return true; }
   if (state.serverConnectionsModal) { state.serverConnectionsModal = null; render(); return true; }
   if (state.serverEditModal) { closeServerEdit(); return true; }
   if (state.marketModal) { state.marketModal = null; render(); return true; }
+  if (state.oauthFlow) { closeOAuthPanel(); return true; }
+  if (settingsUI.secretEdit) { if (!settingsUI.secretEdit.busy) { settingsUI.secretEdit = null; render(); } return true; }
   if (state.jwtPreview || state.pushDiag || state.pushTestResult) {
     state.jwtPreview = null; state.pushDiag = null; state.pushTestResult = null; render(); return true;
   }
@@ -5623,6 +4637,16 @@ function closeTopmostOverlay() {
 // the *focused* approval card (no first-card fallback — that would make an
 // accidental keypress approve something).
 document.addEventListener('keydown', (e) => {
+  if (e.key === 'Tab') {
+    const modal = [...document.querySelectorAll('.modal-bg .modal')].at(-1);
+    if (modal) {
+      const controls = [...modal.querySelectorAll('button:not(:disabled),input:not(:disabled),select:not(:disabled),textarea:not(:disabled),a[href],[tabindex="0"]')].filter(n => n.getClientRects().length);
+      const first = controls[0], last = controls.at(-1);
+      if (!first) { e.preventDefault(); modal.focus(); return; }
+      if (e.shiftKey && (document.activeElement === first || document.activeElement === modal)) { e.preventDefault(); last.focus(); }
+      else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
+    }
+  }
   if (e.key === 'Escape') { if (closeTopmostOverlay()) e.preventDefault(); return; }
   const t = e.target;
   if (t && (t.tagName === 'INPUT' || t.tagName === 'TEXTAREA' || t.tagName === 'SELECT' || t.isContentEditable)) return;
@@ -5638,6 +4662,9 @@ document.addEventListener('keydown', (e) => {
 function render() {
   const root = $('app') || document.body;
   const focus = captureFocus();
+  const settingsTabScroll = root.querySelector('[aria-label="Settings categories"]')?.scrollLeft || 0;
+  const previousSettingsTab = root.querySelector('[aria-label="Settings categories"] [aria-current="page"]')?.id;
+  captureDisclosures(root);
   root.innerHTML = '';
   if (state.setupRequired) { root.appendChild(viewSetup()); return; }
   if (!state.user) { root.appendChild(viewLogin()); return; }
@@ -5652,22 +4679,35 @@ function render() {
     case 'myservers':     body = viewMyServers();     break;
     case 'connections':   body = viewConnections();   break;
     case 'audit':         body = viewAudit();         break;
-    case 'hooks':         body = viewHooks();         break;
-    case 'memory':        body = viewMemory();        break;
-    case 'mempalace':     body = viewMempalace();     break;
     case 'agents':        body = viewAgents();        break;
-    case 'servers':       body = viewServers();       break;
+    case 'servers':       body = viewConnectionHub();       break;
+    case 'policies':      body = viewPolicies();       break;
     case 'tools':         body = viewTools();         break;
     case 'settings':      body = viewSettings();      break;
     case 'insights':      body = viewInsights();      break;
-    case 'call':          body = viewCall();          break;
-    case 'events':        body = viewEvents();        break;
     case 'notifications': body = viewNotifications(); break;
     case 'inbox':         body = viewInbox();         break;
     default:              body = viewApprovals();
   }
-  root.appendChild(shell(body));
+  root.appendChild(shell(withSectionTabs(body)));
+  const settingsTabs = root.querySelector('[aria-label="Settings categories"]');
+  if (settingsTabs && settingsTabs.scrollWidth > settingsTabs.clientWidth) {
+    settingsTabs.scrollLeft = settingsTabScroll;
+    const selected = settingsTabs.querySelector('[aria-current="page"]');
+    if (selected && selected.id !== previousSettingsTab) {
+      const bounds = settingsTabs.getBoundingClientRect(), active = selected.getBoundingClientRect();
+      if (active.left < bounds.left) settingsTabs.scrollLeft += active.left - bounds.left;
+      else if (active.right > bounds.right) settingsTabs.scrollLeft += active.right - bounds.right;
+    }
+  }
+  restoreDisclosures(root);
   restoreFocus(focus);
+  for (const [index, modal] of [...root.querySelectorAll('.modal-bg .modal')].entries()) {
+    modal.setAttribute('role', 'dialog'); modal.setAttribute('aria-modal', 'true'); modal.tabIndex = -1;
+    const title = modal.querySelector('h3');
+    if (title) { title.id = title.id || 'dialog-title-' + index; modal.setAttribute('aria-labelledby', title.id); }
+    if (!modal.contains(document.activeElement)) (modal.querySelector('[autofocus],input:not(:disabled),button:not(:disabled)') || modal).focus({ preventScroll: true });
+  }
 }
 
 // ---- OAuth integration (remote MCPs) ---------------------------------------
@@ -6005,718 +5045,155 @@ async function pollDevice(f) {
   setTimeout(tick, 1000);
 }
 
-// ---- Call (voice live agent) ------------------------------------------------
-//
-// Browser side of the /v1/voice/ws WebSocket. Module-scope handles
-// (voiceClient) hold the WS, AudioContext, MediaStream and AudioWorklet
-// node so they survive re-render. state.call mirrors what the panel
-// needs to show.
-
-const voiceClient = {
-  ws: null,
-  ctx: null,                // AudioContext (output, 24 kHz to match Gemini)
-  micCtx: null,             // AudioContext (input — separate, runs at hardware rate)
-  micStream: null,          // MediaStream from getUserMedia
-  workletNode: null,
-  micSource: null,
-  nextPlaybackAt: 0,        // scheduling clock for AudioBufferSource chain
-  // BTR11 / Bluetooth-headset hardware button support. macOS Now
-  // Playing only recognises HTMLMediaElement playback from a real file
-  // source (URL/Blob), not a MediaStream — so we synthesize a silent
-  // WAV blob and loop it through a hidden <audio> tag. That puts us on
-  // the OS media-key bus where BTR11's play/pause posts events.
-  silentAudioEl: null,      // <audio> tag playing the silent blob loop
-  silentAudioURL: null,     // object URL we created — revoked on teardown
-  // Music ducking ("Path A"): an audible pink-noise loop routed through
-  // the AudioContext destination during mic-live. The level is well
-  // below speech (~-50 dBFS) so it sits under conversation, but it's
-  // measurable enough that the OS treats us as "playing media" and
-  // cooperative apps (Spotify, Apple Music with their auto-pause prefs
-  // on) voluntarily pause themselves while we're hot. Muted → gain
-  // ramps to 0; unmuted → ramps back up.
-  duckNoiseSrc: null,       // AudioBufferSourceNode (looping)
-  duckGain: null,           // GainNode whose .gain we ramp on mute
-  // Downstream audio arrives as 24 kHz mono int16 (Gemini's native rate).
-  // We schedule chunks back-to-back on the AudioContext clock so playback
-  // never gaps; the engine resamples to whatever the output hardware
-  // wants (LDAC over BTR11 typically targets 96 kHz).
-};
-
-async function startCall() {
-  if (state.call.active) return;
-  state.call.error = '';
-  state.call.activeCallElsewhere = null;
-  state.call.phase = 'connecting';
-  state.call.transcript = [];
-  state.call.toolCalls = [];
-  render();
-
-  // 0) Preflight: the WebSocket constructor swallows HTTP response
-  //    bodies, so a 409 from the WS upgrade can't carry the active
-  //    call ID back to us. Hit /v1/voice/sessions first; if anything
-  //    is open, surface the "hang up the other one?" prompt without
-  //    even touching the mic.
-  try {
-    const r = await api('/v1/voice/sessions');
-    if (r && r.sessions && r.sessions.length > 0) {
-      state.call.phase = 'idle';
-      state.call.activeCallElsewhere = { call_id: r.sessions[0].id };
-      render();
-      return;
-    }
-  } catch (e) {
-    // 503 from voice-disabled or auth failure — surface the message and
-    // bail without prompting for mic.
-    state.call.phase = 'error';
-    state.call.error = e.message;
-    render();
-    return;
-  }
-
-  // 1) Mic permission + capture.
-  //
-  // BTR11 (and any closed-back Bluetooth amp/DAC) has no acoustic
-  // feedback path — output goes to wired headphones plugged into the
-  // amp, mic is the device's built-in MEMS or the user's inline mic.
-  // So echoCancellation actively hurts: it adds latency and can carve
-  // out frequencies that aren't echoing in the first place. We ask the
-  // browser to skip it, keeping NS+AGC because those still help voice.
-  // sampleRate hint nudges Chrome toward 16 kHz capture (matches what
-  // Gemini wants on the wire); browsers free to ignore.
-  //
-  // navigator.mediaDevices is undefined on iOS Safari (and stricter
-  // Chrome builds) when the page isn't a "secure context" — i.e. not
-  // HTTPS and not localhost. We detect that explicitly so the user
-  // sees an actionable hint instead of the cryptic stock error.
-  if (!window.isSecureContext || !navigator.mediaDevices ||
-      typeof navigator.mediaDevices.getUserMedia !== 'function') {
-    state.call.phase = 'error';
-    state.call.permission = 'denied';
-    state.call.error =
-      'microphone API unavailable on this origin (' + location.origin + '). ' +
-      'iOS Safari and most browsers refuse mic access unless the page is ' +
-      'served over HTTPS or from localhost. Open the dashboard over an ' +
-      'HTTPS tunnel (Tailscale Serve, Cloudflare Tunnel, or a local cert) ' +
-      'and try again.';
-    render();
-    return;
-  }
-  let stream;
-  try {
-    stream = await navigator.mediaDevices.getUserMedia({ audio: {
-      channelCount: 1,
-      echoCancellation: false,
-      noiseSuppression: true,
-      autoGainControl: true,
-      sampleRate: { ideal: 16000 },
-      sampleSize: 16,
-    }, video: false });
-  } catch (e) {
-    state.call.phase = 'error';
-    state.call.permission = 'denied';
-    state.call.error = 'microphone permission denied: ' + e.message;
-    render();
-    return;
-  }
-  voiceClient.micStream = stream;
-  state.call.permission = 'granted';
-
-  // 2) AudioContext for capture + worklet. Native rate (usually 48 kHz);
-  //    the worklet downsamples to 16 kHz.
-  const InputCtx = window.AudioContext || window.webkitAudioContext;
-  voiceClient.micCtx = new InputCtx();
-  try {
-    await voiceClient.micCtx.audioWorklet.addModule('/voice-worklet.js');
-  } catch (e) {
-    state.call.phase = 'error';
-    state.call.error = 'audio worklet load failed: ' + e.message;
-    hangUpLocal();
-    render();
-    return;
-  }
-  voiceClient.micSource = voiceClient.micCtx.createMediaStreamSource(stream);
-  voiceClient.workletNode = new AudioWorkletNode(voiceClient.micCtx, 'voice-capture');
-  voiceClient.micSource.connect(voiceClient.workletNode);
-  // Worklet doesn't have an audio output we care about, but Chrome
-  // requires a sink for the graph to actually pump. Connect to a muted
-  // gain so the loop spins without echoing the mic back.
-  const muted = voiceClient.micCtx.createGain();
-  muted.gain.value = 0;
-  voiceClient.workletNode.connect(muted);
-  muted.connect(voiceClient.micCtx.destination);
-
-  // 3) Output AudioContext. 24 kHz matches Gemini's native output rate
-  //    so we can hand AudioBuffers in unchanged; the engine resamples up
-  //    to whatever the output device wants (BTR11 over LDAC typically
-  //    runs 96 kHz/24-bit, so we hand off as much upstream fidelity as
-  //    possible).
-  const OutputCtx = window.AudioContext || window.webkitAudioContext;
-  voiceClient.ctx = new OutputCtx({ sampleRate: 24000, latencyHint: 'interactive' });
-  voiceClient.nextPlaybackAt = 0;
-
-  // 3a) Anchor a MediaSession so the BTR11's play/pause button (and any
-  //     other Bluetooth headset's transport buttons) route to us. We
-  //     attach a silent looping AudioBufferSource to an <audio> element
-  //     via MediaStreamDestination — the browser sees a media element
-  //     "playing audio" and registers our app on the OS media key bus.
-  setupMediaSessionAnchor();
-  // 3b) Audible duck anchor: low-level pink noise routed through the
-  //     output graph. Tickles the OS audio session so cooperating apps
-  //     auto-pause. Honors state.call.duck (default on).
-  if (state.call.duck) setupDuckAnchor();
-
-  // 4) WebSocket — same origin, same cookie auth as the rest of the API.
-  const wsProto = location.protocol === 'https:' ? 'wss:' : 'ws:';
-  const ws = new WebSocket(wsProto + '//' + location.host + '/v1/voice/ws');
-  ws.binaryType = 'arraybuffer';
-  voiceClient.ws = ws;
-
-  // Mic frames from the worklet → WS binary frames. Drop frames if the
-  // socket isn't open yet (a few are normal during the handshake).
-  voiceClient.workletNode.port.onmessage = (e) => {
-    if (state.call.mute) return;
-    if (ws.readyState === WebSocket.OPEN) {
-      ws.send(e.data);
-    }
-  };
-
-  ws.onopen = () => {
-    ws.send(JSON.stringify({ type: 'start' }));
-  };
-  ws.onmessage = (e) => {
-    if (e.data instanceof ArrayBuffer) {
-      scheduleVoicePlayback(e.data);
-      return;
-    }
-    try {
-      const msg = JSON.parse(e.data);
-      handleVoiceServerMsg(msg);
-    } catch (_) { /* ignore */ }
-  };
-  ws.onerror = () => {
-    state.call.error = 'websocket error';
-  };
-  ws.onclose = (e) => {
-    // Server hangs up after 409 with code 1008 (policy violation). The
-    // ws.onmessage handler will already have populated activeCallElsewhere.
-    if (e.code === 1008 && !state.call.activeCallElsewhere) {
-      state.call.error = e.reason || 'duplicate session';
-    }
-    hangUpLocal();
-    render();
-  };
-
-  state.call.active = true;
-}
-
-function handleVoiceServerMsg(msg) {
-  switch (msg.type) {
-    case 'state':
-      state.call.phase = msg.value || 'listening';
-      if (msg.call_id) state.call.callId = msg.call_id;
-      break;
-    case 'transcript':
-      state.call.transcript.push({ role: msg.role || 'assistant', text: msg.text || '' });
-      // Cap transcript so a long call doesn't bloat the DOM.
-      if (state.call.transcript.length > 200) {
-        state.call.transcript = state.call.transcript.slice(-200);
-      }
-      break;
-    case 'tool_call':
-      state.call.toolCalls.push({ name: msg.name, args: msg.args });
-      if (state.call.toolCalls.length > 50) {
-        state.call.toolCalls = state.call.toolCalls.slice(-50);
-      }
-      break;
-    case 'error':
-      state.call.error = msg.message || 'unknown error';
-      state.call.phase = 'error';
-      break;
-    case 'hangup':
-      state.call.error = msg.reason || '';
-      break;
-  }
-  render();
-}
-
-// setupMediaSessionAnchor anchors a Now Playing session so the BTR11's
-// hardware play/pause routes to our MediaSession handlers instead of
-// falling through to Siri / the OS media-key default. Async because we
-// only want to claim the anchor was successful after the <audio>
-// element actually fires 'playing' — the macOS Now Playing service is
-// registered at that point, not at .play() invocation. Idempotent.
-//
-// macOS specifics that bit us:
-//   * Stream-sourced media (createMediaStreamDestination) is NOT enough
-//     — Safari and Chrome both refuse to register Now Playing for it.
-//   * Pure-zero silent WAVs sometimes register, sometimes don't —
-//     Chrome's media-focus tracker uses a "really playing audio?"
-//     heuristic. We dither the buffer at -78 dBFS so it's literally
-//     inaudible (one LSB worth of signal) but unambiguously non-silent.
-//   * The metadata must be set BEFORE play() on Safari; setting it
-//     after play() works in Chrome but Safari silently no-ops.
-//   * Some macOS releases keep routing media keys to the previously-
-//     active media app (Music, Spotify) until *they* are paused. If
-//     hardwareReady stays false even after the anchor reports playing,
-//     that's the path to check.
-async function setupMediaSessionAnchor() {
-  if (voiceClient.silentAudioEl) return;
-
-  // 1) Tell the OS who we are *before* play() — Safari requirement.
-  //    Register action handlers in the same gesture frame so the
-  //    Now Playing slot is fully armed the instant the audio starts.
-  if ('mediaSession' in navigator) {
-    try {
-      navigator.mediaSession.metadata = new MediaMetadata({
-        title:  'toolyard live call',
-        artist: 'toolyard',
-        album:  'voice control',
-      });
-      navigator.mediaSession.setActionHandler('pause', () => toggleMuteFromHardware('muted'));
-      navigator.mediaSession.setActionHandler('play',  () => toggleMuteFromHardware('live'));
-      navigator.mediaSession.setActionHandler('stop',  () => endCall());
-    } catch { /* older browsers — fall back silently */ }
-  }
-
-  // 2) Synthesize a 5-second 8 kHz mono WAV with 1-LSB dither so it
-  //    reads as "real audio" to every browser's media-focus heuristic.
-  const blob = createSilentWavBlob(5.0);
-  const url = URL.createObjectURL(blob);
-  const audio = document.createElement('audio');
-  audio.src = url;
-  audio.loop = true;
-  audio.preload = 'auto';
-  audio.autoplay = true;
-  audio.controls = false;
-  audio.style.display = 'none';
-  // Inaudible to a human but non-zero amplitude. Setting volume=0 or
-  // .muted=true makes Safari skip Now Playing registration.
-  audio.volume = 0.02;
-  audio.disableRemotePlayback = true;
-  document.body.appendChild(audio);
-  voiceClient.silentAudioEl = audio;
-  voiceClient.silentAudioURL = url;
-
-  // 3) Listen for the actual 'playing' event so we know the OS has
-  //    registered our Now Playing slot. If we don't see it within
-  //    1.5 s, surface that in the UI so the user can investigate
-  //    (autoplay blocked, another app holding focus, etc.).
-  let playingFired = false;
-  audio.addEventListener('playing', () => {
-    playingFired = true;
-    state.call.hardwareReady = true;
-    state.call.hardwareWhy = '';
-    if ('mediaSession' in navigator) {
-      try { navigator.mediaSession.playbackState = 'playing'; } catch {}
-    }
-    render();
-  });
-
-  try {
-    await audio.play();
-  } catch (e) {
-    state.call.hardwareReady = false;
-    state.call.hardwareWhy = 'autoplay blocked: ' + (e.message || e.name || 'unknown');
-    render();
-    return;
-  }
-  // If play() resolved but 'playing' didn't fire within 1.5s, something
-  // else is in the way (e.g. another app owns Now Playing on macOS).
-  setTimeout(() => {
-    if (!playingFired) {
-      state.call.hardwareReady = false;
-      state.call.hardwareWhy = 'Now Playing not claimed — quit Music/Spotify if open, or try Cmd-Shift-R to hard-refresh.';
-      render();
-    }
-  }, 1500);
-}
-
-function teardownMediaSessionAnchor() {
-  if ('mediaSession' in navigator) {
-    try {
-      navigator.mediaSession.setActionHandler('play',  null);
-      navigator.mediaSession.setActionHandler('pause', null);
-      navigator.mediaSession.setActionHandler('stop',  null);
-      navigator.mediaSession.playbackState = 'none';
-      navigator.mediaSession.metadata = null;
-    } catch {}
-  }
-  if (voiceClient.silentAudioEl) {
-    try { voiceClient.silentAudioEl.pause(); } catch {}
-    try { voiceClient.silentAudioEl.removeAttribute('src'); } catch {}
-    try { voiceClient.silentAudioEl.load(); } catch {}
-    try { voiceClient.silentAudioEl.remove(); } catch {}
-    voiceClient.silentAudioEl = null;
-  }
-  if (voiceClient.silentAudioURL) {
-    try { URL.revokeObjectURL(voiceClient.silentAudioURL); } catch {}
-    voiceClient.silentAudioURL = null;
-  }
-}
-
-// createSilentWavBlob returns a tiny mono 8 kHz 16-bit silent WAV. Used
-// solely as the Now Playing anchor — content is 0-valued samples so it's
-// inaudible even at volume 1.0; we still play it at volume ~0.001 for
-// extra paranoia on browsers that scan the buffer.
-function createSilentWavBlob(durationSec) {
-  const rate = 8000;
-  const numFrames = Math.max(1, Math.floor(rate * durationSec));
-  const dataBytes = numFrames * 2;
-  const buf = new ArrayBuffer(44 + dataBytes);
-  const view = new DataView(buf);
-  let p = 0;
-  const wstr = (s) => { for (let i = 0; i < s.length; i++) view.setUint8(p++, s.charCodeAt(i)); };
-  const u32 = (n) => { view.setUint32(p, n, true); p += 4; };
-  const u16 = (n) => { view.setUint16(p, n, true); p += 2; };
-  wstr('RIFF'); u32(36 + dataBytes); wstr('WAVE');
-  wstr('fmt '); u32(16); u16(1); u16(1); u32(rate); u32(rate * 2); u16(2); u16(16);
-  wstr('data'); u32(dataBytes);
-  // Dither the samples at 1 LSB so the buffer reads as "real audio" to
-  // browser media-focus heuristics without being audible (1 LSB at 16-
-  // bit is ~-96 dBFS; combined with our 2% gain that's ~-130 dBFS at
-  // the speakers — well below the noise floor of any DAC).
-  for (let i = 0; i < numFrames; i++) {
-    view.setInt16(44 + i * 2, (i & 1) ? 1 : -1, true);
-  }
-  return new Blob([buf], { type: 'audio/wav' });
-}
-
-// toggleMuteFromHardware is the MediaSession-side handler. The optional
-// `intent` argument matches what the user pressed: 'muted' means "they
-// pressed pause", 'live' means "they pressed play". On a BTR11 single-
-// button toggle, only one of the two fires per press depending on the
-// browser's current playbackState — we flip state.call.mute accordingly
-// and play the appropriate cue.
-function toggleMuteFromHardware(intent) {
-  if (!state.call.active) return;
-  const wantMuted = intent === 'muted' ? true : intent === 'live' ? false : !state.call.mute;
-  if (state.call.mute === wantMuted) return;
-  state.call.mute = wantMuted;
-  if (voiceClient.ws && voiceClient.ws.readyState === WebSocket.OPEN) {
-    try { voiceClient.ws.send(JSON.stringify({ type: 'mute', mute: wantMuted })); } catch {}
-  }
-  // Ramp the duck anchor down on mute → music auto-resumes; back up
-  // on unmute → music auto-pauses.
-  rampDuckGain(wantMuted ? 0 : DUCK_LIVE_GAIN);
-  playMuteCue(wantMuted ? 'muted' : 'live');
-  // Keep MediaSession state coherent so the next button press fires the
-  // opposite handler (the BTR11's single button toggles).
-  if ('mediaSession' in navigator) {
-    try {
-      navigator.mediaSession.playbackState = wantMuted ? 'paused' : 'playing';
-    } catch {}
-  }
-  render();
-}
-
-// playMuteCue emits a short two-tone chirp through the output graph so
-// the user gets unambiguous audible confirmation that the mic state
-// changed — important on a hardware button press where there's no
-// visual cue if the dashboard isn't in front.
-//
-//   'muted': descending (880 → 440 Hz) — "going to sleep"
-//   'live' : ascending  (440 → 880 Hz) — "waking up, you're hot"
-function playMuteCue(state) {
-  const ctx = voiceClient.ctx;
-  if (!ctx) return;
-  const tones = state === 'muted' ? [880, 440] : [440, 880];
-  const each = 0.06; // 60 ms per tone
-  const now = ctx.currentTime;
-  tones.forEach((freq, i) => {
-    const osc = ctx.createOscillator();
-    const gain = ctx.createGain();
-    osc.type = 'sine';
-    osc.frequency.value = freq;
-    const t0 = now + i * each;
-    // Short attack + release envelope so the cue doesn't click.
-    gain.gain.setValueAtTime(0, t0);
-    gain.gain.linearRampToValueAtTime(0.18, t0 + 0.008);
-    gain.gain.setValueAtTime(0.18, t0 + each - 0.012);
-    gain.gain.linearRampToValueAtTime(0, t0 + each);
-    osc.connect(gain);
-    gain.connect(ctx.destination);
-    osc.start(t0);
-    osc.stop(t0 + each + 0.02);
-  });
-}
-
-// Target gain for the duck anchor when mic is live. -50 dBFS ≈ 0.003.
-// Subjectively well below speech but unambiguously non-silent so the OS
-// audio session activates. Bumping this higher makes more apps notice
-// (some have a higher threshold) at the cost of perceptible hiss.
-const DUCK_LIVE_GAIN = 0.003;
-
-// setupDuckAnchor creates the pink-noise source + gain node and wires
-// it into ctx.destination. Idempotent; bails if already running or the
-// AudioContext isn't ready.
-function setupDuckAnchor() {
-  const ctx = voiceClient.ctx;
-  if (!ctx || voiceClient.duckNoiseSrc) return;
-
-  // 3 seconds of pink noise (Voss-McCartney approximation) baked into a
-  // looping buffer. 3 s is long enough that the loop seam isn't a
-  // perceptible click; short enough that buffer alloc is instant.
-  const seconds = 3;
-  const buf = ctx.createBuffer(1, ctx.sampleRate * seconds, ctx.sampleRate);
-  const data = buf.getChannelData(0);
-  let b0 = 0, b1 = 0, b2 = 0, b3 = 0, b4 = 0, b5 = 0, b6 = 0;
-  for (let i = 0; i < data.length; i++) {
-    const w = Math.random() * 2 - 1;
-    b0 = 0.99886 * b0 + w * 0.0555179;
-    b1 = 0.99332 * b1 + w * 0.0750759;
-    b2 = 0.96900 * b2 + w * 0.1538520;
-    b3 = 0.86650 * b3 + w * 0.3104856;
-    b4 = 0.55000 * b4 + w * 0.5329522;
-    b5 = -0.7616 * b5 - w * 0.0168980;
-    data[i] = (b0 + b1 + b2 + b3 + b4 + b5 + b6 + w * 0.5362) * 0.11;
-    b6 = w * 0.115926;
-  }
-
-  const src = ctx.createBufferSource();
-  src.buffer = buf;
-  src.loop = true;
-  const gain = ctx.createGain();
-  gain.gain.value = state.call.mute ? 0 : DUCK_LIVE_GAIN;
-  src.connect(gain);
-  gain.connect(ctx.destination);
-  src.start();
-  voiceClient.duckNoiseSrc = src;
-  voiceClient.duckGain = gain;
-}
-
-function teardownDuckAnchor() {
-  if (voiceClient.duckNoiseSrc) {
-    try { voiceClient.duckNoiseSrc.stop(); } catch {}
-    try { voiceClient.duckNoiseSrc.disconnect(); } catch {}
-    voiceClient.duckNoiseSrc = null;
-  }
-  if (voiceClient.duckGain) {
-    try { voiceClient.duckGain.disconnect(); } catch {}
-    voiceClient.duckGain = null;
-  }
-}
-
-// rampDuckGain transitions the duck noise volume smoothly. Linear over
-// 50 ms — long enough to avoid a click, short enough that the cue +
-// gain change feel simultaneous from the user's perspective.
-function rampDuckGain(target) {
-  if (!voiceClient.duckGain || !voiceClient.ctx) return;
-  const t = voiceClient.ctx.currentTime;
-  const g = voiceClient.duckGain.gain;
-  try {
-    g.cancelScheduledValues(t);
-    g.setValueAtTime(g.value, t);
-    g.linearRampToValueAtTime(target, t + 0.05);
-  } catch {
-    g.value = target;
-  }
-}
-
-function scheduleVoicePlayback(buf) {
-  const ctx = voiceClient.ctx;
-  if (!ctx) return;
-  const i16 = new Int16Array(buf);
-  if (i16.length === 0) return;
-  // int16 → float32 [-1, 1]
-  const f32 = new Float32Array(i16.length);
-  for (let i = 0; i < i16.length; i++) {
-    f32[i] = i16[i] < 0 ? i16[i] / 0x8000 : i16[i] / 0x7fff;
-  }
-  const ab = ctx.createBuffer(1, f32.length, 24000);
-  ab.copyToChannel(f32, 0);
-  const src = ctx.createBufferSource();
-  src.buffer = ab;
-  src.connect(ctx.destination);
-  // Schedule back-to-back. If we've slipped behind real time (network
-  // hiccup), restart from "now" so we don't lag forever; the user will
-  // hear a tiny gap once.
-  const now = ctx.currentTime;
-  if (voiceClient.nextPlaybackAt < now) voiceClient.nextPlaybackAt = now;
-  src.start(voiceClient.nextPlaybackAt);
-  voiceClient.nextPlaybackAt += f32.length / 24000;
-}
-
-async function endCall() {
-  if (voiceClient.ws && voiceClient.ws.readyState === WebSocket.OPEN) {
-    try { voiceClient.ws.send(JSON.stringify({ type: 'hangup' })); } catch {}
-    try { voiceClient.ws.close(1000, 'user'); } catch {}
-  } else {
-    // No live WS but flag may be stale (server-side); call hangup REST
-    // so a leftover server-side session is cleaned up cleanly.
-    try { await api('/v1/voice/hangup', { method: 'POST', body: {} }); } catch {}
-  }
-  hangUpLocal();
-  render();
-}
-
-function hangUpLocal() {
-  teardownMediaSessionAnchor();
-  teardownDuckAnchor();
-  if (voiceClient.workletNode) {
-    try { voiceClient.workletNode.port.onmessage = null; } catch {}
-    try { voiceClient.workletNode.disconnect(); } catch {}
-    voiceClient.workletNode = null;
-  }
-  if (voiceClient.micSource) {
-    try { voiceClient.micSource.disconnect(); } catch {}
-    voiceClient.micSource = null;
-  }
-  if (voiceClient.micStream) {
-    voiceClient.micStream.getTracks().forEach((t) => t.stop());
-    voiceClient.micStream = null;
-  }
-  if (voiceClient.micCtx) {
-    try { voiceClient.micCtx.close(); } catch {}
-    voiceClient.micCtx = null;
-  }
-  if (voiceClient.ctx) {
-    try { voiceClient.ctx.close(); } catch {}
-    voiceClient.ctx = null;
-  }
-  voiceClient.ws = null;
-  voiceClient.nextPlaybackAt = 0;
-  state.call.active = false;
-  state.call.phase = 'idle';
-  state.call.callId = null;
-  state.call.mute = false;
-  state.call.hardwareReady = false;
-  state.call.hardwareWhy = '';
-}
-
-async function hangUpOtherAndStart() {
-  try { await api('/v1/voice/hangup', { method: 'POST', body: {} }); } catch (e) {
-    state.call.error = e.message; render(); return;
-  }
-  state.call.activeCallElsewhere = null;
-  await startCall();
-}
-
-function viewCall() {
-  const c = state.call;
-  const phaseColor = {
-    idle:        '#888',
-    connecting:  '#f0c75e',
-    listening:   '#4caf50',
-    thinking:    '#5b8def',
-    speaking:    '#b87bff',
-    error:       '#e06060',
-  }[c.phase] || '#888';
-
-  const intro = el('p', { class: 'meta' },
-    'Talk to Toolyard through Gemini Live. Mic audio streams from this device ' +
-    'to the gateway, and tool calls run through the same policy, approval, and ' +
-    'audit path as enrolled agents. Bluetooth headset play/pause (e.g. FiiO BTR11) toggles mute; you\'ll hear ' +
-    'a descending chirp when muted, ascending when live again. With music auto-' +
-    'pause on, a faint masking tone plays while you\'re live so cooperating ' +
-    'apps (Spotify, Music) auto-pause themselves; muting silences the tone ' +
-    'and they resume.');
-
-  const phasePill = el('div', { class: 'row', style: 'align-items: center; gap: 8px; margin: 8px 0; flex-wrap: wrap;' },
-    el('span', { class: 'mic-dot', style: 'background:' + phaseColor }),
-    el('strong', {}, c.phase.toUpperCase()),
-    c.callId ? el('span', { class: 'meta' }, '· ' + c.callId.slice(0, 8)) : null,
-    c.active && c.duck ? el('span', { class: 'meta' }, '🎵 masking on') : null,
-    c.active ? el('span', { class: 'meta', style: 'margin-left: auto;' },
-      c.hardwareReady
-        ? '🎛 BTR11 button armed'
-        : (c.hardwareWhy ? '⚠ ' + c.hardwareWhy : '⚠ BTR11 button not armed yet')
-    ) : null,
-  );
-
-  // Duck preference toggle. Honored at next call start — toggling
-  // mid-call won't switch the anchor on/off (cheap restart by ending
-  // and re-calling if you really want to).
-  const duckRow = c.active ? null : el('label', {
-    class: 'row',
-    style: 'gap: 8px; align-items: center; margin: 6px 0 0;',
-  },
-    el('input', {
-      type: 'checkbox',
-      checked: !!c.duck,
-      on: { change: (e) => {
-        state.call.duck = e.target.checked;
-        try { localStorage.setItem('toolyard.call.duck', e.target.checked ? '1' : '0'); } catch {}
-      }},
-    }),
-    el('span', {}, 'Auto-pause background music while my mic is live (plays a soft masking tone)'),
-  );
-
-  const errBox = c.error
-    ? el('div', { class: 'err', style: 'margin: 8px 0;' }, c.error)
-    : null;
-
-  // 409 — server says another call is active for this user.
-  const dupBox = c.activeCallElsewhere
-    ? el('div', { class: 'card', style: 'border-color: #c2853f;' },
-        el('h3', {}, 'A call is already active'),
-        el('p', { class: 'meta' }, 'You\'ve got an open call elsewhere (call ' + c.activeCallElsewhere.call_id.slice(0,8) + '). End it and start fresh?'),
-        el('div', { class: 'row' },
-          el('button', { class: 'primary', on: { click: hangUpOtherAndStart } }, 'Hang up & start new'),
-          el('button', { on: { click: () => { state.call.activeCallElsewhere = null; render(); }}}, 'Cancel'),
-        ),
-      )
-    : null;
-
-  const buttons = c.active
-    ? el('div', { class: 'row' },
-        el('button', {
-          class: c.mute ? 'primary' : '',
-          on: { click: () => toggleMuteFromHardware(c.mute ? 'live' : 'muted') },
-        }, c.mute ? 'Unmute' : 'Mute'),
-        el('button', { class: 'danger', on: { click: endCall } }, 'End call'),
-      )
-    : el('div', { class: 'row' },
-        el('button', {
-          class: 'primary',
-          style: 'min-height: 56px; min-width: 180px; font-size: 16px;',
-          on: { click: startCall },
-        }, '🎙 Start call'),
-      );
-
-  const transcriptBlock = c.transcript.length === 0
-    ? null
-    : el('div', { class: 'card' },
-        el('h3', {}, 'Transcript'),
-        el('div', { class: 'transcript' },
-          c.transcript.map((row) => el('div', { class: 'transcript-row ' + (row.role === 'user' ? 'user' : 'assistant') },
-            el('span', { class: 'meta' }, row.role + ': '),
-            el('span', {}, row.text),
-          )),
-        ),
-      );
-
-  const toolsBlock = c.toolCalls.length === 0
-    ? null
-    : el('div', { class: 'card' },
-        el('h3', {}, 'Tool calls'),
-        el('ul', {}, c.toolCalls.map((t) => el('li', {},
-          el('code', {}, t.name),
-          t.args ? el('span', { class: 'meta' }, ' ' + t.args) : null,
-        ))),
-      );
-
-  return el('div', {},
-    el('div', { class: 'card' },
-      el('h2', {}, 'Live call'),
-      intro,
-      phasePill,
-      errBox,
-      buttons,
-      duckRow,
-    ),
-    dupBox,
-    transcriptBlock,
-    toolsBlock,
-  );
-}
-
-
 // Pre-load OAuth status for any visible upstreams.
 async function preloadOAuthStatus() {
   const targets = (state.servers || []).filter(isHTTPUpstream).map((s) => s.name);
   for (const n of targets) await loadOAuthStatus(n);
 }
 
+
+
+function withSectionTabs(body) {
+  const pages = {
+    servers: ['Connections', 'Connect services and control the tools they provide.'],
+    connections: ['Connections', 'Manage the accounts your agents use on your behalf.'],
+    agents: ['People & agents', 'Manage the people and agents with access to your workspace.'],
+    users: ['People & agents', 'Manage the people and agents with access to your workspace.'],
+    tools: ['Tools', 'Browse available tools, test a call, and manage access policies.'],
+    policies: ['Tools', 'Browse available tools, test a call, and manage access policies.'],
+    approvals: ['Tools', 'Browse available tools, test a call, and manage access policies.'],
+    audit: ['Activity', 'Review tool calls, permission decisions, and results.'],
+    insights: ['Activity', 'Review tool calls, permission decisions, and results.'],
+    settings: ['Settings', 'Workspace preferences and access controls.'],
+    myservers: ['Available services', 'Services your agents can use.'],
+  };
+  const groups = isAdmin() ? [
+    [['servers', 'Services'], ['connections', 'My accounts']],
+    [['agents', 'Agents'], ['users', 'People']],
+    [['audit', 'Calls'], ['insights', 'Tool activity']],
+    [['tools', 'Catalog'], ['policies', 'Policies'], ['approvals', 'Approval queue']],
+  ] : [];
+  const group = groups.find(g => g.some(([key]) => key === state.route));
+  const meta = pages[state.route];
+  if (!meta) return body;
+  // Move the primary page title out of the legacy card. Keep section titles.
+  const primaryTitles = { servers: 'Connections', tools: 'Tool workbench', agents: 'Agents', users: 'People' };
+  const title = [...body.querySelectorAll('h2')].find(h => h.textContent === primaryTitles[state.route]);
+  if (title) {
+    const card = title.closest('.card'); card?.classList.add('page-primary-card');
+    const description = title.parentElement.classList.contains('agent-add-bar') ? title.parentElement.nextElementSibling : title.nextElementSibling;
+    if (description?.matches('p.meta')) description.remove();
+    title.remove();
+  }
+  if (state.route === 'agents') {
+    const keyCard = [...body.querySelectorAll('.card')].find(card => card.querySelector('h2')?.textContent === 'Your Beknown key');
+    if (keyCard) {
+      const details = el('details', { class: 'connection-setup', 'data-disclosure-key': 'beknown-key' }, el('summary', {}, 'Beknown identity key'));
+      keyCard.replaceWith(details); details.appendChild(keyCard); body.appendChild(details);
+    }
+  }
+  // Tables scroll inside their own region, never across the whole page.
+  for (const table of body.querySelectorAll('table')) {
+    if (table.closest('.table-scroll')) continue;
+    const wrap = el('div', { class: 'table-scroll', tabindex: 0, role: 'region', 'aria-label': 'Scrollable ' + meta[0].toLowerCase() + ' table' });
+    table.replaceWith(wrap); wrap.appendChild(table);
+  }
+  return el('div', { class: 'workspace-page page-' + state.route },
+    el('div', { class: 'workspace-page-heading' }, el('h1', {}, meta[0]), el('p', { class: 'meta' }, meta[1])),
+    group ? el('nav', { class: 'section-tabs', 'aria-label': meta[0] + ' sections' }, ...group.map(([key,label]) => el('button', {
+      class: state.route === key ? 'active' : '', 'aria-current': state.route === key ? 'page' : 'false', on: { click: () => navigate(key) }
+    }, label))) : null, body);
+}
+function viewPolicies() {
+  return el('div', {}, renderPolicyRulesCard(),
+    el('div', { class: 'card' }, el('h3', {}, 'Tool access'), el('p', { class: 'meta' }, 'An explicit policy takes priority over automatic approval rules.'),
+      el('table', {}, el('thead', {}, el('tr', {}, el('th', {}, 'Tool'), el('th', {}, 'Service'), el('th', {}, 'Policy'))),
+        el('tbody', {}, ...state.tools.map(t => el('tr', {}, el('td', {}, el('code', {}, t.name)), el('td', { class: 'meta' }, t.upstream || 'Built in'), el('td', {}, renderPolicyControl({ tool_name: t.name, ...(state.insights.tools.find(row => row.tool_name === t.name) || {}) }))))))));
+}
+function viewConnectionHub() {
+  const page = viewServers();
+  const cards = [...page.children].filter(n => n.classList.contains('card'));
+  const connected = cards.find(n => n.querySelector('h2')?.textContent === 'Connected servers');
+  if (connected) {
+    connected.querySelector('h2').textContent = 'Connections'; page.prepend(connected);
+    const table = connected.querySelector('table');
+    if (table) {
+      const rows = [...table.querySelectorAll('tbody > tr')];
+      const list = el('div', { class:'connection-list' }, ...state.servers.map((srv,i) => {
+        const cells = rows[i] ? [...rows[i].children] : [];
+        const controls = el('div', { class:'connection-controls' });
+        for (const [index,label] of [[5,'Account access'],[6,'Permission policy'],[7,'Actions']]) {
+          if (cells[index]) controls.appendChild(el('div', {}, el('span', { class:'meta' }, label), ...[...cells[index].childNodes]));
+        }
+        return el('div', { class:'connection-row' },
+          el('div', { class:'connection-name' }, el('strong', {}, srv.name),
+            el('span', { class:'meta' }, (srv.auth_mode === 'per_user' ? 'Personal accounts' : 'Shared connection') + ' · ' + (srv.tool_count || 0) + ' tools')),
+          serverStatusBadge(srv),
+          el('details', { class:'connection-manage', 'data-disclosure-key': 'service-' + srv.name }, el('summary', { 'aria-label':'Manage ' + srv.name }, 'Manage'),
+            el('div', { class:'connection-panel' }, el('p', { class:'meta' }, transportLabel(srv)), controls)));
+      }));
+      table.replaceWith(list);
+    }
+  }
+  for (const card of cards.filter(n => n !== connected)) {
+    const title = card.querySelector('h2')?.textContent || 'Add a service';
+    const details = el('details', { class: 'connection-setup' }, el('summary', {}, title));
+    card.replaceWith(details); details.appendChild(card);
+  }
+  return page;
+}
+const ibDrafts = new Map();
+function ibDraftKey(r) { return 'toolyard.answer.' + (state.user?.id || '') + '.' + r.id + '.' + (r.revision || 0); }
+function ibDraft(r) {
+  const key = ibDraftKey(r);
+  if (!ibDrafts.has(key)) {
+    let d;
+    try { d = JSON.parse(sessionStorage.getItem(key)); } catch {}
+    if (!d || Date.now() - d.at > 24 * 3600000) d = { selected: [], text: '', submission: crypto.randomUUID(), at: Date.now() };
+    ibDrafts.set(key, d);
+  }
+  return ibDrafts.get(key);
+}
+function ibSaveDraft(r, d) { d.at = Date.now(); try { sessionStorage.setItem(ibDraftKey(r), JSON.stringify(d)); } catch {} }
+function ibDropDraft(r) { const key=ibDraftKey(r); ibDrafts.delete(key); try { sessionStorage.removeItem(key); } catch {} }
+function ibClearDrafts() { settingsClearDrafts(); ibDrafts.clear(); state.inbox.notes = {};  try { Object.keys(sessionStorage).filter(k => k.startsWith('toolyard.answer.')).forEach(k => sessionStorage.removeItem(k)); } catch {} }
+function ibAnswerForm(r) {
+  if (r.status !== 'pending') return el('div', { class: 'ib-sec answer-section' }, ibResultEl(r));
+  const d = ibDraft(r), q = r.question || { type: 'single_choice', max_selections: 1 };
+  const options = (q.options || r.options || []).map((o,i) => ({ ...o, id: o.id || 'option_' + (i+1) }));
+  const busy = !!state.inbox.busy, multi = q.type === 'multiple_choice';
+  const fieldset = el('fieldset', { class: 'answer-options', disabled: busy },
+    el('legend', {}, q.type === 'free_text' ? 'Write your answer' : multi ? 'Select all that apply, or write your own answer' : 'Choose one, or write your own answer'),
+    ...options.map((o,i) => el('label', { class: 'answer-option' + (d.selected.includes(o.id) ? ' selected' : '') },
+      el('input', { id: 'answer-option-' + i, type: multi ? 'checkbox' : 'radio', name: 'answer-choice', checked: d.selected.includes(o.id), on: { change: e => {
+        d.submission = crypto.randomUUID();
+        if (!multi || o.exclusive) d.selected = e.target.checked ? [o.id] : [];
+        else { const excluded = options.filter(x => x.exclusive).map(x => x.id); d.selected = d.selected.filter(id => !excluded.includes(id) && id !== o.id); if (e.target.checked) d.selected.push(o.id); }
+        ibSaveDraft(r,d); ibRegion('decide',ibAnswerForm(r));
+      } } }),
+      el('span', {}, el('strong', {}, o.label), o.recommended ? el('small', { class: 'option-recommended' }, 'Suggested') : null, o.detail ? el('small', {}, o.detail) : null)
+    )));
+  const error = el('p', { class: 'answer-error', role: 'alert', id: 'answer-error' });
+  const text = el('textarea', { id: 'answer-text', rows: 4, maxlength: 10000, value: d.text, disabled: busy,
+    placeholder: 'Write your answer or add context…', 'aria-describedby': 'answer-help answer-error',
+    on: { input: e => { d.text = e.target.value; d.submission = crypto.randomUUID(); ibSaveDraft(r,d); error.textContent = ''; } }
+  });
+  return el('form', { class: 'ib-sec answer-section', on: { submit: e => {
+    e.preventDefault(); if (busy) return;
+    if (!d.selected.length && !d.text.trim()) { error.textContent = 'Write an answer or choose an option.'; text.focus(); return; }
+    if (q.max_selections && d.selected.length > q.max_selections) { error.textContent = 'Choose at most ' + q.max_selections + ' options.'; return; }
+    if (d.selected.length && d.selected.length < (q.min_selections || 0)) { error.textContent = 'Choose at least ' + q.min_selections + ' options, or clear the choices and write an answer.'; return; }
+    ibSaveDraft(r,d);
+    ibDecide(r, { action:'answer', request_revision:r.revision || 0, submission_id:d.submission, response:{ selected_option_ids:[...d.selected], text:d.text } });
+  } } },
+    el('div', { class: 'ib-eyebrow' }, 'Your answer'), fieldset,
+    d.selected.length ? el('button', { type:'button', class:'ib-link', disabled:busy, on:{click:()=>{d.selected=[];d.submission=crypto.randomUUID();ibSaveDraft(r,d);ibRegion('decide',ibAnswerForm(r));}} }, 'Clear choices') : null,
+    el('label', { for: 'answer-text' }, options.length ? 'Your answer or additional context' : 'Answer'), text,
+    el('p', { id:'answer-help', class:'meta' }, 'Your draft stays on this device until you send it. Selections never submit automatically.'), error,
+    el('div', { class:'ib-btns' },
+      el('button', { type:'button', disabled:busy, on:{click:()=>ibDecide(r,{action:'snooze',snooze_minutes:60})} }, 'Snooze for 1 hour'),
+      el('button', { type:'submit', class:'primary', disabled:busy }, busy ? 'Save answer…' : 'Send answer')));
+}
 
 // ---- Inbox: agents ask, toolyard flags, the owner decides at the end --------
 //
@@ -6726,16 +5203,16 @@ async function preloadOAuthStatus() {
 
 state.inbox = {
   loaded: false, loading: false, filter: 'needs', tab: 'inbox', items: [],
-  openId: null, detail: null, sessions: null,
-  allow: {}, openParams: {}, explain: {}, summary: {}, panel: null, busy: null, killOpen: false,
-  narrow: {}, ttl: {}, editing: {}, sessOpen: {}, info: null,
+  openId: null, detail: null,
+  allow: {}, openParams: {}, explain: {}, summary: {}, panel: null, busy: null,
+  narrow: {}, ttl: {}, editing: {}, info: null,
 };
 
 const IB_KIND = { access: 'Access request', question: 'Question', blocker: 'Blocked', update: 'Update' };
 const IB_VERB = { access: 'is asking for access', question: 'has a question', blocker: 'is stuck', update: 'sent an update' };
 const IB_URG = { now: 0, soon: 1, digest: 2, fyi: 3 };
 const IB_NEEDS = ['access', 'question', 'blocker'];
-const IB_FILTERS = ['needs', 'updates', 'done'];
+const IB_FILTERS = ['needs', 'snoozed', 'updates', 'done'];
 
 async function loadInbox() {
   if (state.inbox.loading) return;
@@ -6763,7 +5240,7 @@ function renderNavBadges() {
 
 function inboxOpenItems() { return state.inbox.items.filter((r) => r.status === 'pending'); }
 function inboxNeeds() {
-  return inboxOpenItems().filter((r) => IB_NEEDS.includes(r.kind))
+  return inboxOpenItems().filter((r) => IB_NEEDS.includes(r.kind) && !(r.snoozed_until > Date.now()))
     .sort((a, b) => (IB_URG[a.urgency] - IB_URG[b.urgency]) || (b.created_at - a.created_at));
 }
 function inboxUpdates() { return inboxOpenItems().filter((r) => r.kind === 'update').sort((a, b) => b.created_at - a.created_at); }
@@ -6993,12 +5470,7 @@ function ibPlayIcon() { return el('span', { class: 'ib-playicon' }); }
 
 function viewInbox() {
   if (state.inbox.openId) return inboxDetailNode();
-  const tabs = el('div', { class: 'ib-tabs' },
-    el('button', { class: state.inbox.tab === 'inbox' ? 'active' : '', on: { click: () => { state.inbox.tab = 'inbox'; render(); } } }, 'Inbox'),
-    el('button', { class: state.inbox.tab === 'sessions' ? 'active' : '', on: { click: () => { state.inbox.tab = 'sessions'; loadInboxSessions(); render(); } } }, 'Sessions'),
-  );
-  if (state.inbox.tab === 'sessions') return el('div', { class: 'ib' }, tabs, viewInboxSessions());
-  const lists = { needs: inboxNeeds(), updates: inboxUpdates(), done: inboxDone() };
+  const lists = { needs: inboxNeeds(), snoozed: inboxOpenItems().filter(r => r.snoozed_until > Date.now()), updates: inboxUpdates(), done: inboxDone() };
   const cur = lists[state.inbox.filter];
   const chip = (k, label) => el('button', {
     class: 'ib-chip' + (state.inbox.filter === k ? ' on' : ''),
@@ -7026,7 +5498,6 @@ function viewInbox() {
       } } }, 'Mark all read') : null);
   }
   return el('div', { class: 'ib' },
-    tabs,
     el('div', { class: 'ib-head' },
       el('div', {},
         el('h2', {}, 'Inbox'),
@@ -7034,7 +5505,7 @@ function viewInbox() {
       ),
       mode !== 'inbox' ? el('span', { class: 'ib-modehint', title: 'Settings → Inbox & permissions' }, 'approval mode: execute') : null,
     ),
-    el('div', { class: 'ib-chips' }, chip('needs', 'Needs you'), chip('updates', 'Updates'), chip('done', 'Done')),
+    el('div', { class: 'ib-chips' }, chip('needs', 'Needs you'), chip('snoozed', 'Snoozed'), chip('updates', 'Updates'), chip('done', 'Resolved')),
     tools,
     body,
   );
@@ -7054,16 +5525,16 @@ function ibCard(r) {
     el('div', { class: 'ib-kindrow' }, el('span', { class: 'ib-kind' }, (IB_KIND[r.kind] || r.kind) + (r.kind === 'access' ? ` · ${(r.tools || []).length} tool${(r.tools || []).length === 1 ? '' : 's'}` : '')), ibStatusPill(r),
       ...ibAttnPills(r), r.checked ? null : el('span', { class: 'ib-pill mute' }, 'Checking…')),
     el('h3', {}, r.title),
-    el('p', { class: 'sum' }, r.summary),
+    r.summary !== r.title ? el('p', { class: 'sum' }, r.summary) : null,
     fs.length ? el('div', { class: 'ib-flags' }, ...fs.map(ibFlagChip)) : null,
     ibDeciderEl(r),
-    el('div', { class: 'ib-minirow' },
+    r.audio?.script ? el('div', { class: 'ib-minirow' },
       el('button', {
         class: 'ib-miniplay', 'data-ib-play': r.id, 'aria-label': 'Play voice note',
         on: { click: (e) => { e.stopPropagation(); ibToggle(r.id); } },
       }, ibPlayIcon(), el('span', { 'data-ib-time': r.id }, ibFmt(ibTotal(r.id)))),
       el('div', { class: 'ib-minibar' }, el('i', { 'data-ib-prog': r.id })),
-    ),
+    ) : null,
   );
   return card;
 }
@@ -7075,7 +5546,7 @@ function openInboxRequest(id) {
   state.inbox.panel = null;
   state.inbox.busy = null;
   state.route = 'inbox';
-  history.replaceState(null, '', '#inbox/' + id);
+  if (location.hash !== '#inbox/' + id) history.pushState(null, '', '#inbox/' + id);
   ibNode = null;
   render();
   window.scrollTo(0, 0);
@@ -7088,7 +5559,7 @@ function closeInboxRequest() {
   state.inbox.detail = null;
   ibNode = null;
   ibObserver && ibObserver.disconnect();
-  history.replaceState(null, '', '#inbox');
+  if (location.hash !== '#inbox') history.pushState(null, '', '#inbox');
   render();
   loadInbox();
 }
@@ -7142,8 +5613,10 @@ function ibRegion(name, ...children) {
   if (!ibNode) return;
   const r = ibNode.querySelector(`[data-region="${name}"]`);
   if (!r) return;
+  const focus = captureFocus();
   r.innerHTML = '';
   for (const c of children.flat()) if (c) r.appendChild(c);
+  restoreFocus(focus);
 }
 
 function ibBuildDetail() {
@@ -7152,7 +5625,7 @@ function ibBuildDetail() {
   if (!state.inbox.allow[r.id] && r.tools) state.inbox.allow[r.id] = r.tools.map(() => true);
   ibRegion('head', ibHeadEl(r));
   ibRegion('flags', ibFlagsEl(r));
-  ibRegion('voice', ibVoiceEl(r));
+  ibRegion('voice', r.audio?.script ? el('details', { class: 'optional-audio' }, el('summary', {}, 'Listen to the summary'), ibVoiceEl(r)) : null);
   ibRegion('msg', ibMsgEl(r));
   ibRegion('att', ibAttEl(r));
   const dec = ibNode.querySelector('#ib-decide'); dec.hidden = false;
@@ -7167,7 +5640,7 @@ function ibRefreshRegions() {
   const r = d.request;
   ibRegion('head', ibHeadEl(r));
   ibRegion('flags', ibFlagsEl(r));
-  ibRegion('decide', ibDecideEl(r, d.grants || []));
+  if (!(r.status === 'pending' && ibNode.querySelector('[data-region=decide]')?.contains(document.activeElement))) ibRegion('decide', ibDecideEl(r, d.grants || []));
   ibRegion('activity', ibActivityEl(r));
   ibObserveDecision(r);
 }
@@ -7181,6 +5654,7 @@ function ibHeadEl(r) {
       el('span', { class: 'ib-kind' }, (IB_KIND[r.kind] || r.kind) + (r.kind === 'access' ? ` · ${r.tools.length} tool${r.tools.length === 1 ? '' : 's'}` : '')),
       ibStatusPill(r), ...ibAttnPills(r), el('span', { class: 'meta' }, relTime(r.created_at))),
     el('h2', {}, r.title),
+    r.task ? el('div', { class: 'meta task-context' }, 'Task · ', r.task.url ? el('a', { href: r.task.url, target: '_blank', rel: 'noopener noreferrer' }, r.task.title || 'Open task') : r.task.title) : null,
   );
 }
 
@@ -7190,6 +5664,7 @@ function ibFlagsEl(r) {
   const extra = [];
   if (r.dry_run_count > 0) extra.push(el('span', { class: 'ib-note' }, `${r.dry_run_count} dry run${r.dry_run_count === 1 ? '' : 's'} before sending`));
   if ((r.dropped_flags || []).length) extra.push(el('span', { class: 'ib-note red' }, 'Flags gone since the dry runs: ' + r.dropped_flags.join(', ')));
+  if (!all.length && r.kind !== 'access') return el('div');
   if (!all.length) return el('div', {}, el('p', { class: 'ib-clean' }, '✓ Toolyard checked this in the background. Nothing to flag.'), ...extra);
   const open = !!state.inbox.flagsOpen;
   return el('div', { class: 'ib-tystrip' },
@@ -7240,6 +5715,7 @@ function ibMsgEl(r) {
   const renderTy = () => {
     holder.innerHTML = '';
     const s = state.inbox.summary[r.id];
+    if (!s && !state.inbox.info?.judge_available) return;
     if (!s) {
       holder.appendChild(el('button', { class: 'ib-tybtn', on: { click: async () => {
         state.inbox.summary[r.id] = { loading: true }; renderTy();
@@ -7441,7 +5917,7 @@ function ibDecideEl(r, grants) {
       else if (reqOff.length) actions = el('div', { class: 'ib-actions' },
         el('p', { class: 'ib-warn' }, `${r.agent_name} marked `, ...reqOff.flatMap((t, i) => [i ? ', ' : '', el('code', {}, t.tool)]),
           ` as required. Without ${reqOff.length > 1 ? 'them' : 'it'} it can’t do this task, so this sends the request back for a new plan.`),
-        el('textarea', { id: 'ib-note', placeholder: 'Tell the agent what to change', rows: 3 }),
+        el('textarea', { id: 'ib-note', value: state.inbox.notes?.[r.id] || '', on: { input: e => { (state.inbox.notes ||= {})[r.id] = e.target.value; } }, placeholder: 'Tell the agent what to change', rows: 3 }),
         el('div', { class: 'ib-btns' },
           el('button', { on: { click: setAll(() => true) } }, 'Undo'),
           el('button', { class: 'danger', disabled: !!busy, on: { click: () => ibDecide(r, { action: 'return', note: ibNote() }) } }, busy ? 'Sending…' : 'Send back to agent')));
@@ -7466,19 +5942,7 @@ function ibDecideEl(r, grants) {
       el('div', { class: 'ib-trows' }, ...rows),
       actions);
   }
-  if (r.kind === 'question' || r.kind === 'blocker') {
-    return el('div', { class: 'ib-sec' },
-      el('div', { class: 'ib-eyebrow' }, 'Your answer'),
-      el('h3', {}, r.kind === 'blocker' ? 'How should it continue?' : 'What should it do?'),
-      open ? null : result,
-      el('div', { class: 'ib-opts' }, ...r.options.map((o, k) => el('button', {
-        class: 'ib-opt' + (r.answer === o.label ? ' chosen' : ''), disabled: !open || !!busy,
-        on: { click: () => ibDecide(r, { action: 'answer', option: k }) },
-      }, el('span', {}, o.label, o.detail ? el('small', {}, o.detail) : null)))),
-      open ? (state.inbox.panel ? ibPanelEl(r) : el('div', { class: 'ib-btns' },
-        el('button', { class: 'danger', on: { click: () => { state.inbox.panel = 'deny'; ibRegion('decide', ibDecideEl(r, grants)); } } }, 'Dismiss'),
-        el('button', { on: { click: () => { state.inbox.panel = 'snooze'; ibRegion('decide', ibDecideEl(r, grants)); } } }, 'Later'))) : null);
-  }
+  if (r.kind === 'question' || r.kind === 'blocker') return ibAnswerForm(r);
   return el('div', { class: 'ib-sec' },
     el('div', { class: 'ib-eyebrow' }, 'Done reading?'),
     open ? el('button', { class: 'primary', disabled: !!busy, on: { click: () => ibDecide(r, { action: 'read' }) } }, 'Mark as read') : result);
@@ -7664,7 +6128,7 @@ function ibPanelEl(r) {
   if (state.inbox.panel === 'deny') {
     return el('div', { class: 'ib-actions' },
       el('label', { class: 'meta', for: 'ib-note' }, `Tell ${r.agent_name} why (optional). It reads this before trying again.`),
-      el('textarea', { id: 'ib-note', rows: 3, placeholder: 'e.g. Don’t touch the flag; I’ll roll it out myself' }),
+      el('textarea', { id: 'ib-note', value: state.inbox.notes?.[r.id] || '', on: { input: e => { (state.inbox.notes ||= {})[r.id] = e.target.value; } }, rows: 3, placeholder: 'e.g. Don’t touch the flag; I’ll roll it out myself' }),
       el('div', { class: 'ib-btns' }, el('button', { on: { click: back } }, 'Cancel'),
         el('button', { class: 'danger', disabled: !!busy, on: { click: () => ibDecide(r, { action: 'deny', note: ibNote() }) } }, busy ? 'Sending…' : (r.kind === 'access' ? 'Deny whole request' : 'Dismiss'))));
   }
@@ -7790,10 +6254,11 @@ async function ibDecide(r, body) {
   ibRegion('decide', ibDecideEl(r, state.inbox.detail.grants || []));
   try {
     await api('/v1/inbox/' + r.id + '/decide', { method: 'POST', body });
+    if (body.action === 'answer') ibDropDraft(r);
     state.inbox.panel = null;
     delete state.inbox.narrow[r.id]; delete state.inbox.ttl[r.id];
-    toast({ approve: 'Approved. The agent can continue.', deny: 'Sent. The agent has been told.', return: 'Sent back for a new plan.',
-      answer: 'Answer sent.', snooze: 'Snoozed.', read: 'Marked as read.' }[body.action] || 'Done');
+    toast({ approve: 'Approved. The agent can continue.', deny: 'Decision saved.', return: 'Sent back for a new plan.',
+      answer: 'Answer saved. The agent can retrieve it.', snooze: 'Snoozed.', read: 'Marked as read.' }[body.action] || 'Done');
     state.inbox.busy = null;
     await loadInboxDetail(r.id, false);
     loadInbox();
@@ -7817,7 +6282,7 @@ function ibResultEl(r) {
   const cls = { approved: 'good', answered: 'good', read: 'mute', denied: 'bad', returned: 'bad', cancelled: 'mute', expired: 'mute' }[r.status] || 'mute';
   const title = {
     approved: `Allowed ${(r.tools || []).filter((t) => t.decision === 'allowed').length} of ${(r.tools || []).length}`,
-    answered: 'Answered: ' + r.answer, read: 'Marked as read', denied: r.kind === 'access' ? 'Denied' : 'Dismissed',
+    answered: (r.retrieved_at ? 'Retrieved by agent: ' : 'Answer saved: ') + r.answer, read: 'Marked as read', denied: r.kind === 'access' ? 'Denied' : 'Dismissed',
     returned: 'Sent back to replan', cancelled: 'Withdrawn by the agent', expired: 'Expired without a decision',
   }[r.status] || r.status;
   const detail = r.status === 'approved' && r.grants_expire_at ? `Permissions expire at ${ibClock(r.grants_expire_at)}.` : '';
@@ -7883,148 +6348,9 @@ function handleInboxEvent(card) {
 
 function handleGrantEvent() {
   if (state.inbox.openId) loadInboxDetail(state.inbox.openId, false);
-  if (state.inbox.tab === 'sessions') loadInboxSessions();
-}
-
-// ---- sessions + live permissions ------------------------------------------
-
-async function loadInboxSessions() {
-  try { state.inbox.sessions = await api('/v1/inbox/sessions'); } catch (e) { toast(e.message, 'error'); }
-  if (state.route === 'inbox' && state.inbox.tab === 'sessions' && !state.inbox.openId) render();
-}
-
-function viewInboxSessions() {
-  const s = state.inbox.sessions;
-  if (!s) return el('div', { class: 'ib-list' }, el('div', { class: 'ib-skcard' }, el('div', { class: 'ib-sk w55' }), el('div', { class: 'ib-sk w85' })));
-  const label = { blocked: 'Blocked on you', waiting: 'Waiting on you', stale: 'No heartbeat', working: 'Working', done: 'Done' };
-  const grantsBy = {};
-  for (const g of s.grants || []) (grantsBy[g.agent_id] = grantsBy[g.agent_id] || []).push(g);
-  const sessions = s.sessions || [];
-  const counts = {};
-  for (const x of sessions) counts[x.derived_status] = (counts[x.derived_status] || 0) + 1;
-  const agentsWithSessions = new Set(sessions.map((x) => x.agent_id));
-  const orphanGrants = (s.grants || []).filter((g) => !agentsWithSessions.has(g.agent_id));
-  const grantRow = (g) => el('div', { class: 'ib-grantrow' },
-    el('span', {}, el('b', {}, 'Live'), ' · ', el('code', {}, g.tool), ' · ', Math.max(0, Math.round((g.expires_at - Date.now()) / 60000)) + ' min left',
-      g.issued_by ? el('span', { class: 'meta' }, ' · issued by ' + userNameById(g.issued_by)) : null),
-    el('button', { class: 'danger', on: { click: async () => {
-      try { await api('/v1/inbox/grants/' + g.id + '/revoke', { method: 'POST', body: {} }); toast('Revoked. The agent stops at its next call.'); loadInboxSessions(); }
-      catch (e) { toast(e.message, 'error'); }
-    } } }, 'Revoke'));
-  return el('div', { class: 'ib-sessions' },
-    el('div', { class: 'ib-head' }, el('div', {}, el('h2', {}, 'Sessions'),
-      el('div', { class: 'meta' }, `${sessions.length} session${sessions.length === 1 ? '' : 's'} · ${(s.grants || []).length} live permission${(s.grants || []).length === 1 ? '' : 's'}`))),
-    el('div', { class: 'ib-chips' }, ...Object.keys(label).filter((k) => counts[k]).map((k) => el('span', { class: 'ib-st st-' + k }, `${counts[k]} ${label[k].toLowerCase()}`))),
-    sessions.length ? null : el('div', { class: 'ib-empty' }, el('b', {}, 'No sessions yet'),
-      el('span', {}, 'Agents appear here when they call session.start. Their requests still reach your inbox without one.')),
-    ...sessions.map((x) => el('div', { class: 'ib-sess' },
-      el('div', { class: 'ib-shd' }, el('div', {}, el('h3', {}, x.title),
-        el('div', { class: 'meta' }, x.agent_name, x.repo ? ' · ' : '', x.repo ? el('code', {}, x.repo + (x.branch ? '@' + x.branch : '')) : null, x.host ? ' · ' + x.host : '')),
-        el('span', { class: 'ib-st st-' + x.derived_status }, label[x.derived_status] || x.derived_status)),
-      el('div', { class: 'meta' }, 'Last heartbeat ' + relTime(x.last_heartbeat_at) + (x.note ? ' · “' + x.note + '”' : '') +
-        (x.coached_24h ? ` · told to ask ${x.coached_24h}× today` : '')),
-      x.open_count ? el('div', { class: 'meta' }, `${x.open_count} open request${x.open_count === 1 ? '' : 's'}`) : null,
-      ...(grantsBy[x.agent_id] || []).map(grantRow),
-      ibSessionTimeline(x))),
-    orphanGrants.length ? el('div', { class: 'ib-sess' }, el('h3', {}, 'Permissions for agents without a session'), ...orphanGrants.map(grantRow)) : null,
-    el('div', { class: 'ib-kill' }, state.inbox.killOpen
-      ? el('div', {}, el('p', {}, 'Revoke every live permission? Agents using one stop at their next call.'),
-        el('div', { class: 'ib-btns' }, el('button', { on: { click: () => { state.inbox.killOpen = false; render(); } } }, 'Cancel'),
-          el('button', { class: 'danger', on: { click: async () => {
-            try { const out = await api('/v1/inbox/grants/revoke-all', { method: 'POST' }); toast(`Revoked ${out.revoked} permission(s).`); }
-            catch (e) { toast(e.message, 'error'); }
-            state.inbox.killOpen = false; loadInboxSessions();
-          } } }, 'Revoke all')))
-      : el('button', { class: 'danger', disabled: !(s.grants || []).length, on: { click: () => { state.inbox.killOpen = true; render(); } } }, 'Revoke all permissions')),
-  );
-}
-
-// ibSessionTimeline: the session's requests, newest first, on demand.
-function ibSessionTimeline(x) {
-  const items = state.inbox.items.filter((r) => r.session_id === x.id).sort((a, b) => b.created_at - a.created_at);
-  if (!items.length) return null;
-  const open = !!state.inbox.sessOpen[x.id];
-  return el('div', { class: 'ib-stl' },
-    el('button', { class: 'ib-link', 'aria-expanded': String(open), on: { click: () => { state.inbox.sessOpen[x.id] = !open; render(); } } },
-      open ? 'Hide timeline' : `Timeline · ${items.length} item${items.length === 1 ? '' : 's'}`),
-    open ? el('ol', { class: 'ib-stlist' }, ...items.map((r) => el('li', {},
-      el('button', { class: 'ib-stitem', title: IB_KIND[r.kind] || r.kind, on: { click: () => openInboxRequest(r.id) } },
-        el('span', { class: 'meta' }, ibClock(r.created_at)),
-        el('b', {}, r.title), ibStatusPill(r))))) : null);
 }
 
 // ---- settings card --------------------------------------------------------
-
-function renderInboxSettingsCard() {
-  const s = state.settings;
-  if (!state.inbox.info && !state.inbox.infoLoading) {
-    state.inbox.infoLoading = true;
-    api('/v1/inbox/info').then((out) => { state.inbox.info = Object.assign({}, out.info, { passkeys: out.passkeys }); render(); })
-      .catch(() => {}).finally(() => { state.inbox.infoLoading = false; });
-  }
-  const patch = async (body) => {
-    try { const out = await api('/v1/settings', { method: 'PATCH', body }); Object.assign(state.settings, body, out || {}); state.inbox.info = null; toast('Saved'); render(); }
-    catch (e) { toast(e.message, 'error'); }
-  };
-  const mode = s.approval_mode || 'execute';
-  return el('div', { class: 'card' },
-    el('h3', {}, 'Inbox & permissions'),
-    el('p', { class: 'meta' }, 'What happens when an agent calls a restricted tool without a permission.'),
-    el('div', { class: 'ib-radio' },
-      el('label', {}, el('input', { type: 'radio', name: 'approval_mode', checked: mode === 'execute', on: { change: () => patch({ approval_mode: 'execute' }) } }),
-        el('span', {}, el('b', {}, 'Queue it (current behaviour). '), 'The call waits in Approvals and runs when you approve it.')),
-      el('label', {}, el('input', { type: 'radio', name: 'approval_mode', checked: mode === 'inbox', on: { change: () => patch({ approval_mode: 'inbox' }) } }),
-        el('span', {}, el('b', {}, 'Coach the agent. '), 'Nothing runs. The agent is told to send one inbox request with its reasons, a voice note and evidence; you decide per tool in the Inbox.'))),
-    el('label', { class: 'ib-check' }, el('input', { type: 'checkbox', checked: s.inbox_snapshot_enabled !== false, on: { change: (e) => patch({ inbox_snapshot_enabled: e.target.checked }) } }),
-      el('span', {}, 'Copy linked media (images, videos, files) when a request arrives, so it still works after the agent’s sandbox is gone.')),
-    el('label', { class: 'ib-check' }, el('input', { type: 'checkbox', checked: !!s.inbox_judge_enabled, on: { change: (e) => patch({ inbox_judge_enabled: e.target.checked }) } }),
-      el('span', {}, 'Judge model: compare each tool call with the agent’s own words and flag contradictions (uses GEMINI_API_KEY; request text is sent to Gemini).')),
-    el('label', { class: 'meta', for: 'ib-hosting' }, 'Where agents should host files (shown to them in the guide):'),
-    el('textarea', { id: 'ib-hosting', rows: 2, value: s.inbox_hosting_note || '', placeholder: 'e.g. Upload to the evidence bucket and link it',
-      on: { change: (e) => patch({ inbox_hosting_note: e.target.value }) } }),
-    ibAttentionSettings(s, patch),
-    ibVoiceSettings(s, patch),
-    ibPasskeySettings(),
-  );
-}
-
-function ibAttentionSettings(s, patch) {
-  const info = state.inbox.info || {};
-  const browserTZ = (() => { try { return Intl.DateTimeFormat().resolvedOptions().timeZone; } catch (_) { return ''; } })();
-  const tz = s.inbox_timezone || '';
-  const clock = (ms) => ms ? new Date(ms).toLocaleString([], { weekday: 'short', hour: '2-digit', minute: '2-digit' }) : '—';
-  const [qs, qe] = (s.inbox_quiet_hours || '').split('-');
-  const qStart = el('input', { type: 'time', value: qs || '', 'aria-label': 'Quiet hours start' });
-  const qEnd = el('input', { type: 'time', value: qe || '', 'aria-label': 'Quiet hours end' });
-  const saveQuiet = () => {
-    if (!qStart.value && !qEnd.value) return patch({ inbox_quiet_hours: '' });
-    if (!qStart.value || !qEnd.value || qStart.value === qEnd.value) return toast('Set both a start and an end time.', 'error');
-    patch({ inbox_quiet_hours: qStart.value + '-' + qEnd.value });
-  };
-  return el('div', { class: 'ib-set' },
-    el('h4', {}, 'When your phone buzzes'),
-    el('p', { class: 'meta' }, '“Now” requests push at once; “soon” ones are grouped per session after 90 seconds; “digest” ones wait for the next digest; updates never push. An agent that’s blocked on you gets one reminder.'),
-    el('div', { class: 'ib-setrow' }, el('span', {}, 'Urgent (“now”) requests per agent per hour'),
-      el('input', { type: 'number', min: '1', max: '60', value: String(s.inbox_now_per_hour || 3), class: 'ib-num',
-        on: { change: (e) => patch({ inbox_now_per_hour: Math.max(1, Math.min(60, +e.target.value || 3)) }) } })),
-    el('div', { class: 'ib-setrow' }, el('span', {}, 'Quiet hours'), el('span', { class: 'ib-inline' }, qStart, '–', qEnd,
-      el('button', { on: { click: saveQuiet } }, 'Save'),
-      s.inbox_quiet_hours ? el('button', { class: 'ib-link', on: { click: () => patch({ inbox_quiet_hours: '' }) } }, 'Off') : null)),
-    el('label', { class: 'meta', for: 'ib-qallow' }, 'Tools whose “now” requests may break through quiet hours (comma-separated; deploy.* matches a prefix):'),
-    el('input', { id: 'ib-qallow', type: 'text', value: s.inbox_quiet_allow || '', placeholder: 'e.g. deploy.rollback, pagerduty.*',
-      on: { change: (e) => patch({ inbox_quiet_allow: e.target.value }) } }),
-    el('div', { class: 'ib-setrow' }, el('span', {}, 'Digest times'),
-      el('input', { type: 'text', value: s.inbox_digest_times === undefined ? '09:30,13:30,18:30' : s.inbox_digest_times, placeholder: 'none', class: 'ib-txt',
-        on: { change: (e) => patch({ inbox_digest_times: e.target.value }) } })),
-    el('div', { class: 'ib-setrow' }, el('span', {}, 'Time zone'),
-      el('span', { class: 'ib-inline' }, el('code', {}, tz || (info.timezone && info.timezone !== 'Local' ? info.timezone : 'server time')),
-        browserTZ && browserTZ !== tz ? el('button', { on: { click: () => patch({ inbox_timezone: browserTZ }) } }, 'Use ' + browserTZ) : null)),
-    el('p', { class: 'meta' }, (info.quiet_now ? `Quiet until ${clock(info.quiet_until)}. ` : '') + `Next digest: ${clock(info.next_digest)}.` +
-      (info.pending_pushes ? ` ${info.pending_pushes} notification(s) queued.` : '')),
-    el('label', { class: 'ib-check' }, el('input', { type: 'checkbox', checked: !!s.inbox_push_details, on: { change: (e) => patch({ inbox_push_details: e.target.checked }) } }),
-      el('span', {}, 'Show titles and summaries in notifications (and on your watch). Off: notifications only say which agent wants what. Text in notifications passes through Apple’s or Google’s push service, encrypted.')),
-  );
-}
 
 function ibVoiceSettings(s, patch) {
   const info = state.inbox.info || {};
@@ -8070,9 +6396,9 @@ function ibVoiceSettings(s, patch) {
 
 function ibPasskeySettings() {
   const st = state.passkeys || (state.passkeys = { list: null, busy: false });
-  if (st.list === null && !st.loading) {
+  if (st.list === null && !st.loading && !st.error) {
     st.loading = true;
-    api('/v1/passkeys').then((out) => { st.list = out.passkeys || []; }).catch(() => { st.list = []; })
+    api('/v1/passkeys').then((out) => { st.list = out.passkeys || []; }).catch(e => { st.error = e.message; })
       .finally(() => { st.loading = false; if (state.route === 'settings') render(); });
   }
   const add = async () => {
@@ -8108,11 +6434,11 @@ function ibPasskeySettings() {
   return el('div', { class: 'ib-set' },
     el('h4', {}, 'Passkeys'),
     el('p', { class: 'meta' }, 'With a passkey, allowing production or red-flagged tools needs Face ID (or Touch ID, or your security key), bound to exactly what you approve. Removing a passkey needs a passkey too; if you lose every device, restart the gateway once with -inbox-reset-passkeys.'),
-    st.list === null ? el('p', { class: 'meta' }, 'Loading…') : st.list.length ? el('div', { class: 'ib-pklist' },
+    st.error ? el('div', { class: 'settings-notice error' }, 'Passkeys could not load. ', el('button', { on: { click: () => { st.error = ''; st.list = null; render(); } } }, 'Try again')) : st.list === null ? el('p', { class: 'meta' }, 'Loading…') : st.list.length ? el('div', { class: 'ib-pklist' },
       ...st.list.map((pk) => el('div', { class: 'ib-pkrow' },
         el('span', {}, el('b', {}, pk.name), el('small', { class: 'meta' }, ' added ' + relTime(pk.created_at) + (pk.last_used_at ? ' · used ' + relTime(pk.last_used_at) : ''))),
         el('button', { class: 'danger', disabled: st.busy, on: { click: () => remove(pk) } }, 'Remove')))) : el('p', { class: 'meta' }, 'No passkeys yet.'),
-    el('button', { class: 'primary', disabled: st.busy, on: { click: add } }, st.busy ? 'Waiting for your passkey…' : 'Add a passkey on this device'),
+    el('button', { class: 'primary', disabled: st.busy || !!st.error || st.list === null, on: { click: add } }, st.busy ? 'Waiting for your passkey…' : 'Add a passkey on this device'),
   );
 }
 
@@ -8141,8 +6467,15 @@ Read the full rules with inbox.guide().`;
   if ('serviceWorker' in navigator) {
     try { navigator.serviceWorker.register('/sw.js'); } catch {}
   }
-  if (location.hash) state.route = location.hash.slice(1) || 'approvals';
+  if (location.hash) {
+    state.route = workspaceRoute(location.hash.slice(1) || 'inbox');
+    if (state.route !== location.hash.slice(1)) history.replaceState(null, '', '#' + state.route);
+  }
+  // Retired extension notification links follow the same route redirects.
+  const routeParam = new URLSearchParams(location.search).get('route');
+  if (routeParam) state.route = workspaceRoute(routeParam);
   let deepInbox = null;
+  if (state.route.startsWith('settings/')) state.route = settingsRoute(state.route);
   if (state.route.startsWith('inbox/')) { deepInbox = state.route.slice(6); state.route = 'inbox'; }
   if (IB_FILTERS.includes(deepInbox)) { state.inbox.filter = deepInbox; deepInbox = null; }
   // Push deep link: notifications open /?approval=<id>. Land on the
@@ -8152,9 +6485,6 @@ Read the full rules with inbox.guide().`;
     state.route = 'approvals';
     state.focusApprovalId = approvalParam;
   }
-  // Events push deep link: notifications open /?route=events.
-  const routeParam = new URLSearchParams(location.search).get('route');
-  if (routeParam) state.route = routeParam;
   // /?password=1 (from /login's "Use password instead") opens the password
   // form straight away instead of behind the Google button.
   if (new URLSearchParams(location.search).get('password') === '1') state.showPasswordLogin = true;
@@ -8171,7 +6501,7 @@ Read the full rules with inbox.guide().`;
     if (state.route === 'connections') loadConnections(true);
     if (!location.hash && !approvalParam && !routeParam && state.settings.approval_mode === 'inbox') state.route = 'inbox';
     if (deepInbox) openInboxRequest(deepInbox);
-    if (state.route === 'insights' || state.route === 'notifications') {
+    if (state.route === 'insights' || state.route === 'policies' || state.route === 'notifications') {
       loadInsights();
     } else {
       // Fetch anomaly count for the navbar badge in the background.
@@ -8204,7 +6534,8 @@ Read the full rules with inbox.guide().`;
   // PWA and changes only the hash, which doesn't reload the page).
   window.addEventListener('hashchange', () => {
     if (!state.user) return;
-    const h = location.hash.slice(1);
+    const raw = location.hash.slice(1), h = workspaceRoute(raw);
+    if (h !== raw) { navigate(h); return; }
     // Members have no inbox; navigate() sends them to an allowed route.
     if (!isAdmin()) { if (h !== state.route) navigate(h); return; }
     if (h.startsWith('inbox/')) {
@@ -8213,6 +6544,8 @@ Read the full rules with inbox.guide().`;
         if (state.inbox.openId) closeInboxRequest();
         state.inbox.filter = id; state.inbox.tab = 'inbox'; navigate('inbox');
       } else if (id && state.inbox.openId !== id) openInboxRequest(id);
+    } else if (h === 'inbox' && state.inbox.openId) {
+      closeInboxRequest();
     } else if (h && h !== state.route) {
       navigate(h);
     }

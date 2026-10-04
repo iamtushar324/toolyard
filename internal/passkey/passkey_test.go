@@ -252,3 +252,16 @@ func TestInboxGate(t *testing.T) {
 		t.Fatalf("legacy decided_by = %q", got.DecidedBy)
 	}
 }
+
+func TestStagePasskeyReadFailureIsClosed(t *testing.T) {
+	s, db := newSvc(t)
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.CheckEnabled(context.Background()); err == nil {
+		t.Fatal("database failure treated as passkeys disabled")
+	}
+	if !s.Enabled(context.Background()) {
+		t.Fatal("legacy predicate failed open")
+	}
+}

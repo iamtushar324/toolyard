@@ -73,6 +73,7 @@ import (
 	"github.com/tusharbhardwaj/toolyard/internal/oauth"
 	"github.com/tusharbhardwaj/toolyard/internal/passkey"
 	"github.com/tusharbhardwaj/toolyard/internal/policy"
+	"github.com/tusharbhardwaj/toolyard/internal/pricing"
 	"github.com/tusharbhardwaj/toolyard/internal/push"
 	"github.com/tusharbhardwaj/toolyard/internal/realtime"
 	"github.com/tusharbhardwaj/toolyard/internal/secrets"
@@ -90,18 +91,21 @@ const (
 )
 
 type Server struct {
-	githubHTTP *http.Client
-	identity   *identity.Service
-	approval   *approval.Bus
-	audit      *audit.Logger
-	memory     *memory.Service
-	push       *push.Service
-	hub        *realtime.Hub
-	gateway    *gateway.Gateway
-	upstreams  *upstreams.Service
-	settings   *settings.Service
-	usage      *usage.Service
-	metrics    *metrics.Reader
+	githubHTTP   *http.Client
+	buildVersion string
+	environment  string
+	identity     *identity.Service
+	approval     *approval.Bus
+	audit        *audit.Logger
+	memory       *memory.Service
+	push         *push.Service
+	hub          *realtime.Hub
+	gateway      *gateway.Gateway
+	upstreams    *upstreams.Service
+	settings     *settings.Service
+	usage        *usage.Service
+	metrics      *metrics.Reader
+	pricing      *pricing.Catalog
 	// metricsRecorder, when set, lets /v1/health surface the
 	// async-flusher's dropped-event counter — a quiet warning sign that
 	// the metrics buffer is overflowing (often the canary for "the
@@ -150,17 +154,20 @@ type Server struct {
 }
 
 type Options struct {
-	Identity  *identity.Service
-	Approval  *approval.Bus
-	Audit     *audit.Logger
-	Memory    *memory.Service
-	Push      *push.Service
-	Hub       *realtime.Hub
-	Gateway   *gateway.Gateway
-	Upstreams *upstreams.Service
-	Settings  *settings.Service
-	Usage     *usage.Service
-	Metrics   *metrics.Reader
+	BuildVersion string
+	Environment  string
+	Identity     *identity.Service
+	Approval     *approval.Bus
+	Audit        *audit.Logger
+	Memory       *memory.Service
+	Push         *push.Service
+	Hub          *realtime.Hub
+	Gateway      *gateway.Gateway
+	Upstreams    *upstreams.Service
+	Settings     *settings.Service
+	Usage        *usage.Service
+	Metrics      *metrics.Reader
+	Pricing      *pricing.Catalog
 	// MetricsRecorder, when set, exposes the async metrics writer's
 	// dropped-event counter on /v1/health. Optional — nil omits the
 	// field from the response.
@@ -241,6 +248,7 @@ type Options struct {
 
 func New(ctx context.Context, opts Options) *Server {
 	s := &Server{
+		buildVersion: opts.BuildVersion, environment: opts.Environment,
 		identity:                 opts.Identity,
 		approval:                 opts.Approval,
 		audit:                    opts.Audit,
@@ -252,6 +260,7 @@ func New(ctx context.Context, opts Options) *Server {
 		settings:                 opts.Settings,
 		usage:                    opts.Usage,
 		metrics:                  opts.Metrics,
+		pricing:                  opts.Pricing,
 		metricsRecorder:          opts.MetricsRecorder,
 		autoApproval:             opts.AutoApproval,
 		policy:                   opts.Policy,
@@ -396,6 +405,7 @@ func (s *Server) Routes(mux *http.ServeMux) {
 	mux.HandleFunc("/v1/insights/anomalies", s.insightsAnomalies)
 	mux.HandleFunc("/v1/insights/anomalies/", s.insightsAnomalyAction)
 	mux.HandleFunc("/v1/insights/cost", s.insightsCost)
+	mux.HandleFunc("/v1/insights/pricing", s.insightsPricing)
 	mux.HandleFunc("/v1/insights/auto/rules", s.autoRulesCollection)
 	mux.HandleFunc("/v1/insights/auto/rules/", s.autoRulesItem)
 	mux.HandleFunc("/v1/insights/purge-agent", s.insightsPurgeAgent)
@@ -428,7 +438,8 @@ func (s *Server) health(w http.ResponseWriter, r *http.Request) {
 	body := map[string]any{
 		"ok":                true,
 		"service":           "toolyard",
-		"version":           "0.1.0",
+		"version":           s.buildVersion,
+		"environment":       s.environment,
 		"goroutines":        runtime.NumGoroutine(),
 		"inflight_calls":    s.gateway.InFlight(),
 		"upstreams_live":    s.gateway.LiveUpstreamCount(),
@@ -1545,8 +1556,8 @@ func (s *Server) serversCollection(w http.ResponseWriter, r *http.Request) {
 			// row body so the dashboard shows the persisted error. Otherwise 400.
 			if srv != nil && (errors.Is(err, gateway.ErrUpstreamNotFound) || !errors.Is(err, upstreams.ErrInvalid)) && !errors.Is(err, upstreams.ErrAlreadyHere) && !errors.Is(err, upstreams.ErrReserved) {
 				writeJSON(w, http.StatusAccepted, map[string]any{
-					"server":  srv,
-					"warning": err.Error(),
+					"server":  upstreams.Masked(*srv),
+					"warning": serverWarning(err, *srv),
 				})
 				return
 			}
@@ -1557,7 +1568,7 @@ func (s *Server) serversCollection(w http.ResponseWriter, r *http.Request) {
 			writeError(w, status, err.Error())
 			return
 		}
-		writeJSON(w, http.StatusOK, srv)
+		writeJSON(w, http.StatusOK, upstreams.Masked(*srv))
 	default:
 		writeError(w, http.StatusMethodNotAllowed, "GET or POST")
 	}
@@ -1600,13 +1611,13 @@ func (s *Server) serversItem(w http.ResponseWriter, r *http.Request) {
 		srv, err := s.upstreams.Reconnect(r.Context(), name)
 		if err != nil {
 			if srv != nil {
-				writeJSON(w, http.StatusAccepted, map[string]any{"server": srv, "warning": err.Error()})
+				writeJSON(w, http.StatusAccepted, map[string]any{"server": upstreams.Masked(*srv), "warning": serverWarning(err, *srv)})
 				return
 			}
 			writeError(w, http.StatusBadRequest, err.Error())
 			return
 		}
-		writeJSON(w, http.StatusOK, srv)
+		writeJSON(w, http.StatusOK, upstreams.Masked(*srv))
 		return
 	}
 	if subpath == "" && r.Method == http.MethodPatch {

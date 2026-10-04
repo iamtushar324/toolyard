@@ -86,8 +86,11 @@ type Audio struct {
 
 // Option is one choice on a question or blocker.
 type Option struct {
-	Label  string `json:"label"`
-	Detail string `json:"detail,omitempty"`
+	ID          string `json:"id,omitempty"`
+	Exclusive   bool   `json:"exclusive,omitempty"`
+	Recommended bool   `json:"recommended,omitempty"`
+	Label       string `json:"label"`
+	Detail      string `json:"detail,omitempty"`
 }
 
 // Series is one line or bar series in a chart attachment.
@@ -164,6 +167,19 @@ type Activity struct {
 
 // Request is the full stored shape of an inbox item.
 type Request struct {
+	RetrievedAt           int64           `json:"retrieved_at,omitempty"`
+	SchemaVersion         int             `json:"schema_version,omitempty"`
+	Revision              int             `json:"revision"`
+	ClientRequestID       string          `json:"client_request_id,omitempty"`
+	SubmissionFingerprint string          `json:"submission_fingerprint,omitempty"`
+	Question              *Question       `json:"question,omitempty"`
+	Task                  *TaskContext    `json:"task,omitempty"`
+	Blocking              bool            `json:"blocking,omitempty"`
+	Response              *AnswerResponse `json:"response,omitempty"`
+	AnswerSubmissionID    string          `json:"answer_submission_id,omitempty"`
+	AnswerFingerprint     string          `json:"answer_fingerprint,omitempty"`
+	Replayed              bool            `json:"-"`
+
 	ID        string `json:"id"`
 	AgentID   string `json:"agent_id"`
 	SessionID string `json:"session_id,omitempty"`

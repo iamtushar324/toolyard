@@ -1,12 +1,12 @@
 {
-  "name": "toolyard",
-  "short_name": "toolyard",
+  "name": "Toolyard",
+  "short_name": "Toolyard",
   "description": "Self-hosted MCP gateway with per-call human approval",
   "start_url": "/",
   "scope": "/",
   "display": "standalone",
-  "background_color": "#0d1117",
-  "theme_color": "#0d1117",
+  "background_color": "#101114",
+  "theme_color": "#101114",
   "icons": [
     {
       "src": "/icon-192.svg",

@@ -1,0 +1,31 @@
+{
+  "health": {
+    "environment": "stage",
+    "goroutines": 38,
+    "inflight_calls": 0,
+    "metrics_dropped": 0,
+    "ok": true,
+    "service": "toolyard",
+    "upstreams_backoff": 0,
+    "upstreams_idle": 0,
+    "upstreams_live": 2,
+    "upstreams_max": 8,
+    "upstreams_per_user_live": 0,
+    "upstreams_per_user_max": 64,
+    "upstreams_recovered": 0,
+    "version": "stage-9eac6b2"
+  },
+  "connectors": [
+    {
+      "name": "sandbox-errors",
+      "last_status": "ok",
+      "tool_count": 3
+    },
+    {
+      "name": "sandbox-files",
+      "last_status": "ok",
+      "tool_count": 2
+    }
+  ],
+  "answer_survived_rollback": true
+}

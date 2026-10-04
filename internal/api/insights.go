@@ -10,7 +10,6 @@ import (
 	"github.com/tusharbhardwaj/toolyard/internal/autoapproval"
 	"github.com/tusharbhardwaj/toolyard/internal/metrics"
 	"github.com/tusharbhardwaj/toolyard/internal/policy"
-	"github.com/tusharbhardwaj/toolyard/internal/settings"
 )
 
 // rangeFromQuery parses a ?range=24h|7d|30d|90d query into a metrics.Range.
@@ -310,28 +309,61 @@ func (s *Server) insightsCost(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusUnauthorized, "unauthorized")
 		return
 	}
-	if s.metrics == nil {
-		writeJSON(w, http.StatusOK, []any{})
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "GET only")
 		return
 	}
-	in, out := 0.0, 0.0
-	if s.settings != nil {
-		in = s.settings.GetFloat(settings.CostInputUsdPerM, 0)
-		out = s.settings.GetFloat(settings.CostOutputUsdPerM, 0)
-	}
-	rows, err := s.metrics.Cost(r.Context(), rangeFromQuery(r), in, out)
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
-		return
-	}
-	if rows == nil {
-		rows = []metrics.CostRow{}
+	rows := []metrics.CostRow{}
+	if s.metrics != nil {
+		var err error
+		rows, err = s.metrics.Cost(r.Context(), rangeFromQuery(r))
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, err.Error())
+			return
+		}
+		if rows == nil {
+			rows = []metrics.CostRow{}
+		}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{
-		"rows":             rows,
-		"input_usd_per_m":  in,
-		"output_usd_per_m": out,
+		"rows":       rows,
+		"status":     "unmetered",
+		"billed_usd": nil,
+		"reason":     "Tool calls do not include the client model or provider token usage. Payload estimates cannot measure billed spend.",
 	})
+}
+
+// insightsPricing reads the local snapshot, never a remote URL on a request.
+// The source is fixed and the catalog refreshes in the background.
+func (s *Server) insightsPricing(w http.ResponseWriter, r *http.Request) {
+	if _, err := s.requireUser(r); err != nil {
+		writeError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "GET only")
+		return
+	}
+	limit := 30
+	if r.URL.Query().Has("limit") {
+		n, err := strconv.Atoi(r.URL.Query().Get("limit"))
+		if err != nil || n < 0 || n > 100 {
+			writeError(w, http.StatusBadRequest, "limit must be from 0 to 100")
+			return
+		}
+		limit = n
+	}
+	offset := 0
+	if r.URL.Query().Has("offset") {
+		n, err := strconv.Atoi(r.URL.Query().Get("offset"))
+		if err != nil || n < 0 {
+			writeError(w, http.StatusBadRequest, "offset must be zero or more")
+			return
+		}
+		offset = n
+	}
+	w.Header().Set("Cache-Control", "private, no-cache")
+	writeJSON(w, http.StatusOK, s.pricing.View(r.URL.Query().Get("provider"), r.URL.Query().Get("q"), offset, limit))
 }
 
 // autoRulesCollection handles GET (list all rules) and POST (operator-created

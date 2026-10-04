@@ -24,7 +24,7 @@ type PasskeyAssertion struct {
 // PasskeyGate verifies passkey assertions.
 type PasskeyGate interface {
 	// Enabled reports whether the owner has registered a passkey.
-	Enabled(ctx context.Context) bool
+	CheckEnabled(ctx context.Context) (bool, error)
 	// VerifyCredential checks an assertion made for the decision with
 	// this digest and returns the id of the credential that signed it, so
 	// the decision can record which passkey confirmed it.

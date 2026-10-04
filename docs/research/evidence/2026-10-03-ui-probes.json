@@ -1,0 +1,67 @@
+{
+  "reviewedAt": "2026-10-03",
+  "revision": "dacb8d387b132e789b0e5434ea1620a9076ce9e2",
+  "environment": "Unchanged Toolyard frontend with synthetic API responses; writes blocked; no live approvals",
+  "observations": {
+    "decisionDraft": {
+      "after": "",
+      "before": "Please deploy only to the test environment."
+    },
+    "defaultRoute": "approvals",
+    "fixture": true,
+    "inbox": {
+      "badge": 2,
+      "done": [
+        {
+          "id": "demo-request-4",
+          "status": "approved"
+        },
+        {
+          "id": "demo-request-5",
+          "status": "expired"
+        }
+      ],
+      "needs": 3
+    },
+    "routeHistory": {
+      "after": 2,
+      "before": 2,
+      "hash": "#connections"
+    },
+    "serverDraft": {
+      "after": {
+        "command": "",
+        "name": ""
+      },
+      "before": {
+        "command": "example-command",
+        "name": "Research custom server"
+      }
+    },
+    "viewport": {
+      "scrollWidth": 1483,
+      "width": 1402
+    }
+  },
+  "reproduction": {
+    "decisionDraft": [
+      "Open demo-request-1",
+      "Choose Deny",
+      "Enter the recorded draft text in ib-note",
+      "Call loadInboxDetail with the same request and first=false",
+      "Compare the draft before and after"
+    ],
+    "serverDraft": [
+      "Navigate to Servers",
+      "Enter the recorded name and command",
+      "Dispatch a synthetic audit event through handleAuditEvent",
+      "Compare fields before and after"
+    ],
+    "routeHistory": [
+      "Record history.length",
+      "Navigate to Agents, then Connections",
+      "Compare history.length"
+    ],
+    "limits": "These probes validate frontend behavior only. They are not live backend or production failure tests."
+  }
+}

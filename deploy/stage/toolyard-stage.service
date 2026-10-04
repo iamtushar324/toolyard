@@ -1,0 +1,26 @@
+[Unit]
+Description=Toolyard stage gateway
+After=network-online.target toolyard-stage-fixtures.service
+Wants=network-online.target toolyard-stage-fixtures.service
+
+[Service]
+Type=simple
+User=toolyard-stage
+Group=toolyard-stage
+WorkingDirectory=/var/lib/toolyard-stage
+EnvironmentFile=/etc/toolyard-stage/stage.env
+ExecStart=/opt/toolyard-stage/current/toolyard serve -addr 172.23.0.1:18792 -data /var/lib/toolyard-stage -public-url https://toolyard.stage.dev.beknown.live -trusted-proxy 172.23.0.0/16 -clickhouse-runtime-env= -mempalace off -voice off -notes off -skills off -no-stdio-upstreams -stateless-mcp -upstream-idle-timeout 15m -owner-email ${TOOLYARD_STAGE_OWNER_EMAIL}
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/toolyard-stage
+UMask=0077
+CPUQuota=100%
+MemoryHigh=384M
+MemoryMax=768M
+
+[Install]
+WantedBy=multi-user.target

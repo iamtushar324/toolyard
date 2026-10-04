@@ -64,6 +64,7 @@ import (
 	"github.com/tusharbhardwaj/toolyard/internal/oauth"
 	"github.com/tusharbhardwaj/toolyard/internal/passkey"
 	"github.com/tusharbhardwaj/toolyard/internal/policy"
+	"github.com/tusharbhardwaj/toolyard/internal/pricing"
 	"github.com/tusharbhardwaj/toolyard/internal/push"
 	"github.com/tusharbhardwaj/toolyard/internal/realtime"
 	"github.com/tusharbhardwaj/toolyard/internal/sealbox"
@@ -487,6 +488,8 @@ func runServe(argv []string) error {
 		_ = metricsRec.Close(shCtx)
 	}()
 	metricsReader := metrics.NewReader(db)
+	priceCatalog := pricing.New(filepath.Join(*dataDir, "model-prices.json"))
+	go priceCatalog.Run(ctx)
 
 	autoApprover := autoapproval.New(db, metricsReader, settingsSvc)
 	bus.SetAutoApprover(autoApprover)
@@ -1096,6 +1099,7 @@ func runServe(argv []string) error {
 
 	// REST API + dashboard.
 	apiSrv := api.New(ctx, api.Options{
+		BuildVersion: version, Environment: os.Getenv("TOOLYARD_ENVIRONMENT"),
 		Identity:                 idSvc,
 		Approval:                 bus,
 		Audit:                    auditSvc,
@@ -1107,6 +1111,7 @@ func runServe(argv []string) error {
 		Settings:                 settingsSvc,
 		Usage:                    usageSvc,
 		Metrics:                  metricsReader,
+		Pricing:                  priceCatalog,
 		MetricsRecorder:          metricsRec,
 		AutoApproval:             autoApprover,
 		Policy:                   policyEngine,
@@ -1597,16 +1602,21 @@ func staticHandler() http.Handler {
 	// window (which Cache-Control:no-cache cannot retroactively shorten).
 	appHash := assetHash(sub, "app.js")
 	cssHash := assetHash(sub, "style.css")
+	settingsHash := assetHash(sub, "settings.js")
+	workspaceHash := assetHash(sub, "workspace.css")
 	swHash := assetHash(sub, "sw.js")
 	loginHash := assetHash(sub, "login.js")
 	rewriteIndex := func(body []byte) []byte {
 		out := strings.ReplaceAll(string(body), `src="/app.js"`, `src="/app.js?v=`+appHash+`"`)
 		out = strings.ReplaceAll(out, `href="/style.css"`, `href="/style.css?v=`+cssHash+`"`)
+		out = strings.ReplaceAll(out, `src="/settings.js"`, `src="/settings.js?v=`+settingsHash+`"`)
+		out = strings.ReplaceAll(out, `href="/workspace.css"`, `href="/workspace.css?v=`+workspaceHash+`"`)
 		return []byte(out)
 	}
 	rewriteLogin := func(body []byte) []byte {
 		out := strings.ReplaceAll(string(body), `src="/login.js"`, `src="/login.js?v=`+loginHash+`"`)
 		out = strings.ReplaceAll(out, `href="/style.css"`, `href="/style.css?v=`+cssHash+`"`)
+		out = strings.ReplaceAll(out, `href="/workspace.css"`, `href="/workspace.css?v=`+workspaceHash+`"`)
 		return []byte(out)
 	}
 	// serveDocument writes an HTML document with the revalidate-always

@@ -1,7 +1,7 @@
 # toolyard
 
-Self-hosted MCP gateway with **per-tool-call human approval pushed to your
-phone** and built-in shared memory. One Go binary + SQLite + a PWA dashboard.
+Self-hosted MCP gateway for **tool access, bounded human permission, and agent
+questions**, with notifications on your phone. One Go binary + SQLite + a PWA dashboard.
 
 Every coding agent today (Claude Code, Cursor, Codex CLI, web Claude)
 reimplements its own MCP config, approval UX, and audit log. `toolyard` sits
@@ -12,9 +12,14 @@ cards to your phone with the model's reasoning visible.
 ## Status
 
 **v0.1 — works end-to-end.** Reads pass, writes hold for human approval,
-audit log streams live to the dashboard, Web Push lights up your phone, and
-the Claude Code hook lets long approvals resume cleanly. See
+audit log streams live to the dashboard, and Web Push lights up your phone. See
 [`docs/architecture.md`](docs/architecture.md).
+
+The dashboard centers on Inbox, Connections, Activity, People & agents, Tools,
+and Settings. It does not offer full agent-session recording, session hooks,
+model pricing/spend, a memory editor, a general Events hub, or live voice calls.
+Existing extension data and APIs remain available for compatibility. See the
+[product scope cleanup](docs/research/2026-10-04-product-scope-cleanup.md).
 
 ## Quickstart
 
@@ -34,12 +39,12 @@ Open <http://localhost:8787>, create the local admin account, and:
 3. Point your MCP-aware agent at `http://localhost:8787/mcp` with
    `Authorization: Bearer <token>`. Or run the gateway with `-stdio` for
    stdio-only hosts.
-4. (Optional) **Settings → Enable push** in the dashboard to get notifications
+4. (Optional) **Settings → Notifications** in the dashboard to enable notifications
    on this device.
 
 The full self-hosting guide is in [`docs/self-hosting.md`](docs/self-hosting.md).
 
-## What's in v0.1
+## Backend capabilities and compatibility
 
 - Stdio + streamable HTTP MCP server, agent enrollment via short-lived
   codes, sha256-hashed long-lived tokens.
@@ -51,12 +56,13 @@ The full self-hosting guide is in [`docs/self-hosting.md`](docs/self-hosting.md)
   with hybrid in-line wait + deferred-response degradation per the
   architecture plan.
 - Built-in memory MCP (`memory.set`, `memory.get`, `memory.list`,
-  `memory.delete`) backed by the same SQLite DB.
+  `memory.delete`) backed by the same SQLite DB, retained for existing integrations.
 - Live SSE dashboard: pending approvals, audit feed, agent enrollment,
-  memory browser, push setup.
+  questions, connection management, and notification setup.
 - Web Push (VAPID) with one-tap allow/deny actions in the notification.
 - `scripts/claude-code-hook.sh` reference implementation of the
-  PostToolUse hook that resumes deferred approvals.
+  PostToolUse hook that resumes deferred approvals, retained for legacy callers;
+  new dashboard setup uses MCP instructions and the permission guide.
 - Multi-stage `deploy/Dockerfile` + `deploy/docker-compose.yml`.
 
 ## Inbox and scoped permissions
@@ -81,15 +87,14 @@ single-use permission (a grant) tied to the exact parameters you saw.
 - **You** see the Inbox tab: the agent's message and voice note first,
   evidence next, the decision last. You can narrow any tool's parameters and
   shorten how long permissions last before approving, and production or
-  red-flagged tools need your passkey (Face ID) once you've added one. The
-  Sessions tab shows what each agent is doing, its timeline, its live
-  permissions, and a kill switch.
+  red-flagged tools need your passkey (Face ID) once you've added one.
+  Activity records tool calls and decisions without a full-session dashboard.
 - **Your phone** buzzes by urgency: `now` at once (rate-limited per agent),
   `soon` grouped per session, `digest` in scheduled digests, never for
   updates, and not during quiet hours. Details in
   [docs/self-hosting.md](docs/self-hosting.md#inbox-and-permissions).
 
-`approval_mode` (Settings → Inbox & permissions) decides what happens when
+`approval_mode` (Settings → Permissions) decides what happens when
 an agent calls a restricted tool without a grant: `execute` (default)
 keeps the existing queue-and-run approvals; `inbox` runs nothing and
 returns `permission_required` with a pre-filled draft request, so agents

@@ -447,7 +447,7 @@ func (s *Service) itemPush(ctx context.Context, c AttentionConfig, r *Request, r
 		p.Actions = []PushAction{{TapDeny, "Deny"}, {TapSnooze, "Snooze 1h"}}
 		actions = []string{TapDeny, TapSnooze}
 	case KindQuestion, KindBlocker:
-		if c.Details && len(r.Options) > 0 && len(r.Options) <= 2 {
+		if r.SchemaVersion < 2 && c.Details && len(r.Options) > 0 && len(r.Options) <= 2 {
 			for i, o := range r.Options {
 				a := TapOption + strconv.Itoa(i)
 				p.Actions = append(p.Actions, PushAction{a, truncate(o.Label, 24)})

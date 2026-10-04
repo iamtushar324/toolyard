@@ -1,0 +1,24 @@
+[Unit]
+Description=Toolyard synthetic stage connectors
+After=network-online.target
+
+[Service]
+Type=simple
+User=toolyard-stage
+Group=toolyard-stage
+WorkingDirectory=/var/lib/toolyard-stage
+ExecStart=/opt/toolyard-stage/current/stage-fixtures -data /var/lib/toolyard-stage
+ExecStartPost=/usr/bin/timeout 10 /bin/sh -c 'until /usr/bin/curl --silent --output /dev/null http://127.0.0.1:18793/; do /bin/sleep 0.1; done'
+Restart=on-failure
+RestartSec=5
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+ReadWritePaths=/var/lib/toolyard-stage
+UMask=0077
+CPUQuota=50%
+MemoryMax=192M
+
+[Install]
+WantedBy=multi-user.target
