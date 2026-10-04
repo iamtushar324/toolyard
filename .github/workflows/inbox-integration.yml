@@ -21,4 +21,13 @@ jobs:
       - name: Dashboard behavior
         run: node --test scripts/*ui.test.cjs
       - name: Build gateway
-        run: go build ./cmd/gateway ./cmd/inbox-migration-check
+        run: |
+          mkdir -p dist
+          go build -ldflags "-X main.version=github-${GITHUB_SHA}" -o dist/toolyard ./cmd/gateway
+          go build -o dist/inbox-migration-check ./cmd/inbox-migration-check
+      - name: Publish validated application artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: toolyard-${{ github.sha }}
+          path: dist/
+          retention-days: 7
