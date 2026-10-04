@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 
@@ -12,6 +13,20 @@ import (
 )
 
 const assertionServerBody = `{"name":"private_control","transport":"http","url":"http://127.0.0.1:18791/mcp","auth_mode":"per_user","assertion_profile":"isolated_preview","enabled":true}`
+
+// Include the normal CSRF marker so these cases reach the user/role guard.
+func (e *accessTestEnv) assertionBearer(t *testing.T, token, method, path, body string) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(method, path, strings.NewReader(body))
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("X-Requested-With", "toolyard")
+	if body != "" {
+		req.Header.Set("Content-Type", "application/json")
+	}
+	rec := httptest.NewRecorder()
+	e.handler.ServeHTTP(rec, req)
+	return rec
+}
 
 func TestAssertionProfileServerAPIAdminCreatesDisabled(t *testing.T) {
 	e := newAccessTestServer(t)
@@ -43,7 +58,7 @@ func TestAssertionProfileServerAPIMemberAndAgentCannotMutate(t *testing.T) {
 		t.Fatalf("member created connector: %d %s", rec.Code, rec.Body.String())
 	}
 	token, _ := e.agentFor(t, member.ID)
-	if rec := e.bearer(t, token, http.MethodPost, "/v1/servers", assertionServerBody); rec.Code != http.StatusUnauthorized {
+	if rec := e.assertionBearer(t, token, http.MethodPost, "/v1/servers", assertionServerBody); rec.Code != http.StatusUnauthorized {
 		t.Fatalf("agent created connector: %d %s", rec.Code, rec.Body.String())
 	}
 	admin := e.cookieFor(t, e.admin.ID)
@@ -56,7 +71,7 @@ func TestAssertionProfileServerAPIMemberAndAgentCannotMutate(t *testing.T) {
 		if rec := e.do(t, cookie, change.method, change.path, change.body); rec.Code != http.StatusForbidden {
 			t.Fatalf("member changed connector: %d %s", rec.Code, rec.Body.String())
 		}
-		if rec := e.bearer(t, token, change.method, change.path, change.body); rec.Code != http.StatusUnauthorized {
+		if rec := e.assertionBearer(t, token, change.method, change.path, change.body); rec.Code != http.StatusUnauthorized {
 			t.Fatalf("agent changed connector: %d %s", rec.Code, rec.Body.String())
 		}
 	}
