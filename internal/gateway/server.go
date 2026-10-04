@@ -112,6 +112,14 @@ type toolEntry struct {
 	originalName   string // upstream-side name (without prefix)
 	reasonField    string // "_reason" (or "__toolyard_reason" if a clash forced a rename)
 	handle         directHandler
+	// preflight validates a restricted builtin before approval or grant use.
+	// Its handler must still recheck authority when it executes later.
+	preflight func(context.Context, map[string]any) error
+	// approvedPreflight refuses deferred execution without an enrollment
+	// commitment that existed when the persisted approval was created.
+	approvedPreflight func(context.Context, *approval.Request) error
+	// denyInternal prevents privileged internal dispatch for agent-only tools.
+	denyInternal bool
 	// forcedAction, when non-nil, short-circuits policy.Eval for this tool
 	// and uses the provided action instead. Used by built-in tools that
 	// need a deterministic policy decision regardless of the name-heuristic
@@ -561,7 +569,7 @@ func (g *Gateway) RegisterBuiltins() {
 func reservedUpstreamName(name string) bool {
 	switch name {
 	case builtinUpstream, "fixture", inboxUpstream, sessionUpstream, "tools", "memory", "lake", "events",
-		policiesUpstream, serversUpstream, auditUpstream, accessUpstream, toolyardServer, connectionsGroup:
+		policiesUpstream, serversUpstream, auditUpstream, accessUpstream, toolyardServer, connectionsGroup, "bks_preview":
 		return true
 	}
 	return false
@@ -997,6 +1005,18 @@ func (g *Gateway) CallInternal(ctx context.Context, viaTool, targetName string, 
 	if g.surface != nil {
 		ev.SurfaceMode = g.surface.SurfaceMode(ctx)
 	}
+	if entry.denyInternal {
+		_ = g.audit.Write(ctx, audit.Event{
+			EventType: audit.EventCallDenied, AgentID: agentID, UpstreamName: entry.upstream,
+			ToolName: entry.tool.Name, Decision: "internal-denied", ResultSummary: "agent policy route required",
+		})
+		ev.Outcome, ev.ErrorClass = metrics.OutcomeDenied, "policy"
+		ev.TotalLatencyMs = int(time.Since(started).Milliseconds())
+		if g.metrics != nil {
+			g.metrics.Record(*ev)
+		}
+		return mcp.NewToolResultError("agent policy route required"), nil
+	}
 	// We log the dispatch as already-allowed so the dashboard's audit feed
 	// shows the call. We deliberately omit the arguments blob because the
 	// ingest path treats whatever the agent posted as opaque — the redactor
@@ -1203,6 +1223,20 @@ func (g *Gateway) routeEntry(ctx context.Context, entry toolEntry, via string, a
 
 	if entry.personalGitHub && decision.Action == policy.ActionApprove {
 		decision.RequireHuman = true
+	}
+	// Validate and durably pin the operator-verified binding before an
+	// approval can wait or a grant can be consumed. Denied calls do not
+	// establish a binding. Dispatch rechecks it, including after approval.
+	if entry.preflight != nil && (decision.Action == policy.ActionAllow || decision.Action == policy.ActionApprove) {
+		if preflightErr := entry.preflight(ctx, cleanArgs); preflightErr != nil {
+			const safeFailure = "trusted preview caller/session binding unavailable"
+			_ = g.audit.Write(ctx, audit.Event{
+				EventType: audit.EventCallFailed, AgentID: agentID, UpstreamName: entry.upstream,
+				ToolName: entry.tool.Name, Reason: reason, ResultSummary: safeFailure,
+			})
+			ev.Outcome, ev.ErrorClass = metrics.OutcomeError, "identity"
+			return mcp.NewToolResultError(safeFailure), nil
+		}
 	}
 
 	// A grant only matters for calls that would otherwise need approval:
@@ -1595,6 +1629,42 @@ func budgetExceededResponse(agentID string, current, max int) *mcp.CallToolResul
 
 func (g *Gateway) dispatch(ctx context.Context, entry toolEntry, args map[string]any,
 	agentID, reason, approvalID string, ev *metrics.Event) (*mcp.CallToolResult, error) {
+	// Include the persisted approval read in the preview's execution bound.
+	// A background executor otherwise has no deadline while it waits on SQLite.
+	if entry.approvedPreflight != nil {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, 10*time.Second)
+		defer cancel()
+	}
+	// Preview approvals must still be live, exact, and backed by the
+	// original durable enrollment. Inbox grants use a separate validated
+	// instrument; their IDs are not approval_requests IDs.
+	if entry.approvedPreflight != nil && approvalID != "" && ev.ApprovalVia != "grant" {
+		var req *approval.Request
+		var approvalErr error
+		if g.approval != nil {
+			req, approvalErr = g.approval.Get(ctx, approvalID)
+		}
+		valid := approvalErr == nil && req != nil && req.Status == approval.StatusAllowed &&
+			req.AgentID == agentID && req.ToolName == entry.tool.Name && req.UpstreamName == entry.upstream &&
+			req.ExpiresAt > time.Now().UnixMilli() && req.ResultExecutedAt == 0
+		if valid {
+			valid = entry.approvedPreflight(ctx, req) == nil
+		}
+		if !valid {
+			const safeFailure = "preview approval or original enrollment is no longer valid"
+			_ = g.audit.Write(ctx, audit.Event{
+				EventType: audit.EventCallFailed, AgentID: agentID, UpstreamName: entry.upstream,
+				ToolName: entry.tool.Name, ApprovalID: approvalID, ResultSummary: safeFailure,
+			})
+			ev.Outcome, ev.ErrorClass = metrics.OutcomeError, "approval"
+			return mcp.NewToolResultError(safeFailure), nil
+		}
+		// Execute's Request argument is not authority for operation inputs.
+		// Use only the persisted parameters the reviewer approved.
+		args, reason = req.Arguments, req.Reason
+		ev.ReasonText, ev.ReasonLen = reason, len(reason)
+	}
 
 	// u is the live upstream behind this entry; nil for built-ins, the
 	// fixture and anything else that isn't in the pool. pu is set instead

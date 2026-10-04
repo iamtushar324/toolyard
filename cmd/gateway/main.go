@@ -236,6 +236,7 @@ Run 'toolyard <command> -h' for command flags.`)
 func runServe(argv []string) error {
 	fs := flag.NewFlagSet("serve", flag.ExitOnError)
 	dataDir := fs.String("data", defaultDataDir(), "directory for SQLite + keys")
+	bksPreview := fs.Bool("bks-preview", false, "enable the private BKS preview builtins only with reviewed service-owned issuer and operator registry files")
 	addr := fs.String("addr", ":8787", "HTTP listen address")
 	stdio := fs.Bool("stdio", false, "also serve MCP over stdio (for direct agent host wiring)")
 	upstreamConfig := fs.String("upstreams", "", "path to JSON file with upstream MCP server configs (optional)")
@@ -545,6 +546,11 @@ func runServe(argv []string) error {
 	})
 	gw.RegisterBuiltins()
 	defer gw.Close()
+	// Register before the restart sweep so deferred preview calls never resolve
+	// to an absent handler when this separately installed feature is enabled.
+	if err := configureBKSPreview(gw, db, *dataDir, *bksPreview); err != nil {
+		log.Print("bks-preview: disabled; trusted private configuration unavailable")
+	}
 	identityKeysSvc.SetCaller(gw)
 	// policies.set by an agent disables a tool's learned auto-approval
 	// rule on ask/deny, as the dashboard's policy editor does.

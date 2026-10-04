@@ -40,6 +40,12 @@ func (f fakeResolver) Exists(ctx context.Context, name string) (bool, error) {
 
 const RefPrefixTest = "secret://"
 
+func TestBKSPreviewNameReserved(t *testing.T) {
+	if err := validate(Server{Name: "bks_preview", Transport: "http", URL: "http://127.0.0.1:18791/mcp"}); !errors.Is(err, ErrReserved) {
+		t.Fatalf("private builtin name is not reserved: %v", err)
+	}
+}
+
 func TestMasked(t *testing.T) {
 	srv := Server{
 		Name: "github",

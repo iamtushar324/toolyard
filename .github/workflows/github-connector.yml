@@ -17,6 +17,10 @@ on:
       - '.github/workflows/github-connector.yml'
 permissions:
   contents: read
+# Two hosted jobs at most. Do not add deployment or runtime activation here.
+concurrency:
+  group: connector-preview-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 jobs:
   validate:
     runs-on: ubuntu-24.04-arm
@@ -28,10 +32,26 @@ jobs:
       - uses: actions/setup-go@v5
         with:
           go-version-file: go.mod
+      - name: Prepare private contract test directory
+        shell: bash
+        run: |
+          preview_test_tmp="$(mktemp -d "$HOME/bks-preview-ci.XXXXXX")"
+          echo "TMPDIR=$preview_test_tmp" >> "$GITHUB_ENV"
+          echo "PYTHONDONTWRITEBYTECODE=1" >> "$GITHUB_ENV"
       - name: Check formatting and dashboard syntax
         run: |
           test -z "$(gofmt -l internal cmd)"
           node --check web/dashboard/app.js
+      - name: Compile the complete module without test execution
+        run: go test -p 2 -parallel 2 ./... -run '^$' -timeout=180s
+      - name: Test preview identity, gateway, startup, transport and Python contract
+        run: |
+          go test -p 2 -parallel 2 ./internal/previewassertion -count=1 -timeout=180s -v
+          go test -p 2 -parallel 2 ./internal/gateway ./internal/upstreams ./cmd/gateway -run 'Preview|BKSPreview' -count=1 -timeout=180s -v
+      - name: Check preview races and immutable enrollment
+        run: |
+          go test -race -p 2 -parallel 2 ./internal/previewassertion -count=1 -timeout=180s -v
+          go test -race -p 2 -parallel 2 ./internal/gateway ./cmd/gateway -run 'Preview|BKSPreview' -count=1 -timeout=180s -v
       - name: Test connector and access boundaries
         run: go test -p 2 -parallel 2 ./internal/githubapi ./internal/gateway ./internal/oauth ./internal/upstreams ./internal/api ./internal/approval ./internal/realtime ./internal/chatnotify -run 'GitHub|RoleGuard|PerUser|UserToken|User.*Refresh|Approval|Export|Actor|Connection|Decide' -count=1 -timeout=180s
       - name: Check GitHub concurrency
@@ -46,3 +66,25 @@ jobs:
           name: toolyard-github-${{ github.sha }}
           path: dist/toolyard
           retention-days: 7
+  preview-darwin:
+    runs-on: macos-latest
+    timeout-minutes: 15
+    env:
+      GOMAXPROCS: '2'
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - name: Prepare private contract test directory
+        shell: bash
+        run: |
+          preview_test_tmp="$(mktemp -d "$HOME/bks-preview-ci.XXXXXX")"
+          echo "TMPDIR=$preview_test_tmp" >> "$GITHUB_ENV"
+          echo "PYTHONDONTWRITEBYTECODE=1" >> "$GITHUB_ENV"
+      - name: Compile the complete Darwin module without test execution
+        run: go test -p 2 -parallel 2 ./... -run '^$' -timeout=180s
+      - name: Test Darwin private file and identity contracts
+        run: |
+          go test -p 2 -parallel 2 ./internal/previewassertion -count=1 -timeout=180s -v
+          go test -p 2 -parallel 2 ./cmd/gateway -run BKSPreview -count=1 -timeout=180s -v

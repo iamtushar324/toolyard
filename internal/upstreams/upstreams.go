@@ -332,7 +332,7 @@ func validate(srv Server) error {
 	// from the dashboard.
 	switch srv.Name {
 	case "builtin", "fixture", "memory", "tools", "mempalace", "notes", "skills",
-		"inbox", "session", "lake", "events", "policies", "servers", "audit", "access", "toolyard", "connections":
+		"inbox", "session", "lake", "events", "policies", "servers", "audit", "access", "toolyard", "connections", "bks_preview":
 		return ErrReserved
 	}
 	switch srv.Transport {
