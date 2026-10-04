@@ -401,8 +401,9 @@ func (s *Service) ConsumeHandoff(ctx context.Context, code string) (string, erro
 		return "", err
 	}
 	defer tx.Rollback()
+	now := s.now().UnixMilli()
 	var userID string
-	err = tx.QueryRowContext(ctx, `UPDATE federation_handoffs SET consumed_at=? WHERE code_hash=? AND consumed_at IS NULL AND expires_at>? AND issuer IN (SELECT issuer FROM federation_issuers WHERE status='active') AND EXISTS (SELECT 1 FROM federation_connections c JOIN agents a ON a.id=c.agent_id WHERE c.issuer=federation_handoffs.issuer AND c.user_id=federation_handoffs.user_id AND c.status='active' AND c.expires_at>federation_handoffs.expires_at AND a.disabled=0) AND user_id IN (SELECT id FROM users WHERE status='active') RETURNING user_id`, s.now().UnixMilli(), hex.EncodeToString(sum[:]), s.now().UnixMilli()).Scan(&userID)
+	err = tx.QueryRowContext(ctx, `UPDATE federation_handoffs SET consumed_at=? WHERE code_hash=? AND consumed_at IS NULL AND expires_at>? AND issuer IN (SELECT issuer FROM federation_issuers WHERE status='active') AND EXISTS (SELECT 1 FROM federation_connections c JOIN agents a ON a.id=c.agent_id WHERE c.issuer=federation_handoffs.issuer AND c.user_id=federation_handoffs.user_id AND c.status='active' AND c.expires_at>? AND a.disabled=0) AND user_id IN (SELECT id FROM users WHERE status='active') RETURNING user_id`, now, hex.EncodeToString(sum[:]), now, now).Scan(&userID)
 	if err != nil {
 		return "", ErrUnauthorized
 	}

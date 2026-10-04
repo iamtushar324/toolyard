@@ -3802,7 +3802,7 @@ function renderChatCard() {
   return el('div', { class: 'card' },
     el('h2', {}, 'Chat notifications', pill(statusText, statusOk)),
     el('p', { class: 'meta' },
-      'Get pending approvals in Telegram with inline Approve / Deny buttons — usable from anywhere, no public URL needed (the bot uses outbound long-polling).'),
+      'Get request updates in Telegram. Open Toolyard Inbox to review and submit the complete decision.'),
     el('div', { style: 'display:flex; gap:8px; align-items:center; margin-top:8px;' },
       el('input', {
         type: 'password', placeholder: 'BotFather token (123456:ABC-DEF…)',

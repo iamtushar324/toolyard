@@ -143,7 +143,8 @@ type SentMessage struct {
 // InlineButton is one inline keyboard button.
 type InlineButton struct {
 	Text         string `json:"text"`
-	CallbackData string `json:"callback_data"`
+	CallbackData string `json:"callback_data,omitempty"`
+	URL          string `json:"url,omitempty"`
 }
 
 // SendMessage posts a message, optionally with a single row of inline buttons.

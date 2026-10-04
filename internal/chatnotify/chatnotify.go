@@ -1,7 +1,7 @@
 // Package chatnotify fans approval-bus events out to chat channels (Telegram
 // first; the Channel interface is pluggable so Slack can follow). It registers
 // as an approval.Notifier: on approval.create it posts a message with
-// Approve/Deny buttons; on decide/expire/cancel/executed it edits that message
+// Inbox review links; on decide/expire/cancel/executed it edits that message
 // in place and strips the buttons.
 //
 // The Registry owns the chat_messages table (one row per approval+channel),
@@ -38,7 +38,7 @@ type Channel interface {
 	// Ready reports whether the channel is configured + paired and able to
 	// deliver. The Registry skips unready channels.
 	Ready() bool
-	// SendApproval posts a new approval message with Approve/Deny controls
+	// SendApproval posts a new notification with an Inbox review link
 	// keyed by approvalID, returning a ref to the posted message.
 	SendApproval(ctx context.Context, approvalID, text string) (MessageRef, error)
 	// UpdateApproval edits a previously-posted message's text and removes

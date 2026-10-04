@@ -406,24 +406,22 @@ func runServe(argv []string) error {
 			// minimizes what a key compromise could reveal. The dashboard
 			// fills in details when the user opens the approval card.
 			n := push.Notification{
-				Title:    "toolyard approval needed",
+				Title:    "toolyard Inbox decision needed",
 				Body:     fmt.Sprintf("%s · %s — tap to review", req.UpstreamName, req.ToolName),
-				URL:      "/?approval=" + req.ID,
+				URL:      "/#inbox/" + req.ID,
 				Approval: req.ID,
 				Tag:      req.ID,
 			}
-			// The decision token is minted for this recipient, so a tap
-			// through it is recorded as their decision.
+			// Legacy calls keep their original execution mode, but all
+			// permission review happens in Inbox. Do not mint an approval
+			// token for a second notification decision interface.
 			payload := map[string]any{
-				"title":          n.Title,
-				"body":           n.Body,
-				"url":            n.URL,
-				"approval_id":    req.ID,
-				"decision_token": bus.DecisionTokenFor(req.ID, user.ID),
-				"tag":            req.ID,
-				// Non-secret label (upstream · tool, same as the body) so
-				// the service worker can show "✓ Approved — github · …".
-				"tool": req.UpstreamName + " · " + req.ToolName,
+				"kind":        "inbox",
+				"title":       n.Title,
+				"body":        n.Body,
+				"url":         n.URL,
+				"approval_id": req.ID,
+				"tag":         req.ID,
 			}
 			_ = pushSvc.Notify(ctx, user.ID, payload)
 		}
@@ -816,22 +814,9 @@ func runServe(argv []string) error {
 		return settingsSvc.GetBoolDefault(settings.ChatIncludeDetails, true)
 	})
 	telegramSvc := telegram.New(telegram.Options{
-		Settings: settingsSvc,
-		Cipher:   secretsCipher,
-		Decide: func(ctx context.Context, id, action, decidedBy string) (string, bool, error) {
-			// The paired Telegram user is the instrument and the only
-			// identity recorded: nothing links a Telegram id to a
-			// toolyard user, so no person is attributed. See
-			// telegramDecider.
-			req, derr := bus.DecideAs(ctx, id, action, telegramDecider(decidedBy))
-			if derr != nil {
-				if errors.Is(derr, approval.ErrNotPending) {
-					return "", true, nil
-				}
-				return "", false, derr
-			}
-			return req.Status, false, nil
-		},
+		Settings:  settingsSvc,
+		Cipher:    secretsCipher,
+		PublicURL: *publicURL,
 	})
 	chatRegistry.Register(telegramSvc)
 	bus.AddNotifier(chatRegistry)

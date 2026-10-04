@@ -217,3 +217,99 @@ func TestFederationEnvironmentRestoreAndHandoff(t *testing.T) {
 		t.Fatal("old credential restored")
 	}
 }
+
+func TestFederationHandoffCredentialConsumptionExpiry(t *testing.T) {
+	for _, tc := range []struct {
+		name               string
+		credentialLifetime time.Duration
+		consumeAfter       time.Duration
+		wantUnauthorized   bool
+	}{
+		{name: "valid credential with fifty seconds remaining", credentialLifetime: 50 * time.Second},
+		{name: "credential expires before code", credentialLifetime: 50 * time.Second, consumeAfter: 50 * time.Second, wantUnauthorized: true},
+		{name: "code expires before credential", credentialLifetime: 90 * time.Second, consumeAfter: time.Minute, wantUnauthorized: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, _, key := federationFixture(t)
+			ctx := t.Context()
+			issuedAt := time.Date(2026, time.October, 4, 12, 0, 0, 0, time.UTC)
+			now := issuedAt
+			s.now = func() time.Time { return now }
+			p := principal(t, s, key, "stage", "alice")
+			connection, err := s.Connect(ctx, p, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, err = s.db.ExecContext(ctx, `UPDATE federation_connections SET expires_at=? WHERE agent_id=?`, issuedAt.Add(tc.credentialLifetime).UnixMilli(), connection.AgentID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			code, expiresAt, err := s.Handoff(ctx, p, p.Origin+"/settings")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !expiresAt.Equal(issuedAt.Add(time.Minute)) {
+				t.Fatal("unexpected handoff deadline", expiresAt)
+			}
+			now = issuedAt.Add(tc.consumeAfter)
+			userID, err := s.ConsumeHandoff(ctx, code)
+			if tc.wantUnauthorized {
+				if !errors.Is(err, ErrUnauthorized) || userID != "" {
+					t.Fatal("expired permission accepted", err)
+				}
+				return
+			}
+			if err != nil || userID != p.User.ID {
+				t.Fatal("still-valid credential handoff refused", err)
+			}
+			if _, err = s.ConsumeHandoff(ctx, code); !errors.Is(err, ErrUnauthorized) {
+				t.Fatal("handoff replay accepted", err)
+			}
+		})
+	}
+}
+
+func TestFederationHandoffConsumptionRejectsInactiveAccess(t *testing.T) {
+	for _, lifecycle := range []string{"user connection revoked", "environment revoked", "agent disabled", "user disabled"} {
+		t.Run(lifecycle, func(t *testing.T) {
+			s, admin, key := federationFixture(t)
+			ctx := t.Context()
+			fixedNow := time.Date(2026, time.October, 4, 12, 0, 0, 0, time.UTC)
+			s.now = func() time.Time { return fixedNow }
+			p := principal(t, s, key, "stage", "alice")
+			connection, err := s.Connect(ctx, p, 0)
+			if err != nil {
+				t.Fatal(err)
+			}
+			code, _, err := s.Handoff(ctx, p, p.Origin+"/settings")
+			if err != nil {
+				t.Fatal(err)
+			}
+			switch lifecycle {
+			case "user connection revoked":
+				err = s.Revoke(ctx, p, "user")
+			case "environment revoked":
+				adminPrincipal := &Principal{Issuer: p.Issuer, Subject: admin.ClerkUserID, Origin: p.Origin, User: admin}
+				err = s.Revoke(ctx, adminPrincipal, "environment")
+			case "agent disabled":
+				_, err = s.db.ExecContext(ctx, `UPDATE agents SET disabled=1 WHERE id=?`, connection.AgentID)
+			case "user disabled":
+				_, err = s.db.ExecContext(ctx, `UPDATE users SET status='blocked' WHERE id=?`, p.User.ID)
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			userID, err := s.ConsumeHandoff(ctx, code)
+			if !errors.Is(err, ErrUnauthorized) || userID != "" {
+				t.Fatal("inactive access accepted an unconsumed handoff", err)
+			}
+			var consumed int
+			if err = s.db.QueryRowContext(ctx, `SELECT count(*) FROM federation_handoffs WHERE consumed_at IS NOT NULL`).Scan(&consumed); err != nil {
+				t.Fatal(err)
+			}
+			if consumed != 0 {
+				t.Fatal("rejected handoff was consumed")
+			}
+		})
+	}
+}
