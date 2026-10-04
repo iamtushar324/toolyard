@@ -324,7 +324,17 @@ func Validate(ctx context.Context, cat Catalog, agentID string, s *Submission, o
 	return r, probs, warns
 }
 
+// checkText validates required agent narrative, including known placeholders.
 func checkText(add func(string, string, ...any), path, v string, max int, hint string) {
+	checkBoundedText(add, path, v, max, hint)
+	if v != "" && utf8.RuneCountInString(v) <= max && isPlaceholder(v) {
+		add(path, "placeholder text; replace it with concrete task information")
+	}
+}
+
+// Choice labels are user answers, not explanations. "None" and "Test" can
+// be meaningful choices and still require nonempty, bounded text.
+func checkBoundedText(add func(string, string, ...any), path, v string, max int, hint string) {
 	n := utf8.RuneCountInString(v)
 	switch {
 	case n == 0:
@@ -333,8 +343,6 @@ func checkText(add func(string, string, ...any), path, v string, max int, hint s
 		} else {
 			add(path, "missing")
 		}
-	case isPlaceholder(v):
-		add(path, "placeholder text; replace it with concrete task information")
 	case n > max:
 		add(path, "%d characters; max %d", n, max)
 	}

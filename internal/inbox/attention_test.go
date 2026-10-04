@@ -196,7 +196,16 @@ func TestQuietHoursHoldAndAllowList(t *testing.T) {
 	}
 	s = deploySubmission()
 	s.Urgency = UrgencyNow
-	s.Tools = append(s.Tools, SubmissionTool{Tool: "slack.post_message", Required: false, Summary: "Tell the team.", Params: map[string]any{"channel": "#eng"}})
+	s.Tools = append(s.Tools, SubmissionTool{
+		CallID: "notify_team", Tool: "slack.post_message", Required: false,
+		Summary: "Tell the engineering team that billing v2 is deployed.",
+		Target:  "Slack channel #eng", Operation: "write",
+		ExpectedEffects: "The engineering team sees the billing v2 deployment notice.",
+		AffectedScope:   "One deployment notice in Slack channel #eng.",
+		MaterialRisks:   "An incorrect notice can confuse the engineering team.",
+		Undo:            "Delete the deployment notice from Slack channel #eng.",
+		Params:          map[string]any{"channel": "#eng"},
+	})
 	mustSubmit(t, e2, "ag_1", s)
 	if got := log2.take(); len(got) != 0 {
 		t.Fatalf("a tool off the allow list broke through: %+v", got)

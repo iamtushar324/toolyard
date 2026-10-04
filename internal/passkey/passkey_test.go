@@ -197,10 +197,10 @@ func TestInboxGate(t *testing.T) {
 	submit := func() *inbox.Request {
 		res, err := svc.Submit(ctx, "ag_1", &inbox.Submission{Kind: inbox.KindAccess, Title: "Deploy api", Summary: "s",
 			Message: "I'd like to deploy the api to production.", Audio: inbox.Audio{Script: "Deploy?"}, Urgency: inbox.UrgencySoon,
-			Facts: &inbox.Facts{WhyNow: "w", IfItGoesWrong: "g", Undo: "u"},
+			Task: &inbox.TaskContext{Objective: "Release the reviewed API change and record its result."}, Facts: &inbox.Facts{WhyNow: "The reviewed release is ready.", IfItGoesWrong: "The deployment can interrupt the API.", Undo: "Restore the prior release."},
 			Tools: []inbox.SubmissionTool{
-				{Tool: "deploy.run", Required: false, Summary: "Deploy to production.", Params: map[string]any{"env": "prod"}},
-				{Tool: "github.comment", Required: false, Summary: "Comment on the PR.", Params: map[string]any{"pr": 12}},
+				{CallID: "deploy", Tool: "deploy.run", Required: false, Summary: "Deploy to production.", Target: "The production API", ExpectedEffects: "Replace the API release.", Operation: "write", AffectedScope: "The API release", MaterialRisks: "The API can stop responding.", Undo: "Restore the prior release.", Params: map[string]any{"env": "prod"}},
+				{CallID: "comment", Tool: "github.comment", Required: false, Summary: "Comment on the PR.", Target: "PR 12", ExpectedEffects: "Add the release result to the review.", Operation: "write", AffectedScope: "One PR comment", MaterialRisks: "The comment is visible to repository users.", Undo: "Delete the comment.", Params: map[string]any{"pr": 12}},
 			}})
 		if err != nil || !res.OK {
 			t.Fatalf("submit: %v %+v", err, res)
@@ -210,26 +210,34 @@ func TestInboxGate(t *testing.T) {
 		return r
 	}
 
+	decision := func(r *inbox.Request, deploy bool) inbox.Decision {
+		dv := inbox.VerdictRejected
+		if deploy {
+			dv = inbox.VerdictAccepted
+		}
+		return inbox.Decision{Action: "approve", RequestRevision: r.Revision, SubmissionID: "passkey-decision", Allow: []bool{deploy, true}, Verdicts: map[string]inbox.CallVerdict{"deploy": {Verdict: dv}, "comment": {Verdict: inbox.VerdictAccepted}}}
+	}
+
 	// No passkey registered: the two-tap confirm in the dashboard is enough.
 	r := submit()
 	if !inbox.HighRisk(r) {
 		t.Fatal("deploy to prod should be high risk")
 	}
-	if _, err := svc.Decide(ctx, r.ID, inbox.Decision{Action: "approve", Allow: []bool{true, true}}); err != nil {
+	if _, err := svc.Decide(ctx, r.ID, decision(r, true)); err != nil {
 		t.Fatalf("approve without passkeys registered: %v", err)
 	}
 
 	a := newSoftAuth(testOrigin)
 	pk := register(t, s, a)
 	r = submit()
-	d := inbox.Decision{Action: "approve", Allow: []bool{true, true}}
+	d := decision(r, true)
 	if _, err := svc.Decide(ctx, r.ID, d); !errors.Is(err, inbox.ErrPasskeyRequired) {
 		t.Fatalf("high-risk approve without passkey: %v", err)
 	}
 	// Low-risk tools alone don't need it.
-	low := inbox.Decision{Action: "approve", Allow: []bool{false, true}}
+	low := decision(r, false)
 	r2 := submit()
-	if _, err := svc.Decide(ctx, r2.ID, low); err != nil {
+	if _, err := svc.Decide(ctx, r2.ID, decision(r2, false)); err != nil {
 		t.Fatalf("low-risk approve: %v", err)
 	}
 	// A confirmation made for "allow only the comment" can't allow the deploy.
@@ -238,7 +246,7 @@ func TestInboxGate(t *testing.T) {
 	if _, err := svc.Decide(ctx, r.ID, d); !errors.Is(err, inbox.ErrPasskeyFailed) {
 		t.Fatalf("confirmation for another decision: %v", err)
 	}
-	cid, opts, _ = s.BeginAssertion(ctx, owner, "decide:"+inbox.DecisionDigest(r.ID, inbox.Decision{Action: "approve", Allow: []bool{true, true}}), testOrigin, "yard.example.com")
+	cid, opts, _ = s.BeginAssertion(ctx, owner, "decide:"+inbox.DecisionDigest(r.ID, decision(r, true)), testOrigin, "yard.example.com")
 	d.Passkey = &inbox.PasskeyAssertion{SessionID: cid, Response: get(t, a, opts, owner.ID)}
 	got, err := svc.Decide(ctx, r.ID, d)
 	if err != nil || got.Status != inbox.StatusApproved {

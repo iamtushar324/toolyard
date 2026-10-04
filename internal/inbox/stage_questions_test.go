@@ -78,3 +78,33 @@ func TestStageFreeTextOnlyQuestion(t *testing.T) {
 		t.Fatalf("answer: %+v %v", got, err)
 	}
 }
+
+// Short answer labels can be legitimate even when the same word is not useful
+// permission context. Bounds still apply to all choice labels.
+func TestStageQuestionLabelsPreserveAnswersAndBounds(t *testing.T) {
+	e := newEnv(t)
+	for _, tc := range []struct {
+		label string
+		valid bool
+	}{
+		{"None", true}, {"Test", true}, {"   ", false}, {strings.Repeat("x", MaxOptionLabel+1), false},
+	} {
+		s := &Submission{SchemaVersion: 2, Kind: KindQuestion, Prompt: "Which action must run?", Question: &Question{Type: "single_choice", Options: []Option{{ID: "choice", Label: tc.label}, {ID: "other", Label: "Deploy"}}}}
+		got, err := e.svc.Submit(context.Background(), "ag_stage", s)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got.OK != tc.valid {
+			t.Fatalf("label %q: valid=%v, response=%+v", tc.label, tc.valid, got)
+		}
+		if !tc.valid {
+			found := false
+			for _, p := range got.Problems {
+				found = found || p.Path == "question.options[0].label"
+			}
+			if !found {
+				t.Fatalf("missing label correction: %+v", got.Problems)
+			}
+		}
+	}
+}

@@ -102,6 +102,14 @@ func (f *actorFixture) call(t *testing.T, ctx context.Context, via, tool string,
 	return res
 }
 
+// Inline decision attribution belongs to the historical approval bus path.
+func newLegacyActorFixture(t *testing.T) *actorFixture {
+	t.Helper()
+	f := newActorFixture(t)
+	f.gw.SetInbox(nil, nil, nil)
+	return f
+}
+
 func (f *actorFixture) lastRaiser(t *testing.T) (actor.Raiser, map[string]any) {
 	t.Helper()
 	f.mu.Lock()
@@ -446,7 +454,7 @@ func TestExecuteKeepsRaiserAndApprovalMetrics(t *testing.T) {
 // A request held in-line and decided by an auto-rule or a person records
 // that decider on the allowed row and the metric.
 func TestHoldAndWaitRecordsDecider(t *testing.T) {
-	f := newActorFixture(t)
+	f := newLegacyActorFixture(t)
 	f.gw.inLineWait = 2 * time.Second
 	ctx := WithAgentID(context.Background(), "ag_1")
 	done := make(chan *mcp.CallToolResult, 1)
@@ -543,7 +551,7 @@ func (fakeAuto) IsDestructive(context.Context, string) bool         { return fal
 // row later (resumeDeferred, Execute); the audit row names the rule (the
 // rule decided, not the person who created it).
 func TestApprovalMetricsAgreeInlineAndReread(t *testing.T) {
-	f := newActorFixture(t)
+	f := newLegacyActorFixture(t)
 	f.bus.SetAutoApprover(fakeAuto{rule: "rule_1", creator: "u_creator"})
 	ctx := WithAgentID(context.Background(), "ag_1")
 	f.drainAudit()

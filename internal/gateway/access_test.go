@@ -184,6 +184,15 @@ func (f *accessFixture) call(t *testing.T, ctx context.Context, tool string, arg
 	return res
 }
 
+// Historical bus tests exercise the gateway before the Inbox was attached.
+// Ordinary access fixtures retain the current coaching path for new calls.
+func newLegacyAccessFixture(t *testing.T) *accessFixture {
+	t.Helper()
+	f := newAccessFixture(t, nil)
+	f.gw.SetInbox(nil, nil, nil)
+	return f
+}
+
 // mcpToolsList runs tools/list through the MCP server so the registered tool
 // filters apply, and returns the tool names.
 func mcpToolsList(t *testing.T, g *Gateway, ctx context.Context) []string {
@@ -522,7 +531,7 @@ func TestAccessSearchAndCatalogFor(t *testing.T) {
 }
 
 func TestAccessExecuteRechecksScope(t *testing.T) {
-	f := newAccessFixture(t, nil)
+	f := newLegacyAccessFixture(t)
 	f.res.set(memberID, groups("alpha", "beta"))
 
 	queue := func() *approval.Request {

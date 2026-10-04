@@ -62,12 +62,18 @@ func isOperatorRequest(r *http.Request) bool {
 
 // operatorNeverPaths can't be reached with an operator token at all.
 var operatorNeverPaths = map[string]bool{
-	"/v1/inbox/voice-key":    true,
-	"/v1/auth/setup":         true,
-	"/v1/auth/login":         true,
-	"/v1/auth/logout":        true,
-	"/v1/auth/clerk/session": true,
-	"/v1/connect/t3":         true,
+	"/v1/inbox/voice-key":          true,
+	"/v1/auth/setup":               true,
+	"/v1/auth/login":               true,
+	"/v1/auth/logout":              true,
+	"/v1/auth/clerk/session":       true,
+	"/v1/connect/t3":               true,
+	"/v1/federation/register":      true,
+	"/v1/federation/":              true,
+	"/v1/callbacks/receivers":      true,
+	"/v1/callbacks/receivers/":     true,
+	"/v1/callbacks/retry/":         true,
+	"/v1/admin/callback-receivers": true,
 }
 
 // operatorOwnerPrefixes need the owner scope for any non-GET method.
@@ -392,6 +398,12 @@ type operatorCatalogEntry struct {
 // operatorCatalog lists every /v1 path the server registers (a test keeps it
 // complete). {id} marks a path segment.
 var operatorCatalog = []operatorCatalogEntry{
+	{"/v1/federation/register", "POST", "administrator server trust registration (fresh verified Clerk session only)"},
+	{"/v1/federation/{id}", "POST", "connect, handoff, or revoke (registered server assertions only)"},
+	{"/v1/callbacks/receivers", "POST", "register an immutable generic callback receiver (agent Bearer only)"},
+	{"/v1/callbacks/receivers/{id}", "GET PATCH", "inspect, disable, rotate, or remove an owned receiver (agent Bearer only)"},
+	{"/v1/callbacks/retry/{id}", "POST", "retry failed owned delivery (agent Bearer only)"},
+	{"/v1/admin/callback-receivers", "POST", "register an administrator-owned private destination (browser only)"},
 	{"/v1/health", "GET", "liveness"},
 	{"/v1/auth/setup", "POST", "first-user bootstrap (browser only)"},
 	{"/v1/auth/login", "POST", "password login (browser only)"},

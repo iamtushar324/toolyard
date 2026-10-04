@@ -129,7 +129,7 @@ func validateQuestion(r *Request, s *Submission, add func(string, string, ...any
 		}
 		ids[o.ID] = true
 		o.Label = strings.TrimSpace(o.Label)
-		checkText(add, p+".label", o.Label, MaxOptionLabel, "")
+		checkBoundedText(add, p+".label", o.Label, MaxOptionLabel, "")
 		label := strings.ToLower(o.Label)
 		if labels[label] {
 			add(p+".label", "duplicate label")
