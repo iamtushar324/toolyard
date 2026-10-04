@@ -55,6 +55,8 @@ def main():
     parser.add_argument('--credentials', required=True)
     parser.add_argument('--output', required=True)
     parser.add_argument('--base-url', default=DEFAULT_BASE)
+    parser.add_argument('--expected-environment', default='stage')
+    parser.add_argument('--expected-version')
     args = parser.parse_args()
     base = args.base_url.rstrip('/')
     parsed = urllib.parse.urlsplit(base)
@@ -112,8 +114,10 @@ def main():
     health_response = request(owner, 'GET', '/v1/health')
     health_response.raise_for_status()
     health = health_response.json()
-    assert health['environment'] == 'stage', 'Smoke test requires stage metadata'
-    checks = ['HTTPS, stage metadata, and secure login cookie']
+    assert health['environment'] == args.expected_environment, 'Unexpected deployment environment'
+    if args.expected_version:
+        assert health['version'] == args.expected_version, 'Unexpected deployed version'
+    checks = ['HTTPS, expected deployment metadata, and secure login cookie']
     assert requests.get(base + '/v1/inbox', timeout=15, allow_redirects=False).status_code == 401
     checks.append('Unauthenticated Inbox refused')
     invalid = request(owner, 'POST', '/v1/inbox/missing/decide', json={'action': 'deny'}, headers={'Origin': 'https://wrong.example'})
