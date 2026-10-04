@@ -1,6 +1,6 @@
 //go:build !linux && !darwin
 
-package previewassertion
+package trustedmcp
 
 // Unsupported platforms keep the preview feature closed without affecting
 // ordinary Toolyard startup or silently weakening private file guarantees.

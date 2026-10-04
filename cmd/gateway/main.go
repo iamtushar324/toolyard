@@ -236,7 +236,8 @@ Run 'toolyard <command> -h' for command flags.`)
 func runServe(argv []string) error {
 	fs := flag.NewFlagSet("serve", flag.ExitOnError)
 	dataDir := fs.String("data", defaultDataDir(), "directory for SQLite + keys")
-	bksPreview := fs.Bool("bks-preview", false, "enable the private BKS preview builtins only with reviewed service-owned issuer and operator registry files")
+	assertionProfiles := fs.Bool("trusted-mcp-profiles", false, "enable reviewed operator assertion profiles for normal MCP upstreams")
+	legacyPreview := fs.Bool("bks-preview", false, "deprecated alias for trusted-mcp-profiles; does not register any server")
 	addr := fs.String("addr", ":8787", "HTTP listen address")
 	stdio := fs.Bool("stdio", false, "also serve MCP over stdio (for direct agent host wiring)")
 	upstreamConfig := fs.String("upstreams", "", "path to JSON file with upstream MCP server configs (optional)")
@@ -546,10 +547,12 @@ func runServe(argv []string) error {
 	})
 	gw.RegisterBuiltins()
 	defer gw.Close()
-	// Register before the restart sweep so deferred preview calls never resolve
-	// to an absent handler when this separately installed feature is enabled.
-	if err := configureBKSPreview(gw, db, *dataDir, *bksPreview); err != nil {
-		log.Print("bks-preview: disabled; trusted private configuration unavailable")
+	upstreamSvc := upstreams.New(db, gw)
+	upstreamSvc.SetPolicy(upstreams.Policy{AllowStdio: !*noStdioUpstreams, EnvDenylist: splitCSV(*envDenylistFlag)})
+	configureAssertionProvider(upstreamSvc, db, *dataDir, *assertionProfiles || *legacyPreview)
+	// Only reviewed local catalogs load before the deferred execution sweep.
+	if err := upstreamSvc.LoadAssertions(ctx); err != nil {
+		log.Print("assertion profiles: unavailable; ordinary upstream startup continues")
 	}
 	identityKeysSvc.SetCaller(gw)
 	// policies.set by an agent disables a tool's learned auto-approval
@@ -715,11 +718,6 @@ func runServe(argv []string) error {
 	log.Printf("toolyard: inbox ready (approval_mode=%s, judge=%v)",
 		settingsSvc.GetString(settings.ApprovalMode, settings.ApprovalModeExecute), inboxJudge != nil)
 
-	upstreamSvc := upstreams.New(db, gw)
-	upstreamSvc.SetPolicy(upstreams.Policy{
-		AllowStdio:  !*noStdioUpstreams,
-		EnvDenylist: splitCSV(*envDenylistFlag),
-	})
 	// Registry upstreams: servers whose identity setting has register =
 	// true expose the upsert-/delete-bifrost-virtual-key-actor tools.
 	identityKeysSvc.SetRegistries(identitykeys.RegistryListerFunc(func(ctx context.Context) ([]string, error) {

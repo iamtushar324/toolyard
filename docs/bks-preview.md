@@ -1,136 +1,150 @@
-# BKS Kubernetes Preview MCP
+# BKS Preview through a normal MCP upstream
 
-This integration is **uninstalled and disabled by default**. Its draft PR is
-not an installation, a live Kubernetes deployment, or a working preview URL.
-Toolyard queues bounded requests. It never holds branch builds or Kubernetes jobs.
+This draft is uninstalled and disabled by default. Contract tests do not prove a
+live preview, private route, real enrollment or full Kubernetes job. BKS owns
+source resolution, CI dispatch, Kubernetes, databases, leases, results and cleanup.
+Toolyard authorizes tool access; BKS independently authorizes environment owners.
 
-## Fixed catalog
+## Generic connector
 
-| Toolyard builtin | Control operation | Scope |
-| --- | --- | --- |
-| `bks_preview.create` | `preview_create` | Queue a same-repository source with a reviewed synthetic snapshot |
-| `bks_preview.inspect` | `preview_inspect` | Read owned environment metadata |
-| `bks_preview.heartbeat` | `preview_heartbeat` | Report owned real activity without extending the absolute deadline |
-| `bks_preview.release` | `preview_release` | Release this caller's job or ownership |
-| `bks_preview.snapshots` | `preview_snapshots` | Read the reviewed synthetic catalog |
-| `bks_preview.results` | `preview_results` | Read owned durable result receipts, not raw logs |
+Use a normal HTTP upstream with `auth_mode: per_user` and an `assertion_profile`
+identifier. This selects a reusable agent assertion provider instead of OAuth.
+Ordinary OAuth and identity-header forwarding remain unchanged. Assertion profiles
+reject static headers, environment overrides, OAuth/PAT and identity forwarding.
 
-These are local builtins, not a generic upstream registration. Startup makes no
-network request. The reserved `bks_preview` prefix cannot be an external server.
-Normal access, `_reason`, policy, approval, grant, audit, metrics, deferred
-execution and timeouts still apply. The privileged `CallInternal` route refuses
-these tools. No forced policy override is used. Annotations do not grant access.
+The service-owned profile supplies endpoint, signing metadata, protocol version,
+bounds and an operation allowlist. There is no BKS-specific Go registration.
+`config/preview-mcp.profile.json` defines the pilot configuration:
 
-The current policy name heuristic does not recognize all preview read names.
-Default approval is therefore expected. This PR creates no policy or access grant.
-The control service's independent ownership and cost gates remain authoritative.
+| Alias under `bks_preview` | Remote operation |
+| --- | --- |
+| create | preview_create |
+| inspect | preview_inspect |
+| heartbeat | preview_heartbeat |
+| release | preview_release |
+| snapshots | preview_snapshots |
+| results | preview_results |
 
-## Disabled startup and private configuration
+Startup registers a reviewed local projection without network access. Each call
+initializes authenticated MCP, discovers tools, verifies the allowlist and schemas,
+then calls the mapped operation. Unlisted tools never enter Toolyard's catalog.
+Normal permissions, `_reason`, policy, approvals, grants, audit, metrics and deferred
+execution apply. There is no forced policy. Internal privileged calls are refused.
+Annotations do not grant permissions. Default policy can still require approval.
 
-The `serve` flag `-bks-preview` defaults to false. It has no environment-variable
-alternative. A future reviewed installation must explicitly enable it with these
-fixed files under the service's own `-data` directory:
+## Default-off profiles and verified identity
 
-- `bks-preview/assertion.key`: private issuer bytes, 32–4096 bytes.
-- `bks-preview/bindings.json`: the bounded private operator registry, at most 64 KiB.
+`serve -trusted-mcp-profiles` defaults to false. `-bks-preview` is a deprecated alias
+for this generic gate; it creates no server. New profile upstreams save disabled.
+Missing private configuration does not break ordinary startup.
 
-Do not place either file in an agent-readable home or a shared runtime directory.
-No file, directory, key, account, enrollment or listener is created by this adapter.
-Missing, invalid or unsafe configuration leaves the preview catalog absent and
-ordinary Toolyard startup available. An empty version-one registry binds nobody
-and refuses all callers. Unsupported secure-file platforms remain closed.
+Future operator installation requires these files below the service data path:
 
-Files must be service-owned private regular files with one link and no executable
-bits. The immediate directory must be service-owned and private. Every ancestor
-must belong to root or the service and deny group/other writes. Descriptor-based
-no-follow traversal rejects symbolic links, unsafe ancestors and path substitution.
-macOS installations must use a real absolute path, not a symlinked `/tmp` path.
-The registry and issuer file are reread and revalidated, not trusted from startup.
-Operators must publish private temporary files by atomic rename in the protected
-directory. The service and privileged host administrators are trusted issuers.
+```text
+trusted-mcp/<reviewed-profile-id>/profile.json
+trusted-mcp/<reviewed-profile-id>/assertion.key
+trusted-mcp/<reviewed-profile-id>/bindings.json
+```
 
-## Operator identity proof and durable ledger
+Files must be service-owned private regular files with one link. The immediate
+directory must be private. Ancestors must belong to root or the service and deny
+group/other writes. No-follow descriptor traversal rejects symlinks. Unsupported
+platforms refuse access. An empty registry authorizes nobody.
 
-There is no automatic trusted T3 session map in the inspected Toolyard APIs.
-An operator must independently verify the real T3 session and its current owner,
-the corresponding Toolyard owner, the dedicated enrolled agent ID, and delivery
-of that agent credential only to that session. No real binding exists in this PR.
-Do not invent a proof receipt or infer the mapping from an agent name, environment
-variable, hook body, dashboard JWT, MCP session header or tool argument.
+Before every POST, the connector rechecks the exact profile digest, enabled upstream
+record, registry, actual enrolled AgentID, current active owner and durable ledger.
+Profile changes require reviewed reconnect or restart. Caller arguments, names,
+hooks, environment variables, dashboard JWTs and MCP session headers are not proof.
+No trusted automatic T3 mapping exists in the inspected APIs. An operator must
+verify the actual session, owners, dedicated agent and private credential delivery.
+This draft creates no real mapping. Never invent verification evidence.
 
-Each registry binding contains the canonical fields `principal_id`,
-`owner_user_id`, `session_id`, `issued_at`, `expires_at`, `credential_mode`,
-`proof_sha256` and `approved_by`. The mode is exactly `dedicated-per-session`.
-The proof hash names retained private non-secret operator evidence, not a generated
-receipt. The approving Toolyard owner ID must equal `owner_user_id`. Validity is
-positive and at most six hours. Unknown, duplicate or case-aliased fields are refused.
+Bindings contain `principal_id`, `owner_user_id`, `session_id`, `issued_at`,
+`expires_at`, `credential_mode`, `proof_sha256`, `approved_by`. The mode is
+`dedicated-per-session`. The approver equals the owner. Evidence stays private.
+Validity is at most six hours. Only enrolled ordinary agents with active owners
+pass. Disabled agents, identity-key agents and pending enrollments fail.
 
-Only a fully enrolled ordinary agent with an active existing owner is accepted.
-Identity-key agents, disabled agents, missing owners and pending enrollments fail.
-The strict preview lookup does not change legacy ordinary MCP authentication.
+Before approval, the append-only SQLite ledger commits the exact immutable tuple
+with `synchronous=FULL`. Migration0100 retains its historical
+`bks_preview_enrollment_ledger` name so this refactor preserves existing records.
+Update/delete/replacement triggers prevent reassignment. Registry removal, owner
+removal, restart and credential rotation never release an ID for another session.
+Expiry renews only the same tuple. Preserve ledger history in reviewed backups.
+Never reuse IDs after lost or restored older history. Host/database administrators
+remain trusted. No token, key or proof contents enter the ledger.
 
-Before approval or grant use, local preflight commits the verified immutable tuple
-to `bks_preview_enrollment_ledger` in Toolyard's own SQLite store. Migration
-`0100_bks_preview_enrollment_ledger.sql` adds an append-only table. Update, delete
-and replacement-insert triggers protect existing rows. The table has no cascading
-foreign key, so agent or owner removal cannot remove an enrollment commitment.
-No proof contents, token, key or assertion enter that ledger.
-Each commitment pins its SQLite connection and verifies `synchronous=FULL`
-before the transaction, so a successful WAL commit includes disk synchronization.
-The ordinary disabled startup path does not change the SQLite sync setting.
+Approved execution reloads the persisted request and original commitment. Its
+stored expiry bounds the entire handshake and call. Delayed initialization cannot
+permit a tools/call after expiry. Migration0101 only adds the generic profile column.
+Approvals also store a server-authored canonical profile digest. Reconnect or
+replacement with another profile cannot reuse the original approval. Caller
+arguments cannot supply this reserved context. It never reaches tools/call.
 
-Agent ID, owner ID, T3 session ID, proof hash, mode and approver never change.
-Registry expiry may renew only with the identical immutable tuple. Registry removal
-revokes requests but does not free the ID. Token rotation retains the same binding.
-A new owner or T3 session requires a new agent ID and fresh operator verification.
-Deferred approval, restart recovery and every POST check the current registry,
-current principal and durable commitment again. Historical audit labels are not
-identity authority. The ledger closes the process-memory restart gap; it does not
-independently prove T3 ownership.
-An approved dispatch also verifies its current persisted status, expiry, agent,
-tool and upstream. Its original ledger commitment must already exist and precede
-the approval record. A historical generic-upstream approval cannot enroll an ID
-for the first time through the new builtin.
+## Transport and unknown outcomes
 
-Preserve this SQLite ledger and its migration state in reviewed backups. Do not
-reset it, restore an older enrollment history, or reuse IDs after loss of that
-history. This design trusts privileged database operators; it is not protection
-against an administrator who erases the database or alters its triggers.
+The reviewed pilot fixes `http://127.0.0.1:18791/mcp`. Profiles accept loopback HTTP
+only. Proxies, redirects and stateful MCP sessions are refused. Each POST receives
+a fresh HS256 assertion with issuer `toolyard`, audience
+`bk-agent-test-pilot-preview-v1`, verified session UUID and `human=false`.
+Assertion TTL is at most 30 seconds and never exceeds registry expiry.
 
-## Fixed transport and assertions
+The pilot permits 35 seconds for headers, 40 seconds per HTTP exchange and
+65 seconds overall. A shorter approval/context deadline wins. The header bound
+accommodates BKS's 30-second source resolver. Connect timeout is two seconds.
+Request and response limits are 16 KiB and 1 MiB respectively.
 
-The only endpoint is `http://127.0.0.1:18791/mcp`. No tool argument or environment
-variable can change it. Proxies, redirects and stateful MCP responses are refused.
-Each call uses the stateless `2025-11-25` handshake and exactly one fixed control
-operation. Responses must be JSON; notification responses must have no body or
-session header. Requests are at most 16 KiB, responses at most 1 MiB, connect
-timeout two seconds, HTTP timeout five seconds, and whole call timeout ten seconds.
+The connector never retries writes automatically. A lost tools/call response can
+mean an unknown outcome. Retain the original request ID and exact parameters on
+retry. BKS must retain the first immutable resolved source for that ID. Reconnect
+must not substitute a new ID or source. A queued receipt is not readiness evidence.
 
-Each POST receives a fresh HS256 assertion with issuer `toolyard`, audience
-`bk-agent-test-pilot-preview-v1`, subject `toolyard:agent:<actual-agent-id>`, the
-operator-verified T3 session UUID, and `human=false`. Lifetime is at most 30 seconds
-and never extends beyond registry expiry. There is no human assertion route,
-global privileged JWT, anonymous assertion or static upstream authorization header.
-Credentials and assertions never belong in argv, environment variables, logs,
-Git, documentation, caller inputs or error bodies. Transport errors are fixed
-safe messages, not remote HTTP bodies or raw exceptions.
+Credential reflection checks reject fragments, combined text blocks and decoded
+JSON before results reach callers, audit or approval caching. Remote error bodies
+and private diagnostics never pass through. Keys, assertions and credentials must
+not enter argv, environment variables, Git, logs or documentation.
 
-## Validation and remaining parent gates
+## Cloud validation
 
-The scoped GitHub workflow compiles the full module on hosted Linux and macOS,
-then runs focused adapter, gateway, startup and immutable-ledger cases. Linux adds
-race checks. The actual pinned BKS Python verifier validates Go assertions; its
-test fixtures retain commit and digest provenance. Synthetic test assertions travel
-through stdin, not argv or failure output. Local Go compilation and tests are not
-part of this task.
+The hosted workflow compiles the complete Linux/Darwin module and runs focused
+gateway, registry, restart, revocation, approval and transport tests. Linux adds
+race checks. Real interoperability tests use pinned BKS `build_app`,
+`IdentityMiddleware`, Python MCP SDK, synthetic keys, MemoryStore and a fake
+same-repository resolver. The bounded loopback subprocess runs only in cloud CI.
+No AWS client or production data is used. Fixture hashes record provenance.
 
-CI contract results do not prove a deployed service, private tunnel, real enrollment
-or usable preview. Separate parent/operator gates remain for control installation,
-private tunnel and transport denial checks, HTTPS/viewer identity, real enrollment
-proof, issuer provisioning, operator access/policies and runtime validation.
-No service restart/deployment, AWS change, worker activation, production data,
-Tailscale handler change or production credential is authorized here.
+## Disposable installation and rollback
 
-The parent's AWS 21-resource package and any fresh worker-cost window remain
-unapproved. Previous allowances are exhausted. Existing pilot Spot groups remain
-zero and fenced closed. A queued result is not build, restore or readiness evidence.
+This future operator procedure does not authorize activation:
+
+1. Obtain the reviewed CI artifact for the exact accepted commit.
+2. Use a separate service-owned disposable data directory with a private hierarchy.
+3. Copy the reviewed profile as `profile.json`. Provision issuer material privately.
+4. Keep the registry empty until an operator verifies real enrollment evidence.
+5. Add a normal HTTP/per_user upstream with the exact profile URL and profile ID.
+6. Keep it disabled until the parent approves the private BKS route and runtime.
+7. Apply separately approved permissions and policies before activation.
+
+For rollback, disable the upstream first. Remove its record if required. Stop only
+the authorized disposable instance. Preserve its ledger and identity history.
+Revoke bindings without erasing history or reassigning agent IDs. These steps do
+not authorize production installation or shared-service changes.
+
+## Remaining parent gates
+
+The concrete BKS `ci_control_installation.dependencies()` factory is missing.
+Runtime wiring, private route guard, supervisor, watchdog, alerts, safe snapshot
+publication/restore, authenticated UI and physical cleanup remain unproved.
+Durable GHCR pull credentials or refresh remain unverified; current preview CI
+uses temporary `GITHUB_TOKEN` authentication.
+
+The parent must retain the development Clerk tenant, same-repository sources,
+Blacksmith ARM64 builds and CI deployment. BKS edits require its owner's isolated
+worktree. Private route/HTTPS, real enrollment, issuer provisioning, policies and
+runtime tests require separate approval.
+
+The AWS 21-resource add-on remains unapproved at SHA256
+`45dc5c2372597976b6585929277099e9813e5858cb402aedbcb44f5f9b87a34c`.
+AWS execution is human-only. Prior worker allowances are exhausted; live workers
+require a new exact approved cost window. No production change, deployment,
+AWS mutation, worker activation or Tailscale handler change is authorized.

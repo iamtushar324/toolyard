@@ -1,4 +1,4 @@
-package previewassertion
+package trustedmcp
 
 import (
 	"context"
@@ -8,29 +8,31 @@ import (
 	"testing"
 )
 
-func TestPreviewFixedCatalogContainsExactlySixClosedOperations(t *testing.T) {
-	want := map[string]string{"bks_preview.create": "preview_create", "bks_preview.inspect": "preview_inspect", "bks_preview.heartbeat": "preview_heartbeat", "bks_preview.release": "preview_release", "bks_preview.snapshots": "preview_snapshots", "bks_preview.results": "preview_results"}
-	for _, d := range Descriptors() {
-		if want[d.Name] != d.Operation || d.Schema["additionalProperties"] != false {
-			t.Fatal("catalog escaped fixed mapping")
+func TestTrustedMCPCatalogUsesReviewedShortAliasesWithoutNetwork(t *testing.T) {
+	c := newTestClient(t, signer(t, binding(agentA, sessionA)))
+	want := map[string]string{"create": "preview_create", "inspect": "preview_inspect", "heartbeat": "preview_heartbeat", "release": "preview_release", "snapshots": "preview_snapshots", "results": "preview_results"}
+	for _, tool := range c.Catalog() {
+		if want[tool.Name] != c.Operation(tool.Name) {
+			t.Fatal("reviewed alias mapping changed")
 		}
-		delete(want, d.Name)
-		properties := d.Schema["properties"].(map[string]any)
-		if len(properties) != len(arguments[d.Operation]) {
-			t.Fatal("schema fields disagree")
+		delete(want, tool.Name)
+		var schema map[string]any
+		if json.Unmarshal(tool.RawInputSchema, &schema) != nil || schema["additionalProperties"] != false {
+			t.Fatal("reviewed schema is not closed")
 		}
-		for k := range properties {
-			if !arguments[d.Operation][k] {
-				t.Fatal("caller identity field exposed")
+		properties := schema["properties"].(map[string]any)
+		for field := range properties {
+			if field == "sid" || field == "session_id" || field == "endpoint" || field == "Authorization" {
+				t.Fatal("caller authority field exposed")
 			}
 		}
 	}
-	if len(want) != 0 || len(Operations()) != 6 {
-		t.Fatal("catalog incomplete")
+	if len(want) != 0 || c.Operation("unknown") != "" {
+		t.Fatal("catalog escaped reviewed profile")
 	}
 }
-func TestPreviewArgumentValidationRejectsWrongTypesBoundsAndMissingFields(t *testing.T) {
-	c, _ := NewClient(signer(t, binding(agentA, sessionA)))
+func TestTrustedMCPArgumentValidationRejectsWrongTypesBoundsAndMissingFields(t *testing.T) {
+	c := newTestClient(t, signer(t, binding(agentA, sessionA)))
 	valid := func() map[string]any {
 		return map[string]any{"source_ref": "pr:1039", "request_id": sessionA, "snapshot_id": "synthetic-v1", "pool": "large", "lifetime_seconds": float64(1200)}
 	}

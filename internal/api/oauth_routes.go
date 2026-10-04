@@ -329,6 +329,10 @@ func (s *Server) oauthDevicePoll(w http.ResponseWriter, r *http.Request, name st
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	// A state can outlive deletion and recreation of its named server.
+	if pending, err := s.oauth.LoadPending(r.Context(), body.State); err == nil && s.assertionOAuthRefused(w, r, pending.UpstreamName) {
+		return
+	}
 	rec, err := s.oauth.PollDevice(r.Context(), body.State)
 	if err != nil {
 		if errors.Is(err, oauth.ErrPendingNotFound) {
@@ -370,6 +374,9 @@ func (s *Server) oauthCallback(w http.ResponseWriter, r *http.Request) {
 	p, err := s.oauth.LoadPending(r.Context(), state)
 	if err != nil {
 		oauthHTMLError(w, "This authorization request expired or was already used. Please try again from the dashboard.")
+		return
+	}
+	if s.assertionOAuthRefused(w, r, p.UpstreamName) {
 		return
 	}
 	if p.Mode != oauth.ModeCallback {
@@ -621,6 +628,9 @@ func (s *Server) oauthPaste(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
+	if s.assertionOAuthRefused(w, r, p.UpstreamName) {
+		return
+	}
 	u, _ := s.sessionUser(r)
 	if p.PerUser {
 		// The same rule as the callback: the person who started it, or
@@ -828,6 +838,9 @@ func (s *Server) oauthStatus(w http.ResponseWriter, r *http.Request, name string
 // /v1/servers/{name}/ starts with "oauth". It routes the trailing
 // segment to the appropriate handler.
 func (s *Server) dispatchOAuth(w http.ResponseWriter, r *http.Request, name, subpath string) bool {
+	if s.assertionOAuthRefused(w, r, name) {
+		return true
+	}
 	if s.oauth == nil {
 		writeError(w, http.StatusServiceUnavailable, "oauth service not wired")
 		return true

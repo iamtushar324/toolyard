@@ -88,7 +88,7 @@ func (s *Server) perUserServersFor(ctx context.Context, u *identity.User) ([]ups
 	}
 	var out []upstreams.Server
 	for _, sv := range all {
-		if sv.AuthMode != upstreams.AuthPerUser {
+		if sv.AuthMode != upstreams.AuthPerUser || sv.AssertionProfile != "" {
 			continue
 		}
 		if u.Role == identity.RoleAdmin || allowed[sv.Name] {
@@ -237,6 +237,9 @@ func (s *Server) meConnectionBegin(w http.ResponseWriter, r *http.Request, u *id
 		writeError(w, http.StatusNotFound, "server not found")
 		return
 	}
+	if s.assertionOAuthRefused(w, r, name) {
+		return
+	}
 	if sv.AuthMode != upstreams.AuthPerUser {
 		writeError(w, http.StatusBadRequest, "this server uses one shared account; there is nothing to connect")
 		return
@@ -278,6 +281,9 @@ func (s *Server) meConnectionBegin(w http.ResponseWriter, r *http.Request, u *id
 // connection. Works whatever the server's current mode, so a row left by
 // a server switched back to shared can still be removed.
 func (s *Server) meConnectionDelete(w http.ResponseWriter, r *http.Request, u *identity.User, name string) {
+	if s.assertionOAuthRefused(w, r, name) {
+		return
+	}
 	ctx := r.Context()
 	if err := s.oauth.DisconnectUser(ctx, name, u.ID); err != nil {
 		if errors.Is(err, oauth.ErrNoUserToken) {
@@ -317,6 +323,9 @@ func (s *Server) serversConnections(w http.ResponseWriter, r *http.Request, name
 	}
 	if _, err := s.requireAdmin(r); err != nil {
 		writeAuthError(w, err)
+		return
+	}
+	if s.assertionOAuthRefused(w, r, name) {
 		return
 	}
 	if s.oauth == nil {

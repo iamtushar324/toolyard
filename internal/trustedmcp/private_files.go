@@ -1,6 +1,6 @@
 //go:build linux || darwin
 
-package previewassertion
+package trustedmcp
 
 import (
 	"io"
@@ -49,7 +49,7 @@ func PrivateFile(path string, ownerUID uint32, maximum int64) ([]byte, error) {
 	if err != nil {
 		return nil, ErrIdentity
 	}
-	f := os.NewFile(uintptr(fd), "private-preview-file")
+	f := os.NewFile(uintptr(fd), "private-trusted-mcp-file")
 	if f == nil {
 		unix.Close(fd)
 		return nil, ErrIdentity

@@ -171,6 +171,9 @@ func (s *Server) lookupConnectLink(r *http.Request) (*connectLinkLookup, *connec
 		return l, &connectLinkRefusal{reason: "error", text: "Something went wrong looking the server up. Ask your agent for a new link."}
 	}
 	l.server = sv
+	if sv.AssertionProfile != "" {
+		return l, &connectLinkRefusal{reason: "assertion_profile", text: "This server uses a private assertion profile and does not accept browser sign-in."}
+	}
 	if !sv.Enabled {
 		return l, &connectLinkRefusal{reason: "server_disabled", text: "That server is disabled in toolyard. Ask an admin to enable it, then ask your agent for a new link."}
 	}

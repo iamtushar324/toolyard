@@ -1,6 +1,6 @@
 //go:build linux || darwin
 
-package previewassertion
+package trustedmcp
 
 import (
 	"context"
@@ -10,7 +10,7 @@ import (
 	"testing"
 )
 
-func TestPreviewPrivateFilesSecureHierarchyAndDenials(t *testing.T) {
+func TestTrustedMCPPrivateFilesSecureHierarchyAndDenials(t *testing.T) {
 	dir := privateTestDir(t)
 	path := filepath.Join(dir, "private")
 	if err := os.WriteFile(path, []byte("synthetic-test-data"), 0600); err != nil {
@@ -65,7 +65,7 @@ func TestPreviewPrivateFilesSecureHierarchyAndDenials(t *testing.T) {
 	}
 }
 
-func TestPreviewPrivateFilesRejectUnsafeAncestorAndReplacement(t *testing.T) {
+func TestTrustedMCPPrivateFilesRejectUnsafeAncestorAndReplacement(t *testing.T) {
 	dir := t.TempDir()
 	parent := filepath.Join(dir, "parent")
 	private := filepath.Join(parent, "private")
@@ -101,7 +101,7 @@ func TestPreviewPrivateFilesRejectUnsafeAncestorAndReplacement(t *testing.T) {
 	}
 }
 
-func TestPreviewRegistryReloadRejectsMalformedAndExpiredBindings(t *testing.T) {
+func TestTrustedMCPRegistryReloadRejectsMalformedAndExpiredBindings(t *testing.T) {
 	dir := privateTestDir(t)
 	path := filepath.Join(dir, "bindings.json")
 	r := &FileRegistry{Path: path, OwnerUID: uint32(os.Geteuid())}

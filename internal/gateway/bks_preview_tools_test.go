@@ -2,19 +2,77 @@ package gateway
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"os"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
+	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/tusharbhardwaj/toolyard/internal/access"
 	"github.com/tusharbhardwaj/toolyard/internal/approval"
 	"github.com/tusharbhardwaj/toolyard/internal/audit"
 	"github.com/tusharbhardwaj/toolyard/internal/inbox"
 	"github.com/tusharbhardwaj/toolyard/internal/metrics"
+	"github.com/tusharbhardwaj/toolyard/internal/trustedmcp"
 )
+
+// Legacy test fixture names keep the gateway regression suite intact. The
+// production integration uses only the normal reusable upstream API.
+type PreviewCaller interface {
+	Preflight(context.Context, string, string, map[string]any) error
+	RequireApprovalBinding(context.Context, string, int64) error
+	Call(context.Context, string, string, map[string]any) (json.RawMessage, error)
+}
+type previewTestProvider struct {
+	PreviewCaller
+	profile trustedmcp.Profile
+}
+
+func (p previewTestProvider) ApprovalIdentity() string {
+	raw, _ := json.Marshal(p.profile)
+	return fmt.Sprintf("%x", sha256.Sum256(raw))
+}
+
+func (p previewTestProvider) Catalog() []mcp.Tool {
+	var tools []mcp.Tool
+	for _, tool := range p.profile.Tools {
+		raw, _ := json.Marshal(tool.Schema)
+		tools = append(tools, mcp.Tool{Name: tool.Alias, Description: tool.Description, RawInputSchema: raw})
+	}
+	return tools
+}
+func (p previewTestProvider) Operation(alias string) string {
+	for _, tool := range p.profile.Tools {
+		if tool.Alias == alias {
+			return tool.Operation
+		}
+	}
+	return ""
+}
+func (p previewTestProvider) Discover(context.Context, string) ([]mcp.Tool, error) {
+	return p.Catalog(), nil
+}
+func (g *Gateway) RegisterBKSPreviewTools(p PreviewCaller) {
+	if p == nil {
+		return
+	}
+	raw, err := os.ReadFile("../../config/preview-mcp.profile.json")
+	if err != nil {
+		panic("test profile unavailable")
+	}
+	profile, err := trustedmcp.ParseProfile(raw)
+	if err != nil {
+		panic("test profile invalid")
+	}
+	if err := g.AddUpstream(context.Background(), UpstreamConfig{Name: "bks_preview", Transport: "http", URL: profile.Endpoint, PerUser: true, Trusted: previewTestProvider{p, profile}}); err != nil {
+		panic(err)
+	}
+}
 
 // previewControlFake replaces only the external control boundary. All gateway
 // policy, access, approval, grants, audit and result persistence are real.
@@ -63,7 +121,7 @@ func (p *previewControlFake) Call(_ context.Context, agent, operation string, ar
 }
 
 func (p *previewControlFake) RequireApprovalBinding(ctx context.Context, agent string, createdAtMillis int64) error {
-	if deadline, ok := ctx.Deadline(); !ok || time.Until(deadline) > 10*time.Second {
+	if deadline, ok := ctx.Deadline(); !ok || time.Until(deadline) > 65*time.Second {
 		return errors.New("approved dispatch has no bounded context")
 	}
 	p.mu.Lock()
@@ -500,3 +558,61 @@ func TestBKSPreviewGrantPreservedOnIdentityFailureThenRedeemed(t *testing.T) {
 }
 
 var _ PreviewCaller = (*previewControlFake)(nil)
+
+func TestTrustedMCPApprovalRejectsProfileReplacementAndCallerContext(t *testing.T) {
+	for _, change := range []string{"operation", "audience", "endpoint"} {
+		t.Run(change, func(t *testing.T) {
+			f := newActorFixture(t)
+			p := newPreviewControlFake("ag_1")
+			f.gw.RegisterBKSPreviewTools(p)
+			ctx := WithAgentID(context.Background(), "ag_1")
+			f.call(t, ctx, "test", "bks_preview.snapshots", nil)
+			id := f.lastMetric(t, "bks_preview.snapshots").ApprovalID
+			if id == "" {
+				t.Fatal("approval not persisted")
+			}
+			raw, err := os.ReadFile("../../config/preview-mcp.profile.json")
+			if err != nil {
+				t.Fatal(err)
+			}
+			profile, err := trustedmcp.ParseProfile(raw)
+			if err != nil {
+				t.Fatal(err)
+			}
+			switch change {
+			case "operation":
+				for i := range profile.Tools {
+					if profile.Tools[i].Alias == "snapshots" {
+						profile.Tools[i].Operation = "different_operation"
+					}
+				}
+			case "audience":
+				profile.Audience = "different-reviewed-audience"
+			case "endpoint":
+				profile.Endpoint = "http://127.0.0.1:18792/mcp"
+			}
+			if f.gw.RemoveUpstream("bks_preview") != nil {
+				t.Fatal("remove failed")
+			}
+			if f.gw.AddUpstream(ctx, UpstreamConfig{Name: "bks_preview", Transport: "http", URL: profile.Endpoint, PerUser: true, Trusted: previewTestProvider{p, profile}}) != nil {
+				t.Fatal("replacement failed")
+			}
+			req, err := f.bus.Decide(ctx, id, approval.StatusAllowed, "u_owner")
+			if err != nil {
+				t.Fatal(err)
+			}
+			f.gw.Execute(ctx, req)
+			stored, err := f.bus.Get(ctx, id)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, posts := p.counts(); posts != 0 || !stored.ResultIsError {
+				t.Fatal("old approval executed changed profile")
+			}
+			res := f.call(t, ctx, "test", "bks_preview.snapshots", map[string]any{trustedApprovalContext: "caller-forged"})
+			if !res.IsError {
+				t.Fatal("caller supplied reserved approval authority")
+			}
+		})
+	}
+}

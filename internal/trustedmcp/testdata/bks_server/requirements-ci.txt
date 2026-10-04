@@ -1,0 +1,4 @@
+# Exact MCP SDK and HTTP host versions from the reviewed BKS requirements.
+# No AWS/cryptography package is required by this synthetic MemoryStore harness.
+mcp==2.3.0
+uvicorn==0.54.0

@@ -11,14 +11,14 @@ import (
 	"time"
 
 	"github.com/tusharbhardwaj/toolyard/internal/approval"
-	"github.com/tusharbhardwaj/toolyard/internal/previewassertion"
 	"github.com/tusharbhardwaj/toolyard/internal/store"
+	"github.com/tusharbhardwaj/toolyard/internal/trustedmcp"
 )
 
 // This control seam keeps the real registry, principal query and SQL ledger.
 // Only the external control response is fake. It never sends network traffic.
 type persistentPreviewControl struct {
-	signer *previewassertion.Signer
+	signer *trustedmcp.Signer
 	posts  int
 }
 
@@ -31,13 +31,13 @@ func (p *persistentPreviewControl) RequireApprovalBinding(ctx context.Context, i
 		CommittedBefore(context.Context, string, int64) error
 	})
 	if !ok || l.CommittedBefore(ctx, id, createdAtMillis) != nil {
-		return previewassertion.ErrIdentity
+		return trustedmcp.ErrIdentity
 	}
 	return p.signer.Preflight(ctx, id)
 }
 
 func (p *persistentPreviewControl) Call(ctx context.Context, id, operation string, args map[string]any) (json.RawMessage, error) {
-	if _, err := p.signer.Assertion(ctx, id); err != nil {
+	if err := p.signer.Preflight(ctx, id); err != nil {
 		return nil, err
 	}
 	p.posts++
@@ -67,23 +67,23 @@ func TestBKSPreviewDeferredApprovalRechecksRealRegistryPrincipalAndLedger(t *tes
 				t.Fatal("test agent failed")
 			}
 			now := int64(1800000000)
-			b := previewassertion.Binding{PrincipalID: agent, OwnerUserID: owner, SessionID: sid, IssuedAt: now - 1, ExpiresAt: now + 300, CredentialMode: "dedicated-per-session", ProofSHA256: strings.Repeat("c", 64), ApprovedBy: owner}
+			b := trustedmcp.Binding{PrincipalID: agent, OwnerUserID: owner, SessionID: sid, IssuedAt: now - 1, ExpiresAt: now + 300, CredentialMode: "dedicated-per-session", ProofSHA256: strings.Repeat("c", 64), ApprovedBy: owner}
 			registryDir := t.TempDir()
 			if err := os.Chmod(registryDir, 0700); err != nil {
 				t.Fatal("private test registry directory unavailable")
 			}
 			rp := filepath.Join(registryDir, "bindings.json")
-			write := func(bindings []previewassertion.Binding) {
-				raw, err := json.Marshal(previewassertion.Registry{Version: 1, Bindings: bindings})
+			write := func(bindings []trustedmcp.Binding) {
+				raw, err := json.Marshal(trustedmcp.Registry{Version: 1, Bindings: bindings})
 				if err != nil || os.WriteFile(rp, raw, 0600) != nil {
 					t.Fatal("test registry failed")
 				}
 			}
-			write([]previewassertion.Binding{b})
-			newSigner := func() *previewassertion.Signer {
-				s, err := previewassertion.NewSigner(bytes.Repeat([]byte{'q'}, 32), &previewassertion.FileRegistry{Path: rp, OwnerUID: uint32(os.Geteuid())}, func(ctx context.Context, id string) (previewassertion.Principal, error) {
-					return previewassertion.CurrentPrincipal(ctx, db.DB, id)
-				}, &previewassertion.SQLLedger{DB: db.DB})
+			write([]trustedmcp.Binding{b})
+			newSigner := func() *trustedmcp.Signer {
+				s, err := trustedmcp.NewSigner(bytes.Repeat([]byte{'q'}, 32), &trustedmcp.FileRegistry{Path: rp, OwnerUID: uint32(os.Geteuid())}, func(ctx context.Context, id string) (trustedmcp.Principal, error) {
+					return trustedmcp.CurrentPrincipal(ctx, db.DB, id)
+				}, &trustedmcp.SQLLedger{DB: db.DB})
 				if err != nil {
 					t.Fatal("test signer failed")
 				}
@@ -104,10 +104,10 @@ func TestBKSPreviewDeferredApprovalRechecksRealRegistryPrincipalAndLedger(t *tes
 				write(nil)
 			case "session-reassignment":
 				b.SessionID = "d569a5e5-05dc-4d55-b6a2-a657b8a4eb78"
-				write([]previewassertion.Binding{b})
+				write([]trustedmcp.Binding{b})
 			case "proof-replacement":
 				b.ProofSHA256 = strings.Repeat("d", 64)
-				write([]previewassertion.Binding{b})
+				write([]trustedmcp.Binding{b})
 			case "expiry":
 				now = b.ExpiresAt
 			case "disabled":
@@ -120,7 +120,7 @@ func TestBKSPreviewDeferredApprovalRechecksRealRegistryPrincipalAndLedger(t *tes
 				mutation = `UPDATE agents SET owner_user='` + otherOwner + `'`
 				b.OwnerUserID = otherOwner
 				b.ApprovedBy = otherOwner
-				write([]previewassertion.Binding{b})
+				write([]trustedmcp.Binding{b})
 			}
 			if mutation != "" {
 				if _, err = db.Exec(mutation); err != nil {

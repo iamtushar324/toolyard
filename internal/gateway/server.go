@@ -118,6 +118,7 @@ type toolEntry struct {
 	// approvedPreflight refuses deferred execution without an enrollment
 	// commitment that existed when the persisted approval was created.
 	approvedPreflight func(context.Context, *approval.Request) error
+	approvalIdentity  string
 	// denyInternal prevents privileged internal dispatch for agent-only tools.
 	denyInternal bool
 	// forcedAction, when non-nil, short-circuits policy.Eval for this tool
@@ -569,7 +570,7 @@ func (g *Gateway) RegisterBuiltins() {
 func reservedUpstreamName(name string) bool {
 	switch name {
 	case builtinUpstream, "fixture", inboxUpstream, sessionUpstream, "tools", "memory", "lake", "events",
-		policiesUpstream, serversUpstream, auditUpstream, accessUpstream, toolyardServer, connectionsGroup, "bks_preview":
+		policiesUpstream, serversUpstream, auditUpstream, accessUpstream, toolyardServer, connectionsGroup:
 		return true
 	}
 	return false
@@ -586,6 +587,9 @@ func (g *Gateway) AddUpstream(ctx context.Context, cfg UpstreamConfig) error {
 	}
 	if cfg.Transport == "github" {
 		return g.addGitHubUpstream(cfg)
+	}
+	if cfg.Trusted != nil {
+		return g.addTrustedUpstream(cfg)
 	}
 	if cfg.PerUser {
 		return g.addPerUserUpstream(ctx, cfg)
@@ -627,6 +631,23 @@ func (g *Gateway) registerUpstreamTools(name string, tools []mcp.Tool, ref *upst
 			reasonField:  field,
 		}
 		if ref != nil {
+			if provider := ref.cfg.Trusted; provider != nil {
+				operation := provider.Operation(original)
+				entry.approvalIdentity = trustedApprovalIdentity(ref.cfg)
+				entry.denyInternal = true
+				entry.preflight = func(ctx context.Context, args map[string]any) error {
+					if _, supplied := args[trustedApprovalContext]; supplied {
+						return errors.New("caller approval context refused")
+					}
+					return provider.Preflight(ctx, AgentIDFromContext(ctx), operation, args)
+				}
+				entry.approvedPreflight = func(ctx context.Context, req *approval.Request) error {
+					if req.Arguments[trustedApprovalContext] != trustedApprovalIdentity(ref.cfg) {
+						return errors.New("approval profile changed")
+					}
+					return provider.RequireApprovalBinding(ctx, req.AgentID, req.CreatedAt)
+				}
+			}
 			entry.handle = func(name string) directHandler {
 				return func(ctx context.Context, args map[string]any) (*mcp.CallToolResult, error) {
 					return ref.callTool(ctx, name, args)
@@ -1229,7 +1250,7 @@ func (g *Gateway) routeEntry(ctx context.Context, entry toolEntry, via string, a
 	// establish a binding. Dispatch rechecks it, including after approval.
 	if entry.preflight != nil && (decision.Action == policy.ActionAllow || decision.Action == policy.ActionApprove) {
 		if preflightErr := entry.preflight(ctx, cleanArgs); preflightErr != nil {
-			const safeFailure = "trusted preview caller/session binding unavailable"
+			const safeFailure = "trusted caller/session binding unavailable"
 			_ = g.audit.Write(ctx, audit.Event{
 				EventType: audit.EventCallFailed, AgentID: agentID, UpstreamName: entry.upstream,
 				ToolName: entry.tool.Name, Reason: reason, ResultSummary: safeFailure,
@@ -1353,11 +1374,19 @@ func (g *Gateway) holdAndWait(ctx context.Context, entry toolEntry, args map[str
 	defer cancel()
 
 	holdStart := time.Now()
+	approvalArgs := args
+	if entry.approvalIdentity != "" {
+		approvalArgs = make(map[string]any, len(args)+1)
+		for name, value := range args {
+			approvalArgs[name] = value
+		}
+		approvalArgs[trustedApprovalContext] = entry.approvalIdentity
+	}
 	req, err := g.approval.Hold(holdCtx, approval.NewRequest{
 		AgentID:        agentID,
 		UpstreamName:   entry.upstream,
 		ToolName:       entry.tool.Name,
-		Arguments:      args,
+		Arguments:      approvalArgs,
 		Reason:         reason,
 		IntentCategory: intent,
 		RequireHuman:   requireHuman,
@@ -1633,7 +1662,7 @@ func (g *Gateway) dispatch(ctx context.Context, entry toolEntry, args map[string
 	// A background executor otherwise has no deadline while it waits on SQLite.
 	if entry.approvedPreflight != nil {
 		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, 10*time.Second)
+		ctx, cancel = context.WithTimeout(ctx, 65*time.Second)
 		defer cancel()
 	}
 	// Preview approvals must still be live, exact, and backed by the
@@ -1649,10 +1678,13 @@ func (g *Gateway) dispatch(ctx context.Context, entry toolEntry, args map[string
 			req.AgentID == agentID && req.ToolName == entry.tool.Name && req.UpstreamName == entry.upstream &&
 			req.ExpiresAt > time.Now().UnixMilli() && req.ResultExecutedAt == 0
 		if valid {
-			valid = entry.approvedPreflight(ctx, req) == nil
+			var cancel context.CancelFunc
+			ctx, cancel = context.WithDeadline(ctx, time.UnixMilli(req.ExpiresAt))
+			defer cancel()
+			valid = entry.approvedPreflight(ctx, req) == nil && ctx.Err() == nil
 		}
 		if !valid {
-			const safeFailure = "preview approval or original enrollment is no longer valid"
+			const safeFailure = "approval or original enrollment is no longer valid"
 			_ = g.audit.Write(ctx, audit.Event{
 				EventType: audit.EventCallFailed, AgentID: agentID, UpstreamName: entry.upstream,
 				ToolName: entry.tool.Name, ApprovalID: approvalID, ResultSummary: safeFailure,
@@ -1663,6 +1695,14 @@ func (g *Gateway) dispatch(ctx context.Context, entry toolEntry, args map[string
 		// Execute's Request argument is not authority for operation inputs.
 		// Use only the persisted parameters the reviewer approved.
 		args, reason = req.Arguments, req.Reason
+		if entry.approvalIdentity != "" {
+			args = make(map[string]any, len(req.Arguments))
+			for name, value := range req.Arguments {
+				if name != trustedApprovalContext {
+					args[name] = value
+				}
+			}
+		}
 		ev.ReasonText, ev.ReasonLen = reason, len(reason)
 	}
 
@@ -1690,7 +1730,7 @@ func (g *Gateway) dispatch(ctx context.Context, entry toolEntry, args map[string
 	}
 	// A shared OAuth server with no usable token is refused before the
 	// dial, with a connect link for an admin owner (connections_tools.go).
-	if u != nil {
+	if u != nil && u.cfg.Trusted == nil {
 		if res := g.refuseSharedSignIn(ctx, u, entry, agentID, reason, approvalID, nil, ev); res != nil {
 			return res, nil
 		}

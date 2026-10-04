@@ -1,0 +1,4 @@
+mcp==2.3.0
+boto3==1.43.108
+uvicorn==0.54.0
+cryptography==50.0.2

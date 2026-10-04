@@ -1,4 +1,4 @@
-package previewassertion
+package trustedmcp
 
 import (
 	"context"

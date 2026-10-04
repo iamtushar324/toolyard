@@ -1,0 +1,168 @@
+{
+  "version": 1,
+  "endpoint": "http://127.0.0.1:18791/mcp",
+  "issuer": "toolyard",
+  "audience": "bk-agent-test-pilot-preview-v1",
+  "key_id": "toolyard-preview-v1",
+  "protocol_version": "2025-11-25",
+  "timeout_seconds": 65,
+  "header_timeout_seconds": 35,
+  "tools": [
+    {
+      "alias": "create",
+      "operation": "preview_create",
+      "description": "Queue a bounded isolated branch, PR or draft preview. Queued does not mean ready.",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "source_ref": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 210
+          },
+          "request_id": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+          },
+          "snapshot_id": {
+            "type": "string",
+            "pattern": "^[a-z][a-z0-9-]{0,62}$"
+          },
+          "pool": {
+            "type": "string",
+            "enum": [
+              "large",
+              "medium"
+            ],
+            "default": "large"
+          },
+          "lifetime_seconds": {
+            "type": "integer",
+            "minimum": 300,
+            "maximum": 21600,
+            "default": 1200
+          }
+        },
+        "required": [
+          "source_ref",
+          "request_id",
+          "snapshot_id"
+        ],
+        "additionalProperties": false
+      },
+      "read_only": false,
+      "destructive": false,
+      "idempotency_field": "request_id"
+    },
+    {
+      "alias": "inspect",
+      "operation": "preview_inspect",
+      "description": "Inspect only the authenticated owner's preview and immutable source.",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "environment_id": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+          }
+        },
+        "required": [
+          "environment_id"
+        ],
+        "additionalProperties": false
+      },
+      "read_only": true,
+      "destructive": false
+    },
+    {
+      "alias": "heartbeat",
+      "operation": "preview_heartbeat",
+      "description": "Report a real active owner or job. This cannot extend the absolute deadline.",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "environment_id": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+          },
+          "job_id": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+          }
+        },
+        "required": [
+          "environment_id"
+        ],
+        "additionalProperties": false
+      },
+      "read_only": false,
+      "destructive": false
+    },
+    {
+      "alias": "release",
+      "operation": "preview_release",
+      "description": "Release this caller's job or ownership. Other valid owners retain the preview.",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "environment_id": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+          },
+          "outcome": {
+            "type": "string",
+            "enum": [
+              "released",
+              "success",
+              "failure"
+            ],
+            "default": "released"
+          },
+          "job_id": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+          }
+        },
+        "required": [
+          "environment_id"
+        ],
+        "additionalProperties": false
+      },
+      "read_only": false,
+      "destructive": true
+    },
+    {
+      "alias": "snapshots",
+      "operation": "preview_snapshots",
+      "description": "List only reviewed synthetic snapshots. Arbitrary storage objects are not accepted.",
+      "schema": {
+        "type": "object",
+        "properties": {},
+        "required": [],
+        "additionalProperties": false
+      },
+      "read_only": true,
+      "destructive": false
+    },
+    {
+      "alias": "results",
+      "operation": "preview_results",
+      "description": "Read owned durable test receipts. Raw application logs and arbitrary execution are not exposed.",
+      "schema": {
+        "type": "object",
+        "properties": {
+          "environment_id": {
+            "type": "string",
+            "pattern": "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
+          }
+        },
+        "required": [
+          "environment_id"
+        ],
+        "additionalProperties": false
+      },
+      "read_only": true,
+      "destructive": false
+    }
+  ]
+}

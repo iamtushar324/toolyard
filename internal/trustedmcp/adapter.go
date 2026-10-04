@@ -1,6 +1,6 @@
-// Package previewassertion implements the disabled-by-default fixed preview adapter.
+// Package trustedmcp implements an authenticated, profile-limited MCP connector.
 // Caller identity comes only from trusted enrollment and operator bindings.
-package previewassertion
+package trustedmcp
 
 import (
 	"bytes"
@@ -8,31 +8,29 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"github.com/santhosh-tekuri/jsonschema/v6"
 	"io"
-	"math"
+	"math/big"
 	"mime"
 	"net"
 	"net/http"
 	"regexp"
+	"sort"
 	"strings"
 	"time"
-	"unicode/utf8"
 )
 
-const Endpoint = "http://127.0.0.1:18791/mcp"
-const Audience = "bk-agent-test-pilot-preview-v1"
-const ProtocolVersion = "2025-11-25"
-
-var ErrIdentity = errors.New("trusted preview caller/session binding unavailable")
-var ErrTransport = errors.New("private preview transport unavailable or invalid")
-var ErrArguments = errors.New("preview request arguments rejected")
+var ErrIdentity = errors.New("trusted MCP caller/session binding unavailable")
+var ErrTransport = errors.New("trusted MCP transport unavailable or invalid")
+var ErrArguments = errors.New("trusted MCP request arguments rejected")
+var ErrUnknownOutcome = errors.New("trusted MCP operation outcome is unknown; inspect before retry")
 var uuidRE = regexp.MustCompile(`^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$`)
 var digestRE = regexp.MustCompile(`^[0-9a-f]{64}$`)
 var agentRE = regexp.MustCompile(`^ag_[0-9a-f-]{36}$`)
 var userRE = regexp.MustCompile(`^u_[0-9a-f-]{36}$`)
-var snapshotRE = regexp.MustCompile(`^[a-z][a-z0-9-]{0,62}$`)
 
 type Principal struct {
 	ID, OwnerUserID string
@@ -122,11 +120,12 @@ func uniqueJSONKeys(raw []byte) bool {
 }
 
 type Signer struct {
-	key       []byte
-	Registry  BindingLookup
-	Principal PrincipalLookup
-	Ledger    CommitmentLedger
-	Clock     func() time.Time
+	key                     []byte
+	issuer, audience, keyID string
+	Registry                BindingLookup
+	Principal               PrincipalLookup
+	Ledger                  CommitmentLedger
+	Clock                   func() time.Time
 	// KeySource rereads the private issuer file for each assertion. Configure once
 	// before concurrent use. Returned transient key bytes are cleared after use.
 	KeySource func() ([]byte, error)
@@ -192,7 +191,7 @@ func (s *Signer) Preflight(ctx context.Context, id string) error {
 }
 func (s *Signer) Assertion(ctx context.Context, id string) (string, error) {
 	var key []byte
-	if s == nil {
+	if s == nil || !assertionConfigRE.MatchString(s.issuer) || !assertionConfigRE.MatchString(s.audience) || !assertionConfigRE.MatchString(s.keyID) {
 		return "", ErrIdentity
 	}
 	if s.KeySource != nil {
@@ -218,8 +217,8 @@ func (s *Signer) Assertion(ctx context.Context, id string) (string, error) {
 	if b.ExpiresAt < expires {
 		expires = b.ExpiresAt
 	}
-	header, _ := json.Marshal(map[string]string{"alg": "HS256", "typ": "JWT", "kid": "toolyard-preview-v1"})
-	payload, _ := json.Marshal(map[string]any{"iss": "toolyard", "aud": Audience, "sub": "toolyard:agent:" + p.ID, "sid": b.SessionID, "iat": now, "exp": expires, "human": false})
+	header, _ := json.Marshal(map[string]string{"alg": "HS256", "typ": "JWT", "kid": s.keyID})
+	payload, _ := json.Marshal(map[string]any{"iss": s.issuer, "aud": s.audience, "sub": "toolyard:agent:" + p.ID, "sid": b.SessionID, "iat": now, "exp": expires, "human": false})
 	encode := base64.RawURLEncoding.EncodeToString
 	signed := encode(header) + "." + encode(payload)
 	mac := hmac.New(sha256.New, key)
@@ -229,18 +228,70 @@ func (s *Signer) Assertion(ctx context.Context, id string) (string, error) {
 
 // Client has no startup discovery, proxy, redirect, session, or anonymous fallback.
 type Client struct {
-	Signer *Signer
-	http   *http.Client
+	Signer  *Signer
+	Profile Profile
+	// Check rechecks service-owned profile immutability and enabled connection
+	// state. Configure once before concurrent use; caller input cannot set it.
+	Check            func(context.Context) error
+	http             *http.Client
+	profile          Profile
+	approvalIdentity string
+	schemas          map[string]*jsonschema.Schema
 }
 
-func NewClient(signer *Signer) (*Client, error) {
-	if signer == nil {
+func NewClient(signer *Signer, profile Profile) (*Client, error) {
+	if signer == nil || validateProfile(profile) != nil {
 		return nil, ErrIdentity
 	}
-	transport := &http.Transport{Proxy: nil, DialContext: (&net.Dialer{Timeout: 2 * time.Second}).DialContext, ResponseHeaderTimeout: 3 * time.Second, DisableKeepAlives: true}
-	return &Client{Signer: signer, http: &http.Client{Transport: transport, Timeout: 5 * time.Second, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}}, nil
+	raw, err := json.Marshal(profile)
+	if err != nil {
+		return nil, ErrIdentity
+	}
+	fixed, err := ParseProfile(raw)
+	if err != nil {
+		return nil, ErrIdentity
+	}
+	public, err := ParseProfile(raw)
+	if err != nil {
+		return nil, ErrIdentity
+	}
+	snapshot := *signer
+	snapshot.issuer = fixed.Issuer
+	snapshot.audience = fixed.Audience
+	snapshot.keyID = fixed.KeyID
+	schemas := map[string]*jsonschema.Schema{}
+	for _, tool := range fixed.Tools {
+		compiled, err := compileSchema(tool.Schema)
+		if err != nil {
+			return nil, ErrIdentity
+		}
+		schemas[tool.Operation] = compiled
+	}
+	httpTimeout := time.Duration(fixed.HeaderTimeoutSeconds+5) * time.Second
+	if httpTimeout > time.Duration(fixed.TimeoutSeconds)*time.Second {
+		httpTimeout = time.Duration(fixed.TimeoutSeconds) * time.Second
+	}
+	transport := &http.Transport{Proxy: nil, DialContext: (&net.Dialer{Timeout: 2 * time.Second}).DialContext, ResponseHeaderTimeout: time.Duration(fixed.HeaderTimeoutSeconds) * time.Second, DisableKeepAlives: true}
+	canonical, err := json.Marshal(fixed)
+	if err != nil {
+		return nil, ErrIdentity
+	}
+	digest := sha256.Sum256(canonical)
+	return &Client{Signer: &snapshot, Profile: public, profile: fixed, approvalIdentity: hex.EncodeToString(digest[:]), schemas: schemas, http: &http.Client{Transport: transport, Timeout: httpTimeout, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}}, nil
+}
+
+// ApprovalIdentity binds pending approvals to the full private profile snapshot.
+// Public metadata edits cannot change it; a different profile requires approval.
+func (c *Client) ApprovalIdentity() string {
+	if c == nil {
+		return ""
+	}
+	return c.approvalIdentity
 }
 func (c *Client) post(ctx context.Context, id string, rpcID int, method string, params any, notification bool, assertions *[]string) (json.RawMessage, error) {
+	if c == nil || c.http == nil || ctx.Err() != nil {
+		return nil, ErrTransport
+	}
 	body := map[string]any{"jsonrpc": "2.0", "method": method}
 	if !notification {
 		body["id"] = rpcID
@@ -252,24 +303,39 @@ func (c *Client) post(ctx context.Context, id string, rpcID int, method string, 
 	if err != nil || len(raw) > 16384 {
 		return nil, ErrTransport
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, Endpoint, bytes.NewReader(raw))
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.profile.Endpoint, bytes.NewReader(raw))
 	if err != nil {
 		return nil, ErrTransport
 	}
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Accept", "application/json, text/event-stream")
-	req.Header.Set("MCP-Protocol-Version", ProtocolVersion)
+	req.Header.Set("MCP-Protocol-Version", c.profile.ProtocolVersion)
+	if ctx.Err() != nil {
+		return nil, ErrTransport
+	}
+	if c.Check == nil || c.Check(ctx) != nil {
+		return nil, ErrIdentity
+	}
 	token, err := c.Signer.Assertion(ctx, id)
 	if err != nil {
 		return nil, ErrIdentity
 	}
 	req.Header.Set("Authorization", "Bearer "+token)
 	*assertions = append(*assertions, token)
-	resp, err := c.http.Do(req)
-	if err != nil {
+	if c.Check == nil || c.Check(ctx) != nil {
+		return nil, ErrIdentity
+	}
+	if ctx.Err() != nil {
 		return nil, ErrTransport
 	}
+	resp, err := c.http.Do(req)
+	if err != nil {
+		return nil, postError(ctx, method, err)
+	}
 	defer resp.Body.Close()
+	if ctx.Err() != nil {
+		return nil, postError(ctx, method, ctx.Err())
+	}
 	if len(resp.Header.Values("Mcp-Session-Id")) != 0 {
 		return nil, ErrTransport
 	}
@@ -279,7 +345,10 @@ func (c *Client) post(ctx context.Context, id string, rpcID int, method string, 
 	}
 	out, err := io.ReadAll(io.LimitReader(resp.Body, limit+1))
 	if err != nil || int64(len(out)) > limit {
-		return nil, ErrTransport
+		return nil, postError(ctx, method, err)
+	}
+	if ctx.Err() != nil {
+		return nil, postError(ctx, method, ctx.Err())
 	}
 	if notification {
 		if resp.StatusCode != http.StatusAccepted && resp.StatusCode != http.StatusOK {
@@ -327,114 +396,148 @@ func (c *Client) post(ctx context.Context, id string, rpcID int, method string, 
 	return rpc.Result, nil
 }
 
+func postError(ctx context.Context, method string, err error) error {
+	var timeout net.Error
+	if method == "tools/call" && (errors.Is(ctx.Err(), context.DeadlineExceeded) || errors.As(err, &timeout) && timeout.Timeout()) {
+		return ErrUnknownOutcome
+	}
+	return ErrTransport
+}
+
+// reflectsAssertion conservatively rejects any eight-byte credential fragment,
+// including JSON-escaped text, JSON nested in strings, and combined text chunks.
+// False-positive refusal is safer than credential persistence in gateway audits.
 func reflectsAssertion(raw []byte, assertions []string) bool {
 	var decoded any
 	if json.Unmarshal(raw, &decoded) != nil {
 		return true
 	}
-	var contains func(any) bool
-	contains = func(value any) bool {
+	fragments := map[string]bool{}
+	for _, token := range assertions {
+		for i := 0; i+8 <= len(token); i++ {
+			fragments[token[i:i+8]] = true
+		}
+	}
+	matches := func(text string) bool {
+		for i := 0; i+8 <= len(text); i++ {
+			if fragments[text[i:i+8]] {
+				return true
+			}
+		}
+		return false
+	}
+	var all, texts []string
+	total := 0
+	var visit func(any, int, int) bool
+	visit = func(value any, depth, decodedStrings int) bool {
+		if depth > 36 {
+			return true
+		}
 		switch value := value.(type) {
 		case string:
-			for _, assertion := range assertions {
-				if strings.Contains(value, assertion) {
+			total += len(value)
+			if total > 4194304 || matches(value) {
+				return true
+			}
+			all = append(all, value)
+			if decodedStrings < 4 && json.Valid([]byte(value)) {
+				var nested any
+				if json.Unmarshal([]byte(value), &nested) == nil && visit(nested, depth+1, decodedStrings+1) {
 					return true
 				}
 			}
 		case []any:
 			for _, item := range value {
-				if contains(item) {
+				if visit(item, depth+1, decodedStrings) {
 					return true
 				}
 			}
 		case map[string]any:
-			for field, item := range value {
-				if contains(field) || contains(item) {
+			keys := make([]string, 0, len(value))
+			for key := range value {
+				keys = append(keys, key)
+			}
+			sort.Strings(keys)
+			for _, key := range keys {
+				if matches(key) {
+					return true
+				}
+				if key == "text" {
+					if text, ok := value[key].(string); ok {
+						texts = append(texts, text)
+					}
+				}
+				if visit(value[key], depth+1, decodedStrings) {
 					return true
 				}
 			}
 		}
 		return false
 	}
-	return contains(decoded)
+	if visit(decoded, 0, 0) {
+		return true
+	}
+	return matches(strings.Join(texts, "")) || matches(strings.Join(all, ""))
 }
 
-var arguments = map[string]map[string]bool{
-	"preview_create":  {"source_ref": true, "request_id": true, "snapshot_id": true, "pool": true, "lifetime_seconds": true},
-	"preview_inspect": {"environment_id": true}, "preview_heartbeat": {"environment_id": true, "job_id": true},
-	"preview_release": {"environment_id": true, "outcome": true, "job_id": true}, "preview_snapshots": {}, "preview_results": {"environment_id": true},
-}
-
-func validArguments(operation string, args map[string]any) bool {
-	allowed, ok := arguments[operation]
+// validateArguments uses only the reviewed local schema. No remote validator or
+// caller-supplied schema can choose fields, defaults, identity, or transport.
+func (c *Client) validateArguments(operation string, args map[string]any) (map[string]any, error) {
+	if c == nil {
+		return nil, ErrIdentity
+	}
+	schema, ok := c.schemas[operation]
 	if !ok {
-		return false
+		return nil, ErrArguments
 	}
-	for k, v := range args {
-		if !allowed[k] {
-			return false
-		}
-		switch k {
-		case "source_ref":
-			s, ok := v.(string)
-			if !ok || !utf8.ValidString(s) || utf8.RuneCountInString(s) < 1 || utf8.RuneCountInString(s) > 210 || strings.TrimSpace(s) == "" {
-				return false
-			}
-		case "request_id", "environment_id", "job_id":
-			s, ok := v.(string)
-			if !ok || !uuidRE.MatchString(s) {
-				return false
-			}
-		case "snapshot_id":
-			s, ok := v.(string)
-			if !ok || !snapshotRE.MatchString(s) {
-				return false
-			}
-		case "pool":
-			s, ok := v.(string)
-			if !ok || (s != "large" && s != "medium") {
-				return false
-			}
-		case "outcome":
-			s, ok := v.(string)
-			if !ok || (s != "released" && s != "success" && s != "failure") {
-				return false
-			}
-		case "lifetime_seconds":
-			var n float64
-			switch v := v.(type) {
-			case int:
-				n = float64(v)
-			case int64:
-				n = float64(v)
-			case float64:
-				n = v
-			case json.Number:
-				var err error
-				n, err = v.Float64()
-				if err != nil {
-					return false
-				}
-			default:
-				return false
-			}
-			if math.IsNaN(n) || math.IsInf(n, 0) || n != math.Trunc(n) || n < 300 || n > 21600 {
-				return false
-			}
+	if args == nil {
+		args = map[string]any{}
+	}
+	raw, err := json.Marshal(args)
+	if err != nil || len(raw) > 16384 {
+		return nil, ErrArguments
+	}
+	instance, err := jsonschema.UnmarshalJSON(bytes.NewReader(raw))
+	if err != nil || schema.Validate(instance) != nil {
+		return nil, ErrArguments
+	}
+	fixed, ok := instance.(map[string]any)
+	if !ok {
+		return nil, ErrArguments
+	}
+	var reviewed map[string]any
+	for _, tool := range c.profile.Tools {
+		if tool.Operation == operation {
+			reviewed = tool.Schema["properties"].(map[string]any)
 		}
 	}
-	if operation == "preview_create" {
-		return args["source_ref"] != nil && args["request_id"] != nil && args["snapshot_id"] != nil
+	for field, value := range fixed {
+		property, ok := reviewed[field].(map[string]any)
+		if !ok || property["type"] != "integer" {
+			continue
+		}
+		number, ok := value.(json.Number)
+		if !ok {
+			return nil, ErrArguments
+		}
+		exact, ok := new(big.Rat).SetString(number.String())
+		if !ok || !exact.IsInt() || !exact.Num().IsInt64() {
+			return nil, ErrArguments
+		}
+		fixed[field] = exact.Num().Int64()
 	}
-	return operation == "preview_snapshots" || args["environment_id"] != nil
+	return fixed, nil
 }
 func (c *Client) Preflight(ctx context.Context, id, operation string, args map[string]any) error {
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
-	if !validArguments(operation, args) {
-		return ErrArguments
+	if _, err := c.validateArguments(operation, args); err != nil {
+		return err
 	}
-	if c == nil || c.Signer == nil {
+	if c == nil || c.Signer == nil || ctx.Err() != nil {
+		return ErrIdentity
+	}
+	if c.Check == nil || c.Check(ctx) != nil {
 		return ErrIdentity
 	}
 	return c.Signer.Preflight(ctx, id)
@@ -448,6 +551,9 @@ func (c *Client) RequireApprovalBinding(ctx context.Context, id string, createdA
 	if c == nil || c.Signer == nil || c.Signer.Ledger == nil || createdAtMillis <= 0 {
 		return ErrIdentity
 	}
+	if c.Check == nil || c.Check(ctx) != nil {
+		return ErrIdentity
+	}
 	ledger, ok := c.Signer.Ledger.(ApprovalCommitmentLedger)
 	if !ok || ledger.CommittedBefore(ctx, id, createdAtMillis) != nil {
 		return ErrIdentity
@@ -455,45 +561,26 @@ func (c *Client) RequireApprovalBinding(ctx context.Context, id string, createdA
 	return c.Signer.Preflight(ctx, id)
 }
 func (c *Client) Call(ctx context.Context, id, operation string, args map[string]any) (json.RawMessage, error) {
-	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	if c == nil {
+		return nil, ErrIdentity
+	}
+	ctx, cancel := context.WithTimeout(ctx, time.Duration(c.profile.TimeoutSeconds)*time.Second)
 	defer cancel()
 	if err := c.Preflight(ctx, id, operation, args); err != nil {
 		return nil, err
 	}
-	// Keep a fixed primitive copy. Normalize integer-valued MCP JSON numbers so
-	// Python receives an integer even for an accepted json.Number("300e0").
-	fixedArgs := make(map[string]any, len(args))
-	for field, value := range args {
-		if field == "lifetime_seconds" {
-			switch value := value.(type) {
-			case int:
-				fixedArgs[field] = int64(value)
-			case int64:
-				fixedArgs[field] = value
-			case float64:
-				fixedArgs[field] = int64(value)
-			case json.Number:
-				number, _ := value.Float64()
-				fixedArgs[field] = int64(number)
-			}
-		} else {
-			fixedArgs[field] = value
-		}
-	}
-	assertions := make([]string, 0, 3)
-	initial, err := c.post(ctx, id, 1, "initialize", map[string]any{"protocolVersion": ProtocolVersion, "capabilities": map[string]any{}, "clientInfo": map[string]string{"name": "toolyard-bks-preview-adapter", "version": "0.1.0"}}, false, &assertions)
+	fixedArgs, err := c.validateArguments(operation, args)
 	if err != nil {
 		return nil, err
 	}
-	var initialized map[string]json.RawMessage
-	var version string
-	if json.Unmarshal(initial, &initialized) != nil || json.Unmarshal(initialized["protocolVersion"], &version) != nil || version != ProtocolVersion {
-		return nil, ErrTransport
-	}
-	if _, err = c.post(ctx, id, 0, "notifications/initialized", nil, true, &assertions); err != nil {
+	assertions := make([]string, 0, 4)
+	if _, err := c.discover(ctx, id, &assertions); err != nil {
 		return nil, err
 	}
-	result, err := c.post(ctx, id, 2, "tools/call", map[string]any{"name": operation, "arguments": fixedArgs}, false, &assertions)
+	if ctx.Err() != nil {
+		return nil, ErrTransport
+	}
+	result, err := c.post(ctx, id, 3, "tools/call", map[string]any{"name": operation, "arguments": fixedArgs}, false, &assertions)
 	if err != nil {
 		return nil, err
 	}
@@ -502,24 +589,20 @@ func (c *Client) Call(ctx context.Context, id, operation string, args map[string
 	if json.Unmarshal(result, &tool) != nil || json.Unmarshal(tool["content"], &content) != nil || content == nil {
 		return nil, ErrTransport
 	}
-	if failure, ok := tool["isError"]; ok {
-		// Tool-level errors are not safe response content. Do not copy even a
-		// well-formed remote error body to the caller or Toolyard's audit records.
-		if string(bytes.TrimSpace(failure)) != "false" {
-			return nil, ErrTransport
-		}
+	if failure, ok := tool["isError"]; ok && string(bytes.TrimSpace(failure)) != "false" {
+		return nil, ErrTransport
 	}
 	return result, nil
-}
-func Operations() []string {
-	return []string{"preview_create", "preview_inspect", "preview_heartbeat", "preview_release", "preview_snapshots", "preview_results"}
 }
 func SafeError(err error) string {
 	if errors.Is(err, ErrIdentity) {
 		return ErrIdentity.Error()
 	}
+	if errors.Is(err, ErrUnknownOutcome) {
+		return ErrUnknownOutcome.Error()
+	}
 	if errors.Is(err, ErrTransport) {
 		return ErrTransport.Error()
 	}
-	return "preview request rejected"
+	return "trusted MCP request rejected"
 }

@@ -2,6 +2,7 @@ package gateway
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -59,6 +60,10 @@ type UpstreamConfig struct {
 	// PerUserAuth answers who has connected a PerUser upstream. Required
 	// when PerUser is set; populated by the upstreams package.
 	PerUserAuth PerUserAuth `json:"-"`
+
+	// Trusted replaces the per-user OAuth credential provider with a verified
+	// agent assertion provider. Its stateless calls never use shared headers.
+	Trusted TrustedUpstream `json:"-"`
 }
 
 type upstream struct {
@@ -257,6 +262,21 @@ func (u *upstream) listTools(ctx context.Context) ([]mcp.Tool, error) {
 // tool may already have run.
 func (u *upstream) callTool(ctx context.Context, name string, args map[string]any) (*mcp.CallToolResult, error) {
 	u.lastUsed.Store(time.Now().UnixNano())
+	if provider := u.cfg.Trusted; provider != nil {
+		if u.retired.Load() || ctx.Err() != nil {
+			return mcp.NewToolResultError("assertion upstream is unavailable"), nil
+		}
+		raw, err := provider.Call(ctx, AgentIDFromContext(ctx), provider.Operation(name), args)
+		if err != nil {
+			// Providers may carry private diagnostics. Never persist their text.
+			return mcp.NewToolResultError("assertion upstream request failed; outcome may be unknown; retain the original request ID and parameters"), nil
+		}
+		var result mcp.CallToolResult
+		if json.Unmarshal(raw, &result) != nil {
+			return mcp.NewToolResultError("assertion upstream response invalid"), nil
+		}
+		return &result, nil
+	}
 
 	c, err := u.liveClient()
 	if err != nil {

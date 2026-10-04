@@ -1,4 +1,4 @@
-package previewassertion
+package trustedmcp
 
 import (
 	"context"
@@ -79,7 +79,7 @@ func persistentSigner(t *testing.T, db *store.DB, path string) *Signer {
 	return s
 }
 
-func TestPreviewLedgerRestartRemovalRotationAndSessionReassignment(t *testing.T) {
+func TestTrustedMCPLedgerRestartRemovalRotationAndSessionReassignment(t *testing.T) {
 	dir := privateTestDir(t)
 	path := filepath.Join(dir, "ledger.db")
 	db := ledgerDB(t, path)
@@ -126,7 +126,7 @@ func TestPreviewLedgerRestartRemovalRotationAndSessionReassignment(t *testing.T)
 	}
 }
 
-func TestPreviewLedgerSurvivesAgentDeletionAndCrossOwnerReassignment(t *testing.T) {
+func TestTrustedMCPLedgerSurvivesAgentDeletionAndCrossOwnerReassignment(t *testing.T) {
 	dir := privateTestDir(t)
 	db := ledgerDB(t, filepath.Join(dir, "ledger.db"))
 	seedLedgerPrincipal(t, db)
@@ -152,7 +152,7 @@ func TestPreviewLedgerSurvivesAgentDeletionAndCrossOwnerReassignment(t *testing.
 	}
 }
 
-func TestPreviewLedgerRejectsUpdateDeleteAndReplace(t *testing.T) {
+func TestTrustedMCPLedgerRejectsUpdateDeleteAndReplace(t *testing.T) {
 	db := ledgerDB(t, filepath.Join(t.TempDir(), "ledger.db"))
 	seedLedgerPrincipal(t, db)
 	l := &SQLLedger{DB: db.DB}
@@ -179,7 +179,7 @@ func TestPreviewLedgerRejectsUpdateDeleteAndReplace(t *testing.T) {
 	}
 }
 
-func TestPreviewLedgerConcurrentFirstUseCommitsOneSession(t *testing.T) {
+func TestTrustedMCPLedgerConcurrentFirstUseCommitsOneSession(t *testing.T) {
 	db := ledgerDB(t, filepath.Join(t.TempDir(), "ledger.db"))
 	seedLedgerPrincipal(t, db)
 	l := &SQLLedger{DB: db.DB}
@@ -205,7 +205,7 @@ func TestPreviewLedgerConcurrentFirstUseCommitsOneSession(t *testing.T) {
 	}
 }
 
-func TestPreviewLedgerRequiresExistingCommitBeforeDeferredApproval(t *testing.T) {
+func TestTrustedMCPLedgerRequiresExistingCommitBeforeDeferredApproval(t *testing.T) {
 	db := ledgerDB(t, filepath.Join(t.TempDir(), "ledger.db"))
 	seedLedgerPrincipal(t, db)
 	l := &SQLLedger{DB: db.DB}
@@ -225,7 +225,7 @@ func TestPreviewLedgerRequiresExistingCommitBeforeDeferredApproval(t *testing.T)
 	}
 }
 
-func TestPreviewPrincipalStrictOwnerEnrollmentAndRevocation(t *testing.T) {
+func TestTrustedMCPPrincipalStrictOwnerEnrollmentAndRevocation(t *testing.T) {
 	for _, statement := range []string{
 		`UPDATE users SET status='blocked' WHERE id='` + ledgerOwner + `'`,
 		`DELETE FROM users WHERE id='` + ledgerOwner + `'`,

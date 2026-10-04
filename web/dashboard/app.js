@@ -2767,6 +2767,12 @@ function viewServers() {
   if (draft.header == null) draft.header = IDENTITY_HEADER_DEFAULT;
   const identityRow = transport !== 'stdio' ? identityFields(draft, 'srv-id') : null;
   const whoRow = transport !== 'stdio' ? whoSignsInField(draft, 'srv-auth') : null;
+  const assertionRow = transport !== 'stdio' ? el('label', {},
+    el('div', { class: 'meta' }, 'Operator assertion profile (optional)'),
+    el('input', { id: 'srv-assertion-profile', value: draft.assertion_profile || '',
+      placeholder: 'Reviewed profile ID', on: { input: (e) => { draft.assertion_profile = e.target.value.trim(); } } }),
+    el('div', { class: 'meta' }, 'Use Each person and the reviewed profile URL. Do not set headers, environment or identity forwarding. New profiles stay disabled.'),
+  ) : null;
 
   const installedByName = new Map(state.servers.map((s) => [s.name, s]));
 
@@ -2844,6 +2850,7 @@ function viewServers() {
       envRow,
       headersRow,
       whoRow,
+      assertionRow,
       identityRow,
       el('div', { class: 'row', style: 'margin-top: 12px;' },
         el('button', { class: 'primary', on: { click: () => addServer() }}, 'Add server'),
@@ -2883,7 +2890,7 @@ function viewServers() {
               })()),
               el('td', {},
                 el('div', { class: 'row' },
-                  isHTTPUpstream(s) ? el('button', { on: { click: () => openOAuthPanel(s.name) }}, 'Auth…') : null,
+                  isHTTPUpstream(s) && !s.assertion_profile ? el('button', { on: { click: () => openOAuthPanel(s.name) }}, 'Auth…') : null,
                   (s.env_plaintext_keys && s.env_plaintext_keys.length)
                     ? el('button', { title: 'Move a plaintext env value into the encrypted secrets store', on: { click: () => convertEnvToSecret(s.name, s.env_plaintext_keys) }}, '🔑 Secret')
                     : null,
@@ -2945,6 +2952,7 @@ function whoSignsInField(d, id) {
 // that PATCHes auth_mode, and for per_user servers a look at who has
 // connected.
 function whoSignsInCell(s) {
+  if (s.assertion_profile) return el('span', { class: 'meta' }, 'Operator assertion: ' + s.assertion_profile);
   if (!isHTTPUpstream(s)) return el('span', { class: 'meta' }, '—');
   const cur = s.auth_mode || 'shared';
   const sel = el('select', {
@@ -3111,6 +3119,7 @@ function openServerEdit(s) {
   const id = s.identity && s.identity.header ? s.identity : null;
   const m = {
     name: s.name,
+    assertion_profile: s.assertion_profile || '',
     http: !!isHTTPUpstream(s),
     url: s.url || '',
     headersText: headersAsText(s.headers),
@@ -3220,7 +3229,7 @@ function renderServerEditModal() {
         el('label', {},
           el('div', { class: 'meta' }, 'URL'),
           el('input', {
-            id: 'srv-edit-url', value: m.url, placeholder: 'https://example.com/mcp',
+            id: 'srv-edit-url', value: m.url, placeholder: 'https://example.com/mcp', disabled: !!m.assertion_profile,
             on: { input: (e) => { m.url = e.target.value; } },
           }),
         ),
@@ -3229,12 +3238,12 @@ function renderServerEditModal() {
             'HTTP headers (Header: value per line). Values may be ', el('code', {}, 'secret://NAME'),
             `. Saved plaintext values show as ${MASKED_VALUE}: leave this box as it is to keep them, or re-enter them if you edit it.`),
           el('textarea', {
-            id: 'srv-edit-headers', placeholder: 'X-Api-Key: secret://MY_API_KEY', value: m.headersText,
+            id: 'srv-edit-headers', placeholder: 'X-Api-Key: secret://MY_API_KEY', value: m.headersText, disabled: !!m.assertion_profile,
             on: { input: (e) => { m.headersText = e.target.value; } },
           }),
         ),
-        whoSignsInField(m, 'srv-edit-auth'),
-        identityFields(m, 'srv-edit-id'),
+        m.assertion_profile ? el('div', { class: 'meta' }, 'Immutable operator assertion profile: ' + m.assertion_profile) : whoSignsInField(m, 'srv-edit-auth'),
+        m.assertion_profile ? null : identityFields(m, 'srv-edit-id'),
       ] : el('div', { class: 'meta' }, 'URL, headers, who signs in and identity forwarding apply to HTTP servers only.'),
       el('label', { class: 'check-row' },
         el('input', {
@@ -3473,6 +3482,7 @@ async function addServer() {
       body.identity = identityFromDraft(draft);
     }
     body.auth_mode = draft.auth_mode || 'shared';
+    if (draft.assertion_profile) body.assertion_profile = draft.assertion_profile.trim();
   }
   body.env = parseEnvText($('srv-env').value);
   if (!body.name) { toast('name required', 'error'); return; }
@@ -3487,6 +3497,8 @@ async function addServer() {
       toast('Saved, but failed to connect: ' + (out.warning || 'unknown'), 'error');
     } else if (!resp.ok) {
       throw new Error(out.error || ('HTTP ' + resp.status));
+    } else if (out && out.assertion_profile) {
+      toast('Saved disabled. An operator must verify the private profile before activation.');
     } else if (out && out.last_status === 'waiting_signin') {
       toast('Saved. Its tools appear once the first person connects on My connections.');
     } else {
@@ -5677,6 +5689,7 @@ function isHTTPUpstream(s) {
 }
 
 function oauthBadge(s) {
+  if (s.assertion_profile) return el('span', { class: 'badge' }, 'Operator assertion profile');
   if (!isHTTPUpstream(s)) return el('span', { class: 'meta' }, '—');
   const st = (state.oauthStatus || {})[s.name];
   if (!st) return el('span', { class: 'meta' }, 'unknown');

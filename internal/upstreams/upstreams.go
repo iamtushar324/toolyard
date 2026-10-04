@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"log"
 	"net/url"
+	"regexp"
 	"sort"
 	"strings"
 	"sync"
@@ -60,13 +61,16 @@ type Server struct {
 	// everyone, the default) or AuthPerUser (each person connects their own
 	// account from My connections; an agent's calls use its owner's token
 	// and never a shared one). http servers only.
-	AuthMode   string `json:"auth_mode"`
-	Enabled    bool   `json:"enabled"`
-	LastStatus string `json:"last_status,omitempty"`
-	LastError  string `json:"last_error,omitempty"`
-	ToolCount  int    `json:"tool_count"`
-	CreatedAt  int64  `json:"created_at"`
-	UpdatedAt  int64  `json:"updated_at"`
+	AuthMode string `json:"auth_mode"`
+	// AssertionProfile selects a service-owned assertion credential profile.
+	// It uses per_user authorization without an OAuth token or caller SID.
+	AssertionProfile string `json:"assertion_profile,omitempty"`
+	Enabled          bool   `json:"enabled"`
+	LastStatus       string `json:"last_status,omitempty"`
+	LastError        string `json:"last_error,omitempty"`
+	ToolCount        int    `json:"tool_count"`
+	CreatedAt        int64  `json:"created_at"`
+	UpdatedAt        int64  `json:"updated_at"`
 	// EnvPlaintextKeys is populated only by Masked(): the env keys whose
 	// values were masked (i.e. plaintext, not secret:// refs) so the UI can
 	// offer a "convert to secret" action. Never persisted.
@@ -130,12 +134,13 @@ type SecretResolver interface {
 
 // Service owns the upstream_servers table and keeps the live gateway in sync.
 type Service struct {
-	db      *store.DB
-	gw      *gateway.Gateway
-	policy  Policy
-	auth    HeaderProvider // optional
-	perUser PerUserAuth    // optional; without it per_user servers cannot connect
-	secrets SecretResolver // optional
+	db         *store.DB
+	gw         *gateway.Gateway
+	policy     Policy
+	auth       HeaderProvider // optional
+	perUser    PerUserAuth    // optional; without it per_user servers cannot connect
+	secrets    SecretResolver // optional
+	assertions func(context.Context, Server) (gateway.TrustedUpstream, error)
 
 	mu sync.Mutex // serializes connect/disconnect side-effects
 }
@@ -159,6 +164,12 @@ func (s *Service) SetPerUserAuth(a PerUserAuth) { s.perUser = a }
 // resolve at dial time. Nil disables the wiring (refs would then fail the
 // dial as missing secrets).
 func (s *Service) SetSecrets(r SecretResolver) { s.secrets = r }
+
+// SetAssertionProvider installs the private service-owned profile resolver.
+// A nil provider refuses assertion activation without affecting other servers.
+func (s *Service) SetAssertionProvider(p func(context.Context, Server) (gateway.TrustedUpstream, error)) {
+	s.assertions = p
+}
 
 // envDenied returns the first env key in the supplied map that the policy
 // forbids. Empty string means clean.
@@ -186,6 +197,12 @@ func (s *Service) toCfg(srv Server) gateway.UpstreamConfig {
 		Args:      srv.Args,
 		URL:       srv.URL,
 		Env:       srv.Env,
+	}
+	if srv.AssertionProfile != "" {
+		// The dedicated provider replaces every ordinary credential source.
+		// connect attaches Trusted; never attach OAuth/static header closures.
+		cfg.PerUser = true
+		return cfg
 	}
 	isHTTP := cfg.Transport == "github" || cfg.Transport == "http" || cfg.Transport == "streamable-http" || cfg.Transport == ""
 
@@ -332,7 +349,7 @@ func validate(srv Server) error {
 	// from the dashboard.
 	switch srv.Name {
 	case "builtin", "fixture", "memory", "tools", "mempalace", "notes", "skills",
-		"inbox", "session", "lake", "events", "policies", "servers", "audit", "access", "toolyard", "connections", "bks_preview":
+		"inbox", "session", "lake", "events", "policies", "servers", "audit", "access", "toolyard", "connections":
 		return ErrReserved
 	}
 	switch srv.Transport {
@@ -363,7 +380,27 @@ func validate(srv Server) error {
 	if err := validateAuthMode(srv); err != nil {
 		return err
 	}
+	if err := validateAssertionProfile(srv); err != nil {
+		return err
+	}
 	return validateIdentity(srv)
+}
+
+var assertionProfileRE = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9_-]{0,63}$`)
+
+func validateAssertionProfile(srv Server) error {
+	if srv.AssertionProfile == "" {
+		return nil
+	}
+	if !assertionProfileRE.MatchString(srv.AssertionProfile) || srv.Transport != "http" || srv.AuthMode != AuthPerUser ||
+		len(srv.Headers) != 0 || len(srv.Env) != 0 || srv.Command != "" || len(srv.Args) != 0 || srv.Identity != nil {
+		return fmt.Errorf("%w: assertion_profile requires a safe profile ID, http, per_user, and no credential or process overrides", ErrInvalid)
+	}
+	u, err := url.Parse(srv.URL)
+	if err != nil || u.Scheme != "http" || u.Host == "" || u.User != nil || u.RawQuery != "" || u.Fragment != "" {
+		return fmt.Errorf("%w: assertion profile endpoint must be a plain http URL without user information, query or fragment", ErrInvalid)
+	}
+	return nil
 }
 
 // validateAuthMode checks the sign-in mode: shared (or unset) is always
@@ -518,7 +555,7 @@ func (s *Service) LoadAll(ctx context.Context) error {
 		return err
 	}
 	for _, srv := range servers {
-		if !srv.Enabled {
+		if !srv.Enabled || srv.AssertionProfile != "" {
 			continue
 		}
 		// A stdio row saved before -no-stdio-upstreams was turned on must
@@ -535,11 +572,43 @@ func (s *Service) LoadAll(ctx context.Context) error {
 	return nil
 }
 
+// LoadAssertions registers enabled assertion catalogs from trusted local
+// profiles. Call this before the deferred approval sweep. It performs no
+// network discovery; normal upstreams remain on the separate LoadAll path.
+func (s *Service) LoadAssertions(ctx context.Context) error {
+	servers, err := s.list(ctx)
+	if err != nil {
+		return err
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	for _, srv := range servers {
+		if !srv.Enabled || srv.AssertionProfile == "" {
+			continue
+		}
+		if err := s.connect(ctx, srv); err != nil {
+			s.recordStatus(ctx, srv.Name, "", "trusted assertion profile unavailable", 0)
+		}
+	}
+	return nil
+}
+
+// AssertEnabled checks the persisted connector before each assertion POST.
+// Removal, disablement or any immutable configuration mismatch refuses it.
+func (s *Service) AssertEnabled(ctx context.Context, name, profile, endpoint string) error {
+	srv, err := s.get(ctx, name)
+	if err != nil || !srv.Enabled || profile == "" || srv.AssertionProfile != profile || srv.URL != endpoint ||
+		srv.AuthMode != AuthPerUser || srv.Transport != "http" || validate(*srv) != nil {
+		return errors.New("trusted assertion connector disabled or changed")
+	}
+	return nil
+}
+
 func (s *Service) list(ctx context.Context) ([]Server, error) {
 	rows, err := s.db.QueryContext(ctx,
 		`SELECT name, transport, COALESCE(command,''), COALESCE(args_json,''),
             COALESCE(url,''), COALESCE(env_json,''), COALESCE(headers_json,''),
-            COALESCE(identity_json,''), COALESCE(auth_mode,'shared'), enabled,
+            COALESCE(identity_json,''), COALESCE(auth_mode,'shared'), COALESCE(assertion_profile,''), enabled,
             COALESCE(last_status,''), COALESCE(last_error,''), tool_count,
             created_at, updated_at
          FROM upstream_servers ORDER BY name`)
@@ -553,7 +622,7 @@ func (s *Service) list(ctx context.Context) ([]Server, error) {
 		var argsRaw, envRaw, headersRaw, identityRaw string
 		var enabled int
 		if err := rows.Scan(&srv.Name, &srv.Transport, &srv.Command, &argsRaw,
-			&srv.URL, &envRaw, &headersRaw, &identityRaw, &srv.AuthMode, &enabled, &srv.LastStatus, &srv.LastError,
+			&srv.URL, &envRaw, &headersRaw, &identityRaw, &srv.AuthMode, &srv.AssertionProfile, &enabled, &srv.LastStatus, &srv.LastError,
 			&srv.ToolCount, &srv.CreatedAt, &srv.UpdatedAt); err != nil {
 			return nil, err
 		}
@@ -595,6 +664,9 @@ func (s *Service) Add(ctx context.Context, srv Server) (*Server, error) {
 	srv.CreatedAt = now
 	srv.UpdatedAt = now
 	srv.Enabled = true
+	if srv.AssertionProfile != "" {
+		srv.Enabled = false
+	}
 	srv.AuthMode = normalizeAuthMode(srv.AuthMode)
 
 	argsBlob, _ := json.Marshal(srv.Args)
@@ -603,10 +675,10 @@ func (s *Service) Add(ctx context.Context, srv Server) (*Server, error) {
 
 	_, err := s.db.ExecContext(ctx,
 		`INSERT INTO upstream_servers(name, transport, command, args_json, url,
-            env_json, headers_json, identity_json, auth_mode, enabled, created_at, updated_at)
-         VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`,
+            env_json, headers_json, identity_json, auth_mode, assertion_profile, enabled, created_at, updated_at)
+         VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		srv.Name, srv.Transport, nullStr(srv.Command), string(argsBlob),
-		nullStr(srv.URL), string(envBlob), string(headersBlob), identityJSON(srv.Identity), srv.AuthMode, 1, now, now)
+		nullStr(srv.URL), string(envBlob), string(headersBlob), identityJSON(srv.Identity), srv.AuthMode, nullStr(srv.AssertionProfile), boolInt(srv.Enabled), now, now)
 	if err != nil {
 		// SQLite reports unique constraint as "UNIQUE constraint failed".
 		if strings.Contains(strings.ToLower(err.Error()), "unique") {
@@ -615,6 +687,10 @@ func (s *Service) Add(ctx context.Context, srv Server) (*Server, error) {
 		return nil, err
 	}
 
+	if !srv.Enabled {
+		s.recordStatus(ctx, srv.Name, "disabled", "", 0)
+		return s.get(ctx, srv.Name)
+	}
 	if err := s.connect(ctx, srv); err != nil {
 		s.recordStatus(ctx, srv.Name, "", err.Error(), 0)
 		final, _ := s.get(ctx, srv.Name)
@@ -656,7 +732,7 @@ func (s *Service) ReconnectAfterAuth(ctx context.Context, name string) {
 	if err != nil {
 		return
 	}
-	if !srv.Enabled {
+	if !srv.Enabled || srv.AssertionProfile != "" {
 		return
 	}
 	s.mu.Lock()
@@ -674,7 +750,7 @@ func (s *Service) ReconnectAfterAuth(ctx context.Context, name string) {
 // first call. Best-effort, as ReconnectAfterAuth.
 func (s *Service) ReconnectAfterUserAuth(ctx context.Context, name, userID string) {
 	srv, err := s.get(ctx, name)
-	if err != nil || !srv.Enabled || srv.AuthMode != AuthPerUser {
+	if err != nil || !srv.Enabled || srv.AuthMode != AuthPerUser || srv.AssertionProfile != "" {
 		return
 	}
 	s.mu.Lock()
@@ -711,6 +787,9 @@ func (s *Service) Reconnect(ctx context.Context, name string) (*Server, error) {
 	if err != nil {
 		return nil, err
 	}
+	if srv.AssertionProfile != "" && !srv.Enabled {
+		return srv, nil
+	}
 	// Built-ins run a command the binary chose, not dashboard input.
 	if s.stdioRefused(*srv) && !isReservedBuiltin(name) {
 		return nil, errStdioDisabled
@@ -736,7 +815,15 @@ func (s *Service) stdioRefused(srv Server) bool {
 // without tools and recorded as waiting for a first sign-in; that is not
 // a failure.
 func (s *Service) connect(ctx context.Context, srv Server) error {
-	err := s.gw.AddUpstream(ctx, s.toCfg(srv))
+	cfg := s.toCfg(srv)
+	if srv.AssertionProfile != "" {
+		trusted, err := s.assertionConfig(ctx, srv)
+		if err != nil {
+			return err
+		}
+		cfg.Trusted = trusted
+	}
+	err := s.gw.AddUpstream(ctx, cfg)
 	if errors.Is(err, gateway.ErrWaitingForSignIn) {
 		s.recordStatus(ctx, srv.Name, gateway.StatusWaitingSignIn, "", 0)
 		s.gw.NotifyToolListChanged()
@@ -750,11 +837,22 @@ func (s *Service) connect(ctx context.Context, srv Server) error {
 	return nil
 }
 
+func (s *Service) assertionConfig(ctx context.Context, srv Server) (gateway.TrustedUpstream, error) {
+	if validate(srv) != nil || s.assertions == nil {
+		return nil, fmt.Errorf("%w: trusted assertion profile unavailable", ErrInvalid)
+	}
+	trusted, err := s.assertions(ctx, srv)
+	if err != nil || trusted == nil {
+		return nil, fmt.Errorf("%w: trusted assertion profile unavailable", ErrInvalid)
+	}
+	return trusted, nil
+}
+
 func (s *Service) get(ctx context.Context, name string) (*Server, error) {
 	row := s.db.QueryRowContext(ctx,
 		`SELECT name, transport, COALESCE(command,''), COALESCE(args_json,''),
             COALESCE(url,''), COALESCE(env_json,''), COALESCE(headers_json,''),
-            COALESCE(identity_json,''), COALESCE(auth_mode,'shared'), enabled,
+            COALESCE(identity_json,''), COALESCE(auth_mode,'shared'), COALESCE(assertion_profile,''), enabled,
             COALESCE(last_status,''), COALESCE(last_error,''), tool_count,
             created_at, updated_at
          FROM upstream_servers WHERE name = ?`, name)
@@ -762,7 +860,7 @@ func (s *Service) get(ctx context.Context, name string) (*Server, error) {
 	var argsRaw, envRaw, headersRaw, identityRaw string
 	var enabled int
 	if err := row.Scan(&srv.Name, &srv.Transport, &srv.Command, &argsRaw,
-		&srv.URL, &envRaw, &headersRaw, &identityRaw, &srv.AuthMode, &enabled, &srv.LastStatus, &srv.LastError,
+		&srv.URL, &envRaw, &headersRaw, &identityRaw, &srv.AuthMode, &srv.AssertionProfile, &enabled, &srv.LastStatus, &srv.LastError,
 		&srv.ToolCount, &srv.CreatedAt, &srv.UpdatedAt); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, ErrNotFound
@@ -786,6 +884,13 @@ func nullStr(s string) any {
 		return nil
 	}
 	return s
+}
+
+func boolInt(v bool) int {
+	if v {
+		return 1
+	}
+	return 0
 }
 
 // isReservedBuiltin reports whether name refers to a toolyard-managed
@@ -814,6 +919,9 @@ func isReservedBuiltin(name string) bool {
 // dashboard can show the failure; the operator may retry via the standard
 // reconnect endpoint.
 func (s *Service) UpsertBuiltin(ctx context.Context, srv Server) (*Server, error) {
+	if srv.AssertionProfile != "" {
+		return nil, fmt.Errorf("%w: assertion profiles are dashboard-managed upstreams", ErrInvalid)
+	}
 	if strings.TrimSpace(srv.Name) == "" {
 		return nil, fmt.Errorf("%w: name required", ErrInvalid)
 	}
@@ -844,8 +952,8 @@ func (s *Service) UpsertBuiltin(ctx context.Context, srv Server) (*Server, error
 	// rest. SQLite's "excluded" pseudo-table refers to the would-be-inserted row.
 	_, err := s.db.ExecContext(ctx,
 		`INSERT INTO upstream_servers(name, transport, command, args_json, url,
-            env_json, headers_json, identity_json, enabled, created_at, updated_at)
-         VALUES(?,?,?,?,?,?,?,?,?,?,?)
+            env_json, headers_json, identity_json, assertion_profile, enabled, created_at, updated_at)
+         VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
          ON CONFLICT(name) DO UPDATE SET
             transport = excluded.transport,
             command   = excluded.command,
@@ -854,10 +962,11 @@ func (s *Service) UpsertBuiltin(ctx context.Context, srv Server) (*Server, error
             env_json  = excluded.env_json,
             headers_json = excluded.headers_json,
             identity_json = excluded.identity_json,
+            assertion_profile = excluded.assertion_profile,
             enabled   = 1,
             updated_at = excluded.updated_at`,
 		srv.Name, srv.Transport, nullStr(srv.Command), string(argsBlob),
-		nullStr(srv.URL), string(envBlob), string(headersBlob), identityJSON(srv.Identity), 1, srv.CreatedAt, now)
+		nullStr(srv.URL), string(envBlob), string(headersBlob), identityJSON(srv.Identity), nullStr(srv.AssertionProfile), 1, srv.CreatedAt, now)
 	if err != nil {
 		return nil, err
 	}
@@ -961,12 +1070,13 @@ func maskValues(in map[string]string) (map[string]string, []string) {
 // again). Correctness only needs the live connections replaced, which
 // Update does by reconnecting.
 type Patch struct {
-	URL      *string            `json:"url"`
-	Headers  *map[string]string `json:"headers"`
-	Env      *map[string]string `json:"env"`
-	Identity OptionalIdentity   `json:"identity"`
-	AuthMode *string            `json:"auth_mode"`
-	Enabled  *bool              `json:"enabled"`
+	URL              *string            `json:"url"`
+	Headers          *map[string]string `json:"headers"`
+	Env              *map[string]string `json:"env"`
+	Identity         OptionalIdentity   `json:"identity"`
+	AuthMode         *string            `json:"auth_mode"`
+	AssertionProfile *string            `json:"assertion_profile"`
+	Enabled          *bool              `json:"enabled"`
 }
 
 // OptionalIdentity tells "not in the body" (Set false) apart from an
@@ -1012,6 +1122,12 @@ func (s *Service) Update(ctx context.Context, name string, patch Patch) (*Server
 		return nil, err
 	}
 	next := *cur
+	if patch.AssertionProfile != nil && *patch.AssertionProfile != cur.AssertionProfile {
+		return nil, fmt.Errorf("%w: assertion_profile is immutable; remove and add a separate connector", ErrInvalid)
+	}
+	if cur.AssertionProfile != "" && patch.URL != nil && strings.TrimSpace(*patch.URL) != cur.URL {
+		return nil, fmt.Errorf("%w: assertion profile endpoint is immutable", ErrInvalid)
+	}
 	if patch.URL != nil {
 		next.URL = strings.TrimSpace(*patch.URL)
 	}
@@ -1042,6 +1158,11 @@ func (s *Service) Update(ctx context.Context, name string, patch Patch) (*Server
 	if err := s.validateSecretRefs(ctx, next); err != nil {
 		return nil, err
 	}
+	if next.AssertionProfile != "" && next.Enabled {
+		if _, err := s.assertionConfig(ctx, next); err != nil {
+			return nil, err
+		}
+	}
 
 	// A bearer belongs to the host it was issued for. Before the url moves
 	// to another origin, drop the server's OAuth client and tokens (the
@@ -1069,10 +1190,10 @@ func (s *Service) Update(ctx context.Context, name string, patch Patch) (*Server
 		enabled = 1
 	}
 	if _, err := s.db.ExecContext(ctx,
-		`UPDATE upstream_servers SET url=?, env_json=?, headers_json=?, identity_json=?, auth_mode=?, enabled=?, updated_at=?
+		`UPDATE upstream_servers SET url=?, env_json=?, headers_json=?, identity_json=?, auth_mode=?, assertion_profile=?, enabled=?, updated_at=?
          WHERE name=?`,
 		nullStr(next.URL), string(envBlob), string(headersBlob), identityJSON(next.Identity),
-		normalizeAuthMode(next.AuthMode), enabled, time.Now().UnixMilli(), name); err != nil {
+		normalizeAuthMode(next.AuthMode), nullStr(next.AssertionProfile), enabled, time.Now().UnixMilli(), name); err != nil {
 		return nil, err
 	}
 

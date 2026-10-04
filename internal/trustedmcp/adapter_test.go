@@ -1,4 +1,4 @@
-package previewassertion
+package trustedmcp
 
 import (
 	"bytes"
@@ -19,12 +19,39 @@ import (
 	"time"
 )
 
+const Endpoint = "http://127.0.0.1:18791/mcp"
+const Audience = "bk-agent-test-pilot-preview-v1"
+const ProtocolVersion = "2025-11-25"
+
 const agentA = "ag_15c39202-4355-48bd-9b7c-dda16cd837c6"
 const agentB = "ag_2ba2fbf0-ed45-4349-9459-31d314b9d3a3"
 const owner = "u_ccff10d3-59cd-46ec-92ca-4bf657e312e8"
 const sessionA = "2d7debf2-ee5d-42b6-bc05-360a320eff72"
 const sessionB = "2c705f36-52fe-4d34-b9cc-eaa07fd23872"
 const now = int64(1800000000)
+
+func testProfile(t *testing.T) Profile {
+	t.Helper()
+	raw, err := os.ReadFile("../../config/preview-mcp.profile.json")
+	if err != nil {
+		t.Fatal("reviewed test profile unavailable")
+	}
+	p, err := ParseProfile(raw)
+	if err != nil {
+		t.Fatal("reviewed test profile invalid")
+	}
+	return p
+}
+
+func newTestClient(t *testing.T, s *Signer) *Client {
+	t.Helper()
+	c, err := NewClient(s, testProfile(t))
+	if err != nil {
+		t.Fatal("trusted test client unavailable")
+	}
+	c.Check = func(context.Context) error { return nil }
+	return c
+}
 
 func binding(id, sid string) Binding {
 	return Binding{id, owner, sid, now - 10, now + 120, "dedicated-per-session", strings.Repeat("f", 64), owner}
@@ -87,7 +114,7 @@ func signer(t *testing.T, bindings ...Binding) *Signer {
 		t.Fatal(err)
 	}
 	s.Clock = func() time.Time { return time.Unix(now, 0) }
-	return s
+	return newTestClient(t, s).Signer
 }
 func claims(t *testing.T, token string) map[string]any {
 	t.Helper()
@@ -105,7 +132,7 @@ func claims(t *testing.T, token string) map[string]any {
 	}
 	return c
 }
-func TestPreviewAssertionInteroperatesWithPinnedPythonVerifier(t *testing.T) {
+func TestTrustedMCPAssertionInteroperatesWithPinnedPythonVerifier(t *testing.T) {
 	root, err := filepath.Abs("testdata/python_contract")
 	if err != nil {
 		t.Fatal(err)
@@ -158,7 +185,7 @@ for key,clock in [(bytes([key[0]^1])*len(key),1800000000),(key,1800000030)]:
 		t.Fatalf("Python contract failed (%v), output bytes %d", err, len(output))
 	}
 }
-func TestPreviewParallelCallersKeepIndependentThirtySecondAssertions(t *testing.T) {
+func TestTrustedMCPParallelCallersKeepIndependentThirtySecondAssertions(t *testing.T) {
 	s := signer(t, binding(agentA, sessionA), binding(agentB, sessionB))
 	var wg sync.WaitGroup
 	for id, sid := range map[string]string{agentA: sessionA, agentB: sessionB} {
@@ -181,7 +208,7 @@ func TestPreviewParallelCallersKeepIndependentThirtySecondAssertions(t *testing.
 	}
 	wg.Wait()
 }
-func TestPreviewAssertionRejectsMissingDisabledExpiredAndCrossOwnerBindings(t *testing.T) {
+func TestTrustedMCPAssertionRejectsMissingDisabledExpiredAndCrossOwnerBindings(t *testing.T) {
 	for _, id := range []string{"", agentB, "dashboard:" + owner, "ag_------------------------------------"} {
 		if _, err := signer(t, binding(agentA, sessionA)).Assertion(context.Background(), id); !errors.Is(err, ErrIdentity) {
 			t.Error("untrusted identity accepted")
@@ -201,7 +228,7 @@ func TestPreviewAssertionRejectsMissingDisabledExpiredAndCrossOwnerBindings(t *t
 		}
 	}
 }
-func TestPreviewPreflightPinsIdentityAcrossDeferredApprovalAndCapsExpiry(t *testing.T) {
+func TestTrustedMCPPreflightPinsIdentityAcrossDeferredApprovalAndCapsExpiry(t *testing.T) {
 	b := binding(agentA, sessionA)
 	b.ExpiresAt = now + 2
 	s := signer(t, b)
@@ -221,7 +248,7 @@ func TestPreviewPreflightPinsIdentityAcrossDeferredApprovalAndCapsExpiry(t *test
 		t.Fatal("deferred identity changed")
 	}
 }
-func TestPreviewSignerRequiresLedgerAndRereadsIssuerWithoutRetainingTransientKey(t *testing.T) {
+func TestTrustedMCPSignerRequiresLedgerAndRereadsIssuerWithoutRetainingTransientKey(t *testing.T) {
 	s := signer(t, binding(agentA, sessionA))
 	if _, err := NewSigner(bytes.Repeat([]byte{'q'}, 32), s.Registry, s.Principal, nil); !errors.Is(err, ErrIdentity) {
 		t.Fatal("missing ledger accepted")
@@ -240,7 +267,7 @@ func TestPreviewSignerRequiresLedgerAndRereadsIssuerWithoutRetainingTransientKey
 	}
 }
 
-func TestPreviewRevocationDuringDurableCommitPreventsAssertion(t *testing.T) {
+func TestTrustedMCPRevocationDuringDurableCommitPreventsAssertion(t *testing.T) {
 	s := signer(t, binding(agentA, sessionA))
 	revoked := false
 	s.Registry = lookupFunc(func(context.Context, string, int64) (Binding, error) {
@@ -255,7 +282,7 @@ func TestPreviewRevocationDuringDurableCommitPreventsAssertion(t *testing.T) {
 	}
 }
 
-func TestPreviewPreflightRejectsIssuerRemovalAndUnsafeRefresh(t *testing.T) {
+func TestTrustedMCPPreflightRejectsIssuerRemovalAndUnsafeRefresh(t *testing.T) {
 	s := signer(t, binding(agentA, sessionA))
 	valid := true
 	s.KeySource = func() ([]byte, error) {
@@ -295,12 +322,22 @@ func goodResponse(req *http.Request) *http.Response {
 		return response(200, `{"jsonrpc":"2.0","id":1,"result":{"protocolVersion":"2025-11-25"}}`)
 	case "notifications/initialized":
 		return response(202, "")
+	case "tools/list":
+		raw, _ := os.ReadFile("../../config/preview-mcp.profile.json")
+		var p Profile
+		_ = json.Unmarshal(raw, &p)
+		tools := make([]map[string]any, 0, len(p.Tools))
+		for _, tool := range p.Tools {
+			tools = append(tools, map[string]any{"name": tool.Operation, "inputSchema": tool.Schema})
+		}
+		out, _ := json.Marshal(map[string]any{"jsonrpc": "2.0", "id": 2, "result": map[string]any{"tools": tools}})
+		return response(200, string(out))
 	default:
-		return response(200, `{"jsonrpc":"2.0","id":2,"result":{"content":[],"structuredContent":{"state":"queued"}}}`)
+		return response(200, `{"jsonrpc":"2.0","id":3,"result":{"content":[],"structuredContent":{"state":"queued"}}}`)
 	}
 }
-func TestPreviewFixedHandshakeRejectsForgedArgumentsWithoutNetwork(t *testing.T) {
-	c, _ := NewClient(signer(t, binding(agentA, sessionA)))
+func TestTrustedMCPFixedHandshakeRejectsForgedArgumentsWithoutNetwork(t *testing.T) {
+	c := newTestClient(t, signer(t, binding(agentA, sessionA)))
 	posts := 0
 	c.http.Transport = roundTrip(func(req *http.Request) (*http.Response, error) {
 		posts++
@@ -312,7 +349,7 @@ func TestPreviewFixedHandshakeRejectsForgedArgumentsWithoutNetwork(t *testing.T)
 	if err := c.Preflight(context.Background(), agentA, "preview_snapshots", nil); err != nil || posts != 0 {
 		t.Fatal("preflight used network")
 	}
-	if _, err := c.Call(context.Background(), agentA, "preview_snapshots", nil); err != nil || posts != 3 {
+	if _, err := c.Call(context.Background(), agentA, "preview_snapshots", nil); err != nil || posts != 4 {
 		t.Fatal("bounded stateless handshake failed")
 	}
 	for _, args := range []map[string]any{{"sid": sessionB}, {"session_id": sessionB}, {"Authorization": "forged"}, {"endpoint": "https://public.invalid"}, {"image": "caller-image"}} {
@@ -322,15 +359,15 @@ func TestPreviewFixedHandshakeRejectsForgedArgumentsWithoutNetwork(t *testing.T)
 		}
 	}
 }
-func TestPreviewRevocationStopsEverySubsequentPost(t *testing.T) {
-	for _, revokeAfter := range []int{0, 1, 2} {
+func TestTrustedMCPRevocationStopsEverySubsequentPost(t *testing.T) {
+	for _, revokeAfter := range []int{0, 1, 2, 3} {
 		t.Run(string(rune('0'+revokeAfter)), func(t *testing.T) {
 			s := signer(t, binding(agentA, sessionA))
 			posts := 0
 			s.Principal = func(_ context.Context, id string) (Principal, error) {
 				return Principal{id, owner, posts >= revokeAfter}, nil
 			}
-			c, _ := NewClient(s)
+			c := newTestClient(t, s)
 			c.http.Transport = roundTrip(func(req *http.Request) (*http.Response, error) { posts++; return goodResponse(req), nil })
 			if _, err := c.Call(context.Background(), agentA, "preview_snapshots", nil); !errors.Is(err, ErrIdentity) || posts != revokeAfter {
 				t.Fatal("revoked caller continued")
@@ -338,10 +375,10 @@ func TestPreviewRevocationStopsEverySubsequentPost(t *testing.T) {
 		})
 	}
 }
-func TestPreviewTransportDeniesRedirectStatefulAndMalformedResponses(t *testing.T) {
+func TestTrustedMCPTransportDeniesRedirectStatefulAndMalformedResponses(t *testing.T) {
 	for _, mode := range []string{"redirect", "session", "empty-session", "notification-session", "notification-body", "notification-size", "notification-content-type", "content-type", "version", "version-case", "oversize", "rpc-id", "rpc-null-id", "rpc-error", "duplicate", "rpc-case", "content-null", "content-case"} {
 		t.Run(mode, func(t *testing.T) {
-			c, _ := NewClient(signer(t, binding(agentA, sessionA)))
+			c := newTestClient(t, signer(t, binding(agentA, sessionA)))
 			posts := 0
 			c.http.Transport = roundTrip(func(req *http.Request) (*http.Response, error) {
 				posts++
@@ -380,12 +417,12 @@ func TestPreviewTransportDeniesRedirectStatefulAndMalformedResponses(t *testing.
 				case "rpc-case":
 					r.Body = io.NopCloser(strings.NewReader(`{"jsonrpc":"2.0","id":9,"ID":1,"result":{"protocolVersion":"2025-11-25"}}`))
 				case "content-null":
-					if posts == 3 {
-						r.Body = io.NopCloser(strings.NewReader(`{"jsonrpc":"2.0","id":2,"result":{"content":null}}`))
+					if posts == 4 {
+						r.Body = io.NopCloser(strings.NewReader(`{"jsonrpc":"2.0","id":3,"result":{"content":null}}`))
 					}
 				case "content-case":
-					if posts == 3 {
-						r.Body = io.NopCloser(strings.NewReader(`{"jsonrpc":"2.0","id":2,"result":{"Content":[]}}`))
+					if posts == 4 {
+						r.Body = io.NopCloser(strings.NewReader(`{"jsonrpc":"2.0","id":3,"result":{"Content":[]}}`))
 					}
 				}
 				return r, nil
@@ -395,9 +432,9 @@ func TestPreviewTransportDeniesRedirectStatefulAndMalformedResponses(t *testing.
 			}
 		})
 	}
-	c, _ := NewClient(signer(t, binding(agentA, sessionA)))
+	c := newTestClient(t, signer(t, binding(agentA, sessionA)))
 	transport := c.http.Transport.(*http.Transport)
-	if transport.Proxy != nil || c.http.Timeout != 5*time.Second || !transport.DisableKeepAlives {
+	if transport.Proxy != nil || c.http.Timeout != 40*time.Second || !transport.DisableKeepAlives {
 		t.Fatal("transport bounds changed")
 	}
 	if c.http.CheckRedirect(nil, nil) != http.ErrUseLastResponse {
@@ -405,21 +442,21 @@ func TestPreviewTransportDeniesRedirectStatefulAndMalformedResponses(t *testing.
 	}
 }
 
-func TestPreviewCallBoundsPreflightAndSendsCanonicalPythonIntegers(t *testing.T) {
+func TestTrustedMCPCallBoundsPreflightAndSendsCanonicalPythonIntegers(t *testing.T) {
 	s := signer(t, binding(agentA, sessionA))
 	s.Registry = lookupFunc(func(ctx context.Context, _ string, _ int64) (Binding, error) {
 		deadline, ok := ctx.Deadline()
-		if !ok || time.Until(deadline) > 10*time.Second {
-			t.Fatal("identity preflight lacks whole-operation deadline")
+		if !ok || time.Until(deadline) > 65*time.Second {
+			t.Fatal("identity lacks bounded operation deadline")
 		}
 		return binding(agentA, sessionA), nil
 	})
-	c, _ := NewClient(s)
+	c := newTestClient(t, s)
 	posts := 0
 	c.http.Transport = roundTrip(func(req *http.Request) (*http.Response, error) {
 		posts++
 		raw, _ := io.ReadAll(req.Body)
-		if posts == 3 {
+		if posts == 4 {
 			var body struct {
 				Params struct {
 					Arguments map[string]json.RawMessage `json:"arguments"`
@@ -433,17 +470,17 @@ func TestPreviewCallBoundsPreflightAndSendsCanonicalPythonIntegers(t *testing.T)
 		return goodResponse(req), nil
 	})
 	args := map[string]any{"source_ref": "pr:1039", "request_id": sessionA, "snapshot_id": "synthetic-v1", "lifetime_seconds": json.Number("300e0")}
-	if _, err := c.Call(context.Background(), agentA, "preview_create", args); err != nil || posts != 3 {
+	if _, err := c.Call(context.Background(), agentA, "preview_create", args); err != nil || posts != 4 {
 		t.Fatal("bounded integer-normalized request failed")
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	if _, err := c.Call(ctx, agentA, "preview_snapshots", nil); !errors.Is(err, ErrIdentity) || posts != 3 {
+	if _, err := c.Call(ctx, agentA, "preview_snapshots", nil); !errors.Is(err, ErrIdentity) || posts != 4 {
 		t.Fatal("cancelled request reached transport")
 	}
 }
 
-func TestPreviewStandalonePreflightHasWholeOperationDeadline(t *testing.T) {
+func TestTrustedMCPStandalonePreflightHasWholeOperationDeadline(t *testing.T) {
 	s := signer(t, binding(agentA, sessionA))
 	s.Registry = lookupFunc(func(ctx context.Context, _ string, _ int64) (Binding, error) {
 		deadline, ok := ctx.Deadline()
@@ -452,15 +489,16 @@ func TestPreviewStandalonePreflightHasWholeOperationDeadline(t *testing.T) {
 		}
 		return binding(agentA, sessionA), nil
 	})
-	c, _ := NewClient(s)
+	c := newTestClient(t, s)
 	if err := c.Preflight(context.Background(), agentA, "preview_snapshots", nil); err != nil {
 		t.Fatal("bounded standalone preflight failed")
 	}
 }
 
-func TestPreviewHistoricalApprovalCannotCreateFirstEnrollment(t *testing.T) {
+func TestTrustedMCPHistoricalApprovalCannotCreateFirstEnrollment(t *testing.T) {
 	s := signer(t, binding(agentA, sessionA))
-	c, _ := NewClient(s)
+	c := newTestClient(t, s)
+	s = c.Signer
 	created := now * 1000
 	if err := c.RequireApprovalBinding(context.Background(), agentA, created); !errors.Is(err, ErrIdentity) {
 		t.Fatal("ledger without historical proof accepted")
@@ -503,13 +541,13 @@ func TestPreviewHistoricalApprovalCannotCreateFirstEnrollment(t *testing.T) {
 	}
 }
 
-func TestPreviewToolFailuresAndReflectedAssertionsNeverReachCaller(t *testing.T) {
-	for _, mode := range []string{"tool-error", "wrong-error-type", "null-error-type", "error-reflection", "success-reflection", "escaped-reflection", "structured-reflection", "metadata-reflection", "previous-assertion-reflection"} {
+func TestTrustedMCPToolFailuresAndReflectedAssertionsNeverReachCaller(t *testing.T) {
+	for _, mode := range []string{"tool-error", "wrong-error-type", "null-error-type", "error-reflection", "success-reflection", "escaped-reflection", "structured-reflection", "metadata-reflection", "previous-assertion-reflection", "half-token-text", "four-byte-text", "nested-json-fragments"} {
 		t.Run(mode, func(t *testing.T) {
 			s := signer(t, binding(agentA, sessionA))
 			tick := int64(0)
 			s.Clock = func() time.Time { tick++; return time.Unix(now+tick, 0) }
-			c, _ := NewClient(s)
+			c := newTestClient(t, s)
 			posts := 0
 			var initialAssertion string
 			c.http.Transport = roundTrip(func(req *http.Request) (*http.Response, error) {
@@ -518,7 +556,7 @@ func TestPreviewToolFailuresAndReflectedAssertionsNeverReachCaller(t *testing.T)
 				if posts == 1 {
 					initialAssertion = assertion
 				}
-				if posts != 3 {
+				if posts != 4 {
 					return goodResponse(req), nil
 				}
 				result := map[string]any{"content": []any{map[string]any{"type": "text", "text": "safe synthetic receipt"}}, "isError": false}
@@ -539,13 +577,37 @@ func TestPreviewToolFailuresAndReflectedAssertionsNeverReachCaller(t *testing.T)
 					result["structuredContent"] = map[string]any{"authorization": assertion}
 				case "metadata-reflection":
 					result["_meta"] = map[string]any{"authorization": assertion}
+				case "half-token-text":
+					middle := len(assertion) / 2
+					result["content"] = []any{map[string]any{"type": "text", "text": assertion[:middle]}, map[string]any{"type": "text", "text": assertion[middle:]}}
+				case "four-byte-text":
+					var content []any
+					for i := 0; i < len(assertion); i += 4 {
+						end := i + 4
+						if end > len(assertion) {
+							end = len(assertion)
+						}
+						content = append(content, map[string]any{"type": "text", "text": assertion[i:end]})
+					}
+					result["content"] = content
+				case "nested-json-fragments":
+					var chunks []string
+					for i := 0; i < len(assertion); i += 4 {
+						end := i + 4
+						if end > len(assertion) {
+							end = len(assertion)
+						}
+						chunks = append(chunks, assertion[i:end])
+					}
+					encoded, _ := json.Marshal(map[string]any{"fragments": chunks})
+					result["content"] = []any{map[string]any{"type": "text", "text": string(encoded)}}
 				case "previous-assertion-reflection":
 					if initialAssertion == assertion {
 						t.Fatal("test clock did not produce distinct assertions")
 					}
 					result["content"] = []any{map[string]any{"type": "text", "text": initialAssertion}}
 				}
-				raw, _ := json.Marshal(map[string]any{"jsonrpc": "2.0", "id": 2, "result": result})
+				raw, _ := json.Marshal(map[string]any{"jsonrpc": "2.0", "id": 3, "result": result})
 				if mode == "escaped-reflection" {
 					raw = []byte(strings.Replace(string(raw), assertion, `\u0065`+assertion[1:], 1))
 				}
