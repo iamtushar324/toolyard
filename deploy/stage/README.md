@@ -62,6 +62,10 @@ request deduplication, permission refusal, exact parameter matching,
 one-use grants, and synthetic connector failures. It creates a pending
 question for a browser test. It never prints credentials or grant tokens.
 
+Run the settings behavior checks with `node --test scripts/settings-ui.test.cjs`.
+Test Settings Save, Discard, failed saves, draft retention, and category deep links.
+Check keyboard focus, the settings categories on a narrow screen, and table scrolling.
+
 Test browser answers separately: multiple choices, custom text, empty submission,
 drafts after an event and reload, keyboard input, and a 390-pixel layout.
 The browser preview resize operation may be unavailable. A same-origin frame
