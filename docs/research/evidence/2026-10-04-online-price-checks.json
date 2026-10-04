@@ -1,0 +1,27 @@
+{
+  "version": "stage-a9aec1f",
+  "catalog": {
+    "status": "ready",
+    "checked_at": "2026-10-04T07:02:22.515063159Z",
+    "model_count": 8190,
+    "refresh_hours": 6,
+    "source": "Models.dev",
+    "source_url": "https://models.dev/api.json?type=all"
+  },
+  "checks": [
+    "Online catalog is ready with source and freshness",
+    "openai provider filter returns exact provider prices",
+    "anthropic provider filter returns exact provider prices",
+    "google provider filter returns exact provider prices",
+    "Pagination has no duplicate models",
+    "Unknown model remains unavailable",
+    "MCP payload estimates never become billed spend",
+    "Settings does not expose obsolete manual prices",
+    "cost_input_usd_per_m cannot be set manually",
+    "cost_output_usd_per_m cannot be set manually",
+    "Price endpoint requires authentication",
+    "/pricing.js is served as a static asset",
+    "/settings.js is served as a static asset",
+    "/workspace.css is served as a static asset"
+  ]
+}

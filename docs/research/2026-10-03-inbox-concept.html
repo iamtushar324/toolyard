@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Toolyard — proposed Inbox layout</title>
+<style>
+:root{color-scheme:light}
+*{box-sizing:border-box}
+html,body{margin:0;background:#f5f6fa;color:#172136;font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
+.wrap{max-width:760px;margin:auto;padding:18px}
+.eyebrow{color:#586078;font-size:12px;letter-spacing:.06em;text-transform:uppercase}
+h1{margin:5px 0 4px;color:#172136;font-size:23px;line-height:1.25;letter-spacing:-.03em}
+.intro{margin:0 0 16px;color:#586078}
+.app{overflow:hidden;border:1px solid #dce0ea;border-radius:13px;background:#fff;color:#172136;box-shadow:0 8px 25px #17213608}
+.top{display:flex;align-items:center;gap:18px;padding:13px 16px;border-bottom:1px solid #e3e6ee;background:#fff;color:#172136}
+.brand{font-weight:750;color:#25334b}
+.nav{display:flex;gap:13px;flex-wrap:wrap;color:#586078;font-size:13px}
+.nav span{color:#586078;padding:3px 0}
+.nav .active{color:#4146b8;font-weight:700;border-bottom:2px solid #555bd3}
+.body{display:grid;grid-template-columns:220px minmax(0,1fr)}
+.queue{background:#f8f9fc;color:#172136;border-right:1px solid #e3e6ee;padding:15px 10px}
+.queuehead{display:flex;justify-content:space-between;padding:0 5px 12px;color:#172136;font-weight:650}
+.count{background:#e9eafc;color:#4146b8;border-radius:20px;padding:0 7px;font-size:12px}
+.item{margin-bottom:8px;border:1px solid #e2e5ed;border-radius:8px;padding:12px;background:#fff;color:#172136}
+.item.selected{background:#eeeefd;color:#172136;border-color:#9a9ee8;box-shadow:inset 3px 0 #555bd3}
+.item strong{display:block;color:#172136;font-size:14px;line-height:1.4}
+.meta{display:block;color:#667087;font-size:12px;margin-top:4px}
+.tag{display:inline-block;color:#875406;background:#fff2d6;padding:2px 7px;border-radius:4px;font-size:11px;font-weight:650;margin-bottom:6px}
+.secondary{padding:9px 6px;color:#687287;font-size:12px}
+.detail{padding:20px;background:#fff;color:#172136}
+.from{color:#687287;font-size:12px}
+h2{font-size:20px;line-height:1.25;margin:7px 0;color:#172136;letter-spacing:-.02em}
+.summary{font-size:14px;color:#49566c;margin:0 0 15px}
+.scope{display:grid;grid-template-columns:1fr 1fr;gap:10px;border:1px solid #e1e5ef;border-radius:8px;background:#fafbfe;color:#172136;padding:12px;margin:0 0 14px}
+.scope dt{color:#6b7485;font-size:11px;margin-bottom:2px}
+.scope dd{margin:0;color:#172136;font-size:13px;font-weight:650}
+.evidence{border-left:3px solid #b5c4ba;padding-left:10px;color:#4e5e55;font-size:12px;line-height:1.5}
+.evidence b{color:#304c3b}
+.permission{margin:14px 0 8px;font-size:13px;color:#374359}
+.permission span{color:#757f90}
+.actions{display:flex;gap:7px;flex-wrap:wrap;margin-top:15px}
+.button{display:inline-block;border:1px solid #d5dae5;border-radius:6px;padding:9px 11px;font-size:12px;font-weight:650;color:#3f4d64;background:#fff}
+.button.primary{background:#4d52c7;border-color:#4d52c7;color:#fff}
+.note{margin:10px 0 0;color:#6b7485;font-size:11px}
+.journey{border-top:1px solid #e3e6ee;padding:12px 16px;background:#fafbfe;color:#657188;font-size:12px}
+.journey b{color:#4146b8}
+.caption{font-size:12px;color:#657188;margin:11px 2px 0}
+@media(max-width:560px){.wrap{padding:10px}.body{grid-template-columns:1fr}.queue{display:none}.top{display:block}.nav{margin-top:7px}.detail{padding:16px}.journey{line-height:1.8}h1{font-size:21px}}
+</style>
+</head>
+<body>
+<main class="wrap">
+<div class="eyebrow">Product direction · static concept</div>
+<h1>One decision, full context.</h1>
+<p class="intro">A focused queue with the exact action, account, scope, and evidence.</p>
+<section class="app" aria-label="Proposed Toolyard Inbox">
+<div class="top"><span class="brand">toolyard</span><nav class="nav" aria-label="Proposed navigation"><span class="active">Inbox</span><span>Sessions</span><span>Connections</span><span>Activity</span></nav></div>
+<div class="body">
+<aside class="queue">
+<div class="queuehead">Needs you <span class="count">2</span></div>
+<div class="item selected"><span class="tag">Permission</span><strong>Deploy to test</strong><span class="meta">Release assistant · 4 min ago</span></div>
+<div class="item"><strong>Choose a report format</strong><span class="meta">Research assistant · 12 min ago</span></div>
+<div class="secondary">Snoozed · 1<br>Updates · 3<br>History</div>
+</aside>
+<article class="detail">
+<div class="from">Release assistant / Test release</div>
+<h2>Deploy to test</h2>
+<p class="summary">Publish the reviewed revision to the test service.</p>
+<dl class="scope">
+<div><dt>Target</dt><dd>Test environment</dd></div>
+<div><dt>Revision</dt><dd>abc123</dd></div>
+<div><dt>Account</dt><dd>Your release account</dd></div>
+<div><dt>Permission</dt><dd>One use · 15 minutes</dd></div>
+</dl>
+<div class="evidence"><b>Evidence attached</b><br>Test results and change details are available.<br>Recovery: restore the previous test release.</div>
+<div class="permission">☑ Deploy this revision<br><span>☐ Optional: post a task update</span></div>
+<div class="actions" aria-label="Example controls; display only"><span class="button primary">Approve test deployment</span><span class="button">Request changes</span><span class="button">Deny</span></div>
+<p class="note">Approval grants permission. The agent reports the result after execution.</p>
+</article>
+</div>
+<div class="journey"><b>Needs review</b> → Permission granted → Tool executed → Result verified</div>
+</section>
+<p class="caption">Example data only. This layout is a proposal. No controls perform live actions.</p>
+</main>
+</body>
+</html>

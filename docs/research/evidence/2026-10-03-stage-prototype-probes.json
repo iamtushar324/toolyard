@@ -1,0 +1,71 @@
+{
+  "date": "2026-10-03",
+  "kind": "Design prototype only",
+  "prototype": "2026-10-03-stage-ui-prototype.html",
+  "sourceUnchanged": true,
+  "observations": {
+    "custom": {
+      "request_id": "release",
+      "response_kind": "text",
+      "selected_option_ids": [],
+      "summary": "Keep one reversible stage release for a week.",
+      "text": "Keep one reversible stage release for a week."
+    },
+    "empty": {
+      "message": "Choose an option or write an answer.",
+      "submitted": false
+    },
+    "freeText": {
+      "request_id": "ready",
+      "response_kind": "text",
+      "selected_option_ids": [],
+      "summary": "I can answer from my phone without losing a draft.\nEvery test permission has a visible result.",
+      "text": "I can answer from my phone without losing a draft.\nEvery test permission has a visible result."
+    },
+    "multiple": {
+      "request_id": "checks",
+      "response_kind": "selection",
+      "selected_option_ids": [
+        "questions",
+        "permissions"
+      ],
+      "summary": "Question responses\nScoped permissions\nInclude keyboard access and a failed connection test.",
+      "text": "Include keyboard access and a failed connection test."
+    },
+    "singleChoice": {
+      "selected": [
+        "limited"
+      ],
+      "submitted": false
+    },
+    "viewport": {
+      "scrollWidth": 390,
+      "width": 390
+    }
+  },
+  "additionalObserved": {
+    "snoozeAfterQueueRefinement": {
+      "badge": 3,
+      "needsYou": 3,
+      "visiblePendingRows": 3,
+      "snoozedRequestHiddenFromNeedsYou": true,
+      "snoozedViewRows": 1,
+      "cssViewport": 390,
+      "scrollWidth": 390
+    },
+    "draftAcrossRequestSwitch": {
+      "selected": [
+        "questions",
+        "permissions"
+      ],
+      "text": "Include keyboard access and a failed connection test.",
+      "retained": true
+    },
+    "desktop": {
+      "cssViewport": 1402,
+      "scrollWidth": 1387
+    },
+    "externalNetworkRequests": 0
+  },
+  "limits": "Native preview tools were intermittent. Evaluation verified the listed states. No actual application API, authentication, SSE delivery, database persistence, or physical phone was tested."
+}

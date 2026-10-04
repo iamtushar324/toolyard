@@ -1,0 +1,22 @@
+{
+  "auth_status": 200,
+  "role": "member",
+  "settings_status": 403,
+  "pages": [
+    {
+      "url": "https://toolyard.stage.dev.beknown.live/#myservers",
+      "title": "Available services",
+      "width": 1536,
+      "bodyWidth": 1521,
+      "text": "Available services\n\nServices your agents can use.\n\nYour Beknown key\n\nBeknown services (BkCoreServices, BkDocsServices) use this key to record who made each change. It replaces your Bifrost virtual key.\n\nAsk a toolyard admin to provision your Beknown key.\nMy servers\n\nThe MCP servers and built-in data tools your agents can reach through toolyard.\n\nNo servers granted to you yet.\n\nAsk an admin for access to more servers."
+    },
+    {
+      "url": "https://toolyard.stage.dev.beknown.live/#connections",
+      "title": "Connections",
+      "width": 1536,
+      "bodyWidth": 1536,
+      "text": "Connections\n\nManage the accounts your agents use on your behalf.\n\nMy accounts\n\nConnect your account so your agents can act on your behalf. Each person uses their own account.\n\nYour available services do not require a personal account."
+    }
+  ],
+  "mobile_verified": false
+}
