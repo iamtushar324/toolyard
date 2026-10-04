@@ -49,7 +49,11 @@ func TestTrustedMCPProfilePrivateFileAndSnapshotImmutability(t *testing.T) {
 	if err != nil {
 		t.Fatal("profile fixture unavailable")
 	}
-	path := filepath.Join(t.TempDir(), "profile.json")
+	dir := t.TempDir()
+	if os.Chmod(dir, 0700) != nil {
+		t.Fatal("private test profile directory unavailable")
+	}
+	path := filepath.Join(dir, "profile.json")
 	if os.WriteFile(path, raw, 0600) != nil {
 		t.Fatal("test profile unavailable")
 	}
