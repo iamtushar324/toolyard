@@ -1,0 +1,18 @@
+{
+  "question_id": "rq_0ea2ceea4dfa4880",
+  "permission_id": "rq_0b5e3eaeb13f449f",
+  "checks": [
+    "HTTPS, stage metadata, and secure login cookie",
+    "Unauthenticated inbox refused",
+    "Cross-origin mutation refused",
+    "Two test connectors healthy",
+    "MCP question and idempotent submission",
+    "Write refused without permission",
+    "Permission refuses changed parameters",
+    "Approved synthetic write succeeds once",
+    "Logical tool failure remains an error",
+    "Slow connector completes",
+    "Simulated sign-in failure remains an error"
+  ],
+  "version": "stage-0492eb1"
+}

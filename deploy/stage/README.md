@@ -14,6 +14,10 @@ GOMAXPROCS=2 go build -p 1 -o /tmp/stage-fixtures ./cmd/stage-fixtures
 ```
 
 Install binaries into a new `/opt/toolyard-stage/releases/<revision>/` directory.
+Install the gateway as `toolyard` and the fixtures as `stage-fixtures`, matching
+the units' `ExecStart` paths. Before switching the symlink, confirm the gateway is
+executable as `toolyard-stage` (for example, `sudo -u toolyard-stage test -x
+/opt/toolyard-stage/releases/<revision>/toolyard`).
 Every directory above the binaries must permit traversal by the `toolyard-stage` user.
 Use `/opt/toolyard-stage/current` as the release symlink.
 The service account owns `/var/lib/toolyard-stage`, with mode 0700.
@@ -62,7 +66,8 @@ request deduplication, permission refusal, exact parameter matching,
 one-use grants, and synthetic connector failures. It creates a pending
 question for a browser test. It never prints credentials or grant tokens.
 
-Run the settings behavior checks with `node --test scripts/settings-ui.test.cjs`.
+Run the UI behavior checks with
+`node --test scripts/settings-ui.test.cjs scripts/product-scope-ui.test.cjs`.
 Test Settings Save, Discard, failed saves, draft retention, and category deep links.
 Check keyboard focus, the settings categories on a narrow screen, and table scrolling.
 

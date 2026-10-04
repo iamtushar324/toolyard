@@ -72,3 +72,65 @@ and Discard restored the saved value. Question drafts survived navigation and
 reload. Two issues remain outside this product cleanup: dialog dismissal loses
 keyboard focus, and Cmd/Ctrl+Enter does not send a question answer. These must not
 be reported as fixed by the feature removals.
+
+## Stage release and measured laptop checks
+
+Application commit `0492eb1` is deployed at <https://toolyard.stage.dev.beknown.live/>.
+Health reports `stage-0492eb1`, `ok: true`, two live upstreams and zero dropped
+metrics. The SQLite backup is
+`/var/lib/toolyard-stage/backups/before-0492eb1.sqlite`; rollback metadata is
+`/etc/toolyard-stage/before-0492eb1.json`. Previous release: `a9aec1f`.
+
+Only the stage gateway was restarted. The fixtures PID remained `1367099`; the
+production gateway PID remained `1446651`. A deployment filename mistake briefly
+produced HTTP 502: the candidate was installed as `toolyard-stage`, while the
+service expects `toolyard`. The filename was corrected before successful health
+and smoke checks. The runbook now documents the filename and executable check.
+No database restore, reset, or credential change occurred.
+
+All 11 live HTTPS/MCP smoke checks passed after recovery: stage identity and secure
+cookie, unauthenticated refusal, cross-origin refusal, both synthetic connectors,
+question idempotency, permission refusal, changed-parameter refusal, one-use grant,
+logical failure, slow response, and simulated sign-in failure.
+
+The Mac's Beknown Chrome profile opened the owner dashboard as Administrator.
+The local browser's read-only evaluation API does not expose `fetch`; direct JSON
+navigation was blocked by the browser. Thus the local session's raw `/v1/auth/me`
+HTTP status was not separately captured. The rendered Admin dashboard and its
+admin-only Settings were verified; this is not a claim that a separate server or
+cloud browser shares those cookies.
+
+In that signed-in local browser, after the release:
+
+- Desktop General at 1440×900 contains tool visibility and Save/Discard, without prices.
+- Data & exports at 394×852 contains activity and approval downloads, without memory import/export.
+- General at 320×740 has no page-wide horizontal overflow (`clientWidth == scrollWidth == 305`; the remaining 15 pixels are the browser's vertical scrollbar).
+- Hooks and Events bookmarks redirect to Activity; Memory/MemPalace redirect to exports; Call and Inbox/Sessions redirect to Inbox.
+- Activity has Calls and Tool activity, with no Agent events section or model pricing/spend cards.
+- The three synthetic laptop-review questions saved free text, one choice, and two choices successfully. A single choice in a minimum-two question showed validation and allowed correction before Send. Selecting a choice alone did not submit.
+- Existing feedback questions stayed intact; only synthetic checks were answered.
+
+Agent setup's removed hook tabs were verified by the UI behavior harness, without
+creating a new credential in the live browser. Failed-save retention is covered
+by the Settings behavior checks; live network-failure simulation and physical
+mobile hardware were not tested in this cleanup.
+
+A remaining responsive issue: switching a desktop Settings page to a narrow
+viewport can leave the selected category outside the horizontal category strip.
+All categories remain reachable; selecting them scrolls them into view. This,
+dialog focus return, and the unanswered Cmd/Ctrl+Enter shortcut issue remain
+follow-up polish items.
+
+Screenshots:
+
+![Desktop General after cleanup](screenshots/2026-10-04-laptop-review/after-desktop-settings.jpg)
+
+![Mobile exports at 394px](screenshots/2026-10-04-laptop-review/after-mobile394-exports.jpg)
+
+![Mobile General at 320px](screenshots/2026-10-04-laptop-review/after-mobile320-settings.jpg)
+
+The retained Permissions form was also checked with a reversible synthetic
+File location guidance edit: Save reported success, reload retained the value,
+and a second Save restored the original blank value. All seven category headings
+were reached in the deployed local browser. README product scope and Settings
+paths now describe the reduced dashboard rather than the retired surfaces.
