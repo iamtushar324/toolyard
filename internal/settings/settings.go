@@ -65,9 +65,9 @@ const (
 	// 7-day baseline triggers a rate_spike anomaly. Default 3.
 	AnomalyRateZScore = "anomaly_rate_z_score"
 
-	// CostInputUsdPerM: USD per 1M input tokens (default 0).
-	CostInputUsdPerM = "cost_input_usd_per_m"
-	// CostOutputUsdPerM: USD per 1M output tokens (default 0).
+	// Deprecated: prices come from the public model catalog. These legacy
+	// keys are hidden and reject writes; stored values stay for rollback.
+	CostInputUsdPerM  = "cost_input_usd_per_m"
 	CostOutputUsdPerM = "cost_output_usd_per_m"
 
 	// Telegram chat-approval channel keys. TelegramBotToken stores the
@@ -218,6 +218,9 @@ func (s *Service) All(ctx context.Context) (map[string]any, error) {
 	defer s.mu.RUnlock()
 	out := make(map[string]any, len(s.cache))
 	for k, v := range s.cache {
+		if k == CostInputUsdPerM || k == CostOutputUsdPerM {
+			continue
+		}
 		if IsSecretKey(k) {
 			// Emit only the presence flag. A non-empty JSON string ("..."
 			// is at minimum 2 bytes) means the operator has set it.
@@ -451,6 +454,9 @@ func (s *Service) GetBoolDefault(key string, def bool) bool {
 
 // Set persists value (must be JSON-serializable) and updates the cache.
 func (s *Service) Set(ctx context.Context, key string, value any) error {
+	if key == CostInputUsdPerM || key == CostOutputUsdPerM {
+		return errors.New("model prices are automatic and cannot be set manually")
+	}
 	if key == "" {
 		return errors.New("key required")
 	}
@@ -477,6 +483,9 @@ func (s *Service) Set(ctx context.Context, key string, value any) error {
 // consistent.
 func (s *Service) Patch(ctx context.Context, updates map[string]any) error {
 	for k := range updates {
+		if k == CostInputUsdPerM || k == CostOutputUsdPerM {
+			return errors.New("model prices are automatic and cannot be set manually")
+		}
 		if IsSecretKey(k) {
 			return errors.New("secret keys are write-only via the rotate endpoint")
 		}

@@ -62,7 +62,7 @@ const state = {
     overview: null,
     tools: [],
     agents: [],
-    cost: { rows: [], input_usd_per_m: 0, output_usd_per_m: 0 },
+    cost: { rows: [], status: 'unmetered', billed_usd: null },
     autoRules: [],
     loading: false,
   },
@@ -4929,6 +4929,7 @@ function urlBase64ToUint8Array(b64) {
 // ---- insights view ---------------------------------------------------------
 
 function viewInsights() {
+  pricingEnsure();
   const ranges = ['1h', '24h', '7d', '30d', '90d'];
   const o = state.insights.overview || {};
   const cardNum = (label, value, sub) => el('div', {
@@ -5127,26 +5128,21 @@ function viewInsights() {
       ),
   );
 
-  // Cost panel
+  // Tool payloads are not provider token usage and cannot measure a bill.
   const costRows = state.insights.cost.rows || [];
-  const totalUsd = costRows.reduce((acc, r) => acc + (r.usd_estimated || 0), 0);
   const costCard = el('div', { class: 'card' },
-    el('h2', {}, 'Cost (estimated)'),
-    el('p', { class: 'meta' },
-      'Token estimate: 1 token ≈ 4 bytes. Edit the per-million USD rates in Settings — they default to 0 (i.e. cost panel is dark) so we don\'t pretend to know what your stack costs.',
-    ),
-    el('div', { class: 'row', style: 'gap: 6px; margin-bottom: 8px;' },
-      el('span', { class: 'meta' }, 'Rates: input $' + state.insights.cost.input_usd_per_m + '/M · output $' + state.insights.cost.output_usd_per_m + '/M · estimated total: '),
-      el('strong', {}, '$' + totalUsd.toFixed(4)),
-    ),
-    costRows.length === 0 ? el('div', { class: 'empty' }, 'No cost data in this range yet.') :
+    el('h2', {}, 'Model spend'),
+    el('span', { class: 'badge' }, 'Usage unavailable'),
+    el('p', { class: 'meta' }, 'Connected agents do not report their model or provider token counts. Toolyard cannot calculate their spend or enforce a spend limit.'),
+    el('h3', {}, 'Tool payload estimates'),
+    el('p', { class: 'meta' }, 'Approximate payload tokens use one token per four bytes. These values exclude conversation context, model output, and cache usage.'),
+    costRows.length === 0 ? el('div', { class: 'empty' }, 'No tool payload data in this range yet.') :
       el('table', {},
-        el('thead', {}, el('tr', {}, el('th', {}, 'Tool'), el('th', {}, 'Tokens in'), el('th', {}, 'Tokens out'), el('th', {}, 'USD'))),
+        el('thead', {}, el('tr', {}, el('th', {}, 'Tool'), el('th', {}, 'Request tokens ≈'), el('th', {}, 'Response tokens ≈'))),
         el('tbody', {}, ...costRows.slice(0, 30).map((r) => el('tr', {},
           el('td', {}, el('code', {}, r.tool_name)),
           el('td', {}, fmtNum(r.tokens_in)),
           el('td', {}, fmtNum(r.tokens_out)),
-          el('td', {}, '$' + r.usd_estimated.toFixed(4)),
         ))),
       ),
     el('div', { class: 'row', style: 'margin-top: 8px;' },
@@ -5161,6 +5157,7 @@ function viewInsights() {
     agentCard,
     autoCard,
     costCard,
+    viewModelPrices(),
   );
 }
 
@@ -5428,6 +5425,8 @@ document.addEventListener('keydown', (e) => {
 function render() {
   const root = $('app') || document.body;
   const focus = captureFocus();
+  const settingsTabScroll = root.querySelector('[aria-label="Settings categories"]')?.scrollLeft || 0;
+  const previousSettingsTab = root.querySelector('[aria-label="Settings categories"] [aria-current="page"]')?.id;
   captureDisclosures(root);
   root.innerHTML = '';
   if (state.setupRequired) { root.appendChild(viewSetup()); return; }
@@ -5459,6 +5458,16 @@ function render() {
     default:              body = viewApprovals();
   }
   root.appendChild(shell(withSectionTabs(body)));
+  const settingsTabs = root.querySelector('[aria-label="Settings categories"]');
+  if (settingsTabs && settingsTabs.scrollWidth > settingsTabs.clientWidth) {
+    settingsTabs.scrollLeft = settingsTabScroll;
+    const selected = settingsTabs.querySelector('[aria-current="page"]');
+    if (selected && selected.id !== previousSettingsTab) {
+      const bounds = settingsTabs.getBoundingClientRect(), active = selected.getBoundingClientRect();
+      if (active.left < bounds.left) settingsTabs.scrollLeft += active.left - bounds.left;
+      else if (active.right > bounds.right) settingsTabs.scrollLeft += active.right - bounds.right;
+    }
+  }
   restoreDisclosures(root);
   restoreFocus(focus);
   for (const [index, modal] of [...root.querySelectorAll('.modal-bg .modal')].entries()) {

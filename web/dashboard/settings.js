@@ -1,7 +1,7 @@
 // Workspace settings. Non-secret drafts survive live updates and tab reloads.
 // Credentials stay in memory and are never written to browser storage.
 const SETTINGS_PAGES = [
-  { id: 'general', title: 'General', icon: 'sliders', description: 'Choose which tools agents see and set usage estimates.' },
+  { id: 'general', title: 'General', icon: 'sliders', description: 'Choose which tools agents see and review automatic model prices.' },
   { id: 'permissions', title: 'Permissions', icon: 'shield', description: 'Control requests, evidence, and restricted tool calls.' },
   { id: 'notifications', title: 'Notifications', icon: 'bell', description: 'Choose when and how Toolyard asks for your attention.' },
   { id: 'security', title: 'Security & access', icon: 'lock', description: 'Manage passkeys and access from the command line.' },
@@ -20,6 +20,10 @@ function settingsInit() {
     const saved = JSON.parse(sessionStorage.getItem(settingsStorageKey()));
     if (saved && Date.now() - saved.at < 86400000 && saved.drafts) settingsUI.drafts = saved.drafts;
   } catch (_) {}
+  for (const draft of Object.values(settingsUI.drafts)) {
+    if (!draft || typeof draft !== 'object') continue;
+    delete draft.cost_input_usd_per_m; delete draft.cost_output_usd_per_m;
+  }
 }
 function settingsPersist() {
   try { sessionStorage.setItem(settingsStorageKey(), JSON.stringify({ at: Date.now(), drafts: settingsUI.drafts })); } catch (_) {}
@@ -84,12 +88,6 @@ function settingsValidate(page, body) {
       const n = Number(body[key]);
       if (body[key] === '' || !Number.isInteger(n) || n < min || n > max) throw new Error('Enter a whole number from ' + min + ' to ' + max + '.');
       body[key] = n;
-    }
-  }
-  for (const key of ['cost_input_usd_per_m', 'cost_output_usd_per_m']) {
-    if (Object.hasOwn(body, key)) {
-      if (body[key] === '' || !Number.isFinite(Number(body[key])) || Number(body[key]) < 0) throw new Error('Enter a rate of zero or more.');
-      body[key] = Number(body[key]);
     }
   }
   return body;
@@ -198,9 +196,10 @@ function settingsGeneral() {
       settingsValue(page, 'surface_mode', 'full') === 'top_n' ? el('div', {},
         settingsInput(page, 'top_n_count', 'Visible tool count', 'Extra tools beyond the router and memory tools.', { type: 'number', min: 1, max: 200, step: 1, fallback: 20 }),
         settingsInput(page, 'top_n_personalize_after', 'Personalize after', 'Successful calls before an agent receives its own most used tools.', { type: 'number', min: 0, max: 1000000, step: 1, fallback: 100 })) : null),
-    settingsSection('Usage estimates', 'Rates apply to the estimates on the Usage page. Zero leaves the cost at zero.',
-      settingsInput(page, 'cost_input_usd_per_m', 'Input rate', 'USD per million input tokens.', { type: 'number', min: 0, step: 'any', fallback: 0 }),
-      settingsInput(page, 'cost_output_usd_per_m', 'Output rate', 'USD per million output tokens.', { type: 'number', min: 0, step: 'any', fallback: 0 })));
+    settingsSection('Automatic model prices', 'Toolyard gets provider-specific prices from Models.dev every six hours.',
+      pricingStatus(),
+      el('p', { class: 'meta' }, 'Prices include separate input, output, and cache rates when the source publishes them.'),
+      el('button', { type: 'button', on: { click: () => { navigate('insights'); requestAnimationFrame(() => document.getElementById('model-prices')?.scrollIntoView({ block: 'start' })); } } }, 'View model prices')));
 }
 function settingsPermissions() {
   const page = 'permissions', info = state.inbox.info || {};

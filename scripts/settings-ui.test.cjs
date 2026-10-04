@@ -44,7 +44,15 @@ test('numbers reject empty, fractional, and out-of-range values', () => {
   const h = harness();
   for (const value of ['', 0, 201, 2.5]) assert.throws(() => h.settingsValidate('general', { top_n_count: value }), /whole number/);
   assert.equal(h.settingsValidate('general', { top_n_count: '25' }).top_n_count, 25);
-  assert.throws(() => h.settingsValidate('general', { cost_input_usd_per_m: -1 }), /zero or more/);
+});
+
+test('obsolete manual prices are removed from saved drafts', () => {
+  const h = harness();
+  h.storage.set('toolyard.settings.test-user', JSON.stringify({ at: Date.now(), drafts: {
+    general: { cost_input_usd_per_m: 2, cost_output_usd_per_m: 8, top_n_count: 25 },
+  } }));
+  h.settingsUI.userId = null; h.settingsInit();
+  assert.deepEqual(Object.keys(h.settingsUI.drafts.general), ['top_n_count']);
 });
 
 test('a failed save keeps the draft and the previous stored value', async () => {

@@ -73,6 +73,7 @@ import (
 	"github.com/tusharbhardwaj/toolyard/internal/oauth"
 	"github.com/tusharbhardwaj/toolyard/internal/passkey"
 	"github.com/tusharbhardwaj/toolyard/internal/policy"
+	"github.com/tusharbhardwaj/toolyard/internal/pricing"
 	"github.com/tusharbhardwaj/toolyard/internal/push"
 	"github.com/tusharbhardwaj/toolyard/internal/realtime"
 	"github.com/tusharbhardwaj/toolyard/internal/secrets"
@@ -103,6 +104,7 @@ type Server struct {
 	settings     *settings.Service
 	usage        *usage.Service
 	metrics      *metrics.Reader
+	pricing      *pricing.Catalog
 	// metricsRecorder, when set, lets /v1/health surface the
 	// async-flusher's dropped-event counter — a quiet warning sign that
 	// the metrics buffer is overflowing (often the canary for "the
@@ -164,6 +166,7 @@ type Options struct {
 	Settings     *settings.Service
 	Usage        *usage.Service
 	Metrics      *metrics.Reader
+	Pricing      *pricing.Catalog
 	// MetricsRecorder, when set, exposes the async metrics writer's
 	// dropped-event counter on /v1/health. Optional — nil omits the
 	// field from the response.
@@ -256,6 +259,7 @@ func New(ctx context.Context, opts Options) *Server {
 		settings:                 opts.Settings,
 		usage:                    opts.Usage,
 		metrics:                  opts.Metrics,
+		pricing:                  opts.Pricing,
 		metricsRecorder:          opts.MetricsRecorder,
 		autoApproval:             opts.AutoApproval,
 		policy:                   opts.Policy,
@@ -398,6 +402,7 @@ func (s *Server) Routes(mux *http.ServeMux) {
 	mux.HandleFunc("/v1/insights/anomalies", s.insightsAnomalies)
 	mux.HandleFunc("/v1/insights/anomalies/", s.insightsAnomalyAction)
 	mux.HandleFunc("/v1/insights/cost", s.insightsCost)
+	mux.HandleFunc("/v1/insights/pricing", s.insightsPricing)
 	mux.HandleFunc("/v1/insights/auto/rules", s.autoRulesCollection)
 	mux.HandleFunc("/v1/insights/auto/rules/", s.autoRulesItem)
 	mux.HandleFunc("/v1/insights/purge-agent", s.insightsPurgeAgent)
