@@ -14,9 +14,9 @@ func TestWorkspaceAssets(t *testing.T) {
 	for _, page := range []string{"/", "/login"} {
 		rec := httptest.NewRecorder()
 		handler.ServeHTTP(rec, httptest.NewRequest("GET", page, nil))
-		pattern := regexp.MustCompile(`(?:src|href)="(/(?:settings\.js|pricing\.js|workspace\.css)\?v=[^"]+)"`)
+		pattern := regexp.MustCompile(`(?:src|href)="(/(?:settings\.js|workspace\.css)\?v=[^"]+)"`)
 		links := pattern.FindAllStringSubmatch(rec.Body.String(), -1)
-		want := 3
+		want := 2
 		if page == "/login" {
 			want = 1
 		}

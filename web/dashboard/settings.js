@@ -1,12 +1,12 @@
 // Workspace settings. Non-secret drafts survive live updates and tab reloads.
 // Credentials stay in memory and are never written to browser storage.
 const SETTINGS_PAGES = [
-  { id: 'general', title: 'General', icon: 'sliders', description: 'Choose which tools agents see and review automatic model prices.' },
+  { id: 'general', title: 'General', icon: 'sliders', description: 'Choose which tools agents see.' },
   { id: 'permissions', title: 'Permissions', icon: 'shield', description: 'Control requests, evidence, and restricted tool calls.' },
   { id: 'notifications', title: 'Notifications', icon: 'bell', description: 'Choose when and how Toolyard asks for your attention.' },
   { id: 'security', title: 'Security & access', icon: 'lock', description: 'Manage passkeys and access from the command line.' },
   { id: 'secrets', title: 'Secrets', icon: 'key', description: 'Store credentials for your connections.' },
-  { id: 'data', title: 'Data & exports', icon: 'download', description: 'Download workspace records and import memory.' },
+  { id: 'data', title: 'Data & exports', icon: 'download', description: 'Download tool activity and permission records.' },
   { id: 'about', title: 'About', icon: 'info', description: 'Review this workspace and its available features.' },
 ];
 const settingsUI = { page: 'general', search: '', drafts: {}, errors: {}, saved: {}, busy: {}, userId: null, secret: null, secretEdit: null };
@@ -195,11 +195,7 @@ function settingsGeneral() {
       ], 'full'),
       settingsValue(page, 'surface_mode', 'full') === 'top_n' ? el('div', {},
         settingsInput(page, 'top_n_count', 'Visible tool count', 'Extra tools beyond the router and memory tools.', { type: 'number', min: 1, max: 200, step: 1, fallback: 20 }),
-        settingsInput(page, 'top_n_personalize_after', 'Personalize after', 'Successful calls before an agent receives its own most used tools.', { type: 'number', min: 0, max: 1000000, step: 1, fallback: 100 })) : null),
-    settingsSection('Automatic model prices', 'Toolyard gets provider-specific prices from Models.dev every six hours.',
-      pricingStatus(),
-      el('p', { class: 'meta' }, 'Prices include separate input, output, and cache rates when the source publishes them.'),
-      el('button', { type: 'button', on: { click: () => { navigate('insights'); requestAnimationFrame(() => document.getElementById('model-prices')?.scrollIntoView({ block: 'start' })); } } }, 'View model prices')));
+        settingsInput(page, 'top_n_personalize_after', 'Personalize after', 'Successful calls before an agent receives its own most used tools.', { type: 'number', min: 0, max: 1000000, step: 1, fallback: 100 })) : null));
 }
 function settingsPermissions() {
   const page = 'permissions', info = state.inbox.info || {};
@@ -317,16 +313,9 @@ function settingsData() {
   const download = (title, description, csv, json) => settingsRow(title, description,
     el('div', { class: 'row' }, csv ? el('a', { class: 'button-link', href: csv, target: '_blank', rel: 'noopener' }, uiIcon('download'), 'CSV') : null,
       el('a', { class: 'button-link', href: json, target: '_blank', rel: 'noopener' }, uiIcon('download'), 'JSON')));
-  const memory = state.authConfig?.capabilities?.memory !== false;
-  return el('div', {}, settingsSection('Workspace exports', 'Exports include stored records. Approval exports exclude decision tokens.',
+  return settingsSection('Workspace exports', 'Exports include stored records. Approval exports exclude decision tokens.',
     download('Activity log', 'Tool calls, decisions, and workspace changes.', '/v1/audit/export?format=csv', '/v1/audit/export?format=json'),
-    download('Approvals', 'Current and previous tool approvals.', '/v1/approvals/export?format=csv', '/v1/approvals/export?format=json'),
-    memory ? download('Memory', 'Entries in the workspace memory store.', null, '/v1/memory/export') : null),
-    memory ? settingsSection('Import memory', 'Merge entries into the existing store, or replace the store with a file.',
-      el('div', { class: 'settings-import' },
-        el('label', { for: 'mem-import-mode' }, 'Import mode', el('select', { id: 'mem-import-mode' }, el('option', { value: 'merge' }, 'Merge entries'), el('option', { value: 'replace' }, 'Replace all entries'))),
-        el('label', { for: 'mem-import-file' }, 'JSON file', el('input', { id: 'mem-import-file', type: 'file', accept: 'application/json,.json' })),
-        el('button', { on: { click: importMemoryFile } }, 'Import file'))) : null);
+    download('Approvals', 'Current and previous tool approvals.', '/v1/approvals/export?format=csv', '/v1/approvals/export?format=json'));
 }
 function settingsAbout() {
   const config = state.authConfig || {};
@@ -335,6 +324,5 @@ function settingsAbout() {
     settingsRow('Version', 'The deployed Toolyard version.', el('code', {}, config.version || 'Unknown')),
     settingsRow('Connections', 'Services available in this workspace.', el('span', {}, String(state.servers.length))),
     settingsRow('Agents', 'Agents enrolled in this workspace.', el('span', {}, String(state.agents.length))),
-    settingsRow('Available features', '', el('div', { class: 'row' }, ...Object.entries(config.capabilities || {}).filter(([, enabled]) => enabled).map(([name]) => el('span', { class: 'badge' }, name)))),
     config.environment === 'stage' ? el('div', { class: 'settings-notice' }, 'Stage uses an isolated database and test connectors. Your feedback stays in this workspace.') : null);
 }

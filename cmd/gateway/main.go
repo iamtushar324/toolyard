@@ -1600,7 +1600,6 @@ func staticHandler() http.Handler {
 	appHash := assetHash(sub, "app.js")
 	cssHash := assetHash(sub, "style.css")
 	settingsHash := assetHash(sub, "settings.js")
-	pricingHash := assetHash(sub, "pricing.js")
 	workspaceHash := assetHash(sub, "workspace.css")
 	swHash := assetHash(sub, "sw.js")
 	loginHash := assetHash(sub, "login.js")
@@ -1608,7 +1607,6 @@ func staticHandler() http.Handler {
 		out := strings.ReplaceAll(string(body), `src="/app.js"`, `src="/app.js?v=`+appHash+`"`)
 		out = strings.ReplaceAll(out, `href="/style.css"`, `href="/style.css?v=`+cssHash+`"`)
 		out = strings.ReplaceAll(out, `src="/settings.js"`, `src="/settings.js?v=`+settingsHash+`"`)
-		out = strings.ReplaceAll(out, `src="/pricing.js"`, `src="/pricing.js?v=`+pricingHash+`"`)
 		out = strings.ReplaceAll(out, `href="/workspace.css"`, `href="/workspace.css?v=`+workspaceHash+`"`)
 		return []byte(out)
 	}
