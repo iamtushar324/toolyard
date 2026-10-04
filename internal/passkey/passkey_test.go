@@ -265,3 +265,23 @@ func TestStagePasskeyReadFailureIsClosed(t *testing.T) {
 		t.Fatal("legacy predicate failed open")
 	}
 }
+
+func TestPasskeyGateIsUserScoped(t *testing.T) {
+	s, _ := newSvc(t)
+	a := newSoftAuth(testOrigin)
+	register(t, s, a)
+	if on, e := s.CheckEnabledFor(t.Context(), owner.ID); e != nil || !on {
+		t.Fatal("owner gate disabled", e)
+	}
+	if on, e := s.CheckEnabledFor(t.Context(), "member_without_key"); e != nil || on {
+		t.Fatal("another user's passkey enabled member gate", e)
+	}
+	id, opts, e := s.BeginAssertion(t.Context(), owner, "decide:test", testOrigin, "yard.example.com")
+	if e != nil {
+		t.Fatal(e)
+	}
+	response := get(t, a, opts, owner.ID)
+	if _, e = s.VerifyCredentialFor(t.Context(), "another_member", "test", &inbox.PasskeyAssertion{SessionID: id, Response: response}); !errors.Is(e, ErrPurpose) {
+		t.Fatal("another owner assertion accepted", e)
+	}
+}

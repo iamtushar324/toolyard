@@ -25,7 +25,7 @@ func TestDecisionRecordsDecider(t *testing.T) {
 	ctx := context.Background()
 	r := submitDeploy(t, e, "ag_1")
 	alice := actor.Decider{UserID: "u_alice", Email: "alice@example.com", Name: "Alice", Via: actor.ViaDashboard}
-	got, err := e.svc.Decide(ctx, r.ID, Decision{Action: "approve", Allow: []bool{true, true, false}, Decider: alice})
+	got, err := e.decide(ctx, r.ID, Decision{Action: "approve", Allow: []bool{true, true, false}, Decider: alice})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -82,7 +82,7 @@ func TestRedeemNamesIssuer(t *testing.T) {
 	ctx := context.Background()
 	r := submitDeploy(t, e, "ag_1")
 	alice := actor.Decider{UserID: "u_alice", Email: "alice@example.com", Name: "Alice", Via: actor.ViaDashboard}
-	if _, err := e.svc.Decide(ctx, r.ID, Decision{Action: "approve", Allow: []bool{true, true, false}, Decider: alice}); err != nil {
+	if _, err := e.decide(ctx, r.ID, Decision{Action: "approve", Allow: []bool{true, true, false}, Decider: alice}); err != nil {
 		t.Fatal(err)
 	}
 	views, err := e.svc.Status(ctx, "ag_1", []string{r.ID})
@@ -117,7 +117,7 @@ func TestDecisionDefaultsDeciderFromBy(t *testing.T) {
 	e := newEnv(t)
 	ctx := context.Background()
 	r := submitDeploy(t, e, "ag_1")
-	got, err := e.svc.Decide(ctx, r.ID, Decision{Action: "deny", By: "barsha"})
+	got, err := e.decide(ctx, r.ID, Decision{Action: "deny", By: "barsha"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -129,7 +129,7 @@ func TestDecisionDefaultsDeciderFromBy(t *testing.T) {
 	}
 
 	r2 := submitDeploy(t, e, "ag_1")
-	got, err = e.svc.Decide(ctx, r2.ID, Decision{Action: "return"})
+	got, err = e.decide(ctx, r2.ID, Decision{Action: "return"})
 	if err != nil {
 		t.Fatal(err)
 	}

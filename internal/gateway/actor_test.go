@@ -357,16 +357,16 @@ func TestGrantUseDecider(t *testing.T) {
 	ctx := context.Background()
 	agent := WithAgentID(ctx, "ag_1")
 	sub, err := f.svc.Submit(ctx, "ag_1", &inbox.Submission{
-		Kind: inbox.KindAccess, Title: "Run the thing", Summary: "One run.", Message: "I'd like to run t.run once in production to finish the task.",
-		Facts: &inbox.Facts{WhyNow: "w", IfItGoesWrong: "g", Undo: "u"}, Audio: inbox.Audio{Script: "Run it?"}, Urgency: inbox.UrgencySoon,
-		Tools: []inbox.SubmissionTool{{Tool: "t.run", Required: true, Summary: "Run it.", Params: map[string]any{"env": "prod"}}},
+		Task: &inbox.TaskContext{Objective: "Run the controlled production operation."}, Kind: inbox.KindAccess, Title: "Run the thing", Summary: "One run.", Message: "I'd like to run t.run once in production to finish the task.",
+		Facts: &inbox.Facts{WhyNow: "The controlled operation is ready.", IfItGoesWrong: "The production operation can fail.", Undo: "Restore the previous operation state."}, Audio: inbox.Audio{Script: "Run it?"}, Urgency: inbox.UrgencySoon,
+		Tools: []inbox.SubmissionTool{{CallID: "run_once", Target: "Production controlled resource", Operation: "write", ExpectedEffects: "One controlled operation completes.", AffectedScope: "The controlled production resource", MaterialRisks: "A wrong argument can change the wrong resource.", Undo: "Restore the previous resource state.", Tool: "t.run", Required: true, Summary: "Run it.", Params: map[string]any{"env": "prod"}}},
 	})
 	if err != nil || !sub.OK {
 		t.Fatalf("submit: %v %+v", err, sub)
 	}
 	f.svc.Flush()
 	alice := actor.Decider{UserID: "u_alice", Email: "alice@example.com", Name: "Alice", Via: actor.ViaDashboard}
-	if _, err := f.svc.Decide(ctx, sub.RequestID, inbox.Decision{Action: "approve", Allow: []bool{true}, Decider: alice}); err != nil {
+	if _, err := f.svc.Decide(ctx, sub.RequestID, inbox.Decision{Action: "submit", RequestRevision: 1, SubmissionID: "actor_test", Verdicts: map[string]inbox.CallVerdict{"run_once": {Verdict: inbox.VerdictAccepted}}, Decider: alice}); err != nil {
 		t.Fatal(err)
 	}
 	status, err := f.svc.Status(ctx, "ag_1", []string{sub.RequestID})

@@ -105,6 +105,7 @@ func draftFor(tool string, args map[string]any) map[string]any {
 		params[k] = c
 	}
 	return map[string]any{
+		"task":    map[string]any{"objective": "<the task this batch advances>"},
 		"title":   "<≤60 chars: verb + object + target>",
 		"summary": "<≤200 chars: one line for the inbox card>",
 		"message": "<first person: what you want to do and why>",
@@ -116,6 +117,7 @@ func draftFor(tool string, args map[string]any) map[string]any {
 		"audio":   map[string]any{"script": "<≤75 words, first person, no IDs or URLs>"},
 		"urgency": "soon",
 		"tools": []any{map[string]any{
+			"call_id": "call_1", "target": "<exact resource or bounded target>", "operation": "write", "expected_effects": "<expected effects>", "affected_scope": "<what changes>", "material_risks": "<concrete risks>", "undo": "<undo path or cannot be undone>",
 			"tool":     tool,
 			"required": true,
 			"summary":  "<in plain words, what this call will do>",
@@ -176,6 +178,10 @@ func (g *Gateway) redeemAndDispatch(ctx context.Context, entry toolEntry, args m
 		ev.Outcome = metrics.OutcomeDenied
 		return mcp.NewToolResultError("grants only work with an enrolled agent token; this connection is anonymous"), nil
 	}
+	scopeProblems := g.ValidateScope(ctx, agentID, inbox.ToolRequest{Tool: entry.tool.Name, Operation: "write", Params: inbox.ParamsFromArgs(args)})
+	if len(scopeProblems) > 0 {
+		return mcp.NewToolResultError("call parameters no longer match the tool schema; permission was not consumed: " + scopeProblems[0].Message), nil
+	}
 	gr, err := g.inbox.Redeem(ctx, token, agentID, entry.tool.Name, args)
 	if err != nil {
 		var re *inbox.RedeemError
@@ -218,7 +224,19 @@ func (g *Gateway) redeemAndDispatch(ctx context.Context, entry toolEntry, args m
 	if gr.CreatedAt > 0 {
 		ev.ApprovalLatencyMs = int(time.Now().UnixMilli() - gr.CreatedAt)
 	}
-	return g.dispatch(ctx, entry, args, agentID, reason, gr.ID, ev)
+	result, dispatchErr := g.dispatch(ctx, entry, args, agentID, reason, gr.ID, ev)
+	state, detail := inbox.ExecutionSucceeded, ""
+	if dispatchErr != nil || ev.ErrorClass == "upstream" || ev.ErrorClass == "audit_outcome_unknown" {
+		state, detail = inbox.ExecutionUnknown, "upstream transport failed after dispatch; inspect upstream state before any new permission"
+	} else if result == nil {
+		state, detail = inbox.ExecutionUnknown, "dispatch returned no outcome"
+	} else if result.IsError {
+		state = inbox.ExecutionFailed
+	}
+	if err := g.inbox.FinishExecution(context.WithoutCancel(ctx), gr, state, result, detail); err != nil {
+		return mcp.NewToolResultError("execution outcome could not be recorded; do not repeat this call; inspect Inbox status"), nil
+	}
+	return result, dispatchErr
 }
 
 func grantInvalidResponse(entry toolEntry, args map[string]any, re *inbox.RedeemError) *mcp.CallToolResult {
@@ -233,7 +251,9 @@ func grantInvalidResponse(entry toolEntry, args map[string]any, re *inbox.Redeem
 	case errors.Is(re, inbox.ErrGrantScope):
 		next += "Call again within the grant's parameters, or send a new inbox.request for the call you actually need (draft below) and say what changed."
 		body["draft"] = draftFor(entry.tool.Name, args)
-	case errors.Is(re, inbox.ErrGrantUsed), errors.Is(re, inbox.ErrGrantExpired):
+	case errors.Is(re, inbox.ErrGrantUsed):
+		next += "This grant already has an execution claim. Inspect inbox.status for its execution outcome. A timeout or lost response can mean the upstream action completed. Never repeat an uncertain write without reconciliation."
+	case errors.Is(re, inbox.ErrGrantExpired):
 		next += "Grants work once and expire. If you still need this, send a new inbox.request (draft below) and say it's a re-request."
 		body["draft"] = draftFor(entry.tool.Name, args)
 	case errors.Is(re, inbox.ErrGrantRevoked):
@@ -347,14 +367,15 @@ var (
 	}
 	commonProps = func() map[string]any {
 		return map[string]any{
-			"title":       map[string]any{"type": "string", "maxLength": inbox.MaxTitle, "description": "Verb + object + target, ≤60 characters."},
-			"summary":     map[string]any{"type": "string", "maxLength": inbox.MaxSummary, "description": "One line for the inbox card, ≤200 characters."},
-			"message":     map[string]any{"type": "string", "description": "First person: what you want and why."},
-			"audio":       schemaAudio,
-			"urgency":     schemaUrgency,
-			"attachments": schemaAttachments,
-			"session_id":  map[string]any{"type": "string", "description": "From session.start (optional)."},
-			"dry_run":     map[string]any{"type": "boolean", "description": "Check the request and see its flags without sending it."},
+			"title":        map[string]any{"type": "string", "maxLength": inbox.MaxTitle, "description": "Verb + object + target, ≤60 characters."},
+			"summary":      map[string]any{"type": "string", "maxLength": inbox.MaxSummary, "description": "One line for the inbox card, ≤200 characters."},
+			"message":      map[string]any{"type": "string", "description": "First person: what you want and why."},
+			"audio":        schemaAudio,
+			"urgency":      schemaUrgency,
+			"attachments":  schemaAttachments,
+			"session_id":   map[string]any{"type": "string", "description": "From session.start (optional)."},
+			"callback_ref": map[string]any{"type": "string", "description": "Opaque authorized receiver reference for committed decision callbacks."},
+			"dry_run":      map[string]any{"type": "boolean", "description": "Check the request and see its flags without sending it."},
 		}
 	}
 )
@@ -363,6 +384,10 @@ func (g *Gateway) inboxTools() []toolEntry {
 	svc := g.inbox
 	requestProps := commonProps()
 	requestProps["facts"] = schemaFacts
+	requestProps["task"] = map[string]any{"type": "object", "required": []string{"objective"}, "properties": map[string]any{"objective": map[string]any{"type": "string", "description": "The concrete task this batch advances."}, "title": map[string]any{"type": "string"}, "url": map[string]any{"type": "string"}}}
+	requestProps["pending_ttl_seconds"] = map[string]any{"type": "integer", "minimum": 60, "maximum": 604800, "description": "Pending decision deadline. Default24 hours, bounded by administrator policy. Distinct from grant TTL."}
+	requestProps["client_request_id"] = map[string]any{"type": "string", "maxLength": 128, "description": "Stable retry key for this agent request."}
+	requestProps["callback_ref"] = map[string]any{"type": "string", "description": "Opaque authorized receiver reference. A callback announces the complete decision without grant tokens."}
 	requestProps["ttl_seconds"] = map[string]any{"type": "integer", "minimum": inbox.MinTTL, "maximum": inbox.MaxTTL, "description": "How long grants last once approved. Default 1800."}
 	requestProps["tools"] = map[string]any{
 		"type":     "array",
@@ -370,18 +395,25 @@ func (g *Gateway) inboxTools() []toolEntry {
 		"maxItems": inbox.MaxTools,
 		"items": map[string]any{
 			"type":     "object",
-			"required": []string{"tool", "required", "summary", "params"},
+			"required": []string{"call_id", "tool", "required", "summary", "target", "operation", "expected_effects", "params"},
 			"properties": map[string]any{
-				"tool":     map[string]any{"type": "string", "description": "Catalog name, e.g. deploy.run."},
-				"required": map[string]any{"type": "boolean", "description": "Without this tool the task fails."},
-				"summary":  map[string]any{"type": "string", "description": "Your plain-words description of what the call does."},
+				"call_id":          map[string]any{"type": "string", "description": "Stable unique ID for this call. Repeated tools need distinct IDs."},
+				"target":           map[string]any{"type": "string", "description": "Exact resource or bounded target."},
+				"operation":        map[string]any{"type": "string", "enum": []string{"read", "write"}},
+				"expected_effects": map[string]any{"type": "string", "description": "Expected effects on this task."},
+				"affected_scope":   map[string]any{"type": "string", "description": "Required for writes: resources that change."},
+				"material_risks":   map[string]any{"type": "string", "description": "Required for writes: concrete material risks."},
+				"undo":             map[string]any{"type": "string", "description": "Required for writes: concrete undo path or cannot be undone."},
+				"tool":             map[string]any{"type": "string", "description": "Catalog name, e.g. deploy.run."},
+				"required":         map[string]any{"type": "boolean", "description": "Planning hint only. Your owner can reject this call and submit."},
+				"summary":          map[string]any{"type": "string", "description": "Your plain-words description of what the call does."},
 				"params": map[string]any{
 					"type": "object",
 					"description": "Every argument you'll pass. A value (or {\"eq\": v}) is exact; also {\"in\": [...]}, {\"prefix\": s}, {\"gte\": n, \"lte\": n}, " +
-						"{\"limit\": \"what it will be\", \"pattern\": \"regex\"} for values not known yet, {\"any\": true}. Arguments you don't list aren't covered.",
+						"{\"limit\": \"what it will be\", \"pattern\": \"regex\"} for values not known yet. Unbounded any scopes are rejected. Arguments you don't list aren't covered.",
 					"additionalProperties": true,
 				},
-				"after": map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "Tools in this request that run first."},
+				"after": map[string]any{"type": "array", "items": map[string]any{"type": "string"}, "description": "Call IDs in this request that run first. Invalid references and cycles are rejected."},
 			},
 		},
 	}
@@ -532,7 +564,7 @@ func (g *Gateway) inboxTools() []toolEntry {
 					mode = "any"
 				}
 				timeout := 60 * time.Second
-				if f, ok := args["timeout_seconds"].(float64); ok && f > 0 {
+				if f, ok := numericArgument(args["timeout_seconds"]); ok && f > 0 {
 					timeout = time.Duration(f) * time.Second
 				}
 				views, err := svc.Wait(ctx, agentID, ids, mode, timeout)
@@ -619,7 +651,7 @@ func submitResult(res *inbox.SubmitResult) *mcp.CallToolResult {
 	case res.DryRun:
 		fmt.Fprintf(&b, "Dry run found %d problem(s). Nothing was sent. Fix them and try again.", len(res.Problems))
 	case res.OK:
-		fmt.Fprintf(&b, "Sent to your owner as %s. Keep working on anything that doesn't depend on it; use inbox.wait when you run out.", res.RequestID)
+		fmt.Fprintf(&b, "Sent to your owner as %s. Continue unrelated work or end the turn. A registered callback announces the final decision. Read inbox.status for authoritative outcomes and grants; inbox.wait is optional.", res.RequestID)
 	default:
 		fmt.Fprintf(&b, "Not sent: %d problem(s). Fix them and send again (dry_run: true helps).", len(res.Problems))
 	}

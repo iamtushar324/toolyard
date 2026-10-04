@@ -1216,7 +1216,7 @@ func (g *Gateway) routeEntry(ctx context.Context, entry toolEntry, via string, a
 	case policy.ActionApprove:
 		// Inbox mode needs an agent identity: grants are bound to it.
 		// Anonymous callers keep the legacy flow.
-		if g.inboxMode() && agentID != "" {
+		if g.inbox != nil {
 			return g.coach(ctx, entry, cleanArgs, agentID, reason, &ev), nil
 		}
 		return g.holdAndWait(ctx, entry, cleanArgs, agentID, reason, intent, decision.RequireHuman, &ev)
@@ -1260,7 +1260,7 @@ func (g *Gateway) handlerFor(toolName string) server.ToolHandlerFunc {
 				toolName, toolName,
 			), nil
 		}
-		args := argsAsMap(request.Params.Arguments)
+		args := exactArguments(ctx, toolName, argsAsMap(request.Params.Arguments))
 		return g.routeEntry(ctx, entry, viaDirect, args)
 	}
 }
@@ -1344,7 +1344,7 @@ func (g *Gateway) holdAndWait(ctx context.Context, entry toolEntry, args map[str
 			// re-fires the executor (re-running the write) on the next
 			// gateway restart.
 			res, derr := g.dispatch(ctx, entry, args, agentID, reason, req.ID, ev)
-			g.persistApprovalResult(ctx, req.ID, res, derr)
+			g.persistApprovalResult(ctx, req.ID, res, derr, ev.ErrorClass == "upstream" || ev.ErrorClass == "audit_outcome_unknown")
 			return res, derr
 		}
 		// Legacy `-in-line-wait > 0` path: a human tapped Allow during the
@@ -1407,6 +1407,11 @@ func (g *Gateway) resumeDeferred(ctx context.Context, entry toolEntry, approvalI
 		ev.Outcome = metrics.OutcomeError
 		ev.ErrorClass = "approval"
 		return mcp.NewToolResultErrorf("unknown approval %q", approvalID), nil
+	}
+	if req.ExecutionState == "outcome_unknown" {
+		ev.Outcome = metrics.OutcomeError
+		ev.ErrorClass = "outcome_unknown"
+		return jsonResultMap(approvalSnapshot(req, false))
 	}
 	// Wait briefly if either the human hasn't decided yet, or we're
 	// approved-but-the-executor-hasn't-finished. Either way the
@@ -1962,31 +1967,16 @@ func AgentIDFromContext(ctx context.Context) string {
 	return agentIDFromContext(ctx)
 }
 
-// buildInstructions composes the MCP server's `instructions` field. It tells
-// the agent how reasons + approvals + batching work so it knows it can fire
-// several writes in parallel and let the human approve them together.
+// buildInstructions describes the Inbox contract and agent execution path.
 func buildInstructions(bus *approval.Bus, inLineWait time.Duration) string {
-	ttl := approval.DefaultTTL
-	if bus != nil {
-		ttl = bus.TTL()
-	}
 	var b strings.Builder
-	b.WriteString("toolyard gateway. ")
-	b.WriteString("Every tool call REQUIRES a `_reason` field (20-2000 chars) explaining why you are calling it; this string is shown verbatim to the human reviewer. ")
-	b.WriteString("PERMISSIONS: some tools are restricted and need your owner's approval. Before a task, run `inbox.check` on the calls you plan, then ask for every restricted tool in ONE `inbox.request` (call `inbox.guide` first to learn the format: a first-person message, a short voice-note script, evidence attachments, and each tool with its parameters). When approved, call each tool with `_grant` set to its token. If a call returns status `permission_required`, nothing ran: fill in the draft it gives you and send it with inbox.request. ")
-	b.WriteString("Reads pass through silently; writes hold for human approval. ")
-	b.WriteString(fmt.Sprintf("Approvals expire after %s if no decision arrives. ", ttl.Round(time.Minute)))
-	b.WriteString("AUTO-EXECUTE ON APPROVE: when a write needs human review the gateway returns a deferred response containing `approval_id`. The moment the human (or an auto-approval rule) flips the request to allowed, toolyard fires the original tool itself with your persisted arguments and stashes the result. ")
-	b.WriteString("Collecting that result is OPTIONAL — the tool runs (and its side effect happens) regardless of whether you fetch the result. Skip the collect step for fire-and-forget writes (logging, notifications, anything you don't need to read back). ")
-	b.WriteString("If you DO need the result, the canonical way to retrieve it is to poll the approval_id, NOT to re-call the original tool: ")
-	b.WriteString("• `tools.poll_approval(approval_id=…)` — non-blocking; response carries the executed tool's `result` once `status='executed'`. ")
-	b.WriteString("• `tools.poll_approvals(approval_ids=[…])` — same shape, batched (up to 32 at once). ")
-	b.WriteString("• `tools.wait_for_approval(approval_id=…, timeout_seconds=60)` — block server-side until the executor finishes (single id). ")
-	b.WriteString("• `tools.wait_for_approvals(approval_ids=[…], mode='all'|'any', timeout_seconds=60)` — block server-side on several ids at once. mode='all' (default) returns when every id is terminal; mode='any' returns as soon as one is. Strictly more efficient than firing N parallel `tools.wait_for_approval` calls. ")
-	b.WriteString("Re-calling the original tool with `_approval_id` still works for backwards compat, but returns the same cached result the polling tools already surface — strictly slower, no extra capability. ")
-	b.WriteString("BATCHING: when a task needs several writes (e.g. create issue + comment + assign), invoke them in parallel from one turn rather than serially. The dashboard groups concurrent calls from the same agent into a single approval card so the human approves the whole batch with one tap. Per-call `_reason` strings are surfaced in that summary, so write each one to be readable on its own. After approving, toolyard executes each tool independently — `tools.wait_for_approvals(mode='all')` is the natural way to collect all the results in one round-trip. ")
-	b.WriteString("Use `tools.search` and `tools.execute` to discover and proxy tools that aren't directly visible in your catalog. ")
-	b.WriteString("SESSIONS: after `session.start`, pass its id as `_session_id` on your tool calls so the audit log ties each call to that piece of work; it is stripped before the tool sees it and ignored if the session isn't yours.")
+	b.WriteString("toolyard gateway. Every tool call requires `_reason` (20-2000 chars) for the audit record. A short reason never authorizes a restricted call. ")
+	b.WriteString("PERMISSIONS: run inbox.check for concrete planned calls. Submit one inbox.request with stable unique call_id values; repeated calls to the same tool are supported. Supply task.objective, message, facts.why_now, each call's summary relating its purpose to the task, target, exact params or explicit bounded constraints, operation and expected_effects. Writes also require affected_scope, material_risks and a concrete undo path or an explicit irreversible statement. Include useful evidence without secrets. Server validation rejects missing context and placeholders; it cannot establish that an explanation is true. Use inbox.guide for schemas and examples. ")
+	b.WriteString("Restricted calls without grants return permission_required and run nothing. New requests always use agent execution. The human selects accepted and rejected calls, adds optional per-call reasons and an overall note, and explicitly submits one complete decision. required is a planning hint; its rejection and all-rejected batches are valid. Rejected calls receive no grant. ")
+	b.WriteString("CALLBACKS: obtain an authorized receiver or an available T3 session webhook, then pass its opaque callback_ref to inbox.request. Continue unrelated work or end the turn. The callback announces the complete committed decision and contains no grant tokens. It is not permission. Read inbox.status for authoritative verdicts, notes, execution state and grants. inbox.wait remains optional for callers without callbacks. Pending decision deadline defaults to 24 hours, bounded by administrator limits; grant lifetime defaults to 30 minutes and is separate. ")
+	b.WriteString("EXECUTION: call each accepted tool with its scoped single-use token in _grant and exactly the approved parameters. Read-only inbox.status can recover the same still-valid unused token after a lost response; it does not consume or renew permission. Never log tokens. Follow per-call reasons and owner_note. Revoked or expired grants never revive automatically. A used grant has one execution claim. Inspect its recorded outcome before any recovery. If a write times out after dispatch, outcome_unknown means it may already have committed; reconcile it and never blindly repeat it. ")
+	b.WriteString("LEGACY: already-pending approvals retain their original execution mode and Toolyard can execute them after an Inbox decision. Inspect tools.poll_approval for their saved result; never reissue the original write. This compatibility path does not apply to new requests. ")
+	b.WriteString("Use tools.search and tools.execute to discover tools outside your visible catalog. After session.start, pass its id as _session_id for attribution; session identifiers do not stream a full session or grant permission.")
 	return b.String()
 }
 
@@ -2080,7 +2070,7 @@ func (g *Gateway) Execute(ctx context.Context, req *approval.Request) {
 	if g.metrics != nil {
 		g.metrics.Record(*ev)
 	}
-	g.persistApprovalResult(ctx, req.ID, res, dispatchErr)
+	g.persistApprovalResult(ctx, req.ID, res, dispatchErr, ev.ErrorClass == "upstream" || ev.ErrorClass == "audit_outcome_unknown")
 }
 
 // persistApprovalResult encodes a dispatched tool result and stores it on
@@ -2089,13 +2079,13 @@ func (g *Gateway) Execute(ctx context.Context, req *approval.Request) {
 // re-fire the executor after a restart. Shared by the bus-driven Execute
 // hook and holdAndWait's inline auto-approve path. SetResult is gated on
 // result_executed_at IS NULL, so a racing second call is a harmless no-op.
-func (g *Gateway) persistApprovalResult(ctx context.Context, approvalID string, res *mcp.CallToolResult, dispatchErr error) {
+func (g *Gateway) persistApprovalResult(ctx context.Context, approvalID string, res *mcp.CallToolResult, dispatchErr error, uncertain ...bool) {
 	if g.approval == nil {
 		return
 	}
 	envelope, encErr := encodeApprovalResult(res)
 	if encErr != nil {
-		if err := g.approval.SetResult(ctx, approvalID, "", false, "encode result: "+encErr.Error()); err != nil {
+		if err := g.approval.SetResultState(ctx, approvalID, "", true, "encode result: "+encErr.Error(), "outcome_unknown"); err != nil {
 			log.Printf("approval-persist: %s: %v", approvalID, err)
 		}
 		return
@@ -2105,7 +2095,14 @@ func (g *Gateway) persistApprovalResult(ctx context.Context, approvalID string, 
 		execErr = dispatchErr.Error()
 	}
 	isErr := res != nil && res.IsError
-	if err := g.approval.SetResult(ctx, approvalID, envelope, isErr, execErr); err != nil {
+	state := "succeeded"
+	if isErr {
+		state = "failed"
+	}
+	if (len(uncertain) > 0 && uncertain[0]) || dispatchErr != nil || (isErr && strings.Contains(strings.ToLower(summariseResult(res)), "outcome unknown")) {
+		state = "outcome_unknown"
+	}
+	if err := g.approval.SetResultState(ctx, approvalID, envelope, isErr, execErr, state); err != nil {
 		log.Printf("approval-persist: %s: %v", approvalID, err)
 	}
 }

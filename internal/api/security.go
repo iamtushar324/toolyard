@@ -424,6 +424,10 @@ func perRouteBodyCap(path string) int64 {
 // because the caller is either (a) bootstrapping with no cookie / dashboard
 // origin in the picture, or (b) a third-party token-tap path.
 func exemptFromCSRFHeader(path string) bool {
+	// These endpoints authenticate signed assertions or agent bearers only.
+	if strings.HasPrefix(path, "/v1/federation/") || strings.HasPrefix(path, "/v1/callbacks/") {
+		return true
+	}
 	// Webhook event ingest is bearer-authenticated (source token); no cookie
 	// or dashboard origin, so the CSRF custom-header check doesn't apply. The
 	// path-token form lives under the /v1/ingest/ subtree.
@@ -492,6 +496,9 @@ type unauthRouteRule struct {
 // a stronger guard (one-shot: 404 after the first success) and the
 // rate limit there mostly hurts test harnesses that re-bootstrap.
 func unauthRouteLimit(path string) *unauthRouteRule {
+	if strings.HasPrefix(path, "/v1/federation/") || strings.HasPrefix(path, "/v1/callbacks/") {
+		return &unauthRouteRule{"federation", 600, time.Minute}
+	}
 	switch {
 	case path == "/v1/agents/exchange":
 		// Exchange burns the enrollment code on success; legitimate users

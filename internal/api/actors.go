@@ -7,6 +7,7 @@ package api
 // who did it and how.
 
 import (
+	"context"
 	"errors"
 	"net/http"
 	"strings"
@@ -129,10 +130,17 @@ func (s *Server) requireAgentFull(w http.ResponseWriter, r *http.Request) (*iden
 		writeError(w, http.StatusUnauthorized, "bearer token required")
 		return nil, false
 	}
-	ag, err := s.identity.VerifyAgentToken(r.Context(), strings.TrimPrefix(authz, "Bearer "))
+	ag, err := s.verifyAgentToken(r.Context(), strings.TrimPrefix(authz, "Bearer "))
 	if err != nil {
 		writeError(w, http.StatusUnauthorized, "invalid agent token")
 		return nil, false
 	}
 	return ag, true
+}
+
+func (s *Server) verifyAgentToken(ctx context.Context, token string) (*identity.Agent, error) {
+	if s.federation != nil {
+		return s.federation.VerifyAgent(ctx, token)
+	}
+	return s.identity.VerifyAgentToken(ctx, token)
 }

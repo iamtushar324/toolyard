@@ -325,9 +325,15 @@ func (s *Service) BeginAssertion(ctx context.Context, u User, purpose, originHea
 
 // FinishAssertion verifies a confirmation made for purpose.
 func (s *Service) FinishAssertion(ctx context.Context, ceremonyID, purpose string, response []byte) (string, error) {
+	return s.finishAssertion(ctx, ceremonyID, purpose, response, "")
+}
+func (s *Service) finishAssertion(ctx context.Context, ceremonyID, purpose string, response []byte, expectedUser string) (string, error) {
 	c, err := s.take(ceremonyID, "assert")
 	if err != nil {
 		return "", err
+	}
+	if expectedUser != "" && c.userID != expectedUser {
+		return "", ErrPurpose
 	}
 	if subtle.ConstantTimeCompare([]byte(c.purpose), []byte(purpose)) != 1 {
 		return "", ErrPurpose
@@ -441,3 +447,15 @@ func (s *Service) Verify(ctx context.Context, digest string, a *inbox.PasskeyAss
 }
 
 var _ inbox.PasskeyGate = (*Service)(nil)
+
+func (s *Service) CheckEnabledFor(ctx context.Context, userID string) (bool, error) {
+	var n int
+	err := s.db.QueryRowContext(ctx, `SELECT count(*) FROM inbox_passkeys WHERE user_id=?`, userID).Scan(&n)
+	return n > 0, err
+}
+func (s *Service) VerifyCredentialFor(ctx context.Context, userID, digest string, a *inbox.PasskeyAssertion) (string, error) {
+	if a == nil {
+		return "", inbox.ErrPasskeyRequired
+	}
+	return s.finishAssertion(ctx, a.SessionID, "decide:"+digest, a.Response, userID)
+}

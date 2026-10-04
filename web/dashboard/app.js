@@ -171,10 +171,10 @@ function isAdmin() {
   return !!state.user && state.user.role !== 'member';
 }
 
-const MEMBER_ROUTES = ['agents', 'myservers', 'connections'];
+const MEMBER_ROUTES = ['inbox', 'agents', 'myservers', 'connections'];
 
 function defaultRoute() {
-  return isAdmin() ? 'inbox' : 'agents';
+  return 'inbox';
 }
 
 function routeAllowed(route) {
@@ -249,6 +249,7 @@ async function loadAll() {
     } catch (e) {
       toast(e.message, 'error');
     }
+    loadInbox();
     return;
   }
   try {
@@ -3494,7 +3495,7 @@ function viewTools() {
     el('div', { class: 'card' },
       el('h2', {}, 'Tool workbench'),
       el('p', { class: 'meta' },
-        'Search across every connected MCP server and try a tool right here. Calls run through the gateway exactly like an agent would: writes hold for approval, reads pass through. Stuck-pending calls show up in the Approvals tab — approve in another tab and the result lands here.'),
+        'Search connected MCP servers and inspect their tools. Restricted calls require an Inbox request with task context. The agent executes accepted calls with a scoped grant.'),
       el('input', {
         id: 'tool-search', 'aria-label': 'Search tools',
         placeholder: 'Search by name, description, or service (e.g. "github", "search", "context7")…',
@@ -3690,7 +3691,7 @@ function renderResult(r) {
   const isPending = r.structured_content && r.structured_content.status === 'pending_approval';
   const cls = r.is_error ? 'result error' : (isPending ? 'result pending' : 'result');
   const title = r.is_error ? 'Error'
-              : isPending ? 'Approval pending — approve in the Approvals tab, then re-run with _approval_id'
+              : isPending ? 'Permission pending — open Inbox for the decision'
               : 'Result';
   let body = r.error || '';
   if (Array.isArray(r.content)) {
@@ -4458,7 +4459,7 @@ function restoreDisclosures(root) {
 
 function workspaceRoute(route) {
   // Retired dashboards are redirected without deleting their stored data or APIs.
-  return ({ hooks: 'audit', events: 'audit', memory: 'settings/data', mempalace: 'settings/data', call: 'inbox', sessions: 'inbox', 'inbox/sessions': 'inbox' })[route] || route;
+  return ({ hooks: 'audit', events: 'audit', memory: 'settings/data', mempalace: 'settings/data', call: 'inbox', sessions: 'inbox', 'inbox/sessions': 'inbox', approvals: 'inbox' })[route] || route;
 }
 
 function navigate(route) {
@@ -4511,7 +4512,7 @@ function shell(content) {
         navBtn('agents', 'People & agents', 'people'),
         navBtn('tools', 'Tools', 'tools'),
         navBtn('settings', 'Settings', 'sliders')) : el('nav', { 'aria-label': 'Main navigation' },
-        navBtn('agents', 'Agents', 'people'), navBtn('myservers', 'Available services', 'tools'), navBtn('connections', 'Connections', 'plug')),
+        navBtn('inbox', 'Inbox', 'inbox', inboxBadgeCount()), navBtn('agents', 'Agents', 'people'), navBtn('myservers', 'Available services', 'tools'), navBtn('connections', 'Connections', 'plug')),
       el('div', { class: 'sidebar-footer' }, admin ? renderStreamPill() : null,
         el('div', { class: 'sidebar-account' }, el('span', { class: 'user-chip', title: state.user.email || '' },
           userAvatar(state.user), el('span', { class: 'account-copy' }, userLabel(state.user), el('small', {}, admin ? 'Administrator' : 'Member'))),
@@ -4520,7 +4521,7 @@ function shell(content) {
     el('nav', { class: 'bottom-nav', 'aria-label': 'Mobile navigation' }, admin ? el('div', { class: 'row' },
       bottomItem('inbox', 'inbox', 'Inbox', inboxBadgeCount()), bottomItem('servers', 'plug', 'Connections'), bottomItem('audit', 'activity', 'Activity'),
       el('button', { class: moreActive ? 'active' : '', 'aria-expanded': String(state.moreSheet), on: { click: () => { state.moreSheet = true; render(); } } }, uiIcon('menu'), el('span', {}, 'More'))) :
-      el('div', { class: 'row' }, bottomItem('agents', 'people', 'Agents'), bottomItem('myservers', 'tools', 'Services'), bottomItem('connections', 'plug', 'Connections'),
+      el('div', { class: 'row' }, bottomItem('inbox', 'inbox', 'Inbox', inboxBadgeCount()), bottomItem('agents', 'people', 'Agents'), bottomItem('myservers', 'tools', 'Services'), bottomItem('connections', 'plug', 'Connections'),
         el('button', { on: { click: () => { state.moreSheet = true; render(); } } }, uiIcon('menu'), 'More'))),
     state.moreSheet ? renderMoreSheet() : null);
 }
@@ -4659,7 +4660,7 @@ function render() {
     case 'insights':      body = viewInsights();      break;
     case 'notifications': body = viewNotifications(); break;
     case 'inbox':         body = viewInbox();         break;
-    default:              body = viewApprovals();
+    default:              body = viewInbox();
   }
   root.appendChild(shell(withSectionTabs(body)));
   const settingsTabs = root.querySelector('[aria-label="Settings categories"]');
@@ -5043,7 +5044,7 @@ function withSectionTabs(body) {
     [['servers', 'Services'], ['connections', 'My accounts']],
     [['agents', 'Agents'], ['users', 'People']],
     [['audit', 'Calls'], ['insights', 'Tool activity']],
-    [['tools', 'Catalog'], ['policies', 'Policies'], ['approvals', 'Approval queue']],
+    [['tools', 'Catalog'], ['policies', 'Policies']],
   ] : [];
   const group = groups.find(g => g.some(([key]) => key === state.route));
   const meta = pages[state.route];
@@ -5128,7 +5129,28 @@ function ibDraft(r) {
 }
 function ibSaveDraft(r, d) { d.at = Date.now(); try { sessionStorage.setItem(ibDraftKey(r), JSON.stringify(d)); } catch {} }
 function ibDropDraft(r) { const key=ibDraftKey(r); ibDrafts.delete(key); try { sessionStorage.removeItem(key); } catch {} }
-function ibClearDrafts() { settingsClearDrafts(); ibDrafts.clear(); state.inbox.notes = {};  try { Object.keys(sessionStorage).filter(k => k.startsWith('toolyard.answer.')).forEach(k => sessionStorage.removeItem(k)); } catch {} }
+const ibAccessDrafts = new Map();
+function ibCallID(t, k) { return t.call_id || 'call_' + (k + 1); }
+function ibAccessDraftKey(r) { return 'toolyard.decision.' + (state.user?.id || '') + '.' + r.id; }
+function ibAccessDraft(r) {
+  const key = ibAccessDraftKey(r);
+  if (!ibAccessDrafts.has(key)) {
+    let d; try { d = JSON.parse(sessionStorage.getItem(key)); } catch {}
+    if (!d || !d.allow || !d.reasons) d = { revision: r.revision || 1, allow: {}, reasons: {}, note: '', narrow: {}, ttl: r.ttl_seconds || 1800 };
+    ibAccessDrafts.set(key, d);
+  }
+  const d = ibAccessDrafts.get(key);
+  (r.tools || []).forEach((t,k) => { const id=ibCallID(t,k); if (!(id in d.allow)) d.allow[id] = true; });
+  state.inbox.allow[r.id] = (r.tools || []).map((t,k) => !!d.allow[ibCallID(t,k)]);
+  state.inbox.narrow[r.id] = d.narrow || {}; state.inbox.ttl[r.id] = d.ttl;
+  (state.inbox.notes ||= {})[r.id] = d.note;
+  return d;
+}
+function ibSaveAccessDraft(r,d) { d.at=Date.now(); try { sessionStorage.setItem(ibAccessDraftKey(r),JSON.stringify(d)); } catch {} }
+function ibSelectCalls(r, allow) { const d=ibAccessDraft(r); r.tools.forEach((t,k)=>{d.allow[ibCallID(t,k)]=!!allow[k];}); state.inbox.allow[r.id]=allow.slice(); ibSaveAccessDraft(r,d); }
+function ibDropAccessDraft(r) { const key=ibAccessDraftKey(r);ibAccessDrafts.delete(key);try{sessionStorage.removeItem(key);}catch{} delete state.inbox.allow[r.id];delete state.inbox.notes?.[r.id]; }
+function ibClearDrafts() { settingsClearDrafts(); ibDrafts.clear();ibAccessDrafts.clear(); state.inbox.notes={};state.inbox.allow={};state.inbox.narrow={};state.inbox.ttl={}; try {Object.keys(sessionStorage).filter(k=>k.startsWith('toolyard.answer.')||k.startsWith('toolyard.decision.')).forEach(k=>sessionStorage.removeItem(k));}catch{} }
+
 function ibAnswerForm(r) {
   if (r.status !== 'pending') return el('div', { class: 'ib-sec answer-section' }, ibResultEl(r));
   const d = ibDraft(r), q = r.question || { type: 'single_choice', max_selections: 1 };
@@ -5448,7 +5470,6 @@ function viewInbox() {
     class: 'ib-chip' + (state.inbox.filter === k ? ' on' : ''),
     on: { click: () => { state.inbox.filter = k; render(); } },
   }, label, el('span', { class: 'n' }, state.inbox.loaded ? String(lists[k].length) : '·'));
-  const mode = state.settings.approval_mode || 'execute';
   let body;
   if (!state.inbox.loaded) body = el('div', { class: 'ib-list' }, ...[0, 1, 2].map(() => el('div', { class: 'ib-skcard' },
     el('div', { class: 'ib-sk w55' }), el('div', { class: 'ib-sk h18 w85' }), el('div', { class: 'ib-sk w95' }))));
@@ -5475,7 +5496,6 @@ function viewInbox() {
         el('h2', {}, 'Inbox'),
         el('div', { class: 'meta' }, state.inbox.loaded ? `${lists.needs.length} need${lists.needs.length === 1 ? 's' : ''} you` : 'Loading…'),
       ),
-      mode !== 'inbox' ? el('span', { class: 'ib-modehint', title: 'Settings → Inbox & permissions' }, 'approval mode: execute') : null,
     ),
     el('div', { class: 'ib-chips' }, chip('needs', 'Needs you'), chip('snoozed', 'Snoozed'), chip('updates', 'Updates'), chip('done', 'Resolved')),
     tools,
@@ -5594,7 +5614,7 @@ function ibRegion(name, ...children) {
 function ibBuildDetail() {
   const d = state.inbox.detail; if (!d || !ibNode) return;
   const r = d.request;
-  if (!state.inbox.allow[r.id] && r.tools) state.inbox.allow[r.id] = r.tools.map(() => true);
+  if (r.kind === 'access') ibAccessDraft(r);
   ibRegion('head', ibHeadEl(r));
   ibRegion('flags', ibFlagsEl(r));
   ibRegion('voice', r.audio?.script ? el('details', { class: 'optional-audio' }, el('summary', {}, 'Listen to the summary'), ibVoiceEl(r)) : null);
@@ -5626,7 +5646,7 @@ function ibHeadEl(r) {
       el('span', { class: 'ib-kind' }, (IB_KIND[r.kind] || r.kind) + (r.kind === 'access' ? ` · ${r.tools.length} tool${r.tools.length === 1 ? '' : 's'}` : '')),
       ibStatusPill(r), ...ibAttnPills(r), el('span', { class: 'meta' }, relTime(r.created_at))),
     el('h2', {}, r.title),
-    r.task ? el('div', { class: 'meta task-context' }, 'Task · ', r.task.url ? el('a', { href: r.task.url, target: '_blank', rel: 'noopener noreferrer' }, r.task.title || 'Open task') : r.task.title) : null,
+    r.task ? el('div', { class: 'meta task-context' }, 'Task · ', r.task.url ? el('a', { href: r.task.url, target: '_blank', rel: 'noopener noreferrer' }, r.task.title || r.task.objective || 'Open task') : (r.task.objective || r.task.title)) : null,
   );
 }
 
@@ -5876,43 +5896,33 @@ function ibDecideEl(r, grants) {
   for (const g of grants) byIdx[g.tool_index] = g;
   const result = ibResultEl(r);
   if (r.kind === 'access') {
-    const allow = state.inbox.allow[r.id] || r.tools.map(() => true);
-    state.inbox.allow[r.id] = allow;
-    const n = r.tools.length, nOn = allow.filter(Boolean).length;
-    const reqOff = open ? r.tools.filter((t, k) => t.required && !allow[k]) : [];
-    const redOn = r.tools.filter((t, k) => allow[k] && ibRedOf(t));
-    const rows = r.tools.map((t, k) => ibToolRow(r, t, k, allow, byIdx[k], open && !busy));
-    const setAll = (fn) => () => { state.inbox.allow[r.id] = r.tools.map(fn); ibRegion('decide', ibDecideEl(r, grants)); };
-    let actions = null;
-    if (open) {
-      if (state.inbox.panel) actions = ibPanelEl(r);
-      else if (reqOff.length) actions = el('div', { class: 'ib-actions' },
-        el('p', { class: 'ib-warn' }, `${r.agent_name} marked `, ...reqOff.flatMap((t, i) => [i ? ', ' : '', el('code', {}, t.tool)]),
-          ` as required. Without ${reqOff.length > 1 ? 'them' : 'it'} it can’t do this task, so this sends the request back for a new plan.`),
-        el('textarea', { id: 'ib-note', value: state.inbox.notes?.[r.id] || '', on: { input: e => { (state.inbox.notes ||= {})[r.id] = e.target.value; } }, placeholder: 'Tell the agent what to change', rows: 3 }),
-        el('div', { class: 'ib-btns' },
-          el('button', { on: { click: setAll(() => true) } }, 'Undo'),
-          el('button', { class: 'danger', disabled: !!busy, on: { click: () => ibDecide(r, { action: 'return', note: ibNote() }) } }, busy ? 'Sending…' : 'Send back to agent')));
-      else actions = el('div', { class: 'ib-actions' },
-        redOn.length ? el('p', { class: 'ib-warn' }, '⚑ You’re allowing a flagged tool: ', ...redOn.flatMap((t, i) => [i ? ', ' : '', el('code', {}, t.tool)])) : null,
-        el('div', { class: 'ib-btns' },
-          el('button', { class: 'danger', disabled: !!busy, on: { click: () => { state.inbox.panel = 'deny'; ibRegion('decide', ibDecideEl(r, grants)); } } }, 'Deny'),
-          el('button', { disabled: !!busy, on: { click: () => { state.inbox.panel = 'snooze'; ibRegion('decide', ibDecideEl(r, grants)); } } }, 'Later'),
-          el('button', { class: 'primary grow', disabled: !!busy || !nOn, on: { click: () => ibApprove(r, allow) } },
-            busy === 'approve' ? 'Issuing permissions…' : busy === 'passkey' ? 'Confirm with your passkey…' : `Approve ${nOn} of ${n}`)),
-        ibTTLEl(r),
-        el('p', { class: 'meta' }, `Each allowed tool gets its own permission, limited to the parameters shown and to one use.`));
-    }
-    return el('div', { class: 'ib-sec' },
-      el('div', { class: 'ib-eyebrow' }, 'Your decision'),
-      el('h3', {}, open ? `${r.agent_name} needs ${n} tool${n === 1 ? '' : 's'}` : 'What you decided'),
-      open ? el('p', { class: 'meta' }, 'Untick anything you don’t want to allow.') : result,
-      open && !busy ? el('div', { class: 'ib-quick' },
-        el('button', { class: 'ib-link', on: { click: setAll((t) => t.required) } }, 'Required only'),
-        el('button', { class: 'ib-link', on: { click: setAll((t) => !ibRedOf(t)) } }, 'All except flagged'),
-        el('button', { class: 'ib-link', on: { click: setAll(() => true) } }, 'Select all')) : null,
-      el('div', { class: 'ib-trows' }, ...rows),
-      actions);
+    const d=ibAccessDraft(r), allow=state.inbox.allow[r.id];
+    const n=r.tools.length,nOn=allow.filter(Boolean).length;
+    const rows=r.tools.map((t,k)=>ibToolRow(r,t,k,allow,byIdx[k],open&&!busy));
+    const setAll=fn=>()=>{ibSelectCalls(r,r.tools.map(fn));ibRegion('decide',ibDecideEl(r,grants));};
+    const stale=d.revision!==(r.revision||1);
+    const legacy=r.execution_mode==='legacy';
+    const delivery=(state.inbox.detail?.callbacks || []).map(c=>el('div',{class:'meta'},'Callback '+c.status+' · '+c.attempts+' attempt(s)',c.terminal_reason?' · '+c.terminal_reason:'',
+      ...(c.history||[]).map(a=>el('div',{},'Attempt '+a.attempt+' · '+a.outcome)),
+      c.status==='failed'?el('button',{disabled:!!busy,on:{click:()=>ibRetryCallback(r,c)}},'Retry callback'):null));
+    return el('div',{class:'ib-sec'},el('div',{class:'ib-eyebrow'},'Your decision'),
+      el('h3',{},open?`${r.agent_name} requests ${n} call${n===1?'':'s'}`:'Saved decision'),
+      open?el('p',{class:'meta'},'Select calls to accept. Clear calls to reject. Nothing is sent until you submit.'):result,
+      legacy?el('p',{class:'ib-warn'},'Legacy execution: Toolyard executes accepted calls after this decision. It does not issue new grants.'):el('p',{class:'meta'},'The agent executes accepted calls with separate single-use grants.'),
+      open?el('p',{class:'meta'},'Decision deadline: '+new Date(r.expires_at).toLocaleString()+(legacy?'.':'. Grant lifetime starts after acceptance.')):null,
+      stale?el('div',{class:'ib-warn',role:'status'},r.status==='pending'?'The server revision changed. Your draft remains saved. Review the current calls before resubmission.':'The server has a final decision. Your unsent draft remains saved.',
+        open?el('button',{on:{click:()=>{d.revision=r.revision||1;delete d.submission;delete d.fingerprint;ibSaveAccessDraft(r,d);ibRegion('decide',ibDecideEl(r,grants));}}},'Use reviewed revision'):null):null,
+      open&&!busy?el('div',{class:'ib-quick'},el('button',{class:'ib-link',on:{click:setAll(()=>true)}},'Accept all'),el('button',{class:'ib-link',on:{click:setAll(()=>false)}},'Reject all')):null,
+      el('div',{class:'ib-trows'},...rows),
+      open?el('div',{class:'ib-actions'},
+        el('label',{class:'meta',for:'ib-note'},'Overall note (optional)'),
+        el('textarea',{id:'ib-note',value:d.note,rows:3,disabled:!!busy,on:{input:e=>{d.note=e.target.value;(state.inbox.notes||={})[r.id]=d.note;ibSaveAccessDraft(r,d);}}}),
+        state.inbox.panel?ibPanelEl(r):el('div',{class:'ib-btns'},
+          el('button',{disabled:!!busy,on:{click:()=>{state.inbox.panel='snooze';ibRegion('decide',ibDecideEl(r,grants));}}},'Later'),
+          el('button',{class:'primary grow',disabled:!!busy||stale,on:{click:()=>ibApprove(r,allow)}},busy?'Submit decision…':`Accept ${nOn}, reject ${n-nOn}`)),
+        !legacy?ibTTLEl(r):null,
+        el('p',{class:'meta'},'A required label is a planning hint. You can reject every call.')):null,
+      delivery.length?el('details',{class:'connection-setup'},el('summary',{},'Callback delivery'),...delivery):null);
   }
   if (r.kind === 'question' || r.kind === 'blocker') return ibAnswerForm(r);
   return el('div', { class: 'ib-sec' },
@@ -5922,7 +5932,7 @@ function ibDecideEl(r, grants) {
 
 function ibToolRow(r, t, k, allow, grant, editable) {
   const on = allow[k], red = ibRedOf(t);
-  const key = r.id + ':' + k;
+  const key = r.id + ':' + ibCallID(t,k);
   let state_ = null;
   if (r.status !== 'pending') {
     if (t.decision === 'allowed') {
@@ -5940,15 +5950,20 @@ function ibToolRow(r, t, k, allow, grant, editable) {
   return el('div', { class: 'ib-trow' + (on || state_ ? '' : ' off') + (red && on && editable ? ' red' : '') + (state_ && state_[0] === 'blocked' ? ' off' : '') },
     el('div', { class: 'ib-thd' },
       editable ? el('button', {
-        class: 'ib-tick', role: 'checkbox', 'aria-checked': String(!!on), 'aria-label': 'Allow ' + t.tool,
-        on: { click: () => { allow[k] = !allow[k]; ibRegion('decide', ibDecideEl(r, state.inbox.detail.grants || [])); } },
+        class: 'ib-tick', role: 'checkbox', 'aria-checked': String(!!on), 'aria-label': 'Accept ' + ibCallID(t,k) + ' · ' + t.tool,
+        on: { click: () => { allow[k] = !allow[k]; ibSelectCalls(r,allow); ibRegion('decide', ibDecideEl(r, state.inbox.detail.grants || [])); } },
       }, '✓') : null,
       el('div', { class: 'ib-tmain' },
         el('div', { class: 'ib-tline' }, el('code', { class: 'ib-tn' }, t.tool),
-          el('span', { class: 'ib-tag' + (t.required ? ' req' : '') }, t.required ? 'Required' : 'Optional'),
+          el('span', { class: 'ib-tag' + (t.required ? ' req' : '') }, t.required ? 'Required hint' : 'Optional hint'),
           Object.keys(ibNarrowed(r, k)).length || t.requested_params ? el('span', { class: 'ib-tag narrowed' }, 'Narrowed') : null,
           state_ ? el('span', { class: 'ib-tstate ' + state_[0] }, state_[1]) : null),
         el('p', { class: 'ib-tsum' }, t.summary),
+        el('div',{class:'meta'},'Call ID: '+ibCallID(t,k)),
+        el('dl',{class:'ib-facts'},...Object.entries({Target:t.target,'Expected effects':t.expected_effects,'Affected scope':t.affected_scope,'Material risks':t.material_risks,Undo:t.undo}).filter(([,v])=>v).flatMap(([label,value])=>[el('dt',{},label),el('dd',{},value)])),
+        editable?el('label',{class:'meta'},'Reason for this '+(on?'acceptance':'rejection')+' (optional)',el('textarea',{id:'ib-call-reason-'+k,rows:2,value:ibAccessDraft(r).reasons[ibCallID(t,k)]||'',on:{input:e=>{const d=ibAccessDraft(r);d.reasons[ibCallID(t,k)]=e.target.value;ibSaveAccessDraft(r,d);}}})):t.reason?el('p',{class:'meta'},'Your reason: '+t.reason):null,
+        r.execution_mode==='legacy'&&r.status!=='pending'?el('p',{class:'meta'},'Decision: '+(t.verdict || (t.decision==='allowed'?'accepted':'rejected'))+'. Legacy execution: '+(r.legacy_execution_state||'outcome unknown')+'.'):null,
+        grant?el('p',{class:'meta'},'Decision: '+(t.verdict || (t.decision==='allowed'?'accepted':'rejected'))+'. Execution: '+(grant.execution?.state || (grant.status==='active'?'not started':grant.status==='used'?'outcome unknown':grant.status))+'.'):null,
         state_ && ibGrantBy(grant) ? el('p', { class: 'ib-grantby' }, ibGrantBy(grant)) : null,
         (t.flags || []).length ? el('div', { class: 'ib-flags' }, ...t.flags.map(ibFlagChip)) : null,
         red && r.status === 'pending' ? el('p', { class: 'ib-flagwhy' }, red.why) : null,
@@ -5958,7 +5973,7 @@ function ibToolRow(r, t, k, allow, grant, editable) {
           ex ? null : el('button', { class: 'ib-tylink', on: { click: () => ibExplain(r, k) } }, '✦ Ask toolyard')),
       )),
     exEl,
-    state.inbox.openParams[key] ? ibParamsEl(r, t, k, editable && on) : null,
+    state.inbox.openParams[key] ? (r.execution_mode==='legacy' && t.legacy_params_json ? el('pre',{class:'ib-code'},t.legacy_params_json) : ibParamsEl(r, t, k, editable && on && r.execution_mode!=='legacy')) : null,
   );
 }
 
@@ -5970,6 +5985,7 @@ function ibSetNarrow(r, k, p, c) {
   const tool = all[k] = all[k] || {};
   if (c === null) delete tool[p]; else tool[p] = c;
   if (!Object.keys(tool).length) delete all[k];
+  const d=ibAccessDraft(r);d.narrow=all;ibSaveAccessDraft(r,d);
   ibRegion('decide', ibDecideEl(r, state.inbox.detail.grants || []));
 }
 function ibParseVal(v) {
@@ -6077,7 +6093,7 @@ function ibDescribe(c) {
 }
 
 async function ibExplain(r, k) {
-  const key = r.id + ':' + k;
+  const key = r.id + ':' + ibCallID(r.tools[k],k);
   state.inbox.explain[key] = { loading: true };
   ibRegion('decide', ibDecideEl(r, state.inbox.detail.grants || []));
   try {
@@ -6124,19 +6140,35 @@ function ibTTLEl(r) {
   const cur = state.inbox.ttl[r.id] || req;
   const lbl = (v) => (v >= 3600 ? (v / 3600) + ' h' : Math.round(v / 60) + ' min') + (v === req ? ' (asked for)' : '');
   return el('label', { class: 'ib-ttl' }, el('span', {}, 'Permissions last'),
-    el('select', { on: { change: (e) => { state.inbox.ttl[r.id] = +e.target.value; } } },
+    el('select', { on: { change: (e) => { state.inbox.ttl[r.id] = +e.target.value;const d=ibAccessDraft(r);d.ttl=+e.target.value;state.inbox.ttl[r.id]=d.ttl;ibSaveAccessDraft(r,d); } } },
       ...opts.map((v) => el('option', { value: String(v), selected: v === cur }, lbl(v)))));
 }
 
 function ibApproveBody(r, allow) {
-  const body = { action: 'approve', allow: allow.slice() };
+  const d=ibAccessDraft(r),verdicts={};
+  r.tools.forEach((t,k)=>{const id=ibCallID(t,k);verdicts[id]={verdict:allow[k]?'accepted':'rejected'};if(d.reasons[id])verdicts[id].reason=d.reasons[id];});
+  const body={action:'submit',request_revision:d.revision,verdicts,note:d.note};
   const nar = state.inbox.narrow[r.id] || {};
   const params = {};
   for (const k of Object.keys(nar)) if (allow[+k] && Object.keys(nar[k]).length) params[k] = nar[k];
-  if (Object.keys(params).length) body.params = params;
+  if (r.execution_mode!=='legacy' && Object.keys(params).length) body.params = params;
   const ttl = state.inbox.ttl[r.id];
-  if (ttl && ttl !== (r.ttl_seconds || 1800)) body.ttl_seconds = ttl;
+  if (r.execution_mode!=='legacy' && ttl && ttl !== (r.ttl_seconds || 1800)) body.ttl_seconds = ttl;
+  const fingerprint=JSON.stringify(body);if(d.fingerprint!==fingerprint){d.fingerprint=fingerprint;d.submission=crypto.randomUUID();}body.submission_id=d.submission;ibSaveAccessDraft(r,d);
   return body;
+}
+
+async function ibRetryCallback(r, delivery) {
+  state.inbox.busy = true;
+  try {
+    await api('/v1/inbox/' + encodeURIComponent(r.id) + '/callbacks/' + encodeURIComponent(delivery.event_id) + '/retry', { method: 'POST', body: {} });
+    toast('Callback retry queued.');
+  } catch (e) {
+    toast('Callback retry failed: ' + e.message, 'error');
+  } finally {
+    state.inbox.busy = false;
+    await loadInboxDetail(r.id, false);
+  }
 }
 
 function ibIsRisky(t) { return (t.flags || []).some((f) => f.level === 'red' || f.label === 'Production'); }
@@ -6227,9 +6259,10 @@ async function ibDecide(r, body) {
   try {
     await api('/v1/inbox/' + r.id + '/decide', { method: 'POST', body });
     if (body.action === 'answer') ibDropDraft(r);
+    if (body.action === 'submit') ibDropAccessDraft(r);
     state.inbox.panel = null;
     delete state.inbox.narrow[r.id]; delete state.inbox.ttl[r.id];
-    toast({ approve: 'Approved. The agent can continue.', deny: 'Decision saved.', return: 'Sent back for a new plan.',
+    toast({ submit:'Decision saved. The agent receives your accepted and rejected calls.',approve: 'Approved. The agent can continue.', deny: 'Decision saved.', return: 'Sent back for a new plan.',
       answer: 'Answer saved. The agent can retrieve it.', snooze: 'Snoozed.', read: 'Marked as read.' }[body.action] || 'Done');
     state.inbox.busy = null;
     await loadInboxDetail(r.id, false);
@@ -6244,7 +6277,7 @@ async function ibDecide(r, body) {
       ibPasskeyDecide(r, body);
       return;
     }
-    if (e.status === 409) staleNote('Already decided, possibly on another device.');
+    if (e.status === 409) staleNote('The server revision or decision changed. Your draft remains saved. Review the current server state.');
     else toast(e.message, 'error');
     await loadInboxDetail(r.id, false);
   }
@@ -6452,10 +6485,9 @@ Read the full rules with inbox.guide().`;
   if (IB_FILTERS.includes(deepInbox)) { state.inbox.filter = deepInbox; deepInbox = null; }
   // Push deep link: notifications open /?approval=<id>. Land on the
   // approvals view so the card (or its expired/decided state) is visible.
-  const approvalParam = new URLSearchParams(location.search).get('approval');
+  const approvalParam = new URLSearchParams(location.search).get('approval') || new URLSearchParams(location.search).get('approval_id');
   if (approvalParam) {
-    state.route = 'approvals';
-    state.focusApprovalId = approvalParam;
+    state.route = 'inbox';deepInbox=approvalParam;history.replaceState(null,'','#inbox/'+encodeURIComponent(approvalParam));
   }
   // /?password=1 (from /login's "Use password instead") opens the password
   // form straight away instead of behind the Google button.
@@ -6466,12 +6498,12 @@ Read the full rules with inbox.guide().`;
     // no admin fetches (they'd all be 403 admin_only).
     await loadAll();
     if (state.route === 'connections') loadConnections(true);
+    if(deepInbox)openInboxRequest(deepInbox);
   } else if (state.user) {
     await loadAll(); startStream();
     if (state.route === 'users') loadUsers(true);
     if (state.route === 'myservers') loadMyServers();
     if (state.route === 'connections') loadConnections(true);
-    if (!location.hash && !approvalParam && !routeParam && state.settings.approval_mode === 'inbox') state.route = 'inbox';
     if (deepInbox) openInboxRequest(deepInbox);
     if (state.route === 'insights' || state.route === 'policies' || state.route === 'notifications') {
       loadInsights();
@@ -6493,12 +6525,12 @@ Read the full rules with inbox.guide().`;
     }, 0);
   }
 
-  // While approvals are on screen, re-render every 30s so countdowns stay
-  // fresh and cards that cross their expiry get disabled even if no SSE
-  // event has arrived yet.
+  // Refresh owned Inbox state, including members without the admin event stream.
+  // Detail updates retain local decision drafts and defer while a field has focus.
   setInterval(() => {
-    if (state.user && state.route === 'approvals' && (state.approvals || []).length) {
-      render();
+    if (state.user && state.route === 'inbox') {
+      loadInbox();
+      if (state.inbox.openId) loadInboxDetail(state.inbox.openId, false);
     }
   }, 30000);
 
@@ -6508,8 +6540,7 @@ Read the full rules with inbox.guide().`;
     if (!state.user) return;
     const raw = location.hash.slice(1), h = workspaceRoute(raw);
     if (h !== raw) { navigate(h); return; }
-    // Members have no inbox; navigate() sends them to an allowed route.
-    if (!isAdmin()) { if (h !== state.route) navigate(h); return; }
+    if (!routeAllowed(h.split('/')[0])) { navigate(defaultRoute()); return; }
     if (h.startsWith('inbox/')) {
       const id = h.slice(6);
       if (IB_FILTERS.includes(id)) {

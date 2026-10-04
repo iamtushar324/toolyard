@@ -50,10 +50,20 @@ type Fetcher interface {
 	Snapshot(ctx context.Context, rawURL, kind string) (sha, contentType string, size int64, err error)
 }
 
+// DecisionCallbacks writes subscriptions and decision events inside the Inbox transaction.
+type DecisionCallbacks interface {
+	RegisterTx(context.Context, *sql.Tx, *Request, string) error
+	DecisionTx(context.Context, *sql.Tx, *Request) error
+}
+
 // Options configure a Service.
 type Options struct {
-	DB      *store.DB
-	Catalog Catalog
+	LegacyDecided func(context.Context, string)
+
+	Callbacks            DecisionCallbacks
+	MaxPendingTTLSeconds int
+	DB                   *store.DB
+	Catalog              Catalog
 	// Judge, when non-nil and JudgeEnabled returns true, reviews requests.
 	Judge        Judge
 	JudgeEnabled func() bool
@@ -109,7 +119,11 @@ func New(ctx context.Context, opts Options) (*Service, error) {
 	if now == nil {
 		now = time.Now
 	}
-	return &Service{db: opts.DB, opts: opts, signer: signer, now: now, watch: map[string]chan struct{}{}}, nil
+	service := &Service{db: opts.DB, opts: opts, signer: signer, now: now, watch: map[string]chan struct{}{}}
+	if _, err := service.RecoverExecutions(ctx); err != nil {
+		return nil, fmt.Errorf("execution recovery: %w", err)
+	}
+	return service, nil
 }
 
 // SetCatalog wires the gateway after construction (the gateway and the
@@ -234,6 +248,9 @@ func (s *Service) Submit(ctx context.Context, agentID string, sub *Submission) (
 	}
 	r, probs, warns := Validate(ctx, s.opts.Catalog, agentID, sub, ValidateOptions{AllowPrivateMedia: s.opts.AllowPrivateMedia})
 	r.AgentID = agentID
+	if s.opts.MaxPendingTTLSeconds > 0 && r.PendingTTLSeconds > s.opts.MaxPendingTTLSeconds {
+		probs = append(probs, Problem{"pending_ttl_seconds", "exceeds the administrator deadline limit"})
+	}
 	r.SubmissionFingerprint = fingerprint
 	for i := range r.Tools {
 		r.Tools[i].Flags = RuleFlags(r.Tools[i])
@@ -303,6 +320,9 @@ func (s *Service) Submit(ctx context.Context, agentID string, sub *Submission) (
 	r.CreatedAt = now.UnixMilli()
 	r.UpdatedAt = r.CreatedAt
 	r.ExpiresAt = now.Add(RequestTTL).UnixMilli()
+	if r.Kind == KindAccess {
+		r.ExpiresAt = now.Add(time.Duration(r.PendingTTLSeconds) * time.Second).UnixMilli()
+	}
 	if r.Kind == KindUpdate {
 		r.ExpiresAt = now.Add(UpdateTTL).UnixMilli()
 	}
@@ -477,10 +497,16 @@ func preview(r *Request) *Preview {
 // ---- owner decisions -----------------------------------------------------------
 
 // Decision is what the owner chose.
+type CallVerdict struct {
+	Verdict string `json:"verdict"`
+	Reason  string `json:"reason,omitempty"`
+}
+
 type Decision struct {
-	Response        *Response `json:"response,omitempty"`
-	RequestRevision int       `json:"request_revision,omitempty"`
-	SubmissionID    string    `json:"submission_id,omitempty"`
+	Verdicts        map[string]CallVerdict `json:"verdicts,omitempty"`
+	Response        *Response              `json:"response,omitempty"`
+	RequestRevision int                    `json:"request_revision,omitempty"`
+	SubmissionID    string                 `json:"submission_id,omitempty"`
 
 	Action        string `json:"action"` // approve | deny | return | answer | snooze | read
 	Allow         []bool `json:"allow,omitempty"`
@@ -536,6 +562,19 @@ func deciderSuffix(d actor.Decider) string {
 // Decide applies an owner decision.
 func (s *Service) Decide(ctx context.Context, id string, d Decision) (*Request, error) {
 	now := s.now().UnixMilli()
+	if d.Action == "submit" {
+		d.Action = "approve"
+	}
+	if d.Verdicts != nil {
+		pre, err := s.Get(ctx, id)
+		if err != nil {
+			return nil, err
+		}
+		d.Allow = make([]bool, len(pre.Tools))
+		for i, t := range pre.Tools {
+			d.Allow[i] = d.Verdicts[t.CallID].Verdict == VerdictAccepted
+		}
+	}
 	dec := d.decider()
 	// Passkey check happens before the transaction (verification writes
 	// the credential's sign count) and is re-checked inside it, in case
@@ -543,7 +582,13 @@ func (s *Service) Decide(ctx context.Context, id string, d Decision) (*Request, 
 	passkeyOn, verified := false, false
 	if d.Action == "approve" && s.opts.Passkeys != nil {
 		var err error
-		passkeyOn, err = s.opts.Passkeys.CheckEnabled(ctx)
+		if gate, ok := s.opts.Passkeys.(interface {
+			CheckEnabledFor(context.Context, string) (bool, error)
+		}); ok && dec.UserID != "" {
+			passkeyOn, err = gate.CheckEnabledFor(ctx, dec.UserID)
+		} else {
+			passkeyOn, err = s.opts.Passkeys.CheckEnabled(ctx)
+		}
 		if err != nil {
 			return nil, fmt.Errorf("%w: cannot check registered passkeys", ErrPasskeyFailed)
 		}
@@ -553,7 +598,15 @@ func (s *Service) Decide(ctx context.Context, id string, d Decision) (*Request, 
 			if d.Passkey == nil {
 				return nil, ErrPasskeyRequired
 			}
-			credID, err := s.opts.Passkeys.VerifyCredential(ctx, DecisionDigest(id, d), d.Passkey)
+			var credID string
+			var err error
+			if gate, ok := s.opts.Passkeys.(interface {
+				VerifyCredentialFor(context.Context, string, string, *PasskeyAssertion) (string, error)
+			}); ok && dec.UserID != "" {
+				credID, err = gate.VerifyCredentialFor(ctx, dec.UserID, DecisionDigest(id, d), d.Passkey)
+			} else {
+				credID, err = s.opts.Passkeys.VerifyCredential(ctx, DecisionDigest(id, d), d.Passkey)
+			}
 			if err != nil {
 				return nil, fmt.Errorf("%w: %v", ErrPasskeyFailed, err)
 			}
@@ -565,6 +618,14 @@ func (s *Service) Decide(ctx context.Context, id string, d Decision) (*Request, 
 	who, how := deciderLabel(dec), deciderSuffix(dec)
 	var out *Request
 	err := s.mutateTx(ctx, id, func(tx *sql.Tx, r *Request) error {
+		if r.Kind == KindAccess && d.SubmissionID != "" && r.DecisionSubmissionID == d.SubmissionID {
+			if r.DecisionFingerprint != decisionFingerprint(d) {
+				return ErrConflict
+			}
+			r.Replayed = true
+			out = r
+			return nil
+		}
 		if d.Action == "answer" && d.SubmissionID != "" && r.AnswerSubmissionID == d.SubmissionID {
 			if r.AnswerFingerprint != answerFingerprint(d) {
 				return ErrConflict
@@ -578,6 +639,14 @@ func (s *Service) Decide(ctx context.Context, id string, d Decision) (*Request, 
 		}
 		if d.Action != "snooze" && r.Status != StatusPending {
 			return ErrNotPending
+		}
+		if r.Kind == KindAccess && d.Action == "approve" {
+			if d.RequestRevision != r.Revision || d.SubmissionID == "" || len(d.SubmissionID) > 128 {
+				return fmt.Errorf("%w: a decision needs request_revision and submission_id", ErrConflict)
+			}
+			if err := validateVerdicts(r, d); err != nil {
+				return err
+			}
 		}
 		note := strings.TrimSpace(d.Note)
 		if d.Action != "snooze" {
@@ -593,19 +662,16 @@ func (s *Service) Decide(ctx context.Context, id string, d Decision) (*Request, 
 				return fmt.Errorf("allow must have one entry per tool (%d)", len(r.Tools))
 			}
 			n := 0
-			for i, t := range r.Tools {
-				if !d.Allow[i] && t.Required {
-					return ErrRequiredRefused
-				}
+			for i := range r.Tools {
 				if d.Allow[i] {
 					n++
 				}
 			}
-			if n == 0 {
-				return ErrNothingAllowed
-			}
 			if passkeyOn && !verified && NeedsPasskey(r, d.Allow) {
 				return ErrPasskeyRequired
+			}
+			if r.ExecutionMode == "legacy" && (len(d.Params) > 0 || d.TTLSeconds != 0) {
+				return fmt.Errorf("legacy parameters are fixed; reject and request a new Inbox item to change scope")
 			}
 			var narrowed []string
 			for i, tighter := range d.Params {
@@ -627,10 +693,13 @@ func (s *Service) Decide(ctx context.Context, id string, d Decision) (*Request, 
 				r.TTLSeconds = d.TTLSeconds
 			}
 			for i := range r.Tools {
+				r.Tools[i].Reason = strings.TrimSpace(d.Verdicts[r.Tools[i].CallID].Reason)
 				if d.Allow[i] {
 					r.Tools[i].Decision = ToolAllowed
+					r.Tools[i].Verdict = VerdictAccepted
 				} else {
 					r.Tools[i].Decision = ToolRefused
+					r.Tools[i].Verdict = VerdictRejected
 				}
 			}
 			if len(narrowed) > 0 {
@@ -645,11 +714,16 @@ func (s *Service) Decide(ctx context.Context, id string, d Decision) (*Request, 
 				r.Tools[i].GrantID = gid
 			}
 			r.Status = StatusApproved
-			r.GrantsExpire = now + int64(r.TTLSeconds)*1000
+			if n == 0 {
+				r.Status = StatusDenied
+			} else if r.ExecutionMode != "legacy" {
+				r.GrantsExpire = now + int64(r.TTLSeconds)*1000
+			}
 			r.addActivity(now, fmt.Sprintf("%s allowed %d of %d tool%s%s", who, n, len(r.Tools), plural(len(r.Tools)), how))
 		case "deny":
 			for i := range r.Tools {
 				r.Tools[i].Decision = ToolRefused
+				r.Tools[i].Verdict = VerdictRejected
 			}
 			r.Status = StatusDenied
 			r.addActivity(now, who+" denied it"+how+withNote(note))
@@ -659,6 +733,7 @@ func (s *Service) Decide(ctx context.Context, id string, d Decision) (*Request, 
 			}
 			for i := range r.Tools {
 				r.Tools[i].Decision = ToolRefused
+				r.Tools[i].Verdict = VerdictRejected
 			}
 			r.Status = StatusReturned
 			r.addActivity(now, who+" sent it back to replan"+how+withNote(note))
@@ -692,6 +767,10 @@ func (s *Service) Decide(ctx context.Context, id string, d Decision) (*Request, 
 		if note != "" {
 			r.OwnerNote = note
 		}
+		if r.Kind == KindAccess && d.Action != "snooze" {
+			r.DecisionSubmissionID = d.SubmissionID
+			r.DecisionFingerprint = decisionFingerprint(d)
+		}
 		out = r
 		return nil
 	})
@@ -700,6 +779,9 @@ func (s *Service) Decide(ctx context.Context, id string, d Decision) (*Request, 
 	}
 	if out.Replayed {
 		return out, nil
+	}
+	if out.ExecutionMode == "legacy" && d.Action != "snooze" && s.opts.LegacyDecided != nil {
+		s.opts.LegacyDecided(ctx, id)
 	}
 	s.wake(id)
 	if d.Action == "snooze" {
@@ -720,6 +802,7 @@ func withNote(n string) string {
 
 // AgentView is what an agent sees about one of its requests.
 type AgentView struct {
+	Revision     int             `json:"revision"`
 	Response     *AnswerResponse `json:"response,omitempty"`
 	RequestID    string          `json:"request_id"`
 	Kind         string          `json:"kind"`
@@ -736,8 +819,12 @@ type AgentView struct {
 // AgentToolView is one tool's outcome, with the grant token the first time
 // the agent sees it.
 type AgentToolView struct {
-	Tool     string `json:"tool"`
-	Decision string `json:"decision"` // pending | allowed | refused
+	CallID    string     `json:"call_id"`
+	Verdict   string     `json:"verdict,omitempty"`
+	Reason    string     `json:"reason,omitempty"`
+	Execution *Execution `json:"execution,omitempty"`
+	Tool      string     `json:"tool"`
+	Decision  string     `json:"decision"` // pending | allowed | refused
 	// Narrowed is set when the owner tightened the parameters; Params is
 	// then what the grant allows.
 	Narrowed  bool                  `json:"narrowed,omitempty"`
@@ -770,7 +857,7 @@ func (s *Service) Status(ctx context.Context, agentID string, ids []string) ([]A
 			}
 			s.publish("inbox", s.cardView(ctx, r))
 		}
-		v := AgentView{RequestID: r.ID, Kind: r.Kind, Status: r.Status, SnoozedUntil: r.SnoozedUntil, OwnerNote: r.OwnerNote,
+		v := AgentView{Revision: r.Revision, RequestID: r.ID, Kind: r.Kind, Status: r.Status, SnoozedUntil: r.SnoozedUntil, OwnerNote: r.OwnerNote,
 			Answer: r.Answer, Response: r.Response, ExpiresAt: r.ExpiresAt, GrantsExpire: r.GrantsExpire}
 		var toks map[string]string
 		if r.Status == StatusApproved {
@@ -780,7 +867,7 @@ func (s *Service) Status(ctx context.Context, agentID string, ids []string) ([]A
 			}
 		}
 		for _, t := range r.Tools {
-			tv := AgentToolView{Tool: t.Tool, Decision: t.Decision, GrantID: t.GrantID}
+			tv := AgentToolView{CallID: t.CallID, Verdict: t.Verdict, Reason: t.Reason, Tool: t.Tool, Decision: t.Decision, GrantID: t.GrantID}
 			if tv.Decision == "" {
 				tv.Decision = "pending"
 			}
@@ -788,10 +875,11 @@ func (s *Service) Status(ctx context.Context, agentID string, ids []string) ([]A
 				tv.Narrowed, tv.Params = true, t.Params
 			}
 			if t.GrantID != "" {
+				tv.Execution, _ = s.Execution(ctx, t.GrantID, agentID)
 				if tok, ok := toks[t.GrantID]; ok {
 					tv.Grant = tok
 				} else {
-					tv.GrantNote = "token already delivered; it is shown only once"
+					tv.GrantNote = "permission is used, expired or revoked; inspect its execution state"
 				}
 			}
 			v.Tools = append(v.Tools, tv)
@@ -808,12 +896,12 @@ func nextStep(r *Request, freshTokens bool) string {
 		if r.SnoozedUntil > 0 {
 			return "Your owner snoozed this. Keep working on anything that doesn't depend on it."
 		}
-		return "Waiting for your owner. Keep working on anything that doesn't depend on it; inbox.wait blocks for up to 5 minutes."
+		return "Waiting for your owner. A registered callback announces the decision. Use inbox.status for recovery; inbox.wait is optional."
 	case StatusApproved:
 		if freshTokens {
 			return "Call each allowed tool with its grant as `_grant`, exactly within the parameters you asked for (or `params`, where your owner narrowed them). Each grant works once. Keep the tokens out of logs. Follow owner_note if there is one."
 		}
-		return "Approved. Use the grant tokens you already collected."
+		return "Accepted calls have single-use grants. Read inbox.status to recover each still-valid unused grant."
 	case StatusDenied:
 		return "Denied. Read owner_note. Ask again only with new information."
 	case StatusReturned:
@@ -986,10 +1074,11 @@ func (s *Service) Check(ctx context.Context, agentID string, calls []CheckCall) 
 
 // ListFilter selects requests for the owner.
 type ListFilter struct {
-	Open    bool // pending only
-	Closed  bool // decided, cancelled, expired, read
-	AgentID string
-	Limit   int
+	Open     bool // pending only
+	Closed   bool // decided, cancelled, expired, read
+	AgentID  string
+	AgentIDs []string // optional owner boundary, applied before LIMIT
+	Limit    int
 }
 
 // List returns requests, newest first.
@@ -1009,6 +1098,17 @@ func (s *Service) List(ctx context.Context, f ListFilter) ([]Request, error) {
 	if f.AgentID != "" {
 		q += ` AND agent_id = ?`
 		args = append(args, f.AgentID)
+	}
+	if f.AgentIDs != nil {
+		if len(f.AgentIDs) == 0 {
+			return []Request{}, nil
+		}
+		marks := make([]string, len(f.AgentIDs))
+		for i, id := range f.AgentIDs {
+			marks[i] = "?"
+			args = append(args, id)
+		}
+		q += ` AND agent_id IN (` + strings.Join(marks, ",") + `)`
 	}
 	q += ` ORDER BY created_at DESC LIMIT ?`
 	args = append(args, f.Limit)
@@ -1276,10 +1376,25 @@ func (s *Service) insert(ctx context.Context, r *Request) error {
 	if err != nil {
 		return err
 	}
-	_, err = s.db.ExecContext(ctx, `INSERT INTO inbox_requests(id, agent_id, session_id, kind, status, urgency, related_id, doc, created_at, updated_at, expires_at)
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	_, err = tx.ExecContext(ctx, `INSERT INTO inbox_requests(id, agent_id, session_id, kind, status, urgency, related_id, doc, created_at, updated_at, expires_at)
 		VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
 		r.ID, r.AgentID, nullStr(r.SessionID), r.Kind, r.Status, r.Urgency, nullStr(r.RelatedID), string(doc), r.CreatedAt, r.UpdatedAt, r.ExpiresAt)
-	return err
+	if err != nil {
+		return err
+	}
+	if s.opts.Callbacks != nil {
+		if err = s.opts.Callbacks.RegisterTx(ctx, tx, r, r.CallbackRef); err != nil {
+			return err
+		}
+	} else if r.CallbackRef != "" {
+		return errors.New("callback_ref: callback delivery is not configured")
+	}
+	return tx.Commit()
 }
 
 func (s *Service) mutate(ctx context.Context, id string, fn func(*Request) error) error {
@@ -1305,8 +1420,25 @@ func (s *Service) mutateTx(ctx context.Context, id string, fn func(*sql.Tx, *Req
 	if err := json.Unmarshal([]byte(doc), &r); err != nil {
 		return err
 	}
+	previousStatus := r.Status
 	if err := fn(tx, &r); err != nil {
 		return err
+	}
+	if previousStatus == StatusPending && r.Status != StatusPending && !r.Replayed {
+		r.Revision++
+		if r.ExecutionMode == "legacy" {
+			if err := s.legacyDecisionTx(ctx, tx, &r); err != nil {
+				return err
+			}
+		}
+		if err := s.recordDecisionAuditTx(ctx, tx, &r); err != nil {
+			return err
+		}
+		if s.opts.Callbacks != nil {
+			if err := s.opts.Callbacks.DecisionTx(ctx, tx, &r); err != nil {
+				return err
+			}
+		}
 	}
 	r.UpdatedAt = s.now().UnixMilli()
 	nb, err := json.Marshal(&r)

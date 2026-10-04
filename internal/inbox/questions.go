@@ -18,8 +18,9 @@ type Question struct {
 	Options       []Option `json:"options,omitempty"`
 }
 type TaskContext struct {
-	Title string `json:"title"`
-	URL   string `json:"url,omitempty"`
+	Objective string `json:"objective,omitempty"`
+	Title     string `json:"title"`
+	URL       string `json:"url,omitempty"`
 }
 type Response struct {
 	SelectedOptionIDs []string `json:"selected_option_ids,omitempty"`

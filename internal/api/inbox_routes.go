@@ -62,6 +62,16 @@ func (s *Server) agentNames(ctx context.Context, uid string) map[string]string {
 			out[a.ID] = a.Name
 		}
 	}
+	// Import records retain their original owner after agent deletion.
+	if s.inbox != nil {
+		if legacy, err := s.inbox.LegacyAgentNames(ctx, uid); err == nil {
+			for id, name := range legacy {
+				if _, exists := out[id]; !exists {
+					out[id] = name
+				}
+			}
+		}
+	}
 	return out
 }
 
@@ -81,6 +91,14 @@ func (s *Server) cardFor(ctx context.Context, r *inbox.Request, names map[string
 		}
 	}
 	return c
+}
+
+func (s *Server) ownsInboxRequest(ctx context.Context, uid string, r *inbox.Request, names map[string]string) bool {
+	if r.ExecutionMode == "legacy" {
+		return s.inbox.OwnsLegacyRequest(ctx, r.ID, uid)
+	}
+	_, owned := names[r.AgentID]
+	return owned
 }
 
 func shortAgent(id string) string {
@@ -116,15 +134,22 @@ func (s *Server) inboxList(w http.ResponseWriter, r *http.Request) {
 	if n, err := strconv.Atoi(r.URL.Query().Get("limit")); err == nil && n > 0 && n < f.Limit {
 		f.Limit = n
 	}
+	names := s.agentNames(r.Context(), uid)
+	f.AgentIDs = make([]string, 0, len(names))
+	for id := range names {
+		f.AgentIDs = append(f.AgentIDs, id)
+	}
 	reqs, err := s.inbox.List(r.Context(), f)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	names := s.agentNames(r.Context(), uid)
 	sessions := map[string]*inbox.Session{}
 	out := make([]inboxCard, 0, len(reqs))
 	for i := range reqs {
+		if !s.ownsInboxRequest(r.Context(), uid, &reqs[i], names) {
+			continue
+		}
 		c := s.cardFor(r.Context(), &reqs[i], names, sessions)
 		// The list only needs what the cards show; attachments and the
 		// timeline come with GET /v1/inbox/{id}.
@@ -148,6 +173,43 @@ func (s *Server) inboxItem(w http.ResponseWriter, r *http.Request) {
 	}
 	rest := strings.Trim(strings.TrimPrefix(r.URL.Path, "/v1/inbox/"), "/")
 	parts := strings.Split(rest, "/")
+	owned := s.agentNames(r.Context(), uid)
+	if len(parts) > 0 && parts[0] != "sessions" && parts[0] != "grants" && parts[0] != "info" && parts[0] != "batch" && parts[0] != "blobs" {
+		req, e := s.inbox.Get(r.Context(), parts[0])
+		if e != nil {
+			writeInboxErr(w, inbox.ErrNotFound)
+			return
+		}
+		if !s.ownsInboxRequest(r.Context(), uid, req, owned) {
+			writeInboxErr(w, inbox.ErrNotFound)
+			return
+		}
+	}
+	if len(parts) >= 2 && parts[0] == "grants" && parts[1] != "revoke-all" {
+		g, e := s.inbox.Grant(r.Context(), parts[1])
+		if e != nil {
+			writeInboxErr(w, inbox.ErrNotFound)
+			return
+		}
+		if _, ok := owned[g.AgentID]; !ok {
+			writeInboxErr(w, inbox.ErrNotFound)
+			return
+		}
+	}
+	if len(parts) == 2 && parts[0] == "blobs" {
+		ok := false
+		for aid := range owned {
+			if s.inbox.BlobBelongsToAgent(r.Context(), aid, parts[1]) {
+				ok = true
+				break
+			}
+		}
+		if !ok {
+			writeInboxErr(w, inbox.ErrNotFound)
+			return
+		}
+	}
+
 	switch {
 	case rest == "sessions":
 		s.inboxSessions(w, r, uid)
@@ -158,7 +220,11 @@ func (s *Server) inboxItem(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusMethodNotAllowed, "GET only")
 			return
 		}
-		info := s.inbox.Info(r.Context())
+		ids := make([]string, 0, len(owned))
+		for id := range owned {
+			ids = append(ids, id)
+		}
+		info := s.inbox.InfoForAgents(r.Context(), ids)
 		pk := 0
 		if s.passkeys != nil {
 			if l, err := s.passkeys.List(r.Context(), uid); err == nil {
@@ -176,6 +242,37 @@ func (s *Server) inboxItem(w http.ResponseWriter, r *http.Request) {
 		s.inboxBlob(w, r, parts[1])
 	case len(parts) == 1 && parts[0] != "":
 		s.inboxGet(w, r, uid, parts[0])
+	case len(parts) == 4 && parts[1] == "callbacks" && parts[3] == "retry":
+		if r.Method != http.MethodPost {
+			writeError(w, 405, "POST only")
+			return
+		}
+		req, e := s.inbox.Get(r.Context(), parts[0])
+		if e != nil || s.callbacks == nil {
+			writeInboxErr(w, inbox.ErrNotFound)
+			return
+		}
+		events, e := s.callbacks.History(r.Context(), req.AgentID, req.ID)
+		if e != nil {
+			federationError(w, e)
+			return
+		}
+		found := false
+		for _, ev := range events {
+			if ev.ID == parts[2] {
+				found = true
+				break
+			}
+		}
+		if !found {
+			writeInboxErr(w, inbox.ErrNotFound)
+			return
+		}
+		if e = s.callbacks.Retry(r.Context(), req.AgentID, parts[2]); e != nil {
+			federationError(w, e)
+			return
+		}
+		writeJSON(w, 200, map[string]bool{"ok": true})
 	case len(parts) == 2 && parts[1] == "decide":
 		s.inboxDecide(w, r, uid, parts[0])
 	case len(parts) == 2 && parts[1] == "audio":
@@ -227,11 +324,24 @@ func (s *Server) inboxGet(w http.ResponseWriter, r *http.Request, uid, id string
 	var mine []inbox.Grant
 	for _, g := range grants {
 		if g.RequestID == req.ID {
+			g.Execution, _ = s.inbox.Execution(r.Context(), g.ID, req.AgentID)
+			if g.Execution != nil {
+				g.Execution.Result = nil
+			}
 			mine = append(mine, g)
 		}
 	}
 	card := s.cardFor(r.Context(), req, s.agentNames(r.Context(), uid), map[string]*inbox.Session{})
-	writeJSON(w, http.StatusOK, map[string]any{"request": card, "grants": mine})
+	body := map[string]any{"request": card, "grants": mine}
+	if s.callbacks != nil {
+		history, e := s.callbacks.History(r.Context(), req.AgentID, req.ID)
+		if e != nil {
+			writeError(w, http.StatusInternalServerError, "callback history unavailable")
+			return
+		}
+		body["callbacks"] = history
+	}
+	writeJSON(w, http.StatusOK, body)
 }
 
 func (s *Server) inboxDecide(w http.ResponseWriter, r *http.Request, uid, id string) {
@@ -348,6 +458,9 @@ func (s *Server) inboxSessions(w http.ResponseWriter, r *http.Request, uid strin
 	now := time.Now().UnixMilli()
 	out := make([]sessionCard, 0, len(sessions))
 	for _, ss := range sessions {
+		if _, owned := names[ss.AgentID]; !owned {
+			continue
+		}
 		c := sessionCard{Session: ss, AgentName: names[ss.AgentID], Coached24h: coached[ss.AgentID], LiveGrants: grantsByAgent[ss.AgentID]}
 		if c.AgentName == "" {
 			c.AgentName = "agent " + shortAgent(ss.AgentID)
@@ -383,6 +496,9 @@ func (s *Server) inboxSessions(w http.ResponseWriter, r *http.Request, uid strin
 	}
 	gc := make([]grantCard, 0, len(grants))
 	for _, g := range grants {
+		if _, owned := names[g.AgentID]; !owned {
+			continue
+		}
 		n := names[g.AgentID]
 		if n == "" {
 			n = "agent " + shortAgent(g.AgentID)
@@ -402,9 +518,19 @@ func (s *Server) inboxGrants(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	if gs == nil {
-		gs = []inbox.Grant{}
+	uid, e := s.requireUser(r)
+	if e != nil {
+		writeError(w, http.StatusUnauthorized, "unauthorized")
+		return
 	}
+	owned := s.agentNames(r.Context(), uid)
+	filtered := []inbox.Grant{}
+	for _, g := range gs {
+		if _, ok := owned[g.AgentID]; ok {
+			filtered = append(filtered, g)
+		}
+	}
+	gs = filtered
 	writeJSON(w, http.StatusOK, map[string]any{"grants": gs})
 }
 
@@ -444,10 +570,25 @@ func (s *Server) inboxRevokeAll(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusUnauthorized, "unauthorized")
 		return
 	}
-	n, err := s.inbox.RevokeAllBy(r.Context(), body.AgentID, s.dashboardDecider(r, u, actor.ViaDashboard))
-	if err != nil {
-		writeError(w, http.StatusInternalServerError, err.Error())
-		return
+	owned := s.agentNames(r.Context(), u.ID)
+	if body.AgentID != "" {
+		if _, ok := owned[body.AgentID]; !ok {
+			writeInboxErr(w, inbox.ErrNotFound)
+			return
+		}
+		owned = map[string]string{body.AgentID: owned[body.AgentID]}
+	}
+	n := 0
+	for aid := range owned {
+		if aid == "" {
+			continue
+		}
+		count, e := s.inbox.RevokeAllBy(r.Context(), aid, s.dashboardDecider(r, u, actor.ViaDashboard))
+		if e != nil {
+			writeError(w, 500, e.Error())
+			return
+		}
+		n += count
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"revoked": n})
 }
@@ -522,7 +663,17 @@ func (s *Server) inboxBatch(w http.ResponseWriter, r *http.Request, uid string) 
 	// One batch id on every request this click decides.
 	decider := s.batchDecider(r, u)
 	done, failed := 0, map[string]string{}
+	owned := s.agentNames(r.Context(), uid)
 	for _, id := range body.IDs {
+		current, e := s.inbox.Get(r.Context(), id)
+		if e != nil {
+			failed[id] = "not found"
+			continue
+		}
+		if !s.ownsInboxRequest(r.Context(), uid, current, owned) {
+			failed[id] = "not found"
+			continue
+		}
 		req, err := s.inbox.Decide(r.Context(), id, inbox.Decision{Action: body.Action, Note: body.Note, SnoozeMinutes: body.SnoozeMinutes, By: u.Label(), Decider: decider})
 		if err != nil {
 			failed[id] = err.Error()

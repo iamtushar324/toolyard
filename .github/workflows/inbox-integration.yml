@@ -1,0 +1,24 @@
+name: Inbox integration
+on:
+  pull_request:
+  push:
+    branches: [t3code/inbox-batch-callbacks]
+permissions:
+  contents: read
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Go validation
+        run: go test ./...
+      - name: Dashboard behavior
+        run: node --test scripts/*ui.test.cjs
+      - name: Build gateway
+        run: go build ./cmd/gateway ./cmd/inbox-migration-check

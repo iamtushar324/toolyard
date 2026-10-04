@@ -218,6 +218,9 @@ func (g *Gateway) approvalMetaTools() []toolEntry {
 // agent's signal that `result` is populated and the call is done.
 func approvalSnapshot(req *approval.Request, includeArgs bool) map[string]any {
 	status := req.Status
+	if req.ExecutionState == "outcome_unknown" {
+		return map[string]any{"approval_id": req.ID, "status": "outcome_unknown", "raw_status": req.Status, "execution_state": "outcome_unknown", "how_to_proceed": "The upstream outcome is uncertain. Inspect authoritative upstream state. Do not repeat the write with this approval."}
+	}
 	if req.Status == approval.StatusAllowed && req.ResultExecutedAt > 0 {
 		status = "executed"
 	}
@@ -373,7 +376,7 @@ func (g *Gateway) handleWaitForApproval() directHandler {
 			return mcp.NewToolResultError("approval_id is required"), nil
 		}
 		timeoutSec := 60
-		if v, ok := args["timeout_seconds"].(float64); ok && v > 0 {
+		if v, ok := numericArgument(args["timeout_seconds"]); ok && v > 0 {
 			timeoutSec = int(v)
 		}
 		if maxSec := int(WaitForApprovalMaxTimeout.Seconds()); timeoutSec > maxSec {
@@ -461,7 +464,7 @@ func (g *Gateway) handleWaitForApprovals() directHandler {
 			mode = m
 		}
 		timeoutSec := 60
-		if v, ok := args["timeout_seconds"].(float64); ok && v > 0 {
+		if v, ok := numericArgument(args["timeout_seconds"]); ok && v > 0 {
 			timeoutSec = int(v)
 		}
 		if maxSec := int(WaitForApprovalMaxTimeout.Seconds()); timeoutSec > maxSec {

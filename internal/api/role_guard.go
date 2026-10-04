@@ -63,7 +63,16 @@ var memberRoutes = map[string]string{
 	"/v1/auth/clerk/session": http.MethodPost,
 	// Authenticated by the Clerk token in its body; a cookie riding along
 	// must not change the answer.
-	"/v1/connect/t3": http.MethodPost,
+	"/v1/connect/t3":               http.MethodPost,
+	"/v1/inbox":                    http.MethodGet,
+	"/v1/inbox/sessions":           http.MethodGet,
+	"/v1/inbox/grants":             http.MethodGet,
+	"/v1/inbox/info":               http.MethodGet,
+	"/v1/inbox/batch":              http.MethodPost,
+	"/v1/inbox/grants/revoke-all":  http.MethodPost,
+	"/v1/passkeys":                 http.MethodGet,
+	"/v1/passkeys/register/begin":  http.MethodPost,
+	"/v1/passkeys/register/finish": http.MethodPost,
 	// Own agents: list, create, enrolment code. Per-agent actions are the
 	// pattern below; identity scopes them to the caller's own agents.
 	"/v1/agents":        http.MethodGet + " " + http.MethodPost,
@@ -113,6 +122,35 @@ func memberAllowed(method, path string) bool {
 			}
 		}
 		return false
+	}
+	// All Inbox item handlers check the caller's owned agents before acting.
+	if rest, ok := strings.CutPrefix(path, "/v1/inbox/"); ok {
+		parts := strings.Split(rest, "/")
+		if len(parts) == 1 {
+			return method == http.MethodGet && parts[0] != "voice-key" && parts[0] != "decide-by-token"
+		}
+		if len(parts) == 2 {
+			if parts[0] == "blobs" {
+				return method == http.MethodGet || method == http.MethodHead
+			}
+			if method == http.MethodPost {
+				switch parts[1] {
+				case "decide", "passkey", "summarize", "explain":
+					return true
+				}
+			}
+		}
+		if len(parts) == 3 && parts[0] == "grants" && parts[2] == "revoke" {
+			return method == http.MethodPost
+		}
+		if len(parts) == 4 && parts[1] == "callbacks" && parts[3] == "retry" {
+			return method == http.MethodPost
+		}
+		return false
+	}
+	if rest, ok := strings.CutPrefix(path, "/v1/passkeys/"); ok {
+		parts := strings.Split(rest, "/")
+		return method == http.MethodPost && ((len(parts) == 2 && parts[1] == "remove") || (len(parts) == 3 && parts[1] == "remove" && parts[2] == "begin"))
 	}
 	// Bearer-token approval polling for the CLI.
 	if strings.HasPrefix(path, "/v1/agents/approvals/") {

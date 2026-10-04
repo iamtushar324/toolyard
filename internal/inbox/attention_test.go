@@ -275,7 +275,7 @@ func TestSnoozeComesBack(t *testing.T) {
 	ctx := context.Background()
 	_, r := mustSubmit(t, e, "ag_1", questionSubmission(UrgencyNow))
 	log.take()
-	if _, err := e.svc.Decide(ctx, r.ID, Decision{Action: "snooze", SnoozeMinutes: 60}); err != nil {
+	if _, err := e.decide(ctx, r.ID, Decision{Action: "snooze", SnoozeMinutes: 60}); err != nil {
 		t.Fatal(err)
 	}
 	e.advance(59 * time.Minute)
@@ -290,10 +290,10 @@ func TestSnoozeComesBack(t *testing.T) {
 		t.Fatalf("snooze end: %+v", got)
 	}
 	// Re-snoozing makes the earlier wake-up a no-op.
-	if _, err := e.svc.Decide(ctx, r.ID, Decision{Action: "snooze", SnoozeMinutes: 30}); err != nil {
+	if _, err := e.decide(ctx, r.ID, Decision{Action: "snooze", SnoozeMinutes: 30}); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := e.svc.Decide(ctx, r.ID, Decision{Action: "snooze", SnoozeMinutes: 120}); err != nil {
+	if _, err := e.decide(ctx, r.ID, Decision{Action: "snooze", SnoozeMinutes: 120}); err != nil {
 		t.Fatal(err)
 	}
 	e.advance(31 * time.Minute)
@@ -302,7 +302,7 @@ func TestSnoozeComesBack(t *testing.T) {
 		t.Fatalf("stale snooze wake-up fired: %+v", got)
 	}
 	// Decided while snoozed: nothing comes back.
-	if _, err := e.svc.Decide(ctx, r.ID, Decision{Action: "answer", Option: new(int)}); err != nil {
+	if _, err := e.decide(ctx, r.ID, Decision{Action: "answer", Option: new(int)}); err != nil {
 		t.Fatal(err)
 	}
 	e.advance(2 * time.Hour)
