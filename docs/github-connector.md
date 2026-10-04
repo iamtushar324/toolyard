@@ -22,16 +22,17 @@ The connector provides these tools:
 | `list_pull_request_reviews` | Read reviews. |
 | `list_review_comments` | Read inline comments. |
 | `create_pull_request_comment` | Propose a conversation comment. |
-| `submit_pull_request_review` | Propose a COMMENT or REQUEST_CHANGES review. |
+| `submit_pull_request_review` | Propose a COMMENT, REQUEST_CHANGES, or APPROVE review. |
 | `create_review_comment` | Propose an inline comment. |
 
 Each write creates an owner-only request in **Approvals**.
-The request shows the repository, pull request, exact text, GitHub account, and commit.
+The request shows the repository, pull request, exact text, review event, GitHub account, and commit.
 Only the account owner can allow or deny it.
 Toolyard sends an allowed write and records the result.
 Agents collect the result with `tools.poll_approval` or `tools.wait_for_approval`.
 Explicit allow rules, declared read intent, auto rules, and inbox grants cannot bypass this request.
-Approving GitHub reviews remain human-only.
+Agents can propose APPROVE reviews through this same flow.
+The account owner must explicitly allow each request before Toolyard submits the review.
 
 A changed commit, changed connection, expired request, or revoked access stops the write.
 A hidden operation marker prevents duplicate posts after a process restart.
@@ -49,5 +50,10 @@ Confirm that GitHub has one comment under your account.
 Propose another comment and deny it.
 Confirm that GitHub has no second comment.
 Repeat with a second user and confirm that each user sees only their own requests.
+Propose an APPROVE review on a pull request from another author.
+Confirm that GitHub has no new review before you allow the request.
+Allow it in Approvals and confirm that GitHub records the review for the displayed commit under your account.
+Propose another review and change the pull request commit before you allow it.
+Confirm that Toolyard refuses the stale request and sends no review.
 
 The setup uses the [GitHub App manifest flow](https://docs.github.com/en/apps/sharing-github-apps/registering-a-github-app-from-a-manifest).

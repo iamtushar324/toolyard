@@ -38,7 +38,7 @@ func (g *Gateway) addGitHubUpstream(cfg UpstreamConfig) error {
 	for _, name := range []string{"get_pull_request", "list_pull_request_files", "list_pull_request_comments", "list_pull_request_reviews", "list_review_comments", "create_pull_request_comment", "submit_pull_request_review", "create_review_comment"} {
 		write := strings.HasPrefix(name, "create_") || strings.HasPrefix(name, "submit_")
 		opts := []mcp.ToolOption{
-			mcp.WithDescription("Use your own GitHub App connection. Writes require your explicit approval. Approving reviews are human-only."),
+			mcp.WithDescription("Use your own GitHub App connection. Every write, including an APPROVE review, requires the account owner's explicit approval in Toolyard."),
 			mcp.WithString("owner", mcp.Required()), mcp.WithString("repo", mcp.Required()),
 			mcp.WithNumber("pull_number", mcp.Required()),
 			mcp.WithString(ReasonField, mcp.Required(), mcp.Description("Why this call is needed")),
@@ -50,7 +50,7 @@ func (g *Gateway) addGitHubUpstream(cfg UpstreamConfig) error {
 			opts = append(opts, mcp.WithString("body", mcp.Required()))
 		}
 		if name == "submit_pull_request_review" {
-			opts = append(opts, mcp.WithString("event", mcp.Required(), mcp.Enum("COMMENT", "REQUEST_CHANGES")))
+			opts = append(opts, mcp.WithString("event", mcp.Required(), mcp.Enum("COMMENT", "REQUEST_CHANGES", "APPROVE")))
 		}
 		if name == "create_review_comment" {
 			opts = append(opts, mcp.WithString("path", mcp.Required()), mcp.WithNumber("line", mcp.Required()), mcp.WithString("side", mcp.Required(), mcp.Enum("LEFT", "RIGHT")))
@@ -133,8 +133,8 @@ func githubArgs(tool string, args map[string]any) (string, error) {
 			return "", errors.New("body must contain between 1 and 60000 bytes")
 		}
 	}
-	if tool == "submit_pull_request_review" && args["event"] != "COMMENT" && args["event"] != "REQUEST_CHANGES" {
-		return "", errors.New("only COMMENT and REQUEST_CHANGES reviews are supported; approving reviews require a human on GitHub")
+	if tool == "submit_pull_request_review" && args["event"] != "COMMENT" && args["event"] != "REQUEST_CHANGES" && args["event"] != "APPROVE" {
+		return "", errors.New("event must be COMMENT, REQUEST_CHANGES, or APPROVE")
 	}
 	if tool == "create_review_comment" {
 		file, _ := args["path"].(string)

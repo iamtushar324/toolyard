@@ -106,6 +106,11 @@ func githubPending(t *testing.T, f *accessFixture, ctx context.Context, tool str
 	if tool == "submit_pull_request_review" {
 		args["event"] = "REQUEST_CHANGES"
 	}
+	return githubPendingArgs(t, f, ctx, tool, args)
+}
+
+func githubPendingArgs(t *testing.T, f *accessFixture, ctx context.Context, tool string, args map[string]any) *approval.Request {
+	t.Helper()
 	res := f.call(t, ctx, "github."+tool, args)
 	if res.IsError {
 		t.Fatalf("call failed: %+v", res)
@@ -213,22 +218,122 @@ func TestGitHubReadsUseEachUsersToken(t *testing.T) {
 	}
 }
 
-func TestGitHubReviewBindsCommitAndForbidsApprove(t *testing.T) {
-	f, _, h, alice, _ := githubFixture(t)
-	args := githubCallArgs()
-	args["event"] = "APPROVE"
-	if res := f.call(t, alice, "github.submit_pull_request_review", args); !res.IsError {
-		t.Fatal("agent approval accepted")
+func TestGitHubReviewsRequireOwnerAndBindCommit(t *testing.T) {
+	for _, event := range []string{"COMMENT", "REQUEST_CHANGES", "APPROVE"} {
+		t.Run(event, func(t *testing.T) {
+			f, _, h, alice, _ := githubFixture(t)
+			if _, err := f.gw.policy.Set(context.Background(), policy.ScopeUpstream, "github", "allow", "", false); err != nil {
+				t.Fatal(err)
+			}
+			f.gw.approvalMode = func() string { return ApprovalModeInbox }
+			args := githubCallArgs()
+			args["event"], args[IntentField], args[GrantField] = event, "read", "fake-grant"
+			r := githubPendingArgs(t, f, alice, "submit_pull_request_review", args)
+			if r.Status != approval.StatusPending || r.PersonalOwner() != "alice" || h.posts != 0 || r.Arguments["event"] != event || r.Arguments["body"] != args["body"] {
+				t.Fatalf("review did not wait for its owner: %+v posts=%d", r, h.posts)
+			}
+			snapshot, _ := r.Arguments[approval.PersonalGitHubField].(map[string]any)
+			if snapshot["head_sha"] != "aaa" || snapshot["github_login"] != "alice-gh" {
+				t.Fatalf("approval lost its account or commit: %v", snapshot)
+			}
+			for _, d := range []actor.Decider{{UserID: "bob", Via: actor.ViaDashboard}, {UserID: "alice", Via: actor.ViaAutoRule}, {UserID: "alice", Via: actor.ViaInboxGrant}} {
+				if _, err := f.bus.DecideAs(context.Background(), r.ID, approval.StatusAllowed, d); err != approval.ErrWrongOwner {
+					t.Fatalf("unsafe review decider: %v", err)
+				}
+			}
+			out := githubDecide(t, f, r)
+			if out.ResultIsError || h.posts != 1 || h.rows[0]["commit_id"] != "aaa" || h.rows[0]["event"] != event || !strings.HasPrefix(h.rows[0]["body"].(string), args["body"].(string)) {
+				t.Fatalf("bad review: %+v posts=%d", out, h.posts)
+			}
+			f.call(t, alice, "github.submit_pull_request_review", map[string]any{ApprovalIDField: r.ID})
+			f.gw.Execute(context.Background(), out)
+			if h.posts != 1 {
+				t.Fatal("review result fetch or recovery duplicated the write")
+			}
+		})
 	}
-	args = githubCallArgs()
+}
+
+func TestGitHubReviewsRejectUnknownEventsAndForgedSnapshots(t *testing.T) {
+	f, _, h, alice, _ := githubFixture(t)
+	for _, event := range []any{"", "APPROVED", "DISMISS", nil} {
+		args := githubCallArgs()
+		args["event"] = event
+		if res := f.call(t, alice, "github.submit_pull_request_review", args); !res.IsError {
+			t.Fatalf("unsupported review event accepted: %v", event)
+		}
+	}
+	args := githubCallArgs()
 	args[approval.PersonalGitHubField] = map[string]any{"owner_user_id": "bob"}
 	if res := f.call(t, alice, "github.create_pull_request_comment", args); !res.IsError {
 		t.Fatal("forged snapshot accepted")
 	}
-	r := githubPending(t, f, alice, "submit_pull_request_review")
-	out := githubDecide(t, f, r)
-	if out.ResultIsError || h.posts != 1 || h.rows[0]["commit_id"] != "aaa" || h.rows[0]["event"] != "REQUEST_CHANGES" {
-		t.Fatalf("bad review: %+v", out)
+	rows, _ := f.bus.ListPending(context.Background())
+	if len(rows) != 0 || h.posts != 0 {
+		t.Fatal("invalid review created a request or a write")
+	}
+}
+
+func TestGitHubApproveStopsAfterConnectionOrCommitChanges(t *testing.T) {
+	for _, change := range []string{"disconnect", "token", "head", "revoked"} {
+		t.Run(change, func(t *testing.T) {
+			f, a, h, alice, _ := githubFixture(t)
+			args := githubCallArgs()
+			args["event"] = "APPROVE"
+			r := githubPendingArgs(t, f, alice, "submit_pull_request_review", args)
+			switch change {
+			case "disconnect":
+				a.connected["alice"] = false
+			case "token":
+				a.tokens["alice"] = "another-token"
+			case "head":
+				h.head = "bbb"
+			case "revoked":
+				h.revoked = true
+			}
+			out := githubDecide(t, f, r)
+			if !out.ResultIsError || h.posts != 0 {
+				t.Fatalf("stale APPROVE review submitted: %+v posts=%d", out, h.posts)
+			}
+		})
+	}
+}
+
+func TestGitHubApproveDeniedSendsNoReview(t *testing.T) {
+	f, _, h, alice, _ := githubFixture(t)
+	args := githubCallArgs()
+	args["event"] = "APPROVE"
+	r := githubPendingArgs(t, f, alice, "submit_pull_request_review", args)
+	if _, err := f.bus.DecideAs(context.Background(), r.ID, approval.StatusDenied, actor.Decider{UserID: "alice", Via: actor.ViaDashboard}); err != nil {
+		t.Fatal(err)
+	}
+	f.call(t, alice, "github.submit_pull_request_review", map[string]any{ApprovalIDField: r.ID})
+	if h.posts != 0 {
+		t.Fatal("denied APPROVE review submitted")
+	}
+}
+
+func TestGitHubReviewSchemaAllowsAllEvents(t *testing.T) {
+	f, _, _, _, _ := githubFixture(t)
+	e, ok := f.gw.tools["github.submit_pull_request_review"]
+	if !ok {
+		t.Fatal("review tool is missing")
+	}
+	b, err := json.Marshal(e.tool.InputSchema.Properties["event"])
+	if err != nil {
+		t.Fatal(err)
+	}
+	var property struct {
+		Enum []string `json:"enum"`
+	}
+	if err := json.Unmarshal(b, &property); err != nil {
+		t.Fatal(err)
+	}
+	if strings.Join(property.Enum, ",") != "COMMENT,REQUEST_CHANGES,APPROVE" {
+		t.Fatalf("review event schema: %s", b)
+	}
+	if !e.requireHuman || !e.personalGitHub {
+		t.Fatal("review schema lost mandatory owner approval")
 	}
 }
 
