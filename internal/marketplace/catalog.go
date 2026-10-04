@@ -125,10 +125,10 @@ func Catalog() []Entry {
 		},
 		{
 			ID: "github", Name: "GitHub", Tagline: "Your GitHub account with approval for each write",
-			Description: "Read pull requests, add comments, and submit COMMENT or REQUEST_CHANGES reviews. Each user connects their own GitHub account. Only that user can permit a write.",
+			Description: "Read pull requests, add comments, and submit COMMENT, REQUEST_CHANGES, or APPROVE reviews. Each user connects their own GitHub account. Only that user can permit a write.",
 			Category:    "Dev", Homepage: "https://docs.github.com/en/apps/creating-github-apps/authenticating-with-a-github-app/authenticating-with-a-github-app-on-behalf-of-a-user",
 			Transport: "github", URL: "https://api.github.com", AuthMode: "per_user", SuggestedName: "GitHubForUsers",
-			Notes: "Install the connector, register the GitHub App, and select its repositories. Each user then connects in My connections. Approving reviews remain human-only.",
+			Notes: "Install the connector, register the GitHub App, and select its repositories. Each user then connects in My connections. Every write, including an APPROVE review, requires the account owner's explicit approval in Toolyard.",
 			Auth:  &AuthPreset{Issuer: "https://github.com", AuthorizationEndpoint: "https://github.com/login/oauth/authorize", TokenEndpoint: "https://github.com/login/oauth/access_token", ClientSetupURL: "https://github.com/settings/apps/new"},
 		},
 		{
