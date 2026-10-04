@@ -406,7 +406,7 @@ func (g *Gateway) inboxTools() []toolEntry {
 				"undo":             map[string]any{"type": "string", "description": "Required for writes: concrete undo path or cannot be undone."},
 				"tool":             map[string]any{"type": "string", "description": "Catalog name, e.g. deploy.run."},
 				"required":         map[string]any{"type": "boolean", "description": "Planning hint only. Your owner can reject this call and submit."},
-				"summary":          map[string]any{"type": "string", "description": "Your plain-words description of what the call does."},
+				"summary":          map[string]any{"type": "string", "description": "Explain this call's purpose and its relationship to task.objective in plain words."},
 				"params": map[string]any{
 					"type": "object",
 					"description": "Every argument you'll pass. A value (or {\"eq\": v}) is exact; also {\"in\": [...]}, {\"prefix\": s}, {\"gte\": n, \"lte\": n}, " +
@@ -514,8 +514,9 @@ func (g *Gateway) inboxTools() []toolEntry {
 		inboxEntry("inbox.request", inboxUpstream,
 			"Ask your owner for permission to use restricted tools: one request per task, with every tool it needs. "+
 				"Write it as yourself: a first-person message, facts (why_now, if_it_goes_wrong, undo), a ≤75-word voice-note script, and evidence attachments. "+
-				"Run it with dry_run: true first. Returns request_id; then keep working and use inbox.wait. Read inbox.guide for the format.",
-			obj([]string{"title", "summary", "message", "facts", "urgency", "tools"}, requestProps),
+				"Supply task.objective and run it with dry_run: true first. Include an authorized callback_ref, then continue unrelated work or end the turn. "+
+				"After a callback, read inbox.status for authoritative decisions and valid grants before execution. inbox.wait is optional. Read inbox.guide for the format.",
+			obj([]string{"title", "summary", "message", "facts", "urgency", "task", "tools"}, requestProps),
 			submit(inbox.KindAccess)),
 		inboxEntry("inbox.ask", inboxUpstream,
 			"Ask a question. Prefer schema_version:2 with prompt and question.type (free_text, single_choice, multiple_choice). Options need stable IDs. Your owner can always write a custom answer. Audio is optional. Legacy title/summary/message/options remain supported.",
@@ -526,7 +527,8 @@ func (g *Gateway) inboxTools() []toolEntry {
 			obj([]string{"title", "summary", "message"}, postProps),
 			submit(inbox.KindUpdate)),
 		inboxEntry("inbox.status", inboxUpstream,
-			"Check your requests without blocking. Approved requests include a grant token per allowed tool, shown once: keep it in memory and pass it as _grant.",
+			"Read authoritative decisions without blocking. Status reads never consume grants. Accepted calls include their same still-valid unused grant token. "+
+				"Recover that token after a lost response and pass it as _grant for the approved call. Expired, revoked, or consumed grants cannot be recovered.",
 			obj([]string{"ids"}, map[string]any{"ids": idsProp}),
 			func(ctx context.Context, args map[string]any) (*mcp.CallToolResult, error) {
 				agentID, errRes := requireAgentID(ctx)
@@ -544,7 +546,8 @@ func (g *Gateway) inboxTools() []toolEntry {
 				return inboxJSON(map[string]any{"requests": views}), nil
 			}),
 		inboxEntry("inbox.wait", inboxUpstream,
-			"Block until your owner decides (mode any: first decision; all: every one) or timeout_seconds passes (max 300). Use it when you have nothing else to do. Same result as inbox.status.",
+			"Optionally block until your owner decides (mode any: first decision; all: every one) or timeout_seconds passes (max 300). "+
+				"With callback_ref, continue unrelated work or end the turn instead. After the callback, read authoritative decisions with inbox.status. Same result as inbox.status.",
 			obj([]string{"ids"}, map[string]any{
 				"ids":             idsProp,
 				"mode":            map[string]any{"type": "string", "enum": []string{"any", "all"}},
