@@ -25,6 +25,17 @@ func ledgerBinding() Binding {
 	return Binding{PrincipalID: ledgerAgent, OwnerUserID: ledgerOwner, SessionID: ledgerSID, IssuedAt: ledgerNow - 1, ExpiresAt: ledgerNow + 300, CredentialMode: "dedicated-per-session", ProofSHA256: strings.Repeat("c", 64), ApprovedBy: ledgerOwner}
 }
 
+// testing.T.TempDir does not promise a private mode for its numbered child.
+// Match the service-owned issuer directory instead of weakening PrivateFile.
+func privateTestDir(t *testing.T) string {
+	t.Helper()
+	dir := t.TempDir()
+	if err := os.Chmod(dir, 0700); err != nil {
+		t.Fatal("private test directory unavailable")
+	}
+	return dir
+}
+
 func ledgerDB(t *testing.T, path string) *store.DB {
 	t.Helper()
 	db, err := store.Open(path)
@@ -69,7 +80,7 @@ func persistentSigner(t *testing.T, db *store.DB, path string) *Signer {
 }
 
 func TestPreviewLedgerRestartRemovalRotationAndSessionReassignment(t *testing.T) {
-	dir := t.TempDir()
+	dir := privateTestDir(t)
 	path := filepath.Join(dir, "ledger.db")
 	db := ledgerDB(t, path)
 	seedLedgerPrincipal(t, db)
@@ -116,7 +127,7 @@ func TestPreviewLedgerRestartRemovalRotationAndSessionReassignment(t *testing.T)
 }
 
 func TestPreviewLedgerSurvivesAgentDeletionAndCrossOwnerReassignment(t *testing.T) {
-	dir := t.TempDir()
+	dir := privateTestDir(t)
 	db := ledgerDB(t, filepath.Join(dir, "ledger.db"))
 	seedLedgerPrincipal(t, db)
 	rp := filepath.Join(dir, "bindings.json")

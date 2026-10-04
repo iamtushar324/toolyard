@@ -68,7 +68,11 @@ func TestBKSPreviewDeferredApprovalRechecksRealRegistryPrincipalAndLedger(t *tes
 			}
 			now := int64(1800000000)
 			b := previewassertion.Binding{PrincipalID: agent, OwnerUserID: owner, SessionID: sid, IssuedAt: now - 1, ExpiresAt: now + 300, CredentialMode: "dedicated-per-session", ProofSHA256: strings.Repeat("c", 64), ApprovedBy: owner}
-			rp := filepath.Join(t.TempDir(), "bindings.json")
+			registryDir := t.TempDir()
+			if err := os.Chmod(registryDir, 0700); err != nil {
+				t.Fatal("private test registry directory unavailable")
+			}
+			rp := filepath.Join(registryDir, "bindings.json")
 			write := func(bindings []previewassertion.Binding) {
 				raw, err := json.Marshal(previewassertion.Registry{Version: 1, Bindings: bindings})
 				if err != nil || os.WriteFile(rp, raw, 0600) != nil {

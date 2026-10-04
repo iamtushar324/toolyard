@@ -11,7 +11,7 @@ import (
 )
 
 func TestPreviewPrivateFilesSecureHierarchyAndDenials(t *testing.T) {
-	dir := t.TempDir()
+	dir := privateTestDir(t)
 	path := filepath.Join(dir, "private")
 	if err := os.WriteFile(path, []byte("synthetic-test-data"), 0600); err != nil {
 		t.Fatal(err)
@@ -102,7 +102,7 @@ func TestPreviewPrivateFilesRejectUnsafeAncestorAndReplacement(t *testing.T) {
 }
 
 func TestPreviewRegistryReloadRejectsMalformedAndExpiredBindings(t *testing.T) {
-	dir := t.TempDir()
+	dir := privateTestDir(t)
 	path := filepath.Join(dir, "bindings.json")
 	r := &FileRegistry{Path: path, OwnerUID: uint32(os.Geteuid())}
 	ctx := context.Background()
