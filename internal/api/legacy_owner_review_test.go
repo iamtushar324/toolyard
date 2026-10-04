@@ -2,6 +2,7 @@ package api
 
 import (
 	"context"
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"testing"
@@ -97,6 +98,33 @@ func TestReviewLegacyHistoryKeepsOwnerAfterAgentDeletion(t *testing.T) {
 			if code := get(cookie, id); code != 404 {
 				t.Fatalf("unknown owner was guessed for %s: %d", id, code)
 			}
+		}
+	}
+	for _, entry := range []struct {
+		cookie *http.Cookie
+		want   map[string]bool
+	}{
+		{f.cookie, map[string]bool{primary.ID: true, recovered.ID: true, anonymous.ID: true}},
+		{memberCookie, map[string]bool{other.ID: true}},
+	} {
+		r := httptest.NewRequest("GET", "/v1/inbox?view=all", nil)
+		r.AddCookie(entry.cookie)
+		w := httptest.NewRecorder()
+		handler.ServeHTTP(w, r)
+		var body struct {
+			Requests []struct{ ID string }
+		}
+		if w.Code != 200 || json.Unmarshal(w.Body.Bytes(), &body) != nil {
+			t.Fatalf("history list failed: %d %s", w.Code, w.Body.String())
+		}
+		for _, row := range body.Requests {
+			if !entry.want[row.ID] {
+				t.Fatalf("history list disclosed another owner's row: %s", row.ID)
+			}
+			delete(entry.want, row.ID)
+		}
+		if len(entry.want) != 0 {
+			t.Fatalf("history list omitted original owner's rows: %v", entry.want)
 		}
 	}
 	if _, err = f.svc.DecideLegacy(ctx, primary.ID, "allowed", actor.Decider{UserID: member.ID}); err == nil {
