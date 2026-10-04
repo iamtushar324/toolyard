@@ -274,7 +274,7 @@ func TestBKSPreviewMissingBindingRefusesBeforeApproval(t *testing.T) {
 	p.revoked = true
 	f.gw.RegisterBKSPreviewTools(p)
 	res := f.call(t, WithAgentID(context.Background(), "ag_1"), "test", "bks_preview.snapshots", nil)
-	if !res.IsError || textOf(res) != "trusted preview caller/session binding unavailable" {
+	if !res.IsError || textOf(res) != "trusted caller/session binding unavailable" {
 		t.Fatalf("unsafe refusal: %s", textOf(res))
 	}
 	if f.lastMetric(t, "bks_preview.snapshots").ApprovalID != "" {

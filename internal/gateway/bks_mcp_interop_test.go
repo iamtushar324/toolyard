@@ -25,7 +25,14 @@ import (
 // These tests are the normal Toolyard connector against the actual pinned BKS
 // build_app, IdentityMiddleware and Python MCP SDK. No HTTP response is mocked.
 // Cloud CI explicitly enables them; ordinary unit tests do not launch a service.
-func actualBKSFixture(t *testing.T, initializeDelay float64, loseFirstCreateResponse bool) string {
+type actualBKSOptions struct {
+	initializeDelay          float64
+	loseFirstCreateResponse  bool
+	sourceDelay              float64
+	reflectSnapshotFragments bool
+}
+
+func actualBKSFixture(t *testing.T, options actualBKSOptions) string {
 	t.Helper()
 	if os.Getenv("BKS_MCP_INTEGRATION") != "1" {
 		t.Skip("actual Python MCP fixture requires the scoped hosted-CI step")
@@ -96,7 +103,7 @@ func actualBKSFixture(t *testing.T, initializeDelay float64, loseFirstCreateResp
 	for i := range key {
 		key[i] = int('i')
 	}
-	if json.NewEncoder(stdin).Encode(map[string]any{"key": key, "initialize_delay_seconds": initializeDelay, "lose_first_create_response": loseFirstCreateResponse}) != nil {
+	if json.NewEncoder(stdin).Encode(map[string]any{"key": key, "initialize_delay_seconds": options.initializeDelay, "lose_first_create_response": options.loseFirstCreateResponse, "source_delay_seconds": options.sourceDelay, "reflect_snapshot_fragments": options.reflectSnapshotFragments}) != nil {
 		t.Fatal("synthetic fixture configuration unavailable")
 	}
 	type readiness struct {
@@ -133,7 +140,7 @@ func actualBKSProfile(t *testing.T, endpoint string) trustedmcp.Profile {
 	}
 	p := trustedmcp.Profile{
 		Version: 1, Endpoint: endpoint, Issuer: "toolyard", Audience: "bk-agent-test-pilot-preview-v1",
-		KeyID: "toolyard-preview-v1", ProtocolVersion: "2025-11-25", TimeoutSeconds: 10, HeaderTimeoutSeconds: 3,
+		KeyID: "toolyard-preview-v1", ProtocolVersion: "2025-11-25", TimeoutSeconds: 65, HeaderTimeoutSeconds: 35,
 		Tools: []trustedmcp.ToolProfile{
 			{Alias: "create", Operation: "preview_create", Description: "Queue a bounded synthetic preview", IdempotencyField: "request_id", Schema: schema(map[string]any{"source_ref": map[string]any{"type": "string", "minLength": 1, "maxLength": 210}, "request_id": id(), "snapshot_id": map[string]any{"type": "string", "pattern": "^[a-z][a-z0-9-]{0,62}$"}, "pool": map[string]any{"type": "string", "enum": []string{"large", "medium"}, "default": "large"}, "lifetime_seconds": map[string]any{"type": "integer", "minimum": 300, "maximum": 21600, "default": 1200}}, "source_ref", "request_id", "snapshot_id")},
 			{Alias: "inspect", Operation: "preview_inspect", Description: "Inspect the owned preview", ReadOnly: true, Schema: schema(map[string]any{"environment_id": id()}, "environment_id")},
@@ -272,7 +279,7 @@ func actualBKSCall(t *testing.T, f *actorFixture, agent, tool string, args map[s
 }
 
 func TestBKSPreviewMCPActualSDKDiscoverySixOperationsAndReconnect(t *testing.T) {
-	endpoint := actualBKSFixture(t, 0, true)
+	endpoint := actualBKSFixture(t, actualBKSOptions{loseFirstCreateResponse: true, sourceDelay: 3.25})
 	profile := actualBKSProfile(t, endpoint)
 	enrolled := actualBKSEnrollment(t)
 	client := enrolled.client(t, profile)
@@ -296,7 +303,11 @@ func TestBKSPreviewMCPActualSDKDiscoverySixOperationsAndReconnect(t *testing.T) 
 	}
 	request := "c779294a-a07b-4da0-8939-bfa6f2a1a57a"
 	create := map[string]any{"source_ref": "pr:42", "request_id": request, "snapshot_id": "synthetic-v1", "lifetime_seconds": 300}
+	started := time.Now()
 	unknown := f.call(t, ctx, "cloud-contract", "bks_preview.create", create)
+	if elapsed := time.Since(started); elapsed < 3200*time.Millisecond {
+		t.Fatal("real resolver response did not pass the previous three-second header limit")
+	}
 	if !unknown.IsError || !strings.Contains(textOf(unknown), "unknown") || !strings.Contains(textOf(unknown), "original request ID") {
 		t.Fatal("lost real control receipt did not preserve unknown-outcome retry guidance")
 	}
@@ -346,7 +357,7 @@ func TestBKSPreviewMCPActualSDKDiscoverySixOperationsAndReconnect(t *testing.T) 
 }
 
 func TestBKSPreviewMCPActualSDKDeferredApprovalAndRevocation(t *testing.T) {
-	endpoint := actualBKSFixture(t, 0, false)
+	endpoint := actualBKSFixture(t, actualBKSOptions{})
 	profile := actualBKSProfile(t, endpoint)
 	enrolled := actualBKSEnrollment(t)
 	f := actualBKSGateway(t, enrolled.client(t, profile), profile)
@@ -380,7 +391,7 @@ func TestBKSPreviewMCPActualSDKDeferredApprovalAndRevocation(t *testing.T) {
 }
 
 func TestBKSPreviewMCPActualSDKApprovalExpiryBoundsInitialize(t *testing.T) {
-	endpoint := actualBKSFixture(t, 0.5, false)
+	endpoint := actualBKSFixture(t, actualBKSOptions{initializeDelay: 0.5})
 	profile := actualBKSProfile(t, endpoint)
 	enrolled := actualBKSEnrollment(t)
 	f := actualBKSGateway(t, enrolled.client(t, profile), profile)
@@ -399,5 +410,44 @@ func TestBKSPreviewMCPActualSDKApprovalExpiryBoundsInitialize(t *testing.T) {
 	res := f.call(t, ctx, "cloud-contract", "bks_preview.snapshots", map[string]any{ApprovalIDField: id})
 	if !res.IsError {
 		t.Fatal("actual delayed initialize outlived its approved request")
+	}
+}
+
+func TestBKSPreviewMCPActualSDKFragmentedAssertionRefusedBeforeDeferredCache(t *testing.T) {
+	endpoint := actualBKSFixture(t, actualBKSOptions{reflectSnapshotFragments: true})
+	profile := actualBKSProfile(t, endpoint)
+	enrolled := actualBKSEnrollment(t)
+	f := actualBKSGateway(t, enrolled.client(t, profile), profile)
+	if _, err := f.gw.policy.Set(context.Background(), "tool", "bks_preview.snapshots", "ask", "synthetic reflection CI policy", true); err != nil {
+		t.Fatal("synthetic reflection policy unavailable")
+	}
+	ctx := WithAgentID(context.Background(), enrolled.agents[0])
+	f.call(t, ctx, "cloud-contract", "bks_preview.snapshots", nil)
+	id := f.lastMetric(t, "bks_preview.snapshots").ApprovalID
+	if id == "" {
+		t.Fatal("reflection test did not enter real deferred approval")
+	}
+	req, err := f.bus.Decide(context.Background(), id, approval.StatusAllowed, enrolled.owners[0])
+	if err != nil {
+		t.Fatal("synthetic reflection decision failed")
+	}
+	f.gw.Execute(context.Background(), req)
+	cached, err := f.bus.Get(context.Background(), id)
+	if err != nil || !cached.ResultIsError || cached.ResultExecutedAt == 0 {
+		t.Fatal("fragmented real assertion reached the persisted success cache")
+	}
+	for _, text := range []string{cached.ResultEnvelope, cached.ResultError} {
+		if strings.Contains(text, "eyJ") || strings.Contains(text, "Bearer ") || strings.Contains(text, "chunks") {
+			t.Fatal("fragmented real assertion reached the deferred result row")
+		}
+	}
+	result := f.call(t, ctx, "cloud-contract", "bks_preview.snapshots", map[string]any{ApprovalIDField: id})
+	if !result.IsError || strings.Contains(textOf(result), "eyJ") || strings.Contains(textOf(result), "Bearer ") {
+		t.Fatal("fragmented real assertion reached the resumed caller")
+	}
+	for _, event := range f.drainAudit() {
+		if strings.Contains(event.ResultSummary, "eyJ") || strings.Contains(event.ResultSummary, "Bearer ") {
+			t.Fatal("fragmented real assertion reached gateway audit")
+		}
 	}
 }

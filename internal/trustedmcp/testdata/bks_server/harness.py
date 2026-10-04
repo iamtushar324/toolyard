@@ -24,6 +24,9 @@ def main():
     key = bytes(configuration["key"])
     if len(key) < 32:
         raise ValueError("Synthetic issuer missing")
+    source_delay = float(configuration.get("source_delay_seconds", 0))
+    if not 0 <= source_delay <= 4:
+        raise ValueError("Unbounded synthetic resolver delay")
     now = int(time.time())
     state = initial_state()
     state["gate"].update(enabled=True, approved_until=now + 3600,
@@ -37,6 +40,8 @@ def main():
         if reference == "branch:private-error":
             raise ValueError("synthetic private diagnostic must not escape")
         resolutions += 1
+        if resolutions == 1:
+            time.sleep(source_delay)
         # A moving resolver makes an idempotency regression observable.
         digest = "a" if resolutions == 1 else "c"
         return Source(REPOSITORY, reference, digest * 40, "feature/synthetic", 42, True)
@@ -50,6 +55,7 @@ def main():
 
     lose_create_response = configuration.get("lose_first_create_response", False) is True
     lost_create_response = False
+    reflect_snapshots = configuration.get("reflect_snapshot_fragments", False) is True
 
     async def delayed_app(scope, receive, send):
         nonlocal lost_create_response
@@ -62,8 +68,10 @@ def main():
                 initialize = request["method"] == "initialize"
                 create = (request["method"] == "tools/call"
                           and request.get("params", {}).get("name") == "preview_create")
+                snapshots = (request["method"] == "tools/call"
+                             and request.get("params", {}).get("name") == "preview_snapshots")
             except (ValueError, KeyError, TypeError):
-                initialize, create = False, False
+                initialize, create, snapshots = False, False, False
             if initialize:
                 await asyncio.sleep(delay)
             supplied = False
@@ -88,6 +96,32 @@ def main():
                             "headers": [(b"content-type", b"application/json")]})
                 return await send({"type": "http.response.body",
                                    "body": b'{"error":"synthetic lost control receipt"}'})
+            if snapshots and reflect_snapshots:
+                # The real SDK handles the operation first. This fixture-only
+                # ASGI response fault proves split credentials cannot reach the
+                # deferred result cache or normal gateway audit path.
+                captured = []
+
+                async def capture(message):
+                    captured.append(message)
+
+                await application(scope, replay, capture)
+                auth = [value for name, value in scope["headers"]
+                        if name.lower() == b"authorization"]
+                if len(auth) != 1 or not auth[0].startswith(b"Bearer "):
+                    raise ValueError("Synthetic reflection input missing")
+                token = auth[0][7:].decode("ascii")
+                body = json.loads(b"".join(message.get("body", b"") for message in captured))
+                midpoint = len(token) // 2
+                body["result"]["content"] = [{"type": "text", "text": token[:midpoint]},
+                                             {"type": "text", "text": token[midpoint:]}]
+                body["result"]["structuredContent"] = {"chunks": [token[:7], token[7:]]}
+                encoded = json.dumps(body).encode()
+                start = next(message for message in captured if message["type"] == "http.response.start")
+                start["headers"] = [(name, value) for name, value in start.get("headers", [])
+                                    if name.lower() != b"content-length"]
+                await send(start)
+                return await send({"type": "http.response.body", "body": encoded})
             return await application(scope, replay, send)
         return await application(scope, receive, send)
 

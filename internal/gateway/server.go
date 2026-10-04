@@ -112,7 +112,7 @@ type toolEntry struct {
 	originalName   string // upstream-side name (without prefix)
 	reasonField    string // "_reason" (or "__toolyard_reason" if a clash forced a rename)
 	handle         directHandler
-	// preflight validates a restricted builtin before approval or grant use.
+	// preflight validates a restricted connector before approval or grant use.
 	// Its handler must still recheck authority when it executes later.
 	preflight func(context.Context, map[string]any) error
 	// approvedPreflight refuses deferred execution without an enrollment
@@ -1658,14 +1658,14 @@ func budgetExceededResponse(agentID string, current, max int) *mcp.CallToolResul
 
 func (g *Gateway) dispatch(ctx context.Context, entry toolEntry, args map[string]any,
 	agentID, reason, approvalID string, ev *metrics.Event) (*mcp.CallToolResult, error) {
-	// Include the persisted approval read in the preview's execution bound.
+	// Include the persisted approval read in the connector's execution bound.
 	// A background executor otherwise has no deadline while it waits on SQLite.
 	if entry.approvedPreflight != nil {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, 65*time.Second)
 		defer cancel()
 	}
-	// Preview approvals must still be live, exact, and backed by the
+	// Assertion approvals must still be live, exact, and backed by the
 	// original durable enrollment. Inbox grants use a separate validated
 	// instrument; their IDs are not approval_requests IDs.
 	if entry.approvedPreflight != nil && approvalID != "" && ev.ApprovalVia != "grant" {
@@ -1727,6 +1727,9 @@ func (g *Gateway) dispatch(ctx context.Context, entry toolEntry, args map[string
 		cfg = &u.cfg
 	case pu != nil:
 		cfg = &pu.cfg
+	}
+	if cfg != nil && cfg.Trusted != nil {
+		asUser, _ = g.ownerUser(ctx, agentID)
 	}
 	// A shared OAuth server with no usable token is refused before the
 	// dial, with a connect link for an admin owner (connections_tools.go).
