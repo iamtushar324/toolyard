@@ -133,7 +133,24 @@ func seedData(dir, credPath string) error {
 			}
 		}
 	}
-	access := &inbox.Submission{Kind: inbox.KindAccess, Title: "Update the sample project note", Summary: "A permission test that changes one synthetic record.", Message: "I would like to set the sample note to Reviewed in stage. This action only changes the local test connector.", Urgency: inbox.UrgencySoon, Facts: &inbox.Facts{WhyNow: "Test the complete permission flow.", IfItGoesWrong: "Only the synthetic welcome record changes.", Undo: "Set the sample record back to its original text."}, Tools: []inbox.SubmissionTool{{Tool: "sandbox-files.update_record", Required: true, Summary: "Update the synthetic welcome record.", Params: map[string]any{"id": "welcome", "text": "Reviewed in stage"}}}}
+	access := &inbox.Submission{
+		Kind: inbox.KindAccess, Title: "Update the sample project note",
+		Summary: "A permission test that changes one synthetic record.",
+		Message: "I would like to set the sample note to Reviewed in stage. This action only changes the local test connector.",
+		Task:    &inbox.TaskContext{Objective: "Verify the scoped permission flow with one synthetic stage record."},
+		Urgency: inbox.UrgencySoon, PendingTTLSeconds: 86400, TTLSeconds: 1800,
+		Facts: &inbox.Facts{WhyNow: "Test the complete permission flow.", IfItGoesWrong: "Only the synthetic welcome record changes.", Undo: "Set the sample record back to its original text."},
+		Tools: []inbox.SubmissionTool{{
+			CallID: "welcome_note", Tool: "sandbox-files.update_record", Required: true,
+			Summary: "Update the welcome record to verify exact scoped permission.",
+			Target:  "The synthetic welcome record", Operation: "write",
+			ExpectedEffects: "The local welcome record contains Reviewed in stage.",
+			AffectedScope:   "Only the synthetic welcome record in the fixture connector.",
+			MaterialRisks:   "The test note changes until its previous text is restored.",
+			Undo:            "Use an approved update_record call to restore the previous welcome text.",
+			Params:          map[string]any{"id": "welcome", "text": "Reviewed in stage"},
+		}},
+	}
 	r, err := svc.Submit(ctx, agent.ID, access)
 	if err != nil {
 		return err
