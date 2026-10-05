@@ -100,7 +100,9 @@ func (s *Server) hostAuthorization(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	w.Header().Set("Cache-Control", "no-store")
-	w.Header().Set("Referrer-Policy", "no-referrer")
+	// no-referrer makes a browser form POST send Origin: null. Preserve the
+	// origin for this same-origin consent form without exposing it elsewhere.
+	w.Header().Set("Referrer-Policy", "same-origin")
 	if !s.unauthLimit.AllowN("host-consent-page:"+s.security.ClientIP(r), 60, time.Minute) {
 		writeError(w, 429, "too_many_requests")
 		return

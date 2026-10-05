@@ -72,6 +72,11 @@ func TestHostRoutesExplicitConsentAndMemberManagement(t *testing.T) {
 	if rec.Code != 200 {
 		t.Fatal("consent page", rec.Code, rec.Body.String())
 	}
+	// HTML form navigation with no-referrer sends Origin: null, which the
+	// mutation guard must reject. Keep the real page's same-origin identity.
+	if policy := rec.Header().Get("Referrer-Policy"); policy != "same-origin" {
+		t.Fatalf("consent form loses its browser origin: Referrer-Policy=%q", policy)
+	}
 	if strings.Contains(rec.Body.String(), "ag_") {
 		t.Fatal("credential in browser")
 	}
@@ -106,6 +111,9 @@ func TestHostRoutesExplicitConsentAndMemberManagement(t *testing.T) {
 	}
 	if bad := submit(matches[1], "https://evil.example"); bad.Code != 403 {
 		t.Fatal("cross origin", bad.Code)
+	}
+	if bad := submit(matches[1], "null"); bad.Code != 403 {
+		t.Fatal("opaque origin", bad.Code)
 	}
 	if good := submit(matches[1], "https://toolyard.example"); good.Code != 200 || !strings.Contains(good.Body.String(), "approved") {
 		t.Fatal("submit", good.Code, good.Body.String())
