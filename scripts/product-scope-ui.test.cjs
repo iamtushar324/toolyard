@@ -81,3 +81,31 @@ test('tool activity loads operational metrics without price or cost requests', a
   assert.match(text(tree), /Calls/);
   assert.doesNotMatch(text(tree), /Model prices|Model spend|payload tokens|Request tokens/);
 });
+
+test('host cards expose the owner and audit binding, with revoke limited to owned active hosts', () => {
+  const h = harness();
+  h.run(`state.hostConnections.loaded = true; state.hostConnections.rows = [
+    { host_name: 'Local macOS', owner_name: 'Owner One', owner_email: 'one@example.test', owner_user_id: 'test', agent_id: 'host-own', environment_id: 'env-one', local_user_id: 'local-user', key_fingerprint: 'fingerprint-one', platform: 'darwin', status: 'active', expires_at: '2026-11-05T00:00:00Z' },
+    { host_name: 'Remote host', owner_name: 'Owner Two', owner_email: 'two@example.test', owner_user_id: 'other', agent_id: 'host-other', environment_id: 'env-two', local_user_id: 'user_other', key_fingerprint: 'fingerprint-two', platform: 'linux', status: 'active', expires_at: '2026-11-05T00:00:00Z' }
+  ];`);
+  const tree = h.run('renderHostConnections()');
+  assert.match(text(tree), /Owner One/);
+  assert.match(text(tree), /one@example.test/);
+  assert.match(text(tree), /Toolyard user test Agent host-own BKT3 environment env-one Server profile local-user Server key fingerprint-one/);
+  assert.equal(nodes(tree, 'button').filter(n => text(n) === 'Revoke host access').length, 1);
+  h.run("state.hostConnections.rows[0].status = 'revoked'");
+  assert.equal(nodes(h.run('renderHostConnections()'), 'button').filter(n => text(n) === 'Revoke host access').length, 0);
+});
+
+test('host lists isolate members and discard a response after the authenticated user changes', async () => {
+  const h = harness();
+  h.run("state.user.role = 'member'");
+  await h.run('loadHostConnections()');
+  assert.equal(h.requests.at(-1), '/v1/connections/hosts');
+  h.run("state.user.role = 'admin'");
+  await h.run('loadHostConnections()');
+  assert.equal(h.requests.at(-1), '/v1/connections/hosts?all=true');
+  h.run("api = async () => { state.user = {id: 'new-user', role: 'member'}; return {hosts:[{agent_id:'old-owner-agent'}]}; }");
+  await h.run('loadHostConnections()');
+  assert.equal(h.run("state.hostConnections.rows.some(h => h.agent_id === 'old-owner-agent')"), false);
+});

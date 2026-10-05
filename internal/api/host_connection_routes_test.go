@@ -116,10 +116,22 @@ func TestHostRoutesExplicitConsentAndMemberManagement(t *testing.T) {
 	}
 	var cred struct {
 		federation.Credential
-		Status string `json:"status"`
+		Status           string `json:"status"`
+		RequestExpiresAt string `json:"request_expires_at"`
 	}
 	if e = json.Unmarshal(approved.Body.Bytes(), &cred); e != nil || cred.Token == "" || cred.Status != "approved" {
 		t.Fatal("credential result", e)
+	}
+	requestDeadline, parseErr := time.Parse(time.RFC3339, cred.RequestExpiresAt)
+	if parseErr != nil {
+		t.Fatal("missing request deadline", parseErr)
+	}
+	leaseDeadline, parseErr := time.Parse(time.RFC3339, cred.ExpiresAt)
+	if parseErr != nil || leaseDeadline.Sub(requestDeadline) < 29*24*time.Hour {
+		t.Fatal("request deadline collided with credential lease", cred.RequestExpiresAt, cred.ExpiresAt, parseErr)
+	}
+	if cred.RequestExpiresAt != b["expires_at"] {
+		t.Fatal("request deadline changed after approval")
 	}
 	owner, _ := f.srv.identity.VerifyAgentToken(t.Context(), f.token)
 	f.db.Exec(`UPDATE users SET role='member' WHERE id=?`, owner.Owner)

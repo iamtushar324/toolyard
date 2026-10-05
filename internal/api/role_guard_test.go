@@ -88,6 +88,10 @@ func concretePaths(patterns []string) []string {
 		add("/v1/agents/x/" + action)
 	}
 	add("/v1/me/connections/x/begin")
+	add("/v1/connections/hosts/x/revoke")
+	for _, action := range []string{"begin", "poll", "cancel", "renew", "revoke", "handoff"} {
+		add("/v1/connections/host/" + action)
+	}
 	for _, p := range []string{"/v1/inbox/sessions", "/v1/inbox/grants", "/v1/inbox/info", "/v1/inbox/batch", "/v1/passkeys/register/begin", "/v1/passkeys/register/finish"} {
 		add(p)
 	}
@@ -110,6 +114,9 @@ func memberAllowlist() map[string]bool {
 		"POST /v1/agents/x/rotate", "POST /v1/agents/x/disable", "POST /v1/agents/x/enable",
 		"DELETE /v1/agents/x",
 		"GET /v1/me/servers",
+		"GET /v1/connections/hosts", "POST /v1/connections/hosts/x/revoke",
+		"POST /v1/connections/host/begin", "POST /v1/connections/host/poll", "POST /v1/connections/host/cancel",
+		"POST /v1/connections/host/renew", "POST /v1/connections/host/revoke", "POST /v1/connections/host/handoff",
 		"GET /v1/me/identity-key", "POST /v1/me/identity-key/reveal",
 		// My connections, and the OAuth return routes a member's own
 		// sign-in comes back through (the handlers check whose flow it is).

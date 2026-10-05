@@ -47,7 +47,7 @@ type HostResult struct {
 	Status           string `json:"status"`
 	RequestID        string `json:"request_id"`
 	AuthorizationURL string `json:"authorization_url,omitempty"`
-	ExpiresAt        string `json:"expires_at"`
+	ExpiresAt        string `json:"request_expires_at"`
 	*Credential
 }
 type HostConnection struct {
@@ -402,8 +402,11 @@ func (s *Service) PollHost(ctx context.Context, proof string, cancel bool) (*Hos
 	var u *identity.User
 	if h.Status == "approved" {
 		u, e = s.identity.GetUserByID(ctx, h.OwnerID)
-		if e != nil || u.Status != identity.StatusActive {
+		if (e != nil || u.Status != identity.StatusActive) && !cancel {
 			return nil, ErrRevoked
+		}
+		if u == nil {
+			u = &identity.User{ID: h.OwnerID}
 		}
 	}
 	tx, e := s.db.BeginTx(ctx, nil)
@@ -458,7 +461,6 @@ func (s *Service) PollHost(ctx context.Context, proof string, cancel bool) (*Hos
 			return nil, ErrRevoked
 		}
 		out.Credential = credential
-		out.ExpiresAt = credential.ExpiresAt
 		res, e := tx.ExecContext(ctx, `UPDATE host_connection_requests SET claimed_at=? WHERE request_id=? AND claimed_at IS NULL`, s.now().UnixMilli(), h.RequestID)
 		if e != nil {
 			return nil, e

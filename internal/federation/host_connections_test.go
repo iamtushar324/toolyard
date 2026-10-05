@@ -373,3 +373,35 @@ func TestHostCancelMissingRequestAndDeletedAgentRecovery(t *testing.T) {
 		t.Fatal("disabled matching credential cleanup", e)
 	}
 }
+
+func TestHostCancelApprovedAfterOwnerBlocked(t *testing.T) {
+	s, _, key := federationFixture(t)
+	ctx := t.Context()
+	u, e := s.identity.UpsertClerkUser(ctx, identity.ClerkProfile{ClerkUserID: "blocked-owner", Email: "blocked@example.test"}, "")
+	if e != nil {
+		t.Fatal(e)
+	}
+	request := uuid.NewString()
+	h, e := s.BeginHost(ctx, hostProof(t, s, key, "blocked-mac", u.ClerkUserID, request, "begin"))
+	if e != nil {
+		t.Fatal(e)
+	}
+	if h, e = s.DecideHost(ctx, h.AuthorizationRef, u.ID, true); e != nil {
+		t.Fatal(e)
+	}
+	if e = s.identity.SetStatus(ctx, u.ID, identity.StatusBlocked, "test"); e != nil {
+		t.Fatal(e)
+	}
+	if _, e = s.PollHost(ctx, hostProof(t, s, key, "blocked-mac", u.ClerkUserID, request, "poll"), false); !errors.Is(e, ErrRevoked) {
+		t.Fatal("inactive owner polled credential", e)
+	}
+	out, e := s.PollHost(ctx, hostProof(t, s, key, "blocked-mac", u.ClerkUserID, request, "cancel"), true)
+	if e != nil || out.Status != "cancelled" || out.Credential != nil {
+		t.Fatal("inactive owner cleanup blocked", e)
+	}
+	var status string
+	s.db.QueryRow(`SELECT status FROM host_connections WHERE agent_id=?`, h.AgentID).Scan(&status)
+	if status != "revoked" {
+		t.Fatal("cleanup recreated permission", status)
+	}
+}
