@@ -19,7 +19,7 @@ func (s *Server) federationRoutes(mux *http.ServeMux) {
 			http.NotFound(w, r)
 			return
 		}
-		writeJSON(w, 200, map[string]any{"instance_id": s.federation.InstanceID, "protocol": federation.Protocol, "capabilities": []string{"inbox.batch.v1", "callbacks.standard-webhooks.v1", "federation.ed25519.v1", "dashboard.handoff.v1", "connections.api-key.v1", "callbacks.pull.v1"}})
+		writeJSON(w, 200, map[string]any{"instance_id": s.federation.InstanceID, "protocol": federation.Protocol, "capabilities": []string{"inbox.batch.v1", "callbacks.standard-webhooks.v1", "federation.ed25519.v1", "dashboard.handoff.v1", "connections.api-key.v1", "callbacks.pull.v1", "connections.host-consent.v1"}})
 	})
 	mux.HandleFunc("/v1/federation/register", s.federationRegister)
 	mux.HandleFunc("/v1/federation/", s.federationAction)
@@ -33,6 +33,11 @@ func (s *Server) federationRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/v1/connections/revoke", s.localConnection)
 	mux.HandleFunc("/v1/connections/handoff", s.localConnection)
 	mux.HandleFunc("/connections/handoff", s.localHandoff)
+	mux.HandleFunc("/v1/connections/host/", s.hostConnection)
+	mux.HandleFunc("/connections/authorize", s.hostAuthorization)
+	mux.HandleFunc("/connections/host/handoff", s.hostHandoff)
+	mux.HandleFunc("/v1/connections/hosts", s.hostManagement)
+	mux.HandleFunc("/v1/connections/hosts/", s.hostManagement)
 }
 
 // Private generic destinations require an explicit administrator registration.

@@ -69,6 +69,9 @@ var operatorNeverPaths = map[string]bool{
 	"/v1/auth/clerk/session":       true,
 	"/v1/connect/t3":               true,
 	"/v1/connections/api-key":      true,
+	"/v1/connections/host/":        true,
+	"/v1/connections/hosts":        true,
+	"/v1/connections/hosts/":       true,
 	"/v1/connections/renew":        true,
 	"/v1/connections/revoke":       true,
 	"/v1/connections/handoff":      true,
@@ -402,6 +405,15 @@ type operatorCatalogEntry struct {
 // operatorCatalog lists every /v1 path the server registers (a test keeps it
 // complete). {id} marks a path segment.
 var operatorCatalog = []operatorCatalogEntry{
+	{"/v1/connections/host/", "POST", "server proof or host bearer endpoints; operator tokens are prohibited"},
+	{"/v1/connections/host/begin", "POST", "create a server-key-bound browser consent request"},
+	{"/v1/connections/host/poll", "POST", "recover an owner-authorized host credential with a signed server proof"},
+	{"/v1/connections/host/cancel", "POST", "cancel a pending host consent request with a signed server proof"},
+	{"/v1/connections/host/renew", "POST", "renew a host-owned credential (agent Bearer only)"},
+	{"/v1/connections/host/revoke", "POST", "revoke a host-owned credential (agent Bearer only)"},
+	{"/v1/connections/host/handoff", "POST", "single-use dashboard handoff (agent Bearer only)"},
+	{"/v1/connections/hosts", "GET", "list owned server connections; administrators can inspect all owners"},
+	{"/v1/connections/hosts/", "POST", "revoke an owned server connection"},
 	{"/v1/connections/api-key", "POST", "exchange an existing account API key for a user/environment-bound credential (agent Bearer only)"},
 	{"/v1/connections/renew", "POST", "CAS renewal of the owned local credential (derived Bearer only)"},
 	{"/v1/connections/revoke", "POST", "revoke the owned local connection and its grants/receivers (derived Bearer only)"},

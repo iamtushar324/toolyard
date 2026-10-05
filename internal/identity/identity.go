@@ -827,8 +827,15 @@ func (s *Service) DeleteAgent(ctx context.Context, ownerUserID, agentID string) 
 	if err := s.requirePlainAgent(ctx, ownerUserID, agentID); err != nil {
 		return err
 	}
-	res, err := s.db.ExecContext(ctx,
-		`DELETE FROM agents WHERE id = ? AND owner_user = ?`, agentID, ownerUserID)
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if err = revokeLocalConnectionsTx(ctx, tx, `user_id=? AND (parent_agent_id=? OR agent_id=?)`, []any{ownerUserID, agentID, agentID}, time.Now().UnixMilli()); err != nil {
+		return err
+	}
+	res, err := tx.ExecContext(ctx, `DELETE FROM agents WHERE id=? AND owner_user=?`, agentID, ownerUserID)
 	if err != nil {
 		return err
 	}
@@ -836,7 +843,7 @@ func (s *Service) DeleteAgent(ctx context.Context, ownerUserID, agentID string) 
 	if n == 0 {
 		return ErrAgentTokenInvalid
 	}
-	return nil
+	return tx.Commit()
 }
 
 // requirePlainAgent is the guard in front of the generic agent actions:

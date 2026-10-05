@@ -54,7 +54,7 @@ func (s *Service) ConnectLocal(ctx context.Context, bootstrap string, b LocalBin
 	}
 	defer tx.Rollback()
 	var derived int
-	if err = tx.QueryRowContext(ctx, `SELECT (SELECT count(*) FROM local_connections WHERE agent_id=?)+(SELECT count(*) FROM federation_connections WHERE agent_id=?)`, parent.ID, parent.ID).Scan(&derived); err != nil {
+	if err = tx.QueryRowContext(ctx, `SELECT (SELECT count(*) FROM local_connections WHERE agent_id=?)+(SELECT count(*) FROM federation_connections WHERE agent_id=?)+(SELECT count(*) FROM host_connections WHERE agent_id=?)`, parent.ID, parent.ID, parent.ID).Scan(&derived); err != nil {
 		return nil, err
 	}
 	if derived != 0 {
@@ -159,6 +159,10 @@ func (s *Service) localValid(ctx context.Context, agent string, allowExpired boo
 	return nil
 }
 func (s *Service) LocalEnvironment(ctx context.Context, agent, env string) bool {
+	var hostEnv string
+	if err := s.db.QueryRowContext(ctx, `SELECT environment_id FROM host_connections WHERE agent_id=?`, agent).Scan(&hostEnv); err == nil {
+		return hostEnv == env && s.hostValid(ctx, agent, false) == nil
+	}
 	if s.localValid(ctx, agent, false) != nil {
 		return false
 	}

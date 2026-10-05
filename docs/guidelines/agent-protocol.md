@@ -605,3 +605,33 @@ permission. Read authoritative Inbox status before any approved execution.
 `Open Toolyard` uses a one-minute, single-use dashboard handoff. The local mode
 redirects only to the same Toolyard instance's Inbox. Credentials remain on the
 server and are never embedded in the browser URL.
+
+## Server-owned host connections
+
+BKT3's browser consent flow creates one dedicated Toolyard agent for the
+selected server environment and authenticated server profile. The Toolyard
+browser account is the agent owner. A hosted profile must match that account's
+verified Clerk subject; the fixed `local-user` profile uses explicit account
+owner consent. Server labels and platforms are self-reported, not verified
+hardware identity.
+
+The server signs a short-lived EdDSA proof to `/v1/connections/host/begin`.
+The owner reviews `/connections/authorize` and explicitly accepts or rejects.
+GET does not grant permission. Only the same server key can poll the result;
+the browser never sees a credential. An approved result is recoverable without
+issuing another credential while its connection generation remains active.
+Replayed proof IDs, substituted environments/profiles, changed keys, and expired
+pending requests are rejected. Consent does not approve any restricted call.
+
+Host credentials remain in the destination server secret store. BKT3 clients
+and authenticated native MCP callers use the server proxy. Requests therefore
+carry the dedicated agent and its real account owner rather than a shared key.
+Private hosts use outbound pull callbacks. A BKT3 connection token authorizes
+BKT3 access; it is not Toolyard consent.
+
+Each host has a 30-day renewable connection lease. API status and the dashboard
+show the owner, host, agent, and expiry. Owners can revoke a host in Toolyard.
+Revocation closes unused grants and callback registrations. Account/agent
+restore cannot recreate that access; fresh browser consent is necessary.
+Account ownership and connection lifecycle audit records are transactional.
+Audit records distinguish owner consent from server claims and renewal.

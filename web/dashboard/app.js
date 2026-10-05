@@ -27,6 +27,7 @@ const state = {
   recentApprovals: [],     // /v1/approvals: the latest decided rows, for "Recently decided"
   audit: [],
   agents: [],
+  hostConnections: { rows: [], loaded: false, loading: false, error: '', busy: '' },
   servers: [],
   tools: [],
   marketplace: [],
@@ -56,6 +57,7 @@ const state = {
     overview: null,
     tools: [],
     agents: [],
+    hostConnections: { rows: [], loaded: false, loading: false, error: '', busy: '' },
     autoRules: [],
     loading: false,
   },
@@ -233,6 +235,7 @@ async function refreshUser() {
 }
 
 async function loadAll() {
+  void loadHostConnections();
   if (!state.user) return;
   // Fire-and-forget: the "Your Beknown key" card fills in once it lands.
   loadMyKey();
@@ -1483,10 +1486,74 @@ function renderIdentityKeyCard() {
   );
 }
 
+async function loadHostConnections() {
+  if (!state.user || state.hostConnections.loading) return;
+  const userId = state.user.id;
+  state.hostConnections.loading = true;
+  try {
+    const response = await api('/v1/connections/hosts' + (isAdmin() ? '?all=true' : ''));
+    if (!state.user || state.user.id !== userId) return;
+    state.hostConnections.rows = Array.isArray(response.hosts) ? response.hosts : [];
+    state.hostConnections.loaded = true;
+    state.hostConnections.error = '';
+  } catch (e) {
+    if (!state.user || state.user.id !== userId) return;
+    state.hostConnections.error = e.message;
+  } finally {
+    if (state.user && state.user.id === userId) {
+      state.hostConnections.loading = false;
+      if (state.route === 'agents') render();
+    }
+  }
+}
+async function revokeHostConnection(host) {
+  if (!confirm(`Revoke Toolyard access for ${host.host_name}? Unused permissions and callbacks will stop.`)) return;
+  state.hostConnections.busy = host.agent_id;
+  render();
+  try {
+    await api(`/v1/connections/hosts/${encodeURIComponent(host.agent_id)}/revoke`, { method: 'POST', body: {} });
+    await Promise.all([loadHostConnections(), reloadAgents()]);
+    toast('Host access was revoked.');
+  } catch (e) { toast(e.message, 'error'); }
+  finally { state.hostConnections.busy = ''; render(); }
+}
+function renderHostConnections() {
+  const hosts = state.hostConnections;
+  return el('div', { class: 'card' },
+    el('div', { class: 'row' }, el('h2', {}, 'BKT3 hosts'),
+      el('button', { disabled: hosts.loading, on: { click: () => loadHostConnections() } }, 'Refresh hosts')),
+    el('p', { class: 'meta' }, 'Each host agent belongs to a Toolyard account. Start account consent from Toolyard settings on the selected BKT3 server.'),
+    hosts.error ? el('p', { class: 'err', role: 'alert' }, hosts.error) : null,
+    !hosts.loaded ? el('p', { class: 'meta' }, hosts.loading ? 'Load in progress…' : 'Host information is unavailable.') :
+    hosts.rows.length === 0 ? el('p', { class: 'meta' }, 'No hosts use account consent yet.') :
+      el('div', { class: 'host-connection-list' }, hosts.rows.map(host => el('article', { class: 'host-connection-row' },
+        el('h3', {}, host.host_name),
+        el('p', {}, `Owner: ${host.owner_name || host.owner_email || host.owner_user_id}`),
+        el('p', { class: 'meta' }, host.owner_email || '', ' · ', host.status),
+        el('dl', {},
+          el('dt', {}, 'Toolyard user'), el('dd', {}, el('code', {}, host.owner_user_id)),
+          el('dt', {}, 'Agent'), el('dd', {}, el('code', {}, host.agent_id)),
+          el('dt', {}, 'BKT3 environment'), el('dd', {}, el('code', {}, host.environment_id)),
+          el('dt', {}, 'Server profile'), el('dd', {}, host.local_user_id),
+          el('dt', {}, 'Server key'), el('dd', {}, el('code', {}, host.key_fingerprint)),
+          el('dt', {}, 'Platform'), el('dd', {}, `${host.platform} (reported by the server)`),
+          el('dt', {}, 'Last use'), el('dd', {}, host.last_used_at ? relTime(host.last_used_at) : 'Not used'),
+          el('dt', {}, 'Expiry'), el('dd', {}, new Date(host.expires_at).toLocaleString())),
+        host.owner_user_id === state.user.id && host.status === 'active'
+          ? el('button', { class: 'danger', disabled: !!hosts.busy, on: { click: () => revokeHostConnection(host) } }, 'Revoke host access')
+          : null,
+      ))),
+  );
+}
+function managedHostAgent(agentId) {
+  return state.hostConnections.rows.find(host => host.agent_id === agentId);
+}
+
 function viewAgents() {
   return el('div', {},
     state.agentModal ? renderAgentModal() : null,
     renderIdentityKeyCard(),
+    renderHostConnections(),
     el('div', { class: 'card' },
       el('div', { class: 'agent-add-bar' },
         el('h2', { style: 'margin: 0;' }, 'Agents'),
@@ -1500,19 +1567,23 @@ function viewAgents() {
       state.agents.length === 0
         ? el('div', { class: 'empty' }, 'No agents yet. Click "Add new agent" to enrol your first one.')
         : el('table', {}, el('thead', {}, el('tr', {},
-            el('th', {}, 'Name'), el('th', {}, 'ID'), el('th', {}, 'Last seen'), el('th', {}, 'Status'), el('th', {}, ''))),
+            el('th', {}, 'Name'), el('th', {}, 'Owner'), el('th', {}, 'ID'), el('th', {}, 'Last seen'), el('th', {}, 'Status'), el('th', {}, ''))),
             // kind "identity" is the person's Beknown key: the generic
             // rotate/disable/delete routes refuse it (409 identity_agent),
             // so it gets no buttons, only a pointer to the key card.
             el('tbody', {}, state.agents.map((a) => el('tr', { style: a.disabled ? 'opacity: 0.6;' : '' },
               el('td', {}, a.name,
                 a.kind === 'identity' ? el('span', { class: 'badge identity inline-badge' }, 'Beknown key') : null),
+              el('td', {}, a.owner_display_name || a.owner_email || a.owner,
+                a.owner_email ? el('div', { class: 'meta' }, a.owner_email) : null),
               el('td', {}, el('code', {}, a.id)),
               el('td', { class: 'meta' }, a.last_seen ? relTime(a.last_seen) : 'never'),
               el('td', {}, a.disabled === true
                 ? el('span', { class: 'badge denied' }, 'disabled')
                 : el('span', { class: 'badge allowed' }, 'active')),
-              el('td', {}, a.kind === 'identity'
+              el('td', {}, managedHostAgent(a.id)
+                ? el('span', { class: 'meta' }, 'Managed by BKT3. Use host access controls above.')
+                : a.kind === 'identity'
                 ? el('span', { class: 'meta' }, 'Managed on the Beknown key card above')
                 : el('div', { class: 'row' },
                     el('button', { on: { click: () => rotateAgent(a) } }, 'Rotate'),
@@ -4482,6 +4553,7 @@ function navigate(route) {
   if (route === 'myservers') loadMyServers();
   if (route === 'connections') loadConnections(true);
   if (route === 'agents' || route === 'myservers') loadMyKey();
+  if (route === 'agents') void loadHostConnections();
   render();
 }
 

@@ -314,6 +314,13 @@ func (s *Service) VerifyAgent(ctx context.Context, token string) (*identity.Agen
 	var expiry int64
 	err = s.db.QueryRowContext(ctx, `SELECT c.status,c.expires_at,i.status FROM federation_connections c JOIN federation_issuers i ON i.issuer=c.issuer WHERE c.agent_id=?`, a.ID).Scan(&status, &expiry, &trust)
 	if errors.Is(err, sql.ErrNoRows) {
+		var hostCount int
+		if e := s.db.QueryRowContext(ctx, `SELECT count(*) FROM host_connections WHERE agent_id=?`, a.ID).Scan(&hostCount); e != nil {
+			return nil, e
+		}
+		if hostCount > 0 && s.hostValid(ctx, a.ID, false) != nil {
+			return nil, identity.ErrAgentTokenInvalid
+		}
 		var count int
 		if e := s.db.QueryRowContext(ctx, `SELECT count(*) FROM local_connections WHERE agent_id=?`, a.ID).Scan(&count); e != nil {
 			return nil, e

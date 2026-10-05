@@ -89,6 +89,9 @@ func (s *Service) register(ctx context.Context, agentID, environmentID, clientID
 			return nil, err
 		}
 	}
+	if err := hostConnectionActive(ctx, s.db, agentID, s.now().UnixMilli()); err != nil {
+		return nil, err
+	}
 	// Retries of identical registration return the same opaque reference.
 	var previousID string
 	err := s.db.QueryRowContext(ctx, `SELECT id FROM callback_receivers WHERE agent_id=? AND client_receiver_id=?`, agentID, clientID).Scan(&previousID)
@@ -114,7 +117,7 @@ func (s *Service) register(ctx context.Context, agentID, environmentID, clientID
 	if err != nil {
 		return nil, err
 	}
-	_, err = s.db.ExecContext(ctx, `INSERT INTO callback_receivers(id,agent_id,environment_id,client_receiver_id,destination,secret_enc,private_allowed,created_at,transport) VALUES(?,?,?,?,?,?,?,?,?)`, id, agentID, environmentID, clientID, destination, enc, privateAllowed, s.now().UnixMilli(), transport)
+	result, err := s.db.ExecContext(ctx, `INSERT INTO callback_receivers(id,agent_id,environment_id,client_receiver_id,destination,secret_enc,private_allowed,created_at,transport) SELECT ?,?,?,?,?,?,?,?,? WHERE NOT EXISTS (`+inactiveHostPredicate+`)`, id, agentID, environmentID, clientID, destination, enc, privateAllowed, s.now().UnixMilli(), transport, agentID, s.now().UnixMilli())
 	if err != nil {
 		// A concurrent identical registration may own the unique client binding.
 		var won string
@@ -122,6 +125,9 @@ func (s *Service) register(ctx context.Context, agentID, environmentID, clientID
 			return s.register(ctx, agentID, environmentID, clientID, destination, secret, privateAllowed, transport)
 		}
 		return nil, err
+	}
+	if n, _ := result.RowsAffected(); n != 1 {
+		return nil, ErrReceiver
 	}
 	return s.Get(ctx, agentID, id)
 }
@@ -221,6 +227,9 @@ func (s *Service) RegisterTx(ctx context.Context, tx *sql.Tx, r *inbox.Request, 
 	if ref == "" {
 		return nil
 	}
+	if err := hostConnectionActive(ctx, tx, r.AgentID, s.now().UnixMilli()); err != nil {
+		return err
+	}
 	var revision int
 	err := tx.QueryRowContext(ctx, `SELECT revision FROM callback_receivers WHERE id=? AND agent_id=? AND status='active'`, ref, r.AgentID).Scan(&revision)
 	if err != nil {
@@ -286,7 +295,14 @@ func (s *Service) DecisionTx(ctx context.Context, tx *sql.Tx, r *inbox.Request) 
 	if err != nil {
 		return err
 	}
-	_, err = tx.ExecContext(ctx, `INSERT INTO callback_outbox(id,request_id,decision_revision,receiver_id,receiver_revision,payload,next_attempt_at) VALUES(?,?,?,?,?,?,?)`, id, r.ID, r.Revision, receiver, revision, string(payload), s.now().UnixMilli())
+	deliveryStatus, terminalReason := "pending", ""
+	if e := hostConnectionActive(ctx, tx, r.AgentID, s.now().UnixMilli()); e != nil {
+		if !errors.Is(e, ErrReceiver) {
+			return e
+		}
+		deliveryStatus, terminalReason = "failed", "connection_revoked_or_expired"
+	}
+	_, err = tx.ExecContext(ctx, `INSERT INTO callback_outbox(id,request_id,decision_revision,receiver_id,receiver_revision,payload,next_attempt_at,status,terminal_reason) VALUES(?,?,?,?,?,?,?,?,?)`, id, r.ID, r.Revision, receiver, revision, string(payload), s.now().UnixMilli(), deliveryStatus, terminalReason)
 	return err
 }
 
@@ -439,6 +455,12 @@ func (s *Service) DeliverOne(ctx context.Context) error {
 	if receiver.Revision != rev {
 		return s.finish(ctx, id, attempts+1, 0, "receiver_revision_changed", false)
 	}
+	if err := hostConnectionActive(ctx, s.db, receiver.AgentID, s.now().UnixMilli()); err != nil {
+		if errors.Is(err, ErrReceiver) {
+			return s.finish(ctx, id, attempts+1, 0, "connection_revoked_or_expired", true)
+		}
+		return s.finish(ctx, id, attempts+1, 0, "connection_unavailable", false)
+	}
 	// Revoked agents, users or environments never keep receiving decisions.
 	var active int
 	err = s.db.QueryRowContext(ctx, `SELECT count(*) FROM agents a JOIN users u ON u.id=a.owner_user WHERE a.id=? AND a.disabled=0 AND u.status='active'`, receiver.AgentID).Scan(&active)
@@ -571,4 +593,23 @@ func (s *Service) attemptHistory(ctx context.Context, eventID string) ([]Attempt
 		out = append(out, a)
 	}
 	return out, rows.Err()
+}
+
+// Connection revocation and registration use the same SQLite write boundary.
+// Generic receivers retain their existing authorization path.
+const inactiveHostPredicate = `SELECT 1 FROM host_connections h WHERE h.agent_id=? AND (h.status<>'active' OR h.expires_at<=? OR NOT EXISTS(SELECT 1 FROM agents a JOIN users u ON u.id=h.user_id WHERE a.id=h.agent_id AND a.disabled=0 AND a.owner_user=h.user_id AND a.token_hash=h.credential_hash AND u.status='active'))`
+
+type hostQuery interface {
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}
+
+func hostConnectionActive(ctx context.Context, q hostQuery, agent string, now int64) error {
+	var count int
+	if e := q.QueryRowContext(ctx, `SELECT count(*) FROM (`+inactiveHostPredicate+`)`, agent, now).Scan(&count); e != nil {
+		return e
+	}
+	if count > 0 {
+		return ErrReceiver
+	}
+	return nil
 }

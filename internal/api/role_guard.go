@@ -78,7 +78,8 @@ var memberRoutes = map[string]string{
 	"/v1/agents":        http.MethodGet + " " + http.MethodPost,
 	"/v1/agents/enroll": http.MethodPost,
 	// Which servers and data groups this member may use.
-	"/v1/me/servers": http.MethodGet,
+	"/v1/me/servers":        http.MethodGet,
+	"/v1/connections/hosts": http.MethodGet,
 	// The member's own Beknown key: see its status, reveal it once.
 	// Provisioning, rotating and revoking are admin routes under /v1/users/.
 	"/v1/me/identity-key":        http.MethodGet,
@@ -107,6 +108,13 @@ var reservedAgentSegments = map[string]bool{
 
 // memberAllowed reports whether a member may call method on path.
 func memberAllowed(method, path string) bool {
+	if hostProtocolPath(path) {
+		return method == http.MethodPost
+	}
+	if rest, ok := strings.CutPrefix(path, "/v1/connections/hosts/"); ok {
+		parts := strings.Split(rest, "/")
+		return method == http.MethodPost && len(parts) == 2 && parts[0] != "" && parts[1] == "revoke"
+	}
 	// ServeMux redirects unclean paths before routing; a member gets no
 	// benefit of the doubt on the raw form.
 	if path != pathpkg.Clean(path) {
