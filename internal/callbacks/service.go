@@ -37,6 +37,7 @@ type Receiver struct {
 	EnvironmentID    string `json:"environment_id"`
 	ClientReceiverID string `json:"client_receiver_id"`
 	Destination      string `json:"destination"`
+	Transport        string `json:"transport"`
 	Revision         int    `json:"revision"`
 	Status           string `json:"status"`
 	PrivateAllowed   bool   `json:"-"`
@@ -68,14 +69,25 @@ func secretBytes(secret string) ([]byte, error) {
 }
 
 func (s *Service) Register(ctx context.Context, agentID, environmentID, clientID, destination, secret string, privateAllowed bool) (*Receiver, error) {
+	return s.register(ctx, agentID, environmentID, clientID, destination, secret, privateAllowed, "push")
+}
+func (s *Service) RegisterPull(ctx context.Context, agentID, environmentID, clientID, secret string) (*Receiver, error) {
+	if environmentID == "" {
+		return nil, ErrReceiver
+	}
+	return s.register(ctx, agentID, environmentID, clientID, "", secret, false, "pull")
+}
+func (s *Service) register(ctx context.Context, agentID, environmentID, clientID, destination, secret string, privateAllowed bool, transport string) (*Receiver, error) {
 	if agentID == "" || clientID == "" || len(clientID) > 120 {
 		return nil, ErrReceiver
 	}
 	if _, err := secretBytes(secret); err != nil {
 		return nil, err
 	}
-	if _, err := s.resolve(ctx, destination, privateAllowed); err != nil {
-		return nil, err
+	if transport == "push" {
+		if _, err := s.resolve(ctx, destination, privateAllowed); err != nil {
+			return nil, err
+		}
 	}
 	// Retries of identical registration return the same opaque reference.
 	var previousID string
@@ -89,7 +101,7 @@ func (s *Service) Register(ctx context.Context, agentID, environmentID, clientID
 		if err != nil {
 			return nil, err
 		}
-		if r.Destination != destination || r.EnvironmentID != environmentID || !hmac.Equal(plain, []byte(secret)) || r.Status != "active" {
+		if r.Transport != transport || r.Destination != destination || r.EnvironmentID != environmentID || !hmac.Equal(plain, []byte(secret)) || r.Status != "active" {
 			return nil, ErrConflict
 		}
 		return r, nil
@@ -102,12 +114,12 @@ func (s *Service) Register(ctx context.Context, agentID, environmentID, clientID
 	if err != nil {
 		return nil, err
 	}
-	_, err = s.db.ExecContext(ctx, `INSERT INTO callback_receivers(id,agent_id,environment_id,client_receiver_id,destination,secret_enc,private_allowed,created_at) VALUES(?,?,?,?,?,?,?,?)`, id, agentID, environmentID, clientID, destination, enc, privateAllowed, s.now().UnixMilli())
+	_, err = s.db.ExecContext(ctx, `INSERT INTO callback_receivers(id,agent_id,environment_id,client_receiver_id,destination,secret_enc,private_allowed,created_at,transport) VALUES(?,?,?,?,?,?,?,?,?)`, id, agentID, environmentID, clientID, destination, enc, privateAllowed, s.now().UnixMilli(), transport)
 	if err != nil {
 		// A concurrent identical registration may own the unique client binding.
 		var won string
 		if e := s.db.QueryRowContext(ctx, `SELECT id FROM callback_receivers WHERE agent_id=? AND client_receiver_id=?`, agentID, clientID).Scan(&won); e == nil {
-			return s.Register(ctx, agentID, environmentID, clientID, destination, secret, privateAllowed)
+			return s.register(ctx, agentID, environmentID, clientID, destination, secret, privateAllowed, transport)
 		}
 		return nil, err
 	}
@@ -116,11 +128,11 @@ func (s *Service) Register(ctx context.Context, agentID, environmentID, clientID
 
 func scanReceiver(row interface{ Scan(...any) error }) (*Receiver, error) {
 	r := new(Receiver)
-	err := row.Scan(&r.ID, &r.AgentID, &r.EnvironmentID, &r.ClientReceiverID, &r.Destination, &r.secret, &r.Revision, &r.Status, &r.PrivateAllowed)
+	err := row.Scan(&r.ID, &r.AgentID, &r.EnvironmentID, &r.ClientReceiverID, &r.Destination, &r.secret, &r.Revision, &r.Status, &r.PrivateAllowed, &r.Transport)
 	return r, err
 }
 
-const receiverColumns = `id,agent_id,environment_id,client_receiver_id,destination,secret_enc,revision,status,private_allowed`
+const receiverColumns = `id,agent_id,environment_id,client_receiver_id,destination,secret_enc,revision,status,private_allowed,transport`
 
 func (s *Service) Get(ctx context.Context, agentID, id string) (*Receiver, error) {
 	r, err := scanReceiver(s.db.QueryRowContext(ctx, `SELECT `+receiverColumns+` FROM callback_receivers WHERE id=? AND agent_id=?`, id, agentID))
@@ -405,7 +417,7 @@ func (s *Service) DeliverOne(ctx context.Context) error {
 	now := s.now().UnixMilli()
 	var id, payload, ref string
 	var attempts, rev int
-	err := s.db.QueryRowContext(ctx, `SELECT id,payload,receiver_id,attempts,receiver_revision FROM callback_outbox WHERE (status='pending' AND next_attempt_at<=?) OR (status='delivering' AND claim_until<=?) ORDER BY next_attempt_at LIMIT 1`, now, now).Scan(&id, &payload, &ref, &attempts, &rev)
+	err := s.db.QueryRowContext(ctx, `SELECT id,payload,receiver_id,attempts,receiver_revision FROM callback_outbox WHERE receiver_id IN (SELECT id FROM callback_receivers WHERE transport='push') AND ((status='pending' AND next_attempt_at<=?) OR (status='delivering' AND claim_until<=?)) ORDER BY next_attempt_at LIMIT 1`, now, now).Scan(&id, &payload, &ref, &attempts, &rev)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil
 	}

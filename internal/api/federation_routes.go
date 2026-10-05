@@ -19,7 +19,7 @@ func (s *Server) federationRoutes(mux *http.ServeMux) {
 			http.NotFound(w, r)
 			return
 		}
-		writeJSON(w, 200, map[string]any{"instance_id": s.federation.InstanceID, "protocol": federation.Protocol, "capabilities": []string{"inbox.batch.v1", "callbacks.standard-webhooks.v1", "federation.ed25519.v1", "dashboard.handoff.v1"}})
+		writeJSON(w, 200, map[string]any{"instance_id": s.federation.InstanceID, "protocol": federation.Protocol, "capabilities": []string{"inbox.batch.v1", "callbacks.standard-webhooks.v1", "federation.ed25519.v1", "dashboard.handoff.v1", "connections.api-key.v1", "callbacks.pull.v1"}})
 	})
 	mux.HandleFunc("/v1/federation/register", s.federationRegister)
 	mux.HandleFunc("/v1/federation/", s.federationAction)
@@ -28,6 +28,11 @@ func (s *Server) federationRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/v1/callbacks/retry/", s.callbackRetry)
 	mux.HandleFunc("/v1/admin/callback-receivers", s.adminCallbackReceiver)
 	mux.HandleFunc("/federation/handoff", s.federationHandoff)
+	mux.HandleFunc("/v1/connections/api-key", s.localConnection)
+	mux.HandleFunc("/v1/connections/renew", s.localConnection)
+	mux.HandleFunc("/v1/connections/revoke", s.localConnection)
+	mux.HandleFunc("/v1/connections/handoff", s.localConnection)
+	mux.HandleFunc("/connections/handoff", s.localHandoff)
 }
 
 // Private generic destinations require an explicit administrator registration.
@@ -251,6 +256,35 @@ func (s *Server) callbackReceiver(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Cache-Control", "no-store")
 	ref := strings.TrimPrefix(r.URL.Path, "/v1/callbacks/receivers")
 	ref = strings.TrimPrefix(ref, "/")
+	parts := strings.Split(ref, "/")
+	if len(parts) == 2 && (parts[1] == "events" || parts[1] == "ack") {
+		if parts[1] == "events" && r.Method == http.MethodGet {
+			events, err := s.callbacks.Pull(r.Context(), a.ID, parts[0])
+			if err != nil {
+				federationError(w, err)
+				return
+			}
+			writeJSON(w, 200, map[string]any{"events": events})
+			return
+		}
+		if parts[1] == "ack" && r.Method == http.MethodPost {
+			var b struct {
+				EventID string `json:"event_id"`
+			}
+			if decode(r, &b) != nil {
+				writeError(w, 400, "invalid_ack")
+				return
+			}
+			if err := s.callbacks.Ack(r.Context(), a.ID, parts[0], b.EventID); err != nil {
+				federationError(w, err)
+				return
+			}
+			writeJSON(w, 200, map[string]bool{"ok": true})
+			return
+		}
+		writeError(w, 405, "method_not_allowed")
+		return
+	}
 	switch r.Method {
 	case http.MethodPost:
 		if ref != "" {
@@ -258,6 +292,7 @@ func (s *Server) callbackReceiver(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		var b struct {
+			Transport        string `json:"transport"`
 			Destination      string `json:"destination"`
 			Secret           string `json:"secret"`
 			ClientReceiverID string `json:"client_receiver_id"`
@@ -265,6 +300,23 @@ func (s *Server) callbackReceiver(w http.ResponseWriter, r *http.Request) {
 		}
 		if err := decode(r, &b); err != nil {
 			writeError(w, 400, "invalid_receiver")
+			return
+		}
+		if b.Transport == "pull" {
+			if b.Destination != "" || !s.federation.LocalEnvironment(r.Context(), a.ID, b.EnvironmentID) {
+				writeError(w, 403, "environment_destination_mismatch")
+				return
+			}
+			receiver, err := s.callbacks.RegisterPull(r.Context(), a.ID, b.EnvironmentID, b.ClientReceiverID, b.Secret)
+			if err != nil {
+				federationError(w, err)
+				return
+			}
+			writeJSON(w, 200, receiver)
+			return
+		}
+		if b.Transport != "" && b.Transport != "push" {
+			writeError(w, 400, "invalid_transport")
 			return
 		}
 		private := s.federation.PrivateReceiverAllowed(r.Context(), a.ID, b.EnvironmentID, b.Destination)

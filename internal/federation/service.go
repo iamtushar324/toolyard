@@ -185,12 +185,14 @@ func (s *Service) verify(ctx context.Context, assertion string, cleanup bool) (*
 }
 
 type Credential struct {
-	Token     string `json:"token"`
-	Email     string `json:"email"`
-	AgentID   string `json:"agent_id"`
-	UserID    string `json:"user_id"`
-	ExpiresAt string `json:"expires_at"`
-	Version   int    `json:"credential_version"`
+	Token      string `json:"token"`
+	InstanceID string `json:"instance_id,omitempty"`
+	Generation int    `json:"connection_generation,omitempty"`
+	Email      string `json:"email"`
+	AgentID    string `json:"agent_id"`
+	UserID     string `json:"user_id"`
+	ExpiresAt  string `json:"expires_at"`
+	Version    int    `json:"credential_version"`
 }
 
 func (s *Service) Connect(ctx context.Context, p *Principal, expectedVersion int) (*Credential, error) {
@@ -300,12 +302,27 @@ func (s *Service) Connect(ctx context.Context, p *Principal, expectedVersion int
 func (s *Service) VerifyAgent(ctx context.Context, token string) (*identity.Agent, error) {
 	a, err := s.identity.VerifyAgentToken(ctx, token)
 	if err != nil {
+		// Persist already invalid local ownership/key state even when the
+		// identity gate rejects a disabled account first. No valid connection
+		// can be changed by an unauthenticated token with a guessed id.
+		if id, _, ok := strings.Cut(token, "."); ok && len(id) <= 128 {
+			_ = s.invalidateLocal(ctx, id)
+		}
 		return nil, err
 	}
 	var status, trust string
 	var expiry int64
 	err = s.db.QueryRowContext(ctx, `SELECT c.status,c.expires_at,i.status FROM federation_connections c JOIN federation_issuers i ON i.issuer=c.issuer WHERE c.agent_id=?`, a.ID).Scan(&status, &expiry, &trust)
 	if errors.Is(err, sql.ErrNoRows) {
+		var count int
+		if e := s.db.QueryRowContext(ctx, `SELECT count(*) FROM local_connections WHERE agent_id=?`, a.ID).Scan(&count); e != nil {
+			return nil, e
+		}
+		if count > 0 {
+			if e := s.localValid(ctx, a.ID, false); e != nil {
+				return nil, identity.ErrAgentTokenInvalid
+			}
+		}
 		return a, nil
 	}
 	if err != nil || status != "active" || trust != "active" || expiry <= s.now().UnixMilli() {

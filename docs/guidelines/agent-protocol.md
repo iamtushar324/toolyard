@@ -582,3 +582,26 @@ inbox.post({
   "urgency": "fyi"
 })
 ```
+
+
+## Local server connections
+
+A server without a verified team identity can use the explicit API key mode in
+its Toolyard settings. The human enters an existing Toolyard agent API key and
+instance URL through authenticated settings. The server exchanges that key for
+an independent environment/user credential and removes the bootstrap key from
+client state. This mode does not provision users or prove a Clerk identity.
+Never ask for the key in a prompt, place it in an Inbox item, or use one user's
+connection for another user. Parent key rotation/revocation and disabled
+accounts invalidate derived access. Explicit connection removal is persistent.
+
+Local session callbacks use registered `transport: "pull"` receivers. The server
+retrieves the signed persistent outbox through authenticated bounded requests,
+verifies and persists each event, then acknowledges its event ID. Unacknowledged
+events survive restart and may repeat. No public laptop address or agent
+`inbox.wait` is necessary. The callback still announces a decision rather than
+permission. Read authoritative Inbox status before any approved execution.
+
+`Open Toolyard` uses a one-minute, single-use dashboard handoff. The local mode
+redirects only to the same Toolyard instance's Inbox. Credentials remain on the
+server and are never embedded in the browser URL.

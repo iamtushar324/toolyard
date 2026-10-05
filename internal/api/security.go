@@ -425,7 +425,7 @@ func perRouteBodyCap(path string) int64 {
 // origin in the picture, or (b) a third-party token-tap path.
 func exemptFromCSRFHeader(path string) bool {
 	// These endpoints authenticate signed assertions or agent bearers only.
-	if strings.HasPrefix(path, "/v1/federation/") || strings.HasPrefix(path, "/v1/callbacks/") {
+	if strings.HasPrefix(path, "/v1/federation/") || strings.HasPrefix(path, "/v1/callbacks/") || localConnectionPath(path) {
 		return true
 	}
 	// Webhook event ingest is bearer-authenticated (source token); no cookie
@@ -496,7 +496,7 @@ type unauthRouteRule struct {
 // a stronger guard (one-shot: 404 after the first success) and the
 // rate limit there mostly hurts test harnesses that re-bootstrap.
 func unauthRouteLimit(path string) *unauthRouteRule {
-	if strings.HasPrefix(path, "/v1/federation/") || strings.HasPrefix(path, "/v1/callbacks/") {
+	if strings.HasPrefix(path, "/v1/federation/") || strings.HasPrefix(path, "/v1/callbacks/") || localConnectionPath(path) {
 		return &unauthRouteRule{"federation", 600, time.Minute}
 	}
 	switch {

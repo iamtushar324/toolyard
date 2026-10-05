@@ -68,6 +68,10 @@ var operatorNeverPaths = map[string]bool{
 	"/v1/auth/logout":              true,
 	"/v1/auth/clerk/session":       true,
 	"/v1/connect/t3":               true,
+	"/v1/connections/api-key":      true,
+	"/v1/connections/renew":        true,
+	"/v1/connections/revoke":       true,
+	"/v1/connections/handoff":      true,
 	"/v1/federation/register":      true,
 	"/v1/federation/":              true,
 	"/v1/callbacks/receivers":      true,
@@ -398,6 +402,12 @@ type operatorCatalogEntry struct {
 // operatorCatalog lists every /v1 path the server registers (a test keeps it
 // complete). {id} marks a path segment.
 var operatorCatalog = []operatorCatalogEntry{
+	{"/v1/connections/api-key", "POST", "exchange an existing account API key for a user/environment-bound credential (agent Bearer only)"},
+	{"/v1/connections/renew", "POST", "CAS renewal of the owned local credential (derived Bearer only)"},
+	{"/v1/connections/revoke", "POST", "revoke the owned local connection and its grants/receivers (derived Bearer only)"},
+	{"/v1/connections/handoff", "POST", "issue a single-use dashboard handoff (derived Bearer only)"},
+	{"/v1/callbacks/receivers/{id}/events", "GET", "retrieve signed pending pull events without consuming them (derived Bearer only)"},
+	{"/v1/callbacks/receivers/{id}/ack", "POST", "acknowledge durable receipt of an owned pull event (derived Bearer only)"},
 	{"/v1/federation/register", "POST", "administrator server trust registration (fresh verified Clerk session only)"},
 	{"/v1/federation/{id}", "POST", "connect, handoff, or revoke (registered server assertions only)"},
 	{"/v1/callbacks/receivers", "POST", "register an immutable generic callback receiver (agent Bearer only)"},
