@@ -395,3 +395,31 @@ func TestLocalConnectionIdentityRevocationWhileOffline(t *testing.T) {
 		})
 	}
 }
+
+func TestLocalConnectionLostRenewResponseBeyondRenewedExpiry(t *testing.T) {
+	s, u, _ := federationFixture(t)
+	ctx := t.Context()
+	key, _, err := s.identity.CreateAgentWithToken(ctx, u.ID, "Long offline Mac")
+	if err != nil {
+		t.Fatal(err)
+	}
+	c, err := s.ConnectLocal(ctx, key, LocalBinding{EnvironmentID: "offline-mac", LocalUserID: "local-user", InstanceID: s.InstanceID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	clock := time.Now().Add(31 * 24 * time.Hour)
+	s.now = func() time.Time { return clock }
+	committed, err := s.RenewLocal(ctx, c.Token, c.Version)
+	if err != nil {
+		t.Fatal(err)
+	}
+	clock = clock.Add(31 * 24 * time.Hour)
+	restarted := &Service{db: s.db, identity: s.identity, cipher: s.cipher, InstanceID: s.InstanceID, now: s.now}
+	recovered, err := restarted.RenewLocal(ctx, c.Token, c.Version)
+	if err != nil || recovered.Token != c.Token || recovered.AgentID != c.AgentID || recovered.Generation != c.Generation || recovered.Version != committed.Version+1 {
+		t.Fatal("long offline recovery", err)
+	}
+	if _, err = restarted.VerifyAgent(ctx, recovered.Token); err != nil {
+		t.Fatal("recovered credential", err)
+	}
+}

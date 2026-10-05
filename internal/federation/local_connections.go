@@ -203,10 +203,7 @@ func (s *Service) RenewLocal(ctx context.Context, token string, expected int) (*
 		return nil, err
 	}
 	current := string(raw)
-	if expires > s.now().Add(24*time.Hour).UnixMilli() || expected < version {
-		if expires <= s.now().UnixMilli() {
-			return nil, ErrConflict
-		}
+	if expires > s.now().Add(24*time.Hour).UnixMilli() || (expected < version && expires > s.now().UnixMilli()) {
 		return &Credential{Token: current, AgentID: a.ID, UserID: a.Owner, Email: a.OwnerEmail, Version: version, ExpiresAt: time.UnixMilli(expires).UTC().Format(time.RFC3339), InstanceID: s.InstanceID, Generation: generation}, nil
 	}
 	// Renewal advances expiry/version without changing the bearer. A lost
