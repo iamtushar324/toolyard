@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"github.com/google/uuid"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -71,7 +73,7 @@ func newEnv(t *testing.T) *testEnv {
 func (e *testEnv) advance(d time.Duration) { e.mu.Lock(); e.now = e.now.Add(d); e.mu.Unlock() }
 
 func deploySubmission() *Submission {
-	return &Submission{
+	sub := &Submission{
 		Kind:    KindAccess,
 		Title:   "Ship billing v2 to production",
 		Summary: "I need 2 tools to migrate and deploy.",
@@ -86,6 +88,18 @@ func deploySubmission() *Submission {
 			{Tool: "flags.set", Required: false, Summary: "Start the rollout.", Params: map[string]any{"flag": "billing_v2", "env": "prod", "enabled": true}},
 		},
 	}
+	sub.Task = &TaskContext{Objective: "Ship the billing handler with its rollout flag disabled."}
+	for i := range sub.Tools {
+		t := &sub.Tools[i]
+		t.CallID = fmt.Sprintf("call_%d", i+1)
+		t.Target = "Production billing API"
+		t.Operation = "write"
+		t.ExpectedEffects = t.Summary
+		t.AffectedScope = "Billing API deployment and configuration"
+		t.MaterialRisks = "An incorrect change can interrupt invoice creation."
+		t.Undo = "Redeploy the previous API release and restore its configuration."
+	}
+	return sub
 }
 
 // ---- params ----
@@ -451,24 +465,24 @@ func TestApproveIssuesOneGrantPerAllowedTool(t *testing.T) {
 	ctx := context.Background()
 	r := submitDeploy(t, e, "ag_1")
 
-	if _, err := e.svc.Decide(ctx, r.ID, Decision{Action: "approve", Allow: []bool{false, true, true}}); !errors.Is(err, ErrRequiredRefused) {
-		t.Fatalf("refusing a required tool must fail, got %v", err)
+	if _, err := e.svc.Decide(ctx, r.ID, Decision{Action: "approve", Allow: []bool{false, true, true}}); !errors.Is(err, ErrConflict) {
+		t.Fatalf("decision without revision and stable verdict IDs must fail, got %v", err)
 	}
-	if _, err := e.svc.Decide(ctx, r.ID, Decision{Action: "approve", Allow: []bool{true, true}}); err == nil {
+	if _, err := e.decide(ctx, r.ID, Decision{Action: "approve", Allow: []bool{true, true}}); err == nil {
 		t.Fatal("allow with the wrong length must fail")
 	}
-	got, err := e.svc.Decide(ctx, r.ID, Decision{Action: "approve", Allow: []bool{true, true, false}, Note: "leave the flag", By: "owner"})
+	got, err := e.decide(ctx, r.ID, Decision{Action: "approve", Allow: []bool{true, true, false}, Note: "leave the flag", By: "owner"})
 	if err != nil {
 		t.Fatal(err)
 	}
 	if got.Status != StatusApproved || got.Tools[2].Decision != ToolRefused || got.Tools[0].GrantID == "" || got.Tools[2].GrantID != "" {
 		t.Fatalf("bad decision state: %+v", got.Tools)
 	}
-	if _, err := e.svc.Decide(ctx, r.ID, Decision{Action: "deny"}); !errors.Is(err, ErrNotPending) {
+	if _, err := e.decide(ctx, r.ID, Decision{Action: "deny"}); !errors.Is(err, ErrNotPending) {
 		t.Fatalf("second decision must fail, got %v", err)
 	}
 
-	// Tokens are delivered exactly once.
+	// Tokens remain recoverable until redemption or expiry.
 	views, err := e.svc.Status(ctx, "ag_1", []string{r.ID})
 	if err != nil {
 		t.Fatal(err)
@@ -478,8 +492,8 @@ func TestApproveIssuesOneGrantPerAllowedTool(t *testing.T) {
 		t.Fatalf("first status should carry two tokens: %+v", v)
 	}
 	again, _ := e.svc.Status(ctx, "ag_1", []string{r.ID})
-	if again[0].Tools[0].Grant != "" || again[0].Tools[0].GrantNote == "" {
-		t.Fatalf("second status must not repeat tokens: %+v", again[0].Tools[0])
+	if again[0].Tools[0].Grant != v.Tools[0].Grant {
+		t.Fatalf("second status must recover the same unused token: %+v", again[0].Tools[0])
 	}
 	// Another agent can't see it.
 	other, _ := e.svc.Status(ctx, "ag_2", []string{r.ID})
@@ -539,7 +553,7 @@ func TestConcurrentRedeemOnlyOnce(t *testing.T) {
 	e := newEnv(t)
 	ctx := context.Background()
 	r := submitDeploy(t, e, "ag_1")
-	if _, err := e.svc.Decide(ctx, r.ID, Decision{Action: "approve", Allow: []bool{true, true, false}}); err != nil {
+	if _, err := e.decide(ctx, r.ID, Decision{Action: "approve", Allow: []bool{true, true, false}}); err != nil {
 		t.Fatal(err)
 	}
 	v, _ := e.svc.Status(ctx, "ag_1", []string{r.ID})
@@ -568,7 +582,7 @@ func TestRevokeAndKillSwitch(t *testing.T) {
 	e := newEnv(t)
 	ctx := context.Background()
 	r := submitDeploy(t, e, "ag_1")
-	got, _ := e.svc.Decide(ctx, r.ID, Decision{Action: "approve", Allow: []bool{true, true, true}})
+	got, _ := e.decide(ctx, r.ID, Decision{Action: "approve", Allow: []bool{true, true, true}})
 	v, _ := e.svc.Status(ctx, "ag_1", []string{r.ID})
 	if err := e.svc.RevokeGrant(ctx, got.Tools[0].GrantID, "owner"); err != nil {
 		t.Fatal(err)
@@ -590,21 +604,21 @@ func TestReturnDenyAnswerSnoozeRead(t *testing.T) {
 	e := newEnv(t)
 	ctx := context.Background()
 	r := submitDeploy(t, e, "ag_1")
-	got, err := e.svc.Decide(ctx, r.ID, Decision{Action: "return", Note: "no flag"})
+	got, err := e.decide(ctx, r.ID, Decision{Action: "return", Note: "no flag"})
 	if err != nil || got.Status != StatusReturned || got.OwnerNote != "no flag" {
 		t.Fatalf("return: %v %+v", err, got)
 	}
 
 	q, _ := e.svc.Submit(ctx, "ag_1", &Submission{Kind: KindQuestion, Title: "Retire it?", Summary: "s", Message: "m",
 		Audio: Audio{Script: "Should I?"}, Urgency: UrgencySoon, Options: []Option{{Label: "Now"}, {Label: "Later"}}})
-	if _, err := e.svc.Decide(ctx, q.RequestID, Decision{Action: "approve"}); !errors.Is(err, ErrBadDecision) {
+	if _, err := e.decide(ctx, q.RequestID, Decision{Action: "approve"}); !errors.Is(err, ErrBadDecision) {
 		t.Fatalf("approve on a question must fail, got %v", err)
 	}
-	if _, err := e.svc.Decide(ctx, q.RequestID, Decision{Action: "snooze", SnoozeMinutes: 60}); err != nil {
+	if _, err := e.decide(ctx, q.RequestID, Decision{Action: "snooze", SnoozeMinutes: 60}); err != nil {
 		t.Fatal(err)
 	}
 	one := 1
-	got, err = e.svc.Decide(ctx, q.RequestID, Decision{Action: "answer", Option: &one})
+	got, err = e.decide(ctx, q.RequestID, Decision{Action: "answer", Option: &one})
 	if err != nil || got.Answer != "Later" || got.Status != StatusAnswered {
 		t.Fatalf("answer: %v %+v", err, got)
 	}
@@ -614,7 +628,7 @@ func TestReturnDenyAnswerSnoozeRead(t *testing.T) {
 	if !u.OK {
 		t.Fatalf("update: %+v", u)
 	}
-	if got, err := e.svc.Decide(ctx, u.RequestID, Decision{Action: "read"}); err != nil || got.Status != StatusRead {
+	if got, err := e.decide(ctx, u.RequestID, Decision{Action: "read"}); err != nil || got.Status != StatusRead {
 		t.Fatalf("read: %v", err)
 	}
 	// An update can't point at another agent's request.
@@ -635,7 +649,7 @@ func TestWaitWakesOnDecision(t *testing.T) {
 		done <- v
 	}()
 	time.Sleep(50 * time.Millisecond)
-	if _, err := e.svc.Decide(ctx, r.ID, Decision{Action: "deny", Note: "not today"}); err != nil {
+	if _, err := e.decide(ctx, r.ID, Decision{Action: "deny", Note: "not today"}); err != nil {
 		t.Fatal(err)
 	}
 	select {
@@ -679,7 +693,7 @@ func TestCheck(t *testing.T) {
 	e := newEnv(t)
 	ctx := context.Background()
 	r := submitDeploy(t, e, "ag_1")
-	if _, err := e.svc.Decide(ctx, r.ID, Decision{Action: "approve", Allow: []bool{true, true, false}}); err != nil {
+	if _, err := e.decide(ctx, r.ID, Decision{Action: "approve", Allow: []bool{true, true, false}}); err != nil {
 		t.Fatal(err)
 	}
 	res, err := e.svc.Check(ctx, "ag_1", []CheckCall{
@@ -926,4 +940,29 @@ func TestUpdatesLastLongerThanRequests(t *testing.T) {
 	if time.Duration(r.ExpiresAt-r.CreatedAt)*time.Millisecond != UpdateTTL {
 		t.Fatalf("update expiry %v, want %v", time.Duration(r.ExpiresAt-r.CreatedAt)*time.Millisecond, UpdateTTL)
 	}
+}
+
+// Old behavior tests use explicit IDs while the dedicated batch tests exercise
+// invalid/missing contracts directly against Service.Decide.
+func (e *testEnv) decide(ctx context.Context, id string, d Decision) (*Request, error) {
+	if d.Action == "approve" && d.Verdicts == nil {
+		r, err := e.svc.Get(ctx, id)
+		if err != nil {
+			return nil, err
+		}
+		d.RequestRevision = r.Revision
+		d.SubmissionID = uuid.NewString()
+		d.Verdicts = map[string]CallVerdict{}
+		for i, v := range d.Allow {
+			if i >= len(r.Tools) {
+				break
+			}
+			verdict := VerdictRejected
+			if v {
+				verdict = VerdictAccepted
+			}
+			d.Verdicts[r.Tools[i].CallID] = CallVerdict{Verdict: verdict}
+		}
+	}
+	return e.svc.Decide(ctx, id, d)
 }

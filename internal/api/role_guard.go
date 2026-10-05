@@ -63,13 +63,23 @@ var memberRoutes = map[string]string{
 	"/v1/auth/clerk/session": http.MethodPost,
 	// Authenticated by the Clerk token in its body; a cookie riding along
 	// must not change the answer.
-	"/v1/connect/t3": http.MethodPost,
+	"/v1/connect/t3":               http.MethodPost,
+	"/v1/inbox":                    http.MethodGet,
+	"/v1/inbox/sessions":           http.MethodGet,
+	"/v1/inbox/grants":             http.MethodGet,
+	"/v1/inbox/info":               http.MethodGet,
+	"/v1/inbox/batch":              http.MethodPost,
+	"/v1/inbox/grants/revoke-all":  http.MethodPost,
+	"/v1/passkeys":                 http.MethodGet,
+	"/v1/passkeys/register/begin":  http.MethodPost,
+	"/v1/passkeys/register/finish": http.MethodPost,
 	// Own agents: list, create, enrolment code. Per-agent actions are the
 	// pattern below; identity scopes them to the caller's own agents.
 	"/v1/agents":        http.MethodGet + " " + http.MethodPost,
 	"/v1/agents/enroll": http.MethodPost,
 	// Which servers and data groups this member may use.
-	"/v1/me/servers": http.MethodGet,
+	"/v1/me/servers":        http.MethodGet,
+	"/v1/connections/hosts": http.MethodGet,
 	// The member's own Beknown key: see its status, reveal it once.
 	// Provisioning, rotating and revoking are admin routes under /v1/users/.
 	"/v1/me/identity-key":        http.MethodGet,
@@ -98,6 +108,13 @@ var reservedAgentSegments = map[string]bool{
 
 // memberAllowed reports whether a member may call method on path.
 func memberAllowed(method, path string) bool {
+	if hostProtocolPath(path) {
+		return method == http.MethodPost
+	}
+	if rest, ok := strings.CutPrefix(path, "/v1/connections/hosts/"); ok {
+		parts := strings.Split(rest, "/")
+		return method == http.MethodPost && len(parts) == 2 && parts[0] != "" && parts[1] == "revoke"
+	}
 	// ServeMux redirects unclean paths before routing; a member gets no
 	// benefit of the doubt on the raw form.
 	if path != pathpkg.Clean(path) {
@@ -113,6 +130,35 @@ func memberAllowed(method, path string) bool {
 			}
 		}
 		return false
+	}
+	// All Inbox item handlers check the caller's owned agents before acting.
+	if rest, ok := strings.CutPrefix(path, "/v1/inbox/"); ok {
+		parts := strings.Split(rest, "/")
+		if len(parts) == 1 {
+			return method == http.MethodGet && parts[0] != "voice-key" && parts[0] != "decide-by-token"
+		}
+		if len(parts) == 2 {
+			if parts[0] == "blobs" {
+				return method == http.MethodGet || method == http.MethodHead
+			}
+			if method == http.MethodPost {
+				switch parts[1] {
+				case "decide", "passkey", "summarize", "explain":
+					return true
+				}
+			}
+		}
+		if len(parts) == 3 && parts[0] == "grants" && parts[2] == "revoke" {
+			return method == http.MethodPost
+		}
+		if len(parts) == 4 && parts[1] == "callbacks" && parts[3] == "retry" {
+			return method == http.MethodPost
+		}
+		return false
+	}
+	if rest, ok := strings.CutPrefix(path, "/v1/passkeys/"); ok {
+		parts := strings.Split(rest, "/")
+		return method == http.MethodPost && ((len(parts) == 2 && parts[1] == "remove") || (len(parts) == 3 && parts[1] == "remove" && parts[2] == "begin"))
 	}
 	// Bearer-token approval polling for the CLI.
 	if strings.HasPrefix(path, "/v1/agents/approvals/") {

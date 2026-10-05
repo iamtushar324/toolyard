@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"net/url"
 	"strconv"
 	"strings"
 	"sync"
@@ -47,10 +48,10 @@ type SettingsStore interface {
 
 // Service implements chatnotify.Channel over the Telegram Bot API.
 type Service struct {
-	settings SettingsStore
-	cipher   *sealbox.Cipher
-	decide   func(ctx context.Context, id, action, decidedBy string) (status string, notPending bool, err error)
-	log      interface {
+	settings  SettingsStore
+	cipher    *sealbox.Cipher
+	publicURL string
+	log       interface {
 		Warn(msg string, args ...any)
 		Info(msg string, args ...any)
 	}
@@ -67,9 +68,10 @@ type Service struct {
 type Options struct {
 	Settings SettingsStore
 	Cipher   *sealbox.Cipher
-	// Decide resolves an approval. Returns (finalStatus, notPending, err);
-	// notPending=true distinguishes the already-decided race so the poller can
-	// toast "already decided" instead of erroring.
+	// PublicURL is the configured Toolyard origin for Inbox review links.
+	PublicURL string
+	// Decide is retained for source compatibility. Telegram never invokes
+	// it; human permission decisions must be submitted in Inbox.
 	Decide func(ctx context.Context, id, action, decidedBy string) (status string, notPending bool, err error)
 	// HTTPClient / BaseURL are test seams; nil/empty use production defaults.
 	HTTPClient *http.Client
@@ -81,7 +83,7 @@ func New(opts Options) *Service {
 	return &Service{
 		settings:   opts.Settings,
 		cipher:     opts.Cipher,
-		decide:     opts.Decide,
+		publicURL:  opts.PublicURL,
 		log:        logx.For("telegram"),
 		httpClient: opts.HTTPClient,
 		baseURL:    opts.BaseURL,
@@ -231,7 +233,7 @@ func (s *Service) SendApproval(ctx context.Context, approvalID, text string) (ch
 	if err != nil {
 		return chatnotify.MessageRef{}, err
 	}
-	m, err := c.SendMessage(ctx, chatID, text, approvalButtons(approvalID))
+	m, err := c.SendMessage(ctx, chatID, text+"\n\nReview and submit the decision in Toolyard Inbox.", inboxButtons(s.publicURL, approvalID))
 	if err != nil {
 		return chatnotify.MessageRef{}, err
 	}
@@ -258,14 +260,15 @@ func (s *Service) UpdateApproval(ctx context.Context, ref chatnotify.MessageRef,
 	return c.EditMessageText(ctx, chatID, msgID, text, nil)
 }
 
-// approvalButtons builds the Approve/Deny inline keyboard. callback_data is
-// capped at 64 bytes, so we use a compact "d|<action>|<id>" rather than the
-// 137-char signed DecisionToken.
-func approvalButtons(approvalID string) []InlineButton {
-	return []InlineButton{
-		{Text: "✅ Approve", CallbackData: "d|allowed|" + approvalID},
-		{Text: "⛔ Deny", CallbackData: "d|denied|" + approvalID},
+// Notifications hand off to the only permission interface. Without a
+// configured public origin the text still directs the user to Inbox.
+func inboxButtons(publicURL, approvalID string) []InlineButton {
+	u, err := url.Parse(publicURL)
+	if err != nil || u.Host == "" || u.User != nil || (u.Scheme != "https" && u.Scheme != "http") {
+		return nil
 	}
+	u.Path, u.RawPath, u.RawQuery, u.Fragment = "/", "", "", ""
+	return []InlineButton{{Text: "Open Inbox", URL: u.String() + "#inbox/" + url.PathEscape(approvalID)}}
 }
 
 func randCode(nBytes int) (string, error) {

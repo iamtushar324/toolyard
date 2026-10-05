@@ -23,8 +23,9 @@ How agents are taught this, and why it's layered, is in
    script, and the evidence. Your owner reads it on a phone and often listens
    first.
 4. Run `inbox.request` with `dry_run: true` first. Fix every problem it lists.
-5. Keep working on anything that doesn't depend on the answer. Use
-   `inbox.wait` when you run out.
+5. Obtain an authorized callback reference before the request when your client supports it.
+   Pass `callback_ref`, continue independent work, and retrieve authoritative `inbox.status` after the callback.
+   `inbox.wait` remains optional.
 6. For each allowed tool you get a **grant**. Call the tool with
    `_grant: "tyg_…"`, exactly within its parameters.
 7. When you're done, `inbox.post` an update, also in the first person.
@@ -45,7 +46,14 @@ You can't tell from the name. Ask:
 ```json
 inbox.check({ "calls": [
   { "tool": "github.merge_pull_request", "args": { "repo": "acme/api", "pull_number": 218 } },
-  { "tool": "deploy.run", "args": { "service": "api", "env": "prod" } }
+  { "call_id": "deploy_api",
+  "tool": "deploy.run",
+  "target": "Production API service",
+  "operation": "write",
+  "expected_effects": "The API uses the new billing handler with its flag disabled.",
+  "affected_scope": "Only the production API deployment",
+  "material_risks": "A wrong release can interrupt invoice requests.",
+  "undo": "Redeploy the current known good release 9f1e2d0.", "args": { "service": "api", "env": "prod" } }
 ]})
 ```
 
@@ -91,6 +99,10 @@ and send it.
 
 ```json
 inbox.request({
+  "task": {"objective": "Deliver the billing handler with the rollout flag disabled."},
+  "client_request_id": "billing-v2-permission-1",
+  "callback_ref": "opaque-authorized-receiver-reference",
+  "pending_ttl_seconds": 86400,
   "title": "Ship billing v2 to production",
   "summary": "I need 5 tools to merge PR #218, add one table, deploy, and let the team know.",
   "message": "PR #218 is approved and all 42 checks are green, so I'd like to ship the billing v2 webhook handler. It goes out behind the billing_v2 flag, which stays off…",
@@ -110,6 +122,10 @@ inbox.request({
 
 | field | required | rules |
 |---|---|---|
+| `task.objective` | yes | The concrete objective this batch advances. |
+| `client_request_id` | no | Stable per-agent retry key; changed content conflicts. |
+| `callback_ref` | no | Opaque registered receiver reference; no credentials. |
+| `pending_ttl_seconds` | no | Deadline for the human decision. Default 86400 seconds (24 hours); administrator limits apply. |
 | `title` | yes | ≤ 60 characters. Verb + object + target. |
 | `summary` | yes | ≤ 200 characters. The line on the inbox card. |
 | `message` | yes | First person. What you want to do, and the context your owner needs. |
@@ -178,14 +194,18 @@ custom text field. Set `kind: "blocker"` when the question blocks progress.
     "env":     { "eq": "prod" },
     "ref":     { "limit": "merge commit of PR #218", "pattern": "^[0-9a-f]{7,40}$" }
   },
-  "after": ["db.migrate"] }
+  "after": ["migrate_billing"] }
 ```
 
 - **`summary` is yours**, and your owner reads it. Describe what the call
   does in plain words, not the tool's description.
-- **`required`**: without this tool, the task fails. If your owner unticks a
-  required tool, the whole request comes back to you to replan. Optional
-  tools can be dropped individually.
+- **`call_id`** is a stable unique identifier, distinct from the tool name. Repeated tools need distinct call IDs.
+- **`summary`** explains the purpose and its relationship to the task.
+- **`target`**, **`operation`**, and **`expected_effects`** are required for every call.
+- For writes, supply **`affected_scope`**, **`material_risks`**, and **`undo`**.
+  State explicitly when the action cannot be undone. Catalog metadata determines whether a tool is read-only.
+- **`required`** is only a planning hint. The human can reject any call and complete the decision.
+  Return rejected calls to the agent without permission.
 - **`params`**: give every argument you'll pass. **Your grant covers only
   the arguments you list**; a call that passes anything else is blocked.
   - `{"eq": value}` is an exact value. Prefer it. A bare value (`"env": "prod"`)
@@ -193,11 +213,10 @@ custom text field. Set `kind: "blocker"` when the question blocks progress.
   - `{"in": [...]}`, `{"prefix": "..."}`, `{"gte": n, "lte": n}` narrow a value.
   - `{"limit": "what it will be", "pattern": "regex"}` is for a value that
     doesn't exist yet (a commit a merge will create). Toolyard checks the
-    actual value against `pattern` when you make the call. Without a pattern
-    it records the value but can't check it, and your owner sees that.
-  - `{"any": true}` allows any value. It's always flagged; avoid it.
-- **`after`**: the order you'll run things in. It's shown to your owner as
-  a plan.
+    actual value against `pattern` when you make the call. Without an enforced pattern this scope is rejected.
+  - `{"any": true}` is unbounded and is rejected.
+- **`after`** references call IDs, never tool names. Invalid references and cycles are rejected.
+  Dependencies do not authorize rejected calls or widen accepted parameters.
 
 ## 5. The voice note
 
@@ -297,7 +316,7 @@ lowered, and returns a warning with `path: "urgency"`.
 
 ## 9. Waiting, grants and using them
 
-`inbox.request` returns `{ "request_id": "rq_…", "expected_decision_in_seconds": … }`.
+`inbox.request` returns `request_id`, `status`, and the pending `expires_at`.
 
 - Keep working on anything that doesn't depend on the answer.
 - `inbox.status({ "ids": [...] })` never blocks.
@@ -322,8 +341,8 @@ A decision looks like this:
 `status` is one of `pending`, `approved`, `denied`, `returned`, `answered`,
 `cancelled`, `expired`. Always read `next`: it says what to do.
 
-- Each grant **token is shown once**. Keep it in memory, never in logs, commits
-  or PRs, and never pass it to another agent. It only works for you anyway.
+- Status reads do not consume grants. The authorized agent can recover the same still-valid unused token after a lost response.
+  Recovery adds no use and never extends or replaces permission. Keep tokens out of logs, commits, and callbacks.
 - Call the tool with `_grant` added to its arguments. Stay inside the
   parameters you asked for, or the call is blocked.
 - Your owner can **narrow** a tool before allowing it: fewer values, an
@@ -331,8 +350,35 @@ A decision looks like this:
   `grants_expire_at`. They can never widen it. A narrowed tool has
   `"narrowed": true` and its `params` are what the grant allows: use those.
 - Read `owner_note`, and honour it even for tools that were allowed.
-- If `status` is `returned`, a required tool was refused. Replan, and say in
-  your next request what changed.
+- Read each call's `call_id`, `verdict` (`accepted` or `rejected`), and optional written `reason`.
+  An all-rejected batch has status `denied` and no grants. Mixed batches grant only accepted calls.
+- Execution is separate: `not_started`, `running`, `succeeded`, `failed`, or `outcome_unknown`.
+  A claimed grant never executes again. If an upstream write times out or the process stops after the claim, inspect upstream state.
+  Do not blindly repeat a write with an unknown outcome.
+- A callback announces one committed decision, with every verdict and note, and no grant tokens or sensitive tool results.
+  Retrieve current authoritative status after the callback; it is not permission itself.
+- A pending request expires after 24 hours by default. Grant lifetime defaults to 1800 seconds after acceptance.
+  Expired or revoked grants cannot be revived.
+
+A human submission supplies the Inbox request ID in the URL and this complete contract:
+
+```json
+{
+  "action": "submit",
+  "request_revision": 1,
+  "submission_id": "stable-decision-retry-key",
+  "verdicts": {
+    "migrate_billing": {"verdict": "rejected", "reason": "The migration is not ready."},
+    "deploy_api": {"verdict": "accepted", "reason": "The release is ready."}
+  },
+  "note": "Keep the rollout flag disabled."
+}
+```
+
+Every requested call ID must appear exactly once. No callback is emitted for draft selections or notes.
+The decision, accepted-call grants, audit, and callback event commit together.
+The same submission ID and content return the saved result. Changed content or a stale revision returns a conflict.
+A competing decision cannot overwrite a committed decision. Drafts remain available after a failed or conflicting submission.
 
 ## 10. Close the loop
 
@@ -374,33 +420,137 @@ inbox.request({
     "if_it_goes_wrong": "The API service only. With the flag off there's no user-visible change.",
     "undo": "I redeploy 9f1e2d0, the current prod build. About 4 minutes."
   },
-  "audio": { "script": "Hi, it's the billing agent. I'd like to ship billing v2 to production. I need to merge the approved pull request, add one new table, and deploy. The new code sits behind a flag that stays off. All 42 checks passed. I'm asking for one merge, one migration and one deploy, valid for 30 minutes." },
+  "audio": {
+    "script": "Hi, it's the billing agent. I'd like to ship billing v2 to production. I need to merge the approved pull request, add one new table, and deploy. The new code sits behind a flag that stays off. All 42 checks passed. I'm asking for one merge, one migration and one deploy, valid for 30 minutes."
+  },
   "urgency": "soon",
   "tools": [
-    { "tool": "github.merge_pull_request", "required": true,
+    {
+      "tool": "github.merge_pull_request",
+      "required": true,
       "summary": "Squash-merge PR #218 into main.",
-      "params": { "repo": "acme/api", "pull_number": 218, "merge_method": "squash" } },
-    { "tool": "db.migrate", "required": true,
+      "params": {
+        "repo": "acme/api",
+        "pull_number": 218,
+        "merge_method": "squash"
+      },
+      "call_id": "merge_billing",
+      "target": "Production billing API",
+      "operation": "write",
+      "expected_effects": "Squash-merge PR #218 into main.",
+      "affected_scope": "Billing API release and configuration",
+      "material_risks": "An incorrect release can interrupt invoice creation.",
+      "undo": "Redeploy release 9f1e2d0 and restore its configuration.",
+      "after": []
+    },
+    {
+      "tool": "db.migrate",
+      "required": true,
       "summary": "Apply migration 0042, which adds the webhook_events table.",
-      "params": { "env": "prod", "migration": "0042_webhook_events", "direction": "up" } },
-    { "tool": "deploy.run", "required": true,
+      "params": {
+        "env": "prod",
+        "migration": "0042_webhook_events",
+        "direction": "up"
+      },
+      "call_id": "migrate_billing",
+      "target": "Production billing API",
+      "operation": "write",
+      "expected_effects": "Apply migration 0042, which adds the webhook_events table.",
+      "affected_scope": "Billing API release and configuration",
+      "material_risks": "An incorrect release can interrupt invoice creation.",
+      "undo": "Redeploy release 9f1e2d0 and restore its configuration.",
+      "after": []
+    },
+    {
+      "tool": "deploy.run",
+      "required": true,
       "summary": "Deploy the api service to prod at the merge commit.",
-      "params": { "service": "api", "env": "prod",
-                  "ref": { "limit": "merge commit of PR #218", "pattern": "^[0-9a-f]{7,40}$" } },
-      "after": ["github.merge_pull_request", "db.migrate"] }
+      "params": {
+        "service": "api",
+        "env": "prod",
+        "ref": {
+          "limit": "merge commit of PR #218",
+          "pattern": "^[0-9a-f]{7,40}$"
+        }
+      },
+      "after": [
+        "merge_billing",
+        "migrate_billing"
+      ],
+      "call_id": "deploy_api",
+      "target": "Production billing API",
+      "operation": "write",
+      "expected_effects": "Deploy the api service to prod at the merge commit.",
+      "affected_scope": "Billing API release and configuration",
+      "material_risks": "An incorrect release can interrupt invoice creation.",
+      "undo": "Redeploy release 9f1e2d0 and restore its configuration."
+    }
   ],
   "attachments": [
-    { "type": "table", "title": "Checks", "columns": ["Check", "Result"],
-      "rows": [["Unit tests", "1,284 passed"], ["Integration", "212 passed"]] },
-    { "type": "chart", "chart": "line", "title": "Error rate, canary vs prod", "unit": "%",
-      "x": ["-30m", "-15m", "now"],
-      "series": [{ "name": "canary", "values": [0.19, 0.21, 0.2] }, { "name": "prod", "values": [0.2, 0.2, 0.2] }],
-      "spoken": "the canary has been flat for 30 minutes" },
-    { "type": "diff", "file": "handlers/webhook.go", "patch": "@@ -41,4 +41,6 @@\n-\treturn err\n+\treturn h.retry(ev)\n",
-      "caption": "The core of the change: failed deliveries now retry." },
-    { "type": "link", "label": "PR #218", "url": "https://github.com/acme/api/pull/218" }
+    {
+      "type": "table",
+      "title": "Checks",
+      "columns": [
+        "Check",
+        "Result"
+      ],
+      "rows": [
+        [
+          "Unit tests",
+          "1,284 passed"
+        ],
+        [
+          "Integration",
+          "212 passed"
+        ]
+      ]
+    },
+    {
+      "type": "chart",
+      "chart": "line",
+      "title": "Error rate, canary vs prod",
+      "unit": "%",
+      "x": [
+        "-30m",
+        "-15m",
+        "now"
+      ],
+      "series": [
+        {
+          "name": "canary",
+          "values": [
+            0.19,
+            0.21,
+            0.2
+          ]
+        },
+        {
+          "name": "prod",
+          "values": [
+            0.2,
+            0.2,
+            0.2
+          ]
+        }
+      ],
+      "spoken": "the canary has been flat for 30 minutes"
+    },
+    {
+      "type": "diff",
+      "file": "handlers/webhook.go",
+      "patch": "@@ -41,4 +41,6 @@\n-\treturn err\n+\treturn h.retry(ev)\n",
+      "caption": "The core of the change: failed deliveries now retry."
+    },
+    {
+      "type": "link",
+      "label": "PR #218",
+      "url": "https://github.com/acme/api/pull/218"
+    }
   ],
-  "ttl_seconds": 1800
+  "ttl_seconds": 1800,
+  "task": {
+    "objective": "Deliver the billing handler with its rollout flag disabled."
+  }
 })
 ```
 
@@ -432,3 +582,56 @@ inbox.post({
   "urgency": "fyi"
 })
 ```
+
+
+## Local server connections
+
+A server without a verified team identity can use the explicit API key mode in
+its Toolyard settings. The human enters an existing Toolyard agent API key and
+instance URL through authenticated settings. The server exchanges that key for
+an independent environment/user credential and removes the bootstrap key from
+client state. This mode does not provision users or prove a Clerk identity.
+Never ask for the key in a prompt, place it in an Inbox item, or use one user's
+connection for another user. Parent key rotation/revocation and disabled
+accounts invalidate derived access. Explicit connection removal is persistent.
+
+Local session callbacks use registered `transport: "pull"` receivers. The server
+retrieves the signed persistent outbox through authenticated bounded requests,
+verifies and persists each event, then acknowledges its event ID. Unacknowledged
+events survive restart and may repeat. No public laptop address or agent
+`inbox.wait` is necessary. The callback still announces a decision rather than
+permission. Read authoritative Inbox status before any approved execution.
+
+`Open Toolyard` uses a one-minute, single-use dashboard handoff. The local mode
+redirects only to the same Toolyard instance's Inbox. Credentials remain on the
+server and are never embedded in the browser URL.
+
+## Server-owned host connections
+
+BKT3's browser consent flow creates one dedicated Toolyard agent for the
+selected server environment and authenticated server profile. The Toolyard
+browser account is the agent owner. A hosted profile must match that account's
+verified Clerk subject; the fixed `local-user` profile uses explicit account
+owner consent. Server labels and platforms are self-reported, not verified
+hardware identity.
+
+The server signs a short-lived EdDSA proof to `/v1/connections/host/begin`.
+The owner reviews `/connections/authorize` and explicitly accepts or rejects.
+GET does not grant permission. Only the same server key can poll the result;
+the browser never sees a credential. An approved result is recoverable without
+issuing another credential while its connection generation remains active.
+Replayed proof IDs, substituted environments/profiles, changed keys, and expired
+pending requests are rejected. Consent does not approve any restricted call.
+
+Host credentials remain in the destination server secret store. BKT3 clients
+and authenticated native MCP callers use the server proxy. Requests therefore
+carry the dedicated agent and its real account owner rather than a shared key.
+Private hosts use outbound pull callbacks. A BKT3 connection token authorizes
+BKT3 access; it is not Toolyard consent.
+
+Each host has a 30-day renewable connection lease. API status and the dashboard
+show the owner, host, agent, and expiry. Owners can revoke a host in Toolyard.
+Revocation closes unused grants and callback registrations. Account/agent
+restore cannot recreate that access; fresh browser consent is necessary.
+Account ownership and connection lifecycle audit records are transactional.
+Audit records distinguish owner consent from server claims and renewal.

@@ -306,3 +306,13 @@ tbody tr:hover { background: #ffffff02; }
 
 .login-brand { display: flex; align-items: center; gap: 10px; justify-content: center; }
 #secret-edit-value { margin-top: 8px; }
+
+/* Server-owned host access uses cards so identifiers remain readable on phones. */
+.host-connection-list { display: grid; gap: 12px; }
+.host-connection-row { padding: 12px; border: 1px solid var(--border, #303030); border-radius: 8px; min-width: 0; }
+.host-connection-row h3 { margin: 0 0 8px; }
+.host-connection-row dl { display: grid; grid-template-columns: minmax(100px, 150px) minmax(0, 1fr); gap: 6px 12px; }
+.host-connection-row dt { color: var(--muted, #aaa); }
+.host-connection-row dd { margin: 0; overflow-wrap: anywhere; min-width: 0; }
+.host-connection-row code { white-space: normal; overflow-wrap: anywhere; }
+@media (max-width: 420px) { .host-connection-row dl { grid-template-columns: minmax(0, 1fr); } }

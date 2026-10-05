@@ -346,7 +346,7 @@ func (s *Server) HardenAPI(next http.Handler) http.Handler {
 			// one browser form on the API, a connect link's Continue
 			// button (connect_link_routes.go), posts form-encoded and
 			// proves itself with a nonce cookie instead.
-			if r.ContentLength != 0 && !strings.HasPrefix(path, connectLinkPath) {
+			if r.ContentLength != 0 && !strings.HasPrefix(path, connectLinkPath) && path != hostAuthorizePath {
 				ct := r.Header.Get("Content-Type")
 				if ct == "" {
 					writeError(w, http.StatusUnsupportedMediaType, "Content-Type required")
@@ -424,6 +424,10 @@ func perRouteBodyCap(path string) int64 {
 // because the caller is either (a) bootstrapping with no cookie / dashboard
 // origin in the picture, or (b) a third-party token-tap path.
 func exemptFromCSRFHeader(path string) bool {
+	// These endpoints authenticate signed assertions or agent bearers only.
+	if strings.HasPrefix(path, "/v1/federation/") || strings.HasPrefix(path, "/v1/callbacks/") || localConnectionPath(path) || hostProtocolPath(path) {
+		return true
+	}
 	// Webhook event ingest is bearer-authenticated (source token); no cookie
 	// or dashboard origin, so the CSRF custom-header check doesn't apply. The
 	// path-token form lives under the /v1/ingest/ subtree.
@@ -434,7 +438,7 @@ func exemptFromCSRFHeader(path string) bool {
 	// set a header, so it carries a nonce the page's response set as a
 	// SameSite=Strict cookie (connect_link_routes.go). The Origin check
 	// still applies (exemptFromOriginCheck).
-	if strings.HasPrefix(path, connectLinkPath) {
+	if strings.HasPrefix(path, connectLinkPath) || path == hostAuthorizePath {
 		return true
 	}
 	switch path {
@@ -472,7 +476,7 @@ func exemptFromOriginCheck(path string) bool {
 		return false
 	}
 	// The connect link's form is posted from its own confirm page only.
-	if strings.HasPrefix(path, connectLinkPath) {
+	if strings.HasPrefix(path, connectLinkPath) || path == hostAuthorizePath {
 		return false
 	}
 	return exemptFromCSRFHeader(path)
@@ -492,6 +496,12 @@ type unauthRouteRule struct {
 // a stronger guard (one-shot: 404 after the first success) and the
 // rate limit there mostly hurts test harnesses that re-bootstrap.
 func unauthRouteLimit(path string) *unauthRouteRule {
+	if path == "/v1/connections/host/begin" || path == hostAuthorizePath {
+		return &unauthRouteRule{"host-authorization", 30, time.Minute}
+	}
+	if strings.HasPrefix(path, "/v1/federation/") || strings.HasPrefix(path, "/v1/callbacks/") || localConnectionPath(path) || hostProtocolPath(path) {
+		return &unauthRouteRule{"federation", 600, time.Minute}
+	}
 	switch {
 	case path == "/v1/agents/exchange":
 		// Exchange burns the enrollment code on success; legitimate users

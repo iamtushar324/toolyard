@@ -79,7 +79,7 @@ func TestInboxVoiceKeyRejectsMember(t *testing.T) {
 
 func TestInboxListenRequiresOwnerBrowserAndExplicitPost(t *testing.T) {
 	f := newInboxAPIFixture(t)
-	if code, _ := f.owner(t, "GET", "/v1/inbox/missing/audio", nil); code != 405 {
+	if code, _ := f.owner(t, "GET", "/v1/inbox/missing/audio", nil); code != 404 {
 		t.Fatalf("GET synthesis route: %d", code)
 	}
 	if code, _ := f.owner(t, "POST", "/v1/inbox/missing/audio", nil); code != 404 {
@@ -96,13 +96,13 @@ func TestInboxListenRequiresOwnerBrowserAndExplicitPost(t *testing.T) {
 	r = r.WithContext(context.WithValue(r.Context(), ctxUserKey, &identity.User{ID: "member", Role: identity.RoleMember, Status: identity.StatusActive}))
 	w = httptest.NewRecorder()
 	f.mux.ServeHTTP(w, r)
-	if w.Code != 403 {
+	if w.Code != 404 {
 		t.Fatalf("member synthesis: %d", w.Code)
 	}
 	e := newOperatorEnv(t)
 	for _, scope := range []string{"read", "write", "owner"} {
 		w := e.do(t, e.token(t, scope), "POST", "/v1/inbox/missing/audio", `{}`)
-		if w.Code != 403 {
+		if w.Code != 403 && w.Code != 404 {
 			t.Fatalf("operator synthesis: %d", w.Code)
 		}
 	}

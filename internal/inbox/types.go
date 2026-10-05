@@ -47,9 +47,11 @@ const (
 
 // Per-tool decisions on an access request.
 const (
-	ToolPending = ""
-	ToolAllowed = "allowed"
-	ToolRefused = "refused"
+	ToolPending     = ""
+	VerdictAccepted = "accepted"
+	VerdictRejected = "rejected"
+	ToolAllowed     = "allowed"
+	ToolRefused     = "refused"
 )
 
 // Flag levels.
@@ -139,11 +141,21 @@ type Attachment struct {
 // ToolRequest is one tool the agent needs, with the parameters it will
 // call it with. Summary is the agent's own description of the call.
 type ToolRequest struct {
-	Tool     string                `json:"tool"`
-	Required bool                  `json:"required"`
-	Summary  string                `json:"summary"`
-	Params   map[string]Constraint `json:"params"`
-	After    []string              `json:"after,omitempty"`
+	LegacyParamsJSON string                `json:"legacy_params_json,omitempty"`
+	CallID           string                `json:"call_id"`
+	Target           string                `json:"target"`
+	ExpectedEffects  string                `json:"expected_effects"`
+	Operation        string                `json:"operation"`
+	AffectedScope    string                `json:"affected_scope,omitempty"`
+	MaterialRisks    string                `json:"material_risks,omitempty"`
+	Undo             string                `json:"undo,omitempty"`
+	Verdict          string                `json:"verdict,omitempty"`
+	Reason           string                `json:"reason,omitempty"`
+	Tool             string                `json:"tool"`
+	Required         bool                  `json:"required"`
+	Summary          string                `json:"summary"`
+	Params           map[string]Constraint `json:"params"`
+	After            []string              `json:"after,omitempty"`
 
 	// Requested holds the agent's original parameters when the owner
 	// narrowed them; Params is then what was granted.
@@ -167,6 +179,12 @@ type Activity struct {
 
 // Request is the full stored shape of an inbox item.
 type Request struct {
+	LegacyExecutionState  string          `json:"legacy_execution_state,omitempty"`
+	CallbackRef           string          `json:"callback_ref,omitempty"`
+	ExecutionMode         string          `json:"execution_mode,omitempty"`
+	PendingTTLSeconds     int             `json:"pending_ttl_seconds,omitempty"`
+	DecisionSubmissionID  string          `json:"decision_submission_id,omitempty"`
+	DecisionFingerprint   string          `json:"decision_fingerprint,omitempty"`
 	RetrievedAt           int64           `json:"retrieved_at,omitempty"`
 	SchemaVersion         int             `json:"schema_version,omitempty"`
 	Revision              int             `json:"revision"`

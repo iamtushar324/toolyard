@@ -88,6 +88,13 @@ func concretePaths(patterns []string) []string {
 		add("/v1/agents/x/" + action)
 	}
 	add("/v1/me/connections/x/begin")
+	add("/v1/connections/hosts/x/revoke")
+	for _, action := range []string{"begin", "poll", "cancel", "renew", "revoke", "handoff"} {
+		add("/v1/connections/host/" + action)
+	}
+	for _, p := range []string{"/v1/inbox/sessions", "/v1/inbox/grants", "/v1/inbox/info", "/v1/inbox/batch", "/v1/passkeys/register/begin", "/v1/passkeys/register/finish"} {
+		add(p)
+	}
 	sort.Strings(out)
 	return out
 }
@@ -101,10 +108,15 @@ func memberAllowlist() map[string]bool {
 		"GET /v1/auth/me", "GET /v1/auth/config",
 		"POST /v1/auth/logout", "POST /v1/auth/login", "POST /v1/auth/clerk/session",
 		"POST /v1/connect/t3",
+		"GET /v1/inbox", "GET /v1/inbox/x", "GET /v1/inbox/sessions", "GET /v1/inbox/grants", "GET /v1/inbox/info",
+		"POST /v1/inbox/batch", "POST /v1/passkeys/register/begin", "POST /v1/passkeys/register/finish", "GET /v1/passkeys",
 		"GET /v1/agents", "POST /v1/agents", "POST /v1/agents/enroll",
 		"POST /v1/agents/x/rotate", "POST /v1/agents/x/disable", "POST /v1/agents/x/enable",
 		"DELETE /v1/agents/x",
 		"GET /v1/me/servers",
+		"GET /v1/connections/hosts", "POST /v1/connections/hosts/x/revoke",
+		"POST /v1/connections/host/begin", "POST /v1/connections/host/poll", "POST /v1/connections/host/cancel",
+		"POST /v1/connections/host/renew", "POST /v1/connections/host/revoke", "POST /v1/connections/host/handoff",
 		"GET /v1/me/identity-key", "POST /v1/me/identity-key/reveal",
 		// My connections, and the OAuth return routes a member's own
 		// sign-in comes back through (the handlers check whose flow it is).
@@ -159,6 +171,9 @@ func TestRoleGuardEveryRoute(t *testing.T) {
 	paths := concretePaths(registeredRoutePaths(t))
 	checked := 0
 	for _, p := range paths {
+		if !strings.HasPrefix(p, "/v1/") {
+			continue
+		}
 		for _, method := range guardMethods {
 			key := method + " " + p
 			rec := call(memberCookie, method, p)

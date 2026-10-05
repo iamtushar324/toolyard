@@ -889,6 +889,22 @@ func (s *Service) Info(ctx context.Context) Info {
 	return in
 }
 
+// InfoForAgents prevents notification counts from crossing user boundaries.
+func (s *Service) InfoForAgents(ctx context.Context, agentIDs []string) Info {
+	in := s.Info(ctx)
+	in.PendingPushes = 0
+	if len(agentIDs) == 0 {
+		return in
+	}
+	args := make([]any, len(agentIDs))
+	for i, id := range agentIDs {
+		args[i] = id
+	}
+	query := `SELECT COUNT(*) FROM inbox_pushes WHERE sent_at IS NULL AND agent_id IN (` + strings.TrimSuffix(strings.Repeat("?,", len(args)), ",") + `)`
+	_ = s.db.QueryRowContext(ctx, query, args...).Scan(&in.PendingPushes)
+	return in
+}
+
 // nextDigest is the first digest slot after t.
 func nextDigest(c AttentionConfig, t time.Time) (time.Time, bool) {
 	t = t.In(c.Location)

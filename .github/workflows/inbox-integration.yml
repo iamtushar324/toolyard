@@ -1,0 +1,34 @@
+name: Inbox integration
+on:
+  pull_request:
+  push:
+    branches: [t3code/inbox-batch-callbacks]
+permissions:
+  contents: read
+jobs:
+  validate:
+    # dev-server-1 uses ARM64; validate and publish a native SQLite-enabled binary.
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 24
+      - name: Go validation
+        run: go test ./...
+      - name: Dashboard behavior
+        run: node --test scripts/*ui.test.cjs
+      - name: Build gateway
+        run: |
+          mkdir -p dist
+          go build -ldflags "-X main.version=github-${GITHUB_SHA}" -o dist/toolyard ./cmd/gateway
+          go build -o dist/inbox-migration-check ./cmd/inbox-migration-check
+      - name: Publish validated application artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: toolyard-${{ github.sha }}
+          path: dist/
+          retention-days: 7

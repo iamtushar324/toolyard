@@ -12,7 +12,7 @@ func TestStageExpiredDecisionRefusedBeforeSweep(t *testing.T) {
 	e := newEnv(t)
 	r := submitDeploy(t, e, "ag_stage")
 	e.advance(RequestTTL + time.Second)
-	if _, err := e.svc.Decide(context.Background(), r.ID, Decision{Action: "approve", Allow: []bool{true, true, false}}); err == nil {
+	if _, err := e.decide(context.Background(), r.ID, Decision{Action: "approve", Allow: []bool{true, true, false}}); err == nil {
 		t.Fatal("expired request issued grants before the sweeper ran")
 	}
 }
@@ -36,18 +36,18 @@ func TestStageStructuredQuestionRoundTrip(t *testing.T) {
 	for _, bad := range []string{`{"selected_option_ids":["unknown"]}`, `{"selected_option_ids":["mobile","mobile"]}`, `{"selected_option_ids":["none","mobile"]}`, `{"text":"   "}`} {
 		var d Decision
 		_ = json.Unmarshal([]byte(`{"action":"answer","request_revision":1,"submission_id":"attempt","response":`+bad+`}`), &d)
-		if _, err = e.svc.Decide(ctx, sub.RequestID, d); err == nil {
+		if _, err = e.decide(ctx, sub.RequestID, d); err == nil {
 			t.Fatalf("accepted invalid answer %s", bad)
 		}
 	}
 	var d Decision
 	_ = json.Unmarshal([]byte(`{"action":"answer","request_revision":1,"submission_id":"attempt","response":{"selected_option_ids":["mobile","keys"],"text":"  Keep this exact text.\n"}}`), &d)
-	r, err := e.svc.Decide(ctx, sub.RequestID, d)
+	r, err := e.decide(ctx, sub.RequestID, d)
 	if err != nil {
 		t.Fatal(err)
 	}
 	before := len(r.Activity)
-	r, err = e.svc.Decide(ctx, sub.RequestID, d)
+	r, err = e.decide(ctx, sub.RequestID, d)
 	if err != nil || len(r.Activity) != before {
 		t.Fatalf("answer retry failed: %v", err)
 	}
@@ -57,7 +57,7 @@ func TestStageStructuredQuestionRoundTrip(t *testing.T) {
 		t.Fatalf("agent lost answer: %s %v", b, err)
 	}
 	d.By = "another person"
-	if _, err = e.svc.Decide(ctx, sub.RequestID, d); err == nil {
+	if _, err = e.decide(ctx, sub.RequestID, d); err == nil {
 		t.Fatal("different actor replayed answer")
 	}
 }
@@ -73,8 +73,38 @@ func TestStageFreeTextOnlyQuestion(t *testing.T) {
 	}
 	var d Decision
 	_ = json.Unmarshal([]byte(`{"action":"answer","request_revision":1,"submission_id":"text1","response":{"text":"Make the list easier to scan."}}`), &d)
-	got, err := e.svc.Decide(ctx, r.RequestID, d)
+	got, err := e.decide(ctx, r.RequestID, d)
 	if err != nil || got.Answer != "Make the list easier to scan." {
 		t.Fatalf("answer: %+v %v", got, err)
+	}
+}
+
+// Short answer labels can be legitimate even when the same word is not useful
+// permission context. Bounds still apply to all choice labels.
+func TestStageQuestionLabelsPreserveAnswersAndBounds(t *testing.T) {
+	e := newEnv(t)
+	for _, tc := range []struct {
+		label string
+		valid bool
+	}{
+		{"None", true}, {"Test", true}, {"   ", false}, {strings.Repeat("x", MaxOptionLabel+1), false},
+	} {
+		s := &Submission{SchemaVersion: 2, Kind: KindQuestion, Prompt: "Which action must run?", Question: &Question{Type: "single_choice", Options: []Option{{ID: "choice", Label: tc.label}, {ID: "other", Label: "Deploy"}}}}
+		got, err := e.svc.Submit(context.Background(), "ag_stage", s)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got.OK != tc.valid {
+			t.Fatalf("label %q: valid=%v, response=%+v", tc.label, tc.valid, got)
+		}
+		if !tc.valid {
+			found := false
+			for _, p := range got.Problems {
+				found = found || p.Path == "question.options[0].label"
+			}
+			if !found {
+				t.Fatalf("missing label correction: %+v", got.Problems)
+			}
+		}
 	}
 }

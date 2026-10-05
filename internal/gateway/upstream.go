@@ -81,6 +81,9 @@ type upstream struct {
 	// goroutine-safe.
 	mu     sync.Mutex
 	client *client.Client // nil when suspended
+	// active pins the transport from before a lazy dial through RPC
+	// completion. Pool pressure and idle sweeps cannot cancel these calls.
+	active int
 
 	// dialMu serialises resume(): one goroutine dials while the others
 	// wait and find the connection live. It is held across the dial and
@@ -210,6 +213,10 @@ func (u *upstream) label() string {
 // tool catalog over the live session. Used for a per_user connection that
 // was created suspended and has no cache yet.
 func (u *upstream) listToolsLive(ctx context.Context) ([]mcp.Tool, error) {
+	if err := u.lease(ctx); err != nil {
+		return nil, err
+	}
+	defer u.release()
 	if _, err := u.liveClient(); err != nil {
 		return nil, err
 	}
@@ -256,6 +263,10 @@ func (u *upstream) listTools(ctx context.Context) ([]mcp.Tool, error) {
 // a timeout or any other transport failure is returned as is, since the
 // tool may already have run.
 func (u *upstream) callTool(ctx context.Context, name string, args map[string]any) (*mcp.CallToolResult, error) {
+	if err := u.lease(ctx); err != nil {
+		return nil, err
+	}
+	defer u.release()
 	u.lastUsed.Store(time.Now().UnixNano())
 
 	c, err := u.liveClient()
@@ -406,8 +417,12 @@ func (u *upstream) recoverSession(dead *client.Client, reason string) error {
 
 // suspend closes the subprocess but keeps the upstream's catalog entry and
 // tool cache intact. The upstream restarts automatically on the next callTool.
-func (u *upstream) suspend() {
+func (u *upstream) suspend() bool {
 	u.mu.Lock()
+	if u.active != 0 || u.client == nil {
+		u.mu.Unlock()
+		return false
+	}
 	c := u.client
 	u.client = nil
 	u.mu.Unlock()
@@ -416,6 +431,32 @@ func (u *upstream) suspend() {
 		// this upstream's callers and — when suspend() is the LRU
 		// eviction victim — the whole admission path in acquireSlot.
 		closeWithTimeout(u.cfg.Name, c, 5*time.Second)
+	}
+	return true
+}
+
+// lease protects both admission/dial and dispatch. Forced retirement and
+// shutdown still close the client; their transport errors are not retried.
+func (u *upstream) lease(ctx context.Context) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	u.mu.Lock()
+	defer u.mu.Unlock()
+	if u.retired.Load() {
+		return errRetired
+	}
+	u.active++
+	return nil
+}
+
+func (u *upstream) release() {
+	u.mu.Lock()
+	u.active--
+	u.lastUsed.Store(time.Now().UnixNano())
+	u.mu.Unlock()
+	if u.pool != nil {
+		u.pool.trimIdlePool(u)
 	}
 }
 

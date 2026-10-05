@@ -37,17 +37,20 @@ import (
 	"github.com/mark3labs/mcp-go/server"
 
 	"github.com/tusharbhardwaj/toolyard/internal/access"
+	"github.com/tusharbhardwaj/toolyard/internal/actor"
 	"github.com/tusharbhardwaj/toolyard/internal/api"
 	"github.com/tusharbhardwaj/toolyard/internal/approval"
 	"github.com/tusharbhardwaj/toolyard/internal/audit"
 	"github.com/tusharbhardwaj/toolyard/internal/auditlink"
 	"github.com/tusharbhardwaj/toolyard/internal/autoapproval"
+	"github.com/tusharbhardwaj/toolyard/internal/callbacks"
 	"github.com/tusharbhardwaj/toolyard/internal/chatnotify"
 	"github.com/tusharbhardwaj/toolyard/internal/chatnotify/telegram"
 	"github.com/tusharbhardwaj/toolyard/internal/clerk"
 	"github.com/tusharbhardwaj/toolyard/internal/codemode"
 	"github.com/tusharbhardwaj/toolyard/internal/crashdump"
 	"github.com/tusharbhardwaj/toolyard/internal/events"
+	"github.com/tusharbhardwaj/toolyard/internal/federation"
 	"github.com/tusharbhardwaj/toolyard/internal/gateway"
 	"github.com/tusharbhardwaj/toolyard/internal/goroutines"
 	hookspkg "github.com/tusharbhardwaj/toolyard/internal/hooks"
@@ -403,24 +406,22 @@ func runServe(argv []string) error {
 			// minimizes what a key compromise could reveal. The dashboard
 			// fills in details when the user opens the approval card.
 			n := push.Notification{
-				Title:    "toolyard approval needed",
+				Title:    "toolyard Inbox decision needed",
 				Body:     fmt.Sprintf("%s · %s — tap to review", req.UpstreamName, req.ToolName),
-				URL:      "/?approval=" + req.ID,
+				URL:      "/#inbox/" + req.ID,
 				Approval: req.ID,
 				Tag:      req.ID,
 			}
-			// The decision token is minted for this recipient, so a tap
-			// through it is recorded as their decision.
+			// Legacy calls keep their original execution mode, but all
+			// permission review happens in Inbox. Do not mint an approval
+			// token for a second notification decision interface.
 			payload := map[string]any{
-				"title":          n.Title,
-				"body":           n.Body,
-				"url":            n.URL,
-				"approval_id":    req.ID,
-				"decision_token": bus.DecisionTokenFor(req.ID, user.ID),
-				"tag":            req.ID,
-				// Non-secret label (upstream · tool, same as the body) so
-				// the service worker can show "✓ Approved — github · …".
-				"tool": req.UpstreamName + " · " + req.ToolName,
+				"kind":        "inbox",
+				"title":       n.Title,
+				"body":        n.Body,
+				"url":         n.URL,
+				"approval_id": req.ID,
+				"tag":         req.ID,
 			}
 			_ = pushSvc.Notify(ctx, user.ID, payload)
 		}
@@ -557,11 +558,6 @@ func runServe(argv []string) error {
 	// result through tools.poll_approval / tools.wait_for_approval —
 	// no need to re-call the original tool.
 	bus.SetExecutor(gw)
-	if n, err := bus.SweepUnexecuted(ctx); err != nil {
-		log.Printf("auto-execute: startup sweep: %v", err)
-	} else if n > 0 {
-		log.Printf("auto-execute: startup sweep re-fired %d allowed-but-not-executed approvals", n)
-	}
 
 	// Owner inbox + scoped grants. Agents ask for restricted tools with
 	// inbox.request; the owner decides on their phone; each allowed tool
@@ -628,6 +624,7 @@ func runServe(argv []string) error {
 		log.Printf("inbox: removed %d passkey(s) (-inbox-reset-passkeys)", n)
 	}
 	inboxSvc, err := inbox.New(ctx, inbox.Options{
+		LegacyDecided:     bus.DispatchCommitted,
 		Passkeys:          passkeySvc,
 		Voice:             inboxVoice,
 		VoiceEnabled:      func() bool { return settingsSvc.GetBool(settings.InboxVoiceEnabled) },
@@ -695,6 +692,28 @@ func runServe(argv []string) error {
 	if err != nil {
 		return fmt.Errorf("inbox: %w", err)
 	}
+	if err := inboxSvc.SyncLegacy(ctx); err != nil {
+		return fmt.Errorf("legacy Inbox migration: %w", err)
+	}
+	bus.LegacyDecision = func(ctx context.Context, id, action string, d actor.Decider) (*approval.Request, error) {
+		_, err := inboxSvc.DecideLegacy(ctx, id, action, d)
+		if err != nil {
+			if errors.Is(err, inbox.ErrNotFound) {
+				return nil, approval.ErrNotFound
+			}
+			if errors.Is(err, inbox.ErrNotPending) || errors.Is(err, inbox.ErrConflict) {
+				old, _ := bus.Get(ctx, id)
+				return old, approval.ErrNotPending
+			}
+			return nil, err
+		}
+		return bus.Get(ctx, id)
+	}
+	bus.AddNotifierFunc(func(ctx context.Context, _ *approval.Request, _ string) {
+		if err := inboxSvc.SyncLegacy(ctx); err != nil {
+			log.Printf("legacy Inbox sync: %v", err)
+		}
+	})
 	defer inboxSvc.Close(20 * time.Second)
 	if n := inboxSvc.RecheckUnchecked(ctx); n > 0 {
 		log.Printf("inbox: re-running background checks for %d request(s)", n)
@@ -704,8 +723,6 @@ func runServe(argv []string) error {
 		return settingsSvc.GetString(settings.ApprovalMode, settings.ApprovalModeExecute)
 	})
 	gw.RegisterInboxTools()
-	go inboxSvc.RunSweeper(ctx, time.Minute)
-	go inboxSvc.RunAttention(ctx, 15*time.Second)
 	log.Printf("toolyard: inbox ready (approval_mode=%s, judge=%v)",
 		settingsSvc.GetString(settings.ApprovalMode, settings.ApprovalModeExecute), inboxJudge != nil)
 
@@ -777,6 +794,15 @@ func runServe(argv []string) error {
 		return fmt.Errorf("secrets cipher: %w", err)
 	}
 	secretsSvc := secrets.New(db, secretsCipher, auditSvc)
+	callbackSvc := callbacks.New(db, secretsCipher)
+	inboxSvc.SetCallbacks(callbackSvc)
+	go inboxSvc.RunSweeper(ctx, time.Minute)
+	go inboxSvc.RunAttention(ctx, 15*time.Second)
+	go callbackSvc.Run(ctx)
+	federationSvc, err := federation.New(ctx, db, idSvc, secretsCipher)
+	if err != nil {
+		return fmt.Errorf("federation: %w", err)
+	}
 	upstreamSvc.SetSecrets(secretsSvc)
 
 	// Chat-approval notifications (Telegram). The Registry fans approval-bus
@@ -788,22 +814,9 @@ func runServe(argv []string) error {
 		return settingsSvc.GetBoolDefault(settings.ChatIncludeDetails, true)
 	})
 	telegramSvc := telegram.New(telegram.Options{
-		Settings: settingsSvc,
-		Cipher:   secretsCipher,
-		Decide: func(ctx context.Context, id, action, decidedBy string) (string, bool, error) {
-			// The paired Telegram user is the instrument and the only
-			// identity recorded: nothing links a Telegram id to a
-			// toolyard user, so no person is attributed. See
-			// telegramDecider.
-			req, derr := bus.DecideAs(ctx, id, action, telegramDecider(decidedBy))
-			if derr != nil {
-				if errors.Is(derr, approval.ErrNotPending) {
-					return "", true, nil
-				}
-				return "", false, derr
-			}
-			return req.Status, false, nil
-		},
+		Settings:  settingsSvc,
+		Cipher:    secretsCipher,
+		PublicURL: *publicURL,
 	})
 	chatRegistry.Register(telegramSvc)
 	bus.AddNotifier(chatRegistry)
@@ -862,6 +875,13 @@ func runServe(argv []string) error {
 		if err := importUpstreams(ctx, upstreamSvc, *upstreamConfig); err != nil {
 			log.Printf("import upstreams: %v", err)
 		}
+	}
+	// Recovery waits for the persistent upstream catalog and Inbox hooks. A
+	// previously claimed write stays unknown and is never dispatched again.
+	if n, err := bus.SweepUnexecuted(ctx); err != nil {
+		log.Printf("legacy execution: startup recovery: %v", err)
+	} else if n > 0 {
+		log.Printf("legacy execution: recovered %d unclaimed decisions", n)
 	}
 
 	// MemPalace: install (if needed), initialize palace dir, and register
@@ -1096,6 +1116,7 @@ func runServe(argv []string) error {
 
 	// REST API + dashboard.
 	apiSrv := api.New(ctx, api.Options{
+		Federation: federationSvc, Callbacks: callbackSvc,
 		BuildVersion: version, Environment: os.Getenv("TOOLYARD_ENVIRONMENT"),
 		Identity:                 idSvc,
 		Approval:                 bus,
@@ -1149,7 +1170,7 @@ func runServe(argv []string) error {
 	// guard, which also works out who raised the call (agent, owner,
 	// client, session) for the audit log. -require-auth-on-mcp
 	// (auto-enabled with -public-url) rejects anonymous traffic too.
-	mcpAuthn := mcpAuth{verify: idSvc.VerifyAgentToken, requireAuth: *requireAuthMCP, sec: secOpts}
+	mcpAuthn := mcpAuth{verify: federationSvc.VerifyAgent, requireAuth: *requireAuthMCP, sec: secOpts}
 	streamable := server.NewStreamableHTTPServer(gw.MCPServer(),
 		server.WithEndpointPath("/mcp"),
 		// Stateless mode is opt-in via -stateless-mcp. The default
@@ -1174,8 +1195,8 @@ func runServe(argv []string) error {
 		server.WithHTTPContextFunc(mcpAuthn.contextFunc),
 	)
 	// /mcp gets a larger body limit because tool-call args can be a few MB.
-	mux.Handle("/mcp", api.LimitBody(mcpAuthn.guard(streamable), 16<<20))
-	mux.Handle("/mcp/", api.LimitBody(mcpAuthn.guard(streamable), 16<<20))
+	mux.Handle("/mcp", api.LimitBody(gateway.PreserveToolCallNumbers(mcpAuthn.guard(streamable)), 16<<20))
+	mux.Handle("/mcp/", api.LimitBody(gateway.PreserveToolCallNumbers(mcpAuthn.guard(streamable)), 16<<20))
 
 	// pprof endpoints, gated to loopback. When toolyard hangs, run
 	//   curl -s http://127.0.0.1:<port>/debug/pprof/goroutine?debug=2

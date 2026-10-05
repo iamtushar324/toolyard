@@ -1,6 +1,7 @@
 package inbox
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
@@ -65,13 +66,15 @@ const (
 // inbox.post. Params stay raw here so a bad constraint is reported with
 // its path instead of failing the whole decode.
 type Submission struct {
-	SchemaVersion   int          `json:"schema_version,omitempty"`
-	ClientRequestID string       `json:"client_request_id,omitempty"`
-	Prompt          string       `json:"prompt,omitempty"`
-	Context         string       `json:"context,omitempty"`
-	Question        *Question    `json:"question,omitempty"`
-	Task            *TaskContext `json:"task,omitempty"`
-	Blocking        bool         `json:"blocking,omitempty"`
+	CallbackRef       string       `json:"callback_ref,omitempty"`
+	PendingTTLSeconds int          `json:"pending_ttl_seconds,omitempty"`
+	SchemaVersion     int          `json:"schema_version,omitempty"`
+	ClientRequestID   string       `json:"client_request_id,omitempty"`
+	Prompt            string       `json:"prompt,omitempty"`
+	Context           string       `json:"context,omitempty"`
+	Question          *Question    `json:"question,omitempty"`
+	Task              *TaskContext `json:"task,omitempty"`
+	Blocking          bool         `json:"blocking,omitempty"`
 
 	Kind        string           `json:"kind,omitempty"`
 	SessionID   string           `json:"session_id,omitempty"`
@@ -91,11 +94,18 @@ type Submission struct {
 
 // SubmissionTool is one tool in a Submission.
 type SubmissionTool struct {
-	Tool     string         `json:"tool"`
-	Required bool           `json:"required"`
-	Summary  string         `json:"summary"`
-	Params   map[string]any `json:"params"`
-	After    []string       `json:"after,omitempty"`
+	CallID          string         `json:"call_id"`
+	Target          string         `json:"target"`
+	ExpectedEffects string         `json:"expected_effects"`
+	Operation       string         `json:"operation"`
+	AffectedScope   string         `json:"affected_scope,omitempty"`
+	MaterialRisks   string         `json:"material_risks,omitempty"`
+	Undo            string         `json:"undo,omitempty"`
+	Tool            string         `json:"tool"`
+	Required        bool           `json:"required"`
+	Summary         string         `json:"summary"`
+	Params          map[string]any `json:"params"`
+	After           []string       `json:"after,omitempty"`
 }
 
 // DecodeSubmission decodes a Submission from a generic map (MCP arguments).
@@ -105,7 +115,9 @@ func DecodeSubmission(args map[string]any) (*Submission, error) {
 		return nil, err
 	}
 	var s Submission
-	if err := json.Unmarshal(b, &s); err != nil {
+	dec := json.NewDecoder(bytes.NewReader(b))
+	dec.UseNumber()
+	if err := dec.Decode(&s); err != nil {
 		return nil, fmt.Errorf("request isn't in the expected shape: %v", err)
 	}
 	return &s, nil
@@ -138,6 +150,7 @@ func Validate(ctx context.Context, cat Catalog, agentID string, s *Submission, o
 	warn := func(path, format string, a ...any) { warns = append(warns, Problem{path, fmt.Sprintf(format, a...)}) }
 
 	r := &Request{
+		CallbackRef: s.CallbackRef, ExecutionMode: "agent", PendingTTLSeconds: s.PendingTTLSeconds,
 		SchemaVersion: s.SchemaVersion, Revision: 1, ClientRequestID: s.ClientRequestID, Question: s.Question, Task: s.Task, Blocking: s.Blocking,
 		Kind:       s.Kind,
 		SessionID:  strings.TrimSpace(s.SessionID),
@@ -188,8 +201,13 @@ func Validate(ctx context.Context, cat Catalog, agentID string, s *Submission, o
 		}
 	}
 
-	// Facts: required for access requests.
+	// Facts and task objective: required for access requests.
 	if r.Kind == KindAccess {
+		if r.Task == nil {
+			add("task.objective", "missing; explain the task this batch advances")
+		} else {
+			checkText(add, "task.objective", r.Task.Objective, MaxFact, "Explain the task this batch advances.")
+		}
 		if r.Facts == nil {
 			add("facts", "missing; give why_now, if_it_goes_wrong and undo")
 		} else {
@@ -213,11 +231,11 @@ func Validate(ctx context.Context, cat Catalog, agentID string, s *Submission, o
 		}
 		names := map[string]bool{}
 		for _, st := range s.Tools {
-			names[strings.TrimSpace(st.Tool)] = true
+			names[st.CallID] = true
 		}
 		for i, st := range s.Tools {
 			p := fmt.Sprintf("tools[%d]", i)
-			tr := ToolRequest{Tool: strings.TrimSpace(st.Tool), Required: st.Required, Summary: strings.TrimSpace(st.Summary), After: st.After, Params: map[string]Constraint{}}
+			tr := ToolRequest{CallID: st.CallID, Target: strings.TrimSpace(st.Target), ExpectedEffects: strings.TrimSpace(st.ExpectedEffects), Operation: st.Operation, AffectedScope: strings.TrimSpace(st.AffectedScope), MaterialRisks: strings.TrimSpace(st.MaterialRisks), Undo: strings.TrimSpace(st.Undo), Tool: strings.TrimSpace(st.Tool), Required: st.Required, Summary: strings.TrimSpace(st.Summary), After: st.After, Params: map[string]Constraint{}}
 			if tr.Tool == "" {
 				add(p+".tool", "missing")
 			} else if cat != nil {
@@ -232,24 +250,47 @@ func Validate(ctx context.Context, cat Catalog, agentID string, s *Submission, o
 					warn(p+".tool", "%q doesn't need permission; you can call it directly.", tr.Tool)
 				}
 			}
+			validateCallContext(add, p, &tr)
 			checkText(add, p+".summary", tr.Summary, MaxToolSummary, "Say in plain words what this call will do.")
 			for name, raw := range st.Params {
+				if !browserNumbersSafe(raw) {
+					add(p+".params."+name, "numeric scope exceeds supported browser precision; use a tool with string identifiers or supported numeric bounds")
+					continue
+				}
 				c, err := ParseConstraint(raw)
 				if err != nil {
 					add(p+".params."+name, "%v", err)
+					continue
+				}
+				if c.Op == "any" || c.Op == "limit" && c.Pattern == "" {
+					add(p+".params."+name, "unbounded scope; provide an exact value or enforced bounded constraint")
 					continue
 				}
 				tr.Params[name] = c
 			}
 			for j, a := range tr.After {
 				if !names[a] {
-					add(fmt.Sprintf("%s.after[%d]", p, j), "%q isn't one of the tools in this request", a)
+					add(fmt.Sprintf("%s.after[%d]", p, j), "%q isn't one of the call IDs in this request", a)
 				}
 			}
 			r.Tools = append(r.Tools, tr)
 		}
+		validateCallIDs(add, r.Tools)
+		if validator, ok := cat.(ScopeValidator); ok {
+			for i, t := range r.Tools {
+				for _, problem := range validator.ValidateScope(ctx, agentID, t) {
+					add(fmt.Sprintf("tools[%d].%s", i, problem.Path), "%s", problem.Message)
+				}
+			}
+		}
 		if len(s.Options) > 0 {
 			add("options", "options are for inbox.ask; an access request lists tools")
+		}
+		if r.PendingTTLSeconds == 0 {
+			r.PendingTTLSeconds = int(RequestTTL.Seconds())
+		}
+		if r.PendingTTLSeconds < MinTTL || r.PendingTTLSeconds > 7*86400 {
+			add("pending_ttl_seconds", "must be between 60 and 604800 seconds")
 		}
 		switch {
 		case r.TTLSeconds == 0:
@@ -283,7 +324,17 @@ func Validate(ctx context.Context, cat Catalog, agentID string, s *Submission, o
 	return r, probs, warns
 }
 
+// checkText validates required agent narrative, including known placeholders.
 func checkText(add func(string, string, ...any), path, v string, max int, hint string) {
+	checkBoundedText(add, path, v, max, hint)
+	if v != "" && utf8.RuneCountInString(v) <= max && isPlaceholder(v) {
+		add(path, "placeholder text; replace it with concrete task information")
+	}
+}
+
+// Choice labels are user answers, not explanations. "None" and "Test" can
+// be meaningful choices and still require nonempty, bounded text.
+func checkBoundedText(add func(string, string, ...any), path, v string, max int, hint string) {
 	n := utf8.RuneCountInString(v)
 	switch {
 	case n == 0:
@@ -401,5 +452,73 @@ func checkMediaURL(add func(string, string, ...any), path, raw string, allowPriv
 	}
 	if ip := net.ParseIP(host); ip != nil && !publicIP(ip) {
 		add(path, "%s is a private or local address, which toolyard won't fetch", host)
+	}
+}
+
+// ScopeValidator optionally validates call parameters against the actual tool schema.
+type ScopeValidator interface {
+	ValidateScope(context.Context, string, ToolRequest) []Problem
+}
+
+func isPlaceholder(v string) bool {
+	x := strings.ToLower(strings.TrimSpace(v))
+	if strings.HasPrefix(x, "<") && strings.HasSuffix(x, ">") {
+		return true
+	}
+	switch x {
+	case "todo", "tbd", "n/a", "na", "placeholder", "test", "testing", "...", "reason", "purpose", "safe", "none":
+		return true
+	}
+	return false
+}
+func validateCallContext(add func(string, string, ...any), p string, t *ToolRequest) {
+	checkText(add, p+".target", t.Target, MaxFact, "Name the exact resource or bounded target.")
+	checkText(add, p+".expected_effects", t.ExpectedEffects, MaxFact, "Describe the expected effects.")
+	if t.Operation != "read" && t.Operation != "write" {
+		add(p+".operation", "use read or write")
+	}
+	if t.Operation != "read" {
+		checkText(add, p+".affected_scope", t.AffectedScope, MaxFact, "Name what changes.")
+		checkText(add, p+".material_risks", t.MaterialRisks, MaxFact, "Describe concrete risks.")
+		checkText(add, p+".undo", t.Undo, MaxFact, "Give a concrete undo path or state the action cannot be undone.")
+	}
+}
+func validateCallIDs(add func(string, string, ...any), tools []ToolRequest) {
+	ids := map[string]int{}
+	validID := regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.:-]{0,79}$`)
+	for i, t := range tools {
+		if !validID.MatchString(t.CallID) {
+			add(fmt.Sprintf("tools[%d].call_id", i), "give a stable ID with 1-80 letters, digits, dots, colons, underscores or hyphens")
+		}
+		if _, ok := ids[t.CallID]; ok {
+			add(fmt.Sprintf("tools[%d].call_id", i), "duplicate call ID; repeated tools need distinct call IDs")
+		}
+		ids[t.CallID] = i
+	}
+	states := map[string]int{}
+	var visit func(string) bool
+	visit = func(id string) bool {
+		if states[id] == 1 {
+			return true
+		}
+		if states[id] == 2 {
+			return false
+		}
+		states[id] = 1
+		if i, ok := ids[id]; ok {
+			for _, dep := range tools[i].After {
+				if _, ok := ids[dep]; ok && visit(dep) {
+					return true
+				}
+			}
+		}
+		states[id] = 2
+		return false
+	}
+	for _, t := range tools {
+		if visit(t.CallID) {
+			add("tools.after", "dependency cycle; use an acyclic graph of call IDs")
+			break
+		}
 	}
 }

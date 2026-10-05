@@ -58,7 +58,9 @@ import (
 	"github.com/tusharbhardwaj/toolyard/internal/approval"
 	"github.com/tusharbhardwaj/toolyard/internal/audit"
 	"github.com/tusharbhardwaj/toolyard/internal/autoapproval"
+	"github.com/tusharbhardwaj/toolyard/internal/callbacks"
 	"github.com/tusharbhardwaj/toolyard/internal/clerk"
+	"github.com/tusharbhardwaj/toolyard/internal/federation"
 	"github.com/tusharbhardwaj/toolyard/internal/gateway"
 	"github.com/tusharbhardwaj/toolyard/internal/hooks"
 	"github.com/tusharbhardwaj/toolyard/internal/identity"
@@ -91,6 +93,8 @@ const (
 )
 
 type Server struct {
+	federation   *federation.Service
+	callbacks    *callbacks.Service
 	buildVersion string
 	environment  string
 	identity     *identity.Service
@@ -153,6 +157,8 @@ type Server struct {
 }
 
 type Options struct {
+	Federation   *federation.Service
+	Callbacks    *callbacks.Service
 	BuildVersion string
 	Environment  string
 	Identity     *identity.Service
@@ -299,6 +305,22 @@ func New(ctx context.Context, opts Options) *Server {
 		s.clerkFrontendAPI = opts.Clerk.FrontendAPI()
 	}
 	s.connect = newConnectT3(opts.Clerk, opts.ConnectAZP)
+	s.federation, s.callbacks = opts.Federation, opts.Callbacks
+	if s.federation != nil {
+		s.federation.Membership = func(ctx context.Context, subject string) (federation.Profile, error) {
+			if s.clerk == nil {
+				return federation.Profile{}, federation.ErrUnavailable
+			}
+			member, err := s.clerk.OrgMembership(ctx, subject)
+			if errors.Is(err, clerk.ErrNotMember) {
+				return federation.Profile{}, federation.ErrNotMember
+			}
+			if err != nil {
+				return federation.Profile{}, federation.ErrUnavailable
+			}
+			return federation.Profile{Email: member.Email, Name: clerkDisplayName(member), Avatar: member.ImageURL}, nil
+		}
+	}
 	// Sweep stale throttle buckets periodically. Tied to ctx so the
 	// goroutine exits on shutdown instead of leaking (precedent:
 	// approval.New).
@@ -323,6 +345,7 @@ func New(ctx context.Context, opts Options) *Server {
 func (s *Server) SecurityOpts() SecurityOptions { return s.security }
 
 func (s *Server) Routes(mux *http.ServeMux) {
+	s.federationRoutes(mux)
 	mux.HandleFunc("/v1/health", s.health)
 	mux.HandleFunc("/v1/auth/setup", s.authSetup)
 	mux.HandleFunc("/v1/auth/login", s.authLogin)
