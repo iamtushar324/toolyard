@@ -104,10 +104,17 @@ func (g *Guide) Topic(topic string) (string, bool) {
 			note = strings.TrimSpace(g.hosting())
 		}
 		if note == "" {
-			note = "Your owner hasn't said where to host files. Use a link that already exists and is public (a CI artifact, a PR attachment, object storage), send the evidence as data instead (table, chart, diff, log), or ask with inbox.ask."
+			note = "Your owner hasn't said where to host files. You don't need a host: upload local files with inbox.upload, or use a link that already exists and is public (a CI artifact, a PR attachment, object storage), or send the evidence as data instead (table, chart, diff, log)."
 		}
-		return "## Hosting media\n\n" + note, true
+		return "## Hosting media\n\n" + uploadHowTo + "\n\n" + note, true
 	}
 	s, ok := g.sections[t]
 	return s, ok
 }
+
+// uploadHowTo opens the hosting topic: native uploads need no host.
+const uploadHowTo = "Preferred for screenshots, diagrams and recordings you hold locally: call inbox.upload " +
+	"{name, content_type, size, sha256, kind}, PUT the exact bytes to the returned upload_url within 15 minutes " +
+	"(curl -sf -X PUT -H 'Content-Type: image/png' --data-binary @shot.png '<upload_url>'), then cite " +
+	"{\"type\": \"image\", \"upload\": \"upload:<sha256>\", \"alt\": \"...\"}. The URL works once; never share it. " +
+	"https links (url) still work for files that are already public."

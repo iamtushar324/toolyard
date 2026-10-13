@@ -43,7 +43,11 @@ rejected call or widen an accepted call's scope.
 Use `title` at most 60 characters and `summary` at most 200 characters. An optional
 `audio.script` is at most 75 words, in first person, without IDs, hashes or URLs.
 Use structured `table`, `chart`, `diff`, `code`, `log`, `markdown`, or `link`
-attachments for evidence. Linked media uses HTTPS. Keep all context consistent.
+attachments for evidence. For a screenshot, diagram, recording or file you
+hold locally, call `inbox.upload` (name, content_type, size, sha256, kind),
+`PUT` the bytes with the returned `curl` command within 15 minutes, and cite
+`{"type": "image", "upload": "upload:<sha256>", "alt": "…"}`. Linked media
+(`url`) uses HTTPS. Keep all context consistent.
 Server field validation does not prove the explanation is true.
 
 ## Submit and continue

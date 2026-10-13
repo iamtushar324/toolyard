@@ -7,6 +7,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/tusharbhardwaj/toolyard/internal/inbox"
 )
 
 // SecurityOptions tunes the public-host hardening middleware.
@@ -39,21 +41,36 @@ func (o SecurityOptions) IsBehindHTTPS(r *http.Request) bool {
 }
 
 // ClientIP returns the apparent client IP, honoring X-Forwarded-For only
-// when the immediate peer is in TrustedProxies. Falls back to RemoteAddr.
+// when the immediate peer is in TrustedProxies. A client can put anything
+// in the header it sends, and each proxy appends the address it saw, so
+// the chain is read from the right: the first address that is not itself
+// a trusted proxy is the client. An unparsable hop stops the walk and
+// yields "" (unknown), never the proxy's own address. Without a trusted
+// peer it is RemoteAddr.
 func (o SecurityOptions) ClientIP(r *http.Request) string {
-	if o.proxyTrusted(r) {
-		if v := r.Header.Get("X-Forwarded-For"); v != "" {
-			// First entry is the original client per spec.
-			parts := strings.Split(v, ",")
-			ip := strings.TrimSpace(parts[0])
-			if ip != "" {
-				return ip
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		host = r.RemoteAddr
+	}
+	if !o.proxyTrusted(r) {
+		return host
+	}
+	var hops []string
+	for _, v := range r.Header.Values("X-Forwarded-For") {
+		for _, p := range strings.Split(v, ",") {
+			if p = strings.TrimSpace(p); p != "" {
+				hops = append(hops, p)
 			}
 		}
 	}
-	host, _, err := net.SplitHostPort(r.RemoteAddr)
-	if err != nil {
-		return r.RemoteAddr
+	for i := len(hops) - 1; i >= 0; i-- {
+		ip := net.ParseIP(hops[i])
+		if ip == nil {
+			return ""
+		}
+		if !o.ipTrusted(ip) || i == 0 {
+			return ip.String()
+		}
 	}
 	return host
 }
@@ -76,6 +93,10 @@ func (o SecurityOptions) proxyTrusted(r *http.Request) bool {
 	if ip == nil {
 		return false
 	}
+	return o.ipTrusted(ip)
+}
+
+func (o SecurityOptions) ipTrusted(ip net.IP) bool {
 	for _, c := range o.TrustedProxies {
 		if c.Contains(ip) {
 			return true
@@ -84,10 +105,24 @@ func (o SecurityOptions) proxyTrusted(r *http.Request) bool {
 	return false
 }
 
-// IsLoopback reports whether the client address (after trusted-proxy
-// resolution) is on loopback.
+// IsLoopback reports whether the request comes straight from loopback:
+// the TCP peer is a loopback address and no proxy header claims another
+// client. It deliberately ignores TrustedProxies and ClientIP: a trusted
+// range can hold other local containers (production trusts a docker
+// range), and any of them could send X-Forwarded-For: 127.0.0.1.
 func (o SecurityOptions) IsLoopback(r *http.Request) bool {
-	host := o.ClientIP(r)
+	return DirectLoopback(r)
+}
+
+// DirectLoopback is IsLoopback without options (used for /debug/pprof).
+func DirectLoopback(r *http.Request) bool {
+	if len(r.Header.Values("X-Forwarded-For")) > 0 || len(r.Header.Values("Forwarded")) > 0 || r.Header.Get("X-Real-Ip") != "" {
+		return false
+	}
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		host = r.RemoteAddr
+	}
 	ip := net.ParseIP(host)
 	return ip != nil && ip.IsLoopback()
 }
@@ -263,12 +298,20 @@ func LimitBody(next http.Handler, maxBytes int64) http.Handler {
 // which case that (larger) limit applies. This lets the memory-webhook ingest
 // route accept large payloads while every other route stays clamped tight —
 // without the override the outer ceiling would bind below the configured
-// webhook cap.
+// webhook cap. An override key ending in "/" applies to every path under it.
 func LimitBodyByPath(next http.Handler, defaultMax int64, overrides map[string]int64) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		max := defaultMax
 		if v, ok := overrides[r.URL.Path]; ok && v > 0 {
 			max = v
+		} else {
+			// A key ending in "/" covers its subtree (e.g. /v1/uploads/).
+			for k, v := range overrides {
+				if v > 0 && strings.HasSuffix(k, "/") && strings.HasPrefix(r.URL.Path, k) {
+					max = v
+					break
+				}
+			}
 		}
 		if r.Body != nil {
 			r.Body = http.MaxBytesReader(w, r.Body, max)
@@ -346,7 +389,7 @@ func (s *Server) HardenAPI(next http.Handler) http.Handler {
 			// one browser form on the API, a connect link's Continue
 			// button (connect_link_routes.go), posts form-encoded and
 			// proves itself with a nonce cookie instead.
-			if r.ContentLength != 0 && !strings.HasPrefix(path, connectLinkPath) && path != hostAuthorizePath {
+			if r.ContentLength != 0 && !strings.HasPrefix(path, connectLinkPath) && path != hostAuthorizePath && !strings.HasPrefix(path, uploadsPathPrefix) {
 				ct := r.Header.Get("Content-Type")
 				if ct == "" {
 					writeError(w, http.StatusUnsupportedMediaType, "Content-Type required")
@@ -387,6 +430,8 @@ func perRouteBodyCap(path string) int64 {
 	case strings.HasPrefix(path, "/v1/tools/run"),
 		strings.HasPrefix(path, "/v1/agents/tools/run"):
 		return 4 << 20 // 4 MiB — tool arguments can be substantial
+	case strings.HasPrefix(path, uploadsPathPrefix):
+		return inbox.MaxVideoBytes // native Inbox upload; the handler caps it again at the ticket's exact size
 	case strings.HasPrefix(path, "/v1/memory"):
 		return 1 << 20 // 1 MiB — memory.set values
 	case strings.HasPrefix(path, "/v1/mempalace/ingest"):
@@ -426,6 +471,11 @@ func perRouteBodyCap(path string) int64 {
 func exemptFromCSRFHeader(path string) bool {
 	// These endpoints authenticate signed assertions or agent bearers only.
 	if strings.HasPrefix(path, "/v1/federation/") || strings.HasPrefix(path, "/v1/callbacks/") || localConnectionPath(path) || hostProtocolPath(path) {
+		return true
+	}
+	// A native Inbox upload is a curl PUT authenticated by the single-use
+	// ticket in its path; no cookie is read, so it isn't CSRF-replayable.
+	if strings.HasPrefix(path, uploadsPathPrefix) {
 		return true
 	}
 	// Webhook event ingest is bearer-authenticated (source token); no cookie
@@ -525,6 +575,10 @@ func unauthRouteLimit(path string) *unauthRouteRule {
 		// once-per-second polling of an in-flight job is comfortable, while
 		// still capping spray on this bearer-authenticated DB-backed lookup.
 		return &unauthRouteRule{"mem-job", 6000, time.Hour}
+	case strings.HasPrefix(path, uploadsPathPrefix):
+		// Native Inbox uploads: the ticket is 256 random bits, so this caps
+		// spray, not guessing; agents upload a few files per request.
+		return &unauthRouteRule{"upload", 600, time.Hour}
 	case strings.HasPrefix(path, connectLinkPath):
 		// Connect links: a person opens a handful per hour at most. The
 		// ticket is 256 random bits, so this caps spray, not guessing.

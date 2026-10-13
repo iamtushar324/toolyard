@@ -246,9 +246,9 @@ phone and readable in both themes.
 | `diff` | `file`, `patch` (unified diff) | the core of a code change; keep it to the part that matters |
 | `code` | `file`, `language`, `body` | a migration, a config change |
 | `log` | `title`, `body` | terminal output, error messages |
-| `image` | `url`, `alt` | screenshots |
-| `video` | `url`, `poster_url?` | screen recordings of the thing working (MP4 H.264, ≤ 2 min) |
-| `file` | `url`, `name` | CSVs, reports |
+| `image` | `upload` or `url`, `alt` | screenshots, diagrams |
+| `video` | `upload` or `url`, `poster_upload?` or `poster_url?` | screen recordings of the thing working (MP4 H.264, ≤ 2 min) |
+| `file` | `upload` or `url`, `name` | CSVs, reports |
 | `link` | `label`, `url` | PRs, CI runs, dashboards |
 
 Every attachment takes an optional **`caption`**: one first-person sentence
@@ -256,14 +256,32 @@ on why it matters ("I replayed a failing delivery. It retried twice and got
 through."). A chart takes an optional **`spoken`** phrase: the words your
 voice note uses for it.
 
-**Media is sent as links.**
-- `image`, `video` and `file` take an `https` URL that toolyard can reach.
+**Upload media you hold locally (preferred for screenshots and diagrams).**
+You don't need a public host:
+
+1. Call `inbox.upload` with `name`, `content_type`, `size` (bytes), `sha256`
+   (64 lowercase hex, from `sha256sum`) and `kind` (`image` default, `video`,
+   `file`). It returns `upload_url`, `ref` and a ready `curl` command.
+2. `PUT` the exact bytes to `upload_url` within 15 minutes:
+   `curl -sf -X PUT -H 'Content-Type: image/png' --data-binary @shot.png '<upload_url>'`.
+   The URL works once and is the credential: never paste it anywhere else.
+   Toolyard checks the size, the sha256 and the real file type (an image must
+   really be PNG, JPEG, WebP or GIF).
+3. Cite the ref instead of a URL:
+   `{ "type": "image", "upload": "upload:<sha256>", "alt": "Checkout after the fix" }`.
+   For a video poster use `poster_upload`.
+
+Give exactly one of `url` or `upload`. Only you can cite your uploads. An
+upload no request cites within 24 hours is deleted. If you already uploaded
+the same bytes, `inbox.upload` answers `already_uploaded: true` with the ref.
+
+**Or send media as links.**
+- `image`, `video` and `file` also take an `https` URL that toolyard can reach.
 - Toolyard **fetches each link once when you send the request, and keeps a
   copy**, so it still works after your sandbox is gone.
-- A `localhost` or private-network URL fails the dry run.
-- Limits: image 10 MB, video 50 MB, file 25 MB.
-- If you have nowhere to host a file, ask your owner which store to upload to
-  (`inbox.guide({ "topic": "hosting" })`).
+- A `localhost` or private-network URL fails the dry run: upload it instead.
+- Limits (both ways): image 10 MB, video 50 MB, file 25 MB.
+- `inbox.guide({ "topic": "hosting" })` has your owner's note on hosting.
 
 ## 7. Urgency is a promise
 

@@ -71,6 +71,9 @@ func (s *Service) recordDecisionAuditTx(ctx context.Context, tx *sql.Tx, r *Requ
 // BlobBelongsToAgent checks evidence ownership before an authenticated download.
 func (s *Service) BlobBelongsToAgent(ctx context.Context, agentID, sha string) bool {
 	var found int
+	if s.db.QueryRowContext(ctx, `SELECT 1 FROM inbox_uploads WHERE agent_id=? AND sha256=?`, agentID, sha).Scan(&found) == nil && found == 1 {
+		return true
+	}
 	err := s.db.QueryRowContext(ctx, `SELECT 1 FROM inbox_requests r,json_tree(r.doc) j WHERE r.agent_id=? AND j.key IN ('blob','poster_blob') AND j.type='text' AND j.value=? LIMIT 1`, agentID, sha).Scan(&found)
 	return err == nil && found == 1
 }

@@ -108,6 +108,19 @@ type Service struct {
 	attnMu       sync.Mutex // one attention round (Tick / dispatch) at a time
 	voiceMu      sync.Mutex
 	voiceFlights map[string]*voiceFlight
+	// uploadSlots bounds concurrent upload bodies (AcquireUploadSlot);
+	// agentUploads counts them per agent (AcquireAgentUploadSlot).
+	uploadSlots    chan struct{}
+	agentUploadsMu sync.Mutex
+	agentUploads   map[string]int
+	// uploadMu serializes the blob-file steps of uploads and the upload
+	// sweep (adopt+record, failure cleanup, sweep tx+file delete), so a
+	// sweep can never delete a file a new upload of the same sha just
+	// adopted.
+	uploadMu sync.Mutex
+	// uploadRecordHook, when set (tests), runs before an upload is
+	// recorded; an error simulates a failed store.
+	uploadRecordHook func() error
 }
 
 // New creates the service and loads (or creates) the grant signing key.
@@ -120,7 +133,7 @@ func New(ctx context.Context, opts Options) (*Service, error) {
 	if now == nil {
 		now = time.Now
 	}
-	service := &Service{db: opts.DB, opts: opts, signer: signer, now: now, watch: map[string]chan struct{}{}}
+	service := &Service{db: opts.DB, opts: opts, signer: signer, now: now, watch: map[string]chan struct{}{}, uploadSlots: make(chan struct{}, MaxConcurrentUploads), agentUploads: map[string]int{}}
 	if _, err := service.RecoverExecutions(ctx); err != nil {
 		return nil, fmt.Errorf("execution recovery: %w", err)
 	}
@@ -271,6 +284,7 @@ func (s *Service) Submit(ctx context.Context, agentID string, sub *Submission) (
 			res.Problems = append(res.Problems, Problem{"request_id", ErrRelatedNotYours.Error()})
 		}
 	}
+	s.resolveUploads(ctx, agentID, r, &res.Problems)
 
 	if sub.DryRun {
 		if n, err := s.countDryRuns(ctx, agentID, time.Hour); err == nil && n >= DryRunsPerHour {
@@ -430,12 +444,22 @@ func (s *Service) checkMedia(ctx context.Context, r *Request, probs *[]Problem, 
 		if a.Type != "image" && a.Type != "video" && a.Type != "file" {
 			continue
 		}
+		// Native uploads are resolved in Submit, without the network.
+		needMain := a.Upload == ""
+		needPoster := a.Type == "video" && a.PosterURL != "" && a.PosterUpload == ""
+		if !needMain && !needPoster {
+			continue
+		}
 		wg.Add(1)
 		go func(i int, a *Attachment) {
 			defer wg.Done()
-			sha, ct, size, err := s.opts.Fetcher.Snapshot(ctx, a.URL, a.Type)
-			var perr error
-			if err == nil && a.Type == "video" && a.PosterURL != "" {
+			var sha, ct string
+			var size int64
+			var err, perr error
+			if needMain {
+				sha, ct, size, err = s.opts.Fetcher.Snapshot(ctx, a.URL, a.Type)
+			}
+			if err == nil && needPoster {
 				psha, _, _, e := s.opts.Fetcher.Snapshot(ctx, a.PosterURL, "image")
 				if e == nil {
 					a.PosterBlob = psha
@@ -450,7 +474,9 @@ func (s *Service) checkMedia(ctx context.Context, r *Request, probs *[]Problem, 
 				*probs = append(*probs, Problem{fmt.Sprintf("attachments[%d].url", i), err.Error()})
 				return
 			}
-			a.Blob, a.ContentType, a.Size = sha, ct, size
+			if needMain {
+				a.Blob, a.ContentType, a.Size = sha, ct, size
+			}
 			if perr != nil {
 				*probs = append(*probs, Problem{fmt.Sprintf("attachments[%d].poster_url", i), perr.Error()})
 			}
@@ -1348,7 +1374,8 @@ func sortStrings(xs []string) { sort.Strings(xs) }
 
 // ---- housekeeping ----------------------------------------------------------------
 
-// Sweep expires stale requests and grants.
+// Sweep expires stale requests and grants, and removes upload tickets
+// and uploads that are no longer needed.
 func (s *Service) Sweep(ctx context.Context) {
 	now := s.now().UnixMilli()
 	rows, err := s.db.QueryContext(ctx, `SELECT id FROM inbox_requests WHERE status = ? AND expires_at <= ?`, StatusPending, now)
@@ -1380,6 +1407,7 @@ func (s *Service) Sweep(ctx context.Context) {
 	if _, err := s.expireGrants(ctx); err != nil {
 		log.Printf("inbox: expire grants: %v", err)
 	}
+	s.sweepUploads(ctx)
 	_, _ = s.db.ExecContext(ctx, `DELETE FROM inbox_dry_runs WHERE created_at < ?`, s.now().Add(-48*time.Hour).UnixMilli())
 	_, _ = s.db.ExecContext(ctx, `DELETE FROM inbox_pushes WHERE sent_at IS NOT NULL AND sent_at < ?`, s.now().Add(-7*24*time.Hour).UnixMilli())
 	_, _ = s.db.ExecContext(ctx, `DELETE FROM inbox_digests WHERE sent_at < ?`, s.now().Add(-30*24*time.Hour).UnixMilli())
@@ -1415,6 +1443,11 @@ func (s *Service) insert(ctx context.Context, r *Request) error {
 		VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
 		r.ID, r.AgentID, nullStr(r.SessionID), r.Kind, r.Status, r.Urgency, nullStr(r.RelatedID), string(doc), r.CreatedAt, r.UpdatedAt, r.ExpiresAt)
 	if err != nil {
+		return err
+	}
+	// Cited uploads are marked in the same transaction, so the sweep can
+	// never delete an upload this request stores a reference to.
+	if err = s.markUploadsUsedTx(ctx, tx, r); err != nil {
 		return err
 	}
 	if s.opts.Callbacks != nil {

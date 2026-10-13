@@ -22,8 +22,15 @@ toolyard.example.com {
     }
 
     # Cap request body up front so we drop oversized uploads at the edge
-    # rather than after they hit the gateway.
-    request_body {
+    # rather than after they hit the gateway. Native Inbox uploads
+    # (PUT /v1/uploads/{ticket}, from inbox.upload) carry up to a 50 MB
+    # video; the gateway caps each one at its ticket's exact size.
+    @uploads path /v1/uploads/*
+    request_body @uploads {
+        max_size 53MB
+    }
+    @notUploads not path /v1/uploads/*
+    request_body @notUploads {
         max_size 16MB
     }
 

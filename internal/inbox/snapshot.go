@@ -48,7 +48,45 @@ func NewSnapshotter(db *store.DB, dir string) (*Snapshotter, error) {
 	}
 	s := &Snapshotter{dir: dir, db: db}
 	s.client = s.newClient()
+	// Leftovers of a crash mid-download or mid-upload.
+	s.CleanTemp(time.Hour)
 	return s, nil
+}
+
+// tempPrefixes name the temporary files Snapshot, Put and uploads create.
+var tempPrefixes = []string{"upload-", "fetch-", "put-"}
+
+// CleanTemp deletes temporary files in the blob directory last modified
+// more than olderThan ago and returns how many it removed. Blobs (named by
+// their sha256) are never touched.
+func (s *Snapshotter) CleanTemp(olderThan time.Duration) int {
+	entries, err := os.ReadDir(s.dir)
+	if err != nil {
+		return 0
+	}
+	cutoff := time.Now().Add(-olderThan)
+	n := 0
+	for _, e := range entries {
+		name := e.Name()
+		if e.IsDir() || blobName.MatchString(name) {
+			continue
+		}
+		temp := false
+		for _, p := range tempPrefixes {
+			temp = temp || strings.HasPrefix(name, p)
+		}
+		if !temp {
+			continue
+		}
+		info, err := e.Info()
+		if err != nil || !info.ModTime().Before(cutoff) {
+			continue
+		}
+		if os.Remove(filepath.Join(s.dir, name)) == nil {
+			n++
+		}
+	}
+	return n
 }
 
 func (s *Snapshotter) newClient() *http.Client {
@@ -267,4 +305,64 @@ func unwrapURLErr(err error) string {
 		return msg[i+2:]
 	}
 	return msg
+}
+
+// Exists reports whether a stored copy's bytes are on disk.
+func (s *Snapshotter) Exists(_ context.Context, sha string) bool {
+	if !blobName.MatchString(sha) {
+		return false
+	}
+	_, err := os.Stat(filepath.Join(s.dir, sha))
+	return err == nil
+}
+
+// Remove deletes a stored copy and its row. Callers decide that nothing
+// references it any more (see Service.sweepUploads).
+func (s *Snapshotter) Remove(ctx context.Context, sha string) error {
+	if !blobName.MatchString(sha) {
+		return ErrNotFound
+	}
+	if s.db != nil {
+		if _, err := s.db.ExecContext(ctx, `DELETE FROM inbox_blobs WHERE sha256 = ?`, sha); err != nil {
+			return err
+		}
+	}
+	if err := os.Remove(filepath.Join(s.dir, sha)); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return nil
+}
+
+// CreateUploadTemp opens a temporary file in the blob directory, so a
+// finished upload can be renamed into place without a copy.
+func (s *Snapshotter) CreateUploadTemp() (*os.File, error) {
+	return os.CreateTemp(s.dir, "upload-*")
+}
+
+// Adopt moves a verified temporary file into place as blob sha. created is
+// false when the blob already existed (the temporary file is removed).
+// It writes no row: the caller records inbox_blobs in its own transaction.
+func (s *Snapshotter) Adopt(tmpPath, sha string) (created bool, err error) {
+	if !blobName.MatchString(sha) || filepath.Dir(tmpPath) != filepath.Clean(s.dir) {
+		_ = os.Remove(tmpPath)
+		return false, ErrNotFound
+	}
+	dst := filepath.Join(s.dir, sha)
+	if _, err := os.Stat(dst); err == nil {
+		_ = os.Remove(tmpPath)
+		return false, nil
+	}
+	if err := os.Rename(tmpPath, dst); err != nil {
+		_ = os.Remove(tmpPath)
+		return false, err
+	}
+	return true, nil
+}
+
+// DiscardFile removes blob sha's file only (no row). Used to undo Adopt
+// when the transaction that would have recorded it fails.
+func (s *Snapshotter) DiscardFile(sha string) {
+	if blobName.MatchString(sha) {
+		_ = os.Remove(filepath.Join(s.dir, sha))
+	}
 }

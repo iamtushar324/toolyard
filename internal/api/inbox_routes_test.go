@@ -62,7 +62,8 @@ func newInboxAPIFixture(t *testing.T) *inboxAPIFixture {
 	t.Cleanup(func() { _ = gw.Close() })
 	pushes := &[]inbox.Push{}
 	pks := passkey.New(db)
-	svc, err := inbox.New(ctx, inbox.Options{DB: db, Catalog: gw, Passkeys: pks,
+	snaps, _ := inbox.NewSnapshotter(db, filepath.Join(dir, "blobs"))
+	svc, err := inbox.New(ctx, inbox.Options{DB: db, Catalog: gw, Passkeys: pks, Blobs: snaps,
 		Notify: func(_ context.Context, p inbox.Push) { *pushes = append(*pushes, p) }})
 	if err != nil {
 		t.Fatal(err)
@@ -71,7 +72,6 @@ func newInboxAPIFixture(t *testing.T) *inboxAPIFixture {
 	guide := inbox.NewGuide(nil)
 	gw.SetInbox(svc, guide, func() string { return gateway.ApprovalModeInbox })
 	gw.RegisterInboxTools()
-	snaps, _ := inbox.NewSnapshotter(db, filepath.Join(dir, "blobs"))
 
 	srv := New(ctx, Options{Identity: id, Audit: auditLog, Approval: bus, Gateway: gw, Inbox: svc, Snapshots: snaps, Guide: guide, Passkeys: pks,
 		SessionKey: []byte("0123456789abcdef0123456789abcdef")})

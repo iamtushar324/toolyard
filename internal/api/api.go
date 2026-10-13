@@ -444,6 +444,7 @@ func (s *Server) Routes(mux *http.ServeMux) {
 	s.operatorRoutes(mux)
 	s.voiceRoutes(mux)
 	s.inboxRoutes(mux)
+	s.uploadRoutes(mux)
 	s.passkeyRoutes(mux)
 	s.identityKeyRoutes(mux)
 }

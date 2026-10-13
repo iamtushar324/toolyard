@@ -169,6 +169,11 @@ func memberAllowed(method, path string) bool {
 	if strings.HasPrefix(path, "/v1/agents/approvals/") {
 		return true
 	}
+	// A native Inbox upload: the single-use ticket in the path is the
+	// credential (upload_routes.go); a cookie riding along changes nothing.
+	if ticket, ok := strings.CutPrefix(path, uploadsPathPrefix); ok {
+		return method == http.MethodPut && ticket != "" && !strings.Contains(ticket, "/")
+	}
 	// A one-time connect link an agent gave the member: GET shows the
 	// confirm page, POST (from that page) redeems the ticket and starts
 	// only that member's own sign-in (connect_link_routes.go).
