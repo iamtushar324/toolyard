@@ -120,7 +120,7 @@ func memberAllowlist() map[string]bool {
 		"POST /v1/connections/host/renew", "POST /v1/connections/host/revoke", "POST /v1/connections/host/handoff",
 		"GET /v1/me/servers", "GET /v1/push/vapid_key", "POST /v1/push/subscribe", "DELETE /v1/push/subscribe",
 		"GET /v1/approvals", "GET /v1/approvals/x", "POST /v1/approvals/x/decide",
-		"POST /v1/approvals/decide-batch", "POST /v1/approvals/decide-by-token", "GET /v1/events/stream",
+		"POST /v1/approvals/decide-batch", "POST /v1/approvals/decide-by-token",
 		"GET /v1/me/identity-key", "POST /v1/me/identity-key/reveal",
 		// My connections, and the OAuth return routes a member's own
 		// sign-in comes back through (the handlers check whose flow it is).

@@ -60,7 +60,6 @@ var memberRoutes = map[string]string{
 	"/v1/approvals":                 http.MethodGet,
 	"/v1/approvals/decide-batch":    http.MethodPost,
 	"/v1/approvals/decide-by-token": http.MethodPost,
-	"/v1/events/stream":             http.MethodGet,
 	"/v1/health":                    http.MethodGet,
 	"/v1/auth/me":                   http.MethodGet,
 	"/v1/auth/config":               http.MethodGet,
