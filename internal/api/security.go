@@ -144,7 +144,7 @@ const strictCSP = "default-src 'self'; " +
 	"worker-src 'self'; " +
 	"frame-ancestors 'none'; " +
 	"base-uri 'self'; " +
-	"form-action 'self'"
+	"form-action 'self' https://github.com"
 
 // isLoginDocument: the one page that loads Clerk. Hash routing keeps the
 // sign-in flow (including Clerk's SSO callback) on this document.

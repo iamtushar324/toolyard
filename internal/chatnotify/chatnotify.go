@@ -92,6 +92,10 @@ func (r *Registry) readyChannels() []Channel {
 
 // OnApproval implements approval.Notifier.
 func (r *Registry) OnApproval(ctx context.Context, req *approval.Request, eventType string) {
+	// Instance-wide chat channels must not expose a person's GitHub proposal.
+	if req.PersonalOwner() != "" {
+		return
+	}
 	switch eventType {
 	case "approval.create":
 		r.send(ctx, req)

@@ -95,6 +95,7 @@ const (
 type Server struct {
 	federation   *federation.Service
 	callbacks    *callbacks.Service
+	githubHTTP   *http.Client
 	buildVersion string
 	environment  string
 	identity     *identity.Service
@@ -360,6 +361,8 @@ func (s *Server) Routes(mux *http.ServeMux) {
 	mux.HandleFunc("/v1/users/", s.usersItem)
 	mux.HandleFunc("/v1/me/servers", s.meServers)
 	s.connectionRoutes(mux)
+	mux.HandleFunc("/v1/github/setup/begin", s.githubSetupBegin)
+	mux.HandleFunc("/v1/mcp-oauth/github-app", s.githubSetupCallback)
 
 	mux.HandleFunc("/v1/agents", s.agentsCollection)
 	mux.HandleFunc("/v1/agents/enroll", s.agentsEnroll)
@@ -981,7 +984,8 @@ func (s *Server) agentsExchange(w http.ResponseWriter, r *http.Request) {
 // ---- approvals -------------------------------------------------------------
 
 func (s *Server) approvalsList(w http.ResponseWriter, r *http.Request) {
-	if _, err := s.requireUser(r); err != nil {
+	u, err := s.requireUserFull(r)
+	if err != nil {
 		writeError(w, http.StatusUnauthorized, "unauthorized")
 		return
 	}
@@ -992,7 +996,7 @@ func (s *Server) approvalsList(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusInternalServerError, err.Error())
 			return
 		}
-		writeJSON(w, http.StatusOK, out)
+		writeJSON(w, http.StatusOK, visibleApprovals(out, u))
 	default:
 		limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
 		out, err := s.approval.Recent(r.Context(), limit)
@@ -1000,7 +1004,7 @@ func (s *Server) approvalsList(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusInternalServerError, err.Error())
 			return
 		}
-		writeJSON(w, http.StatusOK, out)
+		writeJSON(w, http.StatusOK, visibleApprovals(out, u))
 	}
 }
 
@@ -1020,13 +1024,18 @@ func (s *Server) approvalsOne(w http.ResponseWriter, r *http.Request) {
 	// push notification flow uses POST /v1/approvals/decide-by-token
 	// which keeps the token in the body.
 	if r.Method == http.MethodGet {
-		if _, err := s.requireUser(r); err != nil {
+		u, err := s.requireUserFull(r)
+		if err != nil {
 			writeError(w, http.StatusUnauthorized, "unauthorized")
 			return
 		}
 		req, err := s.approval.Get(r.Context(), id)
 		if err != nil {
 			writeError(w, http.StatusNotFound, err.Error())
+			return
+		}
+		if !approvalVisible(req, u) {
+			writeError(w, http.StatusNotFound, "approval not found")
 			return
 		}
 		writeJSON(w, http.StatusOK, req)
@@ -1043,6 +1052,15 @@ func (s *Server) approvalsDecide(w http.ResponseWriter, r *http.Request, id stri
 	u, err := s.requireUserFull(r)
 	if err != nil {
 		writeError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+	held, err := s.approval.Get(r.Context(), id)
+	if err != nil || !approvalVisible(held, u) {
+		writeError(w, http.StatusNotFound, "approval not found")
+		return
+	}
+	if held.PersonalOwner() != "" && isOperatorRequest(r) {
+		writeError(w, http.StatusForbidden, "GitHub requires a human decision")
 		return
 	}
 	var body struct{ Action string }
@@ -1107,6 +1125,15 @@ func (s *Server) approvalsDecideBatch(w http.ResponseWriter, r *http.Request) {
 	decider := s.batchDecider(r, u)
 	out := make([]result, 0, len(body.IDs))
 	for _, id := range body.IDs {
+		held, err := s.approval.Get(r.Context(), id)
+		if err != nil || !approvalVisible(held, u) {
+			out = append(out, result{ID: id, Error: "approval not found"})
+			continue
+		}
+		if held.PersonalOwner() != "" && isOperatorRequest(r) {
+			out = append(out, result{ID: id, Error: "GitHub requires a human decision"})
+			continue
+		}
 		req, err := s.approval.DecideAs(r.Context(), id, body.Action, decider)
 		switch {
 		case err == nil:
@@ -1144,6 +1171,10 @@ func (s *Server) approvalsDecideByToken(w http.ResponseWriter, r *http.Request) 
 		writeError(w, http.StatusBadRequest, verr.Error())
 		return
 	}
+	if held, err := s.approval.Get(r.Context(), id); err == nil && held.PersonalOwner() != "" && isOperatorRequest(r) {
+		writeError(w, http.StatusForbidden, "GitHub requires a human decision")
+		return
+	}
 	decider := actor.Decider{UserID: recipient, Via: actor.ViaPushToken}
 	if u, ok := s.sessionUser(r); ok {
 		decider = s.dashboardDecider(r, u, actor.ViaPushToken)
@@ -1171,7 +1202,8 @@ func (s *Server) approvalsDecideByToken(w http.ResponseWriter, r *http.Request) 
 // ---- audit -----------------------------------------------------------------
 
 func (s *Server) auditList(w http.ResponseWriter, r *http.Request) {
-	if _, err := s.requireUser(r); err != nil {
+	uid, err := s.requireUser(r)
+	if err != nil {
 		writeError(w, http.StatusUnauthorized, "unauthorized")
 		return
 	}
@@ -1185,17 +1217,18 @@ func (s *Server) auditList(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
-	writeJSON(w, http.StatusOK, out)
+	writeJSON(w, http.StatusOK, visibleAudit(out, uid))
 }
 
 // eventsStream pushes both approval lifecycle events and audit rows. The
 // dashboard subscribes once and demuxes by event type.
 func (s *Server) eventsStream(w http.ResponseWriter, r *http.Request) {
-	if _, err := s.requireUser(r); err != nil {
+	u, err := s.requireUserFull(r)
+	if err != nil {
 		writeError(w, http.StatusUnauthorized, "unauthorized")
 		return
 	}
-	s.hub.ServeSSE(w, r)
+	s.hub.ServeSSEFiltered(w, r, func(e realtime.Event) bool { return personalEventVisible(e, u) })
 }
 
 // ---- memory ----------------------------------------------------------------

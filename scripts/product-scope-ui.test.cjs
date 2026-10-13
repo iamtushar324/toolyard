@@ -109,3 +109,22 @@ test('host lists isolate members and discard a response after the authenticated 
   await h.run('loadHostConnections()');
   assert.equal(h.run("state.hostConnections.rows.some(h => h.agent_id === 'old-owner-agent')"), false);
 });
+
+test('members can open their owner approvals (Inbox) from desktop and mobile navigation', () => {
+  const h = harness();
+  h.context.location = { hash: '#agents' };
+  h.context.history = { pushState: (_state, _title, hash) => { h.context.location.hash = hash; } };
+  h.run("state.user = { id: 'member', role: 'member', email: 'member@example.test' }; state.route = 'agents'");
+  const tree = h.run("shell(el('div', {}, 'Member content'))");
+  const navigation = nodes(tree, 'nav');
+  assert.equal(navigation.length, 2);
+  for (const nav of navigation) {
+    const approval = nodes(nav, 'button').find(button => text(button).includes('Inbox'));
+    assert.ok(approval, 'owner approvals must remain reachable');
+    h.run("state.route = 'agents'");
+    approval.attrs.on.click();
+    assert.equal(h.run('state.route'), 'inbox');
+    assert.equal(h.context.location.hash, '#inbox');
+  }
+  assert.equal(h.run("routeAllowed('settings')"), false);
+});
