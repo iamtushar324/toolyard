@@ -359,6 +359,14 @@ func (s *Server) inboxDecide(w http.ResponseWriter, r *http.Request, uid, id str
 		writeError(w, http.StatusUnauthorized, "unauthorized")
 		return
 	}
+	// A personal GitHub write needs the owner in person, as on
+	// /v1/approvals: an operator token never decides it.
+	if isOperatorRequest(r) && s.approval != nil {
+		if held, e := s.approval.Get(r.Context(), id); e == nil && held.PersonalOwner() != "" {
+			writeError(w, http.StatusForbidden, "GitHub requires a human decision")
+			return
+		}
+	}
 	body.By = u.Label()
 	body.Decider = s.dashboardDecider(r, u, actor.ViaDashboard)
 	req, err := s.inbox.Decide(r.Context(), id, body)

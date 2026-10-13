@@ -137,7 +137,14 @@ func (s *Service) legacyDecisionTx(ctx context.Context, tx *sql.Tx, r *Request) 
 	if status == StatusApproved {
 		status = "allowed"
 	}
-	res, err := tx.ExecContext(ctx, `UPDATE approval_requests SET status=?,decided_by=?,decided_at=?,decided_via=?,decider_email=?,decider_name=?,decider_ref=? WHERE id=? AND status='pending'`, status, r.DecidedBy, r.DecidedAt, r.DeciderVia, r.DeciderEmail, r.DeciderName, r.DeciderRef, r.ID)
+	// The legacy executor compares decided_by with the owner's user id
+	// (Gateway.Execute for personal GitHub writes), so record it the way
+	// the approval bus does rather than the display label.
+	decidedBy := r.DecidedBy
+	if r.DeciderUserID != "" {
+		decidedBy = r.Decider().Legacy()
+	}
+	res, err := tx.ExecContext(ctx, `UPDATE approval_requests SET status=?,decided_by=?,decided_at=?,decided_via=?,decider_email=?,decider_name=?,decider_ref=? WHERE id=? AND status='pending'`, status, decidedBy, r.DecidedAt, r.DeciderVia, r.DeciderEmail, r.DeciderName, r.DeciderRef, r.ID)
 	if err != nil {
 		return err
 	}

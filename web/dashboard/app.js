@@ -376,7 +376,7 @@ async function refetchCore() {
       isAdmin() ? api('/v1/audit?' + auditServerParams({ limit: '50' }).toString()) : Promise.resolve([]),
     ]);
     state.approvals = pendings || [];
-    if (isAdmin()) loadInbox();
+    loadInbox();
     const fresh = audits || [];
     const seen = new Set(fresh.map((a) => a.id));
     state.audit = fresh.concat((state.audit || []).filter((a) => !seen.has(a.id))).slice(0, 200);

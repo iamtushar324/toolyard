@@ -6,6 +6,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/tusharbhardwaj/toolyard/internal/actor"
 )
 
 func TestLegacyInboxMigrationAndDecision(t *testing.T) {
@@ -66,5 +68,35 @@ func TestLegacyInboxMigrationAndDecision(t *testing.T) {
 	if r.OwnerNote != d.Note || r.Tools[0].Reason != "Accept test file" || r.DecisionSubmissionID != d.SubmissionID {
 		raw, _ := json.Marshal(r)
 		t.Fatalf("sync lost Inbox verdicts %s", raw)
+	}
+}
+
+// A personal GitHub write runs only when decided_by is the owner's user id
+// (Gateway.Execute), so an Inbox decision must record the id, not a label.
+func TestLegacyDecisionRecordsDeciderUserID(t *testing.T) {
+	e := newEnv(t)
+	ctx := context.Background()
+	now := time.Now().UnixMilli()
+	_, err := e.svc.db.Exec(`INSERT INTO approval_requests(id,agent_id,upstream_name,tool_name,arguments,reason,status,created_at,expires_at) VALUES('ap_owner','ag_legacy','fixture','fixture.write','{"path":"test.txt"}','Owner decides','pending',?,?)`, now, time.Now().Add(time.Hour).UnixMilli())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = e.svc.SyncLegacy(ctx); err != nil {
+		t.Fatal(err)
+	}
+	r, err := e.svc.Get(ctx, "ap_owner")
+	if err != nil {
+		t.Fatal(err)
+	}
+	d := Decision{Action: "submit", RequestRevision: r.Revision, SubmissionID: "legacy-owner", By: "Owner Label", Decider: actor.Decider{UserID: "u_owner", Name: "Owner Label", Via: actor.ViaDashboard}, Verdicts: map[string]CallVerdict{"call_1": {Verdict: VerdictAccepted}}}
+	if _, err = e.svc.Decide(ctx, r.ID, d); err != nil {
+		t.Fatal(err)
+	}
+	var decidedBy, deciderName string
+	if err = e.svc.db.QueryRow(`SELECT decided_by, COALESCE(decider_name,'') FROM approval_requests WHERE id=?`, r.ID).Scan(&decidedBy, &deciderName); err != nil {
+		t.Fatal(err)
+	}
+	if decidedBy != "u_owner" || deciderName != "Owner Label" {
+		t.Fatalf("decided_by=%q decider_name=%q", decidedBy, deciderName)
 	}
 }
