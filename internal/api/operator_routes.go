@@ -467,6 +467,8 @@ var operatorCatalog = []operatorCatalogEntry{
 	{"/v1/servers/{id}", "GET PATCH DELETE POST", "one server; PATCH {url, headers, env, identity, auth_mode, enabled}; POST /reconnect, /convert-env, /oauth/*; GET /connections (who signed in to a per_user server)"},
 	{"/v1/mcp-oauth/callback", "GET", "OAuth redirect target for upstream servers"},
 	{"/v1/mcp-oauth/paste", "POST", "paste an OAuth code for an upstream server"},
+	{"/v1/mcp-oauth/github-app", "GET", "GitHub App manifest return target; stores only the OAuth client secret"},
+	{"/v1/github/setup/begin", "POST", "admin: start the GitHub App manifest flow for the per-user GitHub connector"},
 	{"/v1/marketplace", "GET", "curated server recipes"},
 	{"/v1/secrets", "GET POST", "secrets metadata; POST {name, description, request:true} asks the owner for a value"},
 	{"/v1/secrets/{id}", "PUT DELETE", "set/rotate (?reconnect=1) or delete a secret value"},
