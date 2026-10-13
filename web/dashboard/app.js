@@ -328,8 +328,8 @@ function markStreamEvent() {
 }
 
 function startStream() {
-  // The server filters every event for the current user.
-  if (!state.user) return;
+  // The event stream is admin-only; a member would only collect 403s.
+  if (!isAdmin()) return;
   if (evtSrc) try { evtSrc.close(); } catch {}
   state.stream.status = state.stream.lastEventAt ? 'reconnecting' : 'connecting';
   render();
