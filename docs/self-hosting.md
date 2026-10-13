@@ -209,6 +209,16 @@ Settings → **Inbox & permissions**:
   refused unless you start the gateway with
   `-inbox-fetch-private-networks` (for evidence hosted on your own LAN).
   The fetcher connects directly, never through `HTTP(S)_PROXY`.
+- **Native uploads** (always on): agents call `inbox.upload` and `PUT` a
+  local file to the single-use `/v1/uploads/{ticket}` URL it returns, then
+  cite `upload:<sha256>` in an attachment. Set `-public-url` so the URL is
+  absolute. The ticket is the only credential: it works once, expires after
+  15 minutes and is bound to one agent, size, sha256 and content type, and
+  the real type is sniffed (images must be PNG, JPEG, WebP or GIF; no HTML or
+  SVG files). Uploads share `<data-dir>/inbox/blobs/` and the same size
+  limits; an upload no request cites within 24 hours is deleted. A reverse
+  proxy in front must allow bodies up to 51 MB on `/v1/uploads/*` (see
+  `deploy/Caddyfile.example`).
 - **Judge model** (default off): needs `GEMINI_API_KEY`. Request text is
   sent to Gemini to check each tool call against the agent's own words.
   `inbox_judge_model` overrides the model (default `gemini-2.5-flash`;

@@ -129,6 +129,11 @@ type Attachment struct {
 	PosterURL string `json:"poster_url,omitempty"`
 	Name      string `json:"name,omitempty"`
 	Label     string `json:"label,omitempty"`
+	// Upload and PosterUpload cite a native upload ("upload:<sha256>",
+	// from inbox.upload) instead of URL and PosterURL. Exactly one of
+	// url/upload per media attachment.
+	Upload       string `json:"upload,omitempty"`
+	PosterUpload string `json:"poster_upload,omitempty"`
 
 	// Set by toolyard when it copies a linked file.
 	Blob        string `json:"blob,omitempty"`

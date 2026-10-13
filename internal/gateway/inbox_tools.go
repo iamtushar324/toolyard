@@ -159,7 +159,7 @@ func (g *Gateway) coach(ctx context.Context, entry toolEntry, args map[string]an
 		"also_restricted_nearby": nearby,
 		"tips": []string{
 			"Put every restricted tool your task needs in ONE request. Mark each required or optional.",
-			"Attach evidence: PR links, test results as a table, the diff that matters, screenshots or a short recording (as https links).",
+			"Attach evidence: PR links, test results as a table, the diff that matters, screenshots or a short recording (inbox.upload, then cite the upload ref).",
 			"Send it with dry_run: true first and fix every problem it lists.",
 			"Don't retry this call without a grant; it will return this again.",
 		},
@@ -309,7 +309,7 @@ func (g *Gateway) RegisterInboxTools() {
 // InboxToolNames are always visible to agents.
 var InboxToolNames = []string{
 	"inbox.guide", "inbox.check", "inbox.request", "inbox.ask", "inbox.post",
-	"inbox.status", "inbox.wait", "inbox.cancel", "session.start", "session.update",
+	"inbox.status", "inbox.wait", "inbox.cancel", "inbox.upload", "session.start", "session.update",
 }
 
 func init() {
@@ -357,7 +357,8 @@ var (
 		"maxItems": inbox.MaxAttachments,
 		"description": "Evidence, shown before the decision. Send data where you can: markdown{body}, table{title,columns,rows}, " +
 			"chart{title,chart:line|bar,unit,x,series:[{name,values}]}, diff{file,patch}, code{file,language,body}, log{title,body}, " +
-			"link{label,url}. Media as https links toolyard copies when you send: image{url,alt}, video{url,poster_url} (MP4), file{url,name}. " +
+			"link{label,url}. Media: upload local files with inbox.upload and cite {\"upload\": \"upload:<sha256>\"} (preferred for screenshots and diagrams), " +
+			"or give an https link toolyard copies when you send: image{url|upload,alt}, video{url|upload,poster_url|poster_upload} (MP4), file{url|upload,name}. " +
 			"Each takes an optional first-person caption.",
 		"items": map[string]any{
 			"type":     "object",
@@ -579,6 +580,40 @@ func (g *Gateway) inboxTools() []toolEntry {
 				}
 				return inboxJSON(map[string]any{"requests": views}), nil
 			}),
+		inboxEntry("inbox.upload", inboxUpstream,
+			"Upload a local screenshot, diagram, recording or file for an Inbox attachment, without hosting it anywhere. "+
+				"Give name, content_type, size (bytes) and sha256 (lowercase hex), plus kind (image default, video, file). "+
+				"You get a single-use upload_url that expires in 15 minutes: PUT the exact bytes to it (the returned curl command does it), "+
+				"then cite the returned ref in an attachment, e.g. {\"type\": \"image\", \"upload\": \"upload:<sha256>\", \"alt\": \"...\"}. "+
+				"Limits: image 10 MB (png, jpeg, webp, gif), video 50 MB, file 25 MB.",
+			obj([]string{"name", "content_type", "size", "sha256"}, map[string]any{
+				"name":         map[string]any{"type": "string", "maxLength": 200, "description": "File name, e.g. checkout-after.png."},
+				"content_type": map[string]any{"type": "string", "description": "MIME type: image/png, image/jpeg, image/webp, image/gif, video/mp4, video/webm, video/quicktime, or a file type such as text/csv or application/pdf."},
+				"size":         map[string]any{"type": "integer", "minimum": 1, "maximum": inbox.MaxVideoBytes, "description": "Exact size in bytes (stat -c %s <file>)."},
+				"sha256":       map[string]any{"type": "string", "pattern": "^[0-9a-f]{64}$", "description": "sha256 of the bytes as 64 lowercase hex characters (sha256sum <file>)."},
+				"kind":         map[string]any{"type": "string", "enum": []string{"image", "video", "file"}, "description": "The attachment type you'll cite it as. Default image."},
+			}),
+			func(ctx context.Context, args map[string]any) (*mcp.CallToolResult, error) {
+				agentID, errRes := requireAgentID(ctx)
+				if errRes != nil {
+					return errRes, nil
+				}
+				spec := inbox.UploadSpec{}
+				spec.Name, _ = args["name"].(string)
+				spec.ContentType, _ = args["content_type"].(string)
+				spec.SHA256, _ = args["sha256"].(string)
+				spec.Kind, _ = args["kind"].(string)
+				size, ok := numericArgument(args["size"])
+				if !ok || size != float64(int64(size)) {
+					return mcp.NewToolResultError("size: give the exact size in bytes as an integer"), nil
+				}
+				spec.Size = int64(size)
+				t, err := svc.CreateUpload(ctx, agentID, spec)
+				if err != nil {
+					return mcp.NewToolResultError(err.Error()), nil
+				}
+				return inboxJSON(g.uploadAnswer(t, spec.Name)), nil
+			}),
 		inboxEntry("inbox.cancel", inboxUpstream,
 			"Withdraw one of your pending requests when you no longer need it.",
 			obj([]string{"request_id"}, map[string]any{"request_id": map[string]any{"type": "string"}}),
@@ -639,6 +674,43 @@ func (g *Gateway) inboxTools() []toolEntry {
 				return inboxJSON(ss), nil
 			}),
 	}
+}
+
+// uploadAnswer is inbox.upload's result: where and how to PUT the bytes,
+// and the ref to cite once they're stored.
+func (g *Gateway) uploadAnswer(t *inbox.UploadTicket, name string) map[string]any {
+	if t.AlreadyUploaded {
+		return map[string]any{
+			"ref":              t.Ref,
+			"already_uploaded": true,
+			"content_type":     t.ContentType,
+			"size":             t.Size,
+			"next":             "You uploaded these bytes before. Cite the ref in an attachment: {\"upload\": \"" + t.Ref + "\"}.",
+		}
+	}
+	path := "/v1/uploads/" + t.Ticket
+	uploadURL := path
+	if base := strings.TrimRight(g.publicURL, "/"); base != "" {
+		uploadURL = base + path
+	}
+	file := name
+	if file == "" || strings.ContainsAny(file, "'\\") {
+		file = "<file>"
+	}
+	out := map[string]any{
+		"upload_url": uploadURL,
+		"ref":        t.Ref,
+		"expires_at": t.ExpiresAt,
+		"method":     "PUT",
+		"headers":    map[string]string{"Content-Type": t.ContentType},
+		"curl":       "curl -sf -X PUT -H 'Content-Type: " + t.ContentType + "' --data-binary @'" + file + "' '" + uploadURL + "'",
+		"next": "PUT the exact bytes to upload_url within 15 minutes (the ticket works once), then cite the ref in an attachment: " +
+			"{\"upload\": \"" + t.Ref + "\"}. Never share upload_url: it is the credential.",
+	}
+	if g.publicURL == "" {
+		out["note"] = "This gateway has no -public-url set, so upload_url is a path: prefix it with the toolyard address you connect to."
+	}
+	return out
 }
 
 func requireAgentID(ctx context.Context) (string, *mcp.CallToolResult) {

@@ -413,14 +413,34 @@ func validateAttachment(add func(string, string, ...any), p string, a *Attachmen
 	case "log":
 		bodyLimit("body", a.Body, MaxCodeBody)
 	case "image", "video", "file":
-		checkMediaURL(add, p+".url", a.URL, allowPrivate)
+		switch {
+		case a.URL != "" && a.Upload != "":
+			add(p+".upload", "give url or upload, not both")
+		case a.Upload != "":
+			checkUploadRef(add, p+".upload", a.Upload)
+		default:
+			checkMediaURL(add, p+".url", a.URL, allowPrivate)
+		}
 		if a.Type == "file" && a.Name == "" {
 			add(p+".name", "missing")
 		}
-		if a.Type == "video" && a.PosterURL != "" {
-			checkMediaURL(add, p+".poster_url", a.PosterURL, allowPrivate)
+		if a.Type != "video" && a.PosterUpload != "" {
+			add(p+".poster_upload", "only a video takes a poster")
+		}
+		if a.Type == "video" {
+			switch {
+			case a.PosterURL != "" && a.PosterUpload != "":
+				add(p+".poster_upload", "give poster_url or poster_upload, not both")
+			case a.PosterUpload != "":
+				checkUploadRef(add, p+".poster_upload", a.PosterUpload)
+			case a.PosterURL != "":
+				checkMediaURL(add, p+".poster_url", a.PosterURL, allowPrivate)
+			}
 		}
 	case "link":
+		if a.Upload != "" || a.PosterUpload != "" {
+			add(p+".upload", "only image, video and file attachments take an upload")
+		}
 		if a.Label == "" {
 			add(p+".label", "missing")
 		}
@@ -431,6 +451,14 @@ func validateAttachment(add func(string, string, ...any), p string, a *Attachmen
 		add(p+".type", "missing")
 	default:
 		add(p+".type", "unknown type %q (markdown, table, chart, diff, code, log, image, video, file, link)", a.Type)
+	}
+}
+
+// checkUploadRef checks the form of an "upload:<sha256>" reference; Submit
+// then checks that the calling agent owns it.
+func checkUploadRef(add func(string, string, ...any), path, ref string) {
+	if _, ok := ParseUploadRef(ref); !ok {
+		add(path, "use the ref inbox.upload returned: \"upload:<sha256>\" (64 lowercase hex)")
 	}
 }
 

@@ -1238,12 +1238,15 @@ func runServe(argv []string) error {
 	// check, a member's session may only reach the short allowlist of
 	// member routes; every other /v1 route is admin-only by default.
 	var handler http.Handler = apiSrv.RoleGuard(mux)
-	// 4 MiB universal ceiling, with one override: the memory-webhook ingest
+	// 4 MiB universal ceiling, with two overrides: the memory-webhook ingest
 	// route (TEC-481) intentionally accepts large n8n payloads, so it gets the
 	// configured webhook cap. Without the override this outer ceiling would
 	// bind below that cap.
 	handler = api.LimitBodyByPath(handler, 4<<20, map[string]int64{
 		api.MemoryWebhookIngestPath: *webhookMaxBytes,
+		// Native Inbox uploads (PUT /v1/uploads/{ticket}) carry up to a
+		// 50 MB video; the handler caps each body at its ticket's size.
+		"/v1/uploads/": inbox.MaxVideoBytes,
 	})
 	handler = apiSrv.HardenAPI(handler)
 	handler = apiSrv.EnforceOriginOnMutations(handler)

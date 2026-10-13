@@ -163,6 +163,7 @@ agent's own requests.
 | `inbox.post({kind: "update", …})` | An outcome report |
 | `inbox.status(ids)` / `inbox.wait(ids, mode, timeout)` | Decisions, per-tool grants and the owner's note |
 | `inbox.cancel(id)` | Withdraw a request |
+| `inbox.upload({name, content_type, size, sha256, kind?})` | A single-use URL to `PUT` a local screenshot, recording or file; cite the returned `upload:<sha256>` ref in an attachment |
 | `session.start` / `session.update` | Name the session and report status (feeds the Sessions tab) |
 
 `tools.poll_approval(s)`, `tools.wait_for_approval(s)`,

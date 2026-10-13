@@ -268,3 +268,29 @@ func unwrapURLErr(err error) string {
 	}
 	return msg
 }
+
+// Exists reports whether a stored copy's bytes are on disk.
+func (s *Snapshotter) Exists(_ context.Context, sha string) bool {
+	if !blobName.MatchString(sha) {
+		return false
+	}
+	_, err := os.Stat(filepath.Join(s.dir, sha))
+	return err == nil
+}
+
+// Remove deletes a stored copy and its row. Callers decide that nothing
+// references it any more (see Service.sweepUploads).
+func (s *Snapshotter) Remove(ctx context.Context, sha string) error {
+	if !blobName.MatchString(sha) {
+		return ErrNotFound
+	}
+	if s.db != nil {
+		if _, err := s.db.ExecContext(ctx, `DELETE FROM inbox_blobs WHERE sha256 = ?`, sha); err != nil {
+			return err
+		}
+	}
+	if err := os.Remove(filepath.Join(s.dir, sha)); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return nil
+}

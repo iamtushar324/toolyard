@@ -109,7 +109,8 @@ func operatorScopeFor(method, path string) (scope string, ok bool) {
 	}
 	// A connect link is opened by a person's browser; the ticket in its
 	// path is the credential, so no token may redeem one.
-	if operatorNeverPaths[path] || strings.Contains(path, "/reveal") || strings.HasPrefix(path, connectLinkPath) {
+	// Likewise an upload ticket (upload_routes.go) is its own credential.
+	if operatorNeverPaths[path] || strings.Contains(path, "/reveal") || strings.HasPrefix(path, connectLinkPath) || strings.HasPrefix(path, uploadsPathPrefix) {
 		return "", false
 	}
 	switch method {
@@ -495,6 +496,7 @@ var operatorCatalog = []operatorCatalogEntry{
 	{"/v1/inbox/voice-key", "POST", "save ElevenLabs API key (owner browser only)"},
 	{"/v1/inbox/{id}", "GET POST", "inbox item; /decide, /summarize, /explain, grants, sessions, batch"},
 	{"/v1/inbox/decide-by-token", "POST", "push-tap inbox decision (signed token)"},
+	{"/v1/uploads/{id}", "PUT", "agent: upload the bytes for an inbox.upload ticket; the single-use ticket is the credential (never via operator token)"},
 	{"/v1/guide", "GET", "agent protocol"},
 	{"/v1/guide/skill", "GET", "toolyard-inbox skill"},
 	{"/v1/events", "GET", "event feed"},
