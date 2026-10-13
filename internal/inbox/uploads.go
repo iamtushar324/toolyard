@@ -15,7 +15,9 @@ import (
 	"log"
 	"mime"
 	"net/http"
+	"os"
 	"path"
+	"regexp"
 	"strings"
 	"time"
 	"unicode/utf8"
@@ -26,9 +28,11 @@ import (
 //
 //  1. inbox.upload {name, content_type, size, sha256, kind} returns a
 //     single-use ticket URL, bound to this agent and to exactly those bytes.
-//  2. The agent PUTs the bytes to /v1/uploads/{ticket}. Toolyard checks the
-//     size, the sha256 and the real (sniffed) type, stores the blob and
-//     records that this agent uploaded it.
+//  2. The agent PUTs the bytes to /v1/uploads/{ticket}. Toolyard claims the
+//     ticket, streams the body to a temporary file while hashing it, checks
+//     the size, the sha256 and the real (sniffed) type, and then — in one
+//     transaction — records the blob, records that this agent uploaded it
+//     and uses the ticket. Any failure releases the claim.
 //  3. An attachment cites it as {"upload": "upload:<sha256>"} instead of a
 //     url. Only the agent that uploaded it can cite it.
 //
@@ -38,17 +42,28 @@ const (
 	MaxOpenUploadTickets = 50
 	UploadRetention      = 24 * time.Hour
 	UploadRefPrefix      = "upload:"
-	uploadTicketPrefix   = "tyu_"
-	maxUploadName        = 200
+	// MaxConcurrentUploads is how many upload bodies the server reads at
+	// once; further PUTs are refused (503) rather than queued.
+	MaxConcurrentUploads = 8
+	// UploadClaimTTL bounds a claim whose holder died without releasing it.
+	UploadClaimTTL = 6 * time.Minute
+	// uploadTouchGrace: the sweep skips an upload a submission resolved
+	// this recently, so it never deletes one that is about to be cited.
+	uploadTouchGrace   = time.Hour
+	uploadTicketPrefix = "tyu_"
+	maxUploadName      = 200
+	uploadSniffBytes   = 4096
 )
 
 // Upload errors. UploadError is a problem with what the agent sent (400);
-// the sentinels map to 404, 410 and 429-style refusals.
+// the sentinels map to 404, 409, 410 and 503.
 var (
 	ErrUploadUnknown     = errors.New("unknown upload ticket")
 	ErrUploadGone        = errors.New("this upload ticket was already used or has expired; call inbox.upload for a new one")
+	ErrUploadBusy        = errors.New("another upload with this ticket is in progress")
 	ErrUploadTooMany     = fmt.Errorf("you already have %d open upload tickets; use or let some expire first", MaxOpenUploadTickets)
 	ErrUploadUnavailable = errors.New("uploads are not available on this gateway")
+	ErrUploadServerBusy  = errors.New("too many uploads in progress; retry shortly")
 )
 
 // UploadError is a validation problem with an upload request or body.
@@ -78,7 +93,8 @@ type UploadTicket struct {
 	AlreadyUploaded bool
 }
 
-// PendingUpload is a ticket looked up for a PUT, before its body is read.
+// PendingUpload is a ticket claimed for one PUT. Complete it with
+// CompleteUpload, which releases the claim on any failure.
 type PendingUpload struct {
 	hash        string
 	AgentID     string
@@ -99,18 +115,35 @@ type UploadResult struct {
 	Name        string `json:"-"`
 }
 
-// blobRemover is implemented by Snapshotter; Sweep uses it to delete the
-// file of an upload nothing cites.
-type blobRemover interface {
-	Remove(ctx context.Context, sha string) error
+// uploadBlobs is the blob store an upload needs (Snapshotter implements
+// it): a temporary file next to the blobs, and a rename into place.
+type uploadBlobs interface {
+	CreateUploadTemp() (*os.File, error)
+	Adopt(tmpPath, sha string) (created bool, err error)
+	DiscardFile(sha string)
+	Exists(ctx context.Context, sha string) bool
 }
 
+func (s *Service) uploadStore() (uploadBlobs, bool) {
+	b, ok := s.opts.Blobs.(uploadBlobs)
+	return b, ok
+}
+
+// mediaTypeRE is the RFC 6838 type/subtype grammar, lowercased.
+var mediaTypeRE = regexp.MustCompile(`^[a-z0-9][a-z0-9!#&^_.+-]{0,126}/[a-z0-9][a-z0-9!#&^_.+-]{0,126}$`)
+
+// normalizeContentType returns the bare, lowercased media type, or "" when
+// ct isn't a well-formed media type. Parameters are dropped.
 func normalizeContentType(ct string) string {
 	mt, _, err := mime.ParseMediaType(strings.TrimSpace(ct))
 	if err != nil {
 		return ""
 	}
-	return strings.ToLower(mt)
+	mt = strings.ToLower(mt)
+	if !mediaTypeRE.MatchString(mt) {
+		return ""
+	}
+	return mt
 }
 
 // ParseUploadRef returns the sha256 in an "upload:<sha256>" reference.
@@ -129,11 +162,29 @@ func hashUploadTicket(t string) string {
 
 func validUploadKind(k string) bool { return k == "image" || k == "video" || k == "file" }
 
+// AcquireUploadSlot reserves one of MaxConcurrentUploads body readers. It
+// never blocks: ok is false when every slot is taken.
+func (s *Service) AcquireUploadSlot() (release func(), ok bool) {
+	select {
+	case s.uploadSlots <- struct{}{}:
+		var once bool
+		return func() {
+			if !once {
+				once = true
+				<-s.uploadSlots
+			}
+		}, true
+	default:
+		return func() {}, false
+	}
+}
+
 // CreateUpload validates an agent's declared upload and issues a ticket.
 // When this agent already uploaded the same bytes, it returns the ref with
 // AlreadyUploaded and no ticket.
 func (s *Service) CreateUpload(ctx context.Context, agentID string, spec UploadSpec) (*UploadTicket, error) {
-	if s.opts.Blobs == nil {
+	blobs, ok := s.uploadStore()
+	if !ok {
 		return nil, ErrUploadUnavailable
 	}
 	if agentID == "" {
@@ -155,6 +206,11 @@ func (s *Service) CreateUpload(ctx context.Context, agentID string, spec UploadS
 	}
 	if utf8.RuneCountInString(name) > maxUploadName || strings.ContainsAny(name, "\r\n\"") {
 		return nil, uploadErr("name: at most %d characters, no quotes or line breaks", maxUploadName)
+	}
+	// The type ends up in a shell command we hand back, so anything beyond
+	// the media-type grammar is refused outright, not just stripped.
+	if strings.ContainsAny(spec.ContentType, "'`$\\\"\r\n") {
+		return nil, uploadErr("content_type: give a plain MIME type such as image/png")
 	}
 	ct := normalizeContentType(spec.ContentType)
 	if ct == "" {
@@ -185,12 +241,12 @@ func (s *Service) CreateUpload(ctx context.Context, agentID string, spec UploadS
 	var have string
 	var haveSize int64
 	err := s.db.QueryRowContext(ctx, `SELECT content_type, size FROM inbox_uploads WHERE sha256=? AND agent_id=?`, sha, agentID).Scan(&have, &haveSize)
-	if err == nil && s.blobExists(ctx, sha) {
+	if err == nil && blobs.Exists(ctx, sha) {
 		if haveSize != spec.Size {
 			return nil, uploadErr("size: you already uploaded this sha256 with %d bytes", haveSize)
 		}
 		// Refresh the retention clock: the agent is about to cite it.
-		_, _ = s.db.ExecContext(ctx, `UPDATE inbox_uploads SET created_at=? WHERE sha256=? AND agent_id=? AND used_at IS NULL`, now.UnixMilli(), sha, agentID)
+		_, _ = s.db.ExecContext(ctx, `UPDATE inbox_uploads SET created_at=?, touched_at=? WHERE sha256=? AND agent_id=?`, now.UnixMilli(), now.UnixMilli(), sha, agentID)
 		return &UploadTicket{Ref: UploadRefPrefix + sha, ContentType: have, Size: haveSize, AlreadyUploaded: true}, nil
 	}
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
@@ -217,56 +273,109 @@ func (s *Service) CreateUpload(ctx context.Context, agentID string, spec UploadS
 	return &UploadTicket{Ticket: ticket, Ref: UploadRefPrefix + sha, ContentType: ct, Size: spec.Size, ExpiresAt: exp}, nil
 }
 
-// blobExists reports whether the blob's bytes are still on disk.
-func (s *Service) blobExists(ctx context.Context, sha string) bool {
-	o, ok := s.opts.Blobs.(interface {
-		Exists(ctx context.Context, sha string) bool
-	})
-	if !ok {
-		return true
-	}
-	return o.Exists(ctx, sha)
-}
-
-// OpenUpload looks up a ticket for a PUT. It does not use the ticket.
-func (s *Service) OpenUpload(ctx context.Context, ticket string) (*PendingUpload, error) {
-	if s.opts.Blobs == nil {
+// ClaimUpload marks a ticket as in progress for one PUT, before its body
+// is read. A second PUT on the same ticket gets ErrUploadBusy until the
+// first finishes; a used or expired ticket gets ErrUploadGone.
+func (s *Service) ClaimUpload(ctx context.Context, ticket string) (*PendingUpload, error) {
+	if _, ok := s.uploadStore(); !ok {
 		return nil, ErrUploadUnavailable
 	}
 	if !strings.HasPrefix(ticket, uploadTicketPrefix) || len(ticket) < len(uploadTicketPrefix)+43 || len(ticket) > 128 {
 		return nil, ErrUploadUnknown
 	}
 	want := hashUploadTicket(ticket)
+	now := s.now().UnixMilli()
+	res, err := s.db.ExecContext(ctx, `UPDATE inbox_upload_tickets SET claimed_until=?
+		WHERE token_hash=? AND used_at IS NULL AND expires_at>? AND (claimed_until IS NULL OR claimed_until<=?)`,
+		s.now().Add(UploadClaimTTL).UnixMilli(), want, now, now)
+	if err != nil {
+		return nil, err
+	}
+	claimed, _ := res.RowsAffected()
 	var p PendingUpload
 	var got string
 	var exp int64
-	var used sql.NullInt64
-	err := s.db.QueryRowContext(ctx, `SELECT token_hash, agent_id, sha256, size, content_type, kind, name, expires_at, used_at FROM inbox_upload_tickets WHERE token_hash=?`, want).
-		Scan(&got, &p.AgentID, &p.SHA256, &p.Size, &p.ContentType, &p.Kind, &p.Name, &exp, &used)
+	var used, until sql.NullInt64
+	err = s.db.QueryRowContext(ctx, `SELECT token_hash, agent_id, sha256, size, content_type, kind, name, expires_at, used_at, claimed_until FROM inbox_upload_tickets WHERE token_hash=?`, want).
+		Scan(&got, &p.AgentID, &p.SHA256, &p.Size, &p.ContentType, &p.Kind, &p.Name, &exp, &used, &until)
 	if errors.Is(err, sql.ErrNoRows) || (err == nil && subtle.ConstantTimeCompare([]byte(got), []byte(want)) != 1) {
 		return nil, ErrUploadUnknown
 	}
 	if err != nil {
 		return nil, err
 	}
-	if used.Valid || exp <= s.now().UnixMilli() {
-		return nil, ErrUploadGone
+	if claimed != 1 {
+		if used.Valid || exp <= now {
+			return nil, ErrUploadGone
+		}
+		return nil, ErrUploadBusy
 	}
 	p.hash = want
 	return &p, nil
 }
 
-// CompleteUpload reads the body of a PUT for p, checks it against the
-// ticket, stores it and uses the ticket. contentType is the request's
-// Content-Type header ("" is accepted).
-func (s *Service) CompleteUpload(ctx context.Context, p *PendingUpload, contentType string, body io.Reader) (*UploadResult, error) {
+// ReleaseUpload drops a claim after a failed PUT, so the agent can retry
+// with the same ticket until it expires.
+func (s *Service) ReleaseUpload(p *PendingUpload) {
+	if p == nil || p.hash == "" {
+		return
+	}
+	if _, err := s.db.ExecContext(context.Background(), `UPDATE inbox_upload_tickets SET claimed_until=NULL WHERE token_hash=? AND used_at IS NULL`, p.hash); err != nil {
+		log.Printf("inbox: release upload claim: %v", err)
+	}
+}
+
+// headWriter keeps the first len(buf) bytes written to it.
+type headWriter struct {
+	buf []byte
+	n   int
+}
+
+func (h *headWriter) Write(p []byte) (int, error) {
+	if h.n < len(h.buf) {
+		h.n += copy(h.buf[h.n:], p)
+	}
+	return len(p), nil
+}
+
+// CompleteUpload streams the body of a claimed PUT to a temporary file
+// while hashing it, checks it against the ticket and stores it. The blob
+// row, the owner row and the ticket's used_at are written in one
+// transaction. On any failure the claim is released. contentType is the
+// request's Content-Type header ("" is accepted).
+func (s *Service) CompleteUpload(ctx context.Context, p *PendingUpload, contentType string, body io.Reader) (res *UploadResult, err error) {
 	if p == nil || p.hash == "" {
 		return nil, ErrUploadUnknown
 	}
+	blobs, ok := s.uploadStore()
+	if !ok {
+		return nil, ErrUploadUnavailable
+	}
+	defer func() {
+		if err != nil {
+			s.ReleaseUpload(p)
+		}
+	}()
 	if ct := normalizeContentType(contentType); contentType != "" && ct != p.ContentType {
 		return nil, uploadErr("Content-Type %s doesn't match the ticket (%s)", contentType, p.ContentType)
 	}
-	data, err := io.ReadAll(io.LimitReader(body, p.Size+1))
+	tmp, err := blobs.CreateUploadTemp()
+	if err != nil {
+		return nil, err
+	}
+	tmpPath := tmp.Name()
+	adopted := false
+	defer func() {
+		if !adopted {
+			_ = os.Remove(tmpPath)
+		}
+	}()
+	h := sha256.New()
+	head := &headWriter{buf: make([]byte, uploadSniffBytes)}
+	n, err := io.Copy(io.MultiWriter(tmp, h, head), io.LimitReader(body, p.Size+1))
+	if cerr := tmp.Close(); err == nil && cerr != nil {
+		err = cerr
+	}
 	if err != nil {
 		var mbe *http.MaxBytesError
 		if errors.As(err, &mbe) {
@@ -274,47 +383,78 @@ func (s *Service) CompleteUpload(ctx context.Context, p *PendingUpload, contentT
 		}
 		return nil, uploadErr("couldn't read the body: %v", err)
 	}
-	if int64(len(data)) != p.Size {
-		return nil, uploadErr("the body is %d bytes; the ticket says %d", len(data), p.Size)
+	if n != p.Size {
+		return nil, uploadErr("the body is %d bytes; the ticket says %d", n, p.Size)
 	}
-	sum := sha256.Sum256(data)
-	if got := hex.EncodeToString(sum[:]); got != p.SHA256 {
+	if got := hex.EncodeToString(h.Sum(nil)); got != p.SHA256 {
 		return nil, uploadErr("sha256 mismatch: the body hashes to %s, the ticket says %s", got, p.SHA256)
 	}
-	stored, err := sniffUpload(p.Kind, p.ContentType, data)
+	stored, err := sniffUpload(p.Kind, p.ContentType, head.buf[:head.n])
 	if err != nil {
 		return nil, err
 	}
-	now := s.now().UnixMilli()
-	res, err := s.db.ExecContext(ctx, `UPDATE inbox_upload_tickets SET used_at=? WHERE token_hash=? AND used_at IS NULL AND expires_at>?`, now, p.hash, now)
+
+	created, err := blobs.Adopt(tmpPath, p.SHA256)
+	adopted = true // Adopt consumed (or removed) the temporary file
 	if err != nil {
 		return nil, err
 	}
-	if n, _ := res.RowsAffected(); n != 1 {
-		return nil, ErrUploadGone
-	}
-	sha, err := s.opts.Blobs.Put(ctx, data, stored, UploadRefPrefix+p.SHA256)
-	if err != nil {
-		return nil, err
-	}
-	if sha != p.SHA256 {
-		return nil, fmt.Errorf("stored blob hash %s differs from %s", sha, p.SHA256)
-	}
-	if _, err := s.db.ExecContext(ctx, `INSERT INTO inbox_uploads(sha256, agent_id, name, content_type, kind, size, created_at) VALUES (?,?,?,?,?,?,?)
-		ON CONFLICT(sha256, agent_id) DO UPDATE SET name=excluded.name, content_type=excluded.content_type, kind=excluded.kind, size=excluded.size, created_at=excluded.created_at`,
-		p.SHA256, p.AgentID, p.Name, stored, p.Kind, p.Size, now); err != nil {
+	if err := s.recordUpload(ctx, p, stored); err != nil {
+		if created {
+			// Never leave a file without its row; a blob some other
+			// writer recorded meanwhile keeps its file.
+			var one int
+			if s.db.QueryRowContext(context.Background(), `SELECT 1 FROM inbox_blobs WHERE sha256=?`, p.SHA256).Scan(&one) != nil {
+				blobs.DiscardFile(p.SHA256)
+			}
+		}
 		return nil, err
 	}
 	return &UploadResult{Ref: UploadRefPrefix + p.SHA256, SHA256: p.SHA256, Size: p.Size, ContentType: stored, AgentID: p.AgentID, Name: p.Name}, nil
 }
 
-// sniffUpload checks the bytes against the declared type and returns the
-// content type to store. Images must really be PNG, JPEG, WebP or GIF and
-// match the declared type; videos must look like MP4, WebM or QuickTime;
-// files may be anything except HTML, SVG or XHTML, and a file declared as
-// an image or video must really be one (those render inline).
-func sniffUpload(kind, declared string, data []byte) (string, error) {
-	sniffed := normalizeContentType(http.DetectContentType(data))
+// recordUpload writes the blob row, the owner row and the ticket's used_at
+// as one unit, so a stored upload always has an owner and a used ticket.
+func (s *Service) recordUpload(ctx context.Context, p *PendingUpload, stored string) error {
+	if s.uploadRecordHook != nil {
+		if err := s.uploadRecordHook(); err != nil {
+			return err
+		}
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	now := s.now().UnixMilli()
+	// The claim was taken before expiry; a body that finishes after the
+	// ticket's expiry still counts (Sweep never deletes a claimed ticket).
+	res, err := tx.ExecContext(ctx, `UPDATE inbox_upload_tickets SET used_at=?, claimed_until=NULL WHERE token_hash=? AND used_at IS NULL AND claimed_until IS NOT NULL`, now, p.hash)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n != 1 {
+		return ErrUploadGone
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO inbox_blobs(sha256, content_type, size, source_url, created_at) VALUES (?,?,?,?,?)`,
+		p.SHA256, stored, p.Size, UploadRefPrefix+p.SHA256, now); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO inbox_uploads(sha256, agent_id, name, content_type, kind, size, created_at) VALUES (?,?,?,?,?,?,?)
+		ON CONFLICT(sha256, agent_id) DO UPDATE SET name=excluded.name, content_type=excluded.content_type, kind=excluded.kind, size=excluded.size, created_at=excluded.created_at`,
+		p.SHA256, p.AgentID, p.Name, stored, p.Kind, p.Size, now); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+// sniffUpload checks the first bytes against the declared type and returns
+// the content type to store. Images must really be PNG, JPEG, WebP or GIF
+// and match the declared type; videos must look like MP4, WebM or
+// QuickTime; files may be anything except HTML, SVG or XHTML, and a file
+// declared as an image or video must really be one (those render inline).
+func sniffUpload(kind, declared string, head []byte) (string, error) {
+	sniffed := normalizeContentType(http.DetectContentType(head))
 	checkImage := func() (string, error) {
 		switch sniffed {
 		case "image/png", "image/jpeg", "image/gif", "image/webp":
@@ -327,10 +467,11 @@ func sniffUpload(kind, declared string, data []byte) (string, error) {
 		return sniffed, nil
 	}
 	checkVideo := func() (string, error) {
+		mp4OrWebM := sniffed == "video/mp4" || sniffed == "video/webm"
 		switch {
-		case (sniffed == "video/mp4" || sniffed == "video/webm") && (sniffed == declared || declared == "video/quicktime" && sniffed == "video/mp4"):
+		case mp4OrWebM && sniffed == declared:
 			return declared, nil
-		case declared == "video/quicktime" && looksQuickTime(data):
+		case declared == "video/quicktime" && (sniffed == "video/mp4" || looksQuickTime(head)):
 			return declared, nil
 		}
 		return "", uploadErr("the bytes are %s, not a %s video", sniffed, declared)
@@ -347,7 +488,7 @@ func sniffUpload(kind, declared string, data []byte) (string, error) {
 	if strings.HasPrefix(declared, "video/") {
 		return checkVideo()
 	}
-	if looksLikeMarkup(sniffed, data) {
+	if looksLikeMarkup(sniffed, head) {
 		return "", uploadErr("HTML, SVG and XHTML files aren't accepted; send it as a code or markdown attachment instead")
 	}
 	return declared, nil
@@ -365,16 +506,12 @@ func looksQuickTime(data []byte) bool {
 	return false
 }
 
-func looksLikeMarkup(sniffed string, data []byte) bool {
+func looksLikeMarkup(sniffed string, head []byte) bool {
 	if sniffed == "text/html" || sniffed == "image/svg+xml" || sniffed == "application/xhtml+xml" {
 		return true
 	}
 	if !strings.HasPrefix(sniffed, "text/") {
 		return false
-	}
-	head := data
-	if len(head) > 4096 {
-		head = head[:4096]
 	}
 	lower := bytes.ToLower(head)
 	for _, tag := range [][]byte{[]byte("<svg"), []byte("<html"), []byte("<!doctype html"), []byte("<script")} {
@@ -386,15 +523,24 @@ func looksLikeMarkup(sniffed string, data []byte) bool {
 }
 
 // uploadFor returns an upload agentID owns, checked against the attachment
-// type it is cited as.
+// type it is cited as. It touches the row first, so a concurrent sweep
+// skips it (uploadTouchGrace) instead of deleting it under the citation.
 func (s *Service) uploadFor(ctx context.Context, agentID, ref, kind string) (sha, ct string, size int64, err error) {
 	sha, ok := ParseUploadRef(ref)
 	if !ok {
 		return "", "", 0, fmt.Errorf("use \"upload:<sha256>\" exactly as inbox.upload returned it")
 	}
+	notYours := fmt.Errorf("no finished upload with this ref belongs to you; call inbox.upload, PUT the file, then cite the ref")
+	res, err := s.db.ExecContext(ctx, `UPDATE inbox_uploads SET touched_at=? WHERE sha256=? AND agent_id=?`, s.now().UnixMilli(), sha, agentID)
+	if err != nil {
+		return "", "", 0, err
+	}
+	if n, _ := res.RowsAffected(); n != 1 {
+		return "", "", 0, notYours
+	}
 	err = s.db.QueryRowContext(ctx, `SELECT content_type, size FROM inbox_uploads WHERE sha256=? AND agent_id=?`, sha, agentID).Scan(&ct, &size)
 	if errors.Is(err, sql.ErrNoRows) {
-		return "", "", 0, fmt.Errorf("no finished upload with this ref belongs to you; call inbox.upload, PUT the file, then cite the ref")
+		return "", "", 0, notYours
 	}
 	if err != nil {
 		return "", "", 0, err
@@ -435,34 +581,39 @@ func (s *Service) resolveUploads(ctx context.Context, agentID string, r *Request
 	}
 }
 
-// markUploadsUsed records that a stored request cites its uploads, so
-// Sweep keeps them.
-func (s *Service) markUploadsUsed(ctx context.Context, r *Request) {
+// markUploadsUsedTx records, inside the transaction that stores r, that r
+// cites its uploads, so Sweep keeps them.
+func (s *Service) markUploadsUsedTx(ctx context.Context, tx *sql.Tx, r *Request) error {
 	now := s.now().UnixMilli()
 	for _, a := range r.Attachments {
 		for _, ref := range []string{a.Upload, a.PosterUpload} {
 			if sha, ok := ParseUploadRef(ref); ok {
-				_, _ = s.db.ExecContext(ctx, `UPDATE inbox_uploads SET used_at=? WHERE sha256=? AND agent_id=? AND used_at IS NULL`, now, sha, r.AgentID)
+				if _, err := tx.ExecContext(ctx, `UPDATE inbox_uploads SET used_at=COALESCE(used_at, ?), touched_at=? WHERE sha256=? AND agent_id=?`, now, now, sha, r.AgentID); err != nil {
+					return err
+				}
 			}
 		}
 	}
+	return nil
 }
 
-// sweepUploads purges expired tickets and uploads that no request cited
-// within UploadRetention. A blob is deleted only when it came from an
-// upload, no other agent's upload holds it and no request references it.
+// sweepUploads purges expired tickets, uploads that no request cited
+// within UploadRetention, and upload-sourced blobs left without an owner.
+// Each deletion re-checks citations inside one transaction.
 func (s *Service) sweepUploads(ctx context.Context) {
 	now := s.now()
-	if _, err := s.db.ExecContext(ctx, `DELETE FROM inbox_upload_tickets WHERE expires_at <= ?`, now.UnixMilli()); err != nil {
+	if _, err := s.db.ExecContext(ctx, `DELETE FROM inbox_upload_tickets WHERE expires_at <= ? AND (claimed_until IS NULL OR claimed_until <= ?)`, now.UnixMilli(), now.UnixMilli()); err != nil {
 		log.Printf("inbox: purge upload tickets: %v", err)
 	}
-	rows, err := s.db.QueryContext(ctx, `SELECT sha256, agent_id FROM inbox_uploads WHERE used_at IS NULL AND created_at < ? LIMIT 500`, now.Add(-UploadRetention).UnixMilli())
+	cutoff := now.Add(-UploadRetention).UnixMilli()
+	touchCutoff := now.Add(-uploadTouchGrace).UnixMilli()
+	type up struct{ sha, agent string }
+	var stale []up
+	rows, err := s.db.QueryContext(ctx, `SELECT sha256, agent_id FROM inbox_uploads WHERE used_at IS NULL AND created_at < ? AND COALESCE(touched_at, 0) < ? LIMIT 500`, cutoff, touchCutoff)
 	if err != nil {
 		log.Printf("inbox: sweep uploads: %v", err)
 		return
 	}
-	type up struct{ sha, agent string }
-	var stale []up
 	for rows.Next() {
 		var u up
 		if rows.Scan(&u.sha, &u.agent) == nil {
@@ -470,42 +621,94 @@ func (s *Service) sweepUploads(ctx context.Context) {
 		}
 	}
 	rows.Close()
+	// Blobs an upload wrote whose owner rows are all gone (e.g. a crash
+	// between steps in an older build).
+	rows, err = s.db.QueryContext(ctx, `SELECT b.sha256 FROM inbox_blobs b WHERE b.source_url = 'upload:' || b.sha256 AND b.created_at < ?
+		AND NOT EXISTS (SELECT 1 FROM inbox_uploads u WHERE u.sha256 = b.sha256) LIMIT 500`, cutoff)
+	if err == nil {
+		for rows.Next() {
+			var u up
+			if rows.Scan(&u.sha) == nil {
+				stale = append(stale, u)
+			}
+		}
+		rows.Close()
+	}
 	for _, u := range stale {
-		if s.blobCited(ctx, u.agent, u.sha) {
-			_, _ = s.db.ExecContext(ctx, `UPDATE inbox_uploads SET used_at=? WHERE sha256=? AND agent_id=?`, now.UnixMilli(), u.sha, u.agent)
+		dropFile, err := s.sweepOneUpload(ctx, u.sha, u.agent, cutoff, touchCutoff)
+		if err != nil {
+			log.Printf("inbox: sweep upload %s: %v", u.sha[:12], err)
 			continue
 		}
-		if _, err := s.db.ExecContext(ctx, `DELETE FROM inbox_uploads WHERE sha256=? AND agent_id=?`, u.sha, u.agent); err != nil {
-			continue
-		}
-		var other int
-		if s.db.QueryRowContext(ctx, `SELECT 1 FROM inbox_uploads WHERE sha256=? LIMIT 1`, u.sha).Scan(&other) == nil {
-			continue
-		}
-		if s.blobCited(ctx, "", u.sha) {
-			continue
-		}
-		var source string
-		if s.db.QueryRowContext(ctx, `SELECT source_url FROM inbox_blobs WHERE sha256=?`, u.sha).Scan(&source) != nil || source != UploadRefPrefix+u.sha {
-			continue
-		}
-		if rm, ok := s.opts.Blobs.(blobRemover); ok {
-			if err := rm.Remove(ctx, u.sha); err != nil {
-				log.Printf("inbox: remove upload blob %s: %v", u.sha[:12], err)
+		if dropFile {
+			if b, ok := s.uploadStore(); ok {
+				b.DiscardFile(u.sha)
 			}
 		}
 	}
 }
 
-// blobCited reports whether any request (of agentID, or of anyone when
-// agentID is "") references sha as a blob or poster blob.
-func (s *Service) blobCited(ctx context.Context, agentID, sha string) bool {
+// sweepOneUpload deletes one stale upload row (agent "" = an ownerless
+// blob) and, when nothing else holds or cites it, its blob row. It reports
+// whether the caller should delete the file. All checks run in the same
+// transaction as the deletes.
+func (s *Service) sweepOneUpload(ctx context.Context, sha, agent string, cutoff, touchCutoff int64) (bool, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, err
+	}
+	defer tx.Rollback()
+	if agent != "" {
+		var one int
+		err := tx.QueryRowContext(ctx, `SELECT 1 FROM inbox_uploads WHERE sha256=? AND agent_id=? AND used_at IS NULL AND created_at < ? AND COALESCE(touched_at, 0) < ?`, sha, agent, cutoff, touchCutoff).Scan(&one)
+		if errors.Is(err, sql.ErrNoRows) {
+			return false, nil // cited, touched or re-uploaded since the scan
+		}
+		if err != nil {
+			return false, err
+		}
+		if blobCitedTx(ctx, tx, agent, sha) {
+			if _, err := tx.ExecContext(ctx, `UPDATE inbox_uploads SET used_at=? WHERE sha256=? AND agent_id=?`, s.now().UnixMilli(), sha, agent); err != nil {
+				return false, err
+			}
+			return false, tx.Commit()
+		}
+		if _, err := tx.ExecContext(ctx, `DELETE FROM inbox_uploads WHERE sha256=? AND agent_id=?`, sha, agent); err != nil {
+			return false, err
+		}
+	}
+	drop := true
+	var one int
+	if tx.QueryRowContext(ctx, `SELECT 1 FROM inbox_uploads WHERE sha256=? LIMIT 1`, sha).Scan(&one) == nil {
+		drop = false // another agent's upload still holds it
+	}
+	if drop && blobCitedTx(ctx, tx, "", sha) {
+		drop = false
+	}
+	var source string
+	if drop && (tx.QueryRowContext(ctx, `SELECT source_url FROM inbox_blobs WHERE sha256=?`, sha).Scan(&source) != nil || source != UploadRefPrefix+sha) {
+		drop = false // a URL snapshot, a voice note, or already gone
+	}
+	if drop {
+		if _, err := tx.ExecContext(ctx, `DELETE FROM inbox_blobs WHERE sha256=?`, sha); err != nil {
+			return false, err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return false, err
+	}
+	return drop, nil
+}
+
+// blobCitedTx reports whether any request (of agentID, or of anyone when
+// agentID is "") references sha as a blob, poster blob or voice blob.
+func blobCitedTx(ctx context.Context, tx *sql.Tx, agentID, sha string) bool {
 	var found int
 	var err error
 	if agentID != "" {
-		err = s.db.QueryRowContext(ctx, `SELECT 1 FROM inbox_requests r, json_tree(r.doc) j WHERE r.agent_id=? AND j.key IN ('blob','poster_blob') AND j.type='text' AND j.value=? LIMIT 1`, agentID, sha).Scan(&found)
+		err = tx.QueryRowContext(ctx, `SELECT 1 FROM inbox_requests r, json_tree(r.doc) j WHERE r.agent_id=? AND j.key IN ('blob','poster_blob') AND j.type='text' AND j.value=? LIMIT 1`, agentID, sha).Scan(&found)
 	} else {
-		err = s.db.QueryRowContext(ctx, `SELECT 1 FROM inbox_requests r, json_tree(r.doc) j WHERE j.key IN ('blob','poster_blob') AND j.type='text' AND j.value=? LIMIT 1`, sha).Scan(&found)
+		err = tx.QueryRowContext(ctx, `SELECT 1 FROM inbox_requests r, json_tree(r.doc) j WHERE j.key IN ('blob','poster_blob') AND j.type='text' AND j.value=? LIMIT 1`, sha).Scan(&found)
 	}
 	return err == nil && found == 1
 }

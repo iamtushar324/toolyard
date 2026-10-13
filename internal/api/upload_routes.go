@@ -25,7 +25,8 @@ import (
 //
 //	201 {"ref":"upload:<sha256>", "sha256", "size", "content_type"}
 //	400 size, hash or type mismatch     404 unknown ticket
-//	410 ticket used or expired          405 not PUT
+//	405 not PUT                         409 another PUT on this ticket runs
+//	410 ticket used or expired          503 too many uploads (Retry-After)
 const uploadsPathPrefix = "/v1/uploads/"
 
 // EventInboxUpload is the audit event for a stored upload.
@@ -54,12 +55,26 @@ func (s *Server) inboxUpload(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusNotFound, inbox.ErrUploadUnknown.Error())
 		return
 	}
-	pu, err := s.inbox.OpenUpload(r.Context(), ticket)
+	// A bounded number of bodies are read at once; the rest are refused
+	// now rather than queued, so slow uploads can't pile up memory, disk
+	// or file descriptors.
+	release, ok := s.inbox.AcquireUploadSlot()
+	if !ok {
+		w.Header().Set("Retry-After", "5")
+		writeError(w, http.StatusServiceUnavailable, inbox.ErrUploadServerBusy.Error())
+		return
+	}
+	defer release()
+	// Claim the ticket before reading anything: a second PUT on the same
+	// ticket is refused (409) while this one runs; CompleteUpload releases
+	// the claim on any failure.
+	pu, err := s.inbox.ClaimUpload(r.Context(), ticket)
 	if err != nil {
 		writeUploadErr(w, err)
 		return
 	}
 	if r.ContentLength >= 0 && r.ContentLength != pu.Size {
+		s.inbox.ReleaseUpload(pu)
 		writeError(w, http.StatusBadRequest, "Content-Length doesn't match the size the ticket was issued for")
 		return
 	}
@@ -98,6 +113,8 @@ func writeUploadErr(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusNotFound, err.Error())
 	case errors.Is(err, inbox.ErrUploadGone):
 		writeError(w, http.StatusGone, err.Error())
+	case errors.Is(err, inbox.ErrUploadBusy):
+		writeError(w, http.StatusConflict, err.Error())
 	default:
 		log.Printf("inbox upload: %v", err)
 		writeError(w, http.StatusInternalServerError, "upload failed")

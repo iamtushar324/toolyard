@@ -108,6 +108,11 @@ type Service struct {
 	attnMu       sync.Mutex // one attention round (Tick / dispatch) at a time
 	voiceMu      sync.Mutex
 	voiceFlights map[string]*voiceFlight
+	// uploadSlots bounds concurrent upload bodies (AcquireUploadSlot).
+	uploadSlots chan struct{}
+	// uploadRecordHook, when set (tests), runs before an upload is
+	// recorded; an error simulates a failed store.
+	uploadRecordHook func() error
 }
 
 // New creates the service and loads (or creates) the grant signing key.
@@ -120,7 +125,7 @@ func New(ctx context.Context, opts Options) (*Service, error) {
 	if now == nil {
 		now = time.Now
 	}
-	service := &Service{db: opts.DB, opts: opts, signer: signer, now: now, watch: map[string]chan struct{}{}}
+	service := &Service{db: opts.DB, opts: opts, signer: signer, now: now, watch: map[string]chan struct{}{}, uploadSlots: make(chan struct{}, MaxConcurrentUploads)}
 	if _, err := service.RecoverExecutions(ctx); err != nil {
 		return nil, fmt.Errorf("execution recovery: %w", err)
 	}
@@ -339,7 +344,6 @@ func (s *Service) Submit(ctx context.Context, agentID string, sub *Submission) (
 	if err := s.insert(ctx, r); err != nil {
 		return nil, err
 	}
-	s.markUploadsUsed(ctx, r)
 	s.heartbeat(ctx, r.SessionID)
 	res.OK, res.RequestID, res.Status, res.ExpiresAt = true, r.ID, r.Status, r.ExpiresAt
 
@@ -1431,6 +1435,11 @@ func (s *Service) insert(ctx context.Context, r *Request) error {
 		VALUES (?,?,?,?,?,?,?,?,?,?,?)`,
 		r.ID, r.AgentID, nullStr(r.SessionID), r.Kind, r.Status, r.Urgency, nullStr(r.RelatedID), string(doc), r.CreatedAt, r.UpdatedAt, r.ExpiresAt)
 	if err != nil {
+		return err
+	}
+	// Cited uploads are marked in the same transaction, so the sweep can
+	// never delete an upload this request stores a reference to.
+	if err = s.markUploadsUsedTx(ctx, tx, r); err != nil {
 		return err
 	}
 	if s.opts.Callbacks != nil {

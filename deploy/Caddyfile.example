@@ -27,7 +27,7 @@ toolyard.example.com {
     # video; the gateway caps each one at its ticket's exact size.
     @uploads path /v1/uploads/*
     request_body @uploads {
-        max_size 51MB
+        max_size 53MB
     }
     @notUploads not path /v1/uploads/*
     request_body @notUploads {

@@ -694,7 +694,7 @@ func (g *Gateway) uploadAnswer(t *inbox.UploadTicket, name string) map[string]an
 		uploadURL = base + path
 	}
 	file := name
-	if file == "" || strings.ContainsAny(file, "'\\") {
+	if file == "" {
 		file = "<file>"
 	}
 	out := map[string]any{
@@ -703,7 +703,7 @@ func (g *Gateway) uploadAnswer(t *inbox.UploadTicket, name string) map[string]an
 		"expires_at": t.ExpiresAt,
 		"method":     "PUT",
 		"headers":    map[string]string{"Content-Type": t.ContentType},
-		"curl":       "curl -sf -X PUT -H 'Content-Type: " + t.ContentType + "' --data-binary @'" + file + "' '" + uploadURL + "'",
+		"curl":       "curl -sf -X PUT -H " + shellQuote("Content-Type: "+t.ContentType) + " --data-binary " + shellQuote("@"+file) + " " + shellQuote(uploadURL),
 		"next": "PUT the exact bytes to upload_url within 15 minutes (the ticket works once), then cite the ref in an attachment: " +
 			"{\"upload\": \"" + t.Ref + "\"}. Never share upload_url: it is the credential.",
 	}
@@ -711,6 +711,12 @@ func (g *Gateway) uploadAnswer(t *inbox.UploadTicket, name string) map[string]an
 		out["note"] = "This gateway has no -public-url set, so upload_url is a path: prefix it with the toolyard address you connect to."
 	}
 	return out
+}
+
+// shellQuote quotes v as one POSIX shell word: single quotes, with any
+// embedded single quote closed, escaped and reopened.
+func shellQuote(v string) string {
+	return "'" + strings.ReplaceAll(v, "'", `'\''`) + "'"
 }
 
 func requireAgentID(ctx context.Context) (string, *mcp.CallToolResult) {

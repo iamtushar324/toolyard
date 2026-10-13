@@ -294,3 +294,37 @@ func (s *Snapshotter) Remove(ctx context.Context, sha string) error {
 	}
 	return nil
 }
+
+// CreateUploadTemp opens a temporary file in the blob directory, so a
+// finished upload can be renamed into place without a copy.
+func (s *Snapshotter) CreateUploadTemp() (*os.File, error) {
+	return os.CreateTemp(s.dir, "upload-*")
+}
+
+// Adopt moves a verified temporary file into place as blob sha. created is
+// false when the blob already existed (the temporary file is removed).
+// It writes no row: the caller records inbox_blobs in its own transaction.
+func (s *Snapshotter) Adopt(tmpPath, sha string) (created bool, err error) {
+	if !blobName.MatchString(sha) || filepath.Dir(tmpPath) != filepath.Clean(s.dir) {
+		_ = os.Remove(tmpPath)
+		return false, ErrNotFound
+	}
+	dst := filepath.Join(s.dir, sha)
+	if _, err := os.Stat(dst); err == nil {
+		_ = os.Remove(tmpPath)
+		return false, nil
+	}
+	if err := os.Rename(tmpPath, dst); err != nil {
+		_ = os.Remove(tmpPath)
+		return false, err
+	}
+	return true, nil
+}
+
+// DiscardFile removes blob sha's file only (no row). Used to undo Adopt
+// when the transaction that would have recorded it fails.
+func (s *Snapshotter) DiscardFile(sha string) {
+	if blobName.MatchString(sha) {
+		_ = os.Remove(filepath.Join(s.dir, sha))
+	}
+}

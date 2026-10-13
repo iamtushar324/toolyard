@@ -85,7 +85,7 @@ func (u *uploadEnv) upload(t *testing.T, agent string, spec UploadSpec, data []b
 	if tk.AlreadyUploaded {
 		return tk.Ref
 	}
-	p, err := u.svc.OpenUpload(ctx, tk.Ticket)
+	p, err := u.svc.ClaimUpload(ctx, tk.Ticket)
 	if err != nil {
 		t.Fatalf("open upload: %v", err)
 	}
@@ -117,31 +117,30 @@ func TestUploadTicketIsSingleUse(t *testing.T) {
 	if stored != 0 {
 		t.Fatal("the raw ticket must never be stored")
 	}
-	p, err := u.svc.OpenUpload(ctx, tk.Ticket)
+	p, err := u.svc.ClaimUpload(ctx, tk.Ticket)
 	if err != nil {
 		t.Fatal(err)
 	}
-	p2, err := u.svc.OpenUpload(ctx, tk.Ticket) // a concurrent second PUT
-	if err != nil {
-		t.Fatal(err)
+	if _, err := u.svc.ClaimUpload(ctx, tk.Ticket); !errors.Is(err, ErrUploadBusy) { // a concurrent second PUT
+		t.Fatalf("second claim while the first runs: %v, want ErrUploadBusy", err)
 	}
 	res, err := u.svc.CompleteUpload(ctx, p, "image/png", bytes.NewReader(data))
 	if err != nil || res.ContentType != "image/png" || res.Size != int64(len(data)) || res.AgentID != "ag_1" {
 		t.Fatalf("complete: %+v %v", res, err)
 	}
-	if _, err := u.svc.OpenUpload(ctx, tk.Ticket); !errors.Is(err, ErrUploadGone) {
-		t.Fatalf("reopen a used ticket: %v, want ErrUploadGone", err)
+	if _, err := u.svc.ClaimUpload(ctx, tk.Ticket); !errors.Is(err, ErrUploadGone) {
+		t.Fatalf("reclaim a used ticket: %v, want ErrUploadGone", err)
 	}
-	if _, err := u.svc.CompleteUpload(ctx, p2, "image/png", bytes.NewReader(data)); !errors.Is(err, ErrUploadGone) {
-		t.Fatalf("second PUT on the same ticket: %v, want ErrUploadGone", err)
+	if _, err := u.svc.CompleteUpload(ctx, p, "image/png", bytes.NewReader(data)); !errors.Is(err, ErrUploadGone) {
+		t.Fatalf("completing a used claim again: %v, want ErrUploadGone", err)
 	}
 	if !u.snaps.Exists(ctx, hexSum(data)) {
 		t.Fatal("blob not stored")
 	}
-	if _, err := u.svc.OpenUpload(ctx, "tyu_"+strings.Repeat("A", 43)); !errors.Is(err, ErrUploadUnknown) {
+	if _, err := u.svc.ClaimUpload(ctx, "tyu_"+strings.Repeat("A", 43)); !errors.Is(err, ErrUploadUnknown) {
 		t.Fatalf("unknown ticket: %v", err)
 	}
-	if _, err := u.svc.OpenUpload(ctx, "nope"); !errors.Is(err, ErrUploadUnknown) {
+	if _, err := u.svc.ClaimUpload(ctx, "nope"); !errors.Is(err, ErrUploadUnknown) {
 		t.Fatalf("malformed ticket: %v", err)
 	}
 }
@@ -157,17 +156,92 @@ func TestUploadTicketExpires(t *testing.T) {
 	if tk.ExpiresAt != u.now.Add(UploadTicketTTL).UnixMilli() {
 		t.Fatalf("expiry %d, want 15 minutes", tk.ExpiresAt)
 	}
-	p, err := u.svc.OpenUpload(ctx, tk.Ticket)
+	late, err := u.svc.CreateUpload(ctx, "ag_1", pngSpec(testPNG(20)))
 	if err != nil {
 		t.Fatal(err)
 	}
-	u.advance(UploadTicketTTL + time.Second)
-	if _, err := u.svc.OpenUpload(ctx, tk.Ticket); !errors.Is(err, ErrUploadGone) {
+	u.advance(UploadTicketTTL - time.Minute)
+	p, err := u.svc.ClaimUpload(ctx, tk.Ticket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	u.advance(2 * time.Minute) // past the ticket's expiry, inside the claim
+	if _, err := u.svc.ClaimUpload(ctx, late.Ticket); !errors.Is(err, ErrUploadGone) {
 		t.Fatalf("expired ticket: %v, want ErrUploadGone", err)
 	}
-	// A PUT that started before expiry and finished after it is refused too.
-	if _, err := u.svc.CompleteUpload(ctx, p, "image/png", bytes.NewReader(data)); !errors.Is(err, ErrUploadGone) {
-		t.Fatalf("complete after expiry: %v", err)
+	// The sweep must not delete a ticket whose PUT is still running ...
+	u.svc.Sweep(ctx)
+	// ... and a body claimed before expiry still counts when it finishes.
+	if _, err := u.svc.CompleteUpload(ctx, p, "image/png", bytes.NewReader(data)); err != nil {
+		t.Fatalf("complete a claim taken before expiry: %v", err)
+	}
+}
+
+// A store failure after the claim releases it: no burned ticket, no
+// orphan file, and the same ticket works on retry.
+func TestUploadClaimReleasedOnStoreFailure(t *testing.T) {
+	u := newUploadEnv(t, false)
+	ctx := context.Background()
+	data := testPNG(21)
+	tk, err := u.svc.CreateUpload(ctx, "ag_1", pngSpec(data))
+	if err != nil {
+		t.Fatal(err)
+	}
+	p, err := u.svc.ClaimUpload(ctx, tk.Ticket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	u.svc.uploadRecordHook = func() error { return errors.New("disk full") }
+	if _, err := u.svc.CompleteUpload(ctx, p, "image/png", bytes.NewReader(data)); err == nil {
+		t.Fatal("the store failure should surface")
+	}
+	if u.snaps.Exists(ctx, hexSum(data)) {
+		t.Fatal("a failed store must not leave a file without its row")
+	}
+	var owners int
+	_ = u.db.QueryRow(`SELECT COUNT(*) FROM inbox_uploads`).Scan(&owners)
+	if owners != 0 {
+		t.Fatal("no owner row after a failed store")
+	}
+	u.svc.uploadRecordHook = nil
+	p, err = u.svc.ClaimUpload(ctx, tk.Ticket)
+	if err != nil {
+		t.Fatalf("the claim should be released after a failure: %v", err)
+	}
+	if _, err := u.svc.CompleteUpload(ctx, p, "image/png", bytes.NewReader(data)); err != nil {
+		t.Fatalf("retry with the same ticket: %v", err)
+	}
+	// A bad body releases the claim too.
+	tk2, _ := u.svc.CreateUpload(ctx, "ag_1", pngSpec(testPNG(22)))
+	p2, _ := u.svc.ClaimUpload(ctx, tk2.Ticket)
+	if _, err := u.svc.CompleteUpload(ctx, p2, "image/png", bytes.NewReader([]byte("short"))); !isUploadErr(err) {
+		t.Fatalf("short body: %v", err)
+	}
+	if _, err := u.svc.ClaimUpload(ctx, tk2.Ticket); err != nil {
+		t.Fatalf("claim after a bad body: %v", err)
+	}
+}
+
+func TestUploadSlotsAreBounded(t *testing.T) {
+	u := newUploadEnv(t, false)
+	var releases []func()
+	for i := 0; i < MaxConcurrentUploads; i++ {
+		rel, ok := u.svc.AcquireUploadSlot()
+		if !ok {
+			t.Fatalf("slot %d refused", i)
+		}
+		releases = append(releases, rel)
+	}
+	if _, ok := u.svc.AcquireUploadSlot(); ok {
+		t.Fatal("a slot beyond the cap was granted")
+	}
+	releases[0]()
+	releases[0]() // releasing twice frees one slot only
+	if _, ok := u.svc.AcquireUploadSlot(); !ok {
+		t.Fatal("a released slot should be reusable")
+	}
+	if _, ok := u.svc.AcquireUploadSlot(); ok {
+		t.Fatal("a double release must not free two slots")
 	}
 }
 
@@ -181,7 +255,7 @@ func TestUploadRejectsSizeHashAndTypeMismatches(t *testing.T) {
 		if err != nil {
 			t.Fatalf("create: %v", err)
 		}
-		p, err := u.svc.OpenUpload(ctx, tk.Ticket)
+		p, err := u.svc.ClaimUpload(ctx, tk.Ticket)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -252,6 +326,10 @@ func TestCreateUploadValidates(t *testing.T) {
 		"no name":      {Name: " ", ContentType: "image/png", Size: 10, SHA256: hexSum(data)},
 		"no type":      {Name: "a.png", ContentType: "", Size: 10, SHA256: hexSum(data)},
 		"video as img": {Name: "a.mp4", ContentType: "video/mp4", Size: 10, SHA256: hexSum(data)},
+		"quote type":   {Name: "a.png", ContentType: "image/png'; rm -rf ~; '", Size: 10, SHA256: hexSum(data)},
+		"subst type":   {Name: "a.png", ContentType: "image/png$(id)", Size: 10, SHA256: hexSum(data)},
+		"tick type":    {Name: "a.png", ContentType: "image/`id`png", Size: 10, SHA256: hexSum(data)},
+		"param quote":  {Name: "a.png", ContentType: "image/png; x=\"a b\"", Size: 10, SHA256: hexSum(data)},
 	}
 	for name, spec := range cases {
 		if _, err := u.svc.CreateUpload(ctx, "ag_1", spec); !isUploadErr(err) {
@@ -510,5 +588,103 @@ func TestSweepKeepsBlobAnotherAgentStillHolds(t *testing.T) {
 	}
 	if u.svc.BlobBelongsToAgent(ctx, "ag_1", hexSum(data)) {
 		t.Fatal("ag_1's expired upload no longer grants access")
+	}
+}
+
+// The sweep deletes only blobs an upload created: a blob that a URL
+// snapshot or a recorded voice note wrote first keeps its file.
+func TestSweepKeepsURLAndVoiceBlobs(t *testing.T) {
+	u := newUploadEnv(t, false)
+	ctx := context.Background()
+	voice, fetched := testPNG(30), testPNG(31)
+	if _, err := u.snaps.Put(ctx, voice, "image/png", "voice:rq_1"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := u.snaps.Put(ctx, fetched, "image/png", "https://example.com/shot.png"); err != nil {
+		t.Fatal(err)
+	}
+	u.upload(t, "ag_1", pngSpec(voice), voice)
+	u.upload(t, "ag_1", pngSpec(fetched), fetched)
+	u.advance(UploadRetention + 2*time.Hour)
+	u.svc.Sweep(ctx)
+	var rows int
+	_ = u.db.QueryRow(`SELECT COUNT(*) FROM inbox_uploads`).Scan(&rows)
+	if rows != 0 {
+		t.Fatalf("the uncited upload rows should go, %d left", rows)
+	}
+	for name, b := range map[string][]byte{"voice": voice, "url": fetched} {
+		f, _, err := u.snaps.Open(ctx, hexSum(b))
+		if err != nil {
+			t.Fatalf("%s blob was deleted: %v", name, err)
+		}
+		f.Close()
+	}
+}
+
+// A submission that resolves an upload touches it, so a sweep running at
+// the same time skips it instead of deleting it under the citation.
+func TestSweepSkipsUploadsASubmissionJustResolved(t *testing.T) {
+	u := newUploadEnv(t, false)
+	ctx := context.Background()
+	data := testPNG(32)
+	ref := u.upload(t, "ag_1", pngSpec(data), data)
+	u.advance(UploadRetention + time.Hour) // stale by age
+	sub := uploadPost(Attachment{Type: "image", Upload: ref})
+	sub.Kind, sub.DryRun = KindQuestion, true
+	sub.SchemaVersion, sub.Prompt, sub.Question = 2, "Does the checkout page look right to you?", &Question{Type: "free_text"}
+	if res, err := u.svc.Submit(ctx, "ag_1", sub); err != nil || !res.OK {
+		t.Fatalf("dry run: %+v %v", res, err)
+	}
+	u.svc.Sweep(ctx)
+	if !u.snaps.Exists(ctx, hexSum(data)) {
+		t.Fatal("an upload a submission just resolved must survive the sweep")
+	}
+	// Sending it for real marks it cited in the same transaction.
+	res, err := u.svc.Submit(ctx, "ag_1", uploadPost(Attachment{Type: "image", Upload: ref}))
+	if err != nil || !res.OK {
+		t.Fatalf("post: %+v %v", res, err)
+	}
+	u.advance(UploadRetention)
+	u.svc.Sweep(ctx)
+	if !u.snaps.Exists(ctx, hexSum(data)) {
+		t.Fatal("a cited upload must survive")
+	}
+	// A resolved-but-never-sent upload goes once the grace period passes.
+	other := testPNG(33)
+	oref := u.upload(t, "ag_1", pngSpec(other), other)
+	u.advance(UploadRetention + time.Hour)
+	sub.Attachments = []Attachment{{Type: "image", Upload: oref}}
+	if res, err := u.svc.Submit(ctx, "ag_1", sub); err != nil || !res.OK {
+		t.Fatalf("dry run 2: %+v %v", res, err)
+	}
+	u.advance(2 * uploadTouchGrace)
+	u.svc.Sweep(ctx)
+	if u.snaps.Exists(ctx, hexSum(other)) {
+		t.Fatal("an upload only dry-run cited should go after the grace period")
+	}
+}
+
+// An upload-sourced blob whose owner rows are gone is collected too.
+func TestSweepCollectsOwnerlessUploadBlobs(t *testing.T) {
+	u := newUploadEnv(t, false)
+	ctx := context.Background()
+	data := testPNG(34)
+	sha := hexSum(data)
+	if _, err := u.snaps.Put(ctx, data, "image/png", "voice:placeholder"); err != nil {
+		t.Fatal(err)
+	}
+	// Re-label it as an upload blob written by the service clock.
+	if _, err := u.db.Exec(`UPDATE inbox_blobs SET source_url=?, created_at=? WHERE sha256=?`, UploadRefPrefix+sha, u.now.UnixMilli(), sha); err != nil {
+		t.Fatal(err)
+	}
+	u.advance(time.Hour)
+	u.svc.Sweep(ctx)
+	if !u.snaps.Exists(ctx, sha) {
+		t.Fatal("a young ownerless blob stays")
+	}
+	u.advance(UploadRetention)
+	u.svc.Sweep(ctx)
+	if u.snaps.Exists(ctx, sha) {
+		t.Fatal("an old ownerless upload blob should be collected")
 	}
 }

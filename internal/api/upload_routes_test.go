@@ -6,10 +6,13 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/tusharbhardwaj/toolyard/internal/audit"
 	"github.com/tusharbhardwaj/toolyard/internal/identity"
@@ -209,5 +212,121 @@ func TestUploadRouteGuards(t *testing.T) {
 	}
 	if unauthRouteLimit("/v1/uploads/tyu_abc") == nil {
 		t.Error("upload PUTs need a per-IP rate limit")
+	}
+}
+
+// Two PUTs on one ticket: the second, arriving while the first is still
+// reading its body, is refused at once (409), and exactly one stores.
+func TestInboxUploadParallelPUTs(t *testing.T) {
+	f := newInboxAPIFixture(t)
+	ctx := context.Background()
+	data := uploadTestPNG("parallel")
+	tk, err := f.svc.CreateUpload(ctx, f.agent, inbox.UploadSpec{Name: "p.png", ContentType: "image/png", Size: int64(len(data)), SHA256: sha256Hex(data)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := "/v1/uploads/" + tk.Ticket
+	pr, pw := io.Pipe()
+	first := make(chan int, 1)
+	go func() {
+		req := httptest.NewRequest(http.MethodPut, path, pr)
+		req.Header.Set("Content-Type", "image/png")
+		rec := httptest.NewRecorder()
+		f.uploadStack().ServeHTTP(rec, req)
+		first <- rec.Code
+	}()
+	// Wait until the first PUT holds the claim.
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		var claimed int
+		_ = f.db.QueryRow(`SELECT COUNT(*) FROM inbox_upload_tickets WHERE claimed_until IS NOT NULL`).Scan(&claimed)
+		if claimed == 1 {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("the first PUT never claimed the ticket")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	second := f.put(t, path, "image/png", data, nil)
+	if _, err := pw.Write(data); err != nil {
+		t.Fatal(err)
+	}
+	_ = pw.Close()
+	code := <-first
+	if code != http.StatusCreated || second.Code != http.StatusConflict {
+		t.Fatalf("first %d, second %d %s; want 201 and 409", code, second.Code, second.Body.String())
+	}
+	if again := f.put(t, path, "image/png", data, nil); again.Code != http.StatusGone {
+		t.Fatalf("PUT after success: %d, want 410", again.Code)
+	}
+}
+
+// When every upload slot is busy, a PUT is refused with 503 and
+// Retry-After, and the ticket stays usable.
+func TestInboxUploadConcurrencyCap(t *testing.T) {
+	f := newInboxAPIFixture(t)
+	ctx := context.Background()
+	data := uploadTestPNG("capped")
+	tk, err := f.svc.CreateUpload(ctx, f.agent, inbox.UploadSpec{Name: "c.png", ContentType: "image/png", Size: int64(len(data)), SHA256: sha256Hex(data)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var held []func()
+	for i := 0; i < inbox.MaxConcurrentUploads; i++ {
+		rel, ok := f.svc.AcquireUploadSlot()
+		if !ok {
+			t.Fatalf("slot %d", i)
+		}
+		held = append(held, rel)
+	}
+	rec := f.put(t, "/v1/uploads/"+tk.Ticket, "image/png", data, nil)
+	if rec.Code != http.StatusServiceUnavailable || rec.Header().Get("Retry-After") == "" {
+		t.Fatalf("PUT with every slot busy: %d %q", rec.Code, rec.Header().Get("Retry-After"))
+	}
+	for _, rel := range held {
+		rel()
+	}
+	if rec := f.put(t, "/v1/uploads/"+tk.Ticket, "image/png", data, nil); rec.Code != http.StatusCreated {
+		t.Fatalf("PUT after slots free up: %d %s", rec.Code, rec.Body.String())
+	}
+}
+
+// Behind a trusted proxy the client is the rightmost X-Forwarded-For hop
+// that isn't a trusted proxy, so a client-set header can't pick its own IP
+// (and dodge per-IP limits such as the upload limit).
+func TestClientIPUsesRightmostUntrustedHop(t *testing.T) {
+	_, trusted, _ := net.ParseCIDR("10.0.0.0/8")
+	_, loop, _ := net.ParseCIDR("127.0.0.1/32")
+	o := SecurityOptions{TrustedProxies: []*net.IPNet{trusted, loop}}
+	cases := []struct {
+		peer string
+		xff  []string
+		want string
+	}{
+		{"10.0.0.7:1", []string{"203.0.113.9"}, "203.0.113.9"},
+		{"10.0.0.7:1", []string{"6.6.6.6, 203.0.113.9"}, "203.0.113.9"},
+		{"10.0.0.7:1", []string{"127.0.0.1, 203.0.113.9, 10.0.0.5"}, "203.0.113.9"},
+		{"10.0.0.7:1", []string{"6.6.6.6", "203.0.113.9"}, "203.0.113.9"},
+		{"10.0.0.7:1", []string{"10.0.0.1, 10.0.0.5"}, "10.0.0.1"},
+		{"10.0.0.7:1", []string{"1.2.3.4, not-an-ip"}, "10.0.0.7"},
+		{"10.0.0.7:1", nil, "10.0.0.7"},
+		{"198.51.100.4:1", []string{"1.2.3.4"}, "198.51.100.4"},
+	}
+	for _, c := range cases {
+		r := httptest.NewRequest(http.MethodGet, "/v1/health", nil)
+		r.RemoteAddr = c.peer
+		for _, v := range c.xff {
+			r.Header.Add("X-Forwarded-For", v)
+		}
+		if got := o.ClientIP(r); got != c.want {
+			t.Errorf("peer %s xff %q: got %s, want %s", c.peer, c.xff, got, c.want)
+		}
+	}
+	r := httptest.NewRequest(http.MethodGet, "/debug/pprof/", nil)
+	r.RemoteAddr = "127.0.0.1:1"
+	r.Header.Set("X-Forwarded-For", "127.0.0.1, 203.0.113.9")
+	if o.IsLoopback(r) {
+		t.Error("a client-set 127.0.0.1 must not pass the loopback check")
 	}
 }

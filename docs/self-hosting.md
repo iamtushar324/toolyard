@@ -216,9 +216,20 @@ Settings → **Inbox & permissions**:
   15 minutes and is bound to one agent, size, sha256 and content type, and
   the real type is sniffed (images must be PNG, JPEG, WebP or GIF; no HTML or
   SVG files). Uploads share `<data-dir>/inbox/blobs/` and the same size
-  limits; an upload no request cites within 24 hours is deleted. A reverse
-  proxy in front must allow bodies up to 51 MB on `/v1/uploads/*` (see
-  `deploy/Caddyfile.example`).
+  limits; an upload no request cites within 24 hours is deleted. At most 8
+  upload bodies are read at once (more get `503` with `Retry-After`). A
+  reverse proxy in front must allow bodies of at least 50 MiB (52,428,800
+  bytes) on `/v1/uploads/*`: in Caddy `max_size 53MB` (Caddy's `MB` is
+  decimal; see `deploy/Caddyfile.example`).
+- **Traefik in front (production):** production fronts Toolyard with
+  Traefik v3 plus a socat TCP proxy. No buffering middleware is set on that
+  router, so Traefik applies no body limit. But Traefik v3's entrypoint
+  `respondingTimeouts.readTimeout` defaults to 60s, which can cut a slow,
+  large upload. If agents upload large videos, set it on the `websecure`
+  entrypoint, for example
+  `--entryPoints.websecure.transport.respondingTimeouts.readTimeout=300s`
+  (static config: `entryPoints.websecure.transport.respondingTimeouts.readTimeout: 300s`).
+  Toolyard itself allows an upload body 5 minutes.
 - **Judge model** (default off): needs `GEMINI_API_KEY`. Request text is
   sent to Gemini to check each tool call against the agent's own words.
   `inbox_judge_model` overrides the model (default `gemini-2.5-flash`;

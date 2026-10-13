@@ -41,21 +41,35 @@ func (o SecurityOptions) IsBehindHTTPS(r *http.Request) bool {
 }
 
 // ClientIP returns the apparent client IP, honoring X-Forwarded-For only
-// when the immediate peer is in TrustedProxies. Falls back to RemoteAddr.
+// when the immediate peer is in TrustedProxies. A client can put anything
+// in the header it sends, and each proxy appends the address it saw, so
+// the chain is read from the right: the first address that is not itself
+// a trusted proxy is the client. An unparsable hop stops the walk (falls
+// back to the peer). Falls back to RemoteAddr.
 func (o SecurityOptions) ClientIP(r *http.Request) string {
-	if o.proxyTrusted(r) {
-		if v := r.Header.Get("X-Forwarded-For"); v != "" {
-			// First entry is the original client per spec.
-			parts := strings.Split(v, ",")
-			ip := strings.TrimSpace(parts[0])
-			if ip != "" {
-				return ip
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		host = r.RemoteAddr
+	}
+	if !o.proxyTrusted(r) {
+		return host
+	}
+	var hops []string
+	for _, v := range r.Header.Values("X-Forwarded-For") {
+		for _, p := range strings.Split(v, ",") {
+			if p = strings.TrimSpace(p); p != "" {
+				hops = append(hops, p)
 			}
 		}
 	}
-	host, _, err := net.SplitHostPort(r.RemoteAddr)
-	if err != nil {
-		return r.RemoteAddr
+	for i := len(hops) - 1; i >= 0; i-- {
+		ip := net.ParseIP(hops[i])
+		if ip == nil {
+			return host
+		}
+		if !o.ipTrusted(ip) || i == 0 {
+			return ip.String()
+		}
 	}
 	return host
 }
@@ -78,6 +92,10 @@ func (o SecurityOptions) proxyTrusted(r *http.Request) bool {
 	if ip == nil {
 		return false
 	}
+	return o.ipTrusted(ip)
+}
+
+func (o SecurityOptions) ipTrusted(ip net.IP) bool {
 	for _, c := range o.TrustedProxies {
 		if c.Contains(ip) {
 			return true
