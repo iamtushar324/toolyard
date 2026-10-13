@@ -27,6 +27,7 @@ import (
 )
 
 type inboxAPIFixture struct {
+	db     *store.DB
 	srv    *Server
 	pushes *[]inbox.Push
 	mux    *http.ServeMux
@@ -91,13 +92,34 @@ func newInboxAPIFixture(t *testing.T) *inboxAPIFixture {
 	if cookie == nil {
 		t.Fatalf("login failed: %d %s", rec.Code, rec.Body.String())
 	}
-	return &inboxAPIFixture{srv: srv, pushes: pushes, mux: mux, cookie: cookie, svc: svc, token: tok, agent: ag.ID}
+	return &inboxAPIFixture{db: db, srv: srv, pushes: pushes, mux: mux, cookie: cookie, svc: svc, token: tok, agent: ag.ID}
 }
 
 func (f *inboxAPIFixture) owner(t *testing.T, method, path string, body any) (int, map[string]any) {
 	t.Helper()
 	var rd *bytes.Reader
 	if body != nil {
+		if m, ok := body.(map[string]any); ok && m["action"] == "approve" {
+			id := strings.TrimSuffix(strings.TrimPrefix(path, "/v1/inbox/"), "/decide")
+			r, e := f.svc.Get(context.Background(), id)
+			if e == nil {
+				allow, _ := m["allow"].([]bool)
+				verdicts := map[string]inbox.CallVerdict{}
+				for i, v := range allow {
+					if i >= len(r.Tools) {
+						break
+					}
+					verdict := inbox.VerdictRejected
+					if v {
+						verdict = inbox.VerdictAccepted
+					}
+					verdicts[r.Tools[i].CallID] = inbox.CallVerdict{Verdict: verdict}
+				}
+				m["verdicts"] = verdicts
+				m["request_revision"] = r.Revision
+				m["submission_id"] = "test_approval"
+			}
+		}
 		b, _ := json.Marshal(body)
 		rd = bytes.NewReader(b)
 	} else {
@@ -136,13 +158,14 @@ func (f *inboxAPIFixture) agentRun(t *testing.T, tool string, args map[string]an
 
 func accessRequest(tool string) map[string]any {
 	return map[string]any{
+		"task":    map[string]any{"objective": "Remove the unused preview resource."},
 		"title":   "Delete the stale preview env",
 		"summary": "One cleanup call.",
 		"message": "The preview environment for PR 12 has been idle for a month, so I'd like to delete it.",
 		"facts":   map[string]any{"why_now": "It costs money every day.", "if_it_goes_wrong": "Only the preview env.", "undo": "Recreate it from the PR."},
 		"audio":   map[string]any{"script": "I'd like to delete the old preview environment. It has been idle for a month."},
 		"urgency": "soon",
-		"tools":   []any{map[string]any{"tool": tool, "required": true, "summary": "Delete the preview env.", "params": map[string]any{"key": "preview-12"}}},
+		"tools":   []any{map[string]any{"call_id": "delete_preview", "target": "Preview environment preview-12", "operation": "write", "expected_effects": "The unused preview record is removed.", "affected_scope": "Only the preview-12 record", "material_risks": "The preview must be recreated if needed.", "undo": "Recreate the preview from the PR.", "tool": tool, "required": true, "summary": "Delete the preview env.", "params": map[string]any{"key": "preview-12"}}},
 	}
 }
 
@@ -184,8 +207,8 @@ func TestInboxAPIFlow(t *testing.T) {
 	if code, out := f.owner(t, "POST", "/v1/inbox/"+id+"/explain", map[string]any{"tool_index": 0}); code != 200 || !strings.Contains(out["text"].(string), "memory.delete") {
 		t.Fatalf("explain: %d %v", code, out)
 	}
-	if code, _ := f.owner(t, "POST", "/v1/inbox/"+id+"/decide", map[string]any{"action": "approve", "allow": []bool{false}}); code != 400 {
-		t.Fatalf("refusing a required tool on approve should be 400, got %d", code)
+	if code, _ := f.owner(t, "POST", "/v1/inbox/"+id+"/decide", map[string]any{"action": "submit", "request_revision": 1, "submission_id": "missing_verdicts"}); code != 400 {
+		t.Fatalf("a complete call-ID verdict map is required, got %d", code)
 	}
 	if code, out := f.owner(t, "POST", "/v1/inbox/"+id+"/decide", map[string]any{"action": "approve", "allow": []bool{true}, "note": "go ahead"}); code != 200 ||
 		out["request"].(map[string]any)["status"] != inbox.StatusApproved {
@@ -330,10 +353,10 @@ func TestPasskeyAPIFlow(t *testing.T) {
 		t.Fatalf("list: %d %v", code, out)
 	}
 
-	res, err := f.svc.Submit(ctx, f.agent, &inbox.Submission{Kind: inbox.KindAccess, Title: "Deploy api", Summary: "s",
+	res, err := f.svc.Submit(ctx, f.agent, &inbox.Submission{Task: &inbox.TaskContext{Objective: "Remove the obsolete cache key for the test."}, Kind: inbox.KindAccess, Title: "Deploy api", Summary: "s",
 		Message: "I'd like to deploy the api to production.", Audio: inbox.Audio{Script: "Deploy?"}, Urgency: inbox.UrgencySoon,
 		Facts: &inbox.Facts{WhyNow: "w", IfItGoesWrong: "g", Undo: "u"},
-		Tools: []inbox.SubmissionTool{{Tool: "memory.delete", Required: true, Summary: "Delete the prod key.", Params: map[string]any{"key": "prod-cache"}}}})
+		Tools: []inbox.SubmissionTool{{CallID: "delete_cache", Target: "Cache key prod-cache", Operation: "write", ExpectedEffects: "The obsolete cache key is removed.", AffectedScope: "Only prod-cache", MaterialRisks: "The cached content becomes unavailable.", Undo: "Rebuild the cache from its source.", Tool: "memory.delete", Required: true, Summary: "Delete the prod key.", Params: map[string]any{"key": "prod-cache"}}}})
 	if err != nil || !res.OK {
 		t.Fatalf("submit: %v %+v", err, res)
 	}

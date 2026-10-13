@@ -35,7 +35,7 @@ func (s *Server) cliWhoami(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusUnauthorized, "bearer token required")
 		return
 	}
-	ag, err := s.identity.VerifyAgentToken(r.Context(), strings.TrimPrefix(authz, "Bearer "))
+	ag, err := s.verifyAgentToken(r.Context(), strings.TrimPrefix(authz, "Bearer "))
 	if err != nil {
 		writeError(w, http.StatusUnauthorized, "invalid agent token")
 		return

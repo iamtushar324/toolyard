@@ -81,7 +81,7 @@ func (g *Gateway) handleSearchTools() directHandler {
 		q, _ := args["query"].(string)
 		limitedTo, _ := args["upstream"].(string)
 		limit := 50
-		if v, ok := args["limit"].(float64); ok && int(v) > 0 {
+		if v, ok := numericArgument(args["limit"]); ok && int(v) > 0 {
 			limit = int(v)
 		}
 		needle := strings.ToLower(strings.TrimSpace(q))

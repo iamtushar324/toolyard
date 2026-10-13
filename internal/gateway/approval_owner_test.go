@@ -18,6 +18,8 @@ import (
 // before the call returns, and returns the approval id.
 func raiseExecuted(t *testing.T, f *actorFixture, ctx context.Context) string {
 	t.Helper()
+	// Historical execution fixtures use the old path without an Inbox.
+	f.gw.SetInbox(nil, nil, nil)
 	f.bus.SetAutoApprover(fakeAuto{rule: "rule_1", creator: "u_creator"})
 	res := f.call(t, ctx, "test", "t.run", map[string]any{"env": "prod"})
 	if res.IsError || !strings.Contains(textOf(res), "ran") {

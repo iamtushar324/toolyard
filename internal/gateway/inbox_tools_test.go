@@ -95,11 +95,11 @@ func structured(t *testing.T, res *mcp.CallToolResult) map[string]any {
 
 func deployArgs() map[string]any { return map[string]any{"service": "api", "env": "prod"} }
 
-func TestExecuteModeKeepsLegacyFlow(t *testing.T) {
+func TestExecuteModeRequiresInboxForNewCalls(t *testing.T) {
 	f := newInboxFixture(t)
 	res := f.call(t, f.agent, "deploy.run", deployArgs())
-	if s := structured(t, res); s["status"] != "pending_approval" {
-		t.Fatalf("execute mode should queue an approval, got %v", s["status"])
+	if s := structured(t, res); s["status"] != "permission_required" {
+		t.Fatalf("execute mode must require an Inbox request for new calls, got %v", s["status"])
 	}
 	if f.calls.Load() != 0 {
 		t.Fatal("tool ran without approval")
@@ -117,8 +117,8 @@ func TestDeclaredIntentOnlyEscalates(t *testing.T) {
 		return a
 	}
 	for _, c := range []struct{ tool, intent string }{{"deploy.run", "read"}, {"deploy.get_status", "write"}} {
-		if s := structured(t, f.call(t, f.agent, c.tool, withIntent(c.intent))); s["status"] != "pending_approval" {
-			t.Fatalf("execute mode: %s declared %s should queue an approval, got %v", c.tool, c.intent, s["status"])
+		if s := structured(t, f.call(t, f.agent, c.tool, withIntent(c.intent))); s["status"] != "permission_required" {
+			t.Fatalf("execute mode: %s declared %s must require an Inbox request, got %v", c.tool, c.intent, s["status"])
 		}
 	}
 	f.mode = ApprovalModeInbox
@@ -171,9 +171,9 @@ func TestInboxModeCoaches(t *testing.T) {
 	if !coached {
 		t.Fatal("expected a call.coached audit event")
 	}
-	// Anonymous callers keep the legacy flow: grants need an identity.
-	if s := structured(t, f.call(t, f.anonym, "deploy.run", deployArgs())); s["status"] != "pending_approval" {
-		t.Fatalf("anonymous caller should get the legacy flow, got %v", s["status"])
+	// Anonymous callers cannot bypass the Inbox context contract.
+	if s := structured(t, f.call(t, f.anonym, "deploy.run", deployArgs())); s["status"] != "permission_required" {
+		t.Fatalf("anonymous caller must receive an actionable upgrade response, got %v", s["status"])
 	}
 	// Reads are unaffected.
 	if res := f.call(t, f.agent, "deploy.get_status", nil); res.IsError || f.calls.Load() != 1 {
@@ -183,6 +183,7 @@ func TestInboxModeCoaches(t *testing.T) {
 
 func requestArgs(params map[string]any) map[string]any {
 	return map[string]any{
+		"task":    map[string]any{"objective": "Deploy the API fix for the affected customers."},
 		"title":   "Deploy api to prod",
 		"summary": "I need one deploy.",
 		"message": "The fix is merged and green, so I'd like to deploy the api service to production.",
@@ -190,7 +191,7 @@ func requestArgs(params map[string]any) map[string]any {
 		"audio":   map[string]any{"script": "I'd like to deploy the api service to production. The fix is merged and all checks passed."},
 		"urgency": "soon",
 		"tools": []any{map[string]any{
-			"tool": "deploy.run", "required": true, "summary": "Deploy api to prod.", "params": params,
+			"call_id": "deploy_api", "target": "Production API service", "operation": "write", "expected_effects": "The API uses the fixed release.", "affected_scope": "API service deployment", "material_risks": "A wrong release can interrupt API requests.", "undo": "Redeploy the prior release.", "tool": "deploy.run", "required": true, "summary": "Deploy api to prod.", "params": params,
 		}},
 	}
 }
@@ -211,7 +212,7 @@ func (f *inboxFixture) approvedGrant(t *testing.T) string {
 		t.Fatalf("request: %v", s)
 	}
 	f.svc.Flush()
-	if _, err := f.svc.Decide(ctx, id, inbox.Decision{Action: "approve", Allow: []bool{true}}); err != nil {
+	if _, err := f.svc.Decide(ctx, id, inbox.Decision{Action: "submit", RequestRevision: 1, SubmissionID: "test_approval", Verdicts: map[string]inbox.CallVerdict{"deploy_api": {Verdict: inbox.VerdictAccepted}}}); err != nil {
 		t.Fatal(err)
 	}
 	w := structured(t, f.call(t, f.agent, "inbox.wait", map[string]any{"ids": []any{id}, "timeout_seconds": 1}))

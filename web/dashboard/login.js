@@ -24,7 +24,10 @@
   // for the Beknown instance is another app, so the exchange below would
   // never run. Path only: <SignIn/> keeps its steps in the hash, and the
   // query may carry ?signout=1 or Clerk handshake parameters.
-  const here = location.origin + location.pathname;
+  const hostRequest = new URLSearchParams(location.search).get('host_request');
+  const safeHostRequest = /^[A-Za-z0-9_-]{43}$/.test(hostRequest || '') ? hostRequest : null;
+  const here = location.origin + location.pathname + (safeHostRequest ? '?host_request=' + encodeURIComponent(safeHostRequest) : '');
+  const afterLogin = safeHostRequest ? '/connections/authorize?request=' + encodeURIComponent(safeHostRequest) : '/';
   // The dashboard's Logout sends Google users here with ?signout=1 so the
   // Clerk session ends too; otherwise the next visit signs straight back in.
   const signingOut = new URLSearchParams(location.search).get('signout') === '1';
@@ -189,7 +192,7 @@
       showFailed("Couldn't reach toolyard. Check your connection and try again.");
       return;
     }
-    if (r.ok) { location.replace('/'); return; }
+    if (r.ok) { location.replace(afterLogin); return; }
     const code = res && res.error;
     if (r.status === 403 && code === 'not_org_member') { showDenied(); return; }
     if (r.status === 403 && code === 'blocked') { showBlocked(); return; }

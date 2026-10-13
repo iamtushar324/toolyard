@@ -79,6 +79,8 @@ type botServer struct {
 	mu            sync.Mutex
 	lastOffset    int64
 	sentMessages  int
+	sentMarkup    []string
+	sentTexts     []string
 	editedMessage int
 	answeredCBs   []string
 }
@@ -98,6 +100,8 @@ func newBotServer(t *testing.T) *botServer {
 			writeResult(w, true)
 		case "sendMessage":
 			bs.sentMessages++
+			bs.sentMarkup = append(bs.sentMarkup, r.Form.Get("reply_markup"))
+			bs.sentTexts = append(bs.sentTexts, r.Form.Get("text"))
 			writeResult(w, map[string]any{"message_id": 555, "chat": map[string]any{"id": 1000}})
 		case "editMessageText":
 			bs.editedMessage++
@@ -183,13 +187,13 @@ func TestPairingRightAndWrongCode(t *testing.T) {
 	}
 }
 
-func TestCallbackDecideAuthorized(t *testing.T) {
+func TestLegacyCallbackDirectsAuthorizedUserToInbox(t *testing.T) {
 	var gotID, gotAction, gotBy string
 	decide := func(ctx context.Context, id, action, decidedBy string) (string, bool, error) {
 		gotID, gotAction, gotBy = id, action, decidedBy
 		return "allowed", false, nil
 	}
-	svc, set, _ := newTestService(t, decide)
+	svc, set, bs := newTestService(t, decide)
 	_, _ = svc.Configure(context.Background(), "123:ABC")
 	_ = set.Set(context.Background(), KeyChatID, "1000")
 	_ = set.Set(context.Background(), KeyUserID, "7")
@@ -197,9 +201,14 @@ func TestCallbackDecideAuthorized(t *testing.T) {
 
 	// Authorized callback from the paired user/chat.
 	svc.handleUpdate(context.Background(), c, callbackUpdate(3, "d|allowed|ap_xyz", 7, 1000))
-	if gotID != "ap_xyz" || gotAction != "allowed" || gotBy != "telegram:7" {
-		t.Fatalf("decide args wrong: id=%q action=%q by=%q", gotID, gotAction, gotBy)
+	if gotID != "" || gotAction != "" || gotBy != "" {
+		t.Fatalf("legacy notification decided a call: id=%q action=%q by=%q", gotID, gotAction, gotBy)
 	}
+	bs.mu.Lock()
+	if len(bs.answeredCBs) != 1 || !strings.Contains(bs.answeredCBs[0], "Inbox") {
+		t.Fatalf("missing Inbox handoff: %v", bs.answeredCBs)
+	}
+	bs.mu.Unlock()
 
 	// Unauthorized callback from a different user → decide NOT called again.
 	gotID = ""
@@ -209,8 +218,10 @@ func TestCallbackDecideAuthorized(t *testing.T) {
 	}
 }
 
-func TestCallbackAlreadyDecidedToast(t *testing.T) {
+func TestLegacyCallbackNeverInspectsOrDecidesRequest(t *testing.T) {
+	called := false
 	decide := func(ctx context.Context, id, action, decidedBy string) (string, bool, error) {
+		called = true
 		return "", true, nil // notPending
 	}
 	svc, set, bs := newTestService(t, decide)
@@ -221,8 +232,45 @@ func TestCallbackAlreadyDecidedToast(t *testing.T) {
 	svc.handleUpdate(context.Background(), c, callbackUpdate(5, "d|allowed|ap_xyz", 7, 1000))
 	bs.mu.Lock()
 	defer bs.mu.Unlock()
-	if len(bs.answeredCBs) != 1 || !strings.Contains(strings.ToLower(bs.answeredCBs[0]), "already") {
-		t.Fatalf("expected 'already decided' toast, got %v", bs.answeredCBs)
+	if called || len(bs.answeredCBs) != 1 || !strings.Contains(bs.answeredCBs[0], "Inbox") {
+		t.Fatalf("legacy callback must hand off without a decision: called=%v notices=%v", called, bs.answeredCBs)
+	}
+}
+
+func TestSendApprovalUsesInboxReviewLink(t *testing.T) {
+	for _, publicURL := range []string{"https://toolyard.example/old?obsolete=1", "", "https://user:password@toolyard.example", "javascript:alert(1)"} {
+		t.Run(publicURL, func(t *testing.T) {
+			svc, set, bs := newTestService(t, nil)
+			svc.publicURL = publicURL
+			if _, err := svc.Configure(context.Background(), "123:ABC"); err != nil {
+				t.Fatal(err)
+			}
+			_ = set.Set(context.Background(), KeyChatID, "1000")
+			if _, err := svc.SendApproval(context.Background(), "ap_legacy", "Pending synthetic call"); err != nil {
+				t.Fatal(err)
+			}
+			bs.mu.Lock()
+			defer bs.mu.Unlock()
+			if len(bs.sentTexts) != 1 || !strings.Contains(bs.sentTexts[0], "Inbox") {
+				t.Fatalf("notification lost review instruction: %v", bs.sentTexts)
+			}
+			if publicURL == "https://toolyard.example/old?obsolete=1" {
+				var markup struct {
+					Keyboard [][]map[string]string `json:"inline_keyboard"`
+				}
+				if err := json.Unmarshal([]byte(bs.sentMarkup[0]), &markup); err != nil {
+					t.Fatal(err)
+				}
+				if len(markup.Keyboard) != 1 || len(markup.Keyboard[0]) != 1 || markup.Keyboard[0][0]["url"] != "https://toolyard.example/#inbox/ap_legacy" || markup.Keyboard[0][0]["text"] != "Open Inbox" {
+					t.Fatalf("notification does not open its original Inbox item: %s", bs.sentMarkup[0])
+				}
+				if _, ok := markup.Keyboard[0][0]["callback_data"]; ok {
+					t.Fatal("review button contains a legacy decision callback")
+				}
+			} else if bs.sentMarkup[0] != "" {
+				t.Fatalf("unconfigured or invalid origin acquired a decision button: %s", bs.sentMarkup[0])
+			}
+		})
 	}
 }
 

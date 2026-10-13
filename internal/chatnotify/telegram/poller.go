@@ -9,7 +9,7 @@ import (
 
 // RunPoller long-polls getUpdates and handles two kinds of update:
 //   - "/start <code>" messages → pairing (binds chat_id + user_id)
-//   - callback_query button taps → bus.Decide
+//   - legacy callback_query button taps → review-in-Inbox notice
 //
 // It persists the next update offset in settings so a restart doesn't replay
 // already-processed updates. Shaped as a goroutines.Supervise fn (blocking,
@@ -90,15 +90,15 @@ func (s *Service) handleStart(ctx context.Context, c *Client, u Update) {
 	_ = s.settings.Set(ctx, KeyUserID, strconv.FormatInt(u.Message.From.ID, 10))
 	s.log.Info("paired", "chat_id", u.Message.Chat.ID, "user_id", u.Message.From.ID)
 	_, _ = c.SendMessage(ctx, u.Message.Chat.ID,
-		"✅ Paired. Approval requests will appear here with Approve / Deny buttons.", nil)
+		"✅ Paired. Request notifications will appear here. Review and submit decisions in Toolyard Inbox.", nil)
 }
 
-// handleCallback verifies the tap came from the paired identity and resolves
-// the approval. Authorization is layered: (a) updates arrive only on our
+// handleCallback verifies a legacy tap came from the paired identity and
+// directs the person to Inbox. Authorization is layered: updates arrive on our
 // authenticated poll, (b) from.id + chat.id must match the paired values.
 func (s *Service) handleCallback(ctx context.Context, c *Client, u Update) {
 	cb := u.CallbackQuery
-	action, approvalID, ok := parseCallback(cb.Data)
+	_, _, ok := parseCallback(cb.Data)
 	if !ok {
 		_ = c.AnswerCallbackQuery(ctx, cb.ID, "Unrecognised action")
 		return
@@ -115,21 +115,7 @@ func (s *Service) handleCallback(ctx context.Context, c *Client, u Update) {
 		_ = c.AnswerCallbackQuery(ctx, cb.ID, "Not authorised")
 		return
 	}
-	if s.decide == nil {
-		_ = c.AnswerCallbackQuery(ctx, cb.ID, "Approvals unavailable")
-		return
-	}
-	status, notPending, err := s.decide(ctx, approvalID, action, "telegram:"+gotUser)
-	switch {
-	case notPending:
-		_ = c.AnswerCallbackQuery(ctx, cb.ID, "Already decided")
-	case err != nil:
-		s.log.Warn("callback decide", "approval", approvalID, "err", err.Error())
-		_ = c.AnswerCallbackQuery(ctx, cb.ID, "Couldn't record decision")
-	default:
-		toast := "Recorded: " + status
-		_ = c.AnswerCallbackQuery(ctx, cb.ID, toast)
-	}
+	_ = c.AnswerCallbackQuery(ctx, cb.ID, "Review and submit the decision in Toolyard Inbox.")
 }
 
 // parseCallback splits "d|<action>|<approval_id>".

@@ -447,10 +447,10 @@ func TestInboxRoutesRecordDecider(t *testing.T) {
 	}
 	access := func(title, key string) string {
 		t.Helper()
-		res, err := e.inbox.Submit(ctx, e.agent.ID, &inbox.Submission{Kind: inbox.KindAccess, Title: title, Summary: "s",
+		res, err := e.inbox.Submit(ctx, e.agent.ID, &inbox.Submission{Task: &inbox.TaskContext{Objective: "Record the controlled marker for the test."}, Kind: inbox.KindAccess, Title: title, Summary: "s",
 			Message: "May I write the marker?", Audio: inbox.Audio{Script: title}, Urgency: inbox.UrgencySoon,
 			Facts: &inbox.Facts{WhyNow: "w", IfItGoesWrong: "g", Undo: "u"},
-			Tools: []inbox.SubmissionTool{{Tool: "memory.set", Required: true, Summary: "Write the marker.", Params: map[string]any{"key": key, "value": "v"}}}})
+			Tools: []inbox.SubmissionTool{{CallID: "write_marker", Target: "The controlled marker record", Operation: "write", ExpectedEffects: "The controlled marker is written.", AffectedScope: "One marker record", MaterialRisks: "The marker can replace existing content.", Undo: "Restore the previous marker value.", Tool: "memory.set", Required: true, Summary: "Write the marker.", Params: map[string]any{"key": key, "value": "v"}}}})
 		if err != nil || !res.OK {
 			t.Fatalf("submit %s: %v %+v", title, err, res)
 		}
@@ -501,7 +501,7 @@ func TestInboxRoutesRecordDecider(t *testing.T) {
 
 	t.Run("grant revoke and revoke-all", func(t *testing.T) {
 		id := access("Write marker one", "one")
-		rec := e.do(t, e.cookie, http.MethodPost, "/v1/inbox/"+id+"/decide", `{"action":"approve","allow":[true]}`)
+		rec := e.do(t, e.cookie, http.MethodPost, "/v1/inbox/"+id+"/decide", `{"action":"submit","request_revision":1,"submission_id":"actor_test","verdicts":{"write_marker":{"verdict":"accepted"}}}`)
 		if rec.Code != http.StatusOK {
 			t.Fatalf("approve: %d %s", rec.Code, rec.Body.String())
 		}
@@ -529,7 +529,7 @@ func TestInboxRoutesRecordDecider(t *testing.T) {
 		}
 
 		id2 := access("Write marker two", "two")
-		if rec := e.do(t, e.cookie, http.MethodPost, "/v1/inbox/"+id2+"/decide", `{"action":"approve","allow":[true]}`); rec.Code != http.StatusOK {
+		if rec := e.do(t, e.cookie, http.MethodPost, "/v1/inbox/"+id2+"/decide", `{"action":"submit","request_revision":1,"submission_id":"actor_test","verdicts":{"write_marker":{"verdict":"accepted"}}}`); rec.Code != http.StatusOK {
 			t.Fatalf("approve 2: %d %s", rec.Code, rec.Body.String())
 		}
 		rec = e.do(t, e.cookie, http.MethodPost, "/v1/inbox/grants/revoke-all", `{"agent_id":"`+e.agent.ID+`"}`)

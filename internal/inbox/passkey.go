@@ -39,13 +39,23 @@ var (
 
 // DecisionDigest is what a passkey confirmation commits to.
 func DecisionDigest(id string, d Decision) string {
+	if d.Verdicts != nil {
+		d.Allow = nil
+	}
+	if d.Action == "submit" {
+		d.Action = "approve"
+	}
 	b, _ := json.Marshal(struct {
-		ID     string                        `json:"id"`
-		Action string                        `json:"action"`
-		Allow  []bool                        `json:"allow"`
-		Params map[int]map[string]Constraint `json:"params,omitempty"`
-		TTL    int                           `json:"ttl_seconds,omitempty"`
-	}{id, d.Action, d.Allow, d.Params, d.TTLSeconds})
+		ID           string                        `json:"id"`
+		Action       string                        `json:"action"`
+		Allow        []bool                        `json:"allow"`
+		Params       map[int]map[string]Constraint `json:"params,omitempty"`
+		TTL          int                           `json:"ttl_seconds,omitempty"`
+		Revision     int                           `json:"request_revision,omitempty"`
+		SubmissionID string                        `json:"submission_id,omitempty"`
+		Verdicts     map[string]CallVerdict        `json:"verdicts,omitempty"`
+		Note         string                        `json:"note,omitempty"`
+	}{id, d.Action, d.Allow, d.Params, d.TTLSeconds, d.RequestRevision, d.SubmissionID, d.Verdicts, d.Note})
 	sum := sha256.Sum256(append([]byte("toolyard-decide-v1\n"), b...))
 	return hex.EncodeToString(sum[:])
 }
