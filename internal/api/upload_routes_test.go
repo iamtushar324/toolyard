@@ -110,7 +110,7 @@ func TestInboxUploadEndToEnd(t *testing.T) {
 	}
 	found := false
 	for _, e := range evs {
-		if e.EventType == EventInboxUpload && strings.Contains(string(e.Arguments), sum) {
+		if e.EventType == EventInboxUpload && strings.Contains(string(e.Arguments), sum[:16]) && strings.Contains(string(e.Arguments), "image/png") {
 			found = true
 		}
 	}

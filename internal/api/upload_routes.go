@@ -71,7 +71,10 @@ func (s *Server) inboxUpload(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if s.audit != nil {
-		args, _ := json.Marshal(map[string]any{"sha256": res.SHA256, "size": res.Size, "content_type": res.ContentType, "name": res.Name})
+		// The audit redactor replaces any 40+ hex run (a full sha256
+		// included), so the event keeps a 16-character prefix; the full
+		// hash stays in inbox_uploads next to the agent.
+		args, _ := json.Marshal(map[string]any{"sha256_prefix": res.SHA256[:16], "size": res.Size, "content_type": res.ContentType, "name": res.Name})
 		if err := s.audit.Write(r.Context(), audit.Event{
 			EventType:    EventInboxUpload,
 			AgentID:      res.AgentID,
