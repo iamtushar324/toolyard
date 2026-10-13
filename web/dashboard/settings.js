@@ -200,11 +200,7 @@ function settingsGeneral() {
 function settingsPermissions() {
   const page = 'permissions', info = state.inbox.info || {};
   return settingsForm(page,
-    settingsSection('Restricted calls', 'Choose what happens when an agent has no permission for a restricted tool.',
-      settingsChoices(page, 'approval_mode', [
-        ['inbox', 'Request permission in Inbox', 'Ask the agent to explain its request. The original call does not run.'],
-        ['execute', 'Queue the tool call', 'Keep the call in the approval queue. Run it after you approve.'],
-      ], 'execute')),
+    settingsSection('Restricted calls', 'Agents must submit context in Inbox. The agent executes accepted calls with single-use grants.'),
     settingsSection('Request evidence', 'Keep request attachments available after an agent stops.',
       settingsToggle(page, 'inbox_snapshot_enabled', 'Save linked media', 'Copy linked images, videos, and files when a request arrives.', true),
       settingsInput(page, 'inbox_hosting_note', 'File location guidance', 'Tell agents where to upload files for their requests.', { multiline: true, rows: 3, placeholder: 'Upload files to the evidence bucket and include the link.' })),

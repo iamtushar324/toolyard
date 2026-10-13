@@ -300,7 +300,7 @@ func TestL1WritersNeedAnEnrolledAgent(t *testing.T) {
 // L3: an approval wait inside a script is capped by the script's clock
 // (and answers with the normal timed-out snapshot).
 func TestL3ApprovalWaitInCodeModeEndsWithTheScript(t *testing.T) {
-	f := newAccessFixture(t, nil)
+	f := newLegacyAccessFixture(t)
 	held := f.call(t, f.member, "alpha.run", nil)
 	sc, _ := held.StructuredContent.(map[string]any)
 	id, _ := sc["approval_id"].(string)

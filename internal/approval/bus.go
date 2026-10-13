@@ -25,6 +25,7 @@ import (
 	"fmt"
 	"log"
 	"sort"
+	"strings"
 	"sync"
 	"time"
 
@@ -52,9 +53,11 @@ const (
 var (
 	ErrNotPending = errors.New("approval not pending")
 	ErrNotFound   = errors.New("approval not found")
+	ErrWrongOwner = errors.New("only the account owner can decide this GitHub request")
 )
 
 type Request struct {
+	ExecutionState string         `json:"execution_state,omitempty"`
 	ID             string         `json:"id"`
 	AgentID        string         `json:"agent_id"`
 	UpstreamName   string         `json:"upstream_name"`
@@ -163,6 +166,8 @@ type Bus struct {
 	// tap is persisted; the actual tool dispatch runs on bgCtx so the
 	// HTTP request finishing doesn't cancel the executor.
 	bgCtx context.Context
+	// LegacyDecision redirects compatibility writes through the sole Inbox ledger.
+	LegacyDecision func(context.Context, string, string, actor.Decider) (*Request, error)
 }
 
 // Executor runs an approved tool's actual call after the human (or an
@@ -482,7 +487,11 @@ func scanRequest(s rowScanner) (*Request, error) {
 	}
 	req.ResultIsError = isErr != 0
 	if args != "" {
-		_ = json.Unmarshal([]byte(args), &req.Arguments)
+		decoder := json.NewDecoder(strings.NewReader(args))
+		decoder.UseNumber()
+		if err := decoder.Decode(&req.Arguments); err != nil {
+			return nil, err
+		}
 	}
 	if raisedBy != "" {
 		var r actor.Raiser
@@ -546,6 +555,9 @@ func stringIndex(s, needle string) int {
 // and decider_ref carry the rest). On allow it kicks the registered
 // Executor on a background goroutine; pollers wake when SetResult lands.
 func (b *Bus) DecideAs(ctx context.Context, id, action string, d actor.Decider) (*Request, error) {
+	if b.LegacyDecision != nil {
+		return b.LegacyDecision(ctx, id, action, d)
+	}
 	return b.decide(ctx, id, action, d, true)
 }
 
@@ -580,13 +592,26 @@ func (b *Bus) decide(ctx context.Context, id, action string, d actor.Decider, ru
 	if action != StatusAllowed && action != StatusDenied {
 		return nil, fmt.Errorf("invalid action %q", action)
 	}
+	existing, err := b.Get(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	personal := existing.PersonalOwner() != ""
+	if personal {
+		if d.UserID != existing.PersonalOwner() || (d.Via != actor.ViaDashboard && d.Via != actor.ViaDashboardBatch && d.Via != actor.ViaPushToken && d.Via != actor.ViaPasskey) {
+			return nil, ErrWrongOwner
+		}
+		if existing.ExpiresAt <= time.Now().UnixMilli() {
+			return existing, ErrNotPending
+		}
+	}
 	res, err := b.db.ExecContext(ctx,
 		`UPDATE approval_requests SET status = ?, decided_by = ?, decided_at = ?,
             decided_via = ?, decider_email = ?, decider_name = ?, decider_ref = ?
-         WHERE id = ? AND status = ?`,
+         WHERE id = ? AND status = ? AND (? = 0 OR expires_at > ?)`,
 		action, d.Legacy(), time.Now().UnixMilli(),
 		nullStr(d.Via), nullStr(d.Email), nullStr(d.Name), nullStr(d.Ref),
-		id, StatusPending)
+		id, StatusPending, boolInt(personal), time.Now().UnixMilli())
 	if err != nil {
 		return nil, err
 	}
@@ -618,7 +643,30 @@ func (b *Bus) decide(ctx context.Context, id, action string, d actor.Decider, ru
 // recovers from a panicking executor, and records a generic execution
 // failure if the executor disappears mid-flight without persisting a
 // result.
+// DispatchCommitted releases a legacy decision committed by Inbox.
+func (b *Bus) DispatchCommitted(ctx context.Context, id string) {
+	req, err := b.Get(ctx, id)
+	if err != nil {
+		return
+	}
+	b.fanOut(ctx, req, "approval.decide")
+	if req.Status == StatusAllowed && b.exec != nil {
+		go b.runExecutor(req)
+	} else {
+		b.signal(id)
+	}
+}
 func (b *Bus) runExecutor(req *Request) {
+	res, err := b.db.ExecContext(b.bgCtx, `INSERT INTO legacy_execution_claims(request_id,state,claimed_at) VALUES(?,'running',?) ON CONFLICT(request_id) DO NOTHING`, req.ID, time.Now().UnixMilli())
+	if err != nil {
+		log.Printf("legacy execution claim %s: %v", req.ID, err)
+		return
+	}
+	n, err := res.RowsAffected()
+	if err != nil || n != 1 {
+		return
+	}
+
 	// A single deferred recover handles BOTH failure modes: a panicking
 	// executor, and an executor that returns (or panics) without ever
 	// persisting a result. Either way we record a terminal result so
@@ -628,14 +676,14 @@ func (b *Bus) runExecutor(req *Request) {
 	defer func() {
 		if r := recover(); r != nil {
 			log.Printf("approval executor: panic on %s: %v", req.ID, r)
-			if err := b.SetResult(b.bgCtx, req.ID, "", false, fmt.Sprintf("executor panic: %v", r)); err != nil {
+			if err := b.SetResultState(b.bgCtx, req.ID, "", true, fmt.Sprintf("executor panic: %v", r), "outcome_unknown"); err != nil {
 				log.Printf("approval executor: persist panic result %s: %v", req.ID, err)
 			}
 			return
 		}
 		cur, err := b.Get(b.bgCtx, req.ID)
 		if err == nil && cur.Status == StatusAllowed && cur.ResultExecutedAt == 0 {
-			if serr := b.SetResult(b.bgCtx, req.ID, "", false, "executor returned without persisting result"); serr != nil {
+			if serr := b.SetResultState(b.bgCtx, req.ID, "", true, "executor returned without persisting result", "outcome_unknown"); serr != nil {
 				log.Printf("approval executor: persist fallback result %s: %v", req.ID, serr)
 			}
 		}
@@ -652,6 +700,13 @@ func (b *Bus) runExecutor(req *Request) {
 // executor and the recovery sweep can't race — whichever lands first
 // wins; the loser is a no-op.
 func (b *Bus) SetResult(ctx context.Context, id, envelope string, isError bool, execErr string) error {
+	state := "succeeded"
+	if isError || execErr != "" {
+		state = "failed"
+	}
+	return b.SetResultState(ctx, id, envelope, isError, execErr, state)
+}
+func (b *Bus) SetResultState(ctx context.Context, id, envelope string, isError bool, execErr, state string) error {
 	res, err := b.db.ExecContext(ctx,
 		`UPDATE approval_requests
             SET result_envelope = ?, result_is_error = ?, result_error = ?, result_executed_at = ?
@@ -661,6 +716,7 @@ func (b *Bus) SetResult(ctx context.Context, id, envelope string, isError bool, 
 		return err
 	}
 	if n, _ := res.RowsAffected(); n > 0 {
+		_, _ = b.db.ExecContext(ctx, `UPDATE legacy_execution_claims SET state=?,finished_at=?,reason=? WHERE request_id=?`, state, time.Now().UnixMilli(), execErr, id)
 		b.signal(id)
 		if req, gerr := b.Get(ctx, id); gerr == nil {
 			b.fanOut(ctx, req, "approval.executed")
@@ -682,13 +738,39 @@ func boolInt(b bool) int {
 // finished writing the result." Safe to call multiple times — the
 // SetResult UPDATE is gated on result_executed_at IS NULL.
 func (b *Bus) SweepUnexecuted(ctx context.Context) (int, error) {
+	// A persisted claim from the prior process has an uncertain outcome.
+	// An upstream write must never be repeated merely because its receipt is lost.
+	if _, err := b.db.ExecContext(ctx, `UPDATE legacy_execution_claims SET state='outcome_unknown',reason='Process stopped after dispatch claim; do not repeat' WHERE state='running'`); err != nil {
+		return 0, err
+	}
+
+	uncertain, e := b.db.QueryContext(ctx, `SELECT request_id FROM legacy_execution_claims WHERE state='outcome_unknown' AND request_id IN (SELECT id FROM approval_requests WHERE result_executed_at IS NULL)`)
+	if e != nil {
+		return 0, e
+	}
+	var ids []string
+	for uncertain.Next() {
+		var id string
+		if e = uncertain.Scan(&id); e != nil {
+			uncertain.Close()
+			return 0, e
+		}
+		ids = append(ids, id)
+	}
+	uncertain.Close()
+	for _, id := range ids {
+		if e = b.SetResultState(ctx, id, "", true, "Legacy write outcome is unknown; inspect upstream state and do not repeat", "outcome_unknown"); e != nil {
+			return 0, e
+		}
+	}
+
 	if b.exec == nil {
 		return 0, nil
 	}
 	rows, err := b.db.QueryContext(ctx,
 		`SELECT `+requestSelectColumns+`
          FROM approval_requests
-         WHERE status = ? AND result_executed_at IS NULL
+         WHERE status = ? AND result_executed_at IS NULL AND id NOT IN (SELECT request_id FROM legacy_execution_claims)
          ORDER BY decided_at ASC`, StatusAllowed)
 	if err != nil {
 		return 0, err
@@ -757,6 +839,8 @@ func (b *Bus) Get(ctx context.Context, id string) (*Request, error) {
 		}
 		return nil, err
 	}
+	_ = b.db.QueryRowContext(ctx, `SELECT state FROM legacy_execution_claims WHERE request_id=?`, id).Scan(&req.ExecutionState)
+
 	return req, nil
 }
 
@@ -767,6 +851,19 @@ func (b *Bus) Get(ctx context.Context, id string) (*Request, error) {
 // or ErrNotFound on missing/wrong-agent.
 func (b *Bus) CancelByAgent(ctx context.Context, id, agentID string) (*Request, error) {
 	d := actor.Decider{Via: actor.ViaAgentCancel, Ref: agentID}
+	existing, err := b.Get(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	personal := existing.PersonalOwner() != ""
+	if personal {
+		if d.UserID != existing.PersonalOwner() || (d.Via != actor.ViaDashboard && d.Via != actor.ViaDashboardBatch && d.Via != actor.ViaPushToken && d.Via != actor.ViaPasskey) {
+			return nil, ErrWrongOwner
+		}
+		if existing.ExpiresAt <= time.Now().UnixMilli() {
+			return existing, ErrNotPending
+		}
+	}
 	res, err := b.db.ExecContext(ctx,
 		`UPDATE approval_requests SET status = ?, decided_by = ?, decided_at = ?,
             decided_via = ?, decider_ref = ?

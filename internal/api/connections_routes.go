@@ -32,7 +32,8 @@ func (s *Server) connectionRoutes(mux *http.ServeMux) {
 
 // connectionView is one row of My connections.
 type connectionView struct {
-	Server string `json:"server"`
+	Server    string `json:"server"`
+	Transport string `json:"transport"`
 	// Host is the server URL's host only: a URL can embed a key in its
 	// path or query, and this list is for members.
 	Host string `json:"host,omitempty"`
@@ -163,7 +164,7 @@ func (s *Server) meConnections(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		v := connectionView{
-			Server: sv.Name, Host: urlHost(sv.URL), State: oauth.ConnNeedsSignIn, Ready: ready,
+			Server: sv.Name, Transport: sv.Transport, Host: urlHost(sv.URL), State: oauth.ConnNeedsSignIn, Ready: ready,
 			ServerStatus: sv.LastStatus, Enabled: sv.Enabled, ToolCount: sv.ToolCount,
 		}
 		if !sv.Enabled {

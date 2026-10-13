@@ -735,15 +735,16 @@ func (s *Service) PurgeExpiredPending(ctx context.Context) (int, error) {
 // ---------------------------------------------------------------------------
 
 type tokenResponse struct {
-	AccessToken      string `json:"access_token"`
-	TokenType        string `json:"token_type"`
-	ExpiresIn        int    `json:"expires_in"`
-	RefreshToken     string `json:"refresh_token"`
-	RefreshExpiresIn int    `json:"refresh_expires_in"`
-	Scope            string `json:"scope"`
-	IDToken          string `json:"id_token"`
-	Error            string `json:"error"`
-	ErrorDesc        string `json:"error_description"`
+	AccessToken           string `json:"access_token"`
+	TokenType             string `json:"token_type"`
+	ExpiresIn             int    `json:"expires_in"`
+	RefreshToken          string `json:"refresh_token"`
+	RefreshExpiresIn      int    `json:"refresh_expires_in"`
+	RefreshTokenExpiresIn int    `json:"refresh_token_expires_in"`
+	Scope                 string `json:"scope"`
+	IDToken               string `json:"id_token"`
+	Error                 string `json:"error"`
+	ErrorDesc             string `json:"error_description"`
 }
 
 // ExchangeCode performs the authorization-code -> tokens swap. On success

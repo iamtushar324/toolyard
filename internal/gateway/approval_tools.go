@@ -218,6 +218,9 @@ func (g *Gateway) approvalMetaTools() []toolEntry {
 // agent's signal that `result` is populated and the call is done.
 func approvalSnapshot(req *approval.Request, includeArgs bool) map[string]any {
 	status := req.Status
+	if req.ExecutionState == "outcome_unknown" {
+		return map[string]any{"approval_id": req.ID, "status": "outcome_unknown", "raw_status": req.Status, "execution_state": "outcome_unknown", "how_to_proceed": "The upstream outcome is uncertain. Inspect authoritative upstream state. Do not repeat the write with this approval."}
+	}
 	if req.Status == approval.StatusAllowed && req.ResultExecutedAt > 0 {
 		status = "executed"
 	}
@@ -298,6 +301,17 @@ func approvalVisibleTo(req *approval.Request, caller string) bool {
 	return req.AgentID == "" || req.AgentID == caller
 }
 
+func (g *Gateway) approvalVisible(ctx context.Context, req *approval.Request) bool {
+	if req == nil || !approvalVisibleTo(req, agentIDFromContext(ctx)) {
+		return false
+	}
+	if owner := req.PersonalOwner(); owner != "" {
+		uid, err := g.ownerUser(ctx, agentIDFromContext(ctx))
+		return err == nil && uid == owner
+	}
+	return true
+}
+
 func (g *Gateway) handlePollApproval() directHandler {
 	return func(ctx context.Context, args map[string]any) (*mcp.CallToolResult, error) {
 		id, _ := args["approval_id"].(string)
@@ -307,7 +321,7 @@ func (g *Gateway) handlePollApproval() directHandler {
 		req, err := g.approval.Get(ctx, id)
 		// Scope check: agents only see their own approvals, and another
 		// agent's id reads as unknown.
-		if errors.Is(err, approval.ErrNotFound) || (err == nil && !approvalVisibleTo(req, agentIDFromContext(ctx))) {
+		if errors.Is(err, approval.ErrNotFound) || (err == nil && !g.approvalVisible(ctx, req)) {
 			return mcp.NewToolResultError("unknown approval_id"), nil
 		}
 		if err != nil {
@@ -326,7 +340,6 @@ func (g *Gateway) handlePollApprovals() directHandler {
 		if len(raw) > 32 {
 			return mcp.NewToolResultError("approval_ids: max 32 per call"), nil
 		}
-		callerAgent := agentIDFromContext(ctx)
 		out := make([]map[string]any, 0, len(raw))
 		for _, item := range raw {
 			id, _ := item.(string)
@@ -335,7 +348,7 @@ func (g *Gateway) handlePollApprovals() directHandler {
 				continue
 			}
 			req, err := g.approval.Get(ctx, id)
-			if err != nil || !approvalVisibleTo(req, callerAgent) {
+			if err != nil || !g.approvalVisible(ctx, req) {
 				out = append(out, map[string]any{"approval_id": id, "status": "unknown"})
 				continue
 			}
@@ -373,7 +386,7 @@ func (g *Gateway) handleWaitForApproval() directHandler {
 			return mcp.NewToolResultError("approval_id is required"), nil
 		}
 		timeoutSec := 60
-		if v, ok := args["timeout_seconds"].(float64); ok && v > 0 {
+		if v, ok := numericArgument(args["timeout_seconds"]); ok && v > 0 {
 			timeoutSec = int(v)
 		}
 		if maxSec := int(WaitForApprovalMaxTimeout.Seconds()); timeoutSec > maxSec {
@@ -381,7 +394,7 @@ func (g *Gateway) handleWaitForApproval() directHandler {
 		}
 		timeoutSec = clampToDeadline(ctx, timeoutSec)
 		req, err := g.approval.Get(ctx, id)
-		if errors.Is(err, approval.ErrNotFound) || (err == nil && !approvalVisibleTo(req, agentIDFromContext(ctx))) {
+		if errors.Is(err, approval.ErrNotFound) || (err == nil && !g.approvalVisible(ctx, req)) {
 			return mcp.NewToolResultError("unknown approval_id"), nil
 		}
 		if err != nil {
@@ -461,7 +474,7 @@ func (g *Gateway) handleWaitForApprovals() directHandler {
 			mode = m
 		}
 		timeoutSec := 60
-		if v, ok := args["timeout_seconds"].(float64); ok && v > 0 {
+		if v, ok := numericArgument(args["timeout_seconds"]); ok && v > 0 {
 			timeoutSec = int(v)
 		}
 		if maxSec := int(WaitForApprovalMaxTimeout.Seconds()); timeoutSec > maxSec {
@@ -477,7 +490,6 @@ func (g *Gateway) handleWaitForApprovals() directHandler {
 			}
 			ids = append(ids, id)
 		}
-		callerAgent := agentIDFromContext(ctx)
 		deadline := time.Now().Add(time.Duration(timeoutSec) * time.Second)
 
 		// Each loop iteration: snapshot every id, evaluate condition,
@@ -488,7 +500,7 @@ func (g *Gateway) handleWaitForApprovals() directHandler {
 			anyTerm, allTerm := false, true
 			for _, id := range ids {
 				req, err := g.approval.Get(ctx, id)
-				if errors.Is(err, approval.ErrNotFound) || (err == nil && !approvalVisibleTo(req, callerAgent)) {
+				if errors.Is(err, approval.ErrNotFound) || (err == nil && !g.approvalVisible(ctx, req)) {
 					// Another agent's id reads as unknown too.
 					snapshots = append(snapshots, map[string]any{
 						"approval_id": id, "status": "unknown",
@@ -577,6 +589,9 @@ func (g *Gateway) handleListMyPendingApprovals() directHandler {
 		}
 		snapshots := make([]map[string]any, 0, len(rows))
 		for i := range rows {
+			if !g.approvalVisible(ctx, &rows[i]) {
+				continue
+			}
 			snapshots = append(snapshots, approvalSnapshot(&rows[i], false))
 		}
 		return jsonResultMap(map[string]any{
@@ -597,6 +612,9 @@ func (g *Gateway) handleCancelMyApproval() directHandler {
 		id, _ := args["approval_id"].(string)
 		if strings.TrimSpace(id) == "" {
 			return mcp.NewToolResultError("approval_id is required"), nil
+		}
+		if held, err := g.approval.Get(ctx, id); err != nil || !g.approvalVisible(ctx, held) {
+			return mcp.NewToolResultError("unknown approval_id"), nil
 		}
 		req, err := g.approval.CancelByAgent(ctx, id, callerAgent)
 		if err != nil {

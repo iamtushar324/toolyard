@@ -561,6 +561,9 @@ func (s *Service) SetStatus(ctx context.Context, id, status, reason string) erro
 		if err := revokeAllForUser(ctx, tx, id, now); err != nil {
 			return err
 		}
+		if err := revokeLocalConnectionsTx(ctx, tx, `user_id=?`, []any{id}, now); err != nil {
+			return err
+		}
 	} else {
 		if _, err := tx.ExecContext(ctx,
 			`UPDATE users SET status = ?, blocked_reason = NULL, updated_at = ? WHERE id = ?`,
@@ -795,7 +798,12 @@ func (s *Service) SetAgentDisabled(ctx context.Context, ownerUserID, agentID str
 	if disabled {
 		d = 1
 	}
-	res, err := s.db.ExecContext(ctx,
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	res, err := tx.ExecContext(ctx,
 		`UPDATE agents SET disabled = ? WHERE id = ? AND owner_user = ?`, d, agentID, ownerUserID)
 	if err != nil {
 		return err
@@ -804,7 +812,12 @@ func (s *Service) SetAgentDisabled(ctx context.Context, ownerUserID, agentID str
 	if n == 0 {
 		return ErrAgentTokenInvalid
 	}
-	return nil
+	if disabled {
+		if err = revokeLocalConnectionsTx(ctx, tx, `user_id=? AND (parent_agent_id=? OR agent_id=?)`, []any{ownerUserID, agentID, agentID}, time.Now().UnixMilli()); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
 }
 
 // DeleteAgent removes the agent row entirely so any outstanding bearer
@@ -814,8 +827,15 @@ func (s *Service) DeleteAgent(ctx context.Context, ownerUserID, agentID string) 
 	if err := s.requirePlainAgent(ctx, ownerUserID, agentID); err != nil {
 		return err
 	}
-	res, err := s.db.ExecContext(ctx,
-		`DELETE FROM agents WHERE id = ? AND owner_user = ?`, agentID, ownerUserID)
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	if err = revokeLocalConnectionsTx(ctx, tx, `user_id=? AND (parent_agent_id=? OR agent_id=?)`, []any{ownerUserID, agentID, agentID}, time.Now().UnixMilli()); err != nil {
+		return err
+	}
+	res, err := tx.ExecContext(ctx, `DELETE FROM agents WHERE id=? AND owner_user=?`, agentID, ownerUserID)
 	if err != nil {
 		return err
 	}
@@ -823,7 +843,7 @@ func (s *Service) DeleteAgent(ctx context.Context, ownerUserID, agentID string) 
 	if n == 0 {
 		return ErrAgentTokenInvalid
 	}
-	return nil
+	return tx.Commit()
 }
 
 // requirePlainAgent is the guard in front of the generic agent actions:

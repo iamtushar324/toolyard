@@ -5,8 +5,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"math"
+	"math/big"
+	"reflect"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 )
 
@@ -26,14 +30,14 @@ import (
 // A bare value (string, number, bool, array, or an object without an
 // operator key) is shorthand for {"eq": value}.
 type Constraint struct {
-	Op      string   // eq | in | prefix | range | limit | any
-	Eq      any      // eq
-	In      []any    // in
-	Prefix  string   // prefix
-	Gte     *float64 // range
-	Lte     *float64 // range
-	Limit   string   // limit: description shown to the owner
-	Pattern string   // limit: optional regex the actual value must match
+	Op      string       // eq | in | prefix | range | limit | any
+	Eq      any          // eq
+	In      []any        // in
+	Prefix  string       // prefix
+	Gte     *json.Number // range
+	Lte     *json.Number // range
+	Limit   string       // limit: description shown to the owner
+	Pattern string       // limit: optional regex the actual value must match
 
 	re *regexp.Regexp
 }
@@ -83,20 +87,20 @@ func ParseConstraint(v any) (Constraint, error) {
 		ops++
 		c.Op = "range"
 		if hasGte {
-			f, ok := toFloat(m["gte"])
+			f, ok := numberValue(m["gte"])
 			if !ok {
 				return Constraint{}, errors.New(`"gte" must be a number`)
 			}
 			c.Gte = &f
 		}
 		if hasLte {
-			f, ok := toFloat(m["lte"])
+			f, ok := numberValue(m["lte"])
 			if !ok {
 				return Constraint{}, errors.New(`"lte" must be a number`)
 			}
 			c.Lte = &f
 		}
-		if c.Gte != nil && c.Lte != nil && *c.Gte > *c.Lte {
+		if cmp, ok := compareBounds(c.Gte, c.Lte); ok && cmp > 0 {
 			return Constraint{}, errors.New(`"gte" is greater than "lte"`)
 		}
 	}
@@ -201,11 +205,11 @@ func (c Constraint) Describe() string {
 	case "range":
 		switch {
 		case c.Gte != nil && c.Lte != nil:
-			return fmt.Sprintf("between %g and %g", *c.Gte, *c.Lte)
+			return fmt.Sprintf("between %s and %s", *c.Gte, *c.Lte)
 		case c.Gte != nil:
-			return fmt.Sprintf("at least %g", *c.Gte)
+			return fmt.Sprintf("at least %s", *c.Gte)
 		default:
-			return fmt.Sprintf("at most %g", *c.Lte)
+			return fmt.Sprintf("at most %s", *c.Lte)
 		}
 	case "limit":
 		return "not known yet: " + c.Limit
@@ -239,14 +243,14 @@ func (c Constraint) Matches(actual any, present bool) bool {
 		s, ok := actual.(string)
 		return ok && strings.HasPrefix(s, c.Prefix)
 	case "range":
-		f, ok := toFloat(actual)
+		f, ok := numberValue(actual)
 		if !ok {
 			return false
 		}
-		if c.Gte != nil && f < *c.Gte {
+		if cmp, ok := compareBounds(&f, c.Gte); ok && cmp < 0 {
 			return false
 		}
-		if c.Lte != nil && f > *c.Lte {
+		if cmp, ok := compareBounds(&f, c.Lte); ok && cmp > 0 {
 			return false
 		}
 		return true
@@ -316,53 +320,85 @@ func normalise(v any) any {
 	if err := dec.Decode(&out); err != nil {
 		return v
 	}
-	return canonNumbers(out)
+	return out
 }
 
-// canonNumbers turns json.Number into float64 so 1 and 1.0 compare equal.
-func canonNumbers(v any) any {
-	switch t := v.(type) {
-	case json.Number:
-		f, err := t.Float64()
-		if err != nil {
-			return t.String()
-		}
-		return f
-	case []any:
-		for i := range t {
-			t[i] = canonNumbers(t[i])
-		}
-		return t
-	case map[string]any:
-		for k := range t {
-			t[k] = canonNumbers(t[k])
-		}
-		return t
-	}
-	return v
-}
-
+// Numeric equality uses rational values, so 1 and 1.0 agree without rounding
+// adjacent integers above 2^53. JSON containers compare recursively.
 func equalJSON(a, b any) bool {
-	ab, err1 := json.Marshal(canonNumbers(normalise(a)))
-	bb, err2 := json.Marshal(canonNumbers(normalise(b)))
-	return err1 == nil && err2 == nil && bytes.Equal(ab, bb)
+	return equalNormalised(normalise(a), normalise(b))
 }
 
-func toFloat(v any) (float64, bool) {
-	switch t := v.(type) {
-	case float64:
-		return t, true
-	case float32:
-		return float64(t), true
-	case int:
-		return float64(t), true
-	case int64:
-		return float64(t), true
-	case json.Number:
-		f, err := t.Float64()
-		return f, err == nil
+func equalNormalised(a, b any) bool {
+	if an, ok := a.(json.Number); ok {
+		bn, ok := b.(json.Number)
+		if !ok {
+			return false
+		}
+		cmp, ok := CompareNumbers(an, bn)
+		return ok && cmp == 0
 	}
-	return 0, false
+	switch av := a.(type) {
+	case []any:
+		bv, ok := b.([]any)
+		if !ok || len(av) != len(bv) {
+			return false
+		}
+		for i := range av {
+			if !equalNormalised(av[i], bv[i]) {
+				return false
+			}
+		}
+		return true
+	case map[string]any:
+		bv, ok := b.(map[string]any)
+		if !ok || len(av) != len(bv) {
+			return false
+		}
+		for key, value := range av {
+			other, present := bv[key]
+			if !present || !equalNormalised(value, other) {
+				return false
+			}
+		}
+		return true
+	default:
+		return reflect.DeepEqual(a, b)
+	}
+}
+
+func numberValue(v any) (json.Number, bool) {
+	// The JSON encoder rejects non-finite floats and invalid json.Number text.
+	// UseNumber retains the precise decimal value of all supported Go numbers.
+	n, ok := normalise(v).(json.Number)
+	if !ok {
+		return "", false
+	}
+	_, valid := new(big.Rat).SetString(n.String())
+	return n, valid
+}
+
+// CompareNumbers compares JSON numeric values without binary float rounding.
+// The bool is false when either operand is not a valid JSON number.
+func CompareNumbers(a, b any) (int, bool) {
+	an, aok := numberValue(a)
+	bn, bok := numberValue(b)
+	if !aok || !bok {
+		return 0, false
+	}
+	ar, aok := new(big.Rat).SetString(an.String())
+	br, bok := new(big.Rat).SetString(bn.String())
+	if !aok || !bok {
+		return 0, false
+	}
+	return ar.Cmp(br), true
+}
+
+func compareBounds(a, b *json.Number) (int, bool) {
+	if a == nil || b == nil {
+		return 0, false
+	}
+	return CompareNumbers(*a, *b)
 }
 
 func compactJSON(v any) string {
@@ -410,10 +446,10 @@ func (c Constraint) Within(req Constraint) bool {
 		if c.Op != "range" {
 			return false
 		}
-		if req.Gte != nil && (c.Gte == nil || *c.Gte < *req.Gte) {
+		if cmp, ok := compareBounds(c.Gte, req.Gte); req.Gte != nil && (!ok || cmp < 0) {
 			return false
 		}
-		if req.Lte != nil && (c.Lte == nil || *c.Lte > *req.Lte) {
+		if cmp, ok := compareBounds(c.Lte, req.Lte); req.Lte != nil && (!ok || cmp > 0) {
 			return false
 		}
 		return true
@@ -451,4 +487,31 @@ func sortedKeysC(m map[string]Constraint) []string {
 	}
 	sort.Strings(out)
 	return out
+}
+
+// The human dashboard uses JSON.parse. Reject numeric permission descriptions
+// it cannot faithfully render rather than ask the human to approve rounded scope.
+func browserNumbersSafe(value any) bool {
+	switch v := normalise(value).(type) {
+	case json.Number:
+		f, err := strconv.ParseFloat(v.String(), 64)
+		if err != nil || math.IsInf(f, 0) || math.Abs(f) > 9007199254740991 {
+			return false
+		}
+		cmp, ok := CompareNumbers(v, json.Number(strconv.FormatFloat(f, 'g', -1, 64)))
+		return ok && cmp == 0
+	case []any:
+		for _, child := range v {
+			if !browserNumbersSafe(child) {
+				return false
+			}
+		}
+	case map[string]any:
+		for _, child := range v {
+			if !browserNumbersSafe(child) {
+				return false
+			}
+		}
+	}
+	return true
 }

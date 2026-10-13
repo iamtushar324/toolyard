@@ -15,6 +15,7 @@ import (
 	"github.com/tusharbhardwaj/toolyard/internal/approval"
 	"github.com/tusharbhardwaj/toolyard/internal/audit"
 	"github.com/tusharbhardwaj/toolyard/internal/codemode"
+	"github.com/tusharbhardwaj/toolyard/internal/inbox"
 	"github.com/tusharbhardwaj/toolyard/internal/memory"
 	"github.com/tusharbhardwaj/toolyard/internal/metrics"
 	"github.com/tusharbhardwaj/toolyard/internal/policy"
@@ -278,9 +279,9 @@ func TestCodeModeNestedCallsRouteViaCodeModeWithReason(t *testing.T) {
 }
 
 func TestCodeModeHeldCallAbortsScript(t *testing.T) {
-	// Execute mode: a write is queued for approval and the script stops
+	// Historical bus path: a write is queued and the script stops
 	// with the deferred envelope's text, approval id included.
-	f := newAccessFixture(t, nil)
+	f := newLegacyAccessFixture(t)
 	res := route(t, f.gw, f.member, CodeModeExecuteToolCode, map[string]any{
 		"code": "r = alpha.run()\nprint(\"after the write\")\nresult = r",
 	})
@@ -306,21 +307,29 @@ func TestCodeModeHeldCallAbortsScript(t *testing.T) {
 		t.Fatalf("held call metric = %+v", ev)
 	}
 
-	// Inbox mode: the coaching answer aborts the script the same way.
+	// With Inbox attached, either setting coaches new restricted calls.
 	in := newInboxFixture(t)
-	in.mode = ApprovalModeInbox
-	res, err = in.gw.RouteCall(in.agent, "test", CodeModeExecuteToolCode, map[string]any{
-		"code": "r = deploy.run(service=\"api\", env=\"prod\")\nprint(\"after\")\nresult = r",
-	})
-	if err != nil {
-		t.Fatal(err)
+	for _, mode := range []string{ApprovalModeExecute, ApprovalModeInbox} {
+		in.mode = mode
+		res, err = in.gw.RouteCall(in.agent, "test", CodeModeExecuteToolCode, map[string]any{
+			"code": "r = deploy.run(service=\"api\", env=\"prod\")\nprint(\"after\")\nresult = r",
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		text = textOf(res)
+		if !res.IsError || strings.Contains(text, "\nafter\n") {
+			t.Fatalf("%s coached script continued:\n%s", mode, text)
+		}
+		if !strings.Contains(text, "tool call failed for deploy.run: deploy.run is restricted. Nothing ran and nothing was sent to your owner.") {
+			t.Fatalf("%s coaching text missing:\n%s", mode, text)
+		}
 	}
-	text = textOf(res)
-	if !res.IsError || strings.Contains(text, "\nafter\n") {
-		t.Fatalf("coached script continued:\n%s", text)
+	if pending, err := in.gw.approval.ListPendingByAgent(context.Background(), "ag_1"); err != nil || len(pending) != 0 {
+		t.Fatalf("coaching created implicit approvals: %+v %v", pending, err)
 	}
-	if !strings.Contains(text, "tool call failed for deploy.run: deploy.run is restricted. Nothing ran and nothing was sent to your owner.") {
-		t.Fatalf("coaching text missing:\n%s", text)
+	if requests, err := in.svc.List(context.Background(), inbox.ListFilter{}); err != nil || len(requests) != 0 {
+		t.Fatalf("coaching submitted implicit Inbox requests: %+v %v", requests, err)
 	}
 	if in.calls.Load() != 0 {
 		t.Fatal("the restricted tool ran")
@@ -712,7 +721,7 @@ BkCoreServices.seller_central_proxy(accountId="njg-us",
 
 // TestCodeModeExplicitPolicyApplies: the code-mode tools are open by
 // default, but an operator's explicit rule on executeToolCode still
-// decides it: deny refuses the run, ask holds the whole run for approval.
+// decides it: deny refuses the run, ask requires an explicit Inbox request.
 // Nested calls keep their own policy either way.
 func TestCodeModeExplicitPolicyApplies(t *testing.T) {
 	f := newAccessFixture(t, nil)
@@ -742,15 +751,21 @@ func TestCodeModeExplicitPolicyApplies(t *testing.T) {
 		t.Fatal(err)
 	}
 	res = route(t, f.gw, f.member, CodeModeExecuteToolCode, map[string]any{"code": "result = alpha.get_status()"})
-	if res.IsError || !strings.Contains(textOf(res), "Tool execution requires human approval") || res.Meta == nil || res.Meta.AdditionalFields["toolyard.deferred"] != true {
-		t.Fatalf("ask should hold the run: %v %s", res.IsError, textOf(res))
+	if sc := structured(t, res); !res.IsError || sc["status"] != "permission_required" || sc["executed"] != false || sc["tool"] != CodeModeExecuteToolCode {
+		t.Fatalf("ask must coach an explicit Inbox request: %v %v", res.IsError, sc)
 	}
 	if f.calls.Load() != 1 {
-		t.Fatalf("the held script ran (calls=%d)", f.calls.Load())
+		t.Fatalf("the restricted script ran (calls=%d)", f.calls.Load())
 	}
 	pending, err := f.bus.ListPendingByAgent(ctx, memberID)
-	if err != nil || len(pending) != 1 || pending[0].ToolName != CodeModeExecuteToolCode {
+	if err != nil || len(pending) != 0 {
 		t.Fatalf("pending = %+v (err %v)", pending, err)
+	}
+	if requests, err := f.svc.List(ctx, inbox.ListFilter{}); err != nil || len(requests) != 0 {
+		t.Fatalf("policy coaching submitted implicit Inbox requests: %+v %v", requests, err)
+	}
+	if ev, _ := lastEvent(f.met, CodeModeExecuteToolCode); ev.Outcome != metrics.OutcomeDenied || ev.ErrorClass != "permission_required" {
+		t.Fatalf("coaching metric = %+v", ev)
 	}
 
 	if err := f.gw.policy.DeleteTarget(ctx, policy.ScopeTool, CodeModeExecuteToolCode); err != nil {

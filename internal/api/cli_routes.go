@@ -35,7 +35,7 @@ func (s *Server) cliWhoami(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusUnauthorized, "bearer token required")
 		return
 	}
-	ag, err := s.identity.VerifyAgentToken(r.Context(), strings.TrimPrefix(authz, "Bearer "))
+	ag, err := s.verifyAgentToken(r.Context(), strings.TrimPrefix(authz, "Bearer "))
 	if err != nil {
 		writeError(w, http.StatusUnauthorized, "invalid agent token")
 		return
@@ -74,7 +74,7 @@ func (s *Server) cliApprovalsOne(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusMethodNotAllowed, "GET only")
 		return
 	}
-	agentID, ok := s.requireAgent(w, r)
+	ag, ok := s.requireAgentFull(w, r)
 	if !ok {
 		return
 	}
@@ -88,7 +88,7 @@ func (s *Server) cliApprovalsOne(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
-	if req.AgentID != "" && req.AgentID != agentID {
+	if (req.AgentID != "" && req.AgentID != ag.ID) || (req.PersonalOwner() != "" && req.PersonalOwner() != ag.Owner) {
 		http.NotFound(w, r)
 		return
 	}

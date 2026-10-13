@@ -43,6 +43,9 @@ const grantKeyPurpose = "grant_sign"
 
 // Grant is the stored shape, minus the token.
 type Grant struct {
+	Execution  *Execution            `json:"execution,omitempty"`
+	CallID     string                `json:"call_id"`
+	AttemptID  string                `json:"attempt_id,omitempty"`
 	ID         string                `json:"id"`
 	RequestID  string                `json:"request_id"`
 	ToolIndex  int                   `json:"tool_index"`
@@ -167,6 +170,9 @@ func hashToken(tok string) string {
 // this) is stored as issued_by.
 func (s *Service) issueGrants(ctx context.Context, tx *sql.Tx, r *Request, now int64) (map[int]string, error) {
 	out := map[int]string{}
+	if r.ExecutionMode == "legacy" {
+		return out, nil
+	}
 	expires := now + int64(r.TTLSeconds)*1000
 	for i, t := range r.Tools {
 		if t.Decision != ToolAllowed {
@@ -179,9 +185,9 @@ func (s *Service) issueGrants(ctx context.Context, tx *sql.Tx, r *Request, now i
 			return nil, err
 		}
 		if _, err := tx.ExecContext(ctx, `INSERT INTO inbox_grants
-			(id, request_id, tool_index, agent_id, tool, params, max_uses, uses, status, token_hash, pending_token, created_at, expires_at, issued_by)
-			VALUES (?,?,?,?,?,?,?,0,?,?,?,?,?,?)`,
-			id, r.ID, i, r.AgentID, t.Tool, string(params), 1, GrantActive, hashToken(tok), tok, now, expires, nullStr(r.DeciderUserID)); err != nil {
+			(id, request_id, tool_index, call_id, agent_id, tool, params, max_uses, uses, status, token_hash, pending_token, created_at, expires_at, issued_by)
+			VALUES (?,?,?,?,?,?,?,?,0,?,?,?,?,?,?)`,
+			id, r.ID, i, t.CallID, r.AgentID, t.Tool, string(params), 1, GrantActive, hashToken(tok), nil, now, expires, nullStr(r.DeciderUserID)); err != nil {
 			return nil, err
 		}
 		out[i] = id
@@ -224,19 +230,34 @@ func (s *Service) Redeem(ctx context.Context, token, agentID, tool string, args 
 	if ok, why := MatchArgs(g.Params, args); !ok {
 		return nil, &RedeemError{Err: ErrGrantScope, Grant: g, Detail: why}
 	}
-	res, err := s.db.ExecContext(ctx, `UPDATE inbox_grants
-		SET uses = uses + 1, last_used_at = ?, status = CASE WHEN uses + 1 >= max_uses THEN ? ELSE status END
-		WHERE id = ? AND status = ? AND uses < max_uses AND expires_at > ?`,
-		now, GrantUsed, g.ID, GrantActive, now)
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	res, err := tx.ExecContext(ctx, `UPDATE inbox_grants
+ SET uses = uses + 1, last_used_at = ?, pending_token=NULL, status = CASE WHEN uses + 1 >= max_uses THEN ? ELSE status END
+ WHERE id = ? AND status = ? AND uses < max_uses AND expires_at > ?`, now, GrantUsed, g.ID, GrantActive, now)
 	if err != nil {
 		return nil, err
 	}
 	if n, _ := res.RowsAffected(); n != 1 {
 		return nil, &RedeemError{Err: ErrGrantUsed, Grant: g}
 	}
-	argsJSON, _ := json.Marshal(args)
-	_, _ = s.db.ExecContext(ctx, `INSERT INTO inbox_grant_uses(id, grant_id, arguments, used_at) VALUES (?,?,?,?)`,
-		"gu_"+uuid.NewString(), g.ID, string(argsJSON), now)
+	argsJSON, err := json.Marshal(args)
+	if err != nil {
+		return nil, err
+	}
+	g.AttemptID = "gu_" + uuid.NewString()
+	if _, err = tx.ExecContext(ctx, `INSERT INTO inbox_grant_uses(id,grant_id,arguments,used_at) VALUES(?,?,?,?)`, g.AttemptID, g.ID, string(argsJSON), now); err != nil {
+		return nil, err
+	}
+	if _, err = tx.ExecContext(ctx, `INSERT INTO inbox_executions(grant_id,request_id,call_id,agent_id,state,attempt_id,arguments,started_at) VALUES(?,?,?,?,?,?,?,?)`, g.ID, g.RequestID, g.CallID, g.AgentID, ExecutionRunning, g.AttemptID, string(argsJSON), now); err != nil {
+		return nil, err
+	}
+	if err = tx.Commit(); err != nil {
+		return nil, err
+	}
 	g.Uses++
 	if g.Uses >= g.MaxUses {
 		g.Status = GrantUsed
@@ -270,17 +291,20 @@ func (s *Service) noteGrantUse(ctx context.Context, g *Grant, args map[string]an
 }
 
 func (s *Service) getGrantWithHash(ctx context.Context, id string) (*Grant, string, error) {
-	row := s.db.QueryRowContext(ctx, `SELECT id, request_id, tool_index, agent_id, tool, params, max_uses, uses, status,
+	row := s.db.QueryRowContext(ctx, `SELECT id, request_id, tool_index, call_id, agent_id, tool, params, max_uses, uses, status,
 		created_at, expires_at, COALESCE(revoked_at,0), COALESCE(last_used_at,0), COALESCE(issued_by,''), COALESCE(revoked_by,''), token_hash
 		FROM inbox_grants WHERE id = ?`, id)
 	var g Grant
 	var params, hash string
-	if err := row.Scan(&g.ID, &g.RequestID, &g.ToolIndex, &g.AgentID, &g.Tool, &params, &g.MaxUses, &g.Uses, &g.Status,
+	if err := row.Scan(&g.ID, &g.RequestID, &g.ToolIndex, &g.CallID, &g.AgentID, &g.Tool, &params, &g.MaxUses, &g.Uses, &g.Status,
 		&g.CreatedAt, &g.ExpiresAt, &g.RevokedAt, &g.LastUsedAt, &g.IssuedBy, &g.RevokedBy, &hash); err != nil {
 		return nil, "", err
 	}
 	if err := json.Unmarshal([]byte(params), &g.Params); err != nil {
 		return nil, "", err
+	}
+	if r, e := s.Get(ctx, g.RequestID); g.CallID == "" && e == nil && g.ToolIndex >= 0 && g.ToolIndex < len(r.Tools) {
+		g.CallID = r.Tools[g.ToolIndex].CallID
 	}
 	return &g, hash, nil
 }
@@ -290,7 +314,7 @@ func (s *Service) ListGrants(ctx context.Context, status, agentID string, limit 
 	if limit <= 0 || limit > 500 {
 		limit = 200
 	}
-	q := `SELECT id, request_id, tool_index, agent_id, tool, params, max_uses, uses, status, created_at, expires_at,
+	q := `SELECT id, request_id, tool_index, call_id, agent_id, tool, params, max_uses, uses, status, created_at, expires_at,
 		COALESCE(revoked_at,0), COALESCE(last_used_at,0), COALESCE(issued_by,''), COALESCE(revoked_by,'') FROM inbox_grants WHERE 1=1`
 	var args []any
 	if status != "" {
@@ -312,7 +336,7 @@ func (s *Service) ListGrants(ctx context.Context, status, agentID string, limit 
 	for rows.Next() {
 		var g Grant
 		var params string
-		if err := rows.Scan(&g.ID, &g.RequestID, &g.ToolIndex, &g.AgentID, &g.Tool, &params, &g.MaxUses, &g.Uses, &g.Status,
+		if err := rows.Scan(&g.ID, &g.RequestID, &g.ToolIndex, &g.CallID, &g.AgentID, &g.Tool, &params, &g.MaxUses, &g.Uses, &g.Status,
 			&g.CreatedAt, &g.ExpiresAt, &g.RevokedAt, &g.LastUsedAt, &g.IssuedBy, &g.RevokedBy); err != nil {
 			return nil, err
 		}
@@ -391,30 +415,23 @@ func (s *Service) expireGrants(ctx context.Context) (int64, error) {
 	return res.RowsAffected()
 }
 
-// collectTokens returns plaintext tokens for a request's grants that the
-// agent hasn't collected yet, and clears them. Tokens are handed over once.
+// collectTokens deterministically recovers the original token for each valid,
+// unused permission. Reads never consume permission or mint additional uses.
 func (s *Service) collectTokens(ctx context.Context, requestID, agentID string) (map[string]string, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT id, pending_token FROM inbox_grants
-		WHERE request_id = ? AND agent_id = ? AND pending_token IS NOT NULL AND status = ?`, requestID, agentID, GrantActive)
+	rows, err := s.db.QueryContext(ctx, `SELECT id FROM inbox_grants WHERE request_id=? AND agent_id=? AND status=? AND uses<max_uses AND expires_at>?`, requestID, agentID, GrantActive, s.now().UnixMilli())
 	if err != nil {
 		return nil, err
 	}
+	defer rows.Close()
 	out := map[string]string{}
 	for rows.Next() {
-		var id, tok string
-		if err := rows.Scan(&id, &tok); err != nil {
-			rows.Close()
+		var id string
+		if err := rows.Scan(&id); err != nil {
 			return nil, err
 		}
-		out[id] = tok
+		out[id] = s.signer.token(id, agentID)
 	}
-	rows.Close()
-	for id := range out {
-		if _, err := s.db.ExecContext(ctx, `UPDATE inbox_grants SET pending_token = NULL WHERE id = ?`, id); err != nil {
-			return nil, err
-		}
-	}
-	return out, nil
+	return out, rows.Err()
 }
 
 func nonEmpty(s, def string) string {

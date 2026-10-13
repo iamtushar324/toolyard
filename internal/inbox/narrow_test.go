@@ -53,19 +53,19 @@ func TestOwnerNarrowsScope(t *testing.T) {
 
 	widen := Decision{Action: "approve", Allow: []bool{true, true, false},
 		Params: map[int]map[string]Constraint{0: {"env": mustC(t, "staging")}}}
-	if _, err := e.svc.Decide(ctx, r.ID, widen); !errors.Is(err, ErrWiden) {
+	if _, err := e.decide(ctx, r.ID, widen); !errors.Is(err, ErrWiden) {
 		t.Fatalf("changing a value must fail: %v", err)
 	}
 	extra := Decision{Action: "approve", Allow: []bool{true, true, false},
 		Params: map[int]map[string]Constraint{0: {"region": mustC(t, "eu")}}}
-	if _, err := e.svc.Decide(ctx, r.ID, extra); !errors.Is(err, ErrWiden) {
+	if _, err := e.decide(ctx, r.ID, extra); !errors.Is(err, ErrWiden) {
 		t.Fatalf("adding a parameter must fail: %v", err)
 	}
-	if _, err := e.svc.Decide(ctx, r.ID, Decision{Action: "approve", Allow: []bool{true, true, false}, TTLSeconds: 3600}); !errors.Is(err, ErrWiden) {
+	if _, err := e.decide(ctx, r.ID, Decision{Action: "approve", Allow: []bool{true, true, false}, TTLSeconds: 3600}); !errors.Is(err, ErrWiden) {
 		t.Fatalf("a longer TTL must fail: %v", err)
 	}
 
-	got, err := e.svc.Decide(ctx, r.ID, Decision{Action: "approve", Allow: []bool{true, true, false}, TTLSeconds: 600,
+	got, err := e.decide(ctx, r.ID, Decision{Action: "approve", Allow: []bool{true, true, false}, TTLSeconds: 600,
 		Params: map[int]map[string]Constraint{1: {"ref": mustC(t, "7c1d2e9")}}})
 	if err != nil {
 		t.Fatal(err)
