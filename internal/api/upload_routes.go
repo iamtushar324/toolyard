@@ -26,7 +26,8 @@ import (
 //	201 {"ref":"upload:<sha256>", "sha256", "size", "content_type"}
 //	400 size, hash or type mismatch     404 unknown ticket
 //	405 not PUT                         409 another PUT on this ticket runs
-//	410 ticket used or expired          503 too many uploads (Retry-After)
+//	410 ticket used or expired          503 too many uploads, server-wide
+//	                                        or for this agent (Retry-After)
 const uploadsPathPrefix = "/v1/uploads/"
 
 // EventInboxUpload is the audit event for a stored upload.
@@ -73,6 +74,16 @@ func (s *Server) inboxUpload(w http.ResponseWriter, r *http.Request) {
 		writeUploadErr(w, err)
 		return
 	}
+	// And at most MaxConcurrentUploadsPerAgent of them per agent, so one
+	// agent cannot hold every global slot.
+	releaseAgent, ok := s.inbox.AcquireAgentUploadSlot(pu.AgentID)
+	if !ok {
+		s.inbox.ReleaseUpload(pu)
+		w.Header().Set("Retry-After", "5")
+		writeError(w, http.StatusServiceUnavailable, "this agent already has uploads in progress; retry shortly")
+		return
+	}
+	defer releaseAgent()
 	if r.ContentLength >= 0 && r.ContentLength != pu.Size {
 		s.inbox.ReleaseUpload(pu)
 		writeError(w, http.StatusBadRequest, "Content-Length doesn't match the size the ticket was issued for")

@@ -8,6 +8,8 @@
 -- claimed_until marks a PUT in progress: a second PUT on the same ticket is
 -- refused until the first one stores the file (used_at) or fails (the
 -- claim is released, so the agent can retry until the ticket expires).
+-- claim_token identifies the claim holder: release and completion act only
+-- on the caller's own claim, never on a newer one.
 CREATE TABLE IF NOT EXISTS inbox_upload_tickets (
     token_hash   TEXT PRIMARY KEY,
     agent_id     TEXT NOT NULL,
@@ -19,6 +21,7 @@ CREATE TABLE IF NOT EXISTS inbox_upload_tickets (
     created_at   INTEGER NOT NULL,
     expires_at   INTEGER NOT NULL,
     claimed_until INTEGER,
+    claim_token  TEXT,
     used_at      INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_inbox_upload_tickets_agent ON inbox_upload_tickets(agent_id, expires_at);

@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -686,5 +687,107 @@ func TestSweepCollectsOwnerlessUploadBlobs(t *testing.T) {
 	u.svc.Sweep(ctx)
 	if u.snaps.Exists(ctx, sha) {
 		t.Fatal("an old ownerless upload blob should be collected")
+	}
+}
+
+// Release and completion act only on the caller's own claim: a PUT whose
+// claim expired cannot drop or use the newer claim of the PUT after it.
+func TestUploadClaimTokenOwnsTheClaim(t *testing.T) {
+	u := newUploadEnv(t, false)
+	ctx := context.Background()
+	data := testPNG(40)
+	tk, err := u.svc.CreateUpload(ctx, "ag_1", pngSpec(data))
+	if err != nil {
+		t.Fatal(err)
+	}
+	old, err := u.svc.ClaimUpload(ctx, tk.Ticket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	u.advance(UploadClaimTTL + time.Second) // the first PUT hangs past its claim
+	fresh, err := u.svc.ClaimUpload(ctx, tk.Ticket)
+	if err != nil {
+		t.Fatalf("an expired claim should be reclaimable: %v", err)
+	}
+	u.svc.ReleaseUpload(old)
+	if _, err := u.svc.ClaimUpload(ctx, tk.Ticket); !errors.Is(err, ErrUploadBusy) {
+		t.Fatalf("the stale holder must not release the new claim: %v", err)
+	}
+	if _, err := u.svc.CompleteUpload(ctx, old, "image/png", bytes.NewReader(data)); !errors.Is(err, ErrUploadGone) {
+		t.Fatalf("the stale holder must not complete: %v", err)
+	}
+	if _, err := u.svc.ClaimUpload(ctx, tk.Ticket); !errors.Is(err, ErrUploadBusy) {
+		t.Fatalf("the stale holder's failure must not release the new claim: %v", err)
+	}
+	if _, err := u.svc.CompleteUpload(ctx, fresh, "image/png", bytes.NewReader(data)); err != nil {
+		t.Fatalf("the current holder completes: %v", err)
+	}
+	if !u.snaps.Exists(ctx, hexSum(data)) {
+		t.Fatal("blob missing after the current holder completed")
+	}
+}
+
+func TestAgentUploadSlots(t *testing.T) {
+	u := newUploadEnv(t, false)
+	r1, ok1 := u.svc.AcquireAgentUploadSlot("ag_1")
+	_, ok2 := u.svc.AcquireAgentUploadSlot("ag_1")
+	if !ok1 || !ok2 {
+		t.Fatal("two bodies per agent are allowed")
+	}
+	if _, ok := u.svc.AcquireAgentUploadSlot("ag_1"); ok {
+		t.Fatal("a third body for the same agent must be refused")
+	}
+	if _, ok := u.svc.AcquireAgentUploadSlot("ag_2"); !ok {
+		t.Fatal("another agent has its own slots")
+	}
+	r1()
+	r1()
+	if _, ok := u.svc.AcquireAgentUploadSlot("ag_1"); !ok {
+		t.Fatal("a released slot is reusable")
+	}
+	if _, ok := u.svc.AcquireAgentUploadSlot("ag_1"); ok {
+		t.Fatal("a double release must free one slot only")
+	}
+}
+
+func TestCleanTempRemovesOnlyStaleTempFiles(t *testing.T) {
+	dir := t.TempDir()
+	snaps, err := NewSnapshotter(nil, dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	old := time.Now().Add(-2 * time.Hour)
+	blob := hexSum([]byte("kept blob"))
+	files := map[string]bool{ // name -> should survive
+		"upload-123": false, "fetch-9": false, "put-77": false,
+		"upload-fresh": true, blob: true, "notes.txt": true,
+	}
+	for name := range files {
+		path := filepath.Join(dir, name)
+		if err := os.WriteFile(path, []byte("x"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if name != "upload-fresh" {
+			_ = os.Chtimes(path, old, old)
+		}
+	}
+	if n := snaps.CleanTemp(time.Hour); n != 3 {
+		t.Fatalf("removed %d, want 3", n)
+	}
+	for name, keep := range files {
+		_, err := os.Stat(filepath.Join(dir, name))
+		if keep != (err == nil) {
+			t.Errorf("%s: kept=%v, want %v", name, err == nil, keep)
+		}
+	}
+	// Startup runs the same cleanup.
+	stale := filepath.Join(dir, "fetch-startup")
+	_ = os.WriteFile(stale, []byte("x"), 0o600)
+	_ = os.Chtimes(stale, old, old)
+	if _, err := NewSnapshotter(nil, dir); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(stale); err == nil {
+		t.Fatal("startup should remove stale temp files")
 	}
 }

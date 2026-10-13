@@ -19,6 +19,7 @@ import (
 	"path"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf8"
 )
@@ -45,6 +46,11 @@ const (
 	// MaxConcurrentUploads is how many upload bodies the server reads at
 	// once; further PUTs are refused (503) rather than queued.
 	MaxConcurrentUploads = 8
+	// MaxConcurrentUploadsPerAgent keeps one agent from taking every slot.
+	MaxConcurrentUploadsPerAgent = 2
+	// staleTempAge: temporary files older than this in the blob directory
+	// are leftovers of a crash and are deleted (startup and Sweep).
+	staleTempAge = time.Hour
 	// UploadClaimTTL bounds a claim whose holder died without releasing it.
 	UploadClaimTTL = 6 * time.Minute
 	// uploadTouchGrace: the sweep skips an upload a submission resolved
@@ -97,6 +103,7 @@ type UploadTicket struct {
 // CompleteUpload, which releases the claim on any failure.
 type PendingUpload struct {
 	hash        string
+	claim       string
 	AgentID     string
 	SHA256      string
 	Size        int64
@@ -122,6 +129,7 @@ type uploadBlobs interface {
 	Adopt(tmpPath, sha string) (created bool, err error)
 	DiscardFile(sha string)
 	Exists(ctx context.Context, sha string) bool
+	CleanTemp(olderThan time.Duration) int
 }
 
 func (s *Service) uploadStore() (uploadBlobs, bool) {
@@ -167,16 +175,32 @@ func validUploadKind(k string) bool { return k == "image" || k == "video" || k =
 func (s *Service) AcquireUploadSlot() (release func(), ok bool) {
 	select {
 	case s.uploadSlots <- struct{}{}:
-		var once bool
-		return func() {
-			if !once {
-				once = true
-				<-s.uploadSlots
-			}
-		}, true
+		var once sync.Once
+		return func() { once.Do(func() { <-s.uploadSlots }) }, true
 	default:
 		return func() {}, false
 	}
+}
+
+// AcquireAgentUploadSlot reserves one of an agent's
+// MaxConcurrentUploadsPerAgent body readers, on top of the global slots.
+func (s *Service) AcquireAgentUploadSlot(agentID string) (release func(), ok bool) {
+	s.agentUploadsMu.Lock()
+	defer s.agentUploadsMu.Unlock()
+	if s.agentUploads[agentID] >= MaxConcurrentUploadsPerAgent {
+		return func() {}, false
+	}
+	s.agentUploads[agentID]++
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			s.agentUploadsMu.Lock()
+			defer s.agentUploadsMu.Unlock()
+			if s.agentUploads[agentID]--; s.agentUploads[agentID] <= 0 {
+				delete(s.agentUploads, agentID)
+			}
+		})
+	}, true
 }
 
 // CreateUpload validates an agent's declared upload and issues a ticket.
@@ -285,9 +309,14 @@ func (s *Service) ClaimUpload(ctx context.Context, ticket string) (*PendingUploa
 	}
 	want := hashUploadTicket(ticket)
 	now := s.now().UnixMilli()
-	res, err := s.db.ExecContext(ctx, `UPDATE inbox_upload_tickets SET claimed_until=?
+	cb := make([]byte, 16)
+	if _, err := rand.Read(cb); err != nil {
+		return nil, err
+	}
+	claim := hex.EncodeToString(cb)
+	res, err := s.db.ExecContext(ctx, `UPDATE inbox_upload_tickets SET claimed_until=?, claim_token=?
 		WHERE token_hash=? AND used_at IS NULL AND expires_at>? AND (claimed_until IS NULL OR claimed_until<=?)`,
-		s.now().Add(UploadClaimTTL).UnixMilli(), want, now, now)
+		s.now().Add(UploadClaimTTL).UnixMilli(), claim, want, now, now)
 	if err != nil {
 		return nil, err
 	}
@@ -310,7 +339,7 @@ func (s *Service) ClaimUpload(ctx context.Context, ticket string) (*PendingUploa
 		}
 		return nil, ErrUploadBusy
 	}
-	p.hash = want
+	p.hash, p.claim = want, claim
 	return &p, nil
 }
 
@@ -320,7 +349,9 @@ func (s *Service) ReleaseUpload(p *PendingUpload) {
 	if p == nil || p.hash == "" {
 		return
 	}
-	if _, err := s.db.ExecContext(context.Background(), `UPDATE inbox_upload_tickets SET claimed_until=NULL WHERE token_hash=? AND used_at IS NULL`, p.hash); err != nil {
+	// Only this caller's claim: a newer claim (taken after this one
+	// expired) is left alone.
+	if _, err := s.db.ExecContext(context.Background(), `UPDATE inbox_upload_tickets SET claimed_until=NULL, claim_token=NULL WHERE token_hash=? AND claim_token=? AND used_at IS NULL`, p.hash, p.claim); err != nil {
 		log.Printf("inbox: release upload claim: %v", err)
 	}
 }
@@ -394,6 +425,8 @@ func (s *Service) CompleteUpload(ctx context.Context, p *PendingUpload, contentT
 		return nil, err
 	}
 
+	s.uploadMu.Lock()
+	defer s.uploadMu.Unlock()
 	created, err := blobs.Adopt(tmpPath, p.SHA256)
 	adopted = true // Adopt consumed (or removed) the temporary file
 	if err != nil {
@@ -429,7 +462,7 @@ func (s *Service) recordUpload(ctx context.Context, p *PendingUpload, stored str
 	now := s.now().UnixMilli()
 	// The claim was taken before expiry; a body that finishes after the
 	// ticket's expiry still counts (Sweep never deletes a claimed ticket).
-	res, err := tx.ExecContext(ctx, `UPDATE inbox_upload_tickets SET used_at=?, claimed_until=NULL WHERE token_hash=? AND used_at IS NULL AND claimed_until IS NOT NULL`, now, p.hash)
+	res, err := tx.ExecContext(ctx, `UPDATE inbox_upload_tickets SET used_at=?, claimed_until=NULL, claim_token=NULL WHERE token_hash=? AND used_at IS NULL AND claim_token=?`, now, p.hash, p.claim)
 	if err != nil {
 		return err
 	}
@@ -635,15 +668,28 @@ func (s *Service) sweepUploads(ctx context.Context) {
 		rows.Close()
 	}
 	for _, u := range stale {
-		dropFile, err := s.sweepOneUpload(ctx, u.sha, u.agent, cutoff, touchCutoff)
-		if err != nil {
-			log.Printf("inbox: sweep upload %s: %v", u.sha[:12], err)
-			continue
+		s.sweepUploadLocked(ctx, u.sha, u.agent, cutoff, touchCutoff)
+	}
+	if b, ok := s.uploadStore(); ok {
+		if n := b.CleanTemp(staleTempAge); n > 0 {
+			log.Printf("inbox: removed %d stale temporary blob file(s)", n)
 		}
-		if dropFile {
-			if b, ok := s.uploadStore(); ok {
-				b.DiscardFile(u.sha)
-			}
+	}
+}
+
+// sweepUploadLocked runs one sweep deletion and its file removal under
+// uploadMu, so no upload of the same sha can adopt a file in between.
+func (s *Service) sweepUploadLocked(ctx context.Context, sha, agent string, cutoff, touchCutoff int64) {
+	s.uploadMu.Lock()
+	defer s.uploadMu.Unlock()
+	dropFile, err := s.sweepOneUpload(ctx, sha, agent, cutoff, touchCutoff)
+	if err != nil {
+		log.Printf("inbox: sweep upload %s: %v", sha[:12], err)
+		return
+	}
+	if dropFile {
+		if b, ok := s.uploadStore(); ok {
+			b.DiscardFile(sha)
 		}
 	}
 }

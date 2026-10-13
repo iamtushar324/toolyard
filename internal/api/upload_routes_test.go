@@ -309,7 +309,7 @@ func TestClientIPUsesRightmostUntrustedHop(t *testing.T) {
 		{"10.0.0.7:1", []string{"127.0.0.1, 203.0.113.9, 10.0.0.5"}, "203.0.113.9"},
 		{"10.0.0.7:1", []string{"6.6.6.6", "203.0.113.9"}, "203.0.113.9"},
 		{"10.0.0.7:1", []string{"10.0.0.1, 10.0.0.5"}, "10.0.0.1"},
-		{"10.0.0.7:1", []string{"1.2.3.4, not-an-ip"}, "10.0.0.7"},
+		{"10.0.0.7:1", []string{"1.2.3.4, not-an-ip"}, ""},
 		{"10.0.0.7:1", nil, "10.0.0.7"},
 		{"198.51.100.4:1", []string{"1.2.3.4"}, "198.51.100.4"},
 	}
@@ -323,10 +323,69 @@ func TestClientIPUsesRightmostUntrustedHop(t *testing.T) {
 			t.Errorf("peer %s xff %q: got %s, want %s", c.peer, c.xff, got, c.want)
 		}
 	}
-	r := httptest.NewRequest(http.MethodGet, "/debug/pprof/", nil)
-	r.RemoteAddr = "127.0.0.1:1"
-	r.Header.Set("X-Forwarded-For", "127.0.0.1, 203.0.113.9")
-	if o.IsLoopback(r) {
-		t.Error("a client-set 127.0.0.1 must not pass the loopback check")
+}
+
+// /debug/pprof is gated on the TCP peer itself: production trusts a docker
+// range (172.23.0.0/16) where other containers live, so a forwarded
+// 127.0.0.1 from any of them must not count as loopback.
+func TestDirectLoopbackIgnoresForwardedHeaders(t *testing.T) {
+	_, dockerNet, _ := net.ParseCIDR("172.23.0.0/16")
+	o := SecurityOptions{TrustedProxies: []*net.IPNet{dockerNet}}
+	cases := []struct {
+		peer    string
+		headers map[string]string
+		want    bool
+	}{
+		{"127.0.0.1:5000", nil, true},
+		{"[::1]:5000", nil, true},
+		{"172.23.0.9:5000", map[string]string{"X-Forwarded-For": "127.0.0.1"}, false},
+		{"172.23.0.9:5000", nil, false},
+		{"127.0.0.1:5000", map[string]string{"X-Forwarded-For": "203.0.113.9"}, false},
+		{"127.0.0.1:5000", map[string]string{"X-Forwarded-For": "127.0.0.1"}, false},
+		{"127.0.0.1:5000", map[string]string{"Forwarded": "for=203.0.113.9"}, false},
+		{"127.0.0.1:5000", map[string]string{"X-Real-IP": "203.0.113.9"}, false},
+	}
+	for _, c := range cases {
+		r := httptest.NewRequest(http.MethodGet, "/debug/pprof/", nil)
+		r.RemoteAddr = c.peer
+		for k, v := range c.headers {
+			r.Header.Set(k, v)
+		}
+		if got := DirectLoopback(r); got != c.want {
+			t.Errorf("peer %s headers %v: DirectLoopback %v, want %v", c.peer, c.headers, got, c.want)
+		}
+		if got := o.IsLoopback(r); got != c.want {
+			t.Errorf("peer %s headers %v: IsLoopback %v, want %v", c.peer, c.headers, got, c.want)
+		}
+	}
+}
+
+// One agent may read at most two upload bodies at once; a third PUT gets
+// 503 and its ticket stays usable.
+func TestInboxUploadPerAgentCap(t *testing.T) {
+	f := newInboxAPIFixture(t)
+	ctx := context.Background()
+	data := uploadTestPNG("peragent")
+	tk, err := f.svc.CreateUpload(ctx, f.agent, inbox.UploadSpec{Name: "a.png", ContentType: "image/png", Size: int64(len(data)), SHA256: sha256Hex(data)})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var held []func()
+	for i := 0; i < inbox.MaxConcurrentUploadsPerAgent; i++ {
+		rel, ok := f.svc.AcquireAgentUploadSlot(f.agent)
+		if !ok {
+			t.Fatalf("agent slot %d", i)
+		}
+		held = append(held, rel)
+	}
+	rec := f.put(t, "/v1/uploads/"+tk.Ticket, "image/png", data, nil)
+	if rec.Code != http.StatusServiceUnavailable || rec.Header().Get("Retry-After") == "" {
+		t.Fatalf("third body for one agent: %d %q", rec.Code, rec.Header().Get("Retry-After"))
+	}
+	for _, rel := range held {
+		rel()
+	}
+	if rec := f.put(t, "/v1/uploads/"+tk.Ticket, "image/png", data, nil); rec.Code != http.StatusCreated {
+		t.Fatalf("PUT after the agent's slots free up: %d %s", rec.Code, rec.Body.String())
 	}
 }

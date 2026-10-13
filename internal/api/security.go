@@ -44,8 +44,9 @@ func (o SecurityOptions) IsBehindHTTPS(r *http.Request) bool {
 // when the immediate peer is in TrustedProxies. A client can put anything
 // in the header it sends, and each proxy appends the address it saw, so
 // the chain is read from the right: the first address that is not itself
-// a trusted proxy is the client. An unparsable hop stops the walk (falls
-// back to the peer). Falls back to RemoteAddr.
+// a trusted proxy is the client. An unparsable hop stops the walk and
+// yields "" (unknown), never the proxy's own address. Without a trusted
+// peer it is RemoteAddr.
 func (o SecurityOptions) ClientIP(r *http.Request) string {
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
@@ -65,7 +66,7 @@ func (o SecurityOptions) ClientIP(r *http.Request) string {
 	for i := len(hops) - 1; i >= 0; i-- {
 		ip := net.ParseIP(hops[i])
 		if ip == nil {
-			return host
+			return ""
 		}
 		if !o.ipTrusted(ip) || i == 0 {
 			return ip.String()
@@ -104,10 +105,24 @@ func (o SecurityOptions) ipTrusted(ip net.IP) bool {
 	return false
 }
 
-// IsLoopback reports whether the client address (after trusted-proxy
-// resolution) is on loopback.
+// IsLoopback reports whether the request comes straight from loopback:
+// the TCP peer is a loopback address and no proxy header claims another
+// client. It deliberately ignores TrustedProxies and ClientIP: a trusted
+// range can hold other local containers (production trusts a docker
+// range), and any of them could send X-Forwarded-For: 127.0.0.1.
 func (o SecurityOptions) IsLoopback(r *http.Request) bool {
-	host := o.ClientIP(r)
+	return DirectLoopback(r)
+}
+
+// DirectLoopback is IsLoopback without options (used for /debug/pprof).
+func DirectLoopback(r *http.Request) bool {
+	if len(r.Header.Values("X-Forwarded-For")) > 0 || len(r.Header.Values("Forwarded")) > 0 || r.Header.Get("X-Real-Ip") != "" {
+		return false
+	}
+	host, _, err := net.SplitHostPort(r.RemoteAddr)
+	if err != nil {
+		host = r.RemoteAddr
+	}
 	ip := net.ParseIP(host)
 	return ip != nil && ip.IsLoopback()
 }

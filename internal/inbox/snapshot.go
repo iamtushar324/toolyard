@@ -48,7 +48,45 @@ func NewSnapshotter(db *store.DB, dir string) (*Snapshotter, error) {
 	}
 	s := &Snapshotter{dir: dir, db: db}
 	s.client = s.newClient()
+	// Leftovers of a crash mid-download or mid-upload.
+	s.CleanTemp(time.Hour)
 	return s, nil
+}
+
+// tempPrefixes name the temporary files Snapshot, Put and uploads create.
+var tempPrefixes = []string{"upload-", "fetch-", "put-"}
+
+// CleanTemp deletes temporary files in the blob directory last modified
+// more than olderThan ago and returns how many it removed. Blobs (named by
+// their sha256) are never touched.
+func (s *Snapshotter) CleanTemp(olderThan time.Duration) int {
+	entries, err := os.ReadDir(s.dir)
+	if err != nil {
+		return 0
+	}
+	cutoff := time.Now().Add(-olderThan)
+	n := 0
+	for _, e := range entries {
+		name := e.Name()
+		if e.IsDir() || blobName.MatchString(name) {
+			continue
+		}
+		temp := false
+		for _, p := range tempPrefixes {
+			temp = temp || strings.HasPrefix(name, p)
+		}
+		if !temp {
+			continue
+		}
+		info, err := e.Info()
+		if err != nil || !info.ModTime().Before(cutoff) {
+			continue
+		}
+		if os.Remove(filepath.Join(s.dir, name)) == nil {
+			n++
+		}
+	}
+	return n
 }
 
 func (s *Snapshotter) newClient() *http.Client {

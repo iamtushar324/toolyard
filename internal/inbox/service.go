@@ -108,8 +108,16 @@ type Service struct {
 	attnMu       sync.Mutex // one attention round (Tick / dispatch) at a time
 	voiceMu      sync.Mutex
 	voiceFlights map[string]*voiceFlight
-	// uploadSlots bounds concurrent upload bodies (AcquireUploadSlot).
-	uploadSlots chan struct{}
+	// uploadSlots bounds concurrent upload bodies (AcquireUploadSlot);
+	// agentUploads counts them per agent (AcquireAgentUploadSlot).
+	uploadSlots    chan struct{}
+	agentUploadsMu sync.Mutex
+	agentUploads   map[string]int
+	// uploadMu serializes the blob-file steps of uploads and the upload
+	// sweep (adopt+record, failure cleanup, sweep tx+file delete), so a
+	// sweep can never delete a file a new upload of the same sha just
+	// adopted.
+	uploadMu sync.Mutex
 	// uploadRecordHook, when set (tests), runs before an upload is
 	// recorded; an error simulates a failed store.
 	uploadRecordHook func() error
@@ -125,7 +133,7 @@ func New(ctx context.Context, opts Options) (*Service, error) {
 	if now == nil {
 		now = time.Now
 	}
-	service := &Service{db: opts.DB, opts: opts, signer: signer, now: now, watch: map[string]chan struct{}{}, uploadSlots: make(chan struct{}, MaxConcurrentUploads)}
+	service := &Service{db: opts.DB, opts: opts, signer: signer, now: now, watch: map[string]chan struct{}{}, uploadSlots: make(chan struct{}, MaxConcurrentUploads), agentUploads: map[string]int{}}
 	if _, err := service.RecoverExecutions(ctx); err != nil {
 		return nil, fmt.Errorf("execution recovery: %w", err)
 	}

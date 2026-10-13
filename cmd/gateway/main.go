@@ -1213,7 +1213,9 @@ func runServe(argv []string) error {
 	pprofMux.HandleFunc("/debug/pprof/trace", httppprof.Trace)
 	loopbackOnly := func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-			if !apiSrv.SecurityOpts().IsLoopback(r) {
+			// The TCP peer itself, never a forwarded address: a container
+			// in the trusted docker range could claim 127.0.0.1.
+			if !api.DirectLoopback(r) {
 				http.NotFound(w, r)
 				return
 			}
