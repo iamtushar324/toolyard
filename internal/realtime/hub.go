@@ -22,6 +22,9 @@ type Event struct {
 type Hub struct {
 	mu      sync.RWMutex
 	clients map[chan Event]struct{}
+	// done is closed by CloseAll; every stream, open or new, then ends.
+	done   chan struct{}
+	closed bool
 }
 
 func NewHub() *Hub {
@@ -39,6 +42,33 @@ func (h *Hub) Publish(evt Event) {
 		default:
 		}
 	}
+}
+
+// CloseAll ends every open stream and refuses new ones (503), so the HTTP
+// server's graceful shutdown is not held open by long-lived dashboard
+// streams. The dashboard reconnects to the next process. Safe to call more
+// than once.
+func (h *Hub) CloseAll() {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.closed {
+		return
+	}
+	h.closed = true
+	if h.done == nil {
+		h.done = make(chan struct{})
+	}
+	close(h.done)
+}
+
+// doneCh returns the channel CloseAll closes.
+func (h *Hub) doneCh() <-chan struct{} {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.done == nil {
+		h.done = make(chan struct{})
+	}
+	return h.done
 }
 
 func (h *Hub) subscribe() chan Event {
@@ -68,6 +98,14 @@ func (h *Hub) ServeSSEFiltered(w http.ResponseWriter, r *http.Request, allow fun
 		http.Error(w, "streaming unsupported", http.StatusInternalServerError)
 		return
 	}
+	done := h.doneCh()
+	select {
+	case <-done:
+		w.Header().Set("Retry-After", "5")
+		http.Error(w, "server restarting, reconnect", http.StatusServiceUnavailable)
+		return
+	default:
+	}
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-store")
 	w.Header().Set("Connection", "keep-alive")
@@ -87,6 +125,8 @@ func (h *Hub) ServeSSEFiltered(w http.ResponseWriter, r *http.Request, allow fun
 	for {
 		select {
 		case <-r.Context().Done():
+			return
+		case <-done:
 			return
 		case <-keepalive.C:
 			// A real `event: ping` (not an SSE comment): comments are

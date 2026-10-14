@@ -344,6 +344,13 @@ func (s *Server) HardenAPI(next http.Handler) http.Handler {
 			next.ServeHTTP(w, r)
 			return
 		}
+		// Probe reads (GET/HEAD /v1/livez, /v1/readyz) carry no body and
+		// no credential: no CSRF check and no rate limit, so an
+		// orchestrator polling every second is never refused.
+		if isProbeRead(r) {
+			next.ServeHTTP(w, r)
+			return
+		}
 
 		// 1) Per-route body cap. The memory-webhook ingest path is the one
 		// route that intentionally takes a large body (n8n transcripts), so

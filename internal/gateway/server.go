@@ -8,6 +8,7 @@ import (
 	"log"
 	"math"
 	"net/http"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -22,10 +23,12 @@ import (
 	"github.com/tusharbhardwaj/toolyard/internal/approval"
 	"github.com/tusharbhardwaj/toolyard/internal/audit"
 	"github.com/tusharbhardwaj/toolyard/internal/codemode"
+	"github.com/tusharbhardwaj/toolyard/internal/goroutines"
 	"github.com/tusharbhardwaj/toolyard/internal/inbox"
-	"github.com/tusharbhardwaj/toolyard/internal/lake"
+	"github.com/tusharbhardwaj/toolyard/internal/logx"
 	"github.com/tusharbhardwaj/toolyard/internal/memory"
 	"github.com/tusharbhardwaj/toolyard/internal/metrics"
+	"github.com/tusharbhardwaj/toolyard/internal/opsmetrics"
 	"github.com/tusharbhardwaj/toolyard/internal/policy"
 	"github.com/tusharbhardwaj/toolyard/internal/realtime"
 )
@@ -48,6 +51,11 @@ const (
 	// blocking call can't hold a connection longer than common LB read
 	// timeouts.
 	WaitForApprovalMaxTimeout = 5 * time.Minute
+	// restartRetryAfterSeconds is the retry hint in a drain refusal.
+	restartRetryAfterSeconds = 5
+	// persistTimeout bounds recording an executed approval's outcome on a
+	// context that outlives the executor's.
+	persistTimeout = 5 * time.Second
 )
 
 // ErrUpstreamNotFound is returned when an upstream is referenced by name but
@@ -73,16 +81,6 @@ var PinnedTools = map[string]struct{}{
 	"memory.set":                      {},
 	"memory.list":                     {},
 	"memory.delete":                   {},
-	// Personal data lake — the additive tools are pinned so agents always
-	// see them; the approval-gated mutations (lake.update, lake.delete,
-	// lake.alter, lake.drop) are deliberately not pinned, keeping them off
-	// the default toolbelt unless the agent reaches via tools.search.
-	"lake.query":          {},
-	"lake.list_tables":    {},
-	"lake.describe_table": {},
-	"lake.insert":         {},
-	"lake.create_table":   {},
-	"lake.ingest":         {},
 	// Events Hub — the common-language layer. Pinned so every agent type
 	// always sees the brief/query/publish/ack entry points without reaching
 	// through tools.search.
@@ -116,20 +114,21 @@ type toolEntry struct {
 	// forcedAction, when non-nil, short-circuits policy.Eval for this tool
 	// and uses the provided action instead. Used by built-in tools that
 	// need a deterministic policy decision regardless of the name-heuristic
-	// (e.g., lake.create_table looks like a write but is intentionally
+	// (e.g., notes.publish looks like a write but is intentionally
 	// auto-allowed). The intent_category supplied by the agent is ignored
 	// when forcedAction is set.
 	forcedAction *policy.Action
 	// denyOverridesForced lets an explicit deny policy, on the tool or on
-	// its upstream, beat forcedAction (policy.Engine.ExplicitDeny). Set on
-	// the lake.* tools only: control-plane tools (inbox.*, policies.*, ...)
-	// keep ignoring deny, so one rule can never lock every agent out.
+	// its upstream, beat forcedAction (policy.Engine.ExplicitDeny). For
+	// data tools an owner must be able to switch off; no built-in sets it
+	// today. Control-plane tools (inbox.*, policies.*, ...) keep ignoring
+	// deny, so one rule can never lock every agent out.
 	denyOverridesForced bool
 	// escalate, when non-nil, reads a call's arguments after the policy
 	// decision: if that decision is allow and escalate returns true, the
 	// call needs approval instead, with the returned reason. It sends the
 	// data-replacing or externally reaching forms of an open tool to a
-	// person (lake.create_table, lake.ingest).
+	// person.
 	escalate func(args map[string]any) (string, bool)
 	// reasonOptional lets a call omit _reason. Set on the code-mode tools,
 	// whose clients are configured for Bifrost and never send one; the
@@ -152,7 +151,6 @@ type Gateway struct {
 	audit               *audit.Logger
 	hub                 *realtime.Hub
 	memory              *memory.Service
-	lake                *lake.Service
 	visibility          VisibilityProvider
 	usage               UsageRecorder
 	metrics             MetricsRecorder
@@ -194,6 +192,16 @@ type Gateway struct {
 	// runaway upstream is visible without dumping goroutines.
 	inFlight atomic.Int64
 
+	// Shutdown (TEC-1626). drainActive makes routeEntry refuse new calls
+	// with a retryable answer (BeginDrain). drainRelease, closed by
+	// ReleaseWaiters, ends the approval wait loops. grantCalls tracks
+	// granted (Inbox) executions so shutdown can wait for them.
+	drainActive   atomic.Bool
+	drainMu       sync.Mutex
+	drainRelease  chan struct{}
+	drainReleased bool
+	grantCalls    goroutines.Tracker
+
 	// clientCache remembers each agent's MCP clientInfo; sessionCache
 	// remembers which agent owns a `_session_id` (actor.go).
 	clientCache
@@ -232,18 +240,13 @@ type VisibilityProvider interface {
 }
 
 type Options struct {
-	Name     string
-	Version  string
-	Policy   *policy.Engine
-	Approval *approval.Bus
-	Audit    *audit.Logger
-	Hub      *realtime.Hub
-	Memory   *memory.Service
-	// Lake, when non-nil, gives the gateway a DuckDB-backed personal data
-	// lake. The lake.* MCP tools are registered against it during
-	// RegisterBuiltins. Nil keeps the gateway working without a lake (e.g.,
-	// in tests that don't need it).
-	Lake       *lake.Service
+	Name       string
+	Version    string
+	Policy     *policy.Engine
+	Approval   *approval.Bus
+	Audit      *audit.Logger
+	Hub        *realtime.Hub
+	Memory     *memory.Service
 	InLineWait time.Duration
 	// Visibility, if non-nil, decides which tools the agent sees in
 	// tools/list and whether direct calls to a tool are accepted. Tools
@@ -339,7 +342,6 @@ func New(opts Options) *Gateway {
 		audit:               opts.Audit,
 		hub:                 opts.Hub,
 		memory:              opts.Memory,
-		lake:                opts.Lake,
 		visibility:          opts.Visibility,
 		usage:               opts.Usage,
 		metrics:             opts.Metrics,
@@ -356,10 +358,11 @@ func New(opts Options) *Gateway {
 		upstreams:           map[string]*upstream{},
 		perUser:             map[string]*perUserGroup{},
 	}
+	g.grantCalls.Executions = true
 	serverOpts := []server.ServerOption{
 		server.WithToolCapabilities(true),
 		server.WithLogging(),
-		server.WithRecovery(),
+		server.WithToolHandlerMiddleware(recoverToolPanics),
 		server.WithInstructions(buildInstructions(opts.Approval, opts.InLineWait)),
 	}
 	// The initialize hook remembers what each client says it is, so audit
@@ -513,6 +516,127 @@ func (g *Gateway) denyUngranted(ctx context.Context, entry toolEntry, agentID, a
 	return notFoundResult(entry.tool.Name)
 }
 
+// BeginDrain makes every new routed tool call answer with a retryable
+// "server restarting, call again" result before any grant is redeemed,
+// approval resumed or tool dispatched, so no permission is used up. Calls
+// already running continue.
+func (g *Gateway) BeginDrain() { g.drainActive.Store(true) }
+
+// Draining reports whether BeginDrain was called.
+func (g *Gateway) Draining() bool { return g.drainActive.Load() }
+
+// ReleaseWaiters ends running tools.wait_for_approval(s) calls with the
+// retryable answer, so they do not hold the HTTP server open. Safe to call
+// more than once.
+func (g *Gateway) ReleaseWaiters() {
+	g.drainMu.Lock()
+	defer g.drainMu.Unlock()
+	if g.drainRelease == nil {
+		g.drainRelease = make(chan struct{})
+	}
+	if !g.drainReleased {
+		g.drainReleased = true
+		close(g.drainRelease)
+	}
+}
+
+// drainReleaseCh returns the channel ReleaseWaiters closes.
+func (g *Gateway) drainReleaseCh() <-chan struct{} {
+	g.drainMu.Lock()
+	defer g.drainMu.Unlock()
+	if g.drainRelease == nil {
+		g.drainRelease = make(chan struct{})
+	}
+	return g.drainRelease
+}
+
+// WaitGrantedCalls waits until no granted (Inbox) execution is running or
+// ctx ends, and returns how many were still running.
+func (g *Gateway) WaitGrantedCalls(ctx context.Context) int {
+	return len(g.grantCalls.Wait(ctx))
+}
+
+// recoverToolPanics is mcp-go's WithRecovery (a panicking tool handler
+// becomes an error answer, the process keeps serving) that also logs the
+// panic at ERROR with its stack and counts it in the HTTP panic counter.
+// Without it the panic left no trace beyond the agent's error text.
+func recoverToolPanics(next server.ToolHandlerFunc) server.ToolHandlerFunc {
+	return func(ctx context.Context, request mcp.CallToolRequest) (result *mcp.CallToolResult, err error) {
+		defer func() {
+			if r := recover(); r != nil {
+				opsmetrics.IncHTTPPanic()
+				logx.For("gateway").Error("panic in tool handler",
+					"tool", request.Params.Name, "panic", fmt.Sprint(r), "stack", string(debug.Stack()))
+				err = fmt.Errorf("panic recovered in %s tool handler: %v", request.Params.Name, r)
+			}
+		}()
+		return next(ctx, request)
+	}
+}
+
+// drainAdmittedKey marks the context of a call that passed the drain
+// check. Everything the call does runs on contexts derived from it (the
+// dispatch, an executeToolCode script's nested calls, tools.execute's
+// inner call), so its nested calls are not refused when a drain begins
+// half-way: refusing them would abort a script after some of its writes
+// ran, and the agent's rerun would repeat them. Admitted calls finish
+// under the drain's trackers and the HTTP server's graceful shutdown.
+type drainAdmittedKey struct{}
+
+func withDrainAdmitted(ctx context.Context) context.Context {
+	if drainAdmitted(ctx) {
+		return ctx
+	}
+	return context.WithValue(ctx, drainAdmittedKey{}, true)
+}
+
+func drainAdmitted(ctx context.Context) bool {
+	v, _ := ctx.Value(drainAdmittedKey{}).(bool)
+	return v
+}
+
+// restartingResult is the answer to a call refused or a wait ended by a
+// drain. Nothing ran and no grant or approval was used, so the same call
+// works again in a few seconds (the next process answers it).
+func restartingResult(tool, detail string) *mcp.CallToolResult {
+	msg := "server restarting, call again: " + detail
+	res := mcp.NewToolResultError(msg)
+	res.StructuredContent = map[string]any{
+		"status":              "server_restarting",
+		"executed":            false,
+		"retryable":           true,
+		"retry_after_seconds": restartRetryAfterSeconds,
+		"tool":                tool,
+		"message":             msg,
+	}
+	res.Meta = &mcp.Meta{AdditionalFields: map[string]any{"toolyard.retryable": true}}
+	return res
+}
+
+// toolCallLabel maps a call's metrics outcome to the tool-call counter's
+// fixed labels.
+func toolCallLabel(outcome string) string {
+	switch outcome {
+	case metrics.OutcomeOK:
+		return "ok"
+	case metrics.OutcomeDenied, metrics.OutcomeExpired:
+		return "denied"
+	case metrics.OutcomeDeferred:
+		return "approval"
+	default:
+		return "error"
+	}
+}
+
+// auditWriteFailed logs a failed dispatch audit write at ERROR, with the
+// dispatch id, tool and upstream (never the arguments), and counts it.
+func auditWriteFailed(stage, dispatchID string, entry toolEntry, err error) {
+	opsmetrics.IncAuditWriteFailure(stage)
+	logx.For("gateway").Error("dispatch audit write failed",
+		"stage", stage, "dispatch_id", dispatchID,
+		"tool", entry.tool.Name, "upstream", entry.upstream, "err", err.Error())
+}
+
 // InFlight returns the number of tool calls currently being routed. Used
 // by /v1/health and the dashboard to spot pile-ups; it is also a quick
 // signal during a hang ("how many calls are stuck").
@@ -539,8 +663,8 @@ func (g *Gateway) MCPServer() *server.MCPServer { return g.mcp }
 
 // RegisterBuiltins wires the built-in memory tools, the meta-tools
 // (tools.search / tools.execute), the Bifrost-compatible code-mode tools,
-// the fixture echo tool, and (if a Lake is configured) the lake.*
-// personal-data-warehouse tools into the MCP server.
+// the access and connections tools, and the fixture echo tool into the MCP
+// server.
 func (g *Gateway) RegisterBuiltins() {
 	entries := g.builtinMemoryTools()
 	entries = append(entries, g.staticFixtureTool())
@@ -549,9 +673,6 @@ func (g *Gateway) RegisterBuiltins() {
 	entries = append(entries, g.codeModeTools()...)
 	entries = append(entries, g.accessTools()...)
 	entries = append(entries, g.connectionsTools()...)
-	if g.lake != nil {
-		entries = append(entries, g.lakeTools()...)
-	}
 	for _, e := range entries {
 		g.registerEntry(e)
 	}
@@ -561,11 +682,12 @@ func (g *Gateway) RegisterBuiltins() {
 // the synthetic upstreams (builtin, fixture, inbox, session, policies,
 // servers, audit, access, connections), the meta-tool group "tools", the built-in data
 // groups whose tools are registered under the "builtin" upstream (memory,
-// lake, events), and "toolyard", the code-mode server every internal tool
+// events), and "toolyard", the code-mode server every internal tool
 // is bound under. An upstream with one of these names would register tools
 // under the same prefix as the built-ins and share their access group:
 // "tools" is always-on, so a server called tools would be reachable by
-// every member without a grant.
+// every member without a grant. "lake", the retired data group, stays
+// reserved: old grants for it may still be stored.
 //
 // notes and skills are deliberately not here: they are real upstreams that
 // startup registers under those names (upstreams.UpsertBuiltin), and their
@@ -1090,6 +1212,7 @@ func (g *Gateway) RouteCall(ctx context.Context, viaTool, targetName string, arg
 func (g *Gateway) routeEntry(ctx context.Context, entry toolEntry, via string, args map[string]any) (res *mcp.CallToolResult, err error) {
 	started := time.Now()
 	agentID := agentIDFromContext(ctx)
+	refusedDraining := false
 
 	// Who is calling: the ingress raiser (or the caller id alone), the
 	// client that introduced itself at initialize, and the agent session
@@ -1146,6 +1269,11 @@ func (g *Gateway) routeEntry(ctx context.Context, entry toolEntry, via string, a
 		if g.metrics != nil {
 			g.metrics.Record(ev)
 		}
+		if refusedDraining {
+			opsmetrics.IncToolCall("refused_draining")
+		} else {
+			opsmetrics.IncToolCall(toolCallLabel(ev.Outcome))
+		}
 	}()
 
 	// Per-user access comes first: a member whose admin never granted this
@@ -1154,6 +1282,20 @@ func (g *Gateway) routeEntry(ctx context.Context, entry toolEntry, via string, a
 	if !g.allowsEntry(ctx, agentID, entry) {
 		return g.denyUngranted(ctx, entry, agentID, "", &ev), nil
 	}
+
+	// A drain refuses a new call before anything is used up: no grant is
+	// redeemed, no approval resumed or created, nothing dispatched. A call
+	// made by a call admitted earlier (a nested executeToolCode or
+	// tools.execute call, a resume through tools.execute) is part of that
+	// call and finishes under the drain.
+	if g.Draining() && !drainAdmitted(ctx) {
+		refusedDraining = true
+		ev.Outcome = metrics.OutcomeError
+		ev.ErrorClass = "draining"
+		return restartingResult(entry.tool.Name, entry.tool.Name+
+			" did not run and no permission was used. Call it again with the same arguments in a few seconds."), nil
+	}
+	ctx = withDrainAdmitted(ctx)
 
 	// Deferred-resume short-circuit. The approval coordination tools take
 	// approval ids as their own arguments and have no held call of their
@@ -1213,6 +1355,10 @@ func (g *Gateway) routeEntry(ctx context.Context, entry toolEntry, via string, a
 	// A grant only matters for calls that would otherwise need approval:
 	// an explicit deny still wins, and an open tool doesn't use one up.
 	if !entry.personalGitHub && grantToken != "" && decision.Action == policy.ActionApprove && g.inbox != nil {
+		// Tracked so shutdown waits for the granted execution to finish
+		// and record its outcome.
+		done := g.grantCalls.Add(entry.tool.Name)
+		defer done()
 		return g.redeemAndDispatch(ctx, entry, cleanArgs, agentID, reason, grantToken, &ev)
 	}
 
@@ -1526,6 +1672,7 @@ func (g *Gateway) resumeDeferred(ctx context.Context, entry toolEntry, approvalI
 			case <-waitCh:
 			case <-time.After(wait):
 			case <-ctx.Done():
+			case <-g.drainReleaseCh(): // shutdown: answer with the state as it stands
 			}
 		}
 		req, err = g.approval.Get(ctx, approvalID)
@@ -1752,6 +1899,7 @@ func (g *Gateway) dispatch(ctx context.Context, entry toolEntry, args map[string
 	auditArgs, _ := json.Marshal(args)
 	intent := audit.Event{ID: dispatchID + ".started", EventType: "call.dispatch", AgentID: agentID, UpstreamName: entry.upstream, ToolName: entry.tool.Name, Reason: reason, ApprovalID: approvalID, Arguments: auditArgs, Raiser: actor.Raiser{OwnerUserID: asUser}}
 	if err := g.audit.Write(ctx, intent); err != nil {
+		auditWriteFailed("intent", dispatchID, entry, err)
 		ev.Outcome = metrics.OutcomeError
 		ev.ErrorClass = "audit_unavailable"
 		return mcp.NewToolResultError("Audit unavailable. The tool did not run."), nil
@@ -1784,6 +1932,7 @@ func (g *Gateway) dispatch(ctx context.Context, entry toolEntry, args map[string
 	auditErr := g.audit.Write(auditCtx, outcome)
 	auditCancel()
 	if auditErr != nil {
+		auditWriteFailed("outcome", dispatchID, entry, auditErr)
 		ev.Outcome = metrics.OutcomeError
 		ev.ErrorClass = "audit_outcome_unknown"
 		return mcp.NewToolResultError("Tool outcome unknown: completion audit failed. Do not retry. Review dispatch " + dispatchID + " before another action."), nil
@@ -2129,6 +2278,9 @@ func (g *Gateway) Execute(ctx context.Context, req *approval.Request) {
 	// connect link minted here would sit in a row admins and operator
 	// tokens can read. Refusals name the dashboard instead.
 	execCtx := WithoutConnectLinks(actor.WithRaiser(WithAgentID(ctx, req.AgentID), raiser))
+	// The bus starts an executor only outside a drain, so its nested calls
+	// (an approved script's) are admitted work and finish under it.
+	execCtx = withDrainAdmitted(execCtx)
 	if req.PersonalOwner() != "" {
 		var cancel context.CancelFunc
 		execCtx, cancel = context.WithDeadline(execCtx, time.UnixMilli(req.ExpiresAt))
@@ -2181,7 +2333,12 @@ func (g *Gateway) Execute(ctx context.Context, req *approval.Request) {
 	if g.metrics != nil {
 		g.metrics.Record(*ev)
 	}
-	g.persistApprovalResult(ctx, req.ID, res, dispatchErr, ev.ErrorClass == "upstream" || ev.ErrorClass == "audit_outcome_unknown")
+	// The outcome is recorded even when ctx was cancelled mid-dispatch
+	// (the bus cancels it at the drain deadline): the dispatch error then
+	// makes it outcome_unknown.
+	persistCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), persistTimeout)
+	defer cancel()
+	g.persistApprovalResult(persistCtx, req.ID, res, dispatchErr, ev.ErrorClass == "upstream" || ev.ErrorClass == "audit_outcome_unknown")
 }
 
 // persistApprovalResult encodes a dispatched tool result and stores it on

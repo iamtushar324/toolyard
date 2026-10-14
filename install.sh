@@ -10,8 +10,7 @@
 #   4. installs the `toolyard` binary to /usr/local/bin (or ~/.local/bin)
 #
 # For a production Linux/systemd install that builds from source and sets
-# up the full stack (systemd unit, ClickHouse, Grafana), use
-# deploy/install.sh from a repo checkout instead.
+# up the systemd unit, use deploy/install.sh from a repo checkout instead.
 #
 # Environment:
 #   TOOLYARD_VERSION=v0.1.0   install a specific release instead of latest

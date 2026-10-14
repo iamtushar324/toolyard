@@ -6,6 +6,9 @@ services:
     image: toolyard:dev
     container_name: toolyard
     restart: unless-stopped
+    # SIGTERM starts the drain: in-flight work gets up to -drain-timeout
+    # (60s) plus ~10s of bounded closes before the container is killed.
+    stop_grace_period: 75s
     ports:
       - "8787:8787"
     volumes:

@@ -8,11 +8,12 @@ package auditlink
 
 import (
 	"context"
-	"log"
 
 	"github.com/tusharbhardwaj/toolyard/internal/actor"
 	"github.com/tusharbhardwaj/toolyard/internal/approval"
 	"github.com/tusharbhardwaj/toolyard/internal/audit"
+	"github.com/tusharbhardwaj/toolyard/internal/logx"
+	"github.com/tusharbhardwaj/toolyard/internal/opsmetrics"
 )
 
 // Notifier returns an approval.Notifier that mirrors bus events into
@@ -50,7 +51,11 @@ func (n *notifier) write(ctx context.Context, req *approval.Request, eventType s
 		return
 	}
 	if err := n.log.Write(ctx, ev); err != nil {
-		log.Printf("auditlink: %s %s: %v", eventType, req.ID, err)
+		// Never the arguments: only what identifies the row that is missing.
+		opsmetrics.IncAuditWriteFailure("approval")
+		logx.For("auditlink").Error("approval audit write failed",
+			"event", eventType, "approval_id", req.ID, "tool", req.ToolName,
+			"upstream", req.UpstreamName, "err", err.Error())
 	}
 }
 

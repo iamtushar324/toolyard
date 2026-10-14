@@ -8,8 +8,7 @@
 //
 // Every event carries a `summary` — a natural-language sentence — so the
 // events.brief MCP tool can give any agent the same readable digest of "what
-// happened." Events land in the SQLite hot store, sink async into the
-// ClickHouse lake, and fan out to push/SSE.
+// happened." Events land in the SQLite store and fan out to push/SSE.
 package events
 
 import (

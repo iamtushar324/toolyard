@@ -59,25 +59,25 @@ func TestSetToolPolicy_OffDisablesRule(t *testing.T) {
 	s := newTestService(t)
 	ctx := context.Background()
 
-	if err := s.SetToolPolicy(ctx, "lake_query", true); err != nil {
+	if err := s.SetToolPolicy(ctx, "warehouse_query", true); err != nil {
 		t.Fatalf("on: %v", err)
 	}
-	if err := s.SetToolPolicy(ctx, "lake_query", false); err != nil {
+	if err := s.SetToolPolicy(ctx, "warehouse_query", false); err != nil {
 		t.Fatalf("off: %v", err)
 	}
-	if p := s.ToolPolicies(ctx); p["lake_query"] {
-		t.Fatalf("expected lake_query disabled, got %#v", p)
+	if p := s.ToolPolicies(ctx); p["warehouse_query"] {
+		t.Fatalf("expected warehouse_query disabled, got %#v", p)
 	}
 
 	// The rule row should still exist (disabled) so toggling back on
 	// re-uses it instead of creating a duplicate.
-	if err := s.SetToolPolicy(ctx, "lake_query", true); err != nil {
+	if err := s.SetToolPolicy(ctx, "warehouse_query", true); err != nil {
 		t.Fatalf("on again: %v", err)
 	}
 	rules, _ := s.List(ctx)
 	var n int
 	for _, r := range rules {
-		if r.Kind == "tool" && r.ToolName == "lake_query" {
+		if r.Kind == "tool" && r.ToolName == "warehouse_query" {
 			n++
 		}
 	}

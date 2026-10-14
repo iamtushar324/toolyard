@@ -74,6 +74,7 @@ import (
 	"github.com/tusharbhardwaj/toolyard/internal/metrics"
 	"github.com/tusharbhardwaj/toolyard/internal/notes"
 	"github.com/tusharbhardwaj/toolyard/internal/oauth"
+	"github.com/tusharbhardwaj/toolyard/internal/ops"
 	"github.com/tusharbhardwaj/toolyard/internal/passkey"
 	"github.com/tusharbhardwaj/toolyard/internal/policy"
 	"github.com/tusharbhardwaj/toolyard/internal/pricing"
@@ -116,25 +117,24 @@ type Server struct {
 	// the metrics buffer is overflowing (often the canary for "the
 	// SQLite write path is stalled"), which usually shows up before the
 	// dashboard noticeably hangs.
-	metricsRecorder          *metrics.Recorder
-	autoApproval             *autoapproval.Service
-	policy                   *policy.Engine
-	oauth                    *oauth.Service
-	hooks                    *hooks.Service
-	clickhouseRuntimeEnvPath string
-	mempalace                *mempalace.Service
-	inbox                    *inbox.Service
-	snapshots                *inbox.Snapshotter
-	passkeys                 *passkey.Service
-	identityKeys             *identitykeys.Service
-	guide                    *inbox.Guide
-	notes                    *notes.Service
-	skills                   *skills.Service
-	voice                    *voice.Service
-	secrets                  *secrets.Service
-	chatTelegram             ChatTelegram
-	events                   EventsAPI
-	memWebhooks              *memwebhook.Service
+	metricsRecorder *metrics.Recorder
+	autoApproval    *autoapproval.Service
+	policy          *policy.Engine
+	oauth           *oauth.Service
+	hooks           *hooks.Service
+	mempalace       *mempalace.Service
+	inbox           *inbox.Service
+	snapshots       *inbox.Snapshotter
+	passkeys        *passkey.Service
+	identityKeys    *identitykeys.Service
+	guide           *inbox.Guide
+	notes           *notes.Service
+	skills          *skills.Service
+	voice           *voice.Service
+	secrets         *secrets.Service
+	chatTelegram    ChatTelegram
+	events          EventsAPI
+	memWebhooks     *memwebhook.Service
 	// webhookMaxBytes caps the /v1/memory/webhooks/ingest body. Large by
 	// design (n8n meeting transcripts); enforced via MaxBytesReader for a
 	// clean 413. Other routes keep their tight per-route caps.
@@ -156,6 +156,8 @@ type Server struct {
 	clerkOwnerOnly      bool
 	// connect is POST /v1/connect/t3 (connect_routes.go); nil = off.
 	connect *connectConfig
+	// probes answers /v1/livez and /v1/readyz (and their aliases).
+	probes *ops.Prober
 }
 
 type Options struct {
@@ -184,15 +186,8 @@ type Options struct {
 	OAuth           *oauth.Service
 	// Hooks, when set, enables /v1/hooks/*: bearer-authenticated lifecycle
 	// hook ingest for agents plus dashboard browsing/export.
-	Hooks *hooks.Service
-	// ClickhouseRuntimeEnvPath, when non-empty, is the path on disk
-	// where toolyard maintains a TOOLYARD_CH_PASSWORD=... line for the
-	// toolyard-clickhouse docker-compose `env_file:` to consume.
-	// Updated on initial password bootstrap and on every rotation; the
-	// operator follows up with `docker compose restart clickhouse` so
-	// the container re-reads the env on next process start.
-	ClickhouseRuntimeEnvPath string
-	Mempalace                *mempalace.Service
+	Hooks     *hooks.Service
+	Mempalace *mempalace.Service
 	// Notes, when set, enables /v1/notes/* — markdown workspace +
 	// background MemPalace sync. The Service itself nil-checks so an
 	// unwired install just returns 503 from the routes.
@@ -251,50 +246,52 @@ type Options struct {
 	// session tokens POST /v1/connect/t3 swaps for the person's agent
 	// token. Empty, or Clerk off, leaves the endpoint off (404).
 	ConnectAZP []string
+	// Probes answers the liveness and readiness probes. nil uses a
+	// prober over ops.Default with no database, which is never ready.
+	Probes *ops.Prober
 }
 
 func New(ctx context.Context, opts Options) *Server {
 	s := &Server{
 		buildVersion: opts.BuildVersion, environment: opts.Environment,
-		identity:                 opts.Identity,
-		approval:                 opts.Approval,
-		audit:                    opts.Audit,
-		memory:                   opts.Memory,
-		push:                     opts.Push,
-		hub:                      opts.Hub,
-		gateway:                  opts.Gateway,
-		upstreams:                opts.Upstreams,
-		settings:                 opts.Settings,
-		usage:                    opts.Usage,
-		metrics:                  opts.Metrics,
-		pricing:                  opts.Pricing,
-		metricsRecorder:          opts.MetricsRecorder,
-		autoApproval:             opts.AutoApproval,
-		policy:                   opts.Policy,
-		oauth:                    opts.OAuth,
-		hooks:                    opts.Hooks,
-		clickhouseRuntimeEnvPath: opts.ClickhouseRuntimeEnvPath,
-		mempalace:                opts.Mempalace,
-		notes:                    opts.Notes,
-		skills:                   opts.Skills,
-		voice:                    opts.Voice,
-		secrets:                  opts.Secrets,
-		chatTelegram:             opts.ChatTelegram,
-		events:                   opts.Events,
-		memWebhooks:              opts.MemWebhooks,
-		inbox:                    opts.Inbox,
-		snapshots:                opts.Snapshots,
-		passkeys:                 opts.Passkeys,
-		identityKeys:             opts.IdentityKeys,
-		guide:                    opts.Guide,
-		webhookMaxBytes:          opts.WebhookMaxBytes,
-		sessionKey:               opts.SessionKey,
-		security:                 opts.Security,
-		loginLimit:               newLoginThrottle(5, 15*time.Minute),
-		unauthLimit:              newLoginThrottle(0, time.Hour), // max/window passed per-call via AllowN
-		access:                   opts.Access,
-		ownerEmail:               strings.TrimSpace(opts.OwnerEmail),
-		clerkOwnerOnly:           opts.ClerkOwnerOnly,
+		identity:        opts.Identity,
+		approval:        opts.Approval,
+		audit:           opts.Audit,
+		memory:          opts.Memory,
+		push:            opts.Push,
+		hub:             opts.Hub,
+		gateway:         opts.Gateway,
+		upstreams:       opts.Upstreams,
+		settings:        opts.Settings,
+		usage:           opts.Usage,
+		metrics:         opts.Metrics,
+		pricing:         opts.Pricing,
+		metricsRecorder: opts.MetricsRecorder,
+		autoApproval:    opts.AutoApproval,
+		policy:          opts.Policy,
+		oauth:           opts.OAuth,
+		hooks:           opts.Hooks,
+		mempalace:       opts.Mempalace,
+		notes:           opts.Notes,
+		skills:          opts.Skills,
+		voice:           opts.Voice,
+		secrets:         opts.Secrets,
+		chatTelegram:    opts.ChatTelegram,
+		events:          opts.Events,
+		memWebhooks:     opts.MemWebhooks,
+		inbox:           opts.Inbox,
+		snapshots:       opts.Snapshots,
+		passkeys:        opts.Passkeys,
+		identityKeys:    opts.IdentityKeys,
+		guide:           opts.Guide,
+		webhookMaxBytes: opts.WebhookMaxBytes,
+		sessionKey:      opts.SessionKey,
+		security:        opts.Security,
+		loginLimit:      newLoginThrottle(5, 15*time.Minute),
+		unauthLimit:     newLoginThrottle(0, time.Hour), // max/window passed per-call via AllowN
+		access:          opts.Access,
+		ownerEmail:      strings.TrimSpace(opts.OwnerEmail),
+		clerkOwnerOnly:  opts.ClerkOwnerOnly,
 	}
 	if s.webhookMaxBytes <= 0 {
 		s.webhookMaxBytes = DefaultWebhookMaxBytes
@@ -307,6 +304,10 @@ func New(ctx context.Context, opts Options) *Server {
 		s.clerkFrontendAPI = opts.Clerk.FrontendAPI()
 	}
 	s.connect = newConnectT3(opts.Clerk, opts.ConnectAZP)
+	s.probes = opts.Probes
+	if s.probes == nil {
+		s.probes = ops.NewProber(ops.Default, nil)
+	}
 	s.federation, s.callbacks = opts.Federation, opts.Callbacks
 	if s.federation != nil {
 		s.federation.Membership = func(ctx context.Context, subject string) (federation.Profile, error) {
@@ -349,6 +350,13 @@ func (s *Server) SecurityOpts() SecurityOptions { return s.security }
 func (s *Server) Routes(mux *http.ServeMux) {
 	s.federationRoutes(mux)
 	mux.HandleFunc("/v1/health", s.health)
+	// Liveness and readiness: /v1/livez, /v1/readyz and the aliases
+	// /livez, /readyz and /healthz. GET and HEAD, no session; the role
+	// guard and HardenAPI let them through (ops.IsProbePath).
+	if s.probes == nil {
+		s.probes = ops.NewProber(ops.Default, nil)
+	}
+	s.probes.Register(mux)
 	mux.HandleFunc("/v1/auth/setup", s.authSetup)
 	mux.HandleFunc("/v1/auth/login", s.authLogin)
 	mux.HandleFunc("/v1/auth/logout", s.authLogout)
@@ -415,7 +423,6 @@ func (s *Server) Routes(mux *http.ServeMux) {
 	mux.HandleFunc("/v1/marketplace", s.marketplaceList)
 	mux.HandleFunc("/v1/settings", s.settingsHandler)
 	mux.HandleFunc("/v1/settings/reveal", s.settingsReveal)
-	mux.HandleFunc("/v1/settings/rotate", s.settingsRotate)
 	mux.HandleFunc("/v1/usage", s.usageHandler)
 
 	mux.HandleFunc("/v1/policies", s.policiesCollection)
@@ -1843,7 +1850,7 @@ func (s *Server) settingsHandler(w http.ResponseWriter, r *http.Request) {
 // the explicit one-shot path for the rotation/copy flow, and every call
 // is audit-logged.
 //
-// POST /v1/settings/reveal {"key":"clickhouse_password"} -> {"value":"..."}
+// POST /v1/settings/reveal {"key":"telegram_bot_token"} -> {"value":"..."}
 func (s *Server) settingsReveal(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeError(w, http.StatusMethodNotAllowed, "POST only")
@@ -1878,67 +1885,6 @@ func (s *Server) settingsReveal(w http.ResponseWriter, r *http.Request) {
 		ResultSummary: body.Key,
 	})
 	writeJSON(w, http.StatusOK, map[string]string{"key": body.Key, "value": val})
-}
-
-// settingsRotate generates a fresh value for a known rotatable secret
-// key and returns it once for the operator to copy. Side effect: any
-// downstream files (the ClickHouse runtime env that the docker-compose
-// stack reads) get re-rendered so the new value reaches its consumers
-// without manual file edits.
-//
-// POST /v1/settings/rotate {"key":"clickhouse_password"} -> {"value":"..."}
-func (s *Server) settingsRotate(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		writeError(w, http.StatusMethodNotAllowed, "POST only")
-		return
-	}
-	uid, err := s.requireUser(r)
-	if err != nil {
-		writeError(w, http.StatusUnauthorized, "unauthorized")
-		return
-	}
-	if s.settings == nil {
-		writeError(w, http.StatusServiceUnavailable, "settings not wired")
-		return
-	}
-	var body struct{ Key string }
-	if err := decode(r, &body); err != nil {
-		writeError(w, http.StatusBadRequest, err.Error())
-		return
-	}
-	switch body.Key {
-	case settings.ClickhousePassword:
-		pw, err := s.settings.RotateClickhousePassword(r.Context())
-		if err != nil {
-			writeError(w, http.StatusInternalServerError, err.Error())
-			return
-		}
-		envWriteWarning := ""
-		if err := WriteClickhouseRuntimeEnv(s.clickhouseRuntimeEnvPath, pw); err != nil {
-			envWriteWarning = "password rotated but clickhouse runtime env file write failed: " + err.Error()
-		}
-		summary := body.Key
-		if envWriteWarning != "" {
-			summary += " (env write warned)"
-		}
-		_ = s.audit.Write(r.Context(), audit.Event{
-			EventType: "settings.rotate", AgentID: "user:" + uid,
-			ResultSummary: summary,
-		})
-		out := map[string]any{
-			"key":   body.Key,
-			"value": pw,
-			// CH only re-reads the env at process start, so a rotation
-			// is incomplete until the container restarts. Tell the UI.
-			"requires": "docker compose -f deploy/clickhouse/docker-compose.yaml restart clickhouse",
-		}
-		if envWriteWarning != "" {
-			out["warning"] = envWriteWarning
-		}
-		writeJSON(w, http.StatusOK, out)
-	default:
-		writeError(w, http.StatusBadRequest, "key is not rotatable")
-	}
 }
 
 // ---- usage ----------------------------------------------------------------

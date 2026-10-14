@@ -481,8 +481,9 @@ func TestAccessRawMCPCallMatchesUnknownTool(t *testing.T) {
 
 func TestAddUpstreamReservesAccessGroupNames(t *testing.T) {
 	f := newAccessFixture(t, nil)
-	// The synthetic upstreams, the always-on meta-tool group, and the data
-	// groups whose tools live under the "builtin" upstream.
+	// The synthetic upstreams, the always-on meta-tool group, the data
+	// groups whose tools live under the "builtin" upstream, and lake, the
+	// retired data group.
 	for _, name := range []string{"builtin", "fixture", "inbox", "session", "connections", "tools", "memory", "lake", "events"} {
 		err := f.gw.AddUpstream(context.Background(), UpstreamConfig{Name: name})
 		if err == nil || !strings.Contains(err.Error(), "reserved") {

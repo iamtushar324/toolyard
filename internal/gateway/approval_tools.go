@@ -413,8 +413,10 @@ func (g *Gateway) handleWaitForApproval() directHandler {
 		}
 		// Subscribe to the bus's per-approval signal channel. If the
 		// approval row is in a different process / restart, Watch returns
-		// false; we still poll briefly as fallback below.
+		// false; we still poll briefly as fallback below. A drain
+		// (ReleaseWaiters) ends the wait with the retryable answer.
 		ch, hasWatcher := g.approval.Watch(id)
+		released := g.drainReleaseCh()
 		timer := time.NewTimer(time.Duration(timeoutSec) * time.Second)
 		defer timer.Stop()
 		if hasWatcher {
@@ -422,6 +424,8 @@ func (g *Gateway) handleWaitForApproval() directHandler {
 			case <-ch:
 			case <-timer.C:
 			case <-ctx.Done():
+			case <-released:
+				return waitRestartingResult("tools.wait_for_approval"), nil
 			}
 		} else {
 			// Fallback poll loop — coarse so we don't hammer SQLite.
@@ -433,6 +437,8 @@ func (g *Gateway) handleWaitForApproval() directHandler {
 					goto done
 				case <-ctx.Done():
 					goto done
+				case <-released:
+					return waitRestartingResult("tools.wait_for_approval"), nil
 				case <-pollTimer.C:
 					req, err = g.approval.Get(ctx, id)
 					if err == nil && req.Status != approval.StatusPending {
@@ -491,10 +497,12 @@ func (g *Gateway) handleWaitForApprovals() directHandler {
 			ids = append(ids, id)
 		}
 		deadline := time.Now().Add(time.Duration(timeoutSec) * time.Second)
+		released := g.drainReleaseCh()
 
 		// Each loop iteration: snapshot every id, evaluate condition,
 		// return if met or timed out, otherwise reflect.Select on every
-		// in-memory watcher channel + a polling tick + timeout + ctx.
+		// in-memory watcher channel + a polling tick + timeout + ctx +
+		// the drain release.
 		for {
 			snapshots := make([]map[string]any, 0, len(ids))
 			anyTerm, allTerm := false, true
@@ -554,12 +562,25 @@ func (g *Gateway) handleWaitForApprovals() directHandler {
 				reflect.SelectCase{Dir: reflect.SelectRecv, Chan: reflect.ValueOf(time.After(pollCap))},
 				reflect.SelectCase{Dir: reflect.SelectRecv, Chan: reflect.ValueOf(time.After(remaining))},
 				reflect.SelectCase{Dir: reflect.SelectRecv, Chan: reflect.ValueOf(ctx.Done())},
+				reflect.SelectCase{Dir: reflect.SelectRecv, Chan: reflect.ValueOf(released)},
 			)
 			_, _, _ = reflect.Select(cases)
+			select {
+			case <-released:
+				return waitRestartingResult("tools.wait_for_approvals"), nil
+			default:
+			}
 			// Loop back and re-snapshot. The deadline check at the top
 			// handles the "timer fired" path uniformly.
 		}
 	}
+}
+
+// waitRestartingResult ends a wait loop early at shutdown. The approvals
+// are unchanged; calling the same wait again reaches the next process.
+func waitRestartingResult(tool string) *mcp.CallToolResult {
+	return restartingResult(tool, "the wait ended early because this server is stopping. "+
+		"Nothing changed; call "+tool+" again in a few seconds.")
 }
 
 // isTerminal reports whether the request is in a state that won't

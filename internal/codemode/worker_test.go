@@ -11,6 +11,8 @@ import (
 	"time"
 
 	"github.com/mark3labs/mcp-go/mcp"
+
+	"github.com/tusharbhardwaj/toolyard/internal/goroutines"
 )
 
 // The worker tests spawn this test binary as the worker: TestMain, seeing
@@ -141,6 +143,72 @@ func TestWorkerTimeoutKillsProcess(t *testing.T) {
 	if !processGone(int(rt.lastPID.Load())) {
 		t.Fatalf("spinning worker %d survived", rt.lastPID.Load())
 	}
+}
+
+// A service manager that signals every process of the unit (systemd's
+// default KillMode) must not cut a running script: the gateway drains on
+// SIGTERM and owns its workers' lifetime.
+func TestWorkerIgnoresStopSignals(t *testing.T) {
+	slow := newFake()
+	entered := make(chan struct{}, 1)
+	release := make(chan struct{})
+	slow.handlers["BkCoreServices.get-all-clients"] = func(map[string]any) (*mcp.CallToolResult, error) {
+		entered <- struct{}{}
+		<-release
+		return jsonResult([]any{})
+	}
+	rt := workerRuntime(slow, Limits{}, nil)
+	done := make(chan struct{})
+	var text string
+	var failed bool
+	go func() {
+		defer close(done)
+		text, failed = rt.ExecuteToolCode(context.Background(), "result = BkCoreServices.get_all_clients()", "")
+	}()
+	select {
+	case <-entered:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the script never reached its nested call")
+	}
+	pid := int(rt.lastPID.Load())
+	if pid <= 0 {
+		t.Fatal("no worker pid recorded")
+	}
+	for _, sig := range []syscall.Signal{syscall.SIGTERM, syscall.SIGINT, syscall.SIGHUP} {
+		if err := syscall.Kill(pid, sig); err != nil {
+			t.Fatalf("send %v: %v", sig, err)
+		}
+	}
+	time.Sleep(200 * time.Millisecond)
+	if processGone(pid) {
+		t.Fatal("the worker died from a stop signal")
+	}
+	close(release)
+	<-done
+	if failed || !strings.Contains(text, "Execution completed successfully") {
+		t.Fatalf("a stop signal cut the script (failed=%v):\n%s", failed, text)
+	}
+}
+
+func TestNestedCallPanicFailsOnlyTheScript(t *testing.T) {
+	f := newFake()
+	f.handlers["BkCoreServices.get-all-clients"] = func(map[string]any) (*mcp.CallToolResult, error) {
+		panic("tool exploded")
+	}
+	bothWays(t, f, Limits{}, func(t *testing.T, rt *Runtime) {
+		before := goroutines.Panics()
+		text, failed := rt.ExecuteToolCode(context.Background(), "result = BkCoreServices.get_all_clients()", "")
+		if !failed || !strings.Contains(text, "internal error during the call") || !strings.Contains(text, "outcome is unknown") {
+			t.Fatalf("a panicking tool did not fail the script cleanly (failed=%v):\n%s", failed, text)
+		}
+		if goroutines.Panics() <= before {
+			t.Fatal("the panic was not reported")
+		}
+		text, failed = rt.ExecuteToolCode(context.Background(), `result = BkCoreServices.get_client(clientId="vai-us")`, "")
+		if failed || !strings.Contains(text, "Execution completed successfully") {
+			t.Fatalf("the runtime did not serve the next script (failed=%v):\n%s", failed, text)
+		}
+	})
 }
 
 func TestWorkerConcurrencyIsCapped(t *testing.T) {

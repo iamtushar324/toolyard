@@ -40,6 +40,10 @@ ExecStart=/usr/local/bin/toolyard serve \
 # Restart on crash, with a small backoff so a tight crashloop doesn't burn CPU.
 Restart=on-failure
 RestartSec=5
+# Exit code 78 (EX_CONFIG) is a missing, unreadable or wrong master key or
+# credential file: a restart cannot fix it, so don't retry. Check before an
+# upgrade with: toolyard keys-check -data /var/lib/toolyard
+RestartPreventExitStatus=78
 StartLimitIntervalSec=60
 StartLimitBurst=10
 
@@ -86,9 +90,16 @@ TasksMax=512
 MemoryMax=1536M
 MemoryHigh=1280M
 
-# Graceful shutdown: SIGINT triggers context cancel + 5s drain in main.go.
+# Graceful shutdown: SIGINT starts the ordered drain (cmd/gateway/lifecycle.go):
+# readiness 503, new tool calls refused (retryable), -drain-delay (3s),
+# streams closed, HTTP and in-flight executions finish by -drain-timeout
+# (60s from the start), then bounded closes (~10s). Keep this above
+# -drain-timeout + 10s.
 KillSignal=SIGINT
-TimeoutStopSec=10s
+TimeoutStopSec=75s
+# SIGTERM to the gateway only, so it can drain; code-mode workers and
+# anything else left in the unit get SIGKILL at the stop timeout.
+KillMode=mixed
 
 [Install]
 WantedBy=multi-user.target

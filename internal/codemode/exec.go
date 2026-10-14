@@ -12,6 +12,8 @@ import (
 	"unicode/utf8"
 
 	"github.com/mark3labs/mcp-go/mcp"
+
+	"github.com/tusharbhardwaj/toolyard/internal/goroutines"
 )
 
 // heldMarkers are the result metadata keys the gateway sets when a call
@@ -20,6 +22,10 @@ import (
 // result aborts the script like any tool error, carrying the gateway's
 // text (approval id, next steps) into the error output.
 var heldMarkers = []string{"toolyard.deferred", "toolyard.executing", "toolyard.permission_required"}
+
+// nestedCallLoop names a panic recovered in a nested call (the metric
+// label and crash dump name).
+const nestedCallLoop = "codemode-nested-call"
 
 // ExecuteToolCode runs a script for the ctx caller. reason is the outer
 // call's _reason, or "" when the client sent none (Bifrost clients never
@@ -71,8 +77,16 @@ type session struct {
 
 // handleCall performs one nested call for the script. Every failure is
 // returned as the message that aborts the script, naming the tool and
-// carrying the gateway's text.
-func (s *session) handleCall(serverIdent, member string, args map[string]any) parentMsg {
+// carrying the gateway's text. A panic in the call is one of those
+// failures: in a worker run the call has its own goroutine, where an
+// unrecovered panic would end the whole gateway.
+func (s *session) handleCall(serverIdent, member string, args map[string]any) (reply parentMsg) {
+	defer func() {
+		if r := recover(); r != nil {
+			goroutines.Report(nestedCallLoop, r)
+			reply = parentMsg{Error: fmt.Sprintf("tool call failed for %s.%s: the gateway hit an internal error during the call; its outcome is unknown, so check before you repeat a write", serverIdent, member)}
+		}
+	}()
 	fail := func(msg string) parentMsg { return parentMsg{Error: msg} }
 	srv := s.cat.byIdent(serverIdent)
 	if srv == nil {

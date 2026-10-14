@@ -354,7 +354,7 @@ stays as the break-glass login.
 
 Everyone else who signs in becomes a **member**: they see their own profile,
 manage their own agents, and their agents reach only the servers and data
-groups (memory, lake, events, notes, skills) an admin grants them on the
+groups (memory, events, notes, skills) an admin grants them on the
 **Users** page. Every approval and inbox decision stays with admins.
 
 Once an hour (`-clerk-sync-interval`) toolyard lists the organisation's
@@ -493,3 +493,245 @@ as it is for keys an admin issues: an admin opens the person on the
 **Users** page and presses **Retry registration**
 (`POST /v1/users/{id}/identity-key/register`, which runs as that admin),
 or registers the fingerprint by hand.
+
+## Keys and credentials
+
+toolyard seals stored credentials with AES-256-GCM under master keys,
+one file per subsystem, and signs dashboard session cookies with a
+session key:
+
+| File | Protects |
+| --- | --- |
+| `identity.key` | per-person identity keys |
+| `oauth.key` | upstream OAuth client secrets and tokens |
+| `secrets.key` | the secrets broker, callback and connection credentials, the Telegram bot token |
+| `session.key` | dashboard session cookies (signing only; nothing stored) |
+
+Each file holds the base64 encoding of 32 random bytes. Surrounding
+whitespace (such as the trailing newline of a Docker secret) is ignored,
+and padded base64 is accepted, so `openssl rand -base64 32 > oauth.key`
+makes a valid key.
+
+### Where toolyard looks for keys
+
+For each key, in this order; the first copy found is used:
+
+1. `$CREDENTIALS_DIRECTORY/<name>`: systemd `LoadCredential=`.
+2. `-credentials-dir` (default `$TOOLYARD_CREDENTIALS_DIR`; the Docker
+   image sets `/run/secrets`, where Docker and Compose mount secrets).
+3. The data directory (`-data`), where earlier versions created them.
+
+A copy that exists but cannot be read or decoded stops the start, with an
+error that names the key and the path. toolyard never replaces a key file
+and never falls back to a copy further down the list. When a lower copy
+differs from the one used, a warning says so.
+
+The same two credentials directories may hold a `toolyard.env` file
+(`KEY=value` lines). It is loaded at start; a variable already set in the
+environment wins over it, and the first directory wins over the second.
+The Clerk variables also accept a file: set
+`TOOLYARD_CLERK_SECRET_KEY_FILE=/run/secrets/clerk_secret_key` instead of
+`TOOLYARD_CLERK_SECRET_KEY` (setting both is an error).
+
+### `-keys` modes
+
+- `-keys=create-if-fresh` (the default): a missing key is created in the
+  data directory, with `O_EXCL` and an fsync of the file and the directory,
+  but only when the database is new: it has no key canaries and no sealed
+  rows. On a database in use, a missing key stops the start. The one
+  exception is `session.key`: a missing session key is recreated with a
+  warning, and everyone signs in again.
+- `-keys=require`: no key is ever created. Use it for clusters and for
+  any deployment whose keys come from a secret store.
+
+### Key canaries
+
+The `key_canaries` table holds, for each key, a fixed value sealed with
+that key and a short key id (a non-secret fingerprint). At every start,
+each key must open its canary. A wrong key file stops the start with
+`key <name> does not match this database`, naming the key id of the file
+and the key id the database expects, before anything is written. A key
+that has no canary gets one; that is how the first start with this version
+adopts the keys of an existing installation. Before it adopts a key,
+toolyard tries the key on values the database already holds sealed with
+it (the newest few of each kind, with the same binding the owning feature
+uses; one that opens is enough). A key that opens none of them stops the
+start with `key <name> ... does not open existing data`, so a wrong key
+file on disk at upgrade time is refused instead of being locked in. A key
+with no sealed values yet, and the session key, which seals nothing, are
+adopted as they are.
+
+Key errors, credential-file errors and a bad `-keys` value exit with code
+78 (`EX_CONFIG`). Restarting cannot fix them, so the systemd units in
+`deploy/` set `RestartPreventExitStatus=78`. Docker restart policies have
+no such exception: a container with a key problem restarts until you fix
+it, so read its logs.
+
+### Check keys before an upgrade
+
+Before you upgrade a server that already has data, or move its keys, run
+the read-only check with the same directories the server uses:
+
+```bash
+toolyard keys-check -data /var/lib/toolyard -credentials-dir /run/secrets
+```
+
+It opens `toolyard.db` read-only (no migrations, no writes), runs the same
+search, decode, canary and sealed-data checks as `serve`, and prints one
+line per key: where it was found and its key id, and whether its canary
+matches, is absent (the key is adopted on the next start, as on the first
+start after an upgrade from a version without canaries, once it opens the
+data sealed with it) or does not match, or whether the key `does not open
+existing data`. It never
+creates a key, writes a canary or changes any file, and it never prints
+key material. It exits 0 when every key would load on a real start, and
+78 when one would stop it. It checks `-keys=create-if-fresh` unless you
+pass `-keys require`. A missing session key is reported as `warn`: the
+start creates a new one and everyone signs in again.
+
+Run it with the directories the service really uses. A shell does not see
+a unit's `$CREDENTIALS_DIRECTORY`, so when the service gets its keys
+through systemd `LoadCredential=`, pass that directory with
+`-credentials-dir`, or `keys-check` falls back to the copies in `-data` and
+checks different files than the service loads. While the unit runs,
+systemd mounts its credentials at `/run/credentials/<unit>/`, readable by
+root:
+
+```bash
+sudo toolyard keys-check -data /var/lib/toolyard \
+  -credentials-dir /run/credentials/toolyard.service
+```
+
+Otherwise run it under the same credentials, for example with
+`systemd-run --pipe --wait -p LoadCredential=…` and the unit's lines.
+
+### Moving keys and recovering
+
+- To move keys into a secret store: copy the four files from the data
+  directory into the credentials directory (or `LoadCredential=` them),
+  run `toolyard keys-check -keys require` with both directories, start
+  with `-keys=require`, and once it starts cleanly remove the copies from
+  the data directory.
+- To move a server to a new host, copy `toolyard.db` together with all
+  four key files (`deploy/install.sh --import-from <dir>` does), then run
+  `toolyard keys-check` there before the first start.
+- `does not match this database`: the key file belongs to another database
+  (or `-data` points at another database). Find the file whose key id the
+  error names (each start logs the key ids it adopts or creates), or point
+  `-data` at the database the key belongs to.
+- `not found ... set up with it` or `already in use`: restore the key file
+  from the backup taken with this database. Back up the keys with the
+  database, but store them apart from it.
+- A key lost for good cannot be recovered, and neither can the values
+  sealed with it. Restore the database and the keys from one backup.
+
+## Health probes
+
+| Route | Answer |
+| --- | --- |
+| `GET`/`HEAD /v1/livez` | `200 {"status":"live"}`: the process serves requests. It reads nothing, the database included. |
+| `GET`/`HEAD /v1/readyz` | `200 {"status":"ready"}`, or `503 {"status":"not_ready","reason":"…"}` |
+
+The readiness reasons are `draining` (shutdown started), `keys` (master
+keys not yet verified), `starting` (startup recovery not finished) and
+`db` (no database ping has succeeded yet, or the last two pings in a row
+failed). The database has a single connection, so a ping waits behind a
+long query; each ping may take up to 3 s, and one slow or failed ping does
+not make the process unready. A probe answers from the latest ping results
+and starts at most one new ping per second, in the background, so polling
+cannot put load on the database and a probe does not wait on a busy one
+(only the first check after the start waits for its ping). The answer
+never carries more detail than the reason.
+
+`/livez`, `/readyz` and `/healthz` (liveness) are aliases. The probes need
+no session, have no rate limit and no CSRF check, and accept only `GET`
+and `HEAD`. `/v1/health` keeps its diagnostic body (goroutines, upstream
+pool, sandbox status); it is not a probe.
+
+`toolyard healthcheck -url <probe URL> -expect ready|live` fetches a probe
+with a 3 s timeout and exits 0 when its `status` matches, 1 otherwise. The
+Docker image's `HEALTHCHECK` uses it, because the image has no `curl` or
+`wget`:
+
+```bash
+toolyard healthcheck -url http://127.0.0.1:8787/v1/readyz -expect ready
+```
+
+For an orchestrator, point the liveness check at `/v1/livez` and the
+readiness check at `/v1/readyz`.
+
+## Ops listener and metrics
+
+`-ops-addr` starts a separate listener for monitoring; it is off by
+default. It serves `/metrics` (Prometheus text format 0.0.4) and the two
+probes; every other path is a 404. The main listener never serves
+`/metrics`.
+
+```bash
+./toolyard serve -ops-addr 127.0.0.1:9090
+# several addresses, one of them reachable by a scraper on the LAN:
+./toolyard serve -ops-addr 127.0.0.1:9090,10.0.0.5:9090
+```
+
+- Without `-ops-token-file`, every address must be loopback, private
+  (RFC 1918, `fc00::/7`), link-local or in `100.64.0.0/10`, or `localhost`.
+  Any other address, an empty host (`:9090`) and `0.0.0.0` are refused at
+  startup.
+- With `-ops-token-file <path>` (at least 16 characters, whitespace
+  trimmed), any address is allowed, and every request must send
+  `Authorization: Bearer <token>`, from every peer, loopback included: a
+  relay on the same host would otherwise let remote callers in. The token
+  is compared in constant time. Probes on the ops listener then need the
+  header too; container and orchestrator checks can use the main
+  listener's `/v1/livez` and `/v1/readyz`, which need no token.
+
+| Metric | Type | Meaning |
+| --- | --- | --- |
+| `toolyard_build_info{version}` | gauge | always 1 |
+| `toolyard_process_start_time_seconds` | gauge | process start, Unix seconds |
+| `toolyard_started` | gauge | 1 once startup recovery and upstream loading are done |
+| `toolyard_keys_verified` | gauge | 1 once every key matched its canary |
+| `toolyard_draining` | gauge | 1 during shutdown |
+| `toolyard_db_up` | gauge | 1 when the database answered a ping within 1 s at scrape time |
+| `toolyard_db_ping_seconds` | gauge | duration of that ping |
+| `toolyard_goroutines` | gauge | goroutines that exist now |
+| `toolyard_tool_calls_total{outcome}` | counter | `ok`, `error`, `denied`, `approval`, `refused_draining` |
+| `toolyard_inflight_executions` | gauge | tool executions running now |
+| `toolyard_audit_write_failures_total{stage}` | counter | audit records not written: `intent`, `outcome`, `approval` |
+| `toolyard_executions_outcome_unknown_total{path,cause}` | counter | executions that may have run but have no recorded result (`path` is `inbox` or `legacy`) |
+| `toolyard_goroutine_panics_total{loop}` | counter | panics recovered in background loops and goroutines; `loop="codemode-nested-call"` counts a tool that panicked during a code-mode script |
+| `toolyard_loop_last_success_timestamp_seconds{loop}` | gauge | last successful pass of each background loop |
+| `toolyard_legacy_sync_last_success_timestamp_seconds` | gauge | last successful legacy approval sync into the Inbox (0 = never) |
+| `toolyard_legacy_sync_failures_total` | counter | failed legacy approval syncs |
+| `toolyard_log_records_total{level}` | counter | log records by level |
+| `toolyard_http_panics_total` | counter | panics recovered by the HTTP recovery middleware (every route of the main listener) and by the MCP tool-handler recovery |
+
+Labels never name an agent, a user, a tool or an argument. Each metric
+keeps at most 64 label sets; later new values are counted under `other`.
+
+## Shutdown and drain
+
+On SIGTERM (or SIGINT) toolyard drains before it exits:
+
+1. Readiness turns `503` (`draining`), new tool calls get a retryable
+   refusal, and a new MCP stream `GET` gets `503`, so a load balancer stops
+   sending work.
+2. After `-drain-delay` (default `3s`), open MCP `GET` streams and
+   dashboard event streams close, a new dashboard stream gets `503`, so
+   clients reconnect to another instance, and the HTTP server stops
+   accepting new requests.
+3. Open HTTP requests and in-flight executions have until `-drain-timeout`
+   (default `60s`, counted from the start of the drain) to finish. Work
+   still running then is cancelled and recorded as outcome unknown.
+4. The remaining services and the database close, each within a bound
+   (about 10 s in total).
+
+Give the process time to finish: set the container's `stop_grace_period`
+(Compose) or `terminationGracePeriodSeconds` (Kubernetes), or the systemd
+unit's `TimeoutStopSec`, to at least `75s`.
+
+Under systemd also set `KillMode=mixed` (the shipped units do). The default
+`KillMode=control-group` sends SIGTERM to every process of the unit at once,
+code-mode script workers included; `mixed` sends it to the gateway only,
+which drains and then ends its workers itself. Workers ignore SIGTERM, so a
+stop signal sent to the whole unit cannot cut a running script either.

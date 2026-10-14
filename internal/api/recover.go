@@ -6,6 +6,7 @@ import (
 
 	"github.com/tusharbhardwaj/toolyard/internal/crashdump"
 	"github.com/tusharbhardwaj/toolyard/internal/logx"
+	"github.com/tusharbhardwaj/toolyard/internal/opsmetrics"
 )
 
 // Recover wraps an http.Handler so a panic in any handler returns a 500
@@ -25,6 +26,7 @@ func Recover(next http.Handler) http.Handler {
 			if rec == http.ErrAbortHandler {
 				return
 			}
+			opsmetrics.IncHTTPPanic()
 			path := crashdump.Record("http.handler", rec, map[string]string{
 				"method": r.Method,
 				"path":   r.URL.Path,

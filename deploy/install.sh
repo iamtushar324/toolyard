@@ -45,7 +45,8 @@
 #   NOTES_DIR=/path          Override the notes directory (default
 #                            $DATA_DIR/notes — lives inside the data root
 #                            so existing backups capture it).
-#   --import-from <dir>      copy existing toolyard.db + session.key from <dir>.
+#   --import-from <dir>      copy existing toolyard.db and its four key files
+#                            (identity, oauth, secrets, session) from <dir>.
 #   --mempalace <mode>       same as MEMPALACE env var.
 #   --notes <mode>           same as NOTES env var.
 #
@@ -58,26 +59,9 @@ SERVICE_PATH="/etc/systemd/system/toolyard.service"
 DATA_DIR="/var/lib/toolyard"
 USER_NAME="toolyard"
 LISTEN_ADDR="0.0.0.0:18787"
-# ClickHouse stack — analytical SQL server, runs in docker. Compose file
-# lives in the repo; data + password env file persist under DATA_DIR so
-# the same backup of /var/lib/toolyard/ captures everything.
-CH_COMPOSE="$(pwd)/deploy/clickhouse/docker-compose.yaml"
-GF_COMPOSE="$(pwd)/deploy/grafana/docker-compose.yaml"
-CH_DATA_DIR="$DATA_DIR/clickhouse"
-CH_ENV_FILE="$DATA_DIR/clickhouse-runtime.env"
-# uid:gid the clickhouse-server image runs as internally. Bind mounts
-# need to be owned by this so CH can write to them.
-CH_UID=101
-CH_GID=101
-# Shared docker network for the lake stack. ClickHouse and Grafana both
-# attach to it so Grafana can resolve `clickhouse:9000` without exposing
-# the native protocol on the host. Declared external in both compose
-# files; created here so neither compose owns its lifecycle.
-LAKE_NETWORK="toolyard_lake_net"
 # Operator-managed env file. systemd reads it on every (re)start, so secrets
-# like TOOLYARD_LAKE_TOKEN can change without re-rendering the unit. The
-# install script seeds a commented stub on first install and never touches
-# it again.
+# can change without re-rendering the unit. The install script seeds a
+# commented stub on first install and never touches it again.
 ENV_DIR="/etc/toolyard"
 ENV_FILE="$ENV_DIR/toolyard.env"
 
@@ -109,8 +93,8 @@ NOTES_DIR="${NOTES_DIR:-$NOTES_DIR_DEFAULT}"
 IMPORT_FROM=""
 # --client-only short-circuits the install: build ONLY the CLI binary
 # (cmd/toolyard) and drop it at $CLI_BINARY_PATH; skip user creation,
-# data dir, systemd, ClickHouse, Grafana, etc. Use this on a remote
-# server that talks to a gateway elsewhere.
+# data dir, systemd, etc. Use this on a remote server that talks to a
+# gateway elsewhere.
 CLIENT_ONLY=false
 CLI_BINARY_PATH="/usr/local/bin/toolyard"
 # Idle timeout for stdio subprocesses. When non-empty, passed as
@@ -174,7 +158,7 @@ atomic_install() {
 
 # Client-only short-circuit: build the CLI binary, install it, done.
 # Useful on a remote server that only consumes a remote toolyard gateway
-# via HTTPS. No data dir, no systemd, no docker, no users.
+# via HTTPS. No data dir, no systemd, no users.
 if [[ "$CLIENT_ONLY" == "true" ]]; then
   if [[ ! -f cmd/toolyard/main.go ]]; then
     echo "cmd/toolyard not present; checkout is too old for --client-only" >&2
@@ -257,17 +241,9 @@ if [[ ! -f "$ENV_FILE" ]]; then
 # toolyard runtime environment. Read by systemd via EnvironmentFile=.
 # Edit and `sudo systemctl restart toolyard` to apply.
 #
-# Toolyard's own runtime config (lake API token, Grafana origin) lives
-# in the settings DB and is managed from the dashboard's Settings tab —
-# no env vars needed here for the gateway itself. The lake token is
-# auto-generated on first boot; reveal/rotate from the UI.
-#
-# This file is also the env_file for the deploy/grafana docker-compose
-# stack, so any GF_*-prefixed variables below are consumed by the
-# Grafana container at boot. Only the admin credentials really benefit
-# from being here; structural config lives in compose.
-#GF_SECURITY_ADMIN_USER=admin
-#GF_SECURITY_ADMIN_PASSWORD=changeme
+# Toolyard's own runtime config lives in the settings DB and is managed
+# from the dashboard's Settings tab — no env vars needed here for the
+# gateway itself.
 EOF
   chown root:"$USER_NAME" "$ENV_FILE"
   chmod 0640 "$ENV_FILE"
@@ -384,9 +360,16 @@ if [[ -n "$IMPORT_FROM" ]]; then
   if [[ -f "$IMPORT_FROM/toolyard.db" ]]; then
     say "importing existing data from $IMPORT_FROM"
     cp -a "$IMPORT_FROM/toolyard.db" "$DATA_DIR/toolyard.db"
-    [[ -f "$IMPORT_FROM/session.key" ]]   && cp -a "$IMPORT_FROM/session.key"   "$DATA_DIR/session.key"
-    [[ -f "$IMPORT_FROM/lake.duckdb" ]]   && cp -a "$IMPORT_FROM/lake.duckdb"   "$DATA_DIR/lake.duckdb"
-    [[ -f "$IMPORT_FROM/oauth.key" ]]     && cp -a "$IMPORT_FROM/oauth.key"     "$DATA_DIR/oauth.key"
+    # Every master key the database was sealed with. toolyard refuses to
+    # start when a key its data needs is missing (it never creates one for
+    # a database in use), so copy all four.
+    for key in identity.key oauth.key secrets.key session.key; do
+      if [[ -f "$IMPORT_FROM/$key" ]]; then
+        cp -a "$IMPORT_FROM/$key" "$DATA_DIR/$key"
+      else
+        echo "warning: no $key at $IMPORT_FROM; toolyard keys-check will say whether the start needs it" >&2
+      fi
+    done
     chown -R "$USER_NAME":"$USER_NAME" "$DATA_DIR"
   else
     echo "warning: no toolyard.db at $IMPORT_FROM; skipping import" >&2
@@ -469,9 +452,8 @@ User=$USER_NAME
 Group=$USER_NAME
 ExecStart=$BINARY_PATH ${EXEC_FLAGS[*]}
 
-# Operator-managed runtime env (TOOLYARD_LAKE_TOKEN, TOOLYARD_GRAFANA_ORIGIN,
-# etc). The leading `-` means "ignore if the file doesn't exist" so a fresh
-# install boots even before the file is written.
+# Operator-managed runtime env. The leading `-` means "ignore if the file
+# doesn't exist" so a fresh install boots even before the file is written.
 EnvironmentFile=-$ENV_FILE
 
 # systemd's default PATH for services is just /usr/local/sbin:/usr/local/bin:
@@ -485,9 +467,11 @@ Environment=HOME=$DATA_DIR
 Environment=GOMEMLIMIT=200MiB
 Environment=GOGC=50
 
-# Restart on crash with backoff.
+# Restart on crash with backoff. Exit code 78 is a master key or credential
+# problem (missing, unreadable or wrong): a restart cannot fix it.
 Restart=on-failure
 RestartSec=5
+RestartPreventExitStatus=78
 StartLimitIntervalSec=60
 StartLimitBurst=10
 
@@ -522,9 +506,13 @@ TasksMax=1024
 MemoryMax=1536M
 MemoryHigh=1280M
 
-# Graceful stop: SIGINT triggers context cancel + 5s drain in main.go.
+# Graceful stop: SIGINT starts the ordered drain; in-flight work has up to
+# -drain-timeout (60s), then bounded closes (~10s). Keep this above both.
 KillSignal=SIGINT
-TimeoutStopSec=10s
+TimeoutStopSec=75s
+# SIGTERM to the gateway only, so it can drain; code-mode workers and
+# anything else left in the unit get SIGKILL at the stop timeout.
+KillMode=mixed
 
 [Install]
 WantedBy=multi-user.target
@@ -602,157 +590,6 @@ if [[ "$NOTES" != "off" ]]; then
   fi
 fi
 
-# ----- ClickHouse stack ------------------------------------------------
-#
-# Soft-required: if docker isn't installed we warn and skip rather than
-# fail the whole install. The gateway works fine without CH; this stack
-# is the analytical SQL surface we'll wire Grafana onto.
-ch_status="skipped"
-if ! command -v docker >/dev/null 2>&1; then
-  say "clickhouse: docker not found; skipping (install docker + re-run to enable)"
-elif ! docker compose version >/dev/null 2>&1; then
-  say "clickhouse: 'docker compose' plugin not found; skipping"
-elif [[ ! -f "$CH_COMPOSE" ]]; then
-  say "clickhouse: $CH_COMPOSE missing; skipping"
-else
-  # Ensure the shared network exists before either compose tries to
-  # attach to it. `docker network create` is not idempotent so we guard
-  # on inspect first; this also avoids spurious stderr noise on re-runs.
-  if ! docker network inspect "$LAKE_NETWORK" >/dev/null 2>&1; then
-    say "clickhouse: creating shared docker network $LAKE_NETWORK"
-    docker network create "$LAKE_NETWORK" >/dev/null
-  fi
-  say "clickhouse: ensuring data dirs at $CH_DATA_DIR (owned $CH_UID:$CH_GID)"
-  install -d -m 0750 "$CH_DATA_DIR"
-  install -d -m 0750 -o "$CH_UID" -g "$CH_GID" "$CH_DATA_DIR/data"
-  install -d -m 0750 -o "$CH_UID" -g "$CH_GID" "$CH_DATA_DIR/logs"
-
-  # The CH password lives in toolyard's settings DB and is rendered into
-  # $CH_ENV_FILE by the gateway during boot (see EnsureClickhousePassword
-  # + WriteClickhouseRuntimeEnv). Since systemd already restarted the
-  # gateway above and we waited for /v1/health, the file is guaranteed
-  # to exist by the time we get here — but we double-check before
-  # touching docker so a missing file fails loudly rather than mystery
-  # auth errors against CH.
-  if [[ ! -s "$CH_ENV_FILE" ]]; then
-    echo "    expected $CH_ENV_FILE to be rendered by the toolyard gateway, but it's missing or empty."
-    echo "    check 'sudo journalctl -u toolyard -n 50' for an EnsureClickhousePassword warning."
-    ch_status="env-missing"
-  else
-    say "clickhouse: bringing up the compose stack (force-recreate so CH re-reads the env)"
-    # --force-recreate: the env_file's *contents* aren't part of compose's
-    # config-hash, so a rotated password would otherwise be ignored until
-    # the operator manually restarted the container. Forcing the recreate
-    # makes install.sh idempotently leave CH in sync with whatever
-    # toolyard just wrote. Cost: ~3-4s of CH downtime per install.
-    if docker compose -f "$CH_COMPOSE" up -d --force-recreate >/dev/null; then
-      say "clickhouse: waiting for /ping"
-      # shellcheck disable=SC1090
-      source "$CH_ENV_FILE"
-      ch_ok="no"
-      for i in {1..40}; do
-        if curl -sf -u "default:$TOOLYARD_CH_PASSWORD" \
-             --data-binary 'SELECT 1' \
-             http://127.0.0.1:18123/ >/dev/null 2>&1; then
-          ch_ok="yes"
-          break
-        fi
-        sleep 0.5
-      done
-      if [[ "$ch_ok" == "yes" ]]; then
-        ver=$(curl -sf -u "default:$TOOLYARD_CH_PASSWORD" \
-                --data-binary 'SELECT version()' \
-                http://127.0.0.1:18123/ 2>/dev/null || echo unknown)
-        echo "    clickhouse healthy (version $ver)"
-        # Apply versioned mart views idempotently. CREATE OR REPLACE
-        # VIEW is metadata-only, so this is safe to re-run on every
-        # install. The toolyard gateway has already created the raw,
-        # mart, app databases at boot (via lake.Open), so the views
-        # have somewhere to live.
-        mart_views="$(pwd)/deploy/clickhouse/mart-views.sql"
-        if [[ -s "$mart_views" ]]; then
-          if curl -sf -u "default:$TOOLYARD_CH_PASSWORD" \
-               --data-binary "@$mart_views" \
-               'http://127.0.0.1:18123/?multi_statements=1' >/dev/null 2>&1; then
-            echo "    mart views applied from $mart_views"
-          else
-            echo "    warning: failed to apply mart views from $mart_views — apply manually if dashboards need them"
-          fi
-        fi
-        ch_status="up"
-      else
-        echo "    clickhouse did not respond on 127.0.0.1:18123 within 20s — check 'docker logs toolyard-clickhouse'"
-        ch_status="degraded"
-      fi
-    else
-      echo "    docker compose up failed — check 'docker compose -f $CH_COMPOSE logs'"
-      ch_status="failed"
-    fi
-  fi
-fi
-
-# Restart toolyard once more so the gateway opens the lake against the
-# now-running CH. On a fresh install (or when toolyard minted a new CH
-# password on this boot), the first systemctl restart above happened
-# *before* the CH compose recreate, so the gateway's lake.Open() saw
-# the old/missing password and disabled lake.* tools. Replaying the
-# restart after CH is healthy lets the gateway re-attempt with the
-# current password and register /v1/lake/* + lake.* MCP tools.
-#
-# Idempotent: when the password was already in sync (subsequent
-# re-installs), this is a no-op-shaped restart that costs ~2s. Worth it
-# to guarantee the lake is wired up by the time install.sh exits.
-if [[ "$ch_status" == "up" ]]; then
-  say "restarting toolyard so it re-opens the lake against the running CH"
-  systemctl restart toolyard
-  for i in {1..30}; do
-    if curl -sf http://127.0.0.1:18787/v1/health >/dev/null 2>&1; then
-      break
-    fi
-    sleep 0.5
-  done
-fi
-
-# ----- Grafana stack ---------------------------------------------------
-#
-# Visualisation layer. Reads the same /var/lib/toolyard/clickhouse-runtime.env
-# the CH stack does — when toolyard mints a new password on this boot, the
-# CH compose recreate above picks it up but Grafana's container would
-# still hold the OLD env in memory (docker compose env_file is loaded at
-# container creation, not on restart). `up -d --force-recreate` reloads
-# the env so the provisioned CH datasource lands with current creds.
-#
-# Soft-required: skipped with a warning if docker compose plugin or the
-# compose file is missing, same posture as the CH section.
-gf_status="skipped"
-if [[ "$ch_status" == "up" ]] && [[ -f "$GF_COMPOSE" ]]; then
-  if ! docker network inspect "$LAKE_NETWORK" >/dev/null 2>&1; then
-    docker network create "$LAKE_NETWORK" >/dev/null
-  fi
-  say "grafana: bringing up the compose stack (force-recreate so it re-reads CH password)"
-  if docker compose -f "$GF_COMPOSE" up -d --force-recreate >/dev/null; then
-    say "grafana: waiting for /api/health"
-    gf_ok="no"
-    for i in {1..60}; do
-      if curl -sf http://127.0.0.1:3030/api/health >/dev/null 2>&1; then
-        gf_ok="yes"
-        break
-      fi
-      sleep 1
-    done
-    if [[ "$gf_ok" == "yes" ]]; then
-      echo "    grafana healthy"
-      gf_status="up"
-    else
-      echo "    grafana did not respond on 127.0.0.1:3030 within 60s — check 'docker logs toolyard-grafana'"
-      gf_status="degraded"
-    fi
-  else
-    echo "    docker compose up failed — check 'docker compose -f $GF_COMPOSE logs'"
-    gf_status="failed"
-  fi
-fi
-
 # Detect first-run vs. existing setup.
 need_setup="no"
 if curl -sf http://127.0.0.1:18787/v1/auth/me 2>/dev/null | grep -q '"setup_required":true'; then
@@ -773,23 +610,6 @@ toolyard is up.
   data        : $DATA_DIR (toolyard.db, session.key, server keys)
   unit        : $SERVICE_PATH
   bind        : $LISTEN_ADDR
-
-  clickhouse  : $ch_status
-    compose   : $CH_COMPOSE
-    data      : $CH_DATA_DIR/data
-    logs      : $CH_DATA_DIR/logs (also: docker logs toolyard-clickhouse)
-    bind      : 127.0.0.1:18123 (HTTP), 127.0.0.1:19000 (native)
-    password  : managed by toolyard (settings key 'clickhouse_password')
-                rendered to $CH_ENV_FILE for the compose stack
-                reveal/rotate from the dashboard's Settings tab
-
-  grafana     : $gf_status
-    compose   : $GF_COMPOSE
-    logs      : docker logs toolyard-grafana
-    bind      : 127.0.0.1:3030 (UI)
-    datasource: provisioned at boot from
-                deploy/grafana/provisioning/datasources/datasources.yaml
-                reads TOOLYARD_CH_PASSWORD from $CH_ENV_FILE
 
   reminders:
     - RESTART your MCP agents (Claude Code, etc.) after this. Their MCP

@@ -10,12 +10,15 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 	"unicode/utf8"
 
 	"github.com/google/uuid"
 
 	"github.com/tusharbhardwaj/toolyard/internal/actor"
+	"github.com/tusharbhardwaj/toolyard/internal/logx"
+	"github.com/tusharbhardwaj/toolyard/internal/opsmetrics"
 	"github.com/tusharbhardwaj/toolyard/internal/store"
 )
 
@@ -28,6 +31,14 @@ const (
 	dryRunWindow       = 2 * time.Hour
 	judgeTimeout       = 25 * time.Second
 	MaxWait            = 5 * time.Minute
+	// LegacySyncInterval is how often RunLegacySync syncs without a signal.
+	LegacySyncInterval = 5 * time.Minute
+)
+
+// Supervised loop names (goroutines.Loop and the loop-last-success metric).
+const (
+	SweeperLoop    = "inbox-sweeper"
+	LegacySyncLoop = "legacy-sync"
 )
 
 // Errors returned to callers.
@@ -44,6 +55,10 @@ var (
 	ErrDryRunRateLimit = fmt.Errorf("dry-run limit reached (%d per hour)", DryRunsPerHour)
 	ErrSessionNotYours = errors.New("that session doesn't belong to you")
 	ErrRelatedNotYours = errors.New("request_id doesn't match one of your requests")
+	// ErrRestarting ends a Wait when the server begins to shut down.
+	// Nothing changed; the same call works again (the next process
+	// answers it).
+	ErrRestarting = errors.New("server restarting, call again")
 )
 
 // Fetcher copies a linked file into toolyard's own store.
@@ -121,6 +136,24 @@ type Service struct {
 	// uploadRecordHook, when set (tests), runs before an upload is
 	// recorded; an error simulates a failed store.
 	uploadRecordHook func() error
+
+	// releaseCh is closed by ReleaseWaiters at shutdown; Wait then
+	// returns ErrRestarting.
+	drainMu   sync.Mutex
+	releaseCh chan struct{}
+	released  bool
+	// legacySync carries RequestLegacySync signals to RunLegacySync
+	// (buffer 1: signals before the next pass coalesce). legacyPasses
+	// counts the loop's passes (tests).
+	legacySync   chan struct{}
+	legacyPasses atomic.Int64
+	// legacySig is the legacySignatureSQL value read before the last
+	// committed sync pass, and legacyClean whether that pass skipped no
+	// row. The periodic pass skips its transaction while the signature
+	// is unchanged.
+	legacyMu    sync.Mutex
+	legacySig   string
+	legacyClean bool
 }
 
 // New creates the service and loads (or creates) the grant signing key.
@@ -133,7 +166,7 @@ func New(ctx context.Context, opts Options) (*Service, error) {
 	if now == nil {
 		now = time.Now
 	}
-	service := &Service{db: opts.DB, opts: opts, signer: signer, now: now, watch: map[string]chan struct{}{}, uploadSlots: make(chan struct{}, MaxConcurrentUploads), agentUploads: map[string]int{}}
+	service := &Service{db: opts.DB, opts: opts, signer: signer, now: now, watch: map[string]chan struct{}{}, uploadSlots: make(chan struct{}, MaxConcurrentUploads), agentUploads: map[string]int{}, legacySync: make(chan struct{}, 1)}
 	if _, err := service.RecoverExecutions(ctx); err != nil {
 		return nil, fmt.Errorf("execution recovery: %w", err)
 	}
@@ -156,8 +189,32 @@ func (s *Service) Close(timeout time.Duration) {
 	select {
 	case <-done:
 	case <-time.After(timeout):
-		log.Printf("inbox: shutdown with background checks still running; they'll be redone at next start")
+		logx.For("inbox").Warn("inbox closed with background checks still running; they are redone at the next start")
 	}
+}
+
+// ReleaseWaiters ends every Wait, now and later, with ErrRestarting. The
+// ordered shutdown calls it so long waits do not hold the HTTP server
+// open. Safe to call more than once.
+func (s *Service) ReleaseWaiters() {
+	s.drainMu.Lock()
+	defer s.drainMu.Unlock()
+	if s.releaseCh == nil {
+		s.releaseCh = make(chan struct{})
+	}
+	if !s.released {
+		s.released = true
+		close(s.releaseCh)
+	}
+}
+
+func (s *Service) releaseChan() <-chan struct{} {
+	s.drainMu.Lock()
+	defer s.drainMu.Unlock()
+	if s.releaseCh == nil {
+		s.releaseCh = make(chan struct{})
+	}
+	return s.releaseCh
 }
 
 // RecheckUnchecked restarts the background check for pending requests
@@ -975,13 +1032,15 @@ func nextStep(r *Request, freshTokens bool) string {
 }
 
 // Wait blocks until any (mode "any") or all (mode "all") of the requests
-// leave pending, or the timeout passes. It then returns Status.
+// leave pending, or the timeout passes. It then returns Status. At
+// shutdown (ReleaseWaiters) it returns ErrRestarting instead.
 func (s *Service) Wait(ctx context.Context, agentID string, ids []string, mode string, timeout time.Duration) ([]AgentView, error) {
 	if timeout <= 0 || timeout > MaxWait {
 		timeout = MaxWait
 	}
 	deadline := time.NewTimer(timeout)
 	defer deadline.Stop()
+	released := s.releaseChan()
 	for {
 		done, total := 0, 0
 		var chans []chan struct{}
@@ -1023,6 +1082,9 @@ func (s *Service) Wait(ctx context.Context, agentID string, ids []string, mode s
 		case <-ctx.Done():
 			close(stop)
 			return nil, ctx.Err()
+		case <-released:
+			close(stop)
+			return nil, ErrRestarting
 		}
 	}
 }
@@ -1423,6 +1485,7 @@ func (s *Service) RunSweeper(ctx context.Context, every time.Duration) {
 			return
 		case <-t.C:
 			s.Sweep(ctx)
+			opsmetrics.SetLoopLastSuccess(SweeperLoop, time.Now())
 		}
 	}
 }

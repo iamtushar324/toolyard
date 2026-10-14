@@ -125,14 +125,14 @@ script (`toolyard.tools_wait_for_approval`, `…_wait_for_approvals`) ends
 with the script's clock (5 minutes by default) and answers with the normal
 timed-out snapshot.
 
-Which groups are in `toolyard`: `inbox`, `session`, `memory`, `lake`,
-`events`, `tools` (the approval pollers, `tools.search`, `tools.execute`),
+Which groups are in `toolyard`: `inbox`, `session`, `memory`, `events`,
+`tools` (the approval pollers, `tools.search`, `tools.execute`),
 `policies`, `servers`, `audit`, `access`, and the built-ins toolyard
 registers itself such as `notes.publish` and the `skills.*` tools
 (`toolyard.notes_publish`, `toolyard.skills_list`). The `notes` and `skills`
 MCP servers that startup also connects are upstreams like any other and keep
 their own keys (`notes.<tool>`, `skills.<tool>`); a member needs a grant for
-them, as for `memory`, `lake` and `events`.
+them, as for `memory` and `events`.
 
 **Migration note.** Before this namespace, code mode bound each internal
 group as its own server. A script that called `inbox.request(...)`,

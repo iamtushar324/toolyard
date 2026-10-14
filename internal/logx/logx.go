@@ -21,6 +21,8 @@ import (
 	"os"
 	"strings"
 	"sync"
+
+	"github.com/tusharbhardwaj/toolyard/internal/opsmetrics"
 )
 
 type Format string
@@ -47,6 +49,8 @@ func Init(format Format, level slog.Level) *slog.Logger {
 	default:
 		handler = slog.NewJSONHandler(out, opts)
 	}
+	// Every record that passes the level filter is counted by level.
+	handler = countingHandler{next: handler, count: opsmetrics.IncLogRecord}
 	lg := slog.New(handler)
 	slog.SetDefault(lg)
 	defaultLogger.Store(lg)
@@ -72,8 +76,14 @@ func For(component string) *slog.Logger {
 
 // Bridge routes stdlib `log` package output through slog so legacy
 // `log.Printf("...")` callers end up in the same stream during the
-// migration. Each stdlib log line becomes a single slog Info event with
-// component=legacy and the raw message in the "msg" field.
+// migration. Each stdlib log line becomes a single slog event with
+// component=legacy and the message in the "msg" field. Its level comes
+// from the line (bridgeLevel): a leading "ERROR:", "WARN:" or "INFO:" is
+// stripped and sets the level; otherwise an uppercase level word anywhere
+// in the line ("mcp-auth: WARN token check failed") sets it; otherwise a
+// line that names an error, failure or panic is ERROR, one that names a
+// warning or deprecation is WARN, and anything else is INFO. The
+// configured level applies as usual.
 //
 // Returns an io.Writer; callers wire it via log.SetOutput(bridgeWriter).
 // We do NOT clear stdlib log flags — leave that to the caller so they can
@@ -98,11 +108,158 @@ func (b *bridgeWriter) Write(p []byte) (int, error) {
 			break
 		}
 		line := strings.TrimRight(string(b.buf.Next(i+1)), "\n")
-		if line != "" {
-			b.lg.LogAttrs(context.Background(), slog.LevelInfo, line)
+		if line == "" {
+			continue
+		}
+		level, msg := bridgeLevel(line)
+		if msg != "" {
+			b.lg.LogAttrs(context.Background(), level, msg)
 		}
 	}
 	return len(p), nil
+}
+
+// bridgePrefixes are the explicit level prefixes a legacy line may start
+// with (case-insensitive). Longer prefixes come first.
+var bridgePrefixes = []struct {
+	prefix string
+	level  slog.Level
+}{
+	{"WARNING:", slog.LevelWarn},
+	{"ERROR:", slog.LevelError},
+	{"WARN:", slog.LevelWarn},
+	{"INFO:", slog.LevelInfo},
+}
+
+// bridgeLevelTokens are explicit uppercase level words a legacy line may
+// carry anywhere ("mcp-auth: WARN token check failed"). They match as whole
+// words and case-sensitively, and the leftmost one sets the level, ahead
+// of the keyword heuristics.
+var bridgeLevelTokens = []struct {
+	token string
+	level slog.Level
+}{
+	{"WARNING", slog.LevelWarn},
+	{"ERROR", slog.LevelError},
+	{"WARN", slog.LevelWarn},
+	{"INFO", slog.LevelInfo},
+}
+
+// Words that classify a legacy line without an explicit prefix. They match
+// as whole words only (see hasWord), so "error_rate" or "terrorist" do not.
+var (
+	bridgeErrorWords = []string{"error", "errors", "failed", "panic", "panics", "panicked"}
+	bridgeWarnWords  = []string{"warn", "warning", "warnings", "deprecated"}
+)
+
+// bridgeLevel returns the level of one legacy log line and the message to
+// log, with any leading level prefix removed.
+func bridgeLevel(line string) (slog.Level, string) {
+	trimmed := strings.TrimLeft(line, " \t")
+	for _, p := range bridgePrefixes {
+		if len(trimmed) >= len(p.prefix) && strings.EqualFold(trimmed[:len(p.prefix)], p.prefix) {
+			return p.level, strings.TrimLeft(trimmed[len(p.prefix):], " \t")
+		}
+	}
+	if level, ok := levelToken(line); ok {
+		return level, line
+	}
+	lower := strings.ToLower(line)
+	switch {
+	case hasWord(lower, bridgeErrorWords):
+		return slog.LevelError, line
+	case hasWord(lower, bridgeWarnWords):
+		return slog.LevelWarn, line
+	}
+	return slog.LevelInfo, line
+}
+
+// levelToken returns the level of the leftmost uppercase level word in
+// line (bridgeLevelTokens), if there is one.
+func levelToken(line string) (slog.Level, bool) {
+	best, found := -1, slog.LevelInfo
+	for _, t := range bridgeLevelTokens {
+		if at := wordIndex(line, t.token); at >= 0 && (best < 0 || at < best) {
+			best, found = at, t.level
+		}
+	}
+	return found, best >= 0
+}
+
+// hasWord reports whether s (lower case) contains one of words as a whole
+// word: the bytes on both sides are not letters, digits or '_'.
+func hasWord(s string, words []string) bool {
+	for _, w := range words {
+		if wordIndex(s, w) >= 0 {
+			return true
+		}
+	}
+	return false
+}
+
+// wordIndex returns where w first occurs in s as a whole word, or -1.
+// The comparison is exact (case-sensitive).
+func wordIndex(s, w string) int {
+	for i := 0; i < len(s); {
+		j := strings.Index(s[i:], w)
+		if j < 0 {
+			return -1
+		}
+		start := i + j
+		end := start + len(w)
+		if (start == 0 || !isWordByte(s[start-1])) && (end == len(s) || !isWordByte(s[end])) {
+			return start
+		}
+		i = start + 1
+	}
+	return -1
+}
+
+func isWordByte(c byte) bool {
+	return c == '_' || (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+}
+
+// ---- record counter ---------------------------------------------------------
+
+// countingHandler counts each record its inner handler is asked to write,
+// by level, before passing it on. slog only calls Handle for records that
+// pass Enabled, so the count respects the configured level.
+type countingHandler struct {
+	next  slog.Handler
+	count func(level string)
+}
+
+func (h countingHandler) Enabled(ctx context.Context, l slog.Level) bool {
+	return h.next.Enabled(ctx, l)
+}
+
+func (h countingHandler) Handle(ctx context.Context, r slog.Record) error {
+	if h.count != nil {
+		h.count(levelLabel(r.Level))
+	}
+	return h.next.Handle(ctx, r)
+}
+
+func (h countingHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
+	return countingHandler{next: h.next.WithAttrs(attrs), count: h.count}
+}
+
+func (h countingHandler) WithGroup(name string) slog.Handler {
+	return countingHandler{next: h.next.WithGroup(name), count: h.count}
+}
+
+// levelLabel maps a slog level to one of four fixed metric labels.
+func levelLabel(l slog.Level) string {
+	switch {
+	case l < slog.LevelInfo:
+		return "debug"
+	case l < slog.LevelWarn:
+		return "info"
+	case l < slog.LevelError:
+		return "warn"
+	default:
+		return "error"
+	}
 }
 
 // RingSnapshot returns up to the last N log lines as a single string. Used

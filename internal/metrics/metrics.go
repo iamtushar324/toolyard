@@ -14,8 +14,8 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
-	"log"
 	"log/slog"
+	"runtime/debug"
 	"sort"
 	"strings"
 	"sync/atomic"
@@ -24,6 +24,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/tusharbhardwaj/toolyard/internal/logx"
+	"github.com/tusharbhardwaj/toolyard/internal/opsmetrics"
 	"github.com/tusharbhardwaj/toolyard/internal/store"
 )
 
@@ -200,12 +201,15 @@ func (r *Recorder) run() {
 	buf := make([]Event, 0, r.flushSize)
 	tick := time.NewTicker(r.flushTick)
 	defer tick.Stop()
+	// The run loop is never restarted (done closes once), so a panic in
+	// one batch insert is recovered here: that batch is lost, the loop
+	// keeps going.
 	flush := func() {
 		if len(buf) == 0 {
 			return
 		}
-		if err := r.insertBatch(buf); err != nil {
-			log.Printf("metrics: batch insert: %v", err)
+		if err := r.insertBatchRecovered(buf); err != nil {
+			r.logger().Error("metrics batch insert failed", "events", len(buf), "err", err.Error())
 		}
 		buf = buf[:0]
 	}
@@ -236,11 +240,31 @@ func (r *Recorder) run() {
 	}
 }
 
+// metricsFlushLoop names a recovered flush panic in the goroutine panic
+// counter.
+const metricsFlushLoop = "metrics-flush"
+
+// insertBatchRecovered is insertBatch with a panic turned into an error,
+// logged at ERROR with the stack and counted.
+func (r *Recorder) insertBatchRecovered(evs []Event) (err error) {
+	defer func() {
+		if p := recover(); p != nil {
+			opsmetrics.IncGoroutinePanic(metricsFlushLoop)
+			r.logger().Error("metrics batch insert panic", "panic", fmt.Sprint(p), "stack", string(debug.Stack()))
+			err = fmt.Errorf("batch insert panic: %v", p)
+		}
+	}()
+	return r.insertBatch(evs)
+}
+
 func (r *Recorder) insertBatch(evs []Event) error {
 	tx, err := r.db.Begin()
 	if err != nil {
 		return err
 	}
+	// A panic below must not leave the transaction holding the only
+	// connection; after Commit this is a no-op.
+	defer func() { _ = tx.Rollback() }()
 	stmt, err := tx.Prepare(`INSERT INTO call_events(
         ts, request_id, session_id, agent_id, agent_name,
         upstream, short_name, tool_name, is_write, is_destructive, pinned_tool,

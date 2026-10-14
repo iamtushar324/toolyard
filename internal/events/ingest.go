@@ -137,20 +137,6 @@ func (s *Service) ingestInternal(ctx context.Context, src *Source, in IngestInpu
 	return ev, nil
 }
 
-// markEventSynced flags an event as lake-synced. Used by the sink.
-func (s *Service) markEventSynced(ctx context.Context, ids []string) error {
-	if len(ids) == 0 {
-		return nil
-	}
-	q := `UPDATE events SET lake_synced=1 WHERE id IN (` + placeholders(len(ids)) + `)`
-	args := make([]any, len(ids))
-	for i, id := range ids {
-		args[i] = id
-	}
-	_, err := s.db.ExecContext(ctx, q, args...)
-	return err
-}
-
 func placeholders(n int) string {
 	if n <= 0 {
 		return ""
