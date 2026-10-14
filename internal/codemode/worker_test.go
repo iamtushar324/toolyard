@@ -143,6 +143,51 @@ func TestWorkerTimeoutKillsProcess(t *testing.T) {
 	}
 }
 
+// A service manager that signals every process of the unit (systemd's
+// default KillMode) must not cut a running script: the gateway drains on
+// SIGTERM and owns its workers' lifetime.
+func TestWorkerIgnoresStopSignals(t *testing.T) {
+	slow := newFake()
+	entered := make(chan struct{}, 1)
+	release := make(chan struct{})
+	slow.handlers["BkCoreServices.get-all-clients"] = func(map[string]any) (*mcp.CallToolResult, error) {
+		entered <- struct{}{}
+		<-release
+		return jsonResult([]any{})
+	}
+	rt := workerRuntime(slow, Limits{}, nil)
+	done := make(chan struct{})
+	var text string
+	var failed bool
+	go func() {
+		defer close(done)
+		text, failed = rt.ExecuteToolCode(context.Background(), "result = BkCoreServices.get_all_clients()", "")
+	}()
+	select {
+	case <-entered:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the script never reached its nested call")
+	}
+	pid := int(rt.lastPID.Load())
+	if pid <= 0 {
+		t.Fatal("no worker pid recorded")
+	}
+	for _, sig := range []syscall.Signal{syscall.SIGTERM, syscall.SIGINT, syscall.SIGHUP} {
+		if err := syscall.Kill(pid, sig); err != nil {
+			t.Fatalf("send %v: %v", sig, err)
+		}
+	}
+	time.Sleep(200 * time.Millisecond)
+	if processGone(pid) {
+		t.Fatal("the worker died from a stop signal")
+	}
+	close(release)
+	<-done
+	if failed || !strings.Contains(text, "Execution completed successfully") {
+		t.Fatalf("a stop signal cut the script (failed=%v):\n%s", failed, text)
+	}
+}
+
 func TestWorkerConcurrencyIsCapped(t *testing.T) {
 	slow := newFake()
 	release := make(chan struct{})

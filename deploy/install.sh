@@ -510,6 +510,9 @@ MemoryHigh=1280M
 # -drain-timeout (60s), then bounded closes (~10s). Keep this above both.
 KillSignal=SIGINT
 TimeoutStopSec=75s
+# SIGTERM to the gateway only, so it can drain; code-mode workers and
+# anything else left in the unit get SIGKILL at the stop timeout.
+KillMode=mixed
 
 [Install]
 WantedBy=multi-user.target

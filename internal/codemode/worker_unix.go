@@ -5,6 +5,7 @@ package codemode
 import (
 	"os"
 	"os/exec"
+	"os/signal"
 	"syscall"
 	"time"
 )
@@ -17,6 +18,15 @@ import (
 func applyMemoryCap(mib int) error {
 	n := uint64(mib) << 20
 	return syscall.Setrlimit(syscall.RLIMIT_DATA, &syscall.Rlimit{Cur: n, Max: n})
+}
+
+// ignoreStopSignals keeps a running script alive when a service manager
+// signals every process of the unit (systemd's default KillMode sends
+// SIGTERM to the whole control group). The gateway alone decides when a
+// worker ends: it drains on SIGTERM and stops a worker with SIGKILL
+// (killGroup).
+func ignoreStopSignals() {
+	signal.Ignore(syscall.SIGTERM, syscall.SIGINT, syscall.SIGHUP)
 }
 
 // preferOOMKill asks the kernel to pick this process first when memory

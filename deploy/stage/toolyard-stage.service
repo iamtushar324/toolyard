@@ -16,6 +16,9 @@ RestartSec=5
 RestartPreventExitStatus=78
 # The ordered drain ends within -drain-timeout (60s) + ~10s.
 TimeoutStopSec=75s
+# SIGTERM to the gateway only, so it can drain; code-mode workers and
+# anything else left in the unit get SIGKILL at the stop timeout.
+KillMode=mixed
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true

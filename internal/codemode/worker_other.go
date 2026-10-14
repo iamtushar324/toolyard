@@ -16,6 +16,8 @@ func applyCPUCap(time.Duration) {}
 
 func preferOOMKill() {}
 
+func ignoreStopSignals() {}
+
 func ownProcessGroup(*exec.Cmd) {}
 
 func killGroup(cmd *exec.Cmd) {

@@ -26,6 +26,7 @@ const MemoryEnv = "TOOLYARD_CODEMODE_MEMORY_MIB"
 // code is 0 once the outcome was reported, 1 on a setup or protocol
 // failure (the parent reports either as a worker failure).
 func WorkerMain(stdin io.Reader, stdout, stderr io.Writer) int {
+	ignoreStopSignals()
 	mib := 512
 	if v, err := strconv.Atoi(os.Getenv(MemoryEnv)); err == nil && v > 0 {
 		mib = v

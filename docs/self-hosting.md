@@ -728,3 +728,9 @@ On SIGTERM (or SIGINT) toolyard drains before it exits:
 Give the process time to finish: set the container's `stop_grace_period`
 (Compose) or `terminationGracePeriodSeconds` (Kubernetes), or the systemd
 unit's `TimeoutStopSec`, to at least `75s`.
+
+Under systemd also set `KillMode=mixed` (the shipped units do). The default
+`KillMode=control-group` sends SIGTERM to every process of the unit at once,
+code-mode script workers included; `mixed` sends it to the gateway only,
+which drains and then ends its workers itself. Workers ignore SIGTERM, so a
+stop signal sent to the whole unit cannot cut a running script either.
