@@ -33,6 +33,9 @@ func TestStageStructuredQuestionRoundTrip(t *testing.T) {
 	if err != nil || again.RequestID != sub.RequestID {
 		t.Fatalf("submission retry duplicated request: %+v %v", again, err)
 	}
+	// Let the background check add its activity line first, so the answer
+	// replay below compares like with like.
+	e.svc.Flush()
 	for _, bad := range []string{`{"selected_option_ids":["unknown"]}`, `{"selected_option_ids":["mobile","mobile"]}`, `{"selected_option_ids":["none","mobile"]}`, `{"text":"   "}`} {
 		var d Decision
 		_ = json.Unmarshal([]byte(`{"action":"answer","request_revision":1,"submission_id":"attempt","response":`+bad+`}`), &d)

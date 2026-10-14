@@ -290,7 +290,20 @@ func TestHostProofAudienceExpiryContentAndAtomicAudit(t *testing.T) {
 	if _, e = s.BeginHost(ctx, bad); !errors.Is(e, ErrConflict) {
 		t.Fatal("changed content reused request", e)
 	}
-	if _, e = s.db.Exec(`CREATE TRIGGER host_audit_failure BEFORE INSERT ON audit_events WHEN NEW.event_type='host.authorization_approved' BEGIN SELECT RAISE(ABORT,'synthetic audit failure'); END`); e != nil {
+	failTrigger := `CREATE TRIGGER host_audit_failure BEFORE INSERT ON audit_events WHEN NEW.event_type='host.authorization_approved' BEGIN SELECT RAISE(ABORT,'synthetic audit failure'); END`
+	dropTrigger := `DROP TRIGGER host_audit_failure`
+	if s.db.Dialect.IsPostgres() {
+		failTrigger = `CREATE FUNCTION host_audit_failure_fn() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+	IF NEW.event_type = 'host.authorization_approved' THEN
+		RAISE EXCEPTION 'synthetic audit failure';
+	END IF;
+	RETURN NEW;
+END $$;
+CREATE TRIGGER host_audit_failure BEFORE INSERT ON audit_events FOR EACH ROW EXECUTE FUNCTION host_audit_failure_fn()`
+		dropTrigger = `DROP TRIGGER host_audit_failure ON audit_events`
+	}
+	if _, e = s.db.Exec(failTrigger); e != nil {
 		t.Fatal(e)
 	}
 	if _, e = s.DecideHost(ctx, h.AuthorizationRef, u.ID, true); e == nil {
@@ -306,7 +319,9 @@ func TestHostProofAudienceExpiryContentAndAtomicAudit(t *testing.T) {
 	if status != "pending" {
 		t.Fatal("decision escaped transaction")
 	}
-	s.db.Exec(`DROP TRIGGER host_audit_failure`)
+	if _, e = s.db.Exec(dropTrigger); e != nil {
+		t.Fatal(e)
+	}
 	if _, e = s.DecideHost(ctx, h.AuthorizationRef, u.ID, true); e != nil {
 		t.Fatal("retry after audit failure", e)
 	}

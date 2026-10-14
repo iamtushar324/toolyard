@@ -813,16 +813,33 @@ func (b *Bus) SetResult(ctx context.Context, id, envelope string, isError bool, 
 	return b.SetResultState(ctx, id, envelope, isError, execErr, state)
 }
 func (b *Bus) SetResultState(ctx context.Context, id, envelope string, isError bool, execErr, state string) error {
-	res, err := b.db.ExecContext(ctx,
-		`UPDATE approval_requests
-            SET result_envelope = ?, result_is_error = ?, result_error = ?, result_executed_at = ?
-          WHERE id = ? AND result_executed_at IS NULL`,
-		nullStr(envelope), boolInt(isError), nullStr(execErr), time.Now().UnixMilli(), id)
+	// The result and the claim state commit together, so no reader (on a
+	// pooled database) sees a recorded result whose claim still says
+	// running.
+	tx, err := b.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
-	if n, _ := res.RowsAffected(); n > 0 {
-		_, _ = b.db.ExecContext(ctx, `UPDATE legacy_execution_claims SET state=?,finished_at=?,reason=? WHERE request_id=?`, state, time.Now().UnixMilli(), execErr, id)
+	defer func() { _ = tx.Rollback() }()
+	now := time.Now().UnixMilli()
+	res, err := tx.ExecContext(ctx,
+		`UPDATE approval_requests
+            SET result_envelope = ?, result_is_error = ?, result_error = ?, result_executed_at = ?
+          WHERE id = ? AND result_executed_at IS NULL`,
+		nullStr(envelope), boolInt(isError), nullStr(execErr), now, id)
+	if err != nil {
+		return err
+	}
+	n, _ := res.RowsAffected()
+	if n > 0 {
+		if _, err := tx.ExecContext(ctx, `UPDATE legacy_execution_claims SET state=?,finished_at=?,reason=? WHERE request_id=?`, state, now, execErr, id); err != nil {
+			return err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	if n > 0 {
 		b.signal(id)
 		if req, gerr := b.Get(ctx, id); gerr == nil {
 			b.fanOut(ctx, req, "approval.executed")

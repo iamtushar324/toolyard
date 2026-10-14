@@ -230,7 +230,7 @@ func TestSealedProbeFormatsMatchTheirPackages(t *testing.T) {
 		"../federation/local_connections.go": {`[]byte("local|" + env + "|" + user)`},
 		"../federation/host_connections.go":  {`[]byte("host|" + env + "|" + user + "|" + key)`},
 		"../chatnotify/telegram/telegram.go": {`"toolyard.chat.v1|telegram|bot_token"`, `s.cipher.Open(sealed, []byte(tokenAAD))`},
-		"../identitykeys/identitykeys.go":    {`s.cipher.Seal([]byte(token), []byte(userID))`, `s.cipher.Open(k.KeySealed, []byte(userID))`},
+		"../identitykeys/identitykeys.go":    {`s.cipher.Seal([]byte(token), []byte(userID))`, `s.cipher.Open(sealed, []byte(userID))`},
 	}
 	for path, wants := range sources {
 		b, err := os.ReadFile(filepath.FromSlash(path))

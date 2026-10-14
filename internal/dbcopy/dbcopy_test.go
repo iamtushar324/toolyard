@@ -316,7 +316,9 @@ func TestCopyThenVerify(t *testing.T) {
 		t.Fatal("verify passed with a wrong secrets key")
 	}
 	for _, sr := range bad.Sealed {
-		if sr.Key == keyguard.SecretsKey && sr.Match {
+		// A column with no sealed values matches trivially; every column
+		// that holds values must fail under the wrong key.
+		if sr.Key == keyguard.SecretsKey && sr.SourceValues > 0 && sr.Match {
 			t.Fatalf("%s.%s matched under a wrong key", sr.Table, sr.Column)
 		}
 		if sr.Table == "secrets" && (sr.SourceUnopened != 2 || sr.TargetUnopened != 2) {
