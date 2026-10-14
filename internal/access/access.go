@@ -38,9 +38,9 @@ var alwaysOn = map[string]bool{
 // They are shared across all agents, so members don't get them by default.
 var BuiltinGroups = []string{"memory", "events", "notes", "skills"}
 
-// retiredGroups are groups toolyard no longer has. Stored grants for them
-// stay in user_server_access but are ignored: they grant nothing and are
-// not listed. lake was the built-in ClickHouse data group.
+// retiredGroups are groups toolyard no longer has. A stored grant for one
+// grants nothing and is not listed; the next SetGroups for that user drops
+// the row. lake was the built-in ClickHouse data group.
 var retiredGroups = map[string]bool{"lake": true}
 
 var groupRE = regexp.MustCompile(`^[A-Za-z0-9_-]{1,64}$`)
