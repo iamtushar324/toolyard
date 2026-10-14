@@ -124,6 +124,8 @@ func main() {
 		err = runHealthcheck(args)
 	case "keys-check":
 		err = runKeysCheck(args)
+	case "db":
+		err = runDB(args)
 	case "version", "-v", "--version":
 		fmt.Println("toolyard", version)
 	case "help", "-h", "--help":
