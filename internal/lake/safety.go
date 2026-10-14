@@ -344,7 +344,8 @@ func normalizeSQL(code string) string {
 // comments), any $ outside a literal (ClickHouse reads $tag$ ... $tag$ as a
 // heredoc string), any non-ASCII byte outside a literal (Unicode whitespace
 // and quotation marks), a carriage return inside a line comment other than
-// just before its newline, and an unterminated literal or comment.
+// just before its newline, an escape (a backslash or a doubled quote) inside
+// a quoted identifier, and an unterminated literal or comment.
 func scanSQL(sqlStr string, keepQuotedNames bool) (string, error) {
 	s := sqlStr
 	n := len(s)
@@ -364,6 +365,12 @@ func scanSQL(sqlStr string, keepQuotedNames bool) (string, error) {
 			end, ok := quotedEnd(s, i)
 			if !ok {
 				return "", errors.New("unterminated quoted identifier")
+			}
+			// ClickHouse decodes escapes in a quoted identifier before it
+			// uses the name, so a name with an escape could spell a word
+			// this scanner reads differently. No ordinary query needs one.
+			if name := s[i+1 : end-1]; strings.IndexByte(name, '\\') >= 0 || strings.IndexByte(name, c) >= 0 {
+				return "", errors.New("escape sequences in quoted identifiers are not allowed")
 			}
 			if keepQuotedNames {
 				b.WriteString(" " + identWord(s[i+1:end-1]) + " ")

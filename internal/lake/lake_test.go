@@ -430,6 +430,11 @@ func TestValidatorsRejectExternalTableFunctions(t *testing.T) {
 		"url\v('http://example.invalid/x.csv', CSV)",
 		"`url`('http://example.invalid/x.csv', CSV)",
 		`"url"('http://example.invalid/x.csv', CSV)`,
+		// Escapes in a quoted identifier are rejected: ClickHouse decodes
+		// them before it uses the name.
+		"`ur\\x6c`('http://example.invalid/x.csv', CSV)",
+		`"u\rl"('http://example.invalid/x.csv', CSV)`,
+		"`u``rl`('http://example.invalid/x.csv', CSV)",
 		"urlCluster('c', 'http://example.invalid/x.csv')",
 		"remote('h:9000', db.t)",
 		"remoteSecure('h:9440', db.t)",
