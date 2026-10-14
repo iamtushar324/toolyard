@@ -29,24 +29,29 @@
 // its own process; and a seccomp filter that refuses socket creation,
 // io_uring, ptrace and process_vm access, bpf, perf events, userfaultfd,
 // the kernel key store, new namespaces (unshare, setns, clone with a
-// namespace flag, clone3) and mounting. A flaw in starlark-go then
+// namespace flag or CLONE_PARENT, clone3), mounting, resource limits and
+// scheduling of other processes (prlimit64 on another pid, setpriority,
+// sched_set*, ioprio_set), and changes to file metadata (chmod, chown,
+// utimes, extended attributes, truncate). A flaw in starlark-go then
 // reaches the worker's own pipes and memory, not the gateway's files,
 // network or processes. See sandbox_linux.go.
 //
 // Worker.Sandbox picks the mode; the gateway reads it from
 // TOOLYARD_CODEMODE_SANDBOX (ParseSandboxMode). SandboxAuto, the default,
-// applies what the kernel supports and, on a kernel without Landlock,
-// logs once and runs the worker with its resource caps only, as before:
-// same user, same filesystem view and network as the gateway, kept in
-// its box by the Starlark interpreter (no filesystem, network or load()),
-// the memory, CPU, step and output caps, and the bare environment.
-// SandboxRequired refuses to run scripts there instead. SandboxStatus
-// reports which applies.
+// applies what the kernel supports: without Landlock it logs once and
+// keeps no_new_privs and the seccomp filter; with neither it runs the
+// worker with its resource caps only, as before: same user, same
+// filesystem view and network as the gateway, kept in its box by the
+// Starlark interpreter (no filesystem, network or load()), the memory,
+// CPU, step and output caps, and the bare environment. SandboxRequired
+// refuses to run scripts unless both Landlock and the seccomp filter
+// apply. SandboxStatus reports which applies.
 //
 // Known limits:
-//   - Landlock does not govern path lookup or metadata: a confined worker
+//   - Path lookup and reading metadata stay possible: a confined worker
 //     can still stat, readlink and chdir anywhere, so it can learn which
-//     paths exist, not what files hold.
+//     paths exist, not what files hold. Changing metadata is refused by
+//     the seccomp filter.
 //   - Below Landlock ABI 6 signals are not scoped: a worker can still
 //     signal the gateway and other processes of the same user.
 //     SandboxStatus then adds "(signals unscoped)"; SandboxRequired still
@@ -191,8 +196,8 @@ func (m SandboxMode) String() string {
 }
 
 // ParseSandboxMode reads a mode name: "auto" (or empty), "off" or
-// "required", in any case. An unknown name returns an error and
-// SandboxAuto.
+// "required", in any case. An unknown name returns an error, which the
+// gateway treats as fatal, and SandboxAuto.
 func ParseSandboxMode(s string) (SandboxMode, error) {
 	switch strings.ToLower(strings.TrimSpace(s)) {
 	case "", "auto":
@@ -216,6 +221,11 @@ type sandboxSupport struct {
 	// seccompReason says why not.
 	seccomp       bool
 	seccompReason string
+	// definite says the answer holds for the life of the process: the
+	// probe ran to completion, or a seccomp filter killed it. Any other
+	// probe failure (a timeout, a failed fork) is probed again at the
+	// next worker start.
+	definite bool
 }
 
 var (
@@ -223,34 +233,49 @@ var (
 	// SandboxStatus.
 	lastSandboxMode atomic.Int32
 
-	supportOnce    sync.Once
-	supportProbed  atomic.Pointer[sandboxSupport]
+	// supportMu serialises probes; supportCached holds a definite answer,
+	// supportLast the latest answer of any kind.
+	supportMu      sync.Mutex
+	supportCached  atomic.Pointer[sandboxSupport]
+	supportLast    atomic.Pointer[sandboxSupport]
 	probeRequested atomic.Bool
-	// supportOverride replaces the kernel probe. Tests only.
+	// supportOverride replaces the kernel probe's answer. Tests only.
 	supportOverride atomic.Pointer[sandboxSupport]
+	// probeSupport is the kernel probe; tests replace it to count probes.
+	probeSupport = probeSandboxSupport
 )
 
-// sandboxSupported probes the kernel once per process (probeSandboxSupport,
-// per platform), waiting for the probe if it is running, and caches the
-// answer.
+// sandboxSupported probes the kernel (probeSandboxSupport, per platform),
+// waiting for a probe that is running, and caches a definite answer for
+// the life of the process. An indefinite one is returned but not kept,
+// so the next call probes again.
 func sandboxSupported() sandboxSupport {
 	if s := supportOverride.Load(); s != nil {
 		return *s
 	}
-	supportOnce.Do(func() {
-		s := probeSandboxSupport()
-		supportProbed.Store(&s)
-	})
-	return *supportProbed.Load()
+	if s := supportCached.Load(); s != nil {
+		return *s
+	}
+	supportMu.Lock()
+	defer supportMu.Unlock()
+	if s := supportCached.Load(); s != nil {
+		return *s
+	}
+	s := probeSupport()
+	supportLast.Store(&s)
+	if s.definite {
+		supportCached.Store(&s)
+	}
+	return s
 }
 
-// sandboxSupportNow is sandboxSupported without the wait: ok is false
-// until the first probe has finished.
+// sandboxSupportNow is sandboxSupported without the wait: the latest
+// answer, or ok false until the first probe has finished.
 func sandboxSupportNow() (s sandboxSupport, ok bool) {
 	if p := supportOverride.Load(); p != nil {
 		return *p, true
 	}
-	if p := supportProbed.Load(); p != nil {
+	if p := supportLast.Load(); p != nil {
 		return *p, true
 	}
 	return sandboxSupport{}, false
@@ -259,10 +284,12 @@ func sandboxSupportNow() (s sandboxSupport, ok bool) {
 // SandboxStatus describes the confinement scripts get under the most
 // recently configured worker: "landlock-abi-<n>+seccomp" ("+seccomp"
 // missing when no seccomp filter can be installed, " (signals unscoped)"
-// added below ABI 6), "none: <reason>" when Landlock is unavailable (with
-// " (sandbox required: scripts are refused)" under SandboxRequired), or
-// "off". It never waits for the kernel probe: until the probe has
-// finished it reports "probing", and starts the probe if nothing has.
+// added below ABI 6); "seccomp-only: <reason>" when Landlock is
+// unavailable but the filter applies; "none: <reason>" when neither does;
+// " (sandbox required: scripts are refused)" appended under
+// SandboxRequired when either is missing; or "off". It never waits for
+// the kernel probe: until a probe has finished it reports "probing", and
+// starts one if nothing has.
 func SandboxStatus() string {
 	mode := SandboxMode(lastSandboxMode.Load())
 	if mode == SandboxOff {
@@ -291,22 +318,28 @@ func ProbeSandbox() string {
 }
 
 func sandboxStatusText(mode SandboxMode, s sandboxSupport) string {
-	switch {
-	case mode == SandboxOff:
+	if mode == SandboxOff {
 		return "off"
+	}
+	var text string
+	switch {
 	case s.abi > 0:
-		text := fmt.Sprintf("landlock-abi-%d", s.abi)
+		text = fmt.Sprintf("landlock-abi-%d", s.abi)
 		if s.seccomp {
 			text += "+seccomp"
 		}
 		if s.abi < 6 {
 			text += " (signals unscoped)"
 		}
-		return text
-	case mode == SandboxRequired:
-		return "none: " + s.reason + " (sandbox required: scripts are refused)"
+	case s.seccomp:
+		text = "seccomp-only: " + s.reason
+	default:
+		text = "none: " + s.reason
 	}
-	return "none: " + s.reason
+	if mode == SandboxRequired && (s.abi == 0 || !s.seccomp) {
+		text += " (sandbox required: scripts are refused)"
+	}
+	return text
 }
 
 // DefaultWorker is the production worker: this binary's codemode-worker

@@ -56,10 +56,15 @@ import (
 //     ABI 4 and later it also handles TCP bind and connect, with nothing
 //     allowed; on ABI 6 and later it scopes abstract Unix sockets and
 //     signals to the worker's own domain.
-//   - The seccomp filter (workerSeccompFilter) returns ENOSYS for clone3,
-//     EPERM for clone with a new-namespace flag, for the calls in
-//     deniedSyscalls and for any call made through another system call
-//     convention, and allows everything else.
+//   - The seccomp filter (workerSeccompFilter) returns ENOSYS for clone3;
+//     EPERM for clone with a new-namespace flag or CLONE_PARENT, for
+//     prlimit64 on any pid but 0 (the caller), for the calls in
+//     deniedSyscalls and seccompArchDenied, and for any call made through
+//     another system call convention; and allows everything else. Landlock
+//     does not govern calls that act on another process of the same user
+//     (resource limits, scheduling) or that change a file's metadata
+//     (mode, owner, times, extended attributes, truncation below ABI 3);
+//     the filter refuses those.
 //
 // The Go runtime in the worker does not need anything this takes away.
 // It reads /sys/kernel/mm/transparent_hugepage/hpage_pmd_size and, for
@@ -74,9 +79,11 @@ import (
 //
 // Whether the kernel offers Landlock and seccomp is asked of a child
 // process (probeSandboxSupport), not tried in the gateway: a seccomp
-// filter a service manager installed (systemd's SystemCallFilter=
-// @system-service leaves out the @sandbox calls) kills the whole process
-// on a forbidden call, and only the probe would die.
+// filter a service manager installed kills the whole process on a
+// forbidden call, and only the probe would die. systemd's
+// SystemCallFilter=@system-service allows the Landlock calls only where
+// its @default set includes @sandbox (systemd 259 does; @sandbox was
+// added in 254, and older versions have no such group).
 
 // sandboxProbeEnv makes any binary that links this package answer the
 // sandbox probe from its init and exit, before main or TestMain runs.
@@ -167,6 +174,7 @@ func probeRestrict(abi int) error {
 func parseSandboxProbe(out string, runErr error, stderr string) sandboxSupport {
 	results := map[string]string{}
 	pending := ""
+	var s sandboxSupport
 	for _, line := range strings.Split(out, "\n") {
 		key, value, ok := strings.Cut(strings.TrimSpace(line), " ")
 		if !ok {
@@ -190,6 +198,10 @@ func parseSandboxProbe(out string, runErr error, stderr string) sandboxSupport {
 			killedBy = pending
 		}
 	}
+	// A probe that ran to completion, or that a seccomp filter killed,
+	// gave the kernel's answer; anything else (a timeout, a failed fork,
+	// no output) may go away, and is probed again later.
+	s.definite = killedBy != "" || (runErr == nil && results["landlock"] != "")
 	// blocked names the call and the systemd SystemCallFilter= group that
 	// holds it.
 	blocked := func(what, group string) string {
@@ -207,7 +219,6 @@ func parseSandboxProbe(out string, runErr error, stderr string) sandboxSupport {
 		return "the sandbox probe failed (" + detail + ")"
 	}
 
-	var s sandboxSupport
 	switch v := results["landlock"]; {
 	case killedBy == "landlock":
 		s.reason = blocked("landlock_create_ruleset", "@sandbox")
@@ -270,13 +281,19 @@ func errnoText(err error) string {
 
 var pidfdWarmup sync.Once
 
-// startSandboxed starts cmd from a confined, single-use thread.
+// startSandboxed starts cmd from a confined, single-use thread: no new
+// privileges, the Landlock ruleset when support has an ABI, the seccomp
+// filter when support has one.
 func startSandboxed(cmd *exec.Cmd, exe string, support sandboxSupport) error {
-	ruleset, err := buildWorkerRuleset(exe, support.abi)
-	if err != nil {
-		return err
+	ruleset := -1
+	if support.abi > 0 {
+		fd, err := buildWorkerRuleset(exe, support.abi)
+		if err != nil {
+			return err
+		}
+		defer unix.Close(fd)
+		ruleset = fd
 	}
-	defer unix.Close(ruleset)
 
 	// os/exec opens /dev/null inside Start for a nil Stdin, Stdout or
 	// Stderr, which the confined thread can no longer do.
@@ -311,8 +328,10 @@ func startSandboxed(cmd *exec.Cmd, exe string, support sandboxSupport) error {
 		if err := setNoNewPrivs(); err != nil {
 			return fmt.Errorf("prctl(PR_SET_NO_NEW_PRIVS): %w", err)
 		}
-		if err := restrictSelf(ruleset); err != nil {
-			return fmt.Errorf("landlock_restrict_self: %w", err)
+		if ruleset >= 0 {
+			if err := restrictSelf(ruleset); err != nil {
+				return fmt.Errorf("landlock_restrict_self: %w", err)
+			}
 		}
 		if support.seccomp {
 			if err := installSeccomp(workerSeccompFilter); err != nil {
@@ -530,20 +549,25 @@ const seccompDeny = unix.SECCOMP_RET_ERRNO | uint32(unix.EPERM)
 // Go runtime's threads and os/exec's fork use clone already.
 const seccompNoSys = unix.SECCOMP_RET_ERRNO | uint32(unix.ENOSYS)
 
-// cloneNamespaceFlags are the clone flags that create a namespace. All
+// cloneDeniedFlags are the clone flags that create a namespace, and
+// CLONE_PARENT, which would make the new process the gateway's child. All
 // sit in the low 32 bits of the flags argument. The runtime's own clones
 // (threads: CLONE_VM|CLONE_FS|CLONE_FILES|CLONE_SIGHAND|CLONE_SYSVSEM|
 // CLONE_THREAD; os/exec: CLONE_VFORK|CLONE_VM|CLONE_PIDFD) carry none.
-const cloneNamespaceFlags = unix.CLONE_NEWNS | unix.CLONE_NEWUTS | unix.CLONE_NEWIPC |
-	unix.CLONE_NEWUSER | unix.CLONE_NEWPID | unix.CLONE_NEWNET | unix.CLONE_NEWCGROUP
+const cloneDeniedFlags = unix.CLONE_NEWNS | unix.CLONE_NEWUTS | unix.CLONE_NEWIPC |
+	unix.CLONE_NEWUSER | unix.CLONE_NEWPID | unix.CLONE_NEWNET | unix.CLONE_NEWCGROUP |
+	unix.CLONE_PARENT
 
-// deniedSyscalls are refused with EPERM. The worker uses none of them,
-// and each opens kernel surface or reach a script has no use for:
-// sockets (the worker talks over its pipes), io_uring (a second syscall
-// path), ptrace and process_vm_* (other processes' memory), bpf,
-// perf_event_open, userfaultfd, the kernel key store, unshare and setns
-// (namespaces; clone and clone3 are handled in buildSeccompFilter), and
-// mounting, old API and new.
+// deniedSyscalls are refused with EPERM on every architecture, with
+// seccompArchDenied. The worker uses none of them, and each opens kernel
+// surface or reach a script has no use for: sockets (the worker talks
+// over its pipes), io_uring (a second syscall path), ptrace and
+// process_vm_* (other processes' memory), bpf, perf_event_open,
+// userfaultfd, the kernel key store, unshare and setns (namespaces; clone
+// and clone3 are handled in buildSeccompFilter), mounting, old API and
+// new, scheduling another process of the same user (setpriority,
+// sched_set*, ioprio_set; prlimit64 is handled in buildSeccompFilter),
+// and changing file metadata, which Landlock does not govern.
 var deniedSyscalls = []uint32{
 	unix.SYS_SOCKET,
 	unix.SYS_SOCKETPAIR,
@@ -572,6 +596,27 @@ var deniedSyscalls = []uint32{
 	unix.SYS_FSMOUNT,
 	unix.SYS_FSPICK,
 	unix.SYS_MOUNT_SETATTR,
+	unix.SYS_SETPRIORITY,
+	unix.SYS_SCHED_SETSCHEDULER,
+	unix.SYS_SCHED_SETPARAM,
+	unix.SYS_SCHED_SETATTR,
+	unix.SYS_SCHED_SETAFFINITY,
+	unix.SYS_IOPRIO_SET,
+	unix.SYS_FCHMOD,
+	unix.SYS_FCHMODAT,
+	unix.SYS_FCHMODAT2,
+	unix.SYS_FCHOWN,
+	unix.SYS_FCHOWNAT,
+	unix.SYS_UTIMENSAT,
+	unix.SYS_TRUNCATE,
+	unix.SYS_SETXATTR,
+	unix.SYS_LSETXATTR,
+	unix.SYS_FSETXATTR,
+	unix.SYS_SETXATTRAT,
+	unix.SYS_REMOVEXATTR,
+	unix.SYS_LREMOVEXATTR,
+	unix.SYS_FREMOVEXATTR,
+	unix.SYS_REMOVEXATTRAT,
 }
 
 // workerSeccompFilter is the classic BPF program every worker runs under.
@@ -587,8 +632,8 @@ func bpfJump(code uint16, k uint32, jt, jf uint8) unix.SockFilter {
 
 // buildSeccompFilter: refuse any call made through a convention other
 // than the native one; answer clone3 with ENOSYS; refuse clone with a
-// namespace flag and allow any other clone; refuse each denied call;
-// allow the rest.
+// denied flag and allow any other clone; refuse prlimit64 on any pid but
+// 0 and allow it on 0; refuse each denied call; allow the rest.
 func buildSeccompFilter() []unix.SockFilter {
 	f := []unix.SockFilter{
 		bpfStmt(unix.BPF_LD|unix.BPF_W|unix.BPF_ABS, seccompDataArch),
@@ -603,11 +648,20 @@ func buildSeccompFilter() []unix.SockFilter {
 		// Not clone: skip the next four, with the number still loaded.
 		bpfJump(unix.BPF_JMP|unix.BPF_JEQ|unix.BPF_K, unix.SYS_CLONE, 0, 4),
 		bpfStmt(unix.BPF_LD|unix.BPF_W|unix.BPF_ABS, seccompDataArg0Low),
-		bpfJump(unix.BPF_JMP|unix.BPF_JSET|unix.BPF_K, cloneNamespaceFlags, 0, 1),
+		bpfJump(unix.BPF_JMP|unix.BPF_JSET|unix.BPF_K, cloneDeniedFlags, 0, 1),
+		bpfStmt(unix.BPF_RET|unix.BPF_K, seccompDeny),
+		bpfStmt(unix.BPF_RET|unix.BPF_K, unix.SECCOMP_RET_ALLOW),
+		// prlimit64(pid, ...): pid 0 is the caller itself, which the
+		// worker's own setrlimit and os/exec's child before exec use;
+		// another pid would reach the gateway. The kernel reads pid as a
+		// 32-bit pid_t. Not prlimit64: skip the next four.
+		bpfJump(unix.BPF_JMP|unix.BPF_JEQ|unix.BPF_K, unix.SYS_PRLIMIT64, 0, 4),
+		bpfStmt(unix.BPF_LD|unix.BPF_W|unix.BPF_ABS, seccompDataArg0Low),
+		bpfJump(unix.BPF_JMP|unix.BPF_JEQ|unix.BPF_K, 0, 1, 0),
 		bpfStmt(unix.BPF_RET|unix.BPF_K, seccompDeny),
 		bpfStmt(unix.BPF_RET|unix.BPF_K, unix.SECCOMP_RET_ALLOW),
 	)
-	for _, nr := range deniedSyscalls {
+	for _, nr := range append(append([]uint32(nil), deniedSyscalls...), seccompArchDenied...) {
 		f = append(f,
 			bpfJump(unix.BPF_JMP|unix.BPF_JEQ|unix.BPF_K, nr, 0, 1),
 			bpfStmt(unix.BPF_RET|unix.BPF_K, seccompDeny),
@@ -617,8 +671,10 @@ func buildSeccompFilter() []unix.SockFilter {
 }
 
 // installSeccomp attaches filter to the calling thread. It goes through
-// prctl rather than seccomp(2): prctl is in systemd's @system-service set,
-// seccomp(2) is not. no_new_privs must already be set.
+// prctl rather than seccomp(2): prctl is in systemd's @process group,
+// which every @system-service allows, while seccomp(2) is in @sandbox,
+// which older systemd versions leave out. no_new_privs must already be
+// set.
 func installSeccomp(filter []unix.SockFilter) error {
 	prog := unix.SockFprog{Len: uint16(len(filter)), Filter: &filter[0]}
 	_, _, e := unix.Syscall6(unix.SYS_PRCTL, unix.PR_SET_SECCOMP, unix.SECCOMP_MODE_FILTER,

@@ -14,6 +14,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
@@ -27,6 +28,12 @@ import (
 // runs the probe unconfined first, to show the action works without the
 // sandbox, then confined.
 const sandboxTestProbeEnv = "TOOLYARD_CODEMODE_TEST_SANDBOX_PROBE"
+
+// sandboxMinABIEnv, when set, turns a missing sandbox into a failure
+// instead of a skip: the tests fail when the probed Landlock ABI is below
+// its value or no seccomp filter can be installed. CI sets it, so a
+// sandbox that silently disappears breaks the build.
+const sandboxMinABIEnv = "TOOLYARD_SANDBOX_TEST_MIN_ABI"
 
 func init() {
 	sandboxProbeMain = func() (int, bool) {
@@ -51,6 +58,8 @@ type probeSpec struct {
 	Sockets     bool   `json:"sockets,omitempty"`     // create a Unix and a TCP socket
 	Signal      bool   `json:"signal,omitempty"`      // kill(getppid(), 0)
 	Clone       bool   `json:"clone,omitempty"`       // clone3, and clone with CLONE_NEWUSER
+	Prlimit     bool   `json:"prlimit,omitempty"`     // read RLIMIT_CPU of the parent and of itself
+	Chmod       string `json:"chmod,omitempty"`       // chmod this file
 }
 
 func runSandboxTestProbe(raw string) int {
@@ -115,6 +124,15 @@ func runSandboxTestProbe(raw string) int {
 		_, _, e = unix.RawSyscall(unix.SYS_CLONE, unix.CLONE_NEWUSER|unix.CLONE_FS, 0, 0)
 		res["clone_newuser"] = probeOutcome(errnoErr(e))
 	}
+	if spec.Prlimit {
+		// Reads only (no new limit), so the unconfined run changes nothing.
+		var lim unix.Rlimit
+		res["prlimit_parent"] = probeOutcome(unix.Prlimit(unix.Getppid(), unix.RLIMIT_CPU, nil, &lim))
+		res["prlimit_self"] = probeOutcome(unix.Prlimit(0, unix.RLIMIT_CPU, nil, &lim))
+	}
+	if spec.Chmod != "" {
+		res["chmod"] = probeOutcome(unix.Fchmodat(unix.AT_FDCWD, spec.Chmod, 0o600, 0))
+	}
 	if err := json.NewEncoder(os.Stdout).Encode(res); err != nil {
 		return 1
 	}
@@ -176,24 +194,60 @@ func expectOutcomes(t *testing.T, label string, got map[string]string, want stri
 	}
 }
 
-// landlockOrSkip logs the kernel's Landlock ABI and skips the test when
-// there is none.
-func landlockOrSkip(t *testing.T) sandboxSupport {
+// probedSandbox logs what the kernel offers and, under sandboxMinABIEnv,
+// fails the test when that is less than the floor.
+func probedSandbox(t *testing.T) sandboxSupport {
 	t.Helper()
 	s := sandboxSupported()
-	t.Logf("landlock abi=%d", s.abi)
+	t.Logf("landlock abi=%d seccomp=%v", s.abi, s.seccomp)
+	if v := os.Getenv(sandboxMinABIEnv); v != "" {
+		floor, err := strconv.Atoi(v)
+		if err != nil {
+			t.Fatalf("%s=%q: %v", sandboxMinABIEnv, v, err)
+		}
+		if s.abi < floor {
+			t.Fatalf("landlock abi=%d is below %s=%d: %s", s.abi, sandboxMinABIEnv, floor, s.reason)
+		}
+		if !s.seccomp {
+			t.Fatalf("no seccomp filter, which %s requires: %s", sandboxMinABIEnv, s.seccompReason)
+		}
+	}
+	return s
+}
+
+// landlockOrSkip skips the test when the kernel has no Landlock.
+func landlockOrSkip(t *testing.T) sandboxSupport {
+	t.Helper()
+	s := probedSandbox(t)
 	if s.abi == 0 {
 		t.Skipf("landlock abi=0: %s", s.reason)
 	}
 	return s
 }
 
-// simulateNoLandlock makes the sandbox see a kernel without Landlock for
-// the rest of the test.
+// seccompOrSkip skips the test when no seccomp filter can be installed.
+func seccompOrSkip(t *testing.T) sandboxSupport {
+	t.Helper()
+	s := probedSandbox(t)
+	if !s.seccomp {
+		t.Skipf("no seccomp filter: %s", s.seccompReason)
+	}
+	return s
+}
+
+// simulateSupport makes the sandbox see s for the rest of the test.
+func simulateSupport(t *testing.T, s sandboxSupport) {
+	t.Helper()
+	s.definite = true
+	prev := supportOverride.Swap(&s)
+	t.Cleanup(func() { supportOverride.Store(prev) })
+}
+
+// simulateNoLandlock makes the sandbox see a kernel with neither Landlock
+// nor seccomp for the rest of the test.
 func simulateNoLandlock(t *testing.T) {
 	t.Helper()
-	prev := supportOverride.Swap(&sandboxSupport{reason: "simulated: no Landlock", seccompReason: "simulated"})
-	t.Cleanup(func() { supportOverride.Store(prev) })
+	simulateSupport(t, sandboxSupport{reason: "simulated: no Landlock", seccompReason: "simulated"})
 }
 
 // tcpSockets makes the two TCP sockets the probe uses as fds 3 and 4.
@@ -280,7 +334,7 @@ func TestWorkerSandboxScopesSignals(t *testing.T) {
 }
 
 func TestWorkerSandboxDegradesWhenUnavailable(t *testing.T) {
-	t.Logf("landlock abi=%d", sandboxSupported().abi)
+	probedSandbox(t)
 	simulateNoLandlock(t)
 	rt := workerRuntime(newFake(), Limits{}, nil)
 	if got, want := SandboxStatus(), "none: simulated: no Landlock"; got != want {
@@ -299,9 +353,30 @@ func TestWorkerSandboxDegradesWhenUnavailable(t *testing.T) {
 	expectOutcomes(t, "degraded", runProbe(t, SandboxAuto, probeSpec{Read: secret}), "ok", "read")
 }
 
+// TestWorkerSandboxSeccompOnlyWithoutLandlock: in auto mode a kernel
+// without Landlock still gets no_new_privs and the seccomp filter.
+func TestWorkerSandboxSeccompOnlyWithoutLandlock(t *testing.T) {
+	seccompOrSkip(t)
+	simulateSupport(t, sandboxSupport{reason: "simulated: no Landlock", seccomp: true})
+	rt := workerRuntime(newFake(), Limits{}, nil)
+	if got, want := SandboxStatus(), "seccomp-only: simulated: no Landlock"; got != want {
+		t.Fatalf("SandboxStatus = %q, want %q", got, want)
+	}
+	text, failed := rt.ExecuteToolCode(context.Background(), "print(\"hi\")\nresult = 1", "")
+	if failed || !strings.Contains(text, "Execution completed successfully") {
+		t.Fatalf("seccomp-only run (failed=%v):\n%s", failed, text)
+	}
+	secret := filepath.Join(t.TempDir(), "secret")
+	if err := os.WriteFile(secret, []byte("parent data"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	got := runProbe(t, SandboxAuto, probeSpec{Read: secret, Sockets: true})
+	expectOutcomes(t, "seccomp only", got, "ok", "read")
+	expectOutcomes(t, "seccomp only", got, "EPERM", "unix_socket", "tcp_socket")
+}
+
 func TestWorkerSandboxRequiredRefuses(t *testing.T) {
-	actual := sandboxSupported()
-	t.Logf("landlock abi=%d", actual.abi)
+	actual := probedSandbox(t)
 	t.Run("without landlock", func(t *testing.T) {
 		simulateNoLandlock(t)
 		rt := workerRuntime(newFake(), Limits{}, func(w *Worker) { w.Sandbox = SandboxRequired })
@@ -318,9 +393,25 @@ func TestWorkerSandboxRequiredRefuses(t *testing.T) {
 		}
 		expectClean(t, rt, 0)
 	})
-	t.Run("with landlock", func(t *testing.T) {
-		if actual.abi == 0 {
-			t.Skipf("landlock abi=0: %s", actual.reason)
+	t.Run("without seccomp", func(t *testing.T) {
+		simulateSupport(t, sandboxSupport{abi: 6, seccompReason: "simulated: no seccomp"})
+		rt := workerRuntime(newFake(), Limits{}, func(w *Worker) { w.Sandbox = SandboxRequired })
+		if got, want := SandboxStatus(), "landlock-abi-6 (sandbox required: scripts are refused)"; got != want {
+			t.Fatalf("SandboxStatus = %q, want %q", got, want)
+		}
+		text, failed := rt.ExecuteToolCode(context.Background(), "result = 1", "")
+		want := "could not start the script worker: the worker sandbox is required, but no seccomp filter can be installed: simulated: no seccomp"
+		if !failed || !strings.Contains(text, want) {
+			t.Fatalf("required without seccomp (failed=%v):\n%s", failed, text)
+		}
+		if pid := rt.lastPID.Load(); pid != 0 {
+			t.Fatalf("a worker started anyway (pid %d)", pid)
+		}
+		expectClean(t, rt, 0)
+	})
+	t.Run("with both", func(t *testing.T) {
+		if actual.abi == 0 || !actual.seccomp {
+			t.Skipf("landlock abi=%d seccomp=%v: %s %s", actual.abi, actual.seccomp, actual.reason, actual.seccompReason)
 		}
 		rt := workerRuntime(newFake(), Limits{}, func(w *Worker) { w.Sandbox = SandboxRequired })
 		text, failed := rt.ExecuteToolCode(context.Background(), "print(\"hi\")\nresult = 1", "")
@@ -331,24 +422,35 @@ func TestWorkerSandboxRequiredRefuses(t *testing.T) {
 }
 
 // TestWorkerSandboxProbeParsing: the probe's report, including a probe a
-// seccomp filter on the gateway killed mid-step, as under systemd's
-// SystemCallFilter=@system-service, which leaves out the Landlock calls.
+// seccomp filter on the gateway killed mid-step, as under a systemd
+// SystemCallFilter= without the @sandbox calls.
 func TestWorkerSandboxProbeParsing(t *testing.T) {
-	t.Logf("landlock abi=%d", sandboxSupported().abi)
+	probedSandbox(t)
 	full := "step landlock\nlandlock 6\nstep no_new_privs\nno_new_privs ok\nstep restrict\nrestrict ok\nstep seccomp\nseccomp ok\n"
-	if s := parseSandboxProbe(full, nil, ""); s.abi != 6 || !s.seccomp || s.reason != "" {
+	if s := parseSandboxProbe(full, nil, ""); s.abi != 6 || !s.seccomp || s.reason != "" || !s.definite {
 		t.Fatalf("full support parsed as %+v", s)
 	}
 	none := "step landlock\nlandlock error ENOSYS\nstep no_new_privs\nno_new_privs ok\nstep seccomp\nseccomp ok\n"
-	if s := parseSandboxProbe(none, nil, ""); s.abi != 0 || !s.seccomp || !strings.Contains(s.reason, "no Landlock support") {
+	if s := parseSandboxProbe(none, nil, ""); s.abi != 0 || !s.seccomp || !strings.Contains(s.reason, "no Landlock support") || !s.definite {
 		t.Fatalf("no Landlock parsed as %+v", s)
+	}
+	// A probe that never ran is not an answer, and is probed again.
+	if s := parseSandboxProbe("", errors.New("fork/exec: resource temporarily unavailable"), ""); s.abi != 0 || s.definite ||
+		!strings.Contains(s.reason, "the sandbox probe failed (fork/exec: resource temporarily unavailable)") {
+		t.Fatalf("failed probe parsed as %+v", s)
 	}
 	// A real SIGSYS death, from a shell standing in for the probe.
 	cmd := exec.Command("/bin/sh", "-c", "echo step landlock; kill -SYS $$")
 	out, err := cmd.Output()
 	s := parseSandboxProbe(string(out), err, "")
-	if s.abi != 0 || !strings.Contains(s.reason, "a seccomp filter on the gateway process kills landlock_create_ruleset (under systemd SystemCallFilter=, allow @sandbox)") {
+	if s.abi != 0 || !s.definite || !strings.Contains(s.reason, "a seccomp filter on the gateway process kills landlock_create_ruleset (under systemd SystemCallFilter=, allow @sandbox)") {
 		t.Fatalf("killed probe (err %v) parsed as %+v", err, s)
+	}
+	cmd = exec.Command("/bin/sh", "-c", "echo step landlock; echo landlock 7; echo step no_new_privs; kill -SYS $$")
+	out, err = cmd.Output()
+	if s := parseSandboxProbe(string(out), err, ""); s.abi != 0 || !s.definite ||
+		!strings.Contains(s.reason, "kills prctl(PR_SET_NO_NEW_PRIVS) (under systemd SystemCallFilter=, allow @process)") {
+		t.Fatalf("probe killed at prctl (err %v) parsed as %+v", err, s)
 	}
 	if got := sandboxStatusText(SandboxAuto, s); !strings.HasPrefix(got, "none: a seccomp filter") {
 		t.Fatalf("status for a killed probe: %q", got)
@@ -359,12 +461,16 @@ func TestWorkerSandboxProbeParsing(t *testing.T) {
 		want string
 	}{
 		{SandboxAuto, sandboxSupport{abi: 8, seccomp: true}, "landlock-abi-8+seccomp"},
-		{SandboxRequired, sandboxSupport{abi: 6}, "landlock-abi-6"},
+		{SandboxAuto, sandboxSupport{abi: 6}, "landlock-abi-6"},
+		{SandboxRequired, sandboxSupport{abi: 6}, "landlock-abi-6 (sandbox required: scripts are refused)"},
+		{SandboxRequired, sandboxSupport{abi: 7, seccomp: true}, "landlock-abi-7+seccomp"},
 		{SandboxAuto, sandboxSupport{abi: 5, seccomp: true}, "landlock-abi-5+seccomp (signals unscoped)"},
 		{SandboxRequired, sandboxSupport{abi: 4, seccomp: true}, "landlock-abi-4+seccomp (signals unscoped)"},
 		{SandboxOff, sandboxSupport{abi: 8, seccomp: true}, "off"},
 		{SandboxAuto, sandboxSupport{reason: "r"}, "none: r"},
 		{SandboxRequired, sandboxSupport{reason: "r"}, "none: r (sandbox required: scripts are refused)"},
+		{SandboxAuto, sandboxSupport{reason: "r", seccomp: true}, "seccomp-only: r"},
+		{SandboxRequired, sandboxSupport{reason: "r", seccomp: true}, "seccomp-only: r (sandbox required: scripts are refused)"},
 	} {
 		if got := sandboxStatusText(c.mode, c.s); got != c.want {
 			t.Errorf("status(%s, %+v) = %q, want %q", c.mode, c.s, got, c.want)
@@ -373,7 +479,7 @@ func TestWorkerSandboxProbeParsing(t *testing.T) {
 }
 
 func TestWorkerSandboxParseMode(t *testing.T) {
-	t.Logf("landlock abi=%d", sandboxSupported().abi)
+	probedSandbox(t)
 	for in, want := range map[string]SandboxMode{"": SandboxAuto, "auto": SandboxAuto, " Off ": SandboxOff, "REQUIRED": SandboxRequired} {
 		if got, err := ParseSandboxMode(in); err != nil || got != want {
 			t.Errorf("ParseSandboxMode(%q) = %s, %v; want %s", in, got, err, want)
@@ -385,15 +491,74 @@ func TestWorkerSandboxParseMode(t *testing.T) {
 }
 
 func TestWorkerSandboxDeniesNamespaces(t *testing.T) {
-	s := landlockOrSkip(t)
-	if !s.seccomp {
-		t.Skipf("no seccomp filter (%s)", s.seccompReason)
-	}
+	seccompOrSkip(t)
 	open := runProbe(t, SandboxOff, probeSpec{Clone: true})
 	expectOutcomes(t, "unconfined", open, "EINVAL", "clone3", "clone_newuser")
 	shut := runProbe(t, SandboxAuto, probeSpec{Clone: true})
 	expectOutcomes(t, "confined", shut, "ENOSYS", "clone3")
 	expectOutcomes(t, "confined", shut, "EPERM", "clone_newuser")
+}
+
+// TestWorkerSandboxDeniesMetadataChanges: Landlock does not govern a
+// file's mode, owner, times or extended attributes; the filter refuses
+// changing them.
+func TestWorkerSandboxDeniesMetadataChanges(t *testing.T) {
+	seccompOrSkip(t)
+	dir := t.TempDir()
+	for _, run := range []struct {
+		mode SandboxMode
+		want string
+	}{{SandboxOff, "ok"}, {SandboxAuto, "EPERM"}} {
+		file := filepath.Join(dir, run.mode.String())
+		if err := os.WriteFile(file, []byte("parent data"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		expectOutcomes(t, "sandbox "+run.mode.String(), runProbe(t, run.mode, probeSpec{Chmod: file}), run.want, "chmod")
+	}
+}
+
+// TestWorkerSandboxDeniesOtherProcesses: Landlock does not govern resource
+// limits of another process of the same user; the filter refuses
+// prlimit64 on any pid but the caller's own.
+func TestWorkerSandboxDeniesOtherProcesses(t *testing.T) {
+	seccompOrSkip(t)
+	got := runProbe(t, SandboxAuto, probeSpec{Prlimit: true})
+	expectOutcomes(t, "confined", got, "EPERM", "prlimit_parent")
+	expectOutcomes(t, "confined", got, "ok", "prlimit_self")
+}
+
+// TestWorkerSandboxReprobesAfterFailure: a failed probe is not cached, a
+// definite answer is.
+func TestWorkerSandboxReprobesAfterFailure(t *testing.T) {
+	probedSandbox(t)
+	if supportOverride.Load() != nil {
+		t.Fatal("a sandbox override is still set")
+	}
+	savedProbe, savedCached, savedLast := probeSupport, supportCached.Load(), supportLast.Load()
+	t.Cleanup(func() {
+		probeSupport = savedProbe
+		supportCached.Store(savedCached)
+		supportLast.Store(savedLast)
+	})
+	supportCached.Store(nil)
+	supportLast.Store(nil)
+	calls := 0
+	probeSupport = func() sandboxSupport {
+		calls++
+		if calls == 1 {
+			return sandboxSupport{reason: "the sandbox probe failed (signal: killed)"}
+		}
+		return sandboxSupport{abi: 7, seccomp: true, definite: true}
+	}
+	if s := sandboxSupported(); s.abi != 0 || calls != 1 {
+		t.Fatalf("first probe: %+v after %d calls", s, calls)
+	}
+	if s := sandboxSupported(); s.abi != 7 || calls != 2 {
+		t.Fatalf("second probe: %+v after %d calls", s, calls)
+	}
+	if s := sandboxSupported(); s.abi != 7 || calls != 2 {
+		t.Fatalf("a definite answer was probed again: %+v after %d calls", s, calls)
+	}
 }
 
 // runSeccomp evaluates filter for one call the way the kernel's classic
@@ -437,7 +602,7 @@ func runSeccomp(t *testing.T, filter []unix.SockFilter, arch uint32, nr uint32, 
 // kernel: the clone flags the runtime itself uses pass, namespace flags,
 // clone3, the denied calls and foreign conventions do not.
 func TestWorkerSandboxSeccompFilter(t *testing.T) {
-	t.Logf("landlock abi=%d", sandboxSupported().abi)
+	probedSandbox(t)
 	const (
 		allow   = uint32(unix.SECCOMP_RET_ALLOW)
 		sigchld = uint64(unix.SIGCHLD)
@@ -457,12 +622,18 @@ func TestWorkerSandboxSeccompFilter(t *testing.T) {
 	for name, flag := range map[string]uint64{
 		"CLONE_NEWNS": unix.CLONE_NEWNS, "CLONE_NEWUTS": unix.CLONE_NEWUTS, "CLONE_NEWIPC": unix.CLONE_NEWIPC,
 		"CLONE_NEWUSER": unix.CLONE_NEWUSER, "CLONE_NEWPID": unix.CLONE_NEWPID, "CLONE_NEWNET": unix.CLONE_NEWNET,
-		"CLONE_NEWCGROUP": unix.CLONE_NEWCGROUP,
+		"CLONE_NEWCGROUP": unix.CLONE_NEWCGROUP, "CLONE_PARENT": unix.CLONE_PARENT,
 	} {
 		check("clone "+name, seccompAuditArch, unix.SYS_CLONE, flag|sigchld, seccompDeny)
 	}
-	for _, nr := range deniedSyscalls {
+	check("prlimit64 self", seccompAuditArch, unix.SYS_PRLIMIT64, 0, allow)
+	check("prlimit64 other", seccompAuditArch, unix.SYS_PRLIMIT64, 4242, seccompDeny)
+	check("prlimit64 other, high bits", seccompAuditArch, unix.SYS_PRLIMIT64, 1<<32|4242, seccompDeny)
+	for _, nr := range append(append([]uint32(nil), deniedSyscalls...), seccompArchDenied...) {
 		check(fmt.Sprintf("syscall %d", nr), seccompAuditArch, nr, 0, seccompDeny)
+	}
+	for name, nr := range map[string]uint32{"fchmodat": unix.SYS_FCHMODAT, "setpriority": unix.SYS_SETPRIORITY, "sched_setaffinity": unix.SYS_SCHED_SETAFFINITY} {
+		check(name, seccompAuditArch, nr, 0, seccompDeny)
 	}
 	check("i386 read", unix.AUDIT_ARCH_I386, unix.SYS_READ, 0, seccompDeny)
 	if runtime.GOARCH == "amd64" {

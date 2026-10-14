@@ -15,7 +15,7 @@ import (
 func probeSandboxSupport() sandboxSupport {
 	reason := "the worker sandbox is implemented for linux/arm64 and linux/amd64 only (this is " +
 		runtime.GOOS + "/" + runtime.GOARCH + ")"
-	return sandboxSupport{reason: reason, seccompReason: reason}
+	return sandboxSupport{reason: reason, seccompReason: reason, definite: true}
 }
 
 // startSandboxed is never reached: probeSandboxSupport reports no Landlock.

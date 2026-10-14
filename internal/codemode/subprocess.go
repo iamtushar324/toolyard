@@ -243,10 +243,15 @@ func startConfined(cmd *exec.Cmd, exe string, mode SandboxMode) (err error) {
 	}
 	support := sandboxSupported()
 	logSandboxOnce(support)
-	if support.abi == 0 {
-		if mode == SandboxRequired {
+	if mode == SandboxRequired {
+		switch {
+		case support.abi == 0:
 			return fmt.Errorf("the worker sandbox is required, but Landlock is unavailable: %s", support.reason)
+		case !support.seccomp:
+			return fmt.Errorf("the worker sandbox is required, but no seccomp filter can be installed: %s", support.seccompReason)
 		}
+	}
+	if support.abi == 0 && !support.seccomp {
 		return cmd.Start()
 	}
 	if err := startSandboxed(cmd, exe, support); err != nil {
@@ -258,12 +263,20 @@ func startConfined(cmd *exec.Cmd, exe string, mode SandboxMode) (err error) {
 var sandboxLogOnce sync.Once
 
 // logSandboxOnce records, once per process, what confinement workers get.
+// A failed probe, which is retried, is logged each time.
 func logSandboxOnce(s sandboxSupport) {
+	if !s.definite {
+		logx.For("codemode").Warn("code-mode sandbox probe failed; the next script probes again", "reason", s.reason)
+		return
+	}
 	sandboxLogOnce.Do(func() {
 		lg := logx.For("codemode")
 		switch {
-		case s.abi == 0:
+		case s.abi == 0 && !s.seccomp:
 			lg.Warn("code-mode worker sandbox unavailable; scripts run with resource limits only (or are refused when the sandbox is required)",
+				"reason", s.reason, "seccomp", s.seccompReason)
+		case s.abi == 0:
+			lg.Warn("code-mode worker sandbox: seccomp filter only, no Landlock (scripts are refused when the sandbox is required)",
 				"reason", s.reason)
 		case !s.seccomp:
 			lg.Warn("code-mode worker sandbox: Landlock only, no seccomp filter", "landlock_abi", s.abi, "seccomp", s.seccompReason)

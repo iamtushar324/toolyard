@@ -480,9 +480,11 @@ func (s *Server) health(w http.ResponseWriter, r *http.Request) {
 		// codemode_sandbox is how code-mode script workers are confined:
 		// "landlock-abi-<n>", plus "+seccomp" when a seccomp filter is
 		// applied and " (signals unscoped)" below Landlock ABI 6;
-		// "none: <reason>", plus " (sandbox required: scripts are
-		// refused)" in required mode; "off"; or "probing" until the kernel
-		// probe started at boot is done. It never waits for that probe.
+		// "seccomp-only: <reason>" without Landlock; "none: <reason>"
+		// with neither; " (sandbox required: scripts are refused)"
+		// appended in required mode when either is missing; "off"; or
+		// "probing" until the kernel probe started at boot is done. It
+		// never waits for that probe.
 		"codemode_sandbox": codemode.SandboxStatus(),
 	}
 	if s.metricsRecorder != nil {

@@ -21,3 +21,14 @@ func seccompABIChecks() []unix.SockFilter {
 		bpfStmt(unix.BPF_RET|unix.BPF_K, seccompDeny),
 	}
 }
+
+// seccompArchDenied adds to deniedSyscalls the legacy metadata calls
+// only x86-64's table has.
+var seccompArchDenied = []uint32{
+	unix.SYS_CHMOD,
+	unix.SYS_CHOWN,
+	unix.SYS_LCHOWN,
+	unix.SYS_UTIME,
+	unix.SYS_UTIMES,
+	unix.SYS_FUTIMESAT,
+}
