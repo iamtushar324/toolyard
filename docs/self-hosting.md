@@ -699,7 +699,7 @@ probes; every other path is a 404. The main listener never serves
 | `toolyard_inflight_executions` | gauge | tool executions running now |
 | `toolyard_audit_write_failures_total{stage}` | counter | audit records not written: `intent`, `outcome`, `approval` |
 | `toolyard_executions_outcome_unknown_total{path,cause}` | counter | executions that may have run but have no recorded result (`path` is `inbox` or `legacy`) |
-| `toolyard_goroutine_panics_total{loop}` | counter | panics recovered in background loops |
+| `toolyard_goroutine_panics_total{loop}` | counter | panics recovered in background loops and goroutines; `loop="codemode-nested-call"` counts a tool that panicked during a code-mode script |
 | `toolyard_loop_last_success_timestamp_seconds{loop}` | gauge | last successful pass of each background loop |
 | `toolyard_legacy_sync_last_success_timestamp_seconds` | gauge | last successful legacy approval sync into the Inbox (0 = never) |
 | `toolyard_legacy_sync_failures_total` | counter | failed legacy approval syncs |

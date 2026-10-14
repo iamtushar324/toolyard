@@ -91,7 +91,7 @@ toolyard_audit_write_failures_total{stage="outcome"} 0
 # HELP toolyard_executions_outcome_unknown_total Executions whose outcome is unknown (they may have run), by path and cause.
 # TYPE toolyard_executions_outcome_unknown_total counter
 toolyard_executions_outcome_unknown_total{path="legacy",cause="shutdown_deadline"} 1
-# HELP toolyard_goroutine_panics_total Panics recovered in supervised background loops, by loop.
+# HELP toolyard_goroutine_panics_total Panics recovered in background loops and goroutines, by loop.
 # TYPE toolyard_goroutine_panics_total counter
 toolyard_goroutine_panics_total{loop="telegram-poller"} 1
 # HELP toolyard_loop_last_success_timestamp_seconds Last successful pass of each supervised background loop, in Unix seconds.

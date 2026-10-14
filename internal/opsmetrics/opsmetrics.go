@@ -201,7 +201,7 @@ func newRegistry(state *ops.State, start time.Time, now func() time.Time, gorout
 	r.outcomeUnknown = newFamily("toolyard_executions_outcome_unknown_total", typeCounter,
 		"Executions whose outcome is unknown (they may have run), by path and cause.", "path", "cause")
 	r.goroutinePanics = newFamily("toolyard_goroutine_panics_total", typeCounter,
-		"Panics recovered in supervised background loops, by loop.", "loop")
+		"Panics recovered in background loops and goroutines, by loop.", "loop")
 	r.loopLastSuccess = newFamily("toolyard_loop_last_success_timestamp_seconds", typeGauge,
 		"Last successful pass of each supervised background loop, in Unix seconds.", "loop")
 	r.legacySyncLast = newFamily("toolyard_legacy_sync_last_success_timestamp_seconds", typeGauge,
@@ -247,7 +247,8 @@ func SetDBPinger(ping func(context.Context) error) { std.pinger.Store(pingerBox{
 // stage is "intent", "outcome" or "approval".
 func IncAuditWriteFailure(stage string) { std.auditFailures.with(stage).inc() }
 
-// IncGoroutinePanic counts a panic recovered in a supervised loop.
+// IncGoroutinePanic counts a panic recovered in a background loop or
+// goroutine (codemode-nested-call: a tool called from a code-mode script).
 func IncGoroutinePanic(loop string) { std.goroutinePanics.with(loop).inc() }
 
 // SetLoopLastSuccess records the last successful pass of a supervised loop.
