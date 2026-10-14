@@ -820,6 +820,10 @@ func TestConnectT3RotationKillsPendingEnrollment(t *testing.T) {
 	e := newConnectEnv(t)
 	ctx := context.Background()
 	first := e.connect(t, e.fc.token(nil))
+	// Newest is by created_at in milliseconds; on Postgres the random id
+	// breaks a tie, so keep the pending agent out of the first one's
+	// millisecond.
+	time.Sleep(2 * time.Millisecond)
 	code, pending, err := e.id.CreateEnrollment(ctx, first.UserID, connectT3AgentName, time.Hour)
 	if err != nil {
 		t.Fatal(err)

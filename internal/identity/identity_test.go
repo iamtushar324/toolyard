@@ -306,7 +306,7 @@ func TestRotateClearsPendingEnrollment(t *testing.T) {
 
 // Agents created in the same millisecond list in a fixed order: id
 // descending (Postgres has no rowid, so insertion order is not kept).
-func TestListAgentsTiesBreakByID(t *testing.T) {
+func TestListAgentsTieBreak(t *testing.T) {
 	s, owner := newTestIdentity(t)
 	ctx := context.Background()
 	var ids []string
@@ -325,13 +325,21 @@ func TestListAgentsTiesBreakByID(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	sort.Sort(sort.Reverse(sort.StringSlice(ids)))
-	if len(got) != len(ids) {
-		t.Fatalf("ListAgents returned %d agents, want %d", len(got), len(ids))
+	// SQLite: newest inserted first (rowid). Postgres: id descending.
+	want := make([]string, len(ids))
+	for i := range ids {
+		want[i] = ids[len(ids)-1-i]
+	}
+	if s.db.Dialect.IsPostgres() {
+		copy(want, ids)
+		sort.Sort(sort.Reverse(sort.StringSlice(want)))
+	}
+	if len(got) != len(want) {
+		t.Fatalf("ListAgents returned %d agents, want %d", len(got), len(want))
 	}
 	for i, a := range got {
-		if a.ID != ids[i] {
-			t.Fatalf("ListAgents[%d] = %s, want %s (id descending on a created_at tie)", i, a.ID, ids[i])
+		if a.ID != want[i] {
+			t.Fatalf("ListAgents[%d] = %s, want %s on a created_at tie", i, a.ID, want[i])
 		}
 	}
 }

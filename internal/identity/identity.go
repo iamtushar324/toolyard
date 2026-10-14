@@ -1044,14 +1044,19 @@ func nullStr(s string) any {
 }
 
 // ListAgents returns the owner's agents, newest first. created_at is in
-// milliseconds, so the id (descending) breaks ties: "newest" must be well
-// defined for callers that pick the first match. Ids are random, so among
-// agents created in the same millisecond the order is fixed but not the
-// insertion order (Postgres has no rowid).
+// milliseconds, so a second key breaks ties: "newest" must be well defined
+// for callers that pick the first match (connect rotates the newest bkt3
+// agent). SQLite keeps the insertion order (rowid). Postgres has no rowid,
+// so there the random id decides between agents of the same millisecond:
+// fixed, but not the insertion order.
 func (s *Service) ListAgents(ctx context.Context, ownerUserID string) ([]Agent, error) {
+	tieBreak := "rowid DESC"
+	if s.db.Dialect.IsPostgres() {
+		tieBreak = "id DESC"
+	}
 	rows, err := s.db.QueryContext(ctx,
 		`SELECT id, name, owner_user, COALESCE(last_seen, 0), COALESCE(disabled, 0), kind
-         FROM agents WHERE owner_user = ? ORDER BY created_at DESC, id DESC`, ownerUserID)
+         FROM agents WHERE owner_user = ? ORDER BY created_at DESC, `+tieBreak, ownerUserID)
 	if err != nil {
 		return nil, err
 	}
