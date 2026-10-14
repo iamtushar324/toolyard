@@ -384,7 +384,7 @@ func (g *Gateway) inboxTools() []toolEntry {
 	requestProps["facts"] = schemaFacts
 	requestProps["task"] = map[string]any{"type": "object", "required": []string{"objective"}, "properties": map[string]any{"objective": map[string]any{"type": "string", "description": "The concrete task this batch advances."}, "title": map[string]any{"type": "string"}, "url": map[string]any{"type": "string"}}}
 	requestProps["pending_ttl_seconds"] = map[string]any{"type": "integer", "minimum": 60, "maximum": 604800, "description": "Pending decision deadline. Default24 hours, bounded by administrator policy. Distinct from grant TTL."}
-	requestProps["client_request_id"] = map[string]any{"type": "string", "maxLength": 128, "description": "Stable retry key for this agent request."}
+	requestProps["client_request_id"] = map[string]any{"type": "string", "maxLength": 128, "description": "Stable retry key for this agent request: printable ASCII, no backslash."}
 	requestProps["callback_ref"] = map[string]any{"type": "string", "description": "Opaque authorized receiver reference. A callback announces the complete decision without grant tokens."}
 	requestProps["ttl_seconds"] = map[string]any{"type": "integer", "minimum": inbox.MinTTL, "maximum": inbox.MaxTTL, "description": "How long grants last once approved. Default 1800."}
 	requestProps["tools"] = map[string]any{
@@ -424,7 +424,7 @@ func (g *Gateway) inboxTools() []toolEntry {
 		}},
 	}
 	askProps["schema_version"] = map[string]any{"type": "integer", "enum": []int{1, 2}}
-	askProps["client_request_id"] = map[string]any{"type": "string", "maxLength": 128, "description": "Stable retry key, unique per agent and question."}
+	askProps["client_request_id"] = map[string]any{"type": "string", "maxLength": 128, "description": "Stable retry key, unique per agent and question: printable ASCII, no backslash."}
 	askProps["prompt"] = map[string]any{"type": "string", "maxLength": 1000}
 	askProps["context"] = map[string]any{"type": "string", "maxLength": 3000}
 	askProps["blocking"] = map[string]any{"type": "boolean"}

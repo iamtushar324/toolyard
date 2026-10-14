@@ -131,12 +131,18 @@ func Copy(ctx context.Context, src *sql.DB, srcBlobDir string, dst *store.DB, op
 		if err := dst.MigratePostgres(ctx); err != nil {
 			return rep, fmt.Errorf("db copy: create the toolyard tables in the empty target: %w", err)
 		}
+		// From here on the target holds the empty schema, so a refusal must
+		// not say that nothing was written. A source table or column that
+		// this version's schema lacks is the only way to get here.
 		if p, err = buildPlan(ctx, stx, dst); err != nil {
-			return rep, fmt.Errorf("db copy: %w", err)
+			rep.problemf("the empty toolyard schema was created in the target (no rows); fix the source and run db copy again")
+			return rep, fmt.Errorf("db copy: the empty toolyard schema was created in the target, but no rows were copied: %w", err)
 		}
 		p.fill(rep)
 		if err := p.refusal(); err != nil {
-			return rep, err
+			rep.problemf("the empty toolyard schema was created in the target (no rows); fix the source and run db copy again")
+			return rep, fmt.Errorf("db copy: the empty toolyard schema was created in the target, but no rows were copied: %s",
+				strings.TrimPrefix(err.Error(), "db copy: refused, nothing was written: "))
 		}
 	}
 	if len(blobs) > 0 && len(p.BlobTables) != len(blobTables) {

@@ -58,7 +58,7 @@ var errBadPostgresURL error = &configError{msg: "store: the database URL cannot 
 // errAtInHost is a URL whose password holds an unescaped @: the parser
 // takes the first @ as the end of the password, so the rest of the password
 // would become part of the host name (and reach the logs).
-var errAtInHost error = &configError{msg: "store: the database URL has more than one @ before the host; percent-encode @ in the password as %40"}
+var errAtInHost error = &configError{msg: "store: the database URL does not parse into user, password, host and database; percent-encode @ (%40), / (%2F), : (%3A) and # (%23) in the password"}
 
 func parsePostgresURL(url string) (*pgx.ConnConfig, error) {
 	url = strings.TrimSpace(url)
@@ -83,6 +83,11 @@ func parsePostgresURL(url string) (*pgx.ConnConfig, error) {
 		if strings.Contains(h, "@") {
 			return nil, errAtInHost
 		}
+	}
+	// A '/' in the password ends the host part early: the rest, '@' and
+	// all, becomes the database name, which the logs show.
+	if strings.Contains(cfg.Database, "@") {
+		return nil, errAtInHost
 	}
 	return cfg, nil
 }
@@ -179,11 +184,17 @@ func (db *DB) MigratePostgres(ctx context.Context) error {
 // with en_US.UTF-8 unless told otherwise. datlocprovider exists from
 // Postgres 15 on; to_jsonb reads it as NULL on older servers.
 func checkCollation(ctx context.Context, q Querier) error {
-	var collate, ctype, provider string
-	err := q.QueryRowContext(ctx, `SELECT datcollate::text, datctype::text, COALESCE(to_jsonb(d) ->> 'datlocprovider', 'c')
-		FROM pg_database d WHERE datname = current_database()`).Scan(&collate, &ctype, &provider)
+	var collate, ctype, provider, encoding string
+	err := q.QueryRowContext(ctx, `SELECT datcollate::text, datctype::text, COALESCE(to_jsonb(d) ->> 'datlocprovider', 'c'), pg_encoding_to_char(encoding)::text
+		FROM pg_database d WHERE datname = current_database()`).Scan(&collate, &ctype, &provider, &encoding)
 	if err != nil {
 		return fmt.Errorf("store: read the database collation: %w", err)
+	}
+	if encoding != "UTF8" {
+		// jsonb in SQL_ASCII refuses every \u escape above U+007F, and
+		// text must hold any UTF-8 a client sends.
+		return &configError{msg: fmt.Sprintf("store: the database encoding is %q; toolyard needs UTF8. Create it with: "+
+			"CREATE DATABASE <name> TEMPLATE template0 ENCODING 'UTF8' LC_COLLATE 'C' LC_CTYPE 'C'", encoding)}
 	}
 	if cLocale(collate) && cLocale(ctype) && provider != "i" {
 		return nil

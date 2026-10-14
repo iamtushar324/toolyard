@@ -186,3 +186,27 @@ func TestRequestWithNULCharacterSubmitsAndDecides(t *testing.T) {
 		t.Fatalf("status still pending after the denial")
 	}
 }
+
+// A client_request_id is plain printable ASCII: a NUL cannot travel as a
+// Postgres text parameter, and the replay lookup maps the \u0000 escape,
+// so anything else would compare differently on the two engines.
+func TestClientRequestIDMustBePlainASCII(t *testing.T) {
+	e := newEnv(t)
+	ctx := context.Background()
+	for _, id := range []string{`a\u0000`, "a\x00b", "naïve", "tab\there"} {
+		s := deploySubmission()
+		s.ClientRequestID = id
+		res, err := e.svc.Submit(ctx, "ag_1", s)
+		if err != nil {
+			t.Fatalf("%q: %v", id, err)
+		}
+		if res.OK || len(res.Problems) == 0 || res.Problems[0].Path != "client_request_id" {
+			t.Fatalf("%q accepted: %+v", id, res)
+		}
+	}
+	s := deploySubmission()
+	s.ClientRequestID = "deploy-2026-10-14_v2.1"
+	if res, err := e.svc.Submit(ctx, "ag_1", s); err != nil || !res.OK {
+		t.Fatalf("plain id refused: %+v %v", res, err)
+	}
+}

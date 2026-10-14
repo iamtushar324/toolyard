@@ -183,6 +183,7 @@ func TestPostgresTargetRefusesMalformedURLs(t *testing.T) {
 		"unescaped @ in the password": "postgres://toolyard:s3cret@pw@db.example.invalid:5432/toolyard",
 		"unescaped / in the password": "postgres://toolyard:s3cret/pw@db.example.invalid:5432/toolyard",
 		"bad port":                    "postgres://toolyard:s3cret-pw@db.example.invalid:54x2/toolyard",
+		"/ after a numeric password":  "postgres://toolyard:8080/s3cret@db.example.invalid:5432/toolyard",
 		"not a postgres URL":          "mysql://toolyard:s3cret-pw@db.example.invalid/toolyard",
 	} {
 		_, _, err := PostgresTarget(url)

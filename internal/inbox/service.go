@@ -306,6 +306,12 @@ func (s *Service) Submit(ctx context.Context, agentID string, sub *Submission) (
 	s.submitMu.Lock()
 	defer s.submitMu.Unlock()
 	fingerprint := hashJSON(sub)
+	if problem := clientRequestIDProblem(sub.ClientRequestID); problem != "" {
+		// Checked before the replay lookup: a NUL cannot travel as a
+		// Postgres text parameter, and the lookup expression maps the
+		// \u0000 escape, so only plain IDs compare the same on both engines.
+		return &SubmitResult{DryRun: sub.DryRun, Problems: []Problem{{"client_request_id", problem}}, Flags: []ToolFlag{}}, nil
+	}
 	if sub.ClientRequestID != "" && !sub.DryRun {
 		replay, err := s.replayClientRequest(ctx, agentID, sub.ClientRequestID, fingerprint)
 		if err == nil {
@@ -440,6 +446,20 @@ func (s *Service) Submit(ctx context.Context, agentID string, sub *Submission) (
 		s.backgroundCheck(context.Background(), id)
 	}(r.ID)
 	return res, nil
+}
+
+// clientRequestIDProblem returns why id is not a usable client_request_id
+// ("" when it is): at most 128 bytes of printable ASCII without a backslash.
+func clientRequestIDProblem(id string) string {
+	if len(id) > 128 {
+		return "max 128 bytes"
+	}
+	for i := 0; i < len(id); i++ {
+		if c := id[i]; c < 0x20 || c > 0x7e || c == '\\' {
+			return "use printable ASCII characters other than a backslash"
+		}
+	}
+	return ""
 }
 
 // replayClientRequest answers a retry of a stored submission: the stored
