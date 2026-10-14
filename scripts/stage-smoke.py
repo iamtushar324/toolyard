@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """Verify Toolyard through HTTPS/MCP using pre-existing synthetic fixtures.
 
-This script does not seed a database or create credentials. --base-url must be
-an explicitly authorized deployment with the sandbox-files/sandbox-errors tools.
-Secrets and grant tokens stay in memory and never enter the output artifact.
+This script does not seed a database. It creates one temporary local connection
+credential for the dashboard handoff check and revokes it before it continues.
+--base-url must be an explicitly authorized deployment with the
+sandbox-files/sandbox-errors tools. Secrets, handoff links and grant tokens stay
+in memory and never enter the output artifact.
 """
 import argparse
 import json
@@ -14,6 +16,8 @@ import uuid
 import requests
 
 DEFAULT_BASE = 'https://toolyard.stage.dev.beknown.live'
+# The dashboard session cookie (sessionCookieName in internal/api/api.go).
+SESSION_COOKIE = 'toolyard_session'
 
 
 def access_request(calls, title='Verify synthetic Inbox decisions'):
@@ -48,6 +52,39 @@ def content(result):
     if 'structuredContent' in result:
         return result['structuredContent']
     return json.loads(next(item['text'] for item in result['content'] if item['type'] == 'text'))
+
+
+def check_handoff_link(base, bootstrap_token):
+    """A handoff link opens the Inbox once and never signs a browser in.
+
+    Exchanges the bootstrap agent key for a temporary local connection with a
+    fresh environment ID, asks for a handoff link with it, opens the link with
+    no cookies and no redirects, and revokes the connection at the end.
+    """
+    instance = requests.get(base + '/.well-known/toolyard-instance', timeout=15, allow_redirects=False)
+    instance.raise_for_status()
+    exchange = requests.post(base + '/v1/connections/api-key', timeout=15, allow_redirects=False,
+                             headers={'Authorization': 'Bearer ' + bootstrap_token},
+                             json={'environment_id': 'stage-smoke-' + str(uuid.uuid4()), 'local_user_id': 'stage-smoke',
+                                   'instance_id': instance.json()['instance_id'], 'expected_version': 0})
+    assert exchange.status_code == 200, 'Local connection exchange failed'
+    derived = {'Authorization': 'Bearer ' + exchange.json()['token']}
+    try:
+        minted = requests.post(base + '/v1/connections/handoff', headers=derived, json={}, timeout=15, allow_redirects=False)
+        assert minted.status_code == 200, 'Handoff link was not issued'
+        link = minted.json()['url']
+        target = urllib.parse.urlsplit(link)
+        assert target.scheme + '://' + target.netloc == base and target.path == '/connections/handoff', 'Handoff link points to another location'
+        # Each module-level requests call uses a new, empty cookie jar: a
+        # browser that is not signed in.
+        opened = requests.get(link, timeout=15, allow_redirects=False)
+        assert opened.status_code == 303 and opened.headers.get('Location') == '/#inbox', 'Handoff link must redirect to the Inbox'
+        assert SESSION_COOKIE not in opened.headers.get('Set-Cookie', '') and not opened.cookies, 'Handoff link must not set a session cookie'
+        replay = requests.get(link, timeout=15, allow_redirects=False)
+        assert replay.status_code == 401, 'Handoff link must work only once'
+    finally:
+        revoked = requests.post(base + '/v1/connections/revoke', headers=derived, json={}, timeout=15, allow_redirects=False)
+        assert revoked.status_code == 200, 'Temporary local connection was not revoked'
 
 
 def main():
@@ -123,6 +160,8 @@ def main():
     invalid = request(owner, 'POST', '/v1/inbox/missing/decide', json={'action': 'deny'}, headers={'Origin': 'https://wrong.example'})
     assert invalid.status_code == 403
     checks.append('Cross-origin mutation refused')
+    check_handoff_link(base, credential['agent_token'])
+    checks.append('Handoff link opens the Inbox once and sets no session cookie')
     servers_response = request(owner, 'GET', '/v1/servers')
     servers_response.raise_for_status()
     fixtures = {item['name']: item for item in servers_response.json() if item['name'] in {'sandbox-files', 'sandbox-errors'}}

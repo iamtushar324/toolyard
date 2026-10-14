@@ -96,8 +96,9 @@ func TestLocalConnectionRoutesAndPullOwnership(t *testing.T) {
 	if err != nil || target.Host != "toolyard.example" || target.Path != "/connections/handoff" {
 		t.Fatal("handoff destination")
 	}
+	// The link opens the Inbox; it never signs the browser in.
 	got = call("", http.MethodGet, target.RequestURI(), nil)
-	if got.Code != 303 || got.Header().Get("Location") != "/#inbox" || len(got.Result().Cookies()) == 0 {
+	if got.Code != 303 || got.Header().Get("Location") != "/#inbox" || len(got.Result().Cookies()) != 0 {
 		t.Fatal("handoff consume", got.Code)
 	}
 	got = call("", http.MethodGet, target.RequestURI(), nil)

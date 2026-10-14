@@ -222,9 +222,6 @@ func (s *Server) hostHandoff(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 401, "handoff_expired_or_used")
 		return
 	}
-	if s.issueSession(w, r, user) != nil {
-		writeError(w, 500, "session_failed")
-		return
-	}
-	http.Redirect(w, r, "/#inbox", http.StatusSeeOther)
+	// The link opens the Inbox; it never signs this browser in.
+	s.openHandoff(w, r, user, handoffSourceHost)
 }
