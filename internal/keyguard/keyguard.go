@@ -37,6 +37,7 @@ import (
 	"time"
 
 	"github.com/tusharbhardwaj/toolyard/internal/sealbox"
+	"github.com/tusharbhardwaj/toolyard/internal/store"
 )
 
 // Mode is the -keys flag.
@@ -109,6 +110,8 @@ func configErrorf(format string, args ...any) error {
 type Config struct {
 	// DB holds the key_canaries table and the sealed rows.
 	DB *sql.DB
+	// Dialect is DB's SQL engine; the zero value is SQLite.
+	Dialect store.Dialect
 	// DataDir is the data directory (-data): the last place searched and
 	// the only place a key is created.
 	DataDir string
@@ -213,7 +216,7 @@ func LoadAll(ctx context.Context, cfg Config, specs []Spec) (map[string][]byte, 
 		if ok {
 			continue
 		}
-		d, err := checkSealedData(ctx, cfg.DB, l.spec.Name, l.key)
+		d, err := checkSealedData(ctx, cfg.DB, cfg.Dialect, l.spec.Name, l.key)
 		if err != nil {
 			return nil, err
 		}
@@ -237,7 +240,7 @@ func LoadAll(ctx context.Context, cfg Config, specs []Spec) (map[string][]byte, 
 		}
 		var sealed []string
 		if len(canaries) == 0 {
-			if sealed, err = sealedTables(ctx, cfg.DB); err != nil {
+			if sealed, err = sealedTables(ctx, cfg.DB, cfg.Dialect); err != nil {
 				return nil, err
 			}
 		}
@@ -329,6 +332,39 @@ func LoadAll(ctx context.Context, cfg Config, specs []Spec) (map[string][]byte, 
 	return out, nil
 }
 
+// ReadKeys reads the key files named in specs for a read-only tool
+// (toolyard db verify): the same search order ($CREDENTIALS_DIRECTORY,
+// CredentialsDir, DataDir), whitespace trimming and decoding as LoadAll. It
+// never creates a key, never writes a canary and never touches the
+// database: cfg.DB, cfg.Dialect and cfg.Mode are ignored, and no canary is
+// checked (the caller compares what it needs). A copy that exists but
+// cannot be read or decoded is an error, as in LoadAll. A missing key is an
+// error too, unless its spec is Recreatable (the session key seals
+// nothing); a missing recreatable key is left out of the map. Every error
+// matches ErrConfig and names paths, never key material.
+func ReadKeys(cfg Config, specs []Spec) (map[string][]byte, error) {
+	dirs := cfg.SearchDirs()
+	out := make(map[string][]byte, len(specs))
+	var missing []string
+	for _, sp := range specs {
+		key, _, err := find(cfg, sp.Name, dirs)
+		if err != nil {
+			return nil, err
+		}
+		if key == nil {
+			if !sp.Recreatable {
+				missing = append(missing, fmt.Sprintf("%s (tried %s)", sp.Name, triedPaths(sp.Name, dirs)))
+			}
+			continue
+		}
+		out[sp.Name] = key
+	}
+	if len(missing) > 0 {
+		return nil, configErrorf("key %s not found; nothing was created", strings.Join(missing, "; "))
+	}
+	return out, nil
+}
+
 // find returns the first copy of name in dirs. A copy that exists but
 // cannot be read or decoded is an error; a missing key is (nil, "", nil).
 func find(cfg Config, name string, dirs []string) ([]byte, string, error) {
@@ -416,32 +452,31 @@ var sealedColumns = []struct{ table, where string }{
 // does not exist (an older schema, before its migration) holds none. Any
 // other query error is returned: an unknown state is never treated as
 // fresh.
-func sealedTables(ctx context.Context, db *sql.DB) ([]string, error) {
+func sealedTables(ctx context.Context, db *sql.DB, d store.Dialect) ([]string, error) {
 	var out []string
 	for _, c := range sealedColumns {
-		ok, err := tableExists(ctx, db, c.table)
+		ok, err := tableExists(ctx, db, d, c.table)
 		if err != nil {
 			return nil, fmt.Errorf("keyguard: check %s for sealed rows: %w", c.table, err)
 		}
 		if !ok {
 			continue
 		}
-		var n int
+		var has bool
 		q := `SELECT EXISTS(SELECT 1 FROM ` + c.table + ` WHERE ` + c.where + `)`
-		if err := db.QueryRowContext(ctx, q).Scan(&n); err != nil {
+		if err := db.QueryRowContext(ctx, q).Scan(&has); err != nil {
 			return nil, fmt.Errorf("keyguard: check %s for sealed rows: %w", c.table, err)
 		}
-		if n != 0 {
+		if has {
 			out = append(out, c.table)
 		}
 	}
 	return out, nil
 }
 
-func tableExists(ctx context.Context, db *sql.DB, table string) (bool, error) {
-	var n int
-	err := db.QueryRowContext(ctx, `SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = ?`, table).Scan(&n)
-	return n > 0, err
+// tableExists reports whether table exists, on either engine.
+func tableExists(ctx context.Context, db *sql.DB, d store.Dialect, table string) (bool, error) {
+	return store.TableExists(ctx, db, d, table)
 }
 
 const canaryPlaintext = "toolyard key canary v1"
@@ -471,6 +506,11 @@ func sealCanary(name string, key []byte) ([]byte, error) {
 	}
 	return []byte(s), nil
 }
+
+// CanaryMatches reports whether key opens blob, a key_canaries.check_blob
+// written for the key named name: the key is the one the database was set
+// up with.
+func CanaryMatches(name string, key, blob []byte) bool { return openCanary(name, key, blob) }
 
 func openCanary(name string, key, blob []byte) bool {
 	c, err := sealbox.NewCipher(key)

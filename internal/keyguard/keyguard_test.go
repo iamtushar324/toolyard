@@ -15,6 +15,7 @@ import (
 
 	"github.com/tusharbhardwaj/toolyard/internal/sealbox"
 	"github.com/tusharbhardwaj/toolyard/internal/store"
+	"github.com/tusharbhardwaj/toolyard/internal/store/storetest"
 )
 
 type env struct {
@@ -27,17 +28,13 @@ type env struct {
 
 func newEnv(t *testing.T) *env {
 	t.Helper()
-	db, err := store.Open(filepath.Join(t.TempDir(), "keys.db"))
-	if err != nil {
-		t.Fatalf("open db: %v", err)
-	}
-	t.Cleanup(func() { _ = db.Close() })
-	return &env{db: db, dataDir: t.TempDir()}
+	return &env{db: storetest.Open(t), dataDir: t.TempDir()}
 }
 
 func (e *env) cfg(mode Mode) Config {
 	return Config{
 		DB:             e.db.DB,
+		Dialect:        e.db.Dialect,
 		DataDir:        e.dataDir,
 		CredentialsDir: e.creds,
 		Mode:           mode,
@@ -377,11 +374,11 @@ func TestSealedTablesMatchTheSchema(t *testing.T) {
 	// a misspelt table name would be skipped silently: every listed table
 	// must exist once the migrations ran.
 	for _, c := range sealedColumns {
-		if ok, err := tableExists(context.Background(), e.db.DB, c.table); err != nil || !ok {
+		if ok, err := tableExists(context.Background(), e.db.DB, e.db.Dialect, c.table); err != nil || !ok {
 			t.Fatalf("sealed table %s is not in the schema (%v)", c.table, err)
 		}
 	}
-	got, err := sealedTables(context.Background(), e.db.DB)
+	got, err := sealedTables(context.Background(), e.db.DB, e.db.Dialect)
 	if err != nil || len(got) != 0 {
 		t.Fatalf("fresh database: %v %v", got, err)
 	}
@@ -389,13 +386,13 @@ func TestSealedTablesMatchTheSchema(t *testing.T) {
 	if _, err := e.db.Exec(`INSERT INTO system_settings(key, value, updated_at) VALUES('telegram_bot_token', '""', 1)`); err != nil {
 		t.Fatal(err)
 	}
-	if got, _ := sealedTables(context.Background(), e.db.DB); len(got) != 0 {
+	if got, _ := sealedTables(context.Background(), e.db.DB, e.db.Dialect); len(got) != 0 {
 		t.Fatalf("cleared bot token counted as sealed: %v", got)
 	}
 	if _, err := e.db.Exec(`UPDATE system_settings SET value = '"c2VhbGVk"' WHERE key = 'telegram_bot_token'`); err != nil {
 		t.Fatal(err)
 	}
-	got, err = sealedTables(context.Background(), e.db.DB)
+	got, err = sealedTables(context.Background(), e.db.DB, e.db.Dialect)
 	if err != nil || len(got) != 1 || got[0] != "system_settings" {
 		t.Fatalf("sealed bot token: %v %v", got, err)
 	}

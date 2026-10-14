@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"path/filepath"
 	"strings"
+
+	"github.com/tusharbhardwaj/toolyard/internal/store"
 )
 
 // Check statuses, one per key.
@@ -47,7 +49,7 @@ func Check(ctx context.Context, cfg Config, specs []Spec) ([]KeyReport, error) {
 	canaries := map[string]canary{}
 	var sealed []string
 	if cfg.DB != nil {
-		if canaries, sealed, err = readState(ctx, cfg.DB); err != nil {
+		if canaries, sealed, err = readState(ctx, cfg.DB, cfg.Dialect); err != nil {
 			return nil, configErrorf("cannot read the database: %v", err)
 		}
 	}
@@ -99,7 +101,7 @@ func checkOne(ctx context.Context, cfg Config, sp Spec, mode Mode, dirs []string
 			r.Status, r.Detail = StatusOK, found+"; no canary yet: adopted on the next start"
 		default:
 			// As LoadAll: adopted only if it opens the data sealed with it.
-			d, err := checkSealedData(ctx, cfg.DB, sp.Name, key)
+			d, err := checkSealedData(ctx, cfg.DB, cfg.Dialect, sp.Name, key)
 			switch {
 			case err != nil:
 				r.Status, r.Detail = StatusFail, found+fmt.Sprintf("; cannot check it against the data: %v", err)
@@ -137,9 +139,9 @@ func checkOne(ctx context.Context, cfg Config, sp Spec, mode Mode, dirs []string
 
 // readState reads the canaries (none when the table does not exist yet)
 // and the tables that hold sealed rows.
-func readState(ctx context.Context, db *sql.DB) (map[string]canary, []string, error) {
+func readState(ctx context.Context, db *sql.DB, d store.Dialect) (map[string]canary, []string, error) {
 	canaries := map[string]canary{}
-	ok, err := tableExists(ctx, db, "key_canaries")
+	ok, err := tableExists(ctx, db, d, "key_canaries")
 	if err != nil {
 		return nil, nil, err
 	}
@@ -148,7 +150,7 @@ func readState(ctx context.Context, db *sql.DB) (map[string]canary, []string, er
 			return nil, nil, err
 		}
 	}
-	sealed, err := sealedTables(ctx, db)
+	sealed, err := sealedTables(ctx, db, d)
 	if err != nil {
 		return nil, nil, err
 	}
