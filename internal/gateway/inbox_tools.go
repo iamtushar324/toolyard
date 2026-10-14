@@ -51,7 +51,7 @@ func (g *Gateway) inboxMode() bool {
 // nearby-restricted hints never name a server the agent wasn't granted.
 // It is the routing decision (decide) for a call with these arguments and
 // no declared intent, so an overridable deny and an escalating argument
-// (lake.ingest mode=replace) read here as they would route.
+// read here as they would route.
 func (g *Gateway) Access(ctx context.Context, agentID, tool string, args map[string]any) (string, string) {
 	g.mu.RLock()
 	entry, ok := g.tools[tool]

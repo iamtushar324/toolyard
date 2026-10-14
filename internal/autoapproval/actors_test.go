@@ -93,7 +93,7 @@ func TestRuleSetToolPolicyBy_RecordsActor(t *testing.T) {
 		t.Fatalf("re-enable: created_by=%q enabled_by=%q, want u_one/u_two", got.CreatedBy, got.EnabledBy)
 	}
 	// The actor-less wrapper still works and leaves the columns alone.
-	if err := s.SetToolPolicy(ctx, "lake_query", true); err != nil {
+	if err := s.SetToolPolicy(ctx, "warehouse_query", true); err != nil {
 		t.Fatalf("legacy on: %v", err)
 	}
 }

@@ -63,3 +63,25 @@ func numericArgument(v any) (float64, bool) {
 	}
 	return 0, false
 }
+
+// stringArg is args[key] when it is a string, else "".
+func stringArg(args map[string]any, key string) string {
+	v, _ := args[key].(string)
+	return v
+}
+
+// asInt reads an integer argument from any of the numeric types a decoded
+// call can carry.
+func asInt(v any) (int, bool) {
+	switch x := v.(type) {
+	case int:
+		return x, true
+	case int32:
+		return int(x), true
+	case int64:
+		return int(x), true
+	case float64:
+		return int(x), true
+	}
+	return 0, false
+}

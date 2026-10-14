@@ -332,7 +332,8 @@ func validate(srv Server) error {
 	// (a server by one of these names would share their prefix and access
 	// group) and toolyard, the code-mode server for every internal tool.
 	// Built-ins (mempalace, notes, skills) are registered by startup, not
-	// from the dashboard.
+	// from the dashboard. lake is the retired data group: old grants for it
+	// may still be stored, so no server may take its name.
 	switch srv.Name {
 	case "builtin", "fixture", "memory", "tools", "mempalace", "notes", "skills",
 		"inbox", "session", "lake", "events", "policies", "servers", "audit", "access", "toolyard", "connections":

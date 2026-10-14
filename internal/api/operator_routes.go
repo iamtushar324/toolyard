@@ -94,7 +94,6 @@ var operatorOwnerPrefixes = []string{
 	"/v1/passkeys",
 	"/v1/push/subscribe",
 	"/v1/push/rotate-vapid",
-	"/v1/settings/rotate",
 	"/v1/chat/telegram/",
 	"/v1/inbox/batch",
 	"/v1/inbox/grants",
@@ -145,7 +144,6 @@ var ownerSettingKeys = map[string]bool{
 	settings.TelegramUserID:                  true,
 	settings.MetricsRetentionDays:            true,
 	settings.EventsRetentionDays:             true,
-	settings.ClickhousePassword:              true,
 }
 
 // operatorGuard authenticates an operator-token request and checks its scope.
@@ -477,7 +475,6 @@ var operatorCatalog = []operatorCatalogEntry{
 	{"/v1/policies/{id}", "PATCH DELETE", "one policy"},
 	{"/v1/settings", "GET PATCH", "settings (secret values masked)"},
 	{"/v1/settings/reveal", "POST", "reveal a secret setting (never via operator token)"},
-	{"/v1/settings/rotate", "POST", "rotate a generated secret setting"},
 	{"/v1/usage", "GET", "usage summary"},
 	{"/v1/insights/overview", "GET", "insights overview"},
 	{"/v1/insights/agents", "GET", "per-agent insights"},

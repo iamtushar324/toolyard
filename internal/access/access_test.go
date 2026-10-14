@@ -58,17 +58,17 @@ func TestScopeFor(t *testing.T) {
 		want          bool
 	}{
 		{"", "github", true}, // local unauthenticated MCP
-		{"ag_admin", "clickhouse", true},
-		{"dashboard:u_admin", "lake", true},
+		{"ag_admin", "postgres", true},
+		{"dashboard:u_admin", "events", true},
 		{"ag_member", "github", true},
 		{"ag_member", "memory", true},
-		{"ag_member", "clickhouse", false},
-		{"ag_member", "lake", false},
+		{"ag_member", "postgres", false},
+		{"ag_member", "events", false},
 		{"ag_member", "tools", true},
 		{"ag_member", "inbox", true},
 		{"ag_member", "session", true},
 		{"voice:u_member", "github", true},
-		{"dashboard:u_member", "clickhouse", false},
+		{"dashboard:u_member", "postgres", false},
 		{"ag_blocked", "github", false},
 		{"ag_blocked", "tools", false},
 		{"ag_unknown", "tools", false},
@@ -118,7 +118,7 @@ func TestSetGroupsInvalidatesCache(t *testing.T) {
 		t.Fatal(err)
 	}
 	svc.Invalidate("u_member")
-	if !svc.ScopeFor(ctx, "ag_member").Allows("clickhouse") {
+	if !svc.ScopeFor(ctx, "ag_member").Allows("postgres") {
 		t.Fatal("promotion to admin not visible after Invalidate")
 	}
 }
@@ -138,7 +138,7 @@ func TestGroupOf(t *testing.T) {
 	cases := map[[2]string]string{
 		{"builtin", "memory.get"}:     "memory",
 		{"builtin", "skills.install"}: "skills",
-		{"lake", "lake.query"}:        "lake",
+		{"warehouse", "wh.query"}:     "warehouse",
 		{"github", "github.search"}:   "github",
 		{"tools", "tools.execute"}:    "tools",
 	}
@@ -146,6 +146,35 @@ func TestGroupOf(t *testing.T) {
 		if got := GroupOf(in[0], in[1]); got != want {
 			t.Errorf("GroupOf(%q, %q) = %q, want %q", in[0], in[1], got, want)
 		}
+	}
+}
+
+// A stored grant for a retired group (lake) grants nothing, is not listed,
+// and a new one is dropped like an always-on name.
+func TestRetiredGroupGrantsIgnored(t *testing.T) {
+	ctx := context.Background()
+	db := openTestDB(t)
+	addUser(t, db, "u_member", "member", "active")
+	addAgent(t, db, "ag_member", "u_member")
+	if _, err := db.Exec(`INSERT INTO user_server_access(user_id, server, created_at) VALUES('u_member','lake',0),('u_member','github',0)`); err != nil {
+		t.Fatal(err)
+	}
+	svc := New(db)
+	if got, err := svc.Groups(ctx, "u_member"); err != nil || len(got) != 1 || got[0] != "github" {
+		t.Fatalf("Groups = %v %v, want [github]", got, err)
+	}
+	sc := svc.ScopeFor(ctx, "ag_member")
+	if sc.Allows("lake") || !sc.Allows("github") {
+		t.Fatalf("scope = %+v, want github only", sc)
+	}
+	if err := svc.SetGroups(ctx, "u_member", []string{"lake", "memory"}, ""); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := svc.Groups(ctx, "u_member"); len(got) != 1 || got[0] != "memory" {
+		t.Fatalf("Groups after SetGroups = %v, want [memory]", got)
+	}
+	if IsBuiltinGroup("lake") {
+		t.Error("lake is still a built-in group")
 	}
 }
 

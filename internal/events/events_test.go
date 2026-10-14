@@ -191,28 +191,25 @@ func TestRetention(t *testing.T) {
 	ctx := context.Background()
 	s := newTestService(t)
 	src, _, _ := s.CreateSource(ctx, CreateSourceInput{Name: "x", Kind: KindWebhook})
-	// Old acked+synced event (should purge), old unacked (survives normal tier),
-	// very old unacked (purged by hard floor).
-	mkOld := func(dedup string, ageDays int, acked, synced bool) string {
+	// Old acked event (should purge), old unacked (survives normal tier),
+	// very old unacked (purged by hard floor), recent acked (survives).
+	mkOld := func(dedup string, ageDays int, acked bool) string {
 		ev, _, _ := s.Ingest(ctx, src, IngestInput{Type: "t", DedupKey: dedup})
 		ts := time.Now().Add(-time.Duration(ageDays) * 24 * time.Hour).UnixMilli()
 		ackVal := any(nil)
 		if acked {
 			ackVal = ts
 		}
-		syncVal := 0
-		if synced {
-			syncVal = 1
-		}
-		s.db.ExecContext(ctx, `UPDATE events SET received_at=?, acked_at=?, lake_synced=? WHERE id=?`,
-			ts, ackVal, syncVal, ev.ID)
+		s.db.ExecContext(ctx, `UPDATE events SET received_at=?, acked_at=? WHERE id=?`,
+			ts, ackVal, ev.ID)
 		return ev.ID
 	}
-	purgeable := mkOld("a", 100, true, true)
-	unackedRecentish := mkOld("b", 100, false, true) // unacked → survives normal tier
-	veryOld := mkOld("c", 400, false, false)         // hard floor (4*90=360d)
+	purgeable := mkOld("a", 100, true)
+	unackedRecentish := mkOld("b", 100, false) // unacked → survives normal tier
+	veryOld := mkOld("c", 400, false)          // hard floor (4*90=360d)
+	recentAcked := mkOld("d", 10, true)        // inside the window
 
-	n, err := s.purgeOnce(ctx, 90, true)
+	n, err := s.purgeOnce(ctx, 90)
 	if err != nil {
 		t.Fatalf("purge: %v", err)
 	}
@@ -220,7 +217,10 @@ func TestRetention(t *testing.T) {
 		t.Fatalf("expected >=2 purged, got %d", n)
 	}
 	if _, err := s.Get(ctx, purgeable); err == nil {
-		t.Fatal("acked+synced old event should be purged")
+		t.Fatal("acked old event should be purged")
+	}
+	if _, err := s.Get(ctx, recentAcked); err != nil {
+		t.Fatal("acked event inside the window should survive")
 	}
 	if _, err := s.Get(ctx, veryOld); err == nil {
 		t.Fatal("very old event should be purged by hard floor")

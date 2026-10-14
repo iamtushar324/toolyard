@@ -1,6 +1,6 @@
 // Package access decides which tool groups a dashboard user, and every agent
 // that user owns, may use. A tool group is an upstream server name or a
-// built-in data group (memory, lake, events, notes, skills).
+// built-in data group (memory, events, notes, skills).
 //
 // Admins reach everything. Members reach only the groups an admin granted
 // them in user_server_access, plus the always-on groups (the meta-tools and
@@ -36,7 +36,12 @@ var alwaysOn = map[string]bool{
 
 // BuiltinGroups are the built-in data tools an admin grants like servers.
 // They are shared across all agents, so members don't get them by default.
-var BuiltinGroups = []string{"memory", "lake", "events", "notes", "skills"}
+var BuiltinGroups = []string{"memory", "events", "notes", "skills"}
+
+// retiredGroups are groups toolyard no longer has. Stored grants for them
+// stay in user_server_access but are ignored: they grant nothing and are
+// not listed. lake was the built-in ClickHouse data group.
+var retiredGroups = map[string]bool{"lake": true}
 
 var groupRE = regexp.MustCompile(`^[A-Za-z0-9_-]{1,64}$`)
 
@@ -247,7 +252,8 @@ func (s *Service) agentOwner(ctx context.Context, agentID string) (string, error
 	return owner, nil
 }
 
-// Groups lists the groups granted to userID, sorted.
+// Groups lists the groups granted to userID, sorted. Grants for retired
+// groups are left out.
 func (s *Service) Groups(ctx context.Context, userID string) ([]string, error) {
 	rows, err := s.db.QueryContext(ctx,
 		`SELECT server FROM user_server_access WHERE user_id = ? ORDER BY server`, userID)
@@ -261,14 +267,17 @@ func (s *Service) Groups(ctx context.Context, userID string) ([]string, error) {
 		if err := rows.Scan(&g); err != nil {
 			return nil, err
 		}
+		if retiredGroups[g] {
+			continue
+		}
 		out = append(out, g)
 	}
 	return out, rows.Err()
 }
 
-// SetGroups replaces userID's grants with groups. Always-on groups are
-// dropped (they need no grant); duplicates collapse. by is recorded as
-// created_by on new rows.
+// SetGroups replaces userID's grants with groups. Always-on and retired
+// groups are dropped (they need no grant, or grant nothing); duplicates
+// collapse. by is recorded as created_by on new rows.
 func (s *Service) SetGroups(ctx context.Context, userID string, groups []string, by string) error {
 	want := map[string]bool{}
 	for _, g := range groups {
@@ -276,7 +285,7 @@ func (s *Service) SetGroups(ctx context.Context, userID string, groups []string,
 		if !groupRE.MatchString(g) {
 			return fmt.Errorf("%w: %q", ErrInvalidGroup, g)
 		}
-		if !alwaysOn[g] {
+		if !alwaysOn[g] && !retiredGroups[g] {
 			want[g] = true
 		}
 	}

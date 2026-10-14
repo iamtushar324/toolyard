@@ -172,10 +172,10 @@
 
           <article class="feature-card reveal">
             <div class="feature-icon icon-green">
-              <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true"><path fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" d="M3 12c2-4.5 5-7 9-7s7 2.5 9 7c-2 4.5-5 7-9 7s-7-2.5-9-7Zm9 3a3 3 0 1 0 0-6 3 3 0 0 0 0 6Z"/></svg>
+              <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true"><path fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round" d="M4 13h4l2 3h4l2-3h4M5 5h14l1 8v6H4v-6l1-8Z"/></svg>
             </div>
-            <h3>A personal data lake</h3>
-            <p>ClickHouse-backed warehouse with read tools agents can query and approve-gated mutation tools. Manifest-driven dashboards: a SQL file becomes a chart.</p>
+            <h3>An inbox for permissions</h3>
+            <p>In inbox mode an agent asks first: one request with the task and the exact calls. You accept or reject each call, and every accepted call gets a single-use grant.</p>
           </article>
 
           <article class="feature-card reveal">
@@ -213,7 +213,7 @@
           <div class="flow-col">
             <div class="flow-node">github</div>
             <div class="flow-node">filesystem</div>
-            <div class="flow-node">memory + lake</div>
+            <div class="flow-node">memory + events</div>
             <div class="flow-node">any mcp server</div>
           </div>
         </div>
@@ -336,9 +336,8 @@ enroll your agents, add upstreams.</span></span></code></pre>
 <pre><code><span class="p">$</span> git clone https://github.com/iamtushar324/toolyard
 <span class="p">$</span> cd toolyard
 <span class="p">$</span> sudo ./deploy/install.sh
-<span class="muted"># builds from source, installs a sandboxed systemd unit,
-# and (with docker present) brings up ClickHouse + Grafana
-# for the personal data lake</span></code></pre>
+<span class="muted"># builds from source and installs a sandboxed
+# systemd unit</span></code></pre>
             <button class="copy-btn" type="button" data-copy-text="git clone https://github.com/iamtushar324/toolyard && cd toolyard && sudo ./deploy/install.sh" aria-label="Copy systemd install commands">copy</button>
           </div>
 

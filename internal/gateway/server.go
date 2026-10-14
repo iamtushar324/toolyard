@@ -23,7 +23,6 @@ import (
 	"github.com/tusharbhardwaj/toolyard/internal/audit"
 	"github.com/tusharbhardwaj/toolyard/internal/codemode"
 	"github.com/tusharbhardwaj/toolyard/internal/inbox"
-	"github.com/tusharbhardwaj/toolyard/internal/lake"
 	"github.com/tusharbhardwaj/toolyard/internal/memory"
 	"github.com/tusharbhardwaj/toolyard/internal/metrics"
 	"github.com/tusharbhardwaj/toolyard/internal/policy"
@@ -73,16 +72,6 @@ var PinnedTools = map[string]struct{}{
 	"memory.set":                      {},
 	"memory.list":                     {},
 	"memory.delete":                   {},
-	// Personal data lake — the additive tools are pinned so agents always
-	// see them; the approval-gated mutations (lake.update, lake.delete,
-	// lake.alter, lake.drop) are deliberately not pinned, keeping them off
-	// the default toolbelt unless the agent reaches via tools.search.
-	"lake.query":          {},
-	"lake.list_tables":    {},
-	"lake.describe_table": {},
-	"lake.insert":         {},
-	"lake.create_table":   {},
-	"lake.ingest":         {},
 	// Events Hub — the common-language layer. Pinned so every agent type
 	// always sees the brief/query/publish/ack entry points without reaching
 	// through tools.search.
@@ -116,20 +105,21 @@ type toolEntry struct {
 	// forcedAction, when non-nil, short-circuits policy.Eval for this tool
 	// and uses the provided action instead. Used by built-in tools that
 	// need a deterministic policy decision regardless of the name-heuristic
-	// (e.g., lake.create_table looks like a write but is intentionally
+	// (e.g., notes.publish looks like a write but is intentionally
 	// auto-allowed). The intent_category supplied by the agent is ignored
 	// when forcedAction is set.
 	forcedAction *policy.Action
 	// denyOverridesForced lets an explicit deny policy, on the tool or on
-	// its upstream, beat forcedAction (policy.Engine.ExplicitDeny). Set on
-	// the lake.* tools only: control-plane tools (inbox.*, policies.*, ...)
-	// keep ignoring deny, so one rule can never lock every agent out.
+	// its upstream, beat forcedAction (policy.Engine.ExplicitDeny). For
+	// data tools an owner must be able to switch off; no built-in sets it
+	// today. Control-plane tools (inbox.*, policies.*, ...) keep ignoring
+	// deny, so one rule can never lock every agent out.
 	denyOverridesForced bool
 	// escalate, when non-nil, reads a call's arguments after the policy
 	// decision: if that decision is allow and escalate returns true, the
 	// call needs approval instead, with the returned reason. It sends the
 	// data-replacing or externally reaching forms of an open tool to a
-	// person (lake.create_table, lake.ingest).
+	// person.
 	escalate func(args map[string]any) (string, bool)
 	// reasonOptional lets a call omit _reason. Set on the code-mode tools,
 	// whose clients are configured for Bifrost and never send one; the
@@ -152,7 +142,6 @@ type Gateway struct {
 	audit               *audit.Logger
 	hub                 *realtime.Hub
 	memory              *memory.Service
-	lake                *lake.Service
 	visibility          VisibilityProvider
 	usage               UsageRecorder
 	metrics             MetricsRecorder
@@ -232,18 +221,13 @@ type VisibilityProvider interface {
 }
 
 type Options struct {
-	Name     string
-	Version  string
-	Policy   *policy.Engine
-	Approval *approval.Bus
-	Audit    *audit.Logger
-	Hub      *realtime.Hub
-	Memory   *memory.Service
-	// Lake, when non-nil, gives the gateway a DuckDB-backed personal data
-	// lake. The lake.* MCP tools are registered against it during
-	// RegisterBuiltins. Nil keeps the gateway working without a lake (e.g.,
-	// in tests that don't need it).
-	Lake       *lake.Service
+	Name       string
+	Version    string
+	Policy     *policy.Engine
+	Approval   *approval.Bus
+	Audit      *audit.Logger
+	Hub        *realtime.Hub
+	Memory     *memory.Service
 	InLineWait time.Duration
 	// Visibility, if non-nil, decides which tools the agent sees in
 	// tools/list and whether direct calls to a tool are accepted. Tools
@@ -339,7 +323,6 @@ func New(opts Options) *Gateway {
 		audit:               opts.Audit,
 		hub:                 opts.Hub,
 		memory:              opts.Memory,
-		lake:                opts.Lake,
 		visibility:          opts.Visibility,
 		usage:               opts.Usage,
 		metrics:             opts.Metrics,
@@ -539,8 +522,8 @@ func (g *Gateway) MCPServer() *server.MCPServer { return g.mcp }
 
 // RegisterBuiltins wires the built-in memory tools, the meta-tools
 // (tools.search / tools.execute), the Bifrost-compatible code-mode tools,
-// the fixture echo tool, and (if a Lake is configured) the lake.*
-// personal-data-warehouse tools into the MCP server.
+// the access and connections tools, and the fixture echo tool into the MCP
+// server.
 func (g *Gateway) RegisterBuiltins() {
 	entries := g.builtinMemoryTools()
 	entries = append(entries, g.staticFixtureTool())
@@ -549,9 +532,6 @@ func (g *Gateway) RegisterBuiltins() {
 	entries = append(entries, g.codeModeTools()...)
 	entries = append(entries, g.accessTools()...)
 	entries = append(entries, g.connectionsTools()...)
-	if g.lake != nil {
-		entries = append(entries, g.lakeTools()...)
-	}
 	for _, e := range entries {
 		g.registerEntry(e)
 	}
@@ -561,11 +541,12 @@ func (g *Gateway) RegisterBuiltins() {
 // the synthetic upstreams (builtin, fixture, inbox, session, policies,
 // servers, audit, access, connections), the meta-tool group "tools", the built-in data
 // groups whose tools are registered under the "builtin" upstream (memory,
-// lake, events), and "toolyard", the code-mode server every internal tool
+// events), and "toolyard", the code-mode server every internal tool
 // is bound under. An upstream with one of these names would register tools
 // under the same prefix as the built-ins and share their access group:
 // "tools" is always-on, so a server called tools would be reachable by
-// every member without a grant.
+// every member without a grant. "lake", the retired data group, stays
+// reserved: old grants for it may still be stored.
 //
 // notes and skills are deliberately not here: they are real upstreams that
 // startup registers under those names (upstreams.UpsertBuiltin), and their
