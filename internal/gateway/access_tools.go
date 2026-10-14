@@ -199,16 +199,22 @@ func (g *Gateway) accessTools() []toolEntry {
 
 // ---- effective access -------------------------------------------------------
 
-// policyTarget is one tool the ask rule evaluates.
+// policyTarget is one tool the ask rule evaluates, and what baseDecision
+// needs to decide a call to it.
 type policyTarget struct {
-	requireHuman bool
-	name         string
-	upstream     string
-	forced       *policy.Action
+	requireHuman        bool
+	denyOverridesForced bool
+	name                string
+	upstream            string
+	forced              *policy.Action
+	escalate            func(args map[string]any) (string, bool)
 }
 
 func targetOf(e toolEntry) policyTarget {
-	return policyTarget{name: e.tool.Name, upstream: e.upstream, forced: e.forcedAction, requireHuman: e.requireHuman}
+	return policyTarget{
+		name: e.tool.Name, upstream: e.upstream, forced: e.forcedAction, requireHuman: e.requireHuman,
+		denyOverridesForced: e.denyOverridesForced, escalate: e.escalate,
+	}
 }
 
 // accessWord maps an action to the word policies.* report.
@@ -240,15 +246,15 @@ func (s accessState) String() string {
 	return s.Word
 }
 
-// effectiveAccess is a tool's static access under engine: a built-in's
-// forced action, else the engine's decision for a call with no declared
-// intent and no arguments, exactly as routeEntry would start from.
+// effectiveAccess is a tool's static access under engine: baseDecision for
+// a call with no declared intent and no arguments, exactly as routeEntry
+// would start from. That is a built-in's forced action, unless an explicit
+// deny overrides it (denyOverridesForced), else the engine's decision.
 func effectiveAccess(engine *policy.Engine, t policyTarget) (accessState, policy.Decision) {
+	d := baseDecision(engine, t, policy.Request{})
 	if t.forced != nil {
-		d := policy.Decision{Action: *t.forced, Reason: "built-in tool policy", RuleID: "builtin-forced-" + string(*t.forced)}
-		return accessState{Word: accessWord(d.Action)}, d
+		return accessState{Word: accessWord(d.Action), Human: d.RequireHuman}, d
 	}
-	d := engine.Eval(policy.Request{UpstreamName: t.upstream, ToolName: t.name})
 	if t.requireHuman && d.Action != policy.ActionDeny {
 		d.Action = policy.ActionApprove
 		d.RequireHuman = true
@@ -276,6 +282,16 @@ func explainRule(d policy.Decision) string {
 		return "no explicit policy; its name does not look read-only, so toolyard's default applies: writes need approval"
 	}
 	return d.Reason
+}
+
+// explainRuleFor is explainRule for a call to t: a built-in whose forced
+// action an explicit deny overrides (denyOverridesForced) says so instead
+// of "no policy applies".
+func explainRuleFor(t policyTarget, d policy.Decision) string {
+	if t.denyOverridesForced && strings.HasPrefix(d.RuleID, "builtin-forced-") {
+		return "built-in toolyard tool: " + accessWord(d.Action) + " unless an explicit deny policy on the tool or its server applies"
+	}
+	return explainRule(d)
 }
 
 func accessPhrase(word string) string {
@@ -461,8 +477,9 @@ func (g *Gateway) handlePoliciesList() directHandler {
 			if server != "" && server != e.upstream && server != group {
 				continue
 			}
-			st, d := effectiveAccess(g.policy, targetOf(e))
-			rows = append(rows, effectiveRow{Tool: e.tool.Name, Server: group, Access: st.Word, RequireHuman: st.Human, RuleID: d.RuleID, Rule: explainRule(d)})
+			t := targetOf(e)
+			st, d := effectiveAccess(g.policy, t)
+			rows = append(rows, effectiveRow{Tool: e.tool.Name, Server: group, Access: st.Word, RequireHuman: st.Human, RuleID: d.RuleID, Rule: explainRuleFor(t, d)})
 		}
 		sort.Slice(rows, func(i, j int) bool { return rows[i].Tool < rows[j].Tool })
 
@@ -521,10 +538,14 @@ func (g *Gateway) handlePoliciesExplain() directHandler {
 		if !ok || !g.allowsEntry(ctx, agentIDFromContext(ctx), e) {
 			return notFoundResult(tool), nil
 		}
-		st, d := effectiveAccess(g.policy, targetOf(e))
+		t := targetOf(e)
+		st, d := effectiveAccess(g.policy, t)
+		rule := explainRuleFor(t, d)
 		var b strings.Builder
-		fmt.Fprintf(&b, "%s %s: %s.", tool, accessPhrase(st.Word), explainRule(d))
+		fmt.Fprintf(&b, "%s %s: %s.", tool, accessPhrase(st.Word), rule)
 		switch {
+		case st.Word == AccessAllow && e.escalate != nil:
+			b.WriteString(" Some calls still need approval because of their arguments; the tool's description says which.")
 		case st.Word == AccessAllow && e.forcedAction == nil:
 			b.WriteString(" A call that declares _intent_category write, destructive, external_communication, financial or privileged_admin still needs approval.")
 		case st.Word == AccessAsk && st.Human:
@@ -539,7 +560,7 @@ func (g *Gateway) handlePoliciesExplain() directHandler {
 			"access":        st.Word,
 			"require_human": st.Human,
 			"rule_id":       d.RuleID,
-			"rule":          explainRule(d),
+			"rule":          rule,
 			"explanation":   b.String(),
 		}
 		if p, ok := g.policy.Get(policy.ScopeTool, tool); ok {

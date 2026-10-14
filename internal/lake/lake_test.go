@@ -302,6 +302,8 @@ func TestValidateCreate(t *testing.T) {
 	if err := ValidateCreate("CREATE TABLE t(x INT)"); err != nil {
 		t.Errorf("CREATE TABLE should pass: %v", err)
 	}
+	// CREATE OR REPLACE is valid DDL; lake.create_table sends it to
+	// approval first (IsReplacingDDL), and the approved call runs it.
 	if err := ValidateCreate("CREATE OR REPLACE VIEW v AS SELECT 1"); err != nil {
 		t.Errorf("CREATE OR REPLACE VIEW should pass: %v", err)
 	}
@@ -310,6 +312,197 @@ func TestValidateCreate(t *testing.T) {
 	}
 	if err := ValidateCreate("DROP TABLE t"); err == nil {
 		t.Errorf("DROP should fail")
+	}
+	for _, ok := range []string{
+		"CREATE TABLE app.zz (id Int32, name String) ENGINE = MergeTree() ORDER BY id",
+		"CREATE TABLE app.t ENGINE = MergeTree() ORDER BY x AS SELECT number AS x FROM numbers(10)",
+		"CREATE TABLE t (x Int64) ENGINE = ReplacingMergeTree(ver) ORDER BY x",
+		"CREATE TABLE t (x Int64) ENGINE = ReplicatedMergeTree('/clickhouse/tables/t', 'r1') ORDER BY x",
+		"CREATE TABLE t (x Int64) ENGINE MergeTree ORDER BY x",
+		"CREATE TABLE t (x Int64) ENGINE = TinyLog",
+		"CREATE TABLE t (x Int64) ENGINE = StripeLog",
+		"CREATE TABLE t (x Int64) ENGINE = Log",
+		"CREATE TABLE t (x Int64) ENGINE = Memory",
+		"CREATE TABLE t (x Int64) engine=null",
+		"CREATE TABLE t (engine String, url String) ENGINE = MergeTree ORDER BY url",
+		"CREATE VIEW v AS SELECT name, engine FROM system.tables WHERE engine = 'Memory'",
+		"CREATE VIEW v AS SELECT url, domain(url) AS d FROM app.visits",
+		"CREATE MATERIALIZED VIEW mv TO app.daily AS SELECT toDate(ts) AS d, count() AS n FROM app.events GROUP BY d",
+		"CREATE TABLE t (note String DEFAULT 'see url(x)') ENGINE = MergeTree ORDER BY tuple()",
+		"CREATE TABLE IF NOT EXISTS t (x Int64) ENGINE = MergeTree ORDER BY x -- a comment\r\n",
+		"CREATE DATABASE IF NOT EXISTS mart",
+	} {
+		if err := ValidateCreate(ok); err != nil {
+			t.Errorf("ValidateCreate(%q) should pass: %v", ok, err)
+		}
+	}
+}
+
+func TestIsReplacingDDL(t *testing.T) {
+	cases := []struct {
+		sql  string
+		want bool
+	}{
+		{"CREATE OR REPLACE TABLE t (x Int64) ENGINE = MergeTree ORDER BY x", true},
+		{"create or replace view v as select 1", true},
+		{"  CREATE\n\tOR   REPLACE VIEW v AS SELECT 1", true},
+		{"CREATE /* hidden */ OR -- line\n REPLACE TABLE t AS SELECT 1", true},
+		{"-- lead\n/* lead */ CREATE OR REPLACE DICTIONARY d", true},
+		{"REPLACE TABLE t ENGINE = MergeTree ORDER BY x AS SELECT 1", true},
+		{"EXCHANGE TABLES a AND b", true},
+		{"CREATE TABLE t (x Int64) ENGINE = MergeTree ORDER BY x", false},
+		{"CREATE TABLE t (x Int64) ENGINE = ReplacingMergeTree ORDER BY x", false},
+		{"CREATE VIEW v AS SELECT replace(s, 'a', 'b') AS r FROM t WHERE x = 1 OR replace(s, 'a', 'b') = 'c'", false},
+		{"CREATE TABLE t (c String DEFAULT 'CREATE OR REPLACE') ENGINE = Memory", false},
+		{"CREATE TABLE `or replace` (x Int64) ENGINE = Memory", false},
+		{"", false},
+	}
+	for _, c := range cases {
+		if got := IsReplacingDDL(c.sql); got != c.want {
+			t.Errorf("IsReplacingDDL(%q) = %v, want %v", c.sql, got, c.want)
+		}
+	}
+}
+
+func TestValidateCreateRejectsGlobalAndExternal(t *testing.T) {
+	for _, bad := range []string{
+		// Server-wide objects.
+		"CREATE USER agent IDENTIFIED WITH plaintext_password BY 'x'",
+		"CREATE ROLE writer",
+		"CREATE QUOTA q FOR INTERVAL 1 hour MAX queries = 1",
+		"CREATE ROW POLICY p ON app.t FOR SELECT USING 1 TO ALL",
+		"CREATE POLICY p ON app.t USING 1",
+		"CREATE SETTINGS PROFILE sp SETTINGS max_memory_usage = 1",
+		"CREATE PROFILE sp SETTINGS max_memory_usage = 1",
+		"CREATE FUNCTION f AS (x) -> x + 1",
+		"CREATE OR REPLACE FUNCTION f AS (x) -> x + 1",
+		"create /* x */ function f as (x) -> x",
+		"CREATE DICTIONARY d (k UInt64, v String) PRIMARY KEY k SOURCE(CLICKHOUSE(TABLE 't')) LAYOUT(FLAT()) LIFETIME(0)",
+		"CREATE NAMED COLLECTION nc AS url = 'http://example.invalid'",
+		"CREATE WORKLOAD w",
+		"CREATE RESOURCE r (READ DISK d)",
+		// Table engines outside the allowlist.
+		"CREATE TABLE t (x Int64) ENGINE = Kafka('broker:9092', 'topic', 'g', 'JSONEachRow')",
+		"CREATE TABLE t (x Int64) ENGINE = Distributed(cluster_name, db, t)",
+		"CREATE TABLE t (x Int64) ENGINE = Merge(currentDatabase(), '^t')",
+		"CREATE TABLE t (x Int64) ENGINE = Buffer(app, dst, 1, 10, 100, 10000, 1000000, 10000000, 100000000)",
+		"CREATE TABLE t (x Int64) ENGINE = RabbitMQ SETTINGS rabbitmq_host_port = 'h:5672'",
+		"CREATE TABLE t (x Int64) ENGINE RabbitMQ SETTINGS rabbitmq_host_port = 'h:5672'",
+		"CREATE TABLE t (x Int64) ENGINE = Dictionary(d)",
+		"CREATE TABLE t (x Int64) ENGINE = `MergeTree` ORDER BY x",
+		"CREATE TABLE t (x Int64) ENGINE = /* hide */ Kafka SETTINGS kafka_broker_list = 'b'",
+		"CREATE MATERIALIZED VIEW mv ENGINE = Kafka SETTINGS kafka_broker_list = 'b' AS SELECT 1",
+		"CREATE TABLE t AS app.other ENGINE = Kafka SETTINGS kafka_broker_list = 'b'",
+		"CREATE TABLE t (x Int64) ENGINE = MergeTree ORDER BY x)",
+		// External access: table engines named like the table functions,
+		// table functions, and a disk declared in SETTINGS.
+		"CREATE TABLE t (x Int64) ENGINE = URL('http://example.invalid/x.csv', CSV)",
+		"CREATE TABLE t (x Int64) ENGINE = S3('https://bucket.invalid/x.csv', 'CSV')",
+		"CREATE TABLE t (x Int64) ENGINE = MySQL('h:3306', 'db', 't', 'u', 'p')",
+		"CREATE TABLE t (x Int64) ENGINE = File(CSV)",
+		"CREATE TABLE t AS url('http://example.invalid/x.csv', CSVWithNames)",
+		"CREATE TABLE t ENGINE = MergeTree ORDER BY tuple() AS SELECT * FROM remote('h:9000', db.t)",
+		"CREATE VIEW v AS SELECT * FROM s3('https://bucket.invalid/x.csv')",
+		"CREATE TABLE t (x Int64) ENGINE = MergeTree ORDER BY x SETTINGS disk = disk(type = web, endpoint = 'http://example.invalid/')",
+		"CREATE DATABASE d ENGINE = PostgreSQL('h:5432', 'db', 'u', 'p')",
+		"CREATE DATABASE d ENGINE = Atomic",
+	} {
+		if err := ValidateCreate(bad); err == nil {
+			t.Errorf("ValidateCreate(%q) should fail", bad)
+		}
+	}
+}
+
+func TestValidatorsRejectExternalTableFunctions(t *testing.T) {
+	validators := map[string]struct {
+		fn     func(string) error
+		prefix string
+	}{
+		"select": {ValidateSelect, "SELECT * FROM "},
+		"insert": {ValidateInsert, "INSERT INTO app.t SELECT * FROM "},
+		"create": {ValidateCreate, "CREATE TABLE app.t ENGINE = MergeTree ORDER BY tuple() AS SELECT * FROM "},
+		"alter":  {ValidateAlter, "ALTER TABLE app.t ATTACH PARTITION ID 'x' FROM "},
+	}
+	calls := []string{
+		"url('http://example.invalid/x.csv', CSV)",
+		"URL ('http://example.invalid/x.csv', CSV)",
+		"url/* gap */('http://example.invalid/x.csv', CSV)",
+		"url\v('http://example.invalid/x.csv', CSV)",
+		"`url`('http://example.invalid/x.csv', CSV)",
+		`"url"('http://example.invalid/x.csv', CSV)`,
+		// Escapes in a quoted identifier are rejected: ClickHouse decodes
+		// them before it uses the name.
+		"`ur\\x6c`('http://example.invalid/x.csv', CSV)",
+		`"u\rl"('http://example.invalid/x.csv', CSV)`,
+		"`u``rl`('http://example.invalid/x.csv', CSV)",
+		"urlCluster('c', 'http://example.invalid/x.csv')",
+		"remote('h:9000', db.t)",
+		"remoteSecure('h:9440', db.t)",
+		"cluster('c', db.t)",
+		"clusterAllReplicas('c', db.t)",
+		"file('x.csv')",
+		"s3('https://bucket.invalid/x.csv')",
+		"s3Cluster('c', 'https://bucket.invalid/x.csv')",
+		"hdfs('hdfs://h/x')",
+		"mysql('h:3306', 'db', 't', 'u', 'p')",
+		"postgresql('h:5432', 'db', 't', 'u', 'p')",
+		"jdbc('jdbc:x', 't')",
+		"odbc('dsn', 't')",
+		"mongodb('h:27017', 'db', 'c', 'u', 'p', 'x String')",
+		"redis('h:6379', 'k', 'k String')",
+		"sqlite('x.db', 't')",
+		"executable('x.sh', CSV, 'x String')",
+		"azureBlobStorage('c', 'b', 'x.csv')",
+		"iceberg('https://bucket.invalid/t')",
+		"icebergS3('https://bucket.invalid/t')",
+		"deltaLake('https://bucket.invalid/t')",
+		"hudi('https://bucket.invalid/t')",
+	}
+	for name, v := range validators {
+		for _, call := range calls {
+			if err := v.fn(v.prefix + call); err == nil {
+				t.Errorf("%s: %q should be rejected", name, v.prefix+call)
+			}
+		}
+	}
+	// INSERT INTO FUNCTION writes through a table function.
+	if err := ValidateInsert("INSERT INTO FUNCTION url('http://example.invalid/x', CSV) SELECT 1"); err == nil {
+		t.Error("INSERT INTO FUNCTION url(...) should be rejected")
+	}
+
+	// A column, table or literal that only names a function is fine, and
+	// so are ordinary functions whose names start like one.
+	for _, ok := range []string{
+		"SELECT url, file, remote FROM app.visits",
+		"SELECT domain(url) FROM app.visits WHERE url LIKE '%url(%'",
+		"SELECT * FROM app.url",
+		"SELECT URLHierarchy(url), filesystemAvailable() FROM app.visits",
+		"SELECT 'it''s url(x)', 'a\\' url(x)' FROM app.t",
+		"SELECT count() FROM numbers(10) -- url('x')",
+		"SELECT /* url('x') */ 1",
+		"SELECT 1 # url('x')",
+		"SELECT `url` FROM app.visits",
+	} {
+		if err := ValidateSelect(ok); err != nil {
+			t.Errorf("ValidateSelect(%q) should pass: %v", ok, err)
+		}
+	}
+
+	// SQL that ClickHouse and the scanner could read differently is
+	// rejected rather than guessed at.
+	for _, bad := range []string{
+		"SELECT /* /* */ 1 */ 1",                       // nested block comment
+		"SELECT /* a /*/ ' */ */ 1 -- '",               // "/*" overlapping the close
+		"SELECT /* unterminated",                       // open block comment
+		"SELECT 'unterminated",                         // open literal
+		"SELECT $$ ' $$ AS x FROM app.t -- '",          // heredoc
+		"SELECT \u2018'\u2019, 1 -- '",                 // Unicode quotation marks
+		"SELECT url\u00a0('http://example.invalid/x')", // Unicode whitespace
+		"SELECT 1 -- x\r' \n, 2 -- '",                  // CR inside a line comment
+	} {
+		if err := ValidateSelect(bad); err == nil {
+			t.Errorf("ValidateSelect(%q) should be rejected", bad)
+		}
 	}
 }
 

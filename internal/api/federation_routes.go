@@ -229,11 +229,8 @@ func (s *Server) federationHandoff(w http.ResponseWriter, r *http.Request) {
 		writeError(w, 401, "handoff_expired_or_used")
 		return
 	}
-	if err = s.issueSession(w, r, userID); err != nil {
-		writeError(w, 500, "session_failed")
-		return
-	}
-	http.Redirect(w, r, "/#inbox", http.StatusSeeOther)
+	// The link opens the Inbox; it never signs this browser in.
+	s.openHandoff(w, r, userID, handoffSourceFederation)
 }
 
 func (s *Server) callbackAgent(w http.ResponseWriter, r *http.Request) (*identity.Agent, bool) {

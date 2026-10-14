@@ -620,9 +620,13 @@ events survive restart and may repeat. No public laptop address or agent
 `inbox.wait` is necessary. The callback still announces a decision rather than
 permission. Read authoritative Inbox status before any approved execution.
 
-`Open Toolyard` uses a one-minute, single-use dashboard handoff. The local mode
-redirects only to the same Toolyard instance's Inbox. Credentials remain on the
-server and are never embedded in the browser URL.
+`Open Toolyard` uses a one-minute, single-use dashboard handoff link. The link
+opens the same Toolyard instance's Inbox and never signs a browser in: it sets
+no cookie and creates no session. A browser that already has a Toolyard session
+shows the Inbox. A browser without one shows the normal sign-in, and the person
+signs in there with the instance's usual method. Host handoff links behave the
+same way. Credentials remain on the server and are never embedded in the
+browser URL.
 
 ## Server-owned host connections
 
