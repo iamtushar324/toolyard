@@ -144,14 +144,58 @@ interpreter costs itself the run and nothing else. Defaults are in
 `internal/codemode` (`DefaultLimits`, `DefaultWorker`); the executeToolCode
 tool description states the limits that are enforced.
 
+On Linux (arm64 and amd64) the worker is also sandboxed. The gateway starts
+it from a thread that has confined itself first, so the child inherits:
+
+- **no new privileges** (`PR_SET_NO_NEW_PRIVS`);
+- **a Landlock ruleset**: the worker may open only its own binary and ELF
+  interpreter (to execute) and the shared libraries and `/etc/ld.so.cache`
+  (to read). It cannot open, create or remove anything else: not the data
+  directory, `/etc`, `/proc` or `/tmp`. From Landlock ABI 4 it cannot bind or
+  connect TCP sockets; from ABI 6 it cannot signal processes outside itself.
+  It can still `stat`, `readlink` and `chdir` anywhere, so it can learn which
+  paths exist, but not what files hold;
+- **a seccomp filter** that refuses socket creation, io_uring, ptrace and
+  `process_vm_*`, bpf, perf events, userfaultfd, the kernel key store, new
+  namespaces (`unshare`, `setns`, `clone` with a namespace flag or
+  `CLONE_PARENT`, `clone3`), mounting, resource limits or scheduling of other
+  processes (`prlimit64` on another pid, `setpriority`, `sched_set*`,
+  `ioprio_set`), and changes to file metadata (chmod, chown, utimes, extended
+  attributes, truncate).
+
+`TOOLYARD_CODEMODE_SANDBOX` picks the mode:
+
+| Value | Behaviour |
+|---|---|
+| `auto` (default) | Apply what the kernel supports. Without Landlock, keep no_new_privs and the seccomp filter; with neither, run the worker with its resource caps only. |
+| `required` | Refuse to run scripts unless both Landlock and the seccomp filter apply. |
+| `off` | Resource caps only: the worker runs as the same user, with the same filesystem view and network as the gateway. |
+
+Any other value stops the gateway at start.
+
+`GET /v1/health` reports the result in `codemode_sandbox`:
+
+- `landlock-abi-<n>+seccomp`: both apply. Below ABI 6 the value ends in
+  ` (signals unscoped)`: the worker can still signal the gateway and other
+  processes of the same user.
+- `seccomp-only: <reason>`: no Landlock, the filter applies.
+- `none: <reason>`: neither applies.
+- ` (sandbox required: scripts are refused)` is appended in `required` mode
+  when either is missing.
+- `off`, or `probing` for the moment after start while the gateway checks
+  the kernel.
+
 Two things to know when hardening the unit:
 
-- **It is a resource boundary, not a privilege boundary.** The worker runs
-  as the same user, in the same namespaces, with the same filesystem view
-  as the gateway. Starlark has no filesystem or network access, but a flaw in
-  the interpreter itself would let a script read what the gateway can read,
-  including the data directory. If that matters, isolate the whole service
-  (a container, or `DynamicUser=` and `ProtectSystem=strict`).
+- **`SystemCallFilter` must allow the Landlock calls** (`landlock_create_ruleset`,
+  `landlock_add_rule`, `landlock_restrict_self`, in systemd's `@sandbox`
+  group) and `prctl` (in `@process`). In systemd 259, `@default` includes
+  `@sandbox`, so `@system-service` allows them; check
+  `systemd-analyze syscall-filter @default` on your version. systemd added
+  `@sandbox` in version 254; on older versions, list the three calls by name.
+  The gateway checks this in a throwaway child process, so a filter that
+  kills on these calls costs the sandbox, not the gateway: `codemode_sandbox`
+  then says which call the filter refused and which group to allow.
 - **`SystemCallFilter` must allow `setrlimit` and `prlimit64`.** The shipped
   units (`deploy/toolyard.service`, the strict tier in `deploy/install.sh`)
   deny `@resources` and then allow these two back. Without them the worker

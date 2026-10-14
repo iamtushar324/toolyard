@@ -57,6 +57,14 @@ func (g *Gateway) SetCodeModeWorker(w codemode.Worker) {
 	g.codeModeRuntime().SetWorker(w)
 }
 
+// SetCodeModeSandbox changes only how script workers are confined. Call
+// it at start, before any script runs.
+func (g *Gateway) SetCodeModeSandbox(m codemode.SandboxMode) {
+	w := g.codeModeRuntime().Worker()
+	w.Sandbox = m
+	g.SetCodeModeWorker(w)
+}
+
 func (g *Gateway) codeModeRuntime() *codemode.Runtime {
 	if g.codeMode == nil {
 		g.codeMode = codemode.New(codeModeCaller{g}, codemode.DefaultLimits())

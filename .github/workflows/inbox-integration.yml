@@ -19,6 +19,19 @@ jobs:
           node-version: 24
       - name: Go validation
         run: go test ./...
+      - name: Code-mode worker sandbox
+        # Verbose, so the log shows the runner's Landlock ABI and which
+        # sandbox tests ran. The floor makes the tests fail, not skip, if
+        # the runner's sandbox drops below Landlock ABI 7 or loses seccomp.
+        env:
+          TOOLYARD_SANDBOX_TEST_MIN_ABI: "7"
+        run: go test -v -count=1 -run TestWorkerSandbox ./internal/codemode/
+      - name: Code-mode vet on other platforms
+        # The runner is linux/arm64; the sandbox has linux/amd64 and
+        # non-Linux files that only these steps compile on a pull request.
+        run: |
+          CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go vet ./internal/codemode/
+          GOOS=darwin GOARCH=arm64 go vet ./internal/codemode/
       - name: Dashboard behavior
         run: node --test scripts/*ui.test.cjs
       - name: Build gateway

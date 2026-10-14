@@ -532,6 +532,13 @@ func runServe(argv []string) error {
 	identityKeysSvc := identitykeys.New(db, identityCipher)
 	identityKeysSvc.SetAudit(auditSvc)
 
+	// Code-mode worker sandbox: TOOLYARD_CODEMODE_SANDBOX=auto (default),
+	// off or required. A value it does not know stops the gateway rather
+	// than fall back to a weaker mode than the operator asked for.
+	sandboxMode, err := codemode.ParseSandboxMode(os.Getenv("TOOLYARD_CODEMODE_SANDBOX"))
+	if err != nil {
+		return fmt.Errorf("TOOLYARD_CODEMODE_SANDBOX: %w", err)
+	}
 	gw := gateway.New(gateway.Options{
 		Name:                "toolyard",
 		Version:             version,
@@ -553,6 +560,10 @@ func runServe(argv []string) error {
 		Owners:              accessSvc,
 		PublicURL:           *publicURL,
 	})
+	// The kernel probe for the code-mode sandbox runs now, off the
+	// request path.
+	gw.SetCodeModeSandbox(sandboxMode)
+	go codemode.ProbeSandbox()
 	gw.RegisterBuiltins()
 	defer gw.Close()
 	identityKeysSvc.SetCaller(gw)
