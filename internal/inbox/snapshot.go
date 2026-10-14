@@ -1,6 +1,7 @@
 package inbox
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -17,6 +18,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/tusharbhardwaj/toolyard/internal/blobstore"
 	"github.com/tusharbhardwaj/toolyard/internal/store"
 )
 
@@ -29,24 +31,35 @@ const (
 
 var blobName = regexp.MustCompile(`^[0-9a-f]{64}$`)
 
-// Snapshotter fetches a linked file once and keeps a copy under dir, named
-// by its sha256. It refuses anything that resolves to a loopback, private,
-// link-local or otherwise non-public address — checked on the dialled IP,
-// after DNS, so a public name can't be pointed at an internal service.
+// Snapshotter fetches a linked file once and keeps a copy in a blob store,
+// named by its sha256. It refuses anything that resolves to a loopback,
+// private, link-local or otherwise non-public address — checked on the
+// dialled IP, after DNS, so a public name can't be pointed at an internal
+// service.
 type Snapshotter struct {
+	// dir holds temporary files (downloads and uploads being hashed), and
+	// on SQLite also the blobs themselves.
 	dir    string
 	db     *store.DB
+	blobs  blobstore.Store
 	client *http.Client
 	// allowPrivate is for tests only.
 	allowPrivate bool
 }
 
-// NewSnapshotter stores copies in dir (created if missing).
+// NewSnapshotter keeps copies in the blob store that goes with db
+// (blobstore.ForDB): files named by their sha256 in dir on SQLite or with a
+// nil db, 1 MiB chunks in the database on Postgres. dir is created if
+// missing; temporary files always live there.
 func NewSnapshotter(db *store.DB, dir string) (*Snapshotter, error) {
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return nil, err
 	}
-	s := &Snapshotter{dir: dir, db: db}
+	blobs, err := blobstore.ForDB(db, dir)
+	if err != nil {
+		return nil, err
+	}
+	s := &Snapshotter{dir: dir, db: db, blobs: blobs}
 	s.client = s.newClient()
 	// Leftovers of a crash mid-download or mid-upload.
 	s.CleanTemp(time.Hour)
@@ -238,14 +251,13 @@ func (s *Snapshotter) Snapshot(ctx context.Context, rawURL, kind string) (string
 		return "", "", 0, fmt.Errorf("content type %s isn't allowed for a %s", ct, kind)
 	}
 	sum := hex.EncodeToString(h.Sum(nil))
-	dst := filepath.Join(s.dir, sum)
-	if _, err := os.Stat(dst); err != nil {
-		if err := os.Rename(tmp.Name(), dst); err != nil {
-			return "", "", 0, err
-		}
+	// Local stores rename the temporary file into place (no copy); the
+	// Postgres store copies it into chunks and the file is removed.
+	if _, err := s.storeFile(ctx, sum, tmp.Name()); err != nil {
+		return "", "", 0, err
 	}
 	if s.db != nil {
-		_, _ = s.db.ExecContext(ctx, `INSERT OR IGNORE INTO inbox_blobs(sha256, content_type, size, source_url, created_at) VALUES (?,?,?,?,?)`,
+		_, _ = s.db.ExecContext(ctx, `INSERT INTO inbox_blobs(sha256, content_type, size, source_url, created_at) VALUES (?,?,?,?,?) ON CONFLICT DO NOTHING`,
 			sum, ct, n, rawURL, time.Now().UnixMilli())
 	}
 	return sum, ct, n, nil
@@ -255,25 +267,12 @@ func (s *Snapshotter) Snapshot(ctx context.Context, rawURL, kind string) (string
 func (s *Snapshotter) Put(ctx context.Context, data []byte, contentType, source string) (string, error) {
 	sum := sha256.Sum256(data)
 	name := hex.EncodeToString(sum[:])
-	dst := filepath.Join(s.dir, name)
-	if _, err := os.Stat(dst); err != nil {
-		tmp, err := os.CreateTemp(s.dir, "put-*")
-		if err != nil {
-			return "", err
-		}
-		if _, err := tmp.Write(data); err != nil {
-			tmp.Close()
-			os.Remove(tmp.Name())
-			return "", err
-		}
-		_ = tmp.Close()
-		if err := os.Rename(tmp.Name(), dst); err != nil {
-			os.Remove(tmp.Name())
-			return "", err
-		}
+	// Local writes a put-* temporary file and renames it, as before.
+	if _, err := s.blobs.Put(ctx, name, bytes.NewReader(data), int64(len(data))); err != nil {
+		return "", err
 	}
 	if s.db != nil {
-		if _, err := s.db.ExecContext(ctx, `INSERT OR IGNORE INTO inbox_blobs(sha256, content_type, size, source_url, created_at) VALUES (?,?,?,?,?)`,
+		if _, err := s.db.ExecContext(ctx, `INSERT INTO inbox_blobs(sha256, content_type, size, source_url, created_at) VALUES (?,?,?,?,?) ON CONFLICT DO NOTHING`,
 			name, contentType, len(data), source, time.Now().UnixMilli()); err != nil {
 			return "", err
 		}
@@ -281,22 +280,44 @@ func (s *Snapshotter) Put(ctx context.Context, data []byte, contentType, source 
 	return name, nil
 }
 
-// Open returns a stored copy and its content type.
-func (s *Snapshotter) Open(ctx context.Context, sha string) (*os.File, string, error) {
+// Open returns a stored copy and its content type. The returned Blob also
+// has a ModTime method (see storedBlob) for HTTP caching.
+func (s *Snapshotter) Open(ctx context.Context, sha string) (blobstore.Blob, string, error) {
 	if !blobName.MatchString(sha) {
 		return nil, "", ErrNotFound
 	}
 	var ct string
+	var recorded int64
 	if s.db != nil {
-		if err := s.db.QueryRowContext(ctx, `SELECT content_type FROM inbox_blobs WHERE sha256 = ?`, sha).Scan(&ct); err != nil {
+		if err := s.db.QueryRowContext(ctx, `SELECT content_type, created_at FROM inbox_blobs WHERE sha256 = ?`, sha).Scan(&ct, &recorded); err != nil {
 			return nil, "", ErrNotFound
 		}
 	}
-	f, err := os.Open(filepath.Join(s.dir, sha))
+	b, err := s.blobs.Open(ctx, sha)
 	if err != nil {
 		return nil, "", ErrNotFound
 	}
-	return f, ct, nil
+	return &storedBlob{Blob: b, recorded: recorded}, ct, nil
+}
+
+// storedBlob is an open blob with its modification time.
+type storedBlob struct {
+	blobstore.Blob
+	recorded int64 // inbox_blobs.created_at (Unix ms); 0 when unknown
+}
+
+// ModTime is the file's modification time for a local blob (what the blob
+// route always sent as Last-Modified), else when the blob was recorded.
+func (b *storedBlob) ModTime() time.Time {
+	if f, ok := b.Blob.(interface{ Stat() (os.FileInfo, error) }); ok {
+		if st, err := f.Stat(); err == nil {
+			return st.ModTime()
+		}
+	}
+	if b.recorded > 0 {
+		return time.UnixMilli(b.recorded)
+	}
+	return time.Time{}
 }
 
 func unwrapURLErr(err error) string {
@@ -307,13 +328,13 @@ func unwrapURLErr(err error) string {
 	return msg
 }
 
-// Exists reports whether a stored copy's bytes are on disk.
-func (s *Snapshotter) Exists(_ context.Context, sha string) bool {
+// Exists reports whether a stored copy's bytes are in the blob store.
+func (s *Snapshotter) Exists(ctx context.Context, sha string) bool {
 	if !blobName.MatchString(sha) {
 		return false
 	}
-	_, err := os.Stat(filepath.Join(s.dir, sha))
-	return err == nil
+	ok, err := s.blobs.Exists(ctx, sha)
+	return err == nil && ok
 }
 
 // Remove deletes a stored copy and its row. Callers decide that nothing
@@ -327,42 +348,79 @@ func (s *Snapshotter) Remove(ctx context.Context, sha string) error {
 			return err
 		}
 	}
-	if err := os.Remove(filepath.Join(s.dir, sha)); err != nil && !errors.Is(err, os.ErrNotExist) {
-		return err
-	}
-	return nil
+	return s.blobs.Delete(ctx, sha)
 }
 
 // CreateUploadTemp opens a temporary file in the blob directory, so a
-// finished upload can be renamed into place without a copy.
+// finished upload can be renamed into place without a copy (Local).
 func (s *Snapshotter) CreateUploadTemp() (*os.File, error) {
 	return os.CreateTemp(s.dir, "upload-*")
 }
 
-// Adopt moves a verified temporary file into place as blob sha. created is
-// false when the blob already existed (the temporary file is removed).
+// PrepareUpload copies a verified temporary file into a store that copies
+// (Postgres) and leaves the file in place for Adopt. The upload calls it
+// before it takes uploadMu, so other uploads don't wait for a copy of up to
+// 50 MB. Stores that rename files instead (Local) do nothing here. created
+// is true when this call stored the blob.
+func (s *Snapshotter) PrepareUpload(ctx context.Context, tmpPath, sha string) (created bool, err error) {
+	if _, ok := s.blobs.(blobstore.FileAdopter); ok {
+		return false, nil
+	}
+	if !blobName.MatchString(sha) || !s.inDir(tmpPath) {
+		return false, ErrNotFound
+	}
+	return s.putFile(ctx, sha, tmpPath)
+}
+
+// Adopt moves a verified temporary file into place as blob sha: a rename on
+// Local, a copy into the database on Postgres (a cheap existence check when
+// PrepareUpload already stored it). created is false when the blob already
+// existed. The temporary file is gone afterwards in every case.
 // It writes no row: the caller records inbox_blobs in its own transaction.
-func (s *Snapshotter) Adopt(tmpPath, sha string) (created bool, err error) {
-	if !blobName.MatchString(sha) || filepath.Dir(tmpPath) != filepath.Clean(s.dir) {
+func (s *Snapshotter) Adopt(ctx context.Context, tmpPath, sha string) (created bool, err error) {
+	if !blobName.MatchString(sha) || !s.inDir(tmpPath) {
 		_ = os.Remove(tmpPath)
 		return false, ErrNotFound
 	}
-	dst := filepath.Join(s.dir, sha)
-	if _, err := os.Stat(dst); err == nil {
-		_ = os.Remove(tmpPath)
-		return false, nil
-	}
-	if err := os.Rename(tmpPath, dst); err != nil {
-		_ = os.Remove(tmpPath)
-		return false, err
-	}
-	return true, nil
+	return s.storeFile(ctx, sha, tmpPath)
 }
 
-// DiscardFile removes blob sha's file only (no row). Used to undo Adopt
-// when the transaction that would have recorded it fails.
-func (s *Snapshotter) DiscardFile(sha string) {
-	if blobName.MatchString(sha) {
-		_ = os.Remove(filepath.Join(s.dir, sha))
+// DiscardBlob removes blob sha's bytes only (no row). Used to undo Adopt
+// when the transaction that would have recorded it fails, and by the sweep
+// after it deleted the row. A missing blob is not an error.
+func (s *Snapshotter) DiscardBlob(ctx context.Context, sha string) error {
+	if !blobName.MatchString(sha) {
+		return nil
 	}
+	return s.blobs.Delete(ctx, sha)
+}
+
+// inDir reports whether path is a file directly in the blob directory.
+func (s *Snapshotter) inDir(path string) bool {
+	return filepath.Dir(path) == filepath.Clean(s.dir)
+}
+
+// putFile stores the file at path as blob sha through the blob store and
+// leaves the file in place.
+func (s *Snapshotter) putFile(ctx context.Context, sha, path string) (bool, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return false, err
+	}
+	defer f.Close()
+	st, err := f.Stat()
+	if err != nil {
+		return false, err
+	}
+	return s.blobs.Put(ctx, sha, f, st.Size())
+}
+
+// storeFile moves the temporary file at path into the blob store as blob
+// sha and removes the file: Local renames it, other stores copy it.
+func (s *Snapshotter) storeFile(ctx context.Context, sha, path string) (bool, error) {
+	if a, ok := s.blobs.(blobstore.FileAdopter); ok {
+		return a.AdoptFile(ctx, sha, path)
+	}
+	defer os.Remove(path)
+	return s.putFile(ctx, sha, path)
 }

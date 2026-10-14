@@ -50,7 +50,7 @@ func TestToWAV(t *testing.T) {
 
 func TestVoiceGeneratedOnlyOnListen(t *testing.T) {
 	e := newEnv(t)
-	snaps, err := NewSnapshotter(nil, filepath.Join(t.TempDir(), "blobs"))
+	snaps, err := NewSnapshotter(e.svc.db, filepath.Join(t.TempDir(), "blobs")) // the engine's blob store
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -138,7 +138,7 @@ func (v *blockedVoice) Speak(ctx context.Context, script string) ([]byte, string
 }
 func TestListenConcurrentAndCancelledBrowserCachesOnce(t *testing.T) {
 	e := newEnv(t)
-	snaps, err := NewSnapshotter(nil, filepath.Join(t.TempDir(), "blobs"))
+	snaps, err := NewSnapshotter(e.svc.db, filepath.Join(t.TempDir(), "blobs")) // the engine's blob store
 	if err != nil {
 		t.Fatal(err)
 	}

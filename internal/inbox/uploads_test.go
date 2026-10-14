@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"database/sql"
 	"encoding/hex"
 	"errors"
 	"fmt"
@@ -16,24 +17,25 @@ import (
 	"time"
 
 	"github.com/tusharbhardwaj/toolyard/internal/store"
+	"github.com/tusharbhardwaj/toolyard/internal/store/storetest"
 )
 
 type uploadEnv struct {
 	*testEnv
 	db    *store.DB
 	snaps *Snapshotter
+	dir   string // the Snapshotter's directory (temporary files; blobs on SQLite)
 }
 
 // newUploadEnv is newEnv with a blob store (and, with fetch, the URL
-// fetcher wired to the same store, allowed to reach httptest servers).
+// fetcher wired to the same store, allowed to reach httptest servers). The
+// blob store follows the engine: files on SQLite, database chunks on
+// Postgres (TOOLYARD_TEST_DB=postgres).
 func newUploadEnv(t *testing.T, fetch bool) *uploadEnv {
 	t.Helper()
-	db, err := store.Open(filepath.Join(t.TempDir(), "uploads.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { db.Close() })
-	snaps, err := NewSnapshotter(db, t.TempDir())
+	db := storetest.Open(t)
+	dir := t.TempDir()
+	snaps, err := NewSnapshotter(db, dir)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -57,7 +59,7 @@ func newUploadEnv(t *testing.T, fetch bool) *uploadEnv {
 	}
 	e.svc = svc
 	t.Cleanup(svc.Flush)
-	return &uploadEnv{testEnv: e, db: db, snaps: snaps}
+	return &uploadEnv{testEnv: e, db: db, snaps: snaps, dir: dir}
 }
 
 // testPNG returns bytes that sniff as image/png, distinct per seed.
@@ -344,7 +346,7 @@ func TestCreateUploadValidates(t *testing.T) {
 		t.Errorf("name and type normalization: %+v %v", tk, err)
 	}
 	var name string
-	_ = u.db.QueryRow(`SELECT name FROM inbox_upload_tickets ORDER BY created_at DESC, rowid DESC LIMIT 1`).Scan(&name)
+	_ = u.db.QueryRow(`SELECT name FROM inbox_upload_tickets WHERE kind = 'image'`).Scan(&name) // the only image ticket
 	if name != "shot.png" {
 		t.Errorf("stored name %q, want the base name", name)
 	}
@@ -789,5 +791,132 @@ func TestCleanTempRemovesOnlyStaleTempFiles(t *testing.T) {
 	}
 	if _, err := os.Stat(stale); err == nil {
 		t.Fatal("startup should remove stale temp files")
+	}
+}
+
+// The upload's bytes land in the engine's blob store: a file named by its
+// sha256 in the blob directory on SQLite, 1 MiB chunks in the database on
+// Postgres (no file; the directory holds temporary files only).
+func TestUploadBytesLiveInTheEngineStore(t *testing.T) {
+	u := newUploadEnv(t, false)
+	ctx := context.Background()
+	data := testPNG(50)
+	sha := hexSum(data)
+	u.upload(t, "ag_1", pngSpec(data), data)
+	_, fileErr := os.Stat(filepath.Join(u.dir, sha))
+	var objects int
+	if err := u.db.QueryRow(`SELECT COUNT(*) FROM inbox_blob_objects WHERE sha256 = ?`, sha).Scan(&objects); err != nil {
+		t.Fatal(err)
+	}
+	if u.db.Dialect.IsPostgres() {
+		if fileErr == nil || objects != 1 {
+			t.Fatalf("Postgres: file err %v, %d object rows; want no file and one row", fileErr, objects)
+		}
+	} else if fileErr != nil || objects != 0 {
+		t.Fatalf("SQLite: file err %v, %d object rows; want the file and no row", fileErr, objects)
+	}
+	entries, _ := os.ReadDir(u.dir)
+	for _, e := range entries {
+		if strings.HasPrefix(e.Name(), "upload-") {
+			t.Fatalf("temporary file %s left behind", e.Name())
+		}
+	}
+	f, ct, err := u.snaps.Open(ctx, sha)
+	if err != nil || ct != "image/png" {
+		t.Fatalf("open: %v %s", err, ct)
+	}
+	defer f.Close()
+	if f.Size() != int64(len(data)) {
+		t.Fatalf("size %d, want %d", f.Size(), len(data))
+	}
+	if m, ok := f.(interface{ ModTime() time.Time }); !ok || m.ModTime().IsZero() {
+		t.Fatal("an opened blob should report a modification time for Last-Modified")
+	}
+}
+
+// The sweep's DELETEs repeat the conditions they were checked on: an upload
+// cited after the check, or a blob a new upload holds after the check, is
+// kept with its bytes.
+func TestSweepDeletesOnlyRowsStillStale(t *testing.T) {
+	u := newUploadEnv(t, false)
+	ctx := context.Background()
+	t.Cleanup(func() { sweepBeforeDelete = nil })
+
+	cited := testPNG(51)
+	u.upload(t, "ag_1", pngSpec(cited), cited)
+	u.advance(UploadRetention + time.Minute)
+	sweepBeforeDelete = func(ctx context.Context, tx *sql.Tx, stage, sha string) {
+		if stage == "upload" && sha == hexSum(cited) { // a submission cites it right after the check
+			if _, err := tx.ExecContext(ctx, `UPDATE inbox_uploads SET used_at=? WHERE sha256=?`, u.now.UnixMilli(), sha); err != nil {
+				t.Error(err)
+			}
+		}
+	}
+	u.svc.Sweep(ctx)
+	var n int
+	_ = u.db.QueryRow(`SELECT COUNT(*) FROM inbox_uploads WHERE sha256=?`, hexSum(cited)).Scan(&n)
+	if n != 1 || !u.snaps.Exists(ctx, hexSum(cited)) {
+		t.Fatalf("an upload cited after the check must stay with its bytes (rows %d)", n)
+	}
+
+	held := testPNG(52)
+	u.upload(t, "ag_1", pngSpec(held), held)
+	u.advance(UploadRetention + time.Minute)
+	sweepBeforeDelete = func(ctx context.Context, tx *sql.Tx, stage, sha string) {
+		if stage == "blob" && sha == hexSum(held) { // another agent's upload arrives right after the check
+			if _, err := tx.ExecContext(ctx, `INSERT INTO inbox_uploads(sha256, agent_id, name, content_type, kind, size, created_at) VALUES (?,?,?,?,?,?,?)`,
+				sha, "ag_2", "shot.png", "image/png", "image", len(held), u.now.UnixMilli()); err != nil {
+				t.Error(err)
+			}
+		}
+	}
+	u.svc.Sweep(ctx)
+	var blobRows int
+	_ = u.db.QueryRow(`SELECT COUNT(*) FROM inbox_blobs WHERE sha256=?`, hexSum(held)).Scan(&blobRows)
+	if blobRows != 1 || !u.snaps.Exists(ctx, hexSum(held)) {
+		t.Fatalf("a blob a new upload holds must stay with its bytes (blob rows %d)", blobRows)
+	}
+	if !u.svc.BlobBelongsToAgent(ctx, "ag_2", hexSum(held)) {
+		t.Fatal("ag_2's new upload owns the blob")
+	}
+
+	// Without interference the same sweep deletes a stale upload and its bytes.
+	sweepBeforeDelete = nil
+	lonely := testPNG(53)
+	u.upload(t, "ag_1", pngSpec(lonely), lonely)
+	u.advance(UploadRetention + time.Minute)
+	u.svc.Sweep(ctx)
+	if u.snaps.Exists(ctx, hexSum(lonely)) {
+		t.Fatal("a stale upload's bytes should be deleted")
+	}
+}
+
+// A failed upload store leaves no bytes behind on either engine, including
+// bytes that PrepareUpload copied into the database before the lock.
+func TestUploadFailureAfterPrepareLeavesNoBytes(t *testing.T) {
+	u := newUploadEnv(t, false)
+	ctx := context.Background()
+	data := testPNG(54)
+	tk, err := u.svc.CreateUpload(ctx, "ag_1", pngSpec(data))
+	if err != nil {
+		t.Fatal(err)
+	}
+	p, err := u.svc.ClaimUpload(ctx, tk.Ticket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	u.svc.uploadRecordHook = func() error { return errors.New("database unavailable") }
+	t.Cleanup(func() { u.svc.uploadRecordHook = nil })
+	if _, err := u.svc.CompleteUpload(ctx, p, "image/png", bytes.NewReader(data)); err == nil {
+		t.Fatal("the record failure should surface")
+	}
+	if u.snaps.Exists(ctx, hexSum(data)) {
+		t.Fatal("bytes without a row after a failed upload")
+	}
+	var objects, chunks int
+	_ = u.db.QueryRow(`SELECT COUNT(*) FROM inbox_blob_objects`).Scan(&objects)
+	_ = u.db.QueryRow(`SELECT COUNT(*) FROM inbox_blob_chunks`).Scan(&chunks)
+	if objects != 0 || chunks != 0 {
+		t.Fatalf("%d object rows and %d chunk rows left", objects, chunks)
 	}
 }

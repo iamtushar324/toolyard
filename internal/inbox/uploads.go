@@ -22,6 +22,8 @@ import (
 	"sync"
 	"time"
 	"unicode/utf8"
+
+	"github.com/tusharbhardwaj/toolyard/internal/store"
 )
 
 // Native uploads let an agent attach a screenshot, recording or file it
@@ -123,11 +125,13 @@ type UploadResult struct {
 }
 
 // uploadBlobs is the blob store an upload needs (Snapshotter implements
-// it): a temporary file next to the blobs, and a rename into place.
+// it): a temporary file next to the blobs, and a move into the store (a
+// rename on Local, a copy into database chunks on Postgres).
 type uploadBlobs interface {
 	CreateUploadTemp() (*os.File, error)
-	Adopt(tmpPath, sha string) (created bool, err error)
-	DiscardFile(sha string)
+	PrepareUpload(ctx context.Context, tmpPath, sha string) (created bool, err error)
+	Adopt(ctx context.Context, tmpPath, sha string) (created bool, err error)
+	DiscardBlob(ctx context.Context, sha string) error
 	Exists(ctx context.Context, sha string) bool
 	CleanTemp(olderThan time.Duration) int
 }
@@ -425,20 +429,32 @@ func (s *Service) CompleteUpload(ctx context.Context, p *PendingUpload, contentT
 		return nil, err
 	}
 
-	s.uploadMu.Lock()
-	defer s.uploadMu.Unlock()
-	created, err := blobs.Adopt(tmpPath, p.SHA256)
-	adopted = true // Adopt consumed (or removed) the temporary file
+	// A store that copies (Postgres) gets the bytes before uploadMu, so
+	// other uploads don't wait for a copy of up to 50 MB. Adopt, under the
+	// lock, then finds them stored (or stores them again if the sweep
+	// removed them in between). Local does nothing here and renames the
+	// file in Adopt.
+	prepared, err := blobs.PrepareUpload(ctx, tmpPath, p.SHA256)
 	if err != nil {
 		return nil, err
 	}
-	if err := s.recordUpload(ctx, p, stored); err != nil {
+	s.uploadMu.Lock()
+	defer s.uploadMu.Unlock()
+	created, err := blobs.Adopt(ctx, tmpPath, p.SHA256)
+	adopted = true // Adopt consumed (or removed) the temporary file
+	created = created || prepared
+	if err == nil {
+		err = s.recordUpload(ctx, p, stored)
+	}
+	if err != nil {
 		if created {
-			// Never leave a file without its row; a blob some other
-			// writer recorded meanwhile keeps its file.
+			// Never leave bytes without their row; a blob some other
+			// writer recorded meanwhile keeps its bytes.
 			var one int
 			if s.db.QueryRowContext(context.Background(), `SELECT 1 FROM inbox_blobs WHERE sha256=?`, p.SHA256).Scan(&one) != nil {
-				blobs.DiscardFile(p.SHA256)
+				if derr := blobs.DiscardBlob(context.Background(), p.SHA256); derr != nil {
+					log.Printf("inbox: discard upload blob %s: %v", p.SHA256[:12], derr)
+				}
 			}
 		}
 		return nil, err
@@ -469,7 +485,7 @@ func (s *Service) recordUpload(ctx context.Context, p *PendingUpload, stored str
 	if n, _ := res.RowsAffected(); n != 1 {
 		return ErrUploadGone
 	}
-	if _, err := tx.ExecContext(ctx, `INSERT OR IGNORE INTO inbox_blobs(sha256, content_type, size, source_url, created_at) VALUES (?,?,?,?,?)`,
+	if _, err := tx.ExecContext(ctx, `INSERT INTO inbox_blobs(sha256, content_type, size, source_url, created_at) VALUES (?,?,?,?,?) ON CONFLICT DO NOTHING`,
 		p.SHA256, stored, p.Size, UploadRefPrefix+p.SHA256, now); err != nil {
 		return err
 	}
@@ -677,27 +693,37 @@ func (s *Service) sweepUploads(ctx context.Context) {
 	}
 }
 
-// sweepUploadLocked runs one sweep deletion and its file removal under
+// sweepUploadLocked runs one sweep deletion and its byte removal under
 // uploadMu, so no upload of the same sha can adopt a file in between.
 func (s *Service) sweepUploadLocked(ctx context.Context, sha, agent string, cutoff, touchCutoff int64) {
 	s.uploadMu.Lock()
 	defer s.uploadMu.Unlock()
-	dropFile, err := s.sweepOneUpload(ctx, sha, agent, cutoff, touchCutoff)
+	dropBytes, err := s.sweepOneUpload(ctx, sha, agent, cutoff, touchCutoff)
 	if err != nil {
 		log.Printf("inbox: sweep upload %s: %v", sha[:12], err)
 		return
 	}
-	if dropFile {
+	if dropBytes {
 		if b, ok := s.uploadStore(); ok {
-			b.DiscardFile(sha)
+			if err := b.DiscardBlob(ctx, sha); err != nil {
+				log.Printf("inbox: sweep upload %s: delete bytes: %v", sha[:12], err)
+			}
 		}
 	}
 }
 
+// sweepBeforeDelete, when set (tests), runs inside sweepOneUpload's
+// transaction for blob sha after a check and before the delete it guards:
+// stage "upload" before the upload row's delete, "blob" before the blob
+// row's.
+var sweepBeforeDelete func(ctx context.Context, tx *sql.Tx, stage, sha string)
+
 // sweepOneUpload deletes one stale upload row (agent "" = an ownerless
 // blob) and, when nothing else holds or cites it, its blob row. It reports
-// whether the caller should delete the file. All checks run in the same
-// transaction as the deletes.
+// whether the caller should delete the bytes. All checks run in the same
+// transaction as the deletes, and each DELETE repeats the conditions it
+// was checked on, so a row that changed in between (cited, touched,
+// re-uploaded, or held by a new upload) is kept.
 func (s *Service) sweepOneUpload(ctx context.Context, sha, agent string, cutoff, touchCutoff int64) (bool, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -713,14 +739,29 @@ func (s *Service) sweepOneUpload(ctx context.Context, sha, agent string, cutoff,
 		if err != nil {
 			return false, err
 		}
-		if blobCitedTx(ctx, tx, agent, sha) {
-			if _, err := tx.ExecContext(ctx, `UPDATE inbox_uploads SET used_at=? WHERE sha256=? AND agent_id=?`, s.now().UnixMilli(), sha, agent); err != nil {
+		cited, err := blobCitedTx(ctx, tx, s.db.Dialect, agent, sha)
+		if err != nil {
+			return false, err
+		}
+		if cited {
+			if _, err := tx.ExecContext(ctx, `UPDATE inbox_uploads SET used_at=? WHERE sha256=? AND agent_id=? AND used_at IS NULL`, s.now().UnixMilli(), sha, agent); err != nil {
 				return false, err
 			}
 			return false, tx.Commit()
 		}
-		if _, err := tx.ExecContext(ctx, `DELETE FROM inbox_uploads WHERE sha256=? AND agent_id=?`, sha, agent); err != nil {
+		if sweepBeforeDelete != nil {
+			sweepBeforeDelete(ctx, tx, "upload", sha)
+		}
+		res, err := tx.ExecContext(ctx, `DELETE FROM inbox_uploads WHERE sha256=? AND agent_id=? AND used_at IS NULL AND created_at < ? AND COALESCE(touched_at, 0) < ?`, sha, agent, cutoff, touchCutoff)
+		if err != nil {
 			return false, err
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return false, err
+		}
+		if n != 1 {
+			return false, nil // changed since the check: keep it
 		}
 	}
 	drop := true
@@ -728,17 +769,31 @@ func (s *Service) sweepOneUpload(ctx context.Context, sha, agent string, cutoff,
 	if tx.QueryRowContext(ctx, `SELECT 1 FROM inbox_uploads WHERE sha256=? LIMIT 1`, sha).Scan(&one) == nil {
 		drop = false // another agent's upload still holds it
 	}
-	if drop && blobCitedTx(ctx, tx, "", sha) {
-		drop = false
+	if drop {
+		cited, err := blobCitedTx(ctx, tx, s.db.Dialect, "", sha)
+		if err != nil {
+			return false, err
+		}
+		drop = !cited
 	}
 	var source string
 	if drop && (tx.QueryRowContext(ctx, `SELECT source_url FROM inbox_blobs WHERE sha256=?`, sha).Scan(&source) != nil || source != UploadRefPrefix+sha) {
 		drop = false // a URL snapshot, a voice note, or already gone
 	}
 	if drop {
-		if _, err := tx.ExecContext(ctx, `DELETE FROM inbox_blobs WHERE sha256=?`, sha); err != nil {
+		if sweepBeforeDelete != nil {
+			sweepBeforeDelete(ctx, tx, "blob", sha)
+		}
+		res, err := tx.ExecContext(ctx, `DELETE FROM inbox_blobs WHERE sha256=? AND source_url=? AND NOT EXISTS (SELECT 1 FROM inbox_uploads u WHERE u.sha256=?)`,
+			sha, UploadRefPrefix+sha, sha)
+		if err != nil {
 			return false, err
 		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return false, err
+		}
+		drop = n == 1
 	}
 	if err := tx.Commit(); err != nil {
 		return false, err
@@ -747,14 +802,37 @@ func (s *Service) sweepOneUpload(ctx context.Context, sha, agent string, cutoff,
 }
 
 // blobCitedTx reports whether any request (of agentID, or of anyone when
-// agentID is "") references sha as a blob, poster blob or voice blob.
-func blobCitedTx(ctx context.Context, tx *sql.Tx, agentID, sha string) bool {
+// agentID is "") references sha as a blob, poster blob or voice blob: an
+// object member named blob or poster_blob, at any depth of the request
+// doc, whose value is the string sha. An error means "don't know"; the
+// sweep then deletes nothing.
+func blobCitedTx(ctx context.Context, tx *sql.Tx, d store.Dialect, agentID, sha string) (bool, error) {
 	var found int
 	var err error
-	if agentID != "" {
+	switch {
+	case d.IsPostgres():
+		// The same match as the json_tree queries below (and as
+		// BlobBelongsToAgent): 'strict $.**' yields every item of the doc
+		// once, and jsonb equality with a JSON string matches only a
+		// string.
+		const cited = `EXISTS (SELECT 1 FROM jsonb_path_query(CAST(r.doc AS jsonb), 'strict $.**') AS o(v)
+			WHERE jsonb_typeof(o.v) = 'object'
+			AND ((o.v -> 'blob') = to_jsonb(CAST(? AS TEXT)) OR (o.v -> 'poster_blob') = to_jsonb(CAST(? AS TEXT))))`
+		if agentID != "" {
+			err = tx.QueryRowContext(ctx, `SELECT 1 FROM inbox_requests r WHERE r.agent_id=? AND `+cited+` LIMIT 1`, agentID, sha, sha).Scan(&found)
+		} else {
+			err = tx.QueryRowContext(ctx, `SELECT 1 FROM inbox_requests r WHERE `+cited+` LIMIT 1`, sha, sha).Scan(&found)
+		}
+	case agentID != "":
 		err = tx.QueryRowContext(ctx, `SELECT 1 FROM inbox_requests r, json_tree(r.doc) j WHERE r.agent_id=? AND j.key IN ('blob','poster_blob') AND j.type='text' AND j.value=? LIMIT 1`, agentID, sha).Scan(&found)
-	} else {
+	default:
 		err = tx.QueryRowContext(ctx, `SELECT 1 FROM inbox_requests r, json_tree(r.doc) j WHERE j.key IN ('blob','poster_blob') AND j.type='text' AND j.value=? LIMIT 1`, sha).Scan(&found)
 	}
-	return err == nil && found == 1
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return found == 1, nil
 }
