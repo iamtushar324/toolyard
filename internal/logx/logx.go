@@ -79,9 +79,11 @@ func For(component string) *slog.Logger {
 // migration. Each stdlib log line becomes a single slog event with
 // component=legacy and the message in the "msg" field. Its level comes
 // from the line (bridgeLevel): a leading "ERROR:", "WARN:" or "INFO:" is
-// stripped and sets the level; otherwise a line that names an error,
-// failure or panic is ERROR, one that names a warning or deprecation is
-// WARN, and anything else is INFO. The configured level applies as usual.
+// stripped and sets the level; otherwise an uppercase level word anywhere
+// in the line ("mcp-auth: WARN token check failed") sets it; otherwise a
+// line that names an error, failure or panic is ERROR, one that names a
+// warning or deprecation is WARN, and anything else is INFO. The
+// configured level applies as usual.
 //
 // Returns an io.Writer; callers wire it via log.SetOutput(bridgeWriter).
 // We do NOT clear stdlib log flags — leave that to the caller so they can
@@ -129,6 +131,20 @@ var bridgePrefixes = []struct {
 	{"INFO:", slog.LevelInfo},
 }
 
+// bridgeLevelTokens are explicit uppercase level words a legacy line may
+// carry anywhere ("mcp-auth: WARN token check failed"). They match as whole
+// words and case-sensitively, and the leftmost one sets the level, ahead
+// of the keyword heuristics.
+var bridgeLevelTokens = []struct {
+	token string
+	level slog.Level
+}{
+	{"WARNING", slog.LevelWarn},
+	{"ERROR", slog.LevelError},
+	{"WARN", slog.LevelWarn},
+	{"INFO", slog.LevelInfo},
+}
+
 // Words that classify a legacy line without an explicit prefix. They match
 // as whole words only (see hasWord), so "error_rate" or "terrorist" do not.
 var (
@@ -145,6 +161,9 @@ func bridgeLevel(line string) (slog.Level, string) {
 			return p.level, strings.TrimLeft(trimmed[len(p.prefix):], " \t")
 		}
 	}
+	if level, ok := levelToken(line); ok {
+		return level, line
+	}
 	lower := strings.ToLower(line)
 	switch {
 	case hasWord(lower, bridgeErrorWords):
@@ -155,24 +174,45 @@ func bridgeLevel(line string) (slog.Level, string) {
 	return slog.LevelInfo, line
 }
 
+// levelToken returns the level of the leftmost uppercase level word in
+// line (bridgeLevelTokens), if there is one.
+func levelToken(line string) (slog.Level, bool) {
+	best, found := -1, slog.LevelInfo
+	for _, t := range bridgeLevelTokens {
+		if at := wordIndex(line, t.token); at >= 0 && (best < 0 || at < best) {
+			best, found = at, t.level
+		}
+	}
+	return found, best >= 0
+}
+
 // hasWord reports whether s (lower case) contains one of words as a whole
 // word: the bytes on both sides are not letters, digits or '_'.
 func hasWord(s string, words []string) bool {
 	for _, w := range words {
-		for i := 0; i < len(s); {
-			j := strings.Index(s[i:], w)
-			if j < 0 {
-				break
-			}
-			start := i + j
-			end := start + len(w)
-			if (start == 0 || !isWordByte(s[start-1])) && (end == len(s) || !isWordByte(s[end])) {
-				return true
-			}
-			i = start + 1
+		if wordIndex(s, w) >= 0 {
+			return true
 		}
 	}
 	return false
+}
+
+// wordIndex returns where w first occurs in s as a whole word, or -1.
+// The comparison is exact (case-sensitive).
+func wordIndex(s, w string) int {
+	for i := 0; i < len(s); {
+		j := strings.Index(s[i:], w)
+		if j < 0 {
+			return -1
+		}
+		start := i + j
+		end := start + len(w)
+		if (start == 0 || !isWordByte(s[start-1])) && (end == len(s) || !isWordByte(s[end])) {
+			return start
+		}
+		i = start + 1
+	}
+	return -1
 }
 
 func isWordByte(c byte) bool {

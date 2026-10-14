@@ -59,12 +59,27 @@ func TestCheckWritesNothingAndAgreesWithLoadAll(t *testing.T) {
 		{name: "existing keys, no canaries", mode: Require,
 			setup: func(t *testing.T, e *env) {
 				for _, n := range []string{IdentityKey, OAuthKey, SecretsKey, SessionKey} {
+					k := randomKey(t)
+					writeKey(t, e.dataDir, n, sealbox.EncodeKey(k))
+					if n == SecretsKey {
+						sealSecret(t, e, "API_KEY", k, time.Now())
+					}
+				}
+			},
+			want: all(ok),
+			detail: map[string]string{
+				IdentityKey: "adopted on the next start",
+				SecretsKey:  "opens existing data in secrets",
+			}},
+		{name: "existing keys, the secrets key opens none of its data", mode: Require,
+			setup: func(t *testing.T, e *env) {
+				for _, n := range []string{IdentityKey, OAuthKey, SecretsKey, SessionKey} {
 					writeKey(t, e.dataDir, n, sealbox.EncodeKey(randomKey(t)))
 				}
-				insertSealedSecret(t, e)
+				sealSecret(t, e, "API_KEY", randomKey(t), time.Now())
 			},
-			want:   all(ok),
-			detail: map[string]string{IdentityKey: "adopted on the next start"}},
+			want:   with(all(ok), SecretsKey, fail),
+			detail: map[string]string{SecretsKey: "does not open existing data"}},
 		{name: "wrong key", mode: CreateIfFresh,
 			setup: func(t *testing.T, e *env) {
 				loadOrFail(t, e)

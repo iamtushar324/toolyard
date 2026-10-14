@@ -32,23 +32,64 @@ func TestStateFlags(t *testing.T) {
 	}
 }
 
-func TestReadyOrderAndCache(t *testing.T) {
-	var pings atomic.Int32
-	pingErr := error(nil)
-	var mu sync.Mutex
-	s := &State{}
-	p := NewProber(s, func(ctx context.Context) error {
-		pings.Add(1)
-		if _, ok := ctx.Deadline(); !ok {
-			t.Error("ping without a deadline")
-		}
-		mu.Lock()
-		defer mu.Unlock()
-		return pingErr
-	})
-	now := time.Unix(1000, 0)
-	p.now = func() time.Time { return now }
+// waitPing waits for the Prober's running ping, if any.
+func (p *Prober) waitPing() {
+	p.mu.Lock()
+	done := p.inflight
+	p.mu.Unlock()
+	if done != nil {
+		<-done
+	}
+}
 
+// fakeDB is a database ping whose answer a test sets, on a clock the test
+// moves.
+type fakeDB struct {
+	mu    sync.Mutex
+	err   error
+	clock time.Time
+	pings atomic.Int32
+	t     *testing.T
+}
+
+func (f *fakeDB) ping(ctx context.Context) error {
+	f.pings.Add(1)
+	if dl, ok := ctx.Deadline(); !ok || time.Until(dl) > dbPingTimeout || time.Until(dl) < dbPingTimeout-time.Second {
+		f.t.Errorf("ping deadline %v (set %v), want about %s", dl, ok, dbPingTimeout)
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.err
+}
+
+func (f *fakeDB) now() time.Time {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.clock
+}
+
+func (f *fakeDB) set(err error) {
+	f.mu.Lock()
+	f.err = err
+	f.mu.Unlock()
+}
+
+func (f *fakeDB) advance(d time.Duration) {
+	f.mu.Lock()
+	f.clock = f.clock.Add(d)
+	f.mu.Unlock()
+}
+
+func newFakeProber(t *testing.T, s *State) (*Prober, *fakeDB) {
+	f := &fakeDB{clock: time.Unix(1000, 0), t: t}
+	p := NewProber(s, f.ping)
+	p.now = f.now
+	return p, f
+}
+
+func TestReadyOrderAndCache(t *testing.T) {
+	s := &State{}
+	p, db := newFakeProber(t, s)
 	check := func(wantOK bool, wantReason string) {
 		t.Helper()
 		ok, reason := p.Ready()
@@ -59,28 +100,93 @@ func TestReadyOrderAndCache(t *testing.T) {
 	check(false, ReasonKeys)
 	s.MarkKeysVerified()
 	check(false, ReasonStarting)
-	if pings.Load() != 0 {
+	if db.pings.Load() != 0 {
 		t.Fatal("pinged before the flags were ready")
 	}
 	s.MarkStarted()
+	check(true, "") // the first check waits for its ping
 	check(true, "")
 	check(true, "")
-	if pings.Load() != 1 {
-		t.Fatalf("%d pings within the cache window, want 1", pings.Load())
-	}
-	// The cached answer holds until the window passes.
-	mu.Lock()
-	pingErr = errors.New("database is locked")
-	mu.Unlock()
-	check(true, "")
-	now = now.Add(readyCacheTTL)
-	check(false, ReasonDB)
-	if pings.Load() != 2 {
-		t.Fatalf("%d pings after the window, want 2", pings.Load())
+	if n := db.pings.Load(); n != 1 {
+		t.Fatalf("%d pings within the cache window, want 1", n)
 	}
 	// Draining wins at once.
 	s.SetDraining()
 	check(false, ReasonDraining)
+}
+
+// A busy database (the single connection held by a long query) fails one
+// ping: readiness holds. Only two failed pings in a row report "db", and
+// one good ping brings it back.
+func TestReadyToleratesOneFailedPing(t *testing.T) {
+	s := &State{}
+	s.MarkKeysVerified()
+	s.MarkStarted()
+	p, db := newFakeProber(t, s)
+	check := func(wantOK bool) {
+		t.Helper()
+		ok, reason := p.Ready()
+		if ok != wantOK || (!ok && reason != ReasonDB) {
+			t.Fatalf("Ready() = %v %q, want %v", ok, reason, wantOK)
+		}
+	}
+	// next moves past the cache window, lets the probe start a ping in
+	// the background (answering from the old results), and waits for it.
+	next := func(wantNow bool) {
+		t.Helper()
+		db.advance(readyCacheTTL)
+		check(wantNow)
+		p.waitPing()
+	}
+	check(true)
+	db.set(errors.New("context deadline exceeded"))
+	next(true)
+	check(true) // one failure: still ready
+	next(true)
+	check(false) // two in a row: down
+	if n := db.pings.Load(); n != 3 {
+		t.Fatalf("%d pings, want 3", n)
+	}
+	db.set(nil)
+	next(false)
+	check(true) // one good ping: back
+	// A probe never waits for a background ping.
+	db.set(errors.New("busy"))
+	db.advance(readyCacheTTL)
+	check(true)
+	p.waitPing()
+}
+
+func TestReadyIsDownWhenTheFirstPingFails(t *testing.T) {
+	s := &State{}
+	s.MarkKeysVerified()
+	s.MarkStarted()
+	p, db := newFakeProber(t, s)
+	db.set(errors.New("database is closed"))
+	if ok, reason := p.Ready(); ok || reason != ReasonDB {
+		t.Fatalf("no successful ping yet: %v %q", ok, reason)
+	}
+}
+
+func TestConcurrentProbesShareOnePing(t *testing.T) {
+	s := &State{}
+	s.MarkKeysVerified()
+	s.MarkStarted()
+	p, db := newFakeProber(t, s)
+	var wg sync.WaitGroup
+	for i := 0; i < 20; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if ok, _ := p.Ready(); !ok {
+				t.Error("not ready")
+			}
+		}()
+	}
+	wg.Wait()
+	if n := db.pings.Load(); n != 1 {
+		t.Fatalf("%d pings for 20 concurrent first probes, want 1", n)
+	}
 }
 
 func TestProbeHandlers(t *testing.T) {
@@ -234,22 +340,20 @@ func TestRequireToken(t *testing.T) {
 		h.ServeHTTP(rec, req)
 		return rec.Code
 	}
-	if c := call("127.0.0.1:5000", "", nil); c != http.StatusNoContent {
-		t.Errorf("loopback without token: %d", c)
-	}
-	if c := call("[::1]:5000", "", nil); c != http.StatusNoContent {
-		t.Errorf("IPv6 loopback without token: %d", c)
-	}
-	for _, auth := range []string{"", "Bearer wrong", "Bearer " + token + "x", "Basic " + token, token} {
-		if c := call("10.0.0.7:5000", auth, nil); c != http.StatusUnauthorized {
-			t.Errorf("non-loopback with %q: %d", auth, c)
+	// Every peer needs the token, loopback included: a relay on the same
+	// host would otherwise let any remote caller in.
+	for _, peer := range []string{"127.0.0.1:5000", "[::1]:5000", "10.0.0.7:5000", "203.0.113.9:5000"} {
+		for _, auth := range []string{"", "Bearer wrong", "Bearer " + token + "x", "Basic " + token, token} {
+			if c := call(peer, auth, nil); c != http.StatusUnauthorized {
+				t.Errorf("%s with %q: %d", peer, auth, c)
+			}
+		}
+		if c := call(peer, "Bearer "+token, nil); c != http.StatusNoContent {
+			t.Errorf("%s with the token: %d", peer, c)
 		}
 	}
-	if c := call("10.0.0.7:5000", "Bearer "+token, nil); c != http.StatusNoContent {
-		t.Errorf("non-loopback with the token: %d", c)
-	}
-	// A forwarded request through a local proxy is not loopback.
-	if c := call("127.0.0.1:5000", "", map[string]string{"X-Forwarded-For": "203.0.113.9"}); c != http.StatusUnauthorized {
+	// Proxy headers change nothing.
+	if c := call("127.0.0.1:5000", "", map[string]string{"X-Forwarded-For": "127.0.0.1"}); c != http.StatusUnauthorized {
 		t.Errorf("forwarded loopback without token: %d", c)
 	}
 	// No token: the handler is returned as is.
@@ -282,13 +386,27 @@ func TestListenServesTheOpsMux(t *testing.T) {
 	base := "http://" + srvs[0].Addr
 	client := &http.Client{Timeout: 3 * time.Second}
 	get := func(path string) (int, string) {
-		resp, err := client.Get(base + path)
+		req, err := http.NewRequest(http.MethodGet, base+path, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Authorization", "Bearer 0123456789abcdef-secret")
+		resp, err := client.Do(req)
 		if err != nil {
 			t.Fatalf("GET %s: %v", path, err)
 		}
 		defer resp.Body.Close()
 		b, _ := io.ReadAll(resp.Body)
 		return resp.StatusCode, string(b)
+	}
+	// Loopback without the token is refused when a token is set.
+	resp, err := client.Get(base + "/metrics")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusUnauthorized {
+		t.Errorf("loopback /metrics without the token: %d", resp.StatusCode)
 	}
 	if code, body := get("/metrics"); code != 200 || body != "toolyard_up 1\n" {
 		t.Errorf("/metrics: %d %q", code, body)

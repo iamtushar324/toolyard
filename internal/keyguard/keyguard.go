@@ -11,7 +11,9 @@
 // with the key. At startup every key must open its canary, so a wrong key
 // file stops the start instead of silently failing to decrypt. A key
 // without a canary gets one, which adopts the keys of an existing
-// installation on its first start with this version.
+// installation on its first start with this version, but only after it
+// opens a value the database already holds sealed with it (verify.go), so
+// a wrong key on disk at upgrade time is refused rather than locked in.
 //
 // A missing key is created only in create-if-fresh mode and only for a
 // fresh database: no canaries and no sealed rows. The one exception is a
@@ -199,12 +201,26 @@ func LoadAll(ctx context.Context, cfg Config, specs []Spec) (map[string][]byte, 
 	}
 
 	// 1. Every key found must match its canary before anything is written.
+	// A key without a canary must open the data already sealed with it
+	// (if any) before it is adopted.
 	for _, l := range found {
 		c, ok := canaries[l.spec.Name]
 		if ok && !openCanary(l.spec.Name, l.key, c.blob) {
 			return nil, configErrorf("key %s does not match this database: %s has key id %s, but the database was set up with key id %s. "+
 				"Restore the matching %s, or point -data at the database this key belongs to. Nothing was changed.",
 				l.spec.Name, l.path, KeyID(l.spec.Name, l.key), c.kid, l.spec.Name)
+		}
+		if ok {
+			continue
+		}
+		d, err := checkSealedData(ctx, cfg.DB, l.spec.Name, l.key)
+		if err != nil {
+			return nil, err
+		}
+		if !d.ok() {
+			return nil, configErrorf("key %s (%s, key id %s) does not open existing data: it opened none of the %d sealed values tried, starting with %s. "+
+				"It is not the key this database was sealed with. Restore the matching %s, or point -data at the database this key belongs to. Nothing was changed.",
+				l.spec.Name, l.path, KeyID(l.spec.Name, l.key), d.tried, d.failed, l.spec.Name)
 		}
 	}
 

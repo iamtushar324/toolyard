@@ -284,7 +284,7 @@ func runServe(argv []string) error {
 	keysFlag := fs.String("keys", string(keyguard.CreateIfFresh), "master keys: create-if-fresh (create a missing key only for a new, empty database) | require (never create; every key must be provided)")
 	credentialsDir := fs.String("credentials-dir", os.Getenv("TOOLYARD_CREDENTIALS_DIR"), "directory searched for key files (identity.key, oauth.key, secrets.key, session.key) and toolyard.env after $CREDENTIALS_DIRECTORY and before -data, e.g. /run/secrets. Defaults to $TOOLYARD_CREDENTIALS_DIR.")
 	opsAddr := fs.String("ops-addr", "", "comma-separated listen addresses for the ops listener (/metrics, /v1/livez, /v1/readyz), e.g. 127.0.0.1:9090. Empty = off. A non-private address needs -ops-token-file.")
-	opsTokenFile := fs.String("ops-token-file", "", "file holding the bearer token the ops listener requires from non-loopback peers")
+	opsTokenFile := fs.String("ops-token-file", "", "file holding the bearer token (16+ characters) the ops listener then requires on every request, from every peer, loopback included")
 	clickhouseRuntimeEnvPath := fs.String("clickhouse-runtime-env", "/var/lib/toolyard/clickhouse-runtime.env", "path where toolyard maintains a TOOLYARD_CH_PASSWORD=... line for the toolyard-clickhouse container's docker-compose env_file to consume. Updated on bootstrap and on every rotate. Empty disables the write (useful in tests).")
 	inboxResetPasskeys := fs.Bool("inbox-reset-passkeys", false, "delete every registered passkey at startup (recovery when the owner has lost all their devices), then continue normally")
 	inboxFetchPrivate := fs.Bool("inbox-fetch-private-networks", false, "let the inbox copy attachment links that point at loopback or private-network addresses (e.g. evidence hosted on your LAN). Off by default: agent-chosen URLs could otherwise reach internal services.")
@@ -1299,8 +1299,11 @@ func runServe(argv []string) error {
 		server.WithHTTPContextFunc(mcpAuthn.contextFunc),
 	)
 	// /mcp gets a larger body limit because tool-call args can be a few MB.
-	mux.Handle("/mcp", api.LimitBody(gateway.PreserveToolCallNumbers(mcpAuthn.guard(streamable)), 16<<20))
-	mux.Handle("/mcp/", api.LimitBody(gateway.PreserveToolCallNumbers(mcpAuthn.guard(streamable)), 16<<20))
+	// TEC-1626 drain: the stream gate refuses new GET streams once the
+	// drain starts and ends open ones with the other waiters (lifecycle.go).
+	mcpStreams := newMCPStreamGate()
+	mux.Handle("/mcp", mcpStreams.wrap(api.LimitBody(gateway.PreserveToolCallNumbers(mcpAuthn.guard(streamable)), 16<<20)))
+	mux.Handle("/mcp/", mcpStreams.wrap(api.LimitBody(gateway.PreserveToolCallNumbers(mcpAuthn.guard(streamable)), 16<<20)))
 
 	// pprof endpoints, gated to loopback. When toolyard hangs, run
 	//   curl -s http://127.0.0.1:<port>/debug/pprof/goroutine?debug=2
@@ -1461,9 +1464,11 @@ func runServe(argv []string) error {
 		refuseNew: func() {
 			gw.BeginDrain()
 			bus.BeginDrain()
+			mcpStreams.refuse()
 		},
 		releaseWaiters: func() {
 			hub.CloseAll()
+			mcpStreams.release()
 			inboxSvc.ReleaseWaiters()
 			gw.ReleaseWaiters()
 			bus.ReleaseWaiters()

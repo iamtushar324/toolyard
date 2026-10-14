@@ -409,10 +409,9 @@ func TestExistingKeysAreAdopted(t *testing.T) {
 		keys[n] = randomKey(t)
 		writeKey(t, e.dataDir, n, sealbox.EncodeKey(keys[n]))
 	}
-	now := time.Now().UnixMilli()
-	if _, err := e.db.Exec(`INSERT INTO secrets(name, value_enc, created_at, updated_at) VALUES('API_KEY', 'sealed-bytes', ?, ?)`, now, now); err != nil {
-		t.Fatal(err)
-	}
+	// A secret sealed with the secrets key on disk: adoption first checks
+	// that the key opens it.
+	sealSecret(t, e, "API_KEY", keys[SecretsKey], time.Now())
 	before := snapshot(t, e.dataDir)
 	got, err := e.load(t, Require)
 	if err != nil {

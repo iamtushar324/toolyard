@@ -7,7 +7,9 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/tusharbhardwaj/toolyard/internal/gateway"
@@ -209,6 +211,57 @@ func closeOnce(name string, timeout time.Duration, fn func(context.Context) erro
 		})
 		return err
 	}
+}
+
+// mcpStreamGate ends long-lived MCP GET streams at shutdown. In stateful
+// mode mcp-go's GET handler (the server-to-client notification stream)
+// runs until its request context ends, and http.Server.Shutdown never
+// cancels a request context, so one open stream would hold every stop for
+// the full -drain-timeout. POSTs (the tool calls) pass straight through.
+type mcpStreamGate struct {
+	refusing atomic.Bool
+	// streams is the parent of every GET stream's context; release
+	// cancels it.
+	streams context.Context
+	cancel  context.CancelFunc
+}
+
+func newMCPStreamGate() *mcpStreamGate {
+	ctx, cancel := context.WithCancel(context.Background())
+	return &mcpStreamGate{streams: ctx, cancel: cancel}
+}
+
+// wrap applies the gate to the /mcp handler.
+func (g *mcpStreamGate) wrap(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			next.ServeHTTP(w, r)
+			return
+		}
+		if g.refusing.Load() {
+			w.Header().Set("Retry-After", "5")
+			http.Error(w, "server restarting, reconnect", http.StatusServiceUnavailable)
+			return
+		}
+		// The stream ends when its client goes or when release runs,
+		// whichever comes first (AfterFunc also fires at once if release
+		// already ran).
+		ctx, cancel := context.WithCancel(r.Context())
+		defer cancel()
+		stop := context.AfterFunc(g.streams, cancel)
+		defer stop()
+		next.ServeHTTP(w, r.WithContext(ctx))
+	})
+}
+
+// refuse answers new GET streams with 503 and Retry-After (drain step 2).
+func (g *mcpStreamGate) refuse() { g.refusing.Store(true) }
+
+// release ends every open GET stream (drain step 4). New ones stay
+// refused.
+func (g *mcpStreamGate) release() {
+	g.refusing.Store(true)
+	g.cancel()
 }
 
 // loopDone records that one iteration of a supervised loop completed.

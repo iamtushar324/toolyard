@@ -30,6 +30,13 @@ func TestBridgeLevelClassification(t *testing.T) {
 		{"error_rate=0 within bounds", slog.LevelInfo, "error_rate=0 within bounds"},
 		{"terrorists and failedness are not words we match", slog.LevelInfo, "terrorists and failedness are not words we match"},
 		{"warned_at=12", slog.LevelInfo, "warned_at=12"},
+		// An explicit uppercase level word anywhere wins over the keywords.
+		{"mcp-auth: WARN token check failed: bad signature", slog.LevelWarn, "mcp-auth: WARN token check failed: bad signature"},
+		{"retry: INFO attempt 1 failed, retrying", slog.LevelInfo, "retry: INFO attempt 1 failed, retrying"},
+		{"sync: WARNING 3 rows had errors", slog.LevelWarn, "sync: WARNING 3 rows had errors"},
+		{"job: ERROR then WARN later", slog.LevelError, "job: ERROR then WARN later"},
+		{"Warn and Error in mixed case are keywords, not tokens", slog.LevelError, "Warn and Error in mixed case are keywords, not tokens"},
+		{"WARNINGS is not a level word; nothing failed", slog.LevelError, "WARNINGS is not a level word; nothing failed"},
 	}
 	for _, c := range cases {
 		level, msg := bridgeLevel(c.line)
@@ -106,5 +113,13 @@ func TestLevelLabel(t *testing.T) {
 		if got := levelLabel(level); got != want {
 			t.Errorf("levelLabel(%v) = %q, want %q", level, got, want)
 		}
+	}
+}
+
+func TestBridgeLevelTokenFromActors(t *testing.T) {
+	// The line cmd/gateway/actors.go writes when a token check fails.
+	level, msg := bridgeLevel("mcp-auth: WARN token check failed: token expired")
+	if level != slog.LevelWarn || msg != "mcp-auth: WARN token check failed: token expired" {
+		t.Fatalf("got %v %q, want WARN and the line unchanged", level, msg)
 	}
 }

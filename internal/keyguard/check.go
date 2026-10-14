@@ -31,13 +31,14 @@ type KeyReport struct {
 }
 
 // Check is a dry run of LoadAll that writes nothing: the same search,
-// decode and canary rules, reported per key instead of acted on. It never
-// creates a key file and never writes a canary. cfg.DB may be nil when the
-// database does not exist yet (a first start creates it, so it is new),
-// and may be a read-only connection; a missing key_canaries table (a
-// database from before canaries) means no canaries. The error matches
-// ErrConfig when any key would stop the start, or when the database could
-// not be read.
+// decode and canary rules, and the same test of a key without a canary
+// against the data already sealed with it, reported per key instead of
+// acted on. It never creates a key file and never writes a canary. cfg.DB
+// may be nil when the database does not exist yet (a first start creates
+// it, so it is new), and may be a read-only connection; a missing
+// key_canaries table (a database from before canaries) means no canaries.
+// The error matches ErrConfig when any key would stop the start, or when
+// the database could not be read.
 func Check(ctx context.Context, cfg Config, specs []Spec) ([]KeyReport, error) {
 	mode, err := ParseMode(string(cfg.Mode))
 	if err != nil {
@@ -63,7 +64,7 @@ func Check(ctx context.Context, cfg Config, specs []Spec) ([]KeyReport, error) {
 		quiet.Logf = func(format string, args ...any) {
 			notes = append(notes, strings.TrimPrefix(fmt.Sprintf(format, args...), "warning: keys: "))
 		}
-		r := checkOne(quiet, sp, mode, dirs, canaries, sealed, fresh)
+		r := checkOne(ctx, quiet, sp, mode, dirs, canaries, sealed, fresh)
 		if len(notes) > 0 {
 			r.Detail += "; note: " + strings.Join(notes, "; ")
 		}
@@ -78,7 +79,7 @@ func Check(ctx context.Context, cfg Config, specs []Spec) ([]KeyReport, error) {
 	return reports, nil
 }
 
-func checkOne(cfg Config, sp Spec, mode Mode, dirs []string, canaries map[string]canary, sealed []string, fresh bool) KeyReport {
+func checkOne(ctx context.Context, cfg Config, sp Spec, mode Mode, dirs []string, canaries map[string]canary, sealed []string, fresh bool) KeyReport {
 	r := KeyReport{Name: sp.Name}
 	key, path, err := find(cfg, sp.Name, dirs)
 	if err != nil {
@@ -94,8 +95,21 @@ func checkOne(cfg Config, sp Spec, mode Mode, dirs []string, canaries map[string
 			r.Status, r.Detail = StatusOK, found+"; matches its canary"
 		case ok:
 			r.Status, r.Detail = StatusFail, found+fmt.Sprintf("; does not match this database, which expects key id %s", c.kid)
-		default:
+		case cfg.DB == nil:
 			r.Status, r.Detail = StatusOK, found+"; no canary yet: adopted on the next start"
+		default:
+			// As LoadAll: adopted only if it opens the data sealed with it.
+			d, err := checkSealedData(ctx, cfg.DB, sp.Name, key)
+			switch {
+			case err != nil:
+				r.Status, r.Detail = StatusFail, found+fmt.Sprintf("; cannot check it against the data: %v", err)
+			case !d.ok():
+				r.Status, r.Detail = StatusFail, found+fmt.Sprintf("; does not open existing data: none of the %d sealed values tried opened, starting with %s", d.tried, d.failed)
+			case d.opened != "":
+				r.Status, r.Detail = StatusOK, found+fmt.Sprintf("; no canary yet: opens existing data in %s, so it is adopted on the next start", d.opened)
+			default:
+				r.Status, r.Detail = StatusOK, found+"; no canary yet: adopted on the next start"
+			}
 		}
 		return r
 	}

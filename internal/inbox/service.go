@@ -147,6 +147,13 @@ type Service struct {
 	// counts the loop's passes (tests).
 	legacySync   chan struct{}
 	legacyPasses atomic.Int64
+	// legacySig is the legacySignatureSQL value read before the last
+	// committed sync pass, and legacyClean whether that pass skipped no
+	// row. The periodic pass skips its transaction while the signature
+	// is unchanged.
+	legacyMu    sync.Mutex
+	legacySig   string
+	legacyClean bool
 }
 
 // New creates the service and loads (or creates) the grant signing key.

@@ -3,6 +3,8 @@ package main
 import (
 	"context"
 	"errors"
+	"net/http"
+	"net/http/httptest"
 	"reflect"
 	"strings"
 	"sync"
@@ -138,5 +140,68 @@ func TestCloseOnceRunsOnceAndIsBounded(t *testing.T) {
 	}
 	if !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("hanging close error = %v, want deadline exceeded", err)
+	}
+}
+
+// The /mcp stream gate: once draining, new GET streams get 503 with
+// Retry-After; release ends the open ones (http.Server.Shutdown never
+// cancels their request context); POSTs always pass.
+func TestMCPStreamGate(t *testing.T) {
+	gate := newMCPStreamGate()
+	opened := make(chan struct{}, 1)
+	ended := make(chan error, 1)
+	var posts atomic.Int32
+	h := gate.wrap(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			posts.Add(1)
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		opened <- struct{}{}
+		<-r.Context().Done() // mcp-go's GET loop runs until this
+		ended <- r.Context().Err()
+	}))
+
+	streamDone := make(chan struct{})
+	go func() {
+		h.ServeHTTP(httptest.NewRecorder(), httptest.NewRequest(http.MethodGet, "/mcp", nil))
+		close(streamDone)
+	}()
+	select {
+	case <-opened:
+	case <-time.After(3 * time.Second):
+		t.Fatal("the GET stream did not open")
+	}
+
+	gate.refuse()
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/mcp", nil))
+	if rec.Code != http.StatusServiceUnavailable || rec.Header().Get("Retry-After") != "5" {
+		t.Fatalf("new GET while draining: %d Retry-After=%q, want 503 and 5", rec.Code, rec.Header().Get("Retry-After"))
+	}
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/mcp", strings.NewReader("{}")))
+	if rec.Code != http.StatusOK || posts.Load() != 1 {
+		t.Fatalf("POST while draining: %d, want it passed through", rec.Code)
+	}
+	select {
+	case <-streamDone:
+		t.Fatal("refusing new streams must not end the open one")
+	case <-time.After(20 * time.Millisecond):
+	}
+
+	gate.release()
+	select {
+	case <-streamDone:
+	case <-time.After(3 * time.Second):
+		t.Fatal("release did not end the open GET stream")
+	}
+	if err := <-ended; !errors.Is(err, context.Canceled) {
+		t.Fatalf("stream context ended with %v, want canceled", err)
+	}
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, httptest.NewRequest(http.MethodPost, "/mcp", strings.NewReader("{}")))
+	if rec.Code != http.StatusOK || posts.Load() != 2 {
+		t.Fatalf("POST after release: %d, want it passed through", rec.Code)
 	}
 }

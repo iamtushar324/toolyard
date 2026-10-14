@@ -21,7 +21,8 @@ type ListenerConfig struct {
 	// Addrs is the -ops-addr value: one or more comma-separated
 	// host:port addresses. Empty turns the listener off.
 	Addrs string
-	// TokenFile is the -ops-token-file path. Empty means no token: then
+	// TokenFile is the -ops-token-file path. When set, every request must
+	// carry the token, loopback peers included. Empty means no token: then
 	// every address must be loopback or private.
 	TokenFile string
 	// Handler serves every listener (see Mux).
@@ -96,7 +97,7 @@ func Listen(cfg ListenerConfig) ([]*http.Server, error) {
 		}
 		servers = append(servers, srv)
 		addr := srv.Addr
-		logf("ops: listening on %s (/metrics, /v1/livez, /v1/readyz; token required for non-loopback peers: %v)", addr, token != "")
+		logf("ops: listening on %s (/metrics, /v1/livez, /v1/readyz; bearer token required: %v)", addr, token != "")
 		go func(srv *http.Server, ln net.Listener, addr string) {
 			if err := srv.Serve(ln); err != nil && !errors.Is(err, http.ErrServerClosed) {
 				logf("ops: serve %s: %v", addr, err)
@@ -178,20 +179,18 @@ func PrivateHost(host string) bool {
 	return ip.IsLoopback() || ip.IsPrivate() || ip.IsLinkLocalUnicast() || sharedAddressSpace.Contains(ip)
 }
 
-// RequireToken wraps h so that, when token is set, every peer that is not
-// a direct loopback connection must send "Authorization: Bearer <token>".
-// The comparison is constant-time over SHA-256 digests, so neither the
-// token nor its length leaks through timing. An empty token returns h.
+// RequireToken wraps h so that, when token is set, every request must send
+// "Authorization: Bearer <token>", from any peer: a loopback peer is not
+// trusted either, because a TCP relay on the same host would make any
+// remote caller look local. The comparison is constant-time over SHA-256
+// digests, so neither the token nor its length leaks through timing. An
+// empty token returns h.
 func RequireToken(token string, h http.Handler) http.Handler {
 	if token == "" {
 		return h
 	}
 	want := sha256.Sum256([]byte(token))
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if directLoopback(r) {
-			h.ServeHTTP(w, r)
-			return
-		}
 		got, ok := strings.CutPrefix(r.Header.Get("Authorization"), "Bearer ")
 		sum := sha256.Sum256([]byte(got))
 		if !ok || subtle.ConstantTimeCompare(sum[:], want[:]) != 1 {
@@ -201,18 +200,4 @@ func RequireToken(token string, h http.Handler) http.Handler {
 		}
 		h.ServeHTTP(w, r)
 	})
-}
-
-// directLoopback reports whether the TCP peer itself is loopback and no
-// proxy header claims another client (as api.DirectLoopback).
-func directLoopback(r *http.Request) bool {
-	if len(r.Header.Values("X-Forwarded-For")) > 0 || len(r.Header.Values("Forwarded")) > 0 || r.Header.Get("X-Real-Ip") != "" {
-		return false
-	}
-	host, _, err := net.SplitHostPort(r.RemoteAddr)
-	if err != nil {
-		host = r.RemoteAddr
-	}
-	ip := net.ParseIP(host)
-	return ip != nil && ip.IsLoopback()
 }

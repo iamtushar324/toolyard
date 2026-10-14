@@ -158,6 +158,9 @@ func (s *Service) SyncLegacy(ctx context.Context) error {
 		if e != nil {
 			return e
 		}
+		if string(doc) == existing {
+			continue // already up to date: no write
+		}
 		_, e = tx.ExecContext(ctx, `INSERT INTO inbox_requests(id,agent_id,kind,status,urgency,doc,created_at,updated_at,expires_at) VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO UPDATE SET doc=excluded.doc,status=excluded.status,updated_at=excluded.updated_at`, r.ID, r.AgentID, r.Kind, r.Status, r.Urgency, string(doc), r.CreatedAt, r.UpdatedAt, r.ExpiresAt)
 		if e != nil {
 			return e
@@ -181,8 +184,10 @@ func (s *Service) RequestLegacySync() {
 	}
 }
 
-// RunLegacySync runs LegacySyncPass on a RequestLegacySync signal or every
-// interval, one pass at a time, until ctx is done.
+// RunLegacySync runs one pass at a time until ctx is done: a full
+// LegacySyncPass on every RequestLegacySync signal, and every interval a
+// pass that skips its transaction when the legacy tables are unchanged
+// since the last committed pass (legacySyncIfChanged).
 func (s *Service) RunLegacySync(ctx context.Context, every time.Duration) {
 	if every <= 0 {
 		every = LegacySyncInterval
@@ -194,10 +199,61 @@ func (s *Service) RunLegacySync(ctx context.Context, every time.Duration) {
 		case <-ctx.Done():
 			return
 		case <-s.legacySync:
+			_ = s.LegacySyncPass(ctx)
 		case <-t.C:
+			s.legacySyncIfChanged(ctx)
 		}
-		_ = s.LegacySyncPass(ctx)
 	}
+}
+
+// legacySignatureSQL summarises everything SyncLegacy reads, so the
+// periodic pass can see that nothing changed without a write transaction.
+// Every write to approval_requests adds a row, moves a row between
+// statuses, or stamps decided_at or result_executed_at with the current
+// time; a claim is added, changes state, or gets finished_at.
+const legacySignatureSQL = `SELECT
+ (SELECT COUNT(*)||':'||COALESCE(SUM(status='pending'),0)||':'||COALESCE(SUM(status='allowed'),0)||':'||
+   COALESCE(SUM(status='denied'),0)||':'||COALESCE(SUM(status='expired'),0)||':'||COALESCE(SUM(status='cancelled'),0)||':'||
+   COALESCE(MAX(created_at),0)||':'||COALESCE(MAX(decided_at),0)||':'||COALESCE(MAX(result_executed_at),0)
+  FROM approval_requests)
+ ||'|'||
+ (SELECT COUNT(*)||':'||COALESCE(SUM(state='running'),0)||':'||COALESCE(SUM(state='outcome_unknown'),0)||':'||
+   COALESCE(MAX(claimed_at),0)||':'||COALESCE(MAX(finished_at),0)
+  FROM legacy_execution_claims)`
+
+func (s *Service) legacySignature(ctx context.Context) (string, error) {
+	var sig string
+	err := s.db.QueryRowContext(ctx, legacySignatureSQL).Scan(&sig)
+	return sig, err
+}
+
+// legacySyncIfChanged is the periodic pass. While the legacy tables are as
+// the last committed pass found them, it only reports the loop alive (and
+// in sync, when that pass skipped no row); otherwise it runs
+// LegacySyncPass.
+func (s *Service) legacySyncIfChanged(ctx context.Context) {
+	if sig, err := s.legacySignature(ctx); err == nil {
+		s.legacyMu.Lock()
+		same, clean := s.legacySig != "" && sig == s.legacySig, s.legacyClean
+		s.legacyMu.Unlock()
+		if same {
+			now := time.Now()
+			opsmetrics.SetLoopLastSuccess(LegacySyncLoop, now)
+			if clean {
+				opsmetrics.SetLegacySyncSuccess(now)
+			}
+			return
+		}
+	}
+	_ = s.LegacySyncPass(ctx)
+}
+
+// rememberLegacySync records the signature read before a committed pass.
+// An empty sig (unreadable) makes the next periodic pass run.
+func (s *Service) rememberLegacySync(sig string, clean bool) {
+	s.legacyMu.Lock()
+	s.legacySig, s.legacyClean = sig, clean
+	s.legacyMu.Unlock()
 }
 
 // legacySkipLogMax caps how many skipped IDs one log line names.
@@ -208,15 +264,26 @@ const legacySkipLogMax = 20
 // failed or skipped rows. The caller continues either way.
 func (s *Service) LegacySyncPass(ctx context.Context) error {
 	s.legacyPasses.Add(1)
+	// Read before the sync: a change after this read makes the next
+	// signature differ, so no change is ever missed (at worst one extra
+	// pass runs).
+	sig, sigErr := s.legacySignature(ctx)
+	if sigErr != nil {
+		sig = ""
+	}
 	err := s.SyncLegacy(ctx)
 	lg := logx.For("inbox")
 	var skip *LegacySkipError
 	switch {
 	case err == nil:
+		s.rememberLegacySync(sig, true)
 		now := time.Now()
 		opsmetrics.SetLegacySyncSuccess(now)
 		opsmetrics.SetLoopLastSuccess(LegacySyncLoop, now)
 	case errors.As(err, &skip):
+		// Committed, but not in sync: the periodic pass stays quiet until
+		// the tables change, and the success time stays stale.
+		s.rememberLegacySync(sig, false)
 		opsmetrics.IncLegacySyncFailure()
 		opsmetrics.SetLoopLastSuccess(LegacySyncLoop, time.Now())
 		ids := skip.IDs
@@ -228,6 +295,7 @@ func (s *Service) LegacySyncPass(ctx context.Context) error {
 	case ctx.Err() != nil:
 		// Shutdown cancelled the pass; the next process syncs at start.
 	default:
+		s.rememberLegacySync("", false)
 		opsmetrics.IncLegacySyncFailure()
 		lg.Error("legacy Inbox sync failed", "err", err.Error())
 	}

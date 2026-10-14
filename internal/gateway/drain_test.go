@@ -3,7 +3,9 @@ package gateway
 import (
 	"context"
 	"path/filepath"
+	"reflect"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -260,5 +262,144 @@ func TestDrainMidDispatchKeepsTheGrantedOutcome(t *testing.T) {
 	}
 	if ex.State != inbox.ExecutionSucceeded {
 		t.Fatalf("execution state = %q, want succeeded", ex.State)
+	}
+}
+
+// calledTools records which test tools ran, in order.
+type calledTools struct {
+	mu    sync.Mutex
+	names []string
+}
+
+func (c *calledTools) add(name string) {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	c.names = append(c.names, name)
+}
+
+func (c *calledTools) get() []string {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return append([]string(nil), c.names...)
+}
+
+// drainHookVisibility runs onVisible the first time routeEntry asks about
+// tool, which is before that call's drain check.
+type drainHookVisibility struct {
+	tool      string
+	once      sync.Once
+	onVisible func()
+}
+
+func (v *drainHookVisibility) List(_ context.Context, tools []mcp.Tool) []mcp.Tool { return tools }
+
+func (v *drainHookVisibility) IsVisible(_ context.Context, name string) bool {
+	if name == v.tool {
+		v.once.Do(v.onVisible)
+	}
+	return true
+}
+
+// newAdmittedGateway builds a gateway with two open tools, alpha.first and
+// alpha.second. Each records its call, then runs onCall (when set). vis,
+// when set, is the visibility provider.
+func newAdmittedGateway(t *testing.T, vis VisibilityProvider, onCall func(tool string)) (*Gateway, *calledTools) {
+	t.Helper()
+	db, err := store.Open(filepath.Join(t.TempDir(), "admitted.db"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+	bus, err := approval.New(context.Background(), db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	opts := Options{Policy: policy.New(db), Approval: bus, Audit: audit.New(db), Hub: realtime.NewHub(), Memory: memory.New(db)}
+	if vis != nil {
+		opts.Visibility = vis
+	}
+	gw := New(opts)
+	gw.RegisterBuiltins()
+	t.Cleanup(func() { _ = gw.Close() })
+	calls := &calledTools{}
+	for _, short := range []string{"first", "second"} {
+		name := "alpha." + short
+		gw.registerEntry(toolEntry{
+			tool:     mcp.Tool{Name: name, Description: descriptionBanner + short, InputSchema: mcp.ToolInputSchema{Type: "object", Properties: addMetaProps(map[string]any{})}},
+			upstream: "alpha", originalName: short, reasonField: ReasonField, forcedAction: &actionAllow,
+			handle: func(context.Context, map[string]any) (*mcp.CallToolResult, error) {
+				calls.add(name)
+				if onCall != nil {
+					onCall(name)
+				}
+				return mcp.NewToolResultText("ran " + name), nil
+			},
+		})
+	}
+	return gw, calls
+}
+
+func mustRoute(t *testing.T, gw *Gateway, ctx context.Context, tool string, args map[string]any) *mcp.CallToolResult {
+	t.Helper()
+	res, err := gw.RouteCall(ctx, "test", tool, args)
+	if err != nil {
+		t.Fatalf("%s: %v", tool, err)
+	}
+	return res
+}
+
+// A script admitted before the drain finishes: its second nested call,
+// made after BeginDrain, still runs. Refusing it would abort the script
+// after its first write, and the agent's rerun would repeat that write.
+// New top-level calls are refused.
+func TestDrainLetsAnAdmittedScriptFinish(t *testing.T) {
+	var gw *Gateway
+	gw, calls := newAdmittedGateway(t, nil, func(tool string) {
+		if tool == "alpha.first" {
+			gw.BeginDrain() // the drain starts while the script runs
+		}
+	})
+	ctx := WithAgentID(context.Background(), "ag_1")
+	res := mustRoute(t, gw, ctx, CodeModeExecuteToolCode, map[string]any{
+		"code": "a = alpha.first()\nb = alpha.second()\nresult = b",
+	})
+	if res.IsError {
+		t.Fatalf("the admitted script failed: %s", textOf(res))
+	}
+	if !gw.Draining() {
+		t.Fatal("the drain did not start during the script")
+	}
+	if got, want := calls.get(), []string{"alpha.first", "alpha.second"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("calls = %v, want %v", got, want)
+	}
+
+	assertRestarting(t, mustRoute(t, gw, ctx, "alpha.first", map[string]any{ReasonField: testReason}))
+	assertRestarting(t, mustRoute(t, gw, ctx, CodeModeExecuteToolCode, map[string]any{"code": "result = alpha.first()"}))
+	if got := calls.get(); len(got) != 2 {
+		t.Fatalf("a call made after the drain began ran: %v", got)
+	}
+}
+
+// tools.execute admitted before the drain reaches its target even though
+// the drain begins before the inner call's own check.
+func TestDrainDoesNotRefuseAdmittedToolsExecute(t *testing.T) {
+	var gw *Gateway
+	vis := &drainHookVisibility{tool: "alpha.first", onVisible: func() { gw.BeginDrain() }}
+	gw, calls := newAdmittedGateway(t, vis, nil)
+	ctx := WithAgentID(context.Background(), "ag_1")
+	res := mustRoute(t, gw, ctx, MetaExecuteTool, map[string]any{
+		ReasonField: testReason, "tool": "alpha.first", "arguments": map[string]any{},
+	})
+	if res.IsError || textOf(res) != "ran alpha.first" {
+		t.Fatalf("admitted tools.execute: %s", textOf(res))
+	}
+	if !gw.Draining() {
+		t.Fatal("the drain did not start before the inner call")
+	}
+	assertRestarting(t, mustRoute(t, gw, ctx, MetaExecuteTool, map[string]any{
+		ReasonField: testReason, "tool": "alpha.second", "arguments": map[string]any{},
+	}))
+	if got, want := calls.get(), []string{"alpha.first"}; !reflect.DeepEqual(got, want) {
+		t.Fatalf("calls = %v, want %v", got, want)
 	}
 }

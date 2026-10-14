@@ -552,7 +552,14 @@ each key must open its canary. A wrong key file stops the start with
 `key <name> does not match this database`, naming the key id of the file
 and the key id the database expects, before anything is written. A key
 that has no canary gets one; that is how the first start with this version
-adopts the keys of an existing installation.
+adopts the keys of an existing installation. Before it adopts a key,
+toolyard tries the key on values the database already holds sealed with
+it (the newest few of each kind, with the same binding the owning feature
+uses; one that opens is enough). A key that opens none of them stops the
+start with `key <name> ... does not open existing data`, so a wrong key
+file on disk at upgrade time is refused instead of being locked in. A key
+with no sealed values yet, and the session key, which seals nothing, are
+adopted as they are.
 
 Key errors, credential-file errors and a bad `-keys` value exit with code
 78 (`EX_CONFIG`). Restarting cannot fix them, so the systemd units in
@@ -570,15 +577,33 @@ toolyard keys-check -data /var/lib/toolyard -credentials-dir /run/secrets
 ```
 
 It opens `toolyard.db` read-only (no migrations, no writes), runs the same
-search, decode and canary rules as `serve`, and prints one line per key:
-where it was found and its key id, and whether its canary matches, is
-absent (the key is adopted on the next start, as on the first start after
-an upgrade from a version without canaries) or does not match. It never
+search, decode, canary and sealed-data checks as `serve`, and prints one
+line per key: where it was found and its key id, and whether its canary
+matches, is absent (the key is adopted on the next start, as on the first
+start after an upgrade from a version without canaries, once it opens the
+data sealed with it) or does not match, or whether the key `does not open
+existing data`. It never
 creates a key, writes a canary or changes any file, and it never prints
 key material. It exits 0 when every key would load on a real start, and
 78 when one would stop it. It checks `-keys=create-if-fresh` unless you
 pass `-keys require`. A missing session key is reported as `warn`: the
 start creates a new one and everyone signs in again.
+
+Run it with the directories the service really uses. A shell does not see
+a unit's `$CREDENTIALS_DIRECTORY`, so when the service gets its keys
+through systemd `LoadCredential=`, pass that directory with
+`-credentials-dir`, or `keys-check` falls back to the copies in `-data` and
+checks different files than the service loads. While the unit runs,
+systemd mounts its credentials at `/run/credentials/<unit>/`, readable by
+root:
+
+```bash
+sudo toolyard keys-check -data /var/lib/toolyard \
+  -credentials-dir /run/credentials/toolyard.service
+```
+
+Otherwise run it under the same credentials, for example with
+`systemd-run --pipe --wait -p LoadCredential=…` and the unit's lines.
 
 ### Moving keys and recovering
 
@@ -609,9 +634,14 @@ start creates a new one and everyone signs in again.
 
 The readiness reasons are `draining` (shutdown started), `keys` (master
 keys not yet verified), `starting` (startup recovery not finished) and
-`db` (the database did not answer a ping within 1 s). One ping result
-answers every probe for 1 s, so polling cannot put load on the database.
-The answer never carries more detail than the reason.
+`db` (no database ping has succeeded yet, or the last two pings in a row
+failed). The database has a single connection, so a ping waits behind a
+long query; each ping may take up to 3 s, and one slow or failed ping does
+not make the process unready. A probe answers from the latest ping results
+and starts at most one new ping per second, in the background, so polling
+cannot put load on the database and a probe does not wait on a busy one
+(only the first check after the start waits for its ping). The answer
+never carries more detail than the reason.
 
 `/livez`, `/readyz` and `/healthz` (liveness) are aliases. The probes need
 no session, have no rate limit and no CSRF check, and accept only `GET`
@@ -648,9 +678,12 @@ probes; every other path is a 404. The main listener never serves
   Any other address, an empty host (`:9090`) and `0.0.0.0` are refused at
   startup.
 - With `-ops-token-file <path>` (at least 16 characters, whitespace
-  trimmed), any address is allowed, and every peer that is not a direct
-  loopback connection must send `Authorization: Bearer <token>`. The token
-  is compared in constant time.
+  trimmed), any address is allowed, and every request must send
+  `Authorization: Bearer <token>`, from every peer, loopback included: a
+  relay on the same host would otherwise let remote callers in. The token
+  is compared in constant time. Probes on the ops listener then need the
+  header too; container and orchestrator checks can use the main
+  listener's `/v1/livez` and `/v1/readyz`, which need no token.
 
 | Metric | Type | Meaning |
 | --- | --- | --- |
@@ -671,7 +704,7 @@ probes; every other path is a 404. The main listener never serves
 | `toolyard_legacy_sync_last_success_timestamp_seconds` | gauge | last successful legacy approval sync into the Inbox (0 = never) |
 | `toolyard_legacy_sync_failures_total` | counter | failed legacy approval syncs |
 | `toolyard_log_records_total{level}` | counter | log records by level |
-| `toolyard_http_panics_total` | counter | panics recovered in HTTP handlers |
+| `toolyard_http_panics_total` | counter | panics recovered by the HTTP recovery middleware (every route of the main listener) and by the MCP tool-handler recovery |
 
 Labels never name an agent, a user, a tool or an argument. Each metric
 keeps at most 64 label sets; later new values are counted under `other`.
@@ -681,8 +714,11 @@ keeps at most 64 label sets; later new values are counted under `other`.
 On SIGTERM (or SIGINT) toolyard drains before it exits:
 
 1. Readiness turns `503` (`draining`) and new tool calls get a retryable
-   refusal, so a load balancer stops sending work.
-2. After `-drain-delay` (default `3s`), open streams close.
+   refusal, so a load balancer stops sending work. Open MCP `GET` streams
+   and dashboard event streams are closed at once, and a new stream `GET`
+   gets `503`, so clients reconnect to another instance.
+2. After `-drain-delay` (default `3s`), the HTTP server stops accepting
+   new requests.
 3. Open HTTP requests and in-flight executions have until `-drain-timeout`
    (default `60s`, counted from the start of the drain) to finish. Work
    still running then is cancelled and recorded as outcome unknown.

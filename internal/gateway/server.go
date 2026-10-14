@@ -8,6 +8,7 @@ import (
 	"log"
 	"math"
 	"net/http"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -378,7 +379,7 @@ func New(opts Options) *Gateway {
 	serverOpts := []server.ServerOption{
 		server.WithToolCapabilities(true),
 		server.WithLogging(),
-		server.WithRecovery(),
+		server.WithToolHandlerMiddleware(recoverToolPanics),
 		server.WithInstructions(buildInstructions(opts.Approval, opts.InLineWait)),
 	}
 	// The initialize hook remembers what each client says it is, so audit
@@ -570,6 +571,45 @@ func (g *Gateway) drainReleaseCh() <-chan struct{} {
 // ctx ends, and returns how many were still running.
 func (g *Gateway) WaitGrantedCalls(ctx context.Context) int {
 	return len(g.grantCalls.Wait(ctx))
+}
+
+// recoverToolPanics is mcp-go's WithRecovery (a panicking tool handler
+// becomes an error answer, the process keeps serving) that also logs the
+// panic at ERROR with its stack and counts it in the HTTP panic counter.
+// Without it the panic left no trace beyond the agent's error text.
+func recoverToolPanics(next server.ToolHandlerFunc) server.ToolHandlerFunc {
+	return func(ctx context.Context, request mcp.CallToolRequest) (result *mcp.CallToolResult, err error) {
+		defer func() {
+			if r := recover(); r != nil {
+				opsmetrics.IncHTTPPanic()
+				logx.For("gateway").Error("panic in tool handler",
+					"tool", request.Params.Name, "panic", fmt.Sprint(r), "stack", string(debug.Stack()))
+				err = fmt.Errorf("panic recovered in %s tool handler: %v", request.Params.Name, r)
+			}
+		}()
+		return next(ctx, request)
+	}
+}
+
+// drainAdmittedKey marks the context of a call that passed the drain
+// check. Everything the call does runs on contexts derived from it (the
+// dispatch, an executeToolCode script's nested calls, tools.execute's
+// inner call), so its nested calls are not refused when a drain begins
+// half-way: refusing them would abort a script after some of its writes
+// ran, and the agent's rerun would repeat them. Admitted calls finish
+// under the drain's trackers and the HTTP server's graceful shutdown.
+type drainAdmittedKey struct{}
+
+func withDrainAdmitted(ctx context.Context) context.Context {
+	if drainAdmitted(ctx) {
+		return ctx
+	}
+	return context.WithValue(ctx, drainAdmittedKey{}, true)
+}
+
+func drainAdmitted(ctx context.Context) bool {
+	v, _ := ctx.Value(drainAdmittedKey{}).(bool)
+	return v
 }
 
 // restartingResult is the answer to a call refused or a wait ended by a
@@ -1262,15 +1302,19 @@ func (g *Gateway) routeEntry(ctx context.Context, entry toolEntry, via string, a
 		return g.denyUngranted(ctx, entry, agentID, "", &ev), nil
 	}
 
-	// A drain refuses the call before anything is used up: no grant is
-	// redeemed, no approval resumed or created, nothing dispatched.
-	if g.Draining() {
+	// A drain refuses a new call before anything is used up: no grant is
+	// redeemed, no approval resumed or created, nothing dispatched. A call
+	// made by a call admitted earlier (a nested executeToolCode or
+	// tools.execute call, a resume through tools.execute) is part of that
+	// call and finishes under the drain.
+	if g.Draining() && !drainAdmitted(ctx) {
 		refusedDraining = true
 		ev.Outcome = metrics.OutcomeError
 		ev.ErrorClass = "draining"
 		return restartingResult(entry.tool.Name, entry.tool.Name+
 			" did not run and no permission was used. Call it again with the same arguments in a few seconds."), nil
 	}
+	ctx = withDrainAdmitted(ctx)
 
 	// Deferred-resume short-circuit. The approval coordination tools take
 	// approval ids as their own arguments and have no held call of their
@@ -2253,6 +2297,9 @@ func (g *Gateway) Execute(ctx context.Context, req *approval.Request) {
 	// connect link minted here would sit in a row admins and operator
 	// tokens can read. Refusals name the dashboard instead.
 	execCtx := WithoutConnectLinks(actor.WithRaiser(WithAgentID(ctx, req.AgentID), raiser))
+	// The bus starts an executor only outside a drain, so its nested calls
+	// (an approved script's) are admitted work and finish under it.
+	execCtx = withDrainAdmitted(execCtx)
 	if req.PersonalOwner() != "" {
 		var cancel context.CancelFunc
 		execCtx, cancel = context.WithDeadline(execCtx, time.UnixMilli(req.ExpiresAt))
