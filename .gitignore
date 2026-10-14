@@ -1,6 +1,7 @@
 # Binaries
 /toolyard
 /cmd/gateway/gateway
+/gateway
 /gateway-darwin
 /gateway-linux
 /gateway-linux-arm64

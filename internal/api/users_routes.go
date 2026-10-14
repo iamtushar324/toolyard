@@ -15,7 +15,7 @@ import (
 )
 
 // groupInfo is one grantable tool group: an upstream server or a built-in
-// data group (memory, lake, events, notes, skills).
+// data group (memory, events, notes, skills).
 type groupInfo struct {
 	Name      string `json:"name"`
 	Kind      string `json:"kind"` // "server" | "builtin"
@@ -247,7 +247,7 @@ func (s *Server) usersPatch(w http.ResponseWriter, r *http.Request, caller, targ
 			known[g.Name] = true
 		}
 		// Every built-in group is grantable even while it has no tools
-		// (a lake that is switched off today may be on tomorrow).
+		// (a group that is switched off today may be on tomorrow).
 		for _, g := range access.BuiltinGroups {
 			known[g] = true
 		}

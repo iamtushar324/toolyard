@@ -1,7 +1,11 @@
 # ADR 0004 — Personal data lake (ClickHouse)
 
-Status: accepted (TUS-104, superseded engine choice in TUS-141 cutover)
+Status: superseded (2026-10-14, TEC-1634); was accepted (TUS-104, superseded engine choice in TUS-141 cutover)
 Date: 2026-05-09 (DuckDB landing), 2026-05-12 (ClickHouse cutover)
+
+Superseded because toolyard no longer ships a data lake: the ClickHouse lake
+never ran in production, so its tools, the `toolyard lake` command and its
+deploy stacks were removed.
 
 ## Context
 

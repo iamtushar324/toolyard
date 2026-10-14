@@ -354,7 +354,7 @@ stays as the break-glass login.
 
 Everyone else who signs in becomes a **member**: they see their own profile,
 manage their own agents, and their agents reach only the servers and data
-groups (memory, lake, events, notes, skills) an admin grants them on the
+groups (memory, events, notes, skills) an admin grants them on the
 **Users** page. Every approval and inbox decision stays with admins.
 
 Once an hour (`-clerk-sync-interval`) toolyard lists the organisation's

@@ -225,12 +225,12 @@ func TestExplicitDeny(t *testing.T) {
 	}
 
 	// No rule.
-	wantNone(call{"lake.query", "lake"})
+	wantNone(call{"warehouse.query", "warehouse"})
 
 	// Tool-scope deny.
-	set(ScopeTool, "lake.query", "deny")
-	wantDeny(call{"lake.query", "lake"})
-	wantNone(call{"lake.tables", "lake"})
+	set(ScopeTool, "warehouse.query", "deny")
+	wantDeny(call{"warehouse.query", "warehouse"})
+	wantNone(call{"warehouse.tables", "warehouse"})
 
 	// Upstream-scope deny covers the upstream's other tools.
 	set(ScopeUpstream, "github", "deny")
@@ -253,7 +253,7 @@ func TestExplicitDeny(t *testing.T) {
 
 	// It agrees with Eval on every call above.
 	for _, c := range []call{
-		{"lake.query", "lake"}, {"lake.tables", "lake"},
+		{"warehouse.query", "warehouse"}, {"warehouse.tables", "warehouse"},
 		{"github.list_issues", "github"}, {"github.get_repo", "github"}, {"github.create_issue", "github"},
 		{"search", "tools"}, {"executeToolCode", "tools"},
 	} {

@@ -2,7 +2,7 @@
 // from the browser carrying mic audio in / synthesized audio out, with a
 // Gemini Live session wired up server-side. The model gets toolyard's own
 // system prompt plus the full gateway tool catalog — memory, approvals,
-// lake, upstreams — dispatched through the same policy → approval → audit
+// upstreams — dispatched through the same policy → approval → audit
 // pipeline as any enrolled agent.
 //
 // One Service per gateway. One active call per user (extra attempts get a

@@ -59,7 +59,6 @@ import (
 	"github.com/tusharbhardwaj/toolyard/internal/identitykeys"
 	"github.com/tusharbhardwaj/toolyard/internal/inbox"
 	"github.com/tusharbhardwaj/toolyard/internal/keyguard"
-	"github.com/tusharbhardwaj/toolyard/internal/lake"
 	"github.com/tusharbhardwaj/toolyard/internal/logx"
 	"github.com/tusharbhardwaj/toolyard/internal/memory"
 	"github.com/tusharbhardwaj/toolyard/internal/mempalace"
@@ -119,8 +118,6 @@ func main() {
 		err = runExchange(args)
 	case "probe":
 		err = runProbe(args)
-	case "lake":
-		err = runLake(args)
 	case "operator-token":
 		err = runOperatorToken(args)
 	case "healthcheck":
@@ -250,7 +247,6 @@ Commands:
   serve       run gateway + HTTP dashboard (default ports: stdio + :8787)
   exchange    swap an enrollment code for an agent token
   probe       dry-run a tool against an upstream MCP server
-  lake        manage the personal data lake (backup | tables)
   operator-token  create | list | revoke CLI operator tokens (local, from -data)
   healthcheck check a probe: -url <probe URL> -expect ready|live (exit 0 or 1)
   keys-check  read-only check that every master key would load: -data <dir> [-credentials-dir <dir>] (exit 0 or 78)
@@ -285,7 +281,9 @@ func runServe(argv []string) error {
 	credentialsDir := fs.String("credentials-dir", os.Getenv("TOOLYARD_CREDENTIALS_DIR"), "directory searched for key files (identity.key, oauth.key, secrets.key, session.key) and toolyard.env after $CREDENTIALS_DIRECTORY and before -data, e.g. /run/secrets. Defaults to $TOOLYARD_CREDENTIALS_DIR.")
 	opsAddr := fs.String("ops-addr", "", "comma-separated listen addresses for the ops listener (/metrics, /v1/livez, /v1/readyz), e.g. 127.0.0.1:9090. Empty = off. A non-private address needs -ops-token-file.")
 	opsTokenFile := fs.String("ops-token-file", "", "file holding the bearer token (16+ characters) the ops listener then requires on every request, from every peer, loopback included")
-	clickhouseRuntimeEnvPath := fs.String("clickhouse-runtime-env", "/var/lib/toolyard/clickhouse-runtime.env", "path where toolyard maintains a TOOLYARD_CH_PASSWORD=... line for the toolyard-clickhouse container's docker-compose env_file to consume. Updated on bootstrap and on every rotate. Empty disables the write (useful in tests).")
+	// Still accepted so service units that pass it keep starting: the flag
+	// set exits on an unknown flag. toolyard no longer runs a ClickHouse lake.
+	clickhouseRuntimeEnvPath := fs.String("clickhouse-runtime-env", "", "DEPRECATED: ignored. Kept so existing service units keep starting.")
 	inboxResetPasskeys := fs.Bool("inbox-reset-passkeys", false, "delete every registered passkey at startup (recovery when the owner has lost all their devices), then continue normally")
 	inboxFetchPrivate := fs.Bool("inbox-fetch-private-networks", false, "let the inbox copy attachment links that point at loopback or private-network addresses (e.g. evidence hosted on your LAN). Off by default: agent-chosen URLs could otherwise reach internal services.")
 	requireAuthMCP := fs.Bool("require-auth-on-mcp", false, "reject anonymous /mcp calls (no Authorization header). Auto-enabled when -public-url is set.")
@@ -349,6 +347,9 @@ func runServe(argv []string) error {
 		idleTimeout = *stdioIdleTimeout
 		rootLog.Warn("--stdio-idle-timeout is deprecated; use --upstream-idle-timeout")
 	}
+	if strings.TrimSpace(*clickhouseRuntimeEnvPath) != "" {
+		rootLog.Warn("--clickhouse-runtime-env is deprecated and ignored")
+	}
 
 	// Public mode auto-enables matching safeguards.
 	if *publicURL != "" {
@@ -407,14 +408,6 @@ func runServe(argv []string) error {
 	// Roles and per-user tool-group grants. The gateway asks it on every
 	// tool list/call; the Users admin API writes through it.
 	accessSvc := access.New(db)
-
-	// Personal data lake (ClickHouse). Opened below, once settings are
-	// loaded — see the `lake: opened …` log line right after the CH
-	// password block. Distinct from toolyard.db: the SQLite control
-	// plane is OLTP-shaped, the lake is OLAP-shaped. Failure to open
-	// the lake is logged but not fatal — the gateway still serves
-	// non-lake tools.
-	var lakeSvc *lake.Service
 
 	bus, err := approval.New(ctx, db)
 	if err != nil {
@@ -492,42 +485,6 @@ func runServe(argv []string) error {
 	settingsSvc, err := settings.New(ctx, db)
 	if err != nil {
 		return err
-	}
-
-	// ClickHouse password lives in the settings DB: toolyard is the
-	// source of truth, the env file the docker stack reads is a rendered
-	// view. Auto-mint on first boot so a fresh install + `docker compose
-	// up` Just Works. The rendered file is mode 0600 toolyard:toolyard.
-	chPass, chGenerated, err := settingsSvc.EnsureClickhousePassword(ctx)
-	if err != nil {
-		return fmt.Errorf("ensure clickhouse password: %w", err)
-	}
-	if chGenerated {
-		log.Printf("toolyard: minted a new clickhouse_password; reveal it once from the dashboard's Settings tab")
-	}
-	if err := api.WriteClickhouseRuntimeEnv(*clickhouseRuntimeEnvPath, chPass); err != nil {
-		log.Printf("warning: could not write clickhouse runtime env file at %s: %v", *clickhouseRuntimeEnvPath, err)
-	}
-
-	// Open the lake against the local CH stack. Addr is hardcoded to
-	// 127.0.0.1:19000 (the host binding from deploy/clickhouse/docker-compose.yaml);
-	// CH is loopback-only and the gateway runs on the host, so no
-	// further indirection. If CH is down or the password is wrong,
-	// log and continue with lake.* tools disabled — the gateway still
-	// serves non-lake tools.
-	{
-		var lakeErr error
-		lakeSvc, lakeErr = lake.Open(lake.Config{
-			Addr:     "127.0.0.1:19000",
-			User:     "default",
-			Password: chPass,
-		})
-		if lakeErr != nil {
-			log.Printf("lake: open clickhouse: %v (lake.* tools disabled)", lakeErr)
-		} else {
-			defer lakeSvc.Close()
-			log.Printf("lake: opened clickhouse @ 127.0.0.1:19000")
-		}
 	}
 
 	usageSvc := usagepkg.New(db)
@@ -625,7 +582,6 @@ func runServe(argv []string) error {
 		Audit:               auditSvc,
 		Hub:                 hub,
 		Memory:              memSvc,
-		Lake:                lakeSvc,
 		InLineWait:          *inLineWait,
 		Visibility:          vis,
 		Usage:               usageSvc,
@@ -928,11 +884,10 @@ func runServe(argv []string) error {
 		return chatRegistry.RunReconciler(ctx, 2*time.Minute)
 	})
 
-	// Events Hub. SQLite-backed hot store (always available, independent of
-	// ClickHouse). Notifier mirrors the approval push notifier: every event
-	// fans out on the realtime hub; events from notify-enabled sources also
-	// fire a content-minimal push. Pollers, the lake sink (when CH is up),
-	// and retention run under Supervise. The events.* MCP tools give every
+	// Events Hub. SQLite-backed store. Notifier mirrors the approval push
+	// notifier: every event fans out on the realtime hub; events from
+	// notify-enabled sources also fire a content-minimal push. Pollers and
+	// retention run under Supervise. The events.* MCP tools give every
 	// agent type the same NL activity feed.
 	evSvc := events.New(db)
 	evSvc.AddNotifierFunc(func(ctx context.Context, ev *events.Event, src *events.Source) {
@@ -956,16 +911,9 @@ func runServe(argv []string) error {
 	})
 	gw.RegisterEventsTools(evSvc)
 	goroutines.Supervise(ctx, "events-poller", 60*time.Second, evSvc.RunPollers)
-	if lakeSvc != nil {
-		goroutines.Supervise(ctx, "events-lake-sink", 60*time.Second, func(ctx context.Context) error {
-			return evSvc.RunLakeSink(ctx, lakeSvc)
-		})
-	}
-	hasLake := lakeSvc != nil
 	goroutines.Supervise(ctx, "events-retention", time.Hour, func(ctx context.Context) error {
 		return evSvc.RunRetention(ctx,
-			func() int { return settingsSvc.GetInt(settings.EventsRetentionDays, 90) },
-			func() bool { return hasLake })
+			func() int { return settingsSvc.GetInt(settings.EventsRetentionDays, 90) })
 	})
 
 	if err := upstreamSvc.LoadAll(ctx); err != nil {
@@ -1193,7 +1141,7 @@ func runServe(argv []string) error {
 			Model:       *voiceModel,
 			PersonaPath: filepath.Join(resolvedVoiceDir, "soul.md"),
 			// The whole gateway catalog: memory, approvals/events meta
-			// tools, lake, and every connected upstream. Calls route
+			// tools, and every connected upstream. Calls route
 			// through the same policy → approval → audit pipeline as any
 			// enrolled agent, attributed to "voice:<user>".
 			Tools:           gw,
@@ -1221,46 +1169,45 @@ func runServe(argv []string) error {
 	apiSrv := api.New(ctx, api.Options{
 		Federation: federationSvc, Callbacks: callbackSvc,
 		BuildVersion: version, Environment: os.Getenv("TOOLYARD_ENVIRONMENT"),
-		Identity:                 idSvc,
-		Approval:                 bus,
-		Audit:                    auditSvc,
-		Memory:                   memSvc,
-		Push:                     pushSvc,
-		Hub:                      hub,
-		Gateway:                  gw,
-		Upstreams:                upstreamSvc,
-		Settings:                 settingsSvc,
-		Usage:                    usageSvc,
-		Metrics:                  metricsReader,
-		Pricing:                  priceCatalog,
-		MetricsRecorder:          metricsRec,
-		AutoApproval:             autoApprover,
-		Policy:                   policyEngine,
-		OAuth:                    oauthSvc,
-		Hooks:                    hooksSvc,
-		ClickhouseRuntimeEnvPath: *clickhouseRuntimeEnvPath,
-		Mempalace:                mpSvc,
-		Notes:                    notesSvc,
-		Skills:                   skillsSvc,
-		Voice:                    voiceSvc,
-		Secrets:                  secretsSvc,
-		ChatTelegram:             telegramSvc,
-		Events:                   evSvc,
-		MemWebhooks:              memWebhookSvc,
-		Inbox:                    inboxSvc,
-		Snapshots:                inboxSnaps,
-		Passkeys:                 passkeySvc,
-		IdentityKeys:             identityKeysSvc,
-		Guide:                    inboxGuide,
-		WebhookMaxBytes:          *webhookMaxBytes,
-		SessionKey:               masterKeys[keyguard.SessionKey], // loaded and checked above
-		Probes:                   probes,
-		Security:                 secOpts,
-		Access:                   accessSvc,
-		Clerk:                    clerkClient,
-		ClerkOwnerOnly:           *clerkOwnerOnly,
-		OwnerEmail:               *ownerEmail,
-		ConnectAZP:               connectOrigins,
+		Identity:        idSvc,
+		Approval:        bus,
+		Audit:           auditSvc,
+		Memory:          memSvc,
+		Push:            pushSvc,
+		Hub:             hub,
+		Gateway:         gw,
+		Upstreams:       upstreamSvc,
+		Settings:        settingsSvc,
+		Usage:           usageSvc,
+		Metrics:         metricsReader,
+		Pricing:         priceCatalog,
+		MetricsRecorder: metricsRec,
+		AutoApproval:    autoApprover,
+		Policy:          policyEngine,
+		OAuth:           oauthSvc,
+		Hooks:           hooksSvc,
+		Mempalace:       mpSvc,
+		Notes:           notesSvc,
+		Skills:          skillsSvc,
+		Voice:           voiceSvc,
+		Secrets:         secretsSvc,
+		ChatTelegram:    telegramSvc,
+		Events:          evSvc,
+		MemWebhooks:     memWebhookSvc,
+		Inbox:           inboxSvc,
+		Snapshots:       inboxSnaps,
+		Passkeys:        passkeySvc,
+		IdentityKeys:    identityKeysSvc,
+		Guide:           inboxGuide,
+		WebhookMaxBytes: *webhookMaxBytes,
+		SessionKey:      masterKeys[keyguard.SessionKey], // loaded and checked above
+		Probes:          probes,
+		Security:        secOpts,
+		Access:          accessSvc,
+		Clerk:           clerkClient,
+		ClerkOwnerOnly:  *clerkOwnerOnly,
+		OwnerEmail:      *ownerEmail,
+		ConnectAZP:      connectOrigins,
 	})
 
 	mux := http.NewServeMux()

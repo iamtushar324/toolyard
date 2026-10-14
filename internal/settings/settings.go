@@ -7,9 +7,7 @@ package settings
 
 import (
 	"context"
-	"crypto/rand"
 	"database/sql"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"strconv"
@@ -84,14 +82,6 @@ const (
 	// messages (default true).
 	ChatIncludeDetails = "chat_include_details"
 
-	// ClickhousePassword is the password for the `default` user of the
-	// toolyard-clickhouse docker stack. Generated on first gateway start
-	// if empty; rotatable from the UI. Toolyard renders it into a
-	// runtime env file that the compose env_file directive consumes;
-	// CH reads it at process start via the from_env="TOOLYARD_CH_PASSWORD"
-	// reference in users.d/toolyard.xml.
-	ClickhousePassword = "clickhouse_password"
-
 	// ApprovalMode decides what happens when an agent calls a restricted
 	// tool without a grant. "execute" (default) queues an approval and runs
 	// the call when the owner approves. "inbox" runs nothing and coaches
@@ -152,9 +142,21 @@ const (
 // rotation flow with audit logging instead of a static token sitting in
 // every page response.
 var secretKeys = map[string]struct{}{
-	ClickhousePassword: {},
-	TelegramBotToken:   {},
-	ElevenLabsAPIKey:   {},
+	TelegramBotToken: {},
+	ElevenLabsAPIKey: {},
+}
+
+// retiredKeys are settings toolyard no longer uses whose rows may still be
+// stored. All never returns them and Patch refuses them: clickhouse_password
+// was the password of the removed ClickHouse lake.
+var retiredKeys = map[string]struct{}{
+	"clickhouse_password": {},
+}
+
+// isRetiredKey reports whether key is one of retiredKeys.
+func isRetiredKey(key string) bool {
+	_, ok := retiredKeys[key]
+	return ok
 }
 
 // IsSecretKey reports whether key is classified as a secret.
@@ -218,7 +220,7 @@ func (s *Service) All(ctx context.Context) (map[string]any, error) {
 	defer s.mu.RUnlock()
 	out := make(map[string]any, len(s.cache))
 	for k, v := range s.cache {
-		if k == CostInputUsdPerM || k == CostOutputUsdPerM {
+		if k == CostInputUsdPerM || k == CostOutputUsdPerM || isRetiredKey(k) {
 			continue
 		}
 		if IsSecretKey(k) {
@@ -310,55 +312,6 @@ func (s *Service) Reveal(_ context.Context, key string) (string, error) {
 		return "", err
 	}
 	return str, nil
-}
-
-// EnsureClickhousePassword makes sure clickhouse_password is set for the CH
-// stack: reads the existing password if any, mints one on first call, returns
-// (current_or_new, was_generated, error). Hex output (64 chars) keeps it
-// safe for shell-style env files — no quoting concerns.
-func (s *Service) EnsureClickhousePassword(ctx context.Context) (string, bool, error) {
-	s.mu.RLock()
-	v, ok := s.cache[ClickhousePassword]
-	s.mu.RUnlock()
-	if ok && len(v) > 2 {
-		var existing string
-		if err := json.Unmarshal(v, &existing); err == nil && existing != "" {
-			return existing, false, nil
-		}
-	}
-	pw, err := randomHex(32)
-	if err != nil {
-		return "", false, err
-	}
-	if err := s.Set(ctx, ClickhousePassword, pw); err != nil {
-		return "", false, err
-	}
-	return pw, true, nil
-}
-
-// RotateClickhousePassword replaces the existing CH password with a
-// freshly generated one. The caller is responsible for re-rendering the
-// runtime env file (and operationally for restarting the CH container so
-// it re-reads it).
-func (s *Service) RotateClickhousePassword(ctx context.Context) (string, error) {
-	pw, err := randomHex(32)
-	if err != nil {
-		return "", err
-	}
-	if err := s.Set(ctx, ClickhousePassword, pw); err != nil {
-		return "", err
-	}
-	return pw, nil
-}
-
-// randomHex returns 2*n hex chars from crypto/rand. Used for the
-// ClickHouse password (n=32 -> 64 hex chars, 256 bits of entropy).
-func randomHex(n int) (string, error) {
-	b := make([]byte, n)
-	if _, err := rand.Read(b); err != nil {
-		return "", err
-	}
-	return hex.EncodeToString(b), nil
 }
 
 // GetString reads a string setting from the in-memory cache, returning
@@ -479,15 +432,18 @@ func (s *Service) Set(ctx context.Context, key string, value any) error {
 // Patch merges a map of {key: value} updates in one go, rolled back on error.
 // router_only_mode is normalised into surface_mode at write time so older
 // callers continue working. Secret keys are rejected here — they have to
-// flow through Rotate/Reveal so the audit trail and reveal-once UX stay
-// consistent.
+// flow through their own endpoints and Reveal so the audit trail and
+// reveal-once UX stay consistent. Retired keys are rejected too.
 func (s *Service) Patch(ctx context.Context, updates map[string]any) error {
 	for k := range updates {
 		if k == CostInputUsdPerM || k == CostOutputUsdPerM {
 			return errors.New("model prices are automatic and cannot be set manually")
 		}
 		if IsSecretKey(k) {
-			return errors.New("secret keys are write-only via the rotate endpoint")
+			return errors.New("secret keys are write-only via their own endpoints")
+		}
+		if isRetiredKey(k) {
+			return errors.New("retired setting: " + k)
 		}
 	}
 	updates = normalise(updates)

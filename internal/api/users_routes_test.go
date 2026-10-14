@@ -121,14 +121,19 @@ func TestUsersPatch(t *testing.T) {
 		t.Errorf("grants written despite 400: %v", g)
 	}
 
-	// Servers: a server, a built-in without tools today (lake) and an
+	// Servers: lake, the retired data group, is unknown -> 400.
+	if rec := e.do(t, admin, http.MethodPatch, path, `{"servers":["github","lake"]}`); rec.Code != http.StatusBadRequest {
+		t.Errorf("retired group: %d %s", rec.Code, rec.Body.String())
+	}
+
+	// Servers: a server, a built-in without tools here (events) and an
 	// always-on name (dropped silently).
-	rec = e.do(t, admin, http.MethodPatch, path, `{"servers":["github","lake","tools"]}`)
+	rec = e.do(t, admin, http.MethodPatch, path, `{"servers":["github","events","tools"]}`)
 	if rec.Code != http.StatusOK {
 		t.Fatalf("set servers: %d %s", rec.Code, rec.Body.String())
 	}
 	got := decodeJSON(t, rec)
-	if servers, _ := got["servers"].([]any); len(servers) != 2 || servers[0] != "github" || servers[1] != "lake" {
+	if servers, _ := got["servers"].([]any); len(servers) != 2 || servers[0] != "events" || servers[1] != "github" {
 		t.Errorf("servers after patch = %v", got["servers"])
 	}
 	if got["agent_count"] != float64(0) || got["role"] != identity.RoleMember {

@@ -326,7 +326,7 @@ func Validate(ctx context.Context, cat Catalog, agentID string, s *Submission, o
 
 // exactArgs returns the parameters of a requested call that have an exact
 // value, as call arguments, so the catalog judges argument-dependent access
-// the way the call will route (lake.ingest in replace mode needs permission
+// the way the call will route (a tool whose replace mode needs permission
 // while an append does not). Nil when no parameter has an exact value.
 func exactArgs(raw map[string]any) map[string]any {
 	var out map[string]any
