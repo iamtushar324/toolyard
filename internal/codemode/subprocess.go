@@ -11,6 +11,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/tusharbhardwaj/toolyard/internal/logx"
 )
 
 // The parent side of a worker run: start the child with a bare
@@ -82,10 +84,12 @@ func (r *Runtime) runInWorker(ctx context.Context, s *session, start startMsg, s
 	if err != nil {
 		return runtimeErr("could not start the script worker: " + err.Error())
 	}
-	if err := cmd.Start(); err != nil {
+	if err := startConfined(cmd, path, r.worker.Sandbox); err != nil {
 		return runtimeErr("could not start the script worker: " + err.Error())
 	}
 	r.lastPID.Store(int64(cmd.Process.Pid))
+	// A confined worker cannot reach /proc to do this itself.
+	preferOOMKillChild(cmd.Process.Pid)
 
 	// The reader hands messages over until the child's stdout ends or a
 	// message breaks the line limit; readErr says which.
@@ -213,6 +217,60 @@ func (r *Runtime) runInWorker(ctx context.Context, s *session, start startMsg, s
 			return r.workerDied(ctx, stopNote, waitErr, readErr, stderr.String())
 		}
 	}
+}
+
+// startConfined starts cmd, whose program is exe, confined as mode says.
+// When it confines the child, a nil Stdin, Stdout or Stderr gets a
+// /dev/null opened beforehand; the field then holds that *os.File, which
+// is closed once the child has its copy.
+func startConfined(cmd *exec.Cmd, exe string, mode SandboxMode) (err error) {
+	defer func() {
+		if err != nil {
+			// A refusal before cmd.Start would leave the pipes cmd holds
+			// (StdinPipe, StdoutPipe) open. Start with Err set returns it
+			// without starting anything and closes them; after a Start
+			// that already ran it only reports "already started".
+			cmd.Err = err
+			_ = cmd.Start()
+		}
+	}()
+	switch mode {
+	case SandboxOff:
+		return cmd.Start()
+	case SandboxAuto, SandboxRequired:
+	default:
+		return fmt.Errorf("unknown sandbox mode %d", int(mode))
+	}
+	support := sandboxSupported()
+	logSandboxOnce(support)
+	if support.abi == 0 {
+		if mode == SandboxRequired {
+			return fmt.Errorf("the worker sandbox is required, but Landlock is unavailable: %s", support.reason)
+		}
+		return cmd.Start()
+	}
+	if err := startSandboxed(cmd, exe, support); err != nil {
+		return fmt.Errorf("sandbox: %w", err)
+	}
+	return nil
+}
+
+var sandboxLogOnce sync.Once
+
+// logSandboxOnce records, once per process, what confinement workers get.
+func logSandboxOnce(s sandboxSupport) {
+	sandboxLogOnce.Do(func() {
+		lg := logx.For("codemode")
+		switch {
+		case s.abi == 0:
+			lg.Warn("code-mode worker sandbox unavailable; scripts run with resource limits only (or are refused when the sandbox is required)",
+				"reason", s.reason)
+		case !s.seccomp:
+			lg.Warn("code-mode worker sandbox: Landlock only, no seccomp filter", "landlock_abi", s.abi, "seccomp", s.seccompReason)
+		default:
+			lg.Info("code-mode worker sandbox", "landlock_abi", s.abi, "seccomp", true)
+		}
+	})
 }
 
 // workerDied explains a child that delivered no outcome.

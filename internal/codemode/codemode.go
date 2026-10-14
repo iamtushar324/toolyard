@@ -18,20 +18,55 @@
 // the parent makes them. A child that dies, for any reason, costs one
 // script its run and nothing else.
 //
-// The worker is a resource boundary, not a privilege boundary. It runs as
-// the same user, in the same namespaces and with the same filesystem view
-// as the gateway; what keeps a script inside its box is the Starlark
-// interpreter (no filesystem, network or load()), the memory, CPU, step
-// and output caps, and the bare environment. A flaw in starlark-go itself
-// would let a script read what the gateway can read, including the data
-// directory. Deployments that need more isolate the whole service (a
-// container, or systemd's DynamicUser and ProtectSystem=strict).
+// On Linux (arm64 and amd64) the worker is also a privilege boundary. It
+// starts from a gateway thread that confines itself first, so the child
+// inherits three restrictions before its first instruction: no new
+// privileges; a Landlock ruleset under which it may open only its own
+// binary and ELF interpreter (to execute and read) and the shared
+// libraries and /etc/ld.so.cache (to read), so no data directory, /proc,
+// /etc or /tmp file, and, as far as the kernel's Landlock ABI goes, no
+// TCP bind or connect and no signals or abstract Unix sockets outside
+// its own process; and a seccomp filter that refuses socket creation,
+// io_uring, ptrace and process_vm access, bpf, perf events, userfaultfd,
+// the kernel key store, new namespaces (unshare, setns, clone with a
+// namespace flag, clone3) and mounting. A flaw in starlark-go then
+// reaches the worker's own pipes and memory, not the gateway's files,
+// network or processes. See sandbox_linux.go.
+//
+// Worker.Sandbox picks the mode; the gateway reads it from
+// TOOLYARD_CODEMODE_SANDBOX (ParseSandboxMode). SandboxAuto, the default,
+// applies what the kernel supports and, on a kernel without Landlock,
+// logs once and runs the worker with its resource caps only, as before:
+// same user, same filesystem view and network as the gateway, kept in
+// its box by the Starlark interpreter (no filesystem, network or load()),
+// the memory, CPU, step and output caps, and the bare environment.
+// SandboxRequired refuses to run scripts there instead. SandboxStatus
+// reports which applies.
+//
+// Known limits:
+//   - Landlock does not govern path lookup or metadata: a confined worker
+//     can still stat, readlink and chdir anywhere, so it can learn which
+//     paths exist, not what files hold.
+//   - Below Landlock ABI 6 signals are not scoped: a worker can still
+//     signal the gateway and other processes of the same user.
+//     SandboxStatus then adds "(signals unscoped)"; SandboxRequired still
+//     accepts it.
+//   - On ABI 6 kernels without Landlock erratum 2, signal scoping also
+//     binds the gateway's own confining thread while it starts the
+//     worker, so a runtime preemption signal it sends to another gateway
+//     thread can be refused; the worst case is a short delay to a garbage
+//     collection pause it starts. The one call where a refusal would
+//     matter (the pidfd check) runs before confinement.
+//   - The sandbox tests' unconfined baseline reads /etc/hostname, which a
+//     minimal container may lack.
 package codemode
 
 import (
 	"context"
 	"fmt"
 	"os"
+	"strings"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -121,6 +156,157 @@ type Worker struct {
 	// AcquireWait for a slot, then fails as busy. Defaults 4 and 2s.
 	MaxConcurrent int
 	AcquireWait   time.Duration
+	// Sandbox says how the worker is confined beyond its resource caps;
+	// the zero value is SandboxAuto. With the sandbox on, Path must be an
+	// ELF executable, not a script: the ruleset grants execute on Path and
+	// its ELF interpreter only.
+	Sandbox SandboxMode
+}
+
+// SandboxMode says how a worker is confined beyond its resource caps.
+type SandboxMode int
+
+const (
+	// SandboxAuto confines the worker with what the kernel supports
+	// (Landlock and a seccomp filter on Linux). Without Landlock it logs
+	// once and runs the worker with its resource caps only.
+	SandboxAuto SandboxMode = iota
+	// SandboxOff runs the worker with its resource caps only.
+	SandboxOff
+	// SandboxRequired refuses to start a script when Landlock is
+	// unavailable.
+	SandboxRequired
+)
+
+func (m SandboxMode) String() string {
+	switch m {
+	case SandboxAuto:
+		return "auto"
+	case SandboxOff:
+		return "off"
+	case SandboxRequired:
+		return "required"
+	}
+	return fmt.Sprintf("SandboxMode(%d)", int(m))
+}
+
+// ParseSandboxMode reads a mode name: "auto" (or empty), "off" or
+// "required", in any case. An unknown name returns an error and
+// SandboxAuto.
+func ParseSandboxMode(s string) (SandboxMode, error) {
+	switch strings.ToLower(strings.TrimSpace(s)) {
+	case "", "auto":
+		return SandboxAuto, nil
+	case "off":
+		return SandboxOff, nil
+	case "required":
+		return SandboxRequired, nil
+	}
+	return SandboxAuto, fmt.Errorf("unknown code-mode sandbox mode %q (want auto, off or required)", s)
+}
+
+// sandboxSupport is the confinement this kernel, under the gateway's own
+// seccomp filter (a service manager's, say), lets a worker have.
+type sandboxSupport struct {
+	// abi is the Landlock ABI version; 0 means Landlock is unavailable.
+	abi int
+	// reason says why Landlock is unavailable when abi is 0.
+	reason string
+	// seccomp says whether a seccomp filter can be installed;
+	// seccompReason says why not.
+	seccomp       bool
+	seccompReason string
+}
+
+var (
+	// lastSandboxMode is the mode of the most recent SetWorker, for
+	// SandboxStatus.
+	lastSandboxMode atomic.Int32
+
+	supportOnce    sync.Once
+	supportProbed  atomic.Pointer[sandboxSupport]
+	probeRequested atomic.Bool
+	// supportOverride replaces the kernel probe. Tests only.
+	supportOverride atomic.Pointer[sandboxSupport]
+)
+
+// sandboxSupported probes the kernel once per process (probeSandboxSupport,
+// per platform), waiting for the probe if it is running, and caches the
+// answer.
+func sandboxSupported() sandboxSupport {
+	if s := supportOverride.Load(); s != nil {
+		return *s
+	}
+	supportOnce.Do(func() {
+		s := probeSandboxSupport()
+		supportProbed.Store(&s)
+	})
+	return *supportProbed.Load()
+}
+
+// sandboxSupportNow is sandboxSupported without the wait: ok is false
+// until the first probe has finished.
+func sandboxSupportNow() (s sandboxSupport, ok bool) {
+	if p := supportOverride.Load(); p != nil {
+		return *p, true
+	}
+	if p := supportProbed.Load(); p != nil {
+		return *p, true
+	}
+	return sandboxSupport{}, false
+}
+
+// SandboxStatus describes the confinement scripts get under the most
+// recently configured worker: "landlock-abi-<n>+seccomp" ("+seccomp"
+// missing when no seccomp filter can be installed, " (signals unscoped)"
+// added below ABI 6), "none: <reason>" when Landlock is unavailable (with
+// " (sandbox required: scripts are refused)" under SandboxRequired), or
+// "off". It never waits for the kernel probe: until the probe has
+// finished it reports "probing", and starts the probe if nothing has.
+func SandboxStatus() string {
+	mode := SandboxMode(lastSandboxMode.Load())
+	if mode == SandboxOff {
+		return "off"
+	}
+	s, ok := sandboxSupportNow()
+	if !ok {
+		if probeRequested.CompareAndSwap(false, true) {
+			go sandboxSupported()
+		}
+		return "probing"
+	}
+	return sandboxStatusText(mode, s)
+}
+
+// ProbeSandbox runs the kernel probe unless it has run, logs once what
+// confinement workers get, and returns SandboxStatus. The gateway calls
+// it in a goroutine at start, so neither a request nor the first script
+// waits on the probe.
+func ProbeSandbox() string {
+	if SandboxMode(lastSandboxMode.Load()) != SandboxOff {
+		probeRequested.Store(true)
+		logSandboxOnce(sandboxSupported())
+	}
+	return SandboxStatus()
+}
+
+func sandboxStatusText(mode SandboxMode, s sandboxSupport) string {
+	switch {
+	case mode == SandboxOff:
+		return "off"
+	case s.abi > 0:
+		text := fmt.Sprintf("landlock-abi-%d", s.abi)
+		if s.seccomp {
+			text += "+seccomp"
+		}
+		if s.abi < 6 {
+			text += " (signals unscoped)"
+		}
+		return text
+	case mode == SandboxRequired:
+		return "none: " + s.reason + " (sandbox required: scripts are refused)"
+	}
+	return "none: " + s.reason
 }
 
 // DefaultWorker is the production worker: this binary's codemode-worker
@@ -188,6 +374,7 @@ func (r *Runtime) Limits() Limits { return r.limits }
 func (r *Runtime) SetWorker(w Worker) {
 	r.worker = w.withDefaults()
 	r.sem = make(chan struct{}, r.worker.MaxConcurrent)
+	lastSandboxMode.Store(int32(r.worker.Sandbox))
 }
 
 // Worker returns the effective worker settings.

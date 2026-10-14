@@ -547,6 +547,14 @@ func runServe(argv []string) error {
 		Owners:              accessSvc,
 		PublicURL:           *publicURL,
 	})
+	// Code-mode worker sandbox: TOOLYARD_CODEMODE_SANDBOX=auto (default),
+	// off or required. The kernel probe runs now, off the request path.
+	sandboxMode, err := codemode.ParseSandboxMode(os.Getenv("TOOLYARD_CODEMODE_SANDBOX"))
+	if err != nil {
+		log.Printf("code mode: %v; using auto", err)
+	}
+	gw.SetCodeModeSandbox(sandboxMode)
+	go codemode.ProbeSandbox()
 	gw.RegisterBuiltins()
 	defer gw.Close()
 	identityKeysSvc.SetCaller(gw)

@@ -18,9 +18,19 @@ import (
 // WorkerMain instead of the tests.
 const testWorkerEnv = "TOOLYARD_CODEMODE_TEST_WORKER"
 
+// sandboxProbeMain, set on platforms with a worker sandbox, runs the
+// sandbox tests' probe instead of the tests when its own marker variable
+// is set (sandbox_linux_test.go).
+var sandboxProbeMain func() (code int, ran bool)
+
 func TestMain(m *testing.M) {
 	if os.Getenv(testWorkerEnv) == "1" {
 		os.Exit(WorkerMain(os.Stdin, os.Stdout, os.Stderr))
+	}
+	if sandboxProbeMain != nil {
+		if code, ran := sandboxProbeMain(); ran {
+			os.Exit(code)
+		}
 	}
 	os.Exit(m.Run())
 }
@@ -180,7 +190,7 @@ func TestWorkerConcurrencyIsCapped(t *testing.T) {
 
 func TestWorkerCrashIsCleanError(t *testing.T) {
 	// A worker that exits without reporting.
-	rt := workerRuntime(newFake(), Limits{}, func(w *Worker) { w.Path = "/bin/sh"; w.Args = []string{"-c", "echo boom >&2; exit 3"}; w.Env = nil })
+	rt := workerRuntime(newFake(), Limits{}, shWorker("echo boom >&2; exit 3"))
 	text, failed := rt.ExecuteToolCode(context.Background(), "result = 1", "")
 	if !failed || !strings.Contains(text, "Execution runtime error:\n\nscript worker crashed (exit status 3: boom)") {
 		t.Fatalf("crash (failed=%v):\n%s", failed, text)
@@ -192,11 +202,7 @@ func TestWorkerCrashIsCleanError(t *testing.T) {
 		t.Fatalf("no binary (failed=%v):\n%s", failed, text)
 	}
 	// A worker that reports garbage and hangs is killed by the wall clock.
-	rt = workerRuntime(newFake(), Limits{ScriptTimeout: 300 * time.Millisecond}, func(w *Worker) {
-		w.Path = "/bin/sh"
-		w.Args = []string{"-c", "echo not-json; sleep 30"}
-		w.Env = nil
-	})
+	rt = workerRuntime(newFake(), Limits{ScriptTimeout: 300 * time.Millisecond}, shWorker("echo not-json; sleep 30"))
 	text, failed = rt.ExecuteToolCode(context.Background(), "result = 1", "")
 	if !failed || !strings.Contains(text, "script stopped: context deadline exceeded (limit 300ms)") {
 		t.Fatalf("hang (failed=%v):\n%s", failed, text)
@@ -208,12 +214,8 @@ func TestWorkerCrashIsCleanError(t *testing.T) {
 
 func TestWorkerEnvironmentIsBare(t *testing.T) {
 	t.Setenv("TOOLYARD_SECRET_FOR_TEST", "must-not-leak")
-	rt := workerRuntime(newFake(), Limits{}, func(w *Worker) {
-		w.Path = "/bin/sh"
-		// Report the environment as a fake "done" message.
-		w.Args = []string{"-c", `printf '{"type":"done","hasResult":true,"result":"%s"}\n' "$(env | tr '\n' ' ' | tr -d '"')"`}
-		w.Env = nil
-	})
+	// Report the environment as a fake "done" message.
+	rt := workerRuntime(newFake(), Limits{}, shWorker(`printf '{"type":"done","hasResult":true,"result":"%s"}\n' "$(env | tr '\n' ' ' | tr -d '"')"`))
 	text, failed := rt.ExecuteToolCode(context.Background(), "result = 1", "")
 	if failed {
 		t.Fatalf("env probe:\n%s", text)
@@ -241,12 +243,15 @@ func TestLimitsText(t *testing.T) {
 	}
 }
 
-// shWorker is a fake worker: a shell script standing in for the child.
+// shWorker is a fake worker: a shell script standing in for the child. It
+// runs unsandboxed: the sandbox lets a worker run its own binary and
+// nothing else, so a shell and the tools it starts would be refused.
 func shWorker(script string) func(*Worker) {
 	return func(w *Worker) {
 		w.Path = "/bin/sh"
 		w.Args = []string{"-c", script}
 		w.Env = nil
+		w.Sandbox = SandboxOff
 	}
 }
 

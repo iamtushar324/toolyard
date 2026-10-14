@@ -21,7 +21,9 @@ func applyMemoryCap(mib int) error {
 
 // preferOOMKill asks the kernel to pick this process first when memory
 // runs short in the service's cgroup, so a script's appetite costs the
-// script and not the gateway. Best effort.
+// script and not the gateway. Best effort: a sandboxed worker cannot
+// reach /proc, and the gateway sets it for the child instead
+// (preferOOMKillChild).
 func preferOOMKill() {
 	_ = os.WriteFile("/proc/self/oom_score_adj", []byte("1000"), 0)
 }
