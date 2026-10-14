@@ -239,7 +239,7 @@ func Validate(ctx context.Context, cat Catalog, agentID string, s *Submission, o
 			if tr.Tool == "" {
 				add(p+".tool", "missing")
 			} else if cat != nil {
-				access, upstream := cat.Access(ctx, agentID, tr.Tool, nil)
+				access, upstream := cat.Access(ctx, agentID, tr.Tool, exactArgs(st.Params))
 				tr.Upstream = upstream
 				switch access {
 				case AccessUnknown:
@@ -322,6 +322,25 @@ func Validate(ctx context.Context, cat Catalog, agentID string, s *Submission, o
 		r.Attachments = append(r.Attachments, a)
 	}
 	return r, probs, warns
+}
+
+// exactArgs returns the parameters of a requested call that have an exact
+// value, as call arguments, so the catalog judges argument-dependent access
+// the way the call will route (lake.ingest in replace mode needs permission
+// while an append does not). Nil when no parameter has an exact value.
+func exactArgs(raw map[string]any) map[string]any {
+	var out map[string]any
+	for name, v := range raw {
+		c, err := ParseConstraint(v)
+		if err != nil || c.Op != "eq" {
+			continue
+		}
+		if out == nil {
+			out = map[string]any{}
+		}
+		out[name] = c.Eq
+	}
+	return out
 }
 
 // checkText validates required agent narrative, including known placeholders.

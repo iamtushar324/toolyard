@@ -49,6 +49,9 @@ func (g *Gateway) inboxMode() bool {
 // A tool outside agentID's access scope reads as unknown, the same as a
 // tool that doesn't exist, so inbox.check, request validation and the
 // nearby-restricted hints never name a server the agent wasn't granted.
+// It is the routing decision (decide) for a call with these arguments and
+// no declared intent, so an overridable deny and an escalating argument
+// (lake.ingest mode=replace) read here as they would route.
 func (g *Gateway) Access(ctx context.Context, agentID, tool string, args map[string]any) (string, string) {
 	g.mu.RLock()
 	entry, ok := g.tools[tool]
@@ -56,16 +59,7 @@ func (g *Gateway) Access(ctx context.Context, agentID, tool string, args map[str
 	if !ok || !g.allowsEntry(ctx, agentID, entry) {
 		return inbox.AccessUnknown, ""
 	}
-	var action policy.Action
-	if entry.forcedAction != nil {
-		action = *entry.forcedAction
-	} else {
-		action = g.policy.Eval(policy.Request{AgentID: agentID, UpstreamName: entry.upstream, ToolName: entry.tool.Name, Arguments: args}).Action
-	}
-	if entry.requireHuman && action != policy.ActionDeny {
-		action = policy.ActionApprove
-	}
-	switch action {
+	switch g.decide(entry, agentID, "", "", args).Action {
 	case policy.ActionAllow:
 		return inbox.AccessOpen, entry.upstream
 	case policy.ActionDeny:
