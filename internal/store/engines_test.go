@@ -278,3 +278,92 @@ func TestOpenPostgresReadOnly(t *testing.T) {
 		t.Fatalf("bad URL: %v", err)
 	}
 }
+
+// TestOpenPostgresWithoutMigrations: a read-only pool and a NoMigrate pool
+// leave an empty database empty; MigratePostgres then migrates it.
+func TestOpenPostgresWithoutMigrations(t *testing.T) {
+	storetest.SkipUnlessPostgres(t)
+	ctx := context.Background()
+	dbURL, err := storetest.NewEmptyPostgresDatabase(t, "C")
+	if err != nil {
+		t.Fatalf("create an empty database: %v", err)
+	}
+	for _, opts := range []store.PostgresOptions{{MaxConns: 2, ReadOnly: true}, {MaxConns: 2, NoMigrate: true}} {
+		db, err := store.OpenPostgresWith(ctx, dbURL, opts)
+		if err != nil {
+			t.Fatalf("open %+v: %v", opts, err)
+		}
+		has, err := store.TableExists(ctx, db, store.Postgres, "schema_migrations")
+		_ = db.Close()
+		if err != nil || has {
+			t.Fatalf("open %+v created schema_migrations (%v)", opts, err)
+		}
+	}
+	db, err := store.OpenPostgresWith(ctx, dbURL, store.PostgresOptions{MaxConns: 2, NoMigrate: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if err := db.MigratePostgres(ctx); err != nil {
+		t.Fatalf("migrate: %v", err)
+	}
+	want, err := store.PostgresMigrationNames()
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows, err := db.QueryContext(ctx, `SELECT name FROM schema_migrations ORDER BY name`)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var got []string
+	for rows.Next() {
+		var n string
+		if err := rows.Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		got = append(got, n)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	sort.Strings(got)
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("recorded migrations %v, want %v", got, want)
+	}
+}
+
+// TestOpenPostgresRefusesANonCCollation: a database created with another
+// collation (Aurora's default is en_US.UTF-8) is refused with an error that
+// matches store.ErrConfig, so serve exits 78 instead of restarting.
+func TestOpenPostgresRefusesANonCCollation(t *testing.T) {
+	storetest.SkipUnlessPostgres(t)
+	ctx := context.Background()
+	dbURL, err := storetest.NewEmptyPostgresDatabase(t, "en_US.utf8")
+	if err != nil {
+		t.Skipf("the server cannot create an en_US.utf8 database: %v", err)
+	}
+	for name, open := range map[string]func() (*store.DB, error){
+		"read-write": func() (*store.DB, error) { return store.OpenPostgres(ctx, dbURL, 2) },
+		"read-only":  func() (*store.DB, error) { return store.OpenPostgresReadOnly(ctx, dbURL) },
+	} {
+		db, err := open()
+		if err == nil {
+			_ = db.Close()
+			t.Fatalf("%s: a database with collation en_US.utf8 was accepted", name)
+		}
+		if !errors.Is(err, store.ErrConfig) || !strings.Contains(err.Error(), "LC_COLLATE 'C'") {
+			t.Fatalf("%s: %v, want an ErrConfig error that says how to create the database", name, err)
+		}
+	}
+	// Nothing was migrated into it.
+	cURL, err := storetest.NewEmptyPostgresDatabase(t, "C")
+	if err != nil {
+		t.Fatal(err)
+	}
+	db, err := store.OpenPostgresWith(ctx, cURL, store.PostgresOptions{MaxConns: 1, ReadOnly: true})
+	if err != nil {
+		t.Fatalf("a C database was refused: %v", err)
+	}
+	_ = db.Close()
+}

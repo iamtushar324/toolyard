@@ -815,7 +815,7 @@ func blobCitedTx(ctx context.Context, tx *sql.Tx, d store.Dialect, agentID, sha 
 		// BlobBelongsToAgent): 'strict $.**' yields every item of the doc
 		// once, and jsonb equality with a JSON string matches only a
 		// string.
-		const cited = `EXISTS (SELECT 1 FROM jsonb_path_query(CAST(r.doc AS jsonb), 'strict $.**') AS o(v)
+		const cited = `EXISTS (SELECT 1 FROM jsonb_path_query(CAST(replace(r.doc, '\u0000', '\ufffd') AS jsonb), 'strict $.**') AS o(v)
 			WHERE jsonb_typeof(o.v) = 'object'
 			AND ((o.v -> 'blob') = to_jsonb(CAST(? AS TEXT)) OR (o.v -> 'poster_blob') = to_jsonb(CAST(? AS TEXT))))`
 		if agentID != "" {

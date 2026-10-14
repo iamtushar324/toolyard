@@ -159,3 +159,30 @@ func TestConcurrentClientRequestIDSubmissionsReturnOneRequest(t *testing.T) {
 	e.svc.Flush()
 	other.Flush()
 }
+
+// A NUL character anywhere in a request must not break its writes on
+// Postgres, where jsonb refuses the \u0000 escape that json.Marshal writes
+// and the client_request_id index casts the doc on every write.
+func TestRequestWithNULCharacterSubmitsAndDecides(t *testing.T) {
+	e := newEnv(t)
+	ctx := context.Background()
+	s := deploySubmission()
+	s.ClientRequestID = "nul-check"
+	s.Message += " before\x00after"
+	res, err := e.svc.Submit(ctx, "ag_1", s)
+	if err != nil || !res.OK {
+		t.Fatalf("submit: %v %+v", err, res)
+	}
+	e.svc.Flush()
+	again, err := e.svc.Submit(ctx, "ag_1", s)
+	if err != nil || again.RequestID != res.RequestID {
+		t.Fatalf("retry of a request with a NUL character: %+v %v", again, err)
+	}
+	got, err := e.decide(ctx, res.RequestID, Decision{Action: "deny", Note: "not\x00now", By: "owner"})
+	if err != nil {
+		t.Fatalf("decide a request with a NUL character: %v", err)
+	}
+	if got.Status == StatusPending {
+		t.Fatalf("status still pending after the denial")
+	}
+}

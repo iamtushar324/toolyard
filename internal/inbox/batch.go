@@ -82,7 +82,7 @@ func (s *Service) BlobBelongsToAgent(ctx context.Context, agentID, sha string) b
 		// is NULL unless v is an object with that member, and jsonb
 		// equality with a JSON string matches only a string.
 		err = s.db.QueryRowContext(ctx, `SELECT 1 FROM inbox_requests r WHERE r.agent_id=? AND EXISTS (
- SELECT 1 FROM jsonb_path_query(r.doc::jsonb, 'strict $.**') AS o(v)
+ SELECT 1 FROM jsonb_path_query(replace(r.doc, '\u0000', '\ufffd')::jsonb, 'strict $.**') AS o(v)
  WHERE jsonb_typeof(o.v) = 'object'
    AND ((o.v -> 'blob') = to_jsonb(CAST(? AS TEXT)) OR (o.v -> 'poster_blob') = to_jsonb(CAST(? AS TEXT)))) LIMIT 1`, agentID, sha, sha).Scan(&found)
 	} else {

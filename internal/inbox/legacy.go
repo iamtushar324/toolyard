@@ -62,8 +62,11 @@ func (s *Service) SyncLegacy(ctx context.Context) error {
 		// writes a stale pending copy over a committed decision. Only
 		// inbox_requests rows are locked (never approval_requests, which
 		// mutateTx updates while it holds the Inbox row), in id order.
-		// SQLite's single connection already serializes this.
-		if _, err = tx.ExecContext(ctx, `SELECT id FROM inbox_requests WHERE id IN (SELECT id FROM approval_requests) ORDER BY id FOR UPDATE OF inbox_requests`); err != nil {
+		// Only pending rows: a decision committed before this statement is
+		// already visible to the reads below, and one still in flight holds
+		// a pending row, so the lock waits for it. SQLite's single
+		// connection already serializes this.
+		if _, err = tx.ExecContext(ctx, `SELECT id FROM inbox_requests WHERE status = 'pending' AND id IN (SELECT id FROM approval_requests) ORDER BY id FOR UPDATE OF inbox_requests`); err != nil {
 			return err
 		}
 	}

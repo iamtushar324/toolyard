@@ -3,9 +3,10 @@
 // (toolyard db verify).
 //
 // Copy reads a stopped SQLite database and its blob folder, and loads them
-// into an empty, migrated Postgres database: every table in one
-// transaction (COPY, parents before children), then every blob into the
-// Postgres blob store. Verify compares the two: row counts and a SHA-256
+// into an empty Postgres database (migrating it only when it records no
+// migration yet): every table (COPY, parents before children) and every
+// blob into the Postgres blob store tables, all in one transaction. Verify
+// compares the two, without writing: row counts and a SHA-256
 // of every table in primary-key order, every sealed value opened with its
 // master key on both sides, the signing keys and key canaries by name, and
 // every blob by its sha256.

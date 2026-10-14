@@ -258,7 +258,7 @@ func TestCopyAndVerifyNeedAPostgresTarget(t *testing.T) {
 	if _, err := Copy(ctx, srcDB.DB, t.TempDir(), dst, CopyOptions{}); err == nil || !strings.Contains(err.Error(), "Postgres") {
 		t.Fatalf("copy into SQLite: %v", err)
 	}
-	if _, err := Verify(ctx, srcDB.DB, t.TempDir(), dst, nil); err == nil || !strings.Contains(err.Error(), "Postgres") {
+	if _, err := Verify(ctx, srcDB.DB, t.TempDir(), dst, nil, VerifyOptions{}); err == nil || !strings.Contains(err.Error(), "Postgres") {
 		t.Fatalf("verify against SQLite: %v", err)
 	}
 }

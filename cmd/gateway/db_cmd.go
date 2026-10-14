@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/tusharbhardwaj/toolyard/internal/dbcopy"
 	"github.com/tusharbhardwaj/toolyard/internal/keyguard"
@@ -24,14 +25,17 @@ const dbUsageText = `usage:
   toolyard db verify -from-data DIR [-credentials-dir DIR] [-allow-live-source] [-json PATH]
 
 copy loads a stopped SQLite installation (DIR/toolyard.db and the blob files
-in DIR/inbox/blobs) into an empty Postgres database: every table in one
-transaction, then every blob into the Postgres blob store. It only reads the
-source, and refuses a target that holds rows, a source at other migrations,
-and a missing or damaged blob file, before it writes anything.
+in DIR/inbox/blobs) into an empty Postgres database: every table and every
+blob in one transaction, so a failed copy leaves nothing behind. It only
+reads the source. Before it writes anything it refuses a target that holds
+rows or another application's tables, a source at other migrations, and a
+missing or damaged blob file. It creates the toolyard tables only in a
+database that records no migration yet, and never migrates any other.
 
 verify compares the two and exits non-zero on any difference: row counts and
 a SHA-256 of every table, every sealed value opened with its master key on
-both sides, the signing keys and key canaries, and every blob.
+both sides, the signing keys and key canaries, and every blob. It opens the
+target read-only and never migrates it.
 
 The target is $TOOLYARD_DATABASE_URL, else a database-url file in
 $CREDENTIALS_DIRECTORY or -credentials-dir (as for serve). verify reads the
@@ -40,8 +44,7 @@ the source must not change during a run.
 `
 
 // dbTargetConns is the target's pool size: copy holds one connection for
-// the tables, and verify one for its snapshot while the blob store reads
-// on another.
+// its checks or its copy transaction, verify one for its snapshot.
 const dbTargetConns = 4
 
 // runDB is `toolyard db copy|verify` (TEC-1637).
@@ -103,6 +106,14 @@ func runDBCommand(ctx context.Context, sub string, argv []string, stdout, stderr
 		}
 		fmt.Fprintf(stderr, "WARNING: the source database looks in use (%s); -allow-live-source is set, so this run may miss writes. Use the result for a rehearsal only.\n", why)
 	}
+	// The source opens immutable (no locks), so nothing stops a toolyard
+	// that starts during the run from changing it: the guard checks, just
+	// before the target commit and at the end of verify, that the files did
+	// not change and the database is still not in use.
+	guard, err := newSourceGuard(dbPath, *allowLive, stderr)
+	if err != nil {
+		return fmt.Errorf("toolyard db %s: %w", sub, err)
+	}
 
 	target, err := resolveDatabase(dataDir, *credentialsDir, getenv)
 	if err != nil {
@@ -138,17 +149,25 @@ func runDBCommand(ctx context.Context, sub string, argv []string, stdout, stderr
 			"Use it only to repeat a rehearsal on a throwaway database, never on a database in use.")
 	}
 
-	dst, err := store.OpenPostgres(ctx, target.URL, dbTargetConns)
+	// Neither command migrates on open. verify's sessions are read-only;
+	// copy checks everything in a read-only transaction, and only then
+	// creates the toolyard tables, and only in a database that records no
+	// migration yet.
+	opts := store.PostgresOptions{MaxConns: dbTargetConns, NoMigrate: true}
+	if sub == "verify" {
+		opts = store.PostgresOptions{MaxConns: dbTargetConns, ReadOnly: true}
+	}
+	dst, err := store.OpenPostgresWith(ctx, target.URL, opts)
 	if err != nil {
-		return fmt.Errorf("toolyard db %s: open the target: %w", sub, err)
+		return asDBConfigError(fmt.Errorf("toolyard db %s: open the target: %w", sub, err))
 	}
 	defer dst.Close()
 
 	var rep *dbcopy.Report
 	if sub == "copy" {
-		rep, err = dbcopy.Copy(ctx, src, blobDir, dst, dbcopy.CopyOptions{TruncateTarget: *truncate})
+		rep, err = dbcopy.Copy(ctx, src, blobDir, dst, dbcopy.CopyOptions{TruncateTarget: *truncate, SourceGuard: guard})
 	} else {
-		rep, err = dbcopy.Verify(ctx, src, blobDir, dst, keys)
+		rep, err = dbcopy.Verify(ctx, src, blobDir, dst, keys, dbcopy.VerifyOptions{SourceGuard: guard})
 	}
 	if rep != nil {
 		printDBReport(stdout, rep)
@@ -191,6 +210,85 @@ func dbSourceInUse(dbPath string) string {
 		return "its " + base + "-wal file is not empty"
 	}
 	return ""
+}
+
+// sourceFile is what newSourceGuard records of one source file.
+type sourceFile struct {
+	name   string // base name, for messages
+	exists bool
+	size   int64
+	mod    time.Time
+}
+
+// statSource records the size and modification time of the SQLite database
+// at dbPath and of its -wal and -shm files (a missing sidecar is recorded
+// as missing).
+func statSource(dbPath string) ([]sourceFile, error) {
+	var out []sourceFile
+	for _, p := range []string{dbPath, dbPath + "-wal", dbPath + "-shm"} {
+		f := sourceFile{name: filepath.Base(p)}
+		fi, err := os.Stat(p)
+		switch {
+		case err == nil:
+			f.exists, f.size, f.mod = true, fi.Size(), fi.ModTime()
+		case errors.Is(err, iofs.ErrNotExist):
+		default:
+			return nil, fmt.Errorf("check the source file %s: %w", f.name, err)
+		}
+		out = append(out, f)
+	}
+	return out, nil
+}
+
+// sourceChanges names the files whose existence, size or modification time
+// differ between two statSource results.
+func sourceChanges(before, after []sourceFile) []string {
+	var out []string
+	for i := range before {
+		if i >= len(after) {
+			break
+		}
+		b, a := before[i], after[i]
+		switch {
+		case b.exists != a.exists && a.exists:
+			out = append(out, a.name+" appeared")
+		case b.exists != a.exists:
+			out = append(out, b.name+" disappeared")
+		case b.exists && (b.size != a.size || !b.mod.Equal(a.mod)):
+			out = append(out, a.name+" changed")
+		}
+	}
+	return out
+}
+
+// newSourceGuard records the source files now and returns a check for the
+// end of the run: it fails when a file changed since, or the database now
+// looks in use. With allowLive it only warns on stderr (the run is a
+// rehearsal on a live database anyway).
+func newSourceGuard(dbPath string, allowLive bool, stderr io.Writer) (func() error, error) {
+	before, err := statSource(dbPath)
+	if err != nil {
+		return nil, err
+	}
+	return func() error {
+		after, err := statSource(dbPath)
+		if err != nil {
+			return err
+		}
+		why := sourceChanges(before, after)
+		if inUse := dbSourceInUse(dbPath); inUse != "" {
+			why = append(why, "the database looks in use: "+inUse)
+		}
+		if len(why) == 0 {
+			return nil
+		}
+		if allowLive {
+			fmt.Fprintf(stderr, "WARNING: the source changed during the run (%s); -allow-live-source is set. Use the result for a rehearsal only.\n", strings.Join(why, "; "))
+			return nil
+		}
+		return fmt.Errorf("the source database changed during the run (%s): a toolyard may have started on it. "+
+			"Stop it, and run the command again", strings.Join(why, "; "))
+	}, nil
 }
 
 // printDBReport prints a short summary: counts, names and problems.
@@ -272,14 +370,44 @@ func printDBReport(w io.Writer, rep *dbcopy.Report) {
 }
 
 // writeDBReport writes the report as indented JSON, readable by its owner
-// only.
+// only. It writes a new file (O_CREATE|O_EXCL, mode 0600) in the same
+// directory and renames it over path, so an existing file keeps neither its
+// mode nor its content, and a symlink at path is replaced, not followed.
 func writeDBReport(path string, rep *dbcopy.Report) error {
 	b, err := json.MarshalIndent(rep, "", "  ")
 	if err != nil {
 		return fmt.Errorf("encode the report: %w", err)
 	}
-	if err := os.WriteFile(path, append(b, '\n'), 0o600); err != nil {
+	// os.CreateTemp opens with O_RDWR|O_CREATE|O_EXCL and mode 0600.
+	f, err := os.CreateTemp(filepath.Dir(path), "."+filepath.Base(path)+".tmp-*")
+	if err != nil {
 		return fmt.Errorf("write the report: %w", err)
 	}
+	tmp := f.Name()
+	ok := false
+	defer func() {
+		if !ok {
+			_ = f.Close()
+			_ = os.Remove(tmp)
+		}
+	}()
+	if err := f.Chmod(0o600); err != nil {
+		return fmt.Errorf("write the report: %w", err)
+	}
+	if _, err := f.Write(append(b, '\n')); err != nil {
+		return fmt.Errorf("write the report: %w", err)
+	}
+	if err := f.Sync(); err != nil {
+		return fmt.Errorf("write the report: %w", err)
+	}
+	if err := f.Close(); err != nil {
+		return fmt.Errorf("write the report: %w", err)
+	}
+	if err := os.Rename(tmp, path); err != nil {
+		_ = os.Remove(tmp)
+		ok = true // closed and removed
+		return fmt.Errorf("write the report: %w", err)
+	}
+	ok = true
 	return nil
 }

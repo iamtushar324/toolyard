@@ -75,6 +75,21 @@ func TestResolveDatabaseRejectsBadSettings(t *testing.T) {
 			writeCredFile(t, filepath.Join(creds, databaseURLFile), "mysql://u:s3cret-pw@h/db")
 			return noEnv
 		},
+		// pgx takes the first @ as the end of the password, so the rest of
+		// the password would land in the host name (and in the logs).
+		"env has an unescaped @ in the password": func(*testing.T, string) func(string) string {
+			return dbEnvMap(map[string]string{databaseURLEnv: "postgres://toolyard:s3cret@pw@db.example.invalid:5432/toolyard"})
+		},
+		"env has an unescaped / in the password": func(*testing.T, string) func(string) string {
+			return dbEnvMap(map[string]string{databaseURLEnv: "postgres://toolyard:s3cret/pw@db.example.invalid:5432/toolyard"})
+		},
+		"env has a bad port": func(*testing.T, string) func(string) string {
+			return dbEnvMap(map[string]string{databaseURLEnv: "postgres://toolyard:s3cret-pw@db.example.invalid:54x2/toolyard"})
+		},
+		"file has a bad port": func(t *testing.T, creds string) func(string) string {
+			writeCredFile(t, filepath.Join(creds, databaseURLFile), "postgresql://toolyard:s3cret-pw@db.example.invalid:99999/toolyard")
+			return noEnv
+		},
 	} {
 		t.Run(name, func(t *testing.T) {
 			creds := t.TempDir()
@@ -87,6 +102,19 @@ func TestResolveDatabaseRejectsBadSettings(t *testing.T) {
 				t.Fatalf("the error quotes the setting: %v", err)
 			}
 		})
+	}
+}
+
+// An upper-case scheme is a Postgres URL for every step: resolve, describe
+// and (in store) connect.
+func TestResolveDatabaseAcceptsAnUpperCaseScheme(t *testing.T) {
+	upper := "POSTGRES://toolyard:s3cret-pw@db.example.invalid:5432/toolyard?sslmode=require"
+	got, err := resolveDatabase(t.TempDir(), "", dbEnvMap(map[string]string{databaseURLEnv: upper}))
+	if err != nil || !got.isPostgres() {
+		t.Fatalf("upper-case scheme = %+v, %v", got, err)
+	}
+	if d := got.describe(); d != "postgres host=db.example.invalid database=toolyard" {
+		t.Fatalf("describe = %q", d)
 	}
 }
 

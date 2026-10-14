@@ -21,14 +21,15 @@ import (
 const DefaultPostgresMaxConns = 10
 
 // IsPostgresURL reports whether url names a Postgres database
-// (postgres:// or postgresql://).
+// (postgres:// or postgresql://, the scheme in any letter case).
 func IsPostgresURL(url string) bool {
 	u := strings.ToLower(strings.TrimSpace(url))
 	return strings.HasPrefix(u, "postgres://") || strings.HasPrefix(u, "postgresql://")
 }
 
 // PostgresTarget returns the host and database name of a Postgres URL, for
-// logs. It never returns the user or the password.
+// logs. It never returns the user or the password. Its error matches
+// ErrConfig and never quotes the URL.
 func PostgresTarget(url string) (host, database string, err error) {
 	cfg, err := parsePostgresURL(url)
 	if err != nil {
@@ -37,40 +38,88 @@ func PostgresTarget(url string) (host, database string, err error) {
 	return cfg.Host, cfg.Database, nil
 }
 
+// ErrConfig marks a database setting a restart cannot fix: a Postgres URL
+// that cannot be parsed, or a database whose collation is not C. The
+// gateway maps it to exit code 78.
+var ErrConfig = errors.New("store: database configuration error")
+
+// configError is an error matching ErrConfig. Its message is fixed text:
+// never the URL or the password.
+type configError struct{ msg string }
+
+func (e *configError) Error() string { return e.msg }
+
+func (e *configError) Is(target error) bool { return target == ErrConfig }
+
 // errBadPostgresURL never quotes the URL: it holds the password.
-var errBadPostgresURL = errors.New("store: the database URL cannot be parsed; the form is postgres://user:password@host:5432/database?sslmode=require")
+var errBadPostgresURL error = &configError{msg: "store: the database URL cannot be parsed; the form is postgres://user:password@host:5432/database?sslmode=require " +
+	"(percent-encode @ / : # ? and % in the password)"}
+
+// errAtInHost is a URL whose password holds an unescaped @: the parser
+// takes the first @ as the end of the password, so the rest of the password
+// would become part of the host name (and reach the logs).
+var errAtInHost error = &configError{msg: "store: the database URL has more than one @ before the host; percent-encode @ in the password as %40"}
 
 func parsePostgresURL(url string) (*pgx.ConnConfig, error) {
 	url = strings.TrimSpace(url)
 	if !IsPostgresURL(url) {
-		return nil, errors.New("store: a Postgres database URL starts with postgres:// or postgresql://")
+		return nil, &configError{msg: "store: a Postgres database URL starts with postgres:// or postgresql://"}
+	}
+	// URL schemes are case-insensitive, but pgx only knows the lower-case
+	// spelling: POSTGRES:// would otherwise fail to parse.
+	if i := strings.Index(url, "://"); i > 0 {
+		url = strings.ToLower(url[:i]) + url[i:]
 	}
 	cfg, err := pgx.ParseConfig(url)
 	if err != nil {
 		// pgx redacts the password in its message only as best it can.
 		return nil, errBadPostgresURL
 	}
+	hosts := []string{cfg.Host}
+	for _, fb := range cfg.Fallbacks {
+		hosts = append(hosts, fb.Host)
+	}
+	for _, h := range hosts {
+		if strings.Contains(h, "@") {
+			return nil, errAtInHost
+		}
+	}
 	return cfg, nil
+}
+
+// PostgresOptions tune OpenPostgresWith.
+type PostgresOptions struct {
+	// MaxConns is the pool size; <= 0 means DefaultPostgresMaxConns.
+	MaxConns int
+	// ReadOnly makes every session read-only
+	// (default_transaction_read_only=on) and applies no migrations.
+	ReadOnly bool
+	// NoMigrate applies no migrations: the database is used as it is. A
+	// caller that has checked the database may then call MigratePostgres.
+	NoMigrate bool
 }
 
 // OpenPostgres opens url (postgres:// or postgresql://) through the
 // placeholder-rewriting pgx connector, so the ? placeholders of toolyard's
 // SQL work unchanged. It sets MaxOpenConns(maxConns) (maxConns <= 0 means
-// DefaultPostgresMaxConns), pings, and applies pending migrations under
-// pg_advisory_lock. It never logs the URL or the password, and its errors do
-// not quote the URL.
+// DefaultPostgresMaxConns), pings, checks the collation, and applies pending
+// migrations under pg_advisory_lock. It never logs the URL or the password,
+// and its errors do not quote the URL.
 func OpenPostgres(ctx context.Context, url string, maxConns int) (*DB, error) {
-	return openPostgres(ctx, url, maxConns, false)
+	return OpenPostgresWith(ctx, url, PostgresOptions{MaxConns: maxConns})
 }
 
 // OpenPostgresReadOnly opens url for checks that must change nothing
 // (toolyard keys-check): one connection whose session has
 // default_transaction_read_only=on, and no migrations.
 func OpenPostgresReadOnly(ctx context.Context, url string) (*DB, error) {
-	return openPostgres(ctx, url, 1, true)
+	return OpenPostgresWith(ctx, url, PostgresOptions{MaxConns: 1, ReadOnly: true})
 }
 
-func openPostgres(ctx context.Context, url string, maxConns int, readOnly bool) (*DB, error) {
+// OpenPostgresWith opens url as OpenPostgres does, tuned by opts. Every open
+// checks that the database collation is C (an error matching ErrConfig
+// otherwise); only a read-write open without NoMigrate migrates.
+func OpenPostgresWith(ctx context.Context, url string, opts PostgresOptions) (*DB, error) {
 	cfg, err := parsePostgresURL(url)
 	if err != nil {
 		return nil, err
@@ -81,9 +130,10 @@ func openPostgres(ctx context.Context, url string, maxConns int, readOnly bool) 
 	if _, ok := cfg.RuntimeParams["application_name"]; !ok {
 		cfg.RuntimeParams["application_name"] = "toolyard"
 	}
-	if readOnly {
+	if opts.ReadOnly {
 		cfg.RuntimeParams["default_transaction_read_only"] = "on"
 	}
+	maxConns := opts.MaxConns
 	if maxConns <= 0 {
 		maxConns = DefaultPostgresMaxConns
 	}
@@ -96,8 +146,12 @@ func openPostgres(ctx context.Context, url string, maxConns int, readOnly bool) 
 		_ = sdb.Close()
 		return nil, fmt.Errorf("store: connect to Postgres at %s/%s: %w", cfg.Host, cfg.Database, err)
 	}
+	if err := checkCollation(ctx, sdb); err != nil {
+		_ = sdb.Close()
+		return nil, err
+	}
 	db := &DB{DB: sdb, Dialect: Postgres}
-	if readOnly {
+	if opts.ReadOnly || opts.NoMigrate {
 		return db, nil
 	}
 	if err := db.migratePostgres(ctx); err != nil {
@@ -106,6 +160,40 @@ func openPostgres(ctx context.Context, url string, maxConns int, readOnly bool) 
 	}
 	return db, nil
 }
+
+// MigratePostgres applies the pending Postgres migrations, as OpenPostgres
+// does, for a database opened with NoMigrate.
+func (db *DB) MigratePostgres(ctx context.Context) error {
+	if !db.Dialect.IsPostgres() {
+		return errors.New("store: MigratePostgres needs a Postgres database")
+	}
+	if err := db.migratePostgres(ctx); err != nil {
+		return fmt.Errorf("migrate: %w", err)
+	}
+	return nil
+}
+
+// checkCollation refuses a database whose text does not sort and compare
+// byte by byte, as SQLite's does: datcollate and datctype must be C or
+// POSIX, and the locale provider must not be ICU. Aurora creates databases
+// with en_US.UTF-8 unless told otherwise. datlocprovider exists from
+// Postgres 15 on; to_jsonb reads it as NULL on older servers.
+func checkCollation(ctx context.Context, q Querier) error {
+	var collate, ctype, provider string
+	err := q.QueryRowContext(ctx, `SELECT datcollate::text, datctype::text, COALESCE(to_jsonb(d) ->> 'datlocprovider', 'c')
+		FROM pg_database d WHERE datname = current_database()`).Scan(&collate, &ctype, &provider)
+	if err != nil {
+		return fmt.Errorf("store: read the database collation: %w", err)
+	}
+	if cLocale(collate) && cLocale(ctype) && provider != "i" {
+		return nil
+	}
+	return &configError{msg: fmt.Sprintf("store: the database has collation %q, character type %q and locale provider %q; toolyard needs C (or POSIX) "+
+		"for both, and not the ICU provider, so text sorts and compares as on SQLite. Create it with: "+
+		"CREATE DATABASE <name> TEMPLATE template0 ENCODING 'UTF8' LC_COLLATE 'C' LC_CTYPE 'C'", collate, ctype, provider)}
+}
+
+func cLocale(s string) bool { return s == "C" || s == "POSIX" }
 
 // WithPgxConn runs fn on one raw *pgx.Conn from the pool, for COPY FROM and
 // other pgx-only features. fn must not keep the connection after it returns.
@@ -380,4 +468,27 @@ func sqliteNamesThrough(last string) ([]string, error) {
 		}
 	}
 	return nil, fmt.Errorf("store: SQLite migration %s is missing", last)
+}
+
+// PostgresMigrationNames returns, sorted, every migration name a fully
+// migrated Postgres database records: the SQLite names the baseline stands
+// for, then every later Postgres file. A SQLite database of the same
+// version records the same names.
+func PostgresMigrationNames() ([]string, error) {
+	covered, err := sqliteNamesThrough(pgBaselineCovers)
+	if err != nil {
+		return nil, err
+	}
+	names, err := migrationNames("migrations/postgres")
+	if err != nil {
+		return nil, err
+	}
+	out := append([]string(nil), covered...)
+	for _, n := range names {
+		if n != pgBaseline {
+			out = append(out, n)
+		}
+	}
+	sort.Strings(out)
+	return out, nil
 }

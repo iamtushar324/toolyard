@@ -9,11 +9,13 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 
+	"github.com/tusharbhardwaj/toolyard/internal/blobstore"
 	"github.com/tusharbhardwaj/toolyard/internal/identity"
 	"github.com/tusharbhardwaj/toolyard/internal/keyguard"
 	"github.com/tusharbhardwaj/toolyard/internal/oauth"
@@ -128,9 +130,12 @@ func seedSource(t *testing.T) *source {
 			"key_"+purpose, purpose, randomBytes(t, 64), randomBytes(t, 32), now)
 	}
 	exec(`INSERT INTO federation_instance(id) VALUES('tyi_test')`)
-	for _, id := range []int64{1, 2, 7} { // an identity column with a gap
+	for _, id := range []int64{1, 2, 7, 9} { // an identity column with a gap
 		exec(`INSERT INTO inbox_dry_runs(id, agent_id, title, flags, created_at) VALUES(?, 'ag_identity', ?, '[]', ?)`, id, fmt.Sprintf("draft %d", id), now+id)
 	}
+	// AUTOINCREMENT: sqlite_sequence keeps 9 after the delete, so SQLite
+	// would hand out 10 next, never 8 or 9 again.
+	exec(`DELETE FROM inbox_dry_runs WHERE id = 9`)
 	exec(`INSERT INTO call_events(ts, upstream, short_name, tool_name, outcome, reason_quality) VALUES(?, 'github', 'x', 'github.x', 'ok', 0.75)`, now)
 	exec(`INSERT INTO event_sources(id, name, kind, created_at, updated_at) VALUES('evs_1', 'hooks', 'webhook', ?, ?)`, now, now)
 	exec(`INSERT INTO events(id, source_id, type, summary, created_at, received_at, lake_synced) VALUES('ev_1', 'evs_1', 'note', 'A note.', ?, ?, 1)`, now, now)
@@ -264,7 +269,7 @@ func TestCopyThenVerify(t *testing.T) {
 		t.Fatalf("REAL column: %v %v", quality, err)
 	}
 
-	vrep, err := Verify(ctx, src, s.blobDir, dst, s.keys)
+	vrep, err := Verify(ctx, src, s.blobDir, dst, s.keys, VerifyOptions{})
 	mustOK(t, "verify", vrep, err)
 	if len(vrep.Tables) != len(rep.Tables) {
 		t.Fatalf("verify compared %d tables, copy wrote %d", len(vrep.Tables), len(rep.Tables))
@@ -308,7 +313,7 @@ func TestCopyThenVerify(t *testing.T) {
 		wrong[k] = v
 	}
 	wrong[keyguard.SecretsKey] = randomBytes(t, sealbox.MasterKeySize)
-	bad, err := Verify(ctx, src, s.blobDir, dst, wrong)
+	bad, err := Verify(ctx, src, s.blobDir, dst, wrong, VerifyOptions{})
 	if err != nil {
 		t.Fatalf("verify with a wrong key: %v", err)
 	}
@@ -347,15 +352,17 @@ func TestCopyThenVerify(t *testing.T) {
 	if !rerun.TruncatedTarget || rerun.Blobs.Copied != 2 {
 		t.Fatalf("rerun: truncated %v, blobs %+v", rerun.TruncatedTarget, rerun.Blobs)
 	}
-	vrep, err = Verify(ctx, src, s.blobDir, dst, s.keys)
+	vrep, err = Verify(ctx, src, s.blobDir, dst, s.keys, VerifyOptions{})
 	mustOK(t, "verify after the rerun", vrep, err)
 
-	// New rows continue after the copied ids.
+	// New rows continue after the largest id SQLite handed out
+	// (sqlite_sequence: 9, a deleted row), not after the largest copied
+	// id (7).
 	var id int64
-	if err := dst.QueryRowContext(ctx, `INSERT INTO inbox_dry_runs(agent_id, title, flags, created_at) VALUES('ag_identity', 'new', '[]', 1) RETURNING id`).Scan(&id); err != nil || id != 8 {
-		t.Fatalf("next dry run id = %d (%v), want 8", id, err)
+	if err := dst.QueryRowContext(ctx, `INSERT INTO inbox_dry_runs(agent_id, title, flags, created_at) VALUES('ag_identity', 'new', '[]', 1) RETURNING id`).Scan(&id); err != nil || id != 10 {
+		t.Fatalf("next dry run id = %d (%v), want 10", id, err)
 	}
-	if _, err := dst.ExecContext(ctx, `DELETE FROM inbox_dry_runs WHERE id = 8`); err != nil {
+	if _, err := dst.ExecContext(ctx, `DELETE FROM inbox_dry_runs WHERE id = 10`); err != nil {
 		t.Fatal(err)
 	}
 
@@ -363,7 +370,7 @@ func TestCopyThenVerify(t *testing.T) {
 	if _, err := dst.ExecContext(ctx, `UPDATE system_settings SET value = '"light"' WHERE key = 'theme'`); err != nil {
 		t.Fatal(err)
 	}
-	tampered, err := Verify(ctx, src, s.blobDir, dst, s.keys)
+	tampered, err := Verify(ctx, src, s.blobDir, dst, s.keys, VerifyOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -380,7 +387,7 @@ func TestCopyThenVerify(t *testing.T) {
 	if _, err := dst.ExecContext(ctx, `UPDATE inbox_blob_chunks SET data = ? WHERE sha256 = ? AND seq = 0`, []byte("FIRST BLOB"), s.blobs[0]); err != nil {
 		t.Fatal(err)
 	}
-	tampered, err = Verify(ctx, src, s.blobDir, dst, s.keys)
+	tampered, err = Verify(ctx, src, s.blobDir, dst, s.keys, VerifyOptions{})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -482,5 +489,198 @@ func TestCopyRefusesBeforeWriting(t *testing.T) {
 				t.Fatalf("a refused copy wrote %d rows", n)
 			}
 		})
+	}
+}
+
+// openEmptyTarget creates an empty Postgres database (C collation, no
+// toolyard table) and opens it without migrations, as db copy does.
+func openEmptyTarget(t *testing.T) (string, *store.DB) {
+	t.Helper()
+	dbURL, err := storetest.NewEmptyPostgresDatabase(t, "C")
+	if err != nil {
+		t.Fatalf("create an empty database: %v", err)
+	}
+	dst, err := store.OpenPostgresWith(context.Background(), dbURL, store.PostgresOptions{MaxConns: 4, NoMigrate: true})
+	if err != nil {
+		t.Fatalf("open the empty database: %v", err)
+	}
+	t.Cleanup(func() { _ = dst.Close() })
+	return dbURL, dst
+}
+
+// Copy into an empty database (no toolyard table, no migration) checks
+// everything, then creates the schema and copies; verify then passes.
+func TestCopyIntoAnEmptyDatabase(t *testing.T) {
+	storetest.SkipUnlessPostgres(t)
+	ctx := context.Background()
+	s := seedSource(t)
+	src := s.open(t)
+	_, dst := openEmptyTarget(t)
+
+	rep, err := Copy(ctx, src, s.blobDir, dst, CopyOptions{})
+	mustOK(t, "copy into an empty database", rep, err)
+	if rep.Blobs.Copied != 2 || !rep.MigrationsMatch {
+		t.Fatalf("copy: blobs %+v, migrations match %v", rep.Blobs, rep.MigrationsMatch)
+	}
+	vrep, err := Verify(ctx, src, s.blobDir, dst, s.keys, VerifyOptions{})
+	mustOK(t, "verify", vrep, err)
+}
+
+// A database that records no toolyard migration but holds tables (another
+// application's, say) is refused before anything is written: no toolyard
+// table is created in it.
+func TestCopyRefusesADatabaseWithOtherTables(t *testing.T) {
+	storetest.SkipUnlessPostgres(t)
+	ctx := context.Background()
+	s := seedSource(t)
+	src := s.open(t)
+	_, dst := openEmptyTarget(t)
+	if _, err := dst.ExecContext(ctx, `CREATE TABLE other_app_users (id BIGINT PRIMARY KEY)`); err != nil {
+		t.Fatal(err)
+	}
+	rep, err := Copy(ctx, src, s.blobDir, dst, CopyOptions{TruncateTarget: true})
+	if err == nil || !strings.Contains(err.Error(), "not an empty database") || rep.OK() {
+		t.Fatalf("copy into a database with another application's table: %v", err)
+	}
+	for _, table := range []string{"schema_migrations", "system_settings", "inbox_blob_objects"} {
+		if has, err := store.TableExists(ctx, dst, store.Postgres, table); err != nil || has {
+			t.Fatalf("the refused copy created %s (%v)", table, err)
+		}
+	}
+	if has, err := store.TableExists(ctx, dst, store.Postgres, "other_app_users"); err != nil || !has {
+		t.Fatalf("the other table is gone (%v)", err)
+	}
+}
+
+// A source at other migrations than this toolyard version is refused
+// before an empty target is migrated.
+func TestCopyRefusesAnOlderSourceBeforeMigratingAnEmptyTarget(t *testing.T) {
+	storetest.SkipUnlessPostgres(t)
+	ctx := context.Background()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "toolyard.db")
+	db, err := store.Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := db.ExecContext(ctx, `DELETE FROM schema_migrations WHERE name = '0039_key_canaries.sql'`); err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	src, err := store.OpenReadOnly(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer src.Close()
+	_, dst := openEmptyTarget(t)
+	rep, err := Copy(ctx, src, filepath.Join(dir, "inbox", "blobs"), dst, CopyOptions{})
+	if err == nil || !strings.Contains(err.Error(), "different migrations") || rep.OK() {
+		t.Fatalf("copy from an older source: %v", err)
+	}
+	if has, err := store.TableExists(ctx, dst, store.Postgres, "schema_migrations"); err != nil || has {
+		t.Fatalf("the refused copy migrated the target (%v)", err)
+	}
+}
+
+// The tables and the blobs commit together: a copy stopped at the last
+// step (here the source guard) leaves no row and no blob, and a rerun then
+// copies everything.
+func TestCopyIsAllOrNothing(t *testing.T) {
+	storetest.SkipUnlessPostgres(t)
+	ctx := context.Background()
+	s := seedSource(t)
+	src := s.open(t)
+	dst := storetest.Open(t)
+
+	guardErr := errors.New("the source changed: toolyard.db-wal appeared")
+	rep, err := Copy(ctx, src, s.blobDir, dst, CopyOptions{SourceGuard: func() error { return guardErr }})
+	if !errors.Is(err, guardErr) || rep.OK() {
+		t.Fatalf("copy with a failing guard: %v", err)
+	}
+	for _, q := range []string{`SELECT COUNT(*) FROM inbox_dry_runs`, `SELECT COUNT(*) FROM inbox_blobs`,
+		`SELECT COUNT(*) FROM inbox_blob_objects`, `SELECT COUNT(*) FROM inbox_blob_chunks`} {
+		if n := count(t, dst, q); n != 0 {
+			t.Fatalf("a rolled-back copy left rows: %s = %d", q, n)
+		}
+	}
+	rep, err = Copy(ctx, src, s.blobDir, dst, CopyOptions{SourceGuard: func() error { return nil }})
+	mustOK(t, "rerun", rep, err)
+	if rep.Blobs.Copied != 2 {
+		t.Fatalf("rerun blobs: %+v", rep.Blobs)
+	}
+	vrep, err := Verify(ctx, src, s.blobDir, dst, s.keys, VerifyOptions{SourceGuard: func() error { return guardErr }})
+	if !errors.Is(err, guardErr) || vrep.OK() {
+		t.Fatalf("verify with a failing guard: %v", err)
+	}
+}
+
+// sqlExecer runs blob store statements on a database/sql transaction.
+func sqlExecer(tx *sql.Tx) blobstore.Execer {
+	return func(ctx context.Context, query string, args ...any) (int64, error) {
+		res, err := tx.ExecContext(ctx, query, args...)
+		if err != nil {
+			return 0, err
+		}
+		return res.RowsAffected()
+	}
+}
+
+// A blob file whose bytes changed after the check (same size, other bytes)
+// fails copyBlobs before the transaction can commit; an unchanged one is
+// stored and reads back. The blob tables exist on both engines.
+func TestCopyBlobsRehashes(t *testing.T) {
+	ctx := context.Background()
+	db := storetest.Open(t)
+	dir := t.TempDir()
+	good := append(randomBytes(t, blobstore.ChunkSize), randomBytes(t, 10)...)
+	goodPath := filepath.Join(dir, "good")
+	if err := os.WriteFile(goodPath, good, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	orig := []byte("the bytes that were checked")
+	changedPath := filepath.Join(dir, "changed")
+	if err := os.WriteFile(changedPath, []byte("THE BYTES THAT WERE CHECKED"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	tx, err := db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, _, err = copyBlobs(ctx, []sourceBlob{
+		{sha: sha256Hex(good), path: goodPath, size: int64(len(good))},
+		{sha: sha256Hex(orig), path: changedPath, size: int64(len(orig))},
+	}, sqlExecer(tx))
+	if err == nil || !strings.Contains(err.Error(), "changed during the copy") {
+		t.Fatalf("copy of a changed blob file: %v", err)
+	}
+	if err := tx.Rollback(); err != nil {
+		t.Fatal(err)
+	}
+	if n := count(t, db, `SELECT COUNT(*) FROM inbox_blob_objects`); n != 0 {
+		t.Fatalf("%d blobs left after the rollback", n)
+	}
+
+	tx, err = db.BeginTx(ctx, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	copied, present, err := copyBlobs(ctx, []sourceBlob{{sha: sha256Hex(good), path: goodPath, size: int64(len(good))}}, sqlExecer(tx))
+	if err != nil || copied != 1 || present != 0 {
+		t.Fatalf("copy of a good blob: %d %d %v", copied, present, err)
+	}
+	if err := tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	b, err := blobstore.NewPostgres(db.DB).Open(ctx, sha256Hex(good))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer b.Close()
+	got, err := io.ReadAll(b)
+	if err != nil || sha256Hex(got) != sha256Hex(good) {
+		t.Fatalf("read back: %d bytes, %v", len(got), err)
 	}
 }

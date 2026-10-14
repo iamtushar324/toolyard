@@ -5,11 +5,15 @@ import (
 	"crypto/sha256"
 	"errors"
 	"fmt"
+	"hash"
 	"io"
 	"io/fs"
+	"net"
 	"os"
 	"path/filepath"
 	"sort"
+
+	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/tusharbhardwaj/toolyard/internal/blobstore"
 	"github.com/tusharbhardwaj/toolyard/internal/store"
@@ -118,41 +122,83 @@ func hashFile(path string) (string, int64, error) {
 	return fmt.Sprintf("%x", h.Sum(nil)), n, nil
 }
 
-// copyBlobs stores every checked blob in bs, hashing the bytes again on the
-// way: a file that changed since the check is removed from bs and stops the
-// copy.
-func copyBlobs(ctx context.Context, blobs []sourceBlob, bs blobstore.Store, br *BlobReport) error {
+// errBlobChanged is a blob file whose bytes no longer hash to its name.
+var errBlobChanged = errors.New("the blob file changed")
+
+// verifyingReader hashes what it reads and, at the end of the file, fails
+// with errBlobChanged unless the bytes hash to want. The blob store then
+// sees an error before it is done, so the copy rolls back before it
+// commits. Once failed, it keeps failing.
+type verifyingReader struct {
+	r       io.Reader
+	h       hash.Hash
+	want    string
+	matched bool // the whole file was read and hashed to want
+	failed  bool
+}
+
+func (v *verifyingReader) Read(p []byte) (int, error) {
+	if v.failed {
+		return 0, errBlobChanged
+	}
+	n, err := v.r.Read(p)
+	_, _ = v.h.Write(p[:n])
+	if err == io.EOF {
+		if fmt.Sprintf("%x", v.h.Sum(nil)) != v.want {
+			v.failed, v.matched = true, false
+			return n, errBlobChanged
+		}
+		v.matched = true
+	}
+	return n, err
+}
+
+// copyBlobs writes every checked blob into the blob store tables through
+// exec, inside the copy's transaction, hashing the bytes again on the way:
+// a file that changed since the check fails the copy before it commits. It
+// returns how many blobs it wrote and how many were already there.
+func copyBlobs(ctx context.Context, blobs []sourceBlob, exec blobstore.Execer) (copied, present int, err error) {
 	for _, b := range blobs {
 		if err := ctx.Err(); err != nil {
-			return err
+			return copied, present, loadError("store the blobs", err)
 		}
 		f, err := os.Open(b.path)
 		if err != nil {
-			return fmt.Errorf("db copy: open blob file %s: %w", b.sha, err)
+			return copied, present, fmt.Errorf("db copy: open blob file %s: %w. Nothing was written.", b.sha, err)
 		}
-		h := sha256.New()
-		created, err := bs.Put(ctx, b.sha, io.TeeReader(f, h), b.size)
+		vr := &verifyingReader{r: f, h: sha256.New(), want: b.sha}
+		created, err := blobstore.PutIn(ctx, exec, b.sha, vr, b.size)
 		_ = f.Close()
-		if err != nil {
-			return fmt.Errorf("db copy: store blob %s: %w", b.sha, err)
+		if err != nil || (created && !vr.matched) {
+			if err == nil || errors.Is(err, errBlobChanged) || vr.failed {
+				return copied, present, fmt.Errorf("db copy: blob file %s changed during the copy (its bytes no longer match its name). Nothing was written.", b.sha)
+			}
+			return copied, present, blobError(b.sha, err)
 		}
 		if !created {
-			br.AlreadyPresent++
+			present++
 			continue
 		}
-		if got := fmt.Sprintf("%x", h.Sum(nil)); got != b.sha {
-			_ = bs.Delete(ctx, b.sha)
-			return fmt.Errorf("db copy: blob file %s changed during the copy (its bytes no longer match its name); it was removed from the target again", b.sha)
-		}
-		br.Copied++
+		copied++
 	}
-	return nil
+	return copied, present, nil
+}
+
+// blobError describes a failed blob write without quoting a value. The
+// blob store's own errors hold only the blob name and sizes.
+func blobError(sha string, err error) error {
+	var pe *pgconn.PgError
+	var ne net.Error
+	if errors.As(err, &pe) || errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) || errors.As(err, &ne) {
+		return loadError("store blob "+sha, err)
+	}
+	return fmt.Errorf("db copy: store blob %s: %v. Nothing was written.", sha, err)
 }
 
 // verifyBlobs reads every source blob back from the target store and
 // checks that its sha256 equals its name. The source folder is only
 // listed: rows without a file there, and orphan files, are reported.
-func verifyBlobs(ctx context.Context, src store.Querier, dir string, bs blobstore.Store, br *BlobReport) error {
+func verifyBlobs(ctx context.Context, src store.Querier, dir string, bs blobstore.Opener, br *BlobReport) error {
 	shas, err := blobRows(ctx, src)
 	if err != nil {
 		return fmt.Errorf("db verify: %w", err)

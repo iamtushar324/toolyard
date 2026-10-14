@@ -36,7 +36,12 @@ import (
 // Report.OK is false on any difference. The report holds names, counts,
 // hashes and booleans only: no value and no plaintext is printed, logged
 // or kept. An error means the comparison could not finish.
-func Verify(ctx context.Context, src *sql.DB, srcBlobDir string, dst *store.DB, keys map[string][]byte) (*Report, error) {
+//
+// Verify never writes and never migrates: dst may be a read-only pool
+// (store.PostgresOptions.ReadOnly). Every target read, the blobs included,
+// goes through one read-only REPEATABLE READ transaction, so it sees one
+// snapshot.
+func Verify(ctx context.Context, src *sql.DB, srcBlobDir string, dst *store.DB, keys map[string][]byte, opts VerifyOptions) (*Report, error) {
 	rep := newReport("verify")
 	if src == nil || dst == nil {
 		return rep, errors.New("db verify: no source or no target database")
@@ -93,7 +98,7 @@ func Verify(ctx context.Context, src *sql.DB, srcBlobDir string, dst *store.DB, 
 	if err := verifyNamedRows(ctx, stx, dtx, keys, rep); err != nil {
 		return rep, err
 	}
-	if err := verifyBlobs(ctx, stx, srcBlobDir, blobstore.NewPostgres(dst.DB), &rep.Blobs); err != nil {
+	if err := verifyBlobs(ctx, stx, srcBlobDir, blobstore.NewPostgresReader(dtx), &rep.Blobs); err != nil {
 		return rep, err
 	}
 	if n := len(rep.Blobs.TargetMissing); n > 0 {
@@ -102,7 +107,21 @@ func Verify(ctx context.Context, src *sql.DB, srcBlobDir string, dst *store.DB, 
 	if n := len(rep.Blobs.TargetMismatched); n > 0 {
 		rep.problemf("%d target blobs do not hash to their name", n)
 	}
+	if opts.SourceGuard != nil {
+		if err := opts.SourceGuard(); err != nil {
+			rep.problemf("the source changed or came into use during the run, so this comparison proves nothing")
+			return rep, fmt.Errorf("db verify: %w", err)
+		}
+	}
 	return rep, nil
+}
+
+// VerifyOptions change how Verify runs.
+type VerifyOptions struct {
+	// SourceGuard, when set, runs after the last source read. An error
+	// (the source changed or came into use during the run) fails the
+	// verify: what it compared may be torn.
+	SourceGuard func() error
 }
 
 // sealedStats counts one side's values of one sealed column.

@@ -22,6 +22,10 @@ type CopyOptions struct {
 	// copy's transaction. It is for repeating a rehearsal on a throwaway
 	// database only: without it, Copy refuses a target that holds rows.
 	TruncateTarget bool
+	// SourceGuard, when set, runs after the last source read, just before
+	// the target commit. An error (the source changed or came into use
+	// during the run) stops the copy, and nothing is committed.
+	SourceGuard func() error
 }
 
 // A table is loaded in COPY batches of at most batchRows rows or about
@@ -33,19 +37,28 @@ const (
 
 // Copy loads the SQLite database src (opened read-only; Copy only reads
 // it) and the blob files in srcBlobDir into the Postgres database dst.
+// Open dst without migrations (store.PostgresOptions.NoMigrate): Copy
+// decides whether the target may be migrated.
 //
-// It refuses, before writing anything, when dst is not Postgres, when the
-// two databases record different migrations, when a source table or column
-// is missing in the target (other than the dormant lake items), when the
-// target holds rows (unless opts.TruncateTarget), or when a blob file is
-// missing or does not hash to its name.
+// Every refusal runs first (the target's in a read-only transaction), so a
+// refused copy writes nothing at all. Copy refuses when dst is not
+// Postgres; when the target records no toolyard migration but holds tables
+// (another application's database, say); when the target records
+// migrations other than the source's, or (for an empty target) the source
+// is not at this toolyard version's migrations; when a source table or
+// column is missing in the target (other than the dormant lake items);
+// when the target holds rows (unless opts.TruncateTarget); or when a blob
+// file is missing or does not hash to its name. Only an empty target, one
+// that records no migration, is migrated, and only after every refusal
+// passed. A target that records migrations is never migrated.
 //
-// Every table is then copied in one transaction on one connection: COPY in
-// batches, parents before children, the identity sequences moved past the
-// copied ids, then commit. A value that does not fit its target column
-// stops the copy with a *CellError naming the table, column and primary
-// key, never the value; nothing is committed. Last, every blob goes into
-// the Postgres blob store (a blob already there is left alone).
+// Then everything is copied in one transaction on one connection: COPY in
+// batches, parents before children, every blob into the blob store tables
+// (hashed again on the way), the identity sequences moved past the copied
+// ids, opts.SourceGuard, then commit. A value that does not fit its target
+// column stops the copy with a *CellError naming the table, column and
+// primary key, never the value; nothing is committed, and a rerun starts
+// again from the beginning.
 //
 // The returned report is filled as far as Copy got, also with an error.
 func Copy(ctx context.Context, src *sql.DB, srcBlobDir string, dst *store.DB, opts CopyOptions) (*Report, error) {
@@ -63,26 +76,8 @@ func Copy(ctx context.Context, src *sql.DB, srcBlobDir string, dst *store.DB, op
 	}
 	defer func() { _ = stx.Rollback() }()
 
-	p, err := buildPlan(ctx, stx, dst)
-	if err != nil {
-		return rep, fmt.Errorf("db copy: %w", err)
-	}
-	p.fill(rep)
-	if err := p.refusal(); err != nil {
-		return rep, err
-	}
-
-	full, err := nonEmptyTables(ctx, dst, append(p.tableNames(), p.BlobTables...))
-	if err != nil {
-		return rep, fmt.Errorf("db copy: %w", err)
-	}
-	rep.NonEmptyTargetTables = full
-	if len(full) > 0 && !opts.TruncateTarget {
-		rep.problemf("the target is not empty: %d tables hold rows (%s)", len(full), listNames(full))
-		return rep, fmt.Errorf("db copy: refused, nothing was written: the target database is not empty (%d tables hold rows: %s). "+
-			"Copy into a new, empty database; -truncate-target empties it first, for a rehearsal only", len(full), listNames(full))
-	}
-
+	// The source-only checks first: hashing every blob file can take a
+	// while, and the target's check transaction below stays short.
 	blobs, err := scanSourceBlobs(ctx, stx, srcBlobDir, &rep.Blobs)
 	if err != nil {
 		return rep, fmt.Errorf("db copy: %w", err)
@@ -92,9 +87,66 @@ func Copy(ctx context.Context, src *sql.DB, srcBlobDir string, dst *store.DB, op
 		return rep, fmt.Errorf("db copy: refused, nothing was written: %d inbox_blobs rows have no file in %s, and %d files do not hash to their name (the report lists them)",
 			missing, srcBlobDir, bad)
 	}
+	seqs, err := readSQLiteSequences(ctx, stx)
+	if err != nil {
+		return rep, fmt.Errorf("db copy: %w", err)
+	}
+
+	// Every check of the target runs in a read-only transaction: Postgres
+	// itself refuses a write before the checks pass.
+	rtx, err := dst.BeginTx(ctx, &sql.TxOptions{ReadOnly: true})
+	if err != nil {
+		return rep, fmt.Errorf("db copy: read the target: %w", err)
+	}
+	defer func() { _ = rtx.Rollback() }() // after the first Rollback: a no-op
+
+	ts, err := readTargetState(ctx, rtx)
+	if err != nil {
+		return rep, fmt.Errorf("db copy: %w", err)
+	}
+	var p *plan
+	if ts.fresh() {
+		if err := refuseFreshTarget(ctx, stx, ts, rep); err != nil {
+			return rep, err
+		}
+	} else {
+		if p, err = buildPlan(ctx, stx, rtx); err != nil {
+			return rep, fmt.Errorf("db copy: %w", err)
+		}
+		p.fill(rep)
+		if err := p.refusal(); err != nil {
+			return rep, err
+		}
+		if err := refuseNonEmpty(ctx, rtx, p, rep, opts); err != nil {
+			return rep, err
+		}
+	}
+	if err := rtx.Rollback(); err != nil {
+		return rep, fmt.Errorf("db copy: end the target check: %w", err)
+	}
+
+	if ts.fresh() {
+		// Every refusal passed: give the empty target this version's
+		// schema, then plan against it.
+		if err := dst.MigratePostgres(ctx); err != nil {
+			return rep, fmt.Errorf("db copy: create the toolyard tables in the empty target: %w", err)
+		}
+		if p, err = buildPlan(ctx, stx, dst); err != nil {
+			return rep, fmt.Errorf("db copy: %w", err)
+		}
+		p.fill(rep)
+		if err := p.refusal(); err != nil {
+			return rep, err
+		}
+	}
+	if len(blobs) > 0 && len(p.BlobTables) != len(blobTables) {
+		rep.problemf("the target has no blob store tables (%s)", strings.Join(blobTables, ", "))
+		return rep, fmt.Errorf("db copy: refused, nothing was written: the target has no blob store tables (%s)", strings.Join(blobTables, ", "))
+	}
 
 	var tables []TableReport
 	var reset []string
+	var copied, present int
 	err = dst.WithPgxConn(ctx, func(conn *pgx.Conn) error {
 		tx, err := conn.Begin(ctx)
 		if err != nil {
@@ -118,16 +170,31 @@ func Copy(ctx context.Context, src *sql.DB, srcBlobDir string, dst *store.DB, op
 				return err
 			}
 		}
+		if copied, present, err = copyBlobs(ctx, blobs, pgxExecer(tx)); err != nil {
+			return err
+		}
 		for _, t := range p.Tables {
 			for _, col := range t.Identity {
-				// Names are plain identifiers (plainIdent), so pasting them
-				// is safe; the raw pgx connection takes no ? placeholders.
+				// The next id is past both the largest copied id and the
+				// largest id SQLite ever handed out (sqlite_sequence), so
+				// the ids of deleted rows are never used again, as on
+				// SQLite. Names are plain identifiers (plainIdent), so
+				// pasting them is safe; the raw pgx connection takes $1.
+				var seq int64
+				if len(t.Identity) == 1 {
+					seq = seqs[t.Name]
+				}
 				q := `SELECT setval(pg_get_serial_sequence('` + t.Name + `', '` + col + `'), ` +
-					`COALESCE((SELECT MAX(` + quoteIdent(col) + `) FROM ` + quoteIdent(t.Name) + `), 0) + 1, false)`
-				if _, err := tx.Exec(ctx, q); err != nil {
+					`GREATEST(COALESCE((SELECT MAX(` + quoteIdent(col) + `) FROM ` + quoteIdent(t.Name) + `), 0), $1::bigint) + 1, false)`
+				if _, err := tx.Exec(ctx, q, seq); err != nil {
 					return loadError("reset the identity sequence of "+t.Name+"."+col, err)
 				}
 				reset = append(reset, t.Name+"."+col)
+			}
+		}
+		if opts.SourceGuard != nil {
+			if err := opts.SourceGuard(); err != nil {
+				return fmt.Errorf("db copy: %w. Nothing was written.", err)
 			}
 		}
 		if err := tx.Commit(ctx); err != nil {
@@ -137,22 +204,151 @@ func Copy(ctx context.Context, src *sql.DB, srcBlobDir string, dst *store.DB, op
 	})
 	rep.Tables = append(rep.Tables, tables...)
 	if err != nil {
-		rep.problemf("the table copy failed and was rolled back: the target holds nothing from this run")
+		rep.problemf("the copy failed and was rolled back: the target holds no row and no blob from this run")
 		return rep, err
 	}
 	rep.IdentityReset = reset
 	rep.TruncatedTarget = opts.TruncateTarget
+	rep.Blobs.Copied, rep.Blobs.AlreadyPresent = copied, present
 	for _, tr := range tables {
 		if !tr.Match {
 			rep.problemf("table %s: %d source rows, but Postgres took %d", tr.Name, tr.SourceRows, tr.CopiedRows)
 		}
 	}
-
-	if err := copyBlobs(ctx, blobs, blobstore.NewPostgres(dst.DB), &rep.Blobs); err != nil {
-		rep.problemf("the blob copy stopped after %d of %d blobs; the tables are committed", rep.Blobs.Copied+rep.Blobs.AlreadyPresent, len(blobs))
-		return rep, err
-	}
 	return rep, nil
+}
+
+// targetState is what the target holds before a copy.
+type targetState struct {
+	// migrations are the names schema_migrations records (none when the
+	// table is missing).
+	migrations []string
+	// tables are the base tables of the current schema, schema_migrations
+	// included.
+	tables []string
+}
+
+// fresh reports a target that records no migration: an empty database, or
+// one where toolyard has never run.
+func (s targetState) fresh() bool { return len(s.migrations) == 0 }
+
+// readTargetState reads the target's tables and recorded migrations. It
+// only reads.
+func readTargetState(ctx context.Context, q store.Querier) (targetState, error) {
+	var s targetState
+	tables, err := readNames(ctx, q, `SELECT table_name::text FROM information_schema.tables
+		WHERE table_schema = current_schema() AND table_type = 'BASE TABLE'`)
+	if err != nil {
+		return s, fmt.Errorf("read the target's tables: %w", err)
+	}
+	s.tables = tables
+	if !setOf(tables)["schema_migrations"] {
+		return s, nil
+	}
+	if s.migrations, err = readNames(ctx, q, `SELECT name FROM schema_migrations`); err != nil {
+		return s, fmt.Errorf("read the target's migrations: %w", err)
+	}
+	return s, nil
+}
+
+// refuseFreshTarget runs the refusals for a target that records no
+// migration, before Copy migrates it: the target must hold no table (but
+// an empty schema_migrations), and the source must be at exactly this
+// toolyard version's migrations, so the migrated target matches it.
+func refuseFreshTarget(ctx context.Context, src store.Querier, ts targetState, rep *Report) error {
+	var other []string
+	for _, n := range ts.tables {
+		if n != "schema_migrations" {
+			other = append(other, n)
+		}
+	}
+	if len(other) > 0 {
+		rep.TargetOnlyTables = other
+		rep.problemf("the target records no toolyard migration but holds %d tables (%s)", len(other), listNames(other))
+		return fmt.Errorf("db copy: refused, nothing was written: the target records no toolyard migration but holds %d tables (%s), "+
+			"so it is not an empty database (is the URL right?). Copy into a new, empty database", len(other), listNames(other))
+	}
+	srcMig, err := readNames(ctx, src, `SELECT name FROM schema_migrations`)
+	if err != nil {
+		return fmt.Errorf("db copy: read the source's migrations: %w", err)
+	}
+	want, err := store.PostgresMigrationNames()
+	if err != nil {
+		return fmt.Errorf("db copy: %w", err)
+	}
+	rep.Migrations = len(srcMig)
+	onlySrc, onlyThis := diffNames(srcMig, want)
+	rep.MigrationsMatch = len(onlySrc)+len(onlyThis) == 0
+	rep.SourceOnlyMigrations = onlySrc
+	if rep.MigrationsMatch {
+		return nil
+	}
+	rep.problemf("the source's migrations differ from this toolyard version's: %d only in the source (%s), %d only in this version (%s)",
+		len(onlySrc), listNames(onlySrc), len(onlyThis), listNames(onlyThis))
+	return fmt.Errorf("db copy: refused, nothing was written: the source and this toolyard version are at different migrations (%d only in the source: %s; %d only in this version: %s). "+
+		"Run this toolyard version once on the SQLite data directory (start and stop serve) so both are at the same level",
+		len(onlySrc), listNames(onlySrc), len(onlyThis), listNames(onlyThis))
+}
+
+// refuseNonEmpty refuses a target whose copied tables or blob store tables
+// hold a row, unless opts.TruncateTarget.
+func refuseNonEmpty(ctx context.Context, q store.Querier, p *plan, rep *Report, opts CopyOptions) error {
+	full, err := nonEmptyTables(ctx, q, append(p.tableNames(), p.BlobTables...))
+	if err != nil {
+		return fmt.Errorf("db copy: %w", err)
+	}
+	rep.NonEmptyTargetTables = full
+	if len(full) == 0 || opts.TruncateTarget {
+		return nil
+	}
+	rep.problemf("the target is not empty: %d tables hold rows (%s)", len(full), listNames(full))
+	return fmt.Errorf("db copy: refused, nothing was written: the target database is not empty (%d tables hold rows: %s). "+
+		"Copy into a new, empty database; -truncate-target empties it first, for a rehearsal only", len(full), listNames(full))
+}
+
+// readSQLiteSequences reads sqlite_sequence: for each AUTOINCREMENT table,
+// the largest id SQLite has handed out, deleted rows included. It is empty
+// when no table uses AUTOINCREMENT.
+func readSQLiteSequences(ctx context.Context, src store.Querier) (map[string]int64, error) {
+	out := map[string]int64{}
+	ok, err := store.TableExists(ctx, src, store.SQLite, "sqlite_sequence")
+	if err != nil || !ok {
+		if err != nil {
+			err = fmt.Errorf("read the source's sqlite_sequence: %w", err)
+		}
+		return out, err
+	}
+	rows, err := src.QueryContext(ctx, `SELECT name, seq FROM sqlite_sequence`)
+	if err != nil {
+		return nil, fmt.Errorf("read the source's sqlite_sequence: %w", err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var name string
+		var seq sql.NullInt64
+		if err := rows.Scan(&name, &seq); err != nil {
+			return nil, fmt.Errorf("read the source's sqlite_sequence: %w", err)
+		}
+		if seq.Valid && seq.Int64 > out[name] {
+			out[name] = seq.Int64
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("read the source's sqlite_sequence: %w", err)
+	}
+	return out, nil
+}
+
+// pgxExecer runs blob store statements (? placeholders) on the copy's raw
+// pgx transaction, which does not rewrite them itself.
+func pgxExecer(tx pgx.Tx) blobstore.Execer {
+	return func(ctx context.Context, query string, args ...any) (int64, error) {
+		tag, err := tx.Exec(ctx, store.Rebind(query), args...)
+		if err != nil {
+			return 0, err
+		}
+		return tag.RowsAffected(), nil
+	}
 }
 
 // copyTable streams t's rows from the source into COPY batches on tx.

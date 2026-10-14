@@ -54,7 +54,13 @@ func (s *Service) Query(ctx context.Context, f Filter) ([]Event, error) {
 		q += ` AND e.acked_at IS NULL`
 	}
 	if f.Q != "" {
-		like := "%" + f.Q + "%"
+		q2 := f.Q
+		if s.db.Dialect.IsPostgres() {
+			// Postgres LIKE treats a backslash as the escape character;
+			// SQLite does not. Double it so it matches itself on both.
+			q2 = strings.ReplaceAll(q2, `\`, `\\`)
+		}
+		like := "%" + q2 + "%"
 		op := s.db.Dialect.ILike() // case-insensitive on both engines
 		q += ` AND (e.summary ` + op + ` ? OR e.title ` + op + ` ? OR e.type ` + op + ` ?)`
 		args = append(args, like, like, like)

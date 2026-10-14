@@ -31,14 +31,18 @@ func (d Dialect) IsPostgres() bool { return d == Postgres }
 
 // JSONText returns an SQL expression for the text value at the top-level key
 // of the JSON text column col. SQLite: json_extract(col, '$.key'). Postgres:
-// (col::jsonb ->> 'key'). key must be a plain identifier ([A-Za-z0-9_]+), or
-// JSONText panics: it is pasted into SQL. col is trusted SQL.
+// (replace(col, '\u0000', '\ufffd')::jsonb ->> 'key'): jsonb refuses the
+// \u0000 escape json.Marshal writes for a NUL character, and the replace
+// keeps the text valid JSON, so no stored doc makes the query fail (the
+// inbox_client_request_key index uses the same expression). key must be a
+// plain identifier ([A-Za-z0-9_]+), or JSONText panics: it is pasted into
+// SQL. col is trusted SQL.
 func (d Dialect) JSONText(col, key string) string {
 	if !plainIdent(key) {
 		panic(fmt.Sprintf("store: JSONText key %q is not a plain identifier", key))
 	}
 	if d == Postgres {
-		return "(" + col + "::jsonb ->> '" + key + "')"
+		return "(replace(" + col + `, '\u0000', '\ufffd')::jsonb ->> '` + key + "')"
 	}
 	return "json_extract(" + col + ", '$." + key + "')"
 }

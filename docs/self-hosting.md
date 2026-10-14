@@ -543,6 +543,11 @@ CREATE DATABASE toolyard OWNER toolyard
   TEMPLATE template0 ENCODING 'UTF8' LC_COLLATE 'C' LC_CTYPE 'C';
 ```
 
+`serve` refuses (exit 78) a database whose collation or character type is
+not `C` or `POSIX`, or that uses the ICU provider. In the URL, percent-encode
+`@`, `/`, `:` and `#` in the password; a URL that does not parse also exits
+78, and no message ever quotes it.
+
 The first start creates the whole schema in one transaction, and later
 starts apply new migrations. Migrations run under a Postgres advisory lock,
 so two processes that start at the same time do not both migrate. The role
@@ -564,8 +569,14 @@ does nothing there.
 - Back up the database with Postgres tools (`pg_dump`, or snapshots on
   Aurora) instead of copying `toolyard.db`. Back up the keys with it, but
   store them apart from it, as for SQLite.
-- To move an existing SQLite installation to Postgres, use `toolyard db
-  copy` and then `toolyard db verify` (run `toolyard db` for their flags).
+- To move an existing SQLite installation to Postgres, stop toolyard, then
+  run `toolyard db copy` and `toolyard db verify` (run `toolyard db` for
+  their flags). `copy` creates the schema only in a database that records
+  no migrations and holds no tables, refuses anything else before it
+  writes, and is all-or-nothing, blobs included: a failed run leaves the
+  target empty. `verify` only reads. Both refuse a source that looks in
+  use, and check again before they finish. Never start a gateway on a copy
+  of production data: it would refresh real OAuth tokens.
 
 ## Keys and credentials
 

@@ -384,6 +384,57 @@ func TestDBStoreStrayAndMissingChunks(t *testing.T) {
 	}
 }
 
+// A database blob closed while another goroutine reads and seeks it (what
+// http.ServeContent's multi-range goroutine can do when the handler
+// returns) never panics: the reader sees errClosed or io.EOF. Run under
+// -race this also checks the locking.
+func TestDBBlobConcurrentReadAndClose(t *testing.T) {
+	ctx := context.Background()
+	s := NewPostgres(storetest.Open(t).DB)
+	data := pattern(256<<10, 8)
+	sha := hexSum(data)
+	if _, err := s.Put(ctx, sha, bytes.NewReader(data), int64(len(data))); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 200; i++ {
+		b, err := s.Open(ctx, sha)
+		if err != nil {
+			t.Fatal(err)
+		}
+		done := make(chan error, 1)
+		go func() {
+			buf := make([]byte, 1024)
+			for n := 0; ; n++ {
+				if n%16 == 15 {
+					if _, err := b.Seek(int64(n%7), io.SeekStart); err != nil {
+						done <- err
+						return
+					}
+				}
+				if _, err := b.Read(buf); err != nil {
+					done <- err
+					return
+				}
+			}
+		}()
+		if i%2 == 1 {
+			runtime.Gosched()
+		}
+		if err := b.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if err := <-done; !errors.Is(err, errClosed) && err != io.EOF {
+			t.Fatalf("round %d: the reader stopped with %v, want errClosed or io.EOF", i, err)
+		}
+		if _, err := b.Read(make([]byte, 1)); !errors.Is(err, errClosed) {
+			t.Fatalf("round %d: read after close: %v, want errClosed", i, err)
+		}
+		if _, err := b.Seek(0, io.SeekStart); !errors.Is(err, errClosed) {
+			t.Fatalf("round %d: seek after close: %v, want errClosed", i, err)
+		}
+	}
+}
+
 func TestLocalLayout(t *testing.T) {
 	ctx := context.Background()
 	dir := filepath.Join(t.TempDir(), "blobs")

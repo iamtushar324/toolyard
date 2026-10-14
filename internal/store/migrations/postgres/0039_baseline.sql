@@ -594,9 +594,15 @@ CREATE TABLE inbox_requests (
 );
 CREATE INDEX idx_inbox_status_created ON inbox_requests (status, created_at DESC);
 CREATE INDEX idx_inbox_agent_status ON inbox_requests (agent_id, status);
-CREATE UNIQUE INDEX inbox_client_request_key ON inbox_requests (agent_id, (doc::jsonb ->> 'client_request_id'))
-    WHERE (doc::jsonb ->> 'client_request_id') IS NOT NULL
-      AND (doc::jsonb ->> 'client_request_id') <> '';
+-- jsonb refuses the \u0000 escape that Go's json.Marshal writes for a NUL
+-- character, and this index evaluates its expression on every write. The
+-- replace() keeps the text valid JSON (an escaped backslash followed by
+-- u0000 stays valid too) and makes the cast total, so no request doc can
+-- make an insert or update fail. store.Dialect.JSONText builds the same
+-- expression.
+CREATE UNIQUE INDEX inbox_client_request_key ON inbox_requests (agent_id, (replace(doc, '\u0000', '\ufffd')::jsonb ->> 'client_request_id'))
+    WHERE (replace(doc, '\u0000', '\ufffd')::jsonb ->> 'client_request_id') IS NOT NULL
+      AND (replace(doc, '\u0000', '\ufffd')::jsonb ->> 'client_request_id') <> '';
 
 CREATE TABLE inbox_grants (
     id            TEXT PRIMARY KEY,

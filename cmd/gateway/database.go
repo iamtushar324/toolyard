@@ -51,9 +51,10 @@ func (t dbTarget) describe() string {
 //     credentialsDir, holding that URL (surrounding whitespace trimmed), else
 //  3. SQLite at <dataDir>/toolyard.db.
 //
-// A URL that is not postgres:// or postgresql://, an empty or unreadable
-// database-url file, is an error matching keyguard.ErrConfig (exit 78). No
-// error quotes the URL.
+// A URL that is not postgres:// or postgresql:// (in any letter case) or
+// that cannot be parsed, an empty or unreadable database-url file, is an
+// error matching keyguard.ErrConfig (exit 78), so systemd does not restart
+// a start that cannot work. No error quotes the URL.
 func resolveDatabase(dataDir, credentialsDir string, getenv func(string) string) (dbTarget, error) {
 	if getenv == nil {
 		getenv = os.Getenv
@@ -61,6 +62,9 @@ func resolveDatabase(dataDir, credentialsDir string, getenv func(string) string)
 	if u := strings.TrimSpace(getenv(databaseURLEnv)); u != "" {
 		if !store.IsPostgresURL(u) {
 			return dbTarget{}, dbConfigErrorf("%s must be a postgres:// or postgresql:// URL", databaseURLEnv)
+		}
+		if err := checkPostgresURL(u); err != nil {
+			return dbTarget{}, dbConfigErrorf("%s: %v", databaseURLEnv, err)
 		}
 		return dbTarget{URL: u, Source: databaseURLEnv}, nil
 	}
@@ -88,28 +92,56 @@ func resolveDatabase(dataDir, credentialsDir string, getenv func(string) string)
 		if !store.IsPostgresURL(u) {
 			return dbTarget{}, dbConfigErrorf("%s must hold a postgres:// or postgresql:// URL", p)
 		}
+		if err := checkPostgresURL(u); err != nil {
+			return dbTarget{}, dbConfigErrorf("%s: %v", p, err)
+		}
 		return dbTarget{URL: u, Source: p}, nil
 	}
 	return dbTarget{Path: filepath.Join(dataDir, "toolyard.db"), Source: "-data"}, nil
 }
 
+// checkPostgresURL parses u as store does when it connects. Its error is
+// store's fixed text (it never quotes the URL): the URL cannot be parsed,
+// for example a bad port or an unescaped / in the password, or an unescaped
+// @ in the password would put part of it in the host name.
+func checkPostgresURL(u string) error {
+	_, _, err := store.PostgresTarget(u)
+	return err
+}
+
 // openDatabase opens t read-write and applies pending migrations.
 // maxConns is the Postgres pool size (<= 0: store's default); SQLite always
-// uses one connection.
+// uses one connection. A Postgres setting a restart cannot fix (a database
+// whose collation is not C) is an error matching keyguard.ErrConfig.
 func openDatabase(ctx context.Context, t dbTarget, maxConns int) (*store.DB, error) {
 	if t.isPostgres() {
-		return store.OpenPostgres(ctx, t.URL, maxConns)
+		db, err := store.OpenPostgres(ctx, t.URL, maxConns)
+		return db, asDBConfigError(err)
 	}
 	return store.Open(t.Path)
 }
 
+// asDBConfigError makes an error matching store.ErrConfig also match
+// keyguard.ErrConfig (exit 78). Other errors, nil included, pass unchanged.
+func asDBConfigError(err error) error {
+	if err == nil || !errors.Is(err, store.ErrConfig) || errors.Is(err, keyguard.ErrConfig) {
+		return err
+	}
+	return &dbConfigError{msg: "database: " + err.Error(), err: err}
+}
+
 // dbConfigError is a database setting that is missing, unreadable or wrong:
 // it exits 78 like a key error, since a restart will not fix it.
-type dbConfigError struct{ msg string }
+type dbConfigError struct {
+	msg string
+	err error // the underlying error, when there is one
+}
 
 func (e *dbConfigError) Error() string { return e.msg }
 
 func (e *dbConfigError) Is(target error) bool { return target == keyguard.ErrConfig }
+
+func (e *dbConfigError) Unwrap() error { return e.err }
 
 func dbConfigErrorf(format string, args ...any) error {
 	return &dbConfigError{msg: "database: " + fmt.Sprintf(format, args...)}

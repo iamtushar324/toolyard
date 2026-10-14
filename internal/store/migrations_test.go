@@ -1,6 +1,7 @@
 package store
 
 import (
+	"errors"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -118,7 +119,7 @@ func TestDialectSQL(t *testing.T) {
 	if got := SQLite.JSONText("doc", "client_request_id"); got != "json_extract(doc, '$.client_request_id')" {
 		t.Fatalf("SQLite JSONText = %q", got)
 	}
-	if got := Postgres.JSONText("r.doc", "status"); got != "(r.doc::jsonb ->> 'status')" {
+	if got := Postgres.JSONText("r.doc", "status"); got != `(replace(r.doc, '\u0000', '\ufffd')::jsonb ->> 'status')` {
 		t.Fatalf("Postgres JSONText = %q", got)
 	}
 	if SQLite.ILike() != "LIKE" || Postgres.ILike() != "ILIKE" {
@@ -171,5 +172,33 @@ func TestPostgresTargetNeverReturnsTheSecret(t *testing.T) {
 	}
 	if _, _, err := PostgresTarget("postgres://toolyard:s3cret-pw@[bad"); err == nil || strings.Contains(err.Error(), "s3cret-pw") {
 		t.Fatalf("a bad URL gave error %v; want an error that does not quote the password", err)
+	}
+}
+
+// TestPostgresTargetRefusesMalformedURLs: every URL pgx would reject, or
+// would read with part of the password in the host name, is an ErrConfig
+// error that quotes nothing; an upper-case scheme is accepted.
+func TestPostgresTargetRefusesMalformedURLs(t *testing.T) {
+	for name, url := range map[string]string{
+		"unescaped @ in the password": "postgres://toolyard:s3cret@pw@db.example.invalid:5432/toolyard",
+		"unescaped / in the password": "postgres://toolyard:s3cret/pw@db.example.invalid:5432/toolyard",
+		"bad port":                    "postgres://toolyard:s3cret-pw@db.example.invalid:54x2/toolyard",
+		"not a postgres URL":          "mysql://toolyard:s3cret-pw@db.example.invalid/toolyard",
+	} {
+		_, _, err := PostgresTarget(url)
+		if !errors.Is(err, ErrConfig) {
+			t.Errorf("%s: err %v, want ErrConfig", name, err)
+			continue
+		}
+		if strings.Contains(err.Error(), "s3cret") || strings.Contains(err.Error(), "db.example.invalid") {
+			t.Errorf("%s: the error quotes the URL: %v", name, err)
+		}
+	}
+	host, database, err := PostgresTarget(" POSTGRES://toolyard:s3cret-pw@db.example.invalid:5432/toolyard ")
+	if err != nil || host != "db.example.invalid" || database != "toolyard" {
+		t.Fatalf("upper-case scheme: %q %q %v", host, database, err)
+	}
+	if _, _, err := PostgresTarget("PostgreSQL://toolyard:pw%40x@db.example.invalid/toolyard"); err != nil {
+		t.Fatalf("mixed-case postgresql:// with an escaped @: %v", err)
 	}
 }

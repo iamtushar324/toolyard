@@ -148,6 +148,48 @@ func NewPostgresDatabase(t testing.TB) string {
 	return dbURL
 }
 
+// NewEmptyPostgresDatabase creates an empty Postgres database for one test:
+// no toolyard table and no migration, built from template0 with LC_COLLATE
+// and LC_CTYPE set to locale (for example "C"). It returns its postgres://
+// URL, and drops it when the test ends; close what you open on it before
+// then. The error is CREATE DATABASE's, for example when the server does
+// not know locale, so a test can skip. It fails the test unless
+// TOOLYARD_TEST_DB=postgres.
+func NewEmptyPostgresDatabase(t testing.TB, locale string) (string, error) {
+	t.Helper()
+	if Engine() != store.Postgres {
+		t.Fatalf("storetest: NewEmptyPostgresDatabase needs %s=postgres", EnvEngine)
+	}
+	dsn := strings.TrimSpace(os.Getenv(EnvPostgresDSN))
+	if dsn == "" {
+		t.Fatalf("storetest: %s=postgres needs %s", EnvEngine, EnvPostgresDSN)
+	}
+	setupOnce.Do(func() { setupErr = setup(dsn) })
+	if setupErr != nil {
+		t.Fatalf("storetest: prepare the Postgres template database: %v", setupErr)
+	}
+	name := "t_" + randomHex(t, 8)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
+	defer cancel()
+	lit := "'" + strings.ReplaceAll(locale, "'", "''") + "'"
+	if err := execRetryInUse(ctx, adminDB, `CREATE DATABASE `+quoteIdent(name)+
+		` TEMPLATE template0 ENCODING 'UTF8' LC_COLLATE `+lit+` LC_CTYPE `+lit); err != nil {
+		return "", err
+	}
+	t.Cleanup(func() {
+		dctx, dcancel := context.WithTimeout(context.Background(), time.Minute)
+		defer dcancel()
+		if _, err := adminDB.ExecContext(dctx, `DROP DATABASE IF EXISTS `+quoteIdent(name)+` WITH (FORCE)`); err != nil {
+			t.Logf("storetest: drop database %s: %v", name, err)
+		}
+	})
+	dbURL, err := withDatabase(dsn, name)
+	if err != nil {
+		t.Fatalf("storetest: %v", err)
+	}
+	return dbURL, nil
+}
+
 // setup connects to the maintenance database named in dsn and makes sure
 // the template database for the current migrations exists. It runs once
 // per test process; a pg_advisory_lock makes the test processes of one run
