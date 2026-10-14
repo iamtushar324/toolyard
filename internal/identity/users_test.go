@@ -103,6 +103,10 @@ func TestUpsertClerkUserLinksOwner(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// The owner row is the first user by created_at (ties broken by the
+	// random id), so the next user must not share the primary's
+	// millisecond, or the test picks either row at random.
+	time.Sleep(2 * time.Millisecond)
 	// Someone else with the owner email but... no: a different email first,
 	// to prove non-owners never attach to the primary row.
 	other := clerkUser(t, s, "user_other", "other@beknown.work", "owner@beknown.work")
