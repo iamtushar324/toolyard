@@ -713,12 +713,13 @@ keeps at most 64 label sets; later new values are counted under `other`.
 
 On SIGTERM (or SIGINT) toolyard drains before it exits:
 
-1. Readiness turns `503` (`draining`) and new tool calls get a retryable
-   refusal, so a load balancer stops sending work. Open MCP `GET` streams
-   and dashboard event streams are closed at once, and a new stream `GET`
-   gets `503`, so clients reconnect to another instance.
-2. After `-drain-delay` (default `3s`), the HTTP server stops accepting
-   new requests.
+1. Readiness turns `503` (`draining`), new tool calls get a retryable
+   refusal, and a new MCP stream `GET` gets `503`, so a load balancer stops
+   sending work.
+2. After `-drain-delay` (default `3s`), open MCP `GET` streams and
+   dashboard event streams close, a new dashboard stream gets `503`, so
+   clients reconnect to another instance, and the HTTP server stops
+   accepting new requests.
 3. Open HTTP requests and in-flight executions have until `-drain-timeout`
    (default `60s`, counted from the start of the drain) to finish. Work
    still running then is cancelled and recorded as outcome unknown.

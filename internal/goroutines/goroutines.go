@@ -131,6 +131,12 @@ func recoverAndLog(name string, extra map[string]string) {
 	report(name, r, extra)
 }
 
+// Report counts, dumps and logs a panic the caller recovered itself, for
+// code that must turn the panic into a result instead of ending. Call it
+// from the deferred function that recovered r, so the stack still shows
+// the panicking frames.
+func Report(name string, r any) { report(name, r, nil) }
+
 // report counts, dumps and logs one recovered panic. Called from the
 // deferred recover, so debug.Stack still shows the panicking frames.
 func report(name string, r any, extra map[string]string) {

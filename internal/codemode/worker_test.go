@@ -11,6 +11,8 @@ import (
 	"time"
 
 	"github.com/mark3labs/mcp-go/mcp"
+
+	"github.com/tusharbhardwaj/toolyard/internal/goroutines"
 )
 
 // The worker tests spawn this test binary as the worker: TestMain, seeing
@@ -186,6 +188,27 @@ func TestWorkerIgnoresStopSignals(t *testing.T) {
 	if failed || !strings.Contains(text, "Execution completed successfully") {
 		t.Fatalf("a stop signal cut the script (failed=%v):\n%s", failed, text)
 	}
+}
+
+func TestNestedCallPanicFailsOnlyTheScript(t *testing.T) {
+	f := newFake()
+	f.handlers["BkCoreServices.get-all-clients"] = func(map[string]any) (*mcp.CallToolResult, error) {
+		panic("tool exploded")
+	}
+	bothWays(t, f, Limits{}, func(t *testing.T, rt *Runtime) {
+		before := goroutines.Panics()
+		text, failed := rt.ExecuteToolCode(context.Background(), "result = BkCoreServices.get_all_clients()", "")
+		if !failed || !strings.Contains(text, "internal error during the call") || !strings.Contains(text, "outcome is unknown") {
+			t.Fatalf("a panicking tool did not fail the script cleanly (failed=%v):\n%s", failed, text)
+		}
+		if goroutines.Panics() <= before {
+			t.Fatal("the panic was not reported")
+		}
+		text, failed = rt.ExecuteToolCode(context.Background(), `result = BkCoreServices.get_client(clientId="vai-us")`, "")
+		if failed || !strings.Contains(text, "Execution completed successfully") {
+			t.Fatalf("the runtime did not serve the next script (failed=%v):\n%s", failed, text)
+		}
+	})
 }
 
 func TestWorkerConcurrencyIsCapped(t *testing.T) {
