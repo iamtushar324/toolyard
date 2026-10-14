@@ -526,6 +526,12 @@ type sessionClaims struct {
 	jwt.RegisteredClaims
 }
 
+// issueSession signs a browser in: it creates a sessions row and sets the
+// dashboard session cookie. Call it only after a person has proved who they
+// are in this request: a password (authLogin), a Clerk session
+// (authClerkSession) or first-run setup (authSetup). Handoff links never call
+// it; they only open the Inbox (openHandoff). TestIssueSessionOnlyAfterHumanProof
+// fails when any other function calls it.
 func (s *Server) issueSession(w http.ResponseWriter, r *http.Request, userID string) error {
 	// Persist a session anchor so we can revoke this JWT before its expiry.
 	sid, err := s.identity.CreateSession(r.Context(), userID, r.UserAgent(), s.security.ClientIP(r), sessionTTL)

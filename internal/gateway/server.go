@@ -120,6 +120,17 @@ type toolEntry struct {
 	// auto-allowed). The intent_category supplied by the agent is ignored
 	// when forcedAction is set.
 	forcedAction *policy.Action
+	// denyOverridesForced lets an explicit deny policy, on the tool or on
+	// its upstream, beat forcedAction (policy.Engine.ExplicitDeny). Set on
+	// the lake.* tools only: control-plane tools (inbox.*, policies.*, ...)
+	// keep ignoring deny, so one rule can never lock every agent out.
+	denyOverridesForced bool
+	// escalate, when non-nil, reads a call's arguments after the policy
+	// decision: if that decision is allow and escalate returns true, the
+	// call needs approval instead, with the returned reason. It sends the
+	// data-replacing or externally reaching forms of an open tool to a
+	// person (lake.create_table, lake.ingest).
+	escalate func(args map[string]any) (string, bool)
 	// reasonOptional lets a call omit _reason. Set on the code-mode tools,
 	// whose clients are configured for Bifrost and never send one; the
 	// nested calls a script makes still carry a reason.
@@ -1197,34 +1208,7 @@ func (g *Gateway) routeEntry(ctx context.Context, entry toolEntry, via string, a
 		Arguments:    argsJSON,
 	})
 
-	var decision policy.Decision
-	if entry.forcedAction != nil {
-		decision = policy.Decision{
-			Action: *entry.forcedAction,
-			Reason: "built-in tool policy",
-			RuleID: "builtin-forced-" + string(*entry.forcedAction),
-		}
-	} else {
-		decision = g.policy.Eval(policy.Request{
-			AgentID:      agentID,
-			UpstreamName: entry.upstream,
-			// Wrapped catalog name — matches tool_policies targets and the
-			// IsReadOnlyName/IsWrite computation used everywhere else.
-			ToolName:       entry.tool.Name,
-			IntentCategory: intent,
-			Arguments:      cleanArgs,
-			UserReason:     reason,
-		})
-	}
-
-	if entry.requireHuman && decision.Action != policy.ActionDeny {
-		decision.Action = policy.ActionApprove
-		decision.RequireHuman = true
-	}
-
-	if entry.personalGitHub && decision.Action == policy.ActionApprove {
-		decision.RequireHuman = true
-	}
+	decision := g.decide(entry, agentID, intent, reason, cleanArgs)
 
 	// A grant only matters for calls that would otherwise need approval:
 	// an explicit deny still wins, and an open tool doesn't use one up.
@@ -1274,6 +1258,71 @@ func (g *Gateway) routeEntry(ctx context.Context, entry toolEntry, via string, a
 		ev.ErrorClass = "policy"
 		return mcp.NewToolResultErrorf("policy returned unknown action %q", decision.Action), nil
 	}
+}
+
+// ruleEscalated is the RuleID of the approval an entry's escalate func
+// asks for.
+const ruleEscalated = "builtin-escalated"
+
+// decide is the routing decision for one call to entry: baseDecision (an
+// overridable explicit deny, else the forced action or policy.Eval, then
+// the entry's escalate func), then the requireHuman and personal-GitHub
+// rules. routeEntry and Access (inbox.check, request validation) use it,
+// and effectiveAccess (policies.*, the agent policy guard) starts from the
+// same baseDecision, so all of them agree on what a call needs.
+func (g *Gateway) decide(entry toolEntry, agentID, intent, reason string, args map[string]any) policy.Decision {
+	decision := baseDecision(g.policy, targetOf(entry), policy.Request{
+		AgentID:        agentID,
+		IntentCategory: intent,
+		Arguments:      args,
+		UserReason:     reason,
+	})
+	if entry.requireHuman && decision.Action != policy.ActionDeny {
+		decision.Action = policy.ActionApprove
+		decision.RequireHuman = true
+	}
+	if entry.personalGitHub && decision.Action == policy.ActionApprove {
+		decision.RequireHuman = true
+	}
+	return decision
+}
+
+// baseDecision is the policy decision for a call to t under engine, in
+// this order:
+//  1. with denyOverridesForced, an explicit deny on the tool or its
+//     upstream (a tool rule beats an upstream rule, as in Eval) wins;
+//  2. otherwise the forced action, if any, else engine.Eval;
+//  3. an allow becomes an approval when t.escalate says this call's
+//     arguments need one. A person must decide it (RequireHuman), so a
+//     learned auto-approval rule never runs a data-replacing call.
+//
+// req.UpstreamName and req.ToolName are filled in from t: the wrapped
+// catalog name, which matches tool_policies targets and the
+// IsReadOnlyName/IsWrite computation used everywhere else.
+func baseDecision(engine *policy.Engine, t policyTarget, req policy.Request) policy.Decision {
+	req.UpstreamName = t.upstream
+	req.ToolName = t.name
+	if t.denyOverridesForced {
+		if d, denied := engine.ExplicitDeny(t.name, t.upstream); denied {
+			return d
+		}
+	}
+	var decision policy.Decision
+	if t.forced != nil {
+		decision = policy.Decision{
+			Action: *t.forced,
+			Reason: "built-in tool policy",
+			RuleID: "builtin-forced-" + string(*t.forced),
+		}
+	} else {
+		decision = engine.Eval(req)
+	}
+	if decision.Action == policy.ActionAllow && t.escalate != nil {
+		if why, ok := t.escalate(req.Arguments); ok {
+			decision = policy.Decision{Action: policy.ActionApprove, Reason: why, RuleID: ruleEscalated, RequireHuman: true}
+		}
+	}
+	return decision
 }
 
 func (g *Gateway) registerEntry(e toolEntry) {

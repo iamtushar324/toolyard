@@ -34,12 +34,25 @@ var (
 // The four approval-gated tools deliberately have no forcedAction — they
 // fall through to policy.Eval, where the name heuristic already classifies
 // them as writes and the engine returns ActionApprove.
+//
+// The free tools never replace or drop data and never reach outside the
+// lake without approval: every lake entry lets an explicit deny policy beat
+// its forced allow (denyOverridesForced), lake.create_table escalates DDL
+// that replaces an existing object (escalateLakeCreate), lake.ingest
+// escalates replace mode and URL sources (escalateLakeIngest), and the SQL
+// validators reject external table functions (lake.ValidateSelect and
+// friends).
 func (g *Gateway) lakeTools() []toolEntry {
 	if g.lake == nil {
 		return nil
 	}
-	lk := g.lake
+	return lakeToolEntries(g.lake)
+}
 
+// lakeToolEntries builds the lake.* entries around lk. The handlers use lk
+// only when called, so tests build the entries with a nil lk to check
+// their routing without a ClickHouse.
+func lakeToolEntries(lk *lake.Service) []toolEntry {
 	out := []toolEntry{}
 	out = append(out, lakeEntry(
 		"lake.query",
@@ -48,7 +61,7 @@ func (g *Gateway) lakeTools() []toolEntry {
 			Type:     "object",
 			Required: []string{ReasonField, "sql"},
 			Properties: addMetaProps(map[string]any{
-				"sql":      map[string]any{"type": "string", "description": "Read-only SQL (SELECT, WITH, SHOW, PRAGMA)."},
+				"sql":      map[string]any{"type": "string", "description": "Read-only SQL (SELECT, WITH, SHOW, DESCRIBE, EXPLAIN). External table functions (url, remote, s3, file, ...) are rejected."},
 				"params":   map[string]any{"type": "array", "items": map[string]any{}, "description": "Positional bind parameters (?)"},
 				"max_rows": map[string]any{"type": "integer", "minimum": 1, "maximum": 10000, "description": "Hard cap. Default 1000, max 10000."},
 			}),
@@ -84,7 +97,7 @@ func (g *Gateway) lakeTools() []toolEntry {
 	))
 	out = append(out, lakeEntry(
 		"lake.insert",
-		"Append rows to a lake table. NO approval — additive operations on the lake do not need human review. Provide either `rows` (array of objects, server builds the INSERT) or `sql` (raw INSERT statement, parser-validated). Use this when accumulating a new observation: a holding snapshot, a workout entry, a transaction.",
+		"Append rows to a lake table. NO approval — additive operations on the lake do not need human review. Provide either `rows` (array of objects, server builds the INSERT) or `sql` (raw INSERT statement, parser-validated; external table functions such as url, remote, s3 and file are rejected). Use this when accumulating a new observation: a holding snapshot, a workout entry, a transaction.",
 		mcp.ToolInputSchema{
 			Type:     "object",
 			Required: []string{ReasonField, "table"},
@@ -98,37 +111,46 @@ func (g *Gateway) lakeTools() []toolEntry {
 		&actionAllow,
 		handleLakeInsert(lk),
 	))
-	out = append(out, lakeEntry(
+	create := lakeEntry(
 		"lake.create_table",
-		"Create a new table, view, or index. NO approval — schema growth is additive. Pass raw DDL via `sql`. Use CREATE OR REPLACE freely; DROP/ALTER are NOT permitted here (they have their own approval-gated tools).",
+		"Create a new table, view, or index. NO approval for additive DDL — schema growth is additive. Pass raw DDL via `sql`. "+
+			"DDL that replaces an existing object (CREATE OR REPLACE) discards its data, so it NEEDS APPROVAL. "+
+			"Table engines: MergeTree family, Log, TinyLog, StripeLog, Memory or Null. External table functions (url, remote, s3, file, ...), "+
+			"users, roles, functions and dictionaries are rejected. DROP/ALTER are NOT permitted here (they have their own approval-gated tools).",
 		mcp.ToolInputSchema{
 			Type:     "object",
 			Required: []string{ReasonField, "sql"},
 			Properties: addMetaProps(map[string]any{
-				"sql": map[string]any{"type": "string", "description": "CREATE TABLE / CREATE VIEW / CREATE INDEX / CREATE SCHEMA."},
+				"sql": map[string]any{"type": "string", "description": "CREATE TABLE / CREATE VIEW / CREATE INDEX / CREATE SCHEMA. CREATE OR REPLACE needs approval."},
 			}),
 		},
 		&actionAllow,
 		handleLakeCreateTable(lk),
-	))
-	out = append(out, lakeEntry(
+	)
+	create.escalate = escalateLakeCreate
+	out = append(out, create)
+	ingest := lakeEntry(
 		"lake.ingest",
-		"Bulk-load data from a CSV / Parquet / JSON / JSONL / SQLite source into a target table. NO approval — additive. For SQLite, pass `source_uri` (path to the .db file) and `sqlite_table`.",
+		"Bulk-load data from a CSV / Parquet / JSON / JSONL / SQLite source into a target table. NO approval for mode=append from a local file under the ingest allowlist — additive. "+
+			"mode=replace (drops and recreates the target table) and URL sources (source_type http, or an http(s):// source_uri, which the lake server fetches) NEED APPROVAL. "+
+			"For SQLite, pass `source_uri` (path to the .db file) and `sqlite_table`.",
 		mcp.ToolInputSchema{
 			Type:     "object",
 			Required: []string{ReasonField, "source_type", "source_uri", "target_table"},
 			Properties: addMetaProps(map[string]any{
-				"source_type":  map[string]any{"type": "string", "enum": []string{"csv", "json", "jsonl", "parquet", "sqlite", "http"}},
-				"source_uri":   map[string]any{"type": "string"},
+				"source_type":  map[string]any{"type": "string", "enum": []string{"csv", "json", "jsonl", "parquet", "sqlite", "http"}, "description": "http needs approval."},
+				"source_uri":   map[string]any{"type": "string", "description": "A file path under the ingest allowlist; an http(s):// URL needs approval."},
 				"target_table": map[string]any{"type": "string", "description": "schema.table"},
-				"mode":         map[string]any{"type": "string", "enum": []string{"append", "replace"}, "description": "Default append."},
+				"mode":         map[string]any{"type": "string", "enum": []string{"append", "replace"}, "description": "Default append. replace drops and recreates the target table and needs approval."},
 				"options":      map[string]any{"type": "object"},
 				"sqlite_table": map[string]any{"type": "string", "description": "Required when source_type=sqlite."},
 			}),
 		},
 		&actionAllow,
 		handleLakeIngest(lk),
-	))
+	)
+	ingest.escalate = escalateLakeIngest
+	out = append(out, ingest)
 
 	// Approval-gated tools below: forcedAction is nil so policy.Eval applies.
 	// The name heuristic ("update"/"delete"/"alter"/"drop") classifies each
@@ -196,6 +218,9 @@ func (g *Gateway) lakeTools() []toolEntry {
 	return out
 }
 
+// lakeEntry builds one lake.* entry. Every lake entry lets an explicit deny
+// policy beat its forced action (denyOverridesForced): the lake is data,
+// not the control plane, so an owner can always switch a lake tool off.
 func lakeEntry(name, desc string, schema mcp.ToolInputSchema, forced *policy.Action, h directHandler) toolEntry {
 	tool := mcp.Tool{
 		Name:        name,
@@ -204,13 +229,42 @@ func lakeEntry(name, desc string, schema mcp.ToolInputSchema, forced *policy.Act
 	}
 	short := strings.TrimPrefix(name, "lake.")
 	return toolEntry{
-		tool:         tool,
-		upstream:     lakeUpstream,
-		originalName: short,
-		reasonField:  ReasonField,
-		handle:       h,
-		forcedAction: forced,
+		tool:                tool,
+		upstream:            lakeUpstream,
+		originalName:        short,
+		reasonField:         ReasonField,
+		handle:              h,
+		forcedAction:        forced,
+		denyOverridesForced: true,
 	}
+}
+
+// escalateLakeCreate sends lake.create_table DDL that replaces an existing
+// object (lake.IsReplacingDDL) to approval: the replaced object's data is
+// discarded.
+func escalateLakeCreate(args map[string]any) (string, bool) {
+	if lake.IsReplacingDDL(stringArg(args, "sql")) {
+		return "lake.create_table: this DDL replaces an existing object (CREATE OR REPLACE, REPLACE or EXCHANGE) and discards its data, so a person must approve it", true
+	}
+	return "", false
+}
+
+// escalateLakeIngest sends a lake.ingest call to approval when it would
+// replace the target table (mode replace drops and recreates it) or make
+// the lake server fetch a URL (source_type http, or an http(s):// source
+// URI). Values are compared trimmed and case-insensitively, so a variant
+// spelling escalates rather than slipping through.
+func escalateLakeIngest(args map[string]any) (string, bool) {
+	mode := strings.ToLower(strings.TrimSpace(stringArg(args, "mode")))
+	source := strings.ToLower(strings.TrimSpace(stringArg(args, "source_type")))
+	uri := strings.ToLower(strings.TrimSpace(stringArg(args, "source_uri")))
+	switch {
+	case mode == string(lake.ModeReplace):
+		return "lake.ingest: mode replace drops and recreates the target table, discarding its rows, so a person must approve it", true
+	case source == string(lake.SourceHTTP), strings.HasPrefix(uri, "http://"), strings.HasPrefix(uri, "https://"):
+		return "lake.ingest: a URL source makes the lake server fetch data from outside the lake, so a person must approve it", true
+	}
+	return "", false
 }
 
 // ---- handlers ----------------------------------------------------------------

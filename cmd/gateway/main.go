@@ -507,7 +507,13 @@ func runServe(argv []string) error {
 
 	// Shared policy engine: the gateway evaluates with it, the API exposes
 	// CRUD on the same instance so cache updates are seen immediately.
-	policyEngine := policy.New(db)
+	// Unreadable rules stop the start: serving without them would drop
+	// every explicit deny.
+	policyEngine, err := policy.Load(ctx, db)
+	if err != nil {
+		return fmt.Errorf("policy: load rules: %w", err)
+	}
+	log.Printf("policy: loaded %d rules", len(policyEngine.List()))
 
 	// Per-person identity keys ("Beknown keys"). Their own identity.key
 	// (blast-radius partitioning, as oauth.key and secrets.key): the raw
@@ -1414,8 +1420,12 @@ func runProbe(argv []string) error {
 	if err != nil {
 		return err
 	}
+	pol, err := policy.Load(ctx, db)
+	if err != nil {
+		return err
+	}
 	gw := gateway.New(gateway.Options{
-		Policy: policy.New(db), Approval: bus,
+		Policy: pol, Approval: bus,
 		Audit: audit.New(db), Memory: memory.New(db), Hub: realtime.NewHub(),
 	})
 	defer gw.Close()

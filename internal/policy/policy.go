@@ -6,6 +6,10 @@
 //	explicit upstream-scope policy → escalating intent category →
 //	read-name heuristic → default (writes need approval)
 //
+// If the stored policies could not be loaded, the engine fails closed:
+// every call is denied (RuleUnavailable) until a load succeeds, because the
+// heuristic alone would allow read-shaped tools that an explicit rule denies.
+//
 // The intent category is the caller's own `_intent_category` argument, so it
 // may only make a decision stricter, never looser: write, destructive,
 // external_communication, financial and privileged_admin force approval,
@@ -17,6 +21,7 @@ package policy
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"sync"
 	"time"
@@ -73,6 +78,10 @@ const (
 	ScopeUpstream = "upstream"
 )
 
+// RuleUnavailable is the RuleID of the deny Eval returns for every call
+// while the stored policies have not loaded (see Ready).
+const RuleUnavailable = "policy-unavailable"
+
 // Engine is the policy evaluator. It is nil-tolerant: built with a nil db
 // (probe/tests) it falls back to the heuristic-only behaviour with no stored
 // policies, which is exactly the pre-feature behaviour.
@@ -81,6 +90,11 @@ type Engine struct {
 	mu     sync.RWMutex
 	byTool map[string]ToolPolicy
 	byUp   map[string]ToolPolicy
+	// loadErr is the error of a failed first load. While it is set the
+	// engine knows none of the stored rules, so Eval denies every call
+	// instead of falling back to the name heuristic. The next successful
+	// reload clears it. Guarded by mu.
+	loadErr error
 	// writeMu serialises Set, Delete, DeleteTarget and Change, from the
 	// dashboard and from agents alike, so a guarded Change sees no other
 	// write land between its check and its own write.
@@ -88,15 +102,53 @@ type Engine struct {
 }
 
 // New constructs the engine and primes its policy cache from the db. Pass a
-// nil db for the heuristic-only engine used by probes and tests.
+// nil db for the heuristic-only engine used by probes and tests. If the
+// first load fails, the engine fails closed: Eval denies every call and
+// Ready returns the error until a later reload (for example through Set)
+// succeeds. A caller that can refuse to start should use Load instead.
 func New(db *store.DB) *Engine {
-	e := &Engine{db: db, byTool: map[string]ToolPolicy{}, byUp: map[string]ToolPolicy{}}
+	e := newEngine(db)
 	if db != nil {
-		_ = e.reload(context.Background())
+		if err := e.reload(context.Background()); err != nil {
+			e.loadErr = fmt.Errorf("load tool policies: %w", err)
+		}
 	}
 	return e
 }
 
+// Load constructs the engine and loads the stored policies, returning the
+// error instead of an engine when they cannot be read, so the caller can
+// refuse to start rather than run without its explicit rules. It needs a
+// db: use New(nil) for the heuristic-only engine.
+func Load(ctx context.Context, db *store.DB) (*Engine, error) {
+	if db == nil {
+		return nil, ErrNoDB
+	}
+	e := newEngine(db)
+	if err := e.reload(ctx); err != nil {
+		return nil, fmt.Errorf("load tool policies: %w", err)
+	}
+	return e, nil
+}
+
+func newEngine(db *store.DB) *Engine {
+	return &Engine{db: db, byTool: map[string]ToolPolicy{}, byUp: map[string]ToolPolicy{}}
+}
+
+// Ready returns the error of a failed first load, or nil once the stored
+// policies are loaded (always nil for a heuristic-only engine). While it is
+// non-nil, Eval denies every call. A reload that fails after a successful
+// one does not set it: the engine keeps its last good snapshot.
+func (e *Engine) Ready() error {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	return e.loadErr
+}
+
+// reload reads every stored policy and swaps the cache only once all rows
+// have been read. On any error it returns before the swap, so the engine
+// keeps its last good snapshot (or, after a failed first load, keeps
+// failing closed). A successful reload clears loadErr.
 func (e *Engine) reload(ctx context.Context) error {
 	rows, err := e.db.QueryContext(ctx,
 		`SELECT id, scope, target, action, COALESCE(note,''), created_at, updated_at FROM tool_policies`)
@@ -122,6 +174,7 @@ func (e *Engine) reload(ctx context.Context) error {
 	}
 	e.mu.Lock()
 	e.byTool, e.byUp = byTool, byUp
+	e.loadErr = nil
 	e.mu.Unlock()
 	return nil
 }
@@ -134,7 +187,11 @@ func (e *Engine) Eval(req Request) Decision {
 	e.mu.RLock()
 	tp, okT := e.byTool[req.ToolName]
 	up, okU := e.byUp[req.UpstreamName]
+	loadErr := e.loadErr
 	e.mu.RUnlock()
+	if loadErr != nil {
+		return unavailableDecision()
+	}
 	if okT {
 		if d, ok := decisionFromPolicy(tp); ok {
 			return d
@@ -170,6 +227,51 @@ func (e *Engine) Eval(req Request) Decision {
 		Action: ActionApprove,
 		Reason: "default: writes require approval",
 		RuleID: "v0.1-default-write",
+	}
+}
+
+// ExplicitDeny returns the explicit deny that applies to a call of tool (the
+// wrapped catalog name, as in Request.ToolName) on upstream, and true. It
+// resolves the explicit rules exactly as Eval does: a tool-scope rule wins,
+// then the meta-tool shortcut shadows any upstream-scope rule on the tools
+// group, then an upstream-scope rule applies. It returns Decision{} and
+// false when no explicit rule applies or the winning rule is not a deny
+// (so an upstream deny with a tool allow is not a deny). While the stored
+// policies have not loaded (see Ready), it returns the RuleUnavailable deny
+// and true, as Eval does.
+func (e *Engine) ExplicitDeny(tool, upstream string) (Decision, bool) {
+	e.mu.RLock()
+	tp, okT := e.byTool[tool]
+	up, okU := e.byUp[upstream]
+	loadErr := e.loadErr
+	e.mu.RUnlock()
+	if loadErr != nil {
+		return unavailableDecision(), true
+	}
+	if okT {
+		if d, ok := decisionFromPolicy(tp); ok {
+			if d.Action == ActionDeny {
+				return d, true
+			}
+			return Decision{}, false
+		}
+	}
+	if upstream == "tools" {
+		return Decision{}, false
+	}
+	if okU {
+		if d, ok := decisionFromPolicy(up); ok && d.Action == ActionDeny {
+			return d, true
+		}
+	}
+	return Decision{}, false
+}
+
+func unavailableDecision() Decision {
+	return Decision{
+		Action: ActionDeny,
+		Reason: "policy rules are unavailable (they failed to load); every call is denied until they load",
+		RuleID: RuleUnavailable,
 	}
 }
 
@@ -217,9 +319,11 @@ func (e *Engine) List() []ToolPolicy {
 // change applied: action allow|ask|deny upserts the (scope,target) rule,
 // "" removes it. The copy has no database, so it can only Eval; nothing
 // is persisted. It is how the agent-facing policies.set works out what a
-// change would do to every tool's effective access before making it.
+// change would do to every tool's effective access before making it. A
+// copy of an engine whose rules have not loaded fails closed as well.
 func (e *Engine) WithChange(scope, target, action string) *Engine {
 	e.mu.RLock()
+	loadErr := e.loadErr
 	byTool := make(map[string]ToolPolicy, len(e.byTool)+1)
 	for k, v := range e.byTool {
 		byTool[k] = v
@@ -243,7 +347,7 @@ func (e *Engine) WithChange(scope, target, action string) *Engine {
 		p.Action = action
 		m[target] = p
 	}
-	return &Engine{byTool: byTool, byUp: byUp}
+	return &Engine{byTool: byTool, byUp: byUp, loadErr: loadErr}
 }
 
 // Get returns the stored policy for a (scope,target), if any.
@@ -290,6 +394,14 @@ func (e *Engine) Change(ctx context.Context, scope, target, action, note string,
 	}
 	e.writeMu.Lock()
 	defer e.writeMu.Unlock()
+	// The guard judges the change against the rules in force. While the
+	// first load has not succeeded the engine does not know them, so read
+	// them now and refuse the change if they still cannot be read.
+	if e.Ready() != nil {
+		if err := e.reload(ctx); err != nil {
+			return nil, false, fmt.Errorf("load tool policies: %w", err)
+		}
+	}
 	if guard != nil {
 		if err := guard(e, e.WithChange(scope, target, action)); err != nil {
 			return nil, false, err
@@ -327,6 +439,8 @@ func (e *Engine) setLocked(ctx context.Context, scope, target, action, note stri
 	if err != nil {
 		return nil, err
 	}
+	// A failed reload is returned to the caller; the cache keeps its last
+	// good snapshot until a later reload succeeds.
 	if err := e.reload(ctx); err != nil {
 		return nil, err
 	}
@@ -334,7 +448,8 @@ func (e *Engine) setLocked(ctx context.Context, scope, target, action, note stri
 	return &p, nil
 }
 
-// Delete removes a policy by id.
+// Delete removes a policy by id. A failed reload after the delete is
+// returned; the cache keeps its last good snapshot.
 func (e *Engine) Delete(ctx context.Context, id string) error {
 	if e.db == nil {
 		return ErrNoDB
