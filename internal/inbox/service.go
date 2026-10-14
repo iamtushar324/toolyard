@@ -136,6 +136,12 @@ type Service struct {
 	// uploadRecordHook, when set (tests), runs before an upload is
 	// recorded; an error simulates a failed store.
 	uploadRecordHook func() error
+	// submitInsertHook, when set (tests), runs just before Submit stores
+	// a new request (after the client_request_id lookup).
+	submitInsertHook func()
+	// legacySyncMu runs one SyncLegacy transaction at a time in this
+	// process (DecideLegacy and RunLegacySync both call it).
+	legacySyncMu sync.Mutex
 
 	// releaseCh is closed by ReleaseWaiters at shutdown; Wait then
 	// returns ErrRestarting.
@@ -301,17 +307,9 @@ func (s *Service) Submit(ctx context.Context, agentID string, sub *Submission) (
 	defer s.submitMu.Unlock()
 	fingerprint := hashJSON(sub)
 	if sub.ClientRequestID != "" && !sub.DryRun {
-		var doc string
-		err := s.db.QueryRowContext(ctx, `SELECT doc FROM inbox_requests WHERE agent_id=? AND json_extract(doc,'$.client_request_id')=?`, agentID, sub.ClientRequestID).Scan(&doc)
+		replay, err := s.replayClientRequest(ctx, agentID, sub.ClientRequestID, fingerprint)
 		if err == nil {
-			var prev Request
-			if err = json.Unmarshal([]byte(doc), &prev); err != nil {
-				return nil, err
-			}
-			if prev.SubmissionFingerprint != fingerprint {
-				return nil, ErrConflict
-			}
-			return &SubmitResult{OK: true, RequestID: prev.ID, Status: prev.Status, ExpiresAt: prev.ExpiresAt}, nil
+			return replay, nil
 		}
 		if !errors.Is(err, sql.ErrNoRows) {
 			return nil, err
@@ -406,7 +404,20 @@ func (s *Service) Submit(ctx context.Context, agentID string, sub *Submission) (
 	if r.Downgraded != "" {
 		r.addActivity(r.CreatedAt, "Urgency lowered from now to soon: "+r.Downgraded)
 	}
+	if s.submitInsertHook != nil {
+		s.submitInsertHook()
+	}
 	if err := s.insert(ctx, r); err != nil {
+		// submitMu orders submissions in this process only. When another
+		// submission with the same client_request_id committed first, the
+		// unique index refuses this insert: answer as a sequential retry
+		// would (the stored request, or ErrConflict for other content).
+		if sub.ClientRequestID != "" && store.IsUniqueViolation(err) {
+			replay, rerr := s.replayClientRequest(ctx, agentID, sub.ClientRequestID, fingerprint)
+			if rerr == nil || errors.Is(rerr, ErrConflict) {
+				return replay, rerr
+			}
+		}
 		return nil, err
 	}
 	s.heartbeat(ctx, r.SessionID)
@@ -429,6 +440,25 @@ func (s *Service) Submit(ctx context.Context, agentID string, sub *Submission) (
 		s.backgroundCheck(context.Background(), id)
 	}(r.ID)
 	return res, nil
+}
+
+// replayClientRequest answers a retry of a stored submission: the stored
+// request when the content is the same, ErrConflict when it differs, and
+// sql.ErrNoRows when the agent has no request with this client_request_id.
+// The lookup expression matches the inbox_client_request_key index.
+func (s *Service) replayClientRequest(ctx context.Context, agentID, clientRequestID, fingerprint string) (*SubmitResult, error) {
+	var doc string
+	if err := s.db.QueryRowContext(ctx, `SELECT doc FROM inbox_requests WHERE agent_id=? AND `+s.db.Dialect.JSONText("doc", "client_request_id")+`=?`, agentID, clientRequestID).Scan(&doc); err != nil {
+		return nil, err
+	}
+	var prev Request
+	if err := json.Unmarshal([]byte(doc), &prev); err != nil {
+		return nil, err
+	}
+	if prev.SubmissionFingerprint != fingerprint {
+		return nil, ErrConflict
+	}
+	return &SubmitResult{OK: true, RequestID: prev.ID, Status: prev.Status, ExpiresAt: prev.ExpiresAt}, nil
 }
 
 // backgroundCheck copies linked media and runs the judge, then marks the
@@ -1528,7 +1558,13 @@ func (s *Service) mutate(ctx context.Context, id string, fn func(*Request) error
 }
 
 // mutateTx loads a request inside a transaction, applies fn and writes it
-// back. fn must not use s.db (the store has one connection).
+// back. fn must not use s.db (the SQLite store has one connection, and on
+// Postgres the row lock below would wait for itself).
+//
+// The row is read FOR UPDATE on Postgres, so a concurrent mutation (a
+// snooze, reminder, summary or voice note) waits for a committed decision
+// and then reads it, instead of writing a stale pending document over it.
+// SQLite's single connection already serializes these transactions.
 func (s *Service) mutateTx(ctx context.Context, id string, fn func(*sql.Tx, *Request) error) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -1536,7 +1572,7 @@ func (s *Service) mutateTx(ctx context.Context, id string, fn func(*sql.Tx, *Req
 	}
 	defer func() { _ = tx.Rollback() }()
 	var doc string
-	if err := tx.QueryRowContext(ctx, `SELECT doc FROM inbox_requests WHERE id = ?`, id).Scan(&doc); err != nil {
+	if err := tx.QueryRowContext(ctx, `SELECT doc FROM inbox_requests WHERE id = ?`+s.db.Dialect.ForUpdate(), id).Scan(&doc); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return ErrNotFound
 		}

@@ -3,23 +3,17 @@ package identity
 import (
 	"context"
 	"errors"
-	"path/filepath"
+	"sort"
 	"strings"
 	"testing"
 	"time"
 
-	"github.com/tusharbhardwaj/toolyard/internal/store"
+	"github.com/tusharbhardwaj/toolyard/internal/store/storetest"
 )
 
 func newTestIdentity(t *testing.T) (*Service, string) {
 	t.Helper()
-	dir := t.TempDir()
-	db, err := store.Open(filepath.Join(dir, "t.db"))
-	if err != nil {
-		t.Fatalf("open db: %v", err)
-	}
-	t.Cleanup(func() { db.Close() })
-	s := New(db)
+	s := New(storetest.Open(t))
 	u, err := s.CreateUser(context.Background(), "admin", "pw-correct-horse")
 	if err != nil {
 		t.Fatalf("create user: %v", err)
@@ -310,8 +304,9 @@ func TestRotateClearsPendingEnrollment(t *testing.T) {
 	}
 }
 
-// Agents created in the same millisecond still list newest first.
-func TestListAgentsNewestFirstOnTies(t *testing.T) {
+// Agents created in the same millisecond list in a fixed order: id
+// descending (Postgres has no rowid, so insertion order is not kept).
+func TestListAgentsTiesBreakByID(t *testing.T) {
 	s, owner := newTestIdentity(t)
 	ctx := context.Background()
 	var ids []string
@@ -330,9 +325,13 @@ func TestListAgentsNewestFirstOnTies(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	sort.Sort(sort.Reverse(sort.StringSlice(ids)))
+	if len(got) != len(ids) {
+		t.Fatalf("ListAgents returned %d agents, want %d", len(got), len(ids))
+	}
 	for i, a := range got {
-		if want := ids[len(ids)-1-i]; a.ID != want {
-			t.Fatalf("ListAgents[%d] = %s, want %s (newest first)", i, a.ID, want)
+		if a.ID != ids[i] {
+			t.Fatalf("ListAgents[%d] = %s, want %s (id descending on a created_at tie)", i, a.ID, ids[i])
 		}
 	}
 }

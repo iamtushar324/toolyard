@@ -144,7 +144,7 @@ func (s *Service) ConnectLocal(ctx context.Context, bootstrap string, b LocalBin
 
 func (s *Service) localValid(ctx context.Context, agent string, allowExpired bool) error {
 	var n int
-	err := s.db.QueryRowContext(ctx, `SELECT count(*) FROM local_connections c JOIN agents p ON p.id=c.parent_agent_id JOIN agents a ON a.id=c.agent_id JOIN users u ON u.id=c.user_id WHERE c.agent_id=? AND c.status='active' AND (c.expires_at>? OR ?=1) AND p.disabled=0 AND p.owner_user=c.user_id AND p.token_hash=c.parent_token_hash AND a.disabled=0 AND a.owner_user=c.user_id AND a.token_hash=c.credential_hash AND u.status='active'`, agent, s.now().UnixMilli(), allowExpired).Scan(&n)
+	err := s.db.QueryRowContext(ctx, `SELECT count(*) FROM local_connections c JOIN agents p ON p.id=c.parent_agent_id JOIN agents a ON a.id=c.agent_id JOIN users u ON u.id=c.user_id WHERE c.agent_id=? AND c.status='active' AND (c.expires_at>? OR ?=1) AND p.disabled=0 AND p.owner_user=c.user_id AND p.token_hash=c.parent_token_hash AND a.disabled=0 AND a.owner_user=c.user_id AND a.token_hash=c.credential_hash AND u.status='active'`, agent, s.now().UnixMilli(), boolInt(allowExpired)).Scan(&n)
 	if err != nil {
 		return err
 	}

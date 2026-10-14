@@ -4,13 +4,13 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/tusharbhardwaj/toolyard/internal/audit"
 	"github.com/tusharbhardwaj/toolyard/internal/mempalace"
 	"github.com/tusharbhardwaj/toolyard/internal/store"
+	"github.com/tusharbhardwaj/toolyard/internal/store/storetest"
 )
 
 // fakeIngester records every IngestTagged call so tests can assert the wing
@@ -39,12 +39,7 @@ func (f *fakeIngester) IngestTagged(_ context.Context, entry, topic, wing, agent
 
 func tempDB(t *testing.T) *store.DB {
 	t.Helper()
-	db, err := store.Open(filepath.Join(t.TempDir(), "mw.db"))
-	if err != nil {
-		t.Fatalf("open db: %v", err)
-	}
-	t.Cleanup(func() { _ = db.Close() })
-	return db
+	return storetest.Open(t)
 }
 
 func newService(t *testing.T, ing *fakeIngester) *Service {

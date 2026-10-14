@@ -4,12 +4,11 @@ import (
 	"context"
 	"encoding/base64"
 	"errors"
-	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/tusharbhardwaj/toolyard/internal/actor"
-	"github.com/tusharbhardwaj/toolyard/internal/store"
+	"github.com/tusharbhardwaj/toolyard/internal/store/storetest"
 )
 
 var testRaiser = actor.Raiser{
@@ -37,12 +36,7 @@ func holdRaised(t *testing.T, bus *Bus, tool string, r actor.Raiser) *Request {
 }
 
 func TestApprovalRaisedBy_PersistsThroughRestart(t *testing.T) {
-	dir := t.TempDir()
-	db, err := store.Open(filepath.Join(dir, "test.db"))
-	if err != nil {
-		t.Fatalf("open db: %v", err)
-	}
-	t.Cleanup(func() { db.Close() })
+	db := storetest.Open(t)
 	ctx := context.Background()
 
 	bus1, err := New(ctx, db)

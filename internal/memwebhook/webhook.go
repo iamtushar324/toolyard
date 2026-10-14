@@ -157,7 +157,7 @@ func (s *Service) Create(ctx context.Context, in CreateInput) (*Webhook, string,
 		 VALUES(?,?,?,?,?,?,?,1,0,0,?,?)`,
 		id, name, wing, nullStr(strings.TrimSpace(in.Source)), tokenHash, specJSON, nullStr(strings.TrimSpace(in.Notes)), now, now)
 	if err != nil {
-		if strings.Contains(strings.ToLower(err.Error()), "unique") {
+		if store.IsUniqueViolation(err) {
 			return nil, "", ErrExists
 		}
 		return nil, "", err

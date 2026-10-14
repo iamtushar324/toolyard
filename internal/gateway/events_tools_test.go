@@ -2,7 +2,6 @@ package gateway
 
 import (
 	"context"
-	"path/filepath"
 	"testing"
 
 	"github.com/tusharbhardwaj/toolyard/internal/approval"
@@ -11,7 +10,7 @@ import (
 	"github.com/tusharbhardwaj/toolyard/internal/memory"
 	"github.com/tusharbhardwaj/toolyard/internal/policy"
 	"github.com/tusharbhardwaj/toolyard/internal/realtime"
-	"github.com/tusharbhardwaj/toolyard/internal/store"
+	"github.com/tusharbhardwaj/toolyard/internal/store/storetest"
 )
 
 // stubEventsProvider records calls for argument-plumbing assertions.
@@ -51,10 +50,7 @@ func (s *stubEventsProvider) Ingest(ctx context.Context, src *events.Source, in 
 
 func newTestGateway(t *testing.T) *Gateway {
 	t.Helper()
-	db, err := store.Open(filepath.Join(t.TempDir(), "g.db"))
-	if err != nil {
-		t.Fatalf("store.Open: %v", err)
-	}
+	db := storetest.Open(t)
 	t.Cleanup(func() { _ = db.Close() })
 	bus, err := approval.New(context.Background(), db)
 	if err != nil {

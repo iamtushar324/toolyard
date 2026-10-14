@@ -5,7 +5,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"path/filepath"
 	"sort"
 	"strings"
 	"sync"
@@ -22,7 +21,7 @@ import (
 	"github.com/tusharbhardwaj/toolyard/internal/metrics"
 	"github.com/tusharbhardwaj/toolyard/internal/policy"
 	"github.com/tusharbhardwaj/toolyard/internal/realtime"
-	"github.com/tusharbhardwaj/toolyard/internal/store"
+	"github.com/tusharbhardwaj/toolyard/internal/store/storetest"
 )
 
 // fakeResolver is a map-based access.Resolver. Unknown callers are Denied,
@@ -120,10 +119,7 @@ const (
 // read (auto-allowed), run is a write (needs approval).
 func newAccessFixture(t *testing.T, vis VisibilityProvider) *accessFixture {
 	t.Helper()
-	db, err := store.Open(filepath.Join(t.TempDir(), "g.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	db := storetest.Open(t)
 	t.Cleanup(func() { _ = db.Close() })
 	bus, err := approval.New(context.Background(), db)
 	if err != nil {

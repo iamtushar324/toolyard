@@ -19,7 +19,7 @@ func TestMigration0032PreservesExistingInboxPermission(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	body, err := migrations.ReadFile("migrations/0032_inbox_batch_execution.sql")
+	body, err := migrations.ReadFile("migrations/sqlite/0032_inbox_batch_execution.sql")
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -355,6 +355,11 @@ func (s *Server) oauthDevicePoll(w http.ResponseWriter, r *http.Request, name st
 // oauthCallback is the GET endpoint the IdP redirects the user's
 // browser back to in Mode A. We exchange code for tokens, render a tiny
 // "you can close this tab" page, and SSE-publish the success event.
+//
+// The pending flow is claimed (deleted and read in one statement) before
+// anything else, so a callback delivered twice exchanges its code once:
+// the second finds no flow. Every refusal below therefore burns the flow
+// too, which is safe: the redirect consumed the code it carried.
 func (s *Server) oauthCallback(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		writeError(w, http.StatusMethodNotAllowed, "GET only")
@@ -373,13 +378,13 @@ func (s *Server) oauthCallback(w http.ResponseWriter, r *http.Request) {
 		oauthHTMLError(w, fmt.Sprintf("Authorization server returned %s: %s", idpErr, desc))
 		return
 	}
-	p, err := s.oauth.LoadPending(r.Context(), state)
-	if err != nil {
-		oauthHTMLError(w, "This authorization request expired or was already used. Please try again from the dashboard.")
+	p, err := s.oauth.ClaimPending(r.Context(), state, oauth.ModeCallback)
+	if errors.Is(err, oauth.ErrFlowMismatch) {
+		oauthHTMLError(w, "Wrong mode for this state. Use 'paste' instead.")
 		return
 	}
-	if p.Mode != oauth.ModeCallback {
-		oauthHTMLError(w, "Wrong mode for this state. Use 'paste' instead.")
+	if err != nil {
+		oauthHTMLError(w, "This authorization request expired or was already used. Please try again from the dashboard.")
 		return
 	}
 	if p.PerUser {
@@ -407,7 +412,6 @@ func (s *Server) oauthCallback(w http.ResponseWriter, r *http.Request) {
 	}
 	rec, err := s.oauth.ExchangeCodeChecked(r.Context(), p.UpstreamName, code, p.CodeVerifier, accept)
 	if errors.Is(err, oauth.ErrAccountMismatch) {
-		_ = s.oauth.DeletePending(r.Context(), state)
 		s.connectSharedMismatchPage(w, r, s.flowUser(r, p), p.UpstreamName, prevLabel)
 		return
 	}
@@ -415,7 +419,6 @@ func (s *Server) oauthCallback(w http.ResponseWriter, r *http.Request) {
 		oauthHTMLError(w, "Token exchange failed: "+err.Error())
 		return
 	}
-	_ = s.oauth.DeletePending(r.Context(), state)
 	goroutines.Go(reconnectAfterAuthName, func() { s.upstreams.ReconnectAfterAuth(context.Background(), p.UpstreamName) })
 	_ = s.audit.Write(r.Context(), audit.Event{
 		EventType:     "oauth.success",
@@ -440,12 +443,12 @@ func (s *Server) oauthCallback(w http.ResponseWriter, r *http.Request) {
 // admin must still be an active admin. An unbound flow (started with an
 // operator token, no browser to bind) passes as before. A member's
 // session, or a bound flow without its cookie, is refused and the flow
-// burnt: the code it carried was consumed by the redirect anyway, so
-// nothing legitimate is lost and nothing can be replayed.
+// burnt (oauthCallback claimed it): the code it carried was consumed by
+// the redirect anyway, so nothing legitimate is lost and nothing can be
+// replayed.
 func (s *Server) sharedFlowBrowserOK(w http.ResponseWriter, r *http.Request, p *oauth.PendingRecord) bool {
 	if u, ok := s.sessionUser(r); ok {
 		if u.Role != identity.RoleAdmin {
-			_ = s.oauth.DeletePending(r.Context(), p.State)
 			oauthHTMLError(w, "This authorization was started by an admin for the server's shared account; only an admin can finish it.")
 			return false
 		}
@@ -459,7 +462,6 @@ func (s *Server) sharedFlowBrowserOK(w http.ResponseWriter, r *http.Request, p *
 			return true
 		}
 	}
-	_ = s.oauth.DeletePending(r.Context(), p.State)
 	oauthHTMLError(w, "This authorization did not come back to the browser that started it (or its cookie is missing). Nothing was stored. Start it again from the dashboard.")
 	return false
 }
@@ -470,7 +472,8 @@ func (s *Server) sharedFlowBrowserOK(w http.ResponseWriter, r *http.Request, p *
 // SameSite=Strict and absent on this cross-site return, so the proof is
 // the flow cookie set at begin; a session for the same user (dev, Lax)
 // passes too. The token lands on that person's own row; the server's tool
-// list is loaded if this was its first sign-in.
+// list is loaded if this was its first sign-in. oauthCallback has already
+// claimed the pending row, so every refusal here burns the flow.
 func (s *Server) oauthUserCallback(w http.ResponseWriter, r *http.Request, p *oauth.PendingRecord, code string) {
 	s.clearOAuthFlowCookie(w, r, p.State)
 	u, ok := s.sessionUser(r)
@@ -480,18 +483,17 @@ func (s *Server) oauthUserCallback(w http.ResponseWriter, r *http.Request, p *oa
 	case !ok && s.oauthFlowCookieValid(r, p.State, p.UserID):
 		owner, err := s.identity.GetUserByID(r.Context(), p.UserID)
 		if err != nil || owner.Status != identity.StatusActive {
-			_ = s.oauth.DeletePending(r.Context(), p.State)
 			s.userFlowError(w, p.ViaTicket, "Your toolyard account is not active. Nothing was stored.",
 				"Your toolyard account is not active, so nothing was stored. Ask a toolyard admin.")
 			return
 		}
 		u = owner
 	default:
-		// Another user's session, or no proof at all: burn the flow. The
-		// authorization code was consumed by the redirect that brought
-		// us here, so the real person cannot finish it either way and
-		// must start over; deleting closes any replay window.
-		_ = s.oauth.DeletePending(r.Context(), p.State)
+		// Another user's session, or no proof at all: the flow is burnt
+		// (claimed above). The authorization code was consumed by the
+		// redirect that brought us here, so the real person cannot finish
+		// it either way and must start over; the claim closes any replay
+		// window.
 		_ = s.audit.Write(r.Context(), audit.Event{
 			EventType: "oauth.user_mismatch", UpstreamName: p.UpstreamName,
 			ResultSummary: "sign-in for " + p.UpstreamName + " came back in a browser that is not the person's; no token stored",
@@ -533,7 +535,6 @@ func (s *Server) oauthUserCallback(w http.ResponseWriter, r *http.Request, p *oa
 	}
 	rec, err := s.oauth.ExchangeCodeForUserChecked(r.Context(), p.UpstreamName, u.ID, code, p.CodeVerifier, accept)
 	if errors.Is(err, oauth.ErrAccountMismatch) {
-		_ = s.oauth.DeletePending(r.Context(), p.State)
 		if outcome == accountMismatch {
 			s.connectAccountMismatchPage(w, r, u, p.UpstreamName)
 		} else {
@@ -546,7 +547,6 @@ func (s *Server) oauthUserCallback(w http.ResponseWriter, r *http.Request, p *oa
 			"The provider did not complete the sign-in ("+err.Error()+"). Nothing was stored. Ask your agent for a new link.")
 		return
 	}
-	_ = s.oauth.DeletePending(r.Context(), p.State)
 	goroutines.Go(reconnectAfterAuthName, func() { s.upstreams.ReconnectAfterUserAuth(context.Background(), p.UpstreamName, u.ID) })
 	_ = s.audit.Write(r.Context(), audit.Event{
 		EventType: "oauth.user_success", AgentID: "user:" + u.ID, UpstreamName: p.UpstreamName,

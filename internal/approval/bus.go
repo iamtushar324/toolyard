@@ -408,7 +408,7 @@ func (b *Bus) create(ctx context.Context, in NewRequest) (*Request, error) {
 		if err == nil {
 			return req, nil
 		}
-		if !isUniqueViolation(err) {
+		if !store.IsUniqueViolation(err) {
 			return nil, err
 		}
 		lastErr = err
@@ -562,30 +562,6 @@ func (b *Bus) findPendingByFingerprint(ctx context.Context, fp string) (*Request
 		return nil, err
 	}
 	return req, nil
-}
-
-func isUniqueViolation(err error) bool {
-	if err == nil {
-		return false
-	}
-	msg := err.Error()
-	// mattn/go-sqlite3 returns "UNIQUE constraint failed" in the message.
-	return contains(msg, "UNIQUE constraint failed") || contains(msg, "constraint failed: UNIQUE")
-}
-
-func contains(s, needle string) bool {
-	return len(needle) > 0 && len(s) >= len(needle) && stringIndex(s, needle) >= 0
-}
-
-// stringIndex avoids importing strings into this file just for one call.
-func stringIndex(s, needle string) int {
-	n := len(needle)
-	for i := 0; i+n <= len(s); i++ {
-		if s[i:i+n] == needle {
-			return i
-		}
-	}
-	return -1
 }
 
 // DecideAs is the decision entrypoint: it records who decided and how

@@ -44,6 +44,8 @@ func (e *LegacySkipError) add(id string, err error) {
 // the skipped IDs come back in a *LegacySkipError. Database errors still
 // abort the whole sync.
 func (s *Service) SyncLegacy(ctx context.Context) error {
+	s.legacySyncMu.Lock()
+	defer s.legacySyncMu.Unlock()
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
@@ -51,6 +53,19 @@ func (s *Service) SyncLegacy(ctx context.Context) error {
 	defer tx.Rollback()
 	if _, err = tx.ExecContext(ctx, legacyOwnerSnapshotSQL); err != nil {
 		return err
+	}
+	if s.db.Dialect.IsPostgres() {
+		// Lock every Inbox copy of a legacy approval BEFORE approval_requests
+		// is read. Decide (mutateTx) locks the Inbox row and updates
+		// approval_requests in one transaction, so with these locks held the
+		// reads below see both of its writes or neither, and the upsert never
+		// writes a stale pending copy over a committed decision. Only
+		// inbox_requests rows are locked (never approval_requests, which
+		// mutateTx updates while it holds the Inbox row), in id order.
+		// SQLite's single connection already serializes this.
+		if _, err = tx.ExecContext(ctx, `SELECT id FROM inbox_requests WHERE id IN (SELECT id FROM approval_requests) ORDER BY id FOR UPDATE OF inbox_requests`); err != nil {
+			return err
+		}
 	}
 	rows, err := tx.QueryContext(ctx, `SELECT id,COALESCE(agent_id,''),upstream_name,tool_name,arguments,reason,status,COALESCE(decided_by,''),COALESCE(decided_at,0),created_at,expires_at,COALESCE(result_executed_at,0),COALESCE(result_is_error,0),COALESCE(result_error,''),COALESCE(decided_via,''),COALESCE(decider_email,''),COALESCE(decider_name,''),COALESCE(decider_ref,'') FROM approval_requests`)
 	if err != nil {
@@ -128,7 +143,7 @@ func (s *Service) SyncLegacy(ctx context.Context) error {
 			r.LegacyExecutionState = state
 		}
 		var existing string
-		e := tx.QueryRowContext(ctx, `SELECT doc FROM inbox_requests WHERE id=?`, r.ID).Scan(&existing)
+		e := tx.QueryRowContext(ctx, `SELECT doc FROM inbox_requests WHERE id=?`+s.db.Dialect.ForUpdate(), r.ID).Scan(&existing)
 		if e == nil {
 			var prev Request
 			if e = json.Unmarshal([]byte(existing), &prev); e != nil {
@@ -211,13 +226,16 @@ func (s *Service) RunLegacySync(ctx context.Context, every time.Duration) {
 // Every write to approval_requests adds a row, moves a row between
 // statuses, or stamps decided_at or result_executed_at with the current
 // time; a claim is added, changes state, or gets finished_at.
+//
+// The counts use SUM(CASE ... THEN 1 ELSE 0 END): Postgres has no SUM over
+// a boolean comparison. SQLite gets the same integers as before.
 const legacySignatureSQL = `SELECT
- (SELECT COUNT(*)||':'||COALESCE(SUM(status='pending'),0)||':'||COALESCE(SUM(status='allowed'),0)||':'||
-   COALESCE(SUM(status='denied'),0)||':'||COALESCE(SUM(status='expired'),0)||':'||COALESCE(SUM(status='cancelled'),0)||':'||
+ (SELECT COUNT(*)||':'||COALESCE(SUM(CASE WHEN status='pending' THEN 1 ELSE 0 END),0)||':'||COALESCE(SUM(CASE WHEN status='allowed' THEN 1 ELSE 0 END),0)||':'||
+   COALESCE(SUM(CASE WHEN status='denied' THEN 1 ELSE 0 END),0)||':'||COALESCE(SUM(CASE WHEN status='expired' THEN 1 ELSE 0 END),0)||':'||COALESCE(SUM(CASE WHEN status='cancelled' THEN 1 ELSE 0 END),0)||':'||
    COALESCE(MAX(created_at),0)||':'||COALESCE(MAX(decided_at),0)||':'||COALESCE(MAX(result_executed_at),0)
   FROM approval_requests)
  ||'|'||
- (SELECT COUNT(*)||':'||COALESCE(SUM(state='running'),0)||':'||COALESCE(SUM(state='outcome_unknown'),0)||':'||
+ (SELECT COUNT(*)||':'||COALESCE(SUM(CASE WHEN state='running' THEN 1 ELSE 0 END),0)||':'||COALESCE(SUM(CASE WHEN state='outcome_unknown' THEN 1 ELSE 0 END),0)||':'||
    COALESCE(MAX(claimed_at),0)||':'||COALESCE(MAX(finished_at),0)
   FROM legacy_execution_claims)`
 
@@ -365,6 +383,8 @@ func (s *Service) DecideLegacy(ctx context.Context, id, action string, d actor.D
 
 // Original owners remain authoritative after removal of the original agent.
 // Missing ownership evidence is recorded once as NULL and is never guessed.
+// ON CONFLICT DO NOTHING keeps a concurrent snapshot of the same request
+// (which NOT EXISTS cannot see) from failing on the primary key.
 const legacyOwnerSnapshotSQL = `INSERT INTO legacy_inbox_owners(request_id,agent_id,owner_user_id,agent_name)
 SELECT r.id,COALESCE(r.agent_id,''),
  CASE WHEN COALESCE(r.agent_id,'')=''
@@ -376,7 +396,8 @@ SELECT r.id,COALESCE(r.agent_id,''),
             WHERE approval_id=r.id AND owner_user_id IS NOT NULL AND owner_user_id<>'')
  END,a.name
 FROM approval_requests r LEFT JOIN agents a ON a.id=r.agent_id
-WHERE NOT EXISTS (SELECT 1 FROM legacy_inbox_owners o WHERE o.request_id=r.id)`
+WHERE NOT EXISTS (SELECT 1 FROM legacy_inbox_owners o WHERE o.request_id=r.id)
+ON CONFLICT DO NOTHING`
 
 // LegacyAgentNames restores access to imported history without restoring the
 // deleted agent, its credential, or any permission to execute a new call.

@@ -109,7 +109,7 @@ func TestDecisionNoteLimitAllActions(t *testing.T) {
 			}
 			if tc.action != "snooze" {
 				var eventNote string
-				if err := e.svc.db.QueryRow(`SELECT json_extract(doc,'$.owner_note') FROM batch_test_events WHERE request_id=?`, r.ID).Scan(&eventNote); err != nil || eventNote != d.Note {
+				if err := e.svc.db.QueryRow(`SELECT `+e.svc.db.Dialect.JSONText("doc", "owner_note")+` FROM batch_test_events WHERE request_id=?`, r.ID).Scan(&eventNote); err != nil || eventNote != d.Note {
 					t.Fatalf("callback lost the accepted note: %v", err)
 				}
 			}

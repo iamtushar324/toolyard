@@ -46,6 +46,8 @@ func (s *Server) serversPatch(w http.ResponseWriter, r *http.Request, name strin
 			writeError(w, http.StatusForbidden, "reserved built-in upstream cannot be edited")
 		case errors.Is(err, upstreams.ErrInvalid):
 			writeError(w, http.StatusBadRequest, err.Error())
+		case errors.Is(err, upstreams.ErrConflict):
+			writeError(w, http.StatusConflict, err.Error())
 		case srv != nil:
 			// Saved, but the reconnect failed: hand back the row with its
 			// recorded error, as POST /v1/servers does.

@@ -3,21 +3,18 @@ package policy
 import (
 	"context"
 	"errors"
-	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
 
 	"github.com/tusharbhardwaj/toolyard/internal/store"
+	"github.com/tusharbhardwaj/toolyard/internal/store/storetest"
 )
 
 // openRulesDB opens a migrated test database.
 func openRulesDB(t *testing.T) *store.DB {
 	t.Helper()
-	db, err := store.Open(filepath.Join(t.TempDir(), "policy.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	db := storetest.Open(t)
 	t.Cleanup(func() { _ = db.Close() })
 	return db
 }

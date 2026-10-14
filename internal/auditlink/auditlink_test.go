@@ -2,14 +2,13 @@ package auditlink
 
 import (
 	"context"
-	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/tusharbhardwaj/toolyard/internal/actor"
 	"github.com/tusharbhardwaj/toolyard/internal/approval"
 	"github.com/tusharbhardwaj/toolyard/internal/audit"
-	"github.com/tusharbhardwaj/toolyard/internal/store"
+	"github.com/tusharbhardwaj/toolyard/internal/store/storetest"
 )
 
 var raiser = actor.Raiser{
@@ -25,10 +24,7 @@ type fixture struct {
 
 func newFixture(t *testing.T) *fixture {
 	t.Helper()
-	db, err := store.Open(filepath.Join(t.TempDir(), "t.db"))
-	if err != nil {
-		t.Fatalf("open db: %v", err)
-	}
+	db := storetest.Open(t)
 	t.Cleanup(func() { db.Close() })
 	bus, err := approval.New(context.Background(), db)
 	if err != nil {

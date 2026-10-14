@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
-	"path/filepath"
 	"strings"
 	"testing"
 
@@ -18,7 +17,7 @@ import (
 	"github.com/tusharbhardwaj/toolyard/internal/realtime"
 	"github.com/tusharbhardwaj/toolyard/internal/sealbox"
 	"github.com/tusharbhardwaj/toolyard/internal/secrets"
-	"github.com/tusharbhardwaj/toolyard/internal/store"
+	"github.com/tusharbhardwaj/toolyard/internal/store/storetest"
 	"github.com/tusharbhardwaj/toolyard/internal/upstreams"
 )
 
@@ -28,10 +27,7 @@ import (
 func newSecretsAPITestServer(t *testing.T) (*http.ServeMux, *http.Cookie) {
 	t.Helper()
 	dir := t.TempDir()
-	db, err := store.Open(filepath.Join(dir, "api-secrets.db"))
-	if err != nil {
-		t.Fatalf("open db: %v", err)
-	}
+	db := storetest.Open(t)
 	t.Cleanup(func() { _ = db.Close() })
 
 	id := identity.New(db)

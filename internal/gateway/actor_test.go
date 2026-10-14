@@ -3,7 +3,6 @@ package gateway
 import (
 	"context"
 	"encoding/json"
-	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -19,7 +18,7 @@ import (
 	"github.com/tusharbhardwaj/toolyard/internal/metrics"
 	"github.com/tusharbhardwaj/toolyard/internal/policy"
 	"github.com/tusharbhardwaj/toolyard/internal/realtime"
-	"github.com/tusharbhardwaj/toolyard/internal/store"
+	"github.com/tusharbhardwaj/toolyard/internal/store/storetest"
 )
 
 // actorFixture is a gateway with no access resolver (so anonymous callers
@@ -40,10 +39,7 @@ type actorFixture struct {
 
 func newActorFixture(t *testing.T) *actorFixture {
 	t.Helper()
-	db, err := store.Open(filepath.Join(t.TempDir(), "g.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	db := storetest.Open(t)
 	t.Cleanup(func() { _ = db.Close() })
 	bus, err := approval.New(context.Background(), db)
 	if err != nil {

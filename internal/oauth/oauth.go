@@ -679,16 +679,15 @@ func joinAuthorizeURL(endpoint string, q url.Values) (string, error) {
 	return u.String(), nil
 }
 
-// LoadPending fetches a pending row by state. Returns ErrPendingNotFound
-// if missing or expired.
-func (s *Service) LoadPending(ctx context.Context, state string) (*PendingRecord, error) {
-	row := s.db.QueryRowContext(ctx, `
-        SELECT state, upstream_name, user_id, mode, COALESCE(code_verifier,''),
+// pendingColumns is the column list scanPending reads, in order.
+const pendingColumns = `state, upstream_name, user_id, mode, COALESCE(code_verifier,''),
                COALESCE(device_code,''), COALESCE(user_code,''),
                COALESCE(interval_s,0), COALESCE(verification_uri,''),
-               expires_at, created_at, per_user, browser_bound, via_ticket, opener_verified
-        FROM oauth_pending WHERE state = ?
-    `, state)
+               expires_at, created_at, per_user, browser_bound, via_ticket, opener_verified`
+
+// scanPending reads one pendingColumns row. A missing row is
+// ErrPendingNotFound.
+func scanPending(row rowScanner) (*PendingRecord, error) {
 	var p PendingRecord
 	var exp, created int64
 	var perUser, bound, ticket, opener int
@@ -705,13 +704,63 @@ func (s *Service) LoadPending(ctx context.Context, state string) (*PendingRecord
 	p.BrowserBound = bound == 1
 	p.ViaTicket = ticket == 1
 	p.OpenerVerified = opener == 1
+	return &p, nil
+}
+
+// LoadPending fetches a pending row by state. Returns ErrPendingNotFound
+// if missing or expired.
+func (s *Service) LoadPending(ctx context.Context, state string) (*PendingRecord, error) {
+	p, err := scanPending(s.db.QueryRowContext(ctx,
+		`SELECT `+pendingColumns+` FROM oauth_pending WHERE state = ?`, state))
+	if err != nil {
+		return nil, err
+	}
 	if time.Now().After(p.ExpiresAt) {
 		// Expired — clean up and report as not found so the API layer
 		// returns a uniform 400 either way.
 		_, _ = s.db.ExecContext(ctx, `DELETE FROM oauth_pending WHERE state = ?`, state)
 		return nil, ErrPendingNotFound
 	}
-	return &p, nil
+	return p, nil
+}
+
+// ClaimPending takes the pending row for state, when its mode is mode, in
+// one statement that deletes and returns it: of two requests carrying the
+// same state (a double callback) exactly one gets the row and exchanges
+// the code; the other gets ErrPendingNotFound. A row of another mode is
+// left in place and reported as ErrFlowMismatch. An expired row is
+// consumed and reported as ErrPendingNotFound, as LoadPending does.
+func (s *Service) ClaimPending(ctx context.Context, state, mode string) (*PendingRecord, error) {
+	p, err := scanPending(s.db.QueryRowContext(ctx,
+		`DELETE FROM oauth_pending WHERE state = ? AND mode = ? RETURNING `+pendingColumns, state, mode))
+	if errors.Is(err, ErrPendingNotFound) {
+		if other, lerr := s.LoadPending(ctx, state); lerr == nil && other.Mode != mode {
+			return nil, ErrFlowMismatch
+		}
+		return nil, ErrPendingNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	if time.Now().After(p.ExpiresAt) {
+		return nil, ErrPendingNotFound
+	}
+	return p, nil
+}
+
+// claimPendingRow deletes the pending row for state and reports whether
+// this call removed it: the one caller allowed to act on the flow's
+// result when several finish it at once.
+func (s *Service) claimPendingRow(ctx context.Context, state string) (bool, error) {
+	res, err := s.db.ExecContext(ctx, `DELETE FROM oauth_pending WHERE state = ?`, state)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
+	return n == 1, nil
 }
 
 // DeletePending removes a pending row. Called on success and on hard error.
@@ -1214,12 +1263,21 @@ func (s *Service) PollDevice(ctx context.Context, state string) (*TokenRecord, e
 		}
 		return nil, err
 	}
+	// The row must outlive the authorization_pending polls, so it is
+	// claimed only now: of two polls that both got a token, only the one
+	// that removes the row stores it.
+	claimed, err := s.claimPendingRow(ctx, state)
+	if err != nil {
+		return nil, err
+	}
+	if !claimed {
+		return nil, ErrPendingNotFound
+	}
 	rec := tokenRecordFromResponse(p.UpstreamName, tr)
 	if err := s.PutToken(ctx, rec); err != nil {
 		return nil, err
 	}
 	s.setBearer(p.UpstreamName, rec.AccessToken)
-	_ = s.DeletePending(ctx, state)
 	if s.bus != nil {
 		s.bus.Publish("mcp_oauth_done", map[string]any{"upstream": p.UpstreamName})
 	}

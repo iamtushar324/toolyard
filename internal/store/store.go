@@ -1,4 +1,6 @@
-// Package store wraps the SQLite database used by toolyard.
+// Package store wraps the database used by toolyard: SQLite by default
+// (Open), or Postgres (OpenPostgres). Both run the same SQL with ?
+// placeholders: on Postgres the driver rewrites them (Rebind).
 package store
 
 import (
@@ -10,19 +12,25 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
-	"sort"
-	"strings"
 	"time"
 
 	_ "github.com/mattn/go-sqlite3"
 )
 
-//go:embed migrations/*.sql
+// migrations holds migrations/sqlite/*.sql (every SQLite migration) and
+// migrations/postgres/*.sql (the Postgres baseline, then the Postgres twin
+// of every later SQLite migration, under the same file name).
+//
+//go:embed migrations/sqlite/*.sql migrations/postgres/*.sql
 var migrations embed.FS
 
+// DB is an open toolyard database.
 type DB struct {
 	*sql.DB
+	// Path is the SQLite file path; "" on Postgres.
 	Path string
+	// Dialect is the engine: SQLite or Postgres.
+	Dialect Dialect
 }
 
 // Open opens the SQLite database at path (creating it if missing) and applies
@@ -41,7 +49,7 @@ func Open(path string) (*DB, error) {
 	if err := sdb.Ping(); err != nil {
 		return nil, err
 	}
-	db := &DB{DB: sdb, Path: abs}
+	db := &DB{DB: sdb, Path: abs, Dialect: SQLite}
 	if err := db.migrate(); err != nil {
 		_ = sdb.Close()
 		return nil, fmt.Errorf("migrate: %w", err)
@@ -105,17 +113,20 @@ func (db *DB) Close() error {
 	return db.CloseContext(ctx)
 }
 
-// CloseContext checkpoints the WAL (best-effort) and closes the underlying
-// database, and returns by the time ctx ends even when a connection is
-// still busy. The TRUNCATE checkpoint folds the -wal sidecar back into the
-// main file so a file-copy backup of the .db is complete on its own. A
-// checkpoint failure is non-fatal: we still close so callers don't leak the
-// handle. With MaxOpenConns(1), a checkpoint without a context would wait
-// forever for a connection held by a stuck query.
+// CloseContext checkpoints the WAL on SQLite (best-effort) and closes the
+// underlying database, and returns by the time ctx ends even when a
+// connection is still busy. The TRUNCATE checkpoint folds the -wal sidecar
+// back into the main file so a file-copy backup of the .db is complete on
+// its own. A checkpoint failure is non-fatal: we still close so callers
+// don't leak the handle. With MaxOpenConns(1), a checkpoint without a
+// context would wait forever for a connection held by a stuck query.
+// Postgres has no checkpoint to run here.
 func (db *DB) CloseContext(ctx context.Context) error {
-	if _, err := db.ExecContext(ctx, `PRAGMA wal_checkpoint(TRUNCATE)`); err != nil {
-		// Best-effort; the WAL is replayed on next open regardless.
-		_ = err
+	if !db.Dialect.IsPostgres() {
+		if _, err := db.ExecContext(ctx, `PRAGMA wal_checkpoint(TRUNCATE)`); err != nil {
+			// Best-effort; the WAL is replayed on next open regardless.
+			_ = err
+		}
 	}
 	done := make(chan error, 1)
 	go func() { done <- db.DB.Close() }()
@@ -127,6 +138,9 @@ func (db *DB) CloseContext(ctx context.Context) error {
 	}
 }
 
+// migrate applies the SQLite migrations (migrations/sqlite) that
+// schema_migrations does not record yet, in file-name order, each in its own
+// transaction.
 func (db *DB) migrate() error {
 	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS schema_migrations (
         name TEXT PRIMARY KEY,
@@ -134,18 +148,10 @@ func (db *DB) migrate() error {
     )`); err != nil {
 		return err
 	}
-	entries, err := migrations.ReadDir("migrations")
+	names, err := migrationNames("migrations/sqlite")
 	if err != nil {
 		return err
 	}
-	var names []string
-	for _, e := range entries {
-		if e.IsDir() || !strings.HasSuffix(e.Name(), ".sql") {
-			continue
-		}
-		names = append(names, e.Name())
-	}
-	sort.Strings(names)
 	for _, name := range names {
 		var seen string
 		err := db.QueryRow(`SELECT name FROM schema_migrations WHERE name = ?`, name).Scan(&seen)
@@ -155,7 +161,7 @@ func (db *DB) migrate() error {
 		if err != sql.ErrNoRows {
 			return err
 		}
-		body, err := migrations.ReadFile("migrations/" + name)
+		body, err := migrations.ReadFile("migrations/sqlite/" + name)
 		if err != nil {
 			return err
 		}
@@ -167,7 +173,7 @@ func (db *DB) migrate() error {
 			_ = tx.Rollback()
 			return fmt.Errorf("apply %s: %w", name, err)
 		}
-		if _, err := tx.Exec(`INSERT INTO schema_migrations(name, applied_at) VALUES(?, strftime('%s','now'))`, name); err != nil {
+		if _, err := tx.Exec(`INSERT INTO schema_migrations(name, applied_at) VALUES(?, ?)`, name, time.Now().Unix()); err != nil {
 			_ = tx.Rollback()
 			return err
 		}

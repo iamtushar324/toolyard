@@ -18,6 +18,7 @@ import (
 
 	"github.com/tusharbhardwaj/toolyard/docs"
 	"github.com/tusharbhardwaj/toolyard/internal/store"
+	"github.com/tusharbhardwaj/toolyard/internal/store/storetest"
 )
 
 type fakeCatalog map[string]string // tool -> access
@@ -50,11 +51,7 @@ type testEnv struct {
 
 func newEnv(t *testing.T) *testEnv {
 	t.Helper()
-	db, err := store.Open(filepath.Join(t.TempDir(), "inbox.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { db.Close() })
+	db := storetest.Open(t) // SQLite, or Postgres when TOOLYARD_TEST_DB=postgres
 	e := &testEnv{now: time.Date(2026, 9, 28, 18, 0, 0, 0, time.UTC)}
 	svc, err := New(context.Background(), Options{
 		DB:      db,
@@ -753,8 +750,7 @@ type fakeJudge struct{ rv *Review }
 func (f fakeJudge) Review(context.Context, *Request) (*Review, error) { return f.rv, nil }
 
 func TestJudgeFlagsAndSummaries(t *testing.T) {
-	db, _ := store.Open(filepath.Join(t.TempDir(), "j.db"))
-	t.Cleanup(func() { db.Close() })
+	db := storetest.Open(t)
 	svc, err := New(context.Background(), Options{DB: db, Catalog: testCatalog,
 		Judge: fakeJudge{&Review{Summary: "Two prod changes and a rollout.",
 			Tools: []ToolReview{{Explanation: "Adds a table."}, {Explanation: "Deploys."}, {Explanation: "Turns billing on.", Mismatch: "The message says the flag stays off."}}}},

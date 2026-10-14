@@ -3,7 +3,6 @@ package gateway
 import (
 	"context"
 	"encoding/json"
-	"path/filepath"
 	"reflect"
 	"strings"
 	"sync"
@@ -20,7 +19,7 @@ import (
 	"github.com/tusharbhardwaj/toolyard/internal/metrics"
 	"github.com/tusharbhardwaj/toolyard/internal/policy"
 	"github.com/tusharbhardwaj/toolyard/internal/realtime"
-	"github.com/tusharbhardwaj/toolyard/internal/store"
+	"github.com/tusharbhardwaj/toolyard/internal/store/storetest"
 )
 
 const outerReason = "outer reason the client sent, long enough for the gate"
@@ -437,10 +436,7 @@ func (r *recorder) argsOf(i int) map[string]any {
 // dispatch and argument fidelity; approval behaviour has its own tests.
 func newReplayGateway(t *testing.T, rec *recorder) *Gateway {
 	t.Helper()
-	db, err := store.Open(filepath.Join(t.TempDir(), "replay.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	db := storetest.Open(t)
 	t.Cleanup(func() { _ = db.Close() })
 	bus, err := approval.New(context.Background(), db)
 	if err != nil {
@@ -781,10 +777,7 @@ func TestCodeModeExplicitPolicyApplies(t *testing.T) {
 // timeout does not cut a script short; it still applies to each nested
 // call through that call's own dispatch.
 func TestCodeModeScriptOutlivesUpstreamCallTimeout(t *testing.T) {
-	db, err := store.Open(filepath.Join(t.TempDir(), "t.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	db := storetest.Open(t)
 	t.Cleanup(func() { _ = db.Close() })
 	bus, err := approval.New(context.Background(), db)
 	if err != nil {

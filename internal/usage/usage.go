@@ -39,7 +39,7 @@ func (s *Service) Increment(ctx context.Context, agentID, toolName string) error
 		`INSERT INTO tool_usage(agent_id, tool_name, count, last_used_at)
          VALUES(?,?,1,?)
          ON CONFLICT(agent_id, tool_name) DO UPDATE
-            SET count = count + 1, last_used_at = excluded.last_used_at`,
+            SET count = tool_usage.count + 1, last_used_at = excluded.last_used_at`,
 		agentID, toolName, now)
 	return err
 }

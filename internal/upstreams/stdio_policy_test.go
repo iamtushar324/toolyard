@@ -16,7 +16,7 @@ import (
 	"github.com/tusharbhardwaj/toolyard/internal/memory"
 	"github.com/tusharbhardwaj/toolyard/internal/policy"
 	"github.com/tusharbhardwaj/toolyard/internal/realtime"
-	"github.com/tusharbhardwaj/toolyard/internal/store"
+	"github.com/tusharbhardwaj/toolyard/internal/store/storetest"
 )
 
 // A stdio row saved before -no-stdio-upstreams was turned on must not be
@@ -25,11 +25,7 @@ import (
 func TestNoStdioUpstreamsBlocksSavedRows(t *testing.T) {
 	ctx := context.Background()
 	dir := t.TempDir()
-	db, err := store.Open(filepath.Join(dir, "up.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = db.Close() })
+	db := storetest.Open(t)
 	bus, _ := approval.New(ctx, db)
 	gw := gateway.New(gateway.Options{Policy: policy.New(db), Approval: bus, Audit: audit.New(db), Memory: memory.New(db), Hub: realtime.NewHub()})
 

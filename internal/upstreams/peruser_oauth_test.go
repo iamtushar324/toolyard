@@ -9,7 +9,6 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
-	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -27,7 +26,7 @@ import (
 	"github.com/tusharbhardwaj/toolyard/internal/oauth"
 	"github.com/tusharbhardwaj/toolyard/internal/policy"
 	"github.com/tusharbhardwaj/toolyard/internal/realtime"
-	"github.com/tusharbhardwaj/toolyard/internal/store"
+	"github.com/tusharbhardwaj/toolyard/internal/store/storetest"
 )
 
 // The whole per-user path with the real pieces: oauth.Service sealing each
@@ -138,11 +137,7 @@ func resultText(res *mcp.CallToolResult) string {
 
 func TestPerUserOAuthEndToEnd(t *testing.T) {
 	ctx := context.Background()
-	db, err := store.Open(filepath.Join(t.TempDir(), "pu.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = db.Close() })
+	db := storetest.Open(t)
 	ids := identity.New(db)
 	for _, q := range []string{
 		`INSERT INTO users(id, username, password_hash, created_at, updated_at) VALUES('u_ada','ada','x',1,1)`,

@@ -4,7 +4,6 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
-	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -24,6 +23,7 @@ import (
 	"github.com/tusharbhardwaj/toolyard/internal/policy"
 	"github.com/tusharbhardwaj/toolyard/internal/realtime"
 	"github.com/tusharbhardwaj/toolyard/internal/store"
+	"github.com/tusharbhardwaj/toolyard/internal/store/storetest"
 	"github.com/tusharbhardwaj/toolyard/internal/upstreams"
 )
 
@@ -118,10 +118,7 @@ type accessTestEnv struct {
 
 func newAccessTestServer(t *testing.T) *accessTestEnv {
 	t.Helper()
-	db, err := store.Open(filepath.Join(t.TempDir(), "access-api.db"))
-	if err != nil {
-		t.Fatalf("open db: %v", err)
-	}
+	db := storetest.Open(t)
 	t.Cleanup(func() { _ = db.Close() })
 	ctx := context.Background()
 

@@ -2,24 +2,20 @@ package approval
 
 import (
 	"context"
-	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
 
-	"github.com/tusharbhardwaj/toolyard/internal/store"
+	"github.com/tusharbhardwaj/toolyard/internal/store/storetest"
 )
 
-// newTestBus spins up a temporary sqlite-backed Bus. Auto-approval is left
-// nil so Hold()'d requests stay pending until explicitly decided.
+// newTestBus spins up a Bus on a fresh test database (SQLite, or Postgres
+// when TOOLYARD_TEST_DB=postgres). Auto-approval is left nil so Hold()'d
+// requests stay pending until explicitly decided.
 func newTestBus(t *testing.T) *Bus {
 	t.Helper()
-	dir := t.TempDir()
-	db, err := store.Open(filepath.Join(dir, "test.db"))
-	if err != nil {
-		t.Fatalf("open db: %v", err)
-	}
-	t.Cleanup(func() { db.Close() })
+	db := storetest.Open(t)
 	bus, err := New(context.Background(), db)
 	if err != nil {
 		t.Fatalf("new bus: %v", err)
@@ -81,7 +77,7 @@ func TestRunExecutorPanic_PersistsErrorResult(t *testing.T) {
 		return err == nil && cur.ResultExecutedAt > 0
 	})
 	cur, _ := bus.Get(ctx, req.ID)
-	if cur.ResultError == "" || !contains(cur.ResultError, "panic") {
+	if cur.ResultError == "" || !strings.Contains(cur.ResultError, "panic") {
 		t.Errorf("ResultError = %q, want it to mention the panic", cur.ResultError)
 	}
 }

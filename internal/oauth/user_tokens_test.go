@@ -8,13 +8,13 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
-	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/tusharbhardwaj/toolyard/internal/store"
+	"github.com/tusharbhardwaj/toolyard/internal/store/storetest"
 )
 
 // fakeIdP is a token endpoint: an authorization code becomes a token pair
@@ -198,11 +198,7 @@ type userFixture struct {
 // OAuth client points at the fake IdP.
 func newUserFixture(t *testing.T) *userFixture {
 	t.Helper()
-	db, err := store.Open(filepath.Join(t.TempDir(), "oauth.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = db.Close() })
+	db := storetest.Open(t)
 	for _, q := range []string{
 		`INSERT INTO users(id, username, password_hash, created_at, updated_at) VALUES('u_ada','ada','x',1,1)`,
 		`INSERT INTO users(id, username, password_hash, created_at, updated_at) VALUES('u_bob','bob','x',1,1)`,

@@ -112,3 +112,24 @@ func TestRuleMatch_CarriesCreator(t *testing.T) {
 		t.Fatalf("match = %+v, want created_by u_creator", m)
 	}
 }
+
+// TestRuleCreateOrUpdate_KeepsEnablerWhenUnset covers the upsert's fallback
+// to the existing row: an update that names no enabler keeps the stored
+// enabled_by. Postgres needs that reference qualified with the table name.
+func TestRuleCreateOrUpdate_KeepsEnablerWhenUnset(t *testing.T) {
+	s := newTestService(t)
+	ctx := context.Background()
+	r, err := s.CreateOrUpdate(ctx, Rule{Kind: "static", Fingerprint: "fp_keep", Enabled: true, CreatedBy: "u_first"})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	// A disabled update clears EnabledBy before the write, so the upsert
+	// sends NULL and must keep the stored value.
+	if _, err := s.CreateOrUpdate(ctx, Rule{ID: r.ID, Kind: "static", Fingerprint: "fp_keep", Enabled: false}); err != nil {
+		t.Fatalf("update: %v", err)
+	}
+	got := findRule(t, s, r.ID)
+	if got.Enabled || got.CreatedBy != "u_first" || got.EnabledBy != "u_first" {
+		t.Fatalf("after disabled update: %+v, want disabled with created_by=enabled_by=u_first", got)
+	}
+}

@@ -72,10 +72,28 @@ func (s *Service) Ack(ctx context.Context, agent, ref, event string) error {
 	if status != "pending" {
 		return ErrReceiver
 	}
+	if s.ackHook != nil {
+		s.ackHook()
+	}
 	now := s.now().UnixMilli()
-	_, err = tx.ExecContext(ctx, `UPDATE callback_outbox SET status='delivered',attempts=attempts+1,delivered_at=?,terminal_reason='' WHERE id=? AND status='pending'`, now, event)
+	res, err := tx.ExecContext(ctx, `UPDATE callback_outbox SET status='delivered',attempts=attempts+1,delivered_at=?,terminal_reason='' WHERE id=? AND status='pending'`, now, event)
 	if err != nil {
 		return err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if n != 1 {
+		// The event left pending after the read above: a concurrent Ack
+		// committed first (Postgres, READ COMMITTED). Answer as a repeated
+		// Ack would: success when it is delivered, ErrReceiver otherwise.
+		// This statement sees committed rows; tx keeps SQLite's single
+		// connection usable.
+		if e := tx.QueryRowContext(ctx, `SELECT status FROM callback_outbox WHERE id=?`, event).Scan(&status); e == nil && status == "delivered" {
+			return nil
+		}
+		return ErrReceiver
 	}
 	_, err = tx.ExecContext(ctx, `INSERT INTO callback_attempts(event_id,attempt,attempted_at,http_status,outcome) VALUES(?,?,?,?,?)`, event, attempts+1, now, 200, "pull_acknowledged")
 	if err != nil {

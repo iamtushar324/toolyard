@@ -6,6 +6,8 @@ import (
 	"reflect"
 	"testing"
 	"time"
+
+	"github.com/tusharbhardwaj/toolyard/internal/store/storetest"
 )
 
 // One malformed legacy row no longer aborts the whole sync: it is skipped
@@ -120,6 +122,7 @@ func TestLegacySyncLoopCoalescesRequests(t *testing.T) {
 // skips its transaction while approval_requests and the claims are as the
 // last committed pass found them. A signal always runs a pass.
 func TestLegacySyncSkipsUnchangedWork(t *testing.T) {
+	storetest.SkipUnlessSQLite(t) // counts writes with SQLite triggers
 	e := newEnv(t)
 	ctx := context.Background()
 	// Count every write to inbox_requests.

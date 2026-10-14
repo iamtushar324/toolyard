@@ -6,21 +6,17 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
-	"path/filepath"
 	"testing"
 
 	"github.com/tusharbhardwaj/toolyard/internal/audit"
 	"github.com/tusharbhardwaj/toolyard/internal/events"
 	"github.com/tusharbhardwaj/toolyard/internal/identity"
-	"github.com/tusharbhardwaj/toolyard/internal/store"
+	"github.com/tusharbhardwaj/toolyard/internal/store/storetest"
 )
 
 func newEventsAPITestServer(t *testing.T) (*http.ServeMux, *events.Service) {
 	t.Helper()
-	db, err := store.Open(filepath.Join(t.TempDir(), "ev-api.db"))
-	if err != nil {
-		t.Fatalf("open db: %v", err)
-	}
+	db := storetest.Open(t)
 	t.Cleanup(func() { _ = db.Close() })
 	id := identity.New(db)
 	evSvc := events.New(db)

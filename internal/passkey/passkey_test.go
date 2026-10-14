@@ -3,7 +3,6 @@ package passkey
 import (
 	"context"
 	"errors"
-	"path/filepath"
 	"testing"
 	"time"
 
@@ -13,6 +12,7 @@ import (
 	"github.com/tusharbhardwaj/toolyard/internal/inbox"
 	"github.com/tusharbhardwaj/toolyard/internal/passkey/passkeytest"
 	"github.com/tusharbhardwaj/toolyard/internal/store"
+	"github.com/tusharbhardwaj/toolyard/internal/store/storetest"
 )
 
 type softAuth = passkeytest.Authenticator
@@ -41,10 +41,7 @@ const testOrigin = "https://yard.example.com"
 
 func newSvc(t *testing.T) (*Service, *store.DB) {
 	t.Helper()
-	db, err := store.Open(filepath.Join(t.TempDir(), "pk.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	db := storetest.Open(t)
 	t.Cleanup(func() { db.Close() })
 	return New(db), db
 }

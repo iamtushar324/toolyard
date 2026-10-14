@@ -255,6 +255,8 @@ func (s *Service) CreateUser(ctx context.Context, username, password string) (*U
 	if len(password) > 1024 {
 		return nil, errors.New("password too long")
 	}
+	// Cheap early answer before the slow password hash; the locked check
+	// below is the one that counts.
 	exists, err := s.HasUser(ctx)
 	if err != nil {
 		return nil, err
@@ -263,11 +265,36 @@ func (s *Service) CreateUser(ctx context.Context, username, password string) (*U
 		return nil, ErrUserExists
 	}
 	id := "u_" + uuid.NewString()
+	hash := hashPassword(password)
 	now := time.Now().UnixMilli()
-	// The first (and only) password user is the owner: an admin.
-	if _, err := s.db.ExecContext(ctx,
+	// The first (and only) password user is the owner: an admin. The
+	// empty-store check and the insert share one transaction; on Postgres
+	// the users table is locked against writers for it (SQLite's single
+	// connection already serialises it), so two concurrent setups, or a
+	// setup racing a first Clerk sign-in, cannot both see an empty store.
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	if s.db.Dialect.IsPostgres() {
+		if _, err := tx.ExecContext(ctx, `LOCK TABLE users IN SHARE ROW EXCLUSIVE MODE`); err != nil {
+			return nil, err
+		}
+	}
+	var n int
+	if err := tx.QueryRowContext(ctx, `SELECT count(*) FROM users`).Scan(&n); err != nil {
+		return nil, err
+	}
+	if n > 0 {
+		return nil, ErrUserExists
+	}
+	if _, err := tx.ExecContext(ctx,
 		`INSERT INTO users(id, username, password_hash, role, status, created_at, updated_at) VALUES(?,?,?,?,?,?,?)`,
-		id, username, hashPassword(password), RoleAdmin, StatusActive, now, now); err != nil {
+		id, username, hash, RoleAdmin, StatusActive, now, now); err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(); err != nil {
 		return nil, err
 	}
 	return s.GetUserByID(ctx, id)
@@ -361,12 +388,31 @@ func (s *Service) UpsertClerkUser(ctx context.Context, p ClerkProfile, ownerEmai
 	p.DisplayName = strings.TrimSpace(p.DisplayName)
 	p.AvatarURL = strings.TrimSpace(p.AvatarURL)
 	ownerEmail = strings.TrimSpace(ownerEmail)
+	// On Postgres two concurrent first sign-ins (the same Clerk id, or two
+	// people whose emails give the same username) can both pass the checks
+	// in their transactions; a unique index refuses the second insert, and
+	// a retry finds the row the first one wrote. SQLite's single connection
+	// serialises the transactions, so it never retries.
+	for attempt := 1; ; attempt++ {
+		u, err := s.upsertClerkUserOnce(ctx, p, ownerEmail)
+		if err != nil && attempt < 3 && store.IsUniqueViolation(err) {
+			continue
+		}
+		return u, err
+	}
+}
+
+// upsertClerkUserOnce is one attempt of UpsertClerkUser on a normalised
+// profile.
+func (s *Service) upsertClerkUserOnce(ctx context.Context, p ClerkProfile, ownerEmail string) (*User, error) {
 	now := time.Now().UnixMilli()
 
 	// One transaction so two concurrent first sign-ins can't both pick the
-	// same username or both attach to the owner row. Every statement goes
-	// through tx: the store has a single connection and a stray s.db call
-	// inside an open transaction would deadlock the process.
+	// same username or both attach to the owner row (on Postgres the
+	// unique indexes and the conditional attach catch what the reads
+	// cannot). Every statement goes through tx: on SQLite the store has a
+	// single connection and a stray s.db call inside an open transaction
+	// would deadlock the process.
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, err
@@ -388,10 +434,21 @@ func (s *Service) UpsertClerkUser(ctx context.Context, p ClerkProfile, ownerEmai
 			return nil, err
 		}
 		if err == nil && (!linked.Valid || linked.String == "") {
-			if _, err := tx.ExecContext(ctx, `UPDATE users SET clerk_user_id = ? WHERE id = ?`, p.ClerkUserID, pid); err != nil {
+			// Attach only while the row is still unlinked: a concurrent
+			// sign-in may have linked it since the read.
+			res, err := tx.ExecContext(ctx,
+				`UPDATE users SET clerk_user_id = ? WHERE id = ? AND (clerk_user_id IS NULL OR clerk_user_id = '')`,
+				p.ClerkUserID, pid)
+			if err != nil {
 				return nil, err
 			}
-			id = pid
+			n, err := res.RowsAffected()
+			if err != nil {
+				return nil, err
+			}
+			if n == 1 {
+				id = pid
+			}
 		}
 	}
 	if id != "" {
@@ -518,7 +575,7 @@ func (s *Service) SetRole(ctx context.Context, id, role string) error {
 		return err
 	}
 	if curRole == RoleAdmin && curStatus == StatusActive && role == RoleMember {
-		if err := ensureOtherActiveAdmin(ctx, tx, id); err != nil {
+		if err := ensureOtherActiveAdmin(ctx, tx, s.db.Dialect, id); err != nil {
 			return err
 		}
 	}
@@ -549,7 +606,7 @@ func (s *Service) SetStatus(ctx context.Context, id, status, reason string) erro
 	now := time.Now().UnixMilli()
 	if status == StatusBlocked {
 		if curRole == RoleAdmin && curStatus == StatusActive {
-			if err := ensureOtherActiveAdmin(ctx, tx, id); err != nil {
+			if err := ensureOtherActiveAdmin(ctx, tx, s.db.Dialect, id); err != nil {
 				return err
 			}
 		}
@@ -593,15 +650,34 @@ func noActiveAdmin(ctx context.Context, tx *sql.Tx) (bool, error) {
 }
 
 // ensureOtherActiveAdmin is the last-admin rule: at least one active admin
-// other than exceptID must remain.
-func ensureOtherActiveAdmin(ctx context.Context, tx *sql.Tx, exceptID string) error {
-	var n int
-	if err := tx.QueryRowContext(ctx,
-		`SELECT count(*) FROM users WHERE role = ? AND status = ? AND id != ?`,
-		RoleAdmin, StatusActive, exceptID).Scan(&n); err != nil {
+// other than exceptID must remain. It locks every active admin row (in id
+// order) before counting, so on Postgres two transactions demoting or
+// blocking the last two admins run one after the other and the second sees
+// the first one's change (write skew otherwise leaves no admin). On SQLite
+// the single connection already serialises them and the lock clause is
+// empty.
+func ensureOtherActiveAdmin(ctx context.Context, tx *sql.Tx, d store.Dialect, exceptID string) error {
+	rows, err := tx.QueryContext(ctx,
+		`SELECT id FROM users WHERE role = ? AND status = ? ORDER BY id`+d.ForUpdate(),
+		RoleAdmin, StatusActive)
+	if err != nil {
 		return err
 	}
-	if n == 0 {
+	defer rows.Close()
+	others := 0
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return err
+		}
+		if id != exceptID {
+			others++
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return err
+	}
+	if others == 0 {
 		return ErrLastAdmin
 	}
 	return nil
@@ -665,7 +741,10 @@ func (s *Service) CreateAgentWithToken(ctx context.Context, ownerUserID, agentNa
 
 // ExchangeEnrollment swaps a one-time enrollment code for a long-lived token.
 // The token is returned to the caller in plaintext exactly once; only its hash
-// is persisted.
+// is persisted. The write that sets the token also claims the code: it
+// matches only while the code is still on the row and unexpired, so of two
+// concurrent exchanges exactly one gets a token and the other gets
+// ErrEnrollNotFound.
 func (s *Service) ExchangeEnrollment(ctx context.Context, code string) (string, *Agent, error) {
 	var ag Agent
 	var exp int64
@@ -673,14 +752,15 @@ func (s *Service) ExchangeEnrollment(ctx context.Context, code string) (string, 
 		`SELECT id, name, owner_user, enroll_expires, kind
          FROM agents WHERE enroll_code = ?`, code).
 		Scan(&ag.ID, &ag.Name, &ag.Owner, &exp, &ag.Kind)
-	if err == sql.ErrNoRows {
+	if errors.Is(err, sql.ErrNoRows) {
 		return "", nil, ErrEnrollNotFound
 	}
 	if err != nil {
 		return "", nil, err
 	}
-	if exp < time.Now().UnixMilli() {
-		_, _ = s.db.ExecContext(ctx, `UPDATE agents SET enroll_code = NULL WHERE id = ?`, ag.ID)
+	now := time.Now().UnixMilli()
+	if exp < now {
+		_, _ = s.db.ExecContext(ctx, `UPDATE agents SET enroll_code = NULL WHERE id = ? AND enroll_code = ?`, ag.ID, code)
 		return "", nil, ErrEnrollNotFound
 	}
 	rawToken, err := randCode(32)
@@ -689,10 +769,18 @@ func (s *Service) ExchangeEnrollment(ctx context.Context, code string) (string, 
 	}
 	token := ag.ID + "." + rawToken
 	hash := hashToken(token)
-	if _, err := s.db.ExecContext(ctx,
+	res, err := s.db.ExecContext(ctx,
 		`UPDATE agents SET token_hash = ?, enroll_code = NULL, enroll_expires = NULL, last_seen = ?
-         WHERE id = ?`, hash, time.Now().UnixMilli(), ag.ID); err != nil {
+         WHERE id = ? AND enroll_code = ? AND enroll_expires >= ?`, hash, now, ag.ID, code, now)
+	if err != nil {
 		return "", nil, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return "", nil, err
+	}
+	if n != 1 {
+		return "", nil, ErrEnrollNotFound
 	}
 	return token, &ag, nil
 }
@@ -956,12 +1044,14 @@ func nullStr(s string) any {
 }
 
 // ListAgents returns the owner's agents, newest first. created_at is in
-// milliseconds, so rowid (insertion order) breaks ties: "newest" must be
-// well defined for callers that pick the first match.
+// milliseconds, so the id (descending) breaks ties: "newest" must be well
+// defined for callers that pick the first match. Ids are random, so among
+// agents created in the same millisecond the order is fixed but not the
+// insertion order (Postgres has no rowid).
 func (s *Service) ListAgents(ctx context.Context, ownerUserID string) ([]Agent, error) {
 	rows, err := s.db.QueryContext(ctx,
 		`SELECT id, name, owner_user, COALESCE(last_seen, 0), COALESCE(disabled, 0), kind
-         FROM agents WHERE owner_user = ? ORDER BY created_at DESC, rowid DESC`, ownerUserID)
+         FROM agents WHERE owner_user = ? ORDER BY created_at DESC, id DESC`, ownerUserID)
 	if err != nil {
 		return nil, err
 	}

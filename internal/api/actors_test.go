@@ -6,7 +6,6 @@ import (
 	"net"
 	"net/http"
 	"net/http/httptest"
-	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -23,6 +22,7 @@ import (
 	"github.com/tusharbhardwaj/toolyard/internal/policy"
 	"github.com/tusharbhardwaj/toolyard/internal/realtime"
 	"github.com/tusharbhardwaj/toolyard/internal/store"
+	"github.com/tusharbhardwaj/toolyard/internal/store/storetest"
 )
 
 const actorReason = "checking who raised and who decided, end to end"
@@ -51,10 +51,7 @@ type actorEnv struct {
 
 func newActorEnv(t *testing.T) *actorEnv {
 	t.Helper()
-	db, err := store.Open(filepath.Join(t.TempDir(), "actors-api.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	db := storetest.Open(t)
 	t.Cleanup(func() { _ = db.Close() })
 	ctx := context.Background()
 	id := identity.New(db)

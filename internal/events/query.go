@@ -55,7 +55,8 @@ func (s *Service) Query(ctx context.Context, f Filter) ([]Event, error) {
 	}
 	if f.Q != "" {
 		like := "%" + f.Q + "%"
-		q += ` AND (e.summary LIKE ? OR e.title LIKE ? OR e.type LIKE ?)`
+		op := s.db.Dialect.ILike() // case-insensitive on both engines
+		q += ` AND (e.summary ` + op + ` ? OR e.title ` + op + ` ? OR e.type ` + op + ` ?)`
 		args = append(args, like, like, like)
 	}
 	q += ` ORDER BY e.received_at DESC, e.id DESC`

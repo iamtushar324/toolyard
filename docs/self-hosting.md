@@ -494,6 +494,79 @@ as it is for keys an admin issues: an admin opens the person on the
 (`POST /v1/users/{id}/identity-key/register`, which runs as that admin),
 or registers the fingerprint by hand.
 
+## Database: SQLite or Postgres
+
+By default toolyard keeps everything in SQLite: `toolyard.db` in the data
+directory, in WAL mode, with one connection. That suits a single server,
+development and tests, and it needs no setup.
+
+toolyard can use Postgres 16 instead (Amazon Aurora PostgreSQL works too),
+with a connection pool. Run one toolyard process per database: several
+replicas on one database are not supported yet. Our own production server
+still runs SQLite until its planned move to Postgres.
+
+### How toolyard picks the database
+
+`serve`, `operator-token` and `keys-check` pick the database the same way;
+the first match wins:
+
+1. `$TOOLYARD_DATABASE_URL`, a `postgres://` or `postgresql://` URL. A
+   `toolyard.env` file in a credentials directory can set it (see
+   [Keys and credentials](#keys-and-credentials)).
+2. A file named `database-url` in `$CREDENTIALS_DIRECTORY` (systemd
+   `LoadCredential=`), then in `-credentials-dir`, that holds the URL.
+   Surrounding whitespace is ignored.
+3. SQLite at `<data>/toolyard.db`.
+
+A URL that is not a Postgres URL, or an empty or unreadable `database-url`
+file, stops the start with exit code 78. The URL holds the password, so
+toolyard never logs it: the logs and `keys-check` name only the engine,
+the host and the database name. For example:
+
+```bash
+printf '%s\n' 'postgres://toolyard:PASSWORD@db.example.com:5432/toolyard?sslmode=require' \
+  > /run/secrets/database-url
+chmod 600 /run/secrets/database-url
+```
+
+Use `sslmode=verify-full` with `sslrootcert=<CA bundle>` when you can, so
+the client also checks the server's certificate.
+
+### Creating the Postgres database
+
+Create an empty database with C collation, so text sorts and compares byte
+by byte, as it does in SQLite:
+
+```sql
+CREATE ROLE toolyard LOGIN PASSWORD 'PASSWORD';
+CREATE DATABASE toolyard OWNER toolyard
+  TEMPLATE template0 ENCODING 'UTF8' LC_COLLATE 'C' LC_CTYPE 'C';
+```
+
+The first start creates the whole schema in one transaction, and later
+starts apply new migrations. Migrations run under a Postgres advisory lock,
+so two processes that start at the same time do not both migrate. The role
+must be able to create tables in the database (owning it is enough).
+
+### Connection pool
+
+`-db-max-conns` (default 10) is the most connections `serve` opens to
+Postgres. Keep the server's `max_connections` above the total of every
+process that connects. SQLite always uses one connection, and the flag
+does nothing there.
+
+### What else changes on Postgres
+
+- Inbox attachments (uploads, copied links and voice notes) are kept in
+  the database too, in 1 MiB chunks, instead of under
+  `<data>/inbox/blobs`. The data directory still holds keys (unless they
+  come from a credentials directory), crash dumps, notes and skills.
+- Back up the database with Postgres tools (`pg_dump`, or snapshots on
+  Aurora) instead of copying `toolyard.db`. Back up the keys with it, but
+  store them apart from it, as for SQLite.
+- To move an existing SQLite installation to Postgres, use `toolyard db
+  copy` and then `toolyard db verify` (run `toolyard db` for their flags).
+
 ## Keys and credentials
 
 toolyard seals stored credentials with AES-256-GCM under master keys,
@@ -576,8 +649,10 @@ the read-only check with the same directories the server uses:
 toolyard keys-check -data /var/lib/toolyard -credentials-dir /run/secrets
 ```
 
-It opens `toolyard.db` read-only (no migrations, no writes), runs the same
-search, decode, canary and sealed-data checks as `serve`, and prints one
+It opens the database `serve` would use read-only (`toolyard.db`, or a
+Postgres session with `default_transaction_read_only=on`; no migrations,
+no writes), runs the same search, decode, canary and sealed-data checks as
+`serve`, and prints one
 line per key: where it was found and its key id, and whether its canary
 matches, is absent (the key is adopted on the next start, as on the first
 start after an upgrade from a version without canaries, once it opens the

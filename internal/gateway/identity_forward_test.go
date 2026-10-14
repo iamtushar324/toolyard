@@ -9,7 +9,6 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
-	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -24,7 +23,7 @@ import (
 	"github.com/tusharbhardwaj/toolyard/internal/metrics"
 	"github.com/tusharbhardwaj/toolyard/internal/policy"
 	"github.com/tusharbhardwaj/toolyard/internal/realtime"
-	"github.com/tusharbhardwaj/toolyard/internal/store"
+	"github.com/tusharbhardwaj/toolyard/internal/store/storetest"
 	"github.com/tusharbhardwaj/toolyard/internal/upstreams"
 )
 
@@ -185,10 +184,7 @@ const (
 func newForwardFixture(t *testing.T, ids gateway.IdentityResolver) *forwardFixture {
 	t.Helper()
 	ctx := context.Background()
-	db, err := store.Open(filepath.Join(t.TempDir(), "fwd.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	db := storetest.Open(t)
 	t.Cleanup(func() { _ = db.Close() })
 	bus, err := approval.New(ctx, db)
 	if err != nil {

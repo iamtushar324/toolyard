@@ -3,22 +3,16 @@ package events
 import (
 	"context"
 	"encoding/json"
-	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
-	"github.com/tusharbhardwaj/toolyard/internal/store"
+	"github.com/tusharbhardwaj/toolyard/internal/store/storetest"
 )
 
 func newTestService(t *testing.T) *Service {
 	t.Helper()
-	db, err := store.Open(filepath.Join(t.TempDir(), "events.db"))
-	if err != nil {
-		t.Fatalf("open db: %v", err)
-	}
-	t.Cleanup(func() { db.Close() })
-	return New(db)
+	return New(storetest.Open(t)) // SQLite, or Postgres when TOOLYARD_TEST_DB=postgres
 }
 
 func TestIngestAndDedup(t *testing.T) {

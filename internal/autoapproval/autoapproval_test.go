@@ -2,24 +2,17 @@ package autoapproval
 
 import (
 	"context"
-	"path/filepath"
 	"testing"
 
-	"github.com/tusharbhardwaj/toolyard/internal/store"
+	"github.com/tusharbhardwaj/toolyard/internal/store/storetest"
 )
 
-// newTestService spins up a temporary sqlite-backed Service. The metrics
+// newTestService spins up a temporary database-backed Service. The metrics
 // reader and settings service are nil — SetToolPolicy / ToolPolicies don't
 // touch either of them.
 func newTestService(t *testing.T) *Service {
 	t.Helper()
-	dir := t.TempDir()
-	db, err := store.Open(filepath.Join(dir, "test.db"))
-	if err != nil {
-		t.Fatalf("open db: %v", err)
-	}
-	t.Cleanup(func() { db.Close() })
-	return New(db, nil, nil)
+	return New(storetest.Open(t), nil, nil)
 }
 
 func TestSetToolPolicy_CreatesEnabledRule(t *testing.T) {

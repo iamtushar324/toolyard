@@ -192,7 +192,7 @@ func (s *Service) CreateSource(ctx context.Context, in CreateSourceInput) (*Sour
          VALUES(?,?,?,?,?,?,?,1,?,?)`,
 		id, name, in.Kind, nullStr(tokenHash), cfgJSON, boolToInt(in.Notify), string(notifyTypesJSON), now, now)
 	if err != nil {
-		if strings.Contains(strings.ToLower(err.Error()), "unique") {
+		if store.IsUniqueViolation(err) {
 			return nil, "", ErrExists
 		}
 		return nil, "", err

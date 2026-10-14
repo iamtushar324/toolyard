@@ -3,11 +3,10 @@ package identity
 import (
 	"context"
 	"errors"
-	"path/filepath"
 	"testing"
 	"time"
 
-	"github.com/tusharbhardwaj/toolyard/internal/store"
+	"github.com/tusharbhardwaj/toolyard/internal/store/storetest"
 )
 
 func clerkUser(t *testing.T, s *Service, id, email, owner string) *User {
@@ -314,12 +313,7 @@ func TestVerifyAgentTokenBlockedOwner(t *testing.T) {
 // password setup before the first Clerk sign-in.
 func newEmptyIdentity(t *testing.T) *Service {
 	t.Helper()
-	db, err := store.Open(filepath.Join(t.TempDir(), "empty.db"))
-	if err != nil {
-		t.Fatalf("open db: %v", err)
-	}
-	t.Cleanup(func() { db.Close() })
-	return New(db)
+	return New(storetest.Open(t))
 }
 
 func TestUpsertClerkUserBootstrapsFirstAdmin(t *testing.T) {

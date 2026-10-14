@@ -125,6 +125,8 @@ func writeIdentityKeyError(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusConflict, "no_clerk_identity")
 	case errors.Is(err, identitykeys.ErrKeyExists):
 		writeError(w, http.StatusConflict, "key_exists")
+	case errors.Is(err, identitykeys.ErrKeyChanged):
+		writeError(w, http.StatusConflict, "key_changed")
 	case errors.Is(err, identity.ErrNoUser):
 		writeError(w, http.StatusNotFound, "user not found")
 	default:

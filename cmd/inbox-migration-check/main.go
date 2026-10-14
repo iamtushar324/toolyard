@@ -1,5 +1,9 @@
 // inbox-migration-check applies additive migrations and verifies legacy Inbox
 // preservation against an offline SQLite backup. It never opens a live path.
+//
+// The tool is SQLite-only: it opens the backup file with store.Open, never
+// the gateway's configured (possibly Postgres) database, so its checks use
+// SQLite SQL such as json_extract directly.
 package main
 
 import (
@@ -40,6 +44,7 @@ func main() {
 		panic(err)
 	}
 	counts := map[string]int{}
+	// SQLite SQL (json_extract): db is always the SQLite backup opened above.
 	queries := map[string]string{
 		"legacy_total":                  `SELECT count(*) FROM approval_requests`,
 		"legacy_pending":                `SELECT count(*) FROM approval_requests WHERE status='pending'`,

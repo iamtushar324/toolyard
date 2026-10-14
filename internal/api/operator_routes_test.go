@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
-	"path/filepath"
 	"strings"
 	"testing"
 
@@ -19,6 +18,7 @@ import (
 	"github.com/tusharbhardwaj/toolyard/internal/secrets"
 	"github.com/tusharbhardwaj/toolyard/internal/settings"
 	"github.com/tusharbhardwaj/toolyard/internal/store"
+	"github.com/tusharbhardwaj/toolyard/internal/store/storetest"
 	"github.com/tusharbhardwaj/toolyard/internal/upstreams"
 )
 
@@ -37,10 +37,7 @@ func newOperatorEnv(t *testing.T) *opEnv {
 	t.Helper()
 	ctx := context.Background()
 	dir := t.TempDir()
-	db, err := store.Open(filepath.Join(dir, "op.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	db := storetest.Open(t)
 	t.Cleanup(func() { _ = db.Close() })
 	id := identity.New(db)
 	u, err := id.CreateUser(ctx, "owner", "long-enough-password")

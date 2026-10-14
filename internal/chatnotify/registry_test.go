@@ -2,13 +2,12 @@ package chatnotify
 
 import (
 	"context"
-	"path/filepath"
 	"sync"
 	"testing"
 	"time"
 
 	"github.com/tusharbhardwaj/toolyard/internal/approval"
-	"github.com/tusharbhardwaj/toolyard/internal/store"
+	"github.com/tusharbhardwaj/toolyard/internal/store/storetest"
 )
 
 // fakeChannel records SendApproval / UpdateApproval calls.
@@ -59,11 +58,7 @@ func (f *fakeChannel) updateCountFor(approvalID string) int {
 
 func newTestRegistry(t *testing.T) (*Registry, *approval.Bus, *fakeChannel) {
 	t.Helper()
-	db, err := store.Open(filepath.Join(t.TempDir(), "chat.db"))
-	if err != nil {
-		t.Fatalf("open db: %v", err)
-	}
-	t.Cleanup(func() { db.Close() })
+	db := storetest.Open(t) // SQLite, or Postgres when TOOLYARD_TEST_DB=postgres
 	bus, err := approval.New(context.Background(), db)
 	if err != nil {
 		t.Fatalf("bus: %v", err)

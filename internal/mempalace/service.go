@@ -347,7 +347,7 @@ func (s *Service) recordAgent(ctx context.Context, agentID string) {
          VALUES(?, ?, ?, 1)
          ON CONFLICT(agent_id) DO UPDATE SET
             last_seen = excluded.last_seen,
-            entry_count = entry_count + 1`,
+            entry_count = mempalace_agents.entry_count + 1`,
 		agentID, now, now)
 }
 

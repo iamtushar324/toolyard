@@ -26,7 +26,9 @@ func (c *testCallbacks) DecisionTx(ctx context.Context, tx *sql.Tx, r *Request) 
 		return errors.New("outbox unavailable")
 	}
 	doc, _ := json.Marshal(r)
-	_, err := tx.ExecContext(ctx, `INSERT INTO batch_test_events(request_id,revision,doc) SELECT ?,?,? WHERE EXISTS(SELECT 1 FROM batch_test_subscriptions WHERE request_id=?)`, r.ID, r.Revision, string(doc), r.ID)
+	// Parameters in a SELECT list are cast to the column types (Postgres
+	// cannot infer them there).
+	_, err := tx.ExecContext(ctx, `INSERT INTO batch_test_events(request_id,revision,doc) SELECT CAST(? AS TEXT),CAST(? AS BIGINT),CAST(? AS TEXT) WHERE EXISTS(SELECT 1 FROM batch_test_subscriptions WHERE request_id=?)`, r.ID, r.Revision, string(doc), r.ID)
 	return err
 }
 func installTestCallbacks(t *testing.T, e *testEnv) *testCallbacks {
