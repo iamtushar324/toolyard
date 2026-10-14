@@ -265,8 +265,9 @@ func (s *Service) CreateUser(ctx context.Context, username, password string) (*U
 		return nil, ErrUserExists
 	}
 	id := "u_" + uuid.NewString()
-	hash := hashPassword(password)
+	// Stamp before the slow hash, as before: created_at orders users.
 	now := time.Now().UnixMilli()
+	hash := hashPassword(password)
 	// The first (and only) password user is the owner: an admin. The
 	// empty-store check and the insert share one transaction; on Postgres
 	// the users table is locked against writers for it (SQLite's single

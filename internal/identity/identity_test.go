@@ -18,6 +18,11 @@ func newTestIdentity(t *testing.T) (*Service, string) {
 	if err != nil {
 		t.Fatalf("create user: %v", err)
 	}
+	// Users sort by created_at in milliseconds with the random id as the
+	// tie-break, and CreateUser now stamps the row after the password hash:
+	// keep the next user out of the primary's millisecond so "first user"
+	// stays the primary.
+	time.Sleep(2 * time.Millisecond)
 	return s, u.ID
 }
 
