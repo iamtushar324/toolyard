@@ -22,10 +22,13 @@ import (
 	"github.com/tusharbhardwaj/toolyard/internal/approval"
 	"github.com/tusharbhardwaj/toolyard/internal/audit"
 	"github.com/tusharbhardwaj/toolyard/internal/codemode"
+	"github.com/tusharbhardwaj/toolyard/internal/goroutines"
 	"github.com/tusharbhardwaj/toolyard/internal/inbox"
 	"github.com/tusharbhardwaj/toolyard/internal/lake"
+	"github.com/tusharbhardwaj/toolyard/internal/logx"
 	"github.com/tusharbhardwaj/toolyard/internal/memory"
 	"github.com/tusharbhardwaj/toolyard/internal/metrics"
+	"github.com/tusharbhardwaj/toolyard/internal/opsmetrics"
 	"github.com/tusharbhardwaj/toolyard/internal/policy"
 	"github.com/tusharbhardwaj/toolyard/internal/realtime"
 )
@@ -48,6 +51,11 @@ const (
 	// blocking call can't hold a connection longer than common LB read
 	// timeouts.
 	WaitForApprovalMaxTimeout = 5 * time.Minute
+	// restartRetryAfterSeconds is the retry hint in a drain refusal.
+	restartRetryAfterSeconds = 5
+	// persistTimeout bounds recording an executed approval's outcome on a
+	// context that outlives the executor's.
+	persistTimeout = 5 * time.Second
 )
 
 // ErrUpstreamNotFound is returned when an upstream is referenced by name but
@@ -193,6 +201,16 @@ type Gateway struct {
 	// (not yet returned). Surfaced via /v1/health and the dashboard so a
 	// runaway upstream is visible without dumping goroutines.
 	inFlight atomic.Int64
+
+	// Shutdown (TEC-1626). drainActive makes routeEntry refuse new calls
+	// with a retryable answer (BeginDrain). drainRelease, closed by
+	// ReleaseWaiters, ends the approval wait loops. grantCalls tracks
+	// granted (Inbox) executions so shutdown can wait for them.
+	drainActive   atomic.Bool
+	drainMu       sync.Mutex
+	drainRelease  chan struct{}
+	drainReleased bool
+	grantCalls    goroutines.Tracker
 
 	// clientCache remembers each agent's MCP clientInfo; sessionCache
 	// remembers which agent owns a `_session_id` (actor.go).
@@ -356,6 +374,7 @@ func New(opts Options) *Gateway {
 		upstreams:           map[string]*upstream{},
 		perUser:             map[string]*perUserGroup{},
 	}
+	g.grantCalls.Executions = true
 	serverOpts := []server.ServerOption{
 		server.WithToolCapabilities(true),
 		server.WithLogging(),
@@ -511,6 +530,88 @@ func (g *Gateway) denyUngranted(ctx context.Context, entry toolEntry, agentID, a
 	ev.Outcome = metrics.OutcomeDenied
 	ev.ErrorClass = "access"
 	return notFoundResult(entry.tool.Name)
+}
+
+// BeginDrain makes every new routed tool call answer with a retryable
+// "server restarting, call again" result before any grant is redeemed,
+// approval resumed or tool dispatched, so no permission is used up. Calls
+// already running continue.
+func (g *Gateway) BeginDrain() { g.drainActive.Store(true) }
+
+// Draining reports whether BeginDrain was called.
+func (g *Gateway) Draining() bool { return g.drainActive.Load() }
+
+// ReleaseWaiters ends running tools.wait_for_approval(s) calls with the
+// retryable answer, so they do not hold the HTTP server open. Safe to call
+// more than once.
+func (g *Gateway) ReleaseWaiters() {
+	g.drainMu.Lock()
+	defer g.drainMu.Unlock()
+	if g.drainRelease == nil {
+		g.drainRelease = make(chan struct{})
+	}
+	if !g.drainReleased {
+		g.drainReleased = true
+		close(g.drainRelease)
+	}
+}
+
+// drainReleaseCh returns the channel ReleaseWaiters closes.
+func (g *Gateway) drainReleaseCh() <-chan struct{} {
+	g.drainMu.Lock()
+	defer g.drainMu.Unlock()
+	if g.drainRelease == nil {
+		g.drainRelease = make(chan struct{})
+	}
+	return g.drainRelease
+}
+
+// WaitGrantedCalls waits until no granted (Inbox) execution is running or
+// ctx ends, and returns how many were still running.
+func (g *Gateway) WaitGrantedCalls(ctx context.Context) int {
+	return len(g.grantCalls.Wait(ctx))
+}
+
+// restartingResult is the answer to a call refused or a wait ended by a
+// drain. Nothing ran and no grant or approval was used, so the same call
+// works again in a few seconds (the next process answers it).
+func restartingResult(tool, detail string) *mcp.CallToolResult {
+	msg := "server restarting, call again: " + detail
+	res := mcp.NewToolResultError(msg)
+	res.StructuredContent = map[string]any{
+		"status":              "server_restarting",
+		"executed":            false,
+		"retryable":           true,
+		"retry_after_seconds": restartRetryAfterSeconds,
+		"tool":                tool,
+		"message":             msg,
+	}
+	res.Meta = &mcp.Meta{AdditionalFields: map[string]any{"toolyard.retryable": true}}
+	return res
+}
+
+// toolCallLabel maps a call's metrics outcome to the tool-call counter's
+// fixed labels.
+func toolCallLabel(outcome string) string {
+	switch outcome {
+	case metrics.OutcomeOK:
+		return "ok"
+	case metrics.OutcomeDenied, metrics.OutcomeExpired:
+		return "denied"
+	case metrics.OutcomeDeferred:
+		return "approval"
+	default:
+		return "error"
+	}
+}
+
+// auditWriteFailed logs a failed dispatch audit write at ERROR, with the
+// dispatch id, tool and upstream (never the arguments), and counts it.
+func auditWriteFailed(stage, dispatchID string, entry toolEntry, err error) {
+	opsmetrics.IncAuditWriteFailure(stage)
+	logx.For("gateway").Error("dispatch audit write failed",
+		"stage", stage, "dispatch_id", dispatchID,
+		"tool", entry.tool.Name, "upstream", entry.upstream, "err", err.Error())
 }
 
 // InFlight returns the number of tool calls currently being routed. Used
@@ -1090,6 +1191,7 @@ func (g *Gateway) RouteCall(ctx context.Context, viaTool, targetName string, arg
 func (g *Gateway) routeEntry(ctx context.Context, entry toolEntry, via string, args map[string]any) (res *mcp.CallToolResult, err error) {
 	started := time.Now()
 	agentID := agentIDFromContext(ctx)
+	refusedDraining := false
 
 	// Who is calling: the ingress raiser (or the caller id alone), the
 	// client that introduced itself at initialize, and the agent session
@@ -1146,6 +1248,11 @@ func (g *Gateway) routeEntry(ctx context.Context, entry toolEntry, via string, a
 		if g.metrics != nil {
 			g.metrics.Record(ev)
 		}
+		if refusedDraining {
+			opsmetrics.IncToolCall("refused_draining")
+		} else {
+			opsmetrics.IncToolCall(toolCallLabel(ev.Outcome))
+		}
 	}()
 
 	// Per-user access comes first: a member whose admin never granted this
@@ -1153,6 +1260,16 @@ func (g *Gateway) routeEntry(ctx context.Context, entry toolEntry, via string, a
 	// a tool there. The result matches an unknown tool.
 	if !g.allowsEntry(ctx, agentID, entry) {
 		return g.denyUngranted(ctx, entry, agentID, "", &ev), nil
+	}
+
+	// A drain refuses the call before anything is used up: no grant is
+	// redeemed, no approval resumed or created, nothing dispatched.
+	if g.Draining() {
+		refusedDraining = true
+		ev.Outcome = metrics.OutcomeError
+		ev.ErrorClass = "draining"
+		return restartingResult(entry.tool.Name, entry.tool.Name+
+			" did not run and no permission was used. Call it again with the same arguments in a few seconds."), nil
 	}
 
 	// Deferred-resume short-circuit. The approval coordination tools take
@@ -1213,6 +1330,10 @@ func (g *Gateway) routeEntry(ctx context.Context, entry toolEntry, via string, a
 	// A grant only matters for calls that would otherwise need approval:
 	// an explicit deny still wins, and an open tool doesn't use one up.
 	if !entry.personalGitHub && grantToken != "" && decision.Action == policy.ActionApprove && g.inbox != nil {
+		// Tracked so shutdown waits for the granted execution to finish
+		// and record its outcome.
+		done := g.grantCalls.Add(entry.tool.Name)
+		defer done()
 		return g.redeemAndDispatch(ctx, entry, cleanArgs, agentID, reason, grantToken, &ev)
 	}
 
@@ -1526,6 +1647,7 @@ func (g *Gateway) resumeDeferred(ctx context.Context, entry toolEntry, approvalI
 			case <-waitCh:
 			case <-time.After(wait):
 			case <-ctx.Done():
+			case <-g.drainReleaseCh(): // shutdown: answer with the state as it stands
 			}
 		}
 		req, err = g.approval.Get(ctx, approvalID)
@@ -1752,6 +1874,7 @@ func (g *Gateway) dispatch(ctx context.Context, entry toolEntry, args map[string
 	auditArgs, _ := json.Marshal(args)
 	intent := audit.Event{ID: dispatchID + ".started", EventType: "call.dispatch", AgentID: agentID, UpstreamName: entry.upstream, ToolName: entry.tool.Name, Reason: reason, ApprovalID: approvalID, Arguments: auditArgs, Raiser: actor.Raiser{OwnerUserID: asUser}}
 	if err := g.audit.Write(ctx, intent); err != nil {
+		auditWriteFailed("intent", dispatchID, entry, err)
 		ev.Outcome = metrics.OutcomeError
 		ev.ErrorClass = "audit_unavailable"
 		return mcp.NewToolResultError("Audit unavailable. The tool did not run."), nil
@@ -1784,6 +1907,7 @@ func (g *Gateway) dispatch(ctx context.Context, entry toolEntry, args map[string
 	auditErr := g.audit.Write(auditCtx, outcome)
 	auditCancel()
 	if auditErr != nil {
+		auditWriteFailed("outcome", dispatchID, entry, auditErr)
 		ev.Outcome = metrics.OutcomeError
 		ev.ErrorClass = "audit_outcome_unknown"
 		return mcp.NewToolResultError("Tool outcome unknown: completion audit failed. Do not retry. Review dispatch " + dispatchID + " before another action."), nil
@@ -2181,7 +2305,12 @@ func (g *Gateway) Execute(ctx context.Context, req *approval.Request) {
 	if g.metrics != nil {
 		g.metrics.Record(*ev)
 	}
-	g.persistApprovalResult(ctx, req.ID, res, dispatchErr, ev.ErrorClass == "upstream" || ev.ErrorClass == "audit_outcome_unknown")
+	// The outcome is recorded even when ctx was cancelled mid-dispatch
+	// (the bus cancels it at the drain deadline): the dispatch error then
+	// makes it outcome_unknown.
+	persistCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), persistTimeout)
+	defer cancel()
+	g.persistApprovalResult(persistCtx, req.ID, res, dispatchErr, ev.ErrorClass == "upstream" || ev.ErrorClass == "audit_outcome_unknown")
 }
 
 // persistApprovalResult encodes a dispatched tool result and stores it on

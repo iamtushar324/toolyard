@@ -7,6 +7,7 @@ import (
 	"strings"
 
 	"github.com/tusharbhardwaj/toolyard/internal/identity"
+	"github.com/tusharbhardwaj/toolyard/internal/ops"
 )
 
 // RoleGuard is the deny-by-default gate for members. When a /v1 request
@@ -21,6 +22,12 @@ import (
 func (s *Server) RoleGuard(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !strings.HasPrefix(r.URL.Path, "/v1/") {
+			next.ServeHTTP(w, r)
+			return
+		}
+		// Liveness and readiness probes read no user data and answer
+		// anyone: a cookie or token riding along changes nothing.
+		if isProbeRead(r) {
 			next.ServeHTTP(w, r)
 			return
 		}
@@ -49,6 +56,12 @@ func (s *Server) RoleGuard(next http.Handler) http.Handler {
 		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+// isProbeRead reports a GET or HEAD of a probe route (ops.IsProbePath).
+// Any other method on those paths gets no exemption.
+func isProbeRead(r *http.Request) bool {
+	return (r.Method == http.MethodGet || r.Method == http.MethodHead) && ops.IsProbePath(r.URL.Path)
 }
 
 // memberRoutes: exact path -> space-separated methods a member may use,

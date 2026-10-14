@@ -74,6 +74,7 @@ import (
 	"github.com/tusharbhardwaj/toolyard/internal/metrics"
 	"github.com/tusharbhardwaj/toolyard/internal/notes"
 	"github.com/tusharbhardwaj/toolyard/internal/oauth"
+	"github.com/tusharbhardwaj/toolyard/internal/ops"
 	"github.com/tusharbhardwaj/toolyard/internal/passkey"
 	"github.com/tusharbhardwaj/toolyard/internal/policy"
 	"github.com/tusharbhardwaj/toolyard/internal/pricing"
@@ -156,6 +157,8 @@ type Server struct {
 	clerkOwnerOnly      bool
 	// connect is POST /v1/connect/t3 (connect_routes.go); nil = off.
 	connect *connectConfig
+	// probes answers /v1/livez and /v1/readyz (and their aliases).
+	probes *ops.Prober
 }
 
 type Options struct {
@@ -251,6 +254,9 @@ type Options struct {
 	// session tokens POST /v1/connect/t3 swaps for the person's agent
 	// token. Empty, or Clerk off, leaves the endpoint off (404).
 	ConnectAZP []string
+	// Probes answers the liveness and readiness probes. nil uses a
+	// prober over ops.Default with no database, which is never ready.
+	Probes *ops.Prober
 }
 
 func New(ctx context.Context, opts Options) *Server {
@@ -307,6 +313,10 @@ func New(ctx context.Context, opts Options) *Server {
 		s.clerkFrontendAPI = opts.Clerk.FrontendAPI()
 	}
 	s.connect = newConnectT3(opts.Clerk, opts.ConnectAZP)
+	s.probes = opts.Probes
+	if s.probes == nil {
+		s.probes = ops.NewProber(ops.Default, nil)
+	}
 	s.federation, s.callbacks = opts.Federation, opts.Callbacks
 	if s.federation != nil {
 		s.federation.Membership = func(ctx context.Context, subject string) (federation.Profile, error) {
@@ -349,6 +359,13 @@ func (s *Server) SecurityOpts() SecurityOptions { return s.security }
 func (s *Server) Routes(mux *http.ServeMux) {
 	s.federationRoutes(mux)
 	mux.HandleFunc("/v1/health", s.health)
+	// Liveness and readiness: /v1/livez, /v1/readyz and the aliases
+	// /livez, /readyz and /healthz. GET and HEAD, no session; the role
+	// guard and HardenAPI let them through (ops.IsProbePath).
+	if s.probes == nil {
+		s.probes = ops.NewProber(ops.Default, nil)
+	}
+	s.probes.Register(mux)
 	mux.HandleFunc("/v1/auth/setup", s.authSetup)
 	mux.HandleFunc("/v1/auth/login", s.authLogin)
 	mux.HandleFunc("/v1/auth/logout", s.authLogout)

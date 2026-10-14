@@ -11,9 +11,15 @@ import (
 
 	"github.com/tusharbhardwaj/toolyard/internal/actor"
 	"github.com/tusharbhardwaj/toolyard/internal/audit"
+	"github.com/tusharbhardwaj/toolyard/internal/goroutines"
 	"github.com/tusharbhardwaj/toolyard/internal/identity"
 	"github.com/tusharbhardwaj/toolyard/internal/oauth"
 )
+
+// reconnectAfterAuthName names the reconnect a sign-in starts in the
+// goroutine panic counter. The reconnect runs on its own context, not the
+// request's: the browser's response must not cancel it.
+const reconnectAfterAuthName = "oauth-reconnect"
 
 // oauthRoutes wires the public OAuth callback + paste routes. The
 // serversItem handler dispatches the per-upstream OAuth subpaths
@@ -342,7 +348,7 @@ func (s *Server) oauthDevicePoll(w http.ResponseWriter, r *http.Request, name st
 		writeJSON(w, http.StatusAccepted, map[string]any{"status": "pending"})
 		return
 	}
-	go s.upstreams.ReconnectAfterAuth(context.Background(), name)
+	goroutines.Go(reconnectAfterAuthName, func() { s.upstreams.ReconnectAfterAuth(context.Background(), name) })
 	writeJSON(w, http.StatusOK, map[string]any{"status": "authorized"})
 }
 
@@ -410,7 +416,7 @@ func (s *Server) oauthCallback(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	_ = s.oauth.DeletePending(r.Context(), state)
-	go s.upstreams.ReconnectAfterAuth(context.Background(), p.UpstreamName)
+	goroutines.Go(reconnectAfterAuthName, func() { s.upstreams.ReconnectAfterAuth(context.Background(), p.UpstreamName) })
 	_ = s.audit.Write(r.Context(), audit.Event{
 		EventType:     "oauth.success",
 		ResultSummary: p.UpstreamName,
@@ -541,7 +547,7 @@ func (s *Server) oauthUserCallback(w http.ResponseWriter, r *http.Request, p *oa
 		return
 	}
 	_ = s.oauth.DeletePending(r.Context(), p.State)
-	go s.upstreams.ReconnectAfterUserAuth(context.Background(), p.UpstreamName, u.ID)
+	goroutines.Go(reconnectAfterAuthName, func() { s.upstreams.ReconnectAfterUserAuth(context.Background(), p.UpstreamName, u.ID) })
 	_ = s.audit.Write(r.Context(), audit.Event{
 		EventType: "oauth.user_success", AgentID: "user:" + u.ID, UpstreamName: p.UpstreamName,
 		ResultSummary: p.UpstreamName + " connected as " + nonEmpty(rec.AccountLabel, "(account not named)"),
@@ -653,7 +659,7 @@ func (s *Server) oauthPaste(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		_ = s.oauth.DeletePending(r.Context(), state)
-		go s.upstreams.ReconnectAfterUserAuth(context.Background(), p.UpstreamName, u.ID)
+		goroutines.Go(reconnectAfterAuthName, func() { s.upstreams.ReconnectAfterUserAuth(context.Background(), p.UpstreamName, u.ID) })
 		_ = s.audit.Write(r.Context(), audit.Event{
 			EventType: "oauth.user_success", AgentID: "user:" + u.ID, UpstreamName: p.UpstreamName,
 			ResultSummary: p.UpstreamName + " connected (paste) as " + nonEmpty(rec.AccountLabel, "(account not named)"),
@@ -676,7 +682,7 @@ func (s *Server) oauthPaste(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	_ = s.oauth.DeletePending(r.Context(), state)
-	go s.upstreams.ReconnectAfterAuth(context.Background(), p.UpstreamName)
+	goroutines.Go(reconnectAfterAuthName, func() { s.upstreams.ReconnectAfterAuth(context.Background(), p.UpstreamName) })
 	_ = s.audit.Write(r.Context(), audit.Event{
 		EventType:     "oauth.success",
 		ResultSummary: p.UpstreamName + " (paste)",
@@ -726,7 +732,7 @@ func (s *Server) oauthDisconnect(w http.ResponseWriter, r *http.Request, name st
 		EventType:     "oauth.disconnect",
 		ResultSummary: name,
 	})
-	go s.upstreams.ReconnectAfterAuth(context.Background(), name)
+	goroutines.Go(reconnectAfterAuthName, func() { s.upstreams.ReconnectAfterAuth(context.Background(), name) })
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 
@@ -774,7 +780,7 @@ func (s *Server) oauthPAT(w http.ResponseWriter, r *http.Request, name string) {
 		EventType:     "oauth.pat",
 		ResultSummary: name,
 	})
-	go s.upstreams.ReconnectAfterAuth(context.Background(), name)
+	goroutines.Go(reconnectAfterAuthName, func() { s.upstreams.ReconnectAfterAuth(context.Background(), name) })
 	writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 }
 

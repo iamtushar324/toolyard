@@ -25,10 +25,16 @@ COPY --from=build /out/toolyard /usr/local/bin/toolyard
 USER toolyard
 WORKDIR /var/lib/toolyard
 ENV TOOLYARD_DATA_DIR=/var/lib/toolyard/data
+# Key files (identity.key, oauth.key, secrets.key, session.key) and an
+# optional toolyard.env are read from Docker secrets here first, then from
+# the data directory. See docs/self-hosting.md, "Keys and credentials".
+ENV TOOLYARD_CREDENTIALS_DIR=/run/secrets
 
 EXPOSE 8787
-HEALTHCHECK --interval=30s --timeout=3s --start-period=10s \
-  CMD wget -q -O- http://localhost:8787/v1/health || exit 1
+# The image has no curl or wget: the binary checks its own readiness probe
+# (exit 0 when /v1/readyz reports "ready", 1 otherwise; 3 s timeout).
+HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
+  CMD ["/usr/local/bin/toolyard", "healthcheck", "-url", "http://127.0.0.1:8787/v1/readyz", "-expect", "ready"]
 
 ENTRYPOINT ["/usr/local/bin/toolyard"]
 CMD ["serve", "-addr", ":8787", "-data", "/var/lib/toolyard/data"]

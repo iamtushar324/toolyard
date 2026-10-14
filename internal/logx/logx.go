@@ -21,6 +21,8 @@ import (
 	"os"
 	"strings"
 	"sync"
+
+	"github.com/tusharbhardwaj/toolyard/internal/opsmetrics"
 )
 
 type Format string
@@ -47,6 +49,8 @@ func Init(format Format, level slog.Level) *slog.Logger {
 	default:
 		handler = slog.NewJSONHandler(out, opts)
 	}
+	// Every record that passes the level filter is counted by level.
+	handler = countingHandler{next: handler, count: opsmetrics.IncLogRecord}
 	lg := slog.New(handler)
 	slog.SetDefault(lg)
 	defaultLogger.Store(lg)
@@ -72,8 +76,12 @@ func For(component string) *slog.Logger {
 
 // Bridge routes stdlib `log` package output through slog so legacy
 // `log.Printf("...")` callers end up in the same stream during the
-// migration. Each stdlib log line becomes a single slog Info event with
-// component=legacy and the raw message in the "msg" field.
+// migration. Each stdlib log line becomes a single slog event with
+// component=legacy and the message in the "msg" field. Its level comes
+// from the line (bridgeLevel): a leading "ERROR:", "WARN:" or "INFO:" is
+// stripped and sets the level; otherwise a line that names an error,
+// failure or panic is ERROR, one that names a warning or deprecation is
+// WARN, and anything else is INFO. The configured level applies as usual.
 //
 // Returns an io.Writer; callers wire it via log.SetOutput(bridgeWriter).
 // We do NOT clear stdlib log flags — leave that to the caller so they can
@@ -98,11 +106,120 @@ func (b *bridgeWriter) Write(p []byte) (int, error) {
 			break
 		}
 		line := strings.TrimRight(string(b.buf.Next(i+1)), "\n")
-		if line != "" {
-			b.lg.LogAttrs(context.Background(), slog.LevelInfo, line)
+		if line == "" {
+			continue
+		}
+		level, msg := bridgeLevel(line)
+		if msg != "" {
+			b.lg.LogAttrs(context.Background(), level, msg)
 		}
 	}
 	return len(p), nil
+}
+
+// bridgePrefixes are the explicit level prefixes a legacy line may start
+// with (case-insensitive). Longer prefixes come first.
+var bridgePrefixes = []struct {
+	prefix string
+	level  slog.Level
+}{
+	{"WARNING:", slog.LevelWarn},
+	{"ERROR:", slog.LevelError},
+	{"WARN:", slog.LevelWarn},
+	{"INFO:", slog.LevelInfo},
+}
+
+// Words that classify a legacy line without an explicit prefix. They match
+// as whole words only (see hasWord), so "error_rate" or "terrorist" do not.
+var (
+	bridgeErrorWords = []string{"error", "errors", "failed", "panic", "panics", "panicked"}
+	bridgeWarnWords  = []string{"warn", "warning", "warnings", "deprecated"}
+)
+
+// bridgeLevel returns the level of one legacy log line and the message to
+// log, with any leading level prefix removed.
+func bridgeLevel(line string) (slog.Level, string) {
+	trimmed := strings.TrimLeft(line, " \t")
+	for _, p := range bridgePrefixes {
+		if len(trimmed) >= len(p.prefix) && strings.EqualFold(trimmed[:len(p.prefix)], p.prefix) {
+			return p.level, strings.TrimLeft(trimmed[len(p.prefix):], " \t")
+		}
+	}
+	lower := strings.ToLower(line)
+	switch {
+	case hasWord(lower, bridgeErrorWords):
+		return slog.LevelError, line
+	case hasWord(lower, bridgeWarnWords):
+		return slog.LevelWarn, line
+	}
+	return slog.LevelInfo, line
+}
+
+// hasWord reports whether s (lower case) contains one of words as a whole
+// word: the bytes on both sides are not letters, digits or '_'.
+func hasWord(s string, words []string) bool {
+	for _, w := range words {
+		for i := 0; i < len(s); {
+			j := strings.Index(s[i:], w)
+			if j < 0 {
+				break
+			}
+			start := i + j
+			end := start + len(w)
+			if (start == 0 || !isWordByte(s[start-1])) && (end == len(s) || !isWordByte(s[end])) {
+				return true
+			}
+			i = start + 1
+		}
+	}
+	return false
+}
+
+func isWordByte(c byte) bool {
+	return c == '_' || (c >= '0' && c <= '9') || (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')
+}
+
+// ---- record counter ---------------------------------------------------------
+
+// countingHandler counts each record its inner handler is asked to write,
+// by level, before passing it on. slog only calls Handle for records that
+// pass Enabled, so the count respects the configured level.
+type countingHandler struct {
+	next  slog.Handler
+	count func(level string)
+}
+
+func (h countingHandler) Enabled(ctx context.Context, l slog.Level) bool {
+	return h.next.Enabled(ctx, l)
+}
+
+func (h countingHandler) Handle(ctx context.Context, r slog.Record) error {
+	if h.count != nil {
+		h.count(levelLabel(r.Level))
+	}
+	return h.next.Handle(ctx, r)
+}
+
+func (h countingHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
+	return countingHandler{next: h.next.WithAttrs(attrs), count: h.count}
+}
+
+func (h countingHandler) WithGroup(name string) slog.Handler {
+	return countingHandler{next: h.next.WithGroup(name), count: h.count}
+}
+
+// levelLabel maps a slog level to one of four fixed metric labels.
+func levelLabel(l slog.Level) string {
+	switch {
+	case l < slog.LevelInfo:
+		return "debug"
+	case l < slog.LevelWarn:
+		return "info"
+	case l < slog.LevelError:
+		return "warn"
+	default:
+		return "error"
+	}
 }
 
 // RingSnapshot returns up to the last N log lines as a single string. Used

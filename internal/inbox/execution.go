@@ -6,6 +6,8 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+
+	"github.com/tusharbhardwaj/toolyard/internal/opsmetrics"
 )
 
 const (
@@ -76,5 +78,29 @@ func (s *Service) RecoverExecutions(ctx context.Context) (int64, error) {
 	if err != nil {
 		return 0, err
 	}
-	return res.RowsAffected()
+	n, err := res.RowsAffected()
+	for i := int64(0); i < n; i++ {
+		opsmetrics.IncOutcomeUnknown("inbox", "startup_recovery")
+	}
+	return n, err
+}
+
+// RunningExecutions returns the grant ids of executions that have a claim
+// and no outcome yet. Shutdown names them when they outlive the drain
+// deadline; the next start records them outcome_unknown.
+func (s *Service) RunningExecutions(ctx context.Context) ([]string, error) {
+	rows, err := s.db.QueryContext(ctx, `SELECT grant_id FROM inbox_executions WHERE state=? ORDER BY started_at`, ExecutionRunning)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
 }

@@ -23,15 +23,19 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"log"
+	"runtime/debug"
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
 
 	"github.com/tusharbhardwaj/toolyard/internal/actor"
+	"github.com/tusharbhardwaj/toolyard/internal/goroutines"
+	"github.com/tusharbhardwaj/toolyard/internal/logx"
+	"github.com/tusharbhardwaj/toolyard/internal/opsmetrics"
 	"github.com/tusharbhardwaj/toolyard/internal/store"
 )
 
@@ -48,6 +52,19 @@ const (
 	// upper bound that's still bounded enough to not pile up rows
 	// indefinitely. Override per-process via Bus.SetTTL.
 	DefaultTTL = 3 * time.Hour
+
+	// SweeperLoop names the expiry sweeper (RunSweeper) in the supervised
+	// loop and the loop-last-success metric.
+	SweeperLoop = "approval-sweeper"
+	// notifierLoop and executorLoop name recovered panics in the
+	// goroutine panic counter.
+	notifierLoop = "approval-notifier"
+	executorLoop = "approval-executor"
+	// notifierTimeout bounds one notifier call (audit row, push, chat).
+	notifierTimeout = 10 * time.Second
+	// recordTimeout bounds writing an executor's outcome after its context
+	// ended (a panic, or the drain deadline).
+	recordTimeout = 5 * time.Second
 )
 
 var (
@@ -160,12 +177,26 @@ type Bus struct {
 	auto AutoApprover
 	exec Executor
 
-	// bgCtx is the long-lived context used for background work the bus
-	// initiates itself (auto-execute on approve, recovery sweep on
-	// startup). The dashboard's Decide() returns the moment the human's
-	// tap is persisted; the actual tool dispatch runs on bgCtx so the
-	// HTTP request finishing doesn't cancel the executor.
-	bgCtx context.Context
+	// execCtx is the context executors run on (auto-execute on approve,
+	// recovery sweep on startup). The dashboard's Decide() returns the
+	// moment the human's tap is persisted; the actual tool dispatch runs
+	// on execCtx so the HTTP request finishing doesn't cancel the
+	// executor. It keeps the values of the context given to New but not
+	// its cancellation: cancelling the root context at shutdown must not
+	// abort a write in flight. Only WaitExecutions cancels it, at the
+	// drain deadline.
+	execCtx    context.Context
+	execCancel context.CancelFunc
+	// execs tracks running executors by approval id; notifies tracks
+	// running notifier calls. Shutdown waits for both.
+	execs    goroutines.Tracker
+	notifies goroutines.Tracker
+	// draining refuses new executor claims (BeginDrain). drainCh is
+	// closed by ReleaseWaiters and ends in-line Hold waits.
+	draining atomic.Bool
+	drainMu  sync.Mutex
+	drainCh  chan struct{}
+	released bool
 	// LegacyDecision redirects compatibility writes through the sole Inbox ledger.
 	LegacyDecision func(context.Context, string, string, actor.Decider) (*Request, error)
 }
@@ -185,19 +216,22 @@ func New(ctx context.Context, db *store.DB) (*Bus, error) {
 	if err != nil {
 		return nil, err
 	}
+	execCtx, execCancel := context.WithCancel(context.WithoutCancel(ctx))
 	return &Bus{
-		db:        db,
-		signKey:   priv,
-		verifyKey: pub,
-		ttl:       DefaultTTL,
-		waiters:   map[string]*pending{},
-		bgCtx:     ctx,
+		db:         db,
+		signKey:    priv,
+		verifyKey:  pub,
+		ttl:        DefaultTTL,
+		waiters:    map[string]*pending{},
+		execCtx:    execCtx,
+		execCancel: execCancel,
+		execs:      goroutines.Tracker{Executions: true},
 	}, nil
 }
 
 // SetExecutor installs the auto-execute hook. With one set, bus.Decide
 // flipping a request to "allowed" spawns a background goroutine that
-// invokes Executor.Execute (with bgCtx). The executor must call
+// invokes Executor.Execute (with execCtx). The executor must call
 // SetResult to persist the outcome. Pass nil to fall back to the legacy
 // behaviour where the agent re-calls the original tool with
 // _approval_id to drive execution.
@@ -280,6 +314,10 @@ func (b *Bus) Hold(ctx context.Context, in NewRequest, maxWait time.Duration) (*
 	case <-timer.C:
 		return b.Get(ctx, req.ID)
 	case <-ctx.Done():
+		return b.Get(ctx, req.ID)
+	case <-b.drainChan():
+		// Shutdown: answer with the request as it stands (usually still
+		// pending, so the caller gets the deferred envelope).
 		return b.Get(ctx, req.ID)
 	}
 }
@@ -632,17 +670,13 @@ func (b *Bus) decide(ctx context.Context, id, action string, d actor.Decider, ru
 	}
 	b.fanOut(ctx, req, "approval.decide")
 	if action == StatusAllowed && runExec && b.exec != nil {
-		go b.runExecutor(req)
+		b.startExecutor(req)
 		return req, nil
 	}
 	b.signal(id)
 	return req, nil
 }
 
-// runExecutor invokes the registered executor on the bus's bgCtx,
-// recovers from a panicking executor, and records a generic execution
-// failure if the executor disappears mid-flight without persisting a
-// result.
 // DispatchCommitted releases a legacy decision committed by Inbox.
 func (b *Bus) DispatchCommitted(ctx context.Context, id string) {
 	req, err := b.Get(ctx, id)
@@ -651,15 +685,38 @@ func (b *Bus) DispatchCommitted(ctx context.Context, id string) {
 	}
 	b.fanOut(ctx, req, "approval.decide")
 	if req.Status == StatusAllowed && b.exec != nil {
-		go b.runExecutor(req)
+		b.startExecutor(req)
 	} else {
 		b.signal(id)
 	}
 }
+
+// startExecutor runs the executor for an allowed request on a goroutine
+// of its own, tracked so shutdown can wait for it. During a drain it is
+// refused before the execution claim: the request stays allowed and
+// unclaimed, so the next process's SweepUnexecuted runs it exactly once.
+func (b *Bus) startExecutor(req *Request) {
+	if b.draining.Load() {
+		opsmetrics.IncToolCall("refused_draining")
+		logx.For("approval").Warn("legacy execution deferred to the next start: server restarting",
+			"approval_id", req.ID, "tool", req.ToolName, "upstream", req.UpstreamName)
+		return
+	}
+	done := b.execs.Add(req.ID)
+	go func() {
+		defer done()
+		b.runExecutor(req)
+	}()
+}
+
+// runExecutor claims the request, invokes the registered executor on
+// execCtx, recovers from a panicking executor, and records an
+// outcome_unknown result if the executor returns without persisting one.
 func (b *Bus) runExecutor(req *Request) {
-	res, err := b.db.ExecContext(b.bgCtx, `INSERT INTO legacy_execution_claims(request_id,state,claimed_at) VALUES(?,'running',?) ON CONFLICT(request_id) DO NOTHING`, req.ID, time.Now().UnixMilli())
+	lg := logx.For("approval")
+	res, err := b.db.ExecContext(b.execCtx, `INSERT INTO legacy_execution_claims(request_id,state,claimed_at) VALUES(?,'running',?) ON CONFLICT(request_id) DO NOTHING`, req.ID, time.Now().UnixMilli())
 	if err != nil {
-		log.Printf("legacy execution claim %s: %v", req.ID, err)
+		lg.Error("legacy execution claim failed", "approval_id", req.ID, "err", err.Error())
 		return
 	}
 	n, err := res.RowsAffected()
@@ -672,23 +729,96 @@ func (b *Bus) runExecutor(req *Request) {
 	// persisting a result. Either way we record a terminal result so
 	// pollers don't spin forever. SetResult is gated on
 	// result_executed_at IS NULL, so when the executor DID persist these
-	// are no-ops.
+	// are no-ops. The writes use a context that outlives execCtx, so an
+	// executor cancelled at the drain deadline still gets its record.
 	defer func() {
+		rctx, cancel := context.WithTimeout(context.WithoutCancel(b.execCtx), recordTimeout)
+		defer cancel()
 		if r := recover(); r != nil {
-			log.Printf("approval executor: panic on %s: %v", req.ID, r)
-			if err := b.SetResultState(b.bgCtx, req.ID, "", true, fmt.Sprintf("executor panic: %v", r), "outcome_unknown"); err != nil {
-				log.Printf("approval executor: persist panic result %s: %v", req.ID, err)
+			opsmetrics.IncGoroutinePanic(executorLoop)
+			lg.Error("legacy executor panic", "approval_id", req.ID, "tool", req.ToolName,
+				"panic", fmt.Sprint(r), "stack", string(debug.Stack()))
+			if err := b.SetResultState(rctx, req.ID, "", true, fmt.Sprintf("executor panic: %v", r), "outcome_unknown"); err != nil {
+				lg.Error("legacy executor: persist panic result failed", "approval_id", req.ID, "err", err.Error())
 			}
 			return
 		}
-		cur, err := b.Get(b.bgCtx, req.ID)
+		cur, err := b.Get(rctx, req.ID)
 		if err == nil && cur.Status == StatusAllowed && cur.ResultExecutedAt == 0 {
-			if serr := b.SetResultState(b.bgCtx, req.ID, "", true, "executor returned without persisting result", "outcome_unknown"); serr != nil {
-				log.Printf("approval executor: persist fallback result %s: %v", req.ID, serr)
+			reason := "executor returned without persisting result"
+			if b.execCtx.Err() != nil {
+				reason = "server stopped at the drain deadline while the call ran; outcome unknown, do not repeat"
+			}
+			if serr := b.SetResultState(rctx, req.ID, "", true, reason, "outcome_unknown"); serr != nil {
+				lg.Error("legacy executor: persist fallback result failed", "approval_id", req.ID, "err", serr.Error())
 			}
 		}
 	}()
-	b.exec.Execute(b.bgCtx, req)
+	b.exec.Execute(b.execCtx, req)
+}
+
+// BeginDrain refuses new executor claims: a request allowed from now on
+// stays unclaimed and runs once in the next process (SweepUnexecuted).
+// Executors already running continue.
+func (b *Bus) BeginDrain() { b.draining.Store(true) }
+
+// Draining reports whether BeginDrain was called.
+func (b *Bus) Draining() bool { return b.draining.Load() }
+
+// ReleaseWaiters ends in-line Hold waits; their callers get the request as
+// it stands. Safe to call more than once.
+func (b *Bus) ReleaseWaiters() {
+	b.drainMu.Lock()
+	defer b.drainMu.Unlock()
+	if b.drainCh == nil {
+		b.drainCh = make(chan struct{})
+	}
+	if !b.released {
+		b.released = true
+		close(b.drainCh)
+	}
+}
+
+func (b *Bus) drainChan() <-chan struct{} {
+	b.drainMu.Lock()
+	defer b.drainMu.Unlock()
+	if b.drainCh == nil {
+		b.drainCh = make(chan struct{})
+	}
+	return b.drainCh
+}
+
+// WaitExecutions waits for running executors until ctx ends (the drain
+// deadline). An executor still running then is logged at ERROR by id and
+// counted as outcome_unknown, and execCtx is cancelled so its dispatch
+// stops; the usual path then records it outcome_unknown, with up to grace
+// to do so. Notifier calls (audit rows for those outcomes) get the rest of
+// ctx, or grace once ctx has ended. It returns the ids of the executors
+// that were still running at the deadline.
+func (b *Bus) WaitExecutions(ctx context.Context, grace time.Duration) []string {
+	lg := logx.For("approval")
+	left := b.execs.Wait(ctx)
+	for _, id := range left {
+		lg.Error("legacy execution still running at the drain deadline; cancelling it, outcome unknown", "approval_id", id)
+		opsmetrics.IncOutcomeUnknown("legacy", "shutdown_deadline")
+	}
+	b.execCancel()
+	gctx, cancel := context.WithTimeout(context.Background(), grace)
+	defer cancel()
+	if len(left) > 0 {
+		if still := b.execs.Wait(gctx); len(still) > 0 {
+			lg.Error("legacy executions did not record an outcome before exit; startup recovery marks them outcome_unknown",
+				"approval_ids", still)
+		}
+	}
+	nctx := ctx
+	if ctx.Err() != nil {
+		nctx = gctx
+	}
+	if pending := b.notifies.Wait(nctx); len(pending) > 0 {
+		lg.Warn("approval notifiers still running at exit", "count", len(pending))
+	}
+	return left
 }
 
 // SetResult persists the executed tool's outcome and wakes any pollers
@@ -762,6 +892,7 @@ func (b *Bus) SweepUnexecuted(ctx context.Context) (int, error) {
 		if e = b.SetResultState(ctx, id, "", true, "Legacy write outcome is unknown; inspect upstream state and do not repeat", "outcome_unknown"); e != nil {
 			return 0, e
 		}
+		opsmetrics.IncOutcomeUnknown("legacy", "startup_recovery")
 	}
 
 	if b.exec == nil {
@@ -788,7 +919,7 @@ func (b *Bus) SweepUnexecuted(ctx context.Context) (int, error) {
 		return 0, err
 	}
 	for _, req := range pending {
-		go b.runExecutor(req)
+		b.startExecutor(req)
 	}
 	return len(pending), nil
 }
@@ -1082,9 +1213,14 @@ func (b *Bus) RunSweeper(ctx context.Context, interval time.Duration) {
 			return
 		case <-t.C:
 			if n, err := b.SweepExpired(ctx); err != nil {
-				log.Printf("approval sweep: %v", err)
-			} else if n > 0 {
-				log.Printf("approval sweep: expired %d", n)
+				if ctx.Err() == nil {
+					logx.For("approval").Error("approval sweep failed", "err", err.Error())
+				}
+			} else {
+				opsmetrics.SetLoopLastSuccess(SweeperLoop, time.Now())
+				if n > 0 {
+					logx.For("approval").Info("approval sweep expired requests", "count", n)
+				}
 			}
 		}
 	}
@@ -1104,13 +1240,21 @@ func (b *Bus) signal(id string) {
 	}
 }
 
+// fanOut calls every notifier on a goroutine of its own. A notifier gets
+// the caller's context values without its cancellation (a dashboard click
+// returns before the audit row, push and chat message are written),
+// bounded by notifierTimeout. A panic is recovered, logged at ERROR and
+// counted. Shutdown waits for running notifiers (WaitExecutions).
 func (b *Bus) fanOut(ctx context.Context, req *Request, eventType string) {
+	base := context.WithoutCancel(ctx)
 	for _, n := range b.notifiers {
-		// Decouple from caller's context cancellation; we always want to publish.
-		go func(n Notifier) {
-			defer func() { _ = recover() }()
-			n.OnApproval(ctx, req, eventType)
-		}(n)
+		done := b.notifies.Add(eventType)
+		goroutines.Go(notifierLoop, func() {
+			defer done()
+			nctx, cancel := context.WithTimeout(base, notifierTimeout)
+			defer cancel()
+			n.OnApproval(nctx, req, eventType)
+		})
 	}
 }
 

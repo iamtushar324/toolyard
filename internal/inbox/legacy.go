@@ -4,14 +4,45 @@ import (
 	"context"
 	"database/sql"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"github.com/tusharbhardwaj/toolyard/internal/actor"
 	"strings"
+	"time"
+
+	"github.com/tusharbhardwaj/toolyard/internal/actor"
+	"github.com/tusharbhardwaj/toolyard/internal/logx"
+	"github.com/tusharbhardwaj/toolyard/internal/opsmetrics"
 )
+
+// LegacySkipError reports legacy approvals SyncLegacy could not represent
+// in Inbox (unreadable arguments, an unreadable Inbox copy, an ID used by a
+// non-legacy request). SyncLegacy committed every other row; skipped rows
+// are tried again on every later sync.
+type LegacySkipError struct {
+	IDs  []string
+	Errs []error // one per ID, same order
+}
+
+func (e *LegacySkipError) Error() string {
+	msg := fmt.Sprintf("legacy Inbox sync skipped %d malformed row(s): %s", len(e.IDs), strings.Join(e.IDs, ", "))
+	if len(e.Errs) > 0 {
+		msg += " (first: " + e.Errs[0].Error() + ")"
+	}
+	return msg
+}
+
+func (e *LegacySkipError) add(id string, err error) {
+	e.IDs = append(e.IDs, id)
+	e.Errs = append(e.Errs, err)
+}
 
 // SyncLegacy represents the original approvals, including history, in the only
 // human decision interface. Original IDs, actors, deadlines and arguments stay
 // intact. Missing historical explanations remain missing, never invented.
+//
+// A malformed row is skipped, not fatal: every other row is committed and
+// the skipped IDs come back in a *LegacySkipError. Database errors still
+// abort the whole sync.
 func (s *Service) SyncLegacy(ctx context.Context) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -26,6 +57,7 @@ func (s *Service) SyncLegacy(ctx context.Context) error {
 		return err
 	}
 	var imported []Request
+	var skipped LegacySkipError
 	for rows.Next() {
 		var r Request
 		var upstream, tool, args, reason, status, resultError string
@@ -57,9 +89,9 @@ func (s *Service) SyncLegacy(ctx context.Context) error {
 		var raw map[string]any
 		decoder := json.NewDecoder(strings.NewReader(args))
 		decoder.UseNumber()
-		if err = decoder.Decode(&raw); err != nil {
-			rows.Close()
-			return fmt.Errorf("legacy %s arguments: %w", r.ID, err)
+		if derr := decoder.Decode(&raw); derr != nil {
+			skipped.add(r.ID, fmt.Errorf("legacy %s arguments: %w", r.ID, derr))
+			continue
 		}
 		params := map[string]Constraint{}
 		for k, v := range raw {
@@ -100,10 +132,12 @@ func (s *Service) SyncLegacy(ctx context.Context) error {
 		if e == nil {
 			var prev Request
 			if e = json.Unmarshal([]byte(existing), &prev); e != nil {
-				return e
+				skipped.add(r.ID, fmt.Errorf("legacy %s: unreadable Inbox copy: %w", r.ID, e))
+				continue
 			}
 			if prev.ExecutionMode != "legacy" {
-				return fmt.Errorf("legacy ID collision: %s", r.ID)
+				skipped.add(r.ID, fmt.Errorf("legacy ID collision: %s", r.ID))
+				continue
 			}
 			// Preserve the submitted reasons, notes and decision revision from Inbox.
 			r.DeciderUserID = prev.DeciderUserID
@@ -129,7 +163,75 @@ func (s *Service) SyncLegacy(ctx context.Context) error {
 			return e
 		}
 	}
-	return tx.Commit()
+	if err = tx.Commit(); err != nil {
+		return err
+	}
+	if len(skipped.IDs) > 0 {
+		return &skipped
+	}
+	return nil
+}
+
+// RequestLegacySync asks RunLegacySync for a pass soon. It never blocks:
+// requests made before the next pass starts coalesce into that one pass.
+func (s *Service) RequestLegacySync() {
+	select {
+	case s.legacySync <- struct{}{}:
+	default:
+	}
+}
+
+// RunLegacySync runs LegacySyncPass on a RequestLegacySync signal or every
+// interval, one pass at a time, until ctx is done.
+func (s *Service) RunLegacySync(ctx context.Context, every time.Duration) {
+	if every <= 0 {
+		every = LegacySyncInterval
+	}
+	t := time.NewTicker(every)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-s.legacySync:
+		case <-t.C:
+		}
+		_ = s.LegacySyncPass(ctx)
+	}
+}
+
+// legacySkipLogMax caps how many skipped IDs one log line names.
+const legacySkipLogMax = 20
+
+// LegacySyncPass runs SyncLegacy once and reports the outcome: the success
+// time when it was clean; an ERROR line and the failure counter when it
+// failed or skipped rows. The caller continues either way.
+func (s *Service) LegacySyncPass(ctx context.Context) error {
+	s.legacyPasses.Add(1)
+	err := s.SyncLegacy(ctx)
+	lg := logx.For("inbox")
+	var skip *LegacySkipError
+	switch {
+	case err == nil:
+		now := time.Now()
+		opsmetrics.SetLegacySyncSuccess(now)
+		opsmetrics.SetLoopLastSuccess(LegacySyncLoop, now)
+	case errors.As(err, &skip):
+		opsmetrics.IncLegacySyncFailure()
+		opsmetrics.SetLoopLastSuccess(LegacySyncLoop, time.Now())
+		ids := skip.IDs
+		if len(ids) > legacySkipLogMax {
+			ids = ids[:legacySkipLogMax]
+		}
+		lg.Error("legacy Inbox sync skipped malformed rows; every other row was committed",
+			"skipped", len(skip.IDs), "approval_ids", ids, "first_error", skip.Errs[0].Error())
+	case ctx.Err() != nil:
+		// Shutdown cancelled the pass; the next process syncs at start.
+	default:
+		opsmetrics.IncLegacySyncFailure()
+		lg.Error("legacy Inbox sync failed", "err", err.Error())
+	}
+	return err
 }
 
 func (s *Service) legacyDecisionTx(ctx context.Context, tx *sql.Tx, r *Request) error {
@@ -165,7 +267,12 @@ func (s *Service) DecideLegacy(ctx context.Context, id, action string, d actor.D
 		return nil, ErrBadDecision
 	}
 	if err := s.SyncLegacy(ctx); err != nil {
-		return nil, err
+		// Skipped rows do not block the others; a skipped id reads as
+		// not found below.
+		var skip *LegacySkipError
+		if !errors.As(err, &skip) {
+			return nil, err
+		}
 	}
 	r, err := s.Get(ctx, id)
 	if err != nil {

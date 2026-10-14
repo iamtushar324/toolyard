@@ -45,7 +45,8 @@
 #   NOTES_DIR=/path          Override the notes directory (default
 #                            $DATA_DIR/notes — lives inside the data root
 #                            so existing backups capture it).
-#   --import-from <dir>      copy existing toolyard.db + session.key from <dir>.
+#   --import-from <dir>      copy existing toolyard.db and its four key files
+#                            (identity, oauth, secrets, session) from <dir>.
 #   --mempalace <mode>       same as MEMPALACE env var.
 #   --notes <mode>           same as NOTES env var.
 #
@@ -384,9 +385,17 @@ if [[ -n "$IMPORT_FROM" ]]; then
   if [[ -f "$IMPORT_FROM/toolyard.db" ]]; then
     say "importing existing data from $IMPORT_FROM"
     cp -a "$IMPORT_FROM/toolyard.db" "$DATA_DIR/toolyard.db"
-    [[ -f "$IMPORT_FROM/session.key" ]]   && cp -a "$IMPORT_FROM/session.key"   "$DATA_DIR/session.key"
     [[ -f "$IMPORT_FROM/lake.duckdb" ]]   && cp -a "$IMPORT_FROM/lake.duckdb"   "$DATA_DIR/lake.duckdb"
-    [[ -f "$IMPORT_FROM/oauth.key" ]]     && cp -a "$IMPORT_FROM/oauth.key"     "$DATA_DIR/oauth.key"
+    # Every master key the database was sealed with. toolyard refuses to
+    # start when a key its data needs is missing (it never creates one for
+    # a database in use), so copy all four.
+    for key in identity.key oauth.key secrets.key session.key; do
+      if [[ -f "$IMPORT_FROM/$key" ]]; then
+        cp -a "$IMPORT_FROM/$key" "$DATA_DIR/$key"
+      else
+        echo "warning: no $key at $IMPORT_FROM; toolyard keys-check will say whether the start needs it" >&2
+      fi
+    done
     chown -R "$USER_NAME":"$USER_NAME" "$DATA_DIR"
   else
     echo "warning: no toolyard.db at $IMPORT_FROM; skipping import" >&2
@@ -485,9 +494,11 @@ Environment=HOME=$DATA_DIR
 Environment=GOMEMLIMIT=200MiB
 Environment=GOGC=50
 
-# Restart on crash with backoff.
+# Restart on crash with backoff. Exit code 78 is a master key or credential
+# problem (missing, unreadable or wrong): a restart cannot fix it.
 Restart=on-failure
 RestartSec=5
+RestartPreventExitStatus=78
 StartLimitIntervalSec=60
 StartLimitBurst=10
 
@@ -522,9 +533,10 @@ TasksMax=1024
 MemoryMax=1536M
 MemoryHigh=1280M
 
-# Graceful stop: SIGINT triggers context cancel + 5s drain in main.go.
+# Graceful stop: SIGINT starts the ordered drain; in-flight work has up to
+# -drain-timeout (60s), then bounded closes (~10s). Keep this above both.
 KillSignal=SIGINT
-TimeoutStopSec=10s
+TimeoutStopSec=75s
 
 [Install]
 WantedBy=multi-user.target

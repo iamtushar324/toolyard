@@ -5,12 +5,13 @@
 //	toolyard serve      run the gateway (stdio MCP + HTTP API + dashboard)
 //	toolyard exchange   exchange an enrollment code for a long-lived agent token
 //	toolyard probe      dry-run a tool against an upstream MCP server
+//	toolyard healthcheck  check a liveness or readiness probe (container HEALTHCHECK)
+//	toolyard keys-check   read-only check that every master key would load
 //	toolyard version    print version
 package main
 
 import (
 	"context"
-	"crypto/rand"
 	"crypto/sha256"
 	"encoding/base64"
 	"encoding/json"
@@ -57,6 +58,7 @@ import (
 	"github.com/tusharbhardwaj/toolyard/internal/identity"
 	"github.com/tusharbhardwaj/toolyard/internal/identitykeys"
 	"github.com/tusharbhardwaj/toolyard/internal/inbox"
+	"github.com/tusharbhardwaj/toolyard/internal/keyguard"
 	"github.com/tusharbhardwaj/toolyard/internal/lake"
 	"github.com/tusharbhardwaj/toolyard/internal/logx"
 	"github.com/tusharbhardwaj/toolyard/internal/memory"
@@ -65,6 +67,8 @@ import (
 	"github.com/tusharbhardwaj/toolyard/internal/metrics"
 	notespkg "github.com/tusharbhardwaj/toolyard/internal/notes"
 	"github.com/tusharbhardwaj/toolyard/internal/oauth"
+	"github.com/tusharbhardwaj/toolyard/internal/ops"
+	"github.com/tusharbhardwaj/toolyard/internal/opsmetrics"
 	"github.com/tusharbhardwaj/toolyard/internal/passkey"
 	"github.com/tusharbhardwaj/toolyard/internal/policy"
 	"github.com/tusharbhardwaj/toolyard/internal/pricing"
@@ -119,6 +123,10 @@ func main() {
 		err = runLake(args)
 	case "operator-token":
 		err = runOperatorToken(args)
+	case "healthcheck":
+		err = runHealthcheck(args)
+	case "keys-check":
+		err = runKeysCheck(args)
 	case "version", "-v", "--version":
 		fmt.Println("toolyard", version)
 	case "help", "-h", "--help":
@@ -130,6 +138,11 @@ func main() {
 	}
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
+		if errors.Is(err, keyguard.ErrConfig) {
+			// EX_CONFIG: a key or credential is missing, unreadable or
+			// wrong. Restarting will not help (RestartPreventExitStatus=78).
+			os.Exit(78)
+		}
 		os.Exit(1)
 	}
 }
@@ -157,11 +170,20 @@ func loadDotenv() {
 // as is Clerk without -public-url — a Clerk session token is accepted only
 // when its azp claim is the dashboard's own origin. Returns the client (nil
 // when off) and the instance's Frontend API host for the login-page CSP.
+// Each variable may instead name a file in <NAME>_FILE (Docker and systemd
+// secrets); setting both is an error.
 func clerkFromEnv(publicURL, ownerEmail string, ownerOnly bool) (*clerk.Client, string, error) {
 	vars := []struct{ key, val string }{
-		{"TOOLYARD_CLERK_SECRET_KEY", strings.TrimSpace(os.Getenv("TOOLYARD_CLERK_SECRET_KEY"))},
-		{"TOOLYARD_CLERK_PUBLISHABLE_KEY", strings.TrimSpace(os.Getenv("TOOLYARD_CLERK_PUBLISHABLE_KEY"))},
-		{"TOOLYARD_CLERK_ORGANIZATION_ID", strings.TrimSpace(os.Getenv("TOOLYARD_CLERK_ORGANIZATION_ID"))},
+		{key: "TOOLYARD_CLERK_SECRET_KEY"},
+		{key: "TOOLYARD_CLERK_PUBLISHABLE_KEY"},
+		{key: "TOOLYARD_CLERK_ORGANIZATION_ID"},
+	}
+	for i := range vars {
+		v, err := keyguard.EnvOrFile(vars[i].key)
+		if err != nil {
+			return nil, "", fmt.Errorf("clerk: %w", err)
+		}
+		vars[i].val = v
 	}
 	var missing []string
 	for _, v := range vars {
@@ -230,6 +252,8 @@ Commands:
   probe       dry-run a tool against an upstream MCP server
   lake        manage the personal data lake (backup | tables)
   operator-token  create | list | revoke CLI operator tokens (local, from -data)
+  healthcheck check a probe: -url <probe URL> -expect ready|live (exit 0 or 1)
+  keys-check  read-only check that every master key would load: -data <dir> [-credentials-dir <dir>] (exit 0 or 78)
   version     print version
 
 Run 'toolyard <command> -h' for command flags.`)
@@ -256,6 +280,11 @@ func runServe(argv []string) error {
 	connectAZPFlag := fs.String("connect-azp", "", "comma-separated bkt3 (T3 Code) browser origins, e.g. https://stagebkt3.dev.beknown.live, whose Clerk session tokens POST /v1/connect/t3 swaps for the person's agent token. https only (http just on loopback). Needs Clerk sign-in; must not include -public-url's origin. Empty disables the endpoint (404).")
 	clerkSyncEvery := fs.Duration("clerk-sync-interval", time.Hour, "how often to list the Clerk organisation's members and block users who left (sessions revoked, agents stopped). Only runs when the TOOLYARD_CLERK_* env vars are set.")
 	trustedProxies := fs.String("trusted-proxy", "", "comma-separated CIDRs to trust for X-Forwarded-* headers (e.g. 127.0.0.1/32,::1/128,10.0.0.0/8)")
+	// TEC-1626 keys and ops listener
+	keysFlag := fs.String("keys", string(keyguard.CreateIfFresh), "master keys: create-if-fresh (create a missing key only for a new, empty database) | require (never create; every key must be provided)")
+	credentialsDir := fs.String("credentials-dir", os.Getenv("TOOLYARD_CREDENTIALS_DIR"), "directory searched for key files (identity.key, oauth.key, secrets.key, session.key) and toolyard.env after $CREDENTIALS_DIRECTORY and before -data, e.g. /run/secrets. Defaults to $TOOLYARD_CREDENTIALS_DIR.")
+	opsAddr := fs.String("ops-addr", "", "comma-separated listen addresses for the ops listener (/metrics, /v1/livez, /v1/readyz), e.g. 127.0.0.1:9090. Empty = off. A non-private address needs -ops-token-file.")
+	opsTokenFile := fs.String("ops-token-file", "", "file holding the bearer token the ops listener requires from non-loopback peers")
 	clickhouseRuntimeEnvPath := fs.String("clickhouse-runtime-env", "/var/lib/toolyard/clickhouse-runtime.env", "path where toolyard maintains a TOOLYARD_CH_PASSWORD=... line for the toolyard-clickhouse container's docker-compose env_file to consume. Updated on bootstrap and on every rotate. Empty disables the write (useful in tests).")
 	inboxResetPasskeys := fs.Bool("inbox-reset-passkeys", false, "delete every registered passkey at startup (recovery when the owner has lost all their devices), then continue normally")
 	inboxFetchPrivate := fs.Bool("inbox-fetch-private-networks", false, "let the inbox copy attachment links that point at loopback or private-network addresses (e.g. evidence hosted on your LAN). Off by default: agent-chosen URLs could otherwise reach internal services.")
@@ -264,6 +293,9 @@ func runServe(argv []string) error {
 	noStdioUpstreams := fs.Bool("no-stdio-upstreams", false, "refuse to start any stdio (subprocess) MCP upstream. Use when the dashboard is exposed publicly so a compromised session can't spawn arbitrary commands.")
 	envDenylistFlag := fs.String("upstream-env-denylist", "LD_PRELOAD,LD_LIBRARY_PATH,DYLD_INSERT_LIBRARIES,DYLD_LIBRARY_PATH,PATH", "comma-separated env var keys forbidden in upstream stdio configs")
 	upstreamCallTimeout := fs.Duration("upstream-call-timeout", 120*time.Second, "per-tool-call deadline applied to every dispatch (built-in, fixture, and external upstreams). 0 disables the cap. Without it, a hung upstream pins a goroutine indefinitely and queues every other caller behind it.")
+	// TEC-1626 drain
+	drainDelay := fs.Duration("drain-delay", defaultDrainDelay, "on SIGTERM/SIGINT, how long readiness reports 503 (and new tool calls get a retryable refusal) before streams and waits close, so the load balancer stops sending traffic first")
+	drainTimeout := fs.Duration("drain-timeout", defaultDrainTimeout, "deadline, from the start of the drain (delay included), for open HTTP requests and in-flight executions to finish. Work still running then is cancelled and recorded outcome_unknown. Keep the unit's TimeoutStopSec above this plus ~10s.")
 	mempalaceFlag := fs.String("mempalace", "auto", "MemPalace integration mode: on|off|auto. auto=install via `uv tool install mempalace` if missing and proceed; on=fail boot when install fails; off=skip the integration entirely.")
 	webhookMaxBytes := fs.Int64("webhook-max-bytes", api.DefaultWebhookMaxBytes, "max body (bytes) accepted by the memory-webhook ingest endpoint (/v1/memory/webhooks/ingest). n8n transcript payloads can be large; bodies above this get a clean 413. Every other route keeps its tight cap.")
 	notesFlag := fs.String("notes", "auto", "Notes (markdown workspace) upstream mode: on|off|auto. auto=register the filesystem MCP if npx is on PATH; on=fail boot when npx missing; off=skip the integration entirely.")
@@ -327,6 +359,14 @@ func runServe(argv []string) error {
 	// vars are set (they come from the systemd EnvironmentFile or .env,
 	// never argv). A partial set, or Clerk without -public-url, refuses to
 	// start rather than run half-configured.
+	//
+	// TEC-1626: a toolyard.env in $CREDENTIALS_DIRECTORY or
+	// -credentials-dir fills variables that are still unset first.
+	if loaded, err := keyguard.LoadEnvFiles(*credentialsDir); err != nil {
+		return err
+	} else if len(loaded) > 0 {
+		log.Printf("toolyard: loaded environment from %s", strings.Join(loaded, ", "))
+	}
 	clerkClient, clerkFAPI, cerr := clerkFromEnv(*publicURL, *ownerEmail, *clerkOwnerOnly)
 	if cerr != nil {
 		return cerr
@@ -352,7 +392,10 @@ func runServe(argv []string) error {
 	if err != nil {
 		return fmt.Errorf("open db: %w", err)
 	}
-	defer db.Close()
+	// TEC-1626 drain: the ordered shutdown closes the database last
+	// (lifecycle.go); this deferred call only acts on an early return.
+	closeDB := closeOnce("database", closeTimeout, db.CloseContext)
+	defer closeDB()
 	log.Printf("toolyard: db at %s", dbPath)
 
 	ctx, cancel := context.WithCancel(context.Background())
@@ -383,7 +426,7 @@ func runServe(argv []string) error {
 	// leaves an audit row naming who raised the call and who decided it,
 	// whichever path the decision took.
 	bus.AddNotifier(auditlink.Notifier(auditSvc))
-	go bus.RunSweeper(ctx, 30*time.Second)
+	goroutines.Loop(ctx, approval.SweeperLoop, time.Minute, func(ctx context.Context) { bus.RunSweeper(ctx, 30*time.Second) })
 
 	pushSvc, err := push.New(ctx, db, *pushSubject)
 	if err != nil {
@@ -430,13 +473,21 @@ func runServe(argv []string) error {
 		}
 	})
 	// Audit log -> realtime feed.
-	go func() {
-		ch, cancel := auditSvc.Subscribe()
-		defer cancel()
-		for ev := range ch {
-			hub.Publish(realtime.Event{Type: "audit", Data: ev})
+	goroutines.Loop(ctx, loopAuditFeed, time.Minute, func(ctx context.Context) {
+		ch, unsubscribe := auditSvc.Subscribe()
+		defer unsubscribe()
+		for {
+			select {
+			case <-ctx.Done():
+				return
+			case ev, ok := <-ch:
+				if !ok {
+					return
+				}
+				hub.Publish(realtime.Event{Type: "audit", Data: ev})
+			}
 		}
-	}()
+	})
 
 	settingsSvc, err := settings.New(ctx, db)
 	if err != nil {
@@ -483,27 +534,24 @@ func runServe(argv []string) error {
 	vis := visibility.New(settingsSvc, usageSvc)
 
 	metricsRec := metrics.New(db)
-	defer func() {
-		shCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		_ = metricsRec.Close(shCtx)
-	}()
+	closeMetrics := closeOnce("metrics", closeTimeout, metricsRec.Close)
+	defer closeMetrics()
 	metricsReader := metrics.NewReader(db)
 	priceCatalog := pricing.New(filepath.Join(*dataDir, "model-prices.json"))
-	go priceCatalog.Run(ctx)
+	goroutines.Loop(ctx, loopPricing, time.Hour, priceCatalog.Run)
 
 	autoApprover := autoapproval.New(db, metricsReader, settingsSvc)
 	bus.SetAutoApprover(autoApprover)
-	go autoApprover.RunProposer(ctx, time.Hour)
-	go runSessionPurger(ctx, idSvc)
+	goroutines.Loop(ctx, loopAutoApproval, time.Hour, func(ctx context.Context) { autoApprover.RunProposer(ctx, time.Hour) })
+	goroutines.Loop(ctx, loopSessionPurger, time.Hour, func(ctx context.Context) { runSessionPurger(ctx, idSvc) })
 
 	// Background analytics jobs: anomaly detection, reason quality
 	// scoring, retention compaction. All best-effort — failures log and
 	// continue.
 	zScore := settingsSvc.GetFloat(settings.AnomalyRateZScore, 3)
-	go metrics.NewAnomalyDetector(metricsReader, zScore).RunForever(ctx)
-	go runReasonScorer(ctx, metricsReader)
-	go runRetentionCompactor(ctx, metricsReader, settingsSvc)
+	goroutines.Loop(ctx, loopAnomaly, time.Hour, metrics.NewAnomalyDetector(metricsReader, zScore).RunForever)
+	goroutines.Loop(ctx, loopReasonScorer, time.Hour, func(ctx context.Context) { runReasonScorer(ctx, metricsReader) })
+	goroutines.Loop(ctx, loopRetention, time.Hour, func(ctx context.Context) { runRetentionCompactor(ctx, metricsReader, settingsSvc) })
 
 	// Shared policy engine: the gateway evaluates with it, the API exposes
 	// CRUD on the same instance so cache updates are seen immediately.
@@ -515,16 +563,46 @@ func runServe(argv []string) error {
 	}
 	log.Printf("policy: loaded %d rules", len(policyEngine.List()))
 
+	// TEC-1626: every master key loads here, before anything uses one.
+	// Each is looked up in $CREDENTIALS_DIRECTORY, -credentials-dir, then
+	// -data, and must open its canary in this database. A missing key is
+	// created only for a new database (-keys=create-if-fresh); the session
+	// key alone may be recreated (everyone signs in again). Any key
+	// problem stops the start with exit code 78 (keyguard.ErrConfig).
+	keysMode, err := keyguard.ParseMode(*keysFlag)
+	if err != nil {
+		return err
+	}
+	masterKeys, err := keyguard.LoadAll(ctx, keyguard.Config{
+		DB:             db.DB,
+		DataDir:        *dataDir,
+		CredentialsDir: *credentialsDir,
+		Mode:           keysMode,
+	}, keyguard.ServeKeys())
+	if err != nil {
+		return err
+	}
+	ops.Default.MarkKeysVerified()
+	// Ops listener (-ops-addr): /metrics and the probes on a private
+	// address. It is up from here, so a slow start reads "starting".
+	probes := ops.NewProber(ops.Default, db.PingContext)
+	opsmetrics.SetBuildInfo(version)
+	opsmetrics.SetDBPinger(db.PingContext)
+	if _, err := ops.Listen(ops.ListenerConfig{
+		Addrs:     *opsAddr,
+		TokenFile: *opsTokenFile,
+		Handler:   ops.Mux(opsmetrics.Handler(), probes),
+	}); err != nil {
+		return err
+	}
+
 	// Per-person identity keys ("Beknown keys"). Their own identity.key
 	// (blast-radius partitioning, as oauth.key and secrets.key): the raw
 	// keys are sealed under it so they can be forwarded to upstreams that
 	// name an identity header. The gateway asks this service for the
 	// caller's key on every such call; the registry lister and the
 	// internal caller are wired below once the upstreams service exists.
-	identityKey, err := sealbox.LoadOrCreateKey(*dataDir, "identity.key")
-	if err != nil {
-		return fmt.Errorf("identity key: %w", err)
-	}
+	identityKey := masterKeys[keyguard.IdentityKey]
 	identityCipher, err := sealbox.NewCipher(identityKey)
 	if err != nil {
 		return fmt.Errorf("identity cipher: %w", err)
@@ -563,9 +641,10 @@ func runServe(argv []string) error {
 	// The kernel probe for the code-mode sandbox runs now, off the
 	// request path.
 	gw.SetCodeModeSandbox(sandboxMode)
-	go codemode.ProbeSandbox()
+	goroutines.Go(goCodemodeProbe, func() { codemode.ProbeSandbox() })
 	gw.RegisterBuiltins()
-	defer gw.Close()
+	closeGateway := closeOnce("gateway", closeTimeout, func(context.Context) error { return gw.Close() })
+	defer closeGateway()
 	identityKeysSvc.SetCaller(gw)
 	// policies.set by an agent disables a tool's learned auto-approval
 	// rule on ask/deny, as the dashboard's policy editor does.
@@ -712,9 +791,11 @@ func runServe(argv []string) error {
 	if err != nil {
 		return fmt.Errorf("inbox: %w", err)
 	}
-	if err := inboxSvc.SyncLegacy(ctx); err != nil {
-		return fmt.Errorf("legacy Inbox migration: %w", err)
-	}
+	// TEC-1626: a legacy sync problem no longer stops the start. Malformed
+	// rows are skipped and logged at ERROR, the rest is committed, and
+	// the supervised loop below tries again (LegacySyncPass logs and
+	// counts every outcome).
+	_ = inboxSvc.LegacySyncPass(ctx)
 	bus.LegacyDecision = func(ctx context.Context, id, action string, d actor.Decider) (*approval.Request, error) {
 		_, err := inboxSvc.DecideLegacy(ctx, id, action, d)
 		if err != nil {
@@ -729,12 +810,20 @@ func runServe(argv []string) error {
 		}
 		return bus.Get(ctx, id)
 	}
-	bus.AddNotifierFunc(func(ctx context.Context, _ *approval.Request, _ string) {
-		if err := inboxSvc.SyncLegacy(ctx); err != nil {
-			log.Printf("legacy Inbox sync: %v", err)
-		}
+	// Approval events only signal the one supervised sync loop: no sync
+	// on the request path, one pass at a time, signals before the next
+	// pass coalesce, and a pass every LegacySyncInterval regardless.
+	bus.AddNotifierFunc(func(context.Context, *approval.Request, string) {
+		inboxSvc.RequestLegacySync()
 	})
-	defer inboxSvc.Close(20 * time.Second)
+	goroutines.Loop(ctx, inbox.LegacySyncLoop, time.Minute, func(ctx context.Context) {
+		inboxSvc.RunLegacySync(ctx, inbox.LegacySyncInterval)
+	})
+	closeInbox := closeOnce("inbox", closeTimeout, func(context.Context) error {
+		inboxSvc.Close(closeTimeout * 3 / 4) // logs its own warning first
+		return nil
+	})
+	defer closeInbox()
 	if n := inboxSvc.RecheckUnchecked(ctx); n > 0 {
 		log.Printf("inbox: re-running background checks for %d request(s)", n)
 	}
@@ -772,10 +861,7 @@ func runServe(argv []string) error {
 	// every upstream's refresh token). The hub adapter forwards the
 	// service's small set of event names ("mcp_oauth_done", etc.) onto the
 	// dashboard's SSE feed.
-	oauthKey, err := oauth.LoadOrCreateKey(*dataDir)
-	if err != nil {
-		return fmt.Errorf("oauth key: %w", err)
-	}
+	oauthKey := masterKeys[keyguard.OAuthKey] // loaded and checked above
 	oauthCipher, err := oauth.NewCipher(oauthKey)
 	if err != nil {
 		return fmt.Errorf("oauth cipher: %w", err)
@@ -799,16 +885,13 @@ func runServe(argv []string) error {
 	if err := oauthSvc.PrimeBearers(ctx); err != nil {
 		log.Printf("oauth: prime bearers: %v", err)
 	}
-	go oauthSvc.RunRefresher(ctx)
+	goroutines.Loop(ctx, loopOAuthRefresher, time.Minute, oauthSvc.RunRefresher)
 
 	// Secrets broker. Separate secrets.key (blast-radius partitioning, same
 	// rationale as oauth.key vs session.key). Wired into upstreams so
 	// secret:// refs in env/headers resolve at dial time, never reaching
 	// agents or API responses.
-	secretsKey, err := sealbox.LoadOrCreateKey(*dataDir, "secrets.key")
-	if err != nil {
-		return fmt.Errorf("secrets key: %w", err)
-	}
+	secretsKey := masterKeys[keyguard.SecretsKey] // loaded and checked above
 	secretsCipher, err := sealbox.NewCipher(secretsKey)
 	if err != nil {
 		return fmt.Errorf("secrets cipher: %w", err)
@@ -816,9 +899,9 @@ func runServe(argv []string) error {
 	secretsSvc := secrets.New(db, secretsCipher, auditSvc)
 	callbackSvc := callbacks.New(db, secretsCipher)
 	inboxSvc.SetCallbacks(callbackSvc)
-	go inboxSvc.RunSweeper(ctx, time.Minute)
-	go inboxSvc.RunAttention(ctx, 15*time.Second)
-	go callbackSvc.Run(ctx)
+	goroutines.Loop(ctx, inbox.SweeperLoop, time.Minute, func(ctx context.Context) { inboxSvc.RunSweeper(ctx, time.Minute) })
+	goroutines.Loop(ctx, loopInboxAttention, time.Minute, func(ctx context.Context) { inboxSvc.RunAttention(ctx, 15*time.Second) })
+	goroutines.Loop(ctx, loopCallbacks, time.Minute, callbackSvc.Run)
 	federationSvc, err := federation.New(ctx, db, idSvc, secretsCipher)
 	if err != nil {
 		return fmt.Errorf("federation: %w", err)
@@ -1013,7 +1096,7 @@ func runServe(argv []string) error {
 			Interval: *notesSyncEvery,
 		})
 		gw.RegisterNotesPublish(notesAdapter{notesSvc})
-		go notesSvc.StartScanner(ctx)
+		goroutines.Loop(ctx, loopNotesScanner, time.Minute, notesSvc.StartScanner)
 		log.Printf("notes-sync: scanner started (interval=%s, dir=%s)", *notesSyncEvery, resolvedNotesDir)
 	}
 
@@ -1078,7 +1161,7 @@ func runServe(argv []string) error {
 			ClaudeSkillsDir: *claudeSkillsDir,
 		})
 		gw.RegisterSkillsBuiltins(skillsAdapter{skillsSvc})
-		go skillsSvc.StartScanner(ctx)
+		goroutines.Loop(ctx, loopSkillsScanner, time.Minute, skillsSvc.StartScanner)
 		log.Printf("skills-sync: scanner started (interval=%s, dir=%s)", *skillsSyncEvery, resolvedSkillsDir)
 	}
 
@@ -1170,7 +1253,8 @@ func runServe(argv []string) error {
 		IdentityKeys:             identityKeysSvc,
 		Guide:                    inboxGuide,
 		WebhookMaxBytes:          *webhookMaxBytes,
-		SessionKey:               loadOrCreateSessionKey(*dataDir),
+		SessionKey:               masterKeys[keyguard.SessionKey], // loaded and checked above
+		Probes:                   probes,
 		Security:                 secOpts,
 		Access:                   accessSvc,
 		Clerk:                    clerkClient,
@@ -1313,7 +1397,7 @@ func runServe(argv []string) error {
 	}()
 
 	if idleTimeout > 0 {
-		go func() {
+		goroutines.Loop(ctx, loopIdleSweeper, time.Minute, func(ctx context.Context) {
 			tick := time.NewTicker(idleTimeout / 2)
 			defer tick.Stop()
 			for {
@@ -1325,9 +1409,10 @@ func runServe(argv []string) error {
 						rootLog.Info("idle-kill swept",
 							"count", n, "threshold", idleTimeout.String())
 					}
+					loopDone(loopIdleSweeper)
 				}
 			}
-		}()
+		})
 	}
 	gw.SetMaxLiveUpstreams(*upstreamMaxLive)
 	gw.SetMaxLivePerUser(*perUserMaxLive)
@@ -1336,6 +1421,9 @@ func runServe(argv []string) error {
 		"per_user_max_live", *perUserMaxLive,
 		"idle_timeout", idleTimeout.String())
 
+	// Startup recovery (inbox RecoverExecutions, SweepUnexecuted) and
+	// upstream loading are done: readiness may report ready.
+	markStarted()
 	go func() {
 		log.Printf("toolyard: HTTP listening on %s (dashboard + /mcp + /v1/*)", *addr)
 		if err := httpSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
@@ -1357,13 +1445,43 @@ func runServe(argv []string) error {
 
 	select {
 	case <-stop:
-		log.Printf("toolyard: shutting down")
+		rootLog.Info("shutdown signal received")
 	case <-ctx.Done():
+		rootLog.Warn("root context ended; shutting down")
 	}
-	cancel()
-	shutdownCtx, c := context.WithTimeout(context.Background(), 5*time.Second)
-	defer c()
-	_ = httpSrv.Shutdown(shutdownCtx)
+	// TEC-1626 drain: one ordered shutdown (lifecycle.go). Executors run on
+	// the bus's own context, so nothing in flight is cancelled before the
+	// drain deadline.
+	(&shutdownPlan{
+		log:          logx.For("shutdown"),
+		drainDelay:   *drainDelay,
+		drainTimeout: *drainTimeout,
+		grace:        shutdownGrace,
+		markDraining: markDraining,
+		refuseNew: func() {
+			gw.BeginDrain()
+			bus.BeginDrain()
+		},
+		releaseWaiters: func() {
+			hub.CloseAll()
+			inboxSvc.ReleaseWaiters()
+			gw.ReleaseWaiters()
+			bus.ReleaseWaiters()
+		},
+		stopHTTP:  httpSrv.Shutdown,
+		forceHTTP: httpSrv.Close,
+		waitExecutions: []func(context.Context){
+			func(ctx context.Context) { bus.WaitExecutions(ctx, shutdownGrace) },
+			func(ctx context.Context) { waitGrantedCalls(ctx, gw, inboxSvc, shutdownGrace) },
+		},
+		cancelRoot: cancel,
+		closers: []shutdownCloser{
+			{name: "inbox", close: closeInbox},
+			{name: "metrics", close: closeMetrics},
+			{name: "gateway", close: closeGateway},
+			{name: "database", close: closeDB},
+		},
+	}).run()
 	return nil
 }
 
@@ -1500,6 +1618,8 @@ func runReasonScorer(ctx context.Context, r *metrics.Reader) {
 	// First pass at startup so existing rows get scored.
 	if err := r.ScoreReasons(ctx, time.Now().Add(-24*time.Hour)); err != nil {
 		log.Printf("reason scorer (initial): %v", err)
+	} else {
+		loopDone(loopReasonScorer)
 	}
 	for {
 		select {
@@ -1508,6 +1628,8 @@ func runReasonScorer(ctx context.Context, r *metrics.Reader) {
 		case <-t.C:
 			if err := r.ScoreReasons(ctx, time.Now().Add(-24*time.Hour)); err != nil {
 				log.Printf("reason scorer: %v", err)
+			} else {
+				loopDone(loopReasonScorer)
 			}
 		}
 	}
@@ -1527,8 +1649,11 @@ func runRetentionCompactor(ctx context.Context, r *metrics.Reader, set *settings
 		before := time.Now().Add(-time.Duration(days) * 24 * time.Hour)
 		if n, err := r.PurgeOlderThan(ctx, before); err != nil {
 			log.Printf("retention compactor: %v", err)
-		} else if n > 0 {
-			log.Printf("retention compactor: purged %d rows older than %s", n, before.Format(time.RFC3339))
+		} else {
+			loopDone(loopRetention)
+			if n > 0 {
+				log.Printf("retention compactor: purged %d rows older than %s", n, before.Format(time.RFC3339))
+			}
 		}
 	}
 	step()
@@ -1553,8 +1678,11 @@ func runSessionPurger(ctx context.Context, id *identity.Service) {
 	step := func() {
 		if n, err := id.PurgeExpiredSessions(ctx, 24*time.Hour); err != nil {
 			log.Printf("session purger: %v", err)
-		} else if n > 0 {
-			log.Printf("session purger: removed %d expired session rows", n)
+		} else {
+			loopDone(loopSessionPurger)
+			if n > 0 {
+				log.Printf("session purger: removed %d expired session rows", n)
+			}
 		}
 	}
 	step()
@@ -1614,24 +1742,6 @@ func splitCSV(s string) []string {
 	return out
 }
 
-// loadOrCreateSessionKey persists a 32-byte HMAC key in <data-dir>/session.key
-// so JWT-signed dashboard cookies survive process restarts.
-func loadOrCreateSessionKey(dataDir string) []byte {
-	path := filepath.Join(dataDir, "session.key")
-	if b, err := os.ReadFile(path); err == nil && len(b) >= 32 {
-		out, err := base64.RawStdEncoding.DecodeString(strings.TrimSpace(string(b)))
-		if err == nil && len(out) == 32 {
-			return out
-		}
-	}
-	key := make([]byte, 32)
-	if _, err := rand.Read(key); err != nil {
-		panic(err)
-	}
-	_ = os.WriteFile(path, []byte(base64.RawStdEncoding.EncodeToString(key)), 0o600)
-	return key
-}
-
 // staticHandler serves the embedded dashboard. It also fingerprints assets in
 // log so we can spot stale-cache bugs.
 func staticHandler() http.Handler {
@@ -1682,8 +1792,18 @@ func staticHandler() http.Handler {
 	}
 
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		// Don't let SPA path swallow the API.
-		if strings.HasPrefix(r.URL.Path, "/v1/") || strings.HasPrefix(r.URL.Path, "/mcp") {
+		// Don't let SPA path swallow the API. An unknown /v1 route, a
+		// probe path variant and /metrics (served only on the ops
+		// listener) get a JSON 404, never the dashboard's HTML.
+		if p := r.URL.Path; strings.HasPrefix(p, "/v1/") || ops.IsProbePath(strings.TrimSuffix(p, "/")) ||
+			p == "/metrics" || strings.HasPrefix(p, "/metrics/") {
+			w.Header().Set("Content-Type", "application/json")
+			w.Header().Set("Cache-Control", "no-store")
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = w.Write([]byte(`{"error":"not_found"}` + "\n"))
+			return
+		}
+		if strings.HasPrefix(r.URL.Path, "/mcp") {
 			http.NotFound(w, r)
 			return
 		}
