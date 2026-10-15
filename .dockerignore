@@ -1,0 +1,57 @@
+# Build context for deploy/Dockerfile (context: repository root).
+# The build needs go.mod, go.sum, cmd/, internal/, the embedded files under
+# web/dashboard/ and docs/guidelines/, and LICENSE. Keep those.
+# Patterns are anchored at the context root; **/ matches in any directory.
+
+# Version control, CI and editor state
+.git
+.github
+.claude
+.vscode
+.idea
+**/*.swp
+**/.DS_Store
+**/Thumbs.db
+.mcp.json
+
+# Local secrets and environment files (the binary loads .env from its
+# working directory, so never send one into the build)
+**/.env
+**/.env.*
+**/toolyard.env
+**/*.key
+**/*.pem
+**/database-url
+**/ops-token
+
+# Node and web build output
+**/node_modules
+.pnpm-store
+web/dashboard/dist
+web/dashboard/.vite
+
+# Built binaries and test artefacts
+dist
+toolyard
+gateway
+gateway-*
+cmd/gateway/gateway
+**/*.exe
+**/*.so
+**/*.test
+**/*.out
+**/*.prof
+
+# Local data: SQLite databases, data directories, temporary files
+**/*.db
+**/*.db-journal
+**/*.db-wal
+**/*.db-shm
+**/*.toolyard.db*
+data
+tmp
+
+# Not needed to build the binary
+docs/assets
+docs/research
+deploy/stage

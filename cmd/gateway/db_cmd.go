@@ -21,8 +21,23 @@ import (
 )
 
 const dbUsageText = `usage:
-  toolyard db copy   -from-data DIR [-credentials-dir DIR] [-truncate-target] [-allow-live-source] [-json PATH]
-  toolyard db verify -from-data DIR [-credentials-dir DIR] [-allow-live-source] [-json PATH]
+  toolyard db migrate [-data DIR] [-credentials-dir DIR] [-dry-run] [-timeout 10m] [-db-connect-timeout 60s]
+  toolyard db copy    -from-data DIR [-credentials-dir DIR] [-truncate-target] [-allow-live-source] [-json PATH]
+  toolyard db verify  -from-data DIR [-credentials-dir DIR] [-allow-live-source] [-json PATH]
+
+migrate applies the schema migrations this binary knows and the database
+does not record yet, to the database serve would use: $TOOLYARD_DATABASE_URL,
+else a database-url file in $CREDENTIALS_DIRECTORY or -credentials-dir (a
+toolyard.env there is read first, as by serve), else SQLite at
+DIR/toolyard.db (created when missing). On Postgres it holds the same
+advisory lock as serve while it migrates. It prints each migration it
+applied, or "up to date", and exits 0; a setting that is missing or wrong
+exits 78. -dry-run lists the pending migrations and applies none; it opens
+the database read-only. Run it before serve -migrate=off starts. As serve
+does, it keeps trying a Postgres server it cannot reach for
+-db-connect-timeout (an Aurora failover). TOOLYARD_DATA (or
+TOOLYARD_DATA_DIR), TOOLYARD_CREDENTIALS_DIR and TOOLYARD_DB_CONNECT_TIMEOUT
+set -data, -credentials-dir and -db-connect-timeout when they are not given.
 
 copy loads a stopped SQLite installation (DIR/toolyard.db and the blob files
 in DIR/inbox/blobs) into an empty Postgres database: every table and every
@@ -47,13 +62,19 @@ the source must not change during a run.
 // its checks or its copy transaction, verify one for its snapshot.
 const dbTargetConns = 4
 
-// runDB is `toolyard db copy|verify` (TEC-1637).
+// runDB is `toolyard db migrate|copy|verify` (TEC-1637, TEC-1638).
 func runDB(argv []string) error {
 	if len(argv) == 0 {
 		fmt.Fprint(os.Stderr, dbUsageText)
-		return errors.New("toolyard db: name a subcommand: copy or verify")
+		return errors.New("toolyard db: name a subcommand: migrate, copy or verify")
 	}
 	switch argv[0] {
+	case "migrate":
+		// Ctrl-C or SIGTERM cancels the run; the migration in progress
+		// then rolls back (each runs in its own transaction).
+		ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+		defer stop()
+		return runDBMigrate(ctx, argv[1:], os.Stdout, os.Stderr, processEnv())
 	case "copy", "verify":
 		// Ctrl-C or SIGTERM cancels the run; the copy transaction then
 		// rolls back.
@@ -65,7 +86,189 @@ func runDB(argv []string) error {
 		return nil
 	}
 	fmt.Fprint(os.Stderr, dbUsageText)
-	return fmt.Errorf("toolyard db: unknown subcommand %q (want copy or verify)", argv[0])
+	return fmt.Errorf("toolyard db: unknown subcommand %q (want migrate, copy or verify)", argv[0])
+}
+
+// dbMigrateConns is db migrate's Postgres pool size: the migration holds
+// one connection (with the advisory lock) and the status reads use another.
+const dbMigrateConns = 2
+
+// runDBMigrate is `toolyard db migrate` (TEC-1638). It never prints or logs
+// the database URL: the database is named by engine, host and name only.
+func runDBMigrate(ctx context.Context, argv []string, stdout, stderr io.Writer, env flagEnv) error {
+	fs := flag.NewFlagSet("db migrate", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+	dataDir := fs.String("data", defaultDataDirFrom(env.getenv),
+		"data directory: SQLite at DIR/toolyard.db when no Postgres URL is set, as for serve. Defaults to $TOOLYARD_DATA_DIR, then ~/.toolyard.")
+	credentialsDir := fs.String("credentials-dir", env.getenv("TOOLYARD_CREDENTIALS_DIR"),
+		"directory searched after $CREDENTIALS_DIRECTORY for database-url and toolyard.env, as for serve. Defaults to $TOOLYARD_CREDENTIALS_DIR.")
+	dryRun := fs.Bool("dry-run", false, "list the pending migrations and apply none; the database is opened read-only")
+	timeout := fs.Duration("timeout", 10*time.Minute, "give up after this long, the wait for the migration lock included; 0 means no limit")
+	connectTimeout := fs.Duration("db-connect-timeout", defaultDBConnectTimeout, dbConnectTimeoutUsage)
+	if err := fs.Parse(argv); err != nil {
+		return err
+	}
+	if fs.NArg() > 0 {
+		return fmt.Errorf("toolyard db migrate: unexpected arguments %q", fs.Args())
+	}
+	rep, err := loadFlagEnv(fs, env, credentialsDir, "data", "credentials-dir", "db-connect-timeout")
+	if err != nil {
+		return err
+	}
+	for _, w := range rep.warnings {
+		fmt.Fprintln(stderr, "warning:", w)
+	}
+	if *timeout < 0 {
+		return configErrorf("toolyard db migrate: -timeout must not be negative")
+	}
+	if err := checkConnectTimeout(*connectTimeout); err != nil {
+		return err
+	}
+	if *timeout > 0 {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, *timeout)
+		defer cancel()
+	}
+	target, err := resolveDatabase(*dataDir, *credentialsDir, env.getenv)
+	if err != nil {
+		return err
+	}
+	logf := func(format string, args ...any) { fmt.Fprintf(stderr, format+"\n", args...) }
+	return dbMigrate(ctx, target, *dataDir, *dryRun, *connectTimeout, logf, stdout)
+}
+
+// dbMigrate applies the pending migrations of target (or, with dryRun,
+// lists them) and prints what it did on w. A Postgres server it cannot
+// reach is tried again for connectTimeout (openPostgresRetry; logf gets the
+// retries).
+func dbMigrate(ctx context.Context, target dbTarget, dataDir string, dryRun bool, connectTimeout time.Duration, logf func(string, ...any), w io.Writer) error {
+	line := func(label, text string) { fmt.Fprintf(w, "%-8s %s\n", label, text) }
+	line("database", fmt.Sprintf("%s (from %s)", target.describe(), target.Source))
+
+	var db *store.DB
+	var before, unknown []string
+	switch {
+	case target.isPostgres():
+		opts := store.PostgresOptions{MaxConns: dbMigrateConns, NoMigrate: true}
+		if dryRun {
+			opts = store.PostgresOptions{MaxConns: 1, ReadOnly: true}
+		}
+		pdb, err := openPostgresRetry(ctx, target, opts, connectTimeout, logf)
+		if err != nil {
+			return asDBConfigError(fmt.Errorf("toolyard db migrate: open %s: %w", target.describe(), err))
+		}
+		db = pdb
+	default:
+		var sdb *store.DB
+		var err error
+		if dryRun {
+			// Read only: a dry run changes nothing, not even the journal
+			// mode, and works on a read-only mount.
+			ro, rerr := store.OpenReadOnly(target.Path)
+			if err = rerr; err == nil {
+				sdb = &store.DB{DB: ro, Path: target.Path, Dialect: store.SQLite}
+			}
+		} else {
+			sdb, err = store.OpenNoMigrate(target.Path)
+		}
+		switch {
+		case errors.Is(err, iofs.ErrNotExist):
+			// A new installation: every migration is pending, and the
+			// file is created below (not on a dry run).
+			if before, err = store.KnownMigrations(store.SQLite); err != nil {
+				return err
+			}
+		case err != nil:
+			return fmt.Errorf("toolyard db migrate: open %s: %w", target.Path, err)
+		default:
+			db = sdb
+		}
+	}
+	if db != nil {
+		defer db.Close()
+		var err error
+		if before, unknown, err = store.MigrationStatus(ctx, db); err != nil {
+			return fmt.Errorf("toolyard db migrate: read the schema level: %w", err)
+		}
+	}
+	for _, n := range unknown {
+		line("note", n+" is recorded but unknown to this binary (a newer toolyard migrated the database)")
+	}
+	known := len(before)
+	if all, err := store.KnownMigrations(storeDialect(target)); err == nil {
+		known = len(all)
+	}
+
+	if dryRun {
+		for _, n := range before {
+			line("pending", n)
+		}
+		switch {
+		case len(before) == 0:
+			line("result", fmt.Sprintf("up to date: the database records all %d migrations this binary knows", known))
+		case db == nil:
+			line("result", fmt.Sprintf("%d pending; %s does not exist yet and migrate creates it; nothing applied (-dry-run)", len(before), target.Path))
+		default:
+			line("result", fmt.Sprintf("%d pending; nothing applied (-dry-run)", len(before)))
+		}
+		return nil
+	}
+	if len(before) == 0 {
+		line("result", fmt.Sprintf("up to date: the database records all %d migrations this binary knows", known))
+		return nil
+	}
+
+	if db == nil {
+		// SQLite that does not exist yet: an empty file (a new database)
+		// only its owner can read, in a data directory only its owner can
+		// read, as serve makes it; then it is migrated below.
+		if err := os.MkdirAll(dataDir, 0o700); err != nil {
+			return fmt.Errorf("toolyard db migrate: %w", err)
+		}
+		f, err := os.OpenFile(target.Path, os.O_WRONLY|os.O_CREATE, 0o600)
+		if err != nil {
+			return fmt.Errorf("toolyard db migrate: create %s: %w", target.Path, err)
+		}
+		if err := f.Close(); err != nil {
+			return fmt.Errorf("toolyard db migrate: create %s: %w", target.Path, err)
+		}
+		sdb, err := store.OpenNoMigrate(target.Path)
+		if err != nil {
+			return fmt.Errorf("toolyard db migrate: open %s: %w", target.Path, err)
+		}
+		db = sdb
+		defer db.Close()
+	}
+	// The names Migrate returns are those this run applied, read and
+	// written under the migration lock on Postgres: a run that waited for
+	// another never claims that one's work.
+	applied, err := db.Migrate(ctx)
+	for _, n := range applied {
+		line("applied", n)
+	}
+	if err != nil {
+		return fmt.Errorf("toolyard db migrate: %w", err)
+	}
+	after, _, err := store.MigrationStatus(ctx, db)
+	if err != nil {
+		return fmt.Errorf("toolyard db migrate: read the schema level after migrating: %w", err)
+	}
+	if len(after) > 0 {
+		return fmt.Errorf("toolyard db migrate: %d migration(s) still pending after migrating: %s", len(after), nameList(after, 5))
+	}
+	if len(applied) < len(before) {
+		line("note", fmt.Sprintf("another run applied %d of the %d pending migrations while this one waited", len(before)-len(applied), len(before)))
+	}
+	line("result", fmt.Sprintf("applied %d; the database records all %d migrations this binary knows", len(applied), known))
+	return nil
+}
+
+// storeDialect is the engine of target.
+func storeDialect(t dbTarget) store.Dialect {
+	if t.isPostgres() {
+		return store.Postgres
+	}
+	return store.SQLite
 }
 
 // runDBCommand runs `db copy` or `db verify` (sub). It never prints or

@@ -1,0 +1,232 @@
+# Example Docker Swarm stack for toolyard: one replica on Postgres, behind
+# Traefik. A generic starting point, validated in CI with
+# `docker stack config` and `docker compose config`
+# (.github/workflows/deploy-manifests.yml); copy it and adapt names, hosts
+# and networks.
+#
+#   export TOOLYARD_IMAGE=ghcr.io/iamtushar324/toolyard@sha256:<index digest>
+#   docker stack deploy -c stack.example.yml --detach=false toolyard
+#
+# Before the first deploy:
+#   1. Create the Postgres database (C collation; docs/self-hosting.md).
+#   2. Create the secrets on a manager, values through stdin, never argv:
+#        for k in identity oauth secrets session; do
+#          docker run --rm --network none "$TOOLYARD_IMAGE" keys generate -name "$k" \
+#            | docker secret create "toolyard-$k-key-v1" -
+#        done
+#        docker secret create toolyard-database-url-v1 - < database-url
+#        openssl rand -hex 32 | docker secret create toolyard-ops-token-v1 -
+#      Keep a backup of the four keys, apart from the database backups.
+#   3. Create the CA bundle config if the URL uses sslrootcert:
+#        docker config create toolyard-db-ca-v1 rds-ca-bundle.pem
+#   4. Migrate the schema with the new image before each deploy (the service
+#      runs with -migrate off and refuses, exit 78, a schema behind its
+#      binary). Mount the CA bundle at the path the URL's sslrootcert names;
+#      both files must be readable by uid 10001:
+#        docker run --rm \
+#          -v "$PWD/database-url:/run/secrets/database-url:ro" \
+#          -v "$PWD/rds-ca-bundle.pem:/etc/toolyard/db-ca.pem:ro" \
+#          "$TOOLYARD_IMAGE" db migrate
+#
+# Secrets and configs cannot change in place: to rotate one, create a -v2,
+# change its name below, redeploy, and remove the -v1 after the rollback
+# window.
+
+services:
+  toolyard:
+    image: ${TOOLYARD_IMAGE:?set TOOLYARD_IMAGE to ghcr.io/iamtushar324/toolyard@sha256:<digest>}
+    # The image default command is `serve`; settings come from the
+    # environment below (TOOLYARD_<FLAG>, a flag on the command line wins).
+    environment:
+      TOOLYARD_PUBLIC_URL: https://toolyard.example.com
+      # The subnet of the overlay network shared only with Traefik (below).
+      # Secure cookies, HSTS and per-IP rate limits depend on it.
+      TOOLYARD_TRUSTED_PROXY: 10.200.0.0/24
+      TOOLYARD_KEYS: require
+      TOOLYARD_MIGRATE: "off"
+      # Beyond loopback the ops listener needs the token; scrapers send
+      # Authorization: Bearer <token> (Prometheus or Alloy bearer_token_file).
+      TOOLYARD_OPS_ADDR: 0.0.0.0:9090
+      TOOLYARD_OPS_TOKEN_FILE: /run/secrets/ops-token
+      TOOLYARD_OWNER_EMAIL: owner@example.com
+      TOOLYARD_STATELESS_MCP: "true"
+      TOOLYARD_NO_STDIO_UPSTREAMS: "true"
+      TOOLYARD_NOTES: "off"
+      TOOLYARD_SKILLS: "off"
+      TOOLYARD_MEMPALACE: "off"
+      TOOLYARD_VOICE: "off"
+      TOOLYARD_UPSTREAM_IDLE_TIMEOUT: 15m
+      TOOLYARD_DB_MAX_CONNS: "10"
+      TOOLYARD_DRAIN_DELAY: 5s
+      TOOLYARD_ENVIRONMENT: production
+      # Switch to required once /v1/health reports
+      # codemode_sandbox landlock-abi-<n>+seccomp on your nodes.
+      TOOLYARD_CODEMODE_SANDBOX: auto
+      GOMEMLIMIT: 200MiB
+      GOGC: "50"
+    # Mounted at /run/secrets/<target>, the image's TOOLYARD_CREDENTIALS_DIR,
+    # owned by the image user and readable only by it.
+    secrets:
+      - source: toolyard_identity_key
+        target: identity.key
+        uid: "10001"
+        gid: "10001"
+        mode: 0400
+      - source: toolyard_oauth_key
+        target: oauth.key
+        uid: "10001"
+        gid: "10001"
+        mode: 0400
+      - source: toolyard_secrets_key
+        target: secrets.key
+        uid: "10001"
+        gid: "10001"
+        mode: 0400
+      - source: toolyard_session_key
+        target: session.key
+        uid: "10001"
+        gid: "10001"
+        mode: 0400
+      - source: toolyard_database_url
+        target: database-url
+        uid: "10001"
+        gid: "10001"
+        mode: 0400
+      - source: toolyard_ops_token
+        target: ops-token
+        uid: "10001"
+        gid: "10001"
+        mode: 0400
+      # Optional: TOOLYARD_CLERK_* for Google sign-in, as KEY=value lines.
+      # - source: toolyard_env
+      #   target: toolyard.env
+      #   uid: "10001"
+      #   gid: "10001"
+      #   mode: 0400
+    configs:
+      # Reference it from the database URL: sslrootcert=/etc/toolyard/db-ca.pem
+      - source: toolyard_db_ca
+        target: /etc/toolyard/db-ca.pem
+        uid: "10001"
+        gid: "10001"
+        mode: 0444
+    # Read-only root; the data directory and /tmp are the only writable
+    # paths. On Postgres the data directory holds only crash dumps, the
+    # model-price cache and temporary upload files (up to 50 MiB each).
+    read_only: true
+    volumes:
+      - type: volume
+        source: toolyard-data
+        target: /var/lib/toolyard/data
+      - type: tmpfs
+        target: /tmp
+        tmpfs:
+          size: 67108864
+    cap_drop:
+      - ALL
+    # `docker stack deploy` may ignore security_opt. The image runs as uid
+    # 10001 without capabilities, and script workers set no_new_privs
+    # themselves.
+    security_opt:
+      - no-new-privileges:true
+    # SIGTERM starts the drain: up to 60 s for in-flight work plus ~10 s of
+    # bounded closes. The default 10 s would cut it short.
+    stop_signal: SIGTERM
+    stop_grace_period: 75s
+    # Liveness only: a database outage makes /v1/readyz fail, and a restart
+    # would not fix it. Traefik routes on /v1/readyz instead (labels below).
+    healthcheck:
+      test: ["CMD", "/usr/local/bin/toolyard", "healthcheck", "-url", "http://127.0.0.1:8787/v1/livez", "-expect", "live"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
+      # Docker 25 or later; remove it on older engines.
+      start_interval: 5s
+    networks:
+      - edge
+      - backend
+    deploy:
+      # One gateway per database: some state lives in process memory.
+      replicas: 1
+      # stop-first: never two gateways at once, also during an update or a
+      # rollback. Each deploy has a short outage (drain plus ~20 s startup).
+      update_config:
+        parallelism: 1
+        order: stop-first
+        failure_action: rollback
+        monitor: 60s
+      rollback_config:
+        parallelism: 1
+        order: stop-first
+      # A key or configuration error exits 78 and restarting cannot fix it:
+      # stop after a few attempts instead of looping.
+      restart_policy:
+        condition: on-failure
+        delay: 5s
+        max_attempts: 5
+        window: 120s
+      resources:
+        limits:
+          memory: 1536M
+        reservations:
+          memory: 256M
+      # placement:
+      #   constraints: [node.role == manager]
+      labels:
+        # Traefik (Swarm provider) labels go under deploy.labels. Adapt the
+        # entrypoint, certificate resolver and network names to your setup,
+        # set traefik.enable=true and uncomment the rest.
+        - traefik.enable=false
+        # - traefik.docker.network=traefik-public
+        # - traefik.http.routers.toolyard.rule=Host(`toolyard.example.com`)
+        # - traefik.http.routers.toolyard.entrypoints=websecure
+        # - traefik.http.routers.toolyard.tls.certresolver=le
+        # - traefik.http.services.toolyard.loadbalancer.server.port=8787
+        # - traefik.http.services.toolyard.loadbalancer.healthcheck.path=/v1/readyz
+        # - traefik.http.services.toolyard.loadbalancer.healthcheck.interval=5s
+
+volumes:
+  # Per node, and disposable on Postgres. A fresh volume takes its owner
+  # (10001) from the image.
+  toolyard-data:
+
+networks:
+  # The overlay Traefik is attached to. Give it a fixed subnet that only
+  # Traefik and the services it fronts use, and trust only that subnet:
+  #   docker network create -d overlay --subnet 10.200.0.0/24 traefik-public
+  # Publish Traefik's ports in host mode so it sees real client addresses.
+  edge:
+    external: true
+    name: traefik-public
+  # Reaches the database and your upstream MCP servers.
+  backend:
+    driver: overlay
+
+secrets:
+  toolyard_identity_key:
+    external: true
+    name: toolyard-identity-key-v1
+  toolyard_oauth_key:
+    external: true
+    name: toolyard-oauth-key-v1
+  toolyard_secrets_key:
+    external: true
+    name: toolyard-secrets-key-v1
+  toolyard_session_key:
+    external: true
+    name: toolyard-session-key-v1
+  toolyard_database_url:
+    external: true
+    name: toolyard-database-url-v1
+  toolyard_ops_token:
+    external: true
+    name: toolyard-ops-token-v1
+  # toolyard_env:
+  #   external: true
+  #   name: toolyard-env-v1
+
+configs:
+  toolyard_db_ca:
+    external: true
+    name: toolyard-db-ca-v1

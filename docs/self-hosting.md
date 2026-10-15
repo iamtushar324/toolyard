@@ -19,7 +19,8 @@ docker compose -f deploy/docker-compose.yml up --build
 ```
 
 Persistent data lives in the named volume `toolyard-data`. Pass
-`-e TOOLYARD_DATA_DIR=/var/lib/toolyard/data` to use a custom path.
+`-e TOOLYARD_DATA_DIR=/var/lib/toolyard/data` to use a custom path. For the
+published image and production settings, see [Containers](#containers).
 
 ## Wiring an agent
 
@@ -736,11 +737,11 @@ pool, sandbox status); it is not a probe.
 
 `toolyard healthcheck -url <probe URL> -expect ready|live` fetches a probe
 with a 3 s timeout and exits 0 when its `status` matches, 1 otherwise. The
-Docker image's `HEALTHCHECK` uses it, because the image has no `curl` or
-`wget`:
+Docker image's `HEALTHCHECK` uses it on the liveness probe, because the
+image has no `curl` or `wget`:
 
 ```bash
-toolyard healthcheck -url http://127.0.0.1:8787/v1/readyz -expect ready
+toolyard healthcheck -url http://127.0.0.1:8787/v1/livez -expect live
 ```
 
 For an orchestrator, point the liveness check at `/v1/livez` and the
@@ -821,3 +822,168 @@ Under systemd also set `KillMode=mixed` (the shipped units do). The default
 code-mode script workers included; `mixed` sends it to the gateway only,
 which drains and then ends its workers itself. Workers ignore SIGTERM, so a
 stop signal sent to the whole unit cannot cut a running script either.
+
+## Containers
+
+The image `ghcr.io/iamtushar324/toolyard` is built from `deploy/Dockerfile`
+for linux/amd64 and linux/arm64 on every push to `main`, after the Go tests
+pass (`.github/workflows/publish-image.yml`). Every pull request builds it
+on both architectures and runs it as a smoke test: read-only root, no
+capabilities, uid 10001, against Postgres 16.
+
+### Image
+
+- Tags: `sha-<commit>` (the full 40-character commit) and `main` (moves on
+  every push). The binary reports version `sha-<commit>` (`toolyard
+  version`, `/v1/health`, `toolyard_build_info`).
+- Deploy by digest, never by tag:
+  `ghcr.io/iamtushar324/toolyard@sha256:<digest>`. The publish run's summary
+  prints the digest of the multi-arch index. Each image carries an SBOM and
+  SLSA provenance, and the index has a GitHub attestation:
+
+  ```bash
+  gh attestation verify oci://ghcr.io/iamtushar324/toolyard@sha256:<digest> \
+    --repo iamtushar324/toolyard
+  ```
+
+- Entrypoint `tini -- toolyard`, default command `serve`, user and group
+  10001. Ports 8787 (dashboard, `/mcp`, `/v1/*`) and 9090 (the ops
+  listener, when enabled).
+
+### Mounts
+
+| Path | Purpose |
+| --- | --- |
+| `/var/lib/toolyard/data` | The data directory (`TOOLYARD_DATA_DIR`); must be writable. On Postgres it holds only crash dumps, the model-price cache and temporary upload files (up to 50 MiB each): a disposable disk volume of about 1 GiB. On SQLite it holds the database: use a persistent volume. |
+| `/tmp` | A small tmpfs (64 MiB) when the root filesystem is read-only. |
+| `/run/secrets` | The credentials directory (`TOOLYARD_CREDENTIALS_DIR`), where Docker and Swarm mount secrets. On Kubernetes, mount the Secret elsewhere (for example `/etc/toolyard/credentials`) and set the variable. |
+
+The root filesystem can be read-only, and toolyard needs no capability:
+run it with all capabilities dropped and `no-new-privileges`.
+
+### Secrets
+
+Files in the credentials directory, each readable by uid 10001 (Swarm:
+`uid: "10001"`, `gid: "10001"`, `mode: 0400`):
+
+- `identity.key`, `oauth.key`, `secrets.key`, `session.key`. Create fresh
+  keys with the image itself: `toolyard keys generate -name <identity|oauth|secrets|session>`
+  prints one key to stdout (for example into
+  `docker secret create toolyard-oauth-key-v1 -`), and
+  `toolyard keys generate -all -dir <dir>` writes all four files. Back them
+  up apart from the database.
+- `database-url`: the Postgres URL. For `sslmode=verify-full`, mount the CA
+  bundle (a Swarm config or a ConfigMap) and point `sslrootcert=` at it.
+- `ops-token`: the ops listener's bearer token, needed when it listens
+  beyond loopback and private addresses.
+- `toolyard.env` (optional): `KEY=value` lines, such as the
+  `TOOLYARD_CLERK_*` variables.
+
+### Configuration
+
+Every `serve` flag can also be set as `TOOLYARD_<FLAG>`: the flag name in
+upper case with `-` replaced by `_` (`-public-url` is
+`TOOLYARD_PUBLIC_URL`, `-db-max-conns` is `TOOLYARD_DB_MAX_CONNS`). A flag
+on the command line wins, an empty variable counts as unset, and
+`toolyard.env` may set them too (except `TOOLYARD_CREDENTIALS_DIR`).
+`-inbox-reset-passkeys` is command line only. `serve` warns about a
+`TOOLYARD_*` variable that matches no flag and that nothing reads (a
+misspelt name), naming the variable but never its value. Run
+`toolyard help` for the variables the other commands read.
+
+At startup, `serve` and `toolyard db migrate` keep trying a Postgres server
+they cannot reach for `-db-connect-timeout` (env
+`TOOLYARD_DB_CONNECT_TIMEOUT`, default `60s`, `0` = one attempt), so a
+restart during a database failover recovers by itself. A bad URL, a wrong
+collation or encoding, a refused login or a missing database fails at once.
+The HTTP listener starts only after the database opens, so keep health
+check grace periods at 60 s or more. Secrets stay in files, never in
+variables. A production set:
+
+```bash
+TOOLYARD_PUBLIC_URL=https://toolyard.example.com
+TOOLYARD_TRUSTED_PROXY=10.200.0.0/24   # the proxy's subnet, nothing wider
+TOOLYARD_KEYS=require
+TOOLYARD_MIGRATE=off
+TOOLYARD_OPS_ADDR=0.0.0.0:9090
+TOOLYARD_OPS_TOKEN_FILE=/run/secrets/ops-token
+TOOLYARD_STATELESS_MCP=true
+TOOLYARD_NO_STDIO_UPSTREAMS=true
+TOOLYARD_NOTES=off                     # and SKILLS, MEMPALACE, VOICE
+TOOLYARD_UPSTREAM_IDLE_TIMEOUT=15m
+TOOLYARD_DB_MAX_CONNS=10
+GOMEMLIMIT=200MiB
+GOGC=50
+```
+
+- **`-keys require`**, always in a container. With the default
+  `create-if-fresh`, the first start on an empty database creates the keys
+  in the data directory; once that directory is gone, every later start
+  fails with exit code 78.
+- **`-trusted-proxy`**: the subnet the reverse proxy connects from. On
+  Swarm, give the proxy and toolyard an overlay network with a fixed subnet
+  that nothing else joins. Secure cookies, HSTS and per-IP rate limits
+  depend on it, and an invalid CIDR is skipped, so check the value. The
+  proxy must see real client addresses (Swarm: publish its ports in host
+  mode).
+
+### Schema migrations
+
+`serve -migrate auto` (the default) migrates the schema when it starts.
+With `-migrate off`, `serve` only checks it: a schema behind the binary
+stops the start with exit code 78 and a message to run
+`toolyard db migrate`. Run that command with the new image and the same
+credentials and database before you deploy the image. It applies pending
+migrations (under the Postgres advisory lock), prints what it applied and
+exits 0; config errors exit 78.
+
+### Probes
+
+- Liveness: `/v1/livez` reads nothing. The image's `HEALTHCHECK` runs
+  `toolyard healthcheck` on it (60 s start period), and so should a Swarm
+  `healthcheck` or a Kubernetes startup and liveness probe.
+- Readiness: `/v1/readyz`, for routing only (a Traefik
+  `loadbalancer.healthcheck.path`, a Kubernetes readiness probe). Never
+  restart on it: a database outage makes it fail, and a restart does not
+  help.
+- Port 8787 opens only once startup is done (about 20 s); until then only
+  the ops port answers, with `readyz` reason `starting`. To check the ops
+  port when it needs a token, pass `-token-file <path>` to
+  `toolyard healthcheck`.
+
+### Stopping and updating
+
+- Give the container 75 s to stop (`stop_grace_period: 75s`,
+  `terminationGracePeriodSeconds: 75`); see [Shutdown and
+  drain](#shutdown-and-drain).
+- Never run two gateways on one database, not even for a moment during an
+  update: use Swarm `update_config.order: stop-first` (and the same for
+  `rollback_config`), or Kubernetes `strategy: Recreate`. Each deploy then
+  has a short outage.
+- A key or configuration error exits 78 and a restart does not fix it:
+  limit restarts (Swarm `restart_policy.max_attempts`) and read the logs.
+
+### Code-mode sandbox
+
+Script workers are confined with Landlock and seccomp. That needs no
+capabilities and works under the default seccomp profiles of Docker,
+containerd and CRI-O; the node kernel must have Landlock enabled
+(`landlock` in `/sys/kernel/security/lsm`). Check what a running
+container gets:
+
+```bash
+curl -s https://toolyard.example.com/v1/health | jq -r .codemode_sandbox
+```
+
+It should read `landlock-abi-<n>+seccomp`. Then set
+`TOOLYARD_CODEMODE_SANDBOX=required`, so scripts are refused instead of
+running with less confinement if a later node lacks it.
+
+### Examples
+
+- Docker Swarm: `deploy/swarm/stack.example.yml`, a generic stack with the
+  settings above (secrets with owner and mode, read-only root, tmpfs,
+  stop-first updates, 75 s grace, a liveness health check, Traefik labels).
+- Kubernetes: `deploy/k8s/`, a reference Kustomize base (restricted pod
+  security, `Recreate`, probes, emptyDir volumes). CI validates it with
+  kubeconform; nothing deploys it.

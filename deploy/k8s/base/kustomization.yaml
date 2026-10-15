@@ -1,0 +1,24 @@
+# Reference Kustomize base for toolyard on Kubernetes. Not deployed
+# anywhere; CI renders it and validates it with kubeconform
+# (.github/workflows/deploy-manifests.yml). See ../README.md.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - deployment.yaml
+  - service.yaml
+
+# Non-secret settings as TOOLYARD_<FLAG> variables. The hash suffix makes a
+# changed setting roll the pod.
+configMapGenerator:
+  - name: toolyard-config
+    envs:
+      - config.env
+
+# Pin the image by digest in your overlay:
+#   images:
+#     - name: ghcr.io/iamtushar324/toolyard
+#       digest: sha256:<index digest from the publish run summary>
+images:
+  - name: ghcr.io/iamtushar324/toolyard
+    newTag: main
