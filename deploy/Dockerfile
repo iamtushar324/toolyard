@@ -17,8 +17,11 @@
 # line in go.mod: CI fails when they differ, and GOTOOLCHAIN=local stops the
 # build from downloading a different toolchain.
 
-# golang:1.26.9-bookworm (index digest read 2026-10-15)
-FROM golang:1.26.9-bookworm@sha256:d9c68c2c51161e12fd77e4c6320687c9cd86e1af1e3ad6e6cd63ff970641453c AS build
+# golang:1.25.14-bookworm (index digest read 2026-10-15). Go 1.26 raises the
+# code-mode worker's memory use past its 256 MiB cap on large results
+# (TestWorkerDecodesLargeResultsAtDefaultCap), so the move to 1.26/1.27 waits for
+# that to be measured and fixed.
+FROM golang:1.25.14-bookworm@sha256:3b4a11519ad929d1e1d261a12cff056f0c85b735253d7d861346b9c6f8b36437 AS build
 ENV GOTOOLCHAIN=local \
     CGO_ENABLED=1
 WORKDIR /src
