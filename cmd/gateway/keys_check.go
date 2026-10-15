@@ -35,10 +35,16 @@ func runKeysCheck(argv []string) error {
 	if fs.NArg() > 0 {
 		return fmt.Errorf("keys-check: unexpected arguments %q", fs.Args())
 	}
-	// As serve does: a toolyard.env in the credentials directories fills
-	// unset variables first ($TOOLYARD_DATABASE_URL among them).
-	if _, err := keyguard.LoadEnvFiles(*credentialsDir); err != nil {
+	// As serve does: TOOLYARD_DATA (or TOOLYARD_DATA_DIR),
+	// TOOLYARD_CREDENTIALS_DIR and TOOLYARD_KEYS set the flags the command
+	// line did not, and a toolyard.env in the credentials directories fills
+	// unset variables ($TOOLYARD_DATABASE_URL among them) (envconfig.go).
+	rep, err := loadFlagEnv(fs, processEnv(), credentialsDir, "data", "credentials-dir", "keys")
+	if err != nil {
 		return err
+	}
+	for _, w := range rep.warnings {
+		fmt.Fprintln(os.Stderr, "warning:", w)
 	}
 	return keysCheck(context.Background(), os.Stdout, *dataDir, *credentialsDir, *keysFlag, os.Getenv)
 }

@@ -1,0 +1,19 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: toolyard
+  labels:
+    app.kubernetes.io/name: toolyard
+spec:
+  selector:
+    app.kubernetes.io/name: toolyard
+  ports:
+    # Dashboard, /mcp and /v1/*: point your Ingress or Gateway here.
+    - name: http
+      port: 8787
+      targetPort: http
+    # /metrics and the probes, for an in-cluster scraper. Keep it off any
+    # Ingress.
+    - name: ops
+      port: 9090
+      targetPort: ops

@@ -38,7 +38,7 @@ func TestDBNeedsASubcommand(t *testing.T) {
 	if err := runDB(nil); err == nil {
 		t.Fatal("toolyard db with no subcommand succeeded")
 	}
-	if err := runDB([]string{"migrate"}); err == nil || !strings.Contains(err.Error(), "unknown subcommand") {
+	if err := runDB([]string{"nope"}); err == nil || !strings.Contains(err.Error(), "unknown subcommand") {
 		t.Fatalf("unknown subcommand: %v", err)
 	}
 	if err := runDB([]string{"help"}); err != nil {

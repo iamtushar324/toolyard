@@ -1,0 +1,388 @@
+# Container image: build, smoke-test and publish ghcr.io/iamtushar324/toolyard.
+#
+# Pull requests: build the image natively on amd64 and arm64 and run the
+# container smoke test (read-only root, all capabilities dropped,
+# no-new-privileges, uid 10001, against Postgres 16). Nothing is pushed.
+#
+# Push to main (or a manual run on main): first the same Go tests that gate
+# pull requests (inbox-integration.yml, called as a reusable workflow, so
+# the commit that main points at is tested again as merged), then per
+# architecture the smoke test and a push by digest with SLSA provenance
+# (mode=max) and an SBOM, then one multi-arch index tagged sha-<commit> and
+# main, with a GitHub build-provenance attestation for the index digest.
+# Deployments pin the index digest printed in the run summary.
+#
+# CGO (mattn/go-sqlite3) rules out cross-compiling under QEMU, so each
+# architecture builds on its own GitHub-hosted runner.
+name: Publish image
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: publish-image-${{ github.ref }}
+  # Never cancel a publish on main half-way; a newer pull request push
+  # replaces the running smoke test.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  IMAGE: ghcr.io/iamtushar324/toolyard
+
+jobs:
+  tests:
+    # Publishing only: pull requests already run inbox-integration.yml.
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main' && github.repository == 'iamtushar324/toolyard'
+    uses: ./.github/workflows/inbox-integration.yml
+    permissions:
+      contents: read
+
+  image:
+    needs: tests
+    # tests is skipped when nothing is published (pull requests, manual runs
+    # on other branches); then only the smoke test runs. A failed or
+    # cancelled test run stops the image job.
+    if: ${{ !cancelled() && (needs.tests.result == 'success' || needs.tests.result == 'skipped') }}
+    name: image (${{ matrix.arch }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+    env:
+      PUBLISH: ${{ github.event_name != 'pull_request' && github.ref == 'refs/heads/main' && github.repository == 'iamtushar324/toolyard' && needs.tests.result == 'success' }}
+      VERSION: sha-${{ github.sha }}
+      SMOKE_IMAGE: toolyard:smoke
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          # A throwaway password for this job's own database container.
+          POSTGRES_USER: toolyard
+          POSTGRES_PASSWORD: toolyard-ci
+          POSTGRES_DB: toolyard
+          # toolyard refuses a database without C collation.
+          POSTGRES_INITDB_ARGS: --locale=C --encoding=UTF8
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U toolyard -d toolyard"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 20
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Go version in the Dockerfile matches go.mod
+        run: |
+          set -euo pipefail
+          want="$(awk '$1 == "go" { print $2; exit }' go.mod)"
+          line="$(grep -m1 '^FROM golang:' deploy/Dockerfile)"
+          echo "go.mod: go ${want}"
+          echo "deploy/Dockerfile: ${line}"
+          if [[ "$line" != "FROM golang:${want}-bookworm@sha256:"* ]] || ! [[ "$line" =~ @sha256:[0-9a-f]{64}\ AS\ build$ ]]; then
+            echo "::error file=deploy/Dockerfile::the build stage must be golang:${want}-bookworm pinned by digest (go.mod says go ${want})"
+            exit 1
+          fi
+
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Build the image for the smoke test
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: deploy/Dockerfile
+          platforms: linux/${{ matrix.arch }}
+          build-args: VERSION=${{ env.VERSION }}
+          labels: org.opencontainers.image.revision=${{ github.sha }}
+          load: true
+          tags: ${{ env.SMOKE_IMAGE }}
+          provenance: false
+          sbom: false
+          cache-from: type=gha,scope=image-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=image-${{ matrix.arch }}
+
+      - name: Image metadata
+        run: |
+          set -euo pipefail
+          user="$(docker image inspect -f '{{.Config.User}}' "$SMOKE_IMAGE")"
+          entrypoint="$(docker image inspect -f '{{json .Config.Entrypoint}}' "$SMOKE_IMAGE")"
+          printf 'user %s\nentrypoint %s\n' "$user" "$entrypoint"
+          [ "$user" = "10001:10001" ] || { echo "::error::image user is '$user', want 10001:10001"; exit 1; }
+          [ "$entrypoint" = '["/usr/bin/tini","--","/usr/local/bin/toolyard"]' ] || { echo "::error::unexpected entrypoint $entrypoint"; exit 1; }
+          got="$(docker run --rm --network none "$SMOKE_IMAGE" version)"
+          echo "$got"
+          [ "$got" = "toolyard ${VERSION}" ] || { echo "::error::version is '$got', want 'toolyard ${VERSION}'"; exit 1; }
+
+      - name: Smoke test - credentials
+        # Four fresh keys from the image itself, a database-url file and an
+        # ops token, owned by uid 10001 with mode 0400, as Swarm mounts them.
+        run: |
+          set -euo pipefail
+          creds="$RUNNER_TEMP/credentials"
+          sudo install -d -o 10001 -g 10001 -m 0700 "$creds"
+          docker run --rm --network none --read-only --cap-drop ALL \
+            --security-opt no-new-privileges --user 10001:10001 \
+            -v "$creds:/keys" "$SMOKE_IMAGE" keys generate -all -dir /keys
+          printf '%s\n' 'postgres://toolyard:toolyard-ci@127.0.0.1:5432/toolyard?sslmode=disable' \
+            | sudo tee "$creds/database-url" >/dev/null
+          token="$(openssl rand -hex 24)"
+          echo "::add-mask::$token"
+          printf '%s\n' "$token" | sudo tee "$creds/ops-token" >/dev/null
+          printf 'Authorization: Bearer %s\n' "$token" > "$RUNNER_TEMP/ops-auth-header"
+          chmod 0600 "$RUNNER_TEMP/ops-auth-header"
+          # The directory is 0700 for uid 10001, so only root can list it.
+          sudo find "$creds" -type f -exec chown 10001:10001 {} + -exec chmod 0400 {} +
+          sudo ls -l "$creds"
+          got="$(sudo ls "$creds" | LC_ALL=C sort | xargs)"
+          want="database-url identity.key oauth.key ops-token secrets.key session.key"
+          [ "$got" = "$want" ] || { echo "::error::credentials directory holds '$got', want '$want'"; exit 1; }
+          # The same hardened flags for every container below. The image's
+          # data directory seeds the named volume (owner 10001).
+          cat > "$RUNNER_TEMP/smoke-run.sh" <<EOF
+          SMOKE_RUN=(--network host --read-only --tmpfs /tmp --cap-drop ALL
+            --security-opt no-new-privileges --user 10001:10001
+            -v "$creds:/run/secrets:ro" -v toolyard-smoke-data:/var/lib/toolyard/data)
+          EOF
+
+      - name: Smoke test - migrate
+        run: |
+          set -euo pipefail
+          source "$RUNNER_TEMP/smoke-run.sh"
+          docker run --rm "${SMOKE_RUN[@]}" "$SMOKE_IMAGE" db migrate
+          echo "--- second run applies nothing"
+          docker run --rm "${SMOKE_RUN[@]}" "$SMOKE_IMAGE" db migrate
+          echo "--- keys-check before the first start"
+          docker run --rm "${SMOKE_RUN[@]}" "$SMOKE_IMAGE" keys-check -keys require
+
+      - name: Smoke test - serve
+        # Settings through TOOLYARD_<FLAG> variables (the env layer) and
+        # -keys/-migrate as flags, like a Swarm service or Kubernetes pod.
+        run: |
+          set -euo pipefail
+          source "$RUNNER_TEMP/smoke-run.sh"
+          docker run -d --name toolyard-smoke "${SMOKE_RUN[@]}" \
+            -e TOOLYARD_OPS_ADDR=0.0.0.0:9090 \
+            -e TOOLYARD_OPS_TOKEN_FILE=/run/secrets/ops-token \
+            -e TOOLYARD_STATELESS_MCP=true \
+            -e TOOLYARD_NO_STDIO_UPSTREAMS=true \
+            -e TOOLYARD_NOTES=off -e TOOLYARD_SKILLS=off \
+            -e TOOLYARD_MEMPALACE=off -e TOOLYARD_VOICE=off \
+            -e TOOLYARD_CODEMODE_SANDBOX=auto \
+            -e TOOLYARD_ENVIRONMENT=ci \
+            -e GOMEMLIMIT=200MiB -e GOGC=50 \
+            "$SMOKE_IMAGE" serve -keys require -migrate off
+
+      - name: Smoke test - ready and healthy
+        run: |
+          set -euo pipefail
+          running() { [ "$(docker inspect -f '{{.State.Running}}' toolyard-smoke)" = true ]; }
+          deadline=$((SECONDS + 120))
+          until [ "$(curl -s --max-time 3 http://127.0.0.1:8787/v1/readyz | jq -r .status 2>/dev/null)" = ready ]; do
+            running || { echo "::error::the container exited before it was ready"; exit 1; }
+            [ "$SECONDS" -lt "$deadline" ] || { echo "::error::/v1/readyz not ready within 120 s"; exit 1; }
+            sleep 2
+          done
+          echo "ready after $((SECONDS)) s of this step"
+          # The image HEALTHCHECK (toolyard healthcheck on /v1/livez).
+          deadline=$((SECONDS + 90))
+          until [ "$(docker inspect -f '{{.State.Health.Status}}' toolyard-smoke)" = healthy ]; do
+            running || { echo "::error::the container exited"; exit 1; }
+            [ "$SECONDS" -lt "$deadline" ] || { echo "::error::Docker health is not healthy within 90 s"; docker inspect -f '{{json .State.Health}}' toolyard-smoke; exit 1; }
+            sleep 2
+          done
+          echo "Docker health: healthy"
+
+      - name: Smoke test - code-mode sandbox
+        run: |
+          set -euo pipefail
+          for _ in $(seq 1 30); do
+            sandbox="$(curl -fsS --max-time 3 http://127.0.0.1:8787/v1/health | jq -r .codemode_sandbox)"
+            [ "$sandbox" != probing ] && break
+            sleep 1
+          done
+          echo "codemode_sandbox: $sandbox"
+          echo "- ${{ matrix.arch }}: codemode_sandbox \`$sandbox\`" >> "$GITHUB_STEP_SUMMARY"
+          case "$sandbox" in
+            landlock-*) ;;
+            *) echo "::error::codemode_sandbox is '$sandbox', want landlock-abi-<n>+seccomp"; exit 1 ;;
+          esac
+
+      - name: Smoke test - ops listener and metrics
+        run: |
+          set -euo pipefail
+          code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 3 http://127.0.0.1:9090/metrics)"
+          echo "/metrics without the token: HTTP $code"
+          [ "$code" = 401 ] || { echo "::error::/metrics without the token answered HTTP $code, want 401"; exit 1; }
+          curl -fsS --max-time 3 -H @"$RUNNER_TEMP/ops-auth-header" http://127.0.0.1:9090/metrics > "$RUNNER_TEMP/metrics.txt"
+          grep -E '^toolyard_(build_info|started|keys_verified|db_up)[ {]' "$RUNNER_TEMP/metrics.txt" || true
+          grep -qF "toolyard_build_info{version=\"${VERSION}\"}" "$RUNNER_TEMP/metrics.txt" \
+            || { echo "::error::toolyard_build_info does not carry version ${VERSION}"; exit 1; }
+          for m in toolyard_started toolyard_keys_verified toolyard_db_up; do
+            awk -v m="$m" '$1 == m && $2 == 1 { ok = 1 } END { exit !ok }' "$RUNNER_TEMP/metrics.txt" \
+              || { echo "::error::$m is not 1"; exit 1; }
+          done
+
+      - name: Smoke test - clean stop within 75 s
+        run: |
+          set -euo pipefail
+          start=$SECONDS
+          docker stop -t 75 toolyard-smoke
+          elapsed=$((SECONDS - start))
+          code="$(docker inspect -f '{{.State.ExitCode}}' toolyard-smoke)"
+          echo "stopped in ${elapsed} s with exit code ${code}"
+          docker logs toolyard-smoke 2>&1 | tail -n 20
+          [ "$code" = 0 ] || { echo "::error::exit code ${code} after SIGTERM, want 0"; exit 1; }
+          [ "$elapsed" -lt 75 ] || { echo "::error::stop took ${elapsed} s, want under 75 s"; exit 1; }
+
+      - name: Smoke test - logs on failure
+        if: failure()
+        run: docker logs toolyard-smoke 2>&1 | tail -n 200 || true
+
+      - name: Log in to GHCR
+        if: env.PUBLISH == 'true'
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push by digest
+        id: push
+        if: env.PUBLISH == 'true'
+        # Same inputs as the smoke build, so every layer comes from its cache.
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
+        with:
+          context: .
+          file: deploy/Dockerfile
+          platforms: linux/${{ matrix.arch }}
+          build-args: VERSION=${{ env.VERSION }}
+          labels: org.opencontainers.image.revision=${{ github.sha }}
+          outputs: type=image,name=${{ env.IMAGE }},push-by-digest=true,name-canonical=true,push=true
+          provenance: mode=max
+          sbom: true
+          cache-from: type=gha,scope=image-${{ matrix.arch }}
+
+      - name: Record the digest
+        if: env.PUBLISH == 'true'
+        env:
+          DIGEST: ${{ steps.push.outputs.digest }}
+        run: |
+          set -euo pipefail
+          [[ "$DIGEST" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "::error::bad digest '$DIGEST'"; exit 1; }
+          mkdir -p "$RUNNER_TEMP/digests"
+          touch "$RUNNER_TEMP/digests/${DIGEST#sha256:}"
+          echo "linux/${{ matrix.arch }}: ${IMAGE}@${DIGEST}" | tee -a "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload the digest
+        if: env.PUBLISH == 'true'
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: digest-${{ matrix.arch }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  merge:
+    needs: [tests, image]
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main' && github.repository == 'iamtushar324/toolyard' && needs.tests.result == 'success' && needs.image.result == 'success'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+      attestations: write
+    outputs:
+      digest: ${{ steps.index.outputs.digest }}
+      image: ${{ steps.index.outputs.image }}
+    steps:
+      - name: Download the digests
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: digest-*
+          merge-multiple: true
+          path: ${{ runner.temp }}/digests
+
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+
+      - name: Log in to GHCR
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Create the multi-arch index
+        id: index
+        working-directory: ${{ runner.temp }}/digests
+        env:
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          mapfile -t digests < <(ls)
+          [ "${#digests[@]}" -eq 2 ] || { echo "::error::expected 2 digests, got ${#digests[@]}"; exit 1; }
+          sources=()
+          for d in "${digests[@]}"; do sources+=("${IMAGE}@sha256:${d}"); done
+          docker buildx imagetools create \
+            --tag "${IMAGE}:sha-${SHA}" \
+            --tag "${IMAGE}:main" \
+            --annotation "index:org.opencontainers.image.source=https://github.com/${GITHUB_REPOSITORY}" \
+            --annotation "index:org.opencontainers.image.revision=${SHA}" \
+            --annotation "index:org.opencontainers.image.version=sha-${SHA}" \
+            --annotation "index:org.opencontainers.image.licenses=Apache-2.0" \
+            --annotation "index:org.opencontainers.image.description=Self-hosted MCP gateway for tool access, bounded human permission and agent questions" \
+            "${sources[@]}"
+          digest="$(docker buildx imagetools inspect "${IMAGE}:sha-${SHA}" --format '{{json .Manifest}}' | jq -r .digest)"
+          [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "::error::bad index digest '$digest'"; exit 1; }
+          platforms="$(docker buildx imagetools inspect "${IMAGE}@${digest}" --format '{{json .Manifest}}' \
+            | jq -r '[.manifests[].platform | select(.os != "unknown") | "\(.os)/\(.architecture)"] | sort | join(" ")')"
+          echo "platforms: $platforms"
+          [ "$platforms" = "linux/amd64 linux/arm64" ] || { echo "::error::index platforms are '$platforms'"; exit 1; }
+          echo "digest=${digest}" >> "$GITHUB_OUTPUT"
+          echo "image=${IMAGE}@${digest}" >> "$GITHUB_OUTPUT"
+
+      - name: Attest build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-name: ${{ env.IMAGE }}
+          subject-digest: ${{ steps.index.outputs.digest }}
+          push-to-registry: true
+          # Storage records need an organization-owned repository.
+          create-storage-record: false
+
+      - name: Summary
+        env:
+          SHA: ${{ github.sha }}
+          DIGEST: ${{ steps.index.outputs.digest }}
+        run: |
+          {
+            echo "## Image published"
+            echo
+            echo "Pin this in deployments:"
+            echo
+            echo '```'
+            echo "${IMAGE}@${DIGEST}"
+            echo '```'
+            echo
+            echo "- Tags: \`sha-${SHA}\`, \`main\`"
+            echo "- Platforms: linux/amd64, linux/arm64"
+            echo "- Version stamp: \`sha-${SHA}\`"
+            echo "- Verify: \`gh attestation verify oci://${IMAGE}@${DIGEST} --repo ${GITHUB_REPOSITORY}\`"
+          } >> "$GITHUB_STEP_SUMMARY"
+          echo "image ${IMAGE}@${DIGEST}"

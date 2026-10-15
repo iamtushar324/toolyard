@@ -1,40 +1,91 @@
 # Multi-stage build for toolyard.
 #
-# Single Go binary; the React-style PWA is plain HTML/JS embedded via go:embed
-# so we don't need a Node toolchain in the image.
+# Single Go binary; the dashboard is plain HTML/JS embedded via go:embed, so
+# the image needs no Node toolchain. CGO is on (mattn/go-sqlite3), so each
+# architecture is built natively: the publish workflow
+# (.github/workflows/publish-image.yml) builds linux/amd64 and linux/arm64
+# on their own runners and merges them into one multi-arch index.
+#
+# Both base images are pinned by digest (the multi-arch index digest, with
+# the tag it was read from). Bump the Go image in lock-step with the `go`
+# line in go.mod: CI fails when they differ, and GOTOOLCHAIN=local stops the
+# build from downloading a different toolchain.
 
-FROM golang:1.26-bookworm AS build
+# golang:1.25.5-bookworm (index digest read 2026-10-15)
+FROM golang:1.25.5-bookworm@sha256:d9132cce84391efab786495288756d60e1da215b1f94e87860aeefc3d4c45b6d AS build
+ENV GOTOOLCHAIN=local \
+    CGO_ENABLED=1
 WORKDIR /src
 
-# Cache module deps separately from sources.
+# Cache module downloads separately from the sources.
 COPY go.mod go.sum ./
 RUN go mod download
 
 COPY . .
-RUN CGO_ENABLED=1 go build -trimpath -ldflags "-s -w" -o /out/toolyard ./cmd/gateway
+# VERSION is stamped into the binary (`toolyard version`, /v1/health and
+# toolyard_build_info). The publish workflow passes sha-<commit>.
+ARG VERSION=dev
+RUN go build -trimpath -ldflags "-s -w -X main.version=${VERSION}" -o /out/toolyard ./cmd/gateway \
+ && /out/toolyard version
 
-FROM debian:bookworm-slim
+# debian:bookworm-slim (index digest read 2026-10-15). Same glibc as the
+# build stage, and it keeps a shell for debugging.
+FROM debian:bookworm-slim@sha256:7c7b2c966bc9ee8cedfeef67e0e279108992c77681fa595db4a9d65c06ccc587
 RUN apt-get update \
- && apt-get install -y --no-install-recommends ca-certificates tzdata \
+ && apt-get install -y --no-install-recommends ca-certificates tzdata tini \
  && rm -rf /var/lib/apt/lists/*
 
-RUN useradd --system --uid 10001 --home /var/lib/toolyard --create-home toolyard
+# A fixed numeric uid/gid, so orchestrators that require a non-root user
+# (Kubernetes runAsNonRoot) can verify it, and secret files can be owned by
+# it (Swarm secrets uid/gid 10001). The data directory exists and belongs to
+# that user, so a fresh named volume mounted there is writable.
+RUN groupadd --system --gid 10001 toolyard \
+ && useradd --system --uid 10001 --gid 10001 --home-dir /var/lib/toolyard \
+      --no-create-home --shell /usr/sbin/nologin toolyard \
+ && install -d -o 10001 -g 10001 -m 0750 /var/lib/toolyard \
+ && install -d -o 10001 -g 10001 -m 0700 /var/lib/toolyard/data
 
 COPY --from=build /out/toolyard /usr/local/bin/toolyard
+COPY LICENSE /usr/share/doc/toolyard/LICENSE
 
-USER toolyard
+USER 10001:10001
 WORKDIR /var/lib/toolyard
-ENV TOOLYARD_DATA_DIR=/var/lib/toolyard/data
-# Key files (identity.key, oauth.key, secrets.key, session.key) and an
-# optional toolyard.env are read from Docker secrets here first, then from
-# the data directory. See docs/self-hosting.md, "Keys and credentials".
-ENV TOOLYARD_CREDENTIALS_DIR=/run/secrets
 
-EXPOSE 8787
-# The image has no curl or wget: the binary checks its own readiness probe
-# (exit 0 when /v1/readyz reports "ready", 1 otherwise; 3 s timeout).
-HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --retries=3 \
-  CMD ["/usr/local/bin/toolyard", "healthcheck", "-url", "http://127.0.0.1:8787/v1/readyz", "-expect", "ready"]
+# The root filesystem can be read-only: toolyard writes only to the data
+# directory (crash dumps, the model-price cache, temporary upload files on
+# Postgres; the database itself on SQLite). Mount a volume there.
+ENV TOOLYARD_DATA_DIR=/var/lib/toolyard/data \
+    TOOLYARD_ADDR=:8787 \
+    TOOLYARD_CREDENTIALS_DIR=/run/secrets
+# Key files (identity.key, oauth.key, secrets.key, session.key), database-url,
+# ops-token and an optional toolyard.env are read from TOOLYARD_CREDENTIALS_DIR
+# (where Docker and Swarm mount secrets) before the data directory. See
+# docs/self-hosting.md, "Keys and credentials" and "Containers".
 
-ENTRYPOINT ["/usr/local/bin/toolyard"]
-CMD ["serve", "-addr", ":8787", "-data", "/var/lib/toolyard/data"]
+# 8787: dashboard, /mcp and /v1/*. 9090: the ops listener (/metrics and the
+# probes) when -ops-addr / TOOLYARD_OPS_ADDR enables it.
+EXPOSE 8787 9090
+
+# Liveness, not readiness: a database outage makes /v1/readyz fail, and a
+# restart would not fix it. Route traffic on /v1/readyz in the load balancer
+# instead. The image has no curl or wget, so the binary checks its own probe
+# (exit 0 when the status matches; 3 s timeout). --start-interval needs
+# Docker Engine 25 or later; older engines ignore it.
+HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --start-interval=5s --retries=3 \
+  CMD ["/usr/local/bin/toolyard", "healthcheck", "-url", "http://127.0.0.1:8787/v1/livez", "-expect", "live"]
+
+# SIGTERM starts the drain (up to -drain-timeout, 60 s, plus ~10 s of
+# bounded closes): give the container a stop grace period of 75 s.
+STOPSIGNAL SIGTERM
+
+# tini runs as PID 1: it forwards signals to toolyard and reaps any orphaned
+# grandchildren (stdio upstreams such as npx or uv can leave some).
+ENTRYPOINT ["/usr/bin/tini", "--", "/usr/local/bin/toolyard"]
+CMD ["serve"]
+
+ARG VERSION=dev
+LABEL org.opencontainers.image.title="toolyard" \
+      org.opencontainers.image.description="Self-hosted MCP gateway for tool access, bounded human permission and agent questions" \
+      org.opencontainers.image.source="https://github.com/iamtushar324/toolyard" \
+      org.opencontainers.image.licenses="Apache-2.0" \
+      org.opencontainers.image.version="${VERSION}"

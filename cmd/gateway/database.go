@@ -45,7 +45,7 @@ func (t dbTarget) describe() string {
 }
 
 // resolveDatabase picks the database the same way for serve,
-// operator-token and keys-check:
+// operator-token, keys-check and db migrate:
 //  1. $TOOLYARD_DATABASE_URL (a postgres:// URL), else
 //  2. a file named database-url in $CREDENTIALS_DIRECTORY, then in
 //     credentialsDir, holding that URL (surrounding whitespace trimmed), else
@@ -119,6 +119,74 @@ func openDatabase(ctx context.Context, t dbTarget, maxConns int) (*store.DB, err
 		return db, asDBConfigError(err)
 	}
 	return store.Open(t.Path)
+}
+
+// migrateMode is serve's -migrate flag.
+type migrateMode string
+
+const (
+	// migrateAuto applies pending migrations at startup (on Postgres under
+	// the migration advisory lock): the behaviour before -migrate existed.
+	migrateAuto migrateMode = "auto"
+	// migrateOff applies none: `toolyard db migrate` does, before the
+	// start, and serve refuses a database that is not at its level.
+	migrateOff migrateMode = "off"
+)
+
+// parseMigrateMode parses -migrate. A value it does not know is an error
+// matching keyguard.ErrConfig (exit 78).
+func parseMigrateMode(s string) (migrateMode, error) {
+	switch m := migrateMode(strings.ToLower(strings.TrimSpace(s))); m {
+	case migrateAuto, migrateOff:
+		return m, nil
+	}
+	return "", configErrorf("-migrate must be %q or %q, not %q", migrateAuto, migrateOff, s)
+}
+
+// openDatabaseNoMigrate opens t read-write and applies no migration (serve
+// -migrate=off), then checks the schema level: when the database does not
+// record every migration this binary knows, it is closed and the error
+// matches keyguard.ErrConfig (exit 78) and says to run toolyard db
+// migrate. A SQLite file that does not exist is the same error, and is not
+// created. The second result lists the migrations the database records
+// that this binary does not know (a newer toolyard migrated it): they do
+// not stop the start, as with -migrate=auto, and the caller logs them.
+func openDatabaseNoMigrate(ctx context.Context, t dbTarget, maxConns int) (*store.DB, []string, error) {
+	var db *store.DB
+	var err error
+	if t.isPostgres() {
+		db, err = store.OpenPostgresWith(ctx, t.URL, store.PostgresOptions{MaxConns: maxConns, NoMigrate: true})
+		if err != nil {
+			return nil, nil, asDBConfigError(err)
+		}
+	} else {
+		db, err = store.OpenNoMigrate(t.Path)
+		if errors.Is(err, iofs.ErrNotExist) {
+			return nil, nil, dbConfigErrorf("-migrate=off and %s does not exist: run `toolyard db migrate` with the same -data and -credentials-dir to create it, then start again", t.Path)
+		}
+		if err != nil {
+			return nil, nil, err
+		}
+	}
+	pending, unknown, err := store.MigrationStatus(ctx, db)
+	if err != nil {
+		_ = db.Close()
+		return nil, nil, fmt.Errorf("check the schema level: %w", err)
+	}
+	if len(pending) > 0 {
+		_ = db.Close()
+		return nil, nil, dbConfigErrorf("-migrate=off, but the database does not record %d migration(s) this binary needs (%s): "+
+			"run `toolyard db migrate` with the same database settings, then start again", len(pending), nameList(pending, 3))
+	}
+	return db, unknown, nil
+}
+
+// nameList joins up to limit names, then says how many more there are.
+func nameList(names []string, limit int) string {
+	if len(names) <= limit {
+		return strings.Join(names, ", ")
+	}
+	return fmt.Sprintf("%s and %d more", strings.Join(names[:limit], ", "), len(names)-limit)
 }
 
 // asDBConfigError makes an error matching store.ErrConfig also match

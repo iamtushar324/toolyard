@@ -7,6 +7,8 @@
 //	toolyard probe      dry-run a tool against an upstream MCP server
 //	toolyard healthcheck  check a liveness or readiness probe (container HEALTHCHECK)
 //	toolyard keys-check   read-only check that every master key would load
+//	toolyard keys generate  write fresh master keys (stdout, a file, or all four in a directory)
+//	toolyard db migrate|copy|verify  apply schema migrations; move SQLite to Postgres
 //	toolyard version    print version
 package main
 
@@ -124,6 +126,8 @@ func main() {
 		err = runHealthcheck(args)
 	case "keys-check":
 		err = runKeysCheck(args)
+	case "keys":
+		err = runKeys(args)
 	case "db":
 		err = runDB(args)
 	case "version", "-v", "--version":
@@ -247,13 +251,27 @@ func usage() {
 
 Commands:
   serve       run gateway + HTTP dashboard (default ports: stdio + :8787)
+              -migrate auto|off: apply pending schema migrations at startup (auto), or apply none and
+              refuse to start (exit 78) unless the database is at this binary's level (off)
   exchange    swap an enrollment code for an agent token
   probe       dry-run a tool against an upstream MCP server
   operator-token  create | list | revoke CLI operator tokens (local, from -data)
-  healthcheck check a probe: -url <probe URL> -expect ready|live (exit 0 or 1)
+  healthcheck check a probe: -url <probe URL> -expect ready|live [-token-file <path>] (exit 0 or 1)
   keys-check  read-only check that every master key would load: -data <dir> [-credentials-dir <dir>] (exit 0 or 78)
-  db          copy | verify: move a stopped SQLite installation to Postgres and prove the copy (-from-data <dir>)
+  keys        generate -name identity|oauth|secrets|session [-out <file>]: one fresh key to stdout or a new file
+              generate -all -dir <dir>: all four as <name>.key (mode 0600; never overwrites a file)
+  db          migrate [-dry-run]: apply pending schema migrations to the database serve uses (exit 0, 78 on a config error)
+              copy | verify: move a stopped SQLite installation to Postgres and prove the copy (-from-data <dir>)
   version     print version
+
+Environment:
+  Every serve flag can also be set as TOOLYARD_<FLAG>: the flag name upper-cased, with - as _
+  (-public-url is TOOLYARD_PUBLIC_URL, -db-max-conns is TOOLYARD_DB_MAX_CONNS, -migrate is
+  TOOLYARD_MIGRATE). The command line wins; an empty variable counts as unset. They may also come
+  from toolyard.env in the credentials directory, except TOOLYARD_CREDENTIALS_DIR. keys-check,
+  operator-token and db migrate read TOOLYARD_DATA (or TOOLYARD_DATA_DIR) and TOOLYARD_CREDENTIALS_DIR,
+  keys-check also TOOLYARD_KEYS; healthcheck reads TOOLYARD_HEALTHCHECK_URL, _EXPECT and _TOKEN_FILE.
+  -inbox-reset-passkeys is command line only. Secrets go in files, never in variables.
 
 Run 'toolyard <command> -h' for command flags.`)
 }
@@ -281,6 +299,8 @@ func runServe(argv []string) error {
 	trustedProxies := fs.String("trusted-proxy", "", "comma-separated CIDRs to trust for X-Forwarded-* headers (e.g. 127.0.0.1/32,::1/128,10.0.0.0/8)")
 	// TEC-1626 keys and ops listener
 	keysFlag := fs.String("keys", string(keyguard.CreateIfFresh), "master keys: create-if-fresh (create a missing key only for a new, empty database) | require (never create; every key must be provided)")
+	// TEC-1638: migrations run in the deploy (toolyard db migrate), not at start.
+	migrateFlag := fs.String("migrate", string(migrateAuto), "schema migrations at startup: auto (apply pending migrations; on Postgres under an advisory lock) | off (apply none; refuse to start, exit 78, unless the database records every migration this binary knows: run toolyard db migrate first)")
 	credentialsDir := fs.String("credentials-dir", os.Getenv("TOOLYARD_CREDENTIALS_DIR"), "directory searched for key files (identity.key, oauth.key, secrets.key, session.key), toolyard.env and database-url after $CREDENTIALS_DIRECTORY and before -data, e.g. /run/secrets. Defaults to $TOOLYARD_CREDENTIALS_DIR.")
 	dbMaxConns := fs.Int("db-max-conns", store.DefaultPostgresMaxConns, "Postgres only: the most connections the database pool opens. Postgres is selected by $TOOLYARD_DATABASE_URL or a database-url file in the credentials directory; otherwise toolyard uses SQLite at <data>/toolyard.db, always with one connection.")
 	opsAddr := fs.String("ops-addr", "", "comma-separated listen addresses for the ops listener (/metrics, /v1/livez, /v1/readyz), e.g. 127.0.0.1:9090. Empty = off. A non-private address needs -ops-token-file.")
@@ -320,6 +340,21 @@ func runServe(argv []string) error {
 	logFormat := fs.String("log-format", "json", "log format: json | text. Text is friendlier in a terminal; json is what journalctl + jq want.")
 	_ = fs.Parse(argv)
 
+	// TEC-1638: every flag not given on the command line may come from
+	// TOOLYARD_<FLAG> (envconfig.go): the process environment first, then,
+	// after toolyard.env in $CREDENTIALS_DIRECTORY or -credentials-dir is
+	// loaded (TEC-1626; it fills variables that are still unset), the
+	// variables it added, for every flag but -credentials-dir (the file is
+	// found through it). Logging is not set up yet: report below.
+	envRep, err := loadFlagEnv(fs, processEnv(), credentialsDir)
+	if err != nil {
+		return err
+	}
+	migrate, err := parseMigrateMode(*migrateFlag)
+	if err != nil {
+		return err
+	}
+
 	// Initialize structured logging first so every subsequent log line
 	// flows through slog. The stdlib `log` package gets re-routed too via
 	// logx.Bridge() so existing log.Printf callers don't need to migrate
@@ -328,6 +363,16 @@ func runServe(argv []string) error {
 	log.SetFlags(0)
 	log.SetOutput(logx.Bridge())
 	rootLog := logx.For("gateway")
+	if len(envRep.loaded) > 0 {
+		log.Printf("toolyard: loaded environment from %s", strings.Join(envRep.loaded, ", "))
+	}
+	if len(envRep.variables) > 0 {
+		// Names only: values are never logged.
+		log.Printf("toolyard: flags set from the environment: %s", strings.Join(envRep.variables, ", "))
+	}
+	for _, w := range envRep.warnings {
+		rootLog.Warn(w)
+	}
 
 	// Crash dumps go next to the data dir so the same backup that
 	// captures toolyard.db captures the crash archive too.
@@ -361,17 +406,10 @@ func runServe(argv []string) error {
 	}
 
 	// Clerk (Google) sign-in: on only when all three TOOLYARD_CLERK_* env
-	// vars are set (they come from the systemd EnvironmentFile or .env,
-	// never argv). A partial set, or Clerk without -public-url, refuses to
-	// start rather than run half-configured.
-	//
-	// TEC-1626: a toolyard.env in $CREDENTIALS_DIRECTORY or
-	// -credentials-dir fills variables that are still unset first.
-	if loaded, err := keyguard.LoadEnvFiles(*credentialsDir); err != nil {
-		return err
-	} else if len(loaded) > 0 {
-		log.Printf("toolyard: loaded environment from %s", strings.Join(loaded, ", "))
-	}
+	// vars are set (they come from the systemd EnvironmentFile, .env or
+	// toolyard.env, loaded above, never argv). A partial set, or Clerk
+	// without -public-url, refuses to start rather than run
+	// half-configured.
 	clerkClient, clerkFAPI, cerr := clerkFromEnv(*publicURL, *ownerEmail, *clerkOwnerOnly)
 	if cerr != nil {
 		return cerr
@@ -398,7 +436,15 @@ func runServe(argv []string) error {
 	if err != nil {
 		return err
 	}
-	db, err := openDatabase(context.Background(), dbChoice, *dbMaxConns)
+	// TEC-1638 -migrate=off: the deploy ran `toolyard db migrate`; open
+	// without migrating and refuse (exit 78) a database behind this binary.
+	var db *store.DB
+	var unknownMigrations []string
+	if migrate == migrateOff {
+		db, unknownMigrations, err = openDatabaseNoMigrate(context.Background(), dbChoice, *dbMaxConns)
+	} else {
+		db, err = openDatabase(context.Background(), dbChoice, *dbMaxConns)
+	}
 	if err != nil {
 		return fmt.Errorf("open db (%s): %w", dbChoice.describe(), err)
 	}
@@ -406,7 +452,11 @@ func runServe(argv []string) error {
 	// (lifecycle.go); this deferred call only acts on an early return.
 	closeDB := closeOnce("database", closeTimeout, db.CloseContext)
 	defer closeDB()
-	log.Printf("toolyard: db %s (selected by %s)", dbChoice.describe(), dbChoice.Source)
+	log.Printf("toolyard: db %s (selected by %s; -migrate=%s)", dbChoice.describe(), dbChoice.Source, migrate)
+	if len(unknownMigrations) > 0 {
+		rootLog.Warn("the database records migrations this binary does not know: a newer toolyard migrated it",
+			"count", len(unknownMigrations), "migrations", nameList(unknownMigrations, 5))
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -1532,8 +1582,13 @@ func runProbe(argv []string) error {
 
 // ---- helpers ----------------------------------------------------------------
 
-func defaultDataDir() string {
-	if d := os.Getenv("TOOLYARD_DATA_DIR"); d != "" {
+func defaultDataDir() string { return defaultDataDirFrom(os.Getenv) }
+
+// defaultDataDirFrom is the default of -data: $TOOLYARD_DATA_DIR, else
+// ~/.toolyard. (TOOLYARD_DATA, the environment layer's variable for -data,
+// wins over both.)
+func defaultDataDirFrom(getenv func(string) string) string {
+	if d := getenv("TOOLYARD_DATA_DIR"); d != "" {
 		return d
 	}
 	if home, err := os.UserHomeDir(); err == nil {

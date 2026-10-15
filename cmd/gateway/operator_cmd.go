@@ -12,7 +12,6 @@ import (
 
 	"github.com/tusharbhardwaj/toolyard/internal/audit"
 	"github.com/tusharbhardwaj/toolyard/internal/identity"
-	"github.com/tusharbhardwaj/toolyard/internal/keyguard"
 )
 
 // runOperatorToken manages operator tokens straight from the data directory.
@@ -40,9 +39,16 @@ func runOperatorToken(argv []string) error {
 	}
 	// The same database as serve (TEC-1635): Postgres from
 	// $TOOLYARD_DATABASE_URL or a database-url credential, else
-	// <data>/toolyard.db.
-	if _, err := keyguard.LoadEnvFiles(*credentialsDir); err != nil {
+	// <data>/toolyard.db. TOOLYARD_DATA (or TOOLYARD_DATA_DIR) and
+	// TOOLYARD_CREDENTIALS_DIR set the flags the command line did not, and
+	// a toolyard.env in the credentials directories fills unset variables
+	// (envconfig.go).
+	rep, err := loadFlagEnv(fs, processEnv(), credentialsDir, "data", "credentials-dir")
+	if err != nil {
 		return err
+	}
+	for _, w := range rep.warnings {
+		fmt.Fprintln(os.Stderr, "warning:", w)
 	}
 	target, err := resolveDatabase(*dataDir, *credentialsDir, os.Getenv)
 	if err != nil {
