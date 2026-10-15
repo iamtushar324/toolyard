@@ -21,7 +21,7 @@ import (
 )
 
 const dbUsageText = `usage:
-  toolyard db migrate [-data DIR] [-credentials-dir DIR] [-dry-run] [-timeout 10m]
+  toolyard db migrate [-data DIR] [-credentials-dir DIR] [-dry-run] [-timeout 10m] [-db-connect-timeout 60s]
   toolyard db copy    -from-data DIR [-credentials-dir DIR] [-truncate-target] [-allow-live-source] [-json PATH]
   toolyard db verify  -from-data DIR [-credentials-dir DIR] [-allow-live-source] [-json PATH]
 
@@ -33,9 +33,11 @@ DIR/toolyard.db (created when missing). On Postgres it holds the same
 advisory lock as serve while it migrates. It prints each migration it
 applied, or "up to date", and exits 0; a setting that is missing or wrong
 exits 78. -dry-run lists the pending migrations and applies none; it opens
-the database read-only. Run it before serve -migrate=off starts.
-TOOLYARD_DATA (or TOOLYARD_DATA_DIR) and TOOLYARD_CREDENTIALS_DIR set -data
-and -credentials-dir when they are not given.
+the database read-only. Run it before serve -migrate=off starts. As serve
+does, it keeps trying a Postgres server it cannot reach for
+-db-connect-timeout (an Aurora failover). TOOLYARD_DATA (or
+TOOLYARD_DATA_DIR), TOOLYARD_CREDENTIALS_DIR and TOOLYARD_DB_CONNECT_TIMEOUT
+set -data, -credentials-dir and -db-connect-timeout when they are not given.
 
 copy loads a stopped SQLite installation (DIR/toolyard.db and the blob files
 in DIR/inbox/blobs) into an empty Postgres database: every table and every
@@ -102,13 +104,14 @@ func runDBMigrate(ctx context.Context, argv []string, stdout, stderr io.Writer, 
 		"directory searched after $CREDENTIALS_DIRECTORY for database-url and toolyard.env, as for serve. Defaults to $TOOLYARD_CREDENTIALS_DIR.")
 	dryRun := fs.Bool("dry-run", false, "list the pending migrations and apply none; the database is opened read-only")
 	timeout := fs.Duration("timeout", 10*time.Minute, "give up after this long, the wait for the migration lock included; 0 means no limit")
+	connectTimeout := fs.Duration("db-connect-timeout", defaultDBConnectTimeout, dbConnectTimeoutUsage)
 	if err := fs.Parse(argv); err != nil {
 		return err
 	}
 	if fs.NArg() > 0 {
 		return fmt.Errorf("toolyard db migrate: unexpected arguments %q", fs.Args())
 	}
-	rep, err := loadFlagEnv(fs, env, credentialsDir, "data", "credentials-dir")
+	rep, err := loadFlagEnv(fs, env, credentialsDir, "data", "credentials-dir", "db-connect-timeout")
 	if err != nil {
 		return err
 	}
@@ -117,6 +120,9 @@ func runDBMigrate(ctx context.Context, argv []string, stdout, stderr io.Writer, 
 	}
 	if *timeout < 0 {
 		return configErrorf("toolyard db migrate: -timeout must not be negative")
+	}
+	if err := checkConnectTimeout(*connectTimeout); err != nil {
+		return err
 	}
 	if *timeout > 0 {
 		var cancel context.CancelFunc
@@ -127,12 +133,15 @@ func runDBMigrate(ctx context.Context, argv []string, stdout, stderr io.Writer, 
 	if err != nil {
 		return err
 	}
-	return dbMigrate(ctx, target, *dataDir, *dryRun, stdout)
+	logf := func(format string, args ...any) { fmt.Fprintf(stderr, format+"\n", args...) }
+	return dbMigrate(ctx, target, *dataDir, *dryRun, *connectTimeout, logf, stdout)
 }
 
 // dbMigrate applies the pending migrations of target (or, with dryRun,
-// lists them) and prints what it did.
-func dbMigrate(ctx context.Context, target dbTarget, dataDir string, dryRun bool, w io.Writer) error {
+// lists them) and prints what it did on w. A Postgres server it cannot
+// reach is tried again for connectTimeout (openPostgresRetry; logf gets the
+// retries).
+func dbMigrate(ctx context.Context, target dbTarget, dataDir string, dryRun bool, connectTimeout time.Duration, logf func(string, ...any), w io.Writer) error {
 	line := func(label, text string) { fmt.Fprintf(w, "%-8s %s\n", label, text) }
 	line("database", fmt.Sprintf("%s (from %s)", target.describe(), target.Source))
 
@@ -144,7 +153,7 @@ func dbMigrate(ctx context.Context, target dbTarget, dataDir string, dryRun bool
 		if dryRun {
 			opts = store.PostgresOptions{MaxConns: 1, ReadOnly: true}
 		}
-		pdb, err := store.OpenPostgresWith(ctx, target.URL, opts)
+		pdb, err := openPostgresRetry(ctx, target, opts, connectTimeout, logf)
 		if err != nil {
 			return asDBConfigError(fmt.Errorf("toolyard db migrate: open %s: %w", target.describe(), err))
 		}
@@ -210,39 +219,47 @@ func dbMigrate(ctx context.Context, target dbTarget, dataDir string, dryRun bool
 	}
 
 	if db == nil {
-		// SQLite that does not exist yet: Open creates and migrates it,
-		// in a data directory only its owner can read, as serve does.
+		// SQLite that does not exist yet: an empty file (a new database)
+		// only its owner can read, in a data directory only its owner can
+		// read, as serve makes it; then it is migrated below.
 		if err := os.MkdirAll(dataDir, 0o700); err != nil {
 			return fmt.Errorf("toolyard db migrate: %w", err)
 		}
-		sdb, err := store.Open(target.Path)
+		f, err := os.OpenFile(target.Path, os.O_WRONLY|os.O_CREATE, 0o600)
 		if err != nil {
 			return fmt.Errorf("toolyard db migrate: create %s: %w", target.Path, err)
 		}
+		if err := f.Close(); err != nil {
+			return fmt.Errorf("toolyard db migrate: create %s: %w", target.Path, err)
+		}
+		sdb, err := store.OpenNoMigrate(target.Path)
+		if err != nil {
+			return fmt.Errorf("toolyard db migrate: open %s: %w", target.Path, err)
+		}
 		db = sdb
 		defer db.Close()
-	} else if err := db.Migrate(ctx); err != nil {
+	}
+	// The names Migrate returns are those this run applied, read and
+	// written under the migration lock on Postgres: a run that waited for
+	// another never claims that one's work.
+	applied, err := db.Migrate(ctx)
+	for _, n := range applied {
+		line("applied", n)
+	}
+	if err != nil {
 		return fmt.Errorf("toolyard db migrate: %w", err)
 	}
 	after, _, err := store.MigrationStatus(ctx, db)
 	if err != nil {
 		return fmt.Errorf("toolyard db migrate: read the schema level after migrating: %w", err)
 	}
-	still := map[string]bool{}
-	for _, n := range after {
-		still[n] = true
-	}
-	applied := 0
-	for _, n := range before {
-		if !still[n] {
-			line("applied", n)
-			applied++
-		}
-	}
 	if len(after) > 0 {
 		return fmt.Errorf("toolyard db migrate: %d migration(s) still pending after migrating: %s", len(after), nameList(after, 5))
 	}
-	line("result", fmt.Sprintf("applied %d; the database records all %d migrations this binary knows", applied, known))
+	if len(applied) < len(before) {
+		line("note", fmt.Sprintf("another run applied %d of the %d pending migrations while this one waited", len(before)-len(applied), len(before)))
+	}
+	line("result", fmt.Sprintf("applied %d; the database records all %d migrations this binary knows", len(applied), known))
 	return nil
 }
 

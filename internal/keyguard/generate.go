@@ -56,19 +56,44 @@ func GenerateKey() (key, encoded []byte, err error) {
 	return key, encoded, nil
 }
 
+// createKeyFile is sealbox.CreateKeyFile; tests replace it to make a write
+// fail after the file was created.
+var createKeyFile = sealbox.CreateKeyFile
+
 // WriteNewKeyFile writes a new random key named name (a ServeKeys file name)
 // to path with sealbox.CreateKeyFile, the function serve uses to create a
 // key: mode 0600, fsynced, and never over an existing file (that error
-// wraps fs.ErrExist).
+// wraps fs.ErrExist). When the write fails after the file was created (a
+// write, fsync or directory sync error), the half-written file is removed,
+// so a retry starts clean. A file this call did not create is never
+// removed: an existing path is refused before anything else, and a failed
+// open of path itself removes nothing.
 func WriteNewKeyFile(path, name string) (GeneratedKey, error) {
-	key, err := sealbox.CreateKeyFile(path)
+	if _, err := os.Lstat(path); err == nil {
+		return GeneratedKey{}, fmt.Errorf("%s already exists; a key file is never overwritten: %w", path, fs.ErrExist)
+	}
+	key, err := createKeyFile(path)
 	if errors.Is(err, fs.ErrExist) {
+		// Someone else's file: never touch it.
 		return GeneratedKey{}, fmt.Errorf("%s already exists; a key file is never overwritten: %w", path, err)
 	}
 	if err != nil {
+		if !openFailed(err, path) {
+			// The O_EXCL open made the file (or nothing at all, when
+			// reading random bytes failed: then Remove finds nothing).
+			_ = os.Remove(path)
+		}
 		return GeneratedKey{}, fmt.Errorf("write %s: %w", path, err)
 	}
 	return GeneratedKey{Name: name, Path: path, KeyID: KeyID(name, key)}, nil
+}
+
+// openFailed reports that err is the failure to open path itself (EMFILE,
+// EACCES and the like): the create then made no file, and whatever is at
+// path belongs to someone else.
+func openFailed(err error, path string) bool {
+	var pe *fs.PathError
+	return errors.As(err, &pe) && pe.Op == "open" && pe.Path == path
 }
 
 // WriteNewKeyFiles writes a new random key file for each spec into dir, as

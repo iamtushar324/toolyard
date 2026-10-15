@@ -4,8 +4,10 @@ import (
 	"errors"
 	"flag"
 	"io"
+	iofs "io/fs"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -321,5 +323,99 @@ func TestParseMigrateMode(t *testing.T) {
 		if _, err := parseMigrateMode(in); !errors.Is(err, keyguard.ErrConfig) {
 			t.Errorf("parseMigrateMode(%q): %v, want a configuration error", in, err)
 		}
+	}
+}
+
+// serve warns about each TOOLYARD_ variable that sets none of its flags and
+// that nothing reads (a misspelt name), naming the variable and never its
+// value; flag variables, the variables the code reads itself and empty
+// ones get no warning.
+func TestUnknownEnvWarnings(t *testing.T) {
+	f := newTestFlags(t)
+	environ := []string{
+		"TOOLYARD_KEY=value-one-require",                      // misspelt
+		"TOOLYARD_KEY=value-two",                              // same name again: one warning
+		"TOOLYARD_ADDR=:1",                                    // a flag
+		"TOOLYARD_DATA_DIR=/value/data",                       // the older variable for -data
+		"TOOLYARD_DATABASE_URL=postgres://u:s3cret-value@h/d", // read by the code
+		"TOOLYARD_DATABASE_URL_FILE=/value/database-url",      // not supported: warn
+		"TOOLYARD_CLERK_SECRET_KEY_FILE=/value/clerk",         // read by the code
+		"TOOLYARD_CLERK_SECRET=value-clerk",                   // misspelt
+		"TOOLYARD_HEALTHCHECK_TOKEN_FILE=/value/ops-token",    // the healthcheck command's
+		"TOOLYARD_CODEMODE_SANDBOX=auto",                      // the code-mode sandbox's
+		"TOOLYARD_INBOX_RESET_PASSKEYS=true",                  // command line only
+		"TOOLYARD_EMPTY=",                                     // empty: unset
+		"PATH=/usr/bin",
+		"NOT_TOOLYARD_X=1",
+		"malformed",
+	}
+	got := unknownEnvWarnings(f.fs, environ)
+	var names []string
+	for _, w := range got {
+		names = append(names, strings.Fields(w)[0])
+		for _, v := range []string{"value-one", "value-two", "s3cret-value", "/value/", "value-clerk", "true"} {
+			if strings.Contains(w, v) {
+				t.Errorf("warning %q shows a value (%s)", w, v)
+			}
+		}
+	}
+	want := "TOOLYARD_CLERK_SECRET,TOOLYARD_DATABASE_URL_FILE,TOOLYARD_INBOX_RESET_PASSKEYS,TOOLYARD_KEY"
+	if strings.Join(names, ",") != want {
+		t.Fatalf("warned about %v, want %s:\n%s", names, want, strings.Join(got, "\n"))
+	}
+	for _, w := range got {
+		if strings.HasPrefix(w, "TOOLYARD_INBOX_RESET_PASSKEYS") && !strings.Contains(w, "command line only") {
+			t.Errorf("command-line-only flag: %q", w)
+		}
+		if strings.HasPrefix(w, "TOOLYARD_KEY ") && !strings.Contains(w, "serve") {
+			t.Errorf("unknown variable: %q does not name the command", w)
+		}
+	}
+	if w := unknownEnvWarnings(f.fs, nil); len(w) != 0 {
+		t.Fatalf("no environment: %v", w)
+	}
+}
+
+// Every TOOLYARD_ name the code spells out as a string literal is one it
+// reads itself (knownEnv, knownEnvPrefixes), a prefix (it ends in _) or a
+// flag's variable (envAliases), so unknownEnvWarnings never warns about a
+// variable the code reads. Flag variables are built from flag names and
+// never spelt out. A new os.Getenv("TOOLYARD_...") must be added to knownEnv.
+func TestKnownEnvCoversEveryVariableTheCodeReads(t *testing.T) {
+	literal := regexp.MustCompile(`"(TOOLYARD_[A-Z0-9_]*)"`)
+	var missing []string
+	files := 0
+	for _, root := range []string{filepath.Join("..", "..", "cmd"), filepath.Join("..", "..", "internal")} {
+		err := filepath.WalkDir(root, func(path string, d iofs.DirEntry, err error) error {
+			if err != nil {
+				return err
+			}
+			if d.IsDir() || !strings.HasSuffix(path, ".go") || strings.HasSuffix(path, "_test.go") {
+				return nil
+			}
+			b, err := os.ReadFile(path)
+			if err != nil {
+				return err
+			}
+			files++
+			for _, m := range literal.FindAllStringSubmatch(string(b), -1) {
+				name := m[1]
+				if strings.HasSuffix(name, "_") || knownEnvVar(name) || envAliases[name] != nil {
+					continue
+				}
+				missing = append(missing, path+": "+name)
+			}
+			return nil
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	if files < 50 {
+		t.Fatalf("read only %d Go files: wrong directory?", files)
+	}
+	if len(missing) > 0 {
+		t.Fatalf("TOOLYARD_ variables the code reads but knownEnv does not list (unknownEnvWarnings would warn about them):\n%s",
+			strings.Join(missing, "\n"))
 	}
 }

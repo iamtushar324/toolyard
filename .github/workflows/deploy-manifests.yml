@@ -1,7 +1,8 @@
 # Validates the deployment examples without a cluster:
 #   - deploy/k8s/base: kustomize build | kubeconform -strict (Kubernetes
 #     schemas), with pinned, checksum-verified tool downloads;
-#   - deploy/swarm/stack.example.yml: docker compose config.
+#   - deploy/swarm/stack.example.yml: docker stack config (the loader
+#     docker stack deploy uses) and docker compose config.
 name: Deploy manifests
 
 on:
@@ -72,7 +73,17 @@ jobs:
         env:
           # Any well-formed digest reference: config only renders the file.
           TOOLYARD_IMAGE: ghcr.io/iamtushar324/toolyard@sha256:0000000000000000000000000000000000000000000000000000000000000000
+        # docker stack config runs the loader and schema `docker stack deploy`
+        # uses, on the client only: the CLI's "swarm" annotation on the stack
+        # commands hides them in help but is not checked before they run, so
+        # no swarm mode is needed (docker/cli cmd/docker/docker.go,
+        # areSubcommandsSupported). docker compose config adds a check
+        # against the Compose Specification.
         run: |
           set -euo pipefail
+          docker version --format 'client {{.Client.Version}}, server {{.Server.Version}}'
           docker compose version
-          docker compose -f deploy/swarm/stack.example.yml config
+          echo "--- docker stack config"
+          docker stack config -c deploy/swarm/stack.example.yml
+          echo "--- docker compose config"
+          docker compose -f deploy/swarm/stack.example.yml config --quiet

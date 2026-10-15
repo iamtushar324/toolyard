@@ -28,8 +28,10 @@ package main
 //
 // An empty variable counts as unset. A value the flag refuses is a
 // configuration error (exit 78) that names the variable but never shows
-// the value. Variables that name no flag are ignored. Secrets stay in
-// files: no flag holds one, only paths to them.
+// the value. Variables that name no flag are ignored, but serve logs a
+// warning for each one the code does not read itself either (a misspelt
+// name; unknownEnvWarnings). Secrets stay in files: no flag holds one, only
+// paths to them.
 
 import (
 	"flag"
@@ -56,6 +58,91 @@ var envAliases = map[string][]string{
 // service's environment and run again on every restart.
 var commandLineOnly = map[string]bool{
 	"inbox-reset-passkeys": true,
+}
+
+// knownEnv are the TOOLYARD_ variables the code reads itself rather than
+// through a flag, in this binary (serve and its subcommands, the code-mode
+// worker) and in the toolyard admin CLI and bifrost-import, whose variables
+// can sit in the same environment. unknownEnvWarnings is quiet about them.
+// TestKnownEnvCoversEveryVariableTheCodeReads keeps the list complete.
+var knownEnv = map[string]bool{
+	databaseURLEnv:                        true, // database.go
+	"TOOLYARD_CREDENTIALS_DIR":            true, // default of -credentials-dir
+	"TOOLYARD_DATA_DIR":                   true, // default of -data
+	"TOOLYARD_VOICE_MODEL":                true, // default of -voice-model
+	"TOOLYARD_ENVIRONMENT":                true,
+	"TOOLYARD_INBOX_VOICE_MODEL":          true,
+	"TOOLYARD_MEMPALACE_BIN":              true, // internal/mempalace
+	"TOOLYARD_CLERK_SECRET_KEY":           true, // clerkFromEnv, with the _FILE forms
+	"TOOLYARD_CLERK_SECRET_KEY_FILE":      true,
+	"TOOLYARD_CLERK_PUBLISHABLE_KEY":      true,
+	"TOOLYARD_CLERK_PUBLISHABLE_KEY_FILE": true,
+	"TOOLYARD_CLERK_ORGANIZATION_ID":      true,
+	"TOOLYARD_CLERK_ORGANIZATION_ID_FILE": true,
+	"TOOLYARD_SERVER":                     true, // cmd/toolyard (admin CLI)
+	"TOOLYARD_OPERATOR_TOKEN":             true,
+	"TOOLYARD_OPERATOR_TOKEN_FILE":        true,
+	"TOOLYARD_PASSWORD":                   true, // cmd/bifrost-import
+	// deploy/stage/toolyard-stage.service loads it from its EnvironmentFile
+	// and expands it into -owner-email.
+	"TOOLYARD_STAGE_OWNER_EMAIL": true,
+}
+
+// knownEnvPrefixes are families of variables the code reads itself: the
+// healthcheck command's, the code-mode sandbox and worker's
+// (TOOLYARD_CODEMODE_SANDBOX, internal/codemode) and the test harness's
+// (internal/store/storetest).
+var knownEnvPrefixes = []string{healthcheckEnvPrefix, "TOOLYARD_CODEMODE_", "TOOLYARD_TEST_"}
+
+func knownEnvVar(key string) bool {
+	if knownEnv[key] {
+		return true
+	}
+	for _, p := range knownEnvPrefixes {
+		if strings.HasPrefix(key, p) {
+			return true
+		}
+	}
+	return false
+}
+
+// unknownEnvWarnings returns, sorted, a warning for each TOOLYARD_ variable
+// in environ (KEY=value entries, as os.Environ returns them) that sets no
+// flag of fs and that the code does not read itself (knownEnv): a misspelt
+// name such as TOOLYARD_KEY for TOOLYARD_KEYS would otherwise be ignored
+// without a word. A variable for a command-line-only flag gets its own
+// warning. A warning names the variable, never its value. An empty
+// variable counts as unset and gets none.
+func unknownEnvWarnings(fs *flag.FlagSet, environ []string) []string {
+	flagVars := map[string]string{} // variable -> flag name
+	fs.VisitAll(func(f *flag.Flag) {
+		k := envName(envPrefix, f.Name)
+		flagVars[k] = f.Name
+		for _, alias := range envAliases[k] {
+			flagVars[alias] = f.Name
+		}
+	})
+	seen := map[string]bool{}
+	var out []string
+	for _, kv := range environ {
+		key, val, ok := strings.Cut(kv, "=")
+		if !ok || !strings.HasPrefix(key, envPrefix) || strings.TrimSpace(val) == "" || seen[key] {
+			continue
+		}
+		seen[key] = true
+		if name, isFlag := flagVars[key]; isFlag {
+			if commandLineOnly[name] {
+				out = append(out, fmt.Sprintf("%s is ignored: -%s is set on the command line only", key, name))
+			}
+			continue
+		}
+		if knownEnvVar(key) {
+			continue
+		}
+		out = append(out, fmt.Sprintf("%s is ignored: %s has no flag for it and nothing reads it (a misspelt name?)", key, fs.Name()))
+	}
+	sort.Strings(out)
+	return out
 }
 
 // envName returns the variable that sets the flag name under prefix.

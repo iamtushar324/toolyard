@@ -152,3 +152,73 @@ func TestWriteNewKeyFilesNeverOverwrite(t *testing.T) {
 		t.Fatal("WriteNewKeyFiles into a file succeeded")
 	}
 }
+
+// A write that fails after the file was created leaves no half-written key
+// file behind, and WriteNewKeyFiles removes the keys it wrote before, so a
+// retry starts clean.
+func TestWriteNewKeyFilesCleanUpAfterAFailedWrite(t *testing.T) {
+	orig := createKeyFile
+	t.Cleanup(func() { createKeyFile = orig })
+	calls := 0
+	createKeyFile = func(path string) ([]byte, error) {
+		calls++
+		if calls < 3 {
+			return orig(path)
+		}
+		// Created (O_EXCL), then the write fails part-way.
+		f, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+		if err != nil {
+			return nil, err
+		}
+		_, _ = f.WriteString("half-")
+		_ = f.Close()
+		return nil, errors.New("injected write failure")
+	}
+
+	dir := t.TempDir()
+	_, err := WriteNewKeyFiles(dir, ServeKeys())
+	if err == nil || !strings.Contains(err.Error(), "injected write failure") {
+		t.Fatalf("WriteNewKeyFiles with a failing third write: %v", err)
+	}
+	if entries, _ := os.ReadDir(dir); len(entries) != 0 {
+		t.Fatalf("files left after a failed run: %v", entries)
+	}
+
+	calls = 2 // the next call fails
+	single := filepath.Join(dir, IdentityKey)
+	if _, err := WriteNewKeyFile(single, IdentityKey); err == nil {
+		t.Fatal("WriteNewKeyFile with a failing write succeeded")
+	}
+	if _, err := os.Stat(single); !errors.Is(err, fs.ErrNotExist) {
+		t.Fatalf("the half-written %s was left (%v)", single, err)
+	}
+
+	// The retry starts clean.
+	createKeyFile = orig
+	if _, err := WriteNewKeyFiles(dir, ServeKeys()); err != nil {
+		t.Fatalf("retry after the failure: %v", err)
+	}
+}
+
+// A failed open of the path itself (EMFILE and the like) means the create
+// made no file: whatever is at the path then is someone else's and stays.
+func TestWriteNewKeyFileNeverRemovesAFileItDidNotCreate(t *testing.T) {
+	orig := createKeyFile
+	t.Cleanup(func() { createKeyFile = orig })
+	dir := t.TempDir()
+	path := filepath.Join(dir, SecretsKey)
+	createKeyFile = func(p string) ([]byte, error) {
+		// Another process writes the file after the existence check; our
+		// own open then fails.
+		if err := os.WriteFile(p, []byte("someone else's key"), 0o600); err != nil {
+			return nil, err
+		}
+		return nil, &fs.PathError{Op: "open", Path: p, Err: errors.New("too many open files")}
+	}
+	if _, err := WriteNewKeyFile(path, SecretsKey); err == nil {
+		t.Fatal("WriteNewKeyFile with a failing open succeeded")
+	}
+	if b, err := os.ReadFile(path); err != nil || string(b) != "someone else's key" {
+		t.Fatalf("a file the create did not make was removed or changed: %q %v", b, err)
+	}
+}

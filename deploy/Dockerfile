@@ -1,3 +1,9 @@
+# syntax=docker/dockerfile:1.7@sha256:a57df69d0ea827fb7266491f2813635de6f17269be881f696fbfdf2d83dda33e
+# The syntax line (docker/dockerfile:1.7, pinned by digest) makes BuildKit
+# use a Dockerfile frontend that knows HEALTHCHECK --start-interval, also
+# when the builder's built-in frontend is older. BuildKit is required
+# (the default since Docker 23).
+#
 # Multi-stage build for toolyard.
 #
 # Single Go binary; the dashboard is plain HTML/JS embedded via go:embed, so
@@ -11,8 +17,8 @@
 # line in go.mod: CI fails when they differ, and GOTOOLCHAIN=local stops the
 # build from downloading a different toolchain.
 
-# golang:1.25.5-bookworm (index digest read 2026-10-15)
-FROM golang:1.25.5-bookworm@sha256:d9132cce84391efab786495288756d60e1da215b1f94e87860aeefc3d4c45b6d AS build
+# golang:1.26.9-bookworm (index digest read 2026-10-15)
+FROM golang:1.26.9-bookworm@sha256:d9c68c2c51161e12fd77e4c6320687c9cd86e1af1e3ad6e6cd63ff970641453c AS build
 ENV GOTOOLCHAIN=local \
     CGO_ENABLED=1
 WORKDIR /src
@@ -69,8 +75,8 @@ EXPOSE 8787 9090
 # Liveness, not readiness: a database outage makes /v1/readyz fail, and a
 # restart would not fix it. Route traffic on /v1/readyz in the load balancer
 # instead. The image has no curl or wget, so the binary checks its own probe
-# (exit 0 when the status matches; 3 s timeout). --start-interval needs
-# Docker Engine 25 or later; older engines ignore it.
+# (exit 0 when the status matches; 3 s timeout). Engines older than
+# Docker 25 ignore --start-interval at run time.
 HEALTHCHECK --interval=30s --timeout=5s --start-period=60s --start-interval=5s --retries=3 \
   CMD ["/usr/local/bin/toolyard", "healthcheck", "-url", "http://127.0.0.1:8787/v1/livez", "-expect", "live"]
 

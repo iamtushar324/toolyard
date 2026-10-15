@@ -163,16 +163,23 @@ func (db *DB) CloseContext(ctx context.Context) error {
 // schema_migrations does not record yet, in file-name order, each in its own
 // transaction.
 func (db *DB) migrate() error {
+	_, err := db.migrateNames()
+	return err
+}
+
+// migrateNames is migrate, and returns the names this run applied.
+func (db *DB) migrateNames() ([]string, error) {
 	if _, err := db.Exec(`CREATE TABLE IF NOT EXISTS schema_migrations (
         name TEXT PRIMARY KEY,
         applied_at INTEGER NOT NULL
     )`); err != nil {
-		return err
+		return nil, err
 	}
 	names, err := migrationNames("migrations/sqlite")
 	if err != nil {
-		return err
+		return nil, err
 	}
+	var applied []string
 	for _, name := range names {
 		var seen string
 		err := db.QueryRow(`SELECT name FROM schema_migrations WHERE name = ?`, name).Scan(&seen)
@@ -180,27 +187,28 @@ func (db *DB) migrate() error {
 			continue
 		}
 		if err != sql.ErrNoRows {
-			return err
+			return applied, err
 		}
 		body, err := migrations.ReadFile("migrations/sqlite/" + name)
 		if err != nil {
-			return err
+			return applied, err
 		}
 		tx, err := db.Begin()
 		if err != nil {
-			return err
+			return applied, err
 		}
 		if _, err := tx.Exec(string(body)); err != nil {
 			_ = tx.Rollback()
-			return fmt.Errorf("apply %s: %w", name, err)
+			return applied, fmt.Errorf("apply %s: %w", name, err)
 		}
 		if _, err := tx.Exec(`INSERT INTO schema_migrations(name, applied_at) VALUES(?, ?)`, name, time.Now().Unix()); err != nil {
 			_ = tx.Rollback()
-			return err
+			return applied, err
 		}
 		if err := tx.Commit(); err != nil {
-			return err
+			return applied, err
 		}
+		applied = append(applied, name)
 	}
-	return nil
+	return applied, nil
 }

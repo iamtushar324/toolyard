@@ -3,6 +3,7 @@ package store
 import (
 	"context"
 	"crypto/sha256"
+	"crypto/tls"
 	"database/sql"
 	"database/sql/driver"
 	"encoding/hex"
@@ -13,6 +14,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/stdlib"
 )
 
@@ -50,6 +52,55 @@ type configError struct{ msg string }
 func (e *configError) Error() string { return e.msg }
 
 func (e *configError) Is(target error) bool { return target == ErrConfig }
+
+// ErrConnect marks a failure to reach the Postgres server or to open a
+// session on it when a database is opened that a retry may cure: a refused,
+// reset or timed-out connection, a host name that does not resolve, or a
+// server error of class 08 (connection exception) or 53 (insufficient
+// resources, such as too many connections) or 57P01-57P03 (the server is
+// shutting down, crashed or starting up, as during an Aurora failover). A
+// caller may retry it (serve does). It never marks an ErrConfig error, any
+// other server error (a refused login, a database that does not exist, no
+// CONNECT privilege, a bad parameter) or a TLS certificate that does not
+// verify: a retry cannot fix those.
+var ErrConnect = errors.New("store: cannot connect to the database")
+
+// connectError is an error matching ErrConnect. Its message is the wrapped
+// error's, which never quotes the URL.
+type connectError struct{ err error }
+
+func (e *connectError) Error() string { return e.err.Error() }
+
+func (e *connectError) Unwrap() error { return e.err }
+
+func (e *connectError) Is(target error) bool { return target == ErrConnect }
+
+// connectFailure marks err, a failure while opening a session, as
+// ErrConnect, unless a retry cannot fix it (see ErrConnect).
+func connectFailure(err error) error {
+	var pe *pgconn.PgError
+	if errors.As(err, &pe) && !retryableServerError(pe.Code) {
+		return err
+	}
+	var cve *tls.CertificateVerificationError
+	if errors.As(err, &cve) {
+		return err
+	}
+	return &connectError{err: err}
+}
+
+// retryableServerError reports whether a retry may cure a server error
+// (SQLSTATE code) met while opening a session.
+func retryableServerError(code string) bool {
+	if strings.HasPrefix(code, "08") || strings.HasPrefix(code, "53") {
+		return true
+	}
+	switch code {
+	case "57P01", "57P02", "57P03": // admin shutdown, crash shutdown, cannot connect now
+		return true
+	}
+	return false
+}
 
 // errBadPostgresURL never quotes the URL: it holds the password.
 var errBadPostgresURL error = &configError{msg: "store: the database URL cannot be parsed; the form is postgres://user:password@host:5432/database?sslmode=require " +
@@ -149,10 +200,14 @@ func OpenPostgresWith(ctx context.Context, url string, opts PostgresOptions) (*D
 	sdb.SetConnMaxLifetime(30 * time.Minute)
 	if err := sdb.PingContext(ctx); err != nil {
 		_ = sdb.Close()
-		return nil, fmt.Errorf("store: connect to Postgres at %s/%s: %w", cfg.Host, cfg.Database, err)
+		return nil, connectFailure(fmt.Errorf("store: connect to Postgres at %s/%s: %w", cfg.Host, cfg.Database, err))
 	}
 	if err := checkCollation(ctx, sdb); err != nil {
 		_ = sdb.Close()
+		if !errors.Is(err, ErrConfig) {
+			// The session ended between the ping and this query.
+			err = connectFailure(err)
+		}
 		return nil, err
 	}
 	db := &DB{DB: sdb, Dialect: Postgres}
@@ -325,13 +380,21 @@ const (
 // then every later file of migrations/postgres that is not recorded yet
 // runs in its own transaction.
 func (db *DB) migratePostgres(ctx context.Context) error {
+	_, err := db.migratePostgresNames(ctx)
+	return err
+}
+
+// migratePostgresNames is migratePostgres, and returns the migration names
+// this run recorded, read and written while it held the lock: a run that
+// waited for another to finish returns only what it applied itself.
+func (db *DB) migratePostgresNames(ctx context.Context) ([]string, error) {
 	conn, err := db.DB.Conn(ctx)
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer conn.Close()
 	if _, err := conn.ExecContext(ctx, `SELECT pg_advisory_lock(?)`, pgMigrationLock); err != nil {
-		return fmt.Errorf("take the migration lock: %w", err)
+		return nil, fmt.Errorf("take the migration lock: %w", err)
 	}
 	defer func() {
 		uctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -347,30 +410,36 @@ func (db *DB) migratePostgres(ctx context.Context) error {
         name TEXT PRIMARY KEY,
         applied_at BIGINT NOT NULL
     )`); err != nil {
-		return err
+		return nil, err
 	}
 	applied, err := appliedMigrations(ctx, conn)
 	if err != nil {
-		return err
+		return nil, err
 	}
 
+	var recorded []string
 	if !applied[pgBaselineCovers] {
 		covered, err := sqliteNamesThrough(pgBaselineCovers)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		body, err := migrations.ReadFile("migrations/postgres/" + pgBaseline)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		if err := applyPostgres(ctx, conn, pgBaseline, string(body), covered); err != nil {
-			return err
+			return nil, err
+		}
+		for _, name := range covered {
+			if !applied[name] { // ON CONFLICT DO NOTHING kept the rest
+				recorded = append(recorded, name)
+			}
 		}
 	}
 
 	names, err := migrationNames("migrations/postgres")
 	if err != nil {
-		return err
+		return recorded, err
 	}
 	for _, name := range names {
 		if name == pgBaseline || applied[name] {
@@ -378,13 +447,14 @@ func (db *DB) migratePostgres(ctx context.Context) error {
 		}
 		body, err := migrations.ReadFile("migrations/postgres/" + name)
 		if err != nil {
-			return err
+			return recorded, err
 		}
 		if err := applyPostgres(ctx, conn, name, string(body), []string{name}); err != nil {
-			return err
+			return recorded, err
 		}
+		recorded = append(recorded, name)
 	}
-	return nil
+	return recorded, nil
 }
 
 // applyPostgres runs body (one or more statements) and records names in one

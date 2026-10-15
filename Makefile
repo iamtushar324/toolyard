@@ -23,7 +23,7 @@ LDFLAGS := -s -w
 
 # Pin to a Go version that matches go.mod. Bump in lock-step when you
 # bump the go directive in go.mod or you'll hit "go directive too new".
-GO_IMG := golang:1.25-bookworm
+GO_IMG := golang:1.26.9-bookworm
 
 UNAME_S := $(shell uname -s)
 UNAME_M := $(shell uname -m)

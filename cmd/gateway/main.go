@@ -253,6 +253,7 @@ Commands:
   serve       run gateway + HTTP dashboard (default ports: stdio + :8787)
               -migrate auto|off: apply pending schema migrations at startup (auto), or apply none and
               refuse to start (exit 78) unless the database is at this binary's level (off)
+              -db-connect-timeout 60s: keep trying a Postgres server it cannot reach (0 = one attempt)
   exchange    swap an enrollment code for an agent token
   probe       dry-run a tool against an upstream MCP server
   operator-token  create | list | revoke CLI operator tokens (local, from -data)
@@ -260,7 +261,8 @@ Commands:
   keys-check  read-only check that every master key would load: -data <dir> [-credentials-dir <dir>] (exit 0 or 78)
   keys        generate -name identity|oauth|secrets|session [-out <file>]: one fresh key to stdout or a new file
               generate -all -dir <dir>: all four as <name>.key (mode 0600; never overwrites a file)
-  db          migrate [-dry-run]: apply pending schema migrations to the database serve uses (exit 0, 78 on a config error)
+  db          migrate [-dry-run] [-db-connect-timeout 60s]: apply pending schema migrations to the database serve uses
+              (exit 0, 78 on a config error)
               copy | verify: move a stopped SQLite installation to Postgres and prove the copy (-from-data <dir>)
   version     print version
 
@@ -271,7 +273,8 @@ Environment:
   from toolyard.env in the credentials directory, except TOOLYARD_CREDENTIALS_DIR. keys-check,
   operator-token and db migrate read TOOLYARD_DATA (or TOOLYARD_DATA_DIR) and TOOLYARD_CREDENTIALS_DIR,
   keys-check also TOOLYARD_KEYS; healthcheck reads TOOLYARD_HEALTHCHECK_URL, _EXPECT and _TOKEN_FILE.
-  -inbox-reset-passkeys is command line only. Secrets go in files, never in variables.
+  -inbox-reset-passkeys is command line only. serve warns about a TOOLYARD_ variable that sets no
+  flag and that nothing reads (a misspelt name). Secrets go in files, never in variables.
 
 Run 'toolyard <command> -h' for command flags.`)
 }
@@ -302,6 +305,7 @@ func runServe(argv []string) error {
 	// TEC-1638: migrations run in the deploy (toolyard db migrate), not at start.
 	migrateFlag := fs.String("migrate", string(migrateAuto), "schema migrations at startup: auto (apply pending migrations; on Postgres under an advisory lock) | off (apply none; refuse to start, exit 78, unless the database records every migration this binary knows: run toolyard db migrate first)")
 	credentialsDir := fs.String("credentials-dir", os.Getenv("TOOLYARD_CREDENTIALS_DIR"), "directory searched for key files (identity.key, oauth.key, secrets.key, session.key), toolyard.env and database-url after $CREDENTIALS_DIRECTORY and before -data, e.g. /run/secrets. Defaults to $TOOLYARD_CREDENTIALS_DIR.")
+	dbConnectTimeout := fs.Duration("db-connect-timeout", defaultDBConnectTimeout, dbConnectTimeoutUsage)
 	dbMaxConns := fs.Int("db-max-conns", store.DefaultPostgresMaxConns, "Postgres only: the most connections the database pool opens. Postgres is selected by $TOOLYARD_DATABASE_URL or a database-url file in the credentials directory; otherwise toolyard uses SQLite at <data>/toolyard.db, always with one connection.")
 	opsAddr := fs.String("ops-addr", "", "comma-separated listen addresses for the ops listener (/metrics, /v1/livez, /v1/readyz), e.g. 127.0.0.1:9090. Empty = off. A non-private address needs -ops-token-file.")
 	opsTokenFile := fs.String("ops-token-file", "", "file holding the bearer token (16+ characters) the ops listener then requires on every request, from every peer, loopback included")
@@ -354,6 +358,13 @@ func runServe(argv []string) error {
 	if err != nil {
 		return err
 	}
+	if err := checkConnectTimeout(*dbConnectTimeout); err != nil {
+		return err
+	}
+	// A TOOLYARD_ variable that sets no flag and that nothing reads is most
+	// likely a misspelt name (TOOLYARD_KEY for TOOLYARD_KEYS): say so. The
+	// environment now holds toolyard.env's variables too.
+	envRep.warnings = append(envRep.warnings, unknownEnvWarnings(fs, os.Environ())...)
 
 	// Initialize structured logging first so every subsequent log line
 	// flows through slog. The stdlib `log` package gets re-routed too via
@@ -436,15 +447,11 @@ func runServe(argv []string) error {
 	if err != nil {
 		return err
 	}
-	// TEC-1638 -migrate=off: the deploy ran `toolyard db migrate`; open
-	// without migrating and refuse (exit 78) a database behind this binary.
-	var db *store.DB
-	var unknownMigrations []string
-	if migrate == migrateOff {
-		db, unknownMigrations, err = openDatabaseNoMigrate(context.Background(), dbChoice, *dbMaxConns)
-	} else {
-		db, err = openDatabase(context.Background(), dbChoice, *dbMaxConns)
-	}
+	// TEC-1638: -migrate=off means the deploy ran `toolyard db migrate`:
+	// open without migrating and refuse (exit 78) a database behind this
+	// binary. Postgres connection failures are retried for
+	// -db-connect-timeout (a restart during an Aurora failover).
+	db, unknownMigrations, err := openServeDatabase(context.Background(), dbChoice, *dbMaxConns, migrate, *dbConnectTimeout, log.Printf)
 	if err != nil {
 		return fmt.Errorf("open db (%s): %w", dbChoice.describe(), err)
 	}

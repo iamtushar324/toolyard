@@ -886,8 +886,18 @@ upper case with `-` replaced by `_` (`-public-url` is
 `TOOLYARD_PUBLIC_URL`, `-db-max-conns` is `TOOLYARD_DB_MAX_CONNS`). A flag
 on the command line wins, an empty variable counts as unset, and
 `toolyard.env` may set them too (except `TOOLYARD_CREDENTIALS_DIR`).
-`-inbox-reset-passkeys` is command line only. Run `toolyard help` for the
-variables the other commands read. Secrets stay in files, never in
+`-inbox-reset-passkeys` is command line only. `serve` warns about a
+`TOOLYARD_*` variable that matches no flag and that nothing reads (a
+misspelt name), naming the variable but never its value. Run
+`toolyard help` for the variables the other commands read.
+
+At startup, `serve` and `toolyard db migrate` keep trying a Postgres server
+they cannot reach for `-db-connect-timeout` (env
+`TOOLYARD_DB_CONNECT_TIMEOUT`, default `60s`, `0` = one attempt), so a
+restart during a database failover recovers by itself. A bad URL, a wrong
+collation or encoding, a refused login or a missing database fails at once.
+The HTTP listener starts only after the database opens, so keep health
+check grace periods at 60 s or more. Secrets stay in files, never in
 variables. A production set:
 
 ```bash

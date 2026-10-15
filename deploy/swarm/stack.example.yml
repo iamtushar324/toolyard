@@ -1,7 +1,8 @@
 # Example Docker Swarm stack for toolyard: one replica on Postgres, behind
 # Traefik. A generic starting point, validated in CI with
-# `docker compose config` (.github/workflows/deploy-manifests.yml); copy it
-# and adapt names, hosts and networks.
+# `docker stack config` and `docker compose config`
+# (.github/workflows/deploy-manifests.yml); copy it and adapt names, hosts
+# and networks.
 #
 #   export TOOLYARD_IMAGE=ghcr.io/iamtushar324/toolyard@sha256:<index digest>
 #   docker stack deploy -c stack.example.yml --detach=false toolyard
@@ -10,7 +11,7 @@
 #   1. Create the Postgres database (C collation; docs/self-hosting.md).
 #   2. Create the secrets on a manager, values through stdin, never argv:
 #        for k in identity oauth secrets session; do
-#          docker run --rm "$TOOLYARD_IMAGE" keys generate -name "$k" \
+#          docker run --rm --network none "$TOOLYARD_IMAGE" keys generate -name "$k" \
 #            | docker secret create "toolyard-$k-key-v1" -
 #        done
 #        docker secret create toolyard-database-url-v1 - < database-url
@@ -20,8 +21,11 @@
 #        docker config create toolyard-db-ca-v1 rds-ca-bundle.pem
 #   4. Migrate the schema with the new image before each deploy (the service
 #      runs with -migrate off and refuses, exit 78, a schema behind its
-#      binary). database-url must be readable by uid 10001:
-#        docker run --rm -v "$PWD/database-url:/run/secrets/database-url:ro" \
+#      binary). Mount the CA bundle at the path the URL's sslrootcert names;
+#      both files must be readable by uid 10001:
+#        docker run --rm \
+#          -v "$PWD/database-url:/run/secrets/database-url:ro" \
+#          -v "$PWD/rds-ca-bundle.pem:/etc/toolyard/db-ca.pem:ro" \
 #          "$TOOLYARD_IMAGE" db migrate
 #
 # Secrets and configs cannot change in place: to rotate one, create a -v2,

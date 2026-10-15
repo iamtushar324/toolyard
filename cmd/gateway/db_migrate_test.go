@@ -227,7 +227,7 @@ func TestDBMigrateSettings(t *testing.T) {
 	if !errors.Is(err, keyguard.ErrConfig) || strings.Contains(err.Error(), "s3cret-pw") {
 		t.Fatalf("not a postgres URL: %v", err)
 	}
-	out, errOut, err := runMigrateForTest(t, map[string]string{databaseURLEnv: dbCmdSecretURL}, "-data", data, "-timeout", "20s")
+	out, errOut, err := runMigrateForTest(t, map[string]string{databaseURLEnv: dbCmdSecretURL}, "-data", data, "-timeout", "20s", "-db-connect-timeout", "0")
 	if err == nil {
 		t.Fatal("migrate against an unreachable database succeeded")
 	}
@@ -245,6 +245,9 @@ func TestDBMigrateSettings(t *testing.T) {
 	if _, _, err := runMigrateForTest(t, nil, "-data", data, "-timeout", "-1s"); !errors.Is(err, keyguard.ErrConfig) {
 		t.Fatalf("negative -timeout: %v", err)
 	}
+	if _, _, err := runMigrateForTest(t, nil, "-data", data, "-db-connect-timeout", "-1s"); !errors.Is(err, keyguard.ErrConfig) {
+		t.Fatalf("negative -db-connect-timeout: %v", err)
+	}
 }
 
 // TOOLYARD_DATA and TOOLYARD_CREDENTIALS_DIR choose the database when the
@@ -253,7 +256,7 @@ func TestDBMigrateReadsTheEnvironment(t *testing.T) {
 	creds := t.TempDir()
 	writeCredFile(t, filepath.Join(creds, databaseURLFile), dbCmdSecretURL)
 	data := t.TempDir()
-	out, _, err := runMigrateForTest(t, map[string]string{"TOOLYARD_CREDENTIALS_DIR": creds, "TOOLYARD_DATA": data}, "-timeout", "20s")
+	out, _, err := runMigrateForTest(t, map[string]string{"TOOLYARD_CREDENTIALS_DIR": creds, "TOOLYARD_DATA": data}, "-timeout", "20s", "-db-connect-timeout", "0")
 	if err == nil || !strings.Contains(out, "from "+filepath.Join(creds, databaseURLFile)) {
 		t.Fatalf("TOOLYARD_CREDENTIALS_DIR: %v\n%s", err, out)
 	}
@@ -265,5 +268,37 @@ func TestDBMigrateReadsTheEnvironment(t *testing.T) {
 	}
 	if entries, _ := os.ReadDir(data); len(entries) != 0 {
 		t.Fatalf("the dry run wrote %v", entries)
+	}
+}
+
+// db migrate keeps trying a server it cannot reach for -db-connect-timeout,
+// logging each retry on stderr without the URL; TOOLYARD_DB_CONNECT_TIMEOUT
+// sets it too (0: one attempt, no retry).
+func TestDBMigrateRetriesAnUnreachableDatabase(t *testing.T) {
+	data := t.TempDir()
+	env := map[string]string{databaseURLEnv: dbCmdSecretURL}
+	start := time.Now()
+	out, errOut, err := runMigrateForTest(t, env, "-data", data, "-db-connect-timeout", "1500ms")
+	elapsed := time.Since(start)
+	if err == nil || !strings.Contains(err.Error(), "gave up") {
+		t.Fatalf("migrate against an unreachable database: %v", err)
+	}
+	if elapsed < time.Second || elapsed > 20*time.Second {
+		t.Fatalf("gave up after %s, want about 1.5 s", elapsed)
+	}
+	if n := strings.Count(errOut, "trying again"); n < 1 {
+		t.Fatalf("no retry logged:\n%s", errOut)
+	}
+	for _, s := range []string{err.Error(), out, errOut} {
+		if strings.Contains(s, "s3cret-pw") || strings.Contains(s, dbCmdSecretURL) {
+			t.Fatalf("the URL or its password was shown: %q", s)
+		}
+	}
+
+	env["TOOLYARD_DB_CONNECT_TIMEOUT"] = "0"
+	start = time.Now()
+	_, errOut, err = runMigrateForTest(t, env, "-data", data)
+	if err == nil || strings.Contains(errOut, "trying again") || time.Since(start) > 10*time.Second {
+		t.Fatalf("TOOLYARD_DB_CONNECT_TIMEOUT=0: %v after %s\n%s", err, time.Since(start), errOut)
 	}
 }

@@ -4,10 +4,12 @@ import (
 	"context"
 	"errors"
 	"io/fs"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/tusharbhardwaj/toolyard/internal/store"
 	"github.com/tusharbhardwaj/toolyard/internal/store/storetest"
@@ -101,16 +103,21 @@ func TestMigrateAnEmptyDatabase(t *testing.T) {
 		t.Fatalf("MigrationStatus created schema_migrations (%v)", err)
 	}
 
-	if err := db.Migrate(ctx); err != nil {
+	applied, err := db.Migrate(ctx)
+	if err != nil {
 		t.Fatalf("migrate: %v", err)
+	}
+	if strings.Join(applied, ",") != strings.Join(known, ",") {
+		t.Fatalf("Migrate reported %d applied, want all %d: %v", len(applied), len(known), applied)
 	}
 	pending, unknown, err = store.MigrationStatus(ctx, db)
 	if err != nil || len(pending) != 0 || len(unknown) != 0 {
 		t.Fatalf("after Migrate: pending %v, unknown %v (%v)", pending, unknown, err)
 	}
-	// Migrating again changes nothing.
-	if err := db.Migrate(ctx); err != nil {
-		t.Fatalf("migrate again: %v", err)
+	// Migrating again changes nothing and reports nothing.
+	applied, err = db.Migrate(ctx)
+	if err != nil || len(applied) != 0 {
+		t.Fatalf("migrate again: applied %v (%v)", applied, err)
 	}
 }
 
@@ -148,5 +155,40 @@ func TestOpenNoMigrate(t *testing.T) {
 	pending, _, err := store.MigrationStatus(ctx, db)
 	if err != nil || len(pending) != 0 {
 		t.Fatalf("status: %v %v", pending, err)
+	}
+}
+
+// A server that cannot be reached is store.ErrConnect (worth a retry); a
+// URL that cannot be parsed is ErrConfig and never ErrConnect.
+func TestOpenPostgresConnectErrors(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	_, err := store.OpenPostgresWith(ctx, "postgres://toolyard:s3cret-pw@127.0.0.1:1/toolyard?sslmode=disable&connect_timeout=5",
+		store.PostgresOptions{MaxConns: 1, NoMigrate: true})
+	if !errors.Is(err, store.ErrConnect) || errors.Is(err, store.ErrConfig) {
+		t.Fatalf("unreachable server: %v, want ErrConnect", err)
+	}
+	if strings.Contains(err.Error(), "s3cret-pw") {
+		t.Fatalf("the error shows the password: %v", err)
+	}
+	_, err = store.OpenPostgresWith(ctx, "postgres://toolyard:s3cret-pw@127.0.0.1:99999/toolyard", store.PostgresOptions{MaxConns: 1, NoMigrate: true})
+	if errors.Is(err, store.ErrConnect) || !errors.Is(err, store.ErrConfig) {
+		t.Fatalf("bad port: %v, want ErrConfig and not ErrConnect", err)
+	}
+}
+
+// A database that does not exist is no ErrConnect: a retry cannot create it.
+func TestOpenPostgresMissingDatabaseIsNotRetryable(t *testing.T) {
+	storetest.SkipUnlessPostgres(t)
+	u, err := url.Parse(storetest.NewPostgresDatabase(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	u.Path = "/toolyard_no_such_database"
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	_, err = store.OpenPostgresWith(ctx, u.String(), store.PostgresOptions{MaxConns: 1, NoMigrate: true})
+	if err == nil || errors.Is(err, store.ErrConnect) {
+		t.Fatalf("missing database: %v, want an error that is not ErrConnect", err)
 	}
 }

@@ -57,13 +57,20 @@ func MigrationStatus(ctx context.Context, db *DB) (pending, unknown []string, er
 // Migrate applies the pending migrations of db's engine, as Open and
 // OpenPostgres do (on Postgres on one connection that holds the migration
 // advisory lock), for a database opened without them (OpenNoMigrate,
-// PostgresOptions.NoMigrate).
-func (db *DB) Migrate(ctx context.Context) error {
+// PostgresOptions.NoMigrate). It returns, sorted, the names this call
+// recorded. On Postgres they are read and written under the lock, so a call
+// that waited while another process migrated returns only its own work;
+// after an error they are what was committed before it.
+func (db *DB) Migrate(ctx context.Context) ([]string, error) {
+	var applied []string
+	var err error
 	if db.Dialect.IsPostgres() {
-		return db.MigratePostgres(ctx)
+		applied, err = db.migratePostgresNames(ctx)
+	} else {
+		applied, err = db.migrateNames()
 	}
-	if err := db.migrate(); err != nil {
-		return fmt.Errorf("migrate: %w", err)
+	if err != nil {
+		return applied, fmt.Errorf("migrate: %w", err)
 	}
-	return nil
+	return applied, nil
 }
