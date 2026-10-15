@@ -124,6 +124,8 @@ func main() {
 		err = runHealthcheck(args)
 	case "keys-check":
 		err = runKeysCheck(args)
+	case "db":
+		err = runDB(args)
 	case "version", "-v", "--version":
 		fmt.Println("toolyard", version)
 	case "help", "-h", "--help":
@@ -250,6 +252,7 @@ Commands:
   operator-token  create | list | revoke CLI operator tokens (local, from -data)
   healthcheck check a probe: -url <probe URL> -expect ready|live (exit 0 or 1)
   keys-check  read-only check that every master key would load: -data <dir> [-credentials-dir <dir>] (exit 0 or 78)
+  db          copy | verify: move a stopped SQLite installation to Postgres and prove the copy (-from-data <dir>)
   version     print version
 
 Run 'toolyard <command> -h' for command flags.`)
@@ -278,7 +281,8 @@ func runServe(argv []string) error {
 	trustedProxies := fs.String("trusted-proxy", "", "comma-separated CIDRs to trust for X-Forwarded-* headers (e.g. 127.0.0.1/32,::1/128,10.0.0.0/8)")
 	// TEC-1626 keys and ops listener
 	keysFlag := fs.String("keys", string(keyguard.CreateIfFresh), "master keys: create-if-fresh (create a missing key only for a new, empty database) | require (never create; every key must be provided)")
-	credentialsDir := fs.String("credentials-dir", os.Getenv("TOOLYARD_CREDENTIALS_DIR"), "directory searched for key files (identity.key, oauth.key, secrets.key, session.key) and toolyard.env after $CREDENTIALS_DIRECTORY and before -data, e.g. /run/secrets. Defaults to $TOOLYARD_CREDENTIALS_DIR.")
+	credentialsDir := fs.String("credentials-dir", os.Getenv("TOOLYARD_CREDENTIALS_DIR"), "directory searched for key files (identity.key, oauth.key, secrets.key, session.key), toolyard.env and database-url after $CREDENTIALS_DIRECTORY and before -data, e.g. /run/secrets. Defaults to $TOOLYARD_CREDENTIALS_DIR.")
+	dbMaxConns := fs.Int("db-max-conns", store.DefaultPostgresMaxConns, "Postgres only: the most connections the database pool opens. Postgres is selected by $TOOLYARD_DATABASE_URL or a database-url file in the credentials directory; otherwise toolyard uses SQLite at <data>/toolyard.db, always with one connection.")
 	opsAddr := fs.String("ops-addr", "", "comma-separated listen addresses for the ops listener (/metrics, /v1/livez, /v1/readyz), e.g. 127.0.0.1:9090. Empty = off. A non-private address needs -ops-token-file.")
 	opsTokenFile := fs.String("ops-token-file", "", "file holding the bearer token (16+ characters) the ops listener then requires on every request, from every peer, loopback included")
 	// Still accepted so service units that pass it keep starting: the flag
@@ -388,16 +392,21 @@ func runServe(argv []string) error {
 	}
 	// Tighten any pre-existing data dir so other local users can't read keys.
 	_ = os.Chmod(*dataDir, 0o700)
-	dbPath := filepath.Join(*dataDir, "toolyard.db")
-	db, err := store.Open(dbPath)
+	// TEC-1635: $TOOLYARD_DATABASE_URL or a database-url credential
+	// selects Postgres; otherwise SQLite at <data>/toolyard.db.
+	dbChoice, err := resolveDatabase(*dataDir, *credentialsDir, os.Getenv)
 	if err != nil {
-		return fmt.Errorf("open db: %w", err)
+		return err
+	}
+	db, err := openDatabase(context.Background(), dbChoice, *dbMaxConns)
+	if err != nil {
+		return fmt.Errorf("open db (%s): %w", dbChoice.describe(), err)
 	}
 	// TEC-1626 drain: the ordered shutdown closes the database last
 	// (lifecycle.go); this deferred call only acts on an early return.
 	closeDB := closeOnce("database", closeTimeout, db.CloseContext)
 	defer closeDB()
-	log.Printf("toolyard: db at %s", dbPath)
+	log.Printf("toolyard: db %s (selected by %s)", dbChoice.describe(), dbChoice.Source)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -532,6 +541,7 @@ func runServe(argv []string) error {
 	}
 	masterKeys, err := keyguard.LoadAll(ctx, keyguard.Config{
 		DB:             db.DB,
+		Dialect:        db.Dialect,
 		DataDir:        *dataDir,
 		CredentialsDir: *credentialsDir,
 		Mode:           keysMode,

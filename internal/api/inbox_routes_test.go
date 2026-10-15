@@ -4,11 +4,13 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/go-webauthn/webauthn/protocol"
 	"github.com/mark3labs/mcp-go/mcp"
@@ -24,6 +26,7 @@ import (
 	"github.com/tusharbhardwaj/toolyard/internal/policy"
 	"github.com/tusharbhardwaj/toolyard/internal/realtime"
 	"github.com/tusharbhardwaj/toolyard/internal/store"
+	"github.com/tusharbhardwaj/toolyard/internal/store/storetest"
 )
 
 type inboxAPIFixture struct {
@@ -40,11 +43,7 @@ type inboxAPIFixture struct {
 func newInboxAPIFixture(t *testing.T) *inboxAPIFixture {
 	t.Helper()
 	dir := t.TempDir()
-	db, err := store.Open(filepath.Join(dir, "api-inbox.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = db.Close() })
+	db := storetest.Open(t) // SQLite, or Postgres when TOOLYARD_TEST_DB=postgres
 	ctx := context.Background()
 	id := identity.New(db)
 	u, err := id.CreateUser(ctx, "tester", "long-enough-password")
@@ -444,5 +443,64 @@ func TestInboxBatchAndInfo(t *testing.T) {
 	code, out = f.owner(t, http.MethodGet, "/v1/inbox/info", nil)
 	if code != http.StatusOK || out["info"].(map[string]any)["next_digest"] == nil {
 		t.Fatalf("info: %d %v", code, out)
+	}
+}
+
+// The blob route serves Range and HEAD requests from the engine's blob
+// store (a file on SQLite, 1 MiB database chunks on Postgres), here for a
+// three-chunk blob and a range across both chunk boundaries.
+func TestInboxBlobRouteServesRanges(t *testing.T) {
+	f := newInboxAPIFixture(t)
+	ctx := context.Background()
+	data := make([]byte, 2<<20+5000)
+	x := uint32(7)
+	for i := range data {
+		x = x*1664525 + 1013904223
+		data[i] = byte(x >> 24)
+	}
+	sha, err := f.srv.snapshots.Put(ctx, data, "video/mp4", "voice:route-test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The owner may download what one of their agents uploaded.
+	if _, err := f.db.Exec(`INSERT INTO inbox_uploads(sha256, agent_id, name, content_type, kind, size, created_at) VALUES (?,?,?,?,?,?,?)`,
+		sha, f.agent, "rec.mp4", "video/mp4", "video", len(data), time.Now().UnixMilli()); err != nil {
+		t.Fatal(err)
+	}
+	send := func(method, rng string) *httptest.ResponseRecorder {
+		t.Helper()
+		req := httptest.NewRequest(method, "/v1/inbox/blobs/"+sha, nil)
+		req.AddCookie(f.cookie)
+		if rng != "" {
+			req.Header.Set("Range", rng)
+		}
+		rec := httptest.NewRecorder()
+		f.mux.ServeHTTP(rec, req)
+		return rec
+	}
+	from, to := 1<<20-100, 2<<20+100
+	rec := send(http.MethodGet, fmt.Sprintf("bytes=%d-%d", from, to))
+	if rec.Code != http.StatusPartialContent || !bytes.Equal(rec.Body.Bytes(), data[from:to+1]) {
+		t.Fatalf("range: %d, %d bytes", rec.Code, rec.Body.Len())
+	}
+	if got, want := rec.Header().Get("Content-Range"), fmt.Sprintf("bytes %d-%d/%d", from, to, len(data)); got != want {
+		t.Fatalf("Content-Range %q, want %q", got, want)
+	}
+	if rec.Header().Get("Content-Type") != "video/mp4" || rec.Header().Get("Last-Modified") == "" {
+		t.Fatalf("headers: type %q, Last-Modified %q", rec.Header().Get("Content-Type"), rec.Header().Get("Last-Modified"))
+	}
+	rec = send(http.MethodGet, "")
+	if rec.Code != http.StatusOK || !bytes.Equal(rec.Body.Bytes(), data) {
+		t.Fatalf("whole blob: %d, %d bytes", rec.Code, rec.Body.Len())
+	}
+	rec = send(http.MethodHead, "")
+	if rec.Code != http.StatusOK || rec.Body.Len() != 0 || rec.Header().Get("Content-Length") != fmt.Sprint(len(data)) {
+		t.Fatalf("HEAD: %d, %d body bytes, Content-Length %q", rec.Code, rec.Body.Len(), rec.Header().Get("Content-Length"))
+	}
+	if code := send(http.MethodGet, "").Code; code != http.StatusOK {
+		t.Fatalf("a second download: %d", code)
+	}
+	if code, _ := f.owner(t, "GET", "/v1/inbox/blobs/"+strings.Repeat("0", 64), nil); code != http.StatusNotFound {
+		t.Fatalf("a blob nobody uploaded: %d, want 404", code)
 	}
 }

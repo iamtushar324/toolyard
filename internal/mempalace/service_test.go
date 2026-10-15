@@ -11,6 +11,7 @@ import (
 
 	"github.com/tusharbhardwaj/toolyard/internal/audit"
 	"github.com/tusharbhardwaj/toolyard/internal/store"
+	"github.com/tusharbhardwaj/toolyard/internal/store/storetest"
 )
 
 // stubGateway pretends to be the gateway for tests. has tracks which tools
@@ -40,13 +41,7 @@ func (g *stubGateway) CallInternal(_ context.Context, _, name string, args map[s
 
 func tempDB(t *testing.T) *store.DB {
 	t.Helper()
-	dir := t.TempDir()
-	db, err := store.Open(filepath.Join(dir, "test.db"))
-	if err != nil {
-		t.Fatalf("open db: %v", err)
-	}
-	t.Cleanup(func() { _ = db.Close() })
-	return db
+	return storetest.Open(t)
 }
 
 func TestParseMode(t *testing.T) {

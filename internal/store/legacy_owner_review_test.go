@@ -19,7 +19,7 @@ func TestReviewMigration0034SnapshotsLegacyOwners(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	body, err := migrations.ReadFile("migrations/0034_legacy_inbox.sql")
+	body, err := migrations.ReadFile("migrations/sqlite/0034_legacy_inbox.sql")
 	if err != nil {
 		t.Fatal(err)
 	}

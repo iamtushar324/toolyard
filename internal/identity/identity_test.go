@@ -3,27 +3,26 @@ package identity
 import (
 	"context"
 	"errors"
-	"path/filepath"
+	"sort"
 	"strings"
 	"testing"
 	"time"
 
-	"github.com/tusharbhardwaj/toolyard/internal/store"
+	"github.com/tusharbhardwaj/toolyard/internal/store/storetest"
 )
 
 func newTestIdentity(t *testing.T) (*Service, string) {
 	t.Helper()
-	dir := t.TempDir()
-	db, err := store.Open(filepath.Join(dir, "t.db"))
-	if err != nil {
-		t.Fatalf("open db: %v", err)
-	}
-	t.Cleanup(func() { db.Close() })
-	s := New(db)
+	s := New(storetest.Open(t))
 	u, err := s.CreateUser(context.Background(), "admin", "pw-correct-horse")
 	if err != nil {
 		t.Fatalf("create user: %v", err)
 	}
+	// Users sort by created_at in milliseconds with the random id as the
+	// tie-break, and CreateUser now stamps the row after the password hash:
+	// keep the next user out of the primary's millisecond so "first user"
+	// stays the primary.
+	time.Sleep(2 * time.Millisecond)
 	return s, u.ID
 }
 
@@ -310,8 +309,9 @@ func TestRotateClearsPendingEnrollment(t *testing.T) {
 	}
 }
 
-// Agents created in the same millisecond still list newest first.
-func TestListAgentsNewestFirstOnTies(t *testing.T) {
+// Agents created in the same millisecond list in a fixed order: id
+// descending (Postgres has no rowid, so insertion order is not kept).
+func TestListAgentsTieBreak(t *testing.T) {
 	s, owner := newTestIdentity(t)
 	ctx := context.Background()
 	var ids []string
@@ -330,9 +330,21 @@ func TestListAgentsNewestFirstOnTies(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// SQLite: newest inserted first (rowid). Postgres: id descending.
+	want := make([]string, len(ids))
+	for i := range ids {
+		want[i] = ids[len(ids)-1-i]
+	}
+	if s.db.Dialect.IsPostgres() {
+		copy(want, ids)
+		sort.Sort(sort.Reverse(sort.StringSlice(want)))
+	}
+	if len(got) != len(want) {
+		t.Fatalf("ListAgents returned %d agents, want %d", len(got), len(want))
+	}
 	for i, a := range got {
-		if want := ids[len(ids)-1-i]; a.ID != want {
-			t.Fatalf("ListAgents[%d] = %s, want %s (newest first)", i, a.ID, want)
+		if a.ID != want[i] {
+			t.Fatalf("ListAgents[%d] = %s, want %s on a created_at tie", i, a.ID, want[i])
 		}
 	}
 }

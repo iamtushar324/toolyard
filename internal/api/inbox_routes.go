@@ -616,10 +616,12 @@ func (s *Server) inboxBlob(w http.ResponseWriter, r *http.Request, sha string) {
 		return
 	}
 	defer f.Close()
-	st, err := f.Stat()
-	if err != nil {
-		http.NotFound(w, r)
-		return
+	// Local blobs report their file's modification time, database blobs
+	// the time they were recorded (Snapshotter.Open). The blob reads one
+	// chunk at a time, so Range requests never load the whole file.
+	var mod time.Time
+	if m, ok := f.(interface{ ModTime() time.Time }); ok {
+		mod = m.ModTime()
 	}
 	w.Header().Set("Content-Type", ct)
 	w.Header().Set("X-Content-Type-Options", "nosniff")
@@ -633,7 +635,7 @@ func (s *Server) inboxBlob(w http.ResponseWriter, r *http.Request, sha string) {
 		w.Header().Set("Content-Disposition", `attachment; filename="`+name+`"`)
 	}
 	w.Header().Set("Content-Security-Policy", "default-src 'none'; img-src 'self'; media-src 'self'; sandbox")
-	http.ServeContent(w, r, "", st.ModTime(), f)
+	http.ServeContent(w, r, "", mod, f)
 }
 
 // inboxBatch applies one action to many requests. Approving is never

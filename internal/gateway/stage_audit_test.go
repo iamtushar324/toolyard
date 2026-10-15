@@ -61,11 +61,13 @@ func TestStageDispatchAuditDurability(t *testing.T) {
 
 func TestStageWaitUsesOwnDeadline(t *testing.T) {
 	f := newInboxFixture(t)
-	f.gw.upstreamCallTimeout = time.Millisecond
 	q := structured(t, f.call(t, f.agent, "inbox.ask", map[string]any{"schema_version": 2, "prompt": "Wait for a decision", "question": map[string]any{"type": "free_text"}}))
 	if q["ok"] != true {
 		t.Fatalf("submit: %+v", q)
 	}
+	// Only the wait must ignore the dispatch timeout; set it after the
+	// submit, which a database round trip can take longer than 1 ms.
+	f.gw.upstreamCallTimeout = time.Millisecond
 	start := time.Now()
 	result := f.call(t, f.agent, "inbox.wait", map[string]any{"ids": []any{q["request_id"]}, "timeout_seconds": 1})
 	if result.IsError || time.Since(start) < 800*time.Millisecond {

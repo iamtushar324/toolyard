@@ -186,8 +186,17 @@ func (s *Service) List(ctx context.Context, q Query) ([]Event, error) {
 		args = append(args, q.Before)
 	}
 	if strings.TrimSpace(q.Q) != "" {
-		sqlq += ` AND (text LIKE ? OR tool_name LIKE ? OR event_name LIKE ? OR session_id LIKE ?)`
-		like := "%" + strings.TrimSpace(q.Q) + "%"
+		// Case-insensitive, as SQLite's LIKE always was: Postgres needs
+		// ILIKE. Postgres LIKE also treats a backslash as an escape
+		// character, which SQLite does not, so double it there to keep a
+		// backslash in the search literal on both engines.
+		op := s.db.Dialect.ILike()
+		sqlq += ` AND (text ` + op + ` ? OR tool_name ` + op + ` ? OR event_name ` + op + ` ? OR session_id ` + op + ` ?)`
+		term := strings.TrimSpace(q.Q)
+		if s.db.Dialect.IsPostgres() {
+			term = strings.ReplaceAll(term, `\`, `\\`)
+		}
+		like := "%" + term + "%"
 		args = append(args, like, like, like, like)
 	}
 	sqlq += ` ORDER BY ts DESC`

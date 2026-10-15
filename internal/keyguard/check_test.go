@@ -202,7 +202,7 @@ func TestCheckWithoutTheCanaryTable(t *testing.T) {
 			t.Errorf("%s: %s %s", r.Name, r.Status, r.Detail)
 		}
 	}
-	if ok, err := tableExists(context.Background(), e.db.DB, "key_canaries"); err != nil || ok {
+	if ok, err := tableExists(context.Background(), e.db.DB, e.db.Dialect, "key_canaries"); err != nil || ok {
 		t.Fatalf("Check created the canary table: %v %v", ok, err)
 	}
 }

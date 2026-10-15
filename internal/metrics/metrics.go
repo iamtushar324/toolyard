@@ -775,7 +775,10 @@ type CostRow struct {
 	UsdEstimated *float64 `json:"usd_estimated"`
 }
 
-// Cost returns per-tool payload token approximations, never billable tokens.
+// Cost returns per-tool payload token approximations, never billable tokens,
+// largest total (in + out) first. The ORDER BY used to be "3 + 4", which is
+// a constant expression, not the sum of columns 3 and 4, so rows came back
+// in no particular order.
 func (r *Reader) Cost(ctx context.Context, rg Range) ([]CostRow, error) {
 	from, to := rg.bounds()
 	rows, err := r.db.QueryContext(ctx, `SELECT tool_name, upstream,
@@ -783,7 +786,7 @@ func (r *Reader) Cost(ctx context.Context, rg Range) ([]CostRow, error) {
         COALESCE(SUM(token_estimate_out),0)
         FROM call_events WHERE ts >= ? AND ts < ?
         GROUP BY tool_name, upstream
-        ORDER BY 3 + 4 DESC`, from, to)
+        ORDER BY COALESCE(SUM(token_estimate_in),0) + COALESCE(SUM(token_estimate_out),0) DESC`, from, to)
 	if err != nil {
 		return nil, err
 	}
@@ -940,15 +943,89 @@ func (r *Reader) PurgeAgent(ctx context.Context, agentID string) error {
 	return nil
 }
 
-// ExportCSV streams a CSV dump of call_events in the supplied range to w.
-// One header row, then one data row per event. Memory usage is O(1) — we
-// stream straight from the cursor. Capped at 200k rows so a long-range +
-// big-DB request can't tie up the connection indefinitely.
-const exportRowCap = 200_000
+// exportRowCap bounds one ExportCSV dump. exportPageSize is the number of
+// rows ExportCSV reads per query.
+const (
+	exportRowCap   = 200_000
+	exportPageSize = 1_000
+)
 
+// exportCSVHeader is the first line of every ExportCSV dump.
+const exportCSVHeader = "event_id,ts,agent_id,agent_name,upstream,short_name,tool_name," +
+	"is_write,is_destructive,pinned_tool,via,surface_mode,fingerprint," +
+	"args_size_bytes,reason_text,reason_len,reason_quality,approval_id," +
+	"approval_outcome,approval_latency_ms,approval_via,outcome,error_class," +
+	"total_latency_ms,result_size_bytes\n"
+
+// ExportCSV writes a CSV dump of call_events in the supplied range to w.
+// One header row, then one data row per event, oldest first (ties on ts in
+// event_id order). Capped at exportRowCap rows.
+//
+// It reads exportPageSize rows at a time by keyset on (ts, event_id) and
+// closes each page's cursor before it writes that page. No network write
+// happens while a cursor is open, so a slow HTTP client never holds a
+// database connection: with SQLite's single connection that used to stall
+// every other database caller for the length of the download.
 func (r *Reader) ExportCSV(ctx context.Context, w interface{ Write(p []byte) (int, error) }, rg Range) error {
+	return r.exportCSV(ctx, w, rg, exportPageSize, exportRowCap)
+}
+
+// exportCSV is ExportCSV with the page size and row cap as parameters, so
+// tests can force many pages.
+func (r *Reader) exportCSV(ctx context.Context, w interface{ Write(p []byte) (int, error) }, rg Range, pageSize, rowCap int) error {
+	if pageSize <= 0 {
+		pageSize = exportPageSize
+	}
 	from, to := rg.bounds()
-	rows, err := r.db.QueryContext(ctx, `SELECT
+	var cur *exportCursor
+	written := 0
+	for {
+		limit := pageSize
+		if rest := rowCap - written; rest < limit {
+			limit = rest
+		}
+		var (
+			page []byte
+			n    int
+			last exportCursor
+		)
+		if limit > 0 {
+			var err error
+			page, n, last, err = r.exportPage(ctx, from, to, cur, limit)
+			if err != nil {
+				return err
+			}
+		}
+		// The header goes out only after the first page query succeeded,
+		// as before: a failed query writes nothing.
+		if cur == nil {
+			if _, err := w.Write([]byte(exportCSVHeader)); err != nil {
+				return err
+			}
+		}
+		if n > 0 {
+			if _, err := w.Write(page); err != nil {
+				return err
+			}
+		}
+		written += n
+		if n < limit || limit <= 0 {
+			return nil
+		}
+		cur = &last
+	}
+}
+
+// exportCursor is the (ts, event_id) of the last row of an export page.
+type exportCursor struct {
+	ts, eventID int64
+}
+
+// exportPage reads up to limit call_events rows in [from, to) after cur (all
+// rows from the start when cur is nil), ordered by (ts, event_id), and
+// returns them as CSV lines. The cursor is closed when it returns.
+func (r *Reader) exportPage(ctx context.Context, from, to int64, cur *exportCursor, limit int) ([]byte, int, exportCursor, error) {
+	q := `SELECT
         event_id, ts, COALESCE(agent_id,''), COALESCE(agent_name,''),
         upstream, short_name, tool_name,
         is_write, is_destructive, pinned_tool,
@@ -959,20 +1036,24 @@ func (r *Reader) ExportCSV(ctx context.Context, w interface{ Write(p []byte) (in
         COALESCE(approval_latency_ms,0), COALESCE(approval_via,''),
         outcome, COALESCE(error_class,''), COALESCE(total_latency_ms,0),
         COALESCE(result_size_bytes,0)
-        FROM call_events WHERE ts >= ? AND ts < ? ORDER BY ts ASC LIMIT ?`,
-		from, to, exportRowCap)
+        FROM call_events WHERE ts >= ? AND ts < ?`
+	args := []any{from, to}
+	if cur != nil {
+		q += ` AND (ts > ? OR (ts = ? AND event_id > ?))`
+		args = append(args, cur.ts, cur.ts, cur.eventID)
+	}
+	q += ` ORDER BY ts ASC, event_id ASC LIMIT ?`
+	args = append(args, limit)
+	rows, err := r.db.QueryContext(ctx, q, args...)
 	if err != nil {
-		return err
+		return nil, 0, exportCursor{}, err
 	}
 	defer rows.Close()
-	header := "event_id,ts,agent_id,agent_name,upstream,short_name,tool_name," +
-		"is_write,is_destructive,pinned_tool,via,surface_mode,fingerprint," +
-		"args_size_bytes,reason_text,reason_len,reason_quality,approval_id," +
-		"approval_outcome,approval_latency_ms,approval_via,outcome,error_class," +
-		"total_latency_ms,result_size_bytes\n"
-	if _, err := w.Write([]byte(header)); err != nil {
-		return err
-	}
+	var (
+		buf  []byte
+		n    int
+		last exportCursor
+	)
 	for rows.Next() {
 		var (
 			eventID, ts                                       int64
@@ -993,7 +1074,7 @@ func (r *Reader) ExportCSV(ctx context.Context, w interface{ Write(p []byte) (in
 			&isWrite, &isDestructive, &pinned, &via, &surfaceMode, &fp, &argsSize,
 			&reason, &reasonLen, &reasonQuality, &approvalID, &approvalOutcome,
 			&approvalLatency, &approvalVia, &outcome, &errClass, &totalLatency, &resultSize); err != nil {
-			return err
+			return nil, 0, exportCursor{}, err
 		}
 		fields := []string{
 			fmt.Sprintf("%d", eventID), fmt.Sprintf("%d", ts), agentID, agentName,
@@ -1004,11 +1085,14 @@ func (r *Reader) ExportCSV(ctx context.Context, w interface{ Write(p []byte) (in
 			approvalID, approvalOutcome, fmt.Sprintf("%d", approvalLatency), approvalVia,
 			outcome, errClass, fmt.Sprintf("%d", totalLatency), fmt.Sprintf("%d", resultSize),
 		}
-		if _, err := w.Write([]byte(csvEscape(fields))); err != nil {
-			return err
-		}
+		buf = append(buf, csvEscape(fields)...)
+		n++
+		last = exportCursor{ts: ts, eventID: eventID}
 	}
-	return rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, 0, exportCursor{}, err
+	}
+	return buf, n, last, nil
 }
 
 // csvEscape returns a CSV row terminated with \n. Fields containing comma,

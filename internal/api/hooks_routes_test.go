@@ -6,21 +6,18 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
-	"path/filepath"
 	"testing"
 
 	"github.com/tusharbhardwaj/toolyard/internal/audit"
 	"github.com/tusharbhardwaj/toolyard/internal/hooks"
 	"github.com/tusharbhardwaj/toolyard/internal/identity"
 	"github.com/tusharbhardwaj/toolyard/internal/store"
+	"github.com/tusharbhardwaj/toolyard/internal/store/storetest"
 )
 
 func newHookAPITestServer(t *testing.T) (*http.ServeMux, *store.DB, string, string) {
 	t.Helper()
-	db, err := store.Open(filepath.Join(t.TempDir(), "api-hooks.db"))
-	if err != nil {
-		t.Fatalf("open db: %v", err)
-	}
+	db := storetest.Open(t)
 	t.Cleanup(func() { _ = db.Close() })
 	id := identity.New(db)
 	user, err := id.CreateUser(context.Background(), "tester", "long-enough-password")

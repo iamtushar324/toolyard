@@ -5,7 +5,6 @@ import (
 	"crypto/rand"
 	"encoding/json"
 	"errors"
-	"path/filepath"
 	"regexp"
 	"sort"
 	"strings"
@@ -20,6 +19,7 @@ import (
 	"github.com/tusharbhardwaj/toolyard/internal/identity"
 	"github.com/tusharbhardwaj/toolyard/internal/sealbox"
 	"github.com/tusharbhardwaj/toolyard/internal/store"
+	"github.com/tusharbhardwaj/toolyard/internal/store/storetest"
 )
 
 // fakeCall is one registry call the fake gateway saw: the exact tool name,
@@ -42,9 +42,19 @@ type fakeCaller struct {
 	fail     map[string]string // target -> error text
 	err      error             // transport error for every call
 	registry map[string]map[string]bool
+	// before, when set, runs once (then clears) ahead of the next call,
+	// outside the lock, so it may call the service again.
+	before func(target string)
 }
 
 func (f *fakeCaller) CallInternal(ctx context.Context, via, target string, args map[string]any) (*mcp.CallToolResult, error) {
+	f.mu.Lock()
+	hook := f.before
+	f.before = nil
+	f.mu.Unlock()
+	if hook != nil {
+		hook(target)
+	}
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.calls = append(f.calls, fakeCall{Target: target, Args: args, Caller: gateway.AgentIDFromContext(ctx), Via: via})
@@ -149,11 +159,7 @@ type env struct {
 
 func newEnv(t *testing.T) *env {
 	t.Helper()
-	db, err := store.Open(filepath.Join(t.TempDir(), "ik.db"))
-	if err != nil {
-		t.Fatalf("open db: %v", err)
-	}
-	t.Cleanup(func() { _ = db.Close() })
+	db := storetest.Open(t)
 	ctx := context.Background()
 	id := identity.New(db)
 	if _, err := id.CreateUser(ctx, "owner", "long-enough-password"); err != nil {
@@ -219,13 +225,27 @@ func (e *env) auditDecisions(t *testing.T, decision string) int {
 // auditMentions reports whether any audit row carries s in any text column.
 func (e *env) auditMentions(t *testing.T, s string) bool {
 	t.Helper()
-	var n int
-	q := `SELECT count(*) FROM audit_events WHERE instr(COALESCE(agent_id,''),?) > 0 OR instr(COALESCE(reason,''),?) > 0
-		OR instr(COALESCE(result_summary,''),?) > 0 OR instr(COALESCE(arguments,''),?) > 0`
-	if err := e.db.QueryRow(q, s, s, s, s).Scan(&n); err != nil {
+	// Matched in Go: SQLite's instr has no Postgres twin.
+	rows, err := e.db.Query(`SELECT COALESCE(agent_id,''), COALESCE(reason,''), COALESCE(result_summary,''), COALESCE(arguments,'')
+		FROM audit_events`)
+	if err != nil {
 		t.Fatal(err)
 	}
-	return n > 0
+	defer rows.Close()
+	found := false
+	for rows.Next() {
+		var a, b, c, d string
+		if err := rows.Scan(&a, &b, &c, &d); err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(a, s) || strings.Contains(b, s) || strings.Contains(c, s) || strings.Contains(d, s) {
+			found = true
+		}
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	return found
 }
 
 var hexRE = regexp.MustCompile(`^[0-9a-f]{64}$`)
@@ -1129,5 +1149,118 @@ func TestHadKey(t *testing.T) {
 	_ = e.db.QueryRow(`SELECT count(*) FROM identity_key_retired WHERE user_id = ?`, e.member.ID).Scan(&retired)
 	if retired != 0 || !had(e.member.ID) {
 		t.Errorf("after removals: retired=%d HadKey=%v, want 0/true", retired, had(e.member.ID))
+	}
+}
+
+// Concurrent reveals of one key: exactly one call gets the key, every
+// other gets ErrAlreadyRevealed. On SQLite the calls run one at a time
+// (one connection); on Postgres they race on the conditional UPDATE.
+func TestConcurrentRevealOnce(t *testing.T) {
+	e := newEnv(t)
+	ctx := context.Background()
+	st, err := e.svc.Issue(ctx, e.admin.ID, e.member.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	const n = 8
+	var (
+		wg      sync.WaitGroup
+		mu      sync.Mutex
+		keys    []string
+		already int
+		others  []error
+		barrier = make(chan struct{})
+	)
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			<-barrier
+			key, fp, err := e.svc.Reveal(ctx, e.member.ID)
+			mu.Lock()
+			defer mu.Unlock()
+			switch {
+			case err == nil:
+				if fp != st.Fingerprint || identity.HashToken(key) != fp {
+					others = append(others, errors.New("revealed key does not match the fingerprint"))
+				}
+				keys = append(keys, key)
+			case errors.Is(err, ErrAlreadyRevealed):
+				already++
+			default:
+				others = append(others, err)
+			}
+		}()
+	}
+	close(barrier)
+	wg.Wait()
+	if len(others) > 0 {
+		t.Fatalf("unexpected reveal errors: %v", others)
+	}
+	if len(keys) != 1 || already != n-1 {
+		t.Fatalf("reveals: %d succeeded, %d already revealed; want 1 and %d", len(keys), already, n-1)
+	}
+	if got := e.auditRows(t, EventReveal); got != 1 {
+		t.Errorf("reveal audit rows = %d, want 1", got)
+	}
+}
+
+// A rotate that loses to a concurrent rotate (the key changed between its
+// read and its write) discards its own key: the winner's key stays the
+// stored one, the agent token and every registry hold only the winner's
+// fingerprint, and nothing is left pending.
+func TestRotateLosingToConcurrentRotateKeepsWinner(t *testing.T) {
+	e := newEnv(t)
+	ctx := context.Background()
+	uid := e.member.ID
+	if _, err := e.svc.Issue(ctx, e.admin.ID, uid); err != nil {
+		t.Fatal(err)
+	}
+	e.caller.take()
+	// The second rotate runs in full while the first is registering its
+	// new fingerprint, before the first one's key write.
+	var (
+		winner    *Status
+		winnerErr error
+	)
+	e.caller.mu.Lock()
+	e.caller.before = func(string) { winner, winnerErr = e.svc.Rotate(ctx, e.admin.ID, uid) }
+	e.caller.mu.Unlock()
+	if _, err := e.svc.Rotate(ctx, e.admin.ID, uid); !errors.Is(err, ErrKeyChanged) {
+		t.Fatalf("losing rotate: err = %v, want ErrKeyChanged", err)
+	}
+	if winnerErr != nil || winner == nil {
+		t.Fatalf("winning rotate: %+v, %v", winner, winnerErr)
+	}
+	fp := winner.Fingerprint
+	st, err := e.svc.Status(ctx, uid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.Fingerprint != fp || st.Revealed {
+		t.Errorf("status after lost rotate = %+v, want fingerprint %s unrevealed", st, fp)
+	}
+	regs := regByUpstream(st)
+	for _, up := range []string{"BkCoreServices", "BkCoreServicesProd"} {
+		if regs[up].Status != StatusRegistered || regs[up].keyHash != fp {
+			t.Errorf("registration %s = %+v (hash %s), want registered %s", up, regs[up], regs[up].keyHash, fp)
+		}
+		if got := e.caller.hashes(up); !eq(got, []string{fp}) {
+			t.Errorf("registry %s = %v, want only the winner %s", up, got, fp)
+		}
+	}
+	if got := pendingKeys(st); len(got) != 0 {
+		t.Errorf("pending removals = %v, want none", got)
+	}
+	var tokenHash string
+	if err := e.db.QueryRow(`SELECT token_hash FROM agents WHERE owner_user = ? AND kind = ?`, uid, identity.AgentKindIdentity).Scan(&tokenHash); err != nil {
+		t.Fatal(err)
+	}
+	if tokenHash != fp {
+		t.Errorf("agent token hash = %s, want the winner %s", tokenHash, fp)
+	}
+	key, revealedFP, err := e.svc.Reveal(ctx, uid)
+	if err != nil || revealedFP != fp || identity.HashToken(key) != fp {
+		t.Errorf("reveal after lost rotate: fp=%s err=%v, want %s", revealedFP, err, fp)
 	}
 }

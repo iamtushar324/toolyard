@@ -2,22 +2,16 @@ package identity
 
 import (
 	"context"
-	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
-	"github.com/tusharbhardwaj/toolyard/internal/store"
+	"github.com/tusharbhardwaj/toolyard/internal/store/storetest"
 )
 
 func newOpTestService(t *testing.T) (*Service, *User) {
 	t.Helper()
-	db, err := store.Open(filepath.Join(t.TempDir(), "op.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { db.Close() })
-	s := New(db)
+	s := New(storetest.Open(t))
 	u, err := s.CreateUser(context.Background(), "owner", "long-enough-password")
 	if err != nil {
 		t.Fatal(err)

@@ -7,7 +7,6 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
-	"path/filepath"
 	"regexp"
 	"strings"
 	"testing"
@@ -24,6 +23,7 @@ import (
 	"github.com/tusharbhardwaj/toolyard/internal/policy"
 	"github.com/tusharbhardwaj/toolyard/internal/realtime"
 	"github.com/tusharbhardwaj/toolyard/internal/store"
+	"github.com/tusharbhardwaj/toolyard/internal/store/storetest"
 	"github.com/tusharbhardwaj/toolyard/internal/upstreams"
 )
 
@@ -77,10 +77,7 @@ type connectFixture struct {
 func newConnectFixture(t *testing.T) *connectFixture {
 	t.Helper()
 	ctx := context.Background()
-	db, err := store.Open(filepath.Join(t.TempDir(), "connect.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	db := storetest.Open(t)
 	t.Cleanup(func() { _ = db.Close() })
 	for _, q := range []string{
 		`INSERT INTO users(id, username, password_hash, role, email, created_at, updated_at) VALUES('u_root','root','x','admin','root@beknown.work',1,1)`,
@@ -671,10 +668,7 @@ func (stubConnect) UserConnectionOf(context.Context, string, string) (*oauth.Use
 // wired an unknown agent sees no such tool at all; the tools are pinned
 // and in the always-on group.
 func TestConnectionsToolsNeedOwnerAndWiring(t *testing.T) {
-	db, err := store.Open(filepath.Join(t.TempDir(), "bare.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	db := storetest.Open(t)
 	t.Cleanup(func() { _ = db.Close() })
 	gw := gateway.New(gateway.Options{
 		Policy: policy.New(db), Audit: audit.New(db), Memory: memory.New(db), Hub: realtime.NewHub(),

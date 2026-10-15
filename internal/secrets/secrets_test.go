@@ -2,22 +2,17 @@ package secrets
 
 import (
 	"context"
-	"path/filepath"
 	"testing"
 
 	"github.com/tusharbhardwaj/toolyard/internal/audit"
 	"github.com/tusharbhardwaj/toolyard/internal/sealbox"
-	"github.com/tusharbhardwaj/toolyard/internal/store"
+	"github.com/tusharbhardwaj/toolyard/internal/store/storetest"
 )
 
 func newTestService(t *testing.T) *Service {
 	t.Helper()
 	dir := t.TempDir()
-	db, err := store.Open(filepath.Join(dir, "t.db"))
-	if err != nil {
-		t.Fatalf("open db: %v", err)
-	}
-	t.Cleanup(func() { db.Close() })
+	db := storetest.Open(t)
 	key, err := sealbox.LoadOrCreateKey(dir, "secrets.key")
 	if err != nil {
 		t.Fatalf("key: %v", err)

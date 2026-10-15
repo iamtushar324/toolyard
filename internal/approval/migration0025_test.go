@@ -14,7 +14,7 @@ import (
 // 0025 migration file, so the test runs the SQL that ships.
 func backfillSQL(t *testing.T) string {
 	t.Helper()
-	body, err := os.ReadFile(filepath.Join("..", "store", "migrations", "0025_audit_actors.sql"))
+	body, err := os.ReadFile(filepath.Join("..", "store", "migrations", "sqlite", "0025_audit_actors.sql"))
 	if err != nil {
 		t.Fatalf("read migration: %v", err)
 	}
@@ -32,7 +32,9 @@ func backfillSQL(t *testing.T) string {
 }
 
 // The backfill names the decider only on an approval's decision rows
-// (call.allowed / call.denied), and only when a person decided.
+// (call.allowed / call.denied), and only when a person decided. It runs
+// the shipped SQLite migration SQL, so it stays on SQLite (store.Open) in
+// both CI jobs.
 func TestMigration0025Backfill_OnlyDecisionRowsOfHumanDecisions(t *testing.T) {
 	db, err := store.Open(filepath.Join(t.TempDir(), "m.db"))
 	if err != nil {

@@ -2,7 +2,6 @@ package gateway
 
 import (
 	"context"
-	"path/filepath"
 	"reflect"
 	"strings"
 	"sync"
@@ -17,7 +16,7 @@ import (
 	"github.com/tusharbhardwaj/toolyard/internal/memory"
 	"github.com/tusharbhardwaj/toolyard/internal/policy"
 	"github.com/tusharbhardwaj/toolyard/internal/realtime"
-	"github.com/tusharbhardwaj/toolyard/internal/store"
+	"github.com/tusharbhardwaj/toolyard/internal/store/storetest"
 )
 
 func waitUntil(t *testing.T, what string, cond func() bool) {
@@ -147,10 +146,7 @@ func TestDrainEndsApprovalWaits(t *testing.T) {
 // The write finishes during the drain and its recorded result is the real
 // one, not outcome_unknown.
 func TestDrainMidDispatchKeepsTheLegacyOutcome(t *testing.T) {
-	db, err := store.Open(filepath.Join(t.TempDir(), "drain.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	db := storetest.Open(t)
 	t.Cleanup(func() { _ = db.Close() })
 	root, cancelRoot := context.WithCancel(context.Background())
 	defer cancelRoot()
@@ -305,10 +301,7 @@ func (v *drainHookVisibility) IsVisible(_ context.Context, name string) bool {
 // when set, is the visibility provider.
 func newAdmittedGateway(t *testing.T, vis VisibilityProvider, onCall func(tool string)) (*Gateway, *calledTools) {
 	t.Helper()
-	db, err := store.Open(filepath.Join(t.TempDir(), "admitted.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	db := storetest.Open(t)
 	t.Cleanup(func() { _ = db.Close() })
 	bus, err := approval.New(context.Background(), db)
 	if err != nil {

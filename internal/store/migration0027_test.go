@@ -20,7 +20,7 @@ func openAt(t *testing.T, path, stop string) *sql.DB {
 	if _, err := sdb.Exec(`CREATE TABLE IF NOT EXISTS schema_migrations (name TEXT PRIMARY KEY, applied_at INTEGER NOT NULL)`); err != nil {
 		t.Fatal(err)
 	}
-	entries, err := migrations.ReadDir("migrations")
+	entries, err := migrations.ReadDir("migrations/sqlite")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -35,7 +35,7 @@ func openAt(t *testing.T, path, stop string) *sql.DB {
 		if name >= stop {
 			break
 		}
-		body, _ := migrations.ReadFile("migrations/" + name)
+		body, _ := migrations.ReadFile("migrations/sqlite/" + name)
 		if _, err := sdb.Exec(string(body)); err != nil {
 			t.Fatalf("apply %s: %v", name, err)
 		}

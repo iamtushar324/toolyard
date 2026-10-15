@@ -66,8 +66,8 @@ func (s *Service) Ingest(ctx context.Context, src *Source, in IngestInput) (*Eve
 	dedup := strings.TrimSpace(in.DedupKey)
 
 	res, err := s.db.ExecContext(ctx,
-		`INSERT OR IGNORE INTO events(id, source_id, type, title, summary, payload, dedup_key, created_at, received_at)
-         VALUES(?,?,?,?,?,?,?,?,?)`,
+		`INSERT INTO events(id, source_id, type, title, summary, payload, dedup_key, created_at, received_at)
+         VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT DO NOTHING`,
 		id, src.ID, typ, nullStr(title), summary, nullStr(payload), nullStr(dedup), created, received)
 	if err != nil {
 		return nil, false, err

@@ -235,8 +235,8 @@ func (r *Registry) hasMessage(ctx context.Context, approvalID, channel string) b
 
 func (r *Registry) insertMessage(ctx context.Context, approvalID, channel string, ref MessageRef) {
 	_, err := r.db.ExecContext(ctx,
-		`INSERT OR IGNORE INTO chat_messages(approval_id, channel, chat_id, message_id, created_at)
-         VALUES(?,?,?,?,?)`,
+		`INSERT INTO chat_messages(approval_id, channel, chat_id, message_id, created_at)
+         VALUES(?,?,?,?,?) ON CONFLICT DO NOTHING`,
 		approvalID, channel, ref.ChatID, ref.MessageID, time.Now().UnixMilli())
 	if err != nil {
 		r.log.Warn("insert chat_message", "err", err.Error())
@@ -251,7 +251,7 @@ func (r *Registry) markResolved(ctx context.Context, approvalID, channel string)
 
 func (r *Registry) messagesFor(ctx context.Context, approvalID string) []chatRow {
 	rows, err := r.db.QueryContext(ctx,
-		`SELECT approval_id, channel, chat_id, message_id, resolved_at IS NOT NULL
+		`SELECT approval_id, channel, chat_id, message_id, CASE WHEN resolved_at IS NOT NULL THEN 1 ELSE 0 END
          FROM chat_messages WHERE approval_id=?`, approvalID)
 	if err != nil {
 		return nil

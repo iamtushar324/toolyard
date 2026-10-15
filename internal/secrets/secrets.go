@@ -100,7 +100,7 @@ func (s *Service) Create(ctx context.Context, name, value, description string) (
          VALUES(?,?,?,?,?)`,
 		name, enc, nullStr(description), now, now)
 	if err != nil {
-		if strings.Contains(strings.ToLower(err.Error()), "unique") {
+		if store.IsUniqueViolation(err) {
 			return nil, ErrExists
 		}
 		return nil, err
@@ -123,7 +123,7 @@ func (s *Service) Request(ctx context.Context, name, description, requestedBy st
          VALUES(?,'',?,?,?,1,?)`,
 		name, nullStr(description), now, now, nullStr(requestedBy))
 	if err != nil {
-		if strings.Contains(strings.ToLower(err.Error()), "unique") {
+		if store.IsUniqueViolation(err) {
 			return nil, ErrExists
 		}
 		return nil, err

@@ -4,12 +4,12 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/tusharbhardwaj/toolyard/internal/mempalace"
 	"github.com/tusharbhardwaj/toolyard/internal/store"
+	"github.com/tusharbhardwaj/toolyard/internal/store/storetest"
 )
 
 type stubMemPalace struct {
@@ -30,12 +30,7 @@ func (s *stubMemPalace) Ingest(_ context.Context, _ string, entry, _, _ string) 
 
 func tempHooksDB(t *testing.T) *store.DB {
 	t.Helper()
-	db, err := store.Open(filepath.Join(t.TempDir(), "hooks.db"))
-	if err != nil {
-		t.Fatalf("open db: %v", err)
-	}
-	t.Cleanup(func() { _ = db.Close() })
-	return db
+	return storetest.Open(t)
 }
 
 func TestIngestRawNormalizesAndRedacts(t *testing.T) {
@@ -150,5 +145,46 @@ func TestIngestRawOptsSkipMemoryStillRecords(t *testing.T) {
 	}
 	if !ev.MemoryIngested || mp.calls != 1 {
 		t.Fatalf("default ingest did not forward: ingested=%v calls=%d", ev.MemoryIngested, mp.calls)
+	}
+}
+
+// TestListSearchIsCaseInsensitive pins the free-text search: it ignores case
+// on both engines (SQLite LIKE, Postgres ILIKE) across text, tool name,
+// event name and session id, and a backslash is a plain character.
+func TestListSearchIsCaseInsensitive(t *testing.T) {
+	svc := New(tempHooksDB(t), nil)
+	ctx := context.Background()
+	for _, body := range []string{
+		`{"source":"codex","event_name":"Stop","session_id":"s1","text":"Fixed the Billing bug"}`,
+		`{"source":"cursor","event_name":"afterMCPExecution","session_id":"s2","tool_name":"GitHub.Create_Issue","text":"created issue"}`,
+		`{"source":"codex","event_name":"UserPromptSubmit","session_id":"SessionUpper","text":"path C:\\Temp\\x"}`,
+		`{"source":"codex","event_name":"UserPromptSubmit","session_id":"s4","text":"path C:XTempXx"}`,
+	} {
+		if _, err := svc.IngestRaw(ctx, "ag_1", []byte(body), ""); err != nil {
+			t.Fatalf("IngestRaw %s: %v", body, err)
+		}
+	}
+	search := func(q string) []Event {
+		t.Helper()
+		rows, err := svc.List(ctx, Query{Q: q})
+		if err != nil {
+			t.Fatalf("List(Q=%q): %v", q, err)
+		}
+		return rows
+	}
+	if rows := search("billing"); len(rows) != 1 || rows[0].SessionID != "s1" {
+		t.Fatalf("text search: %+v", rows)
+	}
+	if rows := search("github.create_issue"); len(rows) != 1 || rows[0].ToolName != "GitHub.Create_Issue" {
+		t.Fatalf("tool search: %+v", rows)
+	}
+	if rows := search("AFTERMCP"); len(rows) != 1 || rows[0].SessionID != "s2" {
+		t.Fatalf("event search: %+v", rows)
+	}
+	if rows := search("sessionupper"); len(rows) != 1 || rows[0].SessionID != "SessionUpper" {
+		t.Fatalf("session search: %+v", rows)
+	}
+	if rows := search(`c:\temp`); len(rows) != 1 || rows[0].SessionID != "SessionUpper" {
+		t.Fatalf("backslash search: %+v", rows)
 	}
 }

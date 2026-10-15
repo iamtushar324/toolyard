@@ -6,7 +6,6 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"errors"
-	"path/filepath"
 	"sync"
 	"testing"
 	"time"
@@ -15,16 +14,12 @@ import (
 	"github.com/google/uuid"
 	"github.com/tusharbhardwaj/toolyard/internal/identity"
 	"github.com/tusharbhardwaj/toolyard/internal/sealbox"
-	"github.com/tusharbhardwaj/toolyard/internal/store"
+	"github.com/tusharbhardwaj/toolyard/internal/store/storetest"
 )
 
 func federationFixture(t *testing.T) (*Service, *identity.User, ed25519.PrivateKey) {
 	t.Helper()
-	db, e := store.Open(filepath.Join(t.TempDir(), "db.sqlite"))
-	if e != nil {
-		t.Fatal(e)
-	}
-	t.Cleanup(func() { db.Close() })
+	db := storetest.Open(t)
 	id := identity.New(db)
 	u, e := id.UpsertClerkUser(t.Context(), identity.ClerkProfile{ClerkUserID: "user-admin", Email: "admin@example.test"}, "")
 	if e != nil {

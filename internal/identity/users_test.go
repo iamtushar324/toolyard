@@ -3,11 +3,10 @@ package identity
 import (
 	"context"
 	"errors"
-	"path/filepath"
 	"testing"
 	"time"
 
-	"github.com/tusharbhardwaj/toolyard/internal/store"
+	"github.com/tusharbhardwaj/toolyard/internal/store/storetest"
 )
 
 func clerkUser(t *testing.T, s *Service, id, email, owner string) *User {
@@ -104,6 +103,10 @@ func TestUpsertClerkUserLinksOwner(t *testing.T) {
 		t.Fatal(err)
 	}
 
+	// The owner row is the first user by created_at (ties broken by the
+	// random id), so the next user must not share the primary's
+	// millisecond, or the test picks either row at random.
+	time.Sleep(2 * time.Millisecond)
 	// Someone else with the owner email but... no: a different email first,
 	// to prove non-owners never attach to the primary row.
 	other := clerkUser(t, s, "user_other", "other@beknown.work", "owner@beknown.work")
@@ -314,12 +317,7 @@ func TestVerifyAgentTokenBlockedOwner(t *testing.T) {
 // password setup before the first Clerk sign-in.
 func newEmptyIdentity(t *testing.T) *Service {
 	t.Helper()
-	db, err := store.Open(filepath.Join(t.TempDir(), "empty.db"))
-	if err != nil {
-		t.Fatalf("open db: %v", err)
-	}
-	t.Cleanup(func() { db.Close() })
-	return New(db)
+	return New(storetest.Open(t))
 }
 
 func TestUpsertClerkUserBootstrapsFirstAdmin(t *testing.T) {

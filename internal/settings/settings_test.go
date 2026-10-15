@@ -2,11 +2,10 @@ package settings
 
 import (
 	"context"
-	"path/filepath"
 	"strings"
 	"testing"
 
-	"github.com/tusharbhardwaj/toolyard/internal/store"
+	"github.com/tusharbhardwaj/toolyard/internal/store/storetest"
 )
 
 func TestNormaliseInboxAttention(t *testing.T) {
@@ -40,10 +39,7 @@ func TestNormaliseInboxAttention(t *testing.T) {
 // carries it and Patch refuses it.
 func TestRetiredKeysStayHidden(t *testing.T) {
 	ctx := context.Background()
-	db, err := store.Open(filepath.Join(t.TempDir(), "settings.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	db := storetest.Open(t)
 	t.Cleanup(func() { _ = db.Close() })
 	if _, err := db.Exec(`INSERT INTO system_settings(key, value, updated_at) VALUES('clickhouse_password', '"stored-value"', 0)`); err != nil {
 		t.Fatal(err)

@@ -3,19 +3,14 @@ package policy
 import (
 	"context"
 	"errors"
-	"path/filepath"
 	"testing"
 
-	"github.com/tusharbhardwaj/toolyard/internal/store"
+	"github.com/tusharbhardwaj/toolyard/internal/store/storetest"
 )
 
 func newDBEngine(t *testing.T) *Engine {
 	t.Helper()
-	dir := t.TempDir()
-	db, err := store.Open(filepath.Join(dir, "t.db"))
-	if err != nil {
-		t.Fatalf("open db: %v", err)
-	}
+	db := storetest.Open(t)
 	t.Cleanup(func() { db.Close() })
 	return New(db)
 }

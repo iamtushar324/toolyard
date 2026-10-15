@@ -408,7 +408,7 @@ func (b *Bus) create(ctx context.Context, in NewRequest) (*Request, error) {
 		if err == nil {
 			return req, nil
 		}
-		if !isUniqueViolation(err) {
+		if !store.IsUniqueViolation(err) {
 			return nil, err
 		}
 		lastErr = err
@@ -562,30 +562,6 @@ func (b *Bus) findPendingByFingerprint(ctx context.Context, fp string) (*Request
 		return nil, err
 	}
 	return req, nil
-}
-
-func isUniqueViolation(err error) bool {
-	if err == nil {
-		return false
-	}
-	msg := err.Error()
-	// mattn/go-sqlite3 returns "UNIQUE constraint failed" in the message.
-	return contains(msg, "UNIQUE constraint failed") || contains(msg, "constraint failed: UNIQUE")
-}
-
-func contains(s, needle string) bool {
-	return len(needle) > 0 && len(s) >= len(needle) && stringIndex(s, needle) >= 0
-}
-
-// stringIndex avoids importing strings into this file just for one call.
-func stringIndex(s, needle string) int {
-	n := len(needle)
-	for i := 0; i+n <= len(s); i++ {
-		if s[i:i+n] == needle {
-			return i
-		}
-	}
-	return -1
 }
 
 // DecideAs is the decision entrypoint: it records who decided and how
@@ -837,16 +813,33 @@ func (b *Bus) SetResult(ctx context.Context, id, envelope string, isError bool, 
 	return b.SetResultState(ctx, id, envelope, isError, execErr, state)
 }
 func (b *Bus) SetResultState(ctx context.Context, id, envelope string, isError bool, execErr, state string) error {
-	res, err := b.db.ExecContext(ctx,
-		`UPDATE approval_requests
-            SET result_envelope = ?, result_is_error = ?, result_error = ?, result_executed_at = ?
-          WHERE id = ? AND result_executed_at IS NULL`,
-		nullStr(envelope), boolInt(isError), nullStr(execErr), time.Now().UnixMilli(), id)
+	// The result and the claim state commit together, so no reader (on a
+	// pooled database) sees a recorded result whose claim still says
+	// running.
+	tx, err := b.db.BeginTx(ctx, nil)
 	if err != nil {
 		return err
 	}
-	if n, _ := res.RowsAffected(); n > 0 {
-		_, _ = b.db.ExecContext(ctx, `UPDATE legacy_execution_claims SET state=?,finished_at=?,reason=? WHERE request_id=?`, state, time.Now().UnixMilli(), execErr, id)
+	defer func() { _ = tx.Rollback() }()
+	now := time.Now().UnixMilli()
+	res, err := tx.ExecContext(ctx,
+		`UPDATE approval_requests
+            SET result_envelope = ?, result_is_error = ?, result_error = ?, result_executed_at = ?
+          WHERE id = ? AND result_executed_at IS NULL`,
+		nullStr(envelope), boolInt(isError), nullStr(execErr), now, id)
+	if err != nil {
+		return err
+	}
+	n, _ := res.RowsAffected()
+	if n > 0 {
+		if _, err := tx.ExecContext(ctx, `UPDATE legacy_execution_claims SET state=?,finished_at=?,reason=? WHERE request_id=?`, state, now, execErr, id); err != nil {
+			return err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
+	if n > 0 {
 		b.signal(id)
 		if req, gerr := b.Get(ctx, id); gerr == nil {
 			b.fanOut(ctx, req, "approval.executed")

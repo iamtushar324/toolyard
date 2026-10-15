@@ -27,6 +27,10 @@ var (
 	ErrAlreadyHere = errors.New("server name already exists")
 	ErrNotFound    = errors.New("server not found")
 	ErrReserved    = errors.New("server name is reserved")
+	// ErrConflict means the server row changed between Update's read and
+	// its write (another edit or a status write won). Nothing was saved;
+	// reload the server and apply the edit again.
+	ErrConflict = errors.New("server changed during the edit; reload and try again")
 )
 
 // IdentityForwarding is a server's per-person identity setting.
@@ -612,8 +616,7 @@ func (s *Service) Add(ctx context.Context, srv Server) (*Server, error) {
 		srv.Name, srv.Transport, nullStr(srv.Command), string(argsBlob),
 		nullStr(srv.URL), string(envBlob), string(headersBlob), identityJSON(srv.Identity), srv.AuthMode, 1, now, now)
 	if err != nil {
-		// SQLite reports unique constraint as "UNIQUE constraint failed".
-		if strings.Contains(strings.ToLower(err.Error()), "unique") {
+		if store.IsUniqueViolation(err) {
 			return nil, ErrAlreadyHere
 		}
 		return nil, err
@@ -1019,6 +1022,10 @@ func (o *OptionalIdentity) UnmarshalJSON(b []byte) error {
 // runs on the merged config, so a patch can't sneak an identity header
 // past an existing static header or vice versa. On a connect failure the
 // new config is still saved and the error recorded on the row, as in Add.
+//
+// The write is conditional on the updated_at value read at the start, so a
+// concurrent change to the row (s.mu only serialises this process) is not
+// overwritten: Update then saves nothing and returns ErrConflict.
 func (s *Service) Update(ctx context.Context, name string, patch Patch) (*Server, error) {
 	if isReservedBuiltin(name) {
 		return nil, ErrReserved
@@ -1087,12 +1094,24 @@ func (s *Service) Update(ctx context.Context, name string, patch Patch) (*Server
 	if next.Enabled {
 		enabled = 1
 	}
-	if _, err := s.db.ExecContext(ctx,
+	res, err := s.db.ExecContext(ctx,
 		`UPDATE upstream_servers SET url=?, env_json=?, headers_json=?, identity_json=?, auth_mode=?, enabled=?, updated_at=?
-         WHERE name=?`,
+         WHERE name=? AND updated_at=?`,
 		nullStr(next.URL), string(envBlob), string(headersBlob), identityJSON(next.Identity),
-		normalizeAuthMode(next.AuthMode), enabled, time.Now().UnixMilli(), name); err != nil {
+		normalizeAuthMode(next.AuthMode), enabled, time.Now().UnixMilli(), name, cur.UpdatedAt)
+	if err != nil {
 		return nil, err
+	}
+	if n, err := res.RowsAffected(); err != nil {
+		return nil, err
+	} else if n == 0 {
+		if _, err := s.get(ctx, name); errors.Is(err, ErrNotFound) {
+			return nil, ErrNotFound
+		}
+		if oauthReset {
+			return nil, fmt.Errorf("%w (the server's OAuth sign-in was already reset; authorise it again)", ErrConflict)
+		}
+		return nil, ErrConflict
 	}
 
 	// Reconnect in place so the live upstream runs the new config. A

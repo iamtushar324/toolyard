@@ -6,14 +6,13 @@ import (
 	"flag"
 	"fmt"
 	"os"
-	"path/filepath"
 	"strings"
 	"text/tabwriter"
 	"time"
 
 	"github.com/tusharbhardwaj/toolyard/internal/audit"
 	"github.com/tusharbhardwaj/toolyard/internal/identity"
-	"github.com/tusharbhardwaj/toolyard/internal/store"
+	"github.com/tusharbhardwaj/toolyard/internal/keyguard"
 )
 
 // runOperatorToken manages operator tokens straight from the data directory.
@@ -35,15 +34,26 @@ func runOperatorToken(argv []string) error {
 	scopes := fs.String("scopes", "read,write", "comma-separated scopes: read, write, owner (create)")
 	ttl := fs.Duration("ttl", 0, "expiry, e.g. 720h; 0 never expires (create)")
 	out := fs.String("out", "", "file to write the token to, mode 0600 (create; required)")
+	credentialsDir := fs.String("credentials-dir", os.Getenv("TOOLYARD_CREDENTIALS_DIR"), "directory searched for toolyard.env and database-url after $CREDENTIALS_DIRECTORY, as for serve. Defaults to $TOOLYARD_CREDENTIALS_DIR.")
 	if err := fs.Parse(argv); err != nil {
 		return err
 	}
-	db, err := store.Open(filepath.Join(*dataDir, "toolyard.db"))
+	// The same database as serve (TEC-1635): Postgres from
+	// $TOOLYARD_DATABASE_URL or a database-url credential, else
+	// <data>/toolyard.db.
+	if _, err := keyguard.LoadEnvFiles(*credentialsDir); err != nil {
+		return err
+	}
+	target, err := resolveDatabase(*dataDir, *credentialsDir, os.Getenv)
 	if err != nil {
-		return fmt.Errorf("open db: %w", err)
+		return err
+	}
+	ctx := context.Background()
+	db, err := openDatabase(ctx, target, 2)
+	if err != nil {
+		return fmt.Errorf("open db (%s): %w", target.describe(), err)
 	}
 	defer db.Close()
-	ctx := context.Background()
 	ids := identity.New(db)
 
 	switch sub {

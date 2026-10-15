@@ -26,7 +26,9 @@ type Voice interface {
 	Speak(ctx context.Context, script string) (audio []byte, contentType string, err error)
 }
 
-// BlobStore keeps generated files (voice notes) next to copied attachments.
+// BlobStore keeps generated files (voice notes) in the same blob store as
+// copied attachments (Snapshotter: files on SQLite, database chunks on
+// Postgres).
 type BlobStore interface {
 	Put(ctx context.Context, data []byte, contentType, source string) (sha string, err error)
 }

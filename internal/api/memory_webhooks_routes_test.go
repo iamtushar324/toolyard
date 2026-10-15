@@ -7,7 +7,6 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
-	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -17,7 +16,7 @@ import (
 	"github.com/tusharbhardwaj/toolyard/internal/identity"
 	"github.com/tusharbhardwaj/toolyard/internal/mempalace"
 	"github.com/tusharbhardwaj/toolyard/internal/memwebhook"
-	"github.com/tusharbhardwaj/toolyard/internal/store"
+	"github.com/tusharbhardwaj/toolyard/internal/store/storetest"
 )
 
 // stubMemIngester satisfies memwebhook.MemIngester without a live MemPalace. It
@@ -64,10 +63,7 @@ func (s *stubMemIngester) LastAgent() string    { s.mu.Lock(); defer s.mu.Unlock
 // ingester stub + audit logger.
 func newMemWebhookAPITestServer(t *testing.T, webhookMax int64) (http.Handler, *http.Cookie, *stubMemIngester, *audit.Logger) {
 	t.Helper()
-	db, err := store.Open(filepath.Join(t.TempDir(), "mw-api.db"))
-	if err != nil {
-		t.Fatalf("open db: %v", err)
-	}
+	db := storetest.Open(t)
 	t.Cleanup(func() { _ = db.Close() })
 
 	id := identity.New(db)

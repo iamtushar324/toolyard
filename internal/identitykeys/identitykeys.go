@@ -115,6 +115,9 @@ var (
 	ErrNoClerkIdentity = errors.New("user has no Clerk identity; they must sign in with Google once")
 	// ErrNotWired: the registry caller isn't set.
 	ErrNotWired = errors.New("identity key registry not wired")
+	// ErrKeyChanged: a rotate lost to a concurrent rotate or revoke of the
+	// same key; its new key was discarded and the current one kept.
+	ErrKeyChanged = errors.New("identity key changed during rotate; try again")
 	// errNoActor: a pending removal has nobody to run as.
 	errNoActor = errors.New("no admin recorded to run the removal as")
 )
@@ -423,15 +426,24 @@ func (s *Service) Issue(ctx context.Context, actorID, userID string) (*Status, e
 		return nil, err
 	}
 	defer func() { _ = tx.Rollback() }()
+	// A concurrent Issue for the same user passed the HasKey check too; the
+	// unique identity agent per owner (and the user_identity_keys primary
+	// key) refuses the second one.
 	if _, err := tx.ExecContext(ctx,
 		`INSERT INTO agents(id, name, owner_user, token_hash, kind, created_at) VALUES(?,?,?,?,?,?)`,
 		agentID, AgentName, userID, hash, identity.AgentKindIdentity, now); err != nil {
+		if store.IsUniqueViolation(err) {
+			return nil, ErrKeyExists
+		}
 		return nil, err
 	}
 	if _, err := tx.ExecContext(ctx,
 		`INSERT INTO user_identity_keys(user_id, agent_id, key_hash, key_sealed, revealed_at, created_by, created_at, updated_at)
          VALUES(?,?,?,?,NULL,?,?,?)`,
 		userID, agentID, hash, sealed, nullStr(actorID), now, now); err != nil {
+		if store.IsUniqueViolation(err) {
+			return nil, ErrKeyExists
+		}
 		return nil, err
 	}
 	if err := tx.Commit(); err != nil {
@@ -450,6 +462,10 @@ func (s *Service) Issue(ctx context.Context, actorID, userID string) (*Status, e
 // that succeeds), then swaps the identity agent's token so the old key
 // stops authenticating at once. The new key is unrevealed. A removal that
 // fails stays pending; it is retried by Register and the background pass.
+// The key write is conditional on the fingerprint read at the start: when
+// a concurrent rotate or revoke changed the key first, this rotate's key
+// is discarded (see lostRotate) and the result is ErrKeyChanged or
+// ErrNoKey.
 func (s *Service) Rotate(ctx context.Context, actorID, userID string) (*Status, error) {
 	u, err := s.registrableUser(ctx, userID)
 	if err != nil {
@@ -479,14 +495,25 @@ func (s *Service) Rotate(ctx context.Context, actorID, userID string) (*Status, 
 		return nil, err
 	}
 	defer func() { _ = tx.Rollback() }()
+	res, err := tx.ExecContext(ctx,
+		`UPDATE user_identity_keys SET key_hash = ?, key_sealed = ?, revealed_at = NULL, created_by = ?, updated_at = ?
+         WHERE user_id = ? AND key_hash = ?`, hash, sealed, nullStr(actorID), now, userID, k.KeyHash)
+	if err != nil {
+		return nil, err
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return nil, err
+	}
+	if n != 1 {
+		// Release the transaction (SQLite's only connection) before the
+		// cleanup queries.
+		_ = tx.Rollback()
+		return nil, s.lostRotate(ctx, actorID, userID, u, hash)
+	}
 	if _, err := tx.ExecContext(ctx,
 		`UPDATE agents SET token_hash = ?, prev_token_hash = NULL, prev_token_expires = NULL, disabled = 0
          WHERE id = ? AND kind = ?`, hash, k.AgentID, identity.AgentKindIdentity); err != nil {
-		return nil, err
-	}
-	if _, err := tx.ExecContext(ctx,
-		`UPDATE user_identity_keys SET key_hash = ?, key_sealed = ?, revealed_at = NULL, created_by = ?, updated_at = ?
-         WHERE user_id = ?`, hash, sealed, nullStr(actorID), now, userID); err != nil {
 		return nil, err
 	}
 	if err := tx.Commit(); err != nil {
@@ -497,37 +524,102 @@ func (s *Service) Rotate(ctx context.Context, actorID, userID string) (*Status, 
 	return s.Status(ctx, userID)
 }
 
+// lostRotate cleans up after a rotate whose key write lost to a concurrent
+// rotate or revoke. The lost fingerprint was registered but its key is
+// discarded, so it becomes a pending removal at every registry upstream.
+// This rotate's registerAll may also have retired the winner's fingerprint
+// as superseded and left registration rows naming the lost one, so the
+// current key, if any, is taken off the pending removals and registered
+// again; without one, rows naming the lost fingerprint become revoked. It
+// returns ErrKeyChanged (a key remains) or ErrNoKey (it was revoked), or a
+// store error.
+func (s *Service) lostRotate(ctx context.Context, actorID, userID string, u *userInfo, lost string) error {
+	var upstreams []string
+	if s.registries != nil {
+		var err error
+		if upstreams, err = s.registries.RegistryUpstreams(ctx); err != nil {
+			return err
+		}
+	}
+	cur, err := keyRowFor(ctx, s.db, userID)
+	if err != nil {
+		return err
+	}
+	for _, up := range upstreams {
+		if err := s.retire(ctx, up, lost, userID, actorID, "superseded"); err != nil {
+			return err
+		}
+		if cur != nil {
+			if err := s.unretire(ctx, up, cur.KeyHash); err != nil {
+				return err
+			}
+		}
+	}
+	if cur != nil {
+		if err := s.registerAll(ctx, actorID, userID, u, cur.KeyHash); err != nil {
+			return err
+		}
+		return ErrKeyChanged
+	}
+	regs, err := s.registrations(ctx, userID)
+	if err != nil {
+		return err
+	}
+	for _, r := range regs {
+		if r.keyHash != lost || r.Status == StatusRevoked {
+			continue
+		}
+		if err := s.retire(ctx, r.Upstream, lost, userID, actorID, "superseded"); err != nil {
+			return err
+		}
+		if err := s.setRegistration(ctx, userID, r.Upstream, lost, StatusRevoked, "", actorID); err != nil {
+			return err
+		}
+	}
+	if _, _, err := s.retryRemovals(ctx, actorID, userID); err != nil {
+		return err
+	}
+	return ErrNoKey
+}
+
 // Reveal returns the raw key and its fingerprint to the owner exactly once.
+// The claim is one conditional UPDATE: of two concurrent calls only one
+// finds the key unrevealed, and the other gets ErrAlreadyRevealed. A key
+// that fails to unseal rolls the claim back, so it stays unrevealed.
 func (s *Service) Reveal(ctx context.Context, userID string) (key, fingerprint string, err error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return "", "", err
 	}
 	defer func() { _ = tx.Rollback() }()
-	k, err := keyRowFor(ctx, tx, userID)
-	if err != nil {
-		return "", "", err
-	}
-	if k == nil {
-		return "", "", ErrNoKey
-	}
-	if k.RevealedAt > 0 {
+	now := s.now().UnixMilli()
+	var hash, sealed string
+	err = tx.QueryRowContext(ctx,
+		`UPDATE user_identity_keys SET revealed_at = ?, updated_at = ?
+         WHERE user_id = ? AND (revealed_at IS NULL OR revealed_at <= 0)
+         RETURNING key_hash, key_sealed`, now, now, userID).Scan(&hash, &sealed)
+	if errors.Is(err, sql.ErrNoRows) {
+		k, kerr := keyRowFor(ctx, tx, userID)
+		if kerr != nil {
+			return "", "", kerr
+		}
+		if k == nil {
+			return "", "", ErrNoKey
+		}
 		return "", "", ErrAlreadyRevealed
 	}
-	raw, err := s.cipher.Open(k.KeySealed, []byte(userID))
+	if err != nil {
+		return "", "", err
+	}
+	raw, err := s.cipher.Open(sealed, []byte(userID))
 	if err != nil {
 		return "", "", fmt.Errorf("unseal identity key: %w", err)
-	}
-	now := s.now().UnixMilli()
-	if _, err := tx.ExecContext(ctx,
-		`UPDATE user_identity_keys SET revealed_at = ?, updated_at = ? WHERE user_id = ?`, now, now, userID); err != nil {
-		return "", "", err
 	}
 	if err := tx.Commit(); err != nil {
 		return "", "", err
 	}
 	s.event(ctx, EventReveal, userID, userID, "", "", "", "")
-	return string(raw), k.KeyHash, nil
+	return string(raw), hash, nil
 }
 
 // Revoke retires the fingerprint at every registry that holds or may hold
@@ -691,7 +783,7 @@ func (s *Service) retire(ctx context.Context, upstream, hash, userID, byUser, no
 		`INSERT INTO identity_key_retired(upstream, key_hash, user_id, by_user, error, updated_at)
          VALUES(?,?,?,?,?,?)
          ON CONFLICT(upstream, key_hash) DO UPDATE SET
-           user_id = excluded.user_id, by_user = COALESCE(excluded.by_user, by_user),
+           user_id = excluded.user_id, by_user = COALESCE(excluded.by_user, identity_key_retired.by_user),
            error = excluded.error, updated_at = excluded.updated_at`,
 		upstream, hash, userID, nullStr(byUser), nullStr(note), s.now().UnixMilli())
 	return err

@@ -338,7 +338,7 @@ func (s *Service) CreateOrUpdate(ctx context.Context, r Rule) (*Rule, error) {
         fingerprint=excluded.fingerprint, tool_name=excluded.tool_name,
         enabled=excluded.enabled, rationale_json=excluded.rationale_json,
         cooloff_until=excluded.cooloff_until,
-        enabled_by=COALESCE(excluded.enabled_by, enabled_by)`,
+        enabled_by=COALESCE(excluded.enabled_by, auto_approval_rules.enabled_by)`,
 		r.ID, r.Kind, nullStr(r.AgentID), nullStr(r.Fingerprint), nullStr(r.ToolName),
 		enabled, r.Source, nullStr(r.RationaleJSON), r.CreatedAt, nullInt(r.CoolOffUntil),
 		nullStr(r.CreatedBy), nullStr(r.EnabledBy))

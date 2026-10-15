@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"net/http/httptest"
-	"path/filepath"
 	"strings"
 	"testing"
 
@@ -18,6 +17,7 @@ import (
 	"github.com/tusharbhardwaj/toolyard/internal/policy"
 	"github.com/tusharbhardwaj/toolyard/internal/realtime"
 	"github.com/tusharbhardwaj/toolyard/internal/store"
+	"github.com/tusharbhardwaj/toolyard/internal/store/storetest"
 )
 
 // newMCPTestServer serves one read-only tool over streamable HTTP so a
@@ -36,11 +36,7 @@ func newMCPTestServer(t *testing.T) *httptest.Server {
 func newServiceFixture(t *testing.T) (*Service, *store.DB, *gateway.Gateway) {
 	t.Helper()
 	ctx := context.Background()
-	db, err := store.Open(filepath.Join(t.TempDir(), "up.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = db.Close() })
+	db := storetest.Open(t)
 	bus, _ := approval.New(ctx, db)
 	gw := gateway.New(gateway.Options{Policy: policy.New(db), Approval: bus, Audit: audit.New(db), Memory: memory.New(db), Hub: realtime.NewHub()})
 	t.Cleanup(func() { _ = gw.Close() })
@@ -394,5 +390,68 @@ func TestMaskedValuesRejectedOnSave(t *testing.T) {
 	}
 	if cur, _ := svc.Get(ctx, "bk"); cur.Headers["X-Api-Key"] != "real" || len(cur.Env) != 0 {
 		t.Fatalf("rejected Update changed the row: %+v", cur)
+	}
+}
+
+// rowWriterAuth is a HeaderProvider whose HasClient runs stmt against the
+// server's row. Update calls HasClient between its read and its write when
+// the url moves to another origin, so this stands in for a concurrent edit
+// (for example from another process) landing in that window.
+type rowWriterAuth struct {
+	db   *store.DB
+	stmt string
+}
+
+func (a *rowWriterAuth) HeaderFunc(string) func(ctx context.Context) map[string]string {
+	return func(context.Context) map[string]string { return nil }
+}
+func (a *rowWriterAuth) HasClient(ctx context.Context, name string) (bool, error) {
+	_, err := a.db.ExecContext(ctx, a.stmt, name)
+	return false, err
+}
+func (a *rowWriterAuth) Disconnect(context.Context, string) error { return nil }
+
+// TestUpdateConflictWhenRowChanged: Update writes only if updated_at is
+// still the value it read. A change in between makes it save nothing and
+// return ErrConflict (or ErrNotFound when the row is gone); a retry after
+// the reload goes through.
+func TestUpdateConflictWhenRowChanged(t *testing.T) {
+	ctx := context.Background()
+	svc, db, _ := newServiceFixture(t)
+	ts1 := newMCPTestServer(t)
+	ts2 := newMCPTestServer(t) // another port: another origin
+	if _, err := svc.Add(ctx, Server{Name: "bk", Transport: "http", URL: ts1.URL}); err != nil {
+		t.Fatalf("Add: %v", err)
+	}
+	const otherURL = "https://other.example.test/mcp"
+	svc.SetAuth(&rowWriterAuth{db: db, stmt: `UPDATE upstream_servers SET url='` + otherURL + `', updated_at=updated_at+1 WHERE name=?`})
+	if _, err := svc.Update(ctx, "bk", Patch{URL: strp(ts2.URL)}); !errors.Is(err, ErrConflict) {
+		t.Fatalf("Update over a concurrent change: err = %v, want ErrConflict", err)
+	}
+	got, err := svc.Get(ctx, "bk")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.URL != otherURL {
+		t.Fatalf("url = %q: the concurrent change was overwritten", got.URL)
+	}
+
+	// Reloaded and retried with no concurrent writer: saved.
+	svc.SetAuth(nil)
+	got, err = svc.Update(ctx, "bk", Patch{URL: strp(ts2.URL)})
+	if err != nil {
+		t.Fatalf("retry: %v", err)
+	}
+	if got.URL != ts2.URL || got.LastStatus != "ok" {
+		t.Fatalf("after retry: url=%q status=%q err=%q", got.URL, got.LastStatus, got.LastError)
+	}
+
+	// The row deleted in the window: not found, nothing re-created.
+	svc.SetAuth(&rowWriterAuth{db: db, stmt: `DELETE FROM upstream_servers WHERE name=?`})
+	if _, err := svc.Update(ctx, "bk", Patch{URL: strp(ts1.URL)}); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("Update of a row deleted in the window: err = %v, want ErrNotFound", err)
+	}
+	if _, err := svc.Get(ctx, "bk"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("deleted row came back: %v", err)
 	}
 }

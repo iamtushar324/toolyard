@@ -48,7 +48,7 @@ type Service struct {
 
 func New(ctx context.Context, db *store.DB, id *identity.Service, cipher *sealbox.Cipher) (*Service, error) {
 	s := &Service{db: db, identity: id, cipher: cipher, now: time.Now}
-	_, err := db.ExecContext(ctx, `INSERT INTO federation_instance(id) SELECT ? WHERE NOT EXISTS (SELECT 1 FROM federation_instance)`, "tyi_"+uuid.NewString())
+	_, err := db.ExecContext(ctx, `INSERT INTO federation_instance(id) SELECT CAST(? AS TEXT) WHERE NOT EXISTS (SELECT 1 FROM federation_instance)`, "tyi_"+uuid.NewString())
 	if err != nil {
 		return nil, err
 	}
@@ -113,6 +113,15 @@ func (s *Service) Register(ctx context.Context, t Trust, adminID string) error {
 	return err
 }
 
+// boolInt turns a Go bool into the 0/1 integer the schema stores. Postgres
+// does not accept a Go bool for an integer parameter.
+func boolInt(b bool) int {
+	if b {
+		return 1
+	}
+	return 0
+}
+
 type Claims struct{ jwt.RegisteredClaims }
 type Principal struct {
 	Issuer, Subject, Origin string
@@ -143,7 +152,7 @@ func (s *Service) verify(ctx context.Context, assertion string, cleanup bool) (*
 			return nil, ErrUnauthorized
 		}
 		var publicKey, kid string
-		e := s.db.QueryRowContext(ctx, `SELECT public_key,kid,origin FROM federation_issuers WHERE issuer=? AND (status='active' OR ?=1)`, claims.Issuer, cleanup).Scan(&publicKey, &kid, &origin)
+		e := s.db.QueryRowContext(ctx, `SELECT public_key,kid,origin FROM federation_issuers WHERE issuer=? AND (status='active' OR ?=1)`, claims.Issuer, boolInt(cleanup)).Scan(&publicKey, &kid, &origin)
 		if e != nil {
 			return nil, ErrTrustRevoked
 		}
@@ -280,7 +289,7 @@ func (s *Service) Connect(ctx context.Context, p *Principal, expectedVersion int
 		if e != nil || n != 1 {
 			return nil, ErrConflict
 		}
-		_, err = tx.ExecContext(ctx, `UPDATE agents SET prev_token_hash=CASE WHEN ?='active' THEN token_hash ELSE NULL END,prev_token_expires=CASE WHEN ?='active' THEN ? ELSE NULL END,token_hash=?,last_seen=?,enroll_code=NULL,enroll_expires=NULL WHERE id=? AND disabled=0`, status, status, s.now().Add(identity.DefaultRotateGrace).UnixMilli(), hash, now, agent)
+		_, err = tx.ExecContext(ctx, `UPDATE agents SET prev_token_hash=CASE WHEN CAST(? AS TEXT)='active' THEN token_hash ELSE NULL END,prev_token_expires=CASE WHEN CAST(? AS TEXT)='active' THEN CAST(? AS BIGINT) ELSE NULL END,token_hash=?,last_seen=?,enroll_code=NULL,enroll_expires=NULL WHERE id=? AND disabled=0`, status, status, s.now().Add(identity.DefaultRotateGrace).UnixMilli(), hash, now, agent)
 	} else {
 		envHash := sha256.Sum256([]byte(p.Issuer))
 		_, err = tx.ExecContext(ctx, `INSERT INTO agents(id,name,owner_user,token_hash,last_seen,created_at) VALUES(?,?,?,?,?,?)`, agent, "T3 "+hex.EncodeToString(envHash[:8]), userID, hash, now, now)

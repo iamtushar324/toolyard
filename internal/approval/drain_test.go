@@ -3,7 +3,6 @@ package approval
 import (
 	"context"
 	"log/slog"
-	"path/filepath"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -12,6 +11,7 @@ import (
 	"github.com/tusharbhardwaj/toolyard/internal/goroutines"
 	"github.com/tusharbhardwaj/toolyard/internal/logx"
 	"github.com/tusharbhardwaj/toolyard/internal/store"
+	"github.com/tusharbhardwaj/toolyard/internal/store/storetest"
 )
 
 // newDrainBus opens a bus whose root context the test controls, over db
@@ -19,12 +19,7 @@ import (
 func newDrainBus(t *testing.T, ctx context.Context, db *store.DB) (*Bus, *store.DB) {
 	t.Helper()
 	if db == nil {
-		var err error
-		db, err = store.Open(filepath.Join(t.TempDir(), "drain.db"))
-		if err != nil {
-			t.Fatalf("open db: %v", err)
-		}
-		t.Cleanup(func() { db.Close() })
+		db = storetest.Open(t)
 	}
 	bus, err := New(ctx, db)
 	if err != nil {

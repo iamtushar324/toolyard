@@ -51,6 +51,9 @@ type Service struct {
 	mu     sync.Mutex
 	// Resolver is injectable for deterministic DNS rebinding tests.
 	Resolver func(context.Context, string) ([]net.IPAddr, error)
+	// ackHook, when set (tests), runs inside Ack between its read and its
+	// update.
+	ackHook func()
 }
 
 func New(db *store.DB, cipher *sealbox.Cipher) *Service {
@@ -117,7 +120,7 @@ func (s *Service) register(ctx context.Context, agentID, environmentID, clientID
 	if err != nil {
 		return nil, err
 	}
-	result, err := s.db.ExecContext(ctx, `INSERT INTO callback_receivers(id,agent_id,environment_id,client_receiver_id,destination,secret_enc,private_allowed,created_at,transport) SELECT ?,?,?,?,?,?,?,?,? WHERE NOT EXISTS (`+inactiveHostPredicate+`)`, id, agentID, environmentID, clientID, destination, enc, privateAllowed, s.now().UnixMilli(), transport, agentID, s.now().UnixMilli())
+	n, err := s.insertReceiver(ctx, id, agentID, environmentID, clientID, destination, enc, privateAllowed, transport)
 	if err != nil {
 		// A concurrent identical registration may own the unique client binding.
 		var won string
@@ -126,10 +129,52 @@ func (s *Service) register(ctx context.Context, agentID, environmentID, clientID
 		}
 		return nil, err
 	}
-	if n, _ := result.RowsAffected(); n != 1 {
+	if n != 1 {
 		return nil, ErrReceiver
 	}
 	return s.Get(ctx, agentID, id)
+}
+
+// insertReceiver stores a receiver unless the agent's host connection is
+// inactive, and returns the rows inserted (0 or 1). The host connection
+// rows are locked first (Postgres FOR UPDATE), so a revocation that
+// updates host_connections and then removes the agent's receivers either
+// waits for this insert and removes it too, or commits first and this
+// insert sees the revoked connection. SQLite's single connection already
+// serializes both. The transaction ends before insertReceiver returns.
+func (s *Service) insertReceiver(ctx context.Context, id, agentID, environmentID, clientID, destination, enc string, privateAllowed bool, transport string) (int64, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	defer tx.Rollback()
+	if s.db.Dialect.IsPostgres() {
+		if _, err = tx.ExecContext(ctx, `SELECT agent_id FROM host_connections WHERE agent_id=?`+s.db.Dialect.ForUpdate(), agentID); err != nil {
+			return 0, err
+		}
+	}
+	// Parameters in a SELECT list have no column type on Postgres: cast them
+	// to the column types (the casts change nothing on SQLite).
+	now := s.now().UnixMilli()
+	result, err := tx.ExecContext(ctx, `INSERT INTO callback_receivers(id,agent_id,environment_id,client_receiver_id,destination,secret_enc,private_allowed,created_at,transport) SELECT CAST(? AS TEXT),CAST(? AS TEXT),CAST(? AS TEXT),CAST(? AS TEXT),CAST(? AS TEXT),CAST(? AS TEXT),CAST(? AS BIGINT),CAST(? AS BIGINT),CAST(? AS TEXT) WHERE NOT EXISTS (`+inactiveHostPredicate+`)`, id, agentID, environmentID, clientID, destination, enc, boolInt(privateAllowed), now, transport, agentID, now)
+	if err != nil {
+		return 0, err
+	}
+	n, err := result.RowsAffected()
+	if err != nil {
+		return 0, err
+	}
+	if err = tx.Commit(); err != nil {
+		return 0, err
+	}
+	return n, nil
+}
+
+func boolInt(b bool) int {
+	if b {
+		return 1
+	}
+	return 0
 }
 
 func scanReceiver(row interface{ Scan(...any) error }) (*Receiver, error) {
@@ -440,14 +485,17 @@ func (s *Service) DeliverOne(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	result, err := s.db.ExecContext(ctx, `UPDATE callback_outbox SET status='delivering',claim_until=?,attempts=attempts+1 WHERE id=? AND ((status='pending' AND next_attempt_at<=?) OR (status='delivering' AND claim_until<=?))`, now+60000, id, now, now)
+	// The claim returns the attempt number it took, so finish is fenced on
+	// this claim even if another claim ran between the read and the claim.
+	var claimed int
+	err = s.db.QueryRowContext(ctx, `UPDATE callback_outbox SET status='delivering',claim_until=?,attempts=attempts+1 WHERE id=? AND ((status='pending' AND next_attempt_at<=?) OR (status='delivering' AND claim_until<=?)) RETURNING attempts`, now+60000, id, now, now).Scan(&claimed)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil
+	}
 	if err != nil {
 		return err
 	}
-	n, _ := result.RowsAffected()
-	if n != 1 {
-		return nil
-	}
+	attempts = claimed - 1 // every attempts+1 below is this claim's attempt
 	receiver, err := scanReceiver(s.db.QueryRowContext(ctx, `SELECT `+receiverColumns+` FROM callback_receivers WHERE id=?`, ref))
 	if err != nil || receiver.Status != "active" {
 		return s.finish(ctx, id, attempts+1, 0, "receiver_unavailable", true)
@@ -542,6 +590,12 @@ func (s *Service) DeliverOne(ctx context.Context) error {
 	return s.finish(ctx, id, attempts+1, code, fmt.Sprintf("http_%d", code), code == 410 || code >= 300 && code < 400)
 }
 
+// finish records attempt and moves the event out of delivering. The state
+// change is fenced on the claim (status delivering and attempts equal to
+// attempt): when the claim was lost (its lease expired and a newer claim
+// took the event, or the receiver was disabled meanwhile), the attempt is
+// still recorded in the history, but the event's state is left to its
+// current owner.
 func (s *Service) finish(ctx context.Context, id string, attempt, code int, outcome string, terminal bool) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -568,7 +622,8 @@ func (s *Service) finish(ctx context.Context, id string, attempt, code int, outc
 	} else {
 		next += retryDelays[attempt-base-1].Milliseconds()
 	}
-	_, err = tx.ExecContext(ctx, `UPDATE callback_outbox SET status=?,terminal_reason=?,next_attempt_at=?,claim_until=0,delivered_at=? WHERE id=? AND status='delivering'`, status, reason, next, delivered, id)
+	// A lost claim updates no row: nothing more to do (see above).
+	_, err = tx.ExecContext(ctx, `UPDATE callback_outbox SET status=?,terminal_reason=?,next_attempt_at=?,claim_until=0,delivered_at=? WHERE id=? AND status='delivering' AND attempts=?`, status, reason, next, delivered, id, attempt)
 	if err != nil {
 		return err
 	}
@@ -605,7 +660,8 @@ type hostQuery interface {
 
 func hostConnectionActive(ctx context.Context, q hostQuery, agent string, now int64) error {
 	var count int
-	if e := q.QueryRowContext(ctx, `SELECT count(*) FROM (`+inactiveHostPredicate+`)`, agent, now).Scan(&count); e != nil {
+	// The derived table has an alias: Postgres before 16 requires one.
+	if e := q.QueryRowContext(ctx, `SELECT count(*) FROM (`+inactiveHostPredicate+`) AS inactive`, agent, now).Scan(&count); e != nil {
 		return e
 	}
 	if count > 0 {

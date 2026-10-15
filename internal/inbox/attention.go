@@ -231,7 +231,7 @@ func (s *Service) capUrgency(ctx context.Context, r *Request) *Problem {
 	since := s.now().Add(-time.Hour).UnixMilli()
 	var n int
 	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM inbox_requests WHERE agent_id = ? AND created_at >= ?
-		AND (urgency = 'now' OR json_extract(doc, '$.requested_urgency') = 'now')`, r.AgentID, since).Scan(&n); err != nil {
+		AND (urgency = 'now' OR `+s.db.Dialect.JSONText("doc", "requested_urgency")+` = 'now')`, r.AgentID, since).Scan(&n); err != nil {
 		return nil
 	}
 	if n < c.NowPerHour {
@@ -704,7 +704,7 @@ func (s *Service) runDigest(ctx context.Context) {
 		items = append(items, r)
 		agents[r.AgentID] = true
 	}
-	res, err := s.db.ExecContext(ctx, `INSERT OR IGNORE INTO inbox_digests(slot, sent_at, items) VALUES (?,?,?)`, key, now.UnixMilli(), len(items))
+	res, err := s.db.ExecContext(ctx, `INSERT INTO inbox_digests(slot, sent_at, items) VALUES (?,?,?) ON CONFLICT DO NOTHING`, key, now.UnixMilli(), len(items))
 	if err != nil {
 		return
 	}

@@ -71,7 +71,9 @@ func stringArg(args map[string]any, key string) string {
 }
 
 // asInt reads an integer argument from any of the numeric types a decoded
-// call can carry.
+// call can carry, including the json.Number that PreserveToolCallNumbers
+// (UseNumber) leaves in the arguments. A json.Number that is not an
+// integer ("2.5") is truncated like a float64.
 func asInt(v any) (int, bool) {
 	switch x := v.(type) {
 	case int:
@@ -82,6 +84,13 @@ func asInt(v any) (int, bool) {
 		return int(x), true
 	case float64:
 		return int(x), true
+	case json.Number:
+		if n, err := x.Int64(); err == nil {
+			return int(n), true
+		}
+		if f, err := x.Float64(); err == nil {
+			return int(f), true
+		}
 	}
 	return 0, false
 }

@@ -5,7 +5,6 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"net"
-	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -13,15 +12,12 @@ import (
 	"github.com/tusharbhardwaj/toolyard/internal/inbox"
 	"github.com/tusharbhardwaj/toolyard/internal/sealbox"
 	"github.com/tusharbhardwaj/toolyard/internal/store"
+	"github.com/tusharbhardwaj/toolyard/internal/store/storetest"
 )
 
 func fixture(t *testing.T) (*Service, *store.DB) {
 	t.Helper()
-	db, e := store.Open(filepath.Join(t.TempDir(), "db.sqlite"))
-	if e != nil {
-		t.Fatal(e)
-	}
-	t.Cleanup(func() { db.Close() })
+	db := storetest.Open(t) // SQLite, or Postgres when TOOLYARD_TEST_DB=postgres
 	cipher, e := sealbox.NewCipher(make([]byte, 32))
 	if e != nil {
 		t.Fatal(e)

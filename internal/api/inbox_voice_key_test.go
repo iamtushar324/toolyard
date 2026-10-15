@@ -5,22 +5,19 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
-	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/tusharbhardwaj/toolyard/internal/identity"
 	"github.com/tusharbhardwaj/toolyard/internal/settings"
-	"github.com/tusharbhardwaj/toolyard/internal/store"
+	"github.com/tusharbhardwaj/toolyard/internal/store/storetest"
 )
 
 func TestInboxVoiceKeyOwnerOnlyAndMasked(t *testing.T) {
 	f := newInboxAPIFixture(t)
-	db, err := store.Open(filepath.Join(t.TempDir(), "settings.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	db := storetest.Open(t)
 	defer db.Close()
+	var err error
 	f.srv.settings, err = settings.New(context.Background(), db)
 	if err != nil {
 		t.Fatal(err)

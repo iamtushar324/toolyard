@@ -2,20 +2,16 @@ package policy
 
 import (
 	"context"
-	"path/filepath"
 	"strings"
 	"testing"
 
-	"github.com/tusharbhardwaj/toolyard/internal/store"
+	"github.com/tusharbhardwaj/toolyard/internal/store/storetest"
 )
 
 // newTestEngine is a DB-backed engine, so explicit rules can be set.
 func newTestEngine(t *testing.T) *Engine {
 	t.Helper()
-	db, err := store.Open(filepath.Join(t.TempDir(), "policy.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
+	db := storetest.Open(t)
 	t.Cleanup(func() { _ = db.Close() })
 	return New(db)
 }

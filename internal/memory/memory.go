@@ -8,6 +8,7 @@ package memory
 import (
 	"context"
 	"errors"
+	"strings"
 	"time"
 
 	"github.com/tusharbhardwaj/toolyard/internal/store"
@@ -132,9 +133,16 @@ func (s *Service) List(ctx context.Context, scope, prefix string) ([]Entry, erro
 	if scope == "" {
 		scope = defaultScope
 	}
+	// The prefix match is case-insensitive, as SQLite's LIKE always was:
+	// Postgres needs ILIKE for that. Postgres LIKE also treats a backslash
+	// as an escape character, which SQLite does not, so double it there to
+	// keep a backslash in the prefix literal on both engines.
+	if s.db.Dialect.IsPostgres() {
+		prefix = strings.ReplaceAll(prefix, `\`, `\\`)
+	}
 	rows, err := s.db.QueryContext(ctx,
 		`SELECT scope, key, value, updated_at FROM memory_entries
-         WHERE scope = ? AND key LIKE ? ORDER BY key ASC LIMIT 500`,
+         WHERE scope = ? AND key `+s.db.Dialect.ILike()+` ? ORDER BY key ASC LIMIT 500`,
 		scope, prefix+"%")
 	if err != nil {
 		return nil, err

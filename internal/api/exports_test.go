@@ -5,7 +5,6 @@ import (
 	"encoding/csv"
 	"net/http"
 	"net/http/httptest"
-	"path/filepath"
 	"reflect"
 	"strings"
 	"testing"
@@ -14,17 +13,14 @@ import (
 	"github.com/tusharbhardwaj/toolyard/internal/approval"
 	"github.com/tusharbhardwaj/toolyard/internal/audit"
 	"github.com/tusharbhardwaj/toolyard/internal/identity"
-	"github.com/tusharbhardwaj/toolyard/internal/store"
+	"github.com/tusharbhardwaj/toolyard/internal/store/storetest"
 )
 
 // newExportTestServer builds the smallest Server that can serve the
 // export handlers, plus a user to stand in the request context.
 func newExportTestServer(t *testing.T) (*Server, *identity.User, *audit.Logger, *approval.Bus) {
 	t.Helper()
-	db, err := store.Open(filepath.Join(t.TempDir(), "api-exports.db"))
-	if err != nil {
-		t.Fatalf("open db: %v", err)
-	}
+	db := storetest.Open(t)
 	t.Cleanup(func() { _ = db.Close() })
 	ctx := context.Background()
 	id := identity.New(db)

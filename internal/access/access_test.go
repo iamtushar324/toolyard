@@ -2,21 +2,18 @@ package access
 
 import (
 	"context"
-	"path/filepath"
+	"fmt"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/tusharbhardwaj/toolyard/internal/store"
+	"github.com/tusharbhardwaj/toolyard/internal/store/storetest"
 )
 
 func openTestDB(t *testing.T) *store.DB {
 	t.Helper()
-	db, err := store.Open(filepath.Join(t.TempDir(), "access.db"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = db.Close() })
-	return db
+	return storetest.Open(t)
 }
 
 func addUser(t *testing.T, db *store.DB, id, role, status string) {
@@ -191,5 +188,53 @@ func TestNewUserDefaults(t *testing.T) {
 	}
 	if role != "member" || status != "active" {
 		t.Fatalf("new row defaults = %s/%s, want member/active", role, status)
+	}
+}
+
+// Concurrent replacements of one user's grants: the result is exactly one
+// of the requested sets, never a mix, and no call fails.
+func TestSetGroupsConcurrentLastWins(t *testing.T) {
+	ctx := context.Background()
+	db := openTestDB(t)
+	addUser(t, db, "u_member", "member", "active")
+	svc := New(db)
+	sets := [][]string{
+		{"alpha", "beta"},
+		{"beta", "gamma"},
+		{"delta"},
+		{"alpha", "delta", "gamma"}, // sorted, as Groups returns them
+	}
+	for round := 0; round < 5; round++ {
+		errs := make([]error, len(sets))
+		barrier := make(chan struct{})
+		var wg sync.WaitGroup
+		for i := range sets {
+			wg.Add(1)
+			go func(i int) {
+				defer wg.Done()
+				<-barrier
+				errs[i] = svc.SetGroups(ctx, "u_member", sets[i], "u_admin")
+			}(i)
+		}
+		close(barrier)
+		wg.Wait()
+		for i, err := range errs {
+			if err != nil {
+				t.Fatalf("round %d: SetGroups(%v): %v", round, sets[i], err)
+			}
+		}
+		got, err := svc.Groups(ctx, "u_member")
+		if err != nil {
+			t.Fatal(err)
+		}
+		match := false
+		for _, want := range sets {
+			if fmt.Sprint(got) == fmt.Sprint(want) {
+				match = true
+			}
+		}
+		if !match {
+			t.Fatalf("round %d: groups = %v, want exactly one of %v", round, got, sets)
+		}
 	}
 }

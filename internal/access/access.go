@@ -277,7 +277,10 @@ func (s *Service) Groups(ctx context.Context, userID string) ([]string, error) {
 
 // SetGroups replaces userID's grants with groups. Always-on and retired
 // groups are dropped (they need no grant, or grant nothing); duplicates
-// collapse. by is recorded as created_by on new rows.
+// collapse. by is recorded as created_by on new rows. The user's row is
+// locked first (on Postgres), so two concurrent replacements for one user
+// run one after the other: the last one wins whole, never a union of both
+// or a primary-key error.
 func (s *Service) SetGroups(ctx context.Context, userID string, groups []string, by string) error {
 	want := map[string]bool{}
 	for _, g := range groups {
@@ -300,6 +303,14 @@ func (s *Service) SetGroups(ctx context.Context, userID string, groups []string,
 		return err
 	}
 	defer func() { _ = tx.Rollback() }()
+	// A missing user is left to the inserts below, as before: the foreign
+	// key refuses grants for them.
+	var locked string
+	if err := tx.QueryRowContext(ctx,
+		`SELECT id FROM users WHERE id = ?`+s.db.Dialect.ForUpdate(), userID).Scan(&locked); err != nil &&
+		!errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
 	if _, err := tx.ExecContext(ctx, `DELETE FROM user_server_access WHERE user_id = ?`, userID); err != nil {
 		return err
 	}

@@ -95,11 +95,16 @@ func (s *Service) IssueConnectTicket(ctx context.Context, userID, upstream, purp
 		return "", err
 	}
 	now := time.Now()
-	// The cap and the insert are one statement, so two refusals racing
-	// cannot both slip under it.
+	// The cap and the insert are one statement. On SQLite (one writer) two
+	// refusals racing cannot both slip under it. On Postgres two concurrent
+	// statements can both count below the cap and both insert, so the cap
+	// may be overshot by a few; that is accepted: it bounds link spam and
+	// is not a security limit. The SELECT list is cast so Postgres knows
+	// the parameter types.
 	res, err := s.db.ExecContext(ctx, `
         INSERT INTO connect_tickets(id_hash, user_id, upstream, purpose, agent_id, created_at, expires_at)
-        SELECT ?,?,?,?,?,?,?
+        SELECT CAST(? AS TEXT), CAST(? AS TEXT), CAST(? AS TEXT), CAST(? AS TEXT), CAST(? AS TEXT),
+               CAST(? AS BIGINT), CAST(? AS BIGINT)
         WHERE (SELECT count(*) FROM connect_tickets
                WHERE user_id = ? AND upstream = ? AND used_at IS NULL AND expires_at > ?) < ?`,
 		hashConnectTicket(ticket), userID, upstream, purpose, nullStr(agentID),
@@ -369,7 +374,7 @@ func (s *Service) SharedConnection(ctx context.Context, upstream string) (*Share
 	var authEndpoint string
 	var hasToken, pat int
 	err := s.db.QueryRowContext(ctx, `
-        SELECT c.authorization_endpoint, t.upstream_name IS NOT NULL,
+        SELECT c.authorization_endpoint, CASE WHEN t.upstream_name IS NOT NULL THEN 1 ELSE 0 END,
                COALESCE(t.state,''), COALESCE(t.account_label,''), COALESCE(t.is_pat,0)
         FROM oauth_clients c LEFT JOIN oauth_tokens t ON t.upstream_name = c.upstream_name
         WHERE c.upstream_name = ?`, upstream).Scan(&authEndpoint, &hasToken, &c.State, &c.AccountLabel, &pat)
