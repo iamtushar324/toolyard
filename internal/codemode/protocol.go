@@ -81,6 +81,9 @@ type childMsg struct {
 	// error
 	Kind    string `json:"kind,omitempty"`
 	Message string `json:"message,omitempty"`
+	// Cause is the structured run's error kind when the script side knows
+	// it (ErrorTimeout, ErrorLimit); the parent accepts no other value.
+	Cause string `json:"cause,omitempty"`
 }
 
 // parentMsg answers one call: the tool's text, or the error that aborts the

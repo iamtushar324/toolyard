@@ -20,3 +20,15 @@ var InboxSkill string
 //
 //go:embed guidelines/operator.md
 var OperatorGuide string
+
+// CodeOpenAPI is docs/openapi/code.json: code mode over REST as OpenAPI
+// 3.1, served at GET /v1/code/openapi.json.
+//
+//go:embed openapi/code.json
+var CodeOpenAPI string
+
+// TyScript is docs/ty/ty, the `ty` command for code mode over REST
+// (Python 3, standard library only), served at GET /v1/code/ty.
+//
+//go:embed ty/ty
+var TyScript string

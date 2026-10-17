@@ -657,3 +657,116 @@ Revocation closes unused grants and callback registrations. Account/agent
 restore cannot recreate that access; fresh browser consent is necessary.
 Account ownership and connection lifecycle audit records are transactional.
 Audit records distinguish owner consent from server claims and renewal.
+
+## 13. Backup route when MCP fails
+
+Use this only when your MCP connection to toolyard is broken: the server
+won't connect, calls time out, or your client lost the toolyard tools. Go
+back to MCP as soon as it works again.
+
+It's the same code mode as `executeToolCode`, over plain HTTPS. You run as
+the same agent, your owner's policy is the same, and a call that needs
+permission still needs an Inbox approval. It's never a way around a
+restricted tool or a denial (section 11).
+
+**What you need.**
+
+- `TOOLYARD_URL`: the toolyard base URL. The default is
+  `https://toolyard.beknown.live`.
+- `TOOLYARD_TOKEN_FILE`: a file that holds your toolyard token, readable
+  only by you (`chmod 600`). In T3 the server writes a session token
+  (`tys_…`) there for your session. Operator tokens (`tyop_…`) never work
+  here.
+
+Never print, `echo` or `cat` the token into your output. Never put it in a
+command line, a script, a log, a commit or an Inbox item.
+
+**Get `ty`.** It's one Python 3 file (standard library only). Fetching it
+needs no token:
+
+```sh
+curl -fsS "$TOOLYARD_URL/v1/code/ty" -o ty && chmod +x ty
+./ty files                      # the stubs you may use, like listToolFiles
+./ty stub github/create_issue   # one stub, like readToolFile
+```
+
+**Run a script.** Write the same Starlark you'd pass to `executeToolCode`:
+
+```sh
+./ty run review.star --reason "List the open pull requests to pick the next one to review"
+./ty call github.list_pull_requests '{"owner": "acme", "repo": "api", "state": "open"}'
+```
+
+`--reason` (20–2000 characters) goes to the audit record, like `_reason`;
+without it, `ty` writes one from the file name and the first line. `ty`
+prints the run view as JSON on stdout and exits with the run's status:
+
+| Exit | HTTP | Run status | What it means |
+|---|---|---|---|
+| 0 | 200 | `succeeded` | Read `result`, `logs` and `calls`. |
+| 1 | 200 | `failed` | Read `error.kind` and `error.message`, and fix the script. |
+| 3 | 403 | `permission_required` | A call needs your owner's approval. See below. |
+| 4 | 202 | `queued`, `running`, `deferred` | Still running, or waiting on a legacy approval: `./ty status cr_… --wait 120`. |
+| 5 | 429 | none | Code mode is busy and no run was created. Wait `Retry-After` seconds, then run it again. |
+| 6 | 409 | `outcome_unknown` | A call may have committed. Check the upstream state; never repeat it blindly. |
+| 2 | other | none | A usage or transport error; stderr says which. 401 is a missing, expired or revoked token; 404 an unknown run. |
+
+**Idempotency and retries.** Every `ty run` sends an `Idempotency-Key`.
+When you don't pass `--key`, it makes one and prints it on stderr. After a
+timeout or a lost answer, run the same command again with `--key <that
+key>`: the same key with the same script and reason returns the existing
+run and runs nothing new. The same key with a different script or reason is
+`422 idempotency_key_reused`. The run keeps going on the server after the
+answer, so you never need to hold the connection: `./ty status cr_…` reads
+it later. Runs are kept 7 days.
+
+**When a call needs permission (exit 3, HTTP 403).** Nothing after the held
+call ran. `held` names it (`seq`, `tool`), and `held.draft` is the Inbox
+request draft. Ask exactly as sections 1–9 say, from code; toolyard's own
+tools are `toolyard.<group>_<name>`:
+
+```sh
+./ty call toolyard.inbox_request - < request.json   # "dry_run": true first, then for real
+./ty call toolyard.inbox_status '{"ids": ["rq_…"]}'
+```
+
+When your owner has decided, resume the run with the request id:
+
+```sh
+./ty resume cr_… --request rq_… --wait 120
+```
+
+The server adds that request's grants to the matching calls, and the script
+runs again from the top. Calls before the held one are answered from the
+record (`replayed: true`) and not sent again, so don't change the script
+between the hold and the resume: a different call fails the run with
+`script_diverged`. A recorded call with an unknown outcome stops the resume
+with `outcome_unknown`. A `deferred` run (a legacy approval, with
+`held.approval_id` set) resumes with `./ty resume cr_…` and no `--request`
+once your owner has decided.
+
+**Without `ty`.** Use `curl` with the header read from a file, so the token
+never appears in a command line or the process list:
+
+```sh
+auth() { printf 'Authorization: Bearer '; tr -d ' \r\n\t' < "$TOOLYARD_TOKEN_FILE"; echo; }
+
+curl -sS "$TOOLYARD_URL/v1/code/run" -H @<(auth) \
+  -H 'Content-Type: text/x-starlark' \
+  -H 'X-Toolyard-Reason: List the open pull requests to pick the next one to review' \
+  -H 'Idempotency-Key: review-pick-1' \
+  --data-binary @review.star
+curl -sS "$TOOLYARD_URL/v1/code/runs/cr_…" -H @<(auth) -H 'Prefer: wait=60'
+curl -sS "$TOOLYARD_URL/v1/code/runs/cr_…/resume" -H @<(auth) \
+  -H 'Content-Type: application/json' -d '{"request_id": "rq_…"}'
+```
+
+`Prefer: wait=<seconds>` (0–60, default 25) holds the answer until the run
+finishes or is held. Never write `-H "Authorization: Bearer $TOKEN"` or
+`-u`: that puts the token in argv. The full API is at
+`GET /v1/code/openapi.json`.
+
+**Limits.** The code-mode limits apply: 5 minutes per run, 100 tool calls,
+a 1 MiB script, 1 MiB of output, and 4 scripts at a time per server (more
+is 429). A run that was running when the server restarted is
+`outcome_unknown`.

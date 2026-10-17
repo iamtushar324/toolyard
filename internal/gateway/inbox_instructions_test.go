@@ -8,7 +8,7 @@ import (
 
 func TestInboxAgentInstructionsDescribeDecisionAndRecovery(t *testing.T) {
 	text := buildInstructions(nil, time.Second)
-	for _, want := range []string{"call_id", "task.objective", "material_risks", "callback_ref", "inbox.wait remains optional", "same still-valid unused token", "outcome_unknown", "Rejected calls receive no grant", "required is a planning hint"} {
+	for _, want := range []string{"call_id", "task.objective", "material_risks", "callback_ref", "inbox.wait remains optional", "same still-valid unused token", "outcome_unknown", "Rejected calls receive no grant", "required is a planning hint", "FALLBACK", "POST /v1/code/run", "TOOLYARD_TOKEN_FILE", "GET /v1/code/ty", "topic fallback"} {
 		if !strings.Contains(text, want) {
 			t.Errorf("missing %q", want)
 		}
