@@ -39,24 +39,33 @@ const (
 	waitDelay = 3 * time.Second
 )
 
-// runInWorker executes start in a child process. The session performs the
-// nested calls; the returned result carries the script's outcome or the
-// reason the worker did not deliver one.
+// runInWorker takes a concurrency slot, or reports code mode busy, and
+// executes start in a child process (runWorker).
 func (r *Runtime) runInWorker(ctx context.Context, s *session, start startMsg, stopNote string) scriptResult {
-	runtimeErr := func(msg string) scriptResult { return scriptResult{errKind: "runtime", errMsg: msg} }
-	stopped := func() scriptResult {
-		return runtimeErr(fmt.Sprintf("script stopped: %v (%s)", ctx.Err(), stopNote))
+	slot, err := r.AcquireSlot(ctx)
+	switch {
+	case errors.Is(err, ErrBusy):
+		return scriptResult{errKind: "runtime", cause: ErrorBusy,
+			errMsg: fmt.Sprintf("code mode is busy: %d scripts are already running; try again in a moment", r.worker.MaxConcurrent)}
+	case err != nil:
+		return scriptResult{errKind: "runtime", cause: ErrorTimeout,
+			errMsg: fmt.Sprintf("script stopped: %v (%s)", ctx.Err(), stopNote)}
 	}
+	defer slot.Release()
+	return r.runWorker(ctx, s, start, stopNote)
+}
 
-	// A slot, or busy.
-	select {
-	case r.sem <- struct{}{}:
-	case <-time.After(r.worker.AcquireWait):
-		return runtimeErr(fmt.Sprintf("code mode is busy: %d scripts are already running; try again in a moment", r.worker.MaxConcurrent))
-	case <-ctx.Done():
-		return stopped()
+// runWorker executes start in a child process; the caller holds a slot.
+// The session performs the nested calls; the returned result carries the
+// script's outcome or the reason the worker did not deliver one.
+func (r *Runtime) runWorker(ctx context.Context, s *session, start startMsg, stopNote string) scriptResult {
+	runtimeErr := func(msg string) scriptResult {
+		return scriptResult{errKind: "runtime", errMsg: msg, cause: ErrorInternal}
 	}
-	defer func() { <-r.sem }()
+	stopped := func() scriptResult {
+		return scriptResult{errKind: "runtime", cause: ErrorTimeout,
+			errMsg: fmt.Sprintf("script stopped: %v (%s)", ctx.Err(), stopNote)}
+	}
 
 	path, err := r.executablePath()
 	if err != nil {
@@ -209,7 +218,12 @@ func (r *Runtime) runInWorker(ctx context.Context, s *session, start startMsg, s
 				return scriptResult{result: m.Result, hasResult: m.HasResult}
 			case msgError:
 				finish(true)
-				return scriptResult{errKind: m.Kind, errMsg: m.Message}
+				// The worker is not trusted with more than these two causes.
+				cause := ""
+				if m.Cause == ErrorTimeout || m.Cause == ErrorLimit {
+					cause = m.Cause
+				}
+				return scriptResult{errKind: m.Kind, errMsg: m.Message, cause: cause}
 			}
 		case <-readerDone:
 			// The child ended, or broke the protocol, without an outcome.
@@ -288,9 +302,12 @@ func logSandboxOnce(s sandboxSupport) {
 
 // workerDied explains a child that delivered no outcome.
 func (r *Runtime) workerDied(ctx context.Context, stopNote string, waitErr, readErr error, stderr string) scriptResult {
-	fail := func(msg string) scriptResult { return scriptResult{errKind: "runtime", errMsg: msg} }
+	fail := func(msg string) scriptResult {
+		return scriptResult{errKind: "runtime", errMsg: msg, cause: ErrorInternal}
+	}
 	if ctx.Err() != nil {
-		return fail(fmt.Sprintf("script stopped: %v (%s)", ctx.Err(), stopNote))
+		return scriptResult{errKind: "runtime", cause: ErrorTimeout,
+			errMsg: fmt.Sprintf("script stopped: %v (%s)", ctx.Err(), stopNote)}
 	}
 	waitText := ""
 	if waitErr != nil {
@@ -305,9 +322,11 @@ func (r *Runtime) workerDied(ctx context.Context, stopNote string, waitErr, read
 		return fail("code mode worker could not apply its memory cap (" + detail + "); " +
 			"if toolyard runs under systemd with SystemCallFilter, allow setrlimit and prlimit64")
 	case strings.Contains(stderr, "out of memory") || strings.Contains(stderr, "cannot allocate memory"):
-		return fail(fmt.Sprintf(
+		res := fail(fmt.Sprintf(
 			"script exceeded the memory limit (%d MiB) and was stopped; work on less data at a time, or let the tool filter before returning",
 			r.worker.MemoryMiB))
+		res.cause = ErrorLimit
+		return res
 	case errors.Is(readErr, errLineTooLong):
 		return fail("script worker crashed (it sent a message over the " + errLineTooLong.Error()[len("message exceeds the "):] + ")")
 	}

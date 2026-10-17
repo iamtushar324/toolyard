@@ -7,6 +7,7 @@ import (
 	"github.com/mark3labs/mcp-go/mcp"
 
 	"github.com/tusharbhardwaj/toolyard/internal/access"
+	"github.com/tusharbhardwaj/toolyard/internal/actor"
 	"github.com/tusharbhardwaj/toolyard/internal/codemode"
 )
 
@@ -71,6 +72,37 @@ func (g *Gateway) codeModeRuntime() *codemode.Runtime {
 		g.codeMode.SetWorker(defaultCodeModeWorker())
 	}
 	return g.codeMode
+}
+
+// CodeMode returns the code-mode runtime the MCP tools use. The REST code
+// routes run scripts with its Run (taking a slot first with AcquireSlot
+// to answer busy) and render stubs with its ListToolFiles, ReadToolFile
+// and GetToolDocs, on a context from CodeModeContext. Call it for each
+// run rather than keeping the result: SetCodeModeLimits replaces the
+// runtime.
+func (g *Gateway) CodeMode() *codemode.Runtime { return g.codeModeRuntime() }
+
+// CodeModeContext is the context a code-mode run made outside MCP (the
+// REST code route) runs on. agentID is the caller every nested call is
+// scoped, checked and audited as. sessionID, when not "", is the verified
+// client session id their audit rows carry (a session token's own id,
+// not a caller's claim). The run is admitted past a drain the way an MCP
+// executeToolCode call is, so a drain that begins half-way does not
+// refuse the script's later calls after earlier writes ran. ok is false
+// while the gateway drains: start no new run then. Build it from a
+// context that outlives the HTTP request when the run continues after
+// the response.
+func (g *Gateway) CodeModeContext(ctx context.Context, agentID, sessionID string) (context.Context, bool) {
+	if g.Draining() {
+		return ctx, false
+	}
+	ctx = WithAgentID(ctx, agentID)
+	if sessionID != "" {
+		r, _ := actor.RaiserFrom(ctx)
+		r.ClientSessionID, r.ClientSessionClaimed = sessionID, false
+		ctx = actor.WithRaiser(ctx, r)
+	}
+	return withDrainAdmitted(ctx), true
 }
 
 // codeModeTools returns the four code-mode entries.

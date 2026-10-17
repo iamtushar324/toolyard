@@ -320,6 +320,9 @@ func TestGuideTopics(t *testing.T) {
 	if s, _ := g.Topic("dry_run"); !strings.HasPrefix(s, "## 8.") {
 		t.Errorf("alias dry_run should resolve to section 8, got %q", s[:20])
 	}
+	if s, _ := g.Topic("rest"); !strings.HasPrefix(s, "## 13.") || !strings.Contains(s, "/v1/code/run") {
+		t.Errorf("alias rest should resolve to section 13, the REST fallback")
+	}
 }
 
 // ---- flags ----

@@ -144,3 +144,98 @@ func (s *Server) verifyAgentToken(ctx context.Context, token string) (*identity.
 	}
 	return s.identity.VerifyAgentToken(ctx, token)
 }
+
+// verifySessionToken resolves a session token ("tys_…") to its row and
+// agent. With federation on it also checks the agent's connection, as
+// verifyAgentToken does for agent tokens.
+func (s *Server) verifySessionToken(ctx context.Context, token string) (*identity.SessionToken, *identity.Agent, error) {
+	if s.federation != nil {
+		return s.federation.VerifySessionToken(ctx, token)
+	}
+	return s.identity.VerifySessionToken(ctx, token)
+}
+
+// Errors codeCaller returns; writeCallerError maps each to its answer.
+var (
+	errBearerRequired      = errors.New("bearer token required")
+	errOperatorToken       = errors.New("not available to operator tokens")
+	errInvalidAgentToken   = errors.New("invalid agent token")
+	errInvalidSessionToken = errors.New("invalid session token")
+	// errCallerCheckFailed: the token could not be checked (a database
+	// failure), which says nothing about the token itself.
+	errCallerCheckFailed = errors.New("authentication unavailable, try again")
+)
+
+// bearerToken returns the token in r's "Authorization: Bearer" header.
+func bearerToken(r *http.Request) (string, bool) {
+	authz := r.Header.Get("Authorization")
+	if !strings.HasPrefix(authz, "Bearer ") {
+		return "", false
+	}
+	tok := strings.TrimSpace(strings.TrimPrefix(authz, "Bearer "))
+	return tok, tok != ""
+}
+
+// callerError maps a token verification error to invalid when the token
+// was refused, or to errCallerCheckFailed when the check itself failed.
+func callerError(err, invalid error) error {
+	if errors.Is(err, identity.ErrAgentTokenInvalid) || errors.Is(err, identity.ErrSessionTokenInvalid) {
+		return invalid
+	}
+	return errCallerCheckFailed
+}
+
+// codeCaller resolves the bearer of a code-mode request (/v1/code/*) to its
+// agent, owner details included. It accepts an agent token, or a session
+// token ("tys_…") minted with one: then sessionID is the session token's
+// client session id and viaSession is true. An operator token
+// ("tyop_…") is errOperatorToken: the operator guard normally answers 403
+// before a handler runs. writeCallerError writes the answer for any error.
+func (s *Server) codeCaller(r *http.Request) (ag *identity.Agent, sessionID string, viaSession bool, err error) {
+	tok, ok := bearerToken(r)
+	if !ok {
+		return nil, "", false, errBearerRequired
+	}
+	switch {
+	case strings.HasPrefix(tok, identity.OperatorTokenPrefix):
+		return nil, "", false, errOperatorToken
+	case identity.IsSessionToken(tok):
+		t, a, e := s.verifySessionToken(r.Context(), tok)
+		if e != nil {
+			return nil, "", false, callerError(e, errInvalidSessionToken)
+		}
+		return a, t.SessionID, true, nil
+	}
+	a, e := s.verifyAgentToken(r.Context(), tok)
+	if e != nil {
+		return nil, "", false, callerError(e, errInvalidAgentToken)
+	}
+	return a, "", false, nil
+}
+
+// writeCallerError writes the answer for a codeCaller error: 401 without a
+// token or with a refused one, 403 for an operator token, 503 when the
+// token could not be checked.
+func writeCallerError(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, errOperatorToken):
+		writeError(w, http.StatusForbidden, errOperatorToken.Error())
+	case errors.Is(err, errBearerRequired), errors.Is(err, errInvalidAgentToken), errors.Is(err, errInvalidSessionToken):
+		writeError(w, http.StatusUnauthorized, err.Error())
+	default:
+		w.Header().Set("Retry-After", "5")
+		writeError(w, http.StatusServiceUnavailable, errCallerCheckFailed.Error())
+	}
+}
+
+// codeRaiser is agentRaiser for a caller codeCaller resolved. With a
+// session token, its session id is recorded as a verified client session
+// (ClientSessionClaimed false): toolyard minted that token for that session
+// to the agent's own token, so it is not the caller's unchecked word.
+func (s *Server) codeRaiser(r *http.Request, ag *identity.Agent, sessionID string, viaSession bool, fallbackKind, via string) actor.Raiser {
+	rs := s.agentRaiser(r, ag, fallbackKind, via)
+	if viaSession && sessionID != "" {
+		rs.ClientSessionID, rs.ClientSessionClaimed = sessionID, false
+	}
+	return rs
+}
