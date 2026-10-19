@@ -24,26 +24,26 @@ func (s *Server) cliRoutes(mux *http.ServeMux) {
 
 // GET /v1/agents/whoami — handy for `toolyard auth status`. Returns the
 // authenticated agent's identity so the CLI can confirm the token is
-// live before doing anything else.
+// live before doing anything else. An agent token or a session token
+// (then session_id is its client session).
 func (s *Server) cliWhoami(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		writeError(w, http.StatusMethodNotAllowed, "GET only")
 		return
 	}
-	authz := r.Header.Get("Authorization")
-	if !strings.HasPrefix(authz, "Bearer ") {
-		writeError(w, http.StatusUnauthorized, "bearer token required")
-		return
-	}
-	ag, err := s.verifyAgentToken(r.Context(), strings.TrimPrefix(authz, "Bearer "))
+	ag, sessionID, viaSession, err := s.codeCaller(r)
 	if err != nil {
-		writeError(w, http.StatusUnauthorized, "invalid agent token")
+		writeCallerError(w, err)
 		return
 	}
-	writeJSON(w, http.StatusOK, map[string]any{
+	out := map[string]any{
 		"agent_id": ag.ID,
 		"name":     ag.Name,
-	})
+	}
+	if viaSession {
+		out["session_id"] = sessionID
+	}
+	writeJSON(w, http.StatusOK, out)
 }
 
 // GET /v1/agents/tools — bearer-auth catalog listing for the CLI, limited
@@ -66,16 +66,17 @@ func (s *Server) cliToolsList(w http.ResponseWriter, r *http.Request) {
 }
 
 // GET /v1/agents/approvals/{id} — bearer-auth approval status polling
-// for the CLI. The agent can only see its own approvals; a mismatched
-// agent_id returns 404 (same shape as "no such id") so callers can't
-// enumerate other agents' IDs.
+// for the CLI (an agent token or a session token). The agent can only see
+// its own approvals; a mismatched agent_id returns 404 (same shape as "no
+// such id") so callers can't enumerate other agents' IDs.
 func (s *Server) cliApprovalsOne(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {
 		writeError(w, http.StatusMethodNotAllowed, "GET only")
 		return
 	}
-	ag, ok := s.requireAgentFull(w, r)
-	if !ok {
+	ag, _, _, err := s.codeCaller(r)
+	if err != nil {
+		writeCallerError(w, err)
 		return
 	}
 	id := strings.TrimPrefix(r.URL.Path, "/v1/agents/approvals/")

@@ -72,7 +72,8 @@ Optional headers:
   reason is `422 idempotency_key_reused`.
 - `Prefer: wait=<seconds>` (0–60, default 25; `wait_seconds` in a JSON body
   wins). The server answers when the run reaches a final or held status, or
-  when the wait ends, whichever is first.
+  when the wait ends, whichever is first. A larger value counts as 60; a
+  value that is not a whole number of seconds is ignored.
 
 The run continues on the server after the response; the client never has to
 hold the connection.
@@ -103,14 +104,20 @@ Every run route answers this JSON:
   `permission_required`, `deferred`, `outcome_unknown`.
 - `error`: `{"kind": "...", "message": "..."}` when `failed` or
   `outcome_unknown`. Kinds include `script_error`, `tool_error`,
-  `timeout`, `limit`, `script_diverged`, `grant_invalid`, `busy`.
+  `timeout`, `limit`, `script_diverged`, `grant_invalid`, `busy`,
+  `outcome_unknown`, `internal`, and `interrupted` (the server stopped:
+  a `queued` run is `failed` with it, a `running` one `outcome_unknown`).
+- `calls`: the calls of the latest execution (a resume runs the script
+  again), in order.
 - `calls[].status`: `succeeded`, `failed`, `permission_required`,
   `deferred`, `outcome_unknown`. `replayed: true` marks a call answered from
   the call record during a resume, not sent upstream again.
 - `held`: set when `status` is `permission_required` or `deferred`:
-  `{"seq": 3, "tool": "github.merge_pull_request", "status": "permission_required", "draft": {…}, "approval_id": null}`.
+  `{"seq": 3, "tool": "github.merge_pull_request", "status": "permission_required", "draft": {…}, "approval_id": null, "message": "…"}`.
   `draft` is the Inbox request draft the gateway returned; `approval_id` is
-  set for a legacy deferred approval.
+  set for a legacy deferred approval; `message` is the gateway's text for
+  the call (what to do next).
+- `links.resume` is present only while the run is held.
 
 ### HTTP status per run status
 
@@ -124,13 +131,16 @@ Every run route answers this JSON:
 Other answers: `400` bad input, `401` no or bad token, `403` operator token or a
 session token outside its routes, `404` unknown run (or another agent's run),
 `413` script over 1 MiB, `415` other content types, `422`
-`idempotency_key_reused` or a resume of a run that is not held, `429` code
-mode busy (with `Retry-After`; no run is created).
+`idempotency_key_reused` or a resume of a run that is not held (`run_not_held`,
+with the run's `status`), `429` code mode busy (with `Retry-After`; no run is
+created), `503` the server is restarting or the token could not be checked
+(with `Retry-After`; no run is created).
 
 ### `GET /v1/code/runs/{id}`
 
-The run view. `Prefer: wait=<seconds>` (0–60) waits for a final or held
-status. Only the agent that created the run sees it.
+The run view. `Prefer: wait=<seconds>` (0–60, default 0) waits for a final
+or held status. Only the agent that created the run sees it (with its agent
+token or any of its session tokens).
 
 ### `POST /v1/code/runs/{id}/resume`
 
@@ -144,8 +154,11 @@ owner decided.
 - `request_id`: the approved Inbox request that covers the held call. The
   server reads its grants for this agent and adds `_grant` to each matching
   call (same tool, parameters within the grant).
-- For a `deferred` legacy approval, no body is needed: the held call resumes
-  with its `approval_id`.
+- For a `deferred` legacy approval, no body is needed (an empty body or
+  `{}`): the held call resumes with its `approval_id`.
+- A `permission_required` run needs `request_id` (`400` without it), and the
+  request must belong to the agent (`400` otherwise). A call no unused grant
+  of the request covers is sent without one, so it is held again (`403`).
 
 The script runs again from the top. Each call before the held one is answered
 from the call record when its tool and arguments are the same as recorded
@@ -191,5 +204,17 @@ ty call SERVER.TOOL '{"json": "arguments"}' [--reason TEXT]
 
 The MCP code-mode limits apply: 5 minutes wall clock, 100 tool calls, 1 MiB
 output per run, 4 concurrent scripts per server. Runs and their call records
-are kept 7 days. A run that is `running` when the server stops is
-`outcome_unknown` after the restart.
+are kept 7 days from their start (an hourly sweep deletes older ones). A run
+that is `running` when the server stops is `outcome_unknown` after the
+restart; one still `queued` is `failed` (nothing ran). Both carry the error
+kind `interrupted`.
+
+## Storage
+
+`code_runs` holds one row per run: the agent, the verified client session
+(a session token's), the `Idempotency-Key` (unique per agent) with the
+fingerprint of the script and reason it was used with, the script (so a
+resume can run it again), and the outcome. `code_run_calls` holds one row
+per call: the tool, a SHA-256 of the canonical JSON of the script's own
+arguments (never a grant token), the call status, and the value the script
+received, which a resume hands back instead of sending the call again.

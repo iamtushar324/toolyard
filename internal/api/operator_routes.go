@@ -81,6 +81,9 @@ var operatorNeverPaths = map[string]bool{
 	"/v1/callbacks/receivers/":     true,
 	"/v1/callbacks/retry/":         true,
 	"/v1/admin/callback-receivers": true,
+	// Session tokens are minted with an agent token only (the prefix is
+	// refused in operatorScopeFor).
+	"/v1/agents/session-tokens": true,
 }
 
 // operatorOwnerPrefixes need the owner scope for any non-GET method.
@@ -109,7 +112,10 @@ func operatorScopeFor(method, path string) (scope string, ok bool) {
 	// A connect link is opened by a person's browser; the ticket in its
 	// path is the credential, so no token may redeem one.
 	// Likewise an upload ticket (upload_routes.go) is its own credential.
-	if operatorNeverPaths[path] || strings.Contains(path, "/reveal") || strings.HasPrefix(path, connectLinkPath) || strings.HasPrefix(path, uploadsPathPrefix) {
+	// Code mode over REST runs as an agent, and session tokens belong to
+	// an agent: a person's operator token reaches neither.
+	if operatorNeverPaths[path] || strings.Contains(path, "/reveal") || strings.HasPrefix(path, connectLinkPath) || strings.HasPrefix(path, uploadsPathPrefix) ||
+		strings.HasPrefix(path, codePathPrefix) || strings.HasPrefix(path, sessionTokensPrefix) {
 		return "", false
 	}
 	switch method {
@@ -452,7 +458,16 @@ var operatorCatalog = []operatorCatalogEntry{
 	{"/v1/agents/whoami", "GET", "agent: token identity"},
 	{"/v1/agents/tools", "GET", "agent: tool catalog"},
 	{"/v1/agents/tools/run", "POST", "agent: run a tool"},
-	{"/v1/agents/approvals/{id}", "GET", "agent: poll its own approval"},
+	{"/v1/agents/approvals/{id}", "GET", "agent: poll its own approval (agent or session token)"},
+	{"/v1/agents/session-tokens", "POST", "agent: mint a short-lived session token for one client session {session_id, ttl_seconds} (agent token only; never via operator token)"},
+	{"/v1/agents/session-tokens/{id}", "DELETE", "agent: revoke a session token (its agent token, or the session token itself; never via operator token)"},
+	{"/v1/code/run", "POST", "agent: run a code-mode script (text/x-starlark with X-Toolyard-Reason, or JSON {code, reason, wait_seconds}); Idempotency-Key, Prefer: wait=N (agent or session token; never via operator token)"},
+	{"/v1/code/runs/{id}", "GET POST", "agent: GET reads a run (Prefer: wait=N); POST /resume {request_id} resumes a held run (never via operator token)"},
+	{"/v1/code/files", "GET", "agent: listToolFiles as text (never via operator token)"},
+	{"/v1/code/files/{id}", "GET", "agent: /v1/code/files/{server}/{tool}.pyi, the readToolFile stub (never via operator token)"},
+	{"/v1/code/docs/{id}", "GET", "agent: /v1/code/docs/{server}/{tool}, the getToolDocs text (never via operator token)"},
+	{"/v1/code/openapi.json", "GET", "code mode over REST as OpenAPI 3.1 (no token)"},
+	{"/v1/code/ty", "GET", "the ty command for code mode over REST, Python 3 (no token)"},
 	{"/v1/approvals", "GET", "approval queue"},
 	{"/v1/approvals/{id}", "GET POST", "one approval; POST decides it"},
 	{"/v1/approvals/decide-batch", "POST", "decide many approvals"},

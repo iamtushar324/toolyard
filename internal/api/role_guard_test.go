@@ -135,6 +135,12 @@ func memberAllowlist() map[string]bool {
 	for _, p := range []string{
 		"/v1/agents/exchange", "/v1/agents/whoami", "/v1/agents/tools", "/v1/agents/tools/run",
 		"/v1/agents/approvals/x", "/v1/agents/approvals/x/y",
+		// Bearer-only (agent or session token): a cookie changes nothing.
+		"/v1/agents/session-tokens", "/v1/agents/session-tokens/x", "/v1/agents/session-tokens/x/y",
+		"/v1/code/run", "/v1/code/runs/x", "/v1/code/runs/x/y",
+		"/v1/code/files", "/v1/code/files/x", "/v1/code/files/x/y",
+		"/v1/code/docs/x", "/v1/code/docs/x/y",
+		"/v1/code/openapi.json", "/v1/code/ty",
 	} {
 		for _, m := range guardMethods {
 			allowed[m+" "+p] = true

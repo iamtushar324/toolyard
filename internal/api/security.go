@@ -326,9 +326,11 @@ func LimitBodyByPath(next http.Handler, defaultMax int64, overrides map[string]i
 // enforcing every check uniformly per route.
 //
 // Per request:
-//   - Per-route body cap (writeable routes get 64–256 KiB; tools/run gets
-//     4 MiB; everything else gets 8 KiB. Independently of the global mux
-//     cap so misconfiguration on one side can't widen the other.)
+//   - Per-route body cap (writeable routes get 64–256 KiB; tools/run's
+//     reader allows 4 MiB, but decode() stops every JSON body at 1 MiB
+//     (maxJSONBody); POST /v1/code/run takes a 1 MiB script plus its
+//     envelope; everything else gets 16 KiB. Independently of the global
+//     mux cap so misconfiguration on one side can't widen the other.)
 //   - Anti-CSRF custom-header check on cookie-authenticated mutations.
 //     The dashboard sets X-Requested-With: toolyard; cross-site forms
 //     can't add a custom header without a CORS preflight, which we never
@@ -395,7 +397,9 @@ func (s *Server) HardenAPI(next http.Handler) http.Handler {
 			// agent rotate POST with no payload) skips this check. The
 			// one browser form on the API, a connect link's Continue
 			// button (connect_link_routes.go), posts form-encoded and
-			// proves itself with a nonce cookie instead.
+			// proves itself with a nonce cookie instead. POST /v1/code/run
+			// also takes a raw script as text/x-starlark; it is
+			// bearer-only, so the type is no CSRF door.
 			if r.ContentLength != 0 && !strings.HasPrefix(path, connectLinkPath) && path != hostAuthorizePath && !strings.HasPrefix(path, uploadsPathPrefix) {
 				ct := r.Header.Get("Content-Type")
 				if ct == "" {
@@ -406,7 +410,15 @@ func (s *Server) HardenAPI(next http.Handler) http.Handler {
 					ct = ct[:i]
 				}
 				ct = strings.ToLower(strings.TrimSpace(ct))
-				if ct != "application/json" {
+				switch {
+				case ct == "application/json":
+				case path == codeRunPath && r.Method == http.MethodPost:
+					if ct != contentTypeScript {
+						writeError(w, http.StatusUnsupportedMediaType,
+							"only text/x-starlark or application/json is accepted")
+						return
+					}
+				default:
 					writeError(w, http.StatusUnsupportedMediaType,
 						"only application/json is accepted")
 					return
@@ -434,9 +446,15 @@ func (s *Server) HardenAPI(next http.Handler) http.Handler {
 // unbounded data on a small handler.
 func perRouteBodyCap(path string) int64 {
 	switch {
+	case path == codeRunPath:
+		return maxCodeRunBody // a 1 MiB script, JSON-escaped, plus the envelope and reason
+	case strings.HasPrefix(path, codePathPrefix):
+		return 8 << 10 // 8 KiB — a resume body; the other code routes are GETs
 	case strings.HasPrefix(path, "/v1/tools/run"),
 		strings.HasPrefix(path, "/v1/agents/tools/run"):
-		return 4 << 20 // 4 MiB — tool arguments can be substantial
+		// The reader allows 4 MiB, but decode() stops JSON bodies at 1 MiB
+		// (maxJSONBody), so 1 MiB is the effective limit.
+		return 4 << 20
 	case strings.HasPrefix(path, uploadsPathPrefix):
 		return inbox.MaxVideoBytes // native Inbox upload; the handler caps it again at the ticket's exact size
 	case strings.HasPrefix(path, "/v1/memory"):
@@ -483,6 +501,12 @@ func exemptFromCSRFHeader(path string) bool {
 	// A native Inbox upload is a curl PUT authenticated by the single-use
 	// ticket in its path; no cookie is read, so it isn't CSRF-replayable.
 	if strings.HasPrefix(path, uploadsPathPrefix) {
+		return true
+	}
+	// Code mode over REST and session tokens are bearer-only (agent or
+	// session token); no cookie is read, so they aren't CSRF-replayable.
+	// This also lifts the Origin check (exemptFromOriginCheck).
+	if strings.HasPrefix(path, codePathPrefix) || path == sessionTokensPath || strings.HasPrefix(path, sessionTokensPrefix) {
 		return true
 	}
 	// Webhook event ingest is bearer-authenticated (source token); no cookie
@@ -590,6 +614,10 @@ func unauthRouteLimit(path string) *unauthRouteRule {
 		// Connect links: a person opens a handful per hour at most. The
 		// ticket is 256 random bits, so this caps spray, not guessing.
 		return &unauthRouteRule{"connect-link", 120, time.Hour}
+	case path == codeOpenAPIPath, path == codeTyPath:
+		// Code-mode discovery documents need no token: an agent fetches
+		// them once per session at most.
+		return &unauthRouteRule{"code-discovery", 600, time.Hour}
 	}
 	return nil
 }
