@@ -1,0 +1,636 @@
+#!/usr/bin/env python3
+"""ty runs toolyard code mode over plain HTTPS: the backup route when MCP fails.
+
+The script runs under the same agent identity, policy and Inbox approvals as
+executeToolCode. Contract: docs/design/code-rest-route.md in the toolyard repo;
+the API is described at GET /v1/code/openapi.json.
+
+  ty run FILE|-  [--wait N] [--key IDEMPOTENCY_KEY] [--reason TEXT]
+  ty status RUN_ID [--wait N]
+  ty resume RUN_ID [--request rq_...] [--wait N]
+  ty files
+  ty stub SERVER/TOOL
+  ty call SERVER.TOOL '{"json": "arguments"}' [--reason TEXT]
+
+Environment:
+  TOOLYARD_URL         default https://toolyard.beknown.live
+  TOOLYARD_TOKEN_FILE  required: the file that holds your toolyard token. It
+                       must not be readable by group or others (chmod 600)
+                       unless TOOLYARD_TOKEN_FILE_INSECURE=1.
+
+The token is read from that file and sent only in the Authorization header.
+ty never prints or logs it, never puts it in argv and never hands it to
+another process.
+
+Output: the run view as JSON on stdout (files and stub print text).
+Exit codes: 0 succeeded, 1 failed, 2 usage or transport error,
+3 permission_required, 4 deferred or still running, 5 busy (HTTP 429),
+6 outcome_unknown.
+
+Python 3 standard library only.
+"""
+
+import argparse
+import http.client
+import json
+import os
+import stat
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+import uuid
+
+DEFAULT_URL = "https://toolyard.beknown.live"
+MAX_SCRIPT_BYTES = 1 << 20
+MAX_TOKEN_BYTES = 64 * 1024
+MAX_SERVER_WAIT = 60
+DEFAULT_SERVER_WAIT = 25
+REASON_MIN, REASON_MAX = 20, 2000
+REASON_PAD = " (toolyard code mode over REST)"
+
+EXIT_SUCCEEDED = 0
+EXIT_FAILED = 1
+EXIT_USAGE = 2
+EXIT_PERMISSION = 3
+EXIT_PENDING = 4
+EXIT_BUSY = 5
+EXIT_UNKNOWN = 6
+
+STATUS_EXIT = {
+    "succeeded": EXIT_SUCCEEDED,
+    "failed": EXIT_FAILED,
+    "permission_required": EXIT_PERMISSION,
+    "deferred": EXIT_PENDING,
+    "queued": EXIT_PENDING,
+    "running": EXIT_PENDING,
+    "outcome_unknown": EXIT_UNKNOWN,
+}
+IN_PROGRESS = ("queued", "running")
+
+HINTS = {
+    401: "the token is missing, expired or revoked",
+    403: "this token may not use this route; operator tokens never can",
+    404: "no such run, file or tool for this agent",
+    413: "the script is over 1 MiB",
+    415: "unsupported content type",
+    422: "the idempotency key was used with a different script or reason, or the run is not held",
+}
+
+# Starlark keywords cannot be identifiers (internal/codemode/names.go).
+STARLARK_KEYWORDS = frozenset("""
+and break continue def elif else for if in lambda load not or pass return while
+as assert async await class del except finally from global import is nonlocal
+raise try with yield
+""".split())
+
+_secret = ""
+
+
+class TyError(Exception):
+    """A usage or transport problem: a message for stderr and an exit code."""
+
+    def __init__(self, message, code=EXIT_USAGE):
+        Exception.__init__(self, message)
+        self.code = code
+
+
+def scrub(text):
+    """Removes the token from any text that is about to be shown."""
+    text = str(text)
+    if _secret:
+        text = text.replace(_secret, "[token]")
+    return text
+
+
+def warn(message):
+    sys.stderr.write("ty: " + scrub(message) + "\n")
+    sys.stderr.flush()
+
+
+# ---- configuration ----
+
+def base_url():
+    url = (os.environ.get("TOOLYARD_URL", "").strip() or DEFAULT_URL).rstrip("/")
+    try:
+        parts = urllib.parse.urlsplit(url)
+        host = parts.hostname
+    except ValueError:
+        raise TyError("TOOLYARD_URL is not a valid URL")
+    if parts.scheme not in ("https", "http") or not host:
+        raise TyError("TOOLYARD_URL must look like https://toolyard.example.com")
+    if parts.username or parts.password or parts.query or parts.fragment:
+        raise TyError("TOOLYARD_URL must be a plain base URL, with no user, query or fragment")
+    if (parts.scheme == "http" and host not in ("localhost", "127.0.0.1", "::1")
+            and os.environ.get("TOOLYARD_URL_INSECURE") != "1"):
+        raise TyError("TOOLYARD_URL uses http://, which sends your token in clear text; "
+                      "use https://, or set TOOLYARD_URL_INSECURE=1 on a network you trust")
+    return url
+
+
+def read_token():
+    """Reads the token from TOOLYARD_TOKEN_FILE, refusing a file others can read."""
+    global _secret
+    path = os.environ.get("TOOLYARD_TOKEN_FILE", "").strip()
+    if not path:
+        raise TyError("TOOLYARD_TOKEN_FILE is not set: point it at the file that holds your toolyard token")
+    path = os.path.expanduser(path)
+    try:
+        fd = os.open(path, os.O_RDONLY)
+    except OSError as e:
+        raise TyError("cannot open TOOLYARD_TOKEN_FILE %s: %s" % (path, e.strerror or e))
+    with os.fdopen(fd, "rb") as f:
+        st = os.fstat(f.fileno())
+        if not stat.S_ISREG(st.st_mode):
+            raise TyError("TOOLYARD_TOKEN_FILE %s is not a regular file" % path)
+        if (os.name == "posix" and st.st_mode & 0o077
+                and os.environ.get("TOOLYARD_TOKEN_FILE_INSECURE") != "1"):
+            raise TyError(
+                "refusing TOOLYARD_TOKEN_FILE %s: its mode is %03o, so other users may read it. "
+                "Run `chmod 600 %s`, or set TOOLYARD_TOKEN_FILE_INSECURE=1 to skip this check"
+                % (path, stat.S_IMODE(st.st_mode), path))
+        data = f.read(MAX_TOKEN_BYTES + 1)
+    if len(data) > MAX_TOKEN_BYTES:
+        raise TyError("TOOLYARD_TOKEN_FILE %s is too large to hold a token" % path)
+    try:
+        token = data.decode("ascii").strip()
+    except UnicodeDecodeError:
+        token = ""
+    if not token or any(c < "!" or c > "~" for c in token):
+        raise TyError("TOOLYARD_TOKEN_FILE %s must hold one token and nothing else" % path)
+    _secret = token
+    return token
+
+
+# ---- HTTP ----
+
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Refuses redirects: the token never follows one to another address."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+_OPENER = urllib.request.build_opener(_NoRedirect())
+
+
+class Client(object):
+    def __init__(self, base, token):
+        self.base = base
+        self._token = token
+
+    def send(self, method, path, body=None, headers=None, wait=None):
+        """Sends one request and returns (status, headers, body bytes)."""
+        req = urllib.request.Request(self.base + path, data=body, method=method)
+        for name, value in (headers or {}).items():
+            req.add_header(name, value)
+        req.add_header("User-Agent", "ty/1 (toolyard code mode over REST)")
+        req.add_unredirected_header("Authorization", "Bearer " + self._token)
+        timeout = (DEFAULT_SERVER_WAIT if wait is None else min(wait, MAX_SERVER_WAIT)) + 30
+        try:
+            with _OPENER.open(req, timeout=timeout) as resp:
+                return resp.status, resp.headers, resp.read()
+        except urllib.error.HTTPError as e:
+            try:
+                data = e.read()
+            except Exception:
+                data = b""
+            return e.code, e.headers, data
+        except urllib.error.URLError as e:
+            raise TyError("cannot reach %s: %s" % (self.base, e.reason))
+        except (OSError, http.client.HTTPException) as e:
+            raise TyError("the connection to %s failed: %s" % (self.base, e))
+
+
+def run_path(run_id):
+    return "/v1/code/runs/" + urllib.parse.quote(run_id, safe="")
+
+
+def prefer(wait):
+    if wait is None:
+        return {}
+    return {"Prefer": "wait=%d" % min(wait, MAX_SERVER_WAIT)}
+
+
+def deadline_for(wait):
+    return None if wait is None else time.monotonic() + wait
+
+
+def parse_json(data):
+    try:
+        return json.loads(data.decode("utf-8"))
+    except (ValueError, UnicodeDecodeError):
+        return None
+
+
+def is_run_view(body):
+    return (isinstance(body, dict) and isinstance(body.get("run_id"), str)
+            and isinstance(body.get("status"), str))
+
+
+def emit_json(body):
+    out = json.dumps(body, indent=2, ensure_ascii=False) + "\n"
+    sys.stdout.buffer.write(out.encode("utf-8"))
+    sys.stdout.flush()
+
+
+def emit_text(status, headers, data):
+    if status != 200:
+        return error_exit(status, headers, data)
+    sys.stdout.buffer.write(data)
+    if data and not data.endswith(b"\n"):
+        sys.stdout.buffer.write(b"\n")
+    sys.stdout.flush()
+    return EXIT_SUCCEEDED
+
+
+def error_exit(status, headers, data):
+    """Reports an answer that is not a run view on stderr; returns its exit code."""
+    body = parse_json(data)
+    if isinstance(body, dict) and isinstance(body.get("error"), str):
+        detail = body["error"]
+    else:
+        detail = data.decode("utf-8", "replace")
+    detail = " ".join(detail.split())[:300]
+    if status == 429:
+        retry = (headers.get("Retry-After") if headers is not None else None) or "a few"
+        warn("code mode is busy (HTTP 429), so no run was created; retry after %s seconds. %s"
+             % (retry, detail))
+        return EXIT_BUSY
+    if 300 <= status < 400:
+        hint = "the server answered with a redirect; check TOOLYARD_URL"
+    elif 200 <= status < 300:
+        hint = "the answer is not a run view"
+    else:
+        hint = HINTS.get(status, "")
+    message = "HTTP %d" % status
+    if detail:
+        message += ": " + detail
+    if hint:
+        message += " (" + hint + ")"
+    warn(message)
+    return EXIT_USAGE
+
+
+def finish(client, status, headers, data, deadline):
+    """Prints the run view, polling while it is queued or running and time is left."""
+    body = parse_json(data)
+    while is_run_view(body) and body["status"] in IN_PROGRESS and deadline is not None:
+        remaining = int(deadline - time.monotonic())
+        if remaining < 1:
+            break
+        wait = min(MAX_SERVER_WAIT, remaining)
+        started = time.monotonic()
+        status, headers, data = client.send("GET", run_path(body["run_id"]),
+                                            headers=prefer(wait), wait=wait)
+        body = parse_json(data)
+        if is_run_view(body) and body["status"] in IN_PROGRESS and time.monotonic() - started < 1:
+            time.sleep(1)
+    if not is_run_view(body):
+        return error_exit(status, headers, data)
+    emit_json(body)
+    code = STATUS_EXIT.get(body["status"])
+    if code is None:
+        warn("unknown run status %r" % body["status"])
+        return EXIT_USAGE
+    return code
+
+
+# ---- scripts and reasons ----
+
+def header_safe(text):
+    return all(" " <= c <= "~" for c in text) and text == text.strip()
+
+
+def check_reason(text):
+    reason = text.strip()
+    n = len(reason.encode("utf-8"))
+    if not REASON_MIN <= n <= REASON_MAX:
+        raise TyError("--reason must be %d-%d characters (got %d)" % (REASON_MIN, REASON_MAX, n))
+    return reason
+
+
+def default_reason(verb, label, code):
+    """ty <verb> <label>: <first 60 characters of the first non-comment line>."""
+    first = ""
+    for line in code.splitlines():
+        line = line.strip()
+        if line and not line.startswith("#"):
+            first = line
+            break
+    reason = "ty %s %s" % (verb, label)
+    if first:
+        reason += ": " + first[:60]
+    if len(reason) < REASON_MIN:
+        reason += REASON_PAD
+    return reason
+
+
+def read_script(path):
+    if path == "-":
+        data = sys.stdin.buffer.read(MAX_SCRIPT_BYTES + 1)
+        label = "stdin"
+    else:
+        try:
+            with open(path, "rb") as f:
+                data = f.read(MAX_SCRIPT_BYTES + 1)
+        except OSError as e:
+            raise TyError("cannot read %s: %s" % (path, e.strerror or e))
+        label = os.path.basename(path) or path
+    if len(data) > MAX_SCRIPT_BYTES:
+        raise TyError("the script is over 1 MiB, the code-mode limit")
+    try:
+        code = data.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        raise TyError("the script is not UTF-8 text")
+    if not code.strip():
+        raise TyError("the script is empty")
+    return code, label
+
+
+def start_run(client, code, reason, key, wait):
+    """POST /v1/code/run with an Idempotency-Key, then finish."""
+    if key is None:
+        key = str(uuid.uuid4())
+        warn("Idempotency-Key %s (run again with --key %s to get this run back after a lost answer)"
+             % (key, key))
+    elif not (1 <= len(key) <= 128 and header_safe(key)):
+        raise TyError("--key must be 1-128 printable ASCII characters")
+    deadline = deadline_for(wait)
+    headers = {"Idempotency-Key": key}
+    if header_safe(reason):
+        headers["Content-Type"] = "text/x-starlark"
+        headers["X-Toolyard-Reason"] = reason
+        headers.update(prefer(wait))
+        body = code.encode("utf-8")
+    else:
+        # A reason that cannot travel in a header goes in a JSON body.
+        headers["Content-Type"] = "application/json"
+        payload = {"code": code, "reason": reason}
+        if wait is not None:
+            payload["wait_seconds"] = min(wait, MAX_SERVER_WAIT)
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+    status, hdrs, data = client.send("POST", "/v1/code/run", body, headers, wait=wait)
+    return finish(client, status, hdrs, data, deadline)
+
+
+# ---- `ty call`: one tool as a one-line script ----
+
+def is_identifier(s):
+    if not s:
+        return False
+    for i, c in enumerate(s):
+        if c.isalpha() or c == "_" or (i > 0 and c.isdecimal()):
+            continue
+        return False
+    return True
+
+
+def is_bindable(s):
+    return is_identifier(s) and s not in STARLARK_KEYWORDS
+
+
+def server_ident(name):
+    """The identifier code mode binds a server key as (serverIdent)."""
+    if is_bindable(name):
+        return name
+    out = []
+    for i, c in enumerate(name):
+        if c.isalpha() or c == "_":
+            out.append(c)
+        elif c.isdecimal():
+            if i == 0:
+                out.append("_")
+            out.append(c)
+        elif c.isspace() or c in "-.":
+            out.append("_")
+    ident = "".join(out)
+    if ident in STARLARK_KEYWORDS:
+        ident += "_"
+    return ident if is_bindable(ident) else ""
+
+
+def canonical_name(name):
+    """The identifier code mode exposes a tool under (canonicalName)."""
+    out = ""
+    for i, c in enumerate(name):
+        if i == 0 and (c.isalpha() or c == "_"):
+            out += c.lower()
+        elif i == 0:
+            out += "_"
+            if c.isdecimal():
+                out += c
+        elif c.isalpha() or c.isdecimal() or c == "_":
+            out += c.lower()
+        elif c.isspace() or c == "-":
+            if out and not out.endswith("_"):
+                out += "_"
+    out = out.rstrip("_")
+    if not out:
+        return "tool"
+    if out in STARLARK_KEYWORDS:
+        out += "_"
+    return out
+
+
+def tool_ident(name):
+    """The tool name with '-' as '_' when that is an identifier, else its canonical name."""
+    alias = name.replace("-", "_")
+    return alias if is_bindable(alias) else canonical_name(name)
+
+
+def starlark_string(s):
+    """A double-quoted, ASCII-only Starlark string literal."""
+    out = ['"']
+    for c in s:
+        o = ord(c)
+        if c == '"':
+            out.append('\\"')
+        elif c == "\\":
+            out.append("\\\\")
+        elif 0x20 <= o < 0x7F:
+            out.append(c)
+        elif 0xD800 <= o < 0xE000:
+            raise TyError("ARGS_JSON holds a lone surrogate, which Starlark cannot represent")
+        elif o <= 0xFFFF:
+            out.append("\\u%04x" % o)
+        else:
+            out.append("\\U%08x" % o)
+    out.append('"')
+    return "".join(out)
+
+
+def starlark_literal(v):
+    """Turns decoded JSON into Starlark source."""
+    if v is None:
+        return "None"
+    if v is True:
+        return "True"
+    if v is False:
+        return "False"
+    if isinstance(v, int):
+        return str(v)
+    if isinstance(v, float):
+        if v != v or v in (float("inf"), float("-inf")):
+            raise TyError("ARGS_JSON holds a number Starlark cannot represent (NaN or infinity)")
+        return repr(v)
+    if isinstance(v, str):
+        return starlark_string(v)
+    if isinstance(v, list):
+        return "[" + ", ".join(starlark_literal(x) for x in v) + "]"
+    if isinstance(v, dict):
+        return "{" + ", ".join(starlark_string(k) + ": " + starlark_literal(x) for k, x in v.items()) + "}"
+    raise TyError("ARGS_JSON holds an unsupported value")
+
+
+def _reject_constant(name):
+    raise ValueError("%s is not allowed" % name)
+
+
+def call_script(target, args_json):
+    """result = <server>.<tool>({...}): a single dict is the tool's arguments."""
+    server, sep, tool = target.partition(".")
+    if not sep or not server or not tool:
+        raise TyError("call takes SERVER.TOOL, for example github.create_issue "
+                      "(toolyard's own tools are toolyard.inbox_request and the like)")
+    ident = server_ident(server)
+    if not ident:
+        raise TyError("server %r cannot be called from code; `ty files` lists the names to use" % server)
+    try:
+        params = json.loads(args_json, parse_constant=_reject_constant)
+    except ValueError as e:
+        raise TyError("ARGS_JSON is not valid JSON: %s" % e)
+    if not isinstance(params, dict):
+        raise TyError("ARGS_JSON must be a JSON object, like '{\"owner\": \"acme\"}'")
+    member = tool_ident(tool)
+    call_args = starlark_literal(params) if params else ""
+    return "%s.%s" % (ident, member), "result = %s.%s(%s)\n" % (ident, member, call_args)
+
+
+# ---- commands ----
+
+def cmd_run(client, args):
+    code, label = read_script(args.file)
+    reason = check_reason(args.reason) if args.reason is not None else default_reason("run", label, code)
+    return start_run(client, code, reason, args.key, args.wait)
+
+
+def cmd_call(client, args):
+    raw = sys.stdin.read() if args.args == "-" else args.args
+    label, code = call_script(args.target, raw)
+    reason = check_reason(args.reason) if args.reason is not None else default_reason("call", label, "")
+    return start_run(client, code, reason, args.key, args.wait)
+
+
+def cmd_status(client, args):
+    wait = 0 if args.wait is None else args.wait
+    deadline = deadline_for(args.wait)
+    status, headers, data = client.send("GET", run_path(args.run_id), headers=prefer(wait), wait=wait)
+    return finish(client, status, headers, data, deadline)
+
+
+def cmd_resume(client, args):
+    deadline = deadline_for(args.wait)
+    payload = {"request_id": args.request} if args.request else {}
+    headers = {"Content-Type": "application/json"}
+    headers.update(prefer(args.wait))
+    status, hdrs, data = client.send("POST", run_path(args.run_id) + "/resume",
+                                     json.dumps(payload, ensure_ascii=False).encode("utf-8"), headers, wait=args.wait)
+    return finish(client, status, hdrs, data, deadline)
+
+
+def cmd_files(client, args):
+    status, headers, data = client.send("GET", "/v1/code/files")
+    return emit_text(status, headers, data)
+
+
+def cmd_stub(client, args):
+    target = args.target.strip()
+    if target.startswith("servers/"):
+        target = target[len("servers/"):]
+    if target.endswith(".pyi"):
+        target = target[:-len(".pyi")]
+    server, sep, tool = target.partition("/")
+    if not sep or not server or not tool or "/" in tool:
+        raise TyError("stub takes SERVER/TOOL, for example github/create_issue")
+    path = "/v1/code/files/%s/%s.pyi" % (urllib.parse.quote(server, safe=""),
+                                         urllib.parse.quote(tool, safe=""))
+    status, headers, data = client.send("GET", path)
+    return emit_text(status, headers, data)
+
+
+def seconds(text):
+    try:
+        n = int(text)
+    except ValueError:
+        raise argparse.ArgumentTypeError("must be a whole number of seconds")
+    if n < 0:
+        raise argparse.ArgumentTypeError("must be 0 or more")
+    return n
+
+
+def build_parser():
+    p = argparse.ArgumentParser(prog="ty", description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = p.add_subparsers(dest="command", metavar="COMMAND")
+    wait_help = "wait up to N seconds for the run to finish or be held (polls past 60)"
+
+    r = sub.add_parser("run", help="run a script file, or - for stdin")
+    r.add_argument("file", metavar="FILE|-")
+    r.add_argument("--wait", type=seconds, metavar="N", help=wait_help)
+    r.add_argument("--key", metavar="IDEMPOTENCY_KEY",
+                   help="reuse this key on a retry to get the same run back (default: a new random key)")
+    r.add_argument("--reason", metavar="TEXT", help="why you run it, 20-2000 characters, for the audit")
+    r.set_defaults(func=cmd_run)
+
+    s = sub.add_parser("status", help="show a run")
+    s.add_argument("run_id", metavar="RUN_ID")
+    s.add_argument("--wait", type=seconds, metavar="N", help=wait_help)
+    s.set_defaults(func=cmd_status)
+
+    s = sub.add_parser("resume", help="resume a held run after the owner decided")
+    s.add_argument("run_id", metavar="RUN_ID")
+    s.add_argument("--request", metavar="rq_...",
+                   help="the approved Inbox request that covers the held call (omit for a legacy deferred approval)")
+    s.add_argument("--wait", type=seconds, metavar="N", help=wait_help)
+    s.set_defaults(func=cmd_resume)
+
+    s = sub.add_parser("files", help="list the tool stubs you may use (like listToolFiles)")
+    s.set_defaults(func=cmd_files)
+
+    s = sub.add_parser("stub", help="print one tool stub (like readToolFile)")
+    s.add_argument("target", metavar="SERVER/TOOL")
+    s.set_defaults(func=cmd_stub)
+
+    s = sub.add_parser("call", help="call one tool as a one-line script")
+    s.add_argument("target", metavar="SERVER.TOOL")
+    s.add_argument("args", metavar="ARGS_JSON", nargs="?", default="{}",
+                   help="the arguments as a JSON object, or - to read it from stdin (default: {})")
+    s.add_argument("--reason", metavar="TEXT", help="why you call it, 20-2000 characters, for the audit")
+    s.add_argument("--wait", type=seconds, metavar="N", help=wait_help)
+    s.add_argument("--key", metavar="IDEMPOTENCY_KEY",
+                   help="reuse this key on a retry to get the same run back (default: a new random key)")
+    s.set_defaults(func=cmd_call)
+    return p
+
+
+def main(argv=None):
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if getattr(args, "func", None) is None:
+        parser.print_help(sys.stderr)
+        return EXIT_USAGE
+    try:
+        client = Client(base_url(), read_token())
+        return args.func(client, args)
+    except TyError as e:
+        warn(str(e))
+        return e.code
+    except KeyboardInterrupt:
+        warn("interrupted")
+        return EXIT_USAGE
+
+
+if __name__ == "__main__":
+    sys.exit(main())

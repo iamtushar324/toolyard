@@ -231,7 +231,7 @@ func (g *Gateway) redeemAndDispatch(ctx context.Context, entry toolEntry, args m
 		state = inbox.ExecutionFailed
 	}
 	if err := g.inbox.FinishExecution(context.WithoutCancel(ctx), gr, state, result, detail); err != nil {
-		return mcp.NewToolResultError("execution outcome could not be recorded; do not repeat this call; inspect Inbox status"), nil
+		return outcomeUnknown(mcp.NewToolResultError("execution outcome could not be recorded; do not repeat this call; inspect Inbox status")), nil
 	}
 	return result, dispatchErr
 }
@@ -471,7 +471,7 @@ func (g *Gateway) inboxTools() []toolEntry {
 	return []toolEntry{
 		inboxEntry("inbox.guide", inboxUpstream,
 			"How to ask your owner for permission: the rules, the request format, and worked examples. Call it once before your first request. "+
-				"No topic returns an overview and the topic list (restricted, coaching, requests, tools, voice, attachments, urgency, dry-run, grants, updates, never, examples, hosting, all).",
+				"No topic returns an overview and the topic list (restricted, coaching, requests, tools, voice, attachments, urgency, dry-run, grants, updates, never, examples, fallback, hosting, all).",
 			obj(nil, map[string]any{"topic": map[string]any{"type": "string"}}),
 			func(ctx context.Context, args map[string]any) (*mcp.CallToolResult, error) {
 				if g.guide == nil {

@@ -1,0 +1,652 @@
+{
+  "openapi": "3.1.0",
+  "info": {
+    "title": "toolyard code mode over REST",
+    "version": "1.0.0",
+    "summary": "Run a toolyard code-mode script over plain HTTPS: the backup route when MCP fails.",
+    "description": "An agent whose MCP connection fails can still run a toolyard script with plain HTTPS: `curl` or the `ty` command (`GET /v1/code/ty`). The script runs under the same agent identity, the same policy and the same Inbox approvals as MCP code mode (`executeToolCode`).\n\n## Credentials\n\nAll routes except discovery take `Authorization: Bearer <token>`.\n\n| Token | Format | Allowed on |\n|---|---|---|\n| Agent token | `ag_<uuid>.<secret>` | every agent route, including minting session tokens |\n| Session token | `tys_<id>.<secret>` | `/v1/code/*`, `GET /v1/agents/approvals/{id}`, `GET /v1/agents/whoami`, `DELETE /v1/agents/session-tokens/{id}` (its own id) |\n| Operator token | `tyop_<id>.<secret>` | never on `/v1/code/*` or `/v1/agents/session-tokens*`: 403 |\n\n## HTTP status per run status\n\nEvery run route (`POST /v1/code/run`, `GET /v1/code/runs/{id}`, `POST /v1/code/runs/{id}/resume`) answers the run view, with this HTTP status:\n\n| Run status | HTTP |\n|---|---|\n| `succeeded`, `failed` | 200 |\n| `permission_required` | 403 |\n| `deferred`, `queued`, `running` (the wait ended first) | 202, with `Location: /v1/code/runs/{id}` |\n| `outcome_unknown` | 409 |\n\nOther answers: 400 bad input, 401 no or bad token, 403 operator token or a session token outside its routes, 404 unknown run (or another agent's run), 413 script over 1 MiB, 415 other content types, 422 `idempotency_key_reused` or a resume of a run that is not held, 429 code mode busy (with `Retry-After`; no run is created), 503 the server is restarting or the token could not be checked (with `Retry-After`; no run is created).\n\n## ty exit codes\n\n0 `succeeded`, 1 `failed`, 2 usage or transport error, 3 `permission_required`, 4 `deferred` or still running, 5 busy, 6 `outcome_unknown`.\n\n## Limits\n\nThe MCP code-mode limits apply: 5 minutes wall clock, 100 tool calls, 1 MiB output per run, 4 concurrent scripts per server. Runs and their call records are kept 7 days from their start. A run that is `running` when the server stops is `outcome_unknown` after the restart, and one still `queued` is `failed`; both with the error kind `interrupted`."
+  },
+  "servers": [
+    {
+      "url": "https://toolyard.beknown.live",
+      "description": "The hosted instance. A self-hosted instance serves the same paths under its own URL."
+    }
+  ],
+  "x-run-status-http": {
+    "succeeded": 200,
+    "failed": 200,
+    "permission_required": 403,
+    "deferred": 202,
+    "queued": 202,
+    "running": 202,
+    "outcome_unknown": 409
+  },
+  "security": [
+    { "agentToken": [] },
+    { "sessionToken": [] }
+  ],
+  "tags": [
+    { "name": "session tokens", "description": "Short-lived tokens for one agent session." },
+    { "name": "runs", "description": "Start, read and resume code-mode runs." },
+    { "name": "stubs", "description": "The same stubs and docs as listToolFiles, readToolFile and getToolDocs." },
+    { "name": "discovery", "description": "Public: no token needed." }
+  ],
+  "paths": {
+    "/v1/agents/session-tokens": {
+      "post": {
+        "tags": ["session tokens"],
+        "operationId": "createSessionToken",
+        "summary": "Mint a session token",
+        "description": "Agent token only: a session token cannot mint another one, and an operator token is refused. The server never issues a lifetime longer than 3600 seconds. Only the token's SHA-256 is stored, so the token appears in this answer only.\n\nA session token is refused (`401 invalid session token`) when it is expired, revoked, its agent is revoked or blocked, or the parent credential it was minted with is no longer valid (rotated past its grace period, or revoked).",
+        "security": [{ "agentToken": [] }],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/SessionTokenRequest" },
+              "example": { "session_id": "t3-thread-123", "ttl_seconds": 3600 }
+            }
+          }
+        },
+        "responses": {
+          "201": {
+            "description": "Created.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/SessionToken" }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" }
+        }
+      }
+    },
+    "/v1/agents/session-tokens/{token_id}": {
+      "delete": {
+        "tags": ["session tokens"],
+        "operationId": "revokeSessionToken",
+        "summary": "Revoke a session token",
+        "description": "Allowed for the parent agent token, or the session token itself. Idempotent: an unknown or already revoked id of the same agent is also 204; another agent's id is 404.",
+        "parameters": [
+          {
+            "name": "token_id",
+            "in": "path",
+            "required": true,
+            "description": "The `token_id` from the mint answer.",
+            "schema": { "type": "string", "examples": ["st_9f2c…"] }
+          }
+        ],
+        "responses": {
+          "204": { "description": "Revoked, or already gone." },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" },
+          "404": { "$ref": "#/components/responses/NotFound" }
+        }
+      }
+    },
+    "/v1/code/run": {
+      "post": {
+        "tags": ["runs"],
+        "operationId": "startRun",
+        "summary": "Run a script",
+        "description": "Starts a run and answers when it reaches a final or held status, or when the wait ends, whichever is first. The run continues on the server after the response; the client never has to hold the connection.\n\nBody, one of: `text/x-starlark` (the raw script; the reason comes from `X-Toolyard-Reason`, required), or `application/json` (`code`, `reason`, optional `wait_seconds`). The script is at most 1 MiB.\n\nWith an `Idempotency-Key`, the same key with the same script and reason returns the existing run in its current state and runs nothing new; the same key with a different script or reason is `422 idempotency_key_reused`.",
+        "parameters": [
+          { "$ref": "#/components/parameters/ToolyardReason" },
+          { "$ref": "#/components/parameters/IdempotencyKey" },
+          { "$ref": "#/components/parameters/PreferWait" }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "text/x-starlark": {
+              "schema": {
+                "type": "string",
+                "description": "The raw script (UTF-8), at most 1 MiB. Servers are globals: `result = server.tool(param=value)`."
+              },
+              "example": "result = context7.resolve_library_id(libraryName=\"react\")\n"
+            },
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/RunRequest" },
+              "example": {
+                "code": "result = context7.resolve_library_id(libraryName=\"react\")\n",
+                "reason": "Find the React docs library id to answer the user's question",
+                "wait_seconds": 25
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": { "$ref": "#/components/responses/RunFinished" },
+          "202": { "$ref": "#/components/responses/RunPending" },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/RunHeld" },
+          "409": { "$ref": "#/components/responses/RunOutcomeUnknown" },
+          "413": { "$ref": "#/components/responses/PayloadTooLarge" },
+          "415": { "$ref": "#/components/responses/UnsupportedMediaType" },
+          "422": { "$ref": "#/components/responses/Unprocessable" },
+          "429": { "$ref": "#/components/responses/Busy" },
+          "503": { "$ref": "#/components/responses/Unavailable" }
+        }
+      }
+    },
+    "/v1/code/runs/{id}": {
+      "get": {
+        "tags": ["runs"],
+        "operationId": "getRun",
+        "summary": "Read a run",
+        "description": "The run view. `Prefer: wait=<seconds>` (0–60, default 0) waits for a final or held status. Only the agent that created the run sees it (with its agent token or any of its session tokens).",
+        "parameters": [
+          { "$ref": "#/components/parameters/RunID" },
+          { "$ref": "#/components/parameters/PreferWait" }
+        ],
+        "responses": {
+          "200": { "$ref": "#/components/responses/RunFinished" },
+          "202": { "$ref": "#/components/responses/RunPending" },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/RunHeld" },
+          "404": { "$ref": "#/components/responses/NotFound" },
+          "409": { "$ref": "#/components/responses/RunOutcomeUnknown" },
+          "503": { "$ref": "#/components/responses/Unavailable" }
+        }
+      }
+    },
+    "/v1/code/runs/{id}/resume": {
+      "post": {
+        "tags": ["runs"],
+        "operationId": "resumeRun",
+        "summary": "Resume a held run",
+        "description": "Resumes a run whose status is `permission_required` or `deferred`, after the owner decided.\n\n- `request_id`: the approved Inbox request that covers the held call. The server reads its grants for this agent and adds `_grant` to each matching call (same tool, parameters within the grant).\n- For a `deferred` legacy approval, no body is needed (an empty body or `{}`): the held call resumes with its `approval_id`.\n- A `permission_required` run needs `request_id` (400 without it), and the request must belong to the agent (400 otherwise). A call no unused grant of the request covers is sent without one, so it is held again (403).\n\nThe script runs again from the top. Each call before the held one is answered from the call record when its tool and arguments are the same as recorded (`replayed: true`); a different call is `failed` with `script_diverged` and nothing more runs. A recorded call with an unknown outcome stops the resume with `outcome_unknown`; nothing is repeated blindly. The same `Prefer: wait` and HTTP mapping apply.",
+        "parameters": [
+          { "$ref": "#/components/parameters/RunID" },
+          { "$ref": "#/components/parameters/PreferWait" }
+        ],
+        "requestBody": {
+          "required": false,
+          "content": {
+            "application/json": {
+              "schema": { "$ref": "#/components/schemas/ResumeRequest" },
+              "example": { "request_id": "rq_…" }
+            }
+          }
+        },
+        "responses": {
+          "200": { "$ref": "#/components/responses/RunFinished" },
+          "202": { "$ref": "#/components/responses/RunPending" },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/RunHeld" },
+          "404": { "$ref": "#/components/responses/NotFound" },
+          "409": { "$ref": "#/components/responses/RunOutcomeUnknown" },
+          "415": { "$ref": "#/components/responses/UnsupportedMediaType" },
+          "422": { "$ref": "#/components/responses/Unprocessable" },
+          "429": { "$ref": "#/components/responses/Busy" },
+          "503": { "$ref": "#/components/responses/Unavailable" }
+        }
+      }
+    },
+    "/v1/code/files": {
+      "get": {
+        "tags": ["stubs"],
+        "operationId": "listToolFiles",
+        "summary": "List the tool stubs",
+        "description": "The same listing as `listToolFiles`: only the tools this agent may see.",
+        "responses": {
+          "200": { "$ref": "#/components/responses/Text" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" },
+          "503": { "$ref": "#/components/responses/Unavailable" }
+        }
+      }
+    },
+    "/v1/code/files/{server}/{tool}.pyi": {
+      "get": {
+        "tags": ["stubs"],
+        "operationId": "readToolFile",
+        "summary": "Read one tool stub",
+        "description": "The same stub as `readToolFile`. Unknown files, and tools this agent may not see, are 404.",
+        "parameters": [
+          { "$ref": "#/components/parameters/Server" },
+          { "$ref": "#/components/parameters/Tool" }
+        ],
+        "responses": {
+          "200": { "$ref": "#/components/responses/Text" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" },
+          "404": { "$ref": "#/components/responses/NotFound" },
+          "503": { "$ref": "#/components/responses/Unavailable" }
+        }
+      }
+    },
+    "/v1/code/docs/{server}/{tool}": {
+      "get": {
+        "tags": ["stubs"],
+        "operationId": "getToolDocs",
+        "summary": "Read one tool's docs",
+        "description": "The same text as `getToolDocs`. Unknown tools, and tools this agent may not see, are 404.",
+        "parameters": [
+          { "$ref": "#/components/parameters/Server" },
+          { "$ref": "#/components/parameters/Tool" }
+        ],
+        "responses": {
+          "200": { "$ref": "#/components/responses/Text" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" },
+          "404": { "$ref": "#/components/responses/NotFound" },
+          "503": { "$ref": "#/components/responses/Unavailable" }
+        }
+      }
+    },
+    "/v1/code/openapi.json": {
+      "get": {
+        "tags": ["discovery"],
+        "operationId": "getOpenAPI",
+        "summary": "This API as OpenAPI 3.1",
+        "security": [],
+        "responses": {
+          "200": {
+            "description": "This document.",
+            "content": {
+              "application/json": {
+                "schema": { "type": "object" }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/v1/code/ty": {
+      "get": {
+        "tags": ["discovery"],
+        "operationId": "getTy",
+        "summary": "The ty command",
+        "description": "One Python 3 file, standard library only. Save it, `chmod +x` it, set `TOOLYARD_URL` and `TOOLYARD_TOKEN_FILE`, and run `ty --help`.",
+        "security": [],
+        "responses": {
+          "200": {
+            "description": "The script.",
+            "content": {
+              "text/plain": {
+                "schema": { "type": "string" }
+              }
+            }
+          }
+        }
+      }
+    }
+  },
+  "components": {
+    "securitySchemes": {
+      "agentToken": {
+        "type": "http",
+        "scheme": "bearer",
+        "bearerFormat": "ag_<uuid>.<secret>",
+        "description": "An agent token. Allowed on every agent route, including minting session tokens."
+      },
+      "sessionToken": {
+        "type": "http",
+        "scheme": "bearer",
+        "bearerFormat": "tys_<id>.<secret>",
+        "description": "A session token for one agent session (T3 writes it to TOOLYARD_TOKEN_FILE). Allowed on /v1/code/*, GET /v1/agents/approvals/{id}, GET /v1/agents/whoami and DELETE /v1/agents/session-tokens/{id} for its own id."
+      }
+    },
+    "parameters": {
+      "RunID": {
+        "name": "id",
+        "in": "path",
+        "required": true,
+        "description": "The run id from the run view.",
+        "schema": { "type": "string", "examples": ["cr_…"] }
+      },
+      "Server": {
+        "name": "server",
+        "in": "path",
+        "required": true,
+        "description": "The server identifier as `listToolFiles` shows it.",
+        "schema": { "type": "string" }
+      },
+      "Tool": {
+        "name": "tool",
+        "in": "path",
+        "required": true,
+        "description": "The tool identifier as `listToolFiles` shows it.",
+        "schema": { "type": "string" }
+      },
+      "PreferWait": {
+        "name": "Prefer",
+        "in": "header",
+        "required": false,
+        "description": "`wait=<seconds>`, 0–60: default 25 on `POST /v1/code/run` (`wait_seconds` in a JSON body wins) and on a resume, 0 on `GET`. A larger value counts as 60. The server answers when the run reaches a final or held status, or when the wait ends, whichever is first.",
+        "schema": { "type": "string", "pattern": "^wait=([0-9]|[1-5][0-9]|60)$", "examples": ["wait=25"] }
+      },
+      "IdempotencyKey": {
+        "name": "Idempotency-Key",
+        "in": "header",
+        "required": false,
+        "description": "1–128 printable ASCII characters, scoped to the agent. The same key with the same script and reason returns the existing run and runs nothing new; with a different script or reason it is `422 idempotency_key_reused`.",
+        "schema": { "type": "string", "minLength": 1, "maxLength": 128, "pattern": "^[\\x20-\\x7E]+$" }
+      },
+      "ToolyardReason": {
+        "name": "X-Toolyard-Reason",
+        "in": "header",
+        "required": false,
+        "description": "Why the script runs, for the audit record. Required with `Content-Type: text/x-starlark`; a JSON body carries `reason` instead.",
+        "schema": { "type": "string", "minLength": 20, "maxLength": 2000 }
+      }
+    },
+    "headers": {
+      "Location": {
+        "description": "`/v1/code/runs/{id}`: read it with `Prefer: wait`.",
+        "schema": { "type": "string" }
+      },
+      "RetryAfter": {
+        "description": "Seconds to wait before trying again.",
+        "schema": { "type": "integer", "minimum": 0 }
+      }
+    },
+    "responses": {
+      "RunFinished": {
+        "description": "`succeeded` or `failed`: the run reached a final status.",
+        "content": {
+          "application/json": {
+            "schema": { "$ref": "#/components/schemas/RunView" }
+          }
+        }
+      },
+      "RunPending": {
+        "description": "`deferred` (a legacy approval is pending), or `queued` or `running` (the wait ended first). The run continues on the server; read the `Location` with `Prefer: wait`.",
+        "headers": {
+          "Location": { "$ref": "#/components/headers/Location" }
+        },
+        "content": {
+          "application/json": {
+            "schema": { "$ref": "#/components/schemas/RunView" }
+          }
+        }
+      },
+      "RunHeld": {
+        "description": "`permission_required`: a call needs the owner's approval and the run view's `held` names it; submit `held.draft` as an Inbox request, then resume with its `request_id`. An operator token, or a session token outside its routes, gets an Error instead.",
+        "content": {
+          "application/json": {
+            "schema": {
+              "oneOf": [
+                { "$ref": "#/components/schemas/RunView" },
+                { "$ref": "#/components/schemas/Error" }
+              ]
+            }
+          }
+        }
+      },
+      "RunOutcomeUnknown": {
+        "description": "`outcome_unknown`: a call may have committed upstream. Reconcile its state; never repeat it blindly.",
+        "content": {
+          "application/json": {
+            "schema": { "$ref": "#/components/schemas/RunView" }
+          }
+        }
+      },
+      "Text": {
+        "description": "Plain text.",
+        "content": {
+          "text/plain": {
+            "schema": { "type": "string" }
+          }
+        }
+      },
+      "BadRequest": {
+        "description": "Bad input.",
+        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+      },
+      "Unauthorized": {
+        "description": "No token, or a bad, expired or revoked one.",
+        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+      },
+      "Forbidden": {
+        "description": "An operator token, or a session token outside its routes.",
+        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+      },
+      "NotFound": {
+        "description": "Unknown, or another agent's.",
+        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+      },
+      "PayloadTooLarge": {
+        "description": "The script is over 1 MiB.",
+        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+      },
+      "UnsupportedMediaType": {
+        "description": "A content type other than text/x-starlark or application/json.",
+        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+      },
+      "Unprocessable": {
+        "description": "`idempotency_key_reused` (the key was used with a different script or reason), or `run_not_held`: a resume of a run that is not held (the body then carries the run's `status`).",
+        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+      },
+      "Busy": {
+        "description": "Code mode is busy. No run is created; try again after `Retry-After` seconds.",
+        "headers": {
+          "Retry-After": { "$ref": "#/components/headers/RetryAfter" }
+        },
+        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+      },
+      "Unavailable": {
+        "description": "The server is restarting, or the token could not be checked. Nothing was started; try again after `Retry-After` seconds.",
+        "headers": {
+          "Retry-After": { "$ref": "#/components/headers/RetryAfter" }
+        },
+        "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
+      }
+    },
+    "schemas": {
+      "SessionTokenRequest": {
+        "type": "object",
+        "required": ["session_id"],
+        "additionalProperties": false,
+        "properties": {
+          "session_id": {
+            "type": "string",
+            "minLength": 1,
+            "maxLength": 128,
+            "pattern": "^[\\x20-\\x7E]+$",
+            "description": "1–128 printable ASCII characters. It becomes the verified client session id in the audit of every call made with the token."
+          },
+          "ttl_seconds": {
+            "type": "integer",
+            "minimum": 60,
+            "maximum": 3600,
+            "default": 3600,
+            "description": "Lifetime in seconds. The server never issues a longer one."
+          }
+        }
+      },
+      "SessionToken": {
+        "type": "object",
+        "required": ["token", "token_id", "agent_id", "session_id", "expires_at"],
+        "properties": {
+          "token": {
+            "type": "string",
+            "description": "`tys_<id>.<secret>`. Write it to a file only you can read; never print or log it.",
+            "examples": ["tys_st_9f2c….<secret>"]
+          },
+          "token_id": { "type": "string", "examples": ["st_9f2c…"] },
+          "agent_id": { "type": "string", "examples": ["ag_…"] },
+          "session_id": { "type": "string", "examples": ["t3-thread-123"] },
+          "expires_at": {
+            "type": "integer",
+            "description": "Unix time in milliseconds.",
+            "examples": [1792200000000]
+          }
+        }
+      },
+      "RunRequest": {
+        "type": "object",
+        "required": ["code", "reason"],
+        "additionalProperties": false,
+        "properties": {
+          "code": { "type": "string", "description": "The script, at most 1 MiB." },
+          "reason": {
+            "type": "string",
+            "minLength": 20,
+            "maxLength": 2000,
+            "description": "Why the script runs, for the audit record."
+          },
+          "wait_seconds": {
+            "type": "integer",
+            "minimum": 0,
+            "maximum": 60,
+            "default": 25,
+            "description": "How long to wait for a final or held status. Wins over `Prefer: wait`."
+          }
+        }
+      },
+      "ResumeRequest": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "request_id": {
+            "type": "string",
+            "description": "The approved Inbox request that covers the held call. Omit it for a `deferred` legacy approval.",
+            "examples": ["rq_…"]
+          }
+        }
+      },
+      "RunStatus": {
+        "type": "string",
+        "enum": ["queued", "running", "succeeded", "failed", "permission_required", "deferred", "outcome_unknown"]
+      },
+      "RunError": {
+        "type": "object",
+        "required": ["kind", "message"],
+        "description": "Set when the run is `failed` or `outcome_unknown`.",
+        "properties": {
+          "kind": {
+            "type": "string",
+            "description": "Kinds include script_error, tool_error, timeout, limit, script_diverged, grant_invalid, busy, outcome_unknown, internal and interrupted (the server stopped: a queued run is failed with it, a running one outcome_unknown).",
+            "examples": ["script_error", "tool_error", "timeout", "limit", "script_diverged", "grant_invalid", "busy", "outcome_unknown", "internal", "interrupted"]
+          },
+          "message": { "type": "string" }
+        }
+      },
+      "Call": {
+        "type": "object",
+        "required": ["seq", "tool", "status", "replayed", "started_at"],
+        "properties": {
+          "seq": { "type": "integer", "minimum": 1 },
+          "tool": {
+            "type": "string",
+            "description": "The tool's catalog name.",
+            "examples": ["context7.resolve-library-id"]
+          },
+          "status": {
+            "type": "string",
+            "enum": ["succeeded", "failed", "permission_required", "deferred", "outcome_unknown"]
+          },
+          "replayed": {
+            "type": "boolean",
+            "description": "True when a resume answered the call from the call record instead of sending it upstream again."
+          },
+          "started_at": { "type": "integer", "description": "Unix time in milliseconds." },
+          "finished_at": { "type": ["integer", "null"], "description": "Unix time in milliseconds." }
+        }
+      },
+      "Held": {
+        "type": "object",
+        "required": ["seq", "tool", "status"],
+        "description": "Set when the run is `permission_required` or `deferred`: the call that stopped it.",
+        "properties": {
+          "seq": { "type": "integer", "minimum": 1 },
+          "tool": { "type": "string", "examples": ["github.merge_pull_request"] },
+          "status": { "type": "string", "enum": ["permission_required", "deferred"] },
+          "draft": {
+            "type": ["object", "null"],
+            "description": "The Inbox request draft the gateway returned. Complete it and submit it (from code, toolyard.inbox_request), then resume with the request id."
+          },
+          "approval_id": {
+            "type": ["string", "null"],
+            "description": "Set for a legacy deferred approval; resume with no body after the owner decided."
+          },
+          "message": {
+            "type": "string",
+            "description": "The gateway's text for the call: what to do next."
+          }
+        }
+      },
+      "Links": {
+        "type": "object",
+        "required": ["self"],
+        "properties": {
+          "self": { "type": "string", "examples": ["/v1/code/runs/cr_…"] },
+          "resume": { "type": "string", "examples": ["/v1/code/runs/cr_…/resume"] }
+        }
+      },
+      "RunView": {
+        "type": "object",
+        "required": ["run_id", "status", "created_at", "updated_at", "links"],
+        "properties": {
+          "run_id": { "type": "string", "examples": ["cr_…"] },
+          "status": { "$ref": "#/components/schemas/RunStatus" },
+          "result": { "description": "The JSON value the script assigned to `result`; null when none." },
+          "error": {
+            "oneOf": [
+              { "$ref": "#/components/schemas/RunError" },
+              { "type": "null" }
+            ]
+          },
+          "logs": {
+            "type": "array",
+            "items": { "type": "string" },
+            "description": "print() output, one entry per line."
+          },
+          "calls": {
+            "type": "array",
+            "items": { "$ref": "#/components/schemas/Call" }
+          },
+          "held": {
+            "oneOf": [
+              { "$ref": "#/components/schemas/Held" },
+              { "type": "null" }
+            ]
+          },
+          "created_at": { "type": "integer", "description": "Unix time in milliseconds." },
+          "updated_at": { "type": "integer", "description": "Unix time in milliseconds." },
+          "links": { "$ref": "#/components/schemas/Links" }
+        },
+        "examples": [
+          {
+            "run_id": "cr_…",
+            "status": "succeeded",
+            "result": { "any": "json" },
+            "error": null,
+            "logs": ["print output"],
+            "calls": [
+              {
+                "seq": 1,
+                "tool": "context7.resolve-library-id",
+                "status": "succeeded",
+                "replayed": false,
+                "started_at": 1792200000000,
+                "finished_at": 1792200000800
+              }
+            ],
+            "held": null,
+            "created_at": 1792200000000,
+            "updated_at": 1792200000900,
+            "links": { "self": "/v1/code/runs/cr_…", "resume": "/v1/code/runs/cr_…/resume" }
+          }
+        ]
+      },
+      "Error": {
+        "type": "object",
+        "required": ["error"],
+        "properties": {
+          "error": {
+            "type": "string",
+            "description": "A short message, or a code such as idempotency_key_reused."
+          }
+        }
+      }
+    }
+  }
+}

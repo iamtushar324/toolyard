@@ -31,12 +31,16 @@ type sink interface {
 }
 
 // scriptResult is what one run produced: a JSON result, or an error of
-// kind "syntax" or "runtime".
+// kind "syntax" or "runtime". cause is the structured run's error kind
+// when the side that failed the run knows it (ErrorTimeout, ErrorLimit,
+// ErrorInternal, ErrorBusy); "" leaves it to the caller (a failed tool
+// call, or a script error).
 type scriptResult struct {
 	result    json.RawMessage
 	hasResult bool
 	errKind   string
 	errMsg    string
+	cause     string
 }
 
 // runScript binds the servers and executes code under the limits. stopNote
@@ -57,9 +61,16 @@ func runScript(ctx context.Context, start startMsg, s sink, stopNote string) scr
 		predeclared[srv.Ident] = starlarkstruct.FromStringDict(starlark.String(srv.Ident), members)
 	}
 
+	// stepsHit records that the step limit, not the script, ended the run.
+	// OnMaxSteps runs on the interpreter's goroutine, which is this one.
+	stepsHit := false
 	thread := &starlark.Thread{
 		Name:  "codemode",
 		Print: func(_ *starlark.Thread, msg string) { s.print(msg) },
+		OnMaxSteps: func(th *starlark.Thread) {
+			stepsHit = true
+			th.Cancel("too many steps")
+		},
 	}
 	thread.SetMaxExecutionSteps(start.Limits.MaxSteps)
 	// The wall clock stops the interpreter too, not only the next nested
@@ -85,7 +96,14 @@ func runScript(ctx context.Context, start startMsg, s sink, stopNote string) scr
 	if err != nil {
 		kind, msg := classifyError(err)
 		// fail("m" * (9 << 20)) must not become a message no pipe carries.
-		return scriptResult{errKind: kind, errMsg: cut(msg, maxErrorBytes, "… [error message truncated at 64 KiB]")}
+		res := scriptResult{errKind: kind, errMsg: cut(msg, maxErrorBytes, "… [error message truncated at 64 KiB]")}
+		switch {
+		case ctx.Err() != nil:
+			res.cause = ErrorTimeout
+		case stepsHit:
+			res.cause = ErrorLimit
+		}
+		return res
 	}
 	v, ok := globals["result"]
 	if !ok || v == starlark.None {
@@ -96,7 +114,7 @@ func runScript(ctx context.Context, start startMsg, s sink, stopNote string) scr
 		return scriptResult{errKind: "runtime", errMsg: "result cannot be returned: " + err.Error()}
 	}
 	tooBig := func(n int) scriptResult {
-		return scriptResult{errKind: "runtime", errMsg: fmt.Sprintf(
+		return scriptResult{errKind: "runtime", cause: ErrorLimit, errMsg: fmt.Sprintf(
 			"result is %d bytes; a returned value may be at most %d MiB (the response is truncated there anyway). Return less, or print a summary and return the key fields",
 			n, maxResultBytes>>20)}
 	}

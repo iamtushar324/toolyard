@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"regexp"
 	"strings"
@@ -37,6 +38,27 @@ func (r *Runtime) ExecuteToolCode(ctx context.Context, code, reason string) (tex
 	if code == "" {
 		return "code parameter is required and must be a non-empty string", true
 	}
+	ex := r.execute(ctx, code, reason, nil, false)
+	return r.render(code, ex.cat.idents(), ex.s.snapshotLogs(), ex.res)
+}
+
+// execution is one finished script: the catalog it ran against, the
+// session that made its calls, and its outcome.
+type execution struct {
+	cat *catalog
+	s   *session
+	res scriptResult
+}
+
+// execute runs code for the ctx caller; code is trimmed and non-empty.
+// structured marks a Run: the caller already holds a concurrency slot,
+// hooks (when set) wrap every nested call, and the session keeps the call
+// records and print lines a RunResult returns. Otherwise (ExecuteToolCode)
+// a worker run takes a slot itself, or reports code mode busy.
+func (r *Runtime) execute(ctx context.Context, code, reason string, hooks CallHooks, structured bool) execution {
+	if !structured {
+		hooks = nil
+	}
 	if strings.TrimSpace(reason) == "" {
 		reason = deriveReason(code)
 	}
@@ -49,30 +71,69 @@ func (r *Runtime) ExecuteToolCode(ctx context.Context, code, reason string) (tex
 	runCtx, cancel := context.WithTimeout(ctx, r.limits.ScriptTimeout)
 	defer cancel()
 
-	s := &session{r: r, ctx: runCtx, reason: reason, cat: cat}
+	s := &session{r: r, ctx: runCtx, reason: reason, cat: cat, hooks: hooks, record: structured}
 	start := startMsg{Type: msgStart, Code: code, Servers: cat.wire(), Limits: r.limits}
 	var res scriptResult
-	if r.inProcess {
+	switch {
+	case r.inProcess:
 		res = runScript(runCtx, start, s, stopNote)
-	} else {
+	case structured:
+		res = r.runWorker(runCtx, s, start, stopNote)
+	default:
 		res = r.runInWorker(runCtx, s, start, stopNote)
 	}
-	return r.render(code, cat.idents(), s.snapshotLogs(), res)
+	return execution{cat: cat, s: s, res: res}
 }
 
 // session is the parent's state for one script: the print log, the call
-// budget, and how nested calls are made.
+// budget, how nested calls are made, and, for a structured run, the call
+// records and the call that stopped the run.
 type session struct {
 	r      *Runtime
 	ctx    context.Context
 	reason string
 	cat    *catalog
+	// hooks wrap each nested call (Run only; nil otherwise).
+	hooks CallHooks
+	// record keeps call records and print lines for a RunResult.
+	record bool
 
 	mu        sync.Mutex
 	logs      []string
 	logBytes  int
 	truncated bool
 	calls     int
+
+	// prints are the print() lines alone, for RunResult.Logs.
+	prints     []string
+	printBytes int
+	printsCut  bool
+	// records are the calls that got a sequence number, in order.
+	records []*callState
+	// stop is the call outcome that ended the script; once set, no other
+	// call is made, whatever the worker asks.
+	stop *callStop
+	// sealed is set when Run has taken its snapshot: a call still running
+	// then gets no AfterCall, and nothing more is sent.
+	sealed bool
+	// hookWG counts hook invocations in progress, so Run returns only
+	// once none is running.
+	hookWG sync.WaitGroup
+}
+
+// callState is one recorded call while the run goes on.
+type callState struct {
+	rec  CallRecord
+	sent bool // RouteCall was entered
+	done bool // the call has its final status
+}
+
+// callStop is the outcome of the call that ended the script.
+type callStop struct {
+	status string // the run status it implies
+	kind   string // the run's error kind ("" for a held call)
+	msg    string
+	held   *HeldCall
 }
 
 // handleCall performs one nested call for the script. Every failure is
@@ -81,23 +142,36 @@ type session struct {
 // failures: in a worker run the call has its own goroutine, where an
 // unrecovered panic would end the whole gateway.
 func (s *session) handleCall(serverIdent, member string, args map[string]any) (reply parentMsg) {
+	var st *callState
+	sent := false
 	defer func() {
 		if r := recover(); r != nil {
 			goroutines.Report(nestedCallLoop, r)
-			reply = parentMsg{Error: fmt.Sprintf("tool call failed for %s.%s: the gateway hit an internal error during the call; its outcome is unknown, so check before you repeat a write", serverIdent, member)}
+			if sent {
+				reply = parentMsg{Error: fmt.Sprintf("tool call failed for %s.%s: the gateway hit an internal error during the call; its outcome is unknown, so check before you repeat a write", serverIdent, member)}
+				s.finish(st, StatusOutcomeUnknown, &callStop{status: StatusOutcomeUnknown, kind: ErrorOutcomeUnknown, msg: reply.Error})
+				return
+			}
+			reply = parentMsg{Error: fmt.Sprintf("tool call failed for %s.%s: an internal error stopped the call before it was made", serverIdent, member)}
+			s.finish(st, StatusFailed, &callStop{status: StatusFailed, kind: ErrorInternal, msg: reply.Error})
 		}
 	}()
-	fail := func(msg string) parentMsg { return parentMsg{Error: msg} }
+	// fail aborts the script for a reason found before a call record
+	// exists; kind is the structured run's error kind.
+	fail := func(kind, msg string) parentMsg {
+		s.stopRun(&callStop{status: StatusFailed, kind: kind, msg: msg})
+		return parentMsg{Error: msg}
+	}
 	srv := s.cat.byIdent(serverIdent)
 	if srv == nil {
-		return fail(fmt.Sprintf("tool call failed: unknown server %q", serverIdent))
+		return fail(ErrorScriptError, fmt.Sprintf("tool call failed: unknown server %q", serverIdent))
 	}
 	b, ok := srv.byIdent[member]
 	if !ok {
 		if names, amb := srv.ambiguous[canonicalName(member)]; amb {
-			return fail(ambiguityError(srv.ident, member, names).Error())
+			return fail(ErrorScriptError, ambiguityError(srv.ident, member, names).Error())
 		}
-		return fail(fmt.Sprintf("tool call failed: %s has no tool %q", srv.ident, member))
+		return fail(ErrorScriptError, fmt.Sprintf("tool call failed: %s has no tool %q", srv.ident, member))
 	}
 	t := b.tool
 	label := srv.ident + "." + strings.ReplaceAll(t.Name, "-", "_")
@@ -106,16 +180,26 @@ func (s *session) handleCall(serverIdent, member string, args map[string]any) (r
 	}
 
 	s.mu.Lock()
+	if s.stop != nil || s.sealed {
+		// An honest script never gets here: a failed call aborts it. A
+		// worker that keeps calling anyway is refused.
+		s.mu.Unlock()
+		return parentMsg{Error: fmt.Sprintf("tool call failed for %s: the script already stopped", label)}
+	}
 	s.calls++
 	n := s.calls
 	s.mu.Unlock()
 	if n > s.r.limits.MaxCalls {
 		msg := fmt.Sprintf("this script already made %d tool calls, the limit for one executeToolCode run; split the work across runs", s.r.limits.MaxCalls)
 		s.log(fmt.Sprintf("[TOOL] %s error: %s", label, msg))
-		return fail(fmt.Sprintf("tool call failed for %s: %s", label, msg))
+		return fail(ErrorLimit, fmt.Sprintf("tool call failed for %s: %s", label, msg))
 	}
 	if err := s.ctx.Err(); err != nil {
-		return fail(fmt.Sprintf("tool call failed for %s: script stopped: %v", label, err))
+		return fail(ErrorTimeout, fmt.Sprintf("tool call failed for %s: script stopped: %v", label, err))
+	}
+	var scriptArgs map[string]any
+	if s.record {
+		scriptArgs = scriptArgsOf(args)
 	}
 	if field := t.ReasonField; field != "" {
 		switch given := args[field].(type) {
@@ -127,14 +211,67 @@ func (s *session) handleCall(serverIdent, member string, args map[string]any) (r
 			}
 		default:
 			s.log(fmt.Sprintf("[TOOL] %s error: %s must be a string", label, field))
-			return fail(fmt.Sprintf("tool call failed for %s: %s must be a string", label, field))
+			return fail(ErrorScriptError, fmt.Sprintf("tool call failed for %s: %s must be a string", label, field))
 		}
 	}
 
-	res, err := s.r.caller.RouteCall(s.ctx, Via, t.Target, args)
+	pc := PendingCall{Seq: n, Tool: t.Server + "." + t.Name, Target: t.Target, Args: args, ScriptArgs: scriptArgs, ReasonField: t.ReasonField}
+	st, err := s.begin(pc)
 	if err != nil {
+		return parentMsg{Error: fmt.Sprintf("tool call failed for %s: %v", label, err)}
+	}
+
+	var res *mcp.CallToolResult
+	handled := false
+	if s.hooks != nil {
+		var herr error
+		res, handled, herr = s.beforeCall(&pc)
+		if herr != nil {
+			status, kind := StatusFailed, ErrorInternal
+			var ce *CallError
+			if errors.As(herr, &ce) && ce.Kind != "" {
+				kind = ce.Kind
+				if ce.Kind == ErrorOutcomeUnknown {
+					status = StatusOutcomeUnknown
+				}
+			}
+			msg := fmt.Sprintf("tool call failed for %s: %v", label, herr)
+			s.log(fmt.Sprintf("[TOOL] %s error: %v", label, herr))
+			s.finish(st, status, &callStop{status: status, kind: kind, msg: msg})
+			return parentMsg{Error: msg}
+		}
+		if handled && st != nil {
+			s.mu.Lock()
+			st.rec.Replayed = true
+			s.mu.Unlock()
+		}
+	}
+
+	if !handled {
+		if err := s.ctx.Err(); err != nil || s.isSealed() {
+			if err == nil {
+				err = context.Canceled
+			}
+			msg := fmt.Sprintf("tool call failed for %s: script stopped: %v", label, err)
+			s.finish(st, StatusFailed, &callStop{status: StatusFailed, kind: ErrorTimeout, msg: msg})
+			return parentMsg{Error: msg}
+		}
+		sent = true
+		s.markSent(st)
+		res, err = s.r.caller.RouteCall(s.ctx, Via, t.Target, pc.Args)
+	}
+	// Only a structured run reads the answer beyond the text the script
+	// gets; executeToolCode's behaviour and output stay Bifrost's.
+	var out callOutcome
+	if s.record {
+		out = classify(res, err, pc.Args, !handled && s.ctx.Err() != nil)
+	}
+
+	if err != nil {
+		msg := fmt.Sprintf("tool call failed for %s: %v", label, err)
 		s.log(fmt.Sprintf("[TOOL] %s error: %v", label, err))
-		return fail(fmt.Sprintf("tool call failed for %s: %v", label, err))
+		s.complete(st, pc, out, res, err, msg, handled)
+		return parentMsg{Error: msg}
 	}
 	text := resultText(res, t.Name)
 	if res != nil && (res.IsError || held(res)) {
@@ -142,7 +279,26 @@ func (s *session) handleCall(serverIdent, member string, args map[string]any) (r
 		// or sent, so a huge error result is still a clean abort.
 		text = cut(text, maxErrorBytes, "… [error text truncated at 64 KiB]")
 		s.log(fmt.Sprintf("[TOOL] %s error result: %s", label, text))
-		return fail(fmt.Sprintf("tool call failed for %s: %s", label, text))
+		msg := fmt.Sprintf("tool call failed for %s: %s", label, text)
+		if s.record && out.status == StatusSucceeded {
+			// A failed result the classifier did not place.
+			out = callOutcome{status: StatusFailed, runStatus: StatusFailed, kind: ErrorToolError}
+		}
+		if out.status == StatusPermissionRequired || out.status == StatusDeferred {
+			out.held = heldCall(pc, out.status, res, text)
+		}
+		s.complete(st, pc, out, res, nil, msg, handled)
+		return parentMsg{Error: msg}
+	}
+	if out.status == StatusOutcomeUnknown {
+		// A result that reads as successful but reports an unknown outcome
+		// (a legacy _approval_id resume of such an approval): the script
+		// must not carry on as if the write had run.
+		text = cut(text, maxErrorBytes, "… [error text truncated at 64 KiB]")
+		s.log(fmt.Sprintf("[TOOL] %s error result: %s", label, text))
+		msg := fmt.Sprintf("tool call failed for %s: %s", label, text)
+		s.complete(st, pc, out, res, nil, msg, handled)
+		return parentMsg{Error: msg}
 	}
 	quoted, err := jsonText(text, "")
 	if err != nil || len(quoted) > maxCallResultBytes {
@@ -151,10 +307,127 @@ func (s *session) handleCall(serverIdent, member string, args map[string]any) (r
 		msg := fmt.Sprintf("the result is %d bytes (%d as JSON text), more than code mode passes to a script (limit %d MiB); ask the tool for less data, or page through it",
 			len(text), len(quoted), maxCallResultBytes>>20)
 		s.log(fmt.Sprintf("[TOOL] %s error: %s", label, msg))
-		return fail(fmt.Sprintf("tool call failed for %s: %s", label, msg))
+		// The call itself succeeded; the run stops on the size limit.
+		out.runStatus, out.kind = StatusFailed, ErrorLimit
+		s.complete(st, pc, out, res, nil, fmt.Sprintf("tool call failed for %s: %s", label, msg), handled)
+		return parentMsg{Error: fmt.Sprintf("tool call failed for %s: %s", label, msg)}
 	}
 	s.log(fmt.Sprintf("[TOOL] %s raw response: %s", label, quoted))
+	out.text = text
+	s.complete(st, pc, out, res, nil, "", handled)
 	return parentMsg{Text: text}
+}
+
+// begin gives a structured run's call its record. It refuses the call
+// when Run has already sealed the session.
+func (s *session) begin(pc PendingCall) (*callState, error) {
+	if !s.record {
+		return nil, nil
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.sealed {
+		return nil, errors.New("script stopped")
+	}
+	st := &callState{rec: CallRecord{Seq: pc.Seq, Tool: pc.Tool, Target: pc.Target, StartedAt: nowMS()}}
+	s.records = append(s.records, st)
+	if s.hooks != nil {
+		s.hookWG.Add(1) // for BeforeCall
+	}
+	return st, nil
+}
+
+// beforeCall runs the BeforeCall hook; begin counted it in hookWG.
+func (s *session) beforeCall(pc *PendingCall) (*mcp.CallToolResult, bool, error) {
+	defer s.hookWG.Done()
+	return s.hooks.BeforeCall(s.ctx, pc)
+}
+
+func (s *session) markSent(st *callState) {
+	if st == nil {
+		return
+	}
+	s.mu.Lock()
+	st.sent = true
+	s.mu.Unlock()
+}
+
+func (s *session) isSealed() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.sealed
+}
+
+// stopRun records the outcome that ends the script, unless one already
+// did.
+func (s *session) stopRun(stop *callStop) {
+	if stop == nil {
+		return
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.stop == nil {
+		s.stop = stop
+	}
+}
+
+// finish gives st its final status (unless Run sealed the session
+// first) and records stop, when set, as the outcome that ends the script.
+func (s *session) finish(st *callState, status string, stop *callStop) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if st != nil && !st.done && !s.sealed {
+		st.rec.Status = status
+		st.rec.FinishedAt = nowMS()
+		st.done = true
+	}
+	if stop != nil && s.stop == nil {
+		s.stop = stop
+	}
+}
+
+// complete closes a call that got an answer (from the gateway, or from
+// BeforeCall's record): its record, the stop it implies, and AfterCall
+// for a call the gateway answered. failMsg is the text that aborts the
+// script, "" when the script carries on.
+func (s *session) complete(st *callState, pc PendingCall, out callOutcome, res *mcp.CallToolResult, err error, failMsg string, handled bool) {
+	var stop *callStop
+	if failMsg != "" {
+		stop = &callStop{status: out.runStatus, kind: out.kind, msg: failMsg, held: out.held}
+		if stop.status == "" {
+			stop.status = StatusFailed
+		}
+	}
+	callAfter := false
+	s.mu.Lock()
+	if st != nil && !st.done && !s.sealed {
+		st.rec.Status = out.status
+		st.rec.FinishedAt = nowMS()
+		st.done = true
+		if s.hooks != nil && !handled {
+			s.hookWG.Add(1)
+			callAfter = true
+		}
+	}
+	if stop != nil && s.stop == nil {
+		s.stop = stop
+	}
+	var rec CallRecord
+	if st != nil {
+		rec = st.rec
+	}
+	s.mu.Unlock()
+	if callAfter {
+		s.afterCall(pc, CallOutcome{Record: rec, Result: res, Err: err, Text: out.text, Message: failMsg})
+	}
+}
+
+// afterCall runs the AfterCall hook on a context the script's clock does
+// not cancel, so the hook can still record a call the clock cut short;
+// complete counted it in hookWG.
+func (s *session) afterCall(pc PendingCall, out CallOutcome) {
+	defer s.hookWG.Done()
+	s.hooks.AfterCall(context.WithoutCancel(s.ctx), pc, out)
 }
 
 // call and print make a session the in-process script's sink.
@@ -162,7 +435,29 @@ func (s *session) call(server, member string, args map[string]any) parentMsg {
 	return s.handleCall(server, member, args)
 }
 
-func (s *session) print(text string) { s.log(text) }
+func (s *session) print(text string) {
+	s.log(text)
+	if s.record {
+		s.keepPrint(text)
+	}
+}
+
+// keepPrint appends one print() line to a structured run's Logs, up to
+// the output limit.
+func (s *session) keepPrint(text string) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.printsCut {
+		return
+	}
+	if s.printBytes+len(text) > s.r.limits.MaxOutputBytes {
+		s.printsCut = true
+		s.prints = append(s.prints, fmt.Sprintf("[print output truncated: %d byte limit reached]", s.r.limits.MaxOutputBytes))
+		return
+	}
+	s.printBytes += len(text) + 1
+	s.prints = append(s.prints, text)
+}
 
 // log appends one line, up to the output limit.
 func (s *session) log(msg string) {

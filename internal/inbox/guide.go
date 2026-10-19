@@ -25,6 +25,7 @@ var guideSections = map[int]string{
 	10: "updates",
 	11: "never",
 	12: "examples",
+	13: "fallback",
 }
 
 var topicAliases = map[string]string{
@@ -32,6 +33,7 @@ var topicAliases = map[string]string{
 	"params": "tools", "parameters": "tools", "audio": "voice", "voice-note": "voice", "evidence": "attachments",
 	"media": "attachments", "dry_run": "dry-run", "dryrun": "dry-run", "wait": "grants", "waiting": "grants",
 	"grant": "grants", "update": "updates", "done": "updates", "example": "examples",
+	"rest": "fallback", "backup": "fallback", "ty": "fallback", "curl": "fallback",
 }
 
 var sectionHead = regexp.MustCompile(`(?m)^## (\d+)\. `)

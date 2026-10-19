@@ -38,6 +38,9 @@
 //
 //	POST /v1/push/subscribe       browser PushSubscription
 //	GET  /v1/push/vapid_key
+//
+//	POST /v1/agents/session-tokens          agent: mint a session token
+//	POST /v1/code/run                       code mode over REST (code_routes.go)
 package api
 
 import (
@@ -61,6 +64,7 @@ import (
 	"github.com/tusharbhardwaj/toolyard/internal/callbacks"
 	"github.com/tusharbhardwaj/toolyard/internal/clerk"
 	"github.com/tusharbhardwaj/toolyard/internal/codemode"
+	"github.com/tusharbhardwaj/toolyard/internal/coderuns"
 	"github.com/tusharbhardwaj/toolyard/internal/federation"
 	"github.com/tusharbhardwaj/toolyard/internal/gateway"
 	"github.com/tusharbhardwaj/toolyard/internal/hooks"
@@ -158,6 +162,9 @@ type Server struct {
 	connect *connectConfig
 	// probes answers /v1/livez and /v1/readyz (and their aliases).
 	probes *ops.Prober
+	// codeRuns backs the code routes (/v1/code/*, code_routes.go); nil
+	// answers 503.
+	codeRuns *coderuns.Service
 }
 
 type Options struct {
@@ -249,6 +256,9 @@ type Options struct {
 	// Probes answers the liveness and readiness probes. nil uses a
 	// prober over ops.Default with no database, which is never ready.
 	Probes *ops.Prober
+	// CodeRuns backs code mode over REST (/v1/code/*). Optional; without
+	// it the run routes answer 503.
+	CodeRuns *coderuns.Service
 }
 
 func New(ctx context.Context, opts Options) *Server {
@@ -292,6 +302,7 @@ func New(ctx context.Context, opts Options) *Server {
 		access:          opts.Access,
 		ownerEmail:      strings.TrimSpace(opts.OwnerEmail),
 		clerkOwnerOnly:  opts.ClerkOwnerOnly,
+		codeRuns:        opts.CodeRuns,
 	}
 	if s.webhookMaxBytes <= 0 {
 		s.webhookMaxBytes = DefaultWebhookMaxBytes
@@ -455,6 +466,8 @@ func (s *Server) Routes(mux *http.ServeMux) {
 	s.uploadRoutes(mux)
 	s.passkeyRoutes(mux)
 	s.identityKeyRoutes(mux)
+	s.registerSessionTokenRoutes(mux)
+	s.registerCodeRoutes(mux)
 }
 
 // ---- helpers ----------------------------------------------------------------

@@ -51,6 +51,7 @@ import (
 	"github.com/tusharbhardwaj/toolyard/internal/chatnotify/telegram"
 	"github.com/tusharbhardwaj/toolyard/internal/clerk"
 	"github.com/tusharbhardwaj/toolyard/internal/codemode"
+	"github.com/tusharbhardwaj/toolyard/internal/coderuns"
 	"github.com/tusharbhardwaj/toolyard/internal/crashdump"
 	"github.com/tusharbhardwaj/toolyard/internal/events"
 	"github.com/tusharbhardwaj/toolyard/internal/federation"
@@ -566,7 +567,6 @@ func runServe(argv []string) error {
 	autoApprover := autoapproval.New(db, metricsReader, settingsSvc)
 	bus.SetAutoApprover(autoApprover)
 	goroutines.Loop(ctx, loopAutoApproval, time.Hour, func(ctx context.Context) { autoApprover.RunProposer(ctx, time.Hour) })
-	goroutines.Loop(ctx, loopSessionPurger, time.Hour, func(ctx context.Context) { runSessionPurger(ctx, idSvc) })
 
 	// Background analytics jobs: anomaly detection, reason quality
 	// scoring, retention compaction. All best-effort — failures log and
@@ -857,6 +857,17 @@ func runServe(argv []string) error {
 	gw.RegisterInboxTools()
 	log.Printf("toolyard: inbox ready (approval_mode=%s, judge=%v)",
 		settingsSvc.GetString(settings.ApprovalMode, settings.ApprovalModeExecute), inboxJudge != nil)
+
+	// Code mode over REST (TEC-1627): runs outlive their request, so the
+	// runs a stopped process left queued or running are settled before the
+	// routes serve (a running one is outcome_unknown: a call may have run).
+	codeRuns := coderuns.New(db, coderuns.Options{Engine: coderuns.GatewayEngine(gw), Grants: inboxSvc})
+	if failed, unknown, err := codeRuns.Recover(ctx); err != nil {
+		log.Printf("code runs: recover: %v", err)
+	} else if failed+unknown > 0 {
+		log.Printf("code runs: %d interrupted run(s) failed, %d marked outcome_unknown", failed, unknown)
+	}
+	goroutines.Loop(ctx, loopSessionPurger, time.Hour, func(ctx context.Context) { runSessionPurger(ctx, idSvc, codeRuns) })
 
 	upstreamSvc := upstreams.New(db, gw)
 	upstreamSvc.SetPolicy(upstreams.Policy{
@@ -1275,6 +1286,7 @@ func runServe(argv []string) error {
 		ClerkOwnerOnly:  *clerkOwnerOnly,
 		OwnerEmail:      *ownerEmail,
 		ConnectAZP:      connectOrigins,
+		CodeRuns:        codeRuns,
 	})
 
 	mux := http.NewServeMux()
@@ -1486,12 +1498,14 @@ func runServe(argv []string) error {
 			inboxSvc.ReleaseWaiters()
 			gw.ReleaseWaiters()
 			bus.ReleaseWaiters()
+			codeRuns.ReleaseWaiters()
 		},
 		stopHTTP:  httpSrv.Shutdown,
 		forceHTTP: httpSrv.Close,
 		waitExecutions: []func(context.Context){
 			func(ctx context.Context) { bus.WaitExecutions(ctx, shutdownGrace) },
 			func(ctx context.Context) { waitGrantedCalls(ctx, gw, inboxSvc, shutdownGrace) },
+			codeRuns.Wait,
 		},
 		cancelRoot: cancel,
 		closers: []shutdownCloser{
@@ -1691,22 +1705,38 @@ func runRetentionCompactor(ctx context.Context, r *metrics.Reader, set *settings
 	}
 }
 
-// runSessionPurger drops expired session rows so the table doesn't bloat.
-// Runs every 6h with a 24h grace window past expiry — long enough that a
-// laptop coming back online from a long sleep can still see its session
-// row before deletion (so the user gets a "your session expired" message
-// rather than an opaque 401 after a normal token expiry).
-func runSessionPurger(ctx context.Context, id *identity.Service) {
-	t := time.NewTicker(6 * time.Hour)
+// runSessionPurger drops expired rows so the tables don't bloat. Runs
+// hourly: dashboard sessions with a 24h grace window past expiry — long
+// enough that a laptop coming back online from a long sleep can still see
+// its session row before deletion (so the user gets a "your session
+// expired" message rather than an opaque 401 after a normal token
+// expiry) — agent session tokens an hour past expiry, and code runs older
+// than their 7-day retention (TEC-1627).
+func runSessionPurger(ctx context.Context, id *identity.Service, codeRuns *coderuns.Service) {
+	t := time.NewTicker(time.Hour)
 	defer t.Stop()
 	step := func() {
+		ok := true
 		if n, err := id.PurgeExpiredSessions(ctx, 24*time.Hour); err != nil {
+			ok = false
 			log.Printf("session purger: %v", err)
-		} else {
+		} else if n > 0 {
+			log.Printf("session purger: removed %d expired session rows", n)
+		}
+		if n, err := id.PurgeExpiredSessionTokens(ctx, time.Hour); err != nil {
+			ok = false
+			log.Printf("session purger: session tokens: %v", err)
+		} else if n > 0 {
+			log.Printf("session purger: removed %d expired session tokens", n)
+		}
+		if n, err := codeRuns.Purge(ctx); err != nil {
+			ok = false
+			log.Printf("session purger: code runs: %v", err)
+		} else if n > 0 {
+			log.Printf("session purger: removed %d code runs older than 7 days", n)
+		}
+		if ok {
 			loopDone(loopSessionPurger)
-			if n > 0 {
-				log.Printf("session purger: removed %d expired session rows", n)
-			}
 		}
 	}
 	step()

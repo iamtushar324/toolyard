@@ -19,6 +19,11 @@ import (
 //
 // The resolved user rides along in the request context so handlers'
 // requireUser/requireAdmin don't hit the database a second time.
+//
+// A session token ("tys_…") is refused with 403 on every /v1 route
+// outside its own (sessionTokenAllowed), whatever else the request
+// carries: it is a short-lived child of an agent token for code mode, not
+// a general agent credential.
 func (s *Server) RoleGuard(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !strings.HasPrefix(r.URL.Path, "/v1/") {
@@ -29,6 +34,10 @@ func (s *Server) RoleGuard(next http.Handler) http.Handler {
 		// anyone: a cookie or token riding along changes nothing.
 		if isProbeRead(r) {
 			next.ServeHTTP(w, r)
+			return
+		}
+		if tok, ok := bearerToken(r); ok && identity.IsSessionToken(tok) && !sessionTokenAllowed(r.URL.Path) {
+			writeError(w, http.StatusForbidden, "not available to session tokens")
 			return
 		}
 		// An operator token (no cookie) acts as its user, within its scopes.
@@ -56,6 +65,21 @@ func (s *Server) RoleGuard(next http.Handler) http.Handler {
 		}
 		next.ServeHTTP(w, r)
 	})
+}
+
+// sessionTokenAllowed reports whether a session token may call path: the
+// code routes, whoami, the agent's approval polling, and the session token
+// routes (whose handlers allow only revoking the token itself). Methods
+// are left to the handlers. A path that is not clean gets no benefit of
+// the doubt.
+func sessionTokenAllowed(path string) bool {
+	if path != pathpkg.Clean(path) {
+		return false
+	}
+	return strings.HasPrefix(path, codePathPrefix) ||
+		path == "/v1/agents/whoami" ||
+		strings.HasPrefix(path, "/v1/agents/approvals/") ||
+		path == sessionTokensPath || strings.HasPrefix(path, sessionTokensPrefix)
 }
 
 // isProbeRead reports a GET or HEAD of a probe route (ops.IsProbePath).
@@ -112,16 +136,17 @@ var memberRoutes = map[string]string{
 	"/v1/mcp-oauth/paste":    http.MethodPost,
 	// Bearer-token agent routes ignore cookies, so a member's browser
 	// cookie riding along must not lock them out.
-	"/v1/agents/exchange":  "*",
-	"/v1/agents/whoami":    "*",
-	"/v1/agents/tools":     "*",
-	"/v1/agents/tools/run": "*",
+	"/v1/agents/exchange":       "*",
+	"/v1/agents/whoami":         "*",
+	"/v1/agents/tools":          "*",
+	"/v1/agents/tools/run":      "*",
+	"/v1/agents/session-tokens": "*",
 }
 
 // reservedAgentSegments are the fixed routes under /v1/agents/ that must
 // never be mistaken for an agent id by the pattern match below.
 var reservedAgentSegments = map[string]bool{
-	"enroll": true, "exchange": true, "whoami": true, "tools": true, "approvals": true,
+	"enroll": true, "exchange": true, "whoami": true, "tools": true, "approvals": true, "session-tokens": true,
 }
 
 // memberAllowed reports whether a member may call method on path.
@@ -180,6 +205,11 @@ func memberAllowed(method, path string) bool {
 	}
 	// Bearer-token approval polling for the CLI.
 	if strings.HasPrefix(path, "/v1/agents/approvals/") {
+		return true
+	}
+	// Bearer-only routes (agent or session token) that never read a
+	// cookie: session tokens and code mode over REST.
+	if strings.HasPrefix(path, sessionTokensPrefix) || strings.HasPrefix(path, codePathPrefix) {
 		return true
 	}
 	// A native Inbox upload: the single-use ticket in the path is the

@@ -1935,7 +1935,7 @@ func (g *Gateway) dispatch(ctx context.Context, entry toolEntry, args map[string
 		auditWriteFailed("outcome", dispatchID, entry, auditErr)
 		ev.Outcome = metrics.OutcomeError
 		ev.ErrorClass = "audit_outcome_unknown"
-		return mcp.NewToolResultError("Tool outcome unknown: completion audit failed. Do not retry. Review dispatch " + dispatchID + " before another action."), nil
+		return outcomeUnknown(mcp.NewToolResultError("Tool outcome unknown: completion audit failed. Do not retry. Review dispatch " + dispatchID + " before another action.")), nil
 	}
 	if err != nil {
 		ev.Outcome = metrics.OutcomeError
@@ -1945,7 +1945,7 @@ func (g *Gateway) dispatch(ctx context.Context, entry toolEntry, args map[string
 				return result, nil
 			}
 		}
-		return mcp.NewToolResultErrorFromErr("tool failed", err), nil
+		return outcomeUnknown(mcp.NewToolResultErrorFromErr("tool failed", err)), nil
 	}
 
 	if g.usage != nil && !res.IsError {
@@ -2227,6 +2227,7 @@ func buildInstructions(bus *approval.Bus, inLineWait time.Duration) string {
 	b.WriteString("EXECUTION: call each accepted tool with its scoped single-use token in _grant and exactly the approved parameters. Read-only inbox.status can recover the same still-valid unused token after a lost response; it does not consume or renew permission. Never log tokens. Follow per-call reasons and owner_note. Revoked or expired grants never revive automatically. A used grant has one execution claim. Inspect its recorded outcome before any recovery. If a write times out after dispatch, outcome_unknown means it may already have committed; reconcile it and never blindly repeat it. ")
 	b.WriteString("LEGACY: already-pending approvals retain their original execution mode and Toolyard can execute them after an Inbox decision. Inspect tools.poll_approval for their saved result; never reissue the original write. This compatibility path does not apply to new requests. ")
 	b.WriteString("GITHUB: GitHub writes always require the account owner's explicit approval and never run on inbox grants or automatic policy rules. Call the GitHub tool directly to create the request; it returns a deferred approval_id. Collect the result with tools.poll_approval or tools.wait_for_approval, and never re-issue the write. Agents may propose COMMENT, REQUEST_CHANGES, or APPROVE reviews; Toolyard submits each review only after the account owner explicitly allows the request. ")
+	b.WriteString("FALLBACK: if your MCP connection to toolyard fails, run the same code over HTTPS under the same identity, policy and approvals: POST /v1/code/run with your toolyard token from TOOLYARD_TOKEN_FILE, or the ty command from GET /v1/code/ty. inbox.guide topic fallback explains it. ")
 	b.WriteString("Use tools.search and tools.execute to discover tools outside your visible catalog. After session.start, pass its id as _session_id for attribution; session identifiers do not stream a full session or grant permission.")
 	return b.String()
 }
@@ -2477,4 +2478,19 @@ func watchSlowCall(done <-chan struct{}, started time.Time, tool, upstream, agen
 				time.Since(started).Round(time.Millisecond), tier)
 		}
 	}
+}
+
+// outcomeUnknown marks a result whose call may or may not have run (the
+// upstream failed after dispatch, or the completion audit could not be
+// written), so a code-mode run ends outcome_unknown instead of failed and
+// nobody repeats a write blindly (TEC-1627). MCP clients see the same text.
+func outcomeUnknown(res *mcp.CallToolResult) *mcp.CallToolResult {
+	if res.Meta == nil {
+		res.Meta = &mcp.Meta{}
+	}
+	if res.Meta.AdditionalFields == nil {
+		res.Meta.AdditionalFields = map[string]any{}
+	}
+	res.Meta.AdditionalFields[codemode.OutcomeUnknownMarker] = true
+	return res
 }

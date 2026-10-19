@@ -131,7 +131,7 @@ func (p *pipeSink) finish(res scriptResult) error {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	if res.errKind != "" {
-		return p.send(childMsg{Type: msgError, Kind: res.errKind, Message: res.errMsg})
+		return p.send(childMsg{Type: msgError, Kind: res.errKind, Message: res.errMsg, Cause: res.cause})
 	}
 	return p.send(childMsg{Type: msgDone, Result: res.result, HasResult: res.hasResult})
 }
