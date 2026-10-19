@@ -519,10 +519,12 @@ func TestCodeStubsAndDiscovery(t *testing.T) {
 		code int
 		want string
 	}{
-		{"/v1/code/files", http.StatusOK, "servers/toolyard/memory_get.pyi"},
-		{"/v1/code/files/toolyard/memory_get.pyi", http.StatusOK, "def memory_get("},
-		{"/v1/code/docs/toolyard/memory_get", http.StatusOK, "memory_get"},
-		{"/v1/code/files/toolyard/memory_get", http.StatusNotFound, ""},
+		// The built-in fixture server is the one code-mode server this
+		// environment grants agent A (`fixture/echo.pyi` in the listing).
+		{"/v1/code/files", http.StatusOK, "echo.pyi"}, // an indented tree: servers/, fixture/, echo.pyi
+		{"/v1/code/files/fixture/echo.pyi", http.StatusOK, "def echo("},
+		{"/v1/code/docs/fixture/echo", http.StatusOK, "echo"},
+		{"/v1/code/files/fixture/echo", http.StatusNotFound, ""},
 		{"/v1/code/files/nope/tool.pyi", http.StatusNotFound, ""},
 		{"/v1/code/docs/nope/tool", http.StatusNotFound, ""},
 		{"/v1/code/files/a/b/c.pyi", http.StatusNotFound, ""},

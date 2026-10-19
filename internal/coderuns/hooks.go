@@ -3,12 +3,15 @@ package coderuns
 import (
 	"context"
 	"fmt"
+	"regexp"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/mark3labs/mcp-go/mcp"
 
 	"github.com/tusharbhardwaj/toolyard/internal/codemode"
+	"github.com/tusharbhardwaj/toolyard/internal/inbox"
 )
 
 // The gateway's argument names for an Inbox grant token and a legacy
@@ -37,7 +40,46 @@ type resumeState struct {
 type grantToken struct {
 	tool  string // the gateway target it covers
 	token string
-	used  bool
+	// params are the parameters the grant allows; with matchParams set a
+	// call takes the grant only when its arguments are within them, the
+	// way the gateway checks the grant.
+	params      map[string]inbox.Constraint
+	matchParams bool
+	used        bool
+}
+
+// gatewayMetaArgs are the arguments the gateway strips before it checks a
+// call against a grant (internal/gateway schema_wrap.go).
+var gatewayMetaArgs = []string{"_reason", "__toolyard_reason", "_intent_category", "_approval_id", "_grant", "_session_id"}
+
+// grantArgs is a call's arguments as the gateway matches them to a grant.
+func grantArgs(args map[string]any) map[string]any {
+	out := make(map[string]any, len(args))
+	for k, v := range args {
+		out[k] = v
+	}
+	for _, k := range gatewayMetaArgs {
+		delete(out, k)
+	}
+	return out
+}
+
+// rerunOnResume are read-only Inbox reads that a resume sends again
+// instead of replaying: their answers can carry live grant tokens, which
+// the call record never stores.
+var rerunOnResume = map[string]bool{"toolyard.inbox_status": true, "toolyard.inbox_wait": true}
+
+// grantTokenRE matches an Inbox grant token (tyg_<base64url id>.<base64url signature>).
+var grantTokenRE = regexp.MustCompile(`tyg_[A-Za-z0-9_.-]+`)
+
+// redactGrants removes grant tokens from text the run stores: call
+// records, the result, logs and the held call. A token is single-use and
+// agent-bound, but nothing keeps one at rest in plain text.
+func redactGrants(s string) string {
+	if !strings.Contains(s, "tyg_") {
+		return s
+	}
+	return grantTokenRE.ReplaceAllString(s, "tyg_[redacted]")
 }
 
 // seenCall is what the hooks learnt about one call of this execution.
@@ -97,6 +139,10 @@ func (h *hooks) BeforeCall(_ context.Context, c *codemode.PendingCall) (*mcp.Cal
 		case rec.Status != codemode.StatusSucceeded:
 			return nil, false, diverged("call %d (%s) ended %s before, so it cannot be replayed; nothing more ran", c.Seq, c.Tool, rec.Status)
 		}
+		if rerunOnResume[rec.Tool] {
+			// A read-only Inbox read: sent again, never replayed.
+			return nil, false, nil
+		}
 		h.mu.Lock()
 		sc.replayText = rec.replayText
 		h.mu.Unlock()
@@ -106,14 +152,14 @@ func (h *hooks) BeforeCall(_ context.Context, c *codemode.PendingCall) (*mcp.Cal
 		if rec, ok := rs.recorded[c.Seq]; ok && (rec.Tool != c.Tool || rec.ArgsHash != hash) {
 			return nil, false, diverged("call %d is %s with these arguments, but the held call was %s; the script took another path than before, so nothing more ran", c.Seq, c.Tool, recordName(rec))
 		}
-		if tok := h.takeGrant(c.Target); tok != "" {
+		if tok := h.takeGrant(c); tok != "" {
 			setArg(c, grantArg, tok)
 		} else if rs.approvalID != "" {
 			setArg(c, approvalIDArg, rs.approvalID)
 		}
 		return nil, false, nil
 	}
-	if tok := h.takeGrant(c.Target); tok != "" {
+	if tok := h.takeGrant(c); tok != "" {
 		setArg(c, grantArg, tok)
 	}
 	return nil, false, nil
@@ -126,8 +172,8 @@ func (h *hooks) AfterCall(ctx context.Context, c codemode.PendingCall, out codem
 		sc = &seenCall{argsHash: argsHash(c.ScriptArgs)}
 		h.seen[c.Seq] = sc
 	}
-	if out.Record.Status == codemode.StatusSucceeded {
-		sc.replayText = out.Text
+	if out.Record.Status == codemode.StatusSucceeded && !rerunOnResume[c.Tool] {
+		sc.replayText = redactGrants(out.Text)
 	}
 	rec := Call{Seq: c.Seq, Tool: c.Tool, Target: c.Target, ArgsHash: sc.argsHash, Status: out.Record.Status,
 		StartedAt: out.Record.StartedAt, FinishedAt: out.Record.FinishedAt, replayText: sc.replayText}
@@ -141,19 +187,32 @@ func (h *hooks) AfterCall(ctx context.Context, c codemode.PendingCall, out codem
 	}
 }
 
-// takeGrant returns an unused grant token for target, and marks it used.
-func (h *hooks) takeGrant(target string) string {
+// takeGrant returns an unused grant token that covers the call (same
+// gateway target and, when the grant's parameters are known, arguments
+// within them), and marks it used. A call no grant covers goes without
+// one, so the gateway holds it again and the run stays resumable.
+func (h *hooks) takeGrant(c *codemode.PendingCall) string {
 	if h.resume == nil {
 		return ""
 	}
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	var args map[string]any
 	for i := range h.resume.grants {
 		g := &h.resume.grants[i]
-		if !g.used && g.tool == target {
-			g.used = true
-			return g.token
+		if g.used || g.tool != c.Target {
+			continue
 		}
+		if g.matchParams {
+			if args == nil {
+				args = grantArgs(c.ScriptArgs)
+			}
+			if ok, _ := inbox.MatchArgs(g.params, args); !ok {
+				continue
+			}
+		}
+		g.used = true
+		return g.token
 	}
 	return ""
 }

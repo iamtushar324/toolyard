@@ -370,7 +370,7 @@ def start_run(client, code, reason, key, wait):
         payload = {"code": code, "reason": reason}
         if wait is not None:
             payload["wait_seconds"] = min(wait, MAX_SERVER_WAIT)
-        body = json.dumps(payload).encode("utf-8")
+        body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
     status, hdrs, data = client.send("POST", "/v1/code/run", body, headers, wait=wait)
     return finish(client, status, hdrs, data, deadline)
 
@@ -536,7 +536,7 @@ def cmd_resume(client, args):
     headers = {"Content-Type": "application/json"}
     headers.update(prefer(args.wait))
     status, hdrs, data = client.send("POST", run_path(args.run_id) + "/resume",
-                                     json.dumps(payload).encode("utf-8"), headers, wait=args.wait)
+                                     json.dumps(payload, ensure_ascii=False).encode("utf-8"), headers, wait=args.wait)
     return finish(client, status, hdrs, data, deadline)
 
 

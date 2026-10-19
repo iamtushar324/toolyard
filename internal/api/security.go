@@ -447,7 +447,7 @@ func (s *Server) HardenAPI(next http.Handler) http.Handler {
 func perRouteBodyCap(path string) int64 {
 	switch {
 	case path == codeRunPath:
-		return maxCodeRunBody // a 1 MiB script, JSON-escaped, plus the envelope and reason
+		return maxCodeRunBody // 4 MiB: a 1 MiB script after JSON escaping, plus the envelope and reason
 	case strings.HasPrefix(path, codePathPrefix):
 		return 8 << 10 // 8 KiB — a resume body; the other code routes are GETs
 	case strings.HasPrefix(path, "/v1/tools/run"),

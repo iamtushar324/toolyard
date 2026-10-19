@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/tusharbhardwaj/toolyard/internal/codemode"
 	"github.com/tusharbhardwaj/toolyard/internal/store"
@@ -23,7 +24,14 @@ const runColumns = `id, agent_id, COALESCE(session_id, ''), COALESCE(idempotency
 	created_at, updated_at, COALESCE(finished_at, 0)`
 
 // insertRun stores a new run.
+// runWriteTimeout bounds the writes that must not follow the client's
+// connection: a disconnect while one commits would leave a run row with
+// nothing to execute it.
+const runWriteTimeout = 10 * time.Second
+
 func (s *Service) insertRun(ctx context.Context, r *Run) error {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), runWriteTimeout)
+	defer cancel()
 	_, err := s.db.ExecContext(ctx, `INSERT INTO code_runs
 		(id, agent_id, session_id, idempotency_key, fingerprint, code, reason, status, created_at, updated_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
@@ -128,6 +136,8 @@ func (s *Service) markRunning(ctx context.Context, id string) error {
 // claimResume moves a held run to running, unless another resume (or
 // anything else) changed its status since r was read.
 func (s *Service) claimResume(ctx context.Context, r *Run) (bool, error) {
+	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), runWriteTimeout)
+	defer cancel()
 	now := s.now().UnixMilli()
 	res, err := s.db.ExecContext(ctx, `UPDATE code_runs SET status = ?, error_kind = NULL, error_message = NULL, finished_at = NULL, updated_at = ?
 		WHERE id = ? AND agent_id = ? AND status = ?`, StatusRunning, now, r.ID, r.AgentID, r.Status)
@@ -182,14 +192,14 @@ func (s *Service) finish(ctx context.Context, run *Run, rr *codemode.RunResult, 
 	}
 	var result, errKind, errMsg, held any
 	if status == codemode.StatusSucceeded && len(rr.Result) > 0 {
-		result = string(rr.Result)
+		result = redactGrants(string(rr.Result))
 	}
 	if status == codemode.StatusFailed || status == codemode.StatusOutcomeUnknown {
 		kind := rr.ErrorKind
 		if kind == "" {
 			kind = codemode.ErrorInternal
 		}
-		errKind, errMsg = kind, cleanText(rr.ErrorMessage)
+		errKind, errMsg = kind, redactGrants(cleanText(rr.ErrorMessage))
 	}
 	if IsHeld(status) && rr.Held != nil {
 		raw, err := json.Marshal(Held{
@@ -199,11 +209,11 @@ func (s *Service) finish(ctx context.Context, run *Run, rr *codemode.RunResult, 
 		if err != nil {
 			return err
 		}
-		held = string(raw)
+		held = redactGrants(string(raw))
 	}
-	logs := rr.Logs
-	if logs == nil {
-		logs = []string{}
+	logs := make([]string, 0, len(rr.Logs))
+	for _, l := range rr.Logs {
+		logs = append(logs, redactGrants(l))
 	}
 	logsJSON, err := json.Marshal(logs)
 	if err != nil {

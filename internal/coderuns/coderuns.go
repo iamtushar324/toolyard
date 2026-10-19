@@ -31,6 +31,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/tusharbhardwaj/toolyard/internal/codemode"
 	"github.com/tusharbhardwaj/toolyard/internal/goroutines"
@@ -143,6 +144,13 @@ func (e gatewayEngine) RunContext(ctx context.Context, agentID, sessionID string
 // spending them.
 type Grants interface {
 	Status(ctx context.Context, agentID string, ids []string) ([]inbox.AgentView, error)
+}
+
+// grantRequests is implemented by a Grants that can also read a request
+// (*inbox.Service): a resume then matches each grant to a call by its
+// parameters, not only by its tool.
+type grantRequests interface {
+	Get(ctx context.Context, id string) (*inbox.Request, error)
 }
 
 // Options configure a Service.
@@ -473,10 +481,26 @@ func (s *Service) Resume(ctx context.Context, req ResumeRequest) (*Run, error) {
 		if len(views) != 1 || views[0].Status == "not_found" {
 			return nil, &InputError{Field: "request_id", Message: "no Inbox request with this id belongs to this agent"}
 		}
-		for _, t := range views[0].Tools {
-			if t.Grant != "" {
-				rs.grants = append(rs.grants, grantToken{tool: t.Tool, token: t.Grant})
+		var params map[string]map[string]inbox.Constraint // by call id
+		if gr, ok := s.grants.(grantRequests); ok {
+			if r, err := gr.Get(ctx, req.RequestID); err == nil && r != nil && r.AgentID == req.AgentID {
+				params = make(map[string]map[string]inbox.Constraint, len(r.Tools))
+				for _, t := range r.Tools {
+					params[t.CallID] = t.Params
+				}
 			}
+		}
+		for _, t := range views[0].Tools {
+			if t.Grant == "" {
+				continue
+			}
+			g := grantToken{tool: t.Tool, token: t.Grant}
+			if t.Narrowed {
+				g.params, g.matchParams = t.Params, true
+			} else if p, ok := params[t.CallID]; ok {
+				g.params, g.matchParams = p, true
+			}
+			rs.grants = append(rs.grants, g)
 		}
 	case run.Held.Status == codemode.StatusDeferred && run.Held.ApprovalID != "":
 		rs.approvalID = run.Held.ApprovalID
@@ -699,6 +723,8 @@ func checkReason(reason string) (string, error) {
 		return "", &InputError{Field: "reason", Message: fmt.Sprintf("reason must be %d-%d characters (got %d)", MinReasonLen, MaxReasonLen, len(r))}
 	case strings.ContainsRune(r, 0):
 		return "", &InputError{Field: "reason", Message: "reason must not contain a NUL character"}
+	case !utf8.ValidString(r):
+		return "", &InputError{Field: "reason", Message: "reason must be valid UTF-8"}
 	}
 	return r, nil
 }

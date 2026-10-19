@@ -52,11 +52,12 @@ const (
 	// defaultCodeWait is how long a start or resume waits for a final or
 	// held status when the request names no wait.
 	defaultCodeWait = 25 * time.Second
-	// maxCodeRunBody is the POST /v1/code/run body cap: a 1 MiB script
-	// whose JSON escaping (quotes, newlines) doubled it, with room for the
-	// envelope and the reason. The script itself is checked against 1 MiB
-	// after decoding; a raw text/x-starlark body is read to 1 MiB + 1 only.
-	maxCodeRunBody = 2*coderuns.MaxScriptBytes + 64<<10
+	// maxCodeRunBody is the POST /v1/code/run body cap: 4 MiB, the outer
+	// LimitBodyByPath ceiling, so a 1 MiB script still fits after JSON
+	// escaping up to four times its size (ty sends unescaped UTF-8). The
+	// script itself is checked against 1 MiB after decoding; a raw
+	// text/x-starlark body is read to 1 MiB + 1 only.
+	maxCodeRunBody = 4 * coderuns.MaxScriptBytes
 	// maxCodeResumeBody caps the resume body ({"request_id": "..."}).
 	maxCodeResumeBody = 4 << 10
 	// busyRetryAfter and drainRetryAfter are the Retry-After seconds.

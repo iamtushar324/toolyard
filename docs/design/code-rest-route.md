@@ -164,8 +164,16 @@ The script runs again from the top. Each call before the held one is answered
 from the call record when its tool and arguments are the same as recorded
 (`replayed: true`); a different call is `failed` with `script_diverged` and
 nothing more runs. A recorded call with an unknown outcome stops the resume
-with `outcome_unknown`; nothing is repeated blindly. The same `Prefer: wait`
-and HTTP mapping apply.
+with `outcome_unknown`; nothing is repeated blindly. Inbox status reads
+(`toolyard.inbox_status`, `toolyard.inbox_wait`) are sent again instead of
+replayed, because their answers can carry grant tokens. The same
+`Prefer: wait` and HTTP mapping apply.
+
+Grant tokens (`tyg_…`) never rest in plain text: the call record, the
+result, the logs and the held call are stored with each token replaced by
+`tyg_[redacted]`. A grant is matched to a call by tool and parameters, the
+way the gateway checks it; a call no unused grant covers is sent without
+one, so it is held again and the run stays resumable.
 
 ## Stubs
 
