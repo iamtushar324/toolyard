@@ -9,6 +9,7 @@ import (
 
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
+	"github.com/mark3labs/mcp-go/server/servertest"
 
 	"github.com/tusharbhardwaj/toolyard/internal/approval"
 	"github.com/tusharbhardwaj/toolyard/internal/audit"
@@ -28,7 +29,7 @@ func newMCPTestServer(t *testing.T) *httptest.Server {
 	m.AddTool(mcp.NewTool("get_status"), func(context.Context, mcp.CallToolRequest) (*mcp.CallToolResult, error) {
 		return mcp.NewToolResultText("ok"), nil
 	})
-	ts := server.NewTestStreamableHTTPServer(m)
+	ts := servertest.NewTestStreamableHTTPServer(m)
 	t.Cleanup(ts.Close)
 	return ts
 }

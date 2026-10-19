@@ -316,6 +316,7 @@ func runServe(argv []string) error {
 	inboxResetPasskeys := fs.Bool("inbox-reset-passkeys", false, "delete every registered passkey at startup (recovery when the owner has lost all their devices), then continue normally")
 	inboxFetchPrivate := fs.Bool("inbox-fetch-private-networks", false, "let the inbox copy attachment links that point at loopback or private-network addresses (e.g. evidence hosted on your LAN). Off by default: agent-chosen URLs could otherwise reach internal services.")
 	requireAuthMCP := fs.Bool("require-auth-on-mcp", false, "reject anonymous /mcp calls (no Authorization header). Auto-enabled when -public-url is set.")
+	upstreamProtocolFlag := fs.String("upstream-protocol", upstreamProtocolLegacy, "MCP version toward upstream servers: legacy (2025-11-25 for every upstream) | auto (an http upstream that offers 2026-07-28 is called statelessly, one POST per call, outside the live pool and the idle sweep; stdio stays legacy)")
 	statelessMCP := fs.Bool("stateless-mcp", false, "skip MCP session-ID tracking. Every request stands alone — no server-initiated notifications, but agents that don't auto-reconnect on session-invalid (e.g., hermes) survive a toolyard restart without manual intervention.")
 	noStdioUpstreams := fs.Bool("no-stdio-upstreams", false, "refuse to start any stdio (subprocess) MCP upstream. Use when the dashboard is exposed publicly so a compromised session can't spawn arbitrary commands.")
 	envDenylistFlag := fs.String("upstream-env-denylist", "LD_PRELOAD,LD_LIBRARY_PATH,DYLD_INSERT_LIBRARIES,DYLD_LIBRARY_PATH,PATH", "comma-separated env var keys forbidden in upstream stdio configs")
@@ -338,6 +339,7 @@ func runServe(argv []string) error {
 	voiceModel := fs.String("voice-model", voiceModelDefault, "Gemini Live model to use for voice calls. Falls back to $TOOLYARD_VOICE_MODEL, then "+voice.DefaultModel+".")
 	voiceMaxCall := fs.Duration("voice-max-call", 60*time.Minute, "hard cap on a single voice call's duration; the server hangs up when reached. Bounds the worst-case Gemini Live bill from an abandoned tab.")
 	stdioIdleTimeout := fs.Duration("stdio-idle-timeout", 0, "DEPRECATED: alias for -upstream-idle-timeout. Kept for backwards compat.")
+	catalogRefresh := fs.Duration("catalog-refresh", 15*time.Minute, "read the tool list of every live shared upstream again this often and apply what changed (added, changed and removed tools; clients get tools/list_changed). Suspended upstreams are not dialled for it, and the read does not count as use for -upstream-idle-timeout. 0 disables.")
 	upstreamIdleTimeout := fs.Duration("upstream-idle-timeout", 0, "kill upstream MCP connections idle for this long; transparently re-dial on next call. 0 disables. Recommended: 15m. Covers both stdio (kills subprocess) and http (closes client). Reduces RSS + FDs when no agents are active.")
 	upstreamMaxLive := fs.Int("upstream-max-live", 8, "max simultaneously-live upstream connections. When the cap is hit, the least-recently-used upstream is suspended (catalog stays populated, transparently resumed on next call). 0 = unbounded.")
 	perUserMaxLive := fs.Int("per-user-max-live", 64, "max simultaneously-live per-person connections to servers where each person signs in (auth_mode per_user). Their own pool: they never evict a shared server and a shared server never evicts them. LRU-suspended past the cap, resumed on next call. 0 = unbounded.")
@@ -356,6 +358,10 @@ func runServe(argv []string) error {
 		return err
 	}
 	migrate, err := parseMigrateMode(*migrateFlag)
+	if err != nil {
+		return err
+	}
+	upstreamProtocol, err := parseUpstreamProtocol(*upstreamProtocolFlag)
 	if err != nil {
 		return err
 	}
@@ -660,6 +666,7 @@ func runServe(argv []string) error {
 		Identity:            identityKeysSvc,
 		Owners:              accessSvc,
 		PublicURL:           *publicURL,
+		UpstreamProtocol:    upstreamProtocol,
 	})
 	// The kernel probe for the code-mode sandbox runs now, off the
 	// request path.
@@ -1319,14 +1326,23 @@ func runServe(argv []string) error {
 		// stateless mode lets those clients immediately fall back to
 		// POST-only operation, which works fine.
 		server.WithDisableStreaming(*statelessMCP),
+		// mcp-go refuses a request that arrives on a loopback address with
+		// a Host that is not loopback (DNS rebinding protection). Behind a
+		// reverse proxy on loopback (deploy/Caddyfile.example) every
+		// request carries the public Host, so -public-url turns that check
+		// off: public mode always requires a token on /mcp
+		// (-require-auth-on-mcp), which a rebinding page cannot send. A
+		// local gateway without -public-url keeps the check.
+		server.WithDisableLocalhostProtection(*publicURL != ""),
 		// The guard below verified the token once and put the agent and
 		// its raiser on the request context; this hands them to every
 		// tool call's context. See actors.go.
 		server.WithHTTPContextFunc(mcpAuthn.contextFunc),
 	)
 	// /mcp gets a larger body limit because tool-call args can be a few MB.
-	// TEC-1626 drain: the stream gate refuses new GET streams once the
-	// drain starts and ends open ones with the other waiters (lifecycle.go).
+	// TEC-1626 drain: the stream gate refuses new MCP streams (a GET, or a
+	// 2026-07-28 subscriptions/listen POST) once the drain starts and ends
+	// open ones with the other waiters (lifecycle.go).
 	mcpStreams := newMCPStreamGate()
 	mux.Handle("/mcp", mcpStreams.wrap(api.LimitBody(gateway.PreserveToolCallNumbers(mcpAuthn.guard(streamable)), 16<<20)))
 	mux.Handle("/mcp/", mcpStreams.wrap(api.LimitBody(gateway.PreserveToolCallNumbers(mcpAuthn.guard(streamable)), 16<<20)))
@@ -1439,6 +1455,23 @@ func runServe(argv []string) error {
 							"count", n, "threshold", idleTimeout.String())
 					}
 					loopDone(loopIdleSweeper)
+				}
+			}
+		})
+	}
+	if every := *catalogRefresh; every > 0 {
+		goroutines.Loop(ctx, loopCatalogRefresh, time.Minute, func(ctx context.Context) {
+			tick := time.NewTicker(every)
+			defer tick.Stop()
+			for {
+				select {
+				case <-ctx.Done():
+					return
+				case <-tick.C:
+					if n := gw.RefreshUpstreamCatalogs(ctx); n > 0 {
+						rootLog.Info("upstream catalogs refreshed", "changed", n)
+					}
+					loopDone(loopCatalogRefresh)
 				}
 			}
 		})

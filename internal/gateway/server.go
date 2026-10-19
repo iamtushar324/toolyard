@@ -1,6 +1,7 @@
 package gateway
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -161,6 +162,7 @@ type Gateway struct {
 	upstreamCallTimeout time.Duration
 	access              access.Resolver
 	identity            IdentityResolver
+	upstreamProtocol    string
 
 	// inbox, when set, backs the inbox.* tools and grant redemption.
 	// approvalMode returns "inbox" (restricted calls are coached towards
@@ -293,6 +295,10 @@ type Options struct {
 	// at the My connections page when its owner has not connected a
 	// per_user upstream. Optional.
 	PublicURL string
+	// UpstreamProtocol is "" (every upstream speaks 2025-11-25, as before
+	// 2026-07-28 support) or ProtocolAuto (an http upstream that offers
+	// 2026-07-28 is used statelessly; see requestedProtocol).
+	UpstreamProtocol string
 }
 
 // UsageRecorder is satisfied by *internal/usage.Service. The gateway only
@@ -354,41 +360,62 @@ func New(opts Options) *Gateway {
 		identity:            opts.Identity,
 		owners:              opts.Owners,
 		publicURL:           opts.PublicURL,
+		upstreamProtocol:    opts.UpstreamProtocol,
 		tools:               map[string]toolEntry{},
 		upstreams:           map[string]*upstream{},
 		perUser:             map[string]*perUserGroup{},
 	}
 	g.grantCalls.Executions = true
+	// No logging capability: the gateway never sends log notifications, so
+	// it no longer advertises them. tools/list is filtered per caller, so
+	// its cache hint (sent to 2026-07-28 clients only) is private.
 	serverOpts := []server.ServerOption{
 		server.WithToolCapabilities(true),
-		server.WithLogging(),
 		server.WithToolHandlerMiddleware(recoverToolPanics),
 		server.WithInstructions(buildInstructions(opts.Approval, opts.InLineWait)),
+		server.WithMethodCacheHints(mcp.MethodToolsList, toolsListCacheTTL.Milliseconds(), mcp.CacheScopePrivate),
 	}
 	// The initialize hook remembers what each client says it is, so audit
-	// rows can name the client software. Filters run in registration
-	// order: access first, so the visibility provider only ever ranks
-	// tools the caller may use. The request hook answers raw tools/call
-	// for ungranted tools before mcp-go looks the tool up, so the wire
-	// response matches an unknown tool.
+	// rows can name the client software (a 2026-07-28 client sends no
+	// initialize; resolveRaiser reads its clientInfo from the request).
+	// The request hook answers raw tools/call for ungranted tools before
+	// mcp-go looks the tool up, so the wire response matches an unknown
+	// tool.
 	hooks := &server.Hooks{}
 	hooks.AddAfterInitialize(g.rememberClient)
 	if opts.Access != nil {
-		serverOpts = append(serverOpts, server.WithToolFilter(g.accessToolFilter))
 		hooks.AddOnRequestInitialization(g.accessRequestHook)
 	}
-	serverOpts = append(serverOpts, server.WithHooks(hooks))
-	if opts.Visibility != nil {
-		vp := opts.Visibility
-		serverOpts = append(serverOpts, server.WithToolFilter(
-			func(ctx context.Context, tools []mcp.Tool) []mcp.Tool {
-				return vp.List(ctx, tools)
-			},
-		))
+	// The access and visibility filters shape tools/list only. They are a
+	// list hook, not server.WithToolFilter: mcp-go v1 also runs tool
+	// filters on every tools/call, which would refuse a tool the
+	// visibility mode hides from the list (router_only, top_n) before
+	// handlerFor can answer or audit it. Access first, so the visibility
+	// provider only ever ranks tools the caller may use. The gateway sets
+	// no pagination limit, so the hook sees the whole filtered list.
+	filterAccess, vp := opts.Access != nil, opts.Visibility
+	if filterAccess || vp != nil {
+		hooks.AddAfterListTools(func(ctx context.Context, _ any, _ *mcp.ListToolsRequest, res *mcp.ListToolsResult) {
+			if res == nil {
+				return
+			}
+			if filterAccess {
+				res.Tools = g.accessToolFilter(ctx, res.Tools)
+			}
+			if vp != nil {
+				res.Tools = vp.List(ctx, res.Tools)
+			}
+		})
 	}
+	serverOpts = append(serverOpts, server.WithHooks(hooks))
 	g.mcp = server.NewMCPServer(opts.Name, opts.Version, serverOpts...)
 	return g
 }
+
+// toolsListCacheTTL is the freshness hint on tools/list for 2026-07-28
+// clients. The catalog changes when servers or settings change, and the
+// gateway also announces that with notifications/tools/list_changed.
+const toolsListCacheTTL = time.Minute
 
 // accessDeniedReason is the audit reason on every call refused because the
 // caller's dashboard user was never granted the tool's group.
@@ -713,6 +740,9 @@ func (g *Gateway) AddUpstream(ctx context.Context, cfg UpstreamConfig) error {
 	if cfg.Transport == "github" {
 		return g.addGitHubUpstream(cfg)
 	}
+	if cfg.ProtocolVersion == "" && g.upstreamProtocol == ProtocolAuto {
+		cfg.ProtocolVersion = ProtocolAuto
+	}
 	if cfg.PerUser {
 		return g.addPerUserUpstream(ctx, cfg)
 	}
@@ -741,14 +771,22 @@ func (g *Gateway) AddUpstream(ctx context.Context, cfg UpstreamConfig) error {
 }
 
 // registerUpstreamTools wraps an upstream's tools into the catalog under
-// "<name>.<tool>". With ref set, each tool's handler calls that
-// connection; with ref nil (a per_user upstream) the handler is left
-// empty and dispatch picks the caller's connection.
-func (g *Gateway) registerUpstreamTools(name string, tools []mcp.Tool, ref *upstream) {
+// "<name>.<tool>" and returns the names it registered. With ref set, each
+// tool's handler calls that connection; with ref nil (a per_user upstream)
+// the handler is left empty and dispatch picks the caller's connection.
+func (g *Gateway) registerUpstreamTools(name string, tools []mcp.Tool, ref *upstream) []string {
+	registered := make([]string, 0, len(tools))
 	for _, t := range tools {
 		original := t.Name
 		wrapped, field := wrapSchema(t)
 		wrapped.Name = name + "." + original
+		// mcp-go's AddTool panics on a tool whose x-mcp-header annotations
+		// break SEP-2243. An upstream's catalog is outside our control, so
+		// such a tool is left out rather than taking the gateway down.
+		if err := mcp.ValidateParamHeaderAnnotations(&wrapped); err != nil {
+			log.Printf("gateway: upstream %s: skipping tool %q: invalid x-mcp-header annotations: %v", name, original, err)
+			continue
+		}
 		entry := toolEntry{
 			tool:         wrapped,
 			upstream:     name,
@@ -763,7 +801,87 @@ func (g *Gateway) registerUpstreamTools(name string, tools []mcp.Tool, ref *upst
 			}(original)
 		}
 		g.registerEntry(entry)
+		registered = append(registered, wrapped.Name)
 	}
+	return registered
+}
+
+// catalogRefreshTimeout bounds one upstream's tools/list during a
+// catalog refresh.
+const catalogRefreshTimeout = 30 * time.Second
+
+// RefreshUpstreamCatalogs reads the tool list of every live shared
+// upstream again and applies a catalog that changed: new and changed
+// tools are registered, and tools the upstream no longer lists are
+// removed (mcp-go sends notifications/tools/list_changed for both). A
+// suspended upstream is skipped, because reading it would dial it and
+// undo the idle sweep; the next refresh while it is live reads it.
+// per_user upstreams are skipped too: their catalog comes from one
+// person's connection. A refresh read is not use, so it never keeps a
+// connection from going idle. It returns how many catalogs changed.
+func (g *Gateway) RefreshUpstreamCatalogs(ctx context.Context) int {
+	g.mu.RLock()
+	ups := make(map[string]*upstream, len(g.upstreams))
+	for name, u := range g.upstreams {
+		ups[name] = u
+	}
+	g.mu.RUnlock()
+	changed := 0
+	for name, u := range ups {
+		if ctx.Err() != nil {
+			break
+		}
+		before := u.toolsSnapshot()
+		rctx, cancel := context.WithTimeout(ctx, catalogRefreshTimeout)
+		tools, live, err := u.refreshTools(rctx)
+		cancel()
+		if !live {
+			continue
+		}
+		if err != nil {
+			log.Printf("catalog-refresh: %s: %v", u.label(), err)
+			continue
+		}
+		if sameTools(before, tools) {
+			continue
+		}
+		g.replaceUpstreamTools(name, tools, u)
+		log.Printf("catalog-refresh: %s: catalog changed (%d tools)", u.label(), len(tools))
+		changed++
+	}
+	return changed
+}
+
+// replaceUpstreamTools registers an upstream's new catalog, then removes
+// its tools that the new catalog no longer has (registering first leaves
+// no moment without the tools that stay).
+func (g *Gateway) replaceUpstreamTools(name string, tools []mcp.Tool, ref *upstream) {
+	keep := map[string]bool{}
+	for _, n := range g.registerUpstreamTools(name, tools, ref) {
+		keep[n] = true
+	}
+	var gone []string
+	g.mu.Lock()
+	for k, e := range g.tools {
+		if e.upstream == name && !keep[k] {
+			gone = append(gone, k)
+			delete(g.tools, k)
+		}
+	}
+	g.mu.Unlock()
+	if len(gone) > 0 {
+		g.mcp.DeleteTools(gone...)
+	}
+}
+
+// sameTools reports whether two catalogs are the same, tool for tool.
+func sameTools(a, b []mcp.Tool) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	ja, errA := json.Marshal(a)
+	jb, errB := json.Marshal(b)
+	return errA == nil && errB == nil && bytes.Equal(ja, jb)
 }
 
 // allUpstreams snapshots every connection in the pool: the shared
@@ -1005,9 +1123,11 @@ func (g *Gateway) pickPoolCandidate(self *upstream, admission bool) (*upstream, 
 	if limit <= 0 {
 		return nil, 0, 0
 	}
+	// A 2026-07-28 connection is outside the pool: it is not counted and
+	// is never the one suspended (upstream.pooled).
 	var candidates []*upstream
 	for _, u := range g.allUpstreams() {
-		if (!admission || u != self) && (u.userID != "") == perUser {
+		if (!admission || u != self) && (u.userID != "") == perUser && u.pooled() {
 			candidates = append(candidates, u)
 		}
 	}

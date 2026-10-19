@@ -75,7 +75,8 @@ func ClientKindOf(name string) string {
 	return "unknown"
 }
 
-// clientInfo is what a client said about itself at initialize.
+// clientInfo is what a client said about itself at initialize
+// (2025-11-25 and earlier) or in a request's _meta (2026-07-28).
 type clientInfo struct {
 	name string // "name/version"
 	kind string
@@ -139,6 +140,26 @@ func (g *Gateway) rememberClient(ctx context.Context, _ any, req *mcp.Initialize
 	g.clientMu.Unlock()
 }
 
+// requestClient is the clientInfo a 2026-07-28 client sent in this
+// request's _meta. Such a client never sends initialize, so rememberClient
+// has nothing for it; and the request names its own client, so it wins
+// over any cached entry for the agent.
+func requestClient(ctx context.Context) (clientInfo, bool) {
+	info := server.RequestProtocolInfoFromContext(ctx)
+	if info == nil || !info.Modern || info.ClientInfo == nil {
+		return clientInfo{}, false
+	}
+	name := actor.Clean(info.ClientInfo.Name)
+	if name == "" {
+		return clientInfo{}, false
+	}
+	ci := clientInfo{name: name, kind: ClientKindOf(name)}
+	if v := actor.Clean(info.ClientInfo.Version); v != "" {
+		ci.name = name + "/" + v
+	}
+	return ci, true
+}
+
 // clientFor returns the cached clientInfo for the client a raiser
 // describes: the entry for its MCP session, else for its client session,
 // else the agent's session-less entry.
@@ -181,7 +202,9 @@ func (g *Gateway) resolveRaiser(ctx context.Context, callerID, via string) actor
 	if via != "" {
 		r.Via = via
 	}
-	if ci, ok := g.clientFor(r); ok {
+	if ci, ok := requestClient(ctx); ok {
+		r = r.Merge(actor.Raiser{ClientName: ci.name, ClientKind: ci.kind})
+	} else if ci, ok := g.clientFor(r); ok {
 		r = r.Merge(actor.Raiser{ClientName: ci.name, ClientKind: ci.kind})
 	} else if r.ClientKind == "" && r.ClientName != "" {
 		r.ClientKind = ClientKindOf(r.ClientName)

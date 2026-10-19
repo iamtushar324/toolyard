@@ -59,6 +59,39 @@ type UpstreamConfig struct {
 	// PerUserAuth answers who has connected a PerUser upstream. Required
 	// when PerUser is set; populated by the upstreams package.
 	PerUserAuth PerUserAuth `json:"-"`
+
+	// ProtocolVersion is the MCP version the connection asks for (in
+	// memory only; the gateway sets it from Options.UpstreamProtocol).
+	// Empty asks for 2025-11-25, the version every upstream spoke before
+	// 2026-07-28 support, so upstream behaviour does not change.
+	// ProtocolAuto lets an http upstream move to 2026-07-28 when it
+	// supports it (see requestedProtocol).
+	ProtocolVersion string `json:"-"`
+}
+
+// ProtocolAuto is the UpstreamConfig.ProtocolVersion (and the
+// -upstream-protocol value) that lets an http upstream use the 2026-07-28
+// protocol when it offers it, and 2025-11-25 otherwise.
+const ProtocolAuto = "auto"
+
+// requestedProtocol is the version a dial asks for. An http upstream in
+// auto mode asks for none at its first dial, so mcp-go sends
+// server/discover and falls back to initialize when the server does not
+// know it; later dials ask for the version that dial settled on
+// (upstream.settled), which skips the probe for a 2025-11-25 server.
+// stdio stays on 2025-11-25 even in auto mode: a subprocess that ignores
+// unknown methods would hold every dial for the discover timeout.
+func requestedProtocol(cfg UpstreamConfig) string {
+	switch cfg.ProtocolVersion {
+	case "":
+		return mcp.LATEST_LEGACY_PROTOCOL_VERSION
+	case ProtocolAuto:
+		if cfg.Transport == "stdio" {
+			return mcp.LATEST_LEGACY_PROTOCOL_VERSION
+		}
+		return ""
+	}
+	return cfg.ProtocolVersion
 }
 
 type upstream struct {
@@ -121,7 +154,23 @@ type upstream struct {
 	// re-established it under a tool call (see callTool). Surfaced through
 	// Gateway.SessionRecoveries.
 	recoveries atomic.Int64
+
+	// modern is set when the live client speaks 2026-07-28 or later: every
+	// call is one stateless POST, with no session to lose and nothing to
+	// keep alive, so the connection stays out of the live pool and the
+	// idle sweep (pooled), and a rejected call is never treated as a lost
+	// session.
+	modern atomic.Bool
+
+	// settled is the version an auto-mode dial negotiated, asked for
+	// again on the next dial (requestedProtocol). Guarded by dialMu.
+	settled string
 }
+
+// pooled reports whether the connection counts against the live-upstream
+// cap and is suspended when idle. A 2026-07-28 connection holds no
+// session and no subprocess, so suspending it frees nothing.
+func (u *upstream) pooled() bool { return !u.modern.Load() }
 
 // withoutForwardedKey drops any forwarded identity key from ctx. The
 // upstream's own protocol traffic (initialize, tools/list, a re-dial after
@@ -190,12 +239,17 @@ func newUpstream(ctx context.Context, cfg UpstreamConfig) (*upstream, error) {
 		return nil, fmt.Errorf("start upstream %s: %w", cfg.Name, err)
 	}
 	initReq := mcp.InitializeRequest{}
-	initReq.Params.ProtocolVersion = mcp.LATEST_PROTOCOL_VERSION
+	initReq.Params.ProtocolVersion = requestedProtocol(cfg)
 	initReq.Params.ClientInfo = mcp.Implementation{Name: "toolyard-gateway", Version: "0.1.0"}
 	if _, err := c.Initialize(startCtx, initReq); err != nil {
 		return nil, fmt.Errorf("init upstream %s: %w", cfg.Name, err)
 	}
 	u := &upstream{cfg: cfg, client: c}
+	negotiated := c.ProtocolVersion()
+	u.modern.Store(mcp.IsModernProtocol(negotiated))
+	if cfg.ProtocolVersion == ProtocolAuto {
+		u.settled = negotiated
+	}
 	u.lastUsed.Store(time.Now().UnixNano())
 	return u, nil
 }
@@ -250,6 +304,36 @@ func (u *upstream) listTools(ctx context.Context) ([]mcp.Tool, error) {
 	return res.Tools, nil
 }
 
+// toolsSnapshot is the catalog the last tools/list returned (nil before
+// the first one). listTools replaces the slice and never edits it.
+func (u *upstream) toolsSnapshot() []mcp.Tool {
+	u.cachedToolsMu.RLock()
+	defer u.cachedToolsMu.RUnlock()
+	return u.cachedTools
+}
+
+// refreshTools reads the catalog again over the live client. live is
+// false when the connection is suspended or retired, and then nothing is
+// sent. The read holds the connection like a call, so the idle sweep and
+// the pool leave it open meanwhile, but it does not move lastUsed: a
+// refresh is not use and never keeps a connection from going idle.
+func (u *upstream) refreshTools(ctx context.Context) (tools []mcp.Tool, live bool, err error) {
+	u.mu.Lock()
+	if u.client == nil || u.retired.Load() {
+		u.mu.Unlock()
+		return nil, false, nil
+	}
+	u.active++
+	u.mu.Unlock()
+	defer func() {
+		u.mu.Lock()
+		u.active--
+		u.mu.Unlock()
+	}()
+	tools, err = u.listTools(ctx)
+	return tools, true, err
+}
+
 // callTool dispatches a forwarded call to the upstream. If the upstream is
 // currently suspended (idle-killed) it is restarted transparently before the
 // call is dispatched. mcp-go transports multiplex concurrent requests
@@ -280,8 +364,11 @@ func (u *upstream) callTool(ctx context.Context, name string, args map[string]an
 	if err == nil {
 		return res, nil
 	}
+	// A 2026-07-28 connection has no session: mcp-go maps any HTTP 404
+	// (such as a modern METHOD_NOT_FOUND) to ErrSessionTerminated, which
+	// must not cost a re-dial and a second attempt.
 	reason, ok := sessionErrorReason(err)
-	if !ok {
+	if !ok || u.modern.Load() {
 		return nil, err
 	}
 	if rerr := u.recoverSession(c, reason); rerr != nil {
@@ -418,6 +505,9 @@ func (u *upstream) recoverSession(dead *client.Client, reason string) error {
 // suspend closes the subprocess but keeps the upstream's catalog entry and
 // tool cache intact. The upstream restarts automatically on the next callTool.
 func (u *upstream) suspend() bool {
+	if !u.pooled() {
+		return false
+	}
 	u.mu.Lock()
 	if u.active != 0 || u.client == nil {
 		u.mu.Unlock()
@@ -520,10 +610,14 @@ func (u *upstream) resume(ctx context.Context) error {
 	}
 	u.mu.Unlock()
 
-	if u.pool != nil {
+	if u.pool != nil && u.pooled() {
 		u.pool.acquireSlot(u)
 	}
-	fresh, err := newUpstream(ctx, u.cfg)
+	cfg := u.cfg
+	if cfg.ProtocolVersion == ProtocolAuto && u.settled != "" {
+		cfg.ProtocolVersion = u.settled
+	}
+	fresh, err := newUpstream(ctx, cfg)
 
 	u.mu.Lock()
 	defer u.mu.Unlock()
@@ -540,6 +634,13 @@ func (u *upstream) resume(ctx context.Context) error {
 		return errRetired
 	}
 	u.client = fresh.client
+	u.modern.Store(fresh.modern.Load())
+	if u.cfg.ProtocolVersion == ProtocolAuto {
+		// What this dial negotiated, even when it asked for the cached
+		// version: a server that went back to 2025-11-25 is then asked
+		// for that next time, with no probe.
+		u.settled = fresh.client.ProtocolVersion()
+	}
 	u.consecutiveFailures = 0
 	u.nextRetryAt = time.Time{}
 	u.lastDialErr = nil

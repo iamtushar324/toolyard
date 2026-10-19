@@ -205,3 +205,74 @@ func TestMCPStreamGate(t *testing.T) {
 		t.Fatalf("POST after release: %d, want it passed through", rec.Code)
 	}
 }
+
+// A 2026-07-28 subscriptions/listen POST is a long-lived stream like the
+// GET one: refused once draining, ended by release. Other POSTs pass.
+func TestMCPStreamGateListenPOST(t *testing.T) {
+	gate := newMCPStreamGate()
+	opened := make(chan struct{}, 1)
+	var calls atomic.Int32
+	h := gate.wrap(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !isMCPStream(r) {
+			calls.Add(1)
+			w.WriteHeader(http.StatusOK)
+			return
+		}
+		opened <- struct{}{}
+		<-r.Context().Done()
+	}))
+	listen := func() *http.Request {
+		r := httptest.NewRequest(http.MethodPost, "/mcp", strings.NewReader(`{"jsonrpc":"2.0","id":1,"method":"subscriptions/listen"}`))
+		r.Header.Set("Mcp-Method", "subscriptions/listen")
+		return r
+	}
+	call := func() *http.Request {
+		r := httptest.NewRequest(http.MethodPost, "/mcp", strings.NewReader(`{"jsonrpc":"2.0","id":2,"method":"tools/call"}`))
+		r.Header.Set("Mcp-Method", "tools/call")
+		return r
+	}
+
+	streamDone := make(chan struct{})
+	go func() {
+		h.ServeHTTP(httptest.NewRecorder(), listen())
+		close(streamDone)
+	}()
+	select {
+	case <-opened:
+	case <-time.After(3 * time.Second):
+		t.Fatal("the listen stream did not open")
+	}
+
+	gate.refuse()
+	rec := httptest.NewRecorder()
+	h.ServeHTTP(rec, listen())
+	if rec.Code != http.StatusServiceUnavailable || rec.Header().Get("Retry-After") != "5" {
+		t.Fatalf("new listen while draining: %d Retry-After=%q, want 503 and 5", rec.Code, rec.Header().Get("Retry-After"))
+	}
+	rec = httptest.NewRecorder()
+	h.ServeHTTP(rec, call())
+	if rec.Code != http.StatusOK || calls.Load() != 1 {
+		t.Fatalf("tools/call while draining: %d, want it passed through", rec.Code)
+	}
+
+	gate.release()
+	select {
+	case <-streamDone:
+	case <-time.After(3 * time.Second):
+		t.Fatal("release did not end the open listen stream")
+	}
+}
+
+func TestParseUpstreamProtocol(t *testing.T) {
+	for in, want := range map[string]string{"legacy": "", " Legacy ": "", "auto": "auto", "AUTO": "auto"} {
+		got, err := parseUpstreamProtocol(in)
+		if err != nil || got != want {
+			t.Errorf("parseUpstreamProtocol(%q) = %q, %v; want %q", in, got, err, want)
+		}
+	}
+	for _, in := range []string{"", "modern", "2026-07-28"} {
+		if _, err := parseUpstreamProtocol(in); err == nil {
+			t.Errorf("parseUpstreamProtocol(%q) accepted", in)
+		}
+	}
+}
