@@ -62,7 +62,9 @@ Body, one of:
 - `Content-Type: application/json`:
   `{"code": "<script>", "reason": "<20–2000 chars>", "wait_seconds": 25}`.
 
-The script is at most 1 MiB.
+The script is at most 1 MiB. A script that contains an Inbox grant token
+(`tyg_…`) is `400`: scripts are stored, so resume the held run with its
+`request_id` instead of writing a token into it.
 
 Optional headers:
 
@@ -167,7 +169,9 @@ nothing more runs. A recorded call with an unknown outcome stops the resume
 with `outcome_unknown`; nothing is repeated blindly. Inbox status reads
 (`toolyard.inbox_status`, `toolyard.inbox_wait`) are sent again instead of
 replayed, because their answers can carry grant tokens. The same
-`Prefer: wait` and HTTP mapping apply.
+`Prefer: wait` and HTTP mapping apply. A recorded answer that held a grant
+token is stored redacted, so it cannot be replayed with the same value: the
+resume stops with `script_diverged` instead.
 
 Grant tokens (`tyg_…`) never rest in plain text: the call record, the
 result, the logs and the held call are stored with each token replaced by

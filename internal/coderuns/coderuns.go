@@ -738,6 +738,8 @@ func checkCode(code string) error {
 		return &InputError{Field: "code", Message: "the script is empty"}
 	case strings.ContainsRune(code, 0):
 		return &InputError{Field: "code", Message: "the script must not contain a NUL character"}
+	case grantTokenRE.MatchString(code):
+		return &InputError{Field: "code", Message: "the script contains an Inbox grant token (tyg_…); scripts are stored, so never put a token in one: resume the held run with its request_id instead"}
 	}
 	return nil
 }

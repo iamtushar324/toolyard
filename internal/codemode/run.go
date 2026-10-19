@@ -114,6 +114,10 @@ type PendingCall struct {
 	// record, and to compare with the record on a resume. Changing it
 	// changes nothing that is sent.
 	ScriptArgs map[string]any
+	// ReasonField is the argument the call's reason travels in ("_reason",
+	// or "__toolyard_reason" for a tool with its own _reason), which the
+	// gateway strips before it checks the call against a grant.
+	ReasonField string
 }
 
 // CallHooks wrap each tool call of a Run. Both run on the goroutine that

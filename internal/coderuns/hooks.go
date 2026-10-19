@@ -48,15 +48,22 @@ type grantToken struct {
 	used        bool
 }
 
-// gatewayMetaArgs are the arguments the gateway strips before it checks a
-// call against a grant (internal/gateway schema_wrap.go).
-var gatewayMetaArgs = []string{"_reason", "__toolyard_reason", "_intent_category", "_approval_id", "_grant", "_session_id"}
+// gatewayMetaArgs are the arguments the gateway strips, besides the tool's
+// own reason field, before it checks a call against a grant
+// (internal/gateway schema_wrap.go extractReasonOpt).
+var gatewayMetaArgs = []string{"_intent_category", "_approval_id", "_grant", "_session_id"}
 
-// grantArgs is a call's arguments as the gateway matches them to a grant.
-func grantArgs(args map[string]any) map[string]any {
+// grantArgs is a call's arguments as the gateway matches them to a grant:
+// without the tool's reason field (reasonField) and the meta arguments. A
+// tool with its own _reason keeps it, because its reason field is then
+// __toolyard_reason.
+func grantArgs(args map[string]any, reasonField string) map[string]any {
 	out := make(map[string]any, len(args))
 	for k, v := range args {
 		out[k] = v
+	}
+	if reasonField != "" {
+		delete(out, reasonField)
 	}
 	for _, k := range gatewayMetaArgs {
 		delete(out, k)
@@ -69,8 +76,13 @@ func grantArgs(args map[string]any) map[string]any {
 // the call record never stores.
 var rerunOnResume = map[string]bool{"toolyard.inbox_status": true, "toolyard.inbox_wait": true}
 
-// grantTokenRE matches an Inbox grant token (tyg_<base64url id>.<base64url signature>).
-var grantTokenRE = regexp.MustCompile(`tyg_[A-Za-z0-9_.-]+`)
+// grantTokenRE matches an Inbox grant token: tyg_<base64url id>.<base64url
+// Ed25519 signature> (86 characters; 40 or more is enough to tell a token
+// from a name that only starts with tyg_).
+var grantTokenRE = regexp.MustCompile(`tyg_[A-Za-z0-9_-]+\.[A-Za-z0-9_-]{40,}`)
+
+// redactedGrant replaces a grant token in stored text.
+const redactedGrant = "tyg_[redacted]"
 
 // redactGrants removes grant tokens from text the run stores: call
 // records, the result, logs and the held call. A token is single-use and
@@ -79,7 +91,7 @@ func redactGrants(s string) string {
 	if !strings.Contains(s, "tyg_") {
 		return s
 	}
-	return grantTokenRE.ReplaceAllString(s, "tyg_[redacted]")
+	return grantTokenRE.ReplaceAllString(s, redactedGrant)
 }
 
 // seenCall is what the hooks learnt about one call of this execution.
@@ -143,6 +155,9 @@ func (h *hooks) BeforeCall(_ context.Context, c *codemode.PendingCall) (*mcp.Cal
 			// A read-only Inbox read: sent again, never replayed.
 			return nil, false, nil
 		}
+		if strings.Contains(rec.replayText, redactedGrant) {
+			return nil, false, diverged("call %d (%s) answered with an Inbox grant token, which the record never keeps, so it cannot be replayed with the same value; nothing more ran. Start a new run", c.Seq, c.Tool)
+		}
 		h.mu.Lock()
 		sc.replayText = rec.replayText
 		h.mu.Unlock()
@@ -205,7 +220,7 @@ func (h *hooks) takeGrant(c *codemode.PendingCall) string {
 		}
 		if g.matchParams {
 			if args == nil {
-				args = grantArgs(c.ScriptArgs)
+				args = grantArgs(c.ScriptArgs, c.ReasonField)
 			}
 			if ok, _ := inbox.MatchArgs(g.params, args); !ok {
 				continue

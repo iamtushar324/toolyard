@@ -152,7 +152,7 @@ func TestResumeWithoutACoveringGrantHoldsAgain(t *testing.T) {
 func TestStoredRunsRedactGrantTokens(t *testing.T) {
 	e := newEnv(t)
 	e.f.setHandler("demo.read", func(map[string]any) (*mcp.CallToolResult, error) {
-		return mcp.NewToolResultText(`{"grant": "tyg_aWQ.c2ln-_x"}`), nil
+		return mcp.NewToolResultText(`{"grant": "tyg_aWQ.c2lnbmF0dXJlLWJ5dGVzLW9mLWFuLWVkMjU1MTktc2lnbmF0dXJlLXRoYXQtaXMtbG9uZw"}`), nil
 	})
 	r := e.start(t, "ag_a", "a = demo.read(q=\"one\")\nprint(a)\nresult = a\n", "")
 	if r.Status != codemode.StatusSucceeded {
@@ -182,7 +182,7 @@ func TestResumeRerunsInboxReads(t *testing.T) {
 	fg := &fakeGrants{views: map[string]inbox.AgentView{}}
 	e, f := newEnvWith(t, []codemode.Tool{inboxStatus}, fg)
 	f.setHandler("inbox.status", func(map[string]any) (*mcp.CallToolResult, error) {
-		return mcp.NewToolResultText(`{"requests": [{"status": "approved", "tools": [{"grant": "tyg_aWQ.c2ln"}]}]}`), nil
+		return mcp.NewToolResultText(`{"requests": [{"status": "approved", "tools": [{"grant": "tyg_aWQ.c2lnbmF0dXJlLWJ5dGVzLW9mLWFuLWVkMjU1MTktc2lnbmF0dXJlLXRoYXQtaXMtbG9uZw"}]}]}`), nil
 	})
 	script := "s = toolyard.inbox_status(ids=[\"rq_1\"])\nb = demo.write(x=1)\nresult = {\"b\": b}\n"
 	held := e.start(t, "ag_a", script, "")
@@ -214,5 +214,57 @@ func TestCheckReasonRejectsInvalidUTF8(t *testing.T) {
 	}
 	if _, err := checkReason("a reason that is valid UTF-8, ünïcödé included"); err != nil {
 		t.Fatalf("checkReason(valid) = %v", err)
+	}
+}
+
+const testGrantToken = "tyg_aWQ.c2lnbmF0dXJlLWJ5dGVzLW9mLWFuLWVkMjU1MTktc2lnbmF0dXJlLXRoYXQtaXMtbG9uZw"
+
+func TestGrantArgsStripsTheToolsOwnReasonField(t *testing.T) {
+	args := map[string]any{"x": 1, "_reason": "the upstream's own parameter", "__toolyard_reason": "why", "_grant": "t", "_session_id": "s"}
+	got := grantArgs(args, "__toolyard_reason")
+	if _, ok := got["_reason"]; !ok || len(got) != 2 {
+		t.Fatalf("grantArgs(reason field __toolyard_reason) = %v, want x and the upstream's _reason", got)
+	}
+	got = grantArgs(map[string]any{"x": 1, "_reason": "why"}, "_reason")
+	if len(got) != 1 {
+		t.Fatalf("grantArgs(reason field _reason) = %v, want only x", got)
+	}
+}
+
+func TestCheckCodeRefusesAGrantToken(t *testing.T) {
+	if err := checkCode("result = demo.write(x=1, _grant=\"" + testGrantToken + "\")\n"); !isInput(err) {
+		t.Fatalf("checkCode(token) = %v, want an InputError", err)
+	}
+	if err := checkCode("tyg_count = 1\nresult = tyg_count\n"); err != nil {
+		t.Fatalf("checkCode(a name that starts with tyg_) = %v", err)
+	}
+}
+
+// A recorded answer that held a grant token is stored redacted, so a resume
+// cannot replay the same value: it stops with script_diverged instead of
+// giving the script a different value.
+func TestResumeRefusesToReplayARedactedAnswer(t *testing.T) {
+	e := newEnv(t)
+	e.f.setHandler("demo.read", func(map[string]any) (*mcp.CallToolResult, error) {
+		return mcp.NewToolResultText(`{"token": "` + testGrantToken + `"}`), nil
+	})
+	held := e.start(t, "ag_a", readWriteScript, "")
+	if held.Status != codemode.StatusPermissionRequired {
+		t.Fatalf("held = %+v", held)
+	}
+	e.grants.set("rq_1", inbox.AgentToolView{CallID: "call_1", Tool: "demo.write", Decision: "allowed", Grant: "tok-w"})
+	run, err := e.svc.Resume(context.Background(), ResumeRequest{AgentID: "ag_a", RunID: held.ID, RequestID: "rq_1"})
+	if err != nil {
+		t.Fatalf("resume: %v", err)
+	}
+	done := e.settle(t, "ag_a", run.ID)
+	if done.Status != codemode.StatusFailed || done.ErrorKind != codemode.ErrorScriptDiverged {
+		t.Fatalf("resumed = %+v", done)
+	}
+	if n := len(e.f.sent("demo.read")); n != 1 {
+		t.Fatalf("demo.read sent %d times, want 1", n)
+	}
+	if n := len(e.f.sent("demo.write")); n != 1 {
+		t.Fatalf("demo.write sent %d times, want 1 (nothing ran after the refusal)", n)
 	}
 }

@@ -215,7 +215,7 @@ func (s *session) handleCall(serverIdent, member string, args map[string]any) (r
 		}
 	}
 
-	pc := PendingCall{Seq: n, Tool: t.Server + "." + t.Name, Target: t.Target, Args: args, ScriptArgs: scriptArgs}
+	pc := PendingCall{Seq: n, Tool: t.Server + "." + t.Name, Target: t.Target, Args: args, ScriptArgs: scriptArgs, ReasonField: t.ReasonField}
 	st, err := s.begin(pc)
 	if err != nil {
 		return parentMsg{Error: fmt.Sprintf("tool call failed for %s: %v", label, err)}

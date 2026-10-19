@@ -23,12 +23,12 @@ const runColumns = `id, agent_id, COALESCE(session_id, ''), COALESCE(idempotency
 	COALESCE(result, ''), COALESCE(error_kind, ''), COALESCE(error_message, ''), COALESCE(logs, ''), COALESCE(held, ''),
 	created_at, updated_at, COALESCE(finished_at, 0)`
 
-// insertRun stores a new run.
 // runWriteTimeout bounds the writes that must not follow the client's
 // connection: a disconnect while one commits would leave a run row with
 // nothing to execute it.
 const runWriteTimeout = 10 * time.Second
 
+// insertRun stores a new run.
 func (s *Service) insertRun(ctx context.Context, r *Run) error {
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), runWriteTimeout)
 	defer cancel()
