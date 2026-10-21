@@ -10,6 +10,7 @@ import (
 	"math"
 	"net/http"
 	"runtime/debug"
+	"slices"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -229,6 +230,13 @@ type Gateway struct {
 	// upstream name, one connection per user inside it. A name is in
 	// either upstreams or perUser, never both.
 	perUser map[string]*perUserGroup
+
+	// catalogMu serialises the steps that install or drop a shared
+	// upstream's whole catalog: AddUpstream's register, RemoveUpstream and
+	// a catalog refresh. A refresh read from a connection that was removed
+	// or replaced meanwhile is then dropped, not applied. Taken before mu,
+	// never while holding it.
+	catalogMu sync.Mutex
 }
 
 // VisibilityProvider gives the gateway a way to compute, per request, which
@@ -481,12 +489,17 @@ func (g *Gateway) accessRequestHook(ctx context.Context, _ any, message any) err
 	var req struct {
 		Method string `json:"method"`
 		Params struct {
-			Name string `json:"name"`
+			Name string          `json:"name"`
+			Meta json.RawMessage `json:"_meta"`
 		} `json:"params"`
 	}
 	if err := json.Unmarshal(raw, &req); err != nil || req.Method != string(mcp.MethodToolsCall) {
 		return nil
 	}
+	// mcp-go runs this hook before it puts a 2026-07-28 request's protocol
+	// info on the context, so the client a denied call names comes from
+	// the request's own _meta.
+	ctx = withRequestMeta(ctx, req.Params.Meta)
 	g.mu.RLock()
 	entry, known := g.tools[req.Params.Name]
 	g.mu.RUnlock()
@@ -740,11 +753,15 @@ func (g *Gateway) AddUpstream(ctx context.Context, cfg UpstreamConfig) error {
 	if cfg.Transport == "github" {
 		return g.addGitHubUpstream(cfg)
 	}
-	if cfg.ProtocolVersion == "" && g.upstreamProtocol == ProtocolAuto {
-		cfg.ProtocolVersion = ProtocolAuto
-	}
+	// per_user connections stay on 2025-11-25 even in auto mode: each
+	// person's connection is created suspended and never lists tools, so a
+	// 2026-07-28 client would know none of the x-mcp-header parameters it
+	// must send, and a stateless connection would leave the per-user cap.
 	if cfg.PerUser {
 		return g.addPerUserUpstream(ctx, cfg)
+	}
+	if cfg.ProtocolVersion == "" && g.upstreamProtocol == ProtocolAuto {
+		cfg.ProtocolVersion = ProtocolAuto
 	}
 	// Pre-allocate a pool slot: if the live cap is full this suspends the
 	// LRU upstream first so the new one doesn't push us over.
@@ -760,10 +777,12 @@ func (g *Gateway) AddUpstream(ctx context.Context, cfg UpstreamConfig) error {
 		_ = u.close()
 		return err
 	}
+	g.catalogMu.Lock()
 	g.mu.Lock()
 	g.upstreams[cfg.Name] = u
 	g.mu.Unlock()
 	g.registerUpstreamTools(cfg.Name, tools, u)
+	g.catalogMu.Unlock()
 	// Concurrent adds dial through untracked probes. Once their catalogs
 	// are registered, reclaim any idle overflow in the shared pool.
 	g.trimIdlePool(u)
@@ -774,8 +793,10 @@ func (g *Gateway) AddUpstream(ctx context.Context, cfg UpstreamConfig) error {
 // "<name>.<tool>" and returns the names it registered. With ref set, each
 // tool's handler calls that connection; with ref nil (a per_user upstream)
 // the handler is left empty and dispatch picks the caller's connection.
+// The catalog goes to mcp-go in one batch, so clients get one
+// notifications/tools/list_changed, not one per tool.
 func (g *Gateway) registerUpstreamTools(name string, tools []mcp.Tool, ref *upstream) []string {
-	registered := make([]string, 0, len(tools))
+	entries := make([]toolEntry, 0, len(tools))
 	for _, t := range tools {
 		original := t.Name
 		wrapped, field := wrapSchema(t)
@@ -800,9 +821,21 @@ func (g *Gateway) registerUpstreamTools(name string, tools []mcp.Tool, ref *upst
 				}
 			}(original)
 		}
-		g.registerEntry(entry)
-		registered = append(registered, wrapped.Name)
+		entries = append(entries, entry)
 	}
+	if len(entries) == 0 {
+		return nil
+	}
+	registered := make([]string, len(entries))
+	batch := make([]server.ServerTool, len(entries))
+	g.mu.Lock()
+	for i, e := range entries {
+		g.tools[e.tool.Name] = e
+		registered[i] = e.tool.Name
+		batch[i] = server.ServerTool{Tool: e.tool, Handler: g.handlerFor(e.tool.Name)}
+	}
+	g.mu.Unlock()
+	g.mcp.AddTools(batch...)
 	return registered
 }
 
@@ -845,7 +878,9 @@ func (g *Gateway) RefreshUpstreamCatalogs(ctx context.Context) int {
 		if sameTools(before, tools) {
 			continue
 		}
-		g.replaceUpstreamTools(name, tools, u)
+		if !g.replaceUpstreamTools(name, tools, u) {
+			continue
+		}
 		log.Printf("catalog-refresh: %s: catalog changed (%d tools)", u.label(), len(tools))
 		changed++
 	}
@@ -854,8 +889,18 @@ func (g *Gateway) RefreshUpstreamCatalogs(ctx context.Context) int {
 
 // replaceUpstreamTools registers an upstream's new catalog, then removes
 // its tools that the new catalog no longer has (registering first leaves
-// no moment without the tools that stay).
-func (g *Gateway) replaceUpstreamTools(name string, tools []mcp.Tool, ref *upstream) {
+// no moment without the tools that stay). It applies nothing, and returns
+// false, when ref is no longer the connection registered under name (the
+// upstream was removed or reconnected while its catalog was read).
+func (g *Gateway) replaceUpstreamTools(name string, tools []mcp.Tool, ref *upstream) bool {
+	g.catalogMu.Lock()
+	defer g.catalogMu.Unlock()
+	g.mu.RLock()
+	current := g.upstreams[name] == ref
+	g.mu.RUnlock()
+	if !current || ref.retired.Load() {
+		return false
+	}
 	keep := map[string]bool{}
 	for _, n := range g.registerUpstreamTools(name, tools, ref) {
 		keep[n] = true
@@ -872,16 +917,25 @@ func (g *Gateway) replaceUpstreamTools(name string, tools []mcp.Tool, ref *upstr
 	if len(gone) > 0 {
 		g.mcp.DeleteTools(gone...)
 	}
+	return true
 }
 
-// sameTools reports whether two catalogs are the same, tool for tool.
+// sameTools reports whether two catalogs are the same, tool for tool. The
+// order does not count: an upstream that lists in a different order each
+// time is not re-registered and announced on every refresh.
 func sameTools(a, b []mcp.Tool) bool {
 	if len(a) != len(b) {
 		return false
 	}
-	ja, errA := json.Marshal(a)
-	jb, errB := json.Marshal(b)
+	ja, errA := json.Marshal(sortedByName(a))
+	jb, errB := json.Marshal(sortedByName(b))
 	return errA == nil && errB == nil && bytes.Equal(ja, jb)
+}
+
+func sortedByName(tools []mcp.Tool) []mcp.Tool {
+	out := slices.Clone(tools)
+	slices.SortFunc(out, func(x, y mcp.Tool) int { return strings.Compare(x.Name, y.Name) })
+	return out
 }
 
 // allUpstreams snapshots every connection in the pool: the shared
@@ -917,11 +971,13 @@ func (g *Gateway) Close() error {
 // tools from the gateway catalog (and from the underlying MCP server). For
 // a per_user upstream every person's connection is closed.
 func (g *Gateway) RemoveUpstream(name string) error {
+	g.catalogMu.Lock()
 	g.mu.Lock()
 	u, ok := g.upstreams[name]
 	pu, okPU := g.perUser[name]
 	if !ok && !okPU {
 		g.mu.Unlock()
+		g.catalogMu.Unlock()
 		return ErrUpstreamNotFound
 	}
 	delete(g.upstreams, name)
@@ -939,6 +995,7 @@ func (g *Gateway) RemoveUpstream(name string) error {
 	g.mu.Unlock()
 
 	g.mcp.DeleteTools(toRemove...)
+	g.catalogMu.Unlock()
 	if u != nil {
 		// Retire, not just close: a resume dialling right now (an idle
 		// stdio server waking up) would otherwise install a client on an

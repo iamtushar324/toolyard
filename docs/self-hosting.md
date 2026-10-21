@@ -244,8 +244,10 @@ upstream again and applies what changed: new and changed tools are
 registered, removed ones go, and connected clients get
 `notifications/tools/list_changed`. A suspended upstream is not dialled for
 it, and the read does not count as use for `-upstream-idle-timeout`. An
-upstream tool whose `x-mcp-header` annotations are invalid is left out
-(logged), not registered.
+upstream that restarted and forgot toolyard's session gets a new one, and
+its catalog is read again in the same refresh. An upstream tool whose
+`x-mcp-header` annotations are invalid is left out (logged), not
+registered.
 
 ### MCP protocol versions
 
@@ -274,11 +276,15 @@ Toward upstreams, `-upstream-protocol` chooses the version:
 
 - `legacy` (default): every upstream connection speaks 2025-11-25, as
   before 2026-07-28 support.
-- `auto`: an http upstream gets one `server/discover` at its first dial.
-  When it offers 2026-07-28, every call is one stateless `POST`, with no
-  session to recover, outside `-upstream-max-live` and the idle sweep.
-  Otherwise toolyard initializes at 2025-11-25 and asks for that version
-  straight away on later dials. stdio upstreams stay on 2025-11-25.
+- `auto`: a shared http upstream gets one `server/discover` at its first
+  dial. When it offers 2026-07-28, every call is one stateless `POST`, with
+  no session to recover, outside `-upstream-max-live` and the idle sweep.
+  Otherwise (no `server/discover`, or a server that answers it with
+  `UNSUPPORTED_PROTOCOL_VERSION` and lists only earlier versions) toolyard
+  initializes at 2025-11-25 and asks for that version straight away on
+  later dials. When a 2026-07-28 upstream is rolled back to a server that
+  wants a session, the call it turns away probes again and is retried
+  once. stdio and `per_user` upstreams stay on 2025-11-25.
 
 ## Inbox and permissions
 

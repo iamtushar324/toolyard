@@ -14,6 +14,7 @@ package gateway
 
 import (
 	"context"
+	"encoding/json"
 	"log"
 	"strings"
 	"sync"
@@ -145,19 +146,45 @@ func (g *Gateway) rememberClient(ctx context.Context, _ any, req *mcp.Initialize
 // has nothing for it; and the request names its own client, so it wins
 // over any cached entry for the agent.
 func requestClient(ctx context.Context) (clientInfo, bool) {
-	info := server.RequestProtocolInfoFromContext(ctx)
-	if info == nil || !info.Modern || info.ClientInfo == nil {
+	var impl *mcp.Implementation
+	if info := server.RequestProtocolInfoFromContext(ctx); info != nil && info.Modern {
+		impl = info.ClientInfo
+	} else {
+		impl, _ = ctx.Value(requestMetaClientKey{}).(*mcp.Implementation)
+	}
+	if impl == nil {
 		return clientInfo{}, false
 	}
-	name := actor.Clean(info.ClientInfo.Name)
+	name := actor.Clean(impl.Name)
 	if name == "" {
 		return clientInfo{}, false
 	}
 	ci := clientInfo{name: name, kind: ClientKindOf(name)}
-	if v := actor.Clean(info.ClientInfo.Version); v != "" {
+	if v := actor.Clean(impl.Version); v != "" {
 		ci.name = name + "/" + v
 	}
 	return ci, true
+}
+
+// requestMetaClientKey carries the clientInfo withRequestMeta read from a
+// request's raw _meta.
+type requestMetaClientKey struct{}
+
+// withRequestMeta puts the clientInfo of a 2026-07-28 request's raw _meta
+// on ctx, for code that runs before mcp-go has parsed it (the access
+// hook). A legacy or malformed _meta leaves ctx as it is.
+func withRequestMeta(ctx context.Context, meta json.RawMessage) context.Context {
+	var m map[string]json.RawMessage
+	if len(meta) == 0 || json.Unmarshal(meta, &m) != nil {
+		return ctx
+	}
+	var version string
+	var impl mcp.Implementation
+	if json.Unmarshal(m[mcp.MetaKeyProtocolVersion], &version) != nil || !mcp.IsModernProtocol(version) ||
+		json.Unmarshal(m[mcp.MetaKeyClientInfo], &impl) != nil {
+		return ctx
+	}
+	return context.WithValue(ctx, requestMetaClientKey{}, &impl)
 }
 
 // clientFor returns the cached clientInfo for the client a raiser

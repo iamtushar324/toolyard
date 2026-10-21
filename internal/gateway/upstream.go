@@ -172,6 +172,14 @@ type upstream struct {
 // session and no subprocess, so suspending it frees nothing.
 func (u *upstream) pooled() bool { return !u.modern.Load() }
 
+// forgetSettled makes the next dial probe the protocol again instead of
+// asking for the version an earlier dial settled on.
+func (u *upstream) forgetSettled() {
+	u.dialMu.Lock()
+	u.settled = ""
+	u.dialMu.Unlock()
+}
+
 // withoutForwardedKey drops any forwarded identity key from ctx. The
 // upstream's own protocol traffic (initialize, tools/list, a re-dial after
 // an idle suspend) runs under the gateway's shared credentials only; a
@@ -242,7 +250,19 @@ func newUpstream(ctx context.Context, cfg UpstreamConfig) (*upstream, error) {
 	initReq.Params.ProtocolVersion = requestedProtocol(cfg)
 	initReq.Params.ClientInfo = mcp.Implementation{Name: "toolyard-gateway", Version: "0.1.0"}
 	if _, err := c.Initialize(startCtx, initReq); err != nil {
-		return nil, fmt.Errorf("init upstream %s: %w", cfg.Name, err)
+		// A server that answers the probe with UNSUPPORTED_PROTOCOL_VERSION
+		// and lists only session-based versions (an mcp-go v1 server
+		// restricted with WithStreamableHTTPProtocolVersions) knows
+		// 2026-07-28 but will not speak it, and mcp-go returns that error
+		// without trying initialize: ask for 2025-11-25 once.
+		requested := initReq.Params.ProtocolVersion
+		if !mcp.IsUnsupportedProtocolVersion(err) || (requested != "" && !mcp.IsModernProtocol(requested)) {
+			return nil, fmt.Errorf("init upstream %s: %w", cfg.Name, err)
+		}
+		initReq.Params.ProtocolVersion = mcp.LATEST_LEGACY_PROTOCOL_VERSION
+		if _, err := c.Initialize(startCtx, initReq); err != nil {
+			return nil, fmt.Errorf("init upstream %s: %w", cfg.Name, err)
+		}
 	}
 	u := &upstream{cfg: cfg, client: c}
 	negotiated := c.ProtocolVersion()
@@ -317,9 +337,15 @@ func (u *upstream) toolsSnapshot() []mcp.Tool {
 // sent. The read holds the connection like a call, so the idle sweep and
 // the pool leave it open meanwhile, but it does not move lastUsed: a
 // refresh is not use and never keeps a connection from going idle.
+//
+// An upstream that restarted (often the very moment its catalog changed)
+// no longer knows our session; that is recovered as in callTool and the
+// catalog read once more, so a rarely called upstream's new tools still
+// show up.
 func (u *upstream) refreshTools(ctx context.Context) (tools []mcp.Tool, live bool, err error) {
 	u.mu.Lock()
-	if u.client == nil || u.retired.Load() {
+	c := u.client
+	if c == nil || u.retired.Load() {
 		u.mu.Unlock()
 		return nil, false, nil
 	}
@@ -329,7 +355,23 @@ func (u *upstream) refreshTools(ctx context.Context) (tools []mcp.Tool, live boo
 		u.mu.Lock()
 		u.active--
 		u.mu.Unlock()
+		if u.pool != nil {
+			u.pool.trimIdlePool(u)
+		}
 	}()
+	tools, err = u.listTools(ctx)
+	reason, ok := sessionErrorReason(err)
+	if !ok || u.modern.Load() {
+		return tools, true, err
+	}
+	idle := u.lastUsed.Load()
+	if rerr := u.recoverSession(c, reason); rerr != nil {
+		return nil, true, fmt.Errorf("session lost (%s) and reconnect failed: %w", reason, rerr)
+	}
+	// The re-dial reset the idle clock, and a refresh is not use. (A call
+	// that ran entirely inside the re-dial loses its mark too; at worst
+	// the connection is suspended early and the next call dials again.)
+	u.lastUsed.Store(idle)
 	tools, err = u.listTools(ctx)
 	return tools, true, err
 }
@@ -364,12 +406,21 @@ func (u *upstream) callTool(ctx context.Context, name string, args map[string]an
 	if err == nil {
 		return res, nil
 	}
-	// A 2026-07-28 connection has no session: mcp-go maps any HTTP 404
-	// (such as a modern METHOD_NOT_FOUND) to ErrSessionTerminated, which
-	// must not cost a re-dial and a second attempt.
 	reason, ok := sessionErrorReason(err)
-	if !ok || u.modern.Load() {
+	if !ok {
 		return nil, err
+	}
+	if u.modern.Load() {
+		// A 2026-07-28 connection has no session: mcp-go maps any HTTP 404
+		// (such as a modern METHOD_NOT_FOUND) to ErrSessionTerminated,
+		// which must not cost a re-dial and a second attempt. A 400 that
+		// asks for a session means the server went back to 2025-11-25 (a
+		// rollback): dial it again with a fresh probe.
+		if errors.Is(err, transport.ErrSessionTerminated) {
+			return nil, err
+		}
+		u.forgetSettled()
+		reason = "server asks for a session again"
 	}
 	if rerr := u.recoverSession(c, reason); rerr != nil {
 		return nil, fmt.Errorf("upstream %s: session lost (%s) and reconnect failed: %w", u.cfg.Name, reason, rerr)

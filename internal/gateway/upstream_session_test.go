@@ -30,6 +30,7 @@ const sessionTestHeader = "x-bk-bifrost-vk"
 type forgetfulUpstream struct {
 	srv  *httptest.Server
 	mode string
+	m    *server.MCPServer // the server behind the handler, to change its catalog
 
 	mu        sync.Mutex
 	current   string          // the session id the client is using
@@ -61,7 +62,7 @@ func newForgetfulUpstream(t *testing.T, mode string) *forgetfulUpstream {
 		return nil, errors.New("session not found")
 	})
 	inner := server.NewStreamableHTTPServer(m)
-	f := &forgetfulUpstream{mode: mode, forgotten: map[string]bool{}, counts: map[string]int{}, identity: map[string][]string{}}
+	f := &forgetfulUpstream{mode: mode, m: m, forgotten: map[string]bool{}, counts: map[string]int{}, identity: map[string][]string{}}
 	f.srv = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		var msg struct {
 			ID     json.RawMessage `json:"id"`

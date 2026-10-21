@@ -8,6 +8,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -435,4 +436,173 @@ func TestUpstreamToolWithInvalidHeaderAnnotationIsSkipped(t *testing.T) {
 	if hasTool(f.gw, "hdr.get_bad") {
 		t.Fatal("the tool with an invalid x-mcp-header was registered")
 	}
+}
+
+// A 2026-07-28 client on a stateful endpoint (toolyard's default,
+// -stateless-mcp=false) also works without initialize or a session.
+func TestModernClientOnStatefulEndpoint(t *testing.T) {
+	f := newActorFixture(t)
+	h := server.NewStreamableHTTPServer(f.gw.MCPServer(),
+		server.WithHTTPContextFunc(func(ctx context.Context, _ *http.Request) context.Context {
+			return WithAgentID(ctx, "ag_stateful")
+		}),
+	)
+	srv, wire := recordWire(t, h, nil)
+	c := dialMCP(t, srv.URL, "", "t3-code", "2.0")
+	if v := c.ProtocolVersion(); v != mcp.ProtocolVersion20260728 {
+		t.Fatalf("negotiated %q, want %q", v, mcp.ProtocolVersion20260728)
+	}
+	if got := callText(t, c, "t.get_status"); got != "ran" {
+		t.Fatalf("tools/call answered %q", got)
+	}
+	if wire.count("initialize") != 0 || wire.sessions() != 0 {
+		t.Fatalf("initialize=%d session requests=%d, want 0 and 0", wire.count("initialize"), wire.sessions())
+	}
+}
+
+// -upstream-protocol=auto against an mcp-go v1 server restricted to the
+// session-based versions: it answers the probe with
+// UNSUPPORTED_PROTOCOL_VERSION, and the dial goes on with initialize at
+// 2025-11-25.
+func TestAutoUpstreamFallsBackOnUnsupportedVersion(t *testing.T) {
+	m := server.NewMCPServer("up", "1.0.0")
+	m.AddTool(mcp.NewTool("get_ok"), okTool)
+	ts, wire := recordWire(t, server.NewStreamableHTTPServer(m,
+		server.WithStreamableHTTPProtocolVersions(mcp.LegacyProtocolVersions()...)), nil)
+	f := newActorFixture(t)
+	f.gw.upstreamProtocol = ProtocolAuto
+	u := addedUpstream(t, f.gw, "pinned", ts.URL)
+	if u.modern.Load() || !u.pooled() || u.settled != mcp.ProtocolVersion20251125 {
+		t.Fatalf("modern=%v pooled=%v settled=%q, want false true %q", u.modern.Load(), u.pooled(), u.settled, mcp.ProtocolVersion20251125)
+	}
+	if wire.count("server/discover") != 1 || wire.count("initialize") != 1 {
+		t.Fatalf("server/discover=%d initialize=%d, want 1 and 1", wire.count("server/discover"), wire.count("initialize"))
+	}
+	if res, err := u.callTool(context.Background(), "get_ok", nil); err != nil || res.IsError {
+		t.Fatalf("call: %v %+v", err, res)
+	}
+}
+
+// sessionOnly turns away every POST without an Mcp-Session-Id, initialize
+// aside, as a 2025-11-25 server does: HTTP 400 with JSON-RPC -32000, byte
+// for byte what beknown-services mcp-server sends.
+func sessionOnly(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		r.Body = io.NopCloser(bytes.NewReader(body))
+		var msg struct {
+			Method string `json:"method"`
+		}
+		_ = json.Unmarshal(body, &msg)
+		if r.Method == http.MethodPost && msg.Method != string(mcp.MethodInitialize) && r.Header.Get("Mcp-Session-Id") == "" {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadRequest)
+			_, _ = io.WriteString(w, `{"jsonrpc":"2.0","error":{"code":-32000,"message":"Invalid session or missing initialization"},"id":null}`)
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+// An auto upstream that spoke 2026-07-28 and was then rolled back to a
+// session-based server: the call that the server turns away for want of a
+// session probes again, settles on 2025-11-25 and is retried once.
+func TestAutoUpstreamRedialsAfterRollback(t *testing.T) {
+	m := server.NewMCPServer("up", "1.0.0")
+	m.AddTool(mcp.NewTool("get_ok"), okTool)
+	var mu sync.Mutex
+	current := http.Handler(server.NewStreamableHTTPServer(m))
+	ts, wire := recordWire(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		h := current
+		mu.Unlock()
+		h.ServeHTTP(w, r)
+	}), nil)
+	f := newActorFixture(t)
+	f.gw.upstreamProtocol = ProtocolAuto
+	u := addedUpstream(t, f.gw, "up", ts.URL)
+	if !u.modern.Load() {
+		t.Fatal("the upstream should start on 2026-07-28")
+	}
+
+	mu.Lock()
+	current = sessionOnly(server.NewStreamableHTTPServer(m,
+		server.WithStreamableHTTPProtocolVersions(mcp.LegacyProtocolVersions()...)))
+	mu.Unlock()
+	res, err := u.callTool(context.Background(), "get_ok", nil)
+	if err != nil || res.IsError {
+		t.Fatalf("call after the rollback: %v %+v", err, res)
+	}
+	u.dialMu.Lock()
+	settled := u.settled
+	u.dialMu.Unlock()
+	if u.modern.Load() || !u.pooled() || settled != mcp.ProtocolVersion20251125 {
+		t.Fatalf("modern=%v pooled=%v settled=%q, want false true %q", u.modern.Load(), u.pooled(), settled, mcp.ProtocolVersion20251125)
+	}
+	if wire.count("server/discover") != 2 || wire.count("initialize") != 1 {
+		t.Fatalf("server/discover=%d initialize=%d, want 2 (a fresh probe) and 1", wire.count("server/discover"), wire.count("initialize"))
+	}
+	if got := u.recoveries.Load(); got != 1 {
+		t.Fatalf("recoveries = %d, want 1", got)
+	}
+}
+
+// noUsersAuth is a PerUserAuth with nobody signed in.
+type noUsersAuth struct{}
+
+func (noUsersAuth) ConnectedUsers(context.Context, string) ([]string, error)     { return nil, nil }
+func (noUsersAuth) UserConnected(context.Context, string, string) (bool, error)  { return false, nil }
+func (noUsersAuth) FreshenUserToken(context.Context, string, string) error       { return nil }
+func (noUsersAuth) RefreshUserToken(context.Context, string, string) error       { return nil }
+func (noUsersAuth) MarkUserUnauthorized(context.Context, string, string, string) {}
+
+// per_user connections stay on 2025-11-25 in auto mode.
+func TestPerUserUpstreamStaysLegacyInAutoMode(t *testing.T) {
+	f := newActorFixture(t)
+	f.gw.upstreamProtocol = ProtocolAuto
+	err := f.gw.AddUpstream(context.Background(), UpstreamConfig{
+		Name: "pu", Transport: "http", URL: "http://127.0.0.1:1", PerUser: true, PerUserAuth: noUsersAuth{},
+	})
+	if !errors.Is(err, ErrWaitingForSignIn) {
+		t.Fatalf("add: %v, want ErrWaitingForSignIn", err)
+	}
+	f.gw.mu.RLock()
+	pu := f.gw.perUser["pu"]
+	f.gw.mu.RUnlock()
+	if pu == nil {
+		t.Fatal("the per_user upstream was not added")
+	}
+	if pu.cfg.ProtocolVersion != "" {
+		t.Fatalf("per_user config protocol = %q, want \"\" (2025-11-25)", pu.cfg.ProtocolVersion)
+	}
+}
+
+// A 2026-07-28 call that the access hook denies still names its client:
+// the hook runs before mcp-go parses the request's _meta, so it reads the
+// clientInfo from the raw message.
+func TestDeniedModernCallKeepsClientName(t *testing.T) {
+	f := newAccessFixture(t, nil)
+	msg, _ := json.Marshal(map[string]any{
+		"jsonrpc": "2.0", "id": 3, "method": "tools/call",
+		"params": map[string]any{
+			"name":      "beta.get_status",
+			"arguments": map[string]any{ReasonField: testReason},
+			"_meta": map[string]any{
+				mcp.MetaKeyProtocolVersion: mcp.ProtocolVersion20260728,
+				mcp.MetaKeyClientInfo:      map[string]any{"name": "t3-code", "version": "2.0"},
+			},
+		},
+	})
+	f.gw.MCPServer().HandleMessage(f.member, json.RawMessage(msg))
+	f.met.mu.Lock()
+	defer f.met.mu.Unlock()
+	for _, e := range f.met.events {
+		if e.ToolName == "beta.get_status" {
+			if e.ClientKind != "t3" {
+				t.Fatalf("denied call client kind = %q, want t3", e.ClientKind)
+			}
+			return
+		}
+	}
+	t.Fatal("no metrics event for the denied call")
 }
