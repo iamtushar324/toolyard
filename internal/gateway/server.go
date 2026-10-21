@@ -777,16 +777,22 @@ func (g *Gateway) AddUpstream(ctx context.Context, cfg UpstreamConfig) error {
 		_ = u.close()
 		return err
 	}
-	g.catalogMu.Lock()
-	g.mu.Lock()
-	g.upstreams[cfg.Name] = u
-	g.mu.Unlock()
-	g.registerUpstreamTools(cfg.Name, tools, u)
-	g.catalogMu.Unlock()
+	g.installUpstream(cfg.Name, tools, u)
 	// Concurrent adds dial through untracked probes. Once their catalogs
 	// are registered, reclaim any idle overflow in the shared pool.
 	g.trimIdlePool(u)
 	return nil
+}
+
+// installUpstream puts a dialled shared upstream and its catalog in place,
+// under catalogMu.
+func (g *Gateway) installUpstream(name string, tools []mcp.Tool, u *upstream) {
+	g.catalogMu.Lock()
+	defer g.catalogMu.Unlock()
+	g.mu.Lock()
+	g.upstreams[name] = u
+	g.mu.Unlock()
+	g.registerUpstreamTools(name, tools, u)
 }
 
 // registerUpstreamTools wraps an upstream's tools into the catalog under
@@ -971,14 +977,34 @@ func (g *Gateway) Close() error {
 // tools from the gateway catalog (and from the underlying MCP server). For
 // a per_user upstream every person's connection is closed.
 func (g *Gateway) RemoveUpstream(name string) error {
+	u, pu, err := g.dropUpstream(name)
+	if err != nil {
+		return err
+	}
+	if u != nil {
+		// Retire, not just close: a resume dialling right now (an idle
+		// stdio server waking up) would otherwise install a client on an
+		// upstream nothing tracks any more.
+		u.retire()
+	}
+	if pu != nil {
+		pu.closeAll()
+	}
+	return nil
+}
+
+// dropUpstream takes an upstream (shared or per_user) and all of its tools
+// out of the catalog, under catalogMu, and returns what the caller must
+// close.
+func (g *Gateway) dropUpstream(name string) (*upstream, *perUserGroup, error) {
 	g.catalogMu.Lock()
+	defer g.catalogMu.Unlock()
 	g.mu.Lock()
 	u, ok := g.upstreams[name]
 	pu, okPU := g.perUser[name]
 	if !ok && !okPU {
 		g.mu.Unlock()
-		g.catalogMu.Unlock()
-		return ErrUpstreamNotFound
+		return nil, nil, ErrUpstreamNotFound
 	}
 	delete(g.upstreams, name)
 	delete(g.perUser, name)
@@ -993,19 +1019,8 @@ func (g *Gateway) RemoveUpstream(name string) error {
 		delete(g.tools, k)
 	}
 	g.mu.Unlock()
-
 	g.mcp.DeleteTools(toRemove...)
-	g.catalogMu.Unlock()
-	if u != nil {
-		// Retire, not just close: a resume dialling right now (an idle
-		// stdio server waking up) would otherwise install a client on an
-		// upstream nothing tracks any more.
-		u.retire()
-	}
-	if pu != nil {
-		pu.closeAll()
-	}
-	return nil
+	return u, pu, nil
 }
 
 // SweepIdleStdioUpstreams suspends any upstream (stdio or http) whose last
