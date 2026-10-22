@@ -236,8 +236,55 @@ Then:
 ./toolyard serve -upstreams upstreams.json
 ```
 
-Upstreams' tool catalogs are fetched at startup, schema-wrapped, and
-registered under `<upstream-name>.<original-tool-name>`.
+Upstreams' tool catalogs are fetched at startup (every page of a paged
+`tools/list`), schema-wrapped, and registered under
+`<upstream-name>.<original-tool-name>`. Every `-catalog-refresh` (default
+`15m`, `0` disables) toolyard reads the catalog of each live shared
+upstream again and applies what changed: new and changed tools are
+registered, removed ones go, and connected clients get
+`notifications/tools/list_changed`. A suspended upstream is not dialled for
+it, and the read does not count as use for `-upstream-idle-timeout`. An
+upstream that restarted and forgot toolyard's session gets a new one, and
+its catalog is read again in the same refresh. An upstream tool whose
+`x-mcp-header` annotations are invalid is left out (logged), not
+registered.
+
+### MCP protocol versions
+
+`/mcp` serves MCP 2026-07-28 and the earlier versions (2025-11-25 and
+before) on the same endpoint; each request's version decides how it is
+handled.
+
+- A 2026-07-28 client sends no `initialize` and gets no session: it starts
+  with `server/discover`, and every request carries its version, client
+  capabilities and client info in `_meta` plus the `Mcp-Protocol-Version`
+  and `Mcp-Method` (and `Mcp-Name`) headers. A request whose headers do
+  not match its body is refused with `400`. The audit log names the
+  client from each request's `_meta`.
+- `tools/list` answers 2026-07-28 clients with `cacheScope: private`
+  (each caller sees its own catalog) and `ttlMs: 60000`.
+- An earlier client initializes as before; `-stateless-mcp` still applies
+  to it.
+- A 2026-07-28 notification stream (`subscriptions/listen`, a long-lived
+  `POST`) drains like a `GET` stream (see *Shutdown and drain*).
+- Without `-public-url`, a request on a loopback address must carry a
+  loopback `Host` (DNS rebinding protection). With `-public-url` that
+  check is off: `/mcp` then always needs a token, and the reverse proxy
+  sends the public `Host`.
+
+Toward upstreams, `-upstream-protocol` chooses the version:
+
+- `legacy` (default): every upstream connection speaks 2025-11-25, as
+  before 2026-07-28 support.
+- `auto`: a shared http upstream gets one `server/discover` at its first
+  dial. When it offers 2026-07-28, every call is one stateless `POST`, with
+  no session to recover, outside `-upstream-max-live` and the idle sweep.
+  Otherwise (no `server/discover`, or a server that answers it with
+  `UNSUPPORTED_PROTOCOL_VERSION` and lists only earlier versions) toolyard
+  initializes at 2025-11-25 and asks for that version straight away on
+  later dials. When a 2026-07-28 upstream is rolled back to a server that
+  wants a session, the call it turns away probes again and is retried
+  once. stdio and `per_user` upstreams stay on 2025-11-25.
 
 ## Inbox and permissions
 
@@ -801,9 +848,10 @@ keeps at most 64 label sets; later new values are counted under `other`.
 On SIGTERM (or SIGINT) toolyard drains before it exits:
 
 1. Readiness turns `503` (`draining`), new tool calls get a retryable
-   refusal, and a new MCP stream `GET` gets `503`, so a load balancer stops
+   refusal, and a new MCP stream (a `GET`, or a 2026-07-28
+   `subscriptions/listen` `POST`) gets `503`, so a load balancer stops
    sending work.
-2. After `-drain-delay` (default `3s`), open MCP `GET` streams and
+2. After `-drain-delay` (default `3s`), open MCP streams and
    dashboard event streams close, a new dashboard stream gets `503`, so
    clients reconnect to another instance, and the HTTP server stops
    accepting new requests.

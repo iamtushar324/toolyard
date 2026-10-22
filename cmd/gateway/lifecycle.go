@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"log/slog"
 	"net/http"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -36,6 +37,7 @@ const (
 	loopNotesScanner   = "notes-scanner"
 	loopSkillsScanner  = "skills-scanner"
 	loopIdleSweeper    = "upstream-idle-sweeper"
+	loopCatalogRefresh = "upstream-catalog-refresh"
 	goCodemodeProbe    = "codemode-probe"
 )
 
@@ -213,11 +215,12 @@ func closeOnce(name string, timeout time.Duration, fn func(context.Context) erro
 	}
 }
 
-// mcpStreamGate ends long-lived MCP GET streams at shutdown. In stateful
-// mode mcp-go's GET handler (the server-to-client notification stream)
-// runs until its request context ends, and http.Server.Shutdown never
-// cancels a request context, so one open stream would hold every stop for
-// the full -drain-timeout. POSTs (the tool calls) pass straight through.
+// mcpStreamGate ends long-lived MCP streams at shutdown: a GET (the
+// 2025-11-25 server-to-client notification stream, stateful mode) and a
+// 2026-07-28 subscriptions/listen POST. mcp-go holds either one open until
+// its request context ends, and http.Server.Shutdown never cancels a
+// request context, so one open stream would hold every stop for the full
+// -drain-timeout. Other POSTs (the tool calls) pass straight through.
 type mcpStreamGate struct {
 	refusing atomic.Bool
 	// streams is the parent of every GET stream's context; release
@@ -234,7 +237,7 @@ func newMCPStreamGate() *mcpStreamGate {
 // wrap applies the gate to the /mcp handler.
 func (g *mcpStreamGate) wrap(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodGet {
+		if !isMCPStream(r) {
 			next.ServeHTTP(w, r)
 			return
 		}
@@ -254,11 +257,23 @@ func (g *mcpStreamGate) wrap(next http.Handler) http.Handler {
 	})
 }
 
-// refuse answers new GET streams with 503 and Retry-After (drain step 2).
+// isMCPStream reports whether r opens a long-lived MCP stream. A
+// subscriptions/listen request is told by its Mcp-Method header alone:
+// mcp-go refuses a 2026-07-28 request whose Mcp-Method header is missing
+// or differs from the method in its body, and the method does not exist
+// in older protocol versions.
+func isMCPStream(r *http.Request) bool {
+	if r.Method == http.MethodGet {
+		return true
+	}
+	return r.Method == http.MethodPost &&
+		strings.EqualFold(strings.TrimSpace(r.Header.Get("Mcp-Method")), "subscriptions/listen")
+}
+
+// refuse answers new streams with 503 and Retry-After (drain step 2).
 func (g *mcpStreamGate) refuse() { g.refusing.Store(true) }
 
-// release ends every open GET stream (drain step 4). New ones stay
-// refused.
+// release ends every open stream (drain step 4). New ones stay refused.
 func (g *mcpStreamGate) release() {
 	g.refusing.Store(true)
 	g.cancel()

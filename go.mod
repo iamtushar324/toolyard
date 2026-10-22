@@ -10,7 +10,7 @@ require (
 	github.com/google/uuid v1.6.0
 	github.com/jackc/pgx/v5 v5.11.0
 	github.com/joho/godotenv v1.5.1
-	github.com/mark3labs/mcp-go v0.52.0
+	github.com/mark3labs/mcp-go v1.3.0
 	github.com/mattn/go-sqlite3 v1.14.44
 	go.starlark.net v0.0.0-20260908191801-89a6a09411d5
 	golang.org/x/crypto v0.50.0

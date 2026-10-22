@@ -14,6 +14,7 @@ package gateway
 
 import (
 	"context"
+	"encoding/json"
 	"log"
 	"strings"
 	"sync"
@@ -75,7 +76,8 @@ func ClientKindOf(name string) string {
 	return "unknown"
 }
 
-// clientInfo is what a client said about itself at initialize.
+// clientInfo is what a client said about itself at initialize
+// (2025-11-25 and earlier) or in a request's _meta (2026-07-28).
 type clientInfo struct {
 	name string // "name/version"
 	kind string
@@ -139,6 +141,52 @@ func (g *Gateway) rememberClient(ctx context.Context, _ any, req *mcp.Initialize
 	g.clientMu.Unlock()
 }
 
+// requestClient is the clientInfo a 2026-07-28 client sent in this
+// request's _meta. Such a client never sends initialize, so rememberClient
+// has nothing for it; and the request names its own client, so it wins
+// over any cached entry for the agent.
+func requestClient(ctx context.Context) (clientInfo, bool) {
+	var impl *mcp.Implementation
+	if info := server.RequestProtocolInfoFromContext(ctx); info != nil && info.Modern {
+		impl = info.ClientInfo
+	} else {
+		impl, _ = ctx.Value(requestMetaClientKey{}).(*mcp.Implementation)
+	}
+	if impl == nil {
+		return clientInfo{}, false
+	}
+	name := actor.Clean(impl.Name)
+	if name == "" {
+		return clientInfo{}, false
+	}
+	ci := clientInfo{name: name, kind: ClientKindOf(name)}
+	if v := actor.Clean(impl.Version); v != "" {
+		ci.name = name + "/" + v
+	}
+	return ci, true
+}
+
+// requestMetaClientKey carries the clientInfo withRequestMeta read from a
+// request's raw _meta.
+type requestMetaClientKey struct{}
+
+// withRequestMeta puts the clientInfo of a 2026-07-28 request's raw _meta
+// on ctx, for code that runs before mcp-go has parsed it (the access
+// hook). A legacy or malformed _meta leaves ctx as it is.
+func withRequestMeta(ctx context.Context, meta json.RawMessage) context.Context {
+	var m map[string]json.RawMessage
+	if len(meta) == 0 || json.Unmarshal(meta, &m) != nil {
+		return ctx
+	}
+	var version string
+	var impl mcp.Implementation
+	if json.Unmarshal(m[mcp.MetaKeyProtocolVersion], &version) != nil || !mcp.IsModernProtocol(version) ||
+		json.Unmarshal(m[mcp.MetaKeyClientInfo], &impl) != nil {
+		return ctx
+	}
+	return context.WithValue(ctx, requestMetaClientKey{}, &impl)
+}
+
 // clientFor returns the cached clientInfo for the client a raiser
 // describes: the entry for its MCP session, else for its client session,
 // else the agent's session-less entry.
@@ -181,7 +229,9 @@ func (g *Gateway) resolveRaiser(ctx context.Context, callerID, via string) actor
 	if via != "" {
 		r.Via = via
 	}
-	if ci, ok := g.clientFor(r); ok {
+	if ci, ok := requestClient(ctx); ok {
+		r = r.Merge(actor.Raiser{ClientName: ci.name, ClientKind: ci.kind})
+	} else if ci, ok := g.clientFor(r); ok {
 		r = r.Merge(actor.Raiser{ClientName: ci.name, ClientKind: ci.kind})
 	} else if r.ClientKind == "" && r.ClientName != "" {
 		r.ClientKind = ClientKindOf(r.ClientName)
