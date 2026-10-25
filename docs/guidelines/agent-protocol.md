@@ -365,7 +365,8 @@ lowered, and returns a warning with `path: "urgency"`.
 `inbox.request` returns `request_id`, `status`, and the pending `expires_at`.
 
 - Keep working on anything that doesn't depend on the answer.
-- `inbox.status({ "ids": [...] })` never blocks.
+- `inbox.status({ "ids": [...] })` never blocks. For one item,
+  `{ "request_id": "rq_…" }` works too (also on `inbox.wait`).
 - `inbox.wait({ "ids": [...], "mode": "any" | "all", "timeout_seconds": ≤300 })`
   blocks. Don't poll in a tight loop.
 - A tool your owner made async answers with a `job_id` instead of its
@@ -894,7 +895,10 @@ calls get grants. On a question item the status is `answered`; the legacy
 
 A callback is toolyard calling you when something you wait on happens, so
 you can end your turn instead of polling. Register a receiver once, then
-name it on the calls that should report to it.
+name it on the calls that should report to it. The `callbacks.*` tools are
+always available; in code mode they are `toolyard.callbacks_register(...)`,
+`toolyard.callbacks_list(...)` and so on, and `tools.search` lists them
+under the server `callbacks`.
 
 **Register.** `callbacks.register({ "destination": "https://example.com/hooks/toolyard", "events": ["*"], "v3": true, "make_default": true })`
 returns a `callback_ref` (`cb_…`). A receiver gets only the events it asks
@@ -933,8 +937,8 @@ at most 20 receivers.
 
 | type | when | data |
 |---|---|---|
-| `inbox.decision` | the item is fully answered | `inbox_id`, `status`, every call's `verdict` and `reason`, `overall_note`, `answers`, `status_ref` |
-| `inbox.expired`, `inbox.cancelled` | the item closed without a decision | the same fields |
+| `inbox.decision` | the item is fully answered | `inbox_id`, `status` (`decided`), `item_status` (as `inbox.status` says: `approved`, `denied`, `returned`, `answered`), every call's `verdict` and `reason`, `overall_note`, `answers`, `status_ref` |
+| `inbox.expired`, `inbox.cancelled` | the item closed without a decision | the same fields; `status` and `item_status` are `expired` or `cancelled` |
 | `execution.completed` | a granted call ran | `inbox_id`, `call_id`, `grant_id`, `tool`, `state` (`succeeded`, `failed`, `outcome_unknown`) |
 | `approval.decided` | a legacy deferred approval was decided | `approval_id`, `status`, `tool` |
 | `approval.executed` | its call ran | `approval_id`, `execution_state`, `is_error` |

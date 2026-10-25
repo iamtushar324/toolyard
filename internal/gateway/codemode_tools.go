@@ -152,7 +152,7 @@ func (g *Gateway) codeModeTools() []toolEntry {
 			"In code, access tools via: server_name.tool_name(param=value). " +
 			"CALL THIS TOOL FIRST whenever a server, tool or capability is not visible in your current tool list; do not tell the user something is unavailable until you have called listToolFiles and confirmed it is absent. " +
 			"toolyard code mode: _reason is optional here; every call your code makes still goes through toolyard's access, policy and approval rules. " +
-			"toolyard's own tools (inbox.*, memory.*, events.*, session.*, tools.*, policies.*, servers.*, audit.*, access.*) are one server, toolyard, called as toolyard.<group>_<name>(...), e.g. toolyard.inbox_request(...) or toolyard.policies_explain(tool=\"github.create_issue\"). " +
+			"toolyard's own tools (inbox.*, callbacks.*, jobs.*, memory.*, events.*, session.*, tools.*, policies.*, servers.*, audit.*, access.*) are one server, toolyard, called as toolyard.<group>_<name>(...), e.g. toolyard.inbox_request(...) or toolyard.policies_explain(tool=\"github.create_issue\"). " +
 			"For JavaScript scripts pass language=\"javascript\": the tree lists TypeScript stubs instead (servers/<serverName>/<toolName>.d.ts, and servers/index.d.ts for the tools object). " +
 			"To find a tool by what it does, call toolyard's tools.search (ranked keyword or regex search) instead of reading every stub.",
 		InputSchema: optional(map[string]any{

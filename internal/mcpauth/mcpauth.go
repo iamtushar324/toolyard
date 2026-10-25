@@ -45,6 +45,7 @@ import (
 	"time"
 
 	"github.com/tusharbhardwaj/toolyard/internal/access"
+	"github.com/tusharbhardwaj/toolyard/internal/identity"
 	"github.com/tusharbhardwaj/toolyard/internal/store"
 )
 
@@ -52,7 +53,7 @@ import (
 // (identity.Agent.Kind, actor.Raiser.AgentKind and audit_events.agent_kind).
 // The agents row itself keeps the stored kind "agent": its CHECK constraint
 // predates OAuth, and the grant row is what marks the agent as a client.
-const AgentKindOAuthClient = "oauth_client"
+const AgentKindOAuthClient = identity.AgentKindOAuthClient
 
 // Paths this package and internal/api serve.
 const (

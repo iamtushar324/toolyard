@@ -578,9 +578,9 @@ func (g *Gateway) inboxTools() []toolEntry {
 				if errRes != nil {
 					return errRes, nil
 				}
-				ids := stringList(args["ids"])
+				ids := statusIDs(args)
 				if len(ids) == 0 {
-					return mcp.NewToolResultError("ids: give at least one request_id"), nil
+					return mcp.NewToolResultError(noStatusIDs), nil
 				}
 				views, err := svc.Status(ctx, agentID, ids)
 				if err != nil {
@@ -601,9 +601,9 @@ func (g *Gateway) inboxTools() []toolEntry {
 				if errRes != nil {
 					return errRes, nil
 				}
-				ids := stringList(args["ids"])
+				ids := statusIDs(args)
 				if len(ids) == 0 {
-					return mcp.NewToolResultError("ids: give at least one request_id"), nil
+					return mcp.NewToolResultError(noStatusIDs), nil
 				}
 				mode, _ := args["mode"].(string)
 				if mode != "all" {
@@ -805,6 +805,27 @@ func remarshal(in any, out any) error {
 		return err
 	}
 	return json.Unmarshal(b, out)
+}
+
+// noStatusIDs answers an inbox.status or inbox.wait call without IDs.
+const noStatusIDs = `ids: give the Inbox request IDs to read as a list, e.g. {"ids": ["rq_…"]}; request_id is accepted for one ID`
+
+// statusIDs reads the request IDs of inbox.status and inbox.wait: ids (a
+// list, or one string), else request_id, the name every other Inbox tool
+// gives an item (one string, or a list).
+func statusIDs(args map[string]any) []string {
+	for _, key := range []string{"ids", "request_id"} {
+		if one, ok := args[key].(string); ok {
+			if one = strings.TrimSpace(one); one != "" {
+				return []string{one}
+			}
+			continue
+		}
+		if ids := stringList(args[key]); len(ids) > 0 {
+			return ids
+		}
+	}
+	return nil
 }
 
 func stringList(v any) []string {
