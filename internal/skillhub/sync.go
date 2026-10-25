@@ -261,17 +261,22 @@ func (s *Service) dropVersion(ctx context.Context, versionID string) error {
 // webhook named, or the branch head. The poller asks with the stored
 // ETag, so an unchanged branch costs no rate limit; "Sync now" asks fresh.
 func (s *Service) target(ctx context.Context, gh *ghClient, row *sourceRow, req syncRequest, out *syncOutcome) (string, error) {
-	switch {
-	case row.Mode == ModePinned:
+	if row.Mode == ModePinned {
 		if !shaRe.MatchString(row.PinnedSHA) {
 			return "", fmt.Errorf("%w: a pinned source needs a full commit SHA", ErrInvalid)
 		}
 		return row.PinnedSHA, nil
-	case req.sha != "":
-		out.headSHA = req.sha
-		return req.sha, nil
 	}
 	fresh := req.tr == triggerManual
+	if req.sha != "" {
+		if s.pushedCommitOK(ctx, gh, row, req.sha) {
+			out.headSHA = req.sha
+			return req.sha, nil
+		}
+		// An old or out-of-order delivery (GitHub's "Redeliver"): ask for
+		// the branch head instead, past GitHub's cache.
+		fresh = true
+	}
 	etag := ""
 	if !fresh && row.headSHA != "" {
 		etag = row.headETag
@@ -285,6 +290,27 @@ func (s *Service) target(ctx context.Context, gh *ghClient, row *sourceRow, req 
 	}
 	out.headSHA, out.headETag = sha, newETag
 	return sha, nil
+}
+
+// pushedCommitOK reports whether a push webhook's commit may be served
+// without reading the branch head: it is the head this source last saw,
+// or it descends from the active commit (one comparison, status ahead or
+// identical). An old or out-of-order delivery names an older commit:
+// served as it is, it would make a retired version live again, or rebuild
+// a pruned one, until the next poll.
+func (s *Service) pushedCommitOK(ctx context.Context, gh *ghClient, row *sourceRow, sha string) bool {
+	switch {
+	case sha == row.headSHA || sha == row.ActiveSHA:
+		return true
+	case row.ActiveSHA == "":
+		return false
+	}
+	cmp, err := gh.compare(ctx, row.Owner, row.Repo, row.ActiveSHA, sha)
+	if err != nil {
+		s.log.Info("skillhub: could not compare a pushed commit with the active one; reading the branch head", "source", row.Slug, "err", cleanMessage(err.Error()))
+		return false
+	}
+	return cmp.Status == "ahead" || cmp.Status == "identical"
 }
 
 // repoError explains a GitHub failure on a source's repository.

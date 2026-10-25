@@ -16,6 +16,7 @@ import (
 
 	"github.com/tusharbhardwaj/toolyard/internal/actor"
 	"github.com/tusharbhardwaj/toolyard/internal/audit"
+	"github.com/tusharbhardwaj/toolyard/internal/codemode"
 	"github.com/tusharbhardwaj/toolyard/internal/skillhub"
 	"github.com/tusharbhardwaj/toolyard/internal/store"
 )
@@ -206,9 +207,30 @@ func resolveBundle(ctx context.Context, hub *skillHubConfig, v skillhub.Viewer, 
 	return out, nil
 }
 
+// bundleStoredCallMessage refuses skills.bundle where its answer is stored
+// and read back redacted.
+const bundleStoredCallMessage = "skills.bundle does not work inside code mode or an async job: its one-time download " +
+	"link would come back redacted. Call skills.bundle directly, or use `ty skills pull`"
+
+// bundleInStoredCall reports a call whose result is stored and read back
+// redacted (audit.Redact drops the ticket): inside a code-mode script
+// (the run's result) or an async job's run. A link minted there would
+// come back dead and still hold one of the caller's unused-link slots.
+func bundleInStoredCall(ctx context.Context) bool {
+	if inJob(ctx) || isWithinCodeMode(ctx) {
+		return true
+	}
+	r, ok := actor.RaiserFrom(ctx)
+	return ok && r.Via == codemode.Via
+}
+
 // issueSkillBundle is skills.bundle: it resolves refs for v, stores a
-// ticket for the ctx caller and answers with the download URL.
+// ticket for the ctx caller and answers with the download URL. Inside code
+// mode or an async job it refuses before any ticket exists.
 func (g *Gateway) issueSkillBundle(ctx context.Context, hub *skillHubConfig, v skillhub.Viewer, refs []string) (*skillBundleAnswer, error) {
+	if bundleInStoredCall(ctx) {
+		return nil, fmt.Errorf("%w: %s", skillhub.ErrInvalid, bundleStoredCallMessage)
+	}
 	if hub.tickets == nil {
 		return nil, errSkillBundleOff
 	}

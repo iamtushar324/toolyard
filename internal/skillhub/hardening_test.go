@@ -438,3 +438,52 @@ func TestSecretAfterManyExamples(t *testing.T) {
 		t.Fatalf("examples flagged as %q", got)
 	}
 }
+
+// An old or out-of-order push delivery (GitHub's "Redeliver") does not
+// roll agents back: its commit does not descend from the active one, so
+// the sync reads the branch head instead. A force-push to a new commit
+// still goes live through that head read.
+func TestOldPushDeliveryDoesNotRollBack(t *testing.T) {
+	gh := newFakeGitHub(t, "acme", "skills")
+	c1 := gh.commit("main", baseTree())
+	svc := newTestService(t, gh)
+	ctx := context.Background()
+	src, _ := mustCreate(t, svc, SourceInput{URL: "acme/skills", Path: "skills", Mode: ModeAuto})
+	secret, err := svc.RotateWebhookSecret(ctx, "usr_admin", src.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	push := func(after string) {
+		t.Helper()
+		body := []byte(`{"ref":"refs/heads/main","after":"` + after + `"}`)
+		if err := svc.HandleWebhook(ctx, src.ID, "push", body, sign(secret, body)); err != nil {
+			t.Fatal(err)
+		}
+		svc.Wait()
+	}
+	serving := func() string {
+		got, _ := svc.Sources(ctx, adminViewer)
+		return got[0].Commit
+	}
+	c2 := gh.commit("main", map[string]string{"skills/pr-review/checks.md": "v2\n"})
+	push(c2)
+	if serving() != c2 {
+		t.Fatalf("serving %s after the push of %s", serving(), c2)
+	}
+	// The push of c1 delivered again: c1 is retired, and an older commit.
+	heads := gh.count("head")
+	push(c1)
+	if serving() != c2 {
+		t.Fatalf("an old delivery rolled back to %s", serving())
+	}
+	if gh.count("head") != heads+1 {
+		t.Fatalf("the old delivery did not read the branch head (%d reads)", gh.count("head")-heads)
+	}
+	// A force-push to a new commit that does not descend from c2.
+	gh.setBranch("main", c1)
+	c3 := gh.commit("main", map[string]string{"skills/pr-review/checks.md": "rewritten\n"})
+	push(c3)
+	if serving() != c3 {
+		t.Fatalf("a force-push to %s serves %s", c3, serving())
+	}
+}

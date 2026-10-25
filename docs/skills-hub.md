@@ -353,7 +353,10 @@ The `skills.*` tools are on for every active caller (the always-on
 `skills` access group); an owner can still switch them off for one agent
 with its deny list, or for everyone with an explicit deny policy. In code
 mode they are `toolyard.skills_<name>` (Starlark) and
-`tools.toolyard.skills_<name>` (JavaScript).
+`tools.toolyard.skills_<name>` (JavaScript), except `skills.bundle`: a
+code-mode run and an async job store their results with secrets redacted,
+so a bundle link would come back dead. Call `skills.bundle` directly, or
+use `ty skills pull`.
 
 | Tool | Arguments | Answer |
 | --- | --- | --- |
@@ -475,8 +478,11 @@ in place).
    skips them until it resets. *Sync now* on the dashboard checks at once on the replica
    that got it, without the ETag and with `Cache-Control: no-cache`. A
    signed GitHub push webhook names the pushed commit, and the sync
-   serves that commit without asking for the branch head. A pinned source
-   never asks for the branch head.
+   serves that commit without asking for the branch head when it is the
+   head last seen or descends from the active commit (one comparison). An
+   older commit (a redelivered or out-of-order push) makes the sync read
+   the branch head instead, so a redelivery never rolls agents back. A
+   pinned source never asks for the branch head.
 
    Without a token, GitHub may answer a public repository's branch head
    from a cache up to 60 seconds old, so a poll can see a push up to a
