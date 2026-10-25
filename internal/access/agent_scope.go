@@ -138,7 +138,7 @@ func (l *Limits) Describe() map[string]any {
 		sort.Strings(out)
 		return out
 	}
-	var allowTools []string
+	allowTools := []string{}
 	for _, tools := range l.AllowTools {
 		allowTools = append(allowTools, keys(tools)...)
 	}

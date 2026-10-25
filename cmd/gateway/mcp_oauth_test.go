@@ -535,7 +535,10 @@ func TestMCPOAuthDenyAndStaticTokensWithAgentScope(t *testing.T) {
 		t.Fatalf("limited static agent: %q", msg)
 	}
 	_, res := e.call(token, "access.whoami", map[string]any{})
-	if res == nil || !strings.Contains(resultText(res), `"agent_limits"`) || !strings.Contains(resultText(res), `"role":"admin"`) {
+	who, _ := res["structuredContent"].(map[string]any)
+	owner, _ := who["owner"].(map[string]any)
+	limits, _ := who["agent_limits"].(map[string]any)
+	if owner["role"] != "admin" || limits["mode"] != "listed" {
 		t.Fatalf("whoami does not report the limits and the owner's role: %v", res)
 	}
 }
