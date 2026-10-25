@@ -316,6 +316,9 @@ func runServe(argv []string) error {
 	// set exits on an unknown flag. toolyard no longer runs a ClickHouse lake.
 	clickhouseRuntimeEnvPath := fs.String("clickhouse-runtime-env", "", "DEPRECATED: ignored. Kept so existing service units keep starting.")
 	inboxResetPasskeys := fs.Bool("inbox-reset-passkeys", false, "delete every registered passkey at startup (recovery when the owner has lost all their devices), then continue normally")
+	codemodeMaxConcurrent := fs.Int("codemode-max-concurrent", 4, "code mode: the most scripts (executeToolCode and POST /v1/code/run) running at once on this gateway; each runs in its own worker process under the worker memory cap (256 MiB)")
+	codemodeMaxPerAgent := fs.Int("codemode-max-per-agent", 3, "code mode: the most scripts one agent runs at once")
+	codemodeQueueWait := fs.Duration("codemode-queue-wait", 30*time.Second, "code mode: how long a script past -codemode-max-concurrent or -codemode-max-per-agent waits in the fair queue for a slot before it is refused as busy (HTTP 429 over REST)")
 	inboxFetchPrivate := fs.Bool("inbox-fetch-private-networks", false, "let the inbox copy attachment links that point at loopback or private-network addresses (e.g. evidence hosted on your LAN). Off by default: agent-chosen URLs could otherwise reach internal services.")
 	requireAuthMCP := fs.Bool("require-auth-on-mcp", false, "reject anonymous /mcp calls (no Authorization header). Auto-enabled when -public-url is set.")
 	upstreamProtocolFlag := fs.String("upstream-protocol", upstreamProtocolLegacy, "MCP version toward upstream servers: legacy (2025-11-25 for every upstream) | auto (a shared http upstream that offers 2026-07-28 is called statelessly, one POST per call, outside the live pool and the idle sweep; stdio and per_user stay legacy)")
@@ -709,6 +712,7 @@ func runServe(argv []string) error {
 	// The kernel probe for the code-mode sandbox runs now, off the
 	// request path.
 	gw.SetCodeModeSandbox(sandboxMode)
+	gw.SetCodeModeConcurrency(*codemodeMaxConcurrent, *codemodeMaxPerAgent, *codemodeQueueWait)
 	gw.SetCluster(clusterSvc)
 	goroutines.Go(goCodemodeProbe, func() { codemode.ProbeSandbox() })
 	gw.RegisterBuiltins()

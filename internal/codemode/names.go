@@ -379,3 +379,51 @@ func quoteAll(names []string) []string {
 	}
 	return out
 }
+
+// resolveName finds the tool a script names as a string: "Server.tool"
+// with any of the forms readToolFile accepts on either side of the dot
+// (split at each dot in turn, so a server key with a dot in it resolves
+// too), or failing that the catalog name the gateway dispatches
+// ("tools.search" for toolyard.tools_search). msg explains a name that
+// resolves to nothing, or to more than one tool.
+func (c *catalog) resolveName(name string) (srv *server, b *binding, msg string) {
+	name = strings.TrimSpace(name)
+	for i := 0; i < len(name); i++ {
+		if name[i] != '.' {
+			continue
+		}
+		s, _, _ := findServer(c, name[:i])
+		if s == nil {
+			continue
+		}
+		found, ambiguous := s.lookup(name[i+1:])
+		if len(ambiguous) > 0 {
+			return nil, nil, ambiguityError(s.ident, name[i+1:], ambiguous).Error()
+		}
+		if found != nil {
+			return s, found, ""
+		}
+	}
+	for _, s := range c.servers {
+		for i := range s.bound {
+			if s.bound[i].tool.Target == name {
+				return s, &s.bound[i], ""
+			}
+		}
+	}
+	return nil, nil, fmt.Sprintf("tool call failed: no tool %q; name it Server.tool, as listToolFiles shows", name)
+}
+
+// CodeNames maps each tool's Target to the name a script calls it by
+// ("BkCoreServices.get_client", "toolyard.inbox_request"), for the tools
+// that got an identifier.
+func CodeNames(tools []Tool) map[string]string {
+	cat := buildCatalog(tools)
+	out := map[string]string{}
+	for _, s := range cat.servers {
+		for _, b := range s.bound {
+			out[b.tool.Target] = s.ident + "." + b.ident
+		}
+	}
+	return out
+}

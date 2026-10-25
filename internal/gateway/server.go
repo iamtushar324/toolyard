@@ -34,6 +34,7 @@ import (
 	"github.com/tusharbhardwaj/toolyard/internal/opsmetrics"
 	"github.com/tusharbhardwaj/toolyard/internal/policy"
 	"github.com/tusharbhardwaj/toolyard/internal/realtime"
+	"github.com/tusharbhardwaj/toolyard/internal/toolsearch"
 )
 
 const (
@@ -179,6 +180,9 @@ type Gateway struct {
 	// codeMode backs the Bifrost-compatible listToolFiles / readToolFile /
 	// getToolDocs / executeToolCode tools (codemode_tools.go).
 	codeMode *codemode.Runtime
+	// search ranks the catalog for tools.search and GET /v1/code/search
+	// (meta.go); nil until first use or SetToolSearch.
+	search atomic.Pointer[toolsearch.Engine]
 
 	// maxLiveUpstreams caps how many upstream connections are alive
 	// simultaneously. 0 = unbounded. When the cap is hit and a new
@@ -1451,6 +1455,10 @@ func (g *Gateway) routeEntry(ctx context.Context, entry toolEntry, via string, a
 	raiser := g.resolveRaiser(ctx, agentID, via)
 	g.attachSession(ctx, &raiser, args)
 	ctx = actor.WithRaiser(ctx, raiser)
+	if res := refuseNestedCodeMode(ctx, entry); res != nil {
+		return res, nil
+	}
+	ctx = withCodeModeRunID(ctx, entry)
 
 	// In-flight tracking + slow-call watchdog. The watchdog goroutine
 	// logs at 5s / 30s / 2m elapsed if the call is still routing, so a

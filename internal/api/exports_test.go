@@ -43,10 +43,10 @@ func asUser(r *http.Request, u *identity.User) *http.Request {
 
 func TestAuditFilterFromQueryActorParams(t *testing.T) {
 	r := httptest.NewRequest(http.MethodGet,
-		"/v1/audit/export?owner=u_1&decided_by=u_2&session=ses_3&approval_id=ap_4&client_kind=t3&agent_id=ag_5&since=10", nil)
+		"/v1/audit/export?owner=u_1&decided_by=u_2&session=ses_3&approval_id=ap_4&client_kind=t3&agent_id=ag_5&since=10&run_id=cm_6", nil)
 	got := auditFilterFromQuery(r)
 	want := audit.Filter{Since: 10, AgentID: "ag_5", OwnerUserID: "u_1", DecidedByUserID: "u_2",
-		AgentSessionID: "ses_3", ApprovalID: "ap_4", ClientKind: "t3"}
+		AgentSessionID: "ses_3", ApprovalID: "ap_4", ClientKind: "t3", RunID: "cm_6"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("filter = %+v, want %+v", got, want)
 	}
@@ -57,7 +57,7 @@ func TestAuditExportCSVActorColumns(t *testing.T) {
 	ctx := context.Background()
 	ev := audit.Event{
 		EventType: audit.EventApprovalDecide, AgentID: "ag_1", UpstreamName: "github", ToolName: "github.create_issue",
-		Decision: "allowed", ApprovalID: "ap_1",
+		Decision: "allowed", ApprovalID: "ap_1", RunID: "cm_run1",
 		Raiser: actor.Raiser{AgentName: "claude-cloud-3", OwnerEmail: "owner@example.test", ClientKind: "t3",
 			ClientSessionID: "t3-1", AgentSessionID: "ses_1", Via: "direct"},
 	}
@@ -92,7 +92,7 @@ func TestAuditExportCSVActorColumns(t *testing.T) {
 		"agent_name": "claude-cloud-3", "owner_email": "owner@example.test", "client_kind": "t3",
 		"client_session_id": "t3-1", "agent_session_id": "ses_1", "via": "direct",
 		"decided_by_email": "dec@example.test", "decided_via": actor.ViaPushToken, "decider_ref": "sub_1",
-		"agent_id": "ag_1", "approval_id": "ap_1", "decision": "allowed",
+		"agent_id": "ag_1", "approval_id": "ap_1", "decision": "allowed", "run_id": "cm_run1",
 	}
 	for h, v := range want {
 		if col[h] != v {

@@ -4,6 +4,7 @@ package codemode
 
 import (
 	"errors"
+	"os"
 	"os/exec"
 	"time"
 )
@@ -25,3 +26,5 @@ func killGroup(cmd *exec.Cmd) {
 		_ = cmd.Process.Kill()
 	}
 }
+
+func maxRSSKiB(*os.ProcessState) int64 { return 0 }
