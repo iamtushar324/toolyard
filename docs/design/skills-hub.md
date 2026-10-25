@@ -6,6 +6,8 @@ hub. Each slice works on its own branch and opens a draft pull request into
 `t3/skills-hub`; the integration pull request `t3/skills-hub` → `main` ships
 them together.
 
+Architecture before and after the skills hub: [skills-hub-architecture.excalidraw](skills-hub-architecture.excalidraw) (open it in Excalidraw).
+
 ## Goal
 
 An admin adds a GitHub repository and a branch once. toolyard copies the
