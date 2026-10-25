@@ -121,6 +121,18 @@ type SubmissionTool struct {
 	After           []string       `json:"after,omitempty"`
 }
 
+// jsonSize is the size of v as the agent sent it: JSON without HTML
+// escaping, so "<", ">" and "&" count one byte each, not six (\u003c).
+func jsonSize(v any) (int, error) {
+	var b bytes.Buffer
+	enc := json.NewEncoder(&b)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(v); err != nil {
+		return 0, err
+	}
+	return b.Len() - 1, nil // Encode ends with a newline
+}
+
 // DecodeSubmission decodes a Submission from a generic map (MCP arguments).
 func DecodeSubmission(args map[string]any) (*Submission, error) {
 	b, err := json.Marshal(args)
@@ -196,8 +208,8 @@ func Validate(ctx context.Context, cat Catalog, agentID string, s *Submission, o
 	if len(s.CallbackRef) > MaxCallbackRefLen {
 		add("callback_ref", "at most %d bytes", MaxCallbackRefLen)
 	}
-	if b, err := json.Marshal(s); err == nil && len(b) > MaxSubmissionBytes {
-		add("", "the request is %d bytes as JSON; max %d. Attach large evidence as an upload instead.", len(b), MaxSubmissionBytes)
+	if n, err := jsonSize(s); err == nil && n > MaxSubmissionBytes {
+		add("", "the request is %d bytes as JSON; max %d. Attach large evidence as an upload instead.", n, MaxSubmissionBytes)
 	}
 
 	checkText(add, "title", r.Title, MaxTitle, "Verb + object + target, e.g. \"Deploy api to prod\".")
@@ -284,8 +296,8 @@ func Validate(ctx context.Context, cat Catalog, agentID string, s *Submission, o
 				}
 			}
 			validateCallContext(add, p, &tr)
-			if b, err := json.Marshal(st.Params); err == nil && len(b) > MaxParamsBytes {
-				add(p+".params", "%d bytes as JSON; max %d", len(b), MaxParamsBytes)
+			if n, err := jsonSize(st.Params); err == nil && n > MaxParamsBytes {
+				add(p+".params", "%d bytes as JSON; max %d", n, MaxParamsBytes)
 			}
 			checkText(add, p+".summary", tr.Summary, MaxToolSummary, "Say in plain words what this call will do.")
 			for name, raw := range st.Params {

@@ -285,13 +285,20 @@ func (b *Bus) PublicKey() ed25519.PublicKey { return b.verifyKey }
 // The returned request is the final state (status will be allowed/denied/pending/expired).
 // If the wait elapses but the approval is still pending, it remains pending in
 // the DB and Watch() can still pick it up later.
-func (b *Bus) Hold(ctx context.Context, in NewRequest, maxWait time.Duration) (*Request, error) {
+func (b *Bus) Hold(ctx context.Context, in NewRequest, maxWait time.Duration) (held *Request, err error) {
 	req, err := b.create(ctx, in)
 	if err != nil {
 		return nil, err
 	}
 	// The receivers follow the request before anyone can decide it.
 	b.subscribe(ctx, req, in.CallbackRef)
+	// A re-read request (in-line wait, auto-approval) keeps the warning
+	// about a refused callback_ref; it lives only on this value.
+	defer func() {
+		if held != nil && held.CallbackWarning == "" {
+			held.CallbackWarning = req.CallbackWarning
+		}
+	}()
 	// Auto-approval short-circuit: if a rule matches the new request, decide
 	// it in-line (status -> allowed) before any notifier sees it as pending.
 	// Coalesced rows that landed on an existing pending request are skipped

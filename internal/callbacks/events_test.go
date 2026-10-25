@@ -618,3 +618,41 @@ func TestPre0060ReceiverRegistrationRetry(t *testing.T) {
 		t.Fatal("SameEvents")
 	}
 }
+
+// An item that names no receiver warns when the default receiver cannot
+// carry it: the v2 shape for more than 12 calls, or no inbox.* events.
+func TestDefaultWarningSaysWhyTheDefaultSkipsAnItem(t *testing.T) {
+	s, _ := fixture(t)
+	ctx := t.Context()
+	small := &inbox.Request{ID: "rq_small", AgentID: "agent", Tools: []inbox.ToolRequest{{CallID: "c"}}}
+	big := &inbox.Request{ID: "rq_big", AgentID: "agent"}
+	for i := 0; i < 13; i++ {
+		big.Tools = append(big.Tools, inbox.ToolRequest{CallID: fmt.Sprintf("c%d", i)})
+	}
+	if w := s.DefaultWarning(ctx, "agent", big); w != "" {
+		t.Fatalf("no default receiver, yet a warning: %q", w)
+	}
+	legacy, err := s.RegisterPull(ctx, "agent", "mac", "legacy", testSecret())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = s.SetDefault(ctx, "agent", legacy.ID); err != nil {
+		t.Fatal(err)
+	}
+	if w := s.DefaultWarning(ctx, "agent", small); w != "" {
+		t.Fatalf("a legacy default carries 1 call: %q", w)
+	}
+	if w := s.DefaultWarning(ctx, "agent", big); !strings.Contains(w, "version 2") {
+		t.Fatalf("13 calls for a legacy default: %q", w)
+	}
+	jobs, err := s.RegisterPullWith(ctx, "agent", "mac", "jobs", testSecret(), Subscription{Events: []string{"job.*"}, V3: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = s.SetDefault(ctx, "agent", jobs.ID); err != nil {
+		t.Fatal(err)
+	}
+	if w := s.DefaultWarning(ctx, "agent", small); !strings.Contains(w, "no inbox.* events") {
+		t.Fatalf("a jobs-only default: %q", w)
+	}
+}

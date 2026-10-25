@@ -123,7 +123,7 @@ func acceptsEvent(events []string, eventType string) bool {
 	return false
 }
 
-// eventTypeShape is what EmitTx accepts: lowercase dotted words, such as
+// eventTypeShape is what EmitForAgentTx accepts: lowercase dotted words, such as
 // job.completed.
 var eventTypeShape = regexp.MustCompile(`^[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*)*$`)
 
@@ -264,8 +264,15 @@ func (s *Service) queueTx(ctx context.Context, tx *sql.Tx, q queued) (string, er
 	if q.ignoreDuplicate {
 		query += ` ON CONFLICT DO NOTHING`
 	}
-	if _, err = tx.ExecContext(ctx, query, id, q.subject, q.revision, q.receiver, q.receiverRevision, string(payload), now.UnixMilli(), status, reason, q.eventType, dedupe, now.UnixMilli()); err != nil {
+	res, err := tx.ExecContext(ctx, query, id, q.subject, q.revision, q.receiver, q.receiverRevision, string(payload), now.UnixMilli(), status, reason, q.eventType, dedupe, now.UnixMilli())
+	if err != nil {
 		return "", err
+	}
+	if q.ignoreDuplicate {
+		// A skipped duplicate stored nothing: its id names no event.
+		if n, err := res.RowsAffected(); err != nil || n == 0 {
+			return "", err
+		}
 	}
 	return id, nil
 }
@@ -361,7 +368,7 @@ func subjectOf(data any) string {
 
 // CheckRef reports whether ref is an active receiver of the agent
 // (ErrReceiver otherwise). Callers that store a callback_ref for later
-// events (EmitTx) check it when they store it.
+// events (EmitForAgentTx) check it when they store it.
 func (s *Service) CheckRef(ctx context.Context, agentID, ref string) error {
 	r, err := s.Get(ctx, agentID, ref)
 	if err != nil {
@@ -476,8 +483,10 @@ var ErrPingQuota = fmt.Errorf("at most %d pings a minute; wait, then test again"
 // Test queues a ping for one of the agent's active receivers and returns
 // its event id. The ping is signed and retried like every other event. A
 // receiver has at most one ping pending: a second test returns the pending
-// one. Pings count against the agent's PingsPerMinute quota, kept in the
-// database so every node shares it.
+// one (the partial unique index callback_outbox_one_ping backs this).
+// Pings count against the agent's PingsPerMinute quota, kept in the
+// database so every node shares it; the agent lock makes the check and the
+// insert one step, so concurrent tests never pass the quota together.
 func (s *Service) Test(ctx context.Context, agentID, ref string) (string, error) {
 	rec, err := s.Get(ctx, agentID, ref)
 	if err != nil {
@@ -489,11 +498,14 @@ func (s *Service) Test(ctx context.Context, agentID, ref string) (string, error)
 	if !acceptsEvent(rec.Events, EventPing) {
 		return "", ErrEventNotAccepted
 	}
-	tx, err := s.db.BeginTx(ctx, nil)
+	tx, err := s.db.BeginTx(ctx, readCommitted)
 	if err != nil {
 		return "", err
 	}
 	defer tx.Rollback()
+	if err = s.lockAgentTx(ctx, tx, agentID); err != nil {
+		return "", err
+	}
 	var pending string
 	err = tx.QueryRowContext(ctx, `SELECT id FROM callback_outbox WHERE receiver_id=? AND event_type=? AND status IN ('pending','delivering') ORDER BY created_at LIMIT 1`, ref, EventPing).Scan(&pending)
 	if err == nil {

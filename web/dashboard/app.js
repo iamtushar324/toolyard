@@ -5331,6 +5331,9 @@ function ibAccessDraft(r) {
   if (!ibAccessDrafts.has(key)) {
     let d; try { d = JSON.parse(sessionStorage.getItem(key)); } catch {}
     if (!d || !d.allow || !d.reasons) d = { revision: r.revision || 1, allow: {}, reasons: {}, note: '', narrow: {}, ttl: r.ttl_seconds || 1800 };
+    // Keyed by call ID: no prototype, so an ID such as "constructor" or
+    // "__proto__" is an ordinary key.
+    d.allow = ibDict(d.allow); d.reasons = ibDict(d.reasons);
     ibAccessDrafts.set(key, d);
   }
   const d = ibAccessDrafts.get(key);
@@ -7101,7 +7104,7 @@ function ibTTLEl(r) {
 }
 
 function ibApproveBody(r, allow) {
-  const d=ibAccessDraft(r),verdicts={};
+  const d=ibAccessDraft(r),verdicts=Object.create(null);
   r.tools.forEach((t,k)=>{const id=ibCallID(t,k);verdicts[id]={verdict:allow[k]?'accepted':'rejected'};if(d.reasons[id])verdicts[id].reason=d.reasons[id];});
   const body={action:'submit',request_revision:d.revision,verdicts,note:d.note};
   if (ibHasQuestions(r)) body.answers = ibAnswersBody(r);
