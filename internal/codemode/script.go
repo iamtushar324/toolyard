@@ -55,15 +55,13 @@ type sink interface {
 	print(text string)
 }
 
-// await waits for a call's answer, or for the script's clock.
-func await(ctx context.Context, ch <-chan parentMsg, label string) parentMsg {
-	select {
-	case r := <-ch:
-		return r
-	case <-ctx.Done():
-		return parentMsg{Status: StatusFailed, Error: fmt.Sprintf("tool call failed for %s: script stopped: %v", label, ctx.Err())}
-	}
-}
+// await waits for a call's answer. Every call is answered: in process the
+// call returns once its context ends, and in a worker the parent answers
+// or kills the worker at the deadline. Waiting for the answer, rather
+// than for the clock, keeps the call's record true (a call that finished
+// is not outcome_unknown) and lets the interpreter report the deadline
+// itself.
+func await(ch <-chan parentMsg) parentMsg { return <-ch }
 
 // scriptResult is what one run produced: a JSON result, or an error of
 // kind "syntax" or "runtime". cause is the structured run's error kind
@@ -221,7 +219,7 @@ func toolBuiltin(ctx context.Context, server, member string, s sink) *starlark.B
 		}
 		req := callRequest{server: server, member: member, args: callArgs}
 		_, ch := s.start(req)
-		reply := await(ctx, ch, req.label())
+		reply := await(ch)
 		if reply.Error != "" {
 			return nil, errors.New(reply.Error)
 		}
@@ -310,7 +308,7 @@ func tryCallBuiltin(ctx context.Context, s sink, targets map[*starlark.Builtin]c
 		}
 		req.try = true
 		_, ch := s.start(req)
-		return tryValue(await(ctx, ch, req.label())), nil
+		return tryValue(await(ch)), nil
 	})
 }
 
@@ -386,7 +384,7 @@ func runParallel(ctx context.Context, s sink, reqs []callRequest, limit int, val
 			return
 		}
 		_, ch := s.start(reqs[i])
-		go func() { fin <- done{i, await(ctx, ch, reqs[i].label())} }()
+		go func() { fin <- done{i, await(ch)} }()
 	}
 	for next < len(reqs) && running < limit {
 		launch()

@@ -108,7 +108,7 @@ func tsTool(srv *server, bd binding) string {
 	call := srv.ident + "." + bd.ident
 	var b strings.Builder
 	head := "// tools." + call
-	if desc := shortDescription(t.Description); desc != "" {
+	if desc := tsShort(t.Description); desc != "" {
 		head += ": " + desc
 	}
 	b.WriteString(head + "\n")
@@ -127,6 +127,13 @@ func tsTool(srv *server, bd binding) string {
 	writeOutput(&b, t.OutputSchema)
 	fmt.Fprintf(&b, "\nexport type Call = (%s) => Promise<Output>;\n", tsArgs("Input", t.Required))
 	return b.String()
+}
+
+// tsShort is a description's first sentence on its first line, as the
+// .pyi stubs shorten it.
+func tsShort(desc string) string {
+	first, _, _ := strings.Cut(strings.TrimSpace(desc), "\n")
+	return shortDescription(first)
 }
 
 // tsArgs is a call's parameter: optional when the tool requires nothing.
@@ -172,7 +179,7 @@ func tsServer(srv *server) string {
 	}
 	b.WriteString("\nexport interface Tools {\n")
 	for _, bd := range srv.bound {
-		if desc := shortDescription(bd.tool.Description); desc != "" {
+		if desc := tsShort(bd.tool.Description); desc != "" {
 			writeDoc(&b, "  ", desc)
 		}
 		file := fmt.Sprintf("./%s/%s", srv.ident, bd.ident)
