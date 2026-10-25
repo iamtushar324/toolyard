@@ -1,14 +1,14 @@
 # The toolyard gateway for the HA test deployment: the reference base with
-# two replicas, rolling updates, spreading, a PodDisruptionBudget, an
-# Ingress and NetworkPolicies. The database URL comes from the
-# toolyard-credentials Secret (database-url), as in the base.
+# two replicas, rolling updates, spreading, a PodDisruptionBudget and a
+# NetworkPolicy. The database URL comes from the toolyard-credentials Secret
+# (database-url), as in the base. The Ingress is in ../ingress, applied only
+# after the first admin account exists.
 apiVersion: kustomize.config.k8s.io/v1beta1
 kind: Kustomization
 
 resources:
   - ../../../base
   - pdb.yaml
-  - ingress.yaml
   - networkpolicy.yaml
 
 patches:

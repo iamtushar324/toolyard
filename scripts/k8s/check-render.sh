@@ -2,9 +2,11 @@
 # shellcheck disable=SC2016 # jq programs use jq variables ($ns, ...) in single quotes
 #
 # Renders the HA test overlay through scripts/k8s-test-deploy.sh --render
-# with placeholder inputs (REPLICAS=2 and REPLICAS=1), writes the manifests
-# to OUTDIR for kubeconform, and checks that every input landed where it
-# should. No cluster needed. Used by .github/workflows/deploy-manifests.yml.
+# with placeholder inputs (REPLICAS=2 and REPLICAS=1, an image digest, a
+# ghcr.io tag and a tag on another registry), writes the manifests to OUTDIR
+# for kubeconform, and checks that every input landed where it should. No
+# cluster needed; resolving the ghcr.io tag reads the public registry. Used
+# by .github/workflows/deploy-manifests.yml.
 #
 #   scripts/k8s/check-render.sh OUTDIR
 #
@@ -22,7 +24,10 @@ deploy="$root/scripts/k8s-test-deploy.sh"
 export NAMESPACE=toolyard-test
 export HOST=toolyard-test.example.com
 export IMAGE=ghcr.io/iamtushar324/toolyard@sha256:0000000000000000000000000000000000000000000000000000000000000000
+export REPLICAS=2
 export TRUSTED_PROXY=192.0.2.0/24,198.51.100.0/24
+export INSTANCE=toolyard-ci
+export EXTRA_EGRESS_CIDRS=198.18.0.0/15,203.0.113.0/24
 export NODE_SELECTOR=example.com/pool=test
 export TOLERATIONS=example.com/pool=test:NoSchedule,example.com/spot:NoExecute
 export STORAGE_CLASS=example-ssd
@@ -50,9 +55,11 @@ check() {
 	fi
 }
 
-render() { # replicas file
-	REPLICAS="$1" "$deploy" --render >"$2"
-	yq -o=json -I=0 '.' "$2" | jq -s '[.[] | select(. != null)]' >"$2.json"
+render() { # replicas file [VAR=value...]
+	local r="$1" f="$2"
+	shift 2
+	env REPLICAS="$r" "$@" "$deploy" --render >"$f"
+	yq -o=json -I=0 '.' "$f" | jq -s '[.[] | select(. != null)]' >"$f.json"
 }
 
 common_checks() { # json replicas
@@ -60,8 +67,11 @@ common_checks() { # json replicas
 	printf -- '--- REPLICAS=%s\n' "$r"
 	check "$j" "every object is in namespace $NAMESPACE" \
 		'all(.[]; .metadata.namespace == $ns)'
-	check "$j" "every object carries app.kubernetes.io/part-of=toolyard (used by --destroy)" \
-		'all(.[]; .metadata.labels["app.kubernetes.io/part-of"] == "toolyard")'
+	check "$j" "every object carries part-of=toolyard and instance=INSTANCE (used by --destroy)" \
+		'all(.[]; .metadata.labels["app.kubernetes.io/part-of"] == "toolyard"
+		         and .metadata.labels["app.kubernetes.io/instance"] == "toolyard-ci")'
+	check "$j" "the Postgres volume claim carries the instance label" '
+		.[] | select(.kind == "StatefulSet") | .spec.volumeClaimTemplates[0].metadata.labels["app.kubernetes.io/instance"] == "toolyard-ci"'
 	check "$j" "the expected objects exist" '
 		["Deployment/toolyard", "Service/toolyard", "Ingress/toolyard",
 		 "NetworkPolicy/toolyard-gateway", "StatefulSet/toolyard-postgres",
@@ -72,9 +82,12 @@ common_checks() { # json replicas
 	# $r is a validated number (1 or 2), so it is safe in the program text.
 	check "$j" "the Deployment has $r replica(s)" \
 		".[] | select(.kind == \"Deployment\") | .spec.replicas == $r"
-	check "$j" "gateway and migration Job run IMAGE" '
-		[.[] | select(.kind == "Deployment" or .kind == "Job") | .spec.template.spec.containers[].image]
-		| length == 2 and all(.[]; . == $image)'
+	check "$j" "gateway and migration Job run IMAGE, pulled if not present" '
+		[.[] | select(.kind == "Deployment" or .kind == "Job") | .spec.template.spec.containers[]]
+		| length == 2 and all(.[]; .image == $image and .imagePullPolicy == "IfNotPresent")'
+	check "$j" "the migration Job mounts database-url and no master key" '
+		.[] | select(.kind == "Job") | .spec.template.spec.volumes[] | select(.name == "credentials")
+		| .secret.items == [{key: "database-url", path: "database-url"}]'
 	check "$j" "Postgres runs the pinned postgres:16 image" '
 		.[] | select(.kind == "StatefulSet") | .spec.template.spec.containers[0].image
 		| test("^postgres:16\\.[0-9]+-bookworm@sha256:[0-9a-f]{64}$")'
@@ -112,6 +125,14 @@ common_checks() { # json replicas
 	check "$j" "the gateway NetworkPolicy lets in INGRESS_NAMESPACE" '
 		.[] | select(.kind == "NetworkPolicy" and .metadata.name == "toolyard-gateway")
 		| .spec.ingress[0].from[0].namespaceSelector.matchLabels["kubernetes.io/metadata.name"] == "example-ingress-system"'
+	check "$j" "the gateway reaches DNS, its Postgres, public addresses and EXTRA_EGRESS_CIDRS only" '
+		.[] | select(.kind == "NetworkPolicy" and .metadata.name == "toolyard-gateway") | .spec.egress
+		| length == 4
+		  and .[0] == {to: [{namespaceSelector: {}}], ports: [{port: 53, protocol: "UDP"}, {port: 53, protocol: "TCP"}]}
+		  and .[1].to == [{podSelector: {matchLabels: {"app.kubernetes.io/name": "postgres", "app.kubernetes.io/component": "database"}}}]
+		  and .[1].ports == [{port: 5432, protocol: "TCP"}]
+		  and .[2] == {to: [{ipBlock: {cidr: "0.0.0.0/0", except: ["10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16", "100.64.0.0/10", "169.254.0.0/16"]}}]}
+		  and .[3] == {to: [{ipBlock: {cidr: "198.18.0.0/15"}}, {ipBlock: {cidr: "203.0.113.0/24"}}]}'
 	check "$j" "the ConfigMap holds the public URL, trusted proxy, owner email and test settings" '
 		[.[] | select(.kind == "ConfigMap" and (.metadata.name | startswith("toolyard-config-")))]
 		| length == 1 and (.[0].data
@@ -152,6 +173,18 @@ check "$j" "one replica uses Recreate, so two gateways never share the database"
 check "$j" "one replica has no PodDisruptionBudget" \
 	'[.[] | select(.kind == "PodDisruptionBudget")] | length == 0'
 
+printf -- '--- image tags\n'
+render 1 "$out/ha-test-other-registry.yaml" IMAGE=registry.example.com/team/toolyard:test
+j="$out/ha-test-other-registry.yaml.json"
+check "$j" "a tag on another registry is kept and pulled with imagePullPolicy Always" '
+	[.[] | select(.kind == "Deployment" or .kind == "Job") | .spec.template.spec.containers[0]]
+	| length == 2 and all(.[]; .image == "registry.example.com/team/toolyard:test" and .imagePullPolicy == "Always")'
+render 1 "$out/ha-test-ghcr-tag.yaml" IMAGE=ghcr.io/iamtushar324/toolyard:main
+j="$out/ha-test-ghcr-tag.yaml.json"
+check "$j" "a ghcr.io tag is resolved to its digest" '
+	[.[] | select(.kind == "Deployment" or .kind == "Job") | .spec.template.spec.containers[0]]
+	| length == 2 and all(.[]; (.image | test("^ghcr\\.io/iamtushar324/toolyard@sha256:[0-9a-f]{64}$")) and .imagePullPolicy == "IfNotPresent")'
+
 printf -- '--- bad inputs are refused\n'
 refuse() { # description VAR=value...
 	local what="$1"
@@ -169,6 +202,10 @@ refuse "a toleration without an effect" TOLERATIONS=example.com/pool=test
 refuse "an IMAGE without a tag or digest" IMAGE=ghcr.io/iamtushar324/toolyard
 refuse "a TRUSTED_PROXY that is not a CIDR" TRUSTED_PROXY=10.0.0.1
 refuse "REPLICAS=0" REPLICAS=0
+refuse "a missing REPLICAS" -u REPLICAS
+refuse "an EXTRA_EGRESS_CIDRS entry that is not a CIDR" EXTRA_EGRESS_CIDRS=10.0.0.0/8,example.com
+refuse "an INSTANCE with a space" 'INSTANCE=toolyard ci'
+refuse "an ADMIN_USERNAME with a quote" 'ADMIN_USERNAME=ad"min'
 if "$deploy" --render --purge >/dev/null 2>&1; then
 	bad "refuses --purge without --destroy"
 else

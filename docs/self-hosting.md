@@ -878,7 +878,7 @@ for linux/amd64 and linux/arm64 on every push to `main`, after the Go tests
 pass (`.github/workflows/publish-image.yml`). Every pull request builds it
 on both architectures and runs it as a smoke test: read-only root, no
 capabilities, uid 10001, against Postgres 16. A pull request from this
-repository (not a fork) also publishes its image, after the same Go tests.
+repository (not a fork) also publishes its image.
 
 ### Image
 
@@ -887,17 +887,24 @@ repository (not a fork) also publishes its image, after the same Go tests.
   version`, `/v1/health`, `toolyard_build_info`).
 - Pull requests from this repository: `pr-<number>-<head>`, where `<head>`
   is the first 7 characters of the pull request's head commit, built from
-  the merge commit GitHub tests. The binary reports the same string as its
-  version. For test deployments only ([Kubernetes](#kubernetes)).
+  the merge commit GitHub tests, after the container smoke test (the Go
+  tests run in the pull request's own Inbox integration workflow). The
+  binary reports the same string as its version. For test deployments only
+  ([Kubernetes](#kubernetes)).
 - Deploy by digest, never by tag:
   `ghcr.io/iamtushar324/toolyard@sha256:<digest>`. The publish run's summary
   prints the digest of the multi-arch index. Each image carries an SBOM and
-  SLSA provenance, and the index has a GitHub attestation:
+  SLSA provenance, and the index has a GitHub attestation. Pull request
+  images have valid attestations too, so a production check must also pin
+  the ref the image was built from:
 
   ```bash
   gh attestation verify oci://ghcr.io/iamtushar324/toolyard@sha256:<digest> \
-    --repo iamtushar324/toolyard
+    --repo iamtushar324/toolyard --source-ref refs/heads/main
   ```
+
+  A pull request image names `refs/pull/<number>/merge` instead, and this
+  check refuses it.
 
 - Entrypoint `tini -- toolyard`, default command `serve`, user and group
   10001. Ports 8787 (dashboard, `/mcp`, `/v1/*`) and 9090 (the ops
@@ -1061,15 +1068,19 @@ tolerations, storage class, ingress class, trusted proxy) are environment
 inputs, never committed. It creates the credentials Secret (four keys and
 `database-url`) and the Postgres password once, from files in a private
 temporary directory, then applies Postgres, runs `toolyard db migrate` as a
-Job, waits for the rollout and smoke tests the result: `/v1/health` and
-`/v1/readyz` through the Ingress, `/v1/readyz` on every pod through a
-port-forward, MCP `server/discover`, and, with an agent token
-(`TOKEN_FILE`), a code-mode run. `--destroy` removes it but keeps the
-database volume and the Secrets; `--destroy --purge` deletes those too.
+Job and waits for the gateway's rollout. Until the first account exists,
+`/v1/auth/setup` is open to any caller, so the script then creates the admin
+account through a port-forward (the generated password goes to the
+`toolyard-admin` Secret) and only then applies the Ingress. Last it smoke
+tests the result: `/v1/health` and `/v1/readyz` through the Ingress,
+`/v1/readyz` on every pod through a port-forward, MCP `server/discover`, and,
+with an agent token (`TOKEN_FILE`), a code-mode run. `--destroy` removes it
+but keeps the database volume and the Secrets; `--destroy --purge` deletes
+those too.
 
-Two replicas need an image with v0.1 high availability; until then use
-`REPLICAS=1`, which switches to `Recreate`. Every pull request from this
-repository publishes an image tagged `pr-<number>-<7-character head commit>`
-(after the Go tests and the container smoke test), so a branch can run in
-the test cluster before it merges; the publish run's summary prints the
-digest to pass as `IMAGE`.
+`REPLICAS` is required: 1 for an image without v0.1 high availability
+(`Recreate`, no PodDisruptionBudget), 2 only for one with it. Every pull
+request from this repository publishes an image tagged
+`pr-<number>-<7-character head commit>`, so a branch can run in the test
+cluster before it merges; the publish run's summary prints the digest to
+pass as `IMAGE`.

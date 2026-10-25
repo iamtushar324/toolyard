@@ -4,18 +4,24 @@
 # run the container smoke test (read-only root, all capabilities dropped,
 # no-new-privileges, uid 10001, against Postgres 16). Nothing is pushed.
 #
-# Push to main (or a manual run on main), and pull requests from this
-# repository: first the same Go tests that gate pull requests
-# (inbox-integration.yml, called as a reusable workflow, so the exact commit
-# is tested again), then per architecture the smoke test and a push by
-# digest with SLSA provenance (mode=max) and an SBOM, then one multi-arch
-# index with a GitHub build-provenance attestation for its digest. Tags:
-# sha-<commit> and main on main; pr-<number>-<7-character head commit> for a
-# pull request, so a branch can run in a test cluster before it merges
-# (scripts/k8s-test-deploy.sh). A pull request image is built from the
-# merge commit GitHub tests (the head merged into the base), and its
-# version stamp is that pr-<number>-<head> tag. Deployments pin the index
-# digest printed in the run summary.
+# Push to main (or a manual run on main): first the same Go tests that gate
+# pull requests (inbox-integration.yml, called as a reusable workflow, so
+# the commit that main points at is tested again as merged), then per
+# architecture the smoke test and a push by digest with SLSA provenance
+# (mode=max) and an SBOM, then one multi-arch index tagged sha-<commit> and
+# main, with a GitHub build-provenance attestation for the index digest.
+#
+# Pull requests from this repository: the same smoke test, push and
+# attestation, tagged pr-<number>-<7-character head commit>, so a branch can
+# run in a test cluster before it merges (scripts/k8s-test-deploy.sh). The
+# Go tests are not repeated here: inbox-integration.yml runs them on every
+# pull request. The image is built from the merge commit GitHub tests (the
+# head merged into the base); its version stamp is the pr-<number>-<head>
+# tag, and its attestation names that pull request's ref
+# (refs/pull/<number>/merge), so a check with --source-ref refs/heads/main
+# accepts main's images only.
+#
+# Deployments pin the index digest printed in the run summary.
 #
 # CGO (mattn/go-sqlite3) rules out cross-compiling under QEMU, so each
 # architecture builds on its own GitHub-hosted runner.
@@ -23,6 +29,12 @@ name: Publish image
 
 on:
   pull_request:
+    # A pull request that changes only documentation builds no image.
+    # Nothing here is a required check (no ruleset or branch protection asks
+    # for one), so no check is left waiting.
+    paths-ignore:
+      - 'docs/**'
+      - '**/*.md'
   push:
     branches: [main]
   workflow_dispatch:
@@ -41,22 +53,17 @@ env:
 
 jobs:
   tests:
-    # Publishing only (main, and pull requests from this repository, whose
-    # image is pushed): every pull request also runs inbox-integration.yml
-    # on its own.
-    if: >-
-      github.repository == 'iamtushar324/toolyard' && (
-        (github.event_name != 'pull_request' && github.ref == 'refs/heads/main') ||
-        (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository))
+    # main only: pull requests already run inbox-integration.yml.
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main' && github.repository == 'iamtushar324/toolyard'
     uses: ./.github/workflows/inbox-integration.yml
     permissions:
       contents: read
 
   image:
     needs: tests
-    # tests is skipped when nothing is published (pull requests from forks,
-    # manual runs on other branches); then only the smoke test runs. A
-    # failed or cancelled test run stops the image job.
+    # tests runs on main only; on pull requests and manual runs on other
+    # branches it is skipped and the smoke test runs at once. A failed or
+    # cancelled test run on main stops the image job.
     if: ${{ !cancelled() && (needs.tests.result == 'success' || needs.tests.result == 'skipped') }}
     name: image (${{ matrix.arch }})
     strategy:
@@ -73,9 +80,9 @@ jobs:
       contents: read
       packages: write
     env:
-      # tests runs only where an image is published, so its success is the
-      # gate. VERSION is set by the first step.
-      PUBLISH: ${{ needs.tests.result == 'success' }}
+      # main after its tests, and pull requests from this repository (not
+      # forks). VERSION is set by the first step.
+      PUBLISH: ${{ github.repository == 'iamtushar324/toolyard' && ((github.event_name != 'pull_request' && github.ref == 'refs/heads/main' && needs.tests.result == 'success') || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)) }}
       SMOKE_IMAGE: toolyard:smoke
     services:
       postgres:
@@ -328,8 +335,12 @@ jobs:
 
   merge:
     needs: [tests, image]
-    # tests runs only for main and for pull requests from this repository.
-    if: needs.tests.result == 'success' && needs.image.result == 'success'
+    # Where image pushed: main after its tests, and pull requests from this
+    # repository (tests skipped, hence !cancelled()).
+    if: >-
+      !cancelled() && needs.image.result == 'success' && github.repository == 'iamtushar324/toolyard' && (
+        (github.event_name != 'pull_request' && github.ref == 'refs/heads/main' && needs.tests.result == 'success') ||
+        (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository))
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
@@ -432,7 +443,8 @@ jobs:
             echo "- Tags: $(for t in $TAGS; do printf '`%s` ' "$t"; done)"
             echo "- Platforms: linux/amd64, linux/arm64"
             echo "- Version stamp: \`${VERSION}\`"
-            echo "- Verify: \`gh attestation verify oci://${IMAGE}@${DIGEST} --repo ${GITHUB_REPOSITORY}\`"
+            echo "- Verify: \`gh attestation verify oci://${IMAGE}@${DIGEST} --repo ${GITHUB_REPOSITORY} --source-ref ${GITHUB_REF}\`"
+            echo "  (production accepts \`--source-ref refs/heads/main\` only: pull request images carry attestations too)"
             echo "- Test cluster: \`IMAGE=${IMAGE}@${DIGEST} scripts/k8s-test-deploy.sh\` (deploy/k8s/README.md)"
           } >> "$GITHUB_STEP_SUMMARY"
           echo "image ${IMAGE}@${DIGEST}"
