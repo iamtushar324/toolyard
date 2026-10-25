@@ -32,6 +32,7 @@ const (
 	goReload    = "skillhub-reload"
 	goUsage     = "skillhub-usage-flush"
 	goSyncAsync = "skillhub-sync"
+	goPoll      = "skillhub-poll"
 )
 
 const (
@@ -112,10 +113,9 @@ type Service struct {
 	runCtx context.Context
 	bg     sync.WaitGroup
 
-	// queued is the state of each source's background sync (see
-	// requestSync).
+	// queued holds each source's background sync (see requestSync).
 	qmu    sync.Mutex
-	queued map[string]int
+	queued map[string]*pendingSync
 
 	// wake pokes the poller after a source was created or changed.
 	wake chan struct{}
@@ -170,7 +170,7 @@ func New(opts Options) (*Service, error) {
 		limits:   &rateLimits{until: map[string]time.Time{}, now: now},
 		idx:      newIndex(),
 		runCtx:   context.Background(),
-		queued:   map[string]int{},
+		queued:   map[string]*pendingSync{},
 		wake:     make(chan struct{}, 1),
 	}
 	s.usage.counts = map[usageKey]int64{}

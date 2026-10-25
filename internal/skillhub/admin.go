@@ -181,6 +181,9 @@ func (s *Service) applyInput(ctx context.Context, r *sourceRow, in SourceInput) 
 
 // normalizeSource checks a source's settings and fills in defaults.
 func normalizeSource(r *sourceRow) error {
+	if !validBranch(r.Branch) {
+		return fmt.Errorf("%w: branch %q is not a valid branch name", ErrInvalid, r.Branch)
+	}
 	switch r.Mode {
 	case ModeAuto, ModeReview:
 	case ModePinned:
@@ -252,7 +255,7 @@ func (s *Service) Preview(ctx context.Context, by string, in SourceInput) (*Prev
 	}
 	sha := r.PinnedSHA
 	if r.Mode != ModePinned {
-		if sha, _, _, err = gh.head(ctx, r.Owner, r.Repo, r.Branch, ""); err != nil {
+		if sha, _, _, err = gh.head(ctx, r.Owner, r.Repo, r.Branch, "", true); err != nil {
 			return nil, s.repoError(err, r)
 		}
 	}
@@ -544,10 +547,12 @@ func (s *Service) GetVersion(ctx context.Context, id, versionID string) (*Versio
 	return &v.Version, nil
 }
 
-// Activate makes a staged or retired version active: a review approval or
-// a rollback. Every node serves it within moments.
+// Activate makes a version active: the staged version waiting for review
+// (an approval), or a retired one (a rollback). A staged version that is
+// not the one waiting for review (a newer commit replaced it) is refused
+// with ErrConflict. Every node serves the version within moments.
 func (s *Service) Activate(ctx context.Context, by, id, versionID string) error {
-	changed, err := s.activate(ctx, by, id, versionID, false)
+	changed, _, err := s.activate(ctx, activation{by: by, sourceID: id, versionID: versionID})
 	if err != nil {
 		return err
 	}
@@ -706,6 +711,9 @@ func (s *Service) RotateWebhookSecret(ctx context.Context, by, id string) (strin
 // starts a sync on this node (in the background: GitHub waits 10 seconds
 // at most). Other events are ignored.
 func (s *Service) HandleWebhook(ctx context.Context, id, event string, body []byte, signature string) error {
+	if len(body) > maxWebhookBody {
+		return fmt.Errorf("%w: webhook body too large", ErrInvalid)
+	}
 	r, err := s.getSourceRow(ctx, s.db, id)
 	if err != nil {
 		return err
@@ -724,20 +732,29 @@ func (s *Service) HandleWebhook(ctx context.Context, id, event string, body []by
 	default:
 		return nil
 	}
-	if len(body) > maxWebhookBody {
-		return fmt.Errorf("%w: webhook body too large", ErrInvalid)
-	}
 	var push struct {
 		Ref     string `json:"ref"`
+		After   string `json:"after"`
 		Deleted bool   `json:"deleted"`
 	}
 	if err := json.Unmarshal(body, &push); err != nil {
 		return fmt.Errorf("%w: the push payload is not JSON", ErrInvalid)
 	}
-	if push.Ref != "refs/heads/"+r.Branch || push.Deleted || !r.Enabled || r.Mode == ModePinned {
+	after := strings.ToLower(strings.TrimSpace(push.After))
+	if push.Ref != "refs/heads/"+r.Branch || push.Deleted || !r.Enabled || r.Mode == ModePinned ||
+		strings.Trim(after, "0") == "" {
+		// Another branch, a deleted branch (after is all zeros), a paused
+		// source, or a pinned one.
 		return nil
 	}
-	s.requestSync(id, triggerWebhook)
+	req := syncRequest{tr: triggerWebhook}
+	if shaRe.MatchString(after) {
+		// The signature proves the body: serve the pushed commit itself,
+		// without asking for the branch head (GitHub may answer that from
+		// a cache up to a minute old).
+		req.sha = after
+	}
+	s.requestSync(id, req)
 	return nil
 }
 
