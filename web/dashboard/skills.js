@@ -26,7 +26,7 @@ const skillsUI = {
   watching: {},     // source id -> true while its first sync is polled
   // githubConnection shows "Use my GitHub connection" in the wizard: a
   // private repository read with the admin's own toolyard GitHub
-  // connection (slice D turns it on).
+  // connection. openSkillsWizard sets it from GET /v1/me/connections.
   githubConnection: false,
 };
 
@@ -379,7 +379,20 @@ async function rotateSkillSecret(src) {
 
 // ---- wizard actions ----------------------------------------------------------
 
-function openSkillsWizard() { skillsUI.wizard = skillsWizardNew(); render(); }
+function openSkillsWizard() { skillsUI.wizard = skillsWizardNew(); render(); loadSkillsGitHubConnection(); }
+
+// skillsHasGitHubConnection reports whether a GET /v1/me/connections list
+// holds a connected, enabled GitHub server (a per-user GitHub connection).
+function skillsHasGitHubConnection(list) {
+  return Array.isArray(list) && list.some((c) => c && c.transport === 'github' && c.state === 'connected' && c.enabled !== false);
+}
+
+// loadSkillsGitHubConnection offers "Use my GitHub connection" only to an
+// admin who has one.
+async function loadSkillsGitHubConnection() {
+  try { skillsUI.githubConnection = skillsHasGitHubConnection(await api('/v1/me/connections')); } catch (e) { skillsUI.githubConnection = false; }
+  render();
+}
 
 async function skillsWizardInspect() {
   const w = skillsUI.wizard;
@@ -388,10 +401,14 @@ async function skillsWizardInspect() {
   try {
     const body = { url: w.url.trim() };
     if (w.auth === 'token' && w.token.trim()) body.token = w.token.trim();
+    if (w.auth === 'github') body.auth = 'github';
     skillsWizardAfterInspect(w, await api('/v1/skills/sources/inspect', { method: 'POST', body }));
   } catch (e) {
     w.error = skillsErrorText(e);
-    if (e.body && e.body.code === 'needs_token') { w.auth = 'token'; w.error = 'This repository is private or does not exist. Paste a read-only token and inspect again.'; }
+    if (e.body && e.body.code === 'needs_token' && w.auth !== 'github') {
+      w.auth = 'token';
+      w.error = 'This repository is private or does not exist. ' + (skillsUI.githubConnection ? 'Paste a read-only token, or use your GitHub connection, and inspect again.' : 'Paste a read-only token and inspect again.');
+    }
   }
   w.busy = false; render();
 }
@@ -712,7 +729,8 @@ function renderSkillsWizard() {
   if (w.step === 'url') body = el('div', {},
     skillsField('GitHub repository', el('input', { id: 'skills-wiz-url', autofocus: true, placeholder: 'owner/repo, or a github.com URL (…/tree/<branch>/<folder> works too)', value: w.url,
       on: { input: (e) => { w.url = e.target.value; }, keydown: (e) => { if (e.key === 'Enter') skillsWizardInspect(); } } })),
-    w.auth === 'token' ? renderSkillsTokenField(w) : el('button', { class: 'link', on: { click: () => { w.auth = 'token'; render(); } } }, 'Private repository? Add a read-only token'));
+    w.auth !== 'none' ? renderSkillsTokenField(w) : el('button', { class: 'link', on: { click: () => { w.auth = 'token'; render(); } } },
+      skillsUI.githubConnection ? 'Private repository? Add a read-only token or use your GitHub connection' : 'Private repository? Add a read-only token'));
   else if (w.step === 'repo') body = renderSkillsWizardRepo(w);
   else if (w.step === 'review') body = renderSkillsWizardReview(w);
   else body = renderSkillsWizardDone(w);
@@ -741,7 +759,8 @@ function renderSkillsTokenField(w) {
     w.auth === 'token' ? skillsField('Read-only token',
       el('input', { id: 'skills-wiz-token', type: 'password', autocomplete: 'new-password', placeholder: 'A fine-grained token with Contents: read on this repository', value: w.token,
         on: { input: (e) => { skillsWizardSet(w, 'token', e.target.value); } } }),
-      'Write-only: toolyard stores it sealed and never shows it again. It is used only to read this repository.') : null);
+      'Write-only: toolyard stores it sealed and never shows it again. It is used only to read this repository.') : null,
+    w.auth === 'github' ? el('p', { class: 'meta' }, 'toolyard reads this repository with your own toolyard GitHub connection, now and on every sync. The toolyard GitHub App must be installed on it (Contents: read, Metadata: read).') : null);
 }
 
 function renderSkillsWizardRepo(w) {

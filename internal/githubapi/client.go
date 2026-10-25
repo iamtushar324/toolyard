@@ -31,6 +31,10 @@ func New(h *http.Client, token string) *Client {
 	return &Client{http: &clone, token: token}
 }
 
+// errTransport is a request that got no answer: a write may or may not
+// have reached GitHub (Uncertain).
+var errTransport = errors.New("GitHub request failed; inspect the approval result before a retry")
+
 type APIError struct{ Status int }
 
 func (e *APIError) Error() string { return fmt.Sprintf("GitHub returned HTTP %d", e.Status) }
@@ -67,7 +71,7 @@ func (c *Client) Do(ctx context.Context, method, path string, body any, out any)
 	r.Header.Set("User-Agent", "toolyard")
 	res, err := c.http.Do(r)
 	if err != nil {
-		return errors.New("GitHub request failed; inspect the approval result before a retry")
+		return errTransport
 	}
 	defer res.Body.Close()
 	if res.StatusCode < 200 || res.StatusCode >= 300 {

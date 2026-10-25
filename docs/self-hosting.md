@@ -541,11 +541,25 @@ the database and serves only that copy. How sync, review and limits work:
 - **Credentials.** A private repository needs a read-only token
   (fine-grained, *Contents: read* on that repository). toolyard seals it
   with `secrets.key`, never shows it again, never logs it, and never sends
-  it to the archive host. Webhook secrets are sealed the same way.
+  it to the archive host. Webhook secrets are sealed the same way. Instead
+  of a token, an admin who has connected the per-user GitHub server (My
+  connections) can let a source read with their own connection
+  (`auth: github`); the toolyard GitHub App then needs *Contents: read* and
+  *Metadata: read* on that repository.
+- **Change proposals.** An agent's `skills.propose_change` becomes an
+  Inbox question for the person who added the source; their approval opens
+  a pull request with their own GitHub connection (no flag or setting; it
+  needs the per-user GitHub server). For that, the toolyard GitHub App
+  needs *Contents: write* and *Pull requests: write* on the repository:
+  the App that the GitHub setup creates asks for *Pull requests: write*
+  and *Contents: read*, so add *Contents: write* in the App's settings on
+  GitHub (and accept it on each installation) to use change proposals.
+  The writes go to `https://api.github.com` only.
 - **`skills_github_token`** (set on the Skills page, GitHub access, or
   `PUT /v1/skills/admin/github-token`; never through the settings API,
   which neither returns nor accepts it): a default read token for every
-  source without its own. Without it GitHub allows this server's address
+  source with `auth: none` (a source's own token and `auth: github`
+  win). Without it GitHub allows this server's address
   60 calls an hour, and anonymous `304`s count, so a few public sources
   and some admin use reach the limit; with it, 5,000 calls an hour. A
   fine-grained token with read access to public repositories is enough.

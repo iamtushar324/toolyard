@@ -7,8 +7,8 @@ package skillhub
 // background. The agent polls its proposal with skills.proposal
 // (GetProposal). A proposal whose item expired, was withdrawn, or was
 // decided while no handler ran is settled by Sweep (review_sweep.go), by
-// the agent's next proposal, or by its next poll. ProposeChange belongs to
-// slice D and answers ErrChangeProposalsUnavailable until then.
+// the agent's next proposal, or by its next poll. ProposeChange and the
+// polls of change proposals go to ChangeProposals (slice D) once it is set.
 
 import (
 	"context"
@@ -81,6 +81,9 @@ type SourceProposals struct {
 	limit *cluster.Counter
 	// bg tracks the background first syncs (tests wait for them).
 	bg sync.WaitGroup
+	// changes takes skills.propose_change (slice D, proposal_change.go);
+	// nil until SetChangeProposals.
+	changes *ChangeProposals
 }
 
 var _ Proposals = (*SourceProposals)(nil)
@@ -184,9 +187,13 @@ func (p *SourceProposals) ProposeSource(ctx context.Context, v Viewer, in Source
 	return proposalView(row), nil
 }
 
-// ProposeChange is slice D's; until it ships it refuses every change.
+// ProposeChange hands the change to ChangeProposals (SetChangeProposals);
+// without it every change is refused.
 func (p *SourceProposals) ProposeChange(ctx context.Context, v Viewer, in ChangeInput) (*Proposal, error) {
-	return nil, ErrChangeProposalsUnavailable
+	if p.changes == nil {
+		return nil, ErrChangeProposalsUnavailable
+	}
+	return p.changes.ProposeChange(ctx, v, in)
 }
 
 // GetProposal returns one of the calling agent's proposals (or, for a
@@ -197,6 +204,9 @@ func (p *SourceProposals) GetProposal(ctx context.Context, v Viewer, id string) 
 	row, err := p.store.get(ctx, strings.TrimSpace(id))
 	if err != nil {
 		return nil, err
+	}
+	if row.Kind == proposalKindChange && p.changes != nil {
+		return p.changes.GetProposal(ctx, v, row.ID)
 	}
 	mine := (v.AgentID != "" && row.AgentID == v.AgentID) || (v.AgentID == "" && v.UserID != "" && row.UserID == v.UserID)
 	if row.Kind != proposalKindSource || !mine {

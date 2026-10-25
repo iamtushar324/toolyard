@@ -13,7 +13,7 @@ the API is described at GET /v1/code/openapi.json.
   ty search QUERY [--mode keyword|regex] [--detail name|summary|full] [--limit N] [--upstream SERVER]
   ty call SERVER.TOOL '{"json": "arguments"}' [--reason TEXT]
 
-The skills hub (docs/skills-hub.md in the toolyard repo), read-only:
+The skills hub (docs/skills-hub.md in the toolyard repo):
 
   ty skills search QUERY [--mode keyword|regex] [--source SLUG] [--limit N] [--include-host]
   ty skills get SKILL [--no-files]
@@ -21,6 +21,13 @@ The skills hub (docs/skills-hub.md in the toolyard repo), read-only:
   ty skills grep PATTERN [--source SLUG] [--path GLOB] [--ignore-case] [--limit N] [--include-host]
   ty skills sources
   ty skills list [--cursor CURSOR] [--limit N] [--source SLUG] [--include-host]
+  ty skills pull SKILL... [--dir ~/.claude/skills] [--force] [--reason TEXT]
+
+skills pull downloads the skills as one bundle and unpacks each into its own
+folder under --dir (default ~/.claude/skills, where Claude Code reads them).
+It refuses an archive member that is absolute, has a ".." segment, or is a
+link or a special file, and replaces a skill folder that already exists only
+with --force.
 
 A FILE ending in .js or .mjs runs as JavaScript (await tools.Server.tool({...}),
 return the result); anything else as Starlark, unless --language says.
@@ -46,10 +53,15 @@ Python 3 standard library only.
 
 import argparse
 import http.client
+import io
 import json
 import os
+import re
+import shutil
 import stat
 import sys
+import tarfile
+import tempfile
 import time
 import urllib.error
 import urllib.parse
@@ -63,6 +75,11 @@ MAX_SERVER_WAIT = 60
 DEFAULT_SERVER_WAIT = 25
 REASON_MIN, REASON_MAX = 20, 2000
 REASON_PAD = " (toolyard code mode over REST)"
+DEFAULT_SKILLS_DIR = "~/.claude/skills"
+MAX_BUNDLE_BYTES = 128 << 20     # the downloaded .tar.gz
+MAX_UNPACKED_BYTES = 256 << 20   # every file in it, unpacked
+MAX_BUNDLE_MEMBERS = 50000
+SKILL_FOLDER = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
 
 EXIT_SUCCEEDED = 0
 EXIT_FAILED = 1
@@ -678,6 +695,183 @@ def cmd_skills_list(client, args):
     return skills_query(client, "/v1/skills/list", query)
 
 
+def bundle_url(base, url):
+    """The bundle's download URL: a path is on TOOLYARD_URL; an absolute URL
+    must be https, or http on TOOLYARD_URL's own origin."""
+    if url.startswith("/") and not url.startswith("//"):
+        return base + url
+    try:
+        parts = urllib.parse.urlsplit(url)
+        own = urllib.parse.urlsplit(base)
+    except ValueError:
+        raise TyError("the server answered with a download URL that does not parse")
+    if not parts.hostname or parts.username or parts.password:
+        raise TyError("the server answered with an unusable download URL")
+    if parts.scheme == "https" or (parts.scheme == "http" and (parts.scheme, parts.netloc) == (own.scheme, own.netloc)):
+        return url
+    raise TyError("the server answered with a download URL that is not https")
+
+
+def download_bundle(url):
+    """GETs the bundle. The single-use ticket in the URL is the credential:
+    the token is never sent, redirects are refused and the URL is never
+    printed."""
+    req = urllib.request.Request(url, method="GET")
+    req.add_header("User-Agent", "ty/1 (toolyard skills pull)")
+    try:
+        with _OPENER.open(req, timeout=120) as resp:
+            data = resp.read(MAX_BUNDLE_BYTES + 1)
+    except urllib.error.HTTPError as e:
+        try:
+            body = parse_json(e.read())
+        except Exception:
+            body = None
+        detail = body.get("error") if isinstance(body, dict) and isinstance(body.get("error"), str) else ""
+        raise TyError("downloading the bundle failed: HTTP %d %s" % (e.code, " ".join(detail.split())[:300]))
+    except urllib.error.URLError as e:
+        raise TyError("cannot download the bundle: %s" % e.reason)
+    except (OSError, http.client.HTTPException) as e:
+        raise TyError("downloading the bundle failed: %s" % e)
+    if len(data) > MAX_BUNDLE_BYTES:
+        raise TyError("the bundle is over %d MiB; pull fewer skills at once" % (MAX_BUNDLE_BYTES >> 20))
+    return data
+
+
+def bundle_member_parts(name, folders):
+    """The path segments of one archive member, or a TyError when the member
+    could land outside its skill folder."""
+    if not name or "\x00" in name or "\\" in name:
+        raise TyError("refusing the bundle: member %r has an unsafe name" % name[:200])
+    if name.startswith("/") or re.match(r"^[A-Za-z]:", name):
+        raise TyError("refusing the bundle: member %r has an absolute path" % name[:200])
+    parts = name.split("/")
+    if parts and parts[-1] == "":
+        parts = parts[:-1]  # a folder entry ends with "/"
+    if not parts or any(p in ("", ".", "..") for p in parts):
+        raise TyError("refusing the bundle: member %r is not a plain path inside a skill folder" % name[:200])
+    if parts[0] not in folders:
+        raise TyError("refusing the bundle: member %r is outside the skills the server named" % name[:200])
+    return parts
+
+
+def extract_bundle(data, staging, folders):
+    """Unpacks the bundle into staging, one folder per skill. Only regular
+    files and folders; every file is written new (mode 0644), never through
+    an existing path. Returns {folder: file count}."""
+    counts = {}
+    total = 0
+    members = 0
+    try:
+        archive = tarfile.open(fileobj=io.BytesIO(data), mode="r:gz")
+    except (tarfile.TarError, OSError, EOFError) as e:
+        raise TyError("the bundle is not a valid .tar.gz: %s" % e)
+    with archive:
+        try:
+            for m in archive:
+                members += 1
+                if members > MAX_BUNDLE_MEMBERS:
+                    raise TyError("refusing the bundle: more than %d members" % MAX_BUNDLE_MEMBERS)
+                parts = bundle_member_parts(m.name, folders)
+                if m.issym() or m.islnk():
+                    raise TyError("refusing the bundle: member %r is a link" % m.name[:200])
+                dest = os.path.join(staging, *parts)
+                if m.isdir():
+                    os.makedirs(dest, mode=0o755, exist_ok=True)
+                    continue
+                if not m.isreg():
+                    raise TyError("refusing the bundle: member %r is not a regular file" % m.name[:200])
+                total += m.size
+                if total > MAX_UNPACKED_BYTES:
+                    raise TyError("refusing the bundle: over %d MiB unpacked" % (MAX_UNPACKED_BYTES >> 20))
+                os.makedirs(os.path.dirname(dest), mode=0o755, exist_ok=True)
+                src = archive.extractfile(m)
+                if src is None:
+                    raise TyError("refusing the bundle: member %r has no content" % m.name[:200])
+                flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0)
+                try:
+                    fd = os.open(dest, flags, 0o644)
+                except FileExistsError:
+                    raise TyError("refusing the bundle: member %r appears twice" % m.name[:200])
+                with os.fdopen(fd, "wb") as out:
+                    left = m.size
+                    while left > 0:
+                        chunk = src.read(min(left, 1 << 20))
+                        if not chunk:
+                            raise TyError("the bundle is truncated at %r" % m.name[:200])
+                        out.write(chunk)
+                        left -= len(chunk)
+                counts[parts[0]] = counts.get(parts[0], 0) + 1
+        except (tarfile.TarError, EOFError, OSError) as e:
+            raise TyError("unpacking the bundle failed: %s" % e)
+    return counts
+
+
+def cmd_skills_pull(client, args):
+    target = os.path.abspath(os.path.expanduser(args.dir or DEFAULT_SKILLS_DIR))
+    body = {"skills": args.skills}
+    if args.reason:
+        body["reason"] = check_reason(args.reason)
+    status, headers, data = client.send("POST", "/v1/skills/bundle", json.dumps(body, ensure_ascii=False).encode("utf-8"),
+                                        {"Content-Type": "application/json"})
+    answer = parse_json(data)
+    if status != 200 or not isinstance(answer, dict) or not isinstance(answer.get("url"), str):
+        return error_exit(status, headers, data)
+    skills = [s for s in answer.get("skills") or [] if isinstance(s, dict)]
+    folders = []
+    for s in skills:
+        name = s.get("name")
+        if not isinstance(name, str) or not SKILL_FOLDER.match(name) or name in (".", ".."):
+            raise TyError("the server named a skill folder ty will not write: %r" % (str(name)[:200],))
+        folders.append(name)
+    if not folders:
+        raise TyError("the server named no skills to pull")
+    if os.path.lexists(target) and not os.path.isdir(target):
+        raise TyError("--dir %s exists and is not a folder" % target)
+    try:
+        os.makedirs(target, mode=0o755, exist_ok=True)
+    except OSError as e:
+        raise TyError("cannot make --dir %s: %s" % (target, e.strerror or e))
+    present = [f for f in folders if os.path.lexists(os.path.join(target, f))]
+    if present and not args.force:
+        raise TyError("%s already in %s: pass --force to replace %s" % (", ".join(present), target,
+                                                                         "it" if len(present) == 1 else "them"))
+    bundle = download_bundle(bundle_url(client.base, answer["url"]))
+    out = []
+    try:
+        staging = tempfile.mkdtemp(prefix=".ty-pull-", dir=target)
+    except OSError as e:
+        raise TyError("cannot write in --dir %s: %s" % (target, e.strerror or e))
+    try:
+        counts = extract_bundle(bundle, os.path.join(staging, "new"), set(folders))
+        old = os.path.join(staging, "old")
+        os.makedirs(old)
+        for s, name in zip(skills, folders):
+            src = os.path.join(staging, "new", name)
+            if name not in counts or not os.path.isdir(src):
+                continue
+            dst = os.path.join(target, name)
+            replaced = os.path.lexists(dst)
+            if replaced:
+                # Move the old folder (or file, or link itself) aside first,
+                # and put it back if the new one cannot take its place.
+                os.rename(dst, os.path.join(old, name))
+                try:
+                    os.rename(src, dst)
+                except OSError:
+                    os.rename(os.path.join(old, name), dst)
+                    raise
+            else:
+                os.rename(src, dst)
+            out.append({"name": name, "path": dst, "files": counts[name], "replaced": replaced,
+                        "uri": s.get("uri"), "source": s.get("source"), "repo": s.get("repo"), "commit": s.get("commit")})
+    except OSError as e:
+        raise TyError("installing the skills failed: %s" % e)
+    finally:
+        shutil.rmtree(staging, ignore_errors=True)
+    emit_json({"dir": target, "skills": out})
+    return EXIT_SUCCEEDED
+
+
 def seconds(text):
     try:
         n = int(text)
@@ -788,6 +982,15 @@ def build_parser():
     k.add_argument("--source", metavar="SLUG", help="only this skill source")
     k.add_argument("--include-host", action="store_true", help=host_help)
     k.set_defaults(func=cmd_skills_list)
+
+    k = skills.add_parser("pull", help="download skills into a local folder, such as Claude Code's ~/.claude/skills")
+    k.add_argument("skills", metavar="SKILL", nargs="+",
+                   help="skill://<source>/<path>/SKILL.md, <source>/<path>, or a unique name (at most 50)")
+    k.add_argument("--dir", metavar="DIR", default=DEFAULT_SKILLS_DIR,
+                   help="where each skill gets its folder (default %s)" % DEFAULT_SKILLS_DIR)
+    k.add_argument("--force", action="store_true", help="replace a skill folder that already exists")
+    k.add_argument("--reason", metavar="TEXT", help="why you pull them, 20-2000 characters, for the audit")
+    k.set_defaults(func=cmd_skills_pull)
     return p
 
 
