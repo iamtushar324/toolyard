@@ -404,9 +404,12 @@ def main():
                         time.sleep(0.25)
                 deadline = time.time() + 20
                 while True:
-                    r = requests.get("http://127.0.0.1:%d/v1/skills/get" % port, headers=agent.h,
-                                     params={"skill": "fixture/release-notes", "reason": REASON}, timeout=20)
-                    sha = r.json().get("commit") if r.ok else "HTTP %s" % r.status_code
+                    try:
+                        r = requests.get("http://127.0.0.1:%d/v1/skills/get" % port, headers=agent.h,
+                                         params={"skill": "fixture/release-notes", "reason": REASON}, timeout=20)
+                        sha = r.json().get("commit") if r.ok else "HTTP %s" % r.status_code
+                    except requests.ConnectionError as e:  # port-forward not ready yet
+                        sha = "connection: %s" % type(e).__name__
                     if sha == expect_sha or time.time() > deadline:
                         break
                     time.sleep(1)
