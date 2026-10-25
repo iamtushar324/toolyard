@@ -60,7 +60,7 @@ const (
 	skillsListDefault   = 100
 	skillsListMax       = 500
 	skillsBundleMax     = 50
-	skillsProposeFiles  = 100
+	skillsProposeFiles  = skillhub.MaxChangeFiles
 )
 
 // SkillToolNames are the skills.* tools, in the order they are registered.
@@ -543,10 +543,16 @@ func skillsProposalNext(p *skillhub.Proposal) string {
 	case "pending":
 		return "Your owner has not decided yet. Continue other work and poll again later; do not propose it again."
 	case "approved":
+		if p.Kind == "change" {
+			return "Approved; toolyard is opening the pull request on GitHub (or checking what GitHub did after a lost answer). Poll again in a few minutes."
+		}
 		return "Your owner approved it; toolyard is applying it. Poll again in a minute."
 	case "done":
 		if p.Kind == "source" {
 			return "Added as source " + p.Result + ". Its first sync runs in the background; skills.sources lists it, and skills.search finds its skills, once it finished."
+		}
+		if p.Kind == "change" {
+			return "The pull request is open: " + p.Result + ". People review and merge it on GitHub; agents see the change once the merged commit is synced."
 		}
 		return "Done: " + p.Result
 	case "rejected":
@@ -601,7 +607,7 @@ func (g *Gateway) handleSkillsProposeChange(ctx context.Context, hub *skillHubCo
 	return skillsJSON(map[string]any{
 		"proposal": p,
 		"skill":    map[string]any{"uri": s.URI, "name": s.Name, "source": s.Source, "repo": s.Repo, "commit": s.Commit},
-		"next":     "The source's owner decides in their Inbox; after approval toolyard opens a pull request. Continue other work.",
+		"next":     "The source's owner decides in their Inbox; after approval toolyard opens a pull request. Continue other work; poll the outcome with skills.proposal (id " + p.ID + ").",
 	})
 }
 

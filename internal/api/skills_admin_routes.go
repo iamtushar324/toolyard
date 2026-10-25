@@ -5,7 +5,7 @@ package api
 // the webhook is the one public route, authenticated by GitHub's
 // signature.
 //
-//	POST   /v1/skills/sources/inspect                       {url, token?} -> repository, branches, trusted_owner
+//	POST   /v1/skills/sources/inspect                       {url, token?, auth?} -> repository, branches, trusted_owner
 //	POST   /v1/skills/sources/preview                       SourceInput -> dry run; nothing is stored
 //	GET    /v1/skills/admin/sources                         every source (the agent list is GET /v1/skills/sources)
 //	POST   /v1/skills/sources                               SourceInput -> 201 {source, status: "syncing"}; the first sync runs in the background
@@ -312,6 +312,7 @@ func (s *Server) skillInspect(w http.ResponseWriter, r *http.Request) {
 	var body struct {
 		URL   string `json:"url"`
 		Token string `json:"token,omitempty"`
+		Auth  string `json:"auth,omitempty"` // "github": read with the admin's GitHub connection (slice D)
 	}
 	if err := decode(r, &body); err != nil {
 		writeError(w, http.StatusBadRequest, redactSkillSecrets(err.Error(), body.Token))
@@ -321,7 +322,13 @@ func (s *Server) skillInspect(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "url is required", "code": "invalid"})
 		return
 	}
-	info, err := s.skillsAdmin.Inspect(r.Context(), body.URL, body.Token)
+	var info *skillhub.RepoInfo
+	var err error
+	if body.Auth == string(skillhub.AuthGitHub) {
+		info, err = s.skillInspectWithConnection(r, body.URL)
+	} else {
+		info, err = s.skillsAdmin.Inspect(r.Context(), body.URL, body.Token)
+	}
 	if err != nil {
 		writeSkillAdminError(w, err, body.Token)
 		return

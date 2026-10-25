@@ -541,7 +541,20 @@ the database and serves only that copy. How sync, review and limits work:
 - **Credentials.** A private repository needs a read-only token
   (fine-grained, *Contents: read* on that repository). toolyard seals it
   with `secrets.key`, never shows it again, never logs it, and never sends
-  it to the archive host. Webhook secrets are sealed the same way.
+  it to the archive host. Webhook secrets are sealed the same way. Instead
+  of a token, an admin who has connected the per-user GitHub server (My
+  connections) can let a source read with their own connection
+  (`auth: github`); the toolyard GitHub App then needs *Contents: read* and
+  *Metadata: read* on that repository.
+- **Change proposals.** An agent's `skills.propose_change` becomes an
+  Inbox question for the person who added the source; their approval opens
+  a pull request with their own GitHub connection (no flag or setting; it
+  needs the per-user GitHub server). For that, the toolyard GitHub App
+  needs *Contents: write* and *Pull requests: write* on the repository:
+  the App that the GitHub setup creates asks for *Pull requests: write*
+  and *Contents: read*, so add *Contents: write* in the App's settings on
+  GitHub (and accept it on each installation) to use change proposals.
+  The writes go to `https://api.github.com` only.
 - **Webhook (optional).** Polling checks each source every 5 minutes (its
   `poll_seconds`, at least 60) with a conditional request that costs no
   rate limit when nothing changed. For updates within seconds, add a

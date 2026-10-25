@@ -1443,6 +1443,64 @@ func runServe(argv []string) error {
 		})
 	}
 
+	// skillhub (slice D): people's own toolyard GitHub connections (the
+	// enabled per-user GitHub servers on the Servers page, connected in My
+	// connections). A source with auth "github" reads with its creator's
+	// connection, and an approved change proposal (skills.propose_change)
+	// opens its pull request with the source creator's connection. Every
+	// such GitHub write waits for that person's own Inbox approval; no
+	// grant or policy can approve it. A blocked person's connection is
+	// never used.
+	if skillHubAdmin != nil && skillhubSvc != nil {
+		githubConns := &skillhub.GitHubConnections{
+			Servers: func(ctx context.Context) ([]string, error) {
+				list, err := upstreamSvc.List(ctx)
+				if err != nil {
+					return nil, err
+				}
+				var names []string
+				for _, sv := range list {
+					if sv.Transport == "github" && sv.Enabled && sv.AuthMode == upstreams.AuthPerUser {
+						names = append(names, sv.Name)
+					}
+				}
+				return names, nil
+			},
+			Freshen: oauthSvc.FreshenUserToken,
+			Token: func(ctx context.Context, server, uid string) (string, error) {
+				rec, err := oauthSvc.GetUserToken(ctx, server, uid)
+				if err != nil || rec == nil || rec.State == oauth.StateNeedsReauth {
+					return "", err
+				}
+				return rec.AccessToken, nil
+			},
+			Active: func(ctx context.Context, uid string) bool {
+				u, err := idSvc.GetUserByID(ctx, uid)
+				return err == nil && u.Status == identity.StatusActive
+			},
+		}
+		githubTokens := githubConns.TokenSource()
+		skillHubAdmin.SetTokenSource(githubTokens)
+		changes, err := skillhub.NewChangeProposals(skillhub.ChangeOptions{DB: db, Inbox: inboxSvc, Reader: skillhubSvc,
+			Admin: skillHubAdmin, Tokens: githubTokens, AgentName: agentName, Audit: auditSvc,
+			UserName: func(ctx context.Context, uid string) string {
+				u, err := idSvc.GetUserByID(ctx, uid)
+				if err != nil {
+					return ""
+				}
+				if u.DisplayName != "" {
+					return u.DisplayName
+				}
+				return u.Username
+			}})
+		if err != nil {
+			return fmt.Errorf("skills hub change proposals: %w", err)
+		}
+		if sp, ok := skillHubProposals.(*skillhub.SourceProposals); ok {
+			sp.SetChangeProposals(changes)
+		}
+	}
+
 	// skillhub (slice B): the agent surface: the skills.* tools, the MCP
 	// Skills extension (capability, instructions, skill:// resources) and
 	// the bundle download tickets. Registered after RegisterBuiltins and

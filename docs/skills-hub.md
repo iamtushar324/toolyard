@@ -53,7 +53,9 @@ Open **Skills** in the dashboard and choose **Add source**:
 3. For a private repository, paste a read-only token: a fine-grained token
    with **Contents: read** on that repository is enough. The token is
    write-only: toolyard stores it sealed, uses it only to read that
-   repository, and never shows or logs it again.
+   repository, and never shows or logs it again. If you have connected
+   GitHub in **My connections**, you can choose **Use my GitHub
+   connection** instead ([GitHub connection](#github-connection)).
 4. **Preview** is a dry run: the commit, how many skills and files it found,
    the warnings grouped by kind, and some of the skills. Nothing is stored.
 5. Choose the update mode, who sees the source, and where its skills run by
@@ -120,6 +122,63 @@ The webhook route needs no session: GitHub's `X-Hub-Signature-256`
 signature over the body is the credential, and a delivery with a wrong
 signature gets `401`. Bodies are capped at 5 MiB.
 
+### GitHub connection
+
+A source can read its repository with the toolyard GitHub connection of
+the admin who adds it (source `auth: github`) instead of a token. The
+connection is the per-user GitHub server on the Servers page (the
+marketplace's "GitHub" entry, a GitHub App that each person connects in
+**My connections**). The wizard offers **Use my GitHub connection** only
+when you have a connected GitHub server; Inspect, Preview and every later
+sync then read with your connection, and toolyard keeps the token fresh
+(an expired token is refreshed before use). If you disconnect GitHub, lose
+access to the repository or are blocked, the source's syncs fail with a
+clear error and the live version stays until you reconnect or give the
+source a token.
+
+The same connection opens the pull requests of
+[change proposals](#change-proposals) for the sources you added. The
+toolyard GitHub App must be installed on the repository with these
+permissions (the App's settings on GitHub, then accept the new permissions
+on each installation):
+
+| Use | Repository permissions |
+| --- | --- |
+| Read a source (`auth: github`) | **Contents: read**, **Metadata: read** |
+| Open change proposals as pull requests | **Contents: write**, **Pull requests: write**, **Metadata: read** |
+
+The App that toolyard's GitHub setup creates asks for Contents: read,
+Metadata: read and Pull requests: write; add **Contents: write** in the
+App's settings on GitHub if your admins want change proposals. Your
+GitHub account must also be able to push branches to the repository.
+
+### Change proposals
+
+An agent that sees a skill can propose an edit with
+`skills.propose_change` ([For agents](#change-proposals-for-agents)).
+toolyard checks it against the version agents see now and puts one
+question, "Open a pull request on owner/repo?", in the Inbox of the person
+who added the skill's source: the proposing agent and its owner, the base
+commit, the agent's title and summary, and a short unified diff of every
+file. Nothing reaches GitHub before that person decides.
+
+- **Approve** opens the pull request with *your* GitHub connection: a new
+  branch `toolyard/skills/<proposal id>` from the base commit, one commit
+  with the files, and a pull request into the source's branch, with the
+  agent's title and summary and a footer naming the agent and the
+  proposal. Nothing is merged: review and merge it on GitHub like any pull
+  request. Once merged, the source picks the commit up like any other
+  (and, in review mode, asks you again before it goes live).
+- **Reject** (or a deny) sends nothing to GitHub.
+- Only the person the question went to can approve it: another admin
+  cannot open a pull request with someone else's account, and no grant,
+  policy or automatic rule ever approves one.
+- If GitHub refuses (the App lacks a permission, the base commit is gone,
+  the branch name is taken by someone else), the proposal fails with the
+  reason on the Inbox item. If GitHub's answer is lost, toolyard never
+  writes blindly again: the next attempt first looks for the branch and
+  the pull request it may already have made.
+
 ### Agents propose sources
 
 An agent can ask for a source with `skills.propose_source` (a URL, branch
@@ -146,7 +205,7 @@ secret). Errors are `{"error", "code"}` with the codes `invalid` (400),
 
 | Method and path | What it does |
 | --- | --- |
-| `POST /v1/skills/sources/inspect` | `{url, token?}`: owner, repo, private, default branch, branches, the branch and folder in the URL, `trusted_owner` |
+| `POST /v1/skills/sources/inspect` | `{url, token?, auth?}`: owner, repo, private, default branch, branches, the branch and folder in the URL, `trusted_owner`; `auth: "github"` reads with your GitHub connection (never with an operator token) |
 | `POST /v1/skills/sources/preview` | a source (as for create): dry run with commit, counts, warnings, sample |
 | `GET /v1/skills/admin/sources` | every source with its status (the agent list is `GET /v1/skills/sources`) |
 | `POST /v1/skills/sources` | create `{url, branch?, path?, exclude?, mode?, pinned_sha?, auth?, token?, poll_seconds?, enabled?, visibility?, members?, default_runs?}`; `201 {source, status: "syncing"}` at once, the first sync running in the background (poll `GET /v1/skills/sources/{id}` until `last_checked_at` is set); the same create by the same person within two minutes answers `200 {source, existing: true}` |
@@ -164,17 +223,20 @@ Every change is in the audit log (`skills.source_create`,
 `skills.source_update`, `skills.source_delete`, `skills.source_sync`,
 `skills.version_activate`, `skills.version_reject`,
 `skills.runs_override`, `skills.webhook_secret_rotate`,
-`skills.source_propose`, `skills.source_proposal_reject`). No response and
+`skills.source_propose`, `skills.source_proposal_reject`,
+`skills.change_propose`, `skills.change_proposal_reject`,
+`skills.change_pull_request`, `skills.change_proposal_fail`). No response and
 no audit row carries a token; the webhook secret appears only in the rotate
 response.
 
 ### How the Inbox carries these questions
 
-Review questions and source proposals are Inbox *system items*: questions
-that toolyard itself raises (`internal/inbox/system.go`). A review question
-comes from the sender "toolyard" and goes only to the person who added the
-source; a proposal comes from the proposing agent and goes to its owner.
-In the Inbox both carry a **toolyard** badge, which only toolyard can set:
+Review questions, source proposals and change proposals are Inbox
+*system items*: questions that toolyard itself raises
+(`internal/inbox/system.go`). A review question and a change proposal come
+from the sender "toolyard" and go only to the person who added the source;
+a source proposal comes from the proposing agent and goes to its owner.
+In the Inbox they carry a **toolyard** badge, which only toolyard can set:
 an agent that calls itself "toolyard" gets none. When the answer is
 recorded, toolyard applies it at once and adds the outcome ("Version … is
 live.", or why it could not) to the item's timeline.
@@ -184,11 +246,13 @@ decision can land while no handler runs (a replica stopped in between). A
 sweep settles both, every minute on one replica (the `skills-inbox-sweep`
 leader loop): it applies a recorded decision that was not applied yet,
 closes the proposals and reviews whose items expired or were withdrawn,
-and closes an open review whose version no longer waits. An agent's next
-proposal and its `skills.proposal` poll settle its own proposals too. A
-version that still waits after its question expired (7 days) gets a new
-question at the source's next check; while a question is open, or its
-answer is being applied, the checks add nothing.
+closes an open review whose version no longer waits, and resumes an
+approved change proposal whose GitHub writes stopped or got no answer
+(after three minutes, looking on GitHub for what it already wrote first).
+An agent's next proposal and its `skills.proposal` poll settle its own
+proposals too. A version that still waits after its question expired (7
+days) gets a new question at the source's next check; while a question is
+open, or its answer is being applied, the checks add nothing.
 
 ## For agents
 
@@ -234,7 +298,7 @@ mode they are `toolyard.skills_<name>` (Starlark) and
 | `skills.sources` | none | the sources you see, with the commit each serves |
 | `skills.list` | `cursor`, `limit` (100, at most 500), `source`, `include_host` | a page of skills as MCP `skills/list` entries, plus `next_cursor` |
 | `skills.propose_source` | `url`, `branch`, `path`, `reason` | a pending proposal: an Inbox item for your owner; nothing is added before they approve (at most five waiting, ten an hour) |
-| `skills.proposal` | `id` | one of your proposals: `pending`, `approved`, `done` (with `result`, the new source's id), `rejected` or `failed` (with `error`); poll this instead of proposing again |
+| `skills.proposal` | `id` | one of your proposals: `pending`, `approved`, `done` (with `result`: the new source's id, or a change proposal's pull request URL), `rejected` or `failed` (with `error`); poll this instead of proposing again |
 | `skills.propose_change` | `skill`, `files` (path → new content, `""` deletes), `title`, `summary` | a pending proposal against the version you see; after the source owner's approval toolyard opens a pull request |
 | `skills.bundle` | `skills` (1 to 50) | a `.tar.gz` download URL: one use, 10 minutes, no token needed |
 
@@ -242,12 +306,39 @@ Before a multi-step task, call `skills.search` with a few words about the
 task; when a skill matches, read it with `skills.get` and follow it.
 `tools.search` also names up to three matching skills under `skills`.
 
-To install skills in a local client such as Claude Code:
+To install skills in a local client such as Claude Code, run
+`ty skills pull` (below), or download a bundle yourself:
 
 ```sh
 # url from skills.bundle (or POST /v1/skills/bundle); it is the credential
 curl -sf -o skills.tar.gz "$url" && mkdir -p ~/.claude/skills && tar -xzf skills.tar.gz -C ~/.claude/skills
 ```
+
+### Change proposals (for agents)
+
+To improve a skill, call `skills.propose_change` with the skill, the files
+(path inside the skill folder → its new full content; `""` deletes a
+file), a short `title` (the pull request title, at most 200 characters)
+and a `summary` (what changes and why; the pull request body). The answer
+is a pending proposal; the person who added the skill's source decides in
+their Inbox, and after their approval toolyard opens a pull request on the
+source repository. Poll the outcome with the proposal ID (`skills.proposal`):
+`pending`, then `done` with the pull request URL in `result`, or
+`rejected` or `failed` with the reason in `error`. `approved` means
+toolyard is writing to GitHub, or is waiting to check what GitHub did
+after a lost answer.
+
+The change is against the version you see (its commit is the pull
+request's base). toolyard refuses, before anyone is asked: paths outside
+the skill folder (absolute, `..`, `.`, `.git`, backslashes, control
+characters), more than 50 files, a file over the source's per-file limit
+(1 MiB by default), more than 4 MiB of new content in all, text that is
+not UTF-8 or holds a NUL byte, content that looks like a credential,
+deleting `SKILL.md` or a file that does not exist, a `SKILL.md` that would
+stop being a valid skill (its `name` must stay the folder's name), files
+that would sit inside a file or over a folder, and a change that changes
+nothing. One agent may have at most five change proposals waiting, and the
+source's owner must have a GitHub connection.
 
 MCP clients can also read skills as resources through the MCP Skills
 extension: see [MCP Skills extension](#mcp-skills-extension).
@@ -278,7 +369,7 @@ Refusals are `{"error": "...", "code": "..."}`: `not_found` 404,
 the hub is off), and 403 when the gateway refused the call (an explicit
 deny policy, the agent's own limits).
 
-The `ty` command (`GET /v1/code/ty`) wraps the read routes and keeps the
+The `ty` command (`GET /v1/code/ty`) wraps these routes and keeps the
 token out of argv and logs:
 
 ```sh
@@ -288,7 +379,17 @@ ty skills read skill://team/ops/deploy/references/checklist.md --raw
 ty skills grep 'rollback' --path '**/*.md'
 ty skills sources
 ty skills list --limit 50
+ty skills pull team/ops/deploy pdf --dir ~/.claude/skills
 ```
+
+`ty skills pull` asks for a bundle (`POST /v1/skills/bundle`), downloads
+it once without sending the token, and unpacks each skill into its own
+folder under `--dir` (default `~/.claude/skills`). It refuses the whole
+bundle when a member is absolute, has a `..` segment, is a link or a
+special file, or lies outside the skills the server named, and writes
+nothing then. A skill folder that already exists is replaced only with
+`--force` (the old folder is moved aside and removed once the new one is
+in place).
 
 ## How sync works
 
@@ -519,6 +620,14 @@ details):
   cannot raise toolyard's own Inbox questions (system items), and only
   those carry the Inbox's toolyard badge. Text from a repository or an
   agent cannot break out of its line in an item toolyard sends.
+- **Change proposals.** toolyard, not the agent, writes to GitHub, and
+  only after the person who added the source approves that exact change
+  in their Inbox, with their own GitHub connection; no grant, policy or
+  automatic rule approves it, and another admin cannot. Proposed files are
+  checked like synced ones (text only, no credentials, paths inside the
+  skill folder), each write is reconciled with GitHub before it is made,
+  and nothing is ever merged by toolyard. The pull request names the
+  proposing agent and the proposal, never a person.
 - **Bundle downloads.** The ticket in the URL is 256 random bits, works
   once, for 10 minutes, and is stored only as its SHA-256; a caller holds
   at most 20 live tickets, visibility is checked again at download, and
