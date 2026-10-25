@@ -92,6 +92,37 @@ func sealTelegramToken(t *testing.T, e *env, key []byte) {
 	}
 }
 
+// sealSkillSource stores a skill source whose read token (column token)
+// or webhook secret (column webhook_secret_sealed) is sealed as
+// internal/skillhub does: AAD "skillhub-token|<id>" or
+// "skillhub-webhook|<id>".
+func sealSkillSource(t *testing.T, e *env, key []byte, column, aadPrefix string) {
+	t.Helper()
+	sealed, err := cipherFor(t, key).Seal([]byte("source-secret"), []byte(aadPrefix+"src_kit"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.db.Exec(`INSERT INTO skill_sources(id, slug, owner, repo, branch, mode, created_by, created_at, updated_at, `+column+`)
+		VALUES('src_kit', 'kit', 'acme', 'kit', 'main', 'auto', 'usr_1', 1, 1, ?)`, sealed); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// sealSkillsDefaultToken stores the skills hub's default GitHub token
+// setting as internal/skillhub does: sealed under "skillhub-default-token",
+// saved as a JSON string.
+func sealSkillsDefaultToken(t *testing.T, e *env, key []byte) {
+	t.Helper()
+	sealed, err := cipherFor(t, key).Seal([]byte("github-read-token"), []byte("skillhub-default-token"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := json.Marshal(sealed)
+	if _, err := e.db.Exec(`INSERT INTO system_settings(key, value, updated_at) VALUES('skills_github_token', ?, 1)`, string(body)); err != nil {
+		t.Fatal(err)
+	}
+}
+
 // A key without a canary is adopted only when it opens the data sealed
 // with it; a wrong key on disk is refused before anything is written.
 func TestAdoptionRequiresTheKeyToOpenExistingData(t *testing.T) {
@@ -104,6 +135,13 @@ func TestAdoptionRequiresTheKeyToOpenExistingData(t *testing.T) {
 		{"oauth token", OAuthKey, sealOAuthToken},
 		{"secret", SecretsKey, func(t *testing.T, e *env, key []byte) { sealSecret(t, e, "API_KEY", key, time.Now()) }},
 		{"telegram bot token", SecretsKey, sealTelegramToken},
+		{"skill source token", SecretsKey, func(t *testing.T, e *env, key []byte) {
+			sealSkillSource(t, e, key, "token_sealed", "skillhub-token|")
+		}},
+		{"skill source webhook secret", SecretsKey, func(t *testing.T, e *env, key []byte) {
+			sealSkillSource(t, e, key, "webhook_secret_sealed", "skillhub-webhook|")
+		}},
+		{"skills default GitHub token", SecretsKey, sealSkillsDefaultToken},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
@@ -231,6 +269,8 @@ func TestSealedProbeFormatsMatchTheirPackages(t *testing.T) {
 		"../federation/host_connections.go":  {`[]byte("host|" + env + "|" + user + "|" + key)`},
 		"../chatnotify/telegram/telegram.go": {`"toolyard.chat.v1|telegram|bot_token"`, `s.cipher.Open(sealed, []byte(tokenAAD))`},
 		"../identitykeys/identitykeys.go":    {`s.cipher.Seal([]byte(token), []byte(userID))`, `s.cipher.Open(sealed, []byte(userID))`},
+		"../skillhub/sync.go":                {`[]byte("skillhub-token|" + id)`, `[]byte("skillhub-webhook|" + id)`},
+		"../skillhub/github_access.go":       {`[]byte("skillhub-default-token")`, `settings.SkillsGitHubToken`},
 	}
 	for path, wants := range sources {
 		b, err := os.ReadFile(filepath.FromSlash(path))
@@ -252,6 +292,7 @@ func TestSealedProbeFormatsMatchTheirPackages(t *testing.T) {
 		"A", // identity keys: the user id
 		"toolyard.secrets.v1|A|value", "callback|A", "federation|A|B", "local|A|B", "host|A|B|C",
 		"toolyard.chat.v1|telegram|bot_token",
+		"skillhub-token|A", "skillhub-webhook|A", "skillhub-default-token",
 		string(oauth.AAD("A", "access")), string(oauth.UserAAD("A", "B", "refresh")),
 	} {
 		if !built[want] {

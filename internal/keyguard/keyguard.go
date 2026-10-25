@@ -445,7 +445,8 @@ var sealedColumns = []struct{ table, where string }{
 	{"federation_connections", `COALESCE(credential_enc, '') <> ''`},
 	{"local_connections", `COALESCE(credential_enc, '') <> ''`},
 	{"host_connections", `COALESCE(credential_enc, '') <> ''`},
-	{"system_settings", `key = 'telegram_bot_token' AND value NOT IN ('', '""', 'null')`},
+	{"skill_sources", `COALESCE(token_sealed, '') <> '' OR COALESCE(webhook_secret_sealed, '') <> ''`},
+	{"system_settings", `key IN ('telegram_bot_token', 'skills_github_token') AND value NOT IN ('', '""', 'null')`},
 }
 
 // sealedTables names the tables that hold sealed values. A table that
