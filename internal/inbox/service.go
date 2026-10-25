@@ -197,9 +197,11 @@ type Service struct {
 	legacySig   string
 	legacyClean bool
 
-	// system holds the handlers of system items by kind (system.go).
-	systemMu sync.RWMutex
-	system   map[string]SystemHandler
+	// system holds the handlers of system items by kind, and systemOpts
+	// how each kind may be decided (system.go).
+	systemMu   sync.RWMutex
+	system     map[string]SystemHandler
+	systemOpts map[string]SystemOptions
 }
 
 // New creates the service and loads (or creates) the grant signing key.
@@ -893,6 +895,9 @@ func (s *Service) Decide(ctx context.Context, id string, d Decision) (*Request, 
 		}
 		if d.Action != "snooze" && r.Status != StatusPending {
 			return ErrNotPending
+		}
+		if err := s.checkSystemDecider(r, d.Action, dec); err != nil {
+			return err
 		}
 		if r.Kind == KindAccess && d.Action == "approve" {
 			if d.RequestRevision != r.Revision || d.SubmissionID == "" || len(d.SubmissionID) > 128 {

@@ -66,6 +66,9 @@ const (
 	ViaInboxGrant     = "inbox_grant"
 	ViaAgentCancel    = "agent_cancel"
 	ViaExpiry         = "expiry"
+	// ViaOperator is a decision sent with an operator token (a person's
+	// automation key), not by the person in the dashboard.
+	ViaOperator = "operator"
 )
 
 // LegacyAutoRulePrefix is the historical decided_by form of an
