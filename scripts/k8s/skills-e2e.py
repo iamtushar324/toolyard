@@ -10,11 +10,15 @@ bundles, Auto and Review updates (Inbox approval), rollback, agent source
 proposals, the webhook, and that both replicas serve the same version.
 
 Inputs (environment):
-  BASE                 toolyard URL (default https://toolyard.preview.beknown.live)
+  BASE                 toolyard URL of the deployment under test (required)
   KUBECONFIG/NAMESPACE  for the admin Secret and the per-replica checks
   ADMIN_FILE           JSON {"username", "password"} instead of the Secret
   FIXTURE_REPO         owner/repo of the fixture branch (default iamtushar324/toolyard)
-  FIXTURE_BRANCH       default t3/skills-fixture (folder "skills")
+  FIXTURE_BRANCH       default t3/skills-fixture (folder "skills"): an orphan
+                       branch of this repository that holds the test skills;
+                       keep it, the checks depend on it
+  TRUSTED_OWNERS       skills_trusted_github_owners for the run (default: the
+                       fixture repository's owner)
   FIXTURE_WORKTREE     a local checkout of FIXTURE_BRANCH; when set, the Auto
                        and Review update checks push commits to it
   PRIVATE_URL          optional private repository URL (e.g. a bk-docs folder)
@@ -40,7 +44,9 @@ import uuid
 
 import requests
 
-BASE = os.environ.get("BASE", "https://toolyard.preview.beknown.live").rstrip("/")
+BASE = os.environ.get("BASE", "").rstrip("/")
+if not BASE:
+    sys.exit("skills-e2e: set BASE to the toolyard URL of the deployment under test")
 NS = os.environ.get("NAMESPACE", "toolyard-test")
 FIXTURE_REPO = os.environ.get("FIXTURE_REPO", "iamtushar324/toolyard")
 FIXTURE_BRANCH = os.environ.get("FIXTURE_BRANCH", "t3/skills-fixture")
@@ -240,7 +246,7 @@ def main():
 
     # Our own GitHub owners sync in Auto mode; anthropics stays untrusted.
     admin.j("PATCH", "/v1/settings", json={"skills_trusted_github_owners": os.environ.get(
-        "TRUSTED_OWNERS", FIXTURE_REPO.split("/")[0] + ",beknown-work")})
+        "TRUSTED_OWNERS", FIXTURE_REPO.split("/")[0])})
     # A source left by an earlier run's proposal check.
     for leftover in admin_sources(admin):
         if leftover.get("path") == "skills/incident-triage":
