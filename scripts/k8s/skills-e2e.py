@@ -1,0 +1,488 @@
+#!/usr/bin/env python3
+"""End-to-end check of the toolyard skills hub on a running deployment.
+
+Runs against the Kubernetes HA test deployment (two replicas, Postgres) or any
+toolyard with the hub on. It signs in as the first admin (credentials from the
+`toolyard-admin` Secret through kubectl, or ADMIN_FILE), makes an agent key,
+adds skill sources, and checks every surface: admin REST, MCP tools, the MCP
+Skills extension (SEP-2640), code mode (Starlark and JavaScript), agent REST,
+bundles, Auto and Review updates (Inbox approval), rollback, agent source
+proposals, the webhook, and that both replicas serve the same version.
+
+Inputs (environment):
+  BASE                 toolyard URL (default https://toolyard.preview.beknown.live)
+  KUBECONFIG/NAMESPACE  for the admin Secret and the per-replica checks
+  ADMIN_FILE           JSON {"username", "password"} instead of the Secret
+  FIXTURE_REPO         owner/repo of the fixture branch (default iamtushar324/toolyard)
+  FIXTURE_BRANCH       default t3/skills-fixture (folder "skills")
+  FIXTURE_WORKTREE     a local checkout of FIXTURE_BRANCH; when set, the Auto
+                       and Review update checks push commits to it
+  PRIVATE_URL          optional private repository URL (e.g. a bk-docs folder)
+  PRIVATE_TOKEN_FILE   file with a read-only token for PRIVATE_URL
+  REPORT               path of the JSON report (default /tmp/skills-e2e.json)
+
+Secrets never appear in argv or output: tokens stay in memory or in 0600
+files, and the report redacts them.
+"""
+
+import base64
+import hashlib
+import hmac
+import io
+import json
+import os
+import socket
+import subprocess
+import sys
+import tarfile
+import time
+import uuid
+
+import requests
+
+BASE = os.environ.get("BASE", "https://toolyard.preview.beknown.live").rstrip("/")
+NS = os.environ.get("NAMESPACE", "toolyard-test")
+FIXTURE_REPO = os.environ.get("FIXTURE_REPO", "iamtushar324/toolyard")
+FIXTURE_BRANCH = os.environ.get("FIXTURE_BRANCH", "t3/skills-fixture")
+FIXTURE_WT = os.environ.get("FIXTURE_WORKTREE", "")
+REPORT = os.environ.get("REPORT", "/tmp/skills-e2e.json")
+REASON = "skills hub end-to-end test on the test deployment (TEC-1782)"
+
+results = []
+
+
+def check(name, ok, detail=""):
+    results.append({"check": name, "ok": bool(ok), "detail": str(detail)[:600]})
+    print(("PASS " if ok else "FAIL ") + name + (": " + str(detail)[:300] if detail else ""), flush=True)
+    return ok
+
+
+def step(name, fn):
+    try:
+        return fn()
+    except Exception as e:  # noqa: BLE001 - one failed step must not stop the run
+        check(name, False, "%s: %s" % (type(e).__name__, e))
+        return None
+
+
+def kubectl(*args):
+    return subprocess.run(["kubectl", "-n", NS, *args], capture_output=True, text=True, timeout=60)
+
+
+def admin_creds():
+    path = os.environ.get("ADMIN_FILE")
+    if path:
+        return json.load(open(path))
+    out = {}
+    for k in ("username", "password"):
+        p = kubectl("get", "secret", "toolyard-admin", "-o", "jsonpath={.data.%s}" % k)
+        out[k] = base64.b64decode(p.stdout).decode()
+    return out
+
+
+class Admin:
+    def __init__(self):
+        self.s = requests.Session()
+        self.s.headers.update({"Origin": BASE, "X-Requested-With": "skills-e2e"})
+        r = self.s.post(BASE + "/v1/auth/login", json=admin_creds(), timeout=30)
+        r.raise_for_status()
+
+    def req(self, method, path, **kw):
+        r = self.s.request(method, BASE + path, timeout=kw.pop("timeout", 120), **kw)
+        return r
+
+    def j(self, method, path, **kw):
+        r = self.req(method, path, **kw)
+        if r.status_code >= 400:
+            raise RuntimeError("%s %s -> %s %s" % (method, path, r.status_code, r.text[:300]))
+        return r.json() if r.content else {}
+
+
+class Agent:
+    def __init__(self, token):
+        self.token = token
+        self.h = {"Authorization": "Bearer " + token}
+        self.sid = None
+        self.n = 0
+
+    def rpc(self, method, params=None, proto="2025-11-25"):
+        self.n += 1
+        h = dict(self.h, **{"Content-Type": "application/json", "Accept": "application/json, text/event-stream",
+                            "MCP-Protocol-Version": proto})
+        if self.sid:
+            h["Mcp-Session-Id"] = self.sid
+        body = {"jsonrpc": "2.0", "id": self.n, "method": method, "params": params or {}}
+        r = requests.post(BASE + "/mcp", headers=h, json=body, timeout=120)
+        if r.headers.get("Mcp-Session-Id"):
+            self.sid = r.headers["Mcp-Session-Id"]
+        text = r.text
+        if "text/event-stream" in r.headers.get("Content-Type", ""):
+            data = [ln[5:].strip() for ln in text.splitlines() if ln.startswith("data:")]
+            text = data[-1] if data else "{}"
+        return json.loads(text) if text.strip() else {}
+
+    def init(self):
+        res = self.rpc("initialize", {"protocolVersion": "2025-11-25", "capabilities": {},
+                                      "clientInfo": {"name": "skills-e2e", "version": "1"}})
+        self.rpc("notifications/initialized")
+        return res
+
+    def tool(self, name, args):
+        args = dict(args)
+        args.setdefault("_reason", REASON)
+        res = self.rpc("tools/call", {"name": name, "arguments": args})
+        if "error" in res:
+            raise RuntimeError("%s: %s" % (name, res["error"]))
+        out = res.get("result", {})
+        if out.get("isError"):
+            raise RuntimeError("%s isError: %s" % (name, json.dumps(out)[:400]))
+        sc = out.get("structuredContent")
+        if sc is not None:
+            return sc
+        txt = "".join(c.get("text", "") for c in out.get("content", []) if c.get("type") == "text")
+        try:
+            return json.loads(txt)
+        except ValueError:
+            return {"text": txt}
+
+    def rest(self, path, **params):
+        params.setdefault("reason", REASON)
+        r = requests.get(BASE + path, headers=self.h, params=params, timeout=60)
+        return r
+
+
+def git(*args):
+    p = subprocess.run(["git", "-C", FIXTURE_WT, *args], capture_output=True, text=True, timeout=120)
+    if p.returncode != 0:
+        raise RuntimeError("git %s: %s" % (" ".join(args), p.stderr[-300:]))
+    return p.stdout.strip()
+
+
+def fixture_commit(desc):
+    """Change release-notes' description on the fixture branch and push."""
+    path = os.path.join(FIXTURE_WT, "skills/release-notes/SKILL.md")
+    text = open(path).read().splitlines()
+    for i, ln in enumerate(text):
+        if ln.startswith("description:"):
+            text[i] = "description: " + desc
+    open(path, "w").write("\n".join(text) + "\n")
+    git("add", "skills/release-notes/SKILL.md")
+    git("commit", "-q", "-m", "skills hub e2e: " + desc[:60] + "\n\nCo-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>")
+    git("push", "-q", "origin", "HEAD:" + FIXTURE_BRANCH)
+    return git("rev-parse", "HEAD")
+
+
+def find_source(admin, slug):
+    lst = admin.j("GET", "/v1/skills/admin/sources")
+    items = lst.get("sources", lst) if isinstance(lst, dict) else lst
+    for s in items or []:
+        if s.get("slug") == slug:
+            return s
+    return None
+
+
+def ensure_source(admin, slug, body):
+    s = find_source(admin, slug)
+    if s:
+        return s, False
+    body = dict(body, slug=slug)
+    s = admin.j("POST", "/v1/skills/sources", json=body)
+    return s.get("source", s), True
+
+
+def sync(admin, sid):
+    return admin.j("POST", "/v1/skills/sources/%s/sync" % sid, timeout=600)
+
+
+def pod_names():
+    p = kubectl("get", "pods", "-l", "app.kubernetes.io/name=toolyard", "-o", "jsonpath={.items[*].metadata.name}")
+    return [n for n in p.stdout.split() if n]
+
+
+def free_port():
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    port = s.getsockname()[1]
+    s.close()
+    return port
+
+
+def main():
+    t0 = time.time()
+    h = requests.get(BASE + "/v1/health", timeout=20).json()
+    check("health ok", h.get("ok"), h.get("version"))
+
+    admin = Admin()
+    check("admin signs in", True)
+
+    # An agent key owned by the admin (reused by name across runs).
+    name = "skills-e2e-" + uuid.uuid4().hex[:6]
+    ag = admin.j("POST", "/v1/agents", json={"name": name})
+    agent = Agent(ag["token"])
+    agent_id = ag.get("id") or ag.get("agent", {}).get("id")
+
+    # --- Admin: inspect and preview the fixture -------------------------
+    fx_url = "https://github.com/%s/tree/%s/skills" % (FIXTURE_REPO, FIXTURE_BRANCH)
+
+    def inspect():
+        info = admin.j("POST", "/v1/skills/sources/inspect", json={"url": fx_url})
+        ok = info.get("branch") == FIXTURE_BRANCH and info.get("path") == "skills" and FIXTURE_BRANCH in info.get("branches", [])
+        check("inspect parses /tree/<branch>/<folder> and lists branches", ok,
+              {k: info.get(k) for k in ("owner", "repo", "branch", "path", "default_branch", "private")})
+    step("inspect", inspect)
+
+    def preview():
+        pv = admin.j("POST", "/v1/skills/sources/preview", json={"url": fx_url})
+        codes = sorted({w.get("code") for w in pv.get("warnings", [])})
+        check("preview finds 4 skills and a name_mismatch warning", pv.get("skill_count") == 4 and "name_mismatch" in codes,
+              {"skills": pv.get("skill_count"), "codes": codes, "sha": pv.get("sha", "")[:12]})
+    step("preview", preview)
+
+    # --- Admin: add the fixture (auto) and anthropics/skills (review) ----
+    fx, created = ensure_source(admin, "fixture", {"url": fx_url, "mode": "auto", "visibility": "everyone",
+                                                   "default_runs": "anywhere"})
+    if not created and fx.get("mode") != "auto":
+        admin.j("PATCH", "/v1/skills/sources/%s" % fx["id"], json={"mode": "auto"})
+    sr = sync(admin, fx["id"])
+    fx = admin.j("GET", "/v1/skills/sources/%s" % fx["id"])
+    fx = fx.get("source", fx)
+    check("fixture source syncs and is active", bool(fx.get("active_sha")), {"sha": fx.get("active_sha", "")[:12],
+                                                                          "skills": fx.get("skill_count"), "sync": sr})
+    fx_sha = fx.get("active_sha", "")
+
+    def anthropic():
+        an, _ = ensure_source(admin, "anthropic", {"url": "anthropics/skills", "visibility": "everyone"})
+        check("untrusted owner defaults to review mode", an.get("mode") == "review", an.get("mode"))
+        r = sync(admin, an["id"])
+        an = admin.j("GET", "/v1/skills/sources/%s" % an["id"])
+        an = an.get("source", an)
+        if an.get("pending_version_id"):
+            admin.j("POST", "/v1/skills/sources/%s/versions/%s/activate" % (an["id"], an["pending_version_id"]))
+            an = admin.j("GET", "/v1/skills/sources/%s" % an["id"])
+            an = an.get("source", an)
+        check("anthropics/skills is live after approval", bool(an.get("active_sha")) and an.get("skill_count", 0) >= 10,
+              {"skills": an.get("skill_count"), "sha": an.get("active_sha", "")[:12], "sync": r})
+    step("anthropics/skills", anthropic)
+
+    if os.environ.get("PRIVATE_URL") and os.environ.get("PRIVATE_TOKEN_FILE"):
+        def private():
+            tok = open(os.environ["PRIVATE_TOKEN_FILE"]).read().strip()
+            info = admin.j("POST", "/v1/skills/sources/inspect", json={"url": os.environ["PRIVATE_URL"]})
+            check("private repository without a token says needs_token", info.get("needs_token") is True)
+            pv, _ = ensure_source(admin, "bk-docs", {"url": os.environ["PRIVATE_URL"], "token": tok, "mode": "auto",
+                                                     "visibility": "everyone", "default_runs": "host"})
+            body = json.dumps(pv)
+            check("the token never comes back", tok not in body and "token\": \"" not in body)
+            r = sync(admin, pv["id"])
+            pv = admin.j("GET", "/v1/skills/sources/%s" % pv["id"])
+            pv = pv.get("source", pv)
+            check("private source syncs", bool(pv.get("active_sha")), {"skills": pv.get("skill_count"), "sync": r})
+        step("private source", private)
+
+    # --- MCP: capability, tools ---------------------------------------
+    init = agent.init()
+    caps = init.get("result", {}).get("capabilities", {})
+    check("initialize declares io.modelcontextprotocol/skills", "io.modelcontextprotocol/skills" in caps.get("extensions", {}),
+          caps.get("extensions"))
+
+    def mcp_tools():
+        res = agent.tool("skills.search", {"query": "release notes", "source": "fixture"})
+        hits = res.get("skills", res.get("results", []))
+        top = hits[0] if hits else {}
+        check("skills.search finds release-notes with source and commit",
+              top.get("name") == "release-notes" and top.get("commit") == fx_sha and top.get("repo", "").startswith(FIXTURE_REPO),
+              {k: top.get(k) for k in ("name", "uri", "repo", "commit")})
+        g = agent.tool("skills.get", {"skill": "fixture/release-notes"})
+        files = g.get("files", [])
+        style = [f for f in files if f.get("path") == "references/STYLE.md"]
+        check("skills.get returns body, frontmatter and files with sha256 digests",
+              "Release notes" in g.get("body", "") and style and style[0].get("digest", "").startswith("sha256:"),
+              {"files": [f.get("path") for f in files]})
+        rd = agent.tool("skills.read", {"uri": style[0]["uri"]})
+        digest = "sha256:" + hashlib.sha256(rd.get("content", "").encode()).hexdigest()
+        check("skills.read content matches its digest", digest == style[0]["digest"], digest[:20])
+        gr = agent.tool("skills.grep", {"pattern": "on-call", "source": "fixture", "ignore_case": True})
+        hits = gr.get("hits", gr.get("matches", []))
+        check("skills.grep finds the nested skill text", any("page-oncall" in (x.get("uri", "")) for x in hits), len(hits))
+        nest = agent.tool("skills.get", {"skill": "fixture/incident-triage/skills/page-oncall"})
+        check("a nested skill is its own entry", nest.get("name") == "page-oncall", nest.get("uri"))
+        hs = agent.tool("skills.search", {"query": "browser screenshot", "source": "fixture"})
+        names = [x.get("name") for x in hs.get("skills", hs.get("results", []))]
+        check("host-only skill hidden from a non-host agent", "host-browser" not in names, names)
+        hs2 = agent.tool("skills.search", {"query": "browser screenshot", "source": "fixture", "include_host": True})
+        names2 = [x.get("name") for x in hs2.get("skills", hs2.get("results", []))]
+        check("include_host shows it", "host-browser" in names2, names2)
+        src = agent.tool("skills.sources", {})
+        slugs = [x.get("slug") for x in src.get("sources", [])]
+        check("skills.sources lists the sources", "fixture" in slugs, slugs)
+        ts = agent.tool("tools.search", {"query": "incident triage"})
+        check("tools.search names matching skills", any(x.get("name") == "incident-triage" for x in ts.get("skills", [])),
+              [x.get("name") for x in ts.get("skills", [])])
+    step("MCP tools", mcp_tools)
+
+    def sep2640():
+        lst = agent.rpc("skills/list", {})
+        entries = lst.get("result", {}).get("skills", [])
+        fxe = [e for e in entries if e.get("uri", "").startswith("skill://fixture/")]
+        check("skills/list returns entries with frontmatter and resources",
+              fxe and all("frontmatter" in e and isinstance(e.get("resources"), list) for e in fxe), len(fxe))
+        uri = "skill://fixture/release-notes/SKILL.md"
+        got = agent.rpc("skills/get", {"uri": uri}).get("result", {}).get("skill", {})
+        check("skills/get returns the entry", got.get("uri") == uri and got.get("frontmatter", {}).get("name") == "release-notes")
+        res = agent.rpc("resources/read", {"uri": uri}).get("result", {}).get("contents", [{}])[0]
+        dg = [r for r in got.get("resources", []) if r.get("uri") == uri]
+        ok = dg and "sha256:" + hashlib.sha256(res.get("text", "").encode()).hexdigest() == dg[0].get("digest")
+        check("resources/read of skill:// matches the listed digest", ok, res.get("mimeType"))
+        d = agent.rpc("resources/directory/read", {"uri": "skill://fixture/release-notes"}).get("result", {})
+        check("resources/directory/read lists the folder", any("references" in json.dumps(x) for x in d.get("resources", d.get("entries", [])) or [d]), json.dumps(d)[:200])
+        bad = agent.rpc("skills/get", {"uri": "skill://fixture/nope/SKILL.md"})
+        check("an unknown skill URI is -32602", bad.get("error", {}).get("code") == -32602, bad.get("error"))
+    step("SEP-2640", sep2640)
+
+    def codemode():
+        r = agent.tool("executeToolCode", {"code": 'result = toolyard.skills_search(query="incident triage", source="fixture")'})
+        check("Starlark code mode calls skills_search", "incident-triage" in json.dumps(r), json.dumps(r)[:200])
+        r = agent.tool("executeToolCode", {"language": "javascript",
+                                          "code": 'const r = await tools.toolyard.skills_get({skill: "fixture/release-notes"}); return r.name;'})
+        check("JavaScript code mode calls skills_get", "release-notes" in json.dumps(r), json.dumps(r)[:200])
+    step("code mode", codemode)
+
+    def rest():
+        r = agent.rest("/v1/skills/search", query="release notes", source="fixture")
+        check("REST search", r.status_code == 200 and "release-notes" in r.text, r.status_code)
+        r = agent.rest("/v1/skills/get", skill="fixture/release-notes")
+        check("REST get carries the commit", r.status_code == 200 and fx_sha in r.text, r.status_code)
+        r = requests.get(BASE + "/v1/skills/search", params={"query": "x"}, timeout=20)
+        check("REST without a token is refused", r.status_code in (401, 403), r.status_code)
+    step("agent REST", rest)
+
+    def bundle():
+        b = agent.tool("skills.bundle", {"skills": ["fixture/release-notes", "fixture/incident-triage"]})
+        url = b.get("url") or b.get("download_url")
+        r = requests.get(url, timeout=60)
+        names = tarfile.open(fileobj=io.BytesIO(r.content), mode="r:gz").getnames() if r.ok else []
+        check("bundle downloads a tar.gz in the Agent Skills layout", any(n.endswith("release-notes/SKILL.md") for n in names), names[:8])
+        r2 = requests.get(url, timeout=30)
+        check("a bundle URL works once", r2.status_code in (404, 410), r2.status_code)
+    step("bundle", bundle)
+
+    # --- HA: both replicas serve the same commit ----------------------
+    def per_replica(expect_sha, label):
+        shas = {}
+        for pod in pod_names():
+            port = free_port()
+            pf = subprocess.Popen(["kubectl", "-n", NS, "port-forward", "pod/" + pod, "%d:8787" % port],
+                                  stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            try:
+                for _ in range(40):
+                    try:
+                        socket.create_connection(("127.0.0.1", port), 1).close()
+                        break
+                    except OSError:
+                        time.sleep(0.25)
+                deadline = time.time() + 20
+                while True:
+                    r = requests.get("http://127.0.0.1:%d/v1/skills/get" % port, headers=agent.h,
+                                     params={"skill": "fixture/release-notes", "reason": REASON}, timeout=20)
+                    sha = r.json().get("commit") if r.ok else "HTTP %s" % r.status_code
+                    if sha == expect_sha or time.time() > deadline:
+                        break
+                    time.sleep(1)
+                shas[pod] = sha
+            finally:
+                pf.terminate()
+        check("both replicas serve %s (%s)" % (expect_sha[:12], label), len(shas) >= 2 and all(v == expect_sha for v in shas.values()),
+              {k[-5:]: (v or "")[:12] for k, v in shas.items()})
+    step("replicas", lambda: per_replica(fx_sha, "after first sync"))
+
+    # --- Auto update, Review update with an Inbox approval, rollback ----
+    if FIXTURE_WT:
+        def auto_update():
+            new = fixture_commit("Write release notes from merged pull requests (auto update %s)." % time.strftime("%H:%M:%S"))
+            sync(admin, fx["id"])
+            g = agent.tool("skills.get", {"skill": "fixture/release-notes"})
+            check("Auto mode: a new commit reaches agents", g.get("commit") == new and "auto update" in g.get("frontmatter", {}).get("description", ""),
+                  g.get("commit", "")[:12])
+            per_replica(new, "after auto update")
+            return new
+        auto_sha = step("auto update", auto_update)
+
+        def review_update():
+            admin.j("PATCH", "/v1/skills/sources/%s" % fx["id"], json={"mode": "review"})
+            new = fixture_commit("Write release notes from merged pull requests (review update %s)." % time.strftime("%H:%M:%S"))
+            r = sync(admin, fx["id"])
+            g = agent.tool("skills.get", {"skill": "fixture/release-notes"})
+            check("Review mode: the new commit waits", g.get("commit") == auto_sha and r.get("staged"), {"served": g.get("commit", "")[:12], "sync": r})
+            items = admin.j("GET", "/v1/inbox").get("requests", [])
+            item = next((i for i in items if "live" in json.dumps(i).lower() and new[:7] in json.dumps(i)), None)
+            check("Review mode: an Inbox question waits for the creator", item is not None, (item or {}).get("id"))
+            full = admin.j("GET", "/v1/inbox/%s" % item["id"])
+            full = full.get("request", full)
+            admin.j("POST", "/v1/inbox/%s/decide" % item["id"], json={
+                "action": "answer", "request_revision": full.get("revision"),
+                "submission_id": "e2e-" + uuid.uuid4().hex[:8], "answers": {"decision": {"value": "approve"}}})
+            time.sleep(2)
+            g = agent.tool("skills.get", {"skill": "fixture/release-notes"})
+            check("Review mode: the Inbox approval makes it live", g.get("commit") == new, g.get("commit", "")[:12])
+            per_replica(new, "after review approval")
+            return new
+        step("review update", review_update)
+
+        def rollback():
+            vs = admin.j("GET", "/v1/skills/sources/%s/versions" % fx["id"])
+            vs = vs.get("versions", vs)
+            prev = next((v for v in vs if v.get("sha") == auto_sha), None)
+            admin.j("POST", "/v1/skills/sources/%s/versions/%s/activate" % (fx["id"], prev["id"]))
+            g = agent.tool("skills.get", {"skill": "fixture/release-notes"})
+            check("rollback serves the older commit", g.get("commit") == auto_sha, g.get("commit", "")[:12])
+            admin.j("PATCH", "/v1/skills/sources/%s" % fx["id"], json={"mode": "auto"})
+        step("rollback", rollback)
+
+    # --- Webhook ------------------------------------------------------------
+    def webhook():
+        sec = admin.j("POST", "/v1/skills/sources/%s/webhook-secret" % fx["id"])
+        secret = sec.get("secret", "")
+        body = json.dumps({"ref": "refs/heads/" + FIXTURE_BRANCH, "after": "0" * 40}).encode()
+        sig = "sha256=" + hmac.new(secret.encode(), body, hashlib.sha256).hexdigest()
+        url = BASE + "/v1/skills/sources/%s/webhook" % fx["id"]
+        r = requests.post(url, data=body, headers={"Content-Type": "application/json", "X-GitHub-Event": "push",
+                                                   "X-Hub-Signature-256": sig}, timeout=20)
+        check("webhook with a good signature is accepted", r.status_code == 202, r.status_code)
+        r = requests.post(url, data=body, headers={"Content-Type": "application/json", "X-GitHub-Event": "push",
+                                                   "X-Hub-Signature-256": "sha256=" + "0" * 64}, timeout=20)
+        check("webhook with a bad signature is 401", r.status_code == 401, r.status_code)
+    step("webhook", webhook)
+
+    # --- Agent proposes a source; the owner approves in the Inbox -------
+    def propose():
+        p = agent.tool("skills.propose_source", {"url": "https://github.com/%s/tree/%s/skills/incident-triage" % (FIXTURE_REPO, FIXTURE_BRANCH),
+                                                 "reason": "The incident-triage skill should be its own source for the on-call agents."})
+        pid = p.get("id") or p.get("proposal", {}).get("id")
+        check("skills.propose_source creates a pending proposal", p.get("status", p.get("proposal", {}).get("status")) == "pending", pid)
+        items = admin.j("GET", "/v1/inbox").get("requests", [])
+        item = next((i for i in items if pid and pid in json.dumps(i)), None) or next(
+            (i for i in items if "incident-triage" in json.dumps(i) and i.get("status") in ("pending", "open", None)), None)
+        full = admin.j("GET", "/v1/inbox/%s" % item["id"])
+        full = full.get("request", full)
+        admin.j("POST", "/v1/inbox/%s/decide" % item["id"], json={
+            "action": "answer", "request_revision": full.get("revision"),
+            "submission_id": "e2e-" + uuid.uuid4().hex[:8], "answers": {"decision": {"value": "approve"}}})
+        time.sleep(3)
+        st = agent.tool("skills.sources", {})
+        check("the approved proposal adds the source", any("incident" in (x.get("slug", "") + x.get("path", "")) for x in st.get("sources", [])),
+              [x.get("slug") for x in st.get("sources", [])])
+    step("proposal", propose)
+
+    # Clean up the agent key.
+    if agent_id:
+        admin.req("DELETE", "/v1/agents/%s" % agent_id)
+
+    passed = sum(1 for r in results if r["ok"])
+    print("\n%d/%d checks passed in %.0f s" % (passed, len(results), time.time() - t0))
+    json.dump({"base": BASE, "version": h.get("version"), "results": results}, open(REPORT, "w"), indent=1)
+    os.chmod(REPORT, 0o600)
+    return 0 if passed == len(results) else 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())
