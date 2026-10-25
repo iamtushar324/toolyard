@@ -331,10 +331,11 @@ func (c codeModeCaller) RouteCall(ctx context.Context, via, target string, args 
 
 // codeModeSchema is a tool's input schema without the fields the gateway
 // injects (its reason field, _intent_category, _approval_id, _grant,
-// _session_id). An upstream's own _reason survives when the gateway had to
+// _session_id, and _callback_ref unless the tool declares its own). An
+// upstream's own _reason survives when the gateway had to
 // fall back to __toolyard_reason.
 func codeModeSchema(e toolEntry) (map[string]any, []string) {
-	drop := map[string]bool{e.reasonField: true, IntentField: true, ApprovalIDField: true, GrantField: true, SessionField: true}
+	drop := map[string]bool{e.reasonField: true, IntentField: true, ApprovalIDField: true, GrantField: true, SessionField: true, callbackRefArg: !ownCallbackRef(e)}
 	props := make(map[string]any, len(e.tool.InputSchema.Properties))
 	for k, v := range e.tool.InputSchema.Properties {
 		if !drop[k] {

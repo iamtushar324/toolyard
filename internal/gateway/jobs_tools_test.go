@@ -6,13 +6,17 @@ import (
 	"encoding/json"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/mark3labs/mcp-go/mcp"
 
+	"github.com/tusharbhardwaj/toolyard/internal/access"
+	"github.com/tusharbhardwaj/toolyard/internal/actor"
 	"github.com/tusharbhardwaj/toolyard/internal/approval"
 	"github.com/tusharbhardwaj/toolyard/internal/audit"
+	"github.com/tusharbhardwaj/toolyard/internal/inbox"
 	"github.com/tusharbhardwaj/toolyard/internal/jobs"
 	"github.com/tusharbhardwaj/toolyard/internal/memory"
 	"github.com/tusharbhardwaj/toolyard/internal/policy"
@@ -72,6 +76,9 @@ type jobsFixture struct {
 	db    *store.DB
 	rules *asyncRules
 	notes *jobNotes
+	inbox *inbox.Service
+	// deployCalls counts deploy.run calls (Inbox fixtures only).
+	deployCalls atomic.Int32
 
 	release       chan struct{}
 	releaseOnce   sync.Once
@@ -82,8 +89,19 @@ type jobsFixture struct {
 
 const jobsTestReason = "exercise async tool jobs in the gateway tests"
 
-func newJobsFixture(t *testing.T) *jobsFixture {
+// jobsFixtureConfig varies newJobsFixture: an access resolver, and an
+// Inbox with a restricted deploy.run tool.
+type jobsFixtureConfig struct {
+	resolver access.Resolver
+	inbox    bool
+}
+
+func newJobsFixture(t *testing.T, opts ...func(*jobsFixtureConfig)) *jobsFixture {
 	t.Helper()
+	var cfg jobsFixtureConfig
+	for _, o := range opts {
+		o(&cfg)
+	}
 	db := storetest.Open(t)
 	bus, err := approval.New(context.Background(), db)
 	if err != nil {
@@ -94,9 +112,30 @@ func newJobsFixture(t *testing.T) *jobsFixture {
 		release: make(chan struct{}), slowCancelled: make(chan struct{}), echoArgs: make(chan map[string]any, 8),
 	}
 	f.svc = jobs.New(db, jobs.Options{Notifier: f.notes, PollEvery: 20 * time.Millisecond})
-	f.gw = New(Options{Policy: policy.New(db), Approval: bus, Audit: audit.New(db), Hub: realtime.NewHub(), Memory: memory.New(db), Jobs: f.svc})
+	gopts := Options{Policy: policy.New(db), Approval: bus, Audit: audit.New(db), Hub: realtime.NewHub(), Memory: memory.New(db), Jobs: f.svc}
+	if cfg.resolver != nil {
+		gopts.Access = cfg.resolver
+	}
+	f.gw = New(gopts)
 	f.gw.RegisterBuiltins()
 	f.gw.SetAsyncPolicy(f.rules)
+	if cfg.inbox {
+		f.inbox, err = inbox.New(context.Background(), inbox.Options{DB: db, Catalog: f.gw})
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(f.inbox.Flush)
+		f.gw.SetInbox(f.inbox, inbox.NewGuide(nil), func() string { return ApprovalModeExecute })
+		f.gw.RegisterInboxTools()
+		f.gw.registerEntry(toolEntry{
+			tool:     mcp.Tool{Name: "deploy.run", InputSchema: mcp.ToolInputSchema{Type: "object", Properties: addMetaProps(map[string]any{})}},
+			upstream: "deploy", originalName: "run", reasonField: ReasonField,
+			handle: func(context.Context, map[string]any) (*mcp.CallToolResult, error) {
+				f.deployCalls.Add(1)
+				return mcp.NewToolResultText("deployed"), nil
+			},
+		})
+	}
 	t.Cleanup(func() {
 		f.releaseAll()
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -131,6 +170,14 @@ func newJobsFixture(t *testing.T) *jobsFixture {
 		f.echoArgs <- cp
 		return mcp.NewToolResultText("echo"), nil
 	})
+	f.gw.registerEntry(toolEntry{
+		tool: mcp.Tool{Name: "beta.get_secret", Description: descriptionBanner + "secret",
+			InputSchema: mcp.ToolInputSchema{Type: "object", Properties: addMetaProps(map[string]any{})}},
+		upstream: "beta", originalName: "get_secret", reasonField: ReasonField,
+		handle: func(context.Context, map[string]any) (*mcp.CallToolResult, error) {
+			return mcp.NewToolResultText("secret"), nil
+		},
+	})
 	return f
 }
 
@@ -154,6 +201,23 @@ func (f *jobsFixture) callAs(t *testing.T, agent, tool string, args map[string]a
 func (f *jobsFixture) call(t *testing.T, tool string, args map[string]any) *mcp.CallToolResult {
 	t.Helper()
 	return f.callAs(t, "ag_1", tool, args)
+}
+
+// callOwned calls as agent, owned by the dashboard user owner.
+func (f *jobsFixture) callOwned(t *testing.T, agent, owner, tool string, args map[string]any) *mcp.CallToolResult {
+	t.Helper()
+	if args == nil {
+		args = map[string]any{}
+	}
+	if _, ok := args[ReasonField]; !ok {
+		args[ReasonField] = jobsTestReason
+	}
+	ctx := actor.WithRaiser(WithAgentID(context.Background(), agent), actor.Raiser{CallerID: agent, OwnerUserID: owner})
+	res, err := f.gw.RouteCall(ctx, "test", tool, args)
+	if err != nil || res == nil {
+		t.Fatalf("%s: %v %v", tool, res, err)
+	}
+	return res
 }
 
 // jobIDOf reads the job envelope of a call that became a job.
@@ -275,19 +339,14 @@ func TestAsyncAfterMsAnswersFastCallsInline(t *testing.T) {
 	if w := f.waitJob(t, id); w["status"] != jobs.StatusSucceeded {
 		t.Fatalf("slow job = %v", w)
 	}
-	// Only the job handed back as a job id is reported for a callback.
+	// A fast call stores no job at all; the slow one is a job, reported
+	// for its callback.
 	list, err := f.svc.List(context.Background(), jobs.Filter{AgentID: "ag_1"})
-	if err != nil || len(list) != 2 {
-		t.Fatalf("jobs = %d %v", len(list), err)
+	if err != nil || len(list) != 1 || list[0].ID != id {
+		t.Fatalf("jobs = %+v %v", list, err)
 	}
-	for _, j := range list {
-		_, noticed := f.notes.find(j.ID)
-		if j.Tool == "alpha.get_fast" && noticed {
-			t.Error("a call answered inline was also reported for a callback")
-		}
-		if j.Tool == "alpha.get_slow" && !noticed {
-			t.Error("the job handed back as a job id was not reported")
-		}
+	if _, noticed := f.notes.find(id); !noticed {
+		t.Error("the job handed back as a job id was not reported")
 	}
 }
 
@@ -402,5 +461,240 @@ func TestJobsAreOffWithoutAJobService(t *testing.T) {
 	}
 	if !reservedUpstreamName(jobsUpstream) {
 		t.Fatal("jobs must be a reserved upstream name")
+	}
+}
+
+func withInbox(c *jobsFixtureConfig) { c.inbox = true }
+
+func withResolver(r access.Resolver) func(*jobsFixtureConfig) {
+	return func(c *jobsFixtureConfig) { c.resolver = r }
+}
+
+// grantFor asks for and approves one deploy.run call for ag_1, and
+// returns its grant token.
+func (f *jobsFixture) grantFor(t *testing.T) string {
+	t.Helper()
+	ctx := context.Background()
+	s := structured(t, f.call(t, "inbox.request", requestArgs(map[string]any{"service": "api", "env": "prod"})))
+	id, _ := s["request_id"].(string)
+	if s["ok"] != true || id == "" {
+		t.Fatalf("request: %v", s)
+	}
+	f.inbox.Flush()
+	if _, err := f.inbox.Decide(ctx, id, inbox.Decision{Action: "submit", RequestRevision: 1, SubmissionID: "jobs_test",
+		Verdicts: map[string]inbox.CallVerdict{"deploy_api": {Verdict: inbox.VerdictAccepted}}}); err != nil {
+		t.Fatal(err)
+	}
+	w := structured(t, f.call(t, "inbox.wait", map[string]any{"ids": []any{id}, "timeout_seconds": 1}))
+	tok, _ := w["requests"].([]any)[0].(map[string]any)["tools"].([]any)[0].(map[string]any)["grant"].(string)
+	if !strings.HasPrefix(tok, "tyg_") {
+		t.Fatalf("no grant: %v", w)
+	}
+	return tok
+}
+
+// An async tool under an approve policy answers permission_required and
+// starts no job; with a grant, the grant is redeemed once, inside the job.
+func TestAsyncToolNeedsPermissionAndRedeemsItsGrantInTheJob(t *testing.T) {
+	f := newJobsFixture(t, withInbox)
+	f.rules.set("deploy", jobs.AsyncSetting{Mode: jobs.AsyncAlways})
+	deploy := map[string]any{"service": "api", "env": "prod"}
+
+	res := f.call(t, "deploy.run", map[string]any{"service": "api", "env": "prod"})
+	if s := structured(t, res); s["status"] != "permission_required" || metaTrue(res, "toolyard.job") {
+		t.Fatalf("restricted async call = %v", s)
+	}
+	if n := f.jobCount(t); n != 0 || f.deployCalls.Load() != 0 {
+		t.Fatalf("restricted call stored %d jobs, ran %d times", n, f.deployCalls.Load())
+	}
+
+	tok := f.grantFor(t)
+	granted := map[string]any{GrantField: tok}
+	for k, v := range deploy {
+		granted[k] = v
+	}
+	id := jobIDOf(t, f.call(t, "deploy.run", granted))
+	if w := f.waitJob(t, id); w["status"] != jobs.StatusSucceeded || !strings.Contains(asJSON(w["result"]), "deployed") {
+		t.Fatalf("granted job = %v", w)
+	}
+	if f.deployCalls.Load() != 1 {
+		t.Fatalf("deploy ran %d times", f.deployCalls.Load())
+	}
+	// The grant is used up: a second job reports grant_invalid, nothing runs.
+	again := map[string]any{GrantField: tok}
+	for k, v := range deploy {
+		again[k] = v
+	}
+	id2 := jobIDOf(t, f.call(t, "deploy.run", again))
+	if w := f.waitJob(t, id2); w["status"] != jobs.StatusFailed || !strings.Contains(asJSON(w["result"]), "grant_invalid") {
+		t.Fatalf("second use of the grant = %v", w)
+	}
+	if f.deployCalls.Load() != 1 {
+		t.Fatalf("a used grant ran the tool again (%d calls)", f.deployCalls.Load())
+	}
+}
+
+func scopeResolver() *fakeResolver {
+	return &fakeResolver{scopes: map[string]access.Scope{
+		"ag_1":           {Groups: map[string]bool{"alpha": true}},
+		"ag_2":           {Groups: map[string]bool{"alpha": true}},
+		"dashboard:u_1":  {Groups: map[string]bool{"alpha": true}},
+		"dashboard:boss": {All: true},
+	}}
+}
+
+// jobs.start, an MCP task and a direct call on a tool the caller was
+// never granted answer like an unknown tool and store nothing.
+func TestUngrantedToolsStartNoJob(t *testing.T) {
+	f := newJobsFixture(t, withResolver(scopeResolver()))
+	f.rules.set("beta", jobs.AsyncSetting{Mode: jobs.AsyncAlways})
+	if res := f.call(t, MetaJobsStart, map[string]any{"tool": "beta.get_secret", "arguments": map[string]any{}}); !res.IsError || !strings.Contains(textOf(res), "not found") {
+		t.Fatalf("jobs.start of an ungranted tool = %s", textOf(res))
+	}
+	if res := f.call(t, "beta.get_secret", nil); !res.IsError || !strings.Contains(textOf(res), "not found") {
+		t.Fatalf("async call of an ungranted tool = %s", textOf(res))
+	}
+	c := newTasksServer(t, f, "ag_1", false)
+	c.initialize()
+	out := c.send("tools/call", map[string]any{"name": "beta.get_secret", "arguments": map[string]any{ReasonField: jobsTestReason}, "task": map[string]any{}}, false)
+	if errObj, _ := out["error"].(map[string]any); errObj == nil || !strings.Contains(asJSON(errObj), "not found") {
+		t.Fatalf("task for an ungranted tool = %v", out)
+	}
+	if n := f.jobCount(t); n != 0 {
+		t.Fatalf("%d jobs stored for ungranted tools", n)
+	}
+}
+
+// Agent B reads, waits on and cancels agent A's job as an unknown id,
+// over the jobs.* tools and over MCP Tasks.
+func TestAnotherAgentCannotTouchAJob(t *testing.T) {
+	f := newJobsFixture(t)
+	f.rules.set("alpha", jobs.AsyncSetting{Tools: map[string]jobs.AsyncRule{"get_slow": {Mode: jobs.AsyncAlways}}})
+	id := jobIDOf(t, f.call(t, "alpha.get_slow", nil))
+	for _, tool := range []string{MetaJobsStatus, MetaJobsResult, MetaJobsWait, MetaJobsCancel} {
+		args := map[string]any{"job_id": id}
+		if tool == MetaJobsWait {
+			args["timeout_seconds"] = 1
+		}
+		if res := f.callAs(t, "ag_2", tool, args); !res.IsError || !strings.Contains(textOf(res), "unknown job_id") {
+			t.Errorf("ag_2 %s = %s", tool, textOf(res))
+		}
+	}
+	if list := structured(t, f.callAs(t, "ag_2", MetaJobsList, nil)); list["count"] != float64(0) {
+		t.Errorf("ag_2 lists ag_1's jobs: %v", list)
+	}
+	c := newTasksServer(t, f, "ag_2", false)
+	c.initialize()
+	for _, method := range []string{"tasks/get", "tasks/cancel", "tasks/result"} {
+		if out := c.send(method, map[string]any{"taskId": id}, false); out["error"] == nil {
+			t.Errorf("ag_2 %s = %v", method, out)
+		}
+	}
+	if j, _ := f.svc.Get(context.Background(), id); j.Final() || j.CancelRequested {
+		t.Fatalf("ag_2 changed ag_1's job: %+v", j)
+	}
+}
+
+// A dashboard member sees only their own agents' jobs; an admin sees all.
+func TestDashboardCallersSeeTheirAgentsJobs(t *testing.T) {
+	f := newJobsFixture(t, withResolver(scopeResolver()))
+	mine := jobIDOf(t, f.callOwned(t, "ag_1", "u_1", MetaJobsStart, map[string]any{"tool": "alpha.get_fast", "arguments": map[string]any{}}))
+	theirs := jobIDOf(t, f.callOwned(t, "ag_2", "u_2", MetaJobsStart, map[string]any{"tool": "alpha.get_fast", "arguments": map[string]any{}}))
+	f.waitJob(t, mine)
+	if w := structured(t, f.callAs(t, "ag_2", MetaJobsWait, map[string]any{"job_id": theirs, "timeout_seconds": 30})); w["final"] != true {
+		t.Fatalf("ag_2's job = %v", w)
+	}
+	list := structured(t, f.callAs(t, "dashboard:u_1", MetaJobsList, nil))
+	if list["count"] != float64(1) || !strings.Contains(asJSON(list["jobs"]), mine) {
+		t.Fatalf("member's jobs.list = %v", list)
+	}
+	if st := f.callAs(t, "dashboard:u_1", MetaJobsStatus, map[string]any{"job_id": theirs}); !st.IsError {
+		t.Fatalf("member read another owner's job: %s", textOf(st))
+	}
+	if st := f.callAs(t, "dashboard:u_1", MetaJobsStatus, map[string]any{"job_id": mine}); st.IsError {
+		t.Fatalf("member cannot read their agent's job: %s", textOf(st))
+	}
+	if all := structured(t, f.callAs(t, "dashboard:boss", MetaJobsList, nil)); all["count"] != float64(2) {
+		t.Fatalf("admin's jobs.list = %v", all)
+	}
+}
+
+// A queued job checks access and policy again when it starts.
+func TestQueuedJobRechecksPolicyWhenItStarts(t *testing.T) {
+	f := newJobsFixture(t)
+	ctx := context.Background()
+	f.rules.set("alpha", jobs.AsyncSetting{Mode: jobs.AsyncAlways})
+	c := jobCall{entry: f.gw.tools["alpha.get_echo"], args: map[string]any{}, agentID: "ag_1", reason: jobsTestReason}
+	if r := f.gw.recheckJob(ctx, c); r != "" {
+		t.Fatalf("recheck of an allowed call = %q", r)
+	}
+	if _, err := f.gw.policy.Set(ctx, policy.ScopeTool, "alpha.get_echo", "deny", "", false); err != nil {
+		t.Fatal(err)
+	}
+	if r := f.gw.recheckJob(ctx, c); !strings.Contains(r, "denied by policy") {
+		t.Fatalf("recheck after a deny = %q", r)
+	}
+	if _, err := f.gw.policy.Set(ctx, policy.ScopeTool, "alpha.get_echo", "ask", "", false); err != nil {
+		t.Fatal(err)
+	}
+	if r := f.gw.recheckJob(ctx, c); !strings.Contains(r, "needs approval") {
+		t.Fatalf("recheck after an ask = %q", r)
+	}
+	c.grant = true
+	if r := f.gw.recheckJob(ctx, c); r != "" {
+		t.Fatalf("a granted call refused after an ask: %q", r)
+	}
+}
+
+// When the job budget is full, a tool the administrator made async runs
+// inline instead of failing.
+func TestFullBudgetRunsAsyncToolsInline(t *testing.T) {
+	db := storetest.Open(t)
+	bus, err := approval.New(context.Background(), db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	svc := jobs.New(db, jobs.Options{MaxActive: 1, PollEvery: 20 * time.Millisecond})
+	gw := New(Options{Policy: policy.New(db), Approval: bus, Audit: audit.New(db), Hub: realtime.NewHub(), Memory: memory.New(db), Jobs: svc})
+	gw.RegisterBuiltins()
+	release := make(chan struct{})
+	t.Cleanup(func() {
+		close(release)
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		svc.Wait(ctx)
+		_ = gw.Close()
+	})
+	rules := &asyncRules{m: map[string]jobs.AsyncSetting{"alpha": {Mode: jobs.AsyncAlways}}}
+	gw.SetAsyncPolicy(rules)
+	for _, short := range []string{"get_slow", "get_fast"} {
+		short := short
+		gw.registerEntry(toolEntry{
+			tool:     mcp.Tool{Name: "alpha." + short, InputSchema: mcp.ToolInputSchema{Type: "object", Properties: addMetaProps(map[string]any{})}},
+			upstream: "alpha", originalName: short, reasonField: ReasonField,
+			handle: func(ctx context.Context, _ map[string]any) (*mcp.CallToolResult, error) {
+				if short == "get_slow" {
+					select {
+					case <-release:
+					case <-ctx.Done():
+					}
+				}
+				return mcp.NewToolResultText(short + " done"), nil
+			},
+		})
+	}
+	ctx := WithAgentID(context.Background(), "ag_1")
+	first, _ := gw.RouteCall(ctx, "test", "alpha.get_slow", map[string]any{ReasonField: jobsTestReason})
+	if !metaTrue(first, "toolyard.job") {
+		t.Fatalf("first call = %s", textOf(first))
+	}
+	second, _ := gw.RouteCall(ctx, "test", "alpha.get_fast", map[string]any{ReasonField: jobsTestReason})
+	if second.IsError || metaTrue(second, "toolyard.job") || textOf(second) != "get_fast done" {
+		t.Fatalf("call over the budget = %s", textOf(second))
+	}
+	// An explicit job request over the budget is refused.
+	explicit, _ := gw.RouteCall(ctx, "test", MetaJobsStart, map[string]any{ReasonField: jobsTestReason, "tool": "alpha.get_fast", "arguments": map[string]any{}})
+	if !explicit.IsError || structured(t, explicit)["status"] != "job_budget_exceeded" {
+		t.Fatalf("jobs.start over the budget = %s", textOf(explicit))
 	}
 }

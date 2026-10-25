@@ -428,6 +428,7 @@ func New(opts Options) *Gateway {
 	if opts.Jobs != nil {
 		serverOpts = append(serverOpts, server.WithTaskCapabilities(true, true, true))
 		hooks.AddAfterListTools(g.markTaskSupport)
+		g.attachJobs(opts.Jobs)
 	}
 	serverOpts = append(serverOpts, server.WithHooks(hooks))
 	g.mcp = server.NewMCPServer(opts.Name, opts.Version, serverOpts...)
@@ -1518,8 +1519,9 @@ func (g *Gateway) routeEntry(ctx context.Context, entry toolEntry, via string, a
 	}
 
 	grantToken, _ := args[GrantField].(string)
-	ctx = withCallbackRef(ctx, args)
+	ctx = withCallbackRefFor(ctx, entry, args)
 	reason, intent, cleanArgs, rerr := extractReasonOpt(args, entry.reasonField, entry.reasonOptional)
+	cleanArgs = restoreOwnCallbackRef(entry, args, cleanArgs)
 	if rerr != nil {
 		_ = g.audit.Write(ctx, audit.Event{
 			EventType:     audit.EventCallFailed,
@@ -1566,7 +1568,8 @@ func (g *Gateway) routeEntry(ctx context.Context, entry toolEntry, via string, a
 		// Tracked so shutdown waits for the granted execution to finish
 		// and record its outcome. An async tool redeems and runs in its
 		// job (jobs_tools.go).
-		return g.runOrStartJob(ctx, entry, cleanArgs, agentID, reason, callbackRefFrom(ctx), &ev, func(ctx context.Context, e toolEntry, ev *metrics.Event) (*mcp.CallToolResult, error) {
+		call := jobCall{entry: entry, args: cleanArgs, agentID: agentID, reason: reason, intent: intent, callbackRef: callbackRefFrom(ctx), grant: true}
+		return g.runOrStartJob(ctx, call, &ev, func(ctx context.Context, e toolEntry, ev *metrics.Event) (*mcp.CallToolResult, error) {
 			done := g.grantCalls.Add(e.tool.Name)
 			defer done()
 			return g.redeemAndDispatch(ctx, e, cleanArgs, agentID, reason, grantToken, ev)
@@ -1589,7 +1592,8 @@ func (g *Gateway) routeEntry(ctx context.Context, entry toolEntry, via string, a
 		_ = g.audit.Write(ctx, allowed)
 		ev.ApprovalOutcome = metrics.ApprovalNone
 		// An async tool runs as a job (jobs_tools.go).
-		return g.runOrStartJob(ctx, entry, cleanArgs, agentID, reason, callbackRefFrom(ctx), &ev, func(ctx context.Context, e toolEntry, ev *metrics.Event) (*mcp.CallToolResult, error) {
+		call := jobCall{entry: entry, args: cleanArgs, agentID: agentID, reason: reason, intent: intent, callbackRef: callbackRefFrom(ctx)}
+		return g.runOrStartJob(ctx, call, &ev, func(ctx context.Context, e toolEntry, ev *metrics.Event) (*mcp.CallToolResult, error) {
 			return g.dispatch(ctx, e, cleanArgs, agentID, reason, "", ev)
 		})
 	case policy.ActionDeny:

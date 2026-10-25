@@ -20,13 +20,18 @@
 -- the job.
 --
 -- High availability: owner_instance is the process that runs the job and
--- lease_until (Unix milliseconds) the end of its lease, renewed by that
--- process while the job is queued or running. Recovery takes only rows
+-- lease_until the end of its lease (Unix milliseconds on the database's
+-- clock), renewed by that process while the job is queued or running. Recovery takes only rows
 -- whose lease ended: a running one becomes outcome_unknown (its call may
 -- have run; it is never run again), a queued one failed (nothing ran).
 --
 -- Times are Unix milliseconds; started_at and finished_at stay NULL until
 -- set. Jobs are kept 7 days after they finish (idx_tool_jobs_finished).
+-- The per-agent and per-owner caps count active jobs through
+-- idx_tool_jobs_agent_status and idx_tool_jobs_owner_status; the retention
+-- purge checks blob references through idx_tool_jobs_result_blob. Large
+-- results are stored under a domain-separated key (sha256 of "tool_job",
+-- a NUL byte and the result), never an Inbox attachment's content hash.
 --
 -- Same table as migrations/sqlite/0066_tool_jobs.sql.
 CREATE TABLE IF NOT EXISTS tool_jobs (
@@ -65,3 +70,6 @@ CREATE INDEX IF NOT EXISTS idx_tool_jobs_agent ON tool_jobs (agent_id, created_a
 CREATE INDEX IF NOT EXISTS idx_tool_jobs_owner ON tool_jobs (owner_user_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_tool_jobs_active ON tool_jobs (status, lease_until);
 CREATE INDEX IF NOT EXISTS idx_tool_jobs_finished ON tool_jobs (finished_at);
+CREATE INDEX IF NOT EXISTS idx_tool_jobs_agent_status ON tool_jobs (agent_id, status);
+CREATE INDEX IF NOT EXISTS idx_tool_jobs_owner_status ON tool_jobs (owner_user_id, status);
+CREATE INDEX IF NOT EXISTS idx_tool_jobs_result_blob ON tool_jobs (result_blob);

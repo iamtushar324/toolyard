@@ -65,6 +65,9 @@ func metaProps() map[string]any {
 		SessionField: map[string]any{
 			"type": "string", "description": sessionPropDescription,
 		},
+		callbackRefArg: map[string]any{
+			"type": "string", "maxLength": maxCallbackRef, "description": callbackRefPropDescription,
+		},
 	}
 }
 
@@ -150,6 +153,15 @@ func wrapSchema(t mcp.Tool) (mcp.Tool, string) {
 		props[SessionField] = map[string]any{
 			"type":        "string",
 			"description": sessionPropDescription,
+		}
+	}
+	// A tool's own _callback_ref keeps its schema, and its argument
+	// (ownCallbackRef).
+	if _, has := props[callbackRefArg]; !has {
+		props[callbackRefArg] = map[string]any{
+			"type":        "string",
+			"maxLength":   maxCallbackRef,
+			"description": callbackRefPropDescription,
 		}
 	}
 	required = appendUnique(required, field)

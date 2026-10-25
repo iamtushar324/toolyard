@@ -20,7 +20,7 @@ async. Each rule has a mode:
 |---|---|
 | `off` | Runs inline, as without async tools (the default). |
 | `always` | Answers with a job id at once. |
-| `after` | Runs inline, and answers with a job id only if it is still running after `after_ms` milliseconds (10 – 600000). Fast calls answer as before. |
+| `after` | Runs inline, and answers with a job id only if it is still running after `after_ms` milliseconds (10 – 600000). A fast call answers as before and stores no job. |
 
 A tool rule overrides the server's, so a server can be `always` with one
 quick tool `off`, or `off` with one slow tool `always`.
@@ -89,18 +89,24 @@ result = done["status"]
 ```
 
 `toolyard.jobs_start(tool=..., arguments=...)` starts any tool as a job from
-a script. Calls a job makes itself (a script run as a job, `tools.execute`)
-run inline inside it.
+a script. Calls a job makes itself (a script run as a job, `tools.execute`,
+and `jobs.start` inside a job) run inline inside it: `jobs.start` there
+returns the tool's own result, not a job id.
 
 **Permissions.** A call that needs approval answers exactly as before
 (`permission_required`, or a pending approval) and starts no job. Once you
 hold the grant, call the tool with `_grant` as usual: if the tool is async,
-the grant is redeemed and the call runs in the job.
+the grant is redeemed once, inside the job. A queued job checks access and
+policy again when it starts: a tool whose access was removed, or whose
+policy now denies the call (or asks for approval, for a call the policy
+had allowed), fails without running. A running job stops when its agent
+or owner loses access (disabled, blocked, server access withdrawn).
 
 ## 3. MCP Tasks
 
 Clients that speak MCP Tasks (protocol 2025-11-25) add `"task": {}` to
-`tools/call`. toolyard answers `CreateTaskResult` (the task id is the job
+`tools/call`; `tools/list` marks every tool `execution.taskSupport:
+"optional"` because any tool can run as a job. toolyard answers `CreateTaskResult` (the task id is the job
 id) and serves `tasks/get`, `tasks/result` (waits for the end), `tasks/cancel`
 and `tasks/list` from the jobs table, so any replica answers any task and a
 task survives a restart. Task statuses: `working` (queued or running),
@@ -108,6 +114,13 @@ task survives a restart. Task statuses: `working` (queued or running),
 `statusMessage`), `cancelled`. A call refused before it could run still gets
 a task, already final, whose result is the refusal. Clients without tasks
 get the job envelope above.
+
+A 2026-07-28 request is checked like any other on that version (the
+`Mcp-Protocol-Version` header must match `_meta`, and `Mcp-Method` /
+`Mcp-Name` the body; errors carry HTTP 400 or 404). It gets `tasks/get`
+(with the tool's `result` once the task ended) and `tasks/cancel`;
+`tasks/result` and `tasks/list` do not exist in that version. The tasks
+methods apply the same DNS rebinding protection as the rest of `/mcp`.
 
 ## 4. Callbacks
 
@@ -160,8 +173,8 @@ curl "$TOOLYARD_URL/v1/jobs?status=active&limit=20" -H "Authorization: Bearer $T
 | Limit | Value |
 |---|---|
 | One job's run time | `-async-job-timeout` (default 1 h); it replaces `-upstream-call-timeout` for the call |
-| Queued + running jobs per agent | 32 (`429` / `job_budget_exceeded` above) |
-| Jobs running at once per replica | 64; more wait `queued` |
+| Queued + running jobs per agent | 32; all agents of one owner together 64; anonymous callers together 8. Over the cap a tool the administrator made async runs inline instead; `jobs.start`, `POST /v1/jobs` (`429`) and MCP tasks are refused (`job_budget_exceeded`) |
+| Jobs running at once per replica | 64, at most 16 of them one agent's; more wait `queued` |
 | One wait (`jobs.wait`, `Prefer: wait`) | 60 s |
 | Result kept inline in the row | 256 KiB; larger results go to the blob store (files under `<data>/job-results` on SQLite, chunks in Postgres) |
 | Largest result kept | 32 MiB (above: the job records the size and an error, not the bytes) |
@@ -170,13 +183,23 @@ curl "$TOOLYARD_URL/v1/jobs?status=active&limit=20" -H "Authorization: Bearer $T
 ## 7. High availability
 
 - Every job row carries `owner_instance` (the replica that runs it) and
-  `lease_until`. That replica renews the lease every 5 s while the job is
-  queued or running (30 s leases), and claims it `queued` → `running` with
-  a compare-and-set.
+  `lease_until`, on the database's clock (so clock drift between replicas
+  never ends a lease early). That replica renews the lease every 5 s while
+  the job is queued or running (30 s leases), and claims it `queued` →
+  `running` with a compare-and-set. A replica that finds one of its jobs
+  final or owned elsewhere at a renewal stops its local run.
+- The caps are checked and the job inserted in one transaction, under a
+  Postgres advisory lock on the owner (SQLite has one writer).
+- Large results are stored under a domain-separated key (the sha256 of
+  `tool_job`, a NUL byte and the result), so the Inbox's blob sweeps can
+  never remove one.
 - Recovery runs on every replica and takes only rows whose lease ended: a
   `running` job becomes `outcome_unknown` (its call may have run; it is
   never run again), a `queued` one `failed` (nothing ran). A live
-  replica's jobs are never touched.
+  replica's jobs are never touched. Recovery, a job that never started, an
+  unknown outcome and a job stopped because access was removed write
+  `job.recovered`, `job.not_started`, `job.outcome_unknown` and
+  `job.revoked` audit rows.
 - `jobs.cancel` on another replica sets `cancel_requested`; the owning
   replica sees it within one heartbeat and interrupts the call.
 - Waiters (`jobs.wait`, `tasks/result`, `Prefer: wait`) are woken in
@@ -185,6 +208,7 @@ curl "$TOOLYARD_URL/v1/jobs?status=active&limit=20" -H "Authorization: Bearer $T
 - On shutdown a replica refuses new jobs, ends waits, and gives running
   jobs until `-drain-timeout`; what is still running then is cancelled and
   recorded `outcome_unknown`.
-- Upstream `notifications/progress` for a job's call (toolyard sends a
-  progress token on each upstream call a job makes) are recorded on the job
+- Upstream `notifications/progress` for a job's call (toolyard sends its
+  own progress token on each upstream call a job makes) are recorded on the
+  job, the latest one at most once a second, off the upstream's read loop,
   and shown by `jobs.status` and `tasks/get` (`statusMessage`).

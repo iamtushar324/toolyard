@@ -15,6 +15,7 @@ import (
 
 	"github.com/mark3labs/mcp-go/mcp"
 
+	"github.com/tusharbhardwaj/toolyard/internal/access"
 	"github.com/tusharbhardwaj/toolyard/internal/actor"
 	"github.com/tusharbhardwaj/toolyard/internal/audit"
 	"github.com/tusharbhardwaj/toolyard/internal/codemode"
@@ -181,89 +182,227 @@ func (g *Gateway) asyncPlanFor(ctx context.Context, entry toolEntry) *asyncPlan 
 // jobRun is the dispatch a job runs: the call routeEntry admitted.
 type jobRun func(ctx context.Context, entry toolEntry, ev *metrics.Event) (*mcp.CallToolResult, error)
 
-// runOrStartJob runs the admitted call inline, or as a job when
-// asyncPlanFor says so.
-func (g *Gateway) runOrStartJob(ctx context.Context, entry toolEntry, args map[string]any, agentID, reason, callbackRef string, ev *metrics.Event, run jobRun) (*mcp.CallToolResult, error) {
-	plan := g.asyncPlanFor(ctx, entry)
-	if plan == nil {
-		return run(ctx, entry, ev)
-	}
-	return g.startJob(ctx, plan, entry, args, agentID, reason, callbackRef, ev, run)
+// jobCall is an admitted call that may run as a job: what routeEntry
+// knows about it.
+type jobCall struct {
+	entry       toolEntry
+	args        map[string]any
+	agentID     string
+	reason      string
+	intent      string
+	callbackRef string
+	// grant is set for a call admitted by a redeemable grant (its run
+	// redeems it); otherwise the policy allowed the call.
+	grant bool
 }
 
-// startJob starts the admitted call as a job and answers with the job
-// envelope, or with the call's own result when it finished within the
-// plan's inline wait.
-func (g *Gateway) startJob(ctx context.Context, plan *asyncPlan, entry toolEntry, args map[string]any, agentID, reason, callbackRef string, ev *metrics.Event, run jobRun) (*mcp.CallToolResult, error) {
+// runOrStartJob runs the admitted call inline, or as a job when
+// asyncPlanFor says so.
+func (g *Gateway) runOrStartJob(ctx context.Context, c jobCall, ev *metrics.Event, run jobRun) (*mcp.CallToolResult, error) {
+	plan := g.asyncPlanFor(ctx, c.entry)
+	switch {
+	case plan == nil:
+		return run(ctx, c.entry, ev)
+	case plan.afterMs > 0:
+		return g.runAfter(ctx, plan, c, ev, run)
+	}
+	return g.startJob(ctx, plan, c, ev, run)
+}
+
+// jobRequest is the stored description of c's job.
+func (g *Gateway) jobRequest(ctx context.Context, plan *asyncPlan, c jobCall, ev *metrics.Event) jobs.StartRequest {
 	raiser, _ := actor.RaiserFrom(ctx)
 	req := jobs.StartRequest{
-		AgentID: agentID, OwnerUserID: g.ownerOf(ctx, agentID), SessionID: raiser.ClientSessionID,
-		Tool: entry.tool.Name, Upstream: entry.upstream, ParamsHash: paramsHash(args), Reason: reason,
-		Via: ev.Via, CallbackRef: callbackRef, InlineWait: plan.afterMs > 0,
+		AgentID: c.agentID, OwnerUserID: g.ownerOf(ctx, c.agentID), SessionID: raiser.ClientSessionID,
+		Tool: c.entry.tool.Name, Upstream: c.entry.upstream, ParamsHash: paramsHash(c.args), Reason: c.reason,
+		Via: ev.Via, CallbackRef: c.callbackRef,
 	}
 	if plan.req != nil {
 		req.Via, req.IdempotencyKey = plan.req.via, plan.req.idempotencyKey
 	}
-	// The job keeps no per-call timeout of its own beyond the job limit;
-	// connect links are never minted into a result that is stored.
-	jobEntry := entry
+	return req
+}
+
+// jobContext is the context a job's call runs on: the call's values, no
+// per-call timeout of its own beyond the job limit, nested calls inline,
+// and no connect link minted into a result that is stored.
+func jobContext(ctx context.Context) context.Context {
+	return WithoutConnectLinks(context.WithValue(ctx, jobRunKey{}, true))
+}
+
+// jobMetrics records the metric of a job's own dispatch.
+func (g *Gateway) jobMetrics(started time.Time, res *mcp.CallToolResult, derr error, jev *metrics.Event) {
+	jev.TotalLatencyMs = int(time.Since(started).Milliseconds())
+	if jev.Outcome == "" {
+		jev.Outcome = metrics.OutcomeOK
+		if derr != nil || (res != nil && res.IsError) {
+			jev.Outcome = metrics.OutcomeError
+		}
+	}
+	if res != nil {
+		jev.ResultSizeBytes = approxResultSize(res)
+	}
+	if g.metrics != nil {
+		g.metrics.Record(*jev)
+	}
+}
+
+func newJobEvent(base metrics.Event) metrics.Event {
+	jev := base
+	jev.TS, jev.Via = time.Now().UnixMilli(), viaAsyncJob
+	jev.Outcome, jev.ErrorClass, jev.UpstreamLatencyMs, jev.TotalLatencyMs = "", "", 0, 0
+	return jev
+}
+
+// startJob starts the admitted call as a queued job and answers with the
+// job envelope. When the job budget is full, a tool the administrator
+// made async runs inline instead; an explicit job request (jobs.start,
+// POST /v1/jobs, an MCP task) is refused.
+func (g *Gateway) startJob(ctx context.Context, plan *asyncPlan, c jobCall, ev *metrics.Event, run jobRun) (*mcp.CallToolResult, error) {
+	req := g.jobRequest(ctx, plan, c, ev)
+	jobEntry := c.entry
 	jobEntry.noCallTimeout = true
-	jobCtx := WithoutConnectLinks(context.WithValue(ctx, jobRunKey{}, true))
 	base := *ev
-	var live *mcp.CallToolResult
-	job, h, err := g.jobs.Start(jobCtx, req, func(rctx context.Context, progress jobs.ProgressFunc) jobs.Outcome {
-		rctx = withProgressSink(rctx, progress)
-		jev := base
-		jev.TS, jev.Via = time.Now().UnixMilli(), viaAsyncJob
-		jev.Outcome, jev.ErrorClass, jev.UpstreamLatencyMs, jev.TotalLatencyMs = "", "", 0, 0
+	job, h, err := g.jobs.Start(jobContext(ctx), req, func(rctx context.Context, progress jobs.ProgressFunc) jobs.Outcome {
+		// Queued for a while: the access and policy that admitted the
+		// call must still hold when it starts.
+		if refusal := g.recheckJob(rctx, c); refusal != "" {
+			return jobs.Outcome{Status: jobs.StatusFailed, Envelope: encodeJobResult(mcp.NewToolResultError(refusal)), IsError: true, Error: refusal}
+		}
+		jev := newJobEvent(base)
 		started := time.Now()
-		res, derr := run(rctx, jobEntry, &jev)
-		jev.TotalLatencyMs = int(time.Since(started).Milliseconds())
-		if jev.Outcome == "" {
-			jev.Outcome = metrics.OutcomeOK
-			if derr != nil || (res != nil && res.IsError) {
-				jev.Outcome = metrics.OutcomeError
-			}
-		}
-		if res != nil {
-			jev.ResultSizeBytes = approxResultSize(res)
-		}
-		if g.metrics != nil {
-			g.metrics.Record(jev)
-		}
-		live = res
+		res, derr := run(withProgressSink(rctx, progress), jobEntry, &jev)
+		g.jobMetrics(started, res, derr, &jev)
 		return jobOutcome(res, derr)
 	})
 	if plan.req != nil {
 		plan.req.started(job, err)
 	}
 	if err != nil {
+		if errors.Is(err, jobs.ErrTooManyActive) && plan.req == nil {
+			return run(ctx, c.entry, ev)
+		}
 		ev.Outcome, ev.ErrorClass = metrics.OutcomeError, "job"
-		return jobStartError(entry, err), nil
+		return jobStartError(c.entry, err), nil
 	}
 	ev.Outcome, ev.ErrorClass = metrics.OutcomeDeferred, "async_job"
 	if h != nil {
-		_ = g.audit.Write(ctx, audit.Event{
-			EventType: eventJobStarted, AgentID: agentID, UpstreamName: entry.upstream, ToolName: entry.tool.Name,
-			Reason: reason, ResultSummary: job.ID,
-		})
-	}
-	if h != nil && plan.afterMs > 0 {
-		if out, inline := h.WaitInline(ctx, time.Duration(plan.afterMs)*time.Millisecond); inline {
-			// Ended in time: the agent gets the answer as if the call ran
-			// inline (and no callback is sent).
-			res := live
-			if res == nil {
-				res = outcomeResult(out)
-			}
-			ev.Outcome, ev.ErrorClass = metrics.OutcomeOK, ""
-			if res.IsError {
-				ev.Outcome = metrics.OutcomeError
-			}
-			return res, nil
-		}
+		g.auditJobStarted(ctx, c, job)
 	}
 	return jobEnvelope(job), nil
+}
+
+// runAfter is the `after` mode: the call starts at once, inline, and only
+// a call still running after the plan's wait becomes a job (Adopt), so a
+// fast call stores nothing and takes no job slot. When the job budget is
+// full, or the server drains, the caller keeps waiting for the answer
+// inline.
+func (g *Gateway) runAfter(ctx context.Context, plan *asyncPlan, c jobCall, ev *metrics.Event, run jobRun) (*mcp.CallToolResult, error) {
+	jobEntry := c.entry
+	jobEntry.noCallTimeout = true
+	callCtx, cancelTimeout := context.WithTimeout(context.WithoutCancel(jobContext(ctx)), g.jobs.MaxDuration())
+	callCtx, cancelCall := context.WithCancel(callCtx)
+	cancel := func() { cancelCall(); cancelTimeout() }
+	relay := jobs.NewProgressRelay()
+	done := make(chan struct{})
+	base := *ev
+	jev := newJobEvent(base)
+	started := time.Now()
+	var res *mcp.CallToolResult
+	var derr error
+	go func() {
+		defer close(done)
+		defer func() {
+			if p := recover(); p != nil {
+				derr = fmt.Errorf("panic in %s: %v", c.entry.tool.Name, p)
+			}
+		}()
+		res, derr = run(withProgressSink(callCtx, relay.Report), jobEntry, &jev)
+	}()
+	wait := time.NewTimer(time.Duration(plan.afterMs) * time.Millisecond)
+	defer wait.Stop()
+	select {
+	case <-done:
+		cancel()
+		// Answered in time: as if it ran inline (and no callback is sent).
+		mergeEvent(ev, &jev)
+		return res, derr
+	case <-wait.C:
+	case <-ctx.Done():
+	}
+	job, err := g.jobs.Adopt(ctx, g.jobRequest(ctx, plan, c, ev), jobs.Adoption{
+		StartedAt: started, Cancel: cancel, Done: done, Relay: relay,
+		Outcome: func() jobs.Outcome {
+			g.jobMetrics(started, res, derr, &jev)
+			return jobOutcome(res, derr)
+		},
+	})
+	if err != nil {
+		// No job (budget full, draining): the call keeps running and its
+		// caller waits for it, as without async tools.
+		<-done
+		cancel()
+		mergeEvent(ev, &jev)
+		return res, derr
+	}
+	ev.Outcome, ev.ErrorClass = metrics.OutcomeDeferred, "async_job"
+	g.auditJobStarted(ctx, c, job)
+	return jobEnvelope(job), nil
+}
+
+// mergeEvent copies the dispatch's metric fields of a call that ended
+// inline onto the call's own event.
+func mergeEvent(ev, jev *metrics.Event) {
+	ev.Outcome, ev.ErrorClass, ev.UpstreamLatencyMs = jev.Outcome, jev.ErrorClass, jev.UpstreamLatencyMs
+}
+
+// auditJobStarted records that c became job.
+func (g *Gateway) auditJobStarted(ctx context.Context, c jobCall, job *jobs.Job) {
+	_ = g.audit.Write(ctx, audit.Event{
+		EventType: eventJobStarted, AgentID: c.agentID, UpstreamName: c.entry.upstream, ToolName: c.entry.tool.Name,
+		Reason: c.reason, ResultSummary: job.ID,
+	})
+}
+
+// recheckJob is the admission check again, when a queued job starts: the
+// caller's access, and the policy (a call the policy allowed must still be
+// allowed; a granted call must not be denied now). "" when it holds.
+func (g *Gateway) recheckJob(ctx context.Context, c jobCall) string {
+	if !g.allowsEntry(ctx, c.agentID, c.entry) {
+		_ = g.audit.Write(ctx, audit.Event{
+			EventType: audit.EventCallDenied, AgentID: c.agentID, UpstreamName: c.entry.upstream, ToolName: c.entry.tool.Name,
+			Decision: "deny", Reason: accessDeniedReason,
+		})
+		return "access to " + access.GroupOf(c.entry.upstream, c.entry.tool.Name) + " was removed before the job started; nothing ran"
+	}
+	d := g.decide(c.entry, c.agentID, c.intent, c.reason, c.args)
+	switch {
+	case d.Action == policy.ActionDeny:
+		return "denied by policy before the job started; nothing ran: " + d.Reason
+	case d.Action != policy.ActionAllow && !c.grant:
+		return "the call needs approval now (the policy changed while the job waited); nothing ran: ask with inbox.request"
+	}
+	return ""
+}
+
+// attachJobs wires the job service's audit log and the access guard that
+// stops running jobs whose agent lost access (disabled, blocked, server
+// access withdrawn).
+func (g *Gateway) attachJobs(svc *jobs.Service) {
+	svc.SetAuditor(jobAuditor{g: g})
+	svc.SetGuard(func(ctx context.Context, agentID, upstream, tool string) bool {
+		return g.scopeFor(ctx, agentID).AllowsTool(upstream, tool)
+	})
+}
+
+// jobAuditor writes the job events the job service decides itself.
+type jobAuditor struct{ g *Gateway }
+
+func (a jobAuditor) JobEvent(ctx context.Context, eventType string, j jobs.Job, detail string) {
+	_ = a.g.audit.Write(ctx, audit.Event{
+		EventType: eventType, AgentID: j.AgentID, UpstreamName: j.Upstream, ToolName: j.Tool,
+		Reason: j.Reason, ResultSummary: clipText(j.ID+": "+detail, 500),
+	})
 }
 
 // jobStartError is the answer when a job could not be stored.
@@ -327,17 +466,6 @@ func decodeJobResult(env string) (*mcp.CallToolResult, error) {
 		return nil, err
 	}
 	return &res, nil
-}
-
-// outcomeResult rebuilds a tool result from a job outcome.
-func outcomeResult(out jobs.Outcome) *mcp.CallToolResult {
-	if res, err := decodeJobResult(out.Envelope); err == nil && res != nil {
-		return res
-	}
-	if out.Status == jobs.StatusSucceeded {
-		return mcp.NewToolResultText("(the tool returned no content)")
-	}
-	return mcp.NewToolResultError(out.Error)
 }
 
 func metaTrue(res *mcp.CallToolResult, key string) bool {
@@ -591,7 +719,7 @@ func (g *Gateway) jobsTools() []toolEntry {
 				"agent_id": map[string]any{"type": "string", "description": "Owners and admins only (dashboard callers): one agent's jobs."},
 			}, nil, g.handleJobsList()),
 		entry(MetaJobsStart,
-			"Run any tool you may call as an async job and get its job_id at once: the call goes through the same access, policy and approval rules as a direct call (a call that needs permission answers as it always does and starts no job). Use it for slow tools, or from code mode to start work and wait for it with jobs.wait. callback_ref (optional) names a receiver for a job.completed or job.failed callback.",
+			"Run any tool you may call as an async job and get its job_id at once: the call goes through the same access, policy and approval rules as a direct call (a call that needs permission answers as it always does and starts no job). Use it for slow tools, or from code mode to start work and wait for it with jobs.wait. Called inside a job (a script that itself runs as a job), the call runs inline there and its result is the tool's own. callback_ref (optional) names a receiver for a job.completed or job.failed callback.",
 			map[string]any{
 				"tool":         map[string]any{"type": "string", "description": "Catalog name of the tool (as tools.search shows it)."},
 				"arguments":    map[string]any{"type": "object", "description": "The tool's arguments. _reason on this call is used when they carry none."},

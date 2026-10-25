@@ -28,28 +28,67 @@ type asyncCache struct {
 	asyncMu     sync.Mutex
 	asyncLoaded time.Time
 	asyncByName map[string]jobs.AsyncSetting
+	// asyncLoading is non-nil while one reload runs; asyncGen counts local
+	// writes, so a reload that read before a write does not undo it.
+	asyncLoading chan struct{}
+	asyncGen     uint64
 }
 
 // AsyncSetting is the named server's async setting (zero when it has
 // none). It implements gateway.AsyncPolicy and is read on every routed
-// call, from a copy reloaded at most every asyncCacheTTL.
+// call, from a copy reloaded at most every asyncCacheTTL. The reload runs
+// outside the lock, one at a time, and the stale copy answers meanwhile;
+// only the very first read waits for it.
 func (s *Service) AsyncSetting(name string) jobs.AsyncSetting {
 	s.asyncMu.Lock()
-	defer s.asyncMu.Unlock()
-	if s.asyncByName == nil || time.Since(s.asyncLoaded) > asyncCacheTTL {
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		m, err := s.loadAsync(ctx)
-		cancel()
-		switch {
-		case err == nil:
-			s.asyncByName = m
-		case s.asyncByName == nil:
-			// Keep answering (nothing async) and try again after the TTL.
-			s.asyncByName = map[string]jobs.AsyncSetting{}
+	stale := s.asyncByName == nil || time.Since(s.asyncLoaded) > asyncCacheTTL
+	if stale && s.asyncLoading == nil {
+		ch := make(chan struct{})
+		s.asyncLoading = ch
+		gen := s.asyncGen
+		if s.asyncByName != nil {
+			s.asyncMu.Unlock()
+			go s.reloadAsync(ch, gen)
+			s.asyncMu.Lock()
+		} else {
+			s.asyncMu.Unlock()
+			s.reloadAsync(ch, gen)
+			s.asyncMu.Lock()
 		}
+	}
+	if s.asyncByName == nil && s.asyncLoading != nil {
+		ch := s.asyncLoading
+		s.asyncMu.Unlock()
+		select {
+		case <-ch:
+		case <-time.After(3 * time.Second):
+		}
+		s.asyncMu.Lock()
+	}
+	set := s.asyncByName[name]
+	s.asyncMu.Unlock()
+	return set
+}
+
+// reloadAsync reads the settings and installs them unless a local write
+// happened meanwhile (then the next read reloads).
+func (s *Service) reloadAsync(done chan struct{}, gen uint64) {
+	defer close(done)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	m, err := s.loadAsync(ctx)
+	cancel()
+	s.asyncMu.Lock()
+	defer s.asyncMu.Unlock()
+	s.asyncLoading = nil
+	switch {
+	case err == nil && gen == s.asyncGen:
+		s.asyncByName, s.asyncLoaded = m, time.Now()
+	case s.asyncByName == nil:
+		// Keep answering (nothing async) and try again after the TTL.
+		s.asyncByName, s.asyncLoaded = map[string]jobs.AsyncSetting{}, time.Now()
+	case err != nil:
 		s.asyncLoaded = time.Now()
 	}
-	return s.asyncByName[name]
 }
 
 // loadAsync reads every stored async setting.
@@ -110,12 +149,19 @@ func (s *Service) SetAsync(ctx context.Context, name string, set jobs.AsyncSetti
 		return nil, ErrNotFound
 	}
 	s.asyncMu.Lock()
+	s.asyncGen++
 	if s.asyncByName != nil {
-		if out != nil {
-			s.asyncByName[name] = *out
-		} else {
-			delete(s.asyncByName, name)
+		// Copy on write: readers hold the old map without the lock.
+		next := make(map[string]jobs.AsyncSetting, len(s.asyncByName)+1)
+		for k, v := range s.asyncByName {
+			next[k] = v
 		}
+		if out != nil {
+			next[name] = *out
+		} else {
+			delete(next, name)
+		}
+		s.asyncByName = next
 	}
 	s.asyncMu.Unlock()
 	// tools/list marks async tools for MCP Tasks clients.

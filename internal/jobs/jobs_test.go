@@ -151,6 +151,9 @@ func TestLargeResultsGoToTheBlobStoreAndArePurged(t *testing.T) {
 	if env, err := svc.Result(ctx, got); err != nil || env != big {
 		t.Fatalf("Result from blob = %d bytes, %v", len(env), err)
 	}
+	if ok, _ := blobs.Exists(ctx, jobBlobKey(big)); !ok {
+		t.Fatal("the result is not under its domain-separated key")
+	}
 	var inline sql.NullString
 	if err := db.QueryRow(`SELECT result FROM tool_jobs WHERE id = ?`, job.ID).Scan(&inline); err != nil || inline.Valid {
 		t.Fatalf("inline result kept: %v %v", inline, err)
@@ -169,8 +172,13 @@ func TestLargeResultsGoToTheBlobStoreAndArePurged(t *testing.T) {
 	if _, err := svc.Get(ctx, job.ID); !errors.Is(err, jobs.ErrNotFound) {
 		t.Fatalf("purged job still readable: %v", err)
 	}
-	if ok, _ := blobs.Exists(ctx, sha256Hex(big)); ok {
+	if ok, _ := blobs.Exists(ctx, jobBlobKey(big)); ok {
 		t.Fatal("the result blob outlived its job")
+	}
+	// The key is domain-separated: never the content's own sha256, which
+	// an Inbox attachment of the same bytes would use.
+	if jobBlobKey(big) == sha256Hex(big) {
+		t.Fatal("job blob key equals the content hash")
 	}
 }
 
@@ -178,6 +186,8 @@ func sha256Hex(s string) string {
 	sum := sha256.Sum256([]byte(s))
 	return hex.EncodeToString(sum[:])
 }
+
+func jobBlobKey(env string) string { return sha256Hex("tool_job\x00" + env) }
 
 func TestCancelARunningJob(t *testing.T) {
 	db := storetest.Open(t)
@@ -255,49 +265,6 @@ func TestCancelAQueuedJobRunsNothing(t *testing.T) {
 	case <-done:
 		t.Fatal("a cancelled queued job ran")
 	case <-time.After(200 * time.Millisecond):
-	}
-}
-
-func TestInlineWaitSkipsTheCallbackOnlyWhenTheCallerGotTheResult(t *testing.T) {
-	db := storetest.Open(t)
-	n := &recNotifier{}
-	svc := newService(t, db, jobs.Options{Notifier: n})
-	ctx := context.Background()
-
-	fast := startReq("ag_1", "alpha.get_fast")
-	fast.InlineWait = true
-	job, h, err := svc.Start(ctx, fast, func(context.Context, jobs.ProgressFunc) jobs.Outcome {
-		return jobs.Outcome{Status: jobs.StatusSucceeded, Envelope: "fast"}
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	out, inline := h.WaitInline(ctx, 5*time.Second)
-	if !inline || out.Envelope != "fast" {
-		t.Fatalf("WaitInline = %+v %v", out, inline)
-	}
-	waitFinal(t, svc, job.ID)
-	if _, ok := n.find(job.ID); ok {
-		t.Fatal("a result delivered inline also sent a callback")
-	}
-
-	slow := startReq("ag_1", "alpha.get_slow")
-	slow.InlineWait = true
-	release := make(chan struct{})
-	job2, h2, err := svc.Start(ctx, slow, func(context.Context, jobs.ProgressFunc) jobs.Outcome {
-		<-release
-		return jobs.Outcome{Status: jobs.StatusSucceeded, Envelope: "slow"}
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if _, inline := h2.WaitInline(ctx, 50*time.Millisecond); inline {
-		t.Fatal("a slow job was delivered inline")
-	}
-	close(release)
-	waitFinal(t, svc, job2.ID)
-	if _, ok := n.find(job2.ID); !ok {
-		t.Fatal("a job handed back as a job id sent no callback")
 	}
 }
 
@@ -381,24 +348,28 @@ func TestProgressIsRecorded(t *testing.T) {
 	svc := newService(t, db, jobs.Options{})
 	ctx := context.Background()
 	release := make(chan struct{})
+	reported := make(chan struct{})
 	job, _, err := svc.Start(ctx, startReq("ag_1", "alpha.get_slow"), func(ctx context.Context, progress jobs.ProgressFunc) jobs.Outcome {
 		total := 4.0
+		// Neither call touches the database on this goroutine.
 		progress(1, &total, "a quarter")
-		progress(2, &total, "half") // within a second: kept for the heartbeat
+		progress(2, &total, "half")
+		close(reported)
 		<-release
 		return jobs.Outcome{Status: jobs.StatusSucceeded}
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	waitUntil(t, "first progress", func() bool {
+	<-reported
+	waitUntil(t, "the latest progress", func() bool {
+		svc.Heartbeat(ctx)
 		j, _ := svc.Get(ctx, job.ID)
-		return j != nil && j.Progress != nil && j.Progress.Message == "a quarter"
+		return j != nil && j.Progress != nil && j.Progress.Message == "half"
 	})
-	svc.Heartbeat(ctx)
 	j, _ := svc.Get(ctx, job.ID)
-	if j.Progress == nil || j.Progress.Progress != 2 || j.Progress.Total == nil || *j.Progress.Total != 4 || j.Progress.Message != "half" {
-		t.Fatalf("progress after the heartbeat = %+v", j.Progress)
+	if j.Progress.Progress != 2 || j.Progress.Total == nil || *j.Progress.Total != 4 {
+		t.Fatalf("progress = %+v", j.Progress)
 	}
 	close(release)
 	waitFinal(t, svc, job.ID)
@@ -474,6 +445,8 @@ func TestRecoveryTakesOnlyExpiredLeases(t *testing.T) {
 	nB := &recNotifier{}
 	a := newService(t, db, jobs.Options{InstanceID: "node-a", LeaseTTL: lease, MaxRunning: 1})
 	b := newService(t, db, jobs.Options{InstanceID: "node-b", LeaseTTL: lease, Notifier: nB})
+	audB := &recAuditor{}
+	b.SetAuditor(audB)
 	ctx := context.Background()
 
 	aCtx, stopA := context.WithCancel(ctx)
@@ -538,6 +511,9 @@ func TestRecoveryTakesOnlyExpiredLeases(t *testing.T) {
 	if _, ok := nB.find(running.ID); !ok {
 		t.Fatal("recovery of the running job sent no notice")
 	}
+	if !audB.has(jobs.EventJobRecovered, running.ID) || !audB.has(jobs.EventJobRecovered, queued.ID) {
+		t.Fatal("recovery wrote no job.recovered audit rows")
+	}
 	// A second pass finds nothing, and nothing ran twice.
 	if f, u, err := b.Recover(ctx); err != nil || f+u != 0 {
 		t.Fatalf("second Recover = %d %d %v", f, u, err)
@@ -579,5 +555,312 @@ func TestShutdownStopsRunningJobsAsOutcomeUnknown(t *testing.T) {
 	j, _ := svc.Get(ctx, job.ID)
 	if j.Status != jobs.StatusOutcomeUnknown {
 		t.Fatalf("job after shutdown = %+v", j)
+	}
+}
+
+// recAuditor records the job events the service reports.
+type recAuditor struct {
+	mu  sync.Mutex
+	got []string
+}
+
+func (a *recAuditor) JobEvent(_ context.Context, eventType string, j jobs.Job, _ string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.got = append(a.got, eventType+" "+j.ID)
+}
+
+func (a *recAuditor) has(eventType, id string) bool {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	for _, g := range a.got {
+		if g == eventType+" "+id {
+			return true
+		}
+	}
+	return false
+}
+
+func blockUntil(release <-chan struct{}) jobs.RunFunc {
+	return func(ctx context.Context, _ jobs.ProgressFunc) jobs.Outcome {
+		select {
+		case <-release:
+		case <-ctx.Done():
+		}
+		return jobs.Outcome{Status: jobs.StatusSucceeded}
+	}
+}
+
+func TestAdoptRecordsACallAlreadyRunning(t *testing.T) {
+	db := storetest.Open(t)
+	n := &recNotifier{}
+	svc := newService(t, db, jobs.Options{Notifier: n})
+	ctx := context.Background()
+	relay := jobs.NewProgressRelay()
+	total := 2.0
+	relay.Report(1, &total, "before the job existed")
+	done := make(chan struct{})
+	var out jobs.Outcome
+	job, err := svc.Adopt(ctx, startReq("ag_1", "alpha.get_slow"), jobs.Adoption{
+		StartedAt: time.Now().Add(-time.Second), Cancel: func() {}, Done: done, Relay: relay,
+		Outcome: func() jobs.Outcome { return out },
+	})
+	if err != nil || job.Status != jobs.StatusRunning || job.StartedAt == 0 {
+		t.Fatalf("Adopt = %+v %v", job, err)
+	}
+	waitUntil(t, "the relayed progress", func() bool {
+		svc.Heartbeat(ctx)
+		j, _ := svc.Get(ctx, job.ID)
+		return j != nil && j.Progress != nil && j.Progress.Message == "before the job existed"
+	})
+	out = jobs.Outcome{Status: jobs.StatusSucceeded, Envelope: "late answer"}
+	close(done)
+	got := waitFinal(t, svc, job.ID)
+	if env, _ := svc.Result(ctx, got); got.Status != jobs.StatusSucceeded || env != "late answer" {
+		t.Fatalf("adopted job = %+v %q", got, env)
+	}
+	if _, ok := n.find(job.ID); !ok {
+		t.Fatal("an adopted job sent no notice")
+	}
+}
+
+func TestAdoptedJobCancelStopsTheCall(t *testing.T) {
+	db := storetest.Open(t)
+	svc := newService(t, db, jobs.Options{})
+	ctx := context.Background()
+	done := make(chan struct{})
+	var once sync.Once
+	job, err := svc.Adopt(ctx, startReq("ag_1", "alpha.get_slow"), jobs.Adoption{
+		StartedAt: time.Now(), Done: done,
+		Cancel:  func() { once.Do(func() { close(done) }) },
+		Outcome: func() jobs.Outcome { return jobs.Outcome{Status: jobs.StatusOutcomeUnknown, Error: "context canceled"} },
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, cancelled, err := svc.Cancel(ctx, job.ID); err != nil || !cancelled {
+		t.Fatalf("Cancel = %v %v", cancelled, err)
+	}
+	if got := waitFinal(t, svc, job.ID); got.Status != jobs.StatusCancelled {
+		t.Fatalf("adopted job after cancel = %+v", got)
+	}
+}
+
+func TestOwnerAndAnonymousCaps(t *testing.T) {
+	db := storetest.Open(t)
+	svc := newService(t, db, jobs.Options{MaxActive: 10, MaxActivePerOwner: 2, MaxActiveAnonymous: 1})
+	ctx := context.Background()
+	release := make(chan struct{})
+	defer close(release)
+	for _, agent := range []string{"ag_1", "ag_2"} {
+		if _, _, err := svc.Start(ctx, startReq(agent, "alpha.get_slow"), blockUntil(release)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, _, err := svc.Start(ctx, startReq("ag_3", "alpha.get_slow"), blockUntil(release)); !errors.Is(err, jobs.ErrTooManyActive) {
+		t.Fatalf("a third job of owner u_1 = %v", err)
+	}
+	other := startReq("ag_4", "alpha.get_slow")
+	other.OwnerUserID = "u_2"
+	if _, _, err := svc.Start(ctx, other, blockUntil(release)); err != nil {
+		t.Fatalf("another owner is not capped by u_1: %v", err)
+	}
+	anon := startReq("", "alpha.get_slow")
+	anon.OwnerUserID = ""
+	if _, _, err := svc.Start(ctx, anon, blockUntil(release)); err != nil {
+		t.Fatal(err)
+	}
+	if _, _, err := svc.Start(ctx, anon, blockUntil(release)); !errors.Is(err, jobs.ErrTooManyActive) {
+		t.Fatalf("a second anonymous job = %v", err)
+	}
+}
+
+// Concurrent starts never pass the cap together: the count and the insert
+// are one step (an advisory lock on Postgres).
+func TestConcurrentStartsKeepTheCap(t *testing.T) {
+	db := storetest.Open(t)
+	svc := newService(t, db, jobs.Options{MaxActive: 3})
+	ctx := context.Background()
+	release := make(chan struct{})
+	defer close(release)
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	ok := 0
+	for i := 0; i < 10; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			if _, _, err := svc.Start(ctx, startReq("ag_1", "alpha.get_slow"), blockUntil(release)); err == nil {
+				mu.Lock()
+				ok++
+				mu.Unlock()
+			}
+		}()
+	}
+	wg.Wait()
+	if ok != 3 {
+		t.Fatalf("%d concurrent starts passed a cap of 3", ok)
+	}
+}
+
+func TestRunSlotsAreSharedBetweenAgents(t *testing.T) {
+	db := storetest.Open(t)
+	svc := newService(t, db, jobs.Options{MaxRunning: 2, MaxRunningPerAgent: 1})
+	ctx := context.Background()
+	release := make(chan struct{})
+	defer close(release)
+	running := func(id string) bool { j, _ := svc.Get(ctx, id); return j != nil && j.Status == jobs.StatusRunning }
+	a1, _, _ := svc.Start(ctx, startReq("ag_1", "alpha.get_slow"), blockUntil(release))
+	waitUntil(t, "ag_1's first job running", func() bool { return running(a1.ID) })
+	a2, _, _ := svc.Start(ctx, startReq("ag_1", "alpha.get_slow"), blockUntil(release))
+	b1req := startReq("ag_2", "alpha.get_slow")
+	b1req.OwnerUserID = "u_2"
+	b1, _, _ := svc.Start(ctx, b1req, blockUntil(release))
+	waitUntil(t, "ag_2's job running beside ag_1's", func() bool { return running(b1.ID) })
+	if running(a2.ID) {
+		t.Fatal("ag_1 took more than its share of the run slots")
+	}
+}
+
+func TestUserCancelKeepsTheCallsOwnAnswer(t *testing.T) {
+	db := storetest.Open(t)
+	svc := newService(t, db, jobs.Options{})
+	ctx := context.Background()
+	job, _, err := svc.Start(ctx, startReq("ag_1", "alpha.get_slow"), func(ctx context.Context, _ jobs.ProgressFunc) jobs.Outcome {
+		<-ctx.Done()
+		return jobs.Outcome{Status: jobs.StatusFailed, Envelope: "tool error", IsError: true, Error: "tool error"}
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitUntil(t, "running", func() bool { j, _ := svc.Get(ctx, job.ID); return j != nil && j.Status == jobs.StatusRunning })
+	if _, _, err := svc.Cancel(ctx, job.ID); err != nil {
+		t.Fatal(err)
+	}
+	if got := waitFinal(t, svc, job.ID); got.Status != jobs.StatusFailed || got.Error != "tool error" {
+		t.Fatalf("a call that answered after the cancel = %+v", got)
+	}
+}
+
+// A run whose row another replica settled (its lease lapsed) is stopped
+// at the next heartbeat, and its late outcome is not kept.
+func TestHeartbeatStopsARunThatLostItsRow(t *testing.T) {
+	db := storetest.Open(t)
+	svc := newService(t, db, jobs.Options{})
+	ctx := context.Background()
+	stopped := make(chan struct{})
+	job, _, err := svc.Start(ctx, startReq("ag_1", "alpha.get_slow"), func(ctx context.Context, _ jobs.ProgressFunc) jobs.Outcome {
+		<-ctx.Done()
+		close(stopped)
+		return jobs.Outcome{Status: jobs.StatusSucceeded, Envelope: "late"}
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitUntil(t, "running", func() bool { j, _ := svc.Get(ctx, job.ID); return j != nil && j.Status == jobs.StatusRunning })
+	if _, err := db.ExecContext(ctx, `UPDATE tool_jobs SET status = 'outcome_unknown', finished_at = 1 WHERE id = ?`, job.ID); err != nil {
+		t.Fatal(err)
+	}
+	svc.Heartbeat(ctx)
+	select {
+	case <-stopped:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the run that lost its row was not stopped")
+	}
+	waitUntil(t, "the goroutine to end", func() bool { return svc.Running() == 0 })
+	if j, _ := svc.Get(ctx, job.ID); j.Status != jobs.StatusOutcomeUnknown || j.HasResult() {
+		t.Fatalf("row after the lost run = %+v", j)
+	}
+}
+
+func TestGuardStopsAJobWhoseAccessWasRemoved(t *testing.T) {
+	db := storetest.Open(t)
+	svc := newService(t, db, jobs.Options{})
+	aud := &recAuditor{}
+	svc.SetAuditor(aud)
+	var mu sync.Mutex
+	revoked := map[string]bool{}
+	svc.SetGuard(func(_ context.Context, agentID, _, _ string) bool {
+		mu.Lock()
+		defer mu.Unlock()
+		return !revoked[agentID]
+	})
+	ctx := context.Background()
+	job, _, err := svc.Start(ctx, startReq("ag_1", "alpha.get_slow"), func(ctx context.Context, _ jobs.ProgressFunc) jobs.Outcome {
+		<-ctx.Done()
+		return jobs.Outcome{Status: jobs.StatusOutcomeUnknown, Error: "context canceled"}
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitUntil(t, "running", func() bool { j, _ := svc.Get(ctx, job.ID); return j != nil && j.Status == jobs.StatusRunning })
+	svc.Heartbeat(ctx)
+	if j, _ := svc.Get(ctx, job.ID); j.Final() {
+		t.Fatal("the guard stopped a job that still has access")
+	}
+	mu.Lock()
+	revoked["ag_1"] = true
+	mu.Unlock()
+	svc.Heartbeat(ctx)
+	got := waitFinal(t, svc, job.ID)
+	if got.Status != jobs.StatusCancelled || !strings.Contains(got.Error, "access to this tool was removed") {
+		t.Fatalf("revoked job = %+v", got)
+	}
+	waitUntil(t, "the revoked audit row", func() bool { return aud.has(jobs.EventJobRevoked, job.ID) })
+}
+
+func TestOrphanedResultBlobIsDeleted(t *testing.T) {
+	db := storetest.Open(t)
+	blobs, err := blobstore.NewLocal(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	svc := newService(t, db, jobs.Options{Blobs: blobs, InlineLimit: 16})
+	ctx := context.Background()
+	release := make(chan struct{})
+	big := strings.Repeat("y", 300)
+	job, _, err := svc.Start(ctx, startReq("ag_1", "alpha.get_big"), func(ctx context.Context, _ jobs.ProgressFunc) jobs.Outcome {
+		<-release
+		return jobs.Outcome{Status: jobs.StatusSucceeded, Envelope: big}
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitUntil(t, "running", func() bool { j, _ := svc.Get(ctx, job.ID); return j != nil && j.Status == jobs.StatusRunning })
+	// Another replica settled it meanwhile.
+	if _, err := db.ExecContext(ctx, `UPDATE tool_jobs SET status = 'outcome_unknown', finished_at = 1 WHERE id = ?`, job.ID); err != nil {
+		t.Fatal(err)
+	}
+	close(release)
+	waitUntil(t, "the goroutine to end", func() bool { return svc.Running() == 0 })
+	if ok, _ := blobs.Exists(ctx, jobBlobKey(big)); ok {
+		t.Fatal("a result blob for a row that did not move was kept")
+	}
+}
+
+func TestNeverStartedJobIsAudited(t *testing.T) {
+	db := storetest.Open(t)
+	svc := jobs.New(db, jobs.Options{PollEvery: 20 * time.Millisecond, MaxRunning: 1})
+	aud := &recAuditor{}
+	svc.SetAuditor(aud)
+	ctx := context.Background()
+	if _, _, err := svc.Start(ctx, startReq("ag_1", "alpha.get_slow"), func(ctx context.Context, _ jobs.ProgressFunc) jobs.Outcome {
+		<-ctx.Done()
+		return jobs.Outcome{Status: jobs.StatusOutcomeUnknown}
+	}); err != nil {
+		t.Fatal(err)
+	}
+	queued, _, err := svc.Start(ctx, startReq("ag_2", "alpha.get_other"), blockUntil(make(chan struct{})))
+	if err != nil {
+		t.Fatal(err)
+	}
+	stop, cancel := context.WithTimeout(ctx, 50*time.Millisecond)
+	defer cancel()
+	svc.Wait(stop)
+	if j, _ := svc.Get(ctx, queued.ID); j.Status != jobs.StatusFailed || j.StartedAt != 0 {
+		t.Fatalf("queued job after shutdown = %+v", j)
+	}
+	if !aud.has(jobs.EventJobNotStarted, queued.ID) {
+		t.Fatal("no job.not_started audit row")
 	}
 }

@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/tusharbhardwaj/toolyard/internal/access"
 	"github.com/tusharbhardwaj/toolyard/internal/audit"
 	"github.com/tusharbhardwaj/toolyard/internal/gateway"
 	"github.com/tusharbhardwaj/toolyard/internal/identity"
@@ -16,6 +17,7 @@ import (
 	"github.com/tusharbhardwaj/toolyard/internal/memory"
 	"github.com/tusharbhardwaj/toolyard/internal/policy"
 	"github.com/tusharbhardwaj/toolyard/internal/realtime"
+	"github.com/tusharbhardwaj/toolyard/internal/store"
 	"github.com/tusharbhardwaj/toolyard/internal/store/storetest"
 )
 
@@ -24,14 +26,21 @@ import (
 // fixture.echo tool is allowed by policy.
 type jobsEnv struct {
 	h     http.Handler
+	db    *store.DB
 	tokA  string
 	tokB  string
 	opTok string
 }
 
+// grantedGroups is an access resolver that grants every caller the same
+// server groups.
+type grantedGroups map[string]bool
+
+func (g grantedGroups) ScopeFor(context.Context, string) access.Scope { return access.Scope{Groups: g} }
+
 const jobsRouteReason = "check the async job routes answer correctly"
 
-func newJobsEnv(t *testing.T) *jobsEnv {
+func newJobsEnv(t *testing.T, resolver ...access.Resolver) *jobsEnv {
 	t.Helper()
 	ctx := context.Background()
 	db := storetest.Open(t)
@@ -58,7 +67,11 @@ func newJobsEnv(t *testing.T) *jobsEnv {
 	}
 	svc := jobs.New(db, jobs.Options{PollEvery: 20 * time.Millisecond})
 	auditLog := audit.New(db)
-	gw := gateway.New(gateway.Options{Policy: pol, Audit: auditLog, Memory: memory.New(db), Hub: realtime.NewHub(), Jobs: svc})
+	gopts := gateway.Options{Policy: pol, Audit: auditLog, Memory: memory.New(db), Hub: realtime.NewHub(), Jobs: svc}
+	if len(resolver) > 0 {
+		gopts.Access = resolver[0]
+	}
+	gw := gateway.New(gopts)
 	gw.RegisterBuiltins()
 	t.Cleanup(func() {
 		wctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -78,7 +91,7 @@ func newJobsEnv(t *testing.T) *jobsEnv {
 	var h http.Handler = srv.RoleGuard(mux)
 	h = srv.HardenAPI(h)
 	h = srv.EnforceOriginOnMutations(h)
-	return &jobsEnv{h: h, tokA: tokA, tokB: tokB, opTok: opTok}
+	return &jobsEnv{h: h, db: db, tokA: tokA, tokB: tokB, opTok: opTok}
 }
 
 func (e *jobsEnv) do(t *testing.T, method, path, token, body string, hdr ...string) *httptest.ResponseRecorder {
@@ -197,5 +210,25 @@ func TestJobRoutesIdempotencyAndRefusals(t *testing.T) {
 	}
 	if rec := e.do(t, http.MethodGet, "/v1/jobs?status=weird", e.tokA, ""); rec.Code != http.StatusBadRequest {
 		t.Fatalf("bad status filter = %d", rec.Code)
+	}
+}
+
+// POST /v1/jobs on a tool the caller was never granted answers like an
+// unknown tool and stores nothing.
+func TestJobRoutesUngrantedToolStartsNothing(t *testing.T) {
+	e := newJobsEnv(t, grantedGroups{"fixture": true})
+	body := `{"tool":"memory.get","arguments":{"key":"x"},"reason":"` + jobsRouteReason + `"}`
+	rec := e.do(t, http.MethodPost, "/v1/jobs", e.tokA, body)
+	if v := decodeMap(t, rec); rec.Code != http.StatusUnprocessableEntity || v["status"] != "not_started" || !strings.Contains(rec.Body.String(), "not found") {
+		t.Fatalf("ungranted tool = %d %s", rec.Code, rec.Body.String())
+	}
+	var n int
+	if err := e.db.QueryRow(`SELECT COUNT(*) FROM tool_jobs`).Scan(&n); err != nil || n != 0 {
+		t.Fatalf("%d jobs stored for an ungranted tool (%v)", n, err)
+	}
+	// The granted tool still runs.
+	rec = e.do(t, http.MethodPost, "/v1/jobs", e.tokA, startBody("granted"), "Prefer", "wait=10")
+	if v := decodeMap(t, rec); rec.Code != http.StatusOK || v["status"] != jobs.StatusSucceeded {
+		t.Fatalf("granted tool = %d %s", rec.Code, rec.Body.String())
 	}
 }

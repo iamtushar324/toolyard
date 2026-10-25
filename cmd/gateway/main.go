@@ -1364,8 +1364,9 @@ func runServe(argv []string) error {
 	// open ones with the other waiters (lifecycle.go).
 	mcpStreams := newMCPStreamGate()
 	// MCP Tasks are answered from the jobs table (any replica), in front
-	// of the transport and after the token check.
-	mcpHandler := gw.MCPTasks(streamable, mcpAuthn.contextFunc)
+	// of the transport and after the token check, with the transport's
+	// own DNS rebinding protection (off with -public-url, as above).
+	mcpHandler := gw.MCPTasks(streamable, mcpAuthn.contextFunc, *publicURL == "")
 	mux.Handle("/mcp", mcpStreams.wrap(api.LimitBody(gateway.PreserveToolCallNumbers(mcpAuthn.guard(mcpHandler)), 16<<20)))
 	mux.Handle("/mcp/", mcpStreams.wrap(api.LimitBody(gateway.PreserveToolCallNumbers(mcpAuthn.guard(mcpHandler)), 16<<20)))
 

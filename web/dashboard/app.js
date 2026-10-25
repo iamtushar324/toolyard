@@ -2950,7 +2950,8 @@ function parseAsyncTools(text) {
   for (const raw of String(text || '').split('\n')) {
     const line = raw.trim();
     if (!line) continue;
-    const i = line.indexOf(':');
+    // The rule never holds a colon; a tool name may (split at the last).
+    const i = line.lastIndexOf(':');
     const name = i > 0 ? line.slice(0, i).trim() : '';
     const rule = i > 0 ? line.slice(i + 1).trim().split(/\s+/) : [];
     if (name && (rule[0] === 'always' || rule[0] === 'off') && rule.length === 1) tools[name] = { mode: rule[0] };
