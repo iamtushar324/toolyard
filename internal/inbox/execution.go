@@ -61,13 +61,33 @@ func (s *Service) FinishExecution(ctx context.Context, g *Grant, state string, r
 	if err != nil {
 		return err
 	}
-	res, err := s.db.ExecContext(ctx, `UPDATE inbox_executions SET state=?,finished_at=?,result=?,error=? WHERE grant_id=? AND agent_id=? AND attempt_id=? AND state=?`, state, s.now().UnixMilli(), string(encoded), nullStr(detail), g.ID, g.AgentID, g.AttemptID, ExecutionRunning)
+	// The outcome and its execution.completed callback event commit
+	// together, so a receiver hears of every recorded outcome.
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	finished := s.now().UnixMilli()
+	res, err := tx.ExecContext(ctx, `UPDATE inbox_executions SET state=?,finished_at=?,result=?,error=? WHERE grant_id=? AND agent_id=? AND attempt_id=? AND state=?`, state, finished, string(encoded), nullStr(detail), g.ID, g.AgentID, g.AttemptID, ExecutionRunning)
 	if err != nil {
 		return err
 	}
 	n, _ := res.RowsAffected()
 	if n != 1 {
 		return ErrConflict
+	}
+	if cb, ok := s.opts.Callbacks.(ExecutionCallbacks); ok {
+		e := &Execution{GrantID: g.ID, RequestID: g.RequestID, CallID: g.CallID, State: state, AttemptID: g.AttemptID, FinishedAt: finished, Error: detail}
+		if err := tx.QueryRowContext(ctx, `SELECT started_at FROM inbox_executions WHERE grant_id=?`, g.ID).Scan(&e.StartedAt); err != nil {
+			return err
+		}
+		if err := cb.ExecutionTx(ctx, tx, e, g.AgentID, g.Tool); err != nil {
+			return err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return err
 	}
 	s.publish("execution", map[string]any{"request_id": g.RequestID, "call_id": g.CallID, "state": state})
 	return nil

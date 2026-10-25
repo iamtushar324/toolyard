@@ -65,6 +65,9 @@ func metaProps() map[string]any {
 		SessionField: map[string]any{
 			"type": "string", "description": sessionPropDescription,
 		},
+		callbackRefArg: map[string]any{
+			"type": "string", "maxLength": maxCallbackRef, "description": callbackRefPropDescription,
+		},
 	}
 }
 
@@ -152,6 +155,15 @@ func wrapSchema(t mcp.Tool) (mcp.Tool, string) {
 			"description": sessionPropDescription,
 		}
 	}
+	// A tool's own _callback_ref keeps its schema, and its argument
+	// (ownCallbackRef).
+	if _, has := props[callbackRefArg]; !has {
+		props[callbackRefArg] = map[string]any{
+			"type":        "string",
+			"maxLength":   maxCallbackRef,
+			"description": callbackRefPropDescription,
+		}
+	}
 	required = appendUnique(required, field)
 
 	out := t
@@ -219,7 +231,7 @@ func extractReasonOpt(args map[string]any, fieldName string, optional bool) (str
 
 	out := make(map[string]any, len(args))
 	for k, v := range args {
-		if k == fieldName || k == IntentField || k == ApprovalIDField || k == GrantField || k == SessionField {
+		if k == fieldName || k == IntentField || k == ApprovalIDField || k == GrantField || k == SessionField || k == callbackRefArg {
 			continue
 		}
 		out[k] = v

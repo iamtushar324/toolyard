@@ -103,6 +103,9 @@ func (j *GeminiJudge) Review(ctx context.Context, r *Request) (*Review, error) {
 	if len(r.Options) > 0 {
 		in["options"] = r.Options
 	}
+	if len(r.Questions) > 0 {
+		in["questions"] = r.Questions
+	}
 	b, err := json.MarshalIndent(in, "", "  ")
 	if err != nil {
 		return nil, err
