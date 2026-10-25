@@ -1,11 +1,19 @@
 package skillhub
 
 // The GitHub side of an approved change proposal: with the source
-// creator's own GitHub connection, find what an earlier attempt already
-// wrote (the pull request, then the branch), and write only what is
-// missing: a tree and a commit on the base commit, the branch
-// toolyard/skills/<proposal id>, and the pull request into the source
-// branch.
+// creator's own GitHub connection, compute the tree the owner approved
+// (the base commit with the proposed files), find what an earlier attempt
+// already wrote (the pull request, then the branch), and write only what
+// is missing: a commit of that tree on the base commit, the proposal's
+// branch, and the pull request into the source branch.
+//
+// Nothing found on GitHub is adopted on trust. A branch is ours only when
+// its head commit has the base commit as its only parent and exactly the
+// approved tree; a pull request only when, in addition, the creator's own
+// GitHub account opened it from that branch into the source branch.
+// (Commit authorship is not checked: anyone can write any author into a
+// commit, so the tree is what proves the content.) Anything else fails the
+// proposal; toolyard never builds on content it did not write.
 
 import (
 	"context"
@@ -82,16 +90,26 @@ func (c *ChangeProposals) apply(ctx context.Context, row *proposalRow) (string, 
 	return c.openPull(ctx, gh, row, &ci)
 }
 
-// openPull reconciles first (an earlier attempt's pull request, then its
-// branch) and writes only what is missing.
+// openPull computes the approved tree, reconciles with GitHub (an earlier
+// pull request, then an earlier branch) and writes only what is missing.
 func (c *ChangeProposals) openPull(ctx context.Context, gh *githubapi.Client, row *proposalRow, ci *changeInput) (string, error) {
-	branch := ChangeBranchPrefix + row.ID
-	marker := changeMarkerPrefix + row.ID
+	branch := ci.branchFor(row.ID)
+	me, err := gh.User(ctx)
+	if err != nil {
+		return "", changeGitHubError("read your GitHub account", ci, err)
+	}
+	tree, err := c.approvedTree(ctx, gh, ci)
+	if err != nil {
+		return "", err
+	}
 	pr, err := gh.FindPullByHead(ctx, ci.Owner, ci.Repo, branch)
 	if err != nil {
 		return "", changeGitHubError("look for an earlier pull request of this proposal", ci, err)
 	}
 	if pr != nil {
+		if err := c.checkOurPull(ctx, gh, ci, branch, pr, me, tree); err != nil {
+			return "", err
+		}
 		return pr.HTMLURL, nil
 	}
 	ref, err := gh.GetBranch(ctx, ci.Owner, ci.Repo, branch)
@@ -99,25 +117,27 @@ func (c *ChangeProposals) openPull(ctx context.Context, gh *githubapi.Client, ro
 		return "", changeGitHubError("look for the branch "+branch, ci, err)
 	}
 	if ref != nil {
-		if err := c.checkOurCommit(ctx, gh, ci, branch, ref.Object.SHA, marker); err != nil {
+		if err := c.checkOurCommit(ctx, gh, ci, branch, ref.Object.SHA, tree); err != nil {
 			return "", err
 		}
 	} else {
-		commit, err := c.writeCommit(ctx, gh, row, ci, marker)
+		msg := changeInert(ci.Title) + "\n\nProposed by " + changeInert(c.agentName(ctx, row.AgentID)) +
+			" with toolyard's skills.propose_change (skill " + ci.Skill + ").\n\n" + changeMarkerPrefix + row.ID
+		commit, err := gh.CreateCommit(ctx, ci.Owner, ci.Repo, msg, tree, []string{ci.BaseSHA})
 		if err != nil {
-			return "", err
+			return "", changeGitHubError("write the commit", ci, err)
 		}
 		if _, err := gh.CreateBranch(ctx, ci.Owner, ci.Repo, branch, commit); err != nil {
 			// The branch may exist all the same (an answer lost on the
 			// way back, or an attempt running beside this one): look
-			// before deciding.
+			// before deciding, and accept it only with the approved tree.
 			found, ferr := gh.GetBranch(ctx, ci.Owner, ci.Repo, branch)
 			switch {
 			case ferr != nil:
 				return "", &changeError{msg: "GitHub did not confirm the branch " + branch, uncertain: true}
 			case found != nil && found.Object.SHA == commit:
 			case found != nil:
-				if err := c.checkOurCommit(ctx, gh, ci, branch, found.Object.SHA, marker); err != nil {
+				if err := c.checkOurCommit(ctx, gh, ci, branch, found.Object.SHA, tree); err != nil {
 					return "", err
 				}
 			default:
@@ -125,12 +145,17 @@ func (c *ChangeProposals) openPull(ctx context.Context, gh *githubapi.Client, ro
 			}
 		}
 	}
-	pr, err = gh.CreatePull(ctx, ci.Owner, ci.Repo, githubapi.NewPull{Title: ci.Title, Head: branch, Base: ci.Branch,
+	// The title is inert too: a squash merge copies it into the commit
+	// message, where GitHub acts on closing keywords.
+	pr, err = gh.CreatePull(ctx, ci.Owner, ci.Repo, githubapi.NewPull{Title: changeInert(ci.Title), Head: branch, Base: ci.Branch,
 		Body: changePullBody(c.agentName(ctx, row.AgentID), row.ID, ci)})
 	if err != nil {
 		found, ferr := gh.FindPullByHead(ctx, ci.Owner, ci.Repo, branch)
 		switch {
 		case ferr == nil && found != nil:
+			if err := c.checkOurPull(ctx, gh, ci, branch, found, me, tree); err != nil {
+				return "", err
+			}
 			return found.HTMLURL, nil
 		case ferr != nil || githubapi.Uncertain(err):
 			return "", &changeError{msg: "GitHub did not confirm the pull request from " + branch, uncertain: true}
@@ -142,24 +167,39 @@ func (c *ChangeProposals) openPull(ctx context.Context, gh *githubapi.Client, ro
 	return pr.HTMLURL, nil
 }
 
-// checkOurCommit accepts an existing branch only when its head is the
-// commit an earlier attempt of this proposal wrote: one parent, the base
-// commit, and the proposal's marker in the message.
-func (c *ChangeProposals) checkOurCommit(ctx context.Context, gh *githubapi.Client, ci *changeInput, branch, sha, marker string) error {
+// checkOurPull accepts an existing pull request only when the creator's
+// own GitHub account opened it, from the proposal's branch into the source
+// branch, and its head is the approved commit.
+func (c *ChangeProposals) checkOurPull(ctx context.Context, gh *githubapi.Client, ci *changeInput, branch string, pr *githubapi.PullRequest, me *githubapi.User, tree string) error {
+	if pr.User.ID != me.ID || pr.Head.Ref != branch || pr.Base.Ref != ci.Branch || pr.Head.SHA == "" {
+		return changeFail("a pull request from %s already exists on %s/%s and your account did not open it as approved (%s); close it, and ask the agent to propose again",
+			branch, ci.Owner, ci.Repo, pr.HTMLURL)
+	}
+	return c.checkOurCommit(ctx, gh, ci, branch, pr.Head.SHA, tree)
+}
+
+// checkOurCommit accepts an existing branch head only when it is a commit
+// whose only parent is the base commit and whose tree is exactly the
+// approved one.
+func (c *ChangeProposals) checkOurCommit(ctx context.Context, gh *githubapi.Client, ci *changeInput, branch, sha, tree string) error {
 	cm, err := gh.GetCommit(ctx, ci.Owner, ci.Repo, sha)
 	if err != nil {
 		return changeGitHubError("read the head of the branch "+branch, ci, err)
 	}
-	if len(cm.Parents) != 1 || cm.Parents[0].SHA != ci.BaseSHA || !strings.Contains(cm.Message, marker) {
-		return changeFail("the branch %s already exists on %s/%s and toolyard did not write it; delete that branch, or ask the agent to propose again", branch, ci.Owner, ci.Repo)
+	if len(cm.Parents) != 1 || cm.Parents[0].SHA != ci.BaseSHA || cm.Tree.SHA != tree {
+		return changeFail("the branch %s on %s/%s holds content that is not the approved change, so toolyard did not use it; delete that branch, and ask the agent to propose again",
+			branch, ci.Owner, ci.Repo)
 	}
 	return nil
 }
 
-// writeCommit writes the tree and the commit of the change on the base
-// commit and returns the commit's SHA. Neither is visible on GitHub until
-// a branch points at it, so these two writes need no reconciling.
-func (c *ChangeProposals) writeCommit(ctx context.Context, gh *githubapi.Client, row *proposalRow, ci *changeInput, marker string) (string, error) {
+// approvedTree computes the tree the owner approved, the base commit with
+// the proposal's files, and returns its SHA. GitHub stores trees by
+// content, so writing it again gives the same SHA and changes nothing
+// anyone can see; it is how an existing branch is checked. It enforces
+// what the owner saw: an added file must not exist at the base commit, a
+// changed or deleted one must.
+func (c *ChangeProposals) approvedTree(ctx context.Context, gh *githubapi.Client, ci *changeInput) (string, error) {
 	base, err := gh.GetCommit(ctx, ci.Owner, ci.Repo, ci.BaseSHA)
 	if err != nil {
 		if s := githubapi.StatusOf(err); s == 404 || s == 422 {
@@ -185,6 +225,10 @@ func (c *ChangeProposals) writeCommit(ctx context.Context, gh *githubapi.Client,
 			return "", changeFail("%s is a folder or a submodule at the base commit, not a file", full)
 		case has && e.Mode == "120000":
 			return "", changeFail("%s is a symbolic link; change it on GitHub", full)
+		case f.Op == changeOpAdd && has:
+			return "", changeFail("%s already exists at the base commit, but the approved change adds it as a new file; ask the agent to propose again", full)
+		case f.Op == changeOpChange && !has:
+			return "", changeFail("%s does not exist at the base commit, but the approved change edits it; ask the agent to propose again", full)
 		case f.Op == changeOpDelete && !has:
 			return "", changeFail("%s does not exist at the base commit, so it cannot be deleted", full)
 		}
@@ -201,13 +245,7 @@ func (c *ChangeProposals) writeCommit(ctx context.Context, gh *githubapi.Client,
 	if tree == base.Tree.SHA {
 		return "", changeFail("the change makes no difference at commit %s; nothing was sent", reviewShort(ci.BaseSHA))
 	}
-	msg := ci.Title + "\n\nProposed by " + c.agentName(ctx, row.AgentID) + " with toolyard's skills.propose_change (skill " +
-		ci.Skill + ").\n\n" + marker
-	commit, err := gh.CreateCommit(ctx, ci.Owner, ci.Repo, msg, tree, []string{ci.BaseSHA})
-	if err != nil {
-		return "", changeGitHubError("write the commit", ci, err)
-	}
-	return commit, nil
+	return tree, nil
 }
 
 // skillTree lists the skill folder at the base commit (paths relative to

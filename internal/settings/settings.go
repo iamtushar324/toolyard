@@ -117,6 +117,12 @@ const (
 	// refused by Patch and Reveal; only PUT /v1/skills/admin/github-token
 	// writes it.
 	SkillsGitHubToken = "skills_github_token"
+	// SkillsChangeAllowBuildFiles lets an agent's skill change proposal
+	// write CI or build configuration (a Makefile, package.json, a
+	// workflow file, ...) that sits directly in the skill's own folder.
+	// Default false: every such path is refused (docs/skills-hub.md,
+	// change proposals).
+	SkillsChangeAllowBuildFiles = "skills_change_allow_build_files"
 
 	// Inbox attention (when the phone buzzes; inbox-spec.md §6).
 	//
@@ -328,6 +334,9 @@ func (s *Service) All(ctx context.Context) (map[string]any, error) {
 	}
 	if _, ok := out[SkillsTrustedGitHubOwners]; !ok {
 		out[SkillsTrustedGitHubOwners] = ""
+	}
+	if _, ok := out[SkillsChangeAllowBuildFiles]; !ok {
+		out[SkillsChangeAllowBuildFiles] = false
 	}
 	// Virtual alias: keep router_only_mode boolean in sync for older callers.
 	if mode, _ := out[SurfaceMode].(string); mode == SurfaceRouterOnly {

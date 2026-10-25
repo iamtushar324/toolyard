@@ -1480,6 +1480,9 @@ func runServe(argv []string) error {
 		skillHubAdmin.SetTokenSource(githubTokens)
 		changes, err := skillhub.NewChangeProposals(skillhub.ChangeOptions{DB: db, Inbox: inboxSvc, Reader: skillhubSvc,
 			Admin: skillHubAdmin, Tokens: githubTokens, AgentName: agentName, Audit: auditSvc,
+			// skillhub (slice D2): CI and build files stay refused unless
+			// an admin turns this on (default off).
+			AllowBuildFiles: func(context.Context) bool { return settingsSvc.GetBool(settings.SkillsChangeAllowBuildFiles) },
 			UserName: func(ctx context.Context, uid string) string {
 				u, err := idSvc.GetUserByID(ctx, uid)
 				if err != nil {

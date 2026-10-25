@@ -1,34 +1,29 @@
 package skillhub
 
-// The text of a change proposal: the Inbox item (a Markdown summary with a
-// short unified diff per file) and the pull request body. Everything the
-// agent or the repository wrote is data here: control characters and
-// invisible direction marks become spaces, Markdown punctuation is
-// escaped outside code, and each diff sits in a code fence longer than any
-// run of backticks inside it.
+// The text of a change proposal: the Inbox item and the pull request
+// body. The item shows the owner everything the approval writes: every
+// path with its operation, the whole summary, and the complete unified
+// diff of every added or changed file (a proposal that does not fit is
+// refused when it is made). Everything the agent or the repository wrote
+// is data here: control characters and invisible direction marks become
+// spaces, Markdown punctuation is escaped outside code, and each diff sits
+// in a code fence longer than any run of backticks inside it. In the pull
+// request body, mentions, issue references, closing keywords, HTML and
+// images are neutralised (changeNeutral).
 
 import (
 	"fmt"
+	"regexp"
 	"strings"
 	"unicode/utf8"
-
-	"github.com/tusharbhardwaj/toolyard/internal/inbox"
 )
 
 const (
 	// changeDiffContext is the unified diff context, in lines.
 	changeDiffContext = 3
-	// changeDiffLines and changeDiffRunes cap one file's diff in the item.
-	changeDiffLines = 60
-	changeDiffRunes = 4000
 	// changeDiffCells caps the line-diff table (old × new lines after the
-	// common start and end are cut); a bigger change shows only counts.
+	// common start and end are cut); a bigger change is refused.
 	changeDiffCells = 1_000_000
-	// changeSummaryRunes caps the agent's summary in the item (the pull
-	// request carries all of it).
-	changeSummaryRunes = 3000
-	// changeMessageBudget leaves room under inbox.MaxMessage.
-	changeMessageBudget = inbox.MaxMessage - 500
 )
 
 // changeInvisible reports a rune that changes how text displays without
@@ -102,9 +97,10 @@ func changeCounts(files []changeFile) string {
 	return fmt.Sprintf("%d file%s (%s)", len(files), reviewPlural(len(files)), strings.Join(parts, ", "))
 }
 
-// changeQuote is s as a Markdown quote, escaped, at most n characters.
-func changeQuote(s string, n int) string {
-	s = reviewClip(changeClean(s, true, false), n)
+// changeQuote is s as a Markdown quote, escaped, in full (summaries are
+// at most MaxChangeSummary characters).
+func changeQuote(s string) string {
+	s = strings.TrimSpace(changeClean(s, true, false))
 	var b strings.Builder
 	for _, line := range strings.Split(s, "\n") {
 		b.WriteString("> " + reviewMD(line) + "\n")
@@ -112,55 +108,64 @@ func changeQuote(s string, n int) string {
 	return b.String()
 }
 
-// changeMessage is the Markdown body of the Inbox item.
-func changeMessage(agent, agentOwner, id string, ci *changeInput) string {
-	var head strings.Builder
-	fmt.Fprintf(&head, "The agent **%s**", reviewMD(agent))
-	if agentOwner != "" {
-		fmt.Fprintf(&head, " (owner: %s)", reviewMD(agentOwner))
+// changeOpLabel is how the item names an operation.
+func changeOpLabel(op string) string {
+	switch op {
+	case changeOpAdd:
+		return "added"
+	case changeOpDelete:
+		return "deleted"
 	}
-	fmt.Fprintf(&head, " proposes a change to the skill %s in your skill source **%s** ([%s/%s](%s), branch %s).\n\n",
-		reviewCode(changeSkillLabel(ci)), reviewMD(ci.Slug), reviewMD(ci.Owner), reviewMD(ci.Repo), reviewRepoURL(ci.Owner, ci.Repo), reviewCode(ci.Branch))
-	fmt.Fprintf(&head, "- Based on commit [%s](%s), the version agents see now\n", reviewCode(reviewShort(ci.BaseSHA)), reviewCommitURL(ci.Owner, ci.Repo, ci.BaseSHA))
-	fmt.Fprintf(&head, "- Changes: %s\n\n", changeCounts(ci.Files))
-	fmt.Fprintf(&head, "**Title:** %s\n\n", reviewMD(ci.Title))
-	if ci.Summary != "" {
-		head.WriteString("**Summary, in the agent's words:**\n\n")
-		head.WriteString(changeQuote(ci.Summary, changeSummaryRunes))
-		head.WriteString("\n")
-	}
-	head.WriteString("**Changes:**\n\n")
-
-	var tail strings.Builder
-	fmt.Fprintf(&tail, "Approve opens a pull request on %s/%s with your GitHub account (your toolyard GitHub connection): a new branch %s from commit %s, into %s. Nothing is merged: you review and merge it on GitHub. Reject sends nothing to GitHub.",
-		reviewMD(ci.Owner), reviewMD(ci.Repo), reviewCode(ChangeBranchPrefix+id), reviewCode(reviewShort(ci.BaseSHA)), reviewCode(ci.Branch))
-
-	budget := changeMessageBudget - utf8.RuneCountInString(head.String()) - utf8.RuneCountInString(tail.String())
-	var body strings.Builder
-	for i, f := range ci.Files {
-		part := changeFileSection(f)
-		n := utf8.RuneCountInString(part)
-		if n > budget {
-			rest := ci.Files[i:]
-			names := make([]string, len(rest))
-			for j, r := range rest {
-				names[j] = r.Path
-			}
-			fmt.Fprintf(&body, "The diffs of %d more file%s do not fit here; the pull request shows them: %s\n\n", len(rest), reviewPlural(len(rest)), reviewListN(names, 20))
-			break
-		}
-		budget -= n
-		body.WriteString(part)
-	}
-	return head.String() + body.String() + tail.String()
+	return "changed"
 }
 
-// changeFileSection is one file's heading and diff.
+// changeCode is s as a Markdown code span, never shortened (paths are at
+// most 400 bytes): a backtick cannot end it and control characters cannot
+// leave its line.
+func changeCode(s string) string {
+	return "`" + strings.ReplaceAll(reviewPlain(s), "`", "'") + "`"
+}
+
+// changeMessage is the Markdown body of the Inbox item: everything the
+// approval writes. The caller refuses a proposal whose message is over
+// inbox.MaxMessage.
+func changeMessage(agent, agentOwner string, ci *changeInput) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "The agent **%s**", reviewMD(agent))
+	if agentOwner != "" {
+		fmt.Fprintf(&b, " (owner: %s)", reviewMD(agentOwner))
+	}
+	fmt.Fprintf(&b, " proposes a change to the skill %s in your skill source **%s** ([%s/%s](%s), branch %s).\n\n",
+		changeCode(changeSkillLabel(ci)), reviewMD(ci.Slug), reviewMD(ci.Owner), reviewMD(ci.Repo), reviewRepoURL(ci.Owner, ci.Repo), changeCode(ci.Branch))
+	fmt.Fprintf(&b, "- Based on commit [%s](%s), the version agents see now\n", changeCode(reviewShort(ci.BaseSHA)), reviewCommitURL(ci.Owner, ci.Repo, ci.BaseSHA))
+	fmt.Fprintf(&b, "- Changes: %s\n\n", changeCounts(ci.Files))
+	fmt.Fprintf(&b, "**Title:** %s\n\n", reviewMD(ci.Title))
+	if ci.Summary != "" {
+		b.WriteString("**Summary, in the agent's words (the pull request body):**\n\n")
+		b.WriteString(changeQuote(ci.Summary))
+		b.WriteString("\n")
+	}
+	fmt.Fprintf(&b, "**Every file it writes (%d):**\n\n", len(ci.Files))
+	for _, f := range ci.Files {
+		fmt.Fprintf(&b, "- %s: %s\n", changeCode(repoPath(ci.skillDir(), f.Path)), changeOpLabel(f.Op))
+	}
+	b.WriteString("\n**The complete diff:**\n\n")
+	for _, f := range ci.Files {
+		b.WriteString(changeFileSection(f))
+	}
+	fmt.Fprintf(&b, "Approve opens a pull request on %s/%s with your GitHub account (your toolyard GitHub connection): a new branch %s from commit %s, into %s. ",
+		reviewMD(ci.Owner), reviewMD(ci.Repo), changeCode(ci.HeadBranch), changeCode(reviewShort(ci.BaseSHA)), changeCode(ci.Branch))
+	b.WriteString("Pushing that branch and opening the pull request runs the repository's CI (GitHub Actions and any other checks) on it, as for any pull request. ")
+	b.WriteString("Nothing is merged: you review and merge it on GitHub. Reject sends nothing to GitHub.")
+	return b.String()
+}
+
+// changeFileSection is one file's heading and its complete diff.
 func changeFileSection(f changeFile) string {
 	var b strings.Builder
 	switch f.Op {
 	case changeOpDelete:
-		fmt.Fprintf(&b, "**%s**: deleted", reviewCode(f.Path))
+		fmt.Fprintf(&b, "**%s**: deleted", changeCode(f.Path))
 		if f.HasOld {
 			n := len(changeSplitLines(f.Old))
 			fmt.Fprintf(&b, " (%d line%s)", n, reviewPlural(n))
@@ -168,47 +173,19 @@ func changeFileSection(f changeFile) string {
 		b.WriteString("\n\n")
 		return b.String()
 	case changeOpAdd:
-		fmt.Fprintf(&b, "**%s**: added", reviewCode(f.Path))
+		fmt.Fprintf(&b, "**%s**: added", changeCode(f.Path))
 	default:
-		fmt.Fprintf(&b, "**%s**: changed", reviewCode(f.Path))
+		fmt.Fprintf(&b, "**%s**: changed", changeCode(f.Path))
 		if !f.HasOld {
-			b.WriteString(" (toolyard does not serve the current file, so this shows only the new text)")
+			b.WriteString(" (toolyard does not serve the current file, so this shows the whole new text)")
 		}
 	}
-	old := ""
-	if f.HasOld {
-		old = f.Old
-	}
-	lines, added, removed, ok := changeUnifiedDiff(old, f.Content, changeDiffContext)
-	fmt.Fprintf(&b, ", +%d −%d", added, removed)
-	if !ok {
-		b.WriteString(" (too large to compare here; the pull request shows the diff)\n\n")
-		return b.String()
-	}
-	b.WriteString("\n\n")
-	shown, more := changeCapLines(lines, changeDiffLines, changeDiffRunes)
-	text := changeClean(strings.Join(shown, "\n"), true, true)
+	lines, added, removed, _ := changeUnifiedDiff(f.Old, f.Content, changeDiffContext)
+	fmt.Fprintf(&b, ", +%d −%d\n\n", added, removed)
+	text := changeClean(strings.Join(lines, "\n"), true, true)
 	fence := changeFence(text)
-	b.WriteString(fence + "diff\n" + text + "\n" + fence + "\n")
-	if more > 0 {
-		fmt.Fprintf(&b, "\n… %d more diff line%s in the pull request.\n", more, reviewPlural(more))
-	}
-	b.WriteString("\n")
+	b.WriteString(fence + "diff\n" + text + "\n" + fence + "\n\n")
 	return b.String()
-}
-
-// changeCapLines keeps the first lines within maxLines and maxRunes; more
-// is how many were left out.
-func changeCapLines(lines []string, maxLines, maxRunes int) (kept []string, more int) {
-	runes := 0
-	for i, l := range lines {
-		n := utf8.RuneCountInString(l) + 1
-		if i >= maxLines || runes+n > maxRunes {
-			return lines[:i], len(lines) - i
-		}
-		runes += n
-	}
-	return lines, 0
 }
 
 // changeFence is a backtick fence longer than any backtick run in text.
@@ -416,19 +393,53 @@ func changeRange(start, count int) string {
 	return fmt.Sprintf("%d,%d", start, count)
 }
 
-// changePullBody is the pull request body: the agent's summary, then the
-// proposing agent, the skill, the base commit and the proposal ID. It names
-// no person: the repository may be public, and the pull request's author
-// is the account owner who approved it.
+// changePullBody is the pull request body: the summary the owner read,
+// quoted and neutralised, then the proposing agent, the skill, the base
+// commit and the proposal ID. It names no person: the repository may be
+// public, and the pull request's author is the account owner who approved
+// it.
 func changePullBody(agent, id string, ci *changeInput) string {
 	var b strings.Builder
-	if s := strings.TrimSpace(changeClean(ci.Summary, true, true)); s != "" {
-		b.WriteString(s + "\n\n")
+	if s := strings.TrimSpace(changeClean(ci.Summary, true, false)); s != "" {
+		for _, line := range strings.Split(s, "\n") {
+			b.WriteString("> " + changeNeutral(line) + "\n")
+		}
+		b.WriteString("\n")
 	}
 	b.WriteString("---\n\n")
-	fmt.Fprintf(&b, "Proposed by the agent **%s** with toolyard's `skills.propose_change`, and approved by the account owner in the toolyard Inbox.\n\n", reviewMD(agent))
-	fmt.Fprintf(&b, "- Skill: %s (%s in the source %s)\n", reviewCode(ci.Skill), reviewCode(changeSkillLabel(ci)), reviewCode(ci.Slug))
+	fmt.Fprintf(&b, "Proposed by the agent **%s** with toolyard's `skills.propose_change`, and approved by the account owner in the toolyard Inbox.\n\n", changeNeutral(reviewMD(agent)))
+	fmt.Fprintf(&b, "- Skill: %s (%s in the source %s)\n", changeCode(ci.Skill), changeCode(changeSkillLabel(ci)), changeCode(ci.Slug))
 	fmt.Fprintf(&b, "- Based on commit %s\n", ci.BaseSHA)
-	fmt.Fprintf(&b, "- toolyard proposal: %s\n", reviewCode(id))
+	fmt.Fprintf(&b, "- toolyard proposal: %s\n", changeCode(id))
 	return b.String()
+}
+
+// changeZW is a zero-width space: it breaks GitHub's parsing of a mention,
+// an issue reference, a closing keyword or an image without changing what
+// a reader sees.
+const changeZW = "\u200b"
+
+// changeClosing matches GitHub's closing keywords (Fixes, Closes,
+// Resolves and their forms) as words.
+var changeClosing = regexp.MustCompile(`(?i)\b(clos(e|es|ed)|fix(es|ed)?|resolv(e|es|ed))\b`)
+
+// changeGHRef matches a GH-12 issue reference.
+var changeGHRef = regexp.MustCompile(`(?i)\bGH-(\d)`)
+
+// changeNeutral makes agent text inert in a pull request body: HTML
+// (comments, images, tags) is escaped, then changeInert.
+func changeNeutral(s string) string {
+	return changeInert(strings.NewReplacer("<", "&lt;", ">", "&gt;").Replace(s))
+}
+
+// changeInert gives mentions (@user), issue references (#12,
+// owner/repo#12, GH-12), closing keywords (Fixes ...) and Markdown images
+// a zero-width space that stops GitHub from acting on them. It is used
+// as is for commit messages, which GitHub reads for the same keywords.
+func changeInert(s string) string {
+	s = strings.ReplaceAll(s, "@", "@"+changeZW)
+	s = strings.ReplaceAll(s, "#", "#"+changeZW)
+	s = strings.ReplaceAll(s, "![", "!"+changeZW+"[")
+	s = changeGHRef.ReplaceAllString(s, "GH-"+changeZW+"$1")
+	return changeClosing.ReplaceAllStringFunc(s, func(w string) string { return w[:1] + changeZW + w[1:] })
 }
