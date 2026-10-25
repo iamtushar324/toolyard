@@ -5248,7 +5248,7 @@ function ibAccessDraft(r) {
 function ibSaveAccessDraft(r,d) { d.at=Date.now(); try { sessionStorage.setItem(ibAccessDraftKey(r),JSON.stringify(d)); } catch {} }
 function ibSelectCalls(r, allow) { const d=ibAccessDraft(r); r.tools.forEach((t,k)=>{d.allow[ibCallID(t,k)]=!!allow[k];}); state.inbox.allow[r.id]=allow.slice(); ibSaveAccessDraft(r,d); }
 function ibDropAccessDraft(r) { const key=ibAccessDraftKey(r);ibAccessDrafts.delete(key);try{sessionStorage.removeItem(key);}catch{} delete state.inbox.allow[r.id];delete state.inbox.notes?.[r.id]; }
-function ibClearDrafts() { settingsClearDrafts(); ibDrafts.clear();ibAccessDrafts.clear(); state.inbox.notes={};state.inbox.allow={};state.inbox.narrow={};state.inbox.ttl={}; try {Object.keys(sessionStorage).filter(k=>k.startsWith('toolyard.answer.')||k.startsWith('toolyard.decision.')).forEach(k=>sessionStorage.removeItem(k));}catch{} }
+function ibClearDrafts() { settingsClearDrafts(); ibDrafts.clear();ibAccessDrafts.clear();ibAnswerDrafts.clear(); state.inbox.notes={};state.inbox.allow={};state.inbox.narrow={};state.inbox.ttl={}; try {Object.keys(sessionStorage).filter(k=>k.startsWith('toolyard.answer.')||k.startsWith('toolyard.decision.')).forEach(k=>sessionStorage.removeItem(k));}catch{} }
 
 function ibAnswerForm(r) {
   if (r.status !== 'pending') return el('div', { class: 'ib-sec answer-section' }, ibResultEl(r));
@@ -5286,6 +5286,328 @@ function ibAnswerForm(r) {
     el('div', { class:'ib-btns' },
       el('button', { type:'button', disabled:busy, on:{click:()=>ibDecide(r,{action:'snooze',snooze_minutes:60})} }, 'Snooze for 1 hour'),
       el('button', { type:'submit', class:'primary', disabled:busy }, busy ? 'Save answer…' : 'Send answer')));
+}
+
+// ---- rich items (schema version 3): every call and question, one decision ---
+//
+// An item may carry questions of nine types next to (or instead of) tool
+// calls. The owner's answers stay a local draft until the one Submit; the
+// decision then carries every verdict and every answer, keyed by question
+// ID. ibAnswersBody builds that payload; ibAnswerProblem mirrors the
+// server's checks so the owner sees what is missing before sending.
+
+const ibAnswerDrafts = new Map();
+function ibAnswersKey(r) { return 'toolyard.answer.v3.' + (state.user?.id || '') + '.' + r.id + '.' + (r.revision || 0); }
+function ibAnswersDraft(r) {
+  const key = ibAnswersKey(r);
+  if (!ibAnswerDrafts.has(key)) {
+    let d;
+    try { d = JSON.parse(sessionStorage.getItem(key)); } catch {}
+    if (!d || !d.values || !d.texts || Date.now() - d.at > 24 * 3600000) {
+      d = { values: {}, texts: {}, order: {}, note: '', submission: crypto.randomUUID(), at: Date.now() };
+      for (const q of r.questions || []) {
+        if (q.default === undefined || q.default === null) continue;
+        d.values[q.id] = q.type === 'datetime' ? ibRFC3339ToLocal(q.default) : q.default;
+      }
+    }
+    d.order ||= {};
+    ibAnswerDrafts.set(key, d);
+  }
+  return ibAnswerDrafts.get(key);
+}
+function ibSaveAnswersDraft(r, d) { d.at = Date.now(); try { sessionStorage.setItem(ibAnswersKey(r), JSON.stringify(d)); } catch {} }
+function ibDropAnswersDraft(r) { const key = ibAnswersKey(r); ibAnswerDrafts.delete(key); try { sessionStorage.removeItem(key); } catch {} }
+function ibHasQuestions(r) { return !!(r && (r.questions || []).length); }
+
+// ibLocalToRFC3339 turns a datetime-local value ("2026-11-02T09:30", the
+// owner's own zone) into RFC 3339 with the zone offset.
+function ibLocalToRFC3339(v) {
+  const s = String(v);
+  if (/(?:[zZ]|[+-]\d\d:\d\d)$/.test(s)) return s;
+  const m = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})(?::(\d{2}))?$/.exec(s);
+  if (!m) return s;
+  const d = new Date(+m[1], +m[2] - 1, +m[3], +m[4], +m[5], +(m[6] || 0));
+  const off = -d.getTimezoneOffset(), abs = Math.abs(off), p = (n) => String(n).padStart(2, '0');
+  return `${m[1]}-${m[2]}-${m[3]}T${m[4]}:${m[5]}:${m[6] || '00'}${off >= 0 ? '+' : '-'}${p(Math.floor(abs / 60))}:${p(abs % 60)}`;
+}
+function ibRFC3339ToLocal(v) {
+  const s = String(v || '');
+  if (!/(?:[zZ]|[+-]\d\d:\d\d)$/.test(s)) return s;
+  const d = new Date(s);
+  if (isNaN(d.getTime())) return s;
+  const p = (n) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}T${p(d.getHours())}:${p(d.getMinutes())}`;
+}
+
+// ibAnswerValue is a draft value in the type the server takes, or
+// undefined when unanswered (NaN for a number that doesn't parse).
+function ibAnswerValue(q, v) {
+  if (v === undefined || v === null || v === '') return undefined;
+  switch (q.type) {
+    case 'number': case 'scale': {
+      const n = typeof v === 'number' ? v : Number(String(v).trim());
+      return Number.isFinite(n) ? n : NaN;
+    }
+    case 'yes_no': return v === true || v === 'true' ? true : v === false || v === 'false' ? false : undefined;
+    case 'multiple_choice': case 'ranking': return Array.isArray(v) && v.length ? v.slice() : undefined;
+    case 'datetime': return ibLocalToRFC3339(v);
+    default: return String(v);
+  }
+}
+
+// ibAnswerProblem says what is wrong with the draft answer to q, '' when
+// nothing is.
+function ibAnswerProblem(q, d) {
+  const v = ibAnswerValue(q, d.values[q.id]);
+  const custom = !!(q.allow_other && (d.texts[q.id] || '').trim());
+  const required = q.required !== false;
+  if (v === undefined || (q.type === 'free_text' && !String(v).trim())) {
+    if (!required || custom) return '';
+    return q.type === 'ranking' ? 'Put the options in order, or confirm the order shown.' : 'Answer this question.';
+  }
+  const opts = q.options || [];
+  switch (q.type) {
+    case 'free_text': {
+      const n = [...String(v)].length;
+      if (q.max_length && n > q.max_length) return 'Use at most ' + q.max_length + ' characters.';
+      if (q.min_length && n < q.min_length) return 'Write at least ' + q.min_length + ' characters.';
+      break;
+    }
+    case 'single_choice': if (!opts.some((o) => o.id === v)) return 'Choose one of the options.'; break;
+    case 'multiple_choice': {
+      if (v.some((id) => !opts.some((o) => o.id === id))) return 'Choose from the options.';
+      if (q.max_selections && v.length > q.max_selections) return 'Choose at most ' + q.max_selections + '.';
+      if (v.length < (q.min_selections || 0)) return 'Choose at least ' + q.min_selections + '.';
+      const ex = opts.find((o) => o.exclusive && v.includes(o.id));
+      if (ex && v.length > 1) return ex.label + ' must be chosen alone.';
+      break;
+    }
+    case 'number': {
+      if (!Number.isFinite(v)) return 'Enter a number.';
+      if (q.min != null && v < q.min) return 'Enter ' + q.min + ' or more.';
+      if (q.max != null && v > q.max) return 'Enter ' + q.max + ' or less.';
+      if (q.step) {
+        const k = (v - (q.min || 0)) / q.step;
+        if (Math.abs(k - Math.round(k)) > 1e-9 * Math.max(1, Math.abs(k))) return 'Use steps of ' + q.step + (q.min ? ' from ' + q.min : '') + '.';
+      }
+      break;
+    }
+    case 'scale': if (!Number.isInteger(v) || v < 1 || v > (q.scale || 5)) return 'Choose 1 to ' + (q.scale || 5) + '.'; break;
+    case 'ranking': if (v.length !== opts.length || new Set(v).size !== v.length) return 'Rank every option once.'; break;
+    case 'date': if (!/^\d{4}-\d{2}-\d{2}$/.test(v)) return 'Enter a date.'; break;
+    case 'datetime': if (!/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2}(?:\.\d+)?)?(?:[zZ]|[+-]\d{2}:\d{2})$/.test(v)) return 'Enter a date and a time.'; break;
+  }
+  return '';
+}
+
+function ibAnswerProblems(r, d = ibAnswersDraft(r)) {
+  const out = {};
+  for (const q of r.questions || []) { const p = ibAnswerProblem(q, d); if (p) out[q.id] = p; }
+  return out;
+}
+
+// ibAnswersBody: the draft's answers as the decision endpoint takes them,
+// keyed by question ID. Unanswered optional questions are left out.
+function ibAnswersBody(r, d = ibAnswersDraft(r)) {
+  const out = {};
+  for (const q of r.questions || []) {
+    const v = ibAnswerValue(q, d.values[q.id]);
+    const text = d.texts[q.id] || '';
+    if (v === undefined && !text.trim()) continue;
+    const a = {};
+    if (v !== undefined) a.value = v;
+    if (text.trim()) a.text = text;
+    out[q.id] = a;
+  }
+  return out;
+}
+
+// ibAnswerLabel shows an answer value: option labels, Yes or No, a number
+// with its unit, a date.
+function ibAnswerLabel(q, v) {
+  const opt = (id) => ((q.options || []).find((o) => o.id === id) || { label: String(id) }).label;
+  if (v === undefined || v === null) return '';
+  switch (q.type) {
+    case 'single_choice': return opt(v);
+    case 'multiple_choice': return (Array.isArray(v) ? v : [v]).map(opt).join(', ');
+    case 'ranking': return (Array.isArray(v) ? v : [v]).map(opt).join(' → ');
+    case 'yes_no': return v === true ? 'Yes' : v === false ? 'No' : String(v);
+    case 'number': return String(v) + (q.unit ? ' ' + q.unit : '');
+    case 'scale': return String(v) + ' of ' + (q.scale || 5);
+    case 'datetime': { const t = new Date(v); return isNaN(t.getTime()) ? String(v) : t.toLocaleString(); }
+    default: return String(v);
+  }
+}
+
+function ibAnswerText(q, a) {
+  const parts = [];
+  if (a.value !== undefined && a.value !== null) parts.push(ibAnswerLabel(q, a.value));
+  if (a.text) parts.push(a.text);
+  return parts.join(' — ');
+}
+
+// ibAnswersView lists a decided item's answers.
+function ibAnswersView(r) {
+  if (!ibHasQuestions(r)) return null;
+  const ans = r.answers || {};
+  return el('dl', { class: 'ib-answers' }, ...r.questions.flatMap((q) => [
+    el('dt', {}, q.prompt),
+    el('dd', {}, ans[q.id] ? ibAnswerText(q, ans[q.id]) : el('span', { class: 'meta' }, 'Not answered')),
+  ]));
+}
+
+function ibRefreshDecide(r) { ibRegion('decide', ibDecideEl(r, state.inbox.detail?.grants || [])); }
+
+// ibQuestionEl renders one question as native, labelled form controls, so
+// keyboard and screen readers work and phones show their own pickers.
+function ibQuestionEl(r, q, k, d, busy, problem) {
+  const id = 'ibq-' + k;
+  const set = (v, rerender) => {
+    d.values[q.id] = v;
+    d.submission = crypto.randomUUID();
+    if (state.inbox.qproblems?.[r.id]) delete state.inbox.qproblems[r.id][q.id];
+    ibSaveAnswersDraft(r, d);
+    if (rerender) ibRefreshDecide(r);
+  };
+  const described = [q.help ? id + '-help' : '', problem ? id + '-err' : ''].filter(Boolean).join(' ');
+  const aria = described ? { 'aria-describedby': described } : {};
+  const title = [el('span', {}, q.prompt), q.required === false ? el('small', { class: 'meta' }, ' · optional') : null];
+  const rec = q.recommended !== undefined && q.recommended !== null && !q.options?.length ? el('small', { class: 'option-recommended' }, 'Suggested: ' + ibAnswerLabel(q, q.recommended)) : null;
+  const isRec = (oid) => (q.options || []).some((o) => o.id === oid && o.recommended) || q.recommended === oid || (Array.isArray(q.recommended) && q.recommended.includes(oid));
+  const radios = (choices, cur, cls) => el('fieldset', Object.assign({ class: cls || 'answer-options', disabled: busy }, aria),
+    el('legend', {}, ...title),
+    ...choices.map((c, i) => el('label', { class: 'answer-option' + (cur === c.value ? ' selected' : '') },
+      el('input', { type: 'radio', name: id, id: id + '-' + i, checked: cur === c.value, on: { change: (e) => { if (e.target.checked) set(c.value, true); } } }),
+      el('span', {}, el('strong', {}, c.label), c.recommended ? el('small', { class: 'option-recommended' }, 'Suggested') : null, c.detail ? el('small', {}, c.detail) : null))));
+  const field = (input) => [el('label', { for: id + '-input' }, ...title), input];
+  const cur = d.values[q.id];
+  let body;
+  switch (q.type) {
+    case 'single_choice':
+      body = [radios((q.options || []).map((o) => ({ value: o.id, label: o.label, detail: o.detail, recommended: isRec(o.id) })), cur)];
+      break;
+    case 'multiple_choice': {
+      const sel = Array.isArray(cur) ? cur : [];
+      body = [el('fieldset', Object.assign({ class: 'answer-options', disabled: busy }, aria),
+        el('legend', {}, ...title, el('small', { class: 'meta' }, q.max_selections && q.max_selections < (q.options || []).length ? ' · choose up to ' + q.max_selections : ' · choose any')),
+        ...(q.options || []).map((o, i) => el('label', { class: 'answer-option' + (sel.includes(o.id) ? ' selected' : '') },
+          el('input', { type: 'checkbox', id: id + '-' + i, checked: sel.includes(o.id), on: { change: (e) => {
+            let next = sel.filter((x) => x !== o.id);
+            if (e.target.checked) next = o.exclusive ? [o.id] : next.filter((x) => !(q.options.find((p) => p.id === x) || {}).exclusive).concat(o.id);
+            set(next.length ? next : undefined, true);
+          } } }),
+          el('span', {}, el('strong', {}, o.label), isRec(o.id) ? el('small', { class: 'option-recommended' }, 'Suggested') : null, o.detail ? el('small', {}, o.detail) : null))))];
+      break;
+    }
+    case 'yes_no':
+      body = [radios([{ value: true, label: 'Yes', recommended: q.recommended === true }, { value: false, label: 'No', recommended: q.recommended === false }], ibAnswerValue(q, cur), 'answer-options answer-yesno')];
+      break;
+    case 'scale': {
+      const n = q.scale || 5, v = ibAnswerValue(q, cur);
+      body = [el('fieldset', Object.assign({ class: 'answer-scale-set', disabled: busy }, aria), el('legend', {}, ...title),
+        el('div', { class: 'answer-scale' }, ...Array.from({ length: n }, (_, i) => el('label', { class: v === i + 1 ? 'selected' : '' },
+          el('input', { type: 'radio', name: id, id: id + '-' + (i + 1), checked: v === i + 1, 'aria-label': String(i + 1) + (i === 0 && q.min_label ? ', ' + q.min_label : i === n - 1 && q.max_label ? ', ' + q.max_label : ''),
+            on: { change: (e) => { if (e.target.checked) set(i + 1, true); } } }),
+          el('span', {}, String(i + 1))))),
+        q.min_label || q.max_label ? el('div', { class: 'answer-scale-ends', 'aria-hidden': 'true' }, el('span', {}, q.min_label || ''), el('span', {}, q.max_label || '')) : null)];
+      break;
+    }
+    case 'number':
+      body = [...field(el('input', Object.assign({ type: 'number', id: id + '-input', inputmode: 'decimal', value: cur === undefined || cur === null ? '' : String(cur), disabled: busy,
+        on: { input: (e) => set(e.target.value === '' ? undefined : e.target.value, false) } },
+        q.min != null ? { min: String(q.min) } : {}, q.max != null ? { max: String(q.max) } : {}, { step: q.step ? String(q.step) : 'any' }, aria))),
+        q.unit ? el('span', { class: 'meta answer-unit' }, q.unit) : null];
+      break;
+    case 'date':
+      body = field(el('input', Object.assign({ type: 'date', id: id + '-input', value: cur || '', disabled: busy, on: { input: (e) => set(e.target.value || undefined, false) } }, aria)));
+      break;
+    case 'datetime':
+      body = field(el('input', Object.assign({ type: 'datetime-local', id: id + '-input', value: cur ? ibRFC3339ToLocal(cur) : '', disabled: busy, on: { input: (e) => set(e.target.value || undefined, false) } }, aria)));
+      break;
+    case 'ranking': {
+      const ids = (q.options || []).map((o) => o.id);
+      const valid = (list) => Array.isArray(list) && list.length === ids.length && ids.every((x) => list.includes(x));
+      const order = valid(cur) ? cur : valid(d.order[q.id]) ? d.order[q.id] : valid(q.recommended) ? q.recommended : ids;
+      const move = (from, to) => { const next = order.slice(); next.splice(to, 0, next.splice(from, 1)[0]); d.order[q.id] = next; set(next, true); };
+      body = [el('fieldset', Object.assign({ class: 'answer-ranking-set', disabled: busy }, aria), el('legend', {}, ...title, el('small', { class: 'meta' }, ' · most important first')),
+        el('ol', { class: 'answer-ranking' }, ...order.map((oid, i) => {
+          const o = (q.options || []).find((x) => x.id === oid) || { label: oid };
+          return el('li', {}, el('b', { class: 'answer-rank' }, (i + 1) + '.'), el('span', {}, o.label, o.detail ? el('small', {}, o.detail) : null),
+            el('button', { type: 'button', disabled: busy || i === 0, 'aria-label': 'Move ' + o.label + ' up', on: { click: () => move(i, i - 1) } }, '↑'),
+            el('button', { type: 'button', disabled: busy || i === order.length - 1, 'aria-label': 'Move ' + o.label + ' down', on: { click: () => move(i, i + 1) } }, '↓'));
+        })),
+        valid(cur) ? el('p', { class: 'meta' }, 'Your order is saved in the draft.') : el('button', { type: 'button', class: 'ib-link', on: { click: () => set(order.slice(), true) } }, 'Keep this order'))];
+      break;
+    }
+    default: {
+      const attrs = Object.assign({ id: id + '-input', value: cur || '', disabled: busy, maxlength: q.max_length || 10000, on: { input: (e) => set(e.target.value, false) } }, aria);
+      body = field(q.multiline ? el('textarea', Object.assign({ rows: 4 }, attrs)) : el('input', Object.assign({ type: 'text' }, attrs)));
+    }
+  }
+  const other = q.allow_other && (q.type === 'single_choice' || q.type === 'multiple_choice')
+    ? el('label', { class: 'answer-other' }, el('span', { class: 'meta' }, 'Or write your own answer'),
+      el('input', { type: 'text', id: id + '-other', value: d.texts[q.id] || '', maxlength: 10000, disabled: busy,
+        on: { input: (e) => { d.texts[q.id] = e.target.value; d.submission = crypto.randomUUID(); ibSaveAnswersDraft(r, d); } } }))
+    : null;
+  return el('div', { class: 'ib-question' + (problem ? ' invalid' : ''), id, 'data-question': q.id },
+    ...body, other, rec,
+    q.help ? el('p', { class: 'meta', id: id + '-help' }, q.help) : null,
+    problem ? el('p', { class: 'answer-error', role: 'alert', id: id + '-err' }, problem) : null);
+}
+
+// ibQuestionsEl: every question of the item, numbered, with its draft.
+function ibQuestionsEl(r, busy) {
+  const d = ibAnswersDraft(r);
+  const problems = (state.inbox.qproblems || {})[r.id] || {};
+  const n = r.questions.length;
+  return el('div', { class: 'ib-questions' },
+    el('div', { class: 'ib-eyebrow' }, n === 1 ? 'One question' : n + ' questions'),
+    ...r.questions.map((q, k) => ibQuestionEl(r, q, k, d, busy, problems[q.id])));
+}
+
+// ibCheckAnswers keeps the decision local while an answer is missing or
+// invalid: it marks the questions and moves the focus to the first one.
+function ibCheckAnswers(r) {
+  if (!ibHasQuestions(r)) return true;
+  const problems = ibAnswerProblems(r);
+  (state.inbox.qproblems ||= {})[r.id] = problems;
+  const ids = Object.keys(problems);
+  if (!ids.length) return true;
+  ibRefreshDecide(r);
+  const k = r.questions.findIndex((q) => q.id === ids[0]);
+  const node = typeof document.getElementById === 'function' ? document.getElementById('ibq-' + k) : null;
+  const target = node && node.querySelector ? node.querySelector('input, textarea, button') : null;
+  if (target) target.focus();
+  toast(ids.length === 1 ? 'One question needs an answer.' : ids.length + ' questions need an answer.', 'error');
+  return false;
+}
+
+// ibRichAnswerBody: a question item's decision, every answer at once.
+function ibRichAnswerBody(r) {
+  const d = ibAnswersDraft(r);
+  const body = { action: 'answer', request_revision: r.revision || 0, submission_id: d.submission, answers: ibAnswersBody(r, d) };
+  if ((d.note || '').trim()) body.note = d.note;
+  return body;
+}
+
+// ibRichAnswerForm answers a question or blocker that carries questions.
+function ibRichAnswerForm(r) {
+  if (r.status !== 'pending') return el('div', { class: 'ib-sec answer-section' }, ibResultEl(r));
+  const busy = !!state.inbox.busy, d = ibAnswersDraft(r);
+  return el('form', { class: 'ib-sec answer-section', novalidate: true, on: { submit: (e) => {
+    e.preventDefault();
+    if (busy || !ibCheckAnswers(r)) return undefined;
+    return ibDecide(r, ibRichAnswerBody(r));
+  } } },
+    el('div', { class: 'ib-eyebrow' }, 'Your answers'),
+    ibQuestionsEl(r, busy),
+    el('label', { for: 'ib-answer-note' }, 'Note for the agent (optional)'),
+    el('textarea', { id: 'ib-answer-note', rows: 3, value: d.note || '', disabled: busy, maxlength: 10000,
+      on: { input: (e) => { d.note = e.target.value; d.submission = crypto.randomUUID(); ibSaveAnswersDraft(r, d); } } }),
+    el('p', { class: 'meta' }, 'Your answers stay on this device until you send them, all at once.'),
+    el('div', { class: 'ib-btns' },
+      el('button', { type: 'button', disabled: busy, on: { click: () => ibDecide(r, { action: 'snooze', snooze_minutes: 60 }) } }, 'Snooze for 1 hour'),
+      el('button', { type: 'submit', class: 'primary', disabled: busy }, busy ? 'Sending…' : 'Send answers')));
 }
 
 // ---- Inbox: agents ask, toolyard flags, the owner decides at the end --------
@@ -5613,7 +5935,7 @@ function ibCard(r) {
   },
     el('div', { class: 'ib-sender' }, ibAvatar(r.agent_name), el('b', {}, r.agent_name),
       el('span', { class: 's' }, r.session_title || ''), el('span', { class: 't' }, ibAge(r.created_at))),
-    el('div', { class: 'ib-kindrow' }, el('span', { class: 'ib-kind' }, (IB_KIND[r.kind] || r.kind) + (r.kind === 'access' ? ` · ${(r.tools || []).length} tool${(r.tools || []).length === 1 ? '' : 's'}` : '')), ibStatusPill(r),
+    el('div', { class: 'ib-kindrow' }, el('span', { class: 'ib-kind' }, ibKindLabel(r)), ibStatusPill(r),
       ...ibAttnPills(r), r.checked ? null : el('span', { class: 'ib-pill mute' }, 'Checking…')),
     el('h3', {}, r.title),
     r.summary !== r.title ? el('p', { class: 'sum' }, r.summary) : null,
@@ -5736,15 +6058,22 @@ function ibRefreshRegions() {
   ibObserveDecision(r);
 }
 
+// ibKindLabel: "Access request · 3 tools · 2 questions".
+function ibKindLabel(r) {
+  const n = (r.tools || []).length, q = (r.questions || []).length;
+  return (IB_KIND[r.kind] || r.kind) + (r.kind === 'access' ? ` · ${n} tool${n === 1 ? '' : 's'}` : '') + (q ? ` · ${q} question${q === 1 ? '' : 's'}` : '');
+}
+
 function ibHeadEl(r) {
   const ses = [r.session_title, r.session_repo, r.session_host].filter(Boolean).join(' · ');
   return el('div', { class: 'ib-dh' },
     el('div', { class: 'ib-from' }, ibAvatar(r.agent_name, true),
       el('div', {}, el('b', {}, r.agent_name), el('span', {}, IB_VERB[r.kind] + (ses ? ' · ' + ses : '')))),
     el('div', { class: 'ib-kindrow' },
-      el('span', { class: 'ib-kind' }, (IB_KIND[r.kind] || r.kind) + (r.kind === 'access' ? ` · ${r.tools.length} tool${r.tools.length === 1 ? '' : 's'}` : '')),
+      el('span', { class: 'ib-kind' }, ibKindLabel(r)),
       ibStatusPill(r), ...ibAttnPills(r), el('span', { class: 'meta' }, relTime(r.created_at))),
     el('h2', {}, r.title),
+    r.summary && r.summary !== r.title ? el('p', { class: 'ib-summary' }, r.summary) : null,
     r.task ? el('div', { class: 'meta task-context' }, 'Task · ', r.task.url ? el('a', { href: r.task.url, target: '_blank', rel: 'noopener noreferrer' }, r.task.title || r.task.objective || 'Open task') : (r.task.objective || r.task.title)) : null,
   );
 }
@@ -5825,7 +6154,7 @@ function ibMsgEl(r) {
       el('p', {}, s.shown || s.text)));
   };
   renderTy();
-  return el('div', { class: 'ib-msg' }, el('p', {}, r.message), facts, holder);
+  return el('div', { class: 'ib-msg' }, el('div', { class: 'ib-md' }, ...ibMarkdown(r.message, ibMdContext(r))), facts, holder);
 }
 
 function ibTypewrite(obj, rerender) {
@@ -5863,7 +6192,7 @@ function ibAttachment(r, a, k) {
     el('p', {}, a.fetch_error ? 'Toolyard couldn’t copy this: ' + a.fetch_error : 'Not copied (copying is off in Settings).'),
     a.url ? el('a', { href: a.url, target: '_blank', rel: 'noopener noreferrer' }, 'Open the original link ↗') : null);
   switch (a.type) {
-    case 'markdown': body = el('div', { class: 'ib-attbody ib-md' }, ...ibMarkdown(a.body)); break;
+    case 'markdown': body = el('div', { class: 'ib-attbody ib-md' }, ...ibMarkdown(a.body, ibMdContext(r))); break;
     case 'table': body = el('div', { class: 'ib-attbody ib-tbl' }, el('table', {},
       el('thead', {}, el('tr', {}, ...(a.columns || []).map((c) => el('th', {}, String(c))))),
       el('tbody', {}, ...(a.rows || []).map((row) => el('tr', {}, ...row.map((c) => el('td', { class: typeof c === 'number' ? 'num' : '' }, c == null ? '' : String(c)))))))); break;
@@ -5904,78 +6233,486 @@ function ibCode(file, lines, diff) {
     el('pre', {}, ...lines.map((l) => el('span', { class: 'ln' + (diff ? (l.startsWith('@@') ? ' hunk' : l.startsWith('+') ? ' add' : l.startsWith('-') ? ' del' : '') : '') }, l.replace(/\t/g, '  ') || ' '))));
 }
 
-// ibMarkdown renders a small, safe subset: paragraphs, "- " lists, "#"
-// headings, `code` and **bold**. Everything goes through text nodes.
-function ibMarkdown(src) {
-  const out = [];
-  const inline = (text) => {
-    const frag = [];
-    const re = /(`[^`]+`|\*\*[^*]+\*\*)/g;
-    let last = 0, m;
-    while ((m = re.exec(text))) {
-      if (m.index > last) frag.push(document.createTextNode(text.slice(last, m.index)));
-      const t = m[0];
-      frag.push(t.startsWith('`') ? el('code', {}, t.slice(1, -1)) : el('strong', {}, t.slice(2, -2)));
-      last = m.index + t.length;
+// ---- Markdown: a small, safe CommonMark renderer -------------------------
+//
+// ibMarkdown renders CommonMark with GitHub tables, fenced and indented
+// code, lists (task items too), quotes, headings, emphasis, strikethrough
+// and links. Every piece of text becomes a text node (el's string children);
+// nothing is parsed as HTML, so raw HTML shows as text. Links keep only
+// http, https and mailto targets. An image shows only when ctx.image(src)
+// returns a URL for it: the item's own uploads (ibMdContext); any other
+// image becomes a link, or plain text.
+
+const IB_MD_PUNCT = /[!"#$%&'()*+,\-./:;<=>?@[\\\]^_`{|}~]/;
+const IB_MD_ITEM = /^( {0,3})([-*+]|\d{1,9}[.)])(?:[ ]+(.*)|$)/;
+const IB_MD_ENT = { amp: '&', lt: '<', gt: '>', quot: '"', apos: "'", nbsp: ' ', copy: '©', reg: '®', trade: '™', hellip: '…', mdash: '—', ndash: '–', times: '×', rarr: '→', larr: '←', middot: '·', bull: '•', deg: '°', euro: '€', pound: '£' };
+
+function ibMdEntities(s) {
+  return String(s).replace(/&(#[xX][0-9a-fA-F]{1,6}|#[0-9]{1,7}|[A-Za-z][A-Za-z0-9]{1,31});/g, (m, e) => {
+    if (e[0] === '#') {
+      const n = e[1] === 'x' || e[1] === 'X' ? parseInt(e.slice(2), 16) : parseInt(e.slice(1), 10);
+      return n > 0 && n <= 0x10ffff && !(n >= 0xd800 && n <= 0xdfff) ? String.fromCodePoint(n) : '�';
     }
-    if (last < text.length) frag.push(document.createTextNode(text.slice(last)));
-    return frag;
-  };
-  const blocks = String(src || '').split(/\n{2,}/);
-  for (const b of blocks) {
-    const lines = b.split('\n');
-    if (lines.every((l) => /^\s*[-*] /.test(l))) {
-      out.push(el('ul', {}, ...lines.map((l) => el('li', {}, ...inline(l.replace(/^\s*[-*] /, ''))))));
-    } else if (/^#{1,4} /.test(lines[0])) {
-      out.push(el('p', {}, el('strong', {}, lines[0].replace(/^#+ /, ''))));
-      if (lines.length > 1) out.push(el('p', {}, ...inline(lines.slice(1).join(' '))));
-    } else {
-      out.push(el('p', {}, ...inline(lines.join(' '))));
+    return Object.prototype.hasOwnProperty.call(IB_MD_ENT, e) ? IB_MD_ENT[e] : m;
+  });
+}
+
+// ibSafeHref returns the link target when it is an http(s) or mailto URL
+// without spaces or control characters, else null.
+function ibSafeHref(raw) {
+  const href = ibMdEntities(String(raw == null ? '' : raw).trim());
+  if (!href || /[\u0000- \u007f-\u009f]/.test(href)) return null;
+  if (!/^(?:https?:\/\/[^/?#\\]|mailto:[^/\\])/i.test(href)) return null;
+  return href;
+}
+
+function ibMdLinkAttrs(href, title) {
+  const a = { href, rel: 'noopener noreferrer nofollow' };
+  if (!/^mailto:/i.test(href)) a.target = '_blank';
+  if (title) a.title = ibMdEntities(title);
+  return a;
+}
+
+function ibMdPlain(s) { return ibMdEntities(String(s || '').replace(/\\([!-\/:-@[-`{-~])/g, '$1').replace(/[*_`~]/g, '')).trim(); }
+
+function ibMdIndent(l) { return /^ */.exec(l)[0].length; }
+
+function ibMdBlockStart(l) { return /^ {0,3}(?:`{3,}|~{3,}|#{1,6}(?:\s|$)|>|([-*_])(?:[ ]*\1){2,}[ ]*$)/.test(l); }
+
+// ibMdCodeEnd finds the closing backtick run of exactly len backticks.
+function ibMdCodeEnd(text, from, len) {
+  let j = from;
+  while (j < text.length) {
+    const k = text.indexOf('`', j);
+    if (k === -1) return -1;
+    let e = k;
+    while (text[e] === '`') e++;
+    if (e - k === len) return k;
+    j = e;
+  }
+  return -1;
+}
+
+// ibMdLinkAt parses [label](destination "title") starting at the [.
+function ibMdLinkAt(text, i) {
+  let depth = 0, j = i;
+  for (; j < text.length; j++) {
+    const c = text[j];
+    if (c === '\\') { j++; continue; }
+    if (c === '`') {
+      const run = /^`+/.exec(text.slice(j))[0];
+      const e = ibMdCodeEnd(text, j + run.length, run.length);
+      j = (e === -1 ? j : e) + run.length - 1;
+      continue;
+    }
+    if (c === '[') depth++;
+    else if (c === ']' && --depth === 0) break;
+  }
+  if (j >= text.length || text[j + 1] !== '(') return null;
+  const m = /^[ \n]*(?:<([^<>\n]*)>|((?:[^\s()\\]|\\.|\((?:[^\s()\\]|\\.)*\))*))(?:[ \n]+(?:"([^"\n]*)"|'([^'\n]*)'|\(([^()\n]*)\)))?[ \n]*\)/.exec(text.slice(j + 2));
+  if (!m) return null;
+  const dest = (m[1] !== undefined ? m[1] : m[2] || '').replace(/\\([!-\/:-@[-`{-~])/g, '$1');
+  return { label: text.slice(i + 1, j), dest, title: m[3] || m[4] || m[5] || '', end: j + 2 + m[0].length };
+}
+
+// ibMdEmphasisAt parses *em*, _em_, **strong**, __strong__ and ~~del~~
+// starting at text[i].
+function ibMdEmphasisAt(text, i) {
+  const ch = text[i];
+  let run = 1;
+  while (text[i + run] === ch) run++;
+  if (ch === '~' && run !== 2) return null;
+  const prev = i > 0 ? text[i - 1] : ' ';
+  const next = text[i + run];
+  if (!next || /\s/.test(next)) return null;
+  if (ch === '_' && /[\p{L}\p{N}]/u.test(prev)) return null;
+  for (let n = Math.min(run, 2); n >= 1; n--) {
+    if (ch === '~' && n !== 2) continue;
+    let j = i + n;
+    for (;;) {
+      j = text.indexOf(ch, j);
+      if (j === -1) break;
+      let e = j;
+      while (text[e] === ch) e++;
+      const len = e - j;
+      const close = e - n; // the last n delimiters of the run
+      const before = text[j - 1], after = text[e];
+      const ok = j > i + n - 1 && close > i + n - 1 && before && !/\s/.test(before) && !(ch === '_' && after && /[\p{L}\p{N}]/u.test(after)) &&
+        (n === 2 ? len >= 2 : len === 1 || len === 3);
+      if (ok && close > i + n) return { tag: ch === '~' ? 'del' : n === 2 ? 'strong' : 'em', inner: text.slice(i + n, close), end: e };
+      j = e;
     }
   }
+  return null;
+}
+
+function ibMdInline(src, ctx, depth = 0) {
+  ctx = ctx || {};
+  const text = String(src || '');
+  const out = [];
+  let buf = '';
+  const flush = () => { if (buf) { out.push(ibMdEntities(buf)); buf = ''; } };
+  const push = (n) => { flush(); out.push(n); };
+  let i = 0;
+  while (i < text.length) {
+    const ch = text[i];
+    if (ch === '\\') {
+      const nx = text[i + 1];
+      if (nx === '\n') { push(el('br')); i += 2; continue; }
+      if (nx && IB_MD_PUNCT.test(nx)) { flush(); out.push(nx); i += 2; continue; }
+      buf += ch; i++; continue;
+    }
+    if (ch === '\n') {
+      if (/ {2,}$/.test(buf)) { buf = buf.replace(/ +$/, ''); push(el('br')); } else buf += '\n';
+      i++; continue;
+    }
+    if (ch === '`') {
+      const run = /^`+/.exec(text.slice(i))[0];
+      const e = ibMdCodeEnd(text, i + run.length, run.length);
+      if (e === -1) { buf += run; i += run.length; continue; }
+      let code = text.slice(i + run.length, e).replace(/\n/g, ' ');
+      if (code.length > 2 && code[0] === ' ' && code[code.length - 1] === ' ' && code.trim()) code = code.slice(1, -1);
+      push(el('code', {}, code));
+      i = e + run.length; continue;
+    }
+    if (ch === '!' && text[i + 1] === '[') {
+      const link = ibMdLinkAt(text, i + 1);
+      if (link) {
+        const src = ctx.image ? ctx.image(link.dest) : null;
+        const alt = ibMdPlain(link.label);
+        if (src) push(el('img', { src, alt, loading: 'lazy', class: 'ib-mdimg' }));
+        else {
+          const href = ibSafeHref(link.dest);
+          push(href && !ctx.noLinks ? el('a', ibMdLinkAttrs(href, link.title), alt || href) : el('span', { class: 'ib-mdalt' }, alt || link.dest));
+        }
+        i = link.end; continue;
+      }
+    }
+    if (ch === '[') {
+      const link = ibMdLinkAt(text, i);
+      if (link) {
+        const href = ctx.noLinks ? null : ibSafeHref(link.dest);
+        const inner = depth < 4 ? ibMdInline(link.label, Object.assign({}, ctx, { noLinks: true }), depth + 1) : [link.label];
+        push(href ? el('a', ibMdLinkAttrs(href, link.title), ...inner) : el('span', {}, ...inner));
+        i = link.end; continue;
+      }
+    }
+    if (ch === '<' && !ctx.noLinks) {
+      const rest = text.slice(i);
+      const m = /^<((?:https?:\/\/|mailto:)[^\s<>]+)>/i.exec(rest);
+      const me = !m && /^<([A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,})>/.exec(rest);
+      const href = m ? ibSafeHref(m[1]) : me ? 'mailto:' + me[1] : null;
+      if (href) { push(el('a', ibMdLinkAttrs(href), m ? m[1] : me[1])); i += (m || me)[0].length; continue; }
+    }
+    if ((ch === 'h' || ch === 'H' || ch === 'w' || ch === 'W') && !ctx.noLinks && (i === 0 || /[\s(*_~]/.test(text[i - 1]))) {
+      const m = /^(?:https?:\/\/|www\.)[^\s<]+/i.exec(text.slice(i));
+      if (m) {
+        let url = m[0];
+        while (/[?!.,:*_~'";]$/.test(url) || (url.endsWith(')') && (url.match(/\(/g) || []).length < (url.match(/\)/g) || []).length)) url = url.slice(0, -1);
+        const href = ibSafeHref(/^www\./i.test(url) ? 'https://' + url : url);
+        if (href && url.length > 4) { push(el('a', ibMdLinkAttrs(href), url)); i += url.length; continue; }
+      }
+    }
+    if (ch === '*' || ch === '_' || ch === '~') {
+      const em = ibMdEmphasisAt(text, i);
+      if (em) { push(el(em.tag, {}, ...(depth < 6 ? ibMdInline(em.inner, ctx, depth + 1) : [em.inner]))); i = em.end; continue; }
+      const run = new RegExp('^\\' + ch + '+').exec(text.slice(i))[0];
+      buf += run; i += run.length; continue;
+    }
+    buf += ch; i++;
+  }
+  flush();
   return out;
+}
+
+function ibMdRow(line) {
+  let s = line.trim();
+  if (s.startsWith('|')) s = s.slice(1);
+  if (s.endsWith('|') && !s.endsWith('\\|')) s = s.slice(0, -1);
+  const cells = [];
+  let cur = '', code = false;
+  for (let k = 0; k < s.length; k++) {
+    const c = s[k];
+    if (c === '\\' && s[k + 1] === '|') { cur += '|'; k++; continue; }
+    if (c === '`') code = !code;
+    if (c === '|' && !code) { cells.push(cur.trim()); cur = ''; continue; }
+    cur += c;
+  }
+  cells.push(cur.trim());
+  return cells;
+}
+
+function ibMdTableDelim(line) {
+  if (!line || !line.includes('-')) return null;
+  const cells = ibMdRow(line);
+  if (!cells.length || !cells.every((c) => /^:?-+:?$/.test(c))) return null;
+  return cells.map((c) => (c.startsWith(':') && c.endsWith(':') ? 'center' : c.endsWith(':') ? 'right' : c.startsWith(':') ? 'left' : ''));
+}
+
+function ibMdBlocks(lines, ctx, depth) {
+  const out = [];
+  const para = [];
+  const inline = (s) => ibMdInline(s, ctx);
+  const flush = () => { if (para.length) { out.push(el('p', {}, ...inline(para.join('\n')))); para.length = 0; } };
+  let i = 0, m;
+  while (i < lines.length) {
+    const line = lines[i];
+    if (!line.trim()) { flush(); i++; continue; }
+    if ((m = /^ {0,3}(`{3,}|~{3,})[ ]*([^`\s]*)[^`]*$/.exec(line))) {
+      flush();
+      const fence = m[1], lang = m[2].replace(/[^A-Za-z0-9_+.#-]/g, '').slice(0, 30), body = [];
+      const end = new RegExp('^ {0,3}' + (fence[0] === '`' ? '`' : '~') + '{' + fence.length + ',}[ ]*$');
+      i++;
+      while (i < lines.length && !end.test(lines[i])) { body.push(lines[i]); i++; }
+      i++;
+      out.push(el('pre', { class: 'ib-mdcode' }, el('code', lang ? { class: 'language-' + lang } : {}, body.join('\n'))));
+      continue;
+    }
+    if (para.length && /^ {0,3}(=+|-+)[ ]*$/.test(line)) {
+      out.push(el(line.trim()[0] === '=' ? 'h3' : 'h4', {}, ...inline(para.join('\n'))));
+      para.length = 0; i++; continue;
+    }
+    if ((m = /^ {0,3}(#{1,6})(?:[ ]+(.*?))?(?:[ ]+#+)?[ ]*$/.exec(line))) {
+      flush();
+      out.push(el('h' + Math.min(6, m[1].length + 2), {}, ...inline(m[2] || '')));
+      i++; continue;
+    }
+    if (/^ {0,3}([-*_])(?:[ ]*\1){2,}[ ]*$/.test(line)) { flush(); out.push(el('hr')); i++; continue; }
+    if (/^ {0,3}>/.test(line)) {
+      flush();
+      const body = [];
+      while (i < lines.length && lines[i].trim() && (/^ {0,3}>/.test(lines[i]) || !ibMdBlockStart(lines[i]))) { body.push(lines[i].replace(/^ {0,3}> ?/, '')); i++; }
+      out.push(el('blockquote', {}, ...(depth < 8 ? ibMdBlocks(body, ctx, depth + 1) : [body.join('\n')])));
+      continue;
+    }
+    const aligns = line.includes('|') ? ibMdTableDelim(lines[i + 1]) : null;
+    if (aligns) {
+      const head = ibMdRow(line);
+      if (head.length === aligns.length) {
+        flush();
+        i += 2;
+        const rows = [];
+        while (i < lines.length && lines[i].trim() && !ibMdBlockStart(lines[i])) { rows.push(ibMdRow(lines[i])); i++; }
+        const cell = (tag, k, s) => el(tag, aligns[k] ? { align: aligns[k] } : {}, ...inline(s || ''));
+        out.push(el('div', { class: 'ib-mdtable' }, el('table', {},
+          el('thead', {}, el('tr', {}, ...head.map((h, k) => cell('th', k, h)))),
+          rows.length ? el('tbody', {}, ...rows.map((r) => el('tr', {}, ...head.map((_, k) => cell('td', k, r[k]))))) : null)));
+        continue;
+      }
+    }
+    if ((m = IB_MD_ITEM.exec(line)) && !(para.length && (!m[3] || (/\d/.test(m[2]) && !/^1[.)]$/.test(m[2]))))) {
+      flush();
+      const ordered = /\d/.test(m[2]);
+      const start = ordered ? parseInt(m[2], 10) : 1;
+      const items = [];
+      let loose = false;
+      while (i < lines.length) {
+        const lm = IB_MD_ITEM.exec(lines[i]);
+        if (!lm || /\d/.test(lm[2]) !== ordered) break;
+        const indent = lm[1].length + lm[2].length + 1;
+        const item = [lm[3] || ''];
+        i++;
+        while (i < lines.length) {
+          const l = lines[i];
+          if (!l.trim()) {
+            let k = i;
+            while (k < lines.length && !lines[k].trim()) k++;
+            if (k < lines.length && ibMdIndent(lines[k]) >= 2) { for (; i < k; i++) item.push(''); loose = true; continue; }
+            break;
+          }
+          const ind = ibMdIndent(l);
+          if (ind >= 2) { item.push(l.slice(Math.min(ind, indent))); i++; continue; }
+          if (IB_MD_ITEM.test(l) || ibMdBlockStart(l) || !item[item.length - 1].trim()) break;
+          item.push(l); i++;
+        }
+        items.push(item);
+        let k = i;
+        while (k < lines.length && !lines[k].trim()) k++;
+        const nm = k > i && k < lines.length ? IB_MD_ITEM.exec(lines[k]) : null;
+        if (nm && /\d/.test(nm[2]) === ordered) { loose = true; i = k; }
+      }
+      const lis = items.map((item) => {
+        const t = /^\[([ xX])\][ ]+/.exec(item[0]);
+        const lines_ = t ? [item[0].slice(t[0].length), ...item.slice(1)] : item;
+        const simple = !loose && lines_.every((l, k) => k === 0 || (l.trim() && !IB_MD_ITEM.test(l) && !ibMdBlockStart(l)));
+        const content = simple ? inline(lines_.join('\n')) : depth < 8 ? ibMdBlocks(lines_, ctx, depth + 1) : [lines_.join('\n')];
+        if (!t) return el('li', {}, ...content);
+        const done = t[1] !== ' ';
+        return el('li', { class: 'ib-task' }, el('span', { class: 'ib-check', role: 'img', 'aria-label': done ? 'Done' : 'Not done' }, done ? '☑' : '☐'), ' ', ...content);
+      });
+      out.push(ordered ? el('ol', start !== 1 ? { start: String(start) } : {}, ...lis) : el('ul', {}, ...lis));
+      continue;
+    }
+    if (!para.length && /^ {4,}\S/.test(line)) {
+      const body = [];
+      while (i < lines.length && (/^ {4,}/.test(lines[i]) || !lines[i].trim())) { body.push(lines[i].slice(4)); i++; }
+      while (body.length && !body[body.length - 1].trim()) body.pop();
+      out.push(el('pre', { class: 'ib-mdcode' }, el('code', {}, body.join('\n'))));
+      continue;
+    }
+    para.push(line.replace(/^ {0,3}/, ''));
+    i++;
+  }
+  flush();
+  return out;
+}
+
+function ibMarkdown(src, ctx) {
+  const lines = String(src || '').replace(/\r\n?/g, '\n').replace(/\t/g, '    ').split('\n');
+  return ibMdBlocks(lines, ctx || {}, 0);
+}
+
+// ibMdContext lets Markdown show the item's own images: an inline image
+// upload toolyard resolved when the item was sent, or an image attachment
+// (cited by its upload ref or its original URL), always from toolyard's
+// copy.
+function ibMdContext(r) {
+  const blobs = {};
+  const ok = (sha) => /^[0-9a-f]{64}$/.test(sha || '');
+  for (const im of (r && r.inline_images) || []) if (im.ref && ok(im.blob)) blobs[im.ref] = im.blob;
+  for (const a of (r && r.attachments) || []) {
+    if (a.type !== 'image' || !ok(a.blob)) continue;
+    if (a.upload) blobs[a.upload] = a.blob;
+    if (a.url) blobs[a.url] = a.blob;
+  }
+  return { image: (src) => (Object.prototype.hasOwnProperty.call(blobs, src) ? '/v1/inbox/blobs/' + blobs[src] : null) };
+}
+
+// ---- charts: drawn by the dashboard as SVG ---------------------------------
+
+const IB_CHART_KINDS = ['line', 'bar', 'stacked_bar', 'area', 'pie', 'scatter'];
+
+function ibChartFmt(a, v) { return (Math.abs(v) >= 1000 ? Math.round(v).toLocaleString() : +(+v).toFixed(2)) + (a.unit === '%' ? '%' : ''); }
+
+// ibChartSpec describes a chart attachment as a tree of plain
+// { tag, attrs, children, text } SVG nodes (ibChart builds the DOM), so the
+// shapes can be checked without a browser. Colours are classes c0…c11.
+function ibChartSpec(a) {
+  const W = 340, H = 170, L = 40, R = 10, T = 10, B = 24;
+  const kind = IB_CHART_KINDS.includes(a.chart) ? a.chart : 'line';
+  const node = (tag, attrs, children, text) => ({ tag, attrs: attrs || {}, children: children || [], text });
+  const n1 = (v) => (+v).toFixed(1);
+  const series = (a.series || []).filter((s) => (s.values || []).length).slice(0, 6);
+  const svg = node('svg', { viewBox: `0 0 ${W} ${H}`, role: 'img', 'aria-label': (a.title || 'Chart') + ' (' + kind.replace('_', ' ') + ' chart)', class: 'ib-chart ib-chart-' + kind });
+  const add = (n) => { svg.children.push(n); return n; };
+  const empty = () => { add(node('text', { class: 'axis', x: W / 2, y: H / 2, 'text-anchor': 'middle' }, [], 'No data')); return svg; };
+  if (!series.length) return empty();
+  const xl = a.x || [];
+  if (kind === 'pie') {
+    const vals = series[0].values.map((v) => Math.max(0, +v || 0));
+    const total = vals.reduce((s, v) => s + v, 0);
+    if (!(total > 0)) return empty();
+    const cx = W / 2, cy = H / 2, r = H / 2 - 8;
+    let angle = -Math.PI / 2;
+    const pt = (ang) => n1(cx + r * Math.cos(ang)) + ' ' + n1(cy + r * Math.sin(ang));
+    vals.forEach((v, i) => {
+      if (!v) return;
+      const frac = v / total;
+      const tip = node('title', {}, [], (xl[i] === undefined ? 'Slice ' + (i + 1) : String(xl[i])) + ': ' + ibChartFmt(a, v) + ' (' + Math.round(frac * 100) + '%)');
+      if (frac > 0.9999) { add(node('circle', { class: 'slice c' + (i % 12), cx, cy, r }, [tip])); return; }
+      const a0 = angle, a1 = angle + frac * 2 * Math.PI;
+      angle = a1;
+      add(node('path', { class: 'slice c' + (i % 12), d: `M ${cx} ${cy} L ${pt(a0)} A ${r} ${r} 0 ${a1 - a0 > Math.PI ? 1 : 0} 1 ${pt(a1)} Z` }, [tip]));
+    });
+    return svg;
+  }
+  const n = Math.max(...series.map((s) => s.values.length));
+  let lo, hi;
+  if (kind === 'stacked_bar') {
+    lo = 0;
+    hi = Math.max(...Array.from({ length: n }, (_, i) => series.reduce((t, s) => t + Math.max(0, +s.values[i] || 0), 0)));
+  } else {
+    const all = series.flatMap((s) => s.values.map(Number));
+    lo = Math.min(0, ...all);
+    hi = Math.max(...all);
+  }
+  if (!(hi > lo)) hi = lo + 1;
+  const y = (v) => T + (1 - (v - lo) / (hi - lo)) * (H - T - B);
+  let x;
+  if (kind === 'scatter') {
+    const xs = xl.map(Number).filter(Number.isFinite);
+    let xlo = xs.length ? Math.min(...xs) : 0, xhi = xs.length ? Math.max(...xs) : 1;
+    if (!(xhi > xlo)) xhi = xlo + 1;
+    x = (v) => L + 6 + ((v - xlo) / (xhi - xlo)) * (W - L - R - 12);
+    [[xlo, 'start'], [xhi, 'end']].forEach(([v, anchor]) => add(node('text', { class: 'axis', x: n1(x(v)), y: H - 6, 'text-anchor': anchor }, [], ibChartFmt({}, v))));
+  } else {
+    x = (i) => L + (n === 1 ? (W - L - R) / 2 : (i * (W - L - R)) / (n - 1));
+    [[0, 'start'], [Math.floor((n - 1) / 2), 'middle'], [n - 1, 'end']].forEach(([i, anchor], j) => {
+      if (xl[i] === undefined || (j === 1 && n < 3)) return;
+      const bx = kind === 'bar' || kind === 'stacked_bar' ? L + (i + 0.5) * ((W - L - R) / n) : x(i);
+      add(node('text', { class: 'axis', x: n1(bx), y: H - 6, 'text-anchor': kind === 'bar' || kind === 'stacked_bar' ? 'middle' : anchor }, [], String(xl[i])));
+    });
+  }
+  for (const v of [lo, (lo + hi) / 2, hi]) {
+    add(node('line', { class: 'grid', x1: L, x2: W - R, y1: n1(y(v)), y2: n1(y(v)) }));
+    add(node('text', { class: 'axis', x: L - 5, y: n1(y(v) + 3), 'text-anchor': 'end' }, [], ibChartFmt(a, v)));
+  }
+  const label = (s, i, v) => node('title', {}, [], (s.name ? s.name + ' · ' : '') + (xl[i] === undefined ? '' : xl[i] + ': ') + ibChartFmt(a, v));
+  const bw = (W - L - R) / n;
+  switch (kind) {
+    case 'bar':
+      series.forEach((s, si) => s.values.forEach((v, i) => {
+        const w = Math.max(1, (bw - 4) / series.length);
+        add(node('rect', { class: 'bar c' + si, x: n1(L + i * bw + 2 + si * w), y: n1(y(Math.max(v, 0))), width: n1(w), height: n1(Math.abs(y(v) - y(0))), rx: 2 }, [label(s, i, v)]));
+      }));
+      break;
+    case 'stacked_bar':
+      for (let i = 0; i < n; i++) {
+        let base = 0;
+        series.forEach((s, si) => {
+          const v = Math.max(0, +s.values[i] || 0);
+          if (!v) return;
+          add(node('rect', { class: 'bar stack c' + si, x: n1(L + i * bw + 2), y: n1(y(base + v)), width: n1(Math.max(1, bw - 4)), height: n1(y(base) - y(base + v)) }, [label(s, i, v)]));
+          base += v;
+        });
+      }
+      break;
+    case 'scatter':
+      series.forEach((s, si) => s.values.forEach((v, i) => {
+        const xv = Number(xl[i]);
+        if (!Number.isFinite(xv)) return;
+        add(node('circle', { class: 'dot c' + si, cx: n1(x(xv)), cy: n1(y(v)), r: 3.5 }, [node('title', {}, [], (s.name ? s.name + ' · ' : '') + ibChartFmt({}, xv) + ', ' + ibChartFmt(a, v))]));
+      }));
+      break;
+    case 'area': {
+      const base = y(Math.max(lo, Math.min(0, hi)));
+      series.forEach((s, si) => {
+        const pts = s.values.map((v, i) => n1(x(i)) + ' ' + n1(y(v)));
+        add(node('path', { class: 'areafill c' + si, d: 'M' + n1(x(0)) + ' ' + n1(base) + ' L' + pts.join(' L') + ' L' + n1(x(s.values.length - 1)) + ' ' + n1(base) + ' Z' }));
+        add(node('path', { class: 'line c' + si, d: 'M' + pts.join(' L') }));
+      });
+      break;
+    }
+    default:
+      series.forEach((s, si) => add(node('path', { class: 'line c' + si, d: s.values.map((v, i) => (i ? 'L' : 'M') + n1(x(i)) + ' ' + n1(y(v))).join(' ') })));
+  }
+  return svg;
+}
+
+// ibChartLegend lists what the colours mean: the series, or a pie's slices
+// with their share.
+function ibChartLegend(a) {
+  const series = (a.series || []).filter((s) => (s.values || []).length).slice(0, 6);
+  if (a.chart === 'pie' && series.length) {
+    const vals = series[0].values.map((v) => Math.max(0, +v || 0));
+    const total = vals.reduce((s, v) => s + v, 0) || 1;
+    return vals.map((v, i) => ({ cls: 'c' + (i % 12), label: (a.x && a.x[i] !== undefined ? String(a.x[i]) : 'Slice ' + (i + 1)) + ' · ' + ibChartFmt(a, v) + ' (' + Math.round((v / total) * 100) + '%)' }));
+  }
+  return series.length > 1 ? series.map((s, i) => ({ cls: 'c' + i, label: s.name || 'Series ' + (i + 1) })) : [];
 }
 
 function ibChart(a) {
   const ns = 'http://www.w3.org/2000/svg';
-  const mk = (tag, attrs) => { const n = document.createElementNS(ns, tag); for (const k in attrs) n.setAttribute(k, attrs[k]); return n; };
-  const W = 340, H = 160, L = 38, R = 8, T = 10, B = 22;
-  const series = (a.series || []).filter((s) => (s.values || []).length);
-  const all = series.flatMap((s) => s.values);
-  if (!all.length) return el('p', { class: 'meta' }, 'No data');
-  let lo = Math.min(0, ...all), hi = Math.max(...all);
-  if (hi === lo) hi = lo + 1;
-  const n = Math.max(...series.map((s) => s.values.length));
-  const x = (i) => L + (n === 1 ? (W - L - R) / 2 : i * (W - L - R) / (n - 1));
-  const y = (v) => T + (1 - (v - lo) / (hi - lo)) * (H - T - B);
-  const svg = mk('svg', { viewBox: `0 0 ${W} ${H}`, role: 'img', 'aria-label': a.title || 'chart', class: 'ib-chart' });
-  const fmt = (v) => (Math.abs(v) >= 1000 ? Math.round(v).toLocaleString() : +v.toFixed(2)) + (a.unit === '%' ? '%' : '');
-  [lo, (lo + hi) / 2, hi].forEach((v) => {
-    svg.appendChild(mk('line', { class: 'grid', x1: L, x2: W - R, y1: y(v), y2: y(v) }));
-    const t = mk('text', { class: 'axis', x: L - 5, y: y(v) + 3, 'text-anchor': 'end' }); t.textContent = fmt(v); svg.appendChild(t);
-  });
-  const xl = a.x || [];
-  [[0, 'start'], [Math.floor((n - 1) / 2), 'middle'], [n - 1, 'end']].forEach(([i, anchor], j) => {
-    if (xl[i] === undefined || (j === 1 && n < 3)) return;
-    const t = mk('text', { class: 'axis', x: x(i), y: H - 6, 'text-anchor': anchor }); t.textContent = String(xl[i]); svg.appendChild(t);
-  });
-  if (a.chart === 'bar') {
-    const groups = series.length, bw = (W - L - R) / n;
-    series.forEach((s, si) => s.values.forEach((v, i) => {
-      const w = Math.max(1, (bw - 4) / groups);
-      const r = mk('rect', { class: 'bar s' + si, x: (L + i * bw + 2 + si * w).toFixed(1), y: y(Math.max(v, 0)).toFixed(1), width: w.toFixed(1), height: Math.abs(y(v) - y(0)).toFixed(1), rx: 2 });
-      r.style.animationDelay = (i * 30) + 'ms';
-      svg.appendChild(r);
-    }));
-  } else {
-    series.forEach((s, si) => {
-      const d = s.values.map((v, i) => (i ? 'L' : 'M') + x(i).toFixed(1) + ' ' + y(v).toFixed(1)).join(' ');
-      if (si === 0) svg.appendChild(mk('path', { class: 'area', d: d + ` L${x(s.values.length - 1)} ${y(lo)} L${x(0)} ${y(lo)} Z` }));
-      svg.appendChild(mk('path', { class: 'line s' + si, d }));
-    });
-  }
-  const legend = series.length > 1 ? el('div', { class: 'ib-legend' }, ...series.map((s, si) => el('span', {}, el('i', { class: 's' + si }), s.name))) : null;
-  return el('div', {}, svg, legend);
+  const build = (n) => {
+    const e = document.createElementNS(ns, n.tag);
+    for (const k in n.attrs) e.setAttribute(k, String(n.attrs[k]));
+    if (n.text != null) e.textContent = String(n.text);
+    for (const c of n.children) e.appendChild(build(c));
+    return e;
+  };
+  const legend = ibChartLegend(a);
+  return el('div', {}, build(ibChartSpec(a)),
+    legend.length ? el('div', { class: 'ib-legend' }, ...legend.map((it) => el('span', {}, el('i', { class: it.cls }), it.label))) : null);
 }
 
 function ibLightbox(src, caption) {
@@ -6013,16 +6750,18 @@ function ibDecideEl(r, grants) {
         open?el('button',{on:{click:()=>{d.revision=r.revision||1;delete d.submission;delete d.fingerprint;ibSaveAccessDraft(r,d);ibRegion('decide',ibDecideEl(r,grants));}}},'Use reviewed revision'):null):null,
       open&&!busy?el('div',{class:'ib-quick'},el('button',{class:'ib-link',on:{click:setAll(()=>true)}},'Accept all'),el('button',{class:'ib-link',on:{click:setAll(()=>false)}},'Reject all')):null,
       el('div',{class:'ib-trows'},...rows),
+      open&&ibHasQuestions(r)?ibQuestionsEl(r,!!busy):(!open&&ibHasQuestions(r)?ibAnswersView(r):null),
       open?el('div',{class:'ib-actions'},
         el('label',{class:'meta',for:'ib-note'},'Overall note (optional)'),
         el('textarea',{id:'ib-note',value:d.note,rows:3,disabled:!!busy,on:{input:e=>{d.note=e.target.value;(state.inbox.notes||={})[r.id]=d.note;ibSaveAccessDraft(r,d);}}}),
         state.inbox.panel?ibPanelEl(r):el('div',{class:'ib-btns'},
           el('button',{disabled:!!busy,on:{click:()=>{state.inbox.panel='snooze';ibRegion('decide',ibDecideEl(r,grants));}}},'Later'),
-          el('button',{class:'primary grow',disabled:!!busy||stale,on:{click:()=>ibApprove(r,allow)}},busy?'Submit decision…':`Accept ${nOn}, reject ${n-nOn}`)),
+          el('button',{class:'primary grow',disabled:!!busy||stale,on:{click:()=>ibApprove(r,allow)}},busy?'Submit decision…':`Accept ${nOn}, reject ${n-nOn}`+(ibHasQuestions(r)?' and send answers':''))),
         !legacy?ibTTLEl(r):null,
         el('p',{class:'meta'},'A required label is a planning hint. You can reject every call.')):null,
       delivery.length?el('details',{class:'connection-setup'},el('summary',{},'Callback delivery'),...delivery):null);
   }
+  if ((r.kind === 'question' || r.kind === 'blocker') && ibHasQuestions(r)) return ibRichAnswerForm(r);
   if (r.kind === 'question' || r.kind === 'blocker') return ibAnswerForm(r);
   return el('div', { class: 'ib-sec' },
     el('div', { class: 'ib-eyebrow' }, 'Done reading?'),
@@ -6247,6 +6986,7 @@ function ibApproveBody(r, allow) {
   const d=ibAccessDraft(r),verdicts={};
   r.tools.forEach((t,k)=>{const id=ibCallID(t,k);verdicts[id]={verdict:allow[k]?'accepted':'rejected'};if(d.reasons[id])verdicts[id].reason=d.reasons[id];});
   const body={action:'submit',request_revision:d.revision,verdicts,note:d.note};
+  if (ibHasQuestions(r)) body.answers = ibAnswersBody(r);
   const nar = state.inbox.narrow[r.id] || {};
   const params = {};
   for (const k of Object.keys(nar)) if (allow[+k] && Object.keys(nar[k]).length) params[k] = nar[k];
@@ -6273,6 +7013,7 @@ async function ibRetryCallback(r, delivery) {
 function ibIsRisky(t) { return (t.flags || []).some((f) => f.level === 'red' || f.label === 'Production'); }
 
 function ibApprove(r, allow) {
+  if (!ibCheckAnswers(r)) return;
   const body = ibApproveBody(r, allow);
   const risky = r.tools.filter((t, k) => allow[k] && ibIsRisky(t));
   if (!risky.length) { ibDecide(r, body); return; }
@@ -6359,10 +7100,11 @@ async function ibDecide(r, body) {
     await api('/v1/inbox/' + r.id + '/decide', { method: 'POST', body });
     if (body.action === 'answer') ibDropDraft(r);
     if (body.action === 'submit') ibDropAccessDraft(r);
+    if (body.answers) { ibDropAnswersDraft(r); if (state.inbox.qproblems) delete state.inbox.qproblems[r.id]; }
     state.inbox.panel = null;
     delete state.inbox.narrow[r.id]; delete state.inbox.ttl[r.id];
     toast({ submit:'Decision saved. The agent receives your accepted and rejected calls.',approve: 'Approved. The agent can continue.', deny: 'Decision saved.', return: 'Sent back for a new plan.',
-      answer: 'Answer saved. The agent can retrieve it.', snooze: 'Snoozed.', read: 'Marked as read.' }[body.action] || 'Done');
+      answer: body.answers ? 'Answers saved. The agent can retrieve them.' : 'Answer saved. The agent can retrieve it.', snooze: 'Snoozed.', read: 'Marked as read.' }[body.action] || 'Done');
     state.inbox.busy = null;
     await loadInboxDetail(r.id, false);
     loadInbox();
@@ -6386,13 +7128,13 @@ function ibResultEl(r) {
   const cls = { approved: 'good', answered: 'good', read: 'mute', denied: 'bad', returned: 'bad', cancelled: 'mute', expired: 'mute' }[r.status] || 'mute';
   const title = {
     approved: `Allowed ${(r.tools || []).filter((t) => t.decision === 'allowed').length} of ${(r.tools || []).length}`,
-    answered: (r.retrieved_at ? 'Retrieved by agent: ' : 'Answer saved: ') + r.answer, read: 'Marked as read', denied: r.kind === 'access' ? 'Denied' : 'Dismissed',
+    answered: ibHasQuestions(r) ? (r.retrieved_at ? 'Answers retrieved by the agent' : 'Answers saved') : (r.retrieved_at ? 'Retrieved by agent: ' : 'Answer saved: ') + r.answer, read: 'Marked as read', denied: r.kind === 'access' ? 'Denied' : 'Dismissed',
     returned: 'Sent back to replan', cancelled: 'Withdrawn by the agent', expired: 'Expired without a decision',
   }[r.status] || r.status;
   const detail = r.status === 'approved' && r.grants_expire_at ? `Permissions expire at ${ibClock(r.grants_expire_at)}.` : '';
   return el('div', { class: 'ib-result ' + cls }, el('b', {}, title),
     r.owner_note ? el('span', {}, 'Your note: “' + r.owner_note + '”') : null, detail ? el('span', {}, detail) : null,
-    ibDeciderEl(r));
+    ibDeciderEl(r), r.kind !== 'access' && r.status === 'answered' ? ibAnswersView(r) : null);
 }
 
 // ibDeciderEl: "Decided by <name> via <label>" on a closed request, or null
