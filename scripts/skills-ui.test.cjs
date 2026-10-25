@@ -390,3 +390,18 @@ test('saving the default token PUTs it once and the browser forgets it', async (
   const clear = h.requests.filter((r) => r.method === 'PUT').pop();
   assert.equal(clear.body.token, '');
 });
+
+test('typing in a wizard field enables the next button without a re-render', () => {
+  const h = harness();
+  const out = h.run(`(() => {
+    const button = { disabled: true };
+    document = { getElementById: (id) => (id === 'skills-wiz-next' ? button : null) };
+    const w = skillsWizardNew();
+    skillsWizardRefreshNext(w);
+    const empty = button.disabled;
+    w.url = 'owner/repo';
+    skillsWizardRefreshNext(w);
+    return { empty, typed: button.disabled };
+  })()`);
+  assert.deepEqual(plain(out), { empty: true, typed: false });
+});

@@ -210,6 +210,17 @@ function skillsWizardCanSave(w) {
   return !w.busy && !!w.preview && (w.visibility !== 'members' || w.members.length > 0);
 }
 
+// skillsWizardRefreshNext enables or disables the wizard's next button after
+// a keystroke. A text field changes the wizard without a re-render (which
+// would move the focus), so the button must follow on its own.
+function skillsWizardRefreshNext(w) {
+  const b = typeof document !== 'undefined' && document.getElementById('skills-wiz-next');
+  if (!b) return;
+  b.disabled = w.step === 'url' ? !skillsWizardCanInspect(w)
+    : w.step === 'repo' ? !skillsWizardCanPreview(w)
+    : w.step === 'review' ? !skillsWizardCanSave(w) : false;
+}
+
 // ---- data --------------------------------------------------------------------
 
 async function loadSkills() {
@@ -728,15 +739,15 @@ function renderSkillsWizard() {
   let body;
   if (w.step === 'url') body = el('div', {},
     skillsField('GitHub repository', el('input', { id: 'skills-wiz-url', autofocus: true, placeholder: 'owner/repo, or a github.com URL (…/tree/<branch>/<folder> works too)', value: w.url,
-      on: { input: (e) => { w.url = e.target.value; }, keydown: (e) => { if (e.key === 'Enter') skillsWizardInspect(); } } })),
+      on: { input: (e) => { w.url = e.target.value; skillsWizardRefreshNext(w); }, keydown: (e) => { if (e.key === 'Enter') skillsWizardInspect(); } } })),
     w.auth !== 'none' ? renderSkillsTokenField(w) : el('button', { class: 'link', on: { click: () => { w.auth = 'token'; render(); } } },
       skillsUI.githubConnection ? 'Private repository? Add a read-only token or use your GitHub connection' : 'Private repository? Add a read-only token'));
   else if (w.step === 'repo') body = renderSkillsWizardRepo(w);
   else if (w.step === 'review') body = renderSkillsWizardReview(w);
   else body = renderSkillsWizardDone(w);
-  const next = w.step === 'url' ? el('button', { class: 'primary', disabled: !skillsWizardCanInspect(w), on: { click: skillsWizardInspect } }, w.busy ? 'Inspecting…' : 'Inspect')
-    : w.step === 'repo' ? el('button', { class: 'primary', disabled: !skillsWizardCanPreview(w), on: { click: skillsWizardPreview } }, w.busy ? 'Reading the repository…' : 'Preview')
-    : w.step === 'review' ? el('button', { class: 'primary', disabled: !skillsWizardCanSave(w), on: { click: skillsWizardSave } }, w.busy ? 'Saving and syncing…' : 'Save')
+  const next = w.step === 'url' ? el('button', { id: 'skills-wiz-next', class: 'primary', disabled: !skillsWizardCanInspect(w), on: { click: skillsWizardInspect } }, w.busy ? 'Inspecting…' : 'Inspect')
+    : w.step === 'repo' ? el('button', { id: 'skills-wiz-next', class: 'primary', disabled: !skillsWizardCanPreview(w), on: { click: skillsWizardPreview } }, w.busy ? 'Reading the repository…' : 'Preview')
+    : w.step === 'review' ? el('button', { id: 'skills-wiz-next', class: 'primary', disabled: !skillsWizardCanSave(w), on: { click: skillsWizardSave } }, w.busy ? 'Saving and syncing…' : 'Save')
     : el('button', { class: 'primary', on: { click: () => { const id = w.result && w.result.source && w.result.source.id; close(); if (id) navigate('skills/' + id); } } }, 'Open the source');
   const backTo = { repo: 'url', review: 'repo' }[w.step];
   return el('div', { class: 'modal-bg', on: { click: (e) => { if (e.target === e.currentTarget && !w.busy) close(); } } },
@@ -758,7 +769,7 @@ function renderSkillsTokenField(w) {
       el('label', { class: 'row' }, el('input', { type: 'radio', name: 'skills-auth', checked: w.auth === 'github', on: { change: () => { skillsWizardSet(w, 'auth', 'github'); render(); } } }), 'Use my GitHub connection')) : null,
     w.auth === 'token' ? skillsField('Read-only token',
       el('input', { id: 'skills-wiz-token', type: 'password', autocomplete: 'new-password', placeholder: 'A fine-grained token with Contents: read on this repository', value: w.token,
-        on: { input: (e) => { skillsWizardSet(w, 'token', e.target.value); } } }),
+        on: { input: (e) => { skillsWizardSet(w, 'token', e.target.value); skillsWizardRefreshNext(w); } } }),
       'Write-only: toolyard stores it sealed and never shows it again. It is used only to read this repository.') : null,
     w.auth === 'github' ? el('p', { class: 'meta' }, 'toolyard reads this repository with your own toolyard GitHub connection, now and on every sync. The toolyard GitHub App must be installed on it (Contents: read, Metadata: read).') : null);
 }
@@ -776,7 +787,7 @@ function renderSkillsWizardRepo(w) {
     skillsField('Branch', skillsSelect({ id: 'skills-wiz-branch', on: { change: (e) => { skillsWizardSet(w, 'branch', e.target.value); render(); } } },
       branches.map((b) => [b, b === info.default_branch ? b + ' (default)' : b]), w.branch),
       info.branches_more ? 'This repository has more branches than toolyard lists; type a URL with /tree/<branch> to pick another.' : null),
-    skillsField('Folder', el('input', { id: 'skills-wiz-path', placeholder: 'the repository root', value: w.path, on: { input: (e) => { skillsWizardSet(w, 'path', e.target.value); } } }),
+    skillsField('Folder', el('input', { id: 'skills-wiz-path', placeholder: 'the repository root', value: w.path, on: { input: (e) => { skillsWizardSet(w, 'path', e.target.value); skillsWizardRefreshNext(w); } } }),
       'Every folder under it that holds a SKILL.md becomes a skill.'),
     info.private || info.needs_token || w.auth !== 'none' ? renderSkillsTokenField(w) : null);
 }
