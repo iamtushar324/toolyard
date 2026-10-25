@@ -493,10 +493,12 @@ func TestProtocolRichExampleValidates(t *testing.T) {
 
 // execCallbacks records the execution.completed hook.
 type execCallbacks struct {
-	testCallbacks
 	runs []string
 	fail bool
 }
+
+func (c *execCallbacks) RegisterTx(context.Context, *sql.Tx, *Request, string) error { return nil }
+func (c *execCallbacks) DecisionTx(context.Context, *sql.Tx, *Request) error         { return nil }
 
 func (c *execCallbacks) ExecutionTx(ctx context.Context, tx *sql.Tx, e *Execution, agentID, tool string) error {
 	if c.fail {
