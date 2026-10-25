@@ -1503,8 +1503,9 @@ func (g *Gateway) routeEntry(ctx context.Context, entry toolEntry, via string, a
 	}
 
 	grantToken, _ := args[GrantField].(string)
-	ctx = withCallbackRef(ctx, args)
+	ctx = withCallbackRefFor(ctx, entry, args)
 	reason, intent, cleanArgs, rerr := extractReasonOpt(args, entry.reasonField, entry.reasonOptional)
+	cleanArgs = restoreOwnCallbackRef(entry, args, cleanArgs)
 	if rerr != nil {
 		_ = g.audit.Write(ctx, audit.Event{
 			EventType:     audit.EventCallFailed,
@@ -1815,7 +1816,7 @@ func (g *Gateway) holdAndWait(ctx context.Context, entry toolEntry, args map[str
 	default:
 		// Still pending after in-line window — return deferred response.
 		ev.Outcome = metrics.OutcomeDeferred
-		return g.deferredResponse(ctx, req, entry, args), nil
+		return withCallbackWarning(g.deferredResponse(ctx, req, entry, args), req.CallbackWarning), nil
 	}
 }
 

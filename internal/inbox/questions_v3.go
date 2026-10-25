@@ -54,6 +54,12 @@ var ErrBadAnswer = errors.New("answers are incomplete or invalid")
 // stableID is the shape of question IDs (and of call IDs, validateCallIDs).
 var stableID = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.:-]{0,79}$`)
 
+// reservedQuestionIDs are names of JavaScript's Object.prototype: clients
+// key answers by question ID in plain objects, where these collide.
+// (__proto__ and the other underscore names already fail stableID.)
+var reservedQuestionIDs = map[string]bool{"constructor": true, "prototype": true, "toString": true, "toLocaleString": true,
+	"valueOf": true, "hasOwnProperty": true, "isPrototypeOf": true, "propertyIsEnumerable": true}
+
 // QuestionSpec is one question of a schema version 3 item. Which fields
 // apply depends on Type; validateQuestionShape refuses the others.
 //
@@ -196,6 +202,8 @@ func validateQuestionSpecs(add func(string, string, ...any), in []QuestionSpec) 
 			add(p+".id", "give a stable ID with 1-80 letters, digits, dots, colons, underscores or hyphens; answers are keyed by it")
 		case seen[q.ID]:
 			add(p+".id", "duplicate question ID")
+		case reservedQuestionIDs[q.ID]:
+			add(p+".id", "%q is reserved; choose another ID", q.ID)
 		}
 		seen[q.ID] = true
 		q.Prompt = strings.TrimSpace(q.Prompt)
@@ -544,11 +552,11 @@ func normalizeValue(q *QuestionSpec, v any) (any, []string, error) {
 }
 
 // validateAnswers checks a decision's answers against r.Questions and
-// returns them normalized. Every required question needs an answer, a
-// choice question with allow_other also takes a custom text answer, and
-// unknown question IDs are refused. Unanswered optional questions are left
-// out.
-func validateAnswers(r *Request, in map[string]Answer) (map[string]Answer, error) {
+// returns them normalized. With requireAll, every required question needs
+// an answer (an owner who rejects every call answers only what they want).
+// A choice question with allow_other also takes a custom text answer, and
+// unknown question IDs are refused. Unanswered questions are left out.
+func validateAnswers(r *Request, in map[string]Answer, requireAll bool) (map[string]Answer, error) {
 	known := map[string]bool{}
 	for _, q := range r.Questions {
 		known[q.ID] = true
@@ -578,7 +586,7 @@ func validateAnswers(r *Request, in map[string]Answer) (map[string]Answer, error
 		}
 		custom := q.AllowOther && strings.TrimSpace(a.Text) != ""
 		if v == nil && !custom {
-			if q.required() {
+			if q.required() && requireAll {
 				return nil, fmt.Errorf("%w: answers.%s: required; answer %q", ErrBadAnswer, q.ID, limitText(q.Prompt, 80))
 			}
 			if strings.TrimSpace(a.Text) == "" {
@@ -611,7 +619,7 @@ func answerQuestions(r *Request, d Decision) error {
 	if d.RequestRevision != r.Revision || d.SubmissionID == "" || len(d.SubmissionID) > 128 {
 		return fmt.Errorf("%w: reload the request; answers need its revision and a submission ID", ErrConflict)
 	}
-	answers, err := validateAnswers(r, d.Answers)
+	answers, err := validateAnswers(r, d.Answers, true)
 	if err != nil {
 		return err
 	}

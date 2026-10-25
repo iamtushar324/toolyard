@@ -543,3 +543,129 @@ func TestFinishExecutionAnnouncesTheOutcome(t *testing.T) {
 		t.Fatalf("execution events: %v", cb.runs)
 	}
 }
+
+// Versions 1 and 2 keep their 12-call limit; only schema_version 3 takes
+// up to 50.
+func TestLegacyItemsKeepTwelveCalls(t *testing.T) {
+	sub := deploySubmission()
+	for len(sub.Tools) <= MaxToolsLegacy {
+		tl := sub.Tools[0]
+		tl.CallID = "more_" + strings.Repeat("z", len(sub.Tools))
+		sub.Tools = append(sub.Tools, tl)
+	}
+	_, probs, _ := Validate(context.Background(), testCatalog, "ag_1", sub)
+	found := false
+	for _, p := range probs {
+		found = found || p.Path == "tools"
+	}
+	if !found {
+		t.Fatalf("13 calls without schema_version 3 must be refused: %+v", probs)
+	}
+	sub.SchemaVersion = SchemaVersionRich
+	if _, probs, _ = Validate(context.Background(), testCatalog, "ag_1", sub); len(probs) > 0 {
+		t.Fatalf("13 calls with schema_version 3: %+v", probs)
+	}
+}
+
+func TestRichCapsAndReservedIDs(t *testing.T) {
+	sub := richSubmission()
+	sub.Questions[0].ID = "constructor"
+	sub.Tools[0].Params["blob"] = strings.Repeat("p", MaxParamsBytes)
+	sub.Attachments = []Attachment{{Type: "chart", Title: "Long labels", Chart: "bar", Unit: strings.Repeat("u", MaxChartLabel+1),
+		X: []any{strings.Repeat("x", MaxChartLabel+1), map[string]any{"bad": true}}, Series: []Series{{Name: strings.Repeat("n", MaxChartLabel+1), Values: []float64{1, 2}}}}}
+	_, probs, _ := Validate(context.Background(), testCatalog, "ag_1", sub)
+	paths := map[string]bool{}
+	for _, p := range probs {
+		paths[p.Path] = true
+	}
+	for _, want := range []string{"questions[0].id", "tools[0].params", "attachments[0].unit", "attachments[0].x[0]", "attachments[0].x[1]", "attachments[0].series[0].name"} {
+		if !paths[want] {
+			t.Errorf("no problem at %s: %+v", want, probs)
+		}
+	}
+	big := richSubmission()
+	big.Attachments = nil
+	for i := 0; i < MaxAttachments; i++ {
+		big.Attachments = append(big.Attachments, Attachment{Type: "log", Title: "Output", Body: strings.Repeat("l", 50000)})
+	}
+	_, probs, _ = Validate(context.Background(), testCatalog, "ag_1", big)
+	whole := false
+	for _, p := range probs {
+		whole = whole || (p.Path == "" && strings.Contains(p.Message, "bytes as JSON"))
+	}
+	if !whole {
+		t.Fatalf("a request over 1 MiB must be refused: %+v", probs)
+	}
+}
+
+// An owner who rejects every call ends the item without answering the
+// required questions; any answer given is still checked.
+func TestRejectingEveryCallMakesAnswersOptional(t *testing.T) {
+	e := newEnv(t)
+	ctx := context.Background()
+	r := submitRich(t, e)
+	d := richDecision(r, "reject_all", map[string]Answer{"budget": {Value: 999.0}})
+	for id := range d.Verdicts {
+		d.Verdicts[id] = CallVerdict{Verdict: VerdictRejected}
+	}
+	if _, err := e.svc.Decide(ctx, r.ID, d); !errors.Is(err, ErrBadAnswer) {
+		t.Fatalf("an invalid answer must still be refused: %v", err)
+	}
+	d.SubmissionID = "reject_all_2"
+	d.Answers = map[string]Answer{"notify": {Value: true}}
+	got, err := e.svc.Decide(ctx, r.ID, d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.Status != StatusDenied || len(got.Answers) != 1 || got.Answers["notify"].Value != true {
+		t.Fatalf("all rejected: %+v %+v", got.Status, got.Answers)
+	}
+}
+
+// The inbox_v3_enabled switch refuses version 3 items during a rolling
+// upgrade; versions 1 and 2 still work.
+func TestRichItemsCanBeTurnedOff(t *testing.T) {
+	e := newEnv(t)
+	on := false
+	e.svc.opts.RichEnabled = func() bool { return on }
+	res, err := e.svc.Submit(context.Background(), "ag_1", richSubmission())
+	if err != nil || res.OK || res.Problems[len(res.Problems)-1].Path != "schema_version" {
+		t.Fatalf("v3 while off: %+v %v", res, err)
+	}
+	if res, err = e.svc.Submit(context.Background(), "ag_1", deploySubmission()); err != nil || !res.OK {
+		t.Fatalf("v1 while off: %+v %v", res, err)
+	}
+	on = true
+	if res, err = e.svc.Submit(context.Background(), "ag_1", richSubmission()); err != nil || !res.OK {
+		t.Fatalf("v3 while on: %+v %v", res, err)
+	}
+}
+
+// checkingCallbacks refuses one receiver, as callbacks.CheckSubscription
+// refuses another agent's.
+type checkingCallbacks struct{ execCallbacks }
+
+func (c *checkingCallbacks) CheckSubscription(_ context.Context, agentID, ref string, _ *Request) error {
+	if ref == "cb_theirs" {
+		return errors.New("callback receiver is unavailable or belongs to another agent")
+	}
+	return nil
+}
+
+// Named receivers are checked on dry runs and real sends alike.
+func TestDryRunChecksCallbackRefs(t *testing.T) {
+	e := newEnv(t)
+	e.svc.SetCallbacks(&checkingCallbacks{})
+	sub := deploySubmission()
+	sub.DryRun = true
+	sub.CallbackRef = "cb_mine"
+	sub.CallbackRefs = []string{"cb_theirs"}
+	res, err := e.svc.Submit(context.Background(), "ag_1", sub)
+	if err != nil || res.OK || len(res.Problems) != 1 || res.Problems[0].Path != "callback_refs[0]" {
+		t.Fatalf("dry run: %+v %v", res, err)
+	}
+	sub.CallbackRefs = []string{strings.Repeat("c", MaxCallbackRefLen+1)}
+	if res, _ = e.svc.Submit(context.Background(), "ag_1", sub); res.OK {
+		t.Fatal("an over-long callback_ref was accepted")
+	}
+}

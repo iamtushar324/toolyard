@@ -30,14 +30,18 @@ type EventSink interface {
 func (b *Bus) SetEventSink(s EventSink) { b.events = s }
 
 // subscribe lets the request's receivers follow it. A refused callback
-// reference is logged; the call itself goes on (its deferred answer and
-// tools.poll_approval still work).
+// reference does not stop the call (its deferred answer and
+// tools.poll_approval still work): it is logged and returned to the caller
+// in req.CallbackWarning, which the gateway adds to the deferred answer.
 func (b *Bus) subscribe(ctx context.Context, req *Request, ref string) {
 	if b.events == nil || req == nil {
 		return
 	}
 	if err := b.events.SubscribeApproval(ctx, req, ref); err != nil {
 		logx.For("approval").Warn("approval callback subscription refused", "approval_id", req.ID, "err", err.Error())
+		if ref != "" {
+			req.CallbackWarning = "_callback_ref was not registered for this approval: " + err.Error() + ". No approval.decided or approval.executed callback will arrive; poll with tools.poll_approval."
+		}
 	}
 }
 

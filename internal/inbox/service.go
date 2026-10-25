@@ -75,6 +75,14 @@ type DecisionCallbacks interface {
 	DecisionTx(context.Context, *sql.Tx, *Request) error
 }
 
+// CallbackChecker is implemented by DecisionCallbacks that can check a
+// named receiver before the item is stored: it must be an active receiver
+// of the agent that can carry r's decision. Submit reports a refusal as a
+// problem, on dry runs too.
+type CallbackChecker interface {
+	CheckSubscription(ctx context.Context, agentID, ref string, r *Request) error
+}
+
 // ExecutionCallbacks is implemented by DecisionCallbacks that also announce
 // a granted call's outcome (execution.completed). ExecutionTx runs inside
 // the transaction that records the outcome; tool is the call's tool.
@@ -117,7 +125,11 @@ type Options struct {
 	Passkeys PasskeyGate
 	// AgentName resolves an agent ID to a display name.
 	AgentName func(ctx context.Context, agentID string) string
-	Now       func() time.Time
+	// RichEnabled, when set and false, refuses schema_version 3 items: an
+	// operator turns it off while replicas that predate it still run
+	// (they would drop the version 3 fields when they rewrite an item).
+	RichEnabled func() bool
+	Now         func() time.Time
 }
 
 // Service is the inbox.
@@ -357,6 +369,21 @@ func (s *Service) Submit(ctx context.Context, agentID string, sub *Submission) (
 		}
 	}
 	s.resolveUploads(ctx, agentID, r, &res.Problems)
+	if sub.SchemaVersion == SchemaVersionRich && s.opts.RichEnabled != nil && !s.opts.RichEnabled() {
+		res.Problems = append(res.Problems, Problem{"schema_version", "schema_version 3 is turned off on this server while it is upgraded; send version 1 or 2 for now"})
+	}
+	if checker, ok := s.opts.Callbacks.(CallbackChecker); ok {
+		if r.CallbackRef != "" {
+			if err := checker.CheckSubscription(ctx, agentID, r.CallbackRef, r); err != nil {
+				res.Problems = append(res.Problems, Problem{"callback_ref", err.Error()})
+			}
+		}
+		for i, ref := range r.CallbackRefs {
+			if err := checker.CheckSubscription(ctx, agentID, ref, r); err != nil {
+				res.Problems = append(res.Problems, Problem{fmt.Sprintf("callback_refs[%d]", i), err.Error()})
+			}
+		}
+	}
 
 	if sub.DryRun {
 		if n, err := s.countDryRuns(ctx, agentID, time.Hour); err == nil && n >= DryRunsPerHour {
@@ -829,7 +856,13 @@ func (s *Service) Decide(ctx context.Context, id string, d Decision) (*Request, 
 				return err
 			}
 			if len(r.Questions) > 0 || len(d.Answers) > 0 {
-				a, err := validateAnswers(r, d.Answers)
+				// Rejecting every call ends the item: required answers
+				// are then optional.
+				acceptsAny := false
+				for _, v := range d.Verdicts {
+					acceptsAny = acceptsAny || v.Verdict == VerdictAccepted
+				}
+				a, err := validateAnswers(r, d.Answers, acceptsAny)
 				if err != nil {
 					return err
 				}

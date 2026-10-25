@@ -15,20 +15,73 @@ import (
 // callbackRefArg is the reserved argument with which one call names the
 // receiver (callbacks.register) that hears about it: approval.decided and
 // approval.executed for a legacy deferred approval. Like _reason it is
-// stripped before the tool sees it.
+// stripped before the tool sees it, unless the tool declares a
+// _callback_ref parameter of its own (ownCallbackRef): then the argument
+// is the tool's, and toolyard neither reads nor strips it.
 const callbackRefArg = "_callback_ref"
+
+// maxCallbackRef bounds a _callback_ref (the same bound as callback_refs).
+const maxCallbackRef = 512
+
+const callbackRefPropDescription = "Optional: a callback_ref from callbacks.register. If this call waits for your owner's approval, that receiver gets approval.decided and approval.executed webhooks."
 
 type callbackRefKey struct{}
 
 // withCallbackRef carries a call's _callback_ref to holdAndWait. Each call
 // names its own: a nested call (code mode, tools.execute) without one does
-// not inherit the outer call's.
+// not inherit the outer call's. A reference longer than maxCallbackRef is
+// ignored (the deferred answer then has no callback).
 func withCallbackRef(ctx context.Context, args map[string]any) context.Context {
 	ref := strings.TrimSpace(stringArg(args, callbackRefArg))
+	if len(ref) > maxCallbackRef {
+		ref = ""
+	}
 	if ref == "" && callbackRefFrom(ctx) == "" {
 		return ctx
 	}
 	return context.WithValue(ctx, callbackRefKey{}, ref)
+}
+
+// withCallbackRefFor is withCallbackRef for a call to e: a tool with its
+// own _callback_ref parameter names no receiver.
+func withCallbackRefFor(ctx context.Context, e toolEntry, args map[string]any) context.Context {
+	if ownCallbackRef(e) {
+		return withCallbackRef(ctx, nil)
+	}
+	return withCallbackRef(ctx, args)
+}
+
+// ownCallbackRef reports whether e declares a _callback_ref parameter of
+// its own: one whose schema is not the one toolyard injects.
+func ownCallbackRef(e toolEntry) bool {
+	p, ok := e.tool.InputSchema.Properties[callbackRefArg].(map[string]any)
+	if !ok {
+		return false
+	}
+	d, _ := p["description"].(string)
+	return d != callbackRefPropDescription
+}
+
+// restoreOwnCallbackRef puts back the _callback_ref argument that
+// extractReasonOpt stripped when it belongs to the tool.
+func restoreOwnCallbackRef(e toolEntry, args, clean map[string]any) map[string]any {
+	if v, ok := args[callbackRefArg]; ok && clean != nil && ownCallbackRef(e) {
+		clean[callbackRefArg] = v
+	}
+	return clean
+}
+
+// withCallbackWarning adds to a deferred answer why its _callback_ref will
+// get no callback.
+func withCallbackWarning(res *mcp.CallToolResult, warning string) *mcp.CallToolResult {
+	if res == nil || warning == "" {
+		return res
+	}
+	if m, ok := res.StructuredContent.(map[string]any); ok {
+		m["callback_warning"] = warning
+	}
+	res.Content = append(res.Content, mcp.NewTextContent("Warning: "+warning))
+	return res
 }
 
 // callbackRefFrom is the call's _callback_ref, or "".
@@ -76,6 +129,8 @@ func receiverView(r *callbacks.Receiver) map[string]any {
 		"revision":           r.Revision,
 		"client_receiver_id": r.ClientReceiverID,
 		"default":            r.Default,
+		"events":             r.Events,
+		"v3":                 r.V3,
 	}
 	if r.EnvironmentID != "" {
 		out["environment_id"] = r.EnvironmentID
@@ -111,6 +166,10 @@ func callbackTools(svc *callbacks.Service, private CallbackPrivacy) []toolEntry 
 				"client_receiver_id": map[string]any{"type": "string", "maxLength": 120, "description": "Your stable key for this receiver, so a retry returns the same callback_ref. Default: derived from the destination."},
 				"environment_id":     map[string]any{"type": "string", "description": "Only for a federated T3 environment registering its own session-webhook URL."},
 				"make_default":       map[string]any{"type": "boolean", "description": "Also make it your default receiver (callbacks.set_default)."},
+				"events": map[string]any{"type": "array", "maxItems": callbacks.MaxReceiverEvents, "items": map[string]any{"type": "string"},
+					"description": "Event types this receiver accepts: names (" + strings.Join(callbacks.KnownEvents, ", ") + "), \"<prefix>.*\" or \"*\". " +
+						"Default: inbox.decision, inbox.expired, inbox.cancelled only. A receiver never gets an event it did not ask for."},
+				"v3": map[string]any{"type": "boolean", "description": "Accept the schema version 3 decision shape: answers keyed by question ID, and more than 12 calls. Default false."},
 			}),
 			func(ctx context.Context, args map[string]any) (*mcp.CallToolResult, error) {
 				agentID, errRes := requireAgentID(ctx)
@@ -133,12 +192,18 @@ func callbackTools(svc *callbacks.Service, private CallbackPrivacy) []toolEntry 
 				if env != "" && !privateOK {
 					return mcp.NewToolResultError("environment_id: the destination isn't this environment's session webhook (environment_destination_mismatch)"), nil
 				}
+				events, err := callbacks.NormalizeEvents(stringList(args["events"]))
+				if err != nil {
+					return mcp.NewToolResultError(err.Error()), nil
+				}
+				sub := callbacks.Subscription{Events: events, V3: boolArg(args, "v3")}
 				generated := false
 				if secret == "" {
 					// A retry of a registration whose generated secret was
 					// shown once gets the receiver back, without the secret.
 					if prev, err := svc.ByClientID(ctx, agentID, clientID); err == nil {
-						if prev.Destination != dest || prev.EnvironmentID != env || prev.Status != "active" || prev.Transport != "push" {
+						if prev.Destination != dest || prev.EnvironmentID != env || prev.Status != "active" || prev.Transport != "push" ||
+							strings.Join(prev.Events, ",") != strings.Join(events, ",") || prev.V3 != sub.V3 {
 							return callbackError(callbacks.ErrConflict), nil
 						}
 						out := receiverView(prev)
@@ -152,7 +217,7 @@ func callbackTools(svc *callbacks.Service, private CallbackPrivacy) []toolEntry 
 					}
 					secret, generated = s, true
 				}
-				r, err := svc.Register(ctx, agentID, env, clientID, dest, secret, privateOK)
+				r, err := svc.RegisterWith(ctx, agentID, env, clientID, dest, secret, privateOK, sub)
 				if err != nil {
 					return callbackError(err), nil
 				}

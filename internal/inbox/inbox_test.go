@@ -292,7 +292,7 @@ func TestProtocolExamplesValidate(t *testing.T) {
 }
 
 func TestProtocolMentionsLimits(t *testing.T) {
-	for _, want := range []string{"≤ 60 characters", "≤ 200 characters", "75 words at most", "1–50 entries", "Up to 24", "max 86400", "≤ 20,000 characters", "up to 20 questions"} {
+	for _, want := range []string{"≤ 60 characters", "≤ 200 characters", "75 words at most", "1–12 entries", "up to 50 with `schema_version: 3`", "Up to 24", "max 86400", "≤ 20,000 characters", "up to 20 questions"} {
 		if !strings.Contains(docs.AgentProtocol, want) {
 			t.Errorf("agent-protocol.md should mention %q (it must match validate.go)", want)
 		}

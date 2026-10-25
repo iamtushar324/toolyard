@@ -18,10 +18,10 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"strconv"
 	"strings"
-	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -33,6 +33,13 @@ import (
 var ErrReceiver = errors.New("callback receiver is unavailable or belongs to another agent")
 var ErrConflict = errors.New("callback receiver revision or registration changed")
 
+// ErrTooManyReceivers refuses a registration beyond MaxReceiversPerAgent.
+var ErrTooManyReceivers = fmt.Errorf("an agent may keep at most %d receivers; remove one first", MaxReceiversPerAgent)
+
+// MaxReceiversPerAgent bounds the receivers an agent keeps (removed ones
+// do not count).
+const MaxReceiversPerAgent = 20
+
 type Receiver struct {
 	ID               string `json:"callback_ref"`
 	AgentID          string `json:"-"`
@@ -43,16 +50,29 @@ type Receiver struct {
 	Revision         int    `json:"revision"`
 	Status           string `json:"status"`
 	PrivateAllowed   bool   `json:"-"`
+	// Events are the event types the receiver accepts ("*", exact names,
+	// "prefix.*"); V3 opts it into the schema version 3 decision shape.
+	Events []string `json:"events"`
+	V3     bool     `json:"v3"`
 	// Default is set by List: the agent's default receiver.
 	Default bool `json:"default,omitempty"`
 	secret  string
+}
+
+// Subscription is what a new receiver accepts. The zero value is the
+// legacy receiver: inbox.decision, inbox.expired and inbox.cancelled in
+// the version 2 shape.
+type Subscription struct {
+	Events []string
+	V3     bool
 }
 
 type Service struct {
 	db     *store.DB
 	cipher *sealbox.Cipher
 	now    func() time.Time
-	mu     sync.Mutex
+	// slots bounds the deliveries in flight in this process (delivery.go).
+	slots chan struct{}
 	// Resolver is injectable for deterministic DNS rebinding tests.
 	Resolver func(context.Context, string) ([]net.IPAddr, error)
 	// ackHook, when set (tests), runs inside Ack between its read and its
@@ -61,7 +81,7 @@ type Service struct {
 }
 
 func New(db *store.DB, cipher *sealbox.Cipher) *Service {
-	return &Service{db: db, cipher: cipher, now: time.Now, Resolver: net.DefaultResolver.LookupIPAddr}
+	return &Service{db: db, cipher: cipher, now: time.Now, Resolver: net.DefaultResolver.LookupIPAddr, slots: make(chan struct{}, deliveryWorkers)}
 }
 
 func secretBytes(secret string) ([]byte, error) {
@@ -75,20 +95,37 @@ func secretBytes(secret string) ([]byte, error) {
 	return b, nil
 }
 
+// Register registers a legacy push receiver (Subscription{}).
 func (s *Service) Register(ctx context.Context, agentID, environmentID, clientID, destination, secret string, privateAllowed bool) (*Receiver, error) {
-	return s.register(ctx, agentID, environmentID, clientID, destination, secret, privateAllowed, "push")
+	return s.RegisterWith(ctx, agentID, environmentID, clientID, destination, secret, privateAllowed, Subscription{})
 }
+
+// RegisterWith registers a push receiver that accepts sub.
+func (s *Service) RegisterWith(ctx context.Context, agentID, environmentID, clientID, destination, secret string, privateAllowed bool, sub Subscription) (*Receiver, error) {
+	return s.register(ctx, agentID, environmentID, clientID, destination, secret, privateAllowed, "push", sub)
+}
+
+// RegisterPull registers a legacy pull receiver (Subscription{}).
 func (s *Service) RegisterPull(ctx context.Context, agentID, environmentID, clientID, secret string) (*Receiver, error) {
+	return s.RegisterPullWith(ctx, agentID, environmentID, clientID, secret, Subscription{})
+}
+
+// RegisterPullWith registers a pull receiver that accepts sub.
+func (s *Service) RegisterPullWith(ctx context.Context, agentID, environmentID, clientID, secret string, sub Subscription) (*Receiver, error) {
 	if environmentID == "" {
 		return nil, ErrReceiver
 	}
-	return s.register(ctx, agentID, environmentID, clientID, "", secret, false, "pull")
+	return s.register(ctx, agentID, environmentID, clientID, "", secret, false, "pull", sub)
 }
-func (s *Service) register(ctx context.Context, agentID, environmentID, clientID, destination, secret string, privateAllowed bool, transport string) (*Receiver, error) {
+func (s *Service) register(ctx context.Context, agentID, environmentID, clientID, destination, secret string, privateAllowed bool, transport string, sub Subscription) (*Receiver, error) {
 	if agentID == "" || clientID == "" || len(clientID) > 120 {
 		return nil, ErrReceiver
 	}
 	if _, err := secretBytes(secret); err != nil {
+		return nil, err
+	}
+	events, err := NormalizeEvents(sub.Events)
+	if err != nil {
 		return nil, err
 	}
 	if transport == "push" {
@@ -101,7 +138,7 @@ func (s *Service) register(ctx context.Context, agentID, environmentID, clientID
 	}
 	// Retries of identical registration return the same opaque reference.
 	var previousID string
-	err := s.db.QueryRowContext(ctx, `SELECT id FROM callback_receivers WHERE agent_id=? AND client_receiver_id=?`, agentID, clientID).Scan(&previousID)
+	err = s.db.QueryRowContext(ctx, `SELECT id FROM callback_receivers WHERE agent_id=? AND client_receiver_id=?`, agentID, clientID).Scan(&previousID)
 	if err == nil {
 		r, err := s.Get(ctx, agentID, previousID)
 		if err != nil {
@@ -111,7 +148,8 @@ func (s *Service) register(ctx context.Context, agentID, environmentID, clientID
 		if err != nil {
 			return nil, err
 		}
-		if r.Transport != transport || r.Destination != destination || r.EnvironmentID != environmentID || !hmac.Equal(plain, []byte(secret)) || r.Status != "active" {
+		if r.Transport != transport || r.Destination != destination || r.EnvironmentID != environmentID || !hmac.Equal(plain, []byte(secret)) || r.Status != "active" ||
+			strings.Join(r.Events, ",") != strings.Join(events, ",") || r.V3 != sub.V3 {
 			return nil, ErrConflict
 		}
 		return r, nil
@@ -119,17 +157,24 @@ func (s *Service) register(ctx context.Context, agentID, environmentID, clientID
 	if !errors.Is(err, sql.ErrNoRows) {
 		return nil, err
 	}
+	var kept int
+	if err = s.db.QueryRowContext(ctx, `SELECT count(*) FROM callback_receivers WHERE agent_id=? AND status<>'removed'`, agentID).Scan(&kept); err != nil {
+		return nil, err
+	}
+	if kept >= MaxReceiversPerAgent {
+		return nil, ErrTooManyReceivers
+	}
 	id := "cb_" + uuid.NewString()
 	enc, err := s.cipher.Seal([]byte(secret), []byte("callback|"+id))
 	if err != nil {
 		return nil, err
 	}
-	n, err := s.insertReceiver(ctx, id, agentID, environmentID, clientID, destination, enc, privateAllowed, transport)
+	n, err := s.insertReceiver(ctx, id, agentID, environmentID, clientID, destination, enc, privateAllowed, transport, strings.Join(events, ","), sub.V3)
 	if err != nil {
 		// A concurrent identical registration may own the unique client binding.
 		var won string
 		if e := s.db.QueryRowContext(ctx, `SELECT id FROM callback_receivers WHERE agent_id=? AND client_receiver_id=?`, agentID, clientID).Scan(&won); e == nil {
-			return s.register(ctx, agentID, environmentID, clientID, destination, secret, privateAllowed, transport)
+			return s.register(ctx, agentID, environmentID, clientID, destination, secret, privateAllowed, transport, sub)
 		}
 		return nil, err
 	}
@@ -146,7 +191,7 @@ func (s *Service) register(ctx context.Context, agentID, environmentID, clientID
 // waits for this insert and removes it too, or commits first and this
 // insert sees the revoked connection. SQLite's single connection already
 // serializes both. The transaction ends before insertReceiver returns.
-func (s *Service) insertReceiver(ctx context.Context, id, agentID, environmentID, clientID, destination, enc string, privateAllowed bool, transport string) (int64, error) {
+func (s *Service) insertReceiver(ctx context.Context, id, agentID, environmentID, clientID, destination, enc string, privateAllowed bool, transport, events string, v3 bool) (int64, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return 0, err
@@ -160,7 +205,7 @@ func (s *Service) insertReceiver(ctx context.Context, id, agentID, environmentID
 	// Parameters in a SELECT list have no column type on Postgres: cast them
 	// to the column types (the casts change nothing on SQLite).
 	now := s.now().UnixMilli()
-	result, err := tx.ExecContext(ctx, `INSERT INTO callback_receivers(id,agent_id,environment_id,client_receiver_id,destination,secret_enc,private_allowed,created_at,transport) SELECT CAST(? AS TEXT),CAST(? AS TEXT),CAST(? AS TEXT),CAST(? AS TEXT),CAST(? AS TEXT),CAST(? AS TEXT),CAST(? AS BIGINT),CAST(? AS BIGINT),CAST(? AS TEXT) WHERE NOT EXISTS (`+inactiveHostPredicate+`)`, id, agentID, environmentID, clientID, destination, enc, boolInt(privateAllowed), now, transport, agentID, now)
+	result, err := tx.ExecContext(ctx, `INSERT INTO callback_receivers(id,agent_id,environment_id,client_receiver_id,destination,secret_enc,private_allowed,created_at,transport,events,v3) SELECT CAST(? AS TEXT),CAST(? AS TEXT),CAST(? AS TEXT),CAST(? AS TEXT),CAST(? AS TEXT),CAST(? AS TEXT),CAST(? AS BIGINT),CAST(? AS BIGINT),CAST(? AS TEXT),CAST(? AS TEXT),CAST(? AS BIGINT) WHERE NOT EXISTS (`+inactiveHostPredicate+`)`, id, agentID, environmentID, clientID, destination, enc, boolInt(privateAllowed), now, transport, events, boolInt(v3), agentID, now)
 	if err != nil {
 		return 0, err
 	}
@@ -183,11 +228,13 @@ func boolInt(b bool) int {
 
 func scanReceiver(row interface{ Scan(...any) error }) (*Receiver, error) {
 	r := new(Receiver)
-	err := row.Scan(&r.ID, &r.AgentID, &r.EnvironmentID, &r.ClientReceiverID, &r.Destination, &r.secret, &r.Revision, &r.Status, &r.PrivateAllowed, &r.Transport)
+	var events string
+	err := row.Scan(&r.ID, &r.AgentID, &r.EnvironmentID, &r.ClientReceiverID, &r.Destination, &r.secret, &r.Revision, &r.Status, &r.PrivateAllowed, &r.Transport, &events, &r.V3)
+	r.Events = splitEvents(events)
 	return r, err
 }
 
-const receiverColumns = `id,agent_id,environment_id,client_receiver_id,destination,secret_enc,revision,status,private_allowed,transport`
+const receiverColumns = `id,agent_id,environment_id,client_receiver_id,destination,secret_enc,revision,status,private_allowed,transport,events,v3`
 
 func (s *Service) Get(ctx context.Context, agentID, id string) (*Receiver, error) {
 	r, err := scanReceiver(s.db.QueryRowContext(ctx, `SELECT `+receiverColumns+` FROM callback_receivers WHERE id=? AND agent_id=?`, id, agentID))
@@ -291,6 +338,10 @@ func (s *Service) RegisterTx(ctx context.Context, tx *sql.Tx, r *inbox.Request, 
 		if hostConnectionActive(ctx, tx, r.AgentID, s.now().UnixMilli()) != nil {
 			return nil
 		}
+		// A default receiver that cannot take this item's shape skips it.
+		if v3, err := receiverV3(ctx, tx, def); err != nil || (needsV3(r) && !v3) {
+			return err
+		}
 		_, err = tx.ExecContext(ctx, `INSERT INTO callback_subscriptions(request_id,receiver_id,receiver_revision) VALUES(?,?,?) ON CONFLICT DO NOTHING`, r.ID, def, revision)
 		return err
 	}
@@ -298,12 +349,49 @@ func (s *Service) RegisterTx(ctx context.Context, tx *sql.Tx, r *inbox.Request, 
 		return err
 	}
 	var revision int
-	err := tx.QueryRowContext(ctx, `SELECT revision FROM callback_receivers WHERE id=? AND agent_id=? AND status='active'`, ref, r.AgentID).Scan(&revision)
+	var v3 bool
+	err := tx.QueryRowContext(ctx, `SELECT revision,v3 FROM callback_receivers WHERE id=? AND agent_id=? AND status='active'`, ref, r.AgentID).Scan(&revision, &v3)
 	if err != nil {
 		return ErrReceiver
 	}
+	if needsV3(r) && !v3 {
+		return ErrNeedsV3
+	}
 	_, err = tx.ExecContext(ctx, `INSERT INTO callback_subscriptions(request_id,receiver_id,receiver_revision) VALUES(?,?,?) ON CONFLICT DO NOTHING`, r.ID, ref, revision)
 	return err
+}
+
+// ErrNeedsV3 refuses a receiver without the v3 capability for an item whose
+// decision only the version 3 shape can carry (more than 12 calls).
+var ErrNeedsV3 = fmt.Errorf("this receiver takes the version 2 decision shape, which carries at most %d calls; register a receiver with v3: true for this item", maxLegacyCalls)
+
+// maxLegacyCalls is the most calls a version 2 decision event carries.
+const maxLegacyCalls = 12
+
+// needsV3 reports whether r's decision event needs the version 3 shape.
+func needsV3(r *inbox.Request) bool { return len(r.Tools) > maxLegacyCalls }
+
+func receiverV3(ctx context.Context, q hostQuery, ref string) (bool, error) {
+	var v3 bool
+	err := q.QueryRowContext(ctx, `SELECT v3 FROM callback_receivers WHERE id=?`, ref).Scan(&v3)
+	return v3, err
+}
+
+// CheckSubscription implements inbox.CallbackChecker: ref must be an
+// active receiver of the agent that can carry r's decision. Submit asks it
+// for every named receiver, dry runs included.
+func (s *Service) CheckSubscription(ctx context.Context, agentID, ref string, r *inbox.Request) error {
+	rec, err := s.Get(ctx, agentID, ref)
+	if err != nil {
+		return err
+	}
+	if rec.Status != "active" {
+		return ErrReceiver
+	}
+	if needsV3(r) && !rec.V3 {
+		return ErrNeedsV3
+	}
+	return nil
 }
 
 type Outcome struct {
@@ -359,19 +447,55 @@ func (s *Service) DecisionTx(ctx context.Context, tx *sql.Tx, r *inbox.Request) 
 		outcomes = append(outcomes, Outcome{CallID: t.CallID, Verdict: verdict, Reason: t.Reason})
 	}
 	data := EventData{InboxID: r.ID, DecisionRevision: r.Revision, Status: status, Calls: outcomes, OverallNote: r.OwnerNote, RequestExpiresAt: r.ExpiresAt, GrantExpiresAt: r.GrantsExpire, StatusRef: r.ID, Response: r.Response, Answers: r.Answers}
+	// A receiver without the v3 capability gets the version 2 shape: no
+	// answers, and no event at all when the calls do not fit it.
+	legacy := data
+	legacy.Answers = nil
+	q := queued{agentID: r.AgentID, subject: r.ID, revision: r.Revision, eventType: kind, dedupe: fmt.Sprintf("inbox:%s:%d", r.ID, r.Revision),
+		data: data, legacy: legacy, legacySkip: len(outcomes) > maxLegacyCalls}
 	for _, sub := range subs {
+		q.receiver, q.receiverRevision = sub.receiver, sub.revision
 		// A repeated logical event fails the transaction (dedupe key).
-		_, err := s.queueTx(ctx, tx, queued{agentID: r.AgentID, subject: r.ID, revision: r.Revision, receiver: sub.receiver, receiverRevision: sub.revision,
-			eventType: kind, dedupe: fmt.Sprintf("inbox:%s:%d", r.ID, r.Revision), data: data})
-		if err != nil {
+		if _, err := s.queueTx(ctx, tx, q); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
+// deniedPrefixes are every special-use range a public receiver must not
+// resolve to (RFC 6890 and its updates): this host, private, shared (CGN),
+// loopback, link-local, documentation, benchmarking, protocol assignments,
+// multicast, reserved and broadcast, and their IPv6 equivalents, including
+// the prefixes that embed an IPv4 address (NAT64, 6to4, Teredo).
+var deniedPrefixes = func() []netip.Prefix {
+	var out []netip.Prefix
+	for _, p := range []string{
+		"0.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8", "169.254.0.0/16", "172.16.0.0/12",
+		"192.0.0.0/24", "192.0.2.0/24", "192.31.196.0/24", "192.52.193.0/24", "192.88.99.0/24", "192.168.0.0/16",
+		"192.175.48.0/24", "198.18.0.0/15", "198.51.100.0/24", "203.0.113.0/24", "224.0.0.0/4", "240.0.0.0/4",
+		"::/128", "::1/128", "::ffff:0:0/96", "::/96", "64:ff9b::/96", "64:ff9b:1::/48", "100::/64",
+		"2001::/23", "2001:db8::/32", "2002::/16", "3fff::/20", "5f00::/16", "fc00::/7", "fe80::/10", "fec0::/10", "ff00::/8",
+	} {
+		out = append(out, netip.MustParsePrefix(p))
+	}
+	return out
+}()
+
+// privateIP reports whether ip is not a public unicast address: an IPv4
+// address mapped into IPv6 is checked as IPv4.
 func privateIP(ip net.IP) bool {
-	return ip.IsPrivate() || ip.IsLoopback() || ip.IsUnspecified() || ip.IsLinkLocalUnicast() || ip.IsLinkLocalMulticast() || !ip.IsGlobalUnicast()
+	a, ok := netip.AddrFromSlice(ip)
+	if !ok {
+		return true
+	}
+	a = a.Unmap()
+	for _, p := range deniedPrefixes {
+		if p.Contains(a) {
+			return true
+		}
+	}
+	return false
 }
 func (s *Service) resolve(ctx context.Context, raw string, allowPrivate bool) ([]net.IPAddr, error) {
 	u, err := url.Parse(raw)
@@ -477,45 +601,34 @@ func (s *Service) Retry(ctx context.Context, agentID, eventID string) error {
 
 var retryDelays = []time.Duration{5 * time.Second, time.Minute, 5 * time.Minute, 30 * time.Minute, 2 * time.Hour, 6 * time.Hour, 12 * time.Hour, 24 * time.Hour}
 
-// Run resumes persistent delivery after restarts. Claims have leases, so a
-// lost acknowledgement may cause a physical duplicate with the same event id.
-func (s *Service) Run(ctx context.Context) {
-	ticker := time.NewTicker(time.Second)
-	defer ticker.Stop()
-	for {
-		select {
-		case <-ctx.Done():
-			return
-		case <-ticker.C:
-			_ = s.DeliverOne(ctx)
-		}
-	}
-}
-
+// DeliverOne delivers the oldest due push event in the caller's goroutine
+// (tests and tools; Run delivers in batches, delivery.go).
 func (s *Service) DeliverOne(ctx context.Context) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	now := s.now().UnixMilli()
-	var id, payload, ref string
-	var attempts, rev int
-	err := s.db.QueryRowContext(ctx, `SELECT id,payload,receiver_id,attempts,receiver_revision FROM callback_outbox WHERE receiver_id IN (SELECT id FROM callback_receivers WHERE transport='push') AND ((status='pending' AND next_attempt_at<=?) OR (status='delivering' AND claim_until<=?)) ORDER BY next_attempt_at LIMIT 1`, now, now).Scan(&id, &payload, &ref, &attempts, &rev)
-	if errors.Is(err, sql.ErrNoRows) {
-		return nil
-	}
-	if err != nil {
+	ids, err := s.pickDue(ctx, 1)
+	if err != nil || len(ids) == 0 {
 		return err
 	}
+	return s.deliver(ctx, ids[0])
+}
+
+// deliver claims one due event and sends it. Claims have leases, so a lost
+// acknowledgement may cause a physical duplicate with the same event id;
+// a claim another node (or worker) took first makes this a no-op.
+func (s *Service) deliver(ctx context.Context, id string) error {
+	now := s.now().UnixMilli()
+	var payload, ref string
+	var rev int
 	// The claim returns the attempt number it took, so finish is fenced on
 	// this claim even if another claim ran between the read and the claim.
 	var claimed int
-	err = s.db.QueryRowContext(ctx, `UPDATE callback_outbox SET status='delivering',claim_until=?,attempts=attempts+1 WHERE id=? AND ((status='pending' AND next_attempt_at<=?) OR (status='delivering' AND claim_until<=?)) RETURNING attempts`, now+60000, id, now, now).Scan(&claimed)
+	err := s.db.QueryRowContext(ctx, `UPDATE callback_outbox SET status='delivering',claim_until=?,attempts=attempts+1 WHERE id=? AND ((status='pending' AND next_attempt_at<=?) OR (status='delivering' AND claim_until<=?)) RETURNING attempts,payload,receiver_id,receiver_revision`, now+60000, id, now, now).Scan(&claimed, &payload, &ref, &rev)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil
 	}
 	if err != nil {
 		return err
 	}
-	attempts = claimed - 1 // every attempts+1 below is this claim's attempt
+	attempts := claimed - 1 // every attempts+1 below is this claim's attempt
 	receiver, err := scanReceiver(s.db.QueryRowContext(ctx, `SELECT `+receiverColumns+` FROM callback_receivers WHERE id=?`, ref))
 	if err != nil || receiver.Status != "active" {
 		return s.finish(ctx, id, attempts+1, 0, "receiver_unavailable", true)

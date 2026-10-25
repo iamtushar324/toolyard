@@ -227,3 +227,47 @@ test('a decided item lists its answers',()=>{
   assert.match(all,/Cost → Speed → Safety/);
   assert.match(all,/Not answered/);
 });
+
+test('links with a user name or password are not links',()=>{
+  const h=harness();
+  const tree=md(h,'[bank](https://bank.example@evil.example/login) and https://user:pw@evil.example/x and <https://a@b.example>');
+  assert.equal(nodes(tree,'a').length,0);
+  assert.match(text({children:tree}),/bank/);
+});
+
+test('pathological Markdown finishes quickly',()=>{
+  const h=harness();
+  const inputs=['['.repeat(20000),'*a '.repeat(7000),'`'.repeat(20000),'`a``'.repeat(5000),'![x]('.repeat(3500),'_a '.repeat(7000),
+    '~~a '.repeat(5000),'[a]('.repeat(5000),'<'.repeat(20000),'http://x'.repeat(2500),'> '.repeat(10000),'- '.repeat(10000),
+    '|a'.repeat(10000)+'\n|-|\n','**'.repeat(10000),'[`'.repeat(10000),'1. '.repeat(7000)];
+  for(const src of inputs){
+    const t0=Date.now();
+    md(h,src);
+    const ms=Date.now()-t0;
+    assert.ok(ms<1500,`${JSON.stringify(src.slice(0,12))}… took ${ms} ms`);
+  }
+});
+
+test('answer drafts are maps without a prototype',()=>{
+  const h=harness();h.context.req=structuredClone(everyType);
+  assert.equal(h.run('Object.getPrototypeOf(ibAnswersDraft(req).values)'),null);
+  assert.equal(h.run('Object.getPrototypeOf(ibAnswersDraft(req).texts)'),null);
+  assert.equal(h.run('Object.getPrototypeOf(ibAnswersBody(req))'),null);
+  // A draft read back from storage is converted too.
+  h.run('ibSaveAnswersDraft(req,ibAnswersDraft(req));ibAnswerDrafts.clear()');
+  assert.equal(h.run('Object.getPrototypeOf(ibAnswersDraft(req).values)'),null);
+  assert.equal(h.run('ibAnswersDraft(req).values.notify'),true);
+});
+
+test('rejecting every call does not require the answers',()=>{
+  const h=harness();
+  h.context.req={id:'rq_rej',agent_name:'Agent',kind:'access',status:'pending',revision:1,expires_at:Date.now()+86400000,ttl_seconds:1800,
+    tools:[{call_id:'deploy',tool:'deploy.run',required:true,summary:'Deploy.',target:'api',expected_effects:'New build.',params:{env:{eq:'prod'}},flags:[]}],
+    questions:[{id:'rollout',type:'single_choice',prompt:'Rollout?',required:true,options:[{id:'staged',label:'Staged'},{id:'all',label:'All at once'}]}]};
+  h.run('state.inbox.detail.request=req;sent=[];api=async(url,opts)=>{sent.push(opts.body);return {};};');
+  h.run('ibDecideEl(req,[]);ibSelectCalls(req,[false]);ibApprove(req,[false])');
+  const sent=plain(h.run('sent'));
+  assert.equal(sent.length,1);
+  assert.deepEqual(sent[0].verdicts,{deploy:{verdict:'rejected'}});
+  assert.deepEqual(sent[0].answers,{});
+});

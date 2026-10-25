@@ -317,6 +317,11 @@ dashboard's own sanitizing renderer; charts are `line`, `bar`,
 [agent-protocol.md §14](agent-protocol.md#14-questions-and-rich-items-schema-version-3);
 callbacks, receivers and events are in
 [inbox-federation.md](inbox-federation.md) and agent-protocol.md §15.
+Rollout: every replica must run v0.1 before agents send schema version 3
+items, because an older replica that rewrites an item drops the fields it
+does not know; the `inbox_v3_enabled` setting (default on) refuses version 3
+items until then ([self-hosting.md](../self-hosting.md#inbox-and-permissions)).
+Versions 1 and 2 keep their limits (12 calls).
 
 **Session binding.** If an agent passes no `session_id`, items attach to
 that agent's most recent live session, or an automatic

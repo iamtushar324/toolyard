@@ -86,15 +86,30 @@ func TestCallbackToolsOverMCP(t *testing.T) {
 	}
 
 	// Register with a generated secret: it comes back once.
-	first := structured(t, f.call(t, f.agent, "callbacks.register", map[string]any{"destination": "https://receiver.example/hooks/one"}))
+	everything := map[string]any{"destination": "https://receiver.example/hooks/one", "events": []any{"*"}, "v3": true}
+	first := structured(t, f.call(t, f.agent, "callbacks.register", everything))
 	ref, _ := first["callback_ref"].(string)
 	secret, _ := first["secret"].(string)
-	if !strings.HasPrefix(ref, "cb_") || !strings.HasPrefix(secret, "whsec_") || first["status"] != "active" {
+	if !strings.HasPrefix(ref, "cb_") || !strings.HasPrefix(secret, "whsec_") || first["status"] != "active" || first["v3"] != true {
 		t.Fatalf("register: %v", first)
 	}
-	again := structured(t, f.call(t, f.agent, "callbacks.register", map[string]any{"destination": "https://receiver.example/hooks/one"}))
+	again := structured(t, f.call(t, f.agent, "callbacks.register", everything))
 	if again["callback_ref"] != ref || again["secret"] != nil || again["secret_returned"] != false {
 		t.Fatalf("a repeated registration must return the receiver without its secret: %v", again)
+	}
+	if res := f.call(t, f.agent, "callbacks.register", map[string]any{"destination": "https://receiver.example/hooks/one"}); !res.IsError {
+		t.Fatal("a registration with other events under the same client_receiver_id was accepted")
+	}
+	if res := f.call(t, f.agent, "callbacks.register", map[string]any{"destination": "https://receiver.example/hooks/bad", "events": []any{"inbox.decisions"}}); !res.IsError {
+		t.Fatal("an unknown event type was accepted")
+	}
+	// Without events, a receiver gets the three legacy decision events only.
+	legacy := structured(t, f.call(t, f.agent, "callbacks.register", map[string]any{"destination": "https://receiver.example/hooks/legacy"}))
+	if evs, _ := legacy["events"].([]any); len(evs) != 3 || legacy["v3"] != false {
+		t.Fatalf("legacy receiver: %v", legacy)
+	}
+	if res := f.call(t, f.agent, "callbacks.test", map[string]any{"callback_ref": legacy["callback_ref"]}); !res.IsError {
+		t.Fatal("a receiver that did not opt into ping was pinged")
 	}
 	if res := f.call(t, f.agent, "callbacks.register", map[string]any{"destination": "http://receiver.example/plain"}); !res.IsError {
 		t.Fatal("an http destination was accepted")
@@ -107,13 +122,14 @@ func TestCallbackToolsOverMCP(t *testing.T) {
 
 	// A second receiver, with the agent's own secret, made the default.
 	own := "whsec_" + strings.Repeat("QUJD", 8)
-	second := structured(t, f.call(t, f.agent, "callbacks.register", map[string]any{"destination": "https://receiver.example/hooks/two", "secret": own, "make_default": true}))
+	second := structured(t, f.call(t, f.agent, "callbacks.register", map[string]any{"destination": "https://receiver.example/hooks/two", "secret": own, "make_default": true,
+		"events": []any{"inbox.*"}, "v3": true}))
 	ref2, _ := second["callback_ref"].(string)
 	if ref2 == "" || second["secret"] != nil || second["default"] != true {
 		t.Fatalf("second register: %v", second)
 	}
 	list := structured(t, f.call(t, f.agent, "callbacks.list", nil))
-	if recv, _ := list["receivers"].([]any); len(recv) != 2 || list["default"] != ref2 {
+	if recv, _ := list["receivers"].([]any); len(recv) != 3 || list["default"] != ref2 {
 		t.Fatalf("list: %v", list)
 	}
 	if s := structured(t, f.call(t, f.agent, "callbacks.set_default", map[string]any{"callback_ref": ref})); s["default"] != ref {
@@ -207,5 +223,41 @@ func TestCallbackRefArgumentFollowsLegacyApproval(t *testing.T) {
 	}
 	if nested := withCallbackRef(ctx, map[string]any{"a": "b"}); callbackRefFrom(nested) != "" {
 		t.Fatal("a nested call inherited the outer call's _callback_ref")
+	}
+}
+
+// _callback_ref is advertised on every wrapped tool; a tool that declares
+// its own keeps it: toolyard neither reads nor strips it.
+func TestOwnCallbackRefParameterIsTheTools(t *testing.T) {
+	plain, _ := wrapSchema(mcp.Tool{Name: "x", InputSchema: mcp.ToolInputSchema{Type: "object", Properties: map[string]any{"a": map[string]any{"type": "string"}}}})
+	if _, ok := plain.InputSchema.Properties[callbackRefArg]; !ok {
+		t.Fatal("_callback_ref missing from the wrapped schema")
+	}
+	own, _ := wrapSchema(mcp.Tool{Name: "y", InputSchema: mcp.ToolInputSchema{Type: "object", Properties: map[string]any{callbackRefArg: map[string]any{"type": "string", "description": "the tool's own reference"}}}})
+	ours, theirs := toolEntry{tool: plain}, toolEntry{tool: own}
+	if ownCallbackRef(ours) || !ownCallbackRef(theirs) {
+		t.Fatal("ownCallbackRef")
+	}
+	args := map[string]any{ReasonField: testReason, callbackRefArg: "cb_x"}
+	_, _, clean, err := extractReason(args, ReasonField)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := restoreOwnCallbackRef(theirs, args, clean); got[callbackRefArg] != "cb_x" {
+		t.Fatalf("the tool's own _callback_ref was stripped: %v", got)
+	}
+	if got := restoreOwnCallbackRef(ours, args, map[string]any{}); got[callbackRefArg] != nil {
+		t.Fatalf("toolyard's _callback_ref reached the tool: %v", got)
+	}
+	if callbackRefFrom(withCallbackRefFor(context.Background(), theirs, args)) != "" || callbackRefFrom(withCallbackRefFor(context.Background(), ours, args)) != "cb_x" {
+		t.Fatal("withCallbackRefFor")
+	}
+	long := map[string]any{callbackRefArg: strings.Repeat("c", maxCallbackRef+1)}
+	if callbackRefFrom(withCallbackRef(context.Background(), long)) != "" {
+		t.Fatal("an over-long _callback_ref was used")
+	}
+	res := withCallbackWarning(&mcp.CallToolResult{StructuredContent: map[string]any{"status": "pending_approval"}}, "_callback_ref was not registered")
+	if res.StructuredContent.(map[string]any)["callback_warning"] != "_callback_ref was not registered" || !strings.Contains(textOf(res), "Warning: _callback_ref") {
+		t.Fatalf("warning: %+v", res)
 	}
 }

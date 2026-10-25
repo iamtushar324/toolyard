@@ -764,6 +764,7 @@ func runServe(argv []string) error {
 		JudgeEnabled:      func() bool { return settingsSvc.GetBool(settings.InboxJudgeEnabled) },
 		Fetcher:           inboxSnaps,
 		SnapshotEnabled:   func() bool { return settingsSvc.GetBoolDefault(settings.InboxSnapshotEnabled, true) },
+		RichEnabled:       func() bool { return settingsSvc.GetBoolDefault(settings.InboxV3Enabled, true) },
 		AllowPrivateMedia: *inboxFetchPrivate,
 		Publish:           func(t string, d any) { hub.Publish(realtime.Event{Type: t, Data: d}) },
 		AgentName:         agentName,

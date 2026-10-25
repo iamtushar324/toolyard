@@ -6,6 +6,8 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"strings"
 	"testing"
 	"time"
 
@@ -13,6 +15,9 @@ import (
 	"github.com/tusharbhardwaj/toolyard/internal/inbox"
 	"github.com/tusharbhardwaj/toolyard/internal/store"
 )
+
+// everything is a receiver that opted into every event and the v3 shape.
+var everything = Subscription{Events: []string{"*"}, V3: true}
 
 // newItem stores a pending Inbox item and lets refs follow it ("" asks for
 // the agent's default receiver).
@@ -82,11 +87,11 @@ func countOutbox(t *testing.T, db *store.DB) int {
 func TestTwoReceiversFollowOneItem(t *testing.T) {
 	s, db := fixture(t)
 	ctx := t.Context()
-	a, err := s.RegisterPull(ctx, "agent", "mac", "first", testSecret())
+	a, err := s.RegisterPullWith(ctx, "agent", "mac", "first", testSecret(), everything)
 	if err != nil {
 		t.Fatal(err)
 	}
-	b, err := s.RegisterPull(ctx, "agent", "mac", "second", testSecret())
+	b, err := s.RegisterPullWith(ctx, "agent", "mac", "second", testSecret(), everything)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -142,7 +147,7 @@ func TestTwoReceiversFollowOneItem(t *testing.T) {
 func TestDefaultReceiverFollowsItemsWithoutRef(t *testing.T) {
 	s, db := fixture(t)
 	ctx := t.Context()
-	r, err := s.RegisterPull(ctx, "agent", "mac", "default-hook", testSecret())
+	r, err := s.RegisterPullWith(ctx, "agent", "mac", "default-hook", testSecret(), everything)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -187,29 +192,46 @@ func TestDefaultReceiverFollowsItemsWithoutRef(t *testing.T) {
 	}
 }
 
-// EmitTx is the generic emitter: one signed event in the caller's
-// transaction, filed under the subject its data names.
-func TestEmitTxQueuesSignedEvents(t *testing.T) {
+// EmitForAgentTx is the generic emitter: one signed event in the caller's
+// transaction, for one of that agent's receivers (or its default), filed
+// under the subject its data names.
+func TestEmitForAgentTxQueuesSignedEvents(t *testing.T) {
 	s, db := fixture(t)
 	ctx := t.Context()
-	r, err := s.RegisterPull(ctx, "agent", "mac", "jobs", testSecret())
+	r, err := s.RegisterPullWith(ctx, "agent", "mac", "jobs", testSecret(), Subscription{Events: []string{"job.*"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	theirs, err := s.RegisterPullWith(ctx, "other", "mac", "their-jobs", testSecret(), everything)
 	if err != nil {
 		t.Fatal(err)
 	}
 	data := map[string]any{"job_id": "job_1", "status": "succeeded"}
+	emit := func(agent, ref, eventType string) error {
+		t.Helper()
+		tx, err := db.BeginTx(ctx, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer tx.Rollback()
+		if err := s.EmitForAgentTx(ctx, tx, agent, ref, eventType, data); err != nil {
+			return err
+		}
+		return tx.Commit()
+	}
+	// No default receiver yet: an event for the default goes nowhere.
+	if err = emit("agent", "", EventJobCompleted); err != nil || countOutbox(t, db) != 0 {
+		t.Fatalf("no default receiver: %v, %d rows", err, countOutbox(t, db))
+	}
 	tx, _ := db.BeginTx(ctx, nil)
-	if err = s.EmitTx(ctx, tx, r.ID, "job.completed", data); err != nil {
+	if err = s.EmitForAgentTx(ctx, tx, "agent", r.ID, EventJobCompleted, data); err != nil {
 		t.Fatal(err)
 	}
 	tx.Rollback()
 	if n := countOutbox(t, db); n != 0 {
 		t.Fatal("an event escaped a rolled-back transaction")
 	}
-	tx, _ = db.BeginTx(ctx, nil)
-	if err = s.EmitTx(ctx, tx, r.ID, "job.completed", data); err != nil {
-		t.Fatal(err)
-	}
-	if err = tx.Commit(); err != nil {
+	if err = emit("agent", r.ID, EventJobCompleted); err != nil {
 		t.Fatal(err)
 	}
 	events := pullEvents(t, s, "agent", r.ID)
@@ -217,41 +239,127 @@ func TestEmitTxQueuesSignedEvents(t *testing.T) {
 		t.Fatalf("%d events", len(events))
 	}
 	env, got := envelopeOf(t, events[0].Body)
-	if env.Type != "job.completed" || env.EventID != events[0].EventID || got["job_id"] != "job_1" {
+	if env.Type != EventJobCompleted || env.EventID != events[0].EventID || got["job_id"] != "job_1" {
 		t.Fatalf("envelope %+v", env)
 	}
 	var subject, kind string
 	db.QueryRow(`SELECT request_id,event_type FROM callback_outbox`).Scan(&subject, &kind)
-	if subject != "job_1" || kind != "job.completed" {
+	if subject != "job_1" || kind != EventJobCompleted {
 		t.Fatalf("outbox row: %q %q", subject, kind)
 	}
-	tx, _ = db.BeginTx(ctx, nil)
-	defer tx.Rollback()
-	if err = s.EmitTx(ctx, tx, r.ID, "Job Completed", data); err == nil {
-		t.Fatal("a malformed event type was accepted")
+	if err = emit("agent", theirs.ID, EventJobCompleted); !errors.Is(err, ErrReceiver) {
+		t.Fatalf("another agent's receiver: %v", err)
 	}
-	if err = s.EmitTx(ctx, tx, "cb_unknown", "job.failed", data); !errors.Is(err, ErrReceiver) {
+	if err = emit("agent", "cb_unknown", EventJobFailed); !errors.Is(err, ErrReceiver) {
 		t.Fatalf("unknown receiver: %v", err)
 	}
-	tx.Rollback()
+	if err = emit("agent", r.ID, "Job Completed"); err == nil {
+		t.Fatal("a malformed event type was accepted")
+	}
+	// The receiver opted into job.* only: a ping-shaped event is dropped.
+	if err = emit("agent", r.ID, EventExecutionCompleted); err != nil || countOutbox(t, db) != 1 {
+		t.Fatalf("an event the receiver did not opt into was queued: %v", err)
+	}
+	// The default receiver is read inside the caller's transaction.
+	if err = s.SetDefault(ctx, "agent", r.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err = emit("agent", "", EventJobFailed); err != nil || countOutbox(t, db) != 2 {
+		t.Fatalf("default receiver: %v, %d rows", err, countOutbox(t, db))
+	}
 	if _, err = s.Change(ctx, "agent", r.ID, "disable", "", r.Revision); err != nil {
 		t.Fatal(err)
 	}
-	tx2, _ := db.BeginTx(ctx, nil)
-	defer tx2.Rollback()
-	if err = s.EmitTx(ctx, tx2, r.ID, "job.failed", data); err != nil {
-		t.Fatalf("a disabled receiver must drop the event without failing the caller: %v", err)
+	if err = emit("agent", r.ID, EventJobFailed); !errors.Is(err, ErrReceiver) {
+		t.Fatalf("a disabled receiver: %v", err)
 	}
-	tx2.Commit()
-	if n := countOutbox(t, db); n != 1 {
-		t.Fatalf("a disabled receiver got an event: %d rows", n)
+}
+
+// A legacy receiver (registered without events, as every receiver before
+// v0.1) gets only the three decision events, in the version 2 shape.
+func TestLegacyReceiverGetsOnlyWhatItAccepts(t *testing.T) {
+	s, db := fixture(t)
+	ctx := t.Context()
+	legacy, err := s.RegisterPull(ctx, "agent", "mac", "t3-session", testSecret())
+	if err != nil {
+		t.Fatal(err)
 	}
+	if strings.Join(legacy.Events, ",") != "inbox.cancelled,inbox.decision,inbox.expired" || legacy.V3 {
+		t.Fatalf("legacy receiver: %+v", legacy)
+	}
+	if _, err = s.Test(ctx, "agent", legacy.ID); !errors.Is(err, ErrEventNotAccepted) {
+		t.Fatalf("a legacy receiver was pinged: %v", err)
+	}
+	req := newItem(t, s, db, "rq_legacy", "agent", legacy.ID)
+	tx, _ := db.BeginTx(ctx, nil)
+	if err = s.ExecutionTx(ctx, tx, &inbox.Execution{GrantID: "gr_l", RequestID: req.ID, CallID: "c", State: inbox.ExecutionSucceeded}, "agent", "deploy.run"); err != nil {
+		t.Fatal(err)
+	}
+	req.Revision, req.Status = 2, inbox.StatusApproved
+	req.Tools = []inbox.ToolRequest{{CallID: "c", Decision: inbox.ToolAllowed}}
+	req.Answers = map[string]inbox.Answer{"env": {Value: "stage"}}
+	if err = s.DecisionTx(ctx, tx, req); err != nil {
+		t.Fatal(err)
+	}
+	if err = tx.Commit(); err != nil {
+		t.Fatal(err)
+	}
+	events := pullEvents(t, s, "agent", legacy.ID)
+	if len(events) != 1 {
+		t.Fatalf("%d events for a legacy receiver", len(events))
+	}
+	var raw map[string]map[string]any
+	if err := json.Unmarshal([]byte(events[0].Body), &raw); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := raw["data"]["answers"]; ok {
+		t.Fatalf("a legacy receiver got answers: %s", events[0].Body)
+	}
+	// More than 12 calls only fit the v3 shape: refused when named,
+	// skipped for a default receiver.
+	big := &inbox.Request{ID: "rq_big", AgentID: "agent"}
+	for i := 0; i < 13; i++ {
+		big.Tools = append(big.Tools, inbox.ToolRequest{CallID: fmt.Sprintf("c%d", i)})
+	}
+	if err = s.CheckSubscription(ctx, "agent", legacy.ID, big); !errors.Is(err, ErrNeedsV3) {
+		t.Fatalf("CheckSubscription: %v", err)
+	}
+	tx, _ = db.BeginTx(ctx, nil)
+	defer tx.Rollback()
+	if err = s.RegisterTx(ctx, tx, big, legacy.ID); !errors.Is(err, ErrNeedsV3) {
+		t.Fatalf("RegisterTx: %v", err)
+	}
+}
+
+func TestNormalizeEvents(t *testing.T) {
+	got, err := NormalizeEvents([]string{"ping", "job.*", "ping", "inbox.decision"})
+	if err != nil || strings.Join(got, ",") != "inbox.decision,job.*,ping" {
+		t.Fatalf("normalize: %v %v", got, err)
+	}
+	for _, bad := range []string{"inbox.decisions", "Ping", "job*", "*.*", ""} {
+		if _, err := NormalizeEvents([]string{bad}); err == nil {
+			t.Errorf("%q accepted", bad)
+		}
+	}
+	if !acceptsEvent([]string{"job.*"}, "job.failed") || acceptsEvent([]string{"job.*"}, "jobs.failed") || !acceptsEvent([]string{"*"}, "ping") {
+		t.Fatal("acceptsEvent")
+	}
+}
+
+// mustPing queues a ping and returns its id.
+func mustPing(t *testing.T, s *Service, ref string) string {
+	t.Helper()
+	id, err := s.Test(t.Context(), "agent", ref)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return id
 }
 
 func TestPingAndCheckRef(t *testing.T) {
 	s, _ := fixture(t)
 	ctx := t.Context()
-	r, err := s.RegisterPull(ctx, "agent", "mac", "pinged", testSecret())
+	r, err := s.RegisterPullWith(ctx, "agent", "mac", "pinged", testSecret(), everything)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -261,6 +369,9 @@ func TestPingAndCheckRef(t *testing.T) {
 	id, err := s.Test(ctx, "agent", r.ID)
 	if err != nil {
 		t.Fatal(err)
+	}
+	if again, err := s.Test(ctx, "agent", r.ID); err != nil || again != id {
+		t.Fatalf("a second test must return the pending ping: %q %v", again, err)
 	}
 	events := pullEvents(t, s, "agent", r.ID)
 	if len(events) != 1 || events[0].EventID != id {
@@ -276,6 +387,15 @@ func TestPingAndCheckRef(t *testing.T) {
 	if err = s.CheckRef(ctx, "other", r.ID); !errors.Is(err, ErrReceiver) {
 		t.Fatalf("check ref across agents: %v", err)
 	}
+	// The quota counts every ping of the agent's receivers in the last minute.
+	for i := 0; i < PingsPerMinute; i++ {
+		if err := s.Ack(ctx, "agent", r.ID, mustPing(t, s, r.ID)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if _, err = s.Test(ctx, "agent", r.ID); !errors.Is(err, ErrPingQuota) {
+		t.Fatalf("ping quota: %v", err)
+	}
 	secret, err := GenerateSecret()
 	if err != nil {
 		t.Fatal(err)
@@ -289,7 +409,7 @@ func TestPingAndCheckRef(t *testing.T) {
 func TestExecutionCompletedFollowsTheItem(t *testing.T) {
 	s, db := fixture(t)
 	ctx := t.Context()
-	r, err := s.RegisterPull(ctx, "agent", "mac", "runs", testSecret())
+	r, err := s.RegisterPullWith(ctx, "agent", "mac", "runs", testSecret(), everything)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -320,7 +440,7 @@ func TestExecutionCompletedFollowsTheItem(t *testing.T) {
 func TestApprovalEventsFollowTheApproval(t *testing.T) {
 	s, db := fixture(t)
 	ctx := t.Context()
-	r, err := s.RegisterPull(ctx, "agent", "mac", "approvals", testSecret())
+	r, err := s.RegisterPullWith(ctx, "agent", "mac", "approvals", testSecret(), everything)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -397,7 +517,7 @@ func TestApprovalEventsFollowTheApproval(t *testing.T) {
 func TestRotationRebindsSubjectSubscriptions(t *testing.T) {
 	s, db := fixture(t)
 	ctx := t.Context()
-	r, err := s.RegisterPull(ctx, "agent", "mac", "rotating", testSecret())
+	r, err := s.RegisterPullWith(ctx, "agent", "mac", "rotating", testSecret(), everything)
 	if err != nil {
 		t.Fatal(err)
 	}

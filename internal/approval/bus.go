@@ -90,6 +90,9 @@ type Request struct {
 	ExpiresAt      int64          `json:"expires_at"`
 	Fingerprint    string         `json:"fingerprint,omitempty"`
 	Coalesced      bool           `json:"coalesced,omitempty"` // true if Hold returned an existing pending row instead of creating a new one
+	// CallbackWarning is set by Hold (never stored) when the call's
+	// _callback_ref could not follow the request.
+	CallbackWarning string `json:"callback_warning,omitempty"`
 	// AutoDecidedBy is the auto-approval rule id that decided this request,
 	// or empty if a human (or the rule engine wasn't consulted). Derived
 	// on every read from the decider (Via auto_rule, Ref rule id).

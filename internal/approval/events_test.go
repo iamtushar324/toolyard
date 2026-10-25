@@ -4,6 +4,7 @@ import (
 	"context"
 	"database/sql"
 	"errors"
+	"strings"
 	"sync"
 	"testing"
 )
@@ -76,5 +77,26 @@ func TestBusEmitsApprovalEventsInItsTransactions(t *testing.T) {
 	}
 	if len(sink.events) != 2 {
 		t.Fatalf("a repeated result emitted again: %v", sink.events)
+	}
+}
+
+type refusingSink struct{ fakeSink }
+
+func (r *refusingSink) SubscribeApproval(context.Context, *Request, string) error {
+	return errors.New("callback receiver is unavailable or belongs to another agent")
+}
+
+// A refused _callback_ref does not stop the call; Hold says why in
+// CallbackWarning.
+func TestHoldWarnsAboutARefusedCallbackRef(t *testing.T) {
+	bus := newTestBus(t)
+	bus.SetEventSink(&refusingSink{})
+	req, err := bus.Hold(context.Background(), NewRequest{AgentID: "ag_1", UpstreamName: "github", ToolName: "github.merge_pull_request",
+		Arguments: map[string]any{"number": 10}, Reason: "Merge the reviewed fix for the login bug", CallbackRef: "cb_theirs"}, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if req.Status != StatusPending || !strings.Contains(req.CallbackWarning, "_callback_ref was not registered") {
+		t.Fatalf("hold: %+v", req)
 	}
 }

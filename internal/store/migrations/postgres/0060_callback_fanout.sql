@@ -18,6 +18,13 @@
 -- callback_defaults: an agent's default receiver, used when an Inbox call
 -- names none.
 --
+-- callback_receivers.events lists the event types a receiver accepts;
+-- every existing receiver keeps the three types it was built for. v3 = 1
+-- opts it into the schema version 3 decision shape.
+--
+-- callback_outbox.created_at is when the event was queued (retention and
+-- the ping quota); existing rows take their delivery or first-attempt time.
+--
 -- The constraints to replace are found by their columns, not by name.
 --
 -- Same schema as migrations/sqlite/0060_callback_fanout.sql.
@@ -42,11 +49,17 @@ END $$;
 
 ALTER TABLE callback_subscriptions ADD PRIMARY KEY (request_id, receiver_id);
 
+ALTER TABLE callback_receivers ADD COLUMN events TEXT NOT NULL DEFAULT 'inbox.decision,inbox.expired,inbox.cancelled';
+ALTER TABLE callback_receivers ADD COLUMN v3 BIGINT NOT NULL DEFAULT 0;
+
 ALTER TABLE callback_outbox ADD COLUMN event_type TEXT NOT NULL DEFAULT '';
 ALTER TABLE callback_outbox ADD COLUMN dedupe_key TEXT;
 UPDATE callback_outbox SET dedupe_key = 'inbox:' || request_id || ':' || decision_revision;
 ALTER TABLE callback_outbox ADD UNIQUE (receiver_id, dedupe_key);
 CREATE INDEX callback_outbox_request ON callback_outbox (request_id);
+ALTER TABLE callback_outbox ADD COLUMN created_at BIGINT NOT NULL DEFAULT 0;
+UPDATE callback_outbox SET created_at = COALESCE(delivered_at, next_attempt_at);
+CREATE INDEX callback_outbox_created ON callback_outbox (created_at);
 
 CREATE TABLE callback_subject_subscriptions (
     subject_id        TEXT NOT NULL,

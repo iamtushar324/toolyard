@@ -9,6 +9,8 @@ import (
 	"errors"
 	"fmt"
 	"regexp"
+	"sort"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -36,7 +38,73 @@ const (
 	EventApprovalExecuted = approval.EventApprovalExecuted
 	// EventPing: callbacks.test. PingData.
 	EventPing = "ping"
+	// EventJobCompleted and EventJobFailed: slice E's async jobs
+	// (EmitForAgentTx).
+	EventJobCompleted = "job.completed"
+	EventJobFailed    = "job.failed"
 )
+
+// LegacyEvents are what a receiver accepts unless it asks for more: the
+// three events receivers were built for before v0.1. Every receiver
+// registered before migration 0060, and every registration that names no
+// events, gets them.
+var LegacyEvents = []string{EventInboxCancelled, EventInboxDecision, EventInboxExpired}
+
+// KnownEvents are the event types a receiver can ask for by name; "*"
+// asks for every type, and "<prefix>.*" for every type under a prefix.
+var KnownEvents = []string{EventApprovalDecided, EventApprovalExecuted, EventExecutionCompleted, EventInboxCancelled,
+	EventInboxDecision, EventInboxExpired, EventJobCompleted, EventJobFailed, EventPing}
+
+// MaxReceiverEvents bounds a receiver's event list.
+const MaxReceiverEvents = 24
+
+var eventPattern = regexp.MustCompile(`^(?:\*|[a-z][a-z0-9_]*\.\*)$`)
+
+// NormalizeEvents checks a receiver's event list and returns it sorted,
+// without repeats; an empty list is LegacyEvents.
+func NormalizeEvents(in []string) ([]string, error) {
+	if len(in) == 0 {
+		return append([]string(nil), LegacyEvents...), nil
+	}
+	if len(in) > MaxReceiverEvents {
+		return nil, fmt.Errorf("events: at most %d entries", MaxReceiverEvents)
+	}
+	seen := map[string]bool{}
+	var out []string
+	for _, e := range in {
+		e = strings.TrimSpace(e)
+		known := eventPattern.MatchString(e)
+		for _, k := range KnownEvents {
+			known = known || e == k
+		}
+		if !known {
+			return nil, fmt.Errorf("events: %q is not an event type; use %s, \"<prefix>.*\" or \"*\"", e, strings.Join(KnownEvents, ", "))
+		}
+		if !seen[e] {
+			seen[e] = true
+			out = append(out, e)
+		}
+	}
+	sort.Strings(out)
+	return out, nil
+}
+
+func splitEvents(s string) []string {
+	if s == "" {
+		return []string{}
+	}
+	return strings.Split(s, ",")
+}
+
+// acceptsEvent reports whether a receiver with events takes eventType.
+func acceptsEvent(events []string, eventType string) bool {
+	for _, e := range events {
+		if e == "*" || e == eventType || (strings.HasSuffix(e, ".*") && strings.HasPrefix(eventType, strings.TrimSuffix(e, "*"))) {
+			return true
+		}
+	}
+	return false
+}
 
 // eventTypeShape is what EmitTx accepts: lowercase dotted words, such as
 // job.completed.
@@ -125,19 +193,47 @@ type queued struct {
 	dedupe           string // "" stores NULL: no deduplication
 	ignoreDuplicate  bool   // a repeated dedupe key is a no-op, not an error
 	data             any
+	// legacy is the data a receiver without the v3 capability gets
+	// instead (nil: the same data); legacySkip gives it no event at all.
+	legacy     any
+	legacySkip bool
 }
 
-// queueTx writes one event to the outbox inside tx and returns its id. The
+// queueTx writes one event to the outbox inside tx and returns its id, or
+// "" when the receiver is not active or did not opt into the event type
+// (a receiver never gets an event or a shape it did not ask for). The
 // event fails at once when the agent's host connection is revoked or
 // expired, so its history says why it never left.
 func (s *Service) queueTx(ctx context.Context, tx *sql.Tx, q queued) (string, error) {
+	var recStatus, events string
+	var v3 bool
+	err := tx.QueryRowContext(ctx, `SELECT status,events,v3 FROM callback_receivers WHERE id=?`, q.receiver).Scan(&recStatus, &events, &v3)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	if err != nil {
+		return "", err
+	}
+	if recStatus != "active" || !acceptsEvent(splitEvents(events), q.eventType) {
+		return "", nil
+	}
+	data := q.data
+	if !v3 {
+		if q.legacySkip {
+			return "", nil
+		}
+		if q.legacy != nil {
+			data = q.legacy
+		}
+	}
 	id := "evt_" + uuid.NewString()
-	payload, err := json.Marshal(Envelope{Type: q.eventType, EventID: id, Timestamp: s.now().UTC().Format(time.RFC3339Nano), Data: q.data})
+	now := s.now()
+	payload, err := json.Marshal(Envelope{Type: q.eventType, EventID: id, Timestamp: now.UTC().Format(time.RFC3339Nano), Data: data})
 	if err != nil {
 		return "", err
 	}
 	status, reason := "pending", ""
-	if e := hostConnectionActive(ctx, tx, q.agentID, s.now().UnixMilli()); e != nil {
+	if e := hostConnectionActive(ctx, tx, q.agentID, now.UnixMilli()); e != nil {
 		if !errors.Is(e, ErrReceiver) {
 			return "", e
 		}
@@ -147,11 +243,11 @@ func (s *Service) queueTx(ctx context.Context, tx *sql.Tx, q queued) (string, er
 	if q.dedupe != "" {
 		dedupe = q.dedupe
 	}
-	query := `INSERT INTO callback_outbox(id,request_id,decision_revision,receiver_id,receiver_revision,payload,next_attempt_at,status,terminal_reason,event_type,dedupe_key) VALUES(?,?,?,?,?,?,?,?,?,?,?)`
+	query := `INSERT INTO callback_outbox(id,request_id,decision_revision,receiver_id,receiver_revision,payload,next_attempt_at,status,terminal_reason,event_type,dedupe_key,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`
 	if q.ignoreDuplicate {
 		query += ` ON CONFLICT DO NOTHING`
 	}
-	if _, err = tx.ExecContext(ctx, query, id, q.subject, q.revision, q.receiver, q.receiverRevision, string(payload), s.now().UnixMilli(), status, reason, q.eventType, dedupe); err != nil {
+	if _, err = tx.ExecContext(ctx, query, id, q.subject, q.revision, q.receiver, q.receiverRevision, string(payload), now.UnixMilli(), status, reason, q.eventType, dedupe, now.UnixMilli()); err != nil {
 		return "", err
 	}
 	return id, nil
@@ -169,39 +265,60 @@ func (s *Service) queueAllTx(ctx context.Context, tx *sql.Tx, agentID, subject s
 	return nil
 }
 
-// EmitTx queues one event for ref inside tx (at-least-once, signed, retried).
+// EmitForAgentTx queues one event for one of agentID's receivers inside
+// tx (at-least-once, signed, retried). It is the generic emitter other
+// packages (slice E's async jobs) call in their own transaction.
 //
-// ref is a callback_ref (callbacks.register); the caller checked that it
-// belongs to the agent the event is for (CheckRef). eventType is lowercase
-// dotted words (job.completed); data is any JSON value, sent as the
-// envelope's data. The event commits or rolls back with tx, and the
-// delivery loop sends it like an Inbox decision: Standard Webhooks
-// signature, retries, attempt history. The delivery history files it under
-// the first of data's inbox_id, approval_id, job_id or subject.
+// ref is the callback_ref the agent named (_callback_ref); "" means the
+// agent's default receiver, read through tx, and returns nil when the
+// agent has none. A ref that is not an active receiver of agentID returns
+// ErrReceiver. eventType is lowercase dotted words (job.completed); data
+// is any JSON value, sent as the envelope's data. A receiver that did not
+// opt into eventType (its events list) gets nothing, and nil is returned.
+// The event commits or rolls back with tx, then the delivery loop sends it
+// like an Inbox decision: Standard Webhooks signature, retries, attempt
+// history. The delivery history files it under the first of data's
+// inbox_id, approval_id, job_id or subject.
 //
-// EmitTx returns ErrReceiver only when ref names no receiver. A disabled or
-// removed receiver drops the event and returns nil, so an agent that turned
-// its receiver off never fails the caller's transaction.
-func (s *Service) EmitTx(ctx context.Context, tx *sql.Tx, ref, eventType string, data any) error {
-	_, err := s.emitTx(ctx, tx, ref, eventType, data)
+// tx must be a transaction of the same store (*sql.Tx; on SQLite the
+// store has one connection, and nothing here uses the pool).
+func (s *Service) EmitForAgentTx(ctx context.Context, tx *sql.Tx, agentID, ref, eventType string, data any) error {
+	if agentID == "" {
+		return ErrReceiver
+	}
+	if ref == "" {
+		def, _, err := defaultReceiver(ctx, tx, agentID)
+		if err != nil || def == "" {
+			return err
+		}
+		ref = def
+	}
+	var one int
+	err := tx.QueryRowContext(ctx, `SELECT 1 FROM callback_receivers WHERE id=? AND agent_id=? AND status='active'`, ref, agentID).Scan(&one)
+	if errors.Is(err, sql.ErrNoRows) {
+		return ErrReceiver
+	}
+	if err != nil {
+		return err
+	}
+	_, err = s.emitTx(ctx, tx, ref, eventType, data)
 	return err
 }
 
+// emitTx queues one event for ref (whose owner the caller checked) and
+// returns its id, or "" when the receiver is inactive or did not opt in.
 func (s *Service) emitTx(ctx context.Context, tx *sql.Tx, ref, eventType string, data any) (string, error) {
 	if len(eventType) > 64 || !eventTypeShape.MatchString(eventType) {
 		return "", fmt.Errorf("callbacks: invalid event type %q", eventType)
 	}
-	var agentID, status string
+	var agentID string
 	var revision int
-	err := tx.QueryRowContext(ctx, `SELECT agent_id,revision,status FROM callback_receivers WHERE id=?`, ref).Scan(&agentID, &revision, &status)
+	err := tx.QueryRowContext(ctx, `SELECT agent_id,revision FROM callback_receivers WHERE id=?`, ref).Scan(&agentID, &revision)
 	if errors.Is(err, sql.ErrNoRows) {
 		return "", ErrReceiver
 	}
 	if err != nil {
 		return "", err
-	}
-	if status != "active" {
-		return "", nil
 	}
 	return s.queueTx(ctx, tx, queued{agentID: agentID, subject: subjectOf(data), receiver: ref, receiverRevision: revision, eventType: eventType, data: data})
 }
@@ -329,17 +446,52 @@ func GenerateSecret() (string, error) {
 	return "whsec_" + base64.StdEncoding.EncodeToString(b), nil
 }
 
+// PingsPerMinute is each agent's quota of callbacks.test pings.
+const PingsPerMinute = 10
+
+// ErrEventNotAccepted refuses a ping for a receiver that did not opt into
+// ping events.
+var ErrEventNotAccepted = errors.New("this receiver does not accept ping events; register one whose events include \"ping\"")
+
+// ErrPingQuota refuses a ping beyond PingsPerMinute.
+var ErrPingQuota = fmt.Errorf("at most %d pings a minute; wait, then test again", PingsPerMinute)
+
 // Test queues a ping for one of the agent's active receivers and returns
-// its event id. The ping is signed and retried like every other event.
+// its event id. The ping is signed and retried like every other event. A
+// receiver has at most one ping pending: a second test returns the pending
+// one. Pings count against the agent's PingsPerMinute quota, kept in the
+// database so every node shares it.
 func (s *Service) Test(ctx context.Context, agentID, ref string) (string, error) {
-	if err := s.CheckRef(ctx, agentID, ref); err != nil {
+	rec, err := s.Get(ctx, agentID, ref)
+	if err != nil {
 		return "", err
+	}
+	if rec.Status != "active" {
+		return "", ErrReceiver
+	}
+	if !acceptsEvent(rec.Events, EventPing) {
+		return "", ErrEventNotAccepted
 	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return "", err
 	}
 	defer tx.Rollback()
+	var pending string
+	err = tx.QueryRowContext(ctx, `SELECT id FROM callback_outbox WHERE receiver_id=? AND event_type=? AND status IN ('pending','delivering') ORDER BY created_at LIMIT 1`, ref, EventPing).Scan(&pending)
+	if err == nil {
+		return pending, nil
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return "", err
+	}
+	var recent int
+	if err = tx.QueryRowContext(ctx, `SELECT count(*) FROM callback_outbox o JOIN callback_receivers r ON r.id=o.receiver_id WHERE r.agent_id=? AND o.event_type=? AND o.created_at>?`, agentID, EventPing, s.now().Add(-time.Minute).UnixMilli()).Scan(&recent); err != nil {
+		return "", err
+	}
+	if recent >= PingsPerMinute {
+		return "", ErrPingQuota
+	}
 	id, err := s.emitTx(ctx, tx, ref, EventPing, PingData{CallbackRef: ref, Message: "Test event from toolyard. Verify the signature, store the event id, and answer 2xx."})
 	if err != nil {
 		return "", err
@@ -419,9 +571,14 @@ func (s *Service) legacyDecisionTx(ctx context.Context, tx *sql.Tx, r *inbox.Req
 	if err != nil || len(subs) == 0 {
 		return err
 	}
+	// An approval is allowed, denied, expired or cancelled; an Inbox item
+	// sent back to replan is a denial here.
 	status := r.Status
-	if status == inbox.StatusApproved {
+	switch status {
+	case inbox.StatusApproved:
 		status = approval.StatusAllowed
+	case inbox.StatusReturned:
+		status = approval.StatusDenied
 	}
 	data := ApprovalData{ApprovalID: r.ID, Status: status, DecidedAt: r.DecidedAt, OwnerNote: r.OwnerNote, StatusRef: r.ID}
 	if len(r.Tools) > 0 {

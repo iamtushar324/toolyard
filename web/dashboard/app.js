@@ -5304,16 +5304,24 @@ function ibAnswersDraft(r) {
     let d;
     try { d = JSON.parse(sessionStorage.getItem(key)); } catch {}
     if (!d || !d.values || !d.texts || Date.now() - d.at > 24 * 3600000) {
-      d = { values: {}, texts: {}, order: {}, note: '', submission: crypto.randomUUID(), at: Date.now() };
+      d = { values: null, texts: null, order: null, note: '', submission: crypto.randomUUID(), at: Date.now() };
+      d.values = Object.create(null);
       for (const q of r.questions || []) {
         if (q.default === undefined || q.default === null) continue;
         d.values[q.id] = q.type === 'datetime' ? ibRFC3339ToLocal(q.default) : q.default;
       }
     }
-    d.order ||= {};
+    // Answers are keyed by question ID: maps without a prototype, so no ID
+    // can reach Object.prototype (the server also refuses such IDs).
+    d.values = ibDict(d.values); d.texts = ibDict(d.texts); d.order = ibDict(d.order);
     ibAnswerDrafts.set(key, d);
   }
   return ibAnswerDrafts.get(key);
+}
+function ibDict(o) {
+  const out = Object.create(null);
+  if (o && typeof o === 'object') for (const k of Object.keys(o)) out[k] = o[k];
+  return out;
 }
 function ibSaveAnswersDraft(r, d) { d.at = Date.now(); try { sessionStorage.setItem(ibAnswersKey(r), JSON.stringify(d)); } catch {} }
 function ibDropAnswersDraft(r) { const key = ibAnswersKey(r); ibAnswerDrafts.delete(key); try { sessionStorage.removeItem(key); } catch {} }
@@ -5357,10 +5365,10 @@ function ibAnswerValue(q, v) {
 
 // ibAnswerProblem says what is wrong with the draft answer to q, '' when
 // nothing is.
-function ibAnswerProblem(q, d) {
-  const v = ibAnswerValue(q, d.values[q.id]);
-  const custom = !!(q.allow_other && (d.texts[q.id] || '').trim());
-  const required = q.required !== false;
+function ibAnswerProblem(q, d, requireAll = true) {
+  const v = ibAnswerValue(q, Object.hasOwn(d.values, q.id) ? d.values[q.id] : undefined);
+  const custom = !!(q.allow_other && (Object.hasOwn(d.texts, q.id) ? d.texts[q.id] : '').trim());
+  const required = q.required !== false && requireAll;
   if (v === undefined || (q.type === 'free_text' && !String(v).trim())) {
     if (!required || custom) return '';
     return q.type === 'ranking' ? 'Put the options in order, or confirm the order shown.' : 'Answer this question.';
@@ -5400,19 +5408,19 @@ function ibAnswerProblem(q, d) {
   return '';
 }
 
-function ibAnswerProblems(r, d = ibAnswersDraft(r)) {
-  const out = {};
-  for (const q of r.questions || []) { const p = ibAnswerProblem(q, d); if (p) out[q.id] = p; }
+function ibAnswerProblems(r, d = ibAnswersDraft(r), requireAll = true) {
+  const out = Object.create(null);
+  for (const q of r.questions || []) { const p = ibAnswerProblem(q, d, requireAll); if (p) out[q.id] = p; }
   return out;
 }
 
 // ibAnswersBody: the draft's answers as the decision endpoint takes them,
 // keyed by question ID. Unanswered optional questions are left out.
 function ibAnswersBody(r, d = ibAnswersDraft(r)) {
-  const out = {};
+  const out = Object.create(null);
   for (const q of r.questions || []) {
-    const v = ibAnswerValue(q, d.values[q.id]);
-    const text = d.texts[q.id] || '';
+    const v = ibAnswerValue(q, Object.hasOwn(d.values, q.id) ? d.values[q.id] : undefined);
+    const text = Object.hasOwn(d.texts, q.id) ? d.texts[q.id] || '' : '';
     if (v === undefined && !text.trim()) continue;
     const a = {};
     if (v !== undefined) a.value = v;
@@ -5452,7 +5460,7 @@ function ibAnswersView(r) {
   const ans = r.answers || {};
   return el('dl', { class: 'ib-answers' }, ...r.questions.flatMap((q) => [
     el('dt', {}, q.prompt),
-    el('dd', {}, ans[q.id] ? ibAnswerText(q, ans[q.id]) : el('span', { class: 'meta' }, 'Not answered')),
+    el('dd', {}, Object.hasOwn(ans, q.id) ? ibAnswerText(q, ans[q.id]) : el('span', { class: 'meta' }, 'Not answered')),
   ]));
 }
 
@@ -5567,9 +5575,9 @@ function ibQuestionsEl(r, busy) {
 
 // ibCheckAnswers keeps the decision local while an answer is missing or
 // invalid: it marks the questions and moves the focus to the first one.
-function ibCheckAnswers(r) {
+function ibCheckAnswers(r, requireAll = true) {
   if (!ibHasQuestions(r)) return true;
-  const problems = ibAnswerProblems(r);
+  const problems = ibAnswerProblems(r, ibAnswersDraft(r), requireAll);
   (state.inbox.qproblems ||= {})[r.id] = problems;
   const ids = Object.keys(problems);
   if (!ids.length) return true;
@@ -6263,6 +6271,8 @@ function ibSafeHref(raw) {
   const href = ibMdEntities(String(raw == null ? '' : raw).trim());
   if (!href || /[\u0000- \u007f-\u009f]/.test(href)) return null;
   if (!/^(?:https?:\/\/[^/?#\\]|mailto:[^/\\])/i.test(href)) return null;
+  // No user name or password in a web link (https://bank.example@evil.example).
+  if (/^https?:\/\/[^/?#]*@/i.test(href)) return null;
   return href;
 }
 
@@ -6279,12 +6289,13 @@ function ibMdIndent(l) { return /^ */.exec(l)[0].length; }
 
 function ibMdBlockStart(l) { return /^ {0,3}(?:`{3,}|~{3,}|#{1,6}(?:\s|$)|>|([-*_])(?:[ ]*\1){2,}[ ]*$)/.test(l); }
 
-// ibMdCodeEnd finds the closing backtick run of exactly len backticks.
-function ibMdCodeEnd(text, from, len) {
+// ibMdCodeEnd finds the closing backtick run of exactly len backticks
+// before stop (default: the end of text).
+function ibMdCodeEnd(text, from, len, stop = text.length) {
   let j = from;
-  while (j < text.length) {
+  while (j < stop) {
     const k = text.indexOf('`', j);
-    if (k === -1) return -1;
+    if (k === -1 || k >= stop) return -1;
     let e = k;
     while (text[e] === '`') e++;
     if (e - k === len) return k;
@@ -6294,26 +6305,36 @@ function ibMdCodeEnd(text, from, len) {
 }
 
 // ibMdLinkAt parses [label](destination "title") starting at the [.
+// IB_MD_LABEL_MAX bounds a link label (CommonMark's 999 characters) and
+// IB_MD_DEST_MAX the destination and title, so no input makes a scan long.
+const IB_MD_LABEL_MAX = 999, IB_MD_DEST_MAX = 2048;
+
+// ibMdRun is the length of the run of ch at text[i].
+function ibMdRun(text, i, ch) { let e = i; while (text[e] === ch) e++; return e - i; }
+
 function ibMdLinkAt(text, i) {
   let depth = 0, j = i;
-  for (; j < text.length; j++) {
+  const stop = Math.min(text.length, i + IB_MD_LABEL_MAX + 2);
+  for (; j < stop; j++) {
     const c = text[j];
     if (c === '\\') { j++; continue; }
     if (c === '`') {
-      const run = /^`+/.exec(text.slice(j))[0];
-      const e = ibMdCodeEnd(text, j + run.length, run.length);
-      j = (e === -1 ? j : e) + run.length - 1;
+      const run = ibMdRun(text, j, '`');
+      const e = ibMdCodeEnd(text, j + run, run, stop);
+      j = (e === -1 ? j : e) + run - 1;
       continue;
     }
     if (c === '[') depth++;
     else if (c === ']' && --depth === 0) break;
   }
-  if (j >= text.length || text[j + 1] !== '(') return null;
-  const m = /^[ \n]*(?:<([^<>\n]*)>|((?:[^\s()\\]|\\.|\((?:[^\s()\\]|\\.)*\))*))(?:[ \n]+(?:"([^"\n]*)"|'([^'\n]*)'|\(([^()\n]*)\)))?[ \n]*\)/.exec(text.slice(j + 2));
+  if (j >= stop || text[j + 1] !== '(') return null;
+  const m = /^[ \n]*(?:<([^<>\n]*)>|((?:[^\s()\\]|\\.|\((?:[^\s()\\]|\\.)*\))*))(?:[ \n]+(?:"([^"\n]*)"|'([^'\n]*)'|\(([^()\n]*)\)))?[ \n]*\)/.exec(text.slice(j + 2, j + 2 + IB_MD_DEST_MAX));
   if (!m) return null;
   const dest = (m[1] !== undefined ? m[1] : m[2] || '').replace(/\\([!-\/:-@[-`{-~])/g, '$1');
   return { label: text.slice(i + 1, j), dest, title: m[3] || m[4] || m[5] || '', end: j + 2 + m[0].length };
 }
+
+const IB_MD_EMPH_MAX = 2000;
 
 // ibMdEmphasisAt parses *em*, _em_, **strong**, __strong__ and ~~del~~
 // starting at text[i].
@@ -6326,12 +6347,14 @@ function ibMdEmphasisAt(text, i) {
   const next = text[i + run];
   if (!next || /\s/.test(next)) return null;
   if (ch === '_' && /[\p{L}\p{N}]/u.test(prev)) return null;
+  // The closing delimiter is looked for within IB_MD_EMPH_MAX characters.
+  const stop = Math.min(text.length, i + IB_MD_EMPH_MAX);
   for (let n = Math.min(run, 2); n >= 1; n--) {
     if (ch === '~' && n !== 2) continue;
     let j = i + n;
     for (;;) {
       j = text.indexOf(ch, j);
-      if (j === -1) break;
+      if (j === -1 || j >= stop) break;
       let e = j;
       while (text[e] === ch) e++;
       const len = e - j;
@@ -6367,13 +6390,13 @@ function ibMdInline(src, ctx, depth = 0) {
       i++; continue;
     }
     if (ch === '`') {
-      const run = /^`+/.exec(text.slice(i))[0];
-      const e = ibMdCodeEnd(text, i + run.length, run.length);
-      if (e === -1) { buf += run; i += run.length; continue; }
-      let code = text.slice(i + run.length, e).replace(/\n/g, ' ');
+      const run = ibMdRun(text, i, '`');
+      const e = ibMdCodeEnd(text, i + run, run);
+      if (e === -1) { buf += text.substr(i, run); i += run; continue; }
+      let code = text.slice(i + run, e).replace(/\n/g, ' ');
       if (code.length > 2 && code[0] === ' ' && code[code.length - 1] === ' ' && code.trim()) code = code.slice(1, -1);
       push(el('code', {}, code));
-      i = e + run.length; continue;
+      i = e + run; continue;
     }
     if (ch === '!' && text[i + 1] === '[') {
       const link = ibMdLinkAt(text, i + 1);
@@ -6398,14 +6421,14 @@ function ibMdInline(src, ctx, depth = 0) {
       }
     }
     if (ch === '<' && !ctx.noLinks) {
-      const rest = text.slice(i);
+      const rest = text.slice(i, i + IB_MD_DEST_MAX);
       const m = /^<((?:https?:\/\/|mailto:)[^\s<>]+)>/i.exec(rest);
       const me = !m && /^<([A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,})>/.exec(rest);
       const href = m ? ibSafeHref(m[1]) : me ? 'mailto:' + me[1] : null;
       if (href) { push(el('a', ibMdLinkAttrs(href), m ? m[1] : me[1])); i += (m || me)[0].length; continue; }
     }
     if ((ch === 'h' || ch === 'H' || ch === 'w' || ch === 'W') && !ctx.noLinks && (i === 0 || /[\s(*_~]/.test(text[i - 1]))) {
-      const m = /^(?:https?:\/\/|www\.)[^\s<]+/i.exec(text.slice(i));
+      const m = /^(?:https?:\/\/|www\.)[^\s<]+/i.exec(text.slice(i, i + IB_MD_DEST_MAX));
       if (m) {
         let url = m[0];
         while (/[?!.,:*_~'";]$/.test(url) || (url.endsWith(')') && (url.match(/\(/g) || []).length < (url.match(/\)/g) || []).length)) url = url.slice(0, -1);
@@ -6416,8 +6439,8 @@ function ibMdInline(src, ctx, depth = 0) {
     if (ch === '*' || ch === '_' || ch === '~') {
       const em = ibMdEmphasisAt(text, i);
       if (em) { push(el(em.tag, {}, ...(depth < 6 ? ibMdInline(em.inner, ctx, depth + 1) : [em.inner]))); i = em.end; continue; }
-      const run = new RegExp('^\\' + ch + '+').exec(text.slice(i))[0];
-      buf += run; i += run.length; continue;
+      const run = ibMdRun(text, i, ch);
+      buf += text.substr(i, run); i += run; continue;
     }
     buf += ch; i++;
   }
@@ -7013,7 +7036,9 @@ async function ibRetryCallback(r, delivery) {
 function ibIsRisky(t) { return (t.flags || []).some((f) => f.level === 'red' || f.label === 'Production'); }
 
 function ibApprove(r, allow) {
-  if (!ibCheckAnswers(r)) return;
+  // Rejecting every call ends the item: required answers are then optional
+  // (the server applies the same rule), but what is answered must be valid.
+  if (!ibCheckAnswers(r, allow.some(Boolean))) return;
   const body = ibApproveBody(r, allow);
   const risky = r.tools.filter((t, k) => allow[k] && ibIsRisky(t));
   if (!risky.length) { ibDecide(r, body); return; }

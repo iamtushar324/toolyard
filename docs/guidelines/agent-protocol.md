@@ -136,7 +136,7 @@ inbox.request({
 | `facts` | yes | `why_now`, `if_it_goes_wrong`, `undo`. Concrete; numbers over adjectives. |
 | `audio.script` | no | Optional audio summary. See §5 for limits. |
 | `urgency` | yes | `now` \| `soon` \| `digest` \| `fyi`. See §7. |
-| `tools` | yes | 1–50 entries. |
+| `tools` | yes | 1–12 entries; up to 50 with `schema_version: 3` (§14). |
 | `attachments` | no | Up to 24. Strongly recommended. |
 | `ttl_seconds` | no | How long grants last once approved. Default 1800, max 86400. Ask for the shortest that works. |
 | `session_id` | no | From `session.start`. Attaches task context to related requests. |
@@ -887,8 +887,13 @@ A callback is toolyard calling you when something you wait on happens, so
 you can end your turn instead of polling. Register a receiver once, then
 name it on the calls that should report to it.
 
-**Register.** `callbacks.register({ "destination": "https://example.com/hooks/toolyard", "make_default": true })`
-returns a `callback_ref` (`cb_…`). Give your own Standard Webhooks `secret`
+**Register.** `callbacks.register({ "destination": "https://example.com/hooks/toolyard", "events": ["*"], "v3": true, "make_default": true })`
+returns a `callback_ref` (`cb_…`). A receiver gets only the events it asks
+for: `events` lists names, `"<prefix>.*"` or `"*"`; without it, only
+`inbox.decision`, `inbox.expired` and `inbox.cancelled`. `v3: true` accepts
+the schema version 3 decision shape (`answers`, more than 12 calls);
+without it the receiver gets the version 2 shape, and an item with more
+than 12 calls refuses it. Give your own Standard Webhooks `secret`
 (`whsec_` and 24–64 random bytes in Base64), or leave it out and toolyard
 generates one and returns it **once**: store it. Destinations are public
 `https` URLs on port 443 and never change; register a new receiver for a new
@@ -897,12 +902,18 @@ URL. In T3, use your session webhook instead (`t3_session_webhook_create`).
 **Use it.** Pass `callback_ref` (and up to 5 `callback_refs`) on
 `inbox.request` or `inbox.ask`; several receivers can follow one item. With
 none, your default receiver (`callbacks.set_default`) follows it. On a call
-that may wait for a legacy approval, add `_callback_ref` to its arguments.
+that may wait for a legacy approval, add `_callback_ref` to its arguments
+(at most 512 characters). A tool that declares a `_callback_ref` parameter
+of its own keeps it: toolyard then neither reads nor removes the argument.
+If toolyard cannot register the receiver, the deferred answer carries a
+`callback_warning`.
 
 **Manage.** `callbacks.list` (with `callback_ref`: its recent deliveries),
 `callbacks.update` (`disable`, `rotate`, `remove`, with `expected_revision`),
 `callbacks.set_default` (an empty `callback_ref` clears it), and
-`callbacks.test`, which sends a signed `ping`.
+`callbacks.test`, which sends a signed `ping` (receivers whose `events`
+include `ping`; one pending ping per receiver, 10 a minute). An agent keeps
+at most 20 receivers.
 
 **Events.** Every event is a JSON envelope
 `{ "type", "event_id", "timestamp", "data" }`, POSTed with the headers

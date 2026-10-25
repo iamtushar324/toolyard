@@ -15,30 +15,39 @@ import (
 // Limits. These are the numbers the agent protocol promises; keep them in
 // sync with docs/guidelines/agent-protocol.md (a test checks the key ones).
 const (
-	MaxTitle        = 60
-	MaxSummary      = 200
-	MaxMessage      = 20000
-	MaxFact         = 600
-	MaxAudioWords   = 75
-	MaxTools        = 50
-	MaxToolSummary  = 200
-	MaxAttachments  = 24
-	MaxCaption      = 300
-	MaxSpoken       = 120
-	MaxMarkdown     = 20000
-	MaxCodeBody     = 60000
-	MaxTableCols    = 12
-	MaxTableRows    = 200
-	MaxChartSeries  = 6
-	MaxChartPoints  = 500
-	MaxPieSlices    = 24
-	MinOptions      = 2
-	MaxOptions      = 4
-	MaxOptionLabel  = 80
-	MaxOptionDetail = 200
-	DefaultTTL      = 1800
-	MinTTL          = 60
-	MaxTTL          = 86400
+	MaxTitle       = 60
+	MaxSummary     = 200
+	MaxMessage     = 20000
+	MaxFact        = 600
+	MaxAudioWords  = 75
+	MaxTools       = 50 // schema_version 3; MaxToolsLegacy before
+	MaxToolsLegacy = 12
+	MaxToolSummary = 200
+	MaxAttachments = 24
+	MaxCaption     = 300
+	MaxSpoken      = 120
+	MaxMarkdown    = 20000
+	MaxCodeBody    = 60000
+	MaxTableCols   = 12
+	MaxTableRows   = 200
+	MaxChartSeries = 6
+	MaxChartPoints = 500
+	MaxPieSlices   = 24
+	MaxChartLabel  = 80 // an x label, a series name, the unit
+	// MaxSubmissionBytes bounds a whole submission as JSON, and
+	// MaxParamsBytes one call's params.
+	MaxSubmissionBytes = 1 << 20
+	MaxParamsBytes     = 64 << 10
+	// MaxCallbackRefLen bounds a callback_ref (the same bound as the
+	// _callback_ref argument).
+	MaxCallbackRefLen = 512
+	MinOptions        = 2
+	MaxOptions        = 4
+	MaxOptionLabel    = 80
+	MaxOptionDetail   = 200
+	DefaultTTL        = 1800
+	MinTTL            = 60
+	MaxTTL            = 86400
 )
 
 // Problem is one thing wrong with a request, with the JSON path it's at.
@@ -184,6 +193,12 @@ func Validate(ctx context.Context, cat Catalog, agentID string, s *Submission, o
 		}
 	}
 	r.CallbackRefs = validateCallbackRefs(add, s.CallbackRefs)
+	if len(s.CallbackRef) > MaxCallbackRefLen {
+		add("callback_ref", "at most %d bytes", MaxCallbackRefLen)
+	}
+	if b, err := json.Marshal(s); err == nil && len(b) > MaxSubmissionBytes {
+		add("", "the request is %d bytes as JSON; max %d. Attach large evidence as an upload instead.", len(b), MaxSubmissionBytes)
+	}
 
 	checkText(add, "title", r.Title, MaxTitle, "Verb + object + target, e.g. \"Deploy api to prod\".")
 	checkText(add, "summary", r.Summary, MaxSummary, "One line for the inbox card.")
@@ -240,8 +255,12 @@ func Validate(ctx context.Context, cat Catalog, agentID string, s *Submission, o
 		if len(s.Tools) == 0 {
 			add("tools", "an access request needs at least one tool")
 		}
-		if len(s.Tools) > MaxTools {
-			add("tools", "%d tools; max %d. Split the task, or leave out tools you don't need.", len(s.Tools), MaxTools)
+		maxTools := MaxToolsLegacy
+		if rich {
+			maxTools = MaxTools
+		}
+		if len(s.Tools) > maxTools {
+			add("tools", "%d tools; max %d (%d with schema_version 3). Split the task, or leave out tools you don't need.", len(s.Tools), maxTools, MaxTools)
 		}
 		names := map[string]bool{}
 		for _, st := range s.Tools {
@@ -265,6 +284,9 @@ func Validate(ctx context.Context, cat Catalog, agentID string, s *Submission, o
 				}
 			}
 			validateCallContext(add, p, &tr)
+			if b, err := json.Marshal(st.Params); err == nil && len(b) > MaxParamsBytes {
+				add(p+".params", "%d bytes as JSON; max %d", len(b), MaxParamsBytes)
+			}
 			checkText(add, p+".summary", tr.Summary, MaxToolSummary, "Say in plain words what this call will do.")
 			for name, raw := range st.Params {
 				if !browserNumbersSafe(raw) {
@@ -391,8 +413,8 @@ func validateCallbackRefs(add func(string, string, ...any), refs []string) []str
 	var out []string
 	for i, ref := range refs {
 		ref = strings.TrimSpace(ref)
-		if ref == "" || len(ref) > 128 {
-			add(fmt.Sprintf("callback_refs[%d]", i), "give a callback_ref from callbacks.register (at most 128 bytes)")
+		if ref == "" || len(ref) > MaxCallbackRefLen {
+			add(fmt.Sprintf("callback_refs[%d]", i), "give a callback_ref from callbacks.register (at most %d bytes)", MaxCallbackRefLen)
 			continue
 		}
 		out = append(out, ref)
@@ -556,7 +578,25 @@ func validateChart(add func(string, string, ...any), p string, a *Attachment) {
 	if len(a.Series) == 0 || len(a.Series) > MaxChartSeries {
 		add(p+".series", "give 1 to %d series", MaxChartSeries)
 	}
+	if utf8.RuneCountInString(a.Unit) > MaxChartLabel {
+		add(p+".unit", "max %d characters", MaxChartLabel)
+	}
+	for j, x := range a.X {
+		switch v := x.(type) {
+		case string:
+			if utf8.RuneCountInString(v) > MaxChartLabel {
+				add(fmt.Sprintf("%s.x[%d]", p, j), "max %d characters", MaxChartLabel)
+			}
+		default:
+			if _, ok := answerNumber(x); !ok {
+				add(fmt.Sprintf("%s.x[%d]", p, j), "an x label is a string or a number")
+			}
+		}
+	}
 	for j, s := range a.Series {
+		if utf8.RuneCountInString(s.Name) > MaxChartLabel {
+			add(fmt.Sprintf("%s.series[%d].name", p, j), "max %d characters", MaxChartLabel)
+		}
 		if len(s.Values) == 0 || len(s.Values) > MaxChartPoints {
 			add(fmt.Sprintf("%s.series[%d].values", p, j), "give 1 to %d values", MaxChartPoints)
 		}

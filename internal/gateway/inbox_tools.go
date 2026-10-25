@@ -429,9 +429,10 @@ func (g *Gateway) inboxTools() []toolEntry {
 	requestProps["schema_version"] = map[string]any{"type": "integer", "enum": []int{1, 2, 3}, "description": "3 for questions[] next to the tool calls."}
 	requestProps["questions"] = schemaQuestions
 	requestProps["tools"] = map[string]any{
-		"type":     "array",
-		"minItems": 1,
-		"maxItems": inbox.MaxTools,
+		"type":        "array",
+		"minItems":    1,
+		"maxItems":    inbox.MaxTools,
+		"description": "Every call the task needs: at most 12, or 50 with schema_version 3.",
 		"items": map[string]any{
 			"type":     "object",
 			"required": []string{"call_id", "tool", "required", "summary", "target", "operation", "expected_effects", "params"},
@@ -552,7 +553,7 @@ func (g *Gateway) inboxTools() []toolEntry {
 				return inboxJSON(map[string]any{"calls": res}), nil
 			}),
 		inboxEntry("inbox.request", inboxUpstream,
-			"Ask your owner for permission to use restricted tools: one request per task, with every tool it needs (up to 50 calls), and with schema_version 3 any questions[] the task also needs answered. "+
+			"Ask your owner for permission to use restricted tools: one request per task, with every tool it needs (up to 12 calls; 50 with schema_version 3), and with schema_version 3 any questions[] the task also needs answered. "+
 				"Write it as yourself: a first-person message, facts (why_now, if_it_goes_wrong, undo), a ≤75-word voice-note script, and evidence attachments. "+
 				"Supply task.objective and run it with dry_run: true first. Include an authorized callback_ref, then continue unrelated work or end the turn. "+
 				"After a callback, read inbox.status for authoritative decisions and valid grants before execution. inbox.wait is optional. Read inbox.guide for the format.",
