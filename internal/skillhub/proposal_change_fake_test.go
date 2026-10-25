@@ -36,7 +36,14 @@ type fakeGitCommit struct {
 type fakeGitPull struct {
 	number                  int
 	title, head, base, body string
+	userID                  int64 // who opened it
 }
+
+// The GitHub account behind the fake's token.
+const (
+	fakeGitUserID    = 101
+	fakeGitUserLogin = "creator"
+)
 
 // fakeGitFail makes one call to a route fail: after the first `after`
 // calls, the next one answers status; with apply, it carries the write out
@@ -79,6 +86,17 @@ func newFakeGitData(t *testing.T, gh *fakeGitHub, token string) *fakeGitData {
 	mux.HandleFunc("POST /repos/{o}/{r}/git/refs", f.api("POST refs", f.postRef))
 	mux.HandleFunc("GET /repos/{o}/{r}/pulls", f.api("GET pulls", f.getPulls))
 	mux.HandleFunc("POST /repos/{o}/{r}/pulls", f.api("POST pulls", f.postPull))
+	mux.HandleFunc("GET /user", func(w http.ResponseWriter, r *http.Request) {
+		f.mu.Lock()
+		f.calls["GET user"]++
+		f.auth[r.Header.Get("Authorization")] = true
+		f.mu.Unlock()
+		if r.Header.Get("Authorization") != "Bearer "+f.token {
+			http.Error(w, `{"message":"Bad credentials"}`, http.StatusUnauthorized)
+			return
+		}
+		writeJSON(w, map[string]any{"id": fakeGitUserID, "login": fakeGitUserLogin})
+	})
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
 		t.Errorf("fake GitHub: unexpected %s %s", r.Method, r.URL.Path)
 		http.Error(w, `{"message":"Not Found"}`, http.StatusNotFound)
@@ -398,8 +416,13 @@ func (f *fakeGitData) postRef(w http.ResponseWriter, r *http.Request) {
 }
 
 func (f *fakeGitData) pullJSON(p fakeGitPull) map[string]any {
+	login := fakeGitUserLogin
+	if p.userID != fakeGitUserID {
+		login = "someone-else"
+	}
 	return map[string]any{"number": p.number, "html_url": fmt.Sprintf("https://github.com/%s/%s/pull/%d", f.gh.owner, f.gh.repo, p.number),
-		"state": "open", "title": p.title, "head": map[string]string{"ref": p.head, "sha": f.refs[p.head]}, "base": map[string]string{"ref": p.base}}
+		"state": "open", "title": p.title, "head": map[string]string{"ref": p.head, "sha": f.refs[p.head]}, "base": map[string]string{"ref": p.base},
+		"user": map[string]any{"id": p.userID, "login": login}}
 }
 
 func (f *fakeGitData) getPulls(w http.ResponseWriter, r *http.Request) {
@@ -447,7 +470,7 @@ func (f *fakeGitData) postPull(w http.ResponseWriter, r *http.Request) {
 		http.Error(w, `{"message":"Server Error"}`, ff.status)
 		return
 	}
-	p := fakeGitPull{number: len(f.pulls) + 1, title: body.Title, head: body.Head, base: body.Base, body: body.Body}
+	p := fakeGitPull{number: len(f.pulls) + 1, title: body.Title, head: body.Head, base: body.Base, body: body.Body, userID: fakeGitUserID}
 	f.pulls = append(f.pulls, p)
 	if failing {
 		http.Error(w, `{"message":"Server Error"}`, ff.status)
@@ -467,4 +490,23 @@ func (f *fakeGitData) branchTree(branch string) (files, modes map[string]string,
 	}
 	t := f.trees[commit.tree]
 	return t.files, t.modes, commit, true
+}
+
+// plantBranch makes branch point at a new commit on parent whose tree is
+// the root tree of files (a branch someone else prepared).
+func (f *fakeGitData) plantBranch(branch, parent, message string, files map[string]string) string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	tree := f.treeLocked(files, map[string]string{}, "")
+	sha := fakeSHA("planted", branch, tree)
+	f.commits[sha] = fakeGitCommit{tree: tree, message: message, parents: []string{parent}}
+	f.refs[branch] = sha
+	return sha
+}
+
+// plantPull opens a pull request from branch as userID.
+func (f *fakeGitData) plantPull(branch, base string, userID int64) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.pulls = append(f.pulls, fakeGitPull{number: len(f.pulls) + 1, title: "planted", head: branch, base: base, userID: userID})
 }

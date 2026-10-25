@@ -554,7 +554,13 @@ the database and serves only that copy. How sync, review and limits work:
   the App that the GitHub setup creates asks for *Pull requests: write*
   and *Contents: read*, so add *Contents: write* in the App's settings on
   GitHub (and accept it on each installation) to use change proposals.
-  The writes go to `https://api.github.com` only.
+  The writes go to `https://api.github.com` only. Only the source's
+  creator approves one, in person; an operator token cannot.
+- **`skills_change_allow_build_files`** (Settings; default false; owner
+  scope for operator tokens): lets a change proposal write CI or build
+  configuration (a `Makefile`, `package.json`, a workflow file, ...) that
+  sits directly in the skill's own folder. Off, every such path is
+  refused; a CI folder such as `.github/` is refused either way.
 - **`skills_github_token`** (set on the Skills page, GitHub access, or
   `PUT /v1/skills/admin/github-token`; never through the settings API,
   which neither returns nor accepts it): a default read token for every

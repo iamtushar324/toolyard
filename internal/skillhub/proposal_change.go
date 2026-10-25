@@ -20,6 +20,9 @@ package skillhub
 
 import (
 	"context"
+	"crypto/rand"
+	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -45,9 +48,10 @@ const (
 	// MaxChangeFiles is how many files one proposal may touch.
 	MaxChangeFiles = 50
 	// MaxChangeTitle and MaxChangeSummary bound the pull request title
-	// and body the agent writes (characters).
+	// and body the agent writes (characters). The owner's Inbox item shows
+	// both in full, so the pull request carries exactly what they read.
 	MaxChangeTitle   = 200
-	MaxChangeSummary = 10000
+	MaxChangeSummary = 3000
 	// MaxChangeBytes bounds the new contents of one proposal together.
 	MaxChangeBytes = 4 << 20
 	// MaxPendingChangeProposals is how many change proposals one agent
@@ -68,6 +72,10 @@ const (
 	changeStaleAfter = 3 * time.Minute
 	// changeApplyTimeout bounds one attempt at the GitHub writes.
 	changeApplyTimeout = 2 * time.Minute
+	// changeMaxAge and changeMaxAttempts bound the retries of an approved
+	// proposal whose pull request is not confirmed: after either, it fails.
+	changeMaxAge      = 24 * time.Hour
+	changeMaxAttempts = 10
 )
 
 // ChangeOptions configure ChangeProposals.
@@ -84,6 +92,11 @@ type ChangeOptions struct {
 	// HTTPClient talks to the GitHub API (tests: a fake); nil is the
 	// default client.
 	HTTPClient *http.Client
+	// AllowBuildFiles reports the setting skills_change_allow_build_files:
+	// when true, a proposal may write CI or build configuration that sits
+	// directly in the skill's own folder (changeBuildPath). nil or false
+	// refuses every such path.
+	AllowBuildFiles func(ctx context.Context) bool
 	// AgentName and UserName name an agent and a person in the item and
 	// the pull request ("" falls back to the ID).
 	AgentName func(ctx context.Context, agentID string) string
@@ -109,7 +122,9 @@ func NewChangeProposals(o ChangeOptions) (*ChangeProposals, error) {
 		o.Now = time.Now
 	}
 	c := &ChangeProposals{o: o, store: proposalStore{db: o.DB, now: o.Now}}
-	o.Inbox.HandleSystem(ChangeProposalItemKind, c.decide)
+	// HumanOnly: the Inbox itself refuses an answer that is not the
+	// creator's own (an operator token, a batch, a rule, a grant).
+	o.Inbox.HandleSystem(ChangeProposalItemKind, c.decide, inbox.SystemOptions{HumanOnly: true})
 	return c, nil
 }
 
@@ -133,6 +148,12 @@ type changeInput struct {
 	Title      string       `json:"title"`
 	Summary    string       `json:"summary,omitempty"`
 	Files      []changeFile `json:"files"`
+	// HeadBranch is the pull request's branch: ChangeBranchPrefix, the
+	// proposal ID and a random suffix the agent never sees, so nobody can
+	// prepare that branch before the approval.
+	HeadBranch string `json:"head_branch,omitempty"`
+	// Attempts counts the resumed attempts at the GitHub writes.
+	Attempts int `json:"attempts,omitempty"`
 }
 
 // changeFile is one file of a proposal.
@@ -153,6 +174,23 @@ const (
 
 // skillDir is the skill's folder in the repository.
 func (ci *changeInput) skillDir() string { return repoPath(ci.Folder, ci.SkillPath) }
+
+// branchFor is the pull request's branch of proposal id.
+func (ci *changeInput) branchFor(id string) string {
+	if ci.HeadBranch != "" {
+		return ci.HeadBranch
+	}
+	return ChangeBranchPrefix + id
+}
+
+// changeBranchSuffix is a random suffix for a proposal's branch (48 bits).
+func changeBranchSuffix() string {
+	var b [6]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		panic("skillhub: crypto/rand failed: " + err.Error())
+	}
+	return hex.EncodeToString(b[:])
+}
 
 // ProposeChange checks the edit against the version of the skill the agent
 // sees and asks the source's creator in the Inbox. Nothing is written to
@@ -206,13 +244,23 @@ func (c *ChangeProposals) ProposeChange(ctx context.Context, v Viewer, in Change
 	if tok, err := c.o.Tokens(ctx, src.CreatedBy); err != nil || tok == "" {
 		return nil, needsConnection(fmt.Sprintf("the owner of the skill source %s has no usable toolyard GitHub connection, so toolyard cannot open a pull request; tell your owner what should change", src.Slug))
 	}
+	id := proposalNewID()
 	ci := changeInput{Skill: sk.URI, SkillPath: sk.Path, Name: sk.Name, Slug: src.Slug, Owner: src.Owner, Repo: src.Repo,
-		Branch: src.Branch, Folder: src.Path, BaseSHA: sk.Commit, AgentOwner: v.UserID, Title: title, Summary: summary, Files: files}
+		Branch: src.Branch, Folder: src.Path, BaseSHA: sk.Commit, AgentOwner: v.UserID, Title: title, Summary: summary, Files: files,
+		HeadBranch: ChangeBranchPrefix + id + "-" + changeBranchSuffix()}
+	agent := c.agentName(ctx, v.AgentID)
+	// The owner approves exactly what the item shows: every path, the
+	// whole summary and every diff. A change that does not fit is refused
+	// rather than shown in part.
+	message := changeMessage(agent, c.userName(ctx, v.UserID), &ci)
+	if n := utf8.RuneCountInString(message); n > inbox.MaxMessage {
+		return nil, fmt.Errorf("%w: the change is too large to show in full in the owner's Inbox (%d of at most %d characters with its diffs); propose fewer or smaller files", ErrLimit, n, inbox.MaxMessage)
+	}
 	stored, err := json.Marshal(ci)
 	if err != nil {
 		return nil, err
 	}
-	row := &proposalRow{ID: proposalNewID(), Kind: proposalKindChange, Status: proposalPending, AgentID: v.AgentID,
+	row := &proposalRow{ID: id, Kind: proposalKindChange, Status: proposalPending, AgentID: v.AgentID,
 		UserID: src.CreatedBy, SourceID: src.ID, Input: string(stored), Reason: summary}
 	if src.ActiveSHA == sk.Commit {
 		row.VersionID = src.ActiveVersionID
@@ -220,12 +268,11 @@ func (c *ChangeProposals) ProposeChange(ctx context.Context, v Viewer, in Change
 	if err := c.store.insert(ctx, row); err != nil {
 		return nil, err
 	}
-	agent := c.agentName(ctx, v.AgentID)
 	item, err := c.o.Inbox.CreateSystemItem(ctx, inbox.SystemItem{
 		Kind: ChangeProposalItemKind, Ref: row.ID, UserID: src.CreatedBy,
 		Title:     reviewClip("Skill change: "+title, inbox.MaxTitle),
 		Summary:   reviewClip(changeItemSummary(agent, &ci), inbox.MaxSummary),
-		Message:   changeMessage(agent, c.userName(ctx, v.UserID), row.ID, &ci),
+		Message:   message,
 		Questions: reviewQuestion("Open a pull request on "+src.Owner+"/"+src.Repo+"?", "Approve: open the pull request with my GitHub account", "Reject: send nothing to GitHub"),
 		Activity:  "Proposed by " + agent + " with skills.propose_change",
 	})
@@ -289,12 +336,26 @@ func (c *ChangeProposals) checkFiles(ctx context.Context, v Viewer, sk *Skill, s
 		paths = append(paths, p)
 	}
 	sort.Strings(paths)
+	allowBuild := c.o.AllowBuildFiles != nil && c.o.AllowBuildFiles(ctx)
 	var out []changeFile
 	total := 0
 	for _, p := range paths {
 		content := in[p]
 		if err := checkChangePath(p); err != nil {
 			return nil, fmt.Errorf("%w: files: %s: %v", ErrInvalid, reviewCode(changeLine(p)), err)
+		}
+		// CI and build configuration runs when the branch is pushed or the
+		// pull request opens, before anyone reviews it. It is refused,
+		// unless it sits directly in the skill's own folder and an admin
+		// allowed that (skills_change_allow_build_files).
+		if full := repoPath(dir, p); changeBuildPath(full) {
+			parent := path.Dir(full)
+			if parent == "." {
+				parent = ""
+			}
+			if !allowBuild || parent != dir {
+				return nil, fmt.Errorf("%w: files: %s is CI or build configuration (it would run on the pull request's branch before review); change it on GitHub yourself", ErrInvalid, reviewCode(full))
+			}
 		}
 		if content == "" {
 			switch {
@@ -347,6 +408,9 @@ func (c *ChangeProposals) checkFiles(ctx context.Context, v Viewer, sk *Skill, s
 		total += len(content)
 		if total > MaxChangeBytes {
 			return nil, fmt.Errorf("%w: files: the new contents are over %d bytes together", ErrLimit, MaxChangeBytes)
+		}
+		if _, _, _, ok := changeUnifiedDiff(f.Old, f.Content, changeDiffContext); !ok {
+			return nil, fmt.Errorf("%w: files: the change of %s is too large to show for approval; propose a smaller change", ErrLimit, reviewCode(p))
 		}
 		out = append(out, f)
 	}
@@ -413,6 +477,63 @@ func checkChangePath(p string) error {
 		}
 	}
 	return nil
+}
+
+// changeBuildNames are file names that CI services or build tools run or
+// read on their own (compared in lower case).
+var changeBuildNames = map[string]bool{
+	".gitlab-ci.yml": true, ".travis.yml": true, ".drone.yml": true, ".drone.yaml": true, "azure-pipelines.yml": true,
+	"azure-pipelines.yaml": true, "bitbucket-pipelines.yml": true, "cloudbuild.yaml": true, "cloudbuild.yml": true,
+	"buildspec.yml": true, "buildspec.yaml": true, "appveyor.yml": true, ".appveyor.yml": true, "codecov.yml": true,
+	".pre-commit-config.yaml": true, "jenkinsfile": true, "makefile": true, "gnumakefile": true, "justfile": true,
+	"taskfile.yml": true, "taskfile.yaml": true, "dockerfile": true, "containerfile": true, "docker-compose.yml": true,
+	"docker-compose.yaml": true, "compose.yml": true, "compose.yaml": true, "package.json": true, "package-lock.json": true,
+	"npm-shrinkwrap.json": true, "pnpm-lock.yaml": true, "pnpm-workspace.yaml": true, ".npmrc": true, ".yarnrc": true,
+	".yarnrc.yml": true, "go.mod": true, "go.sum": true, "go.work": true, "cargo.toml": true, "build.rs": true,
+	"pyproject.toml": true, "setup.py": true, "setup.cfg": true, "tox.ini": true, "noxfile.py": true, "pipfile": true,
+	"gemfile": true, "rakefile": true, "build.gradle": true, "build.gradle.kts": true, "settings.gradle": true,
+	"pom.xml": true, "build.xml": true, "cmakelists.txt": true, "meson.build": true, "vercel.json": true,
+	"netlify.toml": true, "renovate.json": true, ".gitmodules": true, ".gitattributes": true, "codeowners": true,
+}
+
+// changeBuildDirs are folders whose files CI services run (any segment,
+// lower case).
+var changeBuildDirs = map[string]bool{
+	".github": true, ".gitlab": true, ".circleci": true, ".buildkite": true, ".azure-pipelines": true,
+	".husky": true, ".devcontainer": true, ".woodpecker": true, ".forgejo": true, ".gitea": true, ".tekton": true,
+}
+
+// changeBuildPath reports whether a repository path is CI or build
+// configuration: a file in a CI folder (.github/**, .circleci/**, ...), a
+// well-known build or pipeline file (Makefile, package.json,
+// Dockerfile, Jenkinsfile, .gitlab-ci.yml, ...), a lock file, or a name
+// that looks like a workflow or pipeline definition.
+func changeBuildPath(p string) bool {
+	segs := strings.Split(strings.ToLower(p), "/")
+	for _, seg := range segs[:len(segs)-1] {
+		if changeBuildDirs[seg] {
+			return true
+		}
+	}
+	name := segs[len(segs)-1]
+	switch {
+	case changeBuildNames[name],
+		strings.HasSuffix(name, ".lock"),
+		strings.HasPrefix(name, "dockerfile."), strings.HasSuffix(name, ".dockerfile"),
+		strings.HasPrefix(name, "jenkinsfile"), strings.HasPrefix(name, "makefile."),
+		strings.HasPrefix(name, "requirements") && strings.HasSuffix(name, ".txt"):
+		return true
+	}
+	if stem, ok := strings.CutSuffix(name, ".yml"); ok || strings.HasSuffix(name, ".yaml") {
+		if !ok {
+			stem = strings.TrimSuffix(name, ".yaml")
+		}
+		if strings.Contains(stem, "workflow") || strings.Contains(stem, "pipeline") || stem == "ci" || stem == "action" ||
+			strings.HasSuffix(stem, "-ci") || strings.HasSuffix(stem, "_ci") || strings.HasSuffix(stem, ".ci") {
+			return true
+		}
+	}
+	return false
 }
 
 // GetProposal returns one change proposal to the agent that sent it, or
@@ -535,10 +656,34 @@ func (c *ChangeProposals) reconcile(ctx context.Context, row *proposalRow) error
 // attempt stopped or got an uncertain answer. Only one caller wins the
 // claim; the writes reconcile with GitHub first.
 func (c *ChangeProposals) resume(ctx context.Context, row *proposalRow) {
-	ok, err := c.store.changeClaim(ctx, row.ID, proposalApproved, row.UpdatedAt)
+	var ci changeInput
+	_ = json.Unmarshal([]byte(row.Input), &ci)
+	approvedAt, err := c.store.changeDecidedAt(ctx, row.ID)
+	if err != nil {
+		return
+	}
+	if approvedAt == 0 {
+		approvedAt = row.CreatedAt
+	}
+	if c.o.Now().UnixMilli()-approvedAt > changeMaxAge.Milliseconds() || ci.Attempts >= changeMaxAttempts {
+		msg := fmt.Sprintf("toolyard gave up: GitHub did not confirm the pull request in %d attempts (toolyard stops after %d attempts or a day); look for the branch %s on GitHub, and ask the agent to propose again if it is not there",
+			ci.Attempts+1, changeMaxAttempts+1, ci.branchFor(row.ID))
+		if ok, _ := c.store.changeSetOutcome(ctx, row.ID, proposalApproved, proposalFailed, "", msg); ok {
+			c.audit(ctx, audit.Event{EventType: "skills.change_proposal_fail", AgentID: row.AgentID, Reason: msg, ApprovalID: row.ID,
+				DecidedByUserID: row.DecidedBy})
+		}
+		return
+	}
+	ci.Attempts++
+	input, err := json.Marshal(ci)
+	if err != nil {
+		return
+	}
+	ok, err := c.store.changeClaim(ctx, row.ID, proposalApproved, row.UpdatedAt, string(input))
 	if err != nil || !ok {
 		return
 	}
+	row.Input = string(input)
 	_, _ = c.finish(ctx, row)
 }
 
@@ -574,9 +719,16 @@ func (c *ChangeProposals) decide(ctx context.Context, r *inbox.Request) (string,
 			ApprovalID: row.ID, DecidedByUserID: decider})
 		return "Proposal rejected; nothing was sent to GitHub.", nil
 	}
+	// Only the owner in person may approve a write with their GitHub
+	// account: the dashboard, their own notification, or a passkey (the
+	// set the approval bus accepts for a personal GitHub write, without
+	// the batch click). Anything else, an empty or unknown instrument
+	// included, fails closed. The Inbox refuses these before they are
+	// recorded (HumanOnly); this is the second check.
 	switch r.DeciderVia {
-	case actor.ViaAutoRule, actor.ViaPolicy, actor.ViaInboxGrant, actor.ViaAgentCancel, actor.ViaExpiry:
-		err := errors.New("a GitHub write needs the account owner's own decision, not an automatic one")
+	case actor.ViaDashboard, actor.ViaPushToken, actor.ViaPasskey:
+	default:
+		err := errors.New("a GitHub write needs the account owner's own decision in the dashboard, from their notification, or with a passkey")
 		_, _ = c.store.move(ctx, row.ID, []string{proposalPending}, proposalFailed, proposalUpdate{Error: err.Error()})
 		return "", err
 	}
@@ -600,7 +752,7 @@ func (c *ChangeProposals) finish(ctx context.Context, row *proposalRow) (string,
 		}
 		c.audit(ctx, audit.Event{EventType: "skills.change_pull_request", AgentID: row.AgentID, Reason: "approved proposal " + row.ID,
 			ResultSummary: pr, ApprovalID: row.ID, DecidedByUserID: row.DecidedBy})
-		return "Opened the pull request " + pr + " (branch " + ChangeBranchPrefix + row.ID + ").", nil
+		return "Opened the pull request " + pr + ".", nil
 	}
 	msg := reviewClip(err.Error(), 500)
 	var ce *changeError
@@ -639,16 +791,26 @@ func (c *ChangeProposals) audit(ctx context.Context, ev audit.Event) {
 	}
 }
 
-// changeClaim moves a row's updated_at to now when it is still in status
-// with updatedAt; it reports whether this caller won.
-func (st proposalStore) changeClaim(ctx context.Context, id, status string, updatedAt int64) (bool, error) {
-	res, err := st.db.ExecContext(ctx, `UPDATE skill_proposals SET updated_at = ? WHERE id = ? AND status = ? AND updated_at = ?`,
-		st.now().UnixMilli(), id, status, updatedAt)
+// changeClaim moves a row's updated_at to now and stores input (with its
+// attempt count) when the row is still in status with updatedAt; it
+// reports whether this caller won.
+func (st proposalStore) changeClaim(ctx context.Context, id, status string, updatedAt int64, input string) (bool, error) {
+	res, err := st.db.ExecContext(ctx, `UPDATE skill_proposals SET updated_at = ?, input = ? WHERE id = ? AND status = ? AND updated_at = ?`,
+		st.now().UnixMilli(), input, id, status, updatedAt)
 	if err != nil {
 		return false, err
 	}
 	n, err := res.RowsAffected()
 	return n == 1, err
+}
+
+// changeDecidedAt is when a row was decided (Unix ms), 0 when unknown.
+func (st proposalStore) changeDecidedAt(ctx context.Context, id string) (int64, error) {
+	var at sql.NullInt64
+	if err := st.db.QueryRowContext(ctx, `SELECT decided_at FROM skill_proposals WHERE id = ?`, id).Scan(&at); err != nil {
+		return 0, err
+	}
+	return at.Int64, nil
 }
 
 // changeStaleApproved lists change rows still approved (being applied)

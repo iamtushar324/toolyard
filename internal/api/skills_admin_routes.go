@@ -203,6 +203,9 @@ func (s *Server) skillSourceCreate(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, redactSkillSecrets(err.Error(), in.Token))
 		return
 	}
+	if s.refuseGitHubConnectionUse(w, r, in.Auth) {
+		return
+	}
 	if existing := s.recentSkillSource(r.Context(), u.ID, in); existing != nil {
 		writeJSON(w, http.StatusOK, map[string]any{"source": existing, "status": skillSourceStatus(existing), "existing": true})
 		return
@@ -413,6 +416,9 @@ func (s *Server) skillPreview(w http.ResponseWriter, r *http.Request, u *identit
 		writeError(w, http.StatusBadRequest, redactSkillSecrets(err.Error(), in.Token))
 		return
 	}
+	if s.refuseGitHubConnectionUse(w, r, in.Auth) {
+		return
+	}
 	prev, err := s.skillsAdmin.Preview(r.Context(), u.ID, in)
 	if err != nil {
 		writeSkillAdminError(w, err, in.Token)
@@ -439,6 +445,9 @@ func (s *Server) skillSource(w http.ResponseWriter, r *http.Request, u *identity
 		before, err := s.skillsAdmin.GetSource(r.Context(), id)
 		if err != nil {
 			writeSkillAdminError(w, err)
+			return
+		}
+		if in.Auth != nil && s.refuseGitHubSwitch(w, r, u, before, *in.Auth) {
 			return
 		}
 		src, err := s.skillsAdmin.UpdateSource(r.Context(), u.ID, id, in)

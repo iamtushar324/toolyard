@@ -9,6 +9,8 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+
+	"github.com/tusharbhardwaj/toolyard/internal/actor"
 )
 
 // System items are Inbox items that toolyard raises itself: a server-side
@@ -109,16 +111,70 @@ type SystemItem struct {
 // item's timeline.
 type SystemHandler func(ctx context.Context, r *Request) (note string, err error)
 
-// HandleSystem registers the handler for one system item kind. Register
-// every kind on every node at start, before the Inbox serves decisions:
-// the node that takes a decision runs its handler.
-func (s *Service) HandleSystem(kind string, h SystemHandler) {
+// SystemOptions say how the items of one system kind may be decided.
+type SystemOptions struct {
+	// HumanOnly: an answer must come from the person the item belongs to,
+	// in person: the dashboard, their own notification, or a passkey. An
+	// operator token, a batch click, a rule, a grant, Telegram or a
+	// decision that names no person is refused with ErrHumanOnly, and the
+	// item stays open. Use it for kinds whose approval acts with that
+	// person's own credentials (a GitHub pull request in their name).
+	// A deny or a snooze is not an answer and stays allowed.
+	HumanOnly bool
+}
+
+// ErrHumanOnly refuses an answer that a HumanOnly system item needs from
+// its owner in person.
+var ErrHumanOnly = errors.New("this item needs your own decision in the dashboard, from your notification, or with a passkey")
+
+// humanVias are the instruments of a decision made by the person in
+// person (the same set the approval bus accepts for a personal GitHub
+// write, without the batch click).
+var humanVias = map[string]bool{actor.ViaDashboard: true, actor.ViaPushToken: true, actor.ViaPasskey: true}
+
+// HandleSystem registers the handler for one system item kind, with its
+// options. Register every kind on every node at start, before the Inbox
+// serves decisions: the node that takes a decision runs its handler.
+func (s *Service) HandleSystem(kind string, h SystemHandler, opts ...SystemOptions) {
 	s.systemMu.Lock()
 	defer s.systemMu.Unlock()
 	if s.system == nil {
 		s.system = map[string]SystemHandler{}
+		s.systemOpts = map[string]SystemOptions{}
 	}
 	s.system[kind] = h
+	var o SystemOptions
+	for _, x := range opts {
+		o.HumanOnly = o.HumanOnly || x.HumanOnly
+	}
+	s.systemOpts[kind] = o
+}
+
+// checkSystemDecider refuses an answer to a HumanOnly system item that
+// does not come from its owner in person. It runs inside the decision's
+// transaction, so every route (REST, operator tokens, notifications,
+// batches) obeys it.
+func (s *Service) checkSystemDecider(r *Request, action string, d actor.Decider) error {
+	if r.System == nil || action == "deny" || action == "snooze" || action == "read" {
+		return nil
+	}
+	s.systemMu.RLock()
+	o := s.systemOpts[r.System.Kind]
+	s.systemMu.RUnlock()
+	if !o.HumanOnly {
+		return nil
+	}
+	owner := ""
+	if uid, ok := SystemAgentUser(r.AgentID); ok {
+		owner = uid
+	}
+	switch {
+	case !humanVias[d.Via], d.UserID == "":
+		return ErrHumanOnly
+	case owner != "" && d.UserID != owner:
+		return ErrHumanOnly
+	}
+	return nil
 }
 
 func (s *Service) systemHandler(kind string) SystemHandler {

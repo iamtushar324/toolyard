@@ -32,7 +32,7 @@ func DeciderFromLegacy(decidedBy string) actor.Decider {
 		case "agent":
 			return actor.Decider{Via: actor.ViaAgentCancel, Ref: ref}
 		case actor.ViaDashboard, actor.ViaDashboardBatch, actor.ViaPushToken, actor.ViaPasskey,
-			actor.ViaAutoRule, actor.ViaPolicy, actor.ViaInboxGrant, actor.ViaAgentCancel:
+			actor.ViaAutoRule, actor.ViaPolicy, actor.ViaInboxGrant, actor.ViaAgentCancel, actor.ViaOperator:
 			return actor.Decider{Via: via, Ref: ref}
 		}
 	}

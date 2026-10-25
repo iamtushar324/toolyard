@@ -154,6 +154,8 @@ func operatorScopeFor(method, path string) (scope string, ok bool) {
 // approval prompts go, how long the audit trail lives, or hold credentials.
 // Patching any of them with an operator token needs the owner scope.
 var ownerSettingKeys = map[string]bool{
+	// What an agent's skill change may push to GitHub.
+	settings.SkillsChangeAllowBuildFiles:     true,
 	settings.ApprovalMode:                    true,
 	settings.AutoApprovalEnabled:             true,
 	settings.AutoApprovalPatternMinApprovals: true,

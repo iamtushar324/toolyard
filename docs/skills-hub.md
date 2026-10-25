@@ -164,6 +164,13 @@ access to the repository or are blocked, the source's syncs fail with a
 clear error and the live version stays until you reconnect or give the
 source a token.
 
+Only you lend your connection, and only in the dashboard: an operator
+token cannot create, preview, inspect or switch a source to `auth:
+github` (403), and an admin cannot switch a source that someone else
+added to `github` (it would read with that person's connection); give it
+a read-only token instead. A source keeps reading with the connection of
+the person who added it.
+
 The same connection opens the pull requests of
 [change proposals](#change-proposals) for the sources you added. The
 toolyard GitHub App must be installed on the repository with these
@@ -186,26 +193,54 @@ An agent that sees a skill can propose an edit with
 `skills.propose_change` ([For agents](#change-proposals-for-agents)).
 toolyard checks it against the version agents see now and puts one
 question, "Open a pull request on owner/repo?", in the Inbox of the person
-who added the skill's source: the proposing agent and its owner, the base
-commit, the agent's title and summary, and a short unified diff of every
-file. Nothing reaches GitHub before that person decides.
+who added the skill's source. The item shows everything the approval
+writes: the proposing agent and its owner, the base commit, the agent's
+title and its whole summary, every file path with its operation (added,
+changed, deleted), and the complete diff of every added or changed file.
+A proposal too large to show in full is refused when the agent makes it,
+never shown in part. Nothing reaches GitHub before that person decides.
 
 - **Approve** opens the pull request with *your* GitHub connection: a new
-  branch `toolyard/skills/<proposal id>` from the base commit, one commit
-  with the files, and a pull request into the source's branch, with the
-  agent's title and summary and a footer naming the agent and the
-  proposal. Nothing is merged: review and merge it on GitHub like any pull
-  request. Once merged, the source picks the commit up like any other
-  (and, in review mode, asks you again before it goes live).
+  branch `toolyard/skills/<proposal id>-<random>` from the base commit
+  (the random part is never shown to the agent, so nobody can prepare
+  that branch), one commit with the files, and a pull request into the
+  source's branch, with the agent's title and summary and a footer naming
+  the agent and the proposal. Pushing the branch and opening the pull
+  request runs the repository's CI on it, as for any pull request.
+  Nothing is merged: review and merge it on GitHub like any pull request.
+  Once merged, the source picks the commit up like any other (and, in
+  review mode, asks you again before it goes live).
 - **Reject** (or a deny) sends nothing to GitHub.
-- Only the person the question went to can approve it: another admin
-  cannot open a pull request with someone else's account, and no grant,
-  policy or automatic rule ever approves one.
-- If GitHub refuses (the App lacks a permission, the base commit is gone,
-  the branch name is taken by someone else), the proposal fails with the
-  reason on the Inbox item. If GitHub's answer is lost, toolyard never
-  writes blindly again: the next attempt first looks for the branch and
-  the pull request it may already have made.
+- Only you can approve it, in person: in the dashboard, from your own
+  notification, or with a passkey. The Inbox refuses an approval from an
+  operator token, a batch click, another admin, a rule or a grant, and
+  the question stays open for you.
+- The pull request carries the summary you read. Its body, its title and
+  the commit message are made inert on GitHub: mentions, issue
+  references, closing keywords ("Fixes #12"), HTML and images do nothing
+  (a zero-width space breaks them; the text reads the same).
+- **CI and build files are refused**: anything in `.github/`,
+  `.gitlab/`, `.circleci/`, `.buildkite/` and similar folders, and files
+  such as `Makefile`, `package.json`, lock files, `Dockerfile`,
+  `Jenkinsfile`, `.gitlab-ci.yml`, `go.mod`, `pyproject.toml` or names
+  that look like a workflow or pipeline. They would run on the pushed
+  branch before anyone reviews the pull request. An admin can allow such
+  a file only when it sits directly in the skill's own folder, with the
+  setting `skills_change_allow_build_files` (default off); a CI folder
+  stays refused.
+- toolyard computes the tree you approved (the base commit with the
+  proposed files) and adopts nothing else it finds on GitHub: a branch of
+  that name must hold exactly that tree on the base commit, and a pull
+  request from it must have been opened by your own GitHub account.
+  Otherwise the proposal fails and says so. When committing, an added
+  file must still be new and an edited one must still exist at the base
+  commit.
+- If GitHub refuses (the App lacks a permission, the base commit is gone),
+  the proposal fails with the reason on the Inbox item. If GitHub's
+  answer is lost, toolyard never writes blindly again: the next attempt
+  (the Inbox sweep, after a few minutes) first looks for the branch and
+  the pull request it may already have made. It stops after ten such
+  attempts or a day, and the proposal fails.
 
 ### Agents propose sources
 
@@ -350,7 +385,8 @@ curl -sf -o skills.tar.gz "$url" && mkdir -p ~/.claude/skills && tar -xzf skills
 To improve a skill, call `skills.propose_change` with the skill, the files
 (path inside the skill folder → its new full content; `""` deletes a
 file), a short `title` (the pull request title, at most 200 characters)
-and a `summary` (what changes and why; the pull request body). The answer
+and a `summary` (what changes and why, at most 3,000 characters; the pull
+request body, shown in full to the owner). The answer
 is a pending proposal; the person who added the skill's source decides in
 their Inbox, and after their approval toolyard opens a pull request on the
 source repository. Poll the outcome with the proposal ID (`skills.proposal`):
@@ -367,9 +403,11 @@ characters), more than 50 files, a file over the source's per-file limit
 not UTF-8 or holds a NUL byte, content that looks like a credential,
 deleting `SKILL.md` or a file that does not exist, a `SKILL.md` that would
 stop being a valid skill (its `name` must stay the folder's name), files
-that would sit inside a file or over a folder, and a change that changes
-nothing. One agent may have at most five change proposals waiting, and the
-source's owner must have a GitHub connection.
+that would sit inside a file or over a folder, CI and build configuration
+(see [Change proposals](#change-proposals)), a change too large to show
+in full in the owner's Inbox item (20,000 characters with its diffs), and
+a change that changes nothing. One agent may have at most five change
+proposals waiting, and the source's owner must have a GitHub connection.
 
 MCP clients can also read skills as resources through the MCP Skills
 extension: see [MCP Skills extension](#mcp-skills-extension).
@@ -681,12 +719,19 @@ details):
   agent cannot break out of its line in an item toolyard sends.
 - **Change proposals.** toolyard, not the agent, writes to GitHub, and
   only after the person who added the source approves that exact change
-  in their Inbox, with their own GitHub connection; no grant, policy or
-  automatic rule approves it, and another admin cannot. Proposed files are
-  checked like synced ones (text only, no credentials, paths inside the
-  skill folder), each write is reconciled with GitHub before it is made,
-  and nothing is ever merged by toolyard. The pull request names the
-  proposing agent and the proposal, never a person.
+  in their Inbox, in person (dashboard, own notification or passkey),
+  with their own GitHub connection. The Inbox enforces this for the item
+  kind (`HumanOnly`): no operator token, batch, grant, policy, rule or
+  other admin approves it. The item shows every path and the complete
+  diff, or the proposal is refused. Proposed files are checked like
+  synced ones (text only, no credentials, paths inside the skill folder),
+  CI and build configuration is refused, the branch name has a part the
+  agent never sees, nothing found on GitHub is adopted unless it is
+  exactly the approved tree (and, for a pull request, opened by the
+  creator), retries stop after ten attempts or a day, and nothing is ever
+  merged by toolyard. The pull request names the proposing agent and the
+  proposal, never a person, and its text is inert (no mentions, closing
+  keywords, HTML or images).
 - **Bundle downloads.** The ticket in the URL is 256 random bits, works
   once, for 10 minutes, and is stored only as its SHA-256; a caller holds
   at most 20 live tickets, visibility is checked again at download, and

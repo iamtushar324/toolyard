@@ -285,7 +285,12 @@ type PullRequest struct {
 	HTMLURL string `json:"html_url"`
 	State   string `json:"state"`
 	Title   string `json:"title"`
-	Head    struct {
+	// User is who opened it.
+	User struct {
+		ID    int64  `json:"id"`
+		Login string `json:"login"`
+	} `json:"user"`
+	Head struct {
 		Ref string `json:"ref"`
 		SHA string `json:"sha"`
 	} `json:"head"`
