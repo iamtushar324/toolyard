@@ -820,6 +820,7 @@ func runServe(argv []string) error {
 		JudgeEnabled:      func() bool { return settingsSvc.GetBool(settings.InboxJudgeEnabled) },
 		Fetcher:           inboxSnaps,
 		SnapshotEnabled:   func() bool { return settingsSvc.GetBoolDefault(settings.InboxSnapshotEnabled, true) },
+		RichEnabled:       func() bool { return settingsSvc.GetBoolDefault(settings.InboxV3Enabled, true) },
 		AllowPrivateMedia: *inboxFetchPrivate,
 		Publish:           func(t string, d any) { hub.Publish(realtime.Event{Type: t, Data: d}) },
 		AgentName:         agentName,
@@ -1031,6 +1032,10 @@ func runServe(argv []string) error {
 		return fmt.Errorf("federation: %w", err)
 	}
 	federationSvc.SetCluster(clusterSvc)
+	// Webhooks: the callbacks.* tools, and approval.decided /
+	// approval.executed for legacy deferred approvals.
+	gw.RegisterCallbackTools(callbackSvc, federationSvc.PrivateReceiverAllowed)
+	bus.SetEventSink(callbackSvc)
 	upstreamSvc.SetSecrets(secretsSvc)
 
 	// Chat-approval notifications (Telegram). The Registry fans approval-bus

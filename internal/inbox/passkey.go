@@ -55,7 +55,8 @@ func DecisionDigest(id string, d Decision) string {
 		SubmissionID string                        `json:"submission_id,omitempty"`
 		Verdicts     map[string]CallVerdict        `json:"verdicts,omitempty"`
 		Note         string                        `json:"note,omitempty"`
-	}{id, d.Action, d.Allow, d.Params, d.TTLSeconds, d.RequestRevision, d.SubmissionID, d.Verdicts, d.Note})
+		Answers      map[string]Answer             `json:"answers,omitempty"`
+	}{id, d.Action, d.Allow, d.Params, d.TTLSeconds, d.RequestRevision, d.SubmissionID, d.Verdicts, d.Note, d.Answers})
 	sum := sha256.Sum256(append([]byte("toolyard-decide-v1\n"), b...))
 	return hex.EncodeToString(sum[:])
 }

@@ -26,6 +26,8 @@ var guideSections = map[int]string{
 	11: "never",
 	12: "examples",
 	13: "fallback",
+	14: "questions",
+	15: "callbacks",
 }
 
 var topicAliases = map[string]string{
@@ -34,6 +36,9 @@ var topicAliases = map[string]string{
 	"media": "attachments", "dry_run": "dry-run", "dryrun": "dry-run", "wait": "grants", "waiting": "grants",
 	"grant": "grants", "update": "updates", "done": "updates", "example": "examples",
 	"rest": "fallback", "backup": "fallback", "ty": "fallback", "curl": "fallback",
+	"question": "questions", "answers": "questions", "rich": "questions", "v3": "questions", "schema_version": "questions",
+	"markdown": "attachments", "charts": "attachments", "chart": "attachments",
+	"callback": "callbacks", "webhook": "callbacks", "webhooks": "callbacks", "receivers": "callbacks", "events": "callbacks",
 }
 
 var sectionHead = regexp.MustCompile(`(?m)^## (\d+)\. `)
