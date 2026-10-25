@@ -19,6 +19,7 @@
 package coderuns
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
@@ -54,7 +55,7 @@ const (
 // ErrorInterrupted is the error kind of a run the server stopped under:
 // a queued run is failed with it (nothing ran), a running one is
 // outcome_unknown with it (a tool call may have run).
-const ErrorInterrupted = "interrupted"
+const ErrorInterrupted = codemode.ErrorInterrupted
 
 // Limits of the REST route.
 const (
@@ -91,6 +92,9 @@ var (
 	ErrUnavailable = errors.New("code mode is not available on this server")
 	// ErrTooLarge: the script is over MaxScriptBytes.
 	ErrTooLarge = errors.New("the script is over 1 MiB, the code-mode limit")
+	// ErrResumeConflict: another resume of the run claimed it after this
+	// one read it; nothing was started (the run is returned as it is now).
+	ErrResumeConflict = errors.New("resume_conflict")
 )
 
 // InputError is bad input in a start or resume request (400).
@@ -192,6 +196,10 @@ type Service struct {
 	// cluster names this node when replicas share the database
 	// (SetCluster, lease.go); nil is a single node.
 	cluster *cluster.Cluster
+
+	// beforeClaim, when set (tests), runs in Resume after the run was read
+	// and before it is claimed.
+	beforeClaim func()
 }
 
 // New returns a Service over db.
@@ -238,6 +246,8 @@ type Run struct {
 
 	// code is the script; loaded for a resume only.
 	code string
+	// resumeGen counts the resumes that claimed the run (claimResume).
+	resumeGen int64
 }
 
 // Held is the call that held a run.
@@ -267,6 +277,31 @@ type Call struct {
 
 	// replayText is the value the script received ("" unless succeeded).
 	replayText string
+	// sent is false for a failed call that never reached the gateway.
+	sent bool
+	// errorKind and errorText are a failed call's error kind and the text
+	// the script saw; errorText is a held call's text too.
+	errorKind, errorText string
+	// approvalID is a deferred call's legacy approval id.
+	approvalID string
+	// hold is a held call's structured content (the Inbox draft), "" when
+	// it was not kept.
+	hold string
+}
+
+// setSeen copies what the hooks saw for the call into c, for its status:
+// the replay value of a succeeded call, the failure of a failed one, the
+// hold of a held one.
+func (c *Call) setSeen(sc seenCall, sent bool) {
+	c.sent = sent
+	switch c.Status {
+	case codemode.StatusSucceeded:
+		c.replayText = sc.replayText
+	case codemode.StatusFailed:
+		c.errorKind, c.errorText = sc.errKind, sc.errText
+	case codemode.StatusPermissionRequired, codemode.StatusDeferred:
+		c.errorText, c.approvalID, c.hold = sc.errText, sc.approvalID, sc.hold
+	}
 }
 
 // InProgress reports a status that will still change on its own: queued
@@ -404,8 +439,13 @@ type StartRequest struct {
 // Start validates req and starts a run, or returns the agent's existing
 // run for the same Idempotency-Key, script and reason (created false).
 // ctx carries the request's values (the actor.Raiser for the audit); the
-// run itself continues after ctx ends. codemode.ErrBusy means no slot
-// came free and nothing was stored.
+// run itself continues after ctx ends. Start never waits for a slot: a
+// free one is taken at once; otherwise the run is stored queued and waits
+// for its slot in the background (the fair queue, up to the runtime's
+// AcquireWait), so the caller's wait bounds the answer. A run that gets no
+// slot ends failed with kind busy (nothing ran; its Idempotency-Key is
+// free again). codemode.ErrBusy means the slot queue itself is full:
+// nothing was stored.
 func (s *Service) Start(ctx context.Context, req StartRequest) (run *Run, created bool, err error) {
 	if req.AgentID == "" {
 		return nil, false, &InputError{Field: "agent", Message: "an agent is required"}
@@ -442,7 +482,7 @@ func (s *Service) Start(ctx context.Context, req StartRequest) (run *Run, create
 	if rt == nil {
 		return nil, false, ErrUnavailable
 	}
-	slot, err := rt.AcquireSlot(codemode.WithAgentKey(ctx, req.AgentID))
+	slot, waitSlot, err := trySlot(ctx, rt, req.AgentID)
 	if err != nil {
 		return nil, false, err
 	}
@@ -465,8 +505,26 @@ func (s *Service) Start(ctx context.Context, req StartRequest) (run *Run, create
 		}
 		return nil, false, err
 	}
-	s.launch(runCtx, rt, slot, run, newHooks(s, run.ID, nil), true)
+	s.launch(runCtx, rt, slot, waitSlot, run, newHooks(s, run.ID, nil), true)
 	return run, true, nil
+}
+
+// trySlot takes a script slot for agentID only if one is free now. It
+// asks with a context that has already ended: AcquireSlot then grants a
+// free slot, refuses at once when the slot queue is full (ErrBusy), and
+// otherwise answers with the context's error, which here means "wait for
+// one" (waitSlot).
+func trySlot(ctx context.Context, rt Runner, agentID string) (slot *codemode.Slot, waitSlot bool, err error) {
+	now, cancel := context.WithCancel(codemode.WithAgentKey(ctx, agentID))
+	cancel()
+	slot, err = rt.AcquireSlot(now)
+	switch {
+	case err == nil:
+		return slot, false, nil
+	case errors.Is(err, context.Canceled):
+		return nil, true, nil
+	}
+	return nil, false, err
 }
 
 // ResumeRequest resumes a held run.
@@ -479,10 +537,12 @@ type ResumeRequest struct {
 	RequestID string
 }
 
-// Resume runs a permission_required or deferred run again from the top:
-// the calls before the held one are answered from the call record, the
-// held call and later ones carry the request's grants (or the legacy
-// approval id). ErrNotHeld (with the run) when the run is not held.
+// Resume runs a permission_required or deferred run again from the top.
+// Each call is checked against the run's record at its number (hooks): a
+// call that ran is answered from the record, a held call goes with the
+// request's grant (or a deferred call with its own legacy approval id),
+// and a call past every call the run ever made is new. ErrNotHeld (with
+// the run) when the run is not held.
 func (s *Service) Resume(ctx context.Context, req ResumeRequest) (*Run, error) {
 	run, err := s.loadRun(ctx, req.AgentID, req.RunID, true)
 	if err != nil {
@@ -491,7 +551,12 @@ func (s *Service) Resume(ctx context.Context, req ResumeRequest) (*Run, error) {
 	if !IsHeld(run.Status) || run.Held == nil {
 		return run, ErrNotHeld
 	}
-	rs := &resumeState{heldSeq: run.Held.Seq}
+	rs := &resumeState{heldSeq: run.Held.Seq, mark: run.Held.Seq}
+	if run.Held.Status == codemode.StatusDeferred && run.Held.ApprovalID != "" {
+		// Its own approval id, also on a resume with a request_id: a grant
+		// would run the tool beside the approval's own execution.
+		rs.approvalID = run.Held.ApprovalID
+	}
 	switch {
 	case req.RequestID != "":
 		if s.grants == nil {
@@ -525,8 +590,8 @@ func (s *Service) Resume(ctx context.Context, req ResumeRequest) (*Run, error) {
 			}
 			rs.grants = append(rs.grants, g)
 		}
-	case run.Held.Status == codemode.StatusDeferred && run.Held.ApprovalID != "":
-		rs.approvalID = run.Held.ApprovalID
+	case rs.approvalID != "":
+		// A deferred legacy approval resumes with its own id.
 	default:
 		return nil, &InputError{Field: "request_id", Message: "request_id is required: submit held.draft as an Inbox request (toolyard.inbox_request), then resume with its request_id once the owner decided"}
 	}
@@ -537,6 +602,7 @@ func (s *Service) Resume(ctx context.Context, req ResumeRequest) (*Run, error) {
 	rs.recorded = make(map[int]Call, len(calls))
 	for _, c := range calls {
 		rs.recorded[c.Seq] = c
+		rs.mark = max(rs.mark, c.Seq)
 	}
 	if s.engine == nil {
 		return nil, ErrUnavailable
@@ -554,20 +620,25 @@ func (s *Service) Resume(ctx context.Context, req ResumeRequest) (*Run, error) {
 		return nil, err
 	}
 	runCtx = audit.WithRunID(runCtx, run.ID)
+	if s.beforeClaim != nil {
+		s.beforeClaim()
+	}
 	claimed, err := s.claimResume(ctx, run)
 	if err != nil || !claimed {
 		slot.Release()
 		if err != nil {
 			return nil, err
 		}
-		// Another resume took it first.
+		// Another resume claimed it after this one read the run and its
+		// call records: running with what was read could send calls that
+		// resume already made.
 		cur, lerr := s.loadRun(ctx, req.AgentID, req.RunID, false)
 		if lerr != nil {
 			return nil, lerr
 		}
-		return cur, ErrNotHeld
+		return cur, ErrResumeConflict
 	}
-	s.launch(runCtx, rt, slot, run, newHooks(s, run.ID, rs), false)
+	s.launch(runCtx, rt, slot, false, run, newHooks(s, run.ID, rs), false)
 	return run, nil
 }
 
@@ -629,17 +700,18 @@ func (s *Service) reload(ctx context.Context, run *Run) (*Run, error) {
 	return cur, nil
 }
 
-// launch runs run's script on a goroutine of its own.
-func (s *Service) launch(base context.Context, rt Runner, slot *codemode.Slot, run *Run, h *hooks, fromQueued bool) {
+// launch runs run's script on a goroutine of its own; with waitSlot the
+// goroutine first waits for a script slot.
+func (s *Service) launch(base context.Context, rt Runner, slot *codemode.Slot, waitSlot bool, run *Run, h *hooks, fromQueued bool) {
 	ctx, cancel := context.WithCancel(base)
 	s.mu.Lock()
 	s.inflight[run.ID] = cancel
 	s.mu.Unlock()
-	go s.execute(ctx, rt, slot, run, h, fromQueued)
+	go s.execute(ctx, rt, slot, waitSlot, run, h, fromQueued)
 }
 
 // execute runs the script and records its outcome.
-func (s *Service) execute(ctx context.Context, rt Runner, slot *codemode.Slot, run *Run, h *hooks, fromQueued bool) {
+func (s *Service) execute(ctx context.Context, rt Runner, slot *codemode.Slot, waitSlot bool, run *Run, h *hooks, fromQueued bool) {
 	defer s.untrack(run.ID)
 	var rr *codemode.RunResult
 	func() {
@@ -650,6 +722,16 @@ func (s *Service) execute(ctx context.Context, rt Runner, slot *codemode.Slot, r
 					ErrorMessage: "the run stopped on an internal error in toolyard"}
 			}
 		}()
+		if waitSlot {
+			// The run is stored queued; it waits for its slot here, in the
+			// fair queue, while the caller already has its answer.
+			got, err := rt.AcquireSlot(codemode.WithAgentKey(ctx, run.AgentID))
+			if err != nil {
+				rr = notStarted(err)
+				return
+			}
+			slot = got
+		}
 		if fromQueued {
 			if err := s.markRunning(ctx, run.ID); err != nil {
 				s.log.Warn("code run: could not mark running", "run_id", run.ID, "err", err.Error())
@@ -658,11 +740,7 @@ func (s *Service) execute(ctx context.Context, rt Runner, slot *codemode.Slot, r
 		res, err := rt.Run(ctx, run.code, codemode.RunOptions{Reason: run.Reason, Hooks: h, Slot: slot, Language: run.Language})
 		switch {
 		case err != nil:
-			kind := codemode.ErrorInternal
-			if errors.Is(err, codemode.ErrBusy) {
-				kind = codemode.ErrorBusy
-			}
-			rr = &codemode.RunResult{Status: codemode.StatusFailed, ErrorKind: kind, ErrorMessage: err.Error()}
+			rr = notStarted(err)
 		case res == nil:
 			rr = &codemode.RunResult{Status: codemode.StatusFailed, ErrorKind: codemode.ErrorInternal,
 				ErrorMessage: "the script runner returned no result"}
@@ -678,6 +756,20 @@ func (s *Service) execute(ctx context.Context, rt Runner, slot *codemode.Slot, r
 			"run_id", run.ID, "status", rr.Status, "err", err.Error())
 	}
 	s.notify.notify(run.ID)
+}
+
+// notStarted is the outcome of a run that never got a script slot: busy
+// when none came free in the wait, interrupted when toolyard stopped it
+// first. Nothing ran either way.
+func notStarted(err error) *codemode.RunResult {
+	switch {
+	case errors.Is(err, codemode.ErrBusy):
+		return &codemode.RunResult{Status: codemode.StatusFailed, ErrorKind: codemode.ErrorBusy,
+			ErrorMessage: err.Error() + " (the run waited for a script slot and none came free; nothing ran: start it again)"}
+	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
+		return &codemode.RunResult{Status: codemode.StatusFailed, ErrorKind: ErrorInterrupted, ErrorMessage: msgInterruptedQueued}
+	}
+	return &codemode.RunResult{Status: codemode.StatusFailed, ErrorKind: codemode.ErrorInternal, ErrorMessage: err.Error()}
 }
 
 func (s *Service) untrack(id string) {
@@ -797,14 +889,18 @@ func fingerprint(code, reason, language string) string {
 }
 
 // argsHash is the sha256 of the canonical JSON of a call's script
-// arguments: keys sorted, and every number as float64 (a worker hands
-// numbers over as float64, so the same arguments hash the same whichever
-// way they arrived).
+// arguments: keys sorted, and every number in the shortest form
+// encoding/json writes (an int 5 and a float64 5 are both 5, so the same
+// arguments hash the same whichever way they arrived). Numbers are read
+// back as json.Number, never float64, so two integers above 2^53 that
+// float64 would round to one value keep their own hashes.
 func argsHash(args map[string]any) string {
 	raw, err := json.Marshal(args)
 	if err == nil {
 		var v any
-		if err = json.Unmarshal(raw, &v); err == nil {
+		dec := json.NewDecoder(bytes.NewReader(raw))
+		dec.UseNumber()
+		if err = dec.Decode(&v); err == nil {
 			raw, err = json.Marshal(v)
 		}
 	}

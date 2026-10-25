@@ -58,9 +58,13 @@ var (
 
 // Agent kinds, mirroring the CHECK constraint on agents.kind. An identity
 // agent is the one per user whose token is that person's identity key.
+// AgentKindOAuthClient is not stored: an OAuth client's agent keeps the
+// stored kind "agent", and its grant row (mcp_oauth_grants) is what makes
+// it report AgentKindOAuthClient (ListAgents, the /mcp ingress, audit).
 const (
-	AgentKindAgent    = "agent"
-	AgentKindIdentity = "identity"
+	AgentKindAgent       = "agent"
+	AgentKindIdentity    = "identity"
+	AgentKindOAuthClient = "oauth_client"
 )
 
 // Roles and statuses, mirroring the CHECK constraints on users.
@@ -167,7 +171,8 @@ type Agent struct {
 	LastSeen time.Time `json:"last_seen"`
 	Disabled bool      `json:"disabled"`
 	// Kind is AgentKindAgent for an enrolled agent, AgentKindIdentity for
-	// the owner's identity key.
+	// the owner's identity key, AgentKindOAuthClient for an OAuth client's
+	// agent (derived from its grant).
 	Kind string `json:"kind"`
 	// OwnerEmail, OwnerDisplayName and OwnerUsername describe the owner
 	// row. VerifyAgentToken fills them from the same lookup that checks
@@ -1091,7 +1096,8 @@ func nullStr(s string) any {
 	return s
 }
 
-// ListAgents returns the owner's agents, newest first. created_at is in
+// ListAgents returns the owner's agents, newest first, an OAuth client's
+// agent with Kind AgentKindOAuthClient (from its grant). created_at is in
 // milliseconds, so a second key breaks ties: "newest" must be well defined
 // for callers that pick the first match (connect rotates the newest bkt3
 // agent). SQLite keeps the insertion order (rowid). Postgres has no rowid,
@@ -1103,7 +1109,8 @@ func (s *Service) ListAgents(ctx context.Context, ownerUserID string) ([]Agent, 
 		tieBreak = "id DESC"
 	}
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT id, name, owner_user, COALESCE(last_seen, 0), COALESCE(disabled, 0), kind
+		`SELECT id, name, owner_user, COALESCE(last_seen, 0), COALESCE(disabled, 0),
+                CASE WHEN EXISTS (SELECT 1 FROM mcp_oauth_grants g WHERE g.agent_id = agents.id) THEN '`+AgentKindOAuthClient+`' ELSE kind END
          FROM agents WHERE owner_user = ? ORDER BY created_at DESC, `+tieBreak, ownerUserID)
 	if err != nil {
 		return nil, err

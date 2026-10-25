@@ -137,7 +137,7 @@ func (g *Gateway) SearchTools(ctx context.Context, req SearchRequest) (map[strin
 		return nil, &SearchError{Message: "limit must be at least 1"}
 	}
 	res, err := g.toolSearch().Search(ctx, g.searchCatalog(ctx), toolsearch.Query{
-		Text: req.Query, Mode: mode, Limit: req.Limit, Server: req.Upstream,
+		Text: req.Query, Mode: mode, Limit: req.Limit, Server: req.Upstream, Caller: agentIDFromContext(ctx),
 	})
 	var qe *toolsearch.QueryError
 	switch {
@@ -223,9 +223,14 @@ func (g *Gateway) handleSearchTools() directHandler {
 		if strings.TrimSpace(req.Detail) == "" {
 			// The MCP tool has always returned each tool's input schema,
 			// and agents in router-only or top-N mode call tools.execute
-			// from it: full stays the default here. Scripts (tools.search)
-			// and GET /v1/code/search default to summary.
+			// from it: full stays the default for an agent's own call. A
+			// script's call (JavaScript or Starlark, directly or through
+			// tools.execute) and GET /v1/code/search default to summary,
+			// which keeps a search's answer small inside a script.
 			req.Detail = string(toolsearch.DetailFull)
+			if isWithinCodeMode(ctx) {
+				req.Detail = string(toolsearch.DetailSummary)
+			}
 		}
 		body, err := g.SearchTools(ctx, req)
 		var se *SearchError

@@ -1,0 +1,10 @@
+-- 0053: a code run's resume generation (v0.1, TEC-1629).
+--
+-- A resume claims a held run only if no other resume claimed it since the
+-- run was read: the claim checks resume_gen and adds one to it. Two
+-- resumes of the same run that read it at the same time cannot both run,
+-- even when the first one ends held again with the same status before the
+-- second one claims.
+--
+-- Same change as migrations/sqlite/0053_code_runs_resume_gen.sql.
+ALTER TABLE code_runs ADD COLUMN IF NOT EXISTS resume_gen BIGINT NOT NULL DEFAULT 0;

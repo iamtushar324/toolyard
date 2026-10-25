@@ -13,6 +13,11 @@ import (
 // (whose caller is under its own cap), so one caller's backlog never
 // holds another caller up, and among callers who may run, first come is
 // first served. The limiter is per process, shared by MCP and REST.
+//
+// The queue is bounded too: a caller may have at most twice its own cap
+// waiting, and all callers together four times the global cap (at least
+// 16). A script past either bound is refused busy at once instead of
+// holding a goroutine and a request for the whole wait.
 type limiter struct {
 	mu       sync.Mutex
 	global   int
@@ -20,6 +25,13 @@ type limiter struct {
 	running  int
 	byAgent  map[string]int
 	queue    []*waiter
+	// waitingBy counts the queued waiters of each caller.
+	waitingBy map[string]int
+}
+
+// queueBounds are the most waiters one caller, and all callers, may have.
+func (l *limiter) queueBounds() (perAgent, total int) {
+	return 2 * l.perAgent, max(4*l.global, 16)
 }
 
 // waiter is one script waiting for a slot.
@@ -30,7 +42,7 @@ type waiter struct {
 }
 
 func newLimiter(global, perAgent int) *limiter {
-	return &limiter{global: global, perAgent: perAgent, byAgent: map[string]int{}}
+	return &limiter{global: global, perAgent: perAgent, byAgent: map[string]int{}, waitingBy: map[string]int{}}
 }
 
 // busyError is ErrBusy with the reason: every slot taken, or this caller
@@ -61,8 +73,20 @@ func (l *limiter) acquire(ctx context.Context, agent string, wait time.Duration)
 		l.mu.Unlock()
 		return l.releaser(agent), nil
 	}
+	maxAgent, maxTotal := l.queueBounds()
+	switch {
+	case l.waitingBy[agent] >= maxAgent:
+		n := l.waitingBy[agent]
+		l.mu.Unlock()
+		return nil, &busyError{fmt.Sprintf("code mode is busy: this caller already has %d scripts waiting for a slot, its queue limit (twice its %d at once); wait for one to finish, then try again", n, l.perAgent)}
+	case len(l.queue) >= maxTotal:
+		n := len(l.queue)
+		l.mu.Unlock()
+		return nil, &busyError{fmt.Sprintf("code mode is busy: %d scripts are already waiting for a slot, the queue limit; try again in a moment", n)}
+	}
 	w := &waiter{agent: agent, ready: make(chan struct{})}
 	l.queue = append(l.queue, w)
+	l.waitingBy[agent]++
 	// The waiters ahead may all be callers at their own cap.
 	l.dispatchLocked()
 	l.mu.Unlock()
@@ -132,6 +156,14 @@ func (l *limiter) dispatchLocked() {
 		w.granted = true
 		close(w.ready)
 		l.queue = append(l.queue[:i], l.queue[i+1:]...)
+		l.unwaitLocked(w.agent)
+	}
+}
+
+// unwaitLocked counts one waiter of agent off the queue; l.mu is held.
+func (l *limiter) unwaitLocked(agent string) {
+	if l.waitingBy[agent]--; l.waitingBy[agent] <= 0 {
+		delete(l.waitingBy, agent)
 	}
 }
 
@@ -140,9 +172,17 @@ func (l *limiter) removeLocked(w *waiter) {
 	for i, q := range l.queue {
 		if q == w {
 			l.queue = append(l.queue[:i], l.queue[i+1:]...)
+			l.unwaitLocked(w.agent)
 			return
 		}
 	}
+}
+
+// waiting is how many scripts wait for a slot.
+func (l *limiter) waiting() int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return len(l.queue)
 }
 
 // inUse is how many scripts hold a slot.

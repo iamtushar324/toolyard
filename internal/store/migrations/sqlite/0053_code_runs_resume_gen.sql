@@ -1,0 +1,11 @@
+-- 0053: a code run's resume generation (v0.1, TEC-1629).
+--
+-- A resume claims a held run only if no other resume claimed it since the
+-- run was read: the claim checks resume_gen and adds one to it. Two
+-- resumes of the same run that read it at the same time cannot both run,
+-- even when the first one ends held again with the same status before the
+-- second one claims.
+--
+-- Same change as migrations/postgres/0053_code_runs_resume_gen.sql.
+-- Rollback: an older binary ignores the column (and claims a resume by status alone).
+ALTER TABLE code_runs ADD COLUMN resume_gen INTEGER NOT NULL DEFAULT 0;

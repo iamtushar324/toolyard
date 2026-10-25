@@ -177,7 +177,13 @@ the app can turn it off. A member's app never gets admin control: a stored
 flag then has no effect, and the Connected apps page says so.
 
 **Audit.** Every audit row an app's agent raises carries the OAuth client
-id in `audit_events.oauth_client_id` (a trigger fills it from the grant).
+id in `audit_events.oauth_client_id` (the audit logger looks it up from the
+grant, and a trigger fills it for every other writer). `GET /v1/audit` and
+the audit export return it, and `?oauth_client_id=` filters by it. The
+rows of a client's own revocation and of a reused code or refresh token
+name the grant's agent. `GET /v1/agents` reports an app's agent with kind
+`oauth_client` (from its grant; the `agents` row keeps the stored kind
+`agent`).
 The grant row is the agent's tombstone: deleting the agent keeps the
 mapping, and connecting the client again recreates the agent under the same
 id. Deleting an app's agent revokes its grant, tokens and unused codes in
@@ -236,11 +242,13 @@ static agent token (rotation and enrolment refuse it).
   in-process pre-limit checks every bucket before it counts any, and
   refuses floods before they write to the database; it never evicts a
   global bucket.
-- Codes are single use and last 60 seconds. A code used twice revokes the
-  tokens it produced. A refresh token used twice revokes the whole grant
-  and disables its agent; the person connects the app again. A retry within
-  60 seconds, while the token that replaced it is still unused, is refused
-  without revoking anything. Revoking a grant (by its owner, its client or
+- Codes are single use and last 60 seconds. A code that produced tokens
+  and is used again revokes the whole grant and disables its agent, as a
+  refresh token used twice does; the person connects the app again. A code
+  that never produced tokens (a newer consent or a revocation used it up,
+  or its exchange was refused) is only refused. A refresh token retried
+  within 60 seconds, while the token that replaced it is still unused, is
+  refused without revoking anything. Revoking a grant (by its owner, its client or
   reuse detection) also cancels its agent's pending approvals (personal
   ones included) and Inbox requests, recorded as cancelled by the system
   because the grant was revoked, and nothing it queued can run.
@@ -295,7 +303,23 @@ many scripts run at once:
 A script past either cap waits in one fair queue for up to
 `-codemode-queue-wait`. A freed slot
 goes to the earliest waiter whose agent is under its own cap. After the
-wait the script is refused as busy (HTTP 429 over REST). Every audit row of
+wait the script is refused as busy (a REST run, stored `queued` at once,
+ends `failed` with kind `busy`, HTTP 429). A script that a drain or
+shutdown stops is kind `interrupted`: `outcome_unknown` once it had sent a
+tool call, `failed` before. The queue holds at
+most twice `-codemode-max-per-agent` for one agent and four times
+`-codemode-max-concurrent` (16 at least) in all; a script past that is
+refused as busy at once. Migration 0052 adds the columns a REST run's call
+records need to answer a resume (whether a call reached the gateway, a
+failed call's error, a held call's text, draft and legacy approval id); it
+only adds columns, and migration 0053 adds `code_runs.resume_gen`, which
+lets only one of two concurrent resumes of a run claim it. During a rolling
+update or after a rollback past these migrations, do not let old and new
+nodes resume code runs at the same time: an older node deletes, when a
+resume it runs ends, the call records past the last call it reached, and
+sends a failed or held call again. Drain the old nodes before the new ones
+serve resumes; after a rollback, start held runs again rather than resume
+them. Every audit row of
 a script, the outer call's and each nested call's, carries the run's id in
 `audit_events.run_id`: `GET /v1/audit?run_id=…` and the audit export
 (`run_id` filter and CSV column) show one script's rows. Migration 0050 adds

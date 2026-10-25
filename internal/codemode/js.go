@@ -191,7 +191,7 @@ func runJS(ctx context.Context, start startMsg, s sink, stopNote string) scriptR
 
 	hctx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	h := &jsHost{ctx: hctx, s: s, ids: map[int]int{}}
+	h := &jsHost{ctx: hctx, cancel: cancel, s: s, ids: map[int]int{}}
 	h.in = &jsStdin{ctx: hctx, lines: make(chan []byte, 2*maxParallelCalls)}
 	h.out = &jsStdout{h: h}
 	boot, err := json.Marshal(jsBoot{Code: start.Code, Servers: start.Servers, MaxParallel: maxParallel})
@@ -231,9 +231,12 @@ func runJS(ctx context.Context, start startMsg, s sink, stopNote string) scriptR
 // jsHost is the Go end of the prelude's stdin and stdout.
 type jsHost struct {
 	ctx context.Context
-	s   sink
-	in  *jsStdin
-	out *jsStdout
+	// cancel ends ctx: on the prelude's first done or error line, so no
+	// answer, and no call, goes to a script that has finished.
+	cancel context.CancelFunc
+	s      sink
+	in     *jsStdin
+	out    *jsStdout
 
 	mu sync.Mutex
 	// final is the prelude's done or error line.
@@ -251,6 +254,14 @@ func (h *jsHost) handle(line []byte) {
 	if json.Unmarshal(line, &m) != nil {
 		return
 	}
+	h.mu.Lock()
+	finished := h.final != nil
+	h.mu.Unlock()
+	if finished {
+		// The script reported its outcome: whatever it writes after that
+		// (a call frame written through qjs:std, say) is not acted on.
+		return
+	}
 	switch m.T {
 	case "print":
 		h.s.print(m.Text)
@@ -258,10 +269,11 @@ func (h *jsHost) handle(line []byte) {
 		h.call(m)
 	case "done", "error":
 		h.mu.Lock()
-		if h.final == nil {
-			h.final = &m
-		}
+		h.final = &m
 		h.mu.Unlock()
+		if h.cancel != nil {
+			h.cancel()
+		}
 	}
 }
 
@@ -411,7 +423,13 @@ func (h *jsHost) outcome(ctx context.Context, runErr error, stderr, stopNote str
 	case errors.As(runErr, &exit) && exit.ExitCode() != 0:
 		return scriptResult{errKind: "runtime", errMsg: fmt.Sprintf("the JavaScript engine exited with code %d before the script finished", exit.ExitCode())}
 	case runErr != nil && strings.Contains(runErr.Error(), "stack overflow"):
-		return scriptResult{errKind: "runtime", errMsg: "RangeError: Maximum call stack size exceeded (the script recursed deeper than the engine allows)"}
+		// wazero's own call-frame limit, below QuickJS's stack check: deep
+		// recursion inside the engine's C code (JSON nested thousands of
+		// levels deep, say) ends the engine at once, so no try/catch in
+		// the script sees it.
+		return scriptResult{errKind: "runtime", cause: ErrorLimit, errMsg: "the script was stopped: it nested deeper than the JavaScript engine's call stack allows " +
+			"(deep recursion, or data nested thousands of levels deep, such as deeply nested JSON). This cannot be caught with try/catch: " +
+			"use a loop instead of recursion, or flatten the data"}
 	case runErr != nil:
 		return scriptResult{errKind: "runtime", errMsg: "the JavaScript engine stopped: " + firstLine(runErr.Error())}
 	}
