@@ -209,8 +209,17 @@ def sync(admin, sid):
 
 
 def pod_names():
-    p = kubectl("get", "pods", "-l", "app.kubernetes.io/name=toolyard", "-o", "jsonpath={.items[*].metadata.name}")
-    return [n for n in p.stdout.split() if n]
+    """The gateway pods that serve: ready, and not on their way out after a
+    rollout (a terminating pod still reports phase Running)."""
+    p = kubectl("get", "pods", "-l", "app.kubernetes.io/name=toolyard", "-o", "json")
+    names = []
+    for pod in json.loads(p.stdout or "{}").get("items", []):
+        if pod["metadata"].get("deletionTimestamp"):
+            continue
+        conds = {c["type"]: c["status"] for c in pod.get("status", {}).get("conditions", [])}
+        if conds.get("Ready") == "True":
+            names.append(pod["metadata"]["name"])
+    return names
 
 
 def free_port():
