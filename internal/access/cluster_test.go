@@ -58,7 +58,7 @@ func TestTwoNodeAccessInvalidation(t *testing.T) {
 	if _, err := db1.Exec(`UPDATE agents SET disabled = 1 WHERE id = 'ag_1'`); err != nil {
 		t.Fatal(err)
 	}
-	if !node2.ScopeFor(ctx, "ag_1").Denied {
+	if node2.ScopeFor(ctx, "ag_1").Denied {
 		t.Fatal("test setup: node 2 did not serve its cached copy")
 	}
 	node1.InvalidateAgent("ag_1")
@@ -70,6 +70,9 @@ func TestTwoNodeAccessInvalidation(t *testing.T) {
 	}
 	if _, err := db1.Exec(`UPDATE users SET status = 'blocked' WHERE id = 'u_admin'`); err != nil {
 		t.Fatal(err)
+	}
+	if node2.UserScope(ctx, "u_admin").Denied {
+		t.Fatal("test setup: node 2 did not serve its cached copy of the user")
 	}
 	node1.Invalidate("u_admin")
 	within("a blocked user", func() bool { return node2.UserScope(ctx, "u_admin").Denied })
