@@ -91,6 +91,9 @@ type Request struct {
 	ExpiresAt      int64          `json:"expires_at"`
 	Fingerprint    string         `json:"fingerprint,omitempty"`
 	Coalesced      bool           `json:"coalesced,omitempty"` // true if Hold returned an existing pending row instead of creating a new one
+	// CallbackWarning is set by Hold (never stored) when the call's
+	// _callback_ref could not follow the request.
+	CallbackWarning string `json:"callback_warning,omitempty"`
 	// AutoDecidedBy is the auto-approval rule id that decided this request,
 	// or empty if a human (or the rule engine wasn't consulted). Derived
 	// on every read from the decider (Via auto_rule, Ref rule id).
@@ -200,6 +203,9 @@ type Bus struct {
 	released bool
 	// LegacyDecision redirects compatibility writes through the sole Inbox ledger.
 	LegacyDecision func(context.Context, string, string, actor.Decider) (*Request, error)
+	// events queues approval.decided / approval.executed webhooks
+	// (events.go).
+	events EventSink
 
 	// cluster names this node when replicas share the database
 	// (SetCluster, cluster.go); nil is a single node.
@@ -277,6 +283,8 @@ func (b *Bus) Hold(ctx context.Context, in NewRequest, maxWait time.Duration) (*
 	if err != nil {
 		return nil, err
 	}
+	// The receivers follow the request before anyone can decide it.
+	b.subscribe(ctx, req, in.CallbackRef)
 	// Auto-approval short-circuit: if a rule matches the new request, decide
 	// it in-line (status -> allowed) before any notifier sees it as pending.
 	// Coalesced rows that landed on an existing pending request are skipped
@@ -384,6 +392,10 @@ type NewRequest struct {
 	RequireHuman bool
 	// RaisedBy is who raised the call; stored on the request.
 	RaisedBy actor.Raiser
+	// CallbackRef is the call's _callback_ref: the receiver that hears
+	// approval.decided and approval.executed ("" for the agent's default
+	// receiver, if any).
+	CallbackRef string
 }
 
 func (b *Bus) create(ctx context.Context, in NewRequest) (*Request, error) {
@@ -674,12 +686,10 @@ func (b *Bus) decide(ctx context.Context, id, action string, d actor.Decider, ru
 		if n, err = b.decideClaimed(ctx, id, update, updateArgs); err != nil {
 			return nil, err
 		}
-	} else {
-		res, err := b.db.ExecContext(ctx, update, updateArgs...)
-		if err != nil {
-			return nil, err
-		}
-		n, _ = res.RowsAffected()
+	} else if n, err = b.decideTx(ctx, id, update, updateArgs); err != nil {
+		// The decision and its approval.decided webhook event commit
+		// together (events.go).
+		return nil, err
 	}
 	if n == 0 {
 		existing, getErr := b.Get(ctx, id)
@@ -741,6 +751,9 @@ func (b *Bus) decideClaimed(ctx context.Context, id, update string, updateArgs [
 	}
 	if n, _ := res.RowsAffected(); n != 1 {
 		return 0, errInlineClaim
+	}
+	if err := b.emitDecidedTx(ctx, tx, id); err != nil {
+		return 0, err
 	}
 	return 1, tx.Commit()
 }
@@ -928,6 +941,16 @@ func (b *Bus) SetResultState(ctx context.Context, id, envelope string, isError b
 	if n > 0 {
 		if _, err := tx.ExecContext(ctx, `UPDATE legacy_execution_claims SET state=?,finished_at=?,reason=? WHERE request_id=?`, state, now, execErr, id); err != nil {
 			return err
+		}
+		if b.events != nil {
+			executed, err := getTx(ctx, tx, id)
+			if err != nil {
+				return err
+			}
+			executed.ExecutionState = state
+			if err := b.events.ApprovalEventTx(ctx, tx, executed, EventApprovalExecuted); err != nil {
+				return err
+			}
 		}
 	}
 	if err := tx.Commit(); err != nil {

@@ -496,6 +496,16 @@ Settings → **Inbox & permissions**:
   which is what an Apple Watch shows. Notification buttons are Deny, Snooze
   1 h, and the two answers of a two-option question. A notification never
   approves tools.
+- **Schema version 3 items** (`inbox_v3_enabled`, default on): many tool
+  calls and questions in one item. During a rolling upgrade to v0.1, roll
+  every replica first, or turn the setting off until no older replica runs:
+  an older replica that rewrites an item (a snooze, a reminder, a voice
+  note) drops the version 3 fields it does not know. With it off, agents get
+  a `schema_version` problem and can send version 1 or 2.
+- **Webhook receivers**: a receiver gets only the event types it registered
+  for; receivers from before v0.1 keep `inbox.decision`, `inbox.expired` and
+  `inbox.cancelled` in the version 2 shape. Delivered and failed events are
+  kept 30 days.
 - **Passkeys**: add one per device. With a passkey registered, allowing
   production or red-flagged tools needs it (Face ID on an iPhone), and the
   confirmation is bound to exactly what you approve. Passkeys need the

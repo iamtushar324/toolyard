@@ -95,7 +95,8 @@ type Option struct {
 	Detail      string `json:"detail,omitempty"`
 }
 
-// Series is one line or bar series in a chart attachment.
+// Series is one series of a chart attachment: a line, a bar group, a
+// stack layer, an area, the slices of a pie, or the y values of a scatter.
 type Series struct {
 	Name   string    `json:"name"`
 	Values []float64 `json:"values"`
@@ -115,7 +116,7 @@ type Attachment struct {
 	Columns []string `json:"columns,omitempty"`
 	Rows    [][]any  `json:"rows,omitempty"`
 	// chart
-	Chart  string   `json:"chart,omitempty"` // line | bar
+	Chart  string   `json:"chart,omitempty"` // line | bar | stacked_bar | area | pie | scatter
 	Unit   string   `json:"unit,omitempty"`
 	X      []any    `json:"x,omitempty"`
 	Series []Series `json:"series,omitempty"`
@@ -186,6 +187,7 @@ type Activity struct {
 type Request struct {
 	LegacyExecutionState  string          `json:"legacy_execution_state,omitempty"`
 	CallbackRef           string          `json:"callback_ref,omitempty"`
+	CallbackRefs          []string        `json:"callback_refs,omitempty"`
 	ExecutionMode         string          `json:"execution_mode,omitempty"`
 	PendingTTLSeconds     int             `json:"pending_ttl_seconds,omitempty"`
 	DecisionSubmissionID  string          `json:"decision_submission_id,omitempty"`
@@ -220,6 +222,14 @@ type Request struct {
 	Options     []Option      `json:"options,omitempty"`
 	Attachments []Attachment  `json:"attachments,omitempty"`
 	TTLSeconds  int           `json:"ttl_seconds,omitempty"`
+	// Questions are the schema version 3 questions (questions_v3.go);
+	// Answers holds the owner's answers to them, keyed by question ID,
+	// once one decision answered the item.
+	Questions []QuestionSpec    `json:"questions,omitempty"`
+	Answers   map[string]Answer `json:"answers,omitempty"`
+	// InlineImages are the uploads that Markdown images in the message or
+	// a markdown attachment cite, resolved when the item was sent.
+	InlineImages []InlineImage `json:"inline_images,omitempty"`
 
 	// Set by toolyard.
 	Flags        []Flag   `json:"flags,omitempty"` // request-level (questions, blockers)
@@ -259,6 +269,20 @@ func (r *Request) AllFlags() []Flag {
 	out := append([]Flag(nil), r.Flags...)
 	for _, t := range r.Tools {
 		out = append(out, t.Flags...)
+	}
+	return out
+}
+
+// callbackRefs is every receiver the agent named for this request
+// (callback_ref and callback_refs), without repeats, in order.
+func (r *Request) callbackRefs() []string {
+	var out []string
+	seen := map[string]bool{}
+	for _, ref := range append([]string{r.CallbackRef}, r.CallbackRefs...) {
+		if ref != "" && !seen[ref] {
+			seen[ref] = true
+			out = append(out, ref)
+		}
 	}
 	return out
 }

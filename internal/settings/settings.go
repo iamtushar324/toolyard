@@ -97,6 +97,10 @@ const (
 	// InboxSnapshotEnabled makes toolyard copy linked media when a request
 	// is sent. Default true.
 	InboxSnapshotEnabled = "inbox_snapshot_enabled"
+	// InboxV3Enabled accepts schema_version 3 Inbox items. Default true;
+	// an operator turns it off while replicas older than v0.1 still run
+	// (docs/self-hosting.md, rolling upgrades).
+	InboxV3Enabled = "inbox_v3_enabled"
 	// InboxHostingNote tells agents where to host files (inbox.guide
 	// topic "hosting").
 	InboxHostingNote = "inbox_hosting_note"
@@ -268,6 +272,9 @@ func (s *Service) All(ctx context.Context) (map[string]any, error) {
 	}
 	if _, ok := out[InboxSnapshotEnabled]; !ok {
 		out[InboxSnapshotEnabled] = true
+	}
+	if _, ok := out[InboxV3Enabled]; !ok {
+		out[InboxV3Enabled] = true
 	}
 	if _, ok := out[InboxJudgeEnabled]; !ok {
 		out[InboxJudgeEnabled] = false
