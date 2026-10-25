@@ -20,6 +20,11 @@ package api
 //	PUT    /v1/skills/sources/{id}/skills/runs              {path, runs}; runs "" clears the override
 //	POST   /v1/skills/sources/{id}/webhook                  GitHub push webhook (public, signed)
 //	POST   /v1/skills/sources/{id}/webhook-secret           rotate: the secret once, with the payload URL
+//	GET    /v1/skills/admin/github-token                    {set, rate, paused_until}: the default GitHub read token's state
+//	PUT    /v1/skills/admin/github-token                    {token}: set (checked with GitHub) or, with "", clear it
+//
+// A GitHub rate limit answers 429 with retry_after (seconds) and reset_at
+// on every route, with a Retry-After header.
 //
 // A source token is write-only: no response carries it, and an error that
 // echoes it is redacted before it leaves. The webhook secret appears only
@@ -85,7 +90,19 @@ func skillWebhookPath(path string) bool {
 // skillAdminPath reports whether path is one of the skills admin routes
 // (for the per-route body cap).
 func skillAdminPath(path string) bool {
-	return path == "/v1/skills/sources" || strings.HasPrefix(path, skillAdminSourcesPrefix) || path == "/v1/skills/admin/sources"
+	return path == "/v1/skills/sources" || strings.HasPrefix(path, skillAdminSourcesPrefix) || path == "/v1/skills/admin/sources" ||
+		path == skillGitHubTokenPath
+}
+
+// skillGitHubTokenPath is the default GitHub read token's route.
+const skillGitHubTokenPath = "/v1/skills/admin/github-token"
+
+// skillsGitHubAccess is the part of the skills hub that holds the default
+// GitHub read token (*skillhub.Service). An admin service without it
+// answers 404 on the route.
+type skillsGitHubAccess interface {
+	GitHubAccess(ctx context.Context) (*skillhub.GitHubAccess, error)
+	SetGitHubToken(ctx context.Context, by, token string) (*skillhub.GitHubAccess, error)
 }
 
 func (s *Server) registerSkillsAdminRoutes(mux *http.ServeMux) {
@@ -94,6 +111,52 @@ func (s *Server) registerSkillsAdminRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("POST /v1/skills/sources", s.skillSourceCreate)
 	mux.HandleFunc("/v1/skills/sources/", s.skillSourcesItem)
 	mux.HandleFunc("/v1/skills/admin/sources", s.skillAdminSources)
+	mux.HandleFunc("/v1/skills/admin/github-token", s.skillGitHubToken)
+}
+
+// skillGitHubToken reads or sets the default GitHub read token: write-only,
+// never in a response, an error or the audit log.
+func (s *Server) skillGitHubToken(w http.ResponseWriter, r *http.Request) {
+	u, ok := s.skillAdminUser(w, r)
+	if !ok {
+		return
+	}
+	ga, ok := s.skillsAdmin.(skillsGitHubAccess)
+	if !ok {
+		writeError(w, http.StatusNotFound, "a default GitHub token is not available on this server")
+		return
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	switch r.Method {
+	case http.MethodGet:
+		st, err := ga.GitHubAccess(r.Context())
+		if err != nil {
+			writeSkillAdminError(w, err)
+			return
+		}
+		writeJSON(w, http.StatusOK, st)
+	case http.MethodPut:
+		var body struct {
+			Token string `json:"token"`
+		}
+		if err := decode(r, &body); err != nil {
+			writeError(w, http.StatusBadRequest, redactSkillSecrets(err.Error(), body.Token))
+			return
+		}
+		st, err := ga.SetGitHubToken(r.Context(), u.ID, body.Token)
+		if err != nil {
+			writeSkillAdminError(w, err, body.Token)
+			return
+		}
+		event := "skills.github_token_set"
+		if strings.TrimSpace(body.Token) == "" {
+			event = "skills.github_token_clear"
+		}
+		s.auditSkillAdmin(r, u, event, "default GitHub read token", "")
+		writeJSON(w, http.StatusOK, st)
+	default:
+		writeError(w, http.StatusMethodNotAllowed, "GET or PUT")
+	}
 }
 
 // skillAdminUser answers 401/403 for anyone but an admin, and 404 while the
@@ -601,6 +664,10 @@ func decodeOptionalBody(r *http.Request, dst any) error {
 // code for the dashboard. secrets (a token from the request) are redacted
 // from the message.
 func writeSkillAdminError(w http.ResponseWriter, err error, secrets ...string) {
+	if until, ok := skillhub.RateLimitedUntil(err); ok {
+		writeSkillRateLimited(w, until)
+		return
+	}
 	status, code := http.StatusInternalServerError, "internal"
 	switch {
 	case errors.Is(err, skillhub.ErrDisabled):
@@ -626,6 +693,20 @@ func writeSkillAdminError(w http.ResponseWriter, err error, secrets ...string) {
 		log.Printf("skills admin: %s", msg)
 	}
 	writeJSON(w, status, map[string]string{"error": msg, "code": code})
+}
+
+// writeSkillRateLimited answers a GitHub rate limit: 429 with when to try
+// again, and the way out (a default token).
+func writeSkillRateLimited(w http.ResponseWriter, until time.Time) {
+	secs := int(time.Until(until).Seconds() + 0.999)
+	secs = max(secs, 1)
+	w.Header().Set("Retry-After", strconv.Itoa(secs))
+	writeJSON(w, http.StatusTooManyRequests, map[string]any{
+		"error":       "GitHub rate limit reached until " + until.UTC().Format("15:04 MST") + ": add a GitHub token in Skills, GitHub access",
+		"code":        "rate_limited",
+		"retry_after": secs,
+		"reset_at":    until.UTC().Format(time.RFC3339),
+	})
 }
 
 // skillAdminErrorText is an error's message without the package prefix.

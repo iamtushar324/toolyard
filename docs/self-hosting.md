@@ -542,6 +542,18 @@ the database and serves only that copy. How sync, review and limits work:
   (fine-grained, *Contents: read* on that repository). toolyard seals it
   with `secrets.key`, never shows it again, never logs it, and never sends
   it to the archive host. Webhook secrets are sealed the same way.
+- **`skills_github_token`** (set on the Skills page, GitHub access, or
+  `PUT /v1/skills/admin/github-token`; never through the settings API,
+  which neither returns nor accepts it): a default read token for every
+  source without its own. Without it GitHub allows this server's address
+  60 calls an hour, and anonymous `304`s count, so a few public sources
+  and some admin use reach the limit; with it, 5,000 calls an hour. A
+  fine-grained token with read access to public repositories is enough.
+  It is sealed with `secrets.key` like a source's token: replacing
+  `secrets.key` makes it unreadable (sources then read anonymously; set
+  it again). On a rate limit, the sources that read with the same
+  credential wait together until it resets, and the API answers `429`
+  with `retry_after`.
 - **Webhook (optional).** Polling checks each source every 5 minutes (its
   `poll_seconds`, at least 60) with a conditional request that costs no
   rate limit when nothing changed. For updates within seconds, add a

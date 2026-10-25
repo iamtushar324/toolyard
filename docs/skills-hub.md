@@ -101,6 +101,33 @@ elsewhere see it only when they ask for host skills). The order of
 precedence: the override on the source page's skills table, then the
 skill's own `metadata.toolyard-runs`, then the source default.
 
+### GitHub access and rate limits
+
+Without a token, GitHub allows this server's address 60 API calls an hour,
+and for anonymous calls even an unchanged branch (a `304` to the
+conditional check) counts. A few public sources checked every five
+minutes, plus an admin trying sources, use that up. On the Skills page,
+open **GitHub access** and **Set token**: every source without its own
+token then reads with it, GitHub allows 5,000 calls an hour, and the
+`304`s stop counting. A fine-grained token with read access to public
+repositories is enough (give it *Contents: read* on private repositories
+if it should read those too, though a private source usually has its own
+token). toolyard checks the token with one call GitHub does not count
+(`/rate_limit`), refuses a token GitHub rejects, stores it sealed with
+`secrets.key` (the setting `skills_github_token`, which no settings API
+returns), and never shows or logs it again. **Clear** removes it. A
+source's own token always wins over the default.
+
+The panel shows whether a token is set and the current rate limit (calls
+left and when it resets). When GitHub answers with a rate limit, every
+call with that credential waits until the limit resets: one shared pause
+for all the sources without their own token (anonymous, or the default
+token), while sources with their own token go on. A rate limit is not
+counted as a source's failure, and its next check is when the limit ends.
+The admin routes and `skills.propose_source` answer `429` with
+`retry_after` (seconds) and `reset_at`, and the dashboard says "GitHub
+rate limit reached until HH:MM — add a GitHub token in GitHub access".
+
 ### Webhook
 
 Without a webhook toolyard checks each branch every few minutes (5 by
@@ -142,7 +169,8 @@ Session-authenticated like the rest of the dashboard API (owner or admin;
 operator tokens need the owner scope for writes and never rotate a webhook
 secret). Errors are `{"error", "code"}` with the codes `invalid` (400),
 `not_found` (404), `conflict` (409), `needs_token` and `limit` (422),
-`skills_hub_off` (404 while the hub is off).
+`rate_limited` (429, with `retry_after` in seconds, `reset_at` and a
+`Retry-After` header), `skills_hub_off` (404 while the hub is off).
 
 | Method and path | What it does |
 | --- | --- |
@@ -159,6 +187,8 @@ secret). Errors are `{"error", "code"}` with the codes `invalid` (400),
 | `PUT /v1/skills/sources/{id}/skills/runs` | `{path, runs}`: `anywhere`, `host`, or `""` to clear the override |
 | `POST /v1/skills/sources/{id}/webhook-secret` | a new webhook secret, once, with the payload URL |
 | `POST /v1/skills/sources/{id}/webhook` | GitHub's push webhook (public, signed) |
+| `GET /v1/skills/admin/github-token` | `{set, rate: {limit, remaining, used, reset}, paused_until?}`: the default read token's state, never the token |
+| `PUT /v1/skills/admin/github-token` | `{token}`: set the default read token (checked with GitHub first) or, with `""`, clear it; answers like the GET |
 
 Every change is in the audit log (`skills.source_create`,
 `skills.source_update`, `skills.source_delete`, `skills.source_sync`,
@@ -274,9 +304,10 @@ the tool call, and the body is the tool's structured answer.
 Each GET takes `?reason=` for the audit record (20 to 2000 characters;
 the default names the route). An unknown query parameter is refused.
 Refusals are `{"error": "...", "code": "..."}`: `not_found` 404,
-`conflict` 409, `invalid` 400, `limit` 422, `unavailable` 503 (also when
-the hub is off), and 403 when the gateway refused the call (an explicit
-deny policy, the agent's own limits).
+`conflict` 409, `invalid` 400, `limit` 422, `rate_limited` 429 (GitHub's
+rate limit, with `retry_after` and `reset_at`), `unavailable` 503 (also
+when the hub is off), and 403 when the gateway refused the call (an
+explicit deny policy, the agent's own limits).
 
 The `ty` command (`GET /v1/code/ty`) wraps the read routes and keeps the
 token out of argv and logs:
@@ -298,7 +329,10 @@ ty skills list --limit 50
    GitHub for the branch's ref (`/git/ref/heads/<branch>`, so a tag or a
    commit SHA never matches a branch name) with the ETag of the last
    answer; an unchanged branch answers `304 Not Modified`, which costs no
-   rate limit. *Sync now* on the dashboard checks at once on the replica
+   rate limit when the source reads with a token (its own, or the default
+   one in GitHub access; anonymous `304`s still count). While GitHub's
+   rate limit holds back the sources without their own token, the leader
+   skips them until it resets. *Sync now* on the dashboard checks at once on the replica
    that got it, without the ETag and with `Cache-Control: no-cache`. A
    signed GitHub push webhook names the pushed commit, and the sync
    serves that commit without asking for the branch head. A pinned source

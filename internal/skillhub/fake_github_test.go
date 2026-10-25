@@ -47,7 +47,11 @@ type fakeGitHub struct {
 	n             int
 	calls         map[string]int
 	codeloadAuth  []string // Authorization headers the archive download got
-	retryAfter    int      // when > 0, the next API call answers 429 with Retry-After
+	apiAuth       []string // Authorization headers the API calls got, in order
+	// rateLimitTokens are the tokens /rate_limit accepts ("" is anonymous);
+	// any other bearer answers 401.
+	rateLimitTokens map[string]bool
+	retryAfter      int // when > 0, the next API call answers 429 with Retry-After
 	// cachedHead, when set for a branch, is the head a request without
 	// Cache-Control: no-cache gets (GitHub's public cache, up to 60 s old).
 	cachedHead map[string]string
@@ -76,6 +80,7 @@ func newFakeGitHub(t *testing.T, owner, repo string) *fakeGitHub {
 	mux.HandleFunc("GET /repos/{o}/{r}/compare/{spec}", f.api(f.handleCompare))
 	mux.HandleFunc("GET /repos/{o}/{r}/contents/{path...}", f.api(f.handleContents))
 	mux.HandleFunc("GET /_codeload/{o}/{r}/{sha}", f.handleCodeload)
+	mux.HandleFunc("GET /rate_limit", f.handleRateLimit)
 	f.srv = httptest.NewServer(mux)
 	t.Cleanup(f.srv.Close)
 	return f
@@ -124,6 +129,7 @@ func (f *fakeGitHub) count(name string) int {
 func (f *fakeGitHub) api(h func(w http.ResponseWriter, r *http.Request)) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		f.mu.Lock()
+		f.apiAuth = append(f.apiAuth, r.Header.Get("Authorization"))
 		retry := f.retryAfter
 		f.retryAfter = 0
 		private, token, renamed := f.private, f.token, f.renamedFrom
@@ -151,6 +157,39 @@ func (f *fakeGitHub) api(h func(w http.ResponseWriter, r *http.Request)) http.Ha
 		}
 		h(w, r)
 	}
+}
+
+// handleRateLimit answers GitHub's /rate_limit: 5,000 calls an hour for a
+// token it knows, 60 anonymously, 401 for an unknown token.
+func (f *fakeGitHub) handleRateLimit(w http.ResponseWriter, r *http.Request) {
+	f.bump("rate_limit")
+	tok := strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")
+	f.mu.Lock()
+	known := tok == "" || f.rateLimitTokens[tok]
+	f.mu.Unlock()
+	if !known {
+		http.Error(w, `{"message":"Bad credentials"}`, http.StatusUnauthorized)
+		return
+	}
+	limit := 5000
+	if tok == "" {
+		limit = 60
+	}
+	core := map[string]any{"limit": limit, "remaining": limit - 1, "used": 1, "reset": time.Now().Add(time.Hour).Unix()}
+	writeJSON(w, map[string]any{"resources": map[string]any{"core": core}, "rate": core})
+}
+
+// auths returns the Authorization headers of the API calls since mark.
+func (f *fakeGitHub) auths(mark int) []string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]string(nil), f.apiAuth[mark:]...)
+}
+
+func (f *fakeGitHub) authMark() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.apiAuth)
 }
 
 func (f *fakeGitHub) bump(name string) {

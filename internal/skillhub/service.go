@@ -119,6 +119,9 @@ type Service struct {
 
 	// wake pokes the poller after a source was created or changed.
 	wake chan struct{}
+	// lastPublicPause is the rate-limit pause the poller last logged for
+	// the sources without their own token (only the poller uses it).
+	lastPublicPause time.Time
 	// reloads queues the sources the cluster asked this node to reload.
 	reloads reloadQueue
 }
