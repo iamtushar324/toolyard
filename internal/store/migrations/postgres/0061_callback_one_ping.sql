@@ -7,6 +7,9 @@
 -- smallest id stays) are failed first (terminal_reason duplicate_ping), so
 -- the index can be built.
 --
+-- Rollback: a binary older than this migration never queues pings, so the
+-- index never refuses its inserts; it ignores the index otherwise.
+--
 -- Same schema as migrations/sqlite/0061_callback_one_ping.sql.
 
 UPDATE callback_outbox SET status = 'failed', terminal_reason = 'duplicate_ping'

@@ -526,7 +526,9 @@ func runServe(argv []string) error {
 	// leaves an audit row naming who raised the call and who decided it,
 	// whichever path the decision took.
 	bus.AddNotifier(auditlink.Notifier(auditSvc))
-	leaderLoop(ctx, clusterSvc, approval.SweeperLoop, time.Minute, func(ctx context.Context) { bus.RunSweeper(ctx, 30*time.Second) })
+	// The approval sweeper starts once the callbacks event sink is wired
+	// (below, before the Inbox): an expiry it records emits
+	// approval.decided through that sink.
 	// Every replica renews the leases of the legacy executions it runs.
 	goroutines.Loop(ctx, approval.LeaseRenewalLoop, time.Minute, bus.RunLeaseRenewal)
 
@@ -824,7 +826,22 @@ func runServe(argv []string) error {
 		}
 		log.Printf("inbox: removed %d passkey(s) (-inbox-reset-passkeys)", n)
 	}
+	// Callbacks are wired before the Inbox and the approval sweeper start
+	// any goroutine: both read their callbacks hook from those goroutines
+	// (Inbox mutations, approval expiry). The secrets cipher (secrets.key,
+	// loaded and checked above) also seals the receivers' secrets.
+	secretsCipher, err := sealbox.NewCipher(masterKeys[keyguard.SecretsKey])
+	if err != nil {
+		return fmt.Errorf("secrets cipher: %w", err)
+	}
+	callbackSvc := callbacks.New(db, secretsCipher)
+	callbackSvc.MaxReceivers = func() int {
+		return settingsSvc.GetInt(settings.CallbackMaxReceivers, callbacks.DefaultMaxReceiversPerAgent)
+	}
+	bus.SetEventSink(callbackSvc)
+	leaderLoop(ctx, clusterSvc, approval.SweeperLoop, time.Minute, func(ctx context.Context) { bus.RunSweeper(ctx, 30*time.Second) })
 	inboxSvc, err := inbox.New(ctx, inbox.Options{
+		Callbacks:         callbackSvc,
 		Cluster:           clusterSvc,
 		LegacyDecided:     bus.DispatchCommitted,
 		Passkeys:          passkeySvc,
@@ -1026,14 +1043,8 @@ func runServe(argv []string) error {
 	// rationale as oauth.key vs session.key). Wired into upstreams so
 	// secret:// refs in env/headers resolve at dial time, never reaching
 	// agents or API responses.
-	secretsKey := masterKeys[keyguard.SecretsKey] // loaded and checked above
-	secretsCipher, err := sealbox.NewCipher(secretsKey)
-	if err != nil {
-		return fmt.Errorf("secrets cipher: %w", err)
-	}
+	// secretsCipher (secrets.key) is built above, with the callbacks.
 	secretsSvc := secrets.New(db, secretsCipher, auditSvc)
-	callbackSvc := callbacks.New(db, secretsCipher)
-	inboxSvc.SetCallbacks(callbackSvc)
 	leaderLoop(ctx, clusterSvc, inbox.SweeperLoop, time.Minute, func(ctx context.Context) { inboxSvc.RunSweeper(ctx, time.Minute) })
 	leaderLoop(ctx, clusterSvc, loopInboxAttention, time.Minute, func(ctx context.Context) { inboxSvc.RunAttention(ctx, 15*time.Second) })
 	// Every replica delivers callbacks: each delivery is claimed with a
@@ -1051,7 +1062,6 @@ func runServe(argv []string) error {
 	// _callback_ref, or the agent's default receiver.
 	jobsSvc.SetNotifier(jobs.EmitterNotifier(callbackSvc.EmitForAgentTx))
 	jobsSvc.Run(ctx)
-	bus.SetEventSink(callbackSvc)
 	upstreamSvc.SetSecrets(secretsSvc)
 
 	// Chat-approval notifications (Telegram). The Registry fans approval-bus

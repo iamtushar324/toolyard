@@ -929,7 +929,10 @@ If toolyard cannot register the receiver, the deferred answer carries a
 `callbacks.set_default` (an empty `callback_ref` clears it), and
 `callbacks.test`, which sends a signed `ping` (receivers whose `events`
 include `ping`; one pending ping per receiver, 10 a minute). An agent keeps
-at most 20 receivers.
+at most 500 active receivers (the administrator may change it); disabled
+ones do not count. A push receiver unused for 30 days (no delivery, nothing
+new to follow) shows `disabled_reason: "idle"` and becomes active again when
+you use it.
 
 **Events.** Every event is a JSON envelope
 `{ "type", "event_id", "timestamp", "data" }`, POSTed with the headers

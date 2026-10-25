@@ -37,12 +37,19 @@ import (
 var ErrReceiver = errors.New("callback receiver is unavailable or belongs to another agent")
 var ErrConflict = errors.New("callback receiver revision or registration changed")
 
-// ErrTooManyReceivers refuses a registration beyond MaxReceiversPerAgent.
-var ErrTooManyReceivers = fmt.Errorf("an agent may keep at most %d receivers; remove one first", MaxReceiversPerAgent)
+// ErrTooManyReceivers refuses a new registration while the agent keeps
+// as many active receivers as the cap (Service.MaxReceivers). Errors
+// that match it say the cap.
+var ErrTooManyReceivers = errors.New("too many active receivers")
 
-// MaxReceiversPerAgent bounds the receivers an agent keeps (removed ones
-// do not count).
-const MaxReceiversPerAgent = 20
+// DefaultMaxReceiversPerAgent is the default cap on an agent's active
+// receivers (setting callback_max_receivers_per_agent). Disabled, idle and
+// removed receivers do not count: T3 Code registers one receiver per
+// session thread, all under its user's one host-connection agent.
+const DefaultMaxReceiversPerAgent = 500
+
+// maxReceiversLimit bounds what the setting may ask for.
+const maxReceiversLimit = 100000
 
 type Receiver struct {
 	ID               string `json:"callback_ref"`
@@ -60,7 +67,10 @@ type Receiver struct {
 	V3     bool     `json:"v3"`
 	// Default is set by List: the agent's default receiver.
 	Default bool `json:"default,omitempty"`
-	secret  string
+	// DisabledReason is "idle" when the retention sweep disabled the
+	// receiver (DisableIdle); naming it again wakes it.
+	DisabledReason string `json:"disabled_reason,omitempty"`
+	secret         string
 }
 
 // Subscription is what a new receiver accepts. The zero value is the
@@ -82,6 +92,29 @@ type Service struct {
 	// ackHook, when set (tests), runs inside Ack between its read and its
 	// update.
 	ackHook func()
+	// MaxReceivers returns the cap on an agent's active receivers; nil, or
+	// a value below 1, means DefaultMaxReceiversPerAgent.
+	MaxReceivers func() int
+}
+
+// maxReceivers is the cap in force.
+func (s *Service) maxReceivers() int {
+	if s.MaxReceivers == nil {
+		return DefaultMaxReceiversPerAgent
+	}
+	n := s.MaxReceivers()
+	if n < 1 {
+		return DefaultMaxReceiversPerAgent
+	}
+	if n > maxReceiversLimit {
+		return maxReceiversLimit
+	}
+	return n
+}
+
+// tooManyReceivers is ErrTooManyReceivers with the cap in force.
+func (s *Service) tooManyReceivers() error {
+	return fmt.Errorf("%w: an agent may keep at most %d active receivers; remove or disable one first", ErrTooManyReceivers, s.maxReceivers())
 }
 
 func New(db *store.DB, cipher *sealbox.Cipher) *Service {
@@ -152,9 +185,19 @@ func (s *Service) register(ctx context.Context, agentID, environmentID, clientID
 		if err != nil {
 			return nil, err
 		}
-		if r.Transport != transport || r.Destination != destination || r.EnvironmentID != environmentID || !hmac.Equal(plain, []byte(secret)) || r.Status != "active" ||
+		idle := r.Status == "disabled" && r.DisabledReason == DisabledIdle
+		if r.Transport != transport || r.Destination != destination || r.EnvironmentID != environmentID || !hmac.Equal(plain, []byte(secret)) || (r.Status != "active" && !idle) ||
 			!SameEvents(r.Events, events) || r.V3 != sub.V3 {
 			return nil, ErrConflict
+		}
+		if idle {
+			// The identical registration again: the client still uses the
+			// receiver. It is woken whatever the cap (it was counted when it
+			// was registered).
+			if err := s.wakeIdle(ctx, s.db, agentID, r.ID); err != nil {
+				return nil, err
+			}
+			return s.Get(ctx, agentID, r.ID)
 		}
 		return r, nil
 	}
@@ -162,13 +205,13 @@ func (s *Service) register(ctx context.Context, agentID, environmentID, clientID
 		return nil, err
 	}
 	// A quick answer before sealing the secret; insertReceiver checks the
-	// cap again under the agent lock.
+	// cap again under the agent lock. Only active receivers count.
 	var kept int
-	if err = s.db.QueryRowContext(ctx, `SELECT count(*) FROM callback_receivers WHERE agent_id=? AND status<>'removed'`, agentID).Scan(&kept); err != nil {
+	if err = s.db.QueryRowContext(ctx, `SELECT count(*) FROM callback_receivers WHERE agent_id=? AND status='active'`, agentID).Scan(&kept); err != nil {
 		return nil, err
 	}
-	if kept >= MaxReceiversPerAgent {
-		return nil, ErrTooManyReceivers
+	if kept >= s.maxReceivers() {
+		return nil, s.tooManyReceivers()
 	}
 	id := "cb_" + uuid.NewString()
 	enc, err := s.cipher.Seal([]byte(secret), []byte("callback|"+id))
@@ -211,7 +254,7 @@ func (s *Service) lockAgentTx(ctx context.Context, tx *sql.Tx, agentID string) e
 }
 
 // insertReceiver stores a receiver unless the agent's host connection is
-// inactive or the agent keeps MaxReceiversPerAgent receivers
+// inactive or the agent keeps as many active receivers as the cap
 // (ErrTooManyReceivers), and returns the rows inserted (0 or 1). The count
 // is read under the agent lock, so concurrent registrations never pass
 // the cap together. The host connection rows are locked first (Postgres
@@ -235,11 +278,11 @@ func (s *Service) insertReceiver(ctx context.Context, id, agentID, environmentID
 		}
 	}
 	var kept int
-	if err = tx.QueryRowContext(ctx, `SELECT count(*) FROM callback_receivers WHERE agent_id=? AND status<>'removed'`, agentID).Scan(&kept); err != nil {
+	if err = tx.QueryRowContext(ctx, `SELECT count(*) FROM callback_receivers WHERE agent_id=? AND status='active'`, agentID).Scan(&kept); err != nil {
 		return 0, err
 	}
-	if kept >= MaxReceiversPerAgent {
-		return 0, ErrTooManyReceivers
+	if kept >= s.maxReceivers() {
+		return 0, s.tooManyReceivers()
 	}
 	// Parameters in a SELECT list have no column type on Postgres: cast them
 	// to the column types (the casts change nothing on SQLite).
@@ -268,7 +311,7 @@ func boolInt(b bool) int {
 func scanReceiver(row interface{ Scan(...any) error }) (*Receiver, error) {
 	r := new(Receiver)
 	var events string
-	err := row.Scan(&r.ID, &r.AgentID, &r.EnvironmentID, &r.ClientReceiverID, &r.Destination, &r.secret, &r.Revision, &r.Status, &r.PrivateAllowed, &r.Transport, &events, &r.V3)
+	err := row.Scan(&r.ID, &r.AgentID, &r.EnvironmentID, &r.ClientReceiverID, &r.Destination, &r.secret, &r.Revision, &r.Status, &r.PrivateAllowed, &r.Transport, &events, &r.V3, &r.DisabledReason)
 	// Sorted, like NormalizeEvents: the column default of receivers from
 	// before migration 0060 lists the legacy types in another order.
 	r.Events = splitEvents(events)
@@ -276,7 +319,7 @@ func scanReceiver(row interface{ Scan(...any) error }) (*Receiver, error) {
 	return r, err
 }
 
-const receiverColumns = `id,agent_id,environment_id,client_receiver_id,destination,secret_enc,revision,status,private_allowed,transport,events,v3`
+const receiverColumns = `id,agent_id,environment_id,client_receiver_id,destination,secret_enc,revision,status,private_allowed,transport,events,v3,disabled_reason`
 
 func (s *Service) Get(ctx context.Context, agentID, id string) (*Receiver, error) {
 	r, err := scanReceiver(s.db.QueryRowContext(ctx, `SELECT `+receiverColumns+` FROM callback_receivers WHERE id=? AND agent_id=?`, id, agentID))
@@ -331,7 +374,9 @@ func (s *Service) Change(ctx context.Context, agentID, id, action, secret string
 		return nil, err
 	}
 	defer tx.Rollback()
-	result, err := tx.ExecContext(ctx, `UPDATE callback_receivers SET status=?,secret_enc=?,revision=revision+1 WHERE id=? AND agent_id=? AND revision=? AND status<>'removed'`, status, enc, id, agentID, revision)
+	// An explicit change clears disabled_reason: a receiver its agent
+	// disabled is never woken by use.
+	result, err := tx.ExecContext(ctx, `UPDATE callback_receivers SET status=?,secret_enc=?,revision=revision+1,disabled_reason='' WHERE id=? AND agent_id=? AND revision=? AND status<>'removed'`, status, enc, id, agentID, revision)
 	if err != nil {
 		return nil, err
 	}
@@ -372,6 +417,10 @@ func (s *Service) Change(ctx context.Context, agentID, id, action, secret string
 // subscribes the agent's default receiver (callbacks.set_default), when it
 // has an active one and its connection is active; otherwise nothing.
 func (s *Service) RegisterTx(ctx context.Context, tx *sql.Tx, r *inbox.Request, ref string) error {
+	// A new item to follow wakes an idle receiver (named, or the default).
+	if err := s.wakeIdle(ctx, tx, r.AgentID, ref); err != nil {
+		return err
+	}
 	if ref == "" {
 		def, revision, err := defaultReceiver(ctx, tx, r.AgentID)
 		if err != nil || def == "" {
@@ -458,6 +507,9 @@ func receiverV3(ctx context.Context, q hostQuery, ref string) (bool, error) {
 // active receiver of the agent that can carry r's decision. Submit asks it
 // for every named receiver, dry runs included.
 func (s *Service) CheckSubscription(ctx context.Context, agentID, ref string, r *inbox.Request) error {
+	if err := s.wakeIdle(ctx, s.db, agentID, ref); err != nil {
+		return err
+	}
 	rec, err := s.Get(ctx, agentID, ref)
 	if err != nil {
 		return err
@@ -922,4 +974,53 @@ func hostConnectionActive(ctx context.Context, q hostQuery, agent string, now in
 		return ErrReceiver
 	}
 	return nil
+}
+
+// DisabledIdle is the disabled_reason of a receiver the retention sweep
+// disabled (DisableIdle).
+const DisabledIdle = "idle"
+
+// IdleReceiverAfter is how long an active push receiver may go without a
+// successful delivery and without anything new to follow before
+// DisableIdle disables it.
+const IdleReceiverAfter = 30 * 24 * time.Hour
+
+// execer runs a statement on the pool or in a transaction.
+type execer interface {
+	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
+}
+
+// wakeIdle makes ref active again when the retention sweep disabled it for
+// idleness and its agent uses it again: idleness is not a decision anyone
+// made. ref "" means the agent's default receiver. A receiver its agent or
+// owner disabled stays disabled. woken_at keeps the next sweep from
+// disabling it again at once. The cap does not apply: the receiver was
+// counted when it was registered. q is the pool, or the caller's
+// transaction (never the pool inside one).
+func (s *Service) wakeIdle(ctx context.Context, q execer, agentID, ref string) error {
+	_, err := q.ExecContext(ctx, `UPDATE callback_receivers SET status='active',disabled_reason='',woken_at=? WHERE agent_id=? AND status='disabled' AND disabled_reason=? AND id=COALESCE(NULLIF(CAST(? AS TEXT),''),(SELECT receiver_id FROM callback_defaults WHERE agent_id=?))`,
+		s.now().UnixMilli(), agentID, DisabledIdle, ref, agentID)
+	return err
+}
+
+// DisableIdle disables every active push receiver that, for
+// IdleReceiverAfter, was not registered or woken, had no successful
+// delivery, and had nothing new to follow: no event queued for it, no
+// Inbox item or legacy approval that names it, and no default change to
+// it. It sets disabled_reason "idle", so the receiver stops counting
+// toward the cap and wakes when its agent names it again. Pull receivers
+// are left alone. The revision does not change (it tracks the agent's own
+// changes). The update is idempotent, so the sweep is safe on every node.
+func (s *Service) DisableIdle(ctx context.Context) (int64, error) {
+	cutoff := s.now().Add(-IdleReceiverAfter).UnixMilli()
+	res, err := s.db.ExecContext(ctx, `UPDATE callback_receivers SET status='disabled',disabled_reason=? WHERE status='active' AND transport='push' AND created_at<? AND woken_at<?
+ AND NOT EXISTS (SELECT 1 FROM callback_outbox o WHERE o.receiver_id=callback_receivers.id AND (o.created_at>=? OR o.delivered_at>=?))
+ AND NOT EXISTS (SELECT 1 FROM callback_subscriptions s JOIN inbox_requests q ON q.id=s.request_id WHERE s.receiver_id=callback_receivers.id AND q.created_at>=?)
+ AND NOT EXISTS (SELECT 1 FROM callback_subject_subscriptions j WHERE j.receiver_id=callback_receivers.id AND j.created_at>=?)
+ AND NOT EXISTS (SELECT 1 FROM callback_defaults d WHERE d.receiver_id=callback_receivers.id AND d.updated_at>=?)`,
+		DisabledIdle, cutoff, cutoff, cutoff, cutoff, cutoff, cutoff, cutoff)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
 }
