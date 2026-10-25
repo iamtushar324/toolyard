@@ -44,13 +44,7 @@ func (h *recordingHandler) count() int {
 	return len(h.calls)
 }
 
-func activityText(r *Request) string {
-	var out []string
-	for _, a := range r.Activity {
-		out = append(out, a.Text)
-	}
-	return strings.Join(out, " | ")
-}
+// activityText (inbox_test.go) joins an item's timeline.
 
 func answerDecision(r *Request, choice, sub string) Decision {
 	return Decision{Action: "answer", RequestRevision: r.Revision, SubmissionID: sub,
