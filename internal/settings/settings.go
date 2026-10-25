@@ -107,6 +107,10 @@ const (
 	// CallbackMaxReceivers caps each agent's active callback receivers.
 	// Default 500 (callbacks.DefaultMaxReceiversPerAgent).
 	CallbackMaxReceivers = "callback_max_receivers_per_agent"
+	// SkillsTrustedGitHubOwners is a comma list of GitHub owners whose
+	// repositories a new skill source syncs in mode auto by default (the
+	// others default to review; docs/skills-hub.md). Default empty.
+	SkillsTrustedGitHubOwners = "skills_trusted_github_owners"
 
 	// Inbox attention (when the phone buzzes; inbox-spec.md §6).
 	//
@@ -302,6 +306,9 @@ func (s *Service) All(ctx context.Context) (map[string]any, error) {
 	}
 	if _, ok := out[InboxVoiceEnabled]; !ok {
 		out[InboxVoiceEnabled] = false
+	}
+	if _, ok := out[SkillsTrustedGitHubOwners]; !ok {
+		out[SkillsTrustedGitHubOwners] = ""
 	}
 	// Virtual alias: keep router_only_mode boolean in sync for older callers.
 	if mode, _ := out[SurfaceMode].(string); mode == SurfaceRouterOnly {

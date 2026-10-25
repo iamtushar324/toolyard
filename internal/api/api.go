@@ -88,7 +88,6 @@ import (
 	"github.com/tusharbhardwaj/toolyard/internal/realtime"
 	"github.com/tusharbhardwaj/toolyard/internal/secrets"
 	"github.com/tusharbhardwaj/toolyard/internal/settings"
-	"github.com/tusharbhardwaj/toolyard/internal/skills"
 	"github.com/tusharbhardwaj/toolyard/internal/upstreams"
 	"github.com/tusharbhardwaj/toolyard/internal/usage"
 	"github.com/tusharbhardwaj/toolyard/internal/voice"
@@ -137,7 +136,6 @@ type Server struct {
 	identityKeys    *identitykeys.Service
 	guide           *inbox.Guide
 	notes           *notes.Service
-	skills          *skills.Service
 	voice           *voice.Service
 	secrets         *secrets.Service
 	chatTelegram    ChatTelegram
@@ -206,11 +204,6 @@ type Options struct {
 	// background MemPalace sync. The Service itself nil-checks so an
 	// unwired install just returns 503 from the routes.
 	Notes *notes.Service
-	// Skills, when set, holds the centralised Claude Code skills workspace
-	// + background MemPalace sync. No /v1/skills/* HTTP routes in v1 —
-	// the field is present so the dashboard can consume snapshots later
-	// without another Options refactor.
-	Skills *skills.Service
 	// Voice, when set, enables /v1/voice/* — the dashboard "live call"
 	// panel. Requires GEMINI_API_KEY to be wired into the voice.Service
 	// itself; the api layer just gates auth and reverse-checks
@@ -293,7 +286,6 @@ func New(ctx context.Context, opts Options) *Server {
 		hooks:           opts.Hooks,
 		mempalace:       opts.Mempalace,
 		notes:           opts.Notes,
-		skills:          opts.Skills,
 		voice:           opts.Voice,
 		secrets:         opts.Secrets,
 		chatTelegram:    opts.ChatTelegram,
