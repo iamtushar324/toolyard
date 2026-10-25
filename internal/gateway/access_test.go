@@ -477,19 +477,19 @@ func TestAccessRawMCPCallMatchesUnknownTool(t *testing.T) {
 
 func TestAddUpstreamReservesAccessGroupNames(t *testing.T) {
 	f := newAccessFixture(t, nil)
-	// The synthetic upstreams, the always-on meta-tool group, the data
-	// groups whose tools live under the "builtin" upstream, and lake, the
-	// retired data group.
-	for _, name := range []string{"builtin", "fixture", "inbox", "session", "connections", "tools", "memory", "lake", "events"} {
+	// The synthetic upstreams, the always-on meta-tool and skills groups,
+	// the data groups whose tools live under the "builtin" upstream, and
+	// lake, the retired data group.
+	for _, name := range []string{"builtin", "fixture", "inbox", "session", "connections", "tools", "memory", "lake", "events", "jobs", "callbacks", "skills"} {
 		err := f.gw.AddUpstream(context.Background(), UpstreamConfig{Name: name})
 		if err == nil || !strings.Contains(err.Error(), "reserved") {
 			t.Errorf("upstream %q should be reserved, got %v", name, err)
 		}
 	}
-	// notes and skills are real upstreams that startup registers under
-	// those names, and any plain name, get past the reservation (and fail
-	// later, on dial).
-	for _, name := range []string{"notes", "skills", "deploy"} {
+	// notes is a real upstream that startup registers under that name;
+	// it, and any plain name, get past the reservation (and fail later, on
+	// dial).
+	for _, name := range []string{"notes", "deploy"} {
 		if err := f.gw.AddUpstream(context.Background(), UpstreamConfig{Name: name}); err != nil && strings.Contains(err.Error(), "reserved") {
 			t.Errorf("%q must not be reserved at the gateway: %v", name, err)
 		}

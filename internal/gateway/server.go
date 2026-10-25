@@ -223,6 +223,9 @@ type Gateway struct {
 	accessToolsState
 	// jobsState backs async tools and the jobs.* tools (jobs_tools.go).
 	jobsState
+	// skillHub backs the skills.* tools and the MCP Skills extension
+	// (builtin_skills.go); nil while the skills hub is off.
+	skillHub atomic.Pointer[skillHubConfig]
 
 	// owners resolves a caller to its dashboard user for per_user
 	// upstreams; publicURL is where their My connections page lives.
@@ -778,22 +781,24 @@ func (g *Gateway) RegisterBuiltins() {
 
 // reservedUpstreamName reports whether name belongs to the gateway itself:
 // the synthetic upstreams (builtin, fixture, inbox, session, policies,
-// servers, audit, access, connections), the meta-tool group "tools", the built-in data
-// groups whose tools are registered under the "builtin" upstream (memory,
-// events), and "toolyard", the code-mode server every internal tool
-// is bound under. An upstream with one of these names would register tools
-// under the same prefix as the built-ins and share their access group:
-// "tools" is always-on, so a server called tools would be reachable by
-// every member without a grant. "lake", the retired data group, stays
-// reserved: old grants for it may still be stored.
+// servers, audit, access, connections, jobs, callbacks, skills), the
+// meta-tool group "tools", the built-in data groups whose tools are
+// registered under the "builtin" upstream (memory, events), and
+// "toolyard", the code-mode server every internal tool is bound under. An
+// upstream with one of these names would register tools under the same
+// prefix as the built-ins and share their access group: "tools" and
+// "skills" are always-on, so a server called tools or skills would be
+// reachable by every member without a grant. "lake", the retired data
+// group, stays reserved: old grants for it may still be stored.
 //
-// notes and skills are deliberately not here: they are real upstreams that
-// startup registers under those names (upstreams.UpsertBuiltin), and their
-// access group is the upstream name like any other server's.
+// notes is deliberately not here: it is a real upstream that startup
+// registers under that name (upstreams.UpsertBuiltin), and its access
+// group is the upstream name like any other server's.
 func reservedUpstreamName(name string) bool {
 	switch name {
 	case builtinUpstream, "fixture", inboxUpstream, sessionUpstream, "tools", "memory", "lake", "events",
-		policiesUpstream, serversUpstream, auditUpstream, accessUpstream, toolyardServer, connectionsGroup, jobsUpstream, callbacksUpstream:
+		policiesUpstream, serversUpstream, auditUpstream, accessUpstream, toolyardServer, connectionsGroup, jobsUpstream, callbacksUpstream,
+		skillsUpstream:
 		return true
 	}
 	return false

@@ -78,7 +78,7 @@ func TestTyScript(t *testing.T) {
 	if !strings.HasPrefix(TyScript, "#!/usr/bin/env python3\n") {
 		t.Errorf("ty must start with #!/usr/bin/env python3")
 	}
-	for _, cmd := range []string{"run", "status", "resume", "files", "stub", "call"} {
+	for _, cmd := range []string{"run", "status", "resume", "files", "stub", "call", "skills"} {
 		if !strings.Contains(TyScript, `add_parser("`+cmd+`"`) {
 			t.Errorf("ty has no %q subcommand", cmd)
 		}

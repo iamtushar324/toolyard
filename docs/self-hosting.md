@@ -699,8 +699,10 @@ stays as the break-glass login.
 
 Everyone else who signs in becomes a **member**: they see their own profile,
 manage their own agents, and their agents reach only the servers and data
-groups (memory, events, notes, skills) an admin grants them on the
-**Users** page. Every approval and inbox decision stays with admins.
+groups (memory, events, notes) an admin grants them on the **Users** page.
+The skills tools need no grant: each person sees the skill sources shared
+with them ([skills-hub.md](skills-hub.md)). Every approval and inbox
+decision stays with admins.
 
 Once an hour (`-clerk-sync-interval`) toolyard lists the organisation's
 members; anyone who left is blocked (`left_org`), their dashboard sessions

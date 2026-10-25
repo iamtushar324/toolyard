@@ -1501,6 +1501,11 @@ func runServe(argv []string) error {
 	// of the transport and after the token check, with the transport's
 	// own DNS rebinding protection (off with -public-url, as above).
 	mcpHandler := gw.MCPTasks(streamable, mcpAuthn.contextFunc, *publicURL == "")
+	// skillhub (slice B): the MCP Skills extension methods mcp-go has no
+	// route for (skills/list, skills/get, resources/directory/read), in
+	// front of the transport like MCP Tasks. It passes every request
+	// through until gw.RegisterSkillHub turns the skills hub on.
+	mcpHandler = gw.MCPSkills(mcpHandler, mcpAuthn.contextFunc, *publicURL == "")
 	mux.Handle("/mcp", mcpStreams.wrap(api.LimitBody(gateway.PreserveToolCallNumbers(mcpAuthn.guard(mcpHandler)), 16<<20)))
 	mux.Handle("/mcp/", mcpStreams.wrap(api.LimitBody(gateway.PreserveToolCallNumbers(mcpAuthn.guard(mcpHandler)), 16<<20)))
 

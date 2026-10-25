@@ -175,6 +175,63 @@ func TestRetiredGroupGrantsIgnored(t *testing.T) {
 	}
 }
 
+// skills is an always-on group since the skills hub: every active caller
+// has the skills tools without a grant (the hub filters what each one
+// sees). A grant stored while skills was a built-in data group is
+// harmless: not listed, dropped by the next SetGroups. An agent's own deny
+// list still switches the group off for that agent.
+func TestSkillsGroupIsAlwaysOn(t *testing.T) {
+	ctx := context.Background()
+	db := openTestDB(t)
+	addUser(t, db, "u_member", "member", "active")
+	addUser(t, db, "u_blocked", "member", "blocked")
+	addAgent(t, db, "ag_member", "u_member")
+	addAgent(t, db, "ag_blocked", "u_blocked")
+	if _, err := db.Exec(`INSERT INTO user_server_access(user_id, server, created_at) VALUES('u_member','skills',0),('u_member','github',0)`); err != nil {
+		t.Fatal(err)
+	}
+	svc := New(db)
+	if !AlwaysOn("skills") || IsBuiltinGroup("skills") {
+		t.Fatalf("skills: always-on %v, built-in %v; want always-on only", AlwaysOn("skills"), IsBuiltinGroup("skills"))
+	}
+	found := false
+	for _, g := range AlwaysOnGroups() {
+		found = found || g == "skills"
+	}
+	if !found {
+		t.Fatalf("AlwaysOnGroups = %v, want skills listed", AlwaysOnGroups())
+	}
+	if got, err := svc.Groups(ctx, "u_member"); err != nil || len(got) != 1 || got[0] != "github" {
+		t.Fatalf("Groups = %v %v, want [github] (the stored skills grant is not listed)", got, err)
+	}
+	for _, caller := range []string{"ag_member", "dashboard:u_member", "voice:u_member"} {
+		sc := svc.ScopeFor(ctx, caller)
+		if !sc.Allows("skills") || !sc.AllowsTool("skills", "skills.search") {
+			t.Errorf("%s: skills not allowed (%+v)", caller, sc)
+		}
+	}
+	if svc.ScopeFor(ctx, "ag_blocked").Allows("skills") || svc.ScopeFor(ctx, "ag_unknown").Allows("skills") {
+		t.Error("a blocked or unknown caller reaches skills")
+	}
+	if err := svc.SetGroups(ctx, "u_member", []string{"skills", "memory"}, ""); err != nil {
+		t.Fatal(err)
+	}
+	var n int
+	if err := db.QueryRow(`SELECT count(*) FROM user_server_access WHERE user_id = 'u_member' AND server = 'skills'`).Scan(&n); err != nil || n != 0 {
+		t.Fatalf("SetGroups kept a skills grant (%d rows, %v)", n, err)
+	}
+	// An agent's deny list beats an always-on group; an allow list that
+	// does not name skills leaves it on.
+	denied := Scope{Groups: map[string]bool{}}.withLimits(&Limits{Listed: true, DenyServers: map[string]bool{"skills": true}})
+	if denied.Allows("skills") || denied.AllowsTool("skills", "skills.get") || !denied.LimitedOut("skills", "skills.get") {
+		t.Fatalf("a denied agent still reaches skills: %+v", denied)
+	}
+	listed := Scope{Groups: map[string]bool{}}.withLimits(&Limits{Listed: true, AllowServers: map[string]bool{"github": true}})
+	if !listed.AllowsTool("skills", "skills.get") {
+		t.Fatal("an allow list without skills switched the always-on group off")
+	}
+}
+
 func TestNewUserDefaults(t *testing.T) {
 	// Rows inserted after 0023 without a role are members, active.
 	db := openTestDB(t)

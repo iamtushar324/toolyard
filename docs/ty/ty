@@ -13,6 +13,15 @@ the API is described at GET /v1/code/openapi.json.
   ty search QUERY [--mode keyword|regex] [--detail name|summary|full] [--limit N] [--upstream SERVER]
   ty call SERVER.TOOL '{"json": "arguments"}' [--reason TEXT]
 
+The skills hub (docs/skills-hub.md in the toolyard repo), read-only:
+
+  ty skills search QUERY [--mode keyword|regex] [--source SLUG] [--limit N] [--include-host]
+  ty skills get SKILL [--no-files]
+  ty skills read URI [--offset N] [--limit N] [--raw]
+  ty skills grep PATTERN [--source SLUG] [--path GLOB] [--ignore-case] [--limit N] [--include-host]
+  ty skills sources
+  ty skills list [--cursor CURSOR] [--limit N] [--source SLUG] [--include-host]
+
 A FILE ending in .js or .mjs runs as JavaScript (await tools.Server.tool({...}),
 return the result); anything else as Starlark, unless --language says.
 
@@ -27,7 +36,7 @@ ty never prints or logs it, never puts it in argv and never hands it to
 another process.
 
 Output: the run view as JSON on stdout (files and stub print text, search
-prints its JSON).
+and the skills commands print their JSON; skills read --raw prints the file).
 Exit codes: 0 succeeded, 1 failed, 2 usage or transport error,
 3 permission_required, 4 deferred or still running, 5 busy (HTTP 429),
 6 outcome_unknown.
@@ -603,6 +612,72 @@ def cmd_search(client, args):
     return EXIT_SUCCEEDED
 
 
+# ---- `ty skills`: the skills hub over REST ----
+
+def skills_query(client, path, query):
+    """GETs one skills route and prints its JSON answer."""
+    url = path
+    if query:
+        url += "?" + urllib.parse.urlencode(query)
+    status, headers, data = client.send("GET", url)
+    body = parse_json(data)
+    if status != 200 or not isinstance(body, dict):
+        return error_exit(status, headers, data)
+    emit_json(body)
+    return EXIT_SUCCEEDED
+
+
+def skills_options(args, query, names):
+    """Adds the optional flags in names to query, as the routes spell them."""
+    for name in names:
+        value = getattr(args, name, None)
+        if value is None or value is False or value == "":
+            continue
+        query[name] = "true" if value is True else str(value)
+    return query
+
+
+def cmd_skills_search(client, args):
+    query = skills_options(args, {"query": args.query}, ("mode", "source", "limit", "include_host"))
+    return skills_query(client, "/v1/skills/search", query)
+
+
+def cmd_skills_get(client, args):
+    query = {"skill": args.skill}
+    if args.no_files:
+        query["include_files"] = "false"
+    return skills_query(client, "/v1/skills/get", query)
+
+
+def cmd_skills_read(client, args):
+    query = skills_options(args, {"uri": args.uri}, ("offset", "limit"))
+    if not args.raw:
+        return skills_query(client, "/v1/skills/read", query)
+    status, headers, data = client.send("GET", "/v1/skills/read?" + urllib.parse.urlencode(query))
+    body = parse_json(data)
+    if status != 200 or not isinstance(body, dict) or not isinstance(body.get("content"), str):
+        return error_exit(status, headers, data)
+    sys.stdout.buffer.write(body["content"].encode("utf-8"))
+    sys.stdout.flush()
+    if body.get("truncated"):
+        warn("the file continues: run again with --offset %s" % body.get("next_offset"))
+    return EXIT_SUCCEEDED
+
+
+def cmd_skills_grep(client, args):
+    query = skills_options(args, {"pattern": args.pattern}, ("source", "path", "ignore_case", "limit", "include_host"))
+    return skills_query(client, "/v1/skills/grep", query)
+
+
+def cmd_skills_sources(client, args):
+    return skills_query(client, "/v1/skills/sources", {})
+
+
+def cmd_skills_list(client, args):
+    query = skills_options(args, {}, ("cursor", "limit", "source", "include_host"))
+    return skills_query(client, "/v1/skills/list", query)
+
+
 def seconds(text):
     try:
         n = int(text)
@@ -670,6 +745,49 @@ def build_parser():
     s.add_argument("--key", metavar="IDEMPOTENCY_KEY",
                    help="reuse this key on a retry to get the same run back (default: a new random key)")
     s.set_defaults(func=cmd_call)
+
+    s = sub.add_parser("skills", help="search and read the skills you may use (the skills hub)")
+    skills = s.add_subparsers(dest="skills_command", metavar="SKILLS_COMMAND")
+    host_help = "also show skills that need the T3 host (runs: host)"
+
+    k = skills.add_parser("search", help="search skills by words, or an RE2 pattern with --mode regex")
+    k.add_argument("query", metavar="QUERY")
+    k.add_argument("--mode", choices=("keyword", "regex"), help="keyword (default) or regex")
+    k.add_argument("--source", metavar="SLUG", help="only this skill source")
+    k.add_argument("--limit", type=int, metavar="N", help="at most N results (default 10, at most 50)")
+    k.add_argument("--include-host", action="store_true", help=host_help)
+    k.set_defaults(func=cmd_skills_search)
+
+    k = skills.add_parser("get", help="print one skill: its SKILL.md and its file list")
+    k.add_argument("skill", metavar="SKILL", help="skill://<source>/<path>/SKILL.md, <source>/<path>, or a unique name")
+    k.add_argument("--no-files", action="store_true", help="leave out the file list")
+    k.set_defaults(func=cmd_skills_get)
+
+    k = skills.add_parser("read", help="print one file of a skill")
+    k.add_argument("uri", metavar="URI")
+    k.add_argument("--offset", type=int, metavar="N", help="first line, 0-based")
+    k.add_argument("--limit", type=int, metavar="N", help="at most N lines")
+    k.add_argument("--raw", action="store_true", help="print the file's text instead of the JSON answer")
+    k.set_defaults(func=cmd_skills_read)
+
+    k = skills.add_parser("grep", help="search the contents of skill files with an RE2 pattern")
+    k.add_argument("pattern", metavar="PATTERN")
+    k.add_argument("--source", metavar="SLUG", help="only this skill source")
+    k.add_argument("--path", metavar="GLOB", help="only files whose path in the skill matches, e.g. '**/*.md'")
+    k.add_argument("--ignore-case", action="store_true", help="match case-insensitively")
+    k.add_argument("--limit", type=int, metavar="N", help="at most N hits (default 50, at most 200)")
+    k.add_argument("--include-host", action="store_true", help=host_help)
+    k.set_defaults(func=cmd_skills_grep)
+
+    k = skills.add_parser("sources", help="list the skill sources you see")
+    k.set_defaults(func=cmd_skills_sources)
+
+    k = skills.add_parser("list", help="list the skills you see, a page at a time")
+    k.add_argument("--cursor", metavar="CURSOR", help="the next_cursor of the page before")
+    k.add_argument("--limit", type=int, metavar="N", help="skills per page (default 100, at most 500)")
+    k.add_argument("--source", metavar="SLUG", help="only this skill source")
+    k.add_argument("--include-host", action="store_true", help=host_help)
+    k.set_defaults(func=cmd_skills_list)
     return p
 
 

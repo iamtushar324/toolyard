@@ -11,6 +11,7 @@ import (
 	"github.com/tusharbhardwaj/toolyard/internal/access"
 	"github.com/tusharbhardwaj/toolyard/internal/actor"
 	"github.com/tusharbhardwaj/toolyard/internal/codemode"
+	"github.com/tusharbhardwaj/toolyard/internal/skillhub"
 	"github.com/tusharbhardwaj/toolyard/internal/toolsearch"
 )
 
@@ -31,6 +32,7 @@ func (g *Gateway) metaTools() []toolEntry {
 			"mode \"regex\" matches an RE2 pattern (at most 200 characters, case-insensitive unless the pattern turns that off) against the same fields: query \"^github\\\\..*pull\". " +
 			"mode \"auto\" is keyword; \"semantic\" works only where an operator configured it. " +
 			"detail \"full\" (default) returns name, upstream, description, the code-mode name, score and the input and output schemas; \"summary\" leaves out the schemas; \"name\" only names. " +
+			"When toolyard serves skills, the answer also names up to 3 matching skills under \"skills\" (playbooks: read one with skills.get). " +
 			"Use it before tools.execute, or in code mode: JavaScript `await tools.search(\"query\", { limit: 5 })`, Starlark `toolyard.tools_search(query=\"...\")`.",
 		InputSchema: mcp.ToolInputSchema{
 			Type:     "object",
@@ -147,12 +149,58 @@ func (g *Gateway) SearchTools(ctx context.Context, req SearchRequest) (map[strin
 		return nil, err
 	}
 	results := toolsearch.Render(res.Hits, detail)
-	return map[string]any{
+	body := map[string]any{
 		"total":   len(results),
 		"matched": res.Matched,
 		"mode":    string(res.Mode),
 		"results": results,
-	}, nil
+	}
+	if skills := g.searchSkillsFor(ctx, req.Query, res.Mode); len(skills) > 0 {
+		body["skills"] = skills
+	}
+	return body, nil
+}
+
+// searchSkillHits is how many matching skills tools.search adds.
+const searchSkillHits = 3
+
+// searchSkill is one skill in tools.search's skills section.
+type searchSkill struct {
+	Name        string `json:"name"`
+	Description string `json:"description"`
+	URI         string `json:"uri"`
+	Repo        string `json:"repo"`
+}
+
+// searchSkillsFor is tools.search's skills section: up to three skills
+// that match query, when the skills hub is on and the caller may use the
+// skills tools. A regex query searches skills by regex, anything else by
+// keyword. The section is a hint: a catalog that fails or is slow leaves
+// it out, and the tool search answers as before.
+func (g *Gateway) searchSkillsFor(ctx context.Context, query string, mode toolsearch.Mode) []searchSkill {
+	hub := g.skillHub.Load()
+	query = strings.TrimSpace(query)
+	if hub == nil || query == "" || !g.scopeFor(ctx, agentIDFromContext(ctx)).AllowsTool(skillsUpstream, SkillsSearchTool) {
+		return nil
+	}
+	q := skillhub.SearchQuery{Text: query, Mode: "keyword", Limit: searchSkillHits}
+	if mode == toolsearch.ModeRegex {
+		q.Mode = "regex"
+	}
+	ctx, cancel := context.WithTimeout(ctx, skillsCallTimeout)
+	defer cancel()
+	hits, err := hub.reader.Search(ctx, g.skillViewer(ctx, hub), q)
+	if err != nil {
+		return nil
+	}
+	out := make([]searchSkill, 0, min(len(hits), searchSkillHits))
+	for _, h := range hits {
+		if len(out) == searchSkillHits {
+			break
+		}
+		out = append(out, searchSkill{Name: h.Name, Description: h.Description, URI: h.URI, Repo: h.Repo})
+	}
+	return out
 }
 
 // searchCatalog is the ctx caller's tools as search sees them: the schema
