@@ -1,6 +1,6 @@
 ---
 name: release-notes
-description: Write release notes for a toolyard release from merged pull requests. Use when a release is cut or someone asks what changed between two versions.
+description: Write release notes from merged pull requests (auto update 20:27:58).
 license: MIT
 metadata:
   author: toolyard-tests
