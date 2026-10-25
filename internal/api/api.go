@@ -41,6 +41,7 @@
 //
 //	POST /v1/agents/session-tokens          agent: mint a session token
 //	POST /v1/code/run                       code mode over REST (code_routes.go)
+//	/v1/skills/sources/*                    admin: skills hub sources (skills_admin_routes.go)
 package api
 
 import (
@@ -88,6 +89,7 @@ import (
 	"github.com/tusharbhardwaj/toolyard/internal/realtime"
 	"github.com/tusharbhardwaj/toolyard/internal/secrets"
 	"github.com/tusharbhardwaj/toolyard/internal/settings"
+	"github.com/tusharbhardwaj/toolyard/internal/skillhub"
 	"github.com/tusharbhardwaj/toolyard/internal/skills"
 	"github.com/tusharbhardwaj/toolyard/internal/upstreams"
 	"github.com/tusharbhardwaj/toolyard/internal/usage"
@@ -172,6 +174,12 @@ type Server struct {
 	// jobs backs the async job routes (/v1/jobs, jobs_routes.go); nil
 	// answers 503.
 	jobs *jobs.Service
+	// skillsAdmin backs the skills hub admin routes
+	// (skills_admin_routes.go); nil answers 404 "skills hub is off".
+	// skillReviews closes open Inbox review items after a decision on the
+	// Skills page; optional.
+	skillsAdmin  skillhub.Admin
+	skillReviews SkillReviewSettler
 }
 
 type Options struct {
@@ -269,6 +277,14 @@ type Options struct {
 	// Jobs backs async tool jobs over REST (/v1/jobs). Optional; without
 	// it the job routes answer 503.
 	Jobs *jobs.Service
+	// SkillsAdmin backs the skills hub admin routes (/v1/skills/sources/*,
+	// POST /v1/skills/sources, /v1/skills/admin/sources). nil answers 404
+	// "skills hub is off". Pass a nil interface, not a typed nil pointer.
+	SkillsAdmin skillhub.Admin
+	// SkillReviews closes the open Inbox review item of a version an admin
+	// activated or rejected on the Skills page (skillhub.ReviewInbox).
+	// Optional.
+	SkillReviews SkillReviewSettler
 }
 
 func New(ctx context.Context, opts Options) *Server {
@@ -314,6 +330,8 @@ func New(ctx context.Context, opts Options) *Server {
 		clerkOwnerOnly:  opts.ClerkOwnerOnly,
 		codeRuns:        opts.CodeRuns,
 		jobs:            opts.Jobs,
+		skillsAdmin:     opts.SkillsAdmin,
+		skillReviews:    opts.SkillReviews,
 	}
 	if s.webhookMaxBytes <= 0 {
 		s.webhookMaxBytes = DefaultWebhookMaxBytes
@@ -480,6 +498,7 @@ func (s *Server) Routes(mux *http.ServeMux) {
 	s.registerSessionTokenRoutes(mux)
 	s.registerCodeRoutes(mux)
 	s.registerJobsRoutes(mux)
+	s.registerSkillsAdminRoutes(mux)
 }
 
 // ---- helpers ----------------------------------------------------------------

@@ -106,6 +106,8 @@ var operatorOwnerPrefixes = []string{
 	"/v1/me/agent-scopes",
 	"/v1/me/apps/scope",
 	"/v1/me/apps/revoke",
+	// Skill sources: what every agent reads, and their read tokens.
+	"/v1/skills/sources",
 }
 
 // operatorScopeFor returns the scope an operator token needs for method on
@@ -119,6 +121,11 @@ func operatorScopeFor(method, path string) (scope string, ok bool) {
 	// Likewise an upload ticket (upload_routes.go) is its own credential.
 	// Code mode over REST runs as an agent, and session tokens belong to
 	// an agent: a person's operator token reaches neither.
+	// A skill source's webhook secret is shown once, to a person on the
+	// Skills page; GitHub's webhook itself takes no token.
+	if strings.HasPrefix(path, skillAdminSourcesPrefix) && (strings.HasSuffix(path, "/webhook-secret") || strings.HasSuffix(path, "/webhook")) {
+		return "", false
+	}
 	if operatorNeverPaths[path] || strings.Contains(path, "/reveal") || strings.HasPrefix(path, connectLinkPath) || strings.HasPrefix(path, uploadsPathPrefix) ||
 		strings.HasPrefix(path, codePathPrefix) || strings.HasPrefix(path, sessionTokensPrefix) ||
 		path == jobsPath || strings.HasPrefix(path, jobsPrefix) {
@@ -511,6 +518,8 @@ var operatorCatalog = []operatorCatalogEntry{
 	{"/v1/marketplace", "GET", "curated server recipes"},
 	{"/v1/secrets", "GET POST", "secrets metadata; POST {name, description, request:true} asks the owner for a value"},
 	{"/v1/secrets/{id}", "PUT DELETE", "set/rotate (?reconnect=1) or delete a secret value"},
+	{"/v1/skills/admin/sources", "GET", "skills hub: every skill source, with status (admin)"},
+	{"/v1/skills/sources/{id}", "GET POST PATCH PUT DELETE", "skills hub admin: POST /v1/skills/sources creates a source; /inspect and /preview try one; /{id} reads, PATCHes or DELETEs it; /{id}/sync, /{id}/versions, /{id}/versions/{vid}/activate|reject, /{id}/skills, PUT /{id}/skills/runs; /{id}/webhook-secret rotates the webhook secret (never via operator token); /{id}/webhook is GitHub's signed push webhook (no token)"},
 	{"/v1/policies", "GET POST", "tool policies"},
 	{"/v1/policies/{id}", "PATCH DELETE", "one policy"},
 	{"/v1/settings", "GET PATCH", "settings (secret values masked)"},

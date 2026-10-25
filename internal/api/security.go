@@ -455,6 +455,10 @@ func (s *Server) HardenAPI(next http.Handler) http.Handler {
 // unbounded data on a small handler.
 func perRouteBodyCap(path string) int64 {
 	switch {
+	case skillWebhookPath(path):
+		return SkillWebhookMaxBytes // 5 MiB: a GitHub push delivery; the handler caps it again
+	case skillAdminPath(path):
+		return skillAdminBodyMax // 64 KiB: a skill source with its excludes and members
 	case path == codeRunPath:
 		return maxCodeRunBody // 4 MiB: a 1 MiB script after JSON escaping, plus the envelope and reason
 	case strings.HasPrefix(path, codePathPrefix):
@@ -531,6 +535,12 @@ func exemptFromCSRFHeader(path string) bool {
 	// or dashboard origin, so the CSRF custom-header check doesn't apply. The
 	// path-token form lives under the /v1/ingest/ subtree.
 	if path == "/v1/ingest" || strings.HasPrefix(path, "/v1/ingest/") {
+		return true
+	}
+	// A skill source's GitHub webhook is authenticated by the
+	// X-Hub-Signature-256 HMAC over its body; the handler reads no cookie,
+	// so it isn't CSRF-replayable. This also lifts the Origin check.
+	if skillWebhookPath(path) {
 		return true
 	}
 	// A connect link's Continue button is a plain browser form: it cannot
@@ -619,6 +629,10 @@ func unauthRouteLimit(path string) *unauthRouteRule {
 		// Memory-webhook ingest (n8n). Same generous per-IP budget; a bad
 		// token still fails auth, this just caps spray on the unauth surface.
 		return &unauthRouteRule{"mem-ingest", 1200, time.Hour}
+	case skillWebhookPath(path):
+		// Skill source webhooks from GitHub. A bad signature still fails;
+		// this caps spray on the unauthenticated surface.
+		return &unauthRouteRule{"skill-webhook", 1200, time.Hour}
 	case strings.HasPrefix(path, MemoryWebhookJobsPrefix):
 		// Async job-status polling (TEC-482). Higher budget than ingest so
 		// once-per-second polling of an in-flight job is comfortable, while

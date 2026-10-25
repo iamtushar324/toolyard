@@ -83,6 +83,7 @@ import (
 	"github.com/tusharbhardwaj/toolyard/internal/sealbox"
 	"github.com/tusharbhardwaj/toolyard/internal/secrets"
 	"github.com/tusharbhardwaj/toolyard/internal/settings"
+	"github.com/tusharbhardwaj/toolyard/internal/skillhub"
 	skillspkg "github.com/tusharbhardwaj/toolyard/internal/skills"
 	"github.com/tusharbhardwaj/toolyard/internal/store"
 	"github.com/tusharbhardwaj/toolyard/internal/upstreams"
@@ -1417,6 +1418,42 @@ func runServe(argv []string) error {
 		log.Printf("mcp-oauth: authorization server on (issuer %s, resource %s)", mcpAuthSvc.Issuer(), mcpAuthSvc.Resource())
 	}
 
+	// skillhub (slice C): the skills hub admin surface: the admin REST
+	// routes and the dashboard Skills page (api), one Inbox review item per
+	// staged version of a review-mode source (skillhub.ReviewInbox, the
+	// hub's ReviewHook), and agents' source proposals
+	// (skillhub.SourceProposals). skillHubAdmin is the hub's admin service:
+	// set it to slice A's *skillhub.Service (a nil interface while the hub
+	// is off, never a typed nil pointer). While it is nil the admin routes
+	// answer 404 "skills hub is off" and no review or proposal handler is
+	// registered. skillHubProposals is what the agent surface (slice B)
+	// passes on for skills.propose_source and skills.propose_change.
+	var (
+		skillHubAdmin     skillhub.Admin
+		skillHubReviews   api.SkillReviewSettler
+		skillHubProposals skillhub.Proposals
+	)
+	if skillHubAdmin != nil {
+		skillHubIsAdmin := func(ctx context.Context, uid string) bool {
+			u, err := idSvc.GetUserByID(ctx, uid)
+			return err == nil && u.Status == identity.StatusActive && u.Role == identity.RoleAdmin
+		}
+		reviews, err := skillhub.NewReviewInbox(skillhub.ReviewOptions{DB: db, Inbox: inboxSvc, Admin: skillHubAdmin,
+			IsAdmin: skillHubIsAdmin, DashboardURL: *publicURL, Audit: auditSvc})
+		if err != nil {
+			return fmt.Errorf("skills hub reviews: %w", err)
+		}
+		skillHubAdmin.SetReviewHook(reviews)
+		skillHubReviews = reviews
+		proposals, err := skillhub.NewSourceProposals(skillhub.ProposalOptions{DB: db, Inbox: inboxSvc, Admin: skillHubAdmin,
+			IsAdmin: skillHubIsAdmin, AgentName: agentName, Audit: auditSvc})
+		if err != nil {
+			return fmt.Errorf("skills hub proposals: %w", err)
+		}
+		skillHubProposals = proposals
+	}
+	_ = skillHubProposals // the agent surface (slice B) takes it
+
 	// REST API + dashboard.
 	apiSrv := api.New(ctx, api.Options{
 		Federation: federationSvc, Callbacks: callbackSvc,
@@ -1462,6 +1499,8 @@ func runServe(argv []string) error {
 		ConnectAZP:      connectOrigins,
 		CodeRuns:        codeRuns,
 		Jobs:            jobsSvc,
+		SkillsAdmin:     skillHubAdmin,   // skillhub (slice C)
+		SkillReviews:    skillHubReviews, // skillhub (slice C)
 	})
 
 	// Rate limits and the connect-t3 lock hold across replicas.
@@ -1580,6 +1619,9 @@ func runServe(argv []string) error {
 		// Native Inbox uploads (PUT /v1/uploads/{ticket}) carry up to a
 		// 50 MB video; the handler caps each body at its ticket's size.
 		"/v1/uploads/": inbox.MaxVideoBytes,
+		// skillhub (slice C): a skill source's GitHub webhook takes up to
+		// 5 MiB; HardenAPI keeps the other routes here at 64 KiB.
+		"/v1/skills/sources/": api.SkillWebhookMaxBytes,
 	})
 	handler = apiSrv.HardenAPI(handler)
 	handler = apiSrv.EnforceOriginOnMutations(handler)
@@ -2066,6 +2108,7 @@ func staticHandler() http.Handler {
 	cssHash := assetHash(sub, "style.css")
 	settingsHash := assetHash(sub, "settings.js")
 	appsHash := assetHash(sub, "apps.js")
+	skillsHash := assetHash(sub, "skills.js") // skillhub (slice C)
 	workspaceHash := assetHash(sub, "workspace.css")
 	swHash := assetHash(sub, "sw.js")
 	loginHash := assetHash(sub, "login.js")
@@ -2074,6 +2117,7 @@ func staticHandler() http.Handler {
 		out = strings.ReplaceAll(out, `href="/style.css"`, `href="/style.css?v=`+cssHash+`"`)
 		out = strings.ReplaceAll(out, `src="/settings.js"`, `src="/settings.js?v=`+settingsHash+`"`)
 		out = strings.ReplaceAll(out, `src="/apps.js"`, `src="/apps.js?v=`+appsHash+`"`)
+		out = strings.ReplaceAll(out, `src="/skills.js"`, `src="/skills.js?v=`+skillsHash+`"`) // skillhub (slice C)
 		out = strings.ReplaceAll(out, `href="/workspace.css"`, `href="/workspace.css?v=`+workspaceHash+`"`)
 		return []byte(out)
 	}
