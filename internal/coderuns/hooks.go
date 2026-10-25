@@ -265,6 +265,15 @@ func (h *hooks) decide(c *codemode.PendingCall, hash string, sc *seenCall) (res 
 			}
 			return nil, true, nil
 		}
+		if rec.errorKind == codemode.ErrorGrantInvalid {
+			// The gateway refused the call's grant before it ran: like a
+			// hold, it goes again with a grant of this request that covers
+			// it, and else the script gets the same refusal.
+			if tok := h.takeGrant(c); tok != "" {
+				setArg(c, grantArg, tok)
+				return nil, true, nil
+			}
+		}
 		// The gateway answered it with an error, and an upstream error may
 		// come after a write took effect: the script gets the same failure
 		// again, never a second attempt.

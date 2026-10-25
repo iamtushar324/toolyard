@@ -257,6 +257,13 @@ func (s *Server) codeRunsItem(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx := actor.WithRaiser(r.Context(), s.codeRaiser(r, ag, sessionID, viaSession, clientKindCLI, codemode.Via))
 	run, err := s.codeRuns.Resume(ctx, coderuns.ResumeRequest{AgentID: ag.ID, SessionID: sessionID, RunID: id, RequestID: requestID})
+	if errors.Is(err, coderuns.ErrResumeConflict) && run != nil {
+		writeJSON(w, http.StatusConflict, map[string]any{
+			"error": coderuns.ErrResumeConflict.Error(), "status": run.Status,
+			"hint": "another resume of this run started first, so this one started nothing; read it with GET " + coderuns.RunPath(run.ID) + " and resume it again if it is still held",
+		})
+		return
+	}
 	if errors.Is(err, coderuns.ErrNotHeld) && run != nil {
 		writeJSON(w, http.StatusUnprocessableEntity, map[string]any{
 			"error": coderuns.ErrNotHeld.Error(), "status": run.Status,

@@ -304,7 +304,14 @@ most twice `-codemode-max-per-agent` for one agent and four times
 refused as busy at once. Migration 0052 adds the columns a REST run's call
 records need to answer a resume (whether a call reached the gateway, a
 failed call's error, a held call's text, draft and legacy approval id); it
-only adds columns. Every audit row of
+only adds columns, and migration 0053 adds `code_runs.resume_gen`, which
+lets only one of two concurrent resumes of a run claim it. During a rolling
+update or after a rollback past these migrations, do not let old and new
+nodes resume code runs at the same time: an older node deletes, when a
+resume it runs ends, the call records past the last call it reached, and
+sends a failed or held call again. Drain the old nodes before the new ones
+serve resumes; after a rollback, start held runs again rather than resume
+them. Every audit row of
 a script, the outer call's and each nested call's, carries the run's id in
 `audit_events.run_id`: `GET /v1/audit?run_id=…` and the audit export
 (`run_id` filter and CSV column) show one script's rows. Migration 0050 adds

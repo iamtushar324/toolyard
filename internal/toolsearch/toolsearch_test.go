@@ -465,17 +465,21 @@ func TestRegexWorkIsBoundedBeforeItRuns(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := e.Search(ctx, small, Query{Text: "tool", Caller: "ag_a"}); !errors.As(err, &qe) || !strings.Contains(err.Error(), "already runs 2 searches") {
-		t.Fatalf("a third search of one caller: %v", err)
+	if _, err := e.Search(ctx, small, Query{Mode: ModeRegex, Text: "tool", Caller: "ag_a"}); !errors.As(err, &qe) || !strings.Contains(err.Error(), "already runs 2 searches") {
+		t.Fatalf("a third regex search of one caller: %v", err)
 	}
-	if _, err := e.Search(ctx, small, Query{Text: "tool", Caller: "ag_b"}); err != nil {
+	if _, err := e.Search(ctx, small, Query{Mode: ModeRegex, Text: "tool", Caller: "ag_b"}); err != nil {
 		t.Fatalf("another caller: %v", err)
+	}
+	// Keyword searches are not capped.
+	if _, err := e.Search(ctx, small, Query{Text: "tool", Caller: "ag_a"}); err != nil {
+		t.Fatalf("a keyword search while two regex searches run: %v", err)
 	}
 	// A third search waits for one to finish.
 	e.wait = 5 * time.Second
 	done := make(chan error, 1)
 	go func() {
-		_, err := e.Search(ctx, small, Query{Text: "tool", Caller: "ag_a"})
+		_, err := e.Search(ctx, small, Query{Mode: ModeRegex, Text: "tool", Caller: "ag_a"})
 		done <- err
 	}()
 	time.Sleep(50 * time.Millisecond)

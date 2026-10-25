@@ -169,8 +169,9 @@ compile to at most 5,000 instructions. It is matched against the first
 4 KiB of each text (a name, a description, a parameter's), a pattern whose
 instructions times the bytes of text to scan pass a fixed budget is
 refused before it runs (make it simpler, or use `keyword`), and one regex
-search stops after 250 ms. One agent runs at most 2 searches at once; a
-third waits up to 2 seconds for one of them to finish, then is refused.
+search stops after 250 ms. One agent runs at most 2 regex searches at
+once; a third waits up to 2 seconds for one of them to finish, then is
+refused. Keyword searches are not capped.
 
 ## Limits
 

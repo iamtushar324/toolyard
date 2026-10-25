@@ -539,12 +539,11 @@ func (s *session) perform(pc *preparedCall) (reply parentMsg) {
 		// Checked again here, just before the call goes out: the script
 		// may have stopped on another call (a held or diverged one) while
 		// this one waited for a lane or for its hook.
-		if msg := s.sendRefusal(label); msg != "" {
+		if msg := s.claimSend(st, label); msg != "" {
 			s.finish(st, StatusFailed, &callStop{status: StatusFailed, kind: ErrorTimeout, msg: msg})
 			return parentMsg{Status: StatusFailed, Error: msg}
 		}
 		sent = true
-		s.markSent(st)
 		res, err = s.r.caller.RouteCall(s.ctx, Via, t.Target, pcall.Args)
 		s.mu.Lock()
 		s.running--
@@ -691,33 +690,29 @@ func (s *session) beforeCall(pc *PendingCall) (*mcp.CallToolResult, bool, error)
 	return s.hooks.BeforeCall(s.hookCtx(), pc)
 }
 
-// sendRefusal is why a call must not go to the gateway now ("" when it
-// may): the clock ended, Run sealed the session, or the script stopped on
-// another call.
-func (s *session) sendRefusal(label string) string {
-	if err := s.ctx.Err(); err != nil {
-		return fmt.Sprintf("tool call failed for %s: script stopped: %v", label, err)
-	}
-	s.mu.Lock()
-	sealed, stopped := s.sealed, s.stop != nil
-	s.mu.Unlock()
-	switch {
-	case sealed:
-		return fmt.Sprintf("tool call failed for %s: script stopped: %v", label, context.Canceled)
-	case stopped:
-		return fmt.Sprintf("tool call failed for %s: not sent, because the script already stopped on another call", label)
-	}
-	return ""
-}
-
-func (s *session) markSent(st *callState) {
+// claimSend decides, in one critical section with Run's seal, whether a
+// call may go to the gateway now: it refuses (with the failure text) when
+// the clock ended, Run sealed the session, or the script stopped on
+// another call, and otherwise marks the call sent before it goes, so a
+// seal that comes next records it as sent (outcome_unknown until it is
+// answered), never as a call that did not run.
+func (s *session) claimSend(st *callState, label string) string {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	switch {
+	case s.ctx.Err() != nil:
+		return fmt.Sprintf("tool call failed for %s: script stopped: %v", label, s.ctx.Err())
+	case s.sealed:
+		return fmt.Sprintf("tool call failed for %s: script stopped: %v", label, context.Canceled)
+	case s.stop != nil:
+		return fmt.Sprintf("tool call failed for %s: not sent, because the script already stopped on another call", label)
+	}
 	s.sentCalls++
 	s.running++
 	if st != nil {
 		st.sent = true
 	}
+	return ""
 }
 
 // stopRun records the outcome that ends the script, unless one already

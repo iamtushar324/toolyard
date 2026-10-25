@@ -92,6 +92,9 @@ var (
 	ErrUnavailable = errors.New("code mode is not available on this server")
 	// ErrTooLarge: the script is over MaxScriptBytes.
 	ErrTooLarge = errors.New("the script is over 1 MiB, the code-mode limit")
+	// ErrResumeConflict: another resume of the run claimed it after this
+	// one read it; nothing was started (the run is returned as it is now).
+	ErrResumeConflict = errors.New("resume_conflict")
 )
 
 // InputError is bad input in a start or resume request (400).
@@ -193,6 +196,10 @@ type Service struct {
 	// cluster names this node when replicas share the database
 	// (SetCluster, lease.go); nil is a single node.
 	cluster *cluster.Cluster
+
+	// beforeClaim, when set (tests), runs in Resume after the run was read
+	// and before it is claimed.
+	beforeClaim func()
 }
 
 // New returns a Service over db.
@@ -239,6 +246,8 @@ type Run struct {
 
 	// code is the script; loaded for a resume only.
 	code string
+	// resumeGen counts the resumes that claimed the run (claimResume).
+	resumeGen int64
 }
 
 // Held is the call that held a run.
@@ -611,18 +620,23 @@ func (s *Service) Resume(ctx context.Context, req ResumeRequest) (*Run, error) {
 		return nil, err
 	}
 	runCtx = audit.WithRunID(runCtx, run.ID)
+	if s.beforeClaim != nil {
+		s.beforeClaim()
+	}
 	claimed, err := s.claimResume(ctx, run)
 	if err != nil || !claimed {
 		slot.Release()
 		if err != nil {
 			return nil, err
 		}
-		// Another resume took it first.
+		// Another resume claimed it after this one read the run and its
+		// call records: running with what was read could send calls that
+		// resume already made.
 		cur, lerr := s.loadRun(ctx, req.AgentID, req.RunID, false)
 		if lerr != nil {
 			return nil, lerr
 		}
-		return cur, ErrNotHeld
+		return cur, ErrResumeConflict
 	}
 	s.launch(runCtx, rt, slot, false, run, newHooks(s, run.ID, rs), false)
 	return run, nil

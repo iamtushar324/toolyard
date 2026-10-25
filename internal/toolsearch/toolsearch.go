@@ -113,10 +113,11 @@ const (
 	// indexCacheSize is how many keyword indexes (one per distinct
 	// catalog) the engine keeps.
 	indexCacheSize = 32
-	// MaxSearchesPerCaller caps the searches one caller (Query.Caller) runs
-	// at once. One more waits up to searchWait for one of them to finish
-	// (a script's tools.parallel of a few searches still works), then is
-	// refused.
+	// MaxSearchesPerCaller caps the regex searches one caller
+	// (Query.Caller) runs at once; keyword searches, which the cached index
+	// answers, are not capped. One more waits up to searchWait for one of
+	// them to finish (a script's tools.parallel of a few searches still
+	// works), then is refused.
 	MaxSearchesPerCaller = 2
 	searchWait           = 2 * time.Second
 )
@@ -142,7 +143,7 @@ type Query struct {
 	// Server keeps only the tools of one server ("" keeps all).
 	Server string
 	// Caller names who searches (an agent id), for the per-caller cap on
-	// searches at once; "" is not capped.
+	// regex searches at once; "" is not capped.
 	Caller string
 }
 
@@ -205,13 +206,6 @@ func (e *Engine) SemanticEnabled() bool { return e != nil && e.semantic != nil }
 
 // Search ranks tools for q.
 func (e *Engine) Search(ctx context.Context, tools []Tool, q Query) (*Result, error) {
-	if q.Caller != "" {
-		release, err := e.enter(ctx, q.Caller)
-		if err != nil {
-			return nil, err
-		}
-		defer release()
-	}
 	mode := q.Mode
 	if mode == "" {
 		mode = ModeKeyword
@@ -248,6 +242,15 @@ func (e *Engine) Search(ctx context.Context, tools []Tool, q Query) (*Result, er
 	case text == "":
 		hits = byName(tools)
 	case mode == ModeRegex:
+		if q.Caller != "" {
+			// Only a regex search scans the catalog's text; cap how many one
+			// caller runs at once.
+			release, eerr := e.enter(ctx, q.Caller)
+			if eerr != nil {
+				return nil, eerr
+			}
+			defer release()
+		}
 		hits, err = regexSearch(ctx, tools, q.Text)
 	case mode == ModeSemantic:
 		hits, err = e.semantic.Rank(ctx, tools, text)

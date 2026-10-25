@@ -160,7 +160,8 @@ Every run route answers this JSON:
 
 Other answers: `400` bad input, `401` no or bad token, `403` operator token or a
 session token outside its routes, `404` unknown run (or another agent's run),
-`413` script over 1 MiB, `415` other content types, `422`
+`409 resume_conflict` (another resume of the run claimed it first), `413`
+script over 1 MiB, `415` other content types, `422`
 `idempotency_key_reused` or a resume of a run that is not held (`run_not_held`,
 with the run's `status`), `429` the slot queue is full (with `Retry-After`; no run is
 created), `503` the server is restarting or the token could not be checked
@@ -192,6 +193,10 @@ owner decided.
 - A `permission_required` run needs `request_id` (`400` without it), and the
   request must belong to the agent (`400` otherwise). A call no unused grant
   of the request covers is sent without one, so it is held again (`403`).
+- Two resumes of one run at the same time: only the first to claim the run
+  runs it (each claim counts in `code_runs.resume_gen`). The other starts
+  nothing and answers `409 resume_conflict` with the run's current status;
+  read the run and resume it again if it is still held.
 
 The script runs again from the top, and each call is checked against the
 call record at its number, wherever it sits: with `tools.parallel`, a call

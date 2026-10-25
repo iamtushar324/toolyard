@@ -22,7 +22,7 @@ const (
 // runColumns are the code_runs columns a view needs (not the script).
 const runColumns = `id, agent_id, COALESCE(session_id, ''), COALESCE(idempotency_key, ''), fingerprint, reason, COALESCE(language, 'starlark'), status,
 	COALESCE(result, ''), COALESCE(error_kind, ''), COALESCE(error_message, ''), COALESCE(logs, ''), COALESCE(held, ''),
-	created_at, updated_at, COALESCE(finished_at, 0)`
+	created_at, updated_at, COALESCE(finished_at, 0), resume_gen`
 
 // runWriteTimeout bounds the writes that must not follow the client's
 // connection: a disconnect while one commits would leave a run row with
@@ -76,7 +76,7 @@ func (s *Service) loadRun(ctx context.Context, agentID, id string, withCode bool
 	var r Run
 	var result, logs, held string
 	dest := []any{&r.ID, &r.AgentID, &r.SessionID, &r.IdempotencyKey, &r.Fingerprint, &r.Reason, &r.Language, &r.Status,
-		&result, &r.ErrorKind, &r.ErrorMessage, &logs, &held, &r.CreatedAt, &r.UpdatedAt, &r.FinishedAt}
+		&result, &r.ErrorKind, &r.ErrorMessage, &logs, &held, &r.CreatedAt, &r.UpdatedAt, &r.FinishedAt, &r.resumeGen}
 	if withCode {
 		dest = append(dest, &r.code)
 	}
@@ -145,15 +145,16 @@ func (s *Service) markRunning(ctx context.Context, id string) error {
 	return err
 }
 
-// claimResume moves a held run to running, unless another resume (or
-// anything else) changed its status since r was read.
+// claimResume moves a held run to running, unless another resume claimed
+// it since r was read (resume_gen moved on, even if that resume ended held
+// again with the same status) or anything else changed its status.
 func (s *Service) claimResume(ctx context.Context, r *Run) (bool, error) {
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), runWriteTimeout)
 	defer cancel()
 	now := s.now().UnixMilli()
 	res, err := s.db.ExecContext(ctx, `UPDATE code_runs SET status = ?, error_kind = NULL, error_message = NULL, finished_at = NULL, updated_at = ?,
-		owner_instance = ?, lease_until = `+cluster.LeaseUntilSQL(s.db.Dialect)+`
-		WHERE id = ? AND agent_id = ? AND status = ?`, StatusRunning, now, s.cluster.InstanceID(), r.ID, r.AgentID, r.Status)
+		owner_instance = ?, lease_until = `+cluster.LeaseUntilSQL(s.db.Dialect)+`, resume_gen = resume_gen + 1
+		WHERE id = ? AND agent_id = ? AND status = ? AND resume_gen = ?`, StatusRunning, now, s.cluster.InstanceID(), r.ID, r.AgentID, r.Status, r.resumeGen)
 	if err != nil {
 		return false, err
 	}
@@ -162,7 +163,7 @@ func (s *Service) claimResume(ctx context.Context, r *Run) (bool, error) {
 		return false, err
 	}
 	if n == 1 {
-		r.Status, r.UpdatedAt = StatusRunning, now
+		r.Status, r.UpdatedAt, r.resumeGen = StatusRunning, now, r.resumeGen+1
 	}
 	return n == 1, nil
 }
@@ -193,12 +194,13 @@ func upsertCall(ctx context.Context, q store.Querier, runID string, c Call) erro
 			status = excluded.status, replayed = excluded.replayed, replay_text = excluded.replay_text,
 			started_at = excluded.started_at, finished_at = excluded.finished_at, sent = excluded.sent,
 			error_kind = excluded.error_kind, error_text = excluded.error_text, approval_id = excluded.approval_id, hold_content = excluded.hold_content
-		WHERE excluded.sent = 1 OR code_run_calls.status NOT IN (?, ?)`,
-		runID, c.Seq, c.Tool, c.Target, c.ArgsHash, c.Status, replayed, text, c.StartedAt, nullInt(c.FinishedAt),
-		sent, nullStr(c.errorKind), nullStr(c.errorText), nullStr(c.approvalID), nullStr(c.hold),
+		WHERE excluded.sent = 1 OR code_run_calls.sent = 0`,
 		// A call that never reached the gateway (refused by its check, or
-		// stopped first) never replaces the record of a call that ran.
-		codemode.StatusSucceeded, codemode.StatusOutcomeUnknown)
+		// stopped first) never replaces the record of one that did: not a
+		// succeeded or unknown one, and not a held one's approval id and
+		// draft, nor a failed one's error, which a resume answers from.
+		runID, c.Seq, c.Tool, c.Target, c.ArgsHash, c.Status, replayed, text, c.StartedAt, nullInt(c.FinishedAt),
+		sent, nullStr(c.errorKind), nullStr(c.errorText), nullStr(c.approvalID), nullStr(c.hold))
 	return err
 }
 

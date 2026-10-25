@@ -22,6 +22,13 @@
 -- leaves its record in place (nothing deletes records past the calls it
 -- made), so the highest seq of a run is the highest call it ever reached.
 --
+-- Rolling update or rollback: a binary older than this migration still
+-- deletes, when a resume it runs ends, the records past the last call it
+-- reached (which lowers the run's mark), and it sends a failed or held
+-- call again on a resume. Do not let old and new nodes resume code runs at
+-- the same time: drain the old nodes before the new ones serve resumes,
+-- and after a rollback start held runs again rather than resume them.
+--
 -- Same change as migrations/sqlite/0052_code_run_calls_outcome.sql.
 ALTER TABLE code_run_calls ADD COLUMN IF NOT EXISTS sent BIGINT NOT NULL DEFAULT 1;
 ALTER TABLE code_run_calls ADD COLUMN IF NOT EXISTS error_kind TEXT;
