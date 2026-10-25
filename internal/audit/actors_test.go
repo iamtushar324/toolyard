@@ -50,6 +50,7 @@ func TestAuditWriteRoundTripsEveryColumn(t *testing.T) {
 		Arguments:     json.RawMessage(`{"title":"x"}`),
 		ResultSummary: "ok",
 		ApprovalID:    "ap_1",
+		OAuthClientID: "mcpc_1",
 		Raiser:        fullRaiser,
 	}
 	in.SetDecider(fullDecider)
@@ -232,7 +233,7 @@ func TestAuditQueryActorFilters(t *testing.T) {
 	write(a)
 	write(Event{EventType: EventCallAllowed, ApprovalID: "ap_b",
 		Raiser: actor.Raiser{OwnerUserID: "u_2", AgentSessionID: "ses_2", ClientKind: "cli"}})
-	write(Event{EventType: EventCallDenied,
+	write(Event{EventType: EventCallDenied, OAuthClientID: "mcpc_app",
 		Raiser: actor.Raiser{OwnerUserID: "u_1", AgentSessionID: "ses_1", ClientKind: "t3"}})
 
 	cases := []struct {
@@ -245,6 +246,7 @@ func TestAuditQueryActorFilters(t *testing.T) {
 		{"session", Filter{AgentSessionID: "ses_2"}, 1},
 		{"approval", Filter{ApprovalID: "ap_a"}, 1},
 		{"client_kind", Filter{ClientKind: "t3"}, 2},
+		{"oauth_client_id", Filter{OAuthClientID: "mcpc_app"}, 1},
 		{"combined", Filter{OwnerUserID: "u_1", EventType: EventCallDenied}, 1},
 		{"no match", Filter{OwnerUserID: "u_none"}, 0},
 	}

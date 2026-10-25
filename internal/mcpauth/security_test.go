@@ -20,6 +20,8 @@ import (
 	"time"
 
 	"github.com/tusharbhardwaj/toolyard/internal/access"
+	"github.com/tusharbhardwaj/toolyard/internal/actor"
+	"github.com/tusharbhardwaj/toolyard/internal/audit"
 	"github.com/tusharbhardwaj/toolyard/internal/identity"
 )
 
@@ -978,5 +980,132 @@ func TestGrantLocksComeFirst(t *testing.T) {
 	close(errs)
 	for err := range errs {
 		t.Errorf("racing refresh and consent: %v", err)
+	}
+}
+
+// TestReusedCodeRevokesTheGrant: a code that produced tokens and comes
+// back ends the grant, as a reused refresh token does: the app shows
+// revoked, its agent is disabled, OnRevoke runs, and the audit row names
+// the agent. A code that a newer consent used up before it produced
+// tokens is only refused, so a stale tab cannot sign the app out.
+func TestReusedCodeRevokesTheGrant(t *testing.T) {
+	f := newFixture(t)
+	var revoked []string
+	var mu sync.Mutex
+	f.svc = New(Options{DB: f.db, PublicURL: testPublic, Settings: f.settings, Now: func() time.Time { return f.clock },
+		OnRevoke: func(_ context.Context, agentID string) { mu.Lock(); revoked = append(revoked, agentID); mu.Unlock() }})
+	redirect := "https://client.example/cb"
+	c := f.register(t, "none", redirect)
+	ca := ClientAuth{ClientID: c.ClientID}
+	ctx := context.Background()
+	consent := Consent{Nickname: "Replayed"}
+
+	staleVerifier, staleChallenge := pkcePair(t)
+	stale := f.approve(t, f.user, c.ClientID, redirect, staleChallenge, consent)
+	verifier, challenge := pkcePair(t)
+	code := f.approve(t, f.user, c.ClientID, redirect, challenge, consent)
+	tok, oerr := f.svc.Exchange(ctx, codeForm(code, redirect, verifier), ca)
+	if oerr != nil {
+		t.Fatal(oerr)
+	}
+	_, oerr = f.svc.Exchange(ctx, codeForm(stale, redirect, staleVerifier), ca)
+	wantOAuthErr(t, oerr, "invalid_grant")
+	ag, err := f.svc.VerifyAccessToken(ctx, tok.AccessToken)
+	if err != nil {
+		t.Fatalf("a code that an older consent left behind signed the app out: %v", err)
+	}
+
+	_, oerr = f.svc.Exchange(ctx, codeForm(code, redirect, verifier), ca)
+	wantOAuthErr(t, oerr, "invalid_grant")
+	if _, err := f.svc.VerifyAccessToken(ctx, tok.AccessToken); err == nil {
+		t.Fatal("a token from a replayed code still works")
+	}
+	app, err := f.svc.AppByAgent(ctx, ag.ID)
+	if err != nil || app.Status != "revoked" || app.RevokedReason != "code_reused" {
+		t.Fatalf("app after a replayed code: %+v %v", app, err)
+	}
+	var disabled int
+	if err := f.db.QueryRow(`SELECT disabled FROM agents WHERE id = ?`, ag.ID).Scan(&disabled); err != nil || disabled != 1 {
+		t.Fatalf("agent after a replayed code: disabled=%d %v", disabled, err)
+	}
+	mu.Lock()
+	got := append([]string(nil), revoked...)
+	mu.Unlock()
+	if len(got) != 1 || got[0] != ag.ID {
+		t.Fatalf("OnRevoke after a replayed code: %v, want [%s]", got, ag.ID)
+	}
+	var agentOnRow, nameOnRow, ownerOnRow string
+	if err := f.db.QueryRow(`SELECT COALESCE(agent_id, ''), COALESCE(agent_name, ''), COALESCE(owner_user_id, '') FROM audit_events WHERE event_type = 'mcp_oauth.code_reused'`).
+		Scan(&agentOnRow, &nameOnRow, &ownerOnRow); err != nil || agentOnRow != ag.ID || nameOnRow != "Replayed" || ownerOnRow != f.user.ID {
+		t.Fatalf("code_reused row: agent %q name %q owner %q %v", agentOnRow, nameOnRow, ownerOnRow, err)
+	}
+
+	// The client's own revocation names the agent too.
+	verifier, challenge = pkcePair(t)
+	code = f.approve(t, f.user, c.ClientID, redirect, challenge, consent)
+	if tok, oerr = f.svc.Exchange(ctx, codeForm(code, redirect, verifier), ca); oerr != nil {
+		t.Fatal(oerr)
+	}
+	if oerr = f.svc.Revoke(ctx, tok.RefreshToken, ca); oerr != nil {
+		t.Fatal(oerr)
+	}
+	var n int
+	if err := f.db.QueryRow(`SELECT COUNT(*) FROM audit_events WHERE event_type = 'mcp_oauth.revoked' AND agent_id = ? AND owner_user_id = ?`, ag.ID, f.user.ID).
+		Scan(&n); err != nil || n != 1 {
+		t.Fatalf("revoked-by-client rows naming the agent: %d %v", n, err)
+	}
+}
+
+// TestAuditLoggerPutsTheClientOnAppRows: the audit logger looks up the
+// OAuth client of an app's agent, so the live feed's copy carries it too,
+// the trigger fills it for a writer that does not name the kind, and the
+// filter finds both.
+func TestAuditLoggerPutsTheClientOnAppRows(t *testing.T) {
+	f := newFixture(t)
+	redirect := "https://client.example/cb"
+	c := f.register(t, "none", redirect)
+	ctx := context.Background()
+	verifier, challenge := pkcePair(t)
+	code := f.approve(t, f.user, c.ClientID, redirect, challenge, Consent{Nickname: "Logged"})
+	tok, oerr := f.svc.Exchange(ctx, codeForm(code, redirect, verifier), ClientAuth{ClientID: c.ClientID})
+	if oerr != nil {
+		t.Fatal(oerr)
+	}
+	ag, err := f.svc.VerifyAccessToken(ctx, tok.AccessToken)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lg := audit.New(f.db)
+	feed, stop := lg.Subscribe()
+	defer stop()
+	if err := lg.Write(ctx, audit.Event{EventType: audit.EventCallSucceeded, Raiser: actor.Raiser{CallerID: ag.ID, AgentKind: ag.Kind}}); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case live := <-feed:
+		if live.OAuthClientID != c.ClientID {
+			t.Fatalf("live copy client id %q, want %q", live.OAuthClientID, c.ClientID)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("no live copy")
+	}
+	if err := lg.Write(ctx, audit.Event{EventType: audit.EventCallStart, AgentID: ag.ID}); err != nil {
+		t.Fatal(err)
+	}
+	rows, err := lg.Query(ctx, audit.Filter{OAuthClientID: c.ClientID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var calls int
+	for _, row := range rows {
+		if row.OAuthClientID != c.ClientID {
+			t.Fatalf("row %s client id %q", row.EventType, row.OAuthClientID)
+		}
+		if strings.HasPrefix(row.EventType, "call.") {
+			calls++
+		}
+	}
+	if calls != 2 {
+		t.Fatalf("call rows of the client: %d, want 2 (%+v)", calls, rows)
 	}
 }

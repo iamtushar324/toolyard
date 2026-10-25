@@ -1584,10 +1584,14 @@ function viewAgents() {
             el('th', {}, 'Name'), el('th', {}, 'Owner'), el('th', {}, 'ID'), el('th', {}, 'Last seen'), el('th', {}, 'Status'), el('th', {}, ''))),
             // kind "identity" is the person's Beknown key: the generic
             // rotate/disable/delete routes refuse it (409 identity_agent),
-            // so it gets no buttons, only a pointer to the key card.
+            // so it gets no buttons, only a pointer to the key card. Kind
+            // "oauth_client" is a connected app's agent: it signs in with
+            // OAuth (rotate refuses it, 409 oauth_agent) and is managed on
+            // the Connected apps page.
             el('tbody', {}, state.agents.map((a) => el('tr', { style: a.disabled ? 'opacity: 0.6;' : '' },
               el('td', {}, a.name,
-                a.kind === 'identity' ? el('span', { class: 'badge identity inline-badge' }, 'Beknown key') : null),
+                a.kind === 'identity' ? el('span', { class: 'badge identity inline-badge' }, 'Beknown key') : null,
+                a.kind === 'oauth_client' ? el('span', { class: 'badge inline-badge' }, 'Connected app') : null),
               el('td', {}, a.owner_display_name || a.owner_email || a.owner,
                 a.owner_email ? el('div', { class: 'meta' }, a.owner_email) : null),
               el('td', {}, el('code', {}, a.id)),
@@ -1599,6 +1603,8 @@ function viewAgents() {
                 ? el('span', { class: 'meta' }, 'Managed by BKT3. Use host access controls above.')
                 : a.kind === 'identity'
                 ? el('span', { class: 'meta' }, 'Managed on the Beknown key card above')
+                : a.kind === 'oauth_client'
+                ? el('span', { class: 'meta' }, 'Managed on the Connected apps page')
                 : el('div', { class: 'row' },
                     el('button', { on: { click: () => rotateAgent(a) } }, 'Rotate'),
                     a.disabled
