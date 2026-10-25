@@ -415,7 +415,7 @@ func (h *jsHost) outcome(ctx context.Context, runErr error, stderr, stopNote str
 	case runErr != nil:
 		return scriptResult{errKind: "runtime", errMsg: "the JavaScript engine stopped: " + firstLine(runErr.Error())}
 	}
-	return scriptResult{errKind: "runtime", errMsg: "the script ended without finishing: its top-level promise never settled, because it awaited a promise nothing resolves (tool calls always settle; code mode has no setTimeout)"}
+	return scriptResult{errKind: "runtime", errMsg: "the script ended without finishing: its top-level promise never settled, because it awaited a promise nothing resolves (tool calls always settle; code mode has no global setTimeout)"}
 }
 
 // jsStdin is the prelude's stdin: the boot line, then the answers.
