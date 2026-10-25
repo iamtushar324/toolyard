@@ -185,7 +185,10 @@ sweep settles both, every minute on one replica (the `skills-inbox-sweep`
 leader loop): it applies a recorded decision that was not applied yet,
 closes the proposals and reviews whose items expired or were withdrawn,
 and closes an open review whose version no longer waits. An agent's next
-proposal and its `skills.proposal` poll settle its own proposals too.
+proposal and its `skills.proposal` poll settle its own proposals too. A
+version that still waits after its question expired (7 days) gets a new
+question at the source's next check; while a question is open, or its
+answer is being applied, the checks add nothing.
 
 ## For agents
 

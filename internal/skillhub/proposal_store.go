@@ -200,3 +200,18 @@ func (st proposalStore) pendingRows(ctx context.Context, kind, agentID string, l
 	}
 	return out, rows.Err()
 }
+
+// openReviewFor reports whether a version already has a review row that is
+// waiting (pending) or being applied (approved).
+func (st proposalStore) openReviewFor(ctx context.Context, sourceID, versionID string) (bool, error) {
+	var n int
+	err := st.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM skill_proposals WHERE kind = ? AND source_id = ? AND version_id = ? AND status IN (?, ?)`,
+		proposalKindReview, sourceID, versionID, proposalPending, proposalApproved).Scan(&n)
+	return n > 0, err
+}
+
+// remove deletes a row (one whose Inbox item was never created).
+func (st proposalStore) remove(ctx context.Context, id string) error {
+	_, err := st.db.ExecContext(ctx, `DELETE FROM skill_proposals WHERE id = ?`, id)
+	return err
+}

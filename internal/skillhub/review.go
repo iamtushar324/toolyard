@@ -96,8 +96,13 @@ type reviewInput struct {
 // PendingVersion puts one review item for v in the Inbox of src's creator,
 // or of the fallback reviewer when the creator can no longer decide it.
 // An open item for an older staged version of the same source is
-// cancelled first: only the newest commit waits for review. A second call
-// for the same version adds nothing.
+// cancelled first: only the newest commit waits for review.
+//
+// The sync engine calls it again at every check while v waits, so it is
+// idempotent: a version whose question is open (or whose answer is being
+// applied) adds nothing. A version whose earlier question expired, or whose
+// answer could not be applied, gets a new question; a call whose Inbox item
+// could not be created leaves no row, so the next check simply tries again.
 func (ri *ReviewInbox) PendingVersion(ctx context.Context, src Source, v Version) error {
 	reviewer := ri.reviewer(ctx, src.CreatedBy)
 	if reviewer == "" {
@@ -106,14 +111,12 @@ func (ri *ReviewInbox) PendingVersion(ctx context.Context, src Source, v Version
 	if v.ID == "" || v.SHA == "" {
 		return fmt.Errorf("%w: the version has no ID or commit", ErrInvalid)
 	}
+	if asked, err := ri.store.openReviewFor(ctx, src.ID, v.ID); err != nil || asked {
+		return err
+	}
 	open, err := ri.store.pendingReviews(ctx, src.ID, "")
 	if err != nil {
 		return err
-	}
-	for _, row := range open {
-		if row.VersionID == v.ID {
-			return nil
-		}
 	}
 	if err := ri.settleRows(ctx, open, "a newer commit is waiting for review"); err != nil {
 		return err
@@ -141,7 +144,9 @@ func (ri *ReviewInbox) PendingVersion(ctx context.Context, src Source, v Version
 		Questions: reviewQuestion("Make this version live?", "Approve: make it live", "Reject: keep the current version"),
 	})
 	if err != nil {
-		_, _ = ri.store.move(ctx, row.ID, []string{proposalPending}, proposalFailed, proposalUpdate{Error: reviewClip(err.Error(), 500)})
+		// No row without an item: the next check calls again, and failed
+		// attempts do not pile up.
+		_ = ri.store.remove(ctx, row.ID)
 		return fmt.Errorf("skillhub: review item for %s: %w", src.Slug, err)
 	}
 	return ri.store.setInbox(ctx, row.ID, item.ID)

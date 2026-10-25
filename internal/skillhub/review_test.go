@@ -444,3 +444,73 @@ func TestReviewTextHasNoLineBreaks(t *testing.T) {
 		}
 	}
 }
+
+// TestReviewHookIsIdempotent: the sync engine calls PendingVersion again at
+// every check while a version waits. An open question, or an answer being
+// applied, adds nothing; an expired question is asked again; a failed
+// Inbox create leaves no row behind.
+func TestReviewHookIsIdempotent(t *testing.T) {
+	e, ri := newReviewTest(t)
+	ctx := context.Background()
+	count := func(versionID string) int {
+		t.Helper()
+		var n int
+		if err := e.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM skill_proposals WHERE kind = ? AND version_id = ?`, proposalKindReview, versionID).Scan(&n); err != nil {
+			t.Fatal(err)
+		}
+		return n
+	}
+	for i := 0; i < 3; i++ {
+		if err := reviewStage(ctx, e, ri, "skv_1", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if n := count("skv_1"); n != 1 {
+		t.Fatalf("three calls made %d questions", n)
+	}
+	// An answer being applied (approved, not done yet) holds too.
+	row := &proposalRow{ID: proposalNewID(), Kind: proposalKindReview, Status: proposalApproved, UserID: "u_owner", SourceID: "src_aaaa", VersionID: "skv_2"}
+	if err := ri.store.insert(ctx, row); err != nil {
+		t.Fatal(err)
+	}
+	if err := reviewStage(ctx, e, ri, "skv_2", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"); err != nil {
+		t.Fatal(err)
+	}
+	if n := count("skv_2"); n != 1 {
+		t.Fatalf("a question was raised while an answer is applied: %d rows", n)
+	}
+	// An expired question is asked again at the next check.
+	if err := reviewStage(ctx, e, ri, "skv_3", "cccccccccccccccccccccccccccccccccccccccc"); err != nil {
+		t.Fatal(err)
+	}
+	e.advance(inbox.SystemItemTTL + time.Minute)
+	if err := ri.Sweep(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := reviewStage(ctx, e, ri, "skv_3", "cccccccccccccccccccccccccccccccccccccccc"); err != nil {
+		t.Fatal(err)
+	}
+	var pending int
+	_ = e.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM skill_proposals WHERE version_id = ? AND status = ?`, "skv_3", proposalPending).Scan(&pending)
+	if n := count("skv_3"); n != 2 || pending != 1 {
+		t.Fatalf("after expiry: %d rows, %d pending", n, pending)
+	}
+	// An Inbox that refuses the item: no row is left, the call fails, and
+	// the next call tries again.
+	off, err := inbox.New(ctx, inbox.Options{DB: e.db, Now: e.clock, RichEnabled: func() bool { return false }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(off.Flush)
+	riOff, err := NewReviewInbox(ReviewOptions{DB: e.db, Inbox: off, Admin: e.admin, IsAdmin: e.isAdmin, Now: e.clock})
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.admin.setPending("src_aaaa", "skv_4")
+	if err := riOff.PendingVersion(ctx, reviewTestSource(), reviewTestVersion("skv_4", "dddddddddddddddddddddddddddddddddddddddd")); err == nil {
+		t.Fatal("a refused Inbox item must fail the call")
+	}
+	if n := count("skv_4"); n != 0 {
+		t.Fatalf("a failed create left %d rows", n)
+	}
+}
