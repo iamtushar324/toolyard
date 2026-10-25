@@ -46,10 +46,12 @@ import (
 	"github.com/tusharbhardwaj/toolyard/internal/audit"
 	"github.com/tusharbhardwaj/toolyard/internal/auditlink"
 	"github.com/tusharbhardwaj/toolyard/internal/autoapproval"
+	"github.com/tusharbhardwaj/toolyard/internal/blobstore"
 	"github.com/tusharbhardwaj/toolyard/internal/callbacks"
 	"github.com/tusharbhardwaj/toolyard/internal/chatnotify"
 	"github.com/tusharbhardwaj/toolyard/internal/chatnotify/telegram"
 	"github.com/tusharbhardwaj/toolyard/internal/clerk"
+	"github.com/tusharbhardwaj/toolyard/internal/cluster"
 	"github.com/tusharbhardwaj/toolyard/internal/codemode"
 	"github.com/tusharbhardwaj/toolyard/internal/coderuns"
 	"github.com/tusharbhardwaj/toolyard/internal/crashdump"
@@ -61,8 +63,10 @@ import (
 	"github.com/tusharbhardwaj/toolyard/internal/identity"
 	"github.com/tusharbhardwaj/toolyard/internal/identitykeys"
 	"github.com/tusharbhardwaj/toolyard/internal/inbox"
+	"github.com/tusharbhardwaj/toolyard/internal/jobs"
 	"github.com/tusharbhardwaj/toolyard/internal/keyguard"
 	"github.com/tusharbhardwaj/toolyard/internal/logx"
+	"github.com/tusharbhardwaj/toolyard/internal/mcpauth"
 	"github.com/tusharbhardwaj/toolyard/internal/memory"
 	"github.com/tusharbhardwaj/toolyard/internal/mempalace"
 	"github.com/tusharbhardwaj/toolyard/internal/memwebhook"
@@ -314,6 +318,9 @@ func runServe(argv []string) error {
 	// set exits on an unknown flag. toolyard no longer runs a ClickHouse lake.
 	clickhouseRuntimeEnvPath := fs.String("clickhouse-runtime-env", "", "DEPRECATED: ignored. Kept so existing service units keep starting.")
 	inboxResetPasskeys := fs.Bool("inbox-reset-passkeys", false, "delete every registered passkey at startup (recovery when the owner has lost all their devices), then continue normally")
+	codemodeMaxConcurrent := fs.Int("codemode-max-concurrent", 4, "code mode: the most scripts (executeToolCode and POST /v1/code/run) running at once on this gateway; each runs in its own worker process under the worker memory cap (256 MiB)")
+	codemodeMaxPerAgent := fs.Int("codemode-max-per-agent", 3, "code mode: the most scripts one agent runs at once")
+	codemodeQueueWait := fs.Duration("codemode-queue-wait", 30*time.Second, "code mode: how long a script past -codemode-max-concurrent or -codemode-max-per-agent waits in the fair queue for a slot before it is refused as busy (HTTP 429 over REST)")
 	inboxFetchPrivate := fs.Bool("inbox-fetch-private-networks", false, "let the inbox copy attachment links that point at loopback or private-network addresses (e.g. evidence hosted on your LAN). Off by default: agent-chosen URLs could otherwise reach internal services.")
 	requireAuthMCP := fs.Bool("require-auth-on-mcp", false, "reject anonymous /mcp calls (no Authorization header). Auto-enabled when -public-url is set.")
 	upstreamProtocolFlag := fs.String("upstream-protocol", upstreamProtocolLegacy, "MCP version toward upstream servers: legacy (2025-11-25 for every upstream) | auto (a shared http upstream that offers 2026-07-28 is called statelessly, one POST per call, outside the live pool and the idle sweep; stdio and per_user stay legacy)")
@@ -321,6 +328,7 @@ func runServe(argv []string) error {
 	noStdioUpstreams := fs.Bool("no-stdio-upstreams", false, "refuse to start any stdio (subprocess) MCP upstream. Use when the dashboard is exposed publicly so a compromised session can't spawn arbitrary commands.")
 	envDenylistFlag := fs.String("upstream-env-denylist", "LD_PRELOAD,LD_LIBRARY_PATH,DYLD_INSERT_LIBRARIES,DYLD_LIBRARY_PATH,PATH", "comma-separated env var keys forbidden in upstream stdio configs")
 	upstreamCallTimeout := fs.Duration("upstream-call-timeout", 120*time.Second, "per-tool-call deadline applied to every dispatch (built-in, fixture, and external upstreams). 0 disables the cap. Without it, a hung upstream pins a goroutine indefinitely and queues every other caller behind it.")
+	asyncJobTimeout := fs.Duration("async-job-timeout", jobs.DefaultMaxDuration, "time limit of one async job (a call to a tool marked async, jobs.start, POST /v1/jobs, an MCP task); it replaces -upstream-call-timeout for that call")
 	// TEC-1626 drain
 	drainDelay := fs.Duration("drain-delay", defaultDrainDelay, "on SIGTERM/SIGINT, how long readiness reports 503 (and new tool calls get a retryable refusal) before streams and waits close, so the load balancer stops sending traffic first")
 	drainTimeout := fs.Duration("drain-timeout", defaultDrainTimeout, "deadline, from the start of the drain (delay included), for open HTTP requests and in-flight executions to finish. Work still running then is cancelled and recorded outcome_unknown. Keep the unit's TimeoutStopSec above this plus ~10s.")
@@ -345,6 +353,9 @@ func runServe(argv []string) error {
 	perUserMaxLive := fs.Int("per-user-max-live", 64, "max simultaneously-live per-person connections to servers where each person signs in (auth_mode per_user). Their own pool: they never evict a shared server and a shared server never evicts them. LRU-suspended past the cap, resumed on next call. 0 = unbounded.")
 	logLevel := fs.String("log-level", "info", "log level: debug | info | warn | error")
 	logFormat := fs.String("log-format", "json", "log format: json | text. Text is friendlier in a terminal; json is what journalctl + jq want.")
+	// TEC-1630 high availability
+	instanceID := fs.String("instance-id", "", "name of this replica in work leases and logs when several replicas share one Postgres database (e.g. the pod name). Every process adds a random suffix of its own: <name>-<8 hex digits>. Empty = the host name.")
+	clusterFlag := fs.String("cluster", string(clusterAuto), "replicas on one database: auto (on for Postgres, off for SQLite) | on (several replicas may share this Postgres database: leader leases, cross-replica messages and locks; refused on SQLite) | off (one gateway per database, also on Postgres: no LISTEN, no periodic recovery, rate limits in process)")
 	_ = fs.Parse(argv)
 
 	// TEC-1638: every flag not given on the command line may come from
@@ -475,31 +486,64 @@ func runServe(argv []string) error {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
+	// TEC-1630: leader leases, cross-node messages and locks. On Postgres
+	// several replicas may share the database; on SQLite this is a
+	// single-node no-op.
+	cmode, err := parseClusterMode(*clusterFlag, db.Dialect)
+	if err != nil {
+		return err
+	}
+	clusterSvc, err := cluster.New(ctx, db, cluster.Options{InstanceID: *instanceID, SingleNode: cmode == clusterOff})
+	if errors.Is(err, cluster.ErrModeConflict) {
+		// -cluster=off next to another gateway, or a replica next to an
+		// off one: a restart cannot fix the configuration (exit 78).
+		return fmt.Errorf("%w (%w)", err, keyguard.ErrConfig)
+	}
+	if err != nil {
+		return fmt.Errorf("cluster: %w", err)
+	}
+	closeCluster := closeOnce("cluster", closeTimeout, func(context.Context) error { return clusterSvc.Close() })
+	defer closeCluster()
+	if clusterSvc.MultiNode() {
+		log.Printf("toolyard: cluster instance %s (replicas may share this database)", clusterSvc.InstanceID())
+	}
+
 	idSvc := identity.New(db)
 	auditSvc := audit.New(db)
 	memSvc := memory.New(db)
 	// Roles and per-user tool-group grants. The gateway asks it on every
 	// tool list/call; the Users admin API writes through it.
 	accessSvc := access.New(db)
+	// A scope or grant change on one replica drops the cached copy on all.
+	accessSvc.SetCluster(clusterSvc)
 
 	bus, err := approval.New(ctx, db)
 	if err != nil {
 		return err
 	}
 	bus.SetTTL(*approvalTTL)
+	bus.SetCluster(clusterSvc)
 	log.Printf("toolyard: approval TTL %s (in-line wait %s)", bus.TTL(), *inLineWait)
 	// Every approval event (create, decide, expire, cancel, executed)
 	// leaves an audit row naming who raised the call and who decided it,
 	// whichever path the decision took.
 	bus.AddNotifier(auditlink.Notifier(auditSvc))
-	goroutines.Loop(ctx, approval.SweeperLoop, time.Minute, func(ctx context.Context) { bus.RunSweeper(ctx, 30*time.Second) })
+	// The approval sweeper starts once the callbacks event sink is wired
+	// (below, before the Inbox): an expiry it records emits
+	// approval.decided through that sink.
+	// Every replica renews the leases of the legacy executions it runs.
+	goroutines.Loop(ctx, approval.LeaseRenewalLoop, time.Minute, bus.RunLeaseRenewal)
 
 	pushSvc, err := push.New(ctx, db, *pushSubject)
 	if err != nil {
 		return err
 	}
+	// A key rotation on any replica reaches this one.
+	pushSvc.SetCluster(clusterSvc)
 
 	hub := realtime.NewHub()
+	registerRealtimeTypes(hub)
+	hub.SetCluster(ctx, clusterSvc)
 
 	// Hook approval lifecycle -> push + realtime fan-out.
 	bus.AddNotifierFunc(func(ctx context.Context, req *approval.Request, eventType string) {
@@ -538,7 +582,9 @@ func runServe(argv []string) error {
 			_ = pushSvc.Notify(ctx, user.ID, payload)
 		}
 	})
-	// Audit log -> realtime feed.
+	// Audit log -> realtime feed. Every replica runs it: the audit logger
+	// fans out in process, and the hub carries each replica's events to the
+	// others' dashboard streams.
 	goroutines.Loop(ctx, loopAuditFeed, time.Minute, func(ctx context.Context) {
 		ch, unsubscribe := auditSvc.Subscribe()
 		defer unsubscribe()
@@ -559,6 +605,7 @@ func runServe(argv []string) error {
 	if err != nil {
 		return err
 	}
+	settingsSvc.SetCluster(clusterSvc)
 
 	usageSvc := usagepkg.New(db)
 	vis := visibility.New(settingsSvc, usageSvc)
@@ -568,19 +615,23 @@ func runServe(argv []string) error {
 	defer closeMetrics()
 	metricsReader := metrics.NewReader(db)
 	priceCatalog := pricing.New(filepath.Join(*dataDir, "model-prices.json"))
+	// Every replica refreshes its own price catalog: it is held in memory
+	// (and a file in -data) per process, and the refresh only reads a
+	// public price list.
 	goroutines.Loop(ctx, loopPricing, time.Hour, priceCatalog.Run)
 
 	autoApprover := autoapproval.New(db, metricsReader, settingsSvc)
+	autoApprover.SetCluster(clusterSvc)
 	bus.SetAutoApprover(autoApprover)
-	goroutines.Loop(ctx, loopAutoApproval, time.Hour, func(ctx context.Context) { autoApprover.RunProposer(ctx, time.Hour) })
+	leaderLoop(ctx, clusterSvc, loopAutoApproval, time.Hour, func(ctx context.Context) { autoApprover.RunProposer(ctx, time.Hour) })
 
 	// Background analytics jobs: anomaly detection, reason quality
 	// scoring, retention compaction. All best-effort — failures log and
 	// continue.
 	zScore := settingsSvc.GetFloat(settings.AnomalyRateZScore, 3)
-	goroutines.Loop(ctx, loopAnomaly, time.Hour, metrics.NewAnomalyDetector(metricsReader, zScore).RunForever)
-	goroutines.Loop(ctx, loopReasonScorer, time.Hour, func(ctx context.Context) { runReasonScorer(ctx, metricsReader) })
-	goroutines.Loop(ctx, loopRetention, time.Hour, func(ctx context.Context) { runRetentionCompactor(ctx, metricsReader, settingsSvc) })
+	leaderLoop(ctx, clusterSvc, loopAnomaly, time.Hour, metrics.NewAnomalyDetector(metricsReader, zScore).RunForever)
+	leaderLoop(ctx, clusterSvc, loopReasonScorer, time.Hour, func(ctx context.Context) { runReasonScorer(ctx, metricsReader) })
+	leaderLoop(ctx, clusterSvc, loopRetention, time.Hour, func(ctx context.Context) { runRetentionCompactor(ctx, metricsReader, settingsSvc) })
 
 	// Shared policy engine: the gateway evaluates with it, the API exposes
 	// CRUD on the same instance so cache updates are seen immediately.
@@ -590,6 +641,8 @@ func runServe(argv []string) error {
 	if err != nil {
 		return fmt.Errorf("policy: load rules: %w", err)
 	}
+	// A rule written on any replica reaches this one's cache at once.
+	policyEngine.SetCluster(clusterSvc)
 	log.Printf("policy: loaded %d rules", len(policyEngine.List()))
 
 	// TEC-1626: every master key loads here, before anything uses one.
@@ -647,6 +700,31 @@ func runServe(argv []string) error {
 	if err != nil {
 		return fmt.Errorf("TOOLYARD_CODEMODE_SANDBOX: %w", err)
 	}
+	// Async tools (docs/guidelines/async-tools.md): calls to tools an
+	// administrator marked async, jobs.start, POST /v1/jobs and MCP tasks
+	// run as durable jobs. Results over 256 KiB go to the blob store (files
+	// under <data>/job-results on SQLite, chunks in Postgres). The lease
+	// heartbeat and recovery run on every node; the retention purge runs on
+	// the cluster leader (cluster.RunLeader).
+	jobBlobs, err := blobstore.ForDB(db, filepath.Join(*dataDir, "job-results"))
+	if err != nil {
+		return fmt.Errorf("job results: %w", err)
+	}
+	// The jobs' leases carry this replica's cluster instance id and, with
+	// several replicas, are renewed on the cluster's reserved connection;
+	// the retention purge runs on the cluster leader.
+	jobOpts := jobs.Options{
+		Blobs: jobBlobs, MaxDuration: *asyncJobTimeout,
+		InstanceID: clusterSvc.InstanceID(), Leader: clusterSvc,
+	}
+	if clusterSvc.MultiNode() {
+		jobOpts.Reserved = clusterSvc
+	}
+	jobsSvc := jobs.New(db, jobOpts)
+	// jobsSvc.Run starts below, once the gateway has attached the job
+	// auditor and the callbacks notifier: its recovery (one lease after the
+	// start) settles the jobs an earlier process left, and their audit rows
+	// and job.failed callbacks must not be lost.
 	gw := gateway.New(gateway.Options{
 		Name:                "toolyard",
 		Version:             version,
@@ -667,10 +745,13 @@ func runServe(argv []string) error {
 		Owners:              accessSvc,
 		PublicURL:           *publicURL,
 		UpstreamProtocol:    upstreamProtocol,
+		Jobs:                jobsSvc,
 	})
 	// The kernel probe for the code-mode sandbox runs now, off the
 	// request path.
 	gw.SetCodeModeSandbox(sandboxMode)
+	gw.SetCodeModeConcurrency(*codemodeMaxConcurrent, *codemodeMaxPerAgent, *codemodeQueueWait)
+	gw.SetCluster(clusterSvc)
 	goroutines.Go(goCodemodeProbe, func() { codemode.ProbeSandbox() })
 	gw.RegisterBuiltins()
 	closeGateway := closeOnce("gateway", closeTimeout, func(context.Context) error { return gw.Close() })
@@ -752,7 +833,23 @@ func runServe(argv []string) error {
 		}
 		log.Printf("inbox: removed %d passkey(s) (-inbox-reset-passkeys)", n)
 	}
+	// Callbacks are wired before the Inbox and the approval sweeper start
+	// any goroutine: both read their callbacks hook from those goroutines
+	// (Inbox mutations, approval expiry). The secrets cipher (secrets.key,
+	// loaded and checked above) also seals the receivers' secrets.
+	secretsCipher, err := sealbox.NewCipher(masterKeys[keyguard.SecretsKey])
+	if err != nil {
+		return fmt.Errorf("secrets cipher: %w", err)
+	}
+	callbackSvc := callbacks.New(db, secretsCipher)
+	callbackSvc.MaxReceivers = func() int {
+		return settingsSvc.GetInt(settings.CallbackMaxReceivers, callbacks.DefaultMaxReceiversPerAgent)
+	}
+	bus.SetEventSink(callbackSvc)
+	leaderLoop(ctx, clusterSvc, approval.SweeperLoop, time.Minute, func(ctx context.Context) { bus.RunSweeper(ctx, 30*time.Second) })
 	inboxSvc, err := inbox.New(ctx, inbox.Options{
+		Callbacks:         callbackSvc,
+		Cluster:           clusterSvc,
 		LegacyDecided:     bus.DispatchCommitted,
 		Passkeys:          passkeySvc,
 		Voice:             inboxVoice,
@@ -764,6 +861,7 @@ func runServe(argv []string) error {
 		JudgeEnabled:      func() bool { return settingsSvc.GetBool(settings.InboxJudgeEnabled) },
 		Fetcher:           inboxSnaps,
 		SnapshotEnabled:   func() bool { return settingsSvc.GetBoolDefault(settings.InboxSnapshotEnabled, true) },
+		RichEnabled:       func() bool { return settingsSvc.GetBoolDefault(settings.InboxV3Enabled, true) },
 		AllowPrivateMedia: *inboxFetchPrivate,
 		Publish:           func(t string, d any) { hub.Publish(realtime.Event{Type: t, Data: d}) },
 		AgentName:         agentName,
@@ -844,18 +942,39 @@ func runServe(argv []string) error {
 	// on the request path, one pass at a time, signals before the next
 	// pass coalesce, and a pass every LegacySyncInterval regardless.
 	bus.AddNotifierFunc(func(context.Context, *approval.Request, string) {
-		inboxSvc.RequestLegacySync()
+		inboxSvc.RequestClusterLegacySync()
 	})
-	goroutines.Loop(ctx, inbox.LegacySyncLoop, time.Minute, func(ctx context.Context) {
+	leaderLoop(ctx, clusterSvc, inbox.LegacySyncLoop, time.Minute, func(ctx context.Context) {
 		inboxSvc.RunLegacySync(ctx, inbox.LegacySyncInterval)
 	})
+	// Every replica renews the leases of the Inbox executions it runs.
+	goroutines.Loop(ctx, inbox.LeaseRenewalLoop, time.Minute, inboxSvc.RunLeaseRenewal)
+	// Every replica removes its own stale temporary upload files.
+	goroutines.Loop(ctx, inbox.TempCleanupLoop, time.Minute, inboxSvc.RunTempCleanup)
 	closeInbox := closeOnce("inbox", closeTimeout, func(context.Context) error {
 		inboxSvc.Close(closeTimeout * 3 / 4) // logs its own warning first
 		return nil
 	})
 	defer closeInbox()
-	if n := inboxSvc.RecheckUnchecked(ctx); n > 0 {
-		log.Printf("inbox: re-running background checks for %d request(s)", n)
+	// Requests whose background check never finished (a gateway stopped
+	// mid-check) are checked again. With replicas one node at a time runs
+	// the pass, as a leader task, and every check is claimed first
+	// (inbox lockCheck), so the judge and the media fetches are never paid
+	// twice.
+	recheck := func(ctx context.Context) {
+		if n := inboxSvc.RecheckUnchecked(ctx); n > 0 {
+			log.Printf("inbox: re-running background checks for %d request(s)", n)
+		}
+	}
+	if clusterSvc.MultiNode() {
+		goroutines.Go(goInboxRecheck, func() {
+			clusterSvc.RunLeader(ctx, goInboxRecheck, func(lctx context.Context) error {
+				recheck(lctx)
+				return nil
+			})
+		})
+	} else {
+		recheck(ctx)
 	}
 	inboxGuide := inbox.NewGuide(func() string { return settingsSvc.GetString(settings.InboxHostingNote, "") })
 	gw.SetInbox(inboxSvc, inboxGuide, func() string {
@@ -869,14 +988,24 @@ func runServe(argv []string) error {
 	// runs a stopped process left queued or running are settled before the
 	// routes serve (a running one is outcome_unknown: a call may have run).
 	codeRuns := coderuns.New(db, coderuns.Options{Engine: coderuns.GatewayEngine(gw), Grants: inboxSvc})
-	if failed, unknown, err := codeRuns.Recover(ctx); err != nil {
-		log.Printf("code runs: recover: %v", err)
-	} else if failed+unknown > 0 {
-		log.Printf("code runs: %d interrupted run(s) failed, %d marked outcome_unknown", failed, unknown)
+	codeRuns.SetCluster(clusterSvc)
+	// With replicas the leader's work recovery settles runs instead, one
+	// lease after it takes over (runWorkRecovery).
+	if !clusterSvc.MultiNode() {
+		if failed, unknown, err := codeRuns.Recover(ctx); err != nil {
+			log.Printf("code runs: recover: %v", err)
+		} else if failed+unknown > 0 {
+			log.Printf("code runs: %d interrupted run(s) failed, %d marked outcome_unknown", failed, unknown)
+		}
 	}
-	goroutines.Loop(ctx, loopSessionPurger, time.Hour, func(ctx context.Context) { runSessionPurger(ctx, idSvc, codeRuns) })
-
+	leaderLoop(ctx, clusterSvc, loopSessionPurger, time.Hour, func(ctx context.Context) { runSessionPurger(ctx, idSvc, codeRuns) })
+	// Every replica renews the leases of the code runs it runs.
+	goroutines.Loop(ctx, coderuns.LeaseRenewalLoop, time.Minute, codeRuns.RunLeaseRenewal)
 	upstreamSvc := upstreams.New(db, gw)
+	// Servers saved on another replica are connected here too.
+	upstreamSvc.SetCluster(ctx, clusterSvc)
+	// Which servers and tools are async (Edit server, PUT /v1/servers/{name}/async).
+	gw.SetAsyncPolicy(upstreamSvc)
 	upstreamSvc.SetPolicy(upstreams.Policy{
 		AllowStdio:  !*noStdioUpstreams,
 		EnvDenylist: splitCSV(*envDenylistFlag),
@@ -892,7 +1021,10 @@ func runServe(argv []string) error {
 	}))
 	// Fingerprints retired by a rotate or revoke whose registry delete
 	// failed are retried hourly, each as the admin who retired it.
-	identityKeysSvc.StartRemovalRetry(ctx, identitykeys.DefaultRetryInterval)
+	leaderLoop(ctx, clusterSvc, loopKeyRemoval, time.Hour, func(ctx context.Context) {
+		identityKeysSvc.StartRemovalRetry(ctx, identitykeys.DefaultRetryInterval)
+		<-ctx.Done()
+	})
 	if *noStdioUpstreams {
 		log.Printf("toolyard: stdio upstreams disabled (--no-stdio-upstreams)")
 	}
@@ -912,6 +1044,7 @@ func runServe(argv []string) error {
 		pushSvc,
 		identityResolver{id: idSvc},
 	)
+	oauthSvc.SetCluster(clusterSvc)
 	upstreamSvc.SetAuth(oauthSvc)
 	// Per-user sign-in: each person's bearer on their own connection, and
 	// a token the upstream or IdP rejects closes only that person's
@@ -926,27 +1059,33 @@ func runServe(argv []string) error {
 	if err := oauthSvc.PrimeBearers(ctx); err != nil {
 		log.Printf("oauth: prime bearers: %v", err)
 	}
-	goroutines.Loop(ctx, loopOAuthRefresher, time.Minute, oauthSvc.RunRefresher)
+	// One replica refreshes at a time: two would spend the same rotating
+	// refresh token, and the loser's invalid_grant reads as needs_reauth.
+	leaderLoop(ctx, clusterSvc, loopOAuthRefresher, time.Minute, oauthSvc.RunRefresher)
 
 	// Secrets broker. Separate secrets.key (blast-radius partitioning, same
 	// rationale as oauth.key vs session.key). Wired into upstreams so
 	// secret:// refs in env/headers resolve at dial time, never reaching
 	// agents or API responses.
-	secretsKey := masterKeys[keyguard.SecretsKey] // loaded and checked above
-	secretsCipher, err := sealbox.NewCipher(secretsKey)
-	if err != nil {
-		return fmt.Errorf("secrets cipher: %w", err)
-	}
+	// secretsCipher (secrets.key) is built above, with the callbacks.
 	secretsSvc := secrets.New(db, secretsCipher, auditSvc)
-	callbackSvc := callbacks.New(db, secretsCipher)
-	inboxSvc.SetCallbacks(callbackSvc)
-	goroutines.Loop(ctx, inbox.SweeperLoop, time.Minute, func(ctx context.Context) { inboxSvc.RunSweeper(ctx, time.Minute) })
-	goroutines.Loop(ctx, loopInboxAttention, time.Minute, func(ctx context.Context) { inboxSvc.RunAttention(ctx, 15*time.Second) })
+	leaderLoop(ctx, clusterSvc, inbox.SweeperLoop, time.Minute, func(ctx context.Context) { inboxSvc.RunSweeper(ctx, time.Minute) })
+	leaderLoop(ctx, clusterSvc, loopInboxAttention, time.Minute, func(ctx context.Context) { inboxSvc.RunAttention(ctx, 15*time.Second) })
+	// Every replica delivers callbacks: each delivery is claimed with a
+	// database lease first, so no callback is sent twice.
 	goroutines.Loop(ctx, loopCallbacks, time.Minute, callbackSvc.Run)
 	federationSvc, err := federation.New(ctx, db, idSvc, secretsCipher)
 	if err != nil {
 		return fmt.Errorf("federation: %w", err)
 	}
+	federationSvc.SetCluster(clusterSvc)
+	// Webhooks: the callbacks.* tools, and approval.decided /
+	// approval.executed for legacy deferred approvals.
+	gw.RegisterCallbackTools(callbackSvc, federationSvc.PrivateReceiverAllowed)
+	// A finished async job sends job.completed / job.failed to its
+	// _callback_ref, or the agent's default receiver.
+	jobsSvc.SetNotifier(jobs.EmitterNotifier(callbackSvc.EmitForAgentTx))
+	jobsSvc.Run(ctx)
 	upstreamSvc.SetSecrets(secretsSvc)
 
 	// Chat-approval notifications (Telegram). The Registry fans approval-bus
@@ -964,8 +1103,9 @@ func runServe(argv []string) error {
 	})
 	chatRegistry.Register(telegramSvc)
 	bus.AddNotifier(chatRegistry)
-	goroutines.Supervise(ctx, "telegram-poller", 30*time.Second, telegramSvc.RunPoller)
-	goroutines.Supervise(ctx, "chat-reconciler", 5*time.Minute, func(ctx context.Context) error {
+	// One long-poller per bot: Telegram refuses a second getUpdates.
+	leaderSupervise(ctx, clusterSvc, loopTelegramPoller, 30*time.Second, telegramSvc.RunPoller)
+	leaderSupervise(ctx, clusterSvc, loopChatReconciler, 5*time.Minute, func(ctx context.Context) error {
 		return chatRegistry.RunReconciler(ctx, 2*time.Minute)
 	})
 
@@ -995,8 +1135,8 @@ func runServe(argv []string) error {
 		})
 	})
 	gw.RegisterEventsTools(evSvc)
-	goroutines.Supervise(ctx, "events-poller", 60*time.Second, evSvc.RunPollers)
-	goroutines.Supervise(ctx, "events-retention", time.Hour, func(ctx context.Context) error {
+	leaderSupervise(ctx, clusterSvc, loopEventsPoller, 60*time.Second, evSvc.RunPollers)
+	leaderSupervise(ctx, clusterSvc, loopEventsRetain, time.Hour, func(ctx context.Context) error {
 		return evSvc.RunRetention(ctx,
 			func() int { return settingsSvc.GetInt(settings.EventsRetentionDays, 90) })
 	})
@@ -1014,11 +1154,22 @@ func runServe(argv []string) error {
 	}
 	// Recovery waits for the persistent upstream catalog and Inbox hooks. A
 	// previously claimed write stays unknown and is never dispatched again.
-	if n, err := bus.SweepUnexecuted(ctx); err != nil {
-		log.Printf("legacy execution: startup recovery: %v", err)
-	} else if n > 0 {
-		log.Printf("legacy execution: recovered %d unclaimed decisions", n)
+	// With replicas the leader's work recovery runs it instead, one lease
+	// after it takes over (runWorkRecovery).
+	if !clusterSvc.MultiNode() {
+		if n, err := bus.SweepUnexecuted(ctx); err != nil {
+			log.Printf("legacy execution: startup recovery: %v", err)
+		} else if n > 0 {
+			log.Printf("legacy execution: recovered %d unclaimed decisions", n)
+		}
 	}
+	// The leader settles the work of replicas that stopped (multi-node
+	// only). It starts here, once startup has loaded what recovery needs
+	// (the upstream servers and the Inbox hooks), so this replica takes no
+	// recovery lease before it could use it.
+	leaderLoop(ctx, clusterSvc, loopWorkRecovery, time.Minute, func(ctx context.Context) {
+		runWorkRecovery(ctx, clusterSvc, db.PingContext, inboxSvc, bus, codeRuns)
+	})
 
 	// MemPalace: install (if needed), initialize palace dir, and register
 	// the built-in stdio upstream so its 29 tools surface as `mempalace.*`.
@@ -1061,10 +1212,12 @@ func runServe(argv []string) error {
 	// memwebhook.MemIngester directly; even when MemPalace is disabled the
 	// service still manages webhooks (ingestion then returns 503).
 	memWebhookSvc := memwebhook.New(db, mpSvc, auditSvc)
+	memWebhookSvc.SetCluster(clusterSvc)
 	// TEC-482: ingest is asynchronous — this worker drains queued jobs and
 	// performs the slow MemPalace embed/index/store off the HTTP request path.
-	// It exits on ctx cancellation; in-flight jobs resume on next boot.
-	goroutines.Supervise(ctx, "memwebhook-jobs", time.Minute, memWebhookSvc.RunWorker)
+	// It exits on ctx cancellation; in-flight jobs resume on next boot. One
+	// replica runs it at a time; each job carries that replica's lease.
+	leaderSupervise(ctx, clusterSvc, loopMemWebhookJobs, time.Minute, memWebhookSvc.RunWorker)
 
 	// Notes workspace: a markdown scratchpad agents read/write through the
 	// official @modelcontextprotocol/server-filesystem MCP. The upstream is
@@ -1129,7 +1282,7 @@ func runServe(argv []string) error {
 			Interval: *notesSyncEvery,
 		})
 		gw.RegisterNotesPublish(notesAdapter{notesSvc})
-		goroutines.Loop(ctx, loopNotesScanner, time.Minute, notesSvc.StartScanner)
+		leaderLoop(ctx, clusterSvc, loopNotesScanner, time.Minute, notesSvc.StartScanner)
 		log.Printf("notes-sync: scanner started (interval=%s, dir=%s)", *notesSyncEvery, resolvedNotesDir)
 	}
 
@@ -1194,7 +1347,7 @@ func runServe(argv []string) error {
 			ClaudeSkillsDir: *claudeSkillsDir,
 		})
 		gw.RegisterSkillsBuiltins(skillsAdapter{skillsSvc})
-		goroutines.Loop(ctx, loopSkillsScanner, time.Minute, skillsSvc.StartScanner)
+		leaderLoop(ctx, clusterSvc, loopSkillsScanner, time.Minute, skillsSvc.StartScanner)
 		log.Printf("skills-sync: scanner started (interval=%s, dir=%s)", *skillsSyncEvery, resolvedSkillsDir)
 	}
 
@@ -1250,6 +1403,20 @@ func runServe(argv []string) error {
 		ClerkFrontendAPI: clerkFAPI,
 	}
 
+	// OAuth 2.1 for MCP clients (docs/guidelines/connect-clients.md): on
+	// whenever -public-url is set, unless an admin turned it off in
+	// settings. Its sweeper is safe on every node (sweep.go).
+	// A revoked grant's agent is disabled (access then refuses everything
+	// it queued); OnRevoke also withdraws what it still has pending.
+	mcpAuthSvc := mcpauth.New(mcpauth.Options{DB: db, PublicURL: *publicURL, Settings: settingsSvc, Access: accessSvc,
+		OnRevoke: func(ctx context.Context, agentID string) { cancelAgentWork(ctx, bus, inboxSvc, agentID) }})
+	// Supervised like the other loops: a panic restarts it, and each
+	// clean pass is recorded in the loop metric.
+	goroutines.Loop(ctx, loopMCPAuthSweep, time.Minute, func(ctx context.Context) { runMCPAuthSweeper(ctx, mcpAuthSvc) })
+	if mcpAuthSvc.Enabled() {
+		log.Printf("mcp-oauth: authorization server on (issuer %s, resource %s)", mcpAuthSvc.Issuer(), mcpAuthSvc.Resource())
+	}
+
 	// REST API + dashboard.
 	apiSrv := api.New(ctx, api.Options{
 		Federation: federationSvc, Callbacks: callbackSvc,
@@ -1294,10 +1461,14 @@ func runServe(argv []string) error {
 		OwnerEmail:      *ownerEmail,
 		ConnectAZP:      connectOrigins,
 		CodeRuns:        codeRuns,
+		Jobs:            jobsSvc,
 	})
 
+	// Rate limits and the connect-t3 lock hold across replicas.
+	apiSrv.SetCluster(clusterSvc)
 	mux := http.NewServeMux()
 	apiSrv.Routes(mux)
+	apiSrv.MCPOAuthRoutes(mux, mcpAuthSvc)
 
 	// Streamable HTTP MCP transport at /mcp. Agents use this if they prefer
 	// HTTP over stdio. Auth via Authorization: Bearer <agent-token>, or
@@ -1307,7 +1478,17 @@ func runServe(argv []string) error {
 	// guard, which also works out who raised the call (agent, owner,
 	// client, session) for the audit log. -require-auth-on-mcp
 	// (auto-enabled with -public-url) rejects anonymous traffic too.
-	mcpAuthn := mcpAuth{verify: federationSvc.VerifyAgent, requireAuth: *requireAuthMCP, sec: secOpts}
+	// An OAuth access token (mcpauth) is checked by the authorization
+	// server; every 401 names its protected-resource metadata while OAuth
+	// is on, so MCP clients can sign the person in.
+	// An MCP client older than 2026-07-28 opens a session that lives in
+	// one replica's memory: with replicas it fails on any other replica
+	// unless the load balancer is sticky (docs/self-hosting.md).
+	if clusterSvc.MultiNode() && !*statelessMCP {
+		logx.For("cluster").Warn("cluster mode is on and -stateless-mcp is off: an MCP session (Mcp-Session-Id) of a client older than 2026-07-28 works only on the replica that opened it; run -stateless-mcp, or route each session to one replica (sticky on the Mcp-Session-Id header)")
+	}
+	mcpAuthn := mcpAuth{verify: federationSvc.VerifyAgent, verifyOAuth: mcpAuthSvc.VerifyAccessToken,
+		resourceMetadata: mcpAuthSvc.ResourceMetadataURL, requireAuth: *requireAuthMCP, sec: secOpts}
 	streamable := server.NewStreamableHTTPServer(gw.MCPServer(),
 		server.WithEndpointPath("/mcp"),
 		// Stateless mode is opt-in via -stateless-mcp. The default
@@ -1344,8 +1525,12 @@ func runServe(argv []string) error {
 	// 2026-07-28 subscriptions/listen POST) once the drain starts and ends
 	// open ones with the other waiters (lifecycle.go).
 	mcpStreams := newMCPStreamGate()
-	mux.Handle("/mcp", mcpStreams.wrap(api.LimitBody(gateway.PreserveToolCallNumbers(mcpAuthn.guard(streamable)), 16<<20)))
-	mux.Handle("/mcp/", mcpStreams.wrap(api.LimitBody(gateway.PreserveToolCallNumbers(mcpAuthn.guard(streamable)), 16<<20)))
+	// MCP Tasks are answered from the jobs table (any replica), in front
+	// of the transport and after the token check, with the transport's
+	// own DNS rebinding protection (off with -public-url, as above).
+	mcpHandler := gw.MCPTasks(streamable, mcpAuthn.contextFunc, *publicURL == "")
+	mux.Handle("/mcp", mcpStreams.wrap(api.LimitBody(gateway.PreserveToolCallNumbers(mcpAuthn.guard(mcpHandler)), 16<<20)))
+	mux.Handle("/mcp/", mcpStreams.wrap(api.LimitBody(gateway.PreserveToolCallNumbers(mcpAuthn.guard(mcpHandler)), 16<<20)))
 
 	// pprof endpoints, gated to loopback. When toolyard hangs, run
 	//   curl -s http://127.0.0.1:<port>/debug/pprof/goroutine?debug=2
@@ -1408,7 +1593,11 @@ func runServe(argv []string) error {
 	// (sessions revoked, agents stopped). No-op when Clerk is off; a Clerk
 	// outage changes nothing.
 	if clerkClient != nil && !*clerkOwnerOnly {
-		apiSrv.StartClerkSync(ctx, *clerkSyncEvery)
+		every := *clerkSyncEvery
+		leaderLoop(ctx, clusterSvc, loopClerkSync, time.Hour, func(ctx context.Context) {
+			apiSrv.StartClerkSync(ctx, every)
+			<-ctx.Done()
+		})
 		log.Printf("clerk: org membership sync every %s", clerkSyncEvery.String())
 	}
 
@@ -1441,6 +1630,8 @@ func runServe(argv []string) error {
 		}
 	}()
 
+	// Per replica by nature: each replica sweeps the idle connections of
+	// its own upstream pool.
 	if idleTimeout > 0 {
 		goroutines.Loop(ctx, loopIdleSweeper, time.Minute, func(ctx context.Context) {
 			tick := time.NewTicker(idleTimeout / 2)
@@ -1459,6 +1650,10 @@ func runServe(argv []string) error {
 			}
 		})
 	}
+	// Per replica by nature: each replica's catalog comes from its own
+	// upstream connections (held in memory), so each re-reads its own live
+	// servers. The refresh only reads tool lists; nothing is written to the
+	// database, so running it on every replica is safe.
 	if every := *catalogRefresh; every > 0 {
 		goroutines.Loop(ctx, loopCatalogRefresh, time.Minute, func(ctx context.Context) {
 			tick := time.NewTicker(every)
@@ -1505,11 +1700,18 @@ func runServe(argv []string) error {
 		}()
 	}
 
+	var exitErr error
 	select {
 	case <-stop:
 		rootLog.Info("shutdown signal received")
 	case <-ctx.Done():
 		rootLog.Warn("root context ended; shutting down")
+	case <-clusterSvc.ModeConflict():
+		// The mode guard no longer holds: a gateway with the other
+		// -cluster setting took the database while this one was
+		// disconnected. Drain and exit 78 (a configuration error).
+		rootLog.Error("a gateway with the other -cluster setting uses this database; shutting down")
+		exitErr = fmt.Errorf("%w (%w)", cluster.ErrModeConflict, keyguard.ErrConfig)
 	}
 	// TEC-1626 drain: one ordered shutdown (lifecycle.go). Executors run on
 	// the bus's own context, so nothing in flight is cancelled before the
@@ -1523,7 +1725,10 @@ func runServe(argv []string) error {
 		refuseNew: func() {
 			gw.BeginDrain()
 			bus.BeginDrain()
+			jobsSvc.BeginDrain()
 			mcpStreams.refuse()
+			// Another replica takes over the leader tasks at once.
+			clusterSvc.Drain()
 		},
 		releaseWaiters: func() {
 			hub.CloseAll()
@@ -1532,6 +1737,7 @@ func runServe(argv []string) error {
 			gw.ReleaseWaiters()
 			bus.ReleaseWaiters()
 			codeRuns.ReleaseWaiters()
+			jobsSvc.ReleaseWaiters()
 		},
 		stopHTTP:  httpSrv.Shutdown,
 		forceHTTP: httpSrv.Close,
@@ -1539,16 +1745,28 @@ func runServe(argv []string) error {
 			func(ctx context.Context) { bus.WaitExecutions(ctx, shutdownGrace) },
 			func(ctx context.Context) { waitGrantedCalls(ctx, gw, inboxSvc, shutdownGrace) },
 			codeRuns.Wait,
+			jobsSvc.Wait,
+			// Leader units (a memory-webhook job, an OAuth refresh, a
+			// job retention pass) run on the root context: let them end
+			// before step 7 cancels it.
+			func(ctx context.Context) {
+				if left := cluster.WaitUnits(ctx); len(left) > 0 {
+					logx.For("shutdown").Warn("shutdown: leader work still running at the drain deadline; it stops with the root context", "running", left)
+				}
+			},
 		},
 		cancelRoot: cancel,
 		closers: []shutdownCloser{
 			{name: "inbox", close: closeInbox},
 			{name: "metrics", close: closeMetrics},
 			{name: "gateway", close: closeGateway},
+			// Releases this replica's leader leases (the others take
+			// over) before the database closes.
+			{name: "cluster", close: closeCluster},
 			{name: "database", close: closeDB},
 		},
 	}).run()
-	return nil
+	return exitErr
 }
 
 // ---- exchange ---------------------------------------------------------------
@@ -1847,6 +2065,7 @@ func staticHandler() http.Handler {
 	appHash := assetHash(sub, "app.js")
 	cssHash := assetHash(sub, "style.css")
 	settingsHash := assetHash(sub, "settings.js")
+	appsHash := assetHash(sub, "apps.js")
 	workspaceHash := assetHash(sub, "workspace.css")
 	swHash := assetHash(sub, "sw.js")
 	loginHash := assetHash(sub, "login.js")
@@ -1854,6 +2073,7 @@ func staticHandler() http.Handler {
 		out := strings.ReplaceAll(string(body), `src="/app.js"`, `src="/app.js?v=`+appHash+`"`)
 		out = strings.ReplaceAll(out, `href="/style.css"`, `href="/style.css?v=`+cssHash+`"`)
 		out = strings.ReplaceAll(out, `src="/settings.js"`, `src="/settings.js?v=`+settingsHash+`"`)
+		out = strings.ReplaceAll(out, `src="/apps.js"`, `src="/apps.js?v=`+appsHash+`"`)
 		out = strings.ReplaceAll(out, `href="/workspace.css"`, `href="/workspace.css?v=`+workspaceHash+`"`)
 		return []byte(out)
 	}
@@ -1894,12 +2114,14 @@ func staticHandler() http.Handler {
 			http.NotFound(w, r)
 			return
 		}
-		// MCP-over-HTTP clients probe OAuth discovery endpoints first
-		// (.well-known/oauth-protected-resource, oauth-authorization-server,
-		// /register). We use static bearer-token auth, so these must 404 —
-		// returning the SPA's index.html breaks the client with
-		// "Failed to parse JSON" because it expects a discovery document.
-		if strings.HasPrefix(r.URL.Path, "/.well-known/") ||
+		// MCP-over-HTTP clients probe OAuth discovery endpoints. The ones
+		// toolyard serves (the RFC 9728 and RFC 8414 documents, /oauth/*,
+		// mcpauth) and /.well-known/toolyard-instance are mux routes and
+		// never reach here. Every other discovery guess must 404: the SPA's
+		// index.html breaks a client with "Failed to parse JSON" because it
+		// expects a document. That includes the root /register, /authorize
+		// and /token that pre-metadata clients guess.
+		if strings.HasPrefix(r.URL.Path, "/.well-known/") || strings.HasPrefix(r.URL.Path, "/oauth/") ||
 			r.URL.Path == "/register" ||
 			r.URL.Path == "/authorize" ||
 			r.URL.Path == "/token" {
@@ -1994,6 +2216,39 @@ func (h hubEventBus) Publish(eventType string, data any) {
 }
 
 // identityResolver adapts identity.Service.PrimaryUser → oauth.IdentityResolver.
+// cancelAgentWork cancels a revoked OAuth client's pending approvals
+// (personal ones included) and Inbox requests and revokes its Inbox
+// grants, each recorded as done by the system because the grant was
+// revoked. Best effort: the agent is already disabled, so nothing it
+// queued can run anyway.
+func cancelAgentWork(ctx context.Context, bus *approval.Bus, inboxSvc *inbox.Service, agentID string) {
+	if bus != nil {
+		pending, err := bus.ListPendingByAgent(ctx, agentID)
+		if err != nil {
+			log.Printf("mcp-oauth: WARN list pending approvals of %s: %v", agentID, err)
+		}
+		for _, p := range pending {
+			if _, err := bus.CancelBySystem(ctx, p.ID, agentID, "grant revoked"); err != nil && !errors.Is(err, approval.ErrNotPending) {
+				log.Printf("mcp-oauth: WARN cancel approval %s of %s: %v", p.ID, agentID, err)
+			}
+		}
+	}
+	if inboxSvc != nil {
+		open, err := inboxSvc.List(ctx, inbox.ListFilter{Open: true, AgentID: agentID})
+		if err != nil {
+			log.Printf("mcp-oauth: WARN list Inbox requests of %s: %v", agentID, err)
+		}
+		for _, r := range open {
+			if _, err := inboxSvc.CancelBySystem(ctx, agentID, r.ID, "grant revoked"); err != nil && !errors.Is(err, inbox.ErrNotPending) {
+				log.Printf("mcp-oauth: WARN cancel Inbox request %s of %s: %v", r.ID, agentID, err)
+			}
+		}
+		if _, err := inboxSvc.RevokeAllBy(ctx, agentID, actor.Decider{Via: approval.ViaSystem, Ref: "grant revoked"}); err != nil {
+			log.Printf("mcp-oauth: WARN revoke Inbox grants of %s: %v", agentID, err)
+		}
+	}
+}
+
 // mcpCredential is the agent token an /mcp request presents: the
 // Authorization bearer when there is one, else the x-bf-vk header (the
 // Bifrost virtual-key slot: bkt3's proxy strips Authorization and sends a

@@ -5,12 +5,16 @@ The script runs under the same agent identity, policy and Inbox approvals as
 executeToolCode. Contract: docs/design/code-rest-route.md in the toolyard repo;
 the API is described at GET /v1/code/openapi.json.
 
-  ty run FILE|-  [--wait N] [--key IDEMPOTENCY_KEY] [--reason TEXT]
+  ty run FILE|-  [--wait N] [--key IDEMPOTENCY_KEY] [--reason TEXT] [--language starlark|javascript]
   ty status RUN_ID [--wait N]
   ty resume RUN_ID [--request rq_...] [--wait N]
-  ty files
-  ty stub SERVER/TOOL
+  ty files [--language starlark|javascript]
+  ty stub SERVER/TOOL [--language starlark|javascript]
+  ty search QUERY [--mode keyword|regex] [--detail name|summary|full] [--limit N] [--upstream SERVER]
   ty call SERVER.TOOL '{"json": "arguments"}' [--reason TEXT]
+
+A FILE ending in .js or .mjs runs as JavaScript (await tools.Server.tool({...}),
+return the result); anything else as Starlark, unless --language says.
 
 Environment:
   TOOLYARD_URL         default https://toolyard.beknown.live
@@ -22,7 +26,8 @@ The token is read from that file and sent only in the Authorization header.
 ty never prints or logs it, never puts it in argv and never hands it to
 another process.
 
-Output: the run view as JSON on stdout (files and stub print text).
+Output: the run view as JSON on stdout (files and stub print text, search
+prints its JSON).
 Exit codes: 0 succeeded, 1 failed, 2 usage or transport error,
 3 permission_required, 4 deferred or still running, 5 busy (HTTP 429),
 6 outcome_unknown.
@@ -290,6 +295,11 @@ def finish(client, status, headers, data, deadline):
     if not is_run_view(body):
         return error_exit(status, headers, data)
     emit_json(body)
+    error = body.get("error")
+    if body["status"] == "failed" and isinstance(error, dict) and error.get("kind") == "busy":
+        retry = (headers.get("Retry-After") if headers is not None else None) or "a few"
+        warn("code mode was busy: the run got no script slot, so nothing ran; start it again after %s seconds" % retry)
+        return EXIT_BUSY
     code = STATUS_EXIT.get(body["status"])
     if code is None:
         warn("unknown run status %r" % body["status"])
@@ -316,7 +326,7 @@ def default_reason(verb, label, code):
     first = ""
     for line in code.splitlines():
         line = line.strip()
-        if line and not line.startswith("#"):
+        if line and not line.startswith("#") and not line.startswith("//"):
             first = line
             break
     reason = "ty %s %s" % (verb, label)
@@ -349,7 +359,16 @@ def read_script(path):
     return code, label
 
 
-def start_run(client, code, reason, key, wait):
+def language_of(path, given):
+    """The script's language: --language, else .js/.mjs is javascript, else starlark."""
+    if given:
+        return given
+    if path.endswith(".js") or path.endswith(".mjs"):
+        return "javascript"
+    return "starlark"
+
+
+def start_run(client, code, reason, key, wait, language="starlark"):
     """POST /v1/code/run with an Idempotency-Key, then finish."""
     if key is None:
         key = str(uuid.uuid4())
@@ -360,14 +379,14 @@ def start_run(client, code, reason, key, wait):
     deadline = deadline_for(wait)
     headers = {"Idempotency-Key": key}
     if header_safe(reason):
-        headers["Content-Type"] = "text/x-starlark"
+        headers["Content-Type"] = "text/javascript" if language == "javascript" else "text/x-starlark"
         headers["X-Toolyard-Reason"] = reason
         headers.update(prefer(wait))
         body = code.encode("utf-8")
     else:
         # A reason that cannot travel in a header goes in a JSON body.
         headers["Content-Type"] = "application/json"
-        payload = {"code": code, "reason": reason}
+        payload = {"code": code, "reason": reason, "language": language}
         if wait is not None:
             payload["wait_seconds"] = min(wait, MAX_SERVER_WAIT)
         body = json.dumps(payload, ensure_ascii=False).encode("utf-8")
@@ -513,7 +532,7 @@ def call_script(target, args_json):
 def cmd_run(client, args):
     code, label = read_script(args.file)
     reason = check_reason(args.reason) if args.reason is not None else default_reason("run", label, code)
-    return start_run(client, code, reason, args.key, args.wait)
+    return start_run(client, code, reason, args.key, args.wait, language_of(args.file, args.language))
 
 
 def cmd_call(client, args):
@@ -541,23 +560,47 @@ def cmd_resume(client, args):
 
 
 def cmd_files(client, args):
-    status, headers, data = client.send("GET", "/v1/code/files")
+    path = "/v1/code/files"
+    if args.language == "javascript":
+        path += "?language=javascript"
+    status, headers, data = client.send("GET", path)
     return emit_text(status, headers, data)
 
 
 def cmd_stub(client, args):
     target = args.target.strip()
+    ext = ".d.ts" if args.language == "javascript" else ".pyi"
     if target.startswith("servers/"):
         target = target[len("servers/"):]
-    if target.endswith(".pyi"):
+    if target.endswith(".d.ts"):
+        target, ext = target[:-len(".d.ts")], ".d.ts"
+    elif target.endswith(".pyi"):
         target = target[:-len(".pyi")]
+    if target == "index" and ext == ".d.ts":
+        status, headers, data = client.send("GET", "/v1/code/files/index.d.ts")
+        return emit_text(status, headers, data)
     server, sep, tool = target.partition("/")
     if not sep or not server or not tool or "/" in tool:
-        raise TyError("stub takes SERVER/TOOL, for example github/create_issue")
-    path = "/v1/code/files/%s/%s.pyi" % (urllib.parse.quote(server, safe=""),
-                                         urllib.parse.quote(tool, safe=""))
+        raise TyError("stub takes SERVER/TOOL, for example github/create_issue (or index.d.ts)")
+    path = "/v1/code/files/%s/%s%s" % (urllib.parse.quote(server, safe=""),
+                                       urllib.parse.quote(tool, safe=""), ext)
     status, headers, data = client.send("GET", path)
     return emit_text(status, headers, data)
+
+
+def cmd_search(client, args):
+    query = {"q": args.query}
+    for name in ("mode", "detail", "upstream"):
+        if getattr(args, name):
+            query[name] = getattr(args, name)
+    if args.limit is not None:
+        query["limit"] = str(args.limit)
+    status, headers, data = client.send("GET", "/v1/code/search?" + urllib.parse.urlencode(query))
+    body = parse_json(data)
+    if status != 200 or not isinstance(body, dict):
+        return error_exit(status, headers, data)
+    emit_json(body)
+    return EXIT_SUCCEEDED
 
 
 def seconds(text):
@@ -582,6 +625,8 @@ def build_parser():
     r.add_argument("--key", metavar="IDEMPOTENCY_KEY",
                    help="reuse this key on a retry to get the same run back (default: a new random key)")
     r.add_argument("--reason", metavar="TEXT", help="why you run it, 20-2000 characters, for the audit")
+    r.add_argument("--language", choices=("starlark", "javascript"),
+                   help="the script's language (default: javascript for .js and .mjs files, else starlark)")
     r.set_defaults(func=cmd_run)
 
     s = sub.add_parser("status", help="show a run")
@@ -597,11 +642,24 @@ def build_parser():
     s.set_defaults(func=cmd_resume)
 
     s = sub.add_parser("files", help="list the tool stubs you may use (like listToolFiles)")
+    s.add_argument("--language", choices=("starlark", "javascript"), default="starlark",
+                   help="javascript lists the TypeScript stubs (.d.ts)")
     s.set_defaults(func=cmd_files)
 
     s = sub.add_parser("stub", help="print one tool stub (like readToolFile)")
     s.add_argument("target", metavar="SERVER/TOOL")
+    s.add_argument("--language", choices=("starlark", "javascript"), default="starlark",
+                   help="javascript prints the TypeScript stub (.d.ts); a target ending in .d.ts does too")
     s.set_defaults(func=cmd_stub)
+
+    s = sub.add_parser("search", help="search the tools you may use (like tools.search)")
+    s.add_argument("query", metavar="QUERY")
+    s.add_argument("--mode", choices=("keyword", "regex", "semantic", "auto"),
+                   help="keyword (default): ranked words; regex: an RE2 pattern of at most 200 characters")
+    s.add_argument("--detail", choices=("name", "summary", "full"), help="full adds the input and output schemas")
+    s.add_argument("--limit", type=int, metavar="N", help="at most N results (default 50, at most 200)")
+    s.add_argument("--upstream", metavar="SERVER", help="only the tools of this upstream server")
+    s.set_defaults(func=cmd_search)
 
     s = sub.add_parser("call", help="call one tool as a one-line script")
     s.add_argument("target", metavar="SERVER.TOOL")

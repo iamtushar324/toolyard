@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"strings"
 	"sync"
 	"time"
@@ -13,7 +14,7 @@ import (
 
 // Structured runs. Run executes a script exactly like ExecuteToolCode (the
 // same worker, limits, catalog and gateway pipeline for every nested
-// call) and returns what happened as data instead of Bifrost's text: the
+// call, in Starlark or JavaScript) and returns what happened as data instead of Bifrost's text: the
 // run's status, its JSON result, its print lines, one record per tool
 // call, and the call that held it for approval. CallHooks let the caller
 // answer a call from a record instead of sending it (a resumed run
@@ -56,6 +57,17 @@ const (
 	// ErrorBusy names ErrBusy for an API's error object; Run itself
 	// returns ErrBusy and no RunResult.
 	ErrorBusy = "busy"
+	// ErrorInterrupted: the caller's context was cancelled (toolyard is
+	// shutting down, or the client went away) before the script finished.
+	// The run is outcome_unknown when a tool call had been sent, failed
+	// (nothing ran) when none had. A script's own clock is ErrorTimeout.
+	ErrorInterrupted = "interrupted"
+)
+
+// The messages of an interrupted script.
+const (
+	msgInterruptedAfterCalls = "toolyard stopped the script before it finished (the server is restarting, or the caller went away), after it sent %d tool call(s); a call may have taken effect, so check what the script changed before you run it again"
+	msgInterruptedNothingRan = "toolyard stopped the script before it finished (the server is restarting, or the caller went away), before it sent any tool call; nothing ran. Run it again"
 )
 
 // OutcomeUnknownMarker is the result metadata key (Meta.AdditionalFields,
@@ -90,6 +102,8 @@ type RunOptions struct {
 	// caller committed to the run (so it can answer busy without creating
 	// one). Run releases it. nil makes Run take a slot itself.
 	Slot *Slot
+	// Language is LanguageStarlark (also "") or LanguageJavaScript.
+	Language string
 }
 
 // PendingCall is one tool call a script is about to make.
@@ -121,19 +135,23 @@ type PendingCall struct {
 }
 
 // CallHooks wrap each tool call of a Run. Both run on the goroutine that
-// makes the call, never two at once for one run, and Run returns only
-// once every hook call it started has returned, so they must return
-// promptly.
+// makes the call. Calls a script runs in parallel run their hooks at the
+// same time, so a hook guards its own state. Run returns only once every
+// hook call it started has returned.
 type CallHooks interface {
-	// BeforeCall runs before a call goes to the gateway, on the run's
-	// context. Returning handled=true answers the call with res instead
-	// (it is not sent; its record says Replayed): give
+	// BeforeCall runs before a call goes to the gateway. Its context ends
+	// when the run's clock does, and also as soon as the script has
+	// stopped on another call (nothing more is sent then), so a hook that
+	// waits (for the calls numbered before this one, say) watches it.
+	// Returning handled=true answers the call with res instead (it is not
+	// sent; its record says Replayed): give
 	// mcp.NewToolResultText(CallOutcome.Text) to replay a recorded call
-	// exactly. Changing c.Args (adding "_grant") changes what is sent;
-	// nothing else in c is read back. Returning an error stops the script
-	// at this call: a *CallError's Kind becomes the run's error kind
-	// (ErrorOutcomeUnknown makes the run outcome_unknown), any other error
-	// fails the run with ErrorInternal.
+	// exactly, ReplayFailure to give the script the failure it saw, or
+	// ReplayHold the hold. Changing c.Args (adding "_grant") changes what
+	// is sent; nothing else in c is read back. Returning an error stops
+	// the script at this call: a *CallError's Kind becomes the run's error
+	// kind (ErrorOutcomeUnknown makes the run outcome_unknown), any other
+	// error fails the run with ErrorInternal.
 	BeforeCall(ctx context.Context, c *PendingCall) (res *mcp.CallToolResult, handled bool, err error)
 	// AfterCall runs once the gateway answered a call that was sent (not
 	// for a call BeforeCall answered or stopped), on a context with the
@@ -152,6 +170,54 @@ type CallError struct {
 
 func (e *CallError) Error() string { return e.Message }
 
+// replayedFailureMarker is the metadata key (value: the error kind) of a
+// failure ReplayFailure made. It counts only on an answer BeforeCall gave
+// (handled), never on one from the gateway.
+const replayedFailureMarker = "toolyard.replayed_failure"
+
+// ReplayFailure is a BeforeCall answer that gives the script a recorded
+// failure again: the same text, and the same error kind (ErrorToolError,
+// ErrorGrantInvalid or ErrorLimit; any other is ErrorToolError) should the
+// script not catch it.
+func ReplayFailure(kind, text string) *mcp.CallToolResult {
+	switch kind {
+	case ErrorToolError, ErrorGrantInvalid, ErrorLimit:
+	default:
+		kind = ErrorToolError
+	}
+	res := mcp.NewToolResultError(text)
+	res.Meta = &mcp.Meta{AdditionalFields: map[string]any{replayedFailureMarker: kind}}
+	return res
+}
+
+// ReplayHold is a BeforeCall answer that gives the script a recorded hold
+// again: status StatusPermissionRequired or StatusDeferred, the gateway's
+// text, and its structured content (the Inbox draft, the approval id),
+// nil when it was not kept. Should the script not catch it, the run holds
+// at this call as it did before.
+func ReplayHold(status, text string, structured json.RawMessage) *mcp.CallToolResult {
+	marker := "toolyard.permission_required"
+	res := mcp.NewToolResultError(text)
+	if status == StatusDeferred {
+		marker = "toolyard.deferred"
+		res = mcp.NewToolResultText(text)
+	}
+	if len(structured) > 0 && json.Valid(structured) {
+		res.StructuredContent = structured
+	}
+	res.Meta = &mcp.Meta{AdditionalFields: map[string]any{marker: true}}
+	return res
+}
+
+// replayedFailure reads the kind ReplayFailure put on res, "" for none.
+func replayedFailure(res *mcp.CallToolResult) string {
+	if res == nil || res.Meta == nil {
+		return ""
+	}
+	kind, _ := res.Meta.AdditionalFields[replayedFailureMarker].(string)
+	return kind
+}
+
 // CallOutcome is what AfterCall learns about a call the gateway answered.
 type CallOutcome struct {
 	// Record is the call's final record.
@@ -162,9 +228,20 @@ type CallOutcome struct {
 	// Text is the value the script received when the call succeeded, ""
 	// when it did not; mcp.NewToolResultText(Text) replays it.
 	Text string
-	// Message is the failure text that stopped the script, "" when the
-	// script carried on.
+	// Message is the failure text the script saw ("tool call failed for
+	// <tool>: <text>"), "" when the call succeeded.
 	Message string
+	// Kind is a failed call's error kind (ErrorToolError, ErrorGrantInvalid,
+	// ErrorLimit), "" otherwise.
+	Kind string
+	// FailureText is the <text> part of Message for a failed or held call
+	// (at most 64 KiB): ReplayFailure(Kind, FailureText) and
+	// ReplayHold(Held.Status, FailureText, Held.Structured) give the
+	// script the same answer again.
+	FailureText string
+	// Held is the hold of a permission_required or deferred call, with its
+	// legacy approval id, nil otherwise.
+	Held *HeldCall
 }
 
 // CallRecord is one tool call of a run.
@@ -177,6 +254,9 @@ type CallRecord struct {
 	Status string
 	// Replayed marks a call BeforeCall answered from a record.
 	Replayed bool
+	// Sent marks a call that went to the gateway. A failed call that was
+	// not sent (the script or its clock stopped first) changed nothing.
+	Sent bool
 	// StartedAt and FinishedAt are unix milliseconds.
 	StartedAt  int64
 	FinishedAt int64
@@ -225,8 +305,8 @@ type RunResult struct {
 // Slot is one of the runtime's concurrent script slots, held from
 // AcquireSlot until Release.
 type Slot struct {
-	sem  chan struct{}
-	once sync.Once
+	release func()
+	once    sync.Once
 }
 
 // Release frees the slot. Releasing twice, or a nil slot, is harmless.
@@ -234,31 +314,33 @@ func (s *Slot) Release() {
 	if s == nil {
 		return
 	}
-	s.once.Do(func() { <-s.sem })
+	s.once.Do(func() {
+		if s.release != nil {
+			s.release()
+		}
+	})
 }
 
-// AcquireSlot takes one of the runtime's Worker.MaxConcurrent script
-// slots, waiting up to Worker.AcquireWait for one: ErrBusy when none
-// came free, ctx's error when ctx ended first. Release the slot, or pass
-// it to Run, which does.
+// AcquireSlot takes one of the runtime's script slots for the ctx caller
+// (WithAgentKey, else the Caller's AgentKey): at most
+// Worker.MaxConcurrent scripts run at once, and at most
+// Worker.MaxPerAgent for one caller. A run that cannot start waits in a
+// fair queue up to Worker.AcquireWait: an error that is ErrBusy when no
+// slot came free (its text says which cap), ctx's error when ctx ended
+// first. Release the slot, or pass it to Run, which does.
 func (r *Runtime) AcquireSlot(ctx context.Context) (*Slot, error) {
-	sem := r.sem
-	select {
-	case sem <- struct{}{}:
-		return &Slot{sem: sem}, nil
-	default:
+	release, err := r.limiter.acquire(ctx, r.agentKey(ctx), r.worker.AcquireWait)
+	if err != nil {
+		return nil, err
 	}
-	t := time.NewTimer(r.worker.AcquireWait)
-	defer t.Stop()
-	select {
-	case sem <- struct{}{}:
-		return &Slot{sem: sem}, nil
-	case <-t.C:
-		return nil, ErrBusy
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	}
+	return &Slot{release: release}, nil
 }
+
+// slotsInUse is how many scripts hold a slot (tests).
+func (r *Runtime) slotsInUse() int { return r.limiter.inUse() }
+
+// SlotWaiters is how many scripts wait in the slot queue now.
+func (r *Runtime) SlotWaiters() int { return r.limiter.waiting() }
 
 // Run executes code for the ctx caller (the same context ExecuteToolCode
 // takes: the agent identity every nested call runs as) and reports the
@@ -276,6 +358,10 @@ func (r *Runtime) Run(ctx context.Context, code string, opts RunOptions) (*RunRe
 		return &RunResult{Status: StatusFailed, ErrorKind: ErrorScriptError,
 			ErrorMessage: "code is required and must be a non-empty string"}, nil
 	}
+	lang, err := ParseLanguage(opts.Language)
+	if err != nil {
+		return &RunResult{Status: StatusFailed, ErrorKind: ErrorScriptError, ErrorMessage: err.Error()}, nil
+	}
 	if opts.Slot == nil {
 		slot, err := r.AcquireSlot(ctx)
 		if err != nil {
@@ -283,7 +369,7 @@ func (r *Runtime) Run(ctx context.Context, code string, opts RunOptions) (*RunRe
 		}
 		defer slot.Release()
 	}
-	ex := r.execute(ctx, code, opts.Reason, opts.Hooks, true)
+	ex := r.execute(ctx, code, execOptions{reason: opts.Reason, hooks: opts.Hooks, structured: true, lang: lang})
 	return ex.s.result(ex.res), nil
 }
 
@@ -296,19 +382,25 @@ func (s *session) result(res scriptResult) *RunResult {
 	now := nowMS()
 	calls := make([]CallRecord, 0, len(s.records))
 	inFlight := false
+	var running CallRecord // the first call still running, when one is
 	for _, st := range s.records {
 		rec := st.rec
+		rec.Sent = st.sent
 		if !st.done {
 			rec.FinishedAt = now
 			rec.Status = StatusFailed
 			if st.sent {
 				rec.Status = StatusOutcomeUnknown
+				if !inFlight {
+					running = rec
+				}
 				inFlight = true
 			}
 		}
 		calls = append(calls, rec)
 	}
 	stop := s.stop
+	sentAny := s.sentCalls > 0
 	prints := append([]string(nil), s.prints...)
 	s.mu.Unlock()
 	s.hookWG.Wait()
@@ -321,6 +413,21 @@ func (s *session) result(res scriptResult) *RunResult {
 		return fallback
 	}
 	switch {
+	case interruptedBy(res, stop):
+		// The caller's context ended first (a drain, a shutdown, a client
+		// that went away): not the script's own timeout.
+		rr.Status, rr.ErrorKind, rr.ErrorMessage = StatusFailed, ErrorInterrupted, res.errMsg
+		if sentAny || inFlight {
+			rr.Status = StatusOutcomeUnknown
+		}
+	case stop != nil && stop.held != nil && inFlight:
+		// Held, but a call the script ran beside the held one was still
+		// running when the script ended: its outcome is unknown, and a
+		// resume would refuse to repeat it, so the run cannot go on.
+		rr.Status, rr.ErrorKind = StatusOutcomeUnknown, ErrorOutcomeUnknown
+		rr.ErrorMessage = fmt.Sprintf("call %d (%s) held the run for approval while call %d (%s) was still running; "+
+			"that call's outcome is unknown, so the run cannot be resumed: check whether it took effect, then start a new run",
+			stop.held.Seq, stop.held.Tool, running.Seq, running.Tool)
 	case stop != nil:
 		rr.Status = stop.status
 		if stop.held != nil {
@@ -359,6 +466,9 @@ type callOutcome struct {
 	held      *HeldCall
 	// text is the value a successful call hands the script.
 	text string
+	// failText is the gateway's text for a failed or held call, as the
+	// script saw it after "tool call failed for <tool>: ".
+	failText string
 }
 
 // classify reads one answer to a call. cutByClock says the run's context

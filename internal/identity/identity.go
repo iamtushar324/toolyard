@@ -51,13 +51,20 @@ var (
 	// delete) refuse a user's identity agent; identitykeys owns its
 	// lifecycle so the registry stays in step with the token.
 	ErrIdentityAgent = errors.New("identity agent: manage it through the identity key")
+	// ErrOAuthAgent: an OAuth client's agent (it has an mcp_oauth_grants
+	// row) signs in with OAuth tokens only; it never gets a static token.
+	ErrOAuthAgent = errors.New("oauth client agent: it signs in with OAuth; manage it on the Connected apps page")
 )
 
 // Agent kinds, mirroring the CHECK constraint on agents.kind. An identity
 // agent is the one per user whose token is that person's identity key.
+// AgentKindOAuthClient is not stored: an OAuth client's agent keeps the
+// stored kind "agent", and its grant row (mcp_oauth_grants) is what makes
+// it report AgentKindOAuthClient (ListAgents, the /mcp ingress, audit).
 const (
-	AgentKindAgent    = "agent"
-	AgentKindIdentity = "identity"
+	AgentKindAgent       = "agent"
+	AgentKindIdentity    = "identity"
+	AgentKindOAuthClient = "oauth_client"
 )
 
 // Roles and statuses, mirroring the CHECK constraints on users.
@@ -164,7 +171,8 @@ type Agent struct {
 	LastSeen time.Time `json:"last_seen"`
 	Disabled bool      `json:"disabled"`
 	// Kind is AgentKindAgent for an enrolled agent, AgentKindIdentity for
-	// the owner's identity key.
+	// the owner's identity key, AgentKindOAuthClient for an OAuth client's
+	// agent (derived from its grant).
 	Kind string `json:"kind"`
 	// OwnerEmail, OwnerDisplayName and OwnerUsername describe the owner
 	// row. VerifyAgentToken fills them from the same lookup that checks
@@ -764,6 +772,10 @@ func (s *Service) ExchangeEnrollment(ctx context.Context, code string) (string, 
 		_, _ = s.db.ExecContext(ctx, `UPDATE agents SET enroll_code = NULL WHERE id = ? AND enroll_code = ?`, ag.ID, code)
 		return "", nil, ErrEnrollNotFound
 	}
+	// An OAuth client's agent never gets a static token, enrolment included.
+	if err := s.refuseOAuthAgent(ctx, ag.ID); err != nil {
+		return "", nil, ErrEnrollNotFound
+	}
 	rawToken, err := randCode(32)
 	if err != nil {
 		return "", nil, err
@@ -848,6 +860,9 @@ func (s *Service) RotateAgentToken(ctx context.Context, ownerUserID, agentID str
 	if err := s.requirePlainAgent(ctx, ownerUserID, agentID); err != nil {
 		return "", err
 	}
+	if err := s.refuseOAuthAgent(ctx, agentID); err != nil {
+		return "", err
+	}
 	token, hash, err := NewAgentToken(agentID)
 	if err != nil {
 		return "", err
@@ -924,6 +939,9 @@ func (s *Service) DeleteAgent(ctx context.Context, ownerUserID, agentID string) 
 	if err = revokeLocalConnectionsTx(ctx, tx, `user_id=? AND (parent_agent_id=? OR agent_id=?)`, []any{ownerUserID, agentID, agentID}, time.Now().UnixMilli()); err != nil {
 		return err
 	}
+	if err = revokeOAuthGrantTx(ctx, tx, agentID, time.Now().UnixMilli()); err != nil {
+		return err
+	}
 	res, err := tx.ExecContext(ctx, `DELETE FROM agents WHERE id=? AND owner_user=?`, agentID, ownerUserID)
 	if err != nil {
 		return err
@@ -954,6 +972,40 @@ func (s *Service) requirePlainAgent(ctx context.Context, ownerUserID, agentID st
 	}
 	if kind == AgentKindIdentity {
 		return ErrIdentityAgent
+	}
+	return nil
+}
+
+// revokeOAuthGrantTx revokes the OAuth grant of an agent that is being
+// deleted, with its tokens and unused codes, in the caller's transaction.
+// The grant row stays (it maps the agent to its client in the audit
+// trail); connecting the client again needs a new consent.
+func revokeOAuthGrantTx(ctx context.Context, tx *sql.Tx, agentID string, now int64) error {
+	// The grant row first, then its tokens and codes: the order every
+	// transaction on a grant uses (mcpauth), so none can deadlock with it.
+	if _, err := tx.ExecContext(ctx, `UPDATE mcp_oauth_grants SET revoked_at = ?, revoked_reason = 'agent_deleted', updated_at = ?
+        WHERE agent_id = ? AND revoked_at IS NULL`, now, now, agentID); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE mcp_oauth_tokens SET revoked_at = ?
+        WHERE revoked_at IS NULL AND grant_id IN (SELECT id FROM mcp_oauth_grants WHERE agent_id = ?)`, now, agentID); err != nil {
+		return err
+	}
+	_, err := tx.ExecContext(ctx, `UPDATE mcp_oauth_codes SET used_at = ?
+        WHERE used_at IS NULL AND grant_id IN (SELECT id FROM mcp_oauth_grants WHERE agent_id = ?)`, now, agentID)
+	return err
+}
+
+// refuseOAuthAgent returns ErrOAuthAgent for an OAuth client's agent: a
+// static token would let it act outside its grant (revocation, refresh
+// rotation, the absolute session limit).
+func (s *Service) refuseOAuthAgent(ctx context.Context, agentID string) error {
+	var n int
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM mcp_oauth_grants WHERE agent_id = ?`, agentID).Scan(&n); err != nil {
+		return err
+	}
+	if n > 0 {
+		return ErrOAuthAgent
 	}
 	return nil
 }
@@ -1044,7 +1096,8 @@ func nullStr(s string) any {
 	return s
 }
 
-// ListAgents returns the owner's agents, newest first. created_at is in
+// ListAgents returns the owner's agents, newest first, an OAuth client's
+// agent with Kind AgentKindOAuthClient (from its grant). created_at is in
 // milliseconds, so a second key breaks ties: "newest" must be well defined
 // for callers that pick the first match (connect rotates the newest bkt3
 // agent). SQLite keeps the insertion order (rowid). Postgres has no rowid,
@@ -1056,7 +1109,8 @@ func (s *Service) ListAgents(ctx context.Context, ownerUserID string) ([]Agent, 
 		tieBreak = "id DESC"
 	}
 	rows, err := s.db.QueryContext(ctx,
-		`SELECT id, name, owner_user, COALESCE(last_seen, 0), COALESCE(disabled, 0), kind
+		`SELECT id, name, owner_user, COALESCE(last_seen, 0), COALESCE(disabled, 0),
+                CASE WHEN EXISTS (SELECT 1 FROM mcp_oauth_grants g WHERE g.agent_id = agents.id) THEN '`+AgentKindOAuthClient+`' ELSE kind END
          FROM agents WHERE owner_user = ? ORDER BY created_at DESC, `+tieBreak, ownerUserID)
 	if err != nil {
 		return nil, err

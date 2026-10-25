@@ -200,7 +200,8 @@ function settingsGeneral() {
 function settingsPermissions() {
   const page = 'permissions', info = state.inbox.info || {};
   return settingsForm(page,
-    settingsSection('Restricted calls', 'Agents must submit context in Inbox. The agent executes accepted calls with single-use grants.'),
+    settingsSection('Restricted calls', 'Agents must submit context in Inbox. The agent executes accepted calls with single-use grants.',
+      settingsToggle(page, 'inbox_v3_enabled', 'Rich requests', 'Accept version 3 requests: questions, charts, Markdown and up to 50 calls. Turn this off while an older Toolyard version still serves this database.', true)),
     settingsSection('Request evidence', 'Keep request attachments available after an agent stops.',
       settingsToggle(page, 'inbox_snapshot_enabled', 'Save linked media', 'Copy linked images, videos, and files when a request arrives.', true),
       settingsInput(page, 'inbox_hosting_note', 'File location guidance', 'Tell agents where to upload files for their requests.', { multiline: true, rows: 3, placeholder: 'Upload files to the evidence bucket and include the link.' })),

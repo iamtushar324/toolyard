@@ -18,6 +18,7 @@ import (
 	"strings"
 	"syscall"
 	"testing"
+	"time"
 
 	"golang.org/x/sys/unix"
 )
@@ -639,4 +640,36 @@ func TestWorkerSandboxSeccompFilter(t *testing.T) {
 	if runtime.GOARCH == "amd64" {
 		check("x32 read", seccompAuditArch, unix.SYS_READ|0x40000000, 0, seccompDeny)
 	}
+}
+
+// TestWorkerSandboxRunsJavaScript: QuickJS under wazero runs in the
+// confined worker (no_new_privs, Landlock, the seccomp filter): its
+// WebAssembly memory is mapped and grown with mmap and mprotect, which the
+// filter allows, and it needs no file, socket or signal the sandbox takes
+// away. With both Landlock and seccomp the worker runs under
+// SandboxRequired, so a sandbox that silently fell away would fail here.
+func TestWorkerSandboxRunsJavaScript(t *testing.T) {
+	s := landlockOrSkip(t)
+	f := newJSFake()
+	rt := workerRuntime(f, Limits{}, func(w *Worker) {
+		if s.seccomp {
+			w.Sandbox = SandboxRequired
+		}
+	})
+	t.Logf("sandbox status: %s", SandboxStatus())
+	start := time.Now()
+	out := rt.Execute(context.Background(), jsScript, ExecOptions{Language: LanguageJavaScript})
+	t.Logf("the JavaScript acceptance script took %s in the confined worker", time.Since(start))
+	if out.Failed || !strings.Contains(out.Text, `"status": "permission_required"`) || !strings.Contains(out.Text, `"facts": [`) {
+		t.Fatalf("confined JavaScript run (failed=%v):\n%s", out.Failed, out.Text)
+	}
+	// The engine can reach nothing outside the module: a dynamic import of
+	// the host modules finds no files to open.
+	out = rt.Execute(context.Background(), `const std = await import("qjs:std");
+const f = std.open("/etc/hostname", "r");
+return { opened: f !== null };`, ExecOptions{Language: LanguageJavaScript})
+	if out.Failed || !strings.Contains(out.Text, `"opened": false`) {
+		t.Fatalf("file access from JavaScript (failed=%v):\n%s", out.Failed, out.Text)
+	}
+	expectClean(t, rt, 0)
 }

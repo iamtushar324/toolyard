@@ -3,13 +3,15 @@ package gateway
 import (
 	"context"
 	"encoding/json"
-	"sort"
+	"errors"
 	"strings"
 
 	"github.com/mark3labs/mcp-go/mcp"
 
+	"github.com/tusharbhardwaj/toolyard/internal/access"
 	"github.com/tusharbhardwaj/toolyard/internal/actor"
 	"github.com/tusharbhardwaj/toolyard/internal/codemode"
+	"github.com/tusharbhardwaj/toolyard/internal/toolsearch"
 )
 
 // Meta-tool names. They live under the synthetic upstream "tools" so the
@@ -23,15 +25,30 @@ const (
 // register on the MCP server.
 func (g *Gateway) metaTools() []toolEntry {
 	search := mcp.Tool{
-		Name:        MetaSearchTool,
-		Description: descriptionBanner + "Search the toolyard catalog. Returns matching tools with their wrapped input schemas. Use this to discover what tools are available before calling tools.execute.",
+		Name: MetaSearchTool,
+		Description: descriptionBanner + "Search the toolyard catalog for the tools you may use, ranked. " +
+			"mode \"keyword\" (default) ranks by BM25 over tool names (split at dots, underscores and camelCase), descriptions, parameter names and parameter descriptions: query \"create a linear issue\". " +
+			"mode \"regex\" matches an RE2 pattern (at most 200 characters, case-insensitive unless the pattern turns that off) against the same fields: query \"^github\\\\..*pull\". " +
+			"mode \"auto\" is keyword; \"semantic\" works only where an operator configured it. " +
+			"detail \"full\" (default) returns name, upstream, description, the code-mode name, score and the input and output schemas; \"summary\" leaves out the schemas; \"name\" only names. " +
+			"Use it before tools.execute, or in code mode: JavaScript `await tools.search(\"query\", { limit: 5 })`, Starlark `toolyard.tools_search(query=\"...\")`.",
 		InputSchema: mcp.ToolInputSchema{
 			Type:     "object",
 			Required: []string{ReasonField},
 			Properties: addMetaProps(map[string]any{
 				"query": map[string]any{
 					"type":        "string",
-					"description": "Substring matched (case-insensitive) against tool name and description. Empty matches all.",
+					"description": "Words to rank by (keyword), or an RE2 pattern (regex). Empty lists every tool, by name.",
+				},
+				"mode": map[string]any{
+					"type":        "string",
+					"enum":        []string{string(toolsearch.ModeKeyword), string(toolsearch.ModeRegex), string(toolsearch.ModeSemantic), string(toolsearch.ModeAuto)},
+					"description": "keyword (default), regex, semantic (only where configured) or auto (keyword).",
+				},
+				"detail": map[string]any{
+					"type":        "string",
+					"enum":        []string{string(toolsearch.DetailName), string(toolsearch.DetailSummary), string(toolsearch.DetailFull)},
+					"description": "full (default: with input and output schemas), summary (no schemas) or name.",
 				},
 				"upstream": map[string]any{
 					"type":        "string",
@@ -40,7 +57,7 @@ func (g *Gateway) metaTools() []toolEntry {
 				"limit": map[string]any{
 					"type":        "integer",
 					"minimum":     1,
-					"maximum":     200,
+					"maximum":     toolsearch.MaxLimit,
 					"description": "Max results (default 50).",
 				},
 			}),
@@ -74,56 +91,161 @@ func (g *Gateway) metaTools() []toolEntry {
 	}
 }
 
-// handleSearchTools matches against tool name + description, oldest-loaded
-// first then alphabetical. Read-only — never holds for approval.
+// SearchRequest is one catalog search (tools.search, GET /v1/code/search).
+type SearchRequest struct {
+	Query    string
+	Mode     string
+	Detail   string
+	Upstream string
+	// Limit is 0 for the default (50); more than 200 is 200.
+	Limit int
+}
+
+// SearchError is a request the search refuses (a bad mode, pattern or
+// limit, or semantic search where none is configured).
+type SearchError struct{ Message string }
+
+func (e *SearchError) Error() string { return e.Message }
+
+// SetToolSearch replaces the search engine (a semantic provider, say).
+// Without it the gateway uses keyword and regex search.
+func (g *Gateway) SetToolSearch(e *toolsearch.Engine) { g.search.Store(e) }
+
+func (g *Gateway) toolSearch() *toolsearch.Engine {
+	if e := g.search.Load(); e != nil {
+		return e
+	}
+	g.search.CompareAndSwap(nil, toolsearch.New(toolsearch.Options{}))
+	return g.search.Load()
+}
+
+// SearchTools ranks the tools the ctx caller may use (CatalogFor's scope)
+// and returns the body tools.search answers with: total (results
+// returned), matched (before the limit), mode and results. The meta-tools
+// themselves are left out, so a model can't recurse tools.execute ->
+// tools.execute.
+func (g *Gateway) SearchTools(ctx context.Context, req SearchRequest) (map[string]any, error) {
+	mode, err := toolsearch.ParseMode(req.Mode)
+	if err != nil {
+		return nil, &SearchError{Message: err.Error()}
+	}
+	detail, err := toolsearch.ParseDetail(req.Detail)
+	if err != nil {
+		return nil, &SearchError{Message: err.Error()}
+	}
+	if req.Limit < 0 {
+		return nil, &SearchError{Message: "limit must be at least 1"}
+	}
+	res, err := g.toolSearch().Search(ctx, g.searchCatalog(ctx), toolsearch.Query{
+		Text: req.Query, Mode: mode, Limit: req.Limit, Server: req.Upstream, Caller: agentIDFromContext(ctx),
+	})
+	var qe *toolsearch.QueryError
+	switch {
+	case errors.Is(err, toolsearch.ErrSemanticOff), errors.As(err, &qe):
+		return nil, &SearchError{Message: err.Error()}
+	case err != nil:
+		return nil, err
+	}
+	results := toolsearch.Render(res.Hits, detail)
+	return map[string]any{
+		"total":   len(results),
+		"matched": res.Matched,
+		"mode":    string(res.Mode),
+		"results": results,
+	}, nil
+}
+
+// searchCatalog is the ctx caller's tools as search sees them: the schema
+// without the gateway's injected fields, the output schema, and the name a
+// script calls each tool by. Which tools is CatalogFor's answer, the one
+// scope every surface shares (the person's grants, the agent's own allow
+// and deny lists, an OAuth client's scope), so search never shows a tool
+// the caller could not list.
+func (g *Gateway) searchCatalog(ctx context.Context) []toolsearch.Tool {
+	visible := g.CatalogFor(ctx)
+	allowed := make(map[string]bool, len(visible))
+	for _, c := range visible {
+		allowed[c.Name] = true
+	}
+	g.mu.RLock()
+	entries := make([]toolEntry, 0, len(allowed))
+	for _, e := range g.tools {
+		if e.tool.Name == MetaSearchTool || e.tool.Name == MetaExecuteTool || !allowed[e.tool.Name] {
+			continue
+		}
+		entries = append(entries, e)
+	}
+	g.mu.RUnlock()
+	codeTools := make([]codemode.Tool, 0, len(entries))
+	out := make([]toolsearch.Tool, 0, len(entries))
+	for _, e := range entries {
+		props, required := codeModeSchema(e)
+		desc := strings.TrimPrefix(e.tool.Description, descriptionBanner)
+		if !isCodeModeTool(e.tool.Name) {
+			group := access.GroupOf(e.upstream, e.tool.Name)
+			server, name := group, strings.TrimPrefix(e.tool.Name, group+".")
+			if internalEntry(e) {
+				server, name = toolyardServer, group+"_"+name
+			}
+			codeTools = append(codeTools, codemode.Tool{Server: server, Name: name, Target: e.tool.Name})
+		}
+		reqAny := make([]any, len(required))
+		for i, r := range required {
+			reqAny[i] = r
+		}
+		out = append(out, toolsearch.Tool{
+			Name:         e.tool.Name,
+			Server:       e.upstream,
+			Description:  desc,
+			InputSchema:  map[string]any{"type": "object", "properties": props, "required": reqAny},
+			OutputSchema: outputSchemaOf(e.tool),
+		})
+	}
+	names := codemode.CodeNames(codeTools)
+	for i := range out {
+		out[i].CodeName = names[out[i].Name]
+	}
+	return out
+}
+
+// handleSearchTools answers tools.search. Read-only: never holds for
+// approval.
 func (g *Gateway) handleSearchTools() directHandler {
 	return func(ctx context.Context, args map[string]any) (*mcp.CallToolResult, error) {
-		q, _ := args["query"].(string)
-		limitedTo, _ := args["upstream"].(string)
-		limit := 50
-		if v, ok := numericArgument(args["limit"]); ok && int(v) > 0 {
-			limit = int(v)
+		req := SearchRequest{}
+		req.Query, _ = args["query"].(string)
+		req.Mode, _ = args["mode"].(string)
+		req.Detail, _ = args["detail"].(string)
+		req.Upstream, _ = args["upstream"].(string)
+		if v, ok := asInt(args["limit"]); ok && v > 0 {
+			req.Limit = v
 		}
-		needle := strings.ToLower(strings.TrimSpace(q))
-
-		// Only the tools this caller may use: a member searching for a
-		// server they were never granted finds nothing, as if it weren't there.
-		entries := g.CatalogFor(ctx)
-		// Hide the meta-tools themselves from search results so the model can't
-		// recursively call tools.execute -> tools.execute.
-		filtered := entries[:0]
-		for _, e := range entries {
-			if e.Name == MetaSearchTool || e.Name == MetaExecuteTool {
-				continue
+		if strings.TrimSpace(req.Detail) == "" {
+			// The MCP tool has always returned each tool's input schema,
+			// and agents in router-only or top-N mode call tools.execute
+			// from it: full stays the default for an agent's own call. A
+			// script's call (JavaScript or Starlark, directly or through
+			// tools.execute) and GET /v1/code/search default to summary,
+			// which keeps a search's answer small inside a script.
+			req.Detail = string(toolsearch.DetailFull)
+			if isWithinCodeMode(ctx) {
+				req.Detail = string(toolsearch.DetailSummary)
 			}
-			if limitedTo != "" && e.Upstream != limitedTo {
-				continue
-			}
-			if needle != "" {
-				hay := strings.ToLower(e.Name + " " + e.Description)
-				if !strings.Contains(hay, needle) {
-					continue
-				}
-			}
-			filtered = append(filtered, e)
 		}
-		sort.Slice(filtered, func(i, j int) bool { return filtered[i].Name < filtered[j].Name })
-		if len(filtered) > limit {
-			filtered = filtered[:limit]
+		body, err := g.SearchTools(ctx, req)
+		var se *SearchError
+		switch {
+		case errors.As(err, &se):
+			return mcp.NewToolResultError(se.Message), nil
+		case err != nil:
+			return mcp.NewToolResultErrorFromErr("search", err), nil
 		}
-
-		body, err := json.MarshalIndent(map[string]any{
-			"total":   len(filtered),
-			"results": filtered,
-		}, "", "  ")
+		text, err := json.MarshalIndent(body, "", "  ")
 		if err != nil {
 			return mcp.NewToolResultErrorFromErr("encode results", err), nil
 		}
-		res := mcp.NewToolResultText(string(body))
-		res.StructuredContent = map[string]any{
-			"total":   len(filtered),
-			"results": filtered,
-		}
+		res := mcp.NewToolResultText(string(text))
+		res.StructuredContent = body
 		return res, nil
 	}
 }
@@ -139,9 +261,14 @@ func (g *Gateway) handleExecuteTool() directHandler {
 		}
 		// A script may reach tools.execute (toolyard.tools_execute) but
 		// not code mode itself: a nested executeToolCode would only
-		// recurse, one worker slot per level.
-		if r, ok := actor.RaiserFrom(ctx); ok && r.Via == codemode.Via && isCodeModeTool(target) {
+		// recurse, one worker slot per level. routeEntry refuses it at any
+		// depth (refuseNestedCodeMode); this answers the direct case early.
+		// tools.execute never targets itself (RouteCall refuses that).
+		if r, ok := actor.RaiserFrom(ctx); ok && (r.Via == codemode.Via || isWithinCodeMode(ctx)) && isCodeModeTool(target) {
 			return mcp.NewToolResultErrorf("%s cannot be called from code mode: call the tools you need directly in the script", target), nil
+		}
+		if target == MetaExecuteTool {
+			return mcp.NewToolResultError("tools.execute cannot target itself"), nil
 		}
 		inner, _ := args["arguments"].(map[string]any)
 		if inner == nil {

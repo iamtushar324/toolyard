@@ -10,6 +10,7 @@ import (
 
 	"github.com/tusharbhardwaj/toolyard/internal/audit"
 	"github.com/tusharbhardwaj/toolyard/internal/clerk"
+	"github.com/tusharbhardwaj/toolyard/internal/cluster"
 	"github.com/tusharbhardwaj/toolyard/internal/identity"
 	"github.com/tusharbhardwaj/toolyard/internal/identitykeys"
 	"github.com/tusharbhardwaj/toolyard/internal/logx"
@@ -186,7 +187,14 @@ func (s *Server) connectT3(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	unlock := cfg.locks.lock(u.ID)
+	unlock, err := cfg.locks.lock(ctx, u.ID)
+	if err != nil {
+		// Another replica is connecting this person and did not finish in
+		// time: a retry a little later finds its result.
+		w.Header().Set("Retry-After", "5")
+		s.connectRefuse(ctx, w, at, http.StatusServiceUnavailable, "busy_retry", err)
+		return
+	}
 	defer unlock()
 	at.keyState, err = s.connectIdentityKey(ctx, u.ID)
 	if err != nil {
@@ -335,10 +343,12 @@ func (s *Server) connectAudit(ctx context.Context, at *connectAttempt, decision,
 }
 
 // keyedMutex is one mutex per key, dropped when nobody holds or waits on
-// it.
+// it. With a multi-node cluster (Server.SetCluster) it is a cluster lock
+// per key instead, so two replicas never connect one person at once.
 type keyedMutex struct {
-	mu    sync.Mutex
-	locks map[string]*keyedLock
+	mu      sync.Mutex
+	locks   map[string]*keyedLock
+	cluster *cluster.Cluster
 }
 
 type keyedLock struct {
@@ -346,8 +356,16 @@ type keyedLock struct {
 	refs int
 }
 
-// lock blocks until key is free and returns its unlock.
-func (k *keyedMutex) lock(key string) func() {
+// lock blocks until key is free and returns its unlock. With several
+// replicas it waits at most 30 s (one connect takes a few round trips to
+// Clerk) or until ctx ends, and then fails rather than connect without
+// the lock: the caller answers with a retryable 503.
+func (k *keyedMutex) lock(ctx context.Context, key string) (func(), error) {
+	if k.cluster.MultiNode() {
+		lctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		defer cancel()
+		return k.cluster.Lock(lctx, "connect-t3:"+key)
+	}
 	k.mu.Lock()
 	if k.locks == nil {
 		k.locks = map[string]*keyedLock{}
@@ -367,5 +385,5 @@ func (k *keyedMutex) lock(key string) func() {
 			delete(k.locks, key)
 		}
 		k.mu.Unlock()
-	}
+	}, nil
 }

@@ -44,6 +44,14 @@ type Event struct {
 	Arguments     json.RawMessage `json:"arguments,omitempty"`
 	ResultSummary string          `json:"result_summary,omitempty"`
 	ApprovalID    string          `json:"approval_id,omitempty"`
+	// RunID is the code-mode run the event belongs to (WithRunID), "" for
+	// a call outside code mode.
+	RunID string `json:"run_id,omitempty"`
+	// OAuthClientID is the OAuth client whose agent raised the event, ""
+	// for an agent that is not an OAuth client. Write looks it up from the
+	// grant when the raiser is an OAuth client's agent; the 0057 trigger
+	// fills the column for every other path that writes audit rows.
+	OAuthClientID string `json:"oauth_client_id,omitempty"`
 
 	// Raiser is who raised the call. Write fills empty fields from the
 	// actor.Raiser on ctx, so call sites needn't repeat it. CallerID is
@@ -67,7 +75,20 @@ func (e *Event) SetDecider(d actor.Decider) {
 type Logger struct {
 	db   *store.DB
 	subs subscribers
+
+	// oauthMu guards oauthClients, a cache of agent id -> OAuth client id.
+	// The mapping never changes: a grant keeps its agent and its client
+	// for life (the grant row outlives the agent).
+	oauthMu      sync.Mutex
+	oauthClients map[string]string
 }
+
+// agentKindOAuthClient is the agent kind of an OAuth client's agent
+// (mcpauth.AgentKindOAuthClient, identity.AgentKindOAuthClient).
+const agentKindOAuthClient = "oauth_client"
+
+// maxOAuthClientCache bounds oauthClients; a full cache starts over.
+const maxOAuthClientCache = 4096
 
 type subscribers struct {
 	mu        sync.Mutex
@@ -114,7 +135,8 @@ const eventColumns = `id, ts, agent_id, upstream_name, tool_name, event_type, de
             agent_name, agent_kind, owner_user_id, owner_email, owner_name,
             mcp_session_id, agent_session_id, client_session_id, client_session_claimed,
             client_kind, client_name, client_ip, via,
-            decided_by_user_id, decided_by_email, decided_by_name, decided_via, decider_ref`
+            decided_by_user_id, decided_by_email, decided_by_name, decided_via, decider_ref,
+            run_id, oauth_client_id`
 
 var eventPlaceholders = strings.TrimSuffix(strings.Repeat("?,", strings.Count(eventColumns, ",")+1), ",")
 
@@ -133,6 +155,10 @@ func (l *Logger) Write(ctx context.Context, e Event) error {
 	if e.TS == 0 {
 		e.TS = time.Now().UnixMilli()
 	}
+	if e.RunID == "" {
+		e.RunID = RunIDFrom(ctx)
+	}
+	e.RunID = actor.Clean(e.RunID)
 	if r, ok := actor.RaiserFrom(ctx); ok {
 		e.Raiser = e.Raiser.Merge(r)
 	}
@@ -141,6 +167,12 @@ func (l *Logger) Write(ctx context.Context, e Event) error {
 	// its own. An explicit AgentID wins, else the caller on the Raiser.
 	if e.AgentID == "" {
 		e.AgentID = e.CallerID
+	}
+	e.OAuthClientID = actor.Clean(e.OAuthClientID)
+	if e.OAuthClientID == "" && e.AgentKind == agentKindOAuthClient {
+		// The trigger would fill the column too; setting it here puts it
+		// on the copy the live feed gets as well.
+		e.OAuthClientID = l.oauthClientOf(ctx, e.AgentID)
 	}
 	for _, p := range []*string{&e.DecidedByUserID, &e.DecidedByEmail, &e.DecidedByName, &e.DecidedVia, &e.DeciderRef} {
 		*p = actor.Clean(*p)
@@ -168,7 +200,32 @@ func eventArgs(e Event) []any {
 		nullStr(e.MCPSessionID), nullStr(e.AgentSessionID), nullStr(e.ClientSessionID), boolInt(e.ClientSessionClaimed),
 		nullStr(e.ClientKind), nullStr(e.ClientName), nullStr(e.ClientIP), nullStr(e.Via),
 		nullStr(e.DecidedByUserID), nullStr(e.DecidedByEmail), nullStr(e.DecidedByName), nullStr(e.DecidedVia), nullStr(e.DeciderRef),
+		nullStr(e.RunID), nullStr(e.OAuthClientID),
 	}
+}
+
+// oauthClientOf returns the OAuth client of agentID's grant, "" when the
+// agent has none or the lookup fails (the trigger still fills the row).
+func (l *Logger) oauthClientOf(ctx context.Context, agentID string) string {
+	if agentID == "" {
+		return ""
+	}
+	l.oauthMu.Lock()
+	id, ok := l.oauthClients[agentID]
+	l.oauthMu.Unlock()
+	if ok {
+		return id
+	}
+	if err := l.db.QueryRowContext(ctx, `SELECT client_id FROM mcp_oauth_grants WHERE agent_id = ?`, agentID).Scan(&id); err != nil {
+		return ""
+	}
+	l.oauthMu.Lock()
+	if l.oauthClients == nil || len(l.oauthClients) >= maxOAuthClientCache {
+		l.oauthClients = map[string]string{}
+	}
+	l.oauthClients[agentID] = id
+	l.oauthMu.Unlock()
+	return id
 }
 
 // rowScanner is the subset shared by *sql.Row and *sql.Rows.
@@ -188,6 +245,7 @@ func scanEvent(s rowScanner) (Event, error) {
 		nstr{&e.MCPSessionID}, nstr{&e.AgentSessionID}, nstr{&e.ClientSessionID}, &claimed,
 		nstr{&e.ClientKind}, nstr{&e.ClientName}, nstr{&e.ClientIP}, nstr{&e.Via},
 		nstr{&e.DecidedByUserID}, nstr{&e.DecidedByEmail}, nstr{&e.DecidedByName}, nstr{&e.DecidedVia}, nstr{&e.DeciderRef},
+		nstr{&e.RunID}, nstr{&e.OAuthClientID},
 	); err != nil {
 		return Event{}, err
 	}
@@ -272,7 +330,11 @@ type Filter struct {
 	AgentSessionID  string
 	ApprovalID      string
 	ClientKind      string
-	Limit           int
+	// RunID keeps the events of one code-mode run.
+	RunID string
+	// OAuthClientID keeps the events of one OAuth client's agents.
+	OAuthClientID string
+	Limit         int
 }
 
 // Query returns events matching the filter, newest first. Backs both the
@@ -302,6 +364,8 @@ func (l *Logger) Query(ctx context.Context, f Filter) ([]Event, error) {
 		{"agent_session_id", f.AgentSessionID},
 		{"approval_id", f.ApprovalID},
 		{"client_kind", f.ClientKind},
+		{"run_id", f.RunID},
+		{"oauth_client_id", f.OAuthClientID},
 	} {
 		if eq.val != "" {
 			q += ` AND ` + eq.col + ` = ?`

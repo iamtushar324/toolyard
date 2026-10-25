@@ -17,6 +17,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/tusharbhardwaj/toolyard/internal/actor"
+	"github.com/tusharbhardwaj/toolyard/internal/cluster"
 	"github.com/tusharbhardwaj/toolyard/internal/logx"
 	"github.com/tusharbhardwaj/toolyard/internal/opsmetrics"
 	"github.com/tusharbhardwaj/toolyard/internal/store"
@@ -67,9 +68,35 @@ type Fetcher interface {
 }
 
 // DecisionCallbacks writes subscriptions and decision events inside the Inbox transaction.
+// RegisterTx is called once per receiver the request names (callback_ref
+// and callback_refs); with ref "" it subscribes the agent's default
+// receiver, if it has one.
 type DecisionCallbacks interface {
 	RegisterTx(context.Context, *sql.Tx, *Request, string) error
 	DecisionTx(context.Context, *sql.Tx, *Request) error
+}
+
+// CallbackChecker is implemented by DecisionCallbacks that can check a
+// named receiver before the item is stored: it must be an active receiver
+// of the agent that can carry r's decision. Submit reports a refusal as a
+// problem, on dry runs too.
+type CallbackChecker interface {
+	CheckSubscription(ctx context.Context, agentID, ref string, r *Request) error
+}
+
+// DefaultWarner is implemented by DecisionCallbacks that can say, before
+// an item that names no receiver is stored, why the agent's default
+// receiver will not follow it ("" when it will, or the agent has none).
+// Submit adds the answer as a warning: the item is still stored.
+type DefaultWarner interface {
+	DefaultWarning(ctx context.Context, agentID string, r *Request) string
+}
+
+// ExecutionCallbacks is implemented by DecisionCallbacks that also announce
+// a granted call's outcome (execution.completed). ExecutionTx runs inside
+// the transaction that records the outcome; tool is the call's tool.
+type ExecutionCallbacks interface {
+	ExecutionTx(ctx context.Context, tx *sql.Tx, e *Execution, agentID, tool string) error
 }
 
 // Options configure a Service.
@@ -107,7 +134,16 @@ type Options struct {
 	Passkeys PasskeyGate
 	// AgentName resolves an agent ID to a display name.
 	AgentName func(ctx context.Context, agentID string) string
-	Now       func() time.Time
+	// RichEnabled, when set and false, refuses schema_version 3 items: an
+	// operator turns it off while replicas that predate it still run
+	// (they would drop the version 3 fields when they rewrite an item).
+	RichEnabled func() bool
+	Now         func() time.Time
+	// Cluster, when it spans several nodes (Postgres), makes the Inbox safe
+	// for replicas sharing the database: execution leases, cross-node
+	// wake-ups for Wait and cluster locks instead of in-process ones
+	// (cluster.go). nil keeps the single-process behaviour.
+	Cluster *cluster.Cluster
 }
 
 // Service is the inbox.
@@ -173,9 +209,16 @@ func New(ctx context.Context, opts Options) (*Service, error) {
 		now = time.Now
 	}
 	service := &Service{db: opts.DB, opts: opts, signer: signer, now: now, watch: map[string]chan struct{}{}, uploadSlots: make(chan struct{}, MaxConcurrentUploads), agentUploads: map[string]int{}, legacySync: make(chan struct{}, 1)}
-	if _, err := service.RecoverExecutions(ctx); err != nil {
-		return nil, fmt.Errorf("execution recovery: %w", err)
+	// With replicas, a starting node never settles executions: one whose
+	// lease seems to have ended may belong to a live node that could not
+	// renew during a database outage. The leader's work recovery does it,
+	// one lease after it takes over.
+	if !service.multiNode() {
+		if _, err := service.RecoverExecutions(ctx); err != nil {
+			return nil, fmt.Errorf("execution recovery: %w", err)
+		}
 	}
+	service.subscribeCluster()
 	return service, nil
 }
 
@@ -293,6 +336,7 @@ type Preview struct {
 	CardTitle    string `json:"card_title"`
 	AudioSeconds int    `json:"audio_seconds"`
 	Tools        int    `json:"tools,omitempty"`
+	Questions    int    `json:"questions,omitempty"`
 	Attachments  int    `json:"attachments"`
 }
 
@@ -303,8 +347,11 @@ func (s *Service) Submit(ctx context.Context, agentID string, sub *Submission) (
 	if sub.Kind == "" {
 		sub.Kind = KindAccess
 	}
-	s.submitMu.Lock()
-	defer s.submitMu.Unlock()
+	unlock, err := s.lockSubmit(ctx, agentID)
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
 	fingerprint := hashJSON(sub)
 	if problem := clientRequestIDProblem(sub.ClientRequestID); problem != "" {
 		// Checked before the replay lookup: a NUL cannot travel as a
@@ -346,6 +393,26 @@ func (s *Service) Submit(ctx context.Context, agentID string, sub *Submission) (
 		}
 	}
 	s.resolveUploads(ctx, agentID, r, &res.Problems)
+	if sub.SchemaVersion == SchemaVersionRich && s.opts.RichEnabled != nil && !s.opts.RichEnabled() {
+		res.Problems = append(res.Problems, Problem{"schema_version", "schema_version 3 is turned off on this server while it is upgraded; send version 1 or 2 for now"})
+	}
+	if checker, ok := s.opts.Callbacks.(CallbackChecker); ok {
+		if r.CallbackRef != "" {
+			if err := checker.CheckSubscription(ctx, agentID, r.CallbackRef, r); err != nil {
+				res.Problems = append(res.Problems, Problem{"callback_ref", err.Error()})
+			}
+		}
+		for i, ref := range r.CallbackRefs {
+			if err := checker.CheckSubscription(ctx, agentID, ref, r); err != nil {
+				res.Problems = append(res.Problems, Problem{fmt.Sprintf("callback_refs[%d]", i), err.Error()})
+			}
+		}
+	}
+	if warner, ok := s.opts.Callbacks.(DefaultWarner); ok && len(r.callbackRefs()) == 0 && r.Kind != KindUpdate {
+		if w := warner.DefaultWarning(ctx, agentID, r); w != "" {
+			res.Warnings = append(res.Warnings, Problem{"callback_ref", w})
+		}
+	}
 
 	if sub.DryRun {
 		if n, err := s.countDryRuns(ctx, agentID, time.Hour); err == nil && n >= DryRunsPerHour {
@@ -414,7 +481,8 @@ func (s *Service) Submit(ctx context.Context, agentID string, sub *Submission) (
 		s.submitInsertHook()
 	}
 	if err := s.insert(ctx, r); err != nil {
-		// submitMu orders submissions in this process only. When another
+		// lockSubmit orders one agent's submissions, but an Inbox without a
+		// cluster does so in this process only. When another
 		// submission with the same client_request_id committed first, the
 		// unique index refuses this insert: answer as a sequential retry
 		// would (the stored request, or ErrConflict for other content).
@@ -484,8 +552,17 @@ func (s *Service) replayClientRequest(ctx context.Context, agentID, clientReques
 // backgroundCheck copies linked media and runs the judge, then marks the
 // request checked.
 func (s *Service) backgroundCheck(ctx context.Context, id string) {
-	r, err := s.Get(ctx, id)
+	// One node checks each request (lockCheck); a request another node
+	// checked meanwhile is left alone, so the judge and the fetches are
+	// never paid twice.
+	unlock, err := s.lockCheck(ctx, id)
 	if err != nil {
+		log.Printf("inbox: background check %s: another node still holds it: %v", id, err)
+		return
+	}
+	defer unlock()
+	r, err := s.Get(ctx, id)
+	if err != nil || r.Checked {
 		return
 	}
 	var probs []Problem
@@ -624,6 +701,7 @@ func preview(r *Request) *Preview {
 		CardTitle:    r.Title,
 		AudioSeconds: int(float64(len(strings.Fields(r.Audio.Script)))/2.6 + 0.5),
 		Tools:        len(r.Tools),
+		Questions:    len(r.Questions),
 		Attachments:  len(r.Attachments),
 	}
 }
@@ -637,10 +715,15 @@ type CallVerdict struct {
 }
 
 type Decision struct {
-	Verdicts        map[string]CallVerdict `json:"verdicts,omitempty"`
-	Response        *Response              `json:"response,omitempty"`
-	RequestRevision int                    `json:"request_revision,omitempty"`
-	SubmissionID    string                 `json:"submission_id,omitempty"`
+	Verdicts map[string]CallVerdict `json:"verdicts,omitempty"`
+	// Answers answers a version 3 item's questions, keyed by question ID:
+	// with the verdicts on an access item (action submit), alone on a
+	// question or blocker (action answer). Every required question needs
+	// an answer; partial answers are never a decision.
+	Answers         map[string]Answer `json:"answers,omitempty"`
+	Response        *Response         `json:"response,omitempty"`
+	RequestRevision int               `json:"request_revision,omitempty"`
+	SubmissionID    string            `json:"submission_id,omitempty"`
 
 	Action        string `json:"action"` // approve | deny | return | answer | snooze | read
 	Allow         []bool `json:"allow,omitempty"`
@@ -781,6 +864,7 @@ func (s *Service) Decide(ctx context.Context, id string, d Decision) (*Request, 
 	who, how := deciderLabel(dec), deciderSuffix(dec)
 	var out *Request
 	err := s.mutateTx(ctx, id, func(tx *sql.Tx, r *Request) error {
+		var answers map[string]Answer
 		if r.Kind == KindAccess && d.SubmissionID != "" && r.DecisionSubmissionID == d.SubmissionID {
 			if r.DecisionFingerprint != decisionFingerprint(d) {
 				return ErrConflict
@@ -809,6 +893,19 @@ func (s *Service) Decide(ctx context.Context, id string, d Decision) (*Request, 
 			}
 			if err := validateVerdicts(r, d); err != nil {
 				return err
+			}
+			if len(r.Questions) > 0 || len(d.Answers) > 0 {
+				// Rejecting every call ends the item: required answers
+				// are then optional.
+				acceptsAny := false
+				for _, v := range d.Verdicts {
+					acceptsAny = acceptsAny || v.Verdict == VerdictAccepted
+				}
+				a, err := validateAnswers(r, d.Answers, acceptsAny)
+				if err != nil {
+					return err
+				}
+				answers = a
 			}
 		}
 		note := strings.TrimSpace(d.Note)
@@ -883,6 +980,11 @@ func (s *Service) Decide(ctx context.Context, id string, d Decision) (*Request, 
 				r.GrantsExpire = now + int64(r.TTLSeconds)*1000
 			}
 			r.addActivity(now, fmt.Sprintf("%s allowed %d of %d tool%s%s", who, n, len(r.Tools), plural(len(r.Tools)), how))
+			if len(r.Questions) > 0 {
+				r.Answers = answers
+				r.Answer = answerSummary(r.Questions, answers)
+				r.addActivity(now, fmt.Sprintf("%s answered %d of %d question%s", who, len(answers), len(r.Questions), plural(len(r.Questions))))
+			}
 		case "deny":
 			for i := range r.Tools {
 				r.Tools[i].Decision = ToolRefused
@@ -904,7 +1006,11 @@ func (s *Service) Decide(ctx context.Context, id string, d Decision) (*Request, 
 			if r.Kind != KindQuestion && r.Kind != KindBlocker {
 				return ErrBadDecision
 			}
-			if err := answerQuestion(r, d, now); err != nil {
+			if len(r.Questions) > 0 {
+				if err := answerQuestions(r, d); err != nil {
+					return err
+				}
+			} else if err := answerQuestion(r, d, now); err != nil {
 				return err
 			}
 			r.Status = StatusAnswered
@@ -965,18 +1071,21 @@ func withNote(n string) string {
 
 // AgentView is what an agent sees about one of its requests.
 type AgentView struct {
-	Revision     int             `json:"revision"`
-	Response     *AnswerResponse `json:"response,omitempty"`
-	RequestID    string          `json:"request_id"`
-	Kind         string          `json:"kind"`
-	Status       string          `json:"status"`
-	SnoozedUntil int64           `json:"snoozed_until,omitempty"`
-	OwnerNote    string          `json:"owner_note,omitempty"`
-	Answer       string          `json:"answer,omitempty"`
-	Tools        []AgentToolView `json:"tools,omitempty"`
-	ExpiresAt    int64           `json:"expires_at,omitempty"`
-	GrantsExpire int64           `json:"grants_expire_at,omitempty"`
-	Next         string          `json:"next"`
+	Revision int             `json:"revision"`
+	Response *AnswerResponse `json:"response,omitempty"`
+	// Answers are the owner's answers to a version 3 item's questions,
+	// keyed by question ID (unanswered optional questions are absent).
+	Answers      map[string]Answer `json:"answers,omitempty"`
+	RequestID    string            `json:"request_id"`
+	Kind         string            `json:"kind"`
+	Status       string            `json:"status"`
+	SnoozedUntil int64             `json:"snoozed_until,omitempty"`
+	OwnerNote    string            `json:"owner_note,omitempty"`
+	Answer       string            `json:"answer,omitempty"`
+	Tools        []AgentToolView   `json:"tools,omitempty"`
+	ExpiresAt    int64             `json:"expires_at,omitempty"`
+	GrantsExpire int64             `json:"grants_expire_at,omitempty"`
+	Next         string            `json:"next"`
 }
 
 // AgentToolView is one tool's outcome, with the grant token the first time
@@ -1021,7 +1130,7 @@ func (s *Service) Status(ctx context.Context, agentID string, ids []string) ([]A
 			s.publish("inbox", s.cardView(ctx, r))
 		}
 		v := AgentView{Revision: r.Revision, RequestID: r.ID, Kind: r.Kind, Status: r.Status, SnoozedUntil: r.SnoozedUntil, OwnerNote: r.OwnerNote,
-			Answer: r.Answer, Response: r.Response, ExpiresAt: r.ExpiresAt, GrantsExpire: r.GrantsExpire}
+			Answer: r.Answer, Response: r.Response, Answers: r.Answers, ExpiresAt: r.ExpiresAt, GrantsExpire: r.GrantsExpire}
 		var toks map[string]string
 		if r.Status == StatusApproved {
 			toks, err = s.collectTokens(ctx, r.ID, agentID)
@@ -1048,6 +1157,9 @@ func (s *Service) Status(ctx context.Context, agentID string, ids []string) ([]A
 			v.Tools = append(v.Tools, tv)
 		}
 		v.Next = nextStep(r, len(toks) > 0)
+		if len(r.Answers) > 0 && r.Status != StatusAnswered {
+			v.Next += " Your owner also answered your questions: read answers, keyed by question ID."
+		}
 		out = append(out, v)
 	}
 	return out, nil
@@ -1070,6 +1182,9 @@ func nextStep(r *Request, freshTokens bool) string {
 	case StatusReturned:
 		return "A required tool was refused. Replan, read owner_note, and say what changed in your next request."
 	case StatusAnswered:
+		if len(r.Questions) > 0 {
+			return "Your owner answered. Read answers, keyed by question ID, and carry on."
+		}
 		return "Your owner answered; carry on with that option."
 	case StatusCancelled:
 		return "You cancelled this request."
@@ -1091,6 +1206,15 @@ func (s *Service) Wait(ctx context.Context, agentID string, ids []string, mode s
 	deadline := time.NewTimer(timeout)
 	defer deadline.Stop()
 	released := s.releaseChan()
+	// A decision on another node wakes this one through the cluster
+	// (wakeTopic); the poll re-reads the requests in case a message was
+	// missed. A single node needs neither.
+	var poll <-chan time.Time
+	if s.multiNode() {
+		t := time.NewTicker(waitPoll)
+		defer t.Stop()
+		poll = t.C
+	}
 	for {
 		done, total := 0, 0
 		var chans []chan struct{}
@@ -1126,6 +1250,8 @@ func (s *Service) Wait(ctx context.Context, agentID string, ids []string, mode s
 		select {
 		case <-changed:
 			close(stop)
+		case <-poll:
+			close(stop)
 		case <-deadline.C:
 			close(stop)
 			return s.Status(ctx, agentID, ids)
@@ -1150,7 +1276,19 @@ func (s *Service) watchCh(id string) chan struct{} {
 	return c
 }
 
+// wake wakes the waiters of request id on every node: this one at once,
+// the others through the cluster.
 func (s *Service) wake(id string) {
+	s.wakeLocal(id)
+	if s.multiNode() {
+		if err := s.opts.Cluster.Publish(context.Background(), wakeTopic, id); err != nil {
+			logx.For("inbox").Warn("inbox: wake-up for other nodes failed; their waiters poll", "request_id", id, "err", err.Error())
+		}
+	}
+}
+
+// wakeLocal wakes this node's waiters of request id.
+func (s *Service) wakeLocal(id string) {
 	s.watchMu.Lock()
 	c, ok := s.watch[id]
 	delete(s.watch, id)
@@ -1172,6 +1310,31 @@ func (s *Service) Cancel(ctx context.Context, agentID, id string) (*Request, err
 		}
 		r.Status = StatusCancelled
 		r.addActivity(s.now().UnixMilli(), "Withdrawn by the agent")
+		out = r
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	s.wake(id)
+	s.publish("inbox", s.cardView(ctx, out))
+	return out, nil
+}
+
+// CancelBySystem cancels one of agentID's pending requests because
+// toolyard took the agent's access away (reason, e.g. "grant revoked").
+// The activity says toolyard cancelled it, not that the agent withdrew it.
+func (s *Service) CancelBySystem(ctx context.Context, agentID, id, reason string) (*Request, error) {
+	var out *Request
+	err := s.mutate(ctx, id, func(r *Request) error {
+		if r.AgentID != agentID {
+			return ErrNotFound
+		}
+		if r.Status != StatusPending {
+			return ErrNotPending
+		}
+		r.Status = StatusCancelled
+		r.addActivity(s.now().UnixMilli(), "Cancelled by toolyard: "+reason)
 		out = r
 		return nil
 	})
@@ -1398,8 +1561,15 @@ func ruleSummary(r *Request) string {
 			}
 		}
 		fmt.Fprintf(&b, "%d tool%s, %d required. ", len(r.Tools), plural(len(r.Tools)), req)
+		if n := len(r.Questions); n > 0 {
+			fmt.Fprintf(&b, "%d question%s. ", n, plural(n))
+		}
 	case KindQuestion, KindBlocker:
-		fmt.Fprintf(&b, "A %s with %d options. ", r.Kind, len(r.Options))
+		if len(r.Questions) > 0 {
+			fmt.Fprintf(&b, "A %s with %d question%s. ", r.Kind, len(r.Questions), plural(len(r.Questions)))
+		} else {
+			fmt.Fprintf(&b, "A %s with %d options. ", r.Kind, len(r.Options))
+		}
 	default:
 		b.WriteString("An update. ")
 	}
@@ -1563,11 +1733,17 @@ func (s *Service) insert(ctx context.Context, r *Request) error {
 	if err = s.markUploadsUsedTx(ctx, tx, r); err != nil {
 		return err
 	}
+	refs := r.callbackRefs()
 	if s.opts.Callbacks != nil {
-		if err = s.opts.Callbacks.RegisterTx(ctx, tx, r, r.CallbackRef); err != nil {
-			return err
+		if len(refs) == 0 && r.Kind != KindUpdate {
+			refs = []string{""} // the agent's default receiver, if any
 		}
-	} else if r.CallbackRef != "" {
+		for _, ref := range refs {
+			if err = s.opts.Callbacks.RegisterTx(ctx, tx, r, ref); err != nil {
+				return err
+			}
+		}
+	} else if len(refs) > 0 {
 		return errors.New("callback_ref: callback delivery is not configured")
 	}
 	return tx.Commit()

@@ -15,29 +15,39 @@ import (
 // Limits. These are the numbers the agent protocol promises; keep them in
 // sync with docs/guidelines/agent-protocol.md (a test checks the key ones).
 const (
-	MaxTitle        = 60
-	MaxSummary      = 200
-	MaxMessage      = 4000
-	MaxFact         = 600
-	MaxAudioWords   = 75
-	MaxTools        = 12
-	MaxToolSummary  = 200
-	MaxAttachments  = 12
-	MaxCaption      = 300
-	MaxSpoken       = 120
-	MaxMarkdown     = 20000
-	MaxCodeBody     = 60000
-	MaxTableCols    = 12
-	MaxTableRows    = 200
-	MaxChartSeries  = 6
-	MaxChartPoints  = 500
-	MinOptions      = 2
-	MaxOptions      = 4
-	MaxOptionLabel  = 80
-	MaxOptionDetail = 200
-	DefaultTTL      = 1800
-	MinTTL          = 60
-	MaxTTL          = 86400
+	MaxTitle       = 60
+	MaxSummary     = 200
+	MaxMessage     = 20000
+	MaxFact        = 600
+	MaxAudioWords  = 75
+	MaxTools       = 50 // schema_version 3; MaxToolsLegacy before
+	MaxToolsLegacy = 12
+	MaxToolSummary = 200
+	MaxAttachments = 24
+	MaxCaption     = 300
+	MaxSpoken      = 120
+	MaxMarkdown    = 20000
+	MaxCodeBody    = 60000
+	MaxTableCols   = 12
+	MaxTableRows   = 200
+	MaxChartSeries = 6
+	MaxChartPoints = 500
+	MaxPieSlices   = 24
+	MaxChartLabel  = 80 // an x label, a series name, the unit
+	// MaxSubmissionBytes bounds a whole submission as JSON, and
+	// MaxParamsBytes one call's params.
+	MaxSubmissionBytes = 1 << 20
+	MaxParamsBytes     = 64 << 10
+	// MaxCallbackRefLen bounds a callback_ref (the same bound as the
+	// _callback_ref argument).
+	MaxCallbackRefLen = 512
+	MinOptions        = 2
+	MaxOptions        = 4
+	MaxOptionLabel    = 80
+	MaxOptionDetail   = 200
+	DefaultTTL        = 1800
+	MinTTL            = 60
+	MaxTTL            = 86400
 )
 
 // Problem is one thing wrong with a request, with the JSON path it's at.
@@ -67,6 +77,7 @@ const (
 // its path instead of failing the whole decode.
 type Submission struct {
 	CallbackRef       string       `json:"callback_ref,omitempty"`
+	CallbackRefs      []string     `json:"callback_refs,omitempty"`
 	PendingTTLSeconds int          `json:"pending_ttl_seconds,omitempty"`
 	SchemaVersion     int          `json:"schema_version,omitempty"`
 	ClientRequestID   string       `json:"client_request_id,omitempty"`
@@ -90,6 +101,8 @@ type Submission struct {
 	Attachments []Attachment     `json:"attachments,omitempty"`
 	TTLSeconds  int              `json:"ttl_seconds,omitempty"`
 	DryRun      bool             `json:"dry_run,omitempty"`
+	// Questions are the schema version 3 questions (questions_v3.go).
+	Questions []QuestionSpec `json:"questions,omitempty"`
 }
 
 // SubmissionTool is one tool in a Submission.
@@ -106,6 +119,18 @@ type SubmissionTool struct {
 	Summary         string         `json:"summary"`
 	Params          map[string]any `json:"params"`
 	After           []string       `json:"after,omitempty"`
+}
+
+// jsonSize is the size of v as the agent sent it: JSON without HTML
+// escaping, so "<", ">" and "&" count one byte each, not six (\u003c).
+func jsonSize(v any) (int, error) {
+	var b bytes.Buffer
+	enc := json.NewEncoder(&b)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(v); err != nil {
+		return 0, err
+	}
+	return b.Len() - 1, nil // Encode ends with a newline
 }
 
 // DecodeSubmission decodes a Submission from a generic map (MCP arguments).
@@ -148,6 +173,7 @@ func Validate(ctx context.Context, cat Catalog, agentID string, s *Submission, o
 	var probs, warns []Problem
 	add := func(path, format string, a ...any) { probs = append(probs, Problem{path, fmt.Sprintf(format, a...)}) }
 	warn := func(path, format string, a ...any) { warns = append(warns, Problem{path, fmt.Sprintf(format, a...)}) }
+	rich := s.SchemaVersion == SchemaVersionRich
 
 	r := &Request{
 		CallbackRef: s.CallbackRef, ExecutionMode: "agent", PendingTTLSeconds: s.PendingTTLSeconds,
@@ -169,6 +195,21 @@ func Validate(ctx context.Context, cat Catalog, agentID string, s *Submission, o
 	case KindAccess, KindQuestion, KindBlocker, KindUpdate:
 	default:
 		add("kind", "unknown kind %q", r.Kind)
+	}
+	// Question kinds check their version in validateQuestion.
+	if r.Kind != KindQuestion && r.Kind != KindBlocker {
+		switch s.SchemaVersion {
+		case 0, 1, 2, SchemaVersionRich:
+		default:
+			add("schema_version", "use 1, 2 or 3")
+		}
+	}
+	r.CallbackRefs = validateCallbackRefs(add, s.CallbackRefs)
+	if len(s.CallbackRef) > MaxCallbackRefLen {
+		add("callback_ref", "at most %d bytes", MaxCallbackRefLen)
+	}
+	if n, err := jsonSize(s); err == nil && n > MaxSubmissionBytes {
+		add("", "the request is %d bytes as JSON; max %d. Attach large evidence as an upload instead.", n, MaxSubmissionBytes)
 	}
 
 	checkText(add, "title", r.Title, MaxTitle, "Verb + object + target, e.g. \"Deploy api to prod\".")
@@ -226,8 +267,12 @@ func Validate(ctx context.Context, cat Catalog, agentID string, s *Submission, o
 		if len(s.Tools) == 0 {
 			add("tools", "an access request needs at least one tool")
 		}
-		if len(s.Tools) > MaxTools {
-			add("tools", "%d tools; max %d. Split the task, or leave out tools you don't need.", len(s.Tools), MaxTools)
+		maxTools := MaxToolsLegacy
+		if rich {
+			maxTools = MaxTools
+		}
+		if len(s.Tools) > maxTools {
+			add("tools", "%d tools; max %d (%d with schema_version 3). Split the task, or leave out tools you don't need.", len(s.Tools), maxTools, MaxTools)
 		}
 		names := map[string]bool{}
 		for _, st := range s.Tools {
@@ -251,6 +296,9 @@ func Validate(ctx context.Context, cat Catalog, agentID string, s *Submission, o
 				}
 			}
 			validateCallContext(add, p, &tr)
+			if n, err := jsonSize(st.Params); err == nil && n > MaxParamsBytes {
+				add(p+".params", "%d bytes as JSON; max %d", n, MaxParamsBytes)
+			}
 			checkText(add, p+".summary", tr.Summary, MaxToolSummary, "Say in plain words what this call will do.")
 			for name, raw := range st.Params {
 				if !browserNumbersSafe(raw) {
@@ -286,6 +334,9 @@ func Validate(ctx context.Context, cat Catalog, agentID string, s *Submission, o
 		if len(s.Options) > 0 {
 			add("options", "options are for inbox.ask; an access request lists tools")
 		}
+		if rich {
+			r.Question = nil
+		}
 		if r.PendingTTLSeconds == 0 {
 			r.PendingTTLSeconds = int(RequestTTL.Seconds())
 		}
@@ -300,15 +351,41 @@ func Validate(ctx context.Context, cat Catalog, agentID string, s *Submission, o
 		}
 	case KindQuestion, KindBlocker:
 		if len(s.Tools) > 0 {
-			add("tools", "a question can't carry tools; send an access request for permissions")
+			add("tools", "a question can't carry tools; send an access request for permissions (it may carry questions too)")
 		}
-		validateQuestion(r, s, add)
+		if rich {
+			// Options and the single question are mapped to questions[]
+			// below.
+			r.Question, r.Options = nil, nil
+			validateTask(r, add)
+		} else {
+			validateQuestion(r, s, add)
+		}
 		r.TTLSeconds = 0
 	case KindUpdate:
 		if len(s.Tools) > 0 || len(s.Options) > 0 {
 			add("kind", "an update can't carry tools or options")
 		}
 		r.TTLSeconds = 0
+	}
+
+	// Questions (schema version 3): an access item may carry questions,
+	// and a question or blocker carries one or more.
+	switch {
+	case rich && r.Kind == KindUpdate:
+		if len(s.Questions) > 0 || s.Question != nil {
+			add("questions", "an update can't carry questions")
+		}
+	case rich && (r.Kind == KindQuestion || r.Kind == KindBlocker):
+		qs := legacyQuestions(s)
+		if len(qs) == 0 {
+			add("questions", "give at least one question")
+		}
+		r.Questions = validateQuestionSpecs(add, qs)
+	case rich && r.Kind == KindAccess:
+		r.Questions = validateQuestionSpecs(add, legacyQuestions(s))
+	case len(s.Questions) > 0:
+		add("questions", "questions[] needs schema_version 3")
 	}
 
 	// Attachments.
@@ -321,7 +398,40 @@ func Validate(ctx context.Context, cat Catalog, agentID string, s *Submission, o
 		validateAttachment(add, p, &a, vo.AllowPrivateMedia)
 		r.Attachments = append(r.Attachments, a)
 	}
+
+	// Markdown images show inline only when they cite the agent's own
+	// upload; anything else is rendered as a link.
+	warnImages := func(path, text string) {
+		_, others := markdownImages(text)
+		if len(others) > 0 {
+			warn(path, "%d image(s) like %q won't show inline: upload the file with inbox.upload and cite ![alt](upload:<sha256>); other sources show as links", len(others), limitText(others[0], 80))
+		}
+	}
+	warnImages("message", r.Message)
+	for i, a := range r.Attachments {
+		if a.Type == "markdown" {
+			warnImages(fmt.Sprintf("attachments[%d].body", i), a.Body)
+		}
+	}
 	return r, probs, warns
+}
+
+// validateCallbackRefs checks callback_refs (more receivers next to
+// callback_ref) and returns them trimmed.
+func validateCallbackRefs(add func(string, string, ...any), refs []string) []string {
+	if len(refs) > MaxCallbackRefs {
+		add("callback_refs", "%d receivers; max %d", len(refs), MaxCallbackRefs)
+	}
+	var out []string
+	for i, ref := range refs {
+		ref = strings.TrimSpace(ref)
+		if ref == "" || len(ref) > MaxCallbackRefLen {
+			add(fmt.Sprintf("callback_refs[%d]", i), "give a callback_ref from callbacks.register (at most %d bytes)", MaxCallbackRefLen)
+			continue
+		}
+		out = append(out, ref)
+	}
+	return out
 }
 
 // exactArgs returns the parameters of a requested call that have an exact
@@ -402,23 +512,7 @@ func validateAttachment(add func(string, string, ...any), p string, a *Attachmen
 			}
 		}
 	case "chart":
-		if a.Title == "" {
-			add(p+".title", "missing")
-		}
-		if a.Chart != "line" && a.Chart != "bar" {
-			add(p+".chart", "use \"line\" or \"bar\"")
-		}
-		if len(a.Series) == 0 || len(a.Series) > MaxChartSeries {
-			add(p+".series", "give 1 to %d series", MaxChartSeries)
-		}
-		for j, s := range a.Series {
-			if len(s.Values) == 0 || len(s.Values) > MaxChartPoints {
-				add(fmt.Sprintf("%s.series[%d].values", p, j), "give 1 to %d values", MaxChartPoints)
-			}
-			if len(a.X) > 0 && len(a.X) != len(s.Values) {
-				add(fmt.Sprintf("%s.series[%d].values", p, j), "has %d values but x has %d labels", len(s.Values), len(a.X))
-			}
-		}
+		validateChart(add, p, a)
 	case "diff":
 		if a.File == "" {
 			add(p+".file", "missing")
@@ -470,6 +564,96 @@ func validateAttachment(add func(string, string, ...any), p string, a *Attachmen
 		add(p+".type", "missing")
 	default:
 		add(p+".type", "unknown type %q (markdown, table, chart, diff, code, log, image, video, file, link)", a.Type)
+	}
+}
+
+// Chart kinds the dashboard draws.
+var chartKinds = []string{"line", "bar", "stacked_bar", "area", "pie", "scatter"}
+
+// validateChart checks a chart attachment's shape. Every chart has a title
+// and 1 to MaxChartSeries series of 1 to MaxChartPoints values; x, when
+// given, labels each value. A stacked bar stacks non-negative values. A pie
+// is one series of 1 to MaxPieSlices non-negative values with a label in x
+// for each slice. A scatter's x holds the numeric x coordinates its
+// series' values (the y coordinates) pair with.
+func validateChart(add func(string, string, ...any), p string, a *Attachment) {
+	if a.Title == "" {
+		add(p+".title", "missing")
+	}
+	known := false
+	for _, k := range chartKinds {
+		known = known || a.Chart == k
+	}
+	if !known {
+		add(p+".chart", "use one of %s", strings.Join(chartKinds, ", "))
+	}
+	if len(a.Series) == 0 || len(a.Series) > MaxChartSeries {
+		add(p+".series", "give 1 to %d series", MaxChartSeries)
+	}
+	if utf8.RuneCountInString(a.Unit) > MaxChartLabel {
+		add(p+".unit", "max %d characters", MaxChartLabel)
+	}
+	for j, x := range a.X {
+		switch v := x.(type) {
+		case string:
+			if utf8.RuneCountInString(v) > MaxChartLabel {
+				add(fmt.Sprintf("%s.x[%d]", p, j), "max %d characters", MaxChartLabel)
+			}
+		default:
+			if _, ok := answerNumber(x); !ok {
+				add(fmt.Sprintf("%s.x[%d]", p, j), "an x label is a string or a number")
+			}
+		}
+	}
+	for j, s := range a.Series {
+		if utf8.RuneCountInString(s.Name) > MaxChartLabel {
+			add(fmt.Sprintf("%s.series[%d].name", p, j), "max %d characters", MaxChartLabel)
+		}
+		if len(s.Values) == 0 || len(s.Values) > MaxChartPoints {
+			add(fmt.Sprintf("%s.series[%d].values", p, j), "give 1 to %d values", MaxChartPoints)
+		}
+		if len(a.X) > 0 && len(a.X) != len(s.Values) {
+			add(fmt.Sprintf("%s.series[%d].values", p, j), "has %d values but x has %d labels", len(s.Values), len(a.X))
+		}
+		if a.Chart == "stacked_bar" || a.Chart == "pie" {
+			for _, v := range s.Values {
+				if v < 0 {
+					add(fmt.Sprintf("%s.series[%d].values", p, j), "a %s takes values of 0 or more", a.Chart)
+					break
+				}
+			}
+		}
+	}
+	switch a.Chart {
+	case "pie":
+		if len(a.Series) != 1 {
+			add(p+".series", "a pie takes exactly one series")
+			return
+		}
+		vals := a.Series[0].Values
+		if len(vals) > MaxPieSlices {
+			add(p+".series[0].values", "give 1 to %d slices", MaxPieSlices)
+		}
+		sum := 0.0
+		for _, v := range vals {
+			sum += v
+		}
+		if sum <= 0 {
+			add(p+".series[0].values", "a pie needs a total above 0")
+		}
+		if len(a.X) != len(vals) {
+			add(p+".x", "name each slice: give one label in x per value")
+		}
+	case "scatter":
+		if len(a.X) == 0 {
+			add(p+".x", "a scatter needs the numeric x coordinates in x")
+		}
+		for j, x := range a.X {
+			if _, ok := answerNumber(x); !ok {
+				add(fmt.Sprintf("%s.x[%d]", p, j), "a scatter's x coordinates are numbers")
+				break
+			}
+		}
 	}
 }
 

@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/tusharbhardwaj/toolyard/internal/gateway"
+	"github.com/tusharbhardwaj/toolyard/internal/jobs"
 	"github.com/tusharbhardwaj/toolyard/internal/secrets"
 	"github.com/tusharbhardwaj/toolyard/internal/store"
 )
@@ -80,6 +81,9 @@ type Server struct {
 	// and tokens were dropped as a result: the operator has to authorise
 	// it again. Never persisted.
 	OAuthReset bool `json:"oauth_reset,omitempty"`
+	// Async is the server's async-tool setting (async.go), set with
+	// SetAsync and filled by List and Get. nil when it has none.
+	Async *jobs.AsyncSetting `json:"async,omitempty"`
 }
 
 // AuthMode values.
@@ -142,10 +146,21 @@ type Service struct {
 	secrets SecretResolver // optional
 
 	mu sync.Mutex // serializes connect/disconnect side-effects
+	// applied is the configuration fingerprint (configFingerprint) each
+	// upstream was last connected with on this node, attempted or not;
+	// guarded by mu. Cross-node reconcile (cluster.go) compares it with
+	// the stored row.
+	applied map[string]string
+	// remote carries changes to and from the other replicas (SetCluster,
+	// cluster.go); nil on a single node.
+	remote *remoteSync
+
+	// asyncCache is the async-tool settings the gateway reads (async.go).
+	asyncCache
 }
 
 func New(db *store.DB, gw *gateway.Gateway) *Service {
-	return &Service{db: db, gw: gw, policy: Policy{AllowStdio: true}}
+	return &Service{db: db, gw: gw, policy: Policy{AllowStdio: true}, applied: map[string]string{}}
 }
 
 // SetPolicy installs admission rules. Idempotent.
@@ -338,9 +353,7 @@ func validate(srv Server) error {
 	// Built-ins (mempalace, notes, skills) are registered by startup, not
 	// from the dashboard. lake is the retired data group: old grants for it
 	// may still be stored, so no server may take its name.
-	switch srv.Name {
-	case "builtin", "fixture", "memory", "tools", "mempalace", "notes", "skills",
-		"inbox", "session", "lake", "events", "policies", "servers", "audit", "access", "toolyard", "connections":
+	if reservedName(srv.Name) {
 		return ErrReserved
 	}
 	switch srv.Transport {
@@ -536,9 +549,19 @@ func (s *Service) LoadAll(ctx context.Context) error {
 			s.recordStatus(ctx, srv.Name, "", errStdioDisabled.Error(), 0)
 			continue
 		}
+		// A server saved by an older version under a name toolyard now
+		// reserves (v0.1: jobs, callbacks) cannot load: say so plainly.
+		if newlyReserved[srv.Name] {
+			msg := reservedNameError(srv.Name)
+			log.Printf("WARNING: upstream %q %s", srv.Name, msg)
+			s.recordStatus(ctx, srv.Name, "", msg, 0)
+			continue
+		}
+		s.mu.Lock()
 		if err := s.connect(ctx, srv); err != nil {
 			s.recordStatus(ctx, srv.Name, "", err.Error(), 0)
 		}
+		s.mu.Unlock()
 	}
 	return nil
 }
@@ -572,12 +595,23 @@ func (s *Service) list(ctx context.Context) ([]Server, error) {
 	return out, rows.Err()
 }
 
-// List returns the persisted upstream configs.
-func (s *Service) List(ctx context.Context) ([]Server, error) { return s.list(ctx) }
+// List returns the persisted upstream configs, with their async settings.
+func (s *Service) List(ctx context.Context) ([]Server, error) {
+	out, err := s.list(ctx)
+	s.attachAsync(out)
+	return out, err
+}
 
-// Get returns one upstream server by name. Returns ErrNotFound when missing.
+// Get returns one upstream server by name, with its async setting.
+// Returns ErrNotFound when missing.
 func (s *Service) Get(ctx context.Context, name string) (*Server, error) {
-	return s.get(ctx, name)
+	srv, err := s.get(ctx, name)
+	if srv != nil {
+		if set := s.AsyncSetting(name); !set.IsZero() {
+			srv.Async = &set
+		}
+	}
+	return srv, err
 }
 
 // Add inserts a new upstream and tries to connect. On a connection failure the
@@ -622,6 +656,7 @@ func (s *Service) Add(ctx context.Context, srv Server) (*Server, error) {
 		return nil, err
 	}
 
+	s.publish(opSync, srv.Name, "")
 	if err := s.connect(ctx, srv); err != nil {
 		s.recordStatus(ctx, srv.Name, "", err.Error(), 0)
 		final, _ := s.get(ctx, srv.Name)
@@ -650,6 +685,8 @@ func (s *Service) Remove(ctx context.Context, name string) error {
 	if n == 0 {
 		return ErrNotFound
 	}
+	delete(s.applied, name)
+	s.publish(opSync, name, "")
 	s.gw.NotifyToolListChanged()
 	return nil
 }
@@ -672,6 +709,7 @@ func (s *Service) ReconnectAfterAuth(ctx context.Context, name string) {
 		s.recordStatus(ctx, name, "", err.Error(), 0)
 	}
 	s.mu.Unlock()
+	s.publish(opReconnect, name, "")
 }
 
 // ReconnectAfterUserAuth is called after one person connects a per_user
@@ -680,6 +718,12 @@ func (s *Service) ReconnectAfterAuth(ctx context.Context, name string) {
 // this person's session). The person's own connection opens on their
 // first call. Best-effort, as ReconnectAfterAuth.
 func (s *Service) ReconnectAfterUserAuth(ctx context.Context, name, userID string) {
+	s.reconnectAfterUserAuth(ctx, name)
+	s.publish(opUser, name, userID)
+}
+
+// reconnectAfterUserAuth is ReconnectAfterUserAuth on this node only.
+func (s *Service) reconnectAfterUserAuth(ctx context.Context, name string) {
 	srv, err := s.get(ctx, name)
 	if err != nil || !srv.Enabled || srv.AuthMode != AuthPerUser {
 		return
@@ -708,6 +752,7 @@ func (s *Service) ReconnectAfterUserAuth(ctx context.Context, name, userID strin
 // upstream: after they disconnect, or after their token was rejected.
 func (s *Service) DropUserConnection(name, userID string) {
 	s.gw.DropUserConnection(name, userID)
+	s.publish(opDropUser, name, userID)
 }
 
 // Reconnect drops any existing connection and re-tries.
@@ -723,6 +768,7 @@ func (s *Service) Reconnect(ctx context.Context, name string) (*Server, error) {
 		return nil, errStdioDisabled
 	}
 	_ = s.gw.RemoveUpstream(name)
+	s.publish(opReconnect, name, "")
 	if err := s.connect(ctx, *srv); err != nil {
 		s.recordStatus(ctx, name, "", err.Error(), 0)
 		final, _ := s.get(ctx, name)
@@ -743,16 +789,28 @@ func (s *Service) stdioRefused(srv Server) bool {
 // without tools and recorded as waiting for a first sign-in; that is not
 // a failure.
 func (s *Service) connect(ctx context.Context, srv Server) error {
+	return s.connectWith(ctx, srv, true)
+}
+
+// connectWith is connect; record false leaves the row's status alone (a
+// replica following another's change: the replica that saved the change
+// records the status, so last_status does not flip between replicas).
+func (s *Service) connectWith(ctx context.Context, srv Server, record bool) error {
+	s.applied[srv.Name] = configFingerprint(srv)
 	err := s.gw.AddUpstream(ctx, s.toCfg(srv))
 	if errors.Is(err, gateway.ErrWaitingForSignIn) {
-		s.recordStatus(ctx, srv.Name, gateway.StatusWaitingSignIn, "", 0)
+		if record {
+			s.recordStatus(ctx, srv.Name, gateway.StatusWaitingSignIn, "", 0)
+		}
 		s.gw.NotifyToolListChanged()
 		return nil
 	}
 	if err != nil {
 		return err
 	}
-	s.recordStatus(ctx, srv.Name, "ok", "", s.gw.UpstreamToolCount(srv.Name))
+	if record {
+		s.recordStatus(ctx, srv.Name, "ok", "", s.gw.UpstreamToolCount(srv.Name))
+	}
 	s.gw.NotifyToolListChanged()
 	return nil
 }
@@ -800,6 +858,26 @@ func nullStr(s string) any {
 // upstreams (e.g. "mempalace") are managed by the gateway's startup wiring;
 // removing them from the DB doesn't unregister the live tools, and the next
 // boot would simply re-insert the row anyway.
+// reservedName reports whether name belongs to the gateway (see validate).
+func reservedName(name string) bool {
+	switch name {
+	case "builtin", "fixture", "memory", "tools", "mempalace", "notes", "skills",
+		"inbox", "session", "lake", "events", "policies", "servers", "audit", "access", "toolyard", "connections", "jobs", "callbacks":
+		return true
+	}
+	return false
+}
+
+// newlyReserved are the names v0.1 reserved: a server saved under one by
+// an older version no longer loads (LoadAll says so).
+var newlyReserved = map[string]bool{"jobs": true, "callbacks": true}
+
+// reservedNameError explains why a stored server under a newly reserved
+// name is not loaded, and how to fix it.
+func reservedNameError(name string) string {
+	return fmt.Sprintf("not loaded: the server name %q is reserved since toolyard v0.1, which uses it for its own %s.* tools. Add this server again under another name, grant that name to the people who used it, then delete this one.", name, name)
+}
+
 func isReservedBuiltin(name string) bool {
 	switch name {
 	case "mempalace", "notes":
@@ -1030,6 +1108,11 @@ func (s *Service) Update(ctx context.Context, name string, patch Patch) (*Server
 	if isReservedBuiltin(name) {
 		return nil, ErrReserved
 	}
+	unlock, err := s.lockServer(ctx, name)
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -1117,8 +1200,10 @@ func (s *Service) Update(ctx context.Context, name string, patch Patch) (*Server
 	// Reconnect in place so the live upstream runs the new config. A
 	// disabled server is just taken down; LoadAll skips it on restart.
 	_ = s.gw.RemoveUpstream(name)
+	s.publish(opSync, name, "")
 	var connectErr error
 	if !next.Enabled {
+		delete(s.applied, name)
 		s.recordStatus(ctx, name, "disabled", "", 0)
 		s.gw.NotifyToolListChanged()
 	} else if connectErr = s.connect(ctx, next); connectErr != nil {
@@ -1142,6 +1227,11 @@ func (s *Service) ConvertEnvToSecret(ctx context.Context, serverName, envKey, se
 	if !secrets.ValidName(secretName) {
 		return nil, fmt.Errorf("%w: secret name must match ^[A-Z][A-Z0-9_]{0,63}$", ErrInvalid)
 	}
+	unlock, err := s.lockServer(ctx, serverName)
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -1169,6 +1259,7 @@ func (s *Service) ConvertEnvToSecret(ctx context.Context, serverName, envKey, se
 	// Reconnect so the running upstream re-dials with the ref (resolved at
 	// dial time). Best-effort: a connect failure is recorded on the row.
 	_ = s.gw.RemoveUpstream(serverName)
+	s.publish(opSync, serverName, "")
 	if err := s.connect(ctx, *srv); err != nil {
 		s.recordStatus(ctx, serverName, "", err.Error(), 0)
 		final, _ := s.get(ctx, serverName)

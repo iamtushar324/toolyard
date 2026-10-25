@@ -1,14 +1,18 @@
 package api
 
 import (
+	"context"
 	"net"
 	"net/http"
 	"net/url"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
+	"github.com/tusharbhardwaj/toolyard/internal/cluster"
 	"github.com/tusharbhardwaj/toolyard/internal/inbox"
+	"github.com/tusharbhardwaj/toolyard/internal/logx"
 )
 
 // SecurityOptions tunes the public-host hardening middleware.
@@ -225,10 +229,14 @@ func (s *Server) EnforceOriginOnMutations(next http.Handler) http.Handler {
 		case http.MethodPost, http.MethodPatch, http.MethodPut, http.MethodDelete:
 			// Token-authenticated MCP traffic skips this — no cookie auth in
 			// play. The token arrives as a bearer or in x-bf-vk, which T3's
-			// Bifrost proxy sends server-to-server with no Origin.
+			// Bifrost proxy sends server-to-server with no Origin. A request
+			// with no cookie at all skips it too: /mcp never reads a cookie,
+			// so its guard answers 401 with WWW-Authenticate, which is how an
+			// MCP client learns it can sign in with OAuth (mcpauth). A
+			// browser request carrying cookies still needs the Origin.
 			if strings.HasPrefix(r.URL.Path, "/mcp") &&
 				(strings.HasPrefix(r.Header.Get("Authorization"), "Bearer ") ||
-					strings.TrimSpace(r.Header.Get("x-bf-vk")) != "") {
+					strings.TrimSpace(r.Header.Get("x-bf-vk")) != "" || r.Header.Get("Cookie") == "") {
 				next.ServeHTTP(w, r)
 				return
 			}
@@ -398,8 +406,9 @@ func (s *Server) HardenAPI(next http.Handler) http.Handler {
 			// one browser form on the API, a connect link's Continue
 			// button (connect_link_routes.go), posts form-encoded and
 			// proves itself with a nonce cookie instead. POST /v1/code/run
-			// also takes a raw script as text/x-starlark; it is
-			// bearer-only, so the type is no CSRF door.
+			// also takes a raw script as text/x-starlark or
+			// text/javascript (application/javascript); it is bearer-only,
+			// so the type is no CSRF door.
 			if r.ContentLength != 0 && !strings.HasPrefix(path, connectLinkPath) && path != hostAuthorizePath && !strings.HasPrefix(path, uploadsPathPrefix) {
 				ct := r.Header.Get("Content-Type")
 				if ct == "" {
@@ -413,9 +422,9 @@ func (s *Server) HardenAPI(next http.Handler) http.Handler {
 				switch {
 				case ct == "application/json":
 				case path == codeRunPath && r.Method == http.MethodPost:
-					if ct != contentTypeScript {
+					if ct != contentTypeScript && ct != contentTypeJS && ct != "application/javascript" {
 						writeError(w, http.StatusUnsupportedMediaType,
-							"only text/x-starlark or application/json is accepted")
+							"only text/x-starlark, text/javascript or application/json is accepted")
 						return
 					}
 				default:
@@ -450,6 +459,8 @@ func perRouteBodyCap(path string) int64 {
 		return maxCodeRunBody // 4 MiB: a 1 MiB script after JSON escaping, plus the envelope and reason
 	case strings.HasPrefix(path, codePathPrefix):
 		return 8 << 10 // 8 KiB — a resume body; the other code routes are GETs
+	case path == jobsPath:
+		return maxJobStartBody // 4 MiB: a tool call's arguments (POST /v1/jobs)
 	case strings.HasPrefix(path, "/v1/tools/run"),
 		strings.HasPrefix(path, "/v1/agents/tools/run"):
 		// The reader allows 4 MiB, but decode() stops JSON bodies at 1 MiB
@@ -503,10 +514,17 @@ func exemptFromCSRFHeader(path string) bool {
 	if strings.HasPrefix(path, uploadsPathPrefix) {
 		return true
 	}
+	// The OAuth endpoints MCP clients call (register, token, revoke) read
+	// no cookie: client credentials and PKCE authenticate them. This also
+	// lifts the Origin check (exemptFromOriginCheck).
+	if mcpOAuthProtocolPath(path) {
+		return true
+	}
 	// Code mode over REST and session tokens are bearer-only (agent or
 	// session token); no cookie is read, so they aren't CSRF-replayable.
 	// This also lifts the Origin check (exemptFromOriginCheck).
-	if strings.HasPrefix(path, codePathPrefix) || path == sessionTokensPath || strings.HasPrefix(path, sessionTokensPrefix) {
+	if strings.HasPrefix(path, codePathPrefix) || path == sessionTokensPath || strings.HasPrefix(path, sessionTokensPrefix) ||
+		path == jobsPath || strings.HasPrefix(path, jobsPrefix) {
 		return true
 	}
 	// Webhook event ingest is bearer-authenticated (source token); no cookie
@@ -623,13 +641,72 @@ func unauthRouteLimit(path string) *unauthRouteRule {
 }
 
 // loginThrottle is a token-bucket per (ip, username) for /v1/auth/login.
-// 5 attempts per 15 minutes per source. Cheap, in-process — sufficient for a
-// single-instance gateway. Distributed deployments would swap for Redis.
+// 5 attempts per 15 minutes per source. In process on a single gateway;
+// with several replicas on one Postgres database (SetCluster) it counts in
+// the database, so the budget holds across replicas, and falls back to
+// the in-process count while the database cannot answer.
 type loginThrottle struct {
 	mu      sync.Mutex
 	buckets map[string]*throttleBucket
 	max     int
 	window  time.Duration
+
+	// shared, when set, is the database counter every replica uses; name
+	// prefixes this throttle's buckets there.
+	shared atomic.Pointer[cluster.Counter]
+	name   string
+}
+
+// sharedLimitTimeout bounds one shared rate-limit query: the limits run
+// on the request path.
+const sharedLimitTimeout = 2 * time.Second
+
+// sharedLimitFailing is set while shared rate-limit queries fail, so the
+// failure is logged once, not on every request.
+var sharedLimitFailing atomic.Bool
+
+// SetCluster makes the rate limits (login, unauthenticated routes,
+// connect-t3) and the connect-t3 per-person lock hold across every replica
+// of a multi-node database. Call it once, after New and before serving.
+// Without a multi-node cluster nothing changes.
+func (s *Server) SetCluster(c *cluster.Cluster) {
+	if !c.MultiNode() {
+		return
+	}
+	k := c.Counter()
+	s.loginLimit.share(k, "login")
+	s.unauthLimit.share(k, "unauth")
+	if s.connect != nil {
+		s.connect.locks.cluster = c
+	}
+}
+
+// share makes the throttle count in k under name.
+func (t *loginThrottle) share(k *cluster.Counter, name string) {
+	t.mu.Lock()
+	t.name = name
+	t.mu.Unlock()
+	t.shared.Store(k)
+}
+
+// sharedAllow asks the shared counter; ok is false when there is none or
+// it failed, and the in-process count decides.
+func (t *loginThrottle) sharedAllow(key string, max int, window time.Duration) (allowed, ok bool) {
+	k := t.shared.Load()
+	if k == nil {
+		return false, false
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), sharedLimitTimeout)
+	defer cancel()
+	allowed, err := k.Allow(ctx, t.name+":"+key, max, window, time.Now())
+	if err != nil {
+		if !sharedLimitFailing.Swap(true) {
+			logx.For("api").Warn("rate limit: the shared counter failed; counting in this process until it answers", "err", err.Error())
+		}
+		return false, false
+	}
+	sharedLimitFailing.Store(false)
+	return allowed, true
 }
 
 type throttleBucket struct {
@@ -653,9 +730,14 @@ func (t *loginThrottle) Allow(key string) bool {
 
 // AllowN is the variant for callers that want to specify max + window per
 // call (e.g. different rate limits per route from one shared bucket store).
+//
+// With a shared counter the in-process count still runs first: it counts
+// only this replica's allowed requests, so when it has reached max the
+// shared count has too, and the request is refused without a database
+// write (a flood stays local). Otherwise the shared counter decides, and
+// an allowed request is counted here as well.
 func (t *loginThrottle) AllowN(key string, max int, window time.Duration) bool {
 	t.mu.Lock()
-	defer t.mu.Unlock()
 	b := t.buckets[key]
 	now := time.Now()
 	if b == nil || now.Sub(b.since) > window {
@@ -663,6 +745,24 @@ func (t *loginThrottle) AllowN(key string, max int, window time.Duration) bool {
 		t.buckets[key] = b
 	}
 	if b.count >= max {
+		t.mu.Unlock()
+		return false
+	}
+	if t.shared.Load() == nil {
+		b.count++
+		t.mu.Unlock()
+		return true
+	}
+	t.mu.Unlock()
+	allowed, ok := t.sharedAllow(key, max, window)
+	if ok && !allowed {
+		return false
+	}
+	// Allowed by the shared counter, or it failed and the in-process
+	// count decides alone.
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if b.count >= max && !ok {
 		return false
 	}
 	b.count++
@@ -672,6 +772,11 @@ func (t *loginThrottle) AllowN(key string, max int, window time.Duration) bool {
 // Reset clears the bucket for a key — call after a successful login so a
 // momentarily-locked-out user can keep working.
 func (t *loginThrottle) Reset(key string) {
+	if k := t.shared.Load(); k != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), sharedLimitTimeout)
+		_ = k.Reset(ctx, t.name+":"+key)
+		cancel()
+	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	delete(t.buckets, key)
@@ -680,6 +785,11 @@ func (t *loginThrottle) Reset(key string) {
 // Sweep drops stale buckets so the map doesn't grow unbounded. Cheap;
 // callers should run it from a goroutine every minute or so.
 func (t *loginThrottle) Sweep() {
+	if k := t.shared.Load(); k != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), sharedLimitTimeout)
+		_ = k.Sweep(ctx, time.Now())
+		cancel()
+	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	now := time.Now()

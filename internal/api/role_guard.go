@@ -77,6 +77,7 @@ func sessionTokenAllowed(path string) bool {
 		return false
 	}
 	return strings.HasPrefix(path, codePathPrefix) ||
+		path == jobsPath || strings.HasPrefix(path, jobsPrefix) ||
 		path == "/v1/agents/whoami" ||
 		strings.HasPrefix(path, "/v1/agents/approvals/") ||
 		path == sessionTokensPath || strings.HasPrefix(path, sessionTokensPrefix)
@@ -120,7 +121,17 @@ var memberRoutes = map[string]string{
 	"/v1/agents":        http.MethodGet + " " + http.MethodPost,
 	"/v1/agents/enroll": http.MethodPost,
 	// Which servers and data groups this member may use.
-	"/v1/me/servers":        http.MethodGet,
+	"/v1/me/servers": http.MethodGet,
+	// Connected apps (OAuth clients) and per-agent scopes: the handlers
+	// act only on the member's own apps and agents.
+	"/v1/me/apps":           http.MethodGet,
+	"/v1/me/apps/config":    http.MethodGet,
+	"/v1/me/apps/rename":    http.MethodPost,
+	"/v1/me/apps/scope":     http.MethodPost,
+	"/v1/me/apps/revoke":    http.MethodPost,
+	"/v1/me/apps/catalog":   http.MethodGet,
+	"/v1/me/apps/audit":     http.MethodGet,
+	"/v1/me/agent-scopes":   http.MethodGet + " " + http.MethodPost,
 	"/v1/connections/hosts": http.MethodGet,
 	// The member's own Beknown key: see its status, reveal it once.
 	// Provisioning, rotating and revoking are admin routes under /v1/users/.
@@ -208,8 +219,9 @@ func memberAllowed(method, path string) bool {
 		return true
 	}
 	// Bearer-only routes (agent or session token) that never read a
-	// cookie: session tokens and code mode over REST.
-	if strings.HasPrefix(path, sessionTokensPrefix) || strings.HasPrefix(path, codePathPrefix) {
+	// cookie: session tokens, code mode over REST and async jobs.
+	if strings.HasPrefix(path, sessionTokensPrefix) || strings.HasPrefix(path, codePathPrefix) ||
+		path == jobsPath || strings.HasPrefix(path, jobsPrefix) {
 		return true
 	}
 	// A native Inbox upload: the single-use ticket in the path is the

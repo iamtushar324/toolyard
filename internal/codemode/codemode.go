@@ -5,6 +5,14 @@
 // skills written against Bifrost work unchanged when their `bifrost` MCP
 // server points at toolyard.
 //
+// Next to Bifrost's Starlark, scripts may be JavaScript (language
+// "javascript"): QuickJS-NG compiled to WebAssembly (quickjs/), run by
+// wazero's interpreter inside the same worker, with async tool calls
+// (await tools.Server.tool({...})), tools.tryCall, a bounded
+// tools.parallel and tools.search; see js.go. TypeScript stubs
+// (servers/<Server>/<tool>.d.ts) describe the tools to it; see
+// stubs_ts.go.
+//
 // The package knows nothing about the gateway. It sees the caller's tools
 // through Caller.Tools, already scoped to what that caller may use, and
 // dispatches every nested call through Caller.RouteCall, which is the
@@ -32,9 +40,9 @@
 // namespace flag or CLONE_PARENT, clone3), mounting, resource limits and
 // scheduling of other processes (prlimit64 on another pid, setpriority,
 // sched_set*, ioprio_set), and changes to file metadata (chmod, chown,
-// utimes, extended attributes, truncate). A flaw in starlark-go then
-// reaches the worker's own pipes and memory, not the gateway's files,
-// network or processes. See sandbox_linux.go.
+// utimes, extended attributes, truncate). A flaw in starlark-go (or in
+// QuickJS or wazero) then reaches the worker's own pipes and memory, not
+// the gateway's files, network or processes. See sandbox_linux.go.
 //
 // Worker.Sandbox picks the mode; the gateway reads it from
 // TOOLYARD_CODEMODE_SANDBOX (ParseSandboxMode). SandboxAuto, the default,
@@ -99,6 +107,9 @@ type Tool struct {
 	// gateway's injected fields (_reason and friends) already removed.
 	Properties map[string]any
 	Required   []string
+	// OutputSchema is the tool's declared output JSON Schema, nil when it
+	// declares none; the TypeScript stubs type results from it.
+	OutputSchema map[string]any
 	// ReasonField is the argument a nested call's reason travels in
 	// (normally _reason).
 	ReasonField string
@@ -157,9 +168,11 @@ type Worker struct {
 	// workers together (1 GiB) fit a 1.5 GiB service limit with the
 	// gateway's own few hundred MiB beside them.
 	MemoryMiB int
-	// MaxConcurrent caps scripts running at once. A run past the cap waits
-	// AcquireWait for a slot, then fails as busy. Defaults 4 and 2s.
+	// MaxConcurrent caps scripts running at once, MaxPerAgent those of
+	// one caller. A run past either cap waits AcquireWait in a fair queue
+	// for a slot, then fails as busy. Defaults 4, 3 and 30s.
 	MaxConcurrent int
+	MaxPerAgent   int
 	AcquireWait   time.Duration
 	// Sandbox says how the worker is confined beyond its resource caps;
 	// the zero value is SandboxAuto. With the sandbox on, Path must be an
@@ -356,24 +369,29 @@ func (w Worker) withDefaults() Worker {
 	if w.MaxConcurrent <= 0 {
 		w.MaxConcurrent = 4
 	}
+	if w.MaxPerAgent <= 0 {
+		w.MaxPerAgent = 3
+	}
 	if w.AcquireWait <= 0 {
-		w.AcquireWait = 2 * time.Second
+		w.AcquireWait = 30 * time.Second
 	}
 	return w
 }
 
 // Runtime renders stubs and runs scripts against one Caller.
 type Runtime struct {
-	caller Caller
-	limits Limits
-	worker Worker
-	sem    chan struct{}
+	caller  Caller
+	limits  Limits
+	worker  Worker
+	limiter *limiter
 	// inProcess runs scripts in this process instead of a worker. Tests
 	// only: it has no memory cap.
 	inProcess bool
 	// lastPID is the most recent worker's pid, for tests that check it is
-	// gone.
-	lastPID atomic.Int64
+	// gone; lastMaxRSSKiB its peak resident memory, for tests that report
+	// it.
+	lastPID       atomic.Int64
+	lastMaxRSSKiB atomic.Int64
 }
 
 // New returns a Runtime with the production worker. Zero fields in limits
@@ -406,7 +424,7 @@ func (r *Runtime) Limits() Limits { return r.limits }
 // SetWorker replaces how scripts are run. Zero fields take their defaults.
 func (r *Runtime) SetWorker(w Worker) {
 	r.worker = w.withDefaults()
-	r.sem = make(chan struct{}, r.worker.MaxConcurrent)
+	r.limiter = newLimiter(r.worker.MaxConcurrent, r.worker.MaxPerAgent)
 	lastSandboxMode.Store(int32(r.worker.Sandbox))
 }
 

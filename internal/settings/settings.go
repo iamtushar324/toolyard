@@ -15,6 +15,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/tusharbhardwaj/toolyard/internal/cluster"
 	"github.com/tusharbhardwaj/toolyard/internal/store"
 )
 
@@ -96,9 +97,16 @@ const (
 	// InboxSnapshotEnabled makes toolyard copy linked media when a request
 	// is sent. Default true.
 	InboxSnapshotEnabled = "inbox_snapshot_enabled"
+	// InboxV3Enabled accepts schema_version 3 Inbox items. Default true;
+	// an operator turns it off while replicas older than v0.1 still run
+	// (docs/self-hosting.md, rolling upgrades).
+	InboxV3Enabled = "inbox_v3_enabled"
 	// InboxHostingNote tells agents where to host files (inbox.guide
 	// topic "hosting").
 	InboxHostingNote = "inbox_hosting_note"
+	// CallbackMaxReceivers caps each agent's active callback receivers.
+	// Default 500 (callbacks.DefaultMaxReceiversPerAgent).
+	CallbackMaxReceivers = "callback_max_receivers_per_agent"
 
 	// Inbox attention (when the phone buzzes; inbox-spec.md §6).
 	//
@@ -177,6 +185,10 @@ type Service struct {
 
 	mu    sync.RWMutex
 	cache map[string]json.RawMessage
+
+	// cluster, when it spans several nodes, carries every write to the
+	// other replicas' caches (SetCluster, cluster.go).
+	cluster *cluster.Cluster
 }
 
 func New(ctx context.Context, db *store.DB) (*Service, error) {
@@ -201,10 +213,14 @@ func (s *Service) reloadAll(ctx context.Context) error {
 		}
 		cache[k] = json.RawMessage(v)
 	}
+	// A read that stopped half-way keeps the last good cache.
+	if err := rows.Err(); err != nil {
+		return err
+	}
 	s.mu.Lock()
 	s.cache = cache
 	s.mu.Unlock()
-	return rows.Err()
+	return nil
 }
 
 // All returns a snapshot of every setting (decoded to interface{}). Used by
@@ -259,6 +275,9 @@ func (s *Service) All(ctx context.Context) (map[string]any, error) {
 	}
 	if _, ok := out[InboxSnapshotEnabled]; !ok {
 		out[InboxSnapshotEnabled] = true
+	}
+	if _, ok := out[InboxV3Enabled]; !ok {
+		out[InboxV3Enabled] = true
 	}
 	if _, ok := out[InboxJudgeEnabled]; !ok {
 		out[InboxJudgeEnabled] = false
@@ -426,6 +445,7 @@ func (s *Service) Set(ctx context.Context, key string, value any) error {
 	s.mu.Lock()
 	s.cache[key] = body
 	s.mu.Unlock()
+	s.publishChange(ctx)
 	return nil
 }
 
@@ -480,6 +500,7 @@ func (s *Service) Patch(ctx context.Context, updates map[string]any) error {
 		s.cache[r.k] = r.b
 	}
 	s.mu.Unlock()
+	s.publishChange(ctx)
 	return nil
 }
 

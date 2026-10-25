@@ -11,6 +11,7 @@ import (
 	"github.com/tusharbhardwaj/toolyard/docs"
 	"github.com/tusharbhardwaj/toolyard/internal/audit"
 	"github.com/tusharbhardwaj/toolyard/internal/identity"
+	"github.com/tusharbhardwaj/toolyard/internal/mcpauth"
 	"github.com/tusharbhardwaj/toolyard/internal/settings"
 )
 
@@ -101,6 +102,10 @@ var operatorOwnerPrefixes = []string{
 	"/v1/inbox/batch",
 	"/v1/inbox/grants",
 	"/v1/secrets/",
+	// A connected app's or agent's access, and revoking an app.
+	"/v1/me/agent-scopes",
+	"/v1/me/apps/scope",
+	"/v1/me/apps/revoke",
 }
 
 // operatorScopeFor returns the scope an operator token needs for method on
@@ -115,7 +120,8 @@ func operatorScopeFor(method, path string) (scope string, ok bool) {
 	// Code mode over REST runs as an agent, and session tokens belong to
 	// an agent: a person's operator token reaches neither.
 	if operatorNeverPaths[path] || strings.Contains(path, "/reveal") || strings.HasPrefix(path, connectLinkPath) || strings.HasPrefix(path, uploadsPathPrefix) ||
-		strings.HasPrefix(path, codePathPrefix) || strings.HasPrefix(path, sessionTokensPrefix) {
+		strings.HasPrefix(path, codePathPrefix) || strings.HasPrefix(path, sessionTokensPrefix) ||
+		path == jobsPath || strings.HasPrefix(path, jobsPrefix) {
 		return "", false
 	}
 	switch method {
@@ -150,6 +156,14 @@ var ownerSettingKeys = map[string]bool{
 	settings.TelegramUserID:                  true,
 	settings.MetricsRetentionDays:            true,
 	settings.EventsRetentionDays:             true,
+	// OAuth for MCP clients: who may sign in, where they may return to
+	// and for how long.
+	mcpauth.SettingEnabled:          true,
+	mcpauth.SettingRedirectHosts:    true,
+	mcpauth.SettingAccessTTLMinutes: true,
+	mcpauth.SettingRefreshTTLDays:   true,
+	mcpauth.SettingMaxSessionDays:   true,
+	mcpauth.SettingCustomSchemes:    true,
 }
 
 // operatorGuard authenticates an operator-token request and checks its scope.
@@ -447,6 +461,14 @@ var operatorCatalog = []operatorCatalogEntry{
 	{"/v1/users", "GET POST", "users: list, create"},
 	{"/v1/users/{id}", "GET PATCH DELETE POST", "one user: role, status, access, identity key"},
 	{"/v1/me/servers", "GET", "servers and data groups the caller may use"},
+	{"/v1/me/apps", "GET", "the caller's connected apps (OAuth clients); ?all=true lists everyone's for an admin"},
+	{"/v1/me/apps/config", "GET", "how to connect an MCP client by URL, and for an admin the OAuth settings"},
+	{"/v1/me/apps/rename", "POST", "rename a connected app (its agent's nickname)"},
+	{"/v1/me/apps/scope", "POST", "replace a connected app's tool scope"},
+	{"/v1/me/apps/revoke", "POST", "revoke a connected app: its tokens stop and its agent is disabled"},
+	{"/v1/me/apps/catalog", "GET", "the servers and tools an app's or agent's owner may use, for the scope editor"},
+	{"/v1/me/apps/audit", "GET", "recent audit rows of a connected app or agent"},
+	{"/v1/me/agent-scopes", "GET POST", "read or replace any owned agent's per-agent allow and deny lists"},
 	{"/v1/me/connections", "GET", "per-user servers the caller may connect, with their sign-in state (never tokens)"},
 	{"/v1/me/connections/{id}", "POST DELETE", "POST /begin starts the caller's own sign-in -> {authorize_url}; DELETE disconnects their account"},
 	{"/v1/me/identity-key", "GET POST", "the caller's identity key status"},
@@ -461,13 +483,16 @@ var operatorCatalog = []operatorCatalogEntry{
 	{"/v1/agents/approvals/{id}", "GET", "agent: poll its own approval (agent or session token)"},
 	{"/v1/agents/session-tokens", "POST", "agent: mint a short-lived session token for one client session {session_id, ttl_seconds} (agent token only; never via operator token)"},
 	{"/v1/agents/session-tokens/{id}", "DELETE", "agent: revoke a session token (its agent token, or the session token itself; never via operator token)"},
-	{"/v1/code/run", "POST", "agent: run a code-mode script (text/x-starlark with X-Toolyard-Reason, or JSON {code, reason, wait_seconds}); Idempotency-Key, Prefer: wait=N (agent or session token; never via operator token)"},
+	{"/v1/code/run", "POST", "agent: run a code-mode script (text/x-starlark or text/javascript with X-Toolyard-Reason, or JSON {code, reason, language, wait_seconds}); Idempotency-Key, Prefer: wait=N (agent or session token; never via operator token)"},
 	{"/v1/code/runs/{id}", "GET POST", "agent: GET reads a run (Prefer: wait=N); POST /resume {request_id} resumes a held run (never via operator token)"},
 	{"/v1/code/files", "GET", "agent: listToolFiles as text (never via operator token)"},
-	{"/v1/code/files/{id}", "GET", "agent: /v1/code/files/{server}/{tool}.pyi, the readToolFile stub (never via operator token)"},
+	{"/v1/code/files/{id}", "GET", "agent: /v1/code/files/{server}/{tool}.pyi (or .d.ts, {server}.d.ts, index.d.ts), the readToolFile stub (never via operator token)"},
 	{"/v1/code/docs/{id}", "GET", "agent: /v1/code/docs/{server}/{tool}, the getToolDocs text (never via operator token)"},
+	{"/v1/code/search", "GET", "agent: tools.search over the caller's tools ?q=, mode=keyword|regex, detail=name|summary|full, limit, upstream (never via operator token)"},
 	{"/v1/code/openapi.json", "GET", "code mode over REST as OpenAPI 3.1 (no token)"},
 	{"/v1/code/ty", "GET", "the ty command for code mode over REST, Python 3 (no token)"},
+	{"/v1/jobs", "GET POST", "agent: POST starts a tool call as an async job {tool, arguments, reason, callback_ref, wait_seconds} (Idempotency-Key, Prefer: wait=N); GET lists the agent's jobs ?status=&limit=&before= (agent or session token; never via operator token)"},
+	{"/v1/jobs/{id}", "GET POST", "agent: GET a job (Prefer: wait=N); GET /result its tool result; POST /cancel cancels it (never via operator token)"},
 	{"/v1/approvals", "GET", "approval queue"},
 	{"/v1/approvals/{id}", "GET POST", "one approval; POST decides it"},
 	{"/v1/approvals/decide-batch", "POST", "decide many approvals"},
@@ -478,7 +503,7 @@ var operatorCatalog = []operatorCatalogEntry{
 	{"/v1/tools", "GET", "full tool catalog"},
 	{"/v1/tools/run", "POST", "run a tool as the user {tool, arguments}; writes still need approval"},
 	{"/v1/servers", "GET POST", "MCP upstream servers: list, add {name, transport, command, args, url, env, headers, identity, auth_mode: shared|per_user, enabled}"},
-	{"/v1/servers/{id}", "GET PATCH DELETE POST", "one server; PATCH {url, headers, env, identity, auth_mode, enabled}; POST /reconnect, /convert-env, /oauth/*; GET /connections (who signed in to a per_user server)"},
+	{"/v1/servers/{id}", "GET PATCH DELETE POST PUT", "one server; PATCH {url, headers, env, identity, auth_mode, enabled}; POST /reconnect, /convert-env, /oauth/*; GET /connections (who signed in to a per_user server); GET/PUT /async {mode: off|always|after, after_ms, tools: {tool: {mode, after_ms}}} (async tools)"},
 	{"/v1/mcp-oauth/callback", "GET", "OAuth redirect target for upstream servers"},
 	{"/v1/mcp-oauth/paste", "POST", "paste an OAuth code for an upstream server"},
 	{"/v1/mcp-oauth/github-app", "GET", "GitHub App manifest return target; stores only the OAuth client secret"},

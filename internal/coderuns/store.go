@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/tusharbhardwaj/toolyard/internal/cluster"
 	"github.com/tusharbhardwaj/toolyard/internal/codemode"
 	"github.com/tusharbhardwaj/toolyard/internal/store"
 )
@@ -19,9 +20,9 @@ const (
 )
 
 // runColumns are the code_runs columns a view needs (not the script).
-const runColumns = `id, agent_id, COALESCE(session_id, ''), COALESCE(idempotency_key, ''), fingerprint, reason, status,
+const runColumns = `id, agent_id, COALESCE(session_id, ''), COALESCE(idempotency_key, ''), fingerprint, reason, COALESCE(language, 'starlark'), status,
 	COALESCE(result, ''), COALESCE(error_kind, ''), COALESCE(error_message, ''), COALESCE(logs, ''), COALESCE(held, ''),
-	created_at, updated_at, COALESCE(finished_at, 0)`
+	created_at, updated_at, COALESCE(finished_at, 0), resume_gen`
 
 // runWriteTimeout bounds the writes that must not follow the client's
 // connection: a disconnect while one commits would leave a run row with
@@ -32,10 +33,17 @@ const runWriteTimeout = 10 * time.Second
 func (s *Service) insertRun(ctx context.Context, r *Run) error {
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), runWriteTimeout)
 	defer cancel()
+	lang := r.Language
+	if lang == "" {
+		lang = codemode.LanguageStarlark
+	}
+	// The run is this node's from the start: it runs on this process, under
+	// a lease it renews (RunLeaseRenewal).
 	_, err := s.db.ExecContext(ctx, `INSERT INTO code_runs
-		(id, agent_id, session_id, idempotency_key, fingerprint, code, reason, status, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		r.ID, r.AgentID, nullStr(r.SessionID), nullStr(r.IdempotencyKey), r.Fingerprint, r.code, r.Reason, r.Status, r.CreatedAt, r.UpdatedAt)
+		(id, agent_id, session_id, idempotency_key, fingerprint, code, reason, language, status, created_at, updated_at, owner_instance, lease_until)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, `+cluster.LeaseUntilSQL(s.db.Dialect)+`)`,
+		r.ID, r.AgentID, nullStr(r.SessionID), nullStr(r.IdempotencyKey), r.Fingerprint, r.code, r.Reason, lang, r.Status, r.CreatedAt, r.UpdatedAt,
+		s.cluster.InstanceID())
 	return err
 }
 
@@ -67,8 +75,8 @@ func (s *Service) loadRun(ctx context.Context, agentID, id string, withCode bool
 	q += ` FROM code_runs WHERE id = ? AND agent_id = ?`
 	var r Run
 	var result, logs, held string
-	dest := []any{&r.ID, &r.AgentID, &r.SessionID, &r.IdempotencyKey, &r.Fingerprint, &r.Reason, &r.Status,
-		&result, &r.ErrorKind, &r.ErrorMessage, &logs, &held, &r.CreatedAt, &r.UpdatedAt, &r.FinishedAt}
+	dest := []any{&r.ID, &r.AgentID, &r.SessionID, &r.IdempotencyKey, &r.Fingerprint, &r.Reason, &r.Language, &r.Status,
+		&result, &r.ErrorKind, &r.ErrorMessage, &logs, &held, &r.CreatedAt, &r.UpdatedAt, &r.FinishedAt, &r.resumeGen}
 	if withCode {
 		dest = append(dest, &r.code)
 	}
@@ -101,7 +109,8 @@ func (s *Service) loadRun(ctx context.Context, agentID, id string, withCode bool
 
 // loadCalls reads a run's call records in order.
 func (s *Service) loadCalls(ctx context.Context, runID string) ([]Call, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT seq, tool, target, args_hash, status, replayed, COALESCE(replay_text, ''), started_at, COALESCE(finished_at, 0)
+	rows, err := s.db.QueryContext(ctx, `SELECT seq, tool, target, args_hash, status, replayed, COALESCE(replay_text, ''), started_at, COALESCE(finished_at, 0),
+		sent, COALESCE(error_kind, ''), COALESCE(error_text, ''), COALESCE(approval_id, ''), COALESCE(hold_content, '')
 		FROM code_run_calls WHERE run_id = ? ORDER BY seq`, runID)
 	if err != nil {
 		return nil, err
@@ -110,12 +119,14 @@ func (s *Service) loadCalls(ctx context.Context, runID string) ([]Call, error) {
 	var out []Call
 	for rows.Next() {
 		var c Call
-		var replayed int64
+		var replayed, sent int64
 		var text string
-		if err := rows.Scan(&c.Seq, &c.Tool, &c.Target, &c.ArgsHash, &c.Status, &replayed, &text, &c.StartedAt, &c.FinishedAt); err != nil {
+		if err := rows.Scan(&c.Seq, &c.Tool, &c.Target, &c.ArgsHash, &c.Status, &replayed, &text, &c.StartedAt, &c.FinishedAt,
+			&sent, &c.errorKind, &c.errorText, &c.approvalID, &c.hold); err != nil {
 			return nil, err
 		}
 		c.Replayed = replayed != 0
+		c.sent = sent != 0
 		if text != "" {
 			if err := json.Unmarshal([]byte(text), &c.replayText); err != nil {
 				return nil, fmt.Errorf("run %s call %d: replay text: %w", runID, c.Seq, err)
@@ -128,19 +139,22 @@ func (s *Service) loadCalls(ctx context.Context, runID string) ([]Call, error) {
 
 // markRunning moves a queued run to running.
 func (s *Service) markRunning(ctx context.Context, id string) error {
-	_, err := s.db.ExecContext(ctx, `UPDATE code_runs SET status = ?, updated_at = ? WHERE id = ? AND status = ?`,
-		StatusRunning, s.now().UnixMilli(), id, StatusQueued)
+	_, err := s.db.ExecContext(ctx, `UPDATE code_runs SET status = ?, updated_at = ?, owner_instance = ?, lease_until = `+cluster.LeaseUntilSQL(s.db.Dialect)+`
+		WHERE id = ? AND status = ?`,
+		StatusRunning, s.now().UnixMilli(), s.cluster.InstanceID(), id, StatusQueued)
 	return err
 }
 
-// claimResume moves a held run to running, unless another resume (or
-// anything else) changed its status since r was read.
+// claimResume moves a held run to running, unless another resume claimed
+// it since r was read (resume_gen moved on, even if that resume ended held
+// again with the same status) or anything else changed its status.
 func (s *Service) claimResume(ctx context.Context, r *Run) (bool, error) {
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), runWriteTimeout)
 	defer cancel()
 	now := s.now().UnixMilli()
-	res, err := s.db.ExecContext(ctx, `UPDATE code_runs SET status = ?, error_kind = NULL, error_message = NULL, finished_at = NULL, updated_at = ?
-		WHERE id = ? AND agent_id = ? AND status = ?`, StatusRunning, now, r.ID, r.AgentID, r.Status)
+	res, err := s.db.ExecContext(ctx, `UPDATE code_runs SET status = ?, error_kind = NULL, error_message = NULL, finished_at = NULL, updated_at = ?,
+		owner_instance = ?, lease_until = `+cluster.LeaseUntilSQL(s.db.Dialect)+`, resume_gen = resume_gen + 1
+		WHERE id = ? AND agent_id = ? AND status = ? AND resume_gen = ?`, StatusRunning, now, s.cluster.InstanceID(), r.ID, r.AgentID, r.Status, r.resumeGen)
 	if err != nil {
 		return false, err
 	}
@@ -149,12 +163,14 @@ func (s *Service) claimResume(ctx context.Context, r *Run) (bool, error) {
 		return false, err
 	}
 	if n == 1 {
-		r.Status, r.UpdatedAt = StatusRunning, now
+		r.Status, r.UpdatedAt, r.resumeGen = StatusRunning, now, r.resumeGen+1
 	}
 	return n == 1, nil
 }
 
-// upsertCall writes one call record.
+// upsertCall writes one call record: with the replay value of a
+// succeeded call, the error kind and text of a failed one, and the text,
+// approval id and structured content of a held one.
 func upsertCall(ctx context.Context, q store.Querier, runID string, c Call) error {
 	var text any
 	if c.Status == codemode.StatusSucceeded {
@@ -164,17 +180,27 @@ func upsertCall(ctx context.Context, q store.Querier, runID string, c Call) erro
 		}
 		text = string(raw)
 	}
-	replayed := 0
+	replayed, sent := 0, 0
 	if c.Replayed {
 		replayed = 1
 	}
+	if c.sent {
+		sent = 1
+	}
 	_, err := q.ExecContext(ctx, `INSERT INTO code_run_calls
-		(run_id, seq, tool, target, args_hash, status, replayed, replay_text, started_at, finished_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		(run_id, seq, tool, target, args_hash, status, replayed, replay_text, started_at, finished_at, sent, error_kind, error_text, approval_id, hold_content)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT (run_id, seq) DO UPDATE SET tool = excluded.tool, target = excluded.target, args_hash = excluded.args_hash,
 			status = excluded.status, replayed = excluded.replayed, replay_text = excluded.replay_text,
-			started_at = excluded.started_at, finished_at = excluded.finished_at`,
-		runID, c.Seq, c.Tool, c.Target, c.ArgsHash, c.Status, replayed, text, c.StartedAt, nullInt(c.FinishedAt))
+			started_at = excluded.started_at, finished_at = excluded.finished_at, sent = excluded.sent,
+			error_kind = excluded.error_kind, error_text = excluded.error_text, approval_id = excluded.approval_id, hold_content = excluded.hold_content
+		WHERE excluded.sent = 1 OR code_run_calls.sent = 0`,
+		// A call that never reached the gateway (refused by its check, or
+		// stopped first) never replaces the record of one that did: not a
+		// succeeded or unknown one, and not a held one's approval id and
+		// draft, nor a failed one's error, which a resume answers from.
+		runID, c.Seq, c.Tool, c.Target, c.ArgsHash, c.Status, replayed, text, c.StartedAt, nullInt(c.FinishedAt),
+		sent, nullStr(c.errorKind), nullStr(c.errorText), nullStr(c.approvalID), nullStr(c.hold))
 	return err
 }
 
@@ -230,9 +256,7 @@ func (s *Service) finish(ctx context.Context, run *Run, rr *codemode.RunResult, 
 		return err
 	}
 	defer tx.Rollback()
-	maxSeq := 0
 	for _, rec := range rr.Calls {
-		maxSeq = max(maxSeq, rec.Seq)
 		if rec.Replayed {
 			if _, err := tx.ExecContext(ctx, `UPDATE code_run_calls SET replayed = 1 WHERE run_id = ? AND seq = ?`, run.ID, rec.Seq); err != nil {
 				return err
@@ -242,22 +266,27 @@ func (s *Service) finish(ctx context.Context, run *Run, rr *codemode.RunResult, 
 		seen := h.callSeen(rec.Seq)
 		c := Call{Seq: rec.Seq, Tool: rec.Tool, Target: rec.Target, ArgsHash: seen.argsHash, Status: rec.Status,
 			StartedAt: rec.StartedAt, FinishedAt: rec.FinishedAt}
-		if rec.Status == codemode.StatusSucceeded {
-			c.replayText = seen.replayText
-		}
+		c.setSeen(seen, rec.Sent)
 		if err := upsertCall(ctx, tx, run.ID, c); err != nil {
 			return err
 		}
 	}
-	// The record is the latest execution's: calls a resumed script did
-	// not reach this time are gone.
-	if _, err := tx.ExecContext(ctx, `DELETE FROM code_run_calls WHERE run_id = ? AND seq > ?`, run.ID, maxSeq); err != nil {
-		return err
-	}
+	// Calls this execution did not reach keep their records from an
+	// earlier one: a call that ran stays known (a later resume answers it
+	// from its record instead of sending it as new), and the highest call
+	// number the run ever reached stays the mark past which calls are new.
 	if _, err := tx.ExecContext(ctx, `UPDATE code_runs SET status = ?, result = ?, error_kind = ?, error_message = ?, logs = ?, held = ?,
 		updated_at = ?, finished_at = ? WHERE id = ?`,
 		status, result, errKind, errMsg, string(logsJSON), held, now, finished, run.ID); err != nil {
 		return err
+	}
+	if status == codemode.StatusFailed && rr.ErrorKind == codemode.ErrorBusy && len(rr.Calls) == 0 {
+		// No slot came free, so nothing ran: the Idempotency-Key is free
+		// again, and a retry with it starts a new run instead of answering
+		// with this one.
+		if _, err := tx.ExecContext(ctx, `UPDATE code_runs SET idempotency_key = NULL WHERE id = ?`, run.ID); err != nil {
+			return err
+		}
 	}
 	return tx.Commit()
 }
@@ -265,17 +294,27 @@ func (s *Service) finish(ctx context.Context, run *Run, rr *codemode.RunResult, 
 // Recover settles the runs a stopped process left behind: queued runs
 // failed with kind interrupted (their script never started), running runs
 // outcome_unknown with kind interrupted (a tool call may have run). Call
-// it at startup, before the routes serve.
+// it at startup, before the routes serve, on a single node: every queued
+// or running run then belongs to a stopped process. On a multi-node
+// database (SetCluster) only the leader calls it, one lease after it took
+// over, and it takes only runs whose lease ended by the database's clock
+// (or that have none), so it never touches the live runs of another node,
+// nor of this one.
 func (s *Service) Recover(ctx context.Context) (failed, unknown int64, err error) {
 	now := s.now().UnixMilli()
-	res, err := s.db.ExecContext(ctx, `UPDATE code_runs SET status = ?, error_kind = ?, error_message = ?, updated_at = ?, finished_at = ? WHERE status = ?`,
-		codemode.StatusFailed, ErrorInterrupted, msgInterruptedQueued, now, now, StatusQueued)
+	expired := ""
+	if s.cluster.MultiNode() {
+		expired = ` AND ` + cluster.LeaseEndedSQL(s.db.Dialect, "lease_until")
+	}
+	// Literal statuses let Postgres use the partial lease index.
+	res, err := s.db.ExecContext(ctx, `UPDATE code_runs SET status = ?, error_kind = ?, error_message = ?, updated_at = ?, finished_at = ? WHERE status = 'queued'`+expired,
+		codemode.StatusFailed, ErrorInterrupted, msgInterruptedQueued, now, now)
 	if err != nil {
 		return 0, 0, err
 	}
 	failed, _ = res.RowsAffected()
-	res, err = s.db.ExecContext(ctx, `UPDATE code_runs SET status = ?, error_kind = ?, error_message = ?, updated_at = ?, finished_at = ? WHERE status = ?`,
-		codemode.StatusOutcomeUnknown, ErrorInterrupted, msgInterruptedRunning, now, now, StatusRunning)
+	res, err = s.db.ExecContext(ctx, `UPDATE code_runs SET status = ?, error_kind = ?, error_message = ?, updated_at = ?, finished_at = ? WHERE status = 'running'`+expired,
+		codemode.StatusOutcomeUnknown, ErrorInterrupted, msgInterruptedRunning, now, now)
 	if err != nil {
 		return failed, 0, err
 	}

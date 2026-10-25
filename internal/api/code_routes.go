@@ -29,14 +29,16 @@ import (
 // never reads a cookie; operator tokens are refused by the operator guard
 // (operatorScopeFor) before a handler runs.
 //
-//	POST /v1/code/run                        start a run (text/x-starlark or JSON)
-//	GET  /v1/code/runs/{id}                  read a run (Prefer: wait=N)
-//	POST /v1/code/runs/{id}/resume           resume a held run {request_id}
-//	GET  /v1/code/files                      listToolFiles
-//	GET  /v1/code/files/{server}/{tool}.pyi  readToolFile
-//	GET  /v1/code/docs/{server}/{tool}       getToolDocs
-//	GET  /v1/code/openapi.json               this API as OpenAPI 3.1 (no token)
-//	GET  /v1/code/ty                         the ty command (no token)
+//	POST /v1/code/run                         start a run (text/x-starlark, text/javascript or JSON)
+//	GET  /v1/code/runs/{id}                   read a run (Prefer: wait=N)
+//	POST /v1/code/runs/{id}/resume            resume a held run {request_id}
+//	GET  /v1/code/files                       listToolFiles (?language=javascript for .d.ts)
+//	GET  /v1/code/files/{server}/{tool}.pyi   readToolFile
+//	GET  /v1/code/files/{server}/{tool}.d.ts  readToolFile, TypeScript (also {server}.d.ts, index.d.ts)
+//	GET  /v1/code/docs/{server}/{tool}        getToolDocs
+//	GET  /v1/code/search                      tools.search (?q=, mode, detail, limit, upstream)
+//	GET  /v1/code/openapi.json                this API as OpenAPI 3.1 (no token)
+//	GET  /v1/code/ty                          the ty command (no token)
 
 const (
 	codePathPrefix    = "/v1/code/"
@@ -46,9 +48,12 @@ const (
 	codeDocsPrefix    = "/v1/code/docs/"
 	codeOpenAPIPath   = "/v1/code/openapi.json"
 	codeTyPath        = "/v1/code/ty"
+	codeSearchPath    = "/v1/code/search"
 	contentTypeScript = "text/x-starlark"
-	headerReason      = "X-Toolyard-Reason"
-	headerIdemKey     = "Idempotency-Key"
+	// contentTypeJS (or application/javascript) posts a JavaScript script.
+	contentTypeJS = "text/javascript"
+	headerReason  = "X-Toolyard-Reason"
+	headerIdemKey = "Idempotency-Key"
 	// defaultCodeWait is how long a start or resume waits for a final or
 	// held status when the request names no wait.
 	defaultCodeWait = 25 * time.Second
@@ -79,15 +84,17 @@ func (s *Server) registerCodeRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/v1/code/files", s.codeFiles)
 	mux.HandleFunc("/v1/code/files/", s.codeFile)
 	mux.HandleFunc("/v1/code/docs/", s.codeDocs)
+	mux.HandleFunc("/v1/code/search", s.codeSearch)
 	mux.HandleFunc("/v1/code/openapi.json", s.codeOpenAPI)
 	mux.HandleFunc("/v1/code/ty", s.codeTy)
 }
 
 // POST /v1/code/run
 //
-// Body: the raw script with Content-Type: text/x-starlark and the reason in
-// X-Toolyard-Reason, or JSON {"code","reason","wait_seconds"}. Optional
-// Idempotency-Key and Prefer: wait=N (0-60, default 25; wait_seconds wins).
+// Body: the raw script with Content-Type: text/x-starlark (or
+// text/javascript) and the reason in X-Toolyard-Reason, or JSON
+// {"code","reason","language","wait_seconds"}. Optional Idempotency-Key
+// and Prefer: wait=N (0-60, default 25; wait_seconds wins).
 func (s *Server) codeRun(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeError(w, http.StatusMethodNotAllowed, "POST only")
@@ -121,7 +128,7 @@ func (s *Server) codeRun(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx := actor.WithRaiser(r.Context(), s.codeRaiser(r, ag, sessionID, viaSession, clientKindCLI, codemode.Via))
 	run, created, err := s.codeRuns.Start(ctx, coderuns.StartRequest{
-		AgentID: ag.ID, SessionID: sessionID, Code: in.code, Reason: in.reason, IdempotencyKey: key,
+		AgentID: ag.ID, SessionID: sessionID, Code: in.code, Reason: in.reason, IdempotencyKey: key, Language: in.language,
 	})
 	if err != nil {
 		writeRunError(w, err)
@@ -135,8 +142,8 @@ func (s *Server) codeRun(w http.ResponseWriter, r *http.Request) {
 
 // runRequest is a parsed POST /v1/code/run body.
 type runRequest struct {
-	code, reason string
-	wait         time.Duration
+	code, reason, language string
+	wait                   time.Duration
 }
 
 // readRunRequest parses a run body, writing the error answer itself.
@@ -145,8 +152,12 @@ func readRunRequest(w http.ResponseWriter, r *http.Request) (runRequest, bool) {
 	if d, ok := preferWait(r); ok {
 		in.wait = d
 	}
-	switch mediaType(r) {
-	case contentTypeScript:
+	switch mt := mediaType(r); mt {
+	case contentTypeScript, contentTypeJS, "application/javascript":
+		in.language = codemode.LanguageStarlark
+		if mt != contentTypeScript {
+			in.language = codemode.LanguageJavaScript
+		}
 		body, err := io.ReadAll(io.LimitReader(r.Body, coderuns.MaxScriptBytes+1))
 		if err != nil {
 			writeBodyError(w, err)
@@ -165,6 +176,7 @@ func readRunRequest(w http.ResponseWriter, r *http.Request) (runRequest, bool) {
 		var body struct {
 			Code        *string `json:"code"`
 			Reason      string  `json:"reason"`
+			Language    string  `json:"language"`
 			WaitSeconds *int    `json:"wait_seconds"`
 		}
 		if err := decodeLimited(w, r, &body, maxCodeRunBody); err != nil {
@@ -187,9 +199,14 @@ func readRunRequest(w http.ResponseWriter, r *http.Request) (runRequest, bool) {
 			}
 			in.wait = time.Duration(n) * time.Second
 		}
-		in.code, in.reason = *body.Code, body.Reason
+		lang, err := codemode.ParseLanguage(body.Language)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return in, false
+		}
+		in.code, in.reason, in.language = *body.Code, body.Reason, lang
 	default:
-		writeError(w, http.StatusUnsupportedMediaType, "Content-Type must be text/x-starlark (with X-Toolyard-Reason) or application/json")
+		writeError(w, http.StatusUnsupportedMediaType, "Content-Type must be text/x-starlark or text/javascript (with X-Toolyard-Reason), or application/json")
 		return in, false
 	}
 	return in, true
@@ -240,6 +257,13 @@ func (s *Server) codeRunsItem(w http.ResponseWriter, r *http.Request) {
 	}
 	ctx := actor.WithRaiser(r.Context(), s.codeRaiser(r, ag, sessionID, viaSession, clientKindCLI, codemode.Via))
 	run, err := s.codeRuns.Resume(ctx, coderuns.ResumeRequest{AgentID: ag.ID, SessionID: sessionID, RunID: id, RequestID: requestID})
+	if errors.Is(err, coderuns.ErrResumeConflict) && run != nil {
+		writeJSON(w, http.StatusConflict, map[string]any{
+			"error": coderuns.ErrResumeConflict.Error(), "status": run.Status,
+			"hint": "another resume of this run started first, so this one started nothing; read it with GET " + coderuns.RunPath(run.ID) + " and resume it again if it is still held",
+		})
+		return
+	}
 	if errors.Is(err, coderuns.ErrNotHeld) && run != nil {
 		writeJSON(w, http.StatusUnprocessableEntity, map[string]any{
 			"error": coderuns.ErrNotHeld.Error(), "status": run.Status,
@@ -306,10 +330,16 @@ func (s *Server) answerRun(w http.ResponseWriter, r *http.Request, run *coderuns
 }
 
 // writeRunView writes the run view with the HTTP status of its run status.
+// A run that ended busy (no script slot came free while it was queued;
+// nothing ran) is 429 with Retry-After, as a start refused at once is.
 func writeRunView(w http.ResponseWriter, run *coderuns.Run) {
 	code := coderuns.HTTPStatus(run.Status)
-	if code == http.StatusAccepted {
+	switch {
+	case code == http.StatusAccepted:
 		w.Header().Set("Location", coderuns.RunPath(run.ID))
+	case run.Status == codemode.StatusFailed && run.ErrorKind == codemode.ErrorBusy:
+		code = http.StatusTooManyRequests
+		w.Header().Set("Retry-After", busyRetryAfter)
 	}
 	w.Header().Set("Cache-Control", "no-store")
 	writeJSON(w, code, run.View())
@@ -334,7 +364,11 @@ func writeRunError(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusUnprocessableEntity, coderuns.ErrNotHeld.Error())
 	case errors.Is(err, codemode.ErrBusy):
 		w.Header().Set("Retry-After", busyRetryAfter)
-		writeError(w, http.StatusTooManyRequests, "code mode is busy: every script slot is in use, so no run was created; try again in a moment")
+		msg := "code mode is busy: every script slot is in use, so no run was created; try again in a moment"
+		if detail := err.Error(); detail != codemode.ErrBusy.Error() {
+			msg = detail + " (no run was created)"
+		}
+		writeError(w, http.StatusTooManyRequests, msg)
 	case errors.Is(err, coderuns.ErrDraining):
 		w.Header().Set("Retry-After", drainRetryAfter)
 		writeError(w, http.StatusServiceUnavailable, err.Error())
@@ -418,7 +452,7 @@ func (s *Server) auditCodeRun(ctx context.Context, eventType string, ag *identit
 	if s.audit == nil || ag == nil || run == nil {
 		return
 	}
-	ev := audit.Event{EventType: eventType, AgentID: ag.ID, Reason: run.Reason, ResultSummary: run.ID}
+	ev := audit.Event{EventType: eventType, AgentID: ag.ID, Reason: run.Reason, ResultSummary: run.ID, RunID: run.ID}
 	if args != nil {
 		if raw, err := json.Marshal(args); err == nil {
 			ev.Arguments = raw
@@ -427,25 +461,43 @@ func (s *Server) auditCodeRun(ctx context.Context, eventType string, ag *identit
 	_ = s.audit.Write(context.WithoutCancel(ctx), ev)
 }
 
-// GET /v1/code/files — the listToolFiles tree for the caller (text/plain).
+// GET /v1/code/files — the listToolFiles tree for the caller (text/plain);
+// ?language=javascript lists the TypeScript stubs.
 func (s *Server) codeFiles(w http.ResponseWriter, r *http.Request) {
 	rt, ctx, ok := s.codeStubs(w, r)
 	if !ok {
 		return
 	}
-	writeText(w, http.StatusOK, rt.ListToolFiles(ctx))
+	lang, err := codemode.ParseLanguage(r.URL.Query().Get("language"))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeText(w, http.StatusOK, rt.ListFiles(ctx, lang))
 }
 
-// GET /v1/code/files/{server}/{tool}.pyi — one stub, as readToolFile.
+// GET /v1/code/files/{server}/{tool}.pyi — one stub, as readToolFile; the
+// TypeScript stubs are /v1/code/files/{server}/{tool}.d.ts,
+// /v1/code/files/{server}.d.ts and /v1/code/files/index.d.ts.
 func (s *Server) codeFile(w http.ResponseWriter, r *http.Request) {
 	rt, ctx, ok := s.codeStubs(w, r)
 	if !ok {
 		return
 	}
-	server, file, found := strings.Cut(strings.TrimPrefix(r.URL.Path, codeFilesPrefix), "/")
+	rest := strings.TrimPrefix(r.URL.Path, codeFilesPrefix)
+	if p, isTS := strings.CutSuffix(rest, ".d.ts"); isTS && p != "" && strings.Count(p, "/") <= 1 && !strings.HasSuffix(p, "/") && !strings.HasPrefix(p, "/") {
+		text, ok := rt.ReadToolFile(ctx, "servers/"+rest, nil, nil)
+		if !ok {
+			writeError(w, http.StatusNotFound, text)
+			return
+		}
+		writeText(w, http.StatusOK, text)
+		return
+	}
+	server, file, found := strings.Cut(rest, "/")
 	tool, isStub := strings.CutSuffix(file, ".pyi")
 	if !found || server == "" || !isStub || tool == "" || strings.Contains(tool, "/") {
-		writeError(w, http.StatusNotFound, "no such file: use /v1/code/files/{server}/{tool}.pyi as GET /v1/code/files lists them")
+		writeError(w, http.StatusNotFound, "no such file: use /v1/code/files/{server}/{tool}.pyi (or .d.ts) as GET /v1/code/files lists them")
 		return
 	}
 	text, ok := rt.ReadToolFile(ctx, "servers/"+server+"/"+tool+".pyi", nil, nil)
@@ -498,6 +550,50 @@ func (s *Server) codeStubs(w http.ResponseWriter, r *http.Request) (*codemode.Ru
 		return nil, nil, false
 	}
 	return rt, gateway.WithAgentID(r.Context(), ag.ID), true
+}
+
+// GET /v1/code/search?q=...&mode=keyword|regex&detail=name|summary|full&limit=N&upstream=...
+// — tools.search for the caller, as JSON.
+func (s *Server) codeSearch(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		writeError(w, http.StatusMethodNotAllowed, "GET only")
+		return
+	}
+	ag, _, _, err := s.codeCaller(r)
+	if err != nil {
+		writeCallerError(w, err)
+		return
+	}
+	if s.gateway == nil {
+		writeError(w, http.StatusServiceUnavailable, coderuns.ErrUnavailable.Error())
+		return
+	}
+	q := r.URL.Query()
+	req := gateway.SearchRequest{Query: q.Get("q"), Mode: q.Get("mode"), Detail: q.Get("detail"), Upstream: q.Get("upstream")}
+	if q.Get("q") == "" {
+		req.Query = q.Get("query")
+	}
+	if v := q.Get("limit"); v != "" {
+		n, err := strconv.Atoi(v)
+		if err != nil || n < 1 {
+			writeError(w, http.StatusBadRequest, "limit must be a whole number of at least 1")
+			return
+		}
+		req.Limit = n
+	}
+	body, err := s.gateway.SearchTools(gateway.WithAgentID(r.Context(), ag.ID), req)
+	var se *gateway.SearchError
+	switch {
+	case errors.As(err, &se):
+		writeError(w, http.StatusBadRequest, se.Message)
+		return
+	case err != nil:
+		logx.For("api").Error("code search", "err", err.Error())
+		writeError(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	writeJSON(w, http.StatusOK, body)
 }
 
 // GET /v1/code/openapi.json — public: no token.

@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 
+	"github.com/tusharbhardwaj/toolyard/internal/cluster"
 	"github.com/tusharbhardwaj/toolyard/internal/opsmetrics"
 )
 
@@ -60,7 +61,15 @@ func (s *Service) FinishExecution(ctx context.Context, g *Grant, state string, r
 	if err != nil {
 		return err
 	}
-	res, err := s.db.ExecContext(ctx, `UPDATE inbox_executions SET state=?,finished_at=?,result=?,error=? WHERE grant_id=? AND agent_id=? AND attempt_id=? AND state=?`, state, s.now().UnixMilli(), string(encoded), nullStr(detail), g.ID, g.AgentID, g.AttemptID, ExecutionRunning)
+	// The outcome and its execution.completed callback event commit
+	// together, so a receiver hears of every recorded outcome.
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	finished := s.now().UnixMilli()
+	res, err := tx.ExecContext(ctx, `UPDATE inbox_executions SET state=?,finished_at=?,result=?,error=? WHERE grant_id=? AND agent_id=? AND attempt_id=? AND state=?`, state, finished, string(encoded), nullStr(detail), g.ID, g.AgentID, g.AttemptID, ExecutionRunning)
 	if err != nil {
 		return err
 	}
@@ -68,13 +77,37 @@ func (s *Service) FinishExecution(ctx context.Context, g *Grant, state string, r
 	if n != 1 {
 		return ErrConflict
 	}
+	if cb, ok := s.opts.Callbacks.(ExecutionCallbacks); ok {
+		e := &Execution{GrantID: g.ID, RequestID: g.RequestID, CallID: g.CallID, State: state, AttemptID: g.AttemptID, FinishedAt: finished, Error: detail}
+		if err := tx.QueryRowContext(ctx, `SELECT started_at FROM inbox_executions WHERE grant_id=?`, g.ID).Scan(&e.StartedAt); err != nil {
+			return err
+		}
+		if err := cb.ExecutionTx(ctx, tx, e, g.AgentID, g.Tool); err != nil {
+			return err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return err
+	}
 	s.publish("execution", map[string]any{"request_id": g.RequestID, "call_id": g.CallID, "state": state})
 	return nil
 }
 
-// RecoverExecutions is called once at process startup. No dispatch is repeated.
+// RecoverExecutions records outcome_unknown for executions whose process
+// stopped after the execution claim. No dispatch is repeated. With a
+// single node it runs at startup (inbox.New), and every running execution
+// belongs to a stopped process, as before. On a multi-node database only
+// the leader runs it (cmd/gateway work recovery, which first waits one
+// lease), and it takes only executions whose lease ended by the database's
+// clock (or that have none), so it never touches the live work of another
+// node, nor of this one.
 func (s *Service) RecoverExecutions(ctx context.Context) (int64, error) {
-	res, err := s.db.ExecContext(ctx, `UPDATE inbox_executions SET state=?,finished_at=?,error=? WHERE state=?`, ExecutionUnknown, s.now().UnixMilli(), "process stopped after the execution claim; inspect upstream state before any new permission", ExecutionRunning)
+	// The literal state lets Postgres use the partial lease index.
+	q := `UPDATE inbox_executions SET state=?,finished_at=?,error=? WHERE state='running'`
+	if s.multiNode() {
+		q += ` AND ` + cluster.LeaseEndedSQL(s.db.Dialect, "lease_until")
+	}
+	res, err := s.db.ExecContext(ctx, q, ExecutionUnknown, s.now().UnixMilli(), "process stopped after the execution claim; inspect upstream state before any new permission")
 	if err != nil {
 		return 0, err
 	}
@@ -85,11 +118,19 @@ func (s *Service) RecoverExecutions(ctx context.Context) (int64, error) {
 	return n, err
 }
 
-// RunningExecutions returns the grant ids of executions that have a claim
-// and no outcome yet. Shutdown names them when they outlive the drain
-// deadline; the next start records them outcome_unknown.
+// RunningExecutions returns the grant ids of this node's executions that
+// have a claim and no outcome yet (on a single node: every one). Shutdown
+// names them when they outlive the drain deadline; recovery records them
+// outcome_unknown once their lease ends (at the next start on a single
+// node).
 func (s *Service) RunningExecutions(ctx context.Context) ([]string, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT grant_id FROM inbox_executions WHERE state=? ORDER BY started_at`, ExecutionRunning)
+	q := `SELECT grant_id FROM inbox_executions WHERE state='running'`
+	var args []any
+	if s.multiNode() {
+		q += ` AND owner_instance=?`
+		args = append(args, s.instance())
+	}
+	rows, err := s.db.QueryContext(ctx, q+` ORDER BY started_at`, args...)
 	if err != nil {
 		return nil, err
 	}

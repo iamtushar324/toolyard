@@ -349,8 +349,8 @@ var (
 	schemaAttachments = map[string]any{
 		"type":     "array",
 		"maxItems": inbox.MaxAttachments,
-		"description": "Evidence, shown before the decision. Send data where you can: markdown{body}, table{title,columns,rows}, " +
-			"chart{title,chart:line|bar,unit,x,series:[{name,values}]}, diff{file,patch}, code{file,language,body}, log{title,body}, " +
+		"description": "Evidence, shown before the decision (up to 24). Send data where you can: markdown{body} (CommonMark and GitHub tables; images only from your own uploads: ![alt](upload:<sha256>)), table{title,columns,rows}, " +
+			"chart{title,chart:line|bar|stacked_bar|area|pie|scatter,unit,x,series:[{name,values}]} (pie: one series, a label in x per slice; scatter: numeric x), diff{file,patch}, code{file,language,body}, log{title,body}, " +
 			"link{label,url}. Media: upload local files with inbox.upload and cite {\"upload\": \"upload:<sha256>\"} (preferred for screenshots and diagrams), " +
 			"or give an https link toolyard copies when you send: image{url|upload,alt}, video{url|upload,poster_url|poster_upload} (MP4), file{url|upload,name}. " +
 			"Each takes an optional first-person caption.",
@@ -367,14 +367,53 @@ var (
 		return map[string]any{
 			"title":        map[string]any{"type": "string", "maxLength": inbox.MaxTitle, "description": "Verb + object + target, ≤60 characters."},
 			"summary":      map[string]any{"type": "string", "maxLength": inbox.MaxSummary, "description": "One line for the inbox card, ≤200 characters."},
-			"message":      map[string]any{"type": "string", "description": "First person: what you want and why."},
+			"message":      map[string]any{"type": "string", "maxLength": inbox.MaxMessage, "description": "First person: what you want and why. Markdown: CommonMark and GitHub tables, fenced code, http(s) and mailto links; images only from your own uploads (![alt](upload:<sha256>)); raw HTML shows as text."},
 			"audio":        schemaAudio,
 			"urgency":      schemaUrgency,
 			"attachments":  schemaAttachments,
 			"session_id":   map[string]any{"type": "string", "description": "From session.start (optional)."},
 			"callback_ref": map[string]any{"type": "string", "description": "Opaque authorized receiver reference for committed decision callbacks."},
-			"dry_run":      map[string]any{"type": "boolean", "description": "Check the request and see its flags without sending it."},
+			"callback_refs": map[string]any{"type": "array", "maxItems": inbox.MaxCallbackRefs, "items": map[string]any{"type": "string"},
+				"description": "More receivers that follow this item, next to callback_ref. With neither, your default receiver (callbacks.set_default) follows it."},
+			"dry_run": map[string]any{"type": "boolean", "description": "Check the request and see its flags without sending it."},
 		}
+	}
+	schemaQuestions = map[string]any{
+		"type":     "array",
+		"maxItems": inbox.MaxQuestions,
+		"description": "schema_version 3: questions your owner answers in the same decision as your tool calls (inbox.request) or alone (inbox.ask). " +
+			"Answers come back keyed by id in inbox.status, inbox.wait and the inbox.decision callback.",
+		"items": map[string]any{
+			"type":     "object",
+			"required": []string{"id", "type", "prompt"},
+			"properties": map[string]any{
+				"id":          map[string]any{"type": "string", "description": "Stable unique ID; the answer is keyed by it."},
+				"type":        map[string]any{"type": "string", "enum": inbox.QuestionTypes},
+				"prompt":      map[string]any{"type": "string", "maxLength": inbox.MaxQuestionPrompt},
+				"help":        map[string]any{"type": "string", "maxLength": inbox.MaxQuestionHelp},
+				"required":    map[string]any{"type": "boolean", "description": "Default true."},
+				"default":     map[string]any{"description": "Pre-filled answer, typed like the answer value."},
+				"recommended": map[string]any{"description": "Suggested answer, shown but never selected by itself."},
+				"options": map[string]any{"type": "array", "minItems": inbox.MinOptions, "maxItems": inbox.MaxChoiceOptions, "description": "single_choice, multiple_choice, ranking.",
+					"items": map[string]any{"type": "object", "required": []string{"id", "label"}, "properties": map[string]any{
+						"id": map[string]any{"type": "string"}, "label": map[string]any{"type": "string"}, "detail": map[string]any{"type": "string"},
+						"exclusive": map[string]any{"type": "boolean"}, "recommended": map[string]any{"type": "boolean"},
+					}}},
+				"min_selections": map[string]any{"type": "integer", "minimum": 0},
+				"max_selections": map[string]any{"type": "integer", "minimum": 0},
+				"allow_other":    map[string]any{"type": "boolean", "description": "Choice questions: a custom text answer is also accepted."},
+				"min_length":     map[string]any{"type": "integer", "minimum": 0},
+				"max_length":     map[string]any{"type": "integer", "minimum": 0, "maximum": inbox.MaxAnswerText},
+				"multiline":      map[string]any{"type": "boolean"},
+				"min":            map[string]any{"type": "number"},
+				"max":            map[string]any{"type": "number"},
+				"step":           map[string]any{"type": "number", "exclusiveMinimum": 0},
+				"unit":           map[string]any{"type": "string"},
+				"scale":          map[string]any{"type": "integer", "minimum": 2, "maximum": inbox.MaxScalePoints, "description": "scale: points (default 5)."},
+				"min_label":      map[string]any{"type": "string"},
+				"max_label":      map[string]any{"type": "string"},
+			},
+		},
 	}
 )
 
@@ -387,10 +426,13 @@ func (g *Gateway) inboxTools() []toolEntry {
 	requestProps["client_request_id"] = map[string]any{"type": "string", "maxLength": 128, "description": "Stable retry key for this agent request: printable ASCII, no backslash."}
 	requestProps["callback_ref"] = map[string]any{"type": "string", "description": "Opaque authorized receiver reference. A callback announces the complete decision without grant tokens."}
 	requestProps["ttl_seconds"] = map[string]any{"type": "integer", "minimum": inbox.MinTTL, "maximum": inbox.MaxTTL, "description": "How long grants last once approved. Default 1800."}
+	requestProps["schema_version"] = map[string]any{"type": "integer", "enum": []int{1, 2, 3}, "description": "3 for questions[] next to the tool calls."}
+	requestProps["questions"] = schemaQuestions
 	requestProps["tools"] = map[string]any{
-		"type":     "array",
-		"minItems": 1,
-		"maxItems": inbox.MaxTools,
+		"type":        "array",
+		"minItems":    1,
+		"maxItems":    inbox.MaxTools,
+		"description": "Every call the task needs: at most 12, or 50 with schema_version 3.",
 		"items": map[string]any{
 			"type":     "object",
 			"required": []string{"call_id", "tool", "required", "summary", "target", "operation", "expected_effects", "params"},
@@ -423,14 +465,15 @@ func (g *Gateway) inboxTools() []toolEntry {
 			"label": map[string]any{"type": "string"}, "detail": map[string]any{"type": "string"},
 		}},
 	}
-	askProps["schema_version"] = map[string]any{"type": "integer", "enum": []int{1, 2}}
+	askProps["schema_version"] = map[string]any{"type": "integer", "enum": []int{1, 2, 3}, "description": "3: questions[] of every type in one item; 2: one question."}
+	askProps["questions"] = schemaQuestions
 	askProps["client_request_id"] = map[string]any{"type": "string", "maxLength": 128, "description": "Stable retry key, unique per agent and question: printable ASCII, no backslash."}
 	askProps["prompt"] = map[string]any{"type": "string", "maxLength": 1000}
 	askProps["context"] = map[string]any{"type": "string", "maxLength": 3000}
 	askProps["blocking"] = map[string]any{"type": "boolean"}
 	askProps["task"] = map[string]any{"type": "object", "properties": map[string]any{"title": map[string]any{"type": "string"}, "url": map[string]any{"type": "string"}}}
 	askProps["question"] = map[string]any{"type": "object", "required": []string{"type"}, "properties": map[string]any{
-		"type":           map[string]any{"type": "string", "enum": []string{"free_text", "single_choice", "multiple_choice"}},
+		"type":           map[string]any{"type": "string", "enum": inbox.QuestionTypes, "description": "schema_version 2 takes free_text, single_choice and multiple_choice; with 3 this question becomes questions[0] (id \"answer\")."},
 		"min_selections": map[string]any{"type": "integer", "minimum": 0}, "max_selections": map[string]any{"type": "integer", "minimum": 0},
 		"options": map[string]any{"type": "array", "maxItems": 12, "items": map[string]any{"type": "object", "required": []string{"id", "label"}, "properties": map[string]any{
 			"id": map[string]any{"type": "string"}, "label": map[string]any{"type": "string"}, "detail": map[string]any{"type": "string"}, "exclusive": map[string]any{"type": "boolean"}, "recommended": map[string]any{"type": "boolean"},
@@ -471,7 +514,7 @@ func (g *Gateway) inboxTools() []toolEntry {
 	return []toolEntry{
 		inboxEntry("inbox.guide", inboxUpstream,
 			"How to ask your owner for permission: the rules, the request format, and worked examples. Call it once before your first request. "+
-				"No topic returns an overview and the topic list (restricted, coaching, requests, tools, voice, attachments, urgency, dry-run, grants, updates, never, examples, fallback, hosting, all).",
+				"No topic returns an overview and the topic list (restricted, coaching, requests, tools, voice, attachments, urgency, dry-run, grants, updates, never, examples, fallback, questions, callbacks, hosting, all).",
 			obj(nil, map[string]any{"topic": map[string]any{"type": "string"}}),
 			func(ctx context.Context, args map[string]any) (*mcp.CallToolResult, error) {
 				if g.guide == nil {
@@ -510,14 +553,16 @@ func (g *Gateway) inboxTools() []toolEntry {
 				return inboxJSON(map[string]any{"calls": res}), nil
 			}),
 		inboxEntry("inbox.request", inboxUpstream,
-			"Ask your owner for permission to use restricted tools: one request per task, with every tool it needs. "+
+			"Ask your owner for permission to use restricted tools: one request per task, with every tool it needs (up to 12 calls; 50 with schema_version 3), and with schema_version 3 any questions[] the task also needs answered. "+
 				"Write it as yourself: a first-person message, facts (why_now, if_it_goes_wrong, undo), a ≤75-word voice-note script, and evidence attachments. "+
 				"Supply task.objective and run it with dry_run: true first. Include an authorized callback_ref, then continue unrelated work or end the turn. "+
 				"After a callback, read inbox.status for authoritative decisions and valid grants before execution. inbox.wait is optional. Read inbox.guide for the format.",
 			obj([]string{"title", "summary", "message", "facts", "urgency", "task", "tools"}, requestProps),
 			submit(inbox.KindAccess)),
 		inboxEntry("inbox.ask", inboxUpstream,
-			"Ask a question. Prefer schema_version:2 with prompt and question.type (free_text, single_choice, multiple_choice). Options need stable IDs. Your owner can always write a custom answer. Audio is optional. Legacy title/summary/message/options remain supported.",
+			"Ask your owner questions. schema_version 3: questions[] (up to 20) of every type (free_text, single_choice, multiple_choice, yes_no, number, date, datetime, scale, ranking), "+
+				"each with a stable id; one answer set comes back keyed by id. schema_version 2: prompt and one question (free_text, single_choice, multiple_choice). "+
+				"Options need stable IDs. Audio is optional. Legacy title/summary/message/options remain supported. To ask questions together with tool approvals, put questions[] in inbox.request.",
 			obj(nil, askProps),
 			submit(inbox.KindQuestion)),
 		inboxEntry("inbox.post", inboxUpstream,
@@ -533,9 +578,9 @@ func (g *Gateway) inboxTools() []toolEntry {
 				if errRes != nil {
 					return errRes, nil
 				}
-				ids := stringList(args["ids"])
+				ids := statusIDs(args)
 				if len(ids) == 0 {
-					return mcp.NewToolResultError("ids: give at least one request_id"), nil
+					return mcp.NewToolResultError(noStatusIDs), nil
 				}
 				views, err := svc.Status(ctx, agentID, ids)
 				if err != nil {
@@ -556,9 +601,9 @@ func (g *Gateway) inboxTools() []toolEntry {
 				if errRes != nil {
 					return errRes, nil
 				}
-				ids := stringList(args["ids"])
+				ids := statusIDs(args)
 				if len(ids) == 0 {
-					return mcp.NewToolResultError("ids: give at least one request_id"), nil
+					return mcp.NewToolResultError(noStatusIDs), nil
 				}
 				mode, _ := args["mode"].(string)
 				if mode != "all" {
@@ -760,6 +805,27 @@ func remarshal(in any, out any) error {
 		return err
 	}
 	return json.Unmarshal(b, out)
+}
+
+// noStatusIDs answers an inbox.status or inbox.wait call without IDs.
+const noStatusIDs = `ids: give the Inbox request IDs to read as a list, e.g. {"ids": ["rq_…"]}; request_id is accepted for one ID`
+
+// statusIDs reads the request IDs of inbox.status and inbox.wait: ids (a
+// list, or one string), else request_id, the name every other Inbox tool
+// gives an item (one string, or a list).
+func statusIDs(args map[string]any) []string {
+	for _, key := range []string{"ids", "request_id"} {
+		if one, ok := args[key].(string); ok {
+			if one = strings.TrimSpace(one); one != "" {
+				return []string{one}
+			}
+			continue
+		}
+		if ids := stringList(args[key]); len(ids) > 0 {
+			return ids
+		}
+	}
+	return nil
 }
 
 func stringList(v any) []string {

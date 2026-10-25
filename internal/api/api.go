@@ -71,7 +71,9 @@ import (
 	"github.com/tusharbhardwaj/toolyard/internal/identity"
 	"github.com/tusharbhardwaj/toolyard/internal/identitykeys"
 	"github.com/tusharbhardwaj/toolyard/internal/inbox"
+	"github.com/tusharbhardwaj/toolyard/internal/jobs"
 	"github.com/tusharbhardwaj/toolyard/internal/marketplace"
+	"github.com/tusharbhardwaj/toolyard/internal/mcpauth"
 	"github.com/tusharbhardwaj/toolyard/internal/memory"
 	"github.com/tusharbhardwaj/toolyard/internal/mempalace"
 	"github.com/tusharbhardwaj/toolyard/internal/memwebhook"
@@ -99,6 +101,8 @@ const (
 )
 
 type Server struct {
+	// mcpAuth is the OAuth server for MCP clients, set by MCPOAuthRoutes.
+	mcpAuth      *mcpauth.Service
 	federation   *federation.Service
 	callbacks    *callbacks.Service
 	githubHTTP   *http.Client
@@ -165,6 +169,9 @@ type Server struct {
 	// codeRuns backs the code routes (/v1/code/*, code_routes.go); nil
 	// answers 503.
 	codeRuns *coderuns.Service
+	// jobs backs the async job routes (/v1/jobs, jobs_routes.go); nil
+	// answers 503.
+	jobs *jobs.Service
 }
 
 type Options struct {
@@ -259,6 +266,9 @@ type Options struct {
 	// CodeRuns backs code mode over REST (/v1/code/*). Optional; without
 	// it the run routes answer 503.
 	CodeRuns *coderuns.Service
+	// Jobs backs async tool jobs over REST (/v1/jobs). Optional; without
+	// it the job routes answer 503.
+	Jobs *jobs.Service
 }
 
 func New(ctx context.Context, opts Options) *Server {
@@ -303,6 +313,7 @@ func New(ctx context.Context, opts Options) *Server {
 		ownerEmail:      strings.TrimSpace(opts.OwnerEmail),
 		clerkOwnerOnly:  opts.ClerkOwnerOnly,
 		codeRuns:        opts.CodeRuns,
+		jobs:            opts.Jobs,
 	}
 	if s.webhookMaxBytes <= 0 {
 		s.webhookMaxBytes = DefaultWebhookMaxBytes
@@ -468,6 +479,7 @@ func (s *Server) Routes(mux *http.ServeMux) {
 	s.identityKeyRoutes(mux)
 	s.registerSessionTokenRoutes(mux)
 	s.registerCodeRoutes(mux)
+	s.registerJobsRoutes(mux)
 }
 
 // ---- helpers ----------------------------------------------------------------
@@ -968,6 +980,11 @@ func (s *Server) agentsItem(w http.ResponseWriter, r *http.Request) {
 			writeAgentActionError(w, err)
 			return
 		}
+		// Every replica reads the agent again: a disabled one reaches
+		// nothing at once.
+		if s.access != nil {
+			s.access.InvalidateAgent(id)
+		}
 		_ = s.audit.Write(r.Context(), audit.Event{
 			EventType: "agent." + subpath, AgentID: id, ResultSummary: "user:" + uid,
 		})
@@ -977,6 +994,10 @@ func (s *Server) agentsItem(w http.ResponseWriter, r *http.Request) {
 			writeAgentActionError(w, err)
 			return
 		}
+		if s.access != nil {
+			s.access.InvalidateAgent(id)
+		}
+		s.oauthAgentDeleted(r.Context(), id)
 		_ = s.audit.Write(r.Context(), audit.Event{
 			EventType: "agent.delete", AgentID: id, ResultSummary: "user:" + uid,
 		})
@@ -991,6 +1012,10 @@ func (s *Server) agentsItem(w http.ResponseWriter, r *http.Request) {
 func writeAgentActionError(w http.ResponseWriter, err error) {
 	if errors.Is(err, identity.ErrIdentityAgent) {
 		writeError(w, http.StatusConflict, "identity_agent")
+		return
+	}
+	if errors.Is(err, identity.ErrOAuthAgent) {
+		writeError(w, http.StatusConflict, "oauth_agent")
 		return
 	}
 	writeError(w, http.StatusNotFound, err.Error())
@@ -1663,6 +1688,10 @@ func (s *Server) serversItem(w http.ResponseWriter, r *http.Request) {
 		s.serversConvertEnv(w, r, name)
 		return
 	}
+	if subpath == "async" {
+		s.serversAsync(w, r, name)
+		return
+	}
 	if subpath == "reconnect" {
 		if r.Method != http.MethodPost {
 			writeError(w, http.StatusMethodNotAllowed, "POST")
@@ -1954,15 +1983,25 @@ var (
 	notesGroup     = access.GroupOf("builtin", "notes.publish")
 )
 
-// agentMayUse reports whether the agent's owner may use group. Without an
-// access resolver (single-user installs, tests) every agent may. The scope
-// is the owner's: an admin's agents reach everything, a member's agents
-// only what an admin granted that member.
-func (s *Server) agentMayUse(ctx context.Context, agentID, group string) bool {
+// restTool is the gateway tool a bearer REST route stands in for: the
+// route is allowed exactly when a call to that tool would be.
+type restTool struct{ upstream, name string }
+
+var (
+	mempalaceTool = restTool{mempalace.ToolPrefix, mempalace.DiaryWriteTool}
+	notesTool     = restTool{"builtin", "notes.publish"}
+)
+
+// agentMayUse reports whether the agent may use the tool the route stands
+// in for. Without an access resolver (single-user installs, tests) every
+// agent may. The scope is the owner's (an admin's agents reach
+// everything, a member's agents only what an admin granted that member),
+// narrowed by the agent's own allow and deny lists, tool by tool.
+func (s *Server) agentMayUse(ctx context.Context, agentID string, t restTool) bool {
 	if s.access == nil {
 		return true
 	}
-	return s.access.ScopeFor(ctx, agentID).Allows(group)
+	return s.access.ScopeFor(ctx, agentID).AllowsTool(t.upstream, t.name)
 }
 
 // writeNotGranted is the bearer-route twin of the gateway's per-caller
@@ -1987,7 +2026,7 @@ func (s *Server) mempalaceIngest(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	if !s.agentMayUse(r.Context(), agentID, mempalaceGroup) {
+	if !s.agentMayUse(r.Context(), agentID, mempalaceTool) {
 		writeNotGranted(w)
 		return
 	}
@@ -2084,7 +2123,7 @@ func (s *Server) notesSync(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	if !s.agentMayUse(r.Context(), agentID, notesGroup) {
+	if !s.agentMayUse(r.Context(), agentID, notesTool) {
 		writeNotGranted(w)
 		return
 	}
@@ -2126,7 +2165,7 @@ func (s *Server) notesPublish(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	if !s.agentMayUse(r.Context(), agentID, notesGroup) {
+	if !s.agentMayUse(r.Context(), agentID, notesTool) {
 		writeNotGranted(w)
 		return
 	}

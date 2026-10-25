@@ -13,11 +13,11 @@ import (
 	"errors"
 	"fmt"
 	"strings"
-	"time"
 
 	"github.com/google/uuid"
 
 	"github.com/tusharbhardwaj/toolyard/internal/actor"
+	"github.com/tusharbhardwaj/toolyard/internal/cluster"
 	"github.com/tusharbhardwaj/toolyard/internal/store"
 )
 
@@ -112,24 +112,15 @@ type grantSigner struct {
 }
 
 func loadGrantSigner(ctx context.Context, db *store.DB) (*grantSigner, error) {
-	var priv, pub []byte
-	err := db.QueryRowContext(ctx, `SELECT private_key, public_key FROM server_keys WHERE purpose = ?`, grantKeyPurpose).Scan(&priv, &pub)
-	if err == nil {
-		return &grantSigner{priv: ed25519.PrivateKey(priv), pub: ed25519.PublicKey(pub)}, nil
-	}
-	if !errors.Is(err, sql.ErrNoRows) {
-		return nil, err
-	}
-	pubKey, privKey, err := ed25519.GenerateKey(rand.Reader)
+	// One key for every replica, also when two start on a new database.
+	priv, pub, err := store.LoadOrCreateServerKey(ctx, db, grantKeyPurpose, func() ([]byte, []byte, error) {
+		pubKey, privKey, err := ed25519.GenerateKey(rand.Reader)
+		return []byte(privKey), []byte(pubKey), err
+	})
 	if err != nil {
 		return nil, err
 	}
-	if _, err := db.ExecContext(ctx,
-		`INSERT INTO server_keys(id, purpose, private_key, public_key, created_at) VALUES(?,?,?,?,?)`,
-		"key_"+uuid.NewString(), grantKeyPurpose, []byte(privKey), []byte(pubKey), time.Now().UnixMilli()); err != nil {
-		return nil, err
-	}
-	return &grantSigner{priv: privKey, pub: pubKey}, nil
+	return &grantSigner{priv: ed25519.PrivateKey(priv), pub: ed25519.PublicKey(pub)}, nil
 }
 
 func grantMessage(id, agentID string) []byte {
@@ -200,6 +191,61 @@ func (s *Service) issueGrants(ctx context.Context, tx *sql.Tx, r *Request, now i
 // concurrent calls can't both redeem a single-use grant. The returned
 // grant carries the issuer's email and name (see Grant.Decider).
 func (s *Service) Redeem(ctx context.Context, token, agentID, tool string, args map[string]any) (*Grant, error) {
+	g, err := s.checkGrant(ctx, token, agentID, tool, args)
+	if err != nil {
+		return nil, err
+	}
+	now := s.now().UnixMilli()
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer tx.Rollback()
+	res, err := tx.ExecContext(ctx, `UPDATE inbox_grants
+ SET uses = uses + 1, last_used_at = ?, pending_token=NULL, status = CASE WHEN uses + 1 >= max_uses THEN ? ELSE status END
+ WHERE id = ? AND status = ? AND uses < max_uses AND expires_at > ?`, now, GrantUsed, g.ID, GrantActive, now)
+	if err != nil {
+		return nil, err
+	}
+	if n, _ := res.RowsAffected(); n != 1 {
+		return nil, &RedeemError{Err: ErrGrantUsed, Grant: g}
+	}
+	argsJSON, err := json.Marshal(args)
+	if err != nil {
+		return nil, err
+	}
+	g.AttemptID = "gu_" + uuid.NewString()
+	if _, err = tx.ExecContext(ctx, `INSERT INTO inbox_grant_uses(id,grant_id,arguments,used_at) VALUES(?,?,?,?)`, g.AttemptID, g.ID, string(argsJSON), now); err != nil {
+		return nil, err
+	}
+	// The execution is this node's: it holds a lease it renews while the
+	// call runs (RunLeaseRenewal), so recovery never takes it from a live
+	// node.
+	if _, err = tx.ExecContext(ctx, `INSERT INTO inbox_executions(grant_id,request_id,call_id,agent_id,state,attempt_id,arguments,started_at,owner_instance,lease_until) VALUES(?,?,?,?,?,?,?,?,?,`+cluster.LeaseUntilSQL(s.db.Dialect)+`)`, g.ID, g.RequestID, g.CallID, g.AgentID, ExecutionRunning, g.AttemptID, string(argsJSON), now, s.instance()); err != nil {
+		return nil, err
+	}
+	if err = tx.Commit(); err != nil {
+		return nil, err
+	}
+	g.Uses++
+	if g.Uses >= g.MaxUses {
+		g.Status = GrantUsed
+	}
+	g.LastUsedAt = now
+	s.noteGrantUse(ctx, g, args)
+	return g, nil
+}
+
+// CheckGrant makes Redeem's checks for one call without using the grant
+// up: an async tool's job checks its grant before the job is stored, and
+// redeems it when the call runs. A grant that passes here can still be
+// refused by Redeem (used, revoked or expired meanwhile).
+func (s *Service) CheckGrant(ctx context.Context, token, agentID, tool string, args map[string]any) (*Grant, error) {
+	return s.checkGrant(ctx, token, agentID, tool, args)
+}
+
+// checkGrant is every check Redeem makes before it uses the grant up.
+func (s *Service) checkGrant(ctx context.Context, token, agentID, tool string, args map[string]any) (*Grant, error) {
 	id, sig, err := parseToken(token)
 	if err != nil {
 		return nil, &RedeemError{Err: err}
@@ -230,40 +276,6 @@ func (s *Service) Redeem(ctx context.Context, token, agentID, tool string, args 
 	if ok, why := MatchArgs(g.Params, args); !ok {
 		return nil, &RedeemError{Err: ErrGrantScope, Grant: g, Detail: why}
 	}
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return nil, err
-	}
-	defer tx.Rollback()
-	res, err := tx.ExecContext(ctx, `UPDATE inbox_grants
- SET uses = uses + 1, last_used_at = ?, pending_token=NULL, status = CASE WHEN uses + 1 >= max_uses THEN ? ELSE status END
- WHERE id = ? AND status = ? AND uses < max_uses AND expires_at > ?`, now, GrantUsed, g.ID, GrantActive, now)
-	if err != nil {
-		return nil, err
-	}
-	if n, _ := res.RowsAffected(); n != 1 {
-		return nil, &RedeemError{Err: ErrGrantUsed, Grant: g}
-	}
-	argsJSON, err := json.Marshal(args)
-	if err != nil {
-		return nil, err
-	}
-	g.AttemptID = "gu_" + uuid.NewString()
-	if _, err = tx.ExecContext(ctx, `INSERT INTO inbox_grant_uses(id,grant_id,arguments,used_at) VALUES(?,?,?,?)`, g.AttemptID, g.ID, string(argsJSON), now); err != nil {
-		return nil, err
-	}
-	if _, err = tx.ExecContext(ctx, `INSERT INTO inbox_executions(grant_id,request_id,call_id,agent_id,state,attempt_id,arguments,started_at) VALUES(?,?,?,?,?,?,?,?)`, g.ID, g.RequestID, g.CallID, g.AgentID, ExecutionRunning, g.AttemptID, string(argsJSON), now); err != nil {
-		return nil, err
-	}
-	if err = tx.Commit(); err != nil {
-		return nil, err
-	}
-	g.Uses++
-	if g.Uses >= g.MaxUses {
-		g.Status = GrantUsed
-	}
-	g.LastUsedAt = now
-	s.noteGrantUse(ctx, g, args)
 	return g, nil
 }
 

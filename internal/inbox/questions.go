@@ -48,15 +48,20 @@ func limitText(s string, n int) string {
 
 func normalizeQuestion(s *Submission) *Submission {
 	c := *s
-	if c.SchemaVersion == 2 && (c.Kind == KindQuestion || c.Kind == KindBlocker) {
+	if (c.SchemaVersion == 2 || c.SchemaVersion == SchemaVersionRich) && (c.Kind == KindQuestion || c.Kind == KindBlocker) {
+		prompt := c.Prompt
+		if prompt == "" && c.SchemaVersion == SchemaVersionRich && len(c.Questions) == 1 {
+			// One question: its prompt stands in for the item's text.
+			prompt = strings.TrimSpace(c.Questions[0].Prompt)
+		}
 		if c.Title == "" {
-			c.Title = limitText(c.Prompt, MaxTitle)
+			c.Title = limitText(prompt, MaxTitle)
 		}
 		if c.Summary == "" {
-			c.Summary = limitText(c.Prompt, MaxSummary)
+			c.Summary = limitText(prompt, MaxSummary)
 		}
 		if c.Message == "" {
-			c.Message = c.Prompt
+			c.Message = prompt
 			if c.Context != "" {
 				c.Message += "\n\n" + c.Context
 			}
@@ -64,7 +69,7 @@ func normalizeQuestion(s *Submission) *Submission {
 		if c.Urgency == "" {
 			c.Urgency = UrgencySoon
 		}
-		if c.Question != nil {
+		if c.SchemaVersion == 2 && c.Question != nil {
 			c.Options = append([]Option(nil), c.Question.Options...)
 		}
 	}
@@ -73,7 +78,7 @@ func normalizeQuestion(s *Submission) *Submission {
 
 func validateQuestion(r *Request, s *Submission, add func(string, string, ...any)) {
 	if s.SchemaVersion != 0 && s.SchemaVersion != 1 && s.SchemaVersion != 2 {
-		add("schema_version", "use 1 or 2")
+		add("schema_version", "use 1, 2 or 3")
 	}
 	if len(s.ClientRequestID) > 128 {
 		add("client_request_id", "max 128 bytes")
@@ -140,15 +145,22 @@ func validateQuestion(r *Request, s *Submission, add func(string, string, ...any
 		}
 	}
 	r.Question.Options = r.Options
-	if r.Task != nil {
-		if utf8.RuneCountInString(r.Task.Title) > 200 {
-			add("task.title", "max 200 characters")
-		}
-		if r.Task.URL != "" {
-			u, e := url.Parse(r.Task.URL)
-			if e != nil || u.Scheme != "https" || u.Host == "" || u.User != nil {
-				add("task.url", "use a public HTTPS URL without credentials")
-			}
+	validateTask(r, add)
+}
+
+// validateTask checks the task context of a question: a bounded title and
+// an HTTPS link without credentials.
+func validateTask(r *Request, add func(string, string, ...any)) {
+	if r.Task == nil {
+		return
+	}
+	if utf8.RuneCountInString(r.Task.Title) > 200 {
+		add("task.title", "max 200 characters")
+	}
+	if r.Task.URL != "" {
+		u, e := url.Parse(r.Task.URL)
+		if e != nil || u.Scheme != "https" || u.Host == "" || u.User != nil {
+			add("task.url", "use a public HTTPS URL without credentials")
 		}
 	}
 }
@@ -218,5 +230,10 @@ func answerQuestion(r *Request, d Decision, now int64) error {
 	return nil
 }
 func answerFingerprint(d Decision) string {
-	return hashJSON([]any{d.Response, d.Option, d.RequestRevision, d.decider(), d.Note})
+	parts := []any{d.Response, d.Option, d.RequestRevision, d.decider(), d.Note}
+	if len(d.Answers) > 0 {
+		// Version 3 answers; older fingerprints stay as they were.
+		parts = append(parts, d.Answers)
+	}
+	return hashJSON(parts)
 }

@@ -107,6 +107,15 @@ func Verify(ctx context.Context, src *sql.DB, srcBlobDir string, dst *store.DB, 
 	if n := len(rep.Blobs.TargetMismatched); n > 0 {
 		rep.problemf("%d target blobs do not hash to their name", n)
 	}
+	if err := verifyJobResults(ctx, stx, opts.JobResultDir, blobstore.NewPostgresReader(dtx), &rep.JobResults); err != nil {
+		return rep, err
+	}
+	if n := len(rep.JobResults.TargetMissing); n > 0 {
+		rep.problemf("%d source job results are missing in the target", n)
+	}
+	if n := len(rep.JobResults.TargetMismatched); n > 0 {
+		rep.problemf("%d target job results do not hash to their key", n)
+	}
 	if opts.SourceGuard != nil {
 		if err := opts.SourceGuard(); err != nil {
 			rep.problemf("the source changed or came into use during the run, so this comparison proves nothing")
@@ -122,6 +131,9 @@ type VerifyOptions struct {
 	// (the source changed or came into use during the run) fails the
 	// verify: what it compared may be torn.
 	SourceGuard func() error
+	// JobResultDir is the folder of large async-job results
+	// (<data>/job-results); "" leaves job results out.
+	JobResultDir string
 }
 
 // sealedStats counts one side's values of one sealed column.

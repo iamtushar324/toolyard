@@ -24,15 +24,18 @@ import (
 	"github.com/tusharbhardwaj/toolyard/internal/actor"
 	"github.com/tusharbhardwaj/toolyard/internal/approval"
 	"github.com/tusharbhardwaj/toolyard/internal/audit"
+	"github.com/tusharbhardwaj/toolyard/internal/cluster"
 	"github.com/tusharbhardwaj/toolyard/internal/codemode"
 	"github.com/tusharbhardwaj/toolyard/internal/goroutines"
 	"github.com/tusharbhardwaj/toolyard/internal/inbox"
+	"github.com/tusharbhardwaj/toolyard/internal/jobs"
 	"github.com/tusharbhardwaj/toolyard/internal/logx"
 	"github.com/tusharbhardwaj/toolyard/internal/memory"
 	"github.com/tusharbhardwaj/toolyard/internal/metrics"
 	"github.com/tusharbhardwaj/toolyard/internal/opsmetrics"
 	"github.com/tusharbhardwaj/toolyard/internal/policy"
 	"github.com/tusharbhardwaj/toolyard/internal/realtime"
+	"github.com/tusharbhardwaj/toolyard/internal/toolsearch"
 )
 
 const (
@@ -145,8 +148,11 @@ type toolEntry struct {
 // Gateway stitches the MCP server, policy, approval bus, memory, and upstream
 // pool into one coordinated unit.
 type Gateway struct {
-	githubHTTP          *http.Client
-	githubWriteMu       sync.Mutex
+	githubHTTP    *http.Client
+	githubWriteMu sync.Mutex
+	// cluster, when it spans several nodes, extends githubWriteMu and the
+	// client cache to every replica (SetCluster, actor.go).
+	cluster             *cluster.Cluster
 	mcp                 *server.MCPServer
 	policy              *policy.Engine
 	approval            *approval.Bus
@@ -175,6 +181,9 @@ type Gateway struct {
 	// codeMode backs the Bifrost-compatible listToolFiles / readToolFile /
 	// getToolDocs / executeToolCode tools (codemode_tools.go).
 	codeMode *codemode.Runtime
+	// search ranks the catalog for tools.search and GET /v1/code/search
+	// (meta.go); nil until first use or SetToolSearch.
+	search atomic.Pointer[toolsearch.Engine]
 
 	// maxLiveUpstreams caps how many upstream connections are alive
 	// simultaneously. 0 = unbounded. When the cap is hit and a new
@@ -212,6 +221,8 @@ type Gateway struct {
 	// accessToolsState backs the policies.*, servers.*, audit.* and
 	// access.* tools (access_tools.go).
 	accessToolsState
+	// jobsState backs async tools and the jobs.* tools (jobs_tools.go).
+	jobsState
 
 	// owners resolves a caller to its dashboard user for per_user
 	// upstreams; publicURL is where their My connections page lives.
@@ -307,6 +318,10 @@ type Options struct {
 	// 2026-07-28 support) or ProtocolAuto (an http upstream that offers
 	// 2026-07-28 is used statelessly; see requestedProtocol).
 	UpstreamProtocol string
+	// Jobs, when set, turns on async tools: the jobs.* tools, MCP Tasks
+	// and the async setting of upstream servers (jobs_tools.go). nil
+	// leaves every call inline, as before.
+	Jobs *jobs.Service
 }
 
 // UsageRecorder is satisfied by *internal/usage.Service. The gateway only
@@ -369,6 +384,7 @@ func New(opts Options) *Gateway {
 		owners:              opts.Owners,
 		publicURL:           opts.PublicURL,
 		upstreamProtocol:    opts.UpstreamProtocol,
+		jobsState:           jobsState{jobs: opts.Jobs},
 		tools:               map[string]toolEntry{},
 		upstreams:           map[string]*upstream{},
 		perUser:             map[string]*perUserGroup{},
@@ -415,6 +431,13 @@ func New(opts Options) *Gateway {
 			}
 		})
 	}
+	// Async tools: MCP Tasks are answered from the jobs table by
+	// MCPTasks (jobs_tasks.go), which also marks async tools in tools/list.
+	if opts.Jobs != nil {
+		serverOpts = append(serverOpts, server.WithTaskCapabilities(true, true, true))
+		hooks.AddAfterListTools(g.markTaskSupport)
+		g.attachJobs(opts.Jobs)
+	}
 	serverOpts = append(serverOpts, server.WithHooks(hooks))
 	g.mcp = server.NewMCPServer(opts.Name, opts.Version, serverOpts...)
 	return g
@@ -428,6 +451,26 @@ const toolsListCacheTTL = time.Minute
 // accessDeniedReason is the audit reason on every call refused because the
 // caller's dashboard user was never granted the tool's group.
 const accessDeniedReason = "access: server not granted"
+
+// agentLimitedReason is the audit reason on a call refused by the agent's
+// own scope (agent_scopes): its owner may use the tool, the agent may not.
+const agentLimitedReason = "access: not allowed for this agent"
+
+// agentLimited reports whether callerID's owner may use entry but the
+// agent's own limits refuse it.
+func (g *Gateway) agentLimited(ctx context.Context, callerID string, entry toolEntry) bool {
+	if g.access == nil {
+		return false
+	}
+	return g.scopeFor(ctx, callerID).LimitedOut(entry.upstream, entry.tool.Name)
+}
+
+// agentLimitedMessage tells an agent plainly that its owner limited it:
+// the owner chose the limit and can see the tool, so nothing is hidden.
+func agentLimitedMessage(toolName string) string {
+	return fmt.Sprintf("tool %q is not allowed for this agent: its owner limited what it may use. "+
+		"The owner can change that on toolyard's Connected apps page.", toolName)
+}
 
 // scopeFor resolves the caller's access scope. Without a resolver every
 // caller has the run of the catalog, exactly as before access existed.
@@ -533,6 +576,9 @@ func (g *Gateway) accessRequestHook(ctx context.Context, _ any, message any) err
 		if g.metrics != nil {
 			g.metrics.Record(ev)
 		}
+		if g.agentLimited(ctx, agentID, entry) {
+			return errors.New(agentLimitedMessage(req.Params.Name))
+		}
 	}
 	// Same text mcp-go uses in handleToolCall for a name it doesn't have.
 	return fmt.Errorf("tool '%s' not found: %w", req.Params.Name, server.ErrToolNotFound)
@@ -541,18 +587,29 @@ func (g *Gateway) accessRequestHook(ctx context.Context, _ any, message any) err
 // denyUngranted answers a call to a tool outside the caller's scope. The
 // agent sees an unknown-tool result; the audit log and metrics record the
 // real reason so an admin can grant the server if that was the intent.
+//
+// A tool the owner may use but the agent's own scope refuses is answered
+// plainly instead (agentLimitedMessage), with its own audit reason.
 func (g *Gateway) denyUngranted(ctx context.Context, entry toolEntry, agentID, approvalID string, ev *metrics.Event) *mcp.CallToolResult {
+	limited := g.agentLimited(ctx, agentID, entry)
+	reason := accessDeniedReason
+	if limited {
+		reason = agentLimitedReason
+	}
 	_ = g.audit.Write(ctx, audit.Event{
 		EventType:    audit.EventCallDenied,
 		AgentID:      agentID,
 		UpstreamName: entry.upstream,
 		ToolName:     entry.tool.Name,
 		Decision:     "deny",
-		Reason:       accessDeniedReason,
+		Reason:       reason,
 		ApprovalID:   approvalID,
 	})
 	ev.Outcome = metrics.OutcomeDenied
 	ev.ErrorClass = "access"
+	if limited {
+		return mcp.NewToolResultError(agentLimitedMessage(entry.tool.Name))
+	}
 	return notFoundResult(entry.tool.Name)
 }
 
@@ -713,6 +770,7 @@ func (g *Gateway) RegisterBuiltins() {
 	entries = append(entries, g.codeModeTools()...)
 	entries = append(entries, g.accessTools()...)
 	entries = append(entries, g.connectionsTools()...)
+	entries = append(entries, g.jobsTools()...)
 	for _, e := range entries {
 		g.registerEntry(e)
 	}
@@ -735,7 +793,7 @@ func (g *Gateway) RegisterBuiltins() {
 func reservedUpstreamName(name string) bool {
 	switch name {
 	case builtinUpstream, "fixture", inboxUpstream, sessionUpstream, "tools", "memory", "lake", "events",
-		policiesUpstream, serversUpstream, auditUpstream, accessUpstream, toolyardServer, connectionsGroup:
+		policiesUpstream, serversUpstream, auditUpstream, accessUpstream, toolyardServer, connectionsGroup, jobsUpstream, callbacksUpstream:
 		return true
 	}
 	return false
@@ -1413,6 +1471,10 @@ func (g *Gateway) routeEntry(ctx context.Context, entry toolEntry, via string, a
 	raiser := g.resolveRaiser(ctx, agentID, via)
 	g.attachSession(ctx, &raiser, args)
 	ctx = actor.WithRaiser(ctx, raiser)
+	if res := refuseNestedCodeMode(ctx, entry); res != nil {
+		return res, nil
+	}
+	ctx = withCodeModeRunID(ctx, entry)
 
 	// In-flight tracking + slow-call watchdog. The watchdog goroutine
 	// logs at 5s / 30s / 2m elapsed if the call is still routing, so a
@@ -1503,7 +1565,9 @@ func (g *Gateway) routeEntry(ctx context.Context, entry toolEntry, via string, a
 	}
 
 	grantToken, _ := args[GrantField].(string)
+	ctx = withCallbackRefFor(ctx, entry, args)
 	reason, intent, cleanArgs, rerr := extractReasonOpt(args, entry.reasonField, entry.reasonOptional)
+	cleanArgs = restoreOwnCallbackRef(entry, args, cleanArgs)
 	if rerr != nil {
 		_ = g.audit.Write(ctx, audit.Event{
 			EventType:     audit.EventCallFailed,
@@ -1548,10 +1612,14 @@ func (g *Gateway) routeEntry(ctx context.Context, entry toolEntry, via string, a
 	// an explicit deny still wins, and an open tool doesn't use one up.
 	if !entry.personalGitHub && grantToken != "" && decision.Action == policy.ActionApprove && g.inbox != nil {
 		// Tracked so shutdown waits for the granted execution to finish
-		// and record its outcome.
-		done := g.grantCalls.Add(entry.tool.Name)
-		defer done()
-		return g.redeemAndDispatch(ctx, entry, cleanArgs, agentID, reason, grantToken, &ev)
+		// and record its outcome. An async tool redeems and runs in its
+		// job (jobs_tools.go).
+		call := jobCall{entry: entry, args: cleanArgs, agentID: agentID, reason: reason, intent: intent, callbackRef: callbackRefFrom(ctx), grant: true, grantToken: grantToken}
+		return g.runOrStartJob(ctx, call, &ev, func(ctx context.Context, e toolEntry, ev *metrics.Event) (*mcp.CallToolResult, error) {
+			done := g.grantCalls.Add(e.tool.Name)
+			defer done()
+			return g.redeemAndDispatch(ctx, e, cleanArgs, agentID, reason, grantToken, ev)
+		})
 	}
 
 	// The policy rule is the decider of an allow or deny row.
@@ -1569,7 +1637,11 @@ func (g *Gateway) routeEntry(ctx context.Context, entry toolEntry, via string, a
 		allowed.SetDecider(policyDecider)
 		_ = g.audit.Write(ctx, allowed)
 		ev.ApprovalOutcome = metrics.ApprovalNone
-		return g.dispatch(ctx, entry, cleanArgs, agentID, reason, "", &ev)
+		// An async tool runs as a job (jobs_tools.go).
+		call := jobCall{entry: entry, args: cleanArgs, agentID: agentID, reason: reason, intent: intent, callbackRef: callbackRefFrom(ctx)}
+		return g.runOrStartJob(ctx, call, &ev, func(ctx context.Context, e toolEntry, ev *metrics.Event) (*mcp.CallToolResult, error) {
+			return g.dispatch(ctx, e, cleanArgs, agentID, reason, "", ev)
+		})
 	case policy.ActionDeny:
 		denied := audit.Event{
 			EventType:    audit.EventCallDenied,
@@ -1736,6 +1808,7 @@ func (g *Gateway) holdAndWait(ctx context.Context, entry toolEntry, args map[str
 		IntentCategory: intent,
 		RequireHuman:   requireHuman,
 		RaisedBy:       raiserOnCtx(ctx, agentID),
+		CallbackRef:    callbackRefFrom(ctx),
 	}, g.inLineWait)
 	if err != nil {
 		ev.Outcome = metrics.OutcomeError
@@ -1772,15 +1845,21 @@ func (g *Gateway) holdAndWait(ctx context.Context, entry toolEntry, args map[str
 		} else {
 			ev.ApprovalOutcome = metrics.ApprovalApproved
 		}
-		if req.AutoDecidedBy != "" {
-			// Inline auto-approve: decideInline ran with runExec=false, so
-			// NO background executor was scheduled — we dispatch here. We
-			// MUST then persist the result, otherwise the row stays
-			// allowed with result_executed_at IS NULL and SweepUnexecuted
-			// re-fires the executor (re-running the write) on the next
-			// gateway restart.
+		if req.DecidedInline {
+			// Inline auto-approve: this Hold's own decideInline decided
+			// it (runExec=false, under its execution claim), so NO
+			// background executor was scheduled — we dispatch here, and
+			// only here: a coalesced call, or one that woke within
+			// -in-line-wait after another call's auto decision, sees a
+			// rule as decider but not this mark, and takes resumeDeferred
+			// below. We MUST then persist the result, on a context the
+			// client's disconnect does not cancel (as Execute does);
+			// otherwise the row stays allowed with result_executed_at IS
+			// NULL until recovery records it outcome_unknown.
 			res, derr := g.dispatch(ctx, entry, args, agentID, reason, req.ID, ev)
-			g.persistApprovalResult(ctx, req.ID, res, derr, ev.ErrorClass == "upstream" || ev.ErrorClass == "audit_outcome_unknown")
+			persistCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), persistTimeout)
+			defer cancel()
+			g.persistApprovalResult(persistCtx, req.ID, res, derr, ev.ErrorClass == "upstream" || ev.ErrorClass == "audit_outcome_unknown")
 			return res, derr
 		}
 		// Legacy `-in-line-wait > 0` path: a human tapped Allow during the
@@ -1813,7 +1892,7 @@ func (g *Gateway) holdAndWait(ctx context.Context, entry toolEntry, args map[str
 	default:
 		// Still pending after in-line window — return deferred response.
 		ev.Outcome = metrics.OutcomeDeferred
-		return g.deferredResponse(ctx, req, entry, args), nil
+		return withCallbackWarning(g.deferredResponse(ctx, req, entry, args), req.CallbackWarning), nil
 	}
 }
 

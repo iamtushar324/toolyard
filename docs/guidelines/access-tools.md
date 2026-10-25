@@ -17,12 +17,23 @@ is for agents and for the admins who read the audit log.
 | `servers.list` | everyone | The servers your owner may use: name, enabled, status (`ok`, `error`, `waiting_signin`, `disabled`), tool count, auth mode (`shared` or `per_user`) and, for servers with a stored sign-in, whether one exists (on a `per_user` server: whether *your owner* connected it). Never URLs, headers or secrets; a URL inside an error message is reduced to `scheme://host`. |
 | `servers.reconnect` | admin-owned enrolled agents | Drop a server's connection and dial again, e.g. after `servers.list` shows an error. Audited (`server.reconnect`). |
 | `audit.mine` | enrolled agents | Your own recent calls and how toolyard decided them (tool, event, decision, reason, time, via). Only your rows, never another agent's; no arguments or result bodies. `limit` (default 50, max 200), `since` (RFC 3339) or `since_minutes`. |
-| `access.whoami` | everyone | Your agent, its owner (email, role), the servers you were granted, the always-on groups, and whether you may change policies. |
+| `access.whoami` | everyone | Your agent, its owner (email, role), the servers you were granted, the always-on groups, whether you may change policies, and `agent_limits` when your owner narrowed this agent (Connected apps). |
 
 A member sees only what is in their scope: `policies.list` and
 `servers.list` leave out servers they were never granted, and
 `policies.explain` answers "tool not found" for a tool on such a server,
 exactly as a direct call would.
+
+An agent can also have its own limits, on top of its owner's scope: only
+chosen servers and tools, and blocks (every OAuth client gets them from its
+consent screen; see [connect-clients.md](connect-clients.md)). A tool its
+owner may use but the agent may not is absent from `tools/list` and
+search, and a call to it says so plainly: "not allowed for this agent: its
+owner limited what it may use". The audit reason is
+`access: not allowed for this agent`. A limited agent cannot change
+policies, reconnect servers or sign in shared connections, even when its
+owner is an admin; neither can an OAuth client unless its admin owner chose
+"May manage toolyard" for it (`access.whoami` shows `can_change_policies`).
 
 ## The ask rule
 

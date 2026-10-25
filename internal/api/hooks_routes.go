@@ -41,7 +41,7 @@ func (s *Server) hooksIngest(w http.ResponseWriter, r *http.Request) {
 	// into the mempalace tool group, so it needs the same grant the tool
 	// itself would: without one the event lands, the memory does not.
 	ev, err := s.hooks.IngestRawOpts(ctx, agentID, body, r.URL.Query().Get("source"), hooks.IngestOptions{
-		SkipMemory: !s.agentMayUse(ctx, agentID, mempalaceGroup),
+		SkipMemory: !s.agentMayUse(ctx, agentID, mempalaceTool),
 	})
 	if err != nil {
 		switch {

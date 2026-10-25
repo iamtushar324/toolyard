@@ -6,6 +6,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"runtime"
 	"syscall"
 	"time"
 )
@@ -59,4 +60,20 @@ func killGroup(cmd *exec.Cmd) {
 	}
 	_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
 	_ = cmd.Process.Kill()
+}
+
+// maxRSSKiB is a finished worker's peak resident memory in KiB, 0 when
+// unknown (Linux reports KiB; macOS reports bytes).
+func maxRSSKiB(ps *os.ProcessState) int64 {
+	if ps == nil {
+		return 0
+	}
+	ru, ok := ps.SysUsage().(*syscall.Rusage)
+	if !ok {
+		return 0
+	}
+	if runtime.GOOS == "darwin" {
+		return int64(ru.Maxrss) >> 10
+	}
+	return int64(ru.Maxrss)
 }

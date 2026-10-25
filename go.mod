@@ -12,10 +12,11 @@ require (
 	github.com/joho/godotenv v1.5.1
 	github.com/mark3labs/mcp-go v1.3.0
 	github.com/mattn/go-sqlite3 v1.14.44
+	github.com/tetratelabs/wazero v1.12.0
 	go.starlark.net v0.0.0-20260908191801-89a6a09411d5
 	golang.org/x/crypto v0.50.0
 	golang.org/x/net v0.52.0
-	golang.org/x/sys v0.43.0
+	golang.org/x/sys v0.44.0
 	google.golang.org/genai v1.57.0
 )
 

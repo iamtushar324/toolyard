@@ -17,6 +17,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/tusharbhardwaj/toolyard/internal/cluster"
 	"github.com/tusharbhardwaj/toolyard/internal/store"
 )
 
@@ -108,6 +109,10 @@ type TokenRecord struct {
 	// AccountLabel names the account the token belongs to when the IdP
 	// said (the id_token email); empty otherwise. Display only.
 	AccountLabel string
+
+	// refreshEnc is the refresh_token_enc ciphertext as read; a refresh
+	// writes only while the row still carries it.
+	refreshEnc string
 }
 
 // PendingRecord is one in-flight OAuth dance.
@@ -203,8 +208,25 @@ type Service struct {
 	// userLocks serialises everything that reads-then-writes one person's
 	// row (exchange, refresh, disconnect, a 401 mark), keyed by
 	// userKey(upstream, userID), so a refresh that waited on the provider
-	// cannot resurrect a row a disconnect deleted meanwhile.
+	// cannot resurrect a row a disconnect deleted meanwhile. With a
+	// multi-node cluster a cluster lock replaces it (lockUser).
 	userLocks map[string]*sync.Mutex
+
+	// bearerGen counts the writes and drops of each cache entry (keys of
+	// bearers, and userKey of userBearers), so a database read that a
+	// newer write or drop overtook is not cached; staleBearers marks the
+	// entries a cluster resync asked to read again (a failed read keeps
+	// serving them). Both guarded by mu.
+	bearerGen    map[string]uint64
+	staleBearers map[string]bool
+	// flights are the bearer reads under way, by key (singleRead).
+	flightMu sync.Mutex
+	flights  map[string]chan struct{}
+
+	// cluster, when it spans several nodes, carries bearer changes to the
+	// other replicas' caches and serializes refreshes across them
+	// (SetCluster, cluster.go).
+	cluster *cluster.Cluster
 }
 
 // New wires the service. dataDir is where we read/create oauth.key.
@@ -218,10 +240,12 @@ func New(db *store.DB, cipher *Cipher, bus EventBus, notifier Notifier, idents I
 		httpc: &http.Client{
 			Timeout: 30 * time.Second,
 		},
-		bearers:     map[string]*atomic.Value{},
-		userBearers: map[string]*atomic.Value{},
-		lastAttempt: map[string]time.Time{},
-		userLocks:   map[string]*sync.Mutex{},
+		bearers:      map[string]*atomic.Value{},
+		userBearers:  map[string]*atomic.Value{},
+		bearerGen:    map[string]uint64{},
+		staleBearers: map[string]bool{},
+		lastAttempt:  map[string]time.Time{},
+		userLocks:    map[string]*sync.Mutex{},
 	}
 }
 
@@ -274,10 +298,14 @@ func (s *Service) HeaderFunc(upstream string) func(ctx context.Context) map[stri
 func (s *Service) currentBearer(upstream string) string {
 	s.mu.RLock()
 	v, ok := s.bearers[upstream]
+	stale := s.staleBearers[upstream]
 	s.mu.RUnlock()
-	if !ok {
-		// Cold path — populate from DB.
-		s.cacheBearerFromDB(upstream)
+	if !ok || stale {
+		// Cold path, or a cluster resync asked to check: read the DB,
+		// once for every concurrent caller of this key, bounded by
+		// bearerReadTimeout (this runs on the tool-call path). A failed or
+		// slow read keeps serving the stale bearer.
+		s.singleRead(upstream, func() { s.cacheBearerFromDB(upstream) })
 		s.mu.RLock()
 		v, ok = s.bearers[upstream]
 		s.mu.RUnlock()
@@ -291,8 +319,19 @@ func (s *Service) currentBearer(upstream string) string {
 	return ""
 }
 
+// setBearer stores a bearer this node just wrote (exchange, refresh, PAT,
+// reauth) and tells the other replicas to drop their cached copy.
 func (s *Service) setBearer(upstream, tok string) {
+	s.storeBearer(upstream, tok)
+	s.publishBearer(upstream, "", false)
+}
+
+// storeBearer fills the cache, telling nobody (a read from the database).
+func (s *Service) storeBearer(upstream, tok string) {
 	s.mu.Lock()
+	// A fill that read the database before this write must not land.
+	s.bearerGen[upstream]++
+	delete(s.staleBearers, upstream)
 	v := s.bearers[upstream]
 	if v == nil {
 		v = &atomic.Value{}
@@ -304,12 +343,54 @@ func (s *Service) setBearer(upstream, tok string) {
 
 // cacheBearerFromDB pre-populates the in-memory bearer cache from the
 // oauth_tokens row. Used on startup and on cold reads.
-func (s *Service) cacheBearerFromDB(upstream string) {
-	tok, err := s.GetToken(context.Background(), upstream)
-	if err != nil || tok == nil {
-		return
+// It reports whether it replaced the cached value; a read that failed, or
+// that a newer write or drop overtook (bearerGen), leaves it alone.
+func (s *Service) cacheBearerFromDB(upstream string) bool {
+	// A write or drop that lands while the row is read makes the read
+	// stale: read again (a few times at most).
+	for attempt := 0; attempt < 3; attempt++ {
+		s.mu.RLock()
+		gen := s.bearerGen[upstream]
+		s.mu.RUnlock()
+		ctx, cancel := context.WithTimeout(context.Background(), bearerReadTimeout)
+		tok, err := s.GetToken(ctx, upstream)
+		cancel()
+		if err != nil {
+			return false
+		}
+		if s.fillBearer(upstream, tok, gen) {
+			return true
+		}
 	}
-	s.setBearer(upstream, tok.AccessToken)
+	return false
+}
+
+// fillBearer caches the token read from the database at generation gen,
+// unless a newer write or drop overtook the read. s.mu is taken.
+func (s *Service) fillBearer(upstream string, tok *TokenRecord, gen uint64) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.bearerGen[upstream] != gen {
+		return false
+	}
+	delete(s.staleBearers, upstream)
+	if tok == nil {
+		delete(s.bearers, upstream)
+		return true
+	}
+	val := tok.AccessToken
+	if tok.State == StateNeedsReauth {
+		// As markNeedsReauth leaves the cache: the stored access token
+		// was rejected.
+		val = ""
+	}
+	v := s.bearers[upstream]
+	if v == nil {
+		v = &atomic.Value{}
+		s.bearers[upstream] = v
+	}
+	v.Store(val)
+	return true
 }
 
 // PrimeBearers walks every upstream with a stored token and warms the
@@ -570,9 +651,11 @@ func (s *Service) DeleteClient(ctx context.Context, upstream string) error {
 		return err
 	}
 	s.mu.Lock()
-	delete(s.bearers, upstream)
+	s.dropBearerLocked(upstream)
 	s.mu.Unlock()
-	return s.deleteUserTokens(ctx, upstream)
+	err = s.deleteUserTokens(ctx, upstream)
+	s.publishBearer(upstream, "", true)
+	return err
 }
 
 // ---------------------------------------------------------------------------
@@ -851,8 +934,20 @@ func (s *Service) exchangeCode(ctx context.Context, upstream, code, verifier str
 }
 
 // Refresh swaps a refresh_token for a fresh access_token. On rotation the
-// new refresh_token replaces the old.
+// new refresh_token replaces the old. With a multi-node cluster the
+// refresh holds a cluster lock per upstream and reads the token inside
+// it, so two replicas never spend the same rotating refresh token (the
+// loser would get invalid_grant and mark the server needs_reauth). The
+// write goes through only while the row still carries the refresh token
+// that was read: a reconnect, a disconnect or another refresh (one whose
+// lock was lost) that changed the row meanwhile is never overwritten, and
+// Refresh returns ErrSuperseded with nothing written.
 func (s *Service) Refresh(ctx context.Context, upstream string) (*TokenRecord, error) {
+	unlock, err := s.lockShared(ctx, upstream)
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
 	cli, err := s.GetClient(ctx, upstream)
 	if err != nil {
 		return nil, err
@@ -891,7 +986,7 @@ func (s *Service) Refresh(ctx context.Context, upstream string) (*TokenRecord, e
 		rec.AccountLabel = cur.AccountLabel
 	}
 	rec.LastRefreshAt = time.Now()
-	if err := s.PutToken(ctx, rec); err != nil {
+	if err := s.updateTokenIfUnchanged(ctx, rec, cur.refreshEnc); err != nil {
 		return nil, err
 	}
 	s.setBearer(upstream, rec.AccessToken)
@@ -999,6 +1094,42 @@ func (s *Service) PutToken(ctx context.Context, rec *TokenRecord) error {
 	return err
 }
 
+// updateTokenIfUnchanged writes a refreshed token over the existing shared
+// row only while that row still carries refreshEnc, the refresh token
+// ciphertext the refresh started from. No row updated means the row was
+// deleted or replaced meanwhile: ErrSuperseded, nothing written, cache
+// untouched.
+func (s *Service) updateTokenIfUnchanged(ctx context.Context, rec *TokenRecord, refreshEnc string) error {
+	if refreshEnc == "" {
+		return ErrSuperseded
+	}
+	atEnc, err := s.cipher.Seal([]byte(rec.AccessToken), AAD(rec.UpstreamName, "access"))
+	if err != nil {
+		return err
+	}
+	rtEnc, err := s.cipher.Seal([]byte(rec.RefreshToken), AAD(rec.UpstreamName, "refresh"))
+	if err != nil {
+		return err
+	}
+	res, err := s.db.ExecContext(ctx, `
+        UPDATE oauth_tokens
+        SET access_token_enc = ?, refresh_token_enc = ?, token_type = ?, scope = ?, account_label = ?,
+            obtained_at = ?, access_expires_at = ?, refresh_expires_at = ?, last_refresh_at = ?,
+            refresh_failures = 0, state = ?, last_error = NULL
+        WHERE upstream_name = ? AND refresh_token_enc = ?`,
+		nullStr(atEnc), nullStr(rtEnc), nullStr(rec.TokenType), nullStr(rec.Scope), nullStr(rec.AccountLabel),
+		nullTimeMS(rec.ObtainedAt), nullTimeMS(rec.AccessExpiresAt), nullTimeMS(rec.RefreshExpiresAt),
+		nullTimeMS(rec.LastRefreshAt), StateActive,
+		rec.UpstreamName, refreshEnc)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ErrSuperseded
+	}
+	return nil
+}
+
 // GetToken returns the decrypted token row (or nil when missing).
 func (s *Service) GetToken(ctx context.Context, upstream string) (*TokenRecord, error) {
 	row := s.db.QueryRowContext(ctx, `
@@ -1033,6 +1164,7 @@ func (s *Service) GetToken(ctx context.Context, upstream string) (*TokenRecord, 
 			return nil, err
 		}
 		rec.RefreshToken = string(pt)
+		rec.refreshEnc = rtEnc
 	}
 	if ob > 0 {
 		rec.ObtainedAt = time.UnixMilli(ob)

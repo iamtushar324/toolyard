@@ -114,6 +114,150 @@ published image and production settings, see [Containers](#containers).
    Conductor workspaces use the same hook config as the agent type they run
    (Claude Code or Codex); there is no separate Conductor hook endpoint.
 
+## OAuth for MCP clients
+
+toolyard is an OAuth 2.1 authorization server for its own `/mcp`, so people
+can add it to ChatGPT, Claude.ai, Claude Code, Codex, Cursor and other MCP
+clients by URL (`<public-url>/mcp`) and sign in through the browser. The
+step-by-step guide for each client is
+[docs/guidelines/connect-clients.md](guidelines/connect-clients.md).
+Agent tokens keep working next to it.
+
+**When it is on.** It needs `-public-url`: that origin is the issuer and,
+with `/mcp`, the only resource a token is valid for. With `-public-url` it
+is on by default. An admin turns it off or on with the `mcp_oauth_enabled`
+setting (the Connected apps page, or `PATCH /v1/settings`). While it is
+off, the endpoints below answer 404, `/mcp` sends no `WWW-Authenticate`
+hint, and issued OAuth tokens stop working.
+
+**Endpoints.** Your reverse proxy must pass these through to toolyard, next
+to `/mcp` and the dashboard:
+
+| Path | What |
+|---|---|
+| `/.well-known/oauth-protected-resource` (and `…/mcp`) | RFC 9728 protected-resource metadata |
+| `/.well-known/oauth-authorization-server` | RFC 8414 authorization server metadata |
+| `/oauth/register` | RFC 7591 dynamic client registration (60 per client IP per hour) |
+| `/oauth/authorize`, `/oauth/consent` | the browser steps: sign-in, then the consent screen |
+| `/oauth/token` | `authorization_code` (PKCE `S256` required) and `refresh_token` |
+| `/oauth/revoke` | RFC 7009 revocation |
+
+Every other `/.well-known/` path still answers 404.
+`/.well-known/toolyard-instance` (federation) is unchanged.
+
+**Settings** (admin; `PATCH /v1/settings` or the Connected apps page):
+
+| Key | Default | What |
+|---|---|---|
+| `mcp_oauth_enabled` | `true` with `-public-url` | the instance switch |
+| `mcp_oauth_redirect_hosts` | empty (any) | allow list of client redirect hosts, comma separated: `claude.ai`, `chatgpt.com`, `*.example.com`, `localhost`, `127.0.0.1`, or `cursor:` for a private-use scheme |
+| `mcp_oauth_access_ttl_minutes` | 60 | access token lifetime, 5 to 1440 |
+| `mcp_oauth_refresh_ttl_days` | 30 | refresh token lifetime, 1 to 365, renewed on every refresh |
+| `mcp_oauth_max_session_days` | 90 | absolute limit from consent, 1 to 365: no token outlives it, however often it is refreshed; the person then signs in again |
+| `mcp_oauth_custom_schemes` | `cursor,vscode,vscode-insiders,windsurf,zed` | private-use redirect schemes allowed without a reverse-DNS name |
+
+**How a connection works.** Each person's authorization of one client is a
+grant. It runs as an agent that the person owns: its name is the nickname
+from the consent screen, and it reports `agent_kind` `oauth_client` in
+audit rows and `access.whoami`. (The `agents.kind` column keeps `agent`;
+the grant row marks the agent as a client.) The consent screen also sets a
+per-agent tool scope (`agent_scopes`): everything the owner can use, or
+only chosen servers and tools, with blocks. The same per-agent scope works
+for every agent. Approval rules do not change.
+
+**Admin control is opt-in.** An app never inherits its owner's admin
+control: even an admin's app with "everything you can use" cannot change
+policies (`policies.set`, `policies.clear`), reconnect servers or sign in
+shared connections. An admin can give one of their own apps that control with **May
+manage toolyard (policies, servers, shared connections)** on the consent
+screen or the Connected apps page; it is off by default and recorded on the
+grant (`may_manage`). Only the app's owner, while an admin, can turn it on
+(an admin cannot turn it on for another person's app); anyone who manages
+the app can turn it off. A member's app never gets admin control: a stored
+flag then has no effect, and the Connected apps page says so.
+
+**Audit.** Every audit row an app's agent raises carries the OAuth client
+id in `audit_events.oauth_client_id` (the audit logger looks it up from the
+grant, and a trigger fills it for every other writer). `GET /v1/audit` and
+the audit export return it, and `?oauth_client_id=` filters by it. The
+rows of a client's own revocation and of a reused code or refresh token
+name the grant's agent. `GET /v1/agents` reports an app's agent with kind
+`oauth_client` (from its grant; the `agents` row keeps the stored kind
+`agent`).
+The grant row is the agent's tombstone: deleting the agent keeps the
+mapping, and connecting the client again recreates the agent under the same
+id. Deleting an app's agent revokes its grant, tokens and unused codes in
+the same transaction and cancels what it had pending. A new consent for a
+client stops the unused codes issued before it; it stops earlier token
+chains only when the grant comes back from a revoke or a deleted or
+disabled agent, or when the person ticks "Sign out this app's other
+sessions" (a client metadata document client shares one client_id across
+installs, so one person's devices share a grant). An app's agent cannot be given a
+static agent token (rotation and enrolment refuse it).
+
+**Security notes.**
+
+- Redirect URIs must be `https` to a valid host name or IP address, `http`
+  on the loopback interface (the port may change, RFC 8252), or a
+  private-use scheme: a reverse-DNS name such as `com.example.app`, or one
+  of `mcp_oauth_custom_schemes`. They are matched exactly otherwise.
+  `javascript:`, `data:`, `file:`, `jar:`, `ms-msdt:`, `search-ms:`,
+  `ms-officecmd:` and similar schemes are always refused.
+- Before the person answers, an invalid authorization request is shown to
+  the person as an error page. It goes back to the client only when the
+  client, its redirect URI and `response_type=code` are all valid and
+  `mcp_oauth_redirect_hosts` names the redirect host. Neither a
+  self-registered client nor a client metadata document makes a redirect
+  URI trusted (anyone can host a document that lists their own site), so
+  toolyard is never an open redirect. After the person answers, allow and
+  deny always redirect.
+  `state` is optional (PKCE is required); a request without `resource` gets
+  `<public-url>/mcp`.
+- Client ID metadata documents are fetched only while handling an
+  authorization request (the token and revocation endpoints use the cached
+  copy, stale included, and never fetch), only on port 443, and only from
+  public addresses: only `2000::/3` for IPv6, and loopback, private,
+  carrier-grade NAT (`100.64.0.0/10`, Tailscale), link-local, unique local,
+  multicast, documentation, benchmarking and reserved ranges are refused,
+  also when wrapped in an IPv4-mapped, NAT64 or 6to4 address. The
+  connection goes to the address that was checked, TLS verifies the host,
+  redirects are not followed, and the size (64 KiB) and time (8 s) are
+  bounded. One client address may cause 20 fetches per 10 minutes (and its
+  network 80), all addresses together 600; one client_id is fetched once at
+  a time, and a requester that leaves does not fail the others waiting. A
+  definite failure (the document answered wrongly, or toolyard refuses its
+  address) is not retried for 5 minutes. A network failure or a temporary
+  answer (HTTP 408, 429, 5xx) is not cached, and an expired copy keeps
+  serving until a fetch succeeds, also while the fetch limits are full,
+  for at most 7 days after it expired. The requester gets a generic error
+  (the detail goes to the log). A document is cached for its `max-age` (5
+  minutes to 24 hours).
+- Rate limits count per address (IPv6 by /64) and per network (IPv4 /24,
+  IPv6 /48), and requests without a known address in one strict bucket.
+  Global caps apply to registering a client and fetching a metadata
+  document, and a high ceiling (50,000 per 10 minutes) to authorization
+  requests. A request counts toward a global cap only after it passed its
+  address's and network's limits, so one address cannot use up a global
+  budget. A registration nobody authorized is swept after a day. An
+  in-process pre-limit checks every bucket before it counts any, and
+  refuses floods before they write to the database; it never evicts a
+  global bucket.
+- Codes are single use and last 60 seconds. A code that produced tokens
+  and is used again revokes the whole grant and disables its agent, as a
+  refresh token used twice does; the person connects the app again. A code
+  that never produced tokens (a newer consent or a revocation used it up,
+  or its exchange was refused) is only refused. A refresh token retried
+  within 60 seconds, while the token that replaced it is still unused, is
+  refused without revoking anything. Revoking a grant (by its owner, its client or
+  reuse detection) also cancels its agent's pending approvals (personal
+  ones included) and Inbox requests, recorded as cancelled by the system
+  because the grant was revoked, and nothing it queued can run.
+- Tokens, codes and client secrets are stored as SHA-256 hashes. Access
+  tokens start `tyat_`, refresh tokens `tyrt_`.
+- All of this state is in the database (`mcp_oauth_*` tables), so several
+  replicas on one Postgres database share it. The sweeper that deletes
+  expired rows is safe to run on every node.
+
 ## Code mode (Bifrost-compatible)
 
 Agents and skills written for the Bifrost MCP gateway's code mode work
@@ -131,6 +275,58 @@ and the access tools) are one server, `toolyard`, called as
 [guidelines/access-tools.md](guidelines/access-tools.md), which also explains
 what an agent may change about tool policies (into ask, or between allow and
 deny; never out of ask) and who may change them.
+
+Next to Starlark, scripts may be JavaScript (`executeToolCode` with
+`language: "javascript"`, `POST /v1/code/run` with `text/javascript`):
+QuickJS-NG compiled to WebAssembly (the official release build, embedded in
+the binary with its checksum pinned) and run by wazero's interpreter inside
+the same worker and sandbox. The worker's memory cap covers both its Go heap
+and the WebAssembly memory, so a JavaScript worker splits it: at 256 MiB,
+88 MiB of JavaScript heap inside 112 MiB of WebAssembly memory, and a
+136 MiB Go memory limit. The WebAssembly module itself gets no files, no
+environment and no network. The
+agent-facing guide is [guidelines/code-mode.md](guidelines/code-mode.md): the
+JavaScript API, TypeScript stubs, Starlark `try_call` and `parallel`, `echo`,
+the call ledger, and `tools.search` (BM25 keyword and RE2 regex search;
+semantic search is not available).
+
+Three flags (or `TOOLYARD_CODEMODE_MAX_CONCURRENT`,
+`TOOLYARD_CODEMODE_MAX_PER_AGENT` and `TOOLYARD_CODEMODE_QUEUE_WAIT`) bound how
+many scripts run at once:
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `-codemode-max-concurrent` | 4 | Scripts running at once on this gateway (MCP and REST together). Each is a worker of up to 256 MiB, so size it with the service's memory limit. With several replicas the limit is per replica. |
+| `-codemode-max-per-agent` | 3 | Scripts one agent runs at once on this gateway; with several replicas, per replica. |
+| `-codemode-queue-wait` | 30s | How long a script past either cap waits for a slot. |
+
+A script past either cap waits in one fair queue for up to
+`-codemode-queue-wait`. A freed slot
+goes to the earliest waiter whose agent is under its own cap. After the
+wait the script is refused as busy (a REST run, stored `queued` at once,
+ends `failed` with kind `busy`, HTTP 429). A script that a drain or
+shutdown stops is kind `interrupted`: `outcome_unknown` once it had sent a
+tool call, `failed` before. The queue holds at
+most twice `-codemode-max-per-agent` for one agent and four times
+`-codemode-max-concurrent` (16 at least) in all; a script past that is
+refused as busy at once. Migration 0052 adds the columns a REST run's call
+records need to answer a resume (whether a call reached the gateway, a
+failed call's error, a held call's text, draft and legacy approval id); it
+only adds columns, and migration 0053 adds `code_runs.resume_gen`, which
+lets only one of two concurrent resumes of a run claim it. During a rolling
+update or after a rollback past these migrations, do not let old and new
+nodes resume code runs at the same time: an older node deletes, when a
+resume it runs ends, the call records past the last call it reached, and
+sends a failed or held call again. Drain the old nodes before the new ones
+serve resumes; after a rollback, start held runs again rather than resume
+them. Every audit row of
+a script, the outer call's and each nested call's, carries the run's id in
+`audit_events.run_id`: `GET /v1/audit?run_id=…` and the audit export
+(`run_id` filter and CSV column) show one script's rows. Migration 0050 adds
+the column and a partial index on it. On Postgres the index is built inside
+the migration, without `CONCURRENTLY`. It covers only rows that have a run
+id, so on an existing database it scans `audit_events` once. Writes to the
+table wait while it builds. A fresh database sees no wait.
 
 ### The script worker
 
@@ -236,6 +432,18 @@ Then:
 ./toolyard serve -upstreams upstreams.json
 ```
 
+Some names belong to toolyard and cannot name a server: `builtin`,
+`fixture`, `memory`, `tools`, `mempalace`, `notes`, `skills`, `inbox`,
+`session`, `lake`, `events`, `policies`, `servers`, `audit`, `access`,
+`toolyard`, `connections`, and since v0.1 `jobs` and `callbacks` (toolyard's
+own `jobs.*` and `callbacks.*` tools). **Upgrade note:** a server saved
+under `jobs` or `callbacks` by an older version does not load on v0.1. The
+log says `WARNING: upstream "jobs" not loaded: the server name "jobs" is
+reserved since toolyard v0.1 …`, and the server's status on the dashboard
+says the same. Before or after the upgrade, add the server again under
+another name, grant that name to the people who used the old one, then
+delete the old row. Agents call its tools by the new name.
+
 Upstreams' tool catalogs are fetched at startup (every page of a paged
 `tools/list`), schema-wrapped, and registered under
 `<upstream-name>.<original-tool-name>`. Every `-catalog-refresh` (default
@@ -264,7 +472,9 @@ handled.
 - `tools/list` answers 2026-07-28 clients with `cacheScope: private`
   (each caller sees its own catalog) and `ttlMs: 60000`.
 - An earlier client initializes as before; `-stateless-mcp` still applies
-  to it.
+  to it. Its session lives in one replica's memory: with several replicas
+  use `-stateless-mcp` or sticky routing (see [Several replicas on one
+  database](#several-replicas-on-one-database)).
 - A 2026-07-28 notification stream (`subscriptions/listen`, a long-lived
   `POST`) drains like a `GET` stream (see *Shutdown and drain*).
 - Without `-public-url`, a request on a loopback address must carry a
@@ -285,6 +495,26 @@ Toward upstreams, `-upstream-protocol` chooses the version:
   later dials. When a 2026-07-28 upstream is rolled back to a server that
   wants a session, the call it turns away probes again and is retried
   once. stdio and `per_user` upstreams stay on 2025-11-25.
+
+### Async tools
+
+An admin can mark a server, or single tools of it, async (Edit server →
+*Async tool calls*, or `PUT /v1/servers/{name}/async`): a call then
+answers with a job id at once (`always`), or after a wait (`after`,
+`after_ms`), and keeps running in toolyard. Agents read it with the
+`jobs.*` tools, MCP Tasks or `/v1/jobs`, or get a `job.completed` /
+`job.failed` callback (docs/guidelines/async-tools.md).
+
+- `-async-job-timeout` (default `1h`) is one job's run time limit; it
+  replaces `-upstream-call-timeout` for that call.
+- Results over 256 KiB go to the blob store: files under
+  `<data>/job-results` on SQLite, chunks in the database on Postgres.
+  Finished jobs are kept 7 days. `toolyard db copy` moves these files into
+  Postgres with the rest of the data (`db verify` checks them); a job whose
+  result file is missing is listed and left without its result.
+- Several replicas on one Postgres database share the jobs: each job has a
+  lease its replica renews, and a replica that stops leaves its running
+  jobs `outcome_unknown` (never re-run) once the lease ends (60 s).
 
 ## Inbox and permissions
 
@@ -349,6 +579,28 @@ Settings → **Inbox & permissions**:
   which is what an Apple Watch shows. Notification buttons are Deny, Snooze
   1 h, and the two answers of a two-option question. A notification never
   approves tools.
+- **Schema version 3 items** (`inbox_v3_enabled`, default on): many tool
+  calls and questions in one item. During a rolling upgrade to v0.1, roll
+  every replica first, or turn the setting off until no older replica runs:
+  an older replica that rewrites an item (a snooze, a reminder, a voice
+  note) drops the version 3 fields it does not know. With it off, agents get
+  a `schema_version` problem and can send version 1 or 2.
+- **Webhook receivers**: a receiver gets only the event types it registered
+  for; receivers from before v0.1 keep `inbox.decision`, `inbox.expired` and
+  `inbox.cancelled` in the version 2 shape. Delivered and failed events are
+  kept 30 days. Each agent keeps at most `callback_max_receivers_per_agent`
+  active receivers (default 500; `PATCH /v1/settings`). Disabled and removed
+  receivers do not count, and the same registration again is always
+  answered. T3 Code registers one receiver per session thread, all under
+  its user's one agent, so it needs room. The hourly callback sweep
+  disables a push receiver that had no successful delivery and nothing new
+  to follow (no Inbox item, approval or event for it, no default change)
+  for 30 days: `callbacks.list` shows it `disabled` with
+  `disabled_reason: "idle"`, and it stops counting toward the cap. When its
+  agent uses it again (names it on an item or call, makes it the default,
+  tests it, an item follows it as the default, or registers it again the
+  same way), it is active again. A receiver its agent disabled stays
+  disabled. The sweep is safe on every replica.
 - **Passkeys**: add one per device. With a passkey registered, allowing
   production or red-flagged tools needs it (Face ID on an iPhone), and the
   confirmation is bound to exactly what you approve. Passkeys need the
@@ -549,9 +801,11 @@ directory, in WAL mode, with one connection. That suits a single server,
 development and tests, and it needs no setup.
 
 toolyard can use Postgres 16 instead (Amazon Aurora PostgreSQL works too),
-with a connection pool. Run one toolyard process per database: several
-replicas on one database are not supported yet. Our own production server
-still runs SQLite until its planned move to Postgres.
+with a connection pool. On Postgres, two or more replicas may share one
+database (see [Several replicas on one
+database](#several-replicas-on-one-database)). On SQLite run exactly one
+toolyard process per database. Our own production server still runs
+SQLite until its planned move to Postgres.
 
 ### How toolyard picks the database
 
@@ -604,9 +858,12 @@ must be able to create tables in the database (owning it is enough).
 ### Connection pool
 
 `-db-max-conns` (default 10) is the most connections `serve` opens to
-Postgres. Keep the server's `max_connections` above the total of every
-process that connects. SQLite always uses one connection, and the flag
-does nothing there.
+Postgres. With replica support on (`-cluster`, see [Several replicas on
+one database](#several-replicas-on-one-database)) each replica also keeps
+up to five connections of its own outside the pool. Keep the server's
+`max_connections` above the total of every process that connects:
+replicas × (`-db-max-conns` + 5), plus your own tools. SQLite always uses
+one connection, and the flag does nothing there.
 
 ### What else changes on Postgres
 
@@ -625,6 +882,205 @@ does nothing there.
   target empty. `verify` only reads. Both refuse a source that looks in
   use, and check again before they finish. Never start a gateway on a copy
   of production data: it would refresh real OAuth tokens.
+
+### Several replicas on one database
+
+On Postgres you can run two or more toolyard replicas behind one load
+balancer, all on one database, and replace them one at a time (a rolling
+update). They share every row: a decision, a policy, a setting, a token or
+a server saved on one replica is in force on the others within moments.
+SQLite stays single-replica.
+
+`-cluster` (`TOOLYARD_CLUSTER`) chooses: `auto` (the default) turns
+replica support on for Postgres and off for SQLite; `on` asks for it (and
+refuses SQLite); `off` runs one gateway per database even on Postgres: no
+`LISTEN` connection, no periodic recovery, rate limits in process, and the
+start settles leftover work at once, as on SQLite. A deployment that runs
+exactly one replica on Postgres may set `off`; with two or more replicas
+it must be `on` (or `auto`). Each gateway states its setting in the
+database for its whole life (an advisory lock: exclusive for `off`,
+shared for `on`), so a second gateway next to an `off` one, or an `off`
+gateway next to running replicas, does not start: it waits up to 60
+seconds for the other gateway to stop (a short overlap), logs the
+`application_name` of each gateway that holds the lock, and exits with
+code 78. A running gateway that loses its database connection and finds
+the lock taken by a gateway with the other setting when it reconnects
+drains and exits with code 78 too.
+
+Because an `off` gateway allows no second gateway at all, a deployment
+with `-cluster=off` must update stop-first (Swarm
+`update_config.order: stop-first` and the same for `rollback_config`,
+Kubernetes `strategy: Recreate`), as on SQLite. A change of the
+`-cluster` setting (from `off` to `on` or back) must also be a
+stop-first update: stop every gateway, then start the new ones.
+
+Every replica must have the same configuration and the same keys
+(identity, OAuth, secrets and session keys from the same credentials, with
+`-keys=require` so no replica ever creates its own), and run the same
+binary except during an update. Run the migrations once per
+deploy (`toolyard db migrate`, with `-migrate=off` on the replicas) or let
+the replicas migrate at start: migrations run under an advisory lock.
+
+How the replicas share the work:
+
+- **One replica at a time** runs each background job that must not run
+  twice: the approval and Inbox sweepers, the Inbox attention loop
+  (pushes, reminders, digests), the legacy Inbox sync, the OAuth token
+  refresher, the Clerk membership sync, the session purge, the retention
+  compactor, the auto-approval proposer, the anomaly detector and reason
+  scorer, the events pollers and retention, the Telegram poller and chat
+  reconciler, the memory-webhook worker, the notes and skills scanners,
+  the retry of failed identity-key removals, and the recovery of stopped
+  replicas' work. Each holds a Postgres advisory lock (a leader lease).
+  A replica that stops cleanly hands its jobs over when its drain starts,
+  and another replica takes them within about five seconds. A replica
+  that vanishes (its node lost, its network cut) keeps its locks until the
+  database ends its session: toolyard asks for TCP keepalives every 5
+  seconds after 10 idle seconds and a 15-second TCP user timeout on these
+  connections, so that takes up to about 30 seconds (the operating system
+  default would be about two hours).
+- **Every replica** runs what belongs to it: its own upstream connections
+  (the live pool, the idle sweep and the catalog refresh of its own
+  connections), its own code-mode script workers, the requests it serves
+  (MCP over stateless requests, REST, dashboard streams), its price list,
+  its temporary upload files, and the callback deliveries (each delivery
+  is claimed in the database first). Because each replica reads tool lists
+  over its own connections, two replicas may show different catalogs for
+  up to `-catalog-refresh` after an upstream changes its tools.
+- **Work that outlives a request** (an Inbox execution of a granted call, a
+  legacy execution, a code run over REST, a memory-webhook job) names the
+  replica that runs it and holds a lease that replica renews every 15
+  seconds, timed by the database's clock (so clock drift between replicas
+  does not matter). The leader settles only work whose lease ended (60
+  seconds without a renewal): a granted call becomes `outcome_unknown` and
+  never runs twice. It waits one lease (60 seconds) after it takes over
+  and after the database last failed to answer, so a replica that could
+  not renew during an outage keeps its work. A replica that starts settles
+  nothing on its own, so a rolling restart never touches the live work of
+  another replica. With `-cluster=off` (or on SQLite) the start settles
+  everything it finds, as before. An auto-approved call that runs in line
+  writes its claim in the same transaction as the decision, so no recovery
+  ever runs it a second time.
+- **Async tool jobs** follow the same rule with their own loop on every
+  replica: each replica renews its jobs' leases every 5 seconds (on the
+  cluster's reserved connection, so a busy pool cannot delay it), and any
+  replica settles a job whose lease ended (a running one `outcome_unknown`,
+  a queued one `failed`; nothing is run twice). Recovery waits one lease
+  (60 seconds) after the replica starts and after the database last failed
+  to answer it, so a failover longer than the lease does not cut short
+  the calls of replicas that are still alive. A replica that drains starts
+  no queued job: such a job ends `failed`, nothing ran.
+- **Caches** (policies, settings, auto-approval rules, OAuth bearers, the
+  upstream servers, MCP client names, the Web Push key pair) are refreshed
+  on every replica when one replica writes; replicas send each other these
+  signals with Postgres `LISTEN`/`NOTIFY`, and every replica reloads every
+  30 seconds in case a signal was missed.
+- **Waits** (`inbox.wait`, `tools.wait_for_approval`, an in-line approval
+  hold) wake on a decision made on any replica, and re-read the database
+  every 2 seconds as a fallback. Dashboard live events reach a dashboard
+  connected to any replica.
+- **Limits and locks** that guarded one process now hold across replicas:
+  the login and unauthenticated-route rate limits, the connect-t3 limits
+  and per-person lock, the auto-approval budget per agent, Inbox
+  submissions per agent, policy writes, upstream edits, OAuth refreshes,
+  federation connection writes and personal GitHub writes. Passkey
+  ceremonies live in the database, so a confirmation started on one
+  replica finishes on another.
+
+Things to set:
+
+- **Connections.** Each replica keeps up to five connections of its own
+  outside the pool: leader leases, named locks, lease renewals, `LISTEN`
+  and the `-cluster` setting. Each shows its purpose and the replica's
+  instance ID as its `application_name` in `pg_stat_activity`; the
+  keepalive settings are `SET` once it opens, and one the server refuses
+  (`tcp_user_timeout` before Postgres 12) is skipped with one log line. They need session state, so connect the replicas to Postgres
+  directly or through a pooler in session mode. A transaction-mode pooler
+  (PgBouncer `pool_mode=transaction`) breaks session advisory locks and
+  `LISTEN`: do not use one between toolyard and Postgres.
+- **MCP sessions.** A 2026-07-28 client has no session and works with any
+  replica. An earlier client opens a session (`Mcp-Session-Id`) that lives
+  in one replica's memory: with several replicas run `-stateless-mcp`, or
+  make the load balancer send each session to one replica (sticky routing
+  on the `Mcp-Session-Id` header). A replica started with replica support
+  on and `-stateless-mcp` off logs a warning that says so.
+- **Code-mode limits are per replica.** `-codemode-max-concurrent` (4)
+  and `-codemode-max-per-agent` (3) count the scripts that run on one
+  replica, so with N replicas up to N × 4 scripts run in all, and one agent
+  may run up to N × 3. Size each replica's memory for its own
+  `-codemode-max-concurrent` workers (up to 256 MiB each), and lower the
+  per-agent cap when an agent must stay under a total limit.
+- **`-instance-id`** names the replica in leases and logs (for example the
+  pod name: `TOOLYARD_INSTANCE_ID` from the Kubernetes downward API).
+  Every process adds a random suffix of its own (`<name>-<8 hex digits>`),
+  so a container that restarts in the same pod, or two replicas given the
+  same name, never share an ID. Without the flag the host name is used.
+- **Files under `-data`** are per replica: crash dumps, the price list
+  cache, temporary uploads, and the notes, skills and MemPalace stores.
+  With several replicas, run `-mempalace=off` (MemPalace keeps its store
+  on one replica's disk, so memories written through one replica are
+  missing on the others), and put notes and skills on a shared volume or
+  turn them off (`-notes=off -skills=off`). Keys come from the shared
+  credentials, not from `-data`.
+- **The first move to v0.1 must stop the old gateway first.** A gateway
+  older than v0.1 (no replica support) must never run next to another
+  gateway on the same database, so the update that brings in v0.1, and any
+  rollback to a version older than v0.1, must be stop-first: Swarm
+  `update_config.order: stop-first`, Kubernetes `strategy: Recreate` with
+  one replica. Only once every replica runs v0.1 or later may updates
+  overlap.
+- **Later updates** may overlap when every gateway runs with `-cluster`
+  `on` or `auto`, and the update keeps that setting: run a rolling update
+  (Kubernetes `RollingUpdate` with `maxUnavailable: 0`, Swarm
+  `update_config.order: start-first`). With `-cluster=off`, or when the
+  update changes the `-cluster` setting, update stop-first. Draining replicas hand over their leader jobs at once and
+  finish or record their in-flight work as described in [Shutdown and
+  drain](#shutdown-and-drain).
+
+## Rolling back below v0.1
+
+v0.1 migrations only add tables, columns and indexes, and there are no down
+migrations: a rollback keeps the v0.1 schema. An older binary starts on it
+with the warning "the database records migrations this binary does not
+know". What it then does differently:
+
+- **Agent scopes** (`agent_scopes`, Connected apps): ignored. An agent its
+  owner narrowed gets its owner's full scope back.
+- **OAuth for MCP clients**: not served. Apps connected that way cannot
+  sign in until you upgrade again.
+- **Async tools**: every tool runs inline again, and the `jobs.*` tools
+  and `/v1/jobs` are gone. Jobs that were queued or running stay as v0.1
+  left them; their results are readable again after the next upgrade.
+- **Code mode**: held and paused code runs cannot be resumed on the older
+  binary. Start them again instead.
+- **Inbox items of schema version 3**: an older binary that rewrites one (a
+  snooze, a reminder, a voice note) drops the fields it does not know.
+- **Callbacks** (migrations 0060 to 0063):
+  - When several receivers follow one item, only one of them hears the
+    decision.
+  - There is no deduplication of a decision event (the old
+    `UNIQUE(request_id, decision_revision)` is gone), so a retried decision
+    can be delivered twice. Receivers deduplicate on `event_id` already.
+  - No `execution.completed`, `approval.*`, `job.*` or `ping` events are
+    queued, and default receivers are not used. Events v0.1 already queued
+    are delivered as stored.
+  - A receiver's `events`, `v3` and `host` are ignored. The receiver cap
+    does not apply, and a receiver the sweep disabled as idle stays disabled.
+
+Do it this way:
+
+1. Decide or cancel the pending schema version 3 Inbox items, or turn
+   `inbox_v3_enabled` off and wait until none is pending.
+2. Stop every v0.1 replica before you start the older binary (stop-first:
+   Swarm `rollback_config.order: stop-first`, Kubernetes `strategy:
+   Recreate` with one replica). An older binary must never run next to
+   another gateway on the same database. Each replica drains as described
+   in [Shutdown and drain](#shutdown-and-drain): running async jobs end
+   `outcome_unknown`, and held code runs stay held.
+3. Start one older gateway with the same database and keys.
+4. Tell the agents that used code mode to start their held code runs
+   again, and the owners of narrowed agents that the limits are off until
+   the next upgrade.
 
 ## Keys and credentials
 
@@ -877,22 +1333,34 @@ The image `ghcr.io/iamtushar324/toolyard` is built from `deploy/Dockerfile`
 for linux/amd64 and linux/arm64 on every push to `main`, after the Go tests
 pass (`.github/workflows/publish-image.yml`). Every pull request builds it
 on both architectures and runs it as a smoke test: read-only root, no
-capabilities, uid 10001, against Postgres 16.
+capabilities, uid 10001, against Postgres 16. A pull request from this
+repository (not a fork) also publishes its image.
 
 ### Image
 
 - Tags: `sha-<commit>` (the full 40-character commit) and `main` (moves on
   every push). The binary reports version `sha-<commit>` (`toolyard
   version`, `/v1/health`, `toolyard_build_info`).
+- Pull requests from this repository: `pr-<number>-<head>`, where `<head>`
+  is the first 7 characters of the pull request's head commit, built from
+  the merge commit GitHub tests, after the container smoke test (the Go
+  tests run in the pull request's own Inbox integration workflow). The
+  binary reports the same string as its version. For test deployments only
+  ([Kubernetes](#kubernetes)).
 - Deploy by digest, never by tag:
   `ghcr.io/iamtushar324/toolyard@sha256:<digest>`. The publish run's summary
   prints the digest of the multi-arch index. Each image carries an SBOM and
-  SLSA provenance, and the index has a GitHub attestation:
+  SLSA provenance, and the index has a GitHub attestation. Pull request
+  images have valid attestations too, so a production check must also pin
+  the ref the image was built from:
 
   ```bash
   gh attestation verify oci://ghcr.io/iamtushar324/toolyard@sha256:<digest> \
-    --repo iamtushar324/toolyard
+    --repo iamtushar324/toolyard --source-ref refs/heads/main
   ```
+
+  A pull request image names `refs/pull/<number>/merge` instead, and this
+  check refuses it.
 
 - Entrypoint `tini -- toolyard`, default command `serve`, user and group
   10001. Ports 8787 (dashboard, `/mcp`, `/v1/*`) and 9090 (the ops
@@ -1004,10 +1472,17 @@ exits 0; config errors exit 78.
 - Give the container 75 s to stop (`stop_grace_period: 75s`,
   `terminationGracePeriodSeconds: 75`); see [Shutdown and
   drain](#shutdown-and-drain).
-- Never run two gateways on one database, not even for a moment during an
-  update: use Swarm `update_config.order: stop-first` (and the same for
-  `rollback_config`), or Kubernetes `strategy: Recreate`. Each deploy then
-  has a short outage.
+- On SQLite, never run two gateways on one database, not even for a moment
+  during an update: use Swarm `update_config.order: stop-first` (and the
+  same for `rollback_config`), or Kubernetes `strategy: Recreate`. Each
+  deploy then has a short outage.
+- On Postgres, once every running gateway is v0.1 or later with
+  `-cluster` `on` or `auto`, replicas may overlap: use a rolling update
+  (Swarm `start-first`, Kubernetes `RollingUpdate` with
+  `maxUnavailable: 0`). The update that first brings in v0.1, a rollback
+  below v0.1, any update of a `-cluster=off` gateway, and an update that
+  changes the `-cluster` setting must still be stop-first. See
+  [Several replicas on one database](#several-replicas-on-one-database).
 - A key or configuration error exits 78 and a restart does not fix it:
   limit restarts (Swarm `restart_policy.max_attempts`) and read the logs.
 
@@ -1033,5 +1508,42 @@ running with less confinement if a later node lacks it.
   settings above (secrets with owner and mode, read-only root, tmpfs,
   stop-first updates, 75 s grace, a liveness health check, Traefik labels).
 - Kubernetes: `deploy/k8s/`, a reference Kustomize base (restricted pod
-  security, `Recreate`, probes, emptyDir volumes). CI validates it with
-  kubeconform; nothing deploys it.
+  security, `Recreate`, probes, emptyDir volumes) and an HA test overlay;
+  see [Kubernetes](#kubernetes).
+
+### Kubernetes
+
+`deploy/k8s/` has two layouts; `deploy/k8s/README.md` explains both. CI
+renders them and validates them with kubeconform.
+
+- `base/`: one replica with `strategy: Recreate` on an external Postgres,
+  under the `restricted` Pod Security Standard. A starting point for your
+  own overlay.
+- `overlays/ha-test/`: a test deployment with two replicas
+  (`RollingUpdate`, `maxUnavailable: 0`), a PodDisruptionBudget, preferred
+  spreading over nodes and zones, an in-cluster Postgres 16 StatefulSet on
+  a persistent volume, a migration Job, an Ingress and NetworkPolicies.
+  Not for production data: the Postgres has no backups and no replication.
+
+`scripts/k8s-test-deploy.sh` deploys the overlay into one namespace with a
+namespaced deployer kubeconfig. Cluster values (host, image, node selector,
+tolerations, storage class, ingress class, trusted proxy) are environment
+inputs, never committed. It creates the credentials Secret (four keys and
+`database-url`) and the Postgres password once, from files in a private
+temporary directory, then applies Postgres, runs `toolyard db migrate` as a
+Job and waits for the gateway's rollout. Until the first account exists,
+`/v1/auth/setup` is open to any caller, so the script then creates the admin
+account through a port-forward (the generated password goes to the
+`toolyard-admin` Secret) and only then applies the Ingress. Last it smoke
+tests the result: `/v1/health` and `/v1/readyz` through the Ingress,
+`/v1/readyz` on every pod through a port-forward, MCP `server/discover`, and,
+with an agent token (`TOKEN_FILE`), a code-mode run. `--destroy` removes it
+but keeps the database volume and the Secrets; `--destroy --purge` deletes
+those too.
+
+`REPLICAS` is required: 1 for an image without v0.1 high availability
+(`Recreate`, no PodDisruptionBudget), 2 only for one with it. Every pull
+request from this repository publishes an image tagged
+`pr-<number>-<7-character head commit>`, so a branch can run in the test
+cluster before it merges; the publish run's summary prints the digest to
+pass as `IMAGE`.

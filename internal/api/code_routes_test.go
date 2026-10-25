@@ -55,6 +55,9 @@ func (r *scriptRunner) Run(ctx context.Context, code string, opts codemode.RunOp
 			Calls: []codemode.CallRecord{{Seq: 1, Tool: "demo.read", Target: "demo.read", Status: codemode.StatusSucceeded, StartedAt: 1, FinishedAt: 2}}}, nil
 	case "fail()":
 		return &codemode.RunResult{Status: codemode.StatusFailed, ErrorKind: codemode.ErrorToolError, ErrorMessage: "tool call failed for demo.write: boom"}, nil
+	case "busyrun()":
+		// A run that waited queued for a slot and got none.
+		return &codemode.RunResult{Status: codemode.StatusFailed, ErrorKind: codemode.ErrorBusy, ErrorMessage: "code mode is busy (nothing ran)"}, nil
 	case "hold()":
 		// One call to demo.write that runs only with the grant tok-w, as
 		// the gateway would: the hooks add the grant on a resume.
@@ -129,7 +132,11 @@ type codeEnv struct {
 	engine *scriptEngine
 }
 
-func newCodeEnv(t *testing.T) *codeEnv {
+func newCodeEnv(t *testing.T) *codeEnv { return newCodeEnvWith(t, nil) }
+
+// newCodeEnvWith is newCodeEnv with the run service on engine instead of
+// scriptRunner (nil keeps scriptRunner).
+func newCodeEnvWith(t *testing.T, eng coderuns.Engine) *codeEnv {
 	t.Helper()
 	ctx := context.Background()
 	db := storetest.Open(t)
@@ -157,7 +164,11 @@ func newCodeEnv(t *testing.T) *codeEnv {
 
 	runner := &scriptRunner{release: make(chan struct{})}
 	engine := &scriptEngine{r: runner}
-	runs := coderuns.New(db, coderuns.Options{Engine: engine, Grants: approvedGrants{}, PollEvery: 20 * time.Millisecond})
+	var useEngine coderuns.Engine = engine
+	if eng != nil {
+		useEngine = eng
+	}
+	runs := coderuns.New(db, coderuns.Options{Engine: useEngine, Grants: approvedGrants{}, PollEvery: 20 * time.Millisecond})
 	t.Cleanup(func() {
 		runner.releaseSlow()
 		wctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
@@ -599,5 +610,26 @@ func TestCodeMiddlewareEntries(t *testing.T) {
 		if got := sessionTokenAllowed(path); got != want {
 			t.Errorf("sessionTokenAllowed(%s) = %v, want %v", path, got, want)
 		}
+	}
+}
+
+// TestBusyRunIsTooManyRequests: a run that waited queued for a script slot
+// and got none (failed, kind busy; nothing ran) is answered 429 with
+// Retry-After and its run view, on the start and on a read.
+func TestBusyRunIsTooManyRequests(t *testing.T) {
+	e := newCodeEnv(t)
+	rec := e.run(t, e.tokA, "busyrun()", "Prefer", "wait=10")
+	v := runView(t, rec)
+	if rec.Code != http.StatusTooManyRequests || rec.Header().Get("Retry-After") == "" || v.Status != codemode.StatusFailed ||
+		v.Error == nil || v.Error.Kind != codemode.ErrorBusy {
+		t.Fatalf("busy run: %d %s", rec.Code, rec.Body.String())
+	}
+	rec = e.do(t, http.MethodGet, "/v1/code/runs/"+v.RunID, e.tokA, "")
+	if rec.Code != http.StatusTooManyRequests || runView(t, rec).Status != codemode.StatusFailed {
+		t.Fatalf("read back: %d %s", rec.Code, rec.Body.String())
+	}
+	// Any other failed run stays 200.
+	if rec := e.run(t, e.tokA, "fail()", "Prefer", "wait=10"); rec.Code != http.StatusOK {
+		t.Fatalf("a failed run: %d %s", rec.Code, rec.Body.String())
 	}
 }

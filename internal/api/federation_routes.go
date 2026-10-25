@@ -19,7 +19,7 @@ func (s *Server) federationRoutes(mux *http.ServeMux) {
 			http.NotFound(w, r)
 			return
 		}
-		writeJSON(w, 200, map[string]any{"instance_id": s.federation.InstanceID, "protocol": federation.Protocol, "capabilities": []string{"inbox.batch.v1", "callbacks.standard-webhooks.v1", "federation.ed25519.v1", "dashboard.handoff.v1", "connections.api-key.v1", "callbacks.pull.v1", "connections.host-consent.v1"}})
+		writeJSON(w, 200, map[string]any{"instance_id": s.federation.InstanceID, "protocol": federation.Protocol, "capabilities": []string{"inbox.batch.v1", "callbacks.standard-webhooks.v1", "federation.ed25519.v1", "dashboard.handoff.v1", "connections.api-key.v1", "callbacks.pull.v1", "connections.host-consent.v1", "callbacks.events.v1", "inbox.items.v3"}})
 	})
 	mux.HandleFunc("/v1/federation/register", s.federationRegister)
 	mux.HandleFunc("/v1/federation/", s.federationAction)
@@ -109,6 +109,8 @@ func federationError(w http.ResponseWriter, err error) {
 		code, status = "conflict", 409
 	case errors.Is(err, callbacks.ErrReceiver):
 		code, status = "receiver_unavailable", 404
+	case errors.Is(err, callbacks.ErrTooManyReceivers):
+		code, status = "too_many_receivers", 409
 	}
 	writeError(w, status, code)
 }
@@ -299,9 +301,18 @@ func (s *Server) callbackReceiver(w http.ResponseWriter, r *http.Request) {
 			Secret           string `json:"secret"`
 			ClientReceiverID string `json:"client_receiver_id"`
 			EnvironmentID    string `json:"environment_id"`
+			// Events and V3 opt the receiver into more than the three
+			// legacy decision events (callbacks.events.v1, inbox.items.v3).
+			Events []string `json:"events"`
+			V3     bool     `json:"v3"`
 		}
 		if err := decode(r, &b); err != nil {
 			writeError(w, 400, "invalid_receiver")
+			return
+		}
+		sub := callbacks.Subscription{Events: b.Events, V3: b.V3}
+		if _, err := callbacks.NormalizeEvents(b.Events); err != nil {
+			writeError(w, 400, err.Error())
 			return
 		}
 		if b.Transport == "pull" {
@@ -309,7 +320,7 @@ func (s *Server) callbackReceiver(w http.ResponseWriter, r *http.Request) {
 				writeError(w, 403, "environment_destination_mismatch")
 				return
 			}
-			receiver, err := s.callbacks.RegisterPull(r.Context(), a.ID, b.EnvironmentID, b.ClientReceiverID, b.Secret)
+			receiver, err := s.callbacks.RegisterPullWith(r.Context(), a.ID, b.EnvironmentID, b.ClientReceiverID, b.Secret, sub)
 			if err != nil {
 				federationError(w, err)
 				return
@@ -327,7 +338,12 @@ func (s *Server) callbackReceiver(w http.ResponseWriter, r *http.Request) {
 			writeError(w, 403, "environment_destination_mismatch")
 			return
 		}
-		receiver, err := s.callbacks.Register(r.Context(), a.ID, b.EnvironmentID, b.ClientReceiverID, b.Destination, b.Secret, private)
+		receiver, err := s.callbacks.RegisterWith(r.Context(), a.ID, b.EnvironmentID, b.ClientReceiverID, b.Destination, b.Secret, private, sub)
+		if errors.Is(err, callbacks.ErrTooManyReceivers) {
+			// The same answer as the pull route (federationError).
+			writeError(w, 409, "too_many_receivers")
+			return
+		}
 		if err != nil {
 			writeError(w, 400, err.Error())
 			return

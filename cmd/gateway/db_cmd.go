@@ -299,6 +299,7 @@ func runDBCommand(ctx context.Context, sub string, argv []string, stdout, stderr
 	}
 	dbPath := filepath.Join(dataDir, "toolyard.db")
 	blobDir := filepath.Join(dataDir, "inbox", "blobs")
+	jobResultDir := filepath.Join(dataDir, "job-results")
 	if _, err := os.Stat(dbPath); err != nil {
 		return fmt.Errorf("toolyard db %s: source database: %w", sub, err)
 	}
@@ -368,9 +369,9 @@ func runDBCommand(ctx context.Context, sub string, argv []string, stdout, stderr
 
 	var rep *dbcopy.Report
 	if sub == "copy" {
-		rep, err = dbcopy.Copy(ctx, src, blobDir, dst, dbcopy.CopyOptions{TruncateTarget: *truncate, SourceGuard: guard})
+		rep, err = dbcopy.Copy(ctx, src, blobDir, dst, dbcopy.CopyOptions{TruncateTarget: *truncate, SourceGuard: guard, JobResultDir: jobResultDir})
 	} else {
-		rep, err = dbcopy.Verify(ctx, src, blobDir, dst, keys, dbcopy.VerifyOptions{SourceGuard: guard})
+		rep, err = dbcopy.Verify(ctx, src, blobDir, dst, keys, dbcopy.VerifyOptions{SourceGuard: guard, JobResultDir: jobResultDir})
 	}
 	if rep != nil {
 		printDBReport(stdout, rep)
@@ -512,6 +513,10 @@ func printDBReport(w io.Writer, rep *dbcopy.Report) {
 		}
 		fmt.Fprintf(w, "blobs    %d rows: %d copied, %d already there, %d bytes, %d orphan files not copied\n",
 			rep.Blobs.Rows, rep.Blobs.Copied, rep.Blobs.AlreadyPresent, rep.Blobs.Bytes, len(rep.Blobs.OrphanFiles))
+		if jr := rep.JobResults; jr.Rows > 0 {
+			fmt.Fprintf(w, "results  %d job results: %d copied, %d already there, %d bytes; %d missing and %d damaged source files not copied\n",
+				jr.Rows, jr.Copied, jr.AlreadyPresent, jr.Bytes, len(jr.MissingFiles), len(jr.MismatchedFiles))
+		}
 	case "verify":
 		var match int
 		var rows int64
@@ -555,6 +560,10 @@ func printDBReport(w io.Writer, rep *dbcopy.Report) {
 			fmt.Fprintf(w, "  %-6s %s\n", state, n.Name)
 		}
 		fmt.Fprintf(w, "blobs    %d of %d read back from the target with the right sha256\n", rep.Blobs.Verified, rep.Blobs.Rows)
+		if jr := rep.JobResults; jr.Rows > 0 {
+			fmt.Fprintf(w, "results  %d of %d job results read back from the target with the right key (%d missing and %d damaged source files)\n",
+				jr.Verified, jr.Rows, len(jr.MissingFiles), len(jr.MismatchedFiles))
+		}
 	}
 	if len(rep.DroppedColumns) > 0 {
 		fmt.Fprintf(w, "dropped  columns not in the target: %s\n", strings.Join(rep.DroppedColumns, ", "))

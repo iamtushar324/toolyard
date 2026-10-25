@@ -419,15 +419,33 @@ func (g *Gateway) handleWaitForApproval() directHandler {
 		released := g.drainReleaseCh()
 		timer := time.NewTimer(time.Duration(timeoutSec) * time.Second)
 		defer timer.Stop()
-		if hasWatcher {
+		for hasWatcher {
 			select {
 			case <-ch:
+				// A wake-up for every waiter (an expiry sweep) can find this
+				// approval unchanged: wait again while it is still pending
+				// or its execution still runs.
+				if cur, err := g.approval.Get(ctx, id); err != nil || approvalWaitSettled(cur) {
+					goto settled
+				}
+				// The holder installs its next channel before it reads; until
+				// it has, Watch still returns the closed one: poll instead
+				// of spinning on it.
+				next, ok := g.approval.Watch(id)
+				if !ok || next == ch {
+					hasWatcher = false
+					continue
+				}
+				ch = next
 			case <-timer.C:
+				goto settled
 			case <-ctx.Done():
+				goto settled
 			case <-released:
 				return waitRestartingResult("tools.wait_for_approval"), nil
 			}
-		} else {
+		}
+		if !hasWatcher {
 			// Fallback poll loop — coarse so we don't hammer SQLite.
 			pollTimer := time.NewTimer(2 * time.Second)
 			defer pollTimer.Stop()
@@ -441,7 +459,7 @@ func (g *Gateway) handleWaitForApproval() directHandler {
 					return waitRestartingResult("tools.wait_for_approval"), nil
 				case <-pollTimer.C:
 					req, err = g.approval.Get(ctx, id)
-					if err == nil && req.Status != approval.StatusPending {
+					if err == nil && approvalWaitSettled(req) {
 						goto done
 					}
 					pollTimer.Reset(2 * time.Second)
@@ -449,6 +467,7 @@ func (g *Gateway) handleWaitForApproval() directHandler {
 			}
 		done:
 		}
+	settled:
 		// Re-fetch authoritative state.
 		req, err = g.approval.Get(ctx, id)
 		if err != nil {
@@ -574,6 +593,17 @@ func (g *Gateway) handleWaitForApprovals() directHandler {
 			// handles the "timer fired" path uniformly.
 		}
 	}
+}
+
+// approvalWaitSettled reports whether tools.wait_for_approval has nothing
+// more to wait for: the approval left pending, and no execution of it is
+// still running without a result (the result is what the agent waits
+// for). The watcher and the polling path use the same test.
+func approvalWaitSettled(r *approval.Request) bool {
+	if r.Status == approval.StatusPending {
+		return false
+	}
+	return !(r.Status == approval.StatusAllowed && r.ResultExecutedAt == 0 && r.ExecutionState == "running")
 }
 
 // waitRestartingResult ends a wait loop early at shutdown. The approvals
