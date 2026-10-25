@@ -35,7 +35,7 @@
 
   const MAX_ARGS_CHARS = 4 * 1024 * 1024;
   const MAX_PRINT_CHARS = 1024 * 1024;
-  const MAX_RESULT_CHARS = 2 * 1024 * 1024;
+  const MAX_RESULT_CHARS = 1024 * 1024;
 
   function sendLine(line) {
     out.puts(line + "\n");
@@ -274,8 +274,10 @@
     });
   }
 
+  // search defaults to detail "summary" (the MCP tool's default is
+  // "full", with schemas): a script reads the stubs for schemas.
   function search(query, opts) {
-    const args = Object.assign({}, opts || {}, { query: query === undefined ? "" : String(query) });
+    const args = Object.assign({ detail: "summary" }, opts || {}, { query: query === undefined ? "" : String(query) });
     return invoke({ name: "toolyard.tools_search" }, args, false).then((r) =>
       r && Array.isArray(r.results) ? r.results : r);
   }
@@ -379,8 +381,10 @@
       return;
     }
     if (json.length > MAX_RESULT_CHARS) {
-      send({ t: "error", kind: "runtime", cause: "limit", message: "result is about " + json.length +
-        " bytes; a returned value may be at most 1 MiB (the response is truncated there anyway). Return less, or print a summary and return the key fields" });
+      // Characters, not bytes: the host checks the exact UTF-8 size of
+      // anything shorter with the same 1 MiB limit and wording.
+      send({ t: "error", kind: "runtime", cause: "limit", message: "result is " + json.length +
+        " characters; a returned value may be at most 1 MiB (the response is truncated there anyway). Return less, or print a summary and return the key fields" });
       return;
     }
     sendLine('{"t":"done","has":true,"result":' + json + "}");

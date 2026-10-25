@@ -179,11 +179,24 @@ owner decided.
   request must belong to the agent (`400` otherwise). A call no unused grant
   of the request covers is sent without one, so it is held again (`403`).
 
-The script runs again from the top. Each call before the held one is answered
-from the call record when its tool and arguments are the same as recorded
-(`replayed: true`); a different call is `failed` with `script_diverged` and
-nothing more runs. A recorded call with an unknown outcome stops the resume
-with `outcome_unknown`; nothing is repeated blindly. Inbox status reads
+The script runs again from the top. Every recorded call other than the held
+one is checked against the call record, wherever it sits: with
+`tools.parallel`, a call left un-awaited, or a held call the script caught,
+calls numbered after the held one may have run too.
+
+- A different tool or different arguments: `failed` with `script_diverged`,
+  and nothing more runs.
+- A recorded call that `succeeded`: answered from the record
+  (`replayed: true`), never sent again.
+- A recorded call with an unknown outcome: the resume stops with
+  `outcome_unknown`. Nothing is repeated blindly.
+- A recorded call that was held and caught (`permission_required` or
+  `deferred`, through `try_call` or `tools.tryCall`), or that `failed`: it
+  did not take effect. It is sent again, with a grant when one of the
+  request's grants covers it.
+- The held call is sent with the request's grant (or the legacy
+  `approval_id`).
+- A call past every recorded call is new, and is sent. Inbox status reads
 (`toolyard.inbox_status`, `toolyard.inbox_wait`) are sent again instead of
 replayed, because their answers can carry grant tokens. The same
 `Prefer: wait` and HTTP mapping apply. A recorded answer that held a grant
@@ -243,9 +256,10 @@ otherwise.
 ## Limits
 
 The MCP code-mode limits apply: 5 minutes wall clock, 100 tool calls, 1 MiB
-output per run, 4 concurrent scripts per server and 2 per agent
+output per run, 4 concurrent scripts per server and 3 per agent
 (`-codemode-max-concurrent`, `-codemode-max-per-agent`). A start past either
-cap waits up to 2 seconds in a fair queue, then is `429` with `Retry-After`
+cap waits up to 30 seconds (`-codemode-queue-wait`) in a fair queue, then is
+`429` with `Retry-After`
 and creates no run. Runs and their call records
 are kept 7 days from their start (an hourly sweep deletes older ones). A run
 that is `running` when the server stops is `outcome_unknown` after the

@@ -71,8 +71,12 @@ func (r *Runtime) ExecuteToolCode(ctx context.Context, code, reason string) (tex
 }
 
 // Execute runs a script for the ctx caller and renders executeToolCode's
-// text. With Language Starlark and Echo full the text is Bifrost's, byte
-// for byte; the other modes add the call ledger to its Environment block.
+// text. With Language Starlark and Echo full the text has Bifrost's shape
+// and wording, with two limits of toolyard's own: tool answers echoed
+// past three quarters of the output limit stop with one "[TOOL] echo
+// stopped" line, and when the text would pass the limit the print output
+// is cut first (fitLogs), so the error or the returned value stays whole.
+// The other modes also add the call ledger to its Environment block.
 func (r *Runtime) Execute(ctx context.Context, code string, opts ExecOptions) ExecResult {
 	lang, err := ParseLanguage(opts.Language)
 	if err != nil {
@@ -705,7 +709,13 @@ func (s *session) echoResponse(label, quoted, text string) {
 	switch s.echo {
 	case EchoNone:
 	case EchoPreview:
-		preview := strings.Join(strings.Fields(text), " ")
+		// Cut first, so a 6 MiB answer is not split into words for 500
+		// bytes of preview.
+		head := text
+		if len(head) > 4*echoPreviewBytes {
+			head = cut(head, 4*echoPreviewBytes, "")
+		}
+		preview := strings.Join(strings.Fields(head), " ")
 		more := ""
 		if len(preview) > echoPreviewBytes {
 			cut := echoPreviewBytes

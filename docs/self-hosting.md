@@ -255,19 +255,27 @@ JavaScript API, TypeScript stubs, Starlark `try_call` and `parallel`, `echo`,
 the call ledger, and `tools.search` (BM25 keyword and RE2 regex search;
 semantic search is not available).
 
-Two flags (or `TOOLYARD_CODEMODE_MAX_CONCURRENT` and
-`TOOLYARD_CODEMODE_MAX_PER_AGENT`) bound how many scripts run at once:
+Three flags (or `TOOLYARD_CODEMODE_MAX_CONCURRENT`,
+`TOOLYARD_CODEMODE_MAX_PER_AGENT` and `TOOLYARD_CODEMODE_QUEUE_WAIT`) bound how
+many scripts run at once:
 
 | Flag | Default | Meaning |
 |---|---|---|
 | `-codemode-max-concurrent` | 4 | Scripts running at once on this gateway (MCP and REST together). Each is a worker of up to 256 MiB, so size it with the service's memory limit. |
-| `-codemode-max-per-agent` | 2 | Scripts one agent runs at once. |
+| `-codemode-max-per-agent` | 3 | Scripts one agent runs at once. |
+| `-codemode-queue-wait` | 30s | How long a script past either cap waits for a slot. |
 
-A script past either cap waits in one fair queue for 2 seconds. A freed slot
+A script past either cap waits in one fair queue for up to
+`-codemode-queue-wait`. A freed slot
 goes to the earliest waiter whose agent is under its own cap. After the
 wait the script is refused as busy (HTTP 429 over REST). Every audit row of
 a script, the outer call's and each nested call's, carries the run's id in
-`audit_events.run_id`, so `GET /v1/audit` rows of one script can be grouped.
+`audit_events.run_id`: `GET /v1/audit?run_id=…` and the audit export
+(`run_id` filter and CSV column) show one script's rows. Migration 0050 adds
+the column and a partial index on it. On Postgres the index is built inside
+the migration, without `CONCURRENTLY`. It covers only rows that have a run
+id, so on an existing database it scans `audit_events` once. Writes to the
+table wait while it builds. A fresh database sees no wait.
 
 ### The script worker
 

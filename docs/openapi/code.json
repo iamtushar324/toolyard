@@ -494,7 +494,7 @@
         "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
       },
       "Busy": {
-        "description": "Code mode is busy: every script slot is in use, or this agent already runs as many scripts as one agent may at once (2 by default). A start waits up to 2 seconds in a fair queue first. No run is created; try again after `Retry-After` seconds.",
+        "description": "Code mode is busy: every script slot is in use, or this agent already runs as many scripts as one agent may at once (3 by default). A start waits up to 30 seconds in a fair queue first (`-codemode-queue-wait`). No run is created; try again after `Retry-After` seconds.",
         "headers": {
           "Retry-After": { "$ref": "#/components/headers/RetryAfter" }
         },

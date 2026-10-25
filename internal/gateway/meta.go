@@ -30,7 +30,7 @@ func (g *Gateway) metaTools() []toolEntry {
 			"mode \"keyword\" (default) ranks by BM25 over tool names (split at dots, underscores and camelCase), descriptions, parameter names and parameter descriptions: query \"create a linear issue\". " +
 			"mode \"regex\" matches an RE2 pattern (at most 200 characters, case-insensitive unless the pattern turns that off) against the same fields: query \"^github\\\\..*pull\". " +
 			"mode \"auto\" is keyword; \"semantic\" works only where an operator configured it. " +
-			"detail \"summary\" (default) returns name, upstream, description, the code-mode name and score; \"name\" only names; \"full\" adds the input and output schemas. " +
+			"detail \"full\" (default) returns name, upstream, description, the code-mode name, score and the input and output schemas; \"summary\" leaves out the schemas; \"name\" only names. " +
 			"Use it before tools.execute, or in code mode: JavaScript `await tools.search(\"query\", { limit: 5 })`, Starlark `toolyard.tools_search(query=\"...\")`.",
 		InputSchema: mcp.ToolInputSchema{
 			Type:     "object",
@@ -48,7 +48,7 @@ func (g *Gateway) metaTools() []toolEntry {
 				"detail": map[string]any{
 					"type":        "string",
 					"enum":        []string{string(toolsearch.DetailName), string(toolsearch.DetailSummary), string(toolsearch.DetailFull)},
-					"description": "name, summary (default) or full (with input and output schemas).",
+					"description": "full (default: with input and output schemas), summary (no schemas) or name.",
 				},
 				"upstream": map[string]any{
 					"type":        "string",
@@ -157,16 +157,20 @@ func (g *Gateway) SearchTools(ctx context.Context, req SearchRequest) (map[strin
 
 // searchCatalog is the ctx caller's tools as search sees them: the schema
 // without the gateway's injected fields, the output schema, and the name a
-// script calls each tool by.
+// script calls each tool by. Which tools is CatalogFor's answer, the one
+// scope every surface shares (the person's grants, the agent's own allow
+// and deny lists, an OAuth client's scope), so search never shows a tool
+// the caller could not list.
 func (g *Gateway) searchCatalog(ctx context.Context) []toolsearch.Tool {
-	scope := g.scopeFor(ctx, agentIDFromContext(ctx))
+	visible := g.CatalogFor(ctx)
+	allowed := make(map[string]bool, len(visible))
+	for _, c := range visible {
+		allowed[c.Name] = true
+	}
 	g.mu.RLock()
-	entries := make([]toolEntry, 0, len(g.tools))
+	entries := make([]toolEntry, 0, len(allowed))
 	for _, e := range g.tools {
-		if e.tool.Name == MetaSearchTool || e.tool.Name == MetaExecuteTool {
-			continue
-		}
-		if g.access != nil && !scope.All && !scope.AllowsTool(e.upstream, e.tool.Name) {
+		if e.tool.Name == MetaSearchTool || e.tool.Name == MetaExecuteTool || !allowed[e.tool.Name] {
 			continue
 		}
 		entries = append(entries, e)
@@ -216,6 +220,13 @@ func (g *Gateway) handleSearchTools() directHandler {
 		if v, ok := asInt(args["limit"]); ok && v > 0 {
 			req.Limit = v
 		}
+		if strings.TrimSpace(req.Detail) == "" {
+			// The MCP tool has always returned each tool's input schema,
+			// and agents in router-only or top-N mode call tools.execute
+			// from it: full stays the default here. Scripts (tools.search)
+			// and GET /v1/code/search default to summary.
+			req.Detail = string(toolsearch.DetailFull)
+		}
 		body, err := g.SearchTools(ctx, req)
 		var se *SearchError
 		switch {
@@ -245,9 +256,14 @@ func (g *Gateway) handleExecuteTool() directHandler {
 		}
 		// A script may reach tools.execute (toolyard.tools_execute) but
 		// not code mode itself: a nested executeToolCode would only
-		// recurse, one worker slot per level.
-		if r, ok := actor.RaiserFrom(ctx); ok && r.Via == codemode.Via && isCodeModeTool(target) {
+		// recurse, one worker slot per level. routeEntry refuses it at any
+		// depth (refuseNestedCodeMode); this answers the direct case early.
+		// tools.execute never targets itself (RouteCall refuses that).
+		if r, ok := actor.RaiserFrom(ctx); ok && (r.Via == codemode.Via || isWithinCodeMode(ctx)) && isCodeModeTool(target) {
 			return mcp.NewToolResultErrorf("%s cannot be called from code mode: call the tools you need directly in the script", target), nil
+		}
+		if target == MetaExecuteTool {
+			return mcp.NewToolResultError("tools.execute cannot target itself"), nil
 		}
 		inner, _ := args["arguments"].(map[string]any)
 		if inner == nil {

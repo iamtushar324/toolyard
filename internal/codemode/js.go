@@ -3,13 +3,17 @@ package codemode
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"crypto/sha256"
 	_ "embed"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"strings"
 	"sync"
+	"time"
 
 	"github.com/tetratelabs/wazero"
 	"github.com/tetratelabs/wazero/imports/wasi_snapshot_preview1"
@@ -126,11 +130,49 @@ func jsBudget(mib int) (heapMiB, wasmMiB, goMiB int) {
 	return heapMiB, wasmMiB, goMiB
 }
 
+var (
+	quickJSCheckOnce sync.Once
+	quickJSCheckErr  error
+)
+
+// checkQuickJS verifies, once per process, that the embedded engine is
+// the build quickJSWasmSHA256 names: a damaged or swapped binary is
+// refused rather than run.
+func checkQuickJS() error {
+	quickJSCheckOnce.Do(func() {
+		sum := sha256.Sum256(quickJSWasm)
+		if got := hex.EncodeToString(sum[:]); got != quickJSWasmSHA256 {
+			quickJSCheckErr = fmt.Errorf("the embedded JavaScript engine has sha256 %s, not %s's %s", got, QuickJSVersion, quickJSWasmSHA256)
+		}
+	})
+	return quickJSCheckErr
+}
+
+// sleepUntil is the module's nanosleep: it ends early when ctx ends, so a
+// script blocked in a sleep (qjs:os's os.sleep, say) stops at its
+// deadline, in process as in a worker.
+func sleepUntil(ctx context.Context) func(ns int64) {
+	return func(ns int64) {
+		if ns <= 0 {
+			return
+		}
+		t := time.NewTimer(time.Duration(ns))
+		defer t.Stop()
+		select {
+		case <-t.C:
+		case <-ctx.Done():
+		}
+	}
+}
+
 // runJS executes JavaScript code under the limits; stopNote names the
 // deadline reported when ctx ends the run.
 func runJS(ctx context.Context, start startMsg, s sink, stopNote string) scriptResult {
 	internal := func(msg string) scriptResult {
 		return scriptResult{errKind: "runtime", cause: ErrorInternal, errMsg: msg}
+	}
+	if err := checkQuickJS(); err != nil {
+		return internal(err.Error())
 	}
 	mib := start.MemoryMiB
 	if mib <= 0 {
@@ -175,7 +217,8 @@ func runJS(ctx context.Context, start startMsg, s sink, stopNote string) scriptR
 		WithStderr(stderr).
 		WithSysWalltime().
 		WithSysNanotime().
-		WithSysNanosleep()
+		WithNanosleep(sleepUntil(ctx)).
+		WithRandSource(rand.Reader)
 	_, runErr := r.InstantiateModule(rctx, compiled, mc)
 	return h.outcome(ctx, runErr, stderr.String(), stopNote, heapMiB)
 }
@@ -365,7 +408,7 @@ func (h *jsHost) outcome(ctx context.Context, runErr error, stderr, stopNote str
 	case runErr != nil:
 		return scriptResult{errKind: "runtime", errMsg: "the JavaScript engine stopped: " + runErr.Error()}
 	}
-	return scriptResult{errKind: "runtime", errMsg: "the script ended without finishing: it awaited something that never settles (in code mode only tool calls settle; there are no timers)"}
+	return scriptResult{errKind: "runtime", errMsg: "the script ended without finishing: its top-level promise never settled, because it awaited a promise nothing resolves (tool calls always settle; code mode has no setTimeout)"}
 }
 
 // jsStdin is the prelude's stdin: the boot line, then the answers.

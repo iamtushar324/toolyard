@@ -15,19 +15,6 @@ import (
 	"github.com/tusharbhardwaj/toolyard/internal/coderuns"
 )
 
-// Scripts run in a child process: in this package's tests the child is
-// the test binary, which runs the code-mode worker instead of the tests
-// when it sees the marker variable in the bare environment the parent
-// builds.
-const apiTestWorkerEnv = "TOOLYARD_API_TEST_WORKER"
-
-func TestMain(m *testing.M) {
-	if os.Getenv(apiTestWorkerEnv) == "1" {
-		os.Exit(codemode.WorkerMain(os.Stdin, os.Stdout, os.Stderr))
-	}
-	os.Exit(m.Run())
-}
-
 // jsCaller is the gateway for the JavaScript route test: demo.read
 // answers JSON text; demo.write needs the grant tok-w (approvedGrants'
 // rq_1) and answers permission_required without it.

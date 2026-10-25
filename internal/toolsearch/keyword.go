@@ -39,6 +39,8 @@ const (
 	exactNameBoost = 10.0
 	// maxSchemaDepth bounds how deep parameter names are collected.
 	maxSchemaDepth = 3
+	// maxQueryTerms caps the distinct words of a keyword query that count.
+	maxQueryTerms = 32
 )
 
 // doc is one indexed tool.
@@ -95,12 +97,15 @@ func buildIndex(tools []Tool) *index {
 }
 
 // search scores every document for query and returns those that match,
-// best first.
+// best first. Only the first maxQueryTerms distinct terms count.
 func (ix *index) search(query string) []Hit {
 	terms := uniq(tokens(query, false))
 	if len(terms) == 0 {
 		// A query of stop words only ("the", "a"): match them anyway.
 		terms = uniq(tokens(query, true))
+	}
+	if len(terms) > maxQueryTerms {
+		terms = terms[:maxQueryTerms]
 	}
 	exact := squash(query)
 	n := float64(len(ix.docs))

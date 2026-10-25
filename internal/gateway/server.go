@@ -1451,6 +1451,9 @@ func (g *Gateway) routeEntry(ctx context.Context, entry toolEntry, via string, a
 	raiser := g.resolveRaiser(ctx, agentID, via)
 	g.attachSession(ctx, &raiser, args)
 	ctx = actor.WithRaiser(ctx, raiser)
+	if res := refuseNestedCodeMode(ctx, entry); res != nil {
+		return res, nil
+	}
 	ctx = withCodeModeRunID(ctx, entry)
 
 	// In-flight tracking + slow-call watchdog. The watchdog goroutine

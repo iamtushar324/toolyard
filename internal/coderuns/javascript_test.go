@@ -6,6 +6,7 @@ import (
 	"os"
 	"reflect"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -115,4 +116,111 @@ func TestPerAgentCapRefusesTheThirdRunOnly(t *testing.T) {
 	}
 	_ = run
 	_ = runs
+}
+
+// demo.post is a write that always runs: a resume must never send it twice.
+func init() {
+	testTools = append(testTools, codemode.Tool{Server: "demo", Name: "post", Target: "demo.post", Description: "Post a message.",
+		ReasonField: "_reason", Properties: map[string]any{"text": map[string]any{"type": "string"}}, Required: []string{"text"}})
+}
+
+func (e *env) countPosts(t *testing.T) *atomic.Int32 {
+	t.Helper()
+	var n atomic.Int32
+	e.f.setHandler("demo.post", func(args map[string]any) (*mcp.CallToolResult, error) {
+		n.Add(1)
+		return mcp.NewToolResultText(`{"posted": "` + args["text"].(string) + `"}`), nil
+	})
+	return &n
+}
+
+// TestResumeNeverRepeatsACallAfterTheHeldOne (review P0-1): with
+// tools.parallel the held write is call 1 and the post that ran is call 2.
+// The resume sends the write with its grant and answers the post from the
+// record, so the post runs once.
+func TestResumeNeverRepeatsACallAfterTheHeldOne(t *testing.T) {
+	e := newEnv(t)
+	posts := e.countPosts(t)
+	ctx := context.Background()
+	script := `const [w, p] = await tools.parallel([
+  () => tools.demo.write({ x: 1 }),
+  () => tools.demo.post({ text: "hi" }),
+], { limit: 2 });
+return { wrote: w.ok, posted: p.posted };`
+	run, _, err := e.svc.Start(ctx, StartRequest{AgentID: "ag_a", Code: script, Reason: testReason, Language: "javascript"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	held := e.settle(t, "ag_a", run.ID)
+	if held.Status != codemode.StatusPermissionRequired || held.Held == nil || held.Held.Seq != 1 ||
+		!reflect.DeepEqual(callStatuses(held), []string{"permission_required", "succeeded"}) || posts.Load() != 1 {
+		t.Fatalf("held = %+v calls %v posts %d", held, callStatuses(held), posts.Load())
+	}
+	e.grants.set("rq_p", inbox.AgentToolView{CallID: "call_1", Tool: "demo.write", Decision: "allowed", Grant: "tok-w"})
+	if _, err := e.svc.Resume(ctx, ResumeRequest{AgentID: "ag_a", RunID: run.ID, RequestID: "rq_p"}); err != nil {
+		t.Fatal(err)
+	}
+	done := e.settle(t, "ag_a", run.ID)
+	if done.Status != codemode.StatusSucceeded || string(done.Result) != `{"wrote":true,"posted":"hi"}` ||
+		!reflect.DeepEqual(callStatuses(done), []string{"succeeded", "succeeded+replayed"}) {
+		t.Fatalf("resumed = %+v calls %v", done, callStatuses(done))
+	}
+	if n := posts.Load(); n != 1 {
+		t.Fatalf("the post after the held write ran %d times", n)
+	}
+	if len(e.f.sent("demo.post")) != 1 {
+		t.Fatalf("demo.post reached the gateway %d times", len(e.f.sent("demo.post")))
+	}
+
+	// A recorded call with an unknown outcome after the held one is never
+	// sent again either: the resume stops with outcome_unknown.
+	run, _, err = e.svc.Start(ctx, StartRequest{AgentID: "ag_a", Code: script, Reason: testReason, Language: "javascript"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	held = e.settle(t, "ag_a", run.ID)
+	if _, err := e.db.Exec(`UPDATE code_run_calls SET status = ? WHERE run_id = ? AND seq = ?`, codemode.StatusOutcomeUnknown, run.ID, 2); err != nil {
+		t.Fatal(err)
+	}
+	before := posts.Load()
+	e.grants.set("rq_q", inbox.AgentToolView{CallID: "call_1", Tool: "demo.write", Decision: "allowed", Grant: "tok-w"})
+	if _, err := e.svc.Resume(ctx, ResumeRequest{AgentID: "ag_a", RunID: run.ID, RequestID: "rq_q"}); err != nil {
+		t.Fatal(err)
+	}
+	done = e.settle(t, "ag_a", run.ID)
+	if done.Status != codemode.StatusOutcomeUnknown || done.ErrorKind != codemode.ErrorOutcomeUnknown || posts.Load() != before {
+		t.Fatalf("unknown-outcome record: %+v posts %d -> %d", done, before, posts.Load())
+	}
+}
+
+// TestResumeAfterACaughtHeldCall (review P1-4): a held call the script
+// caught (try_call) is recorded permission_required; the resume sends it
+// again with the request's grant instead of calling the script diverged.
+func TestResumeAfterACaughtHeldCall(t *testing.T) {
+	e := newEnv(t)
+	ctx := context.Background()
+	script := `first = try_call(demo.write, x=1)
+r = demo.read(q="between")
+w = demo.write(x=2)
+result = {"first": first["ok"], "read": r["q"], "second": w["ok"]}
+`
+	held := e.start(t, "ag_a", script, "")
+	if held.Status != codemode.StatusPermissionRequired || held.Held == nil || held.Held.Seq != 3 ||
+		!reflect.DeepEqual(callStatuses(held), []string{"permission_required", "succeeded", "permission_required"}) {
+		t.Fatalf("held = %+v calls %v", held, callStatuses(held))
+	}
+	e.grants.set("rq_c",
+		inbox.AgentToolView{CallID: "call_1", Tool: "demo.write", Decision: "allowed", Grant: "tok-w"},
+		inbox.AgentToolView{CallID: "call_2", Tool: "demo.write", Decision: "allowed", Grant: "tok-w"})
+	if _, err := e.svc.Resume(ctx, ResumeRequest{AgentID: "ag_a", RunID: held.ID, RequestID: "rq_c"}); err != nil {
+		t.Fatal(err)
+	}
+	done := e.settle(t, "ag_a", held.ID)
+	if done.Status != codemode.StatusSucceeded || string(done.Result) != `{"first":true,"read":"between","second":true}` ||
+		!reflect.DeepEqual(callStatuses(done), []string{"succeeded", "succeeded+replayed", "succeeded"}) {
+		t.Fatalf("resumed = %+v calls %v (%s)", done, callStatuses(done), done.ErrorMessage)
+	}
+	if len(e.f.sent("demo.read")) != 1 {
+		t.Fatalf("the read between was sent %d times", len(e.f.sent("demo.read")))
+	}
 }

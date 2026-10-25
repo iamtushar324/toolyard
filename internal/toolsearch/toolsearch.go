@@ -30,6 +30,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"unicode/utf8"
 )
 
 // Tool is one tool as search sees it.
@@ -104,6 +105,8 @@ const (
 	MaxLimit     = 200
 	// MaxPatternLen caps a regex pattern, in characters.
 	MaxPatternLen = 200
+	// MaxQueryLen caps a keyword query, in characters.
+	MaxQueryLen = 1000
 	// summaryLen caps the description a summary result carries, in bytes.
 	summaryLen = 300
 	// indexCacheSize is how many keyword indexes (one per distinct
@@ -203,6 +206,11 @@ func (e *Engine) Search(ctx context.Context, tools []Tool, q Query) (*Result, er
 		tools = kept
 	}
 	text := strings.TrimSpace(q.Text)
+	if mode != ModeRegex {
+		if n := utf8.RuneCountInString(text); n > MaxQueryLen {
+			return nil, &QueryError{Message: fmt.Sprintf("the query is %d characters; a search takes at most %d", n, MaxQueryLen)}
+		}
+	}
 	var hits []Hit
 	var err error
 	switch {
@@ -286,9 +294,10 @@ func catalogKey(tools []Tool) string {
 	for _, i := range names {
 		t := tools[i]
 		schema, _ := json.Marshal(t.InputSchema)
-		fmt.Fprintf(h, "%d:%s\x00%d:%s\x00%d:%s\x00%d:%s\x00%d:%s\x00",
+		output, _ := json.Marshal(t.OutputSchema)
+		fmt.Fprintf(h, "%d:%s\x00%d:%s\x00%d:%s\x00%d:%s\x00%d:%s\x00%d:%s\x00",
 			len(t.Name), t.Name, len(t.Server), t.Server, len(t.Description), t.Description,
-			len(t.CodeName), t.CodeName, len(schema), schema)
+			len(t.CodeName), t.CodeName, len(schema), schema, len(output), output)
 	}
 	return hex.EncodeToString(h.Sum(nil))
 }

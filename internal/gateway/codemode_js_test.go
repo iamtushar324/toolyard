@@ -2,9 +2,11 @@ package gateway
 
 import (
 	"context"
+	"reflect"
 	"strings"
 	"testing"
 
+	"github.com/tusharbhardwaj/toolyard/internal/access"
 	"github.com/tusharbhardwaj/toolyard/internal/audit"
 	"github.com/tusharbhardwaj/toolyard/internal/codemode"
 )
@@ -159,8 +161,13 @@ func TestToolsSearchModes(t *testing.T) {
 		t.Fatalf("keyword: %v %v", body["mode"], got)
 	}
 	first := body["results"].([]any)[0].(map[string]any)
-	if first["code"] != "LinearForT3Code.save_issue" || first["upstream"] != "LinearForT3Code" || first["input_schema"] != nil || first["score"] == nil {
-		t.Fatalf("summary entry %v", first)
+	// The MCP tool keeps returning input schemas by default (full).
+	if first["code"] != "LinearForT3Code.save_issue" || first["upstream"] != "LinearForT3Code" || first["input_schema"] == nil || first["score"] == nil {
+		t.Fatalf("default (full) entry %v", first)
+	}
+	summary := search(map[string]any{"query": "save issue t3code", "detail": "summary"})["results"].([]any)[0].(map[string]any)
+	if summary["input_schema"] != nil || summary["name"] != "LinearForT3Code.save_issue" {
+		t.Fatalf("summary entry %v", summary)
 	}
 	for _, n := range got {
 		if n == MetaSearchTool || n == MetaExecuteTool {
@@ -195,4 +202,69 @@ func TestToolsSearchModes(t *testing.T) {
 	refused(map[string]any{"query": strings.Repeat("a", 201), "mode": "regex"}, "at most 200")
 	refused(map[string]any{"query": "(", "mode": "regex"}, "not a valid RE2")
 	refused(map[string]any{"query": "x", "detail": "everything"}, "unknown detail")
+}
+
+// TestCodeModeCannotNestAtAnyDepth (review P1-2): a script reaches the
+// code-mode tools neither directly through tools.execute nor through
+// tools.execute calling tools.execute; every hop below a script refuses
+// them, whatever via it records.
+func TestCodeModeCannotNestAtAnyDepth(t *testing.T) {
+	gw := newReplayGateway(t, &recorder{})
+	ctx := context.Background()
+	for _, code := range []string{
+		`result = toolyard.tools_execute(tool="executeToolCode", arguments={"code": "result = 1"})`,
+		`result = toolyard.tools_execute(tool="tools.execute", arguments={"tool": "executeToolCode", "arguments": {"code": "result = 1"}})`,
+		`r = try_call("toolyard.tools_execute", {"tool": "listToolFiles", "arguments": {}})
+result = r`,
+	} {
+		res := route(t, gw, ctx, CodeModeExecuteToolCode, map[string]any{"code": code})
+		text := textOf(res)
+		if !strings.Contains(text, "cannot be called from code mode") && !strings.Contains(text, "cannot target itself") {
+			t.Errorf("nested code mode was not refused:\n%s\n%s", code, text)
+		}
+	}
+	for _, tool := range CodeModeToolNames {
+		res, err := gw.RouteCall(withinCodeMode(ctx), MetaExecuteTool, tool, map[string]any{"code": "result = 1", "fileName": "servers/x/y.pyi", "server": "x", "tool": "y"})
+		if err != nil || !res.IsError || !strings.Contains(textOf(res), "cannot be called from code mode") {
+			t.Errorf("%s below a script: %v %v %s", tool, err, res.IsError, textOf(res))
+		}
+	}
+	if res := route(t, gw, ctx, CodeModeListToolFiles, map[string]any{}); res.IsError {
+		t.Fatalf("outside a script listToolFiles works: %s", textOf(res))
+	}
+}
+
+// TestToolsSearchSharesCatalogForScope (review P1-6): search shows exactly
+// the tools CatalogFor lists for the caller, the agent's own denies
+// included.
+func TestToolsSearchSharesCatalogForScope(t *testing.T) {
+	f := newAccessFixture(t, nil)
+	f.res.set(memberID, access.Scope{Groups: map[string]bool{"alpha": true},
+		Limits: access.AgentScope{DenyTools: []access.ToolRef{{Server: "alpha", Tool: "alpha.run"}}}.Compile()})
+	res := f.call(t, f.member, MetaSearchTool, map[string]any{"query": "", "limit": 200, "detail": "name"})
+	if res.IsError {
+		t.Fatalf("search: %s", textOf(res))
+	}
+	got := map[string]bool{}
+	for _, r := range structured(t, res)["results"].([]any) {
+		got[r.(map[string]any)["name"].(string)] = true
+	}
+	want := map[string]bool{}
+	for _, c := range f.gw.CatalogFor(f.member) {
+		if c.Name != MetaSearchTool && c.Name != MetaExecuteTool {
+			want[c.Name] = true
+		}
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("search and CatalogFor differ:\n search %v\n catalog %v", got, want)
+	}
+	if got["alpha.run"] || !got["alpha.get_status"] || got["beta.run"] {
+		t.Fatalf("scope not applied: %v", got)
+	}
+	regex := f.call(t, f.member, MetaSearchTool, map[string]any{"query": `^alpha\.`, "mode": "regex", "detail": "name"})
+	for _, r := range structured(t, regex)["results"].([]any) {
+		if r.(map[string]any)["name"] == "alpha.run" {
+			t.Fatal("regex search shows a denied tool")
+		}
+	}
 }

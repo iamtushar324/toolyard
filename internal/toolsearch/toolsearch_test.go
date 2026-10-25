@@ -3,6 +3,7 @@ package toolsearch
 import (
 	"context"
 	"errors"
+	"fmt"
 	"reflect"
 	"strings"
 	"testing"
@@ -366,5 +367,58 @@ func TestIndexIsCachedPerCatalog(t *testing.T) {
 	changed[0].Description = "Something else entirely."
 	if c := e.index(changed); c == a {
 		t.Fatal("a changed catalog needs a new index")
+	}
+}
+
+// TestSearchCostIsBounded (review P1-3): a short pattern cannot compile to
+// a huge program, counted repetition is capped, and keyword queries have a
+// length cap and count only their first terms.
+func TestSearchCostIsBounded(t *testing.T) {
+	tools := fixture()
+	e := New(Options{})
+	ctx := context.Background()
+	var qe *QueryError
+	for pattern, want := range map[string]string{
+		`a{101}`:                   "at most {100}",
+		`((abcdefghij){100}){10}`:  "instructions",
+		`(x{100}y{100}z{100}){20}`: "instructions",
+	} {
+		// RE2's own parser may call a pattern too large first; either way
+		// it is refused before it runs.
+		if _, err := e.Search(ctx, tools, Query{Mode: ModeRegex, Text: pattern}); !errors.As(err, &qe) ||
+			!(strings.Contains(err.Error(), want) || strings.Contains(err.Error(), "too large")) {
+			t.Errorf("pattern %s: %v, want an error naming %q", pattern, err, want)
+		}
+	}
+	// Within the limits a counted repetition is fine.
+	if _, err := e.Search(ctx, tools, Query{Mode: ModeRegex, Text: `(abcdefghij){100}`}); err != nil {
+		t.Errorf("a repetition of 100: %v", err)
+	}
+	if _, err := e.Search(ctx, tools, Query{Text: strings.Repeat("issue ", 200)}); !errors.As(err, &qe) || !strings.Contains(err.Error(), "at most 1000") {
+		t.Errorf("a 1200-character query: %v", err)
+	}
+	// Many distinct words: only the first ones count, and the search runs.
+	var words []string
+	for i := 0; i < 60; i++ {
+		words = append(words, fmt.Sprintf("w%d", i))
+	}
+	if res := search(t, e, tools, Query{Text: "linear issue " + strings.Join(words, " ")}); len(res.Hits) == 0 {
+		t.Error("a query with many terms found nothing")
+	}
+}
+
+// TestIndexCacheKeyCoversOutputSchema (review P2-7): a changed output
+// schema makes a new index, so full results never show a stale one.
+func TestIndexCacheKeyCoversOutputSchema(t *testing.T) {
+	e := New(Options{})
+	a := fixture()
+	b := fixture()
+	b[0].OutputSchema = map[string]any{"type": "object", "properties": map[string]any{"id": map[string]any{"type": "string"}}}
+	if e.index(a) == e.index(b) {
+		t.Fatal("a changed output schema reused the old index")
+	}
+	res := search(t, e, b, Query{Text: "create a linear issue", Limit: 1})
+	if res.Hits[0].Tool.OutputSchema == nil {
+		t.Fatal("the hit carries the old output schema")
 	}
 }

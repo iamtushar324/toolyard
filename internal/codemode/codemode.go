@@ -170,7 +170,7 @@ type Worker struct {
 	MemoryMiB int
 	// MaxConcurrent caps scripts running at once, MaxPerAgent those of
 	// one caller. A run past either cap waits AcquireWait in a fair queue
-	// for a slot, then fails as busy. Defaults 4, 2 and 2s.
+	// for a slot, then fails as busy. Defaults 4, 3 and 30s.
 	MaxConcurrent int
 	MaxPerAgent   int
 	AcquireWait   time.Duration
@@ -370,10 +370,10 @@ func (w Worker) withDefaults() Worker {
 		w.MaxConcurrent = 4
 	}
 	if w.MaxPerAgent <= 0 {
-		w.MaxPerAgent = 2
+		w.MaxPerAgent = 3
 	}
 	if w.AcquireWait <= 0 {
-		w.AcquireWait = 2 * time.Second
+		w.AcquireWait = 30 * time.Second
 	}
 	return w
 }

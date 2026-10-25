@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"strings"
+	"time"
 
 	"github.com/mark3labs/mcp-go/mcp"
 
@@ -62,16 +63,20 @@ func (g *Gateway) SetCodeModeWorker(w codemode.Worker) {
 }
 
 // SetCodeModeConcurrency sets how many scripts run at once in all
-// (-codemode-max-concurrent) and for one caller (-codemode-max-per-agent);
-// 0 keeps a setting's default (4 and 2). Call it at start, before any
-// script runs.
-func (g *Gateway) SetCodeModeConcurrency(maxConcurrent, maxPerAgent int) {
+// (-codemode-max-concurrent) and for one caller (-codemode-max-per-agent),
+// and how long a script past either waits for a slot
+// (-codemode-queue-wait); 0 keeps a setting's default (4, 3 and 30s).
+// Call it at start, before any script runs.
+func (g *Gateway) SetCodeModeConcurrency(maxConcurrent, maxPerAgent int, queueWait time.Duration) {
 	w := g.codeModeRuntime().Worker()
 	if maxConcurrent > 0 {
 		w.MaxConcurrent = maxConcurrent
 	}
 	if maxPerAgent > 0 {
 		w.MaxPerAgent = maxPerAgent
+	}
+	if queueWait > 0 {
+		w.AcquireWait = queueWait
 	}
 	g.SetCodeModeWorker(w)
 }
@@ -424,9 +429,35 @@ func outputSchemaOf(t mcp.Tool) map[string]any {
 	return out
 }
 
-// RouteCall is the gateway's pipeline; via is codemode.Via.
+// RouteCall is the gateway's pipeline; via is codemode.Via. The context
+// is marked as a script's, and the mark stays on every hop below (a
+// script's tools.execute, and anything that routes on from there), so
+// routeEntry refuses the code-mode tools however a script reaches them.
 func (c codeModeCaller) RouteCall(ctx context.Context, via, target string, args map[string]any) (*mcp.CallToolResult, error) {
-	return c.g.RouteCall(ctx, via, target, args)
+	return c.g.RouteCall(withinCodeMode(ctx), via, target, args)
+}
+
+type withinCodeModeKey struct{}
+
+// withinCodeMode marks ctx as a code-mode script's nested call.
+func withinCodeMode(ctx context.Context) context.Context {
+	return context.WithValue(ctx, withinCodeModeKey{}, true)
+}
+
+// isWithinCodeMode reports a context withinCodeMode marked.
+func isWithinCodeMode(ctx context.Context) bool {
+	v, _ := ctx.Value(withinCodeModeKey{}).(bool)
+	return v
+}
+
+// refuseNestedCodeMode answers a code-mode tool called from inside a
+// script, at any depth, with a refusal (nil otherwise): a nested script
+// would only recurse, one worker slot per level.
+func refuseNestedCodeMode(ctx context.Context, entry toolEntry) *mcp.CallToolResult {
+	if !isWithinCodeMode(ctx) || !isCodeModeTool(entry.tool.Name) {
+		return nil
+	}
+	return mcp.NewToolResultErrorf("%s cannot be called from code mode: call the tools you need directly in the script", entry.tool.Name)
 }
 
 // codeModeSchema is a tool's input schema without the fields the gateway

@@ -653,3 +653,52 @@ func TestQuickJSFootprint(t *testing.T) {
 		}
 	}
 }
+
+// TestJavaScriptDeepRecursionIsACleanError (review P2-16): unbounded
+// recursion is QuickJS's RangeError, well inside the module's C stack,
+// not a crash.
+func TestJavaScriptDeepRecursionIsACleanError(t *testing.T) {
+	bothWays(t, newJSFake(), Limits{}, func(t *testing.T, rt *Runtime) {
+		out := rt.Execute(context.Background(), "function f(n) { return f(n + 1) + 1; }\nreturn f(0);", ExecOptions{Language: LanguageJavaScript})
+		if !out.Failed || !(strings.Contains(out.Text, "RangeError") || strings.Contains(out.Text, "InternalError")) || !strings.Contains(out.Text, "stack") {
+			t.Fatalf("deep recursion:\n%.1500s", out.Text)
+		}
+		// The engine is still usable for the next script.
+		if out := rt.Execute(context.Background(), "return 2;", ExecOptions{Language: LanguageJavaScript}); out.Failed {
+			t.Fatalf("after the recursion:\n%s", out.Text)
+		}
+	})
+}
+
+// TestJavaScriptHostModulesStayInTheBox (review P2-9): the qjs:std and
+// qjs:os modules a script can still import reach nothing outside the
+// module, and a sleep in them ends at the script's deadline, in process
+// as well.
+func TestJavaScriptHostModulesStayInTheBox(t *testing.T) {
+	rt := inProcess(newJSFake(), Limits{ScriptTimeout: 3 * time.Second})
+	ctx := context.Background()
+	out := rt.Execute(ctx, `const std = await import("qjs:std");
+const os = await import("qjs:os");
+return { file: std.open("/etc/hostname", "r") === null, env: std.getenv("HOME") === undefined, exec: typeof os.exec, globals: typeof globalThis.std };`,
+		ExecOptions{Language: LanguageJavaScript})
+	for _, want := range []string{`"file": true`, `"env": true`, `"exec": "undefined"`, `"globals": "undefined"`} {
+		if out.Failed || !strings.Contains(out.Text, want) {
+			t.Errorf("host modules: missing %q:\n%s", want, out.Text)
+		}
+	}
+	start := time.Now()
+	out = rt.Execute(ctx, `const os = await import("qjs:os");
+os.sleep(60000);
+return "woke";`, ExecOptions{Language: LanguageJavaScript})
+	if !out.Failed || !strings.Contains(out.Text, "script stopped: context deadline exceeded") {
+		t.Fatalf("a long sleep:\n%s", out.Text)
+	}
+	if took := time.Since(start); took > 15*time.Second {
+		t.Fatalf("a 60 s sleep held an in-process run for %s past its 3 s deadline", took)
+	}
+	// A result over 1 MiB is refused with the host's limit and wording.
+	out = rt.Execute(ctx, `return "x".repeat(1100000);`, ExecOptions{Language: LanguageJavaScript})
+	if !out.Failed || !strings.Contains(out.Text, "a returned value may be at most 1 MiB") {
+		t.Fatalf("a 1.1 MB result:\n%.500s", out.Text)
+	}
+}
