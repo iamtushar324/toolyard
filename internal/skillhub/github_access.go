@@ -40,6 +40,12 @@ var ErrRateLimited = errors.New("skillhub: GitHub rate limit reached")
 // RateLimitedUntil returns when the GitHub rate limit behind err ends.
 func RateLimitedUntil(err error) (time.Time, bool) { return retryAfter(err) }
 
+// RateLimitError is the error a GitHub rate limit that ends at until gives,
+// for fakes and tests of the callers.
+func RateLimitError(until time.Time) error {
+	return &ghError{status: http.StatusTooManyRequests, retryAt: until}
+}
+
 // RateLimit is GitHub's core API rate limit for one credential.
 type RateLimit struct {
 	Limit     int       `json:"limit"`

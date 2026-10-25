@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -712,5 +713,27 @@ func TestSkillsProposalTool(t *testing.T) {
 		if got := skillsProposalNext(&skillhub.Proposal{Kind: "source", Status: status, Error: "x"}); !strings.Contains(got, want) {
 			t.Errorf("%s: next %q", status, got)
 		}
+	}
+}
+
+// TestSkillsProposeSourceRateLimited: GitHub's rate limit during the dry
+// run is a rate_limited refusal with when to try again, never internal.
+func TestSkillsProposeSourceRateLimited(t *testing.T) {
+	f := newSkillsFixture(t)
+	until := time.Now().Add(5 * time.Minute)
+	f.props.mu.Lock()
+	f.props.err = fmt.Errorf("skillhub: preview: %w", skillhub.RateLimitError(until))
+	f.props.mu.Unlock()
+	res := f.call(t, f.member, SkillsProposeSourceTool, map[string]any{"url": "acme/x"})
+	if !res.IsError {
+		t.Fatalf("a rate-limited proposal succeeded: %s", textOf(res))
+	}
+	got := structured(t, res)
+	secs, _ := got["retry_after"].(float64) // JSON numbers
+	if got["error"] != SkillsErrRateLimited || secs < 290 || secs > 301 || got["reset_at"] != until.UTC().Format(time.RFC3339) {
+		t.Fatalf("refusal = %v", got)
+	}
+	if msg, _ := got["message"].(string); !strings.Contains(msg, "GitHub access") {
+		t.Fatalf("message = %q", msg)
 	}
 }
