@@ -45,8 +45,7 @@ func (r *Runtime) runInWorker(ctx context.Context, s *session, start startMsg, s
 	slot, err := r.AcquireSlot(ctx)
 	switch {
 	case errors.Is(err, ErrBusy):
-		return scriptResult{errKind: "runtime", cause: ErrorBusy,
-			errMsg: fmt.Sprintf("code mode is busy: %d scripts are already running; try again in a moment", r.worker.MaxConcurrent)}
+		return scriptResult{errKind: "runtime", cause: ErrorBusy, errMsg: err.Error()}
 	case err != nil:
 		return scriptResult{errKind: "runtime", cause: ErrorTimeout,
 			errMsg: fmt.Sprintf("script stopped: %v (%s)", ctx.Err(), stopNote)}
@@ -181,7 +180,32 @@ func (r *Runtime) runWorker(ctx context.Context, s *session, start startMsg, sto
 		return r.workerDied(ctx, stopNote, waitErr, readErr, stderr.String())
 	}
 
+	// Nested calls run beside this loop, at most maxParallelCalls at once;
+	// calls past that wait, in order, for a free lane. Each is admitted
+	// (numbered) here as its message arrives, so the numbers follow the
+	// order the script asked in, and each answer is written back when its
+	// call finishes, in whatever order they finish. The deadline watch
+	// stays in charge: a tool that ignores its context cannot hold the
+	// script past its clock, the worker is killed and the run returns on
+	// time. answers has room for every call in flight, so a call that
+	// finishes after the run returned never blocks.
+	type answer struct {
+		id  int
+		msg parentMsg
+	}
+	answers := make(chan answer, maxParallelCalls)
+	var queued []*preparedCall
+	inflight := 0
+	launch := func(pc *preparedCall) {
+		inflight++
+		go func() { answers <- answer{pc.req.id, s.perform(pc)} }()
+	}
+	reply := func(id int, msg parentMsg) error {
+		msg.Type, msg.ID = msgResult, id
+		return write(msg)
+	}
 	for {
+		var err error
 		select {
 		case <-ctx.Done():
 			finish(false)
@@ -191,27 +215,15 @@ func (r *Runtime) runWorker(ctx context.Context, s *session, start startMsg, sto
 			case msgPrint:
 				s.print(m.Text)
 			case msgCall:
-				// The nested call runs beside the deadline watch: a tool
-				// that ignores its context cannot hold the script past its
-				// clock, the worker is killed and the run returns on time.
-				replies := make(chan parentMsg, 1)
-				go func(m childMsg) {
-					replies <- s.handleCall(m.Server, m.Member, m.Args)
-				}(m)
-				var reply parentMsg
-				select {
-				case reply = <-replies:
-				case <-ctx.Done():
-					finish(false)
-					return stopped()
-				}
-				reply.Type, reply.ID = msgResult, m.ID
-				if err := write(reply); err != nil {
-					finish(false)
-					if ctx.Err() != nil {
-						return stopped()
-					}
-					return r.workerDied(ctx, stopNote, waitErr, readErr, stderr.String())
+				req := callRequest{id: m.ID, server: m.Server, member: m.Member, name: m.Name, args: m.Args, try: m.Try}
+				pc, refusal := s.admit(req)
+				switch {
+				case refusal != nil:
+					err = reply(m.ID, *refusal)
+				case inflight < maxParallelCalls:
+					launch(pc)
+				default:
+					queued = append(queued, pc)
 				}
 			case msgDone:
 				finish(true)
@@ -223,11 +235,25 @@ func (r *Runtime) runWorker(ctx context.Context, s *session, start startMsg, sto
 				if m.Cause == ErrorTimeout || m.Cause == ErrorLimit {
 					cause = m.Cause
 				}
-				return scriptResult{errKind: m.Kind, errMsg: m.Message, cause: cause}
+				return scriptResult{errKind: m.Kind, errMsg: m.Message, cause: cause, call: m.Call}
 			}
+		case a := <-answers:
+			inflight--
+			if len(queued) > 0 {
+				launch(queued[0])
+				queued = queued[1:]
+			}
+			err = reply(a.id, a.msg)
 		case <-readerDone:
 			// The child ended, or broke the protocol, without an outcome.
 			finish(false)
+			return r.workerDied(ctx, stopNote, waitErr, readErr, stderr.String())
+		}
+		if err != nil {
+			finish(false)
+			if ctx.Err() != nil {
+				return stopped()
+			}
 			return r.workerDied(ctx, stopNote, waitErr, readErr, stderr.String())
 		}
 	}

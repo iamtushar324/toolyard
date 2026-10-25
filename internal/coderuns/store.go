@@ -19,7 +19,7 @@ const (
 )
 
 // runColumns are the code_runs columns a view needs (not the script).
-const runColumns = `id, agent_id, COALESCE(session_id, ''), COALESCE(idempotency_key, ''), fingerprint, reason, status,
+const runColumns = `id, agent_id, COALESCE(session_id, ''), COALESCE(idempotency_key, ''), fingerprint, reason, COALESCE(language, 'starlark'), status,
 	COALESCE(result, ''), COALESCE(error_kind, ''), COALESCE(error_message, ''), COALESCE(logs, ''), COALESCE(held, ''),
 	created_at, updated_at, COALESCE(finished_at, 0)`
 
@@ -32,10 +32,14 @@ const runWriteTimeout = 10 * time.Second
 func (s *Service) insertRun(ctx context.Context, r *Run) error {
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), runWriteTimeout)
 	defer cancel()
+	lang := r.Language
+	if lang == "" {
+		lang = codemode.LanguageStarlark
+	}
 	_, err := s.db.ExecContext(ctx, `INSERT INTO code_runs
-		(id, agent_id, session_id, idempotency_key, fingerprint, code, reason, status, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		r.ID, r.AgentID, nullStr(r.SessionID), nullStr(r.IdempotencyKey), r.Fingerprint, r.code, r.Reason, r.Status, r.CreatedAt, r.UpdatedAt)
+		(id, agent_id, session_id, idempotency_key, fingerprint, code, reason, language, status, created_at, updated_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		r.ID, r.AgentID, nullStr(r.SessionID), nullStr(r.IdempotencyKey), r.Fingerprint, r.code, r.Reason, lang, r.Status, r.CreatedAt, r.UpdatedAt)
 	return err
 }
 
@@ -67,7 +71,7 @@ func (s *Service) loadRun(ctx context.Context, agentID, id string, withCode bool
 	q += ` FROM code_runs WHERE id = ? AND agent_id = ?`
 	var r Run
 	var result, logs, held string
-	dest := []any{&r.ID, &r.AgentID, &r.SessionID, &r.IdempotencyKey, &r.Fingerprint, &r.Reason, &r.Status,
+	dest := []any{&r.ID, &r.AgentID, &r.SessionID, &r.IdempotencyKey, &r.Fingerprint, &r.Reason, &r.Language, &r.Status,
 		&result, &r.ErrorKind, &r.ErrorMessage, &logs, &held, &r.CreatedAt, &r.UpdatedAt, &r.FinishedAt}
 	if withCode {
 		dest = append(dest, &r.code)

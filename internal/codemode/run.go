@@ -13,7 +13,7 @@ import (
 
 // Structured runs. Run executes a script exactly like ExecuteToolCode (the
 // same worker, limits, catalog and gateway pipeline for every nested
-// call) and returns what happened as data instead of Bifrost's text: the
+// call, in Starlark or JavaScript) and returns what happened as data instead of Bifrost's text: the
 // run's status, its JSON result, its print lines, one record per tool
 // call, and the call that held it for approval. CallHooks let the caller
 // answer a call from a record instead of sending it (a resumed run
@@ -90,6 +90,8 @@ type RunOptions struct {
 	// caller committed to the run (so it can answer busy without creating
 	// one). Run releases it. nil makes Run take a slot itself.
 	Slot *Slot
+	// Language is LanguageStarlark (also "") or LanguageJavaScript.
+	Language string
 }
 
 // PendingCall is one tool call a script is about to make.
@@ -225,8 +227,8 @@ type RunResult struct {
 // Slot is one of the runtime's concurrent script slots, held from
 // AcquireSlot until Release.
 type Slot struct {
-	sem  chan struct{}
-	once sync.Once
+	release func()
+	once    sync.Once
 }
 
 // Release frees the slot. Releasing twice, or a nil slot, is harmless.
@@ -234,31 +236,30 @@ func (s *Slot) Release() {
 	if s == nil {
 		return
 	}
-	s.once.Do(func() { <-s.sem })
+	s.once.Do(func() {
+		if s.release != nil {
+			s.release()
+		}
+	})
 }
 
-// AcquireSlot takes one of the runtime's Worker.MaxConcurrent script
-// slots, waiting up to Worker.AcquireWait for one: ErrBusy when none
-// came free, ctx's error when ctx ended first. Release the slot, or pass
-// it to Run, which does.
+// AcquireSlot takes one of the runtime's script slots for the ctx caller
+// (WithAgentKey, else the Caller's AgentKey): at most
+// Worker.MaxConcurrent scripts run at once, and at most
+// Worker.MaxPerAgent for one caller. A run that cannot start waits in a
+// fair queue up to Worker.AcquireWait: an error that is ErrBusy when no
+// slot came free (its text says which cap), ctx's error when ctx ended
+// first. Release the slot, or pass it to Run, which does.
 func (r *Runtime) AcquireSlot(ctx context.Context) (*Slot, error) {
-	sem := r.sem
-	select {
-	case sem <- struct{}{}:
-		return &Slot{sem: sem}, nil
-	default:
+	release, err := r.limiter.acquire(ctx, r.agentKey(ctx), r.worker.AcquireWait)
+	if err != nil {
+		return nil, err
 	}
-	t := time.NewTimer(r.worker.AcquireWait)
-	defer t.Stop()
-	select {
-	case sem <- struct{}{}:
-		return &Slot{sem: sem}, nil
-	case <-t.C:
-		return nil, ErrBusy
-	case <-ctx.Done():
-		return nil, ctx.Err()
-	}
+	return &Slot{release: release}, nil
 }
+
+// slotsInUse is how many scripts hold a slot (tests).
+func (r *Runtime) slotsInUse() int { return r.limiter.inUse() }
 
 // Run executes code for the ctx caller (the same context ExecuteToolCode
 // takes: the agent identity every nested call runs as) and reports the
@@ -276,6 +277,10 @@ func (r *Runtime) Run(ctx context.Context, code string, opts RunOptions) (*RunRe
 		return &RunResult{Status: StatusFailed, ErrorKind: ErrorScriptError,
 			ErrorMessage: "code is required and must be a non-empty string"}, nil
 	}
+	lang, err := ParseLanguage(opts.Language)
+	if err != nil {
+		return &RunResult{Status: StatusFailed, ErrorKind: ErrorScriptError, ErrorMessage: err.Error()}, nil
+	}
 	if opts.Slot == nil {
 		slot, err := r.AcquireSlot(ctx)
 		if err != nil {
@@ -283,7 +288,7 @@ func (r *Runtime) Run(ctx context.Context, code string, opts RunOptions) (*RunRe
 		}
 		defer slot.Release()
 	}
-	ex := r.execute(ctx, code, opts.Reason, opts.Hooks, true)
+	ex := r.execute(ctx, code, execOptions{reason: opts.Reason, hooks: opts.Hooks, structured: true, lang: lang})
 	return ex.s.result(ex.res), nil
 }
 

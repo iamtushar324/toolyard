@@ -16,6 +16,16 @@ import (
 const noServersText = "No servers are available to you. There are no virtual .pyi files available. " +
 	"Ask a toolyard admin to grant you a server, then call listToolFiles again."
 
+// ListFiles renders the stub tree for the ctx caller in one language:
+// the .pyi files for Starlark (ListToolFiles), the .d.ts files for
+// JavaScript.
+func (r *Runtime) ListFiles(ctx context.Context, language string) string {
+	if language == LanguageJavaScript {
+		return r.listTSFiles(ctx)
+	}
+	return r.ListToolFiles(ctx)
+}
+
 // ListToolFiles renders the servers/<Server>/<tool>.pyi tree for the ctx
 // caller.
 func (r *Runtime) ListToolFiles(ctx context.Context) string {
@@ -83,10 +93,24 @@ func renderTree(files []string) string {
 
 // ReadToolFile renders one virtual .pyi file, servers/<Server>/<tool>.pyi
 // for a tool or servers/<Server>.pyi for a whole server, matched
-// case-insensitively with the extension optional. startLine and endLine
+// case-insensitively with the extension optional; or, for a name ending in
+// .d.ts, the TypeScript stub (servers/<Server>/<tool>.d.ts,
+// servers/<Server>.d.ts or servers/index.d.ts). startLine and endLine
 // (1-based, inclusive) slice the result; out-of-range values are clamped.
 // ok is false when the answer is an explanation rather than a file.
 func (r *Runtime) ReadToolFile(ctx context.Context, fileName string, startLine, endLine *int) (text string, ok bool) {
+	if p, isTS := strings.CutSuffix(strings.TrimSpace(fileName), ".d.ts"); isTS {
+		p = strings.TrimPrefix(p, "servers/")
+		if p == "" || strings.Contains(p, "..") {
+			return fmt.Sprintf("Invalid filename '%s'. Use servers/<serverName>/<toolName>.d.ts as listToolFiles shows with language \"javascript\".", fileName), false
+		}
+		body, ok := r.readTSFile(ctx, fileName, p)
+		if !ok {
+			return body, false
+		}
+		total := len(strings.Split(body, "\n")) + 1
+		return sliceLines(fmt.Sprintf("// Total lines: %d (this is the complete file, no need to paginate)\n%s", total, body), startLine, endLine), true
+	}
 	cat := buildCatalog(r.caller.Tools(ctx))
 	serverName, toolName, toolLevel, valid := parseFilePath(fileName)
 	if !valid {
@@ -139,8 +163,14 @@ func (r *Runtime) ReadToolFile(ctx context.Context, fileName string, startLine, 
 	// The header line counts itself: Bifrost prepends it after measuring.
 	total := len(strings.Split(body, "\n")) + 1
 	content := fmt.Sprintf("# Total lines: %d (this is the complete file, no need to paginate)\n%s", total, body)
+	return sliceLines(content, startLine, endLine), true
+}
+
+// sliceLines returns lines startLine to endLine (1-based, inclusive,
+// clamped) of content, or all of it when neither is set.
+func sliceLines(content string, startLine, endLine *int) string {
 	if startLine == nil && endLine == nil {
-		return content, true
+		return content
 	}
 	lines := strings.Split(content, "\n")
 	start, end := 1, len(lines)
@@ -155,7 +185,7 @@ func (r *Runtime) ReadToolFile(ctx context.Context, fileName string, startLine, 
 	if start > end {
 		end = start
 	}
-	return strings.Join(lines[start-1:end], "\n"), true
+	return strings.Join(lines[start-1:end], "\n")
 }
 
 func clamp(v, lo, hi int) int {

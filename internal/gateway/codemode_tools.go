@@ -2,12 +2,14 @@ package gateway
 
 import (
 	"context"
+	"encoding/json"
 	"strings"
 
 	"github.com/mark3labs/mcp-go/mcp"
 
 	"github.com/tusharbhardwaj/toolyard/internal/access"
 	"github.com/tusharbhardwaj/toolyard/internal/actor"
+	"github.com/tusharbhardwaj/toolyard/internal/audit"
 	"github.com/tusharbhardwaj/toolyard/internal/codemode"
 )
 
@@ -24,9 +26,10 @@ const (
 	CodeModeGetToolDocs     = "getToolDocs"
 	CodeModeExecuteToolCode = "executeToolCode"
 
-	// codeModeGroup is the access group the code-mode tools live in, and
-	// the one group a script cannot reach: tools.search, tools.execute, the
-	// approval pollers and code mode itself would only recurse.
+	// codeModeGroup is the access group the code-mode tools live in. A
+	// script reaches the group's other tools (toolyard.tools_search,
+	// toolyard.tools_execute, the approval pollers) but never the four
+	// code-mode tools themselves, which would only recurse.
 	codeModeGroup = "tools"
 )
 
@@ -56,6 +59,31 @@ func (g *Gateway) SetCodeModeLimits(l codemode.Limits) {
 // SetCodeModeWorker replaces how scripts are run.
 func (g *Gateway) SetCodeModeWorker(w codemode.Worker) {
 	g.codeModeRuntime().SetWorker(w)
+}
+
+// SetCodeModeConcurrency sets how many scripts run at once in all
+// (-codemode-max-concurrent) and for one caller (-codemode-max-per-agent);
+// 0 keeps a setting's default (4 and 2). Call it at start, before any
+// script runs.
+func (g *Gateway) SetCodeModeConcurrency(maxConcurrent, maxPerAgent int) {
+	w := g.codeModeRuntime().Worker()
+	if maxConcurrent > 0 {
+		w.MaxConcurrent = maxConcurrent
+	}
+	if maxPerAgent > 0 {
+		w.MaxPerAgent = maxPerAgent
+	}
+	g.SetCodeModeWorker(w)
+}
+
+// withCodeModeRunID gives an executeToolCode call its run id before any of
+// its audit rows is written, so the outer call's rows and every nested
+// call's share it (audit_events.run_id).
+func withCodeModeRunID(ctx context.Context, entry toolEntry) context.Context {
+	if entry.tool.Name != CodeModeExecuteToolCode || audit.RunIDFrom(ctx) != "" {
+		return ctx
+	}
+	return audit.WithRunID(ctx, codemode.NewRunID())
 }
 
 // SetCodeModeSandbox changes only how script workers are confined. Call
@@ -119,8 +147,16 @@ func (g *Gateway) codeModeTools() []toolEntry {
 			"In code, access tools via: server_name.tool_name(param=value). " +
 			"CALL THIS TOOL FIRST whenever a server, tool or capability is not visible in your current tool list; do not tell the user something is unavailable until you have called listToolFiles and confirmed it is absent. " +
 			"toolyard code mode: _reason is optional here; every call your code makes still goes through toolyard's access, policy and approval rules. " +
-			"toolyard's own tools (inbox.*, memory.*, events.*, session.*, tools.*, policies.*, servers.*, audit.*, access.*) are one server, toolyard, called as toolyard.<group>_<name>(...), e.g. toolyard.inbox_request(...) or toolyard.policies_explain(tool=\"github.create_issue\").",
-		InputSchema: optional(map[string]any{}),
+			"toolyard's own tools (inbox.*, memory.*, events.*, session.*, tools.*, policies.*, servers.*, audit.*, access.*) are one server, toolyard, called as toolyard.<group>_<name>(...), e.g. toolyard.inbox_request(...) or toolyard.policies_explain(tool=\"github.create_issue\"). " +
+			"For JavaScript scripts pass language=\"javascript\": the tree lists TypeScript stubs instead (servers/<serverName>/<toolName>.d.ts, and servers/index.d.ts for the tools object). " +
+			"To find a tool by what it does, call toolyard's tools.search (ranked keyword or regex search) instead of reading every stub.",
+		InputSchema: optional(map[string]any{
+			"language": map[string]any{
+				"type":        "string",
+				"enum":        []string{codemode.LanguageStarlark, codemode.LanguageJavaScript},
+				"description": "Which stubs to list: starlark (default, .pyi) or javascript (.d.ts).",
+			},
+		}),
 	}
 	read := mcp.Tool{
 		Name: CodeModeReadToolFile,
@@ -131,7 +167,7 @@ func (g *Gateway) codeModeTools() []toolEntry {
 		InputSchema: optional(map[string]any{
 			"fileName": map[string]any{
 				"type":        "string",
-				"description": "The virtual filename from listToolFiles, servers/<serverName>/<toolName>.pyi (e.g. 'servers/BkCoreServices/get_client.pyi').",
+				"description": "The virtual filename from listToolFiles, servers/<serverName>/<toolName>.pyi (e.g. 'servers/BkCoreServices/get_client.pyi'), or a TypeScript stub for JavaScript: servers/<serverName>/<toolName>.d.ts, servers/<serverName>.d.ts or servers/index.d.ts.",
 			},
 			"startLine": map[string]any{
 				"type":        "number",
@@ -156,17 +192,36 @@ func (g *Gateway) codeModeTools() []toolEntry {
 		Name: CodeModeExecuteToolCode,
 		Description: "Executes Python code in a sandboxed Starlark interpreter with tool access. Servers are global objects: result = serverName.toolName(param=\"value\"). " +
 			"Final step of the workflow listToolFiles -> readToolFile -> (optional) getToolDocs -> executeToolCode; read a tool's .pyi stub before calling it and never guess callable names. " +
-			"STARLARK DIFFERENCES FROM PYTHON: no try/except/finally/raise (a failed tool call aborts the script); no classes; no imports, network or filesystem; no `is`; no f-strings (use % formatting); " +
+			"STARLARK DIFFERENCES FROM PYTHON: no try/except/finally/raise (a failed tool call aborts the script; use try_call(server.tool, param=value) to get {ok, status, result | error} instead); no classes; no imports, network or filesystem; no `is`; no f-strings (use % formatting); " +
 			"each call runs in a FRESH ISOLATED SCOPE with no state carried between calls. " +
 			"SYNTAX: synchronous calls, keyword arguments (server.tool(param=\"value\")), dict access with brackets (result[\"key\"]), print() for logging, assign the value to return to `result`. " +
-			"toolyard code mode: each tool call your code makes goes through toolyard's access, policy and approval rules; a call that is held for approval or needs a permission request aborts the script with the gateway's answer, so poll or ask as it says, then rerun. " +
+			"parallel([(server.tool, {\"param\": 1}), (\"server.other\", {})], limit=4) makes several calls at once and returns their try_call results in order. " +
+			"JAVASCRIPT: pass language=\"javascript\" to run JavaScript (QuickJS, ES2023) instead; the code is the body of an async function: " +
+			"const hits = await tools.search(\"create a linear issue\", { limit: 3 }); " +
+			"const issue = await tools.Linear.get_issue({ id: \"TEC-1\" }); " +
+			"const r = await tools.tryCall(\"Linear.save_issue\", { title: \"x\" }); // {ok, status, result | error}, never throws; " +
+			"const all = await tools.parallel([() => tools.A.x({}), () => tools.B.y({})], { limit: 4 }); " +
+			"console.log(...) prints; return { summary } returns. Results are the tool's structuredContent when it sends one, else its JSON text parsed, else the text. Read the .d.ts stubs (listToolFiles with language=\"javascript\") first. " +
+			"toolyard code mode: each tool call your code makes goes through toolyard's access, policy and approval rules; a call that is held for approval or needs a permission request aborts a Starlark script (and rejects in JavaScript) with the gateway's answer, so poll or ask as it says, then rerun. " +
+			"echo=\"preview\" or \"none\" keeps tool answers out of the text (only the first 500 bytes, or nothing) and lists the calls instead; the default \"full\" echoes each answer as a [TOOL] line. " +
 			"Your code runs in an isolated process with no credentials and no network; it can only call tools. " +
 			rt.LimitsText(),
 		InputSchema: optional(map[string]any{
 			"code": map[string]any{
 				"type": "string",
-				"description": "Python (Starlark) code to execute. Tool calls are synchronous: result = server.tool(param=\"value\"). " +
-					"Use print() for logging. Assign to 'result' to return a value. Before rerunning code that already made tool calls, inspect prior output and avoid replaying stateful operations.",
+				"description": "Python (Starlark) code to execute, or JavaScript with language=\"javascript\". Starlark tool calls are synchronous: result = server.tool(param=\"value\"). " +
+					"Use print() for logging. Assign to 'result' to return a value. In JavaScript await tools.Server.tool({param: value}), console.log() and return. " +
+					"Before rerunning code that already made tool calls, inspect prior output and avoid replaying stateful operations.",
+			},
+			"language": map[string]any{
+				"type":        "string",
+				"enum":        []string{codemode.LanguageStarlark, codemode.LanguageJavaScript},
+				"description": "starlark (default) or javascript.",
+			},
+			"echo": map[string]any{
+				"type":        "string",
+				"enum":        []string{codemode.EchoFull, codemode.EchoPreview, codemode.EchoNone},
+				"description": "How much of each tool answer the output repeats as a [TOOL] line: full (default), preview (the first 500 bytes) or none. The call ledger (tool, status, ms) is in the output with preview and none.",
 			},
 		}, "code"),
 	}
@@ -191,8 +246,13 @@ func (g *Gateway) codeModeTools() []toolEntry {
 }
 
 func (g *Gateway) handleListToolFiles() directHandler {
-	return func(ctx context.Context, _ map[string]any) (*mcp.CallToolResult, error) {
-		return mcp.NewToolResultText(g.codeModeRuntime().ListToolFiles(ctx)), nil
+	return func(ctx context.Context, args map[string]any) (*mcp.CallToolResult, error) {
+		raw, _ := args["language"].(string)
+		lang, err := codemode.ParseLanguage(raw)
+		if err != nil {
+			return mcp.NewToolResultError(err.Error()), nil
+		}
+		return mcp.NewToolResultText(g.codeModeRuntime().ListFiles(ctx, lang)), nil
 	}
 }
 
@@ -228,16 +288,32 @@ func (g *Gateway) handleGetToolDocs() directHandler {
 
 // handleExecuteToolCode runs the script. The outer _reason, when the
 // client sent one, is on ctx (dispatch put it there); the runtime derives
-// one from the script otherwise.
+// one from the script otherwise. The text is the runtime's; the result's
+// _meta carries the run id (also on every audit row of the run) and the
+// call ledger, which clients that read only the text never see.
 func (g *Gateway) handleExecuteToolCode() directHandler {
 	return func(ctx context.Context, args map[string]any) (*mcp.CallToolResult, error) {
 		code, _ := args["code"].(string)
 		if strings.TrimSpace(code) == "" {
 			return mcp.NewToolResultError("code parameter is required and must be a non-empty string"), nil
 		}
-		text, failed := g.codeModeRuntime().ExecuteToolCode(ctx, code, callReasonFromContext(ctx))
-		res := mcp.NewToolResultText(text)
-		res.IsError = failed
+		lang, _ := args["language"].(string)
+		echo, _ := args["echo"].(string)
+		runID := audit.RunIDFrom(ctx)
+		if runID == "" {
+			runID = codemode.NewRunID()
+			ctx = audit.WithRunID(ctx, runID)
+		}
+		out := g.codeModeRuntime().Execute(ctx, code, codemode.ExecOptions{
+			Reason: callReasonFromContext(ctx), Language: lang, Echo: echo,
+		})
+		res := mcp.NewToolResultText(out.Text)
+		res.IsError = out.Failed
+		calls := out.Calls
+		if calls == nil {
+			calls = []codemode.LedgerEntry{}
+		}
+		res.Meta = &mcp.Meta{AdditionalFields: map[string]any{"toolyard.run_id": runID, "toolyard.calls": calls}}
 		return res, nil
 	}
 }
@@ -312,14 +388,38 @@ func (c codeModeCaller) Tools(ctx context.Context) []codemode.Tool {
 		}
 		props, required := codeModeSchema(e)
 		out = append(out, codemode.Tool{
-			Server:      server,
-			Name:        name,
-			Target:      e.tool.Name,
-			Description: strings.TrimPrefix(e.tool.Description, descriptionBanner),
-			Properties:  props,
-			Required:    required,
-			ReasonField: e.reasonField,
+			Server:       server,
+			Name:         name,
+			Target:       e.tool.Name,
+			Description:  strings.TrimPrefix(e.tool.Description, descriptionBanner),
+			Properties:   props,
+			Required:     required,
+			OutputSchema: outputSchemaOf(e.tool),
+			ReasonField:  e.reasonField,
 		})
+	}
+	return out
+}
+
+// AgentKey names the ctx caller for code mode's per-caller script cap.
+func (c codeModeCaller) AgentKey(ctx context.Context) string { return agentIDFromContext(ctx) }
+
+// outputSchemaOf is a tool's declared output schema as a map, nil when it
+// declares none.
+func outputSchemaOf(t mcp.Tool) map[string]any {
+	raw := []byte(t.RawOutputSchema)
+	if len(raw) == 0 {
+		if t.OutputSchema.Type == "" && len(t.OutputSchema.Properties) == 0 {
+			return nil
+		}
+		var err error
+		if raw, err = json.Marshal(t.OutputSchema); err != nil {
+			return nil
+		}
+	}
+	var out map[string]any
+	if json.Unmarshal(raw, &out) != nil || len(out) == 0 {
+		return nil
 	}
 	return out
 }
