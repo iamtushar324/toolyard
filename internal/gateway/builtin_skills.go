@@ -59,7 +59,7 @@ const (
 	skillsListDefault   = 100
 	skillsListMax       = 500
 	skillsBundleMax     = 50
-	skillsProposeFiles  = 100
+	skillsProposeFiles  = skillhub.MaxChangeFiles
 )
 
 // SkillToolNames are the skills.* tools, in the order they are registered.
