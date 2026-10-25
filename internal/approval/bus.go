@@ -199,6 +199,9 @@ type Bus struct {
 	released bool
 	// LegacyDecision redirects compatibility writes through the sole Inbox ledger.
 	LegacyDecision func(context.Context, string, string, actor.Decider) (*Request, error)
+	// events queues approval.decided / approval.executed webhooks
+	// (events.go).
+	events EventSink
 }
 
 // Executor runs an approved tool's actual call after the human (or an
@@ -272,6 +275,8 @@ func (b *Bus) Hold(ctx context.Context, in NewRequest, maxWait time.Duration) (*
 	if err != nil {
 		return nil, err
 	}
+	// The receivers follow the request before anyone can decide it.
+	b.subscribe(ctx, req, in.CallbackRef)
 	// Auto-approval short-circuit: if a rule matches the new request, decide
 	// it in-line (status -> allowed) before any notifier sees it as pending.
 	// Coalesced rows that landed on an existing pending request are skipped
@@ -346,6 +351,10 @@ type NewRequest struct {
 	RequireHuman bool
 	// RaisedBy is who raised the call; stored on the request.
 	RaisedBy actor.Raiser
+	// CallbackRef is the call's _callback_ref: the receiver that hears
+	// approval.decided and approval.executed ("" for the agent's default
+	// receiver, if any).
+	CallbackRef string
 }
 
 func (b *Bus) create(ctx context.Context, in NewRequest) (*Request, error) {
@@ -619,7 +628,13 @@ func (b *Bus) decide(ctx context.Context, id, action string, d actor.Decider, ru
 			return existing, ErrNotPending
 		}
 	}
-	res, err := b.db.ExecContext(ctx,
+	// The decision and its approval.decided webhook event commit together.
+	tx, err := b.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	res, err := tx.ExecContext(ctx,
 		`UPDATE approval_requests SET status = ?, decided_by = ?, decided_at = ?,
             decided_via = ?, decider_email = ?, decider_name = ?, decider_ref = ?
          WHERE id = ? AND status = ? AND (? = 0 OR expires_at > ?)`,
@@ -630,6 +645,18 @@ func (b *Bus) decide(ctx context.Context, id, action string, d actor.Decider, ru
 		return nil, err
 	}
 	n, _ := res.RowsAffected()
+	if n == 1 && b.events != nil {
+		decided, err := getTx(ctx, tx, id)
+		if err != nil {
+			return nil, err
+		}
+		if err := b.events.ApprovalEventTx(ctx, tx, decided, EventApprovalDecided); err != nil {
+			return nil, err
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
 	if n == 0 {
 		existing, getErr := b.Get(ctx, id)
 		if getErr != nil {
@@ -834,6 +861,16 @@ func (b *Bus) SetResultState(ctx context.Context, id, envelope string, isError b
 	if n > 0 {
 		if _, err := tx.ExecContext(ctx, `UPDATE legacy_execution_claims SET state=?,finished_at=?,reason=? WHERE request_id=?`, state, now, execErr, id); err != nil {
 			return err
+		}
+		if b.events != nil {
+			executed, err := getTx(ctx, tx, id)
+			if err != nil {
+				return err
+			}
+			executed.ExecutionState = state
+			if err := b.events.ApprovalEventTx(ctx, tx, executed, EventApprovalExecuted); err != nil {
+				return err
+			}
 		}
 	}
 	if err := tx.Commit(); err != nil {

@@ -1,5 +1,8 @@
-// Package callbacks delivers committed Inbox decisions. Delivery is at least
-// once; receivers deduplicate the stable event id before any agent dispatch.
+// Package callbacks delivers committed Inbox decisions and the other
+// webhook events (events.go): execution outcomes, legacy approval
+// decisions and results, pings, and the events other packages emit with
+// EmitTx. Delivery is at least once; receivers deduplicate the stable event
+// id before any agent dispatch.
 package callbacks
 
 import (
@@ -10,7 +13,6 @@ import (
 	"database/sql"
 	"encoding/base64"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -41,7 +43,9 @@ type Receiver struct {
 	Revision         int    `json:"revision"`
 	Status           string `json:"status"`
 	PrivateAllowed   bool   `json:"-"`
-	secret           string
+	// Default is set by List: the agent's default receiver.
+	Default bool `json:"default,omitempty"`
+	secret  string
 }
 
 type Service struct {
@@ -252,10 +256,17 @@ func (s *Service) Change(ctx context.Context, agentID, id, action, secret string
 		// bind to its new key revision, never to an altered URL.
 		_, err = tx.ExecContext(ctx, `UPDATE callback_subscriptions SET receiver_revision=? WHERE receiver_id=?`, revision+1, id)
 		if err == nil {
+			_, err = tx.ExecContext(ctx, `UPDATE callback_subject_subscriptions SET receiver_revision=? WHERE receiver_id=?`, revision+1, id)
+		}
+		if err == nil {
 			_, err = tx.ExecContext(ctx, `UPDATE callback_outbox SET receiver_revision=? WHERE receiver_id=? AND status IN ('pending','delivering')`, revision+1, id)
 		}
 	} else {
 		_, err = tx.ExecContext(ctx, `UPDATE callback_outbox SET status='failed',terminal_reason=? WHERE receiver_id=? AND status IN ('pending','delivering')`, "receiver_"+status, id)
+		if err == nil && action == "remove" {
+			// A removed receiver stops being the agent's default.
+			_, err = tx.ExecContext(ctx, `DELETE FROM callback_defaults WHERE receiver_id=?`, id)
+		}
 	}
 	if err != nil {
 		return nil, err
@@ -268,9 +279,20 @@ func (s *Service) Change(ctx context.Context, agentID, id, action, secret string
 
 // RegisterTx participates in Inbox's insert transaction. No database query
 // may use the pool while this transaction holds its one SQLite connection.
+// Inbox calls it once per receiver the request names. With ref "" it
+// subscribes the agent's default receiver (callbacks.set_default), when it
+// has an active one and its connection is active; otherwise nothing.
 func (s *Service) RegisterTx(ctx context.Context, tx *sql.Tx, r *inbox.Request, ref string) error {
 	if ref == "" {
-		return nil
+		def, revision, err := defaultReceiverTx(ctx, tx, r.AgentID)
+		if err != nil || def == "" {
+			return err
+		}
+		if hostConnectionActive(ctx, tx, r.AgentID, s.now().UnixMilli()) != nil {
+			return nil
+		}
+		_, err = tx.ExecContext(ctx, `INSERT INTO callback_subscriptions(request_id,receiver_id,receiver_revision) VALUES(?,?,?) ON CONFLICT DO NOTHING`, r.ID, def, revision)
+		return err
 	}
 	if err := hostConnectionActive(ctx, tx, r.AgentID, s.now().UnixMilli()); err != nil {
 		return err
@@ -280,7 +302,7 @@ func (s *Service) RegisterTx(ctx context.Context, tx *sql.Tx, r *inbox.Request, 
 	if err != nil {
 		return ErrReceiver
 	}
-	_, err = tx.ExecContext(ctx, `INSERT INTO callback_subscriptions(request_id,receiver_id,receiver_revision) VALUES(?,?,?)`, r.ID, ref, revision)
+	_, err = tx.ExecContext(ctx, `INSERT INTO callback_subscriptions(request_id,receiver_id,receiver_revision) VALUES(?,?,?) ON CONFLICT DO NOTHING`, r.ID, ref, revision)
 	return err
 }
 
@@ -299,6 +321,8 @@ type EventData struct {
 	GrantExpiresAt   int64                 `json:"grant_expires_at,omitempty"`
 	StatusRef        string                `json:"status_ref"`
 	Response         *inbox.AnswerResponse `json:"response,omitempty"`
+	// Answers are a version 3 item's answers, keyed by question ID.
+	Answers map[string]inbox.Answer `json:"answers,omitempty"`
 }
 type Event struct {
 	Type      string    `json:"type"`
@@ -307,16 +331,16 @@ type Event struct {
 	Data      EventData `json:"data"`
 }
 
-// DecisionTx writes one logical event with all outcomes, in the same
-// transaction as verdicts, grants and audit. Drafts never call this hook.
+// DecisionTx writes one logical event with all outcomes, for every
+// receiver that follows the item, in the same transaction as verdicts,
+// answers, grants and audit. Drafts never call this hook. A legacy item is
+// a deferred approval: its followers get approval.decided instead.
 func (s *Service) DecisionTx(ctx context.Context, tx *sql.Tx, r *inbox.Request) error {
-	var receiver string
-	var revision int
-	err := tx.QueryRowContext(ctx, `SELECT receiver_id,receiver_revision FROM callback_subscriptions WHERE request_id=?`, r.ID).Scan(&receiver, &revision)
-	if errors.Is(err, sql.ErrNoRows) {
-		return nil
+	if r.ExecutionMode == "legacy" {
+		return s.legacyDecisionTx(ctx, tx, r)
 	}
-	if err != nil {
+	subs, err := subscriptionsTx(ctx, tx, `SELECT receiver_id,receiver_revision FROM callback_subscriptions WHERE request_id=? ORDER BY receiver_id`, r.ID)
+	if err != nil || len(subs) == 0 {
 		return err
 	}
 	kind, status := "inbox.decision", "decided"
@@ -334,21 +358,16 @@ func (s *Service) DecisionTx(ctx context.Context, tx *sql.Tx, r *inbox.Request) 
 		}
 		outcomes = append(outcomes, Outcome{CallID: t.CallID, Verdict: verdict, Reason: t.Reason})
 	}
-	id := "evt_" + uuid.NewString()
-	event := Event{Type: kind, EventID: id, Timestamp: s.now().UTC().Format(time.RFC3339Nano), Data: EventData{InboxID: r.ID, DecisionRevision: r.Revision, Status: status, Calls: outcomes, OverallNote: r.OwnerNote, RequestExpiresAt: r.ExpiresAt, GrantExpiresAt: r.GrantsExpire, StatusRef: r.ID, Response: r.Response}}
-	payload, err := json.Marshal(event)
-	if err != nil {
-		return err
-	}
-	deliveryStatus, terminalReason := "pending", ""
-	if e := hostConnectionActive(ctx, tx, r.AgentID, s.now().UnixMilli()); e != nil {
-		if !errors.Is(e, ErrReceiver) {
-			return e
+	data := EventData{InboxID: r.ID, DecisionRevision: r.Revision, Status: status, Calls: outcomes, OverallNote: r.OwnerNote, RequestExpiresAt: r.ExpiresAt, GrantExpiresAt: r.GrantsExpire, StatusRef: r.ID, Response: r.Response, Answers: r.Answers}
+	for _, sub := range subs {
+		// A repeated logical event fails the transaction (dedupe key).
+		_, err := s.queueTx(ctx, tx, queued{agentID: r.AgentID, subject: r.ID, revision: r.Revision, receiver: sub.receiver, receiverRevision: sub.revision,
+			eventType: kind, dedupe: fmt.Sprintf("inbox:%s:%d", r.ID, r.Revision), data: data})
+		if err != nil {
+			return err
 		}
-		deliveryStatus, terminalReason = "failed", "connection_revoked_or_expired"
 	}
-	_, err = tx.ExecContext(ctx, `INSERT INTO callback_outbox(id,request_id,decision_revision,receiver_id,receiver_revision,payload,next_attempt_at,status,terminal_reason) VALUES(?,?,?,?,?,?,?,?,?)`, id, r.ID, r.Revision, receiver, revision, string(payload), s.now().UnixMilli(), deliveryStatus, terminalReason)
-	return err
+	return nil
 }
 
 func privateIP(ip net.IP) bool {
@@ -378,6 +397,7 @@ type Delivery struct {
 	History        []Attempt     `json:"history"`
 	ID             string        `json:"event_id"`
 	RequestID      string        `json:"inbox_id"`
+	Type           string        `json:"type,omitempty"`
 	Status         string        `json:"status"`
 	Attempts       int           `json:"attempts"`
 	TerminalReason string        `json:"terminal_reason,omitempty"`
@@ -392,7 +412,7 @@ type Attempt struct {
 }
 
 func (s *Service) History(ctx context.Context, agentID, requestID string) ([]Delivery, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT o.id,o.request_id,o.status,o.attempts,o.terminal_reason,o.delivered_at FROM callback_outbox o JOIN callback_receivers r ON r.id=o.receiver_id WHERE r.agent_id=? AND o.request_id=?`, agentID, requestID)
+	rows, err := s.db.QueryContext(ctx, `SELECT o.id,o.request_id,o.event_type,o.status,o.attempts,o.terminal_reason,o.delivered_at FROM callback_outbox o JOIN callback_receivers r ON r.id=o.receiver_id WHERE r.agent_id=? AND o.request_id=? ORDER BY o.next_attempt_at,o.id`, agentID, requestID)
 	if err != nil {
 		return nil, err
 	}
@@ -400,7 +420,7 @@ func (s *Service) History(ctx context.Context, agentID, requestID string) ([]Del
 	out := []Delivery{}
 	for rows.Next() {
 		var d Delivery
-		if err = rows.Scan(&d.ID, &d.RequestID, &d.Status, &d.Attempts, &d.TerminalReason, &d.DeliveredAt); err != nil {
+		if err = rows.Scan(&d.ID, &d.RequestID, &d.Type, &d.Status, &d.Attempts, &d.TerminalReason, &d.DeliveredAt); err != nil {
 			return nil, err
 		}
 		out = append(out, d)
@@ -418,7 +438,7 @@ func (s *Service) History(ctx context.Context, agentID, requestID string) ([]Del
 	return out, nil
 }
 func (s *Service) ReceiverHistory(ctx context.Context, agentID, ref string) ([]Delivery, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT id,request_id,status,attempts,terminal_reason,delivered_at FROM callback_outbox WHERE receiver_id IN (SELECT id FROM callback_receivers WHERE id=? AND agent_id=?) ORDER BY next_attempt_at DESC LIMIT 100`, ref, agentID)
+	rows, err := s.db.QueryContext(ctx, `SELECT id,request_id,event_type,status,attempts,terminal_reason,delivered_at FROM callback_outbox WHERE receiver_id IN (SELECT id FROM callback_receivers WHERE id=? AND agent_id=?) ORDER BY next_attempt_at DESC LIMIT 100`, ref, agentID)
 	if err != nil {
 		return nil, err
 	}
@@ -426,7 +446,7 @@ func (s *Service) ReceiverHistory(ctx context.Context, agentID, ref string) ([]D
 	out := []Delivery{}
 	for rows.Next() {
 		var d Delivery
-		if err = rows.Scan(&d.ID, &d.RequestID, &d.Status, &d.Attempts, &d.TerminalReason, &d.DeliveredAt); err != nil {
+		if err = rows.Scan(&d.ID, &d.RequestID, &d.Type, &d.Status, &d.Attempts, &d.TerminalReason, &d.DeliveredAt); err != nil {
 			return nil, err
 		}
 		out = append(out, d)

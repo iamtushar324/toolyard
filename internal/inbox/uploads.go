@@ -628,18 +628,43 @@ func (s *Service) resolveUploads(ctx context.Context, agentID string, r *Request
 			}
 		}
 	}
+	// Markdown images in the message and markdown attachments: only the
+	// agent's own image uploads show inline (InlineImages).
+	r.InlineImages = nil
+	seen := map[string]bool{}
+	for _, src := range r.inlineImageSources() {
+		if seen[src.Ref] {
+			continue
+		}
+		seen[src.Ref] = true
+		if len(r.InlineImages) == MaxInlineImages {
+			*probs = append(*probs, Problem{src.Path, fmt.Sprintf("more than %d inline images; attach the rest", MaxInlineImages)})
+			break
+		}
+		sha, ct, _, err := s.uploadFor(ctx, agentID, src.Ref, "image")
+		if err != nil {
+			*probs = append(*probs, Problem{src.Path, "image " + src.Ref + ": " + err.Error()})
+			continue
+		}
+		r.InlineImages = append(r.InlineImages, InlineImage{Ref: src.Ref, Blob: sha, ContentType: ct})
+	}
 }
 
 // markUploadsUsedTx records, inside the transaction that stores r, that r
 // cites its uploads, so Sweep keeps them.
 func (s *Service) markUploadsUsedTx(ctx context.Context, tx *sql.Tx, r *Request) error {
 	now := s.now().UnixMilli()
+	var refs []string
 	for _, a := range r.Attachments {
-		for _, ref := range []string{a.Upload, a.PosterUpload} {
-			if sha, ok := ParseUploadRef(ref); ok {
-				if _, err := tx.ExecContext(ctx, `UPDATE inbox_uploads SET used_at=COALESCE(used_at, ?), touched_at=? WHERE sha256=? AND agent_id=?`, now, now, sha, r.AgentID); err != nil {
-					return err
-				}
+		refs = append(refs, a.Upload, a.PosterUpload)
+	}
+	for _, img := range r.InlineImages {
+		refs = append(refs, img.Ref)
+	}
+	for _, ref := range refs {
+		if sha, ok := ParseUploadRef(ref); ok {
+			if _, err := tx.ExecContext(ctx, `UPDATE inbox_uploads SET used_at=COALESCE(used_at, ?), touched_at=? WHERE sha256=? AND agent_id=?`, now, now, sha, r.AgentID); err != nil {
+				return err
 			}
 		}
 	}

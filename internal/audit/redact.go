@@ -29,6 +29,8 @@ var secretPatterns = []*regexp.Regexp{
 	regexp.MustCompile(`(?i)bearer\s+[A-Za-z0-9._-]{20,}`),
 	// 32+ char hex blob (sha-style hashes / hex secrets)
 	regexp.MustCompile(`\b[a-f0-9]{40,}\b`),
+	// Standard Webhooks signing secrets (callbacks.register / update)
+	regexp.MustCompile(`whsec_[A-Za-z0-9+/=_-]{16,}`),
 	connectLinkRE,
 }
 

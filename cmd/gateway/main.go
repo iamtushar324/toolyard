@@ -947,6 +947,10 @@ func runServe(argv []string) error {
 	if err != nil {
 		return fmt.Errorf("federation: %w", err)
 	}
+	// Webhooks: the callbacks.* tools, and approval.decided /
+	// approval.executed for legacy deferred approvals.
+	gw.RegisterCallbackTools(callbackSvc, federationSvc.PrivateReceiverAllowed)
+	bus.SetEventSink(callbackSvc)
 	upstreamSvc.SetSecrets(secretsSvc)
 
 	// Chat-approval notifications (Telegram). The Registry fans approval-bus

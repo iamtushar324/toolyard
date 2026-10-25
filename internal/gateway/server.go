@@ -1503,6 +1503,7 @@ func (g *Gateway) routeEntry(ctx context.Context, entry toolEntry, via string, a
 	}
 
 	grantToken, _ := args[GrantField].(string)
+	ctx = withCallbackRef(ctx, args)
 	reason, intent, cleanArgs, rerr := extractReasonOpt(args, entry.reasonField, entry.reasonOptional)
 	if rerr != nil {
 		_ = g.audit.Write(ctx, audit.Event{
@@ -1736,6 +1737,7 @@ func (g *Gateway) holdAndWait(ctx context.Context, entry toolEntry, args map[str
 		IntentCategory: intent,
 		RequireHuman:   requireHuman,
 		RaisedBy:       raiserOnCtx(ctx, agentID),
+		CallbackRef:    callbackRefFrom(ctx),
 	}, g.inLineWait)
 	if err != nil {
 		ev.Outcome = metrics.OutcomeError
