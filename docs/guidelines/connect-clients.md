@@ -193,10 +193,17 @@ every person.
 - Every audit row of a call carries the agent id, the nickname
   (`agent_name`), `agent_kind` `oauth_client`, the owner, and the app's
   OAuth client id (`oauth_client_id`).
+- `GET /v1/audit` and the audit export (`GET /v1/audit/export`, CSV or
+  JSON) return `oauth_client_id`. Add `?oauth_client_id=<client id>` to
+  keep only the rows of one app.
 - The connection's own events have their own rows:
   `mcp_oauth.authorized`, `mcp_oauth.denied`, `mcp_oauth.renamed`,
   `mcp_oauth.scope_changed`, `mcp_oauth.revoked`, and
   `mcp_oauth.refresh_reused` or `mcp_oauth.code_reused` when toolyard
-  revoked tokens because one was used twice. Their `arguments` carry
-  `oauth_client_id`.
+  revoked the connection because a token or code was used twice. They
+  carry `oauth_client_id`, and every row but `mcp_oauth.denied` names the
+  app's agent, so the app's **Activity** shows them, including a
+  revocation by the app itself (`/oauth/revoke`).
+- `GET /v1/agents` and the **Agents** page list an app's agent with kind
+  `oauth_client`. Manage it on **Connected apps**.
 - An agent can read its own rows with the `audit.mine` tool.

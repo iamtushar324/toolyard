@@ -103,8 +103,10 @@ func (g *grantState) usable() bool {
 }
 
 // exchangeCode is the authorization_code grant. The code is claimed first,
-// so a failed check still uses it up; a code presented twice revokes the
-// tokens it produced (RFC 6749 section 4.1.2, OAuth 2.1 section 4.1.3).
+// so a failed check still uses it up. A code that produced tokens and is
+// presented again was copied: one of its two holders is not the client,
+// so the whole grant is revoked and its agent disabled, as for a reused
+// refresh token (RFC 6749 section 4.1.2, OAuth 2.1 section 4.1.3).
 func (s *Service) exchangeCode(ctx context.Context, form url.Values, ca ClientAuth) (*TokenResponse, *Error) {
 	code := form.Get("code")
 	if code == "" {
@@ -135,15 +137,28 @@ func (s *Service) exchangeCode(ctx context.Context, form url.Values, ca ClientAu
 		if e != nil {
 			return nil, invalidGrant("the authorization code is unknown or expired")
 		}
-		if _, e = tx.ExecContext(ctx, `UPDATE mcp_oauth_tokens SET revoked_at = ? WHERE family_id = ? AND revoked_at IS NULL`, now, usedFamily); e != nil {
+		// A code that never produced tokens was used up by a newer consent,
+		// a revocation or a refused exchange: refusing it is enough, and a
+		// stale browser tab cannot sign the person out of everything.
+		var issued int
+		if e = tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM mcp_oauth_tokens WHERE family_id = ?`, usedFamily).Scan(&issued); e != nil {
 			return nil, serverError()
 		}
-		_ = s.auditTx(ctx, tx, auditRow{event: "mcp_oauth.code_reused", clientID: client.ID, grantID: usedGrant,
-			details: map[string]any{"action": "tokens issued from the code were revoked"}})
+		if issued == 0 {
+			return nil, invalidGrant("the authorization code was already used")
+		}
+		agentID, e := s.revokeGrantTx(ctx, tx, usedGrant, "code_reused")
+		if e != nil {
+			return nil, serverError()
+		}
+		row := s.grantAuditRow(ctx, tx, "mcp_oauth.code_reused", usedGrant)
+		row.clientID, row.details = client.ID, map[string]any{"action": "the grant was revoked"}
+		_ = s.auditTx(ctx, tx, row)
 		if e = tx.Commit(); e != nil {
 			return nil, serverError()
 		}
-		return nil, invalidGrant("the authorization code was already used")
+		s.afterRevoke(ctx, agentID)
+		return nil, invalidGrant("the authorization code was already used, so toolyard revoked this connection; sign in again")
 	}
 	if err != nil {
 		return nil, serverError()
@@ -254,8 +269,9 @@ func (s *Service) refresh(ctx context.Context, form url.Values, ca ClientAuth) (
 			if e != nil {
 				return nil, serverError()
 			}
-			_ = s.auditTx(ctx, tx, auditRow{event: "mcp_oauth.refresh_reused", clientID: client.ID, grantID: usedGrant,
-				details: map[string]any{"action": "the grant was revoked"}})
+			row := s.grantAuditRow(ctx, tx, "mcp_oauth.refresh_reused", usedGrant)
+			row.clientID, row.details = client.ID, map[string]any{"action": "the grant was revoked"}
+			_ = s.auditTx(ctx, tx, row)
 			if e = tx.Commit(); e != nil {
 				return nil, serverError()
 			}
@@ -367,6 +383,26 @@ func (s *Service) revokeGrantTx(ctx context.Context, q store.Querier, grantID, r
 	return agentID, nil
 }
 
+// grantAuditRow starts the audit row of an event on grantID that came in
+// through the OAuth endpoints (a client's revocation, a reused code or
+// refresh token): the grant's agent, its nickname and its owner, so the
+// row shows in the agent's Activity like the dashboard's own changes. The
+// grant row outlives the agent, so a deleted agent's id is still named.
+func (s *Service) grantAuditRow(ctx context.Context, q store.Querier, event, grantID string) auditRow {
+	r := auditRow{event: event, grantID: grantID}
+	var owner identity.User
+	if err := q.QueryRowContext(ctx,
+		`SELECT g.agent_id, COALESCE(a.name, ''), g.user_id, COALESCE(u.email, ''), COALESCE(u.display_name, ''), COALESCE(u.username, '')
+         FROM mcp_oauth_grants g
+         LEFT JOIN agents a ON a.id = g.agent_id
+         LEFT JOIN users u ON u.id = g.user_id
+         WHERE g.id = ?`, grantID).
+		Scan(&r.agentID, &r.nickname, &owner.ID, &owner.Email, &owner.DisplayName, &owner.Username); err == nil {
+		r.owner = &owner
+	}
+	return r
+}
+
 // afterRevoke runs once a revocation committed: the agent's cached scope
 // is dropped (a disabled agent reaches nothing, so nothing it queued can
 // run) and OnRevoke cancels what it still has pending, on a context the
@@ -462,8 +498,9 @@ func (s *Service) Revoke(ctx context.Context, token string, ca ClientAuth) *Erro
 	if err != nil {
 		return serverError()
 	}
-	if err := s.auditTx(ctx, tx, auditRow{event: "mcp_oauth.revoked", client: client, grantID: grantID,
-		details: map[string]any{"by": "client"}}); err != nil {
+	row := s.grantAuditRow(ctx, tx, "mcp_oauth.revoked", grantID)
+	row.client, row.details = client, map[string]any{"by": "client"}
+	if err := s.auditTx(ctx, tx, row); err != nil {
 		return serverError()
 	}
 	if err := tx.Commit(); err != nil {
