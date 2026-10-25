@@ -55,7 +55,7 @@ func (s *Service) holdLease(ctx context.Context, id string) (stop func()) {
 				return
 			case <-t.C:
 				_, _ = s.cluster.ExecReserved(lctx, `UPDATE memory_webhook_jobs SET lease_until=`+cluster.LeaseUntilSQL(s.db.Dialect)+
-					` WHERE id=? AND status=? AND owner_instance=?`, id, jobRunning, s.cluster.InstanceID())
+					` WHERE id=? AND status='running' AND owner_instance=?`, id, s.cluster.InstanceID())
 			}
 		}
 	}()

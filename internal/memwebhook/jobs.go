@@ -253,13 +253,18 @@ func (s *Service) processOnce(ctx context.Context) (bool, error) {
 		return true, nil // someone else claimed it; try the next one
 	}
 
-	w, err := s.loadJobWork(ctx, id)
+	// The claimed job is one unit: it runs to its end even when the
+	// worker loses its leader lease or hands it over at a drain (ctx ends
+	// then); only the next job does not start (cluster.UnitContext). Its
+	// own lease keeps another node's recovery away meanwhile.
+	unit := cluster.UnitContext(ctx)
+	w, err := s.loadJobWork(unit, id)
 	if err != nil {
 		return true, err
 	}
-	stop := s.holdLease(ctx, id)
+	stop := s.holdLease(unit, id)
 	defer stop()
-	s.runJob(ctx, w)
+	s.runJob(unit, w)
 	return true, nil
 }
 
@@ -437,11 +442,12 @@ func (s *Service) recoverRunningJobs(ctx context.Context) error {
 	if s.db == nil {
 		return nil
 	}
-	q := `UPDATE memory_webhook_jobs SET status=?, next_attempt_at=0, updated_at=? WHERE status=?`
+	// The literal status lets Postgres use the partial lease index.
+	q := `UPDATE memory_webhook_jobs SET status=?, next_attempt_at=0, updated_at=? WHERE status='running'`
 	if s.cluster.MultiNode() {
 		q += ` AND ` + cluster.LeaseEndedSQL(s.db.Dialect, "lease_until")
 	}
-	_, err := s.db.ExecContext(ctx, q, jobQueued, time.Now().UnixMilli(), jobRunning)
+	_, err := s.db.ExecContext(ctx, q, jobQueued, time.Now().UnixMilli())
 	return err
 }
 

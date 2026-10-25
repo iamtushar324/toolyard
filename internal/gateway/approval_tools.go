@@ -429,10 +429,15 @@ func (g *Gateway) handleWaitForApproval() directHandler {
 					(cur.Status != approval.StatusPending && !(cur.Status == approval.StatusAllowed && cur.ResultExecutedAt == 0 && cur.ExecutionState == "running")) {
 					goto settled
 				}
-				ch, hasWatcher = g.approval.Watch(id)
-				if !hasWatcher {
-					goto settled
+				// The holder installs its next channel before it reads; until
+				// it has, Watch still returns the closed one: poll instead
+				// of spinning on it.
+				next, ok := g.approval.Watch(id)
+				if !ok || next == ch {
+					hasWatcher = false
+					continue
 				}
+				ch = next
 			case <-timer.C:
 				goto settled
 			case <-ctx.Done():

@@ -775,8 +775,10 @@ func TestClusterDedicatedConnections(t *testing.T) {
 	if d := time.Since(time.UnixMilli(start)); d > time.Minute || d < -time.Minute {
 		t.Fatalf("the database clock is %s from this one", d)
 	}
-	if until-start != WorkLease.Milliseconds() {
-		t.Fatalf("lease length %d ms, want %d", until-start, WorkLease.Milliseconds())
+	// One statement, so both ends read the same clock; the tolerance only
+	// covers a clock function that ticks between the two reads.
+	if d := until - start - WorkLease.Milliseconds(); d < -50 || d > 50 {
+		t.Fatalf("lease length %d ms, want %d (±50)", until-start, WorkLease.Milliseconds())
 	}
 	var ended bool
 	if err := db.QueryRowContext(ctx, `SELECT `+LeaseEndedSQL(db.Dialect, "expires_at")+` FROM rate_limit_buckets WHERE bucket = 'reserved'`).Scan(&ended); err != nil || ended {
@@ -821,4 +823,46 @@ func TestClusterDroppedTopicsResync(t *testing.T) {
 	if d, ok := c.takeDrops(); !ok || len(d.topics) != 0 {
 		t.Fatalf("a dropped full resync = %+v %v, want one for everyone", d, ok)
 	}
+}
+
+// -cluster=off and replicas never share a database: the mode lock is
+// exclusive for a single node and shared for replicas.
+func TestClusterModeGuard(t *testing.T) {
+	db1, db2 := storetest.OpenPostgresPair(t)
+	ctx := context.Background()
+	replica := newCluster(t, db1, fastOptions("replica"))
+	// A second replica is fine; a single-node gateway is refused.
+	_ = newCluster(t, db2, fastOptions("replica-2"))
+	if c, err := New(ctx, db2, Options{SingleNode: true}); !errors.Is(err, ErrModeConflict) {
+		if c != nil {
+			_ = c.Close()
+		}
+		t.Fatalf("single-node next to replicas: %v, want ErrModeConflict", err)
+	}
+	_ = replica.Close()
+	// (replica-2 still runs.)
+}
+
+func TestClusterModeGuardSingleNode(t *testing.T) {
+	db1, db2 := storetest.OpenPostgresPair(t)
+	ctx := context.Background()
+	solo := newCluster(t, db1, Options{SingleNode: true})
+	for name, opts := range map[string]Options{"another single node": {SingleNode: true}, "a replica": fastOptions("replica")} {
+		if c, err := New(ctx, db2, opts); !errors.Is(err, ErrModeConflict) {
+			if c != nil {
+				_ = c.Close()
+			}
+			t.Fatalf("%s next to a single-node gateway: %v, want ErrModeConflict", name, err)
+		}
+	}
+	// Once it stops, a replica may start.
+	_ = solo.Close()
+	waitFor(t, 10*time.Second, "the mode lock to be free", func() bool {
+		c, err := New(ctx, db2, fastOptions("replica"))
+		if err != nil {
+			return false
+		}
+		_ = c.Close()
+		return true
+	})
 }

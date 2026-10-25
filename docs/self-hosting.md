@@ -719,9 +719,9 @@ must be able to create tables in the database (owning it is enough).
 `-db-max-conns` (default 10) is the most connections `serve` opens to
 Postgres. With replica support on (`-cluster`, see [Several replicas on
 one database](#several-replicas-on-one-database)) each replica also keeps
-up to four connections of its own outside the pool. Keep the server's
+up to five connections of its own outside the pool. Keep the server's
 `max_connections` above the total of every process that connects:
-replicas × (`-db-max-conns` + 4), plus your own tools. SQLite always uses
+replicas × (`-db-max-conns` + 5), plus your own tools. SQLite always uses
 one connection, and the flag does nothing there.
 
 ### What else changes on Postgres
@@ -756,7 +756,10 @@ refuses SQLite); `off` runs one gateway per database even on Postgres: no
 `LISTEN` connection, no periodic recovery, rate limits in process, and the
 start settles leftover work at once, as on SQLite. A deployment that runs
 exactly one replica on Postgres may set `off`; with two or more replicas
-it must be `on` (or `auto`).
+it must be `on` (or `auto`). Each gateway states its setting in the
+database for its whole life (an advisory lock: exclusive for `off`,
+shared for `on`), so a second gateway next to an `off` one, or an `off`
+gateway next to running replicas, refuses to start with exit code 78.
 
 Every replica must have the same configuration and the same keys
 (identity, OAuth, secrets and session keys from the same credentials, with
@@ -824,9 +827,12 @@ How the replicas share the work:
 
 Things to set:
 
-- **Connections.** Each replica keeps up to four connections of its own
-  outside the pool: leader leases, named locks, lease renewals and
-  `LISTEN`. They need session state, so connect the replicas to Postgres
+- **Connections.** Each replica keeps up to five connections of its own
+  outside the pool: leader leases, named locks, lease renewals, `LISTEN`
+  and the `-cluster` setting. Each shows its purpose and the replica's
+  instance ID as its `application_name` in `pg_stat_activity`; the
+  keepalive settings are `SET` once it opens, and one the server refuses
+  (`tcp_user_timeout` before Postgres 12) is skipped with one log line. They need session state, so connect the replicas to Postgres
   directly or through a pooler in session mode. A transaction-mode pooler
   (PgBouncer `pool_mode=transaction`) breaks session advisory locks and
   `LISTEN`: do not use one between toolyard and Postgres.

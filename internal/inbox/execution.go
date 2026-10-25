@@ -82,11 +82,12 @@ func (s *Service) FinishExecution(ctx context.Context, g *Grant, state string, r
 // clock (or that have none), so it never touches the live work of another
 // node, nor of this one.
 func (s *Service) RecoverExecutions(ctx context.Context) (int64, error) {
-	q := `UPDATE inbox_executions SET state=?,finished_at=?,error=? WHERE state=?`
+	// The literal state lets Postgres use the partial lease index.
+	q := `UPDATE inbox_executions SET state=?,finished_at=?,error=? WHERE state='running'`
 	if s.multiNode() {
 		q += ` AND ` + cluster.LeaseEndedSQL(s.db.Dialect, "lease_until")
 	}
-	res, err := s.db.ExecContext(ctx, q, ExecutionUnknown, s.now().UnixMilli(), "process stopped after the execution claim; inspect upstream state before any new permission", ExecutionRunning)
+	res, err := s.db.ExecContext(ctx, q, ExecutionUnknown, s.now().UnixMilli(), "process stopped after the execution claim; inspect upstream state before any new permission")
 	if err != nil {
 		return 0, err
 	}
@@ -103,8 +104,8 @@ func (s *Service) RecoverExecutions(ctx context.Context) (int64, error) {
 // outcome_unknown once their lease ends (at the next start on a single
 // node).
 func (s *Service) RunningExecutions(ctx context.Context) ([]string, error) {
-	q := `SELECT grant_id FROM inbox_executions WHERE state=?`
-	args := []any{ExecutionRunning}
+	q := `SELECT grant_id FROM inbox_executions WHERE state='running'`
+	var args []any
 	if s.multiNode() {
 		q += ` AND owner_instance=?`
 		args = append(args, s.instance())

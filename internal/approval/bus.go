@@ -91,6 +91,13 @@ type Request struct {
 	ExpiresAt      int64          `json:"expires_at"`
 	Fingerprint    string         `json:"fingerprint,omitempty"`
 	Coalesced      bool           `json:"coalesced,omitempty"` // true if Hold returned an existing pending row instead of creating a new one
+	// DecidedInline is set only on the request Hold returns when this
+	// Hold's own auto-approval decided it in line (with its execution
+	// claim): that caller, and no other, dispatches the call. A request
+	// someone else decided (another Hold, a person, a rule on a coalesced
+	// row) never carries it, even when its decider is a rule. Never
+	// stored or sent.
+	DecidedInline bool `json:"-"`
 	// AutoDecidedBy is the auto-approval rule id that decided this request,
 	// or empty if a human (or the rule engine wasn't consulted). Derived
 	// on every read from the decider (Via auto_rule, Ref rule id).
@@ -291,6 +298,7 @@ func (b *Bus) Hold(ctx context.Context, in NewRequest, maxWait time.Duration) (*
 			decided, derr := b.decideInline(ctx, req.ID, StatusAllowed, d)
 			if derr == nil && decided != nil {
 				b.auto.MarkHit(ctx, m.ID, req.AgentID)
+				decided.DecidedInline = true
 				return decided, nil
 			}
 		}
@@ -324,16 +332,18 @@ func (b *Bus) Hold(ctx context.Context, in NewRequest, maxWait time.Duration) (*
 	for {
 		select {
 		case <-w.done:
+			// A wake-up for everyone (an expiry sweep) may find this
+			// request still open: the next waiter is installed before the
+			// read, so a decision that lands in between still wakes it.
+			next := &pending{req: req, done: make(chan struct{})}
+			b.mu.Lock()
+			b.waiters[req.ID] = next
+			b.mu.Unlock()
 			cur, err := b.Get(ctx, req.ID)
 			if err != nil || b.settled(cur) {
 				return cur, err
 			}
-			// A wake-up for everyone (an expiry sweep) found this request
-			// still open: wait again on a fresh signal.
-			w = &pending{req: req, done: make(chan struct{})}
-			b.mu.Lock()
-			b.waiters[req.ID] = w
-			b.mu.Unlock()
+			w = next
 		case <-poll:
 			if cur, err := b.Get(ctx, req.ID); err == nil && b.settled(cur) {
 				return cur, nil
@@ -970,6 +980,20 @@ func (b *Bus) SweepUnexecuted(ctx context.Context) (int, error) {
 		return 0, err
 	}
 
+	// An auto-rule decision is dispatched in line by Hold's caller, and
+	// this binary writes its claim with the decision. One that an older
+	// binary dispatched without a claim, and left without a result, has an
+	// unknown outcome too: it gets an outcome_unknown claim here, so the
+	// step below settles it and nothing ever runs it again.
+	if _, err := b.db.ExecContext(ctx, `INSERT INTO legacy_execution_claims(request_id,state,claimed_at,reason)
+		SELECT id, 'outcome_unknown', CAST(? AS BIGINT), 'In-line auto-approved call left without a result or a claim; do not repeat'
+		FROM approval_requests
+		WHERE status = 'allowed' AND result_executed_at IS NULL AND COALESCE(decided_via, '') = ?
+		  AND id NOT IN (SELECT request_id FROM legacy_execution_claims)
+		ON CONFLICT (request_id) DO NOTHING`, time.Now().UnixMilli(), actor.ViaAutoRule); err != nil {
+		return 0, err
+	}
+
 	uncertain, e := b.db.QueryContext(ctx, `SELECT request_id FROM legacy_execution_claims WHERE state='outcome_unknown' AND request_id IN (SELECT id FROM approval_requests WHERE result_executed_at IS NULL)`)
 	if e != nil {
 		return 0, e
@@ -994,9 +1018,7 @@ func (b *Bus) SweepUnexecuted(ctx context.Context) (int, error) {
 	if b.exec == nil {
 		return 0, nil
 	}
-	// An auto-rule decision is dispatched in line by Hold's caller, under
-	// a claim written with the decision: never run it here, even when an
-	// older binary left one without a claim.
+	// An auto-rule decision is never run here (see above).
 	rows, err := b.db.QueryContext(ctx,
 		`SELECT `+requestSelectColumns+`
          FROM approval_requests

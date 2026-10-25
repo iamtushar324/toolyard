@@ -215,6 +215,9 @@ type Service struct {
 	// serving them). Both guarded by mu.
 	bearerGen    map[string]uint64
 	staleBearers map[string]bool
+	// flights are the bearer reads under way, by key (singleRead).
+	flightMu sync.Mutex
+	flights  map[string]chan struct{}
 
 	// cluster, when it spans several nodes, carries bearer changes to the
 	// other replicas' caches and serializes refreshes across them
@@ -294,13 +297,14 @@ func (s *Service) currentBearer(upstream string) string {
 	stale := s.staleBearers[upstream]
 	s.mu.RUnlock()
 	if !ok || stale {
-		// Cold path, or a cluster resync asked to check: read the DB. A
-		// failed read keeps serving the stale bearer.
-		if s.cacheBearerFromDB(upstream) || !ok {
-			s.mu.RLock()
-			v, ok = s.bearers[upstream]
-			s.mu.RUnlock()
-		}
+		// Cold path, or a cluster resync asked to check: read the DB,
+		// once for every concurrent caller of this key, bounded by
+		// bearerReadTimeout (this runs on the tool-call path). A failed or
+		// slow read keeps serving the stale bearer.
+		s.singleRead(upstream, func() { s.cacheBearerFromDB(upstream) })
+		s.mu.RLock()
+		v, ok = s.bearers[upstream]
+		s.mu.RUnlock()
 		if !ok {
 			return ""
 		}
@@ -344,7 +348,9 @@ func (s *Service) cacheBearerFromDB(upstream string) bool {
 		s.mu.RLock()
 		gen := s.bearerGen[upstream]
 		s.mu.RUnlock()
-		tok, err := s.GetToken(context.Background(), upstream)
+		ctx, cancel := context.WithTimeout(context.Background(), bearerReadTimeout)
+		tok, err := s.GetToken(ctx, upstream)
+		cancel()
 		if err != nil {
 			return false
 		}

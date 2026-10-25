@@ -269,9 +269,48 @@ func (c *Cluster) call(topic string, fn func(string), payload string) {
 	fn(payload)
 }
 
+// SubscribeReload runs reload, on a goroutine of its own, after every
+// message on topic and every Resync, so a slow reload (a database read)
+// never holds up the cluster's delivery goroutine. Signals that arrive
+// while a reload runs fold into one more reload. It stops with the
+// cluster; the returned cancel stops it earlier. A nil Cluster never calls
+// reload.
+func (c *Cluster) SubscribeReload(topic string, reload func()) (cancel func()) {
+	if c == nil || reload == nil {
+		return func() {}
+	}
+	wake := make(chan struct{}, 1)
+	done := make(chan struct{})
+	unsubscribe := c.Subscribe(topic, func(string) {
+		select {
+		case wake <- struct{}{}:
+		default:
+		}
+	})
+	go func() {
+		for {
+			select {
+			case <-c.ctx.Done():
+				return
+			case <-done:
+				return
+			case <-wake:
+				c.call(topic, func(string) { reload() }, "")
+			}
+		}
+	}()
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			unsubscribe()
+			close(done)
+		})
+	}
+}
+
 // dialListen opens a connection that LISTENs on the cluster channel.
 func (c *Cluster) dialListen(ctx context.Context) (*pgx.Conn, error) {
-	conn, err := c.db.ConnectPostgres(ctx, "toolyard-cluster-listen")
+	conn, err := c.db.ConnectPostgres(ctx, c.appName("listen"))
 	if err != nil {
 		return nil, err
 	}

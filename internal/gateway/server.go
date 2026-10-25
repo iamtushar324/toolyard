@@ -1810,15 +1810,21 @@ func (g *Gateway) holdAndWait(ctx context.Context, entry toolEntry, args map[str
 		} else {
 			ev.ApprovalOutcome = metrics.ApprovalApproved
 		}
-		if req.AutoDecidedBy != "" {
-			// Inline auto-approve: decideInline ran with runExec=false, so
-			// NO background executor was scheduled — we dispatch here. We
-			// MUST then persist the result, otherwise the row stays
-			// allowed with result_executed_at IS NULL and SweepUnexecuted
-			// re-fires the executor (re-running the write) on the next
-			// gateway restart.
+		if req.DecidedInline {
+			// Inline auto-approve: this Hold's own decideInline decided
+			// it (runExec=false, under its execution claim), so NO
+			// background executor was scheduled — we dispatch here, and
+			// only here: a coalesced call, or one that woke within
+			// -in-line-wait after another call's auto decision, sees a
+			// rule as decider but not this mark, and takes resumeDeferred
+			// below. We MUST then persist the result, on a context the
+			// client's disconnect does not cancel (as Execute does);
+			// otherwise the row stays allowed with result_executed_at IS
+			// NULL until recovery records it outcome_unknown.
 			res, derr := g.dispatch(ctx, entry, args, agentID, reason, req.ID, ev)
-			g.persistApprovalResult(ctx, req.ID, res, derr, ev.ErrorClass == "upstream" || ev.ErrorClass == "audit_outcome_unknown")
+			persistCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), persistTimeout)
+			defer cancel()
+			g.persistApprovalResult(persistCtx, req.ID, res, derr, ev.ErrorClass == "upstream" || ev.ErrorClass == "audit_outcome_unknown")
 			return res, derr
 		}
 		// Legacy `-in-line-wait > 0` path: a human tapped Allow during the

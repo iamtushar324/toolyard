@@ -91,7 +91,17 @@ var (
 	ErrBadTopic = errors.New("cluster: a topic is 1 to 64 bytes with no NUL byte")
 	// errClosed is the error of a lock or query asked of a closed Cluster.
 	errClosed = errors.New("cluster: closed")
+	// ErrModeConflict is New's error when another gateway uses the
+	// database with the other setting: a single-node gateway
+	// (SingleNode, serve -cluster=off) next to any other gateway, or a
+	// replica next to a single-node gateway.
+	ErrModeConflict = errors.New("cluster: another gateway uses this database with the other -cluster setting (off allows one gateway per database)")
 )
+
+// modeKey is the advisory lock a gateway holds for its life to state its
+// mode: exclusively when single-node, shared when it is one of several
+// replicas, so the two modes never run on one database together.
+var modeKey = LockKey("cluster-mode")
 
 // Options tune New. The zero value is ready to use.
 type Options struct {
@@ -146,6 +156,10 @@ type Cluster struct {
 
 	// Lease renewals and other short writes (work.go).
 	work slot
+
+	// mode holds the mode lock (modeKey) on Postgres, single-node or not.
+	mode     slot
+	modeHeld bool // guarded by mode.mu
 
 	// Messages (messages.go).
 	subMu     sync.RWMutex
@@ -211,6 +225,7 @@ func New(ctx context.Context, db *store.DB, opts Options) (*Cluster, error) {
 		leases:    slot{purpose: "leases"},
 		locks:     slot{purpose: "locks"},
 		work:      slot{purpose: "work"},
+		mode:      slot{purpose: "mode"},
 		held:      map[int64]*lease{},
 		named:     map[int64]*lease{},
 		subs:      map[string]map[uint64]func(string){},
@@ -228,6 +243,25 @@ func New(ctx context.Context, db *store.DB, opts Options) (*Cluster, error) {
 			c.log.Warn("cluster: every named lock of this node is released with its connection", "locks", len(c.named))
 		}
 		cancelAll(c.named)
+	}
+	c.mode.onDrop = func() { c.modeHeld = false }
+	if db != nil && db.Dialect.IsPostgres() {
+		// State this gateway's mode before anything else runs.
+		c.mode.mu.Lock()
+		err := c.takeModeLocked()
+		c.mode.mu.Unlock()
+		if err != nil {
+			cancel()
+			c.mode.mu.Lock()
+			if c.mode.conn != nil {
+				closeConn(c.mode.conn)
+				c.mode.conn = nil
+			}
+			c.mode.mu.Unlock()
+			return nil, err
+		}
+		c.wg.Add(1)
+		go c.keepMode()
 	}
 	c.wg.Add(1)
 	go c.dispatch()
@@ -281,7 +315,7 @@ func (c *Cluster) Close() error {
 		c.closed.Store(true)
 		c.cancel()
 		c.wg.Wait()
-		for _, s := range []*slot{&c.leases, &c.locks, &c.work} {
+		for _, s := range []*slot{&c.leases, &c.locks, &c.work, &c.mode} {
 			s.mu.Lock()
 			if s.conn != nil {
 				closeConn(s.conn)
@@ -313,7 +347,7 @@ func (c *Cluster) connLocked(s *slot) (*pgx.Conn, error) {
 	}
 	dctx, cancel := context.WithTimeout(c.ctx, queryTimeout)
 	defer cancel()
-	conn, err := c.db.ConnectPostgres(dctx, "toolyard-cluster-"+s.purpose)
+	conn, err := c.db.ConnectPostgres(dctx, c.appName(s.purpose))
 	if err != nil {
 		s.dialLog.warn(c.log, "cluster: cannot open the "+s.purpose+" connection; waiting for the database", err)
 		return nil, err
@@ -369,6 +403,70 @@ func (c *Cluster) checkSlot(s *slot, holding func() int) {
 	cancel()
 	if err != nil && c.ctx.Err() == nil {
 		c.dropLocked(s, "check", err)
+	}
+}
+
+// appName is the application_name of a dedicated connection: its purpose
+// and this node's instance ID (pg_stat_activity shows who holds what).
+func (c *Cluster) appName(purpose string) string {
+	return "toolyard " + purpose + " " + c.id
+}
+
+// takeModeLocked takes the mode lock on the mode connection: exclusive
+// for a single node, shared for a replica. c.mode.mu is held.
+func (c *Cluster) takeModeLocked() error {
+	conn, err := c.connLocked(&c.mode)
+	if err != nil {
+		return err
+	}
+	q := `SELECT pg_try_advisory_lock_shared($1)`
+	if !c.pg {
+		q = `SELECT pg_try_advisory_lock($1)`
+	}
+	qctx, cancel := context.WithTimeout(c.ctx, queryTimeout)
+	defer cancel()
+	var got bool
+	if err := conn.QueryRow(qctx, q, modeKey).Scan(&got); err != nil {
+		c.dropLocked(&c.mode, "take the mode lock", err)
+		return err
+	}
+	if !got {
+		return ErrModeConflict
+	}
+	c.modeHeld = true
+	return nil
+}
+
+// keepMode checks the mode connection and takes the mode lock again after
+// the connection failed, so the guard holds for the process's life.
+func (c *Cluster) keepMode() {
+	defer c.wg.Done()
+	t := time.NewTicker(max(c.opts.CheckInterval, time.Second))
+	defer t.Stop()
+	var lg logOnce
+	for {
+		select {
+		case <-c.ctx.Done():
+			return
+		case <-t.C:
+		}
+		c.mode.mu.Lock()
+		if c.modeHeld {
+			qctx, cancel := context.WithTimeout(c.ctx, max(c.opts.CheckInterval, time.Second))
+			err := c.mode.conn.Ping(qctx)
+			cancel()
+			if err != nil && c.ctx.Err() == nil {
+				c.dropLocked(&c.mode, "check the mode lock", err)
+			}
+		}
+		if !c.modeHeld && c.ctx.Err() == nil {
+			if err := c.takeModeLocked(); err != nil {
+				lg.warn(c.log, "cluster: cannot take the mode lock again; another gateway with the other -cluster setting may use this database", err)
+			} else if lg.reset() {
+				c.log.Info("cluster: mode lock taken again")
+			}
+		}
+		c.mode.mu.Unlock()
 	}
 }
 

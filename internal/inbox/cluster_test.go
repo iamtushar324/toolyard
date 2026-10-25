@@ -199,6 +199,7 @@ func TestTwoNodeWaitWakesOnDecision(t *testing.T) {
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
+	decidedAt := time.Now()
 	if _, err := node1.svc.Decide(ctx, r.ID, Decision{Action: "deny", Note: "Not this week"}); err != nil {
 		t.Fatalf("decide on node 1: %v", err)
 	}
@@ -209,6 +210,12 @@ func TestTwoNodeWaitWakesOnDecision(t *testing.T) {
 		}
 		if len(res.views) != 1 || res.views[0].Status == StatusPending {
 			t.Fatalf("wait returned %+v", res.views)
+		}
+		// The fallback poll runs every waitPoll from the start of the
+		// wait: a wake-up well inside one poll interval came through the
+		// cluster message.
+		if took := time.Since(decidedAt); took >= waitPoll/2 {
+			t.Fatalf("node 2's wait returned %s after the decision: the cluster wake-up did not arrive, only the poll", took)
 		}
 		t.Logf("node 2's wait returned %s after node 1's decision", res.took)
 	case <-time.After(10 * time.Second):

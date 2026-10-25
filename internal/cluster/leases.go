@@ -118,10 +118,29 @@ func (c *Cluster) acquire(ctx context.Context, key int64) (context.Context, func
 			return nil, nil, false
 		}
 	}
-	lctx, cancel := context.WithCancel(ctx)
+	lctx, cancel := context.WithCancel(context.WithValue(ctx, unitKey{}, ctx))
 	l := &lease{gen: s.gen, cancel: cancel}
 	c.held[key] = l
 	return lctx, func() { c.releaseLease(key, l) }, true
+}
+
+// unitKey holds, on a leader task's context, the context RunLeader was
+// given (UnitContext).
+type unitKey struct{}
+
+// UnitContext returns, for the context a leader task got from RunLeader,
+// a context that does not end with the lease: it ends only when the
+// context given to RunLeader ends (for the gateway, at the end of the
+// shutdown drain). A leader task runs its current unit of work (one job,
+// one token refresh) on it, so losing the lease, or handing it over at a
+// drain, stops new units without cutting one half-way; the task checks
+// its own context before it starts the next unit. Any other context is
+// returned as it is.
+func UnitContext(lctx context.Context) context.Context {
+	if parent, ok := lctx.Value(unitKey{}).(context.Context); ok {
+		return parent
+	}
+	return lctx
 }
 
 // releaseLease gives up one leader lease. A lease lost with its connection

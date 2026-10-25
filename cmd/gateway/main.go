@@ -488,6 +488,11 @@ func runServe(argv []string) error {
 		return err
 	}
 	clusterSvc, err := cluster.New(ctx, db, cluster.Options{InstanceID: *instanceID, SingleNode: cmode == clusterOff})
+	if errors.Is(err, cluster.ErrModeConflict) {
+		// -cluster=off next to another gateway, or a replica next to an
+		// off one: a restart cannot fix the configuration (exit 78).
+		return fmt.Errorf("%w (%w)", err, keyguard.ErrConfig)
+	}
 	if err != nil {
 		return fmt.Errorf("cluster: %w", err)
 	}
@@ -926,9 +931,11 @@ func runServe(argv []string) error {
 	leaderLoop(ctx, clusterSvc, loopSessionPurger, time.Hour, func(ctx context.Context) { runSessionPurger(ctx, idSvc, codeRuns) })
 	// Every replica renews the leases of the code runs it runs.
 	goroutines.Loop(ctx, coderuns.LeaseRenewalLoop, time.Minute, codeRuns.RunLeaseRenewal)
-	// The leader settles the work of replicas that stopped (multi-node only).
+	// The leader settles the work of replicas that stopped (multi-node
+	// only), once startup has loaded what recovery needs (recoveryReady).
+	recoveryReady := make(chan struct{})
 	leaderLoop(ctx, clusterSvc, loopWorkRecovery, time.Minute, func(ctx context.Context) {
-		runWorkRecovery(ctx, clusterSvc, db.PingContext, inboxSvc, bus, codeRuns)
+		runWorkRecovery(ctx, clusterSvc, recoveryReady, db.PingContext, inboxSvc, bus, codeRuns)
 	})
 
 	upstreamSvc := upstreams.New(db, gw)
@@ -1090,6 +1097,7 @@ func runServe(argv []string) error {
 			log.Printf("legacy execution: recovered %d unclaimed decisions", n)
 		}
 	}
+	close(recoveryReady)
 
 	// MemPalace: install (if needed), initialize palace dir, and register
 	// the built-in stdio upstream so its 29 tools surface as `mempalace.*`.

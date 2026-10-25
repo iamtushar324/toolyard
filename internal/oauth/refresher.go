@@ -7,6 +7,8 @@ import (
 	"log"
 	"math"
 	"time"
+
+	"github.com/tusharbhardwaj/toolyard/internal/cluster"
 )
 
 // RefreshLeadFraction is the fraction of access-token TTL after which we
@@ -148,7 +150,15 @@ func (s *Service) refreshTick(ctx context.Context) {
 	rows.Close()
 
 	now := time.Now()
+	// Each refresh is one unit that runs to its end on unit (see
+	// cluster.UnitContext): a rotating refresh token spent at the provider
+	// must be stored, or the next refresh gets invalid_grant. Losing the
+	// leader lease (ctx) only stops the next refresh from starting.
+	unit := cluster.UnitContext(ctx)
 	for _, c := range cs {
+		if ctx.Err() != nil {
+			return
+		}
 		if c.pat {
 			continue
 		}
@@ -159,8 +169,8 @@ func (s *Service) refreshTick(ctx context.Context) {
 			continue
 		}
 		s.recordAttempt(c.upstream, now)
-		if _, err := s.Refresh(ctx, c.upstream); err != nil {
-			s.handleRefreshFailure(ctx, c.upstream, c.failures+1, err)
+		if _, err := s.Refresh(unit, c.upstream); err != nil {
+			s.handleRefreshFailure(unit, c.upstream, c.failures+1, err)
 		}
 	}
 	s.refreshUserTokens(ctx, now)
@@ -228,11 +238,16 @@ func (s *Service) refreshUserTokens(ctx context.Context, now time.Time) {
 		if !backoffSatisfied(now, c.lastRefresh, s.lastAttemptAt(key), c.failures) {
 			continue
 		}
+		if ctx.Err() != nil {
+			return
+		}
 		s.recordAttempt(key, now)
 		// A superseded write means the row changed while the provider was
-		// answering (a reconnect or disconnect): nothing failed.
-		if _, err := s.RefreshUser(ctx, c.upstream, c.user); err != nil && !errors.Is(err, ErrSuperseded) {
-			s.handleUserRefreshFailure(ctx, c.upstream, c.user, c.failures+1, err)
+		// answering (a reconnect or disconnect): nothing failed. The
+		// refresh runs to its end (cluster.UnitContext), as above.
+		unit := cluster.UnitContext(ctx)
+		if _, err := s.RefreshUser(unit, c.upstream, c.user); err != nil && !errors.Is(err, ErrSuperseded) {
+			s.handleUserRefreshFailure(unit, c.upstream, c.user, c.failures+1, err)
 		}
 	}
 }
