@@ -11,13 +11,15 @@ import (
 	"github.com/tusharbhardwaj/toolyard/internal/cluster"
 )
 
+// waitPoll is how often a Wait re-reads its requests on a multi-node
+// database, in case a wake-up message was missed. A variable so a test can
+// lengthen it and prove the wake-up message works on its own.
+var waitPoll = 2 * time.Second
+
 const (
 	// wakeTopic carries the id of a request that left pending, so a Wait
 	// on another node re-reads it.
 	wakeTopic = "inbox-wake"
-	// waitPoll is how often a Wait re-reads its requests on a multi-node
-	// database, in case a wake-up message was missed.
-	waitPoll = 2 * time.Second
 	// LeaseRenewalLoop names RunLeaseRenewal in the supervised loop.
 	LeaseRenewalLoop = "inbox-lease-renewal"
 	// legacySyncTopic asks the replica that runs the legacy sync loop for

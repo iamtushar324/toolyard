@@ -7,6 +7,7 @@ package memwebhook
 
 import (
 	"context"
+	"errors"
 	"time"
 
 	"github.com/tusharbhardwaj/toolyard/internal/cluster"
@@ -36,31 +37,66 @@ func (s *Service) publishWake(ctx context.Context) {
 	}
 }
 
+// errLeaseLost ends a job's context when its lease can no longer be kept.
+var errLeaseLost = errors.New("memwebhook: the job's lease was lost")
+
+// leaseLostAfter is how long a job runs without a successful renewal before
+// it stops: well before its lease ends (cluster.WorkLease, 60 s) and
+// another node's recovery may settle it, even when a renewal that started
+// just before blocks for its full query timeout. leaseRenewEvery is how
+// often the lease is renewed. Tests shorten both.
+var (
+	leaseLostAfter  = cluster.WorkLease - 15*time.Second
+	leaseRenewEvery = cluster.WorkLeaseRenew
+)
+
 // holdLease renews the lease of running job id until the returned stop is
-// called. Without a multi-node cluster nothing reads the lease, so it does
-// nothing.
-func (s *Service) holdLease(ctx context.Context, id string) (stop func()) {
+// called, and returns the context the job must run under. That context
+// ends (cause errLeaseLost) when a renewal finds the job no longer this
+// node's, or when no renewal succeeded for leaseLostAfter, so the job stops
+// before another node may take it. Without a multi-node cluster nothing
+// reads the lease, so it does nothing and returns ctx.
+func (s *Service) holdLease(ctx context.Context, id string) (jobCtx context.Context, stop func()) {
 	if s.db == nil || !s.cluster.MultiNode() {
-		return func() {}
+		return ctx, func() {}
 	}
-	lctx, cancel := context.WithCancel(ctx)
+	jctx, cancelJob := context.WithCancelCause(ctx)
+	lctx, cancel := context.WithCancel(jctx)
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		t := time.NewTicker(cluster.WorkLeaseRenew)
+		t := time.NewTicker(leaseRenewEvery)
 		defer t.Stop()
+		lost := time.NewTimer(leaseLostAfter)
+		defer lost.Stop()
 		for {
 			select {
 			case <-lctx.Done():
 				return
+			case <-lost.C:
+				logx.For("memwebhook").Warn("memwebhook: no lease renewal succeeded in time; stopping the job so another node may resume it", "job", id, "after", leaseLostAfter.String())
+				cancelJob(errLeaseLost)
+				return
 			case <-t.C:
-				_, _ = s.cluster.ExecReserved(lctx, `UPDATE memory_webhook_jobs SET lease_until=`+cluster.LeaseUntilSQL(s.db.Dialect)+
-					` WHERE id=? AND status='running' AND owner_instance=?`, id, s.cluster.InstanceID())
+			}
+			n, err := s.cluster.ExecReserved(lctx, `UPDATE memory_webhook_jobs SET lease_until=`+cluster.LeaseUntilSQL(s.db.Dialect)+
+				` WHERE id=? AND status='running' AND owner_instance=?`, id, s.cluster.InstanceID())
+			if lctx.Err() != nil {
+				return
+			}
+			switch {
+			case err == nil && n == 0:
+				logx.For("memwebhook").Warn("memwebhook: the job is no longer this node's; stopping it", "job", id)
+				cancelJob(errLeaseLost)
+				return
+			case err == nil:
+				lost.Reset(leaseLostAfter)
 			}
 		}
 	}()
-	return func() {
+	return jctx, func() {
 		cancel()
 		<-done
+		cancelJob(nil)
 	}
 }

@@ -833,7 +833,7 @@ func TestClusterModeGuard(t *testing.T) {
 	replica := newCluster(t, db1, fastOptions("replica"))
 	// A second replica is fine; a single-node gateway is refused.
 	_ = newCluster(t, db2, fastOptions("replica-2"))
-	if c, err := New(ctx, db2, Options{SingleNode: true}); !errors.Is(err, ErrModeConflict) {
+	if c, err := New(ctx, db2, Options{SingleNode: true, ModeWait: -1}); !errors.Is(err, ErrModeConflict) {
 		if c != nil {
 			_ = c.Close()
 		}
@@ -848,6 +848,7 @@ func TestClusterModeGuardSingleNode(t *testing.T) {
 	ctx := context.Background()
 	solo := newCluster(t, db1, Options{SingleNode: true})
 	for name, opts := range map[string]Options{"another single node": {SingleNode: true}, "a replica": fastOptions("replica")} {
+		opts.ModeWait = 300 * time.Millisecond
 		if c, err := New(ctx, db2, opts); !errors.Is(err, ErrModeConflict) {
 			if c != nil {
 				_ = c.Close()
@@ -858,11 +859,105 @@ func TestClusterModeGuardSingleNode(t *testing.T) {
 	// Once it stops, a replica may start.
 	_ = solo.Close()
 	waitFor(t, 10*time.Second, "the mode lock to be free", func() bool {
-		c, err := New(ctx, db2, fastOptions("replica"))
+		o := fastOptions("replica")
+		o.ModeWait = -1
+		c, err := New(ctx, db2, o)
 		if err != nil {
 			return false
 		}
 		_ = c.Close()
 		return true
 	})
+}
+
+// A short overlap (the old single-node gateway still stopping) does not
+// stop a replica's start: New waits for the mode lock.
+func TestClusterModeWaitOutlastsShortOverlap(t *testing.T) {
+	db1, db2 := storetest.OpenPostgresPair(t)
+	solo := newCluster(t, db1, Options{SingleNode: true})
+	go func() {
+		time.Sleep(500 * time.Millisecond)
+		_ = solo.Close()
+	}()
+	o := fastOptions("replica")
+	o.ModeWait = 15 * time.Second
+	start := time.Now()
+	c, err := New(context.Background(), db2, o)
+	if err != nil {
+		t.Fatalf("New during a short overlap: %v", err)
+	}
+	defer c.Close()
+	if took := time.Since(start); took < 400*time.Millisecond {
+		t.Fatalf("New took the mode lock after %v, while the single node still held it", took)
+	}
+}
+
+// A replica that loses its mode connection while a single-node gateway
+// takes the database stops: ModeConflict closes.
+func TestClusterModeConflictAfterReconnect(t *testing.T) {
+	db1, db2 := storetest.OpenPostgresPair(t)
+	ctx := context.Background()
+	replica := newCluster(t, db1, fastOptions("replica"))
+	select {
+	case <-replica.ModeConflict():
+		t.Fatal("ModeConflict closed before any conflict")
+	default:
+	}
+	// Pin one connection of the second pool to stand in for a single-node
+	// gateway (it takes the mode lock exclusively).
+	solo, err := db2.Conn(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer solo.Close()
+	replica.mode.mu.Lock()
+	pid := replica.mode.conn.PgConn().PID()
+	replica.mode.mu.Unlock()
+	if _, err := solo.ExecContext(ctx, `SELECT pg_terminate_backend(?)`, int64(pid)); err != nil {
+		t.Fatal(err)
+	}
+	// The replica checks its mode connection once a second at most, so the
+	// stand-in takes the lock first.
+	waitFor(t, 5*time.Second, "the stand-in to take the mode lock", func() bool {
+		var got bool
+		return solo.QueryRowContext(ctx, `SELECT pg_try_advisory_lock(?)`, modeKey).Scan(&got) == nil && got
+	})
+	defer func() { _, _ = solo.ExecContext(ctx, `SELECT pg_advisory_unlock(?)`, modeKey) }()
+	select {
+	case <-replica.ModeConflict():
+	case <-time.After(10 * time.Second):
+		t.Fatal("ModeConflict did not close after a single-node gateway took the database")
+	}
+	var nilCluster *Cluster
+	if nilCluster.ModeConflict() != nil {
+		t.Fatal("a nil Cluster's ModeConflict is not nil")
+	}
+}
+
+// BeginUnit counts a leader unit until it ends, so the shutdown waits for
+// it (WaitUnits) and names what still runs at its deadline.
+func TestClusterUnitsWait(t *testing.T) {
+	unit, end := BeginUnit(context.Background(), "memory-webhook job")
+	if unit == nil {
+		t.Fatal("BeginUnit returned no context")
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	left := WaitUnits(ctx)
+	cancel()
+	if len(left) != 1 || left[0] != "memory-webhook job" {
+		t.Fatalf("running at the deadline = %v, want the one unit", left)
+	}
+	done := make(chan []string, 1)
+	go func() { done <- WaitUnits(context.Background()) }()
+	time.Sleep(20 * time.Millisecond)
+	end()
+	select {
+	case left := <-done:
+		if left != nil {
+			t.Fatalf("WaitUnits after the unit ended = %v", left)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("WaitUnits did not return after the unit ended")
+	}
+	end() // a second call is safe
 }

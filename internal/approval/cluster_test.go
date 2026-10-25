@@ -118,6 +118,11 @@ func TestTwoNodeLeaseRollingRestartKeepsClaims(t *testing.T) {
 
 // An in-line Hold on node 1 wakes when node 2 decides.
 func TestTwoNodeHoldWakesOnDecision(t *testing.T) {
+	// A poll far longer than the test's bound: only the cluster message
+	// can wake the hold in time.
+	old := holdPoll
+	holdPoll = 30 * time.Second
+	t.Cleanup(func() { holdPoll = old })
 	bus1, bus2, _ := twoBuses(t)
 	ctx := context.Background()
 	type result struct {
@@ -154,10 +159,9 @@ func TestTwoNodeHoldWakesOnDecision(t *testing.T) {
 		if res.err != nil || res.req == nil || res.req.Status != StatusDenied {
 			t.Fatalf("hold returned %+v %v", res.req, res.err)
 		}
-		// The fallback poll runs every holdPoll from the start of the
-		// hold: a wake-up well inside one poll interval came through the
-		// cluster message.
-		if took := time.Since(decidedAt); took >= holdPoll/2 {
+		// The fallback poll runs every 30 s from the start of the hold: a
+		// wake-up within 5 s came through the cluster message.
+		if took := time.Since(decidedAt); took >= 5*time.Second {
 			t.Fatalf("node 1's hold returned %s after the decision: the cluster wake-up did not arrive, only the poll", took)
 		}
 		t.Logf("node 1's hold returned %s after node 2's decision", res.took)
@@ -337,5 +341,25 @@ func TestClusterInlineDecisionMarksOnlyItsHold(t *testing.T) {
 	}
 	if r2.DecidedInline {
 		t.Fatal("call 2 carries DecidedInline: the gateway would run the call twice")
+	}
+}
+
+// P1-1: once the in-line decision and its claim commit, the deciding Hold
+// returns the request to dispatch even when its context ends right then:
+// it holds the claim, so nobody else would ever run the call.
+func TestInlineDecisionSurvivesCancelAfterCommit(t *testing.T) {
+	bus := newTestBus(t)
+	bus.SetAutoApprover(alwaysAuto{})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	afterInlineCommit = func(string) { cancel() }
+	t.Cleanup(func() { afterInlineCommit = nil })
+	req, err := bus.Hold(ctx, NewRequest{AgentID: "a", UpstreamName: "u", ToolName: "t.cancelled", Arguments: map[string]any{"x": 1}}, 0)
+	if err != nil || req == nil || req.Status != StatusAllowed || !req.DecidedInline || req.ExecutionState != "running" {
+		t.Fatalf("hold cancelled right after the commit: %+v %v", req, err)
+	}
+	cur, err := bus.Get(context.Background(), req.ID)
+	if err != nil || cur.Status != StatusAllowed || cur.ExecutionState != "running" {
+		t.Fatalf("stored request = %+v %v, want allowed under a running claim", cur, err)
 	}
 }

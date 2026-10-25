@@ -121,16 +121,11 @@ func registerRealtimeTypes(hub *realtime.Hub) {
 // (or while no leader ran) gets that long to renew before its work could
 // read as abandoned.
 //
-// Nothing runs before ready closes: startup closes it where a single node
-// runs its startup recovery, once the upstream servers (the tool list a
-// re-run legacy execution needs) and the Inbox hooks are loaded.
-func runWorkRecovery(ctx context.Context, c *cluster.Cluster, ready <-chan struct{}, ping func(context.Context) error, inboxSvc *inbox.Service, bus *approval.Bus, codeRuns *coderuns.Service) {
+// Startup starts its leader loop where a single node runs its startup
+// recovery, once the upstream servers (the tool list a re-run legacy
+// execution needs) and the Inbox hooks are loaded.
+func runWorkRecovery(ctx context.Context, c *cluster.Cluster, ping func(context.Context) error, inboxSvc *inbox.Service, bus *approval.Bus, codeRuns *coderuns.Service) {
 	if !c.MultiNode() {
-		return
-	}
-	select {
-	case <-ready:
-	case <-ctx.Done():
 		return
 	}
 	resumeAt := time.Now().Add(cluster.WorkLease)

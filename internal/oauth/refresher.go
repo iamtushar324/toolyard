@@ -150,11 +150,11 @@ func (s *Service) refreshTick(ctx context.Context) {
 	rows.Close()
 
 	now := time.Now()
-	// Each refresh is one unit that runs to its end on unit (see
-	// cluster.UnitContext): a rotating refresh token spent at the provider
+	// Each refresh is one unit that runs to its end on its unit context
+	// (see cluster.BeginUnit): a rotating refresh token spent at the provider
 	// must be stored, or the next refresh gets invalid_grant. Losing the
-	// leader lease (ctx) only stops the next refresh from starting.
-	unit := cluster.UnitContext(ctx)
+	// leader lease (ctx) only stops the next refresh from starting, and the
+	// gateway's shutdown waits for the refresh (cluster.BeginUnit).
 	for _, c := range cs {
 		if ctx.Err() != nil {
 			return
@@ -169,9 +169,13 @@ func (s *Service) refreshTick(ctx context.Context) {
 			continue
 		}
 		s.recordAttempt(c.upstream, now)
-		if _, err := s.Refresh(unit, c.upstream); err != nil {
+		unit, endUnit := cluster.BeginUnit(ctx, "oauth refresh")
+		// A superseded write means the row changed while the provider
+		// was answering (a reconnect, a disconnect): nothing failed.
+		if _, err := s.Refresh(unit, c.upstream); err != nil && !errors.Is(err, ErrSuperseded) {
 			s.handleRefreshFailure(unit, c.upstream, c.failures+1, err)
 		}
+		endUnit()
 	}
 	s.refreshUserTokens(ctx, now)
 }
@@ -244,11 +248,12 @@ func (s *Service) refreshUserTokens(ctx context.Context, now time.Time) {
 		s.recordAttempt(key, now)
 		// A superseded write means the row changed while the provider was
 		// answering (a reconnect or disconnect): nothing failed. The
-		// refresh runs to its end (cluster.UnitContext), as above.
-		unit := cluster.UnitContext(ctx)
+		// refresh runs to its end (cluster.BeginUnit), as above.
+		unit, endUnit := cluster.BeginUnit(ctx, "oauth user refresh")
 		if _, err := s.RefreshUser(unit, c.upstream, c.user); err != nil && !errors.Is(err, ErrSuperseded) {
 			s.handleUserRefreshFailure(unit, c.upstream, c.user, c.failures+1, err)
 		}
+		endUnit()
 	}
 }
 

@@ -68,6 +68,12 @@ const (
 	// DefaultResyncInterval is how often subscribers get a Resync call on
 	// Postgres.
 	DefaultResyncInterval = 30 * time.Second
+	// DefaultModeWait is how long New waits for a gateway with the other
+	// -cluster setting to leave the database (a short overlap during an
+	// update) before it returns ErrModeConflict.
+	DefaultModeWait = 60 * time.Second
+	// modeRetry is how often New tries the mode lock again while it waits.
+	modeRetry = 2 * time.Second
 
 	// channel is the one LISTEN/NOTIFY channel every node uses.
 	channel = "toolyard_cluster"
@@ -125,6 +131,10 @@ type Options struct {
 	// Postgres. 0 means DefaultResyncInterval; < 0 turns it off. A single
 	// node never resyncs: in-process delivery cannot miss a message.
 	ResyncInterval time.Duration
+	// ModeWait is how long New tries the mode lock again while another
+	// gateway holds it with the other -cluster setting. 0 means
+	// DefaultModeWait; < 0 means no retry (New fails at once).
+	ModeWait time.Duration
 	// Logger receives the cluster's log lines; nil means logx.For("cluster").
 	Logger *slog.Logger
 }
@@ -160,6 +170,10 @@ type Cluster struct {
 	// mode holds the mode lock (modeKey) on Postgres, single-node or not.
 	mode     slot
 	modeHeld bool // guarded by mode.mu
+	// conflict closes when a gateway with the other -cluster setting took
+	// the mode lock after this node lost it (ModeConflict).
+	conflict     chan struct{}
+	conflictOnce sync.Once
 
 	// Messages (messages.go).
 	subMu     sync.RWMutex
@@ -231,6 +245,7 @@ func New(ctx context.Context, db *store.DB, opts Options) (*Cluster, error) {
 		subs:      map[string]map[uint64]func(string){},
 		queue:     make(chan delivery, queueSize),
 		dropTopic: map[string]bool{},
+		conflict:  make(chan struct{}),
 	}
 	c.leases.onDrop = func() {
 		if len(c.held) > 0 && c.ctx.Err() == nil {
@@ -247,10 +262,7 @@ func New(ctx context.Context, db *store.DB, opts Options) (*Cluster, error) {
 	c.mode.onDrop = func() { c.modeHeld = false }
 	if db != nil && db.Dialect.IsPostgres() {
 		// State this gateway's mode before anything else runs.
-		c.mode.mu.Lock()
-		err := c.takeModeLocked()
-		c.mode.mu.Unlock()
-		if err != nil {
+		if err := c.takeModeAtStart(ctx); err != nil {
 			cancel()
 			c.mode.mu.Lock()
 			if c.mode.conn != nil {
@@ -437,8 +449,98 @@ func (c *Cluster) takeModeLocked() error {
 	return nil
 }
 
+// takeModeAtStart takes the mode lock for New. While a gateway with the
+// other setting holds it, it tries again every modeRetry for up to
+// Options.ModeWait, so a short overlap during an update does not stop the
+// start; then it logs who holds the lock and returns ErrModeConflict.
+// Other errors (the database is down) return at once.
+func (c *Cluster) takeModeAtStart(ctx context.Context) error {
+	wait := c.opts.ModeWait
+	if wait == 0 {
+		wait = DefaultModeWait
+	}
+	deadline := time.Now().Add(wait)
+	warned := false
+	for {
+		c.mode.mu.Lock()
+		err := c.takeModeLocked()
+		var holders []string
+		if errors.Is(err, ErrModeConflict) {
+			holders = c.modeHoldersLocked()
+		}
+		c.mode.mu.Unlock()
+		if !errors.Is(err, ErrModeConflict) {
+			return err
+		}
+		if wait < 0 || !time.Now().Before(deadline) {
+			c.log.Error("cluster: another gateway holds this database with the other -cluster setting", "holders", holders, "waited", max(wait, 0).String())
+			return err
+		}
+		if !warned {
+			warned = true
+			c.log.Warn("cluster: another gateway holds this database with the other -cluster setting; waiting for it to stop", "holders", holders, "wait", wait.String())
+		}
+		t := time.NewTimer(min(modeRetry, time.Until(deadline)))
+		select {
+		case <-ctx.Done():
+			t.Stop()
+			return err
+		case <-t.C:
+		}
+	}
+}
+
+// modeHoldersLocked names the other sessions that hold the mode lock (their
+// application_name and lock mode), for the conflict log line. c.mode.mu is
+// held. It returns nil when the query fails.
+func (c *Cluster) modeHoldersLocked() []string {
+	if c.mode.conn == nil {
+		return nil
+	}
+	qctx, cancel := context.WithTimeout(c.ctx, queryTimeout)
+	defer cancel()
+	// A bigint advisory key is stored as classid (high 32 bits), objid (low
+	// 32 bits), objsubid 1.
+	rows, err := c.mode.conn.Query(qctx, `SELECT COALESCE(a.application_name, ''), l.mode
+FROM pg_locks l JOIN pg_stat_activity a ON a.pid = l.pid
+WHERE l.locktype = 'advisory' AND l.granted AND l.pid <> pg_backend_pid()
+  AND l.database = (SELECT oid FROM pg_database WHERE datname = current_database())
+  AND l.classid::bigint = $1 AND l.objid::bigint = $2 AND l.objsubid = 1`,
+		int64(uint32(uint64(modeKey)>>32)), int64(uint32(uint64(modeKey))))
+	if err != nil {
+		return nil
+	}
+	defer rows.Close()
+	var out []string
+	for rows.Next() {
+		var app, mode string
+		if rows.Scan(&app, &mode) != nil {
+			return out
+		}
+		if app == "" {
+			app = "(no application_name)"
+		}
+		out = append(out, app+" ("+mode+")")
+	}
+	return out
+}
+
+// ModeConflict closes when this node lost its mode lock (its connection
+// failed) and a gateway with the other -cluster setting took the lock
+// before this node could take it again. The process must stop: the guard
+// no longer holds. A nil Cluster returns nil (never ready).
+func (c *Cluster) ModeConflict() <-chan struct{} {
+	if c == nil {
+		return nil
+	}
+	return c.conflict
+}
+
 // keepMode checks the mode connection and takes the mode lock again after
-// the connection failed, so the guard holds for the process's life.
+// the connection failed, so the guard holds for the process's life. When a
+// gateway with the other setting took the lock in between, it closes the
+// ModeConflict channel and stops; a database that is down stays a warning
+// and is retried.
 func (c *Cluster) keepMode() {
 	defer c.wg.Done()
 	t := time.NewTicker(max(c.opts.CheckInterval, time.Second))
@@ -460,9 +562,17 @@ func (c *Cluster) keepMode() {
 			}
 		}
 		if !c.modeHeld && c.ctx.Err() == nil {
-			if err := c.takeModeLocked(); err != nil {
-				lg.warn(c.log, "cluster: cannot take the mode lock again; another gateway with the other -cluster setting may use this database", err)
-			} else if lg.reset() {
+			err := c.takeModeLocked()
+			switch {
+			case errors.Is(err, ErrModeConflict):
+				holders := c.modeHoldersLocked()
+				c.mode.mu.Unlock()
+				c.log.Error("cluster: a gateway with the other -cluster setting took this database while this node was disconnected; stopping", "holders", holders)
+				c.conflictOnce.Do(func() { close(c.conflict) })
+				return
+			case err != nil:
+				lg.warn(c.log, "cluster: cannot take the mode lock again; retrying", err)
+			case lg.reset():
 				c.log.Info("cluster: mode lock taken again")
 			}
 		}

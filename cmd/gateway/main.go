@@ -932,13 +932,6 @@ func runServe(argv []string) error {
 	leaderLoop(ctx, clusterSvc, loopSessionPurger, time.Hour, func(ctx context.Context) { runSessionPurger(ctx, idSvc, codeRuns) })
 	// Every replica renews the leases of the code runs it runs.
 	goroutines.Loop(ctx, coderuns.LeaseRenewalLoop, time.Minute, codeRuns.RunLeaseRenewal)
-	// The leader settles the work of replicas that stopped (multi-node
-	// only), once startup has loaded what recovery needs (recoveryReady).
-	recoveryReady := make(chan struct{})
-	leaderLoop(ctx, clusterSvc, loopWorkRecovery, time.Minute, func(ctx context.Context) {
-		runWorkRecovery(ctx, clusterSvc, recoveryReady, db.PingContext, inboxSvc, bus, codeRuns)
-	})
-
 	upstreamSvc := upstreams.New(db, gw)
 	// Servers saved on another replica are connected here too.
 	upstreamSvc.SetCluster(ctx, clusterSvc)
@@ -1102,7 +1095,13 @@ func runServe(argv []string) error {
 			log.Printf("legacy execution: recovered %d unclaimed decisions", n)
 		}
 	}
-	close(recoveryReady)
+	// The leader settles the work of replicas that stopped (multi-node
+	// only). It starts here, once startup has loaded what recovery needs
+	// (the upstream servers and the Inbox hooks), so this replica takes no
+	// recovery lease before it could use it.
+	leaderLoop(ctx, clusterSvc, loopWorkRecovery, time.Minute, func(ctx context.Context) {
+		runWorkRecovery(ctx, clusterSvc, db.PingContext, inboxSvc, bus, codeRuns)
+	})
 
 	// MemPalace: install (if needed), initialize palace dir, and register
 	// the built-in stdio upstream so its 29 tools surface as `mempalace.*`.
@@ -1620,11 +1619,18 @@ func runServe(argv []string) error {
 		}()
 	}
 
+	var exitErr error
 	select {
 	case <-stop:
 		rootLog.Info("shutdown signal received")
 	case <-ctx.Done():
 		rootLog.Warn("root context ended; shutting down")
+	case <-clusterSvc.ModeConflict():
+		// The mode guard no longer holds: a gateway with the other
+		// -cluster setting took the database while this one was
+		// disconnected. Drain and exit 78 (a configuration error).
+		rootLog.Error("a gateway with the other -cluster setting uses this database; shutting down")
+		exitErr = fmt.Errorf("%w (%w)", cluster.ErrModeConflict, keyguard.ErrConfig)
 	}
 	// TEC-1626 drain: one ordered shutdown (lifecycle.go). Executors run on
 	// the bus's own context, so nothing in flight is cancelled before the
@@ -1656,6 +1662,14 @@ func runServe(argv []string) error {
 			func(ctx context.Context) { bus.WaitExecutions(ctx, shutdownGrace) },
 			func(ctx context.Context) { waitGrantedCalls(ctx, gw, inboxSvc, shutdownGrace) },
 			codeRuns.Wait,
+			// Leader units (a memory-webhook job, an OAuth refresh)
+			// run on the root context: let them end before step 7
+			// cancels it.
+			func(ctx context.Context) {
+				if left := cluster.WaitUnits(ctx); len(left) > 0 {
+					logx.For("shutdown").Warn("shutdown: leader work still running at the drain deadline; it stops with the root context", "running", left)
+				}
+			},
 		},
 		cancelRoot: cancel,
 		closers: []shutdownCloser{
@@ -1668,7 +1682,7 @@ func runServe(argv []string) error {
 			{name: "database", close: closeDB},
 		},
 	}).run()
-	return nil
+	return exitErr
 }
 
 // ---- exchange ---------------------------------------------------------------

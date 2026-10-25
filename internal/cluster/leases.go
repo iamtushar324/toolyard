@@ -5,6 +5,7 @@ import (
 	"hash/fnv"
 	"time"
 
+	"github.com/tusharbhardwaj/toolyard/internal/goroutines"
 	"github.com/tusharbhardwaj/toolyard/internal/logx"
 )
 
@@ -142,6 +143,24 @@ func UnitContext(lctx context.Context) context.Context {
 	}
 	return lctx
 }
+
+// units counts the leader units running in this process (BeginUnit), so
+// a shutdown can wait for them (WaitUnits) before it ends the context
+// they run on.
+var units goroutines.Tracker
+
+// BeginUnit starts one unit of work of a leader task: it returns
+// UnitContext(lctx) and the func that ends the unit (call it once the unit
+// is done; more calls are safe). Until then the unit is counted, so the
+// gateway's shutdown waits for it (WaitUnits) before it ends the root
+// context the unit runs on.
+func BeginUnit(lctx context.Context, label string) (context.Context, func()) {
+	return UnitContext(lctx), units.Add(label)
+}
+
+// WaitUnits blocks until no unit started with BeginUnit runs, or ctx ends.
+// It returns the labels of the units still running when ctx ended, or nil.
+func WaitUnits(ctx context.Context) []string { return units.Wait(ctx) }
 
 // releaseLease gives up one leader lease. A lease lost with its connection
 // is already gone: nothing is sent then.

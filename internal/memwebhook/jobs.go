@@ -256,15 +256,17 @@ func (s *Service) processOnce(ctx context.Context) (bool, error) {
 	// The claimed job is one unit: it runs to its end even when the
 	// worker loses its leader lease or hands it over at a drain (ctx ends
 	// then); only the next job does not start (cluster.UnitContext). Its
-	// own lease keeps another node's recovery away meanwhile.
-	unit := cluster.UnitContext(ctx)
+	// own lease keeps another node's recovery away meanwhile, and the
+	// gateway's shutdown waits for it (cluster.BeginUnit).
+	unit, endUnit := cluster.BeginUnit(ctx, "memory-webhook job")
+	defer endUnit()
 	w, err := s.loadJobWork(unit, id)
 	if err != nil {
 		return true, err
 	}
-	stop := s.holdLease(unit, id)
+	jobCtx, stop := s.holdLease(unit, id)
 	defer stop()
-	s.runJob(unit, w)
+	s.runJob(jobCtx, w)
 	return true, nil
 }
 
@@ -338,12 +340,11 @@ func (s *Service) runJob(ctx context.Context, w *jobWork) {
 	}
 	// The terminal transition is the guard against double-counting on the rare
 	// crash-then-recover-then-finalize path: only the worker that flips
-	// running->succeeded writes the ledger row and bumps the counters.
-	if !s.markTerminal(ctx, w.ID, jobSucceeded, detail, "", true) {
+	// running->succeeded writes the ledger row and bumps the counters, in the
+	// same transaction (finishJob).
+	if !s.finishJob(ctx, w, jobSucceeded, detail, "", true) {
 		return
 	}
-	s.recordIngestionRow(ctx, w.ID, w.WebhookID, w.WebhookName, w.Wing, w.Source, w.PayloadSize, statusOK, detail, true)
-	s.bumpCounters(ctx, w.WebhookID, true)
 	s.audit2(ctx, "memory_webhook.ingest_ok", w.WebhookName,
 		fmt.Sprintf("wing=%s req=%s bytes=%d", w.Wing, w.ID, w.PayloadSize))
 }
@@ -365,36 +366,55 @@ func (s *Service) failOrRetry(ctx context.Context, w *jobWork, chunkIdx int, det
 			fmt.Sprintf("req=%s attempt=%d %s", w.ID, w.Attempts, detail))
 		return
 	}
-	if !s.markTerminal(ctx, w.ID, jobFailed, detail, detail, false) {
+	if !s.finishJob(ctx, w, jobFailed, detail, detail, false) {
 		return
 	}
-	s.recordIngestionRow(ctx, w.ID, w.WebhookID, w.WebhookName, w.Wing, w.Source, w.PayloadSize, statusFailed, detail, false)
-	s.bumpCounters(ctx, w.WebhookID, false)
 	s.audit2(ctx, "memory_webhook.ingest_failed", w.WebhookName,
 		fmt.Sprintf("req=%s %s", w.ID, detail))
 }
 
-// markTerminal flips a running job to its terminal status (nulling the entry to
-// reclaim space) and reports whether it actually transitioned. The
-// status='running' guard ensures the terminal side effects fire at most once;
+// finishJob flips a running job to its terminal status (nulling the entry
+// to reclaim space) and, in the same transaction, writes its ledger row and
+// bumps the webhook's counters. It reports whether the job transitioned.
+// The status='running' guard makes these side effects fire at most once;
 // the owner_instance guard fences a worker whose job another node recovered
-// (its lease ended) and claimed again.
-func (s *Service) markTerminal(ctx context.Context, id, status, detail, errMsg string, mempalaceOK bool) bool {
+// (its lease ended) and claimed again. One transaction means a reader that
+// sees the job finished also sees its ledger row and counters, and a crash
+// between the steps loses none of them: nothing commits, the job stays
+// running and recovery resumes it.
+func (s *Service) finishJob(ctx context.Context, w *jobWork, status, detail, errMsg string, mempalaceOK bool) bool {
 	if s.db == nil {
 		return true
 	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false
+	}
+	defer func() { _ = tx.Rollback() }()
 	now := time.Now().UnixMilli()
-	res, err := s.db.ExecContext(ctx,
+	res, err := tx.ExecContext(ctx,
 		`UPDATE memory_webhook_jobs
 		 SET status=?, detail=?, error=?, mempalace_ok=?, finished_at=?, entry=NULL, updated_at=?
 		 WHERE id=? AND status=? AND owner_instance=?`,
 		status, nullStr(truncate(detail, maxDetail)), nullStr(truncate(errMsg, maxDetail)),
-		boolToInt(mempalaceOK), now, now, id, jobRunning, s.cluster.InstanceID())
+		boolToInt(mempalaceOK), now, now, w.ID, jobRunning, s.cluster.InstanceID())
 	if err != nil {
 		return false
 	}
-	n, _ := res.RowsAffected()
-	return n == 1
+	if n, _ := res.RowsAffected(); n != 1 {
+		return false
+	}
+	ledger := statusOK
+	if status != jobSucceeded {
+		ledger = statusFailed
+	}
+	if err := insertIngestionRow(ctx, tx, w.ID, w.WebhookID, w.WebhookName, w.Wing, w.Source, w.PayloadSize, ledger, detail, mempalaceOK); err != nil {
+		return false
+	}
+	if err := bumpCountersOn(ctx, tx, w.WebhookID, status == jobSucceeded); err != nil {
+		return false
+	}
+	return tx.Commit() == nil
 }
 
 func (s *Service) requeue(ctx context.Context, id string, attempts int) {
@@ -420,8 +440,8 @@ func (s *Service) setChunkCount(ctx context.Context, id string, n int) {
 		return
 	}
 	_, _ = s.db.ExecContext(ctx,
-		`UPDATE memory_webhook_jobs SET chunk_count=?, updated_at=? WHERE id=? AND owner_instance=?`,
-		n, time.Now().UnixMilli(), id, s.cluster.InstanceID())
+		`UPDATE memory_webhook_jobs SET chunk_count=?, updated_at=? WHERE id=? AND status=? AND owner_instance=?`,
+		n, time.Now().UnixMilli(), id, jobRunning, s.cluster.InstanceID())
 }
 
 func (s *Service) markChunkDone(ctx context.Context, id string, done int) {
@@ -429,8 +449,8 @@ func (s *Service) markChunkDone(ctx context.Context, id string, done int) {
 		return
 	}
 	_, _ = s.db.ExecContext(ctx,
-		`UPDATE memory_webhook_jobs SET chunks_done=?, updated_at=? WHERE id=? AND owner_instance=?`,
-		done, time.Now().UnixMilli(), id, s.cluster.InstanceID())
+		`UPDATE memory_webhook_jobs SET chunks_done=?, updated_at=? WHERE id=? AND status=? AND owner_instance=?`,
+		done, time.Now().UnixMilli(), id, jobRunning, s.cluster.InstanceID())
 }
 
 // recoverRunningJobs requeues jobs left 'running' by a crash/restart so they
