@@ -1,7 +1,7 @@
 // Package callbacks delivers committed Inbox decisions and the other
 // webhook events (events.go): execution outcomes, legacy approval
 // decisions and results, pings, and the events other packages emit with
-// EmitTx. Delivery is at least once; receivers deduplicate the stable event
+// EmitForAgentTx. Delivery is at least once; receivers deduplicate the stable event
 // id before any agent dispatch.
 package callbacks
 
@@ -18,7 +18,6 @@ import (
 	"io"
 	"net"
 	"net/http"
-	"net/netip"
 	"net/url"
 	"sort"
 	"strconv"
@@ -27,6 +26,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/tusharbhardwaj/toolyard/internal/inbox"
+	"github.com/tusharbhardwaj/toolyard/internal/netguard"
 	"github.com/tusharbhardwaj/toolyard/internal/sealbox"
 	"github.com/tusharbhardwaj/toolyard/internal/store"
 )
@@ -505,40 +505,10 @@ func (s *Service) DecisionTx(ctx context.Context, tx *sql.Tx, r *inbox.Request) 
 	return nil
 }
 
-// deniedPrefixes are every special-use range a public receiver must not
-// resolve to (RFC 6890 and its updates): this host, private, shared (CGN),
-// loopback, link-local, documentation, benchmarking, protocol assignments,
-// multicast, reserved and broadcast, and their IPv6 equivalents, including
-// the prefixes that embed an IPv4 address (NAT64, 6to4, Teredo).
-var deniedPrefixes = func() []netip.Prefix {
-	var out []netip.Prefix
-	for _, p := range []string{
-		"0.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8", "169.254.0.0/16", "172.16.0.0/12",
-		"192.0.0.0/24", "192.0.2.0/24", "192.31.196.0/24", "192.52.193.0/24", "192.88.99.0/24", "192.168.0.0/16",
-		"192.175.48.0/24", "198.18.0.0/15", "198.51.100.0/24", "203.0.113.0/24", "224.0.0.0/4", "240.0.0.0/4",
-		"::/128", "::1/128", "::ffff:0:0/96", "::/96", "64:ff9b::/96", "64:ff9b:1::/48", "100::/64",
-		"2001::/23", "2001:db8::/32", "2002::/16", "3fff::/20", "5f00::/16", "fc00::/7", "fe80::/10", "fec0::/10", "ff00::/8",
-	} {
-		out = append(out, netip.MustParsePrefix(p))
-	}
-	return out
-}()
+// privateIP reports whether ip is not a public unicast address
+// (netguard.Public: IPv6 only in 2000::/3, and no special-use range).
+func privateIP(ip net.IP) bool { return !netguard.Public(ip) }
 
-// privateIP reports whether ip is not a public unicast address: an IPv4
-// address mapped into IPv6 is checked as IPv4.
-func privateIP(ip net.IP) bool {
-	a, ok := netip.AddrFromSlice(ip)
-	if !ok {
-		return true
-	}
-	a = a.Unmap()
-	for _, p := range deniedPrefixes {
-		if p.Contains(a) {
-			return true
-		}
-	}
-	return false
-}
 func (s *Service) resolve(ctx context.Context, raw string, allowPrivate bool) ([]net.IPAddr, error) {
 	u, err := url.Parse(raw)
 	if err != nil || u.Scheme != "https" || u.Host == "" || u.User != nil || u.Fragment != "" {

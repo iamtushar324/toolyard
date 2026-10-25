@@ -123,7 +123,7 @@ func acceptsEvent(events []string, eventType string) bool {
 	return false
 }
 
-// eventTypeShape is what EmitTx accepts: lowercase dotted words, such as
+// eventTypeShape is what EmitForAgentTx accepts: lowercase dotted words, such as
 // job.completed.
 var eventTypeShape = regexp.MustCompile(`^[a-z][a-z0-9_]*(\.[a-z][a-z0-9_]*)*$`)
 
@@ -361,7 +361,7 @@ func subjectOf(data any) string {
 
 // CheckRef reports whether ref is an active receiver of the agent
 // (ErrReceiver otherwise). Callers that store a callback_ref for later
-// events (EmitTx) check it when they store it.
+// events (EmitForAgentTx) check it when they store it.
 func (s *Service) CheckRef(ctx context.Context, agentID, ref string) error {
 	r, err := s.Get(ctx, agentID, ref)
 	if err != nil {

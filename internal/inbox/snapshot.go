@@ -19,6 +19,7 @@ import (
 	"time"
 
 	"github.com/tusharbhardwaj/toolyard/internal/blobstore"
+	"github.com/tusharbhardwaj/toolyard/internal/netguard"
 	"github.com/tusharbhardwaj/toolyard/internal/store"
 )
 
@@ -143,31 +144,9 @@ func (s *Snapshotter) newClient() *http.Client {
 	}
 }
 
-// publicIP reports whether ip is a globally routable unicast address.
-func publicIP(ip net.IP) bool {
-	if ip.IsLoopback() || ip.IsPrivate() || ip.IsUnspecified() || ip.IsLinkLocalUnicast() ||
-		ip.IsLinkLocalMulticast() || ip.IsInterfaceLocalMulticast() || ip.IsMulticast() {
-		return false
-	}
-	if v4 := ip.To4(); v4 != nil {
-		switch {
-		case v4[0] == 0, v4[0] >= 240: // "this network", reserved
-			return false
-		case v4[0] == 100 && v4[1]&0xc0 == 64: // 100.64.0.0/10 carrier-grade NAT
-			return false
-		case v4[0] == 192 && v4[1] == 0 && v4[2] == 0: // 192.0.0.0/24
-			return false
-		case v4[0] == 198 && (v4[1] == 18 || v4[1] == 19): // benchmarking
-			return false
-		}
-		return true
-	}
-	// 64:ff9b::/96 NAT64 could map to private v4; treat as non-public.
-	if len(ip) == net.IPv6len && ip[0] == 0x00 && ip[1] == 0x64 && ip[2] == 0xff && ip[3] == 0x9b {
-		return false
-	}
-	return true
-}
+// publicIP reports whether ip is a public unicast address: the same check
+// webhook delivery applies (netguard.Public).
+func publicIP(ip net.IP) bool { return netguard.Public(ip) }
 
 func capFor(kind string) int64 {
 	switch kind {
