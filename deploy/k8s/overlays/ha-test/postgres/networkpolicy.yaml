@@ -1,0 +1,31 @@
+# Postgres accepts connections from the gateway pods and the migration Job
+# only, and opens none itself. The kubelet's exec probes run inside the
+# container, so they are not affected.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: toolyard-postgres
+  labels:
+    app.kubernetes.io/name: postgres
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: postgres
+      app.kubernetes.io/component: database
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: toolyard
+              app.kubernetes.io/component: gateway
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: toolyard-migrate
+              app.kubernetes.io/component: migrate
+      ports:
+        - port: 5432
+          protocol: TCP
+  egress: []

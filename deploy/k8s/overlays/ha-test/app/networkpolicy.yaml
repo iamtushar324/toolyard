@@ -1,0 +1,70 @@
+# Who may reach the gateway pods, and where they may connect.
+#
+# Ingress: the ingress controller's namespace on the HTTP port (the
+# placeholder kube-system is where K3s runs Traefik; the deploy script sets
+# INGRESS_NAMESPACE), and pods of this namespace on both ports.
+#
+# Egress: DNS, this deployment's Postgres, and public addresses only.
+# Private, carrier-grade NAT and link-local ranges are excluded, so the
+# gateway reaches neither other workloads of a shared cluster nor the cloud
+# instance metadata service (169.254.169.254) and its node credentials.
+# Upstream MCP servers on private addresses need their CIDRs allowed: the
+# deploy script's EXTRA_EGRESS_CIDRS input adds one more rule for them.
+# IPv4 only: add an IPv6 block for a dual-stack cluster.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: toolyard-gateway
+  labels:
+    app.kubernetes.io/name: toolyard
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: toolyard
+      app.kubernetes.io/component: gateway
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - port: 8787
+          protocol: TCP
+    - from:
+        - podSelector: {}
+      ports:
+        - port: 8787
+          protocol: TCP
+        - port: 9090
+          protocol: TCP
+  egress:
+    # Cluster DNS, wherever the cluster runs it.
+    - to:
+        - namespaceSelector: {}
+      ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP
+    # This deployment's Postgres.
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: postgres
+              app.kubernetes.io/component: database
+      ports:
+        - port: 5432
+          protocol: TCP
+    # Public addresses (upstream MCP servers, OAuth providers).
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+              - 100.64.0.0/10
+              - 169.254.0.0/16
