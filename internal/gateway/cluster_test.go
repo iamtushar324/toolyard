@@ -93,16 +93,6 @@ func (r *replica) call(t *testing.T, ctx context.Context, tool string, args map[
 	return res
 }
 
-func resultText(res *mcp.CallToolResult) string {
-	var b strings.Builder
-	for _, c := range res.Content {
-		if tc, ok := c.(mcp.TextContent); ok {
-			b.WriteString(tc.Text)
-		}
-	}
-	return b.String()
-}
-
 // Two gateway replicas on one Postgres database: an agent's wait on
 // replica 2 wakes when its owner decides on replica 1, the grant runs once
 // on replica 2 under replica 2's lease, and a deny saved through replica 1

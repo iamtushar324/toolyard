@@ -190,13 +190,23 @@ func (s *Service) dropUserBearer(upstream, userID string) {
 // It reports whether it replaced the cached value (see cacheBearerFromDB).
 func (s *Service) cacheUserBearerFromDB(upstream, userID string) bool {
 	k := userKey(upstream, userID)
-	s.mu.RLock()
-	gen := s.bearerGen[k]
-	s.mu.RUnlock()
-	tok, err := s.GetUserToken(context.Background(), upstream, userID)
-	if err != nil {
-		return false
+	for attempt := 0; attempt < 3; attempt++ {
+		s.mu.RLock()
+		gen := s.bearerGen[k]
+		s.mu.RUnlock()
+		tok, err := s.GetUserToken(context.Background(), upstream, userID)
+		if err != nil {
+			return false
+		}
+		if s.fillUserBearer(k, tok, gen) {
+			return true
+		}
 	}
+	return false
+}
+
+// fillUserBearer is fillBearer for one person's bearer (k is userKey).
+func (s *Service) fillUserBearer(k string, tok *UserTokenRecord, gen uint64) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.bearerGen[k] != gen {

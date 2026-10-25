@@ -338,13 +338,26 @@ func (s *Service) storeBearer(upstream, tok string) {
 // It reports whether it replaced the cached value; a read that failed, or
 // that a newer write or drop overtook (bearerGen), leaves it alone.
 func (s *Service) cacheBearerFromDB(upstream string) bool {
-	s.mu.RLock()
-	gen := s.bearerGen[upstream]
-	s.mu.RUnlock()
-	tok, err := s.GetToken(context.Background(), upstream)
-	if err != nil {
-		return false
+	// A write or drop that lands while the row is read makes the read
+	// stale: read again (a few times at most).
+	for attempt := 0; attempt < 3; attempt++ {
+		s.mu.RLock()
+		gen := s.bearerGen[upstream]
+		s.mu.RUnlock()
+		tok, err := s.GetToken(context.Background(), upstream)
+		if err != nil {
+			return false
+		}
+		if s.fillBearer(upstream, tok, gen) {
+			return true
+		}
 	}
+	return false
+}
+
+// fillBearer caches the token read from the database at generation gen,
+// unless a newer write or drop overtook the read. s.mu is taken.
+func (s *Service) fillBearer(upstream string, tok *TokenRecord, gen uint64) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.bearerGen[upstream] != gen {
