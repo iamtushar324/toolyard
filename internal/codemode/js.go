@@ -32,11 +32,15 @@ import (
 // and is fast enough for scripts that mostly wait on tools.
 //
 // The limits are the worker's: the wall clock (wazero ends the module when
-// the run's context ends, checked in loops and calls), the memory cap
-// (QuickJS's own heap limit, half the worker's cap, below the WebAssembly
-// memory limit, so running out is a catchable "out of memory" error;
-// see jsmem_unix.go for where that memory lives), the output caps and the
-// call limit (the parent's).
+// the run's context ends, checked in loops and calls), the memory cap, the
+// output caps and the call limit (the parent's). The memory cap
+// (RLIMIT_DATA) covers the Go heap and the WebAssembly memory alike, and
+// the WebAssembly memory is not Go heap (jsmem_unix.go), so the worker
+// splits it (jsBudget): QuickJS's own heap limit, below the WebAssembly
+// memory limit so running out is a catchable "out of memory" error; and
+// a Go memory limit for the rest, which keeps the Go heap (wazero's
+// interpreted module, the answers on their way in) from taking the
+// WebAssembly memory's share.
 //
 // js_prelude.js, run by qjs with -e, does the rest in JavaScript: the
 // tools object, console, the call pump, and reporting the outcome. This
@@ -58,7 +62,10 @@ var jsPrelude string
 const (
 	// jsHeadroomMiB is WebAssembly memory past QuickJS's heap limit: the
 	// module's data and 2 MiB C stack, and the allocator's slack.
-	jsHeadroomMiB = 32
+	jsHeadroomMiB = 24
+	// jsSlackMiB is the part of the worker's cap neither the Go limit nor
+	// the WebAssembly memory claims: the runtime's own mappings.
+	jsSlackMiB = 8
 	// jsMinHeapMiB is the smallest heap a script gets.
 	jsMinHeapMiB = 16
 	// jsStackSize is QuickJS's stack limit; the module's C stack is 2 MiB,
@@ -108,6 +115,17 @@ type jsReply struct {
 	ApprovalID string          `json:"approvalId,omitempty"`
 }
 
+// jsBudget splits a worker's memory cap of mib MiB: QuickJS's heap limit,
+// the WebAssembly memory limit (the heap and jsHeadroomMiB), and the Go
+// memory limit (the rest, less jsSlackMiB). With the 256 MiB default:
+// 88, 112 and 136 MiB.
+func jsBudget(mib int) (heapMiB, wasmMiB, goMiB int) {
+	heapMiB = max(mib*11/32, jsMinHeapMiB)
+	wasmMiB = heapMiB + jsHeadroomMiB
+	goMiB = max(mib-wasmMiB-jsSlackMiB, 32)
+	return heapMiB, wasmMiB, goMiB
+}
+
 // runJS executes JavaScript code under the limits; stopNote names the
 // deadline reported when ctx ends the run.
 func runJS(ctx context.Context, start startMsg, s sink, stopNote string) scriptResult {
@@ -118,7 +136,7 @@ func runJS(ctx context.Context, start startMsg, s sink, stopNote string) scriptR
 	if mib <= 0 {
 		mib = 256
 	}
-	heapMiB := max(mib/2, jsMinHeapMiB)
+	heapMiB, wasmMiB, _ := jsBudget(mib)
 	maxParallel := start.MaxParallel
 	if maxParallel <= 0 || maxParallel > maxParallelCalls {
 		maxParallel = maxParallelCalls
@@ -138,7 +156,7 @@ func runJS(ctx context.Context, start startMsg, s sink, stopNote string) scriptR
 	rctx := withJSMemory(ctx)
 	cfg := wazero.NewRuntimeConfigInterpreter().
 		WithCloseOnContextDone(true).
-		WithMemoryLimitPages(uint32((heapMiB + jsHeadroomMiB) * 16)) // 64 KiB pages
+		WithMemoryLimitPages(uint32(wasmMiB * 16)) // 64 KiB pages
 	r := wazero.NewRuntimeWithConfig(rctx, cfg)
 	defer r.Close(context.Background())
 	if _, err := wasi_snapshot_preview1.Instantiate(rctx, r); err != nil {
@@ -233,18 +251,39 @@ func (h *jsHost) call(m jsMsg) {
 // rest of the line, instead of receiving it as a string to parse again.
 func (h *jsHost) reply(jsID int, r parentMsg) {
 	rep := jsReply{ID: jsID, OK: r.Error == "", Status: r.Status, Error: r.Error, ApprovalID: r.ApprovalID}
+	var value []byte
 	switch {
 	case len(r.JSON) > 0:
-		rep.JSON = r.JSON
+		value = r.JSON
 	case r.Error == "" && r.Text != "":
 		var buf bytes.Buffer
+		buf.Grow(len(r.Text) + 64)
 		if json.Compact(&buf, []byte(r.Text)) == nil {
-			rep.JSON = buf.Bytes()
+			value = buf.Bytes()
 		} else {
 			rep.Text = r.Text
 		}
 	default:
 		rep.Text = r.Text
+	}
+	if value != nil {
+		// The value is valid, compact JSON already: splice it in rather
+		// than have json.Marshal check and copy it again (it can be 6 MiB,
+		// and the worker's Go heap is what the WebAssembly memory shares
+		// its cap with).
+		head, err := json.Marshal(rep)
+		if err == nil {
+			line := make([]byte, 0, len(head)+len(value)+16)
+			line = append(line, head[:len(head)-1]...)
+			line = append(line, `,"json":`...)
+			line = append(line, value...)
+			line = append(line, "}\n"...)
+			select {
+			case h.in.lines <- line:
+			case <-h.ctx.Done():
+			}
+			return
+		}
 	}
 	b, err := json.Marshal(rep)
 	if err != nil {
@@ -301,7 +340,7 @@ func (h *jsHost) outcome(ctx context.Context, runErr error, stderr, stopNote str
 		switch {
 		case ctx.Err() != nil:
 			res.cause = ErrorTimeout
-		case final.Cause == "limit" || strings.Contains(msg, "out of memory"):
+		case final.Cause == "limit" || strings.Contains(msg, "out of memory") || strings.Contains(msg, "ran out of memory"):
 			res.cause = ErrorLimit
 		}
 		return res

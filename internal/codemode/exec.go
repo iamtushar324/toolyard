@@ -957,7 +957,7 @@ func jsErrorHints(msg string, keys []string) []string {
 }
 
 // deriveReason is the reason nested calls carry when the outer call had
-// none: "code mode: " and the script's first comment line, or its first
+// none: "code mode: " and the script's first comment line (# or //), or its first
 // 120 characters on one line. It varies with the script, so a detector
 // watching for one reason repeated does not fire on code mode, and it is
 // padded past the gateway's minimum length when the script is tiny.
@@ -968,9 +968,10 @@ func deriveReason(code string) string {
 		t := strings.TrimSpace(line)
 		switch {
 		case t == "":
-		case strings.HasPrefix(t, "#"):
+		case strings.HasPrefix(t, "#"), strings.HasPrefix(t, "//"):
+			// A Starlark comment, or a JavaScript one.
 			if snippet == "" {
-				snippet = strings.TrimSpace(strings.TrimLeft(t, "#"))
+				snippet = strings.TrimSpace(strings.TrimLeft(t, "#/"))
 			}
 		default:
 			codeLines = append(codeLines, t)

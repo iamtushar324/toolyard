@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"reflect"
+	"runtime"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -14,6 +15,7 @@ import (
 	"time"
 
 	"github.com/mark3labs/mcp-go/mcp"
+	"github.com/tetratelabs/wazero"
 )
 
 // jsFake is a gateway for the JavaScript tests: a read tool (JSON text),
@@ -477,6 +479,9 @@ func TestParseLanguageAndEcho(t *testing.T) {
 	if id := NewRunID(); !strings.HasPrefix(id, "cm_") || len(id) != 35 {
 		t.Fatalf("NewRunID = %q", id)
 	}
+	if got := deriveReason("// list the open issues for the sync\nconst r = await tools.Linear.list_issues({});"); got != "code mode: list the open issues for the sync" {
+		t.Fatalf("deriveReason for JavaScript = %q", got)
+	}
 }
 
 // TestFifthScriptOfOneAgentWaitsWhileAnotherAgentRuns: with the global
@@ -612,5 +617,39 @@ func TestLimiterQueueIsFair(t *testing.T) {
 	r2()
 	if n := l.inUse(); n != 0 || len(l.queue) != 0 {
 		t.Fatalf("%d in use, %d queued", n, len(l.queue))
+	}
+}
+
+// TestQuickJSFootprint logs what the engine costs a worker: the Go heap
+// wazero's interpreter holds for the compiled QuickJS module, and the
+// time to compile it, which every JavaScript run pays once. jsBudget's Go
+// share must stay well above the heap.
+func TestQuickJSFootprint(t *testing.T) {
+	runtime.GC()
+	var before, after runtime.MemStats
+	runtime.ReadMemStats(&before)
+	ctx := context.Background()
+	start := time.Now()
+	r := wazero.NewRuntimeWithConfig(ctx, wazero.NewRuntimeConfigInterpreter())
+	defer r.Close(ctx)
+	compiled, err := r.CompileModule(ctx, quickJSWasm)
+	if err != nil {
+		t.Fatal(err)
+	}
+	took := time.Since(start)
+	runtime.GC()
+	runtime.ReadMemStats(&after)
+	heap := int64(after.HeapAlloc) - int64(before.HeapAlloc)
+	_, _, goMiB := jsBudget(256)
+	t.Logf("compiling QuickJS took %s and holds %d MiB of Go heap (the Go share at the 256 MiB cap is %d MiB)", took, heap>>20, goMiB)
+	runtime.KeepAlive(compiled)
+	if heap>>20 > int64(goMiB)/2 {
+		t.Errorf("the compiled module holds %d MiB, more than half the Go share (%d MiB): revisit jsBudget", heap>>20, goMiB)
+	}
+	for _, mib := range []int{64, 256, 1024} {
+		h, w, g := jsBudget(mib)
+		if h >= w || w+g+jsSlackMiB > max(mib, w+32+jsSlackMiB) {
+			t.Errorf("jsBudget(%d) = %d, %d, %d", mib, h, w, g)
+		}
 	}
 }

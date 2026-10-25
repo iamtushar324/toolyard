@@ -342,6 +342,10 @@
       const stack = typeof e.stack === "string" ? e.stack.replace(/\s+$/, "") : "";
       return stack ? head + "\n" + stack : head;
     }
+    if (e === null || e === undefined) {
+      // What QuickJS throws when it runs out of memory building the error.
+      return "Uncaught " + String(e) + " (when the script did not throw it, the JavaScript engine ran out of memory)";
+    }
     try {
       return "Uncaught " + JSON.stringify(e);
     } catch (x) {
