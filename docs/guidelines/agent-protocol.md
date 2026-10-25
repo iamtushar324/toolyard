@@ -368,6 +368,11 @@ lowered, and returns a warning with `path: "urgency"`.
 - `inbox.status({ "ids": [...] })` never blocks.
 - `inbox.wait({ "ids": [...], "mode": "any" | "all", "timeout_seconds": ≤300 })`
   blocks. Don't poll in a tight loop.
+- A tool your owner made async answers with a `job_id` instead of its
+  result, granted calls included. Read it with `jobs.wait` (blocks up to
+  60 s), `jobs.status` or `jobs.result`, and never call the tool again for
+  the same work. `_callback_ref` asks for a `job.completed` / `job.failed`
+  callback. See `docs/guidelines/async-tools.md`.
 
 A decision looks like this:
 

@@ -460,6 +460,24 @@ Toward upstreams, `-upstream-protocol` chooses the version:
   wants a session, the call it turns away probes again and is retried
   once. stdio and `per_user` upstreams stay on 2025-11-25.
 
+### Async tools
+
+An admin can mark a server, or single tools of it, async (Edit server →
+*Async tool calls*, or `PUT /v1/servers/{name}/async`): a call then
+answers with a job id at once (`always`), or after a wait (`after`,
+`after_ms`), and keeps running in toolyard. Agents read it with the
+`jobs.*` tools, MCP Tasks or `/v1/jobs`, or get a `job.completed` /
+`job.failed` callback (docs/guidelines/async-tools.md).
+
+- `-async-job-timeout` (default `1h`) is one job's run time limit; it
+  replaces `-upstream-call-timeout` for that call.
+- Results over 256 KiB go to the blob store: files under
+  `<data>/job-results` on SQLite, chunks in the database on Postgres.
+  Finished jobs are kept 7 days.
+- Several replicas on one Postgres database share the jobs: each job has a
+  lease its replica renews, and a replica that stops leaves its running
+  jobs `outcome_unknown` (never re-run) once the lease ends (60 s).
+
 ## Inbox and permissions
 
 Settings → **Inbox & permissions**:

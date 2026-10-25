@@ -120,7 +120,8 @@ func operatorScopeFor(method, path string) (scope string, ok bool) {
 	// Code mode over REST runs as an agent, and session tokens belong to
 	// an agent: a person's operator token reaches neither.
 	if operatorNeverPaths[path] || strings.Contains(path, "/reveal") || strings.HasPrefix(path, connectLinkPath) || strings.HasPrefix(path, uploadsPathPrefix) ||
-		strings.HasPrefix(path, codePathPrefix) || strings.HasPrefix(path, sessionTokensPrefix) {
+		strings.HasPrefix(path, codePathPrefix) || strings.HasPrefix(path, sessionTokensPrefix) ||
+		path == jobsPath || strings.HasPrefix(path, jobsPrefix) {
 		return "", false
 	}
 	switch method {
@@ -490,6 +491,8 @@ var operatorCatalog = []operatorCatalogEntry{
 	{"/v1/code/search", "GET", "agent: tools.search over the caller's tools ?q=, mode=keyword|regex, detail=name|summary|full, limit, upstream (never via operator token)"},
 	{"/v1/code/openapi.json", "GET", "code mode over REST as OpenAPI 3.1 (no token)"},
 	{"/v1/code/ty", "GET", "the ty command for code mode over REST, Python 3 (no token)"},
+	{"/v1/jobs", "GET POST", "agent: POST starts a tool call as an async job {tool, arguments, reason, callback_ref, wait_seconds} (Idempotency-Key, Prefer: wait=N); GET lists the agent's jobs ?status=&limit=&before= (agent or session token; never via operator token)"},
+	{"/v1/jobs/{id}", "GET POST", "agent: GET a job (Prefer: wait=N); GET /result its tool result; POST /cancel cancels it (never via operator token)"},
 	{"/v1/approvals", "GET", "approval queue"},
 	{"/v1/approvals/{id}", "GET POST", "one approval; POST decides it"},
 	{"/v1/approvals/decide-batch", "POST", "decide many approvals"},
@@ -500,7 +503,7 @@ var operatorCatalog = []operatorCatalogEntry{
 	{"/v1/tools", "GET", "full tool catalog"},
 	{"/v1/tools/run", "POST", "run a tool as the user {tool, arguments}; writes still need approval"},
 	{"/v1/servers", "GET POST", "MCP upstream servers: list, add {name, transport, command, args, url, env, headers, identity, auth_mode: shared|per_user, enabled}"},
-	{"/v1/servers/{id}", "GET PATCH DELETE POST", "one server; PATCH {url, headers, env, identity, auth_mode, enabled}; POST /reconnect, /convert-env, /oauth/*; GET /connections (who signed in to a per_user server)"},
+	{"/v1/servers/{id}", "GET PATCH DELETE POST PUT", "one server; PATCH {url, headers, env, identity, auth_mode, enabled}; POST /reconnect, /convert-env, /oauth/*; GET /connections (who signed in to a per_user server); GET/PUT /async {mode: off|always|after, after_ms, tools: {tool: {mode, after_ms}}} (async tools)"},
 	{"/v1/mcp-oauth/callback", "GET", "OAuth redirect target for upstream servers"},
 	{"/v1/mcp-oauth/paste", "POST", "paste an OAuth code for an upstream server"},
 	{"/v1/mcp-oauth/github-app", "GET", "GitHub App manifest return target; stores only the OAuth client secret"},

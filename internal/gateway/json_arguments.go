@@ -29,6 +29,9 @@ func PreserveToolCallNumbers(next http.Handler) http.Handler {
 			return
 		}
 		r.Body = io.NopCloser(bytes.NewReader(raw))
+		// The bytes ride along so a later layer (MCPTasks) reads them
+		// without buffering the body again.
+		r = r.WithContext(context.WithValue(r.Context(), rawMCPBodyKey{}, raw))
 		var envelope struct {
 			Method string `json:"method"`
 			Params struct {
@@ -44,6 +47,16 @@ func PreserveToolCallNumbers(next http.Handler) http.Handler {
 		next.ServeHTTP(w, r)
 	})
 }
+
+// rawMCPBodyKey carries the /mcp POST body PreserveToolCallNumbers read.
+type rawMCPBodyKey struct{}
+
+// rawMCPBody is the body PreserveToolCallNumbers read, if it ran.
+func rawMCPBody(ctx context.Context) ([]byte, bool) {
+	raw, ok := ctx.Value(rawMCPBodyKey{}).([]byte)
+	return raw, ok
+}
+
 func exactArguments(ctx context.Context, name string, fallback map[string]any) map[string]any {
 	if exact, ok := ctx.Value(exactToolArgumentsKey{}).(exactToolArguments); ok && exact.Name == name {
 		return exact.Args
