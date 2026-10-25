@@ -122,6 +122,10 @@ type Service struct {
 	// lastPublicPause is the rate-limit pause the poller last logged for
 	// the sources without their own token (only the poller uses it).
 	lastPublicPause time.Time
+	// badTokenMu guards badToken, the sealed default token that could not
+	// be opened and was logged (once, not at every check).
+	badTokenMu sync.Mutex
+	badToken   string
 	// reloads queues the sources the cluster asked this node to reload.
 	reloads reloadQueue
 }

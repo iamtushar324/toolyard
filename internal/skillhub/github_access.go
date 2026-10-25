@@ -90,7 +90,13 @@ func (s *Service) defaultToken() string {
 	}
 	tok, err := s.cipher.Open(sealed, defaultTokenAAD())
 	if err != nil {
-		s.log.Warn("skillhub: the default GitHub token cannot be opened (was secrets.key replaced?); sources without a token read anonymously")
+		s.badTokenMu.Lock()
+		first := s.badToken != sealed
+		s.badToken = sealed
+		s.badTokenMu.Unlock()
+		if first {
+			s.log.Warn("skillhub: the default GitHub token cannot be opened (was secrets.key replaced?); sources without a token read anonymously until it is set again")
+		}
 		return ""
 	}
 	return string(tok)
