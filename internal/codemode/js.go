@@ -228,9 +228,25 @@ func (h *jsHost) call(m jsMsg) {
 	}(m.ID)
 }
 
-// reply queues one answer for the prelude.
+// reply queues one answer for the prelude. A successful answer whose text
+// is JSON goes as that JSON value, so the engine parses it once, with the
+// rest of the line, instead of receiving it as a string to parse again.
 func (h *jsHost) reply(jsID int, r parentMsg) {
-	b, err := json.Marshal(jsReply{ID: jsID, OK: r.Error == "", Text: r.Text, JSON: r.JSON, Status: r.Status, Error: r.Error, ApprovalID: r.ApprovalID})
+	rep := jsReply{ID: jsID, OK: r.Error == "", Status: r.Status, Error: r.Error, ApprovalID: r.ApprovalID}
+	switch {
+	case len(r.JSON) > 0:
+		rep.JSON = r.JSON
+	case r.Error == "" && r.Text != "":
+		var buf bytes.Buffer
+		if json.Compact(&buf, []byte(r.Text)) == nil {
+			rep.JSON = buf.Bytes()
+		} else {
+			rep.Text = r.Text
+		}
+	default:
+		rep.Text = r.Text
+	}
+	b, err := json.Marshal(rep)
 	if err != nil {
 		b, _ = json.Marshal(jsReply{ID: jsID, Status: StatusFailed, Error: "the tool's answer could not be passed to the script: " + err.Error()})
 	}

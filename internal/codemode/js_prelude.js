@@ -135,13 +135,17 @@
     return [id, p];
   }
 
+  // decode is a successful answer's value: the host sends JSON answers as
+  // values (json) and anything else as text. Text that still parses (a
+  // replayed answer) is parsed; only a SyntaxError means "not JSON".
   function decode(reply) {
     if (reply.json !== undefined) return reply.json;
     const text = reply.text === undefined ? "" : reply.text;
     try {
       return JSON.parse(text);
     } catch (e) {
-      return text;
+      if (e instanceof SyntaxError) return text;
+      throw e;
     }
   }
 
@@ -172,7 +176,13 @@
         throw new ToolCallError(gone, "failed", id);
       }
       if (isTry) {
-        if (reply.ok) return { ok: true, status: "succeeded", result: decode(reply) };
+        if (reply.ok) {
+          try {
+            return { ok: true, status: "succeeded", result: decode(reply) };
+          } catch (e) {
+            return { ok: false, status: "failed", error: String(e && e.message || e) };
+          }
+        }
         const res = { ok: false, status: reply.status || "failed", error: reply.error };
         if (reply.approvalId) res.approval_id = reply.approvalId;
         return res;

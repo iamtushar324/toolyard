@@ -213,8 +213,8 @@ func (g *Gateway) handleSearchTools() directHandler {
 		req.Mode, _ = args["mode"].(string)
 		req.Detail, _ = args["detail"].(string)
 		req.Upstream, _ = args["upstream"].(string)
-		if v, ok := numericArgument(args["limit"]); ok && int(v) > 0 {
-			req.Limit = int(v)
+		if v, ok := asInt(args["limit"]); ok && v > 0 {
+			req.Limit = v
 		}
 		body, err := g.SearchTools(ctx, req)
 		var se *SearchError
