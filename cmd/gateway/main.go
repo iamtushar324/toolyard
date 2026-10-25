@@ -1415,7 +1415,16 @@ func runServe(argv []string) error {
 			return err == nil && u.Status == identity.StatusActive && u.Role == identity.RoleAdmin
 		}
 		reviews, err := skillhub.NewReviewInbox(skillhub.ReviewOptions{DB: db, Inbox: inboxSvc, Admin: skillHubAdmin,
-			IsAdmin: skillHubIsAdmin, DashboardURL: *publicURL, Audit: auditSvc})
+			IsAdmin: skillHubIsAdmin, DashboardURL: *publicURL, Audit: auditSvc,
+			// A review goes to the owner when the source's creator is no
+			// longer an active admin.
+			FallbackReviewer: func(ctx context.Context) (string, error) {
+				u, err := idSvc.PrimaryUser(ctx)
+				if err != nil {
+					return "", err
+				}
+				return u.ID, nil
+			}})
 		if err != nil {
 			return fmt.Errorf("skills hub reviews: %w", err)
 		}
@@ -1427,6 +1436,11 @@ func runServe(argv []string) error {
 			return fmt.Errorf("skills hub proposals: %w", err)
 		}
 		skillHubProposals = proposals
+		// skillhub (slice C): settle review and proposal questions the Inbox
+		// handler could not (expired, withdrawn, decided while no handler ran).
+		leaderLoop(ctx, clusterSvc, skillhub.InboxSweepLoop, time.Minute, func(ctx context.Context) {
+			skillhub.RunInboxSweeps(ctx, skillhub.InboxSweepInterval, reviews, proposals)
+		})
 	}
 
 	// skillhub (slice D): people's own toolyard GitHub connections (the

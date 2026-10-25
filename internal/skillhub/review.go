@@ -5,7 +5,10 @@ package skillhub
 // live?"), and the answer calls Admin.Activate or Admin.Reject. The Inbox
 // carries the decision natively (inbox system items, internal/inbox
 // system.go); the dashboard's Approve and Reject buttons on the source
-// page decide the same version and close the open item (Settle).
+// page decide the same version and close the open item (Settle). An answer
+// applies only while its version is still the source's pending version, so
+// an outdated question can never roll back a newer live commit. Sweep
+// (review_sweep.go) settles what the Inbox handler could not.
 
 import (
 	"context"
@@ -15,6 +18,7 @@ import (
 	"net/url"
 	"strings"
 	"time"
+	"unicode"
 	"unicode/utf8"
 
 	"github.com/tusharbhardwaj/toolyard/internal/audit"
@@ -40,10 +44,15 @@ type ReviewOptions struct {
 	DB    *store.DB
 	Inbox *inbox.Service
 	Admin Admin
-	// IsAdmin reports whether a user holds the admin role. A decision by
-	// anyone else is refused (the creator may have lost the role since).
-	// nil skips the check.
+	// IsAdmin reports whether a user holds the admin role (and is active).
+	// A decision by anyone else is refused (the creator may have lost the
+	// role since), and a review goes to FallbackReviewer instead of a
+	// creator who is no admin. nil skips both checks.
 	IsAdmin func(ctx context.Context, userID string) bool
+	// FallbackReviewer names who gets a review when the source's creator
+	// can no longer decide it (no longer an admin, or blocked): the owner.
+	// nil, or an error, leaves the review with the creator.
+	FallbackReviewer func(ctx context.Context) (string, error)
 	// DashboardURL is toolyard's public base URL; when set, items link to
 	// the source page (<DashboardURL>/#skills/<source id>).
 	DashboardURL string
@@ -84,25 +93,30 @@ type reviewInput struct {
 	Warnings int    `json:"warnings"`
 }
 
-// PendingVersion puts one review item for v in the Inbox of src's creator.
+// PendingVersion puts one review item for v in the Inbox of src's creator,
+// or of the fallback reviewer when the creator can no longer decide it.
 // An open item for an older staged version of the same source is
-// cancelled first: only the newest commit waits for review. A second call
-// for the same version adds nothing.
+// cancelled first: only the newest commit waits for review.
+//
+// The sync engine calls it again at every check while v waits, so it is
+// idempotent: a version whose question is open (or whose answer is being
+// applied) adds nothing. A version whose earlier question expired, or whose
+// answer could not be applied, gets a new question; a call whose Inbox item
+// could not be created leaves no row, so the next check simply tries again.
 func (ri *ReviewInbox) PendingVersion(ctx context.Context, src Source, v Version) error {
-	if src.CreatedBy == "" {
+	reviewer := ri.reviewer(ctx, src.CreatedBy)
+	if reviewer == "" {
 		return fmt.Errorf("%w: source %s has no creator to review it", ErrInvalid, src.ID)
 	}
 	if v.ID == "" || v.SHA == "" {
 		return fmt.Errorf("%w: the version has no ID or commit", ErrInvalid)
 	}
+	if asked, err := ri.store.openReviewFor(ctx, src.ID, v.ID); err != nil || asked {
+		return err
+	}
 	open, err := ri.store.pendingReviews(ctx, src.ID, "")
 	if err != nil {
 		return err
-	}
-	for _, row := range open {
-		if row.VersionID == v.ID {
-			return nil
-		}
 	}
 	if err := ri.settleRows(ctx, open, "a newer commit is waiting for review"); err != nil {
 		return err
@@ -113,23 +127,43 @@ func (ri *ReviewInbox) PendingVersion(ctx context.Context, src Source, v Version
 	}
 	in, _ := json.Marshal(reviewInput{SHA: v.SHA, FromSHA: diff.FromSHA, Added: len(diff.Added), Changed: len(diff.Changed),
 		Removed: len(diff.Removed), Warnings: len(v.Warnings)})
-	row := &proposalRow{ID: proposalNewID(), Kind: proposalKindReview, Status: proposalPending, UserID: src.CreatedBy,
+	row := &proposalRow{ID: proposalNewID(), Kind: proposalKindReview, Status: proposalPending, UserID: reviewer,
 		SourceID: src.ID, VersionID: v.ID, Input: string(in)}
 	if err := ri.store.insert(ctx, row); err != nil {
 		return err
 	}
+	msg := reviewMessage(src, v, diff, ri.o.DashboardURL)
+	if reviewer != src.CreatedBy {
+		msg = "You get this review because the person who added this source can no longer approve it.\n\n" + msg
+	}
 	item, err := ri.o.Inbox.CreateSystemItem(ctx, inbox.SystemItem{
-		Kind: ReviewItemKind, Ref: row.ID, UserID: src.CreatedBy,
-		Title:     reviewClip("Review skills update: "+src.Slug, inbox.MaxTitle),
-		Summary:   reviewClip(reviewSummary(src, v, diff), inbox.MaxSummary),
-		Message:   reviewMessage(src, v, diff, ri.o.DashboardURL),
+		Kind: ReviewItemKind, Ref: row.ID, UserID: reviewer,
+		Title:     reviewClip(reviewPlain("Review skills update: "+src.Slug), inbox.MaxTitle),
+		Summary:   reviewClip(reviewPlain(reviewSummary(src, v, diff)), inbox.MaxSummary),
+		Message:   msg,
 		Questions: reviewQuestion("Make this version live?", "Approve: make it live", "Reject: keep the current version"),
 	})
 	if err != nil {
-		_, _ = ri.store.move(ctx, row.ID, []string{proposalPending}, proposalFailed, proposalUpdate{Error: reviewClip(err.Error(), 500)})
+		// No row without an item: the next check calls again, and failed
+		// attempts do not pile up.
+		_ = ri.store.remove(ctx, row.ID)
 		return fmt.Errorf("skillhub: review item for %s: %w", src.Slug, err)
 	}
 	return ri.store.setInbox(ctx, row.ID, item.ID)
+}
+
+// reviewer is who decides a source's reviews: its creator while they are an
+// admin, else the fallback reviewer (the owner), else still the creator.
+func (ri *ReviewInbox) reviewer(ctx context.Context, creator string) string {
+	if creator != "" && (ri.o.IsAdmin == nil || ri.o.IsAdmin(ctx, creator)) {
+		return creator
+	}
+	if ri.o.FallbackReviewer != nil {
+		if uid, err := ri.o.FallbackReviewer(ctx); err == nil && uid != "" {
+			return uid
+		}
+	}
+	return creator
 }
 
 // Settle closes the open review items of a source after an admin decided
@@ -181,6 +215,21 @@ func (ri *ReviewInbox) decide(ctx context.Context, r *inbox.Request) (string, er
 	var in reviewInput
 	_ = json.Unmarshal([]byte(row.Input), &in)
 	label := reviewShort(in.SHA)
+	// Only the source's pending version may be decided here: approving an
+	// outdated question must never roll back a newer live commit.
+	src, err := ri.o.Admin.GetSource(ctx, row.SourceID)
+	if errors.Is(err, ErrNotFound) {
+		_, _ = ri.store.move(ctx, row.ID, []string{proposalPending}, proposalCancelled, proposalUpdate{Error: "the source was deleted"})
+		return "", errors.New("the source was deleted")
+	}
+	if err != nil {
+		return "", fmt.Errorf("read the source: %w", err) // the row stays pending; Sweep tries again
+	}
+	if src.PendingVersionID != row.VersionID {
+		why := "version " + label + " no longer waits for review: a newer commit or a change of the source's settings replaced it, and the live version stays"
+		_, _ = ri.store.move(ctx, row.ID, []string{proposalPending}, proposalCancelled, proposalUpdate{Error: why})
+		return "", errors.New(why)
+	}
 	if r.SystemChoice(reviewQuestionID) == reviewApprove {
 		if ok, err := ri.store.move(ctx, row.ID, []string{proposalPending}, proposalApproved, proposalUpdate{DecidedBy: decider}); err != nil || !ok {
 			return "This review was already settled.", err
@@ -315,16 +364,32 @@ func reviewListN(paths []string, max int) string {
 }
 
 // reviewCode is s as a Markdown code span. Skill paths and branch names
-// come from the repository, so a backtick in them cannot end the span.
+// come from the repository, so neither a backtick nor a line break in them
+// can end the span or start a new Markdown line.
 func reviewCode(s string) string {
-	return "`" + strings.ReplaceAll(reviewClip(s, 200), "`", "'") + "`"
+	return "`" + strings.ReplaceAll(reviewClip(reviewPlain(s), 200), "`", "'") + "`"
 }
 
 // reviewMD escapes the Markdown punctuation that could change how plain
-// repository text renders.
+// repository text renders, after reviewPlain.
 func reviewMD(s string) string {
 	r := strings.NewReplacer(`\`, `\\`, "*", `\*`, "_", `\_`, "[", `\[`, "]", `\]`, "`", `\`+"`", "<", "&lt;", ">", "&gt;")
-	return r.Replace(s)
+	return r.Replace(reviewPlain(s))
+}
+
+// reviewPlain replaces control characters (line breaks, tabs, carriage
+// returns, the Unicode line and paragraph separators) and the
+// bidirectional overrides with spaces, so text from a repository or an
+// agent stays on its line in an item toolyard sends.
+func reviewPlain(s string) string {
+	return strings.Map(func(r rune) rune {
+		switch {
+		case unicode.IsControl(r), r == '\u2028', r == '\u2029',
+			r >= '\u202a' && r <= '\u202e', r >= '\u2066' && r <= '\u2069':
+			return ' '
+		}
+		return r
+	}, s)
 }
 
 // reviewShort is the 12-character commit label.

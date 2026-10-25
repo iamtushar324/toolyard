@@ -682,3 +682,35 @@ func TestSkillsCodeModeStubsAndCalls(t *testing.T) {
 		t.Fatalf("code-mode viewer = %+v", v)
 	}
 }
+
+// TestSkillsProposalTool: an agent polls its own proposal; another agent,
+// an unknown id or a missing id is refused, and without proposals the
+// tool says it is not available.
+func TestSkillsProposalTool(t *testing.T) {
+	f := newSkillsFixture(t)
+	out := f.ok(t, f.member, SkillsProposalTool, map[string]any{"id": "skp_source"})
+	p, _ := out["proposal"].(map[string]any)
+	if p["id"] != "skp_source" || p["status"] != "done" || p["result"] != "src_new" {
+		t.Fatalf("skills.proposal = %v", out)
+	}
+	if next, _ := out["next"].(string); !strings.Contains(next, "src_new") {
+		t.Fatalf("next = %q", next)
+	}
+	if code := f.refused(t, f.admin, SkillsProposalTool, map[string]any{"id": "skp_source"}); code != SkillsErrNotFound {
+		t.Fatalf("another agent's proposal: code %q", code)
+	}
+	if code := f.refused(t, f.member, SkillsProposalTool, map[string]any{"id": "skp_other"}); code != SkillsErrNotFound {
+		t.Fatalf("unknown proposal: code %q", code)
+	}
+	if code := f.refused(t, f.member, SkillsProposalTool, map[string]any{"id": " "}); code != SkillsErrInvalid {
+		t.Fatalf("missing id: code %q", code)
+	}
+	if code := f.refused(t, WithAgentID(context.Background(), "dashboard:u_member"), SkillsProposalTool, map[string]any{"id": "skp_source"}); code != SkillsErrInvalid {
+		t.Fatalf("a dashboard caller: code %q", code)
+	}
+	for status, want := range map[string]string{"pending": "not decided", "rejected": "did not take it", "failed": "could not be applied", "approved": "applying"} {
+		if got := skillsProposalNext(&skillhub.Proposal{Kind: "source", Status: status, Error: "x"}); !strings.Contains(got, want) {
+			t.Errorf("%s: next %q", status, got)
+		}
+	}
+}

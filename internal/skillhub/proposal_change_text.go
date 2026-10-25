@@ -32,11 +32,12 @@ const (
 )
 
 // changeInvisible reports a rune that changes how text displays without
-// showing: bidirectional overrides and isolates, direction marks, and the
-// byte order mark.
+// showing: bidirectional overrides and isolates, direction marks, the byte
+// order mark, and the Unicode line and paragraph separators.
 func changeInvisible(r rune) bool {
 	switch {
-	case r >= 0x202a && r <= 0x202e, r >= 0x2066 && r <= 0x2069, r == 0x200e, r == 0x200f, r == 0x061c, r == 0xfeff:
+	case r >= 0x202a && r <= 0x202e, r >= 0x2066 && r <= 0x2069, r == 0x200e, r == 0x200f, r == 0x061c, r == 0xfeff,
+		r == 0x2028, r == 0x2029:
 		return true
 	}
 	return false

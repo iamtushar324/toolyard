@@ -45,6 +45,7 @@ const (
 	SkillsListTool          = "skills.list"
 	SkillsProposeSourceTool = "skills.propose_source"
 	SkillsProposeChangeTool = "skills.propose_change"
+	SkillsProposalTool      = "skills.proposal"
 	SkillsBundleTool        = "skills.bundle"
 
 	// skillsUpstream is the synthetic upstream, and always-on access
@@ -65,7 +66,7 @@ const (
 // SkillToolNames are the skills.* tools, in the order they are registered.
 var SkillToolNames = []string{
 	SkillsSearchTool, SkillsGetTool, SkillsReadTool, SkillsGrepTool, SkillsSourcesTool, SkillsListTool,
-	SkillsProposeSourceTool, SkillsProposeChangeTool, SkillsBundleTool,
+	SkillsProposeSourceTool, SkillsProposeChangeTool, SkillsProposalTool, SkillsBundleTool,
 }
 
 // The read tools are pinned, like the inbox tools: an agent in router-only
@@ -273,6 +274,13 @@ func (g *Gateway) skillsTools() []toolEntry {
 				"title":   str("Short title of the change (the pull request title)."),
 				"summary": str("What changes and why (the pull request body)."),
 			}, []string{"skill", "files", "title"}, g.handleSkillsProposeChange),
+		g.skillsEntry(SkillsProposalTool,
+			"Read one of your skill proposals by its id (from skills.propose_source or skills.propose_change): its status "+
+				"(pending, approved, done, rejected, failed), the result (the new source's id, or the pull request) or why it failed. "+
+				"Your owner decides in their Inbox: poll this now and then instead of proposing again.",
+			map[string]any{
+				"id": str("The proposal id, skp_…, as the propose tool returned it."),
+			}, []string{"id"}, g.handleSkillsProposal),
 		g.skillsEntry(SkillsBundleTool,
 			"Package skills as one .tar.gz in the Agent Skills layout (a folder per skill), to install them in a local client such as "+
 				"Claude Code (~/.claude/skills). Returns a short-lived download URL: it works once, for 10 minutes, without a token.",
@@ -503,8 +511,56 @@ func (g *Gateway) handleSkillsProposeSource(ctx context.Context, hub *skillHubCo
 	}
 	return skillsJSON(map[string]any{
 		"proposal": p, "url": in.URL, "branch": in.Branch, "path": in.Path,
-		"next": "Your owner decides in their Inbox; nothing is added before that. Continue other work; skills.sources lists the source once it is added.",
+		"next": "Your owner decides in their Inbox; nothing is added before that. Continue other work; poll the outcome with skills.proposal (id " +
+			p.ID + "), and skills.sources lists the source once it is added.",
 	})
+}
+
+func (g *Gateway) handleSkillsProposal(ctx context.Context, hub *skillHubConfig, v skillhub.Viewer, args map[string]any) *mcp.CallToolResult {
+	if hub.proposals == nil {
+		return skillsUnavailable("skill proposals are not available on this server")
+	}
+	if v.AgentID == "" {
+		return skillsInvalid("a proposal belongs to the agent that made it: connect with that agent's token")
+	}
+	id := strings.TrimSpace(stringArg(args, "id"))
+	if id == "" {
+		return skillsInvalid("id: give the proposal id (skp_…) the propose tool returned")
+	}
+	p, err := hub.proposals.GetProposal(ctx, v, id)
+	if errors.Is(err, skillhub.ErrNotFound) {
+		return skillsError(SkillsErrNotFound, fmt.Sprintf("%q is not one of your proposals", clipText(id, 100)))
+	}
+	if err != nil {
+		return skillsErrorResult(err, id)
+	}
+	return skillsJSON(map[string]any{"proposal": p, "next": skillsProposalNext(p)})
+}
+
+// skillsProposalNext tells the agent what a proposal's status means for it.
+func skillsProposalNext(p *skillhub.Proposal) string {
+	switch p.Status {
+	case "pending":
+		return "Your owner has not decided yet. Continue other work and poll again later; do not propose it again."
+	case "approved":
+		if p.Kind == "change" {
+			return "Approved; toolyard is opening the pull request on GitHub (or checking what GitHub did after a lost answer). Poll again in a few minutes."
+		}
+		return "Your owner approved it; toolyard is applying it. Poll again in a minute."
+	case "done":
+		if p.Kind == "source" {
+			return "Added as source " + p.Result + ". Its first sync runs in the background; skills.sources lists it, and skills.search finds its skills, once it finished."
+		}
+		if p.Kind == "change" {
+			return "The pull request is open: " + p.Result + ". People review and merge it on GitHub; agents see the change once the merged commit is synced."
+		}
+		return "Done: " + p.Result
+	case "rejected":
+		return "Your owner did not take it (" + p.Error + "). Do not propose it again unless they ask."
+	case "failed":
+		return "It could not be applied (" + p.Error + "). Tell your owner; do not retry on your own."
+	}
+	return ""
 }
 
 func (g *Gateway) handleSkillsProposeChange(ctx context.Context, hub *skillHubConfig, v skillhub.Viewer, args map[string]any) *mcp.CallToolResult {
@@ -551,7 +607,7 @@ func (g *Gateway) handleSkillsProposeChange(ctx context.Context, hub *skillHubCo
 	return skillsJSON(map[string]any{
 		"proposal": p,
 		"skill":    map[string]any{"uri": s.URI, "name": s.Name, "source": s.Source, "repo": s.Repo, "commit": s.Commit},
-		"next":     "The source's owner decides in their Inbox; after approval toolyard opens a pull request. Continue other work.",
+		"next":     "The source's owner decides in their Inbox; after approval toolyard opens a pull request. Continue other work; poll the outcome with skills.proposal (id " + p.ID + ").",
 	})
 }
 

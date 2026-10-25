@@ -3,8 +3,12 @@ package skillhub
 // SourceProposals implements Proposals for skill sources: an agent's
 // skills.propose_source becomes one Inbox question for the agent's owner,
 // with a dry run of the source (Admin.Preview), and the owner's approval
-// creates the source (Admin.CreateSource) and runs its first sync.
-// ProposeChange goes to ChangeProposals (slice D) once it is set.
+// creates the source (Admin.CreateSource) and starts its first sync in the
+// background. The agent polls its proposal with skills.proposal
+// (GetProposal). A proposal whose item expired, was withdrawn, or was
+// decided while no handler ran is settled by Sweep (review_sweep.go), by
+// the agent's next proposal, or by its next poll. ProposeChange and the
+// polls of change proposals go to ChangeProposals (slice D) once it is set.
 
 import (
 	"context"
@@ -13,11 +17,15 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 	"unicode/utf8"
 
 	"github.com/tusharbhardwaj/toolyard/internal/audit"
+	"github.com/tusharbhardwaj/toolyard/internal/cluster"
+	"github.com/tusharbhardwaj/toolyard/internal/goroutines"
 	"github.com/tusharbhardwaj/toolyard/internal/inbox"
+	"github.com/tusharbhardwaj/toolyard/internal/logx"
 	"github.com/tusharbhardwaj/toolyard/internal/store"
 )
 
@@ -32,6 +40,12 @@ const (
 	// MaxPendingSourceProposals is how many source proposals one agent may
 	// have waiting at once.
 	MaxPendingSourceProposals = 5
+	// MaxSourceProposalsPerHour is how many skills.propose_source calls one
+	// agent may make in an hour: each one is a dry run against GitHub. The
+	// count holds across replicas (the rate_limit_buckets table).
+	MaxSourceProposalsPerHour = 10
+	// FirstSyncTimeout bounds the background first sync of a new source.
+	FirstSyncTimeout = 5 * time.Minute
 	// proposalSampleCap and proposalWarningCap bound what an item lists.
 	proposalSampleCap  = 10
 	proposalWarningCap = 5
@@ -63,6 +77,10 @@ type ProposalOptions struct {
 type SourceProposals struct {
 	o     ProposalOptions
 	store proposalStore
+	// limit counts each agent's proposals per hour on every replica.
+	limit *cluster.Counter
+	// bg tracks the background first syncs (tests wait for them).
+	bg sync.WaitGroup
 	// changes takes skills.propose_change (slice D, proposal_change.go);
 	// nil until SetChangeProposals.
 	changes *ChangeProposals
@@ -78,7 +96,7 @@ func NewSourceProposals(o ProposalOptions) (*SourceProposals, error) {
 	if o.Now == nil {
 		o.Now = time.Now
 	}
-	p := &SourceProposals{o: o, store: proposalStore{db: o.DB, now: o.Now}}
+	p := &SourceProposals{o: o, store: proposalStore{db: o.DB, now: o.Now}, limit: cluster.NewCounter(o.DB)}
 	o.Inbox.HandleSystem(SourceProposalItemKind, p.decide)
 	return p, nil
 }
@@ -86,7 +104,8 @@ func NewSourceProposals(o ProposalOptions) (*SourceProposals, error) {
 // ProposeSource dry-runs the proposed source and asks the agent's owner in
 // the Inbox. Only an agent whose owner is an admin may propose; a proposal
 // never carries a token (an admin adds a private repository with its
-// token on the Skills page).
+// token on the Skills page). Of the agent's input only the URL, branch and
+// folder count: the mode, visibility and the rest are the owner's defaults.
 func (p *SourceProposals) ProposeSource(ctx context.Context, v Viewer, in SourceInput, reason string) (*Proposal, error) {
 	reason = strings.TrimSpace(reason)
 	in.URL = strings.TrimSpace(in.URL)
@@ -104,12 +123,23 @@ func (p *SourceProposals) ProposeSource(ctx context.Context, v Viewer, in Source
 	case in.Token != "" || in.Auth == AuthToken:
 		return nil, fmt.Errorf("%w: a proposal cannot carry a token; an admin adds a private repository and its token on the Skills page", ErrInvalid)
 	}
+	in = SourceInput{URL: in.URL, Branch: strings.TrimSpace(in.Branch), Path: strings.TrimSpace(in.Path)}
+	// Settle the agent's own proposals first, so one whose item expired,
+	// was withdrawn or was decided meanwhile no longer counts as waiting.
+	p.reconcileAgent(ctx, v.AgentID)
 	n, err := p.store.countPending(ctx, v.AgentID, proposalKindSource)
 	if err != nil {
 		return nil, err
 	}
 	if n >= MaxPendingSourceProposals {
-		return nil, fmt.Errorf("%w: you already have %d source proposals waiting for your owner", ErrConflict, n)
+		return nil, fmt.Errorf("%w: you already have %d source proposals waiting for your owner; poll them with skills.proposal", ErrConflict, n)
+	}
+	ok, err := p.limit.Allow(ctx, "skillhub-propose:"+v.AgentID, MaxSourceProposalsPerHour, time.Hour, p.o.Now())
+	if err != nil {
+		return nil, fmt.Errorf("skillhub: proposal rate limit: %w", err)
+	}
+	if !ok {
+		return nil, fmt.Errorf("%w: at most %d source proposals an hour; try again later", ErrLimit, MaxSourceProposalsPerHour)
 	}
 	prev, err := p.o.Admin.Preview(ctx, v.UserID, in)
 	if err != nil {
@@ -130,13 +160,13 @@ func (p *SourceProposals) ProposeSource(ctx context.Context, v Viewer, in Source
 	if err := p.store.insert(ctx, row); err != nil {
 		return nil, err
 	}
-	name := p.agentName(ctx, v.AgentID)
+	name := reviewPlain(p.agentName(ctx, v.AgentID))
 	repo := prev.Source.Owner + "/" + prev.Source.Repo
 	item, err := p.o.Inbox.CreateSystemItem(ctx, inbox.SystemItem{
 		Kind: SourceProposalItemKind, Ref: row.ID, AgentID: v.AgentID,
-		Title: reviewClip("Add skill source "+repo, inbox.MaxTitle),
-		Summary: reviewClip(fmt.Sprintf("%s proposes %s: %d skills, %d warning%s", name, RepoLabel(prev.Source.Owner, prev.Source.Repo, prev.SHA),
-			prev.SkillCount, len(prev.Warnings), reviewPlural(len(prev.Warnings))), inbox.MaxSummary),
+		Title: reviewClip(reviewPlain("Add skill source "+repo), inbox.MaxTitle),
+		Summary: reviewClip(reviewPlain(fmt.Sprintf("%s proposes %s: %d skills, %d warning%s", name, RepoLabel(prev.Source.Owner, prev.Source.Repo, prev.SHA),
+			prev.SkillCount, len(prev.Warnings), reviewPlural(len(prev.Warnings)))), inbox.MaxSummary),
 		Message:   p.message(ctx, name, prev, reason),
 		Questions: reviewQuestion("Add this skill source?", "Approve: add it and sync now", "Reject"),
 		Activity:  "Proposed by " + name + " with skills.propose_source",
@@ -193,8 +223,57 @@ func (p *SourceProposals) GetProposal(ctx context.Context, v Viewer, id string) 
 	return proposalView(row), nil
 }
 
+// reconcileAgent settles one agent's pending proposals from their Inbox
+// items; a failure leaves them for the sweep.
+func (p *SourceProposals) reconcileAgent(ctx context.Context, agentID string) {
+	rows, err := p.store.pendingRows(ctx, proposalKindSource, agentID, MaxPendingSourceProposals*4)
+	if err != nil {
+		logx.For("skillhub").Warn("skillhub: settle an agent's proposals", "agent", agentID, "err", err.Error())
+		return
+	}
+	for i := range rows {
+		if err := p.reconcile(ctx, &rows[i]); err != nil {
+			logx.For("skillhub").Warn("skillhub: settle a proposal", "proposal", rows[i].ID, "err", err.Error())
+		}
+	}
+}
+
+// Sweep settles every agent's pending proposals from their Inbox items
+// (decided while no handler ran, withdrawn, expired, gone), and drops the
+// expired proposal rate-limit counts. Run it on one node at a time
+// (RunInboxSweeps); the first error is returned.
+func (p *SourceProposals) Sweep(ctx context.Context) error {
+	if p == nil {
+		return nil
+	}
+	rows, err := p.store.pendingRows(ctx, proposalKindSource, "", inboxSweepBatch)
+	if err != nil {
+		return err
+	}
+	var first error
+	for i := range rows {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if err := p.reconcile(ctx, &rows[i]); err != nil && first == nil {
+			first = err
+		}
+	}
+	if err := p.limit.Sweep(ctx, p.o.Now()); err != nil && first == nil {
+		first = err
+	}
+	return first
+}
+
 // reconcile settles a pending proposal from its Inbox item.
 func (p *SourceProposals) reconcile(ctx context.Context, row *proposalRow) error {
+	if row.InboxID == "" {
+		if p.o.Now().UnixMilli()-row.CreatedAt > inboxOrphanAfter.Milliseconds() {
+			_, err := p.store.move(ctx, row.ID, []string{proposalPending}, proposalFailed, proposalUpdate{Error: "the Inbox item was never created"})
+			return err
+		}
+		return nil
+	}
 	item, err := p.o.Inbox.Get(ctx, row.InboxID)
 	if errors.Is(err, inbox.ErrNotFound) {
 		_, err = p.store.move(ctx, row.ID, []string{proposalPending}, proposalFailed, proposalUpdate{Error: "the Inbox item is gone"})
@@ -213,6 +292,12 @@ func (p *SourceProposals) reconcile(ctx context.Context, row *proposalRow) error
 		_, err = p.store.move(ctx, row.ID, []string{proposalPending}, proposalRejected, proposalUpdate{Error: "the Inbox item was withdrawn"})
 	case inbox.StatusExpired:
 		_, err = p.store.move(ctx, row.ID, []string{proposalPending}, proposalRejected, proposalUpdate{Error: "the Inbox item expired without a decision"})
+	case inbox.StatusPending:
+		// Past its deadline the item can no longer be decided, even
+		// before the Inbox's own sweep marks it expired.
+		if item.ExpiresAt > 0 && item.ExpiresAt <= p.o.Now().UnixMilli() {
+			_, err = p.store.move(ctx, row.ID, []string{proposalPending}, proposalRejected, proposalUpdate{Error: "the Inbox item expired without a decision"})
+		}
 	}
 	return err
 }
@@ -268,19 +353,23 @@ func (p *SourceProposals) decide(ctx context.Context, r *inbox.Request) (string,
 	_, _ = p.store.move(ctx, row.ID, []string{proposalApproved}, proposalDone, proposalUpdate{Result: src.ID})
 	p.audit(ctx, audit.Event{EventType: "skills.source_create", AgentID: row.AgentID, Reason: "approved proposal " + row.ID,
 		ResultSummary: src.ID + " " + RepoLabel(src.Owner, src.Repo, ""), ApprovalID: row.ID, DecidedByUserID: decider})
-	note := fmt.Sprintf("Added skill source %s (%s, mode %s).", src.Slug, src.ID, src.Mode)
-	res, err := p.o.Admin.SyncNow(ctx, src.ID)
-	switch {
-	case err != nil:
-		note += " The first sync failed: " + reviewClip(err.Error(), 300)
-	case res.Error != "":
-		note += " The first sync failed: " + reviewClip(res.Error, 300)
-	case res.Staged:
-		note += " The first version " + reviewShort(res.SHA) + " waits for review on the Skills page."
-	default:
-		note += " The first sync copied commit " + reviewShort(res.SHA) + "."
-	}
-	return note, nil
+	p.firstSync(ctx, src.ID)
+	return fmt.Sprintf("Added skill source %s (%s, mode %s). Its first sync runs now; the Skills page shows the result.", src.Slug, src.ID, src.Mode), nil
+}
+
+// firstSync syncs a new source in the background, so an approval never
+// waits on GitHub. A failure is recorded on the source (its last error)
+// and the leader's poll tries again.
+func (p *SourceProposals) firstSync(ctx context.Context, id string) {
+	sctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), FirstSyncTimeout)
+	p.bg.Add(1)
+	goroutines.Go("skills-first-sync", func() {
+		defer p.bg.Done()
+		defer cancel()
+		if _, err := p.o.Admin.SyncNow(sctx, id); err != nil {
+			logx.For("skillhub").Warn("skillhub: first sync of an approved source failed", "source", id, "err", err.Error())
+		}
+	})
 }
 
 func (p *SourceProposals) agentName(ctx context.Context, agentID string) string {
@@ -331,7 +420,7 @@ func (p *SourceProposals) message(ctx context.Context, agent string, prev *Previ
 	}
 	b.WriteString("\n**Why, in the agent's words:**\n\n")
 	for _, line := range strings.Split(reason, "\n") {
-		b.WriteString("> " + line + "\n")
+		b.WriteString("> " + reviewMD(line) + "\n")
 	}
 	if len(prev.Warnings) > 0 {
 		fmt.Fprintf(&b, "\n**Warnings (%d):**\n\n", len(prev.Warnings))

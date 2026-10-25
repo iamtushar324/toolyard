@@ -11,6 +11,7 @@ function harness(answers) {
   const requests = [];
   const context = vm.createContext({
     URLSearchParams, URL, console, Date, JSON, Number, Math, Set, Map,
+    setTimeout: () => 0,
     location: { origin: 'https://toolyard.example', search: '' },
     state: { user: { id: 'u_1', role: 'admin' } },
     requests, answers: answers || {},

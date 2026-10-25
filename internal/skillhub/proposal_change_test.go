@@ -428,6 +428,41 @@ func TestChangeApprovalReconcilesUncertainWrites(t *testing.T) {
 	}
 }
 
+func TestChangeSweepSettlesAndResumes(t *testing.T) {
+	ctx := context.Background()
+	e := newChangeEnv(t)
+	// An approved proposal whose pull request got no answer is resumed by
+	// the sweep once it is stale, without waiting for the agent.
+	e.git.fail["POST pulls"] = fakeGitFail{status: 503}
+	e.git.fail["GET pulls"] = fakeGitFail{status: 503, after: 1}
+	resumed := e.propose(t, changeInput4())
+	e.decide(t, resumed, "usr_admin", reviewApprove, actor.ViaDashboard)
+	if row := e.row(t, resumed.ID); row.Status != proposalApproved {
+		t.Fatalf("after the lost answer: %+v", row)
+	}
+	// An item nobody decides expires; the sweep closes its proposal.
+	idle := e.propose(t, ChangeInput{Skill: "skills/deploy", Title: "Another change", Files: map[string]string{"notes.md": "x\n"}})
+	if err := e.changes.Sweep(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if row := e.row(t, resumed.ID); row.Status != proposalApproved || e.git.count("POST pulls") != 1 {
+		t.Fatalf("a fresh approved row was resumed: %+v", row)
+	}
+	e.advance(inbox.SystemItemTTL + time.Hour)
+	if err := e.changes.Sweep(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if row := e.row(t, resumed.ID); row.Status != proposalDone || row.Result != "https://github.com/acme/skills/pull/1" {
+		t.Fatalf("not resumed: %+v", row)
+	}
+	if row := e.row(t, idle.ID); row.Status != proposalRejected || !strings.Contains(row.Error, "expired") {
+		t.Fatalf("expired item: %+v", row)
+	}
+	if len(e.git.pulls) != 1 || e.git.count("POST refs") != 1 {
+		t.Fatalf("pulls %d, POST refs %d", len(e.git.pulls), e.git.count("POST refs"))
+	}
+}
+
 func TestChangeRejectAndRefusedDecisions(t *testing.T) {
 	ctx := context.Background()
 	e := newChangeEnv(t)

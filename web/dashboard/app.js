@@ -5811,6 +5811,14 @@ function ibFlagChip(f) {
 function ibAvatar(name, big) {
   return el('span', { class: 'ib-av' + (big ? ' big' : '') }, (name || '?').trim().charAt(0).toUpperCase());
 }
+// ibSystemBadge marks an item toolyard raised itself (a skills review, an
+// agent's skill source proposal). Only the server sets r.system, so an
+// agent that calls itself "toolyard" never gets the badge.
+function ibSystemBadge(r) {
+  if (!r || !r.system) return null;
+  const own = String(r.agent_id || '').startsWith('toolyard:');
+  return el('span', { class: 'ib-pill sys', title: own ? 'Sent by toolyard itself, not by an agent' : 'toolyard asks on behalf of this agent' }, 'toolyard');
+}
 function ibAge(ms) {
   const m = Math.max(0, Math.round((Date.now() - ms) / 60000));
   if (m < 1) return 'now';
@@ -6052,7 +6060,7 @@ function ibCard(r) {
       keydown: (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); openInboxRequest(r.id); } },
     },
   },
-    el('div', { class: 'ib-sender' }, ibAvatar(r.agent_name), el('b', {}, r.agent_name),
+    el('div', { class: 'ib-sender' }, ibAvatar(r.agent_name), el('b', {}, r.agent_name), ibSystemBadge(r),
       el('span', { class: 's' }, r.session_title || ''), el('span', { class: 't' }, ibAge(r.created_at))),
     el('div', { class: 'ib-kindrow' }, el('span', { class: 'ib-kind' }, ibKindLabel(r)), ibStatusPill(r),
       ...ibAttnPills(r), r.checked ? null : el('span', { class: 'ib-pill mute' }, 'Checking…')),
@@ -6187,7 +6195,7 @@ function ibHeadEl(r) {
   const ses = [r.session_title, r.session_repo, r.session_host].filter(Boolean).join(' · ');
   return el('div', { class: 'ib-dh' },
     el('div', { class: 'ib-from' }, ibAvatar(r.agent_name, true),
-      el('div', {}, el('b', {}, r.agent_name), el('span', {}, IB_VERB[r.kind] + (ses ? ' · ' + ses : '')))),
+      el('div', {}, el('b', {}, r.agent_name), ibSystemBadge(r), el('span', {}, IB_VERB[r.kind] + (ses ? ' · ' + ses : '')))),
     el('div', { class: 'ib-kindrow' },
       el('span', { class: 'ib-kind' }, ibKindLabel(r)),
       ibStatusPill(r), ...ibAttnPills(r), el('span', { class: 'meta' }, relTime(r.created_at))),

@@ -14,8 +14,9 @@ package skillhub
 // Inbox: never on a grant, a policy or an automatic rule. Each write is
 // reconciled before it is made (the branch and the pull request carry the
 // proposal ID), and a write whose outcome is uncertain is never repeated
-// blindly: the proposal stays approved, and the next attempt (when the
-// agent polls it) looks for the branch and the pull request first.
+// blindly: the proposal stays approved, and the next attempt (the Inbox
+// sweep, or the agent's poll, after a few minutes) looks for the branch and
+// the pull request first.
 
 import (
 	"context"
@@ -427,7 +428,7 @@ func (c *ChangeProposals) GetProposal(ctx context.Context, v Viewer, id string) 
 		return nil, ErrNotFound
 	}
 	switch {
-	case row.Status == proposalPending && row.InboxID != "":
+	case row.Status == proposalPending:
 		if err := c.reconcile(ctx, row); err != nil {
 			return nil, err
 		}
@@ -456,8 +457,54 @@ func (c *ChangeProposals) mine(row *proposalRow, v Viewer) bool {
 	return json.Unmarshal([]byte(row.Input), &ci) == nil && ci.AgentOwner == v.UserID
 }
 
+// Sweep settles what the Inbox handler could not: a pending proposal whose
+// item was decided while no handler ran, expired or was withdrawn, and an
+// approved proposal whose GitHub writes stopped or got an uncertain answer
+// (resumed after changeStaleAfter, reconciling with GitHub first). Run it
+// on one node at a time (RunInboxSweeps). One row's failure does not stop
+// the others; the first error is returned.
+func (c *ChangeProposals) Sweep(ctx context.Context) error {
+	if c == nil {
+		return nil
+	}
+	rows, err := c.store.pendingRows(ctx, proposalKindChange, "", inboxSweepBatch)
+	if err != nil {
+		return err
+	}
+	var first error
+	for i := range rows {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if err := c.reconcile(ctx, &rows[i]); err != nil && first == nil {
+			first = err
+		}
+	}
+	stale, err := c.store.changeStaleApproved(ctx, c.o.Now().Add(-changeStaleAfter).UnixMilli(), inboxSweepBatch)
+	if err != nil {
+		if first == nil {
+			first = err
+		}
+		return first
+	}
+	for i := range stale {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		c.resume(ctx, &stale[i])
+	}
+	return first
+}
+
 // reconcile settles a pending proposal from its Inbox item.
 func (c *ChangeProposals) reconcile(ctx context.Context, row *proposalRow) error {
+	if row.InboxID == "" {
+		if c.o.Now().UnixMilli()-row.CreatedAt > inboxOrphanAfter.Milliseconds() {
+			_, err := c.store.move(ctx, row.ID, []string{proposalPending}, proposalFailed, proposalUpdate{Error: "the Inbox item was never created"})
+			return err
+		}
+		return nil
+	}
 	item, err := c.o.Inbox.Get(ctx, row.InboxID)
 	if errors.Is(err, inbox.ErrNotFound) {
 		_, err = c.store.move(ctx, row.ID, []string{proposalPending}, proposalFailed, proposalUpdate{Error: "the Inbox item is gone"})
@@ -475,6 +522,11 @@ func (c *ChangeProposals) reconcile(ctx context.Context, row *proposalRow) error
 		_, err = c.store.move(ctx, row.ID, []string{proposalPending}, proposalRejected, proposalUpdate{Error: "the Inbox item was withdrawn"})
 	case inbox.StatusExpired:
 		_, err = c.store.move(ctx, row.ID, []string{proposalPending}, proposalRejected, proposalUpdate{Error: "the Inbox item expired without a decision"})
+	case inbox.StatusPending:
+		// Past its deadline the item can no longer be decided.
+		if item.ExpiresAt > 0 && item.ExpiresAt <= c.o.Now().UnixMilli() {
+			_, err = c.store.move(ctx, row.ID, []string{proposalPending}, proposalRejected, proposalUpdate{Error: "the Inbox item expired without a decision"})
+		}
 	}
 	return err
 }
@@ -553,7 +605,7 @@ func (c *ChangeProposals) finish(ctx context.Context, row *proposalRow) (string,
 	msg := reviewClip(err.Error(), 500)
 	var ce *changeError
 	if errors.As(err, &ce) && ce.uncertain {
-		msg = reviewClip(err.Error()+"; toolyard checks GitHub for the branch and the pull request before it writes again (when the agent polls this proposal)", 500)
+		msg = reviewClip(err.Error()+"; toolyard checks GitHub for the branch and the pull request before it writes again (within a few minutes)", 500)
 		_, _ = c.store.changeSetOutcome(ctx, row.ID, proposalApproved, proposalApproved, "", msg)
 		return "", errors.New(msg)
 	}
@@ -597,6 +649,26 @@ func (st proposalStore) changeClaim(ctx context.Context, id, status string, upda
 	}
 	n, err := res.RowsAffected()
 	return n == 1, err
+}
+
+// changeStaleApproved lists change rows still approved (being applied)
+// whose last update is older than before.
+func (st proposalStore) changeStaleApproved(ctx context.Context, before int64, limit int) ([]proposalRow, error) {
+	rows, err := st.db.QueryContext(ctx, `SELECT `+proposalColumns+` FROM skill_proposals WHERE kind = ? AND status = ? AND updated_at < ? ORDER BY updated_at LIMIT ?`,
+		proposalKindChange, proposalApproved, before, limit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []proposalRow
+	for rows.Next() {
+		r, err := scanProposal(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, *r)
+	}
+	return out, rows.Err()
 }
 
 // changeSetOutcome sets a row's status, result and error (both may be

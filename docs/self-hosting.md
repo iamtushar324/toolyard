@@ -565,8 +565,15 @@ the database and serves only that copy. How sync, review and limits work:
   GitHub.
 - **Replicas.** Each replica keeps an in-memory index of the live
   versions (skills and file lists, not file contents). The leader runs the
-  poll loop; a "Sync now" or a webhook syncs on the replica that received
-  it, under a per-source lock, so two syncs of one source never overlap.
+  poll loop and the Inbox sweep (`skills-inbox-sweep`: review and proposal
+  questions that expired, were withdrawn, or were decided while no handler
+  ran); a "Sync now" or a webhook syncs on the replica that received it,
+  under a per-source lock, so two syncs of one source never overlap.
+- **Rollout.** Run this version on every replica before you turn the hub
+  on. Review questions and agents' source proposals are Inbox *system
+  items*, tagged in the stored item; a replica that predates them drops the
+  tag when it rewrites the item (a snooze, a reminder), and the owner's
+  answer then does nothing.
 - **Storage.** Each file's contents are stored once, by SHA-256, however
   many versions use them. Each source keeps its live version, the one
   waiting for review, and the last 10 others; older versions and contents
@@ -996,7 +1003,7 @@ How the replicas share the work:
   compactor, the auto-approval proposer, the anomaly detector and reason
   scorer, the events pollers and retention, the Telegram poller and chat
   reconciler, the memory-webhook worker, the notes scanner, the skills
-  hub's sync loop (`skills-sync`),
+  hub's sync loop (`skills-sync`) and Inbox sweep (`skills-inbox-sweep`),
   the retry of failed identity-key removals, and the recovery of stopped
   replicas' work. Each holds a Postgres advisory lock (a leader lease).
   A replica that stops cleanly hands its jobs over when its drain starts,
