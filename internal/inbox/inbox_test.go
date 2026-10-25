@@ -206,7 +206,7 @@ func TestValidateProblems(t *testing.T) {
 		{Type: "table", Title: "t", Columns: []string{"a", "b"}, Rows: [][]any{{"1"}}},
 		{Type: "image", URL: "http://localhost:8080/shot.png"},
 		{Type: "video", URL: "https://10.0.0.5/v.mp4"},
-		{Type: "chart", Title: "c", Chart: "pie", Series: []Series{{Name: "a", Values: []float64{1, 2}}}, X: []any{"x"}},
+		{Type: "chart", Title: "c", Chart: "radar", Series: []Series{{Name: "a", Values: []float64{1, 2}}}, X: []any{"x"}},
 		{Type: "hologram"},
 	}
 	s.Facts = nil
@@ -292,7 +292,7 @@ func TestProtocolExamplesValidate(t *testing.T) {
 }
 
 func TestProtocolMentionsLimits(t *testing.T) {
-	for _, want := range []string{"≤ 60 characters", "≤ 200 characters", "75 words at most", "1–12 entries", "Up to 12", "max 86400"} {
+	for _, want := range []string{"≤ 60 characters", "≤ 200 characters", "75 words at most", "1–50 entries", "Up to 24", "max 86400", "≤ 20,000 characters", "up to 20 questions"} {
 		if !strings.Contains(docs.AgentProtocol, want) {
 			t.Errorf("agent-protocol.md should mention %q (it must match validate.go)", want)
 		}

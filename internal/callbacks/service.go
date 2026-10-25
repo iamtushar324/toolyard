@@ -284,7 +284,7 @@ func (s *Service) Change(ctx context.Context, agentID, id, action, secret string
 // has an active one and its connection is active; otherwise nothing.
 func (s *Service) RegisterTx(ctx context.Context, tx *sql.Tx, r *inbox.Request, ref string) error {
 	if ref == "" {
-		def, revision, err := defaultReceiverTx(ctx, tx, r.AgentID)
+		def, revision, err := defaultReceiver(ctx, tx, r.AgentID)
 		if err != nil || def == "" {
 			return err
 		}
