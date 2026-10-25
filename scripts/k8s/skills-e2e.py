@@ -172,13 +172,27 @@ def fixture_commit(desc):
     return git("rev-parse", "HEAD")
 
 
-def find_source(admin, slug):
+def admin_sources(admin):
     lst = admin.j("GET", "/v1/skills/admin/sources")
-    items = lst.get("sources", lst) if isinstance(lst, dict) else lst
-    for s in items or []:
+    return (lst.get("sources", lst) if isinstance(lst, dict) else lst) or []
+
+
+def find_source(admin, slug):
+    for s in admin_sources(admin):
         if s.get("slug") == slug:
             return s
     return None
+
+
+def sync_until(admin, sid, sha, timeout=100):
+    """Sync until the source sees sha: GitHub may serve a public branch head
+    up to 60 s old (Cache-Control: public, max-age=60)."""
+    deadline = time.time() + timeout
+    while True:
+        r = sync(admin, sid)
+        if r.get("sha") == sha or time.time() > deadline:
+            return r
+        time.sleep(5)
 
 
 def ensure_source(admin, slug, body):
@@ -215,7 +229,15 @@ def main():
     admin = Admin()
     check("admin signs in", True)
 
-    # An agent key owned by the admin (reused by name across runs).
+    # Our own GitHub owners sync in Auto mode; anthropics stays untrusted.
+    admin.j("PATCH", "/v1/settings", json={"skills_trusted_github_owners": os.environ.get(
+        "TRUSTED_OWNERS", FIXTURE_REPO.split("/")[0] + ",beknown-work")})
+    # A source left by an earlier run's proposal check.
+    for leftover in admin_sources(admin):
+        if leftover.get("path") == "skills/incident-triage":
+            admin.req("DELETE", "/v1/skills/sources/%s" % leftover["id"])
+
+    # An agent key owned by the admin (a fresh one each run, deleted at the end).
     name = "skills-e2e-" + uuid.uuid4().hex[:6]
     ag = admin.j("POST", "/v1/agents", json={"name": name})
     agent = Agent(ag["token"])
@@ -399,7 +421,21 @@ def main():
     if FIXTURE_WT:
         def auto_update():
             new = fixture_commit("Write release notes from merged pull requests (auto update %s)." % time.strftime("%H:%M:%S"))
-            sync(admin, fx["id"])
+            # A signed push webhook names the exact commit; then make sure.
+            sec = admin.j("POST", "/v1/skills/sources/%s/webhook-secret" % fx["id"]).get("secret", "")
+            body = json.dumps({"ref": "refs/heads/" + FIXTURE_BRANCH, "after": new}).encode()
+            sig = "sha256=" + hmac.new(sec.encode(), body, hashlib.sha256).hexdigest()
+            t_push = time.time()
+            requests.post(BASE + "/v1/skills/sources/%s/webhook" % fx["id"], data=body, timeout=20, headers={
+                "Content-Type": "application/json", "X-GitHub-Event": "push", "X-Hub-Signature-256": sig})
+            seen = None
+            while time.time() - t_push < 30:
+                seen = agent.tool("skills.get", {"skill": "fixture/release-notes"}).get("commit")
+                if seen == new:
+                    break
+                time.sleep(1)
+            check("webhook push reaches agents within 30 s", seen == new, "%.0f s" % (time.time() - t_push))
+            sync_until(admin, fx["id"], new)
             g = agent.tool("skills.get", {"skill": "fixture/release-notes"})
             check("Auto mode: a new commit reaches agents", g.get("commit") == new and "auto update" in g.get("frontmatter", {}).get("description", ""),
                   g.get("commit", "")[:12])
@@ -410,7 +446,7 @@ def main():
         def review_update():
             admin.j("PATCH", "/v1/skills/sources/%s" % fx["id"], json={"mode": "review"})
             new = fixture_commit("Write release notes from merged pull requests (review update %s)." % time.strftime("%H:%M:%S"))
-            r = sync(admin, fx["id"])
+            r = sync_until(admin, fx["id"], new)
             g = agent.tool("skills.get", {"skill": "fixture/release-notes"})
             check("Review mode: the new commit waits", g.get("commit") == auto_sha and r.get("staged"), {"served": g.get("commit", "")[:12], "sync": r})
             items = admin.j("GET", "/v1/inbox").get("requests", [])
@@ -467,10 +503,22 @@ def main():
         admin.j("POST", "/v1/inbox/%s/decide" % item["id"], json={
             "action": "answer", "request_revision": full.get("revision"),
             "submission_id": "e2e-" + uuid.uuid4().hex[:8], "answers": {"decision": {"value": "approve"}}})
-        time.sleep(3)
-        st = agent.tool("skills.sources", {})
-        check("the approved proposal adds the source", any("incident" in (x.get("slug", "") + x.get("path", "")) for x in st.get("sources", [])),
-              [x.get("slug") for x in st.get("sources", [])])
+        # The approval creates the source (Auto: its owner is trusted) and its
+        # first sync runs; agents see it once a version is live.
+        new_src, seen = None, []
+        deadline = time.time() + 120
+        while time.time() < deadline:
+            new_src = next((x for x in admin_sources(admin) if x.get("path") == "skills/incident-triage"), None)
+            st = agent.tool("skills.sources", {})
+            seen = [x.get("slug") for x in st.get("sources", [])]
+            if new_src and new_src.get("slug") in seen:
+                break
+            time.sleep(3)
+        check("the approved proposal adds a live source in Auto mode",
+              new_src is not None and new_src.get("mode") == "auto" and new_src.get("slug") in seen,
+              {"source": (new_src or {}).get("slug"), "mode": (new_src or {}).get("mode"), "agent sees": seen})
+        if new_src:
+            admin.req("DELETE", "/v1/skills/sources/%s" % new_src["id"])
     step("proposal", propose)
 
     # Clean up the agent key.
