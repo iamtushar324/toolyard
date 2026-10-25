@@ -290,7 +290,9 @@ func (g *Gateway) skillsTools() []toolEntry {
 		g.skillsEntry(SkillsBundleTool,
 			"Package skills as one .tar.gz in the Agent Skills layout (a folder per skill, named after it: two skills with one name "+
 				"cannot share a bundle; at most 64 MiB of files), to install them in a local client such as "+
-				"Claude Code (~/.claude/skills). Returns a short-lived download URL: it works once, for 10 minutes, without a token.",
+				"Claude Code (~/.claude/skills). Returns a short-lived download URL: it works once, for 10 minutes, without a token. "+
+				"Call it directly (or use `ty skills pull`): inside code mode or an async job it is refused, because the link would "+
+				"come back redacted.",
 			map[string]any{
 				"skills": map[string]any{
 					"type": "array", "items": map[string]any{"type": "string"}, "minItems": 1, "maxItems": skillsBundleMax,

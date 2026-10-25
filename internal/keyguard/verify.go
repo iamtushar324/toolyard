@@ -94,6 +94,22 @@ var sealedSources = []sealedSource{
 		Query: `SELECT environment_id, local_user_id, public_key, credential_enc FROM host_connections WHERE COALESCE(credential_enc, '') <> ''`,
 		AAD:   func(p []string) []byte { return []byte("host|" + p[0] + "|" + p[1] + "|" + p[2]) }},
 		order: `updated_at DESC`},
+	// internal/skillhub: a source's read token ("skillhub-token|" + source
+	// id) and webhook secret ("skillhub-webhook|" + source id), and the
+	// instance-wide default read token, a JSON string setting sealed under
+	// "skillhub-default-token" (one row at most).
+	{col: SealedColumn{Key: SecretsKey, Table: "skill_sources",
+		Query: `SELECT id, token_sealed FROM skill_sources WHERE COALESCE(token_sealed, '') <> ''`,
+		AAD:   func(p []string) []byte { return []byte("skillhub-token|" + p[0]) }},
+		order: `updated_at DESC`},
+	{col: SealedColumn{Key: SecretsKey, Table: "skill_sources",
+		Query: `SELECT id, webhook_secret_sealed FROM skill_sources WHERE COALESCE(webhook_secret_sealed, '') <> ''`,
+		AAD:   func(p []string) []byte { return []byte("skillhub-webhook|" + p[0]) }},
+		order: `updated_at DESC`},
+	{col: SealedColumn{Key: SecretsKey, Table: "system_settings",
+		Query: `SELECT value FROM system_settings WHERE key = 'skills_github_token' AND value NOT IN ('', '""', 'null')`,
+		AAD:   func([]string) []byte { return []byte("skillhub-default-token") },
+		JSON:  true}},
 	// internal/chatnotify/telegram: the bot token, sealed under tokenAAD
 	// and stored as a JSON string setting. key is the primary key: one row
 	// at most.
