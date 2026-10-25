@@ -1,0 +1,79 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: toolyard-db-migrate
+  labels:
+    app.kubernetes.io/name: toolyard-migrate
+    app.kubernetes.io/component: migrate
+spec:
+  # A failed migration needs a person, not a retry.
+  backoffLimit: 0
+  # db migrate gives up after 10 minutes (-timeout), the lock wait included.
+  activeDeadlineSeconds: 900
+  ttlSecondsAfterFinished: 604800
+  template:
+    metadata:
+      # Not app.kubernetes.io/name: toolyard, so the gateway Service never
+      # sends traffic to this pod.
+      labels:
+        app.kubernetes.io/name: toolyard-migrate
+        app.kubernetes.io/component: migrate
+    spec:
+      restartPolicy: Never
+      automountServiceAccountToken: false
+      # No TOOLYARD_SERVICE_HOST and friends from the toolyard Service.
+      enableServiceLinks: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        runAsGroup: 10001
+        fsGroup: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: migrate
+          image: ghcr.io/iamtushar324/toolyard
+          imagePullPolicy: IfNotPresent
+          args: ["db", "migrate"]
+          env:
+            - name: TOOLYARD_CREDENTIALS_DIR
+              value: /etc/toolyard/credentials
+          resources:
+            requests:
+              cpu: 50m
+              memory: 64Mi
+            limits:
+              memory: 256Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            privileged: false
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/toolyard/data
+            - name: tmp
+              mountPath: /tmp
+            - name: credentials
+              mountPath: /etc/toolyard/credentials
+              readOnly: true
+            - name: db-ca
+              mountPath: /etc/toolyard/db-ca
+              readOnly: true
+      volumes:
+        - name: data
+          emptyDir:
+            sizeLimit: 64Mi
+        - name: tmp
+          emptyDir:
+            medium: Memory
+            sizeLimit: 16Mi
+        - name: credentials
+          secret:
+            secretName: toolyard-credentials
+            defaultMode: 0440
+        - name: db-ca
+          configMap:
+            name: toolyard-db-ca
+            optional: true

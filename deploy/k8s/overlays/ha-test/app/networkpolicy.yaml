@@ -1,0 +1,52 @@
+# Who may reach the gateway pods, and where they may connect.
+#
+# Ingress: the ingress controller's namespace on the HTTP port (the
+# placeholder kube-system is where K3s runs Traefik; the deploy script sets
+# INGRESS_NAMESPACE), and pods of this namespace on both ports.
+#
+# Egress: open, because upstream MCP servers can be anywhere (in the cluster
+# or on the internet), except the link-local range, which holds the cloud
+# instance metadata service (169.254.169.254) and its node credentials.
+# IPv4 only: add an IPv6 block for a dual-stack cluster.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: toolyard-gateway
+  labels:
+    app.kubernetes.io/name: toolyard
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: toolyard
+      app.kubernetes.io/component: gateway
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+      ports:
+        - port: 8787
+          protocol: TCP
+    - from:
+        - podSelector: {}
+      ports:
+        - port: 8787
+          protocol: TCP
+        - port: 9090
+          protocol: TCP
+  egress:
+    # Postgres and anything else in this namespace.
+    - to:
+        - podSelector: {}
+    # Cluster DNS and in-cluster upstream servers.
+    - to:
+        - namespaceSelector: {}
+    # Everything outside the cluster but the metadata service.
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 169.254.0.0/16

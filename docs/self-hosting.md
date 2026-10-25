@@ -877,13 +877,18 @@ The image `ghcr.io/iamtushar324/toolyard` is built from `deploy/Dockerfile`
 for linux/amd64 and linux/arm64 on every push to `main`, after the Go tests
 pass (`.github/workflows/publish-image.yml`). Every pull request builds it
 on both architectures and runs it as a smoke test: read-only root, no
-capabilities, uid 10001, against Postgres 16.
+capabilities, uid 10001, against Postgres 16. A pull request from this
+repository (not a fork) also publishes its image, after the same Go tests.
 
 ### Image
 
 - Tags: `sha-<commit>` (the full 40-character commit) and `main` (moves on
   every push). The binary reports version `sha-<commit>` (`toolyard
   version`, `/v1/health`, `toolyard_build_info`).
+- Pull requests from this repository: `pr-<number>-<head>`, where `<head>`
+  is the first 7 characters of the pull request's head commit, built from
+  the merge commit GitHub tests. The binary reports the same string as its
+  version. For test deployments only ([Kubernetes](#kubernetes)).
 - Deploy by digest, never by tag:
   `ghcr.io/iamtushar324/toolyard@sha256:<digest>`. The publish run's summary
   prints the digest of the multi-arch index. Each image carries an SBOM and
@@ -1033,5 +1038,38 @@ running with less confinement if a later node lacks it.
   settings above (secrets with owner and mode, read-only root, tmpfs,
   stop-first updates, 75 s grace, a liveness health check, Traefik labels).
 - Kubernetes: `deploy/k8s/`, a reference Kustomize base (restricted pod
-  security, `Recreate`, probes, emptyDir volumes). CI validates it with
-  kubeconform; nothing deploys it.
+  security, `Recreate`, probes, emptyDir volumes) and an HA test overlay;
+  see [Kubernetes](#kubernetes).
+
+### Kubernetes
+
+`deploy/k8s/` has two layouts; `deploy/k8s/README.md` explains both. CI
+renders them and validates them with kubeconform.
+
+- `base/`: one replica with `strategy: Recreate` on an external Postgres,
+  under the `restricted` Pod Security Standard. A starting point for your
+  own overlay.
+- `overlays/ha-test/`: a test deployment with two replicas
+  (`RollingUpdate`, `maxUnavailable: 0`), a PodDisruptionBudget, preferred
+  spreading over nodes and zones, an in-cluster Postgres 16 StatefulSet on
+  a persistent volume, a migration Job, an Ingress and NetworkPolicies.
+  Not for production data: the Postgres has no backups and no replication.
+
+`scripts/k8s-test-deploy.sh` deploys the overlay into one namespace with a
+namespaced deployer kubeconfig. Cluster values (host, image, node selector,
+tolerations, storage class, ingress class, trusted proxy) are environment
+inputs, never committed. It creates the credentials Secret (four keys and
+`database-url`) and the Postgres password once, from files in a private
+temporary directory, then applies Postgres, runs `toolyard db migrate` as a
+Job, waits for the rollout and smoke tests the result: `/v1/health` and
+`/v1/readyz` through the Ingress, `/v1/readyz` on every pod through a
+port-forward, MCP `server/discover`, and, with an agent token
+(`TOKEN_FILE`), a code-mode run. `--destroy` removes it but keeps the
+database volume and the Secrets; `--destroy --purge` deletes those too.
+
+Two replicas need an image with v0.1 high availability; until then use
+`REPLICAS=1`, which switches to `Recreate`. Every pull request from this
+repository publishes an image tagged `pr-<number>-<7-character head commit>`
+(after the Go tests and the container smoke test), so a branch can run in
+the test cluster before it merges; the publish run's summary prints the
+digest to pass as `IMAGE`.

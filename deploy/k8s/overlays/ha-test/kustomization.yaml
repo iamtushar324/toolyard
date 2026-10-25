@@ -1,0 +1,15 @@
+# HA test deployment: two toolyard replicas on an in-cluster Postgres 16.
+# See ../../README.md ("The HA test overlay").
+#
+# This file renders the long-lived parts (the gateway and Postgres) in one
+# go. The schema migration Job lives in migrate/ and runs on its own before
+# each rollout; scripts/k8s-test-deploy.sh applies postgres/, then migrate/,
+# then app/, and patches in the cluster's own values (namespace, host,
+# image, node selector, tolerations, storage class, ingress class, trusted
+# proxy). Every value committed here is a placeholder.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - postgres
+  - app
