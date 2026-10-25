@@ -214,7 +214,7 @@ func (c *ChangeProposals) ProposeChange(ctx context.Context, v Viewer, in Change
 	case len(in.Files) > MaxChangeFiles:
 		return nil, fmt.Errorf("%w: files: at most %d files in one proposal", ErrLimit, MaxChangeFiles)
 	case c.o.Tokens == nil:
-		return nil, fmt.Errorf("%w: change proposals need toolyard's GitHub connections, which this server does not have; tell your owner what should change", ErrInvalid)
+		return nil, needsConnection("change proposals need toolyard's GitHub connections, which this server does not have; tell your owner what should change")
 	}
 	sk, err := c.o.Reader.Get(ctx, v, strings.TrimSpace(in.Skill), true)
 	if err != nil {
@@ -242,7 +242,7 @@ func (c *ChangeProposals) ProposeChange(ctx context.Context, v Viewer, in Change
 		return nil, err
 	}
 	if tok, err := c.o.Tokens(ctx, src.CreatedBy); err != nil || tok == "" {
-		return nil, fmt.Errorf("%w: the owner of the skill source %s has no usable toolyard GitHub connection, so toolyard cannot open a pull request; tell your owner what should change", ErrInvalid, src.Slug)
+		return nil, needsConnection(fmt.Sprintf("the owner of the skill source %s has no usable toolyard GitHub connection, so toolyard cannot open a pull request; tell your owner what should change", src.Slug))
 	}
 	id := proposalNewID()
 	ci := changeInput{Skill: sk.URI, SkillPath: sk.Path, Name: sk.Name, Slug: src.Slug, Owner: src.Owner, Repo: src.Repo,

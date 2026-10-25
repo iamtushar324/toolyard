@@ -2,6 +2,7 @@ package skillhub
 
 import (
 	"archive/tar"
+	"bytes"
 	"compress/gzip"
 	"context"
 	"encoding/base64"
@@ -9,7 +10,9 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"net/url"
 	"regexp"
+	"sort"
 	"strings"
 	"time"
 
@@ -37,29 +40,122 @@ const (
 
 const uriScheme = "skill://"
 
+// Skill URIs (SEP-2640) are skill://<slug>/<path>, where each segment of
+// the path is percent-encoded (url.PathEscape: everything but RFC 3986
+// unreserved characters, sub-delimiters, ":" and "@"), so a file whose
+// name holds a space, non-ASCII text, "%", "#", "?" or "{}|^\"<>" still
+// has a URI a client can send back. splitURI decodes it again. The source
+// slug never needs encoding (^[a-z0-9]+(-[a-z0-9]+)*$).
+
 // SkillURI is the URI of a skill's SKILL.md.
 func SkillURI(slug, skillPath string) string {
 	if skillPath == "" {
 		return uriScheme + slug + "/" + skillFile
 	}
-	return uriScheme + slug + "/" + skillPath + "/" + skillFile
+	return uriScheme + slug + "/" + escapePath(skillPath) + "/" + skillFile
 }
 
-// FileURI is the URI of a file of a source (path relative to the source
-// folder).
-func FileURI(slug, p string) string { return uriScheme + slug + "/" + p }
+// FileURI is the URI of a file or folder of a source (path relative to
+// the source folder; a folder has no trailing slash).
+func FileURI(slug, p string) string {
+	if p == "" {
+		return uriScheme + slug
+	}
+	return uriScheme + slug + "/" + escapePath(p)
+}
 
-// splitURI splits skill://<slug>/<rest>.
+// splitURI splits skill://<slug>/<rest> and decodes rest. It refuses an
+// invalid percent-escape, a segment that decodes to one holding "/" or
+// NUL, a "." or ".." segment and an empty one between two others.
 func splitURI(uri string) (slug, rest string, ok bool) {
 	if !strings.HasPrefix(uri, uriScheme) {
 		return "", "", false
 	}
 	s := strings.TrimPrefix(uri, uriScheme)
-	slug, rest, _ = strings.Cut(s, "/")
-	if slug == "" {
+	slug, raw, _ := strings.Cut(s, "/")
+	if slug == "" || strings.ContainsAny(slug, "%?#") {
 		return "", "", false
 	}
-	return slug, strings.Trim(rest, "/"), true
+	raw = strings.Trim(raw, "/")
+	if raw == "" {
+		return slug, "", true
+	}
+	segs := strings.Split(raw, "/")
+	for i, seg := range segs {
+		dec, err := url.PathUnescape(seg)
+		if err != nil || dec == "" || dec == "." || dec == ".." || strings.ContainsAny(dec, "/\x00") {
+			return "", "", false
+		}
+		segs[i] = dec
+	}
+	return slug, strings.Join(segs, "/"), true
+}
+
+// A skill at the source folder itself has the URI skill://<slug>/SKILL.md,
+// whose last skill-path segment is the slug, not the skill's name, unless
+// the two are equal. SEP-2640 requires that segment to be the name, so
+// such a skill is served under its name instead:
+// skill://<slug>/<name>/SKILL.md, its files as skill://<slug>/<name>/<path>.
+// The old form still resolves. When the source already has a file or
+// folder at <name> (the two URIs would collide), the skill keeps
+// skill://<slug>/SKILL.md.
+
+// rootAlias is the folder name the source folder's own skill is served
+// under, or "" when it needs none (see above).
+func (si *srcIndex) rootAlias() string {
+	e := si.byPath[""]
+	if e == nil || e.name == "" || e.name == si.src.Slug {
+		return ""
+	}
+	if si.byPath[e.name] != nil || si.byFile[e.name] != nil {
+		return ""
+	}
+	prefix := e.name + "/"
+	i := sort.Search(len(si.files), func(i int) bool { return si.files[i].path >= prefix })
+	if i < len(si.files) && strings.HasPrefix(si.files[i].path, prefix) {
+		return ""
+	}
+	return e.name
+}
+
+// skillURI is the URI of the SKILL.md of the skill at skillPath.
+func (si *srcIndex) skillURI(skillPath string) string {
+	if skillPath == "" {
+		if a := si.rootAlias(); a != "" {
+			return uriScheme + si.src.Slug + "/" + url.PathEscape(a) + "/" + skillFile
+		}
+	}
+	return SkillURI(si.src.Slug, skillPath)
+}
+
+// fileURI is the URI of the file or folder p as part of the skill at
+// skillPath: under the root alias for the source folder's own skill.
+func (si *srcIndex) fileURI(skillPath, p string) string {
+	if skillPath == "" {
+		if a := si.rootAlias(); a != "" {
+			if p == "" {
+				return uriScheme + si.src.Slug + "/" + url.PathEscape(a)
+			}
+			return uriScheme + si.src.Slug + "/" + url.PathEscape(a) + "/" + escapePath(p)
+		}
+	}
+	return FileURI(si.src.Slug, p)
+}
+
+// unalias maps a decoded path of a URI into the source folder: a path
+// under the root alias names the source folder's own skill's files.
+func (si *srcIndex) unalias(p string) (string, bool) {
+	a := si.rootAlias()
+	if a == "" {
+		return p, false
+	}
+	if p == a {
+		return "", true
+	}
+	if rest, ok := strings.CutPrefix(p, a+"/"); ok {
+		return rest, true
+	}
+	return p, false
 }
 
 // Sources lists the sources the viewer sees that serve a version.
@@ -89,7 +185,7 @@ func (si *srcIndex) htmlURL(rel string) string {
 // summary is a skill as a search result or listing entry.
 func (si *srcIndex) summary(e *skillEntry) SkillSummary {
 	return SkillSummary{
-		URI: SkillURI(si.src.Slug, e.path), Name: e.name, Description: e.description,
+		URI: si.skillURI(e.path), Name: e.name, Description: e.description,
 		Source: si.src.Slug, Path: e.path, Repo: si.repoLabel(), Commit: si.sha, Runs: e.runs,
 	}
 }
@@ -201,6 +297,9 @@ func (s *Service) resolve(v Viewer, ref string) (*srcIndex, *skillEntry, error) 
 	if si == nil || !si.visibleTo(v) {
 		return nil, nil, fmt.Errorf("%w: skill %s", ErrNotFound, ref)
 	}
+	if si.byPath[p] == nil {
+		p, _ = si.unalias(p)
+	}
 	e := si.byPath[p]
 	if e == nil {
 		return nil, nil, fmt.Errorf("%w: skill %s", ErrNotFound, ref)
@@ -216,7 +315,7 @@ func (s *Service) resolveName(v Viewer, name string) (*srcIndex, *skillEntry, er
 	for _, si := range s.visibleSources(v, "") {
 		for _, e := range si.skills {
 			if e.name == name {
-				hits = append(hits, SkillURI(si.src.Slug, e.path))
+				hits = append(hits, si.skillURI(e.path))
 				hitSI, hitE = si, e
 			}
 		}
@@ -239,7 +338,7 @@ func (si *srcIndex) fileRefs(e *skillEntry) []FileRef {
 	files := si.skillFiles[e.path]
 	out := make([]FileRef, 0, len(files))
 	for _, f := range files {
-		out = append(out, FileRef{URI: FileURI(si.src.Slug, f.path), Path: relTo(e.path, f.path), Digest: f.sha, Size: f.size, Type: f.media})
+		out = append(out, FileRef{URI: si.fileURI(e.path, f.path), Path: relTo(e.path, f.path), Digest: f.sha, Size: f.size, Type: f.media})
 	}
 	return out
 }
@@ -253,7 +352,14 @@ func (si *srcIndex) omitted(e *skillEntry) []Warning {
 // given).
 func (si *srcIndex) skillOf(e *skillEntry, raw []byte, includeFiles bool) *Skill {
 	sk := &Skill{SkillSummary: si.summary(e), Frontmatter: map[string]any{}}
-	_ = json.Unmarshal(e.frontmatter, &sk.Frontmatter)
+	// Numbers stay json.Number, so a big integer or a precise decimal in
+	// the frontmatter is passed on exactly as written (SEP-2640: verbatim).
+	dec := json.NewDecoder(bytes.NewReader(e.frontmatter))
+	dec.UseNumber()
+	_ = dec.Decode(&sk.Frontmatter)
+	if sk.Frontmatter == nil {
+		sk.Frontmatter = map[string]any{}
+	}
 	if raw != nil {
 		sk.Raw = string(raw)
 		if _, body, err := splitFrontmatter(sk.Raw); err == nil {
@@ -282,21 +388,26 @@ func (s *Service) Get(ctx context.Context, v Viewer, ref string, includeFiles bo
 	return si.skillOf(e, raw, includeFiles), nil
 }
 
-// fileOf finds a visible file by URI.
-func (s *Service) fileOf(v Viewer, uri string) (*srcIndex, *fileEntry, error) {
+// fileOf finds a visible file by URI. aliased reports a URI under the
+// root alias (rootAlias).
+func (s *Service) fileOf(v Viewer, uri string) (si *srcIndex, f *fileEntry, aliased bool, err error) {
 	slug, p, ok := splitURI(uri)
 	if !ok {
-		return nil, nil, fmt.Errorf("%w: %q is not a skill URI", ErrInvalid, uri)
+		return nil, nil, false, fmt.Errorf("%w: %q is not a skill URI", ErrInvalid, uri)
 	}
-	si := s.idx.slug(slug)
+	si = s.idx.slug(slug)
 	if si == nil || !si.visibleTo(v) {
-		return nil, nil, fmt.Errorf("%w: %s", ErrNotFound, uri)
+		return nil, nil, false, fmt.Errorf("%w: %s", ErrNotFound, uri)
 	}
-	f := si.byFile[p]
+	if f = si.byFile[p]; f == nil {
+		if p, aliased = si.unalias(p); aliased {
+			f = si.byFile[p]
+		}
+	}
 	if f == nil {
-		return nil, nil, fmt.Errorf("%w: %s", ErrNotFound, uri)
+		return nil, nil, false, fmt.Errorf("%w: %s", ErrNotFound, uri)
 	}
-	return si, f, nil
+	return si, f, aliased, nil
 }
 
 // Read returns a file's text, from line offset (0-based), limit lines (0:
@@ -305,7 +416,7 @@ func (s *Service) Read(ctx context.Context, v Viewer, uri string, offset, limit 
 	if offset < 0 || limit < 0 {
 		return nil, fmt.Errorf("%w: offset and limit must not be negative", ErrInvalid)
 	}
-	si, f, err := s.fileOf(v, uri)
+	si, f, aliased, err := s.fileOf(v, uri)
 	if err != nil {
 		return nil, err
 	}
@@ -315,9 +426,15 @@ func (s *Service) Read(ctx context.Context, v Viewer, uri string, offset, limit 
 	}
 	s.countRead(si.src.ID, f.skill)
 	content, total, truncated := sliceLines(string(data), offset, limit)
+	// The URI as asked: a nested skill's file read through the enclosing
+	// root skill's alias keeps that form.
+	fileURI, skill := si.fileURI(f.skill, f.path), f.skill
+	if aliased {
+		fileURI, skill = si.fileURI("", f.path), ""
+	}
 	return &File{
-		FileRef: FileRef{URI: FileURI(si.src.Slug, f.path), Path: relTo(f.skill, f.path), Digest: f.sha, Size: f.size, Type: f.media},
-		Skill:   SkillURI(si.src.Slug, f.skill), Repo: si.repoLabel(), Commit: si.sha,
+		FileRef: FileRef{URI: fileURI, Path: relTo(skill, f.path), Digest: f.sha, Size: f.size, Type: f.media},
+		Skill:   si.skillURI(skill), Repo: si.repoLabel(), Commit: si.sha,
 		Content: content, Offset: offset, TotalLines: total, Truncated: truncated,
 	}, nil
 }
@@ -344,7 +461,11 @@ func sliceLines(text string, offset, limit int) (string, int, bool) {
 }
 
 // ListDir lists the files and folders directly inside a folder of a
-// source (resources/directory/read).
+// source (resources/directory/read). Folder URIs have no trailing slash
+// (SEP-2640). A folder inside a skill lists everything in it: naming the
+// skill's folder is a direct reference, like Get. The source folder and
+// the folders above skills leave out what only host-only skills hold
+// unless the viewer is on the host, as listings do.
 func (s *Service) ListDir(_ context.Context, v Viewer, dirURI string) ([]DirEntry, error) {
 	slug, dir, ok := splitURI(dirURI)
 	if !ok {
@@ -354,10 +475,21 @@ func (s *Service) ListDir(_ context.Context, v Viewer, dirURI string) ([]DirEntr
 	if si == nil || !si.visibleTo(v) {
 		return nil, fmt.Errorf("%w: %s", ErrNotFound, dirURI)
 	}
+	if si.byFile[dir] != nil {
+		return nil, fmt.Errorf("%w: %s is a file, not a folder", ErrNotFound, dirURI)
+	}
+	var aliased bool
+	if !si.hasFolder(dir) {
+		dir, aliased = si.unalias(dir)
+	}
+	inSkill := si.inSkill(dir)
 	seen := map[string]bool{}
 	var out []DirEntry
 	for _, f := range si.files {
 		if dir != "" && !strings.HasPrefix(f.path, dir+"/") {
+			continue
+		}
+		if !inSkill && !si.fileShown(v, false, f) {
 			continue
 		}
 		rest := relTo(dir, f.path)
@@ -367,16 +499,43 @@ func (s *Service) ListDir(_ context.Context, v Viewer, dirURI string) ([]DirEntr
 		}
 		seen[name] = true
 		child := repoPath(dir, name)
+		uri := FileURI(slug, child)
+		if aliased {
+			uri = si.fileURI("", child)
+		}
 		if isDir {
-			out = append(out, DirEntry{URI: FileURI(slug, child) + "/", Name: name, IsDir: true})
+			out = append(out, DirEntry{URI: uri, Name: name, IsDir: true})
 		} else {
-			out = append(out, DirEntry{URI: FileURI(slug, child), Name: name, Size: f.size})
+			out = append(out, DirEntry{URI: uri, Name: name, Size: f.size})
 		}
 	}
 	if len(out) == 0 {
 		return nil, fmt.Errorf("%w: %s is not a folder of the source", ErrNotFound, dirURI)
 	}
 	return out, nil
+}
+
+// hasFolder reports whether dir is the source folder or a folder that
+// holds files of the version.
+func (si *srcIndex) hasFolder(dir string) bool {
+	if dir == "" {
+		return true
+	}
+	prefix := dir + "/"
+	i := sort.Search(len(si.files), func(i int) bool { return si.files[i].path >= prefix })
+	return i < len(si.files) && strings.HasPrefix(si.files[i].path, prefix)
+}
+
+// inSkill reports whether the folder dir is a skill's folder or inside one.
+func (si *srcIndex) inSkill(dir string) bool {
+	for d := dir; ; d = skillDir(d) {
+		if si.byPath[d] != nil {
+			return true
+		}
+		if d == "" {
+			return false
+		}
+	}
 }
 
 // List pages through the viewer's skills, by source slug and path, each
@@ -567,7 +726,7 @@ func (g *grepRun) scan(ctx context.Context, si *srcIndex, files []*fileEntry) bo
 				continue
 			}
 			g.hits = append(g.hits, GrepHit{
-				URI: FileURI(si.src.Slug, f.path), Skill: SkillURI(si.src.Slug, f.skill), Line: line,
+				URI: si.fileURI(f.skill, f.path), Skill: si.skillURI(f.skill), Line: line,
 				Text: capLine(text), Repo: si.repoLabel(), Commit: si.sha,
 			})
 			if len(g.hits) >= g.limit {
@@ -611,7 +770,7 @@ func (s *Service) Bundle(ctx context.Context, v Viewer, refs []string, w io.Writ
 		if err != nil {
 			return err
 		}
-		uri := SkillURI(si.src.Slug, e.path)
+		uri := si.skillURI(e.path)
 		if prev, dup := names[e.name]; dup {
 			if prev == uri {
 				continue

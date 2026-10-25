@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/tusharbhardwaj/toolyard/internal/actor"
+	"github.com/tusharbhardwaj/toolyard/internal/audit"
 	"github.com/tusharbhardwaj/toolyard/internal/skillhub"
 	"github.com/tusharbhardwaj/toolyard/internal/store"
 )
@@ -166,21 +167,41 @@ type skillBundleAnswer struct {
 	Note      string        `json:"note,omitempty"`
 }
 
+// skillsBundleMaxBytes caps the files one bundle carries, as the Reader
+// does (skillhub bundleMaxBytes): checked when the link is issued, so the
+// download does not fail on it later.
+const skillsBundleMaxBytes = 64 << 20
+
 // resolveBundle checks that v can see every ref and names the version of
-// each, in order, without duplicates.
+// each, in order, without duplicates. Like the archive itself, it refuses
+// two different skills with one name (the archive has one folder per
+// name: ErrConflict) and more than skillsBundleMaxBytes of files
+// (ErrLimit).
 func resolveBundle(ctx context.Context, hub *skillHubConfig, v skillhub.Viewer, refs []string) ([]bundleSkill, error) {
 	out := make([]bundleSkill, 0, len(refs))
 	seen := map[string]bool{}
+	names := map[string]string{}
+	var total int64
 	for _, ref := range refs {
-		s, err := hub.reader.Get(ctx, v, ref, false)
+		s, err := hub.reader.Get(ctx, v, ref, true)
 		if err != nil {
 			return nil, fmt.Errorf("%s: %w", ref, err)
 		}
 		if seen[s.URI] {
 			continue
 		}
-		seen[s.URI] = true
+		if prev, dup := names[s.Name]; dup {
+			return nil, fmt.Errorf("%w: two chosen skills are named %q (%s and %s); a bundle has one folder per name, so bundle them separately",
+				skillhub.ErrConflict, s.Name, prev, s.URI)
+		}
+		seen[s.URI], names[s.Name] = true, s.URI
+		for _, f := range s.Files {
+			total += f.Size
+		}
 		out = append(out, bundleSkill{URI: s.URI, Name: s.Name, Source: s.Source, Repo: s.Repo, Commit: s.Commit})
+	}
+	if total > skillsBundleMaxBytes {
+		return nil, fmt.Errorf("%w: the bundle would hold %d bytes of files; the limit is %d, so bundle fewer skills", skillhub.ErrLimit, total, skillsBundleMaxBytes)
 	}
 	return out, nil
 }
@@ -232,10 +253,13 @@ type SkillBundle struct {
 
 // OpenSkillBundle redeems a download ticket for GET
 // /v1/skills/bundle/{ticket}: it uses the ticket up, checks again that its
-// caller can see every skill (under the caller's current scope), and
-// returns the bundle to Write. ErrSkillBundleTicket is an unknown, used or
-// expired ticket; a skill the caller can no longer see is
-// skillhub.ErrNotFound; skillhub.ErrDisabled means the hub is off.
+// caller may still use skills.bundle (the same gate as every non-tool
+// skills path: blocked or deleted agents, a new deny list entry or deny
+// policy refuse it) and can still see every skill, and returns the bundle
+// to Write. ErrSkillBundleTicket is an unknown, used or expired ticket; a
+// refused caller, or a skill it can no longer see, is skillhub.ErrNotFound;
+// skillhub.ErrConflict and skillhub.ErrLimit are a bundle the archive
+// cannot hold; skillhub.ErrDisabled means the hub is off.
 func (g *Gateway) OpenSkillBundle(ctx context.Context, ticket string) (*SkillBundle, error) {
 	hub := g.skillHub.Load()
 	if hub == nil {
@@ -250,13 +274,61 @@ func (g *Gateway) OpenSkillBundle(ctx context.Context, ticket string) (*SkillBun
 	}
 	b := &SkillBundle{g: g, hub: hub, caller: caller}
 	ctx = b.callerContext(ctx)
+	if !g.skillsAllowed(ctx, SkillsBundleTool) {
+		b.audit(ctx, refs, nil, errSkillsRefused)
+		return nil, fmt.Errorf("%w: %w", skillhub.ErrNotFound, errSkillsRefused)
+	}
 	skills, err := resolveBundle(ctx, hub, g.skillViewer(ctx, hub), refs)
 	if err != nil {
-		g.auditSkillRead(ctx, "GET "+SkillBundlePathPrefix, strings.Join(refs, " "), "", err)
+		b.audit(ctx, refs, nil, err)
 		return nil, err
 	}
 	b.Skills = skills
 	return b, nil
+}
+
+// bundleAuditTool is the audit row's tool name for a bundle download.
+const bundleAuditTool = "GET " + SkillBundlePathPrefix
+
+// audit writes the download's audit row: every skill and its version in
+// the arguments (a list, never cut), a short summary, and the refusal or
+// failure when there was one.
+func (b *SkillBundle) audit(ctx context.Context, refs []string, skills []bundleSkill, err error) {
+	if b.g.audit == nil {
+		return
+	}
+	type entry struct {
+		URI  string `json:"uri"`
+		Repo string `json:"repo,omitempty"`
+	}
+	list := make([]entry, 0, max(len(skills), len(refs)))
+	for _, s := range skills {
+		list = append(list, entry{URI: s.URI, Repo: s.Repo})
+	}
+	if skills == nil {
+		for _, r := range refs {
+			list = append(list, entry{URI: r})
+		}
+	}
+	args, _ := json.Marshal(map[string]any{"skills": list})
+	decision, summary := "allow", fmt.Sprintf("bundle of %d skills", len(list))
+	if len(list) > 0 {
+		summary += ": " + list[0].URI + " " + list[0].Repo
+		if len(list) > 1 {
+			summary += fmt.Sprintf(" and %d more (see arguments)", len(list)-1)
+		}
+	}
+	switch {
+	case errors.Is(err, errSkillsRefused):
+		decision, summary = "deny", summary+" (refused: access or policy)"
+	case err != nil:
+		code, _ := skillsErrorText(err, "")
+		decision, summary = "error", summary+" ("+code+")"
+	}
+	_ = b.g.audit.Write(ctx, audit.Event{
+		EventType: EventSkillRead, AgentID: b.caller, UpstreamName: skillsUpstream, ToolName: bundleAuditTool,
+		Decision: decision, ResultSummary: clipText(summary, 500), Arguments: args,
+	})
 }
 
 // callerContext is ctx as the caller that asked for the bundle: the
@@ -271,13 +343,11 @@ func (b *SkillBundle) callerContext(ctx context.Context) context.Context {
 func (b *SkillBundle) Write(ctx context.Context, w io.Writer) error {
 	ctx = b.callerContext(ctx)
 	refs := make([]string, len(b.Skills))
-	labels := make([]string, len(b.Skills))
 	for i, s := range b.Skills {
 		refs[i] = s.URI
-		labels[i] = s.URI + " " + s.Repo
 	}
 	err := b.hub.reader.Bundle(ctx, b.g.skillViewer(ctx, b.hub), refs, w)
-	b.g.auditSkillRead(ctx, "GET "+SkillBundlePathPrefix, strings.Join(labels, ", "), "", err)
+	b.audit(ctx, refs, b.Skills, err)
 	return err
 }
 
