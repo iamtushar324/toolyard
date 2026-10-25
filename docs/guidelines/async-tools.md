@@ -229,7 +229,12 @@ curl "$TOOLYARD_URL/v1/jobs?status=active&limit=20" -H "Authorization: Bearer $T
 - Recovery runs on every replica and takes only rows whose lease ended: a
   `running` job becomes `outcome_unknown` (its call may have run; it is
   never run again), a `queued` one `failed` (nothing ran). A live
-  replica's jobs are never touched. Recovery, a job that never started, an
+  replica's jobs are never touched: recovery waits one lease after the
+  replica starts and after the database last failed to answer it, so an
+  outage longer than the lease leaves live replicas time to renew, and
+  leases are renewed on the cluster's reserved connection. A queued job
+  that gets a run slot after a drain began ends `failed` without running.
+  Recovery, a job that never started, an
   unknown outcome and a job stopped because access was removed write
   `job.recovered`, `job.not_started`, `job.outcome_unknown` and
   `job.revoked` audit rows.

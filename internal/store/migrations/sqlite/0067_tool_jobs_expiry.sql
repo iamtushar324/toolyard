@@ -12,7 +12,7 @@
 -- cancelled job reports may_have_run false; 0 when it may have run.
 --
 -- Same columns as migrations/postgres/0067_tool_jobs_expiry.sql.
--- Rollback: an older binary ignores the column and keeps those rows 7 days.
+-- Rollback: an older binary ignores the columns and keeps those rows 7 days.
 ALTER TABLE tool_jobs ADD COLUMN expires_at INTEGER;
 ALTER TABLE tool_jobs ADD COLUMN nothing_ran INTEGER NOT NULL DEFAULT 0;
 CREATE INDEX IF NOT EXISTS idx_tool_jobs_expires ON tool_jobs(expires_at);

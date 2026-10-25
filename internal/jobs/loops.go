@@ -15,13 +15,33 @@ import (
 // every node: each node renews only its own rows, and recovery takes only
 // rows whose lease ended, with a compare-and-set. The retention purge runs
 // under the Leader.
+//
+// Recovery waits one lease after the loop starts and after the database
+// last failed to answer here (a heartbeat, a ping or a recovery pass), as
+// cmd/gateway's work recovery does for the other durable work: a live
+// replica that could not renew during an outage (an Aurora failover longer
+// than the lease, say) gets a full lease to renew before its jobs could
+// read as abandoned and be marked outcome_unknown under a running call.
 func (s *Service) Run(ctx context.Context) {
 	goroutines.Loop(ctx, loopHeartbeat, time.Minute, func(ctx context.Context) {
 		every(ctx, s.heartbeatEvery(), s.Heartbeat)
 	})
 	goroutines.Loop(ctx, loopRecover, time.Minute, func(ctx context.Context) {
+		resumeAt := time.Now().Add(s.leaseTTL)
 		every(ctx, max(s.leaseTTL/2, 20*time.Millisecond), func(ctx context.Context) {
+			if err := s.ping(ctx); err != nil {
+				s.noteDBFailure()
+			}
+			if f := s.dbFailedAt.Load(); f != 0 {
+				if r := time.Unix(0, f).Add(s.leaseTTL); r.After(resumeAt) {
+					resumeAt = r
+				}
+			}
+			if time.Now().Before(resumeAt) {
+				return
+			}
 			if _, _, err := s.Recover(ctx); err != nil && ctx.Err() == nil {
+				s.noteDBFailure()
 				s.log.Warn("job recovery", "err", err.Error())
 			}
 		})
@@ -42,6 +62,22 @@ func (s *Service) Run(ctx context.Context) {
 			return ctx.Err()
 		})
 	})
+}
+
+// noteDBFailure records that the database just failed to answer.
+func (s *Service) noteDBFailure() { s.dbFailedAt.Store(time.Now().UnixNano()) }
+
+// renewLeases runs one lease-renewal statement: on the reserved connection
+// when there is one, else on the pool. It returns the rows affected.
+func (s *Service) renewLeases(ctx context.Context, query string, args ...any) (int64, error) {
+	if s.reserved != nil {
+		return s.reserved.ExecReserved(ctx, query, args...)
+	}
+	res, err := s.db.ExecContext(ctx, query, args...)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
 }
 
 // heartbeatEvery renews leases well within the lease, and at least every
@@ -88,15 +124,16 @@ func (s *Service) Heartbeat(ctx context.Context) {
 			idArgs[i] = id
 		}
 		args := append([]any{s.leaseTTL.Milliseconds(), s.instance}, idArgs...)
-		res, err := s.db.ExecContext(ctx, `UPDATE tool_jobs SET lease_until = `+s.dbNow()+` + ?
+		n, err := s.renewLeases(ctx, `UPDATE tool_jobs SET lease_until = `+s.dbNow()+` + ?
              WHERE owner_instance = ? AND status IN ('queued','running') AND id IN (`+placeholders(len(batch))+`)`, args...)
 		if err != nil {
 			if ctx.Err() == nil {
+				s.noteDBFailure()
 				s.log.Warn("job heartbeat: could not renew leases", "err", err.Error())
 			}
 			return
 		}
-		if n, err := res.RowsAffected(); err == nil && int(n) < len(batch) {
+		if int(n) < len(batch) {
 			active, err := s.queryIDs(ctx, `SELECT id FROM tool_jobs WHERE owner_instance = ? AND status IN ('queued','running') AND id IN (`+
 				placeholders(len(batch))+`)`, append([]any{s.instance}, idArgs...)...)
 			if err == nil {

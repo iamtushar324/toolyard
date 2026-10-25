@@ -706,16 +706,21 @@ func runServe(argv []string) error {
 	if err != nil {
 		return fmt.Errorf("job results: %w", err)
 	}
-	// The jobs' leases carry this replica's cluster instance id, and the
-	// retention purge runs on the cluster leader.
-	jobsSvc := jobs.New(db, jobs.Options{
+	// The jobs' leases carry this replica's cluster instance id and, with
+	// several replicas, are renewed on the cluster's reserved connection;
+	// the retention purge runs on the cluster leader.
+	jobOpts := jobs.Options{
 		Blobs: jobBlobs, MaxDuration: *asyncJobTimeout,
 		InstanceID: clusterSvc.InstanceID(), Leader: clusterSvc,
-	})
+	}
+	if clusterSvc.MultiNode() {
+		jobOpts.Reserved = clusterSvc
+	}
+	jobsSvc := jobs.New(db, jobOpts)
 	// jobsSvc.Run starts below, once the gateway has attached the job
-	// auditor and the callbacks notifier: its first recovery pass settles
-	// the jobs an earlier process left, and their audit rows and job.failed
-	// callbacks must not be lost.
+	// auditor and the callbacks notifier: its recovery (one lease after the
+	// start) settles the jobs an earlier process left, and their audit rows
+	// and job.failed callbacks must not be lost.
 	gw := gateway.New(gateway.Options{
 		Name:                "toolyard",
 		Version:             version,

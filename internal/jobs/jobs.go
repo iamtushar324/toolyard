@@ -123,6 +123,7 @@ const (
 	msgStoppedBeforeStart   = "toolyard stopped before this job started; nothing ran; call the tool again"
 	msgNoRunSlot            = "the job waited its whole time limit for a free run slot on this toolyard server and never started; nothing ran; call the tool again later"
 	msgRevokedBeforeStart   = "the agent's access to this tool was removed before the job started; nothing ran"
+	msgDrainBeforeStart     = "toolyard began to restart before this job started; nothing ran; call the tool again in a few seconds"
 	msgClaimFailed          = "toolyard could not mark the job running (a database error); nothing ran; call the tool again"
 	msgStoppedRunning       = "toolyard stopped (a restart or shutdown) while the call was running: the call was interrupted and may or may not have run; check the target before any new call"
 	msgRevokedRunning       = "the agent's access to this tool was removed while the job ran: the call was interrupted, and a write may already have taken effect; check the target before any new call"
@@ -257,6 +258,14 @@ type Auditor interface {
 // closed and a short database error reads as a refusal. The gateway wires
 // it to its access resolver.
 type Guard func(ctx context.Context, agentID, upstream, tool string) bool
+
+// Reserved runs one lease-renewal statement (? placeholders) on a
+// connection kept outside the shared pool, so a busy pool never delays a
+// renewal past the lease, and returns the rows affected:
+// *cluster.Cluster's ExecReserved in a multi-node binary.
+type Reserved interface {
+	ExecReserved(ctx context.Context, query string, args ...any) (int64, error)
+}
 
 // Leader runs fn while this process is the one node that should (the
 // retention purge): *cluster.Cluster in the binary. It blocks until ctx
@@ -404,6 +413,12 @@ type Options struct {
 	InstanceID string
 	Notifier   Notifier
 	Leader     Leader
+	// Reserved renews the job leases on the cluster's reserved connection
+	// (multi-node only; nil renews on the shared pool).
+	Reserved Reserved
+	// Ping checks the database before each recovery pass (tests). Default:
+	// the pool's PingContext.
+	Ping func(ctx context.Context) error
 	// Blobs keeps results over InlineLimit. nil keeps every result inline.
 	Blobs blobstore.Store
 	// LeaseTTL is how long a job's lease lasts without a renewal.
@@ -479,6 +494,11 @@ type Service struct {
 	slots        *slotPool
 	auditor      atomic.Pointer[auditorBox]
 	guard        atomic.Pointer[Guard]
+	reserved     Reserved
+	ping         func(ctx context.Context) error
+	// dbFailedAt is when the database last failed to answer a heartbeat,
+	// a ping or a recovery pass (Unix nanoseconds; 0: never).
+	dbFailedAt atomic.Int64
 
 	mu sync.Mutex
 	// inflight is every job this process runs, by id.
@@ -528,7 +548,7 @@ type run struct {
 // New returns a Service over db.
 func New(db *store.DB, opts Options) *Service {
 	s := &Service{
-		db: db, instance: opts.InstanceID, leader: opts.Leader, blobs: opts.Blobs,
+		db: db, instance: opts.InstanceID, leader: opts.Leader, blobs: opts.Blobs, reserved: opts.Reserved, ping: opts.Ping,
 		leaseTTL: opts.LeaseTTL, pollEvery: opts.PollEvery, retention: opts.Retention,
 		inlineLimit: opts.InlineLimit, maxResult: opts.MaxResultBytes, maxActive: opts.MaxActive,
 		maxPerOwner: opts.MaxActivePerOwner, maxAnonymous: opts.MaxActiveAnonymous,
@@ -542,6 +562,9 @@ func New(db *store.DB, opts Options) *Service {
 	s.SetNotifier(opts.Notifier)
 	if s.leader == nil {
 		s.leader = DirectLeader{}
+	}
+	if s.ping == nil {
+		s.ping = db.PingContext
 	}
 	if s.leaseTTL <= 0 {
 		s.leaseTTL = DefaultLeaseTTL

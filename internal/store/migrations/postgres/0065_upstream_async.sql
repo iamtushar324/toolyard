@@ -9,4 +9,5 @@
 -- server's. Changing it never reconnects the server.
 --
 -- Same column as migrations/sqlite/0065_upstream_async.sql.
+-- Rollback: an older binary ignores the column.
 ALTER TABLE upstream_servers ADD COLUMN IF NOT EXISTS async_json TEXT;
