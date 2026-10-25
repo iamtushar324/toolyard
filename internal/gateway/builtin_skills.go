@@ -137,11 +137,16 @@ func (g *Gateway) RegisterSkillHub(h SkillHub) {
 	for _, e := range g.skillsTools() {
 		g.registerEntry(e)
 	}
-	// SEP-2640: the extension (with resources/directory/read), which
-	// requires the resources capability. A source whose active version
-	// changes is announced as a resources list change, best effort: under
-	// -stateless-mcp no session hears it, and hosts re-list on their own.
-	server.WithExtensions(map[string]any{SkillsExtensionID: map[string]any{"directoryRead": true}})(g.mcp)
+	// SEP-2640: the extension (with resources/directory/read) is declared
+	// on the answers MCPSkills fronts, where its methods are served
+	// (declareSkills); it requires the resources capability, declared for
+	// every transport. A source whose active version changes is announced
+	// as a resources list change, best effort: under -stateless-mcp no
+	// session hears it, and hosts re-list on their own.
+	if hooks := g.mcp.GetHooks(); hooks != nil {
+		hooks.AddAfterInitialize(g.declareSkillsOnInitialize)
+		hooks.AddAfterDiscover(g.declareSkillsOnDiscover)
+	}
 	server.WithResourceCapabilities(false, true)(g.mcp)
 	server.WithInstructions(buildInstructions(g.approval, g.inLineWait) + " " + skillsInstructions)(g.mcp)
 	g.mcp.AddResourceTemplate(skillResourceTemplate(), g.readSkillResource)
@@ -220,11 +225,12 @@ func (g *Gateway) skillsTools() []toolEntry {
 			}, []string{"skill"}, g.handleSkillsGet),
 		g.skillsEntry(SkillsReadTool,
 			"Read one file of a skill by its URI (from skills.get files[].uri, or a SKILL.md link resolved against the skill's root), "+
-				"optionally a range of lines. Large files come back in parts: when truncated is true, call again with offset next_offset.",
+				fmt.Sprintf("optionally a range of lines. One call returns at most %d lines and %d KiB: when truncated is true, call again with offset next_offset.",
+					skillsReadMaxLines, skillsReadMaxBytes>>10),
 			map[string]any{
 				"uri":    str("The file URI, e.g. skill://<source>/<path>/references/checklist.md."),
 				"offset": integer(0, 0, "First line to return, 0-based (default 0)."),
-				"limit":  integer(0, 0, "Lines to return (default 0: the whole file, up to the server's limit)."),
+				"limit":  integer(0, skillsReadMaxLines, fmt.Sprintf("Lines to return (default and most: %d).", skillsReadMaxLines)),
 			}, []string{"uri"}, g.handleSkillsRead),
 		g.skillsEntry(SkillsGrepTool,
 			"Search the contents of the skill files you can see with an RE2 pattern, like grep: each hit names the file URI, the skill, "+
@@ -282,7 +288,8 @@ func (g *Gateway) skillsTools() []toolEntry {
 				"id": str("The proposal id, skp_…, as the propose tool returned it."),
 			}, []string{"id"}, g.handleSkillsProposal),
 		g.skillsEntry(SkillsBundleTool,
-			"Package skills as one .tar.gz in the Agent Skills layout (a folder per skill), to install them in a local client such as "+
+			"Package skills as one .tar.gz in the Agent Skills layout (a folder per skill, named after it: two skills with one name "+
+				"cannot share a bundle; at most 64 MiB of files), to install them in a local client such as "+
 				"Claude Code (~/.claude/skills). Returns a short-lived download URL: it works once, for 10 minutes, without a token.",
 			map[string]any{
 				"skills": map[string]any{
@@ -377,16 +384,46 @@ func (g *Gateway) handleSkillsRead(ctx context.Context, hub *skillHubConfig, v s
 		}
 		limit = n
 	}
+	if limit == 0 || limit > skillsReadMaxLines {
+		limit = skillsReadMaxLines
+	}
 	f, err := hub.reader.Read(ctx, v, uri, offset, limit)
 	if err != nil {
 		return skillsErrorResult(err, uri)
 	}
+	capReadBytes(f, skillsReadMaxBytes)
 	out := fileView{File: f, Source: skillSourceOf(f.URI)}
 	if f.Truncated {
 		next := f.Offset + lineCount(f.Content)
 		out.NextOffset = &next
 	}
 	return skillsJSON(out)
+}
+
+// One skills.read call returns at most skillsReadMaxLines lines and
+// skillsReadMaxBytes bytes, so a large file comes back in parts that fit
+// a model's context; resources/read (MCP Skills extension) always returns
+// the whole file, whose bytes must match its digest.
+const (
+	skillsReadMaxLines = 2000
+	skillsReadMaxBytes = 256 << 10
+)
+
+// capReadBytes cuts f's content after the last whole line within max
+// bytes (always keeping its first line) and marks it truncated.
+func capReadBytes(f *skillhub.File, max int) {
+	if len(f.Content) <= max {
+		return
+	}
+	cut := strings.LastIndexByte(f.Content[:max], '\n')
+	if cut < 0 {
+		// The first line alone is longer than max: return that line.
+		if nl := strings.IndexByte(f.Content, '\n'); nl >= 0 && nl+1 < len(f.Content) {
+			f.Content, f.Truncated = f.Content[:nl+1], true
+		}
+		return
+	}
+	f.Content, f.Truncated = f.Content[:cut+1], true
 }
 
 // grepHitView is one grep hit plus its source slug.
@@ -672,13 +709,19 @@ func skillsErrorText(err error, ref string) (code, msg string) {
 		}
 		return SkillsErrNotFound, fmt.Sprintf("%q is not a skill or file you can see: find skills with skills.search or skills.list", clipText(ref, 300))
 	case errors.Is(err, skillhub.ErrConflict):
-		return SkillsErrConflict, fmt.Sprintf("%q names more than one skill you can see: give its URI (skill://…/SKILL.md) or <source>/<path> instead", clipText(ref, 300))
+		return SkillsErrConflict, skillsDetail(err)
+	case errors.Is(err, skillhub.ErrChangeProposalsUnavailable):
+		return SkillsErrUnavailable, "skill change proposals are not available on this server: tell your owner what should change in the skill"
+	case errors.Is(err, skillhub.ErrNoGitHubConnection):
+		// Before ErrInvalid: a missing GitHub connection is a setup the
+		// agent cannot fix, not a bad request.
+		return SkillsErrUnavailable, skillsDetail(err)
 	case errors.Is(err, skillhub.ErrInvalid):
-		return SkillsErrInvalid, clipText(err.Error(), 500)
+		return SkillsErrInvalid, skillsDetail(err)
 	case errors.Is(err, skillhub.ErrNeedsToken):
-		return SkillsErrInvalid, skillhub.ErrNeedsToken.Error()
+		return SkillsErrInvalid, skillsDetail(err)
 	case errors.Is(err, skillhub.ErrLimit):
-		return SkillsErrLimit, clipText(err.Error(), 500)
+		return SkillsErrLimit, skillsDetail(err)
 	case errors.Is(err, skillhub.ErrDisabled):
 		return SkillsErrUnavailable, "the skills hub is off on this server"
 	case errors.Is(err, errSkillBundleOff):
@@ -687,6 +730,24 @@ func skillsErrorText(err error, ref string) (code, msg string) {
 		return SkillsErrUnavailable, "the skills catalog did not answer in time: call again in a few seconds"
 	}
 	return SkillsErrInternal, "the skills catalog could not answer (" + sanitizeServerError(err.Error()) + "): call again in a few seconds"
+}
+
+// skillsDetail is err's message for an agent: without the "skillhub: "
+// package prefix and the sentinel's own words in front of the detail
+// ("invalid input: ", "conflict: ", ...), capped.
+func skillsDetail(err error) string {
+	msg := err.Error()
+	for _, sentinel := range []error{skillhub.ErrInvalid, skillhub.ErrConflict, skillhub.ErrLimit, skillhub.ErrNotFound} {
+		if rest, ok := strings.CutPrefix(msg, sentinel.Error()+": "); ok {
+			msg = rest
+			break
+		}
+		if i := strings.Index(msg, ": "+sentinel.Error()+": "); i >= 0 {
+			msg = msg[:i] + ": " + msg[i+len(sentinel.Error())+4:]
+			break
+		}
+	}
+	return clipText(strings.TrimPrefix(msg, "skillhub: "), 500)
 }
 
 // limitArg reads an optional limit: def when absent, at most max, at least 1.

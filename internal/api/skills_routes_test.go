@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -480,5 +481,28 @@ func TestSkillsAgentPaths(t *testing.T) {
 	}
 	if unauthRouteLimit("/v1/skills/bundle/tyskb_x") == nil {
 		t.Error("bundle downloads have no rate limit")
+	}
+}
+
+// A bundle the archive cannot hold answers 409 (two skills with one name)
+// or 422 (too large), never 500.
+func TestSkillsBundleErrorStatuses(t *testing.T) {
+	for _, c := range []struct {
+		err    error
+		status int
+		code   string
+	}{
+		{fmt.Errorf("%w: two chosen skills are named \"review\"", skillhub.ErrConflict), http.StatusConflict, "conflict"},
+		{fmt.Errorf("%w: the bundle would hold 70000000 bytes", skillhub.ErrLimit), http.StatusUnprocessableEntity, "limit"},
+		{errors.New("disk full"), http.StatusInternalServerError, ""},
+	} {
+		rec := httptest.NewRecorder()
+		writeBundleError(rec, c.err)
+		if rec.Code != c.status {
+			t.Errorf("%v: %d, want %d", c.err, rec.Code, c.status)
+		}
+		if c.code != "" && decodeBody(t, rec)["code"] != c.code {
+			t.Errorf("%v: body %s", c.err, rec.Body)
+		}
 	}
 }

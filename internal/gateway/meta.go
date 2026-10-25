@@ -173,14 +173,15 @@ type searchSkill struct {
 }
 
 // searchSkillsFor is tools.search's skills section: up to three skills
-// that match query, when the skills hub is on and the caller may use the
-// skills tools. A regex query searches skills by regex, anything else by
-// keyword. The section is a hint: a catalog that fails or is slow leaves
-// it out, and the tool search answers as before.
+// that match query, when the skills hub is on and the caller may use
+// skills.search (skillsAllowed: access, its own limits, deny policies). A
+// regex query searches skills by regex, anything else by keyword. The
+// section is a hint: a catalog that fails or is slow leaves it out, and
+// the tool search answers as before.
 func (g *Gateway) searchSkillsFor(ctx context.Context, query string, mode toolsearch.Mode) []searchSkill {
 	hub := g.skillHub.Load()
 	query = strings.TrimSpace(query)
-	if hub == nil || query == "" || !g.scopeFor(ctx, agentIDFromContext(ctx)).AllowsTool(skillsUpstream, SkillsSearchTool) {
+	if hub == nil || query == "" || !g.skillsAllowed(ctx, SkillsSearchTool) {
 		return nil
 	}
 	q := skillhub.SearchQuery{Text: query, Mode: "keyword", Limit: searchSkillHits}

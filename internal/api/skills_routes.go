@@ -49,11 +49,12 @@ import (
 // to curl. It runs as the caller that asked for it, whose visibility is
 // checked again when it is redeemed.
 //
-// Route layout with the admin surface: /v1/skills/sources is shared. This
-// file serves a GET that carries an agent or session token (the agent
-// listing); every other request to that exact path (an admin's dashboard
-// GET, a POST that creates a source) belongs to the admin routes, which
-// own the /v1/skills/sources/ subtree too.
+// Route layout with the admin surface (skills_admin_routes.go): a GET of
+// /v1/skills/sources with an agent or session token is the agent listing
+// (this file); POST /v1/skills/sources creates a source and the
+// /v1/skills/sources/ subtree is one source's admin routes; admins list
+// every source at /v1/skills/admin/sources. A GET of /v1/skills/sources
+// without an agent bearer answers 404.
 
 const (
 	skillsBundlePath  = "/v1/skills/bundle"
@@ -368,16 +369,30 @@ func (s *Server) skillsBundleDownload(w http.ResponseWriter, r *http.Request) {
 		s.skillsReady(w)
 		return
 	case err != nil:
-		logx.For("api").Error("skills bundle", "err", err.Error())
-		writeError(w, http.StatusInternalServerError, "internal error")
+		writeBundleError(w, err)
 		return
 	}
 	out := &bundleWriter{w: w}
 	if err := b.Write(r.Context(), out); err != nil {
-		logx.For("api").Error("skills bundle", "err", err.Error())
 		if !out.started {
-			writeError(w, http.StatusInternalServerError, "the bundle could not be built; ask for a new one")
+			writeBundleError(w, err)
+			return
 		}
+		logx.For("api").Error("skills bundle", "err", err.Error())
+	}
+}
+
+// writeBundleError answers a bundle that cannot be built: two skills with
+// one name (409), too large (422), or a failure (500).
+func writeBundleError(w http.ResponseWriter, err error) {
+	switch {
+	case errors.Is(err, skillhub.ErrConflict):
+		writeJSON(w, http.StatusConflict, map[string]string{"error": err.Error(), "code": gateway.SkillsErrConflict})
+	case errors.Is(err, skillhub.ErrLimit):
+		writeJSON(w, http.StatusUnprocessableEntity, map[string]string{"error": err.Error(), "code": gateway.SkillsErrLimit})
+	default:
+		logx.For("api").Error("skills bundle", "err", err.Error())
+		writeError(w, http.StatusInternalServerError, "the bundle could not be built; ask for a new one")
 	}
 }
 

@@ -213,8 +213,10 @@ func TestSkillResourcesReadAndDirectory(t *testing.T) {
 	if sh := c.result(string(mcp.MethodResourcesRead), map[string]any{"uri": "skill://team/ops/deploy/scripts/rollback.sh"}); sh["contents"].([]any)[0].(map[string]any)["mimeType"] != "text/x-shellscript" {
 		t.Fatalf("a script's mimeType = %v", sh)
 	}
+	// A missing or invisible skill file on 2025-11-25 is -32002, as mcp-go
+	// answers for any other resource (skills/get keeps -32602).
 	for _, uri := range []string{"skill://team/ops/deploy/nope.md", "skill://private/secret-sauce/SKILL.md"} {
-		if out := c.send(string(mcp.MethodResourcesRead), map[string]any{"uri": uri}, false); rpcErrorCode(out) != mcp.INVALID_PARAMS {
+		if out := c.send(string(mcp.MethodResourcesRead), map[string]any{"uri": uri}, false); rpcErrorCode(out) != mcp.RESOURCE_NOT_FOUND {
 			t.Errorf("resources/read %q = %v", uri, out)
 		}
 	}
@@ -256,8 +258,8 @@ func TestSkillResourcesReadAndDirectory(t *testing.T) {
 	if len(sub["resources"].([]any)) != 2 {
 		t.Fatalf("subdirectory = %v", sub)
 	}
-	if !auditHas(t, f.aud, EventSkillRead, MethodResourcesDirectoryRead, "ag_member", "skill://team/ops/deploy") {
-		t.Fatal("resources/directory/read wrote no audit row")
+	if !auditHas(t, f.aud, EventSkillRead, MethodResourcesDirectoryRead, "ag_member", "skill://team/ops/deploy acme/playbooks@0123456789ab") {
+		t.Fatal("resources/directory/read wrote no audit row with the version")
 	}
 	for _, uri := range []string{"skill://team/ops/deploy/SKILL.md", "skill://team/nope", "skill://private/secret-sauce", "test://plain", ""} {
 		if out := c.send(MethodResourcesDirectoryRead, map[string]any{"uri": uri}, false); rpcErrorCode(out) != mcp.INVALID_PARAMS {

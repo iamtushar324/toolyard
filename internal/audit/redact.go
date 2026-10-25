@@ -32,6 +32,7 @@ var secretPatterns = []*regexp.Regexp{
 	// Standard Webhooks signing secrets (callbacks.register / update)
 	regexp.MustCompile(`whsec_[A-Za-z0-9+/=_-]{16,}`),
 	connectLinkRE,
+	skillBundleRE,
 }
 
 // connectLinkRE matches a toolyard connect link's ticket (the path is
@@ -39,15 +40,22 @@ var secretPatterns = []*regexp.Regexp{
 // once, which must not land in result_summary or any other stored text.
 var connectLinkRE = regexp.MustCompile(`/v1/connect/link/[A-Za-z0-9_-]{16,}`)
 
+// skillBundleRE matches a skills bundle download ticket (gateway
+// skills.bundle: "tyskb_" and 32 random bytes in unpadded base64url, 43
+// characters): the URL's only credential, wherever it appears.
+var skillBundleRE = regexp.MustCompile(`tyskb_[A-Za-z0-9_-]{43}`)
+
 // redactionPlaceholder is the literal substituted in for matched secrets.
 const redactionPlaceholder = "«redacted»"
 
-// RedactConnectLinks replaces only connect-link tickets in s, for text
-// that is otherwise stored verbatim and read back by an agent (a persisted
-// approval result), where the broad patterns above would damage legitimate
-// values such as commit hashes.
+// RedactConnectLinks replaces only one-time link tickets in s (connect
+// links and skills bundle downloads), for text that is otherwise stored
+// verbatim and read back by an agent (a persisted approval or job result),
+// where the broad patterns above would damage legitimate values such as
+// commit hashes.
 func RedactConnectLinks(s string) string {
-	return connectLinkRE.ReplaceAllString(s, redactionPlaceholder)
+	s = connectLinkRE.ReplaceAllString(s, redactionPlaceholder)
+	return skillBundleRE.ReplaceAllString(s, redactionPlaceholder)
 }
 
 // RedactString runs every pattern over s, replacing matches with the

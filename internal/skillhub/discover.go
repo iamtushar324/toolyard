@@ -83,6 +83,7 @@ func discover(fs *fileSet, folder, rootName string, contents map[string][]byte) 
 		return nil, fmt.Errorf("%w: %d skills, over the limit of %d", ErrLimit, len(skills), fs.lim.skills)
 	}
 	digests := map[string]hash.Hash{}
+	counts, sizes := map[string]int{}, map[string]int64{}
 	for _, p := range sortedPaths(fs.files) {
 		inner, ok := innermostSkill(p, skills)
 		if !ok {
@@ -98,6 +99,8 @@ func discover(fs *fileSet, folder, rootName string, contents map[string][]byte) 
 				digests[sp] = h
 			}
 			fmt.Fprintf(h, "%s\x00%s\n", relTo(sp, p), c.sha)
+			counts[sp]++
+			sizes[sp] += c.size
 		}
 	}
 	if len(b.files) > fs.lim.files {
@@ -109,6 +112,7 @@ func discover(fs *fileSet, folder, rootName string, contents map[string][]byte) 
 			sk.filesDigest = "sha256:" + hex.EncodeToString(h.Sum(nil))
 		}
 		b.skills = append(b.skills, sk)
+		warns = append(warns, sepSizeWarnings(repoPath(folder, path.Join(dir, skillFile)), counts[dir], sizes[dir])...)
 	}
 	// File warnings matter only inside skill folders.
 	for _, p := range sortedPaths(fs.omitted) {
@@ -134,6 +138,28 @@ func discover(fs *fileSet, folder, rootName string, contents map[string][]byte) 
 	}
 	b.warnings = capWarnings(warns)
 	return b, nil
+}
+
+// SEP-2640 fixes what every MCP host must accept of one skill: 512
+// resources (files, SKILL.md and nested skills' files included) and 16 MiB
+// in total. A bigger skill is still served; hosts may refuse it.
+const (
+	sepMaxResources = 512
+	sepMaxBytes     = 16 << 20
+)
+
+// sepSizeWarnings warns (never skips) about a skill over those limits.
+func sepSizeWarnings(skillMD string, files int, size int64) []Warning {
+	var out []Warning
+	if files > sepMaxResources {
+		out = append(out, Warning{Path: printablePath(skillMD), Code: "sep_too_many_files", Severity: "warn",
+			Message: fmt.Sprintf("the skill has %d files; MCP hosts only have to accept %d per skill (SEP-2640), so some may not load it", files, sepMaxResources)})
+	}
+	if size > sepMaxBytes {
+		out = append(out, Warning{Path: printablePath(skillMD), Code: "sep_too_large", Severity: "warn",
+			Message: fmt.Sprintf("the skill's files are %d bytes together; MCP hosts only have to accept %d per skill (SEP-2640), so some may not load it", size, sepMaxBytes)})
+	}
+	return out
 }
 
 // capWarnings keeps the first maxWarnings warnings and says how many more

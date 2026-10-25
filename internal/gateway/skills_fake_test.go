@@ -35,6 +35,30 @@ type fakeSkillReader struct {
 	subs     []func(string)
 	// fail, when set for a method name, is returned by that method.
 	fail map[string]error
+	// content replaces a file's content (by URI) for Read; size replaces a
+	// file's size (by URI) in Get's file list.
+	content map[string]string
+	size    map[string]int64
+}
+
+// setContent makes Read answer content for the file at uri.
+func (f *fakeSkillReader) setContent(uri, content string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.content == nil {
+		f.content = map[string]string{}
+	}
+	f.content[uri] = content
+}
+
+// setSize makes Get report size for the file at uri.
+func (f *fakeSkillReader) setSize(uri string, size int64) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.size == nil {
+		f.size = map[string]int64{}
+	}
+	f.size[uri] = size
 }
 
 type fakeSkillSource struct {
@@ -240,7 +264,15 @@ func (f *fakeSkillReader) Get(_ context.Context, v skillhub.Viewer, ref string, 
 	if err != nil {
 		return nil, err
 	}
-	return src.skill(sk, includeFiles), nil
+	out := src.skill(sk, includeFiles)
+	f.mu.Lock()
+	for i := range out.Files {
+		if n, ok := f.size[out.Files[i].URI]; ok {
+			out.Files[i].Size = n
+		}
+	}
+	f.mu.Unlock()
+	return out, nil
 }
 
 // fileAt resolves a file URI among the sources v sees.
@@ -270,6 +302,11 @@ func (f *fakeSkillReader) Read(_ context.Context, v skillhub.Viewer, uri string,
 		return nil, skillhub.ErrNotFound
 	}
 	content := sk.files[name]
+	f.mu.Lock()
+	if c, ok := f.content[uri]; ok {
+		content = c
+	}
+	f.mu.Unlock()
 	lines := strings.SplitAfter(content, "\n")
 	if lines[len(lines)-1] == "" {
 		lines = lines[:len(lines)-1]
