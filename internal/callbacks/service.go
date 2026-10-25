@@ -676,9 +676,6 @@ func (s *Service) DeliverOne(ctx context.Context) error {
 	return s.deliver(ctx, ids[0])
 }
 
-// deliver claims one due event and sends it. Claims have leases, so a lost
-// acknowledgement may cause a physical duplicate with the same event id;
-// a claim another node (or worker) took first makes this a no-op.
 // claim takes one due event for delivery and returns the attempt number
 // it took, so finish is fenced on this claim even if another claim ran
 // between the read and the claim. sql.ErrNoRows means the event is not due
@@ -707,6 +704,10 @@ func (s *Service) claim(ctx context.Context, id string) (claimed int, payload, r
 	return claimed, payload, ref, rev, tx.Commit()
 }
 
+// deliver claims one due event and sends it. Claims have leases, so a lost
+// acknowledgement may cause a physical duplicate with the same event id;
+// a claim another node (or worker) took first, or a receiver at its
+// in-flight cap, makes this a no-op.
 func (s *Service) deliver(ctx context.Context, id string) error {
 	claimed, payload, ref, rev, err := s.claim(ctx, id)
 	if errors.Is(err, sql.ErrNoRows) {
