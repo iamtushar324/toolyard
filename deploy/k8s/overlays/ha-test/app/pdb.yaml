@@ -1,0 +1,17 @@
+# Keep one gateway up through voluntary disruptions (node drains, cluster
+# autoscaler scale-down). scripts/k8s-test-deploy.sh removes it for
+# REPLICAS=1, where it would block every drain.
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: toolyard
+  labels:
+    app.kubernetes.io/name: toolyard
+spec:
+  minAvailable: 1
+  # A pod that is not ready (crash loop, bad config) never blocks a drain.
+  unhealthyPodEvictionPolicy: AlwaysAllow
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: toolyard
+      app.kubernetes.io/component: gateway

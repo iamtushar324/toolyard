@@ -1,0 +1,34 @@
+# The migration Job reaches Postgres and DNS, nothing else, and accepts no
+# connections.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: toolyard-migrate
+  labels:
+    app.kubernetes.io/name: toolyard-migrate
+spec:
+  podSelector:
+    matchLabels:
+      app.kubernetes.io/name: toolyard-migrate
+      app.kubernetes.io/component: migrate
+  policyTypes:
+    - Ingress
+    - Egress
+  ingress: []
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              app.kubernetes.io/name: postgres
+              app.kubernetes.io/component: database
+      ports:
+        - port: 5432
+          protocol: TCP
+    # Cluster DNS, wherever the cluster runs it.
+    - to:
+        - namespaceSelector: {}
+      ports:
+        - port: 53
+          protocol: UDP
+        - port: 53
+          protocol: TCP

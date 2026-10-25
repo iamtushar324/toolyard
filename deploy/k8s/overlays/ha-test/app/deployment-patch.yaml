@@ -1,0 +1,51 @@
+# Two gateways on one Postgres database (v0.1 high availability). An image
+# without it must run one replica with Recreate: scripts/k8s-test-deploy.sh
+# does that for REPLICAS=1.
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: toolyard
+spec:
+  replicas: 2
+  # Start the new pod first and remove an old one only once the new one is
+  # ready, so one gateway always serves.
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxUnavailable: 0
+      maxSurge: 1
+  # Give the Service and the ingress controller time to add a new pod's
+  # endpoint before the next old pod starts its drain.
+  minReadySeconds: 10
+  template:
+    spec:
+      # Preferred, not required: a one-node pool still runs both replicas.
+      affinity:
+        podAntiAffinity:
+          preferredDuringSchedulingIgnoredDuringExecution:
+            - weight: 100
+              podAffinityTerm:
+                topologyKey: kubernetes.io/hostname
+                labelSelector:
+                  matchLabels:
+                    app.kubernetes.io/name: toolyard
+                    app.kubernetes.io/component: gateway
+      topologySpreadConstraints:
+        - maxSkew: 1
+          topologyKey: topology.kubernetes.io/zone
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: toolyard
+              app.kubernetes.io/component: gateway
+          matchLabelKeys:
+            - pod-template-hash
+        - maxSkew: 1
+          topologyKey: kubernetes.io/hostname
+          whenUnsatisfiable: ScheduleAnyway
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: toolyard
+              app.kubernetes.io/component: gateway
+          matchLabelKeys:
+            - pod-template-hash
