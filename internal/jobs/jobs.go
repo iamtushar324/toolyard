@@ -81,6 +81,19 @@ const (
 	DefaultMaxDuration        = time.Hour
 	// MaxWait caps one jobs.wait or Prefer: wait.
 	MaxWait = 60 * time.Second
+	// DefaultMaxWaitersPerAgent caps one agent's waits in progress in this
+	// process (jobs.wait, tasks/result, Prefer: wait), each of which
+	// rereads the database.
+	DefaultMaxWaitersPerAgent = 8
+	// DefaultMaxStoredBytesPerAgent and DefaultMaxStoredBytesPerOwner cap
+	// the result bytes kept for one agent's jobs, and for all the agents
+	// of one owner, over the retention.
+	DefaultMaxStoredBytesPerAgent = 256 << 20
+	DefaultMaxStoredBytesPerOwner = 1 << 30
+	// RecordedRetention is how long a recorded task answer (Record) is
+	// kept, and DefaultMaxRecordedPerAgent how many one agent may hold.
+	RecordedRetention          = time.Hour
+	DefaultMaxRecordedPerAgent = 200
 	// MaxCallbackRefLen and MaxIdempotencyKeyLen cap those inputs.
 	MaxCallbackRefLen    = 512
 	MaxIdempotencyKeyLen = 128
@@ -91,6 +104,14 @@ const (
 	progressEvery = time.Second
 	// waitDebounce gathers a burst of state changes into one reread.
 	waitDebounce = 25 * time.Millisecond
+	// guardRefusalsToStop is how many Guard refusals in a row stop a job:
+	// the access lookup fails closed, so one refusal may be a database
+	// error rather than access removed.
+	guardRefusalsToStop = 2
+	// settleRetryFirst is the first pause before a failed final write is
+	// tried again (doubling up to settleRetryMax, within the lease).
+	settleRetryFirst = 250 * time.Millisecond
+	settleRetryMax   = 5 * time.Second
 )
 
 // Error texts of the statuses toolyard sets itself.
@@ -100,6 +121,10 @@ const (
 	msgLostBeforeStart      = "the toolyard server that accepted this job stopped before the job started; nothing ran; call the tool again"
 	msgLostRunning          = "the toolyard server that ran this job stopped while the call was running; the call may or may not have run; check the target before any new call"
 	msgStoppedBeforeStart   = "toolyard stopped before this job started; nothing ran; call the tool again"
+	msgNoRunSlot            = "the job waited its whole time limit for a free run slot on this toolyard server and never started; nothing ran; call the tool again later"
+	msgRevokedBeforeStart   = "the agent's access to this tool was removed before the job started; nothing ran"
+	msgClaimFailed          = "toolyard could not mark the job running (a database error); nothing ran; call the tool again"
+	msgStoppedRunning       = "toolyard stopped (a restart or shutdown) while the call was running: the call was interrupted and may or may not have run; check the target before any new call"
 	msgRevokedRunning       = "the agent's access to this tool was removed while the job ran: the call was interrupted, and a write may already have taken effect; check the target before any new call"
 )
 
@@ -117,6 +142,8 @@ var (
 	ErrIdempotencyKeyReused = errors.New("idempotency_key_reused")
 	ErrTooManyActive        = errors.New("too many queued or running jobs for this agent or owner; wait for some to finish or cancel them")
 	ErrDraining             = errors.New("toolyard is restarting: no job was started; try again in a moment")
+	ErrTooManyWaiters       = errors.New("too many waits in progress for this agent; wait for one to end, or poll the job's status instead")
+	ErrTooManyRecorded      = errors.New("too many recent task answers stored for this agent; try again later")
 )
 
 // InputError is bad input in a start request.
@@ -159,6 +186,10 @@ type CallbackData struct {
 	Error       string `json:"error,omitempty"`
 	CallbackRef string `json:"callback_ref,omitempty"`
 	FinishedAt  int64  `json:"finished_at"`
+	// MayHaveRun is set for outcome_unknown (true) and cancelled (whether
+	// the call was sent, Job.MayHaveRun): check the target before any new
+	// call.
+	MayHaveRun *bool `json:"may_have_run,omitempty"`
 }
 
 // CallbackEvent is the event a finished job sends: job.completed when it
@@ -178,6 +209,10 @@ func CallbackEvent(j Job) (string, CallbackData) {
 	}
 	if j.HasResult() {
 		d.ResultRef = "/v1/jobs/" + j.ID + "/result"
+	}
+	if j.Status == StatusOutcomeUnknown || j.Status == StatusCancelled {
+		ran := j.MayHaveRun()
+		d.MayHaveRun = &ran
 	}
 	return ev, d
 }
@@ -217,8 +252,10 @@ type Auditor interface {
 
 // Guard reports whether agentID may still call tool (on upstream). The
 // heartbeat asks it for every job this process runs and stops the ones it
-// refuses: an agent or owner disabled, or a server access withdrawn. The
-// gateway wires it to its access resolver.
+// refuses twice in a row: an agent or owner disabled, or a server access
+// withdrawn. One refusal is not enough, because the access lookup fails
+// closed and a short database error reads as a refusal. The gateway wires
+// it to its access resolver.
 type Guard func(ctx context.Context, agentID, upstream, tool string) bool
 
 // Leader runs fn while this process is the one node that should (the
@@ -282,6 +319,12 @@ type Job struct {
 	StartedAt  int64
 	FinishedAt int64
 	UpdatedAt  int64
+	// ExpiresAt is set (Unix milliseconds) on a recorded task answer
+	// (Record), which is removed then; 0 for a job, kept for the retention.
+	ExpiresAt int64
+	// NothingRan is set when toolyard knows the call was never sent: the
+	// job never started, its recheck refused it, or it was cancelled first.
+	NothingRan bool
 
 	// resultBlob is the blob store key of a large result ("" when inline).
 	resultBlob string
@@ -289,6 +332,19 @@ type Job struct {
 
 // Final reports whether the job's status never changes again.
 func (j *Job) Final() bool { return Final(j.Status) }
+
+// MayHaveRun reports whether the job's call may have taken effect, for a
+// job that did not end with the tool's own answer: always for
+// outcome_unknown, and for cancelled when the call was sent.
+func (j *Job) MayHaveRun() bool {
+	switch j.Status {
+	case StatusOutcomeUnknown:
+		return true
+	case StatusCancelled:
+		return j.StartedAt > 0 && !j.NothingRan
+	}
+	return false
+}
 
 // HasResult reports whether a finished job kept an encoded result.
 func (j *Job) HasResult() bool { return j.ResultBytes > 0 }
@@ -306,6 +362,10 @@ type Outcome struct {
 	IsError  bool
 	// Error explains a status other than succeeded.
 	Error string
+	// NothingRan says the call was never sent (refused by its recheck, or
+	// cancelled first): a job the Guard stopped then says its access was
+	// removed before it started, not that a write may have taken effect.
+	NothingRan bool
 }
 
 // ProgressFunc records a progress notification for the job's call. It
@@ -329,6 +389,12 @@ type StartRequest struct {
 	CallbackRef string
 	// IdempotencyKey is optional, scoped to the agent.
 	IdempotencyKey string
+	// Admit, when set (Start only), runs once Start knows the job is new:
+	// after the Idempotency-Key replay found no job, before the row is
+	// stored. An error stops Start, which returns it and stores nothing;
+	// a replay never calls it (the gateway checks a _grant here, so a
+	// retried request whose grant its first job used still gets that job).
+	Admit func(ctx context.Context) error
 }
 
 // Options configure a Service. Zero values pick the defaults.
@@ -363,6 +429,18 @@ type Options struct {
 	MaxActiveAnonymous int
 	// MaxDuration is a job's time limit.
 	MaxDuration time.Duration
+	// MaxWaitersPerAgent caps one agent's waits in progress here.
+	MaxWaitersPerAgent int
+	// MaxStoredBytesPerAgent and MaxStoredBytesPerOwner cap the result
+	// bytes kept for one agent's jobs and for one owner's agents together;
+	// a result over either is not kept (the job still finishes). They are
+	// soft caps: each result is checked just before it is stored, so jobs
+	// that finish at the same moment can each pass a cap by one result.
+	MaxStoredBytesPerAgent int64
+	MaxStoredBytesPerOwner int64
+	// MaxRecordedPerAgent caps one agent's recorded task answers within
+	// RecordedRetention.
+	MaxRecordedPerAgent int
 	// Now is the clock for the times shown and the retention (tests).
 	// Leases always use the database's clock.
 	Now func() time.Time
@@ -392,6 +470,10 @@ type Service struct {
 	maxPerOwner  int
 	maxAnonymous int
 	maxDuration  time.Duration
+	maxWaiters   int
+	maxStoredAg  int64
+	maxStoredOwn int64
+	maxRecorded  int
 	now          func() time.Time
 	log          *slog.Logger
 	slots        *slotPool
@@ -401,6 +483,8 @@ type Service struct {
 	mu sync.Mutex
 	// inflight is every job this process runs, by id.
 	inflight map[string]*run
+	// waiters counts each agent's waits in progress.
+	waiters map[string]int
 	// idle is closed and replaced whenever a job goroutine ends.
 	idle chan struct{}
 	// changed is closed and replaced whenever a job of this process
@@ -427,6 +511,10 @@ type run struct {
 	revoked    atomic.Bool
 	// started is set once the call runs (claimed, or adopted).
 	started atomic.Bool
+	// guardRefusals counts the Guard's refusals in a row.
+	guardRefusals atomic.Int32
+	// shutdown is set when Wait stops the run at the drain deadline.
+	shutdown atomic.Bool
 
 	mu              sync.Mutex
 	progressWritten time.Time
@@ -444,8 +532,9 @@ func New(db *store.DB, opts Options) *Service {
 		leaseTTL: opts.LeaseTTL, pollEvery: opts.PollEvery, retention: opts.Retention,
 		inlineLimit: opts.InlineLimit, maxResult: opts.MaxResultBytes, maxActive: opts.MaxActive,
 		maxPerOwner: opts.MaxActivePerOwner, maxAnonymous: opts.MaxActiveAnonymous,
-		maxDuration: opts.MaxDuration, now: opts.Now, log: logx.For("jobs"),
-		inflight: map[string]*run{}, idle: make(chan struct{}), changed: make(chan struct{}), released: make(chan struct{}),
+		maxDuration: opts.MaxDuration, maxWaiters: opts.MaxWaitersPerAgent, maxStoredAg: opts.MaxStoredBytesPerAgent,
+		maxStoredOwn: opts.MaxStoredBytesPerOwner, maxRecorded: opts.MaxRecordedPerAgent, now: opts.Now, log: logx.For("jobs"),
+		inflight: map[string]*run{}, waiters: map[string]int{}, idle: make(chan struct{}), changed: make(chan struct{}), released: make(chan struct{}),
 	}
 	if s.instance == "" {
 		s.instance = defaultInstanceID()
@@ -480,6 +569,18 @@ func New(db *store.DB, opts Options) *Service {
 	}
 	if s.maxDuration <= 0 {
 		s.maxDuration = DefaultMaxDuration
+	}
+	if s.maxWaiters <= 0 {
+		s.maxWaiters = DefaultMaxWaitersPerAgent
+	}
+	if s.maxStoredAg <= 0 {
+		s.maxStoredAg = DefaultMaxStoredBytesPerAgent
+	}
+	if s.maxStoredOwn <= 0 {
+		s.maxStoredOwn = DefaultMaxStoredBytesPerOwner
+	}
+	if s.maxRecorded <= 0 {
+		s.maxRecorded = DefaultMaxRecordedPerAgent
 	}
 	if s.now == nil {
 		s.now = time.Now

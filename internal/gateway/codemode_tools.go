@@ -330,7 +330,7 @@ func codeModeResult(out codemode.ExecResult, runID string) *mcp.CallToolResult {
 	if calls == nil {
 		calls = []codemode.LedgerEntry{}
 	}
-	meta := map[string]any{"toolyard.run_id": runID, "toolyard.calls": calls, "toolyard.status": out.Status}
+	meta := map[string]any{"toolyard.run_id": runID, "toolyard.calls": calls, "toolyard.status": out.Status, "toolyard.sent_calls": out.SentCalls}
 	if out.ErrorKind != "" {
 		meta["toolyard.error_kind"] = out.ErrorKind
 	}

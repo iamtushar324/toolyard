@@ -21,7 +21,7 @@ const jobColumns = `id, agent_id, owner_user_id, COALESCE(session_id,''), tool, 
     progress, progress_total, COALESCE(progress_message,''), COALESCE(progress_at,0),
     COALESCE(result_blob,''), result_bytes, result_is_error, COALESCE(error,''), COALESCE(callback_ref,''),
     COALESCE(callback_error,''), COALESCE(idempotency_key,''), cancel_requested, owner_instance, lease_until,
-    created_at, COALESCE(started_at,0), COALESCE(finished_at,0), updated_at`
+    created_at, COALESCE(started_at,0), COALESCE(finished_at,0), updated_at, COALESCE(expires_at,0), nothing_ran`
 
 type rowScanner interface{ Scan(dest ...any) error }
 
@@ -29,17 +29,18 @@ func scanJob(r rowScanner) (*Job, error) {
 	var j Job
 	var prog, total sql.NullFloat64
 	var progMsg string
-	var progAt, resultBytes, isErr, cancelReq int64
+	var progAt, resultBytes, isErr, cancelReq, nothingRan int64
 	if err := r.Scan(&j.ID, &j.AgentID, &j.OwnerUserID, &j.SessionID, &j.Tool, &j.Upstream, &j.ParamsHash, &j.Reason, &j.Via, &j.Status,
 		&prog, &total, &progMsg, &progAt,
 		&j.resultBlob, &resultBytes, &isErr, &j.Error, &j.CallbackRef,
 		&j.CallbackError, &j.IdempotencyKey, &cancelReq, &j.OwnerInstance, &j.LeaseUntil,
-		&j.CreatedAt, &j.StartedAt, &j.FinishedAt, &j.UpdatedAt); err != nil {
+		&j.CreatedAt, &j.StartedAt, &j.FinishedAt, &j.UpdatedAt, &j.ExpiresAt, &nothingRan); err != nil {
 		return nil, err
 	}
 	j.ResultBytes = int(resultBytes)
 	j.ResultIsError = isErr != 0
 	j.CancelRequested = cancelReq != 0
+	j.NothingRan = nothingRan != 0
 	if prog.Valid {
 		p := &Progress{Progress: prog.Float64, Message: progMsg, At: progAt}
 		if total.Valid {
@@ -57,6 +58,14 @@ func scanJob(r rowScanner) (*Job, error) {
 // early.
 func (s *Service) dbNow() string { return cluster.NowMillisSQL(s.db.Dialect) }
 
+// recordLockKey is the advisory lock the recorded-answer cap check and
+// insert of agentID take on Postgres.
+func recordLockKey(agentID string) int64 {
+	h := fnv.New64a()
+	_, _ = h.Write([]byte("tool_jobs:recorded:" + agentID))
+	return int64(h.Sum64())
+}
+
 // capLockKey is the advisory lock the cap check and insert of req take on
 // Postgres: the owner's, or the agent's when there is no owner.
 func capLockKey(req StartRequest) int64 {
@@ -69,13 +78,21 @@ func capLockKey(req StartRequest) int64 {
 	return int64(h.Sum64())
 }
 
-// blobKey names a job result in the blob store: the sha256 of the result
-// behind a domain prefix, so it never equals an Inbox attachment's content
-// hash and the Inbox's sweeps can never remove it (the store is shared on
-// Postgres).
-func blobKey(env string) string {
-	sum := sha256.Sum256([]byte("tool_job\x00" + env))
-	return hex.EncodeToString(sum[:])
+// BlobKeyPrefix is what a job's result blob key hashes before the result
+// itself: blob key = sha256(BlobKeyPrefix(id) + result). The domain prefix
+// keeps it from ever equalling an Inbox attachment's content hash, so the
+// Inbox's sweeps never remove it (the store is shared on Postgres); the
+// job id makes it the job's own, so one job's orphan cleanup or retention
+// purge never deletes another job's identical result. dbcopy checks copied
+// result files with it.
+func BlobKeyPrefix(id string) string { return "tool_job\x00" + id + "\x00" }
+
+// blobKey names job id's result in the blob store.
+func blobKey(id, env string) string {
+	h := sha256.New()
+	_, _ = h.Write([]byte(BlobKeyPrefix(id)))
+	_, _ = h.Write([]byte(env))
+	return hex.EncodeToString(h.Sum(nil))
 }
 
 func (s *Service) queryIDs(ctx context.Context, q string, args ...any) ([]string, error) {

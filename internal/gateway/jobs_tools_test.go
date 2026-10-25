@@ -97,6 +97,7 @@ const jobsTestReason = "exercise async tool jobs in the gateway tests"
 type jobsFixtureConfig struct {
 	resolver access.Resolver
 	inbox    bool
+	jobOpts  func(*jobs.Options)
 }
 
 func newJobsFixture(t *testing.T, opts ...func(*jobsFixtureConfig)) *jobsFixture {
@@ -114,7 +115,11 @@ func newJobsFixture(t *testing.T, opts ...func(*jobsFixtureConfig)) *jobsFixture
 		db: db, rules: &asyncRules{m: map[string]jobs.AsyncSetting{}}, notes: &jobNotes{},
 		release: make(chan struct{}), slowStarted: make(chan struct{}), slowCancelled: make(chan struct{}), echoArgs: make(chan map[string]any, 8),
 	}
-	f.svc = jobs.New(db, jobs.Options{Notifier: f.notes, PollEvery: 20 * time.Millisecond})
+	jopts := jobs.Options{Notifier: f.notes, PollEvery: 20 * time.Millisecond}
+	if cfg.jobOpts != nil {
+		cfg.jobOpts(&jopts)
+	}
+	f.svc = jobs.New(db, jopts)
 	gopts := Options{Policy: policy.New(db), Approval: bus, Audit: audit.New(db), Hub: realtime.NewHub(), Memory: memory.New(db), Jobs: f.svc}
 	if cfg.resolver != nil {
 		gopts.Access = cfg.resolver
@@ -523,14 +528,22 @@ func TestAsyncToolNeedsPermissionAndRedeemsItsGrantInTheJob(t *testing.T) {
 	if f.deployCalls.Load() != 1 {
 		t.Fatalf("deploy ran %d times", f.deployCalls.Load())
 	}
-	// The grant is used up: a second job reports grant_invalid, nothing runs.
-	again := map[string]any{GrantField: tok}
-	for k, v := range deploy {
-		again[k] = v
+	// The grant is checked before a job is stored: a used one, or a
+	// made-up one, answers grant_invalid at once, starts no job and runs
+	// nothing.
+	jobsBefore := f.jobCount(t)
+	for _, bad := range []string{tok, "tyg_not.a-real-grant"} {
+		again := map[string]any{GrantField: bad}
+		for k, v := range deploy {
+			again[k] = v
+		}
+		res := f.call(t, "deploy.run", again)
+		if s := structured(t, res); s["status"] != "grant_invalid" || metaTrue(res, "toolyard.job") {
+			t.Fatalf("call with grant %q = %v", bad, s)
+		}
 	}
-	id2 := jobIDOf(t, f.call(t, "deploy.run", again))
-	if w := f.waitJob(t, id2); w["status"] != jobs.StatusFailed || !strings.Contains(asJSON(w["result"]), "grant_invalid") {
-		t.Fatalf("second use of the grant = %v", w)
+	if n := f.jobCount(t); n != jobsBefore {
+		t.Fatalf("invalid grants stored %d jobs", n-jobsBefore)
 	}
 	if f.deployCalls.Load() != 1 {
 		t.Fatalf("a used grant ran the tool again (%d calls)", f.deployCalls.Load())

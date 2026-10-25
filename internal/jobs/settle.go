@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/tusharbhardwaj/toolyard/internal/store"
@@ -20,6 +21,8 @@ type settlement struct {
 	bytes   int
 	isError bool
 	errText string
+	// nothingRan records that the call was never sent (Job.NothingRan).
+	nothingRan bool
 }
 
 // noticeError is a Notifier failure inside settle.
@@ -27,23 +30,32 @@ type noticeError struct{ err error }
 
 func (e *noticeError) Error() string { return e.err.Error() }
 
-// settleOutcome stores out's result (inline or in the blob store) and
-// writes the final status. A blob written for a row that did not move (it
-// was already final) is deleted again unless something else names it.
-func (s *Service) settleOutcome(ctx context.Context, id string, from []string, out Outcome, notify bool) (bool, error) {
-	st := settlement{status: out.Status, isError: out.IsError, errText: out.Error, bytes: len(out.Envelope)}
+// prepareResult turns out into the settlement that records it for job,
+// storing a large result in the blob store first (under the job's own
+// key). A result over the per-job limit, or over what the job's agent or
+// owner may keep (soft caps, storedOver), is not kept.
+func (s *Service) prepareResult(ctx context.Context, job *Job, out Outcome) settlement {
+	st := settlement{status: out.Status, isError: out.IsError, errText: out.Error, bytes: len(out.Envelope), nothingRan: out.NothingRan}
 	env := out.Envelope
+	over := ""
 	switch {
 	case env == "":
 	case len(env) > s.maxResult:
+		over = fmt.Sprintf("the result (%d bytes) is over the %d byte job limit and was not kept; the call itself finished", len(env), s.maxResult)
+	default:
+		over = s.storedOver(ctx, job, len(env))
+	}
+	switch {
+	case env == "":
+	case over != "":
 		if st.errText == "" {
-			st.errText = fmt.Sprintf("the result (%d bytes) is over the %d byte job limit and was not kept; the call itself finished", len(env), s.maxResult)
+			st.errText = over
 		}
 		st.bytes = 0
 	case len(env) > s.inlineLimit && s.blobs != nil:
-		key := blobKey(env)
+		key := blobKey(job.ID, env)
 		if _, err := s.blobs.Put(ctx, key, strings.NewReader(env), int64(len(env))); err != nil {
-			s.log.Warn("job: could not store a large result in the blob store; keeping it in the row", "job_id", id, "err", err.Error())
+			s.log.Warn("job: could not store a large result in the blob store; keeping it in the row", "job_id", job.ID, "err", err.Error())
 			st.inline = env
 		} else {
 			st.blob = key
@@ -51,16 +63,48 @@ func (s *Service) settleOutcome(ctx context.Context, id string, from []string, o
 	default:
 		st.inline = env
 	}
-	ok, err := s.settle(ctx, id, from, "", nil, st, notify)
-	if !ok && st.blob != "" && !s.blobReferenced(ctx, st.blob) {
-		if derr := s.blobs.Delete(ctx, st.blob); derr != nil {
-			s.log.Warn("job: could not delete an orphaned result blob", "job_id", id, "err", derr.Error())
+	return st
+}
+
+// dropUnusedBlob deletes the blob st stored when no row names it (its row
+// did not take it).
+func (s *Service) dropUnusedBlob(ctx context.Context, id string, st settlement) {
+	if st.blob == "" || s.blobs == nil || s.blobReferenced(ctx, st.blob) {
+		return
+	}
+	if err := s.blobs.Delete(ctx, st.blob); err != nil {
+		s.log.Warn("job: could not delete an orphaned result blob", "job_id", id, "err", err.Error())
+	}
+}
+
+// storedOver says why a result of n bytes is not kept for job: its
+// agent's, or its owner's, stored results would pass their cap. "" when it
+// fits. A failed count keeps the result (the per-job limit still holds).
+// The caps are soft: the count and the write are not one step, so jobs
+// that finish at the same moment can each pass a cap by one result (at
+// most MaxResultBytes each); taking a lock for it on every settle is not
+// worth that bound.
+func (s *Service) storedOver(ctx context.Context, job *Job, n int) string {
+	sum := func(col, v string) (int64, bool) {
+		var total int64
+		err := s.db.QueryRowContext(ctx, `SELECT COALESCE(SUM(result_bytes),0) FROM tool_jobs WHERE `+col+` = ? AND id <> ?`, v, job.ID).Scan(&total)
+		if err != nil {
+			s.log.Warn("job: could not count the stored result bytes; keeping the result", "job_id", job.ID, "err", err.Error())
+			return 0, false
+		}
+		return total, true
+	}
+	if total, ok := sum("agent_id", job.AgentID); ok && total+int64(n) > s.maxStoredAg {
+		return fmt.Sprintf("the result (%d bytes) was not kept: this agent's stored job results would pass their %d byte limit; the call itself finished. Results are removed %s after their job ends",
+			n, s.maxStoredAg, s.retention)
+	}
+	if job.OwnerUserID != "" {
+		if total, ok := sum("owner_user_id", job.OwnerUserID); ok && total+int64(n) > s.maxStoredOwn {
+			return fmt.Sprintf("the result (%d bytes) was not kept: the stored job results of this owner's agents would pass their %d byte limit; the call itself finished. Results are removed %s after their job ends",
+				n, s.maxStoredOwn, s.retention)
 		}
 	}
-	if err == nil && !ok {
-		s.log.Info("job: already final when its outcome came (recovered meanwhile); the late outcome is not kept", "job_id", id, "status", out.Status)
-	}
-	return ok, err
+	return ""
 }
 
 // settle moves job id from one of the from statuses to st.status, in one
@@ -74,13 +118,14 @@ func (s *Service) settle(ctx context.Context, id string, from []string, guard st
 		}
 		defer func() { _ = tx.Rollback() }()
 		now := s.now().UnixMilli()
-		args := []any{st.status, nullStr(st.inline), nullStr(st.blob), st.bytes, boolInt(st.isError), nullStr(st.errText), nullStr(noticeErr), now, now, id}
+		args := []any{st.status, nullStr(st.inline), nullStr(st.blob), st.bytes, boolInt(st.isError), nullStr(st.errText), nullStr(noticeErr),
+			boolInt(st.nothingRan), now, now, id}
 		for _, f := range from {
 			args = append(args, f)
 		}
 		args = append(args, guardArgs...)
 		res, err := tx.ExecContext(ctx, `UPDATE tool_jobs SET status = ?, result = ?, result_blob = ?, result_bytes = ?, result_is_error = ?,
-            error = ?, callback_error = ?, finished_at = ?, updated_at = ?
+            error = ?, callback_error = ?, nothing_ran = ?, finished_at = ?, updated_at = ?
          WHERE id = ? AND status IN (`+placeholders(len(from))+`)`+guard, args...)
 		if err != nil {
 			return false, err
@@ -246,18 +291,28 @@ func (s *Service) List(ctx context.Context, f Filter) ([]*Job, error) {
 // or with anyOne set the first. It returns their latest state in the order
 // of ids (nil for an id that is not stored) and whether the time ran out
 // (or ctx ended, or ReleaseWaiters was called) before the condition held.
-// Each reread is one query; a burst of changes is one reread.
+// The first read runs even on an ended ctx (bounded on its own), and when
+// ctx ends later it returns the last rows it read: it never answers empty
+// rows for jobs that exist (a nil row always means the job is not
+// stored); a failed read is an error. Each reread is one query; a burst
+// of changes is one reread.
 func (s *Service) WaitFor(ctx context.Context, ids []string, anyOne bool, timeout time.Duration) ([]*Job, bool, error) {
 	deadline := time.NewTimer(timeout)
 	defer deadline.Stop()
 	poll := time.NewTicker(s.pollEvery)
 	defer poll.Stop()
+	var last []*Job
 	for {
 		ch := s.changedCh()
-		byID, err := s.getMany(ctx, ids)
+		rctx, cancel := ctx, context.CancelFunc(func() {})
+		if last == nil {
+			rctx, cancel = context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+		}
+		byID, err := s.getMany(rctx, ids)
+		cancel()
 		if err != nil {
-			if ctx.Err() != nil {
-				return make([]*Job, len(ids)), true, nil
+			if ctx.Err() != nil && last != nil {
+				return last, true, nil
 			}
 			return nil, false, err
 		}
@@ -275,11 +330,13 @@ func (s *Service) WaitFor(ctx context.Context, ids []string, anyOne bool, timeou
 		if (anyOne && final) || (!anyOne && all) {
 			return jobs, false, nil
 		}
+		last = jobs
 		select {
 		case <-ch:
 			select {
 			case <-time.After(waitDebounce):
 			case <-ctx.Done():
+				return jobs, true, nil
 			}
 		case <-poll.C:
 		case <-deadline.C:
@@ -290,6 +347,29 @@ func (s *Service) WaitFor(ctx context.Context, ids []string, anyOne bool, timeou
 			return jobs, true, nil
 		}
 	}
+}
+
+// BeginWait admits one wait of agentID's (jobs.wait, tasks/result,
+// Prefer: wait) within the per-agent cap, MaxWaitersPerAgent, since each
+// wait rereads the database. Call done when the wait ends.
+// ErrTooManyWaiters when the agent is at the cap.
+func (s *Service) BeginWait(agentID string) (done func(), err error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.waiters[agentID] >= s.maxWaiters {
+		return nil, ErrTooManyWaiters
+	}
+	s.waiters[agentID]++
+	var once sync.Once
+	return func() {
+		once.Do(func() {
+			s.mu.Lock()
+			defer s.mu.Unlock()
+			if s.waiters[agentID]--; s.waiters[agentID] <= 0 {
+				delete(s.waiters, agentID)
+			}
+		})
+	}, nil
 }
 
 // Cancel stops job id: a queued job is cancelled at once (nothing ran); a
@@ -304,7 +384,7 @@ func (s *Service) Cancel(ctx context.Context, id string) (job *Job, cancelled bo
 		}
 		switch j.Status {
 		case StatusQueued:
-			ok, err := s.settle(ctx, id, []string{StatusQueued}, "", nil, settlement{status: StatusCancelled, errText: msgCancelledBeforeStart}, true)
+			ok, err := s.settle(ctx, id, []string{StatusQueued}, "", nil, settlement{status: StatusCancelled, errText: msgCancelledBeforeStart, nothingRan: true}, true)
 			if err != nil {
 				return nil, false, err
 			}

@@ -497,7 +497,9 @@ answers with a job id at once (`always`), or after a wait (`after`,
   replaces `-upstream-call-timeout` for that call.
 - Results over 256 KiB go to the blob store: files under
   `<data>/job-results` on SQLite, chunks in the database on Postgres.
-  Finished jobs are kept 7 days.
+  Finished jobs are kept 7 days. `toolyard db copy` moves these files into
+  Postgres with the rest of the data (`db verify` checks them); a job whose
+  result file is missing is listed and left without its result.
 - Several replicas on one Postgres database share the jobs: each job has a
   lease its replica renews, and a replica that stops leaves its running
   jobs `outcome_unknown` (never re-run) once the lease ends (60 s).

@@ -63,6 +63,10 @@ type Report struct {
 	Sealed    []SealedReport   `json:"sealed,omitempty"`
 	NamedRows []NamedRowReport `json:"named_rows,omitempty"`
 	Blobs     BlobReport       `json:"blobs"`
+	// JobResults covers the large async-job results (tool_jobs.result_blob
+	// files under <data>/job-results). Missing or mismatched source files
+	// are listed, not copied, and are not problems.
+	JobResults BlobReport `json:"job_results"`
 
 	// Problems lists everything wrong, one line each (names and counts
 	// only). The report is OK when it is empty.

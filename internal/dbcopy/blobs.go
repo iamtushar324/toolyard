@@ -16,15 +16,19 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 
 	"github.com/tusharbhardwaj/toolyard/internal/blobstore"
+	"github.com/tusharbhardwaj/toolyard/internal/jobs"
 	"github.com/tusharbhardwaj/toolyard/internal/store"
 )
 
-// sourceBlob is one blob file named by an inbox_blobs row, already checked
-// against its name.
+// sourceBlob is one blob file named by an inbox_blobs row (or a tool_jobs
+// result_blob), already checked against its name.
 type sourceBlob struct {
 	sha  string
 	path string
 	size int64
+	// prefix is hashed before the bytes: "" for an Inbox blob (its name is
+	// its sha256), jobs.BlobKeyPrefix(id) for a job result.
+	prefix string
 }
 
 // blobRows reads every inbox_blobs.sha256 of the source, sorted.
@@ -108,13 +112,16 @@ func orphanFiles(dir string, known map[string]bool) ([]string, error) {
 	return out, nil
 }
 
-func hashFile(path string) (string, int64, error) {
+func hashFile(path string) (string, int64, error) { return hashFilePrefixed(path, "") }
+
+// hashFilePrefixed is the sha256 of prefix and the file's bytes.
+func hashFilePrefixed(path, prefix string) (string, int64, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return "", 0, err
 	}
 	defer f.Close()
-	h := sha256.New()
+	h := newPrefixedHash(prefix)
 	n, err := io.Copy(h, f)
 	if err != nil {
 		return "", 0, err
@@ -166,7 +173,7 @@ func copyBlobs(ctx context.Context, blobs []sourceBlob, exec blobstore.Execer) (
 		if err != nil {
 			return copied, present, fmt.Errorf("db copy: open blob file %s: %w. Nothing was written.", b.sha, err)
 		}
-		vr := &verifyingReader{r: f, h: sha256.New(), want: b.sha}
+		vr := &verifyingReader{r: f, h: newPrefixedHash(b.prefix), want: b.sha}
 		created, err := blobstore.PutIn(ctx, exec, b.sha, vr, b.size)
 		_ = f.Close()
 		if err != nil || (created && !vr.matched) {
@@ -247,5 +254,198 @@ func verifyBlobs(ctx context.Context, src store.Querier, dir string, bs blobstor
 		return fmt.Errorf("db verify: %w", err)
 	}
 	br.OrphanFiles = orphans
+	return nil
+}
+
+// newPrefixedHash is a sha256 that has already hashed prefix.
+func newPrefixedHash(prefix string) hash.Hash {
+	h := sha256.New()
+	_, _ = h.Write([]byte(prefix))
+	return h
+}
+
+// Job results. A large async-job result is a blob too: a file under
+// <data>/job-results on SQLite, named by its tool_jobs.result_blob key,
+// which is the sha256 of jobs.BlobKeyPrefix(job id) and the result (not of
+// the result alone). Copy stores each one in the target's blob store, so a
+// finished job's result still reads after the move; a row whose file is
+// missing or does not match is listed, not copied, and does not stop the
+// copy (that result was already unreadable on the source, and job rows
+// are removed 7 days after they finish anyway).
+
+// jobResult is one tool_jobs row that names a result blob.
+type jobResult struct{ id, key string }
+
+// jobResultRows reads the tool_jobs rows that name a result blob, by job
+// id. A source from before async tools has no tool_jobs table: none.
+func jobResultRows(ctx context.Context, src store.Querier) ([]jobResult, error) {
+	var n int
+	if err := src.QueryRowContext(ctx, `SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'tool_jobs'`).Scan(&n); err != nil {
+		return nil, fmt.Errorf("read the source's tables: %w", err)
+	}
+	if n == 0 {
+		return nil, nil
+	}
+	rows, err := src.QueryContext(ctx, `SELECT id, result_blob FROM tool_jobs WHERE result_blob IS NOT NULL AND result_blob <> '' ORDER BY id`)
+	if err != nil {
+		return nil, fmt.Errorf("read the source's job results: %w", err)
+	}
+	defer rows.Close()
+	var out []jobResult
+	for rows.Next() {
+		var r jobResult
+		if err := rows.Scan(&r.id, &r.key); err != nil {
+			return nil, fmt.Errorf("read the source's job results: %w", err)
+		}
+		out = append(out, r)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("read the source's job results: %w", err)
+	}
+	return out, nil
+}
+
+// legacyJobBlobPrefix is what a result key hashed before the job id was
+// part of it (slice E, before E2): sha256 of this prefix and the result.
+// Rows written then still name such keys.
+const legacyJobBlobPrefix = "tool_job\x00"
+
+// checkJobResult hashes the source file of r in dir under both key forms
+// (jobs.BlobKeyPrefix, and legacyJobBlobPrefix for older rows). It records
+// a missing or mismatched file in br and returns ok false for it.
+func checkJobResult(r jobResult, dir string, br *BlobReport) (b sourceBlob, ok bool, err error) {
+	if !blobstore.ValidSHA(r.key) {
+		br.MismatchedFiles = append(br.MismatchedFiles, blobName(r.key))
+		return b, false, nil
+	}
+	path := filepath.Join(dir, r.key)
+	prefixes := []string{jobs.BlobKeyPrefix(r.id), legacyJobBlobPrefix}
+	sums, n, err := hashFileWithPrefixes(path, prefixes)
+	if errors.Is(err, fs.ErrNotExist) {
+		br.MissingFiles = append(br.MissingFiles, r.key)
+		return b, false, nil
+	}
+	if err != nil {
+		return b, false, fmt.Errorf("read job result file %s: %w", r.key, err)
+	}
+	for i, sum := range sums {
+		if sum == r.key {
+			return sourceBlob{sha: r.key, path: path, size: n, prefix: prefixes[i]}, true, nil
+		}
+	}
+	br.MismatchedFiles = append(br.MismatchedFiles, r.key)
+	return b, false, nil
+}
+
+// hashFileWithPrefixes is the sha256 of each prefix followed by the
+// file's bytes, read once.
+func hashFileWithPrefixes(path string, prefixes []string) ([]string, int64, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer f.Close()
+	hs := make([]hash.Hash, len(prefixes))
+	ws := make([]io.Writer, len(prefixes))
+	for i, p := range prefixes {
+		hs[i] = newPrefixedHash(p)
+		ws[i] = hs[i]
+	}
+	n, err := io.Copy(io.MultiWriter(ws...), f)
+	if err != nil {
+		return nil, 0, err
+	}
+	sums := make([]string, len(hs))
+	for i, h := range hs {
+		sums[i] = fmt.Sprintf("%x", h.Sum(nil))
+	}
+	return sums, n, nil
+}
+
+// scanJobResults checks the result file of every tool_jobs row that names
+// one, in dir (none when dir is ""), and returns the good ones. Files in
+// dir that no row names are reported as orphans. It only reads.
+func scanJobResults(ctx context.Context, src store.Querier, dir string, br *BlobReport) ([]sourceBlob, error) {
+	if dir == "" {
+		return nil, nil
+	}
+	rows, err := jobResultRows(ctx, src)
+	if err != nil {
+		return nil, err
+	}
+	br.Rows = len(rows)
+	known := make(map[string]bool, len(rows))
+	var out []sourceBlob
+	for _, r := range rows {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		known[r.key] = true
+		b, ok, err := checkJobResult(r, dir, br)
+		if err != nil {
+			return nil, err
+		}
+		if ok {
+			br.Bytes += b.size
+			out = append(out, b)
+		}
+	}
+	orphans, err := orphanFiles(dir, known)
+	if err != nil {
+		return nil, err
+	}
+	br.OrphanFiles = orphans
+	return out, nil
+}
+
+// verifyJobResults reads every good source job result back from the
+// target store and checks it hashes to its key. Rows whose source file is
+// missing or does not match were not copied: they are listed only.
+func verifyJobResults(ctx context.Context, src store.Querier, dir string, bs blobstore.Opener, br *BlobReport) error {
+	if dir == "" {
+		return nil
+	}
+	rows, err := jobResultRows(ctx, src)
+	if err != nil {
+		return fmt.Errorf("db verify: %w", err)
+	}
+	br.Rows = len(rows)
+	for _, r := range rows {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
+		sb, ok, err := checkJobResult(r, dir, br)
+		if err != nil {
+			return fmt.Errorf("db verify: %w", err)
+		}
+		if !ok {
+			continue
+		}
+		b, err := bs.Open(ctx, sb.sha)
+		if errors.Is(err, blobstore.ErrNotFound) {
+			br.TargetMissing = append(br.TargetMissing, sb.sha)
+			continue
+		}
+		if err != nil {
+			return fmt.Errorf("db verify: open target job result %s: %w", sb.sha, err)
+		}
+		h := newPrefixedHash(sb.prefix)
+		n, err := io.Copy(h, b)
+		size := b.Size()
+		_ = b.Close()
+		if err != nil {
+			if cerr := ctx.Err(); cerr != nil {
+				return cerr
+			}
+			br.TargetMismatched = append(br.TargetMismatched, sb.sha)
+			continue
+		}
+		if fmt.Sprintf("%x", h.Sum(nil)) != sb.sha || n != size {
+			br.TargetMismatched = append(br.TargetMismatched, sb.sha)
+			continue
+		}
+		br.Verified++
+		br.Bytes += n
+	}
 	return nil
 }

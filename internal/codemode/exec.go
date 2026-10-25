@@ -59,6 +59,11 @@ type ExecResult struct {
 	// ErrorKind says why a run that did not succeed stopped (ErrorTimeout,
 	// ErrorInterrupted, ErrorToolError, ...), "" otherwise.
 	ErrorKind string
+	// SentCalls is how many tool calls reached the gateway. 0 proves the
+	// script changed nothing (a call refused before it was sent is in
+	// Calls, not here): an async job of a stopped script with no sent call
+	// is failed, not outcome_unknown.
+	SentCalls int
 }
 
 // LedgerEntry is one tool call in a run's ledger.
@@ -101,7 +106,7 @@ func (r *Runtime) Execute(ctx context.Context, code string, opts ExecOptions) Ex
 	ex := r.execute(ctx, code, execOptions{reason: opts.Reason, lang: lang, echo: echo})
 	text, failed := r.render(ex, code)
 	status, kind := ex.outcome()
-	return ExecResult{Text: text, Failed: failed, Calls: ex.s.ledgerSnapshot(), Status: status, ErrorKind: kind}
+	return ExecResult{Text: text, Failed: failed, Calls: ex.s.ledgerSnapshot(), Status: status, ErrorKind: kind, SentCalls: ex.s.sentCount()}
 }
 
 // outcome is an executeToolCode run's status and error kind, read the way

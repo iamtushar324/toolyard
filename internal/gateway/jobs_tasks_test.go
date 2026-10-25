@@ -199,6 +199,10 @@ func TestMCPTasksRunAsyncToolsAsDurableTasks(t *testing.T) {
 	if rt["status"] != string(mcp.TaskStatusFailed) {
 		t.Fatalf("refused task = %v", refused)
 	}
+	// A recorded answer is kept an hour, not the jobs' retention.
+	if rt["ttl"] != float64(jobs.RecordedRetention.Milliseconds()) {
+		t.Fatalf("refused task ttl = %v", rt["ttl"])
+	}
 	rres := c.result("tasks/result", map[string]any{"taskId": rt["taskId"]})
 	if rres["isError"] != true || !strings.Contains(asJSON(rres["content"]), "denied by policy") {
 		t.Fatalf("refused task result = %v", rres)

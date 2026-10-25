@@ -1614,7 +1614,7 @@ func (g *Gateway) routeEntry(ctx context.Context, entry toolEntry, via string, a
 		// Tracked so shutdown waits for the granted execution to finish
 		// and record its outcome. An async tool redeems and runs in its
 		// job (jobs_tools.go).
-		call := jobCall{entry: entry, args: cleanArgs, agentID: agentID, reason: reason, intent: intent, callbackRef: callbackRefFrom(ctx), grant: true}
+		call := jobCall{entry: entry, args: cleanArgs, agentID: agentID, reason: reason, intent: intent, callbackRef: callbackRefFrom(ctx), grant: true, grantToken: grantToken}
 		return g.runOrStartJob(ctx, call, &ev, func(ctx context.Context, e toolEntry, ev *metrics.Event) (*mcp.CallToolResult, error) {
 			done := g.grantCalls.Add(e.tool.Name)
 			defer done()
