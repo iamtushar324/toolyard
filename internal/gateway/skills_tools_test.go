@@ -737,3 +737,22 @@ func TestSkillsProposeSourceRateLimited(t *testing.T) {
 		t.Fatalf("message = %q", msg)
 	}
 }
+
+// TestToolsSearchNamesSkillsOnlyWithTheHub: the tools.search description
+// mentions skills only while the hub is registered.
+func TestToolsSearchNamesSkillsOnlyWithTheHub(t *testing.T) {
+	off := newAccessFixture(t, nil)
+	off.gw.mu.RLock()
+	desc := off.gw.tools[MetaSearchTool].tool.Description
+	off.gw.mu.RUnlock()
+	if strings.Contains(desc, "skills") || desc != metaSearchDescription(false) {
+		t.Fatalf("hub off: %q", desc)
+	}
+	on := newSkillsFixture(t)
+	on.gw.mu.RLock()
+	desc = on.gw.tools[MetaSearchTool].tool.Description
+	on.gw.mu.RUnlock()
+	if !strings.Contains(desc, metaSearchSkillsSentence) {
+		t.Fatalf("hub on: %q", desc)
+	}
+}

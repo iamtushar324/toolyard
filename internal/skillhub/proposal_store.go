@@ -215,3 +215,52 @@ func (st proposalStore) remove(ctx context.Context, id string) error {
 	_, err := st.db.ExecContext(ctx, `DELETE FROM skill_proposals WHERE id = ?`, id)
 	return err
 }
+
+// pendingForSource lists the pending rows of one kind about a source.
+func (st proposalStore) pendingForSource(ctx context.Context, kind, sourceID string) ([]proposalRow, error) {
+	rows, err := st.db.QueryContext(ctx, `SELECT `+proposalColumns+` FROM skill_proposals WHERE kind = ? AND source_id = ? AND status = ? ORDER BY created_at`,
+		kind, sourceID, proposalPending)
+	if err != nil {
+		return nil, err
+	}
+	return collectProposals(rows)
+}
+
+// staleApproved lists rows of one kind still approved (being applied)
+// whose last update is older than before: an approval whose process
+// stopped before it finished.
+func (st proposalStore) staleApproved(ctx context.Context, kind string, before int64, limit int) ([]proposalRow, error) {
+	rows, err := st.db.QueryContext(ctx, `SELECT `+proposalColumns+` FROM skill_proposals WHERE kind = ? AND status = ? AND updated_at < ? ORDER BY updated_at LIMIT ?`,
+		kind, proposalApproved, before, limit)
+	if err != nil {
+		return nil, err
+	}
+	return collectProposals(rows)
+}
+
+// claim moves a row's updated_at to now when it is still in status with
+// updatedAt (compare-and-swap), and reports whether this caller won: of
+// two replicas resuming the same row, one goes on.
+func (st proposalStore) claim(ctx context.Context, id, status string, updatedAt int64) (bool, error) {
+	res, err := st.db.ExecContext(ctx, `UPDATE skill_proposals SET updated_at = ? WHERE id = ? AND status = ? AND updated_at = ?`,
+		max(st.now().UnixMilli(), updatedAt+1), id, status, updatedAt)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	return n == 1, err
+}
+
+// collectProposals reads and closes a row set.
+func collectProposals(rows *sql.Rows) ([]proposalRow, error) {
+	defer rows.Close()
+	var out []proposalRow
+	for rows.Next() {
+		r, err := scanProposal(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, *r)
+	}
+	return out, rows.Err()
+}

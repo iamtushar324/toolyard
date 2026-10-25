@@ -128,3 +128,25 @@ test('members can open their owner approvals (Inbox) from desktop and mobile nav
   }
   assert.equal(h.run("routeAllowed('settings')"), false);
 });
+
+test('the Skills page shows only while the skills hub is on', () => {
+  const h = harness();
+  h.context.location = { hash: '#inbox' };
+  h.context.history = { pushState() {}, replaceState() {} };
+  h.run("state.user = { id: 'admin', role: 'admin', email: 'admin@example.test' }; state.route = 'inbox'; state.authConfig = { capabilities: { skills: false } }");
+  const skillsButtons = () => nodes(h.run("shell(el('div', {}, 'content'))"), 'button').filter(b => text(b).includes('Skills'));
+  assert.equal(skillsButtons().length, 0, 'no Skills nav while the hub is off');
+  assert.equal(h.run("routeAllowed('skills')"), false);
+  assert.equal(h.run("state.authConfig = null; routeAllowed('skills')"), false, 'unknown means off');
+  h.run("state.authConfig = { capabilities: { skills: true } }");
+  assert.ok(skillsButtons().length >= 1, 'the Skills nav is back when the hub is on');
+  assert.equal(h.run("routeAllowed('skills')"), true);
+  h.run("state.user.role = 'member'");
+  assert.equal(h.run("routeAllowed('skills')"), false, 'members never see it');
+});
+
+test('an operator-token decision is labelled as such', () => {
+  const h = harness();
+  assert.equal(h.run("decidedViaLabel('operator')"), 'operator token');
+  assert.equal(h.run("decidedViaLabel('dashboard')"), 'dashboard');
+});

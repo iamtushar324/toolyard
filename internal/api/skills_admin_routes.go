@@ -468,7 +468,7 @@ func (s *Server) skillSource(w http.ResponseWriter, r *http.Request, u *identity
 			writeSkillAdminError(w, err)
 			return
 		}
-		s.settleSkillReviews(r.Context(), id, "", "the source was deleted")
+		s.settleDeletedSkillSource(r.Context(), id, "the source was deleted")
 		s.auditSkillAdmin(r, u, "skills.source_delete", id, "")
 		writeJSON(w, http.StatusOK, map[string]bool{"ok": true})
 	default:
@@ -637,6 +637,26 @@ func (s *Server) settleSkillReviews(ctx context.Context, sourceID, versionID, re
 	if err := s.skillReviews.Settle(ctx, sourceID, versionID, reason); err != nil {
 		log.Printf("skills: close review items of %s: %v", sourceID, err)
 	}
+}
+
+// skillSourceDeleted is the part of the review settler that also closes the
+// agents' change proposals against a deleted source
+// (skillhub.ReviewInbox.SourceDeleted).
+type skillSourceDeleted interface {
+	SourceDeleted(ctx context.Context, sourceID, reason string) error
+}
+
+// settleDeletedSkillSource closes every open question about a deleted
+// source: its review items and, when the settler can, the change
+// proposals against it. The Inbox sweep closes what this misses.
+func (s *Server) settleDeletedSkillSource(ctx context.Context, sourceID, reason string) {
+	if sd, ok := s.skillReviews.(skillSourceDeleted); ok {
+		if err := sd.SourceDeleted(ctx, sourceID, reason); err != nil {
+			log.Printf("skills: close the open questions of %s: %v", sourceID, err)
+		}
+		return
+	}
+	s.settleSkillReviews(ctx, sourceID, "", reason)
 }
 
 func (s *Server) auditSkillAdmin(r *http.Request, u *identity.User, event, summary, reason string) {

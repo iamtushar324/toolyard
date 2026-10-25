@@ -5,6 +5,7 @@ package skillhub
 
 import (
 	"context"
+	"encoding/json"
 	"strings"
 	"sync"
 	"testing"
@@ -33,6 +34,13 @@ type proposalFakeAdmin struct {
 	// GetSource reports as PendingVersionID. A source not in it does not
 	// exist.
 	pending map[string]string
+	// active is each source's live version (GetSource's ActiveVersionID);
+	// Activate sets it.
+	active map[string]string
+	// created are the sources CreateSource made, which ListSources lists;
+	// now stamps their CreatedAt (default time.Now).
+	created []Source
+	now     func() time.Time
 
 	previews  []SourceInput
 	previewBy []string
@@ -61,6 +69,8 @@ func newProposalFakeAdmin() *proposalFakeAdmin {
 		syncResult: SyncResult{SHA: "0123456789abcdef0123456789abcdef01234567", Activated: true},
 		trusted:    map[string]bool{"anthropics": true},
 		pending:    map[string]string{},
+		active:     map[string]string{},
+		now:        time.Now,
 	}
 }
 
@@ -106,7 +116,10 @@ func (f *proposalFakeAdmin) CreateSource(_ context.Context, by string, in Source
 		return nil, f.createErr
 	}
 	ref, _ := f.ParseURL(in.URL)
-	return &Source{ID: "src_00000001", Slug: ref.Repo, Owner: ref.Owner, Repo: ref.Repo, Branch: in.Branch, Path: in.Path, Mode: in.Mode, CreatedBy: by}, nil
+	src := Source{ID: "src_00000001", Slug: ref.Repo, Owner: ref.Owner, Repo: ref.Repo, Branch: in.Branch, Path: in.Path, Mode: in.Mode,
+		CreatedBy: by, CreatedAt: f.now()}
+	f.created = append(f.created, src)
+	return &src, nil
 }
 
 func (f *proposalFakeAdmin) UpdateSource(context.Context, string, string, SourceUpdate) (*Source, error) {
@@ -120,9 +133,13 @@ func (f *proposalFakeAdmin) GetSource(_ context.Context, id string) (*Source, er
 	if !ok {
 		return nil, ErrNotFound
 	}
-	return &Source{ID: id, Slug: "team-skills", Owner: "acme", Repo: "skills", Mode: ModeReview, PendingVersionID: pending}, nil
+	return &Source{ID: id, Slug: "team-skills", Owner: "acme", Repo: "skills", Mode: ModeReview, PendingVersionID: pending, ActiveVersionID: f.active[id]}, nil
 }
-func (f *proposalFakeAdmin) ListSources(context.Context) ([]Source, error) { return nil, nil }
+func (f *proposalFakeAdmin) ListSources(context.Context) ([]Source, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]Source(nil), f.created...), nil
+}
 
 func (f *proposalFakeAdmin) SyncNow(_ context.Context, id string) (*SyncResult, error) {
 	f.mu.Lock()
@@ -149,6 +166,7 @@ func (f *proposalFakeAdmin) Activate(_ context.Context, by, id, versionID string
 	f.activates = append(f.activates, [3]string{by, id, versionID})
 	if f.activateErr == nil && f.pending[id] == versionID {
 		f.pending[id] = ""
+		f.active[id] = versionID
 	}
 	return f.activateErr
 }
@@ -194,6 +212,7 @@ func newProposalEnv(t *testing.T) *proposalEnv {
 	t.Helper()
 	e := &proposalEnv{db: storetest.Open(t), admin: newProposalFakeAdmin(),
 		admins: map[string]bool{"u_owner": true}, now: time.Date(2026, 10, 25, 9, 0, 0, 0, time.UTC)}
+	e.admin.now = e.clock
 	svc, err := inbox.New(context.Background(), inbox.Options{DB: e.db, Now: e.clock})
 	if err != nil {
 		t.Fatal(err)
@@ -240,4 +259,33 @@ func proposalActivity(r *inbox.Request) string {
 // proposalDecider is a dashboard decision by uid.
 func proposalDecider(uid string) actor.Decider {
 	return actor.Decider{UserID: uid, Name: uid, Via: actor.ViaDashboard}
+}
+
+// dropSystemTag rewrites an Inbox item without its system tag, as a
+// replica that predates system items does when it snoozes or decides it.
+func dropSystemTag(t *testing.T, db *store.DB, inboxID string) {
+	t.Helper()
+	var doc string
+	if err := db.QueryRowContext(context.Background(), `SELECT doc FROM inbox_requests WHERE id = ?`, inboxID).Scan(&doc); err != nil {
+		t.Fatal(err)
+	}
+	var m map[string]any
+	if err := json.Unmarshal([]byte(doc), &m); err != nil {
+		t.Fatal(err)
+	}
+	delete(m, "system")
+	b, _ := json.Marshal(m)
+	if _, err := db.ExecContext(context.Background(), `UPDATE inbox_requests SET doc = ? WHERE id = ?`, string(b), inboxID); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// ageRow makes a row approved by uid and last updated d before now, as an
+// approval whose process stopped leaves it.
+func ageRow(t *testing.T, db *store.DB, id, uid string, at time.Time) {
+	t.Helper()
+	if _, err := db.ExecContext(context.Background(), `UPDATE skill_proposals SET status = ?, decided_by = ?, decided_at = ?, updated_at = ? WHERE id = ?`,
+		proposalApproved, uid, at.UnixMilli(), at.UnixMilli(), id); err != nil {
+		t.Fatal(err)
+	}
 }

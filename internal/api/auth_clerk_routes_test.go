@@ -305,3 +305,23 @@ func TestPersonalClerkOnly(t *testing.T) {
 		t.Fatalf("owner session %d %s", me.Code, me.Body.String())
 	}
 }
+
+// TestAuthConfigSkillsCapability: the dashboard shows the Skills page only
+// while the skills hub is on (it is off with -skills=off).
+func TestAuthConfigSkillsCapability(t *testing.T) {
+	e := newAccessTestServer(t)
+	caps := func() map[string]any {
+		t.Helper()
+		got := decodeJSON(t, e.do(t, nil, http.MethodGet, "/v1/auth/config", ""))
+		c, _ := got["capabilities"].(map[string]any)
+		return c
+	}
+	e.srv.skillsAdmin = nil
+	if c := caps(); c["skills"] != false {
+		t.Fatalf("hub off: capabilities %v", c)
+	}
+	e.srv.skillsAdmin = &skillsAdminFake{}
+	if c := caps(); c["skills"] != true {
+		t.Fatalf("hub on: capabilities %v", c)
+	}
+}

@@ -604,6 +604,15 @@ the database and serves only that copy. How sync, review and limits work:
   named `skills`) is gone: the name now belongs to the hub's own
   `skills.*` tools. A stored server under that name is not loaded, and its
   status says so; delete it on the Servers page.
+- **Upgrade: API changes to watch.** An Inbox decision sent with an
+  operator token is now recorded with `decided_via: operator` (it was
+  `dashboard`) in the item and its audit row; scripts that
+  filter on `decided_via` should accept it. `GET /v1/settings` gains the
+  skills keys `skills_trusted_github_owners` (default `""`) and
+  `skills_change_allow_build_files` (default `false`); both need an
+  operator token's owner scope to change. `GET /v1/auth/config` lists
+  `skills` under `capabilities`; with `-skills=off` it is `false`, and the
+  dashboard hides the Skills page.
 
 ## Inbox and permissions
 

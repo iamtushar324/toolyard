@@ -22,18 +22,31 @@ const (
 	MetaExecuteTool = "tools.execute"
 )
 
+// metaSearchSkillsSentence joins the tools.search description only while
+// the skills hub is registered (RegisterSkillHub): with the hub off the
+// description stays as it was before the hub existed.
+const metaSearchSkillsSentence = "When toolyard serves skills, the answer also names up to 3 matching skills under \"skills\" (playbooks: read one with skills.get). "
+
+// metaSearchDescription is the tools.search description, with the skills
+// sentence when skills is set.
+func metaSearchDescription(skills bool) string {
+	d := descriptionBanner + "Search the toolyard catalog for the tools you may use, ranked. " +
+		"mode \"keyword\" (default) ranks by BM25 over tool names (split at dots, underscores and camelCase), descriptions, parameter names and parameter descriptions: query \"create a linear issue\". " +
+		"mode \"regex\" matches an RE2 pattern (at most 200 characters, case-insensitive unless the pattern turns that off) against the same fields: query \"^github\\\\..*pull\". " +
+		"mode \"auto\" is keyword; \"semantic\" works only where an operator configured it. " +
+		"detail \"full\" (default) returns name, upstream, description, the code-mode name, score and the input and output schemas; \"summary\" leaves out the schemas; \"name\" only names. "
+	if skills {
+		d += metaSearchSkillsSentence
+	}
+	return d + "Use it before tools.execute, or in code mode: JavaScript `await tools.search(\"query\", { limit: 5 })`, Starlark `toolyard.tools_search(query=\"...\")`."
+}
+
 // metaTools returns the search/execute meta-tools as toolEntry values ready to
 // register on the MCP server.
 func (g *Gateway) metaTools() []toolEntry {
 	search := mcp.Tool{
-		Name: MetaSearchTool,
-		Description: descriptionBanner + "Search the toolyard catalog for the tools you may use, ranked. " +
-			"mode \"keyword\" (default) ranks by BM25 over tool names (split at dots, underscores and camelCase), descriptions, parameter names and parameter descriptions: query \"create a linear issue\". " +
-			"mode \"regex\" matches an RE2 pattern (at most 200 characters, case-insensitive unless the pattern turns that off) against the same fields: query \"^github\\\\..*pull\". " +
-			"mode \"auto\" is keyword; \"semantic\" works only where an operator configured it. " +
-			"detail \"full\" (default) returns name, upstream, description, the code-mode name, score and the input and output schemas; \"summary\" leaves out the schemas; \"name\" only names. " +
-			"When toolyard serves skills, the answer also names up to 3 matching skills under \"skills\" (playbooks: read one with skills.get). " +
-			"Use it before tools.execute, or in code mode: JavaScript `await tools.search(\"query\", { limit: 5 })`, Starlark `toolyard.tools_search(query=\"...\")`.",
+		Name:        MetaSearchTool,
+		Description: metaSearchDescription(false),
 		InputSchema: mcp.ToolInputSchema{
 			Type:     "object",
 			Required: []string{ReasonField},
