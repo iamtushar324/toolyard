@@ -1,6 +1,7 @@
 package api
 
 import (
+	"context"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
@@ -131,5 +132,41 @@ func TestOnlyTheOwnerAdminMayLetAnAppManageToolyard(t *testing.T) {
 	}
 	if code := post(adminCookie, adminApp, false); code != http.StatusOK {
 		t.Fatalf("the admin owner could not turn may_manage off: %d", code)
+	}
+}
+
+// TestDeletingAnAppAgentRunsTheCancelHook: DELETE /v1/agents/{id} on an
+// OAuth app's agent runs the revocation follow-up (OnRevoke).
+func TestDeletingAnAppAgentRunsTheCancelHook(t *testing.T) {
+	e := newAccessTestServer(t)
+	ctx := t.Context()
+	var revoked []string
+	svc := mcpauth.New(mcpauth.Options{DB: e.db, PublicURL: "https://toolyard.example.com", Access: e.access,
+		OnRevoke: func(_ context.Context, agentID string) { revoked = append(revoked, agentID) }})
+	e.srv.MCPOAuthRoutes(http.NewServeMux(), svc)
+	reg, oerr := svc.Register(ctx, []byte(`{"redirect_uris":["https://a.example/cb"],"token_endpoint_auth_method":"none"}`), "198.51.100.7")
+	if oerr != nil {
+		t.Fatal(oerr)
+	}
+	q := url.Values{"response_type": {"code"}, "client_id": {reg.ClientID}, "redirect_uri": {"https://a.example/cb"},
+		"code_challenge": {strings.Repeat("a", 43)}, "code_challenge_method": {"S256"}}
+	req, aerr := svc.BeginAuthorize(ctx, q, "198.51.100.7")
+	if aerr != nil {
+		t.Fatalf("authorize: %+v", aerr)
+	}
+	if _, err := svc.Approve(ctx, req.ID, e.admin, mcpauth.Consent{Nickname: "App"}); err != nil {
+		t.Fatal(err)
+	}
+	apps, _ := svc.ListApps(ctx, e.admin.ID)
+	r := httptest.NewRequest(http.MethodDelete, "/v1/agents/"+apps[0].AgentID, nil)
+	r.Header.Set("X-Requested-With", "toolyard")
+	r.AddCookie(e.cookieFor(t, e.admin.ID))
+	rec := httptest.NewRecorder()
+	e.handler.ServeHTTP(rec, r)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("delete: %d %s", rec.Code, rec.Body)
+	}
+	if len(revoked) != 1 || revoked[0] != apps[0].AgentID {
+		t.Fatalf("OnRevoke after the delete: %v", revoked)
 	}
 }

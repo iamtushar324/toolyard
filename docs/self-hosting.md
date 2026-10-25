@@ -181,8 +181,12 @@ id in `audit_events.oauth_client_id` (a trigger fills it from the grant).
 The grant row is the agent's tombstone: deleting the agent keeps the
 mapping, and connecting the client again recreates the agent under the same
 id. Deleting an app's agent revokes its grant, tokens and unused codes in
-the same transaction, and every new consent for a client stops all token
-chains and codes issued to it before. An app's agent cannot be given a
+the same transaction and cancels what it had pending. A new consent for a
+client stops the unused codes issued before it; it stops earlier token
+chains only when the grant comes back from a revoke or a deleted or
+disabled agent, or when the person ticks "Sign out this app's other
+sessions" (a client metadata document client shares one client_id across
+installs, so one person's devices share a grant). An app's agent cannot be given a
 static agent token (rotation and enrolment refuse it).
 
 **Security notes.**
@@ -195,11 +199,12 @@ static agent token (rotation and enrolment refuse it).
   `ms-officecmd:` and similar schemes are always refused.
 - Before the person answers, an invalid authorization request is shown to
   the person as an error page. It goes back to the client only when the
-  client, its redirect URI and `response_type=code` are all valid and the
-  redirect URI is trusted: named by `mcp_oauth_redirect_hosts`, or on the
-  host of the client's own metadata document. A self-registered client's
-  redirect URI is never trusted this way, so toolyard is never an open
-  redirect. After the person answers, allow and deny always redirect.
+  client, its redirect URI and `response_type=code` are all valid and
+  `mcp_oauth_redirect_hosts` names the redirect host. Neither a
+  self-registered client nor a client metadata document makes a redirect
+  URI trusted (anyone can host a document that lists their own site), so
+  toolyard is never an open redirect. After the person answers, allow and
+  deny always redirect.
   `state` is optional (PKCE is required); a request without `resource` gets
   `<public-url>/mcp`.
 - Client ID metadata documents are fetched only while handling an
@@ -215,21 +220,26 @@ static agent token (rotation and enrolment refuse it).
   network 80), all addresses together 600; one client_id is fetched once at
   a time, and a requester that leaves does not fail the others waiting. A
   definite failure (the document answered wrongly, or toolyard refuses its
-  address) is not retried for 5 minutes; a network failure is not cached,
-  and an expired copy keeps serving until a fetch succeeds. The requester
-  gets a generic error (the detail goes to the log). A document is cached
-  for its `max-age` (5 minutes to 24 hours).
+  address) is not retried for 5 minutes. A network failure or a temporary
+  answer (HTTP 408, 429, 5xx) is not cached, and an expired copy keeps
+  serving until a fetch succeeds, also while the fetch limits are full,
+  for at most 7 days after it expired. The requester gets a generic error
+  (the detail goes to the log). A document is cached for its `max-age` (5
+  minutes to 24 hours).
 - Rate limits count per address (IPv6 by /64) and per network (IPv4 /24,
   IPv6 /48), and requests without a known address in one strict bucket.
-  Global caps apply only to work that costs more than a short-lived row:
-  registering a client and fetching a metadata document, never an
-  authorization for a known client. A registration nobody authorized is
-  swept after a day. An in-process pre-limit, global buckets first, refuses
-  floods before they write to the database.
+  Global caps apply to registering a client and fetching a metadata
+  document, and a high ceiling (50,000 per 10 minutes) to authorization
+  requests. A request counts toward a global cap only after it passed its
+  address's and network's limits, so one address cannot use up a global
+  budget. A registration nobody authorized is swept after a day. An
+  in-process pre-limit checks every bucket before it counts any, and
+  refuses floods before they write to the database; it never evicts a
+  global bucket.
 - Codes are single use and last 60 seconds. A code used twice revokes the
   tokens it produced. A refresh token used twice revokes the whole grant
   and disables its agent; the person connects the app again. A retry within
-  10 seconds, while the token that replaced it is still unused, is refused
+  60 seconds, while the token that replaced it is still unused, is refused
   without revoking anything. Revoking a grant (by its owner, its client or
   reuse detection) also cancels its agent's pending approvals (personal
   ones included) and Inbox requests, recorded as cancelled by the system

@@ -157,8 +157,9 @@ to your Inbox. When you select **Deny**, nothing is created and the app gets
 
 If you connect the same app again (for example after you revoked it),
 toolyard asks again and keeps the same agent, so its activity history
-stays in one place. The new consent replaces the old one: the app's earlier
-sign-ins stop working.
+stays in one place. If the app is still connected elsewhere (for example
+on your other device), that session keeps working, unless you tick **Sign
+out this app's other sessions** on the consent screen.
 
 ## Restrict a connection
 

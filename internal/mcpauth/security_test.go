@@ -883,3 +883,100 @@ func TestDeletedAgentKeepsItsGrantAsATombstone(t *testing.T) {
 		t.Fatalf("reconnect after delete: %+v %v", back, err)
 	}
 }
+
+// TestAgentDeletedRunsTheCancelHook: deleting an app's agent through the
+// generic routes cancels what it had pending, on a context the request
+// ending does not cancel; an ordinary agent's delete runs nothing.
+func TestAgentDeletedRunsTheCancelHook(t *testing.T) {
+	f := newFixture(t)
+	var got []string
+	var liveCtx bool
+	f.svc = New(Options{DB: f.db, PublicURL: testPublic, Settings: f.settings, Now: func() time.Time { return f.clock },
+		OnRevoke: func(ctx context.Context, agentID string) { got = append(got, agentID); liveCtx = ctx.Err() == nil }})
+	redirect := "https://client.example/cb"
+	c := f.register(t, "none", redirect)
+	verifier, challenge := pkcePair(t)
+	code := f.approve(t, f.user, c.ClientID, redirect, challenge, Consent{Nickname: "Gone"})
+	tok, oerr := f.svc.Exchange(context.Background(), codeForm(code, redirect, verifier), ClientAuth{ClientID: c.ClientID})
+	if oerr != nil {
+		t.Fatal(oerr)
+	}
+	ag, _ := f.svc.VerifyAccessToken(context.Background(), tok.AccessToken)
+	if err := identity.New(f.db).DeleteAgent(context.Background(), f.user.ID, ag.ID); err != nil {
+		t.Fatal(err)
+	}
+	cancelled, cancel := context.WithCancel(context.Background())
+	cancel()
+	f.svc.AgentDeleted(cancelled, ag.ID)
+	if len(got) != 1 || got[0] != ag.ID || !liveCtx {
+		t.Fatalf("OnRevoke after delete: %v (live context %v)", got, liveCtx)
+	}
+	_, plain, err := identity.New(f.db).CreateAgentWithToken(context.Background(), f.user.ID, "plain")
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.svc.AgentDeleted(context.Background(), plain.ID)
+	if len(got) != 1 {
+		t.Fatalf("OnRevoke ran for an ordinary agent: %v", got)
+	}
+}
+
+// TestGrantLocksComeFirst: code exchange and refresh lock the grant row
+// before their code or token, like Approve; a refresh racing a consent on
+// the same grant completes both (no deadlock on Postgres).
+func TestGrantLocksComeFirst(t *testing.T) {
+	f := newFixture(t)
+	redirect := "https://client.example/cb"
+	c := f.register(t, "none", redirect)
+	ca := ClientAuth{ClientID: c.ClientID}
+	ctx := context.Background()
+	verifier, challenge := pkcePair(t)
+	code := f.approve(t, f.user, c.ClientID, redirect, challenge, Consent{Nickname: "Locks"})
+	tok, oerr := f.svc.Exchange(ctx, codeForm(code, redirect, verifier), ca)
+	if oerr != nil {
+		t.Fatal(oerr)
+	}
+	var wg sync.WaitGroup
+	errs := make(chan error, 8)
+	refresh := tok.RefreshToken
+	var mu sync.Mutex
+	for i := 0; i < 4; i++ {
+		wg.Add(2)
+		go func() {
+			defer wg.Done()
+			mu.Lock()
+			rt := refresh
+			mu.Unlock()
+			if resp, oerr := f.svc.Exchange(ctx, refreshForm(rt), ca); oerr == nil {
+				mu.Lock()
+				refresh = resp.RefreshToken
+				mu.Unlock()
+			} else if oerr.Code != "invalid_grant" {
+				errs <- oerr
+			}
+		}()
+		go func() {
+			defer wg.Done()
+			_, ch := pkcePair(t)
+			req, aerr := f.svc.BeginAuthorize(ctx, authorizeQuery(c.ClientID, redirect, ch, nil), "198.51.100.7")
+			if aerr != nil {
+				errs <- aerr.Error
+				return
+			}
+			if _, err := f.svc.Approve(ctx, req.ID, f.user, Consent{Nickname: "Locks"}); err != nil {
+				errs <- err
+			}
+		}()
+	}
+	done := make(chan struct{})
+	go func() { wg.Wait(); close(done) }()
+	select {
+	case <-done:
+	case <-time.After(30 * time.Second):
+		t.Fatal("a refresh racing a consent did not finish (deadlock)")
+	}
+	close(errs)
+	for err := range errs {
+		t.Errorf("racing refresh and consent: %v", err)
+	}
+}
