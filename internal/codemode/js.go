@@ -72,9 +72,14 @@ const (
 	jsSlackMiB = 8
 	// jsMinHeapMiB is the smallest heap a script gets.
 	jsMinHeapMiB = 16
-	// jsStackSize is QuickJS's stack limit; the module's C stack is 2 MiB,
-	// so deep recursion is a RangeError, never an overflow.
-	jsStackSize = "1m"
+	// jsStackSize is QuickJS's stack limit. Two ceilings sit above it: the
+	// module's 2 MiB C stack, and wazero's interpreter, which allows 2,000
+	// WebAssembly call frames (one or more per JavaScript call). 192 KiB
+	// lets QuickJS raise its own RangeError ("Maximum call stack size
+	// exceeded") well before either, a little over a thousand calls deep for
+	// the smallest functions; anything that still reaches wazero's ceiling
+	// is reported as the same RangeError.
+	jsStackSize = "192k"
 	// jsStderrCap bounds what is kept of the engine's stderr.
 	jsStderrCap = 16 << 10
 )
@@ -405,8 +410,10 @@ func (h *jsHost) outcome(ctx context.Context, runErr error, stderr, stopNote str
 		return scriptResult{errKind: "runtime", errMsg: cut(detail, maxErrorBytes, "… [error message truncated at 64 KiB]")}
 	case errors.As(runErr, &exit) && exit.ExitCode() != 0:
 		return scriptResult{errKind: "runtime", errMsg: fmt.Sprintf("the JavaScript engine exited with code %d before the script finished", exit.ExitCode())}
+	case runErr != nil && strings.Contains(runErr.Error(), "stack overflow"):
+		return scriptResult{errKind: "runtime", errMsg: "RangeError: Maximum call stack size exceeded (the script recursed deeper than the engine allows)"}
 	case runErr != nil:
-		return scriptResult{errKind: "runtime", errMsg: "the JavaScript engine stopped: " + runErr.Error()}
+		return scriptResult{errKind: "runtime", errMsg: "the JavaScript engine stopped: " + firstLine(runErr.Error())}
 	}
 	return scriptResult{errKind: "runtime", errMsg: "the script ended without finishing: its top-level promise never settled, because it awaited a promise nothing resolves (tool calls always settle; code mode has no setTimeout)"}
 }

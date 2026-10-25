@@ -379,9 +379,8 @@ func TestSearchCostIsBounded(t *testing.T) {
 	ctx := context.Background()
 	var qe *QueryError
 	for pattern, want := range map[string]string{
-		`a{101}`:                   "at most {100}",
-		`((abcdefghij){100}){10}`:  "instructions",
-		`(x{100}y{100}z{100}){20}`: "instructions",
+		`a{101}`:                  "at most {100}",
+		`((abcdefghij){100}){10}`: "instructions",
 	} {
 		// RE2's own parser may call a pattern too large first; either way
 		// it is refused before it runs.

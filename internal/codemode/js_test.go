@@ -219,7 +219,7 @@ func TestJavaScriptErrors(t *testing.T) {
 		{"await tools.nope.x({});", []string{"Execution runtime error:", "TypeError"}},
 		{`await tools.call("demo.missing", {});`, []string{`no tool "demo.missing"`}},
 		{"return tools.demo.read('not an object');", []string{"tool arguments must be an object"}},
-		{"await new Promise(() => {});", []string{"never settles"}},
+		{"await new Promise(() => {});", []string{"never settled"}},
 		{"Promise.reject(new Error('lost'));\nawait tools.demo.read({ q: 'x' });", []string{"Possibly unhandled promise rejection", "lost"}},
 	}
 	for _, c := range cases {
