@@ -140,8 +140,13 @@ that writes the final status:
 The event never carries the result: read it with `jobs.result` or
 `GET result_ref` under your own token. A call with `async after N ms` that
 finished in time answered inline and sends no callback. Receivers are
-registered with the `callbacks.*` tools (see the agent protocol); without a
-`_callback_ref` the agent's default receiver, if any, applies.
+registered with the `callbacks.*` tools (see the agent protocol), and get
+job events only when their `events` list asks for them: `job.completed`,
+`job.failed`, `job.*` or `*` (a receiver that names no events gets the
+Inbox events only). Without a `_callback_ref` the agent's default
+receiver, if any, applies. A `_callback_ref` that is not one of the
+agent's active receivers sends nothing; the job records why in
+`callback_error`.
 
 ## 5. REST
 

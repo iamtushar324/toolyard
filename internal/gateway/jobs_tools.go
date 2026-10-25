@@ -534,7 +534,7 @@ func jobEnvelope(job *jobs.Job) *mcp.CallToolResult {
 	}
 	if job.CallbackRef != "" {
 		body["callback_ref"] = job.CallbackRef
-		body["callback"] = "toolyard sends a job.completed or job.failed event to this receiver when the job ends"
+		body["callback"] = "toolyard sends a job.completed or job.failed event to this receiver when the job ends, if its events list asks for job events (job.*)"
 	}
 	text := fmt.Sprintf("%s runs as an async job.\njob_id: %s (status %s)\n"+
 		"Get the result: jobs.wait(job_id=%q, timeout_seconds=60) blocks until it ends (up to 60 s); jobs.status(job_id=%q) does not block. "+

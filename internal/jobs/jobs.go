@@ -126,11 +126,11 @@ type InputError struct {
 func (e *InputError) Error() string { return e.Field + ": " + e.Message }
 
 // Notifier is told, inside the transaction that records a job's final
-// status, that the job finished. The orchestrator wires it to the
-// callbacks service: callbacks.EmitForAgentTx(ctx, tx, job.AgentID,
-// job.CallbackRef, CallbackEvent(job)), which uses the agent's default
-// receiver when the job has no callback_ref and does nothing when there is
-// none. It is called for every finished job; only an error it returns is
+// status, that the job finished. The gateway binary wires it to the
+// callbacks service through EmitterNotifier: callbacks.EmitForAgentTx(ctx,
+// tx, job.AgentID, job.CallbackRef, CallbackEvent(job)), which uses the
+// agent's default receiver when the job has no callback_ref and does
+// nothing when there is none. It is called for every finished job; only an error it returns is
 // recorded: the event is rolled back, the status written without it, and
 // the error kept in callback_error.
 type Notifier interface {
@@ -186,6 +186,26 @@ type NopNotifier struct{}
 // JobFinished does nothing.
 func (NopNotifier) JobFinished(context.Context, *sql.Tx, Job) error { return nil }
 
+// Emitter queues one callback event for agentID inside tx, to ref or, when
+// ref is "", to the agent's default receiver (nil when it has none):
+// callbacks.Service.EmitForAgentTx.
+type Emitter func(ctx context.Context, tx *sql.Tx, agentID, ref, eventType string, data any) error
+
+// EmitterNotifier is the Notifier that sends job.completed / job.failed
+// (CallbackEvent) through emit. A job of an anonymous caller with no
+// callback_ref has no receiver and sends nothing.
+func EmitterNotifier(emit Emitter) Notifier { return emitterNotifier{emit: emit} }
+
+type emitterNotifier struct{ emit Emitter }
+
+func (n emitterNotifier) JobFinished(ctx context.Context, tx *sql.Tx, j Job) error {
+	if n.emit == nil || (j.AgentID == "" && j.CallbackRef == "") {
+		return nil
+	}
+	ev, data := CallbackEvent(j)
+	return n.emit(ctx, tx, j.AgentID, j.CallbackRef, ev, data)
+}
+
 // Auditor records the job events toolyard decides itself (recovery, a job
 // that never started, an unknown outcome, access removed while running) in
 // the audit log. The gateway wires it.
@@ -200,8 +220,8 @@ type Auditor interface {
 type Guard func(ctx context.Context, agentID, upstream, tool string) bool
 
 // Leader runs fn while this process is the one node that should (the
-// retention purge). The orchestrator wires it to cluster.RunLeader. It
-// blocks until ctx ends.
+// retention purge): *cluster.Cluster in the binary. It blocks until ctx
+// ends.
 type Leader interface {
 	RunLeader(ctx context.Context, name string, fn func(ctx context.Context) error)
 }
@@ -311,8 +331,8 @@ type StartRequest struct {
 
 // Options configure a Service. Zero values pick the defaults.
 type Options struct {
-	// InstanceID names this process in owner_instance (cluster.InstanceID
-	// once slice A lands). Default: host name, process id and random hex.
+	// InstanceID names this process in owner_instance (the binary passes
+	// cluster.InstanceID). Default: host name, process id and random hex.
 	InstanceID string
 	Notifier   Notifier
 	Leader     Leader
@@ -358,7 +378,7 @@ const (
 type Service struct {
 	db           *store.DB
 	instance     string
-	notifier     Notifier
+	notifier     atomic.Pointer[notifierBox]
 	leader       Leader
 	blobs        blobstore.Store
 	leaseTTL     time.Duration
@@ -392,6 +412,8 @@ type Service struct {
 
 type auditorBox struct{ a Auditor }
 
+type notifierBox struct{ n Notifier }
+
 // run is one job goroutine of this process.
 type run struct {
 	cancel     context.CancelFunc
@@ -416,7 +438,7 @@ type run struct {
 // New returns a Service over db.
 func New(db *store.DB, opts Options) *Service {
 	s := &Service{
-		db: db, instance: opts.InstanceID, notifier: opts.Notifier, leader: opts.Leader, blobs: opts.Blobs,
+		db: db, instance: opts.InstanceID, leader: opts.Leader, blobs: opts.Blobs,
 		leaseTTL: opts.LeaseTTL, pollEvery: opts.PollEvery, retention: opts.Retention,
 		inlineLimit: opts.InlineLimit, maxResult: opts.MaxResultBytes, maxActive: opts.MaxActive,
 		maxPerOwner: opts.MaxActivePerOwner, maxAnonymous: opts.MaxActiveAnonymous,
@@ -426,9 +448,7 @@ func New(db *store.DB, opts Options) *Service {
 	if s.instance == "" {
 		s.instance = defaultInstanceID()
 	}
-	if s.notifier == nil {
-		s.notifier = NopNotifier{}
-	}
+	s.SetNotifier(opts.Notifier)
 	if s.leader == nil {
 		s.leader = DirectLeader{}
 	}
@@ -472,6 +492,15 @@ func New(db *store.DB, opts Options) *Service {
 	}
 	s.slots = newSlotPool(maxRunning, perAgent)
 	return s
+}
+
+// SetNotifier replaces the Notifier (nil: NopNotifier), for a callbacks
+// service built after the job service. Safe to call while it runs.
+func (s *Service) SetNotifier(n Notifier) {
+	if n == nil {
+		n = NopNotifier{}
+	}
+	s.notifier.Store(&notifierBox{n: n})
 }
 
 // SetAuditor wires the audit log. Safe to call while the service runs.

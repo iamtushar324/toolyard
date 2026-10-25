@@ -91,7 +91,7 @@ func (s *Service) settle(ctx context.Context, id string, from []string, guard st
 		if withNotice {
 			j, err := getJob(ctx, tx, id)
 			if err == nil {
-				err = s.notifier.JobFinished(ctx, tx, *j)
+				err = s.notifier.Load().n.JobFinished(ctx, tx, *j)
 			}
 			if err != nil {
 				return false, &noticeError{err: err}

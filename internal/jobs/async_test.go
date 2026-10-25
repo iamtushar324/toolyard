@@ -1,6 +1,8 @@
 package jobs
 
 import (
+	"context"
+	"database/sql"
 	"errors"
 	"strings"
 	"testing"
@@ -68,5 +70,25 @@ func TestCallbackEvent(t *testing.T) {
 		if ev, d := CallbackEvent(Job{ID: "job_2", Status: st, Error: "why"}); ev != EventJobFailed || d.ResultRef != "" || d.Error != "why" {
 			t.Fatalf("%s = %s %+v", st, ev, d)
 		}
+	}
+}
+
+func TestEmitterNotifier(t *testing.T) {
+	type call struct{ agent, ref, ev string }
+	var got []call
+	n := EmitterNotifier(func(_ context.Context, _ *sql.Tx, agentID, ref, eventType string, data any) error {
+		if d, ok := data.(CallbackData); !ok || d.JobID == "" {
+			t.Fatalf("data = %#v", data)
+		}
+		got = append(got, call{agentID, ref, eventType})
+		return nil
+	})
+	ctx := context.Background()
+	_ = n.JobFinished(ctx, nil, Job{ID: "job_1", AgentID: "ag_1", Status: StatusSucceeded})
+	_ = n.JobFinished(ctx, nil, Job{ID: "job_2", AgentID: "ag_1", CallbackRef: "cb_1", Status: StatusOutcomeUnknown})
+	_ = n.JobFinished(ctx, nil, Job{ID: "job_3", Status: StatusSucceeded}) // anonymous, no ref: nothing
+	want := []call{{"ag_1", "", EventJobCompleted}, {"ag_1", "cb_1", EventJobFailed}}
+	if len(got) != len(want) || got[0] != want[0] || got[1] != want[1] {
+		t.Fatalf("emitted %v, want %v", got, want)
 	}
 }

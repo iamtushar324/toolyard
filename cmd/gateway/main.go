@@ -698,7 +698,12 @@ func runServe(argv []string) error {
 	if err != nil {
 		return fmt.Errorf("job results: %w", err)
 	}
-	jobsSvc := jobs.New(db, jobs.Options{Blobs: jobBlobs, MaxDuration: *asyncJobTimeout})
+	// The jobs' leases carry this replica's cluster instance id, and the
+	// retention purge runs on the cluster leader.
+	jobsSvc := jobs.New(db, jobs.Options{
+		Blobs: jobBlobs, MaxDuration: *asyncJobTimeout,
+		InstanceID: clusterSvc.InstanceID(), Leader: clusterSvc,
+	})
 	jobsSvc.Run(ctx)
 	gw := gateway.New(gateway.Options{
 		Name:                "toolyard",
@@ -1035,6 +1040,9 @@ func runServe(argv []string) error {
 	// Webhooks: the callbacks.* tools, and approval.decided /
 	// approval.executed for legacy deferred approvals.
 	gw.RegisterCallbackTools(callbackSvc, federationSvc.PrivateReceiverAllowed)
+	// A finished async job sends job.completed / job.failed to its
+	// _callback_ref, or the agent's default receiver.
+	jobsSvc.SetNotifier(jobs.EmitterNotifier(callbackSvc.EmitForAgentTx))
 	bus.SetEventSink(callbackSvc)
 	upstreamSvc.SetSecrets(secretsSvc)
 
