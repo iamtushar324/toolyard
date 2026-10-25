@@ -511,12 +511,25 @@ func (s *session) perform(pc *preparedCall) (reply parentMsg) {
 	s.echoResponse(label, quoted, text)
 	out.text = text
 	reply = parentMsg{Status: StatusSucceeded, Text: text}
-	if s.lang == LanguageJavaScript && res != nil && res.StructuredContent != nil {
+	if s.lang == LanguageJavaScript {
 		// JavaScript gets the structured content, when the tool sent one
-		// that fits; the record keeps that value, so a resume replays it.
-		if raw, err := jsonText(res.StructuredContent, ""); err == nil && len(raw) <= maxCallResultBytes {
-			reply = parentMsg{Status: StatusSucceeded, JSON: json.RawMessage(raw)}
-			out.text = raw
+		// that fits (the record keeps that value, so a resume replays it);
+		// else text that is JSON goes as that JSON value. Either way the
+		// value is compact JSON made here, where memory is plentiful, so
+		// the worker passes it on to the engine without decoding a string
+		// or copying it again.
+		if res != nil && res.StructuredContent != nil {
+			if raw, err := jsonText(res.StructuredContent, ""); err == nil && len(raw) <= maxCallResultBytes {
+				reply = parentMsg{Status: StatusSucceeded, JSON: json.RawMessage(raw)}
+				out.text = raw
+			}
+		}
+		if reply.JSON == nil {
+			var buf bytes.Buffer
+			buf.Grow(len(text))
+			if json.Compact(&buf, []byte(text)) == nil {
+				reply = parentMsg{Status: StatusSucceeded, JSON: json.RawMessage(buf.Bytes())}
+			}
 		}
 	}
 	s.complete(st, req, pcall, out, res, nil, "", handled)

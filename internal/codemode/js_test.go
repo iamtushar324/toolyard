@@ -326,9 +326,9 @@ func TestJavaScriptDecodesLargeResults(t *testing.T) {
 	start := time.Now()
 	out := rt.Execute(context.Background(), `const rows = await tools.BkCoreServices.get_all_clients();
 return { rows: rows.length, last: rows[rows.length - 1].id };`, ExecOptions{Language: LanguageJavaScript, Echo: EchoNone})
-	t.Logf("a 5 MiB result took %s", time.Since(start))
+	t.Logf("a 5 MiB result took %s; the worker peaked at %d MiB resident", time.Since(start), rt.lastMaxRSSKiB.Load()>>10)
 	if out.Failed || !strings.Contains(out.Text, `"rows": 128000`) || !strings.Contains(out.Text, `"last": 1362566`) {
-		t.Fatalf("5 MiB result:\n%.1000s", out.Text)
+		t.Fatalf("5 MiB result (the worker peaked at %d MiB resident):\n%.1000s", rt.lastMaxRSSKiB.Load()>>10, out.Text)
 	}
 }
 

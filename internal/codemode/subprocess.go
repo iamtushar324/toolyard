@@ -148,6 +148,7 @@ func (r *Runtime) runWorker(ctx context.Context, s *session, start startMsg, sto
 				}
 			}
 			waitErr = cmd.Wait()
+			r.lastMaxRSSKiB.Store(maxRSSKiB(cmd.ProcessState))
 		})
 	}
 	defer finish(false)

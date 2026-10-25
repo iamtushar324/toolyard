@@ -388,8 +388,10 @@ type Runtime struct {
 	// only: it has no memory cap.
 	inProcess bool
 	// lastPID is the most recent worker's pid, for tests that check it is
-	// gone.
-	lastPID atomic.Int64
+	// gone; lastMaxRSSKiB its peak resident memory, for tests that report
+	// it.
+	lastPID       atomic.Int64
+	lastMaxRSSKiB atomic.Int64
 }
 
 // New returns a Runtime with the production worker. Zero fields in limits

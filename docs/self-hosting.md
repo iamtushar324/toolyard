@@ -136,8 +136,11 @@ Next to Starlark, scripts may be JavaScript (`executeToolCode` with
 `language: "javascript"`, `POST /v1/code/run` with `text/javascript`):
 QuickJS-NG compiled to WebAssembly (the official release build, embedded in
 the binary with its checksum pinned) and run by wazero's interpreter inside
-the same worker and sandbox. Its heap is half the worker's memory cap. The
-WebAssembly module itself gets no files, no environment and no network. The
+the same worker and sandbox. The worker's memory cap covers both its Go heap
+and the WebAssembly memory, so a JavaScript worker splits it: at 256 MiB,
+88 MiB of JavaScript heap inside 112 MiB of WebAssembly memory, and a
+136 MiB Go memory limit. The WebAssembly module itself gets no files, no
+environment and no network. The
 agent-facing guide is [guidelines/code-mode.md](guidelines/code-mode.md): the
 JavaScript API, TypeScript stubs, Starlark `try_call` and `parallel`, `echo`,
 the call ledger, and `tools.search` (BM25 keyword and RE2 regex search;

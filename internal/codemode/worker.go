@@ -59,9 +59,13 @@ func WorkerMain(stdin io.Reader, stdout, stderr io.Writer) int {
 	}
 	if start.Language == LanguageJavaScript {
 		// The WebAssembly memory shares the cap and is not Go heap: keep
-		// the Go heap to its own share (jsBudget).
+		// the Go heap to its own share (jsBudget), and collect garbage
+		// (large answers passing through) sooner. The engine itself
+		// allocates almost no Go memory while it runs, so the extra
+		// collections cost little.
 		_, _, goMiB := jsBudget(mib)
 		debug.SetMemoryLimit(int64(goMiB) << 20)
+		debug.SetGCPercent(50)
 	}
 	p := &pipeSink{r: r, w: stdout, limits: start.Limits, waiting: map[int]chan parentMsg{}}
 	stopNote := fmt.Sprintf("limit %s", start.Limits.ScriptTimeout)

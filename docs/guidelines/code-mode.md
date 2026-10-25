@@ -144,7 +144,7 @@ every audit row of the run: the outer call's and every nested call's
 ## Limits
 
 Per run: 5 minutes of wall clock, 100 tool calls, 1 MiB of output, a 256 MiB
-worker (a JavaScript program gets half of it as its heap; going past it is a
+worker (a JavaScript program's heap is 88 MiB of it; going past it is a
 catchable `out of memory` error), a 1 MiB returned value and 6 MiB per tool
 result. At most 8 calls of one program are in flight at once.
 
