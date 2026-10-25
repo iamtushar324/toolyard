@@ -324,14 +324,14 @@ mode they are `toolyard.skills_<name>` (Starlark) and
 | --- | --- | --- |
 | `skills.search` | `query`, `mode` (`keyword` default, `regex`), `source`, `limit` (10, at most 50), `include_host` | matching skills: name, description, uri, source, repo, commit, runs |
 | `skills.get` | `skill` (URI, `source/path`, or a unique bare name), `include_files` (default true) | the SKILL.md body and frontmatter, `root`, and every file with its URI, `sha256:` digest and size |
-| `skills.read` | `uri`, `offset`, `limit` (lines) | the file's content; when `truncated`, call again with `offset: next_offset` |
+| `skills.read` | `uri`, `offset`, `limit` (lines) | the file's content, at most 2,000 lines and 256 KiB per call; when `truncated`, call again with `offset: next_offset` |
 | `skills.grep` | `pattern` (RE2), `source`, `path` (glob), `ignore_case`, `limit` (50, at most 200), `include_host` | matching lines with their file URI, skill and line number |
 | `skills.sources` | none | the sources you see, with the commit each serves |
 | `skills.list` | `cursor`, `limit` (100, at most 500), `source`, `include_host` | a page of skills as MCP `skills/list` entries, plus `next_cursor` |
 | `skills.propose_source` | `url`, `branch`, `path`, `reason` | a pending proposal: an Inbox item for your owner; nothing is added before they approve (at most five waiting, ten an hour) |
 | `skills.proposal` | `id` | one of your proposals: `pending`, `approved`, `done` (with `result`: the new source's id, or a change proposal's pull request URL), `rejected` or `failed` (with `error`); poll this instead of proposing again |
 | `skills.propose_change` | `skill`, `files` (path → new content, `""` deletes), `title`, `summary` | a pending proposal against the version you see; after the source owner's approval toolyard opens a pull request |
-| `skills.bundle` | `skills` (1 to 50) | a `.tar.gz` download URL: one use, 10 minutes, no token needed |
+| `skills.bundle` | `skills` (1 to 50; no two with the same name; at most 64 MiB of files) | a `.tar.gz` download URL: one use, 10 minutes, no token needed |
 
 Before a multi-step task, call `skills.search` with a few words about the
 task; when a skill matches, read it with `skills.get` and follow it.
@@ -573,8 +573,12 @@ repository archive larger than 4 GiB uncompressed is refused.
 Reads have their own caps: search returns at most 50 results (10 by
 default); a listing page at most 500 skills (100 by default); grep stops
 at 200 matching lines, 5,000 files, 20 MB scanned or 2 seconds, and
-returns what it found by then; a bundle holds at most 200 skills and
-64 MiB.
+returns what it found by then; a bundle (`skills.bundle`) holds at most
+50 skills and 64 MiB of files, one folder per skill name; one
+`skills.read` call returns at most 2,000 lines and 256 KiB. A skill over
+the MCP Skills extension's per-skill limits (512 files or 16 MiB) is
+still served, with a warning on its version: some MCP hosts may refuse
+it.
 
 Each source records reads per skill per day (a `get`, a file `read`, or a
 bundle); the dashboard shows the last 30 days, and counts older than 90
@@ -584,9 +588,10 @@ days are deleted.
 
 While the hub is on, toolyard declares
 `capabilities.extensions["io.modelcontextprotocol/skills"] = {"directoryRead": true}`
-(with the `resources` capability) on both protocol versions: the
-2025-11-25 `initialize` result and the 2026-07-28 `server/discover`
-result. It serves:
+(with the `resources` capability) on both protocol versions of its HTTP
+endpoint (`/mcp`): the 2025-11-25 `initialize` result and the 2026-07-28
+`server/discover` result. `-stdio` does not declare it (it serves the
+tools and `resources/read`, not the extension's methods). It serves:
 
 - `skills/list` (`cursor`): your skills, each entry
   `{uri, frontmatter, resources: [{uri, digest, size}]}` with every file of
@@ -598,15 +603,32 @@ result. It serves:
 - `resources/directory/read` (`uri` of a skill folder or a folder in it):
   its direct children; folders have `mimeType: "inode/directory"`.
 
-An unknown URI, or one you cannot see, is JSON-RPC error `-32602` (invalid
-params). When a source's active version changes, toolyard sends
+URIs percent-encode each path segment (a space is `%20`, `#` is `%23`,
+`%` is `%25`, non-ASCII text is its UTF-8 bytes); folder URIs have no
+trailing slash. A skill at a source's folder itself is served under its
+name, `skill://<source>/<name>/SKILL.md`, so the last segment is always
+the skill's name; `skill://<source>/SKILL.md` still resolves. Listing a
+source's folder, or a folder above skills, leaves out the folders of
+skills that need the T3 host unless you run on it; a skill's own folder
+lists everything.
+
+These methods pass the same checks as the matching tool (`skills.list`,
+`skills.get`, `skills.read` for `resources/read` and
+`resources/directory/read`): your access, your agent's deny list and an
+explicit deny policy. A refused call answers like an unknown URI. An
+unknown URI, or one you cannot see, is JSON-RPC error `-32602` (invalid
+params), except `resources/read` on 2025-11-25, which answers `-32002`
+(resource not found) as for any other resource. When a source's active
+version changes, toolyard sends
 `notifications/resources/list_changed`, best effort: a stateless MCP
 connection never hears it, so re-list when you need fresh digests.
 
 Reads of skill content outside a tool call (`skills/get`,
 `resources/read`, `resources/directory/read`, a bundle download) write a
 `skill.read` audit row with the URI and `owner/repo@commit`, as tool calls
-do.
+do, also when they are refused; a bundle download lists every skill and
+its version in the row's arguments. A bundle link is a credential: the
+audit log, stored job results and code-run records keep it redacted.
 
 ## Security
 
@@ -647,7 +669,9 @@ details):
   caller sees only the sources its owner may see, and a skill it cannot
   see answers exactly like one that does not exist. An owner can switch
   the skills tools off for one agent (its deny list) or for everyone (an
-  explicit deny policy).
+  explicit deny policy); the same checks guard the MCP Skills extension
+  methods, bundle downloads (checked again when the link is used) and the
+  skills that `tools.search` adds.
 - **Proposals.** Only an agent whose owner is an admin may propose a
   source, a proposal never carries a token and keeps only the URL, branch
   and folder of the agent's input, one agent may have at most five waiting

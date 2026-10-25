@@ -221,10 +221,12 @@ func memberAllowed(method, path string) bool {
 	// Bearer-only routes (agent or session token) that never read a
 	// cookie: session tokens, code mode over REST, async jobs and the
 	// agent skills routes, whose bundle download is authenticated by the
-	// single-use ticket in its path (skills_routes.go). Not
-	// /v1/skills/sources, which the admin skill routes share.
+	// single-use ticket in its path (skills_routes.go). Of
+	// /v1/skills/sources only the GET is: it answers only an agent bearer
+	// (the agent listing); its POST creates a source (admin).
 	if strings.HasPrefix(path, sessionTokensPrefix) || strings.HasPrefix(path, codePathPrefix) ||
-		path == jobsPath || strings.HasPrefix(path, jobsPrefix) || skillsAgentPath(path) {
+		path == jobsPath || strings.HasPrefix(path, jobsPrefix) || skillsAgentPath(path) ||
+		(path == skillsSourcesPath && method == http.MethodGet) {
 		return true
 	}
 	// A native Inbox upload: the single-use ticket in the path is the

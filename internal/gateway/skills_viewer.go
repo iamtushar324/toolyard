@@ -8,8 +8,34 @@ import (
 	"github.com/tusharbhardwaj/toolyard/internal/skillhub"
 )
 
+// skillsAllowed is the one gate of every skills path that is not a tool
+// call: the MCP Skills extension methods (skills.list for skills/list,
+// skills.get for skills/get, skills.read for resources/read and
+// resources/directory/read), a bundle download (skills.bundle) and
+// tools.search's skills section (skills.search). It asks what the call
+// pipeline asks of the matching tool: the caller is not denied (blocked,
+// unknown, an agent whose owner is gone), its scope reaches the tool (its
+// owner's access and the agent's own allow and deny lists), and no
+// explicit deny policy names the tool or the skills upstream (the deny
+// that beats the tools' forced allow, denyOverridesForced). The tools
+// themselves get the same answer from routeEntry.
+func (g *Gateway) skillsAllowed(ctx context.Context, tool string) bool {
+	scope := g.scopeFor(ctx, agentIDFromContext(ctx))
+	if scope.Denied || !scope.AllowsTool(skillsUpstream, tool) {
+		return false
+	}
+	if g.policy != nil {
+		if _, denied := g.policy.ExplicitDeny(tool, skillsUpstream); denied {
+			return false
+		}
+	}
+	return true
+}
+
 // skillViewer is who the ctx caller is to the skills hub, which filters
-// every answer by it:
+// every answer by it. It describes a caller that passed the gate (the
+// call pipeline for a tool, skillsAllowed elsewhere); it is never a check
+// of its own:
 //
 //   - UserID is the person whose sources the caller sees: an agent's
 //     owner, or the dashboard (or voice) user themselves.

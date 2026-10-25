@@ -256,7 +256,10 @@ UI in `app.js`.
      private, default branch, branches, branch and path parsed from the URL.
    - `POST /v1/skills/sources/preview` — a `SourceInput` → `Preview` (dry run:
      commit, skills found, warnings, sample, sizes). Nothing is stored.
-   - `GET/POST /v1/skills/sources`, `GET/PATCH/DELETE /v1/skills/sources/{id}`.
+   - `GET /v1/skills/admin/sources` (every source, for admins),
+     `POST /v1/skills/sources` (create; a `GET /v1/skills/sources` with an
+     agent bearer is the agent listing, slice B),
+     `GET/PATCH/DELETE /v1/skills/sources/{id}`.
    - `POST /v1/skills/sources/{id}/sync`,
      `GET /v1/skills/sources/{id}/versions`,
      `POST /v1/skills/sources/{id}/versions/{vid}/activate` (rollback or
