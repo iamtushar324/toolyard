@@ -141,7 +141,8 @@ block for JavaScript and for `echo` `preview` or `none`. A Starlark run with
 `deferred` or `outcome_unknown`) and, when it did not succeed,
 `toolyard.error_kind`; an `outcome_unknown` run (a call was cut short, or
 the run was interrupted after a call was sent) also sets
-`toolyard.outcome_unknown: true`. A run that toolyard stops because the
+`toolyard.outcome_unknown: true` and has structured content
+`{"status": "outcome_unknown", "error_kind": …, "run_id": …}`. A run that toolyard stops because the
 server shuts down, or because the client went away, is kind `interrupted`:
 `outcome_unknown` once it had sent a tool call, `failed` (nothing ran)
 before. The script's own clock is kind `timeout`.

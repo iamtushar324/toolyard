@@ -312,25 +312,34 @@ func (g *Gateway) handleExecuteToolCode() directHandler {
 		out := g.codeModeRuntime().Execute(ctx, code, codemode.ExecOptions{
 			Reason: callReasonFromContext(ctx), Language: lang, Echo: echo,
 		})
-		res := mcp.NewToolResultText(out.Text)
-		res.IsError = out.Failed
-		calls := out.Calls
-		if calls == nil {
-			calls = []codemode.LedgerEntry{}
-		}
-		meta := map[string]any{"toolyard.run_id": runID, "toolyard.calls": calls, "toolyard.status": out.Status}
-		if out.ErrorKind != "" {
-			meta["toolyard.error_kind"] = out.ErrorKind
-		}
-		if out.Status == codemode.StatusOutcomeUnknown {
-			// A tool call may have taken effect (one was cut short, or the
-			// script was interrupted after one was sent): an async job built
-			// on executeToolCode reads this as outcome_unknown.
-			meta[codemode.OutcomeUnknownMarker] = true
-		}
-		res.Meta = &mcp.Meta{AdditionalFields: meta}
-		return res, nil
+		return codeModeResult(out, runID), nil
 	}
+}
+
+// codeModeResult is executeToolCode's answer for one run: the text, and in
+// _meta the run id, the call ledger, the run's status and error kind. A
+// run whose outcome is unknown (a call was cut short, or the script was
+// interrupted after it sent one) also carries the toolyard.outcome_unknown
+// flag and structured content {"status": "outcome_unknown", "error_kind",
+// "run_id"}, which is how an async job built on executeToolCode tells it
+// from a plain failure; other runs keep text only, as Bifrost answers.
+func codeModeResult(out codemode.ExecResult, runID string) *mcp.CallToolResult {
+	res := mcp.NewToolResultText(out.Text)
+	res.IsError = out.Failed
+	calls := out.Calls
+	if calls == nil {
+		calls = []codemode.LedgerEntry{}
+	}
+	meta := map[string]any{"toolyard.run_id": runID, "toolyard.calls": calls, "toolyard.status": out.Status}
+	if out.ErrorKind != "" {
+		meta["toolyard.error_kind"] = out.ErrorKind
+	}
+	if out.Status == codemode.StatusOutcomeUnknown {
+		meta[codemode.OutcomeUnknownMarker] = true
+		res.StructuredContent = map[string]any{"status": codemode.StatusOutcomeUnknown, "error_kind": out.ErrorKind, "run_id": runID}
+	}
+	res.Meta = &mcp.Meta{AdditionalFields: meta}
+	return res
 }
 
 // intArg reads an optional integer argument however JSON or an in-process

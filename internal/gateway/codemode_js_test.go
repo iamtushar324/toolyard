@@ -283,3 +283,29 @@ func TestToolsSearchSharesCatalogForScope(t *testing.T) {
 		}
 	}
 }
+
+// TestCodeModeResultMarksAnUnknownOutcome (live test fix 1): an
+// executeToolCode run interrupted after it sent a call carries the
+// toolyard.outcome_unknown flag and structured status outcome_unknown with
+// kind interrupted (what an async job maps); a plain failure carries
+// neither, only its status and kind.
+func TestCodeModeResultMarksAnUnknownOutcome(t *testing.T) {
+	res := codeModeResult(codemode.ExecResult{Text: "Execution runtime error: toolyard stopped the script", Failed: true,
+		Status: codemode.StatusOutcomeUnknown, ErrorKind: codemode.ErrorInterrupted,
+		Calls: []codemode.LedgerEntry{{Seq: 1, Tool: "demo.read", Status: codemode.StatusSucceeded}}}, "cm_1")
+	sc, _ := res.StructuredContent.(map[string]any)
+	if !res.IsError || sc["status"] != codemode.StatusOutcomeUnknown || sc["error_kind"] != codemode.ErrorInterrupted || sc["run_id"] != "cm_1" ||
+		res.Meta.AdditionalFields[codemode.OutcomeUnknownMarker] != true || res.Meta.AdditionalFields["toolyard.error_kind"] != codemode.ErrorInterrupted ||
+		textOf(res) != "Execution runtime error: toolyard stopped the script" {
+		t.Fatalf("interrupted after a call: %+v meta %v", res, res.Meta.AdditionalFields)
+	}
+	res = codeModeResult(codemode.ExecResult{Text: "Execution runtime error: nothing ran", Failed: true,
+		Status: codemode.StatusFailed, ErrorKind: codemode.ErrorInterrupted}, "cm_2")
+	if res.StructuredContent != nil || res.Meta.AdditionalFields[codemode.OutcomeUnknownMarker] != nil ||
+		res.Meta.AdditionalFields["toolyard.status"] != codemode.StatusFailed || res.Meta.AdditionalFields["toolyard.error_kind"] != codemode.ErrorInterrupted {
+		t.Fatalf("interrupted before a call: %+v meta %v", res, res.Meta.AdditionalFields)
+	}
+	if calls, ok := res.Meta.AdditionalFields["toolyard.calls"].([]codemode.LedgerEntry); !ok || calls == nil || len(calls) != 0 {
+		t.Fatalf("the ledger of a run that made no call: %#v", res.Meta.AdditionalFields["toolyard.calls"])
+	}
+}
