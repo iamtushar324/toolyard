@@ -84,10 +84,20 @@ var grantTokenRE = regexp.MustCompile(`tyg_[A-Za-z0-9_-]+\.[A-Za-z0-9_-]{40,}`)
 // redactedGrant replaces a grant token in stored text.
 const redactedGrant = "tyg_[redacted]"
 
-// redactGrants removes grant tokens from text the run stores: call
-// records, the result, logs and the held call. A token is single-use and
-// agent-bound, but nothing keeps one at rest in plain text.
+// webhookSecretRE matches a Standard Webhooks secret (callbacks.register
+// and callbacks.update return a generated one once).
+var webhookSecretRE = regexp.MustCompile(`whsec_[A-Za-z0-9+/=_-]{16,}`)
+
+// redactedSecret replaces a webhook secret in stored text.
+const redactedSecret = "whsec_[redacted]"
+
+// redactGrants removes grant tokens and webhook secrets from text the run
+// stores: call records, the result, logs and the held call. Nothing keeps
+// either at rest in plain text.
 func redactGrants(s string) string {
+	if strings.Contains(s, "whsec_") {
+		s = webhookSecretRE.ReplaceAllString(s, redactedSecret)
+	}
 	if !strings.Contains(s, "tyg_") {
 		return s
 	}
@@ -157,6 +167,9 @@ func (h *hooks) BeforeCall(_ context.Context, c *codemode.PendingCall) (*mcp.Cal
 		}
 		if strings.Contains(rec.replayText, redactedGrant) {
 			return nil, false, diverged("call %d (%s) answered with an Inbox grant token, which the record never keeps, so it cannot be replayed with the same value; nothing more ran. Start a new run", c.Seq, c.Tool)
+		}
+		if strings.Contains(rec.replayText, redactedSecret) {
+			return nil, false, diverged("call %d (%s) answered with a webhook secret, which the record never keeps, so it cannot be replayed with the same value; nothing more ran. Start a new run", c.Seq, c.Tool)
 		}
 		h.mu.Lock()
 		sc.replayText = rec.replayText

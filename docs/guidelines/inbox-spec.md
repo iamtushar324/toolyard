@@ -302,6 +302,27 @@ restricted tool without a grant **no longer creates a request**. It returns a
 `permission_required` result with a pre-filled draft, and only
 `inbox.request` / `inbox.ask` reach the owner's inbox.
 
+**Rich items (v0.1, schema version 3).** One item carries up to 50 tool
+calls, 20 questions and 24 attachments, and one decision answers them all:
+the owner submits every call's verdict and every required question's answer
+together (`verdicts` and `answers` on `action: "submit"`; `answers` alone on
+`action: "answer"` for a question item). Question types are `free_text`,
+`single_choice`, `multiple_choice`, `yes_no`, `number`, `date`, `datetime`,
+`scale` and `ranking`; the server checks the questions when the item is sent
+and the answers when the decision is submitted, and stores them in the item
+document (`questions`, `answers`, keyed by question ID). The message and
+markdown attachments are CommonMark with GitHub tables, rendered by the
+dashboard's own sanitizing renderer; charts are `line`, `bar`,
+`stacked_bar`, `area`, `pie` and `scatter`, drawn as SVG. The agent rules are
+[agent-protocol.md §14](agent-protocol.md#14-questions-and-rich-items-schema-version-3);
+callbacks, receivers and events are in
+[inbox-federation.md](inbox-federation.md) and agent-protocol.md §15.
+Rollout: every replica must run v0.1 before agents send schema version 3
+items, because an older replica that rewrites an item drops the fields it
+does not know; the `inbox_v3_enabled` setting (default on) refuses version 3
+items until then ([self-hosting.md](../self-hosting.md#inbox-and-permissions)).
+Versions 1 and 2 keep their limits (12 calls).
+
 **Session binding.** If an agent passes no `session_id`, items attach to
 that agent's most recent live session, or an automatic
 `"<agent name> (unnamed session)"` if it has none.
