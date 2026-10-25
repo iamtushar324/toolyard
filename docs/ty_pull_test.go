@@ -4,7 +4,7 @@ package docs
 // bundle with the token, downloads it without the token, and unpacks it
 // only when every member stays inside its skill folder. The script is
 // Python 3 (standard library only); the test skips when python3 is not
-// installed.
+// installed, except in CI.
 
 import (
 	"archive/tar"
@@ -111,6 +111,9 @@ func (f *tyFake) runTy(t *testing.T, dir string, args ...string) (int, string, s
 	t.Helper()
 	python, err := exec.LookPath("python3")
 	if err != nil {
+		if os.Getenv("CI") != "" {
+			t.Fatal("python3 is required in CI to test ty")
+		}
 		t.Skip("python3 is not installed")
 	}
 	home := t.TempDir()
