@@ -110,7 +110,7 @@ const (
 	// refreshReuseGrace: a refresh token presented again this soon after
 	// its use, while its successor is still unused, is refused without
 	// revoking the grant (a client retry, or two of its requests racing).
-	refreshReuseGrace = 30 * time.Second
+	refreshReuseGrace = 60 * time.Second
 	// CodeTTL: an authorization code must be exchanged within a minute.
 	CodeTTL = 60 * time.Second
 	// RequestTTL: the person has ten minutes to sign in and answer.
@@ -392,6 +392,26 @@ func rateKey(ip string) string {
 		return p.String()
 	}
 	return addr.String()
+}
+
+// netKey is the network of a client address for the second rate-limit
+// tier: an IPv4 /24 or an IPv6 /48; "" when the address is unknown (the
+// strict "unknown" bucket already covers it).
+func netKey(ip string) string {
+	addr, err := netip.ParseAddr(strings.TrimSpace(ip))
+	if err != nil {
+		return ""
+	}
+	addr = addr.Unmap().WithZone("")
+	bits := 24
+	if addr.Is6() {
+		bits = 48
+	}
+	p, err := addr.Prefix(bits)
+	if err != nil {
+		return ""
+	}
+	return p.String()
 }
 
 // limitFor is max for a known address and a strict quarter of it for the

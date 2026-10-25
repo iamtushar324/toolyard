@@ -106,7 +106,7 @@ func TestRunSucceedsWithJSONResult(t *testing.T) {
 		if len(hooks.seen) != 1 || hooks.seen[0].ScriptArgs["clientId"] != "vai-us" || hooks.seen[0].ScriptArgs["_reason"] != nil {
 			t.Fatalf("pending call = %+v", hooks.seen)
 		}
-		if n := len(rt.sem); n != 0 {
+		if n := rt.slotsInUse(); n != 0 {
 			t.Fatalf("%d slots still held", n)
 		}
 
@@ -397,7 +397,7 @@ func TestRunBusy(t *testing.T) {
 	if rr := mustRun(t, rt, "result = 2", RunOptions{Slot: slot}); rr.Status != StatusSucceeded || string(rr.Result) != "2" {
 		t.Fatalf("run on a taken slot: %+v", rr)
 	}
-	if n := len(rt.sem); n != 0 {
+	if n := rt.slotsInUse(); n != 0 {
 		t.Fatalf("%d slots still held", n)
 	}
 }
@@ -492,7 +492,7 @@ func TestRunCallCutByClockIsOutcomeUnknown(t *testing.T) {
 		if !reflect.DeepEqual(callStatuses(rr), []string{StatusSucceeded, StatusOutcomeUnknown}) {
 			t.Fatalf("call statuses = %v", callStatuses(rr))
 		}
-		if n := len(rt.sem); n != 0 {
+		if n := rt.slotsInUse(); n != 0 {
 			t.Fatalf("%d slots still held", n)
 		}
 	}

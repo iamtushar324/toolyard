@@ -139,11 +139,12 @@ func (s *Service) currentUserBearer(upstream, userID string) string {
 	stale := s.staleBearers[k]
 	s.mu.RUnlock()
 	if !ok || stale {
-		if s.cacheUserBearerFromDB(upstream, userID) || !ok {
-			s.mu.RLock()
-			v, ok = s.userBearers[k]
-			s.mu.RUnlock()
-		}
+		// As currentBearer: one bounded read per key; a failed or slow
+		// read keeps serving the stale bearer.
+		s.singleRead(k, func() { s.cacheUserBearerFromDB(upstream, userID) })
+		s.mu.RLock()
+		v, ok = s.userBearers[k]
+		s.mu.RUnlock()
 		if !ok {
 			return ""
 		}
@@ -194,7 +195,9 @@ func (s *Service) cacheUserBearerFromDB(upstream, userID string) bool {
 		s.mu.RLock()
 		gen := s.bearerGen[k]
 		s.mu.RUnlock()
-		tok, err := s.GetUserToken(context.Background(), upstream, userID)
+		ctx, cancel := context.WithTimeout(context.Background(), bearerReadTimeout)
+		tok, err := s.GetUserToken(ctx, upstream, userID)
+		cancel()
 		if err != nil {
 			return false
 		}

@@ -9,8 +9,10 @@ import (
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"log"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -286,11 +288,16 @@ func (db *DB) WithPgxConn(ctx context.Context, fn func(*pgx.Conn) error) error {
 // ConnectPostgres opens one new connection to the database, outside the
 // pool and not counted in its size, for a caller that must keep a session
 // of its own for a long time: session advisory locks and LISTEN
-// (internal/cluster). The session reports applicationName (pg_stat_activity)
-// and asks the server for short TCP keepalives and a TCP user timeout, so
-// the server ends it, and releases its advisory locks, within about half a
-// minute of the node vanishing (the operating system default is about two
-// hours). The caller closes it. SQL sent through it is not rewritten: use
+// (internal/cluster). The session reports applicationName
+// (pg_stat_activity; at most 63 bytes are kept) and then asks the server,
+// best effort, for short TCP keepalives and a TCP user timeout
+// (DedicatedSessionParams), so the server ends it, and releases its
+// advisory locks, within about half a minute of the node vanishing (the
+// operating system default is about two hours). They are SET after the
+// connection opens rather than sent as startup parameters, which a
+// pooler such as PgBouncer refuses, and a setting the server refuses
+// (tcp_user_timeout before Postgres 12) is skipped and logged once. The
+// caller closes the connection. SQL sent through it is not rewritten: use
 // $1, $2 there (or Rebind). It is an error on SQLite.
 func (db *DB) ConnectPostgres(ctx context.Context, applicationName string) (*pgx.Conn, error) {
 	if !db.Dialect.IsPostgres() || db.pgConfig == nil {
@@ -302,29 +309,45 @@ func (db *DB) ConnectPostgres(ctx context.Context, applicationName string) (*pgx
 		params[k] = v
 	}
 	if applicationName != "" {
+		if len(applicationName) > 63 {
+			applicationName = applicationName[:63]
+		}
 		params["application_name"] = applicationName
-	}
-	for k, v := range DedicatedSessionParams {
-		params[k] = v
 	}
 	cfg.RuntimeParams = params
 	conn, err := pgx.ConnectConfig(ctx, cfg)
 	if err != nil {
 		return nil, connectFailure(fmt.Errorf("store: connect to Postgres at %s/%s: %w", db.pgConfig.Host, db.pgConfig.Database, err))
 	}
+	for _, p := range DedicatedSessionParams {
+		if _, err := conn.Exec(ctx, "SET "+p.Name+" = "+p.Value); err != nil {
+			if conn.IsClosed() {
+				return nil, connectFailure(fmt.Errorf("store: set %s on a dedicated connection: %w", p.Name, err))
+			}
+			if _, logged := dedicatedParamFailed.LoadOrStore(p.Name, true); !logged {
+				log.Printf("store: the database refused %s on a dedicated connection (%v); it keeps the server's default", p.Name, err)
+			}
+		}
+	}
 	return conn, nil
 }
 
+// SessionParam is one session setting.
+type SessionParam struct{ Name, Value string }
+
 // DedicatedSessionParams are the session settings of a ConnectPostgres
-// connection: the server probes an idle client after 10 s, every 5 s, and
-// gives up after 3 lost probes; data unacknowledged for 15 s ends the
-// connection too. Postgres ignores them on a Unix socket.
-var DedicatedSessionParams = map[string]string{
-	"tcp_keepalives_idle":     "10",
-	"tcp_keepalives_interval": "5",
-	"tcp_keepalives_count":    "3",
-	"tcp_user_timeout":        "15000",
+// connection, in order: the server probes an idle client after 10 s,
+// every 5 s, and gives up after 3 lost probes; data unacknowledged for
+// 15 s ends the connection too. Postgres ignores them on a Unix socket.
+var DedicatedSessionParams = []SessionParam{
+	{"tcp_keepalives_idle", "10"},
+	{"tcp_keepalives_interval", "5"},
+	{"tcp_keepalives_count", "3"},
+	{"tcp_user_timeout", "15000"},
 }
+
+// dedicatedParamFailed remembers the settings already logged as refused.
+var dedicatedParamFailed sync.Map
 
 // ---- placeholder-rewriting connector ----------------------------------------
 

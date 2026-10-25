@@ -82,34 +82,52 @@ func withParams(raw string, params map[string]string) string {
 	return u.String()
 }
 
-// Authorization request limits: per client address (IPv6 by /64), and
-// across every address, so a flood can neither fill mcp_oauth_requests nor
-// make toolyard fetch documents without end.
+// Request limits: per client address (IPv6 by /64) and network (IPv4 /24,
+// IPv6 /48) everywhere, and global caps only on work that costs something
+// beyond one row that expires in minutes: registering a client and
+// fetching a metadata document.
 var (
 	authorizePerIP   = 120
-	authorizeGlobal  = 5000
+	authorizeGlobal  = 50000
 	authorizeWindow  = 10 * time.Minute
 	registerPerIP    = 60
 	registerGlobal   = 300
 	registerWindow   = time.Hour
-	maxUnusedClients = 10000
+	cimdFetchGlobal  = 600
+	maxUnusedClients = 5000
+	// unusedClientTTL: a registration nobody authorized within a day is
+	// swept, so the cap on unused registrations frees up within a day.
+	unusedClientTTL = 24 * time.Hour
 )
+
+// trustedRedirect reports whether an error may go straight back to a
+// redirect URI before the person answered: only when the admin's redirect
+// host allow list (SettingRedirectHosts) names it. Neither a
+// self-registered client nor a client metadata document makes a redirect
+// URI trusted: anyone can register a client, and anyone can host a
+// document that lists their own site (RFC 9700 section 4.11.2).
+func (s *Service) trustedRedirect(redirect string) bool {
+	return len(s.RedirectHosts()) > 0 && s.redirectHostAllowed(redirect)
+}
 
 // BeginAuthorize checks an authorization request (the query of GET
 // /oauth/authorize) and stores it for the consent screen.
 //
-// An error is sent back to the client only once the client, its redirect
-// URI and response_type=code are all valid; before that the person sees
-// it, so a link built around a client that registered someone else's
-// redirect URI cannot use toolyard to bounce a browser anywhere (RFC 9700
-// section 4.11.2).
+// Errors before the person answers are shown to the person, except that
+// one goes back to the client once the client, its redirect URI and
+// response_type=code are all valid and the admin's allow list names the
+// redirect URI (trustedRedirect). After the person answers, allow and deny
+// redirect.
 func (s *Service) BeginAuthorize(ctx context.Context, q url.Values, ip string) (*AuthorizeRequest, *AuthorizeError) {
 	show := func(status int, code, desc string) *AuthorizeError {
 		return &AuthorizeError{Error: oauthErr(status, code, desc)}
 	}
-	key := rateKey(ip)
-	if !s.allow(ctx, "authorize:"+key, limitFor(key, authorizePerIP), authorizeWindow) ||
-		!s.allow(ctx, "authorize:global", authorizeGlobal, authorizeWindow) {
+	// Per address and per network, and a high global ceiling last (a
+	// circuit breaker against a flood from many networks; only a flood
+	// that passes every per-address limit counts toward it). Fetching a
+	// document and registering a client have their own, lower, caps.
+	limits := append(ipLimits("authorize", ip, authorizePerIP, authorizeWindow), limit{bucket: "authorize:global", max: authorizeGlobal, window: authorizeWindow, global: true})
+	if !s.allowAll(ctx, limits...) {
 		return nil, show(http.StatusTooManyRequests, "temporarily_unavailable", "Too many sign-in attempts. Wait a few minutes and try again.")
 	}
 	for _, k := range []string{"client_id", "redirect_uri", "response_type", "state", "code_challenge", "code_challenge_method", "resource", "scope"} {
@@ -142,11 +160,18 @@ func (s *Service) BeginAuthorize(ctx context.Context, q url.Values, ip string) (
 	if q.Get("response_type") != "code" {
 		return nil, show(http.StatusBadRequest, "unsupported_response_type", "The app asked for something other than an authorization code (response_type must be code).")
 	}
-	// The client, its redirect URI and the response type are valid: from
-	// here errors go back to the client. state is optional: PKCE is
-	// required, and it is what protects the code (OAuth 2.1).
+	// Before the person answers, an error goes back to the client only
+	// when its redirect URI is trusted (s.trustedRedirect); otherwise the
+	// person sees it: anyone can register a client with someone else's
+	// redirect URI, and a broken request must not bounce a browser there
+	// (RFC 9700 section 4.11.2). state is optional: PKCE is required, and
+	// it is what protects the code (OAuth 2.1).
 	state := q.Get("state")
+	trusted := s.trustedRedirect(redirect)
 	back := func(code, desc string) *AuthorizeError {
+		if !trusted {
+			return show(http.StatusBadRequest, code, "The app sent an invalid sign-in request: "+desc+".")
+		}
 		return &AuthorizeError{Error: oauthErr(http.StatusBadRequest, code, desc), RedirectURI: redirect, State: state, issuer: s.Issuer()}
 	}
 	if len(state) > 1000 {
@@ -265,6 +290,11 @@ type Consent struct {
 	// MayManage lets the client manage toolyard (policies, servers, shared
 	// connections). Only an admin can give it; it is ignored otherwise.
 	MayManage bool
+	// SignOutOthers stops the client's other sessions (every earlier token
+	// chain of the grant). Off by default: a client metadata document
+	// client shares one client_id across installs, so two devices of one
+	// person share the grant and must not sign each other out.
+	SignOutOthers bool
 }
 
 // DefaultNickname turns a client name into a valid agent name.
@@ -339,6 +369,15 @@ func (s *Service) Approve(ctx context.Context, id string, u *identity.User, c Co
 	if err != nil {
 		return "", err
 	}
+	// Coming back from a revoke, a deleted or a disabled agent: cancel
+	// whatever the agent still has pending from before, while it is still
+	// disabled (nothing it queued can run until then), so re-enabling it
+	// below wakes none of it up.
+	if agentID, revived, err := s.revivalOf(ctx, u.ID, pending.Client.ID); err != nil {
+		return "", err
+	} else if revived {
+		s.cancelPending(ctx, agentID)
+	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return "", err
@@ -372,27 +411,37 @@ func (s *Service) Approve(ctx context.Context, id string, u *identity.User, c Co
 	case err != nil:
 		return "", err
 	default:
-		res, err := tx.ExecContext(ctx, `UPDATE agents SET name = ?, disabled = 0 WHERE id = ? AND owner_user = ?`, nickname, agentID, u.ID)
-		if err != nil {
-			return "", err
+		var disabled int
+		e := tx.QueryRowContext(ctx, `SELECT COALESCE(disabled, 0) FROM agents WHERE id = ?`, agentID).Scan(&disabled)
+		missing := errors.Is(e, sql.ErrNoRows)
+		if e != nil && !missing {
+			return "", e
 		}
-		if n, _ := res.RowsAffected(); n == 0 {
+		revived := wasRevoked.Valid || missing || disabled != 0
+		if missing {
 			// The agent was deleted; the grant kept its id (the tombstone),
 			// so the client comes back as the same agent.
 			if _, err = tx.ExecContext(ctx, `INSERT INTO agents(id, name, owner_user, token_hash, last_seen, created_at) VALUES(?,?,?,'',?,?)`,
 				agentID, nickname, u.ID, now, now); err != nil {
 				return "", err
 			}
+		} else if _, err = tx.ExecContext(ctx, `UPDATE agents SET name = ?, disabled = 0 WHERE id = ? AND owner_user = ?`, nickname, agentID, u.ID); err != nil {
+			return "", err
 		}
-		if wasRevoked.Valid {
-			// Reviving a revoked grant: nothing issued before the revoke
-			// may come back with it.
+		// Earlier token chains stop when the grant comes back from a
+		// revoke, a deleted or a disabled agent (nothing from before may
+		// come back with it), or when the person asked to sign out the
+		// app's other sessions. Otherwise they keep working: another
+		// device of the same person may share this client and grant.
+		if revived || c.SignOutOthers {
 			if _, err = tx.ExecContext(ctx, `UPDATE mcp_oauth_tokens SET revoked_at = ? WHERE grant_id = ? AND revoked_at IS NULL`, now, grantID); err != nil {
 				return "", err
 			}
-			if _, err = tx.ExecContext(ctx, `UPDATE mcp_oauth_codes SET used_at = ? WHERE grant_id = ? AND used_at IS NULL`, now, grantID); err != nil {
-				return "", err
-			}
+		}
+		// Unused codes from before this consent always stop: only the
+		// code issued below is valid afterwards.
+		if _, err = tx.ExecContext(ctx, `UPDATE mcp_oauth_codes SET used_at = ? WHERE grant_id = ? AND used_at IS NULL`, now, grantID); err != nil {
+			return "", err
 		}
 		if _, err = tx.ExecContext(ctx,
 			`UPDATE mcp_oauth_grants SET scope = ?, resource = ?, updated_at = ?, revoked_at = NULL, revoked_reason = NULL, may_manage = ? WHERE id = ?`,
@@ -427,6 +476,26 @@ func (s *Service) Approve(ctx context.Context, id string, u *identity.User, c Co
 		s.access.InvalidateAgent(agentID)
 	}
 	return withParams(req.redirect, map[string]string{"code": code, "state": req.state, "iss": s.Issuer()}), nil
+}
+
+// revivalOf reports the agent of userID's grant for clientID and whether a
+// consent would bring it back from a revoked grant, a deleted agent or a
+// disabled agent.
+func (s *Service) revivalOf(ctx context.Context, userID, clientID string) (string, bool, error) {
+	var agentID string
+	var revoked sql.NullInt64
+	var agentRow sql.NullString
+	var disabled int
+	err := s.db.QueryRowContext(ctx,
+		`SELECT g.agent_id, g.revoked_at, a.id, COALESCE(a.disabled, 0) FROM mcp_oauth_grants g LEFT JOIN agents a ON a.id = g.agent_id
+         WHERE g.user_id = ? AND g.client_id = ?`, userID, clientID).Scan(&agentID, &revoked, &agentRow, &disabled)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, err
+	}
+	return agentID, revoked.Valid || !agentRow.Valid || disabled != 0, nil
 }
 
 // Deny answers request id with the person's no and returns the redirect

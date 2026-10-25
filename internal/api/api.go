@@ -71,7 +71,9 @@ import (
 	"github.com/tusharbhardwaj/toolyard/internal/identity"
 	"github.com/tusharbhardwaj/toolyard/internal/identitykeys"
 	"github.com/tusharbhardwaj/toolyard/internal/inbox"
+	"github.com/tusharbhardwaj/toolyard/internal/jobs"
 	"github.com/tusharbhardwaj/toolyard/internal/marketplace"
+	"github.com/tusharbhardwaj/toolyard/internal/mcpauth"
 	"github.com/tusharbhardwaj/toolyard/internal/memory"
 	"github.com/tusharbhardwaj/toolyard/internal/mempalace"
 	"github.com/tusharbhardwaj/toolyard/internal/memwebhook"
@@ -99,6 +101,8 @@ const (
 )
 
 type Server struct {
+	// mcpAuth is the OAuth server for MCP clients, set by MCPOAuthRoutes.
+	mcpAuth      *mcpauth.Service
 	federation   *federation.Service
 	callbacks    *callbacks.Service
 	githubHTTP   *http.Client
@@ -165,6 +169,9 @@ type Server struct {
 	// codeRuns backs the code routes (/v1/code/*, code_routes.go); nil
 	// answers 503.
 	codeRuns *coderuns.Service
+	// jobs backs the async job routes (/v1/jobs, jobs_routes.go); nil
+	// answers 503.
+	jobs *jobs.Service
 }
 
 type Options struct {
@@ -259,6 +266,9 @@ type Options struct {
 	// CodeRuns backs code mode over REST (/v1/code/*). Optional; without
 	// it the run routes answer 503.
 	CodeRuns *coderuns.Service
+	// Jobs backs async tool jobs over REST (/v1/jobs). Optional; without
+	// it the job routes answer 503.
+	Jobs *jobs.Service
 }
 
 func New(ctx context.Context, opts Options) *Server {
@@ -303,6 +313,7 @@ func New(ctx context.Context, opts Options) *Server {
 		ownerEmail:      strings.TrimSpace(opts.OwnerEmail),
 		clerkOwnerOnly:  opts.ClerkOwnerOnly,
 		codeRuns:        opts.CodeRuns,
+		jobs:            opts.Jobs,
 	}
 	if s.webhookMaxBytes <= 0 {
 		s.webhookMaxBytes = DefaultWebhookMaxBytes
@@ -468,6 +479,7 @@ func (s *Server) Routes(mux *http.ServeMux) {
 	s.identityKeyRoutes(mux)
 	s.registerSessionTokenRoutes(mux)
 	s.registerCodeRoutes(mux)
+	s.registerJobsRoutes(mux)
 }
 
 // ---- helpers ----------------------------------------------------------------
@@ -977,6 +989,7 @@ func (s *Server) agentsItem(w http.ResponseWriter, r *http.Request) {
 			writeAgentActionError(w, err)
 			return
 		}
+		s.oauthAgentDeleted(r.Context(), id)
 		_ = s.audit.Write(r.Context(), audit.Event{
 			EventType: "agent.delete", AgentID: id, ResultSummary: "user:" + uid,
 		})
@@ -1665,6 +1678,10 @@ func (s *Server) serversItem(w http.ResponseWriter, r *http.Request) {
 	}
 	if subpath == "convert-env" {
 		s.serversConvertEnv(w, r, name)
+		return
+	}
+	if subpath == "async" {
+		s.serversAsync(w, r, name)
 		return
 	}
 	if subpath == "reconnect" {

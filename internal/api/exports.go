@@ -33,6 +33,7 @@ func auditFilterFromQuery(r *http.Request) audit.Filter {
 		AgentSessionID:  q.Get("session"),
 		ApprovalID:      q.Get("approval_id"),
 		ClientKind:      q.Get("client_kind"),
+		RunID:           q.Get("run_id"),
 	}
 }
 
@@ -40,7 +41,7 @@ func auditFilterFromQuery(r *http.Request) audit.Filter {
 var auditCSVHeader = []string{
 	"id", "ts_iso", "event_type", "agent_id", "upstream", "tool", "decision", "reason", "result_summary", "approval_id",
 	"agent_name", "owner_email", "client_kind", "client_session_id", "agent_session_id", "via",
-	"decided_by_email", "decided_via", "decider_ref",
+	"decided_by_email", "decided_via", "decider_ref", "run_id",
 }
 
 func auditCSVRow(e audit.Event) []string {
@@ -48,7 +49,7 @@ func auditCSVRow(e audit.Event) []string {
 		e.ID, time.UnixMilli(e.TS).UTC().Format(time.RFC3339), e.EventType,
 		e.AgentID, e.UpstreamName, e.ToolName, e.Decision, e.Reason, e.ResultSummary, e.ApprovalID,
 		e.AgentName, e.OwnerEmail, e.ClientKind, e.ClientSessionID, e.AgentSessionID, e.Via,
-		e.DecidedByEmail, e.DecidedVia, e.DeciderRef,
+		e.DecidedByEmail, e.DecidedVia, e.DeciderRef, e.RunID,
 	}
 }
 

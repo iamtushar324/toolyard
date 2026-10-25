@@ -428,11 +428,12 @@ func (s *Service) Register(ctx context.Context, body []byte, ip string) (*Regist
 		return nil, oerr
 	}
 	// A global cap on registrations nobody used: unused ones are swept
-	// after a week, and this keeps a flood from growing the table first.
+	// after a day (unusedClientTTL), and this keeps a flood from growing
+	// the table first.
 	var unused int
 	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM mcp_oauth_clients c WHERE c.kind = ? AND c.created_at > ?
          AND NOT EXISTS (SELECT 1 FROM mcp_oauth_grants g WHERE g.client_id = c.client_id)`,
-		ClientKindDCR, s.now().Add(-7*24*time.Hour).UnixMilli()).Scan(&unused); err != nil {
+		ClientKindDCR, s.now().Add(-unusedClientTTL).UnixMilli()).Scan(&unused); err != nil {
 		return nil, serverError()
 	}
 	if unused >= maxUnusedClients {
@@ -557,7 +558,16 @@ const (
 	// toolyard fetch per cimdFetchWindow.
 	cimdFetchesPerIP = 20
 	cimdFetchWindow  = 10 * time.Minute
+	// cimdStaleMax: an expired copy keeps serving while the document
+	// cannot be fetched (a network failure, a temporary HTTP error, a full
+	// fetch budget), for at most this long after it expired.
+	cimdStaleMax = 7 * 24 * time.Hour
 )
+
+// staleUsable reports whether an expired cached copy may still serve.
+func (s *Service) staleUsable(c *Client) bool {
+	return c != nil && c.expiresAt > s.now().Add(-cimdStaleMax).UnixMilli()
+}
 
 // errCIMDUnusable is what a caller is told about any failed document: the
 // detail goes to the log, never back to the requester.
@@ -610,15 +620,23 @@ func (s *Service) ResolveClient(ctx context.Context, clientID, ip string) (*Clie
 	if s.recalled(ctx, negKey) {
 		return nil, errCIMDUnusable()
 	}
-	key := rateKey(ip)
-	if !s.allow(ctx, "cimd-fetch:"+key, limitFor(key, cimdFetchesPerIP), cimdFetchWindow) {
+	// A fetch is expensive: the global cap applies, last, so an address
+	// over its own limit never uses it up. With every fetch bucket full,
+	// a stale copy (within cimdStaleMax) still serves.
+	limits := append(ipLimits("cimd-fetch", ip, cimdFetchesPerIP, cimdFetchWindow), limit{bucket: "cimd-fetch:global", max: cimdFetchGlobal, window: cimdFetchWindow, global: true})
+	if !s.allowAll(ctx, limits...) {
+		if s.staleUsable(cached) {
+			return cached, nil
+		}
 		return nil, oauthErr(http.StatusTooManyRequests, "temporarily_unavailable", "too many client metadata documents from this address; try again later")
 	}
 	return s.fetchOnce(ctx, clientID, cached, negKey)
 }
 
 // fetchOnce runs one fetch per client_id at a time on this node; requests
-// that arrive meanwhile wait for its answer.
+// that arrive meanwhile wait for its answer. The fetch runs on a context
+// that the first requester's disconnect does not cancel (it has its own
+// timeout, cimdFetchTimeout), so it never fails the others.
 func (s *Service) fetchOnce(ctx context.Context, clientID string, cached *Client, negKey string) (*Client, *Error) {
 	s.flightMu.Lock()
 	if f, ok := s.flights[clientID]; ok {
@@ -633,9 +651,11 @@ func (s *Service) fetchOnce(ctx context.Context, clientID string, cached *Client
 	f := &flight{done: make(chan struct{})}
 	s.flights[clientID] = f
 	s.flightMu.Unlock()
-	f.client, f.err = s.fetchAndStore(ctx, clientID, cached)
-	if f.err != nil && f.err.Status != http.StatusInternalServerError {
-		s.remember(ctx, negKey, cimdFailureTTL)
+	fctx := context.WithoutCancel(ctx)
+	var definite bool
+	f.client, f.err, definite = s.fetchAndStore(fctx, clientID, cached)
+	if f.err != nil && definite {
+		s.remember(fctx, negKey, cimdFailureTTL)
 	}
 	s.flightMu.Lock()
 	delete(s.flights, clientID)
@@ -644,29 +664,56 @@ func (s *Service) fetchOnce(ctx context.Context, clientID string, cached *Client
 	return f.client, f.err
 }
 
+// fetchError is a failed document fetch. A definite one (the document
+// answered and is wrong, or toolyard refuses where it is) is cached as a
+// failure; a transient one (DNS, network, TLS, timeout, HTTP 408, 429 or
+// 5xx) is not, and a stale copy (staleUsable) keeps serving.
+type fetchError struct {
+	msg      string
+	definite bool
+}
+
+func (e *fetchError) Error() string { return e.msg }
+
+func definiteErr(format string, a ...any) error {
+	return &fetchError{msg: fmt.Sprintf(format, a...), definite: true}
+}
+
+func transientErr(format string, a ...any) error {
+	return &fetchError{msg: fmt.Sprintf(format, a...)}
+}
+
 // fetchAndStore fetches and checks a document and stores the client. Any
-// failure is logged in detail and answered with errCIMDUnusable.
-func (s *Service) fetchAndStore(ctx context.Context, clientID string, cached *Client) (*Client, *Error) {
-	fail := func(why string) (*Client, *Error) {
+// failure is logged in detail and answered with errCIMDUnusable; definite
+// reports whether it was a definite failure (one to cache). After a
+// transient failure the stale copy, when there is one, is returned.
+func (s *Service) fetchAndStore(ctx context.Context, clientID string, cached *Client) (*Client, *Error, bool) {
+	fail := func(why string, definite bool) (*Client, *Error, bool) {
 		log.Printf("mcpauth: client metadata document %q refused: %s", clientID, why)
-		return nil, errCIMDUnusable()
+		return nil, errCIMDUnusable(), definite
 	}
 	doc, ttl, ferr := s.fetchMetadataDocument(ctx, clientID)
 	if ferr != nil {
-		return fail(ferr.Error())
+		var fe *fetchError
+		definite := errors.As(ferr, &fe) && fe.definite
+		if !definite && s.staleUsable(cached) {
+			log.Printf("mcpauth: client metadata document %q not refreshed (%v); using the stale copy", clientID, ferr)
+			return cached, nil, false
+		}
+		return fail(ferr.Error(), definite)
 	}
 	if doc.ClientID != clientID {
-		return fail("its client_id does not equal its URL")
+		return fail("its client_id does not equal its URL", true)
 	}
 	if len(doc.ClientSecret) > 0 || len(doc.ClientSecretExpiresAt) > 0 {
-		return fail("it carries a client secret")
+		return fail("it carries a client secret", true)
 	}
 	method := strings.TrimSpace(doc.TokenEndpointAuthMethod)
 	if method == "" {
 		method = AuthNone
 	}
 	if _, oerr := s.validateClientMetadata(doc.RedirectURIs, method, doc.GrantTypes, doc.ResponseTypes, false); oerr != nil {
-		return fail(oerr.Description)
+		return fail(oerr.Description, true)
 	}
 	c := &Client{
 		ID: clientID, Kind: ClientKindCIMD, Name: cleanText(doc.ClientName, maxClientNameLen),
@@ -686,12 +733,12 @@ func (s *Service) fetchAndStore(ctx context.Context, clientID string, cached *Cl
              updated_at = excluded.updated_at, expires_at = excluded.expires_at`,
 		c.ID, ClientKindCIMD, c.Name, nullStr(c.URI), nullStr(c.LogoURI), string(redirects), c.AuthMethod,
 		c.CreatedAt, c.CreatedAt, c.expiresAt); err != nil {
-		return nil, serverError()
+		return nil, serverError(), false
 	}
 	if cached != nil {
 		c.CreatedAt = cached.CreatedAt
 	}
-	return c, nil
+	return c, nil, false
 }
 
 // blockedPrefixes are the special-use ranges a metadata document may never
@@ -719,6 +766,10 @@ var blockedPrefixes = func() []netip.Prefix {
 var (
 	nat64Prefix  = netip.MustParsePrefix("64:ff9b::/96")
 	sixToFourNet = netip.MustParsePrefix("2002::/16")
+	// globalUnicast6 is the only IPv6 space a document may come from
+	// (after an embedded IPv4 address was unwrapped); the deny list still
+	// applies inside it.
+	globalUnicast6 = netip.MustParsePrefix("2000::/3")
 )
 
 // blockedAddr reports an address a metadata document may not be fetched
@@ -736,6 +787,8 @@ func blockedAddr(a netip.Addr) bool {
 			return blockedAddr(netip.AddrFrom4([4]byte{b[12], b[13], b[14], b[15]}))
 		case sixToFourNet.Contains(a):
 			return blockedAddr(netip.AddrFrom4([4]byte{b[2], b[3], b[4], b[5]}))
+		case !globalUnicast6.Contains(a):
+			return true
 		}
 	}
 	for _, p := range blockedPrefixes {
@@ -755,14 +808,14 @@ func blockedAddr(a netip.Addr) bool {
 func (s *Service) fetchMetadataDocument(ctx context.Context, raw string) (*cimdDocument, time.Duration, error) {
 	u, err := url.Parse(raw)
 	if err != nil {
-		return nil, 0, err
+		return nil, 0, definiteErr("its URL does not parse: %v", err)
 	}
 	host, port := u.Hostname(), u.Port()
 	if port == "" {
 		port = "443"
 	}
 	if port != "443" && !s.allowPrivateCIMD {
-		return nil, 0, errors.New("its port is not 443")
+		return nil, 0, definiteErr("its port is not 443")
 	}
 	ctx, cancel := context.WithTimeout(ctx, cimdFetchTimeout)
 	defer cancel()
@@ -772,19 +825,19 @@ func (s *Service) fetchMetadataDocument(ctx context.Context, raw string) (*cimdD
 	} else {
 		ips, err := s.resolver(ctx, host)
 		if err != nil || len(ips) == 0 {
-			return nil, 0, errors.New("its host does not resolve")
+			return nil, 0, transientErr("its host does not resolve: %v", err)
 		}
 		for _, ip := range ips {
 			a, ok := netip.AddrFromSlice(ip.IP)
 			if !ok {
-				return nil, 0, errors.New("its host resolved to an unreadable address")
+				return nil, 0, transientErr("its host resolved to an unreadable address")
 			}
 			addrs = append(addrs, a.Unmap())
 		}
 	}
 	for _, a := range addrs {
 		if blockedAddr(a) && !s.allowPrivateCIMD {
-			return nil, 0, fmt.Errorf("its host resolves to %s, which is not on the public internet", a)
+			return nil, 0, definiteErr("its host resolves to %s, which is not on the public internet", a)
 		}
 	}
 	pinned := net.JoinHostPort(addrs[0].String(), port)
@@ -804,28 +857,31 @@ func (s *Service) fetchMetadataDocument(ctx context.Context, raw string) (*cimdD
 	client := &http.Client{Transport: transport, CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, raw, nil)
 	if err != nil {
-		return nil, 0, err
+		return nil, 0, definiteErr("its URL is not a request: %v", err)
 	}
 	req.Header.Set("Accept", "application/json")
 	req.Header.Set("User-Agent", "toolyard-oauth/1")
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, 0, fmt.Errorf("the request failed: %v", err)
+		return nil, 0, transientErr("the request failed: %v", err)
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return nil, 0, fmt.Errorf("it answered HTTP %d (redirects are not followed)", resp.StatusCode)
+	switch {
+	case resp.StatusCode == http.StatusRequestTimeout || resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500:
+		return nil, 0, transientErr("it answered HTTP %d (temporary)", resp.StatusCode)
+	case resp.StatusCode != http.StatusOK:
+		return nil, 0, definiteErr("it answered HTTP %d (redirects are not followed)", resp.StatusCode)
 	}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, maxCIMDBody+1))
 	if err != nil {
-		return nil, 0, errors.New("reading it failed")
+		return nil, 0, transientErr("reading it failed: %v", err)
 	}
 	if len(body) > maxCIMDBody {
-		return nil, 0, fmt.Errorf("it is larger than %d bytes", maxCIMDBody)
+		return nil, 0, definiteErr("it is larger than %d bytes", maxCIMDBody)
 	}
 	var doc cimdDocument
 	if err := json.Unmarshal(body, &doc); err != nil {
-		return nil, 0, errors.New("it is not a JSON object")
+		return nil, 0, definiteErr("it is not a JSON object")
 	}
 	return &doc, cacheTTL(resp.Header.Get("Cache-Control")), nil
 }

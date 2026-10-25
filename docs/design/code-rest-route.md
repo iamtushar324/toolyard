@@ -57,10 +57,18 @@ Only the token's SHA-256 is stored.
 
 Body, one of:
 
-- `Content-Type: text/x-starlark`: the raw script. The reason comes from the
-  `X-Toolyard-Reason` header (20–2000 characters, required).
+- `Content-Type: text/x-starlark`: the raw Starlark script. The reason comes
+  from the `X-Toolyard-Reason` header (20–2000 characters, required).
+- `Content-Type: text/javascript` (or `application/javascript`): the raw
+  JavaScript script, the body of an async function (v0.1,
+  docs/guidelines/code-mode.md). The reason comes from `X-Toolyard-Reason`.
 - `Content-Type: application/json`:
-  `{"code": "<script>", "reason": "<20–2000 chars>", "wait_seconds": 25}`.
+  `{"code": "<script>", "reason": "<20–2000 chars>", "language": "starlark", "wait_seconds": 25}`;
+  `language` is `starlark` (default) or `javascript`.
+
+The run keeps its language (`code_runs.language`): a resume runs the script
+again in it, and the `Idempotency-Key` fingerprint covers it (a Starlark run's
+fingerprint is what it was before runs had a language).
 
 The script is at most 1 MiB. A script that contains an Inbox grant token
 (`tyg_…`) is `400`: scripts are stored, so resume the held run with its
@@ -87,13 +95,14 @@ Every run route answers this JSON:
 ```json
 {
   "run_id": "cr_…",
+  "language": "starlark",
   "status": "succeeded",
   "result": {"any": "json"},
   "error": null,
   "logs": ["print output"],
   "calls": [
     {"seq": 1, "tool": "context7.resolve-library-id", "status": "succeeded", "replayed": false,
-     "started_at": 1792200000000, "finished_at": 1792200000800}
+     "started_at": 1792200000000, "finished_at": 1792200000800, "ms": 800}
   ],
   "held": null,
   "created_at": 1792200000000,
@@ -110,7 +119,15 @@ Every run route answers this JSON:
   `outcome_unknown`, `internal`, and `interrupted` (the server stopped:
   a `queued` run is `failed` with it, a `running` one `outcome_unknown`).
 - `calls`: the calls of the latest execution (a resume runs the script
-  again), in order.
+  again), in order: the call ledger, with `ms` the call's duration (0 until
+  it finished). A JavaScript script, or a Starlark `try_call` or `parallel`,
+  can carry on past a failed or held call; the call keeps its status here
+  and the run ends `succeeded` when the script does. A call made in parallel
+  is numbered in the order the script started it. A resume replays by that
+  number, so a script whose parallel calls start in another order the second
+  time is `script_diverged`.
+- The run id is also the `run_id` of every audit row of the run: the
+  `code.run` and `code.resume` rows and every nested call's.
 - `calls[].status`: `succeeded`, `failed`, `permission_required`,
   `deferred`, `outcome_unknown`. `replayed: true` marks a call answered from
   the call record during a resume, not sent upstream again.
@@ -162,11 +179,24 @@ owner decided.
   request must belong to the agent (`400` otherwise). A call no unused grant
   of the request covers is sent without one, so it is held again (`403`).
 
-The script runs again from the top. Each call before the held one is answered
-from the call record when its tool and arguments are the same as recorded
-(`replayed: true`); a different call is `failed` with `script_diverged` and
-nothing more runs. A recorded call with an unknown outcome stops the resume
-with `outcome_unknown`; nothing is repeated blindly. Inbox status reads
+The script runs again from the top. Every recorded call other than the held
+one is checked against the call record, wherever it sits: with
+`tools.parallel`, a call left un-awaited, or a held call the script caught,
+calls numbered after the held one may have run too.
+
+- A different tool or different arguments: `failed` with `script_diverged`,
+  and nothing more runs.
+- A recorded call that `succeeded`: answered from the record
+  (`replayed: true`), never sent again.
+- A recorded call with an unknown outcome: the resume stops with
+  `outcome_unknown`. Nothing is repeated blindly.
+- A recorded call that was held and caught (`permission_required` or
+  `deferred`, through `try_call` or `tools.tryCall`), or that `failed`: it
+  did not take effect. It is sent again, with a grant when one of the
+  request's grants covers it.
+- The held call is sent with the request's grant (or the legacy
+  `approval_id`).
+- A call past every recorded call is new, and is sent. Inbox status reads
 (`toolyard.inbox_status`, `toolyard.inbox_wait`) are sent again instead of
 replayed, because their answers can carry grant tokens. The same
 `Prefer: wait` and HTTP mapping apply. A recorded answer that held a grant
@@ -181,9 +211,16 @@ one, so it is held again and the run stays resumable.
 
 ## Stubs
 
-- `GET /v1/code/files`: the same listing as `listToolFiles` (text/plain).
+- `GET /v1/code/files`: the same listing as `listToolFiles` (text/plain);
+  `?language=javascript` lists the TypeScript stubs.
 - `GET /v1/code/files/{server}/{tool}.pyi`: the same stub as `readToolFile`.
+- `GET /v1/code/files/{server}/{tool}.d.ts`, `/v1/code/files/{server}.d.ts`,
+  `/v1/code/files/index.d.ts`: the TypeScript stubs for JavaScript.
 - `GET /v1/code/docs/{server}/{tool}`: the same text as `getToolDocs`.
+- `GET /v1/code/search?q=…&mode=keyword|regex&detail=name|summary|full&limit=N&upstream=…`:
+  the same JSON as the `tools.search` tool (`total`, `matched`, `mode`,
+  `results`). A bad mode, detail, pattern or limit, and `semantic` where no
+  semantic search is configured, are `400`.
 
 These show only the tools the agent may see. Unknown files are `404`.
 
@@ -195,13 +232,17 @@ These show only the tools the agent may see. Unknown files are `404`.
 ## The `ty` command
 
 ```text
-ty run FILE|-  [--wait N] [--key IDEMPOTENCY_KEY] [--reason TEXT]
+ty run FILE|-  [--wait N] [--key IDEMPOTENCY_KEY] [--reason TEXT] [--language starlark|javascript]
 ty status RUN_ID [--wait N]
 ty resume RUN_ID [--request rq_…] [--wait N]
-ty files
-ty stub SERVER/TOOL
+ty files [--language starlark|javascript]
+ty stub SERVER/TOOL [--language starlark|javascript]
+ty search QUERY [--mode keyword|regex] [--detail name|summary|full] [--limit N] [--upstream SERVER]
 ty call SERVER.TOOL '{"json": "arguments"}' [--reason TEXT]
 ```
+
+A file ending in `.js` or `.mjs` runs as JavaScript unless `--language` says
+otherwise.
 
 - `TOOLYARD_URL` (default `https://toolyard.beknown.live`) and
   `TOOLYARD_TOKEN_FILE` (required). The token never appears in argv, the
@@ -215,7 +256,11 @@ ty call SERVER.TOOL '{"json": "arguments"}' [--reason TEXT]
 ## Limits
 
 The MCP code-mode limits apply: 5 minutes wall clock, 100 tool calls, 1 MiB
-output per run, 4 concurrent scripts per server. Runs and their call records
+output per run, 4 concurrent scripts per server and 3 per agent
+(`-codemode-max-concurrent`, `-codemode-max-per-agent`). A start past either
+cap waits up to 30 seconds (`-codemode-queue-wait`) in a fair queue, then is
+`429` with `Retry-After`
+and creates no run. Runs and their call records
 are kept 7 days from their start (an hourly sweep deletes older ones). A run
 that is `running` when the server stops is `outcome_unknown` after the
 restart; one still `queued` is `failed` (nothing ran). Both carry the error

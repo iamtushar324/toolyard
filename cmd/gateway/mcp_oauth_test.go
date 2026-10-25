@@ -478,7 +478,7 @@ func TestMCPOAuthFullFlowWithDynamicRegistration(t *testing.T) {
 	if names := e.toolNames(access2); !names["memory.get"] {
 		t.Fatal("a retry within the grace revoked the grant")
 	}
-	e.offset += 31 * time.Second
+	e.offset += 61 * time.Second // past the refresh reuse grace
 	w, tok = e.form("/oauth/token", url.Values{"grant_type": {"refresh_token"}, "refresh_token": {refresh1}, "client_id": {clientID}})
 	if w.Code != 400 || tok["error"] != "invalid_grant" {
 		t.Fatalf("refresh token reuse: %d %s", w.Code, w.Body)
@@ -561,6 +561,14 @@ func TestMCPOAuthNoOpenRedirect(t *testing.T) {
 	w := e.do(http.MethodGet, "/oauth/authorize?"+q.Encode(), nil, nil)
 	if w.Code == http.StatusFound || strings.Contains(w.Header().Get("Location"), "evil.example") || w.Code != http.StatusBadRequest {
 		t.Fatalf("an invalid request redirected: %d %s", w.Code, w.Header().Get("Location"))
+	}
+	// A valid response type with the PKCE challenge missing: still an
+	// error page, since a self-registered redirect URI is never trusted.
+	q.Set("response_type", "code")
+	q.Del("code_challenge")
+	w = e.do(http.MethodGet, "/oauth/authorize?"+q.Encode(), nil, nil)
+	if w.Code != http.StatusBadRequest || w.Header().Get("Location") != "" || !strings.Contains(w.Body.String(), "Toolyard cannot connect this app") {
+		t.Fatalf("a request without PKCE redirected: %d %q", w.Code, w.Header().Get("Location"))
 	}
 }
 

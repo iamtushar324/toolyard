@@ -146,7 +146,8 @@ After you sign in, toolyard shows:
 - for an admin only, **May manage toolyard (policies, servers, shared
   connections)**, off by default. Leave it off unless the app must change
   toolyard itself: an app never gets admin control otherwise, even an
-  admin's app.
+  admin's app. Only you can turn it on for your own app; no other admin
+  can turn it on for you.
 
 When you select **Allow**, toolyard creates an agent that you own, named by
 the nickname. Every call that the app makes runs as this agent. Your
@@ -156,7 +157,9 @@ to your Inbox. When you select **Deny**, nothing is created and the app gets
 
 If you connect the same app again (for example after you revoked it),
 toolyard asks again and keeps the same agent, so its activity history
-stays in one place.
+stays in one place. If the app is still connected elsewhere (for example
+on your other device), that session keeps working, unless you tick **Sign
+out this app's other sessions** on the consent screen.
 
 ## Restrict a connection
 

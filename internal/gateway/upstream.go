@@ -237,6 +237,9 @@ func newUpstream(ctx context.Context, cfg UpstreamConfig) (*upstream, error) {
 	default:
 		return nil, fmt.Errorf("unsupported transport %q", cfg.Transport)
 	}
+	// A job's calls carry a progress token; the upstream's progress
+	// notifications are recorded on the job (jobs_tools.go).
+	c.OnNotification(routeUpstreamProgress)
 
 	// First-run starts that need to npm/pnpm/uv install can take well over a
 	// minute. We give the connect a generous deadline; once the package cache
@@ -402,6 +405,9 @@ func (u *upstream) callTool(ctx context.Context, name string, args map[string]an
 	req := mcp.CallToolRequest{}
 	req.Params.Name = name
 	req.Params.Arguments = args
+	meta, forget := upstreamProgressMeta(ctx)
+	defer forget()
+	req.Params.Meta = meta
 	res, err := c.CallTool(ctx, req)
 	if err == nil {
 		return res, nil

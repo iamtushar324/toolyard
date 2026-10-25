@@ -46,6 +46,11 @@ const (
 	// maxOutputCap is the most Limits.MaxOutputBytes may be set to, so the
 	// print log stays well inside the line limit.
 	maxOutputCap = 2 << 20
+	// maxParallelCalls caps the nested calls one script has in flight at
+	// once; more wait in order. defaultParallel is the parallel() limit
+	// when the script names none.
+	maxParallelCalls = 8
+	defaultParallel  = 4
 )
 
 // startMsg is the parent's opening message.
@@ -54,6 +59,15 @@ type startMsg struct {
 	Code    string       `json:"code"`
 	Servers []wireServer `json:"servers"`
 	Limits  Limits       `json:"limits"`
+	// Language is LanguageStarlark ("" in an older parent) or
+	// LanguageJavaScript.
+	Language string `json:"language,omitempty"`
+	// MaxParallel caps the calls a script keeps in flight at once
+	// (JavaScript's tools.parallel, Starlark's parallel).
+	MaxParallel int `json:"maxParallel,omitempty"`
+	// MemoryMiB is the worker's memory cap, which sizes the JavaScript
+	// heap.
+	MemoryMiB int `json:"memoryMiB,omitempty"`
 }
 
 // wireServer is one server as the worker binds it: its identifier, the
@@ -73,6 +87,12 @@ type childMsg struct {
 	Server string         `json:"server,omitempty"`
 	Member string         `json:"member,omitempty"`
 	Args   map[string]any `json:"args,omitempty"`
+	// Name is a call by name ("Server.tool"), with Server and Member
+	// empty: JavaScript's tools.call, Starlark's try_call("...").
+	Name string `json:"name,omitempty"`
+	// Try asks for the call's outcome as data: a failed or held call does
+	// not end the script.
+	Try bool `json:"try,omitempty"`
 	// print
 	Text string `json:"text,omitempty"`
 	// done
@@ -84,15 +104,27 @@ type childMsg struct {
 	// Cause is the structured run's error kind when the script side knows
 	// it (ErrorTimeout, ErrorLimit); the parent accepts no other value.
 	Cause string `json:"cause,omitempty"`
+	// Call names the call (its ID) whose failure, uncaught, ended a
+	// JavaScript script, so the run reports that call's outcome
+	// (permission_required, say) rather than a script error.
+	Call int `json:"call,omitempty"`
 }
 
-// parentMsg answers one call: the tool's text, or the error that aborts the
-// script.
+// parentMsg answers one call: the tool's text (or, for JavaScript, its
+// structured content as JSON), or the error that aborts the script.
 type parentMsg struct {
 	Type  string `json:"type"`
 	ID    int    `json:"id"`
 	Text  string `json:"text,omitempty"`
 	Error string `json:"error,omitempty"`
+	// JSON is the tool's structured content, sent instead of Text to a
+	// JavaScript script.
+	JSON json.RawMessage `json:"json,omitempty"`
+	// Status is the call's status (succeeded, failed,
+	// permission_required, deferred, outcome_unknown).
+	Status string `json:"status,omitempty"`
+	// ApprovalID names the legacy approval a deferred call waits on.
+	ApprovalID string `json:"approvalId,omitempty"`
 }
 
 // cut bounds s to max bytes (on a rune boundary), marking the cut.

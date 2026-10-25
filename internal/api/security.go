@@ -406,8 +406,9 @@ func (s *Server) HardenAPI(next http.Handler) http.Handler {
 			// one browser form on the API, a connect link's Continue
 			// button (connect_link_routes.go), posts form-encoded and
 			// proves itself with a nonce cookie instead. POST /v1/code/run
-			// also takes a raw script as text/x-starlark; it is
-			// bearer-only, so the type is no CSRF door.
+			// also takes a raw script as text/x-starlark or
+			// text/javascript (application/javascript); it is bearer-only,
+			// so the type is no CSRF door.
 			if r.ContentLength != 0 && !strings.HasPrefix(path, connectLinkPath) && path != hostAuthorizePath && !strings.HasPrefix(path, uploadsPathPrefix) {
 				ct := r.Header.Get("Content-Type")
 				if ct == "" {
@@ -421,9 +422,9 @@ func (s *Server) HardenAPI(next http.Handler) http.Handler {
 				switch {
 				case ct == "application/json":
 				case path == codeRunPath && r.Method == http.MethodPost:
-					if ct != contentTypeScript {
+					if ct != contentTypeScript && ct != contentTypeJS && ct != "application/javascript" {
 						writeError(w, http.StatusUnsupportedMediaType,
-							"only text/x-starlark or application/json is accepted")
+							"only text/x-starlark, text/javascript or application/json is accepted")
 						return
 					}
 				default:
@@ -458,6 +459,8 @@ func perRouteBodyCap(path string) int64 {
 		return maxCodeRunBody // 4 MiB: a 1 MiB script after JSON escaping, plus the envelope and reason
 	case strings.HasPrefix(path, codePathPrefix):
 		return 8 << 10 // 8 KiB — a resume body; the other code routes are GETs
+	case path == jobsPath:
+		return maxJobStartBody // 4 MiB: a tool call's arguments (POST /v1/jobs)
 	case strings.HasPrefix(path, "/v1/tools/run"),
 		strings.HasPrefix(path, "/v1/agents/tools/run"):
 		// The reader allows 4 MiB, but decode() stops JSON bodies at 1 MiB
@@ -520,7 +523,8 @@ func exemptFromCSRFHeader(path string) bool {
 	// Code mode over REST and session tokens are bearer-only (agent or
 	// session token); no cookie is read, so they aren't CSRF-replayable.
 	// This also lifts the Origin check (exemptFromOriginCheck).
-	if strings.HasPrefix(path, codePathPrefix) || path == sessionTokensPath || strings.HasPrefix(path, sessionTokensPrefix) {
+	if strings.HasPrefix(path, codePathPrefix) || path == sessionTokensPath || strings.HasPrefix(path, sessionTokensPrefix) ||
+		path == jobsPath || strings.HasPrefix(path, jobsPrefix) {
 		return true
 	}
 	// Webhook event ingest is bearer-authenticated (source token); no cookie

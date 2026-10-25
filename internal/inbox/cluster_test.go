@@ -170,6 +170,11 @@ func TestTwoNodeLeaseRollingRestartKeepsExecutions(t *testing.T) {
 
 // Wait on node 2 wakes when node 1 records the decision.
 func TestTwoNodeWaitWakesOnDecision(t *testing.T) {
+	// A poll far longer than the test's bound: only the cluster message
+	// can wake the wait in time.
+	old := waitPoll
+	waitPoll = 30 * time.Second
+	t.Cleanup(func() { waitPoll = old })
 	node1, node2, _, _, _ := twoInboxNodes(t)
 	ctx := context.Background()
 	r := submitDeploy(t, node1, "ag_1")
@@ -199,6 +204,7 @@ func TestTwoNodeWaitWakesOnDecision(t *testing.T) {
 		}
 		time.Sleep(10 * time.Millisecond)
 	}
+	decidedAt := time.Now()
 	if _, err := node1.svc.Decide(ctx, r.ID, Decision{Action: "deny", Note: "Not this week"}); err != nil {
 		t.Fatalf("decide on node 1: %v", err)
 	}
@@ -209,6 +215,11 @@ func TestTwoNodeWaitWakesOnDecision(t *testing.T) {
 		}
 		if len(res.views) != 1 || res.views[0].Status == StatusPending {
 			t.Fatalf("wait returned %+v", res.views)
+		}
+		// The fallback poll runs every 30 s from the start of the wait: a
+		// wake-up within 5 s came through the cluster message.
+		if took := time.Since(decidedAt); took >= 5*time.Second {
+			t.Fatalf("node 2's wait returned %s after the decision: the cluster wake-up did not arrive, only the poll", took)
 		}
 		t.Logf("node 2's wait returned %s after node 1's decision", res.took)
 	case <-time.After(10 * time.Second):

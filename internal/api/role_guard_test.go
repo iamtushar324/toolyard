@@ -144,8 +144,9 @@ func memberAllowlist() map[string]bool {
 		"/v1/agents/session-tokens", "/v1/agents/session-tokens/x", "/v1/agents/session-tokens/x/y",
 		"/v1/code/run", "/v1/code/runs/x", "/v1/code/runs/x/y",
 		"/v1/code/files", "/v1/code/files/x", "/v1/code/files/x/y",
-		"/v1/code/docs/x", "/v1/code/docs/x/y",
+		"/v1/code/docs/x", "/v1/code/docs/x/y", "/v1/code/search",
 		"/v1/code/openapi.json", "/v1/code/ty",
+		"/v1/jobs", "/v1/jobs/x", "/v1/jobs/x/y",
 	} {
 		for _, m := range guardMethods {
 			allowed[m+" "+p] = true

@@ -120,6 +120,10 @@ func registerRealtimeTypes(hub *realtime.Hub) {
 // failed to answer: a live replica that could not renew during an outage
 // (or while no leader ran) gets that long to renew before its work could
 // read as abandoned.
+//
+// Startup starts its leader loop where a single node runs its startup
+// recovery, once the upstream servers (the tool list a re-run legacy
+// execution needs) and the Inbox hooks are loaded.
 func runWorkRecovery(ctx context.Context, c *cluster.Cluster, ping func(context.Context) error, inboxSvc *inbox.Service, bus *approval.Bus, codeRuns *coderuns.Service) {
 	if !c.MultiNode() {
 		return

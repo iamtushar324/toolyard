@@ -91,6 +91,13 @@ type Request struct {
 	ExpiresAt      int64          `json:"expires_at"`
 	Fingerprint    string         `json:"fingerprint,omitempty"`
 	Coalesced      bool           `json:"coalesced,omitempty"` // true if Hold returned an existing pending row instead of creating a new one
+	// DecidedInline is set only on the request Hold returns when this
+	// Hold's own auto-approval decided it in line (with its execution
+	// claim): that caller, and no other, dispatches the call. A request
+	// someone else decided (another Hold, a person, a rule on a coalesced
+	// row) never carries it, even when its decider is a rule. Never
+	// stored or sent.
+	DecidedInline bool `json:"-"`
 	// CallbackWarning is set by Hold (never stored) when the call's
 	// _callback_ref could not follow the request.
 	CallbackWarning string `json:"callback_warning,omitempty"`
@@ -306,6 +313,7 @@ func (b *Bus) Hold(ctx context.Context, in NewRequest, maxWait time.Duration) (h
 			decided, derr := b.decideInline(ctx, req.ID, StatusAllowed, d)
 			if derr == nil && decided != nil {
 				b.auto.MarkHit(ctx, m.ID, req.AgentID)
+				decided.DecidedInline = true
 				return decided, nil
 			}
 		}
@@ -317,8 +325,18 @@ func (b *Bus) Hold(ctx context.Context, in NewRequest, maxWait time.Duration) (h
 	b.waiters[req.ID] = w
 	b.mu.Unlock()
 	defer func() {
+		// Only this Hold's own waiter goes (another Hold on the same
+		// request may have installed its own since), and it is closed, so
+		// a watcher of its channel (tools.wait_for_approval) re-reads.
 		b.mu.Lock()
-		delete(b.waiters, req.ID)
+		if b.waiters[req.ID] == w {
+			delete(b.waiters, req.ID)
+			select {
+			case <-w.done:
+			default:
+				close(w.done)
+			}
+		}
 		b.mu.Unlock()
 	}()
 
@@ -339,16 +357,18 @@ func (b *Bus) Hold(ctx context.Context, in NewRequest, maxWait time.Duration) (h
 	for {
 		select {
 		case <-w.done:
+			// A wake-up for everyone (an expiry sweep) may find this
+			// request still open: the next waiter is installed before the
+			// read, so a decision that lands in between still wakes it.
+			next := &pending{req: req, done: make(chan struct{})}
+			b.mu.Lock()
+			b.waiters[req.ID] = next
+			b.mu.Unlock()
+			w = next
 			cur, err := b.Get(ctx, req.ID)
 			if err != nil || b.settled(cur) {
 				return cur, err
 			}
-			// A wake-up for everyone (an expiry sweep) found this request
-			// still open: wait again on a fresh signal.
-			w = &pending{req: req, done: make(chan struct{})}
-			b.mu.Lock()
-			b.waiters[req.ID] = w
-			b.mu.Unlock()
 		case <-poll:
 			if cur, err := b.Get(ctx, req.ID); err == nil && b.settled(cur) {
 				return cur, nil
@@ -689,9 +709,14 @@ func (b *Bus) decide(ctx context.Context, id, action string, d actor.Decider, ru
 		// recovery sweep (another node's, or this one's next start) ever
 		// sees the request allowed and unclaimed and runs it a second time.
 		// When the claim cannot be written, nothing is decided: the request
-		// stays pending for a person.
+		// stays pending for a person. Once it committed, no error comes
+		// back (decidedInline): the caller holds the claim and must
+		// dispatch, or nobody ever would.
 		if n, err = b.decideClaimed(ctx, id, update, updateArgs); err != nil {
 			return nil, err
+		}
+		if n == 1 {
+			return b.decidedInline(ctx, existing, d), nil
 		}
 	} else if n, err = b.decideTx(ctx, id, update, updateArgs); err != nil {
 		// The decision and its approval.decided webhook event commit
@@ -762,7 +787,72 @@ func (b *Bus) decideClaimed(ctx context.Context, id, update string, updateArgs [
 	if err := b.emitDecidedTx(ctx, tx, id); err != nil {
 		return 0, err
 	}
-	return 1, tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return b.unclearInlineCommit(ctx, id, err)
+	}
+	if afterInlineCommit != nil {
+		afterInlineCommit(id)
+	}
+	return 1, nil
+}
+
+// afterInlineCommit, when set (tests), runs right after decideClaimed
+// committed.
+var afterInlineCommit func(id string)
+
+// postCommitTimeout bounds the reads and writes that settle an in-line
+// decision after its commit, on a context the caller's cannot cancel.
+const postCommitTimeout = 5 * time.Second
+
+// unclearInlineCommit settles an in-line decision whose Commit returned
+// an error: it may have committed anyway. A fresh read tells: allowed
+// under this node's claim means it committed (the caller dispatches);
+// still pending means it did not (nothing happens). When even that read
+// fails, the request is recorded outcome_unknown, so nothing ever
+// dispatches it and no claim waits forever.
+func (b *Bus) unclearInlineCommit(ctx context.Context, id string, commitErr error) (int64, error) {
+	rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), postCommitTimeout)
+	defer cancel()
+	cur, err := b.Get(rctx, id)
+	if err == nil {
+		if cur.Status == StatusAllowed && cur.ExecutionState == "running" {
+			return 1, nil
+		}
+		if cur.Status == StatusPending {
+			return 0, fmt.Errorf("in-line decision: %w", commitErr)
+		}
+	}
+	logx.For("approval").Error("in-line decision: commit outcome unclear; recording outcome_unknown", "approval_id", id, "err", commitErr.Error())
+	if serr := b.SetResultState(rctx, id, "", true, "the in-line approval's commit failed with an unclear outcome; inspect upstream state and do not repeat", "outcome_unknown"); serr != nil {
+		logx.For("approval").Error("in-line decision: recording outcome_unknown failed", "approval_id", id, "err", serr.Error())
+	}
+	return 0, fmt.Errorf("in-line decision: %w", commitErr)
+}
+
+// decidedInline finishes an in-line allow that committed: the fan-out and
+// signal as for any decision, and the request to dispatch. Its read runs
+// on a context the caller's cannot cancel; when even that fails the
+// request is built from existing and the decision, so the deciding Hold
+// still dispatches under its claim.
+func (b *Bus) decidedInline(ctx context.Context, existing *Request, d actor.Decider) *Request {
+	rctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), postCommitTimeout)
+	defer cancel()
+	req, err := b.Get(rctx, existing.ID)
+	if err != nil {
+		logx.For("approval").Warn("in-line decision: re-read after commit failed; answering from the decision", "approval_id", existing.ID, "err", err.Error())
+		built := *existing
+		built.Status = StatusAllowed
+		built.DecidedBy, built.DecidedAt = d.Legacy(), time.Now().UnixMilli()
+		built.DecidedVia, built.DeciderEmail, built.DeciderName, built.DeciderRef = d.Via, d.Email, d.Name, d.Ref
+		if d.Via == actor.ViaAutoRule {
+			built.AutoDecidedBy = d.Ref
+		}
+		built.ExecutionState = "running"
+		req = &built
+	}
+	b.fanOut(context.WithoutCancel(ctx), req, "approval.decide")
+	b.signal(existing.ID)
+	return req
 }
 
 // DispatchCommitted releases a legacy decision committed by Inbox.
@@ -1000,6 +1090,20 @@ func (b *Bus) SweepUnexecuted(ctx context.Context) (int, error) {
 		return 0, err
 	}
 
+	// An auto-rule decision is dispatched in line by Hold's caller, and
+	// this binary writes its claim with the decision. One that an older
+	// binary dispatched without a claim, and left without a result, has an
+	// unknown outcome too: it gets an outcome_unknown claim here, so the
+	// step below settles it and nothing ever runs it again.
+	if _, err := b.db.ExecContext(ctx, `INSERT INTO legacy_execution_claims(request_id,state,claimed_at,reason)
+		SELECT id, 'outcome_unknown', CAST(? AS BIGINT), 'In-line auto-approved call left without a result or a claim; do not repeat'
+		FROM approval_requests
+		WHERE status = 'allowed' AND result_executed_at IS NULL AND COALESCE(decided_via, '') = ?
+		  AND id NOT IN (SELECT request_id FROM legacy_execution_claims)
+		ON CONFLICT (request_id) DO NOTHING`, time.Now().UnixMilli(), actor.ViaAutoRule); err != nil {
+		return 0, err
+	}
+
 	uncertain, e := b.db.QueryContext(ctx, `SELECT request_id FROM legacy_execution_claims WHERE state='outcome_unknown' AND request_id IN (SELECT id FROM approval_requests WHERE result_executed_at IS NULL)`)
 	if e != nil {
 		return 0, e
@@ -1024,9 +1128,7 @@ func (b *Bus) SweepUnexecuted(ctx context.Context) (int, error) {
 	if b.exec == nil {
 		return 0, nil
 	}
-	// An auto-rule decision is dispatched in line by Hold's caller, under
-	// a claim written with the decision: never run it here, even when an
-	// older binary left one without a claim.
+	// An auto-rule decision is never run here (see above).
 	rows, err := b.db.QueryContext(ctx,
 		`SELECT `+requestSelectColumns+`
          FROM approval_requests
@@ -1144,6 +1246,44 @@ func (b *Bus) CancelByAgent(ctx context.Context, id, agentID string) (*Request, 
 		// uniformly reported as ErrNotPending so callers don't probe other
 		// agents' queues.
 		if existing.AgentID != agentID {
+			return nil, ErrNotFound
+		}
+		return existing, ErrNotPending
+	}
+	req, err := b.Get(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	b.signal(id)
+	b.fanOut(ctx, req, "approval.cancel")
+	return req, nil
+}
+
+// ViaSystem is the decided_via of a cancellation toolyard made itself, not
+// a person or the agent: CancelBySystem.
+const ViaSystem = "system"
+
+// CancelBySystem cancels a pending approval of agentID because toolyard
+// took the agent's access away (reason, e.g. "grant revoked"). Unlike
+// CancelByAgent it also cancels a personal approval (one only its owner
+// may decide): the request can no longer run, whoever would have decided
+// it. It is recorded as decided by the system (decided_via "system",
+// decider_ref reason), never as withdrawn by the agent. ErrNotPending when
+// it was already decided, ErrNotFound for another agent's request.
+func (b *Bus) CancelBySystem(ctx context.Context, id, agentID, reason string) (*Request, error) {
+	d := actor.Decider{Via: ViaSystem, Ref: reason}
+	res, err := b.db.ExecContext(ctx,
+		`UPDATE approval_requests SET status = ?, decided_by = ?, decided_at = ?,
+            decided_via = ?, decider_ref = ?
+         WHERE id = ? AND status = ? AND agent_id = ?`,
+		StatusCancelled, d.Legacy(), time.Now().UnixMilli(), d.Via, d.Ref,
+		id, StatusPending, agentID)
+	if err != nil {
+		return nil, err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		existing, getErr := b.Get(ctx, id)
+		if getErr != nil || existing.AgentID != agentID {
 			return nil, ErrNotFound
 		}
 		return existing, ErrNotPending

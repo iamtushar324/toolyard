@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/tusharbhardwaj/toolyard/internal/gateway"
+	"github.com/tusharbhardwaj/toolyard/internal/jobs"
 	"github.com/tusharbhardwaj/toolyard/internal/secrets"
 	"github.com/tusharbhardwaj/toolyard/internal/store"
 )
@@ -80,6 +81,9 @@ type Server struct {
 	// and tokens were dropped as a result: the operator has to authorise
 	// it again. Never persisted.
 	OAuthReset bool `json:"oauth_reset,omitempty"`
+	// Async is the server's async-tool setting (async.go), set with
+	// SetAsync and filled by List and Get. nil when it has none.
+	Async *jobs.AsyncSetting `json:"async,omitempty"`
 }
 
 // AuthMode values.
@@ -150,6 +154,9 @@ type Service struct {
 	// remote carries changes to and from the other replicas (SetCluster,
 	// cluster.go); nil on a single node.
 	remote *remoteSync
+
+	// asyncCache is the async-tool settings the gateway reads (async.go).
+	asyncCache
 }
 
 func New(db *store.DB, gw *gateway.Gateway) *Service {
@@ -348,7 +355,7 @@ func validate(srv Server) error {
 	// may still be stored, so no server may take its name.
 	switch srv.Name {
 	case "builtin", "fixture", "memory", "tools", "mempalace", "notes", "skills",
-		"inbox", "session", "lake", "events", "policies", "servers", "audit", "access", "toolyard", "connections":
+		"inbox", "session", "lake", "events", "policies", "servers", "audit", "access", "toolyard", "connections", "jobs":
 		return ErrReserved
 	}
 	switch srv.Transport {
@@ -582,12 +589,23 @@ func (s *Service) list(ctx context.Context) ([]Server, error) {
 	return out, rows.Err()
 }
 
-// List returns the persisted upstream configs.
-func (s *Service) List(ctx context.Context) ([]Server, error) { return s.list(ctx) }
+// List returns the persisted upstream configs, with their async settings.
+func (s *Service) List(ctx context.Context) ([]Server, error) {
+	out, err := s.list(ctx)
+	s.attachAsync(out)
+	return out, err
+}
 
-// Get returns one upstream server by name. Returns ErrNotFound when missing.
+// Get returns one upstream server by name, with its async setting.
+// Returns ErrNotFound when missing.
 func (s *Service) Get(ctx context.Context, name string) (*Server, error) {
-	return s.get(ctx, name)
+	srv, err := s.get(ctx, name)
+	if srv != nil {
+		if set := s.AsyncSetting(name); !set.IsZero() {
+			srv.Async = &set
+		}
+	}
+	return srv, err
 }
 
 // Add inserts a new upstream and tries to connect. On a connection failure the

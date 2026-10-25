@@ -18,12 +18,14 @@ const (
 	// it (decided, executed, cancelled), or wakeAll after an expiry sweep.
 	wakeTopic = "approval-wake"
 	wakeAll   = "*"
-	// holdPoll is how often an in-line Hold re-reads its request on a
-	// multi-node database, in case a wake-up message was missed.
-	holdPoll = 2 * time.Second
 	// LeaseRenewalLoop names RunLeaseRenewal in the supervised loop.
 	LeaseRenewalLoop = "approval-lease-renewal"
 )
+
+// holdPoll is how often an in-line Hold re-reads its request on a
+// multi-node database, in case a wake-up message was missed. A variable
+// so a test can lengthen it and prove the message path alone.
+var holdPoll = 2 * time.Second
 
 // SetCluster makes the bus safe for replicas sharing the database: waiters
 // wake on decisions made on any node, execution claims carry this node's

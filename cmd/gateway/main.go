@@ -46,6 +46,7 @@ import (
 	"github.com/tusharbhardwaj/toolyard/internal/audit"
 	"github.com/tusharbhardwaj/toolyard/internal/auditlink"
 	"github.com/tusharbhardwaj/toolyard/internal/autoapproval"
+	"github.com/tusharbhardwaj/toolyard/internal/blobstore"
 	"github.com/tusharbhardwaj/toolyard/internal/callbacks"
 	"github.com/tusharbhardwaj/toolyard/internal/chatnotify"
 	"github.com/tusharbhardwaj/toolyard/internal/chatnotify/telegram"
@@ -62,6 +63,7 @@ import (
 	"github.com/tusharbhardwaj/toolyard/internal/identity"
 	"github.com/tusharbhardwaj/toolyard/internal/identitykeys"
 	"github.com/tusharbhardwaj/toolyard/internal/inbox"
+	"github.com/tusharbhardwaj/toolyard/internal/jobs"
 	"github.com/tusharbhardwaj/toolyard/internal/keyguard"
 	"github.com/tusharbhardwaj/toolyard/internal/logx"
 	"github.com/tusharbhardwaj/toolyard/internal/mcpauth"
@@ -316,6 +318,9 @@ func runServe(argv []string) error {
 	// set exits on an unknown flag. toolyard no longer runs a ClickHouse lake.
 	clickhouseRuntimeEnvPath := fs.String("clickhouse-runtime-env", "", "DEPRECATED: ignored. Kept so existing service units keep starting.")
 	inboxResetPasskeys := fs.Bool("inbox-reset-passkeys", false, "delete every registered passkey at startup (recovery when the owner has lost all their devices), then continue normally")
+	codemodeMaxConcurrent := fs.Int("codemode-max-concurrent", 4, "code mode: the most scripts (executeToolCode and POST /v1/code/run) running at once on this gateway; each runs in its own worker process under the worker memory cap (256 MiB)")
+	codemodeMaxPerAgent := fs.Int("codemode-max-per-agent", 3, "code mode: the most scripts one agent runs at once")
+	codemodeQueueWait := fs.Duration("codemode-queue-wait", 30*time.Second, "code mode: how long a script past -codemode-max-concurrent or -codemode-max-per-agent waits in the fair queue for a slot before it is refused as busy (HTTP 429 over REST)")
 	inboxFetchPrivate := fs.Bool("inbox-fetch-private-networks", false, "let the inbox copy attachment links that point at loopback or private-network addresses (e.g. evidence hosted on your LAN). Off by default: agent-chosen URLs could otherwise reach internal services.")
 	requireAuthMCP := fs.Bool("require-auth-on-mcp", false, "reject anonymous /mcp calls (no Authorization header). Auto-enabled when -public-url is set.")
 	upstreamProtocolFlag := fs.String("upstream-protocol", upstreamProtocolLegacy, "MCP version toward upstream servers: legacy (2025-11-25 for every upstream) | auto (a shared http upstream that offers 2026-07-28 is called statelessly, one POST per call, outside the live pool and the idle sweep; stdio and per_user stay legacy)")
@@ -323,6 +328,7 @@ func runServe(argv []string) error {
 	noStdioUpstreams := fs.Bool("no-stdio-upstreams", false, "refuse to start any stdio (subprocess) MCP upstream. Use when the dashboard is exposed publicly so a compromised session can't spawn arbitrary commands.")
 	envDenylistFlag := fs.String("upstream-env-denylist", "LD_PRELOAD,LD_LIBRARY_PATH,DYLD_INSERT_LIBRARIES,DYLD_LIBRARY_PATH,PATH", "comma-separated env var keys forbidden in upstream stdio configs")
 	upstreamCallTimeout := fs.Duration("upstream-call-timeout", 120*time.Second, "per-tool-call deadline applied to every dispatch (built-in, fixture, and external upstreams). 0 disables the cap. Without it, a hung upstream pins a goroutine indefinitely and queues every other caller behind it.")
+	asyncJobTimeout := fs.Duration("async-job-timeout", jobs.DefaultMaxDuration, "time limit of one async job (a call to a tool marked async, jobs.start, POST /v1/jobs, an MCP task); it replaces -upstream-call-timeout for that call")
 	// TEC-1626 drain
 	drainDelay := fs.Duration("drain-delay", defaultDrainDelay, "on SIGTERM/SIGINT, how long readiness reports 503 (and new tool calls get a retryable refusal) before streams and waits close, so the load balancer stops sending traffic first")
 	drainTimeout := fs.Duration("drain-timeout", defaultDrainTimeout, "deadline, from the start of the drain (delay included), for open HTTP requests and in-flight executions to finish. Work still running then is cancelled and recorded outcome_unknown. Keep the unit's TimeoutStopSec above this plus ~10s.")
@@ -488,6 +494,11 @@ func runServe(argv []string) error {
 		return err
 	}
 	clusterSvc, err := cluster.New(ctx, db, cluster.Options{InstanceID: *instanceID, SingleNode: cmode == clusterOff})
+	if errors.Is(err, cluster.ErrModeConflict) {
+		// -cluster=off next to another gateway, or a replica next to an
+		// off one: a restart cannot fix the configuration (exit 78).
+		return fmt.Errorf("%w (%w)", err, keyguard.ErrConfig)
+	}
 	if err != nil {
 		return fmt.Errorf("cluster: %w", err)
 	}
@@ -685,6 +696,23 @@ func runServe(argv []string) error {
 	if err != nil {
 		return fmt.Errorf("TOOLYARD_CODEMODE_SANDBOX: %w", err)
 	}
+	// Async tools (docs/guidelines/async-tools.md): calls to tools an
+	// administrator marked async, jobs.start, POST /v1/jobs and MCP tasks
+	// run as durable jobs. Results over 256 KiB go to the blob store (files
+	// under <data>/job-results on SQLite, chunks in Postgres). The lease
+	// heartbeat and recovery run on every node; retention runs under the
+	// job Leader (single node until slice A's cluster.RunLeader is wired).
+	jobBlobs, err := blobstore.ForDB(db, filepath.Join(*dataDir, "job-results"))
+	if err != nil {
+		return fmt.Errorf("job results: %w", err)
+	}
+	// The jobs' leases carry this replica's cluster instance id, and the
+	// retention purge runs on the cluster leader.
+	jobsSvc := jobs.New(db, jobs.Options{
+		Blobs: jobBlobs, MaxDuration: *asyncJobTimeout,
+		InstanceID: clusterSvc.InstanceID(), Leader: clusterSvc,
+	})
+	jobsSvc.Run(ctx)
 	gw := gateway.New(gateway.Options{
 		Name:                "toolyard",
 		Version:             version,
@@ -705,10 +733,12 @@ func runServe(argv []string) error {
 		Owners:              accessSvc,
 		PublicURL:           *publicURL,
 		UpstreamProtocol:    upstreamProtocol,
+		Jobs:                jobsSvc,
 	})
 	// The kernel probe for the code-mode sandbox runs now, off the
 	// request path.
 	gw.SetCodeModeSandbox(sandboxMode)
+	gw.SetCodeModeConcurrency(*codemodeMaxConcurrent, *codemodeMaxPerAgent, *codemodeQueueWait)
 	gw.SetCluster(clusterSvc)
 	goroutines.Go(goCodemodeProbe, func() { codemode.ProbeSandbox() })
 	gw.RegisterBuiltins()
@@ -927,14 +957,11 @@ func runServe(argv []string) error {
 	leaderLoop(ctx, clusterSvc, loopSessionPurger, time.Hour, func(ctx context.Context) { runSessionPurger(ctx, idSvc, codeRuns) })
 	// Every replica renews the leases of the code runs it runs.
 	goroutines.Loop(ctx, coderuns.LeaseRenewalLoop, time.Minute, codeRuns.RunLeaseRenewal)
-	// The leader settles the work of replicas that stopped (multi-node only).
-	leaderLoop(ctx, clusterSvc, loopWorkRecovery, time.Minute, func(ctx context.Context) {
-		runWorkRecovery(ctx, clusterSvc, db.PingContext, inboxSvc, bus, codeRuns)
-	})
-
 	upstreamSvc := upstreams.New(db, gw)
 	// Servers saved on another replica are connected here too.
 	upstreamSvc.SetCluster(ctx, clusterSvc)
+	// Which servers and tools are async (Edit server, PUT /v1/servers/{name}/async).
+	gw.SetAsyncPolicy(upstreamSvc)
 	upstreamSvc.SetPolicy(upstreams.Policy{
 		AllowStdio:  !*noStdioUpstreams,
 		EnvDenylist: splitCSV(*envDenylistFlag),
@@ -1017,6 +1044,9 @@ func runServe(argv []string) error {
 	// Webhooks: the callbacks.* tools, and approval.decided /
 	// approval.executed for legacy deferred approvals.
 	gw.RegisterCallbackTools(callbackSvc, federationSvc.PrivateReceiverAllowed)
+	// A finished async job sends job.completed / job.failed to its
+	// _callback_ref, or the agent's default receiver.
+	jobsSvc.SetNotifier(jobs.EmitterNotifier(callbackSvc.EmitForAgentTx))
 	bus.SetEventSink(callbackSvc)
 	upstreamSvc.SetSecrets(secretsSvc)
 
@@ -1095,6 +1125,13 @@ func runServe(argv []string) error {
 			log.Printf("legacy execution: recovered %d unclaimed decisions", n)
 		}
 	}
+	// The leader settles the work of replicas that stopped (multi-node
+	// only). It starts here, once startup has loaded what recovery needs
+	// (the upstream servers and the Inbox hooks), so this replica takes no
+	// recovery lease before it could use it.
+	leaderLoop(ctx, clusterSvc, loopWorkRecovery, time.Minute, func(ctx context.Context) {
+		runWorkRecovery(ctx, clusterSvc, db.PingContext, inboxSvc, bus, codeRuns)
+	})
 
 	// MemPalace: install (if needed), initialize palace dir, and register
 	// the built-in stdio upstream so its 29 tools surface as `mempalace.*`.
@@ -1384,6 +1421,7 @@ func runServe(argv []string) error {
 		OwnerEmail:      *ownerEmail,
 		ConnectAZP:      connectOrigins,
 		CodeRuns:        codeRuns,
+		Jobs:            jobsSvc,
 	})
 
 	// Rate limits and the connect-t3 lock hold across replicas.
@@ -1441,8 +1479,12 @@ func runServe(argv []string) error {
 	// 2026-07-28 subscriptions/listen POST) once the drain starts and ends
 	// open ones with the other waiters (lifecycle.go).
 	mcpStreams := newMCPStreamGate()
-	mux.Handle("/mcp", mcpStreams.wrap(api.LimitBody(gateway.PreserveToolCallNumbers(mcpAuthn.guard(streamable)), 16<<20)))
-	mux.Handle("/mcp/", mcpStreams.wrap(api.LimitBody(gateway.PreserveToolCallNumbers(mcpAuthn.guard(streamable)), 16<<20)))
+	// MCP Tasks are answered from the jobs table (any replica), in front
+	// of the transport and after the token check, with the transport's
+	// own DNS rebinding protection (off with -public-url, as above).
+	mcpHandler := gw.MCPTasks(streamable, mcpAuthn.contextFunc, *publicURL == "")
+	mux.Handle("/mcp", mcpStreams.wrap(api.LimitBody(gateway.PreserveToolCallNumbers(mcpAuthn.guard(mcpHandler)), 16<<20)))
+	mux.Handle("/mcp/", mcpStreams.wrap(api.LimitBody(gateway.PreserveToolCallNumbers(mcpAuthn.guard(mcpHandler)), 16<<20)))
 
 	// pprof endpoints, gated to loopback. When toolyard hangs, run
 	//   curl -s http://127.0.0.1:<port>/debug/pprof/goroutine?debug=2
@@ -1612,11 +1654,18 @@ func runServe(argv []string) error {
 		}()
 	}
 
+	var exitErr error
 	select {
 	case <-stop:
 		rootLog.Info("shutdown signal received")
 	case <-ctx.Done():
 		rootLog.Warn("root context ended; shutting down")
+	case <-clusterSvc.ModeConflict():
+		// The mode guard no longer holds: a gateway with the other
+		// -cluster setting took the database while this one was
+		// disconnected. Drain and exit 78 (a configuration error).
+		rootLog.Error("a gateway with the other -cluster setting uses this database; shutting down")
+		exitErr = fmt.Errorf("%w (%w)", cluster.ErrModeConflict, keyguard.ErrConfig)
 	}
 	// TEC-1626 drain: one ordered shutdown (lifecycle.go). Executors run on
 	// the bus's own context, so nothing in flight is cancelled before the
@@ -1630,6 +1679,7 @@ func runServe(argv []string) error {
 		refuseNew: func() {
 			gw.BeginDrain()
 			bus.BeginDrain()
+			jobsSvc.BeginDrain()
 			mcpStreams.refuse()
 			// Another replica takes over the leader tasks at once.
 			clusterSvc.Drain()
@@ -1641,6 +1691,7 @@ func runServe(argv []string) error {
 			gw.ReleaseWaiters()
 			bus.ReleaseWaiters()
 			codeRuns.ReleaseWaiters()
+			jobsSvc.ReleaseWaiters()
 		},
 		stopHTTP:  httpSrv.Shutdown,
 		forceHTTP: httpSrv.Close,
@@ -1648,6 +1699,15 @@ func runServe(argv []string) error {
 			func(ctx context.Context) { bus.WaitExecutions(ctx, shutdownGrace) },
 			func(ctx context.Context) { waitGrantedCalls(ctx, gw, inboxSvc, shutdownGrace) },
 			codeRuns.Wait,
+			jobsSvc.Wait,
+			// Leader units (a memory-webhook job, an OAuth refresh, a
+			// job retention pass) run on the root context: let them end
+			// before step 7 cancels it.
+			func(ctx context.Context) {
+				if left := cluster.WaitUnits(ctx); len(left) > 0 {
+					logx.For("shutdown").Warn("shutdown: leader work still running at the drain deadline; it stops with the root context", "running", left)
+				}
+			},
 		},
 		cancelRoot: cancel,
 		closers: []shutdownCloser{
@@ -1660,7 +1720,7 @@ func runServe(argv []string) error {
 			{name: "database", close: closeDB},
 		},
 	}).run()
-	return nil
+	return exitErr
 }
 
 // ---- exchange ---------------------------------------------------------------
@@ -2110,9 +2170,11 @@ func (h hubEventBus) Publish(eventType string, data any) {
 }
 
 // identityResolver adapts identity.Service.PrimaryUser → oauth.IdentityResolver.
-// cancelAgentWork withdraws a revoked OAuth client's pending approvals and
-// Inbox requests and revokes its Inbox grants. Best effort: the agent is
-// already disabled, so nothing it queued can run anyway.
+// cancelAgentWork cancels a revoked OAuth client's pending approvals
+// (personal ones included) and Inbox requests and revokes its Inbox
+// grants, each recorded as done by the system because the grant was
+// revoked. Best effort: the agent is already disabled, so nothing it
+// queued can run anyway.
 func cancelAgentWork(ctx context.Context, bus *approval.Bus, inboxSvc *inbox.Service, agentID string) {
 	if bus != nil {
 		pending, err := bus.ListPendingByAgent(ctx, agentID)
@@ -2120,7 +2182,7 @@ func cancelAgentWork(ctx context.Context, bus *approval.Bus, inboxSvc *inbox.Ser
 			log.Printf("mcp-oauth: WARN list pending approvals of %s: %v", agentID, err)
 		}
 		for _, p := range pending {
-			if _, err := bus.CancelByAgent(ctx, p.ID, agentID); err != nil && !errors.Is(err, approval.ErrNotPending) {
+			if _, err := bus.CancelBySystem(ctx, p.ID, agentID, "grant revoked"); err != nil && !errors.Is(err, approval.ErrNotPending) {
 				log.Printf("mcp-oauth: WARN cancel approval %s of %s: %v", p.ID, agentID, err)
 			}
 		}
@@ -2131,11 +2193,11 @@ func cancelAgentWork(ctx context.Context, bus *approval.Bus, inboxSvc *inbox.Ser
 			log.Printf("mcp-oauth: WARN list Inbox requests of %s: %v", agentID, err)
 		}
 		for _, r := range open {
-			if _, err := inboxSvc.Cancel(ctx, agentID, r.ID); err != nil && !errors.Is(err, inbox.ErrNotPending) {
+			if _, err := inboxSvc.CancelBySystem(ctx, agentID, r.ID, "grant revoked"); err != nil && !errors.Is(err, inbox.ErrNotPending) {
 				log.Printf("mcp-oauth: WARN cancel Inbox request %s of %s: %v", r.ID, agentID, err)
 			}
 		}
-		if _, err := inboxSvc.RevokeAll(ctx, agentID); err != nil {
+		if _, err := inboxSvc.RevokeAllBy(ctx, agentID, actor.Decider{Via: approval.ViaSystem, Ref: "grant revoked"}); err != nil {
 			log.Printf("mcp-oauth: WARN revoke Inbox grants of %s: %v", agentID, err)
 		}
 	}

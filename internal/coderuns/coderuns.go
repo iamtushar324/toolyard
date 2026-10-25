@@ -33,6 +33,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/tusharbhardwaj/toolyard/internal/audit"
 	"github.com/tusharbhardwaj/toolyard/internal/cluster"
 	"github.com/tusharbhardwaj/toolyard/internal/codemode"
 	"github.com/tusharbhardwaj/toolyard/internal/goroutines"
@@ -217,7 +218,9 @@ type Run struct {
 	IdempotencyKey string
 	Fingerprint    string
 	Reason         string
-	Status         string
+	// Language is codemode.LanguageStarlark or LanguageJavaScript.
+	Language string
+	Status   string
 	// Result is the script's result as JSON (succeeded runs only).
 	Result       json.RawMessage
 	ErrorKind    string
@@ -296,6 +299,7 @@ func RunPath(id string) string { return "/v1/code/runs/" + id }
 // View is the run view every run route answers.
 type View struct {
 	RunID     string          `json:"run_id"`
+	Language  string          `json:"language"`
 	Status    string          `json:"status"`
 	Result    json.RawMessage `json:"result"`
 	Error     *ViewError      `json:"error"`
@@ -321,6 +325,8 @@ type ViewCall struct {
 	Replayed   bool   `json:"replayed"`
 	StartedAt  int64  `json:"started_at"`
 	FinishedAt *int64 `json:"finished_at"`
+	// MS is how long the call took, 0 until it finished.
+	MS int64 `json:"ms"`
 }
 
 // ViewHeld is the held call in the run view.
@@ -343,8 +349,11 @@ type Links struct {
 // View renders the run view.
 func (r *Run) View() View {
 	v := View{
-		RunID: r.ID, Status: r.Status, Logs: r.Logs, Calls: make([]ViewCall, 0, len(r.Calls)),
+		RunID: r.ID, Language: r.Language, Status: r.Status, Logs: r.Logs, Calls: make([]ViewCall, 0, len(r.Calls)),
 		CreatedAt: r.CreatedAt, UpdatedAt: r.UpdatedAt, Links: Links{Self: RunPath(r.ID)},
+	}
+	if v.Language == "" {
+		v.Language = codemode.LanguageStarlark
 	}
 	if v.Logs == nil {
 		v.Logs = []string{}
@@ -362,6 +371,7 @@ func (r *Run) View() View {
 		if c.FinishedAt > 0 {
 			f := c.FinishedAt
 			vc.FinishedAt = &f
+			vc.MS = max(c.FinishedAt-c.StartedAt, 0)
 		}
 		v.Calls = append(v.Calls, vc)
 	}
@@ -387,6 +397,8 @@ type StartRequest struct {
 	Reason    string
 	// IdempotencyKey is optional, scoped to the agent.
 	IdempotencyKey string
+	// Language is codemode.LanguageStarlark ("" too) or LanguageJavaScript.
+	Language string
 }
 
 // Start validates req and starts a run, or returns the agent's existing
@@ -408,7 +420,11 @@ func (s *Service) Start(ctx context.Context, req StartRequest) (run *Run, create
 	if err := CheckIdempotencyKey(req.IdempotencyKey); err != nil {
 		return nil, false, err
 	}
-	fp := fingerprint(req.Code, reason)
+	lang, err := codemode.ParseLanguage(req.Language)
+	if err != nil {
+		return nil, false, &InputError{Field: "language", Message: err.Error()}
+	}
+	fp := fingerprint(req.Code, reason, lang)
 	if req.IdempotencyKey != "" {
 		r, err := s.replay(ctx, req.AgentID, req.IdempotencyKey, fp)
 		if err == nil || !errors.Is(err, ErrNotFound) {
@@ -426,15 +442,17 @@ func (s *Service) Start(ctx context.Context, req StartRequest) (run *Run, create
 	if rt == nil {
 		return nil, false, ErrUnavailable
 	}
-	slot, err := rt.AcquireSlot(ctx)
+	slot, err := rt.AcquireSlot(codemode.WithAgentKey(ctx, req.AgentID))
 	if err != nil {
 		return nil, false, err
 	}
 	now := s.now().UnixMilli()
 	run = &Run{
 		ID: newRunID(), AgentID: req.AgentID, SessionID: req.SessionID, IdempotencyKey: req.IdempotencyKey,
-		Fingerprint: fp, Reason: reason, Status: StatusQueued, CreatedAt: now, UpdatedAt: now, code: req.Code,
+		Fingerprint: fp, Reason: reason, Language: lang, Status: StatusQueued, CreatedAt: now, UpdatedAt: now, code: req.Code,
 	}
+	// Every audit row of the run, nested calls included, names it.
+	runCtx = audit.WithRunID(runCtx, run.ID)
 	if err := s.insertRun(ctx, run); err != nil {
 		slot.Release()
 		// Another request with the same key committed first: answer as a
@@ -531,10 +549,11 @@ func (s *Service) Resume(ctx context.Context, req ResumeRequest) (*Run, error) {
 	if rt == nil {
 		return nil, ErrUnavailable
 	}
-	slot, err := rt.AcquireSlot(ctx)
+	slot, err := rt.AcquireSlot(codemode.WithAgentKey(ctx, req.AgentID))
 	if err != nil {
 		return nil, err
 	}
+	runCtx = audit.WithRunID(runCtx, run.ID)
 	claimed, err := s.claimResume(ctx, run)
 	if err != nil || !claimed {
 		slot.Release()
@@ -636,7 +655,7 @@ func (s *Service) execute(ctx context.Context, rt Runner, slot *codemode.Slot, r
 				s.log.Warn("code run: could not mark running", "run_id", run.ID, "err", err.Error())
 			}
 		}
-		res, err := rt.Run(ctx, run.code, codemode.RunOptions{Reason: run.Reason, Hooks: h, Slot: slot})
+		res, err := rt.Run(ctx, run.code, codemode.RunOptions{Reason: run.Reason, Hooks: h, Slot: slot, Language: run.Language})
 		switch {
 		case err != nil:
 			kind := codemode.ErrorInternal
@@ -763,9 +782,14 @@ func CheckIdempotencyKey(key string) error {
 	return nil
 }
 
-// fingerprint identifies a script and reason for an Idempotency-Key.
-func fingerprint(code, reason string) string {
+// fingerprint identifies a script, reason and language for an
+// Idempotency-Key. A Starlark run's is what it was before runs had a
+// language.
+func fingerprint(code, reason, language string) string {
 	h := sha256.New()
+	if language != "" && language != codemode.LanguageStarlark {
+		fmt.Fprintf(h, "%s\x00", language)
+	}
 	fmt.Fprintf(h, "%d:", len(code))
 	h.Write([]byte(code))
 	h.Write([]byte(reason))

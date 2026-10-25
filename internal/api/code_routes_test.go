@@ -129,7 +129,11 @@ type codeEnv struct {
 	engine *scriptEngine
 }
 
-func newCodeEnv(t *testing.T) *codeEnv {
+func newCodeEnv(t *testing.T) *codeEnv { return newCodeEnvWith(t, nil) }
+
+// newCodeEnvWith is newCodeEnv with the run service on engine instead of
+// scriptRunner (nil keeps scriptRunner).
+func newCodeEnvWith(t *testing.T, eng coderuns.Engine) *codeEnv {
 	t.Helper()
 	ctx := context.Background()
 	db := storetest.Open(t)
@@ -157,7 +161,11 @@ func newCodeEnv(t *testing.T) *codeEnv {
 
 	runner := &scriptRunner{release: make(chan struct{})}
 	engine := &scriptEngine{r: runner}
-	runs := coderuns.New(db, coderuns.Options{Engine: engine, Grants: approvedGrants{}, PollEvery: 20 * time.Millisecond})
+	var useEngine coderuns.Engine = engine
+	if eng != nil {
+		useEngine = eng
+	}
+	runs := coderuns.New(db, coderuns.Options{Engine: useEngine, Grants: approvedGrants{}, PollEvery: 20 * time.Millisecond})
 	t.Cleanup(func() {
 		runner.releaseSlow()
 		wctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
