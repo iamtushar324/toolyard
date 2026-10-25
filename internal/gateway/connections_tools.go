@@ -170,9 +170,10 @@ func (g *Gateway) connectCaller(ctx context.Context) (callerID, uid string, admi
 	if uid == "" {
 		return callerID, "", false, mcp.NewToolResultError("the connections tools need an enrolled agent with an owner: connect with an agent token (Authorization: Bearer …)")
 	}
-	// Scope.All is an active admin (or a local anonymous caller, who has
-	// no user and was refused above).
-	return callerID, uid, g.scopeFor(ctx, callerID).All, nil
+	// CanAdminister is an active admin's agent (or a local anonymous
+	// caller, who has no user and was refused above) that may manage
+	// toolyard: never an OAuth client its owner did not let manage it.
+	return callerID, uid, g.scopeFor(ctx, callerID).CanAdminister(), nil
 }
 
 // connectionView is one server on connections.status.
@@ -626,7 +627,7 @@ func sharedWhy(conn *oauth.SharedConnection, cause error) string {
 // told which admins can do it.
 func (g *Gateway) sharedConnectMessage(ctx context.Context, upstream, uid, callerID string, conn *oauth.SharedConnection, cause error) string {
 	why := sharedWhy(conn, cause)
-	admin := uid != "" && g.scopeFor(ctx, callerID).All
+	admin := uid != "" && g.scopeFor(ctx, callerID).CanAdminister()
 	if !admin {
 		return fmt.Sprintf("%s uses one shared account and %s; %s, then ask me to retry. Nothing was run.",
 			upstream, why, g.askAdminNote(ctx, upstream))
