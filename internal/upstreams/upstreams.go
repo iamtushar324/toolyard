@@ -353,9 +353,7 @@ func validate(srv Server) error {
 	// Built-ins (mempalace, notes, skills) are registered by startup, not
 	// from the dashboard. lake is the retired data group: old grants for it
 	// may still be stored, so no server may take its name.
-	switch srv.Name {
-	case "builtin", "fixture", "memory", "tools", "mempalace", "notes", "skills",
-		"inbox", "session", "lake", "events", "policies", "servers", "audit", "access", "toolyard", "connections", "jobs", "callbacks":
+	if reservedName(srv.Name) {
 		return ErrReserved
 	}
 	switch srv.Transport {
@@ -549,6 +547,14 @@ func (s *Service) LoadAll(ctx context.Context) error {
 		// UpsertBuiltin right after this, which overwrites the status.
 		if s.stdioRefused(srv) {
 			s.recordStatus(ctx, srv.Name, "", errStdioDisabled.Error(), 0)
+			continue
+		}
+		// A server saved by an older version under a name toolyard now
+		// reserves (v0.1: jobs, callbacks) cannot load: say so plainly.
+		if newlyReserved[srv.Name] {
+			msg := reservedNameError(srv.Name)
+			log.Printf("WARNING: upstream %q %s", srv.Name, msg)
+			s.recordStatus(ctx, srv.Name, "", msg, 0)
 			continue
 		}
 		s.mu.Lock()
@@ -852,6 +858,26 @@ func nullStr(s string) any {
 // upstreams (e.g. "mempalace") are managed by the gateway's startup wiring;
 // removing them from the DB doesn't unregister the live tools, and the next
 // boot would simply re-insert the row anyway.
+// reservedName reports whether name belongs to the gateway (see validate).
+func reservedName(name string) bool {
+	switch name {
+	case "builtin", "fixture", "memory", "tools", "mempalace", "notes", "skills",
+		"inbox", "session", "lake", "events", "policies", "servers", "audit", "access", "toolyard", "connections", "jobs", "callbacks":
+		return true
+	}
+	return false
+}
+
+// newlyReserved are the names v0.1 reserved: a server saved under one by
+// an older version no longer loads (LoadAll says so).
+var newlyReserved = map[string]bool{"jobs": true, "callbacks": true}
+
+// reservedNameError explains why a stored server under a newly reserved
+// name is not loaded, and how to fix it.
+func reservedNameError(name string) string {
+	return fmt.Sprintf("not loaded: the server name %q is reserved since toolyard v0.1, which uses it for its own %s.* tools. Add this server again under another name, grant that name to the people who used it, then delete this one.", name, name)
+}
+
 func isReservedBuiltin(name string) bool {
 	switch name {
 	case "mempalace", "notes":

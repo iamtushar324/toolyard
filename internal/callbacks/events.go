@@ -310,6 +310,9 @@ func (s *Service) EmitForAgentTx(ctx context.Context, tx *sql.Tx, agentID, ref, 
 	if agentID == "" {
 		return ErrReceiver
 	}
+	if err := s.wakeIdle(ctx, tx, agentID, ref); err != nil {
+		return err
+	}
 	if ref == "" {
 		def, _, err := defaultReceiver(ctx, tx, agentID)
 		if err != nil || def == "" {
@@ -370,6 +373,9 @@ func subjectOf(data any) string {
 // (ErrReceiver otherwise). Callers that store a callback_ref for later
 // events (EmitForAgentTx) check it when they store it.
 func (s *Service) CheckRef(ctx context.Context, agentID, ref string) error {
+	if err := s.wakeIdle(ctx, s.db, agentID, ref); err != nil {
+		return err
+	}
 	r, err := s.Get(ctx, agentID, ref)
 	if err != nil {
 		return err
@@ -488,6 +494,9 @@ var ErrPingQuota = fmt.Errorf("at most %d pings a minute; wait, then test again"
 // database so every node shares it; the agent lock makes the check and the
 // insert one step, so concurrent tests never pass the quota together.
 func (s *Service) Test(ctx context.Context, agentID, ref string) (string, error) {
+	if err := s.wakeIdle(ctx, s.db, agentID, ref); err != nil {
+		return "", err
+	}
 	rec, err := s.Get(ctx, agentID, ref)
 	if err != nil {
 		return "", err
@@ -562,6 +571,9 @@ func (s *Service) SubscribeApproval(ctx context.Context, req *approval.Request, 
 	defer tx.Rollback()
 	var revision int
 	named := ref != ""
+	if err = s.wakeIdle(ctx, tx, req.AgentID, ref); err != nil {
+		return err
+	}
 	if !named {
 		ref, revision, err = defaultReceiver(ctx, tx, req.AgentID)
 		if err != nil || ref == "" {

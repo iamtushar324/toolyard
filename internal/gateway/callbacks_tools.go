@@ -141,6 +141,10 @@ func receiverView(r *callbacks.Receiver) map[string]any {
 	if r.EnvironmentID != "" {
 		out["environment_id"] = r.EnvironmentID
 	}
+	if r.DisabledReason != "" {
+		// "idle": naming it again (or the same registration) wakes it.
+		out["disabled_reason"] = r.DisabledReason
+	}
 	return out
 }
 

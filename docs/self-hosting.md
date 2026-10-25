@@ -432,6 +432,18 @@ Then:
 ./toolyard serve -upstreams upstreams.json
 ```
 
+Some names belong to toolyard and cannot name a server: `builtin`,
+`fixture`, `memory`, `tools`, `mempalace`, `notes`, `skills`, `inbox`,
+`session`, `lake`, `events`, `policies`, `servers`, `audit`, `access`,
+`toolyard`, `connections`, and since v0.1 `jobs` and `callbacks` (toolyard's
+own `jobs.*` and `callbacks.*` tools). **Upgrade note:** a server saved
+under `jobs` or `callbacks` by an older version does not load on v0.1. The
+log says `WARNING: upstream "jobs" not loaded: the server name "jobs" is
+reserved since toolyard v0.1 …`, and the server's status on the dashboard
+says the same. Before or after the upgrade, add the server again under
+another name, grant that name to the people who used the old one, then
+delete the old row. Agents call its tools by the new name.
+
 Upstreams' tool catalogs are fetched at startup (every page of a paged
 `tools/list`), schema-wrapped, and registered under
 `<upstream-name>.<original-tool-name>`. Every `-catalog-refresh` (default
@@ -576,7 +588,19 @@ Settings → **Inbox & permissions**:
 - **Webhook receivers**: a receiver gets only the event types it registered
   for; receivers from before v0.1 keep `inbox.decision`, `inbox.expired` and
   `inbox.cancelled` in the version 2 shape. Delivered and failed events are
-  kept 30 days.
+  kept 30 days. Each agent keeps at most `callback_max_receivers_per_agent`
+  active receivers (default 500; `PATCH /v1/settings`). Disabled and removed
+  receivers do not count, and the same registration again is always
+  answered. T3 Code registers one receiver per session thread, all under
+  its user's one agent, so it needs room. The hourly callback sweep
+  disables a push receiver that had no successful delivery and nothing new
+  to follow (no Inbox item, approval or event for it, no default change)
+  for 30 days: `callbacks.list` shows it `disabled` with
+  `disabled_reason: "idle"`, and it stops counting toward the cap. When its
+  agent uses it again (names it on an item or call, makes it the default,
+  tests it, an item follows it as the default, or registers it again the
+  same way), it is active again. A receiver its agent disabled stays
+  disabled. The sweep is safe on every replica.
 - **Passkeys**: add one per device. With a passkey registered, allowing
   production or red-flagged tools needs it (Face ID on an iPhone), and the
   confirmation is bound to exactly what you approve. Passkeys need the
@@ -1012,6 +1036,51 @@ Things to set:
   update changes the `-cluster` setting, update stop-first. Draining replicas hand over their leader jobs at once and
   finish or record their in-flight work as described in [Shutdown and
   drain](#shutdown-and-drain).
+
+## Rolling back below v0.1
+
+v0.1 migrations only add tables, columns and indexes, and there are no down
+migrations: a rollback keeps the v0.1 schema. An older binary starts on it
+with the warning "the database records migrations this binary does not
+know". What it then does differently:
+
+- **Agent scopes** (`agent_scopes`, Connected apps): ignored. An agent its
+  owner narrowed gets its owner's full scope back.
+- **OAuth for MCP clients**: not served. Apps connected that way cannot
+  sign in until you upgrade again.
+- **Async tools**: every tool runs inline again, and the `jobs.*` tools
+  and `/v1/jobs` are gone. Jobs that were queued or running stay as v0.1
+  left them; their results are readable again after the next upgrade.
+- **Code mode**: held and paused code runs cannot be resumed on the older
+  binary. Start them again instead.
+- **Inbox items of schema version 3**: an older binary that rewrites one (a
+  snooze, a reminder, a voice note) drops the fields it does not know.
+- **Callbacks** (migrations 0060 to 0063):
+  - When several receivers follow one item, only one of them hears the
+    decision.
+  - There is no deduplication of a decision event (the old
+    `UNIQUE(request_id, decision_revision)` is gone), so a retried decision
+    can be delivered twice. Receivers deduplicate on `event_id` already.
+  - No `execution.completed`, `approval.*`, `job.*` or `ping` events are
+    queued, and default receivers are not used. Events v0.1 already queued
+    are delivered as stored.
+  - A receiver's `events`, `v3` and `host` are ignored. The receiver cap
+    does not apply, and a receiver the sweep disabled as idle stays disabled.
+
+Do it this way:
+
+1. Decide or cancel the pending schema version 3 Inbox items, or turn
+   `inbox_v3_enabled` off and wait until none is pending.
+2. Stop every v0.1 replica before you start the older binary (stop-first:
+   Swarm `rollback_config.order: stop-first`, Kubernetes `strategy:
+   Recreate` with one replica). An older binary must never run next to
+   another gateway on the same database. Each replica drains as described
+   in [Shutdown and drain](#shutdown-and-drain): running async jobs end
+   `outcome_unknown`, and held code runs stay held.
+3. Start one older gateway with the same database and keys.
+4. Tell the agents that used code mode to start their held code runs
+   again, and the owners of narrowed agents that the limits are off until
+   the next upgrade.
 
 ## Keys and credentials
 

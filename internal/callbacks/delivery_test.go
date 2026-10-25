@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net"
 	"sort"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -120,28 +121,43 @@ func TestSweepDeletesOldFinishedEvents(t *testing.T) {
 	}
 }
 
+// The cap counts active receivers only (removed and disabled ones free a
+// place), follows the setting, and never blocks the identical
+// registration of a receiver the agent already has.
 func TestReceiversPerAgentAreCapped(t *testing.T) {
 	s, _ := fixture(t)
-	ctx := t.Context()
-	var first *Receiver
-	for i := 0; i < MaxReceiversPerAgent; i++ {
-		r, err := s.Register(ctx, "agent", "", fmt.Sprintf("hook-%d", i), fmt.Sprintf("https://receiver.example/%d", i), testSecret(), false)
-		if err != nil {
-			t.Fatal(err)
-		}
-		if first == nil {
-			first = r
-		}
+	if s.maxReceivers() != DefaultMaxReceiversPerAgent || DefaultMaxReceiversPerAgent != 500 {
+		t.Fatalf("default cap %d", s.maxReceivers())
 	}
-	if _, err := s.Register(ctx, "agent", "", "one-too-many", "https://receiver.example/x", testSecret(), false); !errors.Is(err, ErrTooManyReceivers) {
+	s.MaxReceivers = func() int { return 3 }
+	ctx := t.Context()
+	var kept []*Receiver
+	for i := 0; i < 3; i++ {
+		kept = append(kept, mustRegister(t, s, "agent", fmt.Sprintf("hook-%d", i), fmt.Sprintf("https://receiver.example/%d", i)))
+	}
+	_, err := s.Register(ctx, "agent", "", "one-too-many", "https://receiver.example/x", testSecret(), false)
+	if !errors.Is(err, ErrTooManyReceivers) || !strings.Contains(err.Error(), "at most 3 active receivers") {
 		t.Fatalf("receiver cap: %v", err)
 	}
-	if _, err := s.Change(ctx, "agent", first.ID, "remove", "", first.Revision); err != nil {
+	// The same registration again is answered, cap or not.
+	if again, err := s.Register(ctx, "agent", "", "hook-0", "https://receiver.example/0", testSecret(), false); err != nil || again.ID != kept[0].ID {
+		t.Fatalf("a repeated registration at the cap: %v", err)
+	}
+	if _, err := s.Change(ctx, "agent", kept[0].ID, "remove", "", kept[0].Revision); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := s.Register(ctx, "agent", "", "one-too-many", "https://receiver.example/x", testSecret(), false); err != nil {
-		t.Fatalf("a removed receiver still counted: %v", err)
+	mustRegister(t, s, "agent", "after-remove", "https://receiver.example/r")
+	if _, err := s.Change(ctx, "agent", kept[1].ID, "disable", "", kept[1].Revision); err != nil {
+		t.Fatal(err)
 	}
+	mustRegister(t, s, "agent", "after-disable", "https://receiver.example/d")
+	if _, err := s.Register(ctx, "agent", "", "full-again", "https://receiver.example/f", testSecret(), false); !errors.Is(err, ErrTooManyReceivers) {
+		t.Fatalf("cap after the frees: %v", err)
+	}
+	// Another agent has its own cap; a setting below 1 means the default.
+	mustRegister(t, s, "other", "hook", "https://receiver.example/o")
+	s.MaxReceivers = func() int { return 0 }
+	mustRegister(t, s, "agent", "default-cap", "https://receiver.example/c")
 }
 
 // outboxRow stores one event of receiver: status, next attempt time and
@@ -265,7 +281,8 @@ func TestConcurrentPingsAndRegistrationsKeepTheLimits(t *testing.T) {
 		t.Fatalf("%d pings stored, %d ids returned (%v)", pings, len(got), err)
 	}
 	// The receiver above counts too: fill the cap but one, then race.
-	for i := 1; i < MaxReceiversPerAgent-1; i++ {
+	s.MaxReceivers = func() int { return 6 }
+	for i := 1; i < 5; i++ {
 		mustRegister(t, s, "agent", fmt.Sprintf("hook-%d", i), fmt.Sprintf("https://receiver.example/%d", i))
 	}
 	var errs []string
@@ -288,10 +305,10 @@ func TestConcurrentPingsAndRegistrationsKeepTheLimits(t *testing.T) {
 	wg.Wait()
 	sort.Strings(errs)
 	var kept int
-	if err := db.QueryRow(`SELECT count(*) FROM callback_receivers WHERE agent_id='agent' AND status<>'removed'`).Scan(&kept); err != nil {
+	if err := db.QueryRow(`SELECT count(*) FROM callback_receivers WHERE agent_id='agent' AND status='active'`).Scan(&kept); err != nil {
 		t.Fatal(err)
 	}
-	if kept != MaxReceiversPerAgent || fmt.Sprint(errs) != "[full full full full ok]" {
+	if kept != 6 || fmt.Sprint(errs) != "[full full full full ok]" {
 		t.Fatalf("kept %d receivers, registrations %v", kept, errs)
 	}
 }

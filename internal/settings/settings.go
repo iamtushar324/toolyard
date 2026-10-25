@@ -104,6 +104,9 @@ const (
 	// InboxHostingNote tells agents where to host files (inbox.guide
 	// topic "hosting").
 	InboxHostingNote = "inbox_hosting_note"
+	// CallbackMaxReceivers caps each agent's active callback receivers.
+	// Default 500 (callbacks.DefaultMaxReceiversPerAgent).
+	CallbackMaxReceivers = "callback_max_receivers_per_agent"
 
 	// Inbox attention (when the phone buzzes; inbox-spec.md §6).
 	//

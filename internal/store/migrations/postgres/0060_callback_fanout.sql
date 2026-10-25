@@ -27,6 +27,17 @@
 --
 -- The constraints to replace are found by their columns, not by name.
 --
+-- Rollback: a binary older than this migration (before v0.1) still starts
+-- on this schema and ignores the new columns and tables. It reads one
+-- subscription per item, so when several receivers follow an item only one
+-- hears the decision. UNIQUE(request_id, decision_revision) is gone and it
+-- writes no dedupe_key, so a retried decision can be queued twice
+-- (receivers deduplicate on event_id). It ignores events and v3, queues no
+-- approval, execution, job or ping event, and uses no default receiver;
+-- events already queued are delivered as stored. Rows it queues have
+-- event_type '' and created_at 0, which the v0.1 sweep dates by
+-- next_attempt_at after an upgrade again.
+--
 -- Same schema as migrations/sqlite/0060_callback_fanout.sql.
 
 DO $$

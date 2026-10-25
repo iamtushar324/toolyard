@@ -161,11 +161,19 @@ func destinationHost(destination string) string {
 	return strings.ToLower(u.Hostname())
 }
 
-// Sweep deletes delivered and failed events older than OutboxRetention,
-// with their attempt history, and old approval subscriptions, in batches.
-// It returns the number of events deleted. Concurrent sweeps on several
-// nodes delete disjoint or already-deleted rows and are harmless.
+// Sweep disables idle push receivers (DisableIdle), then deletes delivered
+// and failed events older than OutboxRetention, with their attempt
+// history, and old approval subscriptions, in batches. It returns the
+// number of events deleted. Concurrent sweeps on several nodes update or
+// delete the same or disjoint rows and are harmless.
 func (s *Service) Sweep(ctx context.Context) (int, error) {
+	// Idle receivers first: their activity is read from the events this
+	// sweep deletes.
+	if n, err := s.DisableIdle(ctx); err != nil {
+		return 0, err
+	} else if n > 0 {
+		logx.For("callbacks").Info("disabled idle callback receivers", "count", n, "idle_for", IdleReceiverAfter.String())
+	}
 	cutoff := s.now().Add(-OutboxRetention).UnixMilli()
 	total := 0
 	for {

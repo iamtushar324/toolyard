@@ -8,6 +8,10 @@
 -- push receivers get it here, from the text after "://" up to the first
 -- "/", "?", "#" or ":".
 --
+-- Rollback: a binary older than this migration ignores host and inserts
+-- receivers without it (''); after an upgrade again the picker counts such
+-- a receiver's destination as its host.
+--
 -- Same schema as migrations/postgres/0062_callback_receiver_host.sql.
 
 ALTER TABLE callback_receivers ADD COLUMN host TEXT NOT NULL DEFAULT '';
