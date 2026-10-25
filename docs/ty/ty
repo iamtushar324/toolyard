@@ -295,6 +295,11 @@ def finish(client, status, headers, data, deadline):
     if not is_run_view(body):
         return error_exit(status, headers, data)
     emit_json(body)
+    error = body.get("error")
+    if body["status"] == "failed" and isinstance(error, dict) and error.get("kind") == "busy":
+        retry = (headers.get("Retry-After") if headers is not None else None) or "a few"
+        warn("code mode was busy: the run got no script slot, so nothing ran; start it again after %s seconds" % retry)
+        return EXIT_BUSY
     code = STATUS_EXIT.get(body["status"])
     if code is None:
         warn("unknown run status %r" % body["status"])

@@ -312,15 +312,34 @@ func (g *Gateway) handleExecuteToolCode() directHandler {
 		out := g.codeModeRuntime().Execute(ctx, code, codemode.ExecOptions{
 			Reason: callReasonFromContext(ctx), Language: lang, Echo: echo,
 		})
-		res := mcp.NewToolResultText(out.Text)
-		res.IsError = out.Failed
-		calls := out.Calls
-		if calls == nil {
-			calls = []codemode.LedgerEntry{}
-		}
-		res.Meta = &mcp.Meta{AdditionalFields: map[string]any{"toolyard.run_id": runID, "toolyard.calls": calls}}
-		return res, nil
+		return codeModeResult(out, runID), nil
 	}
+}
+
+// codeModeResult is executeToolCode's answer for one run: the text, and in
+// _meta the run id, the call ledger, the run's status and error kind. A
+// run whose outcome is unknown (a call was cut short, or the script was
+// interrupted after it sent one) also carries the toolyard.outcome_unknown
+// flag and structured content {"status": "outcome_unknown", "error_kind",
+// "run_id"}, which is how an async job built on executeToolCode tells it
+// from a plain failure; other runs keep text only, as Bifrost answers.
+func codeModeResult(out codemode.ExecResult, runID string) *mcp.CallToolResult {
+	res := mcp.NewToolResultText(out.Text)
+	res.IsError = out.Failed
+	calls := out.Calls
+	if calls == nil {
+		calls = []codemode.LedgerEntry{}
+	}
+	meta := map[string]any{"toolyard.run_id": runID, "toolyard.calls": calls, "toolyard.status": out.Status}
+	if out.ErrorKind != "" {
+		meta["toolyard.error_kind"] = out.ErrorKind
+	}
+	if out.Status == codemode.StatusOutcomeUnknown {
+		meta[codemode.OutcomeUnknownMarker] = true
+		res.StructuredContent = map[string]any{"status": codemode.StatusOutcomeUnknown, "error_kind": out.ErrorKind, "run_id": runID}
+	}
+	res.Meta = &mcp.Meta{AdditionalFields: meta}
+	return res
 }
 
 // intArg reads an optional integer argument however JSON or an in-process
@@ -437,18 +456,13 @@ func (c codeModeCaller) RouteCall(ctx context.Context, via, target string, args 
 	return c.g.RouteCall(withinCodeMode(ctx), via, target, args)
 }
 
-type withinCodeModeKey struct{}
-
-// withinCodeMode marks ctx as a code-mode script's nested call.
-func withinCodeMode(ctx context.Context) context.Context {
-	return context.WithValue(ctx, withinCodeModeKey{}, true)
-}
+// withinCodeMode marks ctx as a code-mode script's nested call
+// (codemode.WithinScript: work that moves to a context of its own keeps
+// the mark with codemode.CarryScriptMark).
+func withinCodeMode(ctx context.Context) context.Context { return codemode.WithinScript(ctx) }
 
 // isWithinCodeMode reports a context withinCodeMode marked.
-func isWithinCodeMode(ctx context.Context) bool {
-	v, _ := ctx.Value(withinCodeModeKey{}).(bool)
-	return v
-}
+func isWithinCodeMode(ctx context.Context) bool { return codemode.IsWithinScript(ctx) }
 
 // refuseNestedCodeMode answers a code-mode tool called from inside a
 // script, at any depth, with a refusal (nil otherwise): a nested script

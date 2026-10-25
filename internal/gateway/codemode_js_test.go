@@ -202,6 +202,21 @@ func TestToolsSearchModes(t *testing.T) {
 	refused(map[string]any{"query": strings.Repeat("a", 201), "mode": "regex"}, "at most 200")
 	refused(map[string]any{"query": "(", "mode": "regex"}, "not a valid RE2")
 	refused(map[string]any{"query": "x", "detail": "everything"}, "unknown detail")
+
+	// Inside a script the default is summary (B2 P2-2): a direct call
+	// marked as a script's, and a Starlark script's toolyard.tools_search.
+	res := route(t, gw, withinCodeMode(ctx), MetaSearchTool, map[string]any{"query": "save issue t3code", ReasonField: outerReason})
+	if res.IsError {
+		t.Fatalf("tools.search inside a script: %s", textOf(res))
+	}
+	if first := structured(t, res)["results"].([]any)[0].(map[string]any); first["input_schema"] != nil || first["name"] != "LinearForT3Code.save_issue" {
+		t.Fatalf("default inside a script: %v", first)
+	}
+	res = route(t, gw, ctx, CodeModeExecuteToolCode, map[string]any{"code": `r = toolyard.tools_search(query="save issue t3code", limit=1)
+result = r`})
+	if text := textOf(res); res.IsError || !strings.Contains(text, "LinearForT3Code.save_issue") || strings.Contains(text, "input_schema") {
+		t.Fatalf("Starlark tools_search default:\n%s", text)
+	}
 }
 
 // TestCodeModeCannotNestAtAnyDepth (review P1-2): a script reaches the
@@ -266,5 +281,31 @@ func TestToolsSearchSharesCatalogForScope(t *testing.T) {
 		if r.(map[string]any)["name"] == "alpha.run" {
 			t.Fatal("regex search shows a denied tool")
 		}
+	}
+}
+
+// TestCodeModeResultMarksAnUnknownOutcome (live test fix 1): an
+// executeToolCode run interrupted after it sent a call carries the
+// toolyard.outcome_unknown flag and structured status outcome_unknown with
+// kind interrupted (what an async job maps); a plain failure carries
+// neither, only its status and kind.
+func TestCodeModeResultMarksAnUnknownOutcome(t *testing.T) {
+	res := codeModeResult(codemode.ExecResult{Text: "Execution runtime error: toolyard stopped the script", Failed: true,
+		Status: codemode.StatusOutcomeUnknown, ErrorKind: codemode.ErrorInterrupted,
+		Calls: []codemode.LedgerEntry{{Seq: 1, Tool: "demo.read", Status: codemode.StatusSucceeded}}}, "cm_1")
+	sc, _ := res.StructuredContent.(map[string]any)
+	if !res.IsError || sc["status"] != codemode.StatusOutcomeUnknown || sc["error_kind"] != codemode.ErrorInterrupted || sc["run_id"] != "cm_1" ||
+		res.Meta.AdditionalFields[codemode.OutcomeUnknownMarker] != true || res.Meta.AdditionalFields["toolyard.error_kind"] != codemode.ErrorInterrupted ||
+		textOf(res) != "Execution runtime error: toolyard stopped the script" {
+		t.Fatalf("interrupted after a call: %+v meta %v", res, res.Meta.AdditionalFields)
+	}
+	res = codeModeResult(codemode.ExecResult{Text: "Execution runtime error: nothing ran", Failed: true,
+		Status: codemode.StatusFailed, ErrorKind: codemode.ErrorInterrupted}, "cm_2")
+	if res.StructuredContent != nil || res.Meta.AdditionalFields[codemode.OutcomeUnknownMarker] != nil ||
+		res.Meta.AdditionalFields["toolyard.status"] != codemode.StatusFailed || res.Meta.AdditionalFields["toolyard.error_kind"] != codemode.ErrorInterrupted {
+		t.Fatalf("interrupted before a call: %+v meta %v", res, res.Meta.AdditionalFields)
+	}
+	if calls, ok := res.Meta.AdditionalFields["toolyard.calls"].([]codemode.LedgerEntry); !ok || calls == nil || len(calls) != 0 {
+		t.Fatalf("the ledger of a run that made no call: %#v", res.Meta.AdditionalFields["toolyard.calls"])
 	}
 }

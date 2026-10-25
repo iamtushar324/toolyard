@@ -775,13 +775,16 @@ When your owner has decided, resume the run with the request id:
 ```
 
 The server adds that request's grants to the matching calls, and the script
-runs again from the top. Calls before the held one are answered from the
-record (`replayed: true`) and not sent again, so don't change the script
-between the hold and the resume: a different call fails the run with
-`script_diverged`. A recorded call with an unknown outcome stops the resume
-with `outcome_unknown`. A `deferred` run (a legacy approval, with
-`held.approval_id` set) resumes with `./ty resume cr_…` and no `--request`
-once your owner has decided.
+runs again from the top. Each call the run made before is answered from the
+record (`replayed: true`) and not sent again: a succeeded call with its
+value, a failed one with the same failure, a held one you caught with the
+same hold unless a grant now covers it. So don't change the script between
+the hold and the resume: a different call fails the run with
+`script_diverged`, and nothing on the new path is sent. A recorded call with
+an unknown outcome stops the resume with `outcome_unknown`. A `deferred` run
+(a legacy approval, with `held.approval_id` set) resumes with
+`./ty resume cr_…` and no `--request` once your owner has decided; it
+resumes with that approval even when you pass `--request`.
 
 **Without `ty`.** Use `curl` with the header read from a file, so the token
 never appears in a command line or the process list:

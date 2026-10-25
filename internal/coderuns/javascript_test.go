@@ -64,8 +64,9 @@ return { q: r.q, ok: w.ok };`
 }
 
 // TestPerAgentCapRefusesTheThirdRunOnly: with room for four scripts, one
-// agent runs two at once; its third start is refused busy (HTTP 429 at
-// the route) and creates nothing, while another agent starts at once.
+// agent runs two at once; its third start is stored queued at once and,
+// when no slot comes free in the wait, ends failed with kind busy (HTTP
+// 429 at the route, nothing ran), while another agent starts at once.
 func TestPerAgentCapRefusesTheThirdRunOnly(t *testing.T) {
 	e := newEnv(t)
 	exe, err := os.Executable()
@@ -97,13 +98,14 @@ func TestPerAgentCapRefusesTheThirdRunOnly(t *testing.T) {
 			t.Fatal("agent a's runs did not start")
 		}
 	}
-	before := e.count(t, `SELECT count(*) FROM code_runs`)
-	_, _, err = e.svc.Start(ctx, StartRequest{AgentID: "ag_a", Code: readScript, Reason: testReason})
-	if !errors.Is(err, codemode.ErrBusy) || !strings.Contains(err.Error(), "this caller already runs 2 scripts") {
-		t.Fatalf("third start for agent a: %v", err)
+	third, created, err := e.svc.Start(ctx, StartRequest{AgentID: "ag_a", Code: readScript, Reason: testReason})
+	if err != nil || !created || third.Status != StatusQueued {
+		t.Fatalf("third start for agent a: %+v %v %v", third, created, err)
 	}
-	if n := e.count(t, `SELECT count(*) FROM code_runs`); n != before {
-		t.Fatalf("a refused start stored a run (%d -> %d)", before, n)
+	busy := e.settle(t, "ag_a", third.ID)
+	if busy.Status != codemode.StatusFailed || busy.ErrorKind != codemode.ErrorBusy || !strings.Contains(busy.ErrorMessage, "this caller already runs 2 scripts") ||
+		len(busy.Calls) != 0 {
+		t.Fatalf("third run of agent a = %+v", busy)
 	}
 	run, _, err := e.svc.Start(ctx, StartRequest{AgentID: "ag_b", Code: readScript, Reason: testReason})
 	if err != nil {
