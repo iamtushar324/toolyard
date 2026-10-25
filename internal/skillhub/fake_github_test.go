@@ -12,6 +12,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"path"
 	"sort"
 	"strconv"
 	"strings"
@@ -47,6 +48,17 @@ type fakeGitHub struct {
 	calls         map[string]int
 	codeloadAuth  []string // Authorization headers the archive download got
 	retryAfter    int      // when > 0, the next API call answers 429 with Retry-After
+	// cachedHead, when set for a branch, is the head a request without
+	// Cache-Control: no-cache gets (GitHub's public cache, up to 60 s old).
+	cachedHead map[string]string
+	// contentsHook, when set, may answer a contents request itself.
+	contentsHook func(w http.ResponseWriter, r *http.Request) bool
+	// codeloadGate, when set, holds every archive download until it is
+	// closed.
+	codeloadGate chan struct{}
+	// renamedFrom is an old name of the repository: API calls under it
+	// answer 301 to the same call under the current name.
+	renamedFrom string
 }
 
 func newFakeGitHub(t *testing.T, owner, repo string) *fakeGitHub {
@@ -54,12 +66,12 @@ func newFakeGitHub(t *testing.T, owner, repo string) *fakeGitHub {
 	f := &fakeGitHub{
 		t: t, owner: owner, repo: repo, defaultBranch: "main",
 		branches: map[string]string{}, commits: map[string]map[string]string{},
-		parents: map[string]string{}, calls: map[string]int{},
+		parents: map[string]string{}, calls: map[string]int{}, cachedHead: map[string]string{},
 	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /repos/{o}/{r}", f.api(f.handleRepo))
 	mux.HandleFunc("GET /repos/{o}/{r}/branches", f.api(f.handleBranches))
-	mux.HandleFunc("GET /repos/{o}/{r}/commits/{ref...}", f.api(f.handleHead))
+	mux.HandleFunc("GET /repos/{o}/{r}/git/ref/heads/{branch...}", f.api(f.handleHead))
 	mux.HandleFunc("GET /repos/{o}/{r}/tarball/{sha}", f.api(f.handleTarball))
 	mux.HandleFunc("GET /repos/{o}/{r}/compare/{spec}", f.api(f.handleCompare))
 	mux.HandleFunc("GET /repos/{o}/{r}/contents/{path...}", f.api(f.handleContents))
@@ -94,6 +106,13 @@ func (f *fakeGitHub) commit(branch string, set map[string]string, del ...string)
 	return sha
 }
 
+// setBranch points a branch at a commit (a force-push).
+func (f *fakeGitHub) setBranch(branch, sha string) {
+	f.mu.Lock()
+	f.branches[branch] = sha
+	f.mu.Unlock()
+}
+
 func (f *fakeGitHub) count(name string) int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -107,8 +126,16 @@ func (f *fakeGitHub) api(h func(w http.ResponseWriter, r *http.Request)) http.Ha
 		f.mu.Lock()
 		retry := f.retryAfter
 		f.retryAfter = 0
-		private, token := f.private, f.token
+		private, token, renamed := f.private, f.token, f.renamedFrom
 		f.mu.Unlock()
+		if renamed != "" && r.PathValue("o") == f.owner && r.PathValue("r") == renamed {
+			to := strings.Replace(r.URL.Path, "/"+renamed, "/"+f.repo, 1)
+			if r.URL.RawQuery != "" {
+				to += "?" + r.URL.RawQuery
+			}
+			http.Redirect(w, r, to, http.StatusMovedPermanently)
+			return
+		}
 		if retry > 0 {
 			w.Header().Set("Retry-After", strconv.Itoa(retry))
 			http.Error(w, `{"message":"secondary rate limit"}`, http.StatusTooManyRequests)
@@ -173,27 +200,34 @@ func (f *fakeGitHub) handleBranches(w http.ResponseWriter, r *http.Request) {
 }
 
 func (f *fakeGitHub) handleHead(w http.ResponseWriter, r *http.Request) {
+	branch := r.PathValue("branch")
+	fresh := r.Header.Get("Cache-Control") == "no-cache"
 	f.mu.Lock()
-	sha, ok := f.branches[r.PathValue("ref")]
+	sha, ok := f.branches[branch]
+	if cached, has := f.cachedHead[branch]; has && !fresh {
+		sha = cached
+	}
+	if fresh {
+		f.calls["headFresh"]++
+	}
 	f.mu.Unlock()
 	if !ok {
 		f.bump("head")
-		http.Error(w, `{"message":"No commit found for SHA"}`, http.StatusUnprocessableEntity)
+		http.Error(w, `{"message":"Not Found"}`, http.StatusNotFound)
 		return
 	}
 	etag := `"` + sha + `"`
-	if r.Header.Get("If-None-Match") == etag {
+	if inm := r.Header.Get("If-None-Match"); inm != "" && inm == etag {
 		f.bump("head304")
 		w.WriteHeader(http.StatusNotModified)
 		return
 	}
 	f.bump("head")
-	if r.Header.Get("Accept") != "application/vnd.github.sha" {
-		http.Error(w, `{"message":"want the sha media type"}`, http.StatusBadRequest)
-		return
-	}
 	w.Header().Set("ETag", etag)
-	_, _ = w.Write([]byte(sha))
+	writeJSON(w, map[string]any{
+		"ref":    "refs/heads/" + branch,
+		"object": map[string]any{"sha": sha, "type": "commit"},
+	})
 }
 
 func (f *fakeGitHub) handleTarball(w http.ResponseWriter, r *http.Request) {
@@ -207,7 +241,15 @@ func (f *fakeGitHub) handleCodeload(w http.ResponseWriter, r *http.Request) {
 	f.calls["codeload"]++
 	f.codeloadAuth = append(f.codeloadAuth, r.Header.Get("Authorization"))
 	tree, ok := f.commits[r.PathValue("sha")]
+	gate := f.codeloadGate
 	f.mu.Unlock()
+	if gate != nil {
+		select {
+		case <-gate:
+		case <-r.Context().Done():
+			return
+		}
+	}
 	if !ok {
 		http.NotFound(w, r)
 		return
@@ -255,19 +297,32 @@ func (f *fakeGitHub) handleCompare(w http.ResponseWriter, r *http.Request) {
 
 func (f *fakeGitHub) handleContents(w http.ResponseWriter, r *http.Request) {
 	f.bump("contents")
+	if f.contentsHook != nil && f.contentsHook(w, r) {
+		return
+	}
+	asked := r.PathValue("path")
 	f.mu.Lock()
-	content, ok := f.commits[r.URL.Query().Get("ref")][r.PathValue("path")]
+	tree := f.commits[r.URL.Query().Get("ref")]
+	content, ok := tree[asked]
 	f.mu.Unlock()
 	if !ok {
 		http.Error(w, `{"message":"Not Found"}`, http.StatusNotFound)
 		return
 	}
+	name := asked
 	if target, isLink := strings.CutPrefix(content, symlinkPrefix); isLink {
-		writeJSON(w, map[string]any{"type": "symlink", "target": target, "size": len(target)})
-		return
+		// As GitHub does: a link to a file in the repository answers
+		// with that file's content and path; other links as a symlink.
+		resolved := path.Clean(path.Join(path.Dir(asked), target))
+		linked, found := tree[resolved]
+		if !found || strings.HasPrefix(linked, symlinkPrefix) {
+			writeJSON(w, map[string]any{"type": "symlink", "path": asked, "target": target, "size": len(target)})
+			return
+		}
+		name, content = resolved, linked
 	}
 	writeJSON(w, map[string]any{
-		"type": "file", "encoding": "base64", "size": len(content),
+		"type": "file", "path": name, "encoding": "base64", "size": len(content),
 		"content": base64.StdEncoding.EncodeToString([]byte(content)),
 	})
 }
