@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"net/http/httptest"
@@ -495,6 +496,39 @@ func TestSharedTokenKeepsAccountLabel(t *testing.T) {
 	}
 	if got := accountLabelFromIDToken("not-a-jwt"); got != "" {
 		t.Fatalf("garbage id_token gave %q", got)
+	}
+}
+
+// TestSharedRefreshWriteSuperseded: a shared refresh writes back only while
+// the row still carries the refresh token it read, so a reconnect that
+// happened while the provider was answering is never overwritten.
+func TestSharedRefreshWriteSuperseded(t *testing.T) {
+	f := newUserFixture(t)
+	ctx := context.Background()
+	if _, err := f.svc.ExchangeCode(ctx, "shared", "bot1", "verifier"); err != nil {
+		t.Fatal(err)
+	}
+	cur, _ := f.svc.GetToken(ctx, "shared")
+	// A reconnect replaces the row (new refresh token) while an old
+	// refresh is in flight.
+	if _, err := f.svc.ExchangeCode(ctx, "shared", "bot2", "verifier"); err != nil {
+		t.Fatal(err)
+	}
+	stale := &TokenRecord{UpstreamName: "shared", AccessToken: "at-stale", RefreshToken: "rt-bot1", State: StateActive}
+	if err := f.svc.updateTokenIfUnchanged(ctx, stale, cur.refreshEnc); !errors.Is(err, ErrSuperseded) {
+		t.Fatalf("stale write = %v, want ErrSuperseded", err)
+	}
+	now, _ := f.svc.GetToken(ctx, "shared")
+	if now.AccessToken != "at-bot2" || now.RefreshToken != "rt-bot2" {
+		t.Fatalf("row after the stale write = %+v", now)
+	}
+	// A refresh that starts from the current row goes through.
+	if _, err := f.svc.Refresh(ctx, "shared"); err != nil {
+		t.Fatal(err)
+	}
+	after, _ := f.svc.GetToken(ctx, "shared")
+	if after.AccessToken != "at-refreshed-1" || after.RefreshToken != "rt-bot2" || after.State != StateActive || after.RefreshFailures != 0 {
+		t.Fatalf("after a normal refresh = %+v", after)
 	}
 }
 

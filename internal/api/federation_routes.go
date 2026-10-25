@@ -339,6 +339,11 @@ func (s *Server) callbackReceiver(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		receiver, err := s.callbacks.RegisterWith(r.Context(), a.ID, b.EnvironmentID, b.ClientReceiverID, b.Destination, b.Secret, private, sub)
+		if errors.Is(err, callbacks.ErrTooManyReceivers) {
+			// The same answer as the pull route (federationError).
+			writeError(w, 409, "too_many_receivers")
+			return
+		}
 		if err != nil {
 			writeError(w, 400, err.Error())
 			return

@@ -23,7 +23,9 @@ func (s *Service) SetCluster(c *cluster.Cluster) {
 	if !c.MultiNode() {
 		return
 	}
-	c.Subscribe(clusterTopic, func(string) {
+	// The reload reads the database: it runs on a goroutine of its own,
+	// off the cluster's delivery goroutine.
+	c.SubscribeReload(clusterTopic, func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		pub, priv, err := loadOrCreateVapid(ctx, s.db)

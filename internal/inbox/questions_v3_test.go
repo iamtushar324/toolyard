@@ -669,3 +669,58 @@ func TestDryRunChecksCallbackRefs(t *testing.T) {
 		t.Fatal("an over-long callback_ref was accepted")
 	}
 }
+
+// Size limits count the JSON the agent sent: "<", ">" and "&" are one byte
+// each, not the six of Go's default HTML escaping.
+func TestSizeLimitsCountHTMLCharactersOnce(t *testing.T) {
+	sub := richSubmission()
+	sub.Tools[0].Params["blob"] = strings.Repeat("<a&b>", (MaxParamsBytes-1024)/5)
+	for len(sub.Attachments) < MaxAttachments {
+		// 24 KB each: about 600 KB as sent, about 3.5 MB escaped.
+		sub.Attachments = append(sub.Attachments, Attachment{Type: "log", Title: "Output", Body: strings.Repeat("<&>", 8000)})
+	}
+	_, probs, _ := Validate(context.Background(), testCatalog, "ag_1", sub)
+	for _, p := range probs {
+		if p.Path == "tools[0].params" || strings.Contains(p.Message, "bytes as JSON") {
+			t.Fatalf("HTML characters counted as escapes: %+v", p)
+		}
+	}
+	if n, err := jsonSize(map[string]string{"a": "<&>"}); err != nil || n != len(`{"a":"<&>"}`) {
+		t.Fatalf("jsonSize: %d %v", n, err)
+	}
+}
+
+// warningCallbacks says the agent's default receiver cannot carry an item.
+type warningCallbacks struct{ execCallbacks }
+
+func (warningCallbacks) DefaultWarning(context.Context, string, *Request) string {
+	return "your default receiver takes the version 2 decision shape"
+}
+
+// An item that names no receiver carries the default receiver's warning;
+// one that names a receiver does not ask.
+func TestSubmitWarnsWhenTheDefaultReceiverSkipsTheItem(t *testing.T) {
+	e := newEnv(t)
+	e.svc.SetCallbacks(&warningCallbacks{})
+	res, err := e.svc.Submit(context.Background(), "ag_1", richSubmission())
+	if err != nil || !res.OK {
+		t.Fatalf("submit: %+v %v", res, err)
+	}
+	found := false
+	for _, w := range res.Warnings {
+		found = found || (w.Path == "callback_ref" && strings.Contains(w.Message, "version 2"))
+	}
+	if !found {
+		t.Fatalf("no default receiver warning: %+v", res.Warnings)
+	}
+	sub := richSubmission()
+	sub.CallbackRef = "cb_named"
+	if res, err = e.svc.Submit(context.Background(), "ag_1", sub); err != nil || !res.OK {
+		t.Fatalf("submit with a ref: %+v %v", res, err)
+	}
+	for _, w := range res.Warnings {
+		if w.Path == "callback_ref" {
+			t.Fatalf("a named receiver still warned: %+v", w)
+		}
+	}
+}

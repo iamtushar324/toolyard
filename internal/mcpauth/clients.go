@@ -21,6 +21,7 @@ import (
 	"net/netip"
 	"net/url"
 	"regexp"
+	"slices"
 	"strconv"
 	"strings"
 	"time"
@@ -387,15 +388,16 @@ func (s *Service) validateClientMetadata(redirects []string, method string, gran
 			return "", invalidRedirect(fmt.Sprintf("redirect URI %q is not on this toolyard's list of allowed client redirect hosts", r))
 		}
 	}
-	for _, g := range grants {
-		if g != "authorization_code" && g != "refresh_token" {
-			return "", invalidMetadata(fmt.Sprintf("grant type %q is not supported; use authorization_code and refresh_token", g))
-		}
+	// A client lists every grant and response type it can use; toolyard
+	// issues only authorization_code (with refresh_token) and ignores the
+	// rest. Claude.ai's metadata document, for one, also lists
+	// urn:ietf:params:oauth:grant-type:jwt-bearer. A client that lists
+	// grant or response types must include the ones toolyard starts with.
+	if len(grants) > 0 && !slices.Contains(grants, "authorization_code") {
+		return "", invalidMetadata("grant_types must include authorization_code; toolyard supports authorization_code and refresh_token")
 	}
-	for _, rt := range responses {
-		if rt != "code" {
-			return "", invalidMetadata(fmt.Sprintf("response type %q is not supported; use code", rt))
-		}
+	if len(responses) > 0 && !slices.Contains(responses, "code") {
+		return "", invalidMetadata("response_types must include code")
 	}
 	switch method {
 	case AuthNone:

@@ -1,0 +1,12 @@
+-- 0065: async tools, the administrator's setting (v0.1 slice E).
+--
+-- async_json on upstream_servers says which calls to the server run as
+-- durable jobs (docs/guidelines/async-tools.md): NULL or {} for none, else
+-- {"mode": "always" | "after" | "off", "after_ms": N, "tools": {"<tool>":
+-- {"mode": ..., "after_ms": N}}}. "always" hands the agent a job at once;
+-- "after" runs the call inline and hands back a job only when it is still
+-- running after after_ms milliseconds. A per-tool rule overrides the
+-- server's. Changing it never reconnects the server.
+--
+-- Same column as migrations/sqlite/0065_upstream_async.sql.
+ALTER TABLE upstream_servers ADD COLUMN IF NOT EXISTS async_json TEXT;

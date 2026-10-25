@@ -28,6 +28,7 @@ import (
 	"github.com/tusharbhardwaj/toolyard/internal/codemode"
 	"github.com/tusharbhardwaj/toolyard/internal/goroutines"
 	"github.com/tusharbhardwaj/toolyard/internal/inbox"
+	"github.com/tusharbhardwaj/toolyard/internal/jobs"
 	"github.com/tusharbhardwaj/toolyard/internal/logx"
 	"github.com/tusharbhardwaj/toolyard/internal/memory"
 	"github.com/tusharbhardwaj/toolyard/internal/metrics"
@@ -220,6 +221,8 @@ type Gateway struct {
 	// accessToolsState backs the policies.*, servers.*, audit.* and
 	// access.* tools (access_tools.go).
 	accessToolsState
+	// jobsState backs async tools and the jobs.* tools (jobs_tools.go).
+	jobsState
 
 	// owners resolves a caller to its dashboard user for per_user
 	// upstreams; publicURL is where their My connections page lives.
@@ -315,6 +318,10 @@ type Options struct {
 	// 2026-07-28 support) or ProtocolAuto (an http upstream that offers
 	// 2026-07-28 is used statelessly; see requestedProtocol).
 	UpstreamProtocol string
+	// Jobs, when set, turns on async tools: the jobs.* tools, MCP Tasks
+	// and the async setting of upstream servers (jobs_tools.go). nil
+	// leaves every call inline, as before.
+	Jobs *jobs.Service
 }
 
 // UsageRecorder is satisfied by *internal/usage.Service. The gateway only
@@ -377,6 +384,7 @@ func New(opts Options) *Gateway {
 		owners:              opts.Owners,
 		publicURL:           opts.PublicURL,
 		upstreamProtocol:    opts.UpstreamProtocol,
+		jobsState:           jobsState{jobs: opts.Jobs},
 		tools:               map[string]toolEntry{},
 		upstreams:           map[string]*upstream{},
 		perUser:             map[string]*perUserGroup{},
@@ -422,6 +430,13 @@ func New(opts Options) *Gateway {
 				res.Tools = vp.List(ctx, res.Tools)
 			}
 		})
+	}
+	// Async tools: MCP Tasks are answered from the jobs table by
+	// MCPTasks (jobs_tasks.go), which also marks async tools in tools/list.
+	if opts.Jobs != nil {
+		serverOpts = append(serverOpts, server.WithTaskCapabilities(true, true, true))
+		hooks.AddAfterListTools(g.markTaskSupport)
+		g.attachJobs(opts.Jobs)
 	}
 	serverOpts = append(serverOpts, server.WithHooks(hooks))
 	g.mcp = server.NewMCPServer(opts.Name, opts.Version, serverOpts...)
@@ -755,6 +770,7 @@ func (g *Gateway) RegisterBuiltins() {
 	entries = append(entries, g.codeModeTools()...)
 	entries = append(entries, g.accessTools()...)
 	entries = append(entries, g.connectionsTools()...)
+	entries = append(entries, g.jobsTools()...)
 	for _, e := range entries {
 		g.registerEntry(e)
 	}
@@ -777,7 +793,7 @@ func (g *Gateway) RegisterBuiltins() {
 func reservedUpstreamName(name string) bool {
 	switch name {
 	case builtinUpstream, "fixture", inboxUpstream, sessionUpstream, "tools", "memory", "lake", "events",
-		policiesUpstream, serversUpstream, auditUpstream, accessUpstream, toolyardServer, connectionsGroup:
+		policiesUpstream, serversUpstream, auditUpstream, accessUpstream, toolyardServer, connectionsGroup, jobsUpstream:
 		return true
 	}
 	return false
@@ -1596,10 +1612,14 @@ func (g *Gateway) routeEntry(ctx context.Context, entry toolEntry, via string, a
 	// an explicit deny still wins, and an open tool doesn't use one up.
 	if !entry.personalGitHub && grantToken != "" && decision.Action == policy.ActionApprove && g.inbox != nil {
 		// Tracked so shutdown waits for the granted execution to finish
-		// and record its outcome.
-		done := g.grantCalls.Add(entry.tool.Name)
-		defer done()
-		return g.redeemAndDispatch(ctx, entry, cleanArgs, agentID, reason, grantToken, &ev)
+		// and record its outcome. An async tool redeems and runs in its
+		// job (jobs_tools.go).
+		call := jobCall{entry: entry, args: cleanArgs, agentID: agentID, reason: reason, intent: intent, callbackRef: callbackRefFrom(ctx), grant: true}
+		return g.runOrStartJob(ctx, call, &ev, func(ctx context.Context, e toolEntry, ev *metrics.Event) (*mcp.CallToolResult, error) {
+			done := g.grantCalls.Add(e.tool.Name)
+			defer done()
+			return g.redeemAndDispatch(ctx, e, cleanArgs, agentID, reason, grantToken, ev)
+		})
 	}
 
 	// The policy rule is the decider of an allow or deny row.
@@ -1617,7 +1637,11 @@ func (g *Gateway) routeEntry(ctx context.Context, entry toolEntry, via string, a
 		allowed.SetDecider(policyDecider)
 		_ = g.audit.Write(ctx, allowed)
 		ev.ApprovalOutcome = metrics.ApprovalNone
-		return g.dispatch(ctx, entry, cleanArgs, agentID, reason, "", &ev)
+		// An async tool runs as a job (jobs_tools.go).
+		call := jobCall{entry: entry, args: cleanArgs, agentID: agentID, reason: reason, intent: intent, callbackRef: callbackRefFrom(ctx)}
+		return g.runOrStartJob(ctx, call, &ev, func(ctx context.Context, e toolEntry, ev *metrics.Event) (*mcp.CallToolResult, error) {
+			return g.dispatch(ctx, e, cleanArgs, agentID, reason, "", ev)
+		})
 	case policy.ActionDeny:
 		denied := audit.Event{
 			EventType:    audit.EventCallDenied,
@@ -1821,15 +1845,21 @@ func (g *Gateway) holdAndWait(ctx context.Context, entry toolEntry, args map[str
 		} else {
 			ev.ApprovalOutcome = metrics.ApprovalApproved
 		}
-		if req.AutoDecidedBy != "" {
-			// Inline auto-approve: decideInline ran with runExec=false, so
-			// NO background executor was scheduled — we dispatch here. We
-			// MUST then persist the result, otherwise the row stays
-			// allowed with result_executed_at IS NULL and SweepUnexecuted
-			// re-fires the executor (re-running the write) on the next
-			// gateway restart.
+		if req.DecidedInline {
+			// Inline auto-approve: this Hold's own decideInline decided
+			// it (runExec=false, under its execution claim), so NO
+			// background executor was scheduled — we dispatch here, and
+			// only here: a coalesced call, or one that woke within
+			// -in-line-wait after another call's auto decision, sees a
+			// rule as decider but not this mark, and takes resumeDeferred
+			// below. We MUST then persist the result, on a context the
+			// client's disconnect does not cancel (as Execute does);
+			// otherwise the row stays allowed with result_executed_at IS
+			// NULL until recovery records it outcome_unknown.
 			res, derr := g.dispatch(ctx, entry, args, agentID, reason, req.ID, ev)
-			g.persistApprovalResult(ctx, req.ID, res, derr, ev.ErrorClass == "upstream" || ev.ErrorClass == "audit_outcome_unknown")
+			persistCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), persistTimeout)
+			defer cancel()
+			g.persistApprovalResult(persistCtx, req.ID, res, derr, ev.ErrorClass == "upstream" || ev.ErrorClass == "audit_outcome_unknown")
 			return res, derr
 		}
 		// Legacy `-in-line-wait > 0` path: a human tapped Allow during the

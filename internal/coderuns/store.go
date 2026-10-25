@@ -296,14 +296,15 @@ func (s *Service) Recover(ctx context.Context) (failed, unknown int64, err error
 	if s.cluster.MultiNode() {
 		expired = ` AND ` + cluster.LeaseEndedSQL(s.db.Dialect, "lease_until")
 	}
-	res, err := s.db.ExecContext(ctx, `UPDATE code_runs SET status = ?, error_kind = ?, error_message = ?, updated_at = ?, finished_at = ? WHERE status = ?`+expired,
-		codemode.StatusFailed, ErrorInterrupted, msgInterruptedQueued, now, now, StatusQueued)
+	// Literal statuses let Postgres use the partial lease index.
+	res, err := s.db.ExecContext(ctx, `UPDATE code_runs SET status = ?, error_kind = ?, error_message = ?, updated_at = ?, finished_at = ? WHERE status = 'queued'`+expired,
+		codemode.StatusFailed, ErrorInterrupted, msgInterruptedQueued, now, now)
 	if err != nil {
 		return 0, 0, err
 	}
 	failed, _ = res.RowsAffected()
-	res, err = s.db.ExecContext(ctx, `UPDATE code_runs SET status = ?, error_kind = ?, error_message = ?, updated_at = ?, finished_at = ? WHERE status = ?`+expired,
-		codemode.StatusOutcomeUnknown, ErrorInterrupted, msgInterruptedRunning, now, now, StatusRunning)
+	res, err = s.db.ExecContext(ctx, `UPDATE code_runs SET status = ?, error_kind = ?, error_message = ?, updated_at = ?, finished_at = ? WHERE status = 'running'`+expired,
+		codemode.StatusOutcomeUnknown, ErrorInterrupted, msgInterruptedRunning, now, now)
 	if err != nil {
 		return failed, 0, err
 	}

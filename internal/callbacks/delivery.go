@@ -2,6 +2,7 @@ package callbacks
 
 import (
 	"context"
+	"net/url"
 	"strings"
 	"sync"
 	"time"
@@ -10,13 +11,18 @@ import (
 )
 
 // Delivery limits. Each process runs at most deliveryWorkers deliveries at
-// once, and every process together keeps at most deliveryPerReceiver
-// events of one receiver in flight, so one slow or hanging destination
-// holds a worker, not the queue. Claims stay atomic in the database (the
-// fenced UPDATE in deliver), so the loop is safe on every node.
+// once. Every process together keeps at most deliveryPerReceiver events of
+// one receiver in flight: the claim (claim in service.go) checks it
+// atomically. pickDue also keeps at most deliveryPerAgent events of one
+// agent and deliveryPerHost of one destination host in flight; it counts
+// the claims every node holds when it picks, so two nodes picking at the
+// same moment can pass those two caps by a few. One slow or hanging
+// destination, agent or host holds a few workers, not the queue.
 const (
 	deliveryWorkers     = 8
 	deliveryPerReceiver = 2
+	deliveryPerAgent    = 4
+	deliveryPerHost     = 4
 	// OutboxRetention is how long delivered and failed events (and their
 	// attempt history) are kept.
 	OutboxRetention = 30 * 24 * time.Hour
@@ -74,46 +80,85 @@ func (s *Service) dispatchDue(ctx context.Context, wg *sync.WaitGroup) {
 	}
 }
 
-// pickDue returns up to limit due push events, oldest first, without more
-// than deliveryPerReceiver in flight for any receiver (counting the claims
-// every node holds).
+// pickDue returns up to limit due push events, oldest first, within the
+// in-flight caps per receiver, agent and destination host (counting the
+// claims every node holds). The due window holds at most
+// deliveryPerReceiver events of a receiver, deliveryPerAgent of an agent
+// and deliveryPerHost of a host, so a receiver, an agent or a shared host
+// with a long backlog cannot fill the window and starve the others (no
+// head-of-line blocking). A receiver without a host (registered by an
+// older version during a rolling upgrade) counts its destination as its
+// host.
 func (s *Service) pickDue(ctx context.Context, limit int) ([]string, error) {
 	now := s.now().UnixMilli()
-	inflight := map[string]int{}
-	rows, err := s.db.QueryContext(ctx, `SELECT receiver_id,count(*) FROM callback_outbox WHERE status='delivering' AND claim_until>? GROUP BY receiver_id`, now)
+	perReceiver, perAgent, perHost := map[string]int{}, map[string]int{}, map[string]int{}
+	rows, err := s.db.QueryContext(ctx, `SELECT o.receiver_id,r.agent_id,`+hostKey+`,count(*) FROM callback_outbox o JOIN callback_receivers r ON r.id=o.receiver_id WHERE o.status='delivering' AND o.claim_until>? GROUP BY o.receiver_id,r.agent_id,`+hostKey, now)
 	if err != nil {
 		return nil, err
 	}
 	for rows.Next() {
-		var ref string
+		var ref, agent, host string
 		var n int
-		if err := rows.Scan(&ref, &n); err != nil {
+		if err := rows.Scan(&ref, &agent, &host, &n); err != nil {
 			rows.Close()
 			return nil, err
 		}
-		inflight[ref] = n
+		perReceiver[ref] += n
+		perAgent[agent] += n
+		perHost[host] += n
 	}
 	if err := rows.Close(); err != nil {
 		return nil, err
 	}
-	rows, err = s.db.QueryContext(ctx, `SELECT id,receiver_id FROM callback_outbox WHERE receiver_id IN (SELECT id FROM callback_receivers WHERE transport='push') AND ((status='pending' AND next_attempt_at<=?) OR (status='delivering' AND claim_until<=?)) ORDER BY next_attempt_at,id LIMIT ?`, now, now, limit*8)
+	rows, err = s.db.QueryContext(ctx, `SELECT id,receiver_id,agent_id,host_key FROM (
+ SELECT id,receiver_id,agent_id,host_key,next_attempt_at,
+  ROW_NUMBER() OVER (PARTITION BY host_key ORDER BY next_attempt_at,id) AS host_rank
+ FROM (
+  SELECT id,receiver_id,agent_id,host_key,next_attempt_at,
+   ROW_NUMBER() OVER (PARTITION BY agent_id ORDER BY next_attempt_at,id) AS agent_rank
+  FROM (
+   SELECT o.id,o.receiver_id,r.agent_id,`+hostKey+` AS host_key,o.next_attempt_at,
+    ROW_NUMBER() OVER (PARTITION BY o.receiver_id ORDER BY o.next_attempt_at,o.id) AS receiver_rank
+   FROM callback_outbox o JOIN callback_receivers r ON r.id=o.receiver_id
+   WHERE r.transport='push' AND ((o.status='pending' AND o.next_attempt_at<=?) OR (o.status='delivering' AND o.claim_until<=?))
+  ) per_receiver WHERE receiver_rank<=?
+ ) per_agent WHERE agent_rank<=?
+) per_host WHERE host_rank<=? ORDER BY next_attempt_at,id LIMIT ?`, now, now, deliveryPerReceiver, deliveryPerAgent, deliveryPerHost, limit*8)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 	var out []string
 	for rows.Next() && len(out) < limit {
-		var id, ref string
-		if err := rows.Scan(&id, &ref); err != nil {
+		var id, ref, agent, host string
+		if err := rows.Scan(&id, &ref, &agent, &host); err != nil {
 			return nil, err
 		}
-		if inflight[ref] >= deliveryPerReceiver {
+		if perReceiver[ref] >= deliveryPerReceiver || perAgent[agent] >= deliveryPerAgent || perHost[host] >= deliveryPerHost {
 			continue
 		}
-		inflight[ref]++
+		perReceiver[ref]++
+		perAgent[agent]++
+		perHost[host]++
 		out = append(out, id)
 	}
 	return out, rows.Err()
+}
+
+// hostKey is the SQL for a receiver r's host: callback_receivers.host, or
+// its destination when host is empty.
+const hostKey = `COALESCE(NULLIF(r.host,''),r.destination)`
+
+// destinationHost is the lowercase host name of a receiver's destination,
+// stored in callback_receivers.host: an IPv6 literal without brackets, ""
+// for a pull receiver, the destination itself when it does not parse.
+// Migration 0062 derives the same value for older receivers.
+func destinationHost(destination string) string {
+	u, err := url.Parse(destination)
+	if err != nil || u.Hostname() == "" {
+		return strings.ToLower(destination)
+	}
+	return strings.ToLower(u.Hostname())
 }
 
 // Sweep deletes delivered and failed events older than OutboxRetention,
@@ -141,7 +186,10 @@ func (s *Service) sweepBatch(ctx context.Context, cutoff int64) (int, error) {
 		return 0, err
 	}
 	defer tx.Rollback()
-	rows, err := tx.QueryContext(ctx, `SELECT id FROM callback_outbox WHERE status IN ('delivered','failed') AND created_at<? ORDER BY created_at LIMIT ?`, cutoff, sweepBatch)
+	// A row an older node queued during a rolling upgrade has created_at
+	// 0: its next attempt time stands in, so it is neither swept at once
+	// nor kept for ever. Each branch can use an index.
+	rows, err := tx.QueryContext(ctx, `SELECT id FROM callback_outbox WHERE status IN ('delivered','failed') AND ((created_at>0 AND created_at<?) OR (created_at=0 AND next_attempt_at<?)) ORDER BY created_at,next_attempt_at LIMIT ?`, cutoff, cutoff, sweepBatch)
 	if err != nil {
 		return 0, err
 	}

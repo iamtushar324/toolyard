@@ -80,6 +80,40 @@ func (s *Service) SetCluster(c *cluster.Cluster) {
 	})
 }
 
+// bearerReadTimeout bounds one database read of a bearer on the tool-call
+// path; past it the call goes on with the bearer cached before.
+const bearerReadTimeout = 2 * time.Second
+
+// singleRead runs read for key unless another caller already reads the
+// same key: then it waits for that read (at most bearerReadTimeout) and
+// does not read again. The caller looks at the cache afterwards.
+func (s *Service) singleRead(key string, read func()) {
+	s.flightMu.Lock()
+	if s.flights == nil {
+		s.flights = map[string]chan struct{}{}
+	}
+	if done, ok := s.flights[key]; ok {
+		s.flightMu.Unlock()
+		t := time.NewTimer(bearerReadTimeout)
+		defer t.Stop()
+		select {
+		case <-done:
+		case <-t.C:
+		}
+		return
+	}
+	done := make(chan struct{})
+	s.flights[key] = done
+	s.flightMu.Unlock()
+	defer func() {
+		s.flightMu.Lock()
+		delete(s.flights, key)
+		s.flightMu.Unlock()
+		close(done)
+	}()
+	read()
+}
+
 // dropBearerLocked forgets one upstream's shared bearer; a database read
 // already under way is not cached (bearerGen). s.mu is held.
 func (s *Service) dropBearerLocked(upstream string) {

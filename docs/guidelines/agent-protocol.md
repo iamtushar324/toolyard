@@ -368,6 +368,11 @@ lowered, and returns a warning with `path: "urgency"`.
 - `inbox.status({ "ids": [...] })` never blocks.
 - `inbox.wait({ "ids": [...], "mode": "any" | "all", "timeout_seconds": ≤300 })`
   blocks. Don't poll in a tight loop.
+- A tool your owner made async answers with a `job_id` instead of its
+  result, granted calls included. Read it with `jobs.wait` (blocks up to
+  60 s), `jobs.status` or `jobs.result`, and never call the tool again for
+  the same work. `_callback_ref` asks for a `job.completed` / `job.failed`
+  callback. See `docs/guidelines/async-tools.md`.
 
 A decision looks like this:
 
@@ -905,7 +910,10 @@ URL. In T3, use your session webhook instead (`t3_session_webhook_create`).
 
 **Use it.** Pass `callback_ref` (and up to 5 `callback_refs`) on
 `inbox.request` or `inbox.ask`; several receivers can follow one item. With
-none, your default receiver (`callbacks.set_default`) follows it. On a call
+none, your default receiver (`callbacks.set_default`) follows it. If the
+default cannot carry the item (more than 12 calls without `v3`, or no
+`inbox.*` events), the answer has a `callback_ref` warning and the default
+does not follow it: name another receiver or poll. On a call
 that may wait for a legacy approval, add `_callback_ref` to its arguments
 (at most 512 characters). A tool that declares a `_callback_ref` parameter
 of its own keeps it: toolyard then neither reads nor removes the argument.
@@ -957,3 +965,8 @@ def verify(secret: str, headers: dict, body: bytes) -> bool:
 Answer 2xx once you have stored the event. Delivery is at least once:
 deduplicate on `event_id`. Failed deliveries retry after 5 s, 1 min, 5 min,
 30 min, 2 h, 6 h, 12 h and 24 h; `410 Gone` stops them.
+
+Events have no order: a retry or a parallel delivery can bring a later event
+first. Never infer state from the order of arrival. Read the current state
+from the event's `status_ref` (`inbox.status`, or `tools.poll_approval` for
+an approval) before you act.

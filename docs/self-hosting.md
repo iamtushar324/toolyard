@@ -466,6 +466,24 @@ Toward upstreams, `-upstream-protocol` chooses the version:
   wants a session, the call it turns away probes again and is retried
   once. stdio and `per_user` upstreams stay on 2025-11-25.
 
+### Async tools
+
+An admin can mark a server, or single tools of it, async (Edit server →
+*Async tool calls*, or `PUT /v1/servers/{name}/async`): a call then
+answers with a job id at once (`always`), or after a wait (`after`,
+`after_ms`), and keeps running in toolyard. Agents read it with the
+`jobs.*` tools, MCP Tasks or `/v1/jobs`, or get a `job.completed` /
+`job.failed` callback (docs/guidelines/async-tools.md).
+
+- `-async-job-timeout` (default `1h`) is one job's run time limit; it
+  replaces `-upstream-call-timeout` for that call.
+- Results over 256 KiB go to the blob store: files under
+  `<data>/job-results` on SQLite, chunks in the database on Postgres.
+  Finished jobs are kept 7 days.
+- Several replicas on one Postgres database share the jobs: each job has a
+  lease its replica renews, and a replica that stops leaves its running
+  jobs `outcome_unknown` (never re-run) once the lease ends (60 s).
+
 ## Inbox and permissions
 
 Settings → **Inbox & permissions**:
@@ -798,9 +816,9 @@ must be able to create tables in the database (owning it is enough).
 `-db-max-conns` (default 10) is the most connections `serve` opens to
 Postgres. With replica support on (`-cluster`, see [Several replicas on
 one database](#several-replicas-on-one-database)) each replica also keeps
-up to four connections of its own outside the pool. Keep the server's
+up to five connections of its own outside the pool. Keep the server's
 `max_connections` above the total of every process that connects:
-replicas × (`-db-max-conns` + 4), plus your own tools. SQLite always uses
+replicas × (`-db-max-conns` + 5), plus your own tools. SQLite always uses
 one connection, and the flag does nothing there.
 
 ### What else changes on Postgres
@@ -835,7 +853,22 @@ refuses SQLite); `off` runs one gateway per database even on Postgres: no
 `LISTEN` connection, no periodic recovery, rate limits in process, and the
 start settles leftover work at once, as on SQLite. A deployment that runs
 exactly one replica on Postgres may set `off`; with two or more replicas
-it must be `on` (or `auto`).
+it must be `on` (or `auto`). Each gateway states its setting in the
+database for its whole life (an advisory lock: exclusive for `off`,
+shared for `on`), so a second gateway next to an `off` one, or an `off`
+gateway next to running replicas, does not start: it waits up to 60
+seconds for the other gateway to stop (a short overlap), logs the
+`application_name` of each gateway that holds the lock, and exits with
+code 78. A running gateway that loses its database connection and finds
+the lock taken by a gateway with the other setting when it reconnects
+drains and exits with code 78 too.
+
+Because an `off` gateway allows no second gateway at all, a deployment
+with `-cluster=off` must update stop-first (Swarm
+`update_config.order: stop-first` and the same for `rollback_config`,
+Kubernetes `strategy: Recreate`), as on SQLite. A change of the
+`-cluster` setting (from `off` to `on` or back) must also be a
+stop-first update: stop every gateway, then start the new ones.
 
 Every replica must have the same configuration and the same keys
 (identity, OAuth, secrets and session keys from the same credentials, with
@@ -903,9 +936,12 @@ How the replicas share the work:
 
 Things to set:
 
-- **Connections.** Each replica keeps up to four connections of its own
-  outside the pool: leader leases, named locks, lease renewals and
-  `LISTEN`. They need session state, so connect the replicas to Postgres
+- **Connections.** Each replica keeps up to five connections of its own
+  outside the pool: leader leases, named locks, lease renewals, `LISTEN`
+  and the `-cluster` setting. Each shows its purpose and the replica's
+  instance ID as its `application_name` in `pg_stat_activity`; the
+  keepalive settings are `SET` once it opens, and one the server refuses
+  (`tcp_user_timeout` before Postgres 12) is skipped with one log line. They need session state, so connect the replicas to Postgres
   directly or through a pooler in session mode. A transaction-mode pooler
   (PgBouncer `pool_mode=transaction`) breaks session advisory locks and
   `LISTEN`: do not use one between toolyard and Postgres.
@@ -933,9 +969,11 @@ Things to set:
   `update_config.order: stop-first`, Kubernetes `strategy: Recreate` with
   one replica. Only once every replica runs v0.1 or later may updates
   overlap.
-- **Later updates** may overlap: run a rolling update (Kubernetes
-  `RollingUpdate` with `maxUnavailable: 0`, Swarm `update_config.order:
-  start-first`). Draining replicas hand over their leader jobs at once and
+- **Later updates** may overlap when every gateway runs with `-cluster`
+  `on` or `auto`, and the update keeps that setting: run a rolling update
+  (Kubernetes `RollingUpdate` with `maxUnavailable: 0`, Swarm
+  `update_config.order: start-first`). With `-cluster=off`, or when the
+  update changes the `-cluster` setting, update stop-first. Draining replicas hand over their leader jobs at once and
   finish or record their in-flight work as described in [Shutdown and
   drain](#shutdown-and-drain).
 
@@ -1333,10 +1371,12 @@ exits 0; config errors exit 78.
   during an update: use Swarm `update_config.order: stop-first` (and the
   same for `rollback_config`), or Kubernetes `strategy: Recreate`. Each
   deploy then has a short outage.
-- On Postgres, once every running gateway is v0.1 or later, replicas may
-  overlap: use a rolling update (Swarm `start-first`, Kubernetes
-  `RollingUpdate` with `maxUnavailable: 0`). The update that first brings
-  in v0.1, and a rollback below v0.1, must still be stop-first. See
+- On Postgres, once every running gateway is v0.1 or later with
+  `-cluster` `on` or `auto`, replicas may overlap: use a rolling update
+  (Swarm `start-first`, Kubernetes `RollingUpdate` with
+  `maxUnavailable: 0`). The update that first brings in v0.1, a rollback
+  below v0.1, any update of a `-cluster=off` gateway, and an update that
+  changes the `-cluster` setting must still be stop-first. See
   [Several replicas on one database](#several-replicas-on-one-database).
 - A key or configuration error exits 78 and a restart does not fix it:
   limit restarts (Swarm `restart_policy.max_attempts`) and read the logs.

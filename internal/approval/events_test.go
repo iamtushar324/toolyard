@@ -7,6 +7,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 )
 
 type fakeSink struct {
@@ -98,5 +99,20 @@ func TestHoldWarnsAboutARefusedCallbackRef(t *testing.T) {
 	}
 	if req.Status != StatusPending || !strings.Contains(req.CallbackWarning, "_callback_ref was not registered") {
 		t.Fatalf("hold: %+v", req)
+	}
+}
+
+// The warning survives an in-line wait: Hold re-reads the request when the
+// wait ends, and the stored row does not carry the warning.
+func TestHoldKeepsTheWarningAfterAnInlineWait(t *testing.T) {
+	bus := newTestBus(t)
+	bus.SetEventSink(&refusingSink{})
+	req, err := bus.Hold(context.Background(), NewRequest{AgentID: "ag_1", UpstreamName: "github", ToolName: "github.merge_pull_request",
+		Arguments: map[string]any{"number": 11}, Reason: "Merge the reviewed fix for the login bug", CallbackRef: "cb_theirs"}, 20*time.Millisecond)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if req.Status != StatusPending || !strings.Contains(req.CallbackWarning, "_callback_ref was not registered") {
+		t.Fatalf("hold after a wait: %+v", req)
 	}
 }

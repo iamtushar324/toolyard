@@ -1,8 +1,11 @@
 // Package callbacks delivers committed Inbox decisions and the other
 // webhook events (events.go): execution outcomes, legacy approval
 // decisions and results, pings, and the events other packages emit with
-// EmitTx. Delivery is at least once; receivers deduplicate the stable event
-// id before any agent dispatch.
+// EmitForAgentTx. Delivery is at least once; receivers deduplicate the
+// stable event id before any agent dispatch. Events have no order:
+// retries and parallel deliveries can deliver a later event first, so a
+// receiver reads the current state from the event's status_ref (Inbox
+// items: inbox.status) instead of trusting the order of arrival.
 package callbacks
 
 import (
@@ -18,7 +21,6 @@ import (
 	"io"
 	"net"
 	"net/http"
-	"net/netip"
 	"net/url"
 	"sort"
 	"strconv"
@@ -27,6 +29,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/tusharbhardwaj/toolyard/internal/inbox"
+	"github.com/tusharbhardwaj/toolyard/internal/netguard"
 	"github.com/tusharbhardwaj/toolyard/internal/sealbox"
 	"github.com/tusharbhardwaj/toolyard/internal/store"
 )
@@ -158,6 +161,8 @@ func (s *Service) register(ctx context.Context, agentID, environmentID, clientID
 	if !errors.Is(err, sql.ErrNoRows) {
 		return nil, err
 	}
+	// A quick answer before sealing the secret; insertReceiver checks the
+	// cap again under the agent lock.
 	var kept int
 	if err = s.db.QueryRowContext(ctx, `SELECT count(*) FROM callback_receivers WHERE agent_id=? AND status<>'removed'`, agentID).Scan(&kept); err != nil {
 		return nil, err
@@ -172,7 +177,8 @@ func (s *Service) register(ctx context.Context, agentID, environmentID, clientID
 	}
 	n, err := s.insertReceiver(ctx, id, agentID, environmentID, clientID, destination, enc, privateAllowed, transport, strings.Join(events, ","), sub.V3)
 	if err != nil {
-		// A concurrent identical registration may own the unique client binding.
+		// A concurrent identical registration may own the unique client
+		// binding (or have taken the last place under the cap).
 		var won string
 		if e := s.db.QueryRowContext(ctx, `SELECT id FROM callback_receivers WHERE agent_id=? AND client_receiver_id=?`, agentID, clientID).Scan(&won); e == nil {
 			return s.register(ctx, agentID, environmentID, clientID, destination, secret, privateAllowed, transport, sub)
@@ -185,28 +191,60 @@ func (s *Service) register(ctx context.Context, agentID, environmentID, clientID
 	return s.Get(ctx, agentID, id)
 }
 
+// readCommitted opens the transactions that take a lock and then count
+// (receivers, pings, claims): each statement after the lock must see what
+// the previous holder committed, which a snapshot taken at the start of
+// the transaction (REPEATABLE READ or SERIALIZABLE as the server default)
+// would not. SQLite ignores it: one connection runs one transaction.
+var readCommitted = &sql.TxOptions{Isolation: sql.LevelReadCommitted}
+
+// lockAgentTx serializes, on Postgres, the transactions that count an
+// agent's callback rows before they insert one (receivers, pings): the
+// count read after the lock holds until the insert commits, on every node.
+// The lock ends with tx. SQLite's single connection already serializes.
+func (s *Service) lockAgentTx(ctx context.Context, tx *sql.Tx, agentID string) error {
+	if !s.db.Dialect.IsPostgres() {
+		return nil
+	}
+	_, err := tx.ExecContext(ctx, `SELECT pg_advisory_xact_lock(hashtext(CAST(? AS TEXT)))`, "callbacks|"+agentID)
+	return err
+}
+
 // insertReceiver stores a receiver unless the agent's host connection is
-// inactive, and returns the rows inserted (0 or 1). The host connection
-// rows are locked first (Postgres FOR UPDATE), so a revocation that
-// updates host_connections and then removes the agent's receivers either
-// waits for this insert and removes it too, or commits first and this
-// insert sees the revoked connection. SQLite's single connection already
-// serializes both. The transaction ends before insertReceiver returns.
+// inactive or the agent keeps MaxReceiversPerAgent receivers
+// (ErrTooManyReceivers), and returns the rows inserted (0 or 1). The count
+// is read under the agent lock, so concurrent registrations never pass
+// the cap together. The host connection rows are locked first (Postgres
+// FOR UPDATE), so a revocation that updates host_connections and then
+// removes the agent's receivers either waits for this insert and removes
+// it too, or commits first and this insert sees the revoked connection.
+// SQLite's single connection already serializes both. The transaction
+// ends before insertReceiver returns.
 func (s *Service) insertReceiver(ctx context.Context, id, agentID, environmentID, clientID, destination, enc string, privateAllowed bool, transport, events string, v3 bool) (int64, error) {
-	tx, err := s.db.BeginTx(ctx, nil)
+	tx, err := s.db.BeginTx(ctx, readCommitted)
 	if err != nil {
 		return 0, err
 	}
 	defer tx.Rollback()
+	if err = s.lockAgentTx(ctx, tx, agentID); err != nil {
+		return 0, err
+	}
 	if s.db.Dialect.IsPostgres() {
 		if _, err = tx.ExecContext(ctx, `SELECT agent_id FROM host_connections WHERE agent_id=?`+s.db.Dialect.ForUpdate(), agentID); err != nil {
 			return 0, err
 		}
 	}
+	var kept int
+	if err = tx.QueryRowContext(ctx, `SELECT count(*) FROM callback_receivers WHERE agent_id=? AND status<>'removed'`, agentID).Scan(&kept); err != nil {
+		return 0, err
+	}
+	if kept >= MaxReceiversPerAgent {
+		return 0, ErrTooManyReceivers
+	}
 	// Parameters in a SELECT list have no column type on Postgres: cast them
 	// to the column types (the casts change nothing on SQLite).
 	now := s.now().UnixMilli()
-	result, err := tx.ExecContext(ctx, `INSERT INTO callback_receivers(id,agent_id,environment_id,client_receiver_id,destination,secret_enc,private_allowed,created_at,transport,events,v3) SELECT CAST(? AS TEXT),CAST(? AS TEXT),CAST(? AS TEXT),CAST(? AS TEXT),CAST(? AS TEXT),CAST(? AS TEXT),CAST(? AS BIGINT),CAST(? AS BIGINT),CAST(? AS TEXT),CAST(? AS TEXT),CAST(? AS BIGINT) WHERE NOT EXISTS (`+inactiveHostPredicate+`)`, id, agentID, environmentID, clientID, destination, enc, boolInt(privateAllowed), now, transport, events, boolInt(v3), agentID, now)
+	result, err := tx.ExecContext(ctx, `INSERT INTO callback_receivers(id,agent_id,environment_id,client_receiver_id,destination,secret_enc,private_allowed,created_at,transport,events,v3,host) SELECT CAST(? AS TEXT),CAST(? AS TEXT),CAST(? AS TEXT),CAST(? AS TEXT),CAST(? AS TEXT),CAST(? AS TEXT),CAST(? AS BIGINT),CAST(? AS BIGINT),CAST(? AS TEXT),CAST(? AS TEXT),CAST(? AS BIGINT),CAST(? AS TEXT) WHERE NOT EXISTS (`+inactiveHostPredicate+`)`, id, agentID, environmentID, clientID, destination, enc, boolInt(privateAllowed), now, transport, events, boolInt(v3), destinationHost(destination), agentID, now)
 	if err != nil {
 		return 0, err
 	}
@@ -436,6 +474,28 @@ func (s *Service) CheckSubscription(ctx context.Context, agentID, ref string, r 
 	return nil
 }
 
+// DefaultWarning implements inbox.DefaultWarner: why the agent's default
+// receiver will not follow r, an item that names no receiver ("" when it
+// will, or the agent has none). RegisterTx then skips the default
+// receiver; Submit warns the agent so it polls or names another receiver.
+func (s *Service) DefaultWarning(ctx context.Context, agentID string, r *inbox.Request) string {
+	def, _, err := defaultReceiver(ctx, s.db, agentID)
+	if err != nil || def == "" {
+		return ""
+	}
+	rec, err := s.Get(ctx, agentID, def)
+	if err != nil {
+		return ""
+	}
+	if needsV3(r) && !rec.V3 {
+		return fmt.Sprintf("your default receiver takes the version 2 decision shape (at most %d calls), so it will not hear of this item; name a receiver with v3: true in callback_ref, or poll inbox.status", maxLegacyCalls)
+	}
+	if !acceptsAny(rec.Events, inboxEvents) {
+		return "your default receiver accepts no inbox.* events, so it will not hear of this item; name a receiver that does in callback_ref, or poll inbox.status"
+	}
+	return ""
+}
+
 type Outcome struct {
 	CallID  string `json:"call_id"`
 	Verdict string `json:"verdict"`
@@ -505,40 +565,10 @@ func (s *Service) DecisionTx(ctx context.Context, tx *sql.Tx, r *inbox.Request) 
 	return nil
 }
 
-// deniedPrefixes are every special-use range a public receiver must not
-// resolve to (RFC 6890 and its updates): this host, private, shared (CGN),
-// loopback, link-local, documentation, benchmarking, protocol assignments,
-// multicast, reserved and broadcast, and their IPv6 equivalents, including
-// the prefixes that embed an IPv4 address (NAT64, 6to4, Teredo).
-var deniedPrefixes = func() []netip.Prefix {
-	var out []netip.Prefix
-	for _, p := range []string{
-		"0.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8", "169.254.0.0/16", "172.16.0.0/12",
-		"192.0.0.0/24", "192.0.2.0/24", "192.31.196.0/24", "192.52.193.0/24", "192.88.99.0/24", "192.168.0.0/16",
-		"192.175.48.0/24", "198.18.0.0/15", "198.51.100.0/24", "203.0.113.0/24", "224.0.0.0/4", "240.0.0.0/4",
-		"::/128", "::1/128", "::ffff:0:0/96", "::/96", "64:ff9b::/96", "64:ff9b:1::/48", "100::/64",
-		"2001::/23", "2001:db8::/32", "2002::/16", "3fff::/20", "5f00::/16", "fc00::/7", "fe80::/10", "fec0::/10", "ff00::/8",
-	} {
-		out = append(out, netip.MustParsePrefix(p))
-	}
-	return out
-}()
+// privateIP reports whether ip is not a public unicast address
+// (netguard.Public: IPv6 only in 2000::/3, and no special-use range).
+func privateIP(ip net.IP) bool { return !netguard.Public(ip) }
 
-// privateIP reports whether ip is not a public unicast address: an IPv4
-// address mapped into IPv6 is checked as IPv4.
-func privateIP(ip net.IP) bool {
-	a, ok := netip.AddrFromSlice(ip)
-	if !ok {
-		return true
-	}
-	a = a.Unmap()
-	for _, p := range deniedPrefixes {
-		if p.Contains(a) {
-			return true
-		}
-	}
-	return false
-}
 func (s *Service) resolve(ctx context.Context, raw string, allowPrivate bool) ([]net.IPAddr, error) {
 	u, err := url.Parse(raw)
 	if err != nil || u.Scheme != "https" || u.Host == "" || u.User != nil || u.Fragment != "" {
@@ -630,16 +660,33 @@ func (s *Service) ReceiverHistory(ctx context.Context, agentID, ref string) ([]D
 	return out, nil
 }
 func (s *Service) Retry(ctx context.Context, agentID, eventID string) error {
-	result, err := s.db.ExecContext(ctx, `UPDATE callback_outbox SET status='pending',retry_base=attempts,next_attempt_at=?,terminal_reason='' WHERE id=? AND status='failed' AND receiver_id IN (SELECT id FROM callback_receivers WHERE agent_id=? AND status='active')`, s.now().UnixMilli(), eventID, agentID)
+	result, err := s.db.ExecContext(ctx, `UPDATE callback_outbox SET status='pending',retry_base=attempts,next_attempt_at=?,terminal_reason='' WHERE id=? AND status='failed' AND event_type<>'ping' AND receiver_id IN (SELECT id FROM callback_receivers WHERE agent_id=? AND status='active')`, s.now().UnixMilli(), eventID, agentID)
 	if err != nil {
 		return err
 	}
 	n, _ := result.RowsAffected()
 	if n != 1 {
+		var kind string
+		e := s.db.QueryRowContext(ctx, `SELECT o.event_type FROM callback_outbox o JOIN callback_receivers r ON r.id=o.receiver_id WHERE o.id=? AND r.agent_id=?`, eventID, agentID).Scan(&kind)
+		if e == nil && kind == EventPing {
+			return ErrPingNotRetried
+		}
 		return ErrReceiver
 	}
 	return nil
 }
+
+// ErrPingNotRetried refuses a manual retry of a ping: a receiver keeps at
+// most one open ping, so callbacks.test sends a new one. It matches
+// ErrConflict (409 conflict).
+var ErrPingNotRetried error = pingRetryError{}
+
+type pingRetryError struct{}
+
+func (pingRetryError) Error() string {
+	return "a ping is not retried; send a new one with callbacks.test"
+}
+func (pingRetryError) Is(target error) bool { return target == ErrConflict }
 
 var retryDelays = []time.Duration{5 * time.Second, time.Minute, 5 * time.Minute, 30 * time.Minute, 2 * time.Hour, 6 * time.Hour, 12 * time.Hour, 24 * time.Hour}
 
@@ -653,17 +700,40 @@ func (s *Service) DeliverOne(ctx context.Context) error {
 	return s.deliver(ctx, ids[0])
 }
 
+// claim takes one due event for delivery and returns the attempt number
+// it took, so finish is fenced on this claim even if another claim ran
+// between the read and the claim. sql.ErrNoRows means the event is not due
+// (another node took it, or it finished) or its receiver already has
+// deliveryPerReceiver events in flight. The cap is checked in the claim
+// itself, and claims of one receiver take turns on Postgres (a
+// transaction-scoped lock on the receiver), so every node together never
+// keeps more than deliveryPerReceiver events of a receiver in flight.
+func (s *Service) claim(ctx context.Context, id string) (claimed int, payload, ref string, rev int, err error) {
+	now := s.now().UnixMilli()
+	tx, err := s.db.BeginTx(ctx, readCommitted)
+	if err != nil {
+		return 0, "", "", 0, err
+	}
+	defer tx.Rollback()
+	if s.db.Dialect.IsPostgres() {
+		if _, err = tx.ExecContext(ctx, `SELECT pg_advisory_xact_lock(hashtext('callback-receiver|' || receiver_id)) FROM callback_outbox WHERE id=?`, id); err != nil {
+			return 0, "", "", 0, err
+		}
+	}
+	err = tx.QueryRowContext(ctx, `UPDATE callback_outbox SET status='delivering',claim_until=?,attempts=attempts+1 WHERE id=? AND ((status='pending' AND next_attempt_at<=?) OR (status='delivering' AND claim_until<=?)) AND (SELECT count(*) FROM callback_outbox busy WHERE busy.receiver_id=callback_outbox.receiver_id AND busy.status='delivering' AND busy.claim_until>? AND busy.id<>callback_outbox.id)<? RETURNING attempts,payload,receiver_id,receiver_revision`,
+		now+60000, id, now, now, now, deliveryPerReceiver).Scan(&claimed, &payload, &ref, &rev)
+	if err != nil {
+		return 0, "", "", 0, err
+	}
+	return claimed, payload, ref, rev, tx.Commit()
+}
+
 // deliver claims one due event and sends it. Claims have leases, so a lost
 // acknowledgement may cause a physical duplicate with the same event id;
-// a claim another node (or worker) took first makes this a no-op.
+// a claim another node (or worker) took first, or a receiver at its
+// in-flight cap, makes this a no-op.
 func (s *Service) deliver(ctx context.Context, id string) error {
-	now := s.now().UnixMilli()
-	var payload, ref string
-	var rev int
-	// The claim returns the attempt number it took, so finish is fenced on
-	// this claim even if another claim ran between the read and the claim.
-	var claimed int
-	err := s.db.QueryRowContext(ctx, `UPDATE callback_outbox SET status='delivering',claim_until=?,attempts=attempts+1 WHERE id=? AND ((status='pending' AND next_attempt_at<=?) OR (status='delivering' AND claim_until<=?)) RETURNING attempts,payload,receiver_id,receiver_revision`, now+60000, id, now, now).Scan(&claimed, &payload, &ref, &rev)
+	claimed, payload, ref, rev, err := s.claim(ctx, id)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil
 	}

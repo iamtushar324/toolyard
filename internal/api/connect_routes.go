@@ -187,7 +187,14 @@ func (s *Server) connectT3(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	unlock := cfg.locks.lock(u.ID)
+	unlock, err := cfg.locks.lock(ctx, u.ID)
+	if err != nil {
+		// Another replica is connecting this person and did not finish in
+		// time: a retry a little later finds its result.
+		w.Header().Set("Retry-After", "5")
+		s.connectRefuse(ctx, w, at, http.StatusServiceUnavailable, "busy_retry", err)
+		return
+	}
 	defer unlock()
 	at.keyState, err = s.connectIdentityKey(ctx, u.ID)
 	if err != nil {
@@ -349,17 +356,15 @@ type keyedLock struct {
 	refs int
 }
 
-// lock blocks until key is free and returns its unlock.
-func (k *keyedMutex) lock(key string) func() {
+// lock blocks until key is free and returns its unlock. With several
+// replicas it waits at most 30 s (one connect takes a few round trips to
+// Clerk) or until ctx ends, and then fails rather than connect without
+// the lock: the caller answers with a retryable 503.
+func (k *keyedMutex) lock(ctx context.Context, key string) (func(), error) {
 	if k.cluster.MultiNode() {
-		// Bounded: one connect takes a few round trips to Clerk.
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		unlock, err := k.cluster.Lock(ctx, "connect-t3:"+key)
-		cancel()
-		if err == nil {
-			return unlock
-		}
-		logx.For("api").Warn("connect: cluster lock failed; locking in this process only", "err", err.Error())
+		lctx, cancel := context.WithTimeout(ctx, 30*time.Second)
+		defer cancel()
+		return k.cluster.Lock(lctx, "connect-t3:"+key)
 	}
 	k.mu.Lock()
 	if k.locks == nil {
@@ -380,5 +385,5 @@ func (k *keyedMutex) lock(key string) func() {
 			delete(k.locks, key)
 		}
 		k.mu.Unlock()
-	}
+	}, nil
 }
