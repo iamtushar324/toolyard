@@ -502,9 +502,16 @@ type Outcome struct {
 	Reason  string `json:"reason,omitempty"`
 }
 type EventData struct {
-	InboxID          string                `json:"inbox_id"`
-	DecisionRevision int                   `json:"decision_revision"`
-	Status           string                `json:"status"`
+	InboxID          string `json:"inbox_id"`
+	DecisionRevision int    `json:"decision_revision"`
+	// Status is the event's outcome: decided (inbox.decision), expired or
+	// cancelled. It stays "decided" for every decision because receivers
+	// built for the version 2 shape (T3 Code) accept only these three.
+	Status string `json:"status"`
+	// ItemStatus is the item's status as inbox.status reports it
+	// (approved, denied, returned, answered, expired, cancelled). Only v3
+	// receivers get it: version 2 receivers refuse unknown fields.
+	ItemStatus       string                `json:"item_status,omitempty"`
 	Calls            []Outcome             `json:"calls"`
 	OverallNote      string                `json:"overall_note,omitempty"`
 	RequestExpiresAt int64                 `json:"request_expires_at"`
@@ -548,11 +555,13 @@ func (s *Service) DecisionTx(ctx context.Context, tx *sql.Tx, r *inbox.Request) 
 		}
 		outcomes = append(outcomes, Outcome{CallID: t.CallID, Verdict: verdict, Reason: t.Reason})
 	}
-	data := EventData{InboxID: r.ID, DecisionRevision: r.Revision, Status: status, Calls: outcomes, OverallNote: r.OwnerNote, RequestExpiresAt: r.ExpiresAt, GrantExpiresAt: r.GrantsExpire, StatusRef: r.ID, Response: r.Response, Answers: r.Answers}
+	data := EventData{InboxID: r.ID, DecisionRevision: r.Revision, Status: status, ItemStatus: r.Status, Calls: outcomes, OverallNote: r.OwnerNote, RequestExpiresAt: r.ExpiresAt, GrantExpiresAt: r.GrantsExpire, StatusRef: r.ID, Response: r.Response, Answers: r.Answers}
 	// A receiver without the v3 capability gets the version 2 shape: no
-	// answers, and no event at all when the calls do not fit it.
+	// answers and no item_status, and no event at all when the calls do
+	// not fit it.
 	legacy := data
 	legacy.Answers = nil
+	legacy.ItemStatus = ""
 	q := queued{agentID: r.AgentID, subject: r.ID, revision: r.Revision, eventType: kind, dedupe: fmt.Sprintf("inbox:%s:%d", r.ID, r.Revision),
 		data: data, legacy: legacy, legacySkip: len(outcomes) > maxLegacyCalls}
 	for _, sub := range subs {

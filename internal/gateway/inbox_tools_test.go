@@ -334,3 +334,35 @@ func textOf(res *mcp.CallToolResult) string {
 	}
 	return b.String()
 }
+
+// inbox.status and inbox.wait take request_id, the name every other Inbox
+// tool gives an item, as well as ids; without either they name the field.
+func TestInboxStatusAcceptsRequestID(t *testing.T) {
+	f := newInboxFixture(t)
+	res := f.call(t, f.agent, "inbox.request", requestArgs(map[string]any{"service": "api", "env": "prod"}))
+	id, _ := structured(t, res)["request_id"].(string)
+	if id == "" {
+		t.Fatalf("request: %s", textOf(res))
+	}
+	calls := []struct {
+		tool string
+		args map[string]any
+	}{
+		{"inbox.status", map[string]any{"request_id": id}},
+		{"inbox.status", map[string]any{"request_id": []any{id}}},
+		{"inbox.status", map[string]any{"ids": id}},
+		{"inbox.status", map[string]any{"ids": []any{id}}},
+		{"inbox.wait", map[string]any{"request_id": id, "timeout_seconds": 1}},
+	}
+	for _, c := range calls {
+		res := f.call(t, f.agent, c.tool, c.args)
+		reqs, _ := structured(t, res)["requests"].([]any)
+		if res.IsError || len(reqs) != 1 || reqs[0].(map[string]any)["request_id"] != id {
+			t.Fatalf("%s %v: %s", c.tool, c.args, textOf(res))
+		}
+	}
+	res = f.call(t, f.agent, "inbox.status", nil)
+	if !res.IsError || !strings.Contains(textOf(res), `{"ids": ["rq_`) || !strings.Contains(textOf(res), "request_id") {
+		t.Fatalf("no IDs: %s", textOf(res))
+	}
+}

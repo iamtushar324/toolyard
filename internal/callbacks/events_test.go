@@ -125,6 +125,10 @@ func TestTwoReceiversFollowOneItem(t *testing.T) {
 		if ev.Data.Answers["env"].Value != "stage" || ev.Data.Answers["notify"].Value != false {
 			t.Fatalf("%s: answers %+v", ref, ev.Data.Answers)
 		}
+		// status names the event; item_status is what inbox.status says.
+		if ev.Data.Status != "decided" || ev.Data.ItemStatus != inbox.StatusApproved {
+			t.Fatalf("%s: status %q, item_status %q", ref, ev.Data.Status, ev.Data.ItemStatus)
+		}
 		ids[ev.EventID] = true
 	}
 	if len(ids) != 2 {
@@ -311,6 +315,19 @@ func TestLegacyReceiverGetsOnlyWhatItAccepts(t *testing.T) {
 	_, legacyData := envelopeOf(t, events[0].Body)
 	if _, ok := legacyData["answers"]; ok {
 		t.Fatalf("a legacy receiver got answers: %s", events[0].Body)
+	}
+	// The version 2 shape keeps to the keys a version 2 receiver accepts
+	// (T3 Code's session-webhook parser refuses any other key), and its
+	// status stays "decided".
+	v2Keys := map[string]bool{"inbox_id": true, "decision_revision": true, "status": true, "calls": true, "overall_note": true,
+		"request_expires_at": true, "grant_expires_at": true, "status_ref": true, "response": true, "options": true}
+	for k := range legacyData {
+		if !v2Keys[k] {
+			t.Errorf("a legacy receiver got the key %q: %s", k, events[0].Body)
+		}
+	}
+	if legacyData["status"] != "decided" {
+		t.Fatalf("legacy status %v", legacyData["status"])
 	}
 	// More than 12 calls only fit the v3 shape: refused when named,
 	// skipped for a default receiver.

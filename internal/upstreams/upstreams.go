@@ -355,7 +355,7 @@ func validate(srv Server) error {
 	// may still be stored, so no server may take its name.
 	switch srv.Name {
 	case "builtin", "fixture", "memory", "tools", "mempalace", "notes", "skills",
-		"inbox", "session", "lake", "events", "policies", "servers", "audit", "access", "toolyard", "connections", "jobs":
+		"inbox", "session", "lake", "events", "policies", "servers", "audit", "access", "toolyard", "connections", "jobs", "callbacks":
 		return ErrReserved
 	}
 	switch srv.Transport {
