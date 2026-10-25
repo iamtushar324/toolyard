@@ -68,9 +68,27 @@ type Fetcher interface {
 }
 
 // DecisionCallbacks writes subscriptions and decision events inside the Inbox transaction.
+// RegisterTx is called once per receiver the request names (callback_ref
+// and callback_refs); with ref "" it subscribes the agent's default
+// receiver, if it has one.
 type DecisionCallbacks interface {
 	RegisterTx(context.Context, *sql.Tx, *Request, string) error
 	DecisionTx(context.Context, *sql.Tx, *Request) error
+}
+
+// CallbackChecker is implemented by DecisionCallbacks that can check a
+// named receiver before the item is stored: it must be an active receiver
+// of the agent that can carry r's decision. Submit reports a refusal as a
+// problem, on dry runs too.
+type CallbackChecker interface {
+	CheckSubscription(ctx context.Context, agentID, ref string, r *Request) error
+}
+
+// ExecutionCallbacks is implemented by DecisionCallbacks that also announce
+// a granted call's outcome (execution.completed). ExecutionTx runs inside
+// the transaction that records the outcome; tool is the call's tool.
+type ExecutionCallbacks interface {
+	ExecutionTx(ctx context.Context, tx *sql.Tx, e *Execution, agentID, tool string) error
 }
 
 // Options configure a Service.
@@ -108,7 +126,11 @@ type Options struct {
 	Passkeys PasskeyGate
 	// AgentName resolves an agent ID to a display name.
 	AgentName func(ctx context.Context, agentID string) string
-	Now       func() time.Time
+	// RichEnabled, when set and false, refuses schema_version 3 items: an
+	// operator turns it off while replicas that predate it still run
+	// (they would drop the version 3 fields when they rewrite an item).
+	RichEnabled func() bool
+	Now         func() time.Time
 	// Cluster, when it spans several nodes (Postgres), makes the Inbox safe
 	// for replicas sharing the database: execution leases, cross-node
 	// wake-ups for Wait and cluster locks instead of in-process ones
@@ -306,6 +328,7 @@ type Preview struct {
 	CardTitle    string `json:"card_title"`
 	AudioSeconds int    `json:"audio_seconds"`
 	Tools        int    `json:"tools,omitempty"`
+	Questions    int    `json:"questions,omitempty"`
 	Attachments  int    `json:"attachments"`
 }
 
@@ -362,6 +385,21 @@ func (s *Service) Submit(ctx context.Context, agentID string, sub *Submission) (
 		}
 	}
 	s.resolveUploads(ctx, agentID, r, &res.Problems)
+	if sub.SchemaVersion == SchemaVersionRich && s.opts.RichEnabled != nil && !s.opts.RichEnabled() {
+		res.Problems = append(res.Problems, Problem{"schema_version", "schema_version 3 is turned off on this server while it is upgraded; send version 1 or 2 for now"})
+	}
+	if checker, ok := s.opts.Callbacks.(CallbackChecker); ok {
+		if r.CallbackRef != "" {
+			if err := checker.CheckSubscription(ctx, agentID, r.CallbackRef, r); err != nil {
+				res.Problems = append(res.Problems, Problem{"callback_ref", err.Error()})
+			}
+		}
+		for i, ref := range r.CallbackRefs {
+			if err := checker.CheckSubscription(ctx, agentID, ref, r); err != nil {
+				res.Problems = append(res.Problems, Problem{fmt.Sprintf("callback_refs[%d]", i), err.Error()})
+			}
+		}
+	}
 
 	if sub.DryRun {
 		if n, err := s.countDryRuns(ctx, agentID, time.Hour); err == nil && n >= DryRunsPerHour {
@@ -641,6 +679,7 @@ func preview(r *Request) *Preview {
 		CardTitle:    r.Title,
 		AudioSeconds: int(float64(len(strings.Fields(r.Audio.Script)))/2.6 + 0.5),
 		Tools:        len(r.Tools),
+		Questions:    len(r.Questions),
 		Attachments:  len(r.Attachments),
 	}
 }
@@ -654,10 +693,15 @@ type CallVerdict struct {
 }
 
 type Decision struct {
-	Verdicts        map[string]CallVerdict `json:"verdicts,omitempty"`
-	Response        *Response              `json:"response,omitempty"`
-	RequestRevision int                    `json:"request_revision,omitempty"`
-	SubmissionID    string                 `json:"submission_id,omitempty"`
+	Verdicts map[string]CallVerdict `json:"verdicts,omitempty"`
+	// Answers answers a version 3 item's questions, keyed by question ID:
+	// with the verdicts on an access item (action submit), alone on a
+	// question or blocker (action answer). Every required question needs
+	// an answer; partial answers are never a decision.
+	Answers         map[string]Answer `json:"answers,omitempty"`
+	Response        *Response         `json:"response,omitempty"`
+	RequestRevision int               `json:"request_revision,omitempty"`
+	SubmissionID    string            `json:"submission_id,omitempty"`
 
 	Action        string `json:"action"` // approve | deny | return | answer | snooze | read
 	Allow         []bool `json:"allow,omitempty"`
@@ -798,6 +842,7 @@ func (s *Service) Decide(ctx context.Context, id string, d Decision) (*Request, 
 	who, how := deciderLabel(dec), deciderSuffix(dec)
 	var out *Request
 	err := s.mutateTx(ctx, id, func(tx *sql.Tx, r *Request) error {
+		var answers map[string]Answer
 		if r.Kind == KindAccess && d.SubmissionID != "" && r.DecisionSubmissionID == d.SubmissionID {
 			if r.DecisionFingerprint != decisionFingerprint(d) {
 				return ErrConflict
@@ -826,6 +871,19 @@ func (s *Service) Decide(ctx context.Context, id string, d Decision) (*Request, 
 			}
 			if err := validateVerdicts(r, d); err != nil {
 				return err
+			}
+			if len(r.Questions) > 0 || len(d.Answers) > 0 {
+				// Rejecting every call ends the item: required answers
+				// are then optional.
+				acceptsAny := false
+				for _, v := range d.Verdicts {
+					acceptsAny = acceptsAny || v.Verdict == VerdictAccepted
+				}
+				a, err := validateAnswers(r, d.Answers, acceptsAny)
+				if err != nil {
+					return err
+				}
+				answers = a
 			}
 		}
 		note := strings.TrimSpace(d.Note)
@@ -900,6 +958,11 @@ func (s *Service) Decide(ctx context.Context, id string, d Decision) (*Request, 
 				r.GrantsExpire = now + int64(r.TTLSeconds)*1000
 			}
 			r.addActivity(now, fmt.Sprintf("%s allowed %d of %d tool%s%s", who, n, len(r.Tools), plural(len(r.Tools)), how))
+			if len(r.Questions) > 0 {
+				r.Answers = answers
+				r.Answer = answerSummary(r.Questions, answers)
+				r.addActivity(now, fmt.Sprintf("%s answered %d of %d question%s", who, len(answers), len(r.Questions), plural(len(r.Questions))))
+			}
 		case "deny":
 			for i := range r.Tools {
 				r.Tools[i].Decision = ToolRefused
@@ -921,7 +984,11 @@ func (s *Service) Decide(ctx context.Context, id string, d Decision) (*Request, 
 			if r.Kind != KindQuestion && r.Kind != KindBlocker {
 				return ErrBadDecision
 			}
-			if err := answerQuestion(r, d, now); err != nil {
+			if len(r.Questions) > 0 {
+				if err := answerQuestions(r, d); err != nil {
+					return err
+				}
+			} else if err := answerQuestion(r, d, now); err != nil {
 				return err
 			}
 			r.Status = StatusAnswered
@@ -982,18 +1049,21 @@ func withNote(n string) string {
 
 // AgentView is what an agent sees about one of its requests.
 type AgentView struct {
-	Revision     int             `json:"revision"`
-	Response     *AnswerResponse `json:"response,omitempty"`
-	RequestID    string          `json:"request_id"`
-	Kind         string          `json:"kind"`
-	Status       string          `json:"status"`
-	SnoozedUntil int64           `json:"snoozed_until,omitempty"`
-	OwnerNote    string          `json:"owner_note,omitempty"`
-	Answer       string          `json:"answer,omitempty"`
-	Tools        []AgentToolView `json:"tools,omitempty"`
-	ExpiresAt    int64           `json:"expires_at,omitempty"`
-	GrantsExpire int64           `json:"grants_expire_at,omitempty"`
-	Next         string          `json:"next"`
+	Revision int             `json:"revision"`
+	Response *AnswerResponse `json:"response,omitempty"`
+	// Answers are the owner's answers to a version 3 item's questions,
+	// keyed by question ID (unanswered optional questions are absent).
+	Answers      map[string]Answer `json:"answers,omitempty"`
+	RequestID    string            `json:"request_id"`
+	Kind         string            `json:"kind"`
+	Status       string            `json:"status"`
+	SnoozedUntil int64             `json:"snoozed_until,omitempty"`
+	OwnerNote    string            `json:"owner_note,omitempty"`
+	Answer       string            `json:"answer,omitempty"`
+	Tools        []AgentToolView   `json:"tools,omitempty"`
+	ExpiresAt    int64             `json:"expires_at,omitempty"`
+	GrantsExpire int64             `json:"grants_expire_at,omitempty"`
+	Next         string            `json:"next"`
 }
 
 // AgentToolView is one tool's outcome, with the grant token the first time
@@ -1038,7 +1108,7 @@ func (s *Service) Status(ctx context.Context, agentID string, ids []string) ([]A
 			s.publish("inbox", s.cardView(ctx, r))
 		}
 		v := AgentView{Revision: r.Revision, RequestID: r.ID, Kind: r.Kind, Status: r.Status, SnoozedUntil: r.SnoozedUntil, OwnerNote: r.OwnerNote,
-			Answer: r.Answer, Response: r.Response, ExpiresAt: r.ExpiresAt, GrantsExpire: r.GrantsExpire}
+			Answer: r.Answer, Response: r.Response, Answers: r.Answers, ExpiresAt: r.ExpiresAt, GrantsExpire: r.GrantsExpire}
 		var toks map[string]string
 		if r.Status == StatusApproved {
 			toks, err = s.collectTokens(ctx, r.ID, agentID)
@@ -1065,6 +1135,9 @@ func (s *Service) Status(ctx context.Context, agentID string, ids []string) ([]A
 			v.Tools = append(v.Tools, tv)
 		}
 		v.Next = nextStep(r, len(toks) > 0)
+		if len(r.Answers) > 0 && r.Status != StatusAnswered {
+			v.Next += " Your owner also answered your questions: read answers, keyed by question ID."
+		}
 		out = append(out, v)
 	}
 	return out, nil
@@ -1087,6 +1160,9 @@ func nextStep(r *Request, freshTokens bool) string {
 	case StatusReturned:
 		return "A required tool was refused. Replan, read owner_note, and say what changed in your next request."
 	case StatusAnswered:
+		if len(r.Questions) > 0 {
+			return "Your owner answered. Read answers, keyed by question ID, and carry on."
+		}
 		return "Your owner answered; carry on with that option."
 	case StatusCancelled:
 		return "You cancelled this request."
@@ -1463,8 +1539,15 @@ func ruleSummary(r *Request) string {
 			}
 		}
 		fmt.Fprintf(&b, "%d tool%s, %d required. ", len(r.Tools), plural(len(r.Tools)), req)
+		if n := len(r.Questions); n > 0 {
+			fmt.Fprintf(&b, "%d question%s. ", n, plural(n))
+		}
 	case KindQuestion, KindBlocker:
-		fmt.Fprintf(&b, "A %s with %d options. ", r.Kind, len(r.Options))
+		if len(r.Questions) > 0 {
+			fmt.Fprintf(&b, "A %s with %d question%s. ", r.Kind, len(r.Questions), plural(len(r.Questions)))
+		} else {
+			fmt.Fprintf(&b, "A %s with %d options. ", r.Kind, len(r.Options))
+		}
 	default:
 		b.WriteString("An update. ")
 	}
@@ -1628,11 +1711,17 @@ func (s *Service) insert(ctx context.Context, r *Request) error {
 	if err = s.markUploadsUsedTx(ctx, tx, r); err != nil {
 		return err
 	}
+	refs := r.callbackRefs()
 	if s.opts.Callbacks != nil {
-		if err = s.opts.Callbacks.RegisterTx(ctx, tx, r, r.CallbackRef); err != nil {
-			return err
+		if len(refs) == 0 && r.Kind != KindUpdate {
+			refs = []string{""} // the agent's default receiver, if any
 		}
-	} else if r.CallbackRef != "" {
+		for _, ref := range refs {
+			if err = s.opts.Callbacks.RegisterTx(ctx, tx, r, ref); err != nil {
+				return err
+			}
+		}
+	} else if len(refs) > 0 {
 		return errors.New("callback_ref: callback delivery is not configured")
 	}
 	return tx.Commit()

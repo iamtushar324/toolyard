@@ -43,7 +43,7 @@ func validateVerdicts(r *Request, d Decision) error {
 
 func decisionFingerprint(d Decision) string {
 	// Identity and transient passkey signatures do not change decision content.
-	return hashJSON(struct {
+	base := struct {
 		Action   string
 		Revision int
 		Verdicts map[string]CallVerdict
@@ -51,16 +51,22 @@ func decisionFingerprint(d Decision) string {
 		Note     string
 		Params   map[int]map[string]Constraint
 		TTL      int
-	}{d.Action, d.RequestRevision, d.Verdicts, d.Allow, strings.TrimSpace(d.Note), d.Params, d.TTLSeconds})
+	}{d.Action, d.RequestRevision, d.Verdicts, d.Allow, strings.TrimSpace(d.Note), d.Params, d.TTLSeconds}
+	if len(d.Answers) == 0 {
+		return hashJSON(base)
+	}
+	// Version 3 answers; fingerprints without answers stay as they were.
+	return hashJSON([]any{base, d.Answers})
 }
 
 func (s *Service) recordDecisionAuditTx(ctx context.Context, tx *sql.Tx, r *Request) error {
 	doc, err := json.Marshal(struct {
-		Status  string        `json:"status"`
-		Note    string        `json:"note,omitempty"`
-		Tools   []ToolRequest `json:"calls,omitempty"`
-		Decider any           `json:"decider"`
-	}{r.Status, r.OwnerNote, r.Tools, r.Decider()})
+		Status  string            `json:"status"`
+		Note    string            `json:"note,omitempty"`
+		Tools   []ToolRequest     `json:"calls,omitempty"`
+		Answers map[string]Answer `json:"answers,omitempty"`
+		Decider any               `json:"decider"`
+	}{r.Status, r.OwnerNote, r.Tools, r.Answers, r.Decider()})
 	if err != nil {
 		return err
 	}

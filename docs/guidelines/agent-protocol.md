@@ -23,7 +23,8 @@ How agents are taught this, and why it's layered, is in
    script, and the evidence. Your owner reads it on a phone and often listens
    first.
 4. Run `inbox.request` with `dry_run: true` first. Fix every problem it lists.
-5. Obtain an authorized callback reference before the request when your client supports it.
+5. Obtain an authorized callback reference before the request when your client supports it
+   (`callbacks.register`, or your T3 session webhook; §15).
    Pass `callback_ref`, continue independent work, and retrieve authoritative `inbox.status` after the callback.
    `inbox.wait` remains optional.
 6. For each allowed tool you get a **grant**. Call the tool with
@@ -125,20 +126,26 @@ inbox.request({
 | `task.objective` | yes | The concrete objective this batch advances. |
 | `client_request_id` | no | Stable per-agent retry key; changed content conflicts. |
 | `callback_ref` | no | Opaque registered receiver reference; no credentials. |
+| `callback_refs` | no | Up to 5 more receivers that follow this item. With neither, your default receiver follows it (§15). |
+| `schema_version` | no | `3` to add `questions` (§14). |
+| `questions` | no | With `schema_version: 3`: up to 20 questions your owner answers in the same decision (§14). |
 | `pending_ttl_seconds` | no | Deadline for the human decision. Default 86400 seconds (24 hours); administrator limits apply. |
 | `title` | yes | ≤ 60 characters. Verb + object + target. |
 | `summary` | yes | ≤ 200 characters. The line on the inbox card. |
-| `message` | yes | First person. What you want to do, and the context your owner needs. |
+| `message` | yes | First person. What you want to do, and the context your owner needs. Markdown, ≤ 20,000 characters (§6). |
 | `facts` | yes | `why_now`, `if_it_goes_wrong`, `undo`. Concrete; numbers over adjectives. |
 | `audio.script` | no | Optional audio summary. See §5 for limits. |
 | `urgency` | yes | `now` \| `soon` \| `digest` \| `fyi`. See §7. |
-| `tools` | yes | 1–12 entries. |
-| `attachments` | no | Up to 12. Strongly recommended. |
+| `tools` | yes | 1–12 entries; up to 50 with `schema_version: 3` (§14). |
+| `attachments` | no | Up to 24. Strongly recommended. |
 | `ttl_seconds` | no | How long grants last once approved. Default 1800, max 86400. Ask for the shortest that works. |
 | `session_id` | no | From `session.start`. Attaches task context to related requests. |
 | `request_id` | no | On `inbox.post` updates: the request this update closes. |
 
-For a question, use the version 2 `inbox.ask` contract. Audio is optional.
+For several questions of any type in one item (yes/no, numbers, dates,
+scales, rankings), or for questions next to tool calls, use schema version 3
+(§14). For one simple question, the version 2 `inbox.ask` contract below
+still works. Audio is optional.
 
 ```json
 {
@@ -242,7 +249,7 @@ phone and readable in both themes.
 |---|---|---|
 | `markdown` | `title`, `body` | notes, lists, short explanations |
 | `table` | `title`, `columns`, `rows` | test results, row counts, recipients |
-| `chart` | `title`, `chart` (`line` \| `bar`), `unit`, `x`, `series: [{ name, values }]` | error rates, traffic, anything over time |
+| `chart` | `title`, `chart` (`line` \| `bar` \| `stacked_bar` \| `area` \| `pie` \| `scatter`), `unit`, `x`, `series: [{ name, values }]` | error rates, traffic, shares, correlations |
 | `diff` | `file`, `patch` (unified diff) | the core of a code change; keep it to the part that matters |
 | `code` | `file`, `language`, `body` | a migration, a config change |
 | `log` | `title`, `body` | terminal output, error messages |
@@ -250,6 +257,27 @@ phone and readable in both themes.
 | `video` | `upload` or `url`, `poster_upload?` or `poster_url?` | screen recordings of the thing working (MP4 H.264, ≤ 2 min) |
 | `file` | `upload` or `url`, `name` | CSVs, reports |
 | `link` | `label`, `url` | PRs, CI runs, dashboards |
+
+**Markdown.** `message` and `markdown` attachments render as CommonMark with
+GitHub tables, fenced code blocks, lists, quotes and links. Links work for
+`http`, `https` and `mailto` only. Raw HTML is shown as text, never run. An
+image shows inline only when it cites one of your own image uploads:
+`![Checkout after the fix](upload:<sha256>)` (upload it with `inbox.upload`
+first); any other image source shows as a link.
+
+**Charts.** Every chart has a `title` and 1–6 `series` of up to 500 values;
+`x`, when given, labels each value.
+- `line`, `bar`, `area`: series over `x`.
+- `stacked_bar`: series stacked per `x`; values of 0 or more.
+- `pie`: exactly one series of up to 24 values of 0 or more, with a label in
+  `x` for each slice.
+- `scatter`: `x` holds the numeric x coordinates; each series' values are
+  the y coordinates.
+
+```json
+{ "type": "chart", "title": "Where the 5xx errors come from", "chart": "pie",
+  "x": ["checkout", "search", "login"], "series": [{ "name": "errors", "values": [61, 27, 12] }] }
+```
 
 Every attachment takes an optional **`caption`**: one first-person sentence
 on why it matters ("I replayed a failing delivery. It retried twice and got
@@ -357,7 +385,8 @@ A decision looks like this:
 ```
 
 `status` is one of `pending`, `approved`, `denied`, `returned`, `answered`,
-`cancelled`, `expired`. Always read `next`: it says what to do.
+`cancelled`, `expired`. Always read `next`: it says what to do. When the item
+had questions (§14), `answers` holds your owner's answers keyed by question ID.
 
 - Status reads do not consume grants. The authorized agent can recover the same still-valid unused token after a lost response.
   Recovery adds no use and never extends or replaces permission. Keep tokens out of logs, commits, and callbacks.
@@ -393,7 +422,9 @@ A human submission supplies the Inbox request ID in the URL and this complete co
 }
 ```
 
-Every requested call ID must appear exactly once. No callback is emitted for draft selections or notes.
+Every requested call ID must appear exactly once. An item with questions also
+carries `answers` (keyed by question ID, every required question answered) in
+the same submission. No callback is emitted for draft selections or notes.
 The decision, accepted-call grants, audit, and callback event commit together.
 The same submission ID and content return the saved result. Changed content or a stale revision returns a conflict.
 A competing decision cannot overwrite a committed decision. Drafts remain available after a failed or conflicting submission.
@@ -770,3 +801,155 @@ finishes or is held. Never write `-H "Authorization: Bearer $TOKEN"` or
 a 1 MiB script, 1 MiB of output, and 4 scripts at a time per server (more
 is 429). A run that was running when the server restarted is
 `outcome_unknown`.
+
+## 14. Questions and rich items (schema version 3)
+
+With `"schema_version": 3` one Inbox item can unblock a whole session: up to
+50 tool calls, up to 20 questions of every type, and up to 24 attachments.
+Your owner answers everything in **one** decision; drafts and partial answers
+are never sent to you.
+
+- `inbox.request` with `questions`: tool approvals and questions together.
+- `inbox.ask` with `questions`: questions only. `title`, `summary` and
+  `message` may be left out when there is exactly one question; its prompt
+  stands in.
+- The old single `question` (and version 1 `options`) still work with
+  version 3: they become `questions[0]` with the ID `answer`.
+
+Each question has a stable `id` (1–80 letters, digits, `.`, `:`, `_`, `-`),
+a `type`, a `prompt` (≤ 1000 characters), an optional `help`, `required`
+(default `true`), and an optional `default` (pre-filled) and `recommended`
+(shown as a suggestion, never chosen for your owner). The answer's `value`
+has the question's type:
+
+| type | fields | answer `value` |
+|---|---|---|
+| `free_text` | `min_length`, `max_length` (≤ 10000), `multiline` | a string |
+| `single_choice` | `options` (2–12), `allow_other` | one option ID |
+| `multiple_choice` | `options` (2–12), `min_selections`, `max_selections`, `allow_other` | a list of option IDs |
+| `yes_no` | none | `true` or `false` |
+| `number` | `min`, `max`, `step`, `unit` | a number within the range, a whole number of steps from `min` |
+| `date` | none | `"YYYY-MM-DD"` |
+| `datetime` | none | RFC 3339, e.g. `"2026-10-25T14:30:00+05:30"` |
+| `scale` | `scale` (2–10 points, default 5), `min_label`, `max_label` | a whole number from 1 to `scale` |
+| `ranking` | `options` (2–12) | every option ID, most preferred first |
+
+Options are `{ "id", "label", "detail"?, "exclusive"?, "recommended"? }`. An
+exclusive option is selected alone. With `allow_other`, a choice question
+also accepts a custom text answer instead of a selection.
+
+```json
+inbox.request({
+  "schema_version": 3,
+  "task": {"objective": "Ship billing v2 with the rollout flag disabled."},
+  "title": "Ship billing v2 and pick the rollout",
+  "summary": "2 tools to migrate and deploy, and 3 questions about the rollout.",
+  "message": "PR #218 is approved and **all 42 checks** are green.\n\n| check | result |\n|---|---|\n| unit | 212 passed |\n| e2e | 18 passed |",
+  "facts": {"why_now": "The invoice migration waits on it.", "if_it_goes_wrong": "API only; the flag stays off.", "undo": "I redeploy the current build in about 4 minutes."},
+  "urgency": "soon",
+  "tools": [
+    {"call_id": "migrate", "tool": "db.migrate", "required": true, "summary": "Apply migration 0042.", "target": "Production billing database", "operation": "write",
+     "expected_effects": "Adds the invoices_v2 table.", "affected_scope": "One new table", "material_risks": "A lock on the invoices table for under a second.",
+     "undo": "Drop the new table.", "params": {"env": "prod", "migration": "0042"}},
+    {"call_id": "deploy", "tool": "deploy.run", "required": true, "summary": "Deploy the merge commit.", "target": "Production billing API", "operation": "write",
+     "expected_effects": "The new handler ships behind the flag.", "affected_scope": "The billing API deployment", "material_risks": "A bad build could fail invoice creation.",
+     "undo": "Redeploy the previous release.", "params": {"service": "api", "env": "prod"}}
+  ],
+  "questions": [
+    {"id": "rollout", "type": "single_choice", "prompt": "Which rollout do you want?", "recommended": "staged",
+     "options": [{"id": "staged", "label": "Staged, 10% a day"}, {"id": "all", "label": "Everyone at once"}]},
+    {"id": "notify_team", "type": "yes_no", "prompt": "Shall I post in #billing when it's live?", "default": true},
+    {"id": "start_on", "type": "date", "prompt": "From which day may the rollout start?", "required": false}
+  ]
+})
+```
+
+The answers come back keyed by question ID in `inbox.status`, `inbox.wait`
+and the `inbox.decision` callback:
+
+```json
+{ "request_id": "rq_…", "status": "approved",
+  "answers": {
+    "rollout": {"value": "staged", "labels": ["Staged, 10% a day"]},
+    "notify_team": {"value": true, "labels": ["Yes"], "text": "Tag Priya."}
+  },
+  "tools": [ … ] }
+```
+
+An unanswered optional question is absent. `text` is a custom answer
+(`allow_other`) or a comment. Answers never grant a tool: only accepted
+calls get grants. On a question item the status is `answered`; the legacy
+`answer` string lists every answer as `prompt: answer` lines.
+
+## 15. Callbacks: receivers and events
+
+A callback is toolyard calling you when something you wait on happens, so
+you can end your turn instead of polling. Register a receiver once, then
+name it on the calls that should report to it.
+
+**Register.** `callbacks.register({ "destination": "https://example.com/hooks/toolyard", "events": ["*"], "v3": true, "make_default": true })`
+returns a `callback_ref` (`cb_…`). A receiver gets only the events it asks
+for: `events` lists names, `"<prefix>.*"` or `"*"`; without it, only
+`inbox.decision`, `inbox.expired` and `inbox.cancelled`. `v3: true` accepts
+the schema version 3 decision shape (`answers`, more than 12 calls);
+without it the receiver gets the version 2 shape, and an item with more
+than 12 calls refuses it. Give your own Standard Webhooks `secret`
+(`whsec_` and 24–64 random bytes in Base64), or leave it out and toolyard
+generates one and returns it **once**: store it. Destinations are public
+`https` URLs on port 443 and never change; register a new receiver for a new
+URL. In T3, use your session webhook instead (`t3_session_webhook_create`).
+
+**Use it.** Pass `callback_ref` (and up to 5 `callback_refs`) on
+`inbox.request` or `inbox.ask`; several receivers can follow one item. With
+none, your default receiver (`callbacks.set_default`) follows it. On a call
+that may wait for a legacy approval, add `_callback_ref` to its arguments
+(at most 512 characters). A tool that declares a `_callback_ref` parameter
+of its own keeps it: toolyard then neither reads nor removes the argument.
+If toolyard cannot register the receiver, the deferred answer carries a
+`callback_warning`.
+
+**Manage.** `callbacks.list` (with `callback_ref`: its recent deliveries),
+`callbacks.update` (`disable`, `rotate`, `remove`, with `expected_revision`),
+`callbacks.set_default` (an empty `callback_ref` clears it), and
+`callbacks.test`, which sends a signed `ping` (receivers whose `events`
+include `ping`; one pending ping per receiver, 10 a minute). An agent keeps
+at most 20 receivers.
+
+**Events.** Every event is a JSON envelope
+`{ "type", "event_id", "timestamp", "data" }`, POSTed with the headers
+`webhook-id` (the event ID), `webhook-timestamp` and `webhook-signature`.
+
+| type | when | data |
+|---|---|---|
+| `inbox.decision` | the item is fully answered | `inbox_id`, `status`, every call's `verdict` and `reason`, `overall_note`, `answers`, `status_ref` |
+| `inbox.expired`, `inbox.cancelled` | the item closed without a decision | the same fields |
+| `execution.completed` | a granted call ran | `inbox_id`, `call_id`, `grant_id`, `tool`, `state` (`succeeded`, `failed`, `outcome_unknown`) |
+| `approval.decided` | a legacy deferred approval was decided | `approval_id`, `status`, `tool` |
+| `approval.executed` | its call ran | `approval_id`, `execution_state`, `is_error` |
+| `ping` | `callbacks.test` | `callback_ref`, `message` |
+
+A callback never carries grants, tokens or tool results, and it is not
+permission: read `inbox.status` (or `tools.poll_approval`) before you act.
+
+**Verify every delivery.** Compute HMAC-SHA256 over
+`<webhook-id>.<webhook-timestamp>.<raw body>` with the secret's bytes (the
+Base64 after `whsec_`), and compare it in constant time with the Base64 after
+`v1,` in `webhook-signature`. Refuse a timestamp more than 5 minutes old.
+
+```python
+import base64, hashlib, hmac, time
+
+def verify(secret: str, headers: dict, body: bytes) -> bool:
+    key = base64.b64decode(secret.removeprefix("whsec_"))
+    msg_id, ts = headers["webhook-id"], headers["webhook-timestamp"]
+    if abs(time.time() - int(ts)) > 300:
+        return False
+    mac = hmac.new(key, f"{msg_id}.{ts}.".encode() + body, hashlib.sha256).digest()
+    expected = base64.b64encode(mac).decode()
+    return any(hmac.compare_digest(expected, sig.split(",", 1)[1])
+               for sig in headers["webhook-signature"].split() if sig.startswith("v1,"))
+```
+
+Answer 2xx once you have stored the event. Delivery is at least once:
+deduplicate on `event_id`. Failed deliveries retry after 5 s, 1 min, 5 min,
+30 min, 2 h, 6 h, 12 h and 24 h; `410 Gone` stops them.
