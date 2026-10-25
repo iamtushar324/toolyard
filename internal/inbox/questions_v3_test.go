@@ -2,6 +2,7 @@ package inbox
 
 import (
 	"context"
+	"database/sql"
 	"encoding/json"
 	"errors"
 	"regexp"
@@ -487,5 +488,56 @@ func TestProtocolRichExampleValidates(t *testing.T) {
 	}
 	if _, ok := g.Topic("callbacks"); !ok {
 		t.Fatal("callbacks topic missing")
+	}
+}
+
+// execCallbacks records the execution.completed hook.
+type execCallbacks struct {
+	testCallbacks
+	runs []string
+	fail bool
+}
+
+func (c *execCallbacks) ExecutionTx(ctx context.Context, tx *sql.Tx, e *Execution, agentID, tool string) error {
+	if c.fail {
+		return errors.New("outbox unavailable")
+	}
+	var state string
+	if err := tx.QueryRowContext(ctx, `SELECT state FROM inbox_executions WHERE grant_id=?`, e.GrantID).Scan(&state); err != nil {
+		return err
+	}
+	c.runs = append(c.runs, agentID+"|"+tool+"|"+e.CallID+"|"+e.State+"|"+state)
+	return nil
+}
+
+// A granted call's outcome reaches the callbacks hook inside the
+// transaction that records it; a failed hook records nothing.
+func TestFinishExecutionAnnouncesTheOutcome(t *testing.T) {
+	e := newEnv(t)
+	ctx := context.Background()
+	cb := &execCallbacks{}
+	e.svc.SetCallbacks(cb)
+	r := submitBatch(t, e)
+	if _, err := e.svc.Decide(ctx, r.ID, batchDecision(r, "approved", VerdictAccepted, VerdictRejected)); err != nil {
+		t.Fatal(err)
+	}
+	views, _ := e.svc.Status(ctx, "ag_1", []string{r.ID})
+	g, err := e.svc.Redeem(ctx, views[0].Tools[0].Grant, "ag_1", "db.migrate", map[string]any{"env": "stage", "migration": "0042"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cb.fail = true
+	if err := e.svc.FinishExecution(ctx, g, ExecutionUnknown, nil, "transport failed after dispatch"); err == nil {
+		t.Fatal("an outcome committed without its event")
+	}
+	if ex, _ := e.svc.Execution(ctx, g.ID, "ag_1"); ex.State != ExecutionRunning {
+		t.Fatalf("a failed event left the execution %s", ex.State)
+	}
+	cb.fail = false
+	if err := e.svc.FinishExecution(ctx, g, ExecutionUnknown, nil, "transport failed after dispatch"); err != nil {
+		t.Fatal(err)
+	}
+	if len(cb.runs) != 1 || cb.runs[0] != "ag_1|db.migrate|file_alpha|outcome_unknown|outcome_unknown" {
+		t.Fatalf("execution events: %v", cb.runs)
 	}
 }
