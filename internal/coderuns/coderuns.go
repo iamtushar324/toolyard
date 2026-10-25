@@ -33,6 +33,7 @@ import (
 	"time"
 	"unicode/utf8"
 
+	"github.com/tusharbhardwaj/toolyard/internal/cluster"
 	"github.com/tusharbhardwaj/toolyard/internal/codemode"
 	"github.com/tusharbhardwaj/toolyard/internal/goroutines"
 	"github.com/tusharbhardwaj/toolyard/internal/inbox"
@@ -186,6 +187,10 @@ type Service struct {
 	// released is closed by ReleaseWaiters: waiting Gets answer at once.
 	released    chan struct{}
 	releaseOnce sync.Once
+
+	// cluster names this node when replicas share the database
+	// (SetCluster, lease.go); nil is a single node.
+	cluster *cluster.Cluster
 }
 
 // New returns a Service over db.

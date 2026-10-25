@@ -21,6 +21,7 @@ import (
 	"github.com/tusharbhardwaj/toolyard/internal/gateway"
 	"github.com/tusharbhardwaj/toolyard/internal/identity"
 	"github.com/tusharbhardwaj/toolyard/internal/inbox"
+	"github.com/tusharbhardwaj/toolyard/internal/mcpauth"
 )
 
 // Headers the /mcp ingress reads besides the credential.
@@ -63,30 +64,46 @@ func mcpIngressFrom(ctx context.Context) (mcpIngress, bool) {
 // context as the gateway caller id and the actor.Raiser every audit row,
 // approval and metric below will carry.
 type mcpAuth struct {
-	verify      func(ctx context.Context, token string) (*identity.Agent, error)
-	requireAuth bool
-	sec         api.SecurityOptions
+	verify func(ctx context.Context, token string) (*identity.Agent, error)
+	// verifyOAuth checks an OAuth access token (mcpauth.IsAccessToken);
+	// nil when toolyard is not an authorization server for MCP clients.
+	verifyOAuth func(ctx context.Context, token string) (*identity.Agent, error)
+	// resourceMetadata is the RFC 9728 document a 401 points clients at
+	// (WWW-Authenticate resource_metadata), "" while OAuth is off.
+	resourceMetadata func() string
+	requireAuth      bool
+	sec              api.SecurityOptions
 }
 
 // guard rejects calls that carry a credential we can't verify, so a
 // stale token surfaces as a clear 401 instead of silently falling through
 // to the anonymous bucket. With requireAuth (on when -public-url is set)
 // anonymous traffic is rejected too: the dashboard is exposed publicly so
-// unauthenticated callers have no business calling our tools.
+// unauthenticated callers have no business calling our tools. Every 401
+// names the protected-resource metadata when OAuth is on, which is how an
+// MCP client finds out it can sign the person in.
 func (a mcpAuth) guard(next http.Handler) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		raw, ok := mcpCredential(r)
 		if !ok {
 			if a.requireAuth {
-				writeMCPUnauthorized(w, "toolyard: bearer token required")
+				a.unauthorized(w, false, "toolyard: bearer token required")
 				return
 			}
 			next.ServeHTTP(w, r)
 			return
 		}
-		ag, err := a.verify(r.Context(), raw)
+		verify, oauth := a.verify, false
+		if a.verifyOAuth != nil && mcpauth.IsAccessToken(raw) {
+			verify, oauth = a.verifyOAuth, true
+		}
+		ag, err := verify(r.Context(), raw)
 		if errors.Is(err, identity.ErrAgentTokenInvalid) {
-			writeMCPUnauthorized(w, "toolyard: invalid agent token; re-enroll via the dashboard")
+			msg := "toolyard: invalid agent token; re-enroll via the dashboard"
+			if oauth {
+				msg = "toolyard: the access token is invalid, expired or revoked; sign in again"
+			}
+			a.unauthorized(w, true, msg)
 			return
 		}
 		if err != nil {
@@ -126,6 +143,23 @@ func writeMCPUnauthorized(w http.ResponseWriter, msg string) {
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusUnauthorized)
 	_, _ = w.Write([]byte(`{"jsonrpc":"2.0","error":{"code":-32001,"message":"` + msg + `"}}`))
+}
+
+// unauthorized writes the 401, with WWW-Authenticate pointing at the
+// protected-resource metadata when OAuth is on (MCP authorization, RFC
+// 9728 section 5.1), and error="invalid_token" when a token was presented
+// (RFC 6750 section 3.1). The body stays the JSON-RPC error.
+func (a mcpAuth) unauthorized(w http.ResponseWriter, presented bool, msg string) {
+	if a.resourceMetadata != nil {
+		if prm := a.resourceMetadata(); prm != "" {
+			v := `Bearer resource_metadata="` + prm + `", scope="` + mcpauth.ScopeMCP + `"`
+			if presented {
+				v += `, error="invalid_token"`
+			}
+			w.Header().Set("WWW-Authenticate", v)
+		}
+	}
+	writeMCPUnauthorized(w, msg)
 }
 
 // mcpRaiser is who raised an /mcp call: the verified agent and its owner,

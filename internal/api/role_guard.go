@@ -121,7 +121,17 @@ var memberRoutes = map[string]string{
 	"/v1/agents":        http.MethodGet + " " + http.MethodPost,
 	"/v1/agents/enroll": http.MethodPost,
 	// Which servers and data groups this member may use.
-	"/v1/me/servers":        http.MethodGet,
+	"/v1/me/servers": http.MethodGet,
+	// Connected apps (OAuth clients) and per-agent scopes: the handlers
+	// act only on the member's own apps and agents.
+	"/v1/me/apps":           http.MethodGet,
+	"/v1/me/apps/config":    http.MethodGet,
+	"/v1/me/apps/rename":    http.MethodPost,
+	"/v1/me/apps/scope":     http.MethodPost,
+	"/v1/me/apps/revoke":    http.MethodPost,
+	"/v1/me/apps/catalog":   http.MethodGet,
+	"/v1/me/apps/audit":     http.MethodGet,
+	"/v1/me/agent-scopes":   http.MethodGet + " " + http.MethodPost,
 	"/v1/connections/hosts": http.MethodGet,
 	// The member's own Beknown key: see its status, reveal it once.
 	// Provisioning, rotating and revoking are admin routes under /v1/users/.

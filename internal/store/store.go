@@ -14,6 +14,7 @@ import (
 	"path/filepath"
 	"time"
 
+	"github.com/jackc/pgx/v5"
 	_ "github.com/mattn/go-sqlite3"
 )
 
@@ -31,6 +32,10 @@ type DB struct {
 	Path string
 	// Dialect is the engine: SQLite or Postgres.
 	Dialect Dialect
+
+	// pgConfig is the parsed Postgres connection configuration (nil on
+	// SQLite), for ConnectPostgres.
+	pgConfig *pgx.ConnConfig
 }
 
 // Open opens the SQLite database at path (creating it if missing) and applies

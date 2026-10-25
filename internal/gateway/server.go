@@ -24,6 +24,7 @@ import (
 	"github.com/tusharbhardwaj/toolyard/internal/actor"
 	"github.com/tusharbhardwaj/toolyard/internal/approval"
 	"github.com/tusharbhardwaj/toolyard/internal/audit"
+	"github.com/tusharbhardwaj/toolyard/internal/cluster"
 	"github.com/tusharbhardwaj/toolyard/internal/codemode"
 	"github.com/tusharbhardwaj/toolyard/internal/goroutines"
 	"github.com/tusharbhardwaj/toolyard/internal/inbox"
@@ -146,8 +147,11 @@ type toolEntry struct {
 // Gateway stitches the MCP server, policy, approval bus, memory, and upstream
 // pool into one coordinated unit.
 type Gateway struct {
-	githubHTTP          *http.Client
-	githubWriteMu       sync.Mutex
+	githubHTTP    *http.Client
+	githubWriteMu sync.Mutex
+	// cluster, when it spans several nodes, extends githubWriteMu and the
+	// client cache to every replica (SetCluster, actor.go).
+	cluster             *cluster.Cluster
 	mcp                 *server.MCPServer
 	policy              *policy.Engine
 	approval            *approval.Bus
@@ -444,6 +448,26 @@ const toolsListCacheTTL = time.Minute
 // caller's dashboard user was never granted the tool's group.
 const accessDeniedReason = "access: server not granted"
 
+// agentLimitedReason is the audit reason on a call refused by the agent's
+// own scope (agent_scopes): its owner may use the tool, the agent may not.
+const agentLimitedReason = "access: not allowed for this agent"
+
+// agentLimited reports whether callerID's owner may use entry but the
+// agent's own limits refuse it.
+func (g *Gateway) agentLimited(ctx context.Context, callerID string, entry toolEntry) bool {
+	if g.access == nil {
+		return false
+	}
+	return g.scopeFor(ctx, callerID).LimitedOut(entry.upstream, entry.tool.Name)
+}
+
+// agentLimitedMessage tells an agent plainly that its owner limited it:
+// the owner chose the limit and can see the tool, so nothing is hidden.
+func agentLimitedMessage(toolName string) string {
+	return fmt.Sprintf("tool %q is not allowed for this agent: its owner limited what it may use. "+
+		"The owner can change that on toolyard's Connected apps page.", toolName)
+}
+
 // scopeFor resolves the caller's access scope. Without a resolver every
 // caller has the run of the catalog, exactly as before access existed.
 func (g *Gateway) scopeFor(ctx context.Context, callerID string) access.Scope {
@@ -548,6 +572,9 @@ func (g *Gateway) accessRequestHook(ctx context.Context, _ any, message any) err
 		if g.metrics != nil {
 			g.metrics.Record(ev)
 		}
+		if g.agentLimited(ctx, agentID, entry) {
+			return errors.New(agentLimitedMessage(req.Params.Name))
+		}
 	}
 	// Same text mcp-go uses in handleToolCall for a name it doesn't have.
 	return fmt.Errorf("tool '%s' not found: %w", req.Params.Name, server.ErrToolNotFound)
@@ -556,18 +583,29 @@ func (g *Gateway) accessRequestHook(ctx context.Context, _ any, message any) err
 // denyUngranted answers a call to a tool outside the caller's scope. The
 // agent sees an unknown-tool result; the audit log and metrics record the
 // real reason so an admin can grant the server if that was the intent.
+//
+// A tool the owner may use but the agent's own scope refuses is answered
+// plainly instead (agentLimitedMessage), with its own audit reason.
 func (g *Gateway) denyUngranted(ctx context.Context, entry toolEntry, agentID, approvalID string, ev *metrics.Event) *mcp.CallToolResult {
+	limited := g.agentLimited(ctx, agentID, entry)
+	reason := accessDeniedReason
+	if limited {
+		reason = agentLimitedReason
+	}
 	_ = g.audit.Write(ctx, audit.Event{
 		EventType:    audit.EventCallDenied,
 		AgentID:      agentID,
 		UpstreamName: entry.upstream,
 		ToolName:     entry.tool.Name,
 		Decision:     "deny",
-		Reason:       accessDeniedReason,
+		Reason:       reason,
 		ApprovalID:   approvalID,
 	})
 	ev.Outcome = metrics.OutcomeDenied
 	ev.ErrorClass = "access"
+	if limited {
+		return mcp.NewToolResultError(agentLimitedMessage(entry.tool.Name))
+	}
 	return notFoundResult(entry.tool.Name)
 }
 

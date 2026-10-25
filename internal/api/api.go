@@ -1002,6 +1002,10 @@ func writeAgentActionError(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusConflict, "identity_agent")
 		return
 	}
+	if errors.Is(err, identity.ErrOAuthAgent) {
+		writeError(w, http.StatusConflict, "oauth_agent")
+		return
+	}
 	writeError(w, http.StatusNotFound, err.Error())
 }
 
@@ -1967,15 +1971,25 @@ var (
 	notesGroup     = access.GroupOf("builtin", "notes.publish")
 )
 
-// agentMayUse reports whether the agent's owner may use group. Without an
-// access resolver (single-user installs, tests) every agent may. The scope
-// is the owner's: an admin's agents reach everything, a member's agents
-// only what an admin granted that member.
-func (s *Server) agentMayUse(ctx context.Context, agentID, group string) bool {
+// restTool is the gateway tool a bearer REST route stands in for: the
+// route is allowed exactly when a call to that tool would be.
+type restTool struct{ upstream, name string }
+
+var (
+	mempalaceTool = restTool{mempalace.ToolPrefix, mempalace.DiaryWriteTool}
+	notesTool     = restTool{"builtin", "notes.publish"}
+)
+
+// agentMayUse reports whether the agent may use the tool the route stands
+// in for. Without an access resolver (single-user installs, tests) every
+// agent may. The scope is the owner's (an admin's agents reach
+// everything, a member's agents only what an admin granted that member),
+// narrowed by the agent's own allow and deny lists, tool by tool.
+func (s *Server) agentMayUse(ctx context.Context, agentID string, t restTool) bool {
 	if s.access == nil {
 		return true
 	}
-	return s.access.ScopeFor(ctx, agentID).Allows(group)
+	return s.access.ScopeFor(ctx, agentID).AllowsTool(t.upstream, t.name)
 }
 
 // writeNotGranted is the bearer-route twin of the gateway's per-caller
@@ -2000,7 +2014,7 @@ func (s *Server) mempalaceIngest(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	if !s.agentMayUse(r.Context(), agentID, mempalaceGroup) {
+	if !s.agentMayUse(r.Context(), agentID, mempalaceTool) {
 		writeNotGranted(w)
 		return
 	}
@@ -2097,7 +2111,7 @@ func (s *Server) notesSync(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	if !s.agentMayUse(r.Context(), agentID, notesGroup) {
+	if !s.agentMayUse(r.Context(), agentID, notesTool) {
 		writeNotGranted(w)
 		return
 	}
@@ -2139,7 +2153,7 @@ func (s *Server) notesPublish(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	if !s.agentMayUse(r.Context(), agentID, notesGroup) {
+	if !s.agentMayUse(r.Context(), agentID, notesTool) {
 		writeNotGranted(w)
 		return
 	}

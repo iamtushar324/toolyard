@@ -7,7 +7,6 @@ import (
 	"crypto/elliptic"
 	"crypto/rand"
 	"crypto/x509"
-	"database/sql"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -15,21 +14,36 @@ import (
 	"io"
 	"log"
 	"strings"
+	"sync"
 	"time"
 
 	webpush "github.com/SherClockHolmes/webpush-go"
 	"github.com/google/uuid"
 
+	"github.com/tusharbhardwaj/toolyard/internal/cluster"
 	"github.com/tusharbhardwaj/toolyard/internal/store"
 )
 
 const vapidKeyPurpose = "vapid"
 
 type Service struct {
-	db          *store.DB
-	subject     string
+	db      *store.DB
+	subject string
+
+	// keyMu guards the VAPID keys: a rotation on another replica reloads
+	// them (SetCluster, cluster.go).
+	keyMu       sync.RWMutex
 	vapidPublic string
 	vapidPriv   string
+
+	cluster *cluster.Cluster
+}
+
+// keys returns the current VAPID public and private keys (base64url).
+func (s *Service) keys() (pub, priv string) {
+	s.keyMu.RLock()
+	defer s.keyMu.RUnlock()
+	return s.vapidPublic, s.vapidPriv
 }
 
 // New loads or generates a VAPID keypair stored in server_keys.
@@ -54,7 +68,10 @@ func New(ctx context.Context, db *store.DB, subject string) (*Service, error) {
 	return &Service{db: db, subject: subject, vapidPublic: pub, vapidPriv: priv}, nil
 }
 
-func (s *Service) PublicKey() string { return s.vapidPublic }
+func (s *Service) PublicKey() string {
+	pub, _ := s.keys()
+	return pub
+}
 
 // Subscription is the browser-side PushSubscription payload.
 type Subscription struct {
@@ -168,6 +185,7 @@ func (s *Service) NotifyDetailed(ctx context.Context, userID string, payload any
 		return nil, err
 	}
 	out := make([]SendResult, 0, len(subs))
+	vapidPub, vapidPriv := s.keys()
 	for _, sub := range subs {
 		ws := &webpush.Subscription{
 			Endpoint: sub.Endpoint,
@@ -176,8 +194,8 @@ func (s *Service) NotifyDetailed(ctx context.Context, userID string, payload any
 		res := SendResult{SubscriptionID: sub.ID, Endpoint: sub.Endpoint, UserAgent: sub.UserAgent}
 		resp, err := webpush.SendNotification(body, ws, &webpush.Options{
 			Subscriber:      s.subject,
-			VAPIDPublicKey:  s.vapidPublic,
-			VAPIDPrivateKey: s.vapidPriv,
+			VAPIDPublicKey:  vapidPub,
+			VAPIDPrivateKey: vapidPriv,
 			TTL:             60,
 		})
 		if err != nil {
@@ -254,8 +272,11 @@ func (s *Service) RotateKeys(ctx context.Context) (string, error) {
 	if err := tx.Commit(); err != nil {
 		return "", err
 	}
+	s.keyMu.Lock()
 	s.vapidPublic = pub
 	s.vapidPriv = priv
+	s.keyMu.Unlock()
+	s.publishRotation(ctx)
 	return pub, nil
 }
 
@@ -273,11 +294,12 @@ func (s *Service) JWTPreview(ctx context.Context, userID string) ([]map[string]a
 		return nil, err
 	}
 	out := make([]map[string]any, 0, len(subs))
-	privBytes, err := base64.RawURLEncoding.DecodeString(s.vapidPriv)
+	vapidPub, vapidPriv := s.keys()
+	privBytes, err := base64.RawURLEncoding.DecodeString(vapidPriv)
 	if err != nil {
 		return nil, fmt.Errorf("decode priv: %w", err)
 	}
-	pubBytes, err := base64.RawURLEncoding.DecodeString(s.vapidPublic)
+	pubBytes, err := base64.RawURLEncoding.DecodeString(vapidPub)
 	if err != nil {
 		return nil, fmt.Errorf("decode pub: %w", err)
 	}
@@ -307,7 +329,7 @@ func (s *Service) JWTPreview(ctx context.Context, userID string) ([]map[string]a
 		derivedPub := elliptic.Marshal(curve, px, py)
 		entry["derived_pub_matches_stored"] = bytesEqual(derivedPub, pubBytes)
 		entry["derived_pub_b64"] = base64.RawURLEncoding.EncodeToString(derivedPub)
-		entry["stored_pub_b64"] = s.vapidPublic
+		entry["stored_pub_b64"] = vapidPub
 		out = append(out, entry)
 	}
 	return out, nil
@@ -363,40 +385,29 @@ func (s *Service) Subject() string {
 // loadOrCreateVapid returns base64-url-safe public/private keys for VAPID.
 // Stored as DER in server_keys (purpose='vapid').
 func loadOrCreateVapid(ctx context.Context, db *store.DB) (string, string, error) {
-	var pubB64, privB64 string
-	row := db.QueryRowContext(ctx,
-		`SELECT public_key, private_key FROM server_keys WHERE purpose = ?`, vapidKeyPurpose)
-	var pub, priv []byte
-	err := row.Scan(&pub, &priv)
-	if err == nil {
-		pubB64 = base64.RawURLEncoding.EncodeToString(pub)
-		privB64 = base64.RawURLEncoding.EncodeToString(priv)
-		return pubB64, privB64, nil
-	}
-	if err != sql.ErrNoRows {
-		return "", "", err
-	}
-
-	// generate fresh P-256 keypair
-	priv2, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	// One key pair for every replica, also when two start on a new
+	// database.
+	priv, pub, err := store.LoadOrCreateServerKey(ctx, db, vapidKeyPurpose, func() ([]byte, []byte, error) {
+		// generate fresh P-256 keypair
+		priv2, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+		if err != nil {
+			return nil, nil, err
+		}
+		rawPriv := priv2.D.Bytes()
+		// pad to 32 bytes
+		if len(rawPriv) < 32 {
+			buf := make([]byte, 32)
+			copy(buf[32-len(rawPriv):], rawPriv)
+			rawPriv = buf
+		}
+		rawPub := elliptic.Marshal(elliptic.P256(), priv2.PublicKey.X, priv2.PublicKey.Y) // 65 bytes uncompressed
+		return rawPriv, rawPub, nil
+	})
 	if err != nil {
 		return "", "", err
 	}
-	rawPriv := priv2.D.Bytes()
-	// pad to 32 bytes
-	if len(rawPriv) < 32 {
-		buf := make([]byte, 32)
-		copy(buf[32-len(rawPriv):], rawPriv)
-		rawPriv = buf
-	}
-	rawPub := elliptic.Marshal(elliptic.P256(), priv2.PublicKey.X, priv2.PublicKey.Y) // 65 bytes uncompressed
-	if _, err := db.ExecContext(ctx,
-		`INSERT INTO server_keys(id, purpose, private_key, public_key, created_at) VALUES(?,?,?,?,?)`,
-		"key_"+uuid.NewString(), vapidKeyPurpose, rawPriv, rawPub, time.Now().UnixMilli()); err != nil {
-		return "", "", err
-	}
 	_ = x509.MarshalECPrivateKey // silence unused-import linters; kept for future PEM export
-	return base64.RawURLEncoding.EncodeToString(rawPub), base64.RawURLEncoding.EncodeToString(rawPriv), nil
+	return base64.RawURLEncoding.EncodeToString(pub), base64.RawURLEncoding.EncodeToString(priv), nil
 }
 
 // Notification is the JSON payload pushed to the browser. The dashboard's

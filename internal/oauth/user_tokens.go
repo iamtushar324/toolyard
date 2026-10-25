@@ -71,6 +71,9 @@ type UserTokenRecord struct {
 // (exchange, refresh, disconnect, a 401 mark). The returned func unlocks.
 func (s *Service) lockUser(upstream, userID string) func() {
 	k := userKey(upstream, userID)
+	if unlock, ok := s.lockUserCluster(k); ok {
+		return unlock
+	}
 	s.mu.Lock()
 	m := s.userLocks[k]
 	if m == nil {
@@ -133,12 +136,14 @@ func (s *Service) currentUserBearer(upstream, userID string) string {
 	k := userKey(upstream, userID)
 	s.mu.RLock()
 	v, ok := s.userBearers[k]
+	stale := s.staleBearers[k]
 	s.mu.RUnlock()
-	if !ok {
-		s.cacheUserBearerFromDB(upstream, userID)
-		s.mu.RLock()
-		v, ok = s.userBearers[k]
-		s.mu.RUnlock()
+	if !ok || stale {
+		if s.cacheUserBearerFromDB(upstream, userID) || !ok {
+			s.mu.RLock()
+			v, ok = s.userBearers[k]
+			s.mu.RUnlock()
+		}
 		if !ok {
 			return ""
 		}
@@ -149,9 +154,20 @@ func (s *Service) currentUserBearer(upstream, userID string) string {
 	return ""
 }
 
+// setUserBearer stores a bearer this node just wrote for one person and
+// tells the other replicas to drop their cached copy.
 func (s *Service) setUserBearer(upstream, userID, tok string) {
+	s.storeUserBearer(upstream, userID, tok)
+	s.publishBearer(upstream, userID, false)
+}
+
+// storeUserBearer fills the cache, telling nobody (a read from the
+// database).
+func (s *Service) storeUserBearer(upstream, userID, tok string) {
 	k := userKey(upstream, userID)
 	s.mu.Lock()
+	s.bearerGen[k]++
+	delete(s.staleBearers, k)
 	v := s.userBearers[k]
 	if v == nil {
 		v = &atomic.Value{}
@@ -163,23 +179,55 @@ func (s *Service) setUserBearer(upstream, userID, tok string) {
 
 func (s *Service) dropUserBearer(upstream, userID string) {
 	s.mu.Lock()
-	delete(s.userBearers, userKey(upstream, userID))
+	s.dropUserBearerLocked(userKey(upstream, userID))
 	s.mu.Unlock()
+	s.publishBearer(upstream, userID, false)
 }
 
 // cacheUserBearerFromDB warms the cache for one (upstream, user). A row
 // that is not active (needs_reauth) caches an empty bearer, so the header
 // function sends nothing for it.
-func (s *Service) cacheUserBearerFromDB(upstream, userID string) {
-	tok, err := s.GetUserToken(context.Background(), upstream, userID)
-	if err != nil || tok == nil {
-		return
+// It reports whether it replaced the cached value (see cacheBearerFromDB).
+func (s *Service) cacheUserBearerFromDB(upstream, userID string) bool {
+	k := userKey(upstream, userID)
+	for attempt := 0; attempt < 3; attempt++ {
+		s.mu.RLock()
+		gen := s.bearerGen[k]
+		s.mu.RUnlock()
+		tok, err := s.GetUserToken(context.Background(), upstream, userID)
+		if err != nil {
+			return false
+		}
+		if s.fillUserBearer(k, tok, gen) {
+			return true
+		}
 	}
+	return false
+}
+
+// fillUserBearer is fillBearer for one person's bearer (k is userKey).
+func (s *Service) fillUserBearer(k string, tok *UserTokenRecord, gen uint64) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.bearerGen[k] != gen {
+		return false
+	}
+	delete(s.staleBearers, k)
+	if tok == nil {
+		delete(s.userBearers, k)
+		return true
+	}
+	val := tok.AccessToken
 	if tok.State != StateActive {
-		s.setUserBearer(upstream, userID, "")
-		return
+		val = ""
 	}
-	s.setUserBearer(upstream, userID, tok.AccessToken)
+	v := s.userBearers[k]
+	if v == nil {
+		v = &atomic.Value{}
+		s.userBearers[k] = v
+	}
+	v.Store(val)
+	return true
 }
 
 // ---------------------------------------------------------------------------
@@ -409,7 +457,7 @@ func (s *Service) deleteUserTokens(ctx context.Context, upstream string) error {
 	s.mu.Lock()
 	for k := range s.userBearers {
 		if strings.HasPrefix(k, prefix) {
-			delete(s.userBearers, k)
+			s.dropUserBearerLocked(k)
 		}
 	}
 	s.mu.Unlock()

@@ -173,7 +173,7 @@ function isAdmin() {
   return !!state.user && state.user.role !== 'member';
 }
 
-const MEMBER_ROUTES = ['inbox', 'agents', 'myservers', 'connections'];
+const MEMBER_ROUTES = ['inbox', 'agents', 'myservers', 'connections', 'apps'];
 
 function defaultRoute() {
   return 'inbox';
@@ -603,7 +603,10 @@ async function submitPasswordLogin() {
       Username: $('lg-user').value.trim(),
       Password: $('lg-pass').value,
     }});
-    await refreshUser(); await loadAll(); startStream();
+    await refreshUser();
+    // Back to an MCP client's OAuth consent screen when sign-in started there (apps.js).
+    if (appsResumeOAuth()) return;
+    await loadAll(); startStream();
     navigate(defaultRoute());
   } catch (e) { state.errors.login = e.message; render(); }
   finally { passwordLoginBusy = false; }
@@ -4668,6 +4671,7 @@ function navigate(route) {
   if (route === 'connections') loadConnections(true);
   if (route === 'agents' || route === 'myservers') loadMyKey();
   if (route === 'agents') void loadHostConnections();
+  if (route === 'apps') loadApps();
   render();
 }
 
@@ -4696,9 +4700,10 @@ function shell(content) {
         navBtn('audit', 'Activity', 'activity'),
         el('span', { class: 'nav-label' }, 'Manage'),
         navBtn('agents', 'People & agents', 'people'),
+        navBtn('apps', 'Connected apps', 'key'),
         navBtn('tools', 'Tools', 'tools'),
         navBtn('settings', 'Settings', 'sliders')) : el('nav', { 'aria-label': 'Main navigation' },
-        navBtn('inbox', 'Inbox', 'inbox', inboxBadgeCount()), navBtn('agents', 'Agents', 'people'), navBtn('myservers', 'Available services', 'tools'), navBtn('connections', 'Connections', 'plug')),
+        navBtn('inbox', 'Inbox', 'inbox', inboxBadgeCount()), navBtn('agents', 'Agents', 'people'), navBtn('apps', 'Connected apps', 'key'), navBtn('myservers', 'Available services', 'tools'), navBtn('connections', 'Connections', 'plug')),
       el('div', { class: 'sidebar-footer' }, admin ? renderStreamPill() : null,
         el('div', { class: 'sidebar-account' }, el('span', { class: 'user-chip', title: state.user.email || '' },
           userAvatar(state.user), el('span', { class: 'account-copy' }, userLabel(state.user), el('small', {}, admin ? 'Administrator' : 'Member'))),
@@ -4728,10 +4733,12 @@ function renderMoreSheet() {
       el('h3', {}, 'More'),
       isAdmin() ? [
         item('agents', 'People & agents', 'Manage access and enrolled agents'),
+        item('apps', 'Connected apps', 'Apps added by URL, like ChatGPT and Claude'),
         item('tools', 'Tools', 'Browse tools and review access policies'),
         item('settings', 'Settings', 'Workspace preferences'),
       ] : [
         item('agents',    'Agents',     'Manage your enrolled agents'),
+        item('apps',      'Connected apps', 'Apps added by URL, like ChatGPT and Claude'),
         item('myservers', 'My servers', 'Servers your agents may use'),
         item('connections', 'My connections', 'Sign in to servers that act as you'),
       ],
@@ -4839,6 +4846,7 @@ function render() {
     case 'connections':   body = viewConnections();   break;
     case 'audit':         body = viewAudit();         break;
     case 'agents':        body = viewAgents();        break;
+    case 'apps':          body = viewApps();          break;
     case 'servers':       body = viewConnectionHub();       break;
     case 'policies':      body = viewPolicies();       break;
     case 'tools':         body = viewTools();         break;
@@ -6679,6 +6687,8 @@ Read the full rules with inbox.guide().`;
   // form straight away instead of behind the Google button.
   if (new URLSearchParams(location.search).get('password') === '1') state.showPasswordLogin = true;
   await Promise.all([refreshUser(), loadAuthConfig()]);
+  // Signed in already but sent here from an MCP client's sign-in (apps.js).
+  if (state.user && appsResumeOAuth()) return;
   if (state.user && !isAdmin()) {
     // Members: their agents and granted servers only. No event stream and
     // no admin fetches (they'd all be 403 admin_only).

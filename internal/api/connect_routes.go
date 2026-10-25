@@ -10,6 +10,7 @@ import (
 
 	"github.com/tusharbhardwaj/toolyard/internal/audit"
 	"github.com/tusharbhardwaj/toolyard/internal/clerk"
+	"github.com/tusharbhardwaj/toolyard/internal/cluster"
 	"github.com/tusharbhardwaj/toolyard/internal/identity"
 	"github.com/tusharbhardwaj/toolyard/internal/identitykeys"
 	"github.com/tusharbhardwaj/toolyard/internal/logx"
@@ -335,10 +336,12 @@ func (s *Server) connectAudit(ctx context.Context, at *connectAttempt, decision,
 }
 
 // keyedMutex is one mutex per key, dropped when nobody holds or waits on
-// it.
+// it. With a multi-node cluster (Server.SetCluster) it is a cluster lock
+// per key instead, so two replicas never connect one person at once.
 type keyedMutex struct {
-	mu    sync.Mutex
-	locks map[string]*keyedLock
+	mu      sync.Mutex
+	locks   map[string]*keyedLock
+	cluster *cluster.Cluster
 }
 
 type keyedLock struct {
@@ -348,6 +351,16 @@ type keyedLock struct {
 
 // lock blocks until key is free and returns its unlock.
 func (k *keyedMutex) lock(key string) func() {
+	if k.cluster.MultiNode() {
+		// Bounded: one connect takes a few round trips to Clerk.
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		unlock, err := k.cluster.Lock(ctx, "connect-t3:"+key)
+		cancel()
+		if err == nil {
+			return unlock
+		}
+		logx.For("api").Warn("connect: cluster lock failed; locking in this process only", "err", err.Error())
+	}
 	k.mu.Lock()
 	if k.locks == nil {
 		k.locks = map[string]*keyedLock{}
