@@ -125,7 +125,7 @@ func (s *Service) Record(ctx context.Context, req StartRequest, out Outcome) (*J
 	if n >= s.maxRecorded {
 		return nil, ErrTooManyRecorded
 	}
-	job, err := s.insert(ctx, s.db, req, StatusQueued, 0, now.Add(RecordedRetention).UnixMilli())
+	job, err := s.insert(ctx, s.db, req, StatusQueued, 0, RecordedRetention)
 	if err != nil {
 		return nil, err
 	}
@@ -248,10 +248,14 @@ func (s *Service) checkCaps(ctx context.Context, q store.Querier, req StartReque
 	return nil
 }
 
-// insert writes a new row. expiresAt > 0 marks a recorded task answer
-// (Record), removed then.
-func (s *Service) insert(ctx context.Context, q store.Querier, req StartRequest, status string, startedAt, expiresAt int64) (*Job, error) {
+// insert writes a new row. keepFor > 0 marks a recorded task answer
+// (Record), removed that long after it was created.
+func (s *Service) insert(ctx context.Context, q store.Querier, req StartRequest, status string, startedAt int64, keepFor time.Duration) (*Job, error) {
 	now := s.now().UnixMilli()
+	var expiresAt int64
+	if keepFor > 0 {
+		expiresAt = now + keepFor.Milliseconds()
+	}
 	j := &Job{
 		ID: newJobID(), AgentID: req.AgentID, OwnerUserID: req.OwnerUserID, SessionID: req.SessionID,
 		Tool: req.Tool, Upstream: req.Upstream, ParamsHash: req.ParamsHash, Reason: req.Reason, Via: req.Via,
