@@ -271,3 +271,33 @@ test('rejecting every call does not require the answers',()=>{
   assert.deepEqual(sent[0].verdicts,{deploy:{verdict:'rejected'}});
   assert.deepEqual(sent[0].answers,{});
 });
+
+test('call IDs such as constructor and __proto__ are ordinary keys',()=>{
+  const h=harness();
+  const call=(id)=>({call_id:id,tool:id+'.run',summary:'Run it.',target:'t',expected_effects:'None.',params:{},flags:[]});
+  h.context.req={id:'rq_keys',agent_name:'Agent',kind:'access',status:'pending',revision:1,expires_at:Date.now()+86400000,ttl_seconds:1800,
+    tools:[call('constructor'),call('__proto__'),call('toString')]};
+  h.run('state.inbox.detail.request=req;ibAccessDraft(req);');
+  assert.deepEqual(plain(h.run('state.inbox.allow[req.id]')),[true,true,true]);
+  h.run('ibSelectCalls(req,[true,false,true])');
+  h.run(`const d=ibAccessDraft(req); d.reasons['__proto__']='Not this one.'; ibSaveAccessDraft(req,d);`);
+  assert.deepEqual(plain(h.run('ibAccessDraft(req),state.inbox.allow[req.id]')),[true,false,true]);
+  const body=plain(h.run('ibApproveBody(req,state.inbox.allow[req.id])'));
+  assert.deepEqual(Object.keys(body.verdicts).sort(),['__proto__','constructor','toString']);
+  assert.equal(Object.getOwnPropertyDescriptor(body.verdicts,'__proto__').value.verdict,'rejected');
+  assert.equal(Object.getOwnPropertyDescriptor(body.verdicts,'__proto__').value.reason,'Not this one.');
+  assert.equal(body.verdicts.constructor.verdict,'accepted');
+  // The draft survives a reload with the same keys.
+  const again=harness(h.storage);again.context.req=h.context.req;
+  assert.deepEqual(plain(again.run('ibAccessDraft(req),state.inbox.allow[req.id]')),[true,false,true]);
+});
+
+test('the permissions page switches rich requests, on by default',()=>{
+  const h=harness();
+  h.run('state.settings={};state.inbox.info={};');
+  const find=()=>nodes(h.run('settingsPermissions()'),'input').find(n=>n.attrs.id==='setting-inbox_v3_enabled');
+  assert.ok(find(),'the rich requests switch is on the permissions page');
+  assert.equal(find().attrs.checked,true);
+  h.run('state.settings={inbox_v3_enabled:false};');
+  assert.equal(find().attrs.checked,false);
+});

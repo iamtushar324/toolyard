@@ -84,6 +84,14 @@ type CallbackChecker interface {
 	CheckSubscription(ctx context.Context, agentID, ref string, r *Request) error
 }
 
+// DefaultWarner is implemented by DecisionCallbacks that can say, before
+// an item that names no receiver is stored, why the agent's default
+// receiver will not follow it ("" when it will, or the agent has none).
+// Submit adds the answer as a warning: the item is still stored.
+type DefaultWarner interface {
+	DefaultWarning(ctx context.Context, agentID string, r *Request) string
+}
+
 // ExecutionCallbacks is implemented by DecisionCallbacks that also announce
 // a granted call's outcome (execution.completed). ExecutionTx runs inside
 // the transaction that records the outcome; tool is the call's tool.
@@ -398,6 +406,11 @@ func (s *Service) Submit(ctx context.Context, agentID string, sub *Submission) (
 			if err := checker.CheckSubscription(ctx, agentID, ref, r); err != nil {
 				res.Problems = append(res.Problems, Problem{fmt.Sprintf("callback_refs[%d]", i), err.Error()})
 			}
+		}
+	}
+	if warner, ok := s.opts.Callbacks.(DefaultWarner); ok && len(r.callbackRefs()) == 0 && r.Kind != KindUpdate {
+		if w := warner.DefaultWarning(ctx, agentID, r); w != "" {
+			res.Warnings = append(res.Warnings, Problem{"callback_ref", w})
 		}
 	}
 

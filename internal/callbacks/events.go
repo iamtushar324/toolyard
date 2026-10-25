@@ -264,8 +264,15 @@ func (s *Service) queueTx(ctx context.Context, tx *sql.Tx, q queued) (string, er
 	if q.ignoreDuplicate {
 		query += ` ON CONFLICT DO NOTHING`
 	}
-	if _, err = tx.ExecContext(ctx, query, id, q.subject, q.revision, q.receiver, q.receiverRevision, string(payload), now.UnixMilli(), status, reason, q.eventType, dedupe, now.UnixMilli()); err != nil {
+	res, err := tx.ExecContext(ctx, query, id, q.subject, q.revision, q.receiver, q.receiverRevision, string(payload), now.UnixMilli(), status, reason, q.eventType, dedupe, now.UnixMilli())
+	if err != nil {
 		return "", err
+	}
+	if q.ignoreDuplicate {
+		// A skipped duplicate stored nothing: its id names no event.
+		if n, err := res.RowsAffected(); err != nil || n == 0 {
+			return "", err
+		}
 	}
 	return id, nil
 }
@@ -476,8 +483,10 @@ var ErrPingQuota = fmt.Errorf("at most %d pings a minute; wait, then test again"
 // Test queues a ping for one of the agent's active receivers and returns
 // its event id. The ping is signed and retried like every other event. A
 // receiver has at most one ping pending: a second test returns the pending
-// one. Pings count against the agent's PingsPerMinute quota, kept in the
-// database so every node shares it.
+// one (the partial unique index callback_outbox_one_ping backs this).
+// Pings count against the agent's PingsPerMinute quota, kept in the
+// database so every node shares it; the agent lock makes the check and the
+// insert one step, so concurrent tests never pass the quota together.
 func (s *Service) Test(ctx context.Context, agentID, ref string) (string, error) {
 	rec, err := s.Get(ctx, agentID, ref)
 	if err != nil {
@@ -494,6 +503,9 @@ func (s *Service) Test(ctx context.Context, agentID, ref string) (string, error)
 		return "", err
 	}
 	defer tx.Rollback()
+	if err = s.lockAgentTx(ctx, tx, agentID); err != nil {
+		return "", err
+	}
 	var pending string
 	err = tx.QueryRowContext(ctx, `SELECT id FROM callback_outbox WHERE receiver_id=? AND event_type=? AND status IN ('pending','delivering') ORDER BY created_at LIMIT 1`, ref, EventPing).Scan(&pending)
 	if err == nil {
