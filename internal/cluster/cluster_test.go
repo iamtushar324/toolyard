@@ -19,15 +19,20 @@ func fastOptions(id string) Options {
 	return Options{InstanceID: id, RetryInterval: 50 * time.Millisecond, CheckInterval: 50 * time.Millisecond, ResyncInterval: -1}
 }
 
+// newCluster starts a Cluster that lives until the test ends (New's ctx
+// bounds the helper's life).
 func newCluster(t *testing.T, db *store.DB, opts Options) *Cluster {
 	t.Helper()
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
+	ctx, cancel := context.WithCancel(context.Background())
 	c, err := New(ctx, db, opts)
 	if err != nil {
+		cancel()
 		t.Fatalf("New: %v", err)
 	}
-	t.Cleanup(func() { _ = c.Close() })
+	t.Cleanup(func() {
+		cancel()
+		_ = c.Close()
+	})
 	return c
 }
 
@@ -514,4 +519,127 @@ func TestLockTwoNodes(t *testing.T) {
 		t.Fatalf("node 2 Lock after the commit: %v", err)
 	}
 	unlock3()
+}
+
+func TestPublishLargeAcrossNodes(t *testing.T) {
+	c1, c2, db1, _ := twoNodes(t)
+	big := strings.Repeat("0123456789", 700) // 7000 bytes: over a NOTIFY payload's share
+	got1 := make(chan string, 4)
+	got2 := make(chan string, 4)
+	c1.Subscribe("realtime", func(p string) {
+		if p != Resync {
+			got1 <- p
+		}
+	})
+	c2.Subscribe("realtime", func(p string) {
+		if p != Resync {
+			got2 <- p
+		}
+	})
+	if err := c1.PublishLarge(context.Background(), "realtime", big); err != nil {
+		t.Fatalf("PublishLarge: %v", err)
+	}
+	for name, ch := range map[string]chan string{"node 1 (local)": got1, "node 2": got2} {
+		select {
+		case p := <-ch:
+			if p != big {
+				t.Fatalf("%s got %d bytes, want the %d published", name, len(p), len(big))
+			}
+		case <-time.After(10 * time.Second):
+			t.Fatalf("%s got nothing", name)
+		}
+	}
+	var rows int
+	if err := db1.QueryRowContext(context.Background(), `SELECT count(*) FROM cluster_messages`).Scan(&rows); err != nil || rows != 1 {
+		t.Fatalf("cluster_messages rows %d %v, want 1", rows, err)
+	}
+	// A small payload travels in the NOTIFY itself.
+	if err := c1.PublishLarge(context.Background(), "realtime", "small"); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case p := <-got2:
+		if p != "small" {
+			t.Fatalf("node 2 got %q", p)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("node 2 got nothing")
+	}
+	if err := c1.PublishLarge(context.Background(), "realtime", strings.Repeat("x", MaxLargePayload+1)); err == nil {
+		t.Fatal("published more than 1 MiB")
+	}
+}
+
+func TestPublishLargeSingleNode(t *testing.T) {
+	storetest.SkipUnlessSQLite(t)
+	db := storetest.Open(t)
+	c := newCluster(t, db, fastOptions("solo"))
+	got := make(chan string, 1)
+	c.Subscribe("realtime", func(p string) { got <- p })
+	big := strings.Repeat("y", 5000)
+	if err := c.PublishLarge(context.Background(), "realtime", big); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case p := <-got:
+		if p != big {
+			t.Fatalf("got %d bytes", len(p))
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("no local delivery")
+	}
+}
+
+// The shared counter: a window counts up to max and refuses the rest, a
+// refused request does not count, and the window starts over once it
+// ended. Runs on both engines (the table exists on SQLite too).
+func TestCounter(t *testing.T) {
+	db := storetest.Open(t)
+	k := NewCounter(db)
+	ctx := context.Background()
+	now := time.Unix(1_800_000_000, 0)
+	for i := 0; i < 3; i++ {
+		ok, err := k.Allow(ctx, "login:1.2.3.4", 3, time.Minute, now.Add(time.Duration(i)*time.Second))
+		if err != nil || !ok {
+			t.Fatalf("request %d: %v %v", i+1, ok, err)
+		}
+	}
+	for i := 0; i < 2; i++ {
+		if ok, err := k.Allow(ctx, "login:1.2.3.4", 3, time.Minute, now.Add(10*time.Second)); err != nil || ok {
+			t.Fatalf("over the limit: %v %v", ok, err)
+		}
+	}
+	if ok, err := k.Allow(ctx, "login:5.6.7.8", 3, time.Minute, now.Add(10*time.Second)); err != nil || !ok {
+		t.Fatalf("another bucket: %v %v", ok, err)
+	}
+	// The window began at the first request; it ends a minute later.
+	if ok, err := k.Allow(ctx, "login:1.2.3.4", 3, time.Minute, now.Add(61*time.Second)); err != nil || !ok {
+		t.Fatalf("after the window: %v %v", ok, err)
+	}
+	if err := k.Reset(ctx, "login:5.6.7.8"); err != nil {
+		t.Fatal(err)
+	}
+	if n, err := k.Count(ctx, "login:5.6.7.8"); err != nil || n != 0 {
+		t.Fatalf("after reset: %d %v", n, err)
+	}
+
+	// Add and Count: a window the bucket name fixes.
+	for i := 0; i < 2; i++ {
+		if err := k.Add(ctx, "auto:ag_1:hour", now, now.Add(time.Hour)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if n, err := k.Count(ctx, "auto:ag_1:hour"); err != nil || n != 2 {
+		t.Fatalf("count %d %v, want 2", n, err)
+	}
+	if err := k.Sweep(ctx, now.Add(3*time.Hour)); err != nil {
+		t.Fatal(err)
+	}
+	if n, err := k.Count(ctx, "auto:ag_1:hour"); err != nil || n != 0 {
+		t.Fatalf("after sweep: %d %v", n, err)
+	}
+	var nilCluster *Cluster
+	if nilCluster.Counter() != nil {
+		t.Fatal("a nil Cluster has a shared counter")
+	}
 }

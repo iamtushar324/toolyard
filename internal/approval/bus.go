@@ -33,6 +33,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/tusharbhardwaj/toolyard/internal/actor"
+	"github.com/tusharbhardwaj/toolyard/internal/cluster"
 	"github.com/tusharbhardwaj/toolyard/internal/goroutines"
 	"github.com/tusharbhardwaj/toolyard/internal/logx"
 	"github.com/tusharbhardwaj/toolyard/internal/opsmetrics"
@@ -199,6 +200,10 @@ type Bus struct {
 	released bool
 	// LegacyDecision redirects compatibility writes through the sole Inbox ledger.
 	LegacyDecision func(context.Context, string, string, actor.Decider) (*Request, error)
+
+	// cluster names this node when replicas share the database
+	// (SetCluster, cluster.go); nil is a single node.
+	cluster *cluster.Cluster
 }
 
 // Executor runs an approved tool's actual call after the human (or an
@@ -307,19 +312,43 @@ func (b *Bus) Hold(ctx context.Context, in NewRequest, maxWait time.Duration) (*
 	}
 	timer := time.NewTimer(maxWait)
 	defer timer.Stop()
-
-	select {
-	case <-w.done:
-		return b.Get(ctx, req.ID)
-	case <-timer.C:
-		return b.Get(ctx, req.ID)
-	case <-ctx.Done():
-		return b.Get(ctx, req.ID)
-	case <-b.drainChan():
-		// Shutdown: answer with the request as it stands (usually still
-		// pending, so the caller gets the deferred envelope).
-		return b.Get(ctx, req.ID)
+	// A decision on another node wakes w through the cluster; the poll
+	// re-reads the request in case that message was missed.
+	var poll <-chan time.Time
+	if b.multiNode() {
+		t := time.NewTicker(holdPoll)
+		defer t.Stop()
+		poll = t.C
 	}
+
+	for {
+		select {
+		case <-w.done:
+			return b.Get(ctx, req.ID)
+		case <-poll:
+			if cur, err := b.Get(ctx, req.ID); err == nil && b.settled(cur) {
+				return cur, nil
+			}
+		case <-timer.C:
+			return b.Get(ctx, req.ID)
+		case <-ctx.Done():
+			return b.Get(ctx, req.ID)
+		case <-b.drainChan():
+			// Shutdown: answer with the request as it stands (usually still
+			// pending, so the caller gets the deferred envelope).
+			return b.Get(ctx, req.ID)
+		}
+	}
+}
+
+// settled reports what a local signal would: the request left pending
+// and, when it was allowed with an executor installed, its result is
+// recorded.
+func (b *Bus) settled(r *Request) bool {
+	if r.Status == StatusAllowed && b.exec != nil {
+		return r.ResultExecutedAt > 0
+	}
+	return r.Status != StatusPending
 }
 
 // Watch returns a channel that closes when the given approval's status leaves
@@ -649,8 +678,27 @@ func (b *Bus) decide(ctx context.Context, id, action string, d actor.Decider, ru
 		b.startExecutor(req)
 		return req, nil
 	}
+	if action == StatusAllowed && !runExec {
+		// The caller dispatches this call itself (Hold's auto-approval).
+		// Claim it now, so a recovery sweep (another node's, or this one's
+		// next start) records it outcome_unknown instead of running the
+		// executor for it a second time.
+		b.claimInline(ctx, req)
+	}
 	b.signal(id)
 	return req, nil
+}
+
+// claimInline records the execution claim of a call its caller dispatches
+// in line, held by this node under a lease (RunLeaseRenewal).
+func (b *Bus) claimInline(ctx context.Context, req *Request) {
+	owner, lease := b.claimArgs()
+	if _, err := b.db.ExecContext(context.WithoutCancel(ctx), `INSERT INTO legacy_execution_claims(request_id,state,claimed_at,owner_instance,lease_until) VALUES(?,'running',?,?,?) ON CONFLICT(request_id) DO NOTHING`,
+		req.ID, time.Now().UnixMilli(), owner, lease); err != nil {
+		logx.For("approval").Error("in-line execution claim failed", "approval_id", req.ID, "err", err.Error())
+		return
+	}
+	req.ExecutionState = "running"
 }
 
 // DispatchCommitted releases a legacy decision committed by Inbox.
@@ -690,7 +738,8 @@ func (b *Bus) startExecutor(req *Request) {
 // outcome_unknown result if the executor returns without persisting one.
 func (b *Bus) runExecutor(req *Request) {
 	lg := logx.For("approval")
-	res, err := b.db.ExecContext(b.execCtx, `INSERT INTO legacy_execution_claims(request_id,state,claimed_at) VALUES(?,'running',?) ON CONFLICT(request_id) DO NOTHING`, req.ID, time.Now().UnixMilli())
+	owner, lease := b.claimArgs()
+	res, err := b.db.ExecContext(b.execCtx, `INSERT INTO legacy_execution_claims(request_id,state,claimed_at,owner_instance,lease_until) VALUES(?,'running',?,?,?) ON CONFLICT(request_id) DO NOTHING`, req.ID, time.Now().UnixMilli(), owner, lease)
 	if err != nil {
 		lg.Error("legacy execution claim failed", "approval_id", req.ID, "err", err.Error())
 		return
@@ -856,14 +905,25 @@ func boolInt(b bool) int {
 }
 
 // SweepUnexecuted re-fires the executor for any approval that was
-// allowed but whose result was never persisted. Called once at startup
-// to recover from a crash between "human tapped Allow" and "tool
-// finished writing the result." Safe to call multiple times — the
+// allowed but whose result was never persisted. Called at startup to
+// recover from a crash between "human tapped Allow" and "tool finished
+// writing the result", and periodically on the leader of a multi-node
+// database. Safe to call multiple times and on several nodes: the executor
+// runs only under the execution claim, which one caller wins, and the
 // SetResult UPDATE is gated on result_executed_at IS NULL.
 func (b *Bus) SweepUnexecuted(ctx context.Context) (int, error) {
-	// A persisted claim from the prior process has an uncertain outcome.
-	// An upstream write must never be repeated merely because its receipt is lost.
-	if _, err := b.db.ExecContext(ctx, `UPDATE legacy_execution_claims SET state='outcome_unknown',reason='Process stopped after dispatch claim; do not repeat' WHERE state='running'`); err != nil {
+	// A persisted claim from a stopped process has an uncertain outcome.
+	// An upstream write must never be repeated merely because its receipt
+	// is lost. With a single node every running claim is a stopped
+	// process's; on a multi-node database only a claim whose lease ended
+	// is (a live node renews its own).
+	q := `UPDATE legacy_execution_claims SET state='outcome_unknown',reason='Process stopped after dispatch claim; do not repeat' WHERE state='running'`
+	var args []any
+	if b.multiNode() {
+		q += ` AND (lease_until IS NULL OR lease_until < ?)`
+		args = append(args, time.Now().UnixMilli())
+	}
+	if _, err := b.db.ExecContext(ctx, q, args...); err != nil {
 		return 0, err
 	}
 
@@ -1174,16 +1234,10 @@ func (b *Bus) SweepExpired(ctx context.Context) (int, error) {
 	}
 	n, _ := res.RowsAffected()
 	if n > 0 {
-		// Wake any in-memory waiters so they observe the new status.
-		b.mu.Lock()
-		for _, w := range b.waiters {
-			select {
-			case <-w.done:
-			default:
-				close(w.done)
-			}
-		}
-		b.mu.Unlock()
+		// Wake any waiters, here and on other nodes, so they observe the
+		// new status.
+		b.signalAllLocal()
+		b.publishWake(wakeAll)
 		// Fan out per row so SSE clients remove the expired cards. Re-Get
 		// confirms the row actually expired (vs. a decision that landed in
 		// the gap between our SELECT and the UPDATE).
@@ -1219,10 +1273,20 @@ func (b *Bus) RunSweeper(ctx context.Context, interval time.Duration) {
 	}
 }
 
+// signal wakes the waiters of approval id on every node: this one at
+// once, the others through the cluster.
 func (b *Bus) signal(id string) {
+	b.signalLocal(id)
+	b.publishWake(id)
+}
+
+// signalLocal wakes this node's waiter of approval id.
+// The check and the close happen under b.mu, so a local signal and one
+// from another node never both close the channel.
+func (b *Bus) signalLocal(id string) {
 	b.mu.Lock()
+	defer b.mu.Unlock()
 	w, ok := b.waiters[id]
-	b.mu.Unlock()
 	if !ok {
 		return
 	}
@@ -1341,6 +1405,15 @@ func loadOrCreateSigningKey(ctx context.Context, db *store.DB) (ed25519.PrivateK
 		`INSERT INTO server_keys(id, purpose, private_key, public_key, created_at) VALUES(?,?,?,?,?)`,
 		"key_"+uuid.NewString(), signingKeyPurpose, []byte(privKey), []byte(pubKey),
 		time.Now().UnixMilli()); err != nil {
+		if store.IsUniqueViolation(err) {
+			// Another replica starting on the same new database stored
+			// its key first: every node must sign with that one.
+			if err := db.QueryRowContext(ctx,
+				`SELECT private_key, public_key FROM server_keys WHERE purpose = ?`, signingKeyPurpose).Scan(&priv, &pub); err != nil {
+				return nil, nil, err
+			}
+			return ed25519.PrivateKey(priv), ed25519.PublicKey(pub), nil
+		}
 		return nil, nil, err
 	}
 	return privKey, pubKey, nil

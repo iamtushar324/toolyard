@@ -1,14 +1,18 @@
 package api
 
 import (
+	"context"
 	"net"
 	"net/http"
 	"net/url"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
+	"github.com/tusharbhardwaj/toolyard/internal/cluster"
 	"github.com/tusharbhardwaj/toolyard/internal/inbox"
+	"github.com/tusharbhardwaj/toolyard/internal/logx"
 )
 
 // SecurityOptions tunes the public-host hardening middleware.
@@ -623,13 +627,72 @@ func unauthRouteLimit(path string) *unauthRouteRule {
 }
 
 // loginThrottle is a token-bucket per (ip, username) for /v1/auth/login.
-// 5 attempts per 15 minutes per source. Cheap, in-process — sufficient for a
-// single-instance gateway. Distributed deployments would swap for Redis.
+// 5 attempts per 15 minutes per source. In process on a single gateway;
+// with several replicas on one Postgres database (SetCluster) it counts in
+// the database, so the budget holds across replicas, and falls back to
+// the in-process count while the database cannot answer.
 type loginThrottle struct {
 	mu      sync.Mutex
 	buckets map[string]*throttleBucket
 	max     int
 	window  time.Duration
+
+	// shared, when set, is the database counter every replica uses; name
+	// prefixes this throttle's buckets there.
+	shared atomic.Pointer[cluster.Counter]
+	name   string
+}
+
+// sharedLimitTimeout bounds one shared rate-limit query: the limits run
+// on the request path.
+const sharedLimitTimeout = 2 * time.Second
+
+// sharedLimitFailing is set while shared rate-limit queries fail, so the
+// failure is logged once, not on every request.
+var sharedLimitFailing atomic.Bool
+
+// SetCluster makes the rate limits (login, unauthenticated routes,
+// connect-t3) and the connect-t3 per-person lock hold across every replica
+// of a multi-node database. Call it once, after New and before serving.
+// Without a multi-node cluster nothing changes.
+func (s *Server) SetCluster(c *cluster.Cluster) {
+	if !c.MultiNode() {
+		return
+	}
+	k := c.Counter()
+	s.loginLimit.share(k, "login")
+	s.unauthLimit.share(k, "unauth")
+	if s.connect != nil {
+		s.connect.locks.cluster = c
+	}
+}
+
+// share makes the throttle count in k under name.
+func (t *loginThrottle) share(k *cluster.Counter, name string) {
+	t.mu.Lock()
+	t.name = name
+	t.mu.Unlock()
+	t.shared.Store(k)
+}
+
+// sharedAllow asks the shared counter; ok is false when there is none or
+// it failed, and the in-process count decides.
+func (t *loginThrottle) sharedAllow(key string, max int, window time.Duration) (allowed, ok bool) {
+	k := t.shared.Load()
+	if k == nil {
+		return false, false
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), sharedLimitTimeout)
+	defer cancel()
+	allowed, err := k.Allow(ctx, t.name+":"+key, max, window, time.Now())
+	if err != nil {
+		if !sharedLimitFailing.Swap(true) {
+			logx.For("api").Warn("rate limit: the shared counter failed; counting in this process until it answers", "err", err.Error())
+		}
+		return false, false
+	}
+	sharedLimitFailing.Store(false)
+	return allowed, true
 }
 
 type throttleBucket struct {
@@ -654,6 +717,9 @@ func (t *loginThrottle) Allow(key string) bool {
 // AllowN is the variant for callers that want to specify max + window per
 // call (e.g. different rate limits per route from one shared bucket store).
 func (t *loginThrottle) AllowN(key string, max int, window time.Duration) bool {
+	if allowed, ok := t.sharedAllow(key, max, window); ok {
+		return allowed
+	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	b := t.buckets[key]
@@ -672,6 +738,11 @@ func (t *loginThrottle) AllowN(key string, max int, window time.Duration) bool {
 // Reset clears the bucket for a key — call after a successful login so a
 // momentarily-locked-out user can keep working.
 func (t *loginThrottle) Reset(key string) {
+	if k := t.shared.Load(); k != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), sharedLimitTimeout)
+		_ = k.Reset(ctx, t.name+":"+key)
+		cancel()
+	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	delete(t.buckets, key)
@@ -680,6 +751,11 @@ func (t *loginThrottle) Reset(key string) {
 // Sweep drops stale buckets so the map doesn't grow unbounded. Cheap;
 // callers should run it from a goroutine every minute or so.
 func (t *loginThrottle) Sweep() {
+	if k := t.shared.Load(); k != nil {
+		ctx, cancel := context.WithTimeout(context.Background(), sharedLimitTimeout)
+		_ = k.Sweep(ctx, time.Now())
+		cancel()
+	}
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	now := time.Now()

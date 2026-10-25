@@ -71,6 +71,9 @@ type UserTokenRecord struct {
 // (exchange, refresh, disconnect, a 401 mark). The returned func unlocks.
 func (s *Service) lockUser(upstream, userID string) func() {
 	k := userKey(upstream, userID)
+	if unlock, ok := s.lockUserCluster(k); ok {
+		return unlock
+	}
 	s.mu.Lock()
 	m := s.userLocks[k]
 	if m == nil {
@@ -149,7 +152,16 @@ func (s *Service) currentUserBearer(upstream, userID string) string {
 	return ""
 }
 
+// setUserBearer stores a bearer this node just wrote for one person and
+// tells the other replicas to drop their cached copy.
 func (s *Service) setUserBearer(upstream, userID, tok string) {
+	s.storeUserBearer(upstream, userID, tok)
+	s.publishBearer(upstream, userID, false)
+}
+
+// storeUserBearer fills the cache, telling nobody (a read from the
+// database).
+func (s *Service) storeUserBearer(upstream, userID, tok string) {
 	k := userKey(upstream, userID)
 	s.mu.Lock()
 	v := s.userBearers[k]
@@ -165,6 +177,7 @@ func (s *Service) dropUserBearer(upstream, userID string) {
 	s.mu.Lock()
 	delete(s.userBearers, userKey(upstream, userID))
 	s.mu.Unlock()
+	s.publishBearer(upstream, userID, false)
 }
 
 // cacheUserBearerFromDB warms the cache for one (upstream, user). A row
@@ -176,10 +189,10 @@ func (s *Service) cacheUserBearerFromDB(upstream, userID string) {
 		return
 	}
 	if tok.State != StateActive {
-		s.setUserBearer(upstream, userID, "")
+		s.storeUserBearer(upstream, userID, "")
 		return
 	}
-	s.setUserBearer(upstream, userID, tok.AccessToken)
+	s.storeUserBearer(upstream, userID, tok.AccessToken)
 }
 
 // ---------------------------------------------------------------------------

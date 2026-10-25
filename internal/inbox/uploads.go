@@ -438,8 +438,11 @@ func (s *Service) CompleteUpload(ctx context.Context, p *PendingUpload, contentT
 	if err != nil {
 		return nil, err
 	}
-	s.uploadMu.Lock()
-	defer s.uploadMu.Unlock()
+	unlock, err := s.lockBlob(ctx, p.SHA256)
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
 	created, err := blobs.Adopt(ctx, tmpPath, p.SHA256)
 	adopted = true // Adopt consumed (or removed) the temporary file
 	created = created || prepared
@@ -694,10 +697,15 @@ func (s *Service) sweepUploads(ctx context.Context) {
 }
 
 // sweepUploadLocked runs one sweep deletion and its byte removal under
-// uploadMu, so no upload of the same sha can adopt a file in between.
+// the blob's lock (lockBlob), so no upload of the same sha can adopt a
+// file in between, on this node or another.
 func (s *Service) sweepUploadLocked(ctx context.Context, sha, agent string, cutoff, touchCutoff int64) {
-	s.uploadMu.Lock()
-	defer s.uploadMu.Unlock()
+	unlock, err := s.lockBlob(ctx, sha)
+	if err != nil {
+		log.Printf("inbox: sweep upload %s: %v", sha[:12], err)
+		return
+	}
+	defer unlock()
 	dropBytes, err := s.sweepOneUpload(ctx, sha, agent, cutoff, touchCutoff)
 	if err != nil {
 		log.Printf("inbox: sweep upload %s: %v", sha[:12], err)

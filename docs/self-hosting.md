@@ -264,7 +264,9 @@ handled.
 - `tools/list` answers 2026-07-28 clients with `cacheScope: private`
   (each caller sees its own catalog) and `ttlMs: 60000`.
 - An earlier client initializes as before; `-stateless-mcp` still applies
-  to it.
+  to it. Its session lives in one replica's memory: with several replicas
+  use `-stateless-mcp` or sticky routing (see [Several replicas on one
+  database](#several-replicas-on-one-database)).
 - A 2026-07-28 notification stream (`subscriptions/listen`, a long-lived
   `POST`) drains like a `GET` stream (see *Shutdown and drain*).
 - Without `-public-url`, a request on a loopback address must carry a
@@ -549,9 +551,11 @@ directory, in WAL mode, with one connection. That suits a single server,
 development and tests, and it needs no setup.
 
 toolyard can use Postgres 16 instead (Amazon Aurora PostgreSQL works too),
-with a connection pool. Run one toolyard process per database: several
-replicas on one database are not supported yet. Our own production server
-still runs SQLite until its planned move to Postgres.
+with a connection pool. On Postgres, two or more replicas may share one
+database (see [Several replicas on one
+database](#several-replicas-on-one-database)). On SQLite run exactly one
+toolyard process per database. Our own production server still runs
+SQLite until its planned move to Postgres.
 
 ### How toolyard picks the database
 
@@ -604,9 +608,11 @@ must be able to create tables in the database (owning it is enough).
 ### Connection pool
 
 `-db-max-conns` (default 10) is the most connections `serve` opens to
-Postgres. Keep the server's `max_connections` above the total of every
-process that connects. SQLite always uses one connection, and the flag
-does nothing there.
+Postgres. Each replica also keeps two connections of its own outside the
+pool (leader leases and cluster messages). Keep the server's
+`max_connections` above the total of every process that connects:
+replicas × (`-db-max-conns` + 2), plus your own tools. SQLite always uses
+one connection, and the flag does nothing there.
 
 ### What else changes on Postgres
 
@@ -625,6 +631,84 @@ does nothing there.
   target empty. `verify` only reads. Both refuse a source that looks in
   use, and check again before they finish. Never start a gateway on a copy
   of production data: it would refresh real OAuth tokens.
+
+### Several replicas on one database
+
+On Postgres you can run two or more toolyard replicas behind one load
+balancer, all on one database, and replace them one at a time (a rolling
+update). They share every row: a decision, a policy, a setting, a token or
+a server saved on one replica is in force on the others within moments.
+SQLite stays single-replica.
+
+Every replica must have the same configuration and the same keys
+(identity, OAuth, secrets and session keys from the same credentials), and
+run the same binary except during an update. Run the migrations once per
+deploy (`toolyard db migrate`, with `-migrate=off` on the replicas) or let
+the replicas migrate at start: migrations run under an advisory lock.
+
+How the replicas share the work:
+
+- **One replica at a time** runs each background job that must not run
+  twice: the approval and Inbox sweepers, the Inbox attention loop
+  (pushes, reminders, digests), the legacy Inbox sync, the OAuth token
+  refresher, the Clerk membership sync, the session purge, the retention
+  compactor, the auto-approval proposer, the anomaly detector and reason
+  scorer, the events pollers and retention, the Telegram poller and chat
+  reconciler, the memory-webhook worker, the notes and skills scanners,
+  the retry of failed identity-key removals, and the recovery of stopped
+  replicas' work. Each holds a Postgres advisory lock (a leader lease); when
+  that replica stops or loses its database session, another takes the job
+  within about five seconds.
+- **Every replica** runs what belongs to it: its own upstream connections
+  (the live pool, the idle sweep and the catalog refresh of its own
+  connections), its own code-mode script workers, the requests it serves
+  (MCP over stateless requests, REST, dashboard streams), its price list,
+  and the callback deliveries (each delivery is claimed in the database
+  first).
+- **Work that outlives a request** (an Inbox execution of a granted call, a
+  legacy execution, a code run over REST, a memory-webhook job) names the
+  replica that runs it and holds a lease that replica renews every 15
+  seconds. A replica that starts, or the leader every 30 seconds, settles
+  only work whose lease ended (60 seconds without a renewal): a granted
+  call becomes `outcome_unknown`, never runs twice, and a restarting
+  replica never touches the live work of another. On a single replica the
+  start settles everything it finds, as before.
+- **Caches** (policies, settings, auto-approval rules, OAuth bearers, the
+  upstream servers, MCP client names) are refreshed on every replica when
+  one replica writes; replicas send each other these signals with
+  Postgres `LISTEN`/`NOTIFY`, and every replica reloads every 30 seconds in
+  case a signal was missed.
+- **Waits** (`inbox.wait`, `tools.wait_for_approval`, an in-line approval
+  hold) wake on a decision made on any replica, and re-read the database
+  every 2 seconds as a fallback. Dashboard live events reach a dashboard
+  connected to any replica.
+- **Limits and locks** that guarded one process now hold across replicas:
+  the login and unauthenticated-route rate limits, the connect-t3 limits
+  and per-person lock, the auto-approval budget per agent, Inbox
+  submissions per agent, policy writes, OAuth refreshes, federation
+  connection writes and personal GitHub writes. Passkey ceremonies live in
+  the database, so a confirmation started on one replica finishes on
+  another.
+
+Things to set:
+
+- **MCP sessions.** A 2026-07-28 client has no session and works with any
+  replica. An earlier client opens a session (`Mcp-Session-Id`) that lives
+  in one replica's memory: with several replicas run `-stateless-mcp`, or
+  make the load balancer send each session to one replica (sticky routing
+  on the `Mcp-Session-Id` header).
+- **`-instance-id`** names the replica in leases and logs (for example the
+  pod name: `TOOLYARD_INSTANCE_ID` from the Kubernetes downward API).
+  Without it each start picks `<hostname>-<random>`.
+- **Files under `-data`** are per replica: crash dumps, the price list
+  cache, and the notes, skills and MemPalace stores. With several
+  replicas, put notes, skills and MemPalace on a shared volume or turn
+  them off (`-notes=off -skills=off -mempalace=off`); keys come from the
+  shared credentials, not from `-data`.
+- **Updates** may overlap: run a rolling update (Kubernetes
+  `RollingUpdate` with `maxUnavailable: 0`, Swarm `update_config.order:
+  start-first`). Draining replicas finish or hand over their work as
+  described in [Shutdown and drain](#shutdown-and-drain).
 
 ## Keys and credentials
 
@@ -1004,10 +1088,13 @@ exits 0; config errors exit 78.
 - Give the container 75 s to stop (`stop_grace_period: 75s`,
   `terminationGracePeriodSeconds: 75`); see [Shutdown and
   drain](#shutdown-and-drain).
-- Never run two gateways on one database, not even for a moment during an
-  update: use Swarm `update_config.order: stop-first` (and the same for
-  `rollback_config`), or Kubernetes `strategy: Recreate`. Each deploy then
-  has a short outage.
+- On SQLite, never run two gateways on one database, not even for a moment
+  during an update: use Swarm `update_config.order: stop-first` (and the
+  same for `rollback_config`), or Kubernetes `strategy: Recreate`. Each
+  deploy then has a short outage.
+- On Postgres, replicas may overlap: use a rolling update (Swarm
+  `start-first`, Kubernetes `RollingUpdate` with `maxUnavailable: 0`). See
+  [Several replicas on one database](#several-replicas-on-one-database).
 - A key or configuration error exits 78 and a restart does not fix it:
   limit restarts (Swarm `restart_policy.max_attempts`) and read the logs.
 

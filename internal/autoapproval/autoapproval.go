@@ -41,6 +41,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/tusharbhardwaj/toolyard/internal/approval"
+	"github.com/tusharbhardwaj/toolyard/internal/cluster"
 	"github.com/tusharbhardwaj/toolyard/internal/metrics"
 	"github.com/tusharbhardwaj/toolyard/internal/settings"
 	"github.com/tusharbhardwaj/toolyard/internal/store"
@@ -102,6 +103,12 @@ type Service struct {
 
 	rateMu      sync.Mutex
 	rateBuckets map[string]*rateBucket // agent -> bucket
+
+	// cluster, when it spans several nodes, carries rule changes to the
+	// other replicas and counts the per-agent budget in the database
+	// (SetCluster, cluster.go).
+	cluster *cluster.Cluster
+	shared  *cluster.Counter
 }
 
 type rateBucket struct {
@@ -236,6 +243,9 @@ func (s *Service) allowedByRate(agentID string) bool {
 		return true
 	}
 	now := time.Now()
+	if n, ok := s.sharedRate(agentID, now); ok {
+		return n < cap
+	}
 	hourStart := now.Truncate(time.Hour).UnixMilli()
 	s.rateMu.Lock()
 	defer s.rateMu.Unlock()
@@ -265,6 +275,9 @@ func (s *Service) MarkHit(ctx context.Context, ruleID, agentID string) {
 	}
 	s.mu.Unlock()
 
+	if s.addSharedRate(ctx, agentID, time.Now()) {
+		return
+	}
 	hourStart := time.Now().Truncate(time.Hour).UnixMilli()
 	s.rateMu.Lock()
 	b := s.rateBuckets[agentID]
@@ -302,7 +315,7 @@ func (s *Service) MarkDenial(ctx context.Context, agentID, toolName, fingerprint
         WHERE kind = 'pattern' AND fingerprint = ?
           AND (agent_id IS NULL OR agent_id = '' OR agent_id = ?)`,
 		fingerprint, agentID)
-	if err := s.reload(ctx); err != nil {
+	if err := s.reloadChanged(ctx); err != nil {
 		log.Printf("autoapproval: reload after denial: %v", err)
 	}
 }
@@ -345,7 +358,7 @@ func (s *Service) CreateOrUpdate(ctx context.Context, r Rule) (*Rule, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := s.reload(ctx); err != nil {
+	if err := s.reloadChanged(ctx); err != nil {
 		return nil, err
 	}
 	return &r, nil
@@ -360,7 +373,7 @@ func (s *Service) Enable(ctx context.Context, id, by string) error {
         WHERE id = ?`, nullStr(by), id); err != nil {
 		return err
 	}
-	return s.reload(ctx)
+	return s.reloadChanged(ctx)
 }
 
 // Disable flips enabled to 0 — used for "revoke" and "dismiss".
@@ -369,7 +382,7 @@ func (s *Service) Disable(ctx context.Context, id string) error {
         SET enabled = 0 WHERE id = ?`, id); err != nil {
 		return err
 	}
-	return s.reload(ctx)
+	return s.reloadChanged(ctx)
 }
 
 // Delete removes the row entirely; used for "dismiss forever" on suggested.
@@ -377,7 +390,7 @@ func (s *Service) Delete(ctx context.Context, id string) error {
 	if _, err := s.db.ExecContext(ctx, `DELETE FROM auto_approval_rules WHERE id = ?`, id); err != nil {
 		return err
 	}
-	return s.reload(ctx)
+	return s.reloadChanged(ctx)
 }
 
 // List returns every rule, regardless of enabled state. The dashboard splits
@@ -614,7 +627,7 @@ func (s *Service) SetToolPolicyBy(ctx context.Context, toolName string, autoAppr
 		toolName); err != nil {
 		return err
 	}
-	return s.reload(ctx)
+	return s.reloadChanged(ctx)
 }
 
 // ToolPolicies returns the set of tools that currently have an enabled

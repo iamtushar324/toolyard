@@ -25,6 +25,7 @@ import (
 
 	"github.com/tusharbhardwaj/toolyard/internal/actor"
 	"github.com/tusharbhardwaj/toolyard/internal/approval"
+	"github.com/tusharbhardwaj/toolyard/internal/cluster"
 	"github.com/tusharbhardwaj/toolyard/internal/metrics"
 )
 
@@ -133,6 +134,12 @@ func (g *Gateway) rememberClient(ctx context.Context, _ any, req *mcp.Initialize
 		mcpSession = cs.SessionID()
 	}
 	key := clientKey(agentID, actor.Clean(mcpSession), ingress.ClientSessionID)
+	g.storeClient(key, ci)
+	g.publishClient(key, ci)
+}
+
+// storeClient caches one client's clientInfo.
+func (g *Gateway) storeClient(key string, ci clientInfo) {
 	g.clientMu.Lock()
 	if g.clients == nil || len(g.clients) >= maxClientCache {
 		g.clients = map[string]clientInfo{}
@@ -315,6 +322,12 @@ func (g *Gateway) sessionAgent(ctx context.Context, sid string) (string, bool) {
 		e.agentID = ss.AgentID
 		g.inbox.HeartbeatSession(ctx, sid)
 	}
+	if e.agentID == "" && g.cluster.MultiNode() {
+		// A session's owner never changes, but another replica may create
+		// the session a moment from now: with several replicas only a
+		// session that exists is cached.
+		return "", false
+	}
 	g.sessionMu.Lock()
 	if g.sessions == nil {
 		g.sessions = map[string]sessionOwner{}
@@ -404,4 +417,67 @@ type clientCache struct {
 type sessionCache struct {
 	sessionMu sync.Mutex
 	sessions  map[string]sessionOwner
+}
+
+// ---- high availability (TEC-1630) -------------------------------------------
+
+// clientTopic carries clientMsg: a client named itself at initialize on
+// another replica.
+const clientTopic = "gateway-client"
+
+// clientMsg is one clientInfo cache entry, published by the replica that
+// received the initialize.
+type clientMsg struct {
+	Instance string `json:"n"`
+	Key      string `json:"k"`
+	Name     string `json:"c"`
+}
+
+// SetCluster connects the gateway to the other replicas: a clientInfo one
+// replica learns at initialize reaches every replica's cache (so a call
+// that lands on another replica still names its client), the session
+// cache keeps no negative entries, and the GitHub write section is
+// serialized across replicas. Call it once, at startup. Without a
+// multi-node cluster the gateway works as before.
+func (g *Gateway) SetCluster(c *cluster.Cluster) {
+	g.cluster = c
+	if !c.MultiNode() {
+		return
+	}
+	c.Subscribe(clientTopic, func(payload string) {
+		var m clientMsg
+		if payload == cluster.Resync || json.Unmarshal([]byte(payload), &m) != nil || m.Instance == c.InstanceID() || m.Key == "" {
+			return
+		}
+		name := actor.Clean(m.Name)
+		if name == "" {
+			return
+		}
+		g.storeClient(m.Key, clientInfo{name: name, kind: ClientKindOf(name)})
+	})
+}
+
+// publishClient sends one clientInfo cache entry to the other replicas.
+func (g *Gateway) publishClient(key string, ci clientInfo) {
+	if !g.cluster.MultiNode() {
+		return
+	}
+	body, err := json.Marshal(clientMsg{Instance: g.cluster.InstanceID(), Key: key, Name: ci.name})
+	if err != nil || len(body) > cluster.MaxPayload {
+		return
+	}
+	if err := g.cluster.Publish(context.Background(), clientTopic, string(body)); err != nil {
+		log.Printf("gateway: sharing a client name with other nodes failed: %v", err)
+	}
+}
+
+// lockGitHubWrite serializes the reconcile-then-create section of the
+// personal GitHub write tools: githubWriteMu, and on a multi-node database
+// a cluster lock, so two replicas never both find no marker and post.
+func (g *Gateway) lockGitHubWrite(ctx context.Context) (func(), error) {
+	if !g.cluster.MultiNode() {
+		g.githubWriteMu.Lock()
+		return g.githubWriteMu.Unlock, nil
+	}
+	return g.cluster.Lock(ctx, "github-write")
 }

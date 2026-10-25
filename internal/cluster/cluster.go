@@ -24,7 +24,6 @@ package cluster
 import (
 	"context"
 	"crypto/rand"
-	"database/sql/driver"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -54,6 +53,9 @@ const (
 	MaxPayload = 1024
 	// MaxTopic is the longest topic name, in bytes.
 	MaxTopic = 64
+	// MaxLargePayload is the largest payload PublishLarge accepts, in
+	// bytes.
+	MaxLargePayload = 1 << 20
 
 	// DefaultRetryInterval is how often a node that does not hold a leader
 	// lease tries to take it.
@@ -65,6 +67,15 @@ const (
 	// Postgres.
 	DefaultResyncInterval = 30 * time.Second
 
+	// WorkLease is how long a row a node executes (an Inbox execution, a
+	// legacy execution claim, a code run, a memory-webhook job) stays
+	// claimed without a renewal. Recovery takes a row only once its lease
+	// ended.
+	WorkLease = 60 * time.Second
+	// WorkLeaseRenew is how often a node renews the leases of the work it
+	// runs.
+	WorkLeaseRenew = 15 * time.Second
+
 	// channel is the one LISTEN/NOTIFY channel every node uses.
 	channel = "toolyard_cluster"
 	// queueSize bounds the delivery queue; a full queue drops the message
@@ -72,6 +83,8 @@ const (
 	queueSize = 1024
 	// queryTimeout bounds each query on a dedicated connection.
 	queryTimeout = 10 * time.Second
+	// largeKeep is how long a PublishLarge row stays in cluster_messages.
+	largeKeep = 5 * time.Minute
 )
 
 var (
@@ -131,6 +144,9 @@ type Cluster struct {
 	nextSub uint64
 	queue   chan delivery
 	dropped atomic.Bool
+	// lastPrune is when PublishLarge last deleted old cluster_messages
+	// rows (Unix milliseconds).
+	lastPrune atomic.Int64
 
 	// listenConn is the LISTEN connection, for tests that cut it.
 	listenMu   sync.Mutex
@@ -146,18 +162,23 @@ type lease struct {
 	cancel context.CancelFunc
 }
 
-// delivery is one queued message, or a Resync for every subscriber.
+// delivery is one queued message, or a Resync for every subscriber. A
+// message stored by PublishLarge on another node arrives as ref, the
+// cluster_messages row to read.
 type delivery struct {
 	topic   string
 	payload string
+	ref     string
 	resync  bool
 }
 
-// wireMsg is a message as NOTIFY carries it.
+// wireMsg is a message as NOTIFY carries it: the payload, or the
+// cluster_messages row that holds it (Ref).
 type wireMsg struct {
 	Instance string `json:"n"`
 	Topic    string `json:"t"`
-	Payload  string `json:"p"`
+	Payload  string `json:"p,omitempty"`
+	Ref      string `json:"r,omitempty"`
 }
 
 // New starts the cluster helper. On SQLite (or with a nil db) it is a
@@ -498,6 +519,52 @@ func (c *Cluster) Publish(ctx context.Context, topic, payload string) error {
 	return err
 }
 
+// PublishLarge is Publish for a payload of up to 1 MiB, such as a
+// dashboard live event. A payload over MaxPayload is stored in the
+// cluster_messages table for a few minutes and the NOTIFY names its row;
+// each other node reads it before it calls its subscribers. This node's
+// subscribers get the payload at once, as with Publish.
+func (c *Cluster) PublishLarge(ctx context.Context, topic, payload string) error {
+	if len(payload) <= MaxPayload {
+		return c.Publish(ctx, topic, payload)
+	}
+	if err := checkTopic(topic); err != nil {
+		return err
+	}
+	if len(payload) > MaxLargePayload {
+		return errors.New("cluster: payload larger than 1 MiB")
+	}
+	if strings.IndexByte(payload, 0) >= 0 {
+		return errors.New("cluster: a payload holds no NUL byte")
+	}
+	if c == nil {
+		return nil
+	}
+	c.enqueue(delivery{topic: topic, payload: payload})
+	if !c.pg {
+		return nil
+	}
+	var b [12]byte
+	_, _ = rand.Read(b[:])
+	id := hex.EncodeToString(b[:])
+	now := time.Now()
+	if _, err := c.db.ExecContext(ctx, `INSERT INTO cluster_messages(id, topic, payload, created_at) VALUES (?, ?, ?, ?)`,
+		id, topic, payload, now.UnixMilli()); err != nil {
+		return err
+	}
+	if last := c.lastPrune.Load(); now.UnixMilli()-last > time.Minute.Milliseconds() && c.lastPrune.CompareAndSwap(last, now.UnixMilli()) {
+		if _, err := c.db.ExecContext(ctx, `DELETE FROM cluster_messages WHERE created_at < ?`, now.Add(-largeKeep).UnixMilli()); err != nil {
+			c.log.Warn("cluster: deleting old large messages failed", "err", err.Error())
+		}
+	}
+	body, err := json.Marshal(wireMsg{Instance: c.id, Topic: topic, Ref: id})
+	if err != nil {
+		return err
+	}
+	_, err = c.db.ExecContext(ctx, `SELECT pg_notify(?, ?)`, channel, string(body))
+	return err
+}
+
 // Subscribe calls fn with the payload of every message published on topic,
 // on any node, and with Resync (see there). fn runs on the cluster's one
 // delivery goroutine, in order: it must return quickly (start a goroutine
@@ -577,9 +644,23 @@ func (c *Cluster) deliver(d delivery) {
 		}
 	}
 	c.subMu.RUnlock()
+	if len(fns) == 0 {
+		return
+	}
 	payload := d.payload
 	if d.resync {
 		payload = Resync
+	}
+	if d.ref != "" {
+		ctx, cancel := context.WithTimeout(c.ctx, queryTimeout)
+		err := c.db.QueryRowContext(ctx, `SELECT payload FROM cluster_messages WHERE id = ?`, d.ref).Scan(&payload)
+		cancel()
+		if err != nil {
+			if c.ctx.Err() == nil {
+				c.log.Warn("cluster: reading a large message failed; it is dropped", "topic", d.topic, "err", err.Error())
+			}
+			return
+		}
 	}
 	for _, fn := range fns {
 		c.call(d.topic, fn, payload)
@@ -671,7 +752,7 @@ func (c *Cluster) receive(raw string) {
 	if m.Instance == c.id {
 		return
 	}
-	c.enqueue(delivery{topic: m.Topic, payload: m.Payload})
+	c.enqueue(delivery{topic: m.Topic, payload: m.Payload, ref: m.Ref})
 }
 
 // resyncLoop sends every subscriber a Resync each ResyncInterval.
@@ -696,10 +777,14 @@ var processLocks keyedMutex
 
 // Lock takes the named lock across every node and returns the function
 // that releases it (safe to call more than once). It waits until the lock
-// is free or ctx ends. The lock is held both in process and, on Postgres,
-// as a session advisory lock (pg_advisory_lock) on a pooled connection
-// kept until unlock, so keep the section short: it holds one connection
-// of the pool. Use LockTx instead when the section is one transaction.
+// is free or ctx ends. The lock is held in process and, on Postgres, as a
+// session advisory lock on the cluster's own lease connection, so it holds
+// no connection of the pool however long the section runs (a section may
+// use the pool freely). Waiting polls pg_try_advisory_lock, at most every
+// 100 ms. Should that connection fail while the lock is held, the server
+// releases the lock with it: keep each section idempotent or checked in
+// the database, as the in-process mutexes it replaces had to be across a
+// restart. Use LockTx instead when the section is one transaction.
 func (c *Cluster) Lock(ctx context.Context, name string) (unlock func(), err error) {
 	locks := &processLocks
 	if c != nil {
@@ -713,30 +798,74 @@ func (c *Cluster) Lock(ctx context.Context, name string) (unlock func(), err err
 		return unlockLocal, nil
 	}
 	key := LockKey("lock:" + name)
-	conn, err := c.db.DB.Conn(ctx)
-	if err != nil {
-		unlockLocal()
-		return nil, err
-	}
-	if _, err := conn.ExecContext(ctx, `SELECT pg_advisory_lock(?)`, key); err != nil {
-		_ = conn.Close()
-		unlockLocal()
-		return nil, err
-	}
-	var once sync.Once
-	return func() {
-		once.Do(func() {
-			uctx, cancel := context.WithTimeout(context.Background(), queryTimeout)
-			defer cancel()
-			if _, err := conn.ExecContext(uctx, `SELECT pg_advisory_unlock(?)`, key); err != nil {
-				// The session lock ends with its connection: drop this
-				// one rather than return it to the pool still locked.
-				_ = conn.Raw(func(any) error { return driver.ErrBadConn })
-			}
-			_ = conn.Close()
+	backoff := 5 * time.Millisecond
+	for {
+		gen, got, err := c.tryNamed(key)
+		if err == nil && got {
+			var once sync.Once
+			return func() {
+				once.Do(func() {
+					c.unlockNamed(key, gen)
+					unlockLocal()
+				})
+			}, nil
+		}
+		if errors.Is(err, errClosed) {
 			unlockLocal()
-		})
-	}, nil
+			return nil, err
+		}
+		// Taken elsewhere, or the connection failed (it is opened again on
+		// the next try): wait and try again.
+		t := time.NewTimer(backoff)
+		select {
+		case <-ctx.Done():
+			t.Stop()
+			unlockLocal()
+			return nil, ctx.Err()
+		case <-t.C:
+		}
+		backoff = min(backoff*2, 100*time.Millisecond)
+	}
+}
+
+// errClosed is the error of a lock asked of a closed Cluster.
+var errClosed = errors.New("cluster: closed")
+
+// tryNamed tries once to take the session advisory lock key on the lease
+// connection; gen names that connection.
+func (c *Cluster) tryNamed(key int64) (gen uint64, got bool, err error) {
+	c.lockMu.Lock()
+	defer c.lockMu.Unlock()
+	if c.closed || c.ctx.Err() != nil {
+		return 0, false, errClosed
+	}
+	conn, err := c.lockConnLocked()
+	if err != nil {
+		return 0, false, err
+	}
+	qctx, cancel := context.WithTimeout(c.ctx, queryTimeout)
+	defer cancel()
+	if err := conn.QueryRow(qctx, `SELECT pg_try_advisory_lock($1)`, key).Scan(&got); err != nil {
+		c.dropLockConnLocked("take a lock", err)
+		return 0, false, err
+	}
+	return c.lockGen, got, nil
+}
+
+// unlockNamed releases a lock tryNamed took on connection gen. A lock lost
+// with its connection is already gone.
+func (c *Cluster) unlockNamed(key int64, gen uint64) {
+	c.lockMu.Lock()
+	defer c.lockMu.Unlock()
+	if c.lockConn == nil || gen != c.lockGen || c.ctx.Err() != nil {
+		return
+	}
+	qctx, cancel := context.WithTimeout(c.ctx, queryTimeout)
+	defer cancel()
+	var ok bool
+	if err := c.lockConn.QueryRow(qctx, `SELECT pg_advisory_unlock($1)`, key).Scan(&ok); err != nil {
+		c.dropLockConnLocked("release a lock", err)
+	}
 }
 
 // LockTx takes the named lock for the rest of tx: pg_advisory_xact_lock on
@@ -803,6 +932,35 @@ func (k *keyedMutex) put(name string, e *keyedEntry) {
 	e.refs--
 	if e.refs == 0 {
 		delete(k.m, name)
+	}
+}
+
+// ---- work leases ------------------------------------------------------------------
+
+// LeaseUntil is the end, in Unix milliseconds, of a work lease taken or
+// renewed at now.
+func LeaseUntil(now time.Time) int64 { return now.Add(WorkLease).UnixMilli() }
+
+// RenewLeases calls renew every WorkLeaseRenew until ctx ends, logging a
+// failure under name. Every node runs one for each kind of work it
+// executes, outside RunLeader: each renews only its own rows.
+func RenewLeases(ctx context.Context, name string, renew func(ctx context.Context) error) {
+	t := time.NewTicker(WorkLeaseRenew)
+	defer t.Stop()
+	var lg logOnce
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+		}
+		if err := renew(ctx); err != nil {
+			if ctx.Err() == nil {
+				lg.warn(logx.For("cluster").With("work", name), "cluster: renewing work leases failed; another node may recover this work once the leases end", err)
+			}
+			continue
+		}
+		lg.reset()
 	}
 }
 

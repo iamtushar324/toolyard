@@ -15,6 +15,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/tusharbhardwaj/toolyard/internal/cluster"
 	"github.com/tusharbhardwaj/toolyard/internal/store"
 )
 
@@ -177,6 +178,10 @@ type Service struct {
 
 	mu    sync.RWMutex
 	cache map[string]json.RawMessage
+
+	// cluster, when it spans several nodes, carries every write to the
+	// other replicas' caches (SetCluster, cluster.go).
+	cluster *cluster.Cluster
 }
 
 func New(ctx context.Context, db *store.DB) (*Service, error) {
@@ -426,6 +431,7 @@ func (s *Service) Set(ctx context.Context, key string, value any) error {
 	s.mu.Lock()
 	s.cache[key] = body
 	s.mu.Unlock()
+	s.publishChange(ctx)
 	return nil
 }
 
@@ -480,6 +486,7 @@ func (s *Service) Patch(ctx context.Context, updates map[string]any) error {
 		s.cache[r.k] = r.b
 	}
 	s.mu.Unlock()
+	s.publishChange(ctx)
 	return nil
 }
 

@@ -17,6 +17,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/tusharbhardwaj/toolyard/internal/cluster"
 	"github.com/tusharbhardwaj/toolyard/internal/store"
 )
 
@@ -203,8 +204,14 @@ type Service struct {
 	// userLocks serialises everything that reads-then-writes one person's
 	// row (exchange, refresh, disconnect, a 401 mark), keyed by
 	// userKey(upstream, userID), so a refresh that waited on the provider
-	// cannot resurrect a row a disconnect deleted meanwhile.
+	// cannot resurrect a row a disconnect deleted meanwhile. With a
+	// multi-node cluster a cluster lock replaces it (lockUser).
 	userLocks map[string]*sync.Mutex
+
+	// cluster, when it spans several nodes, carries bearer changes to the
+	// other replicas' caches and serializes refreshes across them
+	// (SetCluster, cluster.go).
+	cluster *cluster.Cluster
 }
 
 // New wires the service. dataDir is where we read/create oauth.key.
@@ -291,7 +298,15 @@ func (s *Service) currentBearer(upstream string) string {
 	return ""
 }
 
+// setBearer stores a bearer this node just wrote (exchange, refresh, PAT,
+// reauth) and tells the other replicas to drop their cached copy.
 func (s *Service) setBearer(upstream, tok string) {
+	s.storeBearer(upstream, tok)
+	s.publishBearer(upstream, "", false)
+}
+
+// storeBearer fills the cache, telling nobody (a read from the database).
+func (s *Service) storeBearer(upstream, tok string) {
 	s.mu.Lock()
 	v := s.bearers[upstream]
 	if v == nil {
@@ -309,7 +324,13 @@ func (s *Service) cacheBearerFromDB(upstream string) {
 	if err != nil || tok == nil {
 		return
 	}
-	s.setBearer(upstream, tok.AccessToken)
+	if tok.State == StateNeedsReauth {
+		// As markNeedsReauth leaves the cache: the stored access token
+		// was rejected.
+		s.storeBearer(upstream, "")
+		return
+	}
+	s.storeBearer(upstream, tok.AccessToken)
 }
 
 // PrimeBearers walks every upstream with a stored token and warms the
@@ -572,7 +593,9 @@ func (s *Service) DeleteClient(ctx context.Context, upstream string) error {
 	s.mu.Lock()
 	delete(s.bearers, upstream)
 	s.mu.Unlock()
-	return s.deleteUserTokens(ctx, upstream)
+	err = s.deleteUserTokens(ctx, upstream)
+	s.publishBearer(upstream, "", true)
+	return err
 }
 
 // ---------------------------------------------------------------------------
@@ -851,8 +874,16 @@ func (s *Service) exchangeCode(ctx context.Context, upstream, code, verifier str
 }
 
 // Refresh swaps a refresh_token for a fresh access_token. On rotation the
-// new refresh_token replaces the old.
+// new refresh_token replaces the old. With a multi-node cluster the
+// refresh holds a cluster lock per upstream and reads the token inside
+// it, so two replicas never spend the same rotating refresh token (the
+// loser would get invalid_grant and mark the server needs_reauth).
 func (s *Service) Refresh(ctx context.Context, upstream string) (*TokenRecord, error) {
+	unlock, err := s.lockShared(ctx, upstream)
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
 	cli, err := s.GetClient(ctx, upstream)
 	if err != nil {
 		return nil, err

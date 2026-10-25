@@ -18,6 +18,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/tusharbhardwaj/toolyard/internal/actor"
+	"github.com/tusharbhardwaj/toolyard/internal/cluster"
 	"github.com/tusharbhardwaj/toolyard/internal/store"
 )
 
@@ -252,7 +253,10 @@ func (s *Service) Redeem(ctx context.Context, token, agentID, tool string, args 
 	if _, err = tx.ExecContext(ctx, `INSERT INTO inbox_grant_uses(id,grant_id,arguments,used_at) VALUES(?,?,?,?)`, g.AttemptID, g.ID, string(argsJSON), now); err != nil {
 		return nil, err
 	}
-	if _, err = tx.ExecContext(ctx, `INSERT INTO inbox_executions(grant_id,request_id,call_id,agent_id,state,attempt_id,arguments,started_at) VALUES(?,?,?,?,?,?,?,?)`, g.ID, g.RequestID, g.CallID, g.AgentID, ExecutionRunning, g.AttemptID, string(argsJSON), now); err != nil {
+	// The execution is this node's: it holds a lease it renews while the
+	// call runs (RunLeaseRenewal), so recovery never takes it from a live
+	// node.
+	if _, err = tx.ExecContext(ctx, `INSERT INTO inbox_executions(grant_id,request_id,call_id,agent_id,state,attempt_id,arguments,started_at,owner_instance,lease_until) VALUES(?,?,?,?,?,?,?,?,?,?)`, g.ID, g.RequestID, g.CallID, g.AgentID, ExecutionRunning, g.AttemptID, string(argsJSON), now, s.instance(), cluster.LeaseUntil(s.now())); err != nil {
 		return nil, err
 	}
 	if err = tx.Commit(); err != nil {

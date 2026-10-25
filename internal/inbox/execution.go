@@ -72,9 +72,21 @@ func (s *Service) FinishExecution(ctx context.Context, g *Grant, state string, r
 	return nil
 }
 
-// RecoverExecutions is called once at process startup. No dispatch is repeated.
+// RecoverExecutions records outcome_unknown for executions whose process
+// stopped after the execution claim. No dispatch is repeated. It runs at
+// startup (inbox.New) and, on a multi-node database, periodically on the
+// leader (RunRecovery). With a single node every running execution belongs
+// to a stopped process, as before; on a multi-node database it takes only
+// executions whose lease ended (or that have none), so it never touches
+// the live work of another node, nor of this one.
 func (s *Service) RecoverExecutions(ctx context.Context) (int64, error) {
-	res, err := s.db.ExecContext(ctx, `UPDATE inbox_executions SET state=?,finished_at=?,error=? WHERE state=?`, ExecutionUnknown, s.now().UnixMilli(), "process stopped after the execution claim; inspect upstream state before any new permission", ExecutionRunning)
+	q := `UPDATE inbox_executions SET state=?,finished_at=?,error=? WHERE state=?`
+	args := []any{ExecutionUnknown, s.now().UnixMilli(), "process stopped after the execution claim; inspect upstream state before any new permission", ExecutionRunning}
+	if s.multiNode() {
+		q += ` AND (lease_until IS NULL OR lease_until < ?)`
+		args = append(args, s.now().UnixMilli())
+	}
+	res, err := s.db.ExecContext(ctx, q, args...)
 	if err != nil {
 		return 0, err
 	}
@@ -85,11 +97,19 @@ func (s *Service) RecoverExecutions(ctx context.Context) (int64, error) {
 	return n, err
 }
 
-// RunningExecutions returns the grant ids of executions that have a claim
-// and no outcome yet. Shutdown names them when they outlive the drain
-// deadline; the next start records them outcome_unknown.
+// RunningExecutions returns the grant ids of this node's executions that
+// have a claim and no outcome yet (on a single node: every one). Shutdown
+// names them when they outlive the drain deadline; recovery records them
+// outcome_unknown once their lease ends (at the next start on a single
+// node).
 func (s *Service) RunningExecutions(ctx context.Context) ([]string, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT grant_id FROM inbox_executions WHERE state=? ORDER BY started_at`, ExecutionRunning)
+	q := `SELECT grant_id FROM inbox_executions WHERE state=?`
+	args := []any{ExecutionRunning}
+	if s.multiNode() {
+		q += ` AND owner_instance=?`
+		args = append(args, s.instance())
+	}
+	rows, err := s.db.QueryContext(ctx, q+` ORDER BY started_at`, args...)
 	if err != nil {
 		return nil, err
 	}
