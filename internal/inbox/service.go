@@ -196,6 +196,10 @@ type Service struct {
 	legacyMu    sync.Mutex
 	legacySig   string
 	legacyClean bool
+
+	// system holds the handlers of system items by kind (system.go).
+	systemMu sync.RWMutex
+	system   map[string]SystemHandler
 }
 
 // New creates the service and loads (or creates) the grant signing key.
@@ -295,6 +299,9 @@ func (s *Service) publish(t string, data any) {
 }
 
 func (s *Service) agentName(ctx context.Context, id string) string {
+	if _, ok := SystemAgentUser(id); ok {
+		return SystemSenderName
+	}
 	if s.opts.AgentName != nil {
 		if n := s.opts.AgentName(ctx, id); n != "" {
 			return n
@@ -1056,6 +1063,8 @@ func (s *Service) Decide(ctx context.Context, id string, d Decision) (*Request, 
 	if d.Action == "snooze" {
 		s.enqueuePush(ctx, out, "snooze_end", out.ID, time.UnixMilli(out.SnoozedUntil))
 	}
+	// A system item's handler acts on the committed decision (system.go).
+	out = s.afterSystemDecision(ctx, out)
 	s.publish("inbox", s.cardView(ctx, out))
 	return out, nil
 }

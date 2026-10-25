@@ -62,6 +62,9 @@ func (s *Server) agentNames(ctx context.Context, uid string) map[string]string {
 			out[a.ID] = a.Name
 		}
 	}
+	// The person's own system items (internal/inbox system.go): toolyard
+	// is their sender.
+	out[inbox.SystemAgentID(uid)] = inbox.SystemSenderName
 	// Import records retain their original owner after agent deletion.
 	if s.inbox != nil {
 		if legacy, err := s.inbox.LegacyAgentNames(ctx, uid); err == nil {

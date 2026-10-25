@@ -558,8 +558,13 @@ the database and serves only that copy. How sync, review and limits work:
   many versions use them. Each source keeps its live version, the one
   waiting for review, and the last 10 others; older versions and contents
   no version uses are deleted.
-- **Rollback.** Migration `0068_skill_hub` only adds tables. An older
-  binary ignores them (and the old `skills_sync` table is left as it was).
+- **Rollback.** Migrations `0068_skill_hub`, `0070_skill_proposals` and
+  `0071_skill_bundle_tickets` only add tables. An older binary ignores
+  them (and the old `skills_sync` table is left as it was).
+- **Upgrade.** The old skills workspace server (the built-in upstream
+  named `skills`) is gone: the name now belongs to the hub's own
+  `skills.*` tools. A stored server under that name is not loaded, and its
+  status says so; delete it on the Servers page.
 
 ## Inbox and permissions
 

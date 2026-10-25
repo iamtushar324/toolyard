@@ -4620,6 +4620,7 @@ function uiIcon(name) {
     menu: 'M2 5h16 M2 10h16 M2 15h16',
     logout: 'M8 2H2v16h6 M7 10h12 M15 6l4 4-4 4',
     chevron: 'M7 4l6 6-6 6',
+    book: 'M2 3h5a3 3 0 0 1 3 3v12a2 2 0 0 0-2-2H2z M18 3h-5a3 3 0 0 0-3 3v12a2 2 0 0 1 2-2h6z',
   };
   const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
   for (const [key, value] of Object.entries({ viewBox: '-1 -1 22 22', width: '18', height: '18', fill: 'none', stroke: 'currentColor', 'stroke-width': '1.5', 'stroke-linecap': 'round', 'stroke-linejoin': 'round', 'aria-hidden': 'true', class: 'ui-icon' })) svg.setAttribute(key, value);
@@ -4661,6 +4662,7 @@ function navigate(route) {
   let hashRoute = route;
   if (route.startsWith('settings/')) route = settingsRoute(route);
   else if (route === 'settings') hashRoute = 'settings/' + settingsUI.page;
+  else if (route === 'skills' || route.startsWith('skills/')) route = skillsRoute(route);
   if (!routeAllowed(route)) route = defaultRoute();
   if (route === 'inbox' || state.route === 'inbox') {
     if (state.inbox.openId) { ibHalt(); state.inbox.openId = null; state.inbox.detail = null; ibNode = null; }
@@ -4678,6 +4680,7 @@ function navigate(route) {
   if (route === 'agents' || route === 'myservers') loadMyKey();
   if (route === 'agents') void loadHostConnections();
   if (route === 'apps') loadApps();
+  if (route === 'skills') loadSkills();
   render();
 }
 
@@ -4708,6 +4711,7 @@ function shell(content) {
         navBtn('agents', 'People & agents', 'people'),
         navBtn('apps', 'Connected apps', 'key'),
         navBtn('tools', 'Tools', 'tools'),
+        navBtn('skills', 'Skills', 'book'),
         navBtn('settings', 'Settings', 'sliders')) : el('nav', { 'aria-label': 'Main navigation' },
         navBtn('inbox', 'Inbox', 'inbox', inboxBadgeCount()), navBtn('agents', 'Agents', 'people'), navBtn('apps', 'Connected apps', 'key'), navBtn('myservers', 'Available services', 'tools'), navBtn('connections', 'Connections', 'plug')),
       el('div', { class: 'sidebar-footer' }, admin ? renderStreamPill() : null,
@@ -4741,6 +4745,7 @@ function renderMoreSheet() {
         item('agents', 'People & agents', 'Manage access and enrolled agents'),
         item('apps', 'Connected apps', 'Apps added by URL, like ChatGPT and Claude'),
         item('tools', 'Tools', 'Browse tools and review access policies'),
+        item('skills', 'Skills', 'Skill sources toolyard serves to agents'),
         item('settings', 'Settings', 'Workspace preferences'),
       ] : [
         item('agents',    'Agents',     'Manage your enrolled agents'),
@@ -4853,6 +4858,7 @@ function render() {
     case 'audit':         body = viewAudit();         break;
     case 'agents':        body = viewAgents();        break;
     case 'apps':          body = viewApps();          break;
+    case 'skills':        body = viewSkills();        break;
     case 'servers':       body = viewConnectionHub();       break;
     case 'policies':      body = viewPolicies();       break;
     case 'tools':         body = viewTools();         break;
@@ -5239,6 +5245,7 @@ function withSectionTabs(body) {
     insights: ['Activity', 'Review tool calls, permission decisions, and results.'],
     settings: ['Settings', 'Workspace preferences and access controls.'],
     myservers: ['Available services', 'Services your agents can use.'],
+    skills: ['Skills', 'Skill sources: GitHub repositories whose Agent Skills toolyard copies and serves to agents.'],
   };
   const groups = isAdmin() ? [
     [['servers', 'Services'], ['connections', 'My accounts']],
@@ -7422,7 +7429,6 @@ function agentRulesSnippet(base, tok) {
 mkdir -p ~/.claude/skills/toolyard-inbox
 curl -fsSL -H "Authorization: Bearer ${tok}" ${base}/v1/guide/skill \\
   -o ~/.claude/skills/toolyard-inbox/SKILL.md
-# (or, with the toolyard CLI: toolyard skills install toolyard-inbox)
 
 # Codex, Cursor, hermes and others: add this to AGENTS.md / your rules
 ## Asking for permission (toolyard)
@@ -7451,6 +7457,7 @@ Read the full rules with inbox.guide().`;
   if (routeParam) state.route = workspaceRoute(routeParam);
   let deepInbox = null;
   if (state.route.startsWith('settings/')) state.route = settingsRoute(state.route);
+  if (state.route.startsWith('skills/')) state.route = skillsRoute(state.route);
   if (state.route.startsWith('inbox/')) { deepInbox = state.route.slice(6); state.route = 'inbox'; }
   if (IB_FILTERS.includes(deepInbox)) { state.inbox.filter = deepInbox; deepInbox = null; }
   // Push deep link: notifications open /?approval=<id>. Land on the
@@ -7521,6 +7528,8 @@ Read the full rules with inbox.guide().`;
       } else if (id && state.inbox.openId !== id) openInboxRequest(id);
     } else if (h === 'inbox' && state.inbox.openId) {
       closeInboxRequest();
+    } else if (h === 'skills' && skillsUI.openId) {
+      navigate('skills');
     } else if (h && h !== state.route) {
       navigate(h);
     }

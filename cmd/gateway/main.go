@@ -1315,11 +1315,10 @@ func runServe(argv []string) error {
 		if err := skillhubSvc.Start(ctx); err != nil {
 			rootLog.Warn("skills hub: the first catalog load failed; it is retried in the background", "err", err.Error())
 		}
-		leaderLoop(ctx, clusterSvc, loopSkillsSync, time.Minute, skillhubSvc.RunPoller)
 		log.Printf("skills hub: on")
-		// Slice B (agent surface) plugs in here: gw.RegisterSkillHub(skillhubSvc).
-		// Slice C (admin surface) passes skillhubSvc in api.Options below and
-		// sets the review hook: skillhubSvc.SetReviewHook(...).
+		// skillhub: the admin surface (slice C) and the agent surface
+		// (slice B) are wired below, before api.New; the leader's sync
+		// loop starts there too, once the review hook is set.
 	} else {
 		log.Printf("skills hub: off (-skills=off)")
 	}
@@ -1390,6 +1389,68 @@ func runServe(argv []string) error {
 		log.Printf("mcp-oauth: authorization server on (issuer %s, resource %s)", mcpAuthSvc.Issuer(), mcpAuthSvc.Resource())
 	}
 
+	// skillhub (slice C): the skills hub admin surface: the admin REST
+	// routes and the dashboard Skills page (api), one Inbox review item per
+	// staged version of a review-mode source (skillhub.ReviewInbox, the
+	// hub's ReviewHook), and agents' source proposals
+	// (skillhub.SourceProposals). skillHubAdmin is the hub's admin service:
+	// set it to slice A's *skillhub.Service (a nil interface while the hub
+	// is off, never a typed nil pointer). While it is nil the admin routes
+	// answer 404 "skills hub is off" and no review or proposal handler is
+	// registered. skillHubProposals is what the agent surface (slice B)
+	// passes on for skills.propose_source and skills.propose_change.
+	var (
+		skillHubAdmin     skillhub.Admin
+		skillHubReviews   api.SkillReviewSettler
+		skillHubProposals skillhub.Proposals
+	)
+	if skillhubSvc != nil {
+		// skillhub: assigned only here, so a hub that is off stays a nil
+		// interface, never a typed nil *skillhub.Service.
+		skillHubAdmin = skillhubSvc
+	}
+	if skillHubAdmin != nil {
+		skillHubIsAdmin := func(ctx context.Context, uid string) bool {
+			u, err := idSvc.GetUserByID(ctx, uid)
+			return err == nil && u.Status == identity.StatusActive && u.Role == identity.RoleAdmin
+		}
+		reviews, err := skillhub.NewReviewInbox(skillhub.ReviewOptions{DB: db, Inbox: inboxSvc, Admin: skillHubAdmin,
+			IsAdmin: skillHubIsAdmin, DashboardURL: *publicURL, Audit: auditSvc})
+		if err != nil {
+			return fmt.Errorf("skills hub reviews: %w", err)
+		}
+		skillHubAdmin.SetReviewHook(reviews)
+		skillHubReviews = reviews
+		proposals, err := skillhub.NewSourceProposals(skillhub.ProposalOptions{DB: db, Inbox: inboxSvc, Admin: skillHubAdmin,
+			IsAdmin: skillHubIsAdmin, AgentName: agentName, Audit: auditSvc})
+		if err != nil {
+			return fmt.Errorf("skills hub proposals: %w", err)
+		}
+		skillHubProposals = proposals
+	}
+
+	// skillhub (slice B): the agent surface: the skills.* tools, the MCP
+	// Skills extension (capability, instructions, skill:// resources) and
+	// the bundle download tickets. Registered after RegisterBuiltins and
+	// before the MCP transport and the HTTP server start. With -skills=off
+	// nothing is registered: the agent REST routes answer 503 "the skills
+	// hub is off", the tools are absent and gw.MCPSkills passes every
+	// request through. The Reader is set only while skillhubSvc is non-nil
+	// (never a typed nil in the interface).
+	if skillhubSvc != nil {
+		gw.RegisterSkillHub(gateway.SkillHub{
+			Reader:    skillhubSvc,
+			Proposals: skillHubProposals, // slice C's SourceProposals
+			Tickets:   gateway.NewSkillBundleTickets(db),
+			OnHost:    federationSvc.OnHost,
+		})
+		// skillhub (slice A): the leader checks each source on its own
+		// schedule (skills-sync). Started after SetReviewHook above, so a
+		// first poll at startup that stages a version in review mode
+		// always raises its Inbox question.
+		leaderLoop(ctx, clusterSvc, loopSkillsSync, time.Minute, skillhubSvc.RunPoller)
+	}
+
 	// REST API + dashboard.
 	apiSrv := api.New(ctx, api.Options{
 		Federation: federationSvc, Callbacks: callbackSvc,
@@ -1434,6 +1495,8 @@ func runServe(argv []string) error {
 		ConnectAZP:      connectOrigins,
 		CodeRuns:        codeRuns,
 		Jobs:            jobsSvc,
+		SkillsAdmin:     skillHubAdmin,   // skillhub (slice C)
+		SkillReviews:    skillHubReviews, // skillhub (slice C)
 	})
 
 	// Rate limits and the connect-t3 lock hold across replicas.
@@ -1557,6 +1620,9 @@ func runServe(argv []string) error {
 		// Native Inbox uploads (PUT /v1/uploads/{ticket}) carry up to a
 		// 50 MB video; the handler caps each body at its ticket's size.
 		"/v1/uploads/": inbox.MaxVideoBytes,
+		// skillhub (slice C): a skill source's GitHub webhook takes up to
+		// 5 MiB; HardenAPI keeps the other routes here at 64 KiB.
+		"/v1/skills/sources/": api.SkillWebhookMaxBytes,
 	})
 	handler = apiSrv.HardenAPI(handler)
 	handler = apiSrv.EnforceOriginOnMutations(handler)
@@ -2043,6 +2109,7 @@ func staticHandler() http.Handler {
 	cssHash := assetHash(sub, "style.css")
 	settingsHash := assetHash(sub, "settings.js")
 	appsHash := assetHash(sub, "apps.js")
+	skillsHash := assetHash(sub, "skills.js") // skillhub (slice C)
 	workspaceHash := assetHash(sub, "workspace.css")
 	swHash := assetHash(sub, "sw.js")
 	loginHash := assetHash(sub, "login.js")
@@ -2051,6 +2118,7 @@ func staticHandler() http.Handler {
 		out = strings.ReplaceAll(out, `href="/style.css"`, `href="/style.css?v=`+cssHash+`"`)
 		out = strings.ReplaceAll(out, `src="/settings.js"`, `src="/settings.js?v=`+settingsHash+`"`)
 		out = strings.ReplaceAll(out, `src="/apps.js"`, `src="/apps.js?v=`+appsHash+`"`)
+		out = strings.ReplaceAll(out, `src="/skills.js"`, `src="/skills.js?v=`+skillsHash+`"`) // skillhub (slice C)
 		out = strings.ReplaceAll(out, `href="/workspace.css"`, `href="/workspace.css?v=`+workspaceHash+`"`)
 		return []byte(out)
 	}

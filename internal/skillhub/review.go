@@ -1,0 +1,353 @@
+package skillhub
+
+// ReviewInbox is the ReviewHook: a review-mode source's new staged version
+// becomes one Inbox question for the source's creator ("Make this version
+// live?"), and the answer calls Admin.Activate or Admin.Reject. The Inbox
+// carries the decision natively (inbox system items, internal/inbox
+// system.go); the dashboard's Approve and Reject buttons on the source
+// page decide the same version and close the open item (Settle).
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"net/url"
+	"strings"
+	"time"
+	"unicode/utf8"
+
+	"github.com/tusharbhardwaj/toolyard/internal/audit"
+	"github.com/tusharbhardwaj/toolyard/internal/inbox"
+	"github.com/tusharbhardwaj/toolyard/internal/store"
+)
+
+// ReviewItemKind is the Inbox system item kind of a version review.
+const ReviewItemKind = "skillhub.review"
+
+// reviewQuestionID is the ID of the one question review and proposal
+// items ask; its options are reviewApprove and reviewReject.
+const (
+	reviewQuestionID = "decision"
+	reviewApprove    = "approve"
+	reviewReject     = "reject"
+	// reviewListCap is how many skill paths one list of an item names.
+	reviewListCap = 20
+)
+
+// ReviewOptions configure a ReviewInbox.
+type ReviewOptions struct {
+	DB    *store.DB
+	Inbox *inbox.Service
+	Admin Admin
+	// IsAdmin reports whether a user holds the admin role. A decision by
+	// anyone else is refused (the creator may have lost the role since).
+	// nil skips the check.
+	IsAdmin func(ctx context.Context, userID string) bool
+	// DashboardURL is toolyard's public base URL; when set, items link to
+	// the source page (<DashboardURL>/#skills/<source id>).
+	DashboardURL string
+	// Audit, when set, records every applied decision.
+	Audit *audit.Logger
+	Now   func() time.Time
+}
+
+// ReviewInbox implements ReviewHook with Inbox items. Create it with
+// NewReviewInbox and give it to Admin.SetReviewHook.
+type ReviewInbox struct {
+	o     ReviewOptions
+	store proposalStore
+}
+
+var _ ReviewHook = (*ReviewInbox)(nil)
+
+// NewReviewInbox registers the review item handler with the Inbox.
+func NewReviewInbox(o ReviewOptions) (*ReviewInbox, error) {
+	if o.DB == nil || o.Inbox == nil || o.Admin == nil {
+		return nil, errors.New("skillhub: review inbox needs a database, the Inbox and the admin service")
+	}
+	if o.Now == nil {
+		o.Now = time.Now
+	}
+	ri := &ReviewInbox{o: o, store: proposalStore{db: o.DB, now: o.Now}}
+	o.Inbox.HandleSystem(ReviewItemKind, ri.decide)
+	return ri, nil
+}
+
+// reviewInput is what a review row keeps of the version it asks about.
+type reviewInput struct {
+	SHA      string `json:"sha"`
+	FromSHA  string `json:"from_sha,omitempty"`
+	Added    int    `json:"added"`
+	Changed  int    `json:"changed"`
+	Removed  int    `json:"removed"`
+	Warnings int    `json:"warnings"`
+}
+
+// PendingVersion puts one review item for v in the Inbox of src's creator.
+// An open item for an older staged version of the same source is
+// cancelled first: only the newest commit waits for review. A second call
+// for the same version adds nothing.
+func (ri *ReviewInbox) PendingVersion(ctx context.Context, src Source, v Version) error {
+	if src.CreatedBy == "" {
+		return fmt.Errorf("%w: source %s has no creator to review it", ErrInvalid, src.ID)
+	}
+	if v.ID == "" || v.SHA == "" {
+		return fmt.Errorf("%w: the version has no ID or commit", ErrInvalid)
+	}
+	open, err := ri.store.pendingReviews(ctx, src.ID, "")
+	if err != nil {
+		return err
+	}
+	for _, row := range open {
+		if row.VersionID == v.ID {
+			return nil
+		}
+	}
+	if err := ri.settleRows(ctx, open, "a newer commit is waiting for review"); err != nil {
+		return err
+	}
+	diff := v.Diff
+	if diff == nil {
+		diff = &Diff{ToSHA: v.SHA}
+	}
+	in, _ := json.Marshal(reviewInput{SHA: v.SHA, FromSHA: diff.FromSHA, Added: len(diff.Added), Changed: len(diff.Changed),
+		Removed: len(diff.Removed), Warnings: len(v.Warnings)})
+	row := &proposalRow{ID: proposalNewID(), Kind: proposalKindReview, Status: proposalPending, UserID: src.CreatedBy,
+		SourceID: src.ID, VersionID: v.ID, Input: string(in)}
+	if err := ri.store.insert(ctx, row); err != nil {
+		return err
+	}
+	item, err := ri.o.Inbox.CreateSystemItem(ctx, inbox.SystemItem{
+		Kind: ReviewItemKind, Ref: row.ID, UserID: src.CreatedBy,
+		Title:     reviewClip("Review skills update: "+src.Slug, inbox.MaxTitle),
+		Summary:   reviewClip(reviewSummary(src, v, diff), inbox.MaxSummary),
+		Message:   reviewMessage(src, v, diff, ri.o.DashboardURL),
+		Questions: reviewQuestion("Make this version live?", "Approve: make it live", "Reject: keep the current version"),
+	})
+	if err != nil {
+		_, _ = ri.store.move(ctx, row.ID, []string{proposalPending}, proposalFailed, proposalUpdate{Error: reviewClip(err.Error(), 500)})
+		return fmt.Errorf("skillhub: review item for %s: %w", src.Slug, err)
+	}
+	return ri.store.setInbox(ctx, row.ID, item.ID)
+}
+
+// Settle closes the open review items of a source after an admin decided
+// in the dashboard (Activate, Reject) or deleted the source. versionID ""
+// closes the items of every version. reason is shown on the items.
+func (ri *ReviewInbox) Settle(ctx context.Context, sourceID, versionID, reason string) error {
+	open, err := ri.store.pendingReviews(ctx, sourceID, versionID)
+	if err != nil {
+		return err
+	}
+	return ri.settleRows(ctx, open, reason)
+}
+
+func (ri *ReviewInbox) settleRows(ctx context.Context, rows []proposalRow, reason string) error {
+	for _, row := range rows {
+		moved, err := ri.store.move(ctx, row.ID, []string{proposalPending}, proposalCancelled, proposalUpdate{Error: reason})
+		if err != nil {
+			return err
+		}
+		if !moved || row.InboxID == "" {
+			continue
+		}
+		if _, err := ri.o.Inbox.CancelBySystem(ctx, inbox.SystemAgentID(row.UserID), row.InboxID, reason); err != nil &&
+			!errors.Is(err, inbox.ErrNotPending) && !errors.Is(err, inbox.ErrNotFound) {
+			return err
+		}
+	}
+	return nil
+}
+
+// decide is the Inbox handler of review items: approve activates the
+// staged version, reject (or a deny) rejects it.
+func (ri *ReviewInbox) decide(ctx context.Context, r *inbox.Request) (string, error) {
+	row, err := ri.store.get(ctx, r.System.Ref)
+	if err != nil {
+		return "", fmt.Errorf("review %s: %w", r.System.Ref, err)
+	}
+	if row.Kind != proposalKindReview {
+		return "", fmt.Errorf("review %s: not a review", row.ID)
+	}
+	if row.Status != proposalPending {
+		return "This review was already settled (" + row.Status + ").", nil
+	}
+	decider := r.DeciderUserID
+	if err := checkDecider(ctx, ri.o.IsAdmin, decider, row.UserID); err != nil {
+		_, _ = ri.store.move(ctx, row.ID, []string{proposalPending}, proposalFailed, proposalUpdate{Error: err.Error()})
+		return "", err
+	}
+	var in reviewInput
+	_ = json.Unmarshal([]byte(row.Input), &in)
+	label := reviewShort(in.SHA)
+	if r.SystemChoice(reviewQuestionID) == reviewApprove {
+		if ok, err := ri.store.move(ctx, row.ID, []string{proposalPending}, proposalApproved, proposalUpdate{DecidedBy: decider}); err != nil || !ok {
+			return "This review was already settled.", err
+		}
+		if err := ri.o.Admin.Activate(ctx, decider, row.SourceID, row.VersionID); err != nil {
+			_, _ = ri.store.move(ctx, row.ID, []string{proposalApproved}, proposalFailed, proposalUpdate{Error: reviewClip(err.Error(), 500)})
+			return "", fmt.Errorf("make version %s live: %w", label, err)
+		}
+		_, _ = ri.store.move(ctx, row.ID, []string{proposalApproved}, proposalDone, proposalUpdate{})
+		ri.audit(ctx, "skills.version_activate", decider, row, "inbox")
+		return "Version " + label + " is live.", nil
+	}
+	note := strings.TrimSpace(r.OwnerNote)
+	if note == "" {
+		note = "rejected in the Inbox"
+	}
+	if ok, err := ri.store.move(ctx, row.ID, []string{proposalPending}, proposalRejected, proposalUpdate{DecidedBy: decider}); err != nil || !ok {
+		return "This review was already settled.", err
+	}
+	if err := ri.o.Admin.Reject(ctx, decider, row.SourceID, row.VersionID, note); err != nil {
+		_, _ = ri.store.move(ctx, row.ID, []string{proposalRejected}, proposalFailed, proposalUpdate{Error: reviewClip(err.Error(), 500)})
+		return "", fmt.Errorf("reject version %s: %w", label, err)
+	}
+	ri.audit(ctx, "skills.version_reject", decider, row, note)
+	return "Version " + label + " was rejected; the current version stays live.", nil
+}
+
+func (ri *ReviewInbox) audit(ctx context.Context, event, by string, row *proposalRow, reason string) {
+	if ri.o.Audit == nil {
+		return
+	}
+	_ = ri.o.Audit.Write(ctx, audit.Event{EventType: event, AgentID: "user:" + by, Reason: reason,
+		ResultSummary: row.SourceID + " " + row.VersionID, ApprovalID: row.ID})
+}
+
+// checkDecider refuses a decision that names no person, a person other
+// than want (when want is set), or one who is not an admin (when isAdmin
+// is set).
+func checkDecider(ctx context.Context, isAdmin func(context.Context, string) bool, decider, want string) error {
+	switch {
+	case decider == "":
+		return errors.New("the decision does not name a person; decide in the dashboard")
+	case want != "" && decider != want:
+		return errors.New("only the person this item was sent to can decide it")
+	case isAdmin != nil && !isAdmin(ctx, decider):
+		return errors.New("only an admin can decide this; ask an admin to decide on the Skills page")
+	}
+	return nil
+}
+
+// ---- item text (shared with source proposals) ---------------------------------
+
+// reviewQuestion is the single approve/reject question of an item.
+func reviewQuestion(prompt, approve, reject string) []inbox.QuestionSpec {
+	return []inbox.QuestionSpec{{ID: reviewQuestionID, Type: inbox.QuestionSingleChoice, Prompt: prompt,
+		Options: []inbox.Option{{ID: reviewApprove, Label: approve}, {ID: reviewReject, Label: reject}}}}
+}
+
+func reviewSummary(src Source, v Version, d *Diff) string {
+	return fmt.Sprintf("%s: %d added, %d changed, %d removed, %d warning%s",
+		RepoLabel(src.Owner, src.Repo, v.SHA), len(d.Added), len(d.Changed), len(d.Removed), len(v.Warnings), reviewPlural(len(v.Warnings)))
+}
+
+func reviewMessage(src Source, v Version, d *Diff, dashboard string) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "A new commit of **%s/%s** (branch %s, %s) waits for your review before agents see it.\n\n",
+		reviewMD(src.Owner), reviewMD(src.Repo), reviewCode(src.Branch), reviewFolder(src.Path))
+	fmt.Fprintf(&b, "- New commit: [%s](%s)\n", reviewCode(reviewShort(v.SHA)), reviewCommitURL(src.Owner, src.Repo, v.SHA))
+	if d.FromSHA != "" {
+		fmt.Fprintf(&b, "- Live now: [%s](%s)\n", reviewCode(reviewShort(d.FromSHA)), reviewCommitURL(src.Owner, src.Repo, d.FromSHA))
+	} else {
+		b.WriteString("- Live now: no version yet\n")
+	}
+	fmt.Fprintf(&b, "- Skills in this version: %d (%d files)\n\n", v.SkillCount, v.FileCount)
+	fmt.Fprintf(&b, "**Added (%d):** %s\n\n", len(d.Added), reviewList(d.Added))
+	fmt.Fprintf(&b, "**Changed (%d):** %s\n\n", len(d.Changed), reviewList(d.Changed))
+	fmt.Fprintf(&b, "**Removed (%d):** %s\n\n", len(d.Removed), reviewList(d.Removed))
+	fmt.Fprintf(&b, "**Warnings:** %d", len(v.Warnings))
+	if link := reviewSourceLink(dashboard, src.ID); link != "" {
+		fmt.Fprintf(&b, ". [Open the source in toolyard](%s) to read them and compare versions.", link)
+	}
+	b.WriteString("\n\nApprove makes this version live for agents at once. Reject keeps the current version; the next commit asks again.")
+	return b.String()
+}
+
+// reviewSourceLink is the dashboard page of a source, or "" without a
+// public URL.
+func reviewSourceLink(dashboard, sourceID string) string {
+	base := strings.TrimRight(strings.TrimSpace(dashboard), "/")
+	if base == "" || sourceID == "" {
+		return ""
+	}
+	return base + "/#skills/" + url.PathEscape(sourceID)
+}
+
+func reviewCommitURL(owner, repo, sha string) string {
+	return reviewRepoURL(owner, repo) + "/commit/" + url.PathEscape(sha)
+}
+
+func reviewRepoURL(owner, repo string) string {
+	return "https://github.com/" + url.PathEscape(owner) + "/" + url.PathEscape(repo)
+}
+
+func reviewFolder(path string) string {
+	if strings.Trim(path, "/") == "" {
+		return "the repository root"
+	}
+	return "folder " + reviewCode(path)
+}
+
+// reviewList names up to reviewListCap skill paths as code, then how many
+// more there are.
+func reviewList(paths []string) string { return reviewListN(paths, reviewListCap) }
+
+// reviewListN is reviewList with its own cap.
+func reviewListN(paths []string, max int) string {
+	if len(paths) == 0 {
+		return "none"
+	}
+	n := len(paths)
+	if n > max {
+		n = max
+	}
+	parts := make([]string, 0, n+1)
+	for _, p := range paths[:n] {
+		parts = append(parts, reviewCode(p))
+	}
+	if len(paths) > n {
+		parts = append(parts, fmt.Sprintf("and %d more", len(paths)-n))
+	}
+	return strings.Join(parts, ", ")
+}
+
+// reviewCode is s as a Markdown code span. Skill paths and branch names
+// come from the repository, so a backtick in them cannot end the span.
+func reviewCode(s string) string {
+	return "`" + strings.ReplaceAll(reviewClip(s, 200), "`", "'") + "`"
+}
+
+// reviewMD escapes the Markdown punctuation that could change how plain
+// repository text renders.
+func reviewMD(s string) string {
+	r := strings.NewReplacer(`\`, `\\`, "*", `\*`, "_", `\_`, "[", `\[`, "]", `\]`, "`", `\`+"`", "<", "&lt;", ">", "&gt;")
+	return r.Replace(s)
+}
+
+// reviewShort is the 12-character commit label.
+func reviewShort(sha string) string {
+	if len(sha) > 12 {
+		return sha[:12]
+	}
+	return sha
+}
+
+// reviewClip shortens s to at most n runes, ending with "…" when cut.
+func reviewClip(s string, n int) string {
+	s = strings.TrimSpace(s)
+	if utf8.RuneCountInString(s) <= n {
+		return s
+	}
+	r := []rune(s)
+	return strings.TrimSpace(string(r[:n-1])) + "…"
+}
+
+func reviewPlural(n int) string {
+	if n == 1 {
+		return ""
+	}
+	return "s"
+}

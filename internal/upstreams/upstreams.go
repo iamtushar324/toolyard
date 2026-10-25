@@ -550,7 +550,8 @@ func (s *Service) LoadAll(ctx context.Context) error {
 			continue
 		}
 		// A server saved by an older version under a name toolyard now
-		// reserves (v0.1: jobs, callbacks) cannot load: say so plainly.
+		// reserves (v0.1: jobs, callbacks; the skills hub: skills, the old
+		// skills workspace server) cannot load: say so plainly.
 		if newlyReserved[srv.Name] {
 			msg := reservedNameError(srv.Name)
 			log.Printf("WARNING: upstream %q %s", srv.Name, msg)
@@ -869,12 +870,17 @@ func reservedName(name string) bool {
 }
 
 // newlyReserved are the names v0.1 reserved: a server saved under one by
-// an older version no longer loads (LoadAll says so).
-var newlyReserved = map[string]bool{"jobs": true, "callbacks": true}
+// an older version no longer loads (LoadAll says so). skillhub: "skills"
+// was the built-in skills workspace server (a filesystem MCP server) that
+// the skills hub replaced; the gateway now owns the skills.* tools.
+var newlyReserved = map[string]bool{"jobs": true, "callbacks": true, "skills": true}
 
 // reservedNameError explains why a stored server under a newly reserved
 // name is not loaded, and how to fix it.
 func reservedNameError(name string) string {
+	if name == "skills" {
+		return `not loaded: the server name "skills" is reserved since the skills hub (docs/skills-hub.md), which serves toolyard's own skills.* tools and replaced the old skills workspace server. Delete this server; if it was not that workspace, add it again under another name first.`
+	}
 	return fmt.Sprintf("not loaded: the server name %q is reserved since toolyard v0.1, which uses it for its own %s.* tools. Add this server again under another name, grant that name to the people who used it, then delete this one.", name, name)
 }
 
