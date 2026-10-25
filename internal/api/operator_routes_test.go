@@ -295,7 +295,7 @@ func TestOperatorTokenNeedsOwnerScopeForTrustedSkillOwners(t *testing.T) {
 		!strings.Contains(rec.Body.String(), settings.SkillsTrustedGitHubOwners) {
 		t.Fatalf("write scope: %d %s", rec.Code, rec.Body)
 	}
-	if rec := e.do(t, e.token(t, "owner"), "PATCH", "/v1/settings", body); rec.Code != 200 {
+	if rec := e.do(t, e.token(t, "write", "owner"), "PATCH", "/v1/settings", body); rec.Code != 200 {
 		t.Fatalf("owner scope: %d %s", rec.Code, rec.Body)
 	}
 	if !ownerSettingKeys[settings.SkillsChangeAllowBuildFiles] || !ownerSettingKeys[settings.SkillsTrustedGitHubOwners] {
