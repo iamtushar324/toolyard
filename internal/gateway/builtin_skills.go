@@ -137,6 +137,14 @@ func (g *Gateway) RegisterSkillHub(h SkillHub) {
 	for _, e := range g.skillsTools() {
 		g.registerEntry(e)
 	}
+	// tools.search names matching skills now: say so in its description.
+	g.mu.RLock()
+	search, ok := g.tools[MetaSearchTool]
+	g.mu.RUnlock()
+	if ok {
+		search.tool.Description = metaSearchDescription(true)
+		g.registerEntry(search)
+	}
 	// SEP-2640: the extension (with resources/directory/read) is declared
 	// on the answers MCPSkills fronts, where its methods are served
 	// (declareSkills); it requires the resources capability, declared for

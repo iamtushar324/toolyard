@@ -283,3 +283,22 @@ func TestOperatorScopeFor(t *testing.T) {
 		}
 	}
 }
+
+// TestOperatorTokenNeedsOwnerScopeForTrustedSkillOwners: the trusted
+// GitHub owners decide which new skill sources, an approved agent proposal
+// included, go live without review, so a write-scope operator token cannot
+// change them.
+func TestOperatorTokenNeedsOwnerScopeForTrustedSkillOwners(t *testing.T) {
+	e := newOperatorEnv(t)
+	body := `{"` + settings.SkillsTrustedGitHubOwners + `":"acme"}`
+	if rec := e.do(t, e.token(t), "PATCH", "/v1/settings", body); rec.Code != 403 ||
+		!strings.Contains(rec.Body.String(), settings.SkillsTrustedGitHubOwners) {
+		t.Fatalf("write scope: %d %s", rec.Code, rec.Body)
+	}
+	if rec := e.do(t, e.token(t, "owner"), "PATCH", "/v1/settings", body); rec.Code != 200 {
+		t.Fatalf("owner scope: %d %s", rec.Code, rec.Body)
+	}
+	if !ownerSettingKeys[settings.SkillsChangeAllowBuildFiles] || !ownerSettingKeys[settings.SkillsTrustedGitHubOwners] {
+		t.Fatal("the skills hub's trust settings must need the owner scope")
+	}
+}

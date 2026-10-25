@@ -48,7 +48,9 @@ func (s *Server) authConfig(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"clerk":   clerkCfg,
 		"version": s.buildVersion, "environment": s.environment,
-		"capabilities": map[string]bool{"voice": s.voice != nil, "notes": s.notes != nil && s.notes.Enabled(), "memory": s.mempalace != nil},
+		"capabilities": map[string]bool{"voice": s.voice != nil, "notes": s.notes != nil && s.notes.Enabled(), "memory": s.mempalace != nil,
+			// The skills hub (-skills): the dashboard shows the Skills page only while it is on.
+			"skills": s.skillsAdmin != nil},
 		// The local password account stays as the break-glass login.
 		"password_login": !s.clerkOwnerOnly,
 		"owner_only":     s.clerkOwnerOnly,

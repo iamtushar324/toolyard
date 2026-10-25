@@ -35,6 +35,7 @@ import (
 
 	"github.com/tusharbhardwaj/toolyard/internal/actor"
 	"github.com/tusharbhardwaj/toolyard/internal/audit"
+	"github.com/tusharbhardwaj/toolyard/internal/cluster"
 	"github.com/tusharbhardwaj/toolyard/internal/inbox"
 	"github.com/tusharbhardwaj/toolyard/internal/store"
 )
@@ -57,6 +58,10 @@ const (
 	// MaxPendingChangeProposals is how many change proposals one agent
 	// may have waiting at once.
 	MaxPendingChangeProposals = 5
+	// MaxChangeProposalsPerHour is how many change proposals one agent may
+	// send in an hour, counted on every replica (rate_limit_buckets), so a
+	// looping agent cannot flood the source owner's Inbox.
+	MaxChangeProposalsPerHour = 10
 	// ChangeBranchPrefix starts the branch of every proposal.
 	ChangeBranchPrefix = "toolyard/skills/"
 )
@@ -111,6 +116,8 @@ type ChangeOptions struct {
 type ChangeProposals struct {
 	o     ChangeOptions
 	store proposalStore
+	// limit counts each agent's change proposals per hour.
+	limit *cluster.Counter
 }
 
 // NewChangeProposals registers the change item handler with the Inbox.
@@ -121,7 +128,7 @@ func NewChangeProposals(o ChangeOptions) (*ChangeProposals, error) {
 	if o.Now == nil {
 		o.Now = time.Now
 	}
-	c := &ChangeProposals{o: o, store: proposalStore{db: o.DB, now: o.Now}}
+	c := &ChangeProposals{o: o, store: proposalStore{db: o.DB, now: o.Now}, limit: cluster.NewCounter(o.DB)}
 	// HumanOnly: the Inbox itself refuses an answer that is not the
 	// creator's own (an operator token, a batch, a rule, a grant).
 	o.Inbox.HandleSystem(ChangeProposalItemKind, c.decide, inbox.SystemOptions{HumanOnly: true})
@@ -259,6 +266,16 @@ func (c *ChangeProposals) ProposeChange(ctx context.Context, v Viewer, in Change
 	stored, err := json.Marshal(ci)
 	if err != nil {
 		return nil, err
+	}
+	// Counted last, right before the Inbox item: a refused proposal costs
+	// the agent nothing, and an hour's cap holds whatever happened to the
+	// earlier ones.
+	allowed, err := c.limit.Allow(ctx, "skillhub-change:"+v.AgentID, MaxChangeProposalsPerHour, time.Hour, c.o.Now())
+	if err != nil {
+		return nil, fmt.Errorf("skillhub: change proposal rate limit: %w", err)
+	}
+	if !allowed {
+		return nil, fmt.Errorf("%w: at most %d change proposals an hour; try again later", ErrLimit, MaxChangeProposalsPerHour)
 	}
 	row := &proposalRow{ID: id, Kind: proposalKindChange, Status: proposalPending, AgentID: v.AgentID,
 		UserID: src.CreatedBy, SourceID: src.ID, Input: string(stored), Reason: summary}
@@ -579,11 +596,11 @@ func (c *ChangeProposals) mine(row *proposalRow, v Viewer) bool {
 }
 
 // Sweep settles what the Inbox handler could not: a pending proposal whose
-// item was decided while no handler ran, expired or was withdrawn, and an
-// approved proposal whose GitHub writes stopped or got an uncertain answer
-// (resumed after changeStaleAfter, reconciling with GitHub first). Run it
-// on one node at a time (RunInboxSweeps). One row's failure does not stop
-// the others; the first error is returned.
+// item was decided while no handler ran, expired or was withdrawn (or whose
+// source was deleted), and an approved proposal whose GitHub writes stopped
+// or got an uncertain answer (resumed after changeStaleAfter, reconciling
+// with GitHub first). Run it on one node at a time (RunInboxSweeps). One
+// row's failure does not stop the others; the first error is returned.
 func (c *ChangeProposals) Sweep(ctx context.Context) error {
 	if c == nil {
 		return nil
@@ -614,6 +631,11 @@ func (c *ChangeProposals) Sweep(ctx context.Context) error {
 		}
 		c.resume(ctx, &stale[i])
 	}
+	// Drop the expired hourly counts (the source proposals' sweep does
+	// the same; either one is enough).
+	if err := c.limit.Sweep(ctx, c.o.Now()); err != nil && first == nil {
+		first = err
+	}
 	return first
 }
 
@@ -636,9 +658,13 @@ func (c *ChangeProposals) reconcile(ctx context.Context, row *proposalRow) error
 	}
 	switch item.Status {
 	case inbox.StatusAnswered, inbox.StatusDenied:
-		if item.System != nil && item.System.Kind == ChangeProposalItemKind {
-			_, _ = c.decide(ctx, item) // records its own outcome on the row
+		if lostSystemTag(item, ChangeProposalItemKind) {
+			// Never act on it (no GitHub write): the row fails, so the
+			// agent's limit frees up and it can propose again.
+			_, err = c.store.move(ctx, row.ID, []string{proposalPending}, proposalFailed, proposalUpdate{Error: lostTagError})
+			return err
 		}
+		_, _ = c.decide(ctx, item) // records its own outcome on the row
 	case inbox.StatusCancelled:
 		_, err = c.store.move(ctx, row.ID, []string{proposalPending}, proposalRejected, proposalUpdate{Error: "the Inbox item was withdrawn"})
 	case inbox.StatusExpired:
@@ -647,6 +673,11 @@ func (c *ChangeProposals) reconcile(ctx context.Context, row *proposalRow) error
 		// Past its deadline the item can no longer be decided.
 		if item.ExpiresAt > 0 && item.ExpiresAt <= c.o.Now().UnixMilli() {
 			_, err = c.store.move(ctx, row.ID, []string{proposalPending}, proposalRejected, proposalUpdate{Error: "the Inbox item expired without a decision"})
+			return err
+		}
+		// A deleted source takes its open change proposals with it.
+		if _, gerr := c.o.Admin.GetSource(ctx, row.SourceID); errors.Is(gerr, ErrNotFound) {
+			return closeProposalRows(ctx, c.store, c.o.Inbox, []proposalRow{*row}, proposalRejected, "the skill source was deleted")
 		}
 	}
 	return err

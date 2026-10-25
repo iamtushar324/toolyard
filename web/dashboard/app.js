@@ -179,7 +179,15 @@ function defaultRoute() {
   return 'inbox';
 }
 
+// skillsHubOn reports the skills hub (-skills): /v1/auth/config lists it
+// under capabilities. While it is off the Skills page and its nav item are
+// hidden.
+function skillsHubOn() {
+  return !!(state.authConfig && state.authConfig.capabilities && state.authConfig.capabilities.skills);
+}
+
 function routeAllowed(route) {
+  if (route === 'skills' && !skillsHubOn()) return false;
   return isAdmin() || MEMBER_ROUTES.includes(route);
 }
 
@@ -977,7 +985,7 @@ const AGENT_KIND_LABEL = { dashboard: 'Dashboard', voice: 'Voice', cli: 'CLI', s
 const DECIDED_VIA_LABEL = {
   dashboard: 'dashboard', dashboard_batch: 'batch', push_token: 'notification tap', passkey: 'passkey',
   telegram: 'Telegram', auto_rule: 'auto-rule', policy: 'policy rule', inbox_grant: 'inbox grant',
-  agent_cancel: 'cancelled by agent', expiry: 'expired',
+  agent_cancel: 'cancelled by agent', expiry: 'expired', operator: 'operator token',
 };
 
 function shortId(id, n = 12) {
@@ -4711,7 +4719,7 @@ function shell(content) {
         navBtn('agents', 'People & agents', 'people'),
         navBtn('apps', 'Connected apps', 'key'),
         navBtn('tools', 'Tools', 'tools'),
-        navBtn('skills', 'Skills', 'book'),
+        skillsHubOn() ? navBtn('skills', 'Skills', 'book') : null,
         navBtn('settings', 'Settings', 'sliders')) : el('nav', { 'aria-label': 'Main navigation' },
         navBtn('inbox', 'Inbox', 'inbox', inboxBadgeCount()), navBtn('agents', 'Agents', 'people'), navBtn('apps', 'Connected apps', 'key'), navBtn('myservers', 'Available services', 'tools'), navBtn('connections', 'Connections', 'plug')),
       el('div', { class: 'sidebar-footer' }, admin ? renderStreamPill() : null,
@@ -4745,7 +4753,7 @@ function renderMoreSheet() {
         item('agents', 'People & agents', 'Manage access and enrolled agents'),
         item('apps', 'Connected apps', 'Apps added by URL, like ChatGPT and Claude'),
         item('tools', 'Tools', 'Browse tools and review access policies'),
-        item('skills', 'Skills', 'Skill sources toolyard serves to agents'),
+        skillsHubOn() ? item('skills', 'Skills', 'Skill sources toolyard serves to agents') : null,
         item('settings', 'Settings', 'Workspace preferences'),
       ] : [
         item('agents',    'Agents',     'Manage your enrolled agents'),

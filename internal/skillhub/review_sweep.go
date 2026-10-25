@@ -11,13 +11,20 @@ package skillhub
 //     no handler for those);
 //   - an open review whose version no longer waits for review (a newer
 //     commit, a change of mode, branch, folder or pinned commit, a deleted
-//     source) is cancelled, so nobody approves an outdated version.
+//     source) is cancelled, so nobody approves an outdated version;
+//   - an item decided on a replica that predates system items (it dropped
+//     the tag, so no handler ran) fails its row, so limits free up and a
+//     new question can be asked; toolyard never acts on such an answer;
+//   - an approval whose process stopped before it finished (the row stays
+//     approved) is resumed once it is approvedStaleAfter old, under a
+//     compare-and-swap claim so two replicas never both act.
 //
 // Every step is a conditional update of the row, so a second runner, or the
 // Inbox handler racing the sweep, applies nothing twice.
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"time"
 
@@ -36,7 +43,39 @@ const (
 	// inboxOrphanAfter is when a pending row whose Inbox item was never
 	// created (the process stopped in between) is given up.
 	inboxOrphanAfter = 10 * time.Minute
+	// approvedStaleAfter is how long an approved review or source proposal
+	// may stay unfinished before the sweep resumes it: longer than the
+	// Inbox handler may run (inbox systemHandlerTimeout, 2 minutes).
+	approvedStaleAfter = 5 * time.Minute
+	// lostTagError is a row whose Inbox item was decided without its system
+	// tag (a replica that predates system items rewrote it).
+	lostTagError = "the Inbox item was decided on a toolyard replica that predates system items, so toolyard did not act on the answer; ask again"
 )
+
+// lostSystemTag reports an item that is not (or no longer) the system item
+// of kind: an older replica rewrote it without the tag.
+func lostSystemTag(item *inbox.Request, kind string) bool {
+	return item.System == nil || item.System.Kind != kind
+}
+
+// closeProposalRows moves pending rows to status to with reason, and
+// withdraws their Inbox items (sent by toolyard for row.UserID).
+func closeProposalRows(ctx context.Context, st proposalStore, ib *inbox.Service, rows []proposalRow, to, reason string) error {
+	for _, row := range rows {
+		moved, err := st.move(ctx, row.ID, []string{proposalPending}, to, proposalUpdate{Error: reason})
+		if err != nil {
+			return err
+		}
+		if !moved || row.InboxID == "" {
+			continue
+		}
+		if _, err := ib.CancelBySystem(ctx, inbox.SystemAgentID(row.UserID), row.InboxID, reason); err != nil &&
+			!errors.Is(err, inbox.ErrNotPending) && !errors.Is(err, inbox.ErrNotFound) {
+			return err
+		}
+	}
+	return nil
+}
 
 // InboxSweeper is a feature whose Inbox questions need a periodic sweep:
 // *ReviewInbox and *SourceProposals.
@@ -93,7 +132,56 @@ func (ri *ReviewInbox) Sweep(ctx context.Context) error {
 			first = err
 		}
 	}
+	stale, err := ri.store.staleApproved(ctx, proposalKindReview, ri.o.Now().Add(-approvedStaleAfter).UnixMilli(), inboxSweepBatch)
+	if err != nil {
+		if first == nil {
+			first = err
+		}
+		return first
+	}
+	for i := range stale {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if err := ri.resume(ctx, &stale[i]); err != nil && first == nil {
+			first = err
+		}
+	}
 	return first
+}
+
+// resume finishes an approved review whose process stopped: the version
+// goes live if it still waits for review, the row is done if it is live
+// already, and else (another version waits or is live) the row is
+// cancelled as superseded. Only the caller that wins the claim acts.
+func (ri *ReviewInbox) resume(ctx context.Context, row *proposalRow) error {
+	ok, err := ri.store.claim(ctx, row.ID, proposalApproved, row.UpdatedAt)
+	if err != nil || !ok {
+		return err
+	}
+	decider := row.DecidedBy
+	if decider == "" {
+		decider = row.UserID
+	}
+	var in reviewInput
+	_ = json.Unmarshal([]byte(row.Input), &in)
+	src, err := ri.o.Admin.GetSource(ctx, row.SourceID)
+	switch {
+	case errors.Is(err, ErrNotFound):
+		_, err = ri.store.move(ctx, row.ID, []string{proposalApproved}, proposalCancelled, proposalUpdate{Error: "the source was deleted"})
+		return err
+	case err != nil:
+		return err // claimed: the next sweep after approvedStaleAfter tries again
+	case src.ActiveVersionID == row.VersionID:
+		_, err = ri.store.move(ctx, row.ID, []string{proposalApproved}, proposalDone, proposalUpdate{})
+		return err
+	case src.PendingVersionID == row.VersionID:
+		_, _ = ri.applyApproved(ctx, row, decider, reviewShort(in.SHA), "inbox, resumed") // records its outcome on the row
+		return nil
+	}
+	_, err = ri.store.move(ctx, row.ID, []string{proposalApproved}, proposalCancelled,
+		proposalUpdate{Error: "superseded: another version waits for review or is live now"})
+	return err
 }
 
 func (ri *ReviewInbox) sweepRow(ctx context.Context, row *proposalRow) error {
@@ -114,8 +202,10 @@ func (ri *ReviewInbox) sweepRow(ctx context.Context, row *proposalRow) error {
 	}
 	switch item.Status {
 	case inbox.StatusAnswered, inbox.StatusDenied:
-		if item.System == nil || item.System.Kind != ReviewItemKind {
-			return nil
+		if lostSystemTag(item, ReviewItemKind) {
+			// Never act on it; a failed row lets the next check ask again.
+			_, err = ri.store.move(ctx, row.ID, []string{proposalPending}, proposalFailed, proposalUpdate{Error: lostTagError})
+			return err
 		}
 		// decide records its outcome on the row (done, rejected,
 		// cancelled or failed); its error is that outcome, not a

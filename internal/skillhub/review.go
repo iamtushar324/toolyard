@@ -178,20 +178,21 @@ func (ri *ReviewInbox) Settle(ctx context.Context, sourceID, versionID, reason s
 }
 
 func (ri *ReviewInbox) settleRows(ctx context.Context, rows []proposalRow, reason string) error {
-	for _, row := range rows {
-		moved, err := ri.store.move(ctx, row.ID, []string{proposalPending}, proposalCancelled, proposalUpdate{Error: reason})
-		if err != nil {
-			return err
-		}
-		if !moved || row.InboxID == "" {
-			continue
-		}
-		if _, err := ri.o.Inbox.CancelBySystem(ctx, inbox.SystemAgentID(row.UserID), row.InboxID, reason); err != nil &&
-			!errors.Is(err, inbox.ErrNotPending) && !errors.Is(err, inbox.ErrNotFound) {
-			return err
-		}
+	return closeProposalRows(ctx, ri.store, ri.o.Inbox, rows, proposalCancelled, reason)
+}
+
+// SourceDeleted closes every open question about a deleted source: its
+// review items, and the agents' change proposals against it (rejected, so
+// the proposing agent sees why; their Inbox items are withdrawn).
+func (ri *ReviewInbox) SourceDeleted(ctx context.Context, sourceID, reason string) error {
+	if err := ri.Settle(ctx, sourceID, "", reason); err != nil {
+		return err
 	}
-	return nil
+	rows, err := ri.store.pendingForSource(ctx, proposalKindChange, sourceID)
+	if err != nil {
+		return err
+	}
+	return closeProposalRows(ctx, ri.store, ri.o.Inbox, rows, proposalRejected, reason)
 }
 
 // decide is the Inbox handler of review items: approve activates the
@@ -234,13 +235,7 @@ func (ri *ReviewInbox) decide(ctx context.Context, r *inbox.Request) (string, er
 		if ok, err := ri.store.move(ctx, row.ID, []string{proposalPending}, proposalApproved, proposalUpdate{DecidedBy: decider}); err != nil || !ok {
 			return "This review was already settled.", err
 		}
-		if err := ri.o.Admin.Activate(ctx, decider, row.SourceID, row.VersionID); err != nil {
-			_, _ = ri.store.move(ctx, row.ID, []string{proposalApproved}, proposalFailed, proposalUpdate{Error: reviewClip(err.Error(), 500)})
-			return "", fmt.Errorf("make version %s live: %w", label, err)
-		}
-		_, _ = ri.store.move(ctx, row.ID, []string{proposalApproved}, proposalDone, proposalUpdate{})
-		ri.audit(ctx, "skills.version_activate", decider, row, "inbox")
-		return "Version " + label + " is live.", nil
+		return ri.applyApproved(ctx, row, decider, label, "inbox")
 	}
 	note := strings.TrimSpace(r.OwnerNote)
 	if note == "" {
@@ -255,6 +250,19 @@ func (ri *ReviewInbox) decide(ctx context.Context, r *inbox.Request) (string, er
 	}
 	ri.audit(ctx, "skills.version_reject", decider, row, note)
 	return "Version " + label + " was rejected; the current version stays live.", nil
+}
+
+// applyApproved makes an approved review's version live and records the
+// outcome; the row is approved (the caller won that move or a resume's
+// claim).
+func (ri *ReviewInbox) applyApproved(ctx context.Context, row *proposalRow, decider, label, via string) (string, error) {
+	if err := ri.o.Admin.Activate(ctx, decider, row.SourceID, row.VersionID); err != nil {
+		_, _ = ri.store.move(ctx, row.ID, []string{proposalApproved}, proposalFailed, proposalUpdate{Error: reviewClip(err.Error(), 500)})
+		return "", fmt.Errorf("make version %s live: %w", label, err)
+	}
+	_, _ = ri.store.move(ctx, row.ID, []string{proposalApproved}, proposalDone, proposalUpdate{})
+	ri.audit(ctx, "skills.version_activate", decider, row, via)
+	return "Version " + label + " is live.", nil
 }
 
 func (ri *ReviewInbox) audit(ctx context.Context, event, by string, row *proposalRow, reason string) {

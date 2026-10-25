@@ -259,10 +259,92 @@ func (p *SourceProposals) Sweep(ctx context.Context) error {
 			first = err
 		}
 	}
+	stale, err := p.store.staleApproved(ctx, proposalKindSource, p.o.Now().Add(-approvedStaleAfter).UnixMilli(), inboxSweepBatch)
+	if err != nil && first == nil {
+		first = err
+	}
+	for i := range stale {
+		if ctx.Err() != nil {
+			return ctx.Err()
+		}
+		if err := p.resume(ctx, &stale[i]); err != nil && first == nil {
+			first = err
+		}
+	}
 	if err := p.limit.Sweep(ctx, p.o.Now()); err != nil && first == nil {
 		first = err
 	}
 	return first
+}
+
+// resume finishes an approved source proposal whose process stopped. Only
+// the caller that wins the claim acts. When the interrupted approval had
+// created the source already (the same repository, branch and folder,
+// created by the decider since the approval), the row is done with it;
+// otherwise the source is created now, or the row fails with the reason.
+func (p *SourceProposals) resume(ctx context.Context, row *proposalRow) error {
+	ok, err := p.store.claim(ctx, row.ID, proposalApproved, row.UpdatedAt)
+	if err != nil || !ok {
+		return err
+	}
+	decider := row.DecidedBy
+	if decider == "" {
+		decider = row.UserID
+	}
+	var in SourceInput
+	if err := json.Unmarshal([]byte(row.Input), &in); err != nil {
+		_, err = p.store.move(ctx, row.ID, []string{proposalApproved}, proposalFailed, proposalUpdate{Error: "the stored proposal is unreadable"})
+		return err
+	}
+	decidedAt, err := p.store.changeDecidedAt(ctx, row.ID)
+	if err != nil {
+		return err
+	}
+	if decidedAt == 0 {
+		decidedAt = row.CreatedAt
+	}
+	src, err := p.createdFor(ctx, in, decider, decidedAt)
+	if err != nil {
+		return err // claimed: the next sweep after approvedStaleAfter tries again
+	}
+	if src != nil {
+		if _, err := p.store.move(ctx, row.ID, []string{proposalApproved}, proposalDone, proposalUpdate{Result: src.ID}); err != nil {
+			return err
+		}
+		if src.LastCheckedAt == nil {
+			p.firstSync(ctx, src.ID)
+		}
+		return nil
+	}
+	_, _ = p.applyApproved(ctx, row, decider, in) // records its outcome on the row
+	return nil
+}
+
+// createdFor finds the source an interrupted approval created: same
+// repository, branch and folder as the proposal, created by the decider
+// since a minute before the approval.
+func (p *SourceProposals) createdFor(ctx context.Context, in SourceInput, decider string, decidedAt int64) (*Source, error) {
+	ref, err := p.o.Admin.ParseURL(in.URL)
+	if err != nil {
+		return nil, nil
+	}
+	list, err := p.o.Admin.ListSources(ctx)
+	if err != nil {
+		return nil, err
+	}
+	since := decidedAt - time.Minute.Milliseconds()
+	for i := range list {
+		s := &list[i]
+		switch {
+		case s.CreatedBy != decider, s.CreatedAt.UnixMilli() < since,
+			!strings.EqualFold(s.Owner, ref.Owner), !strings.EqualFold(s.Repo, ref.Repo),
+			in.Branch != "" && s.Branch != in.Branch,
+			strings.Trim(s.Path, "/") != strings.Trim(in.Path, "/"):
+			continue
+		}
+		return s, nil
+	}
+	return nil, nil
 }
 
 // reconcile settles a pending proposal from its Inbox item.
@@ -284,8 +366,11 @@ func (p *SourceProposals) reconcile(ctx context.Context, row *proposalRow) error
 	}
 	switch item.Status {
 	case inbox.StatusAnswered, inbox.StatusDenied:
-		if item.System == nil {
-			return nil
+		if lostSystemTag(item, SourceProposalItemKind) {
+			// Never act on it: the row fails, so the agent's limit frees up
+			// and it can propose again.
+			_, err = p.store.move(ctx, row.ID, []string{proposalPending}, proposalFailed, proposalUpdate{Error: lostTagError})
+			return err
 		}
 		_, _ = p.decide(ctx, item) // records its own outcome on the row
 	case inbox.StatusCancelled:
@@ -339,6 +424,13 @@ func (p *SourceProposals) decide(ctx context.Context, r *inbox.Request) (string,
 		_, _ = p.store.move(ctx, row.ID, []string{proposalApproved}, proposalFailed, proposalUpdate{Error: "the stored proposal is unreadable"})
 		return "", fmt.Errorf("proposal %s: %w", row.ID, err)
 	}
+	return p.applyApproved(ctx, row, decider, in)
+}
+
+// applyApproved creates the source of an approved proposal (mode by the
+// trusted-owner rule), starts its first sync and records the outcome; the
+// row is approved (the caller won that move or a resume's claim).
+func (p *SourceProposals) applyApproved(ctx context.Context, row *proposalRow, decider string, in SourceInput) (string, error) {
 	if in.Mode == "" {
 		in.Mode = ModeReview
 		if ref, err := p.o.Admin.ParseURL(in.URL); err == nil && p.o.Admin.TrustedOwner(ctx, ref.Owner) {
