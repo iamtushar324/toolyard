@@ -895,6 +895,45 @@ func TestClientIDMetadataDocumentChecks(t *testing.T) {
 	}
 }
 
+// Claude.ai's metadata document lists jwt-bearer next to authorization_code
+// and refresh_token. toolyard ignores grant types it does not support and
+// accepts the client, for documents and for registration alike; a client
+// that leaves out authorization_code is still refused.
+func TestClientsMayListUnsupportedGrantTypes(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	srv, _ := cimdServer(t, func(u string) any {
+		return map[string]any{
+			"client_id": u, "client_name": "Claude", "redirect_uris": []string{"https://a.example/cb"},
+			"grant_types":                []string{"authorization_code", "refresh_token", "urn:ietf:params:oauth:grant-type:jwt-bearer"},
+			"response_types":             []string{"code"},
+			"token_endpoint_auth_method": "none",
+		}
+	}, http.StatusOK)
+	c, oerr := cimdService(f, srv, true).ResolveClient(ctx, srv.URL+"/doc.json", "198.51.100.7")
+	if oerr != nil {
+		t.Fatalf("a document that also lists jwt-bearer was refused: %v", oerr)
+	}
+	if c.Name != "Claude" || !c.Public() {
+		t.Fatalf("client: %+v", c)
+	}
+	noCode, _ := cimdServer(t, func(u string) any {
+		return map[string]any{"client_id": u, "redirect_uris": []string{"https://a.example/cb"}, "grant_types": []string{"urn:ietf:params:oauth:grant-type:jwt-bearer"}}
+	}, http.StatusOK)
+	if _, oerr := cimdService(f, noCode, true).ResolveClient(ctx, noCode.URL+"/doc.json", "198.51.100.8"); oerr == nil || oerr.Code != "invalid_client" {
+		t.Fatalf("a document without authorization_code was accepted: %v", oerr)
+	}
+	body, _ := json.Marshal(map[string]any{"redirect_uris": []string{"https://a.example/cb"}, "token_endpoint_auth_method": "none",
+		"grant_types": []string{"authorization_code", "refresh_token", "client_credentials"}, "response_types": []string{"code", "token"}})
+	if _, oerr := f.svc.Register(ctx, body, "198.51.100.9"); oerr != nil {
+		t.Fatalf("a registration that also lists client_credentials was refused: %v", oerr)
+	}
+	body, _ = json.Marshal(map[string]any{"redirect_uris": []string{"https://a.example/cb"}, "response_types": []string{"token"}})
+	if _, oerr := f.svc.Register(ctx, body, "198.51.100.9"); oerr == nil || oerr.Code != "invalid_client_metadata" {
+		t.Fatalf("a registration without the code response type was accepted: %v", oerr)
+	}
+}
+
 func TestHTTPEndpoints(t *testing.T) {
 	f := newFixture(t)
 	mux := http.NewServeMux()
