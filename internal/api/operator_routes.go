@@ -118,10 +118,12 @@ func operatorScopeFor(method, path string) (scope string, ok bool) {
 	// path is the credential, so no token may redeem one.
 	// Likewise an upload ticket (upload_routes.go) is its own credential.
 	// Code mode over REST runs as an agent, and session tokens belong to
-	// an agent: a person's operator token reaches neither.
+	// an agent: a person's operator token reaches neither. The agent
+	// skills routes and a bundle download (its ticket is the credential)
+	// are an agent's too.
 	if operatorNeverPaths[path] || strings.Contains(path, "/reveal") || strings.HasPrefix(path, connectLinkPath) || strings.HasPrefix(path, uploadsPathPrefix) ||
 		strings.HasPrefix(path, codePathPrefix) || strings.HasPrefix(path, sessionTokensPrefix) ||
-		path == jobsPath || strings.HasPrefix(path, jobsPrefix) {
+		path == jobsPath || strings.HasPrefix(path, jobsPrefix) || skillsAgentPath(path) {
 		return "", false
 	}
 	switch method {
@@ -493,6 +495,14 @@ var operatorCatalog = []operatorCatalogEntry{
 	{"/v1/code/ty", "GET", "the ty command for code mode over REST, Python 3 (no token)"},
 	{"/v1/jobs", "GET POST", "agent: POST starts a tool call as an async job {tool, arguments, reason, callback_ref, wait_seconds} (Idempotency-Key, Prefer: wait=N); GET lists the agent's jobs ?status=&limit=&before= (agent or session token; never via operator token)"},
 	{"/v1/jobs/{id}", "GET POST", "agent: GET a job (Prefer: wait=N); GET /result its tool result; POST /cancel cancels it (never via operator token)"},
+	{"/v1/skills/search", "GET", "agent: skills.search ?query=, mode=keyword|regex, source, limit, include_host (agent or session token; never via operator token)"},
+	{"/v1/skills/get", "GET", "agent: skills.get ?skill=, include_files (agent or session token; never via operator token)"},
+	{"/v1/skills/read", "GET", "agent: skills.read ?uri=, offset, limit (agent or session token; never via operator token)"},
+	{"/v1/skills/grep", "GET", "agent: skills.grep ?pattern=, source, path, ignore_case, limit, include_host (agent or session token; never via operator token)"},
+	{"/v1/skills/sources", "GET", "agent: skills.sources, the skill sources the caller sees (agent or session token)"},
+	{"/v1/skills/list", "GET", "agent: skills.list ?cursor=, limit, source, include_host (agent or session token; never via operator token)"},
+	{"/v1/skills/bundle", "POST", "agent: skills.bundle {skills, reason} -> a single-use download URL for a .tar.gz (agent or session token; never via operator token)"},
+	{"/v1/skills/bundle/{id}", "GET", "download a skills bundle (.tar.gz): the single-use ticket in the path is the credential, for 10 minutes (no token; never via operator token)"},
 	{"/v1/approvals", "GET", "approval queue"},
 	{"/v1/approvals/{id}", "GET POST", "one approval; POST decides it"},
 	{"/v1/approvals/decide-batch", "POST", "decide many approvals"},

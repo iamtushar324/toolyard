@@ -480,6 +480,7 @@ func (s *Server) Routes(mux *http.ServeMux) {
 	s.registerSessionTokenRoutes(mux)
 	s.registerCodeRoutes(mux)
 	s.registerJobsRoutes(mux)
+	s.registerSkillsRoutes(mux)
 }
 
 // ---- helpers ----------------------------------------------------------------

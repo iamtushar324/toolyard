@@ -68,16 +68,16 @@ func (s *Server) RoleGuard(next http.Handler) http.Handler {
 }
 
 // sessionTokenAllowed reports whether a session token may call path: the
-// code routes, whoami, the agent's approval polling, and the session token
-// routes (whose handlers allow only revoking the token itself). Methods
-// are left to the handlers. A path that is not clean gets no benefit of
-// the doubt.
+// code routes, the job and agent skills routes, whoami, the agent's
+// approval polling, and the session token routes (whose handlers allow
+// only revoking the token itself). Methods are left to the handlers. A
+// path that is not clean gets no benefit of the doubt.
 func sessionTokenAllowed(path string) bool {
 	if path != pathpkg.Clean(path) {
 		return false
 	}
 	return strings.HasPrefix(path, codePathPrefix) ||
-		path == jobsPath || strings.HasPrefix(path, jobsPrefix) ||
+		path == jobsPath || strings.HasPrefix(path, jobsPrefix) || skillsAgentPath(path) || path == skillsSourcesPath ||
 		path == "/v1/agents/whoami" ||
 		strings.HasPrefix(path, "/v1/agents/approvals/") ||
 		path == sessionTokensPath || strings.HasPrefix(path, sessionTokensPrefix)
@@ -219,9 +219,12 @@ func memberAllowed(method, path string) bool {
 		return true
 	}
 	// Bearer-only routes (agent or session token) that never read a
-	// cookie: session tokens, code mode over REST and async jobs.
+	// cookie: session tokens, code mode over REST, async jobs and the
+	// agent skills routes, whose bundle download is authenticated by the
+	// single-use ticket in its path (skills_routes.go). Not
+	// /v1/skills/sources, which the admin skill routes share.
 	if strings.HasPrefix(path, sessionTokensPrefix) || strings.HasPrefix(path, codePathPrefix) ||
-		path == jobsPath || strings.HasPrefix(path, jobsPrefix) {
+		path == jobsPath || strings.HasPrefix(path, jobsPrefix) || skillsAgentPath(path) {
 		return true
 	}
 	// A native Inbox upload: the single-use ticket in the path is the

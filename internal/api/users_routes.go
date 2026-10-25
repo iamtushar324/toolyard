@@ -15,7 +15,7 @@ import (
 )
 
 // groupInfo is one grantable tool group: an upstream server or a built-in
-// data group (memory, events, notes, skills).
+// data group (memory, events, notes).
 type groupInfo struct {
 	Name      string `json:"name"`
 	Kind      string `json:"kind"` // "server" | "builtin"
