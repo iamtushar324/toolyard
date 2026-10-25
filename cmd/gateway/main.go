@@ -1403,6 +1403,7 @@ func runServe(argv []string) error {
 		skillHubAdmin     skillhub.Admin
 		skillHubReviews   api.SkillReviewSettler
 		skillHubProposals skillhub.Proposals
+		skillHubSweepers  []skillhub.InboxSweeper // run by the Inbox sweep loop below
 	)
 	if skillhubSvc != nil {
 		// skillhub: assigned only here, so a hub that is off stays a nil
@@ -1436,11 +1437,7 @@ func runServe(argv []string) error {
 			return fmt.Errorf("skills hub proposals: %w", err)
 		}
 		skillHubProposals = proposals
-		// skillhub (slice C): settle review and proposal questions the Inbox
-		// handler could not (expired, withdrawn, decided while no handler ran).
-		leaderLoop(ctx, clusterSvc, skillhub.InboxSweepLoop, time.Minute, func(ctx context.Context) {
-			skillhub.RunInboxSweeps(ctx, skillhub.InboxSweepInterval, reviews, proposals)
-		})
+		skillHubSweepers = append(skillHubSweepers, reviews, proposals)
 	}
 
 	// skillhub (slice D): people's own toolyard GitHub connections (the
@@ -1499,6 +1496,16 @@ func runServe(argv []string) error {
 		if sp, ok := skillHubProposals.(*skillhub.SourceProposals); ok {
 			sp.SetChangeProposals(changes)
 		}
+		skillHubSweepers = append(skillHubSweepers, changes)
+	}
+	// skillhub (slices C, D): settle the review, source-proposal and
+	// change-proposal questions the Inbox handler could not (expired,
+	// withdrawn, decided while no handler ran, an approved change whose pull
+	// request write was left uncertain).
+	if len(skillHubSweepers) > 0 {
+		leaderLoop(ctx, clusterSvc, skillhub.InboxSweepLoop, time.Minute, func(ctx context.Context) {
+			skillhub.RunInboxSweeps(ctx, skillhub.InboxSweepInterval, skillHubSweepers...)
+		})
 	}
 
 	// skillhub (slice B): the agent surface: the skills.* tools, the MCP
