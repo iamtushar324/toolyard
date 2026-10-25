@@ -8,7 +8,7 @@ package api
 //	POST   /v1/skills/sources/inspect                       {url, token?} -> repository, branches, trusted_owner
 //	POST   /v1/skills/sources/preview                       SourceInput -> dry run; nothing is stored
 //	GET    /v1/skills/admin/sources                         every source (the agent list is GET /v1/skills/sources)
-//	POST   /v1/skills/sources                               SourceInput -> 201 {source, sync}
+//	POST   /v1/skills/sources                               SourceInput -> 201 {source, status: "syncing"}; the first sync runs in the background
 //	GET    /v1/skills/sources/{id}
 //	PATCH  /v1/skills/sources/{id}                          SourceUpdate
 //	DELETE /v1/skills/sources/{id}
@@ -38,6 +38,7 @@ import (
 	"time"
 
 	"github.com/tusharbhardwaj/toolyard/internal/audit"
+	"github.com/tusharbhardwaj/toolyard/internal/goroutines"
 	"github.com/tusharbhardwaj/toolyard/internal/identity"
 	"github.com/tusharbhardwaj/toolyard/internal/skillhub"
 )
@@ -53,7 +54,12 @@ const (
 	// skillWebhookTimeout bounds one webhook's sync; it is detached from
 	// the request so GitHub closing the connection does not cut it short.
 	skillWebhookTimeout = 2 * time.Minute
-	skillAdminHubOff    = "skills hub is off"
+	// skillCreateRetryWindow is how long after a create the same create
+	// (same person, repository, branch and folder) answers with the
+	// source it made instead of a second one with a "-2" slug: a retried
+	// request, a double click.
+	skillCreateRetryWindow = 2 * time.Minute
+	skillAdminHubOff       = "skills hub is off"
 )
 
 // skillAdminIDPattern is the shape of source and version IDs in a path.
@@ -134,23 +140,88 @@ func (s *Server) skillSourceCreate(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, redactSkillSecrets(err.Error(), in.Token))
 		return
 	}
+	if existing := s.recentSkillSource(r.Context(), u.ID, in); existing != nil {
+		writeJSON(w, http.StatusOK, map[string]any{"source": existing, "status": skillSourceStatus(existing), "existing": true})
+		return
+	}
 	src, err := s.skillsAdmin.CreateSource(r.Context(), u.ID, in)
 	if err != nil {
 		writeSkillAdminError(w, err, in.Token)
 		return
 	}
 	s.auditSkillAdmin(r, u, "skills.source_create", src.ID+" "+skillhub.RepoLabel(src.Owner, src.Repo, ""), "")
-	// The first sync runs now, so the admin sees what the source holds.
-	body := map[string]any{"source": src}
-	if res, err := s.skillsAdmin.SyncNow(r.Context(), src.ID); err != nil {
-		body["sync_error"] = redactSkillSecrets(skillAdminErrorText(err), in.Token)
-	} else {
-		body["sync"] = res
-		if fresh, err := s.skillsAdmin.GetSource(r.Context(), src.ID); err == nil {
-			body["source"] = fresh
+	// The first sync runs in the background: a large repository can take
+	// longer than a request should wait. The dashboard polls the source
+	// until its first check is recorded.
+	s.skillFirstSync(r.Context(), src.ID)
+	writeJSON(w, http.StatusCreated, map[string]any{"source": src, "status": "syncing"})
+}
+
+// skillFirstSync syncs a new source on this node in the background. A
+// failure is recorded on the source (last_error), and the leader's poll
+// tries again.
+func (s *Server) skillFirstSync(ctx context.Context, id string) {
+	admin := s.skillsAdmin
+	sctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), skillhub.FirstSyncTimeout)
+	goroutines.Go("skills-first-sync", func() {
+		defer cancel()
+		if _, err := admin.SyncNow(sctx, id); err != nil {
+			log.Printf("skills: first sync of %s: %s", id, skillAdminErrorText(err))
 		}
+	})
+}
+
+// recentSkillSource is the source this person created from the same
+// repository, branch and folder within skillCreateRetryWindow, or nil: a
+// retried create answers with it.
+func (s *Server) recentSkillSource(ctx context.Context, uid string, in skillhub.SourceInput) *skillhub.Source {
+	ref, err := s.skillsAdmin.ParseURL(in.URL)
+	if err != nil {
+		return nil
 	}
-	writeJSON(w, http.StatusCreated, body)
+	branch := strings.TrimSpace(in.Branch)
+	if branch == "" {
+		branch = ref.Branch
+	}
+	folder := strings.Trim(strings.TrimSpace(in.Path), "/")
+	if strings.TrimSpace(in.Path) == "" {
+		folder = strings.Trim(ref.Path, "/")
+	}
+	slug := strings.TrimSpace(in.Slug)
+	list, err := s.skillsAdmin.ListSources(ctx)
+	if err != nil {
+		return nil
+	}
+	for i := range list {
+		src := &list[i]
+		switch {
+		case src.CreatedBy != uid, time.Since(src.CreatedAt) > skillCreateRetryWindow,
+			!strings.EqualFold(src.Owner, ref.Owner), !strings.EqualFold(src.Repo, ref.Repo),
+			strings.Trim(src.Path, "/") != folder,
+			branch != "" && src.Branch != branch,
+			slug != "" && src.Slug != slug:
+			continue
+		}
+		return src
+	}
+	return nil
+}
+
+// skillSourceStatus is the word the dashboard shows for a source.
+func skillSourceStatus(src *skillhub.Source) string {
+	switch {
+	case !src.Enabled:
+		return "paused"
+	case src.LastCheckedAt == nil:
+		return "syncing"
+	case src.LastError != "":
+		return "error"
+	case src.PendingVersionID != "":
+		return "pending review"
+	case src.ActiveVersionID == "":
+		return "syncing"
+	}
+	return "ok"
 }
 
 // skillSourcesItem dispatches everything under /v1/skills/sources/.
@@ -295,10 +366,21 @@ func (s *Server) skillSource(w http.ResponseWriter, r *http.Request, u *identity
 			writeError(w, http.StatusBadRequest, redactSkillSecrets(err.Error(), skillAdminDeref(in.Token)))
 			return
 		}
+		before, err := s.skillsAdmin.GetSource(r.Context(), id)
+		if err != nil {
+			writeSkillAdminError(w, err)
+			return
+		}
 		src, err := s.skillsAdmin.UpdateSource(r.Context(), u.ID, id, in)
 		if err != nil {
 			writeSkillAdminError(w, err, skillAdminDeref(in.Token))
 			return
+		}
+		// A change of what is fetched or of how commits go live makes an
+		// open review question outdated: close it, so nobody approves a
+		// version the new settings did not produce.
+		if what := skillReviewChanges(before, src); what != "" {
+			s.settleSkillReviews(r.Context(), id, "", "the source's "+what+" changed on the Skills page")
 		}
 		s.auditSkillAdmin(r, u, "skills.source_update", id, skillUpdateSummary(in))
 		writeJSON(w, http.StatusOK, src)
@@ -559,6 +641,26 @@ func redactSkillSecrets(msg string, secrets ...string) string {
 		}
 	}
 	return msg
+}
+
+// skillReviewChanges names the settings that changed between before and
+// after which make an open review outdated (mode, branch, folder, pinned
+// commit), or "".
+func skillReviewChanges(before, after *skillhub.Source) string {
+	var f []string
+	if before.Mode != after.Mode {
+		f = append(f, "update mode")
+	}
+	if before.Branch != after.Branch {
+		f = append(f, "branch")
+	}
+	if strings.Trim(before.Path, "/") != strings.Trim(after.Path, "/") {
+		f = append(f, "folder")
+	}
+	if before.PinnedSHA != after.PinnedSHA {
+		f = append(f, "pinned commit")
+	}
+	return strings.Join(f, ", ")
 }
 
 // skillUpdateSummary names the fields a PATCH changed, for the audit row

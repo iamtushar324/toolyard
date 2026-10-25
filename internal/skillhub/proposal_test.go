@@ -20,6 +20,7 @@ func newProposalTest(t *testing.T) (*proposalEnv, *SourceProposals) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	t.Cleanup(p.bg.Wait) // background first syncs end before the database closes
 	return e, p
 }
 
@@ -156,11 +157,14 @@ func TestApprovedProposalCreatesTheSource(t *testing.T) {
 	if created.Mode != ModeReview || created.Branch != "main" || created.Path != "skills" || created.Token != "" {
 		t.Fatalf("created input %+v", created)
 	}
+	// The approval does not wait for GitHub: the first sync runs in the
+	// background.
+	if !strings.Contains(proposalActivity(item), "Added skill source skills (src_00000001, mode review). Its first sync runs now") {
+		t.Fatalf("activity %q", proposalActivity(item))
+	}
+	p.bg.Wait()
 	if len(e.admin.syncs) != 1 || e.admin.syncs[0] != "src_00000001" {
 		t.Fatalf("syncs %v", e.admin.syncs)
-	}
-	if !strings.Contains(proposalActivity(item), "Added skill source skills (src_00000001, mode review). The first sync copied commit 0123456789ab.") {
-		t.Fatalf("activity %q", proposalActivity(item))
 	}
 	done, err := p.GetProposal(ctx, proposalAgent, got.ID)
 	if err != nil || done.Status != "done" || done.Result != "src_00000001" {
@@ -240,9 +244,10 @@ func TestProposalDecisionFailures(t *testing.T) {
 	e.admin.syncErr = errors.New("GitHub is down")
 	got = proposeTestSource(t, p, "acme/skills")
 	item = e.answer(t, got.InboxID, "u_owner", reviewApprove)
-	if !strings.Contains(proposalActivity(item), "The first sync failed: GitHub is down") {
+	if !strings.Contains(proposalActivity(item), "Its first sync runs now") {
 		t.Fatalf("activity %q", proposalActivity(item))
 	}
+	p.bg.Wait()
 	if res, _ := p.GetProposal(ctx, proposalAgent, got.ID); res.Status != "done" {
 		t.Fatalf("status %s", res.Status)
 	}
@@ -296,5 +301,163 @@ func TestProposalHelpers(t *testing.T) {
 	}
 	if _, err := NewSourceProposals(ProposalOptions{}); err == nil {
 		t.Fatal("NewSourceProposals without dependencies must fail")
+	}
+}
+
+// TestProposalLimitFreesUpAfterExpiry: proposals whose items expired no
+// longer count as waiting, so the agent can propose again without anyone
+// polling them.
+func TestProposalLimitFreesUpAfterExpiry(t *testing.T) {
+	e, p := newProposalTest(t)
+	ctx := context.Background()
+	var ids []string
+	for i := 0; i < MaxPendingSourceProposals; i++ {
+		ids = append(ids, proposeTestSource(t, p, "acme/skills").ID)
+	}
+	if _, err := p.ProposeSource(ctx, proposalAgent, SourceInput{URL: "acme/skills"}, "We need these playbooks."); !errors.Is(err, ErrConflict) {
+		t.Fatalf("over the limit: %v", err)
+	}
+	// A week later every item is past its deadline; the Inbox's own sweep
+	// has not run yet.
+	e.advance(inbox.SystemItemTTL + time.Minute)
+	if _, err := p.ProposeSource(ctx, proposalAgent, SourceInput{URL: "acme/skills"}, "We need these playbooks."); err != nil {
+		t.Fatalf("after the old items expired: %v", err)
+	}
+	for _, id := range ids {
+		if res, _ := p.GetProposal(ctx, proposalAgent, id); res.Status != "rejected" || !strings.Contains(res.Error, "expired") {
+			t.Fatalf("proposal %s: %+v", id, res)
+		}
+	}
+}
+
+// TestProposalSweep settles proposals nobody polls: a decision no handler
+// ran, a withdrawn item, an expired one.
+func TestProposalSweep(t *testing.T) {
+	e, p := newProposalTest(t)
+	ctx := context.Background()
+	missed := proposeTestSource(t, p, "acme/skills")
+	withdrawn := proposeTestSource(t, p, "acme/skills")
+	expired := proposeTestSource(t, p, "acme/skills")
+	e.inbox.HandleSystem(SourceProposalItemKind, func(context.Context, *inbox.Request) (string, error) { return "", nil })
+	e.answer(t, missed.InboxID, "u_owner", reviewApprove)
+	if _, err := e.inbox.Cancel(ctx, "ag_1", withdrawn.InboxID); err != nil {
+		t.Fatal(err)
+	}
+	if len(e.admin.creates) != 0 {
+		t.Fatal("the stand-in handler must not create")
+	}
+	if err := p.Sweep(ctx); err != nil {
+		t.Fatal(err)
+	}
+	p.bg.Wait()
+	if len(e.admin.creates) != 1 || len(e.admin.syncs) != 1 {
+		t.Fatalf("missed decision: creates %d syncs %v", len(e.admin.creates), e.admin.syncs)
+	}
+	check := func(id, status, errPart string) {
+		t.Helper()
+		var got proposalRow
+		row, err := p.store.get(ctx, id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		got = *row
+		if got.Status != status || !strings.Contains(got.Error, errPart) {
+			t.Fatalf("%s: %+v, want %s (%s)", id, got, status, errPart)
+		}
+	}
+	check(missed.ID, "done", "")
+	check(withdrawn.ID, "rejected", "withdrawn")
+	check(expired.ID, "pending", "")
+	e.advance(inbox.SystemItemTTL + time.Minute)
+	if err := p.Sweep(ctx); err != nil {
+		t.Fatal(err)
+	}
+	check(expired.ID, "rejected", "expired")
+	// Nothing is applied twice; a nil sweeper is a no-op.
+	if err := p.Sweep(ctx); err != nil || len(e.admin.creates) != 1 {
+		t.Fatalf("second sweep: %v creates %d", err, len(e.admin.creates))
+	}
+	var nilP *SourceProposals
+	if err := nilP.Sweep(ctx); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestProposalKeepsOnlyURLBranchAndFolder: the agent cannot choose the
+// mode, visibility or anything else of the source it proposes.
+func TestProposalKeepsOnlyURLBranchAndFolder(t *testing.T) {
+	e, p := newProposalTest(t)
+	ctx := context.Background()
+	in := SourceInput{URL: "acme/skills", Branch: "dev", Path: "skills", Slug: "mine", Mode: ModeAuto, PinnedSHA: "abc",
+		Visibility: VisibleMembers, Members: []string{"u_agent_friend"}, DefaultRuns: RunsHost, Exclude: []string{"**"},
+		PollSeconds: 60, Limits: &Limits{MaxSkills: 1}}
+	got, err := p.ProposeSource(ctx, proposalAgent, in, "The team keeps its release checklists there.")
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := SourceInput{URL: "acme/skills", Branch: "dev", Path: "skills"}
+	if prev := e.admin.previews[0]; prev.URL != want.URL || prev.Branch != want.Branch || prev.Path != want.Path || prev.Mode != "" ||
+		prev.Visibility != "" || prev.Members != nil || prev.DefaultRuns != "" || prev.Exclude != nil || prev.PollSeconds != 0 ||
+		prev.Limits != nil || prev.Slug != "" || prev.PinnedSHA != "" {
+		t.Fatalf("previewed %+v", prev)
+	}
+	e.answer(t, got.InboxID, "u_owner", reviewApprove)
+	created := e.admin.creates[0]
+	if created.Mode != ModeReview || created.Visibility != "" || created.Members != nil || created.DefaultRuns != "" || created.Slug != "" {
+		t.Fatalf("created %+v: the owner's defaults must decide", created)
+	}
+}
+
+// TestProposalRateLimit: at most MaxSourceProposalsPerHour dry runs an
+// hour per agent, whatever happened to them.
+func TestProposalRateLimit(t *testing.T) {
+	e, p := newProposalTest(t)
+	ctx := context.Background()
+	for i := 0; i < MaxSourceProposalsPerHour; i++ {
+		got := proposeTestSource(t, p, "acme/skills")
+		e.answer(t, got.InboxID, "u_owner", reviewReject) // none stays waiting
+	}
+	if _, err := p.ProposeSource(ctx, proposalAgent, SourceInput{URL: "acme/skills"}, "We need these playbooks."); !errors.Is(err, ErrLimit) {
+		t.Fatalf("over the hourly limit: %v", err)
+	}
+	if n := len(e.admin.previews); n != MaxSourceProposalsPerHour {
+		t.Fatalf("a refused proposal ran a dry run: %d previews", n)
+	}
+	// Another agent has its own budget; an hour later this one does too.
+	if _, err := p.ProposeSource(ctx, Viewer{UserID: "u_owner", AgentID: "ag_2", Admin: true}, SourceInput{URL: "acme/skills"}, "We need these playbooks."); err != nil {
+		t.Fatalf("another agent: %v", err)
+	}
+	e.advance(time.Hour + time.Minute)
+	if _, err := p.ProposeSource(ctx, proposalAgent, SourceInput{URL: "acme/skills"}, "We need these playbooks."); err != nil {
+		t.Fatalf("an hour later: %v", err)
+	}
+}
+
+// TestProposalTextHasNoLineBreaks: the agent's name and the repository's
+// text stay on their lines; the reason is quoted line by line, escaped.
+func TestProposalTextHasNoLineBreaks(t *testing.T) {
+	e := newProposalEnv(t)
+	p, err := NewSourceProposals(ProposalOptions{DB: e.db, Inbox: e.inbox, Admin: e.admin, IsAdmin: e.isAdmin, Now: e.clock,
+		AgentName: func(context.Context, string) string { return "bot\n# Approve" }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(p.bg.Wait)
+	e.admin.preview.Warnings = []Warning{{Path: "x\n- [ ] approve", Code: "secret\nhi"}}
+	got, err := p.ProposeSource(context.Background(), proposalAgent, SourceInput{URL: "acme/skills"}, "line one\n![img](https://evil.example/x.png)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	item, err := e.inbox.Get(context.Background(), got.InboxID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, bad := range []string{"\n# Approve", "\n- [ ] approve", "secret\nhi", "![img]"} {
+		if strings.Contains(item.Message, bad) || strings.Contains(item.Summary, bad) {
+			t.Errorf("item keeps %q:\n%s", bad, item.Message)
+		}
+	}
+	if !strings.Contains(item.Message, "> line one\n> !\\[img\\](https://evil.example/x.png)") {
+		t.Errorf("reason not quoted and escaped:\n%s", item.Message)
 	}
 }

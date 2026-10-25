@@ -149,7 +149,7 @@ func memberAllowlist() map[string]bool {
 		"/v1/jobs", "/v1/jobs/x", "/v1/jobs/x/y",
 		// Agent skills routes; a bundle download's ticket is its own
 		// credential. /v1/skills/sources is shared with the admin routes.
-		"/v1/skills/search", "/v1/skills/get", "/v1/skills/read", "/v1/skills/grep", "/v1/skills/list",
+		"/v1/skills/search", "/v1/skills/get", "/v1/skills/read", "/v1/skills/grep", "/v1/skills/list", "/v1/skills/proposal",
 		"/v1/skills/bundle", "/v1/skills/bundle/x",
 	} {
 		for _, m := range guardMethods {

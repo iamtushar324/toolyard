@@ -33,6 +33,7 @@ import (
 //	GET  /v1/skills/grep     ?pattern=&source=&path=&ignore_case=&limit=&include_host= skills.grep
 //	GET  /v1/skills/sources                                                           skills.sources
 //	GET  /v1/skills/list     ?cursor=&limit=&source=&include_host=                    skills.list
+//	GET  /v1/skills/proposal ?id=                                                     skills.proposal: one of the caller's proposals
 //	POST /v1/skills/bundle   {skills, reason}                                         skills.bundle: {url, expires_at, skills}
 //	GET  /v1/skills/bundle/{ticket}                                                   the .tar.gz
 //
@@ -90,6 +91,7 @@ var skillsReadRoutes = map[string]skillsReadRoute{
 	"/v1/skills/sources": {gateway.SkillsSourcesTool, map[string]skillsParamKind{}},
 	"/v1/skills/list": {gateway.SkillsListTool, map[string]skillsParamKind{
 		"cursor": paramString, "limit": paramInt, "source": paramString, "include_host": paramBool}},
+	"/v1/skills/proposal": {gateway.SkillsProposalTool, map[string]skillsParamKind{"id": paramString}},
 }
 
 // registerSkillsRoutes adds the agent skills routes to mux. The paths are
@@ -100,6 +102,7 @@ func (s *Server) registerSkillsRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/v1/skills/read", s.skillsRead)
 	mux.HandleFunc("/v1/skills/grep", s.skillsRead)
 	mux.HandleFunc("/v1/skills/list", s.skillsRead)
+	mux.HandleFunc("/v1/skills/proposal", s.skillsRead)
 	mux.HandleFunc("/v1/skills/sources", s.skillsSources)
 	mux.HandleFunc("/v1/skills/bundle", s.skillsBundle)
 	mux.HandleFunc("/v1/skills/bundle/", s.skillsBundleDownload)
@@ -149,7 +152,7 @@ func (s *Server) skillsSources(w http.ResponseWriter, r *http.Request) {
 	writeError(w, http.StatusNotFound, "not found")
 }
 
-// GET /v1/skills/{search,get,read,grep,sources,list}
+// GET /v1/skills/{search,get,read,grep,sources,list,proposal}
 func (s *Server) skillsRead(w http.ResponseWriter, r *http.Request) {
 	route, ok := skillsReadRoutes[r.URL.Path]
 	if !ok {

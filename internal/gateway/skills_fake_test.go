@@ -493,8 +493,16 @@ func (p *fakeProposals) ProposeChange(_ context.Context, v skillhub.Viewer, in s
 	return &skillhub.Proposal{ID: "skp_change", Kind: "change", Status: "pending", InboxID: "rq_change", CreatedAt: time.Unix(1_700_000_000, 0).UTC()}, nil
 }
 
-func (p *fakeProposals) GetProposal(context.Context, skillhub.Viewer, string) (*skillhub.Proposal, error) {
-	return nil, skillhub.ErrNotFound
+// GetProposal knows the one proposal ProposeSource returns, for its agent.
+func (p *fakeProposals) GetProposal(_ context.Context, v skillhub.Viewer, id string) (*skillhub.Proposal, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.viewers = append(p.viewers, v)
+	if id != "skp_source" || v.AgentID != "ag_member" {
+		return nil, skillhub.ErrNotFound
+	}
+	return &skillhub.Proposal{ID: "skp_source", Kind: "source", Status: "done", InboxID: "rq_source", Result: "src_new",
+		CreatedAt: time.Unix(1_700_000_000, 0).UTC()}, nil
 }
 
 // fakeHosts is SkillHub.OnHost over a fixed set of host agents, counting

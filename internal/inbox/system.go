@@ -33,10 +33,17 @@ import (
 //
 // The handler runs after the decision committed, never inside its
 // transaction (a handler may write the database, which the SQLite store's
-// single connection would refuse). If the process stops in between, the
-// decision is recorded but not applied: a feature that must not lose it
-// reconciles from its own records (the skills hub does when the proposing
-// agent polls its proposal).
+// single connection would refuse), and only for a decision: an item that
+// expires, or that the agent or toolyard cancels, runs no handler. So a
+// feature reconciles from its own records with a periodic sweep that reads
+// its items' statuses: the skills hub runs skillhub.RunInboxSweeps under a
+// leader lease, which also applies a decision recorded while no handler ran
+// (the process stopped in between).
+//
+// Rollout: Request.System lives in the stored document. A replica that
+// predates it drops the tag when it rewrites an item (a snooze, a
+// reminder), and the decision then runs no handler; run this version on
+// every replica before a feature creates system items.
 
 const (
 	// SystemSenderName is how the dashboard names toolyard as the sender
@@ -215,10 +222,10 @@ func (r *Request) SystemChoice(questionID string) string {
 	return ""
 }
 
-// afterSystemDecision runs the handler of a decided system item and
-// returns the item as stored afterwards (with the handler's timeline
-// line). Items without a tag, or without a registered handler, come back
-// unchanged.
+// afterSystemDecision runs the handler of a decided system item (answered
+// or denied; never expired or cancelled) and returns the item as stored
+// afterwards (with the handler's timeline line). Items without a tag, or
+// without a registered handler, come back unchanged.
 func (s *Service) afterSystemDecision(ctx context.Context, r *Request) *Request {
 	if r == nil || r.System == nil || (r.Status != StatusAnswered && r.Status != StatusDenied) {
 		return r

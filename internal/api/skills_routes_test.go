@@ -180,8 +180,9 @@ type skillsEnv struct {
 const skillsRouteReason = "find the deploy playbook before shipping the service"
 
 // newSkillsEnv is a Server behind the production middleware chain with
-// the skills hub on (hubOn) over restSkills.
-func newSkillsEnv(t *testing.T, hubOn bool) *skillsEnv {
+// the skills hub on (hubOn) over restSkills, and props as its proposals
+// when given.
+func newSkillsEnv(t *testing.T, hubOn bool, props ...skillhub.Proposals) *skillsEnv {
 	t.Helper()
 	ctx := context.Background()
 	db := storetest.Open(t)
@@ -211,7 +212,11 @@ func newSkillsEnv(t *testing.T, hubOn bool) *skillsEnv {
 	t.Cleanup(func() { _ = gw.Close() })
 	e := &skillsEnv{db: db, skills: &restSkills{}, member: member, admin: admin, opTok: opTok, agentID: ag.ID}
 	if hubOn {
-		gw.RegisterSkillHub(gateway.SkillHub{Reader: e.skills, Tickets: gateway.NewSkillBundleTickets(db)})
+		hub := gateway.SkillHub{Reader: e.skills, Tickets: gateway.NewSkillBundleTickets(db)}
+		if len(props) > 0 {
+			hub.Proposals = props[0]
+		}
+		gw.RegisterSkillHub(hub)
 	}
 	srvCtx, cancel := context.WithCancel(ctx)
 	t.Cleanup(cancel)

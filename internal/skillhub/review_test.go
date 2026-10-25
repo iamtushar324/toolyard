@@ -5,6 +5,7 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/tusharbhardwaj/toolyard/internal/inbox"
 )
@@ -32,6 +33,13 @@ func newReviewTest(t *testing.T) (*proposalEnv, *ReviewInbox) {
 	return e, ri
 }
 
+// reviewStage stages a version of src_aaaa as the sync engine does: the
+// source's pending version first, then the hook.
+func reviewStage(ctx context.Context, e *proposalEnv, ri *ReviewInbox, versionID, sha string) error {
+	e.admin.setPending("src_aaaa", versionID)
+	return ri.PendingVersion(ctx, reviewTestSource(), reviewTestVersion(versionID, sha))
+}
+
 // reviewRows returns the source's review rows by version.
 func reviewRow(t *testing.T, e *proposalEnv, versionID string) *proposalRow {
 	t.Helper()
@@ -50,7 +58,7 @@ func TestReviewItemGoesToTheCreator(t *testing.T) {
 	e, ri := newReviewTest(t)
 	ctx := context.Background()
 	sha := "abcdef0123456789abcdef0123456789abcdef01"
-	if err := ri.PendingVersion(ctx, reviewTestSource(), reviewTestVersion("skv_1", sha)); err != nil {
+	if err := reviewStage(ctx, e, ri, "skv_1", sha); err != nil {
 		t.Fatal(err)
 	}
 	row := reviewRow(t, e, "skv_1")
@@ -87,7 +95,7 @@ func TestReviewItemGoesToTheCreator(t *testing.T) {
 		t.Fatalf("questions %+v", item.Questions)
 	}
 	// The same version again adds no second item.
-	if err := ri.PendingVersion(ctx, reviewTestSource(), reviewTestVersion("skv_1", sha)); err != nil {
+	if err := reviewStage(ctx, e, ri, "skv_1", sha); err != nil {
 		t.Fatal(err)
 	}
 	var n int
@@ -101,7 +109,7 @@ func TestReviewApproveActivatesTheVersion(t *testing.T) {
 	e, ri := newReviewTest(t)
 	ctx := context.Background()
 	sha := "abcdef0123456789abcdef0123456789abcdef01"
-	if err := ri.PendingVersion(ctx, reviewTestSource(), reviewTestVersion("skv_1", sha)); err != nil {
+	if err := reviewStage(ctx, e, ri, "skv_1", sha); err != nil {
 		t.Fatal(err)
 	}
 	row := reviewRow(t, e, "skv_1")
@@ -123,7 +131,7 @@ func TestReviewApproveActivatesTheVersion(t *testing.T) {
 func TestReviewRejectAndDenyRejectTheVersion(t *testing.T) {
 	e, ri := newReviewTest(t)
 	ctx := context.Background()
-	if err := ri.PendingVersion(ctx, reviewTestSource(), reviewTestVersion("skv_1", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")); err != nil {
+	if err := reviewStage(ctx, e, ri, "skv_1", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"); err != nil {
 		t.Fatal(err)
 	}
 	row := reviewRow(t, e, "skv_1")
@@ -135,7 +143,7 @@ func TestReviewRejectAndDenyRejectTheVersion(t *testing.T) {
 		t.Fatalf("activity %q", proposalActivity(got))
 	}
 	// A deny with a note rejects the next version with that note.
-	if err := ri.PendingVersion(ctx, reviewTestSource(), reviewTestVersion("skv_2", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")); err != nil {
+	if err := reviewStage(ctx, e, ri, "skv_2", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"); err != nil {
 		t.Fatal(err)
 	}
 	row = reviewRow(t, e, "skv_2")
@@ -153,7 +161,7 @@ func TestReviewRejectAndDenyRejectTheVersion(t *testing.T) {
 func TestReviewRefusesANonAdminAndRecordsFailures(t *testing.T) {
 	e, ri := newReviewTest(t)
 	ctx := context.Background()
-	if err := ri.PendingVersion(ctx, reviewTestSource(), reviewTestVersion("skv_1", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")); err != nil {
+	if err := reviewStage(ctx, e, ri, "skv_1", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"); err != nil {
 		t.Fatal(err)
 	}
 	// The creator lost the admin role since the source was added.
@@ -177,7 +185,7 @@ func TestReviewRefusesANonAdminAndRecordsFailures(t *testing.T) {
 	e.admins["u_owner"] = true
 	e.mu.Unlock()
 	e.admin.activateErr = errors.New("skillhub: conflict: the version is not staged")
-	if err := ri.PendingVersion(ctx, reviewTestSource(), reviewTestVersion("skv_2", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")); err != nil {
+	if err := reviewStage(ctx, e, ri, "skv_2", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"); err != nil {
 		t.Fatal(err)
 	}
 	row = reviewRow(t, e, "skv_2")
@@ -190,11 +198,11 @@ func TestReviewRefusesANonAdminAndRecordsFailures(t *testing.T) {
 func TestReviewNewerCommitAndDashboardDecisionsCloseOpenItems(t *testing.T) {
 	e, ri := newReviewTest(t)
 	ctx := context.Background()
-	if err := ri.PendingVersion(ctx, reviewTestSource(), reviewTestVersion("skv_1", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")); err != nil {
+	if err := reviewStage(ctx, e, ri, "skv_1", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"); err != nil {
 		t.Fatal(err)
 	}
 	first := reviewRow(t, e, "skv_1")
-	if err := ri.PendingVersion(ctx, reviewTestSource(), reviewTestVersion("skv_2", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")); err != nil {
+	if err := reviewStage(ctx, e, ri, "skv_2", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"); err != nil {
 		t.Fatal(err)
 	}
 	if row := reviewRow(t, e, "skv_1"); row.Status != proposalCancelled || !strings.Contains(row.Error, "newer commit") {
@@ -256,5 +264,183 @@ func TestReviewTextHelpers(t *testing.T) {
 	}
 	if reviewFolder("") != "the repository root" || reviewFolder("skills") != "folder `skills`" {
 		t.Error("reviewFolder")
+	}
+}
+
+// TestReviewOutdatedApprovalIsRefused: approving a question whose version
+// is no longer the source's pending version (a settings change or an
+// automatic commit replaced it) activates nothing and says why.
+func TestReviewOutdatedApprovalIsRefused(t *testing.T) {
+	e, ri := newReviewTest(t)
+	ctx := context.Background()
+	if err := reviewStage(ctx, e, ri, "skv_1", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"); err != nil {
+		t.Fatal(err)
+	}
+	row := reviewRow(t, e, "skv_1")
+	// The source moved on without raising a new question (mode changed to
+	// auto and a newer commit went live).
+	e.admin.setPending("src_aaaa", "")
+	got := e.answer(t, row.InboxID, "u_owner", reviewApprove)
+	if len(e.admin.activates) != 0 || len(e.admin.rejects) != 0 {
+		t.Fatalf("an outdated approval decided something: activates %v rejects %v", e.admin.activates, e.admin.rejects)
+	}
+	if !strings.Contains(proposalActivity(got), "no longer waits for review") {
+		t.Fatalf("activity %q", proposalActivity(got))
+	}
+	if row = reviewRow(t, e, "skv_1"); row.Status != proposalCancelled {
+		t.Fatalf("row %+v", row)
+	}
+	// Another version pending: still refused.
+	if err := reviewStage(ctx, e, ri, "skv_2", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"); err != nil {
+		t.Fatal(err)
+	}
+	row = reviewRow(t, e, "skv_2")
+	e.admin.setPending("src_aaaa", "skv_3")
+	e.answer(t, row.InboxID, "u_owner", reviewApprove)
+	if len(e.admin.activates) != 0 {
+		t.Fatalf("activates %v", e.admin.activates)
+	}
+	// A deleted source: refused too.
+	if err := reviewStage(ctx, e, ri, "skv_4", "cccccccccccccccccccccccccccccccccccccccc"); err != nil {
+		t.Fatal(err)
+	}
+	row = reviewRow(t, e, "skv_4")
+	e.admin.mu.Lock()
+	delete(e.admin.pending, "src_aaaa")
+	e.admin.mu.Unlock()
+	got = e.answer(t, row.InboxID, "u_owner", reviewReject)
+	if len(e.admin.rejects) != 0 || !strings.Contains(proposalActivity(got), "the source was deleted") {
+		t.Fatalf("deleted source: rejects %v activity %q", e.admin.rejects, proposalActivity(got))
+	}
+}
+
+// TestReviewGoesToTheOwnerWhenTheCreatorCannotDecide: a creator who lost
+// the admin role (or is blocked) no longer gets the review.
+func TestReviewGoesToTheOwnerWhenTheCreatorCannotDecide(t *testing.T) {
+	e := newProposalEnv(t)
+	e.admins["u_root"] = true
+	ri, err := NewReviewInbox(ReviewOptions{DB: e.db, Inbox: e.inbox, Admin: e.admin, IsAdmin: e.isAdmin, Now: e.clock,
+		FallbackReviewer: func(context.Context) (string, error) { return "u_root", nil }})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	e.mu.Lock()
+	e.admins["u_owner"] = false
+	e.mu.Unlock()
+	if err := reviewStage(ctx, e, ri, "skv_1", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"); err != nil {
+		t.Fatal(err)
+	}
+	row := reviewRow(t, e, "skv_1")
+	item, err := e.inbox.Get(ctx, row.InboxID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if row.UserID != "u_root" || item.AgentID != inbox.SystemAgentID("u_root") || !strings.Contains(item.Message, "can no longer approve it") {
+		t.Fatalf("review went to %q (%q): %s", row.UserID, item.AgentID, item.Message)
+	}
+	e.answer(t, row.InboxID, "u_root", reviewApprove)
+	if len(e.admin.activates) != 1 || e.admin.activates[0][0] != "u_root" {
+		t.Fatalf("activates %v", e.admin.activates)
+	}
+	// Without a fallback the review stays with the creator.
+	ri2, _ := NewReviewInbox(ReviewOptions{DB: e.db, Inbox: e.inbox, Admin: e.admin, IsAdmin: e.isAdmin, Now: e.clock})
+	if got := ri2.reviewer(ctx, "u_owner"); got != "u_owner" {
+		t.Fatalf("no fallback: %q", got)
+	}
+}
+
+// TestReviewSweep applies a decision no handler ran, and closes items that
+// were withdrawn, expired, or whose version no longer waits.
+func TestReviewSweep(t *testing.T) {
+	e, ri := newReviewTest(t)
+	ctx := context.Background()
+	if err := reviewStage(ctx, e, ri, "skv_1", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"); err != nil {
+		t.Fatal(err)
+	}
+	row := reviewRow(t, e, "skv_1")
+	// The decision lands while no handler runs (a node stopped).
+	e.inbox.HandleSystem(ReviewItemKind, func(context.Context, *inbox.Request) (string, error) { return "", nil })
+	e.answer(t, row.InboxID, "u_owner", reviewApprove)
+	if len(e.admin.activates) != 0 || reviewRow(t, e, "skv_1").Status != proposalPending {
+		t.Fatal("the stand-in handler must not decide")
+	}
+	if err := ri.Sweep(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if len(e.admin.activates) != 1 || reviewRow(t, e, "skv_1").Status != proposalDone {
+		t.Fatalf("sweep: activates %v row %+v", e.admin.activates, reviewRow(t, e, "skv_1"))
+	}
+	// A second sweep applies nothing twice.
+	if err := ri.Sweep(ctx); err != nil || len(e.admin.activates) != 1 {
+		t.Fatalf("second sweep: %v activates %v", err, e.admin.activates)
+	}
+
+	// An open question whose version no longer waits is cancelled.
+	if err := reviewStage(ctx, e, ri, "skv_2", "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"); err != nil {
+		t.Fatal(err)
+	}
+	e.admin.setPending("src_aaaa", "")
+	if err := ri.Sweep(ctx); err != nil {
+		t.Fatal(err)
+	}
+	row = reviewRow(t, e, "skv_2")
+	item, _ := e.inbox.Get(ctx, row.InboxID)
+	if row.Status != proposalCancelled || item.Status != inbox.StatusCancelled {
+		t.Fatalf("outdated question: row %s item %s", row.Status, item.Status)
+	}
+
+	// A question past its deadline is closed even before the Inbox marks
+	// it expired.
+	if err := reviewStage(ctx, e, ri, "skv_3", "cccccccccccccccccccccccccccccccccccccccc"); err != nil {
+		t.Fatal(err)
+	}
+	e.advance(inbox.SystemItemTTL + time.Minute)
+	if err := ri.Sweep(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if row = reviewRow(t, e, "skv_3"); row.Status != proposalCancelled || !strings.Contains(row.Error, "expired") {
+		t.Fatalf("expired question: %+v", row)
+	}
+	if len(e.admin.activates)+len(e.admin.rejects) != 1 {
+		t.Fatalf("the sweep decided more than the one missed decision: %v %v", e.admin.activates, e.admin.rejects)
+	}
+	// A nil sweeper and RunInboxSweeps with a cancelled context return.
+	var nilRI *ReviewInbox
+	if err := nilRI.Sweep(ctx); err != nil {
+		t.Fatal(err)
+	}
+	cctx, cancel := context.WithCancel(ctx)
+	cancel()
+	RunInboxSweeps(cctx, time.Millisecond, ri, nil)
+}
+
+// TestReviewTextHasNoLineBreaks: repository text cannot start a new
+// Markdown line (a heading, a link) in an item toolyard sends.
+func TestReviewTextHasNoLineBreaks(t *testing.T) {
+	if got := reviewCode("a\nb\r\tc\u2028d"); got != "`a b  c d`" {
+		t.Errorf("reviewCode = %q", got)
+	}
+	if got := reviewMD("x\n# y\u202e"); got != "x # y " {
+		t.Errorf("reviewMD = %q", got)
+	}
+	e, ri := newReviewTest(t)
+	ctx := context.Background()
+	v := reviewTestVersion("skv_1", "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+	v.Diff.Added = []string{"ok\n\n# Approve now\n[click](https://evil.example)"}
+	e.admin.setPending("src_aaaa", "skv_1")
+	src := reviewTestSource()
+	src.Branch = "main\n## injected"
+	if err := ri.PendingVersion(ctx, src, v); err != nil {
+		t.Fatal(err)
+	}
+	item, err := e.inbox.Get(ctx, reviewRow(t, e, "skv_1").InboxID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, bad := range []string{"\n# Approve now", "\n## injected", "\n[click]"} {
+		if strings.Contains(item.Message, bad) {
+			t.Errorf("message keeps %q:\n%s", bad, item.Message)
+		}
 	}
 }

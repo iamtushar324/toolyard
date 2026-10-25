@@ -173,3 +173,30 @@ func (st proposalStore) countPending(ctx context.Context, agentID, kind string) 
 		agentID, kind, proposalPending).Scan(&n)
 	return n, err
 }
+
+// pendingRows lists pending rows of one kind, oldest first: one agent's
+// (agentID set) or everyone's, at most limit.
+func (st proposalStore) pendingRows(ctx context.Context, kind, agentID string, limit int) ([]proposalRow, error) {
+	q := `SELECT ` + proposalColumns + ` FROM skill_proposals WHERE kind = ? AND status = ?`
+	args := []any{kind, proposalPending}
+	if agentID != "" {
+		q += ` AND agent_id = ?`
+		args = append(args, agentID)
+	}
+	q += ` ORDER BY created_at LIMIT ?`
+	args = append(args, limit)
+	rows, err := st.db.QueryContext(ctx, q, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var out []proposalRow
+	for rows.Next() {
+		r, err := scanProposal(rows)
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, *r)
+	}
+	return out, rows.Err()
+}

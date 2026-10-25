@@ -29,6 +29,10 @@ type proposalFakeAdmin struct {
 	syncResult  SyncResult
 	syncErr     error
 	trusted     map[string]bool
+	// pending is each source's pending (staged, waiting) version: what
+	// GetSource reports as PendingVersionID. A source not in it does not
+	// exist.
+	pending map[string]string
 
 	previews  []SourceInput
 	previewBy []string
@@ -56,7 +60,15 @@ func newProposalFakeAdmin() *proposalFakeAdmin {
 		},
 		syncResult: SyncResult{SHA: "0123456789abcdef0123456789abcdef01234567", Activated: true},
 		trusted:    map[string]bool{"anthropics": true},
+		pending:    map[string]string{},
 	}
+}
+
+// setPending records a source's pending version, as staging does.
+func (f *proposalFakeAdmin) setPending(sourceID, versionID string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.pending[sourceID] = versionID
 }
 
 func (f *proposalFakeAdmin) ParseURL(raw string) (RepoRef, error) {
@@ -101,8 +113,14 @@ func (f *proposalFakeAdmin) UpdateSource(context.Context, string, string, Source
 	return nil, ErrNotFound
 }
 func (f *proposalFakeAdmin) DeleteSource(context.Context, string, string) error { return ErrNotFound }
-func (f *proposalFakeAdmin) GetSource(context.Context, string) (*Source, error) {
-	return nil, ErrNotFound
+func (f *proposalFakeAdmin) GetSource(_ context.Context, id string) (*Source, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	pending, ok := f.pending[id]
+	if !ok {
+		return nil, ErrNotFound
+	}
+	return &Source{ID: id, Slug: "team-skills", Owner: "acme", Repo: "skills", Mode: ModeReview, PendingVersionID: pending}, nil
 }
 func (f *proposalFakeAdmin) ListSources(context.Context) ([]Source, error) { return nil, nil }
 
@@ -129,6 +147,9 @@ func (f *proposalFakeAdmin) Activate(_ context.Context, by, id, versionID string
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.activates = append(f.activates, [3]string{by, id, versionID})
+	if f.activateErr == nil && f.pending[id] == versionID {
+		f.pending[id] = ""
+	}
 	return f.activateErr
 }
 
@@ -136,6 +157,9 @@ func (f *proposalFakeAdmin) Reject(_ context.Context, by, id, versionID, note st
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.rejects = append(f.rejects, [4]string{by, id, versionID, note})
+	if f.rejectErr == nil && f.pending[id] == versionID {
+		f.pending[id] = ""
+	}
 	return f.rejectErr
 }
 
