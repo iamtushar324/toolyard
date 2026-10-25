@@ -210,7 +210,7 @@ func OpenPostgresWith(ctx context.Context, url string, opts PostgresOptions) (*D
 		}
 		return nil, err
 	}
-	db := &DB{DB: sdb, Dialect: Postgres}
+	db := &DB{DB: sdb, Dialect: Postgres, pgConfig: cfg}
 	if opts.ReadOnly || opts.NoMigrate {
 		return db, nil
 	}
@@ -281,6 +281,22 @@ func (db *DB) WithPgxConn(ctx context.Context, fn func(*pgx.Conn) error) error {
 		}
 		return fn(rc.pg.Conn())
 	})
+}
+
+// ConnectPostgres opens one new connection to the database, outside the
+// pool and not counted in its size, for a caller that must keep a session
+// of its own for a long time: session advisory locks and LISTEN
+// (internal/cluster). The caller closes it. SQL sent through it is not
+// rewritten: use $1, $2 there. It is an error on SQLite.
+func (db *DB) ConnectPostgres(ctx context.Context) (*pgx.Conn, error) {
+	if !db.Dialect.IsPostgres() || db.pgConfig == nil {
+		return nil, errors.New("store: ConnectPostgres needs a database opened with OpenPostgres")
+	}
+	conn, err := pgx.ConnectConfig(ctx, db.pgConfig.Copy())
+	if err != nil {
+		return nil, connectFailure(fmt.Errorf("store: connect to Postgres at %s/%s: %w", db.pgConfig.Host, db.pgConfig.Database, err))
+	}
+	return conn, nil
 }
 
 // ---- placeholder-rewriting connector ----------------------------------------
