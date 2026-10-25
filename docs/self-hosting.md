@@ -168,17 +168,26 @@ for every agent. Approval rules do not change.
 **Admin control is opt-in.** An app never inherits its owner's admin
 control: even an admin's app with "everything you can use" cannot change
 policies (`policies.set`, `policies.clear`), reconnect servers or sign in
-shared connections. An admin can give one app that control with **May
+shared connections. An admin can give one of their own apps that control with **May
 manage toolyard (policies, servers, shared connections)** on the consent
 screen or the Connected apps page; it is off by default and recorded on the
-grant (`may_manage`). A member's app never gets it.
+grant (`may_manage`). Only the app's owner, while an admin, can turn it on
+(an admin cannot turn it on for another person's app); anyone who manages
+the app can turn it off. A member's app never gets admin control: a stored
+flag then has no effect, and the Connected apps page says so.
 
 **Audit.** Every audit row an app's agent raises carries the OAuth client
 id in `audit_events.oauth_client_id` (a trigger fills it from the grant).
 The grant row is the agent's tombstone: deleting the agent keeps the
 mapping, and connecting the client again recreates the agent under the same
-id. An app's agent cannot be given a static agent token (rotation and
-enrolment refuse it).
+id. Deleting an app's agent revokes its grant, tokens and unused codes in
+the same transaction and cancels what it had pending. A new consent for a
+client stops the unused codes issued before it; it stops earlier token
+chains only when the grant comes back from a revoke or a deleted or
+disabled agent, or when the person ticks "Sign out this app's other
+sessions" (a client metadata document client shares one client_id across
+installs, so one person's devices share a grant). An app's agent cannot be given a
+static agent token (rotation and enrolment refuse it).
 
 **Security notes.**
 
@@ -188,35 +197,53 @@ enrolment refuse it).
   of `mcp_oauth_custom_schemes`. They are matched exactly otherwise.
   `javascript:`, `data:`, `file:`, `jar:`, `ms-msdt:`, `search-ms:`,
   `ms-officecmd:` and similar schemes are always refused.
-- An invalid authorization request goes back to the client only once the
-  client, its redirect URI and `response_type=code` are all valid; before
-  that the person sees an error page, so toolyard is never an open
-  redirect. `state` is optional (PKCE is required); a request without
-  `resource` gets `<public-url>/mcp`.
+- Before the person answers, an invalid authorization request is shown to
+  the person as an error page. It goes back to the client only when the
+  client, its redirect URI and `response_type=code` are all valid and
+  `mcp_oauth_redirect_hosts` names the redirect host. Neither a
+  self-registered client nor a client metadata document makes a redirect
+  URI trusted (anyone can host a document that lists their own site), so
+  toolyard is never an open redirect. After the person answers, allow and
+  deny always redirect.
+  `state` is optional (PKCE is required); a request without `resource` gets
+  `<public-url>/mcp`.
 - Client ID metadata documents are fetched only while handling an
   authorization request (the token and revocation endpoints use the cached
   copy, stale included, and never fetch), only on port 443, and only from
-  public addresses: loopback, private, carrier-grade NAT (`100.64.0.0/10`,
-  Tailscale), link-local, unique local, multicast, documentation,
-  benchmarking and reserved ranges are refused, also when wrapped in an
-  IPv4-mapped, NAT64 or 6to4 address. The connection goes to the address
-  that was checked, TLS verifies the host, redirects are not followed, and
-  the size (64 KiB) and time (8 s) are bounded. One client address may
-  cause 20 fetches per 10 minutes, one client_id is fetched once at a time,
-  a failure is not retried for 5 minutes, and the requester gets a generic
-  error (the detail goes to the log). A document is cached for its
-  `max-age` (5 minutes to 24 hours).
-- Rate limits count IPv6 addresses by their /64 and requests without a
-  known address in one strict bucket, and there are global caps on
-  registrations and pending authorization requests. An in-process
-  pre-limit refuses floods before they write to the database.
+  public addresses: only `2000::/3` for IPv6, and loopback, private,
+  carrier-grade NAT (`100.64.0.0/10`, Tailscale), link-local, unique local,
+  multicast, documentation, benchmarking and reserved ranges are refused,
+  also when wrapped in an IPv4-mapped, NAT64 or 6to4 address. The
+  connection goes to the address that was checked, TLS verifies the host,
+  redirects are not followed, and the size (64 KiB) and time (8 s) are
+  bounded. One client address may cause 20 fetches per 10 minutes (and its
+  network 80), all addresses together 600; one client_id is fetched once at
+  a time, and a requester that leaves does not fail the others waiting. A
+  definite failure (the document answered wrongly, or toolyard refuses its
+  address) is not retried for 5 minutes. A network failure or a temporary
+  answer (HTTP 408, 429, 5xx) is not cached, and an expired copy keeps
+  serving until a fetch succeeds, also while the fetch limits are full,
+  for at most 7 days after it expired. The requester gets a generic error
+  (the detail goes to the log). A document is cached for its `max-age` (5
+  minutes to 24 hours).
+- Rate limits count per address (IPv6 by /64) and per network (IPv4 /24,
+  IPv6 /48), and requests without a known address in one strict bucket.
+  Global caps apply to registering a client and fetching a metadata
+  document, and a high ceiling (50,000 per 10 minutes) to authorization
+  requests. A request counts toward a global cap only after it passed its
+  address's and network's limits, so one address cannot use up a global
+  budget. A registration nobody authorized is swept after a day. An
+  in-process pre-limit checks every bucket before it counts any, and
+  refuses floods before they write to the database; it never evicts a
+  global bucket.
 - Codes are single use and last 60 seconds. A code used twice revokes the
   tokens it produced. A refresh token used twice revokes the whole grant
   and disables its agent; the person connects the app again. A retry within
-  30 seconds, while the token that replaced it is still unused, is refused
+  60 seconds, while the token that replaced it is still unused, is refused
   without revoking anything. Revoking a grant (by its owner, its client or
-  reuse detection) also cancels its agent's pending approvals and Inbox
-  requests, and nothing it queued can run.
+  reuse detection) also cancels its agent's pending approvals (personal
+  ones included) and Inbox requests, recorded as cancelled by the system
+  because the grant was revoked, and nothing it queued can run.
 - Tokens, codes and client secrets are stored as SHA-256 hashes. Access
   tokens start `tyat_`, refresh tokens `tyrt_`.
 - All of this state is in the database (`mcp_oauth_*` tables), so several

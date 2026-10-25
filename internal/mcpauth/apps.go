@@ -33,19 +33,24 @@ type App struct {
 	ScopeSummary  string            `json:"scope_summary"`
 	OAuthScope    string            `json:"oauth_scope"`
 	Status        string            `json:"status"` // active | revoked | disabled | deleted
-	MayManage     bool              `json:"may_manage"`
-	CreatedAt     int64             `json:"created_at"`
-	UpdatedAt     int64             `json:"updated_at"`
-	LastUsedAt    int64             `json:"last_used_at,omitempty"`
-	RevokedAt     int64             `json:"revoked_at,omitempty"`
-	RevokedReason string            `json:"revoked_reason,omitempty"`
+	// MayManage is the stored choice; it has an effect only while the
+	// owner is an admin (ManageActive).
+	MayManage     bool   `json:"may_manage"`
+	OwnerIsAdmin  bool   `json:"owner_is_admin"`
+	ManageActive  bool   `json:"manage_active"`
+	CreatedAt     int64  `json:"created_at"`
+	UpdatedAt     int64  `json:"updated_at"`
+	LastUsedAt    int64  `json:"last_used_at,omitempty"`
+	RevokedAt     int64  `json:"revoked_at,omitempty"`
+	RevokedReason string `json:"revoked_reason,omitempty"`
 }
 
 const appColumns = `g.id, g.agent_id, COALESCE(a.name, ''), g.client_id, COALESCE(c.client_name, ''), COALESCE(c.kind, ''),
 	COALESCE(c.client_uri, ''), COALESCE(c.logo_uri, ''), COALESCE(c.redirect_uris, '[]'),
 	g.user_id, COALESCE(u.email, ''), COALESCE(u.display_name, ''), COALESCE(u.username, ''),
 	g.scope, COALESCE(a.disabled, 0), g.created_at, g.updated_at, COALESCE(g.last_used_at, 0),
-	COALESCE(g.revoked_at, 0), COALESCE(g.revoked_reason, ''), g.may_manage, COALESCE(a.id, '')`
+	COALESCE(g.revoked_at, 0), COALESCE(g.revoked_reason, ''), g.may_manage, COALESCE(a.id, ''),
+	COALESCE(u.role, ''), COALESCE(u.status, '')`
 
 const appFrom = ` FROM mcp_oauth_grants g
 	LEFT JOIN agents a ON a.id = g.agent_id
@@ -57,14 +62,17 @@ const appFrom = ` FROM mcp_oauth_grants g
 // SQLite runs on one connection.
 func scanApp(row interface{ Scan(...any) error }) (*App, error) {
 	var a App
-	var redirects, display, username, agentRow string
+	var redirects, display, username, agentRow, ownerRole, ownerStatus string
 	var disabled, manage int
 	if err := row.Scan(&a.ID, &a.AgentID, &a.Nickname, &a.ClientID, &a.ClientName, &a.ClientKind,
 		&a.ClientURI, &a.LogoURI, &redirects, &a.OwnerID, &a.OwnerEmail, &display, &username,
-		&a.OAuthScope, &disabled, &a.CreatedAt, &a.UpdatedAt, &a.LastUsedAt, &a.RevokedAt, &a.RevokedReason, &manage, &agentRow); err != nil {
+		&a.OAuthScope, &disabled, &a.CreatedAt, &a.UpdatedAt, &a.LastUsedAt, &a.RevokedAt, &a.RevokedReason, &manage, &agentRow,
+		&ownerRole, &ownerStatus); err != nil {
 		return nil, err
 	}
 	a.MayManage = manage != 0
+	a.OwnerIsAdmin = ownerRole == identity.RoleAdmin && ownerStatus == identity.StatusActive
+	a.ManageActive = a.MayManage && a.OwnerIsAdmin
 	a.OwnerName = display
 	if a.OwnerName == "" {
 		a.OwnerName = username
@@ -187,10 +195,11 @@ func (s *Service) RenameApp(ctx context.Context, app *App, nickname string, by *
 		return err
 	}
 	defer func() { _ = tx.Rollback() }()
-	if _, err = tx.ExecContext(ctx, `UPDATE agents SET name = ? WHERE id = ?`, nickname, app.AgentID); err != nil {
+	// The grant row first, as in every transaction on a grant (lockGrantOf).
+	if _, err = tx.ExecContext(ctx, `UPDATE mcp_oauth_grants SET updated_at = ? WHERE id = ?`, s.now().UnixMilli(), app.ID); err != nil {
 		return err
 	}
-	if _, err = tx.ExecContext(ctx, `UPDATE mcp_oauth_grants SET updated_at = ? WHERE id = ?`, s.now().UnixMilli(), app.ID); err != nil {
+	if _, err = tx.ExecContext(ctx, `UPDATE agents SET name = ? WHERE id = ?`, nickname, app.AgentID); err != nil {
 		return err
 	}
 	if err = s.auditTx(ctx, tx, auditRow{event: "mcp_oauth.renamed", agentID: app.AgentID, nickname: nickname,
@@ -208,11 +217,12 @@ func (s *Service) SetAppScope(ctx context.Context, app *App, sc access.AgentScop
 		return access.AgentScope{}, err
 	}
 	defer func() { _ = tx.Rollback() }()
-	out, err := access.WriteAgentScope(ctx, tx, app.AgentID, sc, by.ID)
-	if err != nil {
+	// The grant row first, as in every transaction on a grant (lockGrantOf).
+	if _, err = tx.ExecContext(ctx, `UPDATE mcp_oauth_grants SET updated_at = ? WHERE id = ?`, s.now().UnixMilli(), app.ID); err != nil {
 		return access.AgentScope{}, err
 	}
-	if _, err = tx.ExecContext(ctx, `UPDATE mcp_oauth_grants SET updated_at = ? WHERE id = ?`, s.now().UnixMilli(), app.ID); err != nil {
+	out, err := access.WriteAgentScope(ctx, tx, app.AgentID, sc, by.ID)
+	if err != nil {
 		return access.AgentScope{}, err
 	}
 	if err = s.auditTx(ctx, tx, auditRow{event: "mcp_oauth.scope_changed", agentID: app.AgentID, nickname: app.Nickname,
@@ -253,9 +263,17 @@ func (s *Service) RevokeApp(ctx context.Context, app *App, by *identity.User) er
 	return nil
 }
 
+// ErrManageOwnerOnly: only the app's owner, while an admin, may let it
+// manage toolyard.
+var ErrManageOwnerOnly = errors.New("mcpauth: only the app's owner, an admin, may let it manage toolyard")
+
 // SetAppManage sets whether the app may manage toolyard (policies, servers,
-// shared connections). The caller checks that only an admin turns it on.
+// shared connections). Turning it on is for the app's owner, while an
+// admin; anyone who manages the app may turn it off.
 func (s *Service) SetAppManage(ctx context.Context, app *App, manage bool, by *identity.User) error {
+	if manage && (by == nil || by.ID != app.OwnerID || by.Role != identity.RoleAdmin) {
+		return ErrManageOwnerOnly
+	}
 	v := 0
 	if manage {
 		v = 1
