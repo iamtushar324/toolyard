@@ -27,7 +27,8 @@ function harness(answers) {
     api = async (path, opts) => {
       requests.push({ path, method: (opts && opts.method) || 'GET', body: opts && opts.body });
       const a = answers[path];
-      if (a instanceof Error) throw a;
+      // An Error from this file is not instanceof the context's Error.
+      if (a && a.__throw) throw a.__throw;
       return a === undefined ? {} : a;
     };
   `, context);
@@ -168,7 +169,7 @@ test('the wizard walks inspect, preview and save, then forgets the token', async
 
 test('a private repository found at inspect asks for a token', async () => {
   const err = Object.assign(new Error('the repository is private or missing'), { status: 422, body: { code: 'needs_token' } });
-  const h = harness({ '/v1/skills/sources/inspect': err });
+  const h = harness({ '/v1/skills/sources/inspect': { __throw: err } });
   h.run(`openSkillsWizard(); skillsUI.wizard.url = 'acme/private';`);
   await h.run('skillsWizardInspect()');
   assert.equal(h.run('skillsUI.wizard.step'), 'url');
