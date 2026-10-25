@@ -27,8 +27,9 @@ func newSkillsMCPClient(t *testing.T, g *Gateway, agent string, stateless, local
 // modernParams are params of a 2026-07-28 request, with extra fields.
 func modernParams(extra map[string]any) map[string]any {
 	p := map[string]any{"_meta": map[string]any{
-		mcp.MetaKeyProtocolVersion: mcp.ProtocolVersion20260728,
-		mcp.MetaKeyClientInfo:      map[string]any{"name": "skills-test", "version": "1.0.0"},
+		mcp.MetaKeyProtocolVersion:                   mcp.ProtocolVersion20260728,
+		mcp.MetaKeyClientInfo:                        map[string]any{"name": "skills-test", "version": "1.0.0"},
+		"io.modelcontextprotocol/clientCapabilities": map[string]any{},
 	}}
 	for k, v := range extra {
 		p[k] = v
