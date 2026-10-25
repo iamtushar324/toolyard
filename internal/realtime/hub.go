@@ -25,6 +25,10 @@ type Hub struct {
 	// done is closed by CloseAll; every stream, open or new, then ends.
 	done   chan struct{}
 	closed bool
+
+	// remote carries events to the other replicas when they share a
+	// database (SetCluster, cluster.go); nil on a single node.
+	remote *remote
 }
 
 func NewHub() *Hub {
@@ -32,8 +36,19 @@ func NewHub() *Hub {
 }
 
 // Publish fans an event out to all current subscribers (best-effort, drop on
-// slow consumer).
+// slow consumer), on this replica and, through the cluster, on the others.
 func (h *Hub) Publish(evt Event) {
+	h.publishLocal(evt)
+	h.mu.RLock()
+	r := h.remote
+	h.mu.RUnlock()
+	if r != nil {
+		r.send(evt)
+	}
+}
+
+// publishLocal fans an event out to this replica's subscribers.
+func (h *Hub) publishLocal(evt Event) {
 	h.mu.RLock()
 	defer h.mu.RUnlock()
 	for ch := range h.clients {

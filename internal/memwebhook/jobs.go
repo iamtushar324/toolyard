@@ -20,6 +20,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/tusharbhardwaj/toolyard/internal/cluster"
 	"github.com/tusharbhardwaj/toolyard/internal/mempalace"
 )
 
@@ -116,6 +117,7 @@ func (s *Service) Enqueue(ctx context.Context, wh *Webhook, in IngestRequest) (*
 	s.audit2(ctx, "memory_webhook.ingest_queued", wh.Name,
 		fmt.Sprintf("wing=%s req=%s bytes=%d", wh.Wing, in.RequestID, in.PayloadSize))
 	s.signalWake()
+	s.publishWake(ctx)
 
 	return &Job{
 		ID:          in.RequestID,
@@ -155,8 +157,19 @@ func (s *Service) GetJob(ctx context.Context, id string) (*Job, error) {
 // would worsen memory pressure, and it matches SQLite's single-writer model.
 // The atomic claim (UPDATE ... WHERE status='queued') is belt-and-suspenders in
 // case that single-worker invariant is ever violated.
+//
+// On a multi-node database the worker runs on one node at a time
+// (cluster.RunLeader in cmd/gateway), and each job carries the claiming
+// node's lease.
 func (s *Service) RunWorker(ctx context.Context) error {
-	s.recoverRunningJobs(ctx)
+	// A single node recovers at once: every running job is a stopped
+	// worker's. With replicas, recovery waits one lease after this worker
+	// started and after any database error, so a worker on another node
+	// that could not renew during an outage keeps its job.
+	waitUntil := time.Now().Add(cluster.WorkLease)
+	if !s.cluster.MultiNode() {
+		_ = s.recoverRunningJobs(ctx)
+	}
 	s.drain(ctx)
 
 	tick := time.NewTicker(workerTick)
@@ -171,6 +184,13 @@ func (s *Service) RunWorker(ctx context.Context) error {
 		case <-s.wake:
 			s.drain(ctx)
 		case <-tick.C:
+			if s.cluster.MultiNode() && time.Now().After(waitUntil) {
+				// A job left by a worker that stopped on another node
+				// comes back once its lease ends.
+				if err := s.recoverRunningJobs(ctx); err != nil {
+					waitUntil = time.Now().Add(cluster.WorkLease)
+				}
+			}
 			s.drain(ctx)
 		case <-purge.C:
 			s.purgeOldJobs(ctx)
@@ -219,12 +239,13 @@ func (s *Service) processOnce(ctx context.Context) (bool, error) {
 		return false, err
 	}
 
-	// Atomic claim: the status='queued' guard makes it idempotent.
+	// Atomic claim: the status='queued' guard makes it idempotent. The job
+	// is this node's while it runs, under a lease runJob renews.
 	res, err := s.db.ExecContext(ctx,
 		`UPDATE memory_webhook_jobs
-		 SET status=?, started_at=COALESCE(started_at,?), attempts=attempts+1, updated_at=?
+		 SET status=?, started_at=COALESCE(started_at,?), attempts=attempts+1, updated_at=?, owner_instance=?, lease_until=`+cluster.LeaseUntilSQL(s.db.Dialect)+`
 		 WHERE id=? AND status=?`,
-		jobRunning, now, now, id, jobQueued)
+		jobRunning, now, now, s.cluster.InstanceID(), id, jobQueued)
 	if err != nil {
 		return false, err
 	}
@@ -236,6 +257,8 @@ func (s *Service) processOnce(ctx context.Context) (bool, error) {
 	if err != nil {
 		return true, err
 	}
+	stop := s.holdLease(ctx, id)
+	defer stop()
 	s.runJob(ctx, w)
 	return true, nil
 }
@@ -348,7 +371,9 @@ func (s *Service) failOrRetry(ctx context.Context, w *jobWork, chunkIdx int, det
 
 // markTerminal flips a running job to its terminal status (nulling the entry to
 // reclaim space) and reports whether it actually transitioned. The
-// status='running' guard ensures the terminal side effects fire at most once.
+// status='running' guard ensures the terminal side effects fire at most once;
+// the owner_instance guard fences a worker whose job another node recovered
+// (its lease ended) and claimed again.
 func (s *Service) markTerminal(ctx context.Context, id, status, detail, errMsg string, mempalaceOK bool) bool {
 	if s.db == nil {
 		return true
@@ -357,9 +382,9 @@ func (s *Service) markTerminal(ctx context.Context, id, status, detail, errMsg s
 	res, err := s.db.ExecContext(ctx,
 		`UPDATE memory_webhook_jobs
 		 SET status=?, detail=?, error=?, mempalace_ok=?, finished_at=?, entry=NULL, updated_at=?
-		 WHERE id=? AND status=?`,
+		 WHERE id=? AND status=? AND owner_instance=?`,
 		status, nullStr(truncate(detail, maxDetail)), nullStr(truncate(errMsg, maxDetail)),
-		boolToInt(mempalaceOK), now, now, id, jobRunning)
+		boolToInt(mempalaceOK), now, now, id, jobRunning, s.cluster.InstanceID())
 	if err != nil {
 		return false
 	}
@@ -381,8 +406,8 @@ func (s *Service) requeue(ctx context.Context, id string, attempts int) {
 	}
 	now := time.Now().UnixMilli()
 	_, _ = s.db.ExecContext(ctx,
-		`UPDATE memory_webhook_jobs SET status=?, next_attempt_at=?, updated_at=? WHERE id=? AND status=?`,
-		jobQueued, now+backoff.Milliseconds(), now, id, jobRunning)
+		`UPDATE memory_webhook_jobs SET status=?, next_attempt_at=?, updated_at=? WHERE id=? AND status=? AND owner_instance=?`,
+		jobQueued, now+backoff.Milliseconds(), now, id, jobRunning, s.cluster.InstanceID())
 }
 
 func (s *Service) setChunkCount(ctx context.Context, id string, n int) {
@@ -390,8 +415,8 @@ func (s *Service) setChunkCount(ctx context.Context, id string, n int) {
 		return
 	}
 	_, _ = s.db.ExecContext(ctx,
-		`UPDATE memory_webhook_jobs SET chunk_count=?, updated_at=? WHERE id=?`,
-		n, time.Now().UnixMilli(), id)
+		`UPDATE memory_webhook_jobs SET chunk_count=?, updated_at=? WHERE id=? AND owner_instance=?`,
+		n, time.Now().UnixMilli(), id, s.cluster.InstanceID())
 }
 
 func (s *Service) markChunkDone(ctx context.Context, id string, done int) {
@@ -399,20 +424,25 @@ func (s *Service) markChunkDone(ctx context.Context, id string, done int) {
 		return
 	}
 	_, _ = s.db.ExecContext(ctx,
-		`UPDATE memory_webhook_jobs SET chunks_done=?, updated_at=? WHERE id=?`,
-		done, time.Now().UnixMilli(), id)
+		`UPDATE memory_webhook_jobs SET chunks_done=?, updated_at=? WHERE id=? AND owner_instance=?`,
+		done, time.Now().UnixMilli(), id, s.cluster.InstanceID())
 }
 
 // recoverRunningJobs requeues jobs left 'running' by a crash/restart so they
-// resume (from chunks_done) on the next worker pass.
-func (s *Service) recoverRunningJobs(ctx context.Context) {
+// resume (from chunks_done) on the next worker pass. With a single node
+// every running job belongs to a stopped worker; on a multi-node database
+// only a job whose lease ended does (the worker that moved to another
+// node keeps renewing its job until it stops), so no job runs twice.
+func (s *Service) recoverRunningJobs(ctx context.Context) error {
 	if s.db == nil {
-		return
+		return nil
 	}
-	now := time.Now().UnixMilli()
-	_, _ = s.db.ExecContext(ctx,
-		`UPDATE memory_webhook_jobs SET status=?, next_attempt_at=0, updated_at=? WHERE status=?`,
-		jobQueued, now, jobRunning)
+	q := `UPDATE memory_webhook_jobs SET status=?, next_attempt_at=0, updated_at=? WHERE status=?`
+	if s.cluster.MultiNode() {
+		q += ` AND ` + cluster.LeaseEndedSQL(s.db.Dialect, "lease_until")
+	}
+	_, err := s.db.ExecContext(ctx, q, jobQueued, time.Now().UnixMilli(), jobRunning)
+	return err
 }
 
 // purgeOldJobs deletes terminal job rows past the retention window. The ledger

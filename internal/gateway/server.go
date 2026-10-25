@@ -24,6 +24,7 @@ import (
 	"github.com/tusharbhardwaj/toolyard/internal/actor"
 	"github.com/tusharbhardwaj/toolyard/internal/approval"
 	"github.com/tusharbhardwaj/toolyard/internal/audit"
+	"github.com/tusharbhardwaj/toolyard/internal/cluster"
 	"github.com/tusharbhardwaj/toolyard/internal/codemode"
 	"github.com/tusharbhardwaj/toolyard/internal/goroutines"
 	"github.com/tusharbhardwaj/toolyard/internal/inbox"
@@ -146,8 +147,11 @@ type toolEntry struct {
 // Gateway stitches the MCP server, policy, approval bus, memory, and upstream
 // pool into one coordinated unit.
 type Gateway struct {
-	githubHTTP          *http.Client
-	githubWriteMu       sync.Mutex
+	githubHTTP    *http.Client
+	githubWriteMu sync.Mutex
+	// cluster, when it spans several nodes, extends githubWriteMu and the
+	// client cache to every replica (SetCluster, actor.go).
+	cluster             *cluster.Cluster
 	mcp                 *server.MCPServer
 	policy              *policy.Engine
 	approval            *approval.Bus

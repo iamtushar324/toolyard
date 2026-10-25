@@ -419,15 +419,29 @@ func (g *Gateway) handleWaitForApproval() directHandler {
 		released := g.drainReleaseCh()
 		timer := time.NewTimer(time.Duration(timeoutSec) * time.Second)
 		defer timer.Stop()
-		if hasWatcher {
+		for hasWatcher {
 			select {
 			case <-ch:
+				// A wake-up for every waiter (an expiry sweep) can find this
+				// approval unchanged: wait again while it is still pending
+				// or its execution still runs.
+				if cur, err := g.approval.Get(ctx, id); err != nil ||
+					(cur.Status != approval.StatusPending && !(cur.Status == approval.StatusAllowed && cur.ResultExecutedAt == 0 && cur.ExecutionState == "running")) {
+					goto settled
+				}
+				ch, hasWatcher = g.approval.Watch(id)
+				if !hasWatcher {
+					goto settled
+				}
 			case <-timer.C:
+				goto settled
 			case <-ctx.Done():
+				goto settled
 			case <-released:
 				return waitRestartingResult("tools.wait_for_approval"), nil
 			}
-		} else {
+		}
+		if !hasWatcher {
 			// Fallback poll loop — coarse so we don't hammer SQLite.
 			pollTimer := time.NewTimer(2 * time.Second)
 			defer pollTimer.Stop()
@@ -449,6 +463,7 @@ func (g *Gateway) handleWaitForApproval() directHandler {
 			}
 		done:
 		}
+	settled:
 		// Re-fetch authoritative state.
 		req, err = g.approval.Get(ctx, id)
 		if err != nil {

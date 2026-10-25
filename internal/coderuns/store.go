@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"time"
 
+	"github.com/tusharbhardwaj/toolyard/internal/cluster"
 	"github.com/tusharbhardwaj/toolyard/internal/codemode"
 	"github.com/tusharbhardwaj/toolyard/internal/store"
 )
@@ -36,10 +37,13 @@ func (s *Service) insertRun(ctx context.Context, r *Run) error {
 	if lang == "" {
 		lang = codemode.LanguageStarlark
 	}
+	// The run is this node's from the start: it runs on this process, under
+	// a lease it renews (RunLeaseRenewal).
 	_, err := s.db.ExecContext(ctx, `INSERT INTO code_runs
-		(id, agent_id, session_id, idempotency_key, fingerprint, code, reason, language, status, created_at, updated_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		r.ID, r.AgentID, nullStr(r.SessionID), nullStr(r.IdempotencyKey), r.Fingerprint, r.code, r.Reason, lang, r.Status, r.CreatedAt, r.UpdatedAt)
+		(id, agent_id, session_id, idempotency_key, fingerprint, code, reason, language, status, created_at, updated_at, owner_instance, lease_until)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, `+cluster.LeaseUntilSQL(s.db.Dialect)+`)`,
+		r.ID, r.AgentID, nullStr(r.SessionID), nullStr(r.IdempotencyKey), r.Fingerprint, r.code, r.Reason, lang, r.Status, r.CreatedAt, r.UpdatedAt,
+		s.cluster.InstanceID())
 	return err
 }
 
@@ -132,8 +136,9 @@ func (s *Service) loadCalls(ctx context.Context, runID string) ([]Call, error) {
 
 // markRunning moves a queued run to running.
 func (s *Service) markRunning(ctx context.Context, id string) error {
-	_, err := s.db.ExecContext(ctx, `UPDATE code_runs SET status = ?, updated_at = ? WHERE id = ? AND status = ?`,
-		StatusRunning, s.now().UnixMilli(), id, StatusQueued)
+	_, err := s.db.ExecContext(ctx, `UPDATE code_runs SET status = ?, updated_at = ?, owner_instance = ?, lease_until = `+cluster.LeaseUntilSQL(s.db.Dialect)+`
+		WHERE id = ? AND status = ?`,
+		StatusRunning, s.now().UnixMilli(), s.cluster.InstanceID(), id, StatusQueued)
 	return err
 }
 
@@ -143,8 +148,9 @@ func (s *Service) claimResume(ctx context.Context, r *Run) (bool, error) {
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), runWriteTimeout)
 	defer cancel()
 	now := s.now().UnixMilli()
-	res, err := s.db.ExecContext(ctx, `UPDATE code_runs SET status = ?, error_kind = NULL, error_message = NULL, finished_at = NULL, updated_at = ?
-		WHERE id = ? AND agent_id = ? AND status = ?`, StatusRunning, now, r.ID, r.AgentID, r.Status)
+	res, err := s.db.ExecContext(ctx, `UPDATE code_runs SET status = ?, error_kind = NULL, error_message = NULL, finished_at = NULL, updated_at = ?,
+		owner_instance = ?, lease_until = `+cluster.LeaseUntilSQL(s.db.Dialect)+`
+		WHERE id = ? AND agent_id = ? AND status = ?`, StatusRunning, now, s.cluster.InstanceID(), r.ID, r.AgentID, r.Status)
 	if err != nil {
 		return false, err
 	}
@@ -269,16 +275,25 @@ func (s *Service) finish(ctx context.Context, run *Run, rr *codemode.RunResult, 
 // Recover settles the runs a stopped process left behind: queued runs
 // failed with kind interrupted (their script never started), running runs
 // outcome_unknown with kind interrupted (a tool call may have run). Call
-// it at startup, before the routes serve.
+// it at startup, before the routes serve, on a single node: every queued
+// or running run then belongs to a stopped process. On a multi-node
+// database (SetCluster) only the leader calls it, one lease after it took
+// over, and it takes only runs whose lease ended by the database's clock
+// (or that have none), so it never touches the live runs of another node,
+// nor of this one.
 func (s *Service) Recover(ctx context.Context) (failed, unknown int64, err error) {
 	now := s.now().UnixMilli()
-	res, err := s.db.ExecContext(ctx, `UPDATE code_runs SET status = ?, error_kind = ?, error_message = ?, updated_at = ?, finished_at = ? WHERE status = ?`,
+	expired := ""
+	if s.cluster.MultiNode() {
+		expired = ` AND ` + cluster.LeaseEndedSQL(s.db.Dialect, "lease_until")
+	}
+	res, err := s.db.ExecContext(ctx, `UPDATE code_runs SET status = ?, error_kind = ?, error_message = ?, updated_at = ?, finished_at = ? WHERE status = ?`+expired,
 		codemode.StatusFailed, ErrorInterrupted, msgInterruptedQueued, now, now, StatusQueued)
 	if err != nil {
 		return 0, 0, err
 	}
 	failed, _ = res.RowsAffected()
-	res, err = s.db.ExecContext(ctx, `UPDATE code_runs SET status = ?, error_kind = ?, error_message = ?, updated_at = ?, finished_at = ? WHERE status = ?`,
+	res, err = s.db.ExecContext(ctx, `UPDATE code_runs SET status = ?, error_kind = ?, error_message = ?, updated_at = ?, finished_at = ? WHERE status = ?`+expired,
 		codemode.StatusOutcomeUnknown, ErrorInterrupted, msgInterruptedRunning, now, now, StatusRunning)
 	if err != nil {
 		return failed, 0, err
