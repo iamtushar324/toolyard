@@ -64,3 +64,35 @@ func TestRetiredKeysStayHidden(t *testing.T) {
 		t.Errorf("stored row changed: %q", v)
 	}
 }
+
+// The skills hub's default GitHub token (stored sealed) is an internal
+// key: no settings response carries it, Patch refuses it, and only its own
+// endpoint writes it (through Set).
+func TestInternalKeysStayHidden(t *testing.T) {
+	ctx := context.Background()
+	s, err := New(ctx, storetest.Open(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.Set(ctx, SkillsGitHubToken, "sealed-value"); err != nil {
+		t.Fatal(err)
+	}
+	all, err := s.All(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for k := range all {
+		if strings.HasPrefix(k, SkillsGitHubToken) {
+			t.Fatalf("All returns %q", k)
+		}
+	}
+	if err := s.Patch(ctx, map[string]any{SkillsGitHubToken: "x"}); err == nil {
+		t.Fatal("Patch accepted the internal key")
+	}
+	if IsSecretKey(SkillsGitHubToken) {
+		t.Fatal("the internal key must not be revealable as a secret key")
+	}
+	if got := s.GetString(SkillsGitHubToken, ""); got != "sealed-value" {
+		t.Fatalf("GetString = %q", got)
+	}
+}

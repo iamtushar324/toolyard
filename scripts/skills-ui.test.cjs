@@ -345,3 +345,48 @@ test('only the pending version can be approved; rejected versions are not offere
   assert.equal(card.length, 1);
   assert.doesNotMatch(text(card[0]), /dddddddddddd/);
 });
+
+test('a GitHub rate limit names when it ends and the way out', () => {
+  const h = harness();
+  h.context.err = { message: 'x', body: { code: 'rate_limited', reset_at: '2026-10-25T21:27:50Z', retry_after: 60 } };
+  const msg = h.run('skillsErrorText(err)');
+  assert.match(msg, /^GitHub rate limit reached until \d\d:\d\d — add a GitHub token in GitHub access\.$/);
+  h.context.other = { message: 'branch nope does not exist', body: { code: 'invalid' } };
+  assert.equal(h.run('skillsErrorText(other)'), 'branch nope does not exist');
+  h.context.s = Object.assign({}, source1, { last_error: 'github: rate limited until 2026-10-25T21:27:50Z' });
+  assert.equal(h.run('skillsStatus(s)'), 'rate limited');
+  assert.equal(h.run('skillsStatusClass("rate limited")'), 'pending');
+});
+
+test('the GitHub access panel shows the token state and the rate limit, never a token', () => {
+  const h = harness();
+  h.run(`skillsUI.access.data = { set: false, rate: { limit: 60, remaining: 0, reset: '2026-10-25T21:27:50Z' },
+    paused_until: new Date(Date.now() + 600000).toISOString() };`);
+  let panel = text(h.run('renderSkillsAccess()'));
+  assert.match(panel, /no token: 60 calls an hour/);
+  assert.match(panel, /0 of 60 calls left/);
+  assert.match(panel, /rate limit reached until/);
+  assert.match(panel, /Set token/);
+  assert.match(panel, /fine-grained token/);
+  h.run(`skillsUI.access.data = { set: true, rate: { limit: 5000, remaining: 4990, reset: '2026-10-25T21:27:50Z' } };`);
+  panel = text(h.run('renderSkillsAccess()'));
+  assert.match(panel, /default token set/);
+  assert.match(panel, /Replace token/);
+  assert.match(panel, /Clear/);
+  assert.doesNotMatch(panel, /rate limit reached/);
+});
+
+test('saving the default token PUTs it once and the browser forgets it', async () => {
+  const h = harness({ '/v1/skills/admin/github-token': { set: true, rate: { limit: 5000, remaining: 4999 } } });
+  h.run(`skillsUI.access.editing = true; skillsUI.access.token = 'github_pat_x';`);
+  await h.run(`saveSkillsAccess(skillsUI.access.token)`);
+  const put = h.requests.find((r) => r.path === '/v1/skills/admin/github-token' && r.method === 'PUT');
+  assert.equal(put.body.token, 'github_pat_x');
+  assert.equal(h.run('skillsUI.access.token'), '');
+  assert.equal(h.run('skillsUI.access.editing'), false);
+  assert.equal(h.run('skillsUI.access.data.set'), true);
+  // Clearing asks first and sends an empty token.
+  await h.run(`saveSkillsAccess('')`);
+  const clear = h.requests.filter((r) => r.method === 'PUT').pop();
+  assert.equal(clear.body.token, '');
+});

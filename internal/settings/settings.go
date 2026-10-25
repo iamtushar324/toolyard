@@ -111,6 +111,12 @@ const (
 	// repositories a new skill source syncs in mode auto by default (the
 	// others default to review; docs/skills-hub.md). Default empty.
 	SkillsTrustedGitHubOwners = "skills_trusted_github_owners"
+	// SkillsGitHubToken holds the skills hub's instance-wide default
+	// GitHub read token, sealed with secrets.key (internal/skillhub
+	// github_access.go). It is an internal key: never returned by All,
+	// refused by Patch and Reveal; only PUT /v1/skills/admin/github-token
+	// writes it.
+	SkillsGitHubToken = "skills_github_token"
 
 	// Inbox attention (when the phone buzzes; inbox-spec.md §6).
 	//
@@ -163,6 +169,19 @@ var secretKeys = map[string]struct{}{
 // was the password of the removed ClickHouse lake.
 var retiredKeys = map[string]struct{}{
 	"clickhouse_password": {},
+}
+
+// internalKeys are settings that only their own feature reads and writes,
+// through its own endpoint: All never returns them, and Patch refuses
+// them. They are not secret keys, so Reveal refuses them too.
+var internalKeys = map[string]struct{}{
+	SkillsGitHubToken: {},
+}
+
+// isInternalKey reports whether key is one of internalKeys.
+func isInternalKey(key string) bool {
+	_, ok := internalKeys[key]
+	return ok
 }
 
 // isRetiredKey reports whether key is one of retiredKeys.
@@ -240,7 +259,7 @@ func (s *Service) All(ctx context.Context) (map[string]any, error) {
 	defer s.mu.RUnlock()
 	out := make(map[string]any, len(s.cache))
 	for k, v := range s.cache {
-		if k == CostInputUsdPerM || k == CostOutputUsdPerM || isRetiredKey(k) {
+		if k == CostInputUsdPerM || k == CostOutputUsdPerM || isRetiredKey(k) || isInternalKey(k) {
 			continue
 		}
 		if IsSecretKey(k) {
@@ -471,6 +490,9 @@ func (s *Service) Patch(ctx context.Context, updates map[string]any) error {
 		}
 		if isRetiredKey(k) {
 			return errors.New("retired setting: " + k)
+		}
+		if isInternalKey(k) {
+			return errors.New("this setting is written only by its own endpoint: " + k)
 		}
 	}
 	updates = normalise(updates)

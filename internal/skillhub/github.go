@@ -56,6 +56,10 @@ type ghError struct {
 	retryAt time.Time // set for a rate limit
 }
 
+// Is makes a rate limit answer match ErrRateLimited (errors.Is), however
+// it is wrapped.
+func (e *ghError) Is(target error) bool { return target == ErrRateLimited && !e.retryAt.IsZero() }
+
 func (e *ghError) Error() string {
 	if !e.retryAt.IsZero() {
 		return fmt.Sprintf("github: rate limited until %s", e.retryAt.UTC().Format(time.RFC3339))
@@ -133,6 +137,9 @@ type ghClient struct {
 	key    string // rate-limit key of the credential (never the token)
 	limits *rateLimits
 	now    func() time.Time
+	// isDefault: the token is the instance-wide default read token
+	// (github_access.go), not a source's own.
+	isDefault bool
 }
 
 // newClient returns a client for token ("" reads anonymously).

@@ -41,6 +41,9 @@ func (s *Service) Inspect(ctx context.Context, rawURL, token string) (*RepoInfo,
 	}
 	token = strings.TrimSpace(token)
 	gh := s.newClient(token)
+	if token == "" {
+		gh = s.publicClient()
+	}
 	repo, err := gh.repo(ctx, ref.Owner, ref.Repo)
 	if isGHStatus(err, 404) && token == "" {
 		// Private or missing: the dashboard asks for a token.
@@ -75,7 +78,7 @@ func (s *Service) inspectError(err error, ref RepoRef, withToken bool) error {
 	case isGHStatus(err, 404):
 		return fmt.Errorf("%w: %s/%s is missing or the token cannot read it", ErrNeedsToken, ref.Owner, ref.Repo)
 	case isGHStatus(err, 401):
-		return fmt.Errorf("%w: GitHub rejected the token", ErrInvalid)
+		return fmt.Errorf("%w: GitHub rejected the token (the one given, or the default token in Skills, GitHub access)", ErrInvalid)
 	}
 	return err
 }
@@ -102,7 +105,7 @@ func (s *Service) prepareSource(ctx context.Context, by string, in SourceInput) 
 		if token != "" {
 			return nil, nil, fmt.Errorf("%w: a token was given but auth is none", ErrInvalid)
 		}
-		gh = s.newClient("")
+		gh = s.publicClient()
 	case AuthToken:
 		if token == "" {
 			return nil, nil, fmt.Errorf("%w: auth token needs a token", ErrInvalid)

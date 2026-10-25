@@ -20,6 +20,9 @@ const skillsUI = {
   edit: null,       // the Edit source modal { id, draft, saving, error }
   users: null,      // /v1/users rows for the members picker, once loaded
   syncing: {},      // source id -> true while Sync now runs
+  // access is the GitHub access panel: the default read token's state
+  // (/v1/skills/admin/github-token) and its editor.
+  access: { data: null, error: '', editing: false, token: '', busy: false },
   watching: {},     // source id -> true while its first sync is polled
   // githubConnection shows "Use my GitHub connection" in the wizard: a
   // private repository read with the admin's own toolyard GitHub
@@ -57,6 +60,7 @@ function skillsRepoLabel(src) {
 function skillsStatus(src, syncing) {
   if (syncing) return 'syncing';
   if (!src.enabled) return 'paused';
+  if (src.last_error && /rate limit/i.test(src.last_error)) return 'rate limited';
   if (src.last_error) return 'error';
   if (src.pending_version_id) return 'pending review';
   if (!src.active_version_id) return 'syncing';
@@ -64,7 +68,7 @@ function skillsStatus(src, syncing) {
 }
 
 function skillsStatusClass(status) {
-  return ({ ok: 'allowed', 'pending review': 'pending', error: 'denied', paused: 'expired', syncing: 'ask' })[status] || '';
+  return ({ ok: 'allowed', 'pending review': 'pending', 'rate limited': 'pending', error: 'denied', paused: 'expired', syncing: 'ask' })[status] || '';
 }
 
 // skillsGroupWarnings groups warnings by code, the largest group first.
@@ -101,6 +105,24 @@ function skillsVersionState(src, v) {
 }
 
 function skillsSleep(ms) { return new Promise((resolve) => setTimeout(resolve, ms)); }
+
+// skillsClock is a time as HH:MM in the browser's time zone.
+function skillsClock(v) {
+  const ms = skillsMs(v);
+  if (!ms) return '';
+  const d = new Date(ms);
+  return String(d.getHours()).padStart(2, '0') + ':' + String(d.getMinutes()).padStart(2, '0');
+}
+
+// skillsErrorText is the message to show for a failed API call: a GitHub
+// rate limit names when it ends and the way out.
+function skillsErrorText(e) {
+  const b = (e && e.body) || {};
+  if (b.code === 'rate_limited') {
+    return 'GitHub rate limit reached' + (b.reset_at ? ' until ' + skillsClock(b.reset_at) : '') + ' — add a GitHub token in GitHub access.';
+  }
+  return (e && e.message) || 'Something went wrong.';
+}
 
 // skillsRoute reads "skills" or "skills/<source id>" into skillsUI.openId.
 function skillsRoute(route) {
@@ -193,6 +215,7 @@ function skillsWizardCanSave(w) {
 async function loadSkills() {
   if (skillsUI.loading) return;
   skillsUI.loading = true; skillsUI.error = '';
+  loadSkillsAccess();
   try {
     const out = await api('/v1/skills/admin/sources');
     skillsUI.sources = (out && out.sources) || [];
@@ -204,6 +227,35 @@ async function loadSkills() {
     render();
   }
   if (skillsUI.openId && (!skillsUI.detail || skillsUI.detail.id !== skillsUI.openId)) loadSkillSource(skillsUI.openId);
+}
+
+// loadSkillsAccess reads the default GitHub token's state (never the
+// token).
+async function loadSkillsAccess() {
+  const a = skillsUI.access;
+  try {
+    a.data = await api('/v1/skills/admin/github-token');
+    a.error = '';
+  } catch (e) {
+    a.data = null;
+    a.error = e.status === 404 ? '' : skillsErrorText(e);
+  }
+  render();
+}
+
+// saveSkillsAccess sets (token) or clears ('') the default token.
+async function saveSkillsAccess(token) {
+  const a = skillsUI.access;
+  if (a.busy) return;
+  if (!token && !confirm('Clear the default GitHub token? Sources without their own token then read anonymously: 60 GitHub calls an hour from this server.')) return;
+  a.busy = true; a.error = ''; render();
+  try {
+    a.data = await api('/v1/skills/admin/github-token', { method: 'PUT', body: { token } });
+    a.editing = false;
+    toast(token ? 'GitHub token saved. Sources without their own token now read with it.' : 'GitHub token cleared.');
+  } catch (e) { a.error = skillsErrorText(e); }
+  a.token = ''; // write-only: the browser forgets it either way
+  a.busy = false; render();
 }
 
 async function loadSkillSource(id) {
@@ -244,7 +296,7 @@ async function skillsBusy(label, fn, okMsg) {
     if (okMsg) toast(typeof okMsg === 'function' ? okMsg(out) : okMsg);
     return out;
   } catch (e) {
-    toast(e.message, 'error');
+    toast(skillsErrorText(e), 'error');
     return null;
   } finally {
     if (d) d.busy = '';
@@ -259,7 +311,7 @@ async function syncSkillSource(id) {
   try {
     const res = await api('/v1/skills/sources/' + encodeURIComponent(id) + '/sync', { method: 'POST' });
     toast(skillsSyncSummary(res));
-  } catch (e) { toast(e.message, 'error'); }
+  } catch (e) { toast(skillsErrorText(e), 'error'); }
   delete skillsUI.syncing[id];
   if (skillsUI.openId === id) await loadSkillSource(id);
   skillsUI.loaded = false;
@@ -291,7 +343,7 @@ async function deleteSkillSource(src) {
     navigate('skills');
     skillsUI.loaded = false;
     await loadSkills();
-  } catch (e) { toast(e.message, 'error'); }
+  } catch (e) { toast(skillsErrorText(e), 'error'); }
 }
 
 function activateSkillVersion(src, v, staged) {
@@ -320,7 +372,7 @@ async function rotateSkillSecret(src) {
   try {
     const out = await api('/v1/skills/sources/' + encodeURIComponent(src.id) + '/webhook-secret', { method: 'POST' });
     if (d) d.secret = out;
-  } catch (e) { toast(e.message, 'error'); }
+  } catch (e) { toast(skillsErrorText(e), 'error'); }
   if (d) d.busy = '';
   render();
 }
@@ -352,7 +404,7 @@ async function skillsWizardInspect() {
     if (w.auth === 'github') body.auth = 'github';
     skillsWizardAfterInspect(w, await api('/v1/skills/sources/inspect', { method: 'POST', body }));
   } catch (e) {
-    w.error = e.message;
+    w.error = skillsErrorText(e);
     if (e.body && e.body.code === 'needs_token' && w.auth !== 'github') {
       w.auth = 'token';
       w.error = 'This repository is private or does not exist. ' + (skillsUI.githubConnection ? 'Paste a read-only token, or use your GitHub connection, and inspect again.' : 'Paste a read-only token and inspect again.');
@@ -368,7 +420,7 @@ async function skillsWizardPreview() {
   try {
     w.preview = await api('/v1/skills/sources/preview', { method: 'POST', body: skillsWizardInput(w, false) });
     w.step = 'review';
-  } catch (e) { w.error = e.message; }
+  } catch (e) { w.error = skillsErrorText(e); }
   w.busy = false; render();
 }
 
@@ -383,7 +435,7 @@ async function skillsWizardSave() {
     skillsUI.loaded = false;
     loadSkills();
     if (w.result && w.result.source && !w.result.source.last_checked_at) skillsWatchWizard(w, w.result.source.id);
-  } catch (e) { w.error = e.message; }
+  } catch (e) { w.error = skillsErrorText(e); }
   w.busy = false; render();
 }
 
@@ -460,7 +512,7 @@ async function saveSkillsEdit() {
     if (skillsUI.openId) await loadSkillSource(skillsUI.openId);
     skillsUI.loaded = false;
     await loadSkills();
-  } catch (e) { ed.saving = false; ed.error = e.message; render(); }
+  } catch (e) { ed.saving = false; ed.error = skillsErrorText(e); render(); }
 }
 
 // ---- views -------------------------------------------------------------------
@@ -498,6 +550,7 @@ function renderSkillsList() {
       el('p', { class: 'meta' }, 'Each source is a GitHub repository and branch that holds Agent Skills. toolyard copies them at an exact commit, checks for new commits every few minutes (or at once with a webhook), and serves them to agents through skills.search, skills.get and the MCP Skills extension. ',
         el('a', { href: SKILLS_DOCS_URL, target: '_blank', rel: 'noopener' }, 'How it works'))),
     skillsUI.error ? el('div', { class: 'card err' }, skillsUI.error) : null,
+    renderSkillsAccess(),
     !skillsUI.loaded && skillsUI.loading ? el('div', { class: 'card empty' }, 'Loading…')
       : skillsUI.loaded && rows.length === 0 ? el('div', { class: 'card empty' }, 'No skill sources yet. Add a repository to give your agents its skills.')
       : rows.length ? el('div', { class: 'card' }, el('table', { class: 'skills-table' },
@@ -791,4 +844,31 @@ function renderSkillsEdit() {
       el('div', { class: 'row', style: 'margin-top: 16px; justify-content: flex-end;' },
         el('button', { disabled: ed.saving, on: { click: close } }, 'Cancel'),
         el('button', { class: 'primary', disabled: ed.saving || (d.visibility === 'members' && d.members.length === 0), on: { click: saveSkillsEdit } }, ed.saving ? 'Saving…' : 'Save'))));
+}
+
+// renderSkillsAccess is the GitHub access panel: the default read token
+// sources without their own use, and the rate limit they read under.
+function renderSkillsAccess() {
+  const a = skillsUI.access;
+  if (!a.data && !a.error) return null;
+  const d = a.data || {};
+  const rate = d.rate;
+  const paused = d.paused_until && skillsMs(d.paused_until) > Date.now();
+  const low = rate && rate.limit > 0 && rate.remaining === 0;
+  return el('details', { class: 'card', 'data-disclosure-key': 'skills-github-access', open: !d.set || paused || low },
+    el('summary', {}, el('b', {}, 'GitHub access'), el('span', { class: 'meta' }, d.set ? ' · default token set' : ' · no token: 60 calls an hour')),
+    el('p', { class: 'meta' }, 'Sources without their own token read public repositories with this token. Without one, GitHub allows this server 60 calls an hour, and a few sources checked every five minutes use that up. ',
+      'A fine-grained token with read access to public repositories is enough (or Contents: read for private ones). It is write-only: toolyard stores it sealed and never shows it again. A source\'s own token always wins.'),
+    rate ? el('p', { class: low ? 'err' : '' }, 'Rate limit: ' + rate.remaining + ' of ' + rate.limit + ' calls left this hour, resets at ' + skillsClock(rate.reset) + '.') : null,
+    d.rate_error ? el('p', { class: 'meta' }, 'Could not read the rate limit: ' + d.rate_error) : null,
+    paused ? el('p', { class: 'err' }, 'GitHub rate limit reached until ' + skillsClock(d.paused_until) + ': sources without their own token wait until then' + (d.set ? '.' : ' — add a GitHub token here.')) : null,
+    a.editing ? el('div', { class: 'row' },
+      el('input', { id: 'skills-access-token', class: 'grow', type: 'password', autocomplete: 'new-password', placeholder: 'github_pat_… (read-only)',
+        value: a.token, on: { input: (e) => { a.token = e.target.value; }, keydown: (e) => { if (e.key === 'Enter' && a.token.trim()) saveSkillsAccess(a.token.trim()); } } }),
+      el('button', { class: 'primary', disabled: a.busy, on: { click: () => { if (a.token.trim()) saveSkillsAccess(a.token.trim()); } } }, a.busy ? 'Checking…' : 'Save'),
+      el('button', { disabled: a.busy, on: { click: () => { a.editing = false; a.token = ''; render(); } } }, 'Cancel'))
+      : el('div', { class: 'row' },
+        el('button', { on: { click: () => { a.editing = true; render(); } } }, d.set ? 'Replace token' : 'Set token'),
+        d.set ? el('button', { class: 'danger', disabled: a.busy, on: { click: () => saveSkillsAccess('') } }, 'Clear') : null),
+    a.error ? el('div', { class: 'err' }, a.error) : null);
 }

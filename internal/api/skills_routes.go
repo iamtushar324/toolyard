@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/url"
@@ -253,10 +254,16 @@ func writeSkillsResult(w http.ResponseWriter, res *mcp.CallToolResult) {
 		return
 	}
 	code, msg := "", toolResultText(res)
+	extra := map[string]any{}
 	if m, ok := res.StructuredContent.(map[string]any); ok {
 		code, _ = m["error"].(string)
 		if s, ok := m["message"].(string); ok && s != "" {
 			msg = s
+		}
+		for _, k := range []string{"retry_after", "reset_at"} {
+			if v, ok := m[k]; ok {
+				extra[k] = v
+			}
 		}
 	}
 	status := http.StatusForbidden // refused by the gateway: a deny policy, the agent's own limits
@@ -273,10 +280,19 @@ func writeSkillsResult(w http.ResponseWriter, res *mcp.CallToolResult) {
 		status = http.StatusServiceUnavailable
 	case gateway.SkillsErrInternal:
 		status = http.StatusInternalServerError
+	case gateway.SkillsErrRateLimited:
+		status = http.StatusTooManyRequests
+		if v, ok := extra["retry_after"]; ok {
+			w.Header().Set("Retry-After", fmt.Sprint(v))
+		}
 	case "":
 		code = "refused"
 	}
-	writeJSON(w, status, map[string]string{"error": msg, "code": code})
+	body := map[string]any{"error": msg, "code": code}
+	for k, v := range extra {
+		body[k] = v
+	}
+	writeJSON(w, status, body)
 }
 
 // toolResultText is a tool result's text content.
