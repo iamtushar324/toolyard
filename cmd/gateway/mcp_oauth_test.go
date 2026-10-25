@@ -478,7 +478,7 @@ func TestMCPOAuthFullFlowWithDynamicRegistration(t *testing.T) {
 	if names := e.toolNames(access2); !names["memory.get"] {
 		t.Fatal("a retry within the grace revoked the grant")
 	}
-	e.offset += 31 * time.Second
+	e.offset += 61 * time.Second // past the refresh reuse grace
 	w, tok = e.form("/oauth/token", url.Values{"grant_type": {"refresh_token"}, "refresh_token": {refresh1}, "client_id": {clientID}})
 	if w.Code != 400 || tok["error"] != "invalid_grant" {
 		t.Fatalf("refresh token reuse: %d %s", w.Code, w.Body)

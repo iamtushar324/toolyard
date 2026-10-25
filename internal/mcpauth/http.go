@@ -137,8 +137,9 @@ func (s *Service) HandleRegister(w http.ResponseWriter, r *http.Request, ip stri
 		writeOAuthError(w, oauthErr(http.StatusMethodNotAllowed, "invalid_request", "POST a JSON object of client metadata"), false)
 		return
 	}
-	// A registration writes a row: the global cap applies, checked first.
-	limits := append([]limit{{"register:global", registerGlobal, registerWindow}}, ipLimits("register", ip, registerPerIP, registerWindow)...)
+	// A registration writes a row: the global cap applies, last, so an
+	// address over its own limit never uses it up.
+	limits := append(ipLimits("register", ip, registerPerIP, registerWindow), limit{bucket: "register:global", max: registerGlobal, window: registerWindow, global: true})
 	if !s.allowAll(r.Context(), limits...) {
 		w.Header().Set("Retry-After", "600")
 		writeOAuthError(w, oauthErr(http.StatusTooManyRequests, "temporarily_unavailable", "too many registrations; try again later"), false)

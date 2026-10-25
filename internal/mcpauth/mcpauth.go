@@ -110,7 +110,7 @@ const (
 	// refreshReuseGrace: a refresh token presented again this soon after
 	// its use, while its successor is still unused, is refused without
 	// revoking the grant (a client retry, or two of its requests racing).
-	refreshReuseGrace = 10 * time.Second
+	refreshReuseGrace = 60 * time.Second
 	// CodeTTL: an authorization code must be exchanged within a minute.
 	CodeTTL = 60 * time.Second
 	// RequestTTL: the person has ten minutes to sign in and answer.

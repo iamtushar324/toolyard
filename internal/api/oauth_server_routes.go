@@ -20,6 +20,7 @@ package api
 //     Members see their own; admins may see and change everyone's.
 
 import (
+	"context"
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/hex"
@@ -57,6 +58,7 @@ func (s *Server) MCPOAuthRoutes(mux *http.ServeMux, svc *mcpauth.Service) {
 		return
 	}
 	h := &mcpOAuthHandlers{s: s, svc: svc}
+	s.mcpAuth = svc
 	// String literals throughout: role_guard_test.go finds the routes by
 	// scanning for them. The paths match mcpauth's constants.
 	mux.HandleFunc("/.well-known/oauth-protected-resource", svc.HandleProtectedResource)
@@ -266,9 +268,13 @@ func scopeFromForm(form url.Values, groups []scopeGroup) access.AgentScope {
 
 // consentDraft is what the form showed or the person typed.
 type consentDraft struct {
-	nickname  string
-	scope     access.AgentScope
-	mayManage bool
+	nickname      string
+	scope         access.AgentScope
+	mayManage     bool
+	signOutOthers bool
+	// connected: the person already has an active grant for this client
+	// (another device), so the page offers to sign its sessions out.
+	connected bool
 }
 
 func (h *mcpOAuthHandlers) consentSubmit(w http.ResponseWriter, r *http.Request, pending *mcpauth.AuthorizeRequest, u *identity.User) {
@@ -299,8 +305,12 @@ func (h *mcpOAuthHandlers) consentSubmit(w http.ResponseWriter, r *http.Request,
 	case "allow":
 		groups := h.s.ownerCatalog(r, u.ID)
 		draft := &consentDraft{nickname: r.PostForm.Get("nickname"), scope: scopeFromForm(r.PostForm, groups),
-			mayManage: u.Role == identity.RoleAdmin && r.PostForm.Get("may_manage") == "1"}
-		loc, err = h.svc.Approve(r.Context(), pending.ID, u, mcpauth.Consent{Nickname: draft.nickname, Scope: draft.scope, MayManage: draft.mayManage})
+			mayManage: u.Role == identity.RoleAdmin && r.PostForm.Get("may_manage") == "1", signOutOthers: r.PostForm.Get("sign_out_others") == "1"}
+		if prev, err := h.svc.Existing(r.Context(), u.ID, pending.Client.ID); err == nil && prev != nil && !prev.Revoked {
+			draft.connected = true
+		}
+		loc, err = h.svc.Approve(r.Context(), pending.ID, u, mcpauth.Consent{Nickname: draft.nickname, Scope: draft.scope,
+			MayManage: draft.mayManage, SignOutOthers: draft.signOutOthers})
 		if errors.Is(err, mcpauth.ErrInvalidNickname) || errors.Is(err, access.ErrInvalidScope) {
 			h.renderConsent(w, r, pending, u, err.Error(), draft)
 			return
@@ -346,7 +356,7 @@ func (h *mcpOAuthHandlers) renderConsent(w http.ResponseWriter, r *http.Request,
 	if draft == nil {
 		draft = &consentDraft{nickname: mcpauth.DefaultNickname(client.DisplayName()), scope: access.AgentScope{Mode: access.ScopeModeAll}}
 		if prev, err := h.svc.Existing(r.Context(), u.ID, client.ID); err == nil && prev != nil {
-			draft.nickname, draft.scope = prev.Nickname, prev.Scope
+			draft.nickname, draft.scope, draft.connected = prev.Nickname, prev.Scope, !prev.Revoked
 		}
 	}
 	groups := h.s.ownerCatalog(r, u.ID)
@@ -427,6 +437,11 @@ func (h *mcpOAuthHandlers) renderConsent(w http.ResponseWriter, r *http.Request,
 		}
 		b.WriteString(`</fieldset>`)
 	}
+	if draft.connected {
+		b.WriteString(`<fieldset><legend>Other sessions</legend><p><label><input type="checkbox" name="sign_out_others" value="1"` + checked(draft.signOutOthers) +
+			`> Sign out this app's other sessions</label></p>` +
+			`<p class="meta">You already connected this app, maybe on another device. Leave this off to keep those sessions working.</p></fieldset>`)
+	}
 	if u.Role == identity.RoleAdmin {
 		b.WriteString(`<fieldset><legend>Admin control</legend><p><label><input type="checkbox" name="may_manage" value="1"` + checked(draft.mayManage) +
 			`> May manage toolyard (policies, servers, shared connections)</label></p>` +
@@ -448,6 +463,15 @@ func sortedKeys(m map[string]bool) []string {
 	}
 	sort.Strings(out)
 	return out
+}
+
+// oauthAgentDeleted runs the OAuth revocation follow-up (cancel what the
+// agent had pending) after the generic agent route deleted an agent that
+// was an OAuth client; identity.DeleteAgent already revoked its grant.
+func (s *Server) oauthAgentDeleted(ctx context.Context, agentID string) {
+	if s.mcpAuth != nil {
+		s.mcpAuth.AgentDeleted(ctx, agentID)
+	}
 }
 
 func setOf(v []string) map[string]bool {

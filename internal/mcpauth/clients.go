@@ -558,7 +558,16 @@ const (
 	// toolyard fetch per cimdFetchWindow.
 	cimdFetchesPerIP = 20
 	cimdFetchWindow  = 10 * time.Minute
+	// cimdStaleMax: an expired copy keeps serving while the document
+	// cannot be fetched (a network failure, a temporary HTTP error, a full
+	// fetch budget), for at most this long after it expired.
+	cimdStaleMax = 7 * 24 * time.Hour
 )
+
+// staleUsable reports whether an expired cached copy may still serve.
+func (s *Service) staleUsable(c *Client) bool {
+	return c != nil && c.expiresAt > s.now().Add(-cimdStaleMax).UnixMilli()
+}
 
 // errCIMDUnusable is what a caller is told about any failed document: the
 // detail goes to the log, never back to the requester.
@@ -611,9 +620,14 @@ func (s *Service) ResolveClient(ctx context.Context, clientID, ip string) (*Clie
 	if s.recalled(ctx, negKey) {
 		return nil, errCIMDUnusable()
 	}
-	// A fetch is expensive: the global cap applies, checked first.
-	limits := append([]limit{{"cimd-fetch:global", cimdFetchGlobal, cimdFetchWindow}}, ipLimits("cimd-fetch", ip, cimdFetchesPerIP, cimdFetchWindow)...)
+	// A fetch is expensive: the global cap applies, last, so an address
+	// over its own limit never uses it up. With every fetch bucket full,
+	// a stale copy (within cimdStaleMax) still serves.
+	limits := append(ipLimits("cimd-fetch", ip, cimdFetchesPerIP, cimdFetchWindow), limit{bucket: "cimd-fetch:global", max: cimdFetchGlobal, window: cimdFetchWindow, global: true})
 	if !s.allowAll(ctx, limits...) {
+		if s.staleUsable(cached) {
+			return cached, nil
+		}
 		return nil, oauthErr(http.StatusTooManyRequests, "temporarily_unavailable", "too many client metadata documents from this address; try again later")
 	}
 	return s.fetchOnce(ctx, clientID, cached, negKey)
@@ -652,8 +666,8 @@ func (s *Service) fetchOnce(ctx context.Context, clientID string, cached *Client
 
 // fetchError is a failed document fetch. A definite one (the document
 // answered and is wrong, or toolyard refuses where it is) is cached as a
-// failure; a transient one (DNS, network, TLS, timeout) is not, and a
-// stale copy, when there is one, keeps serving.
+// failure; a transient one (DNS, network, TLS, timeout, HTTP 408, 429 or
+// 5xx) is not, and a stale copy (staleUsable) keeps serving.
 type fetchError struct {
 	msg      string
 	definite bool
@@ -682,7 +696,7 @@ func (s *Service) fetchAndStore(ctx context.Context, clientID string, cached *Cl
 	if ferr != nil {
 		var fe *fetchError
 		definite := errors.As(ferr, &fe) && fe.definite
-		if !definite && cached != nil {
+		if !definite && s.staleUsable(cached) {
 			log.Printf("mcpauth: client metadata document %q not refreshed (%v); using the stale copy", clientID, ferr)
 			return cached, nil, false
 		}
@@ -852,7 +866,10 @@ func (s *Service) fetchMetadataDocument(ctx context.Context, raw string) (*cimdD
 		return nil, 0, transientErr("the request failed: %v", err)
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
+	switch {
+	case resp.StatusCode == http.StatusRequestTimeout || resp.StatusCode == http.StatusTooManyRequests || resp.StatusCode >= 500:
+		return nil, 0, transientErr("it answered HTTP %d (temporary)", resp.StatusCode)
+	case resp.StatusCode != http.StatusOK:
 		return nil, 0, definiteErr("it answered HTTP %d (redirects are not followed)", resp.StatusCode)
 	}
 	body, err := io.ReadAll(io.LimitReader(resp.Body, maxCIMDBody+1))

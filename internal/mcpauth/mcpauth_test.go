@@ -347,20 +347,23 @@ func TestNoOpenRedirectBeforeTheRequestIsTrusted(t *testing.T) {
 			t.Errorf("%s: got %v, want an error page and no redirect", name, aerr)
 		}
 	}
-	// A metadata document client is trusted on its own host: an error
-	// there goes back to it, one for another host is shown.
+	// A metadata document does not make its own host trusted either:
+	// anyone can host a document that lists their own site (RFC 9700
+	// section 4.11.2, attack 1). Only the admin's allow list does.
 	srv, _ := cimdServer(t, func(u string) any {
-		return map[string]any{"client_id": u, "redirect_uris": []string{"https://127.0.0.1/cb", "https://evil.example/cb"}}
+		return map[string]any{"client_id": u, "redirect_uris": []string{"https://127.0.0.1/cb"}}
 	}, http.StatusOK)
 	svc := cimdService(f, srv, true)
-	id := srv.URL + "/trusted.json"
+	id := srv.URL + "/own-host.json"
 	_, aerr := svc.BeginAuthorize(context.Background(), authorizeQuery(id, "https://127.0.0.1/cb", challenge, map[string]string{"code_challenge": ""}), "198.51.100.7")
-	if aerr == nil || !strings.HasPrefix(aerr.Location(), "https://127.0.0.1/cb?") {
-		t.Errorf("an error for a document client's own host: %v, want a redirect", aerr)
-	}
-	_, aerr = svc.BeginAuthorize(context.Background(), authorizeQuery(id, "https://evil.example/cb", challenge, map[string]string{"code_challenge": ""}), "198.51.100.7")
 	if aerr == nil || aerr.Location() != "" {
-		t.Errorf("an error for another host of a document client: %v, want an error page", aerr)
+		t.Errorf("an error for a document client's own host: %v, want an error page", aerr)
+	}
+	f.settings[SettingRedirectHosts] = "127.0.0.1"
+	svc = New(Options{DB: f.db, PublicURL: testPublic, Settings: f.settings, Now: func() time.Time { return f.clock }, AllowPrivateCIMD: true, CIMDRootCAs: svc.cimdRoots})
+	_, aerr = svc.BeginAuthorize(context.Background(), authorizeQuery(id, "https://127.0.0.1/cb", challenge, map[string]string{"code_challenge": ""}), "198.51.100.7")
+	if aerr == nil || !strings.HasPrefix(aerr.Location(), "https://127.0.0.1/cb?") {
+		t.Errorf("an error for a host on the admin's allow list: %v, want a redirect", aerr)
 	}
 }
 

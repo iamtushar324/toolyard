@@ -7,6 +7,7 @@ package mcpauth
 import (
 	"context"
 	"log"
+	"sort"
 	"sync"
 	"time"
 )
@@ -17,61 +18,106 @@ import (
 // allows what the shared counter would refuse: it only refuses earlier.
 type memLimiter struct {
 	mu sync.Mutex
-	m  map[string]memBucket
+	m  map[string]*memBucket
 }
 
 type memBucket struct {
-	hits  int
-	reset time.Time
+	hits   int
+	reset  time.Time
+	last   time.Time // last use, for evicting per-address buckets
+	global bool      // never evicted
 }
 
-// maxMemBuckets bounds the pre-limit's memory; past it, finished windows
-// are dropped, and if that is not enough the map starts over.
+// maxMemBuckets bounds the pre-limit's memory. Past it, finished windows
+// are dropped first, then the least recently used per-address buckets (a
+// tenth at a time); global buckets are never evicted, so a flood of fresh
+// addresses cannot reset a global count.
 const maxMemBuckets = 50000
 
-func (l *memLimiter) allow(key string, max int, window time.Duration, now time.Time) bool {
+// admit checks every bucket of one request without counting, and counts
+// them all only when every one has room, so a request refused by one
+// bucket (an address over its limit) uses up none of the others (a global
+// bucket) and creates no bucket. It reports whether all had room.
+func (l *memLimiter) admit(now time.Time, limits []limit) bool {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if l.m == nil {
-		l.m = map[string]memBucket{}
+		l.m = map[string]*memBucket{}
 	}
-	if len(l.m) >= maxMemBuckets {
-		for k, b := range l.m {
-			if !now.Before(b.reset) {
-				delete(l.m, k)
-			}
+	for _, lim := range limits {
+		hits := 0
+		if b, ok := l.m[lim.bucket]; ok && now.Before(b.reset) {
+			hits = b.hits
 		}
-		if len(l.m) >= maxMemBuckets {
-			l.m = map[string]memBucket{}
+		if hits >= lim.max {
+			return false
 		}
 	}
-	b := l.m[key]
-	if !now.Before(b.reset) {
-		b = memBucket{reset: now.Add(window)}
+	for _, lim := range limits {
+		b, ok := l.m[lim.bucket]
+		if !ok {
+			l.makeRoom(now)
+			b = &memBucket{global: lim.global}
+			l.m[lim.bucket] = b
+		}
+		if !now.Before(b.reset) {
+			b.hits, b.reset = 0, now.Add(lim.window)
+		}
+		b.hits++
+		b.last = now
 	}
-	b.hits++
-	l.m[key] = b
-	return b.hits <= max
+	return true
 }
 
-// limit is one fixed-window bucket.
+// makeRoom keeps the map under maxMemBuckets before a new bucket goes in.
+func (l *memLimiter) makeRoom(now time.Time) {
+	if len(l.m) < maxMemBuckets {
+		return
+	}
+	for k, b := range l.m {
+		if !now.Before(b.reset) && !b.global {
+			delete(l.m, k)
+		}
+	}
+	if len(l.m) < maxMemBuckets {
+		return
+	}
+	type aged struct {
+		key  string
+		last time.Time
+	}
+	var perAddress []aged
+	for k, b := range l.m {
+		if !b.global {
+			perAddress = append(perAddress, aged{k, b.last})
+		}
+	}
+	sort.Slice(perAddress, func(i, j int) bool { return perAddress[i].last.Before(perAddress[j].last) })
+	for i := 0; i < len(perAddress) && i < maxMemBuckets/10; i++ {
+		delete(l.m, perAddress[i].key)
+	}
+}
+
+// limit is one fixed-window bucket. A global bucket counts every caller.
 type limit struct {
 	bucket string
 	max    int
 	window time.Duration
+	global bool
 }
 
 // allowAll counts one hit on every bucket and reports whether all are
-// still within their limit. The in-process pre-limit answers for every
-// bucket first, so a request refused by any of them (a global bucket
-// before all) writes nothing to the database; then the shared counters
-// are written in order. A database error refuses (fails closed).
+// still within their limit. Callers list per-address buckets first and
+// global buckets last. The in-process pre-limit first checks every bucket
+// without counting and counts them only if all have room, so a refused
+// request writes nothing to the database and uses up nothing. Then the
+// shared counters are written in order and the first one over its limit
+// refuses, before the buckets after it (the global ones) are touched: one
+// address over its limit never uses up a global budget. A database error
+// refuses (fails closed).
 func (s *Service) allowAll(ctx context.Context, limits ...limit) bool {
-	now := s.now()
-	for _, l := range limits {
-		if !s.mem.allow(l.bucket, l.max, l.window, now) {
-			return false
-		}
+	if !s.mem.admit(s.now(), limits) {
+		return false
 	}
 	for _, l := range limits {
 		if !s.dbAllow(ctx, l) {
@@ -83,7 +129,7 @@ func (s *Service) allowAll(ctx context.Context, limits ...limit) bool {
 
 // allow is allowAll for one bucket.
 func (s *Service) allow(ctx context.Context, bucket string, max int, window time.Duration) bool {
-	return s.allowAll(ctx, limit{bucket, max, window})
+	return s.allowAll(ctx, limit{bucket: bucket, max: max, window: window})
 }
 
 // dbAllow counts one hit on the shared counter.
@@ -110,9 +156,9 @@ func (s *Service) dbAllow(ctx context.Context, l limit) bool {
 // over many addresses. A missing address shares one strict bucket.
 func ipLimits(route, ip string, max int, window time.Duration) []limit {
 	key := rateKey(ip)
-	out := []limit{{route + ":" + key, limitFor(key, max), window}}
+	out := []limit{{bucket: route + ":" + key, max: limitFor(key, max), window: window}}
 	if net := netKey(ip); net != "" {
-		out = append(out, limit{route + ":net:" + net, max * networkFactor, window})
+		out = append(out, limit{bucket: route + ":net:" + net, max: max * networkFactor, window: window})
 	}
 	return out
 }

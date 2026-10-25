@@ -195,10 +195,11 @@ func (s *Service) RenameApp(ctx context.Context, app *App, nickname string, by *
 		return err
 	}
 	defer func() { _ = tx.Rollback() }()
-	if _, err = tx.ExecContext(ctx, `UPDATE agents SET name = ? WHERE id = ?`, nickname, app.AgentID); err != nil {
+	// The grant row first, as in every transaction on a grant (lockGrantOf).
+	if _, err = tx.ExecContext(ctx, `UPDATE mcp_oauth_grants SET updated_at = ? WHERE id = ?`, s.now().UnixMilli(), app.ID); err != nil {
 		return err
 	}
-	if _, err = tx.ExecContext(ctx, `UPDATE mcp_oauth_grants SET updated_at = ? WHERE id = ?`, s.now().UnixMilli(), app.ID); err != nil {
+	if _, err = tx.ExecContext(ctx, `UPDATE agents SET name = ? WHERE id = ?`, nickname, app.AgentID); err != nil {
 		return err
 	}
 	if err = s.auditTx(ctx, tx, auditRow{event: "mcp_oauth.renamed", agentID: app.AgentID, nickname: nickname,
@@ -216,11 +217,12 @@ func (s *Service) SetAppScope(ctx context.Context, app *App, sc access.AgentScop
 		return access.AgentScope{}, err
 	}
 	defer func() { _ = tx.Rollback() }()
-	out, err := access.WriteAgentScope(ctx, tx, app.AgentID, sc, by.ID)
-	if err != nil {
+	// The grant row first, as in every transaction on a grant (lockGrantOf).
+	if _, err = tx.ExecContext(ctx, `UPDATE mcp_oauth_grants SET updated_at = ? WHERE id = ?`, s.now().UnixMilli(), app.ID); err != nil {
 		return access.AgentScope{}, err
 	}
-	if _, err = tx.ExecContext(ctx, `UPDATE mcp_oauth_grants SET updated_at = ? WHERE id = ?`, s.now().UnixMilli(), app.ID); err != nil {
+	out, err := access.WriteAgentScope(ctx, tx, app.AgentID, sc, by.ID)
+	if err != nil {
 		return access.AgentScope{}, err
 	}
 	if err = s.auditTx(ctx, tx, auditRow{event: "mcp_oauth.scope_changed", agentID: app.AgentID, nickname: app.Nickname,

@@ -976,16 +976,18 @@ func (s *Service) requirePlainAgent(ctx context.Context, ownerUserID, agentID st
 // The grant row stays (it maps the agent to its client in the audit
 // trail); connecting the client again needs a new consent.
 func revokeOAuthGrantTx(ctx context.Context, tx *sql.Tx, agentID string, now int64) error {
+	// The grant row first, then its tokens and codes: the order every
+	// transaction on a grant uses (mcpauth), so none can deadlock with it.
+	if _, err := tx.ExecContext(ctx, `UPDATE mcp_oauth_grants SET revoked_at = ?, revoked_reason = 'agent_deleted', updated_at = ?
+        WHERE agent_id = ? AND revoked_at IS NULL`, now, now, agentID); err != nil {
+		return err
+	}
 	if _, err := tx.ExecContext(ctx, `UPDATE mcp_oauth_tokens SET revoked_at = ?
         WHERE revoked_at IS NULL AND grant_id IN (SELECT id FROM mcp_oauth_grants WHERE agent_id = ?)`, now, agentID); err != nil {
 		return err
 	}
-	if _, err := tx.ExecContext(ctx, `UPDATE mcp_oauth_codes SET used_at = ?
-        WHERE used_at IS NULL AND grant_id IN (SELECT id FROM mcp_oauth_grants WHERE agent_id = ?)`, now, agentID); err != nil {
-		return err
-	}
-	_, err := tx.ExecContext(ctx, `UPDATE mcp_oauth_grants SET revoked_at = ?, revoked_reason = 'agent_deleted', updated_at = ?
-        WHERE agent_id = ? AND revoked_at IS NULL`, now, now, agentID)
+	_, err := tx.ExecContext(ctx, `UPDATE mcp_oauth_codes SET used_at = ?
+        WHERE used_at IS NULL AND grant_id IN (SELECT id FROM mcp_oauth_grants WHERE agent_id = ?)`, now, agentID)
 	return err
 }
 
