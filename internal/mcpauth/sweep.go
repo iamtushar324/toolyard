@@ -54,13 +54,40 @@ func (l *memLimiter) allow(key string, max int, window time.Duration, now time.T
 	return b.hits <= max
 }
 
-// allow counts one hit on bucket in a fixed window and reports whether the
-// bucket is still within max. The in-process pre-limit answers first; a
-// database error refuses (fails closed).
-func (s *Service) allow(ctx context.Context, bucket string, max int, window time.Duration) bool {
-	if !s.mem.allow(bucket, max, window, s.now()) {
-		return false
+// limit is one fixed-window bucket.
+type limit struct {
+	bucket string
+	max    int
+	window time.Duration
+}
+
+// allowAll counts one hit on every bucket and reports whether all are
+// still within their limit. The in-process pre-limit answers for every
+// bucket first, so a request refused by any of them (a global bucket
+// before all) writes nothing to the database; then the shared counters
+// are written in order. A database error refuses (fails closed).
+func (s *Service) allowAll(ctx context.Context, limits ...limit) bool {
+	now := s.now()
+	for _, l := range limits {
+		if !s.mem.allow(l.bucket, l.max, l.window, now) {
+			return false
+		}
 	}
+	for _, l := range limits {
+		if !s.dbAllow(ctx, l) {
+			return false
+		}
+	}
+	return true
+}
+
+// allow is allowAll for one bucket.
+func (s *Service) allow(ctx context.Context, bucket string, max int, window time.Duration) bool {
+	return s.allowAll(ctx, limit{bucket, max, window})
+}
+
+// dbAllow counts one hit on the shared counter.
+func (s *Service) dbAllow(ctx context.Context, l limit) bool {
 	now := s.now().UnixMilli()
 	var hits int64
 	err := s.db.QueryRowContext(ctx,
@@ -69,20 +96,34 @@ func (s *Service) allow(ctx context.Context, bucket string, max int, window time
              hits = CASE WHEN mcp_oauth_rate_limits.reset_at <= CAST(? AS BIGINT) THEN 1 ELSE mcp_oauth_rate_limits.hits + 1 END,
              reset_at = CASE WHEN mcp_oauth_rate_limits.reset_at <= CAST(? AS BIGINT) THEN excluded.reset_at ELSE mcp_oauth_rate_limits.reset_at END
          RETURNING hits`,
-		bucket, now+window.Milliseconds(), now, now).Scan(&hits)
+		l.bucket, now+l.window.Milliseconds(), now, now).Scan(&hits)
 	if err != nil {
-		log.Printf("mcpauth: WARN rate limit %s: %v", bucket, err)
+		log.Printf("mcpauth: WARN rate limit %s: %v", l.bucket, err)
 		return false
 	}
-	return hits <= int64(max)
+	return hits <= int64(l.max)
 }
 
-// AllowIP is allow for the HTTP layer (the consent page): one bucket per
-// route and client address (IPv6 by /64, a missing address in a strict
-// shared bucket).
-func (s *Service) AllowIP(ctx context.Context, route, ip string, max int, window time.Duration) bool {
+// ipLimits are the per-address and per-network buckets of route for ip:
+// the address (IPv6 by /64) with max, and its network (IPv4 /24, IPv6
+// /48) with networkFactor times max, so one network cannot spread a flood
+// over many addresses. A missing address shares one strict bucket.
+func ipLimits(route, ip string, max int, window time.Duration) []limit {
 	key := rateKey(ip)
-	return s.allow(ctx, route+":"+key, limitFor(key, max), window)
+	out := []limit{{route + ":" + key, limitFor(key, max), window}}
+	if net := netKey(ip); net != "" {
+		out = append(out, limit{route + ":net:" + net, max * networkFactor, window})
+	}
+	return out
+}
+
+// networkFactor: a network may make this many times one address's hits.
+const networkFactor = 4
+
+// AllowIP is the per-address and per-network limit for the HTTP layer
+// (the consent page).
+func (s *Service) AllowIP(ctx context.Context, route, ip string, max int, window time.Duration) bool {
+	return s.allowAll(ctx, ipLimits(route, ip, max, window)...)
 }
 
 // remember marks key (a negative cache entry) for ttl in the shared
@@ -113,7 +154,7 @@ type flight struct {
 // Sweep deletes what can no longer be used: answered or expired requests,
 // codes and tokens past their expiry (a used refresh token is kept until
 // then, for reuse detection), finished rate-limit windows, registered
-// clients nobody authorized within a week and cached metadata documents
+// clients nobody authorized within a day and cached metadata documents
 // no grant uses. Grants are never deleted here: they name the client in
 // the audit trail.
 func (s *Service) Sweep(ctx context.Context) error {
@@ -129,7 +170,7 @@ func (s *Service) Sweep(ctx context.Context) error {
 		{`DELETE FROM mcp_oauth_rate_limits WHERE reset_at < ?`, []any{ms}},
 		{`DELETE FROM mcp_oauth_clients WHERE kind = 'dcr' AND created_at < ?
              AND NOT EXISTS (SELECT 1 FROM mcp_oauth_grants g WHERE g.client_id = mcp_oauth_clients.client_id)`,
-			[]any{ms - 7*24*time.Hour.Milliseconds()}},
+			[]any{ms - unusedClientTTL.Milliseconds()}},
 		{`DELETE FROM mcp_oauth_clients WHERE kind = 'cimd' AND expires_at < ?
              AND NOT EXISTS (SELECT 1 FROM mcp_oauth_grants g WHERE g.client_id = mcp_oauth_clients.client_id)`,
 			[]any{ms - 24*time.Hour.Milliseconds()}},

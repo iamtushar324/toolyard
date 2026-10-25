@@ -276,8 +276,10 @@ func TestAuthorizeChecks(t *testing.T) {
 		aerr.Code != "unsupported_response_type" || aerr.Location() != "" {
 		t.Errorf("token response: got %v, want an error shown to the person", aerr)
 	}
-	// Errors that go back to the client, with state and iss.
-	for name, tc := range map[string]struct {
+	// Request errors: shown to the person while the redirect URI is not
+	// trusted (a self-registered client's never is), sent back to the
+	// client with state and iss once the admin's allow list names it.
+	cases := map[string]struct {
 		extra map[string]string
 		code  string
 	}{
@@ -285,7 +287,15 @@ func TestAuthorizeChecks(t *testing.T) {
 		"plain method":      {map[string]string{"code_challenge_method": "plain"}, "invalid_request"},
 		"short challenge":   {map[string]string{"code_challenge": "abc"}, "invalid_request"},
 		"wrong resource":    {map[string]string{"resource": "https://other.example/mcp"}, "invalid_target"},
-	} {
+	}
+	for name, tc := range cases {
+		_, aerr := f.svc.BeginAuthorize(ctx, authorizeQuery(c.ClientID, redirect, challenge, tc.extra), "198.51.100.7")
+		if aerr == nil || aerr.Code != tc.code || aerr.Location() != "" {
+			t.Errorf("%s, untrusted redirect: got %v, want %s shown to the person", name, aerr, tc.code)
+		}
+	}
+	f.settings[SettingRedirectHosts] = "127.0.0.1"
+	for name, tc := range cases {
 		_, aerr := f.svc.BeginAuthorize(ctx, authorizeQuery(c.ClientID, redirect, challenge, tc.extra), "198.51.100.7")
 		if aerr == nil || aerr.Code != tc.code {
 			t.Errorf("%s: got %v, want %s", name, aerr, tc.code)
@@ -293,9 +303,10 @@ func TestAuthorizeChecks(t *testing.T) {
 		}
 		loc, _ := url.Parse(aerr.Location())
 		if loc == nil || !strings.HasPrefix(aerr.Location(), redirect) || loc.Query().Get("error") != tc.code || loc.Query().Get("iss") != testPublic {
-			t.Errorf("%s: redirect %q", name, aerr.Location())
+			t.Errorf("%s, trusted redirect: redirect %q", name, aerr.Location())
 		}
 	}
+	delete(f.settings, SettingRedirectHosts)
 	// A loopback redirect may change its port (RFC 8252 section 7.3), and
 	// the resource may carry a trailing slash.
 	if _, aerr := f.svc.BeginAuthorize(ctx, authorizeQuery(c.ClientID, "http://127.0.0.1:52222/callback", challenge,
@@ -327,11 +338,29 @@ func TestNoOpenRedirectBeforeTheRequestIsTrusted(t *testing.T) {
 	for name, extra := range map[string]map[string]string{
 		"bad response_type":     {"response_type": "token"},
 		"missing response_type": {"response_type": ""},
+		"missing challenge":     {"code_challenge": ""},
+		"plain challenge":       {"code_challenge_method": "plain"},
+		"wrong resource":        {"resource": "https://other.example/mcp"},
 	} {
 		_, aerr := f.svc.BeginAuthorize(context.Background(), authorizeQuery(evil.ClientID, "https://evil.example/landing", challenge, extra), "198.51.100.7")
 		if aerr == nil || aerr.Location() != "" {
 			t.Errorf("%s: got %v, want an error page and no redirect", name, aerr)
 		}
+	}
+	// A metadata document client is trusted on its own host: an error
+	// there goes back to it, one for another host is shown.
+	srv, _ := cimdServer(t, func(u string) any {
+		return map[string]any{"client_id": u, "redirect_uris": []string{"https://127.0.0.1/cb", "https://evil.example/cb"}}
+	}, http.StatusOK)
+	svc := cimdService(f, srv, true)
+	id := srv.URL + "/trusted.json"
+	_, aerr := svc.BeginAuthorize(context.Background(), authorizeQuery(id, "https://127.0.0.1/cb", challenge, map[string]string{"code_challenge": ""}), "198.51.100.7")
+	if aerr == nil || !strings.HasPrefix(aerr.Location(), "https://127.0.0.1/cb?") {
+		t.Errorf("an error for a document client's own host: %v, want a redirect", aerr)
+	}
+	_, aerr = svc.BeginAuthorize(context.Background(), authorizeQuery(id, "https://evil.example/cb", challenge, map[string]string{"code_challenge": ""}), "198.51.100.7")
+	if aerr == nil || aerr.Location() != "" {
+		t.Errorf("an error for another host of a document client: %v, want an error page", aerr)
 	}
 }
 

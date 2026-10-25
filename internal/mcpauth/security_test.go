@@ -34,6 +34,8 @@ func TestBlockedAddresses(t *testing.T) {
 		"2002:808:808::1": false, "2002:a00:1::1": true, "2002:a9fe:a9fe::1": true,
 		"2001::1": true, "2001:db8::1": true, "3fff::1": true, "fc00::1": true, "fd12::1": true, "fe80::1": true,
 		"fec0::1": true, "ff02::1": true, "100::1": true, "2001:2::1": true,
+		// Only 2000::/3 is public IPv6.
+		"4000::1": true, "1::1": true, "e000::1": true, "3ffe:1::1": false,
 	} {
 		if got := blockedAddr(netip.MustParseAddr(addr)); got != want {
 			t.Errorf("blockedAddr(%s) = %v, want %v", addr, got, want)
@@ -161,8 +163,8 @@ func TestRateKeys(t *testing.T) {
 
 func TestGlobalCapsOnRegistrationsAndRequests(t *testing.T) {
 	f := newFixture(t)
-	defer func(g, a int) { registerGlobal, authorizeGlobal = g, a }(registerGlobal, authorizeGlobal)
-	registerGlobal, authorizeGlobal = 2, 3
+	defer func(g, p int) { registerGlobal, authorizePerIP = g, p }(registerGlobal, authorizePerIP)
+	registerGlobal, authorizePerIP = 2, 2
 	mux := http.NewServeMux()
 	mux.HandleFunc(RegisterPath, func(w http.ResponseWriter, r *http.Request) {
 		f.svc.HandleRegister(w, r, r.Header.Get("X-Test-IP"))
@@ -179,17 +181,237 @@ func TestGlobalCapsOnRegistrationsAndRequests(t *testing.T) {
 	if codes[0] != http.StatusCreated || codes[1] != http.StatusCreated || codes[2] != http.StatusTooManyRequests {
 		t.Fatalf("registrations from three addresses: %v, want the third refused by the global cap", codes)
 	}
+	// Authorizations for a known client have no global cap, only the
+	// per-address and per-network tiers: five addresses of one /24 at two
+	// each make ten, past the network's eight; another /24 is unaffected.
 	c := f.register(t, "none", "https://ok.example/cb") // direct Register skips the HTTP limits
 	_, challenge := pkcePair(t)
-	refused := false
-	for i := 0; i < 5; i++ {
-		_, aerr := f.svc.BeginAuthorize(context.Background(), authorizeQuery(c.ClientID, "https://ok.example/cb", challenge, nil), "198.51.100."+string(rune('1'+i)))
-		if aerr != nil && aerr.Status == http.StatusTooManyRequests {
-			refused = true
+	authorize := func(ip string) int {
+		_, aerr := f.svc.BeginAuthorize(context.Background(), authorizeQuery(c.ClientID, "https://ok.example/cb", challenge, nil), ip)
+		if aerr != nil {
+			return aerr.Status
+		}
+		return http.StatusOK
+	}
+	refused := 0
+	for i := 1; i <= 5; i++ {
+		for j := 0; j < 2; j++ {
+			if authorize("203.0.113."+string(rune('0'+i))) == http.StatusTooManyRequests {
+				refused++
+			}
 		}
 	}
-	if !refused {
-		t.Fatal("pending requests past the global cap were accepted")
+	if refused != 2 {
+		t.Fatalf("%d of ten authorizations from one /24 refused, want 2 past the network tier", refused)
+	}
+	if got := authorize("198.51.100.77"); got != http.StatusOK {
+		t.Fatalf("another network was refused: %d", got)
+	}
+	if got := authorize("203.0.113.6"); got != http.StatusTooManyRequests {
+		t.Fatalf("a fresh address of the full /24: %d, want 429", got)
+	}
+}
+
+// TestGlobalMemoryBucketIsCheckedBeforeDatabaseWrites: once a global
+// bucket is full in memory, a request writes no per-address row.
+func TestGlobalMemoryBucketIsCheckedBeforeDatabaseWrites(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	global := limit{"test:global", 1, time.Minute}
+	if !f.svc.allowAll(ctx, global, limit{"test:ip:a", 10, time.Minute}) {
+		t.Fatal("first request refused")
+	}
+	if f.svc.allowAll(ctx, global, limit{"test:ip:b", 10, time.Minute}) {
+		t.Fatal("a request past the global cap was allowed")
+	}
+	var n int
+	if err := f.db.QueryRow(`SELECT COUNT(*) FROM mcp_oauth_rate_limits WHERE bucket = 'test:ip:b'`).Scan(&n); err != nil || n != 0 {
+		t.Fatalf("a refused request wrote %d per-address rows (%v)", n, err)
+	}
+}
+
+func TestDocumentFetchesHaveAGlobalCap(t *testing.T) {
+	f := newFixture(t)
+	defer func(g int) { cimdFetchGlobal = g }(cimdFetchGlobal)
+	cimdFetchGlobal = 1
+	srv, _ := cimdServer(t, func(u string) any {
+		return map[string]any{"client_id": u, "redirect_uris": []string{"https://a.example/cb"}}
+	}, http.StatusOK)
+	svc := cimdService(f, srv, true)
+	ctx := context.Background()
+	if _, oerr := svc.ResolveClient(ctx, srv.URL+"/one.json", "198.51.100.1"); oerr != nil {
+		t.Fatal(oerr)
+	}
+	if _, oerr := svc.ResolveClient(ctx, srv.URL+"/two.json", "203.0.113.1"); oerr == nil || oerr.Code != "temporarily_unavailable" {
+		t.Fatalf("a fetch past the global cap: %v", oerr)
+	}
+	// A cached client needs no fetch, so the cap does not apply to it.
+	if _, oerr := svc.ResolveClient(ctx, srv.URL+"/one.json", "203.0.113.1"); oerr != nil {
+		t.Fatalf("a cached client hit the fetch cap: %v", oerr)
+	}
+}
+
+// TestTransientFetchFailuresServeTheStaleCopy: a network failure is not
+// cached as a failure, and a stale copy keeps serving; a definite failure
+// (the document answered wrongly) is cached.
+func TestTransientFetchFailuresServeTheStaleCopy(t *testing.T) {
+	f := newFixture(t)
+	srv, _ := cimdServer(t, func(u string) any {
+		return map[string]any{"client_id": u, "client_name": "Stale", "redirect_uris": []string{"https://a.example/cb"}}
+	}, http.StatusOK)
+	svc := cimdService(f, srv, true)
+	ctx := context.Background()
+	id := srv.URL + "/stale.json"
+	if _, oerr := svc.ResolveClient(ctx, id, "198.51.100.1"); oerr != nil {
+		t.Fatal(oerr)
+	}
+	f.clock = f.clock.Add(25 * time.Hour) // past the longest cache time
+	srv.Close()                           // the next fetch fails at the network
+	c, oerr := svc.ResolveClient(ctx, id, "198.51.100.1")
+	if oerr != nil || c == nil || c.Name != "Stale" {
+		t.Fatalf("a transient failure did not serve the stale copy: %+v %v", c, oerr)
+	}
+	if svc.recalled(ctx, "neg:cimd:"+hashSecret(id)) {
+		t.Fatal("a transient failure was cached as a failure")
+	}
+	if _, oerr := svc.ResolveClient(ctx, srv.URL+"/never-seen.json", "198.51.100.1"); oerr == nil {
+		t.Fatal("an unknown client with a transient failure was accepted")
+	}
+	if svc.recalled(ctx, "neg:cimd:"+hashSecret(srv.URL+"/never-seen.json")) {
+		t.Fatal("a transient failure of an unknown client was cached as a failure")
+	}
+	bad, _ := cimdServer(t, nil, http.StatusInternalServerError)
+	badSvc := cimdService(f, bad, true)
+	_, _ = badSvc.ResolveClient(ctx, bad.URL+"/broken.json", "198.51.100.1")
+	if !badSvc.recalled(ctx, "neg:cimd:"+hashSecret(bad.URL+"/broken.json")) {
+		t.Fatal("a definite failure (HTTP 500) was not cached")
+	}
+}
+
+// TestSharedFetchSurvivesTheFirstCallerLeaving: the request that started a
+// fetch going away does not fail the requests waiting on it.
+func TestSharedFetchSurvivesTheFirstCallerLeaving(t *testing.T) {
+	f := newFixture(t)
+	release := make(chan struct{})
+	var slow *httptest.Server
+	slow = httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		<-release
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"client_id":"` + slow.URL + r.URL.Path + `","redirect_uris":["https://a.example/cb"]}`))
+	}))
+	defer slow.Close()
+	svc := cimdService(f, slow, true)
+	id := slow.URL + "/leave.json"
+	first, cancel := context.WithCancel(context.Background())
+	firstDone := make(chan *Error, 1)
+	go func() {
+		_, oerr := svc.ResolveClient(first, id, "198.51.100.1")
+		firstDone <- oerr
+	}()
+	time.Sleep(150 * time.Millisecond)
+	waiterDone := make(chan *Error, 1)
+	go func() {
+		_, oerr := svc.ResolveClient(context.Background(), id, "198.51.100.2")
+		waiterDone <- oerr
+	}()
+	time.Sleep(150 * time.Millisecond)
+	cancel() // the first requester disconnects
+	time.Sleep(50 * time.Millisecond)
+	close(release)
+	if oerr := <-waiterDone; oerr != nil {
+		t.Fatalf("the waiting request failed because the first one left: %v", oerr)
+	}
+	<-firstDone
+	if _, oerr := svc.Client(context.Background(), id); oerr != nil {
+		t.Fatalf("the shared fetch was not stored: %v", oerr)
+	}
+}
+
+// TestReconnectReplacesEarlierChains: a new consent stops every token
+// chain issued before it, even on an active grant.
+func TestReconnectReplacesEarlierChains(t *testing.T) {
+	f := newFixture(t)
+	redirect := "https://client.example/cb"
+	c := f.register(t, "none", redirect)
+	ca := ClientAuth{ClientID: c.ClientID}
+	ctx := context.Background()
+	verifier, challenge := pkcePair(t)
+	code := f.approve(t, f.user, c.ClientID, redirect, challenge, Consent{Nickname: "First"})
+	first, oerr := f.svc.Exchange(ctx, codeForm(code, redirect, verifier), ca)
+	if oerr != nil {
+		t.Fatal(oerr)
+	}
+	verifier, challenge = pkcePair(t)
+	code = f.approve(t, f.user, c.ClientID, redirect, challenge, Consent{Nickname: "Second"})
+	if _, err := f.svc.VerifyAccessToken(ctx, first.AccessToken); err == nil {
+		t.Fatal("the earlier access token survived a new consent")
+	}
+	if _, oerr := f.svc.Exchange(ctx, refreshForm(first.RefreshToken), ca); oerr == nil {
+		t.Fatal("the earlier refresh token survived a new consent")
+	}
+	second, oerr := f.svc.Exchange(ctx, codeForm(code, redirect, verifier), ca)
+	if oerr != nil {
+		t.Fatal(oerr)
+	}
+	if _, err := f.svc.VerifyAccessToken(ctx, second.AccessToken); err != nil {
+		t.Fatalf("the new consent's token: %v", err)
+	}
+}
+
+// TestDeleteAgentRevokesItsGrant: deleting an OAuth client's agent revokes
+// its grant, tokens and codes at once, and reconnecting brings none back.
+func TestDeleteAgentRevokesItsGrant(t *testing.T) {
+	f := newFixture(t)
+	redirect := "https://client.example/cb"
+	c := f.register(t, "none", redirect)
+	ca := ClientAuth{ClientID: c.ClientID}
+	ctx := context.Background()
+	verifier, challenge := pkcePair(t)
+	code := f.approve(t, f.user, c.ClientID, redirect, challenge, Consent{Nickname: "Deleted"})
+	tok, oerr := f.svc.Exchange(ctx, codeForm(code, redirect, verifier), ca)
+	if oerr != nil {
+		t.Fatal(oerr)
+	}
+	apps, err := f.svc.ListApps(ctx, f.user.ID)
+	if err != nil || len(apps) != 1 {
+		t.Fatalf("apps: %+v %v", apps, err)
+	}
+	// An unused code of the grant, as if a second sign-in were under way.
+	now := f.clock.UnixMilli()
+	if _, err := f.db.Exec(`INSERT INTO mcp_oauth_codes(code_hash, grant_id, client_id, redirect_uri, code_challenge, resource, scope, family_id, created_at, expires_at)
+        VALUES('code_pending', ?, ?, ?, 'x', ?, 'mcp', 'fam_pending', ?, ?)`, apps[0].ID, c.ClientID, redirect, testPublic+"/mcp", now, now+60000); err != nil {
+		t.Fatal(err)
+	}
+	if err := identity.New(f.db).DeleteAgent(ctx, f.user.ID, apps[0].AgentID); err != nil {
+		t.Fatal(err)
+	}
+	var reason string
+	var live, unused int
+	if err := f.db.QueryRow(`SELECT COALESCE(revoked_reason, '') FROM mcp_oauth_grants WHERE agent_id = ?`, apps[0].AgentID).Scan(&reason); err != nil || reason != "agent_deleted" {
+		t.Fatalf("grant after delete: %q %v", reason, err)
+	}
+	if err := f.db.QueryRow(`SELECT COUNT(*) FROM mcp_oauth_tokens WHERE revoked_at IS NULL`).Scan(&live); err != nil || live != 0 {
+		t.Fatalf("%d tokens still live after delete (%v)", live, err)
+	}
+	if err := f.db.QueryRow(`SELECT COUNT(*) FROM mcp_oauth_codes WHERE used_at IS NULL`).Scan(&unused); err != nil || unused != 0 {
+		t.Fatalf("%d codes still usable after delete (%v)", unused, err)
+	}
+	// Reconnecting recreates the agent under its id; nothing from before
+	// comes back.
+	verifier, challenge = pkcePair(t)
+	code = f.approve(t, f.user, c.ClientID, redirect, challenge, Consent{Nickname: "Back"})
+	if _, err := f.svc.VerifyAccessToken(ctx, tok.AccessToken); err == nil {
+		t.Fatal("an access token from before the delete works")
+	}
+	if _, oerr := f.svc.Exchange(ctx, refreshForm(tok.RefreshToken), ca); oerr == nil {
+		t.Fatal("a refresh token from before the delete works")
+	}
+	fresh, oerr := f.svc.Exchange(ctx, codeForm(code, redirect, verifier), ca)
+	if oerr != nil {
+		t.Fatal(oerr)
+	}
+	if back, err := f.svc.VerifyAccessToken(ctx, fresh.AccessToken); err != nil || back.ID != apps[0].AgentID {
+		t.Fatalf("reconnect after delete: %+v %v", back, err)
 	}
 }
 
@@ -436,8 +658,33 @@ func TestManageFlagGivesAdminControlOnlyWhenChosen(t *testing.T) {
 		t.Fatalf("a member's consent stored may_manage = %d (%v)", stored, err)
 	}
 	app, _ := f.svc.AppByAgent(ctx, managed)
-	if !app.MayManage {
-		t.Fatal("App.MayManage not reported")
+	if !app.MayManage || !app.OwnerIsAdmin || !app.ManageActive {
+		t.Fatalf("App flags: %+v", app)
+	}
+	// Only the app's owner, while an admin, may turn it on: not another
+	// admin, and never for a member's app.
+	if _, err := f.db.Exec(`INSERT INTO users(id, username, password_hash, role, status, created_at, updated_at) VALUES('u_admin2','admin2','','admin','active',?,?)`, now, now); err != nil {
+		t.Fatal(err)
+	}
+	admin2, _ := identity.New(f.db).GetUserByID(ctx, "u_admin2")
+	if err := f.svc.SetAppManage(ctx, app, true, admin2); err != ErrManageOwnerOnly {
+		t.Fatalf("another admin turned may_manage on: %v", err)
+	}
+	mApp, _ := f.svc.AppByAgent(ctx, memberApp)
+	if err := f.svc.SetAppManage(ctx, mApp, true, f.user); err != ErrManageOwnerOnly {
+		t.Fatalf("an admin turned may_manage on for a member's app: %v", err)
+	}
+	if err := f.svc.SetAppManage(ctx, mApp, true, member); err != ErrManageOwnerOnly {
+		t.Fatalf("a member turned may_manage on: %v", err)
+	}
+	// A stored flag of a member's app has no effect and says so.
+	if _, err := f.db.Exec(`UPDATE mcp_oauth_grants SET may_manage = 1 WHERE agent_id = ?`, memberApp); err != nil {
+		t.Fatal(err)
+	}
+	mApp, _ = f.svc.AppByAgent(ctx, memberApp)
+	acc.InvalidateAgent(memberApp)
+	if !mApp.MayManage || mApp.OwnerIsAdmin || mApp.ManageActive || acc.ScopeFor(ctx, memberApp).CanAdminister() {
+		t.Fatalf("a member's app with the flag stored: %+v", mApp)
 	}
 	if err := f.svc.SetAppManage(ctx, app, false, f.user); err != nil {
 		t.Fatal(err)

@@ -100,7 +100,7 @@ test('a metadata document client is labelled by its host, never as verified', ()
   assert.doesNotMatch(h.run(`appsKindLabel({ client_kind: 'cimd', client_id: 'https://x.example/c' })`), /[Vv]erified/);
 });
 
-test('only an admin sends may_manage; a member cannot turn it on', async () => {
+test('only the owner, an admin, sends may_manage: true', async () => {
   const h = harness();
   h.run(`appsUI.editor = { appId: 'grt_1', name: 'x', servers: [], error: '', saving: false, open: {},
     draft: Object.assign(appsDraftFromScope(null), { mayManage: true }) };`);
@@ -108,11 +108,26 @@ test('only an admin sends may_manage; a member cannot turn it on', async () => {
   let post = h.requests.find(r => r.path === '/v1/me/apps/scope');
   assert.equal(Object.hasOwn(post.body, 'may_manage'), false, 'a member must not send may_manage: true');
   h.requests.length = 0;
-  h.run(`state.user.role = 'admin'; appsUI.editor = { appId: 'grt_1', name: 'x', servers: [], error: '', saving: false, open: {},
+  // An admin may not turn it on for another person's app.
+  h.run(`state.user.role = 'admin'; appsUI.editor = { appId: 'grt_1', ownerId: 'u_other', name: 'x', servers: [], error: '', saving: false, open: {},
+    draft: Object.assign(appsDraftFromScope(null), { mayManage: true }) };`);
+  await h.run('saveScopeEditor()');
+  post = h.requests.find(r => r.path === '/v1/me/apps/scope');
+  assert.equal(Object.hasOwn(post.body, 'may_manage'), false, "an admin must not send may_manage: true for another person's app");
+  h.requests.length = 0;
+  h.run(`appsUI.editor = { appId: 'grt_1', ownerId: 'u_1', name: 'x', servers: [], error: '', saving: false, open: {},
     draft: Object.assign(appsDraftFromScope(null), { mayManage: true }) };`);
   await h.run('saveScopeEditor()');
   post = h.requests.find(r => r.path === '/v1/me/apps/scope');
   assert.equal(post.body.may_manage, true);
+});
+
+test('the flag is shown as without effect when the owner is not an admin', () => {
+  const h = harness();
+  h.run(`appsUI.loaded = true; appsUI.config = { enabled: true, mcp_url: 'https://toolyard.example/mcp' };
+    appsUI.apps = [{ id: 'grt_1', agent_id: 'ag_1', nickname: 'App', client_name: 'X', client_kind: 'dcr', client_id: 'mcpc_x',
+      redirect_hosts: [], status: 'active', created_at: 1, may_manage: true, owner_is_admin: false, scope: { mode: 'all' } }];`);
+  assert.match(text(h.run('viewApps()')), /no effect: the owner is not an admin/);
 });
 
 test('saving the editor posts the app scope', async () => {

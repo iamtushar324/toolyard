@@ -1183,6 +1183,31 @@ func (s *Service) Cancel(ctx context.Context, agentID, id string) (*Request, err
 	return out, nil
 }
 
+// CancelBySystem cancels one of agentID's pending requests because
+// toolyard took the agent's access away (reason, e.g. "grant revoked").
+// The activity says toolyard cancelled it, not that the agent withdrew it.
+func (s *Service) CancelBySystem(ctx context.Context, agentID, id, reason string) (*Request, error) {
+	var out *Request
+	err := s.mutate(ctx, id, func(r *Request) error {
+		if r.AgentID != agentID {
+			return ErrNotFound
+		}
+		if r.Status != StatusPending {
+			return ErrNotPending
+		}
+		r.Status = StatusCancelled
+		r.addActivity(s.now().UnixMilli(), "Cancelled by toolyard: "+reason)
+		out = r
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	s.wake(id)
+	s.publish("inbox", s.cardView(ctx, out))
+	return out, nil
+}
+
 // CheckCall is one call an agent plans to make.
 type CheckCall struct {
 	Tool string         `json:"tool"`

@@ -562,6 +562,14 @@ func TestMCPOAuthNoOpenRedirect(t *testing.T) {
 	if w.Code == http.StatusFound || strings.Contains(w.Header().Get("Location"), "evil.example") || w.Code != http.StatusBadRequest {
 		t.Fatalf("an invalid request redirected: %d %s", w.Code, w.Header().Get("Location"))
 	}
+	// A valid response type with the PKCE challenge missing: still an
+	// error page, since a self-registered redirect URI is never trusted.
+	q.Set("response_type", "code")
+	q.Del("code_challenge")
+	w = e.do(http.MethodGet, "/oauth/authorize?"+q.Encode(), nil, nil)
+	if w.Code != http.StatusBadRequest || w.Header().Get("Location") != "" || !strings.Contains(w.Body.String(), "Toolyard cannot connect this app") {
+		t.Fatalf("a request without PKCE redirected: %d %q", w.Code, w.Header().Get("Location"))
+	}
 }
 
 func TestMCPOAuthDenyAndStaticTokensWithAgentScope(t *testing.T) {

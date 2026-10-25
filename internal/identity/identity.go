@@ -934,6 +934,9 @@ func (s *Service) DeleteAgent(ctx context.Context, ownerUserID, agentID string) 
 	if err = revokeLocalConnectionsTx(ctx, tx, `user_id=? AND (parent_agent_id=? OR agent_id=?)`, []any{ownerUserID, agentID, agentID}, time.Now().UnixMilli()); err != nil {
 		return err
 	}
+	if err = revokeOAuthGrantTx(ctx, tx, agentID, time.Now().UnixMilli()); err != nil {
+		return err
+	}
 	res, err := tx.ExecContext(ctx, `DELETE FROM agents WHERE id=? AND owner_user=?`, agentID, ownerUserID)
 	if err != nil {
 		return err
@@ -966,6 +969,24 @@ func (s *Service) requirePlainAgent(ctx context.Context, ownerUserID, agentID st
 		return ErrIdentityAgent
 	}
 	return nil
+}
+
+// revokeOAuthGrantTx revokes the OAuth grant of an agent that is being
+// deleted, with its tokens and unused codes, in the caller's transaction.
+// The grant row stays (it maps the agent to its client in the audit
+// trail); connecting the client again needs a new consent.
+func revokeOAuthGrantTx(ctx context.Context, tx *sql.Tx, agentID string, now int64) error {
+	if _, err := tx.ExecContext(ctx, `UPDATE mcp_oauth_tokens SET revoked_at = ?
+        WHERE revoked_at IS NULL AND grant_id IN (SELECT id FROM mcp_oauth_grants WHERE agent_id = ?)`, now, agentID); err != nil {
+		return err
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE mcp_oauth_codes SET used_at = ?
+        WHERE used_at IS NULL AND grant_id IN (SELECT id FROM mcp_oauth_grants WHERE agent_id = ?)`, now, agentID); err != nil {
+		return err
+	}
+	_, err := tx.ExecContext(ctx, `UPDATE mcp_oauth_grants SET revoked_at = ?, revoked_reason = 'agent_deleted', updated_at = ?
+        WHERE agent_id = ? AND revoked_at IS NULL`, now, now, agentID)
+	return err
 }
 
 // refuseOAuthAgent returns ErrOAuthAgent for an OAuth client's agent: a

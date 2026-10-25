@@ -2016,9 +2016,11 @@ func (h hubEventBus) Publish(eventType string, data any) {
 }
 
 // identityResolver adapts identity.Service.PrimaryUser → oauth.IdentityResolver.
-// cancelAgentWork withdraws a revoked OAuth client's pending approvals and
-// Inbox requests and revokes its Inbox grants. Best effort: the agent is
-// already disabled, so nothing it queued can run anyway.
+// cancelAgentWork cancels a revoked OAuth client's pending approvals
+// (personal ones included) and Inbox requests and revokes its Inbox
+// grants, each recorded as done by the system because the grant was
+// revoked. Best effort: the agent is already disabled, so nothing it
+// queued can run anyway.
 func cancelAgentWork(ctx context.Context, bus *approval.Bus, inboxSvc *inbox.Service, agentID string) {
 	if bus != nil {
 		pending, err := bus.ListPendingByAgent(ctx, agentID)
@@ -2026,7 +2028,7 @@ func cancelAgentWork(ctx context.Context, bus *approval.Bus, inboxSvc *inbox.Ser
 			log.Printf("mcp-oauth: WARN list pending approvals of %s: %v", agentID, err)
 		}
 		for _, p := range pending {
-			if _, err := bus.CancelByAgent(ctx, p.ID, agentID); err != nil && !errors.Is(err, approval.ErrNotPending) {
+			if _, err := bus.CancelBySystem(ctx, p.ID, agentID, "grant revoked"); err != nil && !errors.Is(err, approval.ErrNotPending) {
 				log.Printf("mcp-oauth: WARN cancel approval %s of %s: %v", p.ID, agentID, err)
 			}
 		}
@@ -2037,11 +2039,11 @@ func cancelAgentWork(ctx context.Context, bus *approval.Bus, inboxSvc *inbox.Ser
 			log.Printf("mcp-oauth: WARN list Inbox requests of %s: %v", agentID, err)
 		}
 		for _, r := range open {
-			if _, err := inboxSvc.Cancel(ctx, agentID, r.ID); err != nil && !errors.Is(err, inbox.ErrNotPending) {
+			if _, err := inboxSvc.CancelBySystem(ctx, agentID, r.ID, "grant revoked"); err != nil && !errors.Is(err, inbox.ErrNotPending) {
 				log.Printf("mcp-oauth: WARN cancel Inbox request %s of %s: %v", r.ID, agentID, err)
 			}
 		}
-		if _, err := inboxSvc.RevokeAll(ctx, agentID); err != nil {
+		if _, err := inboxSvc.RevokeAllBy(ctx, agentID, actor.Decider{Via: approval.ViaSystem, Ref: "grant revoked"}); err != nil {
 			log.Printf("mcp-oauth: WARN revoke Inbox grants of %s: %v", agentID, err)
 		}
 	}

@@ -578,10 +578,11 @@ func (h *mcpOAuthHandlers) scopeApp(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	// Only an admin may let an app manage toolyard; anyone who manages the
-	// app may take that away.
-	if body.MayManage != nil && *body.MayManage && u.Role != identity.RoleAdmin {
-		writeError(w, http.StatusForbidden, "admin_only")
+	// Only the app's owner, while an admin, may let it manage toolyard (an
+	// admin may not give another person's app admin control); anyone who
+	// manages the app may take that away.
+	if body.MayManage != nil && *body.MayManage && (app.OwnerID != u.ID || u.Role != identity.RoleAdmin) {
+		writeError(w, http.StatusForbidden, "owner_admin_only")
 		return
 	}
 	if body.Scope != nil {
@@ -592,6 +593,10 @@ func (h *mcpOAuthHandlers) scopeApp(w http.ResponseWriter, r *http.Request) {
 	}
 	if body.MayManage != nil && *body.MayManage != app.MayManage {
 		if err := h.svc.SetAppManage(r.Context(), app, *body.MayManage, u); err != nil {
+			if errors.Is(err, mcpauth.ErrManageOwnerOnly) {
+				writeError(w, http.StatusForbidden, "owner_admin_only")
+				return
+			}
 			writeError(w, http.StatusInternalServerError, "manage_failed")
 			return
 		}

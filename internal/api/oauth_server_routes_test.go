@@ -2,6 +2,8 @@ package api
 
 import (
 	"net/http"
+	"net/http/httptest"
+	"net/url"
 	"strings"
 	"testing"
 
@@ -71,5 +73,63 @@ func TestConsentCSPAllowsOnlyTheRedirectTarget(t *testing.T) {
 	}
 	if strings.Contains(consentCSP("https://a.example/cb;script-src *", ""), "script-src *") {
 		t.Error("a redirect URI injected a CSP directive")
+	}
+}
+
+// TestOnlyTheOwnerAdminMayLetAnAppManageToolyard: over the Connected apps
+// API, an admin cannot give another person's app admin control; the
+// owner, while an admin, can; anyone who manages the app can take it away.
+func TestOnlyTheOwnerAdminMayLetAnAppManageToolyard(t *testing.T) {
+	e := newAccessTestServer(t)
+	ctx := t.Context()
+	svc := mcpauth.New(mcpauth.Options{DB: e.db, PublicURL: "https://toolyard.example.com", Access: e.access})
+	mux := http.NewServeMux()
+	e.srv.MCPOAuthRoutes(mux, svc)
+	handler := e.srv.HardenAPI(e.srv.RoleGuard(mux))
+	m := e.member(t, "user_m", "m@beknown.work")
+	appOf := func(u *identity.User, redirect string) string {
+		body := `{"redirect_uris":["` + redirect + `"],"token_endpoint_auth_method":"none"}`
+		reg, oerr := svc.Register(ctx, []byte(body), "198.51.100.7")
+		if oerr != nil {
+			t.Fatal(oerr)
+		}
+		q := url.Values{"response_type": {"code"}, "client_id": {reg.ClientID}, "redirect_uri": {redirect},
+			"code_challenge": {strings.Repeat("a", 43)}, "code_challenge_method": {"S256"}}
+		req, aerr := svc.BeginAuthorize(ctx, q, "198.51.100.7")
+		if aerr != nil {
+			t.Fatalf("authorize: %+v", aerr)
+		}
+		if _, err := svc.Approve(ctx, req.ID, u, mcpauth.Consent{Nickname: "App"}); err != nil {
+			t.Fatal(err)
+		}
+		apps, err := svc.ListApps(ctx, u.ID)
+		if err != nil || len(apps) == 0 {
+			t.Fatalf("apps: %v %v", apps, err)
+		}
+		return apps[0].ID
+	}
+	adminApp, memberApp := appOf(e.admin, "https://a.example/cb"), appOf(m, "https://b.example/cb")
+	post := func(cookie *http.Cookie, id string, manage bool) int {
+		body := `{"id":"` + id + `","may_manage":` + map[bool]string{true: "true", false: "false"}[manage] + `}`
+		req := httptest.NewRequest(http.MethodPost, "/v1/me/apps/scope", strings.NewReader(body))
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("X-Requested-With", "toolyard")
+		req.AddCookie(cookie)
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		return rec.Code
+	}
+	adminCookie, memberCookie := e.cookieFor(t, e.admin.ID), e.cookieFor(t, m.ID)
+	if code := post(adminCookie, memberApp, true); code != http.StatusForbidden {
+		t.Fatalf("an admin turned may_manage on for a member's app: %d", code)
+	}
+	if code := post(memberCookie, memberApp, true); code != http.StatusForbidden {
+		t.Fatalf("a member turned may_manage on: %d", code)
+	}
+	if code := post(adminCookie, adminApp, true); code != http.StatusOK {
+		t.Fatalf("the admin owner could not turn may_manage on: %d", code)
+	}
+	if code := post(adminCookie, adminApp, false); code != http.StatusOK {
+		t.Fatalf("the admin owner could not turn may_manage off: %d", code)
 	}
 }
