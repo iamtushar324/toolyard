@@ -308,11 +308,8 @@ func TestLegacyReceiverGetsOnlyWhatItAccepts(t *testing.T) {
 	if len(events) != 1 {
 		t.Fatalf("%d events for a legacy receiver", len(events))
 	}
-	var raw map[string]map[string]any
-	if err := json.Unmarshal([]byte(events[0].Body), &raw); err != nil {
-		t.Fatal(err)
-	}
-	if _, ok := raw["data"]["answers"]; ok {
+	_, legacyData := envelopeOf(t, events[0].Body)
+	if _, ok := legacyData["answers"]; ok {
 		t.Fatalf("a legacy receiver got answers: %s", events[0].Body)
 	}
 	// More than 12 calls only fit the v3 shape: refused when named,
