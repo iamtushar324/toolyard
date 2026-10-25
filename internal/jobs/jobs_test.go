@@ -1206,3 +1206,78 @@ func TestCallsStoppedByShutdownAreOutcomeUnknown(t *testing.T) {
 		t.Fatalf("user-cancelled script = %+v", got)
 	}
 }
+
+// During a drain, a call a user cancelled first keeps its own answer, and
+// so does a call that ran past its own time limit: neither becomes
+// outcome_unknown because Wait stopped it too.
+func TestDrainKeepsUserCancelsAndTimeouts(t *testing.T) {
+	ctx := context.Background()
+	failed := jobs.Outcome{Status: jobs.StatusFailed, IsError: true, Error: "the call stopped"}
+	// fn ends on its context, then holds until proceed, so the drain's
+	// cancel lands while the call is still on its way out.
+	slow := func(proceed <-chan struct{}) jobs.RunFunc {
+		return func(ctx context.Context, _ jobs.ProgressFunc) jobs.Outcome {
+			<-ctx.Done()
+			<-proceed
+			return failed
+		}
+	}
+	drain := func(svc *jobs.Service) <-chan struct{} {
+		done := make(chan struct{})
+		go func() {
+			defer close(done)
+			ended, cancel := context.WithCancel(ctx)
+			cancel()
+			svc.Wait(ended)
+		}()
+		time.Sleep(100 * time.Millisecond) // Wait has marked and cancelled the runs
+		return done
+	}
+
+	svc := jobs.New(storetest.Open(t), jobs.Options{PollEvery: 20 * time.Millisecond})
+	proceed := make(chan struct{})
+	job, _, err := svc.Start(ctx, startReq("ag_1", "alpha.cancelled"), slow(proceed))
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitUntil(t, "running", func() bool { j, _ := svc.Get(ctx, job.ID); return j != nil && j.Status == jobs.StatusRunning })
+	if _, _, err := svc.Cancel(ctx, job.ID); err != nil {
+		t.Fatal(err)
+	}
+	done := drain(svc)
+	close(proceed)
+	<-done
+	if j, _ := svc.Get(ctx, job.ID); j.Status != jobs.StatusFailed {
+		t.Fatalf("a call a user cancelled before the drain = %+v", j)
+	}
+
+	timed := jobs.New(storetest.Open(t), jobs.Options{PollEvery: 20 * time.Millisecond, MaxDuration: 200 * time.Millisecond})
+	proceed2 := make(chan struct{})
+	job2, _, err := timed.Start(ctx, startReq("ag_1", "alpha.timed_out"), slow(proceed2))
+	if err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(400 * time.Millisecond) // past the job's time limit
+	done = drain(timed)
+	close(proceed2)
+	<-done
+	if j, _ := timed.Get(ctx, job2.ID); j.Status != jobs.StatusFailed {
+		t.Fatalf("a call past its time limit during the drain = %+v", j)
+	}
+}
+
+// Anonymous callers share one recorded-answer count.
+func TestRecordedAnswersOfAnonymousCallersAreCapped(t *testing.T) {
+	svc := newService(t, storetest.Open(t), jobs.Options{MaxRecordedPerAgent: 1})
+	ctx := context.Background()
+	refused := jobs.Outcome{Status: jobs.StatusFailed, Error: "refused", NothingRan: true}
+	anon := startReq("", "alpha.get_x")
+	anon.OwnerUserID = ""
+	j, err := svc.Record(ctx, anon, refused)
+	if err != nil || !j.NothingRan || j.Status != jobs.StatusFailed || j.FinishedAt == 0 {
+		t.Fatalf("recorded answer = %+v %v", j, err)
+	}
+	if _, err := svc.Record(ctx, anon, refused); !errors.Is(err, jobs.ErrTooManyRecorded) {
+		t.Fatalf("second anonymous recorded answer: %v", err)
+	}
+}

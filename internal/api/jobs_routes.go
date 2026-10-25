@@ -177,7 +177,7 @@ func (s *Server) jobsStart(w http.ResponseWriter, r *http.Request, ctx context.C
 		})
 		return
 	}
-	s.answerJob(w, r.Context(), job, wait)
+	s.answerJob(w, r.Context(), agentID, job, wait)
 }
 
 // GET /v1/jobs
@@ -259,13 +259,13 @@ func (s *Server) jobsItem(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusMethodNotAllowed, "GET only")
 			return
 		}
-		s.answerJob(w, r.Context(), j, wait)
+		s.answerJob(w, r.Context(), ag.ID, j, wait)
 	case "result":
 		if r.Method != http.MethodGet {
 			writeError(w, http.StatusMethodNotAllowed, "GET only")
 			return
 		}
-		j = s.waitJob(r.Context(), j, wait)
+		j = s.waitJob(r.Context(), ag.ID, j, wait)
 		if !j.Final() {
 			writeJobView(w, j)
 			return
@@ -302,13 +302,13 @@ func (s *Server) jobsItem(w http.ResponseWriter, r *http.Request) {
 }
 
 // waitJob waits up to wait for j to be final and returns its latest state.
-// Prefer: wait is a hint: past the agent's cap on waits in progress, the
-// current state answers at once.
-func (s *Server) waitJob(ctx context.Context, j *jobs.Job, wait time.Duration) *jobs.Job {
+// The wait counts against caller's cap on waits in progress; Prefer: wait
+// is a hint, so past the cap the current state answers at once.
+func (s *Server) waitJob(ctx context.Context, caller string, j *jobs.Job, wait time.Duration) *jobs.Job {
 	if j.Final() || wait <= 0 {
 		return j
 	}
-	done, err := s.jobs.BeginWait(j.AgentID)
+	done, err := s.jobs.BeginWait(caller)
 	if err != nil {
 		return j
 	}
@@ -320,9 +320,10 @@ func (s *Server) waitJob(ctx context.Context, j *jobs.Job, wait time.Duration) *
 	return j
 }
 
-// answerJob waits up to wait, then writes the job view.
-func (s *Server) answerJob(w http.ResponseWriter, ctx context.Context, j *jobs.Job, wait time.Duration) {
-	writeJobView(w, s.waitJob(ctx, j, wait))
+// answerJob waits up to wait (counted against caller), then writes the
+// job view.
+func (s *Server) answerJob(w http.ResponseWriter, ctx context.Context, caller string, j *jobs.Job, wait time.Duration) {
+	writeJobView(w, s.waitJob(ctx, caller, j, wait))
 }
 
 // jobView is the job view every job route answers.
@@ -375,12 +376,8 @@ func newJobView(j *jobs.Job) jobView {
 		t := j.FinishedAt
 		v.FinishedAt = &t
 	}
-	switch j.Status {
-	case jobs.StatusOutcomeUnknown:
-		yes := true
-		v.MayHaveRun = &yes
-	case jobs.StatusCancelled:
-		ran := j.StartedAt > 0
+	if j.Status == jobs.StatusOutcomeUnknown || j.Status == jobs.StatusCancelled {
+		ran := j.MayHaveRun()
 		v.MayHaveRun = &ran
 	}
 	return v

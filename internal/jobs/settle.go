@@ -21,6 +21,8 @@ type settlement struct {
 	bytes   int
 	isError bool
 	errText string
+	// nothingRan records that the call was never sent (Job.NothingRan).
+	nothingRan bool
 }
 
 // noticeError is a Notifier failure inside settle.
@@ -28,14 +30,12 @@ type noticeError struct{ err error }
 
 func (e *noticeError) Error() string { return e.err.Error() }
 
-// settleOutcome stores out's result for job (inline or in the blob store)
-// and writes the final status. A result over the per-job limit, or over
-// what the job's agent or owner may keep, is not kept. A blob written for
-// a row that did not move (it was already final) is deleted again unless
-// something else names it.
-func (s *Service) settleOutcome(ctx context.Context, job *Job, from []string, out Outcome, notify bool) (bool, error) {
-	id := job.ID
-	st := settlement{status: out.Status, isError: out.IsError, errText: out.Error, bytes: len(out.Envelope)}
+// prepareResult turns out into the settlement that records it for job,
+// storing a large result in the blob store first (under the job's own
+// key). A result over the per-job limit, or over what the job's agent or
+// owner may keep (soft caps, storedOver), is not kept.
+func (s *Service) prepareResult(ctx context.Context, job *Job, out Outcome) settlement {
+	st := settlement{status: out.Status, isError: out.IsError, errText: out.Error, bytes: len(out.Envelope), nothingRan: out.NothingRan}
 	env := out.Envelope
 	over := ""
 	switch {
@@ -53,9 +53,9 @@ func (s *Service) settleOutcome(ctx context.Context, job *Job, from []string, ou
 		}
 		st.bytes = 0
 	case len(env) > s.inlineLimit && s.blobs != nil:
-		key := blobKey(id, env)
+		key := blobKey(job.ID, env)
 		if _, err := s.blobs.Put(ctx, key, strings.NewReader(env), int64(len(env))); err != nil {
-			s.log.Warn("job: could not store a large result in the blob store; keeping it in the row", "job_id", id, "err", err.Error())
+			s.log.Warn("job: could not store a large result in the blob store; keeping it in the row", "job_id", job.ID, "err", err.Error())
 			st.inline = env
 		} else {
 			st.blob = key
@@ -63,21 +63,27 @@ func (s *Service) settleOutcome(ctx context.Context, job *Job, from []string, ou
 	default:
 		st.inline = env
 	}
-	ok, err := s.settle(ctx, id, from, "", nil, st, notify)
-	if !ok && st.blob != "" && !s.blobReferenced(ctx, st.blob) {
-		if derr := s.blobs.Delete(ctx, st.blob); derr != nil {
-			s.log.Warn("job: could not delete an orphaned result blob", "job_id", id, "err", derr.Error())
-		}
+	return st
+}
+
+// dropUnusedBlob deletes the blob st stored when no row names it (its row
+// did not take it).
+func (s *Service) dropUnusedBlob(ctx context.Context, id string, st settlement) {
+	if st.blob == "" || s.blobs == nil || s.blobReferenced(ctx, st.blob) {
+		return
 	}
-	if err == nil && !ok {
-		s.log.Info("job: already final when its outcome came (recovered meanwhile); the late outcome is not kept", "job_id", id, "status", out.Status)
+	if err := s.blobs.Delete(ctx, st.blob); err != nil {
+		s.log.Warn("job: could not delete an orphaned result blob", "job_id", id, "err", err.Error())
 	}
-	return ok, err
 }
 
 // storedOver says why a result of n bytes is not kept for job: its
 // agent's, or its owner's, stored results would pass their cap. "" when it
 // fits. A failed count keeps the result (the per-job limit still holds).
+// The caps are soft: the count and the write are not one step, so jobs
+// that finish at the same moment can each pass a cap by one result (at
+// most MaxResultBytes each); taking a lock for it on every settle is not
+// worth that bound.
 func (s *Service) storedOver(ctx context.Context, job *Job, n int) string {
 	sum := func(col, v string) (int64, bool) {
 		var total int64
@@ -112,13 +118,14 @@ func (s *Service) settle(ctx context.Context, id string, from []string, guard st
 		}
 		defer func() { _ = tx.Rollback() }()
 		now := s.now().UnixMilli()
-		args := []any{st.status, nullStr(st.inline), nullStr(st.blob), st.bytes, boolInt(st.isError), nullStr(st.errText), nullStr(noticeErr), now, now, id}
+		args := []any{st.status, nullStr(st.inline), nullStr(st.blob), st.bytes, boolInt(st.isError), nullStr(st.errText), nullStr(noticeErr),
+			boolInt(st.nothingRan), now, now, id}
 		for _, f := range from {
 			args = append(args, f)
 		}
 		args = append(args, guardArgs...)
 		res, err := tx.ExecContext(ctx, `UPDATE tool_jobs SET status = ?, result = ?, result_blob = ?, result_bytes = ?, result_is_error = ?,
-            error = ?, callback_error = ?, finished_at = ?, updated_at = ?
+            error = ?, callback_error = ?, nothing_ran = ?, finished_at = ?, updated_at = ?
          WHERE id = ? AND status IN (`+placeholders(len(from))+`)`+guard, args...)
 		if err != nil {
 			return false, err
@@ -377,7 +384,7 @@ func (s *Service) Cancel(ctx context.Context, id string) (job *Job, cancelled bo
 		}
 		switch j.Status {
 		case StatusQueued:
-			ok, err := s.settle(ctx, id, []string{StatusQueued}, "", nil, settlement{status: StatusCancelled, errText: msgCancelledBeforeStart}, true)
+			ok, err := s.settle(ctx, id, []string{StatusQueued}, "", nil, settlement{status: StatusCancelled, errText: msgCancelledBeforeStart, nothingRan: true}, true)
 			if err != nil {
 				return nil, false, err
 			}

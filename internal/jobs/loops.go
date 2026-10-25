@@ -175,7 +175,7 @@ func (s *Service) Recover(ctx context.Context) (failed, unknown int, err error) 
 	for _, st := range found {
 		set := settlement{status: StatusOutcomeUnknown, errText: msgLostRunning}
 		if st.status == StatusQueued {
-			set = settlement{status: StatusFailed, errText: msgLostBeforeStart}
+			set = settlement{status: StatusFailed, errText: msgLostBeforeStart, nothingRan: true}
 		}
 		ok, err := s.settle(ctx, st.id, []string{st.status}, " AND lease_until < "+s.dbNow(), nil, set, true)
 		if err != nil {

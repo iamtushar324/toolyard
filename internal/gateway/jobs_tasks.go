@@ -256,7 +256,11 @@ func (g *Gateway) taskToolCall(ctx context.Context, w http.ResponseWriter, req t
 	job, jerr := areq.result()
 	if job == nil {
 		// Answered without a job (refused, held, or the job could not be
-		// stored): keep that answer as a final task.
+		// stored): keep that answer as a final task. An unknown outcome
+		// stays one (a resumed approval, an inline jobs.* call or a held
+		// call may have run), and so does a handler error or a recovered
+		// panic: the task says it may have run rather than that it failed.
+		out := jobOutcome(res, err)
 		if res == nil {
 			msg := "the call returned no result"
 			if err != nil {
@@ -267,10 +271,6 @@ func (g *Gateway) taskToolCall(ctx context.Context, w http.ResponseWriter, req t
 			res = mcp.NewToolResultError(msg)
 		}
 		reason, _ := args[entry.reasonField].(string)
-		// An unknown outcome stays one (a resumed approval, an inline
-		// jobs.* call or a held call may have run): the task says it may
-		// have run rather than that it failed.
-		out := jobOutcome(res, nil)
 		job, err = g.jobs.Record(ctx, jobs.StartRequest{
 			AgentID: agentID, OwnerUserID: g.ownerOf(ctx, agentID), Tool: entry.tool.Name, Upstream: entry.upstream,
 			ParamsHash: paramsHash(args), Reason: reason, Via: jobViaTask, CallbackRef: callbackRefFrom(withCallbackRefFor(ctx, entry, args)),
@@ -281,9 +281,19 @@ func (g *Gateway) taskToolCall(ctx context.Context, w http.ResponseWriter, req t
 			return
 		}
 		if errors.Is(err, jobs.ErrTooManyRecorded) {
-			// Too many stored answers: the answer itself, as an error,
-			// with no task.
-			writeRPCError(w, req, mcp.INTERNAL_ERROR, "no task was stored ("+err.Error()+"); the call's answer: "+clipText(summariseResult(res), 2000))
+			// Too many stored answers, so no task. A refusal that proves
+			// nothing ran is an error the client can retry; an answer that
+			// may have had an effect is sent as the plain tool result, so
+			// the client still learns what happened.
+			if out.NothingRan {
+				writeRPCError(w, req, mcp.INTERNAL_ERROR, "no task was stored ("+err.Error()+"); the call's answer: "+clipText(summariseResult(res), 2000))
+				return
+			}
+			plain := *res
+			if req.modern {
+				plain.ResultType = mcp.ResultTypeComplete
+			}
+			writeRPCResult(w, req.id, &plain)
 			return
 		}
 		if err != nil {

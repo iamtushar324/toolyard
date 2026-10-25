@@ -97,6 +97,7 @@ const jobsTestReason = "exercise async tool jobs in the gateway tests"
 type jobsFixtureConfig struct {
 	resolver access.Resolver
 	inbox    bool
+	jobOpts  func(*jobs.Options)
 }
 
 func newJobsFixture(t *testing.T, opts ...func(*jobsFixtureConfig)) *jobsFixture {
@@ -114,7 +115,11 @@ func newJobsFixture(t *testing.T, opts ...func(*jobsFixtureConfig)) *jobsFixture
 		db: db, rules: &asyncRules{m: map[string]jobs.AsyncSetting{}}, notes: &jobNotes{},
 		release: make(chan struct{}), slowStarted: make(chan struct{}), slowCancelled: make(chan struct{}), echoArgs: make(chan map[string]any, 8),
 	}
-	f.svc = jobs.New(db, jobs.Options{Notifier: f.notes, PollEvery: 20 * time.Millisecond})
+	jopts := jobs.Options{Notifier: f.notes, PollEvery: 20 * time.Millisecond}
+	if cfg.jobOpts != nil {
+		cfg.jobOpts(&jopts)
+	}
+	f.svc = jobs.New(db, jopts)
 	gopts := Options{Policy: policy.New(db), Approval: bus, Audit: audit.New(db), Hub: realtime.NewHub(), Memory: memory.New(db), Jobs: f.svc}
 	if cfg.resolver != nil {
 		gopts.Access = cfg.resolver

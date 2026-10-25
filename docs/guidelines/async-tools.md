@@ -128,8 +128,10 @@ task survives a restart. Task statuses: `working` (queued or running),
 could run, held for approval, or answered inline) still gets a task,
 already final, whose result is that answer; an unknown outcome stays
 `outcome_unknown`. Such a task is kept one hour (its `ttl`), and one agent
-may hold 200 of them: past that, the answer comes back as a JSON-RPC
-error with no task. Clients without tasks get the job envelope above.
+(or all anonymous callers together) may hold 200 of them. Past that there
+is no task: a toolyard refusal (nothing ran) comes back as a JSON-RPC
+error, and any other answer as the plain `tools/call` result. Clients
+without tasks get the job envelope above.
 
 A 2026-07-28 request is checked like any other on that version (the
 `Mcp-Protocol-Version` header must match `_meta`, and `Mcp-Method` /
@@ -151,7 +153,7 @@ that writes the final status:
   "data": { "job_id": "job_…", "tool": "…", "upstream": "…", "status": "succeeded",
             "is_error": false, "result_ref": "/v1/jobs/job_…/result", "result_bytes": 1832,
             "error": "", "callback_ref": "cb_…", "finished_at": 1790621520000,
-            "may_have_run": true } }   // outcome_unknown (true) and cancelled only
+            "may_have_run": true } }   // outcome_unknown (true) and cancelled (whether the call was sent) only
 ```
 
 The event never carries the result: read it with `jobs.result` or
@@ -187,7 +189,8 @@ curl "$TOOLYARD_URL/v1/jobs?status=active&limit=20" -H "Authorization: Bearer $T
   approval) is `{"status": "not_started", "result": …}`: `422` when that
   answer is an error.
 - The same `Idempotency-Key` with the same tool and arguments returns the
-  existing job; with other ones it is `422 idempotency_key_reused`.
+  existing job; with other ones it is `422 idempotency_key_reused`. A
+  retry whose `_grant` the first job already used still gets that job.
 - `GET /v1/jobs` pages with `next` → `?before=<cursor>`.
 
 ## 6. Limits
@@ -201,7 +204,7 @@ curl "$TOOLYARD_URL/v1/jobs?status=active&limit=20" -H "Authorization: Bearer $T
 | Waits in progress per agent, per replica (`jobs.wait`, `tasks/result`, `Prefer: wait`) | 8; past it `jobs.wait` and `tasks/result` answer an error, and `Prefer: wait` answers the current state at once |
 | Result kept inline in the row | 256 KiB; larger results go to the blob store (files under `<data>/job-results` on SQLite, chunks in Postgres) |
 | Largest result kept | 32 MiB (above: the job records the size and an error, not the bytes) |
-| Result bytes kept per agent / per owner | 256 MiB / 1 GiB over the retention; a result that would pass either is not kept (the job still ends with its status, and says why in `error`) |
+| Result bytes kept per agent / per owner | 256 MiB / 1 GiB over the retention; a result that would pass either is not kept (the job still ends with its status, and says why in `error`). Soft caps: jobs that end at the same moment can each pass a cap by one result |
 | Retention | 7 days after the job ends; a task recorded for a call answered at once, 1 hour |
 
 ## 7. High availability

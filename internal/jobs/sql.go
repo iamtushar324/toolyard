@@ -21,7 +21,7 @@ const jobColumns = `id, agent_id, owner_user_id, COALESCE(session_id,''), tool, 
     progress, progress_total, COALESCE(progress_message,''), COALESCE(progress_at,0),
     COALESCE(result_blob,''), result_bytes, result_is_error, COALESCE(error,''), COALESCE(callback_ref,''),
     COALESCE(callback_error,''), COALESCE(idempotency_key,''), cancel_requested, owner_instance, lease_until,
-    created_at, COALESCE(started_at,0), COALESCE(finished_at,0), updated_at, COALESCE(expires_at,0)`
+    created_at, COALESCE(started_at,0), COALESCE(finished_at,0), updated_at, COALESCE(expires_at,0), nothing_ran`
 
 type rowScanner interface{ Scan(dest ...any) error }
 
@@ -29,17 +29,18 @@ func scanJob(r rowScanner) (*Job, error) {
 	var j Job
 	var prog, total sql.NullFloat64
 	var progMsg string
-	var progAt, resultBytes, isErr, cancelReq int64
+	var progAt, resultBytes, isErr, cancelReq, nothingRan int64
 	if err := r.Scan(&j.ID, &j.AgentID, &j.OwnerUserID, &j.SessionID, &j.Tool, &j.Upstream, &j.ParamsHash, &j.Reason, &j.Via, &j.Status,
 		&prog, &total, &progMsg, &progAt,
 		&j.resultBlob, &resultBytes, &isErr, &j.Error, &j.CallbackRef,
 		&j.CallbackError, &j.IdempotencyKey, &cancelReq, &j.OwnerInstance, &j.LeaseUntil,
-		&j.CreatedAt, &j.StartedAt, &j.FinishedAt, &j.UpdatedAt, &j.ExpiresAt); err != nil {
+		&j.CreatedAt, &j.StartedAt, &j.FinishedAt, &j.UpdatedAt, &j.ExpiresAt, &nothingRan); err != nil {
 		return nil, err
 	}
 	j.ResultBytes = int(resultBytes)
 	j.ResultIsError = isErr != 0
 	j.CancelRequested = cancelReq != 0
+	j.NothingRan = nothingRan != 0
 	if prog.Valid {
 		p := &Progress{Progress: prog.Float64, Message: progMsg, At: progAt}
 		if total.Valid {
@@ -56,6 +57,14 @@ func scanJob(r rowScanner) (*Job, error) {
 // replica, so a replica whose clock drifts never ends another one's lease
 // early.
 func (s *Service) dbNow() string { return cluster.NowMillisSQL(s.db.Dialect) }
+
+// recordLockKey is the advisory lock the recorded-answer cap check and
+// insert of agentID take on Postgres.
+func recordLockKey(agentID string) int64 {
+	h := fnv.New64a()
+	_, _ = h.Write([]byte("tool_jobs:recorded:" + agentID))
+	return int64(h.Sum64())
+}
 
 // capLockKey is the advisory lock the cap check and insert of req take on
 // Postgres: the owner's, or the agent's when there is no owner.

@@ -264,14 +264,20 @@ func newJobEvent(base metrics.Event) metrics.Event {
 // made async runs inline instead; an explicit job request (jobs.start,
 // POST /v1/jobs, an MCP task) is refused.
 func (g *Gateway) startJob(ctx context.Context, plan *asyncPlan, c jobCall, ev *metrics.Event, run jobRun) (*mcp.CallToolResult, error) {
+	req := g.jobRequest(ctx, plan, c, ev)
+	var refusal *mcp.CallToolResult
 	if c.grant {
-		// The job redeems the grant when it runs: an invalid one answers
-		// now, as an inline call would, and stores no job.
-		if res := g.checkJobGrant(ctx, c, ev); res != nil {
-			return res, nil
+		// The job redeems the grant when it runs. An invalid one answers
+		// now, as an inline call would, and stores no job; Start checks it
+		// only for a new job, so a retried request with the same
+		// Idempotency-Key gets the job its grant already started.
+		req.Admit = func(actx context.Context) error {
+			if refusal = g.checkJobGrant(actx, c, ev); refusal != nil {
+				return errJobRefused
+			}
+			return nil
 		}
 	}
-	req := g.jobRequest(ctx, plan, c, ev)
 	jobEntry := c.entry
 	jobEntry.noCallTimeout = true
 	base := *ev
@@ -301,6 +307,9 @@ func (g *Gateway) startJob(ctx context.Context, plan *asyncPlan, c jobCall, ev *
 		}
 		return jobOutcome(res, derr)
 	})
+	if errors.Is(err, errJobRefused) {
+		return refusal, nil
+	}
 	if plan.req != nil {
 		plan.req.started(job, err)
 	}
@@ -364,7 +373,7 @@ func (g *Gateway) runAfter(ctx context.Context, plan *asyncPlan, c jobCall, ev *
 	actx, cancelAdopt := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
 	defer cancelAdopt()
 	job, err := g.jobs.Adopt(actx, g.jobRequest(actx, plan, c, ev), jobs.Adoption{
-		StartedAt: started, Cancel: cancel, Done: done, Relay: relay,
+		StartedAt: started, Cancel: cancel, Context: callCtx, Done: done, Relay: relay,
 		Outcome: func() jobs.Outcome {
 			g.jobMetrics(started, res, derr, &jev)
 			return jobOutcome(res, derr)
@@ -446,6 +455,10 @@ func (g *Gateway) recheckJob(ctx context.Context, c jobCall) string {
 	}
 	return ""
 }
+
+// errJobRefused is the Admit error of a job whose admission check
+// answered the call itself (startJob returns that answer).
+var errJobRefused = errors.New("the call was answered without a job")
 
 // checkJobGrant checks the grant of a granted call that becomes a job,
 // without using it up (the job redeems it when it runs), with the same
@@ -534,20 +547,38 @@ func jobOutcome(res *mcp.CallToolResult, err error) jobs.Outcome {
 	return jobs.Outcome{Status: jobs.StatusSucceeded, Envelope: env}
 }
 
-// codeModeCallsMeta is the result metadata key of executeToolCode's call
-// ledger.
-const codeModeCallsMeta = "toolyard.calls"
+// Result metadata keys of executeToolCode (codeModeResult): the call
+// ledger, the run's status, and how many calls reached the gateway.
+const (
+	codeModeCallsMeta  = "toolyard.calls"
+	codeModeStatusMeta = "toolyard.status"
+	codeModeSentMeta   = "toolyard.sent_calls"
+)
+
+// refusalStatuses are toolyard's own answers to a call it did not run
+// (structured status, with executed: false). Only these prove nothing ran:
+// an upstream's structured content can say anything.
+var refusalStatuses = map[string]bool{
+	"permission_required":           true,
+	"grant_invalid":                 true,
+	"server_restarting":             true,
+	"job_budget_exceeded":           true,
+	"agent_pending_budget_exceeded": true,
+}
 
 // resultOutcomeUnknown reports whether an error result says its work may
-// or may not have run: structured content with status outcome_unknown (a
-// code-mode run interrupted after it made a call), or a call ledger with
-// such a call.
+// or may not have run: structured content with status outcome_unknown, a
+// code-mode run whose status is outcome_unknown (interrupted after it made
+// a call), or a call ledger with such a call.
 func resultOutcomeUnknown(res *mcp.CallToolResult) bool {
 	if m, ok := res.StructuredContent.(map[string]any); ok && m["status"] == jobs.StatusOutcomeUnknown {
 		return true
 	}
 	if res.Meta == nil {
 		return false
+	}
+	if res.Meta.AdditionalFields[codeModeStatusMeta] == codemode.StatusOutcomeUnknown {
+		return true
 	}
 	switch calls := res.Meta.AdditionalFields[codeModeCallsMeta].(type) {
 	case []codemode.LedgerEntry:
@@ -567,20 +598,26 @@ func resultOutcomeUnknown(res *mcp.CallToolResult) bool {
 }
 
 // resultNothingRan reports whether an error result proves nothing ran:
-// toolyard's own refusals say executed: false, and a code-mode run with an
-// empty call ledger made no call (a script changes nothing else).
+// one of toolyard's own refusals (refusalStatuses, executed: false), or a
+// code-mode run that sent no call to the gateway (a script changes
+// nothing else; a call the script asked for and toolyard refused before
+// sending is in the ledger but not in the sent count).
 func resultNothingRan(res *mcp.CallToolResult) bool {
 	if m, ok := res.StructuredContent.(map[string]any); ok && m["executed"] == false {
-		return true
+		if st, _ := m["status"].(string); refusalStatuses[st] {
+			return true
+		}
 	}
 	if res.Meta == nil {
 		return false
 	}
-	switch calls := res.Meta.AdditionalFields[codeModeCallsMeta].(type) {
-	case []codemode.LedgerEntry:
-		return len(calls) == 0
-	case []any:
-		return len(calls) == 0
+	switch n := res.Meta.AdditionalFields[codeModeSentMeta].(type) {
+	case int:
+		return n == 0
+	case float64:
+		return n == 0
+	case json.Number:
+		return n.String() == "0"
 	}
 	return false
 }
@@ -790,7 +827,7 @@ func (g *Gateway) jobSnapshot(ctx context.Context, j *jobs.Job, withResult bool)
 		out["how_to_proceed"] = "The tool answered with an error (result) or the job never started (error). Read it before you call the tool again."
 	case jobs.StatusCancelled:
 		out["how_to_proceed"] = "Cancelled. If it was running, a write may already have taken effect: check the target before you call the tool again."
-		out["may_have_run"] = j.StartedAt > 0
+		out["may_have_run"] = j.MayHaveRun()
 	case jobs.StatusOutcomeUnknown:
 		out["how_to_proceed"] = "The outcome is unknown: the call may or may not have run. Inspect the target's own state. Do not repeat a write blindly."
 		out["may_have_run"] = true
@@ -986,16 +1023,19 @@ func (g *Gateway) handleJobsWait() directHandler {
 		// reads as unknown. Any other failed read is not "unknown": the
 		// answer is a retryable error.
 		var visible []string
+		pending := false
 		for _, id := range ids {
-			_, err := g.visibleJob(ctx, id)
+			j, err := g.visibleJob(ctx, id)
 			switch {
 			case err == nil:
 				visible = append(visible, id)
+				pending = pending || !j.Final()
 			case !errors.Is(err, jobs.ErrNotFound):
 				return jobReadFailed(err), nil
 			}
 		}
-		if len(visible) > 0 {
+		// Only a wait that will block takes one of the agent's wait slots.
+		if pending {
 			done, err := g.jobs.BeginWait(agentIDFromContext(ctx))
 			if err != nil {
 				return mcp.NewToolResultError(err.Error() + ": jobs.status(job_id=...) answers at once"), nil

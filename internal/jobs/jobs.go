@@ -187,7 +187,8 @@ type CallbackData struct {
 	CallbackRef string `json:"callback_ref,omitempty"`
 	FinishedAt  int64  `json:"finished_at"`
 	// MayHaveRun is set for outcome_unknown (true) and cancelled (whether
-	// the call had started): check the target before any new call.
+	// the call was sent, Job.MayHaveRun): check the target before any new
+	// call.
 	MayHaveRun *bool `json:"may_have_run,omitempty"`
 }
 
@@ -209,12 +210,8 @@ func CallbackEvent(j Job) (string, CallbackData) {
 	if j.HasResult() {
 		d.ResultRef = "/v1/jobs/" + j.ID + "/result"
 	}
-	switch j.Status {
-	case StatusOutcomeUnknown:
-		yes := true
-		d.MayHaveRun = &yes
-	case StatusCancelled:
-		ran := j.StartedAt > 0
+	if j.Status == StatusOutcomeUnknown || j.Status == StatusCancelled {
+		ran := j.MayHaveRun()
 		d.MayHaveRun = &ran
 	}
 	return ev, d
@@ -325,6 +322,9 @@ type Job struct {
 	// ExpiresAt is set (Unix milliseconds) on a recorded task answer
 	// (Record), which is removed then; 0 for a job, kept for the retention.
 	ExpiresAt int64
+	// NothingRan is set when toolyard knows the call was never sent: the
+	// job never started, its recheck refused it, or it was cancelled first.
+	NothingRan bool
 
 	// resultBlob is the blob store key of a large result ("" when inline).
 	resultBlob string
@@ -332,6 +332,19 @@ type Job struct {
 
 // Final reports whether the job's status never changes again.
 func (j *Job) Final() bool { return Final(j.Status) }
+
+// MayHaveRun reports whether the job's call may have taken effect, for a
+// job that did not end with the tool's own answer: always for
+// outcome_unknown, and for cancelled when the call was sent.
+func (j *Job) MayHaveRun() bool {
+	switch j.Status {
+	case StatusOutcomeUnknown:
+		return true
+	case StatusCancelled:
+		return j.StartedAt > 0 && !j.NothingRan
+	}
+	return false
+}
 
 // HasResult reports whether a finished job kept an encoded result.
 func (j *Job) HasResult() bool { return j.ResultBytes > 0 }
@@ -376,6 +389,12 @@ type StartRequest struct {
 	CallbackRef string
 	// IdempotencyKey is optional, scoped to the agent.
 	IdempotencyKey string
+	// Admit, when set (Start only), runs once Start knows the job is new:
+	// after the Idempotency-Key replay found no job, before the row is
+	// stored. An error stops Start, which returns it and stores nothing;
+	// a replay never calls it (the gateway checks a _grant here, so a
+	// retried request whose grant its first job used still gets that job).
+	Admit func(ctx context.Context) error
 }
 
 // Options configure a Service. Zero values pick the defaults.
@@ -414,7 +433,9 @@ type Options struct {
 	MaxWaitersPerAgent int
 	// MaxStoredBytesPerAgent and MaxStoredBytesPerOwner cap the result
 	// bytes kept for one agent's jobs and for one owner's agents together;
-	// a result over either is not kept (the job still finishes).
+	// a result over either is not kept (the job still finishes). They are
+	// soft caps: each result is checked just before it is stored, so jobs
+	// that finish at the same moment can each pass a cap by one result.
 	MaxStoredBytesPerAgent int64
 	MaxStoredBytesPerOwner int64
 	// MaxRecordedPerAgent caps one agent's recorded task answers within

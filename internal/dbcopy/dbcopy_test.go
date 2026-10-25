@@ -704,11 +704,18 @@ func TestCopyAndVerifyJobResults(t *testing.T) {
 		t.Fatal(err)
 	}
 	gone := sha256Hex(append([]byte(jobs.BlobKeyPrefix("job_gone")), []byte("lost")...))
+	// A row from before the key named the job (sha256 of "tool_job", a NUL
+	// byte and the result).
+	oldBody := []byte(`{"content":[{"type":"text","text":"from before the job id was in the key"}]}`)
+	legacy := sha256Hex(append([]byte("tool_job\x00"), oldBody...))
+	if err := os.WriteFile(filepath.Join(resultDir, legacy), oldBody, 0o600); err != nil {
+		t.Fatal(err)
+	}
 	db, err := store.Open(s.dbPath)
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, r := range []struct{ id, key string }{{"job_good", good}, {"job_gone", gone}} {
+	for _, r := range []struct{ id, key string }{{"job_good", good}, {"job_gone", gone}, {"job_legacy", legacy}} {
 		if _, err := db.ExecContext(ctx, `INSERT INTO tool_jobs(id, agent_id, tool, upstream, params_hash, reason, via, status,
             result_blob, result_bytes, owner_instance, lease_until, created_at, finished_at, updated_at)
             VALUES(?, 'ag_1', 'alpha.get_big', 'alpha', 'h', 'test the job result copy', 'direct', 'succeeded', ?, ?, 'node', 1, 1, 2, 2)`,
@@ -724,15 +731,17 @@ func TestCopyAndVerifyJobResults(t *testing.T) {
 
 	rep, err := Copy(ctx, src, s.blobDir, dst, CopyOptions{JobResultDir: resultDir})
 	mustOK(t, "copy", rep, err)
-	if jr := rep.JobResults; jr.Rows != 2 || jr.Copied != 1 || !contains(jr.MissingFiles, gone) {
+	if jr := rep.JobResults; jr.Rows != 3 || jr.Copied != 2 || !contains(jr.MissingFiles, gone) || len(jr.MismatchedFiles) != 0 {
 		t.Fatalf("job results copied: %+v", jr)
 	}
-	if ok, err := blobstore.NewPostgres(dst.DB).Exists(ctx, good); err != nil || !ok {
-		t.Fatalf("the job result is not in the target blob store: %v %v", ok, err)
+	for _, key := range []string{good, legacy} {
+		if ok, err := blobstore.NewPostgres(dst.DB).Exists(ctx, key); err != nil || !ok {
+			t.Fatalf("job result %s is not in the target blob store: %v %v", key, ok, err)
+		}
 	}
 	vrep, err := Verify(ctx, src, s.blobDir, dst, s.keys, VerifyOptions{JobResultDir: resultDir})
 	mustOK(t, "verify", vrep, err)
-	if jr := vrep.JobResults; jr.Verified != 1 || !contains(jr.MissingFiles, gone) {
+	if jr := vrep.JobResults; jr.Verified != 2 || !contains(jr.MissingFiles, gone) {
 		t.Fatalf("job results verified: %+v", jr)
 	}
 }

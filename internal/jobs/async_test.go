@@ -80,6 +80,14 @@ func TestCallbackEvent(t *testing.T) {
 	if _, d := CallbackEvent(Job{ID: "job_5", Status: StatusFailed}); d.MayHaveRun != nil {
 		t.Fatalf("failed job with may_have_run: %+v", d)
 	}
+	// A cancelled job that started may have run, unless its call was
+	// never sent.
+	if _, d := CallbackEvent(Job{ID: "job_6", Status: StatusCancelled, StartedAt: 5}); d.MayHaveRun == nil || !*d.MayHaveRun {
+		t.Fatalf("a job cancelled while its call ran: %+v", d)
+	}
+	if _, d := CallbackEvent(Job{ID: "job_7", Status: StatusCancelled, StartedAt: 5, NothingRan: true}); d.MayHaveRun == nil || *d.MayHaveRun {
+		t.Fatalf("a job cancelled before its call was sent: %+v", d)
+	}
 }
 
 func TestEmitterNotifier(t *testing.T) {

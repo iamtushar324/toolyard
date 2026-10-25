@@ -305,16 +305,22 @@ func jobResultRows(ctx context.Context, src store.Querier) ([]jobResult, error) 
 	return out, nil
 }
 
-// checkJobResult hashes the source file of r in dir. It records a missing
-// or mismatched file in br and returns ok false for it.
+// legacyJobBlobPrefix is what a result key hashed before the job id was
+// part of it (slice E, before E2): sha256 of this prefix and the result.
+// Rows written then still name such keys.
+const legacyJobBlobPrefix = "tool_job\x00"
+
+// checkJobResult hashes the source file of r in dir under both key forms
+// (jobs.BlobKeyPrefix, and legacyJobBlobPrefix for older rows). It records
+// a missing or mismatched file in br and returns ok false for it.
 func checkJobResult(r jobResult, dir string, br *BlobReport) (b sourceBlob, ok bool, err error) {
 	if !blobstore.ValidSHA(r.key) {
 		br.MismatchedFiles = append(br.MismatchedFiles, blobName(r.key))
 		return b, false, nil
 	}
 	path := filepath.Join(dir, r.key)
-	prefix := jobs.BlobKeyPrefix(r.id)
-	sum, n, err := hashFilePrefixed(path, prefix)
+	prefixes := []string{jobs.BlobKeyPrefix(r.id), legacyJobBlobPrefix}
+	sums, n, err := hashFileWithPrefixes(path, prefixes)
 	if errors.Is(err, fs.ErrNotExist) {
 		br.MissingFiles = append(br.MissingFiles, r.key)
 		return b, false, nil
@@ -322,11 +328,38 @@ func checkJobResult(r jobResult, dir string, br *BlobReport) (b sourceBlob, ok b
 	if err != nil {
 		return b, false, fmt.Errorf("read job result file %s: %w", r.key, err)
 	}
-	if sum != r.key {
-		br.MismatchedFiles = append(br.MismatchedFiles, r.key)
-		return b, false, nil
+	for i, sum := range sums {
+		if sum == r.key {
+			return sourceBlob{sha: r.key, path: path, size: n, prefix: prefixes[i]}, true, nil
+		}
 	}
-	return sourceBlob{sha: r.key, path: path, size: n, prefix: prefix}, true, nil
+	br.MismatchedFiles = append(br.MismatchedFiles, r.key)
+	return b, false, nil
+}
+
+// hashFileWithPrefixes is the sha256 of each prefix followed by the
+// file's bytes, read once.
+func hashFileWithPrefixes(path string, prefixes []string) ([]string, int64, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return nil, 0, err
+	}
+	defer f.Close()
+	hs := make([]hash.Hash, len(prefixes))
+	ws := make([]io.Writer, len(prefixes))
+	for i, p := range prefixes {
+		hs[i] = newPrefixedHash(p)
+		ws[i] = hs[i]
+	}
+	n, err := io.Copy(io.MultiWriter(ws...), f)
+	if err != nil {
+		return nil, 0, err
+	}
+	sums := make([]string, len(hs))
+	for i, h := range hs {
+		sums[i] = fmt.Sprintf("%x", h.Sum(nil))
+	}
+	return sums, n, nil
 }
 
 // scanJobResults checks the result file of every tool_jobs row that names

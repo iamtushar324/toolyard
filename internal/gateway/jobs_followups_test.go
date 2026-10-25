@@ -157,30 +157,130 @@ func TestJobsStartTakesItsOwnCallbackRef(t *testing.T) {
 }
 
 // A task-augmented call whose handler panics still gets an answer: the
-// same panic guard as a plain tools/call.
+// same panic guard as a plain tools/call. A panic in a call answered
+// without a job (here an inline jobs.* tool) is recorded outcome_unknown:
+// it may have run.
 func TestMCPTasksRecoverAPanickingTool(t *testing.T) {
 	f := newJobsFixture(t)
 	f.gw.registerEntry(toolEntry{
-		tool: mcp.Tool{Name: "alpha.get_panic", Description: descriptionBanner + "panic",
+		tool: mcp.Tool{Name: "jobs.boom", Description: descriptionBanner + "panic",
 			InputSchema: mcp.ToolInputSchema{Type: "object", Properties: addMetaProps(map[string]any{})}},
-		upstream: "alpha", originalName: "get_panic", reasonField: ReasonField,
+		upstream: jobsUpstream, originalName: "boom", reasonField: ReasonField,
 		handle: func(context.Context, map[string]any) (*mcp.CallToolResult, error) { panic("boom") },
 	})
 	c := newTasksServer(t, f, "ag_1", false)
 	c.initialize()
-	out := c.send("tools/call", map[string]any{"name": "alpha.get_panic", "arguments": map[string]any{ReasonField: jobsTestReason}, "task": map[string]any{}}, false)
-	if out["result"] == nil && out["error"] == nil {
-		t.Fatalf("no JSON-RPC answer for a panicking tool: %v", out)
+	out := c.result("tools/call", map[string]any{"name": "jobs.boom", "arguments": map[string]any{ReasonField: jobsTestReason}, "task": map[string]any{}})
+	task, _ := out["task"].(map[string]any)
+	id, _ := task["taskId"].(string)
+	if id == "" {
+		t.Fatalf("no task for a panicking tool: %v", out)
+	}
+	if j, err := f.svc.Get(context.Background(), id); err != nil || j.Status != jobs.StatusOutcomeUnknown {
+		t.Fatalf("recorded answer of a panicking tool = %+v %v", j, err)
+	}
+}
+
+// A retried POST /v1/jobs with the same Idempotency-Key gets the job its
+// first request started, even though that job used the grant up.
+func TestIdempotentRetryWithAGrantReturnsTheJob(t *testing.T) {
+	f := newJobsFixture(t, withInbox)
+	tok := f.grantFor(t)
+	args := func() map[string]any {
+		return map[string]any{"service": "api", "env": "prod", GrantField: tok}
+	}
+	ctx := context.Background()
+	first, res, err := f.gw.StartJob(ctx, "ag_1", "deploy.run", args(), jobsTestReason, "", "deploy-api-1")
+	if err != nil || first == nil {
+		t.Fatalf("first request = %+v %s %v", first, textOf(res), err)
+	}
+	if w := f.waitJob(t, first.ID); w["status"] != jobs.StatusSucceeded {
+		t.Fatalf("first job = %v", w)
+	}
+	again, res, err := f.gw.StartJob(ctx, "ag_1", "deploy.run", args(), jobsTestReason, "", "deploy-api-1")
+	if err != nil || again == nil || again.ID != first.ID {
+		t.Fatalf("retried request = %+v %s %v, want job %s", again, textOf(res), err, first.ID)
+	}
+	if f.deployCalls.Load() != 1 {
+		t.Fatalf("deploy ran %d times", f.deployCalls.Load())
+	}
+	// A new key with the used grant is refused at once and stores no job.
+	jobsBefore := f.jobCount(t)
+	if j, res, err := f.gw.StartJob(ctx, "ag_1", "deploy.run", args(), jobsTestReason, "", "deploy-api-2"); err != nil || j != nil ||
+		structured(t, res)["status"] != "grant_invalid" {
+		t.Fatalf("new key with a used grant = %+v %s %v", j, textOf(res), err)
+	}
+	if n := f.jobCount(t); n != jobsBefore {
+		t.Fatalf("a used grant stored %d jobs", n-jobsBefore)
+	}
+}
+
+// Past the recorded-answer cap, a task call answered at once gets no task:
+// a toolyard refusal (nothing ran) is a JSON-RPC error, and an answer
+// that may have had an effect is the plain tool result.
+func TestTasksPastTheRecordedCap(t *testing.T) {
+	f := newJobsFixture(t, func(c *jobsFixtureConfig) {
+		c.jobOpts = func(o *jobs.Options) { o.MaxRecordedPerAgent, o.MaxActive = 1, 1 }
+	})
+	c := newTasksServer(t, f, "ag_1", false)
+	c.initialize()
+	call := func(name string) map[string]any {
+		return c.send("tools/call", map[string]any{"name": name, "arguments": map[string]any{ReasonField: jobsTestReason}, "task": map[string]any{}}, false)
+	}
+	// The only active job slot is taken: task calls are refused with
+	// job_budget_exceeded (nothing ran).
+	if out := call("alpha.get_slow"); out["result"] == nil {
+		t.Fatalf("slow task = %v", out)
+	}
+	if out := call("alpha.get_fast"); out["result"] == nil {
+		t.Fatalf("first refused task (recorded) = %v", out)
+	}
+	if out := call("alpha.get_fast"); out["error"] == nil || !strings.Contains(asJSON(out["error"]), "no task was stored") {
+		t.Fatalf("refusal past the cap = %v", out)
+	}
+	out := call(MetaJobsList)
+	res, _ := out["result"].(map[string]any)
+	if res == nil || res["task"] != nil || res["content"] == nil {
+		t.Fatalf("inline answer past the cap = %v", out)
+	}
+}
+
+// jobs.wait takes one of the agent's wait slots only when it will block.
+func TestJobsWaitOnFinishedJobsTakesNoSlot(t *testing.T) {
+	f := newJobsFixture(t, func(c *jobsFixtureConfig) {
+		c.jobOpts = func(o *jobs.Options) { o.MaxWaitersPerAgent = 1 }
+	})
+	f.rules.set("alpha", jobs.AsyncSetting{Tools: map[string]jobs.AsyncRule{"get_slow": {Mode: jobs.AsyncAlways}}})
+	done := jobIDOf(t, f.call(t, MetaJobsStart, map[string]any{"tool": "alpha.get_fast", "arguments": map[string]any{}}))
+	f.waitJob(t, done)
+	running := jobIDOf(t, f.call(t, "alpha.get_slow", nil))
+	release, err := f.svc.BeginWait("ag_1") // the agent's only slot
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer release()
+	if w := f.call(t, MetaJobsWait, map[string]any{"job_id": done, "timeout_seconds": 5}); w.IsError || structured(t, w)["final"] != true {
+		t.Fatalf("jobs.wait on a finished job without a free slot = %s", textOf(w))
+	}
+	if w := f.call(t, MetaJobsWait, map[string]any{"job_id": running, "timeout_seconds": 5}); !w.IsError || !strings.Contains(textOf(w), "too many waits") {
+		t.Fatalf("jobs.wait on a running job without a free slot = %s", textOf(w))
 	}
 }
 
 // A job's outcome reads the result: an error result that says its work
 // may have run is outcome_unknown, and one that proves nothing ran says
-// so.
+// so: a code-mode run that sent no call, or one of toolyard's own
+// refusals. An upstream's structured content proves nothing.
 func TestJobOutcomeReadsTheResult(t *testing.T) {
+	ledger := []codemode.LedgerEntry{{Seq: 1, Tool: "alpha.x", Status: codemode.StatusFailed}}
 	interrupted := mcp.NewToolResultError("script interrupted")
-	interrupted.Meta = &mcp.Meta{AdditionalFields: map[string]any{"toolyard.calls": []codemode.LedgerEntry{{Seq: 1, Tool: "alpha.x", Status: codemode.StatusOutcomeUnknown}}}}
+	interrupted.Meta = &mcp.Meta{AdditionalFields: map[string]any{"toolyard.calls": ledger, "toolyard.status": codemode.StatusOutcomeUnknown, "toolyard.sent_calls": 1}}
 	if out := jobOutcome(interrupted, nil); out.Status != jobs.StatusOutcomeUnknown {
+		t.Fatalf("an interrupted run that sent a call = %+v", out)
+	}
+	unknownCall := mcp.NewToolResultError("script failed")
+	unknownCall.Meta = &mcp.Meta{AdditionalFields: map[string]any{"toolyard.calls": []codemode.LedgerEntry{{Seq: 1, Tool: "alpha.x", Status: codemode.StatusOutcomeUnknown}}}}
+	if out := jobOutcome(unknownCall, nil); out.Status != jobs.StatusOutcomeUnknown {
 		t.Fatalf("a run with an outcome_unknown call = %+v", out)
 	}
 	structuredUnknown := mcp.NewToolResultError("interrupted")
@@ -188,19 +288,31 @@ func TestJobOutcomeReadsTheResult(t *testing.T) {
 	if out := jobOutcome(structuredUnknown, nil); out.Status != jobs.StatusOutcomeUnknown {
 		t.Fatalf("structured outcome_unknown = %+v", out)
 	}
-	noCalls := mcp.NewToolResultError("script failed")
-	noCalls.Meta = &mcp.Meta{AdditionalFields: map[string]any{"toolyard.calls": []codemode.LedgerEntry{}}}
-	if out := jobOutcome(noCalls, nil); out.Status != jobs.StatusFailed || !out.NothingRan {
-		t.Fatalf("a run that made no call = %+v", out)
+	// A call the script asked for but toolyard refused before sending is
+	// in the ledger, not in the sent count: nothing ran.
+	refusedOnly := mcp.NewToolResultError("script failed")
+	refusedOnly.Meta = &mcp.Meta{AdditionalFields: map[string]any{"toolyard.calls": ledger, "toolyard.status": codemode.StatusFailed, "toolyard.sent_calls": 0}}
+	if out := jobOutcome(refusedOnly, nil); out.Status != jobs.StatusFailed || !out.NothingRan {
+		t.Fatalf("a run that sent no call = %+v", out)
 	}
-	madeCalls := mcp.NewToolResultError("script failed")
-	madeCalls.Meta = &mcp.Meta{AdditionalFields: map[string]any{"toolyard.calls": []codemode.LedgerEntry{{Seq: 1, Tool: "alpha.x", Status: "succeeded"}}}}
-	if out := jobOutcome(madeCalls, nil); out.Status != jobs.StatusFailed || out.NothingRan {
-		t.Fatalf("a failed run that made a call = %+v", out)
+	sent := mcp.NewToolResultError("script failed")
+	sent.Meta = &mcp.Meta{AdditionalFields: map[string]any{"toolyard.calls": ledger, "toolyard.status": codemode.StatusFailed, "toolyard.sent_calls": 1}}
+	if out := jobOutcome(sent, nil); out.Status != jobs.StatusFailed || out.NothingRan {
+		t.Fatalf("a failed run that sent a call = %+v", out)
+	}
+	// The same through codeModeResult, as executeToolCode answers.
+	if out := jobOutcome(codeModeResult(codemode.ExecResult{Text: "stopped", Failed: true, Status: codemode.StatusFailed,
+		ErrorKind: codemode.ErrorInterrupted, Calls: ledger, SentCalls: 0}, "cm_1"), nil); !out.NothingRan {
+		t.Fatalf("executeToolCode result with no sent call = %+v", out)
 	}
 	refused := mcp.NewToolResultError("refused")
 	refused.StructuredContent = map[string]any{"status": "job_budget_exceeded", "executed": false}
 	if out := jobOutcome(refused, nil); !out.NothingRan {
-		t.Fatalf("a refusal = %+v", out)
+		t.Fatalf("a toolyard refusal = %+v", out)
+	}
+	upstream := mcp.NewToolResultError("the upstream says so")
+	upstream.StructuredContent = map[string]any{"status": "rejected", "executed": false}
+	if out := jobOutcome(upstream, nil); out.NothingRan {
+		t.Fatalf("an upstream's executed: false was trusted: %+v", out)
 	}
 }
