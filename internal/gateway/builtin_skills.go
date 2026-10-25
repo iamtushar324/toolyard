@@ -642,6 +642,9 @@ const (
 	SkillsErrLimit       = "limit"
 	SkillsErrUnavailable = "unavailable"
 	SkillsErrInternal    = "internal"
+	// SkillsErrRateLimited: GitHub's rate limit; the answer carries
+	// retry_after (seconds) and reset_at (RFC 3339).
+	SkillsErrRateLimited = "rate_limited"
 )
 
 // skillsError is a skills tool's refusal: a message for the model and a
@@ -660,12 +663,29 @@ func skillsUnavailable(msg string) *mcp.CallToolResult { return skillsError(Skil
 // next step. ref is what the caller named, for the message.
 func skillsErrorResult(err error, ref string) *mcp.CallToolResult {
 	code, msg := skillsErrorText(err, ref)
-	return skillsError(code, msg)
+	res := skillsError(code, msg)
+	if until, ok := skillhub.RateLimitedUntil(err); ok {
+		if m, ok := res.StructuredContent.(map[string]any); ok {
+			m["retry_after"] = skillsRetryAfter(until)
+			m["reset_at"] = until.UTC().Format(time.RFC3339)
+		}
+	}
+	return res
+}
+
+// skillsRetryAfter is the whole seconds until t, at least 1.
+func skillsRetryAfter(t time.Time) int {
+	secs := int(time.Until(t).Seconds() + 0.999)
+	return max(secs, 1)
 }
 
 // skillsErrorText is the code and the message for err.
 func skillsErrorText(err error, ref string) (code, msg string) {
 	switch {
+	case errors.Is(err, skillhub.ErrRateLimited):
+		until, _ := skillhub.RateLimitedUntil(err)
+		return SkillsErrRateLimited, "GitHub's rate limit for toolyard is reached until " + until.UTC().Format("15:04 MST") +
+			": try again after that, or ask your owner to add a GitHub token in toolyard (Skills, GitHub access)"
 	case errors.Is(err, skillhub.ErrNotFound):
 		if ref == "" {
 			return SkillsErrNotFound, "not found among the skills you can see: find skills with skills.search or skills.list"

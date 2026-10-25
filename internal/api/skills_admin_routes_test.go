@@ -40,6 +40,9 @@ type skillsAdminFake struct {
 	lastLimit  int
 	// extra are more sources ListSources returns (a recent create).
 	extra []skillhub.Source
+	// defaultToken is what SetGitHubToken stored
+	// (skills_github_access_test.go).
+	defaultToken string
 }
 
 var _ skillhub.Admin = (*skillsAdminFake)(nil)
