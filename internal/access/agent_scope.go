@@ -87,8 +87,14 @@ func countOf(n int, noun string) string {
 }
 
 // Limits is the compiled form of an AgentScope that Scope checks against.
-// A nil *Limits allows everything (no agent limits).
+// A nil *Limits allows everything (no agent limits). Every OAuth client
+// has Limits, empty when its scope is "everything", so it never inherits
+// its owner's admin control unless Manage says so (CanAdminister).
 type Limits struct {
+	// OAuthClient: the agent is an OAuth client (it has a grant).
+	OAuthClient bool
+	// Manage: the owner let this OAuth client manage toolyard.
+	Manage       bool
 	Listed       bool
 	AllowServers map[string]bool
 	AllowTools   map[string]map[string]bool // group -> tool names
@@ -153,6 +159,8 @@ func (l *Limits) Describe() map[string]any {
 		"allow_tools":   allowTools,
 		"deny_servers":  keys(l.DenyServers),
 		"deny_tools":    keys(l.DenyTools),
+		"oauth_client":  l.OAuthClient,
+		"may_manage":    l.Manage,
 	}
 }
 
@@ -396,6 +404,20 @@ func (s *Service) agentLimits(ctx context.Context, agentID string) (*Limits, err
 		return nil, err
 	}
 	lim := sc.Compile()
+	// An OAuth client (mcpauth's grant row) always has limits, so it never
+	// inherits its owner's admin control by default.
+	var manage int
+	err = s.db.QueryRowContext(ctx, `SELECT may_manage FROM mcp_oauth_grants WHERE agent_id = ?`, agentID).Scan(&manage)
+	switch {
+	case errors.Is(err, sql.ErrNoRows):
+	case err != nil:
+		return nil, err
+	default:
+		if lim == nil {
+			lim = &Limits{}
+		}
+		lim.OAuthClient, lim.Manage = true, manage != 0
+	}
 	s.mu.Lock()
 	s.limits[agentID] = cached[*Limits]{v: lim, exp: s.now().Add(cacheTTL)}
 	s.mu.Unlock()

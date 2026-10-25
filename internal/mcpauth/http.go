@@ -14,7 +14,6 @@ import (
 	"net/http"
 	"net/url"
 	"strings"
-	"time"
 )
 
 // maxFormBody bounds a token or revocation request.
@@ -138,9 +137,11 @@ func (s *Service) HandleRegister(w http.ResponseWriter, r *http.Request, ip stri
 		writeOAuthError(w, oauthErr(http.StatusMethodNotAllowed, "invalid_request", "POST a JSON object of client metadata"), false)
 		return
 	}
-	if !s.allow(r.Context(), "register:"+ip, 60, time.Hour) {
+	key := rateKey(ip)
+	if !s.allow(r.Context(), "register:"+key, limitFor(key, registerPerIP), registerWindow) ||
+		!s.allow(r.Context(), "register:global", registerGlobal, registerWindow) {
 		w.Header().Set("Retry-After", "600")
-		writeOAuthError(w, oauthErr(http.StatusTooManyRequests, "temporarily_unavailable", "too many registrations from this address; try again later"), false)
+		writeOAuthError(w, oauthErr(http.StatusTooManyRequests, "temporarily_unavailable", "too many registrations; try again later"), false)
 		return
 	}
 	if mt, _, _ := mime.ParseMediaType(r.Header.Get("Content-Type")); mt != "application/json" {

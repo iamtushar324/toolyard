@@ -15,8 +15,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
 	"regexp"
 	"strconv"
@@ -85,21 +87,56 @@ func (c *Client) Public() bool { return c.AuthMethod == AuthNone }
 // ---- redirect URIs -------------------------------------------------------------
 
 // privateSchemeRE is a private-use URI scheme a native app may redirect to
-// (RFC 8252 section 7.1), e.g. "cursor" or "com.example.app".
-var privateSchemeRE = regexp.MustCompile(`^[a-z][a-z0-9+.-]{1,62}$`)
+// (RFC 8252 section 7.1): a reverse-DNS name such as "com.example.app" (at
+// least one dot), unless the scheme is on the admin's exception list
+// (SettingCustomSchemes, default cursor, vscode, vscode-insiders,
+// windsurf, zed).
+var (
+	privateSchemeRE = regexp.MustCompile(`^[a-z][a-z0-9+.-]{1,62}$`)
+	reverseDNSRE    = regexp.MustCompile(`^[a-z][a-z0-9-]*(\.[a-z0-9][a-z0-9-]*)+$`)
+	// dnsLabelRE is one label of a host name.
+	dnsLabelRE = regexp.MustCompile(`^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$`)
+)
 
 // deniedSchemes can never be redirect targets: they run code, read local
-// files or are plain-text network schemes.
+// files, start other programs or are plain-text network schemes. The list
+// applies even to an admin's exception list.
 var deniedSchemes = map[string]bool{
 	"javascript": true, "data": true, "file": true, "vbscript": true, "about": true, "blob": true,
 	"filesystem": true, "ftp": true, "ws": true, "wss": true, "mailto": true, "tel": true, "sms": true,
-	"view-source": true, "chrome": true, "intent": true,
+	"view-source": true, "chrome": true, "intent": true, "jar": true, "ms-msdt": true, "search-ms": true,
+	"search": true, "ms-officecmd": true, "ms-word": true, "ms-excel": true, "ms-powerpoint": true,
+	"ms-appinstaller": true, "ms-settings": true, "shell": true, "smb": true, "nfs": true, "telnet": true,
+	"ssh": true, "res": true, "resource": true, "chrome-extension": true, "moz-extension": true,
 }
 
-// checkRedirectURI validates one redirect URI: https anywhere, http only
-// on the loopback interface (native apps, RFC 8252 section 7.3), or a
-// private-use scheme; never a fragment or user info.
-func checkRedirectURI(raw string) error {
+// validHost reports whether host is an IP literal or a DNS host name:
+// labels of letters, digits and inner hyphens, at most 253 characters, no
+// wildcard, underscore or empty label.
+func validHost(host string) bool {
+	if host == "" {
+		return false
+	}
+	if _, err := netip.ParseAddr(host); err == nil {
+		return true
+	}
+	host = strings.ToLower(strings.TrimSuffix(host, "."))
+	if len(host) > 253 {
+		return false
+	}
+	for _, label := range strings.Split(host, ".") {
+		if !dnsLabelRE.MatchString(label) {
+			return false
+		}
+	}
+	return true
+}
+
+// checkRedirectURI validates one redirect URI: https to a valid host, http
+// only on the loopback interface (native apps, RFC 8252 section 7.3), or a
+// private-use scheme (reverse DNS, or on the exception list); never a
+// fragment or user info.
+func (s *Service) checkRedirectURI(raw string) error {
 	if raw == "" || len(raw) > maxRedirectURILen {
 		return errors.New("redirect URI is empty or too long")
 	}
@@ -120,8 +157,8 @@ func checkRedirectURI(raw string) error {
 	}
 	switch scheme := strings.ToLower(u.Scheme); {
 	case scheme == "https":
-		if u.Host == "" {
-			return fmt.Errorf("redirect URI %q has no host", raw)
+		if !validHost(u.Hostname()) {
+			return fmt.Errorf("redirect URI %q has no valid host", raw)
 		}
 	case scheme == "http":
 		if !isLoopbackHost(u.Hostname()) {
@@ -129,6 +166,10 @@ func checkRedirectURI(raw string) error {
 		}
 	case deniedSchemes[scheme] || !privateSchemeRE.MatchString(scheme):
 		return fmt.Errorf("redirect URI %q uses a scheme toolyard does not redirect to", raw)
+	case !reverseDNSRE.MatchString(scheme) && !s.CustomSchemes()[scheme]:
+		return fmt.Errorf("redirect URI %q uses a private scheme that is not a reverse-DNS name (such as com.example.app); an admin can allow it (%s)", raw, SettingCustomSchemes)
+	case u.Host != "" && !validHost(u.Hostname()):
+		return fmt.Errorf("redirect URI %q has no valid host", raw)
 	}
 	return nil
 }
@@ -214,6 +255,34 @@ func RedirectHost(raw string) string {
 		return u.Scheme + "://" + u.Host
 	}
 	return u.Scheme + ":"
+}
+
+// ClientHost is the host that identifies a metadata document client (its
+// client_id's host), or "" for a self-registered client, which nothing
+// identifies but its own claims.
+func ClientHost(c *Client) string {
+	if c == nil || c.Kind != ClientKindCIMD {
+		return ""
+	}
+	u, err := url.Parse(c.ID)
+	if err != nil {
+		return ""
+	}
+	return strings.ToLower(u.Hostname())
+}
+
+// RedirectLeavesClientHost reports whether a metadata document client
+// sends the person to a web host other than its own (neither host inside
+// the other): worth a warning on the consent screen. A loopback or
+// private-scheme redirect (a native app) is not.
+func RedirectLeavesClientHost(c *Client, redirect string) bool {
+	host := ClientHost(c)
+	u, err := url.Parse(redirect)
+	if host == "" || err != nil || (u.Scheme != "https" && u.Scheme != "http") || isLoopbackHost(u.Hostname()) {
+		return false
+	}
+	r := strings.ToLower(u.Hostname())
+	return r != host && !strings.HasSuffix(r, "."+host) && !strings.HasSuffix(host, "."+r)
 }
 
 // CSPSource is the Content-Security-Policy source expression that matches
@@ -311,7 +380,7 @@ func (s *Service) validateClientMetadata(redirects []string, method string, gran
 		return "", invalidRedirect(fmt.Sprintf("at most %d redirect_uris", maxRedirectURIs))
 	}
 	for _, r := range redirects {
-		if err := checkRedirectURI(r); err != nil {
+		if err := s.checkRedirectURI(r); err != nil {
 			return "", invalidRedirect(err.Error())
 		}
 		if !s.redirectHostAllowed(r) {
@@ -357,6 +426,17 @@ func (s *Service) Register(ctx context.Context, body []byte, ip string) (*Regist
 	method, oerr := s.validateClientMetadata(req.RedirectURIs, method, req.GrantTypes, req.ResponseTypes, true)
 	if oerr != nil {
 		return nil, oerr
+	}
+	// A global cap on registrations nobody used: unused ones are swept
+	// after a week, and this keeps a flood from growing the table first.
+	var unused int
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM mcp_oauth_clients c WHERE c.kind = ? AND c.created_at > ?
+         AND NOT EXISTS (SELECT 1 FROM mcp_oauth_grants g WHERE g.client_id = c.client_id)`,
+		ClientKindDCR, s.now().Add(-7*24*time.Hour).UnixMilli()).Scan(&unused); err != nil {
+		return nil, serverError()
+	}
+	if unused >= maxUnusedClients {
+		return nil, oauthErr(http.StatusTooManyRequests, "temporarily_unavailable", "too many registrations; try again later")
 	}
 	id, err := newSecret(clientPrefix)
 	if err != nil {
@@ -413,18 +493,28 @@ func scanClient(row interface{ Scan(...any) error }) (*Client, error) {
 	return &c, nil
 }
 
-// Client returns the client clientID names: a registered client, or the
-// one its metadata document describes (fetched when not cached or when the
-// cached copy expired). An unknown client is invalid_client.
+// Client returns the client clientID names without fetching anything: a
+// registered client, or the cached copy of a metadata document client
+// (an expired copy too). The token and revocation endpoints use it, so an
+// unauthenticated request there can never make toolyard fetch a URL; only
+// an authorization request reads a document (ResolveClient). An unknown
+// client is invalid_client.
 func (s *Service) Client(ctx context.Context, clientID string) (*Client, *Error) {
 	if clientID == "" || len(clientID) > maxRedirectURILen {
 		return nil, invalidClient("unknown client_id")
 	}
+	kind := ClientKindDCR
 	if strings.HasPrefix(clientID, "https://") {
-		return s.cimdClient(ctx, clientID)
+		if err := s.checkCIMDURL(clientID); err != nil {
+			return nil, invalidClient(err.Error())
+		}
+		kind = ClientKindCIMD
 	}
-	c, err := scanClient(s.db.QueryRowContext(ctx, `SELECT `+clientColumns+` FROM mcp_oauth_clients WHERE client_id = ? AND kind = ?`, clientID, ClientKindDCR))
+	c, err := scanClient(s.db.QueryRowContext(ctx, `SELECT `+clientColumns+` FROM mcp_oauth_clients WHERE client_id = ? AND kind = ?`, clientID, kind))
 	if errors.Is(err, sql.ErrNoRows) {
+		if kind == ClientKindCIMD {
+			return nil, invalidClient("unknown client_id; start the sign-in from the app again")
+		}
 		return nil, invalidClient("unknown client_id; register the client first")
 	}
 	if err != nil {
@@ -457,12 +547,34 @@ type cimdDocument struct {
 	ClientSecretExpiresAt   json.RawMessage `json:"client_secret_expires_at"`
 }
 
-// checkCIMDURL validates a metadata document client_id: https, a host, a
-// path other than "/", no fragment, no user info, no dot segments.
-func checkCIMDURL(raw string) error {
+// Metadata document fetch limits.
+const (
+	// cimdFailureTTL: a document that could not be used is not fetched
+	// again for this long (a negative cache per client_id, shared by
+	// every node).
+	cimdFailureTTL = 5 * time.Minute
+	// cimdFetchesPerIP bounds the documents one client address can make
+	// toolyard fetch per cimdFetchWindow.
+	cimdFetchesPerIP = 20
+	cimdFetchWindow  = 10 * time.Minute
+)
+
+// errCIMDUnusable is what a caller is told about any failed document: the
+// detail goes to the log, never back to the requester.
+func errCIMDUnusable() *Error {
+	return invalidClient("toolyard could not use this app's client metadata document")
+}
+
+// checkCIMDURL validates a metadata document client_id: https on port 443,
+// a valid host, a path other than "/", no fragment, no user info, no dot
+// segments. (AllowPrivateCIMD, for tests, lets any port through.)
+func (s *Service) checkCIMDURL(raw string) error {
 	u, err := url.Parse(raw)
-	if err != nil || u.Scheme != "https" || u.Host == "" || u.User != nil || u.Fragment != "" || strings.Contains(raw, "#") {
-		return errors.New("client_id URL must be https with a host and no user info or fragment")
+	if err != nil || u.Scheme != "https" || u.User != nil || u.Fragment != "" || strings.Contains(raw, "#") || !validHost(u.Hostname()) {
+		return errors.New("client_id URL must be https with a valid host and no user info or fragment")
+	}
+	if p := u.Port(); p != "" && p != "443" && !s.allowPrivateCIMD {
+		return errors.New("client_id URL must use port 443")
 	}
 	if u.Path == "" || u.Path == "/" {
 		return errors.New("client_id URL must have a path")
@@ -475,8 +587,16 @@ func checkCIMDURL(raw string) error {
 	return nil
 }
 
-func (s *Service) cimdClient(ctx context.Context, clientID string) (*Client, *Error) {
-	if err := checkCIMDURL(clientID); err != nil {
+// ResolveClient is Client for an authorization request, the one place a
+// metadata document is read: a document client with no cached copy, or an
+// expired one, is fetched (at most cimdFetchesPerIP per client address,
+// once at a time per client_id, and not again for cimdFailureTTL after a
+// failure). ip is the requester's address.
+func (s *Service) ResolveClient(ctx context.Context, clientID, ip string) (*Client, *Error) {
+	if !strings.HasPrefix(clientID, "https://") {
+		return s.Client(ctx, clientID)
+	}
+	if err := s.checkCIMDURL(clientID); err != nil {
 		return nil, invalidClient(err.Error())
 	}
 	cached, err := scanClient(s.db.QueryRowContext(ctx, `SELECT `+clientColumns+` FROM mcp_oauth_clients WHERE client_id = ? AND kind = ?`, clientID, ClientKindCIMD))
@@ -486,22 +606,67 @@ func (s *Service) cimdClient(ctx context.Context, clientID string) (*Client, *Er
 	if cached != nil && cached.expiresAt > s.now().UnixMilli() {
 		return cached, nil
 	}
+	negKey := "neg:cimd:" + hashSecret(clientID)
+	if s.recalled(ctx, negKey) {
+		return nil, errCIMDUnusable()
+	}
+	key := rateKey(ip)
+	if !s.allow(ctx, "cimd-fetch:"+key, limitFor(key, cimdFetchesPerIP), cimdFetchWindow) {
+		return nil, oauthErr(http.StatusTooManyRequests, "temporarily_unavailable", "too many client metadata documents from this address; try again later")
+	}
+	return s.fetchOnce(ctx, clientID, cached, negKey)
+}
+
+// fetchOnce runs one fetch per client_id at a time on this node; requests
+// that arrive meanwhile wait for its answer.
+func (s *Service) fetchOnce(ctx context.Context, clientID string, cached *Client, negKey string) (*Client, *Error) {
+	s.flightMu.Lock()
+	if f, ok := s.flights[clientID]; ok {
+		s.flightMu.Unlock()
+		select {
+		case <-f.done:
+			return f.client, f.err
+		case <-ctx.Done():
+			return nil, errCIMDUnusable()
+		}
+	}
+	f := &flight{done: make(chan struct{})}
+	s.flights[clientID] = f
+	s.flightMu.Unlock()
+	f.client, f.err = s.fetchAndStore(ctx, clientID, cached)
+	if f.err != nil && f.err.Status != http.StatusInternalServerError {
+		s.remember(ctx, negKey, cimdFailureTTL)
+	}
+	s.flightMu.Lock()
+	delete(s.flights, clientID)
+	s.flightMu.Unlock()
+	close(f.done)
+	return f.client, f.err
+}
+
+// fetchAndStore fetches and checks a document and stores the client. Any
+// failure is logged in detail and answered with errCIMDUnusable.
+func (s *Service) fetchAndStore(ctx context.Context, clientID string, cached *Client) (*Client, *Error) {
+	fail := func(why string) (*Client, *Error) {
+		log.Printf("mcpauth: client metadata document %q refused: %s", clientID, why)
+		return nil, errCIMDUnusable()
+	}
 	doc, ttl, ferr := s.fetchMetadataDocument(ctx, clientID)
 	if ferr != nil {
-		return nil, invalidClient("could not read the client metadata document: " + ferr.Error())
+		return fail(ferr.Error())
 	}
 	if doc.ClientID != clientID {
-		return nil, invalidClient("the client metadata document's client_id does not equal its URL")
+		return fail("its client_id does not equal its URL")
 	}
 	if len(doc.ClientSecret) > 0 || len(doc.ClientSecretExpiresAt) > 0 {
-		return nil, invalidClient("a client metadata document must not carry a client secret")
+		return fail("it carries a client secret")
 	}
 	method := strings.TrimSpace(doc.TokenEndpointAuthMethod)
 	if method == "" {
 		method = AuthNone
 	}
 	if _, oerr := s.validateClientMetadata(doc.RedirectURIs, method, doc.GrantTypes, doc.ResponseTypes, false); oerr != nil {
-		return nil, invalidClient("client metadata document: " + oerr.Description)
+		return fail(oerr.Description)
 	}
 	c := &Client{
 		ID: clientID, Kind: ClientKindCIMD, Name: cleanText(doc.ClientName, maxClientNameLen),
@@ -529,17 +694,64 @@ func (s *Service) cimdClient(ctx context.Context, clientID string) (*Client, *Er
 	return c, nil
 }
 
-// privateIP reports an address a metadata document may not live on.
-func privateIP(ip net.IP) bool {
-	return ip.IsPrivate() || ip.IsLoopback() || ip.IsUnspecified() || ip.IsLinkLocalUnicast() ||
-		ip.IsLinkLocalMulticast() || ip.IsInterfaceLocalMulticast() || ip.IsMulticast() || !ip.IsGlobalUnicast()
+// blockedPrefixes are the special-use ranges a metadata document may never
+// be fetched from: unspecified, loopback, private, carrier-grade NAT
+// (Tailscale), link-local, IETF protocol assignments, documentation,
+// benchmarking, 6to4 relay, multicast, reserved and broadcast (IPv4);
+// unspecified and loopback, IPv4-compatible, discard, Teredo, ORCHID,
+// documentation, benchmarking, SRv6, unique local, link-local, site-local
+// and multicast (IPv6). IPv4-mapped, NAT64 and 6to4 addresses are judged
+// by the IPv4 address inside them (blockedAddr).
+var blockedPrefixes = func() []netip.Prefix {
+	var out []netip.Prefix
+	for _, p := range []string{
+		"0.0.0.0/8", "10.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8", "169.254.0.0/16", "172.16.0.0/12",
+		"192.0.0.0/24", "192.0.2.0/24", "192.88.99.0/24", "192.168.0.0/16", "198.18.0.0/15",
+		"198.51.100.0/24", "203.0.113.0/24", "224.0.0.0/4", "240.0.0.0/4",
+		"::/96", "64:ff9b:1::/48", "100::/64", "2001::/32", "2001:2::/48", "2001:10::/28", "2001:20::/28",
+		"2001:db8::/32", "3fff::/20", "5f00::/16", "fc00::/7", "fe80::/10", "fec0::/10", "ff00::/8",
+	} {
+		out = append(out, netip.MustParsePrefix(p))
+	}
+	return out
+}()
+
+var (
+	nat64Prefix  = netip.MustParsePrefix("64:ff9b::/96")
+	sixToFourNet = netip.MustParsePrefix("2002::/16")
+)
+
+// blockedAddr reports an address a metadata document may not be fetched
+// from: anything in blockedPrefixes or not global unicast, after unwrapping
+// an IPv4 address embedded in an IPv4-mapped, NAT64 or 6to4 address.
+func blockedAddr(a netip.Addr) bool {
+	if !a.IsValid() || a.Zone() != "" {
+		return true
+	}
+	a = a.Unmap()
+	if a.Is6() {
+		b := a.As16()
+		switch {
+		case nat64Prefix.Contains(a):
+			return blockedAddr(netip.AddrFrom4([4]byte{b[12], b[13], b[14], b[15]}))
+		case sixToFourNet.Contains(a):
+			return blockedAddr(netip.AddrFrom4([4]byte{b[2], b[3], b[4], b[5]}))
+		}
+	}
+	for _, p := range blockedPrefixes {
+		if p.Contains(a) {
+			return true
+		}
+	}
+	return !a.IsGlobalUnicast()
 }
 
 // fetchMetadataDocument GETs a client metadata document without leaving
 // the public internet: every address of the host must be public (unless
 // AllowPrivateCIMD), the connection goes to the address that was checked
 // (no second DNS answer can move it), TLS still verifies the host name,
-// redirects are not followed, and the body and time are bounded.
+// redirects are not followed, and the body and time are bounded. Its
+// errors are detailed for the log; callers answer errCIMDUnusable.
 func (s *Service) fetchMetadataDocument(ctx context.Context, raw string) (*cimdDocument, time.Duration, error) {
 	u, err := url.Parse(raw)
 	if err != nil {
@@ -549,20 +761,33 @@ func (s *Service) fetchMetadataDocument(ctx context.Context, raw string) (*cimdD
 	if port == "" {
 		port = "443"
 	}
+	if port != "443" && !s.allowPrivateCIMD {
+		return nil, 0, errors.New("its port is not 443")
+	}
 	ctx, cancel := context.WithTimeout(ctx, cimdFetchTimeout)
 	defer cancel()
-	var ips []net.IPAddr
-	if ip := net.ParseIP(host); ip != nil {
-		ips = []net.IPAddr{{IP: ip}}
-	} else if ips, err = s.resolver(ctx, host); err != nil || len(ips) == 0 {
-		return nil, 0, errors.New("its host does not resolve")
-	}
-	for _, a := range ips {
-		if privateIP(a.IP) && !s.allowPrivateCIMD {
-			return nil, 0, errors.New("its host is not on the public internet")
+	var addrs []netip.Addr
+	if a, err := netip.ParseAddr(host); err == nil {
+		addrs = []netip.Addr{a}
+	} else {
+		ips, err := s.resolver(ctx, host)
+		if err != nil || len(ips) == 0 {
+			return nil, 0, errors.New("its host does not resolve")
+		}
+		for _, ip := range ips {
+			a, ok := netip.AddrFromSlice(ip.IP)
+			if !ok {
+				return nil, 0, errors.New("its host resolved to an unreadable address")
+			}
+			addrs = append(addrs, a.Unmap())
 		}
 	}
-	pinned := net.JoinHostPort(ips[0].IP.String(), port)
+	for _, a := range addrs {
+		if blockedAddr(a) && !s.allowPrivateCIMD {
+			return nil, 0, fmt.Errorf("its host resolves to %s, which is not on the public internet", a)
+		}
+	}
+	pinned := net.JoinHostPort(addrs[0].String(), port)
 	dialer := &net.Dialer{Timeout: 5 * time.Second}
 	transport := &http.Transport{
 		Proxy: nil, // the checked address is the trust decision; a proxy would make its own
@@ -585,7 +810,7 @@ func (s *Service) fetchMetadataDocument(ctx context.Context, raw string) (*cimdD
 	req.Header.Set("User-Agent", "toolyard-oauth/1")
 	resp, err := client.Do(req)
 	if err != nil {
-		return nil, 0, errors.New("the request failed")
+		return nil, 0, fmt.Errorf("the request failed: %v", err)
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode != http.StatusOK {

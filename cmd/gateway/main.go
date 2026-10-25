@@ -1254,7 +1254,10 @@ func runServe(argv []string) error {
 	// OAuth 2.1 for MCP clients (docs/guidelines/connect-clients.md): on
 	// whenever -public-url is set, unless an admin turned it off in
 	// settings. Its sweeper is safe on every node (sweep.go).
-	mcpAuthSvc := mcpauth.New(mcpauth.Options{DB: db, PublicURL: *publicURL, Settings: settingsSvc, Access: accessSvc})
+	// A revoked grant's agent is disabled (access then refuses everything
+	// it queued); OnRevoke also withdraws what it still has pending.
+	mcpAuthSvc := mcpauth.New(mcpauth.Options{DB: db, PublicURL: *publicURL, Settings: settingsSvc, Access: accessSvc,
+		OnRevoke: func(ctx context.Context, agentID string) { cancelAgentWork(ctx, bus, inboxSvc, agentID) }})
 	go mcpAuthSvc.Run(ctx)
 	if mcpAuthSvc.Enabled() {
 		log.Printf("mcp-oauth: authorization server on (issuer %s, resource %s)", mcpAuthSvc.Issuer(), mcpAuthSvc.Resource())
@@ -2013,6 +2016,37 @@ func (h hubEventBus) Publish(eventType string, data any) {
 }
 
 // identityResolver adapts identity.Service.PrimaryUser → oauth.IdentityResolver.
+// cancelAgentWork withdraws a revoked OAuth client's pending approvals and
+// Inbox requests and revokes its Inbox grants. Best effort: the agent is
+// already disabled, so nothing it queued can run anyway.
+func cancelAgentWork(ctx context.Context, bus *approval.Bus, inboxSvc *inbox.Service, agentID string) {
+	if bus != nil {
+		pending, err := bus.ListPendingByAgent(ctx, agentID)
+		if err != nil {
+			log.Printf("mcp-oauth: WARN list pending approvals of %s: %v", agentID, err)
+		}
+		for _, p := range pending {
+			if _, err := bus.CancelByAgent(ctx, p.ID, agentID); err != nil && !errors.Is(err, approval.ErrNotPending) {
+				log.Printf("mcp-oauth: WARN cancel approval %s of %s: %v", p.ID, agentID, err)
+			}
+		}
+	}
+	if inboxSvc != nil {
+		open, err := inboxSvc.List(ctx, inbox.ListFilter{Open: true, AgentID: agentID})
+		if err != nil {
+			log.Printf("mcp-oauth: WARN list Inbox requests of %s: %v", agentID, err)
+		}
+		for _, r := range open {
+			if _, err := inboxSvc.Cancel(ctx, agentID, r.ID); err != nil && !errors.Is(err, inbox.ErrNotPending) {
+				log.Printf("mcp-oauth: WARN cancel Inbox request %s of %s: %v", r.ID, agentID, err)
+			}
+		}
+		if _, err := inboxSvc.RevokeAll(ctx, agentID); err != nil {
+			log.Printf("mcp-oauth: WARN revoke Inbox grants of %s: %v", agentID, err)
+		}
+	}
+}
+
 // mcpCredential is the agent token an /mcp request presents: the
 // Authorization bearer when there is one, else the x-bf-vk header (the
 // Bifrost virtual-key slot: bkt3's proxy strips Authorization and sends a

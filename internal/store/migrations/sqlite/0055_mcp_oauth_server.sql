@@ -16,9 +16,13 @@
 --
 -- mcp_oauth_grants is one person's authorization of one client. Its agent
 -- (agents.id) is who the client's calls run as; the nickname the person
--- chose is that agent's name. A revoked grant keeps its row, so audit rows
--- can still name the client: the OAuth client id of an audit row is
--- mcp_oauth_grants.client_id joined on agent_id.
+-- chose is that agent's name. agent_id has no foreign key on purpose: the
+-- grant is the tombstone that keeps the agent-to-client mapping when the
+-- agent row is deleted (connecting the client again recreates the agent
+-- under the same id). A revoked grant keeps its row too. may_manage is
+-- the person's explicit choice that the client may manage toolyard
+-- (policies, servers, shared connections) when its owner is an admin;
+-- without it the agent never gets admin control (access.Scope).
 --
 -- mcp_oauth_requests is an authorization request waiting for consent (10
 -- minutes); used_at is set once, when the person answers.
@@ -28,7 +32,10 @@
 -- replayed code revokes them.
 --
 -- mcp_oauth_tokens is an access or refresh token (SHA-256 hex). A refresh
--- token is used once (used_at); a second use revokes the whole grant.
+-- token is used once (used_at); a second use revokes the whole grant,
+-- except within 30 seconds while its successor (parent_hash names the token
+-- it replaced) is still unused. auth_time is when the person consented;
+-- no token outlives auth_time plus the absolute session limit.
 --
 -- mcp_oauth_rate_limits holds fixed-window counters per route and client IP.
 --
@@ -58,14 +65,15 @@ CREATE TABLE IF NOT EXISTS mcp_oauth_grants (
     id             TEXT PRIMARY KEY,
     client_id      TEXT NOT NULL REFERENCES mcp_oauth_clients(client_id) ON DELETE CASCADE,
     user_id        TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
-    agent_id       TEXT NOT NULL REFERENCES agents(id) ON DELETE CASCADE,
+    agent_id       TEXT NOT NULL,
     scope          TEXT NOT NULL DEFAULT '',
     resource       TEXT NOT NULL,
     created_at     INTEGER NOT NULL,
     updated_at     INTEGER NOT NULL,
     last_used_at   INTEGER,
     revoked_at     INTEGER,
-    revoked_reason TEXT
+    revoked_reason TEXT,
+    may_manage     INTEGER NOT NULL DEFAULT 0
 );
 CREATE UNIQUE INDEX IF NOT EXISTS idx_mcp_oauth_grants_user_client ON mcp_oauth_grants (user_id, client_id);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_mcp_oauth_grants_agent ON mcp_oauth_grants (agent_id);
@@ -103,20 +111,23 @@ CREATE INDEX IF NOT EXISTS idx_mcp_oauth_codes_expires ON mcp_oauth_codes (expir
 CREATE INDEX IF NOT EXISTS idx_mcp_oauth_codes_grant ON mcp_oauth_codes (grant_id);
 
 CREATE TABLE IF NOT EXISTS mcp_oauth_tokens (
-    token_hash TEXT PRIMARY KEY,
-    kind       TEXT NOT NULL CHECK (kind IN ('access', 'refresh')),
-    grant_id   TEXT NOT NULL REFERENCES mcp_oauth_grants(id) ON DELETE CASCADE,
-    client_id  TEXT NOT NULL,
-    family_id  TEXT NOT NULL,
-    scope      TEXT NOT NULL DEFAULT '',
-    resource   TEXT NOT NULL,
-    created_at INTEGER NOT NULL,
-    expires_at INTEGER NOT NULL,
-    used_at    INTEGER,
-    revoked_at INTEGER
+    token_hash  TEXT PRIMARY KEY,
+    kind        TEXT NOT NULL CHECK (kind IN ('access', 'refresh')),
+    grant_id    TEXT NOT NULL REFERENCES mcp_oauth_grants(id) ON DELETE CASCADE,
+    client_id   TEXT NOT NULL,
+    family_id   TEXT NOT NULL,
+    parent_hash TEXT,
+    scope       TEXT NOT NULL DEFAULT '',
+    resource    TEXT NOT NULL,
+    auth_time   INTEGER NOT NULL,
+    created_at  INTEGER NOT NULL,
+    expires_at  INTEGER NOT NULL,
+    used_at     INTEGER,
+    revoked_at  INTEGER
 );
 CREATE INDEX IF NOT EXISTS idx_mcp_oauth_tokens_grant ON mcp_oauth_tokens (grant_id);
 CREATE INDEX IF NOT EXISTS idx_mcp_oauth_tokens_family ON mcp_oauth_tokens (family_id);
+CREATE INDEX IF NOT EXISTS idx_mcp_oauth_tokens_parent ON mcp_oauth_tokens (parent_hash);
 CREATE INDEX IF NOT EXISTS idx_mcp_oauth_tokens_expires ON mcp_oauth_tokens (expires_at);
 
 CREATE TABLE IF NOT EXISTS mcp_oauth_rate_limits (

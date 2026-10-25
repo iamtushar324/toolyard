@@ -82,14 +82,35 @@ func withParams(raw string, params map[string]string) string {
 	return u.String()
 }
 
+// Authorization request limits: per client address (IPv6 by /64), and
+// across every address, so a flood can neither fill mcp_oauth_requests nor
+// make toolyard fetch documents without end.
+var (
+	authorizePerIP   = 120
+	authorizeGlobal  = 5000
+	authorizeWindow  = 10 * time.Minute
+	registerPerIP    = 60
+	registerGlobal   = 300
+	registerWindow   = time.Hour
+	maxUnusedClients = 10000
+)
+
 // BeginAuthorize checks an authorization request (the query of GET
 // /oauth/authorize) and stores it for the consent screen.
+//
+// An error is sent back to the client only once the client, its redirect
+// URI and response_type=code are all valid; before that the person sees
+// it, so a link built around a client that registered someone else's
+// redirect URI cannot use toolyard to bounce a browser anywhere (RFC 9700
+// section 4.11.2).
 func (s *Service) BeginAuthorize(ctx context.Context, q url.Values, ip string) (*AuthorizeRequest, *AuthorizeError) {
 	show := func(status int, code, desc string) *AuthorizeError {
 		return &AuthorizeError{Error: oauthErr(status, code, desc)}
 	}
-	if !s.allow(ctx, "authorize:"+ip, 120, 10*time.Minute) {
-		return nil, show(http.StatusTooManyRequests, "temporarily_unavailable", "Too many sign-in attempts from this address. Wait a few minutes and try again.")
+	key := rateKey(ip)
+	if !s.allow(ctx, "authorize:"+key, limitFor(key, authorizePerIP), authorizeWindow) ||
+		!s.allow(ctx, "authorize:global", authorizeGlobal, authorizeWindow) {
+		return nil, show(http.StatusTooManyRequests, "temporarily_unavailable", "Too many sign-in attempts. Wait a few minutes and try again.")
 	}
 	for _, k := range []string{"client_id", "redirect_uri", "response_type", "state", "code_challenge", "code_challenge_method", "resource", "scope"} {
 		if len(q[k]) > 1 {
@@ -100,9 +121,13 @@ func (s *Service) BeginAuthorize(ctx context.Context, q url.Values, ip string) (
 	if clientID == "" {
 		return nil, show(http.StatusBadRequest, "invalid_request", "The sign-in link has no client_id. Start the connection again from your app.")
 	}
-	client, cerr := s.Client(ctx, clientID)
+	client, cerr := s.ResolveClient(ctx, clientID, ip)
 	if cerr != nil {
-		return nil, show(http.StatusBadRequest, cerr.Code, "Toolyard does not know this app: "+cerr.Description)
+		status := http.StatusBadRequest
+		if cerr.Status == http.StatusTooManyRequests {
+			status = cerr.Status
+		}
+		return nil, show(status, cerr.Code, "Toolyard cannot use this app: "+cerr.Description)
 	}
 	redirect := q.Get("redirect_uri")
 	if redirect == "" {
@@ -114,15 +139,15 @@ func (s *Service) BeginAuthorize(ctx context.Context, q url.Values, ip string) (
 	if !s.redirectHostAllowed(redirect) {
 		return nil, show(http.StatusForbidden, "access_denied", "This toolyard's administrator does not allow apps that return to "+RedirectHost(redirect)+".")
 	}
+	if q.Get("response_type") != "code" {
+		return nil, show(http.StatusBadRequest, "unsupported_response_type", "The app asked for something other than an authorization code (response_type must be code).")
+	}
+	// The client, its redirect URI and the response type are valid: from
+	// here errors go back to the client. state is optional: PKCE is
+	// required, and it is what protects the code (OAuth 2.1).
 	state := q.Get("state")
 	back := func(code, desc string) *AuthorizeError {
 		return &AuthorizeError{Error: oauthErr(http.StatusBadRequest, code, desc), RedirectURI: redirect, State: state, issuer: s.Issuer()}
-	}
-	if q.Get("response_type") != "code" {
-		return nil, back("unsupported_response_type", "response_type must be code")
-	}
-	if state == "" {
-		return nil, back("invalid_request", "state is required")
 	}
 	if len(state) > 1000 {
 		return nil, back("invalid_request", "state is too long")
@@ -137,9 +162,11 @@ func (s *Service) BeginAuthorize(ctx context.Context, q url.Values, ip string) (
 	if !challengeRE.MatchString(challenge) {
 		return nil, back("invalid_request", "code_challenge must be the base64url SHA-256 of the code verifier (43 characters)")
 	}
+	// A client that sends no resource indicator gets toolyard's only
+	// resource, /mcp; one that sends another resource is refused.
 	resource := q.Get("resource")
 	if resource == "" {
-		return nil, back("invalid_request", "resource is required (RFC 8707): send "+s.Resource())
+		resource = s.Resource()
 	}
 	if !s.sameResource(resource) {
 		return nil, back("invalid_target", "resource must be "+s.Resource())
@@ -202,27 +229,29 @@ func (s *Service) PendingRequest(ctx context.Context, id string) (*AuthorizeRequ
 // ExistingGrant is what a person already allowed a client: the nickname
 // and scope the consent screen starts from when they connect it again.
 type ExistingGrant struct {
-	GrantID  string
-	AgentID  string
-	Nickname string
-	Scope    access.AgentScope
-	Revoked  bool
+	GrantID   string
+	AgentID   string
+	Nickname  string
+	Scope     access.AgentScope
+	Revoked   bool
+	MayManage bool
 }
 
 // Existing returns userID's grant for clientID, or nil when there is none.
 func (s *Service) Existing(ctx context.Context, userID, clientID string) (*ExistingGrant, error) {
 	var g ExistingGrant
 	var revoked sql.NullInt64
+	var manage int
 	err := s.db.QueryRowContext(ctx,
-		`SELECT g.id, g.agent_id, a.name, g.revoked_at FROM mcp_oauth_grants g JOIN agents a ON a.id = g.agent_id
-         WHERE g.user_id = ? AND g.client_id = ?`, userID, clientID).Scan(&g.GrantID, &g.AgentID, &g.Nickname, &revoked)
+		`SELECT g.id, g.agent_id, COALESCE(a.name, ''), g.revoked_at, g.may_manage FROM mcp_oauth_grants g LEFT JOIN agents a ON a.id = g.agent_id
+         WHERE g.user_id = ? AND g.client_id = ?`, userID, clientID).Scan(&g.GrantID, &g.AgentID, &g.Nickname, &revoked, &manage)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
 	if err != nil {
 		return nil, err
 	}
-	g.Revoked = revoked.Valid
+	g.Revoked, g.MayManage = revoked.Valid, manage != 0
 	if g.Scope, err = access.ReadAgentScope(ctx, s.db, g.AgentID); err != nil {
 		return nil, err
 	}
@@ -233,6 +262,9 @@ func (s *Service) Existing(ctx context.Context, userID, clientID string) (*Exist
 type Consent struct {
 	Nickname string
 	Scope    access.AgentScope
+	// MayManage lets the client manage toolyard (policies, servers, shared
+	// connections). Only an admin can give it; it is ignored otherwise.
+	MayManage bool
 }
 
 // DefaultNickname turns a client name into a valid agent name.
@@ -317,9 +349,14 @@ func (s *Service) Approve(ctx context.Context, id string, u *identity.User, c Co
 		return "", err
 	}
 	now := s.now().UnixMilli()
+	manage := 0
+	if c.MayManage && u.Role == identity.RoleAdmin {
+		manage = 1
+	}
 	var grantID, agentID string
-	err = tx.QueryRowContext(ctx, `SELECT id, agent_id FROM mcp_oauth_grants WHERE user_id = ? AND client_id = ?`+s.db.Dialect.ForUpdate(),
-		u.ID, req.clientID).Scan(&grantID, &agentID)
+	var wasRevoked sql.NullInt64
+	err = tx.QueryRowContext(ctx, `SELECT id, agent_id, revoked_at FROM mcp_oauth_grants WHERE user_id = ? AND client_id = ?`+s.db.Dialect.ForUpdate(),
+		u.ID, req.clientID).Scan(&grantID, &agentID, &wasRevoked)
 	switch {
 	case errors.Is(err, sql.ErrNoRows):
 		grantID, agentID = "grt_"+uuid.NewString(), identity.NewAgentID()
@@ -328,19 +365,38 @@ func (s *Service) Approve(ctx context.Context, id string, u *identity.User, c Co
 			return "", err
 		}
 		if _, err = tx.ExecContext(ctx,
-			`INSERT INTO mcp_oauth_grants(id, client_id, user_id, agent_id, scope, resource, created_at, updated_at)
-             VALUES(?,?,?,?,?,?,?,?)`, grantID, req.clientID, u.ID, agentID, req.scope, req.resource, now, now); err != nil {
+			`INSERT INTO mcp_oauth_grants(id, client_id, user_id, agent_id, scope, resource, created_at, updated_at, may_manage)
+             VALUES(?,?,?,?,?,?,?,?,?)`, grantID, req.clientID, u.ID, agentID, req.scope, req.resource, now, now, manage); err != nil {
 			return "", err
 		}
 	case err != nil:
 		return "", err
 	default:
-		if _, err = tx.ExecContext(ctx, `UPDATE agents SET name = ?, disabled = 0 WHERE id = ? AND owner_user = ?`, nickname, agentID, u.ID); err != nil {
+		res, err := tx.ExecContext(ctx, `UPDATE agents SET name = ?, disabled = 0 WHERE id = ? AND owner_user = ?`, nickname, agentID, u.ID)
+		if err != nil {
 			return "", err
 		}
+		if n, _ := res.RowsAffected(); n == 0 {
+			// The agent was deleted; the grant kept its id (the tombstone),
+			// so the client comes back as the same agent.
+			if _, err = tx.ExecContext(ctx, `INSERT INTO agents(id, name, owner_user, token_hash, last_seen, created_at) VALUES(?,?,?,'',?,?)`,
+				agentID, nickname, u.ID, now, now); err != nil {
+				return "", err
+			}
+		}
+		if wasRevoked.Valid {
+			// Reviving a revoked grant: nothing issued before the revoke
+			// may come back with it.
+			if _, err = tx.ExecContext(ctx, `UPDATE mcp_oauth_tokens SET revoked_at = ? WHERE grant_id = ? AND revoked_at IS NULL`, now, grantID); err != nil {
+				return "", err
+			}
+			if _, err = tx.ExecContext(ctx, `UPDATE mcp_oauth_codes SET used_at = ? WHERE grant_id = ? AND used_at IS NULL`, now, grantID); err != nil {
+				return "", err
+			}
+		}
 		if _, err = tx.ExecContext(ctx,
-			`UPDATE mcp_oauth_grants SET scope = ?, resource = ?, updated_at = ?, revoked_at = NULL, revoked_reason = NULL WHERE id = ?`,
-			req.scope, req.resource, now, grantID); err != nil {
+			`UPDATE mcp_oauth_grants SET scope = ?, resource = ?, updated_at = ?, revoked_at = NULL, revoked_reason = NULL, may_manage = ? WHERE id = ?`,
+			req.scope, req.resource, now, manage, grantID); err != nil {
 			return "", err
 		}
 	}
@@ -360,7 +416,7 @@ func (s *Service) Approve(ctx context.Context, id string, u *identity.User, c Co
 	}
 	if err = s.auditTx(ctx, tx, auditRow{event: "mcp_oauth.authorized", agentID: agentID, nickname: nickname, owner: u, decider: u,
 		client: pending.Client, grantID: grantID, details: map[string]any{
-			"redirect_host": RedirectHost(req.redirect), "scope": req.scope, "tool_scope": scope.Summary(),
+			"redirect_host": RedirectHost(req.redirect), "scope": req.scope, "tool_scope": scope.Summary(), "may_manage": manage == 1,
 		}}); err != nil {
 		return "", err
 	}
@@ -433,12 +489,14 @@ func (s *Service) auditTx(ctx context.Context, q store.Querier, r auditRow) erro
 	for k, v := range r.details {
 		args[k] = v
 	}
-	clientName := ""
+	clientName, clientID := "", r.clientID
 	if r.client != nil {
-		args["oauth_client_id"], args["oauth_client_kind"] = r.client.ID, r.client.Kind
+		clientID = r.client.ID
+		args["oauth_client_kind"] = r.client.Kind
 		clientName = r.client.DisplayName()
-	} else if r.clientID != "" {
-		args["oauth_client_id"] = r.clientID
+	}
+	if clientID != "" {
+		args["oauth_client_id"] = clientID
 	}
 	if r.grantID != "" {
 		args["grant_id"] = r.grantID
@@ -453,10 +511,11 @@ func (s *Service) auditTx(ctx context.Context, q store.Querier, r auditRow) erro
 	}
 	_, err := q.ExecContext(ctx,
 		`INSERT INTO audit_events(id, ts, event_type, agent_id, agent_name, agent_kind, owner_user_id, owner_email, owner_name,
-             arguments, client_kind, client_name, via, decided_by_user_id, decided_by_email, decided_by_name, decided_via, decider_ref)
-         VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+             arguments, client_kind, client_name, via, decided_by_user_id, decided_by_email, decided_by_name, decided_via, decider_ref,
+             oauth_client_id)
+         VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		"ev_"+uuid.NewString(), s.now().UnixMilli(), r.event, nullStr(r.agentID), nullStr(r.nickname), AgentKindOAuthClient,
 		nullStr(ownerID), nullStr(ownerEmail), nullStr(ownerName), string(body), nil, nullStr(clientName), r.via(),
-		nullStr(decID), nullStr(decEmail), nullStr(decName), nullStr(via), nullStr(r.grantID))
+		nullStr(decID), nullStr(decEmail), nullStr(decName), nullStr(via), nullStr(r.grantID), nullStr(clientID))
 	return err
 }

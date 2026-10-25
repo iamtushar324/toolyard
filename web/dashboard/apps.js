@@ -59,8 +59,14 @@ function appsResumeOAuth(loc) {
   return true;
 }
 
-function appsKindLabel(kind) {
-  return kind === 'cimd' ? 'Verified by its URL' : 'Self-registered';
+// appsKindLabel says how far toolyard knows who the app is: a metadata
+// document client is identified by its document's host; a self-registered
+// client only by its own claims.
+function appsKindLabel(app) {
+  if (app.client_kind === 'cimd') {
+    try { return 'Identified by ' + new URL(app.client_id).hostname; } catch (_) { return 'Identified by its client ID'; }
+  }
+  return 'Self-registered';
 }
 
 // ---- data --------------------------------------------------------------------
@@ -125,6 +131,7 @@ async function openAppActivity(app) {
 // (target.agentId).
 async function openScopeEditor(target) {
   appsUI.editor = Object.assign({ servers: null, error: '', saving: false, open: {} }, target, { draft: appsDraftFromScope(target.scope) });
+  appsUI.editor.draft.mayManage = !!target.mayManage;
   render();
   try {
     const q = target.appId ? 'id=' + encodeURIComponent(target.appId) : 'agent_id=' + encodeURIComponent(target.agentId);
@@ -147,7 +154,7 @@ async function saveScopeEditor() {
   ed.saving = true; ed.error = ''; render();
   const scope = appsScopeFromDraft(ed.draft);
   try {
-    if (ed.appId) await api('/v1/me/apps/scope', { method: 'POST', body: { id: ed.appId, scope } });
+    if (ed.appId) await api('/v1/me/apps/scope', { method: 'POST', body: Object.assign({ id: ed.appId, scope }, isAdmin() || !ed.draft.mayManage ? { may_manage: !!ed.draft.mayManage } : {}) });
     else await api('/v1/me/agent-scopes', { method: 'POST', body: { agent_id: ed.agentId, scope } });
     appsUI.editor = null;
     toast('Access saved: ' + appsScopeSummary(scope) + '.');
@@ -167,6 +174,8 @@ async function saveAppsSettings() {
       mcp_oauth_redirect_hosts: String(s.mcp_oauth_redirect_hosts || '').trim(),
       mcp_oauth_access_ttl_minutes: Number(s.mcp_oauth_access_ttl_minutes) || 60,
       mcp_oauth_refresh_ttl_days: Number(s.mcp_oauth_refresh_ttl_days) || 30,
+      mcp_oauth_max_session_days: Number(s.mcp_oauth_max_session_days) || 90,
+      mcp_oauth_custom_schemes: String(s.mcp_oauth_custom_schemes || '').trim(),
     } });
     appsUI.settings = null;
     toast('OAuth settings saved.');
@@ -213,16 +222,17 @@ function renderAppCard(app) {
     el('div', { class: 'row' },
       el('h3', { class: 'grow', style: 'margin: 0;' }, app.nickname),
       el('span', { class: 'badge ' + (active ? 'allowed' : 'denied') }, app.status)),
-    el('div', { class: 'meta' }, app.client_name + ' · ' + appsKindLabel(app.client_kind) +
+    el('div', { class: 'meta' }, app.client_name + ' (name not checked) · ' + appsKindLabel(app) +
       (app.redirect_hosts && app.redirect_hosts.length ? ' · returns to ' + app.redirect_hosts.join(', ') : '')),
     appsUI.all ? el('div', { class: 'meta' }, 'Owner: ' + (app.owner_name || app.owner_email || app.owner_id)) : null,
     el('div', { class: 'meta' }, 'Connected ' + relTime(app.created_at) + ' · last used ' + (app.last_used_at ? relTime(app.last_used_at) : 'never') +
       (app.revoked_at ? ' · revoked ' + relTime(app.revoked_at) : '')),
     el('p', {}, 'Access: ' + (app.scope_summary || appsScopeSummary(app.scope))),
+    app.may_manage ? el('p', { class: 'err' }, 'May manage toolyard (policies, servers, shared connections).') : null,
     el('div', { class: 'meta' }, 'Client ID: ', el('code', {}, app.client_id), ' · Agent: ', el('code', {}, app.agent_id)),
     el('div', { class: 'row', style: 'margin-top: 8px;' },
       active ? el('button', { on: { click: () => renameApp(app) } }, 'Rename') : null,
-      active ? el('button', { on: { click: () => openScopeEditor({ appId: app.id, name: app.nickname, scope: app.scope }) } }, 'Change access') : null,
+      active ? el('button', { on: { click: () => openScopeEditor({ appId: app.id, name: app.nickname, scope: app.scope, mayManage: !!app.may_manage }) } }, 'Change access') : null,
       el('button', { on: { click: () => openAppActivity(app) } }, 'Activity'),
       active ? el('button', { class: 'danger', on: { click: () => revokeApp(app) } }, 'Revoke') : null),
   );
@@ -279,6 +289,9 @@ function renderScopeEditor() {
               box(d.denyTools.has(key), (on) => toggle(d.denyTools, key, on), 'Block'));
           }) : null);
       })),
+      ed.appId && (isAdmin() || d.mayManage) ? el('label', { class: 'row' },
+        el('input', { type: 'checkbox', checked: !!d.mayManage, disabled: !isAdmin() && !d.mayManage, on: { change: (e) => { d.mayManage = e.target.checked; render(); } } }),
+        el('span', {}, 'May manage toolyard (policies, servers, shared connections)')) : null,
       el('p', { class: 'meta' }, 'Result: ' + appsScopeSummary(appsScopeFromDraft(d))),
       ed.error ? el('div', { class: 'err' }, ed.error) : null,
       el('div', { class: 'row', style: 'margin-top: 16px; justify-content: flex-end;' },
@@ -322,6 +335,10 @@ function renderAppsSettings() {
       el('input', { type: 'number', min: 5, max: 1440, value: s.mcp_oauth_access_ttl_minutes, on: { input: (e) => { s.mcp_oauth_access_ttl_minutes = e.target.value; } } })),
     field('Refresh token lifetime (days, 1–365, renewed on every use)',
       el('input', { type: 'number', min: 1, max: 365, value: s.mcp_oauth_refresh_ttl_days, on: { input: (e) => { s.mcp_oauth_refresh_ttl_days = e.target.value; } } })),
+    field('Longest sign-in (days, 1–365): after this, the person signs in again however often the app refreshed',
+      el('input', { type: 'number', min: 1, max: 365, value: s.mcp_oauth_max_session_days, on: { input: (e) => { s.mcp_oauth_max_session_days = e.target.value; } } })),
+    field('App schemes allowed without a reverse-DNS name (comma separated)',
+      el('input', { value: s.mcp_oauth_custom_schemes || '', on: { input: (e) => { s.mcp_oauth_custom_schemes = e.target.value; } } })),
     el('div', { class: 'row', style: 'margin-top: 12px; justify-content: flex-end;' },
       el('button', { class: 'primary', disabled: appsUI.busy === 'settings', on: { click: saveAppsSettings } }, appsUI.busy === 'settings' ? 'Saving…' : 'Save settings')),
   );

@@ -170,3 +170,72 @@ func TestAgentScopeValidation(t *testing.T) {
 		t.Errorf("Describe: %v", d)
 	}
 }
+
+// TestOAuthClientsNeverInheritAdminControl: an agent with an OAuth grant
+// has limits even when its scope is "everything", so it uses every tool its
+// admin owner can but gets no admin control unless the grant says
+// may_manage; an ordinary admin agent keeps both.
+func TestOAuthClientsNeverInheritAdminControl(t *testing.T) {
+	ctx := context.Background()
+	db := openTestDB(t)
+	addUser(t, db, "u_admin", "admin", "active")
+	addAgent(t, db, "ag_plain", "u_admin")
+	addAgent(t, db, "ag_app", "u_admin")
+	addAgent(t, db, "ag_managed", "u_admin")
+	now := time.Now().UnixMilli()
+	for _, g := range []struct {
+		id, agent string
+		manage    int
+	}{{"app", "ag_app", 0}, {"managed", "ag_managed", 1}} {
+		if _, err := db.Exec(`INSERT INTO mcp_oauth_clients(client_id, kind, redirect_uris, created_at, updated_at) VALUES(?, 'dcr', '[]', ?, ?)`,
+			"mcpc_"+g.id, now, now); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.Exec(`INSERT INTO mcp_oauth_grants(id, client_id, user_id, agent_id, resource, created_at, updated_at, may_manage)
+            VALUES(?, ?, 'u_admin', ?, 'r', ?, ?, ?)`, "grt_"+g.id, "mcpc_"+g.id, g.agent, now, now, g.manage); err != nil {
+			t.Fatal(err)
+		}
+	}
+	svc := New(db)
+	plain, app, managed := svc.ScopeFor(ctx, "ag_plain"), svc.ScopeFor(ctx, "ag_app"), svc.ScopeFor(ctx, "ag_managed")
+	if !plain.All || !plain.CanAdminister() {
+		t.Fatalf("an admin's ordinary agent lost admin control: %+v", plain)
+	}
+	if app.All || app.CanAdminister() || !app.OwnerIsAdmin() || !app.AllowsTool("postgres", "postgres.query") || app.Limits == nil || !app.Limits.OAuthClient {
+		t.Fatalf("an OAuth client without may_manage: %+v", app)
+	}
+	if !managed.CanAdminister() {
+		t.Fatalf("an OAuth client with may_manage has no admin control: %+v", managed)
+	}
+	// A limited ordinary agent has no admin control either.
+	if _, err := svc.SetAgentScope(ctx, "ag_plain", AgentScope{Mode: ScopeModeAll, DenyServers: []string{"x"}}, ""); err != nil {
+		t.Fatal(err)
+	}
+	if svc.ScopeFor(ctx, "ag_plain").CanAdminister() {
+		t.Fatal("a limited ordinary agent kept admin control")
+	}
+}
+
+// TestDisabledAgentsReachNothing: a disabled (revoked) agent is denied, so
+// a call it queued before the revoke (an approval, an Inbox grant) cannot
+// run when it is decided later.
+func TestDisabledAgentsReachNothing(t *testing.T) {
+	ctx := context.Background()
+	db := openTestDB(t)
+	addUser(t, db, "u_admin", "admin", "active")
+	addAgent(t, db, "ag_1", "u_admin")
+	svc := New(db)
+	if svc.ScopeFor(ctx, "ag_1").Denied {
+		t.Fatal("an enabled agent is denied")
+	}
+	if _, err := db.Exec(`UPDATE agents SET disabled = 1 WHERE id = 'ag_1'`); err != nil {
+		t.Fatal(err)
+	}
+	svc.InvalidateAgent("ag_1")
+	if sc := svc.ScopeFor(ctx, "ag_1"); !sc.Denied || sc.AllowsTool("builtin", "tools.search") {
+		t.Fatalf("a disabled agent still reaches tools: %+v", sc)
+	}
+	if owner, _ := svc.OwnerUser(ctx, "ag_1"); owner != "" {
+		t.Fatalf("a disabled agent still has an owner: %q", owner)
+	}
+}

@@ -11,6 +11,7 @@ import (
 	"github.com/tusharbhardwaj/toolyard/docs"
 	"github.com/tusharbhardwaj/toolyard/internal/audit"
 	"github.com/tusharbhardwaj/toolyard/internal/identity"
+	"github.com/tusharbhardwaj/toolyard/internal/mcpauth"
 	"github.com/tusharbhardwaj/toolyard/internal/settings"
 )
 
@@ -101,6 +102,10 @@ var operatorOwnerPrefixes = []string{
 	"/v1/inbox/batch",
 	"/v1/inbox/grants",
 	"/v1/secrets/",
+	// A connected app's or agent's access, and revoking an app.
+	"/v1/me/agent-scopes",
+	"/v1/me/apps/scope",
+	"/v1/me/apps/revoke",
 }
 
 // operatorScopeFor returns the scope an operator token needs for method on
@@ -150,6 +155,14 @@ var ownerSettingKeys = map[string]bool{
 	settings.TelegramUserID:                  true,
 	settings.MetricsRetentionDays:            true,
 	settings.EventsRetentionDays:             true,
+	// OAuth for MCP clients: who may sign in, where they may return to
+	// and for how long.
+	mcpauth.SettingEnabled:          true,
+	mcpauth.SettingRedirectHosts:    true,
+	mcpauth.SettingAccessTTLMinutes: true,
+	mcpauth.SettingRefreshTTLDays:   true,
+	mcpauth.SettingMaxSessionDays:   true,
+	mcpauth.SettingCustomSchemes:    true,
 }
 
 // operatorGuard authenticates an operator-token request and checks its scope.

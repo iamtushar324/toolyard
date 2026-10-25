@@ -32,7 +32,8 @@ type App struct {
 	Scope         access.AgentScope `json:"scope"`
 	ScopeSummary  string            `json:"scope_summary"`
 	OAuthScope    string            `json:"oauth_scope"`
-	Status        string            `json:"status"` // active | revoked | disabled
+	Status        string            `json:"status"` // active | revoked | disabled | deleted
+	MayManage     bool              `json:"may_manage"`
 	CreatedAt     int64             `json:"created_at"`
 	UpdatedAt     int64             `json:"updated_at"`
 	LastUsedAt    int64             `json:"last_used_at,omitempty"`
@@ -40,14 +41,14 @@ type App struct {
 	RevokedReason string            `json:"revoked_reason,omitempty"`
 }
 
-const appColumns = `g.id, g.agent_id, a.name, g.client_id, COALESCE(c.client_name, ''), COALESCE(c.kind, ''),
+const appColumns = `g.id, g.agent_id, COALESCE(a.name, ''), g.client_id, COALESCE(c.client_name, ''), COALESCE(c.kind, ''),
 	COALESCE(c.client_uri, ''), COALESCE(c.logo_uri, ''), COALESCE(c.redirect_uris, '[]'),
 	g.user_id, COALESCE(u.email, ''), COALESCE(u.display_name, ''), COALESCE(u.username, ''),
 	g.scope, COALESCE(a.disabled, 0), g.created_at, g.updated_at, COALESCE(g.last_used_at, 0),
-	COALESCE(g.revoked_at, 0), COALESCE(g.revoked_reason, '')`
+	COALESCE(g.revoked_at, 0), COALESCE(g.revoked_reason, ''), g.may_manage, COALESCE(a.id, '')`
 
 const appFrom = ` FROM mcp_oauth_grants g
-	JOIN agents a ON a.id = g.agent_id
+	LEFT JOIN agents a ON a.id = g.agent_id
 	LEFT JOIN mcp_oauth_clients c ON c.client_id = g.client_id
 	LEFT JOIN users u ON u.id = g.user_id`
 
@@ -56,13 +57,14 @@ const appFrom = ` FROM mcp_oauth_grants g
 // SQLite runs on one connection.
 func scanApp(row interface{ Scan(...any) error }) (*App, error) {
 	var a App
-	var redirects, display, username string
-	var disabled int
+	var redirects, display, username, agentRow string
+	var disabled, manage int
 	if err := row.Scan(&a.ID, &a.AgentID, &a.Nickname, &a.ClientID, &a.ClientName, &a.ClientKind,
 		&a.ClientURI, &a.LogoURI, &redirects, &a.OwnerID, &a.OwnerEmail, &display, &username,
-		&a.OAuthScope, &disabled, &a.CreatedAt, &a.UpdatedAt, &a.LastUsedAt, &a.RevokedAt, &a.RevokedReason); err != nil {
+		&a.OAuthScope, &disabled, &a.CreatedAt, &a.UpdatedAt, &a.LastUsedAt, &a.RevokedAt, &a.RevokedReason, &manage, &agentRow); err != nil {
 		return nil, err
 	}
+	a.MayManage = manage != 0
 	a.OwnerName = display
 	if a.OwnerName == "" {
 		a.OwnerName = username
@@ -80,6 +82,8 @@ func scanApp(row interface{ Scan(...any) error }) (*App, error) {
 	c := Client{ID: a.ClientID, Kind: a.ClientKind, Name: a.ClientName}
 	a.ClientName = c.DisplayName()
 	switch {
+	case agentRow == "":
+		a.Status = "deleted" // the agent was deleted; the grant is its tombstone
 	case a.RevokedAt > 0:
 		a.Status = "revoked"
 	case disabled != 0:
@@ -233,7 +237,8 @@ func (s *Service) RevokeApp(ctx context.Context, app *App, by *identity.User) er
 		return err
 	}
 	defer func() { _ = tx.Rollback() }()
-	if err = s.revokeGrantTx(ctx, tx, app.ID, "revoked_by_owner"); err != nil {
+	agentID, err := s.revokeGrantTx(ctx, tx, app.ID, "revoked_by_owner")
+	if err != nil {
 		return err
 	}
 	if err = s.auditTx(ctx, tx, auditRow{event: "mcp_oauth.revoked", agentID: app.AgentID, nickname: app.Nickname,
@@ -241,7 +246,40 @@ func (s *Service) RevokeApp(ctx context.Context, app *App, by *identity.User) er
 		details: map[string]any{"by": "dashboard"}}); err != nil {
 		return err
 	}
-	return tx.Commit()
+	if err = tx.Commit(); err != nil {
+		return err
+	}
+	s.afterRevoke(ctx, agentID)
+	return nil
+}
+
+// SetAppManage sets whether the app may manage toolyard (policies, servers,
+// shared connections). The caller checks that only an admin turns it on.
+func (s *Service) SetAppManage(ctx context.Context, app *App, manage bool, by *identity.User) error {
+	v := 0
+	if manage {
+		v = 1
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	if _, err = tx.ExecContext(ctx, `UPDATE mcp_oauth_grants SET may_manage = ?, updated_at = ? WHERE id = ?`, v, s.now().UnixMilli(), app.ID); err != nil {
+		return err
+	}
+	if err = s.auditTx(ctx, tx, auditRow{event: "mcp_oauth.manage_changed", agentID: app.AgentID, nickname: app.Nickname,
+		owner: appOwner(app), decider: by, clientID: app.ClientID, grantID: app.ID,
+		details: map[string]any{"may_manage": manage}}); err != nil {
+		return err
+	}
+	if err = tx.Commit(); err != nil {
+		return err
+	}
+	if s.access != nil {
+		s.access.InvalidateAgent(app.AgentID)
+	}
+	return nil
 }
 
 // appOwner is the app's owner as a user, for audit rows.

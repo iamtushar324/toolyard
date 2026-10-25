@@ -9,7 +9,7 @@ const source = fs.readFileSync(path.join(__dirname, '../web/dashboard/apps.js'),
 function harness() {
   const requests = [];
   const context = vm.createContext({
-    URLSearchParams, console,
+    URLSearchParams, URL, console,
     location: { origin: 'https://toolyard.example', search: '' },
     state: { user: { id: 'u_1', role: 'member' }, agents: [], auditFilter: {} },
     requests,
@@ -88,9 +88,31 @@ test('the page lists an app with its nickname, client, access and actions', () =
   const page = text(h.run('viewApps()'));
   assert.match(page, /https:\/\/toolyard\.example\/mcp/);
   assert.match(page, /My ChatGPT/);
-  assert.match(page, /ChatGPT · Self-registered · returns to chatgpt\.com/);
+  assert.match(page, /ChatGPT \(name not checked\) · Self-registered · returns to chatgpt\.com/);
   assert.match(page, /only 1 server and 0 tools/);
   for (const label of ['Rename', 'Change access', 'Activity', 'Revoke']) assert.match(page, new RegExp(label));
+});
+
+test('a metadata document client is labelled by its host, never as verified', () => {
+  const h = harness();
+  assert.equal(h.run(`appsKindLabel({ client_kind: 'cimd', client_id: 'https://apps.example.com/client.json' })`), 'Identified by apps.example.com');
+  assert.equal(h.run(`appsKindLabel({ client_kind: 'dcr', client_id: 'mcpc_x' })`), 'Self-registered');
+  assert.doesNotMatch(h.run(`appsKindLabel({ client_kind: 'cimd', client_id: 'https://x.example/c' })`), /[Vv]erified/);
+});
+
+test('only an admin sends may_manage; a member cannot turn it on', async () => {
+  const h = harness();
+  h.run(`appsUI.editor = { appId: 'grt_1', name: 'x', servers: [], error: '', saving: false, open: {},
+    draft: Object.assign(appsDraftFromScope(null), { mayManage: true }) };`);
+  await h.run('saveScopeEditor()');
+  let post = h.requests.find(r => r.path === '/v1/me/apps/scope');
+  assert.equal(Object.hasOwn(post.body, 'may_manage'), false, 'a member must not send may_manage: true');
+  h.requests.length = 0;
+  h.run(`state.user.role = 'admin'; appsUI.editor = { appId: 'grt_1', name: 'x', servers: [], error: '', saving: false, open: {},
+    draft: Object.assign(appsDraftFromScope(null), { mayManage: true }) };`);
+  await h.run('saveScopeEditor()');
+  post = h.requests.find(r => r.path === '/v1/me/apps/scope');
+  assert.equal(post.body.may_manage, true);
 });
 
 test('saving the editor posts the app scope', async () => {

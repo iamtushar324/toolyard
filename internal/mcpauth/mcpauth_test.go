@@ -194,16 +194,30 @@ func TestRegisterValidatesClients(t *testing.T) {
 	for _, bad := range []string{
 		"http://evil.example/cb", "javascript:alert(1)", "https://x.example/cb#frag", "https://user@x.example/cb",
 		"data:text/html,hi", "file:///etc/passwd", "/relative", "",
+		"https://*.example.com/cb", "https://exa_mple.com/cb", "https://-x.example/cb", "https:///cb",
+		"ms-msdt:/id", "search-ms:query=x", "ms-officecmd:x", "jar:https://x.example/a!/b",
+		"myapp:/cb", "vscode-foo://x/cb", "com.example.app://*/cb",
 	} {
 		body, _ := json.Marshal(map[string]any{"redirect_uris": []string{bad}, "token_endpoint_auth_method": "none"})
 		if _, oerr := f.svc.Register(context.Background(), body, "198.51.100.7"); oerr == nil || oerr.Code != "invalid_redirect_uri" {
 			t.Errorf("redirect %q: got %v, want invalid_redirect_uri", bad, oerr)
 		}
 	}
-	for _, good := range []string{"https://claude.ai/api/mcp/auth_callback", "http://127.0.0.1:33418/callback", "http://localhost:9999/cb", "http://[::1]:8080/cb", "cursor://anysphere.cursor-mcp/oauth/callback"} {
+	for _, good := range []string{"https://claude.ai/api/mcp/auth_callback", "http://127.0.0.1:33418/callback", "http://localhost:9999/cb",
+		"http://[::1]:8080/cb", "cursor://anysphere.cursor-mcp/oauth/callback", "vscode://vscode.github-authentication/did-authenticate",
+		"com.example.app:/oauth/cb", "https://192.0.2.10/cb"} {
 		f.register(t, "none", good)
 	}
-	body, _ := json.Marshal(map[string]any{"redirect_uris": []string{"https://a.example/cb"}, "token_endpoint_auth_method": "private_key_jwt"})
+	// The exception list is the admin's: without cursor on it, cursor://
+	// is not a reverse-DNS scheme and is refused; with myapp it is allowed.
+	f.settings[SettingCustomSchemes] = "myapp"
+	body, _ := json.Marshal(map[string]any{"redirect_uris": []string{"cursor://anysphere.cursor-mcp/oauth/callback"}, "token_endpoint_auth_method": "none"})
+	if _, oerr := f.svc.Register(context.Background(), body, "198.51.100.7"); oerr == nil {
+		t.Error("cursor:// allowed though the admin's exception list leaves it out")
+	}
+	f.register(t, "none", "myapp:/cb")
+	delete(f.settings, SettingCustomSchemes)
+	body, _ = json.Marshal(map[string]any{"redirect_uris": []string{"https://a.example/cb"}, "token_endpoint_auth_method": "private_key_jwt"})
 	if _, oerr := f.svc.Register(context.Background(), body, "198.51.100.7"); oerr == nil || oerr.Code != "invalid_client_metadata" {
 		t.Errorf("private_key_jwt: %v", oerr)
 	}
@@ -256,18 +270,21 @@ func TestAuthorizeChecks(t *testing.T) {
 			t.Errorf("%s: got %v, want an error shown to the person", name, aerr)
 		}
 	}
+	// A response type other than code is shown, not sent back: until the
+	// response type is valid the request is not trusted with a redirect.
+	if _, aerr := f.svc.BeginAuthorize(ctx, authorizeQuery(c.ClientID, redirect, challenge, map[string]string{"response_type": "token"}), "198.51.100.7"); aerr == nil ||
+		aerr.Code != "unsupported_response_type" || aerr.Location() != "" {
+		t.Errorf("token response: got %v, want an error shown to the person", aerr)
+	}
 	// Errors that go back to the client, with state and iss.
 	for name, tc := range map[string]struct {
 		extra map[string]string
 		code  string
 	}{
-		"missing state":     {map[string]string{"state": ""}, "invalid_request"},
 		"missing challenge": {map[string]string{"code_challenge": ""}, "invalid_request"},
 		"plain method":      {map[string]string{"code_challenge_method": "plain"}, "invalid_request"},
 		"short challenge":   {map[string]string{"code_challenge": "abc"}, "invalid_request"},
-		"missing resource":  {map[string]string{"resource": ""}, "invalid_request"},
 		"wrong resource":    {map[string]string{"resource": "https://other.example/mcp"}, "invalid_target"},
-		"token response":    {map[string]string{"response_type": "token"}, "unsupported_response_type"},
 	} {
 		_, aerr := f.svc.BeginAuthorize(ctx, authorizeQuery(c.ClientID, redirect, challenge, tc.extra), "198.51.100.7")
 		if aerr == nil || aerr.Code != tc.code {
@@ -287,6 +304,34 @@ func TestAuthorizeChecks(t *testing.T) {
 	}
 	if _, aerr := f.svc.BeginAuthorize(ctx, authorizeQuery(c.ClientID, "http://127.0.0.1:52222/other", challenge, nil), "198.51.100.7"); aerr == nil {
 		t.Fatal("a loopback redirect with another path was accepted")
+	}
+	// state is optional (PKCE protects the code), and a missing resource
+	// means toolyard's only resource.
+	req, aerr := f.svc.BeginAuthorize(ctx, authorizeQuery(c.ClientID, redirect, challenge, map[string]string{"state": "", "resource": ""}), "198.51.100.7")
+	if aerr != nil || req.State != "" || req.Resource != testPublic+"/mcp" {
+		t.Fatalf("no state, no resource: %+v %v", req, aerr)
+	}
+	loc, err := f.svc.Approve(ctx, req.ID, f.user, Consent{Nickname: "No state"})
+	if err != nil || strings.Contains(loc, "state=") {
+		t.Fatalf("approve without state: %q %v", loc, err)
+	}
+}
+
+// TestNoOpenRedirectBeforeTheRequestIsTrusted: a client that registered
+// someone else's site as its redirect URI cannot use an invalid request to
+// bounce a browser there without the person (RFC 9700 section 4.11.2).
+func TestNoOpenRedirectBeforeTheRequestIsTrusted(t *testing.T) {
+	f := newFixture(t)
+	evil := f.register(t, "none", "https://evil.example/landing")
+	_, challenge := pkcePair(t)
+	for name, extra := range map[string]map[string]string{
+		"bad response_type":     {"response_type": "token"},
+		"missing response_type": {"response_type": ""},
+	} {
+		_, aerr := f.svc.BeginAuthorize(context.Background(), authorizeQuery(evil.ClientID, "https://evil.example/landing", challenge, extra), "198.51.100.7")
+		if aerr == nil || aerr.Location() != "" {
+			t.Errorf("%s: got %v, want an error page and no redirect", name, aerr)
+		}
 	}
 }
 
@@ -397,7 +442,15 @@ func TestTokensRefreshRotateAndReuseRevokes(t *testing.T) {
 	if _, err := f.svc.VerifyAccessToken(ctx, t2.AccessToken); err != nil {
 		t.Fatalf("rotated token: %v", err)
 	}
-	// The used refresh token again: one of its holders is not the client.
+	// The used refresh token again, within the grace and while its
+	// successor is unused: refused, nothing revoked (a client retry).
+	_, oerr = f.svc.Exchange(ctx, refreshForm(t1.RefreshToken), ca)
+	wantOAuthErr(t, oerr, "invalid_grant")
+	if _, err := f.svc.VerifyAccessToken(ctx, t2.AccessToken); err != nil {
+		t.Fatalf("a retry within the grace revoked the grant: %v", err)
+	}
+	// After the grace: one of its holders is not the client.
+	f.clock = f.clock.Add(refreshReuseGrace + time.Second)
 	_, oerr = f.svc.Exchange(ctx, refreshForm(t1.RefreshToken), ca)
 	wantOAuthErr(t, oerr, "invalid_grant")
 	if _, err := f.svc.VerifyAccessToken(ctx, t2.AccessToken); err != identity.ErrAgentTokenInvalid {
@@ -712,18 +765,28 @@ func TestClientIDMetadataDocument(t *testing.T) {
 	svc := cimdService(f, srv, true)
 	ctx := context.Background()
 	id := srv.URL + "/oauth/client.json"
-	c, oerr := svc.Client(ctx, id)
+	// Client never fetches: before an authorization request read the
+	// document, the client is unknown.
+	if _, oerr := svc.Client(ctx, id); oerr == nil || atomic.LoadInt32(hits) != 0 {
+		t.Fatalf("Client fetched or knew an unread document (%d fetches, %v)", atomic.LoadInt32(hits), oerr)
+	}
+	c, oerr := svc.ResolveClient(ctx, id, "198.51.100.7")
 	if oerr != nil {
 		t.Fatal(oerr)
 	}
 	if c.Kind != ClientKindCIMD || c.Name != "CIMD Client" || !c.Public() {
 		t.Fatalf("client: %+v", c)
 	}
-	if _, oerr := svc.Client(ctx, id); oerr != nil || atomic.LoadInt32(hits) != 1 {
+	if _, oerr := svc.ResolveClient(ctx, id, "198.51.100.7"); oerr != nil || atomic.LoadInt32(hits) != 1 {
 		t.Fatalf("the cached document was fetched again (%d fetches, %v)", atomic.LoadInt32(hits), oerr)
 	}
 	f.clock = f.clock.Add(11 * time.Minute)
-	if _, oerr := svc.Client(ctx, id); oerr != nil || atomic.LoadInt32(hits) != 2 {
+	// An expired copy still serves the token endpoint (Client)...
+	if _, oerr := svc.Client(ctx, id); oerr != nil || atomic.LoadInt32(hits) != 1 {
+		t.Fatalf("Client refused or refetched a stale copy (%d fetches, %v)", atomic.LoadInt32(hits), oerr)
+	}
+	// ...and an authorization request fetches it again.
+	if _, oerr := svc.ResolveClient(ctx, id, "198.51.100.7"); oerr != nil || atomic.LoadInt32(hits) != 2 {
 		t.Fatalf("an expired copy was not fetched again (%d fetches, %v)", atomic.LoadInt32(hits), oerr)
 	}
 	// The whole flow works for a document client.
@@ -744,17 +807,25 @@ func TestClientIDMetadataDocument(t *testing.T) {
 	if ag, err := svc.VerifyAccessToken(ctx, tok.AccessToken); err != nil || ag.Name != "Doc client" {
 		t.Fatalf("verify: %+v %v", ag, err)
 	}
-	// Private addresses are refused outside tests.
+	// Outside tests: port 443 only, and private addresses are refused,
+	// with a generic answer (the detail goes to the log).
 	strict := cimdService(f, srv, false)
-	if _, oerr := strict.Client(ctx, srv.URL+"/another.json"); oerr == nil || !strings.Contains(oerr.Description, "public internet") {
-		t.Fatalf("loopback document allowed: %v", oerr)
+	if _, oerr := strict.ResolveClient(ctx, srv.URL+"/another.json", "198.51.100.7"); oerr == nil || !strings.Contains(oerr.Description, "port 443") {
+		t.Fatalf("a document on another port was allowed: %v", oerr)
 	}
-	// A resolver that answers with a private address is refused too.
-	strict.resolver = func(context.Context, string) ([]net.IPAddr, error) {
-		return []net.IPAddr{{IP: net.ParseIP("10.0.0.5")}}, nil
-	}
-	if _, oerr := strict.Client(ctx, "https://client.example/doc.json"); oerr == nil {
-		t.Fatal("a private DNS answer was allowed")
+	for _, private := range []string{"10.0.0.5", "100.100.1.1", "::ffff:127.0.0.1", "64:ff9b::a00:1", "2002:a00:1::1", "fd00::1"} {
+		strict.resolver = func(context.Context, string) ([]net.IPAddr, error) {
+			return []net.IPAddr{{IP: net.ParseIP(private)}}, nil
+		}
+		_, _, err := strict.fetchMetadataDocument(ctx, "https://client.example/doc.json")
+		if err == nil || !strings.Contains(err.Error(), "not on the public internet") {
+			t.Errorf("DNS answer %s: %v", private, err)
+		}
+		before := atomic.LoadInt32(hits)
+		if _, oerr := strict.ResolveClient(ctx, "https://client-"+strings.NewReplacer(":", "-", ".", "-").Replace(private)+".example/doc.json", "198.51.100.8"); oerr == nil ||
+			oerr.Description != errCIMDUnusable().Description || atomic.LoadInt32(hits) != before {
+			t.Errorf("DNS answer %s: got %v, want the generic refusal and no fetch", private, oerr)
+		}
 	}
 	for _, bad := range []string{"https://client.example/", "https://client.example", "https://u@client.example/x", "https://client.example/a/../b"} {
 		if _, oerr := svc.Client(ctx, bad); oerr == nil {
@@ -785,8 +856,9 @@ func TestClientIDMetadataDocumentChecks(t *testing.T) {
 		"redirect not followed": {nil, http.StatusFound},
 	} {
 		srv, _ := cimdServer(t, tc.doc, tc.status)
-		if _, oerr := cimdService(f, srv, true).Client(ctx, srv.URL+"/doc.json"); oerr == nil || oerr.Code != "invalid_client" {
-			t.Errorf("%s: got %v, want invalid_client", name, oerr)
+		if _, oerr := cimdService(f, srv, true).ResolveClient(ctx, srv.URL+"/doc.json", "198.51.100.7"); oerr == nil || oerr.Code != "invalid_client" ||
+			oerr.Description != errCIMDUnusable().Description {
+			t.Errorf("%s: got %v, want the generic invalid_client", name, oerr)
 		}
 	}
 }

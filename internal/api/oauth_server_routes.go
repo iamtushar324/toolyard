@@ -145,7 +145,7 @@ func (h *mcpOAuthHandlers) consent(w http.ResponseWriter, r *http.Request) {
 	// A form POST under no-referrer sends Origin: null, which the Origin
 	// check refuses; keep the page's own origin on its form.
 	w.Header().Set("Referrer-Policy", "same-origin")
-	if !h.svc.Allow(r.Context(), "consent:"+h.s.security.ClientIP(r), 120, 10*time.Minute) {
+	if !h.svc.AllowIP(r.Context(), "consent", h.s.security.ClientIP(r), 120, 10*time.Minute) {
 		writeConnectPage(w, http.StatusTooManyRequests, "Too many requests", "<h1>Too many requests</h1><p>Wait a few minutes and try again.</p>")
 		return
 	}
@@ -266,8 +266,9 @@ func scopeFromForm(form url.Values, groups []scopeGroup) access.AgentScope {
 
 // consentDraft is what the form showed or the person typed.
 type consentDraft struct {
-	nickname string
-	scope    access.AgentScope
+	nickname  string
+	scope     access.AgentScope
+	mayManage bool
 }
 
 func (h *mcpOAuthHandlers) consentSubmit(w http.ResponseWriter, r *http.Request, pending *mcpauth.AuthorizeRequest, u *identity.User) {
@@ -297,8 +298,9 @@ func (h *mcpOAuthHandlers) consentSubmit(w http.ResponseWriter, r *http.Request,
 		loc, err = h.svc.Deny(r.Context(), pending.ID, u)
 	case "allow":
 		groups := h.s.ownerCatalog(r, u.ID)
-		draft := &consentDraft{nickname: r.PostForm.Get("nickname"), scope: scopeFromForm(r.PostForm, groups)}
-		loc, err = h.svc.Approve(r.Context(), pending.ID, u, mcpauth.Consent{Nickname: draft.nickname, Scope: draft.scope})
+		draft := &consentDraft{nickname: r.PostForm.Get("nickname"), scope: scopeFromForm(r.PostForm, groups),
+			mayManage: u.Role == identity.RoleAdmin && r.PostForm.Get("may_manage") == "1"}
+		loc, err = h.svc.Approve(r.Context(), pending.ID, u, mcpauth.Consent{Nickname: draft.nickname, Scope: draft.scope, MayManage: draft.mayManage})
 		if errors.Is(err, mcpauth.ErrInvalidNickname) || errors.Is(err, access.ErrInvalidScope) {
 			h.renderConsent(w, r, pending, u, err.Error(), draft)
 			return
@@ -360,7 +362,7 @@ func (h *mcpOAuthHandlers) renderConsent(w http.ResponseWriter, r *http.Request,
 
 	var b strings.Builder
 	e := htmlEscape
-	b.WriteString(`<h1>Allow ` + e(client.DisplayName()) + ` to use your toolyard?</h1>`)
+	b.WriteString(`<h1>Allow this app to use your toolyard?</h1>`)
 	if client.LogoURI != "" {
 		b.WriteString(`<p><img src="` + e(client.LogoURI) + `" alt="" width="48" height="48" referrerpolicy="no-referrer"></p>`)
 	}
@@ -368,15 +370,22 @@ func (h *mcpOAuthHandlers) renderConsent(w http.ResponseWriter, r *http.Request,
 	if u.Email != "" {
 		b.WriteString(` (` + e(u.Email) + `)`)
 	}
-	b.WriteString(`.</p>`)
-	b.WriteString(`<div class="card"><p>After you answer, toolyard sends you back to</p><p><strong>` + e(mcpauth.RedirectHost(pending.RedirectURI)) + `</strong></p>` +
-		`<p class="meta">` + e(pending.RedirectURI) + `</p>`)
-	if client.Kind == mcpauth.ClientKindCIMD {
-		b.WriteString(`<p class="meta">This app is identified by its metadata document at ` + e(client.ID) + `.</p>`)
+	b.WriteString(`.</p><div class="card">`)
+	// Who the app is: only a metadata document's host is checked; the
+	// name is always the app's own claim.
+	if host := mcpauth.ClientHost(client); host != "" {
+		b.WriteString(`<p>Identified by <strong>` + e(host) + `</strong></p>` +
+			`<p class="meta">Its client metadata document is ` + e(client.ID) + `. The name it gives itself (not checked): ` + e(client.DisplayName()) + `.</p>`)
+		if mcpauth.RedirectLeavesClientHost(client, pending.RedirectURI) {
+			b.WriteString(`<p class="err" role="alert">Warning: this app is identified by ` + e(host) + ` but sends you back to ` +
+				e(mcpauth.RedirectHost(pending.RedirectURI)) + `. Allow it only if you expect that.</p>`)
+		}
 	} else {
-		b.WriteString(`<p class="meta">This app registered itself with toolyard. Its name is what it says it is: check the address above before you allow it.</p>`)
+		b.WriteString(`<p><strong>Self-registered app</strong></p>` +
+			`<p class="meta">The name it gives itself (not checked): ` + e(client.DisplayName()) + `. Toolyard cannot check who made it: check the address below before you allow it.</p>`)
 	}
-	b.WriteString(`</div>`)
+	b.WriteString(`<p>After you answer, toolyard sends you back to</p><p><strong>` + e(mcpauth.RedirectHost(pending.RedirectURI)) + `</strong></p>` +
+		`<p class="meta">` + e(pending.RedirectURI) + `</p></div>`)
 	b.WriteString(`<p>It asks to use toolyard's tools (` + e(pending.Scope) + `). It will act as an agent you own, named by the nickname below. ` +
 		`Toolyard records every call it makes, and calls that need approval still come to your Inbox. You can rename it, limit it or revoke it later on the Connected apps page.</p>`)
 	if errMsg != "" {
@@ -418,6 +427,11 @@ func (h *mcpOAuthHandlers) renderConsent(w http.ResponseWriter, r *http.Request,
 		}
 		b.WriteString(`</fieldset>`)
 	}
+	if u.Role == identity.RoleAdmin {
+		b.WriteString(`<fieldset><legend>Admin control</legend><p><label><input type="checkbox" name="may_manage" value="1"` + checked(draft.mayManage) +
+			`> May manage toolyard (policies, servers, shared connections)</label></p>` +
+			`<p class="meta">Leave this off unless the app must change toolyard itself. Off, it uses tools like any agent of yours but cannot change policies, reconnect servers or sign in shared connections, although you are an admin.</p></fieldset>`)
+	}
 	b.WriteString(`<p class="row"><button class="primary" type="submit" name="verdict" value="allow">Allow</button> ` +
 		`<button type="submit" name="verdict" value="deny" formnovalidate>Deny</button></p></form>`)
 	status := http.StatusOK
@@ -425,6 +439,15 @@ func (h *mcpOAuthHandlers) renderConsent(w http.ResponseWriter, r *http.Request,
 		status = http.StatusBadRequest
 	}
 	writeConnectPage(w, status, "Allow "+client.DisplayName(), b.String())
+}
+
+func sortedKeys(m map[string]bool) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	sort.Strings(out)
+	return out
 }
 
 func setOf(v []string) map[string]bool {
@@ -502,6 +525,8 @@ func (h *mcpOAuthHandlers) appsConfig(w http.ResponseWriter, r *http.Request) {
 			mcpauth.SettingRedirectHosts:    strings.Join(h.svc.RedirectHosts(), ", "),
 			mcpauth.SettingAccessTTLMinutes: int(h.svc.AccessTTL() / time.Minute),
 			mcpauth.SettingRefreshTTLDays:   int(h.svc.RefreshTTL() / (24 * time.Hour)),
+			mcpauth.SettingMaxSessionDays:   int(h.svc.MaxSession() / (24 * time.Hour)),
+			mcpauth.SettingCustomSchemes:    strings.Join(sortedKeys(h.svc.CustomSchemes()), ", "),
 		}
 	}
 	writeJSON(w, http.StatusOK, out)
@@ -541,8 +566,9 @@ func (h *mcpOAuthHandlers) scopeApp(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var body struct {
-		ID    string            `json:"id"`
-		Scope access.AgentScope `json:"scope"`
+		ID        string             `json:"id"`
+		Scope     *access.AgentScope `json:"scope"`
+		MayManage *bool              `json:"may_manage"`
 	}
 	if err := decode(r, &body); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid_body")
@@ -552,13 +578,23 @@ func (h *mcpOAuthHandlers) scopeApp(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	if _, err := h.svc.SetAppScope(r.Context(), app, body.Scope, u); err != nil {
-		if errors.Is(err, access.ErrInvalidScope) {
-			writeError(w, http.StatusBadRequest, err.Error())
+	// Only an admin may let an app manage toolyard; anyone who manages the
+	// app may take that away.
+	if body.MayManage != nil && *body.MayManage && u.Role != identity.RoleAdmin {
+		writeError(w, http.StatusForbidden, "admin_only")
+		return
+	}
+	if body.Scope != nil {
+		if _, err := h.svc.SetAppScope(r.Context(), app, *body.Scope, u); err != nil {
+			writeScopeError(w, err)
 			return
 		}
-		writeError(w, http.StatusInternalServerError, "scope_failed")
-		return
+	}
+	if body.MayManage != nil && *body.MayManage != app.MayManage {
+		if err := h.svc.SetAppManage(r.Context(), app, *body.MayManage, u); err != nil {
+			writeError(w, http.StatusInternalServerError, "manage_failed")
+			return
+		}
 	}
 	h.writeApp(w, r, app.ID)
 }

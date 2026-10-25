@@ -137,6 +137,18 @@ func (s Scope) LimitedOut(upstream, toolName string) bool {
 // (an admin), whatever the agent's own limits.
 func (s Scope) OwnerIsAdmin() bool { return !s.Denied && (s.All || s.OwnerAll) }
 
+// CanAdminister reports whether the caller may use toolyard's admin
+// controls (policies.set/clear, servers.reconnect, shared connections): an
+// admin's unlimited agent or the admin's own session, or an admin's agent
+// whose limits say it may manage toolyard. A limited agent, and every
+// OAuth client its owner did not explicitly let manage toolyard, may not.
+func (s Scope) CanAdminister() bool {
+	if s.Denied {
+		return false
+	}
+	return s.All || (s.OwnerAll && s.Limits != nil && s.Limits.Manage)
+}
+
 // Resolver is what the gateway asks on every tool list and call.
 type Resolver interface {
 	ScopeFor(ctx context.Context, callerID string) Scope
@@ -176,7 +188,8 @@ func New(db *store.DB) *Service {
 //	""                   local unauthenticated MCP caller (only possible
 //	                     without -require-auth-on-mcp): All
 //	"ag_<uuid>"          an agent: its owner's scope, narrowed by the
-//	                     agent's own limits (agent_scopes)
+//	                     agent's own limits (agent_scopes; every OAuth
+//	                     client has limits); a disabled agent is Denied
 //	"dashboard:<uid>"    dashboard Call tab: that user's scope
 //	"voice:<uid>"        voice session: that user's scope
 //
@@ -285,13 +298,19 @@ func (s *Service) agentOwner(ctx context.Context, agentID string) (string, error
 	}
 	s.mu.Unlock()
 
+	// A disabled agent has no owner here, so it reaches nothing: a call it
+	// queued (an approval, an Inbox grant) cannot run after a revoke.
 	var owner string
-	err := s.db.QueryRowContext(ctx, `SELECT owner_user FROM agents WHERE id = ?`, agentID).Scan(&owner)
+	var disabled int
+	err := s.db.QueryRowContext(ctx, `SELECT owner_user, COALESCE(disabled, 0) FROM agents WHERE id = ?`, agentID).Scan(&owner, &disabled)
 	if errors.Is(err, sql.ErrNoRows) {
 		owner, err = "", nil
 	}
 	if err != nil {
 		return "", err
+	}
+	if disabled != 0 {
+		owner = ""
 	}
 	s.mu.Lock()
 	s.owners[agentID] = cached[string]{v: owner, exp: s.now().Add(cacheTTL)}

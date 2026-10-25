@@ -39,7 +39,9 @@ import (
 	"errors"
 	"net"
 	"net/http"
+	"net/netip"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/tusharbhardwaj/toolyard/internal/access"
@@ -86,12 +88,29 @@ const (
 	// SettingRefreshTTLDays is the refresh token lifetime, renewed on every
 	// refresh (1-365, default 30).
 	SettingRefreshTTLDays = "mcp_oauth_refresh_ttl_days"
+	// SettingMaxSessionDays is the absolute limit from consent: no token
+	// of a grant outlives it, however often it is refreshed (1-365,
+	// default 90). The person then signs in again.
+	SettingMaxSessionDays = "mcp_oauth_max_session_days"
+	// SettingCustomSchemes lists the private-use redirect schemes allowed
+	// without a reverse-DNS name (comma separated). Default:
+	// DefaultCustomSchemes.
+	SettingCustomSchemes = "mcp_oauth_custom_schemes"
 )
+
+// DefaultCustomSchemes are the redirect schemes of well-known native MCP
+// clients that do not use a reverse-DNS scheme (RFC 8252 section 7.1).
+const DefaultCustomSchemes = "cursor,vscode,vscode-insiders,windsurf,zed"
 
 // Lifetimes and limits.
 const (
 	DefaultAccessTTL  = time.Hour
 	DefaultRefreshTTL = 30 * 24 * time.Hour
+	DefaultMaxSession = 90 * 24 * time.Hour
+	// refreshReuseGrace: a refresh token presented again this soon after
+	// its use, while its successor is still unused, is refused without
+	// revoking the grant (a client retry, or two of its requests racing).
+	refreshReuseGrace = 30 * time.Second
 	// CodeTTL: an authorization code must be exchanged within a minute.
 	CodeTTL = 60 * time.Second
 	// RequestTTL: the person has ten minutes to sign in and answer.
@@ -142,11 +161,16 @@ type Options struct {
 	// resolver.
 	Resolver func(ctx context.Context, host string) ([]net.IPAddr, error)
 	// AllowPrivateCIMD lets client metadata documents live on loopback and
-	// private addresses. Tests only: in production a document must be on
-	// the public internet.
+	// private addresses and on any port. Tests only: in production a
+	// document must be on the public internet, on port 443.
 	AllowPrivateCIMD bool
 	// CIMDRootCAs replaces the system roots for document fetches. Tests only.
 	CIMDRootCAs *x509.CertPool
+	// OnRevoke, when set, runs after a grant is revoked (by its owner, by
+	// its client, or because a token was used twice) with the grant's
+	// agent, after the agent was disabled: main.go cancels the agent's
+	// pending approvals and Inbox requests there.
+	OnRevoke func(ctx context.Context, agentID string)
 }
 
 // Service is the authorization server.
@@ -159,6 +183,10 @@ type Service struct {
 	resolver         func(ctx context.Context, host string) ([]net.IPAddr, error)
 	allowPrivateCIMD bool
 	cimdRoots        *x509.CertPool
+	onRevoke         func(ctx context.Context, agentID string)
+	mem              memLimiter
+	flightMu         sync.Mutex
+	flights          map[string]*flight
 }
 
 // New returns the service. It starts nothing; call Run for the sweeper.
@@ -172,6 +200,8 @@ func New(o Options) *Service {
 		resolver:         o.Resolver,
 		allowPrivateCIMD: o.AllowPrivateCIMD,
 		cimdRoots:        o.CIMDRootCAs,
+		onRevoke:         o.OnRevoke,
+		flights:          map[string]*flight{},
 	}
 	if s.now == nil {
 		s.now = time.Now
@@ -223,6 +253,30 @@ func (s *Service) RefreshTTL() time.Duration {
 		return DefaultRefreshTTL
 	}
 	return time.Duration(clamp(s.settings.GetInt(SettingRefreshTTLDays, 30), 1, 365)) * 24 * time.Hour
+}
+
+// MaxSession is the configured absolute session limit.
+func (s *Service) MaxSession() time.Duration {
+	if s.settings == nil {
+		return DefaultMaxSession
+	}
+	return time.Duration(clamp(s.settings.GetInt(SettingMaxSessionDays, 90), 1, 365)) * 24 * time.Hour
+}
+
+// CustomSchemes is the set of private-use redirect schemes allowed without
+// a reverse-DNS name.
+func (s *Service) CustomSchemes() map[string]bool {
+	raw := DefaultCustomSchemes
+	if s.settings != nil {
+		raw = s.settings.GetString(SettingCustomSchemes, DefaultCustomSchemes)
+	}
+	out := map[string]bool{}
+	for _, f := range strings.FieldsFunc(raw, func(r rune) bool { return r == ',' || r == ' ' || r == '\n' || r == '\t' || r == ';' }) {
+		if f = strings.ToLower(strings.TrimSuffix(strings.TrimSpace(f), ":")); f != "" {
+			out[f] = true
+		}
+	}
+	return out
 }
 
 // RedirectHosts is the configured redirect host allow list (lower case),
@@ -319,6 +373,36 @@ func clamp(v, lo, hi int) int {
 		return hi
 	}
 	return v
+}
+
+// rateKey is the rate-limit key for a client address: the address, an
+// IPv6 address's /64 (one host usually owns the whole /64), or "unknown"
+// when the address is missing or unreadable.
+func rateKey(ip string) string {
+	addr, err := netip.ParseAddr(strings.TrimSpace(ip))
+	if err != nil {
+		return "unknown"
+	}
+	addr = addr.Unmap().WithZone("")
+	if addr.Is6() {
+		p, err := addr.Prefix(64)
+		if err != nil {
+			return "unknown"
+		}
+		return p.String()
+	}
+	return addr.String()
+}
+
+// limitFor is max for a known address and a strict quarter of it for the
+// shared "unknown" bucket.
+func limitFor(key string, max int) int {
+	if key == "unknown" {
+		if max /= 4; max < 1 {
+			max = 1
+		}
+	}
+	return max
 }
 
 func nullStr(v string) any {

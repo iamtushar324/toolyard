@@ -31,7 +31,9 @@ owner may use but the agent may not is absent from `tools/list` and
 search, and a call to it says so plainly: "not allowed for this agent: its
 owner limited what it may use". The audit reason is
 `access: not allowed for this agent`. A limited agent cannot change
-policies, even when its owner is an admin.
+policies, reconnect servers or sign in shared connections, even when its
+owner is an admin; neither can an OAuth client unless its admin owner chose
+"May manage toolyard" for it (`access.whoami` shows `can_change_policies`).
 
 ## The ask rule
 

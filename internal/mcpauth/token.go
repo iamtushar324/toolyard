@@ -85,9 +85,11 @@ func (s *Service) grantStateTx(ctx context.Context, q store.Querier, grantID str
 	var g grantState
 	var revoked sql.NullInt64
 	var disabled int
+	// A grant whose agent was deleted (the grant is its tombstone) counts
+	// as disabled until the person connects the client again.
 	err := q.QueryRowContext(ctx,
-		`SELECT g.agent_id, a.name, g.revoked_at, COALESCE(a.disabled, 0), COALESCE(u.status, '')
-         FROM mcp_oauth_grants g JOIN agents a ON a.id = g.agent_id LEFT JOIN users u ON u.id = g.user_id
+		`SELECT g.agent_id, COALESCE(a.name, ''), g.revoked_at, COALESCE(a.disabled, 1), COALESCE(u.status, '')
+         FROM mcp_oauth_grants g LEFT JOIN agents a ON a.id = g.agent_id LEFT JOIN users u ON u.id = g.user_id
          WHERE g.id = ?`, grantID).Scan(&g.agentID, &g.nickname, &revoked, &disabled, &g.ownerStatus)
 	if err != nil {
 		return nil, err
@@ -119,11 +121,11 @@ func (s *Service) exchangeCode(ctx context.Context, form url.Values, ca ClientAu
 	defer func() { _ = tx.Rollback() }()
 	now := s.now().UnixMilli()
 	var grantID, clientID, redirect, challenge, resource, scope, family string
-	var expires int64
+	var expires, consentedAt int64
 	err = tx.QueryRowContext(ctx,
 		`UPDATE mcp_oauth_codes SET used_at = ? WHERE code_hash = ? AND used_at IS NULL
-         RETURNING grant_id, client_id, redirect_uri, code_challenge, resource, scope, family_id, expires_at`,
-		now, hashSecret(code)).Scan(&grantID, &clientID, &redirect, &challenge, &resource, &scope, &family, &expires)
+         RETURNING grant_id, client_id, redirect_uri, code_challenge, resource, scope, family_id, expires_at, created_at`,
+		now, hashSecret(code)).Scan(&grantID, &clientID, &redirect, &challenge, &resource, &scope, &family, &expires, &consentedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		var usedFamily, usedGrant string
 		e := tx.QueryRowContext(ctx, `SELECT family_id, grant_id FROM mcp_oauth_codes WHERE code_hash = ?`, hashSecret(code)).Scan(&usedFamily, &usedGrant)
@@ -175,7 +177,10 @@ func (s *Service) exchangeCode(ctx context.Context, form url.Values, ca ClientAu
 	if !g.usable() {
 		return fail(invalidGrant("this connection was revoked or its owner can no longer sign in"))
 	}
-	resp, err := s.issueTokensTx(ctx, tx, grantID, client.ID, family, scope, resource)
+	resp, err := s.issueTokensTx(ctx, tx, grantID, client.ID, family, scope, resource, consentedAt, "")
+	if errors.Is(err, errSessionTooOld) {
+		return fail(invalidGrant("this sign-in reached its maximum age; sign in again"))
+	}
 	if err != nil {
 		return nil, serverError()
 	}
@@ -188,10 +193,15 @@ func (s *Service) exchangeCode(ctx context.Context, form url.Values, ca ClientAu
 	return resp, nil
 }
 
+// errSessionTooOld: the grant's sign-in passed the absolute session limit.
+var errSessionTooOld = errors.New("mcpauth: the sign-in reached its maximum age")
+
 // refresh is the refresh_token grant: the presented token is claimed
 // (used once) and a new access and refresh token are issued. A refresh
 // token presented after it was used revokes the whole grant: one of the
-// two holders is not the client.
+// two holders is not the client. The one exception is a retry: within
+// refreshReuseGrace of its use, while the token that replaced it is still
+// unused, it is refused without revoking anything.
 func (s *Service) refresh(ctx context.Context, form url.Values, ca ClientAuth) (*TokenResponse, *Error) {
 	raw := form.Get("refresh_token")
 	if raw == "" {
@@ -209,11 +219,12 @@ func (s *Service) refresh(ctx context.Context, form url.Values, ca ClientAuth) (
 	now := s.now().UnixMilli()
 	hash := hashSecret(raw)
 	var grantID, family, scope, resource string
+	var authTime int64
 	err = tx.QueryRowContext(ctx,
 		`UPDATE mcp_oauth_tokens SET used_at = ?
          WHERE token_hash = ? AND kind = 'refresh' AND client_id = ? AND used_at IS NULL AND revoked_at IS NULL AND expires_at > ?
-         RETURNING grant_id, family_id, scope, resource`,
-		now, hash, client.ID, now).Scan(&grantID, &family, &scope, &resource)
+         RETURNING grant_id, family_id, scope, resource, auth_time`,
+		now, hash, client.ID, now).Scan(&grantID, &family, &scope, &resource, &authTime)
 	if errors.Is(err, sql.ErrNoRows) {
 		var usedGrant, usedClient string
 		var used, revoked sql.NullInt64
@@ -223,7 +234,18 @@ func (s *Service) refresh(ctx context.Context, form url.Values, ca ClientAuth) (
 			return nil, invalidGrant("the refresh token is unknown, expired or revoked")
 		}
 		if used.Valid && !revoked.Valid {
-			if e = s.revokeGrantTx(ctx, tx, usedGrant, "refresh_token_reused"); e != nil {
+			if used.Int64 >= now-refreshReuseGrace.Milliseconds() {
+				var live int
+				if e = tx.QueryRowContext(ctx, `SELECT COUNT(*) FROM mcp_oauth_tokens
+                    WHERE parent_hash = ? AND kind = 'refresh' AND used_at IS NULL AND revoked_at IS NULL`, hash).Scan(&live); e != nil {
+					return nil, serverError()
+				}
+				if live > 0 {
+					return nil, invalidGrant("the refresh token was just used; use the newest refresh token")
+				}
+			}
+			agentID, e := s.revokeGrantTx(ctx, tx, usedGrant, "refresh_token_reused")
+			if e != nil {
 				return nil, serverError()
 			}
 			_ = s.auditTx(ctx, tx, auditRow{event: "mcp_oauth.refresh_reused", clientID: client.ID, grantID: usedGrant,
@@ -231,6 +253,7 @@ func (s *Service) refresh(ctx context.Context, form url.Values, ca ClientAuth) (
 			if e = tx.Commit(); e != nil {
 				return nil, serverError()
 			}
+			s.afterRevoke(ctx, agentID)
 			return nil, invalidGrant("the refresh token was already used, so toolyard revoked this connection; sign in again")
 		}
 		return nil, invalidGrant("the refresh token is unknown, expired or revoked")
@@ -256,7 +279,10 @@ func (s *Service) refresh(ctx context.Context, form url.Values, ca ClientAuth) (
 	if !g.usable() {
 		return nil, invalidGrant("this connection was revoked or its owner can no longer sign in")
 	}
-	resp, err := s.issueTokensTx(ctx, tx, grantID, client.ID, family, scope, resource)
+	resp, err := s.issueTokensTx(ctx, tx, grantID, client.ID, family, scope, resource, authTime, hash)
+	if errors.Is(err, errSessionTooOld) {
+		return nil, invalidGrant("this sign-in reached its maximum age; sign in again")
+	}
 	if err != nil {
 		return nil, serverError()
 	}
@@ -270,7 +296,22 @@ func (s *Service) refresh(ctx context.Context, form url.Values, ca ClientAuth) (
 }
 
 // issueTokensTx stores a new access and refresh token for the grant.
-func (s *Service) issueTokensTx(ctx context.Context, q store.Querier, grantID, clientID, family, scope, resource string) (*TokenResponse, error) {
+// authTime is when the person consented: no token outlives authTime plus
+// MaxSession, however often it is refreshed (errSessionTooOld once that
+// has passed). parent is the refresh token this one replaces ("" for a
+// code exchange).
+func (s *Service) issueTokensTx(ctx context.Context, q store.Querier, grantID, clientID, family, scope, resource string, authTime int64, parent string) (*TokenResponse, error) {
+	now := s.now()
+	limit := time.UnixMilli(authTime).Add(s.MaxSession())
+	if !now.Before(limit) {
+		return nil, errSessionTooOld
+	}
+	until := func(ttl time.Duration) time.Time {
+		if t := now.Add(ttl); t.Before(limit) {
+			return t
+		}
+		return limit
+	}
 	access, err := newSecret(accessPrefix)
 	if err != nil {
 		return nil, err
@@ -279,39 +320,60 @@ func (s *Service) issueTokensTx(ctx context.Context, q store.Querier, grantID, c
 	if err != nil {
 		return nil, err
 	}
-	now := s.now()
-	accessTTL := s.AccessTTL()
+	accessUntil := until(s.AccessTTL())
 	for _, t := range []struct {
-		raw, kind string
-		ttl       time.Duration
-	}{{access, "access", accessTTL}, {refresh, "refresh", s.RefreshTTL()}} {
+		raw, kind, parent string
+		expires           time.Time
+	}{{access, "access", "", accessUntil}, {refresh, "refresh", parent, until(s.RefreshTTL())}} {
 		if _, err := q.ExecContext(ctx,
-			`INSERT INTO mcp_oauth_tokens(token_hash, kind, grant_id, client_id, family_id, scope, resource, created_at, expires_at)
-             VALUES(?,?,?,?,?,?,?,?,?)`,
-			hashSecret(t.raw), t.kind, grantID, clientID, family, scope, resource, now.UnixMilli(), now.Add(t.ttl).UnixMilli()); err != nil {
+			`INSERT INTO mcp_oauth_tokens(token_hash, kind, grant_id, client_id, family_id, parent_hash, scope, resource, auth_time, created_at, expires_at)
+             VALUES(?,?,?,?,?,?,?,?,?,?,?)`,
+			hashSecret(t.raw), t.kind, grantID, clientID, family, nullStr(t.parent), scope, resource, authTime, now.UnixMilli(), t.expires.UnixMilli()); err != nil {
 			return nil, err
 		}
 	}
-	return &TokenResponse{AccessToken: access, TokenType: "Bearer", ExpiresIn: int64(accessTTL / time.Second), RefreshToken: refresh, Scope: scope}, nil
+	return &TokenResponse{AccessToken: access, TokenType: "Bearer", ExpiresIn: int64(accessUntil.Sub(now) / time.Second), RefreshToken: refresh, Scope: scope}, nil
 }
 
 // revokeGrantTx ends a grant: its tokens and unused codes stop working and
 // its agent is disabled. The rows stay, so the audit trail keeps naming
-// the client. Connecting the client again re-enables the same agent.
-func (s *Service) revokeGrantTx(ctx context.Context, q store.Querier, grantID, reason string) error {
+// the client. Connecting the client again re-enables the same agent. It
+// returns the agent, for afterRevoke once the transaction commits.
+func (s *Service) revokeGrantTx(ctx context.Context, q store.Querier, grantID, reason string) (string, error) {
 	now := s.now().UnixMilli()
+	var agentID string
+	if err := q.QueryRowContext(ctx, `SELECT agent_id FROM mcp_oauth_grants WHERE id = ?`, grantID).Scan(&agentID); err != nil {
+		return "", err
+	}
 	if _, err := q.ExecContext(ctx, `UPDATE mcp_oauth_grants SET revoked_at = ?, revoked_reason = ?, updated_at = ? WHERE id = ? AND revoked_at IS NULL`,
 		now, reason, now, grantID); err != nil {
-		return err
+		return "", err
 	}
 	if _, err := q.ExecContext(ctx, `UPDATE mcp_oauth_tokens SET revoked_at = ? WHERE grant_id = ? AND revoked_at IS NULL`, now, grantID); err != nil {
-		return err
+		return "", err
 	}
 	if _, err := q.ExecContext(ctx, `UPDATE mcp_oauth_codes SET used_at = ? WHERE grant_id = ? AND used_at IS NULL`, now, grantID); err != nil {
-		return err
+		return "", err
 	}
-	_, err := q.ExecContext(ctx, `UPDATE agents SET disabled = 1 WHERE id = (SELECT agent_id FROM mcp_oauth_grants WHERE id = ?)`, grantID)
-	return err
+	if _, err := q.ExecContext(ctx, `UPDATE agents SET disabled = 1 WHERE id = ?`, agentID); err != nil {
+		return "", err
+	}
+	return agentID, nil
+}
+
+// afterRevoke runs once a revocation committed: the agent's cached scope
+// is dropped (a disabled agent reaches nothing, so nothing it queued can
+// run) and OnRevoke cancels what it still has pending.
+func (s *Service) afterRevoke(ctx context.Context, agentID string) {
+	if agentID == "" {
+		return
+	}
+	if s.access != nil {
+		s.access.InvalidateAgent(agentID)
+	}
+	if s.onRevoke != nil {
+		s.onRevoke(ctx, agentID)
+	}
 }
 
 // Revoke is RFC 7009 revocation. An unknown token, or one issued to
@@ -350,7 +412,8 @@ func (s *Service) Revoke(ctx context.Context, token string, ca ClientAuth) *Erro
 		return serverError()
 	}
 	defer func() { _ = tx.Rollback() }()
-	if err := s.revokeGrantTx(ctx, tx, grantID, "revoked_by_client"); err != nil {
+	agentID, err := s.revokeGrantTx(ctx, tx, grantID, "revoked_by_client")
+	if err != nil {
 		return serverError()
 	}
 	if err := s.auditTx(ctx, tx, auditRow{event: "mcp_oauth.revoked", client: client, grantID: grantID,
@@ -360,6 +423,7 @@ func (s *Service) Revoke(ctx context.Context, token string, ca ClientAuth) *Erro
 	if err := tx.Commit(); err != nil {
 		return serverError()
 	}
+	s.afterRevoke(ctx, agentID)
 	return nil
 }
 

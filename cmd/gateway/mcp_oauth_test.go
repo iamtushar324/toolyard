@@ -19,6 +19,7 @@ import (
 	"regexp"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/mark3labs/mcp-go/server"
 
@@ -49,6 +50,8 @@ type oauthEnv struct {
 	handler http.Handler
 	session []*http.Cookie
 	cimd    *httptest.Server
+	// offset moves the authorization server's clock (refresh grace).
+	offset time.Duration
 }
 
 const cimdRedirect = "http://127.0.0.1:43999/cb"
@@ -90,7 +93,10 @@ func newOAuthEnv(t *testing.T) *oauthEnv {
 	t.Cleanup(cimd.Close)
 	pool := x509.NewCertPool()
 	pool.AddCert(cimd.Certificate())
-	svc := mcpauth.New(mcpauth.Options{DB: db, PublicURL: oauthPublic, Access: accessSvc, AllowPrivateCIMD: true, CIMDRootCAs: pool})
+	e := &oauthEnv{t: t, db: db, ids: ids, user: u, cimd: cimd}
+	svc := mcpauth.New(mcpauth.Options{DB: db, PublicURL: oauthPublic, Access: accessSvc, AllowPrivateCIMD: true, CIMDRootCAs: pool,
+		Now: func() time.Time { return time.Now().Add(e.offset) }})
+	e.svc = svc
 	sec := api.SecurityOptions{PublicURL: oauthPublic}
 	apiSrv := api.New(ctx, api.Options{Identity: ids, Audit: auditLog, Approval: bus, Gateway: gw, Access: accessSvc, Federation: fed,
 		SessionKey: []byte("0123456789abcdef0123456789abcdef"), Security: sec})
@@ -102,8 +108,7 @@ func newOAuthEnv(t *testing.T) *oauthEnv {
 		server.WithDisableStreaming(true), server.WithDisableLocalhostProtection(true), server.WithHTTPContextFunc(auth.contextFunc))
 	mux.Handle("/mcp", gateway.PreserveToolCallNumbers(auth.guard(streamable)))
 	mux.Handle("/", staticHandler())
-	e := &oauthEnv{t: t, db: db, ids: ids, svc: svc, user: u, cimd: cimd,
-		handler: apiSrv.SecurityHeaders(apiSrv.EnforceOriginOnMutations(apiSrv.HardenAPI(apiSrv.RoleGuard(mux))))}
+	e.handler = apiSrv.SecurityHeaders(apiSrv.EnforceOriginOnMutations(apiSrv.HardenAPI(apiSrv.RoleGuard(mux))))
 	login := e.do(http.MethodPost, "/v1/auth/login", strings.NewReader(`{"Username":"owner","Password":"long-enough-password"}`),
 		map[string]string{"Content-Type": "application/json", "Origin": oauthPublic})
 	if login.Code != http.StatusOK || len(login.Result().Cookies()) == 0 {
@@ -247,6 +252,20 @@ func (e *oauthEnv) consent(clientID, redirect, challenge string, form url.Values
 	}
 	if !strings.Contains(page.Body.String(), mcpauth.RedirectHost(redirect)) {
 		e.t.Fatalf("consent page does not show the redirect host %q", mcpauth.RedirectHost(redirect))
+	}
+	// Who the app is: its document's host, or self-registered; the name
+	// is labelled as its own claim; the admin sees the manage switch, off.
+	body := page.Body.String()
+	label := "Self-registered app"
+	if strings.HasPrefix(clientID, "https://") {
+		u, _ := url.Parse(clientID)
+		label = "Identified by <strong>" + u.Hostname() + "</strong>"
+	}
+	if !strings.Contains(body, label) || !strings.Contains(body, "(not checked)") || strings.Contains(body, "Verified") {
+		e.t.Fatalf("consent page trust labels: want %q and a not-checked name", label)
+	}
+	if !strings.Contains(body, `name="may_manage" value="1">`) {
+		e.t.Fatal("the admin's consent page lacks the manage switch, or it is on by default")
 	}
 	m := nonceRE.FindStringSubmatch(page.Body.String())
 	var nonceCookie *http.Cookie
@@ -400,6 +419,19 @@ func TestMCPOAuthFullFlowWithDynamicRegistration(t *testing.T) {
 	if calls < 3 || limited != 2 {
 		t.Fatalf("audit: %d call rows, %d limited refusals", calls, limited)
 	}
+	var missing int
+	if err := e.db.QueryRow(`SELECT COUNT(*) FROM audit_events WHERE agent_id = ? AND event_type LIKE 'call.%' AND COALESCE(oauth_client_id, '') <> ?`, agentID, clientID).Scan(&missing); err != nil || missing != 0 {
+		t.Fatalf("%d call rows lack the OAuth client id (%v)", missing, err)
+	}
+	// Without may_manage, an admin's app uses tools but has no admin control.
+	_, who := e.call(access1, "access.whoami", map[string]any{})
+	if sc, _ := who["structuredContent"].(map[string]any); sc["can_change_policies"] != false {
+		t.Fatalf("an admin's app may change policies by default: %v", who)
+	}
+	if msg, res := e.call(access1, "policies.set", map[string]any{"scope": "tool", "target": "memory.get", "access": "deny"}); msg != "" ||
+		res == nil || !strings.Contains(resultText(res), "has not let this agent manage toolyard") {
+		t.Fatalf("policies.set from an app without may_manage: %q %v", msg, res)
+	}
 
 	// The Connected apps API renames the app; the next call carries it.
 	rest := func(method, path, body string) *httptest.ResponseRecorder {
@@ -438,6 +470,15 @@ func TestMCPOAuthFullFlowWithDynamicRegistration(t *testing.T) {
 	if names := e.toolNames(access2); !names["memory.get"] {
 		t.Fatal("the rotated access token does not work")
 	}
+	// A retry within the grace is refused without revoking anything.
+	w, tok = e.form("/oauth/token", url.Values{"grant_type": {"refresh_token"}, "refresh_token": {refresh1}, "client_id": {clientID}})
+	if w.Code != 400 || tok["error"] != "invalid_grant" {
+		t.Fatalf("refresh token retry: %d %s", w.Code, w.Body)
+	}
+	if names := e.toolNames(access2); !names["memory.get"] {
+		t.Fatal("a retry within the grace revoked the grant")
+	}
+	e.offset += 31 * time.Second
 	w, tok = e.form("/oauth/token", url.Values{"grant_type": {"refresh_token"}, "refresh_token": {refresh1}, "client_id": {clientID}})
 	if w.Code != 400 || tok["error"] != "invalid_grant" {
 		t.Fatalf("refresh token reuse: %d %s", w.Code, w.Body)
@@ -482,7 +523,8 @@ func TestMCPOAuthFullFlowWithMetadataDocument(t *testing.T) {
 	e := newOAuthEnv(t)
 	clientID := e.cimd.URL + "/oauth/client.json"
 	verifier, challenge := newPKCE(t)
-	loc := e.consent(clientID, cimdRedirect, challenge, url.Values{"verdict": {"allow"}, "nickname": {"Doc client"}, "scope_mode": {"all"}, "deny_server": {"fixture"}})
+	loc := e.consent(clientID, cimdRedirect, challenge, url.Values{"verdict": {"allow"}, "nickname": {"Doc client"}, "scope_mode": {"all"}, "deny_server": {"fixture"},
+		"may_manage": {"1"}})
 	w, tok := e.form("/oauth/token", url.Values{"grant_type": {"authorization_code"}, "code": {loc.Query().Get("code")},
 		"redirect_uri": {cimdRedirect}, "code_verifier": {verifier}, "client_id": {clientID}})
 	if w.Code != 200 {
@@ -493,8 +535,32 @@ func TestMCPOAuthFullFlowWithMetadataDocument(t *testing.T) {
 		t.Fatalf("scope 'everything except fixture' not applied: memory.delete=%v fixture.echo=%v", names["memory.delete"], names["fixture.echo"])
 	}
 	apps, _ := e.svc.ListApps(context.Background(), e.user.ID)
-	if len(apps) != 1 || apps[0].ClientKind != mcpauth.ClientKindCIMD || apps[0].ClientName != "CIMD Test Client" {
+	if len(apps) != 1 || apps[0].ClientKind != mcpauth.ClientKindCIMD || apps[0].ClientName != "CIMD Test Client" || !apps[0].MayManage {
 		t.Fatalf("apps: %+v", apps)
+	}
+	// The admin let this app manage toolyard on the consent screen.
+	_, who := e.call(tok["access_token"].(string), "access.whoami", map[string]any{})
+	if sc, _ := who["structuredContent"].(map[string]any); sc["can_change_policies"] != true {
+		t.Fatalf("an app with may_manage cannot change policies: %v", who)
+	}
+}
+
+// TestMCPOAuthNoOpenRedirect: a client that registered someone else's site
+// cannot use an invalid authorization request to bounce a browser there.
+func TestMCPOAuthNoOpenRedirect(t *testing.T) {
+	e := newOAuthEnv(t)
+	reg := e.do(http.MethodPost, "/oauth/register", strings.NewReader(`{"redirect_uris":["https://evil.example/landing"],"token_endpoint_auth_method":"none"}`),
+		map[string]string{"Content-Type": "application/json"})
+	var client map[string]any
+	if err := json.Unmarshal(reg.Body.Bytes(), &client); err != nil || reg.Code != http.StatusCreated {
+		t.Fatalf("register: %d %s", reg.Code, reg.Body)
+	}
+	_, challenge := newPKCE(t)
+	q := url.Values{"response_type": {"token"}, "client_id": {client["client_id"].(string)}, "redirect_uri": {"https://evil.example/landing"},
+		"code_challenge": {challenge}, "code_challenge_method": {"S256"}}
+	w := e.do(http.MethodGet, "/oauth/authorize?"+q.Encode(), nil, nil)
+	if w.Code == http.StatusFound || strings.Contains(w.Header().Get("Location"), "evil.example") || w.Code != http.StatusBadRequest {
+		t.Fatalf("an invalid request redirected: %d %s", w.Code, w.Header().Get("Location"))
 	}
 }
 

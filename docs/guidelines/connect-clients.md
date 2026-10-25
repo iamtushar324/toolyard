@@ -123,13 +123,18 @@ finds everything from the URL:
    `/oauth/token`.
 
 Access tokens last one hour. Refresh tokens last 30 days and change on every
-use. An admin can change both lifetimes.
+use. After 90 days from your consent, you sign in again. An admin can change
+these lifetimes.
 
 ## What the consent screen does
 
 After you sign in, toolyard shows:
 
-- the app's name (and logo, when it gives one);
+- **who the app is**: "Identified by `<host>`" for an app that uses a client
+  ID metadata document (toolyard read its registration from that host), or
+  "Self-registered app" for an app that registered itself. The name and
+  logo are the app's own claim: toolyard does not check them. If an
+  identified app sends you back to another web host, toolyard warns you;
 - **where toolyard sends you back to**, for example `claude.ai`,
   `chatgpt.com`, `127.0.0.1:33418` or `cursor://…`. Check this address: an
   app that registered itself can choose any name, but it cannot change
@@ -138,6 +143,10 @@ After you sign in, toolyard shows:
   name that tells your connections apart, for example "Laptop Claude Code";
 - **what it may use**: everything you can use, or only the servers and
   tools you allow. You can also block servers or tools in both cases.
+- for an admin only, **May manage toolyard (policies, servers, shared
+  connections)**, off by default. Leave it off unless the app must change
+  toolyard itself: an app never gets admin control otherwise, even an
+  admin's app.
 
 When you select **Allow**, toolyard creates an agent that you own, named by
 the nickname. Every call that the app makes runs as this agent. Your
@@ -155,7 +164,8 @@ Open **Connected apps** in the dashboard. For each app you can:
 
 - **Rename** it. The next call uses the new nickname.
 - **Change access**: everything you can use or only chosen servers and
-  tools, and blocks. The change applies within a few seconds.
+  tools, and blocks. An admin can also turn **May manage toolyard** on or
+  off here. The change applies within a few seconds.
 - **Revoke** it. Its tokens stop at once and its agent is disabled. To use
   the app again, connect it again from the app.
 
@@ -178,9 +188,8 @@ every person.
   Activity page, filtered to the app's agent. Members see the app's recent
   rows in a list.
 - Every audit row of a call carries the agent id, the nickname
-  (`agent_name`), `agent_kind` `oauth_client` and the owner. The app's
-  OAuth client id comes from its agent:
-  `SELECT client_id FROM mcp_oauth_grants WHERE agent_id = '<agent id>'`.
+  (`agent_name`), `agent_kind` `oauth_client`, the owner, and the app's
+  OAuth client id (`oauth_client_id`).
 - The connection's own events have their own rows:
   `mcp_oauth.authorized`, `mcp_oauth.denied`, `mcp_oauth.renamed`,
   `mcp_oauth.scope_changed`, `mcp_oauth.revoked`, and
