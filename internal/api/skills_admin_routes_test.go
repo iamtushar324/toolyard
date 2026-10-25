@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/tusharbhardwaj/toolyard/internal/skillhub"
 )
@@ -37,6 +38,8 @@ type skillsAdminFake struct {
 	lastNote   string
 	lastBy     string
 	lastLimit  int
+	// extra are more sources ListSources returns (a recent create).
+	extra []skillhub.Source
 }
 
 var _ skillhub.Admin = (*skillsAdminFake)(nil)
@@ -109,7 +112,20 @@ func (f *skillsAdminFake) UpdateSource(_ context.Context, by, id string, in skil
 	if err := f.record("UpdateSource " + id); err != nil {
 		return nil, err
 	}
-	return skillsTestSource(id), nil
+	src := skillsTestSource(id)
+	if in.Mode != nil {
+		src.Mode = *in.Mode
+	}
+	if in.Branch != nil {
+		src.Branch = *in.Branch
+	}
+	if in.Path != nil {
+		src.Path = *in.Path
+	}
+	if in.PinnedSHA != nil {
+		src.PinnedSHA = *in.PinnedSHA
+	}
+	return src, nil
 }
 
 func (f *skillsAdminFake) DeleteSource(_ context.Context, by, id string) error {
@@ -127,7 +143,23 @@ func (f *skillsAdminFake) ListSources(context.Context) ([]skillhub.Source, error
 	if err := f.record("ListSources"); err != nil {
 		return nil, err
 	}
-	return []skillhub.Source{*skillsTestSource("src_1")}, nil
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]skillhub.Source{*skillsTestSource("src_1")}, f.extra...), nil
+}
+
+// skillsEventually waits up to two seconds for cond (a background first
+// sync).
+func skillsEventually(t *testing.T, cond func() bool) bool {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return true
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	return cond()
 }
 
 func (f *skillsAdminFake) SyncNow(_ context.Context, id string) (*skillhub.SyncResult, error) {
@@ -304,8 +336,12 @@ func TestSkillsAdminRoutesCallTheService(t *testing.T) {
 		t.Fatalf("create: %d %s", rec.Code, rec.Body.String())
 	}
 	got = skillsJSON(t, rec)
-	if got["source"].(map[string]any)["id"] != "src_1" || got["sync"].(map[string]any)["activated"] != true || !fake.called("SyncNow src_1") {
-		t.Fatalf("create body %v calls %v", got, fake.calls)
+	if got["source"].(map[string]any)["id"] != "src_1" || got["status"] != "syncing" || got["sync"] != nil {
+		t.Fatalf("create body %v", got)
+	}
+	// The first sync runs in the background, after the answer.
+	if !skillsEventually(t, func() bool { return fake.called("SyncNow src_1") }) {
+		t.Fatalf("no background first sync: calls %v", fake.calls)
 	}
 	if fake.lastInput.Mode != skillhub.ModeAuto || fake.lastInput.Visibility != skillhub.VisibleMembers || fake.lastInput.DefaultRuns != skillhub.RunsHost {
 		t.Fatalf("create input %+v", fake.lastInput)
@@ -325,6 +361,13 @@ func TestSkillsAdminRoutesCallTheService(t *testing.T) {
 		fake.lastUpdate.Enabled == nil || *fake.lastUpdate.Enabled || *fake.lastUpdate.Mode != skillhub.ModePinned {
 		t.Fatalf("patch: %d %s %+v", rec.Code, rec.Body.String(), fake.lastUpdate)
 	}
+	// The mode and the pinned commit changed: the open review closes.
+	settler.mu.Lock()
+	if len(settler.calls) != 1 || settler.calls[0] != "src_1||the source's update mode, pinned commit changed on the Skills page" {
+		t.Fatalf("patch settle calls %v", settler.calls)
+	}
+	settler.calls = nil
+	settler.mu.Unlock()
 	if rec := e.do(t, cookie, http.MethodPost, "/v1/skills/sources/src_1/sync", ""); rec.Code != http.StatusOK || skillsJSON(t, rec)["full"] != true {
 		t.Fatalf("sync: %d %s", rec.Code, rec.Body.String())
 	}
@@ -592,5 +635,79 @@ func TestSkillWebhookSecurityRules(t *testing.T) {
 	}
 	if scope, ok := operatorScopeFor(http.MethodPost, "/v1/skills/sources"); !ok || scope != "owner" {
 		t.Fatalf("creating a source needs the owner scope: %q %v", scope, ok)
+	}
+}
+
+// TestSkillsCreateRetryAnswersWithTheSameSource: the same create by the
+// same person within two minutes returns the source it made, instead of
+// a second source with a "-2" slug.
+func TestSkillsCreateRetryAnswersWithTheSameSource(t *testing.T) {
+	e, fake, _, cookie := newSkillsAdminEnv(t)
+	recent := *skillsTestSource("src_recent")
+	recent.CreatedBy, recent.CreatedAt = e.admin.ID, time.Now().Add(-30*time.Second)
+	fake.mu.Lock()
+	fake.extra = []skillhub.Source{recent}
+	fake.mu.Unlock()
+
+	rec := e.do(t, cookie, http.MethodPost, "/v1/skills/sources", `{"url":"acme/skills","branch":"main","path":"/skills/"}`)
+	got := skillsJSON(t, rec)
+	if rec.Code != http.StatusOK || got["existing"] != true || got["source"].(map[string]any)["id"] != "src_recent" {
+		t.Fatalf("retry: %d %v", rec.Code, got)
+	}
+	if fake.called("CreateSource") {
+		t.Fatal("a retry created a second source")
+	}
+	// Without a branch in the request, any branch of that create matches.
+	if rec := e.do(t, cookie, http.MethodPost, "/v1/skills/sources", `{"url":"acme/skills","path":"skills"}`); rec.Code != http.StatusOK {
+		t.Fatalf("retry without a branch: %d %s", rec.Code, rec.Body.String())
+	}
+	// Another branch, another folder, another slug or an older source is
+	// a new source.
+	for _, body := range []string{
+		`{"url":"acme/skills","branch":"dev","path":"skills"}`,
+		`{"url":"acme/skills","branch":"main","path":"other"}`,
+		`{"url":"acme/skills","branch":"main","path":"skills","slug":"second"}`,
+	} {
+		if rec := e.do(t, cookie, http.MethodPost, "/v1/skills/sources", body); rec.Code != http.StatusCreated {
+			t.Fatalf("%s: %d %s", body, rec.Code, rec.Body.String())
+		}
+	}
+	fake.mu.Lock()
+	fake.extra[0].CreatedAt = time.Now().Add(-3 * time.Minute)
+	fake.mu.Unlock()
+	if rec := e.do(t, cookie, http.MethodPost, "/v1/skills/sources", `{"url":"acme/skills","branch":"main","path":"skills"}`); rec.Code != http.StatusCreated {
+		t.Fatalf("after the window: %d", rec.Code)
+	}
+}
+
+// TestSkillsPatchSettlesReviewsOnlyWhenWhatIsFetchedChanges.
+func TestSkillsPatchSettlesReviewsOnlyWhenWhatIsFetchedChanges(t *testing.T) {
+	e, _, settler, cookie := newSkillsAdminEnv(t)
+	for _, body := range []string{`{"enabled":false}`, `{"visibility":"members","members":["u_a"]}`, `{"mode":"review"}`, `{"branch":"main"}`} {
+		if rec := e.do(t, cookie, http.MethodPatch, "/v1/skills/sources/src_1", body); rec.Code != http.StatusOK {
+			t.Fatalf("%s: %d %s", body, rec.Code, rec.Body.String())
+		}
+	}
+	settler.mu.Lock()
+	n := len(settler.calls)
+	settler.mu.Unlock()
+	if n != 0 {
+		t.Fatalf("an unchanged mode, branch or folder closed reviews: %v", settler.calls)
+	}
+	for body, what := range map[string]string{
+		`{"branch":"dev"}`:   "branch",
+		`{"path":"other"}`:   "folder",
+		`{"mode":"auto"}`:    "update mode",
+		`{"pinned_sha":"x"}`: "pinned commit",
+	} {
+		if rec := e.do(t, cookie, http.MethodPatch, "/v1/skills/sources/src_1", body); rec.Code != http.StatusOK {
+			t.Fatalf("%s: %d", body, rec.Code)
+		}
+		settler.mu.Lock()
+		last := settler.calls[len(settler.calls)-1]
+		settler.mu.Unlock()
+		if last != "src_1||the source's "+what+" changed on the Skills page" {
+			t.Fatalf("%s: settle %q", body, last)
+		}
 	}
 }

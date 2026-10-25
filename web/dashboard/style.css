@@ -610,6 +610,7 @@ code { background: var(--bg); padding: 1px 4px; border-radius: 3px; font-size: 1
 .ib-pill { font-size: 11.5px; font-weight: 600; padding: 2px 8px; border-radius: 999px; white-space: nowrap; }
 .ib-pill.u-now { background: rgba(248, 81, 73, 0.16); color: var(--danger); }
 .ib-pill.u-soon { background: rgba(210, 153, 34, 0.16); color: var(--warn); }
+.ib-pill.sys { background: rgba(88, 166, 255, 0.16); color: var(--link); margin-left: 6px; }
 .ib-pill.u-digest, .ib-pill.u-fyi, .ib-pill.mute { background: var(--bg-elev-2); color: var(--muted); border: 1px solid var(--border); }
 .ib-pill.good { background: rgba(46, 160, 67, 0.16); color: var(--accent-hover); }
 .ib-pill.bad { background: rgba(248, 81, 73, 0.16); color: var(--danger); }

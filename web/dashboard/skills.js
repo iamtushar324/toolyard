@@ -20,6 +20,7 @@ const skillsUI = {
   edit: null,       // the Edit source modal { id, draft, saving, error }
   users: null,      // /v1/users rows for the members picker, once loaded
   syncing: {},      // source id -> true while Sync now runs
+  watching: {},     // source id -> true while its first sync is polled
   // githubConnection shows "Use my GitHub connection" in the wizard: a
   // private repository read with the admin's own toolyard GitHub
   // connection (slice D turns it on).
@@ -80,6 +81,26 @@ function skillsGroupWarnings(warnings) {
 function skillsWebhookURL(src, origin) {
   return (origin || '') + (src.webhook_url_path || '/v1/skills/sources/' + encodeURIComponent(src.id) + '/webhook');
 }
+
+// skillsFirstSyncText says what a new source's first sync did, once its
+// first check is recorded (last_checked_at), or that it still runs.
+function skillsFirstSyncText(src) {
+  if (!src || !src.last_checked_at) return 'The first sync runs now. A large repository can take a minute; this updates by itself.';
+  if (src.last_error) return 'The first sync failed: ' + src.last_error + '. toolyard tries again on its next check; Sync now on the source page tries at once.';
+  if (src.pending_version_id) return 'First sync: the first version waits for review on the source page.';
+  if (src.active_sha) return 'First sync: commit ' + skillsShort(src.active_sha) + ' is live, with ' + skillsCount(src.skill_count, 'skill') + '.';
+  return 'First sync: no new commit to copy.';
+}
+
+// skillsVersionState is how the versions table shows a version: a staged
+// version other than the source's pending one was replaced (by a newer
+// commit or a settings change) and can no longer be approved.
+function skillsVersionState(src, v) {
+  if (v.status === 'staged' && v.id !== src.pending_version_id) return 'superseded';
+  return v.status;
+}
+
+function skillsSleep(ms) { return new Promise((resolve) => setTimeout(resolve, ms)); }
 
 // skillsRoute reads "skills" or "skills/<source id>" into skillsUI.openId.
 function skillsRoute(route) {
@@ -344,8 +365,40 @@ async function skillsWizardSave() {
     w.step = 'done';
     skillsUI.loaded = false;
     loadSkills();
+    if (w.result && w.result.source && !w.result.source.last_checked_at) skillsWatchWizard(w, w.result.source.id);
   } catch (e) { w.error = e.message; }
   w.busy = false; render();
+}
+
+// skillsWatchWizard polls a new source until its first check is recorded
+// (the first sync runs in the background), for at most three minutes.
+async function skillsWatchWizard(w, id) {
+  for (let i = 0; i < 90; i++) {
+    await skillsSleep(2000);
+    if (skillsUI.wizard !== w) return;
+    try {
+      const src = await api('/v1/skills/sources/' + encodeURIComponent(id));
+      if (skillsUI.wizard !== w) return;
+      w.result.source = src;
+      if (src.last_checked_at) { render(); skillsUI.loaded = false; loadSkills(); return; }
+    } catch (_) { /* try again on the next tick */ }
+  }
+}
+
+// skillsWatchSource reloads the open source page until its first check is
+// recorded, for at most three minutes.
+async function skillsWatchSource(id) {
+  if (skillsUI.watching[id]) return;
+  skillsUI.watching[id] = true;
+  try {
+    for (let i = 0; i < 90; i++) {
+      await skillsSleep(2000);
+      if (skillsUI.openId !== id) return;
+      await loadSkillSource(id);
+      const d = skillsUI.detail;
+      if (!d || !d.source || d.source.last_checked_at) return;
+    }
+  } finally { delete skillsUI.watching[id]; }
 }
 
 function openSkillsEdit(src) {
@@ -450,7 +503,10 @@ function renderSkillSource() {
   if (!d.source) return el('div', {}, back, el('div', { class: 'card err' }, d.error || 'Could not load this source.'));
   const src = d.source;
   const busy = !!d.busy || !!skillsUI.syncing[src.id];
-  const staged = d.versions.filter((v) => v.status === 'staged');
+  if (src.enabled && !src.last_checked_at) skillsWatchSource(src.id);
+  // Only the source's pending version can be approved; older staged ones
+  // show as superseded in the versions table.
+  const staged = d.versions.filter((v) => v.status === 'staged' && v.id === src.pending_version_id);
   const shown = d.versions.find((v) => v.id === src.pending_version_id) || d.versions.find((v) => v.status === 'active');
   return el('div', {}, back,
     el('div', { class: 'card' },
@@ -510,15 +566,19 @@ function renderSkillsVersions(src, versions, busy) {
           const diff = v.diff || {};
           const changes = v.status === 'failed' ? (v.error || 'failed')
             : '+' + (diff.added || []).length + ' ~' + (diff.changed || []).length + ' −' + (diff.removed || []).length;
+          const state = skillsVersionState(src, v);
           let action = null;
-          if (v.status === 'staged') action = el('span', { class: 'row' },
+          // A rejected version was never live: rolling back to it is not
+          // offered, nor is approving a superseded staged one.
+          if (state === 'staged') action = el('span', { class: 'row' },
             el('button', { disabled: busy, on: { click: () => activateSkillVersion(src, v, true) } }, 'Approve'),
             el('button', { disabled: busy, on: { click: () => rejectSkillVersion(src, v) } }, 'Reject'));
-          else if (v.status === 'retired' || v.status === 'rejected') action = el('button', { disabled: busy, title: 'Make this commit live again', on: { click: () => activateSkillVersion(src, v, false) } }, 'Activate');
-          else if (v.status === 'active') action = el('span', { class: 'meta' }, 'live');
+          else if (state === 'retired') action = el('button', { disabled: busy, title: 'Make this commit live again', on: { click: () => activateSkillVersion(src, v, false) } }, 'Activate');
+          else if (state === 'active') action = el('span', { class: 'meta' }, 'live');
+          else if (state === 'superseded') action = el('span', { class: 'meta', title: 'A newer commit or a change of the source settings replaced it' }, 'replaced');
           return el('tr', {},
             el('td', {}, el('a', { href: skillsCommitURL(src, v.sha), target: '_blank', rel: 'noopener' }, el('code', {}, skillsShort(v.sha)))),
-            el('td', {}, el('span', { class: 'badge ' + ({ active: 'allowed', staged: 'pending', failed: 'denied', rejected: 'denied', retired: 'expired' }[v.status] || '') }, v.status)),
+            el('td', {}, el('span', { class: 'badge ' + ({ active: 'allowed', staged: 'pending', failed: 'denied', rejected: 'denied', retired: 'expired', superseded: 'expired' }[state] || '') }, state)),
             el('td', {}, String(v.skill_count || 0)),
             el('td', { class: v.status === 'failed' ? 'err' : 'meta' }, changes),
             el('td', {}, String((v.warnings || []).length)),
@@ -636,7 +696,7 @@ function renderSkillsWizardRepo(w) {
   const branches = skillsWizardBranches(w);
   const many = (info.branches || []).length > 15;
   return el('div', {},
-    el('p', {}, el('a', { href: info.html_url || '#', target: '_blank', rel: 'noopener' }, info.owner + '/' + info.repo),
+    el('p', {}, el('a', { href: skillsRepoURL(info), target: '_blank', rel: 'noopener' }, info.owner + '/' + info.repo),
       info.private ? el('span', { class: 'badge pending', style: 'margin-left: 6px;' }, 'private') : null,
       info.trusted_owner ? el('span', { class: 'badge allowed', style: 'margin-left: 6px;' }, 'trusted owner') : null),
     many ? el('input', { id: 'skills-wiz-branch-filter', type: 'search', placeholder: 'Filter ' + info.branches.length + ' branches', value: w.branchFilter,
@@ -679,9 +739,8 @@ function renderSkillsWizardDone(w) {
   const r = w.result || {};
   const src = r.source || {};
   return el('div', {},
-    el('p', {}, el('b', {}, src.slug), ' was added.'),
-    r.sync ? el('p', {}, 'First sync: ' + skillsSyncSummary(r.sync)) : null,
-    r.sync_error ? el('p', { class: 'err' }, 'The first sync failed: ' + r.sync_error + '. toolyard tries again on its next check; Sync now on the source page tries at once.') : null,
+    el('p', {}, el('b', {}, src.slug), r.existing ? ' was already added a moment ago; this is that source.' : ' was added.'),
+    el('p', { class: src.last_error ? 'err' : '' }, skillsFirstSyncText(src)),
     el('p', { class: 'meta' }, 'Set up the webhook on the source page so pushes reach agents within seconds.'));
 }
 

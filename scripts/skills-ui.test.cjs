@@ -10,6 +10,8 @@ function harness(answers) {
   const requests = [];
   const context = vm.createContext({
     URLSearchParams, URL, console, Date, JSON, Number, Math, Set, Map,
+    // Timers never fire here: the first-sync polls wait forever.
+    setTimeout: () => 0,
     location: { origin: 'https://toolyard.example', search: '' },
     state: { user: { id: 'u_1', role: 'admin' } },
     requests, answers: answers || {},
@@ -148,7 +150,7 @@ test('the wizard walks inspect, preview and save, then forgets the token', async
   const h = harness({
     '/v1/skills/sources/inspect': { owner: 'acme', repo: 'skills', default_branch: 'main', branches: ['main'], private: true, trusted_owner: false },
     '/v1/skills/sources/preview': { sha: '0123456789abcdef', skill_count: 3, file_count: 9, warnings: [], sample: [], source: { owner: 'acme', repo: 'skills' } },
-    '/v1/skills/sources': { source: { id: 'src_9', slug: 'skills' }, sync: { sha: '0123456789abcdef', activated: true } },
+    '/v1/skills/sources': { source: { id: 'src_9', slug: 'skills', enabled: true }, status: 'syncing' },
     '/v1/skills/admin/sources': { sources: [] },
   });
   h.run(`openSkillsWizard(); skillsUI.wizard.url = 'acme/skills';`);
@@ -164,7 +166,33 @@ test('the wizard walks inspect, preview and save, then forgets the token', async
   const save = h.requests.find((r) => r.path === '/v1/skills/sources' && r.method === 'POST');
   assert.equal(save.body.token, 'read-only-token');
   assert.equal(save.body.mode, 'review');
-  assert.match(text(h.run('renderSkillsWizard()')), /First sync: Commit 0123456789ab is live\./);
+  // The first sync runs in the background; the wizard says so, then shows
+  // the result once the polled source has its first check.
+  assert.match(text(h.run('renderSkillsWizard()')), /The first sync runs now/);
+  h.run(`skillsUI.wizard.result.source = Object.assign({}, skillsUI.wizard.result.source,
+    { last_checked_at: '2026-10-25T09:00:00Z', active_sha: '0123456789abcdef', skill_count: 3 })`);
+  assert.match(text(h.run('renderSkillsWizard()')), /First sync: commit 0123456789ab is live, with 3 skills\./);
+});
+
+test('the first sync text covers review, errors and a retried create', () => {
+  const h = harness();
+  assert.match(h.run(`skillsFirstSyncText({ last_checked_at: 'x', pending_version_id: 'skv_1' })`), /waits for review/);
+  assert.match(h.run(`skillsFirstSyncText({ last_checked_at: 'x', last_error: 'GitHub said 404' })`), /failed: GitHub said 404/);
+  h.run(`skillsUI.wizard = skillsWizardNew(); skillsUI.wizard.step = 'done';
+    skillsUI.wizard.result = { existing: true, status: 'ok', source: { id: 'src_1', slug: 'team', last_checked_at: 'x', active_sha: 'abc' } };`);
+  assert.match(text(h.run('renderSkillsWizard()')), /already added a moment ago/);
+});
+
+test('the repository link is built from owner and repo, never the API URL', () => {
+  const h = harness();
+  h.run(`skillsUI.wizard = skillsWizardAfterInspect(skillsWizardNew(), { owner: 'acme', repo: 'skills', default_branch: 'main',
+    branches: ['main'], html_url: 'javascript:alert(1)' });`);
+  const view = h.run('renderSkillsWizardRepo(skillsUI.wizard)');
+  const links = [];
+  const walk = (n) => { if (n && typeof n === 'object') { if (n.tag === 'a') links.push(n.attrs.href); (n.children || []).forEach(walk); } };
+  walk(view);
+  assert.ok(links.includes('https://github.com/acme/skills'), JSON.stringify(links));
+  assert.ok(!links.some((l) => String(l).startsWith('javascript:')));
 });
 
 test('a private repository found at inspect asks for a token', async () => {
@@ -287,4 +315,33 @@ test('the sync summary says what happened', () => {
   assert.equal(h.run(`skillsSyncSummary({ unchanged: true, sha: '0123456789abcdef' })`), 'No new commit; 0123456789ab is current.');
   assert.equal(h.run(`skillsSyncSummary({ staged: true, sha: '0123456789abcdef' })`), 'Commit 0123456789ab waits for review.');
   assert.equal(h.run(`skillsSyncSummary({ error: 'GitHub is down' })`), 'Sync failed: GitHub is down');
+});
+
+test('only the pending version can be approved; rejected versions are not offered for rollback', () => {
+  const h = harness();
+  h.context.s = Object.assign({}, source1, { pending_version_id: 'skv_new' });
+  h.run(`skillsUI.loaded = true; skillsUI.openId = 'src_1'; skillsUI.detail = { id: 'src_1', source: s, busy: '', secret: null, error: '',
+    versions: [
+      { id: 'skv_new', sha: 'eeeeeeeeeeeeeeee', status: 'staged', skill_count: 3, warnings: [], diff: { added: ['a'] }, created_at: '2026-10-25T10:00:00Z' },
+      { id: 'skv_old', sha: 'dddddddddddddddd', status: 'staged', skill_count: 3, warnings: [], diff: { added: ['b'] }, created_at: '2026-10-25T09:00:00Z' },
+      { id: 'skv_rej', sha: 'bbbbbbbbbbbbbbbb', status: 'rejected', skill_count: 3, warnings: [], created_at: '2026-10-24T09:00:00Z' },
+    ], skills: [] };`);
+  const versions = h.run(`renderSkillsVersions(s, skillsUI.detail.versions, false)`);
+  const rows = [];
+  const walk = (n) => { if (n && typeof n === 'object') { if (n.tag === 'tr') rows.push(n); (n.children || []).forEach(walk); } };
+  walk(versions);
+  const byCommit = (sha) => text(rows.find((r) => text(r).includes(sha.slice(0, 12))));
+  assert.match(byCommit('eeeeeeeeeeee'), /Approve/);
+  assert.doesNotMatch(byCommit('dddddddddddd'), /Approve|Reject/);
+  assert.match(byCommit('dddddddddddd'), /superseded/);
+  assert.doesNotMatch(byCommit('bbbbbbbbbbbb'), /Activate/);
+  const review = text(h.run('viewSkills()'));
+  assert.match(review, /Waiting for review/);
+  assert.match(review, /eeeeeeeeeeee/);
+  // The review card lists only the pending version.
+  const card = [];
+  const find = (n) => { if (n && typeof n === 'object') { if (n.attrs && n.attrs.class === 'card skills-review') card.push(n); (n.children || []).forEach(find); } };
+  find(h.run('viewSkills()'));
+  assert.equal(card.length, 1);
+  assert.doesNotMatch(text(card[0]), /dddddddddddd/);
 });

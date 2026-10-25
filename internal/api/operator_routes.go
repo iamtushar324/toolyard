@@ -508,6 +508,7 @@ var operatorCatalog = []operatorCatalogEntry{
 	{"/v1/skills/grep", "GET", "agent: skills.grep ?pattern=, source, path, ignore_case, limit, include_host (agent or session token; never via operator token)"},
 	{"/v1/skills/sources", "GET", "agent: skills.sources, the skill sources the caller sees (agent or session token)"},
 	{"/v1/skills/list", "GET", "agent: skills.list ?cursor=, limit, source, include_host (agent or session token; never via operator token)"},
+	{"/v1/skills/proposal", "GET", "agent: skills.proposal ?id=, one of the calling agent's skill proposals (agent or session token; never via operator token)"},
 	{"/v1/skills/bundle", "POST", "agent: skills.bundle {skills, reason} -> a single-use download URL for a .tar.gz (agent or session token; never via operator token)"},
 	{"/v1/skills/bundle/{id}", "GET", "download a skills bundle (.tar.gz): the single-use ticket in the path is the credential, for 10 minutes (no token; never via operator token)"},
 	{"/v1/approvals", "GET", "approval queue"},

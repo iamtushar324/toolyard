@@ -57,8 +57,11 @@ Open **Skills** in the dashboard and choose **Add source**:
 4. **Preview** is a dry run: the commit, how many skills and files it found,
    the warnings grouped by kind, and some of the skills. Nothing is stored.
 5. Choose the update mode, who sees the source, and where its skills run by
-   default, then **Save**. toolyard adds the source and runs its first sync
-   at once; the dialog shows what the sync did.
+   default, then **Save**. toolyard adds the source at once and starts its
+   first sync in the background (a large repository can take a minute);
+   the dialog follows it and shows what the sync did. Saving the same
+   repository, branch and folder again within two minutes (a retry, a
+   double click) returns the source already made instead of a second one.
 
 ### Update modes and review
 
@@ -69,16 +72,22 @@ Open **Skills** in the dashboard and choose **Add source**:
   This is the default for every other owner. The person who added the
   source gets one Inbox question, "Make this version live?", with the
   skills added, changed and removed, a link to the commit on GitHub and the
-  number of warnings. **Approve** makes the version live; **Reject** (or a
-  deny) keeps the live version, and the next commit asks again. The same
-  version also shows **Approve** and **Reject** on the source page; a
-  decision in either place closes the other. Only the newest staged commit
-  waits: a newer commit closes the older question. Only an admin can make a
+  number of warnings; when that person is no longer an admin (or is
+  blocked), the owner gets it instead. **Approve** makes the version live;
+  **Reject** (or a deny) keeps the live version, and the next commit asks
+  again. The same version also shows **Approve** and **Reject** on the
+  source page; a decision in either place closes the other. Only the
+  newest staged commit waits: a newer commit, or a change of the source's
+  mode, branch, folder or pinned commit, closes the older question, and an
+  answer to a question whose version no longer waits is refused (it never
+  rolls back a newer live commit; the item says why). Older staged commits
+  show as *superseded* on the source page. Only an admin can make a
   version live, so a person who lost the role since cannot.
 - **Pinned**: toolyard serves one commit and ignores new ones.
 
 The source page lists the last versions. **Activate** on an older version
-rolls back to it at once.
+that was live rolls back to it at once; a rejected version is never
+offered.
 
 ### Who sees a source, and where skills run
 
@@ -113,15 +122,19 @@ signature gets `401`. Bodies are capped at 5 MiB.
 
 ### Agents propose sources
 
-An agent can ask for a source with `skills.propose_source` (a URL, branch,
-folder and its reason). toolyard previews the source and puts one question
-in the Inbox of the agent's owner, with the repository, branch, folder,
-counts, warnings and the agent's reason. **Approve** adds the source (mode
-by the trusted-owner rule) and runs its first sync; **Reject** adds nothing.
-The agent polls the outcome with the proposal ID. Only an agent whose owner
-is an admin can propose, a proposal never carries a token (add a private
-repository yourself on the Skills page), and one agent may have at most
-five proposals waiting.
+An agent can ask for a source with `skills.propose_source` (a URL, branch
+and folder, and its reason; nothing else of the agent's input counts: the
+mode, visibility and the rest are your defaults). toolyard previews the
+source and puts one question in the Inbox of the agent's owner, with the
+repository, branch, folder, counts, warnings and the agent's reason.
+**Approve** adds the source (mode by the trusted-owner rule) and starts its
+first sync in the background; **Reject** adds nothing. The agent polls the
+outcome with `skills.proposal` (`GET /v1/skills/proposal?id=`). Only an
+agent whose owner is an admin can propose, a proposal never carries a token
+(add a private repository yourself on the Skills page), one agent may have
+at most five proposals waiting, and at most ten proposals an hour (each is
+a dry run against GitHub). A proposal whose question expires (after 7
+days) or is withdrawn stops counting as waiting.
 
 ### Admin REST
 
@@ -136,8 +149,8 @@ secret). Errors are `{"error", "code"}` with the codes `invalid` (400),
 | `POST /v1/skills/sources/inspect` | `{url, token?}`: owner, repo, private, default branch, branches, the branch and folder in the URL, `trusted_owner` |
 | `POST /v1/skills/sources/preview` | a source (as for create): dry run with commit, counts, warnings, sample |
 | `GET /v1/skills/admin/sources` | every source with its status (the agent list is `GET /v1/skills/sources`) |
-| `POST /v1/skills/sources` | create `{url, branch?, path?, exclude?, mode?, pinned_sha?, auth?, token?, poll_seconds?, enabled?, visibility?, members?, default_runs?}`; `201 {source, sync}` after the first sync |
-| `GET`, `PATCH`, `DELETE /v1/skills/sources/{id}` | read, change (only the fields sent; `token` replaces, `clear_token` removes) or delete a source |
+| `POST /v1/skills/sources` | create `{url, branch?, path?, exclude?, mode?, pinned_sha?, auth?, token?, poll_seconds?, enabled?, visibility?, members?, default_runs?}`; `201 {source, status: "syncing"}` at once, the first sync running in the background (poll `GET /v1/skills/sources/{id}` until `last_checked_at` is set); the same create by the same person within two minutes answers `200 {source, existing: true}` |
+| `GET`, `PATCH`, `DELETE /v1/skills/sources/{id}` | read, change (only the fields sent; `token` replaces, `clear_token` removes) or delete a source; a change of mode, branch, folder or pinned commit, and a delete, close the open review question |
 | `POST /v1/skills/sources/{id}/sync` | sync now |
 | `GET /v1/skills/sources/{id}/versions?limit=` | the last versions (default 20, at most 100) |
 | `POST /v1/skills/sources/{id}/versions/{vid}/activate` | make a version live (approve or roll back) |
@@ -161,11 +174,21 @@ Review questions and source proposals are Inbox *system items*: questions
 that toolyard itself raises (`internal/inbox/system.go`). A review question
 comes from the sender "toolyard" and goes only to the person who added the
 source; a proposal comes from the proposing agent and goes to its owner.
-When the answer is recorded, toolyard applies it at once and adds the
-outcome ("Version … is live.", or why it could not) to the item's timeline.
-If toolyard stops between the two, the decision stays recorded: a proposal
-is applied when the agent next polls it, and a staged version keeps its
-**Approve** and **Reject** buttons on the source page.
+In the Inbox both carry a **toolyard** badge, which only toolyard can set:
+an agent that calls itself "toolyard" gets none. When the answer is
+recorded, toolyard applies it at once and adds the outcome ("Version … is
+live.", or why it could not) to the item's timeline.
+
+The Inbox runs no handler for an item that expires or is withdrawn, and a
+decision can land while no handler runs (a replica stopped in between). A
+sweep settles both, every minute on one replica (the `skills-inbox-sweep`
+leader loop): it applies a recorded decision that was not applied yet,
+closes the proposals and reviews whose items expired or were withdrawn,
+and closes an open review whose version no longer waits. An agent's next
+proposal and its `skills.proposal` poll settle its own proposals too. A
+version that still waits after its question expired (7 days) gets a new
+question at the source's next check; while a question is open, or its
+answer is being applied, the checks add nothing.
 
 ## For agents
 
@@ -210,7 +233,8 @@ mode they are `toolyard.skills_<name>` (Starlark) and
 | `skills.grep` | `pattern` (RE2), `source`, `path` (glob), `ignore_case`, `limit` (50, at most 200), `include_host` | matching lines with their file URI, skill and line number |
 | `skills.sources` | none | the sources you see, with the commit each serves |
 | `skills.list` | `cursor`, `limit` (100, at most 500), `source`, `include_host` | a page of skills as MCP `skills/list` entries, plus `next_cursor` |
-| `skills.propose_source` | `url`, `branch`, `path`, `reason` | a pending proposal: an Inbox item for your owner; nothing is added before they approve |
+| `skills.propose_source` | `url`, `branch`, `path`, `reason` | a pending proposal: an Inbox item for your owner; nothing is added before they approve (at most five waiting, ten an hour) |
+| `skills.proposal` | `id` | one of your proposals: `pending`, `approved`, `done` (with `result`, the new source's id), `rejected` or `failed` (with `error`); poll this instead of proposing again |
 | `skills.propose_change` | `skill`, `files` (path → new content, `""` deletes), `title`, `summary` | a pending proposal against the version you see; after the source owner's approval toolyard opens a pull request |
 | `skills.bundle` | `skills` (1 to 50) | a `.tar.gz` download URL: one use, 10 minutes, no token needed |
 
@@ -243,6 +267,7 @@ the tool call, and the body is the tool's structured answer.
 | `GET /v1/skills/grep?pattern=&source=&path=&ignore_case=&limit=&include_host=` | `skills.grep` |
 | `GET /v1/skills/sources` | `skills.sources` |
 | `GET /v1/skills/list?cursor=&limit=&source=&include_host=` | `skills.list` |
+| `GET /v1/skills/proposal?id=` | `skills.proposal` |
 | `POST /v1/skills/bundle` `{"skills": [...], "reason": "..."}` | `skills.bundle` |
 | `GET /v1/skills/bundle/{ticket}` | the `.tar.gz` (no token: the ticket is the credential) |
 
@@ -488,9 +513,12 @@ details):
   the skills tools off for one agent (its deny list) or for everyone (an
   explicit deny policy).
 - **Proposals.** Only an agent whose owner is an admin may propose a
-  source, a proposal never carries a token, one agent may have at most
-  five waiting, and nothing is added before the owner approves. Agents
-  cannot raise toolyard's own Inbox questions (system items).
+  source, a proposal never carries a token and keeps only the URL, branch
+  and folder of the agent's input, one agent may have at most five waiting
+  and ten an hour, and nothing is added before the owner approves. Agents
+  cannot raise toolyard's own Inbox questions (system items), and only
+  those carry the Inbox's toolyard badge. Text from a repository or an
+  agent cannot break out of its line in an item toolyard sends.
 - **Bundle downloads.** The ticket in the URL is 256 random bits, works
   once, for 10 minutes, and is stored only as its SHA-256; a caller holds
   at most 20 live tickets, visibility is checked again at download, and
