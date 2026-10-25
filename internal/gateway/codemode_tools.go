@@ -437,18 +437,13 @@ func (c codeModeCaller) RouteCall(ctx context.Context, via, target string, args 
 	return c.g.RouteCall(withinCodeMode(ctx), via, target, args)
 }
 
-type withinCodeModeKey struct{}
-
-// withinCodeMode marks ctx as a code-mode script's nested call.
-func withinCodeMode(ctx context.Context) context.Context {
-	return context.WithValue(ctx, withinCodeModeKey{}, true)
-}
+// withinCodeMode marks ctx as a code-mode script's nested call
+// (codemode.WithinScript: work that moves to a context of its own keeps
+// the mark with codemode.CarryScriptMark).
+func withinCodeMode(ctx context.Context) context.Context { return codemode.WithinScript(ctx) }
 
 // isWithinCodeMode reports a context withinCodeMode marked.
-func isWithinCodeMode(ctx context.Context) bool {
-	v, _ := ctx.Value(withinCodeModeKey{}).(bool)
-	return v
-}
+func isWithinCodeMode(ctx context.Context) bool { return codemode.IsWithinScript(ctx) }
 
 // refuseNestedCodeMode answers a code-mode tool called from inside a
 // script, at any depth, with a refusal (nil otherwise): a nested script

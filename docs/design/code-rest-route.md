@@ -118,14 +118,18 @@ Every run route answers this JSON:
   `timeout`, `limit`, `script_diverged`, `grant_invalid`, `busy`,
   `outcome_unknown`, `internal`, and `interrupted` (the server stopped:
   a `queued` run is `failed` with it, a `running` one `outcome_unknown`).
-- `calls`: the calls of the latest execution (a resume runs the script
-  again), in order: the call ledger, with `ms` the call's duration (0 until
-  it finished). A JavaScript script, or a Starlark `try_call` or `parallel`,
-  can carry on past a failed or held call; the call keeps its status here
-  and the run ends `succeeded` when the script does. A call made in parallel
-  is numbered in the order the script started it. A resume replays by that
-  number, so a script whose parallel calls start in another order the second
-  time is `script_diverged`.
+- `calls`: every call the run made, by its number, in order: the call
+  ledger, with `ms` the call's duration (0 until it finished). Each number
+  shows its latest record: a resume runs the script again and updates the
+  calls it reaches; a call it did not reach keeps the record of the
+  execution that made it, and a call that never reached the gateway (its
+  check refused it) does not replace the record of a call that ran at its
+  number. A JavaScript script, or a Starlark `try_call` or `parallel`, can
+  carry on past a failed or held call; the call keeps its status here and
+  the run ends `succeeded` when the script does. A call made in parallel is
+  numbered in the order the script started it. A resume checks calls by
+  that number, so a script whose parallel calls start in another order the
+  second time is `script_diverged`.
 - The run id is also the `run_id` of every audit row of the run: the
   `code.run` and `code.resume` rows and every nested call's.
 - `calls[].status`: `succeeded`, `failed`, `permission_required`,
@@ -174,34 +178,62 @@ owner decided.
   server reads its grants for this agent and adds `_grant` to each matching
   call (same tool, parameters within the grant).
 - For a `deferred` legacy approval, no body is needed (an empty body or
-  `{}`): the held call resumes with its `approval_id`.
+  `{}`): the held call resumes with its `approval_id`. It does so also when
+  a `request_id` is given (whose grants then serve the other calls): a
+  grant would run the tool a second time beside the approval's own
+  execution.
 - A `permission_required` run needs `request_id` (`400` without it), and the
   request must belong to the agent (`400` otherwise). A call no unused grant
   of the request covers is sent without one, so it is held again (`403`).
 
-The script runs again from the top. Every recorded call other than the held
-one is checked against the call record, wherever it sits: with
-`tools.parallel`, a call left un-awaited, or a held call the script caught,
-calls numbered after the held one may have run too.
+The script runs again from the top, and each call is checked against the
+call record at its number, wherever it sits: with `tools.parallel`, a call
+left un-awaited, or a held call the script caught, calls numbered after
+the held one may have run too. The record keeps every call the run ever
+made; the highest number among them is the run's mark.
 
 - A different tool or different arguments: `failed` with `script_diverged`,
   and nothing more runs.
+- No record at a number at or below the mark: the script took another path,
+  so `failed` with `script_diverged`.
 - A recorded call that `succeeded`: answered from the record
   (`replayed: true`), never sent again.
 - A recorded call with an unknown outcome: the resume stops with
   `outcome_unknown`. Nothing is repeated blindly.
-- A recorded call that was held and caught (`permission_required` or
-  `deferred`, through `try_call` or `tools.tryCall`), or that `failed`: it
-  did not take effect. It is sent again, with a grant when one of the
-  request's grants covers it.
-- The held call is sent with the request's grant (or the legacy
-  `approval_id`).
-- A call past every recorded call is new, and is sent. Inbox status reads
-(`toolyard.inbox_status`, `toolyard.inbox_wait`) are sent again instead of
-replayed, because their answers can carry grant tokens. The same
-`Prefer: wait` and HTTP mapping apply. A recorded answer that held a grant
-token is stored redacted, so it cannot be replayed with the same value: the
-resume stops with `script_diverged` instead.
+- A recorded call that `failed` after it reached the gateway: the script
+  gets the same failure again (`replayed: true`; the same text, and the same
+  error kind should it not catch it), never a second attempt, since an
+  upstream error may come after a write took effect. A call that failed
+  without reaching the gateway (the script or its clock stopped first) is
+  sent.
+- A recorded call that was held and caught as `permission_required`: sent
+  again only with a grant of the request that covers it; otherwise the
+  script gets the same hold again (`replayed: true`), so it takes the same
+  path as before.
+- A recorded call that was caught as `deferred` (a legacy approval): asked
+  again with its own `approval_id`, which answers the approval's state or
+  result and never makes a second approval.
+- The held call is sent with the request's grant, or a deferred one with its
+  `approval_id`.
+- A call past the mark is new, and is sent.
+
+A call that is sent waits until every call numbered before it (up to the
+mark) has passed its check in this execution, and is not sent if one of them
+did not: when an Inbox read answers differently, say, the script's calls
+shift, and no call on the new path reaches the gateway, not even one started
+beside the calls that diverged. Inbox status reads (`toolyard.inbox_status`,
+`toolyard.inbox_wait`) are sent again instead of replayed, because their
+answers can carry grant tokens. The same `Prefer: wait` and HTTP mapping
+apply. A recorded answer that held a grant token is stored redacted, so it
+cannot be replayed with the same value: the resume stops with
+`script_diverged` instead.
+
+A run held while another of its calls was still running (a call the script
+started beside the held one, unfinished when the script ended) is
+`outcome_unknown`, not held: that call's outcome is unknown, and a resume
+would refuse to repeat it. A tool result over the per-call limit (6 MiB)
+is a `failed` call with kind `limit`, and a resume gives the script that
+failure again.
 
 Grant tokens (`tyg_…`) never rest in plain text: the call record, the
 result, the logs and the held call are stored with each token replaced by
@@ -259,8 +291,9 @@ The MCP code-mode limits apply: 5 minutes wall clock, 100 tool calls, 1 MiB
 output per run, 4 concurrent scripts per server and 3 per agent
 (`-codemode-max-concurrent`, `-codemode-max-per-agent`). A start past either
 cap waits up to 30 seconds (`-codemode-queue-wait`) in a fair queue, then is
-`429` with `Retry-After`
-and creates no run. Runs and their call records
+`429` with `Retry-After` and creates no run. The queue holds at most twice
+the per-agent cap for one agent, and four times the global cap (16 at
+least) in all; a start past that is `429` at once. Runs and their call records
 are kept 7 days from their start (an hourly sweep deletes older ones). A run
 that is `running` when the server stops is `outcome_unknown` after the
 restart; one still `queued` is `failed` (nothing ran). Both carry the error
@@ -273,5 +306,9 @@ kind `interrupted`.
 fingerprint of the script and reason it was used with, the script (so a
 resume can run it again), and the outcome. `code_run_calls` holds one row
 per call: the tool, a SHA-256 of the canonical JSON of the script's own
-arguments (never a grant token), the call status, and the value the script
-received, which a resume hands back instead of sending the call again.
+arguments (never a grant token; numbers keep their exact digits), the call
+status, whether it reached the gateway, and what the script received: the
+value of a succeeded call, the error kind and text of a failed one, and the
+text, structured content (the Inbox draft, up to 1 MiB) and legacy approval
+id of a held one. A resume hands these back instead of sending the call
+again.

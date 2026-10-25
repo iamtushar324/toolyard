@@ -7,6 +7,7 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
 )
 
 // fixture is a catalog of 60+ tools shaped like production's: several
@@ -419,5 +420,73 @@ func TestIndexCacheKeyCoversOutputSchema(t *testing.T) {
 	res := search(t, e, b, Query{Text: "create a linear issue", Limit: 1})
 	if res.Hits[0].Tool.OutputSchema == nil {
 		t.Fatal("the hit carries the old output schema")
+	}
+}
+
+// TestRegexWorkIsBoundedBeforeItRuns (B2 P2-1): a pattern whose program
+// times the catalog's text passes the work budget is refused before any
+// matching; each text is matched on its first 4 KiB; a search stops when
+// its context ends; one caller runs at most two searches at once.
+func TestRegexWorkIsBoundedBeforeItRuns(t *testing.T) {
+	e := New(Options{})
+	ctx := context.Background()
+	long := strings.Repeat("lorem ipsum ", 400) // 4800 bytes, matched on 4 KiB
+	big := make([]Tool, 2000)
+	for i := range big {
+		big[i] = Tool{Name: fmt.Sprintf("srv.tool_%d", i), Server: "srv", Description: long}
+	}
+	var qe *QueryError
+	if _, err := e.Search(ctx, big, Query{Mode: ModeRegex, Text: `(abcdefghij){50}`}); !errors.As(err, &qe) || !strings.Contains(err.Error(), "too complex") {
+		t.Fatalf("a complex pattern over 8 MB of text: %v", err)
+	}
+	small := big[:200]
+	if res := search(t, e, small, Query{Mode: ModeRegex, Text: `tool_19\b`}); len(res.Hits) != 1 {
+		t.Fatalf("a simple pattern: %v", names(res.Hits))
+	}
+	capped := []Tool{
+		{Name: "srv.late", Server: "srv", Description: strings.Repeat("a", 5000) + " needle"},
+		{Name: "srv.early", Server: "srv", Description: "a needle " + strings.Repeat("a", 5000)},
+	}
+	if res := search(t, e, capped, Query{Mode: ModeRegex, Text: "needle"}); !reflect.DeepEqual(names(res.Hits), []string{"srv.early"}) {
+		t.Fatalf("matched past 4 KiB: %v", names(res.Hits))
+	}
+	cctx, cancel := context.WithCancel(ctx)
+	cancel()
+	if _, err := e.Search(cctx, small, Query{Mode: ModeRegex, Text: "tool"}); !errors.Is(err, context.Canceled) {
+		t.Fatalf("a cancelled search: %v", err)
+	}
+
+	e.wait = 50 * time.Millisecond
+	rel1, err := e.enter(ctx, "ag_a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rel2, err := e.enter(ctx, "ag_a")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.Search(ctx, small, Query{Text: "tool", Caller: "ag_a"}); !errors.As(err, &qe) || !strings.Contains(err.Error(), "already runs 2 searches") {
+		t.Fatalf("a third search of one caller: %v", err)
+	}
+	if _, err := e.Search(ctx, small, Query{Text: "tool", Caller: "ag_b"}); err != nil {
+		t.Fatalf("another caller: %v", err)
+	}
+	// A third search waits for one to finish.
+	e.wait = 5 * time.Second
+	done := make(chan error, 1)
+	go func() {
+		_, err := e.Search(ctx, small, Query{Text: "tool", Caller: "ag_a"})
+		done <- err
+	}()
+	time.Sleep(50 * time.Millisecond)
+	rel1()
+	if err := <-done; err != nil {
+		t.Fatalf("a search that waited for a slot: %v", err)
+	}
+	rel2()
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if len(e.running) != 0 {
+		t.Fatalf("running left behind: %v", e.running)
 	}
 }

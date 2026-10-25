@@ -68,7 +68,12 @@ Not available: `setTimeout`, `fetch`, files, modules from disk and the
 environment. A promise that nothing settles ends the program with an error.
 An unhandled rejection ends it too, as in Node.js. A thrown error is
 reported with its stack, using the program's own line numbers. Unbounded
-recursion is a `RangeError`.
+recursion is a `RangeError` you can catch. Recursion inside the engine's own
+code, such as `JSON.parse` of data nested many thousands of levels deep,
+can instead reach the WebAssembly call-frame limit below QuickJS's own
+check: the engine then stops at once with an error that no `try`/`catch`
+sees ("nested deeper than the JavaScript engine's call stack allows", kind
+`limit`). Flatten such data, or use a loop instead of recursion.
 
 The engine is QuickJS's `qjs` command. Its host modules `qjs:std`, `qjs:os`
 and `qjs:bjson` are not globals, but `await import("qjs:os")` still loads
@@ -146,14 +151,18 @@ every audit row of the run: the outer call's and every nested call's
 |---|---|
 | `query` | Words (keyword) or a pattern (regex). Empty lists every tool by name. |
 | `mode` | `keyword` (default): BM25 ranking over tool names (split at dots, underscores, dashes and camelCase), descriptions, parameter names and parameter descriptions, with the name weighted most. `regex`: an RE2 pattern of at most 200 characters, case-insensitive unless the pattern says `(?-i)`. `auto`: keyword. `semantic`: an error unless the operator configured semantic search (not available today). |
-| `detail` | `summary`: `name`, `upstream`, `description`, `code` (the name to call it by), `score`. `name`: the name only. `full`: also `input_schema` and `output_schema`. The default is `full` for the MCP tool `tools.search` (its answer has always carried the input schemas) and `summary` for scripts and `GET /v1/code/search`. |
+| `detail` | `summary`: `name`, `upstream`, `description`, `code` (the name to call it by), `score`. `name`: the name only. `full`: also `input_schema` and `output_schema`. The default is `full` for an agent's own call of the MCP tool `tools.search` (its answer has always carried the input schemas) and `summary` inside a script (JavaScript and Starlark, also through `tools.execute`) and for `GET /v1/code/search`. |
 | `limit` | 50 by default, 200 at most. |
 | `upstream` | Only one server's tools. |
 
 A keyword query is at most 1,000 characters, and only its first 32
 distinct words count. A regex may repeat something at most `{100}` times and
-compile to at most 5,000 instructions, and one regex search stops after
-250 ms.
+compile to at most 5,000 instructions. It is matched against the first
+4 KiB of each text (a name, a description, a parameter's), a pattern whose
+instructions times the bytes of text to scan pass a fixed budget is
+refused before it runs (make it simpler, or use `keyword`), and one regex
+search stops after 250 ms. One agent runs at most 2 searches at once; a
+third waits up to 2 seconds for one of them to finish, then is refused.
 
 ## Limits
 
@@ -169,4 +178,6 @@ either cap waits in one fair queue, for up to 30 seconds
 earliest waiter whose agent is under its own cap, so one agent's backlog
 never holds another agent up. After the wait the program is refused as
 busy: `executeToolCode` says so, and `POST /v1/code/run` answers 429 with
-`Retry-After`.
+`Retry-After`. The queue is bounded: one agent may have twice its own cap
+waiting, and all agents together four times the global cap (16 at least);
+a program past that is refused as busy at once.

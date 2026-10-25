@@ -202,6 +202,21 @@ func TestToolsSearchModes(t *testing.T) {
 	refused(map[string]any{"query": strings.Repeat("a", 201), "mode": "regex"}, "at most 200")
 	refused(map[string]any{"query": "(", "mode": "regex"}, "not a valid RE2")
 	refused(map[string]any{"query": "x", "detail": "everything"}, "unknown detail")
+
+	// Inside a script the default is summary (B2 P2-2): a direct call
+	// marked as a script's, and a Starlark script's toolyard.tools_search.
+	res := route(t, gw, withinCodeMode(ctx), MetaSearchTool, map[string]any{"query": "save issue t3code", ReasonField: outerReason})
+	if res.IsError {
+		t.Fatalf("tools.search inside a script: %s", textOf(res))
+	}
+	if first := structured(t, res)["results"].([]any)[0].(map[string]any); first["input_schema"] != nil || first["name"] != "LinearForT3Code.save_issue" {
+		t.Fatalf("default inside a script: %v", first)
+	}
+	res = route(t, gw, ctx, CodeModeExecuteToolCode, map[string]any{"code": `r = toolyard.tools_search(query="save issue t3code", limit=1)
+result = r`})
+	if text := textOf(res); res.IsError || !strings.Contains(text, "LinearForT3Code.save_issue") || strings.Contains(text, "input_schema") {
+		t.Fatalf("Starlark tools_search default:\n%s", text)
+	}
 }
 
 // TestCodeModeCannotNestAtAnyDepth (review P1-2): a script reaches the

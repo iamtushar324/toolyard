@@ -415,7 +415,10 @@ func TestResumeRefusesADivergedScript(t *testing.T) {
 	if done.Status != codemode.StatusFailed || done.ErrorKind != codemode.ErrorScriptDiverged {
 		t.Fatalf("resumed = %+v", done)
 	}
-	if !reflect.DeepEqual(callStatuses(done), []string{"failed"}) {
+	// The refused call never reached the gateway, so it does not replace
+	// the record of the call that ran at its place; the held call keeps
+	// its record too.
+	if !reflect.DeepEqual(callStatuses(done), []string{"succeeded", "permission_required"}) {
 		t.Fatalf("calls = %v", callStatuses(done))
 	}
 	if len(e.f.sent("demo.read")) != 1 || len(e.f.sent("demo.write")) != 1 {

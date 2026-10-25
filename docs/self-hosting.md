@@ -295,7 +295,13 @@ many scripts run at once:
 A script past either cap waits in one fair queue for up to
 `-codemode-queue-wait`. A freed slot
 goes to the earliest waiter whose agent is under its own cap. After the
-wait the script is refused as busy (HTTP 429 over REST). Every audit row of
+wait the script is refused as busy (HTTP 429 over REST). The queue holds at
+most twice `-codemode-max-per-agent` for one agent and four times
+`-codemode-max-concurrent` (16 at least) in all; a script past that is
+refused as busy at once. Migration 0052 adds the columns a REST run's call
+records need to answer a resume (whether a call reached the gateway, a
+failed call's error, a held call's text, draft and legacy approval id); it
+only adds columns. Every audit row of
 a script, the outer call's and each nested call's, carries the run's id in
 `audit_events.run_id`: `GET /v1/audit?run_id=…` and the audit export
 (`run_id` filter and CSV column) show one script's rows. Migration 0050 adds

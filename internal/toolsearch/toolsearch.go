@@ -30,6 +30,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"time"
 	"unicode/utf8"
 )
 
@@ -112,6 +113,12 @@ const (
 	// indexCacheSize is how many keyword indexes (one per distinct
 	// catalog) the engine keeps.
 	indexCacheSize = 32
+	// MaxSearchesPerCaller caps the searches one caller (Query.Caller) runs
+	// at once. One more waits up to searchWait for one of them to finish
+	// (a script's tools.parallel of a few searches still works), then is
+	// refused.
+	MaxSearchesPerCaller = 2
+	searchWait           = 2 * time.Second
 )
 
 // ErrSemanticOff answers a semantic search on a server without a
@@ -134,6 +141,9 @@ type Query struct {
 	Limit int
 	// Server keeps only the tools of one server ("" keeps all).
 	Server string
+	// Caller names who searches (an agent id), for the per-caller cap on
+	// searches at once; "" is not capped.
+	Caller string
 }
 
 // Hit is one ranked tool.
@@ -171,11 +181,23 @@ type Engine struct {
 	mu      sync.Mutex
 	indexes map[string]*index
 	order   []string // index keys, oldest first
+	// running holds each caller's search slots while it has searches
+	// running or waiting.
+	running map[string]*callerSlots
+	// wait is how long a search past the per-caller cap waits (tests).
+	wait time.Duration
+}
+
+// callerSlots are one caller's search slots and how many searches use or
+// wait for them.
+type callerSlots struct {
+	slots chan struct{}
+	users int
 }
 
 // New returns an Engine.
 func New(opts Options) *Engine {
-	return &Engine{semantic: opts.Semantic, indexes: map[string]*index{}}
+	return &Engine{semantic: opts.Semantic, indexes: map[string]*index{}, running: map[string]*callerSlots{}, wait: searchWait}
 }
 
 // SemanticEnabled reports whether mode semantic can run.
@@ -183,6 +205,13 @@ func (e *Engine) SemanticEnabled() bool { return e != nil && e.semantic != nil }
 
 // Search ranks tools for q.
 func (e *Engine) Search(ctx context.Context, tools []Tool, q Query) (*Result, error) {
+	if q.Caller != "" {
+		release, err := e.enter(ctx, q.Caller)
+		if err != nil {
+			return nil, err
+		}
+		defer release()
+	}
 	mode := q.Mode
 	if mode == "" {
 		mode = ModeKeyword
@@ -219,7 +248,7 @@ func (e *Engine) Search(ctx context.Context, tools []Tool, q Query) (*Result, er
 	case text == "":
 		hits = byName(tools)
 	case mode == ModeRegex:
-		hits, err = regexSearch(tools, q.Text)
+		hits, err = regexSearch(ctx, tools, q.Text)
 	case mode == ModeSemantic:
 		hits, err = e.semantic.Rank(ctx, tools, text)
 	default: // keyword, auto
@@ -236,6 +265,45 @@ func (e *Engine) Search(ctx context.Context, tools []Tool, q Query) (*Result, er
 		res.Hits = res.Hits[:limit]
 	}
 	return res, nil
+}
+
+// enter takes one of caller's search slots, waiting up to e.wait when the
+// caller already runs MaxSearchesPerCaller; the returned func gives it
+// back.
+func (e *Engine) enter(ctx context.Context, caller string) (func(), error) {
+	e.mu.Lock()
+	cs := e.running[caller]
+	if cs == nil {
+		cs = &callerSlots{slots: make(chan struct{}, MaxSearchesPerCaller)}
+		e.running[caller] = cs
+	}
+	cs.users++
+	wait := e.wait
+	e.mu.Unlock()
+	leave := func() {
+		e.mu.Lock()
+		defer e.mu.Unlock()
+		if cs.users--; cs.users == 0 {
+			delete(e.running, caller)
+		}
+	}
+	select {
+	case cs.slots <- struct{}{}:
+		return func() { <-cs.slots; leave() }, nil
+	default:
+	}
+	t := time.NewTimer(wait)
+	defer t.Stop()
+	select {
+	case cs.slots <- struct{}{}:
+		return func() { <-cs.slots; leave() }, nil
+	case <-ctx.Done():
+		leave()
+		return nil, ctx.Err()
+	case <-t.C:
+		leave()
+		return nil, &QueryError{Message: fmt.Sprintf("this caller already runs %d searches at once, the limit, and none finished within %s; search again in a moment", MaxSearchesPerCaller, wait)}
+	}
 }
 
 // byName is every tool, sorted by name, unscored.

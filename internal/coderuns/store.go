@@ -109,7 +109,8 @@ func (s *Service) loadRun(ctx context.Context, agentID, id string, withCode bool
 
 // loadCalls reads a run's call records in order.
 func (s *Service) loadCalls(ctx context.Context, runID string) ([]Call, error) {
-	rows, err := s.db.QueryContext(ctx, `SELECT seq, tool, target, args_hash, status, replayed, COALESCE(replay_text, ''), started_at, COALESCE(finished_at, 0)
+	rows, err := s.db.QueryContext(ctx, `SELECT seq, tool, target, args_hash, status, replayed, COALESCE(replay_text, ''), started_at, COALESCE(finished_at, 0),
+		sent, COALESCE(error_kind, ''), COALESCE(error_text, ''), COALESCE(approval_id, ''), COALESCE(hold_content, '')
 		FROM code_run_calls WHERE run_id = ? ORDER BY seq`, runID)
 	if err != nil {
 		return nil, err
@@ -118,12 +119,14 @@ func (s *Service) loadCalls(ctx context.Context, runID string) ([]Call, error) {
 	var out []Call
 	for rows.Next() {
 		var c Call
-		var replayed int64
+		var replayed, sent int64
 		var text string
-		if err := rows.Scan(&c.Seq, &c.Tool, &c.Target, &c.ArgsHash, &c.Status, &replayed, &text, &c.StartedAt, &c.FinishedAt); err != nil {
+		if err := rows.Scan(&c.Seq, &c.Tool, &c.Target, &c.ArgsHash, &c.Status, &replayed, &text, &c.StartedAt, &c.FinishedAt,
+			&sent, &c.errorKind, &c.errorText, &c.approvalID, &c.hold); err != nil {
 			return nil, err
 		}
 		c.Replayed = replayed != 0
+		c.sent = sent != 0
 		if text != "" {
 			if err := json.Unmarshal([]byte(text), &c.replayText); err != nil {
 				return nil, fmt.Errorf("run %s call %d: replay text: %w", runID, c.Seq, err)
@@ -164,7 +167,9 @@ func (s *Service) claimResume(ctx context.Context, r *Run) (bool, error) {
 	return n == 1, nil
 }
 
-// upsertCall writes one call record.
+// upsertCall writes one call record: with the replay value of a
+// succeeded call, the error kind and text of a failed one, and the text,
+// approval id and structured content of a held one.
 func upsertCall(ctx context.Context, q store.Querier, runID string, c Call) error {
 	var text any
 	if c.Status == codemode.StatusSucceeded {
@@ -174,17 +179,26 @@ func upsertCall(ctx context.Context, q store.Querier, runID string, c Call) erro
 		}
 		text = string(raw)
 	}
-	replayed := 0
+	replayed, sent := 0, 0
 	if c.Replayed {
 		replayed = 1
 	}
+	if c.sent {
+		sent = 1
+	}
 	_, err := q.ExecContext(ctx, `INSERT INTO code_run_calls
-		(run_id, seq, tool, target, args_hash, status, replayed, replay_text, started_at, finished_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+		(run_id, seq, tool, target, args_hash, status, replayed, replay_text, started_at, finished_at, sent, error_kind, error_text, approval_id, hold_content)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 		ON CONFLICT (run_id, seq) DO UPDATE SET tool = excluded.tool, target = excluded.target, args_hash = excluded.args_hash,
 			status = excluded.status, replayed = excluded.replayed, replay_text = excluded.replay_text,
-			started_at = excluded.started_at, finished_at = excluded.finished_at`,
-		runID, c.Seq, c.Tool, c.Target, c.ArgsHash, c.Status, replayed, text, c.StartedAt, nullInt(c.FinishedAt))
+			started_at = excluded.started_at, finished_at = excluded.finished_at, sent = excluded.sent,
+			error_kind = excluded.error_kind, error_text = excluded.error_text, approval_id = excluded.approval_id, hold_content = excluded.hold_content
+		WHERE excluded.sent = 1 OR code_run_calls.status NOT IN (?, ?)`,
+		runID, c.Seq, c.Tool, c.Target, c.ArgsHash, c.Status, replayed, text, c.StartedAt, nullInt(c.FinishedAt),
+		sent, nullStr(c.errorKind), nullStr(c.errorText), nullStr(c.approvalID), nullStr(c.hold),
+		// A call that never reached the gateway (refused by its check, or
+		// stopped first) never replaces the record of a call that ran.
+		codemode.StatusSucceeded, codemode.StatusOutcomeUnknown)
 	return err
 }
 
@@ -240,9 +254,7 @@ func (s *Service) finish(ctx context.Context, run *Run, rr *codemode.RunResult, 
 		return err
 	}
 	defer tx.Rollback()
-	maxSeq := 0
 	for _, rec := range rr.Calls {
-		maxSeq = max(maxSeq, rec.Seq)
 		if rec.Replayed {
 			if _, err := tx.ExecContext(ctx, `UPDATE code_run_calls SET replayed = 1 WHERE run_id = ? AND seq = ?`, run.ID, rec.Seq); err != nil {
 				return err
@@ -252,18 +264,15 @@ func (s *Service) finish(ctx context.Context, run *Run, rr *codemode.RunResult, 
 		seen := h.callSeen(rec.Seq)
 		c := Call{Seq: rec.Seq, Tool: rec.Tool, Target: rec.Target, ArgsHash: seen.argsHash, Status: rec.Status,
 			StartedAt: rec.StartedAt, FinishedAt: rec.FinishedAt}
-		if rec.Status == codemode.StatusSucceeded {
-			c.replayText = seen.replayText
-		}
+		c.setSeen(seen, rec.Sent)
 		if err := upsertCall(ctx, tx, run.ID, c); err != nil {
 			return err
 		}
 	}
-	// The record is the latest execution's: calls a resumed script did
-	// not reach this time are gone.
-	if _, err := tx.ExecContext(ctx, `DELETE FROM code_run_calls WHERE run_id = ? AND seq > ?`, run.ID, maxSeq); err != nil {
-		return err
-	}
+	// Calls this execution did not reach keep their records from an
+	// earlier one: a call that ran stays known (a later resume answers it
+	// from its record instead of sending it as new), and the highest call
+	// number the run ever reached stays the mark past which calls are new.
 	if _, err := tx.ExecContext(ctx, `UPDATE code_runs SET status = ?, result = ?, error_kind = ?, error_message = ?, logs = ?, held = ?,
 		updated_at = ?, finished_at = ? WHERE id = ?`,
 		status, result, errKind, errMsg, string(logsJSON), held, now, finished, run.ID); err != nil {

@@ -19,6 +19,7 @@
 package coderuns
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
@@ -267,6 +268,31 @@ type Call struct {
 
 	// replayText is the value the script received ("" unless succeeded).
 	replayText string
+	// sent is false for a failed call that never reached the gateway.
+	sent bool
+	// errorKind and errorText are a failed call's error kind and the text
+	// the script saw; errorText is a held call's text too.
+	errorKind, errorText string
+	// approvalID is a deferred call's legacy approval id.
+	approvalID string
+	// hold is a held call's structured content (the Inbox draft), "" when
+	// it was not kept.
+	hold string
+}
+
+// setSeen copies what the hooks saw for the call into c, for its status:
+// the replay value of a succeeded call, the failure of a failed one, the
+// hold of a held one.
+func (c *Call) setSeen(sc seenCall, sent bool) {
+	c.sent = sent
+	switch c.Status {
+	case codemode.StatusSucceeded:
+		c.replayText = sc.replayText
+	case codemode.StatusFailed:
+		c.errorKind, c.errorText = sc.errKind, sc.errText
+	case codemode.StatusPermissionRequired, codemode.StatusDeferred:
+		c.errorText, c.approvalID, c.hold = sc.errText, sc.approvalID, sc.hold
+	}
 }
 
 // InProgress reports a status that will still change on its own: queued
@@ -479,10 +505,12 @@ type ResumeRequest struct {
 	RequestID string
 }
 
-// Resume runs a permission_required or deferred run again from the top:
-// the calls before the held one are answered from the call record, the
-// held call and later ones carry the request's grants (or the legacy
-// approval id). ErrNotHeld (with the run) when the run is not held.
+// Resume runs a permission_required or deferred run again from the top.
+// Each call is checked against the run's record at its number (hooks): a
+// call that ran is answered from the record, a held call goes with the
+// request's grant (or a deferred call with its own legacy approval id),
+// and a call past every call the run ever made is new. ErrNotHeld (with
+// the run) when the run is not held.
 func (s *Service) Resume(ctx context.Context, req ResumeRequest) (*Run, error) {
 	run, err := s.loadRun(ctx, req.AgentID, req.RunID, true)
 	if err != nil {
@@ -491,7 +519,12 @@ func (s *Service) Resume(ctx context.Context, req ResumeRequest) (*Run, error) {
 	if !IsHeld(run.Status) || run.Held == nil {
 		return run, ErrNotHeld
 	}
-	rs := &resumeState{heldSeq: run.Held.Seq}
+	rs := &resumeState{heldSeq: run.Held.Seq, mark: run.Held.Seq}
+	if run.Held.Status == codemode.StatusDeferred && run.Held.ApprovalID != "" {
+		// Its own approval id, also on a resume with a request_id: a grant
+		// would run the tool beside the approval's own execution.
+		rs.approvalID = run.Held.ApprovalID
+	}
 	switch {
 	case req.RequestID != "":
 		if s.grants == nil {
@@ -525,8 +558,8 @@ func (s *Service) Resume(ctx context.Context, req ResumeRequest) (*Run, error) {
 			}
 			rs.grants = append(rs.grants, g)
 		}
-	case run.Held.Status == codemode.StatusDeferred && run.Held.ApprovalID != "":
-		rs.approvalID = run.Held.ApprovalID
+	case rs.approvalID != "":
+		// A deferred legacy approval resumes with its own id.
 	default:
 		return nil, &InputError{Field: "request_id", Message: "request_id is required: submit held.draft as an Inbox request (toolyard.inbox_request), then resume with its request_id once the owner decided"}
 	}
@@ -537,6 +570,7 @@ func (s *Service) Resume(ctx context.Context, req ResumeRequest) (*Run, error) {
 	rs.recorded = make(map[int]Call, len(calls))
 	for _, c := range calls {
 		rs.recorded[c.Seq] = c
+		rs.mark = max(rs.mark, c.Seq)
 	}
 	if s.engine == nil {
 		return nil, ErrUnavailable
@@ -797,14 +831,18 @@ func fingerprint(code, reason, language string) string {
 }
 
 // argsHash is the sha256 of the canonical JSON of a call's script
-// arguments: keys sorted, and every number as float64 (a worker hands
-// numbers over as float64, so the same arguments hash the same whichever
-// way they arrived).
+// arguments: keys sorted, and every number in the shortest form
+// encoding/json writes (an int 5 and a float64 5 are both 5, so the same
+// arguments hash the same whichever way they arrived). Numbers are read
+// back as json.Number, never float64, so two integers above 2^53 that
+// float64 would round to one value keep their own hashes.
 func argsHash(args map[string]any) string {
 	raw, err := json.Marshal(args)
 	if err == nil {
 		var v any
-		if err = json.Unmarshal(raw, &v); err == nil {
+		dec := json.NewDecoder(bytes.NewReader(raw))
+		dec.UseNumber()
+		if err = dec.Decode(&v); err == nil {
 			raw, err = json.Marshal(v)
 		}
 	}
