@@ -61,7 +61,7 @@ func newSkillsFixture(t *testing.T) *skillsFixture {
 	}
 	f.gw = New(Options{
 		Policy: f.pol, Approval: bus, Audit: f.aud, Hub: realtime.NewHub(), Memory: memory.New(db), Access: f.res,
-		Owners:    fakeOwners{"ag_member": "u_member", "ag_admin": "u_admin", "ag_host": "u_member", "ag_oauth": "u_member", "ag_limited": "u_member"},
+		Owners:    skillOwners{"ag_member": "u_member", "ag_admin": "u_admin", "ag_host": "u_member", "ag_oauth": "u_member", "ag_limited": "u_member"},
 		PublicURL: "https://toolyard.example",
 	})
 	f.gw.RegisterBuiltins()
@@ -409,7 +409,7 @@ func TestSkillsProposeTools(t *testing.T) {
 	f.props.mu.Lock()
 	in, reason, v := f.props.sources[0], f.props.reasons[0], f.props.viewers[0]
 	f.props.mu.Unlock()
-	if in != (skillhub.SourceInput{URL: "acme/more-skills", Branch: "main", Path: "skills"}) || reason != testReason || v.AgentID != "ag_member" || v.UserID != "u_member" {
+	if in.URL != "acme/more-skills" || in.Branch != "main" || in.Path != "skills" || reason != testReason || v.AgentID != "ag_member" || v.UserID != "u_member" {
 		t.Fatalf("ProposeSource(%+v, %q) by %+v", in, reason, v)
 	}
 	f.ok(t, f.member, SkillsProposeSourceTool, map[string]any{"url": "acme/x", "reason": "the team keeps its release playbooks there"})

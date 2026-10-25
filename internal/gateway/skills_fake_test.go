@@ -523,3 +523,10 @@ func (h *fakeHosts) count(agentID string) int {
 	defer h.mu.Unlock()
 	return h.lookups[agentID]
 }
+
+// skillOwners maps agent ids to the users who own them (OwnerResolver).
+type skillOwners map[string]string
+
+func (o skillOwners) OwnerUser(_ context.Context, callerID string) (string, error) {
+	return o[callerID], nil
+}
