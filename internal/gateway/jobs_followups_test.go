@@ -163,14 +163,14 @@ func TestJobsStartTakesItsOwnCallbackRef(t *testing.T) {
 func TestMCPTasksRecoverAPanickingTool(t *testing.T) {
 	f := newJobsFixture(t)
 	f.gw.registerEntry(toolEntry{
-		tool: mcp.Tool{Name: "jobs.boom", Description: descriptionBanner + "panic",
+		tool: mcp.Tool{Name: "jobs.get_boom", Description: descriptionBanner + "panic",
 			InputSchema: mcp.ToolInputSchema{Type: "object", Properties: addMetaProps(map[string]any{})}},
-		upstream: jobsUpstream, originalName: "boom", reasonField: ReasonField,
+		upstream: jobsUpstream, originalName: "get_boom", reasonField: ReasonField,
 		handle: func(context.Context, map[string]any) (*mcp.CallToolResult, error) { panic("boom") },
 	})
 	c := newTasksServer(t, f, "ag_1", false)
 	c.initialize()
-	out := c.result("tools/call", map[string]any{"name": "jobs.boom", "arguments": map[string]any{ReasonField: jobsTestReason}, "task": map[string]any{}})
+	out := c.result("tools/call", map[string]any{"name": "jobs.get_boom", "arguments": map[string]any{ReasonField: jobsTestReason}, "task": map[string]any{}})
 	task, _ := out["task"].(map[string]any)
 	id, _ := task["taskId"].(string)
 	if id == "" {
