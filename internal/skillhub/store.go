@@ -827,8 +827,15 @@ func (s *Service) recordCheck(ctx context.Context, src *sourceRow, out *syncOutc
 	} else {
 		failures := src.failures + 1
 		next := now.Add(backoff(poll, failures))
-		if until, ok := retryAfter(cause); ok && until.After(next) {
+		if until, ok := retryAfter(cause); ok {
+			// A rate limit is GitHub's answer to the credential, shared by
+			// every source that reads with it: not this source's failure.
+			// No backoff grows; the next check is when the limit ends.
+			failures = src.failures
 			next = until
+			if floor := now.Add(MinPollSeconds * time.Second); next.Before(floor) {
+				next = floor
+			}
 		}
 		res, err = s.db.ExecContext(ctx, `UPDATE skill_sources SET last_checked_at = ?, next_check_at = ?, last_error = ?,
 			failures = ?, head_sha = ?, head_etag = ? WHERE id = ? AND updated_at = ?`,
