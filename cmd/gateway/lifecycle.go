@@ -22,7 +22,11 @@ import (
 
 // Supervised background loops (goroutines.Loop / goroutines.Go). The names
 // are a fixed set because each one is a metric label. approval.SweeperLoop,
-// inbox.SweeperLoop and inbox.LegacySyncLoop live with their loops.
+// inbox.SweeperLoop and inbox.LegacySyncLoop live with their loops, as do
+// the lease renewal loops (inbox, approval and coderuns LeaseRenewalLoop).
+// With several replicas on one Postgres database (TEC-1630) a loop that
+// must run on one replica at a time runs under a cluster leader lease of
+// the same name (cluster.go).
 const (
 	loopAuditFeed      = "audit-feed"
 	loopPricing        = "pricing-refresh"
@@ -39,6 +43,15 @@ const (
 	loopIdleSweeper    = "upstream-idle-sweeper"
 	loopCatalogRefresh = "upstream-catalog-refresh"
 	goCodemodeProbe    = "codemode-probe"
+	// TEC-1630.
+	loopWorkRecovery   = "work-recovery"
+	loopClerkSync      = "clerk-sync"
+	loopKeyRemoval     = "identity-key-removal-retry"
+	loopTelegramPoller = "telegram-poller"
+	loopChatReconciler = "chat-reconciler"
+	loopEventsPoller   = "events-poller"
+	loopEventsRetain   = "events-retention"
+	loopMemWebhookJobs = "memwebhook-jobs"
 )
 
 // Shutdown budget. With the defaults a stop takes at most drainTimeout
@@ -293,8 +306,9 @@ func markDraining() { ops.Default.SetDraining() }
 // the drain deadline. Those still running then are logged at ERROR by
 // grant id and counted outcome_unknown; step 5 closed their HTTP
 // connections, which cancels them, and they get grace to record the
-// outcome. Any that do not are recorded outcome_unknown at the next start
-// (inbox.RecoverExecutions).
+// outcome. Any that do not are recorded outcome_unknown by recovery
+// (inbox.RecoverExecutions): at the next start on a single node, or by the
+// leader of a multi-node database once their lease ends.
 func waitGrantedCalls(ctx context.Context, gw *gateway.Gateway, svc *inbox.Service, grace time.Duration) {
 	left := gw.WaitGrantedCalls(ctx)
 	if left == 0 {

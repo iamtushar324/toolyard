@@ -5,6 +5,8 @@
 // Ceremonies are short-lived and single-use. Each one remembers the
 // relying-party ID and origin it was started from (the dashboard's own
 // origin), so toolyard works behind any hostname without configuration.
+// They are rows of passkey_ceremonies, not process memory, so a ceremony
+// started on one replica can finish on another (TEC-1630).
 // An assertion's challenge embeds a hash of its purpose — for a decision,
 // inbox.DecisionDigest — so the authenticator's signature covers exactly
 // what the owner confirmed.
@@ -23,7 +25,6 @@ import (
 	"fmt"
 	"net/url"
 	"strings"
-	"sync"
 	"time"
 	"unicode/utf8"
 
@@ -74,14 +75,15 @@ type ceremony struct {
 type Service struct {
 	db  *store.DB
 	now func() time.Time
-
-	mu      sync.Mutex
-	pending map[string]*ceremony
 }
+
+// maxCeremonies bounds the started ceremonies kept at once (runaway
+// protection); past it the oldest go.
+const maxCeremonies = 256
 
 // New creates the service.
 func New(db *store.DB) *Service {
-	return &Service{db: db, now: time.Now, pending: map[string]*ceremony{}}
+	return &Service{db: db, now: time.Now}
 }
 
 // SetClock replaces the clock (tests).
@@ -173,38 +175,55 @@ func (s *Service) credentials(ctx context.Context, userID string) ([]webauthn.Cr
 	return out, rows.Err()
 }
 
-func (s *Service) put(c *ceremony) string {
+// put stores a started ceremony and returns its ID. Expired ceremonies
+// are deleted first, and only the newest maxCeremonies are kept.
+func (s *Service) put(ctx context.Context, c *ceremony) (string, error) {
 	b := make([]byte, 18)
 	_, _ = rand.Read(b)
 	id := base64.RawURLEncoding.EncodeToString(b)
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	now := s.now()
-	for k, v := range s.pending {
-		if now.After(v.exp) {
-			delete(s.pending, k)
-		}
+	sess, err := json.Marshal(c.session)
+	if err != nil {
+		return "", err
 	}
-	if len(s.pending) > 256 { // runaway protection
-		for k := range s.pending {
-			delete(s.pending, k)
-			break
-		}
+	now := s.now().UnixMilli()
+	if _, err := s.db.ExecContext(ctx, `DELETE FROM passkey_ceremonies WHERE expires_at < ?`, now); err != nil {
+		return "", err
 	}
-	s.pending[id] = c
-	return id
+	if _, err := s.db.ExecContext(ctx, `INSERT INTO passkey_ceremonies(id, kind, user_id, purpose, session, rp_id, origin, created_at, expires_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`, id, c.kind, c.userID, c.purpose, string(sess), c.rpID, c.origin, now, c.exp.UnixMilli()); err != nil {
+		return "", err
+	}
+	if _, err := s.db.ExecContext(ctx, `DELETE FROM passkey_ceremonies WHERE id NOT IN
+		(SELECT id FROM passkey_ceremonies ORDER BY created_at DESC, id DESC LIMIT ?)`, maxCeremonies); err != nil {
+		return "", err
+	}
+	return id, nil
 }
 
-// take removes and returns a ceremony (single use).
-func (s *Service) take(id, kind string) (*ceremony, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	c, ok := s.pending[id]
-	delete(s.pending, id)
-	if !ok || c.kind != kind || s.now().After(c.exp) {
+// take removes and returns a ceremony (single use): one statement reads
+// and deletes it, so two finishes of the same ceremony, on one replica or
+// two, never both get it.
+func (s *Service) take(ctx context.Context, id, kind string) (*ceremony, error) {
+	var c ceremony
+	var sess string
+	var exp int64
+	err := s.db.QueryRowContext(ctx, `DELETE FROM passkey_ceremonies WHERE id = ?
+		RETURNING kind, user_id, purpose, session, rp_id, origin, expires_at`, id).
+		Scan(&c.kind, &c.userID, &c.purpose, &sess, &c.rpID, &c.origin, &exp)
+	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNoCeremony
 	}
-	return c, nil
+	if err != nil {
+		return nil, err
+	}
+	c.exp = time.UnixMilli(exp)
+	if c.kind != kind || s.now().After(c.exp) {
+		return nil, ErrNoCeremony
+	}
+	if err := json.Unmarshal([]byte(sess), &c.session); err != nil {
+		return nil, ErrNoCeremony
+	}
+	return &c, nil
 }
 
 // BeginRegistration starts adding a passkey. It returns the ceremony ID
@@ -236,13 +255,16 @@ func (s *Service) BeginRegistration(ctx context.Context, u User, originHeader st
 	if err != nil {
 		return "", nil, err
 	}
-	id := s.put(&ceremony{kind: "register", userID: u.ID, session: *sess, rpID: rpID, origin: origin, exp: s.now().Add(CeremonyTTL)})
+	id, err := s.put(ctx, &ceremony{kind: "register", userID: u.ID, session: *sess, rpID: rpID, origin: origin, exp: s.now().Add(CeremonyTTL)})
+	if err != nil {
+		return "", nil, err
+	}
 	return id, opts, nil
 }
 
 // FinishRegistration verifies the browser's response and stores the passkey.
 func (s *Service) FinishRegistration(ctx context.Context, u User, ceremonyID, name string, response []byte) (*Passkey, error) {
-	c, err := s.take(ceremonyID, "register")
+	c, err := s.take(ctx, ceremonyID, "register")
 	if err != nil {
 		return nil, err
 	}
@@ -319,7 +341,10 @@ func (s *Service) BeginAssertion(ctx context.Context, u User, purpose, originHea
 	if err != nil {
 		return "", nil, err
 	}
-	id := s.put(&ceremony{kind: "assert", userID: u.ID, purpose: purpose, session: *sess, rpID: rpID, origin: origin, exp: s.now().Add(CeremonyTTL)})
+	id, err := s.put(ctx, &ceremony{kind: "assert", userID: u.ID, purpose: purpose, session: *sess, rpID: rpID, origin: origin, exp: s.now().Add(CeremonyTTL)})
+	if err != nil {
+		return "", nil, err
+	}
 	return id, opts, nil
 }
 
@@ -328,7 +353,7 @@ func (s *Service) FinishAssertion(ctx context.Context, ceremonyID, purpose strin
 	return s.finishAssertion(ctx, ceremonyID, purpose, response, "")
 }
 func (s *Service) finishAssertion(ctx context.Context, ceremonyID, purpose string, response []byte, expectedUser string) (string, error) {
-	c, err := s.take(ceremonyID, "assert")
+	c, err := s.take(ctx, ceremonyID, "assert")
 	if err != nil {
 		return "", err
 	}

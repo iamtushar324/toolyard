@@ -32,6 +32,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/tusharbhardwaj/toolyard/internal/audit"
+	"github.com/tusharbhardwaj/toolyard/internal/cluster"
 	"github.com/tusharbhardwaj/toolyard/internal/mempalace"
 	"github.com/tusharbhardwaj/toolyard/internal/store"
 )
@@ -106,6 +107,9 @@ type Service struct {
 	// enqueued job without waiting for the next tick. Buffered (cap 1) and sent
 	// non-blocking, so Enqueue never stalls on a busy worker.
 	wake chan struct{}
+	// cluster names this node when replicas share the database
+	// (SetCluster, cluster.go); nil is a single node.
+	cluster *cluster.Cluster
 }
 
 // New builds a Service. mem may be a *mempalace.Service that is currently

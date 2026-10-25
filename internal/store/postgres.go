@@ -210,7 +210,7 @@ func OpenPostgresWith(ctx context.Context, url string, opts PostgresOptions) (*D
 		}
 		return nil, err
 	}
-	db := &DB{DB: sdb, Dialect: Postgres}
+	db := &DB{DB: sdb, Dialect: Postgres, pgConfig: cfg}
 	if opts.ReadOnly || opts.NoMigrate {
 		return db, nil
 	}
@@ -281,6 +281,49 @@ func (db *DB) WithPgxConn(ctx context.Context, fn func(*pgx.Conn) error) error {
 		}
 		return fn(rc.pg.Conn())
 	})
+}
+
+// ConnectPostgres opens one new connection to the database, outside the
+// pool and not counted in its size, for a caller that must keep a session
+// of its own for a long time: session advisory locks and LISTEN
+// (internal/cluster). The session reports applicationName (pg_stat_activity)
+// and asks the server for short TCP keepalives and a TCP user timeout, so
+// the server ends it, and releases its advisory locks, within about half a
+// minute of the node vanishing (the operating system default is about two
+// hours). The caller closes it. SQL sent through it is not rewritten: use
+// $1, $2 there (or Rebind). It is an error on SQLite.
+func (db *DB) ConnectPostgres(ctx context.Context, applicationName string) (*pgx.Conn, error) {
+	if !db.Dialect.IsPostgres() || db.pgConfig == nil {
+		return nil, errors.New("store: ConnectPostgres needs a database opened with OpenPostgres")
+	}
+	cfg := db.pgConfig.Copy()
+	params := map[string]string{}
+	for k, v := range cfg.RuntimeParams {
+		params[k] = v
+	}
+	if applicationName != "" {
+		params["application_name"] = applicationName
+	}
+	for k, v := range DedicatedSessionParams {
+		params[k] = v
+	}
+	cfg.RuntimeParams = params
+	conn, err := pgx.ConnectConfig(ctx, cfg)
+	if err != nil {
+		return nil, connectFailure(fmt.Errorf("store: connect to Postgres at %s/%s: %w", db.pgConfig.Host, db.pgConfig.Database, err))
+	}
+	return conn, nil
+}
+
+// DedicatedSessionParams are the session settings of a ConnectPostgres
+// connection: the server probes an idle client after 10 s, every 5 s, and
+// gives up after 3 lost probes; data unacknowledged for 15 s ends the
+// connection too. Postgres ignores them on a Unix socket.
+var DedicatedSessionParams = map[string]string{
+	"tcp_keepalives_idle":     "10",
+	"tcp_keepalives_interval": "5",
+	"tcp_keepalives_count":    "3",
+	"tcp_user_timeout":        "15000",
 }
 
 // ---- placeholder-rewriting connector ----------------------------------------

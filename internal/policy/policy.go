@@ -28,6 +28,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/tusharbhardwaj/toolyard/internal/cluster"
 	"github.com/tusharbhardwaj/toolyard/internal/store"
 )
 
@@ -97,8 +98,12 @@ type Engine struct {
 	loadErr error
 	// writeMu serialises Set, Delete, DeleteTarget and Change, from the
 	// dashboard and from agents alike, so a guarded Change sees no other
-	// write land between its check and its own write.
+	// write land between its check and its own write. With a multi-node
+	// cluster a cluster lock extends it to every replica (lockWrite).
 	writeMu sync.Mutex
+	// cluster, when it spans several nodes, carries every write to the
+	// other replicas' caches (SetCluster, cluster.go).
+	cluster *cluster.Cluster
 }
 
 // New constructs the engine and primes its policy cache from the db. Pass a
@@ -368,8 +373,11 @@ func (e *Engine) Set(ctx context.Context, scope, target, action, note string, fo
 	if e.db == nil {
 		return nil, ErrNoDB
 	}
-	e.writeMu.Lock()
-	defer e.writeMu.Unlock()
+	unlock, err := e.lockWrite(ctx)
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
 	return e.setLocked(ctx, scope, target, action, note, force)
 }
 
@@ -392,8 +400,11 @@ func (e *Engine) Change(ctx context.Context, scope, target, action, note string,
 	if action != "" && action != "allow" && action != "ask" && action != "deny" {
 		return nil, false, errString("action must be allow, ask, or deny")
 	}
-	e.writeMu.Lock()
-	defer e.writeMu.Unlock()
+	unlock, err := e.lockWrite(ctx)
+	if err != nil {
+		return nil, false, err
+	}
+	defer unlock()
 	// The guard judges the change against the rules in force. While the
 	// first load has not succeeded the engine does not know them, so read
 	// them now and refuse the change if they still cannot be read.
@@ -439,6 +450,7 @@ func (e *Engine) setLocked(ctx context.Context, scope, target, action, note stri
 	if err != nil {
 		return nil, err
 	}
+	e.publishChange(ctx)
 	// A failed reload is returned to the caller; the cache keeps its last
 	// good snapshot until a later reload succeeds.
 	if err := e.reload(ctx); err != nil {
@@ -454,11 +466,15 @@ func (e *Engine) Delete(ctx context.Context, id string) error {
 	if e.db == nil {
 		return ErrNoDB
 	}
-	e.writeMu.Lock()
-	defer e.writeMu.Unlock()
+	unlock, err := e.lockWrite(ctx)
+	if err != nil {
+		return err
+	}
+	defer unlock()
 	if _, err := e.db.ExecContext(ctx, `DELETE FROM tool_policies WHERE id = ?`, id); err != nil {
 		return err
 	}
+	e.publishChange(ctx)
 	return e.reload(ctx)
 }
 
@@ -468,8 +484,11 @@ func (e *Engine) DeleteTarget(ctx context.Context, scope, target string) error {
 	if e.db == nil {
 		return ErrNoDB
 	}
-	e.writeMu.Lock()
-	defer e.writeMu.Unlock()
+	unlock, err := e.lockWrite(ctx)
+	if err != nil {
+		return err
+	}
+	defer unlock()
 	return e.deleteTargetLocked(ctx, scope, target)
 }
 
@@ -478,6 +497,7 @@ func (e *Engine) deleteTargetLocked(ctx context.Context, scope, target string) e
 	if _, err := e.db.ExecContext(ctx, `DELETE FROM tool_policies WHERE scope = ? AND target = ?`, scope, target); err != nil {
 		return err
 	}
+	e.publishChange(ctx)
 	return e.reload(ctx)
 }
 
