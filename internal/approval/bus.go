@@ -1150,6 +1150,44 @@ func (b *Bus) CancelByAgent(ctx context.Context, id, agentID string) (*Request, 
 	return req, nil
 }
 
+// ViaSystem is the decided_via of a cancellation toolyard made itself, not
+// a person or the agent: CancelBySystem.
+const ViaSystem = "system"
+
+// CancelBySystem cancels a pending approval of agentID because toolyard
+// took the agent's access away (reason, e.g. "grant revoked"). Unlike
+// CancelByAgent it also cancels a personal approval (one only its owner
+// may decide): the request can no longer run, whoever would have decided
+// it. It is recorded as decided by the system (decided_via "system",
+// decider_ref reason), never as withdrawn by the agent. ErrNotPending when
+// it was already decided, ErrNotFound for another agent's request.
+func (b *Bus) CancelBySystem(ctx context.Context, id, agentID, reason string) (*Request, error) {
+	d := actor.Decider{Via: ViaSystem, Ref: reason}
+	res, err := b.db.ExecContext(ctx,
+		`UPDATE approval_requests SET status = ?, decided_by = ?, decided_at = ?,
+            decided_via = ?, decider_ref = ?
+         WHERE id = ? AND status = ? AND agent_id = ?`,
+		StatusCancelled, d.Legacy(), time.Now().UnixMilli(), d.Via, d.Ref,
+		id, StatusPending, agentID)
+	if err != nil {
+		return nil, err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		existing, getErr := b.Get(ctx, id)
+		if getErr != nil || existing.AgentID != agentID {
+			return nil, ErrNotFound
+		}
+		return existing, ErrNotPending
+	}
+	req, err := b.Get(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	b.signal(id)
+	b.fanOut(ctx, req, "approval.cancel")
+	return req, nil
+}
+
 // ListPendingByAgent is the agent-scoped view used by
 // tools.list_my_pending_approvals — only returns rows whose agent_id
 // matches the caller, never leaks other agents' queues.

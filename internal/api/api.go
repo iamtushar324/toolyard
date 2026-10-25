@@ -73,6 +73,7 @@ import (
 	"github.com/tusharbhardwaj/toolyard/internal/inbox"
 	"github.com/tusharbhardwaj/toolyard/internal/jobs"
 	"github.com/tusharbhardwaj/toolyard/internal/marketplace"
+	"github.com/tusharbhardwaj/toolyard/internal/mcpauth"
 	"github.com/tusharbhardwaj/toolyard/internal/memory"
 	"github.com/tusharbhardwaj/toolyard/internal/mempalace"
 	"github.com/tusharbhardwaj/toolyard/internal/memwebhook"
@@ -100,6 +101,8 @@ const (
 )
 
 type Server struct {
+	// mcpAuth is the OAuth server for MCP clients, set by MCPOAuthRoutes.
+	mcpAuth      *mcpauth.Service
 	federation   *federation.Service
 	callbacks    *callbacks.Service
 	githubHTTP   *http.Client
@@ -986,6 +989,7 @@ func (s *Server) agentsItem(w http.ResponseWriter, r *http.Request) {
 			writeAgentActionError(w, err)
 			return
 		}
+		s.oauthAgentDeleted(r.Context(), id)
 		_ = s.audit.Write(r.Context(), audit.Event{
 			EventType: "agent.delete", AgentID: id, ResultSummary: "user:" + uid,
 		})
