@@ -576,7 +576,9 @@ POD_VERSION=""
 check_pod() {
 	local pod="$1" pflog="$WORK/pf-$1.log" port="" pid code status
 	POD_VERSION="unknown"
-	k port-forward "pod/$pod" ":8787" </dev/null >"$pflog" 2>&1 &
+	# kubectl itself, not the k function: $! must be kubectl's own PID, or
+	# killing it would leave the port-forward running.
+	kubectl --namespace "$NAMESPACE" port-forward "pod/$pod" ":8787" </dev/null >"$pflog" 2>&1 &
 	pid=$!
 	PF_PIDS+=("$pid")
 	for _ in $(seq 1 75); do
