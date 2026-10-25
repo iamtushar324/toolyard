@@ -347,7 +347,7 @@ func runServe(argv []string) error {
 	logLevel := fs.String("log-level", "info", "log level: debug | info | warn | error")
 	logFormat := fs.String("log-format", "json", "log format: json | text. Text is friendlier in a terminal; json is what journalctl + jq want.")
 	// TEC-1630 high availability
-	instanceID := fs.String("instance-id", "", "name of this replica in work leases and logs when several replicas share one Postgres database (e.g. the pod name). Empty = <hostname>-<random>, new at every start.")
+	instanceID := fs.String("instance-id", "", "name of this replica in work leases and logs when several replicas share one Postgres database (e.g. the pod name); unique per running replica. Empty = <hostname>-<random>, new at every start.")
 	_ = fs.Parse(argv)
 
 	// TEC-1638: every flag not given on the command line may come from

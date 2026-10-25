@@ -641,8 +641,9 @@ a server saved on one replica is in force on the others within moments.
 SQLite stays single-replica.
 
 Every replica must have the same configuration and the same keys
-(identity, OAuth, secrets and session keys from the same credentials), and
-run the same binary except during an update. Run the migrations once per
+(identity, OAuth, secrets and session keys from the same credentials, with
+`-keys=require` so no replica ever creates its own), and run the same
+binary except during an update. Run the migrations once per
 deploy (`toolyard db migrate`, with `-migrate=off` on the replicas) or let
 the replicas migrate at start: migrations run under an advisory lock.
 
@@ -698,8 +699,9 @@ Things to set:
   make the load balancer send each session to one replica (sticky routing
   on the `Mcp-Session-Id` header).
 - **`-instance-id`** names the replica in leases and logs (for example the
-  pod name: `TOOLYARD_INSTANCE_ID` from the Kubernetes downward API).
-  Without it each start picks `<hostname>-<random>`.
+  pod name: `TOOLYARD_INSTANCE_ID` from the Kubernetes downward API). Each
+  running replica needs its own; without the flag each start picks
+  `<hostname>-<random>`.
 - **Files under `-data`** are per replica: crash dumps, the price list
   cache, and the notes, skills and MemPalace stores. With several
   replicas, put notes, skills and MemPalace on a shared volume or turn
