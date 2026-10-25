@@ -7,7 +7,9 @@ import (
 	"sync"
 	"time"
 
+	"github.com/tusharbhardwaj/toolyard/internal/cluster"
 	"github.com/tusharbhardwaj/toolyard/internal/jobs"
+	"github.com/tusharbhardwaj/toolyard/internal/logx"
 )
 
 // Async tools: an administrator marks a server, or single tools of it,
@@ -17,10 +19,14 @@ import (
 // instead of waiting for the result.
 
 // asyncCacheTTL bounds how stale the gateway's copy of the settings can
-// be. A change made on this process applies at once; one made on another
-// replica within this time (cluster.Subscribe can make it immediate once
-// slice A lands).
+// be. A change made on this process applies at once, and one made on
+// another replica as soon as its cluster message arrives (asyncTopic);
+// the TTL covers a lost message until the cluster's next resync.
 const asyncCacheTTL = 5 * time.Second
+
+// asyncTopic tells the other replicas that an async setting changed: they
+// reload their copy.
+const asyncTopic = "upstreams-async"
 
 // asyncCache is the gateway's copy of every server's async setting,
 // embedded in Service.
@@ -32,6 +38,8 @@ type asyncCache struct {
 	// writes, so a reload that read before a write does not undo it.
 	asyncLoading chan struct{}
 	asyncGen     uint64
+	// asyncCluster publishes this replica's changes (multi-node only).
+	asyncCluster *cluster.Cluster
 }
 
 // AsyncSetting is the named server's async setting (zero when it has
@@ -163,12 +171,46 @@ func (s *Service) SetAsync(ctx context.Context, name string, set jobs.AsyncSetti
 		}
 		s.asyncByName = next
 	}
+	c := s.asyncCluster
 	s.asyncMu.Unlock()
-	// tools/list marks async tools for MCP Tasks clients.
+	if c != nil {
+		if err := c.PublishOthers(context.WithoutCancel(ctx), asyncTopic, name); err != nil {
+			logx.For("upstreams").Warn("upstreams: telling other nodes about an async setting failed; they catch up within seconds", "server", name, "err", err.Error())
+		}
+	}
+	// servers.list shows the setting.
 	if s.gw != nil {
 		s.gw.NotifyToolListChanged()
 	}
 	return out, nil
+}
+
+// followAsync makes this replica reload its copy of the async settings
+// when another replica changes one (and at every cluster resync), and
+// publish its own changes. Multi-node only; SetCluster calls it.
+func (s *Service) followAsync(c *cluster.Cluster) {
+	s.asyncMu.Lock()
+	s.asyncCluster = c
+	s.asyncMu.Unlock()
+	c.SubscribeReload(asyncTopic, s.refreshAsync)
+}
+
+// refreshAsync reloads the async settings now. A reload already running
+// may have read before the change: it is not installed, and the next read
+// reloads again.
+func (s *Service) refreshAsync() {
+	s.asyncMu.Lock()
+	s.asyncGen++
+	if s.asyncLoading != nil {
+		s.asyncLoaded = time.Time{}
+		s.asyncMu.Unlock()
+		return
+	}
+	ch := make(chan struct{})
+	s.asyncLoading = ch
+	gen := s.asyncGen
+	s.asyncMu.Unlock()
+	s.reloadAsync(ch, gen)
 }
 
 // attachAsync fills Async on servers for the API.

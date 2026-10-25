@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -19,6 +20,7 @@ import (
 	"github.com/tusharbhardwaj/toolyard/internal/actor"
 	"github.com/tusharbhardwaj/toolyard/internal/audit"
 	"github.com/tusharbhardwaj/toolyard/internal/codemode"
+	"github.com/tusharbhardwaj/toolyard/internal/inbox"
 	"github.com/tusharbhardwaj/toolyard/internal/jobs"
 	"github.com/tusharbhardwaj/toolyard/internal/metrics"
 	"github.com/tusharbhardwaj/toolyard/internal/policy"
@@ -192,8 +194,9 @@ type jobCall struct {
 	intent      string
 	callbackRef string
 	// grant is set for a call admitted by a redeemable grant (its run
-	// redeems it); otherwise the policy allowed the call.
-	grant bool
+	// redeems grantToken); otherwise the policy allowed the call.
+	grant      bool
+	grantToken string
 }
 
 // runOrStartJob runs the admitted call inline, or as a job when
@@ -261,20 +264,31 @@ func newJobEvent(base metrics.Event) metrics.Event {
 // made async runs inline instead; an explicit job request (jobs.start,
 // POST /v1/jobs, an MCP task) is refused.
 func (g *Gateway) startJob(ctx context.Context, plan *asyncPlan, c jobCall, ev *metrics.Event, run jobRun) (*mcp.CallToolResult, error) {
+	if c.grant {
+		// The job redeems the grant when it runs: an invalid one answers
+		// now, as an inline call would, and stores no job.
+		if res := g.checkJobGrant(ctx, c, ev); res != nil {
+			return res, nil
+		}
+	}
 	req := g.jobRequest(ctx, plan, c, ev)
 	jobEntry := c.entry
 	jobEntry.noCallTimeout = true
 	base := *ev
+	nothingRan := jobs.Outcome{Status: jobs.StatusCancelled, Error: "cancelled before the call was sent; nothing ran", NothingRan: true}
 	job, h, err := g.jobs.Start(jobContext(ctx), req, func(rctx context.Context, progress jobs.ProgressFunc) jobs.Outcome {
+		// Cancelled (jobs.cancel, the Guard, shutdown) before the call was
+		// sent: nothing ran.
+		if rctx.Err() != nil {
+			return nothingRan
+		}
 		// Queued for a while: the access and policy that admitted the
 		// call must still hold when it starts.
 		if refusal := g.recheckJob(rctx, c); refusal != "" {
-			return jobs.Outcome{Status: jobs.StatusFailed, Envelope: encodeJobResult(mcp.NewToolResultError(refusal)), IsError: true, Error: refusal}
+			return jobs.Outcome{Status: jobs.StatusFailed, Envelope: encodeJobResult(mcp.NewToolResultError(refusal)), IsError: true, Error: refusal, NothingRan: true}
 		}
-		// Cancelled (jobs.cancel, shutdown) before the call was sent:
-		// nothing ran.
 		if rctx.Err() != nil {
-			return jobs.Outcome{Status: jobs.StatusCancelled, Error: "cancelled before the call was sent; nothing ran"}
+			return nothingRan
 		}
 		jev := newJobEvent(base)
 		started := time.Now()
@@ -283,7 +297,7 @@ func (g *Gateway) startJob(ctx context.Context, plan *asyncPlan, c jobCall, ev *
 		if rctx.Err() != nil && jev.ErrorClass == "audit_unavailable" {
 			// The cancel came before dispatch could record its intent: the
 			// tool was never called.
-			return jobs.Outcome{Status: jobs.StatusCancelled, Error: "cancelled before the call was sent; nothing ran"}
+			return nothingRan
 		}
 		return jobOutcome(res, derr)
 	})
@@ -341,8 +355,15 @@ func (g *Gateway) runAfter(ctx context.Context, plan *asyncPlan, c jobCall, ev *
 		return res, derr
 	case <-wait.C:
 	case <-ctx.Done():
+		// The caller gave up first (a client timeout, a script's
+		// deadline): the call becomes a job all the same, so it can be
+		// found, waited on and cancelled, within the job caps and limits.
 	}
-	job, err := g.jobs.Adopt(ctx, g.jobRequest(ctx, plan, c, ev), jobs.Adoption{
+	// The caller's context may have ended: the job is stored and audited
+	// on one that has not.
+	actx, cancelAdopt := context.WithTimeout(context.WithoutCancel(ctx), 30*time.Second)
+	defer cancelAdopt()
+	job, err := g.jobs.Adopt(actx, g.jobRequest(actx, plan, c, ev), jobs.Adoption{
 		StartedAt: started, Cancel: cancel, Done: done, Relay: relay,
 		Outcome: func() jobs.Outcome {
 			g.jobMetrics(started, res, derr, &jev)
@@ -350,15 +371,39 @@ func (g *Gateway) runAfter(ctx context.Context, plan *asyncPlan, c jobCall, ev *
 		},
 	})
 	if err != nil {
-		// No job (budget full, draining): the call keeps running and its
-		// caller waits for it, as without async tools.
-		<-done
+		// No job (budget full, draining, a database error): the call is an
+		// inline call again, with an inline call's limits. It stops when
+		// its caller goes away, and at the per-call timeout counted from
+		// its start.
+		var limit <-chan time.Time
+		if t := g.upstreamCallTimeout; t > 0 && !c.entry.noCallTimeout {
+			timer := time.NewTimer(max(t-time.Since(started), 0))
+			defer timer.Stop()
+			limit = timer.C
+		}
+		timedOut := false
+		select {
+		case <-done:
+		case <-ctx.Done():
+			cancel()
+			<-done
+		case <-limit:
+			timedOut = true
+			cancel()
+			<-done
+		}
 		cancel()
 		mergeEvent(ev, &jev)
+		if timedOut && (derr != nil || res == nil || res.IsError) {
+			log.Printf("upstream-timeout: tool=%s upstream=%s agent=%s elapsed=%s timeout=%s",
+				c.entry.tool.Name, c.entry.upstream, c.agentID, time.Since(started).Round(time.Millisecond), g.upstreamCallTimeout)
+			ev.Outcome, ev.ErrorClass = metrics.OutcomeError, "upstream"
+			return outcomeUnknown(mcp.NewToolResultErrorf("tool failed: the call passed the %s per-call time limit and was stopped; it may have run", g.upstreamCallTimeout)), nil
+		}
 		return res, derr
 	}
 	ev.Outcome, ev.ErrorClass = metrics.OutcomeDeferred, "async_job"
-	g.auditJobStarted(ctx, c, job)
+	g.auditJobStarted(actx, c, job)
 	return jobEnvelope(job), nil
 }
 
@@ -381,6 +426,11 @@ func (g *Gateway) auditJobStarted(ctx context.Context, c jobCall, job *jobs.Job)
 // allowed; a granted call must not be denied now). "" when it holds.
 func (g *Gateway) recheckJob(ctx context.Context, c jobCall) string {
 	if !g.allowsEntry(ctx, c.agentID, c.entry) {
+		if ctx.Err() != nil {
+			// Cancelled during the lookup, which then fails closed: not a
+			// denial. The job reports the cancel.
+			return ""
+		}
 		_ = g.audit.Write(ctx, audit.Event{
 			EventType: audit.EventCallDenied, AgentID: c.agentID, UpstreamName: c.entry.upstream, ToolName: c.entry.tool.Name,
 			Decision: "deny", Reason: accessDeniedReason,
@@ -395,6 +445,35 @@ func (g *Gateway) recheckJob(ctx context.Context, c jobCall) string {
 		return "the call needs approval now (the policy changed while the job waited); nothing ran: ask with inbox.request"
 	}
 	return ""
+}
+
+// checkJobGrant checks the grant of a granted call that becomes a job,
+// without using it up (the job redeems it when it runs), with the same
+// answers redeemAndDispatch gives. nil when the grant would redeem.
+func (g *Gateway) checkJobGrant(ctx context.Context, c jobCall, ev *metrics.Event) *mcp.CallToolResult {
+	if c.agentID == "" {
+		ev.Outcome = metrics.OutcomeDenied
+		return mcp.NewToolResultError("grants only work with an enrolled agent token; this connection is anonymous")
+	}
+	if problems := g.ValidateScope(ctx, c.agentID, inbox.ToolRequest{Tool: c.entry.tool.Name, Operation: "write", Params: inbox.ParamsFromArgs(c.args)}); len(problems) > 0 {
+		return mcp.NewToolResultError("call parameters no longer match the tool schema; permission was not consumed: " + problems[0].Message)
+	}
+	_, err := g.inbox.CheckGrant(ctx, c.grantToken, c.agentID, c.entry.tool.Name, c.args)
+	if err == nil {
+		return nil
+	}
+	var re *inbox.RedeemError
+	if !errors.As(err, &re) {
+		ev.Outcome = metrics.OutcomeError
+		return mcp.NewToolResultErrorFromErr("grant check failed; nothing ran and no job was started", err)
+	}
+	argsJSON, _ := json.Marshal(c.args)
+	_ = g.audit.Write(ctx, audit.Event{
+		EventType: audit.EventCallDenied, AgentID: c.agentID, UpstreamName: c.entry.upstream, ToolName: c.entry.tool.Name,
+		Decision: "grant_invalid", Reason: c.reason, Arguments: argsJSON,
+	})
+	ev.Outcome, ev.ErrorClass = metrics.OutcomeDenied, "grant_invalid"
+	return grantInvalidResponse(c.entry, c.args, re)
 }
 
 // attachJobs wires the job service's audit log and the access guard that
@@ -445,13 +524,65 @@ func jobOutcome(res *mcp.CallToolResult, err error) jobs.Outcome {
 	case err != nil:
 		return jobs.Outcome{Status: jobs.StatusOutcomeUnknown, Envelope: env, IsError: true,
 			Error: "the call may or may not have run: " + clipText(err.Error(), 500)}
-	case metaTrue(res, codemode.OutcomeUnknownMarker):
+	case metaTrue(res, codemode.OutcomeUnknownMarker), res.IsError && resultOutcomeUnknown(res):
 		return jobs.Outcome{Status: jobs.StatusOutcomeUnknown, Envelope: env, IsError: true,
 			Error: "the call may or may not have run: " + clipText(summariseResult(res), 500)}
 	case res.IsError:
-		return jobs.Outcome{Status: jobs.StatusFailed, Envelope: env, IsError: true, Error: clipText(summariseResult(res), 500)}
+		return jobs.Outcome{Status: jobs.StatusFailed, Envelope: env, IsError: true, Error: clipText(summariseResult(res), 500),
+			NothingRan: resultNothingRan(res)}
 	}
 	return jobs.Outcome{Status: jobs.StatusSucceeded, Envelope: env}
+}
+
+// codeModeCallsMeta is the result metadata key of executeToolCode's call
+// ledger.
+const codeModeCallsMeta = "toolyard.calls"
+
+// resultOutcomeUnknown reports whether an error result says its work may
+// or may not have run: structured content with status outcome_unknown (a
+// code-mode run interrupted after it made a call), or a call ledger with
+// such a call.
+func resultOutcomeUnknown(res *mcp.CallToolResult) bool {
+	if m, ok := res.StructuredContent.(map[string]any); ok && m["status"] == jobs.StatusOutcomeUnknown {
+		return true
+	}
+	if res.Meta == nil {
+		return false
+	}
+	switch calls := res.Meta.AdditionalFields[codeModeCallsMeta].(type) {
+	case []codemode.LedgerEntry:
+		for _, c := range calls {
+			if c.Status == codemode.StatusOutcomeUnknown {
+				return true
+			}
+		}
+	case []any:
+		for _, c := range calls {
+			if m, ok := c.(map[string]any); ok && m["status"] == codemode.StatusOutcomeUnknown {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// resultNothingRan reports whether an error result proves nothing ran:
+// toolyard's own refusals say executed: false, and a code-mode run with an
+// empty call ledger made no call (a script changes nothing else).
+func resultNothingRan(res *mcp.CallToolResult) bool {
+	if m, ok := res.StructuredContent.(map[string]any); ok && m["executed"] == false {
+		return true
+	}
+	if res.Meta == nil {
+		return false
+	}
+	switch calls := res.Meta.AdditionalFields[codeModeCallsMeta].(type) {
+	case []codemode.LedgerEntry:
+		return len(calls) == 0
+	case []any:
+		return len(calls) == 0
+	}
+	return false
 }
 
 // encodeJobResult stores the whole tool result (text, images, structured
@@ -571,16 +702,32 @@ func (g *Gateway) jobVisible(ctx context.Context, j *jobs.Job) bool {
 	return false
 }
 
-// visibleJob returns job id when the ctx caller may see it.
+// visibleJob returns job id when the ctx caller may see it. Only
+// jobs.ErrNotFound means unknown (or another caller's): any other error is
+// a failed read, and the job may well exist.
 func (g *Gateway) visibleJob(ctx context.Context, id string) (*jobs.Job, error) {
 	j, err := g.jobs.Get(ctx, id)
 	if err != nil {
 		return nil, err
 	}
 	if !g.jobVisible(ctx, j) {
+		if err := ctx.Err(); err != nil {
+			return nil, err // the scope lookup failed closed
+		}
 		return nil, jobs.ErrNotFound
 	}
 	return j, nil
+}
+
+// jobReadFailed answers a jobs.* call whose read of the job state failed
+// (a database error, a restart): a retryable error, never "unknown", so the
+// caller does not take a live job for a missing one and call its tool
+// again.
+func jobReadFailed(err error) *mcp.CallToolResult {
+	res := mcp.NewToolResultError("could not read the job state (" + clipText(err.Error(), 200) +
+		"). The job is not affected and may still be running: call again in a few seconds; do not start the work again.")
+	res.StructuredContent = map[string]any{"status": "unavailable", "retryable": true}
+	return res
 }
 
 // ---- snapshots ----------------------------------------------------------
@@ -836,12 +983,24 @@ func (g *Gateway) handleJobsWait() directHandler {
 		}
 		timeout = clampToDeadline(ctx, timeout)
 		// Only the caller's own jobs are waited on; another agent's id
-		// reads as unknown.
+		// reads as unknown. Any other failed read is not "unknown": the
+		// answer is a retryable error.
 		var visible []string
 		for _, id := range ids {
-			if _, err := g.visibleJob(ctx, id); err == nil {
+			_, err := g.visibleJob(ctx, id)
+			switch {
+			case err == nil:
 				visible = append(visible, id)
+			case !errors.Is(err, jobs.ErrNotFound):
+				return jobReadFailed(err), nil
 			}
+		}
+		if len(visible) > 0 {
+			done, err := g.jobs.BeginWait(agentIDFromContext(ctx))
+			if err != nil {
+				return mcp.NewToolResultError(err.Error() + ": jobs.status(job_id=...) answers at once"), nil
+			}
+			defer done()
 		}
 		wctx, cancel := context.WithCancel(ctx)
 		defer cancel()
@@ -855,9 +1014,12 @@ func (g *Gateway) handleJobsWait() directHandler {
 		got := map[string]*jobs.Job{}
 		timedOut := false
 		if len(visible) > 0 {
+			// On a cancel (a restart releases waiters, a script's deadline)
+			// WaitFor answers the rows it last read, so a live job never
+			// reads as unknown; a nil row is a job purged meanwhile.
 			list, to, err := g.jobs.WaitFor(wctx, visible, mode == "any", time.Duration(timeout)*time.Second)
 			if err != nil {
-				return mcp.NewToolResultErrorFromErr("wait for jobs", err), nil
+				return jobReadFailed(err), nil
 			}
 			timedOut = to
 			for i, j := range list {
@@ -1004,6 +1166,11 @@ func (g *Gateway) handleJobsStart() directHandler {
 			return mcp.NewToolResultErrorf("%s cannot be called from code mode: call the tools you need directly in the script", target), nil
 		}
 		ref := strings.TrimSpace(stringArg(args, "callback_ref"))
+		if ref == "" {
+			// jobs.start's own _callback_ref (the reserved argument every
+			// tool takes) names the job's receiver too.
+			ref = callbackRefFrom(ctx)
+		}
 		if err := jobs.CheckCallbackRef(ref); err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
 		}

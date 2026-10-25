@@ -251,7 +251,8 @@ func (g *Gateway) taskToolCall(ctx context.Context, w http.ResponseWriter, req t
 		return
 	}
 	areq := &asyncRequest{via: jobViaTask}
-	res, err := g.handlerFor(name)(withAsyncRequest(ctx, areq), mcp.CallToolRequest{Params: mcp.CallToolParams{Name: name, Arguments: args}})
+	// The same panic guard mcp-go's middleware gives a plain tools/call.
+	res, err := recoverToolPanics(g.handlerFor(name))(withAsyncRequest(ctx, areq), mcp.CallToolRequest{Params: mcp.CallToolParams{Name: name, Arguments: args}})
 	job, jerr := areq.result()
 	if job == nil {
 		// Answered without a job (refused, held, or the job could not be
@@ -266,10 +267,10 @@ func (g *Gateway) taskToolCall(ctx context.Context, w http.ResponseWriter, req t
 			res = mcp.NewToolResultError(msg)
 		}
 		reason, _ := args[entry.reasonField].(string)
+		// An unknown outcome stays one (a resumed approval, an inline
+		// jobs.* call or a held call may have run): the task says it may
+		// have run rather than that it failed.
 		out := jobOutcome(res, nil)
-		if out.Status == jobs.StatusOutcomeUnknown {
-			out.Status = jobs.StatusFailed
-		}
 		job, err = g.jobs.Record(ctx, jobs.StartRequest{
 			AgentID: agentID, OwnerUserID: g.ownerOf(ctx, agentID), Tool: entry.tool.Name, Upstream: entry.upstream,
 			ParamsHash: paramsHash(args), Reason: reason, Via: jobViaTask, CallbackRef: callbackRefFrom(withCallbackRefFor(ctx, entry, args)),
@@ -277,6 +278,12 @@ func (g *Gateway) taskToolCall(ctx context.Context, w http.ResponseWriter, req t
 		var ie *jobs.InputError
 		if errors.As(err, &ie) {
 			writeRPCError(w, req, mcp.INVALID_PARAMS, ie.Error())
+			return
+		}
+		if errors.Is(err, jobs.ErrTooManyRecorded) {
+			// Too many stored answers: the answer itself, as an error,
+			// with no task.
+			writeRPCError(w, req, mcp.INTERNAL_ERROR, "no task was stored ("+err.Error()+"); the call's answer: "+clipText(summariseResult(res), 2000))
 			return
 		}
 		if err != nil {
@@ -330,15 +337,18 @@ func (g *Gateway) taskGet(ctx context.Context, w http.ResponseWriter, req taskRe
 	}
 	// 2026-07-28 has no tasks/result: an ended task carries its result.
 	result.ResultType = mcp.ResultTypeComplete
-	body := map[string]any{}
-	raw, _ := json.Marshal(result)
-	_ = json.Unmarshal(raw, &body)
+	body := modernTaskGet{GetTaskResult: result}
 	if j.Final() {
-		if res := g.taskToolResult(ctx, j); res != nil {
-			body["result"] = res
-		}
+		body.TaskResult = g.taskToolResult(ctx, j)
 	}
 	writeRPCResult(w, req.id, body)
+}
+
+// modernTaskGet is a 2026-07-28 tasks/get answer: the task, and the
+// result of an ended one, encoded once.
+type modernTaskGet struct {
+	mcp.GetTaskResult
+	TaskResult *mcp.TaskResultResult `json:"result,omitempty"`
 }
 
 // taskToolResult is an ended job's tool result as tasks/result answers it.
@@ -379,10 +389,21 @@ func (g *Gateway) taskResult(ctx context.Context, w http.ResponseWriter, req tas
 	if !ok {
 		return
 	}
+	if !j.Final() {
+		done, err := g.jobs.BeginWait(agentIDFromContext(ctx))
+		if err != nil {
+			writeRPCError(w, req, mcp.INTERNAL_ERROR, err.Error()+": tasks/get answers at once; call tasks/result again later")
+			return
+		}
+		defer done()
+	}
 	for !j.Final() {
 		list, timedOut, err := g.jobs.WaitFor(ctx, []string{j.ID}, false, jobs.MaxWait)
 		if err != nil {
-			writeRPCError(w, req, mcp.INTERNAL_ERROR, "wait for task: "+err.Error())
+			if ctx.Err() != nil {
+				return // the client went away
+			}
+			writeRPCError(w, req, mcp.INTERNAL_ERROR, "could not read the task state ("+err.Error()+"); the task is not affected: call tasks/result again in a few seconds")
 			return
 		}
 		if len(list) != 1 || list[0] == nil {
@@ -494,6 +515,10 @@ func taskStatus(status string) mcp.TaskStatus {
 // jobs.status and the REST route read the same work.
 func (g *Gateway) taskOf(j *jobs.Job) mcp.Task {
 	ttl := g.jobs.Retention().Milliseconds()
+	if j.ExpiresAt > 0 {
+		// A recorded answer is kept a short while from its creation.
+		ttl = max(j.ExpiresAt-j.CreatedAt, 0)
+	}
 	poll := int64(taskPollIntervalMs)
 	t := mcp.Task{
 		TaskId: j.ID, Status: taskStatus(j.Status), CreatedAt: msTime(j.CreatedAt), LastUpdatedAt: msTime(j.UpdatedAt),

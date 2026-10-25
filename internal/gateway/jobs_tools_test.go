@@ -523,14 +523,22 @@ func TestAsyncToolNeedsPermissionAndRedeemsItsGrantInTheJob(t *testing.T) {
 	if f.deployCalls.Load() != 1 {
 		t.Fatalf("deploy ran %d times", f.deployCalls.Load())
 	}
-	// The grant is used up: a second job reports grant_invalid, nothing runs.
-	again := map[string]any{GrantField: tok}
-	for k, v := range deploy {
-		again[k] = v
+	// The grant is checked before a job is stored: a used one, or a
+	// made-up one, answers grant_invalid at once, starts no job and runs
+	// nothing.
+	jobsBefore := f.jobCount(t)
+	for _, bad := range []string{tok, "tyg_not.a-real-grant"} {
+		again := map[string]any{GrantField: bad}
+		for k, v := range deploy {
+			again[k] = v
+		}
+		res := f.call(t, "deploy.run", again)
+		if s := structured(t, res); s["status"] != "grant_invalid" || metaTrue(res, "toolyard.job") {
+			t.Fatalf("call with grant %q = %v", bad, s)
+		}
 	}
-	id2 := jobIDOf(t, f.call(t, "deploy.run", again))
-	if w := f.waitJob(t, id2); w["status"] != jobs.StatusFailed || !strings.Contains(asJSON(w["result"]), "grant_invalid") {
-		t.Fatalf("second use of the grant = %v", w)
+	if n := f.jobCount(t); n != jobsBefore {
+		t.Fatalf("invalid grants stored %d jobs", n-jobsBefore)
 	}
 	if f.deployCalls.Load() != 1 {
 		t.Fatalf("a used grant ran the tool again (%d calls)", f.deployCalls.Load())

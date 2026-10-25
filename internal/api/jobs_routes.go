@@ -302,10 +302,17 @@ func (s *Server) jobsItem(w http.ResponseWriter, r *http.Request) {
 }
 
 // waitJob waits up to wait for j to be final and returns its latest state.
+// Prefer: wait is a hint: past the agent's cap on waits in progress, the
+// current state answers at once.
 func (s *Server) waitJob(ctx context.Context, j *jobs.Job, wait time.Duration) *jobs.Job {
 	if j.Final() || wait <= 0 {
 		return j
 	}
+	done, err := s.jobs.BeginWait(j.AgentID)
+	if err != nil {
+		return j
+	}
+	defer done()
 	list, _, err := s.jobs.WaitFor(ctx, []string{j.ID}, false, min(wait, jobs.MaxWait))
 	if err == nil && len(list) == 1 && list[0] != nil {
 		return list[0]

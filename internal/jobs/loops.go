@@ -126,10 +126,22 @@ func (s *Service) Heartbeat(ctx context.Context) {
 	}
 	if g := s.guard.Load(); g != nil && *g != nil {
 		for id, r := range runs {
-			if !(*g)(ctx, r.agentID, r.upstream, r.tool) {
-				r.revoked.Store(true)
-				s.cancelLocal(id, false)
+			allowed := (*g)(ctx, r.agentID, r.upstream, r.tool)
+			if ctx.Err() != nil {
+				break // a lookup on an ended context proves nothing
 			}
+			if allowed {
+				r.guardRefusals.Store(0)
+				continue
+			}
+			// The lookup fails closed: one refusal may be a short database
+			// error. Access removed reads the same on the next beat too.
+			if r.guardRefusals.Add(1) < guardRefusalsToStop {
+				s.log.Warn("job: the access check refused a running job once; it is stopped if the next check refuses it too", "job_id", id)
+				continue
+			}
+			r.revoked.Store(true)
+			s.cancelLocal(id, false)
 		}
 	}
 	for id, r := range runs {
@@ -186,14 +198,16 @@ func (s *Service) Recover(ctx context.Context) (failed, unknown int, err error) 
 	return failed, unknown, nil
 }
 
-// Purge deletes jobs that finished more than Retention ago, and their
-// blob-store results that nothing else names.
+// Purge deletes jobs that finished more than Retention ago, recorded task
+// answers past their ExpiresAt, and their blob-store results that nothing
+// else names.
 func (s *Service) Purge(ctx context.Context) (int, error) {
-	cutoff := s.now().Add(-s.retention).UnixMilli()
+	now := s.now()
+	cutoff := now.Add(-s.retention).UnixMilli()
 	total := 0
 	for {
 		rows, err := s.db.QueryContext(ctx, `SELECT id, COALESCE(result_blob,'') FROM tool_jobs
-             WHERE finished_at IS NOT NULL AND finished_at < ? ORDER BY finished_at LIMIT 500`, cutoff)
+             WHERE finished_at IS NOT NULL AND (finished_at < ? OR (expires_at IS NOT NULL AND expires_at < ?)) LIMIT 500`, cutoff, now.UnixMilli())
 		if err != nil {
 			return total, err
 		}
@@ -239,8 +253,9 @@ func (s *Service) Purge(ctx context.Context) (int, error) {
 }
 
 // blobReferenced reports whether a stored job still names blob key. Job
-// result keys are domain-separated (blobKey), so no Inbox attachment can
-// name one; inbox_blobs is checked too, to be safe.
+// result keys are domain-separated and per job (blobKey), so no Inbox
+// attachment and no other job can name one; both are checked anyway, to be
+// safe.
 func (s *Service) blobReferenced(ctx context.Context, key string) bool {
 	var n int
 	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM tool_jobs WHERE result_blob = ?`, key).Scan(&n); err != nil || n > 0 {
@@ -426,8 +441,8 @@ func (s *Service) Released() <-chan struct{} { return s.released }
 
 // Wait returns once no job goroutine of this process is left. When ctx
 // ends first it cancels the jobs still going (a running call is recorded
-// outcome_unknown, a queued job failed) and gives them up to two seconds
-// to record that.
+// outcome_unknown unless it succeeded or proves it never ran, a queued job
+// failed) and gives them up to two seconds to record that.
 func (s *Service) Wait(ctx context.Context) {
 	if !s.waitIdle(ctx.Done()) {
 		// Jobs that never started go first, so a slot a running job frees
@@ -435,10 +450,12 @@ func (s *Service) Wait(ctx context.Context) {
 		s.mu.Lock()
 		for _, r := range s.inflight {
 			if !r.started.Load() {
+				r.shutdown.Store(true)
 				r.cancel()
 			}
 		}
 		for _, r := range s.inflight {
+			r.shutdown.Store(true)
 			r.cancel()
 		}
 		n := len(s.inflight)

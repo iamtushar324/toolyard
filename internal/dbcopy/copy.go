@@ -26,6 +26,9 @@ type CopyOptions struct {
 	// the target commit. An error (the source changed or came into use
 	// during the run) stops the copy, and nothing is committed.
 	SourceGuard func() error
+	// JobResultDir is the folder of large async-job results
+	// (<data>/job-results); "" leaves job results out.
+	JobResultDir string
 }
 
 // A table is loaded in COPY batches of at most batchRows rows or about
@@ -87,6 +90,10 @@ func Copy(ctx context.Context, src *sql.DB, srcBlobDir string, dst *store.DB, op
 		return rep, fmt.Errorf("db copy: refused, nothing was written: %d inbox_blobs rows have no file in %s, and %d files do not hash to their name (the report lists them)",
 			missing, srcBlobDir, bad)
 	}
+	jobBlobs, err := scanJobResults(ctx, stx, opts.JobResultDir, &rep.JobResults)
+	if err != nil {
+		return rep, fmt.Errorf("db copy: %w", err)
+	}
 	seqs, err := readSQLiteSequences(ctx, stx)
 	if err != nil {
 		return rep, fmt.Errorf("db copy: %w", err)
@@ -145,14 +152,14 @@ func Copy(ctx context.Context, src *sql.DB, srcBlobDir string, dst *store.DB, op
 				strings.TrimPrefix(err.Error(), "db copy: refused, nothing was written: "))
 		}
 	}
-	if len(blobs) > 0 && len(p.BlobTables) != len(blobTables) {
+	if len(blobs)+len(jobBlobs) > 0 && len(p.BlobTables) != len(blobTables) {
 		rep.problemf("the target has no blob store tables (%s)", strings.Join(blobTables, ", "))
 		return rep, fmt.Errorf("db copy: refused, nothing was written: the target has no blob store tables (%s)", strings.Join(blobTables, ", "))
 	}
 
 	var tables []TableReport
 	var reset []string
-	var copied, present int
+	var copied, present, jobCopied, jobPresent int
 	err = dst.WithPgxConn(ctx, func(conn *pgx.Conn) error {
 		tx, err := conn.Begin(ctx)
 		if err != nil {
@@ -177,6 +184,9 @@ func Copy(ctx context.Context, src *sql.DB, srcBlobDir string, dst *store.DB, op
 			}
 		}
 		if copied, present, err = copyBlobs(ctx, blobs, pgxExecer(tx)); err != nil {
+			return err
+		}
+		if jobCopied, jobPresent, err = copyBlobs(ctx, jobBlobs, pgxExecer(tx)); err != nil {
 			return err
 		}
 		for _, t := range p.Tables {
@@ -216,6 +226,7 @@ func Copy(ctx context.Context, src *sql.DB, srcBlobDir string, dst *store.DB, op
 	rep.IdentityReset = reset
 	rep.TruncatedTarget = opts.TruncateTarget
 	rep.Blobs.Copied, rep.Blobs.AlreadyPresent = copied, present
+	rep.JobResults.Copied, rep.JobResults.AlreadyPresent = jobCopied, jobPresent
 	for _, tr := range tables {
 		if !tr.Match {
 			rep.problemf("table %s: %d source rows, but Postgres took %d", tr.Name, tr.SourceRows, tr.CopiedRows)

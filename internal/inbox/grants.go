@@ -191,36 +191,11 @@ func (s *Service) issueGrants(ctx context.Context, tx *sql.Tx, r *Request, now i
 // concurrent calls can't both redeem a single-use grant. The returned
 // grant carries the issuer's email and name (see Grant.Decider).
 func (s *Service) Redeem(ctx context.Context, token, agentID, tool string, args map[string]any) (*Grant, error) {
-	id, sig, err := parseToken(token)
+	g, err := s.checkGrant(ctx, token, agentID, tool, args)
 	if err != nil {
-		return nil, &RedeemError{Err: err}
-	}
-	g, hash, err := s.getGrantWithHash(ctx, id)
-	if err != nil {
-		return nil, &RedeemError{Err: ErrGrantUnknown}
-	}
-	if subtle.ConstantTimeCompare([]byte(hash), []byte(hashToken(token))) != 1 ||
-		!ed25519.Verify(s.signer.pub, grantMessage(g.ID, g.AgentID), sig) {
-		return nil, &RedeemError{Err: ErrGrantUnknown}
-	}
-	if g.AgentID != agentID {
-		return nil, &RedeemError{Err: ErrGrantAgent, Grant: g}
+		return nil, err
 	}
 	now := s.now().UnixMilli()
-	switch {
-	case g.Status == GrantRevoked:
-		return nil, &RedeemError{Err: ErrGrantRevoked, Grant: g}
-	case g.Status == GrantUsed || g.Uses >= g.MaxUses:
-		return nil, &RedeemError{Err: ErrGrantUsed, Grant: g}
-	case g.Status == GrantExpired || now >= g.ExpiresAt:
-		return nil, &RedeemError{Err: ErrGrantExpired, Grant: g}
-	}
-	if g.Tool != tool {
-		return nil, &RedeemError{Err: ErrGrantTool, Grant: g, Detail: fmt.Sprintf("it covers %s, not %s", g.Tool, tool)}
-	}
-	if ok, why := MatchArgs(g.Params, args); !ok {
-		return nil, &RedeemError{Err: ErrGrantScope, Grant: g, Detail: why}
-	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, err
@@ -258,6 +233,49 @@ func (s *Service) Redeem(ctx context.Context, token, agentID, tool string, args 
 	}
 	g.LastUsedAt = now
 	s.noteGrantUse(ctx, g, args)
+	return g, nil
+}
+
+// CheckGrant makes Redeem's checks for one call without using the grant
+// up: an async tool's job checks its grant before the job is stored, and
+// redeems it when the call runs. A grant that passes here can still be
+// refused by Redeem (used, revoked or expired meanwhile).
+func (s *Service) CheckGrant(ctx context.Context, token, agentID, tool string, args map[string]any) (*Grant, error) {
+	return s.checkGrant(ctx, token, agentID, tool, args)
+}
+
+// checkGrant is every check Redeem makes before it uses the grant up.
+func (s *Service) checkGrant(ctx context.Context, token, agentID, tool string, args map[string]any) (*Grant, error) {
+	id, sig, err := parseToken(token)
+	if err != nil {
+		return nil, &RedeemError{Err: err}
+	}
+	g, hash, err := s.getGrantWithHash(ctx, id)
+	if err != nil {
+		return nil, &RedeemError{Err: ErrGrantUnknown}
+	}
+	if subtle.ConstantTimeCompare([]byte(hash), []byte(hashToken(token))) != 1 ||
+		!ed25519.Verify(s.signer.pub, grantMessage(g.ID, g.AgentID), sig) {
+		return nil, &RedeemError{Err: ErrGrantUnknown}
+	}
+	if g.AgentID != agentID {
+		return nil, &RedeemError{Err: ErrGrantAgent, Grant: g}
+	}
+	now := s.now().UnixMilli()
+	switch {
+	case g.Status == GrantRevoked:
+		return nil, &RedeemError{Err: ErrGrantRevoked, Grant: g}
+	case g.Status == GrantUsed || g.Uses >= g.MaxUses:
+		return nil, &RedeemError{Err: ErrGrantUsed, Grant: g}
+	case g.Status == GrantExpired || now >= g.ExpiresAt:
+		return nil, &RedeemError{Err: ErrGrantExpired, Grant: g}
+	}
+	if g.Tool != tool {
+		return nil, &RedeemError{Err: ErrGrantTool, Grant: g, Detail: fmt.Sprintf("it covers %s, not %s", g.Tool, tool)}
+	}
+	if ok, why := MatchArgs(g.Params, args); !ok {
+		return nil, &RedeemError{Err: ErrGrantScope, Grant: g, Detail: why}
+	}
 	return g, nil
 }
 

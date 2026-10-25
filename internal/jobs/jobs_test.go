@@ -151,7 +151,7 @@ func TestLargeResultsGoToTheBlobStoreAndArePurged(t *testing.T) {
 	if env, err := svc.Result(ctx, got); err != nil || env != big {
 		t.Fatalf("Result from blob = %d bytes, %v", len(env), err)
 	}
-	if ok, _ := blobs.Exists(ctx, jobBlobKey(big)); !ok {
+	if ok, _ := blobs.Exists(ctx, jobBlobKey(job.ID, big)); !ok {
 		t.Fatal("the result is not under its domain-separated key")
 	}
 	var inline sql.NullString
@@ -172,12 +172,12 @@ func TestLargeResultsGoToTheBlobStoreAndArePurged(t *testing.T) {
 	if _, err := svc.Get(ctx, job.ID); !errors.Is(err, jobs.ErrNotFound) {
 		t.Fatalf("purged job still readable: %v", err)
 	}
-	if ok, _ := blobs.Exists(ctx, jobBlobKey(big)); ok {
+	if ok, _ := blobs.Exists(ctx, jobBlobKey(job.ID, big)); ok {
 		t.Fatal("the result blob outlived its job")
 	}
 	// The key is domain-separated: never the content's own sha256, which
 	// an Inbox attachment of the same bytes would use.
-	if jobBlobKey(big) == sha256Hex(big) {
+	if jobBlobKey(job.ID, big) == sha256Hex(big) {
 		t.Fatal("job blob key equals the content hash")
 	}
 }
@@ -187,7 +187,7 @@ func sha256Hex(s string) string {
 	return hex.EncodeToString(sum[:])
 }
 
-func jobBlobKey(env string) string { return sha256Hex("tool_job\x00" + env) }
+func jobBlobKey(id, env string) string { return sha256Hex(jobs.BlobKeyPrefix(id) + env) }
 
 func TestCancelARunningJob(t *testing.T) {
 	db := storetest.Open(t)
@@ -798,15 +798,112 @@ func TestGuardStopsAJobWhoseAccessWasRemoved(t *testing.T) {
 	if j, _ := svc.Get(ctx, job.ID); j.Final() {
 		t.Fatal("the guard stopped a job that still has access")
 	}
-	mu.Lock()
-	revoked["ag_1"] = true
-	mu.Unlock()
+	setRevoked := func(v bool) {
+		mu.Lock()
+		defer mu.Unlock()
+		revoked["ag_1"] = v
+	}
+	// One refusal (the lookup fails closed, so it may be a database
+	// error) does not stop the job, and a pass in between starts the count
+	// again.
+	for i := 0; i < 2; i++ {
+		setRevoked(true)
+		svc.Heartbeat(ctx)
+		setRevoked(false)
+		svc.Heartbeat(ctx)
+	}
+	time.Sleep(50 * time.Millisecond)
+	if j, _ := svc.Get(ctx, job.ID); j.Final() {
+		t.Fatalf("single refusals stopped the job: %+v", j)
+	}
+	// Two refusals in a row do.
+	setRevoked(true)
+	svc.Heartbeat(ctx)
+	if j, _ := svc.Get(ctx, job.ID); j.Final() {
+		t.Fatalf("the first refusal stopped the job: %+v", j)
+	}
 	svc.Heartbeat(ctx)
 	got := waitFinal(t, svc, job.ID)
 	if got.Status != jobs.StatusCancelled || !strings.Contains(got.Error, "access to this tool was removed") {
 		t.Fatalf("revoked job = %+v", got)
 	}
 	waitUntil(t, "the revoked audit row", func() bool { return aud.has(jobs.EventJobRevoked, job.ID) })
+}
+
+// A heartbeat whose context ended counts no refusal: the lookup failed,
+// it did not say the access is gone.
+func TestGuardIgnoresLookupsOnAnEndedContext(t *testing.T) {
+	db := storetest.Open(t)
+	svc := newService(t, db, jobs.Options{})
+	svc.SetGuard(func(ctx context.Context, _, _, _ string) bool { return ctx.Err() == nil })
+	ctx := context.Background()
+	release := make(chan struct{})
+	defer close(release)
+	job, _, err := svc.Start(ctx, startReq("ag_1", "alpha.get_slow"), blockUntil(release))
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitUntil(t, "running", func() bool { j, _ := svc.Get(ctx, job.ID); return j != nil && j.Status == jobs.StatusRunning })
+	ended, cancel := context.WithCancel(ctx)
+	cancel()
+	for i := 0; i < 3; i++ {
+		svc.Heartbeat(ended)
+	}
+	time.Sleep(50 * time.Millisecond)
+	if j, _ := svc.Get(ctx, job.ID); j.Final() {
+		t.Fatalf("lookups on an ended context stopped the job: %+v", j)
+	}
+}
+
+// A queued job the Guard stops says its access was removed, and that
+// nothing ran; a queued job that waits its whole time limit for a run
+// slot says so.
+func TestNeverStartedJobsSayWhy(t *testing.T) {
+	db := storetest.Open(t)
+	svc := jobs.New(db, jobs.Options{PollEvery: 20 * time.Millisecond, MaxRunning: 1, MaxDuration: 300 * time.Millisecond})
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		svc.Wait(ctx)
+	})
+	ctx := context.Background()
+	// The first job holds the only slot past its own time limit.
+	hold := make(chan struct{})
+	t.Cleanup(func() { close(hold) })
+	first, _, err := svc.Start(ctx, startReq("ag_1", "alpha.get_slow"), func(context.Context, jobs.ProgressFunc) jobs.Outcome {
+		<-hold
+		return jobs.Outcome{Status: jobs.StatusSucceeded}
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitUntil(t, "the first job running", func() bool { j, _ := svc.Get(ctx, first.ID); return j != nil && j.Status == jobs.StatusRunning })
+	starved, _, err := svc.Start(ctx, startReq("ag_2", "alpha.get_other"), blockUntil(make(chan struct{})))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := waitFinal(t, svc, starved.ID); got.Status != jobs.StatusFailed || !strings.Contains(got.Error, "run slot") || got.StartedAt != 0 {
+		t.Fatalf("job that never got a slot = %+v", got)
+	}
+
+	svc2 := newService(t, storetest.Open(t), jobs.Options{MaxRunning: 1})
+	svc2.SetGuard(func(_ context.Context, agentID, _, _ string) bool { return agentID != "ag_gone" })
+	release := make(chan struct{})
+	defer close(release)
+	busy, _, err := svc2.Start(ctx, startReq("ag_1", "alpha.get_slow"), blockUntil(release))
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitUntil(t, "the busy job running", func() bool { j, _ := svc2.Get(ctx, busy.ID); return j != nil && j.Status == jobs.StatusRunning })
+	queued, _, err := svc2.Start(ctx, startReq("ag_gone", "alpha.get_other"), blockUntil(release))
+	if err != nil {
+		t.Fatal(err)
+	}
+	svc2.Heartbeat(ctx)
+	svc2.Heartbeat(ctx)
+	if got := waitFinal(t, svc2, queued.ID); got.Status != jobs.StatusCancelled || !strings.Contains(got.Error, "removed before the job started") {
+		t.Fatalf("queued job whose access was removed = %+v", got)
+	}
 }
 
 func TestOrphanedResultBlobIsDeleted(t *testing.T) {
@@ -833,7 +930,7 @@ func TestOrphanedResultBlobIsDeleted(t *testing.T) {
 	}
 	close(release)
 	waitUntil(t, "the goroutine to end", func() bool { return svc.Running() == 0 })
-	if ok, _ := blobs.Exists(ctx, jobBlobKey(big)); ok {
+	if ok, _ := blobs.Exists(ctx, jobBlobKey(job.ID, big)); ok {
 		t.Fatal("a result blob for a row that did not move was kept")
 	}
 }
@@ -864,5 +961,248 @@ func TestNeverStartedJobIsAudited(t *testing.T) {
 	}
 	if !aud.has(jobs.EventJobNotStarted, queued.ID) {
 		t.Fatal("no job.not_started audit row")
+	}
+}
+
+// WaitFor returns the rows it last read when its context ends or the
+// waiters are released, never empty rows (which would read as unknown
+// jobs); even on a context that already ended it reads once.
+func TestWaitForKeepsTheLastRowsWhenItsContextEnds(t *testing.T) {
+	db := storetest.Open(t)
+	svc := newService(t, db, jobs.Options{})
+	ctx := context.Background()
+	release := make(chan struct{})
+	defer close(release)
+	job, _, err := svc.Start(ctx, startReq("ag_1", "alpha.get_slow"), blockUntil(release))
+	if err != nil {
+		t.Fatal(err)
+	}
+	wctx, cancel := context.WithTimeout(ctx, 100*time.Millisecond)
+	defer cancel()
+	list, timedOut, err := svc.WaitFor(wctx, []string{job.ID}, false, 10*time.Second)
+	if err != nil || !timedOut || len(list) != 1 || list[0] == nil || list[0].ID != job.ID || list[0].Final() {
+		t.Fatalf("WaitFor after its context ended = %+v %v %v", list, timedOut, err)
+	}
+	ended, endNow := context.WithCancel(ctx)
+	endNow()
+	list, timedOut, err = svc.WaitFor(ended, []string{job.ID, "job_missing"}, false, 10*time.Second)
+	if err != nil || !timedOut || len(list) != 2 || list[0] == nil || list[0].ID != job.ID || list[1] != nil {
+		t.Fatalf("WaitFor on an ended context = %+v %v %v", list, timedOut, err)
+	}
+	svc.ReleaseWaiters()
+	list, timedOut, err = svc.WaitFor(ctx, []string{job.ID}, false, 10*time.Second)
+	if err != nil || !timedOut || len(list) != 1 || list[0] == nil {
+		t.Fatalf("WaitFor after ReleaseWaiters = %+v %v %v", list, timedOut, err)
+	}
+}
+
+func TestRecordedTaskAnswersExpireAndAreCapped(t *testing.T) {
+	db := storetest.Open(t)
+	now := time.Now()
+	var clockMu sync.Mutex
+	clock := func() time.Time { clockMu.Lock(); defer clockMu.Unlock(); return now }
+	svc := newService(t, db, jobs.Options{MaxRecordedPerAgent: 2, Now: clock})
+	ctx := context.Background()
+	refused := jobs.Outcome{Status: jobs.StatusFailed, Error: "permission required", IsError: true}
+	first, err := svc.Record(ctx, startReq("ag_1", "alpha.get_x"), refused)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if first.Status != jobs.StatusFailed || first.ExpiresAt != now.Add(jobs.RecordedRetention).UnixMilli() {
+		t.Fatalf("recorded answer = %+v", first)
+	}
+	if _, err := svc.Record(ctx, startReq("ag_1", "alpha.get_x"), refused); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.Record(ctx, startReq("ag_1", "alpha.get_x"), refused); !errors.Is(err, jobs.ErrTooManyRecorded) {
+		t.Fatalf("third recorded answer within the hour: %v", err)
+	}
+	// Another agent has its own count, and an unknown outcome stays one.
+	unknown, err := svc.Record(ctx, startReq("ag_2", "alpha.get_x"), jobs.Outcome{Status: jobs.StatusOutcomeUnknown, Error: "may have run"})
+	if err != nil || unknown.Status != jobs.StatusOutcomeUnknown {
+		t.Fatalf("recorded unknown outcome = %+v %v", unknown, err)
+	}
+	// A real job is kept for the retention, not the hour.
+	job, _, err := svc.Start(ctx, startReq("ag_1", "alpha.get_fast"), func(context.Context, jobs.ProgressFunc) jobs.Outcome {
+		return jobs.Outcome{Status: jobs.StatusSucceeded}
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := waitFinal(t, svc, job.ID); got.ExpiresAt != 0 {
+		t.Fatalf("a job got an expiry: %+v", got)
+	}
+	clockMu.Lock()
+	now = now.Add(jobs.RecordedRetention + time.Minute)
+	clockMu.Unlock()
+	if n, err := svc.Purge(ctx); err != nil || n != 3 {
+		t.Fatalf("Purge after the hour = %d %v, want the 3 recorded answers", n, err)
+	}
+	if _, err := svc.Get(ctx, job.ID); err != nil {
+		t.Fatalf("the job went with the recorded answers: %v", err)
+	}
+	if _, err := svc.Record(ctx, startReq("ag_1", "alpha.get_x"), refused); err != nil {
+		t.Fatalf("recorded answer after the hour: %v", err)
+	}
+}
+
+func TestStoredResultBytesAreCappedPerAgentAndOwner(t *testing.T) {
+	db := storetest.Open(t)
+	svc := newService(t, db, jobs.Options{MaxStoredBytesPerAgent: 100, MaxStoredBytesPerOwner: 150})
+	ctx := context.Background()
+	run := func(agent string) *jobs.Job {
+		t.Helper()
+		job, _, err := svc.Start(ctx, startReq(agent, "alpha.get_big"), func(context.Context, jobs.ProgressFunc) jobs.Outcome {
+			return jobs.Outcome{Status: jobs.StatusSucceeded, Envelope: strings.Repeat("z", 60)}
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return waitFinal(t, svc, job.ID)
+	}
+	if a := run("ag_1"); a.ResultBytes != 60 {
+		t.Fatalf("first result not kept: %+v", a)
+	}
+	if b := run("ag_1"); b.Status != jobs.StatusSucceeded || b.HasResult() || !strings.Contains(b.Error, "this agent's stored job results") {
+		t.Fatalf("result over the agent's cap = %+v", b)
+	}
+	if c := run("ag_2"); c.ResultBytes != 60 {
+		t.Fatalf("another agent's result not kept: %+v", c)
+	}
+	if d := run("ag_3"); d.HasResult() || !strings.Contains(d.Error, "owner's agents") {
+		t.Fatalf("result over the owner's cap = %+v", d)
+	}
+}
+
+func TestWaitsAreCappedPerAgent(t *testing.T) {
+	svc := newService(t, storetest.Open(t), jobs.Options{MaxWaitersPerAgent: 2})
+	d1, err := svc.BeginWait("ag_1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.BeginWait("ag_1"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.BeginWait("ag_1"); !errors.Is(err, jobs.ErrTooManyWaiters) {
+		t.Fatalf("third wait: %v", err)
+	}
+	if _, err := svc.BeginWait("ag_2"); err != nil {
+		t.Fatalf("another agent's wait: %v", err)
+	}
+	d1()
+	d1() // a second call frees nothing more
+	if _, err := svc.BeginWait("ag_1"); err != nil {
+		t.Fatalf("wait after one ended: %v", err)
+	}
+	if _, err := svc.BeginWait("ag_1"); !errors.Is(err, jobs.ErrTooManyWaiters) {
+		t.Fatalf("wait over the cap after a double done: %v", err)
+	}
+}
+
+// A final write that fails is tried again, so a known outcome is kept.
+func TestAFailedFinalWriteIsTriedAgain(t *testing.T) {
+	db := storetest.Open(t)
+	if db.Dialect.IsPostgres() {
+		t.Skip("the failure is injected with a SQLite trigger")
+	}
+	svc := newService(t, db, jobs.Options{})
+	ctx := context.Background()
+	for _, q := range []string{
+		`CREATE TABLE fail_settle(n INTEGER)`,
+		`INSERT INTO fail_settle VALUES(1)`,
+		`CREATE TRIGGER fail_settle_trg BEFORE UPDATE OF status ON tool_jobs
+           WHEN NEW.status = 'succeeded' AND EXISTS (SELECT 1 FROM fail_settle)
+         BEGIN SELECT RAISE(ABORT, 'injected settle failure'); END`,
+	} {
+		if _, err := db.ExecContext(ctx, q); err != nil {
+			t.Fatal(err)
+		}
+	}
+	release := make(chan struct{})
+	job, _, err := svc.Start(ctx, startReq("ag_1", "alpha.get_slow"), func(context.Context, jobs.ProgressFunc) jobs.Outcome {
+		<-release
+		return jobs.Outcome{Status: jobs.StatusSucceeded, Envelope: "done"}
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitUntil(t, "running", func() bool { j, _ := svc.Get(ctx, job.ID); return j != nil && j.Status == jobs.StatusRunning })
+	close(release)
+	time.Sleep(400 * time.Millisecond)
+	if j, _ := svc.Get(ctx, job.ID); j.Status != jobs.StatusRunning {
+		t.Fatalf("the injected failure did not hold the row: %+v", j)
+	}
+	if _, err := db.ExecContext(ctx, `DELETE FROM fail_settle`); err != nil {
+		t.Fatal(err)
+	}
+	if got := waitFinal(t, svc, job.ID); got.Status != jobs.StatusSucceeded || !got.HasResult() {
+		t.Fatalf("job after the write recovered = %+v", got)
+	}
+}
+
+// A running call that the drain deadline interrupts is outcome_unknown
+// (with its audit row and a job.failed notice that says it may have run),
+// whatever error the interrupted call answered, unless it succeeded or
+// proves it never ran.
+func TestCallsStoppedByShutdownAreOutcomeUnknown(t *testing.T) {
+	db := storetest.Open(t)
+	n := &recNotifier{}
+	svc := jobs.New(db, jobs.Options{Notifier: n, PollEvery: 20 * time.Millisecond})
+	aud := &recAuditor{}
+	svc.SetAuditor(aud)
+	ctx := context.Background()
+	start := func(tool string, out jobs.Outcome) *jobs.Job {
+		t.Helper()
+		job, _, err := svc.Start(ctx, startReq("ag_1", tool), func(ctx context.Context, _ jobs.ProgressFunc) jobs.Outcome {
+			<-ctx.Done()
+			return out
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		waitUntil(t, tool+" running", func() bool { j, _ := svc.Get(ctx, job.ID); return j != nil && j.Status == jobs.StatusRunning })
+		return job
+	}
+	// A script that made a call and was then stopped answers a plain
+	// error, as executeToolCode does.
+	script := start("alpha.script", jobs.Outcome{Status: jobs.StatusFailed, IsError: true, Error: "the script was cancelled"})
+	notSent := start("alpha.not_sent", jobs.Outcome{Status: jobs.StatusCancelled, Error: "nothing ran", NothingRan: true})
+	answered := start("alpha.answered", jobs.Outcome{Status: jobs.StatusSucceeded, Envelope: "ok"})
+	ended, cancel := context.WithCancel(ctx)
+	cancel()
+	svc.Wait(ended)
+	if j, _ := svc.Get(ctx, script.ID); j.Status != jobs.StatusOutcomeUnknown || !strings.Contains(j.Error, "toolyard stopped") {
+		t.Fatalf("script stopped by shutdown = %+v", j)
+	}
+	if !aud.has(jobs.EventJobOutcomeUnknown, script.ID) {
+		t.Fatal("no job.outcome_unknown audit row for the interrupted call")
+	}
+	if got, ok := n.find(script.ID); !ok || got.Status != jobs.StatusOutcomeUnknown {
+		t.Fatalf("notice for the interrupted call = %+v %v", got, ok)
+	} else if ev, d := jobs.CallbackEvent(got); ev != jobs.EventJobFailed || d.MayHaveRun == nil || !*d.MayHaveRun {
+		t.Fatalf("callback for the interrupted call = %s %+v", ev, d)
+	}
+	if j, _ := svc.Get(ctx, notSent.ID); j.Status != jobs.StatusFailed || !strings.Contains(j.Error, "nothing ran") {
+		t.Fatalf("call never sent, stopped by shutdown = %+v", j)
+	}
+	if j, _ := svc.Get(ctx, answered.ID); j.Status != jobs.StatusSucceeded {
+		t.Fatalf("call that answered = %+v", j)
+	}
+
+	// A user's cancel is not a shutdown: the call's own answer stands.
+	svc2 := newService(t, storetest.Open(t), jobs.Options{})
+	job, _, err := svc2.Start(ctx, startReq("ag_1", "alpha.script"), func(ctx context.Context, _ jobs.ProgressFunc) jobs.Outcome {
+		<-ctx.Done()
+		return jobs.Outcome{Status: jobs.StatusFailed, IsError: true, Error: "the script was cancelled"}
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitUntil(t, "running", func() bool { j, _ := svc2.Get(ctx, job.ID); return j != nil && j.Status == jobs.StatusRunning })
+	if _, _, err := svc2.Cancel(ctx, job.ID); err != nil {
+		t.Fatal(err)
+	}
+	if got := waitFinal(t, svc2, job.ID); got.Status != jobs.StatusFailed {
+		t.Fatalf("user-cancelled script = %+v", got)
 	}
 }

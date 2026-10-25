@@ -68,6 +68,7 @@ func (s *Service) SetCluster(ctx context.Context, c *cluster.Cluster) {
 	}
 	r := &remoteSync{c: c, wake: make(chan struct{}, 1)}
 	s.remote = r
+	s.followAsync(c)
 	c.Subscribe(clusterTopic, func(payload string) {
 		r.mu.Lock()
 		if payload == cluster.Resync {

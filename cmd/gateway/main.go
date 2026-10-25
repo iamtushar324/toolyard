@@ -700,8 +700,8 @@ func runServe(argv []string) error {
 	// administrator marked async, jobs.start, POST /v1/jobs and MCP tasks
 	// run as durable jobs. Results over 256 KiB go to the blob store (files
 	// under <data>/job-results on SQLite, chunks in Postgres). The lease
-	// heartbeat and recovery run on every node; retention runs under the
-	// job Leader (single node until slice A's cluster.RunLeader is wired).
+	// heartbeat and recovery run on every node; the retention purge runs on
+	// the cluster leader (cluster.RunLeader).
 	jobBlobs, err := blobstore.ForDB(db, filepath.Join(*dataDir, "job-results"))
 	if err != nil {
 		return fmt.Errorf("job results: %w", err)
@@ -712,7 +712,10 @@ func runServe(argv []string) error {
 		Blobs: jobBlobs, MaxDuration: *asyncJobTimeout,
 		InstanceID: clusterSvc.InstanceID(), Leader: clusterSvc,
 	})
-	jobsSvc.Run(ctx)
+	// jobsSvc.Run starts below, once the gateway has attached the job
+	// auditor and the callbacks notifier: its first recovery pass settles
+	// the jobs an earlier process left, and their audit rows and job.failed
+	// callbacks must not be lost.
 	gw := gateway.New(gateway.Options{
 		Name:                "toolyard",
 		Version:             version,
@@ -1047,6 +1050,7 @@ func runServe(argv []string) error {
 	// A finished async job sends job.completed / job.failed to its
 	// _callback_ref, or the agent's default receiver.
 	jobsSvc.SetNotifier(jobs.EmitterNotifier(callbackSvc.EmitForAgentTx))
+	jobsSvc.Run(ctx)
 	bus.SetEventSink(callbackSvc)
 	upstreamSvc.SetSecrets(secretsSvc)
 

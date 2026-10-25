@@ -21,7 +21,7 @@ const jobColumns = `id, agent_id, owner_user_id, COALESCE(session_id,''), tool, 
     progress, progress_total, COALESCE(progress_message,''), COALESCE(progress_at,0),
     COALESCE(result_blob,''), result_bytes, result_is_error, COALESCE(error,''), COALESCE(callback_ref,''),
     COALESCE(callback_error,''), COALESCE(idempotency_key,''), cancel_requested, owner_instance, lease_until,
-    created_at, COALESCE(started_at,0), COALESCE(finished_at,0), updated_at`
+    created_at, COALESCE(started_at,0), COALESCE(finished_at,0), updated_at, COALESCE(expires_at,0)`
 
 type rowScanner interface{ Scan(dest ...any) error }
 
@@ -34,7 +34,7 @@ func scanJob(r rowScanner) (*Job, error) {
 		&prog, &total, &progMsg, &progAt,
 		&j.resultBlob, &resultBytes, &isErr, &j.Error, &j.CallbackRef,
 		&j.CallbackError, &j.IdempotencyKey, &cancelReq, &j.OwnerInstance, &j.LeaseUntil,
-		&j.CreatedAt, &j.StartedAt, &j.FinishedAt, &j.UpdatedAt); err != nil {
+		&j.CreatedAt, &j.StartedAt, &j.FinishedAt, &j.UpdatedAt, &j.ExpiresAt); err != nil {
 		return nil, err
 	}
 	j.ResultBytes = int(resultBytes)
@@ -69,13 +69,21 @@ func capLockKey(req StartRequest) int64 {
 	return int64(h.Sum64())
 }
 
-// blobKey names a job result in the blob store: the sha256 of the result
-// behind a domain prefix, so it never equals an Inbox attachment's content
-// hash and the Inbox's sweeps can never remove it (the store is shared on
-// Postgres).
-func blobKey(env string) string {
-	sum := sha256.Sum256([]byte("tool_job\x00" + env))
-	return hex.EncodeToString(sum[:])
+// BlobKeyPrefix is what a job's result blob key hashes before the result
+// itself: blob key = sha256(BlobKeyPrefix(id) + result). The domain prefix
+// keeps it from ever equalling an Inbox attachment's content hash, so the
+// Inbox's sweeps never remove it (the store is shared on Postgres); the
+// job id makes it the job's own, so one job's orphan cleanup or retention
+// purge never deletes another job's identical result. dbcopy checks copied
+// result files with it.
+func BlobKeyPrefix(id string) string { return "tool_job\x00" + id + "\x00" }
+
+// blobKey names job id's result in the blob store.
+func blobKey(id, env string) string {
+	h := sha256.New()
+	_, _ = h.Write([]byte(BlobKeyPrefix(id)))
+	_, _ = h.Write([]byte(env))
+	return hex.EncodeToString(h.Sum(nil))
 }
 
 func (s *Service) queryIDs(ctx context.Context, q string, args ...any) ([]string, error) {

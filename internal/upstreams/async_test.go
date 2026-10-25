@@ -64,3 +64,26 @@ func TestAsyncSettingIsStoredAndReadWithoutReconnecting(t *testing.T) {
 		t.Fatalf("cleared column = %v %v", raw, err)
 	}
 }
+
+// A change another replica saved applies here as soon as its cluster
+// message arrives (refreshAsync), not only after the cache TTL.
+func TestAsyncSettingFollowsAnotherReplicaAtOnce(t *testing.T) {
+	db := storetest.Open(t)
+	ctx := context.Background()
+	now := time.Now().UnixMilli()
+	if _, err := db.ExecContext(ctx, `INSERT INTO upstream_servers(name, transport, url, args_json, env_json, headers_json, identity_json, auth_mode, enabled, created_at, updated_at)
+        VALUES(?, 'http', 'http://127.0.0.1:1/mcp', '[]', '{}', '{}', NULL, 'shared', 1, ?, ?)`, "BkCore", now, now); err != nil {
+		t.Fatal(err)
+	}
+	here, there := New(db, nil), New(db, nil)
+	if got := here.AsyncSetting("BkCore"); !got.IsZero() {
+		t.Fatalf("new server is async: %+v", got)
+	}
+	if _, err := there.SetAsync(ctx, "BkCore", jobs.AsyncSetting{Mode: jobs.AsyncAlways}); err != nil {
+		t.Fatal(err)
+	}
+	here.refreshAsync()
+	if r := here.AsyncSetting("BkCore").RuleFor("get_client"); r.Mode != jobs.AsyncAlways {
+		t.Fatalf("after the message, this replica reads %+v", r)
+	}
+}
