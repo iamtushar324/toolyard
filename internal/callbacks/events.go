@@ -498,7 +498,7 @@ func (s *Service) Test(ctx context.Context, agentID, ref string) (string, error)
 	if !acceptsEvent(rec.Events, EventPing) {
 		return "", ErrEventNotAccepted
 	}
-	tx, err := s.db.BeginTx(ctx, nil)
+	tx, err := s.db.BeginTx(ctx, readCommitted)
 	if err != nil {
 		return "", err
 	}

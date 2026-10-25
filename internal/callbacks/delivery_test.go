@@ -295,3 +295,75 @@ func TestConcurrentPingsAndRegistrationsKeepTheLimits(t *testing.T) {
 		t.Fatalf("kept %d receivers, registrations %v", kept, errs)
 	}
 }
+
+// Many receivers of one shared host (one T3 server) with a backlog do not
+// fill the due window while that host is at its in-flight cap: an event
+// for another host is still picked.
+func TestPickDueHostBacklogDoesNotFillTheWindow(t *testing.T) {
+	s, db := fixture(t)
+	future := time.Now().Add(time.Minute).UnixMilli()
+	for i := 0; i < 12; i++ {
+		r := mustRegister(t, s, fmt.Sprintf("session-%02d", i), "t3", fmt.Sprintf("https://T3.example/api/session-webhooks/%d", i))
+		if i < 2 {
+			outboxRow(t, db, fmt.Sprintf("evt_t3_%02d_busy_a", i), r.ID, "delivering", 1, future)
+			outboxRow(t, db, fmt.Sprintf("evt_t3_%02d_busy_b", i), r.ID, "delivering", 1, future)
+		}
+		for j := 0; j < 3; j++ {
+			outboxRow(t, db, fmt.Sprintf("evt_t3_%02d_%d", i, j), r.ID, "pending", int64(10+i*3+j), 0)
+		}
+	}
+	other := mustRegister(t, s, "elsewhere", "hook", "https://other.example/hook")
+	outboxRow(t, db, "evt_other", other.ID, "pending", 1000, 0)
+	ids, err := s.pickDue(t.Context(), 1)
+	if err != nil || len(ids) != 1 || ids[0] != "evt_other" {
+		t.Fatalf("picked %v (%v), want evt_other", ids, err)
+	}
+	var host string
+	if err := db.QueryRow(`SELECT host FROM callback_receivers WHERE id=?`, other.ID).Scan(&host); err != nil || host != "other.example" {
+		t.Fatalf("stored host %q %v", host, err)
+	}
+}
+
+// destinationHost gives the value migration 0062 derives in SQL.
+func TestDestinationHost(t *testing.T) {
+	for in, want := range map[string]string{
+		"https://Hooks.Example.com/a?x=1":   "hooks.example.com",
+		"https://receiver.example:443/hook": "receiver.example",
+		"https://[2001:DB8::1]/hook":        "2001:db8::1",
+		"https://q.example?only":            "q.example",
+		"https://plain.example":             "plain.example",
+		"":                                  "",
+	} {
+		if got := destinationHost(in); got != want {
+			t.Errorf("destinationHost(%q) = %q, want %q", in, got, want)
+		}
+	}
+}
+
+// A failed ping is not retried by hand (409 conflict): callbacks.test
+// sends a new one, and a receiver keeps at most one open ping.
+func TestRetryRefusesPings(t *testing.T) {
+	s, db := fixture(t)
+	ctx := t.Context()
+	r, err := s.RegisterPullWith(ctx, "agent", "mac", "pinged", testSecret(), everything)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := s.Test(ctx, "agent", r.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = db.Exec(`UPDATE callback_outbox SET status='failed',terminal_reason='http_500' WHERE id=?`, first); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = s.Test(ctx, "agent", r.ID); err != nil {
+		t.Fatal(err)
+	}
+	err = s.Retry(ctx, "agent", first)
+	if !errors.Is(err, ErrPingNotRetried) || !errors.Is(err, ErrConflict) {
+		t.Fatalf("retry of a ping: %v", err)
+	}
+	if err = s.Retry(ctx, "other", first); !errors.Is(err, ErrReceiver) {
+		t.Fatalf("another agent's ping: %v", err)
+	}
+}

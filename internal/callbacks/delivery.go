@@ -83,51 +83,57 @@ func (s *Service) dispatchDue(ctx context.Context, wg *sync.WaitGroup) {
 // pickDue returns up to limit due push events, oldest first, within the
 // in-flight caps per receiver, agent and destination host (counting the
 // claims every node holds). The due window holds at most
-// deliveryPerReceiver events of a receiver and deliveryPerAgent of an
-// agent, so a receiver or an agent with a long backlog cannot fill the
-// window and starve the others (no head-of-line blocking).
+// deliveryPerReceiver events of a receiver, deliveryPerAgent of an agent
+// and deliveryPerHost of a host, so a receiver, an agent or a shared host
+// with a long backlog cannot fill the window and starve the others (no
+// head-of-line blocking). A receiver without a host (registered by an
+// older version during a rolling upgrade) counts its destination as its
+// host.
 func (s *Service) pickDue(ctx context.Context, limit int) ([]string, error) {
 	now := s.now().UnixMilli()
 	perReceiver, perAgent, perHost := map[string]int{}, map[string]int{}, map[string]int{}
-	rows, err := s.db.QueryContext(ctx, `SELECT o.receiver_id,r.agent_id,r.destination,count(*) FROM callback_outbox o JOIN callback_receivers r ON r.id=o.receiver_id WHERE o.status='delivering' AND o.claim_until>? GROUP BY o.receiver_id,r.agent_id,r.destination`, now)
+	rows, err := s.db.QueryContext(ctx, `SELECT o.receiver_id,r.agent_id,`+hostKey+`,count(*) FROM callback_outbox o JOIN callback_receivers r ON r.id=o.receiver_id WHERE o.status='delivering' AND o.claim_until>? GROUP BY o.receiver_id,r.agent_id,`+hostKey, now)
 	if err != nil {
 		return nil, err
 	}
 	for rows.Next() {
-		var ref, agent, destination string
+		var ref, agent, host string
 		var n int
-		if err := rows.Scan(&ref, &agent, &destination, &n); err != nil {
+		if err := rows.Scan(&ref, &agent, &host, &n); err != nil {
 			rows.Close()
 			return nil, err
 		}
 		perReceiver[ref] += n
 		perAgent[agent] += n
-		perHost[destinationHost(destination)] += n
+		perHost[host] += n
 	}
 	if err := rows.Close(); err != nil {
 		return nil, err
 	}
-	rows, err = s.db.QueryContext(ctx, `SELECT id,receiver_id,agent_id,destination FROM (
- SELECT id,receiver_id,agent_id,destination,next_attempt_at,
-  ROW_NUMBER() OVER (PARTITION BY agent_id ORDER BY next_attempt_at,id) AS agent_rank
+	rows, err = s.db.QueryContext(ctx, `SELECT id,receiver_id,agent_id,host_key FROM (
+ SELECT id,receiver_id,agent_id,host_key,next_attempt_at,
+  ROW_NUMBER() OVER (PARTITION BY host_key ORDER BY next_attempt_at,id) AS host_rank
  FROM (
-  SELECT o.id,o.receiver_id,r.agent_id,r.destination,o.next_attempt_at,
-   ROW_NUMBER() OVER (PARTITION BY o.receiver_id ORDER BY o.next_attempt_at,o.id) AS receiver_rank
-  FROM callback_outbox o JOIN callback_receivers r ON r.id=o.receiver_id
-  WHERE r.transport='push' AND ((o.status='pending' AND o.next_attempt_at<=?) OR (o.status='delivering' AND o.claim_until<=?))
- ) per_receiver WHERE receiver_rank<=?
-) per_agent WHERE agent_rank<=? ORDER BY next_attempt_at,id LIMIT ?`, now, now, deliveryPerReceiver, deliveryPerAgent, limit*8)
+  SELECT id,receiver_id,agent_id,host_key,next_attempt_at,
+   ROW_NUMBER() OVER (PARTITION BY agent_id ORDER BY next_attempt_at,id) AS agent_rank
+  FROM (
+   SELECT o.id,o.receiver_id,r.agent_id,`+hostKey+` AS host_key,o.next_attempt_at,
+    ROW_NUMBER() OVER (PARTITION BY o.receiver_id ORDER BY o.next_attempt_at,o.id) AS receiver_rank
+   FROM callback_outbox o JOIN callback_receivers r ON r.id=o.receiver_id
+   WHERE r.transport='push' AND ((o.status='pending' AND o.next_attempt_at<=?) OR (o.status='delivering' AND o.claim_until<=?))
+  ) per_receiver WHERE receiver_rank<=?
+ ) per_agent WHERE agent_rank<=?
+) per_host WHERE host_rank<=? ORDER BY next_attempt_at,id LIMIT ?`, now, now, deliveryPerReceiver, deliveryPerAgent, deliveryPerHost, limit*8)
 	if err != nil {
 		return nil, err
 	}
 	defer rows.Close()
 	var out []string
 	for rows.Next() && len(out) < limit {
-		var id, ref, agent, destination string
-		if err := rows.Scan(&id, &ref, &agent, &destination); err != nil {
+		var id, ref, agent, host string
+		if err := rows.Scan(&id, &ref, &agent, &host); err != nil {
 			return nil, err
 		}
-		host := destinationHost(destination)
 		if perReceiver[ref] >= deliveryPerReceiver || perAgent[agent] >= deliveryPerAgent || perHost[host] >= deliveryPerHost {
 			continue
 		}
@@ -139,8 +145,14 @@ func (s *Service) pickDue(ctx context.Context, limit int) ([]string, error) {
 	return out, rows.Err()
 }
 
-// destinationHost is the lowercase host name of a receiver's destination
-// (the destination itself when it does not parse).
+// hostKey is the SQL for a receiver r's host: callback_receivers.host, or
+// its destination when host is empty.
+const hostKey = `COALESCE(NULLIF(r.host,''),r.destination)`
+
+// destinationHost is the lowercase host name of a receiver's destination,
+// stored in callback_receivers.host: an IPv6 literal without brackets, ""
+// for a pull receiver, the destination itself when it does not parse.
+// Migration 0062 derives the same value for older receivers.
 func destinationHost(destination string) string {
 	u, err := url.Parse(destination)
 	if err != nil || u.Hostname() == "" {
@@ -176,8 +188,8 @@ func (s *Service) sweepBatch(ctx context.Context, cutoff int64) (int, error) {
 	defer tx.Rollback()
 	// A row an older node queued during a rolling upgrade has created_at
 	// 0: its next attempt time stands in, so it is neither swept at once
-	// nor kept for ever.
-	rows, err := tx.QueryContext(ctx, `SELECT id FROM callback_outbox WHERE status IN ('delivered','failed') AND COALESCE(NULLIF(created_at,0),next_attempt_at)<? ORDER BY COALESCE(NULLIF(created_at,0),next_attempt_at) LIMIT ?`, cutoff, sweepBatch)
+	// nor kept for ever. Each branch can use an index.
+	rows, err := tx.QueryContext(ctx, `SELECT id FROM callback_outbox WHERE status IN ('delivered','failed') AND ((created_at>0 AND created_at<?) OR (created_at=0 AND next_attempt_at<?)) ORDER BY created_at,next_attempt_at LIMIT ?`, cutoff, cutoff, sweepBatch)
 	if err != nil {
 		return 0, err
 	}

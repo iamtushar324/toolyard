@@ -191,6 +191,13 @@ func (s *Service) register(ctx context.Context, agentID, environmentID, clientID
 	return s.Get(ctx, agentID, id)
 }
 
+// readCommitted opens the transactions that take a lock and then count
+// (receivers, pings, claims): each statement after the lock must see what
+// the previous holder committed, which a snapshot taken at the start of
+// the transaction (REPEATABLE READ or SERIALIZABLE as the server default)
+// would not. SQLite ignores it: one connection runs one transaction.
+var readCommitted = &sql.TxOptions{Isolation: sql.LevelReadCommitted}
+
 // lockAgentTx serializes, on Postgres, the transactions that count an
 // agent's callback rows before they insert one (receivers, pings): the
 // count read after the lock holds until the insert commits, on every node.
@@ -214,7 +221,7 @@ func (s *Service) lockAgentTx(ctx context.Context, tx *sql.Tx, agentID string) e
 // SQLite's single connection already serializes both. The transaction
 // ends before insertReceiver returns.
 func (s *Service) insertReceiver(ctx context.Context, id, agentID, environmentID, clientID, destination, enc string, privateAllowed bool, transport, events string, v3 bool) (int64, error) {
-	tx, err := s.db.BeginTx(ctx, nil)
+	tx, err := s.db.BeginTx(ctx, readCommitted)
 	if err != nil {
 		return 0, err
 	}
@@ -237,7 +244,7 @@ func (s *Service) insertReceiver(ctx context.Context, id, agentID, environmentID
 	// Parameters in a SELECT list have no column type on Postgres: cast them
 	// to the column types (the casts change nothing on SQLite).
 	now := s.now().UnixMilli()
-	result, err := tx.ExecContext(ctx, `INSERT INTO callback_receivers(id,agent_id,environment_id,client_receiver_id,destination,secret_enc,private_allowed,created_at,transport,events,v3) SELECT CAST(? AS TEXT),CAST(? AS TEXT),CAST(? AS TEXT),CAST(? AS TEXT),CAST(? AS TEXT),CAST(? AS TEXT),CAST(? AS BIGINT),CAST(? AS BIGINT),CAST(? AS TEXT),CAST(? AS TEXT),CAST(? AS BIGINT) WHERE NOT EXISTS (`+inactiveHostPredicate+`)`, id, agentID, environmentID, clientID, destination, enc, boolInt(privateAllowed), now, transport, events, boolInt(v3), agentID, now)
+	result, err := tx.ExecContext(ctx, `INSERT INTO callback_receivers(id,agent_id,environment_id,client_receiver_id,destination,secret_enc,private_allowed,created_at,transport,events,v3,host) SELECT CAST(? AS TEXT),CAST(? AS TEXT),CAST(? AS TEXT),CAST(? AS TEXT),CAST(? AS TEXT),CAST(? AS TEXT),CAST(? AS BIGINT),CAST(? AS BIGINT),CAST(? AS TEXT),CAST(? AS TEXT),CAST(? AS BIGINT),CAST(? AS TEXT) WHERE NOT EXISTS (`+inactiveHostPredicate+`)`, id, agentID, environmentID, clientID, destination, enc, boolInt(privateAllowed), now, transport, events, boolInt(v3), destinationHost(destination), agentID, now)
 	if err != nil {
 		return 0, err
 	}
@@ -653,16 +660,33 @@ func (s *Service) ReceiverHistory(ctx context.Context, agentID, ref string) ([]D
 	return out, nil
 }
 func (s *Service) Retry(ctx context.Context, agentID, eventID string) error {
-	result, err := s.db.ExecContext(ctx, `UPDATE callback_outbox SET status='pending',retry_base=attempts,next_attempt_at=?,terminal_reason='' WHERE id=? AND status='failed' AND receiver_id IN (SELECT id FROM callback_receivers WHERE agent_id=? AND status='active')`, s.now().UnixMilli(), eventID, agentID)
+	result, err := s.db.ExecContext(ctx, `UPDATE callback_outbox SET status='pending',retry_base=attempts,next_attempt_at=?,terminal_reason='' WHERE id=? AND status='failed' AND event_type<>'ping' AND receiver_id IN (SELECT id FROM callback_receivers WHERE agent_id=? AND status='active')`, s.now().UnixMilli(), eventID, agentID)
 	if err != nil {
 		return err
 	}
 	n, _ := result.RowsAffected()
 	if n != 1 {
+		var kind string
+		e := s.db.QueryRowContext(ctx, `SELECT o.event_type FROM callback_outbox o JOIN callback_receivers r ON r.id=o.receiver_id WHERE o.id=? AND r.agent_id=?`, eventID, agentID).Scan(&kind)
+		if e == nil && kind == EventPing {
+			return ErrPingNotRetried
+		}
 		return ErrReceiver
 	}
 	return nil
 }
+
+// ErrPingNotRetried refuses a manual retry of a ping: a receiver keeps at
+// most one open ping, so callbacks.test sends a new one. It matches
+// ErrConflict (409 conflict).
+var ErrPingNotRetried error = pingRetryError{}
+
+type pingRetryError struct{}
+
+func (pingRetryError) Error() string {
+	return "a ping is not retried; send a new one with callbacks.test"
+}
+func (pingRetryError) Is(target error) bool { return target == ErrConflict }
 
 var retryDelays = []time.Duration{5 * time.Second, time.Minute, 5 * time.Minute, 30 * time.Minute, 2 * time.Hour, 6 * time.Hour, 12 * time.Hour, 24 * time.Hour}
 
@@ -686,7 +710,7 @@ func (s *Service) DeliverOne(ctx context.Context) error {
 // keeps more than deliveryPerReceiver events of a receiver in flight.
 func (s *Service) claim(ctx context.Context, id string) (claimed int, payload, ref string, rev int, err error) {
 	now := s.now().UnixMilli()
-	tx, err := s.db.BeginTx(ctx, nil)
+	tx, err := s.db.BeginTx(ctx, readCommitted)
 	if err != nil {
 		return 0, "", "", 0, err
 	}
