@@ -290,29 +290,45 @@ ty skills list --limit 50
 ## How sync works
 
 1. **Check.** The cluster leader looks every 15 seconds for sources whose
-   check is due: each enabled source is checked every `poll_seconds`
-   (default 300, at least 60). The check asks GitHub for the branch head
-   with the ETag of the last answer; an unchanged branch answers
-   `304 Not Modified`, which costs no rate limit. A GitHub push webhook, or
-   *Sync now* on the dashboard, checks at once on the replica that got it.
-   A pinned source never asks for the branch head.
+   check is due, and checks up to three at once: each enabled source is
+   checked every `poll_seconds` (default 300, at least 60). The check asks
+   GitHub for the branch's ref (`/git/ref/heads/<branch>`, so a tag or a
+   commit SHA never matches a branch name) with the ETag of the last
+   answer; an unchanged branch answers `304 Not Modified`, which costs no
+   rate limit. *Sync now* on the dashboard checks at once on the replica
+   that got it, without the ETag and with `Cache-Control: no-cache`. A
+   signed GitHub push webhook names the pushed commit, and the sync
+   serves that commit without asking for the branch head. A pinned source
+   never asks for the branch head.
+
+   Without a token, GitHub may answer a public repository's branch head
+   from a cache up to 60 seconds old, so a poll can see a push up to a
+   minute late. Add the push webhook (or a token) for updates within
+   seconds. A poll never moves a source back to an older commit on such a
+   stale answer: it waits for a fresh one.
 2. **Lock.** A sync of a source runs under a cluster lock named after the
    source, so two syncs of one source never overlap, whichever replicas
    start them.
 3. **Known commit?** When the commit already has a version built with the
    source's current settings, nothing is downloaded: an active version
    stays; a staged one keeps waiting for review (an `auto` source makes it
-   live); a retired one stays retired (a rollback holds until a new commit
-   arrives); a rejected one stays rejected; a failed one stays failed until
-   *Sync now* tries it again. A pinned source makes its commit's version
-   live whatever its state.
+   live; a `review` source asks the review hook again, so an Inbox item
+   that could not be created is retried); a retired one stays retired
+   while the branch head stays where it is (an admin's rollback holds), and
+   goes live again in an `auto` source when the branch moves back to it (a
+   force-push or a revert to that commit); a rejected one stays rejected;
+   a failed one stays failed until *Sync now* tries it again. A pinned
+   source makes its commit's version live whatever its state.
 4. **Fetch.** toolyard builds the new version from the active one when it
    can: it asks GitHub which files changed between the two commits and
    reads only those (the contents API), when the active version was built
    with the same folder, excludes and limits, the new commit descends from
-   it, at most 100 files changed under the source folder, and no skill
-   appears or goes away (no `SKILL.md` added, removed or renamed). Anything
-   else downloads the commit's archive (`/tarball/<sha>`, a gzip'd tar from
+   it, at most 100 files changed under the source folder, no skill
+   appears or goes away (no `SKILL.md` added, removed or renamed), no
+   `.gitattributes` changed, and every changed file is a plain file at the
+   path asked for (the contents API answers for a symbolic link with its
+   target's content, which toolyard never follows). Anything else
+   downloads the commit's archive (`/tarball/<sha>`, a gzip'd tar from
    `codeload.github.com`). The archive is read as a stream: only text files
    under the source folder are kept, and only within the limits below. A
    private repository's token goes to the GitHub API only, never to the
@@ -328,18 +344,22 @@ ty skills list --limit 50
    - no links: symbolic links, hard links and devices are left out, never
      followed; an archive entry with an absolute path or a `..` segment
      fails the whole sync;
+   - storable paths: a path that is not valid UTF-8, or holds a backslash
+     or a control character, is left out (`invalid_path`);
    - no secrets: a file that holds a private key block or a well-known
      token shape (GitHub `ghp_`/`gho_`/`ghu_`/`ghs_`/`ghr_`/`github_pat_`,
      AWS `AKIA…`/`ASIA…`, Slack `xox…`, Anthropic `sk-ant-…`, OpenAI
      `sk-proj-…` and long `sk-…` keys) is left out with a `secret`
      warning, which never repeats the match.
    A file left out inside a skill folder is listed in the skill's
-   `omitted` list with the reason.
+   `omitted` list with the reason (the first 10,000 such files of a
+   commit; a warning counts the rest).
 6. **Find the skills.** Every folder with a `SKILL.md` is a skill. Its YAML
    frontmatter is stored verbatim as JSON (SEP-2640). A skill is skipped,
    with a warning, when its frontmatter is missing or not valid YAML, it
-   has no `name` or no `description`, or its `name` differs from its
-   folder's name. Other departures from the specification are warnings
+   has no `name` or no `description`, its `name` or `description` holds a
+   NUL byte or invalid UTF-8 (a YAML escape can make one), or its `name`
+   differs from its folder's name. Other departures from the specification are warnings
    and the skill is still served: a name that is not lowercase letters,
    digits and hyphens, a description over 1,024 characters, a
    compatibility note over 500, fields the specification does not define,
@@ -353,7 +373,9 @@ ty skills list --limit 50
    difference from the active version: skills added, changed (a different
    `SKILL.md` or file set) and removed.
 8. **Go live.** `auto` and `pinned` sources make the version active at
-   once; `review` sources keep it staged and send the source's creator an
+   once, unless an admin changed what the source fetches (or made another
+   version live) while the sync ran: then the version is dropped and the
+   next check builds with the new settings; `review` sources keep it staged and send the source's creator an
    Inbox item. Activation is one transaction (the old version becomes
    retired) and is announced on the cluster: every replica reloads that
    source into its in-memory catalog within moments. Replicas also compare
@@ -364,13 +386,18 @@ ty skills list --limit 50
    version uses any more, are deleted.
 
 A failed sync (GitHub down, a token revoked, a limit) records the error on
-the source and leaves the active version as it was. The next check waits
+the source and leaves the active version as it was. A commit whose content
+the database refuses is recorded as a failed version, like a limit, so it
+is not downloaded again and again. A sync that stops because its replica
+lost the leader lease, or is shutting down, is not a failure: another
+replica checks the source. The next check waits
 twice as long after each failure in a row, at most an hour; a GitHub rate
 limit answer (`Retry-After`, or no calls left until `X-RateLimit-Reset`)
 pauses calls with that credential until the time GitHub gives.
 
-An admin can make any staged or retired version active again (a review
-approval or a rollback), or reject a staged one. A rollback on an `auto`
+An admin can make the staged version that waits for review active (an
+approval) or any retired version (a rollback), or reject a staged one. A
+staged version that a newer commit replaced cannot be approved. A rollback on an `auto`
 source holds until the next commit; pin the source to keep it longer.
 
 ## Where a skill runs
@@ -396,10 +423,12 @@ the ceilings.
 
 A file over the per-file limit is left out with a `too_large` warning.
 The other limits fail the sync with a clear error, record a `failed`
-version for that commit, and leave the active version as it was. The byte
-and file limits count every text file under the source folder that is not
-excluded, inside a skill folder or not: point the source at the folder
-that holds the skills, or add exclude globs, to stay well under them. A
+version for that commit, and leave the active version as it was. The file
+limit counts every file under the source folder that is not excluded
+(kept, binary, linked or too large), inside a skill folder or not; the
+byte limit counts every text file toolyard reads and checks, files left
+out by the secret check included. Point the source at the folder that
+holds the skills, or add exclude globs, to stay well under them. A
 repository archive larger than 4 GiB uncompressed is refused.
 
 Reads have their own caps: search returns at most 50 results (10 by
@@ -409,7 +438,8 @@ returns what it found by then; a bundle holds at most 200 skills and
 64 MiB.
 
 Each source records reads per skill per day (a `get`, a file `read`, or a
-bundle); the dashboard shows the last 30 days.
+bundle); the dashboard shows the last 30 days, and counts older than 90
+days are deleted.
 
 ## MCP Skills extension
 

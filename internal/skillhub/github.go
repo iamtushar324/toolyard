@@ -43,6 +43,9 @@ const (
 	maxIncrementalFiles = 100
 	// maxRateBlock caps how long a rate limit answer pauses calls.
 	maxRateBlock = time.Hour
+	// maxAPIRedirects caps the redirects an API call follows (a renamed
+	// or transferred repository answers 301 or 307).
+	maxAPIRedirects = 3
 )
 
 // ghError is a GitHub answer toolyard could not use. It never holds a
@@ -151,10 +154,38 @@ func (c *ghClient) endpoint(p string, q url.Values) string {
 	return u
 }
 
-// do sends one API request. It answers a rate limit (and a call made
-// while GitHub said to wait) with a ghError that carries retryAt. The
+// do sends one API request. With follow it follows the redirects of a
+// renamed or transferred repository, only to the API's own scheme and
+// host (the credential is kept, as for the first request); without it
+// the caller handles a redirect. A rate limit answer (and a call made
+// while GitHub said to wait) is a ghError that carries retryAt. The
 // caller closes the body.
-func (c *ghClient) do(ctx context.Context, rawURL, accept string, header http.Header) (*http.Response, error) {
+func (c *ghClient) do(ctx context.Context, rawURL, accept string, header http.Header, follow bool) (*http.Response, error) {
+	for hops := 0; ; hops++ {
+		resp, err := c.send(ctx, rawURL, accept, header)
+		if err != nil || !follow || !isRedirect(resp.StatusCode) {
+			return resp, err
+		}
+		loc, lerr := resp.Request.URL.Parse(resp.Header.Get("Location"))
+		drain(resp)
+		if lerr != nil || resp.Header.Get("Location") == "" || hops >= maxAPIRedirects ||
+			loc.Scheme != c.base.Scheme || !strings.EqualFold(loc.Host, c.base.Host) {
+			return nil, &ghError{status: resp.StatusCode, msg: "the repository moved somewhere toolyard does not follow"}
+		}
+		rawURL = loc.String()
+	}
+}
+
+func isRedirect(status int) bool {
+	switch status {
+	case http.StatusMovedPermanently, http.StatusFound, http.StatusSeeOther, http.StatusTemporaryRedirect, http.StatusPermanentRedirect:
+		return true
+	}
+	return false
+}
+
+// send sends one request (see do).
+func (c *ghClient) send(ctx context.Context, rawURL, accept string, header http.Header) (*http.Response, error) {
 	if until, blocked := c.limits.blockedUntil(c.key); blocked {
 		return nil, &ghError{status: http.StatusTooManyRequests, retryAt: until}
 	}
@@ -266,7 +297,7 @@ func cleanTransportError(err error) error {
 func (c *ghClient) getJSON(ctx context.Context, p string, q url.Values, out any) error {
 	ctx, cancel := context.WithTimeout(ctx, apiTimeout)
 	defer cancel()
-	resp, err := c.do(ctx, c.endpoint(p, q), "application/vnd.github+json", nil)
+	resp, err := c.do(ctx, c.endpoint(p, q), "application/vnd.github+json", nil, true)
 	if err != nil {
 		return err
 	}
@@ -328,16 +359,25 @@ func (c *ghClient) branches(ctx context.Context, owner, repo string) (names []st
 	}
 }
 
-// head reads the commit SHA of a branch. With etag it sends
-// If-None-Match; a 304 answer (notModified) costs no rate limit.
-func (c *ghClient) head(ctx context.Context, owner, repo, branch, etag string) (sha, newETag string, notModified bool, err error) {
+// head reads the commit SHA of a branch, through the branch's ref (so a
+// tag or a commit SHA never matches a branch name). With etag it sends
+// If-None-Match; a 304 answer (notModified) costs no rate limit. fresh
+// sends neither and asks caches not to answer: GitHub may serve a public
+// repository's ref from a cache up to 60 seconds old.
+func (c *ghClient) head(ctx context.Context, owner, repo, branch, etag string, fresh bool) (sha, newETag string, notModified bool, err error) {
+	if !validBranch(branch) {
+		return "", "", false, fmt.Errorf("%w: branch %q is not a valid branch name", ErrInvalid, branch)
+	}
 	ctx, cancel := context.WithTimeout(ctx, apiTimeout)
 	defer cancel()
 	h := http.Header{}
-	if etag != "" {
+	switch {
+	case fresh:
+		h.Set("Cache-Control", "no-cache")
+	case etag != "":
 		h.Set("If-None-Match", etag)
 	}
-	resp, err := c.do(ctx, c.endpoint(repoAPIPath(owner, repo)+"/commits/"+escapePath(branch), nil), "application/vnd.github.sha", h)
+	resp, err := c.do(ctx, c.endpoint(repoAPIPath(owner, repo)+"/git/ref/heads/"+escapePath(branch), nil), "application/vnd.github+json", h, true)
 	if err != nil {
 		return "", "", false, err
 	}
@@ -350,13 +390,19 @@ func (c *ghClient) head(ctx context.Context, owner, repo, branch, etag string) (
 		return "", "", false, statusError(resp)
 	}
 	defer drain(resp)
-	b, err := io.ReadAll(io.LimitReader(resp.Body, 256))
-	if err != nil {
-		return "", "", false, fmt.Errorf("github: read branch head: %w", err)
+	var ref struct {
+		Ref    string `json:"ref"`
+		Object struct {
+			SHA  string `json:"sha"`
+			Type string `json:"type"`
+		} `json:"object"`
 	}
-	sha = strings.ToLower(strings.TrimSpace(string(b)))
-	if !shaRe.MatchString(sha) {
-		return "", "", false, fmt.Errorf("github: branch %q: the answer is not a commit SHA", branch)
+	if err := json.NewDecoder(io.LimitReader(resp.Body, 64<<10)).Decode(&ref); err != nil {
+		return "", "", false, fmt.Errorf("github: read branch %q: %w", branch, err)
+	}
+	sha = strings.ToLower(ref.Object.SHA)
+	if ref.Ref != "refs/heads/"+branch || ref.Object.Type != "commit" || !shaRe.MatchString(sha) {
+		return "", "", false, &ghError{status: http.StatusNotFound, msg: fmt.Sprintf("no branch named %q", branch)}
 	}
 	return sha, resp.Header.Get("ETag"), false, nil
 }
@@ -386,6 +432,7 @@ func (c *ghClient) compare(ctx context.Context, owner, repo, base, head string) 
 
 // ghContent is one entry of the contents API.
 type ghContent struct {
+	Path     string `json:"path"`
 	Type     string `json:"type"` // file | dir | symlink | submodule
 	Encoding string `json:"encoding"`
 	Content  string `json:"content"`
@@ -414,43 +461,63 @@ func (c *ghClient) contents(ctx context.Context, owner, repo, filePath, ref stri
 // read. The API answers with a redirect to codeload.github.com; toolyard
 // follows it only to that host or to the API's own host (a test server),
 // and never sends the token there (the redirect URL carries its own
-// short-lived grant).
+// short-lived grant). A redirect to another API URL of the same host (a
+// renamed or transferred repository) is followed with the token.
 func (c *ghClient) archive(ctx context.Context, owner, repo, sha string, read func(io.Reader) error) error {
 	ctx, cancel := context.WithTimeout(ctx, archiveTimeout)
 	defer cancel()
-	resp, err := c.do(ctx, c.endpoint(repoAPIPath(owner, repo)+"/tarball/"+url.PathEscape(sha), nil), "application/vnd.github+json", nil)
+	const accept = "application/vnd.github+json"
+	resp, err := c.do(ctx, c.endpoint(repoAPIPath(owner, repo)+"/tarball/"+url.PathEscape(sha), nil), accept, nil, false)
+	for hops := 0; err == nil && isRedirect(resp.StatusCode); hops++ {
+		loc, lerr := resp.Request.URL.Parse(resp.Header.Get("Location"))
+		drain(resp)
+		switch {
+		case lerr != nil || resp.Header.Get("Location") == "" || hops >= maxAPIRedirects:
+			return errors.New("github: the archive redirect has no usable Location")
+		case c.isAPIURL(loc):
+			resp, err = c.send(ctx, loc.String(), accept, nil)
+		case c.archiveHostAllowed(loc):
+			resp, err = c.download(ctx, loc)
+			if err == nil && isRedirect(resp.StatusCode) {
+				drain(resp)
+				return errors.New("github: the archive download redirected again")
+			}
+		default:
+			return fmt.Errorf("github: the archive redirect points at %s, which toolyard does not download from", loc.Host)
+		}
+	}
 	if err != nil {
 		return err
 	}
-	switch resp.StatusCode {
-	case http.StatusOK:
-	case http.StatusFound, http.StatusMovedPermanently, http.StatusSeeOther, http.StatusTemporaryRedirect, http.StatusPermanentRedirect:
-		loc, lerr := resp.Request.URL.Parse(resp.Header.Get("Location"))
-		drain(resp)
-		if lerr != nil || resp.Header.Get("Location") == "" {
-			return errors.New("github: the archive redirect has no usable Location")
-		}
-		if !c.archiveHostAllowed(loc) {
-			return fmt.Errorf("github: the archive redirect points at %s, which toolyard does not download from", loc.Host)
-		}
-		req, rerr := http.NewRequestWithContext(ctx, http.MethodGet, loc.String(), nil)
-		if rerr != nil {
-			return errors.New("github: the archive redirect is not a valid URL")
-		}
-		req.Header.Set("User-Agent", userAgent)
-		resp, err = c.hc.Do(req)
-		if err != nil {
-			return cleanTransportError(err)
-		}
-		if resp.StatusCode != http.StatusOK {
-			drain(resp)
-			return fmt.Errorf("github: archive download: HTTP %d", resp.StatusCode)
-		}
-	default:
+	if resp.StatusCode != http.StatusOK {
 		return statusError(resp)
 	}
 	defer drain(resp)
 	return read(resp.Body)
+}
+
+// download GETs an archive URL without the token.
+func (c *ghClient) download(ctx context.Context, u *url.URL) (*http.Response, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, u.String(), nil)
+	if err != nil {
+		return nil, errors.New("github: the archive redirect is not a valid URL")
+	}
+	req.Header.Set("User-Agent", userAgent)
+	resp, err := c.hc.Do(req)
+	if err != nil {
+		return nil, cleanTransportError(err)
+	}
+	return resp, nil
+}
+
+// isAPIURL reports a repository URL of the API itself (same scheme and
+// host, under /repos/ or /repositories/).
+func (c *ghClient) isAPIURL(u *url.URL) bool {
+	if u.Scheme != c.base.Scheme || !strings.EqualFold(u.Host, c.base.Host) {
+		return false
+	}
+	base := strings.TrimRight(c.base.Path, "/")
+	return strings.HasPrefix(u.Path, base+"/repos/") || strings.HasPrefix(u.Path, base+"/repositories/")
 }
 
 // archiveHostAllowed reports whether toolyard may download an archive from

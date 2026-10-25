@@ -1,8 +1,8 @@
 package skillhub
 
 import (
+	"bytes"
 	"regexp"
-	"strings"
 )
 
 // secretPatterns are content shapes that mean a file holds a credential.
@@ -25,14 +25,15 @@ var secretPatterns = []struct {
 }
 
 // findSecret returns what kind of credential content seems to hold, or "".
-// AWS's documented example keys (they contain "EXAMPLE") do not count.
+// AWS's documented example keys (they contain "EXAMPLE") do not count;
+// every match is looked at, so a real key after any number of examples is
+// still found.
 func findSecret(content []byte) string {
 	for _, p := range secretPatterns {
-		for _, m := range p.re.FindAll(content, 8) {
-			if strings.Contains(string(m), "EXAMPLE") {
-				continue
+		for _, loc := range p.re.FindAllIndex(content, -1) {
+			if !bytes.Contains(content[loc[0]:loc[1]], []byte("EXAMPLE")) {
+				return p.what
 			}
-			return p.what
 		}
 	}
 	return ""

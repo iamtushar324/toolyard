@@ -11,6 +11,9 @@ import (
 	"strings"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgconn"
+	sqlite3 "github.com/mattn/go-sqlite3"
+
 	"github.com/tusharbhardwaj/toolyard/internal/store"
 )
 
@@ -423,39 +426,69 @@ func (s *Service) insertVersion(ctx context.Context, nv newVersion) (*versionRow
 		SkillCount: len(nv.b.skills), FileCount: len(nv.b.files), TotalBytes: nv.b.totalBytes,
 		Warnings: nv.b.warnings, Diff: nv.diff,
 	}, config: nv.config}
+	if err := s.writeVersion(ctx, nv, v, string(warnings), string(diff)); err != nil {
+		return nil, storeError(err)
+	}
+	return v, nil
+}
+
+// writeVersion is insertVersion's transaction.
+func (s *Service) writeVersion(ctx context.Context, nv newVersion, v *versionRow, warnings, diff string) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return nil, fmt.Errorf("skillhub: store version: %w", err)
+		return err
 	}
 	defer func() { _ = tx.Rollback() }()
 	var id string
 	err = tx.QueryRowContext(ctx, `SELECT id FROM skill_sources WHERE id = ?`+s.db.Dialect.ForUpdate(), nv.src.ID).Scan(&id)
 	if errors.Is(err, sql.ErrNoRows) {
-		return nil, fmt.Errorf("%w: source %s was deleted", ErrNotFound, nv.src.ID)
+		return fmt.Errorf("%w: source %s was deleted", ErrNotFound, nv.src.ID)
 	}
 	if err != nil {
-		return nil, fmt.Errorf("skillhub: store version: %w", err)
+		return err
 	}
 	if err := s.storeBlobs(ctx, tx, nv.b.files); err != nil {
-		return nil, err
+		return err
 	}
 	if _, err := tx.ExecContext(ctx, `INSERT INTO skill_versions (id, source_id, sha, status, config, created_at,
 		skill_count, file_count, total_bytes, warning_count, warnings_json, diff_json, full_sync)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		v.ID, v.SourceID, v.SHA, string(v.Status), v.config, v.CreatedAt.UnixMilli(),
-		int64(v.SkillCount), int64(v.FileCount), v.TotalBytes, int64(len(nv.b.warnings)), string(warnings), string(diff), boolInt(nv.full)); err != nil {
-		return nil, fmt.Errorf("skillhub: store version: %w", err)
+		int64(v.SkillCount), int64(v.FileCount), v.TotalBytes, int64(len(nv.b.warnings)), warnings, diff, boolInt(nv.full)); err != nil {
+		return err
 	}
 	if err := insertEntries(ctx, tx, v.ID, nv.b.skills); err != nil {
-		return nil, err
+		return err
 	}
 	if err := insertFiles(ctx, tx, v.ID, nv.b.files); err != nil {
-		return nil, err
+		return err
 	}
-	if err := tx.Commit(); err != nil {
-		return nil, fmt.Errorf("skillhub: store version: %w", err)
+	return tx.Commit()
+}
+
+// errContent is a commit whose content the database refuses (a value it
+// cannot store): the same commit would fail again, so it is recorded as a
+// failed version.
+var errContent = errors.New("skillhub: the database refused the commit's content")
+
+// storeError wraps a failed version write: content the database refuses
+// becomes errContent; anything else (the database being down) stays a
+// plain error, and the next check tries again.
+func storeError(err error) error {
+	if errors.Is(err, ErrNotFound) {
+		return err
 	}
-	return v, nil
+	var pe *pgconn.PgError
+	if errors.As(err, &pe) && (strings.HasPrefix(pe.Code, "22") || strings.HasPrefix(pe.Code, "54")) {
+		// Class 22 (data exception: a NUL byte, invalid UTF-8, a value
+		// out of range) and 54 (program limit exceeded).
+		return fmt.Errorf("%w: %s", errContent, pe.Message)
+	}
+	var se sqlite3.Error
+	if errors.As(err, &se) && (se.Code == sqlite3.ErrTooBig || se.Code == sqlite3.ErrMismatch) {
+		return fmt.Errorf("%w: %s", errContent, se.Error())
+	}
+	return fmt.Errorf("skillhub: store version: %w", err)
 }
 
 func nonNilWarnings(w []Warning) []Warning {
@@ -465,8 +498,9 @@ func nonNilWarnings(w []Warning) []Warning {
 	return w
 }
 
-// storeBlobs writes the contents a version adds: blobs already stored are
-// only touched (so the purge leaves them alone), the rest inserted.
+// storeBlobs writes the contents a version adds. A blob already stored
+// is touched (so the purge leaves it alone); the touch returns the blobs
+// it found, so one the purge deleted meanwhile is inserted again.
 func (s *Service) storeBlobs(ctx context.Context, tx *sql.Tx, files []builtFile) error {
 	var fresh []*candidate
 	seen := map[string]bool{}
@@ -480,36 +514,28 @@ func (s *Service) storeBlobs(ctx context.Context, tx *sql.Tx, files []builtFile)
 	now := s.now().UnixMilli()
 	for start := 0; start < len(fresh); start += blobBatch {
 		batch := fresh[start:min(start+blobBatch, len(fresh))]
-		args := make([]any, len(batch))
-		for i, c := range batch {
-			args[i] = c.sha
+		args := make([]any, 0, len(batch)+1)
+		args = append(args, now)
+		for _, c := range batch {
+			args = append(args, c.sha)
 		}
-		rows, err := tx.QueryContext(ctx, `SELECT sha256 FROM skill_blobs WHERE sha256 IN (`+placeholders(len(batch))+`)`, args...)
+		rows, err := tx.QueryContext(ctx, `UPDATE skill_blobs SET touched_at = ? WHERE sha256 IN (`+placeholders(len(batch))+`) RETURNING sha256`, args...)
 		if err != nil {
-			return fmt.Errorf("skillhub: store file contents: %w", err)
+			return err
 		}
 		have := map[string]bool{}
 		for rows.Next() {
 			var sha string
 			if err := rows.Scan(&sha); err != nil {
 				rows.Close()
-				return fmt.Errorf("skillhub: store file contents: %w", err)
+				return err
 			}
 			have[sha] = true
 		}
 		err = rows.Err()
 		rows.Close()
 		if err != nil {
-			return fmt.Errorf("skillhub: store file contents: %w", err)
-		}
-		if len(have) > 0 {
-			touch := []any{now}
-			for sha := range have {
-				touch = append(touch, sha)
-			}
-			if _, err := tx.ExecContext(ctx, `UPDATE skill_blobs SET touched_at = ? WHERE sha256 IN (`+placeholders(len(have))+`)`, touch...); err != nil {
-				return fmt.Errorf("skillhub: store file contents: %w", err)
-			}
+			return err
 		}
 		var missing []*candidate
 		for _, c := range batch {
@@ -542,7 +568,7 @@ func insertBlobs(ctx context.Context, tx *sql.Tx, blobs []*candidate, now int64)
 		}
 		if _, err := tx.ExecContext(ctx, `INSERT INTO skill_blobs (sha256, size, content, touched_at) VALUES `+
 			strings.Join(vals, ", ")+` ON CONFLICT (sha256) DO UPDATE SET touched_at = excluded.touched_at`, args...); err != nil {
-			return fmt.Errorf("skillhub: store file contents: %w", err)
+			return err
 		}
 	}
 	return nil
@@ -564,7 +590,7 @@ func insertEntries(ctx context.Context, tx *sql.Tx, versionID string, skills []*
 		}
 		if _, err := tx.ExecContext(ctx, `INSERT INTO skill_entries (version_id, path, name, description, frontmatter_json,
 			runs, skill_md_sha256, files_digest) VALUES `+strings.Join(vals, ", "), args...); err != nil {
-			return fmt.Errorf("skillhub: store skills: %w", err)
+			return err
 		}
 	}
 	return nil
@@ -582,119 +608,238 @@ func insertFiles(ctx context.Context, tx *sql.Tx, versionID string, files []buil
 		}
 		if _, err := tx.ExecContext(ctx, `INSERT INTO skill_files (version_id, path, skill_path, sha256, size, media_type)
 			VALUES `+strings.Join(vals, ", "), args...); err != nil {
-			return fmt.Errorf("skillhub: store files: %w", err)
+			return err
 		}
 	}
 	return nil
 }
 
 // recordFailedVersion stores (or refreshes) the failed version of a
-// commit, so the dashboard shows why it is not served.
+// commit, so the dashboard shows why it is not served and the commit is
+// not downloaded again. Nothing is stored for a source deleted meanwhile.
 func (s *Service) recordFailedVersion(ctx context.Context, src *sourceRow, sha, config string, cause error) {
-	msg := cause.Error()
-	now := s.now().UnixMilli()
-	res, err := s.db.ExecContext(ctx, `UPDATE skill_versions SET error = ?, created_at = ?
-		WHERE source_id = ? AND sha = ? AND config = ? AND status = ?`, msg, now, src.ID, sha, config, string(VersionFailed))
-	if err == nil {
-		if n, _ := res.RowsAffected(); n > 0 {
-			return
-		}
-		_, err = s.db.ExecContext(ctx, `INSERT INTO skill_versions (id, source_id, sha, status, config, created_at, error)
-			VALUES (?, ?, ?, ?, ?, ?, ?)`, newID("skv_"), src.ID, sha, string(VersionFailed), config, now, msg)
-	}
-	if err != nil {
+	if err := s.writeFailedVersion(ctx, src, sha, config, cleanMessage(cause.Error())); err != nil {
 		s.log.Warn("skillhub: recording a failed version failed", "source", src.ID, "err", err.Error())
 	}
 }
 
-// activate makes a version active in one transaction: the old active one
-// becomes retired, and the source names the new one. allowRejected lets a
-// pinned source serve a commit an admin rejected before.
-func (s *Service) activate(ctx context.Context, by, sourceID, versionID string, allowRejected bool) (bool, error) {
+func (s *Service) writeFailedVersion(ctx context.Context, src *sourceRow, sha, config, msg string) error {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return false, fmt.Errorf("skillhub: activate: %w", err)
+		return err
 	}
 	defer func() { _ = tx.Rollback() }()
-	var active, pending string
-	err = tx.QueryRowContext(ctx, `SELECT active_version_id, pending_version_id FROM skill_sources WHERE id = ?`+s.db.Dialect.ForUpdate(),
-		sourceID).Scan(&active, &pending)
+	var id string
+	err = tx.QueryRowContext(ctx, `SELECT id FROM skill_sources WHERE id = ?`+s.db.Dialect.ForUpdate(), src.ID).Scan(&id)
 	if errors.Is(err, sql.ErrNoRows) {
-		return false, fmt.Errorf("%w: source %s", ErrNotFound, sourceID)
+		return nil
 	}
 	if err != nil {
-		return false, fmt.Errorf("skillhub: activate: %w", err)
-	}
-	v, err := s.getVersionRow(ctx, tx, sourceID, versionID)
-	if err != nil {
-		return false, err
-	}
-	switch {
-	case v.Status == VersionActive && active == versionID:
-		return false, nil
-	case v.Status == VersionStaged, v.Status == VersionRetired, v.Status == VersionActive:
-	case v.Status == VersionRejected && allowRejected:
-	default:
-		return false, fmt.Errorf("%w: version %s is %s and cannot be made active", ErrConflict, versionID, v.Status)
+		return err
 	}
 	now := s.now().UnixMilli()
-	if active != "" && active != versionID {
-		if _, err := tx.ExecContext(ctx, `UPDATE skill_versions SET status = ? WHERE id = ?`, string(VersionRetired), active); err != nil {
-			return false, fmt.Errorf("skillhub: activate: %w", err)
+	res, err := tx.ExecContext(ctx, `UPDATE skill_versions SET error = ?, created_at = ?
+		WHERE source_id = ? AND sha = ? AND config = ? AND status = ?`, msg, now, src.ID, sha, config, string(VersionFailed))
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO skill_versions (id, source_id, sha, status, config, created_at, error)
+			VALUES (?, ?, ?, ?, ?, ?, ?)`, newID("skv_"), src.ID, sha, string(VersionFailed), config, now, msg); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
+}
+
+// sourceState is what a sync depends on: what it fetches and which
+// version is live. A sync makes its version live (or pending) only when
+// the source still has the state the sync read, so an admin's edit or
+// rollback during the sync is never undone.
+type sourceState struct {
+	branch, path, exclude, limits, mode, pinned, active string
+}
+
+// stateOf is the state of a source as read.
+func stateOf(r *sourceRow) sourceState {
+	ex, _ := json.Marshal(nonNil(r.Exclude))
+	lim, _ := json.Marshal(r.Limits)
+	return sourceState{branch: r.Branch, path: r.Path, exclude: string(ex), limits: string(lim),
+		mode: string(r.Mode), pinned: r.PinnedSHA, active: r.ActiveVersionID}
+}
+
+// fetchOnly is the state without the live version.
+func (st sourceState) fetchOnly() sourceState {
+	st.active = ""
+	return st
+}
+
+// lockState reads a source's state in tx and locks its row (Postgres) for
+// the rest of tx; ErrNotFound when it was deleted.
+func (s *Service) lockState(ctx context.Context, tx *sql.Tx, id string) (st sourceState, pending string, updated int64, err error) {
+	err = tx.QueryRowContext(ctx, `SELECT branch, path, exclude_json, limits_json, mode, pinned_sha, active_version_id,
+		pending_version_id, updated_at FROM skill_sources WHERE id = ?`+s.db.Dialect.ForUpdate(), id).
+		Scan(&st.branch, &st.path, &st.exclude, &st.limits, &st.mode, &st.pinned, &st.active, &pending, &updated)
+	if errors.Is(err, sql.ErrNoRows) {
+		return st, "", 0, fmt.Errorf("%w: source %s", ErrNotFound, id)
+	}
+	return st, pending, updated, err
+}
+
+// activation is one request to make a version live.
+type activation struct {
+	by, sourceID, versionID string
+	// fromSync is a sync's own activation: any staged version may go
+	// live. An admin may make live only the staged version waiting for
+	// review, or a retired one (a rollback).
+	fromSync bool
+	// allowRejected lets a pinned source serve a commit an admin rejected
+	// before.
+	allowRejected bool
+	// expect, when set, is the state the sync read: a different state
+	// refuses with errSourceChanged.
+	expect *sourceState
+}
+
+// activate makes a version active in one transaction: the old active one
+// becomes retired, and the source names the new one. It returns whether
+// anything changed and the source's new updated_at, which always moves
+// forward so every node's index sees the change.
+func (s *Service) activate(ctx context.Context, a activation) (bool, int64, error) {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, 0, fmt.Errorf("skillhub: activate: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	st, pending, updated, err := s.lockState(ctx, tx, a.sourceID)
+	if err != nil {
+		return false, 0, err
+	}
+	if a.expect != nil && st != *a.expect {
+		return false, 0, errSourceChanged
+	}
+	v, err := s.getVersionRow(ctx, tx, a.sourceID, a.versionID)
+	if err != nil {
+		return false, 0, err
+	}
+	switch {
+	case v.Status == VersionActive && st.active == a.versionID:
+		return false, updated, nil
+	case v.Status == VersionStaged && !a.fromSync && pending != a.versionID:
+		return false, 0, fmt.Errorf("%w: version %s is staged but is not the one waiting for review", ErrConflict, a.versionID)
+	case v.Status == VersionStaged, v.Status == VersionRetired, v.Status == VersionActive:
+	case v.Status == VersionRejected && a.allowRejected:
+	default:
+		return false, 0, fmt.Errorf("%w: version %s is %s and cannot be made active", ErrConflict, a.versionID, v.Status)
+	}
+	now := max(s.now().UnixMilli(), updated+1)
+	if st.active != "" && st.active != a.versionID {
+		if _, err := tx.ExecContext(ctx, `UPDATE skill_versions SET status = ? WHERE id = ?`, string(VersionRetired), st.active); err != nil {
+			return false, 0, fmt.Errorf("skillhub: activate: %w", err)
 		}
 	}
 	if _, err := tx.ExecContext(ctx, `UPDATE skill_versions SET status = ?, activated_at = ?, decided_by = ? WHERE id = ?`,
-		string(VersionActive), now, by, versionID); err != nil {
-		return false, fmt.Errorf("skillhub: activate: %w", err)
+		string(VersionActive), now, a.by, a.versionID); err != nil {
+		return false, 0, fmt.Errorf("skillhub: activate: %w", err)
 	}
-	if pending == versionID {
+	if pending == a.versionID {
 		pending = ""
 	}
 	if _, err := tx.ExecContext(ctx, `UPDATE skill_sources SET active_version_id = ?, pending_version_id = ?, updated_at = ? WHERE id = ?`,
-		versionID, pending, now, sourceID); err != nil {
-		return false, fmt.Errorf("skillhub: activate: %w", err)
+		a.versionID, pending, now, a.sourceID); err != nil {
+		return false, 0, fmt.Errorf("skillhub: activate: %w", err)
 	}
 	if err := tx.Commit(); err != nil {
-		return false, fmt.Errorf("skillhub: activate: %w", err)
+		return false, 0, fmt.Errorf("skillhub: activate: %w", err)
 	}
-	return true, nil
+	return true, now, nil
 }
 
-// setPending makes a staged version the one waiting for review.
-func (s *Service) setPending(ctx context.Context, sourceID, versionID string) error {
-	_, err := s.db.ExecContext(ctx, `UPDATE skill_sources SET pending_version_id = ? WHERE id = ?`, versionID, sourceID)
+// setPending makes a staged version the one waiting for review, unless
+// what the source fetches changed since the sync read it
+// (errSourceChanged).
+func (s *Service) setPending(ctx context.Context, row *sourceRow, versionID string) error {
+	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
+		return fmt.Errorf("skillhub: stage version: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	st, _, _, err := s.lockState(ctx, tx, row.ID)
+	if err != nil {
+		return err
+	}
+	if st.fetchOnly() != stateOf(row).fetchOnly() {
+		return errSourceChanged
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE skill_sources SET pending_version_id = ? WHERE id = ?`, versionID, row.ID); err != nil {
+		return fmt.Errorf("skillhub: stage version: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("skillhub: stage version: %w", err)
 	}
 	return nil
 }
 
+// discardVersion deletes a staged version that will never be served (it
+// was built with settings the source no longer has).
+func (s *Service) discardVersion(ctx context.Context, versionID string) {
+	err := func() error {
+		tx, err := s.db.BeginTx(ctx, nil)
+		if err != nil {
+			return err
+		}
+		defer func() { _ = tx.Rollback() }()
+		res, err := tx.ExecContext(ctx, `DELETE FROM skill_versions WHERE id = ? AND status = ?`, versionID, string(VersionStaged))
+		if err != nil {
+			return err
+		}
+		if n, _ := res.RowsAffected(); n == 0 {
+			return nil
+		}
+		for _, q := range []string{`DELETE FROM skill_files WHERE version_id = ?`, `DELETE FROM skill_entries WHERE version_id = ?`} {
+			if _, err := tx.ExecContext(ctx, q, versionID); err != nil {
+				return err
+			}
+		}
+		return tx.Commit()
+	}()
+	if err != nil {
+		s.log.Warn("skillhub: discarding a version failed; retention removes it later", "version", versionID, "err", err.Error())
+	}
+}
+
 // recordCheck stores the outcome of one check of a source: the branch head
-// it saw and when to check next.
+// it saw and when to check next. It yields to an admin's edit made during
+// the sync (the source's updated_at moved): that edit made the next check
+// due when it changed what is fetched.
 func (s *Service) recordCheck(ctx context.Context, src *sourceRow, out *syncOutcome, cause error) {
+	if out == nil {
+		out = &syncOutcome{headSHA: src.headSHA, headETag: src.headETag, updatedAt: src.UpdatedAt.UnixMilli()}
+	}
 	now := s.now()
 	poll := time.Duration(max(src.PollSeconds, MinPollSeconds)) * time.Second
+	var res sql.Result
 	var err error
 	if cause == nil {
-		_, err = s.db.ExecContext(ctx, `UPDATE skill_sources SET last_checked_at = ?, next_check_at = ?, last_error = '',
-			failures = 0, head_sha = ?, head_etag = ? WHERE id = ?`,
-			now.UnixMilli(), now.Add(poll).UnixMilli(), out.headSHA, out.headETag, src.ID)
+		res, err = s.db.ExecContext(ctx, `UPDATE skill_sources SET last_checked_at = ?, next_check_at = ?, last_error = '',
+			failures = 0, head_sha = ?, head_etag = ? WHERE id = ? AND updated_at = ?`,
+			now.UnixMilli(), now.Add(poll).UnixMilli(), out.headSHA, out.headETag, src.ID, out.updatedAt)
 	} else {
 		failures := src.failures + 1
 		next := now.Add(backoff(poll, failures))
 		if until, ok := retryAfter(cause); ok && until.After(next) {
 			next = until
 		}
-		headSHA, headETag := src.headSHA, src.headETag
-		if out != nil && out.headSHA != "" {
-			headSHA, headETag = out.headSHA, out.headETag
-		}
-		_, err = s.db.ExecContext(ctx, `UPDATE skill_sources SET last_checked_at = ?, next_check_at = ?, last_error = ?,
-			failures = ?, head_sha = ?, head_etag = ? WHERE id = ?`,
-			now.UnixMilli(), next.UnixMilli(), cleanMessage(cause.Error()), int64(failures), headSHA, headETag, src.ID)
+		res, err = s.db.ExecContext(ctx, `UPDATE skill_sources SET last_checked_at = ?, next_check_at = ?, last_error = ?,
+			failures = ?, head_sha = ?, head_etag = ? WHERE id = ? AND updated_at = ?`,
+			now.UnixMilli(), next.UnixMilli(), cleanMessage(cause.Error()), int64(failures), out.headSHA, out.headETag, src.ID, out.updatedAt)
 	}
 	if err != nil {
 		s.log.Warn("skillhub: recording a check failed", "source", src.ID, "err", err.Error())
+		return
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		s.log.Info("skillhub: the source changed during the sync; its check is not recorded", "source", src.ID)
 	}
 }
 
@@ -735,23 +880,7 @@ func (s *Service) retain(ctx context.Context, sourceID string) error {
 		return fmt.Errorf("skillhub: retention: %w", err)
 	}
 	for start := 0; start < len(old); start += rowBatch {
-		batch := old[start:min(start+rowBatch, len(old))]
-		in := placeholders(len(batch))
-		tx, err := s.db.BeginTx(ctx, nil)
-		if err != nil {
-			return fmt.Errorf("skillhub: retention: %w", err)
-		}
-		for _, q := range []string{
-			`DELETE FROM skill_files WHERE version_id IN (` + in + `)`,
-			`DELETE FROM skill_entries WHERE version_id IN (` + in + `)`,
-			`DELETE FROM skill_versions WHERE id IN (` + in + `)`,
-		} {
-			if _, err := tx.ExecContext(ctx, q, batch...); err != nil {
-				_ = tx.Rollback()
-				return fmt.Errorf("skillhub: retention: %w", err)
-			}
-		}
-		if err := tx.Commit(); err != nil {
+		if err := s.deleteVersions(ctx, sourceID, old[start:min(start+rowBatch, len(old))]); err != nil {
 			return fmt.Errorf("skillhub: retention: %w", err)
 		}
 	}
@@ -759,6 +888,44 @@ func (s *Service) retain(ctx context.Context, sourceID string) error {
 		return s.purgeBlobs(ctx)
 	}
 	return nil
+}
+
+// deleteVersions deletes versions of a source with their skills and
+// files, except the ones that became active or pending meanwhile (an
+// admin's rollback): the source's row is locked while it checks.
+func (s *Service) deleteVersions(ctx context.Context, sourceID string, ids []any) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+	st, pending, _, err := s.lockState(ctx, tx, sourceID)
+	if errors.Is(err, ErrNotFound) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	batch := make([]any, 0, len(ids))
+	for _, id := range ids {
+		if id != st.active && id != pending {
+			batch = append(batch, id)
+		}
+	}
+	if len(batch) == 0 {
+		return nil
+	}
+	in := placeholders(len(batch))
+	for _, q := range []string{
+		`DELETE FROM skill_files WHERE version_id IN (` + in + `)`,
+		`DELETE FROM skill_entries WHERE version_id IN (` + in + `)`,
+		`DELETE FROM skill_versions WHERE id IN (` + in + `)`,
+	} {
+		if _, err := tx.ExecContext(ctx, q, batch...); err != nil {
+			return err
+		}
+	}
+	return tx.Commit()
 }
 
 // purgeBlobs deletes the blobs no version references, except those a sync
