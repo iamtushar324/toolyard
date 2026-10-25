@@ -74,8 +74,8 @@ func changeSkillLabel(ci *changeInput) string {
 	return ci.SkillPath
 }
 
-// changeCounts is "1 added, 2 changed, 1 deleted" (only the kinds there
-// are).
+// changeCounts is "4 files (1 added, 2 changed, 1 deleted)", naming only
+// the kinds there are.
 func changeCounts(files []changeFile) string {
 	var add, chg, del int
 	for _, f := range files {
@@ -98,7 +98,7 @@ func changeCounts(files []changeFile) string {
 	if del > 0 {
 		parts = append(parts, fmt.Sprintf("%d deleted", del))
 	}
-	return strings.Join(parts, ", ") + " " + map[bool]string{true: "file", false: "files"}[len(files) == 1]
+	return fmt.Sprintf("%d file%s (%s)", len(files), reviewPlural(len(files)), strings.Join(parts, ", "))
 }
 
 // changeQuote is s as a Markdown quote, escaped, at most n characters.
@@ -121,7 +121,7 @@ func changeMessage(agent, agentOwner, id string, ci *changeInput) string {
 	fmt.Fprintf(&head, " proposes a change to the skill %s in your skill source **%s** ([%s/%s](%s), branch %s).\n\n",
 		reviewCode(changeSkillLabel(ci)), reviewMD(ci.Slug), reviewMD(ci.Owner), reviewMD(ci.Repo), reviewRepoURL(ci.Owner, ci.Repo), reviewCode(ci.Branch))
 	fmt.Fprintf(&head, "- Based on commit [%s](%s), the version agents see now\n", reviewCode(reviewShort(ci.BaseSHA)), reviewCommitURL(ci.Owner, ci.Repo, ci.BaseSHA))
-	fmt.Fprintf(&head, "- Files: %s\n\n", changeCounts(ci.Files))
+	fmt.Fprintf(&head, "- Changes: %s\n\n", changeCounts(ci.Files))
 	fmt.Fprintf(&head, "**Title:** %s\n\n", reviewMD(ci.Title))
 	if ci.Summary != "" {
 		head.WriteString("**Summary, in the agent's words:**\n\n")
@@ -290,7 +290,9 @@ func changeDiffOps(a, b []string) (ops []changeDiffOp, ok bool) {
 			ops = append(ops, changeDiffOp{' ', am[i]})
 			i++
 			j++
-		case lcs[(i+1)*w+j] >= lcs[i*w+j+1]:
+		case lcs[(i+1)*w+j] > lcs[i*w+j+1], lcs[(i+1)*w+j] == lcs[i*w+j+1] && n-i >= m-j:
+			// On a tie, consume the longer rest first: a replaced line
+			// among repeated ones stays where it was.
 			ops = append(ops, changeDiffOp{'-', am[i]})
 			i++
 		default:
@@ -306,6 +308,28 @@ func changeDiffOps(a, b []string) (ops []changeDiffOp, ok bool) {
 	}
 	for _, l := range a[len(a)-suf:] {
 		ops = append(ops, changeDiffOp{' ', l})
+	}
+	// In each run of changes, removed lines come before added ones, as
+	// unified diffs show them.
+	for k := 0; k < len(ops); {
+		if ops[k].kind == ' ' {
+			k++
+			continue
+		}
+		end := k
+		for end < len(ops) && ops[end].kind != ' ' {
+			end++
+		}
+		run := make([]changeDiffOp, 0, end-k)
+		for _, kind := range []byte{'-', '+'} {
+			for _, op := range ops[k:end] {
+				if op.kind == kind {
+					run = append(run, op)
+				}
+			}
+		}
+		copy(ops[k:end], run)
+		k = end
 	}
 	return ops, true
 }
