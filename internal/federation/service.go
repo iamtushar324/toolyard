@@ -19,6 +19,7 @@ import (
 
 	"github.com/golang-jwt/jwt/v5"
 	"github.com/google/uuid"
+	"github.com/tusharbhardwaj/toolyard/internal/cluster"
 	"github.com/tusharbhardwaj/toolyard/internal/identity"
 	"github.com/tusharbhardwaj/toolyard/internal/sealbox"
 	"github.com/tusharbhardwaj/toolyard/internal/store"
@@ -43,7 +44,10 @@ type Service struct {
 	// independently of claims in the environment's signed assertion.
 	Membership func(context.Context, string) (Profile, error)
 	now        func() time.Time
-	mu         sync.Mutex
+	// mu serializes the connection writes in this process; with a
+	// multi-node cluster a cluster lock replaces it (lock, cluster.go).
+	mu      sync.Mutex
+	cluster *cluster.Cluster
 }
 
 func New(ctx context.Context, db *store.DB, id *identity.Service, cipher *sealbox.Cipher) (*Service, error) {
@@ -52,7 +56,9 @@ func New(ctx context.Context, db *store.DB, id *identity.Service, cipher *sealbo
 	if err != nil {
 		return nil, err
 	}
-	err = db.QueryRowContext(ctx, `SELECT id FROM federation_instance LIMIT 1`).Scan(&s.InstanceID)
+	// Two replicas starting on a new database may both insert a row:
+	// every replica reads the same one.
+	err = db.QueryRowContext(ctx, `SELECT id FROM federation_instance ORDER BY id LIMIT 1`).Scan(&s.InstanceID)
 	return s, err
 }
 
@@ -205,8 +211,11 @@ type Credential struct {
 }
 
 func (s *Service) Connect(ctx context.Context, p *Principal, expectedVersion int) (*Credential, error) {
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	unlock, lerr := s.lock(ctx)
+	if lerr != nil {
+		return nil, lerr
+	}
+	defer unlock()
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, err

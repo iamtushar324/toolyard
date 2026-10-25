@@ -181,8 +181,11 @@ func (s *Service) BeginHost(ctx context.Context, proof string) (*HostRequest, er
 	if e != nil {
 		return nil, e
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	unlock, lerr := s.lock(ctx)
+	if lerr != nil {
+		return nil, lerr
+	}
+	defer unlock()
 	tx, e := s.db.BeginTx(ctx, nil)
 	if e != nil {
 		return nil, e
@@ -245,8 +248,11 @@ func (s *Service) DecideHost(ctx context.Context, ref, owner string, accept bool
 	if e != nil || u.Status != identity.StatusActive {
 		return nil, ErrUnauthorized
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	unlock, lerr := s.lock(ctx)
+	if lerr != nil {
+		return nil, lerr
+	}
+	defer unlock()
 	h, e := s.InspectHostRequest(ctx, ref)
 	if e != nil {
 		return nil, e
@@ -363,8 +369,11 @@ func (s *Service) PollHost(ctx context.Context, proof string, cancel bool) (*Hos
 	if e != nil {
 		return nil, e
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	unlock, lerr := s.lock(ctx)
+	if lerr != nil {
+		return nil, lerr
+	}
+	defer unlock()
 	h, e := s.hostRequest(ctx, c.RequestID, false)
 	if e != nil && cancel {
 		tx, err := s.db.BeginTx(ctx, nil)
@@ -512,8 +521,11 @@ func (s *Service) RenewHost(ctx context.Context, token string, expected int) (*C
 	if e != nil {
 		return nil, e
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	unlock, lerr := s.lock(ctx)
+	if lerr != nil {
+		return nil, lerr
+	}
+	defer unlock()
 	tx, e := s.db.BeginTx(ctx, nil)
 	if e != nil {
 		return nil, e
@@ -580,8 +592,11 @@ func (s *Service) revokeHost(ctx context.Context, owner, agent string, byOwner b
 	if u == nil {
 		u = &identity.User{ID: owner}
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	unlock, lerr := s.lock(ctx)
+	if lerr != nil {
+		return lerr
+	}
+	defer unlock()
 	tx, e := s.db.BeginTx(ctx, nil)
 	if e != nil {
 		return e

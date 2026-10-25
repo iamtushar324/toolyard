@@ -17,6 +17,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/tusharbhardwaj/toolyard/internal/actor"
+	"github.com/tusharbhardwaj/toolyard/internal/cluster"
 	"github.com/tusharbhardwaj/toolyard/internal/logx"
 	"github.com/tusharbhardwaj/toolyard/internal/opsmetrics"
 	"github.com/tusharbhardwaj/toolyard/internal/store"
@@ -108,6 +109,11 @@ type Options struct {
 	// AgentName resolves an agent ID to a display name.
 	AgentName func(ctx context.Context, agentID string) string
 	Now       func() time.Time
+	// Cluster, when it spans several nodes (Postgres), makes the Inbox safe
+	// for replicas sharing the database: execution leases, cross-node
+	// wake-ups for Wait and cluster locks instead of in-process ones
+	// (cluster.go). nil keeps the single-process behaviour.
+	Cluster *cluster.Cluster
 }
 
 // Service is the inbox.
@@ -173,9 +179,16 @@ func New(ctx context.Context, opts Options) (*Service, error) {
 		now = time.Now
 	}
 	service := &Service{db: opts.DB, opts: opts, signer: signer, now: now, watch: map[string]chan struct{}{}, uploadSlots: make(chan struct{}, MaxConcurrentUploads), agentUploads: map[string]int{}, legacySync: make(chan struct{}, 1)}
-	if _, err := service.RecoverExecutions(ctx); err != nil {
-		return nil, fmt.Errorf("execution recovery: %w", err)
+	// With replicas, a starting node never settles executions: one whose
+	// lease seems to have ended may belong to a live node that could not
+	// renew during a database outage. The leader's work recovery does it,
+	// one lease after it takes over.
+	if !service.multiNode() {
+		if _, err := service.RecoverExecutions(ctx); err != nil {
+			return nil, fmt.Errorf("execution recovery: %w", err)
+		}
 	}
+	service.subscribeCluster()
 	return service, nil
 }
 
@@ -303,8 +316,11 @@ func (s *Service) Submit(ctx context.Context, agentID string, sub *Submission) (
 	if sub.Kind == "" {
 		sub.Kind = KindAccess
 	}
-	s.submitMu.Lock()
-	defer s.submitMu.Unlock()
+	unlock, err := s.lockSubmit(ctx, agentID)
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
 	fingerprint := hashJSON(sub)
 	if problem := clientRequestIDProblem(sub.ClientRequestID); problem != "" {
 		// Checked before the replay lookup: a NUL cannot travel as a
@@ -414,7 +430,8 @@ func (s *Service) Submit(ctx context.Context, agentID string, sub *Submission) (
 		s.submitInsertHook()
 	}
 	if err := s.insert(ctx, r); err != nil {
-		// submitMu orders submissions in this process only. When another
+		// lockSubmit orders one agent's submissions, but an Inbox without a
+		// cluster does so in this process only. When another
 		// submission with the same client_request_id committed first, the
 		// unique index refuses this insert: answer as a sequential retry
 		// would (the stored request, or ErrConflict for other content).
@@ -1091,6 +1108,15 @@ func (s *Service) Wait(ctx context.Context, agentID string, ids []string, mode s
 	deadline := time.NewTimer(timeout)
 	defer deadline.Stop()
 	released := s.releaseChan()
+	// A decision on another node wakes this one through the cluster
+	// (wakeTopic); the poll re-reads the requests in case a message was
+	// missed. A single node needs neither.
+	var poll <-chan time.Time
+	if s.multiNode() {
+		t := time.NewTicker(waitPoll)
+		defer t.Stop()
+		poll = t.C
+	}
 	for {
 		done, total := 0, 0
 		var chans []chan struct{}
@@ -1126,6 +1152,8 @@ func (s *Service) Wait(ctx context.Context, agentID string, ids []string, mode s
 		select {
 		case <-changed:
 			close(stop)
+		case <-poll:
+			close(stop)
 		case <-deadline.C:
 			close(stop)
 			return s.Status(ctx, agentID, ids)
@@ -1150,7 +1178,19 @@ func (s *Service) watchCh(id string) chan struct{} {
 	return c
 }
 
+// wake wakes the waiters of request id on every node: this one at once,
+// the others through the cluster.
 func (s *Service) wake(id string) {
+	s.wakeLocal(id)
+	if s.multiNode() {
+		if err := s.opts.Cluster.Publish(context.Background(), wakeTopic, id); err != nil {
+			logx.For("inbox").Warn("inbox: wake-up for other nodes failed; their waiters poll", "request_id", id, "err", err.Error())
+		}
+	}
+}
+
+// wakeLocal wakes this node's waiters of request id.
+func (s *Service) wakeLocal(id string) {
 	s.watchMu.Lock()
 	c, ok := s.watch[id]
 	delete(s.watch, id)

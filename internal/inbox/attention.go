@@ -306,8 +306,23 @@ func (s *Service) markPush(ctx context.Context, id int64, outcome string) {
 	_, _ = s.db.ExecContext(ctx, `UPDATE inbox_pushes SET sent_at = ?, outcome = ? WHERE id = ?`, s.now().UnixMilli(), outcome, id)
 }
 
-// dispatchPushes sends due notifications. One dispatcher runs at a time,
-// so a row is never sent twice.
+// claimPush takes one due push row just before it is sent: another
+// dispatcher that read the same row (on another node, or the urgent
+// dispatch of a Submit) finds it taken and leaves it, so no notification
+// goes out twice. A claimed row that is never marked keeps outcome
+// "sending" (at most once: a lost push is better than a repeated one).
+func (s *Service) claimPush(ctx context.Context, id int64) bool {
+	res, err := s.db.ExecContext(ctx, `UPDATE inbox_pushes SET sent_at = ?, outcome = ? WHERE id = ? AND sent_at IS NULL`, s.now().UnixMilli(), "sending", id)
+	if err != nil {
+		return false
+	}
+	n, err := res.RowsAffected()
+	return err == nil && n == 1
+}
+
+// dispatchPushes sends due notifications. One dispatcher runs at a time in
+// a process, and each row is claimed before it is sent (claimPush), so a
+// row is never sent twice, on one node or several.
 func (s *Service) dispatchPushes(ctx context.Context) {
 	s.attnMu.Lock()
 	defer s.attnMu.Unlock()
@@ -381,7 +396,15 @@ func (s *Service) dispatchLocked(ctx context.Context) {
 		groups[key] = append(groups[key], item{p, r})
 	}
 	for _, key := range order {
-		items := groups[key]
+		var items []item
+		for _, it := range groups[key] {
+			if s.claimPush(ctx, it.row.id) {
+				items = append(items, it)
+			}
+		}
+		if len(items) == 0 {
+			continue
+		}
 		if len(items) == 1 {
 			s.send(ctx, s.itemPush(ctx, c, items[0].r, items[0].row.reason))
 			s.markPush(ctx, items[0].row.id, "sent")

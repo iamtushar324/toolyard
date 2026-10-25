@@ -41,6 +41,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/tusharbhardwaj/toolyard/internal/approval"
+	"github.com/tusharbhardwaj/toolyard/internal/cluster"
 	"github.com/tusharbhardwaj/toolyard/internal/metrics"
 	"github.com/tusharbhardwaj/toolyard/internal/settings"
 	"github.com/tusharbhardwaj/toolyard/internal/store"
@@ -102,6 +103,12 @@ type Service struct {
 
 	rateMu      sync.Mutex
 	rateBuckets map[string]*rateBucket // agent -> bucket
+
+	// cluster, when it spans several nodes, carries rule changes to the
+	// other replicas and counts the per-agent budget in the database
+	// (SetCluster, cluster.go).
+	cluster *cluster.Cluster
+	shared  *cluster.Counter
 }
 
 type rateBucket struct {
@@ -140,10 +147,14 @@ func (s *Service) reload(ctx context.Context) error {
 		}
 		out = append(out, r)
 	}
+	// A read that stopped half-way keeps the last good cache.
+	if err := rows.Err(); err != nil {
+		return err
+	}
 	s.mu.Lock()
 	s.cache = out
 	s.mu.Unlock()
-	return rows.Err()
+	return nil
 }
 
 // Match returns the first enabled rule that allows the supplied request, or
@@ -168,10 +179,24 @@ func (s *Service) matchRule(agentID, toolName, fingerprint string, isDestructive
 	if s.settings != nil && !s.settings.GetBool(settings.AutoApprovalEnabled) {
 		return nil
 	}
+	if s.shared != nil {
+		// Several replicas: the matching rule takes one unit of the
+		// shared budget in one conditional increment (cluster.go).
+		r := s.findRule(agentID, toolName, fingerprint)
+		if r == nil || !s.takeSharedBudget(agentID) {
+			return nil
+		}
+		return r
+	}
 	if !s.allowedByRate(agentID) {
 		return nil
 	}
+	return s.findRule(agentID, toolName, fingerprint)
+}
 
+// findRule returns the first enabled, unexpired rule, in static → pattern
+// → tool order, that allows the call.
+func (s *Service) findRule(agentID, toolName, fingerprint string) *Rule {
 	now := time.Now().UnixMilli()
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -265,6 +290,9 @@ func (s *Service) MarkHit(ctx context.Context, ruleID, agentID string) {
 	}
 	s.mu.Unlock()
 
+	if s.shared != nil {
+		return // counted by takeSharedBudget when the rule matched
+	}
 	hourStart := time.Now().Truncate(time.Hour).UnixMilli()
 	s.rateMu.Lock()
 	b := s.rateBuckets[agentID]
@@ -302,7 +330,7 @@ func (s *Service) MarkDenial(ctx context.Context, agentID, toolName, fingerprint
         WHERE kind = 'pattern' AND fingerprint = ?
           AND (agent_id IS NULL OR agent_id = '' OR agent_id = ?)`,
 		fingerprint, agentID)
-	if err := s.reload(ctx); err != nil {
+	if err := s.reloadChanged(ctx); err != nil {
 		log.Printf("autoapproval: reload after denial: %v", err)
 	}
 }
@@ -345,7 +373,7 @@ func (s *Service) CreateOrUpdate(ctx context.Context, r Rule) (*Rule, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := s.reload(ctx); err != nil {
+	if err := s.reloadChanged(ctx); err != nil {
 		return nil, err
 	}
 	return &r, nil
@@ -360,7 +388,7 @@ func (s *Service) Enable(ctx context.Context, id, by string) error {
         WHERE id = ?`, nullStr(by), id); err != nil {
 		return err
 	}
-	return s.reload(ctx)
+	return s.reloadChanged(ctx)
 }
 
 // Disable flips enabled to 0 — used for "revoke" and "dismiss".
@@ -369,7 +397,7 @@ func (s *Service) Disable(ctx context.Context, id string) error {
         SET enabled = 0 WHERE id = ?`, id); err != nil {
 		return err
 	}
-	return s.reload(ctx)
+	return s.reloadChanged(ctx)
 }
 
 // Delete removes the row entirely; used for "dismiss forever" on suggested.
@@ -377,7 +405,7 @@ func (s *Service) Delete(ctx context.Context, id string) error {
 	if _, err := s.db.ExecContext(ctx, `DELETE FROM auto_approval_rules WHERE id = ?`, id); err != nil {
 		return err
 	}
-	return s.reload(ctx)
+	return s.reloadChanged(ctx)
 }
 
 // List returns every rule, regardless of enabled state. The dashboard splits
@@ -614,7 +642,7 @@ func (s *Service) SetToolPolicyBy(ctx context.Context, toolName string, autoAppr
 		toolName); err != nil {
 		return err
 	}
-	return s.reload(ctx)
+	return s.reloadChanged(ctx)
 }
 
 // ToolPolicies returns the set of tools that currently have an enabled

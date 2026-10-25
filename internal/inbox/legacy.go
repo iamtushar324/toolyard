@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/tusharbhardwaj/toolyard/internal/actor"
+	"github.com/tusharbhardwaj/toolyard/internal/cluster"
 	"github.com/tusharbhardwaj/toolyard/internal/logx"
 	"github.com/tusharbhardwaj/toolyard/internal/opsmetrics"
 )
@@ -51,6 +52,11 @@ func (s *Service) SyncLegacy(ctx context.Context) error {
 		return err
 	}
 	defer tx.Rollback()
+	// legacySyncMu covers this process; on Postgres the transaction lock
+	// also makes the sync passes of other replicas take turns with it.
+	if err = cluster.LockTx(ctx, tx, s.db.Dialect, "inbox-legacy-sync"); err != nil {
+		return err
+	}
 	if _, err = tx.ExecContext(ctx, legacyOwnerSnapshotSQL); err != nil {
 		return err
 	}
