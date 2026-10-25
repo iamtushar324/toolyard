@@ -203,6 +203,12 @@ func scalarValue(n *yaml.Node) any {
 	return n.Value
 }
 
+// storableText reports text a database text column takes on both
+// engines: valid UTF-8 without NUL bytes.
+func storableText(s string) bool {
+	return utf8.ValidString(s) && !strings.ContainsRune(s, 0)
+}
+
 // skillMeta is what the hub reads from one SKILL.md.
 type skillMeta struct {
 	name        string
@@ -236,6 +242,10 @@ func parseSkillMD(repoFile, folderName string, content []byte) (meta skillMeta, 
 	desc, _ := fm["description"].(string)
 	name, desc = strings.TrimSpace(name), strings.TrimSpace(desc)
 	switch {
+	case !storableText(name) || !storableText(desc):
+		// A YAML escape ("\0") can put a NUL byte in a string, which
+		// Postgres text refuses.
+		return skipWith("invalid_text", "skipped: the name or description holds a NUL byte or invalid UTF-8")
 	case name == "":
 		return skipWith("missing_field", "skipped: the frontmatter has no name")
 	case desc == "":

@@ -20,7 +20,7 @@ const maxWarnings = 1000
 // skill): an incremental update carries them over for unchanged files.
 var fileLevelCodes = map[string]bool{
 	"binary": true, "too_large": true, "secret": true, "symlink": true,
-	"special": true, "excluded": true,
+	"special": true, "excluded": true, "invalid_path": true,
 }
 
 // builtSkill is one skill of a version being built.
@@ -114,9 +114,13 @@ func discover(fs *fileSet, folder, rootName string, contents map[string][]byte) 
 	for _, p := range sortedPaths(fs.omitted) {
 		if _, ok := innermostSkill(p, skills); ok {
 			w := fs.omitted[p]
-			w.Path = repoPath(folder, p)
+			w.Path = printablePath(repoPath(folder, p))
 			warns = append(warns, w)
 		}
+	}
+	if fs.dropped > 0 {
+		warns = append(warns, Warning{Path: folder, Code: "too_many_omitted", Severity: "warn",
+			Message: fmt.Sprintf("%d more files were left out and are not listed", fs.dropped)})
 	}
 	excluded := append([]string(nil), fs.excluded...)
 	sort.Strings(excluded)
@@ -125,7 +129,7 @@ func discover(fs *fileSet, folder, rootName string, contents map[string][]byte) 
 			continue
 		}
 		if _, ok := innermostSkill(p, skills); ok {
-			warns = append(warns, Warning{Path: repoPath(folder, p), Code: "excluded", Message: "omitted: matches an exclude glob", Severity: "skip"})
+			warns = append(warns, Warning{Path: printablePath(repoPath(folder, p)), Code: "excluded", Message: "omitted: matches an exclude glob", Severity: "skip"})
 		}
 	}
 	b.warnings = capWarnings(warns)

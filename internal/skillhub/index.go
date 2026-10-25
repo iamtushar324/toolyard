@@ -17,6 +17,10 @@ type index struct {
 	mu     sync.RWMutex
 	byID   map[string]*srcIndex
 	bySlug map[string]*srcIndex
+	// deleted remembers the sources this node saw deleted (IDs are never
+	// reused), so a reload that read the source before its delete cannot
+	// bring it back.
+	deleted map[string]bool
 
 	lmu       sync.Mutex
 	nextL     int
@@ -24,7 +28,8 @@ type index struct {
 }
 
 func newIndex() *index {
-	return &index{byID: map[string]*srcIndex{}, bySlug: map[string]*srcIndex{}, listeners: map[int]func(string){}}
+	return &index{byID: map[string]*srcIndex{}, bySlug: map[string]*srcIndex{}, deleted: map[string]bool{},
+		listeners: map[int]func(string){}}
 }
 
 // srcIndex is one source and its active version.
@@ -39,6 +44,10 @@ type srcIndex struct {
 	files     []*fileEntry // by path
 	byFile    map[string]*fileEntry
 	warnings  []Warning
+	// skillFiles and skillOmitted are each skill's files (nested skills'
+	// included) and left-out files, by skill path.
+	skillFiles   map[string][]*fileEntry
+	skillOmitted map[string][]Warning
 }
 
 // skillEntry is one skill of an active version.
@@ -104,17 +113,35 @@ func (ix *index) slug(slug string) *srcIndex {
 }
 
 // put swaps in a source (nil removes id) and reports the slugs whose
-// served content changed.
+// served content changed. Reloads may finish in any order, so put keeps
+// the newer of two snapshots of a source (updated_at moves forward with
+// every change), never brings back a deleted source, and gives a slug to
+// the newest source that holds it (a slug freed by a delete may be taken
+// by a new source before this node hears of the delete).
 func (ix *index) put(id string, si *srcIndex) []string {
 	ix.mu.Lock()
 	old := ix.byID[id]
+	switch {
+	case si == nil:
+		ix.deleted[id] = true
+	case ix.deleted[id]:
+		ix.mu.Unlock()
+		return nil
+	case old != nil && si.src.UpdatedAt.Before(old.src.UpdatedAt):
+		ix.mu.Unlock()
+		return nil
+	}
 	if old != nil {
-		delete(ix.bySlug, old.src.Slug)
+		if ix.bySlug[old.src.Slug] == old {
+			delete(ix.bySlug, old.src.Slug)
+		}
 		delete(ix.byID, id)
 	}
 	if si != nil {
 		ix.byID[id] = si
-		ix.bySlug[si.src.Slug] = si
+		if cur := ix.bySlug[si.src.Slug]; cur == nil || cur.src.ID == id || !si.src.CreatedAt.Before(cur.src.CreatedAt) {
+			ix.bySlug[si.src.Slug] = si
+		}
 	}
 	ix.mu.Unlock()
 	var changed []string
@@ -249,6 +276,7 @@ func (s *Service) buildSrcIndex(ctx context.Context, row *sourceRow) (*srcIndex,
 	si := &srcIndex{
 		src: row.Source, members: map[string]bool{},
 		byPath: map[string]*skillEntry{}, byFile: map[string]*fileEntry{},
+		skillFiles: map[string][]*fileEntry{}, skillOmitted: map[string][]Warning{},
 	}
 	for _, m := range row.Members {
 		si.members[m] = true
@@ -291,6 +319,21 @@ func (s *Service) buildSrcIndex(ctx context.Context, row *sourceRow) (*srcIndex,
 	// cursors compare paths as Go strings.
 	sort.Slice(si.skills, func(i, j int) bool { return si.skills[i].path < si.skills[j].path })
 	sort.Slice(si.files, func(i, j int) bool { return si.files[i].path < si.files[j].path })
+	for _, f := range si.files {
+		for _, sp := range enclosingSkills(f.path, si.byPath) {
+			si.skillFiles[sp] = append(si.skillFiles[sp], f)
+		}
+	}
+	for _, w := range si.warnings {
+		if w.Severity != "skip" || w.Path == "" {
+			continue
+		}
+		if rel, ok := underFolder(w.Path, row.Path); ok && rel != "" {
+			for _, sp := range enclosingSkills(rel, si.byPath) {
+				si.skillOmitted[sp] = append(si.skillOmitted[sp], w)
+			}
+		}
+	}
 	return si, nil
 }
 

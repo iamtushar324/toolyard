@@ -6,6 +6,7 @@ import (
 	"path"
 	"regexp"
 	"strings"
+	"unicode/utf8"
 )
 
 var (
@@ -112,6 +113,33 @@ func splitTreeRest(rest string, branches []string) (branch, folder string) {
 	return segs[0], strings.Join(segs[1:], "/")
 }
 
+// validBranch reports a branch name toolyard accepts (git's ref name
+// rules): at most 255 bytes of UTF-8, no "..", "//" or "@{", no control
+// character, space or any of ~^:?*[\, no leading or trailing "/", no
+// segment starting with ".", not ending in "." or ".lock", no leading
+// "-", and not "@".
+func validBranch(b string) bool {
+	if b == "" || b == "@" || len(b) > 255 || !utf8.ValidString(b) {
+		return false
+	}
+	if strings.Contains(b, "..") || strings.Contains(b, "//") || strings.Contains(b, "@{") ||
+		strings.HasPrefix(b, "/") || strings.HasPrefix(b, "-") || strings.HasSuffix(b, "/") ||
+		strings.HasSuffix(b, ".") || strings.HasSuffix(b, ".lock") {
+		return false
+	}
+	for _, r := range b {
+		if r < 0x20 || r == 0x7f || strings.ContainsRune(" ~^:?*[\\", r) {
+			return false
+		}
+	}
+	for _, seg := range strings.Split(b, "/") {
+		if strings.HasPrefix(seg, ".") {
+			return false
+		}
+	}
+	return true
+}
+
 // splitPath splits p at "/" and drops empty segments.
 func splitPath(p string) []string {
 	var out []string
@@ -128,7 +156,7 @@ func splitPath(p string) []string {
 func cleanFolder(p string) (string, error) {
 	segs := splitPath(strings.TrimSpace(p))
 	for _, seg := range segs {
-		if seg == "." || seg == ".." || strings.ContainsAny(seg, "\\\x00") {
+		if seg == "." || seg == ".." || !validPath(seg) {
 			return "", fmt.Errorf("%w: folder %q must be a plain path inside the repository", ErrInvalid, p)
 		}
 	}

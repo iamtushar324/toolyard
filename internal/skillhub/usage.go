@@ -80,6 +80,17 @@ func (s *Service) runUsageFlush(ctx context.Context) {
 	}
 }
 
+// usageKeepDays is how many days of read counts are kept.
+const usageKeepDays = 90
+
+// pruneUsage deletes read counts older than usageKeepDays.
+func (s *Service) pruneUsage(ctx context.Context) error {
+	if _, err := s.db.ExecContext(ctx, `DELETE FROM skill_usage WHERE day < ?`, day(s.now())-usageKeepDays); err != nil {
+		return fmt.Errorf("skillhub: prune read counts: %w", err)
+	}
+	return nil
+}
+
 // reads30d sums each skill's reads over the last 30 days.
 func (s *Service) reads30d(ctx context.Context, sourceID string) (map[string]int, error) {
 	rows, err := s.db.QueryContext(ctx, `SELECT skill_path, CAST(SUM(reads) AS BIGINT) FROM skill_usage

@@ -10,7 +10,6 @@ import (
 	"fmt"
 	"io"
 	"regexp"
-	"sort"
 	"strings"
 	"time"
 
@@ -237,11 +236,9 @@ func (s *Service) resolveName(v Viewer, name string) (*srcIndex, *skillEntry, er
 // fileRefs is the complete file list of a skill (nested skills' files
 // included), with paths relative to the skill folder.
 func (si *srcIndex) fileRefs(e *skillEntry) []FileRef {
-	var out []FileRef
-	for _, f := range si.files {
-		if !inFolder(e.path, f.path) {
-			continue
-		}
+	files := si.skillFiles[e.path]
+	out := make([]FileRef, 0, len(files))
+	for _, f := range files {
 		out = append(out, FileRef{URI: FileURI(si.src.Slug, f.path), Path: relTo(e.path, f.path), Digest: f.sha, Size: f.size, Type: f.media})
 	}
 	return out
@@ -249,14 +246,7 @@ func (si *srcIndex) fileRefs(e *skillEntry) []FileRef {
 
 // omitted is the version's warnings about files inside a skill's folder.
 func (si *srcIndex) omitted(e *skillEntry) []Warning {
-	dir := repoPath(si.src.Path, e.path)
-	var out []Warning
-	for _, w := range si.warnings {
-		if w.Severity == "skip" && w.Path != "" && inFolder(dir, w.Path) {
-			out = append(out, w)
-		}
-	}
-	return out
+	return si.skillOmitted[e.path]
 }
 
 // skillOf builds the Skill (frontmatter and file list; body when raw is
@@ -536,7 +526,19 @@ type grepRun struct {
 
 // scan greps a batch of files of one source; true means a cap was hit.
 func (g *grepRun) scan(ctx context.Context, si *srcIndex, files []*fileEntry) bool {
-	if ctx.Err() != nil {
+	if ctx.Err() != nil || g.files >= grepMaxFiles || g.bytes >= grepMaxBytes {
+		return true
+	}
+	// Load only what the caps leave room for.
+	room, budget := grepMaxFiles-g.files, grepMaxBytes-g.bytes
+	n := 0
+	for n < len(files) && n < room && files[n].size <= budget {
+		budget -= files[n].size
+		n++
+	}
+	capped := n < len(files)
+	files = files[:n]
+	if len(files) == 0 {
 		return true
 	}
 	shas := make([]string, len(files))
@@ -573,7 +575,7 @@ func (g *grepRun) scan(ctx context.Context, si *srcIndex, files []*fileEntry) bo
 			}
 		}
 	}
-	return false
+	return capped
 }
 
 // capLine cuts a line to grepMaxLine bytes at a character boundary.
@@ -617,10 +619,8 @@ func (s *Service) Bundle(ctx context.Context, v Viewer, refs []string, w io.Writ
 			return fmt.Errorf("%w: two chosen skills are named %q (%s, %s)", ErrConflict, e.name, prev, uri)
 		}
 		names[e.name] = uri
-		for _, f := range si.files {
-			if inFolder(e.path, f.path) {
-				total += f.size
-			}
+		for _, f := range si.skillFiles[e.path] {
+			total += f.size
 		}
 		picks = append(picks, chosen{si, e})
 	}
@@ -646,13 +646,7 @@ func (s *Service) Bundle(ctx context.Context, v Viewer, refs []string, w io.Writ
 
 // bundleSkill writes one skill's folder into a bundle.
 func (s *Service) bundleSkill(ctx context.Context, tw *tar.Writer, si *srcIndex, e *skillEntry) error {
-	var files []*fileEntry
-	for _, f := range si.files {
-		if inFolder(e.path, f.path) {
-			files = append(files, f)
-		}
-	}
-	sort.Slice(files, func(i, j int) bool { return files[i].path < files[j].path })
+	files := si.skillFiles[e.path] // by path
 	for start := 0; start < len(files); start += blobBatch {
 		batch := files[start:min(start+blobBatch, len(files))]
 		shas := make([]string, len(batch))

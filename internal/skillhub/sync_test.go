@@ -39,8 +39,13 @@ func TestSyncAutoFullThenIncremental(t *testing.T) {
 		t.Fatalf("downloads: tarball %d codeload %d", gh.count("tarball"), gh.count("codeload"))
 	}
 
-	// An unchanged branch: the ETag check answers 304 and nothing is fetched.
-	res, err := svc.SyncNow(ctx, src.ID)
+	// "Sync now" asked for the head fresh (no ETag, no cache).
+	if gh.count("headFresh") != 1 || gh.count("head304") != 0 {
+		t.Fatalf("fresh head reads %d, 304 answers %d", gh.count("headFresh"), gh.count("head304"))
+	}
+	// An unchanged branch, checked as the poller does: the ETag check
+	// answers 304 and nothing is fetched.
+	res, err := svc.syncSource(ctx, src.ID, syncRequest{tr: triggerWebhook})
 	if err != nil || !res.Unchanged {
 		t.Fatalf("second sync %+v %v", res, err)
 	}
@@ -90,17 +95,30 @@ func TestSyncAutoFullThenIncremental(t *testing.T) {
 	}
 }
 
-// recordingHook records staged versions.
+// recordingHook records staged versions once each, as the Inbox hook
+// does; failures makes its first calls fail.
 type recordingHook struct {
 	mu       sync.Mutex
 	versions []Version
+	calls    int
+	failures int
 }
 
 func (h *recordingHook) PendingVersion(_ context.Context, src Source, v Version) error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
+	h.calls++
 	if src.PendingVersionID != v.ID {
 		return errors.New("source does not name the pending version")
+	}
+	if h.failures > 0 {
+		h.failures--
+		return errors.New("inbox down")
+	}
+	for _, have := range h.versions {
+		if have.ID == v.ID {
+			return nil
+		}
 	}
 	h.versions = append(h.versions, v)
 	return nil
@@ -324,7 +342,7 @@ func TestSyncLimitKeepsActiveVersion(t *testing.T) {
 	}
 	// A webhook (or poll) does not download the failed commit again.
 	downloads := gh.count("tarball")
-	if res, err := svc.syncSource(ctx, src.ID, triggerWebhook); err == nil || !res.Unchanged {
+	if res, err := svc.syncSource(ctx, src.ID, syncRequest{tr: triggerWebhook}); err == nil || !res.Unchanged {
 		t.Fatalf("webhook retry %+v %v", res, err)
 	}
 	if gh.count("tarball") != downloads {
