@@ -62,6 +62,12 @@ function appsResumeOAuth(loc) {
 // appsKindLabel says how far toolyard knows who the app is: a metadata
 // document client is identified by its document's host; a self-registered
 // client only by its own claims.
+// appsMayGrantManage: only the app's owner, while an admin, may let an app
+// manage toolyard; anyone who manages the app may turn it off.
+function appsMayGrantManage(ed) {
+  return !!(ed && ed.appId && isAdmin() && state.user && ed.ownerId === state.user.id);
+}
+
 function appsKindLabel(app) {
   if (app.client_kind === 'cimd') {
     try { return 'Identified by ' + new URL(app.client_id).hostname; } catch (_) { return 'Identified by its client ID'; }
@@ -154,7 +160,7 @@ async function saveScopeEditor() {
   ed.saving = true; ed.error = ''; render();
   const scope = appsScopeFromDraft(ed.draft);
   try {
-    if (ed.appId) await api('/v1/me/apps/scope', { method: 'POST', body: Object.assign({ id: ed.appId, scope }, isAdmin() || !ed.draft.mayManage ? { may_manage: !!ed.draft.mayManage } : {}) });
+    if (ed.appId) await api('/v1/me/apps/scope', { method: 'POST', body: Object.assign({ id: ed.appId, scope }, appsMayGrantManage(ed) || !ed.draft.mayManage ? { may_manage: !!ed.draft.mayManage } : {}) });
     else await api('/v1/me/agent-scopes', { method: 'POST', body: { agent_id: ed.agentId, scope } });
     appsUI.editor = null;
     toast('Access saved: ' + appsScopeSummary(scope) + '.');
@@ -228,11 +234,13 @@ function renderAppCard(app) {
     el('div', { class: 'meta' }, 'Connected ' + relTime(app.created_at) + ' · last used ' + (app.last_used_at ? relTime(app.last_used_at) : 'never') +
       (app.revoked_at ? ' · revoked ' + relTime(app.revoked_at) : '')),
     el('p', {}, 'Access: ' + (app.scope_summary || appsScopeSummary(app.scope))),
-    app.may_manage ? el('p', { class: 'err' }, 'May manage toolyard (policies, servers, shared connections).') : null,
+    app.may_manage ? el('p', { class: 'err' }, app.owner_is_admin === false
+      ? 'May manage toolyard, but this has no effect: the owner is not an admin.'
+      : 'May manage toolyard (policies, servers, shared connections).') : null,
     el('div', { class: 'meta' }, 'Client ID: ', el('code', {}, app.client_id), ' · Agent: ', el('code', {}, app.agent_id)),
     el('div', { class: 'row', style: 'margin-top: 8px;' },
       active ? el('button', { on: { click: () => renameApp(app) } }, 'Rename') : null,
-      active ? el('button', { on: { click: () => openScopeEditor({ appId: app.id, name: app.nickname, scope: app.scope, mayManage: !!app.may_manage }) } }, 'Change access') : null,
+      active ? el('button', { on: { click: () => openScopeEditor({ appId: app.id, name: app.nickname, scope: app.scope, mayManage: !!app.may_manage, ownerId: app.owner_id }) } }, 'Change access') : null,
       el('button', { on: { click: () => openAppActivity(app) } }, 'Activity'),
       active ? el('button', { class: 'danger', on: { click: () => revokeApp(app) } }, 'Revoke') : null),
   );
@@ -289,8 +297,8 @@ function renderScopeEditor() {
               box(d.denyTools.has(key), (on) => toggle(d.denyTools, key, on), 'Block'));
           }) : null);
       })),
-      ed.appId && (isAdmin() || d.mayManage) ? el('label', { class: 'row' },
-        el('input', { type: 'checkbox', checked: !!d.mayManage, disabled: !isAdmin() && !d.mayManage, on: { change: (e) => { d.mayManage = e.target.checked; render(); } } }),
+      ed.appId && (appsMayGrantManage(ed) || d.mayManage) ? el('label', { class: 'row' },
+        el('input', { type: 'checkbox', checked: !!d.mayManage, disabled: !appsMayGrantManage(ed) && !d.mayManage, on: { change: (e) => { d.mayManage = e.target.checked; render(); } } }),
         el('span', {}, 'May manage toolyard (policies, servers, shared connections)')) : null,
       el('p', { class: 'meta' }, 'Result: ' + appsScopeSummary(appsScopeFromDraft(d))),
       ed.error ? el('div', { class: 'err' }, ed.error) : null,

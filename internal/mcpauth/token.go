@@ -119,6 +119,9 @@ func (s *Service) exchangeCode(ctx context.Context, form url.Values, ca ClientAu
 		return nil, serverError()
 	}
 	defer func() { _ = tx.Rollback() }()
+	if err := s.lockGrantOf(ctx, tx, `SELECT grant_id FROM mcp_oauth_codes WHERE code_hash = ?`, hashSecret(code)); err != nil {
+		return nil, serverError()
+	}
 	now := s.now().UnixMilli()
 	var grantID, clientID, redirect, challenge, resource, scope, family string
 	var expires, consentedAt int64
@@ -218,6 +221,9 @@ func (s *Service) refresh(ctx context.Context, form url.Values, ca ClientAuth) (
 	defer func() { _ = tx.Rollback() }()
 	now := s.now().UnixMilli()
 	hash := hashSecret(raw)
+	if err := s.lockGrantOf(ctx, tx, `SELECT grant_id FROM mcp_oauth_tokens WHERE token_hash = ? AND kind = 'refresh'`, hash); err != nil {
+		return nil, serverError()
+	}
 	var grantID, family, scope, resource string
 	var authTime int64
 	err = tx.QueryRowContext(ctx,
@@ -363,7 +369,8 @@ func (s *Service) revokeGrantTx(ctx context.Context, q store.Querier, grantID, r
 
 // afterRevoke runs once a revocation committed: the agent's cached scope
 // is dropped (a disabled agent reaches nothing, so nothing it queued can
-// run) and OnRevoke cancels what it still has pending.
+// run) and OnRevoke cancels what it still has pending, on a context the
+// caller's request ending cannot cancel.
 func (s *Service) afterRevoke(ctx context.Context, agentID string) {
 	if agentID == "" {
 		return
@@ -371,9 +378,48 @@ func (s *Service) afterRevoke(ctx context.Context, agentID string) {
 	if s.access != nil {
 		s.access.InvalidateAgent(agentID)
 	}
-	if s.onRevoke != nil {
-		s.onRevoke(ctx, agentID)
+	s.cancelPending(ctx, agentID)
+}
+
+// cancelPending runs OnRevoke for agentID on a context the caller's
+// request ending cannot cancel.
+func (s *Service) cancelPending(ctx context.Context, agentID string) {
+	if s.onRevoke != nil && agentID != "" {
+		s.onRevoke(context.WithoutCancel(ctx), agentID)
 	}
+}
+
+// AgentDeleted runs the revocation follow-up for an agent deleted through
+// the generic agent routes (identity.DeleteAgent revoked its grant in the
+// same transaction): its cached scope goes and OnRevoke cancels what it
+// had pending. Nothing happens for an agent that was not an OAuth client.
+func (s *Service) AgentDeleted(ctx context.Context, agentID string) {
+	// The delete already committed: finish the follow-up even when the
+	// request that asked for it has ended.
+	ctx = context.WithoutCancel(ctx)
+	var n int
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM mcp_oauth_grants WHERE agent_id = ?`, agentID).Scan(&n); err != nil || n == 0 {
+		return
+	}
+	s.afterRevoke(ctx, agentID)
+}
+
+// lockGrantOf locks the grant of the code or refresh token hash in tx
+// (SELECT ... FOR UPDATE on Postgres) before the code or token row is
+// claimed, so every transaction that touches a grant and its tokens or
+// codes takes the grant first, as Approve and revokeGrantTx do: no two of
+// them can lock the same rows in opposite orders (a deadlock).
+func (s *Service) lockGrantOf(ctx context.Context, tx store.Querier, query, hash string) error {
+	var grantID string
+	err := tx.QueryRowContext(ctx, query, hash).Scan(&grantID)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil // the claim below finds nothing either
+	}
+	if err != nil {
+		return err
+	}
+	var locked string
+	return tx.QueryRowContext(ctx, `SELECT id FROM mcp_oauth_grants WHERE id = ?`+s.db.Dialect.ForUpdate(), grantID).Scan(&locked)
 }
 
 // Revoke is RFC 7009 revocation. An unknown token, or one issued to
