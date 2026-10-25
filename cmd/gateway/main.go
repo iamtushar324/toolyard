@@ -514,6 +514,8 @@ func runServe(argv []string) error {
 	// Roles and per-user tool-group grants. The gateway asks it on every
 	// tool list/call; the Users admin API writes through it.
 	accessSvc := access.New(db)
+	// A scope or grant change on one replica drops the cached copy on all.
+	accessSvc.SetCluster(clusterSvc)
 
 	bus, err := approval.New(ctx, db)
 	if err != nil {
@@ -937,8 +939,25 @@ func runServe(argv []string) error {
 		return nil
 	})
 	defer closeInbox()
-	if n := inboxSvc.RecheckUnchecked(ctx); n > 0 {
-		log.Printf("inbox: re-running background checks for %d request(s)", n)
+	// Requests whose background check never finished (a gateway stopped
+	// mid-check) are checked again. With replicas one node at a time runs
+	// the pass, as a leader task, and every check is claimed first
+	// (inbox lockCheck), so the judge and the media fetches are never paid
+	// twice.
+	recheck := func(ctx context.Context) {
+		if n := inboxSvc.RecheckUnchecked(ctx); n > 0 {
+			log.Printf("inbox: re-running background checks for %d request(s)", n)
+		}
+	}
+	if clusterSvc.MultiNode() {
+		goroutines.Go(goInboxRecheck, func() {
+			clusterSvc.RunLeader(ctx, goInboxRecheck, func(lctx context.Context) error {
+				recheck(lctx)
+				return nil
+			})
+		})
+	} else {
+		recheck(ctx)
 	}
 	inboxGuide := inbox.NewGuide(func() string { return settingsSvc.GetString(settings.InboxHostingNote, "") })
 	gw.SetInbox(inboxSvc, inboxGuide, func() string {
@@ -1381,7 +1400,9 @@ func runServe(argv []string) error {
 	// it queued); OnRevoke also withdraws what it still has pending.
 	mcpAuthSvc := mcpauth.New(mcpauth.Options{DB: db, PublicURL: *publicURL, Settings: settingsSvc, Access: accessSvc,
 		OnRevoke: func(ctx context.Context, agentID string) { cancelAgentWork(ctx, bus, inboxSvc, agentID) }})
-	go mcpAuthSvc.Run(ctx)
+	// Supervised like the other loops: a panic restarts it, and each
+	// clean pass is recorded in the loop metric.
+	goroutines.Loop(ctx, loopMCPAuthSweep, time.Minute, func(ctx context.Context) { runMCPAuthSweeper(ctx, mcpAuthSvc) })
 	if mcpAuthSvc.Enabled() {
 		log.Printf("mcp-oauth: authorization server on (issuer %s, resource %s)", mcpAuthSvc.Issuer(), mcpAuthSvc.Resource())
 	}
@@ -1450,6 +1471,12 @@ func runServe(argv []string) error {
 	// An OAuth access token (mcpauth) is checked by the authorization
 	// server; every 401 names its protected-resource metadata while OAuth
 	// is on, so MCP clients can sign the person in.
+	// An MCP client older than 2026-07-28 opens a session that lives in
+	// one replica's memory: with replicas it fails on any other replica
+	// unless the load balancer is sticky (docs/self-hosting.md).
+	if clusterSvc.MultiNode() && !*statelessMCP {
+		logx.For("cluster").Warn("cluster mode is on and -stateless-mcp is off: an MCP session (Mcp-Session-Id) of a client older than 2026-07-28 works only on the replica that opened it; run -stateless-mcp, or route each session to one replica (sticky on the Mcp-Session-Id header)")
+	}
 	mcpAuthn := mcpAuth{verify: federationSvc.VerifyAgent, verifyOAuth: mcpAuthSvc.VerifyAccessToken,
 		resourceMetadata: mcpAuthSvc.ResourceMetadataURL, requireAuth: *requireAuthMCP, sec: secOpts}
 	streamable := server.NewStreamableHTTPServer(gw.MCPServer(),

@@ -552,8 +552,17 @@ func (s *Service) replayClientRequest(ctx context.Context, agentID, clientReques
 // backgroundCheck copies linked media and runs the judge, then marks the
 // request checked.
 func (s *Service) backgroundCheck(ctx context.Context, id string) {
-	r, err := s.Get(ctx, id)
+	// One node checks each request (lockCheck); a request another node
+	// checked meanwhile is left alone, so the judge and the fetches are
+	// never paid twice.
+	unlock, err := s.lockCheck(ctx, id)
 	if err != nil {
+		log.Printf("inbox: background check %s: another node still holds it: %v", id, err)
+		return
+	}
+	defer unlock()
+	r, err := s.Get(ctx, id)
+	if err != nil || r.Checked {
 		return
 	}
 	var probs []Problem

@@ -17,8 +17,10 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
+	"github.com/tusharbhardwaj/toolyard/internal/cluster"
 	"github.com/tusharbhardwaj/toolyard/internal/store"
 )
 
@@ -176,6 +178,10 @@ type Service struct {
 	owners map[string]cached[string]  // agent id -> owner user id ("" = unknown)
 	limits map[string]cached[*Limits] // agent id -> its limits (nil = none)
 	now    func() time.Time
+
+	// cluster sends cache drops to the other replicas (SetCluster); nil
+	// on a single node.
+	cluster atomic.Pointer[cluster.Cluster]
 }
 
 func New(db *store.DB) *Service {
@@ -401,9 +407,19 @@ func (s *Service) SetGroups(ctx context.Context, userID string, groups []string,
 }
 
 // Invalidate drops the cached scope for userID, or every cached scope,
-// agent owner and agent limit when userID is "". Call it after a role,
-// status, grant or agent-ownership change.
+// agent owner and agent limit when userID is "", on every replica. Call it
+// after a role, status, grant or agent-ownership change.
 func (s *Service) Invalidate(userID string) {
+	s.dropUser(userID)
+	if userID == "" {
+		s.publish(msgAll)
+	} else {
+		s.publish(msgUser + userID)
+	}
+}
+
+// dropUser is Invalidate on this replica only.
+func (s *Service) dropUser(userID string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if userID == "" {

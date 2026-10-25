@@ -9,6 +9,7 @@
 -- OAuth clients (set on the consent screen) and to ordinary agents.
 --
 -- Same table as migrations/sqlite/0056_agent_scopes.sql.
+-- Rollback: an older binary ignores the table (and every agent's limits).
 
 CREATE TABLE IF NOT EXISTS agent_scopes (
     agent_id   TEXT PRIMARY KEY REFERENCES agents(id) ON DELETE CASCADE,

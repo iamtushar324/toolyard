@@ -380,9 +380,16 @@ func WriteAgentScope(ctx context.Context, q store.Querier, agentID string, sc Ag
 	return out, nil
 }
 
-// InvalidateAgent drops agentID's cached limits and owner, so the next
-// check reads them again. Other nodes see the change within cacheTTL.
+// InvalidateAgent drops agentID's cached limits and owner, on every
+// replica, so the next check reads them again. Call it after the agent's
+// limits change, or the agent is disabled, deleted or revoked.
 func (s *Service) InvalidateAgent(agentID string) {
+	s.dropAgent(agentID)
+	s.publish(msgAgent + agentID)
+}
+
+// dropAgent is InvalidateAgent on this replica only.
+func (s *Service) dropAgent(agentID string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	delete(s.limits, agentID)

@@ -7,6 +7,7 @@
 -- that are not OAuth clients. An explicit value is kept.
 --
 -- Same column as migrations/sqlite/0057_audit_oauth_client.sql.
+-- Rollback: an older binary ignores the column; the trigger keeps filling it.
 
 ALTER TABLE audit_events ADD COLUMN IF NOT EXISTS oauth_client_id TEXT;
 CREATE INDEX IF NOT EXISTS idx_audit_oauth_client ON audit_events (oauth_client_id)

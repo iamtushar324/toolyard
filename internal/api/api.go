@@ -980,6 +980,11 @@ func (s *Server) agentsItem(w http.ResponseWriter, r *http.Request) {
 			writeAgentActionError(w, err)
 			return
 		}
+		// Every replica reads the agent again: a disabled one reaches
+		// nothing at once.
+		if s.access != nil {
+			s.access.InvalidateAgent(id)
+		}
 		_ = s.audit.Write(r.Context(), audit.Event{
 			EventType: "agent." + subpath, AgentID: id, ResultSummary: "user:" + uid,
 		})
@@ -988,6 +993,9 @@ func (s *Server) agentsItem(w http.ResponseWriter, r *http.Request) {
 		if err := s.identity.DeleteAgent(r.Context(), uid, id); err != nil {
 			writeAgentActionError(w, err)
 			return
+		}
+		if s.access != nil {
+			s.access.InvalidateAgent(id)
 		}
 		s.oauthAgentDeleted(r.Context(), id)
 		_ = s.audit.Write(r.Context(), audit.Event{

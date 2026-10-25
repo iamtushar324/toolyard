@@ -2,6 +2,7 @@ package inbox
 
 import (
 	"context"
+	"strings"
 	"testing"
 	"time"
 
@@ -271,5 +272,73 @@ func TestClusterPushClaimedOnce(t *testing.T) {
 	}
 	if e.svc.claimPush(ctx, id) {
 		t.Fatal("a claimed push was claimed again")
+	}
+}
+
+// A background check runs once across nodes: a node that asks for a check
+// another node holds waits for it, then finds the request checked and
+// leaves it alone (no second judge call, no second fetch).
+func TestTwoNodeBackgroundCheckRunsOnce(t *testing.T) {
+	node1, node2, _, _, _ := twoInboxNodes(t)
+	ctx := context.Background()
+	r := submitDeploy(t, node1, "ag_1")
+	checks := func() (checked bool, n int) {
+		t.Helper()
+		cur, err := node1.svc.Get(ctx, r.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, a := range cur.Activity {
+			if strings.HasPrefix(a.Text, "Toolyard checked it") {
+				n++
+			}
+		}
+		return cur.Checked, n
+	}
+	deadline := time.Now().Add(10 * time.Second)
+	for {
+		if checked, _ := checks(); checked {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("node 1's own background check did not finish")
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if _, n := checks(); n != 1 {
+		t.Fatalf("checked %d times after the submit, want once", n)
+	}
+
+	// Node 1 checks the request again and holds the claim meanwhile.
+	if err := node1.svc.mutate(ctx, r.ID, func(cur *Request) error { cur.Checked = false; return nil }); err != nil {
+		t.Fatal(err)
+	}
+	unlock, err := node1.svc.lockCheck(ctx, r.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan struct{})
+	go func() {
+		node2.svc.backgroundCheck(ctx, r.ID)
+		close(done)
+	}()
+	select {
+	case <-done:
+		unlock()
+		t.Fatal("node 2 checked the request while node 1 held its check")
+	case <-time.After(300 * time.Millisecond):
+	}
+	if err := node1.svc.mutate(ctx, r.ID, func(cur *Request) error { cur.Checked = true; return nil }); err != nil {
+		unlock()
+		t.Fatal(err)
+	}
+	unlock()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("node 2's check did not end after node 1 finished")
+	}
+	if _, n := checks(); n != 1 {
+		t.Fatalf("checked %d times, want once: node 2 checked a request node 1 had checked", n)
 	}
 }
