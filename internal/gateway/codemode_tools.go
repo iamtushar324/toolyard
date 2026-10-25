@@ -318,7 +318,17 @@ func (g *Gateway) handleExecuteToolCode() directHandler {
 		if calls == nil {
 			calls = []codemode.LedgerEntry{}
 		}
-		res.Meta = &mcp.Meta{AdditionalFields: map[string]any{"toolyard.run_id": runID, "toolyard.calls": calls}}
+		meta := map[string]any{"toolyard.run_id": runID, "toolyard.calls": calls, "toolyard.status": out.Status}
+		if out.ErrorKind != "" {
+			meta["toolyard.error_kind"] = out.ErrorKind
+		}
+		if out.Status == codemode.StatusOutcomeUnknown {
+			// A tool call may have taken effect (one was cut short, or the
+			// script was interrupted after one was sent): an async job built
+			// on executeToolCode reads this as outcome_unknown.
+			meta[codemode.OutcomeUnknownMarker] = true
+		}
+		res.Meta = &mcp.Meta{AdditionalFields: meta}
 		return res, nil
 	}
 }

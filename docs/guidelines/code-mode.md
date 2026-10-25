@@ -136,7 +136,15 @@ Every result carries the **call ledger**: each call with its status and
 duration in milliseconds. It is in the result's `_meta` (`toolyard.calls`,
 with `toolyard.run_id`) for every run, and in the text's `Environment`
 block for JavaScript and for `echo` `preview` or `none`. A Starlark run with
-`echo: "full"` keeps Bifrost's exact text.
+`echo: "full"` keeps Bifrost's exact text. `_meta` also carries the run's
+`toolyard.status` (`succeeded`, `failed`, `permission_required`,
+`deferred` or `outcome_unknown`) and, when it did not succeed,
+`toolyard.error_kind`; an `outcome_unknown` run (a call was cut short, or
+the run was interrupted after a call was sent) also sets
+`toolyard.outcome_unknown: true`. A run that toolyard stops because the
+server shuts down, or because the client went away, is kind `interrupted`:
+`outcome_unknown` once it had sent a tool call, `failed` (nothing ran)
+before. The script's own clock is kind `timeout`.
 
 The run id (`cm_…` for `executeToolCode`, `cr_…` for a REST run) is also on
 every audit row of the run: the outer call's and every nested call's
@@ -177,7 +185,9 @@ either cap waits in one fair queue, for up to 30 seconds
 (`-codemode-queue-wait`). A freed slot goes to the
 earliest waiter whose agent is under its own cap, so one agent's backlog
 never holds another agent up. After the wait the program is refused as
-busy: `executeToolCode` says so, and `POST /v1/code/run` answers 429 with
-`Retry-After`. The queue is bounded: one agent may have twice its own cap
+busy: `executeToolCode` says so, and a run of `POST /v1/code/run` (stored
+`queued` at once, so the request answers within its own wait) ends
+`failed` with kind `busy`, answered 429 with `Retry-After`. The queue is
+bounded: one agent may have twice its own cap
 waiting, and all agents together four times the global cap (16 at least);
 a program past that is refused as busy at once.

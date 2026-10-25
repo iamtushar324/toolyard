@@ -295,7 +295,10 @@ many scripts run at once:
 A script past either cap waits in one fair queue for up to
 `-codemode-queue-wait`. A freed slot
 goes to the earliest waiter whose agent is under its own cap. After the
-wait the script is refused as busy (HTTP 429 over REST). The queue holds at
+wait the script is refused as busy (a REST run, stored `queued` at once,
+ends `failed` with kind `busy`, HTTP 429). A script that a drain or
+shutdown stops is kind `interrupted`: `outcome_unknown` once it had sent a
+tool call, `failed` before. The queue holds at
 most twice `-codemode-max-per-agent` for one agent and four times
 `-codemode-max-concurrent` (16 at least) in all; a script past that is
 refused as busy at once. Migration 0052 adds the columns a REST run's call

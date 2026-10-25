@@ -57,6 +57,17 @@ const (
 	// ErrorBusy names ErrBusy for an API's error object; Run itself
 	// returns ErrBusy and no RunResult.
 	ErrorBusy = "busy"
+	// ErrorInterrupted: the caller's context was cancelled (toolyard is
+	// shutting down, or the client went away) before the script finished.
+	// The run is outcome_unknown when a tool call had been sent, failed
+	// (nothing ran) when none had. A script's own clock is ErrorTimeout.
+	ErrorInterrupted = "interrupted"
+)
+
+// The messages of an interrupted script.
+const (
+	msgInterruptedAfterCalls = "toolyard stopped the script before it finished (the server is restarting, or the caller went away), after it sent %d tool call(s); a call may have taken effect, so check what the script changed before you run it again"
+	msgInterruptedNothingRan = "toolyard stopped the script before it finished (the server is restarting, or the caller went away), before it sent any tool call; nothing ran. Run it again"
 )
 
 // OutcomeUnknownMarker is the result metadata key (Meta.AdditionalFields,
@@ -328,6 +339,9 @@ func (r *Runtime) AcquireSlot(ctx context.Context) (*Slot, error) {
 // slotsInUse is how many scripts hold a slot (tests).
 func (r *Runtime) slotsInUse() int { return r.limiter.inUse() }
 
+// SlotWaiters is how many scripts wait in the slot queue now.
+func (r *Runtime) SlotWaiters() int { return r.limiter.waiting() }
+
 // Run executes code for the ctx caller (the same context ExecuteToolCode
 // takes: the agent identity every nested call runs as) and reports the
 // outcome as data. A tool call that is held for approval, fails, or has
@@ -386,6 +400,7 @@ func (s *session) result(res scriptResult) *RunResult {
 		calls = append(calls, rec)
 	}
 	stop := s.stop
+	sentAny := s.sentCalls > 0
 	prints := append([]string(nil), s.prints...)
 	s.mu.Unlock()
 	s.hookWG.Wait()
@@ -398,6 +413,13 @@ func (s *session) result(res scriptResult) *RunResult {
 		return fallback
 	}
 	switch {
+	case interruptedBy(res, stop):
+		// The caller's context ended first (a drain, a shutdown, a client
+		// that went away): not the script's own timeout.
+		rr.Status, rr.ErrorKind, rr.ErrorMessage = StatusFailed, ErrorInterrupted, res.errMsg
+		if sentAny || inFlight {
+			rr.Status = StatusOutcomeUnknown
+		}
 	case stop != nil && stop.held != nil && inFlight:
 		// Held, but a call the script ran beside the held one was still
 		// running when the script ended: its outcome is unknown, and a

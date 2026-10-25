@@ -278,6 +278,14 @@ func (s *Service) finish(ctx context.Context, run *Run, rr *codemode.RunResult, 
 		status, result, errKind, errMsg, string(logsJSON), held, now, finished, run.ID); err != nil {
 		return err
 	}
+	if status == codemode.StatusFailed && rr.ErrorKind == codemode.ErrorBusy && len(rr.Calls) == 0 {
+		// No slot came free, so nothing ran: the Idempotency-Key is free
+		// again, and a retry with it starts a new run instead of answering
+		// with this one.
+		if _, err := tx.ExecContext(ctx, `UPDATE code_runs SET idempotency_key = NULL WHERE id = ?`, run.ID); err != nil {
+			return err
+		}
+	}
 	return tx.Commit()
 }
 

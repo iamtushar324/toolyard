@@ -51,6 +51,14 @@ type ExecResult struct {
 	Failed bool
 	// Calls is the call ledger: every tool call the script made, in order.
 	Calls []LedgerEntry
+	// Status is the run's outcome as a structured run reports it:
+	// succeeded, failed, permission_required, deferred or outcome_unknown
+	// (a tool call may have taken effect: one was cut short, or the caller
+	// went away after one was sent).
+	Status string
+	// ErrorKind says why a run that did not succeed stopped (ErrorTimeout,
+	// ErrorInterrupted, ErrorToolError, ...), "" otherwise.
+	ErrorKind string
 }
 
 // LedgerEntry is one tool call in a run's ledger.
@@ -92,7 +100,42 @@ func (r *Runtime) Execute(ctx context.Context, code string, opts ExecOptions) Ex
 	}
 	ex := r.execute(ctx, code, execOptions{reason: opts.Reason, lang: lang, echo: echo})
 	text, failed := r.render(ex, code)
-	return ExecResult{Text: text, Failed: failed, Calls: ex.s.ledgerSnapshot()}
+	status, kind := ex.outcome()
+	return ExecResult{Text: text, Failed: failed, Calls: ex.s.ledgerSnapshot(), Status: status, ErrorKind: kind}
+}
+
+// outcome is an executeToolCode run's status and error kind, read the way
+// a structured run reads them (session.result).
+func (ex execution) outcome() (status, kind string) {
+	res, s := ex.res, ex.s
+	s.mu.Lock()
+	stop, sent, running := s.stop, s.sentCalls, s.running
+	s.mu.Unlock()
+	switch {
+	case interruptedBy(res, stop):
+		if sent > 0 {
+			return StatusOutcomeUnknown, ErrorInterrupted
+		}
+		return StatusFailed, ErrorInterrupted
+	case stop != nil:
+		return stop.status, stop.kind
+	case running > 0:
+		return StatusOutcomeUnknown, ErrorTimeout
+	case res.errKind != "":
+		switch res.cause {
+		case ErrorTimeout, ErrorLimit, ErrorInternal, ErrorBusy:
+			return StatusFailed, res.cause
+		}
+		return StatusFailed, ErrorScriptError
+	}
+	return StatusSucceeded, ""
+}
+
+// interruptedBy reports a script the caller's context stopped
+// (execute marks it): no other outcome had ended it, or only the calls
+// that failed because the script was stopping.
+func interruptedBy(res scriptResult, stop *callStop) bool {
+	return res.cause == ErrorInterrupted && (stop == nil || stop.kind == ErrorTimeout)
 }
 
 // execOptions configure execute.
@@ -163,7 +206,36 @@ func (r *Runtime) execute(ctx context.Context, code string, o execOptions) execu
 	if res.errKind != "" && res.call != 0 {
 		s.promote(res.call)
 	}
+	if res.errKind != "" && errors.Is(ctx.Err(), context.Canceled) && (res.cause == ErrorTimeout || s.stopKind() == ErrorTimeout) {
+		// The caller's context was cancelled (a drain, a shutdown, a client
+		// that went away), not the script's own clock, which is a deadline:
+		// the script was interrupted. Whether anything ran decides the
+		// message, and for a structured run the status (session.result).
+		res.cause = ErrorInterrupted
+		res.errMsg = fmt.Sprintf(msgInterruptedAfterCalls, s.sentCount())
+		if s.sentCount() == 0 {
+			res.errMsg = msgInterruptedNothingRan
+		}
+	}
 	return execution{cat: cat, s: s, res: res, lang: lang, echo: echo}
+}
+
+// stopKind is the error kind of the outcome that ended the script, "" for
+// none.
+func (s *session) stopKind() string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.stop == nil {
+		return ""
+	}
+	return s.stop.kind
+}
+
+// sentCount is how many calls reached the gateway.
+func (s *session) sentCount() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.sentCalls
 }
 
 // session is the parent's state for one script: the print log, the call
@@ -219,6 +291,9 @@ type session struct {
 	// sealed is set when Run has taken its snapshot: a call still running
 	// then gets no AfterCall, and nothing more is sent.
 	sealed bool
+	// sentCalls counts the calls that reached the gateway, running those
+	// still waiting for its answer.
+	sentCalls, running int
 	// hookWG counts hook invocations in progress, so Run returns only
 	// once none is running.
 	hookWG sync.WaitGroup
@@ -471,6 +546,9 @@ func (s *session) perform(pc *preparedCall) (reply parentMsg) {
 		sent = true
 		s.markSent(st)
 		res, err = s.r.caller.RouteCall(s.ctx, Via, t.Target, pcall.Args)
+		s.mu.Lock()
+		s.running--
+		s.mu.Unlock()
 	}
 	// cls is how the answer reads, for the script's status and the
 	// ledger. Only a structured run lets it steer the run (out): the
@@ -483,6 +561,11 @@ func (s *session) perform(pc *preparedCall) (reply parentMsg) {
 	var out callOutcome
 	if s.record {
 		out = cls
+	} else {
+		// The stop this call may cause still says what it was (a held call,
+		// a tool error, a call cut short), for ExecResult's status and kind;
+		// the text stays Bifrost's.
+		out.runStatus, out.kind = cls.runStatus, cls.kind
 	}
 	failStatus := cls.status
 	if failStatus == "" || failStatus == StatusSucceeded {
@@ -628,12 +711,13 @@ func (s *session) sendRefusal(label string) string {
 }
 
 func (s *session) markSent(st *callState) {
-	if st == nil {
-		return
-	}
 	s.mu.Lock()
-	st.sent = true
-	s.mu.Unlock()
+	defer s.mu.Unlock()
+	s.sentCalls++
+	s.running++
+	if st != nil {
+		st.sent = true
+	}
 }
 
 // stopRun records the outcome that ends the script, unless one already

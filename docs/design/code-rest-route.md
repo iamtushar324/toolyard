@@ -83,7 +83,11 @@ Optional headers:
 - `Prefer: wait=<seconds>` (0–60, default 25; `wait_seconds` in a JSON body
   wins). The server answers when the run reaches a final or held status, or
   when the wait ends, whichever is first. A larger value counts as 60; a
-  value that is not a whole number of seconds is ignored.
+  value that is not a whole number of seconds is ignored. The wait bounds
+  the answer even when every script slot is taken: the run is stored
+  `queued` at once (its `created_at` is the request's time) and waits for
+  its slot in the background, so `wait=0` answers `202` with the `queued`
+  run straight away.
 
 The run continues on the server after the response; the client never has to
 hold the connection.
@@ -116,8 +120,10 @@ Every run route answers this JSON:
 - `error`: `{"kind": "...", "message": "..."}` when `failed` or
   `outcome_unknown`. Kinds include `script_error`, `tool_error`,
   `timeout`, `limit`, `script_diverged`, `grant_invalid`, `busy`,
-  `outcome_unknown`, `internal`, and `interrupted` (the server stopped:
-  a `queued` run is `failed` with it, a `running` one `outcome_unknown`).
+  `outcome_unknown`, `internal`, and `interrupted` (the server stopped
+  the run: `failed` with it when no tool call had been sent, nothing ran;
+  `outcome_unknown` once one had). `busy`: the run waited `queued` for a
+  script slot and none came free; nothing ran.
 - `calls`: every call the run made, by its number, in order: the call
   ledger, with `ms` the call's duration (0 until it finished). Each number
   shows its latest record: a resume runs the script again and updates the
@@ -149,13 +155,14 @@ Every run route answers this JSON:
 | `succeeded`, `failed` | 200 |
 | `permission_required` | 403 |
 | `deferred`, `queued`, `running` (the wait ended first) | 202, with `Location: /v1/code/runs/{id}` |
+| `failed` with kind `busy` (no slot came free; nothing ran) | 429, with `Retry-After` |
 | `outcome_unknown` | 409 |
 
 Other answers: `400` bad input, `401` no or bad token, `403` operator token or a
 session token outside its routes, `404` unknown run (or another agent's run),
 `413` script over 1 MiB, `415` other content types, `422`
 `idempotency_key_reused` or a resume of a run that is not held (`run_not_held`,
-with the run's `status`), `429` code mode busy (with `Retry-After`; no run is
+with the run's `status`), `429` the slot queue is full (with `Retry-After`; no run is
 created), `503` the server is restarting or the token could not be checked
 (with `Retry-After`; no run is created).
 
@@ -290,14 +297,19 @@ otherwise.
 The MCP code-mode limits apply: 5 minutes wall clock, 100 tool calls, 1 MiB
 output per run, 4 concurrent scripts per server and 3 per agent
 (`-codemode-max-concurrent`, `-codemode-max-per-agent`). A start past either
-cap waits up to 30 seconds (`-codemode-queue-wait`) in a fair queue, then is
-`429` with `Retry-After` and creates no run. The queue holds at most twice
-the per-agent cap for one agent, and four times the global cap (16 at
-least) in all; a start past that is `429` at once. Runs and their call records
-are kept 7 days from their start (an hourly sweep deletes older ones). A run
-that is `running` when the server stops is `outcome_unknown` after the
-restart; one still `queued` is `failed` (nothing ran). Both carry the error
-kind `interrupted`.
+cap is stored `queued` and waits up to 30 seconds (`-codemode-queue-wait`)
+in a fair queue for a slot, while the request answers within its own wait.
+A run that gets no slot ends `failed` with kind `busy` (nothing ran; `429`
+with `Retry-After`; its `Idempotency-Key` is free again). The queue holds
+at most twice the per-agent cap for one agent, and four times the global cap
+(16 at least) in all; a start past that is `429` at once and creates no run.
+Runs and their call records are kept 7 days from their start (an hourly
+sweep deletes older ones). A run the server stops (a drain or a shutdown
+that cancels it) is `outcome_unknown` with kind `interrupted` once it had
+sent a tool call, and `failed` with kind `interrupted` (nothing ran) before
+that; a run still `running` or `queued` when the process dies is settled
+the same way after the restart. The run's own 5-minute clock is kind
+`timeout`, never `interrupted`.
 
 ## Storage
 

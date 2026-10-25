@@ -55,7 +55,7 @@ const (
 // ErrorInterrupted is the error kind of a run the server stopped under:
 // a queued run is failed with it (nothing ran), a running one is
 // outcome_unknown with it (a tool call may have run).
-const ErrorInterrupted = "interrupted"
+const ErrorInterrupted = codemode.ErrorInterrupted
 
 // Limits of the REST route.
 const (
@@ -430,8 +430,13 @@ type StartRequest struct {
 // Start validates req and starts a run, or returns the agent's existing
 // run for the same Idempotency-Key, script and reason (created false).
 // ctx carries the request's values (the actor.Raiser for the audit); the
-// run itself continues after ctx ends. codemode.ErrBusy means no slot
-// came free and nothing was stored.
+// run itself continues after ctx ends. Start never waits for a slot: a
+// free one is taken at once; otherwise the run is stored queued and waits
+// for its slot in the background (the fair queue, up to the runtime's
+// AcquireWait), so the caller's wait bounds the answer. A run that gets no
+// slot ends failed with kind busy (nothing ran; its Idempotency-Key is
+// free again). codemode.ErrBusy means the slot queue itself is full:
+// nothing was stored.
 func (s *Service) Start(ctx context.Context, req StartRequest) (run *Run, created bool, err error) {
 	if req.AgentID == "" {
 		return nil, false, &InputError{Field: "agent", Message: "an agent is required"}
@@ -468,7 +473,7 @@ func (s *Service) Start(ctx context.Context, req StartRequest) (run *Run, create
 	if rt == nil {
 		return nil, false, ErrUnavailable
 	}
-	slot, err := rt.AcquireSlot(codemode.WithAgentKey(ctx, req.AgentID))
+	slot, waitSlot, err := trySlot(ctx, rt, req.AgentID)
 	if err != nil {
 		return nil, false, err
 	}
@@ -491,8 +496,26 @@ func (s *Service) Start(ctx context.Context, req StartRequest) (run *Run, create
 		}
 		return nil, false, err
 	}
-	s.launch(runCtx, rt, slot, run, newHooks(s, run.ID, nil), true)
+	s.launch(runCtx, rt, slot, waitSlot, run, newHooks(s, run.ID, nil), true)
 	return run, true, nil
+}
+
+// trySlot takes a script slot for agentID only if one is free now. It
+// asks with a context that has already ended: AcquireSlot then grants a
+// free slot, refuses at once when the slot queue is full (ErrBusy), and
+// otherwise answers with the context's error, which here means "wait for
+// one" (waitSlot).
+func trySlot(ctx context.Context, rt Runner, agentID string) (slot *codemode.Slot, waitSlot bool, err error) {
+	now, cancel := context.WithCancel(codemode.WithAgentKey(ctx, agentID))
+	cancel()
+	slot, err = rt.AcquireSlot(now)
+	switch {
+	case err == nil:
+		return slot, false, nil
+	case errors.Is(err, context.Canceled):
+		return nil, true, nil
+	}
+	return nil, false, err
 }
 
 // ResumeRequest resumes a held run.
@@ -601,7 +624,7 @@ func (s *Service) Resume(ctx context.Context, req ResumeRequest) (*Run, error) {
 		}
 		return cur, ErrNotHeld
 	}
-	s.launch(runCtx, rt, slot, run, newHooks(s, run.ID, rs), false)
+	s.launch(runCtx, rt, slot, false, run, newHooks(s, run.ID, rs), false)
 	return run, nil
 }
 
@@ -663,17 +686,18 @@ func (s *Service) reload(ctx context.Context, run *Run) (*Run, error) {
 	return cur, nil
 }
 
-// launch runs run's script on a goroutine of its own.
-func (s *Service) launch(base context.Context, rt Runner, slot *codemode.Slot, run *Run, h *hooks, fromQueued bool) {
+// launch runs run's script on a goroutine of its own; with waitSlot the
+// goroutine first waits for a script slot.
+func (s *Service) launch(base context.Context, rt Runner, slot *codemode.Slot, waitSlot bool, run *Run, h *hooks, fromQueued bool) {
 	ctx, cancel := context.WithCancel(base)
 	s.mu.Lock()
 	s.inflight[run.ID] = cancel
 	s.mu.Unlock()
-	go s.execute(ctx, rt, slot, run, h, fromQueued)
+	go s.execute(ctx, rt, slot, waitSlot, run, h, fromQueued)
 }
 
 // execute runs the script and records its outcome.
-func (s *Service) execute(ctx context.Context, rt Runner, slot *codemode.Slot, run *Run, h *hooks, fromQueued bool) {
+func (s *Service) execute(ctx context.Context, rt Runner, slot *codemode.Slot, waitSlot bool, run *Run, h *hooks, fromQueued bool) {
 	defer s.untrack(run.ID)
 	var rr *codemode.RunResult
 	func() {
@@ -684,6 +708,16 @@ func (s *Service) execute(ctx context.Context, rt Runner, slot *codemode.Slot, r
 					ErrorMessage: "the run stopped on an internal error in toolyard"}
 			}
 		}()
+		if waitSlot {
+			// The run is stored queued; it waits for its slot here, in the
+			// fair queue, while the caller already has its answer.
+			got, err := rt.AcquireSlot(codemode.WithAgentKey(ctx, run.AgentID))
+			if err != nil {
+				rr = notStarted(err)
+				return
+			}
+			slot = got
+		}
 		if fromQueued {
 			if err := s.markRunning(ctx, run.ID); err != nil {
 				s.log.Warn("code run: could not mark running", "run_id", run.ID, "err", err.Error())
@@ -692,11 +726,7 @@ func (s *Service) execute(ctx context.Context, rt Runner, slot *codemode.Slot, r
 		res, err := rt.Run(ctx, run.code, codemode.RunOptions{Reason: run.Reason, Hooks: h, Slot: slot, Language: run.Language})
 		switch {
 		case err != nil:
-			kind := codemode.ErrorInternal
-			if errors.Is(err, codemode.ErrBusy) {
-				kind = codemode.ErrorBusy
-			}
-			rr = &codemode.RunResult{Status: codemode.StatusFailed, ErrorKind: kind, ErrorMessage: err.Error()}
+			rr = notStarted(err)
 		case res == nil:
 			rr = &codemode.RunResult{Status: codemode.StatusFailed, ErrorKind: codemode.ErrorInternal,
 				ErrorMessage: "the script runner returned no result"}
@@ -712,6 +742,20 @@ func (s *Service) execute(ctx context.Context, rt Runner, slot *codemode.Slot, r
 			"run_id", run.ID, "status", rr.Status, "err", err.Error())
 	}
 	s.notify.notify(run.ID)
+}
+
+// notStarted is the outcome of a run that never got a script slot: busy
+// when none came free in the wait, interrupted when toolyard stopped it
+// first. Nothing ran either way.
+func notStarted(err error) *codemode.RunResult {
+	switch {
+	case errors.Is(err, codemode.ErrBusy):
+		return &codemode.RunResult{Status: codemode.StatusFailed, ErrorKind: codemode.ErrorBusy,
+			ErrorMessage: err.Error() + " (the run waited for a script slot and none came free; nothing ran: start it again)"}
+	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
+		return &codemode.RunResult{Status: codemode.StatusFailed, ErrorKind: ErrorInterrupted, ErrorMessage: msgInterruptedQueued}
+	}
+	return &codemode.RunResult{Status: codemode.StatusFailed, ErrorKind: codemode.ErrorInternal, ErrorMessage: err.Error()}
 }
 
 func (s *Service) untrack(id string) {

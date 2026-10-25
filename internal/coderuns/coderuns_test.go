@@ -458,6 +458,10 @@ func TestResumeOfADeferredApproval(t *testing.T) {
 	}
 }
 
+// A start while every slot is taken is stored queued at once; when no slot
+// comes free in the wait it ends failed with kind busy, nothing ran, and
+// its Idempotency-Key is free again. A start while draining stores
+// nothing.
 func TestBusyAndDrainingCreateNoRun(t *testing.T) {
 	e := newEnv(t)
 	var slots []*codemode.Slot
@@ -468,9 +472,16 @@ func TestBusyAndDrainingCreateNoRun(t *testing.T) {
 		}
 		slots = append(slots, s)
 	}
-	_, _, err := e.svc.Start(context.Background(), StartRequest{AgentID: "ag_a", Code: readScript, Reason: testReason, IdempotencyKey: "k"})
-	if !errors.Is(err, codemode.ErrBusy) {
-		t.Fatalf("busy start: %v", err)
+	run, created, err := e.svc.Start(context.Background(), StartRequest{AgentID: "ag_a", Code: readScript, Reason: testReason, IdempotencyKey: "k"})
+	if err != nil || !created || run.Status != StatusQueued {
+		t.Fatalf("busy start: %+v %v %v", run, created, err)
+	}
+	busy := e.settle(t, "ag_a", run.ID)
+	if busy.Status != codemode.StatusFailed || busy.ErrorKind != codemode.ErrorBusy || !strings.Contains(busy.ErrorMessage, "nothing ran") {
+		t.Fatalf("busy run = %+v", busy)
+	}
+	if n := e.count(t, `SELECT count(*) FROM code_runs WHERE idempotency_key IS NOT NULL`); n != 0 {
+		t.Fatal("the busy run kept its Idempotency-Key")
 	}
 	for _, s := range slots {
 		s.Release()
@@ -479,8 +490,8 @@ func TestBusyAndDrainingCreateNoRun(t *testing.T) {
 	if _, _, err := e.svc.Start(context.Background(), StartRequest{AgentID: "ag_a", Code: readScript, Reason: testReason}); !errors.Is(err, ErrDraining) {
 		t.Fatalf("draining start: %v", err)
 	}
-	if n := e.count(t, `SELECT count(*) FROM code_runs`); n != 0 {
-		t.Fatalf("runs = %d, want none", n)
+	if n := e.count(t, `SELECT count(*) FROM code_runs`); n != 1 {
+		t.Fatalf("runs = %d, want only the busy one", n)
 	}
 	if len(e.f.sent("demo.read")) != 0 {
 		t.Fatal("a refused start ran a call")

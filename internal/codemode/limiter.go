@@ -178,6 +178,13 @@ func (l *limiter) removeLocked(w *waiter) {
 	}
 }
 
+// waiting is how many scripts wait for a slot.
+func (l *limiter) waiting() int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return len(l.queue)
+}
+
 // inUse is how many scripts hold a slot.
 func (l *limiter) inUse() int {
 	l.mu.Lock()

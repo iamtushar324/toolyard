@@ -323,10 +323,16 @@ func (s *Server) answerRun(w http.ResponseWriter, r *http.Request, run *coderuns
 }
 
 // writeRunView writes the run view with the HTTP status of its run status.
+// A run that ended busy (no script slot came free while it was queued;
+// nothing ran) is 429 with Retry-After, as a start refused at once is.
 func writeRunView(w http.ResponseWriter, run *coderuns.Run) {
 	code := coderuns.HTTPStatus(run.Status)
-	if code == http.StatusAccepted {
+	switch {
+	case code == http.StatusAccepted:
 		w.Header().Set("Location", coderuns.RunPath(run.ID))
+	case run.Status == codemode.StatusFailed && run.ErrorKind == codemode.ErrorBusy:
+		code = http.StatusTooManyRequests
+		w.Header().Set("Retry-After", busyRetryAfter)
 	}
 	w.Header().Set("Cache-Control", "no-store")
 	writeJSON(w, code, run.View())
