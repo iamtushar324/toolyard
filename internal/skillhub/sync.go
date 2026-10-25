@@ -289,6 +289,9 @@ func (s *Service) buildIncremental(ctx context.Context, gh *ghClient, row *sourc
 	type change struct{ rel, status string }
 	var changes []change
 	for _, f := range cmp.Files {
+		if !safeRepoPath(f.Filename) || (f.PreviousFilename != "" && !safeRepoPath(f.PreviousFilename)) {
+			return nil, false, nil
+		}
 		if f.Status == "renamed" && f.PreviousFilename != "" {
 			if rel, ok := underFolder(f.PreviousFilename, row.Path); ok && rel != "" {
 				changes = append(changes, change{rel, "removed"})

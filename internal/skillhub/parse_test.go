@@ -375,3 +375,21 @@ func TestSliceLines(t *testing.T) {
 		t.Fatalf("got %q %d", got, total)
 	}
 }
+
+func TestSafeRepoPath(t *testing.T) {
+	for p, want := range map[string]bool{
+		"skills/a/SKILL.md": true,
+		"a":                 true,
+		"":                  false,
+		"/abs":              false,
+		"a/../b":            false,
+		"a/./b":             false,
+		"a//b":              false,
+		"a\\b":              false,
+		"a/\x00":            false,
+	} {
+		if got := safeRepoPath(p); got != want {
+			t.Errorf("safeRepoPath(%q) = %v, want %v", p, got, want)
+		}
+	}
+}

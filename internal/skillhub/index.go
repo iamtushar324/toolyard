@@ -148,8 +148,10 @@ func (ix *index) ids() []string {
 }
 
 // Subscribe calls fn with a source slug after what the source serves
-// changed (its active version, visibility or runs), on this or another
-// node. fn runs on the node's reload goroutine: keep it short.
+// changed (its active version, visibility or runs, or the source was
+// deleted), on this or another node. fn runs on the goroutine that
+// reloaded the source, possibly several at once: keep it short and safe
+// for concurrent calls.
 func (s *Service) Subscribe(fn func(slug string)) (cancel func()) {
 	ix := s.idx
 	ix.lmu.Lock()

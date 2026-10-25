@@ -218,6 +218,20 @@ func archivePath(name string) (string, error) {
 	return strings.Join(kept, "/"), nil
 }
 
+// safeRepoPath reports a plain relative path: no empty, "." or ".."
+// segment, no leading "/", no backslash or NUL.
+func safeRepoPath(p string) bool {
+	if p == "" || strings.ContainsAny(p, "\\\x00") {
+		return false
+	}
+	for _, seg := range strings.Split(p, "/") {
+		if seg == "" || seg == "." || seg == ".." {
+			return false
+		}
+	}
+	return true
+}
+
 // underFolder returns name relative to folder, and whether it is inside.
 func underFolder(name, folder string) (string, bool) {
 	if folder == "" {
