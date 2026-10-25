@@ -1,0 +1,14 @@
+# The public route to the gateway. Kept apart from app/ on purpose: the
+# deploy script applies it only after the first admin account exists,
+# because /v1/auth/setup is open to any caller until then.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - ingress.yaml
+
+labels:
+  - pairs:
+      app.kubernetes.io/part-of: toolyard
+    includeSelectors: false
+    includeTemplates: true
