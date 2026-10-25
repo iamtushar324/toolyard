@@ -219,7 +219,7 @@ func extractReasonOpt(args map[string]any, fieldName string, optional bool) (str
 
 	out := make(map[string]any, len(args))
 	for k, v := range args {
-		if k == fieldName || k == IntentField || k == ApprovalIDField || k == GrantField || k == SessionField {
+		if k == fieldName || k == IntentField || k == ApprovalIDField || k == GrantField || k == SessionField || k == callbackRefArg {
 			continue
 		}
 		out[k] = v

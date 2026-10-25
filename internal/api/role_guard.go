@@ -77,6 +77,7 @@ func sessionTokenAllowed(path string) bool {
 		return false
 	}
 	return strings.HasPrefix(path, codePathPrefix) ||
+		path == jobsPath || strings.HasPrefix(path, jobsPrefix) ||
 		path == "/v1/agents/whoami" ||
 		strings.HasPrefix(path, "/v1/agents/approvals/") ||
 		path == sessionTokensPath || strings.HasPrefix(path, sessionTokensPrefix)
@@ -208,8 +209,9 @@ func memberAllowed(method, path string) bool {
 		return true
 	}
 	// Bearer-only routes (agent or session token) that never read a
-	// cookie: session tokens and code mode over REST.
-	if strings.HasPrefix(path, sessionTokensPrefix) || strings.HasPrefix(path, codePathPrefix) {
+	// cookie: session tokens, code mode over REST and async jobs.
+	if strings.HasPrefix(path, sessionTokensPrefix) || strings.HasPrefix(path, codePathPrefix) ||
+		path == jobsPath || strings.HasPrefix(path, jobsPrefix) {
 		return true
 	}
 	// A native Inbox upload: the single-use ticket in the path is the

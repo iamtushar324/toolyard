@@ -28,6 +28,7 @@ import (
 
 	"github.com/tusharbhardwaj/toolyard/internal/access"
 	"github.com/tusharbhardwaj/toolyard/internal/audit"
+	"github.com/tusharbhardwaj/toolyard/internal/jobs"
 	"github.com/tusharbhardwaj/toolyard/internal/policy"
 	"github.com/tusharbhardwaj/toolyard/internal/realtime"
 )
@@ -96,6 +97,9 @@ type ServerInfo struct {
 	// is stored; on a per_user server, whether the calling agent's owner
 	// has connected it. nil when not applicable.
 	SignedIn *bool `json:"signed_in,omitempty"`
+	// Async is the server's async-tool setting, when it has one
+	// (jobs_tools.go).
+	Async *jobs.AsyncSetting `json:"async,omitempty"`
 }
 
 // ServersProvider is the upstream service as the access tools see it.
@@ -827,6 +831,7 @@ func (g *Gateway) handleServersList() directHandler {
 			r.Error = sanitizeServerError(r.Error)
 			out = append(out, r)
 		}
+		g.annotateAsync(out)
 		sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
 		return inboxJSON(map[string]any{"servers": out, "count": len(out)}), nil
 	}

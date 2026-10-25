@@ -2842,10 +2842,14 @@ function openServerEdit(s) {
     register: !!(id && id.register),
     auth_mode: s.auth_mode || 'shared',
     enabled: s.enabled !== false,
+    asyncMode: (s.async && s.async.mode) || 'off',
+    asyncAfter: (s.async && s.async.after_ms) || 5000,
+    asyncTools: asyncToolsAsText(s.async && s.async.tools),
     error: '',
     saving: false,
   };
-  m.orig = { url: m.url, headersText: m.headersText, identityOn: m.identityOn, header: m.header, register: m.register, auth_mode: m.auth_mode, enabled: m.enabled };
+  m.orig = { url: m.url, headersText: m.headersText, identityOn: m.identityOn, header: m.header, register: m.register, auth_mode: m.auth_mode, enabled: m.enabled,
+    asyncMode: m.asyncMode, asyncAfter: m.asyncAfter, asyncTools: m.asyncTools };
   state.serverEditModal = m;
   render();
 }
@@ -2892,14 +2896,23 @@ async function saveServerEdit() {
   if (!m || m.saving) return;
   const { body, error } = serverEditBody(m);
   if (error) { m.error = error; render(); return; }
-  if (!Object.keys(body).length) { state.serverEditModal = null; toast('No changes'); render(); return; }
+  const asyncOut = serverAsyncBody(m);
+  if (asyncOut.error) { m.error = asyncOut.error; render(); return; }
+  const asyncChanged = m.asyncMode !== m.orig.asyncMode || String(m.asyncAfter) !== String(m.orig.asyncAfter) || m.asyncTools !== m.orig.asyncTools;
+  if (!Object.keys(body).length && !asyncChanged) { state.serverEditModal = null; toast('No changes'); render(); return; }
   m.saving = true; m.error = ''; render();
   try {
+    // The async setting never reconnects the server (PUT .../async).
+    if (asyncChanged) {
+      await api('/v1/servers/' + encodeURIComponent(m.name) + '/async', { method: 'PUT', body: asyncOut.body });
+    }
     // 200 is the masked server; 202 is { server, warning } when the row was
     // saved but the reconnect failed.
     // Either may carry oauth_reset: the URL moved to another origin, so the
     // stored OAuth client and tokens were dropped.
-    const out = await api('/v1/servers/' + encodeURIComponent(m.name), { method: 'PATCH', body });
+    const out = Object.keys(body).length
+      ? await api('/v1/servers/' + encodeURIComponent(m.name), { method: 'PATCH', body })
+      : null;
     if (state.serverEditModal === m) state.serverEditModal = null;
     const srv = (out && out.server) || out || {};
     const warning = out && out.warning;
@@ -2918,6 +2931,78 @@ async function saveServerEdit() {
     if (e.status === 404) reloadServers().then(render);
     render();
   }
+}
+
+// ---- async tools (PUT /v1/servers/{name}/async) ----
+
+// asyncToolsAsText renders per-tool async rules one per line:
+// "tool: always", "tool: after 5000" or "tool: off".
+function asyncToolsAsText(tools) {
+  return Object.entries(tools || {})
+    .map(([name, r]) => name + ': ' + (r.mode === 'after' ? 'after ' + r.after_ms : r.mode))
+    .join('\n');
+}
+
+// parseAsyncTools reads the per-tool rules box; { error } when a line is
+// not a rule.
+function parseAsyncTools(text) {
+  const tools = {};
+  for (const raw of String(text || '').split('\n')) {
+    const line = raw.trim();
+    if (!line) continue;
+    const i = line.indexOf(':');
+    const name = i > 0 ? line.slice(0, i).trim() : '';
+    const rule = i > 0 ? line.slice(i + 1).trim().split(/\s+/) : [];
+    if (name && (rule[0] === 'always' || rule[0] === 'off') && rule.length === 1) tools[name] = { mode: rule[0] };
+    else if (name && rule[0] === 'after' && /^\d+$/.test(rule[1] || '') && rule.length === 2) tools[name] = { mode: 'after', after_ms: Number(rule[1]) };
+    else return { error: `Async rule "${line}" must look like "tool_name: always", "tool_name: after 5000" or "tool_name: off".` };
+  }
+  return { tools };
+}
+
+// serverAsyncBody is the PUT /v1/servers/{name}/async body.
+function serverAsyncBody(m) {
+  const parsed = parseAsyncTools(m.asyncTools);
+  if (parsed.error) return { error: parsed.error };
+  const body = { mode: m.asyncMode };
+  if (m.asyncMode === 'after') {
+    const ms = Number(m.asyncAfter);
+    if (!Number.isInteger(ms) || ms < 10 || ms > 600000) return { error: 'The async wait must be 10-600000 milliseconds.' };
+    body.after_ms = ms;
+  }
+  if (Object.keys(parsed.tools).length) body.tools = parsed.tools;
+  return { body };
+}
+
+// asyncFields is the edit form's async control, bound to m.asyncMode,
+// m.asyncAfter and m.asyncTools.
+function asyncFields(m) {
+  const sel = el('select', { id: 'srv-edit-async', on: { change: (e) => { m.asyncMode = e.target.value; render(); } } },
+    el('option', { value: 'off' }, 'Off: every call waits for its result'),
+    el('option', { value: 'always' }, 'Always: answer with a job id at once'),
+    el('option', { value: 'after' }, 'After a wait: inline when done in time, else a job id'),
+  );
+  sel.value = m.asyncMode;
+  return el('div', { class: 'async-fields' },
+    el('label', {},
+      el('div', { class: 'meta' }, 'Async tool calls. A job id lets the agent wait with jobs.wait, or get a callback, instead of holding the call open.'),
+      sel,
+    ),
+    m.asyncMode === 'after' ? el('label', {},
+      el('div', { class: 'meta' }, 'Wait before answering with a job id (milliseconds)'),
+      el('input', {
+        id: 'srv-edit-async-after', type: 'number', min: '10', max: '600000', value: String(m.asyncAfter),
+        on: { input: (e) => { m.asyncAfter = e.target.value; } },
+      }),
+    ) : null,
+    el('label', {},
+      el('div', { class: 'meta' }, 'Per-tool rules, one per line (override the setting above): tool_name: always | after 5000 | off'),
+      el('textarea', {
+        id: 'srv-edit-async-tools', placeholder: 'create_report: always', value: m.asyncTools,
+        on: { input: (e) => { m.asyncTools = e.target.value; } },
+      }),
+    ),
+  );
 }
 
 // oauthResetNote is a banner that stays until dismissed (a toast fades):
@@ -2959,6 +3044,7 @@ function renderServerEditModal() {
         whoSignsInField(m, 'srv-edit-auth'),
         identityFields(m, 'srv-edit-id'),
       ] : el('div', { class: 'meta' }, 'URL, headers, who signs in and identity forwarding apply to HTTP servers only.'),
+      asyncFields(m),
       el('label', { class: 'check-row' },
         el('input', {
           type: 'checkbox', id: 'srv-edit-enabled', checked: m.enabled,

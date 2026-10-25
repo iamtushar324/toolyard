@@ -450,6 +450,8 @@ func perRouteBodyCap(path string) int64 {
 		return maxCodeRunBody // 4 MiB: a 1 MiB script after JSON escaping, plus the envelope and reason
 	case strings.HasPrefix(path, codePathPrefix):
 		return 8 << 10 // 8 KiB — a resume body; the other code routes are GETs
+	case path == jobsPath:
+		return maxJobStartBody // 4 MiB: a tool call's arguments (POST /v1/jobs)
 	case strings.HasPrefix(path, "/v1/tools/run"),
 		strings.HasPrefix(path, "/v1/agents/tools/run"):
 		// The reader allows 4 MiB, but decode() stops JSON bodies at 1 MiB
@@ -506,7 +508,8 @@ func exemptFromCSRFHeader(path string) bool {
 	// Code mode over REST and session tokens are bearer-only (agent or
 	// session token); no cookie is read, so they aren't CSRF-replayable.
 	// This also lifts the Origin check (exemptFromOriginCheck).
-	if strings.HasPrefix(path, codePathPrefix) || path == sessionTokensPath || strings.HasPrefix(path, sessionTokensPrefix) {
+	if strings.HasPrefix(path, codePathPrefix) || path == sessionTokensPath || strings.HasPrefix(path, sessionTokensPrefix) ||
+		path == jobsPath || strings.HasPrefix(path, jobsPrefix) {
 		return true
 	}
 	// Webhook event ingest is bearer-authenticated (source token); no cookie

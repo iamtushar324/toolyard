@@ -46,6 +46,7 @@ import (
 	"github.com/tusharbhardwaj/toolyard/internal/audit"
 	"github.com/tusharbhardwaj/toolyard/internal/auditlink"
 	"github.com/tusharbhardwaj/toolyard/internal/autoapproval"
+	"github.com/tusharbhardwaj/toolyard/internal/blobstore"
 	"github.com/tusharbhardwaj/toolyard/internal/callbacks"
 	"github.com/tusharbhardwaj/toolyard/internal/chatnotify"
 	"github.com/tusharbhardwaj/toolyard/internal/chatnotify/telegram"
@@ -61,6 +62,7 @@ import (
 	"github.com/tusharbhardwaj/toolyard/internal/identity"
 	"github.com/tusharbhardwaj/toolyard/internal/identitykeys"
 	"github.com/tusharbhardwaj/toolyard/internal/inbox"
+	"github.com/tusharbhardwaj/toolyard/internal/jobs"
 	"github.com/tusharbhardwaj/toolyard/internal/keyguard"
 	"github.com/tusharbhardwaj/toolyard/internal/logx"
 	"github.com/tusharbhardwaj/toolyard/internal/memory"
@@ -321,6 +323,7 @@ func runServe(argv []string) error {
 	noStdioUpstreams := fs.Bool("no-stdio-upstreams", false, "refuse to start any stdio (subprocess) MCP upstream. Use when the dashboard is exposed publicly so a compromised session can't spawn arbitrary commands.")
 	envDenylistFlag := fs.String("upstream-env-denylist", "LD_PRELOAD,LD_LIBRARY_PATH,DYLD_INSERT_LIBRARIES,DYLD_LIBRARY_PATH,PATH", "comma-separated env var keys forbidden in upstream stdio configs")
 	upstreamCallTimeout := fs.Duration("upstream-call-timeout", 120*time.Second, "per-tool-call deadline applied to every dispatch (built-in, fixture, and external upstreams). 0 disables the cap. Without it, a hung upstream pins a goroutine indefinitely and queues every other caller behind it.")
+	asyncJobTimeout := fs.Duration("async-job-timeout", jobs.DefaultMaxDuration, "time limit of one async job (a call to a tool marked async, jobs.start, POST /v1/jobs, an MCP task); it replaces -upstream-call-timeout for that call")
 	// TEC-1626 drain
 	drainDelay := fs.Duration("drain-delay", defaultDrainDelay, "on SIGTERM/SIGINT, how long readiness reports 503 (and new tool calls get a retryable refusal) before streams and waits close, so the load balancer stops sending traffic first")
 	drainTimeout := fs.Duration("drain-timeout", defaultDrainTimeout, "deadline, from the start of the drain (delay included), for open HTTP requests and in-flight executions to finish. Work still running then is cancelled and recorded outcome_unknown. Keep the unit's TimeoutStopSec above this plus ~10s.")
@@ -647,6 +650,18 @@ func runServe(argv []string) error {
 	if err != nil {
 		return fmt.Errorf("TOOLYARD_CODEMODE_SANDBOX: %w", err)
 	}
+	// Async tools (docs/guidelines/async-tools.md): calls to tools an
+	// administrator marked async, jobs.start, POST /v1/jobs and MCP tasks
+	// run as durable jobs. Results over 256 KiB go to the blob store (files
+	// under <data>/job-results on SQLite, chunks in Postgres). The lease
+	// heartbeat and recovery run on every node; retention runs under the
+	// job Leader (single node until slice A's cluster.RunLeader is wired).
+	jobBlobs, err := blobstore.ForDB(db, filepath.Join(*dataDir, "job-results"))
+	if err != nil {
+		return fmt.Errorf("job results: %w", err)
+	}
+	jobsSvc := jobs.New(db, jobs.Options{Blobs: jobBlobs, MaxDuration: *asyncJobTimeout})
+	jobsSvc.Run(ctx)
 	gw := gateway.New(gateway.Options{
 		Name:                "toolyard",
 		Version:             version,
@@ -667,6 +682,7 @@ func runServe(argv []string) error {
 		Owners:              accessSvc,
 		PublicURL:           *publicURL,
 		UpstreamProtocol:    upstreamProtocol,
+		Jobs:                jobsSvc,
 	})
 	// The kernel probe for the code-mode sandbox runs now, off the
 	// request path.
@@ -877,6 +893,8 @@ func runServe(argv []string) error {
 	goroutines.Loop(ctx, loopSessionPurger, time.Hour, func(ctx context.Context) { runSessionPurger(ctx, idSvc, codeRuns) })
 
 	upstreamSvc := upstreams.New(db, gw)
+	// Which servers and tools are async (Edit server, PUT /v1/servers/{name}/async).
+	gw.SetAsyncPolicy(upstreamSvc)
 	upstreamSvc.SetPolicy(upstreams.Policy{
 		AllowStdio:  !*noStdioUpstreams,
 		EnvDenylist: splitCSV(*envDenylistFlag),
@@ -1294,6 +1312,7 @@ func runServe(argv []string) error {
 		OwnerEmail:      *ownerEmail,
 		ConnectAZP:      connectOrigins,
 		CodeRuns:        codeRuns,
+		Jobs:            jobsSvc,
 	})
 
 	mux := http.NewServeMux()
@@ -1344,8 +1363,11 @@ func runServe(argv []string) error {
 	// 2026-07-28 subscriptions/listen POST) once the drain starts and ends
 	// open ones with the other waiters (lifecycle.go).
 	mcpStreams := newMCPStreamGate()
-	mux.Handle("/mcp", mcpStreams.wrap(api.LimitBody(gateway.PreserveToolCallNumbers(mcpAuthn.guard(streamable)), 16<<20)))
-	mux.Handle("/mcp/", mcpStreams.wrap(api.LimitBody(gateway.PreserveToolCallNumbers(mcpAuthn.guard(streamable)), 16<<20)))
+	// MCP Tasks are answered from the jobs table (any replica), in front
+	// of the transport and after the token check.
+	mcpHandler := gw.MCPTasks(streamable, mcpAuthn.contextFunc)
+	mux.Handle("/mcp", mcpStreams.wrap(api.LimitBody(gateway.PreserveToolCallNumbers(mcpAuthn.guard(mcpHandler)), 16<<20)))
+	mux.Handle("/mcp/", mcpStreams.wrap(api.LimitBody(gateway.PreserveToolCallNumbers(mcpAuthn.guard(mcpHandler)), 16<<20)))
 
 	// pprof endpoints, gated to loopback. When toolyard hangs, run
 	//   curl -s http://127.0.0.1:<port>/debug/pprof/goroutine?debug=2
@@ -1523,6 +1545,7 @@ func runServe(argv []string) error {
 		refuseNew: func() {
 			gw.BeginDrain()
 			bus.BeginDrain()
+			jobsSvc.BeginDrain()
 			mcpStreams.refuse()
 		},
 		releaseWaiters: func() {
@@ -1532,6 +1555,7 @@ func runServe(argv []string) error {
 			gw.ReleaseWaiters()
 			bus.ReleaseWaiters()
 			codeRuns.ReleaseWaiters()
+			jobsSvc.ReleaseWaiters()
 		},
 		stopHTTP:  httpSrv.Shutdown,
 		forceHTTP: httpSrv.Close,
@@ -1539,6 +1563,7 @@ func runServe(argv []string) error {
 			func(ctx context.Context) { bus.WaitExecutions(ctx, shutdownGrace) },
 			func(ctx context.Context) { waitGrantedCalls(ctx, gw, inboxSvc, shutdownGrace) },
 			codeRuns.Wait,
+			jobsSvc.Wait,
 		},
 		cancelRoot: cancel,
 		closers: []shutdownCloser{
