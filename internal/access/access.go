@@ -89,23 +89,64 @@ type Scope struct {
 	// Denied: blocked or unknown caller. Nothing is allowed.
 	Denied bool
 	// All: admin, or a local unauthenticated caller. Everything is allowed.
+	// An agent with Limits never has All, so code that short-cuts on All
+	// still filters it; OwnerAll keeps its owner's reach.
 	All bool
 	// Groups granted to a member.
 	Groups map[string]bool
+	// OwnerAll: the agent's owner is an admin (everything), and Limits
+	// narrow that for this one agent.
+	OwnerAll bool
+	// Limits are the agent's own allow and deny lists (agent_scopes), on
+	// top of its owner's scope. nil: no limits.
+	Limits *Limits
 }
 
-// Allows reports whether the scope reaches group.
-func (s Scope) Allows(group string) bool {
+// ownerAllows reports whether the scope reaches group before any agent
+// limits.
+func (s Scope) ownerAllows(group string) bool {
 	if s.Denied {
 		return false
 	}
-	return s.All || alwaysOn[group] || s.Groups[group]
+	return s.All || s.OwnerAll || alwaysOn[group] || s.Groups[group]
+}
+
+// Allows reports whether the scope reaches group: the owner may use it and
+// the agent's limits allow at least part of it.
+func (s Scope) Allows(group string) bool {
+	return s.ownerAllows(group) && s.Limits.allowsGroup(group)
 }
 
 // AllowsTool reports whether the scope reaches a tool registered under
 // upstream with the given full name.
 func (s Scope) AllowsTool(upstream, toolName string) bool {
-	return s.Allows(GroupOf(upstream, toolName))
+	group := GroupOf(upstream, toolName)
+	return s.ownerAllows(group) && s.Limits.allowsTool(group, toolName)
+}
+
+// LimitedOut reports whether the owner may use the tool but the agent's
+// own limits refuse it. The gateway then says so plainly instead of
+// answering "not found": the agent's owner chose the limit and can see
+// the tool anyway.
+func (s Scope) LimitedOut(upstream, toolName string) bool {
+	group := GroupOf(upstream, toolName)
+	return s.ownerAllows(group) && !s.Limits.allowsTool(group, toolName)
+}
+
+// OwnerIsAdmin reports whether the caller's owner reaches everything
+// (an admin), whatever the agent's own limits.
+func (s Scope) OwnerIsAdmin() bool { return !s.Denied && (s.All || s.OwnerAll) }
+
+// CanAdminister reports whether the caller may use toolyard's admin
+// controls (policies.set/clear, servers.reconnect, shared connections): an
+// admin's unlimited agent or the admin's own session, or an admin's agent
+// whose limits say it may manage toolyard. A limited agent, and every
+// OAuth client its owner did not explicitly let manage toolyard, may not.
+func (s Scope) CanAdminister() bool {
+	if s.Denied {
+		return false
+	}
+	return s.All || (s.OwnerAll && s.Limits != nil && s.Limits.Manage)
 }
 
 // Resolver is what the gateway asks on every tool list and call.
@@ -126,8 +167,9 @@ type cached[T any] struct {
 type Service struct {
 	db     *store.DB
 	mu     sync.Mutex
-	users  map[string]cached[Scope]  // user id -> scope
-	owners map[string]cached[string] // agent id -> owner user id ("" = unknown)
+	users  map[string]cached[Scope]   // user id -> scope
+	owners map[string]cached[string]  // agent id -> owner user id ("" = unknown)
+	limits map[string]cached[*Limits] // agent id -> its limits (nil = none)
 	now    func() time.Time
 }
 
@@ -136,6 +178,7 @@ func New(db *store.DB) *Service {
 		db:     db,
 		users:  map[string]cached[Scope]{},
 		owners: map[string]cached[string]{},
+		limits: map[string]cached[*Limits]{},
 		now:    time.Now,
 	}
 }
@@ -144,7 +187,9 @@ func New(db *store.DB) *Service {
 //
 //	""                   local unauthenticated MCP caller (only possible
 //	                     without -require-auth-on-mcp): All
-//	"ag_<uuid>"          an agent: its owner's scope
+//	"ag_<uuid>"          an agent: its owner's scope, narrowed by the
+//	                     agent's own limits (agent_scopes; every OAuth
+//	                     client has limits); a disabled agent is Denied
 //	"dashboard:<uid>"    dashboard Call tab: that user's scope
 //	"voice:<uid>"        voice session: that user's scope
 //
@@ -162,9 +207,24 @@ func (s *Service) ScopeFor(ctx context.Context, callerID string) Scope {
 		if err != nil || owner == "" {
 			return Scope{Denied: true}
 		}
-		return s.UserScope(ctx, owner)
+		sc := s.UserScope(ctx, owner)
+		lim, err := s.agentLimits(ctx, callerID)
+		if err != nil {
+			return Scope{Denied: true} // fail closed, like every lookup here
+		}
+		return sc.withLimits(lim)
 	}
 	return Scope{Denied: true}
+}
+
+// withLimits narrows s by an agent's limits. All moves to OwnerAll so no
+// caller mistakes a limited agent for one that may use everything.
+func (s Scope) withLimits(lim *Limits) Scope {
+	if lim == nil || s.Denied {
+		return s
+	}
+	s.OwnerAll, s.All, s.Limits = s.All, false, lim
+	return s
 }
 
 // OwnerUser implements gateway.OwnerResolver: the dashboard user behind a
@@ -238,13 +298,19 @@ func (s *Service) agentOwner(ctx context.Context, agentID string) (string, error
 	}
 	s.mu.Unlock()
 
+	// A disabled agent has no owner here, so it reaches nothing: a call it
+	// queued (an approval, an Inbox grant) cannot run after a revoke.
 	var owner string
-	err := s.db.QueryRowContext(ctx, `SELECT owner_user FROM agents WHERE id = ?`, agentID).Scan(&owner)
+	var disabled int
+	err := s.db.QueryRowContext(ctx, `SELECT owner_user, COALESCE(disabled, 0) FROM agents WHERE id = ?`, agentID).Scan(&owner, &disabled)
 	if errors.Is(err, sql.ErrNoRows) {
 		owner, err = "", nil
 	}
 	if err != nil {
 		return "", err
+	}
+	if disabled != 0 {
+		owner = ""
 	}
 	s.mu.Lock()
 	s.owners[agentID] = cached[string]{v: owner, exp: s.now().Add(cacheTTL)}
@@ -329,15 +395,16 @@ func (s *Service) SetGroups(ctx context.Context, userID string, groups []string,
 	return nil
 }
 
-// Invalidate drops the cached scope for userID, or every cached scope and
-// agent owner when userID is "". Call it after a role, status, grant or
-// agent-ownership change.
+// Invalidate drops the cached scope for userID, or every cached scope,
+// agent owner and agent limit when userID is "". Call it after a role,
+// status, grant or agent-ownership change.
 func (s *Service) Invalidate(userID string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if userID == "" {
 		s.users = map[string]cached[Scope]{}
 		s.owners = map[string]cached[string]{}
+		s.limits = map[string]cached[*Limits]{}
 		return
 	}
 	delete(s.users, userID)

@@ -51,6 +51,9 @@ var (
 	// delete) refuse a user's identity agent; identitykeys owns its
 	// lifecycle so the registry stays in step with the token.
 	ErrIdentityAgent = errors.New("identity agent: manage it through the identity key")
+	// ErrOAuthAgent: an OAuth client's agent (it has an mcp_oauth_grants
+	// row) signs in with OAuth tokens only; it never gets a static token.
+	ErrOAuthAgent = errors.New("oauth client agent: it signs in with OAuth; manage it on the Connected apps page")
 )
 
 // Agent kinds, mirroring the CHECK constraint on agents.kind. An identity
@@ -764,6 +767,10 @@ func (s *Service) ExchangeEnrollment(ctx context.Context, code string) (string, 
 		_, _ = s.db.ExecContext(ctx, `UPDATE agents SET enroll_code = NULL WHERE id = ? AND enroll_code = ?`, ag.ID, code)
 		return "", nil, ErrEnrollNotFound
 	}
+	// An OAuth client's agent never gets a static token, enrolment included.
+	if err := s.refuseOAuthAgent(ctx, ag.ID); err != nil {
+		return "", nil, ErrEnrollNotFound
+	}
 	rawToken, err := randCode(32)
 	if err != nil {
 		return "", nil, err
@@ -846,6 +853,9 @@ func (s *Service) VerifyAgentToken(ctx context.Context, token string) (*Agent, e
 // silently replace the token just issued.
 func (s *Service) RotateAgentToken(ctx context.Context, ownerUserID, agentID string, grace time.Duration) (string, error) {
 	if err := s.requirePlainAgent(ctx, ownerUserID, agentID); err != nil {
+		return "", err
+	}
+	if err := s.refuseOAuthAgent(ctx, agentID); err != nil {
 		return "", err
 	}
 	token, hash, err := NewAgentToken(agentID)
@@ -954,6 +964,20 @@ func (s *Service) requirePlainAgent(ctx context.Context, ownerUserID, agentID st
 	}
 	if kind == AgentKindIdentity {
 		return ErrIdentityAgent
+	}
+	return nil
+}
+
+// refuseOAuthAgent returns ErrOAuthAgent for an OAuth client's agent: a
+// static token would let it act outside its grant (revocation, refresh
+// rotation, the absolute session limit).
+func (s *Service) refuseOAuthAgent(ctx context.Context, agentID string) error {
+	var n int
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM mcp_oauth_grants WHERE agent_id = ?`, agentID).Scan(&n); err != nil {
+		return err
+	}
+	if n > 0 {
+		return ErrOAuthAgent
 	}
 	return nil
 }

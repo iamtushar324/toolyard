@@ -1,7 +1,7 @@
 # Container image: build, smoke-test and publish ghcr.io/iamtushar324/toolyard.
 #
-# Pull requests: build the image natively on amd64 and arm64 and run the
-# container smoke test (read-only root, all capabilities dropped,
+# Pull requests from forks: build the image natively on amd64 and arm64 and
+# run the container smoke test (read-only root, all capabilities dropped,
 # no-new-privileges, uid 10001, against Postgres 16). Nothing is pushed.
 #
 # Push to main (or a manual run on main): first the same Go tests that gate
@@ -10,6 +10,17 @@
 # architecture the smoke test and a push by digest with SLSA provenance
 # (mode=max) and an SBOM, then one multi-arch index tagged sha-<commit> and
 # main, with a GitHub build-provenance attestation for the index digest.
+#
+# Pull requests from this repository: the same smoke test, push and
+# attestation, tagged pr-<number>-<7-character head commit>, so a branch can
+# run in a test cluster before it merges (scripts/k8s-test-deploy.sh). The
+# Go tests are not repeated here: inbox-integration.yml runs them on every
+# pull request. The image is built from the merge commit GitHub tests (the
+# head merged into the base); its version stamp is the pr-<number>-<head>
+# tag, and its attestation names that pull request's ref
+# (refs/pull/<number>/merge), so a check with --source-ref refs/heads/main
+# accepts main's images only.
+#
 # Deployments pin the index digest printed in the run summary.
 #
 # CGO (mattn/go-sqlite3) rules out cross-compiling under QEMU, so each
@@ -18,6 +29,12 @@ name: Publish image
 
 on:
   pull_request:
+    # A pull request that changes only documentation builds no image.
+    # Nothing here is a required check (no ruleset or branch protection asks
+    # for one), so no check is left waiting.
+    paths-ignore:
+      - 'docs/**'
+      - '**/*.md'
   push:
     branches: [main]
   workflow_dispatch:
@@ -36,7 +53,7 @@ env:
 
 jobs:
   tests:
-    # Publishing only: pull requests already run inbox-integration.yml.
+    # main only: pull requests already run inbox-integration.yml.
     if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main' && github.repository == 'iamtushar324/toolyard'
     uses: ./.github/workflows/inbox-integration.yml
     permissions:
@@ -44,9 +61,9 @@ jobs:
 
   image:
     needs: tests
-    # tests is skipped when nothing is published (pull requests, manual runs
-    # on other branches); then only the smoke test runs. A failed or
-    # cancelled test run stops the image job.
+    # tests runs on main only; on pull requests and manual runs on other
+    # branches it is skipped and the smoke test runs at once. A failed or
+    # cancelled test run on main stops the image job.
     if: ${{ !cancelled() && (needs.tests.result == 'success' || needs.tests.result == 'skipped') }}
     name: image (${{ matrix.arch }})
     strategy:
@@ -63,8 +80,9 @@ jobs:
       contents: read
       packages: write
     env:
-      PUBLISH: ${{ github.event_name != 'pull_request' && github.ref == 'refs/heads/main' && github.repository == 'iamtushar324/toolyard' && needs.tests.result == 'success' }}
-      VERSION: sha-${{ github.sha }}
+      # main after its tests, and pull requests from this repository (not
+      # forks). VERSION is set by the first step.
+      PUBLISH: ${{ github.repository == 'iamtushar324/toolyard' && ((github.event_name != 'pull_request' && github.ref == 'refs/heads/main' && needs.tests.result == 'success') || (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository)) }}
       SMOKE_IMAGE: toolyard:smoke
     services:
       postgres:
@@ -84,6 +102,23 @@ jobs:
           --health-timeout 5s
           --health-retries 20
     steps:
+      - name: Version stamp
+        env:
+          EVENT: ${{ github.event_name }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT" = pull_request ]; then
+            version="pr-${PR_NUMBER}-${HEAD_SHA:0:7}"
+          else
+            version="sha-${SHA}"
+          fi
+          [[ "$version" =~ ^(pr-[0-9]+-[0-9a-f]{7}|sha-[0-9a-f]{40})$ ]] || { echo "::error::bad version '$version'"; exit 1; }
+          echo "VERSION=${version}" >> "$GITHUB_ENV"
+          echo "version ${version}"
+
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           persist-credentials: false
@@ -300,7 +335,12 @@ jobs:
 
   merge:
     needs: [tests, image]
-    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main' && github.repository == 'iamtushar324/toolyard' && needs.tests.result == 'success' && needs.image.result == 'success'
+    # Where image pushed: main after its tests, and pull requests from this
+    # repository (tests skipped, hence !cancelled()).
+    if: >-
+      !cancelled() && needs.image.result == 'success' && github.repository == 'iamtushar324/toolyard' && (
+        (github.event_name != 'pull_request' && github.ref == 'refs/heads/main' && needs.tests.result == 'success') ||
+        (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository))
     runs-on: ubuntu-24.04
     timeout-minutes: 15
     permissions:
@@ -312,6 +352,26 @@ jobs:
       digest: ${{ steps.index.outputs.digest }}
       image: ${{ steps.index.outputs.image }}
     steps:
+      - name: Version stamp and tags
+        env:
+          EVENT: ${{ github.event_name }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          SHA: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT" = pull_request ]; then
+            version="pr-${PR_NUMBER}-${HEAD_SHA:0:7}"
+            tags="${version}"
+          else
+            version="sha-${SHA}"
+            tags="${version} main"
+          fi
+          [[ "$version" =~ ^(pr-[0-9]+-[0-9a-f]{7}|sha-[0-9a-f]{40})$ ]] || { echo "::error::bad version '$version'"; exit 1; }
+          echo "VERSION=${version}" >> "$GITHUB_ENV"
+          echo "TAGS=${tags}" >> "$GITHUB_ENV"
+          echo "version ${version}, tags ${tags}"
+
       - name: Download the digests
         uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
         with:
@@ -339,16 +399,17 @@ jobs:
           [ "${#digests[@]}" -eq 2 ] || { echo "::error::expected 2 digests, got ${#digests[@]}"; exit 1; }
           sources=()
           for d in "${digests[@]}"; do sources+=("${IMAGE}@sha256:${d}"); done
+          tag_args=()
+          for t in $TAGS; do tag_args+=(--tag "${IMAGE}:${t}"); done
           docker buildx imagetools create \
-            --tag "${IMAGE}:sha-${SHA}" \
-            --tag "${IMAGE}:main" \
+            "${tag_args[@]}" \
             --annotation "index:org.opencontainers.image.source=https://github.com/${GITHUB_REPOSITORY}" \
             --annotation "index:org.opencontainers.image.revision=${SHA}" \
-            --annotation "index:org.opencontainers.image.version=sha-${SHA}" \
+            --annotation "index:org.opencontainers.image.version=${VERSION}" \
             --annotation "index:org.opencontainers.image.licenses=Apache-2.0" \
             --annotation "index:org.opencontainers.image.description=Self-hosted MCP gateway for tool access, bounded human permission and agent questions" \
             "${sources[@]}"
-          digest="$(docker buildx imagetools inspect "${IMAGE}:sha-${SHA}" --format '{{json .Manifest}}' | jq -r .digest)"
+          digest="$(docker buildx imagetools inspect "${IMAGE}:${VERSION}" --format '{{json .Manifest}}' | jq -r .digest)"
           [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "::error::bad index digest '$digest'"; exit 1; }
           platforms="$(docker buildx imagetools inspect "${IMAGE}@${digest}" --format '{{json .Manifest}}' \
             | jq -r '[.manifests[].platform | select(.os != "unknown") | "\(.os)/\(.architecture)"] | sort | join(" ")')"
@@ -368,7 +429,6 @@ jobs:
 
       - name: Summary
         env:
-          SHA: ${{ github.sha }}
           DIGEST: ${{ steps.index.outputs.digest }}
         run: |
           {
@@ -380,9 +440,11 @@ jobs:
             echo "${IMAGE}@${DIGEST}"
             echo '```'
             echo
-            echo "- Tags: \`sha-${SHA}\`, \`main\`"
+            echo "- Tags: $(for t in $TAGS; do printf '`%s` ' "$t"; done)"
             echo "- Platforms: linux/amd64, linux/arm64"
-            echo "- Version stamp: \`sha-${SHA}\`"
-            echo "- Verify: \`gh attestation verify oci://${IMAGE}@${DIGEST} --repo ${GITHUB_REPOSITORY}\`"
+            echo "- Version stamp: \`${VERSION}\`"
+            echo "- Verify: \`gh attestation verify oci://${IMAGE}@${DIGEST} --repo ${GITHUB_REPOSITORY} --source-ref ${GITHUB_REF}\`"
+            echo "  (production accepts \`--source-ref refs/heads/main\` only: pull request images carry attestations too)"
+            echo "- Test cluster: \`IMAGE=${IMAGE}@${DIGEST} scripts/k8s-test-deploy.sh\` (deploy/k8s/README.md)"
           } >> "$GITHUB_STEP_SUMMARY"
           echo "image ${IMAGE}@${DIGEST}"

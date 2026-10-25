@@ -63,6 +63,7 @@ import (
 	"github.com/tusharbhardwaj/toolyard/internal/inbox"
 	"github.com/tusharbhardwaj/toolyard/internal/keyguard"
 	"github.com/tusharbhardwaj/toolyard/internal/logx"
+	"github.com/tusharbhardwaj/toolyard/internal/mcpauth"
 	"github.com/tusharbhardwaj/toolyard/internal/memory"
 	"github.com/tusharbhardwaj/toolyard/internal/mempalace"
 	"github.com/tusharbhardwaj/toolyard/internal/memwebhook"
@@ -1253,6 +1254,18 @@ func runServe(argv []string) error {
 		ClerkFrontendAPI: clerkFAPI,
 	}
 
+	// OAuth 2.1 for MCP clients (docs/guidelines/connect-clients.md): on
+	// whenever -public-url is set, unless an admin turned it off in
+	// settings. Its sweeper is safe on every node (sweep.go).
+	// A revoked grant's agent is disabled (access then refuses everything
+	// it queued); OnRevoke also withdraws what it still has pending.
+	mcpAuthSvc := mcpauth.New(mcpauth.Options{DB: db, PublicURL: *publicURL, Settings: settingsSvc, Access: accessSvc,
+		OnRevoke: func(ctx context.Context, agentID string) { cancelAgentWork(ctx, bus, inboxSvc, agentID) }})
+	go mcpAuthSvc.Run(ctx)
+	if mcpAuthSvc.Enabled() {
+		log.Printf("mcp-oauth: authorization server on (issuer %s, resource %s)", mcpAuthSvc.Issuer(), mcpAuthSvc.Resource())
+	}
+
 	// REST API + dashboard.
 	apiSrv := api.New(ctx, api.Options{
 		Federation: federationSvc, Callbacks: callbackSvc,
@@ -1301,6 +1314,7 @@ func runServe(argv []string) error {
 
 	mux := http.NewServeMux()
 	apiSrv.Routes(mux)
+	apiSrv.MCPOAuthRoutes(mux, mcpAuthSvc)
 
 	// Streamable HTTP MCP transport at /mcp. Agents use this if they prefer
 	// HTTP over stdio. Auth via Authorization: Bearer <agent-token>, or
@@ -1310,7 +1324,11 @@ func runServe(argv []string) error {
 	// guard, which also works out who raised the call (agent, owner,
 	// client, session) for the audit log. -require-auth-on-mcp
 	// (auto-enabled with -public-url) rejects anonymous traffic too.
-	mcpAuthn := mcpAuth{verify: federationSvc.VerifyAgent, requireAuth: *requireAuthMCP, sec: secOpts}
+	// An OAuth access token (mcpauth) is checked by the authorization
+	// server; every 401 names its protected-resource metadata while OAuth
+	// is on, so MCP clients can sign the person in.
+	mcpAuthn := mcpAuth{verify: federationSvc.VerifyAgent, verifyOAuth: mcpAuthSvc.VerifyAccessToken,
+		resourceMetadata: mcpAuthSvc.ResourceMetadataURL, requireAuth: *requireAuthMCP, sec: secOpts}
 	streamable := server.NewStreamableHTTPServer(gw.MCPServer(),
 		server.WithEndpointPath("/mcp"),
 		// Stateless mode is opt-in via -stateless-mcp. The default
@@ -1850,6 +1868,7 @@ func staticHandler() http.Handler {
 	appHash := assetHash(sub, "app.js")
 	cssHash := assetHash(sub, "style.css")
 	settingsHash := assetHash(sub, "settings.js")
+	appsHash := assetHash(sub, "apps.js")
 	workspaceHash := assetHash(sub, "workspace.css")
 	swHash := assetHash(sub, "sw.js")
 	loginHash := assetHash(sub, "login.js")
@@ -1857,6 +1876,7 @@ func staticHandler() http.Handler {
 		out := strings.ReplaceAll(string(body), `src="/app.js"`, `src="/app.js?v=`+appHash+`"`)
 		out = strings.ReplaceAll(out, `href="/style.css"`, `href="/style.css?v=`+cssHash+`"`)
 		out = strings.ReplaceAll(out, `src="/settings.js"`, `src="/settings.js?v=`+settingsHash+`"`)
+		out = strings.ReplaceAll(out, `src="/apps.js"`, `src="/apps.js?v=`+appsHash+`"`)
 		out = strings.ReplaceAll(out, `href="/workspace.css"`, `href="/workspace.css?v=`+workspaceHash+`"`)
 		return []byte(out)
 	}
@@ -1897,12 +1917,14 @@ func staticHandler() http.Handler {
 			http.NotFound(w, r)
 			return
 		}
-		// MCP-over-HTTP clients probe OAuth discovery endpoints first
-		// (.well-known/oauth-protected-resource, oauth-authorization-server,
-		// /register). We use static bearer-token auth, so these must 404 —
-		// returning the SPA's index.html breaks the client with
-		// "Failed to parse JSON" because it expects a discovery document.
-		if strings.HasPrefix(r.URL.Path, "/.well-known/") ||
+		// MCP-over-HTTP clients probe OAuth discovery endpoints. The ones
+		// toolyard serves (the RFC 9728 and RFC 8414 documents, /oauth/*,
+		// mcpauth) and /.well-known/toolyard-instance are mux routes and
+		// never reach here. Every other discovery guess must 404: the SPA's
+		// index.html breaks a client with "Failed to parse JSON" because it
+		// expects a document. That includes the root /register, /authorize
+		// and /token that pre-metadata clients guess.
+		if strings.HasPrefix(r.URL.Path, "/.well-known/") || strings.HasPrefix(r.URL.Path, "/oauth/") ||
 			r.URL.Path == "/register" ||
 			r.URL.Path == "/authorize" ||
 			r.URL.Path == "/token" {
@@ -1997,6 +2019,37 @@ func (h hubEventBus) Publish(eventType string, data any) {
 }
 
 // identityResolver adapts identity.Service.PrimaryUser → oauth.IdentityResolver.
+// cancelAgentWork withdraws a revoked OAuth client's pending approvals and
+// Inbox requests and revokes its Inbox grants. Best effort: the agent is
+// already disabled, so nothing it queued can run anyway.
+func cancelAgentWork(ctx context.Context, bus *approval.Bus, inboxSvc *inbox.Service, agentID string) {
+	if bus != nil {
+		pending, err := bus.ListPendingByAgent(ctx, agentID)
+		if err != nil {
+			log.Printf("mcp-oauth: WARN list pending approvals of %s: %v", agentID, err)
+		}
+		for _, p := range pending {
+			if _, err := bus.CancelByAgent(ctx, p.ID, agentID); err != nil && !errors.Is(err, approval.ErrNotPending) {
+				log.Printf("mcp-oauth: WARN cancel approval %s of %s: %v", p.ID, agentID, err)
+			}
+		}
+	}
+	if inboxSvc != nil {
+		open, err := inboxSvc.List(ctx, inbox.ListFilter{Open: true, AgentID: agentID})
+		if err != nil {
+			log.Printf("mcp-oauth: WARN list Inbox requests of %s: %v", agentID, err)
+		}
+		for _, r := range open {
+			if _, err := inboxSvc.Cancel(ctx, agentID, r.ID); err != nil && !errors.Is(err, inbox.ErrNotPending) {
+				log.Printf("mcp-oauth: WARN cancel Inbox request %s of %s: %v", r.ID, agentID, err)
+			}
+		}
+		if _, err := inboxSvc.RevokeAll(ctx, agentID); err != nil {
+			log.Printf("mcp-oauth: WARN revoke Inbox grants of %s: %v", agentID, err)
+		}
+	}
+}
+
 // mcpCredential is the agent token an /mcp request presents: the
 // Authorization bearer when there is one, else the x-bf-vk header (the
 // Bifrost virtual-key slot: bkt3's proxy strips Authorization and sends a

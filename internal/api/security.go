@@ -225,10 +225,14 @@ func (s *Server) EnforceOriginOnMutations(next http.Handler) http.Handler {
 		case http.MethodPost, http.MethodPatch, http.MethodPut, http.MethodDelete:
 			// Token-authenticated MCP traffic skips this — no cookie auth in
 			// play. The token arrives as a bearer or in x-bf-vk, which T3's
-			// Bifrost proxy sends server-to-server with no Origin.
+			// Bifrost proxy sends server-to-server with no Origin. A request
+			// with no cookie at all skips it too: /mcp never reads a cookie,
+			// so its guard answers 401 with WWW-Authenticate, which is how an
+			// MCP client learns it can sign in with OAuth (mcpauth). A
+			// browser request carrying cookies still needs the Origin.
 			if strings.HasPrefix(r.URL.Path, "/mcp") &&
 				(strings.HasPrefix(r.Header.Get("Authorization"), "Bearer ") ||
-					strings.TrimSpace(r.Header.Get("x-bf-vk")) != "") {
+					strings.TrimSpace(r.Header.Get("x-bf-vk")) != "" || r.Header.Get("Cookie") == "") {
 				next.ServeHTTP(w, r)
 				return
 			}
@@ -502,6 +506,12 @@ func exemptFromCSRFHeader(path string) bool {
 	// A native Inbox upload is a curl PUT authenticated by the single-use
 	// ticket in its path; no cookie is read, so it isn't CSRF-replayable.
 	if strings.HasPrefix(path, uploadsPathPrefix) {
+		return true
+	}
+	// The OAuth endpoints MCP clients call (register, token, revoke) read
+	// no cookie: client credentials and PKCE authenticate them. This also
+	// lifts the Origin check (exemptFromOriginCheck).
+	if mcpOAuthProtocolPath(path) {
 		return true
 	}
 	// Code mode over REST and session tokens are bearer-only (agent or

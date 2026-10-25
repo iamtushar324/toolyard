@@ -114,6 +114,115 @@ published image and production settings, see [Containers](#containers).
    Conductor workspaces use the same hook config as the agent type they run
    (Claude Code or Codex); there is no separate Conductor hook endpoint.
 
+## OAuth for MCP clients
+
+toolyard is an OAuth 2.1 authorization server for its own `/mcp`, so people
+can add it to ChatGPT, Claude.ai, Claude Code, Codex, Cursor and other MCP
+clients by URL (`<public-url>/mcp`) and sign in through the browser. The
+step-by-step guide for each client is
+[docs/guidelines/connect-clients.md](guidelines/connect-clients.md).
+Agent tokens keep working next to it.
+
+**When it is on.** It needs `-public-url`: that origin is the issuer and,
+with `/mcp`, the only resource a token is valid for. With `-public-url` it
+is on by default. An admin turns it off or on with the `mcp_oauth_enabled`
+setting (the Connected apps page, or `PATCH /v1/settings`). While it is
+off, the endpoints below answer 404, `/mcp` sends no `WWW-Authenticate`
+hint, and issued OAuth tokens stop working.
+
+**Endpoints.** Your reverse proxy must pass these through to toolyard, next
+to `/mcp` and the dashboard:
+
+| Path | What |
+|---|---|
+| `/.well-known/oauth-protected-resource` (and `…/mcp`) | RFC 9728 protected-resource metadata |
+| `/.well-known/oauth-authorization-server` | RFC 8414 authorization server metadata |
+| `/oauth/register` | RFC 7591 dynamic client registration (60 per client IP per hour) |
+| `/oauth/authorize`, `/oauth/consent` | the browser steps: sign-in, then the consent screen |
+| `/oauth/token` | `authorization_code` (PKCE `S256` required) and `refresh_token` |
+| `/oauth/revoke` | RFC 7009 revocation |
+
+Every other `/.well-known/` path still answers 404.
+`/.well-known/toolyard-instance` (federation) is unchanged.
+
+**Settings** (admin; `PATCH /v1/settings` or the Connected apps page):
+
+| Key | Default | What |
+|---|---|---|
+| `mcp_oauth_enabled` | `true` with `-public-url` | the instance switch |
+| `mcp_oauth_redirect_hosts` | empty (any) | allow list of client redirect hosts, comma separated: `claude.ai`, `chatgpt.com`, `*.example.com`, `localhost`, `127.0.0.1`, or `cursor:` for a private-use scheme |
+| `mcp_oauth_access_ttl_minutes` | 60 | access token lifetime, 5 to 1440 |
+| `mcp_oauth_refresh_ttl_days` | 30 | refresh token lifetime, 1 to 365, renewed on every refresh |
+| `mcp_oauth_max_session_days` | 90 | absolute limit from consent, 1 to 365: no token outlives it, however often it is refreshed; the person then signs in again |
+| `mcp_oauth_custom_schemes` | `cursor,vscode,vscode-insiders,windsurf,zed` | private-use redirect schemes allowed without a reverse-DNS name |
+
+**How a connection works.** Each person's authorization of one client is a
+grant. It runs as an agent that the person owns: its name is the nickname
+from the consent screen, and it reports `agent_kind` `oauth_client` in
+audit rows and `access.whoami`. (The `agents.kind` column keeps `agent`;
+the grant row marks the agent as a client.) The consent screen also sets a
+per-agent tool scope (`agent_scopes`): everything the owner can use, or
+only chosen servers and tools, with blocks. The same per-agent scope works
+for every agent. Approval rules do not change.
+
+**Admin control is opt-in.** An app never inherits its owner's admin
+control: even an admin's app with "everything you can use" cannot change
+policies (`policies.set`, `policies.clear`), reconnect servers or sign in
+shared connections. An admin can give one app that control with **May
+manage toolyard (policies, servers, shared connections)** on the consent
+screen or the Connected apps page; it is off by default and recorded on the
+grant (`may_manage`). A member's app never gets it.
+
+**Audit.** Every audit row an app's agent raises carries the OAuth client
+id in `audit_events.oauth_client_id` (a trigger fills it from the grant).
+The grant row is the agent's tombstone: deleting the agent keeps the
+mapping, and connecting the client again recreates the agent under the same
+id. An app's agent cannot be given a static agent token (rotation and
+enrolment refuse it).
+
+**Security notes.**
+
+- Redirect URIs must be `https` to a valid host name or IP address, `http`
+  on the loopback interface (the port may change, RFC 8252), or a
+  private-use scheme: a reverse-DNS name such as `com.example.app`, or one
+  of `mcp_oauth_custom_schemes`. They are matched exactly otherwise.
+  `javascript:`, `data:`, `file:`, `jar:`, `ms-msdt:`, `search-ms:`,
+  `ms-officecmd:` and similar schemes are always refused.
+- An invalid authorization request goes back to the client only once the
+  client, its redirect URI and `response_type=code` are all valid; before
+  that the person sees an error page, so toolyard is never an open
+  redirect. `state` is optional (PKCE is required); a request without
+  `resource` gets `<public-url>/mcp`.
+- Client ID metadata documents are fetched only while handling an
+  authorization request (the token and revocation endpoints use the cached
+  copy, stale included, and never fetch), only on port 443, and only from
+  public addresses: loopback, private, carrier-grade NAT (`100.64.0.0/10`,
+  Tailscale), link-local, unique local, multicast, documentation,
+  benchmarking and reserved ranges are refused, also when wrapped in an
+  IPv4-mapped, NAT64 or 6to4 address. The connection goes to the address
+  that was checked, TLS verifies the host, redirects are not followed, and
+  the size (64 KiB) and time (8 s) are bounded. One client address may
+  cause 20 fetches per 10 minutes, one client_id is fetched once at a time,
+  a failure is not retried for 5 minutes, and the requester gets a generic
+  error (the detail goes to the log). A document is cached for its
+  `max-age` (5 minutes to 24 hours).
+- Rate limits count IPv6 addresses by their /64 and requests without a
+  known address in one strict bucket, and there are global caps on
+  registrations and pending authorization requests. An in-process
+  pre-limit refuses floods before they write to the database.
+- Codes are single use and last 60 seconds. A code used twice revokes the
+  tokens it produced. A refresh token used twice revokes the whole grant
+  and disables its agent; the person connects the app again. A retry within
+  30 seconds, while the token that replaced it is still unused, is refused
+  without revoking anything. Revoking a grant (by its owner, its client or
+  reuse detection) also cancels its agent's pending approvals and Inbox
+  requests, and nothing it queued can run.
+- Tokens, codes and client secrets are stored as SHA-256 hashes. Access
+  tokens start `tyat_`, refresh tokens `tyrt_`.
+- All of this state is in the database (`mcp_oauth_*` tables), so several
+  replicas on one Postgres database share it. The sweeper that deletes
+  expired rows is safe to run on every node.
+
 ## Code mode (Bifrost-compatible)
 
 Agents and skills written for the Bifrost MCP gateway's code mode work
@@ -905,22 +1014,34 @@ The image `ghcr.io/iamtushar324/toolyard` is built from `deploy/Dockerfile`
 for linux/amd64 and linux/arm64 on every push to `main`, after the Go tests
 pass (`.github/workflows/publish-image.yml`). Every pull request builds it
 on both architectures and runs it as a smoke test: read-only root, no
-capabilities, uid 10001, against Postgres 16.
+capabilities, uid 10001, against Postgres 16. A pull request from this
+repository (not a fork) also publishes its image.
 
 ### Image
 
 - Tags: `sha-<commit>` (the full 40-character commit) and `main` (moves on
   every push). The binary reports version `sha-<commit>` (`toolyard
   version`, `/v1/health`, `toolyard_build_info`).
+- Pull requests from this repository: `pr-<number>-<head>`, where `<head>`
+  is the first 7 characters of the pull request's head commit, built from
+  the merge commit GitHub tests, after the container smoke test (the Go
+  tests run in the pull request's own Inbox integration workflow). The
+  binary reports the same string as its version. For test deployments only
+  ([Kubernetes](#kubernetes)).
 - Deploy by digest, never by tag:
   `ghcr.io/iamtushar324/toolyard@sha256:<digest>`. The publish run's summary
   prints the digest of the multi-arch index. Each image carries an SBOM and
-  SLSA provenance, and the index has a GitHub attestation:
+  SLSA provenance, and the index has a GitHub attestation. Pull request
+  images have valid attestations too, so a production check must also pin
+  the ref the image was built from:
 
   ```bash
   gh attestation verify oci://ghcr.io/iamtushar324/toolyard@sha256:<digest> \
-    --repo iamtushar324/toolyard
+    --repo iamtushar324/toolyard --source-ref refs/heads/main
   ```
+
+  A pull request image names `refs/pull/<number>/merge` instead, and this
+  check refuses it.
 
 - Entrypoint `tini -- toolyard`, default command `serve`, user and group
   10001. Ports 8787 (dashboard, `/mcp`, `/v1/*`) and 9090 (the ops
@@ -1061,5 +1182,42 @@ running with less confinement if a later node lacks it.
   settings above (secrets with owner and mode, read-only root, tmpfs,
   stop-first updates, 75 s grace, a liveness health check, Traefik labels).
 - Kubernetes: `deploy/k8s/`, a reference Kustomize base (restricted pod
-  security, `Recreate`, probes, emptyDir volumes). CI validates it with
-  kubeconform; nothing deploys it.
+  security, `Recreate`, probes, emptyDir volumes) and an HA test overlay;
+  see [Kubernetes](#kubernetes).
+
+### Kubernetes
+
+`deploy/k8s/` has two layouts; `deploy/k8s/README.md` explains both. CI
+renders them and validates them with kubeconform.
+
+- `base/`: one replica with `strategy: Recreate` on an external Postgres,
+  under the `restricted` Pod Security Standard. A starting point for your
+  own overlay.
+- `overlays/ha-test/`: a test deployment with two replicas
+  (`RollingUpdate`, `maxUnavailable: 0`), a PodDisruptionBudget, preferred
+  spreading over nodes and zones, an in-cluster Postgres 16 StatefulSet on
+  a persistent volume, a migration Job, an Ingress and NetworkPolicies.
+  Not for production data: the Postgres has no backups and no replication.
+
+`scripts/k8s-test-deploy.sh` deploys the overlay into one namespace with a
+namespaced deployer kubeconfig. Cluster values (host, image, node selector,
+tolerations, storage class, ingress class, trusted proxy) are environment
+inputs, never committed. It creates the credentials Secret (four keys and
+`database-url`) and the Postgres password once, from files in a private
+temporary directory, then applies Postgres, runs `toolyard db migrate` as a
+Job and waits for the gateway's rollout. Until the first account exists,
+`/v1/auth/setup` is open to any caller, so the script then creates the admin
+account through a port-forward (the generated password goes to the
+`toolyard-admin` Secret) and only then applies the Ingress. Last it smoke
+tests the result: `/v1/health` and `/v1/readyz` through the Ingress,
+`/v1/readyz` on every pod through a port-forward, MCP `server/discover`, and,
+with an agent token (`TOKEN_FILE`), a code-mode run. `--destroy` removes it
+but keeps the database volume and the Secrets; `--destroy --purge` deletes
+those too.
+
+`REPLICAS` is required: 1 for an image without v0.1 high availability
+(`Recreate`, no PodDisruptionBudget), 2 only for one with it. Every pull
+request from this repository publishes an image tagged
+`pr-<number>-<7-character head commit>`, so a branch can run in the test
+cluster before it merges; the publish run's summary prints the digest to
+pass as `IMAGE`.

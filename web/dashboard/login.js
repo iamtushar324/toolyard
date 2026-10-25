@@ -17,7 +17,6 @@
   // @clerk/clerk-js 6.x, with its components in @clerk/ui 1.x.
   const CLERK_JS_MAJOR = 6;
   const CLERK_UI_MAJOR = 1;
-  const PASSWORD_URL = '/?password=1';
 
   // Where Clerk returns after sign-in, sign-up and sign-out. Without an
   // explicit URL Clerk falls back to the instance's dashboard setting, which
@@ -26,8 +25,16 @@
   // query may carry ?signout=1 or Clerk handshake parameters.
   const hostRequest = new URLSearchParams(location.search).get('host_request');
   const safeHostRequest = /^[A-Za-z0-9_-]{43}$/.test(hostRequest || '') ? hostRequest : null;
-  const here = location.origin + location.pathname + (safeHostRequest ? '?host_request=' + encodeURIComponent(safeHostRequest) : '');
-  const afterLogin = safeHostRequest ? '/connections/authorize?request=' + encodeURIComponent(safeHostRequest) : '/';
+  // An MCP client's OAuth sign-in (/oauth/consent) sends people here the
+  // same way; they return to its consent screen after sign-in.
+  const oauthRequest = new URLSearchParams(location.search).get('oauth_request');
+  const safeOAuthRequest = !safeHostRequest && /^[A-Za-z0-9_-]{43}$/.test(oauthRequest || '') ? oauthRequest : null;
+  const returnQuery = safeHostRequest ? '?host_request=' + encodeURIComponent(safeHostRequest)
+    : safeOAuthRequest ? '?oauth_request=' + encodeURIComponent(safeOAuthRequest) : '';
+  const here = location.origin + location.pathname + returnQuery;
+  const afterLogin = safeHostRequest ? '/connections/authorize?request=' + encodeURIComponent(safeHostRequest)
+    : safeOAuthRequest ? '/oauth/consent?request=' + encodeURIComponent(safeOAuthRequest) : '/';
+  const PASSWORD_URL = '/?password=1' + (safeOAuthRequest ? '&oauth_request=' + encodeURIComponent(safeOAuthRequest) : '');
   // The dashboard's Logout sends Google users here with ?signout=1 so the
   // Clerk session ends too; otherwise the next visit signs straight back in.
   const signingOut = new URLSearchParams(location.search).get('signout') === '1';
@@ -35,6 +42,8 @@
 
   const body = document.getElementById('login-body');
   const passwordAlt = document.getElementById('login-alt');
+  const passwordAltLink = passwordAlt && passwordAlt.querySelector('a');
+  if (passwordAltLink) passwordAltLink.href = PASSWORD_URL;
   let clerk = null;
   let mountNode = null;
   // Set once an exchange starts and cleared only by an explicit retry, so a

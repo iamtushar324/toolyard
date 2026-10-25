@@ -1,0 +1,27 @@
+# The public route to the dashboard, /mcp and /v1/*. The host is a
+# placeholder; scripts/k8s-test-deploy.sh sets HOST, and adds
+# ingressClassName (INGRESS_CLASS) and a TLS Secret (TLS_SECRET) when given.
+# Without a secretName the controller serves its default certificate, such
+# as a wildcard certificate that covers HOST. The ops port (9090) stays off
+# the Ingress.
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: toolyard
+  labels:
+    app.kubernetes.io/name: toolyard
+spec:
+  tls:
+    - hosts:
+        - toolyard-test.example.com
+  rules:
+    - host: toolyard-test.example.com
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: toolyard
+                port:
+                  name: http
