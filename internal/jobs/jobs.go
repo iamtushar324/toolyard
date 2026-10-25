@@ -401,6 +401,8 @@ type run struct {
 	tool       string
 	userCancel atomic.Bool
 	revoked    atomic.Bool
+	// started is set once the call runs (claimed, or adopted).
+	started atomic.Bool
 
 	mu              sync.Mutex
 	progressWritten time.Time

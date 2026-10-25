@@ -85,6 +85,7 @@ func (s *Service) Adopt(ctx context.Context, req StartRequest, a Adoption) (*Job
 		cancel = func() {}
 	}
 	r := &run{handle: newHandle(), cancel: cancel, agentID: req.AgentID, upstream: req.Upstream, tool: req.Tool}
+	r.started.Store(true)
 	s.track(job.ID, r)
 	s.slots.take(req.AgentID)
 	if a.Relay != nil {
@@ -269,6 +270,10 @@ func (s *Service) execute(ctx context.Context, job *Job, r *run, fn RunFunc) {
 		return
 	}
 	defer s.slots.release(r.agentID)
+	if ctx.Err() != nil {
+		s.settleUnstarted(job.ID, r)
+		return
+	}
 	claimed, err := s.claim(ctx, job.ID)
 	if err != nil {
 		s.log.Warn("job: could not mark running", "job_id", job.ID, "err", err.Error())
@@ -277,6 +282,7 @@ func (s *Service) execute(ctx context.Context, job *Job, r *run, fn RunFunc) {
 		s.settleUnstarted(job.ID, r)
 		return
 	}
+	r.started.Store(true)
 	s.broadcast()
 	s.finishRun(job, r, s.call(ctx, r, job.ID, fn))
 }

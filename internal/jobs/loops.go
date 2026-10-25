@@ -265,6 +265,9 @@ func newSlotPool(max, perAgent int) *slotPool {
 // acquire waits for a slot for agent; false when ctx ended first.
 func (p *slotPool) acquire(ctx context.Context, agent string) bool {
 	for {
+		if ctx.Err() != nil {
+			return false
+		}
 		p.mu.Lock()
 		if p.used < p.max && p.byAgent[agent] < p.perAgent {
 			p.used++
@@ -420,7 +423,14 @@ func (s *Service) Released() <-chan struct{} { return s.released }
 // to record that.
 func (s *Service) Wait(ctx context.Context) {
 	if !s.waitIdle(ctx.Done()) {
+		// Jobs that never started go first, so a slot a running job frees
+		// on its way out is not taken by one of them.
 		s.mu.Lock()
+		for _, r := range s.inflight {
+			if !r.started.Load() {
+				r.cancel()
+			}
+		}
 		for _, r := range s.inflight {
 			r.cancel()
 		}
