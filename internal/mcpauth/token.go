@@ -394,6 +394,9 @@ func (s *Service) cancelPending(ctx context.Context, agentID string) {
 // same transaction): its cached scope goes and OnRevoke cancels what it
 // had pending. Nothing happens for an agent that was not an OAuth client.
 func (s *Service) AgentDeleted(ctx context.Context, agentID string) {
+	// The delete already committed: finish the follow-up even when the
+	// request that asked for it has ended.
+	ctx = context.WithoutCancel(ctx)
 	var n int
 	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM mcp_oauth_grants WHERE agent_id = ?`, agentID).Scan(&n); err != nil || n == 0 {
 		return
