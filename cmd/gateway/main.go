@@ -347,7 +347,8 @@ func runServe(argv []string) error {
 	logLevel := fs.String("log-level", "info", "log level: debug | info | warn | error")
 	logFormat := fs.String("log-format", "json", "log format: json | text. Text is friendlier in a terminal; json is what journalctl + jq want.")
 	// TEC-1630 high availability
-	instanceID := fs.String("instance-id", "", "name of this replica in work leases and logs when several replicas share one Postgres database (e.g. the pod name); unique per running replica. Empty = <hostname>-<random>, new at every start.")
+	instanceID := fs.String("instance-id", "", "name of this replica in work leases and logs when several replicas share one Postgres database (e.g. the pod name). Every process adds a random suffix of its own: <name>-<8 hex digits>. Empty = the host name.")
+	clusterFlag := fs.String("cluster", string(clusterAuto), "replicas on one database: auto (on for Postgres, off for SQLite) | on (several replicas may share this Postgres database: leader leases, cross-replica messages and locks; refused on SQLite) | off (one gateway per database, also on Postgres: no LISTEN, no periodic recovery, rate limits in process)")
 	_ = fs.Parse(argv)
 
 	// TEC-1638: every flag not given on the command line may come from
@@ -481,7 +482,11 @@ func runServe(argv []string) error {
 	// TEC-1630: leader leases, cross-node messages and locks. On Postgres
 	// several replicas may share the database; on SQLite this is a
 	// single-node no-op.
-	clusterSvc, err := cluster.New(ctx, db, cluster.Options{InstanceID: *instanceID})
+	cmode, err := parseClusterMode(*clusterFlag, db.Dialect)
+	if err != nil {
+		return err
+	}
+	clusterSvc, err := cluster.New(ctx, db, cluster.Options{InstanceID: *instanceID, SingleNode: cmode == clusterOff})
 	if err != nil {
 		return fmt.Errorf("cluster: %w", err)
 	}
@@ -517,6 +522,8 @@ func runServe(argv []string) error {
 	if err != nil {
 		return err
 	}
+	// A key rotation on any replica reaches this one.
+	pushSvc.SetCluster(clusterSvc)
 
 	hub := realtime.NewHub()
 	registerRealtimeTypes(hub)
@@ -883,6 +890,8 @@ func runServe(argv []string) error {
 	})
 	// Every replica renews the leases of the Inbox executions it runs.
 	goroutines.Loop(ctx, inbox.LeaseRenewalLoop, time.Minute, inboxSvc.RunLeaseRenewal)
+	// Every replica removes its own stale temporary upload files.
+	goroutines.Loop(ctx, inbox.TempCleanupLoop, time.Minute, inboxSvc.RunTempCleanup)
 	closeInbox := closeOnce("inbox", closeTimeout, func(context.Context) error {
 		inboxSvc.Close(closeTimeout * 3 / 4) // logs its own warning first
 		return nil
@@ -904,17 +913,21 @@ func runServe(argv []string) error {
 	// routes serve (a running one is outcome_unknown: a call may have run).
 	codeRuns := coderuns.New(db, coderuns.Options{Engine: coderuns.GatewayEngine(gw), Grants: inboxSvc})
 	codeRuns.SetCluster(clusterSvc)
-	if failed, unknown, err := codeRuns.Recover(ctx); err != nil {
-		log.Printf("code runs: recover: %v", err)
-	} else if failed+unknown > 0 {
-		log.Printf("code runs: %d interrupted run(s) failed, %d marked outcome_unknown", failed, unknown)
+	// With replicas the leader's work recovery settles runs instead, one
+	// lease after it takes over (runWorkRecovery).
+	if !clusterSvc.MultiNode() {
+		if failed, unknown, err := codeRuns.Recover(ctx); err != nil {
+			log.Printf("code runs: recover: %v", err)
+		} else if failed+unknown > 0 {
+			log.Printf("code runs: %d interrupted run(s) failed, %d marked outcome_unknown", failed, unknown)
+		}
 	}
 	leaderLoop(ctx, clusterSvc, loopSessionPurger, time.Hour, func(ctx context.Context) { runSessionPurger(ctx, idSvc, codeRuns) })
 	// Every replica renews the leases of the code runs it runs.
 	goroutines.Loop(ctx, coderuns.LeaseRenewalLoop, time.Minute, codeRuns.RunLeaseRenewal)
 	// The leader settles the work of replicas that stopped (multi-node only).
 	leaderLoop(ctx, clusterSvc, loopWorkRecovery, time.Minute, func(ctx context.Context) {
-		runWorkRecovery(ctx, clusterSvc, inboxSvc, bus, codeRuns)
+		runWorkRecovery(ctx, clusterSvc, db.PingContext, inboxSvc, bus, codeRuns)
 	})
 
 	upstreamSvc := upstreams.New(db, gw)
@@ -1067,10 +1080,14 @@ func runServe(argv []string) error {
 	}
 	// Recovery waits for the persistent upstream catalog and Inbox hooks. A
 	// previously claimed write stays unknown and is never dispatched again.
-	if n, err := bus.SweepUnexecuted(ctx); err != nil {
-		log.Printf("legacy execution: startup recovery: %v", err)
-	} else if n > 0 {
-		log.Printf("legacy execution: recovered %d unclaimed decisions", n)
+	// With replicas the leader's work recovery runs it instead, one lease
+	// after it takes over (runWorkRecovery).
+	if !clusterSvc.MultiNode() {
+		if n, err := bus.SweepUnexecuted(ctx); err != nil {
+			log.Printf("legacy execution: startup recovery: %v", err)
+		} else if n > 0 {
+			log.Printf("legacy execution: recovered %d unclaimed decisions", n)
+		}
 	}
 
 	// MemPalace: install (if needed), initialize palace dir, and register
@@ -1591,6 +1608,8 @@ func runServe(argv []string) error {
 			gw.BeginDrain()
 			bus.BeginDrain()
 			mcpStreams.refuse()
+			// Another replica takes over the leader tasks at once.
+			clusterSvc.Drain()
 		},
 		releaseWaiters: func() {
 			hub.CloseAll()

@@ -158,8 +158,8 @@ func (s *Service) applyRemote(ctx context.Context, m upstreamMsg) {
 		return
 	}
 	_ = s.gw.RemoveUpstream(m.Name)
-	if err := s.connect(ctx, *srv); err != nil {
-		s.recordStatus(ctx, m.Name, "", err.Error(), 0)
+	if err := s.connectWith(ctx, *srv, false); err != nil {
+		logx.For("upstreams").Warn("upstreams: connecting a server another node changed failed on this node", "server", m.Name, "err", err.Error())
 	}
 }
 
@@ -190,8 +190,8 @@ func (s *Service) resync(ctx context.Context) {
 				return
 			}
 			_ = s.gw.RemoveUpstream(srv.Name)
-			if err := s.connect(ctx, srv); err != nil {
-				s.recordStatus(ctx, srv.Name, "", err.Error(), 0)
+			if err := s.connectWith(ctx, srv, false); err != nil {
+				logx.For("upstreams").Warn("upstreams: connecting a changed server failed on this node", "server", srv.Name, "err", err.Error())
 			}
 		}
 	}
@@ -200,6 +200,15 @@ func (s *Service) resync(ctx context.Context) {
 			s.takeDownLocked(name)
 		}
 	}
+}
+
+// lockServer serializes the read-modify-write edits of one server (Update,
+// ConvertEnvToSecret) across replicas; on a single node s.mu does.
+func (s *Service) lockServer(ctx context.Context, name string) (func(), error) {
+	if s.remote == nil {
+		return func() {}, nil
+	}
+	return s.remote.c.Lock(ctx, "upstream:"+name)
 }
 
 // takeDownLocked disconnects a server this replica runs. s.mu is held.

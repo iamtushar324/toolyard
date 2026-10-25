@@ -206,10 +206,14 @@ func (s *Service) reloadAll(ctx context.Context) error {
 		}
 		cache[k] = json.RawMessage(v)
 	}
+	// A read that stopped half-way keeps the last good cache.
+	if err := rows.Err(); err != nil {
+		return err
+	}
 	s.mu.Lock()
 	s.cache = cache
 	s.mu.Unlock()
-	return rows.Err()
+	return nil
 }
 
 // All returns a snapshot of every setting (decoded to interface{}). Used by

@@ -7,13 +7,13 @@ import (
 	"time"
 
 	"github.com/tusharbhardwaj/toolyard/internal/cluster"
+	"github.com/tusharbhardwaj/toolyard/internal/store"
 	"github.com/tusharbhardwaj/toolyard/internal/store/storetest"
 )
 
 // A token written through node 1 replaces the bearer node 2 had cached.
-func TestBearerChangeReachesOtherNode(t *testing.T) {
-	storetest.SkipUnlessPostgres(t)
-	db := storetest.Open(t)
+func TestTwoNodeBearerChange(t *testing.T) {
+	db, db2 := storetest.OpenPostgresPair(t)
 	if _, err := db.Exec(`INSERT INTO upstream_servers(name, transport, url, enabled, auth_mode, created_at, updated_at) VALUES('shared','http','http://127.0.0.1:1/mcp',1,'shared',1,1)`); err != nil {
 		t.Fatal(err)
 	}
@@ -23,7 +23,7 @@ func TestBearerChangeReachesOtherNode(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	node := func(id string) *Service {
+	node := func(db *store.DB, id string) *Service {
 		ctx, cancel := context.WithCancel(context.Background())
 		c, err := cluster.New(ctx, db, cluster.Options{InstanceID: id, ResyncInterval: -1})
 		if err != nil {
@@ -38,7 +38,7 @@ func TestBearerChangeReachesOtherNode(t *testing.T) {
 		s.SetCluster(c)
 		return s
 	}
-	node1, node2 := node("node-1"), node("node-2")
+	node1, node2 := node(db, "node-1"), node(db2, "node-2")
 	ctx := context.Background()
 	bearer := func() string { return node2.HeaderFunc("shared")(ctx)["Authorization"] }
 

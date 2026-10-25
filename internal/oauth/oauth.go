@@ -208,6 +208,14 @@ type Service struct {
 	// multi-node cluster a cluster lock replaces it (lockUser).
 	userLocks map[string]*sync.Mutex
 
+	// bearerGen counts the writes and drops of each cache entry (keys of
+	// bearers, and userKey of userBearers), so a database read that a
+	// newer write or drop overtook is not cached; staleBearers marks the
+	// entries a cluster resync asked to read again (a failed read keeps
+	// serving them). Both guarded by mu.
+	bearerGen    map[string]uint64
+	staleBearers map[string]bool
+
 	// cluster, when it spans several nodes, carries bearer changes to the
 	// other replicas' caches and serializes refreshes across them
 	// (SetCluster, cluster.go).
@@ -225,10 +233,12 @@ func New(db *store.DB, cipher *Cipher, bus EventBus, notifier Notifier, idents I
 		httpc: &http.Client{
 			Timeout: 30 * time.Second,
 		},
-		bearers:     map[string]*atomic.Value{},
-		userBearers: map[string]*atomic.Value{},
-		lastAttempt: map[string]time.Time{},
-		userLocks:   map[string]*sync.Mutex{},
+		bearers:      map[string]*atomic.Value{},
+		userBearers:  map[string]*atomic.Value{},
+		bearerGen:    map[string]uint64{},
+		staleBearers: map[string]bool{},
+		lastAttempt:  map[string]time.Time{},
+		userLocks:    map[string]*sync.Mutex{},
 	}
 }
 
@@ -281,13 +291,16 @@ func (s *Service) HeaderFunc(upstream string) func(ctx context.Context) map[stri
 func (s *Service) currentBearer(upstream string) string {
 	s.mu.RLock()
 	v, ok := s.bearers[upstream]
+	stale := s.staleBearers[upstream]
 	s.mu.RUnlock()
-	if !ok {
-		// Cold path — populate from DB.
-		s.cacheBearerFromDB(upstream)
-		s.mu.RLock()
-		v, ok = s.bearers[upstream]
-		s.mu.RUnlock()
+	if !ok || stale {
+		// Cold path, or a cluster resync asked to check: read the DB. A
+		// failed read keeps serving the stale bearer.
+		if s.cacheBearerFromDB(upstream) || !ok {
+			s.mu.RLock()
+			v, ok = s.bearers[upstream]
+			s.mu.RUnlock()
+		}
 		if !ok {
 			return ""
 		}
@@ -308,6 +321,9 @@ func (s *Service) setBearer(upstream, tok string) {
 // storeBearer fills the cache, telling nobody (a read from the database).
 func (s *Service) storeBearer(upstream, tok string) {
 	s.mu.Lock()
+	// A fill that read the database before this write must not land.
+	s.bearerGen[upstream]++
+	delete(s.staleBearers, upstream)
 	v := s.bearers[upstream]
 	if v == nil {
 		v = &atomic.Value{}
@@ -319,18 +335,39 @@ func (s *Service) storeBearer(upstream, tok string) {
 
 // cacheBearerFromDB pre-populates the in-memory bearer cache from the
 // oauth_tokens row. Used on startup and on cold reads.
-func (s *Service) cacheBearerFromDB(upstream string) {
+// It reports whether it replaced the cached value; a read that failed, or
+// that a newer write or drop overtook (bearerGen), leaves it alone.
+func (s *Service) cacheBearerFromDB(upstream string) bool {
+	s.mu.RLock()
+	gen := s.bearerGen[upstream]
+	s.mu.RUnlock()
 	tok, err := s.GetToken(context.Background(), upstream)
-	if err != nil || tok == nil {
-		return
+	if err != nil {
+		return false
 	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.bearerGen[upstream] != gen {
+		return false
+	}
+	delete(s.staleBearers, upstream)
+	if tok == nil {
+		delete(s.bearers, upstream)
+		return true
+	}
+	val := tok.AccessToken
 	if tok.State == StateNeedsReauth {
 		// As markNeedsReauth leaves the cache: the stored access token
 		// was rejected.
-		s.storeBearer(upstream, "")
-		return
+		val = ""
 	}
-	s.storeBearer(upstream, tok.AccessToken)
+	v := s.bearers[upstream]
+	if v == nil {
+		v = &atomic.Value{}
+		s.bearers[upstream] = v
+	}
+	v.Store(val)
+	return true
 }
 
 // PrimeBearers walks every upstream with a stored token and warms the
@@ -591,7 +628,7 @@ func (s *Service) DeleteClient(ctx context.Context, upstream string) error {
 		return err
 	}
 	s.mu.Lock()
-	delete(s.bearers, upstream)
+	s.dropBearerLocked(upstream)
 	s.mu.Unlock()
 	err = s.deleteUserTokens(ctx, upstream)
 	s.publishBearer(upstream, "", true)

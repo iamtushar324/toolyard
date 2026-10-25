@@ -11,7 +11,7 @@ import (
 	"context"
 	"encoding/json"
 	"strings"
-	"sync/atomic"
+	"time"
 
 	"github.com/tusharbhardwaj/toolyard/internal/cluster"
 	"github.com/tusharbhardwaj/toolyard/internal/logx"
@@ -19,6 +19,11 @@ import (
 
 // bearerTopic carries bearerMsg: a bearer changed on another node.
 const bearerTopic = "oauth-bearer"
+
+// userLockWait bounds the wait for a person's cluster lock; past it the
+// in-process lock alone applies (and the write's refresh-token check still
+// refuses a stale write).
+const userLockWait = 45 * time.Second
 
 // bearerMsg names the cache entry to drop: the shared bearer of Upstream
 // (User ""), one person's (User set), or every bearer of Upstream (All).
@@ -39,11 +44,16 @@ func (s *Service) SetCluster(c *cluster.Cluster) {
 	}
 	c.Subscribe(bearerTopic, func(payload string) {
 		if payload == cluster.Resync {
-			// Messages may have been missed: drop every cached bearer,
-			// each is read again on its next use.
+			// Messages may have been missed: every cached bearer is read
+			// again on its next use, and served as it is while the
+			// database cannot answer.
 			s.mu.Lock()
-			s.bearers = map[string]*atomic.Value{}
-			s.userBearers = map[string]*atomic.Value{}
+			for k := range s.bearers {
+				s.staleBearers[k] = true
+			}
+			for k := range s.userBearers {
+				s.staleBearers[k] = true
+			}
 			s.mu.Unlock()
 			return
 		}
@@ -55,19 +65,35 @@ func (s *Service) SetCluster(c *cluster.Cluster) {
 		defer s.mu.Unlock()
 		switch {
 		case m.All:
-			delete(s.bearers, m.Upstream)
+			s.dropBearerLocked(m.Upstream)
 			prefix := m.Upstream + "\x00"
 			for k := range s.userBearers {
 				if strings.HasPrefix(k, prefix) {
-					delete(s.userBearers, k)
+					s.dropUserBearerLocked(k)
 				}
 			}
 		case m.User != "":
-			delete(s.userBearers, userKey(m.Upstream, m.User))
+			s.dropUserBearerLocked(userKey(m.Upstream, m.User))
 		default:
-			delete(s.bearers, m.Upstream)
+			s.dropBearerLocked(m.Upstream)
 		}
 	})
+}
+
+// dropBearerLocked forgets one upstream's shared bearer; a database read
+// already under way is not cached (bearerGen). s.mu is held.
+func (s *Service) dropBearerLocked(upstream string) {
+	delete(s.bearers, upstream)
+	delete(s.staleBearers, upstream)
+	s.bearerGen[upstream]++
+}
+
+// dropUserBearerLocked forgets one person's bearer (k is userKey). s.mu is
+// held.
+func (s *Service) dropUserBearerLocked(k string) {
+	delete(s.userBearers, k)
+	delete(s.staleBearers, k)
+	s.bearerGen[k]++
 }
 
 // publishBearer tells the other replicas that a bearer this node wrote
@@ -92,7 +118,10 @@ func (s *Service) lockUserCluster(key string) (func(), bool) {
 	if !s.cluster.MultiNode() {
 		return nil, false
 	}
-	unlock, err := s.cluster.Lock(context.Background(), "oauth-user:"+key)
+	// Bounded: a refresh holds the lock for one provider round trip.
+	ctx, cancel := context.WithTimeout(context.Background(), userLockWait)
+	defer cancel()
+	unlock, err := s.cluster.Lock(ctx, "oauth-user:"+key)
 	if err != nil {
 		logx.For("oauth").Warn("oauth: cluster lock for a person's token failed; locking in process only", "err", err.Error())
 		return nil, false

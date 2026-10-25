@@ -179,8 +179,14 @@ func New(ctx context.Context, opts Options) (*Service, error) {
 		now = time.Now
 	}
 	service := &Service{db: opts.DB, opts: opts, signer: signer, now: now, watch: map[string]chan struct{}{}, uploadSlots: make(chan struct{}, MaxConcurrentUploads), agentUploads: map[string]int{}, legacySync: make(chan struct{}, 1)}
-	if _, err := service.RecoverExecutions(ctx); err != nil {
-		return nil, fmt.Errorf("execution recovery: %w", err)
+	// With replicas, a starting node never settles executions: one whose
+	// lease seems to have ended may belong to a live node that could not
+	// renew during a database outage. The leader's work recovery does it,
+	// one lease after it takes over.
+	if !service.multiNode() {
+		if _, err := service.RecoverExecutions(ctx); err != nil {
+			return nil, fmt.Errorf("execution recovery: %w", err)
+		}
 	}
 	service.subscribeCluster()
 	return service, nil

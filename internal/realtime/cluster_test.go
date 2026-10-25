@@ -60,11 +60,10 @@ func next(t *testing.T, ch chan Event) Event {
 
 // An event published on one node reaches the other node's streams, with
 // its data rebuilt as the type a stream filter checks.
-func TestHubFansOutAcrossNodes(t *testing.T) {
-	storetest.SkipUnlessPostgres(t)
-	db := storetest.Open(t)
-	hub1 := hubOn(t, db, "node-1")
-	hub2 := hubOn(t, db, "node-2")
+func TestTwoNodeHubFanOut(t *testing.T) {
+	db1, db2 := storetest.OpenPostgresPair(t)
+	hub1 := hubOn(t, db1, "node-1")
+	hub2 := hubOn(t, db2, "node-2")
 	stream := hub2.subscribe()
 	defer hub2.unsubscribe(stream)
 	local := hub1.subscribe()

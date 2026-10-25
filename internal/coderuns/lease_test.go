@@ -13,7 +13,7 @@ import (
 // A rolling restart of node 1 (Recover at its start) leaves node 2's
 // queued and running code runs alone; it settles the runs of a node whose
 // lease ended and runs from before leases existed.
-func TestRecoverKeepsOtherNodesRuns(t *testing.T) {
+func TestTwoNodeLeaseRecoverRuns(t *testing.T) {
 	storetest.SkipUnlessPostgres(t)
 	db := storetest.Open(t)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -34,11 +34,11 @@ func TestRecoverKeepsOtherNodesRuns(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	live := cluster.LeaseUntil(now)
+	live := now.Add(time.Hour).UnixMilli()
 	insert("cr_live_running", StatusRunning, "node-2", live)
 	insert("cr_live_queued", StatusQueued, "node-2", live)
-	insert("cr_dead_running", StatusRunning, "node-dead", now.Add(-time.Second).UnixMilli())
-	insert("cr_dead_queued", StatusQueued, "node-dead", now.Add(-time.Second).UnixMilli())
+	insert("cr_dead_running", StatusRunning, "node-dead", int64(1))
+	insert("cr_dead_queued", StatusQueued, "node-dead", int64(1))
 	insert("cr_old_running", StatusRunning, nil, nil)
 
 	svc := New(db, Options{})
@@ -64,8 +64,9 @@ func TestRecoverKeepsOtherNodesRuns(t *testing.T) {
 	}
 }
 
-// A run's row names the node that runs it, with a lease.
-func TestRunCarriesLease(t *testing.T) {
+// A run's row names the node that runs it, with a lease from the
+// database's clock.
+func TestClusterRunCarriesLease(t *testing.T) {
 	e := newEnv(t)
 	now := time.Now()
 	e.svc.now = func() time.Time { return now }
@@ -75,7 +76,7 @@ func TestRunCarriesLease(t *testing.T) {
 	if err := e.db.QueryRowContext(context.Background(), `SELECT owner_instance, lease_until FROM code_runs WHERE id = ?`, "cr_lease").Scan(&owner, &lease); err != nil {
 		t.Fatal(err)
 	}
-	if owner != e.svc.cluster.InstanceID() || lease != cluster.LeaseUntil(now) {
-		t.Fatalf("owner %q lease %d, want %q %d", owner, lease, e.svc.cluster.InstanceID(), cluster.LeaseUntil(now))
+	if left := time.Until(time.UnixMilli(lease)); owner != e.svc.cluster.InstanceID() || left < cluster.WorkLease-time.Minute || left > cluster.WorkLease+time.Minute {
+		t.Fatalf("owner %q lease ends in %s, want %q and about %s", owner, left, e.svc.cluster.InstanceID(), cluster.WorkLease)
 	}
 }

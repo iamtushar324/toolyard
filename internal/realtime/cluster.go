@@ -3,9 +3,10 @@ package realtime
 // High availability (TEC-1630): a dashboard holds its event stream open on
 // one replica, while the approval, audit or Inbox change it must see may
 // happen on another. With a multi-node cluster every event published on
-// one replica is sent to the others (cluster.PublishLarge, so an event
-// that carries a large approval or audit row still fits) and each
-// delivers it to its own streams.
+// one replica is sent to the others only (cluster.PublishOthers, which
+// also carries an event with a large approval or audit row), and each
+// decodes it and delivers it to its own streams on a goroutine of the
+// hub's own, never on the cluster's delivery goroutine.
 //
 // A stream's filter (ServeSSEFiltered) looks at the Go type of an event's
 // data, so the data is rebuilt as the type it had: a map[string]any as a
@@ -49,10 +50,12 @@ type remoteEvent struct {
 // Decoder rebuilds the data of an event type from its JSON.
 type Decoder func(raw json.RawMessage) (any, error)
 
-// remote is the hub's link to the other replicas.
+// remote is the hub's link to the other replicas: queue holds local
+// events to send, inbox the other replicas' events to deliver.
 type remote struct {
 	c        *cluster.Cluster
 	queue    chan Event
+	inbox    chan string
 	mu       sync.RWMutex
 	decoders map[string]Decoder
 }
@@ -65,7 +68,7 @@ func (h *Hub) SetCluster(ctx context.Context, c *cluster.Cluster) {
 	if !c.MultiNode() {
 		return
 	}
-	r := &remote{c: c, queue: make(chan Event, remoteQueue), decoders: map[string]Decoder{}}
+	r := &remote{c: c, queue: make(chan Event, remoteQueue), inbox: make(chan string, remoteQueue), decoders: map[string]Decoder{}}
 	h.mu.Lock()
 	if h.remote != nil {
 		for t, d := range h.remote.decoders {
@@ -76,13 +79,30 @@ func (h *Hub) SetCluster(ctx context.Context, c *cluster.Cluster) {
 	h.mu.Unlock()
 	c.Subscribe(clusterTopic, func(payload string) {
 		if payload == cluster.Resync {
-			return
+			return // live events are not replayed
 		}
-		if evt, ok := r.decode(payload); ok {
-			h.publishLocal(evt)
+		select {
+		case r.inbox <- payload:
+		default: // a slow hub drops, as a slow stream does
 		}
 	})
 	go r.run(ctx)
+	go r.receive(ctx, h)
+}
+
+// receive decodes the other replicas' events and delivers them to this
+// hub's streams until ctx ends.
+func (r *remote) receive(ctx context.Context, h *Hub) {
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case payload := <-r.inbox:
+			if evt, ok := r.decode(payload); ok {
+				h.publishLocal(evt)
+			}
+		}
+	}
 }
 
 // RegisterType makes events of eventType arrive from other replicas with
@@ -124,7 +144,7 @@ func (r *remote) run(ctx context.Context) {
 			if err != nil {
 				continue
 			}
-			if err := r.c.PublishLarge(ctx, clusterTopic, string(body)); err != nil && ctx.Err() == nil {
+			if err := r.c.PublishOthers(ctx, clusterTopic, string(body)); err != nil && ctx.Err() == nil {
 				lg.Warn("realtime: sending a live event to other nodes failed", "type", evt.Type, "err", err.Error())
 			}
 		}
@@ -151,8 +171,7 @@ func (r *remote) encode(evt Event) ([]byte, error) {
 	return json.Marshal(remoteEvent{Instance: r.c.InstanceID(), Type: evt.Type, Kind: kind, Data: data})
 }
 
-// decode rebuilds an event another replica published. Our own come back
-// on the channel too; they were delivered when they were published.
+// decode rebuilds an event another replica published.
 func (r *remote) decode(payload string) (Event, bool) {
 	var m remoteEvent
 	if err := json.Unmarshal([]byte(payload), &m); err != nil || m.Instance == r.c.InstanceID() || m.Type == "" {

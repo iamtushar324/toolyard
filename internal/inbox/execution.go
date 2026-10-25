@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 
+	"github.com/tusharbhardwaj/toolyard/internal/cluster"
 	"github.com/tusharbhardwaj/toolyard/internal/opsmetrics"
 )
 
@@ -73,20 +74,19 @@ func (s *Service) FinishExecution(ctx context.Context, g *Grant, state string, r
 }
 
 // RecoverExecutions records outcome_unknown for executions whose process
-// stopped after the execution claim. No dispatch is repeated. It runs at
-// startup (inbox.New) and, on a multi-node database, periodically on the
-// leader (RunRecovery). With a single node every running execution belongs
-// to a stopped process, as before; on a multi-node database it takes only
-// executions whose lease ended (or that have none), so it never touches
-// the live work of another node, nor of this one.
+// stopped after the execution claim. No dispatch is repeated. With a
+// single node it runs at startup (inbox.New), and every running execution
+// belongs to a stopped process, as before. On a multi-node database only
+// the leader runs it (cmd/gateway work recovery, which first waits one
+// lease), and it takes only executions whose lease ended by the database's
+// clock (or that have none), so it never touches the live work of another
+// node, nor of this one.
 func (s *Service) RecoverExecutions(ctx context.Context) (int64, error) {
 	q := `UPDATE inbox_executions SET state=?,finished_at=?,error=? WHERE state=?`
-	args := []any{ExecutionUnknown, s.now().UnixMilli(), "process stopped after the execution claim; inspect upstream state before any new permission", ExecutionRunning}
 	if s.multiNode() {
-		q += ` AND (lease_until IS NULL OR lease_until < ?)`
-		args = append(args, s.now().UnixMilli())
+		q += ` AND ` + cluster.LeaseEndedSQL(s.db.Dialect, "lease_until")
 	}
-	res, err := s.db.ExecContext(ctx, q, args...)
+	res, err := s.db.ExecContext(ctx, q, ExecutionUnknown, s.now().UnixMilli(), "process stopped after the execution claim; inspect upstream state before any new permission", ExecutionRunning)
 	if err != nil {
 		return 0, err
 	}

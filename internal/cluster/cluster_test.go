@@ -36,24 +36,11 @@ func newCluster(t *testing.T, db *store.DB, opts Options) *Cluster {
 	return c
 }
 
-// twoNodes opens two connections pools on one Postgres test database, as
+// twoNodes opens two connection pools on one Postgres test database, as
 // two gateways would, and a Cluster on each.
 func twoNodes(t *testing.T) (*Cluster, *Cluster, *store.DB, *store.DB) {
 	t.Helper()
-	storetest.SkipUnlessPostgres(t)
-	url := storetest.NewPostgresDatabase(t)
-	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
-	defer cancel()
-	db1, err := store.OpenPostgres(ctx, url, 4)
-	if err != nil {
-		t.Fatalf("open node 1: %v", err)
-	}
-	t.Cleanup(func() { _ = db1.Close() })
-	db2, err := store.OpenPostgres(ctx, url, 4)
-	if err != nil {
-		t.Fatalf("open node 2: %v", err)
-	}
-	t.Cleanup(func() { _ = db2.Close() })
+	db1, db2 := storetest.OpenPostgresPair(t)
 	return newCluster(t, db1, fastOptions("node-1")), newCluster(t, db2, fastOptions("node-2")), db1, db2
 }
 
@@ -78,8 +65,8 @@ func TestInstanceID(t *testing.T) {
 		t.Fatalf("two clusters share instance ID %q", c.InstanceID())
 	}
 	named := newCluster(t, nil, Options{InstanceID: "  pod-a  "})
-	if named.InstanceID() != "pod-a" {
-		t.Fatalf("InstanceID = %q, want pod-a", named.InstanceID())
+	if !strings.HasPrefix(named.InstanceID(), "pod-a-") || len(named.InstanceID()) != len("pod-a-")+8 {
+		t.Fatalf("InstanceID = %q, want pod-a-<8 hex digits>", named.InstanceID())
 	}
 	var nilCluster *Cluster
 	if nilCluster.InstanceID() == "" || nilCluster.InstanceID() != nilCluster.InstanceID() {
@@ -338,6 +325,38 @@ func TestLeaderLeaseTwoNodes(t *testing.T) {
 	<-done2
 }
 
+// The same -instance-id given to two processes (a container restarted in
+// the same pod, two replicas configured alike) still yields two IDs, so
+// neither renews nor ignores the other's work and messages.
+func TestClusterInstanceIDReuse(t *testing.T) {
+	a := newCluster(t, nil, Options{InstanceID: "toolyard-0"})
+	b := newCluster(t, nil, Options{InstanceID: "toolyard-0"})
+	if a.InstanceID() == b.InstanceID() {
+		t.Fatalf("two processes named toolyard-0 share instance ID %q", a.InstanceID())
+	}
+	storetest.SkipUnlessPostgres(t)
+	db1, db2 := storetest.OpenPostgresPair(t)
+	c1 := newCluster(t, db1, fastOptions("toolyard-0"))
+	c2 := newCluster(t, db2, fastOptions("toolyard-0"))
+	got := make(chan string, 4)
+	c2.Subscribe("policy", func(p string) {
+		if p != Resync {
+			got <- p
+		}
+	})
+	if err := c1.Publish(context.Background(), "policy", "from-1"); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case p := <-got:
+		if p != "from-1" {
+			t.Fatalf("got %q", p)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("a node dropped a message from another node with the same configured name")
+	}
+}
+
 func TestLeaderLeaseLostWithConnection(t *testing.T) {
 	c1, c2, _, db2 := twoNodes(t)
 	ctx, cancel := context.WithCancel(context.Background())
@@ -371,9 +390,9 @@ func TestLeaderLeaseLostWithConnection(t *testing.T) {
 	})
 
 	// The server ends node 1's lease session (a failover, a network cut).
-	c1.lockMu.Lock()
-	pid := c1.lockConn.PgConn().PID()
-	c1.lockMu.Unlock()
+	c1.leases.mu.Lock()
+	pid := c1.leases.conn.PgConn().PID()
+	c1.leases.mu.Unlock()
 	if _, err := db2.ExecContext(ctx, `SELECT pg_terminate_backend(?)`, int64(pid)); err != nil {
 		t.Fatalf("terminate node 1's lease session: %v", err)
 	}
@@ -389,7 +408,7 @@ func TestLeaderLeaseLostWithConnection(t *testing.T) {
 	}
 }
 
-func TestPublishAcrossNodes(t *testing.T) {
+func TestTwoNodePublish(t *testing.T) {
 	c1, c2, _, _ := twoNodes(t)
 	got1 := make(chan string, 8)
 	got2 := make(chan string, 8)
@@ -425,7 +444,7 @@ func TestPublishAcrossNodes(t *testing.T) {
 	}
 }
 
-func TestListenReconnectResyncs(t *testing.T) {
+func TestTwoNodeListenReconnect(t *testing.T) {
 	c1, c2, db1, _ := twoNodes(t)
 	resync := make(chan struct{}, 8)
 	got := make(chan string, 8)
@@ -460,7 +479,7 @@ func TestListenReconnectResyncs(t *testing.T) {
 	}
 }
 
-func TestPeriodicResync(t *testing.T) {
+func TestClusterPeriodicResync(t *testing.T) {
 	storetest.SkipUnlessPostgres(t)
 	db := storetest.Open(t)
 	opts := fastOptions("solo")
@@ -521,7 +540,7 @@ func TestLockTwoNodes(t *testing.T) {
 	unlock3()
 }
 
-func TestPublishLargeAcrossNodes(t *testing.T) {
+func TestTwoNodePublishLarge(t *testing.T) {
 	c1, c2, db1, _ := twoNodes(t)
 	big := strings.Repeat("0123456789", 700) // 7000 bytes: over a NOTIFY payload's share
 	got1 := make(chan string, 4)
@@ -570,7 +589,7 @@ func TestPublishLargeAcrossNodes(t *testing.T) {
 	}
 }
 
-func TestPublishLargeSingleNode(t *testing.T) {
+func TestClusterPublishLargeSingleNode(t *testing.T) {
 	storetest.SkipUnlessSQLite(t)
 	db := storetest.Open(t)
 	c := newCluster(t, db, fastOptions("solo"))
@@ -593,7 +612,7 @@ func TestPublishLargeSingleNode(t *testing.T) {
 // The shared counter: a window counts up to max and refuses the rest, a
 // refused request does not count, and the window starts over once it
 // ended. Runs on both engines (the table exists on SQLite too).
-func TestCounter(t *testing.T) {
+func TestClusterCounter(t *testing.T) {
 	db := storetest.Open(t)
 	k := NewCounter(db)
 	ctx := context.Background()
@@ -641,5 +660,165 @@ func TestCounter(t *testing.T) {
 	var nilCluster *Cluster
 	if nilCluster.Counter() != nil {
 		t.Fatal("a nil Cluster has a shared counter")
+	}
+}
+
+// Drain hands every leader lease to another node at once.
+func TestTwoNodeLeaseDrain(t *testing.T) {
+	c1, c2, _, _ := twoNodes(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	started1 := make(chan struct{}, 4)
+	stopped1 := make(chan struct{}, 4)
+	go c1.RunLeader(ctx, "sweeper", func(lctx context.Context) error {
+		started1 <- struct{}{}
+		<-lctx.Done()
+		stopped1 <- struct{}{}
+		return nil
+	})
+	select {
+	case <-started1:
+	case <-time.After(10 * time.Second):
+		t.Fatal("node 1 did not lead")
+	}
+	started2 := make(chan struct{}, 4)
+	go c2.RunLeader(ctx, "sweeper", func(lctx context.Context) error {
+		started2 <- struct{}{}
+		<-lctx.Done()
+		return nil
+	})
+	c1.Drain()
+	select {
+	case <-stopped1:
+	case <-time.After(5 * time.Second):
+		t.Fatal("node 1's task kept running after Drain")
+	}
+	select {
+	case <-started2:
+	case <-time.After(10 * time.Second):
+		t.Fatal("node 2 did not take the lease node 1 released")
+	}
+	// Node 1 takes no lease any more.
+	select {
+	case <-started1:
+		t.Fatal("node 1 led again after Drain")
+	case <-time.After(300 * time.Millisecond):
+	}
+}
+
+// A named lock whose session ends hands its context's end to the holder.
+func TestTwoNodeLockLostEndsContext(t *testing.T) {
+	c1, c2, _, db2 := twoNodes(t)
+	lctx, unlock, err := c1.LockCtx(context.Background(), "github-write")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unlock()
+	c1.locks.mu.Lock()
+	pid := c1.locks.conn.PgConn().PID()
+	c1.locks.mu.Unlock()
+	if _, err := db2.ExecContext(context.Background(), `SELECT pg_terminate_backend(?)`, int64(pid)); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-lctx.Done():
+	case <-time.After(10 * time.Second):
+		t.Fatal("the lock's context did not end when its session did")
+	}
+	// The lock is free for node 2 now.
+	short, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	unlock2, err := c2.Lock(short, "github-write")
+	if err != nil {
+		t.Fatalf("node 2 could not take the lost lock: %v", err)
+	}
+	unlock2()
+	// Leader leases use a connection of their own: they were not touched.
+	c1.leases.mu.Lock()
+	leases := c1.leases.conn
+	c1.leases.mu.Unlock()
+	if leases != nil && leases.PgConn().PID() == pid {
+		t.Fatal("named locks and leader leases share one connection")
+	}
+}
+
+// The dedicated connections ask for short keepalives, carry their purpose
+// as application_name, and ExecReserved runs on one of them.
+func TestClusterDedicatedConnections(t *testing.T) {
+	storetest.SkipUnlessPostgres(t)
+	db := storetest.Open(t)
+	c := newCluster(t, db, fastOptions("solo"))
+	ctx := context.Background()
+	conn, err := db.ConnectPostgres(ctx, "toolyard-cluster-test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer closeConn(conn)
+	for setting, want := range map[string]string{"tcp_keepalives_idle": "10", "tcp_keepalives_interval": "5", "tcp_keepalives_count": "3", "application_name": "toolyard-cluster-test"} {
+		var got string
+		if err := conn.QueryRow(ctx, "SELECT current_setting($1)", setting).Scan(&got); err != nil {
+			t.Fatal(err)
+		}
+		// Over a Unix socket the server reports 0 for the keepalives.
+		if got != want && !(strings.HasPrefix(setting, "tcp_") && got == "0") {
+			t.Errorf("%s = %q, want %q", setting, got, want)
+		}
+	}
+	n, err := c.ExecReserved(ctx, `INSERT INTO rate_limit_buckets(bucket, window_start, hits, expires_at) VALUES (?, `+NowMillisSQL(db.Dialect)+`, 1, `+LeaseUntilSQL(db.Dialect)+`)`, "reserved")
+	if err != nil || n != 1 {
+		t.Fatalf("ExecReserved: %d %v", n, err)
+	}
+	var start, until int64
+	if err := db.QueryRowContext(ctx, `SELECT window_start, expires_at FROM rate_limit_buckets WHERE bucket = 'reserved'`).Scan(&start, &until); err != nil {
+		t.Fatal(err)
+	}
+	if d := time.Since(time.UnixMilli(start)); d > time.Minute || d < -time.Minute {
+		t.Fatalf("the database clock is %s from this one", d)
+	}
+	if until-start != WorkLease.Milliseconds() {
+		t.Fatalf("lease length %d ms, want %d", until-start, WorkLease.Milliseconds())
+	}
+	var ended bool
+	if err := db.QueryRowContext(ctx, `SELECT `+LeaseEndedSQL(db.Dialect, "expires_at")+` FROM rate_limit_buckets WHERE bucket = 'reserved'`).Scan(&ended); err != nil || ended {
+		t.Fatalf("a fresh lease reads as ended: %v %v", ended, err)
+	}
+}
+
+// SingleNode (serve -cluster=off) makes a Postgres database single-node.
+func TestClusterSingleNodeOption(t *testing.T) {
+	storetest.SkipUnlessPostgres(t)
+	db := storetest.Open(t)
+	c := newCluster(t, db, Options{SingleNode: true})
+	if c.MultiNode() || c.Counter() != nil {
+		t.Fatal("SingleNode left the cluster multi-node")
+	}
+	ran := make(chan struct{})
+	go c.RunLeader(context.Background(), "x", func(context.Context) error { close(ran); return nil })
+	select {
+	case <-ran:
+	case <-time.After(5 * time.Second):
+		t.Fatal("a single node did not run the leader task at once")
+	}
+}
+
+// Dropped messages resync only their topics.
+func TestClusterDroppedTopicsResync(t *testing.T) {
+	c := newCluster(t, nil, Options{})
+	_ = c.Close() // stop the dispatcher, so the queue fills
+	for i := 0; i < queueSize; i++ {
+		c.enqueue(delivery{topic: "filler"})
+	}
+	c.enqueue(delivery{topic: "policy", payload: "x"})
+	c.enqueue(delivery{topic: "settings", payload: "y"})
+	d, ok := c.takeDrops()
+	if !ok || !d.resync || len(d.topics) != 2 {
+		t.Fatalf("drops = %+v %v, want a resync of two topics", d, ok)
+	}
+	if _, ok := c.takeDrops(); ok {
+		t.Fatal("drops were not cleared")
+	}
+	c.enqueue(delivery{resync: true})
+	if d, ok := c.takeDrops(); !ok || len(d.topics) != 0 {
+		t.Fatalf("a dropped full resync = %+v %v, want one for everyone", d, ok)
 	}
 }

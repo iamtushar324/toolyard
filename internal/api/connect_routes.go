@@ -352,7 +352,10 @@ type keyedLock struct {
 // lock blocks until key is free and returns its unlock.
 func (k *keyedMutex) lock(key string) func() {
 	if k.cluster.MultiNode() {
-		unlock, err := k.cluster.Lock(context.Background(), "connect-t3:"+key)
+		// Bounded: one connect takes a few round trips to Clerk.
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		unlock, err := k.cluster.Lock(ctx, "connect-t3:"+key)
+		cancel()
 		if err == nil {
 			return unlock
 		}

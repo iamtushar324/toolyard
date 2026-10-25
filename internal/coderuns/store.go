@@ -37,9 +37,9 @@ func (s *Service) insertRun(ctx context.Context, r *Run) error {
 	// a lease it renews (RunLeaseRenewal).
 	_, err := s.db.ExecContext(ctx, `INSERT INTO code_runs
 		(id, agent_id, session_id, idempotency_key, fingerprint, code, reason, status, created_at, updated_at, owner_instance, lease_until)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, `+cluster.LeaseUntilSQL(s.db.Dialect)+`)`,
 		r.ID, r.AgentID, nullStr(r.SessionID), nullStr(r.IdempotencyKey), r.Fingerprint, r.code, r.Reason, r.Status, r.CreatedAt, r.UpdatedAt,
-		s.cluster.InstanceID(), cluster.LeaseUntil(s.now()))
+		s.cluster.InstanceID())
 	return err
 }
 
@@ -132,8 +132,9 @@ func (s *Service) loadCalls(ctx context.Context, runID string) ([]Call, error) {
 
 // markRunning moves a queued run to running.
 func (s *Service) markRunning(ctx context.Context, id string) error {
-	_, err := s.db.ExecContext(ctx, `UPDATE code_runs SET status = ?, updated_at = ?, owner_instance = ?, lease_until = ? WHERE id = ? AND status = ?`,
-		StatusRunning, s.now().UnixMilli(), s.cluster.InstanceID(), cluster.LeaseUntil(s.now()), id, StatusQueued)
+	_, err := s.db.ExecContext(ctx, `UPDATE code_runs SET status = ?, updated_at = ?, owner_instance = ?, lease_until = `+cluster.LeaseUntilSQL(s.db.Dialect)+`
+		WHERE id = ? AND status = ?`,
+		StatusRunning, s.now().UnixMilli(), s.cluster.InstanceID(), id, StatusQueued)
 	return err
 }
 
@@ -144,8 +145,8 @@ func (s *Service) claimResume(ctx context.Context, r *Run) (bool, error) {
 	defer cancel()
 	now := s.now().UnixMilli()
 	res, err := s.db.ExecContext(ctx, `UPDATE code_runs SET status = ?, error_kind = NULL, error_message = NULL, finished_at = NULL, updated_at = ?,
-		owner_instance = ?, lease_until = ?
-		WHERE id = ? AND agent_id = ? AND status = ?`, StatusRunning, now, s.cluster.InstanceID(), cluster.LeaseUntil(s.now()), r.ID, r.AgentID, r.Status)
+		owner_instance = ?, lease_until = `+cluster.LeaseUntilSQL(s.db.Dialect)+`
+		WHERE id = ? AND agent_id = ? AND status = ?`, StatusRunning, now, s.cluster.InstanceID(), r.ID, r.AgentID, r.Status)
 	if err != nil {
 		return false, err
 	}
@@ -270,25 +271,26 @@ func (s *Service) finish(ctx context.Context, run *Run, rr *codemode.RunResult, 
 // Recover settles the runs a stopped process left behind: queued runs
 // failed with kind interrupted (their script never started), running runs
 // outcome_unknown with kind interrupted (a tool call may have run). Call
-// it at startup, before the routes serve, and on a multi-node database
-// periodically on the leader. With a single node every queued or running
-// run belongs to a stopped process; on a multi-node database (SetCluster)
-// it takes only runs whose lease ended (or that have none), so it never
-// touches the live runs of another node, nor of this one.
+// it at startup, before the routes serve, on a single node: every queued
+// or running run then belongs to a stopped process. On a multi-node
+// database (SetCluster) only the leader calls it, one lease after it took
+// over, and it takes only runs whose lease ended by the database's clock
+// (or that have none), so it never touches the live runs of another node,
+// nor of this one.
 func (s *Service) Recover(ctx context.Context) (failed, unknown int64, err error) {
 	now := s.now().UnixMilli()
-	expired, args := "", []any(nil)
+	expired := ""
 	if s.cluster.MultiNode() {
-		expired, args = ` AND (lease_until IS NULL OR lease_until < ?)`, []any{now}
+		expired = ` AND ` + cluster.LeaseEndedSQL(s.db.Dialect, "lease_until")
 	}
 	res, err := s.db.ExecContext(ctx, `UPDATE code_runs SET status = ?, error_kind = ?, error_message = ?, updated_at = ?, finished_at = ? WHERE status = ?`+expired,
-		append([]any{codemode.StatusFailed, ErrorInterrupted, msgInterruptedQueued, now, now, StatusQueued}, args...)...)
+		codemode.StatusFailed, ErrorInterrupted, msgInterruptedQueued, now, now, StatusQueued)
 	if err != nil {
 		return 0, 0, err
 	}
 	failed, _ = res.RowsAffected()
 	res, err = s.db.ExecContext(ctx, `UPDATE code_runs SET status = ?, error_kind = ?, error_message = ?, updated_at = ?, finished_at = ? WHERE status = ?`+expired,
-		append([]any{codemode.StatusOutcomeUnknown, ErrorInterrupted, msgInterruptedRunning, now, now, StatusRunning}, args...)...)
+		codemode.StatusOutcomeUnknown, ErrorInterrupted, msgInterruptedRunning, now, now, StatusRunning)
 	if err != nil {
 		return failed, 0, err
 	}

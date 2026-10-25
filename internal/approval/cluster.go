@@ -35,11 +35,14 @@ func (b *Bus) SetCluster(c *cluster.Cluster) {
 		return
 	}
 	c.Subscribe(wakeTopic, func(id string) {
-		if id == cluster.Resync || id == wakeAll {
+		switch id {
+		case cluster.Resync:
+			// Holds poll the database every holdPoll; nothing to wake.
+		case wakeAll:
 			b.signalAllLocal()
-			return
+		default:
+			b.signalLocal(id)
 		}
-		b.signalLocal(id)
 	})
 }
 
@@ -69,12 +72,6 @@ func (b *Bus) signalAllLocal() {
 	}
 }
 
-// claimArgs are the owner_instance and lease_until values of a claim this
-// node takes now.
-func (b *Bus) claimArgs() (string, int64) {
-	return b.cluster.InstanceID(), cluster.LeaseUntil(time.Now())
-}
-
 // RunLeaseRenewal renews the leases of the execution claims this node
 // holds until ctx ends. Every node runs it (not a leader task): each
 // renews only its own claims. Without a multi-node cluster it returns at
@@ -84,8 +81,8 @@ func (b *Bus) RunLeaseRenewal(ctx context.Context) {
 		return
 	}
 	cluster.RenewLeases(ctx, LeaseRenewalLoop, func(ctx context.Context) error {
-		_, err := b.db.ExecContext(ctx, `UPDATE legacy_execution_claims SET lease_until=? WHERE owner_instance=? AND state='running'`,
-			cluster.LeaseUntil(time.Now()), b.cluster.InstanceID())
+		_, err := b.cluster.ExecReserved(ctx, `UPDATE legacy_execution_claims SET lease_until=`+cluster.LeaseUntilSQL(b.db.Dialect)+
+			` WHERE owner_instance=? AND state='running'`, b.cluster.InstanceID())
 		return err
 	})
 }

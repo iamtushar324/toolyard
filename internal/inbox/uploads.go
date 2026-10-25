@@ -689,6 +689,11 @@ func (s *Service) sweepUploads(ctx context.Context) {
 	for _, u := range stale {
 		s.sweepUploadLocked(ctx, u.sha, u.agent, cutoff, touchCutoff)
 	}
+	s.cleanUploadTemp()
+}
+
+// cleanUploadTemp removes this node's stale temporary upload files.
+func (s *Service) cleanUploadTemp() {
 	if b, ok := s.uploadStore(); ok {
 		if n := b.CleanTemp(staleTempAge); n > 0 {
 			log.Printf("inbox: removed %d stale temporary blob file(s)", n)

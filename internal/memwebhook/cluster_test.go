@@ -11,7 +11,7 @@ import (
 
 // On a multi-node database the worker requeues only a job whose lease
 // ended: a job another node's worker is still running stays running.
-func TestRecoverRunningKeepsLiveLease(t *testing.T) {
+func TestTwoNodeLeaseRecoverJobs(t *testing.T) {
 	storetest.SkipUnlessPostgres(t)
 	ing := &fakeIngester{available: true}
 	s := newService(t, ing)
@@ -33,7 +33,7 @@ func TestRecoverRunningKeepsLiveLease(t *testing.T) {
 		t.Fatal(err)
 	}
 	now := time.Now()
-	for id, lease := range map[string]int64{live.ID: cluster.LeaseUntil(now), dead.ID: now.Add(-time.Second).UnixMilli()} {
+	for id, lease := range map[string]int64{live.ID: now.Add(time.Hour).UnixMilli(), dead.ID: 1} {
 		if _, err := s.db.ExecContext(context.Background(), `UPDATE memory_webhook_jobs SET status=?, owner_instance=?, lease_until=? WHERE id=?`,
 			jobRunning, "node-2", lease, id); err != nil {
 			t.Fatal(err)

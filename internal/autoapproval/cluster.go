@@ -14,6 +14,7 @@ import (
 
 	"github.com/tusharbhardwaj/toolyard/internal/cluster"
 	"github.com/tusharbhardwaj/toolyard/internal/logx"
+	"github.com/tusharbhardwaj/toolyard/internal/settings"
 )
 
 const (
@@ -59,34 +60,25 @@ func rateBucketName(agentID string, now time.Time) string {
 	return "autoapproval:" + agentID + ":" + strconv.FormatInt(now.Truncate(time.Hour).UnixMilli(), 10)
 }
 
-// sharedRate returns the agent's auto-approvals this hour from the shared
-// budget, and false when there is none (a single node) or it cannot be
-// read: the in-process count then applies.
-func (s *Service) sharedRate(agentID string, now time.Time) (int, bool) {
-	if s.shared == nil {
-		return 0, false
+// takeSharedBudget takes one auto-approval from the agent's shared hourly
+// budget, in one conditional increment, and reports whether it did. When
+// the budget cannot be read the call goes to a person: a database fault
+// never grants more auto-approvals than the cap.
+func (s *Service) takeSharedBudget(agentID string) bool {
+	if s.settings == nil {
+		return true
+	}
+	cap := s.settings.GetInt(settings.AutoApprovalRateLimitPerHour, 100)
+	if cap <= 0 {
+		return true
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), rateTimeout)
 	defer cancel()
-	n, err := s.shared.Count(ctx, rateBucketName(agentID, now))
+	now := time.Now()
+	ok, err := s.shared.Allow(ctx, rateBucketName(agentID, now), cap, 2*time.Hour, now)
 	if err != nil {
-		logx.For("autoapproval").Warn("autoapproval: reading the shared budget failed; counting in process", "err", err.Error())
-		return 0, false
-	}
-	return n, true
-}
-
-// addSharedRate counts one auto-approval in the shared budget and reports
-// whether it did.
-func (s *Service) addSharedRate(ctx context.Context, agentID string, now time.Time) bool {
-	if s.shared == nil {
+		logx.For("autoapproval").Warn("autoapproval: the shared budget cannot be read; the call waits for a person", "err", err.Error())
 		return false
 	}
-	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), rateTimeout)
-	defer cancel()
-	if err := s.shared.Add(ctx, rateBucketName(agentID, now), now, now.Truncate(time.Hour).Add(2*time.Hour)); err != nil {
-		logx.For("autoapproval").Warn("autoapproval: counting in the shared budget failed; counting in process", "err", err.Error())
-		return false
-	}
-	return true
+	return ok
 }

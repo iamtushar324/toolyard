@@ -2,6 +2,7 @@ package approval
 
 import (
 	"context"
+	"database/sql"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -11,12 +12,12 @@ import (
 	"github.com/tusharbhardwaj/toolyard/internal/store/storetest"
 )
 
-// twoBuses is two replicas' buses on one Postgres database.
+// twoBuses is two replicas' buses, each on its own pool, on one Postgres
+// database. It returns node 1's pool.
 func twoBuses(t *testing.T) (*Bus, *Bus, *store.DB) {
 	t.Helper()
-	storetest.SkipUnlessPostgres(t)
-	db := storetest.Open(t)
-	mk := func(id string) *Bus {
+	db1, db2 := storetest.OpenPostgresPair(t)
+	mk := func(db *store.DB, id string) *Bus {
 		ctx, cancel := context.WithCancel(context.Background())
 		c, err := cluster.New(ctx, db, cluster.Options{InstanceID: id, ResyncInterval: -1})
 		if err != nil {
@@ -34,13 +35,13 @@ func twoBuses(t *testing.T) (*Bus, *Bus, *store.DB) {
 		b.SetCluster(c)
 		return b
 	}
-	return mk("node-1"), mk("node-2"), db
+	return mk(db1, "node-1"), mk(db2, "node-2"), db1
 }
 
 // A rolling restart of node 1 (its startup recovery, SweepUnexecuted) does
 // not touch node 2's running legacy execution and never runs it again; a
 // claim whose owner stopped (lease ended) becomes outcome_unknown.
-func TestRollingRestartKeepsOtherNodesClaims(t *testing.T) {
+func TestTwoNodeLeaseRollingRestartKeepsClaims(t *testing.T) {
 	bus1, bus2, db := twoBuses(t)
 	ctx := context.Background()
 
@@ -74,7 +75,7 @@ func TestRollingRestartKeepsOtherNodesClaims(t *testing.T) {
 		t.Fatal(err)
 	}
 	if _, err := db.ExecContext(ctx, `INSERT INTO legacy_execution_claims(request_id,state,claimed_at,owner_instance,lease_until) VALUES(?,'running',?,?,?)`,
-		dead.ID, time.Now().Add(-2*time.Minute).UnixMilli(), "node-dead", time.Now().Add(-time.Minute).UnixMilli()); err != nil {
+		dead.ID, time.Now().Add(-2*time.Minute).UnixMilli(), "node-dead", int64(1)); err != nil {
 		t.Fatal(err)
 	}
 
@@ -116,7 +117,7 @@ func TestRollingRestartKeepsOtherNodesClaims(t *testing.T) {
 }
 
 // An in-line Hold on node 1 wakes when node 2 decides.
-func TestHoldWakesOnOtherNodesDecision(t *testing.T) {
+func TestTwoNodeHoldWakesOnDecision(t *testing.T) {
 	bus1, bus2, _ := twoBuses(t)
 	ctx := context.Background()
 	type result struct {
@@ -160,7 +161,7 @@ func TestHoldWakesOnOtherNodesDecision(t *testing.T) {
 
 // The in-line auto-approval path claims the execution, so a recovery
 // sweep never runs it a second time.
-func TestInlineAutoApprovalIsClaimed(t *testing.T) {
+func TestClusterInlineAutoApprovalIsClaimed(t *testing.T) {
 	bus := newTestBus(t)
 	bus.SetAutoApprover(alwaysAuto{})
 	ctx := context.Background()
@@ -184,5 +185,73 @@ func TestInlineAutoApprovalIsClaimed(t *testing.T) {
 	// A single node's sweep treats the claim as a stopped process's.
 	if cur.ExecutionState != "outcome_unknown" {
 		t.Fatalf("execution state %q, want outcome_unknown", cur.ExecutionState)
+	}
+}
+
+// P0: the in-line auto-approval commits the decision and its claim
+// together, so another node's recovery sweep that runs between the two
+// steps sees the request still pending, and never runs the call that the
+// in-line caller runs.
+func TestTwoNodeInlineClaimRace(t *testing.T) {
+	bus1, bus2, _ := twoBuses(t)
+	ctx := context.Background()
+	var ran atomic.Int32
+	bus2.SetExecutor(execFunc(func(ctx context.Context, r *Request) {
+		ran.Add(1)
+		_ = bus2.SetResult(ctx, r.ID, `{"is_error":false}`, false, "")
+	}))
+	bus1.SetAutoApprover(alwaysAuto{})
+	var swept atomic.Int32
+	beforeInlineClaim = func(_ *sql.Tx, id string) {
+		// Node 2's leader runs its sweep now, between node 1's decision
+		// and its claim.
+		n, err := bus2.SweepUnexecuted(ctx)
+		if err != nil {
+			t.Errorf("sweep between the steps: %v", err)
+		}
+		swept.Add(int32(n))
+	}
+	t.Cleanup(func() { beforeInlineClaim = nil })
+	req, err := bus1.Hold(ctx, NewRequest{AgentID: "a", UpstreamName: "u", ToolName: "t.write", Arguments: map[string]any{"x": 1}}, 0)
+	if err != nil || req.Status != StatusAllowed || req.ExecutionState != "running" {
+		t.Fatalf("hold: %+v %v", req, err)
+	}
+	beforeInlineClaim = nil
+	// And any later sweep, on either node.
+	for _, b := range []*Bus{bus1, bus2} {
+		n, err := b.SweepUnexecuted(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		swept.Add(int32(n))
+	}
+	time.Sleep(100 * time.Millisecond)
+	if swept.Load() != 0 || ran.Load() != 0 {
+		t.Fatalf("a sweep started %d executor(s), %d ran: the in-line call would run twice", swept.Load(), ran.Load())
+	}
+}
+
+// When the claim cannot be written the in-line allow is not made: the
+// request stays pending for a person and the caller does not dispatch.
+func TestClusterInlineClaimTakenStaysPending(t *testing.T) {
+	bus := newTestBus(t)
+	bus.SetAutoApprover(alwaysAuto{})
+	ctx := context.Background()
+	beforeInlineClaim = func(tx *sql.Tx, id string) {
+		if _, err := tx.ExecContext(ctx, `INSERT INTO legacy_execution_claims(request_id,state,claimed_at) VALUES(?,'running',?)`, id, time.Now().UnixMilli()); err != nil {
+			t.Errorf("pre-claim: %v", err)
+		}
+	}
+	t.Cleanup(func() { beforeInlineClaim = nil })
+	req, err := bus.Hold(ctx, NewRequest{AgentID: "a", UpstreamName: "u", ToolName: "t.taken", Arguments: map[string]any{"x": 2}}, 0)
+	if err != nil {
+		t.Fatalf("hold: %v", err)
+	}
+	if req.Status != StatusPending {
+		t.Fatalf("status %q, want pending: an allow without its claim was committed", req.Status)
+	}
+	var claims int
+	if err := bus.db.QueryRowContext(ctx, `SELECT count(*) FROM legacy_execution_claims WHERE request_id = ?`, req.ID).Scan(&claims); err != nil || claims != 0 {
+		t.Fatalf("claims %d %v: the rolled-back claim stayed", claims, err)
 	}
 }

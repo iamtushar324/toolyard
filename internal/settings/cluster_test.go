@@ -6,14 +6,14 @@ import (
 	"time"
 
 	"github.com/tusharbhardwaj/toolyard/internal/cluster"
+	"github.com/tusharbhardwaj/toolyard/internal/store"
 	"github.com/tusharbhardwaj/toolyard/internal/store/storetest"
 )
 
 // A setting saved through node 1 is read on node 2 within moments.
-func TestSettingReachesOtherNode(t *testing.T) {
-	storetest.SkipUnlessPostgres(t)
-	db := storetest.Open(t)
-	node := func(id string) *Service {
+func TestTwoNodeSetting(t *testing.T) {
+	db1, db2 := storetest.OpenPostgresPair(t)
+	node := func(db *store.DB, id string) *Service {
 		ctx, cancel := context.WithCancel(context.Background())
 		c, err := cluster.New(ctx, db, cluster.Options{InstanceID: id, ResyncInterval: -1})
 		if err != nil {
@@ -31,7 +31,7 @@ func TestSettingReachesOtherNode(t *testing.T) {
 		s.SetCluster(c)
 		return s
 	}
-	node1, node2 := node("node-1"), node("node-2")
+	node1, node2 := node(db1, "node-1"), node(db2, "node-2")
 	ctx := context.Background()
 	if got := node2.GetString(ApprovalMode, "unset"); got != "unset" {
 		t.Fatalf("before: %q", got)

@@ -716,12 +716,14 @@ func (t *loginThrottle) Allow(key string) bool {
 
 // AllowN is the variant for callers that want to specify max + window per
 // call (e.g. different rate limits per route from one shared bucket store).
+//
+// With a shared counter the in-process count still runs first: it counts
+// only this replica's allowed requests, so when it has reached max the
+// shared count has too, and the request is refused without a database
+// write (a flood stays local). Otherwise the shared counter decides, and
+// an allowed request is counted here as well.
 func (t *loginThrottle) AllowN(key string, max int, window time.Duration) bool {
-	if allowed, ok := t.sharedAllow(key, max, window); ok {
-		return allowed
-	}
 	t.mu.Lock()
-	defer t.mu.Unlock()
 	b := t.buckets[key]
 	now := time.Now()
 	if b == nil || now.Sub(b.since) > window {
@@ -729,6 +731,24 @@ func (t *loginThrottle) AllowN(key string, max int, window time.Duration) bool {
 		t.buckets[key] = b
 	}
 	if b.count >= max {
+		t.mu.Unlock()
+		return false
+	}
+	if t.shared.Load() == nil {
+		b.count++
+		t.mu.Unlock()
+		return true
+	}
+	t.mu.Unlock()
+	allowed, ok := t.sharedAllow(key, max, window)
+	if ok && !allowed {
+		return false
+	}
+	// Allowed by the shared counter, or it failed and the in-process
+	// count decides alone.
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if b.count >= max && !ok {
 		return false
 	}
 	b.count++

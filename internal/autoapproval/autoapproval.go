@@ -147,10 +147,14 @@ func (s *Service) reload(ctx context.Context) error {
 		}
 		out = append(out, r)
 	}
+	// A read that stopped half-way keeps the last good cache.
+	if err := rows.Err(); err != nil {
+		return err
+	}
 	s.mu.Lock()
 	s.cache = out
 	s.mu.Unlock()
-	return rows.Err()
+	return nil
 }
 
 // Match returns the first enabled rule that allows the supplied request, or
@@ -175,10 +179,24 @@ func (s *Service) matchRule(agentID, toolName, fingerprint string, isDestructive
 	if s.settings != nil && !s.settings.GetBool(settings.AutoApprovalEnabled) {
 		return nil
 	}
+	if s.shared != nil {
+		// Several replicas: the matching rule takes one unit of the
+		// shared budget in one conditional increment (cluster.go).
+		r := s.findRule(agentID, toolName, fingerprint)
+		if r == nil || !s.takeSharedBudget(agentID) {
+			return nil
+		}
+		return r
+	}
 	if !s.allowedByRate(agentID) {
 		return nil
 	}
+	return s.findRule(agentID, toolName, fingerprint)
+}
 
+// findRule returns the first enabled, unexpired rule, in static → pattern
+// → tool order, that allows the call.
+func (s *Service) findRule(agentID, toolName, fingerprint string) *Rule {
 	now := time.Now().UnixMilli()
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -243,9 +261,6 @@ func (s *Service) allowedByRate(agentID string) bool {
 		return true
 	}
 	now := time.Now()
-	if n, ok := s.sharedRate(agentID, now); ok {
-		return n < cap
-	}
 	hourStart := now.Truncate(time.Hour).UnixMilli()
 	s.rateMu.Lock()
 	defer s.rateMu.Unlock()
@@ -275,8 +290,8 @@ func (s *Service) MarkHit(ctx context.Context, ruleID, agentID string) {
 	}
 	s.mu.Unlock()
 
-	if s.addSharedRate(ctx, agentID, time.Now()) {
-		return
+	if s.shared != nil {
+		return // counted by takeSharedBudget when the rule matched
 	}
 	hourStart := time.Now().Truncate(time.Hour).UnixMilli()
 	s.rateMu.Lock()

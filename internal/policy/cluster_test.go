@@ -50,7 +50,7 @@ func waitDecision(t *testing.T, e *Engine, req Request, want Action) {
 
 // A deny written through node 1 is enforced by node 2 within seconds, and
 // so is its removal.
-func TestDenyPolicySpansNodes(t *testing.T) {
+func TestTwoNodeDenyPolicy(t *testing.T) {
 	storetest.SkipUnlessPostgres(t)
 	url := storetest.NewPostgresDatabase(t)
 	node1 := openNode(t, url, "node-1")
@@ -85,7 +85,7 @@ func TestDenyPolicySpansNodes(t *testing.T) {
 
 // Writes from two nodes take turns: a guarded Change judges the rules the
 // other node wrote a moment before.
-func TestChangeSeesOtherNodesWrite(t *testing.T) {
+func TestTwoNodePolicyChange(t *testing.T) {
 	storetest.SkipUnlessPostgres(t)
 	url := storetest.NewPostgresDatabase(t)
 	node1 := openNode(t, url, "node-1")

@@ -26,8 +26,8 @@ func (s *Service) RunLeaseRenewal(ctx context.Context) {
 		return
 	}
 	cluster.RenewLeases(ctx, LeaseRenewalLoop, func(ctx context.Context) error {
-		_, err := s.db.ExecContext(ctx, `UPDATE code_runs SET lease_until = ? WHERE owner_instance = ? AND status IN (?, ?)`,
-			cluster.LeaseUntil(s.now()), s.cluster.InstanceID(), StatusQueued, StatusRunning)
+		_, err := s.cluster.ExecReserved(ctx, `UPDATE code_runs SET lease_until = `+cluster.LeaseUntilSQL(s.db.Dialect)+
+			` WHERE owner_instance = ? AND status IN (?, ?)`, s.cluster.InstanceID(), StatusQueued, StatusRunning)
 		return err
 	})
 }

@@ -324,7 +324,16 @@ func (b *Bus) Hold(ctx context.Context, in NewRequest, maxWait time.Duration) (*
 	for {
 		select {
 		case <-w.done:
-			return b.Get(ctx, req.ID)
+			cur, err := b.Get(ctx, req.ID)
+			if err != nil || b.settled(cur) {
+				return cur, err
+			}
+			// A wake-up for everyone (an expiry sweep) found this request
+			// still open: wait again on a fresh signal.
+			w = &pending{req: req, done: make(chan struct{})}
+			b.mu.Lock()
+			b.waiters[req.ID] = w
+			b.mu.Unlock()
 		case <-poll:
 			if cur, err := b.Get(ctx, req.ID); err == nil && b.settled(cur) {
 				return cur, nil
@@ -648,17 +657,30 @@ func (b *Bus) decide(ctx context.Context, id, action string, d actor.Decider, ru
 			return existing, ErrNotPending
 		}
 	}
-	res, err := b.db.ExecContext(ctx,
-		`UPDATE approval_requests SET status = ?, decided_by = ?, decided_at = ?,
+	const update = `UPDATE approval_requests SET status = ?, decided_by = ?, decided_at = ?,
             decided_via = ?, decider_email = ?, decider_name = ?, decider_ref = ?
-         WHERE id = ? AND status = ? AND (? = 0 OR expires_at > ?)`,
-		action, d.Legacy(), time.Now().UnixMilli(),
+         WHERE id = ? AND status = ? AND (? = 0 OR expires_at > ?)`
+	updateArgs := []any{action, d.Legacy(), time.Now().UnixMilli(),
 		nullStr(d.Via), nullStr(d.Email), nullStr(d.Name), nullStr(d.Ref),
-		id, StatusPending, boolInt(personal), time.Now().UnixMilli())
-	if err != nil {
-		return nil, err
+		id, StatusPending, boolInt(personal), time.Now().UnixMilli()}
+	var n int64
+	if action == StatusAllowed && !runExec {
+		// The caller dispatches this call itself (Hold's auto-approval).
+		// The decision and its execution claim commit together, so no
+		// recovery sweep (another node's, or this one's next start) ever
+		// sees the request allowed and unclaimed and runs it a second time.
+		// When the claim cannot be written, nothing is decided: the request
+		// stays pending for a person.
+		if n, err = b.decideClaimed(ctx, id, update, updateArgs); err != nil {
+			return nil, err
+		}
+	} else {
+		res, err := b.db.ExecContext(ctx, update, updateArgs...)
+		if err != nil {
+			return nil, err
+		}
+		n, _ = res.RowsAffected()
 	}
-	n, _ := res.RowsAffected()
 	if n == 0 {
 		existing, getErr := b.Get(ctx, id)
 		if getErr != nil {
@@ -678,27 +700,49 @@ func (b *Bus) decide(ctx context.Context, id, action string, d actor.Decider, ru
 		b.startExecutor(req)
 		return req, nil
 	}
-	if action == StatusAllowed && !runExec {
-		// The caller dispatches this call itself (Hold's auto-approval).
-		// Claim it now, so a recovery sweep (another node's, or this one's
-		// next start) records it outcome_unknown instead of running the
-		// executor for it a second time.
-		b.claimInline(ctx, req)
-	}
 	b.signal(id)
 	return req, nil
 }
 
-// claimInline records the execution claim of a call its caller dispatches
-// in line, held by this node under a lease (RunLeaseRenewal).
-func (b *Bus) claimInline(ctx context.Context, req *Request) {
-	owner, lease := b.claimArgs()
-	if _, err := b.db.ExecContext(context.WithoutCancel(ctx), `INSERT INTO legacy_execution_claims(request_id,state,claimed_at,owner_instance,lease_until) VALUES(?,'running',?,?,?) ON CONFLICT(request_id) DO NOTHING`,
-		req.ID, time.Now().UnixMilli(), owner, lease); err != nil {
-		logx.For("approval").Error("in-line execution claim failed", "approval_id", req.ID, "err", err.Error())
-		return
+// errInlineClaim refuses an in-line allow whose execution claim another
+// caller already holds.
+var errInlineClaim = errors.New("approval: the execution claim is taken")
+
+// beforeInlineClaim, when set (tests), runs inside decideClaimed's
+// transaction after the decision and before the claim.
+var beforeInlineClaim func(tx *sql.Tx, id string)
+
+// decideClaimed applies an in-line allow (update, with updateArgs) and
+// writes its execution claim, held by this node under a lease
+// (RunLeaseRenewal), in one transaction. It returns how many requests the
+// update decided (0: no longer pending); a claim that cannot be written
+// rolls the decision back and is an error.
+func (b *Bus) decideClaimed(ctx context.Context, id, update string, updateArgs []any) (int64, error) {
+	tx, err := b.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
 	}
-	req.ExecutionState = "running"
+	defer func() { _ = tx.Rollback() }()
+	res, err := tx.ExecContext(ctx, update, updateArgs...)
+	if err != nil {
+		return 0, err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return 0, nil
+	}
+	if beforeInlineClaim != nil {
+		beforeInlineClaim(tx, id)
+	}
+	res, err = tx.ExecContext(ctx, `INSERT INTO legacy_execution_claims(request_id,state,claimed_at,owner_instance,lease_until)
+		VALUES(?,'running',?,?,`+cluster.LeaseUntilSQL(b.db.Dialect)+`) ON CONFLICT(request_id) DO NOTHING`,
+		id, time.Now().UnixMilli(), b.cluster.InstanceID())
+	if err != nil {
+		return 0, fmt.Errorf("in-line execution claim: %w", err)
+	}
+	if n, _ := res.RowsAffected(); n != 1 {
+		return 0, errInlineClaim
+	}
+	return 1, tx.Commit()
 }
 
 // DispatchCommitted releases a legacy decision committed by Inbox.
@@ -738,8 +782,9 @@ func (b *Bus) startExecutor(req *Request) {
 // outcome_unknown result if the executor returns without persisting one.
 func (b *Bus) runExecutor(req *Request) {
 	lg := logx.For("approval")
-	owner, lease := b.claimArgs()
-	res, err := b.db.ExecContext(b.execCtx, `INSERT INTO legacy_execution_claims(request_id,state,claimed_at,owner_instance,lease_until) VALUES(?,'running',?,?,?) ON CONFLICT(request_id) DO NOTHING`, req.ID, time.Now().UnixMilli(), owner, lease)
+	res, err := b.db.ExecContext(b.execCtx, `INSERT INTO legacy_execution_claims(request_id,state,claimed_at,owner_instance,lease_until)
+		VALUES(?,'running',?,?,`+cluster.LeaseUntilSQL(b.db.Dialect)+`) ON CONFLICT(request_id) DO NOTHING`,
+		req.ID, time.Now().UnixMilli(), b.cluster.InstanceID())
 	if err != nil {
 		lg.Error("legacy execution claim failed", "approval_id", req.ID, "err", err.Error())
 		return
@@ -918,12 +963,10 @@ func (b *Bus) SweepUnexecuted(ctx context.Context) (int, error) {
 	// process's; on a multi-node database only a claim whose lease ended
 	// is (a live node renews its own).
 	q := `UPDATE legacy_execution_claims SET state='outcome_unknown',reason='Process stopped after dispatch claim; do not repeat' WHERE state='running'`
-	var args []any
 	if b.multiNode() {
-		q += ` AND (lease_until IS NULL OR lease_until < ?)`
-		args = append(args, time.Now().UnixMilli())
+		q += ` AND ` + cluster.LeaseEndedSQL(b.db.Dialect, "lease_until")
 	}
-	if _, err := b.db.ExecContext(ctx, q, args...); err != nil {
+	if _, err := b.db.ExecContext(ctx, q); err != nil {
 		return 0, err
 	}
 
@@ -951,11 +994,15 @@ func (b *Bus) SweepUnexecuted(ctx context.Context) (int, error) {
 	if b.exec == nil {
 		return 0, nil
 	}
+	// An auto-rule decision is dispatched in line by Hold's caller, under
+	// a claim written with the decision: never run it here, even when an
+	// older binary left one without a claim.
 	rows, err := b.db.QueryContext(ctx,
 		`SELECT `+requestSelectColumns+`
          FROM approval_requests
          WHERE status = ? AND result_executed_at IS NULL AND id NOT IN (SELECT request_id FROM legacy_execution_claims)
-         ORDER BY decided_at ASC`, StatusAllowed)
+           AND COALESCE(decided_via, '') <> ?
+         ORDER BY decided_at ASC`, StatusAllowed, actor.ViaAutoRule)
 	if err != nil {
 		return 0, err
 	}
@@ -1387,36 +1434,15 @@ func (b *Bus) verifyToken(token string) (tokenClaims, error) {
 }
 
 func loadOrCreateSigningKey(ctx context.Context, db *store.DB) (ed25519.PrivateKey, ed25519.PublicKey, error) {
-	row := db.QueryRowContext(ctx,
-		`SELECT private_key, public_key FROM server_keys WHERE purpose = ?`, signingKeyPurpose)
-	var priv, pub []byte
-	err := row.Scan(&priv, &pub)
-	if err == nil {
-		return ed25519.PrivateKey(priv), ed25519.PublicKey(pub), nil
-	}
-	if !errors.Is(err, sql.ErrNoRows) {
-		return nil, nil, err
-	}
-	pubKey, privKey, err := ed25519.GenerateKey(rand.Reader)
+	// One key for every replica, also when two start on a new database.
+	priv, pub, err := store.LoadOrCreateServerKey(ctx, db, signingKeyPurpose, func() ([]byte, []byte, error) {
+		pubKey, privKey, err := ed25519.GenerateKey(rand.Reader)
+		return []byte(privKey), []byte(pubKey), err
+	})
 	if err != nil {
 		return nil, nil, err
 	}
-	if _, err := db.ExecContext(ctx,
-		`INSERT INTO server_keys(id, purpose, private_key, public_key, created_at) VALUES(?,?,?,?,?)`,
-		"key_"+uuid.NewString(), signingKeyPurpose, []byte(privKey), []byte(pubKey),
-		time.Now().UnixMilli()); err != nil {
-		if store.IsUniqueViolation(err) {
-			// Another replica starting on the same new database stored
-			// its key first: every node must sign with that one.
-			if err := db.QueryRowContext(ctx,
-				`SELECT private_key, public_key FROM server_keys WHERE purpose = ?`, signingKeyPurpose).Scan(&priv, &pub); err != nil {
-				return nil, nil, err
-			}
-			return ed25519.PrivateKey(priv), ed25519.PublicKey(pub), nil
-		}
-		return nil, nil, err
-	}
-	return privKey, pubKey, nil
+	return ed25519.PrivateKey(priv), ed25519.PublicKey(pub), nil
 }
 
 func nullStr(s string) any {

@@ -40,8 +40,7 @@ func (s *Service) subscribeCluster() {
 	}
 	s.opts.Cluster.Subscribe(wakeTopic, func(id string) {
 		if id == cluster.Resync {
-			s.wakeAllLocal()
-			return
+			return // every Wait polls the database every waitPoll
 		}
 		s.wakeLocal(id)
 	})
@@ -59,17 +58,6 @@ func (s *Service) RequestClusterLegacySync() {
 	s.RequestLegacySync()
 	if s.multiNode() {
 		_ = s.opts.Cluster.Publish(context.Background(), legacySyncTopic, "sync")
-	}
-}
-
-// wakeAllLocal wakes every waiter of this node.
-func (s *Service) wakeAllLocal() {
-	s.watchMu.Lock()
-	chans := s.watch
-	s.watch = map[string]chan struct{}{}
-	s.watchMu.Unlock()
-	for _, c := range chans {
-		close(c)
 	}
 }
 
@@ -106,9 +94,34 @@ func (s *Service) RunLeaseRenewal(ctx context.Context) {
 	cluster.RenewLeases(ctx, LeaseRenewalLoop, s.renewLeases)
 }
 
-// renewLeases extends the lease of every running execution this node owns.
+// renewLeases extends the lease of every running execution this node
+// owns, on the cluster's reserved connection.
 func (s *Service) renewLeases(ctx context.Context) error {
-	_, err := s.db.ExecContext(ctx, `UPDATE inbox_executions SET lease_until=? WHERE owner_instance=? AND state=?`,
-		cluster.LeaseUntil(s.now()), s.instance(), ExecutionRunning)
+	_, err := s.opts.Cluster.ExecReserved(ctx, `UPDATE inbox_executions SET lease_until=`+cluster.LeaseUntilSQL(s.db.Dialect)+
+		` WHERE owner_instance=? AND state=?`, s.instance(), ExecutionRunning)
 	return err
+}
+
+// TempCleanupLoop names RunTempCleanup in the supervised loop.
+const TempCleanupLoop = "inbox-temp-cleanup"
+
+// RunTempCleanup removes this node's stale temporary upload files every
+// hour until ctx ends. Each replica has its own temporary directory, so
+// every node runs it (the upload sweep, on the leader, cleans only the
+// leader's). Without a multi-node cluster it returns at once: the sweep
+// covers the one node.
+func (s *Service) RunTempCleanup(ctx context.Context) {
+	if !s.multiNode() {
+		return
+	}
+	t := time.NewTicker(time.Hour)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+			s.cleanUploadTemp()
+		}
+	}
 }

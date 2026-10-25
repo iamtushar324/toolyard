@@ -13,7 +13,6 @@ import (
 	"errors"
 	"fmt"
 	"strings"
-	"time"
 
 	"github.com/google/uuid"
 
@@ -113,24 +112,15 @@ type grantSigner struct {
 }
 
 func loadGrantSigner(ctx context.Context, db *store.DB) (*grantSigner, error) {
-	var priv, pub []byte
-	err := db.QueryRowContext(ctx, `SELECT private_key, public_key FROM server_keys WHERE purpose = ?`, grantKeyPurpose).Scan(&priv, &pub)
-	if err == nil {
-		return &grantSigner{priv: ed25519.PrivateKey(priv), pub: ed25519.PublicKey(pub)}, nil
-	}
-	if !errors.Is(err, sql.ErrNoRows) {
-		return nil, err
-	}
-	pubKey, privKey, err := ed25519.GenerateKey(rand.Reader)
+	// One key for every replica, also when two start on a new database.
+	priv, pub, err := store.LoadOrCreateServerKey(ctx, db, grantKeyPurpose, func() ([]byte, []byte, error) {
+		pubKey, privKey, err := ed25519.GenerateKey(rand.Reader)
+		return []byte(privKey), []byte(pubKey), err
+	})
 	if err != nil {
 		return nil, err
 	}
-	if _, err := db.ExecContext(ctx,
-		`INSERT INTO server_keys(id, purpose, private_key, public_key, created_at) VALUES(?,?,?,?,?)`,
-		"key_"+uuid.NewString(), grantKeyPurpose, []byte(privKey), []byte(pubKey), time.Now().UnixMilli()); err != nil {
-		return nil, err
-	}
-	return &grantSigner{priv: privKey, pub: pubKey}, nil
+	return &grantSigner{priv: ed25519.PrivateKey(priv), pub: ed25519.PublicKey(pub)}, nil
 }
 
 func grantMessage(id, agentID string) []byte {
@@ -256,7 +246,7 @@ func (s *Service) Redeem(ctx context.Context, token, agentID, tool string, args 
 	// The execution is this node's: it holds a lease it renews while the
 	// call runs (RunLeaseRenewal), so recovery never takes it from a live
 	// node.
-	if _, err = tx.ExecContext(ctx, `INSERT INTO inbox_executions(grant_id,request_id,call_id,agent_id,state,attempt_id,arguments,started_at,owner_instance,lease_until) VALUES(?,?,?,?,?,?,?,?,?,?)`, g.ID, g.RequestID, g.CallID, g.AgentID, ExecutionRunning, g.AttemptID, string(argsJSON), now, s.instance(), cluster.LeaseUntil(s.now())); err != nil {
+	if _, err = tx.ExecContext(ctx, `INSERT INTO inbox_executions(grant_id,request_id,call_id,agent_id,state,attempt_id,arguments,started_at,owner_instance,lease_until) VALUES(?,?,?,?,?,?,?,?,?,`+cluster.LeaseUntilSQL(s.db.Dialect)+`)`, g.ID, g.RequestID, g.CallID, g.AgentID, ExecutionRunning, g.AttemptID, string(argsJSON), now, s.instance()); err != nil {
 		return nil, err
 	}
 	if err = tx.Commit(); err != nil {

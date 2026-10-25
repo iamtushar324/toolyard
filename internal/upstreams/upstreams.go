@@ -765,17 +765,28 @@ func (s *Service) stdioRefused(srv Server) bool {
 // without tools and recorded as waiting for a first sign-in; that is not
 // a failure.
 func (s *Service) connect(ctx context.Context, srv Server) error {
+	return s.connectWith(ctx, srv, true)
+}
+
+// connectWith is connect; record false leaves the row's status alone (a
+// replica following another's change: the replica that saved the change
+// records the status, so last_status does not flip between replicas).
+func (s *Service) connectWith(ctx context.Context, srv Server, record bool) error {
 	s.applied[srv.Name] = configFingerprint(srv)
 	err := s.gw.AddUpstream(ctx, s.toCfg(srv))
 	if errors.Is(err, gateway.ErrWaitingForSignIn) {
-		s.recordStatus(ctx, srv.Name, gateway.StatusWaitingSignIn, "", 0)
+		if record {
+			s.recordStatus(ctx, srv.Name, gateway.StatusWaitingSignIn, "", 0)
+		}
 		s.gw.NotifyToolListChanged()
 		return nil
 	}
 	if err != nil {
 		return err
 	}
-	s.recordStatus(ctx, srv.Name, "ok", "", s.gw.UpstreamToolCount(srv.Name))
+	if record {
+		s.recordStatus(ctx, srv.Name, "ok", "", s.gw.UpstreamToolCount(srv.Name))
+	}
 	s.gw.NotifyToolListChanged()
 	return nil
 }
@@ -1053,6 +1064,11 @@ func (s *Service) Update(ctx context.Context, name string, patch Patch) (*Server
 	if isReservedBuiltin(name) {
 		return nil, ErrReserved
 	}
+	unlock, err := s.lockServer(ctx, name)
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -1167,6 +1183,11 @@ func (s *Service) ConvertEnvToSecret(ctx context.Context, serverName, envKey, se
 	if !secrets.ValidName(secretName) {
 		return nil, fmt.Errorf("%w: secret name must match ^[A-Z][A-Z0-9_]{0,63}$", ErrInvalid)
 	}
+	unlock, err := s.lockServer(ctx, serverName)
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 

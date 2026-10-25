@@ -48,14 +48,14 @@ func newNode(t *testing.T, db *store.DB, c *cluster.Cluster) *testEnv {
 	return e
 }
 
-// twoInboxNodes is two replicas on one Postgres database.
-func twoInboxNodes(t *testing.T) (*testEnv, *testEnv, *cluster.Cluster, *store.DB) {
+// twoInboxNodes is two replicas, each with its own pool, on one Postgres
+// database. It returns node 1's cluster and pool, and node 2's cluster.
+func twoInboxNodes(t *testing.T) (*testEnv, *testEnv, *cluster.Cluster, *store.DB, *cluster.Cluster) {
 	t.Helper()
-	storetest.SkipUnlessPostgres(t)
-	db := storetest.Open(t)
-	c1 := newClusterFor(t, db, "node-1")
-	c2 := newClusterFor(t, db, "node-2")
-	return newNode(t, db, c1), newNode(t, db, c2), c1, db
+	db1, db2 := storetest.OpenPostgresPair(t)
+	c1 := newClusterFor(t, db1, "node-1")
+	c2 := newClusterFor(t, db2, "node-2")
+	return newNode(t, db1, c1), newNode(t, db2, c2), c1, db1, c2
 }
 
 func executionState(t *testing.T, db *store.DB, grantID string) (state, owner string) {
@@ -70,11 +70,12 @@ func executionState(t *testing.T, db *store.DB, grantID string) (state, owner st
 	return state, owner
 }
 
-// A rolling restart of node 1 (its startup recovery runs) leaves node 2's
-// in-flight execution alone, and still settles the executions of a node
-// that stopped (lease ended) and of a pre-lease row.
-func TestRollingRestartKeepsOtherNodesExecutions(t *testing.T) {
-	_, node2, c1, db := twoInboxNodes(t)
+// A rolling restart of node 1 leaves node 2's in-flight execution alone:
+// the restarted node does not recover at start, and recovery (the
+// leader's) settles only the executions of a node that stopped (lease
+// ended) and pre-lease rows.
+func TestTwoNodeLeaseRollingRestartKeepsExecutions(t *testing.T) {
+	_, node2, c1, db, c2 := twoInboxNodes(t)
 	ctx := context.Background()
 
 	r := submitBatch(t, node2)
@@ -89,18 +90,19 @@ func TestRollingRestartKeepsOtherNodesExecutions(t *testing.T) {
 	if err != nil {
 		t.Fatalf("redeem on node 2: %v", err)
 	}
-	if state, owner := executionState(t, db, live.ID); state != ExecutionRunning || owner != "node-2" {
+	if state, owner := executionState(t, db, live.ID); state != ExecutionRunning || owner != c2.InstanceID() {
 		t.Fatalf("node 2's execution: state %q owner %q", state, owner)
 	}
 
-	// A node that stopped mid-call, and a row from before leases existed.
+	// A node that stopped mid-call (its lease ended long ago), and a row
+	// from before leases existed.
 	now := haBase.UnixMilli()
 	for _, row := range []struct {
 		grant string
 		owner any
 		lease any
 	}{
-		{"gr_dead", "node-dead", now - 1000},
+		{"gr_dead", "node-dead", int64(1)},
 		{"gr_old", nil, nil},
 	} {
 		if _, err := db.ExecContext(ctx, `INSERT INTO inbox_executions(grant_id,request_id,call_id,agent_id,state,attempt_id,arguments,started_at,owner_instance,lease_until)
@@ -109,18 +111,25 @@ func TestRollingRestartKeepsOtherNodesExecutions(t *testing.T) {
 		}
 	}
 
-	// Node 1 restarts: a new Inbox runs its startup recovery.
+	// Node 1 restarts: a new Inbox starts without settling anything.
 	restarted := newNode(t, db, c1)
-	if state, owner := executionState(t, db, live.ID); state != ExecutionRunning || owner != "node-2" {
-		t.Fatalf("node 1's restart changed node 2's in-flight execution: state %q owner %q", state, owner)
+	for _, g := range []string{live.ID, "gr_dead", "gr_old"} {
+		if state, _ := executionState(t, db, g); state != ExecutionRunning {
+			t.Fatalf("a multi-node start settled %s: state %q", g, state)
+		}
+	}
+	// Recovery (the leader's pass) settles only what no live node renews.
+	if n, err := restarted.svc.RecoverExecutions(ctx); err != nil || n != 2 {
+		t.Fatalf("recovery: %d %v, want 2", n, err)
+	}
+	if state, owner := executionState(t, db, live.ID); state != ExecutionRunning || owner != c2.InstanceID() {
+		t.Fatalf("node 1's recovery changed node 2's in-flight execution: state %q owner %q", state, owner)
 	}
 	for _, g := range []string{"gr_dead", "gr_old"} {
 		if state, _ := executionState(t, db, g); state != ExecutionUnknown {
 			t.Fatalf("%s: state %q, want %q", g, state, ExecutionUnknown)
 		}
 	}
-
-	// Recovery again (the leader's periodic pass) still leaves it alone.
 	if n, err := restarted.svc.RecoverExecutions(ctx); err != nil || n != 0 {
 		t.Fatalf("second recovery: %d %v", n, err)
 	}
@@ -132,12 +141,25 @@ func TestRollingRestartKeepsOtherNodesExecutions(t *testing.T) {
 		t.Fatalf("node 1 running executions: %v %v", ids, err)
 	}
 
-	// Node 2 renews its lease; once node 2 stops renewing and the lease
-	// ends, node 1's recovery takes the execution.
+	// Node 2 renews its lease (by the database's clock, on its reserved
+	// connection); once node 2 stops renewing and the lease ends, node 1's
+	// recovery takes the execution.
+	if _, err := db.ExecContext(ctx, `UPDATE inbox_executions SET lease_until = 1 WHERE grant_id = ?`, live.ID); err != nil {
+		t.Fatal(err)
+	}
 	if err := node2.svc.renewLeases(ctx); err != nil {
 		t.Fatal(err)
 	}
-	restarted.advance(cluster.WorkLease + time.Second)
+	var lease int64
+	if err := db.QueryRowContext(ctx, `SELECT lease_until FROM inbox_executions WHERE grant_id = ?`, live.ID).Scan(&lease); err != nil {
+		t.Fatal(err)
+	}
+	if time.Until(time.UnixMilli(lease)) < cluster.WorkLease/2 {
+		t.Fatalf("renewal set lease_until %d, not about a lease from now", lease)
+	}
+	if _, err := db.ExecContext(ctx, `UPDATE inbox_executions SET lease_until = 1 WHERE grant_id = ?`, live.ID); err != nil {
+		t.Fatal(err)
+	}
 	if n, err := restarted.svc.RecoverExecutions(ctx); err != nil || n != 1 {
 		t.Fatalf("recovery after node 2's lease ended: %d %v", n, err)
 	}
@@ -147,8 +169,8 @@ func TestRollingRestartKeepsOtherNodesExecutions(t *testing.T) {
 }
 
 // Wait on node 2 wakes when node 1 records the decision.
-func TestWaitWakesOnOtherNodesDecision(t *testing.T) {
-	node1, node2, _, _ := twoInboxNodes(t)
+func TestTwoNodeWaitWakesOnDecision(t *testing.T) {
+	node1, node2, _, _, _ := twoInboxNodes(t)
 	ctx := context.Background()
 	r := submitDeploy(t, node1, "ag_1")
 
@@ -196,8 +218,8 @@ func TestWaitWakesOnOtherNodesDecision(t *testing.T) {
 
 // Submissions of one agent take turns across nodes: the per-agent cap
 // holds when both nodes submit at once.
-func TestSubmitLockSpansNodes(t *testing.T) {
-	node1, node2, _, _ := twoInboxNodes(t)
+func TestTwoNodeSubmitLock(t *testing.T) {
+	node1, node2, _, _, _ := twoInboxNodes(t)
 	ctx := context.Background()
 	unlock, err := node1.svc.lockSubmit(ctx, "ag_1")
 	if err != nil {
@@ -222,7 +244,7 @@ func TestSubmitLockSpansNodes(t *testing.T) {
 }
 
 // A due push read by two dispatchers goes out once.
-func TestPushClaimedOnce(t *testing.T) {
+func TestClusterPushClaimedOnce(t *testing.T) {
 	e := newEnv(t)
 	ctx := context.Background()
 	if _, err := e.svc.db.ExecContext(ctx, `INSERT INTO inbox_pushes(request_id, agent_id, group_key, reason, urgency, due_at) VALUES (?,?,?,?,?,?)`,
