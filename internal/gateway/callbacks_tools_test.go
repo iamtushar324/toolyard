@@ -261,3 +261,33 @@ func TestOwnCallbackRefParameterIsTheTools(t *testing.T) {
 		t.Fatalf("warning: %+v", res)
 	}
 }
+
+// The callbacks tools have one name everywhere: their own always-on group,
+// so code mode, its stubs and tools.search call them
+// toolyard.callbacks_<name> and report them under "callbacks", like every
+// other toolyard tool (toolyard.inbox_request).
+func TestCallbackToolsHaveOneCodeName(t *testing.T) {
+	f := newCallbackFixture(t)
+	bound := map[string]string{}
+	for _, tl := range (codeModeCaller{g: f.gw}).Tools(f.agent) {
+		bound[tl.Target] = tl.Server + "." + tl.Name
+	}
+	searched := map[string]toolsearchView{}
+	for _, tl := range f.gw.searchCatalog(f.agent) {
+		searched[tl.Name] = toolsearchView{server: tl.Server, code: tl.CodeName}
+	}
+	for _, n := range CallbackToolNames {
+		want := "toolyard.callbacks_" + strings.TrimPrefix(n, "callbacks.")
+		if bound[n] != want {
+			t.Errorf("code mode binds %s as %q, want %q", n, bound[n], want)
+		}
+		if got := searched[n]; got.server != "callbacks" || got.code != want {
+			t.Errorf("tools.search reports %s as %+v, want server callbacks and code %q", n, got, want)
+		}
+	}
+	if bound["inbox.request"] != "toolyard.inbox_request" {
+		t.Errorf("inbox.request is bound as %q", bound["inbox.request"])
+	}
+}
+
+type toolsearchView struct{ server, code string }

@@ -90,6 +90,12 @@ func callbackRefFrom(ctx context.Context) string {
 	return ref
 }
 
+// callbacksUpstream is the synthetic upstream, and always-on access group,
+// of the callbacks.* tools: code mode names them toolyard.callbacks_<name>
+// (toolyard.callbacks_list), tools.search reports them under "callbacks",
+// and the call ledger records toolyard.callbacks_<name>.
+const callbacksUpstream = "callbacks"
+
 // CallbackToolNames are the callbacks.* tools with which an agent manages
 // the webhook receivers toolyard calls (docs/guidelines/inbox-federation.md).
 // They are always visible, like the inbox tools.
@@ -108,7 +114,7 @@ type CallbackPrivacy func(ctx context.Context, agentID, environmentID, destinati
 
 // RegisterCallbackTools adds the callbacks.* tools. Each acts only on the
 // calling agent's own receivers, so they are always allowed; they sit in
-// the inbox access group, which every caller has. private may be nil (no
+// the always-on callbacks access group, which every caller has. private may be nil (no
 // private destinations).
 func (g *Gateway) RegisterCallbackTools(svc *callbacks.Service, private CallbackPrivacy) {
 	if svc == nil {
@@ -154,7 +160,7 @@ const callbackSecretNote = "Shown once: store it now to verify the webhook-signa
 func callbackTools(svc *callbacks.Service, private CallbackPrivacy) []toolEntry {
 	refProp := map[string]any{"type": "string", "description": "The receiver's callback_ref (cb_…) from callbacks.register or callbacks.list."}
 	return []toolEntry{
-		inboxEntry("callbacks.register", inboxUpstream,
+		inboxEntry("callbacks.register", callbacksUpstream,
 			"Register a webhook receiver: an https URL (port 443) toolyard POSTs signed events to. Give your own Standard Webhooks secret (whsec_…), "+
 				"or omit it and toolyard generates one and returns it once. Pass the returned callback_ref on inbox.request / inbox.ask (callback_ref or callback_refs), "+
 				"as _callback_ref on a call that may wait for approval, or make it your default with callbacks.set_default (make_default: true). "+
@@ -235,7 +241,7 @@ func callbackTools(svc *callbacks.Service, private CallbackPrivacy) []toolEntry 
 				out["next"] = "Pass callback_ref on inbox.request / inbox.ask (callback_ref or callback_refs), or make it your default with callbacks.set_default. Check delivery with callbacks.test."
 				return inboxJSON(out), nil
 			}),
-		inboxEntry("callbacks.list", inboxUpstream,
+		inboxEntry("callbacks.list", callbacksUpstream,
 			"List your webhook receivers: callback_ref, destination, status, revision and which one is your default. "+
 				"Give callback_ref to also see that receiver's recent deliveries (event id, type, status, attempts).",
 			obj(nil, map[string]any{
@@ -269,7 +275,7 @@ func callbackTools(svc *callbacks.Service, private CallbackPrivacy) []toolEntry 
 				}
 				return inboxJSON(out), nil
 			}),
-		inboxEntry("callbacks.update", inboxUpstream,
+		inboxEntry("callbacks.update", callbacksUpstream,
 			"Change one of your receivers: disable (stop delivery), rotate (new secret; give yours or toolyard generates one and returns it once) or remove. "+
 				"Give expected_revision from callbacks.list; a repeated identical change is answered as before. Pending events follow a rotated secret; disabling or removing fails them.",
 			obj([]string{"callback_ref", "action", "expected_revision"}, map[string]any{
@@ -309,7 +315,7 @@ func callbackTools(svc *callbacks.Service, private CallbackPrivacy) []toolEntry 
 				}
 				return inboxJSON(out), nil
 			}),
-		inboxEntry("callbacks.set_default", inboxUpstream,
+		inboxEntry("callbacks.set_default", callbacksUpstream,
 			"Make one of your receivers your default: it follows every inbox.request / inbox.ask (and every call that waits for a legacy approval) that names no callback_ref. "+
 				"Give an empty callback_ref to clear the default.",
 			obj([]string{"callback_ref"}, map[string]any{"callback_ref": refProp}),
@@ -327,7 +333,7 @@ func callbackTools(svc *callbacks.Service, private CallbackPrivacy) []toolEntry 
 				}
 				return inboxJSON(map[string]any{"default": ref, "next": "Items and legacy approval calls that name no callback_ref now report to this receiver."}), nil
 			}),
-		inboxEntry("callbacks.test", inboxUpstream,
+		inboxEntry("callbacks.test", callbacksUpstream,
 			"Send a signed ping event to one of your receivers, to check that it verifies the signature and answers 2xx. Read the delivery with callbacks.list {callback_ref}.",
 			obj([]string{"callback_ref"}, map[string]any{"callback_ref": refProp}),
 			func(ctx context.Context, args map[string]any) (*mcp.CallToolResult, error) {
