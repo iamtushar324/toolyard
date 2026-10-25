@@ -1,0 +1,139 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: toolyard-postgres
+  labels:
+    app.kubernetes.io/name: postgres
+    app.kubernetes.io/component: database
+spec:
+  serviceName: toolyard-postgres
+  replicas: 1
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: postgres
+      app.kubernetes.io/component: database
+  # Deleting or scaling the StatefulSet keeps the volume (and the data).
+  # scripts/k8s-test-deploy.sh --destroy --purge deletes it on purpose.
+  persistentVolumeClaimRetentionPolicy:
+    whenDeleted: Retain
+    whenScaled: Retain
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: postgres
+        app.kubernetes.io/component: database
+    spec:
+      # The image's STOPSIGNAL is SIGINT (fast shutdown), which containerd
+      # and CRI-O send instead of SIGTERM; a fast shutdown takes seconds.
+      terminationGracePeriodSeconds: 60
+      automountServiceAccountToken: false
+      enableServiceLinks: false
+      # The restricted Pod Security Standard, as the postgres user (uid and
+      # gid 999 in the official Debian image). fsGroup makes the volume
+      # writable for it; OnRootMismatch keeps the kubelet from changing the
+      # data directory's 0700 mode on later mounts.
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 999
+        runAsGroup: 999
+        fsGroup: 999
+        fsGroupChangePolicy: OnRootMismatch
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: postgres
+          # The official multi-arch image (amd64, arm64 and more), pinned by
+          # the digest of its index. Update tag and digest together.
+          image: postgres:16.15-bookworm@sha256:d81f7b51697014367236d07ec58b54153fc28f828b72bf247fe5c7487520bcb0
+          imagePullPolicy: IfNotPresent
+          env:
+            # The image creates this role (a superuser) and this database on
+            # the first start. Test only: production uses a dedicated
+            # non-superuser role (docs/self-hosting.md).
+            - name: POSTGRES_USER
+              value: toolyard
+            - name: POSTGRES_DB
+              value: toolyard
+            - name: POSTGRES_PASSWORD_FILE
+              value: /etc/postgres/secret/password
+            # toolyard refuses a database without C collation and ctype
+            # (docs/self-hosting.md, "Creating the Postgres database").
+            - name: POSTGRES_INITDB_ARGS
+              value: --encoding=UTF8 --locale=C
+            # A subdirectory: the volume's root holds lost+found, and initdb
+            # needs an empty directory.
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          ports:
+            - name: postgres
+              containerPort: 5432
+          # The first start runs initdb and a temporary server on the Unix
+          # socket only, so a TCP check fails until the real server is up.
+          startupProbe:
+            exec:
+              command: ["pg_isready", "-h", "127.0.0.1", "-p", "5432", "-U", "toolyard", "-d", "toolyard"]
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 120
+          readinessProbe:
+            exec:
+              command: ["pg_isready", "-h", "127.0.0.1", "-p", "5432", "-U", "toolyard", "-d", "toolyard"]
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3
+          livenessProbe:
+            exec:
+              command: ["pg_isready", "-h", "127.0.0.1", "-p", "5432", "-U", "toolyard", "-d", "toolyard"]
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 6
+          resources:
+            requests:
+              cpu: 100m
+              memory: 256Mi
+            limits:
+              memory: 1Gi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            privileged: false
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+            - name: run
+              mountPath: /var/run/postgresql
+            - name: tmp
+              mountPath: /tmp
+            - name: secret
+              mountPath: /etc/postgres/secret
+              readOnly: true
+      volumes:
+        # The Unix socket directory, writable on a read-only root.
+        - name: run
+          emptyDir:
+            sizeLimit: 16Mi
+        - name: tmp
+          emptyDir:
+            sizeLimit: 256Mi
+        - name: secret
+          secret:
+            secretName: toolyard-postgres
+            defaultMode: 0440
+  volumeClaimTemplates:
+    # Immutable once created: changing the size or storage class later
+    # means deleting the StatefulSet (the volume stays) and applying again.
+    - metadata:
+        name: data
+        labels:
+          app.kubernetes.io/name: postgres
+          app.kubernetes.io/component: database
+          app.kubernetes.io/part-of: toolyard
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        # No storageClassName: the cluster's default class. The deploy script
+        # sets STORAGE_CLASS and PG_STORAGE_SIZE.
+        resources:
+          requests:
+            storage: 10Gi

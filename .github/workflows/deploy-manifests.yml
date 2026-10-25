@@ -1,6 +1,10 @@
 # Validates the deployment examples without a cluster:
-#   - deploy/k8s/base: kustomize build | kubeconform -strict (Kubernetes
-#     schemas), with pinned, checksum-verified tool downloads;
+#   - deploy/k8s/base and deploy/k8s/overlays/ha-test: kustomize build |
+#     kubeconform -strict (Kubernetes schemas), with pinned,
+#     checksum-verified tool downloads;
+#   - the HA test overlay as scripts/k8s-test-deploy.sh --render patches it,
+#     with placeholder inputs (scripts/k8s/check-render.sh checks that every
+#     input lands where it should), and shellcheck on both scripts;
 #   - deploy/swarm/stack.example.yml: docker stack config (the loader
 #     docker stack deploy uses) and docker compose config.
 name: Deploy manifests
@@ -10,12 +14,16 @@ on:
     paths:
       - 'deploy/k8s/**'
       - 'deploy/swarm/**'
+      - 'scripts/k8s-test-deploy.sh'
+      - 'scripts/k8s/**'
       - '.github/workflows/deploy-manifests.yml'
   push:
     branches: [main]
     paths:
       - 'deploy/k8s/**'
       - 'deploy/swarm/**'
+      - 'scripts/k8s-test-deploy.sh'
+      - 'scripts/k8s/**'
       - '.github/workflows/deploy-manifests.yml'
   workflow_dispatch:
 
@@ -31,6 +39,10 @@ jobs:
       KUSTOMIZE_SHA256: cb9e31198d3f63b44848bd0afc4c8efc56e6cfef9c93a4a39a211940e6decd61
       KUBECONFORM_VERSION: 0.8.0
       KUBECONFORM_SHA256: 9bc2bffbf71f261128533edaf912153948b7ff238f9a531ae6d34466ec287883
+      SHELLCHECK_VERSION: 0.11.0
+      SHELLCHECK_SHA256: 8c3be12b05d5c177a04c29e3c78ce89ac86f1595681cab149b65b97c4e227198
+      YQ_VERSION: 4.54.1
+      YQ_SHA256: 8e34fc298390875de416e6a4afcb8cabeceb25d9aa8506c1a2f9353cf702ea5f
       # Schemas from yannh/kubernetes-json-schema.
       KUBERNETES_VERSION: 1.34.0
     steps:
@@ -38,7 +50,7 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Install kustomize and kubeconform
+      - name: Install kustomize, kubeconform, shellcheck and yq
         run: |
           set -euo pipefail
           dl="$RUNNER_TEMP/dl"
@@ -50,8 +62,17 @@ jobs:
           curl -fsSL -o "$dl/kubeconform.tar.gz" \
             "https://github.com/yannh/kubeconform/releases/download/v${KUBECONFORM_VERSION}/kubeconform-linux-amd64.tar.gz"
           echo "${KUBECONFORM_SHA256}  $dl/kubeconform.tar.gz" | sha256sum -c -
+          curl -fsSL -o "$dl/shellcheck.tar.xz" \
+            "https://github.com/koalaman/shellcheck/releases/download/v${SHELLCHECK_VERSION}/shellcheck-v${SHELLCHECK_VERSION}.linux.x86_64.tar.xz"
+          echo "${SHELLCHECK_SHA256}  $dl/shellcheck.tar.xz" | sha256sum -c -
+          curl -fsSL -o "$dl/yq" \
+            "https://github.com/mikefarah/yq/releases/download/v${YQ_VERSION}/yq_linux_amd64"
+          echo "${YQ_SHA256}  $dl/yq" | sha256sum -c -
           tar -xzf "$dl/kustomize.tar.gz" -C "$bin" kustomize
           tar -xzf "$dl/kubeconform.tar.gz" -C "$bin" kubeconform
+          tar -xJf "$dl/shellcheck.tar.xz" -C "$dl"
+          install -m 0755 "$dl/shellcheck-v${SHELLCHECK_VERSION}/shellcheck" "$bin/shellcheck"
+          install -m 0755 "$dl/yq" "$bin/yq"
           echo "$bin" >> "$GITHUB_PATH"
 
       - name: Render and validate the Kustomize base
@@ -60,6 +81,35 @@ jobs:
           kustomize version
           kustomize build deploy/k8s/base | tee "$RUNNER_TEMP/k8s.yaml" \
             | kubeconform -strict -summary -kubernetes-version "$KUBERNETES_VERSION"
+
+      - name: Render and validate the HA test overlay as committed
+        # Placeholder values only (example.com, documentation ranges).
+        run: |
+          set -euo pipefail
+          for dir in deploy/k8s/overlays/ha-test deploy/k8s/overlays/ha-test/migrate; do
+            echo "--- $dir"
+            kustomize build "$dir" \
+              | kubeconform -strict -summary -kubernetes-version "$KUBERNETES_VERSION"
+          done
+
+      - name: Render the HA test overlay through the deploy script and check it
+        env:
+          KUSTOMIZE_BIN: kustomize
+        run: |
+          set -euo pipefail
+          yq --version
+          out="$RUNNER_TEMP/ha-test"
+          scripts/k8s/check-render.sh "$out"
+          for f in "$out"/*.yaml; do
+            echo "--- $(basename "$f")"
+            kubeconform -strict -summary -kubernetes-version "$KUBERNETES_VERSION" "$f"
+          done
+
+      - name: shellcheck the deploy scripts
+        run: |
+          set -euo pipefail
+          shellcheck --version
+          shellcheck scripts/k8s-test-deploy.sh scripts/k8s/*.sh
 
   swarm:
     runs-on: ubuntu-24.04
