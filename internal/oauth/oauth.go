@@ -109,6 +109,10 @@ type TokenRecord struct {
 	// AccountLabel names the account the token belongs to when the IdP
 	// said (the id_token email); empty otherwise. Display only.
 	AccountLabel string
+
+	// refreshEnc is the refresh_token_enc ciphertext as read; a refresh
+	// writes only while the row still carries it.
+	refreshEnc string
 }
 
 // PendingRecord is one in-flight OAuth dance.
@@ -215,6 +219,9 @@ type Service struct {
 	// serving them). Both guarded by mu.
 	bearerGen    map[string]uint64
 	staleBearers map[string]bool
+	// flights are the bearer reads under way, by key (singleRead).
+	flightMu sync.Mutex
+	flights  map[string]chan struct{}
 
 	// cluster, when it spans several nodes, carries bearer changes to the
 	// other replicas' caches and serializes refreshes across them
@@ -294,13 +301,14 @@ func (s *Service) currentBearer(upstream string) string {
 	stale := s.staleBearers[upstream]
 	s.mu.RUnlock()
 	if !ok || stale {
-		// Cold path, or a cluster resync asked to check: read the DB. A
-		// failed read keeps serving the stale bearer.
-		if s.cacheBearerFromDB(upstream) || !ok {
-			s.mu.RLock()
-			v, ok = s.bearers[upstream]
-			s.mu.RUnlock()
-		}
+		// Cold path, or a cluster resync asked to check: read the DB,
+		// once for every concurrent caller of this key, bounded by
+		// bearerReadTimeout (this runs on the tool-call path). A failed or
+		// slow read keeps serving the stale bearer.
+		s.singleRead(upstream, func() { s.cacheBearerFromDB(upstream) })
+		s.mu.RLock()
+		v, ok = s.bearers[upstream]
+		s.mu.RUnlock()
 		if !ok {
 			return ""
 		}
@@ -344,7 +352,9 @@ func (s *Service) cacheBearerFromDB(upstream string) bool {
 		s.mu.RLock()
 		gen := s.bearerGen[upstream]
 		s.mu.RUnlock()
-		tok, err := s.GetToken(context.Background(), upstream)
+		ctx, cancel := context.WithTimeout(context.Background(), bearerReadTimeout)
+		tok, err := s.GetToken(ctx, upstream)
+		cancel()
 		if err != nil {
 			return false
 		}
@@ -927,7 +937,11 @@ func (s *Service) exchangeCode(ctx context.Context, upstream, code, verifier str
 // new refresh_token replaces the old. With a multi-node cluster the
 // refresh holds a cluster lock per upstream and reads the token inside
 // it, so two replicas never spend the same rotating refresh token (the
-// loser would get invalid_grant and mark the server needs_reauth).
+// loser would get invalid_grant and mark the server needs_reauth). The
+// write goes through only while the row still carries the refresh token
+// that was read: a reconnect, a disconnect or another refresh (one whose
+// lock was lost) that changed the row meanwhile is never overwritten, and
+// Refresh returns ErrSuperseded with nothing written.
 func (s *Service) Refresh(ctx context.Context, upstream string) (*TokenRecord, error) {
 	unlock, err := s.lockShared(ctx, upstream)
 	if err != nil {
@@ -972,7 +986,7 @@ func (s *Service) Refresh(ctx context.Context, upstream string) (*TokenRecord, e
 		rec.AccountLabel = cur.AccountLabel
 	}
 	rec.LastRefreshAt = time.Now()
-	if err := s.PutToken(ctx, rec); err != nil {
+	if err := s.updateTokenIfUnchanged(ctx, rec, cur.refreshEnc); err != nil {
 		return nil, err
 	}
 	s.setBearer(upstream, rec.AccessToken)
@@ -1080,6 +1094,42 @@ func (s *Service) PutToken(ctx context.Context, rec *TokenRecord) error {
 	return err
 }
 
+// updateTokenIfUnchanged writes a refreshed token over the existing shared
+// row only while that row still carries refreshEnc, the refresh token
+// ciphertext the refresh started from. No row updated means the row was
+// deleted or replaced meanwhile: ErrSuperseded, nothing written, cache
+// untouched.
+func (s *Service) updateTokenIfUnchanged(ctx context.Context, rec *TokenRecord, refreshEnc string) error {
+	if refreshEnc == "" {
+		return ErrSuperseded
+	}
+	atEnc, err := s.cipher.Seal([]byte(rec.AccessToken), AAD(rec.UpstreamName, "access"))
+	if err != nil {
+		return err
+	}
+	rtEnc, err := s.cipher.Seal([]byte(rec.RefreshToken), AAD(rec.UpstreamName, "refresh"))
+	if err != nil {
+		return err
+	}
+	res, err := s.db.ExecContext(ctx, `
+        UPDATE oauth_tokens
+        SET access_token_enc = ?, refresh_token_enc = ?, token_type = ?, scope = ?, account_label = ?,
+            obtained_at = ?, access_expires_at = ?, refresh_expires_at = ?, last_refresh_at = ?,
+            refresh_failures = 0, state = ?, last_error = NULL
+        WHERE upstream_name = ? AND refresh_token_enc = ?`,
+		nullStr(atEnc), nullStr(rtEnc), nullStr(rec.TokenType), nullStr(rec.Scope), nullStr(rec.AccountLabel),
+		nullTimeMS(rec.ObtainedAt), nullTimeMS(rec.AccessExpiresAt), nullTimeMS(rec.RefreshExpiresAt),
+		nullTimeMS(rec.LastRefreshAt), StateActive,
+		rec.UpstreamName, refreshEnc)
+	if err != nil {
+		return err
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return ErrSuperseded
+	}
+	return nil
+}
+
 // GetToken returns the decrypted token row (or nil when missing).
 func (s *Service) GetToken(ctx context.Context, upstream string) (*TokenRecord, error) {
 	row := s.db.QueryRowContext(ctx, `
@@ -1114,6 +1164,7 @@ func (s *Service) GetToken(ctx context.Context, upstream string) (*TokenRecord, 
 			return nil, err
 		}
 		rec.RefreshToken = string(pt)
+		rec.refreshEnc = rtEnc
 	}
 	if ob > 0 {
 		rec.ObtainedAt = time.UnixMilli(ob)

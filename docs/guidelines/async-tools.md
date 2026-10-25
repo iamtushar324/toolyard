@@ -190,7 +190,7 @@ curl "$TOOLYARD_URL/v1/jobs?status=active&limit=20" -H "Authorization: Bearer $T
 - Every job row carries `owner_instance` (the replica that runs it) and
   `lease_until`, on the database's clock (so clock drift between replicas
   never ends a lease early). That replica renews the lease every 5 s while
-  the job is queued or running (30 s leases), and claims it `queued` →
+  the job is queued or running (60 s leases, the cluster's work lease), and claims it `queued` →
   `running` with a compare-and-set. A replica that finds one of its jobs
   final or owned elsewhere at a renewal stops its local run.
 - The caps are checked and the job inserted in one transaction, under a
@@ -212,7 +212,11 @@ curl "$TOOLYARD_URL/v1/jobs?status=active&limit=20" -H "Authorization: Bearer $T
   on another replica is seen.
 - On shutdown a replica refuses new jobs, ends waits, and gives running
   jobs until `-drain-timeout`; what is still running then is cancelled and
-  recorded `outcome_unknown`.
+  recorded `outcome_unknown`. The retention purge runs on the cluster
+  leader, one pass at a time as a leader unit the drain waits for.
+- A job a code-mode script started keeps the script's mark and run id:
+  it cannot start code mode, and its audit rows carry the script's
+  `run_id`.
 - Upstream `notifications/progress` for a job's call (toolyard sends its
   own progress token on each upstream call a job makes) are recorded on the
   job, the latest one at most once a second, off the upstream's read loop,

@@ -318,6 +318,9 @@ func runServe(argv []string) error {
 	// set exits on an unknown flag. toolyard no longer runs a ClickHouse lake.
 	clickhouseRuntimeEnvPath := fs.String("clickhouse-runtime-env", "", "DEPRECATED: ignored. Kept so existing service units keep starting.")
 	inboxResetPasskeys := fs.Bool("inbox-reset-passkeys", false, "delete every registered passkey at startup (recovery when the owner has lost all their devices), then continue normally")
+	codemodeMaxConcurrent := fs.Int("codemode-max-concurrent", 4, "code mode: the most scripts (executeToolCode and POST /v1/code/run) running at once on this gateway; each runs in its own worker process under the worker memory cap (256 MiB)")
+	codemodeMaxPerAgent := fs.Int("codemode-max-per-agent", 3, "code mode: the most scripts one agent runs at once")
+	codemodeQueueWait := fs.Duration("codemode-queue-wait", 30*time.Second, "code mode: how long a script past -codemode-max-concurrent or -codemode-max-per-agent waits in the fair queue for a slot before it is refused as busy (HTTP 429 over REST)")
 	inboxFetchPrivate := fs.Bool("inbox-fetch-private-networks", false, "let the inbox copy attachment links that point at loopback or private-network addresses (e.g. evidence hosted on your LAN). Off by default: agent-chosen URLs could otherwise reach internal services.")
 	requireAuthMCP := fs.Bool("require-auth-on-mcp", false, "reject anonymous /mcp calls (no Authorization header). Auto-enabled when -public-url is set.")
 	upstreamProtocolFlag := fs.String("upstream-protocol", upstreamProtocolLegacy, "MCP version toward upstream servers: legacy (2025-11-25 for every upstream) | auto (a shared http upstream that offers 2026-07-28 is called statelessly, one POST per call, outside the live pool and the idle sweep; stdio and per_user stay legacy)")
@@ -491,6 +494,11 @@ func runServe(argv []string) error {
 		return err
 	}
 	clusterSvc, err := cluster.New(ctx, db, cluster.Options{InstanceID: *instanceID, SingleNode: cmode == clusterOff})
+	if errors.Is(err, cluster.ErrModeConflict) {
+		// -cluster=off next to another gateway, or a replica next to an
+		// off one: a restart cannot fix the configuration (exit 78).
+		return fmt.Errorf("%w (%w)", err, keyguard.ErrConfig)
+	}
 	if err != nil {
 		return fmt.Errorf("cluster: %w", err)
 	}
@@ -730,6 +738,7 @@ func runServe(argv []string) error {
 	// The kernel probe for the code-mode sandbox runs now, off the
 	// request path.
 	gw.SetCodeModeSandbox(sandboxMode)
+	gw.SetCodeModeConcurrency(*codemodeMaxConcurrent, *codemodeMaxPerAgent, *codemodeQueueWait)
 	gw.SetCluster(clusterSvc)
 	goroutines.Go(goCodemodeProbe, func() { codemode.ProbeSandbox() })
 	gw.RegisterBuiltins()
@@ -948,11 +957,6 @@ func runServe(argv []string) error {
 	leaderLoop(ctx, clusterSvc, loopSessionPurger, time.Hour, func(ctx context.Context) { runSessionPurger(ctx, idSvc, codeRuns) })
 	// Every replica renews the leases of the code runs it runs.
 	goroutines.Loop(ctx, coderuns.LeaseRenewalLoop, time.Minute, codeRuns.RunLeaseRenewal)
-	// The leader settles the work of replicas that stopped (multi-node only).
-	leaderLoop(ctx, clusterSvc, loopWorkRecovery, time.Minute, func(ctx context.Context) {
-		runWorkRecovery(ctx, clusterSvc, db.PingContext, inboxSvc, bus, codeRuns)
-	})
-
 	upstreamSvc := upstreams.New(db, gw)
 	// Servers saved on another replica are connected here too.
 	upstreamSvc.SetCluster(ctx, clusterSvc)
@@ -1121,6 +1125,13 @@ func runServe(argv []string) error {
 			log.Printf("legacy execution: recovered %d unclaimed decisions", n)
 		}
 	}
+	// The leader settles the work of replicas that stopped (multi-node
+	// only). It starts here, once startup has loaded what recovery needs
+	// (the upstream servers and the Inbox hooks), so this replica takes no
+	// recovery lease before it could use it.
+	leaderLoop(ctx, clusterSvc, loopWorkRecovery, time.Minute, func(ctx context.Context) {
+		runWorkRecovery(ctx, clusterSvc, db.PingContext, inboxSvc, bus, codeRuns)
+	})
 
 	// MemPalace: install (if needed), initialize palace dir, and register
 	// the built-in stdio upstream so its 29 tools surface as `mempalace.*`.
@@ -1643,11 +1654,18 @@ func runServe(argv []string) error {
 		}()
 	}
 
+	var exitErr error
 	select {
 	case <-stop:
 		rootLog.Info("shutdown signal received")
 	case <-ctx.Done():
 		rootLog.Warn("root context ended; shutting down")
+	case <-clusterSvc.ModeConflict():
+		// The mode guard no longer holds: a gateway with the other
+		// -cluster setting took the database while this one was
+		// disconnected. Drain and exit 78 (a configuration error).
+		rootLog.Error("a gateway with the other -cluster setting uses this database; shutting down")
+		exitErr = fmt.Errorf("%w (%w)", cluster.ErrModeConflict, keyguard.ErrConfig)
 	}
 	// TEC-1626 drain: one ordered shutdown (lifecycle.go). Executors run on
 	// the bus's own context, so nothing in flight is cancelled before the
@@ -1682,6 +1700,14 @@ func runServe(argv []string) error {
 			func(ctx context.Context) { waitGrantedCalls(ctx, gw, inboxSvc, shutdownGrace) },
 			codeRuns.Wait,
 			jobsSvc.Wait,
+			// Leader units (a memory-webhook job, an OAuth refresh, a
+			// job retention pass) run on the root context: let them end
+			// before step 7 cancels it.
+			func(ctx context.Context) {
+				if left := cluster.WaitUnits(ctx); len(left) > 0 {
+					logx.For("shutdown").Warn("shutdown: leader work still running at the drain deadline; it stops with the root context", "running", left)
+				}
+			},
 		},
 		cancelRoot: cancel,
 		closers: []shutdownCloser{
@@ -1694,7 +1720,7 @@ func runServe(argv []string) error {
 			{name: "database", close: closeDB},
 		},
 	}).run()
-	return nil
+	return exitErr
 }
 
 // ---- exchange ---------------------------------------------------------------

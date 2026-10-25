@@ -20,7 +20,7 @@ const (
 )
 
 // runColumns are the code_runs columns a view needs (not the script).
-const runColumns = `id, agent_id, COALESCE(session_id, ''), COALESCE(idempotency_key, ''), fingerprint, reason, status,
+const runColumns = `id, agent_id, COALESCE(session_id, ''), COALESCE(idempotency_key, ''), fingerprint, reason, COALESCE(language, 'starlark'), status,
 	COALESCE(result, ''), COALESCE(error_kind, ''), COALESCE(error_message, ''), COALESCE(logs, ''), COALESCE(held, ''),
 	created_at, updated_at, COALESCE(finished_at, 0)`
 
@@ -33,12 +33,16 @@ const runWriteTimeout = 10 * time.Second
 func (s *Service) insertRun(ctx context.Context, r *Run) error {
 	ctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), runWriteTimeout)
 	defer cancel()
+	lang := r.Language
+	if lang == "" {
+		lang = codemode.LanguageStarlark
+	}
 	// The run is this node's from the start: it runs on this process, under
 	// a lease it renews (RunLeaseRenewal).
 	_, err := s.db.ExecContext(ctx, `INSERT INTO code_runs
-		(id, agent_id, session_id, idempotency_key, fingerprint, code, reason, status, created_at, updated_at, owner_instance, lease_until)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, `+cluster.LeaseUntilSQL(s.db.Dialect)+`)`,
-		r.ID, r.AgentID, nullStr(r.SessionID), nullStr(r.IdempotencyKey), r.Fingerprint, r.code, r.Reason, r.Status, r.CreatedAt, r.UpdatedAt,
+		(id, agent_id, session_id, idempotency_key, fingerprint, code, reason, language, status, created_at, updated_at, owner_instance, lease_until)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, `+cluster.LeaseUntilSQL(s.db.Dialect)+`)`,
+		r.ID, r.AgentID, nullStr(r.SessionID), nullStr(r.IdempotencyKey), r.Fingerprint, r.code, r.Reason, lang, r.Status, r.CreatedAt, r.UpdatedAt,
 		s.cluster.InstanceID())
 	return err
 }
@@ -71,7 +75,7 @@ func (s *Service) loadRun(ctx context.Context, agentID, id string, withCode bool
 	q += ` FROM code_runs WHERE id = ? AND agent_id = ?`
 	var r Run
 	var result, logs, held string
-	dest := []any{&r.ID, &r.AgentID, &r.SessionID, &r.IdempotencyKey, &r.Fingerprint, &r.Reason, &r.Status,
+	dest := []any{&r.ID, &r.AgentID, &r.SessionID, &r.IdempotencyKey, &r.Fingerprint, &r.Reason, &r.Language, &r.Status,
 		&result, &r.ErrorKind, &r.ErrorMessage, &logs, &held, &r.CreatedAt, &r.UpdatedAt, &r.FinishedAt}
 	if withCode {
 		dest = append(dest, &r.code)
@@ -283,14 +287,15 @@ func (s *Service) Recover(ctx context.Context) (failed, unknown int64, err error
 	if s.cluster.MultiNode() {
 		expired = ` AND ` + cluster.LeaseEndedSQL(s.db.Dialect, "lease_until")
 	}
-	res, err := s.db.ExecContext(ctx, `UPDATE code_runs SET status = ?, error_kind = ?, error_message = ?, updated_at = ?, finished_at = ? WHERE status = ?`+expired,
-		codemode.StatusFailed, ErrorInterrupted, msgInterruptedQueued, now, now, StatusQueued)
+	// Literal statuses let Postgres use the partial lease index.
+	res, err := s.db.ExecContext(ctx, `UPDATE code_runs SET status = ?, error_kind = ?, error_message = ?, updated_at = ?, finished_at = ? WHERE status = 'queued'`+expired,
+		codemode.StatusFailed, ErrorInterrupted, msgInterruptedQueued, now, now)
 	if err != nil {
 		return 0, 0, err
 	}
 	failed, _ = res.RowsAffected()
-	res, err = s.db.ExecContext(ctx, `UPDATE code_runs SET status = ?, error_kind = ?, error_message = ?, updated_at = ?, finished_at = ? WHERE status = ?`+expired,
-		codemode.StatusOutcomeUnknown, ErrorInterrupted, msgInterruptedRunning, now, now, StatusRunning)
+	res, err = s.db.ExecContext(ctx, `UPDATE code_runs SET status = ?, error_kind = ?, error_message = ?, updated_at = ?, finished_at = ? WHERE status = 'running'`+expired,
+		codemode.StatusOutcomeUnknown, ErrorInterrupted, msgInterruptedRunning, now, now)
 	if err != nil {
 		return failed, 0, err
 	}

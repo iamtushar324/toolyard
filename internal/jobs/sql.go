@@ -11,6 +11,8 @@ import (
 	"os"
 	"strings"
 	"unicode/utf8"
+
+	"github.com/tusharbhardwaj/toolyard/internal/cluster"
 )
 
 // jobColumns is the SELECT list scanJob reads (the inline result is read
@@ -49,15 +51,11 @@ func scanJob(r rowScanner) (*Job, error) {
 	return &j, nil
 }
 
-// dbNow is the database's clock in Unix milliseconds, as SQL. Leases use
-// it on every replica, so a replica whose clock drifts never ends another
-// one's lease early.
-func (s *Service) dbNow() string {
-	if s.db.Dialect.IsPostgres() {
-		return `CAST(EXTRACT(EPOCH FROM clock_timestamp()) * 1000 AS BIGINT)`
-	}
-	return `CAST((julianday('now') - 2440587.5) * 86400000.0 AS INTEGER)`
-}
+// dbNow is the database's clock in Unix milliseconds, as SQL: the
+// cluster's work-lease clock (cluster.NowMillisSQL). Leases use it on every
+// replica, so a replica whose clock drifts never ends another one's lease
+// early.
+func (s *Service) dbNow() string { return cluster.NowMillisSQL(s.db.Dialect) }
 
 // capLockKey is the advisory lock the cap check and insert of req take on
 // Postgres: the owner's, or the agent's when there is no owner.

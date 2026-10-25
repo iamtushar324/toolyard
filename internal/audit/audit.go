@@ -44,6 +44,9 @@ type Event struct {
 	Arguments     json.RawMessage `json:"arguments,omitempty"`
 	ResultSummary string          `json:"result_summary,omitempty"`
 	ApprovalID    string          `json:"approval_id,omitempty"`
+	// RunID is the code-mode run the event belongs to (WithRunID), "" for
+	// a call outside code mode.
+	RunID string `json:"run_id,omitempty"`
 
 	// Raiser is who raised the call. Write fills empty fields from the
 	// actor.Raiser on ctx, so call sites needn't repeat it. CallerID is
@@ -114,7 +117,8 @@ const eventColumns = `id, ts, agent_id, upstream_name, tool_name, event_type, de
             agent_name, agent_kind, owner_user_id, owner_email, owner_name,
             mcp_session_id, agent_session_id, client_session_id, client_session_claimed,
             client_kind, client_name, client_ip, via,
-            decided_by_user_id, decided_by_email, decided_by_name, decided_via, decider_ref`
+            decided_by_user_id, decided_by_email, decided_by_name, decided_via, decider_ref,
+            run_id`
 
 var eventPlaceholders = strings.TrimSuffix(strings.Repeat("?,", strings.Count(eventColumns, ",")+1), ",")
 
@@ -133,6 +137,10 @@ func (l *Logger) Write(ctx context.Context, e Event) error {
 	if e.TS == 0 {
 		e.TS = time.Now().UnixMilli()
 	}
+	if e.RunID == "" {
+		e.RunID = RunIDFrom(ctx)
+	}
+	e.RunID = actor.Clean(e.RunID)
 	if r, ok := actor.RaiserFrom(ctx); ok {
 		e.Raiser = e.Raiser.Merge(r)
 	}
@@ -168,6 +176,7 @@ func eventArgs(e Event) []any {
 		nullStr(e.MCPSessionID), nullStr(e.AgentSessionID), nullStr(e.ClientSessionID), boolInt(e.ClientSessionClaimed),
 		nullStr(e.ClientKind), nullStr(e.ClientName), nullStr(e.ClientIP), nullStr(e.Via),
 		nullStr(e.DecidedByUserID), nullStr(e.DecidedByEmail), nullStr(e.DecidedByName), nullStr(e.DecidedVia), nullStr(e.DeciderRef),
+		nullStr(e.RunID),
 	}
 }
 
@@ -188,6 +197,7 @@ func scanEvent(s rowScanner) (Event, error) {
 		nstr{&e.MCPSessionID}, nstr{&e.AgentSessionID}, nstr{&e.ClientSessionID}, &claimed,
 		nstr{&e.ClientKind}, nstr{&e.ClientName}, nstr{&e.ClientIP}, nstr{&e.Via},
 		nstr{&e.DecidedByUserID}, nstr{&e.DecidedByEmail}, nstr{&e.DecidedByName}, nstr{&e.DecidedVia}, nstr{&e.DeciderRef},
+		nstr{&e.RunID},
 	); err != nil {
 		return Event{}, err
 	}
@@ -272,7 +282,9 @@ type Filter struct {
 	AgentSessionID  string
 	ApprovalID      string
 	ClientKind      string
-	Limit           int
+	// RunID keeps the events of one code-mode run.
+	RunID string
+	Limit int
 }
 
 // Query returns events matching the filter, newest first. Backs both the
@@ -302,6 +314,7 @@ func (l *Logger) Query(ctx context.Context, f Filter) ([]Event, error) {
 		{"agent_session_id", f.AgentSessionID},
 		{"approval_id", f.ApprovalID},
 		{"client_kind", f.ClientKind},
+		{"run_id", f.RunID},
 	} {
 		if eq.val != "" {
 			q += ` AND ` + eq.col + ` = ?`

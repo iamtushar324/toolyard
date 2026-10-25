@@ -27,10 +27,12 @@ const (
 )
 
 // NowMillisSQL is an SQL expression for the database's current time in
-// Unix milliseconds.
+// Unix milliseconds: Postgres now() (the statement's transaction start,
+// a stable value, so a comparison with it can use an index) and SQLite's
+// 'now' (fixed for the statement).
 func NowMillisSQL(d store.Dialect) string {
 	if d.IsPostgres() {
-		return `CAST(EXTRACT(EPOCH FROM clock_timestamp()) * 1000 AS BIGINT)`
+		return `CAST(EXTRACT(EPOCH FROM now()) * 1000 AS BIGINT)`
 	}
 	return `CAST((julianday('now') - 2440587.5) * 86400000 AS INTEGER)`
 }

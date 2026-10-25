@@ -6,6 +6,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/tusharbhardwaj/toolyard/internal/cluster"
 	"github.com/tusharbhardwaj/toolyard/internal/goroutines"
 )
 
@@ -28,7 +29,11 @@ func (s *Service) Run(ctx context.Context) {
 	goroutines.Go(leaderPurge, func() {
 		s.leader.RunLeader(ctx, leaderPurge, func(ctx context.Context) error {
 			every(ctx, time.Hour, func(ctx context.Context) {
-				if n, err := s.Purge(ctx); err != nil && ctx.Err() == nil {
+				// One pass is a leader unit: a lost lease or a drain does
+				// not cut it half-way, and shutdown waits for it.
+				unit, end := cluster.BeginUnit(ctx, "tool-jobs retention")
+				defer end()
+				if n, err := s.Purge(unit); err != nil && unit.Err() == nil {
 					s.log.Warn("job retention", "err", err.Error())
 				} else if n > 0 {
 					s.log.Info("job retention: removed finished jobs", "count", n)
@@ -39,8 +44,10 @@ func (s *Service) Run(ctx context.Context) {
 	})
 }
 
+// heartbeatEvery renews leases well within the lease, and at least every
+// 5 s, the delay of a cancel made on another replica.
 func (s *Service) heartbeatEvery() time.Duration {
-	return max(s.leaseTTL/6, 50*time.Millisecond)
+	return max(min(s.leaseTTL/6, 5*time.Second), 50*time.Millisecond)
 }
 
 // every runs fn now and then every d until ctx ends.

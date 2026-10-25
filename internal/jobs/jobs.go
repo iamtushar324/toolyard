@@ -32,6 +32,7 @@ import (
 	"time"
 
 	"github.com/tusharbhardwaj/toolyard/internal/blobstore"
+	"github.com/tusharbhardwaj/toolyard/internal/cluster"
 	"github.com/tusharbhardwaj/toolyard/internal/logx"
 	"github.com/tusharbhardwaj/toolyard/internal/store"
 )
@@ -65,7 +66,8 @@ func Final(status string) bool {
 
 // Defaults and limits.
 const (
-	DefaultLeaseTTL       = 30 * time.Second
+	// DefaultLeaseTTL is the cluster's work lease (cluster.WorkLease).
+	DefaultLeaseTTL       = cluster.WorkLease
 	DefaultRetention      = 7 * 24 * time.Hour
 	DefaultInlineLimit    = 256 << 10
 	DefaultMaxResultBytes = 32 << 20

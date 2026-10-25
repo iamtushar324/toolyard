@@ -148,19 +148,40 @@ func (h *hooks) BeforeCall(_ context.Context, c *codemode.PendingCall) (*mcp.Cal
 	if rs == nil {
 		return nil, false, nil
 	}
-	if c.Seq < rs.heldSeq {
-		rec, ok := rs.recorded[c.Seq]
-		switch {
-		case !ok:
-			return nil, false, diverged("call %d (%s) has no record in this run, so the script took another path than before; nothing more ran", c.Seq, c.Tool)
-		case rec.Status == codemode.StatusOutcomeUnknown:
-			return nil, false, &codemode.CallError{Kind: codemode.ErrorOutcomeUnknown, Message: fmt.Sprintf(
-				"call %d (%s) has an unknown outcome in this run's record, so it is not repeated: check whether it took effect, then start a new run", c.Seq, rec.Tool)}
-		case rec.Tool != c.Tool || rec.ArgsHash != hash:
-			return nil, false, diverged("call %d is %s with these arguments, but the run's record has %s; the script took another path than before, so nothing more ran", c.Seq, c.Tool, recordName(rec))
-		case rec.Status != codemode.StatusSucceeded:
-			return nil, false, diverged("call %d (%s) ended %s before, so it cannot be replayed; nothing more ran", c.Seq, c.Tool, rec.Status)
+	rec, recorded := rs.recorded[c.Seq]
+	if c.Seq == rs.heldSeq {
+		if recorded && (rec.Tool != c.Tool || rec.ArgsHash != hash) {
+			return nil, false, diverged("call %d is %s with these arguments, but the held call was %s; the script took another path than before, so nothing more ran", c.Seq, c.Tool, recordName(rec))
 		}
+		if tok := h.takeGrant(c); tok != "" {
+			setArg(c, grantArg, tok)
+		} else if rs.approvalID != "" {
+			setArg(c, approvalIDArg, rs.approvalID)
+		}
+		return nil, false, nil
+	}
+	if !recorded {
+		if c.Seq < rs.heldSeq {
+			return nil, false, diverged("call %d (%s) has no record in this run, so the script took another path than before; nothing more ran", c.Seq, c.Tool)
+		}
+		// A call past every call the run made before: new, so it is sent,
+		// with a grant when one of the request's covers it.
+		if tok := h.takeGrant(c); tok != "" {
+			setArg(c, grantArg, tok)
+		}
+		return nil, false, nil
+	}
+	// A recorded call other than the held one, wherever it sits: with
+	// tools.parallel, a call left un-awaited, or a held call the script
+	// caught, calls numbered after the held one may have run too. The
+	// record decides for each of them, so nothing that ran is sent again.
+	switch {
+	case rec.Tool != c.Tool || rec.ArgsHash != hash:
+		return nil, false, diverged("call %d is %s with these arguments, but the run's record has %s; the script took another path than before, so nothing more ran", c.Seq, c.Tool, recordName(rec))
+	case rec.Status == codemode.StatusOutcomeUnknown:
+		return nil, false, &codemode.CallError{Kind: codemode.ErrorOutcomeUnknown, Message: fmt.Sprintf(
+			"call %d (%s) has an unknown outcome in this run's record, so it is not repeated: check whether it took effect, then start a new run", c.Seq, rec.Tool)}
+	case rec.Status == codemode.StatusSucceeded:
 		if rerunOnResume[rec.Tool] {
 			// A read-only Inbox read: sent again, never replayed.
 			return nil, false, nil
@@ -176,17 +197,10 @@ func (h *hooks) BeforeCall(_ context.Context, c *codemode.PendingCall) (*mcp.Cal
 		h.mu.Unlock()
 		return mcp.NewToolResultText(rec.replayText), true, nil
 	}
-	if c.Seq == rs.heldSeq {
-		if rec, ok := rs.recorded[c.Seq]; ok && (rec.Tool != c.Tool || rec.ArgsHash != hash) {
-			return nil, false, diverged("call %d is %s with these arguments, but the held call was %s; the script took another path than before, so nothing more ran", c.Seq, c.Tool, recordName(rec))
-		}
-		if tok := h.takeGrant(c); tok != "" {
-			setArg(c, grantArg, tok)
-		} else if rs.approvalID != "" {
-			setArg(c, approvalIDArg, rs.approvalID)
-		}
-		return nil, false, nil
-	}
+	// permission_required or deferred (a held call the script caught, with
+	// try_call or tools.tryCall), or failed: the call did not take effect,
+	// so it is sent again, with a grant when one of the request's covers
+	// it (else the gateway holds it again and the script sees that).
 	if tok := h.takeGrant(c); tok != "" {
 		setArg(c, grantArg, tok)
 	}

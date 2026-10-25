@@ -16,6 +16,8 @@ var codeRoutes = map[string][]string{
 	"/v1/code/runs/{id}/resume":            {"post"},
 	"/v1/code/files":                       {"get"},
 	"/v1/code/files/{server}/{tool}.pyi":   {"get"},
+	"/v1/code/files/{server}/{tool}.d.ts":  {"get"},
+	"/v1/code/search":                      {"get"},
 	"/v1/code/docs/{server}/{tool}":        {"get"},
 	"/v1/code/openapi.json":                {"get"},
 	"/v1/code/ty":                          {"get"},

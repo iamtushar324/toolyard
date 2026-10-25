@@ -223,9 +223,11 @@ func (g *Gateway) jobRequest(ctx context.Context, plan *asyncPlan, c jobCall, ev
 	return req
 }
 
-// jobContext is the context a job's call runs on: the call's values, no
-// per-call timeout of its own beyond the job limit, nested calls inline,
-// and no connect link minted into a result that is stored.
+// jobContext is the context a job's call runs on: the call's values (the
+// caller, its raiser, a code-mode script's mark and run id, so a job a
+// script started cannot start code mode and its audit rows name the run),
+// no per-call timeout of its own beyond the job limit, nested calls
+// inline, and no connect link minted into a result that is stored.
 func jobContext(ctx context.Context) context.Context {
 	return WithoutConnectLinks(context.WithValue(ctx, jobRunKey{}, true))
 }
@@ -996,7 +998,9 @@ func (g *Gateway) handleJobsStart() directHandler {
 		if strings.HasPrefix(target, jobsUpstream+".") {
 			return mcp.NewToolResultErrorf("%s cannot run as a job", target), nil
 		}
-		if r, ok := actor.RaiserFrom(ctx); ok && r.Via == codemode.Via && isCodeModeTool(target) {
+		// Code mode cannot nest, however a script reaches it (routeEntry
+		// refuses it at any depth too; this answers early).
+		if r, ok := actor.RaiserFrom(ctx); ok && (r.Via == codemode.Via || isWithinCodeMode(ctx)) && isCodeModeTool(target) {
 			return mcp.NewToolResultErrorf("%s cannot be called from code mode: call the tools you need directly in the script", target), nil
 		}
 		ref := strings.TrimSpace(stringArg(args, "callback_ref"))

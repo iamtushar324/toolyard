@@ -16,6 +16,7 @@ import (
 	"github.com/tusharbhardwaj/toolyard/internal/actor"
 	"github.com/tusharbhardwaj/toolyard/internal/approval"
 	"github.com/tusharbhardwaj/toolyard/internal/audit"
+	"github.com/tusharbhardwaj/toolyard/internal/codemode"
 	"github.com/tusharbhardwaj/toolyard/internal/inbox"
 	"github.com/tusharbhardwaj/toolyard/internal/jobs"
 	"github.com/tusharbhardwaj/toolyard/internal/memory"
@@ -698,5 +699,58 @@ func TestFullBudgetRunsAsyncToolsInline(t *testing.T) {
 	explicit, _ := gw.RouteCall(ctx, "test", MetaJobsStart, map[string]any{ReasonField: jobsTestReason, "tool": "alpha.get_fast", "arguments": map[string]any{}})
 	if !explicit.IsError || structured(t, explicit)["status"] != "job_budget_exceeded" {
 		t.Fatalf("jobs.start over the budget = %s", textOf(explicit))
+	}
+}
+
+// A job a code-mode script starts keeps the script's mark and run id, in
+// both async modes: the job cannot start code mode, and its audit rows
+// name the run. jobs.start of a code-mode tool from a script is refused.
+func TestJobsFromCodeModeKeepTheScriptContext(t *testing.T) {
+	f := newJobsFixture(t)
+	nested := make(chan *mcp.CallToolResult, 4)
+	f.gw.registerEntry(toolEntry{
+		tool: mcp.Tool{Name: "alpha.get_nested", Description: descriptionBanner + "nested",
+			InputSchema: mcp.ToolInputSchema{Type: "object", Properties: addMetaProps(map[string]any{})}},
+		upstream: "alpha", originalName: "get_nested", reasonField: ReasonField,
+		handle: func(ctx context.Context, _ map[string]any) (*mcp.CallToolResult, error) {
+			res, _ := f.gw.RouteCall(ctx, "test", CodeModeExecuteToolCode, map[string]any{"code": "result = 1"})
+			nested <- res
+			time.Sleep(100 * time.Millisecond) // past the `after` wait below
+			return mcp.NewToolResultText("nested done"), nil
+		},
+	})
+	script := func(runID string) context.Context {
+		ctx := actor.WithRaiser(WithAgentID(context.Background(), "ag_1"), actor.Raiser{CallerID: "ag_1", Via: codemode.Via})
+		return audit.WithRunID(withinCodeMode(ctx), runID)
+	}
+	for _, mode := range []jobs.AsyncRule{{Mode: jobs.AsyncAlways}, {Mode: jobs.AsyncAfter, AfterMs: 10}} {
+		runID := "run_" + mode.Mode
+		f.rules.set("alpha", jobs.AsyncSetting{Tools: map[string]jobs.AsyncRule{"get_nested": mode}})
+		res, err := f.gw.RouteCall(script(runID), codemode.Via, "alpha.get_nested", map[string]any{ReasonField: jobsTestReason})
+		if err != nil {
+			t.Fatal(err)
+		}
+		id := jobIDOf(t, res)
+		select {
+		case got := <-nested:
+			if !got.IsError || !strings.Contains(textOf(got), "cannot be called from code mode") {
+				t.Fatalf("%s: executeToolCode inside a script's job = %s", mode.Mode, textOf(got))
+			}
+		case <-time.After(10 * time.Second):
+			t.Fatalf("%s: the job's call never ran", mode.Mode)
+		}
+		if w := f.waitJob(t, id); w["status"] != jobs.StatusSucceeded {
+			t.Fatalf("%s: job = %v", mode.Mode, w)
+		}
+		var n int
+		if err := f.db.QueryRow(`SELECT COUNT(*) FROM audit_events WHERE tool_name = ? AND event_type = 'call.dispatch' AND run_id = ?`,
+			"alpha.get_nested", runID).Scan(&n); err != nil || n != 1 {
+			t.Fatalf("%s: dispatch audit rows with the script's run id = %d (%v)", mode.Mode, n, err)
+		}
+	}
+	started, err := f.gw.RouteCall(script("run_start"), codemode.Via, MetaJobsStart, map[string]any{
+		ReasonField: jobsTestReason, "tool": CodeModeExecuteToolCode, "arguments": map[string]any{"code": "result = 1"}})
+	if err != nil || !started.IsError || !strings.Contains(textOf(started), "cannot be called from code mode") {
+		t.Fatalf("jobs.start of executeToolCode from a script = %s %v", textOf(started), err)
 	}
 }

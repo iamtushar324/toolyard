@@ -333,7 +333,7 @@ func expectClean(t *testing.T, rt *Runtime, took time.Duration) {
 	if pid := int(rt.lastPID.Load()); pid != 0 && !processGone(pid) {
 		t.Fatalf("worker %d is still alive", pid)
 	}
-	if n := len(rt.sem); n != 0 {
+	if n := rt.slotsInUse(); n != 0 {
 		t.Fatalf("%d concurrency slots still held", n)
 	}
 }
@@ -510,7 +510,7 @@ result = {"rows": len(rows), "first": rows[0]["name"], "last_id": rows[-1]["id"]
 	if failed {
 		t.Fatalf("5 MiB result at the default cap:\n%.600s", text)
 	}
-	for _, want := range []string{`"rows": 128000`, `"first": "abcdefghijklmnop"`, `"last_id": 1362566`, `"sum_tail": 2725131`, "[print output truncated: 1048576 byte limit reached]"} {
+	for _, want := range []string{`"rows": 128000`, `"first": "abcdefghijklmnop"`, `"last_id": 1362566`, `"sum_tail": 2725131`, "[TOOL] echo stopped: tool answers used their 768 KiB share of the output"} {
 		if !strings.Contains(text, want) {
 			t.Errorf("output missing %q:\n%.600s", want, text)
 		}
