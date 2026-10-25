@@ -614,7 +614,11 @@ func (g *Gateway) changePolicy(ctx context.Context, args map[string]any, clear b
 	if !enrolledAgent(agentID) {
 		return refuse("agent_required", fmt.Sprintf("%s needs an enrolled agent: connect with an agent token (Authorization: Bearer …). People change policies on the dashboard's Policies page.", verb))
 	}
-	if !g.scopeFor(ctx, agentID).All {
+	if sc := g.scopeFor(ctx, agentID); !sc.All {
+		if sc.OwnerIsAdmin() {
+			return refuse("admin_only", fmt.Sprintf("%s refused: your owner limited what this agent may use (Connected apps), so it may not change policies, which apply to every agent. "+
+				"Ask your owner to change the policy on the dashboard.", verb))
+		}
 		return refuse("admin_only", fmt.Sprintf("%s refused: policies apply to every agent on this toolyard, so only an admin's agent may change them, and your owner is a member. "+
 			"Ask an admin, or use policies.explain to tell your owner why a call needs approval.", verb))
 	}
@@ -987,11 +991,11 @@ func (g *Gateway) handleAccessWhoami() directHandler {
 		switch {
 		case scope.Denied:
 			role = "blocked"
-		case scope.All:
+		case scope.OwnerIsAdmin():
 			role = "admin"
 		}
 		var granted any = "all"
-		if !scope.All {
+		if !scope.OwnerIsAdmin() {
 			names := make([]string, 0, len(scope.Groups))
 			for gname := range scope.Groups {
 				names = append(names, gname)
@@ -1016,6 +1020,10 @@ func (g *Gateway) handleAccessWhoami() directHandler {
 		}
 		if raiser.AgentSessionID != "" {
 			out["session_id"] = raiser.AgentSessionID
+		}
+		if scope.Limits != nil {
+			// The agent's own allow and deny lists narrow its owner's scope.
+			out["agent_limits"] = scope.Limits.Describe()
 		}
 		switch {
 		case agentID == "":

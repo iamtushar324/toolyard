@@ -115,6 +115,11 @@ func memberAllowlist() map[string]bool {
 		"POST /v1/agents/x/rotate", "POST /v1/agents/x/disable", "POST /v1/agents/x/enable",
 		"DELETE /v1/agents/x",
 		"GET /v1/me/servers",
+		// Connected apps and per-agent scopes; the handlers act only on the
+		// member's own apps and agents.
+		"GET /v1/me/apps", "GET /v1/me/apps/config", "POST /v1/me/apps/rename", "POST /v1/me/apps/scope",
+		"POST /v1/me/apps/revoke", "GET /v1/me/apps/catalog", "GET /v1/me/apps/audit",
+		"GET /v1/me/agent-scopes", "POST /v1/me/agent-scopes",
 		"GET /v1/connections/hosts", "POST /v1/connections/hosts/x/revoke",
 		"POST /v1/connections/host/begin", "POST /v1/connections/host/poll", "POST /v1/connections/host/cancel",
 		"POST /v1/connections/host/renew", "POST /v1/connections/host/revoke", "POST /v1/connections/host/handoff",

@@ -63,6 +63,7 @@ import (
 	"github.com/tusharbhardwaj/toolyard/internal/inbox"
 	"github.com/tusharbhardwaj/toolyard/internal/keyguard"
 	"github.com/tusharbhardwaj/toolyard/internal/logx"
+	"github.com/tusharbhardwaj/toolyard/internal/mcpauth"
 	"github.com/tusharbhardwaj/toolyard/internal/memory"
 	"github.com/tusharbhardwaj/toolyard/internal/mempalace"
 	"github.com/tusharbhardwaj/toolyard/internal/memwebhook"
@@ -1250,6 +1251,15 @@ func runServe(argv []string) error {
 		ClerkFrontendAPI: clerkFAPI,
 	}
 
+	// OAuth 2.1 for MCP clients (docs/guidelines/connect-clients.md): on
+	// whenever -public-url is set, unless an admin turned it off in
+	// settings. Its sweeper is safe on every node (sweep.go).
+	mcpAuthSvc := mcpauth.New(mcpauth.Options{DB: db, PublicURL: *publicURL, Settings: settingsSvc, Access: accessSvc})
+	go mcpAuthSvc.Run(ctx)
+	if mcpAuthSvc.Enabled() {
+		log.Printf("mcp-oauth: authorization server on (issuer %s, resource %s)", mcpAuthSvc.Issuer(), mcpAuthSvc.Resource())
+	}
+
 	// REST API + dashboard.
 	apiSrv := api.New(ctx, api.Options{
 		Federation: federationSvc, Callbacks: callbackSvc,
@@ -1298,6 +1308,7 @@ func runServe(argv []string) error {
 
 	mux := http.NewServeMux()
 	apiSrv.Routes(mux)
+	apiSrv.MCPOAuthRoutes(mux, mcpAuthSvc)
 
 	// Streamable HTTP MCP transport at /mcp. Agents use this if they prefer
 	// HTTP over stdio. Auth via Authorization: Bearer <agent-token>, or
@@ -1307,7 +1318,11 @@ func runServe(argv []string) error {
 	// guard, which also works out who raised the call (agent, owner,
 	// client, session) for the audit log. -require-auth-on-mcp
 	// (auto-enabled with -public-url) rejects anonymous traffic too.
-	mcpAuthn := mcpAuth{verify: federationSvc.VerifyAgent, requireAuth: *requireAuthMCP, sec: secOpts}
+	// An OAuth access token (mcpauth) is checked by the authorization
+	// server; every 401 names its protected-resource metadata while OAuth
+	// is on, so MCP clients can sign the person in.
+	mcpAuthn := mcpAuth{verify: federationSvc.VerifyAgent, verifyOAuth: mcpAuthSvc.VerifyAccessToken,
+		resourceMetadata: mcpAuthSvc.ResourceMetadataURL, requireAuth: *requireAuthMCP, sec: secOpts}
 	streamable := server.NewStreamableHTTPServer(gw.MCPServer(),
 		server.WithEndpointPath("/mcp"),
 		// Stateless mode is opt-in via -stateless-mcp. The default
@@ -1847,6 +1862,7 @@ func staticHandler() http.Handler {
 	appHash := assetHash(sub, "app.js")
 	cssHash := assetHash(sub, "style.css")
 	settingsHash := assetHash(sub, "settings.js")
+	appsHash := assetHash(sub, "apps.js")
 	workspaceHash := assetHash(sub, "workspace.css")
 	swHash := assetHash(sub, "sw.js")
 	loginHash := assetHash(sub, "login.js")
@@ -1854,6 +1870,7 @@ func staticHandler() http.Handler {
 		out := strings.ReplaceAll(string(body), `src="/app.js"`, `src="/app.js?v=`+appHash+`"`)
 		out = strings.ReplaceAll(out, `href="/style.css"`, `href="/style.css?v=`+cssHash+`"`)
 		out = strings.ReplaceAll(out, `src="/settings.js"`, `src="/settings.js?v=`+settingsHash+`"`)
+		out = strings.ReplaceAll(out, `src="/apps.js"`, `src="/apps.js?v=`+appsHash+`"`)
 		out = strings.ReplaceAll(out, `href="/workspace.css"`, `href="/workspace.css?v=`+workspaceHash+`"`)
 		return []byte(out)
 	}
@@ -1894,12 +1911,14 @@ func staticHandler() http.Handler {
 			http.NotFound(w, r)
 			return
 		}
-		// MCP-over-HTTP clients probe OAuth discovery endpoints first
-		// (.well-known/oauth-protected-resource, oauth-authorization-server,
-		// /register). We use static bearer-token auth, so these must 404 —
-		// returning the SPA's index.html breaks the client with
-		// "Failed to parse JSON" because it expects a discovery document.
-		if strings.HasPrefix(r.URL.Path, "/.well-known/") ||
+		// MCP-over-HTTP clients probe OAuth discovery endpoints. The ones
+		// toolyard serves (the RFC 9728 and RFC 8414 documents, /oauth/*,
+		// mcpauth) and /.well-known/toolyard-instance are mux routes and
+		// never reach here. Every other discovery guess must 404: the SPA's
+		// index.html breaks a client with "Failed to parse JSON" because it
+		// expects a document. That includes the root /register, /authorize
+		// and /token that pre-metadata clients guess.
+		if strings.HasPrefix(r.URL.Path, "/.well-known/") || strings.HasPrefix(r.URL.Path, "/oauth/") ||
 			r.URL.Path == "/register" ||
 			r.URL.Path == "/authorize" ||
 			r.URL.Path == "/token" {

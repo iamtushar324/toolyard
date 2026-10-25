@@ -114,6 +114,74 @@ published image and production settings, see [Containers](#containers).
    Conductor workspaces use the same hook config as the agent type they run
    (Claude Code or Codex); there is no separate Conductor hook endpoint.
 
+## OAuth for MCP clients
+
+toolyard is an OAuth 2.1 authorization server for its own `/mcp`, so people
+can add it to ChatGPT, Claude.ai, Claude Code, Codex, Cursor and other MCP
+clients by URL (`<public-url>/mcp`) and sign in through the browser. The
+step-by-step guide for each client is
+[docs/guidelines/connect-clients.md](guidelines/connect-clients.md).
+Agent tokens keep working next to it.
+
+**When it is on.** It needs `-public-url`: that origin is the issuer and,
+with `/mcp`, the only resource a token is valid for. With `-public-url` it
+is on by default. An admin turns it off or on with the `mcp_oauth_enabled`
+setting (the Connected apps page, or `PATCH /v1/settings`). While it is
+off, the endpoints below answer 404, `/mcp` sends no `WWW-Authenticate`
+hint, and issued OAuth tokens stop working.
+
+**Endpoints.** Your reverse proxy must pass these through to toolyard, next
+to `/mcp` and the dashboard:
+
+| Path | What |
+|---|---|
+| `/.well-known/oauth-protected-resource` (and `…/mcp`) | RFC 9728 protected-resource metadata |
+| `/.well-known/oauth-authorization-server` | RFC 8414 authorization server metadata |
+| `/oauth/register` | RFC 7591 dynamic client registration (60 per client IP per hour) |
+| `/oauth/authorize`, `/oauth/consent` | the browser steps: sign-in, then the consent screen |
+| `/oauth/token` | `authorization_code` (PKCE `S256` required) and `refresh_token` |
+| `/oauth/revoke` | RFC 7009 revocation |
+
+Every other `/.well-known/` path still answers 404.
+`/.well-known/toolyard-instance` (federation) is unchanged.
+
+**Settings** (admin; `PATCH /v1/settings` or the Connected apps page):
+
+| Key | Default | What |
+|---|---|---|
+| `mcp_oauth_enabled` | `true` with `-public-url` | the instance switch |
+| `mcp_oauth_redirect_hosts` | empty (any) | allow list of client redirect hosts, comma separated: `claude.ai`, `chatgpt.com`, `*.example.com`, `localhost`, `127.0.0.1`, or `cursor:` for a private-use scheme |
+| `mcp_oauth_access_ttl_minutes` | 60 | access token lifetime, 5 to 1440 |
+| `mcp_oauth_refresh_ttl_days` | 30 | refresh token lifetime, 1 to 365, renewed on every refresh |
+
+**How a connection works.** Each person's authorization of one client is a
+grant. It runs as an agent that the person owns: its name is the nickname
+from the consent screen, and it reports `agent_kind` `oauth_client` in
+audit rows and `access.whoami`. (The `agents.kind` column keeps `agent`;
+the grant row marks the agent as a client.) The consent screen also sets a
+per-agent tool scope (`agent_scopes`): everything the owner can use, or
+only chosen servers and tools, with blocks. The same per-agent scope works
+for every agent. Approval rules do not change.
+
+**Security notes.**
+
+- Redirect URIs must be `https`, `http` on the loopback interface (the port
+  may change, RFC 8252), or a private-use scheme such as `cursor://`. They
+  are matched exactly otherwise. `javascript:`, `data:`, `file:` and similar
+  schemes are refused.
+- Client ID metadata documents are fetched only from public addresses: the
+  connection goes to the address that was checked, TLS verifies the host,
+  redirects are not followed, and the size (64 KiB) and time (8 s) are
+  bounded. A document is cached for its `max-age` (5 minutes to 24 hours).
+- Codes are single use and last 60 seconds. A code used twice revokes the
+  tokens it produced. A refresh token used twice revokes the whole grant
+  and disables its agent; the person connects the app again.
+- Tokens, codes and client secrets are stored as SHA-256 hashes. Access
+  tokens start `tyat_`, refresh tokens `tyrt_`.
+- All of this state is in the database (`mcp_oauth_*` tables), so several
+  replicas on one Postgres database share it. The sweeper that deletes
+  expired rows is safe to run on every node.
+
 ## Code mode (Bifrost-compatible)
 
 Agents and skills written for the Bifrost MCP gateway's code mode work
