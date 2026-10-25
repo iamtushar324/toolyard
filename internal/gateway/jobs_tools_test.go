@@ -82,6 +82,8 @@ type jobsFixture struct {
 
 	release       chan struct{}
 	releaseOnce   sync.Once
+	slowStarted   chan struct{}
+	startedOnce   sync.Once
 	slowCancelled chan struct{}
 	cancelOnce    sync.Once
 	echoArgs      chan map[string]any
@@ -109,7 +111,7 @@ func newJobsFixture(t *testing.T, opts ...func(*jobsFixtureConfig)) *jobsFixture
 	}
 	f := &jobsFixture{
 		db: db, rules: &asyncRules{m: map[string]jobs.AsyncSetting{}}, notes: &jobNotes{},
-		release: make(chan struct{}), slowCancelled: make(chan struct{}), echoArgs: make(chan map[string]any, 8),
+		release: make(chan struct{}), slowStarted: make(chan struct{}), slowCancelled: make(chan struct{}), echoArgs: make(chan map[string]any, 8),
 	}
 	f.svc = jobs.New(db, jobs.Options{Notifier: f.notes, PollEvery: 20 * time.Millisecond})
 	gopts := Options{Policy: policy.New(db), Approval: bus, Audit: audit.New(db), Hub: realtime.NewHub(), Memory: memory.New(db), Jobs: f.svc}
@@ -151,6 +153,7 @@ func newJobsFixture(t *testing.T, opts ...func(*jobsFixtureConfig)) *jobsFixture
 		})
 	}
 	reg("get_slow", func(ctx context.Context, _ map[string]any) (*mcp.CallToolResult, error) {
+		f.startedOnce.Do(func() { close(f.slowStarted) })
 		select {
 		case <-f.release:
 			return mcp.NewToolResultText("slow done"), nil
@@ -354,12 +357,11 @@ func TestJobsCancelStopsTheRunningCall(t *testing.T) {
 	f := newJobsFixture(t)
 	f.rules.set("alpha", jobs.AsyncSetting{Tools: map[string]jobs.AsyncRule{"get_slow": {Mode: jobs.AsyncAlways}}})
 	id := jobIDOf(t, f.call(t, "alpha.get_slow", nil))
-	deadline := time.Now().Add(10 * time.Second)
-	for structured(t, f.call(t, MetaJobsStatus, map[string]any{"job_id": id}))["status"] != jobs.StatusRunning {
-		if time.Now().After(deadline) {
-			t.Fatal("the job never started")
-		}
-		time.Sleep(10 * time.Millisecond)
+	// The upstream call is in flight before the cancel.
+	select {
+	case <-f.slowStarted:
+	case <-time.After(10 * time.Second):
+		t.Fatal("the job's call never started")
 	}
 	c := structured(t, f.call(t, MetaJobsCancel, map[string]any{"job_id": id}))
 	if c["cancel_accepted"] != true {

@@ -269,6 +269,11 @@ func (g *Gateway) startJob(ctx context.Context, plan *asyncPlan, c jobCall, ev *
 		if refusal := g.recheckJob(rctx, c); refusal != "" {
 			return jobs.Outcome{Status: jobs.StatusFailed, Envelope: encodeJobResult(mcp.NewToolResultError(refusal)), IsError: true, Error: refusal}
 		}
+		// Cancelled (jobs.cancel, shutdown) before the call was sent:
+		// nothing ran.
+		if rctx.Err() != nil {
+			return jobs.Outcome{Status: jobs.StatusCancelled, Error: "cancelled before the call was sent; nothing ran"}
+		}
 		jev := newJobEvent(base)
 		started := time.Now()
 		res, derr := run(withProgressSink(rctx, progress), jobEntry, &jev)
