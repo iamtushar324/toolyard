@@ -37,7 +37,7 @@ test('Markdown keeps only http, https and mailto links',()=>{
   const h=harness();
   const tree=md(h,['[a](javascript:alert(1))','[b](data:text/html;base64,PHNjcmlwdD4=)','[c](&#106;avascript:alert(1))','[d](//evil.example/x)','[e](vbscript:msgbox)','<javascript:alert(1)>','[f](java\tscript:alert(1))','[g](https://example.com/a_(b))','<mailto:owner@example.com>','see https://ci.example.com/run/42.','[h](http://example.com "Title")'].join('\n\n'));
   const links=nodes(tree,'a');
-  assert.deepEqual(links.map(a=>a.attrs.href),['https://example.com/a_(b)','mailto:owner@example.com','https://ci.example.com/run/42','http://example.com']);
+  assert.deepEqual(plain(links.map(a=>a.attrs.href)),['https://example.com/a_(b)','mailto:owner@example.com','https://ci.example.com/run/42','http://example.com']);
   for(const a of links){assert.match(a.attrs.rel,/noopener/);assert.match(a.attrs.rel,/noreferrer/);}
   assert.equal(links[0].attrs.target,'_blank');
   assert.equal(links[3].attrs.title,'Title');
@@ -49,9 +49,9 @@ test('Markdown images show only the item\'s own uploads',()=>{
   const req={inline_images:[{ref:'upload:'+SHA,blob:BLOB}],attachments:[{type:'image',url:'https://cdn.example/shot.png',blob:'c'.repeat(64)}]};
   const tree=md(h,`![own](upload:${SHA}) ![copied](https://cdn.example/shot.png) ![remote](https://evil.example/x.png) ![bad](javascript:alert(1)) ![other](upload:${'d'.repeat(64)})`,req);
   const imgs=nodes(tree,'img');
-  assert.deepEqual(imgs.map(i=>i.attrs.src),['/v1/inbox/blobs/'+BLOB,'/v1/inbox/blobs/'+'c'.repeat(64)]);
+  assert.deepEqual(plain(imgs.map(i=>i.attrs.src)),['/v1/inbox/blobs/'+BLOB,'/v1/inbox/blobs/'+'c'.repeat(64)]);
   assert.equal(imgs[0].attrs.alt,'own');
-  assert.deepEqual(nodes(tree,'a').map(a=>a.attrs.href),['https://evil.example/x.png']);
+  assert.deepEqual(plain(nodes(tree,'a').map(a=>a.attrs.href)),['https://evil.example/x.png']);
   assert.match(text({children:tree}),/bad/);
 });
 

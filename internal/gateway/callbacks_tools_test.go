@@ -205,4 +205,7 @@ func TestCallbackRefArgumentFollowsLegacyApproval(t *testing.T) {
 	if callbackRefFrom(ctx) != "cb_x" || callbackRefFrom(context.Background()) != "" {
 		t.Fatal("callback ref context")
 	}
+	if nested := withCallbackRef(ctx, map[string]any{"a": "b"}); callbackRefFrom(nested) != "" {
+		t.Fatal("a nested call inherited the outer call's _callback_ref")
+	}
 }

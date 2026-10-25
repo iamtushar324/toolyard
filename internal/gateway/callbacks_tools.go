@@ -20,10 +20,12 @@ const callbackRefArg = "_callback_ref"
 
 type callbackRefKey struct{}
 
-// withCallbackRef carries a call's _callback_ref to holdAndWait.
+// withCallbackRef carries a call's _callback_ref to holdAndWait. Each call
+// names its own: a nested call (code mode, tools.execute) without one does
+// not inherit the outer call's.
 func withCallbackRef(ctx context.Context, args map[string]any) context.Context {
 	ref := strings.TrimSpace(stringArg(args, callbackRefArg))
-	if ref == "" {
+	if ref == "" && callbackRefFrom(ctx) == "" {
 		return ctx
 	}
 	return context.WithValue(ctx, callbackRefKey{}, ref)
