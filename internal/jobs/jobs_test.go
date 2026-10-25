@@ -8,6 +8,7 @@ import (
 	"errors"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -1279,5 +1280,148 @@ func TestRecordedAnswersOfAnonymousCallersAreCapped(t *testing.T) {
 	}
 	if _, err := svc.Record(ctx, anon, refused); !errors.Is(err, jobs.ErrTooManyRecorded) {
 		t.Fatalf("second anonymous recorded answer: %v", err)
+	}
+}
+
+// insertStale stores a running job whose owner stopped long ago (its lease
+// ended).
+func insertStale(t *testing.T, db *store.DB, id string) {
+	t.Helper()
+	if _, err := db.ExecContext(context.Background(), `INSERT INTO tool_jobs(id, agent_id, owner_user_id, tool, upstream, params_hash, reason, via,
+        status, owner_instance, lease_until, created_at, started_at, updated_at)
+        VALUES(?, 'ag_1', 'u_1', 'alpha.write', 'alpha', 'h', 'test the job recovery grace', 'direct', 'running', 'node-gone', 1, 1, 1, 1)`, id); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func jobStatus(t *testing.T, svc *jobs.Service, id string) string {
+	t.Helper()
+	j, err := svc.Get(context.Background(), id)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return j.Status
+}
+
+// Recovery waits one lease after the service starts: a replica that was
+// down with the database renews its leases first.
+func TestRecoveryWaitsALeaseAfterStartup(t *testing.T) {
+	db := storetest.Open(t)
+	insertStale(t, db, "job_stale")
+	const lease = 2 * time.Second
+	svc := newService(t, db, jobs.Options{InstanceID: "node-b", LeaseTTL: lease})
+	ctx, stop := context.WithCancel(context.Background())
+	defer stop()
+	started := time.Now()
+	svc.Run(ctx)
+	time.Sleep(lease / 4)
+	if st := jobStatus(t, svc, "job_stale"); st != jobs.StatusRunning && time.Since(started) < lease {
+		t.Fatalf("recovered %s after startup, within the grace: %s", time.Since(started), st)
+	}
+	waitUntil(t, "recovery after the grace", func() bool { return jobStatus(t, svc, "job_stale") == jobs.StatusOutcomeUnknown })
+}
+
+// Recovery waits one lease after the database last failed to answer: an
+// outage longer than the lease does not make live jobs read as abandoned
+// the moment the database is back.
+func TestRecoveryWaitsALeaseAfterADatabaseFailure(t *testing.T) {
+	db := storetest.Open(t)
+	insertStale(t, db, "job_stale")
+	const lease = 2 * time.Second
+	var down atomic.Bool
+	down.Store(true)
+	svc := newService(t, db, jobs.Options{InstanceID: "node-b", LeaseTTL: lease, Ping: func(ctx context.Context) error {
+		if down.Load() {
+			return errors.New("the database does not answer")
+		}
+		return db.PingContext(ctx)
+	}})
+	ctx, stop := context.WithCancel(context.Background())
+	defer stop()
+	svc.Run(ctx)
+	time.Sleep(lease + lease/2) // past the startup grace, the database still down
+	if st := jobStatus(t, svc, "job_stale"); st != jobs.StatusRunning {
+		t.Fatalf("recovered while the database failed: %s", st)
+	}
+	down.Store(false)
+	back := time.Now()
+	time.Sleep(lease / 4)
+	// The last failed ping was at most one pass (lease/2) before back, so
+	// the grace lasts until at least back + lease/2.
+	if st := jobStatus(t, svc, "job_stale"); st != jobs.StatusRunning && time.Since(back) < lease/2 {
+		t.Fatalf("recovered %s after the database came back, within the grace: %s", time.Since(back), st)
+	}
+	waitUntil(t, "recovery after the grace", func() bool { return jobStatus(t, svc, "job_stale") == jobs.StatusOutcomeUnknown })
+}
+
+// reservedCounter is a Reserved that counts its statements and runs them
+// on the pool.
+type reservedCounter struct {
+	db *store.DB
+	n  atomic.Int32
+}
+
+func (r *reservedCounter) ExecReserved(ctx context.Context, query string, args ...any) (int64, error) {
+	r.n.Add(1)
+	res, err := r.db.ExecContext(ctx, query, args...)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
+}
+
+// With a reserved connection, the heartbeat renews leases on it.
+func TestHeartbeatRenewsOnTheReservedConnection(t *testing.T) {
+	db := storetest.Open(t)
+	res := &reservedCounter{db: db}
+	svc := newService(t, db, jobs.Options{Reserved: res})
+	ctx := context.Background()
+	release := make(chan struct{})
+	defer close(release)
+	job, _, err := svc.Start(ctx, startReq("ag_1", "alpha.get_slow"), blockUntil(release))
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitUntil(t, "running", func() bool { j, _ := svc.Get(ctx, job.ID); return j != nil && j.Status == jobs.StatusRunning })
+	if _, err := db.ExecContext(ctx, `UPDATE tool_jobs SET lease_until = 1 WHERE id = ?`, job.ID); err != nil {
+		t.Fatal(err)
+	}
+	svc.Heartbeat(ctx)
+	if res.n.Load() == 0 {
+		t.Fatal("the heartbeat did not use the reserved connection")
+	}
+	if j, _ := svc.Get(ctx, job.ID); j.LeaseUntil <= 1 || j.Final() {
+		t.Fatalf("lease not renewed: %+v", j)
+	}
+}
+
+// A queued job that gets a run slot after the drain began never starts:
+// it ends failed, nothing ran, and its call is never made.
+func TestQueuedJobsDoNotStartDuringADrain(t *testing.T) {
+	db := storetest.Open(t)
+	svc := newService(t, db, jobs.Options{MaxRunning: 1})
+	ctx := context.Background()
+	release := make(chan struct{})
+	first, _, err := svc.Start(ctx, startReq("ag_1", "alpha.get_slow"), blockUntil(release))
+	if err != nil {
+		t.Fatal(err)
+	}
+	waitUntil(t, "the first job running", func() bool { j, _ := svc.Get(ctx, first.ID); return j != nil && j.Status == jobs.StatusRunning })
+	var ran atomic.Bool
+	queued, _, err := svc.Start(ctx, startReq("ag_2", "alpha.get_other"), func(context.Context, jobs.ProgressFunc) jobs.Outcome {
+		ran.Store(true)
+		return jobs.Outcome{Status: jobs.StatusSucceeded}
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	svc.BeginDrain()
+	close(release) // the slot frees
+	got := waitFinal(t, svc, queued.ID)
+	if got.Status != jobs.StatusFailed || !got.NothingRan || got.StartedAt != 0 || !strings.Contains(got.Error, "nothing ran") || ran.Load() {
+		t.Fatalf("queued job during the drain = %+v (ran: %v)", got, ran.Load())
+	}
+	if j := waitFinal(t, svc, first.ID); j.Status != jobs.StatusSucceeded {
+		t.Fatalf("the running job = %+v", j)
 	}
 }

@@ -342,6 +342,13 @@ func (s *Service) execute(ctx context.Context, job *Job, r *run, fn RunFunc) {
 		s.settleUnstarted(ctx, job.ID, r, "")
 		return
 	}
+	if s.draining.Load() {
+		// The server began to drain while the job waited for a slot: a
+		// queued job never starts now (nothing ran), so the drain does not
+		// wait on new calls it would have to cut short.
+		s.settleUnstarted(ctx, job.ID, r, msgDrainBeforeStart)
+		return
+	}
 	claimed, err := s.claim(ctx, job.ID)
 	if err != nil {
 		s.log.Warn("job: could not mark running", "job_id", job.ID, "err", err.Error())

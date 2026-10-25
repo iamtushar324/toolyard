@@ -937,6 +937,15 @@ How the replicas share the work:
   everything it finds, as before. An auto-approved call that runs in line
   writes its claim in the same transaction as the decision, so no recovery
   ever runs it a second time.
+- **Async tool jobs** follow the same rule with their own loop on every
+  replica: each replica renews its jobs' leases every 5 seconds (on the
+  cluster's reserved connection, so a busy pool cannot delay it), and any
+  replica settles a job whose lease ended (a running one `outcome_unknown`,
+  a queued one `failed`; nothing is run twice). Recovery waits one lease
+  (60 seconds) after the replica starts and after the database last failed
+  to answer it, so a failover longer than the lease does not cut short
+  the calls of replicas that are still alive. A replica that drains starts
+  no queued job: such a job ends `failed`, nothing ran.
 - **Caches** (policies, settings, auto-approval rules, OAuth bearers, the
   upstream servers, MCP client names, the Web Push key pair) are refreshed
   on every replica when one replica writes; replicas send each other these

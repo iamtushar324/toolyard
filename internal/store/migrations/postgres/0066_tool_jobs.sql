@@ -34,6 +34,7 @@
 -- a NUL byte and the result), never an Inbox attachment's content hash.
 --
 -- Same table as migrations/sqlite/0066_tool_jobs.sql.
+-- Rollback: an older binary ignores the table.
 CREATE TABLE IF NOT EXISTS tool_jobs (
     id               TEXT PRIMARY KEY,
     agent_id         TEXT NOT NULL,
