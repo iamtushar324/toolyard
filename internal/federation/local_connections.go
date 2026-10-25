@@ -46,8 +46,11 @@ func (s *Service) ConnectLocal(ctx context.Context, bootstrap string, b LocalBin
 	if err != nil || u.Status != identity.StatusActive {
 		return nil, ErrRevoked
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	unlock, lerr := s.lock(ctx)
+	if lerr != nil {
+		return nil, lerr
+	}
+	defer unlock()
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, err
@@ -175,8 +178,11 @@ func (s *Service) RenewLocal(ctx context.Context, token string, expected int) (*
 	if err != nil {
 		return nil, ErrUnauthorized
 	}
-	s.mu.Lock()
-	defer s.mu.Unlock()
+	unlock, lerr := s.lock(ctx)
+	if lerr != nil {
+		return nil, lerr
+	}
+	defer unlock()
 	if err = s.localValid(ctx, a.ID, true); err != nil {
 		return nil, err
 	}

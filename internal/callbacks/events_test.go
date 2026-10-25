@@ -531,3 +531,90 @@ func TestRotationRebindsSubjectSubscriptions(t *testing.T) {
 		t.Fatalf("subject subscription revision %d", rev)
 	}
 }
+
+// A receiver that takes no approval.* (or no inbox.*) event never follows
+// what it would not hear of: refused when named, skipped as a default.
+func TestReceiversFollowOnlyWhatTheyHearOf(t *testing.T) {
+	s, db := fixture(t)
+	ctx := t.Context()
+	jobs, err := s.RegisterPullWith(ctx, "agent", "mac", "jobs-only", testSecret(), Subscription{Events: []string{"job.*"}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ap := &approval.Request{ID: "ap_jobs", AgentID: "agent", ToolName: "github.merge_pull_request", Status: approval.StatusPending}
+	if err = s.SubscribeApproval(ctx, ap, jobs.ID); !errors.Is(err, ErrNoApprovalEvents) {
+		t.Fatalf("named receiver without approval events: %v", err)
+	}
+	if err = s.CheckSubscription(ctx, "agent", jobs.ID, &inbox.Request{ID: "rq_jobs", AgentID: "agent"}); !errors.Is(err, ErrNoInboxEvents) {
+		t.Fatalf("named receiver without inbox events: %v", err)
+	}
+	if err = s.SetDefault(ctx, "agent", jobs.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err = s.SubscribeApproval(ctx, ap, ""); err != nil {
+		t.Fatalf("a default receiver without approval events must be skipped quietly: %v", err)
+	}
+	newItem(t, s, db, "rq_jobs", "agent", "")
+	var subs int
+	db.QueryRow(`SELECT (SELECT count(*) FROM callback_subject_subscriptions)+(SELECT count(*) FROM callback_subscriptions)`).Scan(&subs)
+	if subs != 0 {
+		t.Fatalf("%d subscriptions for a receiver that hears of neither", subs)
+	}
+	tx, _ := db.BeginTx(ctx, nil)
+	defer tx.Rollback()
+	if err = s.RegisterTx(ctx, tx, &inbox.Request{ID: "rq_jobs", AgentID: "agent"}, jobs.ID); !errors.Is(err, ErrNoInboxEvents) {
+		t.Fatalf("RegisterTx: %v", err)
+	}
+	tx.Rollback()
+	// Through the bus, the refusal reaches the deferred answer.
+	bus, err := approval.New(ctx, db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bus.SetEventSink(s)
+	held, err := bus.Hold(ctx, approval.NewRequest{AgentID: "agent", UpstreamName: "github", ToolName: "github.merge_pull_request",
+		Arguments: map[string]any{"number": 11}, Reason: "Merge the reviewed fix for the billing page", CallbackRef: jobs.ID}, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(held.CallbackWarning, "does not accept approval.* events") {
+		t.Fatalf("callback warning: %q", held.CallbackWarning)
+	}
+}
+
+// A receiver registered before migration 0060 has the column default,
+// whose order differs from NormalizeEvents; repeating its registration
+// (T3 does after a lost response) returns it instead of a conflict.
+func TestPre0060ReceiverRegistrationRetry(t *testing.T) {
+	s, db := fixture(t)
+	ctx := t.Context()
+	secret := testSecret()
+	for _, rec := range []struct{ id, client, dest, transport, env string }{
+		{"cb_old_push", "old-push", "https://receiver.example/old", "push", ""},
+		{"cb_old_pull", "old-pull", "", "pull", "mac"},
+	} {
+		enc, err := s.cipher.Seal([]byte(secret), []byte("callback|"+rec.id))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := db.Exec(`INSERT INTO callback_receivers(id,agent_id,environment_id,client_receiver_id,destination,secret_enc,created_at,transport) VALUES(?,'agent',?,?,?,?,1,?)`, rec.id, rec.env, rec.client, rec.dest, enc, rec.transport); err != nil {
+			t.Fatal(err)
+		}
+	}
+	var stored string
+	db.QueryRow(`SELECT events FROM callback_receivers WHERE id='cb_old_push'`).Scan(&stored)
+	if stored != "inbox.decision,inbox.expired,inbox.cancelled" {
+		t.Fatalf("column default %q", stored)
+	}
+	push, err := s.Register(ctx, "agent", "", "old-push", "https://receiver.example/old", secret, false)
+	if err != nil || push.ID != "cb_old_push" {
+		t.Fatalf("push retry: %+v %v", push, err)
+	}
+	pull, err := s.RegisterPull(ctx, "agent", "mac", "old-pull", secret)
+	if err != nil || pull.ID != "cb_old_pull" {
+		t.Fatalf("pull retry: %+v %v", pull, err)
+	}
+	if !SameEvents(push.Events, LegacyEvents) || !SameEvents([]string{"b", "a"}, []string{"a", "b"}) || SameEvents([]string{"a"}, []string{"a", "b"}) {
+		t.Fatal("SameEvents")
+	}
+}

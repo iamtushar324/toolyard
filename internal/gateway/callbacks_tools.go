@@ -203,7 +203,7 @@ func callbackTools(svc *callbacks.Service, private CallbackPrivacy) []toolEntry 
 					// shown once gets the receiver back, without the secret.
 					if prev, err := svc.ByClientID(ctx, agentID, clientID); err == nil {
 						if prev.Destination != dest || prev.EnvironmentID != env || prev.Status != "active" || prev.Transport != "push" ||
-							strings.Join(prev.Events, ",") != strings.Join(events, ",") || prev.V3 != sub.V3 {
+							!callbacks.SameEvents(prev.Events, events) || prev.V3 != sub.V3 {
 							return callbackError(callbacks.ErrConflict), nil
 						}
 						out := receiverView(prev)

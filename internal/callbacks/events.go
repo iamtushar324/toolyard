@@ -89,6 +89,23 @@ func NormalizeEvents(in []string) ([]string, error) {
 	return out, nil
 }
 
+// SameEvents reports whether two event lists hold the same entries, in
+// any order.
+func SameEvents(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	x, y := append([]string(nil), a...), append([]string(nil), b...)
+	sort.Strings(x)
+	sort.Strings(y)
+	for i := range x {
+		if x[i] != y[i] {
+			return false
+		}
+	}
+	return true
+}
+
 func splitEvents(s string) []string {
 	if s == "" {
 		return []string{}
@@ -532,7 +549,8 @@ func (s *Service) SubscribeApproval(ctx context.Context, req *approval.Request, 
 	}
 	defer tx.Rollback()
 	var revision int
-	if ref == "" {
+	named := ref != ""
+	if !named {
 		ref, revision, err = defaultReceiver(ctx, tx, req.AgentID)
 		if err != nil || ref == "" {
 			return err
@@ -543,11 +561,27 @@ func (s *Service) SubscribeApproval(ctx context.Context, req *approval.Request, 
 		}
 		return err
 	}
+	// A receiver that takes no approval.* event would follow the approval
+	// and never hear of it: refused when named, skipped as a default.
+	var events string
+	if err = tx.QueryRowContext(ctx, `SELECT events FROM callback_receivers WHERE id=?`, ref).Scan(&events); err != nil {
+		return err
+	}
+	if !acceptsAny(splitEvents(events), []string{EventApprovalDecided, EventApprovalExecuted}) {
+		if named {
+			return ErrNoApprovalEvents
+		}
+		return nil
+	}
 	if _, err = tx.ExecContext(ctx, `INSERT INTO callback_subject_subscriptions(subject_id,receiver_id,receiver_revision,created_at) VALUES(?,?,?,?) ON CONFLICT DO NOTHING`, req.ID, ref, revision, s.now().UnixMilli()); err != nil {
 		return err
 	}
 	return tx.Commit()
 }
+
+// ErrNoApprovalEvents refuses a named _callback_ref whose receiver takes
+// neither approval.decided nor approval.executed.
+var ErrNoApprovalEvents = errors.New("receiver does not accept approval.* events (approval.decided, approval.executed); poll tools.poll_approval, or register a receiver whose events include them")
 
 // ApprovalEventTx implements approval.EventSink: every receiver that
 // follows the approval hears eventType once, in the transaction that

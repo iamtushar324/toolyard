@@ -96,6 +96,13 @@ to `strategy: Recreate` and leaves out the PodDisruptionBudget, so two
 gateways never share the database. Use `REPLICAS=2` only with an image that
 has it.
 
+The first rollout of a v0.1 image over a deployment that still runs an older
+image must also use `REPLICAS=1` (`Recreate`): `RollingUpdate` would start
+the new pod next to the old one, and a gateway older than v0.1 must never
+share the database. The same holds for a rollback to an image older than
+v0.1. Once every pod runs v0.1 or later, deploy again with `REPLICAS=2`.
+See "Several replicas on one database" in `docs/self-hosting.md`.
+
 ### What a cluster admin creates first
 
 The deployer needs rights in one namespace only. A cluster admin creates:

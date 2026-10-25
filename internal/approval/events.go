@@ -45,6 +45,40 @@ func (b *Bus) subscribe(ctx context.Context, req *Request, ref string) {
 	}
 }
 
+// decideTx applies a decision UPDATE and queues approval.decided in one
+// transaction, and returns the rows it decided (0: no longer pending).
+func (b *Bus) decideTx(ctx context.Context, id, update string, updateArgs []any) (int64, error) {
+	tx, err := b.db.BeginTx(ctx, nil)
+	if err != nil {
+		return 0, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	res, err := tx.ExecContext(ctx, update, updateArgs...)
+	if err != nil {
+		return 0, err
+	}
+	n, _ := res.RowsAffected()
+	if n == 1 {
+		if err := b.emitDecidedTx(ctx, tx, id); err != nil {
+			return 0, err
+		}
+	}
+	return n, tx.Commit()
+}
+
+// emitDecidedTx queues approval.decided for the receivers that follow id,
+// inside the decision's transaction.
+func (b *Bus) emitDecidedTx(ctx context.Context, tx *sql.Tx, id string) error {
+	if b.events == nil {
+		return nil
+	}
+	decided, err := getTx(ctx, tx, id)
+	if err != nil {
+		return err
+	}
+	return b.events.ApprovalEventTx(ctx, tx, decided, EventApprovalDecided)
+}
+
 // getTx reads one approval inside tx (a decision or result transaction
 // that must not use the pool: SQLite has one connection).
 func getTx(ctx context.Context, tx *sql.Tx, id string) (*Request, error) {

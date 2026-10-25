@@ -20,6 +20,7 @@ import (
 	"net/http"
 	"net/netip"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
 	"time"
@@ -149,7 +150,7 @@ func (s *Service) register(ctx context.Context, agentID, environmentID, clientID
 			return nil, err
 		}
 		if r.Transport != transport || r.Destination != destination || r.EnvironmentID != environmentID || !hmac.Equal(plain, []byte(secret)) || r.Status != "active" ||
-			strings.Join(r.Events, ",") != strings.Join(events, ",") || r.V3 != sub.V3 {
+			!SameEvents(r.Events, events) || r.V3 != sub.V3 {
 			return nil, ErrConflict
 		}
 		return r, nil
@@ -230,7 +231,10 @@ func scanReceiver(row interface{ Scan(...any) error }) (*Receiver, error) {
 	r := new(Receiver)
 	var events string
 	err := row.Scan(&r.ID, &r.AgentID, &r.EnvironmentID, &r.ClientReceiverID, &r.Destination, &r.secret, &r.Revision, &r.Status, &r.PrivateAllowed, &r.Transport, &events, &r.V3)
+	// Sorted, like NormalizeEvents: the column default of receivers from
+	// before migration 0060 lists the legacy types in another order.
 	r.Events = splitEvents(events)
+	sort.Strings(r.Events)
 	return r, err
 }
 
@@ -338,8 +342,12 @@ func (s *Service) RegisterTx(ctx context.Context, tx *sql.Tx, r *inbox.Request, 
 		if hostConnectionActive(ctx, tx, r.AgentID, s.now().UnixMilli()) != nil {
 			return nil
 		}
-		// A default receiver that cannot take this item's shape skips it.
+		// A default receiver that cannot take this item's shape, or takes
+		// no inbox.* event, skips it.
 		if v3, err := receiverV3(ctx, tx, def); err != nil || (needsV3(r) && !v3) {
+			return err
+		}
+		if ok, err := acceptsInboxTx(ctx, tx, def); err != nil || !ok {
 			return err
 		}
 		_, err = tx.ExecContext(ctx, `INSERT INTO callback_subscriptions(request_id,receiver_id,receiver_revision) VALUES(?,?,?) ON CONFLICT DO NOTHING`, r.ID, def, revision)
@@ -357,8 +365,39 @@ func (s *Service) RegisterTx(ctx context.Context, tx *sql.Tx, r *inbox.Request, 
 	if needsV3(r) && !v3 {
 		return ErrNeedsV3
 	}
+	if ok, err := acceptsInboxTx(ctx, tx, ref); err != nil || !ok {
+		if err == nil {
+			err = ErrNoInboxEvents
+		}
+		return err
+	}
 	_, err = tx.ExecContext(ctx, `INSERT INTO callback_subscriptions(request_id,receiver_id,receiver_revision) VALUES(?,?,?) ON CONFLICT DO NOTHING`, r.ID, ref, revision)
 	return err
+}
+
+// ErrNoInboxEvents refuses a named receiver that accepts none of the
+// inbox.* events: it would follow the item and never hear of it.
+var ErrNoInboxEvents = errors.New("this receiver accepts no inbox.* events (inbox.decision, inbox.expired, inbox.cancelled), so it would never hear of this item; name a receiver that does, or poll inbox.status")
+
+// inboxEvents are the events that announce an Inbox item's end.
+var inboxEvents = []string{EventInboxDecision, EventInboxExpired, EventInboxCancelled}
+
+func acceptsAny(events []string, types []string) bool {
+	for _, t := range types {
+		if acceptsEvent(events, t) {
+			return true
+		}
+	}
+	return false
+}
+
+// acceptsInboxTx reports whether receiver ref takes any inbox.* event.
+func acceptsInboxTx(ctx context.Context, q hostQuery, ref string) (bool, error) {
+	var events string
+	if err := q.QueryRowContext(ctx, `SELECT events FROM callback_receivers WHERE id=?`, ref).Scan(&events); err != nil {
+		return false, err
+	}
+	return acceptsAny(splitEvents(events), inboxEvents), nil
 }
 
 // ErrNeedsV3 refuses a receiver without the v3 capability for an item whose
@@ -390,6 +429,9 @@ func (s *Service) CheckSubscription(ctx context.Context, agentID, ref string, r 
 	}
 	if needsV3(r) && !rec.V3 {
 		return ErrNeedsV3
+	}
+	if !acceptsAny(rec.Events, inboxEvents) {
+		return ErrNoInboxEvents
 	}
 	return nil
 }

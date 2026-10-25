@@ -251,10 +251,14 @@ func (g *Gateway) callGitHub(ctx context.Context, pu *perUserGroup, tool string,
 		}
 		return mcp.NewToolResultJSON(out)
 	}
-	// Reconciliation and creation are serialized in this single-instance
-	// service. The persisted marker also survives a process restart.
-	g.githubWriteMu.Lock()
-	defer g.githubWriteMu.Unlock()
+	// Reconciliation and creation are serialized, across every replica
+	// when there are several (lockGitHubWrite). The persisted marker also
+	// survives a process restart.
+	unlockWrite, err := g.lockGitHubWrite(ctx)
+	if err != nil {
+		return mcp.NewToolResultError("the GitHub write could not be serialized: " + err.Error()), nil
+	}
+	defer unlockWrite()
 	var s githubSnapshot
 	b, _ := json.Marshal(args[approval.PersonalGitHubField])
 	if json.Unmarshal(b, &s) != nil || s.Owner == "" || s.Operation == "" || s.Owner != uid || s.Connection != fingerprint {
