@@ -1,0 +1,758 @@
+package skillhub
+
+import (
+	"context"
+	"crypto/hmac"
+	"crypto/rand"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"strings"
+
+	"github.com/tusharbhardwaj/toolyard/internal/store"
+)
+
+// Ceilings on what an admin may set.
+const (
+	maxPollSeconds   = 86400
+	ceilFileBytes    = 16 << 20
+	ceilTotalBytes   = 1 << 30
+	ceilSkills       = 20000
+	ceilFiles        = 200000
+	maxMembers       = 1000
+	maxSampleSkills  = 20
+	defaultVersions  = 20
+	maxVersionsList  = 100
+	maxWebhookBody   = 25 << 20
+	webhookSecretLen = 32
+)
+
+// Inspect reads what toolyard can see of a repository: owner, name,
+// visibility, default branch and branches, and the branch and folder of a
+// tree or blob URL (a branch name with "/" is matched against the branch
+// list). Without a token, a private or missing repository answers with
+// NeedsToken set.
+func (s *Service) Inspect(ctx context.Context, rawURL, token string) (*RepoInfo, error) {
+	ref, rest, err := parseRepoURL(rawURL)
+	if err != nil {
+		return nil, err
+	}
+	token = strings.TrimSpace(token)
+	gh := s.newClient(token)
+	repo, err := gh.repo(ctx, ref.Owner, ref.Repo)
+	if isGHStatus(err, 404) && token == "" {
+		// Private or missing: the dashboard asks for a token.
+		return &RepoInfo{RepoRef: ref, NeedsToken: true}, nil
+	}
+	if err != nil {
+		return nil, s.inspectError(err, ref, token != "")
+	}
+	info := &RepoInfo{RepoRef: ref, Private: repo.Private, DefaultBranch: repo.DefaultBranch, HTMLURL: repo.HTMLURL}
+	if repo.Owner.Login != "" {
+		info.Owner = repo.Owner.Login
+	}
+	if repo.Name != "" {
+		info.Repo = repo.Name
+	}
+	info.Branches, info.BranchesMore, err = gh.branches(ctx, info.Owner, info.Repo)
+	if err != nil {
+		return nil, s.inspectError(err, ref, token != "")
+	}
+	info.Branch, info.Path = "", ""
+	if rest != "" {
+		info.Branch, info.Path = splitTreeRest(rest, info.Branches)
+	}
+	return info, nil
+}
+
+// inspectError explains a failed repository read.
+func (s *Service) inspectError(err error, ref RepoRef, withToken bool) error {
+	switch {
+	case isGHStatus(err, 404) && !withToken:
+		return fmt.Errorf("%w (%s/%s)", ErrNeedsToken, ref.Owner, ref.Repo)
+	case isGHStatus(err, 404):
+		return fmt.Errorf("%w: %s/%s is missing or the token cannot read it", ErrNeedsToken, ref.Owner, ref.Repo)
+	case isGHStatus(err, 401):
+		return fmt.Errorf("%w: GitHub rejected the token", ErrInvalid)
+	}
+	return err
+}
+
+// prepareSource turns an admin's input into a source row and the token it
+// reads with. It reads the repository, so a source that cannot be read is
+// refused before it is stored.
+func (s *Service) prepareSource(ctx context.Context, by string, in SourceInput) (*sourceRow, *ghClient, error) {
+	ref, rest, err := parseRepoURL(in.URL)
+	if err != nil {
+		return nil, nil, err
+	}
+	token := strings.TrimSpace(in.Token)
+	auth := in.Auth
+	if auth == "" {
+		auth = AuthNone
+		if token != "" {
+			auth = AuthToken
+		}
+	}
+	var gh *ghClient
+	switch auth {
+	case AuthNone:
+		if token != "" {
+			return nil, nil, fmt.Errorf("%w: a token was given but auth is none", ErrInvalid)
+		}
+		gh = s.newClient("")
+	case AuthToken:
+		if token == "" {
+			return nil, nil, fmt.Errorf("%w: auth token needs a token", ErrInvalid)
+		}
+		gh = s.newClient(token)
+	case AuthGitHub:
+		if gh, err = s.userClient(ctx, by); err != nil {
+			return nil, nil, err
+		}
+	default:
+		return nil, nil, fmt.Errorf("%w: auth %q: use none, token or github", ErrInvalid, in.Auth)
+	}
+	repo, err := gh.repo(ctx, ref.Owner, ref.Repo)
+	if err != nil {
+		return nil, nil, s.inspectError(err, ref, auth != AuthNone)
+	}
+	r := &sourceRow{Source: Source{Kind: "github", Owner: ref.Owner, Repo: ref.Repo, Auth: auth, CreatedBy: by}}
+	if repo.Owner.Login != "" {
+		r.Owner = repo.Owner.Login
+	}
+	if repo.Name != "" {
+		r.Repo = repo.Name
+	}
+	r.Branch, r.Path = strings.TrimSpace(in.Branch), in.Path
+	if rest != "" && (r.Branch == "" || strings.TrimSpace(r.Path) == "") {
+		branches, _, err := gh.branches(ctx, r.Owner, r.Repo)
+		if err != nil {
+			return nil, nil, s.inspectError(err, ref, auth != AuthNone)
+		}
+		b, p := splitTreeRest(rest, branches)
+		if r.Branch == "" {
+			r.Branch = b
+		}
+		if strings.TrimSpace(r.Path) == "" && r.Branch == b {
+			r.Path = p
+		}
+	}
+	if r.Branch == "" {
+		r.Branch = repo.DefaultBranch
+	}
+	if err := s.applyInput(ctx, r, in); err != nil {
+		return nil, nil, err
+	}
+	return r, gh, nil
+}
+
+// applyInput validates and fills in everything but the repository and
+// credential.
+func (s *Service) applyInput(ctx context.Context, r *sourceRow, in SourceInput) error {
+	var err error
+	if r.Path, err = cleanFolder(r.Path); err != nil {
+		return err
+	}
+	if r.Branch == "" {
+		return fmt.Errorf("%w: a branch is required", ErrInvalid)
+	}
+	if r.Exclude, err = validateGlobs(in.Exclude); err != nil {
+		return err
+	}
+	r.Mode = in.Mode
+	if r.Mode == "" {
+		r.Mode = ModeReview
+		if s.TrustedOwner(ctx, r.Owner) {
+			r.Mode = ModeAuto
+		}
+	}
+	r.PinnedSHA = strings.ToLower(strings.TrimSpace(in.PinnedSHA))
+	r.PollSeconds = in.PollSeconds
+	r.Enabled = in.Enabled == nil || *in.Enabled
+	r.Visibility, r.Members, r.DefaultRuns = in.Visibility, in.Members, in.DefaultRuns
+	if in.Limits != nil {
+		r.Limits = *in.Limits
+	}
+	return normalizeSource(r)
+}
+
+// normalizeSource checks a source's settings and fills in defaults.
+func normalizeSource(r *sourceRow) error {
+	switch r.Mode {
+	case ModeAuto, ModeReview:
+	case ModePinned:
+		if !shaRe.MatchString(r.PinnedSHA) {
+			return fmt.Errorf("%w: mode pinned needs pinned_sha, a full 40-character commit SHA", ErrInvalid)
+		}
+	default:
+		return fmt.Errorf("%w: mode %q: use auto, review or pinned", ErrInvalid, r.Mode)
+	}
+	if r.PinnedSHA != "" && !shaRe.MatchString(r.PinnedSHA) {
+		return fmt.Errorf("%w: pinned_sha must be a full commit SHA", ErrInvalid)
+	}
+	switch {
+	case r.PollSeconds == 0:
+		r.PollSeconds = DefaultPollSeconds
+	case r.PollSeconds < MinPollSeconds:
+		r.PollSeconds = MinPollSeconds
+	case r.PollSeconds > maxPollSeconds:
+		r.PollSeconds = maxPollSeconds
+	}
+	switch r.Visibility {
+	case "":
+		r.Visibility = VisibleEveryone
+	case VisibleEveryone, VisibleMembers:
+	default:
+		return fmt.Errorf("%w: visibility %q: use everyone or members", ErrInvalid, r.Visibility)
+	}
+	members := uniqueStrings(trimAll(r.Members))
+	if len(members) > maxMembers {
+		return fmt.Errorf("%w: at most %d members", ErrInvalid, maxMembers)
+	}
+	r.Members = members
+	switch r.DefaultRuns {
+	case "":
+		r.DefaultRuns = RunsAnywhere
+	case RunsAnywhere, RunsHost:
+	default:
+		return fmt.Errorf("%w: default_runs %q: use anywhere or host", ErrInvalid, r.DefaultRuns)
+	}
+	l := r.Limits
+	if l.MaxFileBytes < 0 || l.MaxTotalBytes < 0 || l.MaxSkills < 0 || l.MaxFiles < 0 ||
+		l.MaxFileBytes > ceilFileBytes || l.MaxTotalBytes > ceilTotalBytes || l.MaxSkills > ceilSkills || l.MaxFiles > ceilFiles {
+		return fmt.Errorf("%w: limits must be between 0 (the default) and %d bytes per file, %d bytes in total, %d skills, %d files",
+			ErrInvalid, ceilFileBytes, ceilTotalBytes, ceilSkills, ceilFiles)
+	}
+	return nil
+}
+
+func trimAll(xs []string) []string {
+	out := make([]string, 0, len(xs))
+	for _, x := range xs {
+		if x = strings.TrimSpace(x); x != "" {
+			out = append(out, x)
+		}
+	}
+	return out
+}
+
+// Preview is a dry run of a source: the commit it would serve, the skills
+// found, warnings, a sample and sizes. Nothing is stored.
+func (s *Service) Preview(ctx context.Context, by string, in SourceInput) (*Preview, error) {
+	r, gh, err := s.prepareSource(ctx, by, in)
+	if err != nil {
+		return nil, err
+	}
+	r.Slug = strings.TrimSpace(in.Slug)
+	if r.Slug == "" {
+		r.Slug = slugify(r.Repo)
+	}
+	sha := r.PinnedSHA
+	if r.Mode != ModePinned {
+		if sha, _, _, err = gh.head(ctx, r.Owner, r.Repo, r.Branch, ""); err != nil {
+			return nil, s.repoError(err, r)
+		}
+	}
+	ex, err := newExcluder(r.Exclude)
+	if err != nil {
+		return nil, err
+	}
+	fs, err := s.download(ctx, gh, r, sha, ex, r.Limits.effective())
+	if err != nil {
+		return nil, err
+	}
+	b, err := discover(fs, r.Path, r.rootName(), nil)
+	if err != nil {
+		return nil, err
+	}
+	p := &Preview{
+		Source: r.Source, SHA: sha, SkillCount: len(b.skills), FileCount: len(b.files),
+		TotalBytes: b.totalBytes, Warnings: nonNilWarnings(b.warnings), Sample: []SkillSummary{},
+	}
+	label := RepoLabel(r.Owner, r.Repo, sha)
+	for _, sk := range b.skills {
+		if len(p.Sample) == maxSampleSkills {
+			break
+		}
+		runs := effectiveRuns("", sk.meta.runs, r.DefaultRuns)
+		p.Sample = append(p.Sample, SkillSummary{
+			URI: SkillURI(r.Slug, sk.path), Name: sk.meta.name, Description: sk.meta.description,
+			Source: r.Slug, Path: sk.path, Repo: label, Commit: sha, Runs: runs,
+		})
+	}
+	return p, nil
+}
+
+// CreateSource stores a new source. Its first check is due at once: the
+// leader's poll loop runs it within moments, or call SyncNow for a sync on
+// this node.
+func (s *Service) CreateSource(ctx context.Context, by string, in SourceInput) (*Source, error) {
+	r, gh, err := s.prepareSource(ctx, by, in)
+	if err != nil {
+		return nil, err
+	}
+	r.ID = newID("src_")
+	if gh.token != "" && r.Auth == AuthToken {
+		if r.tokenSealed, err = s.seal(gh.token, tokenAAD(r.ID)); err != nil {
+			return nil, err
+		}
+	}
+	if err := s.insertWithSlug(ctx, r, strings.TrimSpace(in.Slug)); err != nil {
+		return nil, err
+	}
+	s.pokePoller()
+	return s.GetSource(ctx, r.ID)
+}
+
+// insertWithSlug stores the source under the given slug, or the first
+// free default one.
+func (s *Service) insertWithSlug(ctx context.Context, r *sourceRow, slug string) error {
+	if slug != "" {
+		if len(slug) > maxSlugLen || !slugRe.MatchString(slug) {
+			return fmt.Errorf("%w: slug %q: lowercase letters, digits and single hyphens, at most %d characters", ErrInvalid, slug, maxSlugLen)
+		}
+		r.Slug = slug
+		if err := s.insertSource(ctx, r); err != nil {
+			if store.IsUniqueViolation(err) {
+				return fmt.Errorf("%w: slug %q is taken", ErrConflict, slug)
+			}
+			return fmt.Errorf("skillhub: store source: %w", err)
+		}
+		return nil
+	}
+	base := slugify(r.Repo)
+	for n := 1; n <= 100; n++ {
+		r.Slug = slugCandidate(base, n)
+		err := s.insertSource(ctx, r)
+		if err == nil {
+			return nil
+		}
+		if !store.IsUniqueViolation(err) {
+			return fmt.Errorf("skillhub: store source: %w", err)
+		}
+	}
+	return fmt.Errorf("%w: no free slug for %q; give one", ErrConflict, base)
+}
+
+// seal seals a secret with secrets.key.
+func (s *Service) seal(secret string, aad []byte) (string, error) {
+	if s.cipher == nil {
+		return "", errors.New("skillhub: this server has no cipher to store secrets")
+	}
+	sealed, err := s.cipher.Seal([]byte(secret), aad)
+	if err != nil {
+		return "", fmt.Errorf("skillhub: seal secret: %w", err)
+	}
+	return sealed, nil
+}
+
+// UpdateSource changes a source's settings. A change to what is fetched
+// (branch, folder, excludes, limits, mode, pinned commit, credential)
+// makes its next check due at once.
+func (s *Service) UpdateSource(ctx context.Context, by, id string, up SourceUpdate) (*Source, error) {
+	r, err := s.getSourceRow(ctx, s.db, id)
+	if err != nil {
+		return nil, err
+	}
+	due := false
+	set := func(dst *string, v *string) {
+		if v != nil && strings.TrimSpace(*v) != *dst {
+			*dst = strings.TrimSpace(*v)
+			due = true
+		}
+	}
+	set(&r.Branch, up.Branch)
+	if up.Path != nil {
+		p, err := cleanFolder(*up.Path)
+		if err != nil {
+			return nil, err
+		}
+		due = due || p != r.Path
+		r.Path = p
+	}
+	if up.Exclude != nil {
+		ex, err := validateGlobs(*up.Exclude)
+		if err != nil {
+			return nil, err
+		}
+		r.Exclude, due = ex, true
+	}
+	if up.Mode != nil && *up.Mode != r.Mode {
+		r.Mode, due = *up.Mode, true
+	}
+	if up.PinnedSHA != nil {
+		pin := strings.ToLower(strings.TrimSpace(*up.PinnedSHA))
+		due = due || pin != r.PinnedSHA
+		r.PinnedSHA = pin
+	}
+	if up.Limits != nil {
+		r.Limits, due = *up.Limits, true
+	}
+	if err := s.updateCredential(r, up, &due); err != nil {
+		return nil, err
+	}
+	if up.PollSeconds != nil {
+		r.PollSeconds = *up.PollSeconds
+	}
+	if up.Enabled != nil {
+		due = due || (*up.Enabled && !r.Enabled)
+		r.Enabled = *up.Enabled
+	}
+	if up.Visibility != nil {
+		r.Visibility = *up.Visibility
+	}
+	if up.Members != nil {
+		r.Members = *up.Members
+	}
+	if up.DefaultRuns != nil {
+		r.DefaultRuns = *up.DefaultRuns
+	}
+	if r.Branch == "" {
+		return nil, fmt.Errorf("%w: a branch is required", ErrInvalid)
+	}
+	if err := normalizeSource(r); err != nil {
+		return nil, err
+	}
+	if err := s.updateSourceSettings(ctx, r, due); err != nil {
+		return nil, err
+	}
+	s.changed(ctx, id)
+	if due {
+		s.pokePoller()
+	}
+	return s.GetSource(ctx, id)
+}
+
+// updateCredential applies an update's auth and token fields.
+func (s *Service) updateCredential(r *sourceRow, up SourceUpdate, due *bool) error {
+	if up.Auth != nil && *up.Auth != r.Auth {
+		switch *up.Auth {
+		case AuthNone, AuthToken, AuthGitHub:
+		default:
+			return fmt.Errorf("%w: auth %q: use none, token or github", ErrInvalid, *up.Auth)
+		}
+		r.Auth, *due = *up.Auth, true
+	}
+	if up.ClearToken {
+		r.tokenSealed, *due = "", true
+	}
+	if up.Token != nil && strings.TrimSpace(*up.Token) != "" {
+		sealed, err := s.seal(strings.TrimSpace(*up.Token), tokenAAD(r.ID))
+		if err != nil {
+			return err
+		}
+		r.tokenSealed, *due = sealed, true
+		if up.Auth == nil && r.Auth == AuthNone {
+			r.Auth = AuthToken
+		}
+	}
+	if r.Auth == AuthToken && r.tokenSealed == "" {
+		return fmt.Errorf("%w: auth token needs a token", ErrInvalid)
+	}
+	if r.Auth == AuthGitHub && s.tokenSource() == nil {
+		return fmt.Errorf("%w: reading with a GitHub connection is not available on this server", ErrInvalid)
+	}
+	return nil
+}
+
+// DeleteSource deletes a source with its versions, usage and overrides.
+// File contents no other version uses are purged.
+func (s *Service) DeleteSource(ctx context.Context, by, id string) error {
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("skillhub: delete source: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	// The source row goes first: a sync storing a version holds it (FOR
+	// UPDATE), so its version is committed before the rest is deleted, or
+	// it finds the source gone.
+	res, err := tx.ExecContext(ctx, `DELETE FROM skill_sources WHERE id = ?`, id)
+	if err != nil {
+		return fmt.Errorf("skillhub: delete source: %w", err)
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return fmt.Errorf("%w: source %s", ErrNotFound, id)
+	}
+	for _, q := range []string{
+		`DELETE FROM skill_files WHERE version_id IN (SELECT id FROM skill_versions WHERE source_id = ?)`,
+		`DELETE FROM skill_entries WHERE version_id IN (SELECT id FROM skill_versions WHERE source_id = ?)`,
+		`DELETE FROM skill_versions WHERE source_id = ?`,
+		`DELETE FROM skill_usage WHERE source_id = ?`,
+		`DELETE FROM skill_runs_overrides WHERE source_id = ?`,
+	} {
+		if _, err := tx.ExecContext(ctx, q, id); err != nil {
+			return fmt.Errorf("skillhub: delete source: %w", err)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("skillhub: delete source: %w", err)
+	}
+	s.log.Info("skillhub: source deleted", "source", id, "by", by)
+	s.changed(ctx, id)
+	if err := s.purgeBlobs(ctx); err != nil {
+		s.log.Warn("skillhub: purge after a delete failed", "err", err.Error())
+	}
+	return nil
+}
+
+// GetSource returns one source.
+func (s *Service) GetSource(ctx context.Context, id string) (*Source, error) {
+	r, err := s.getSourceRow(ctx, s.db, id)
+	if err != nil {
+		return nil, err
+	}
+	src := r.Source
+	return &src, nil
+}
+
+// ListSources returns every source, by slug.
+func (s *Service) ListSources(ctx context.Context) ([]Source, error) {
+	rows, err := s.listSourceRows(ctx)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]Source, 0, len(rows))
+	for _, r := range rows {
+		out = append(out, r.Source)
+	}
+	return out, nil
+}
+
+// Versions lists a source's versions, newest first.
+func (s *Service) Versions(ctx context.Context, id string, limit int) ([]Version, error) {
+	if _, err := s.getSourceRow(ctx, s.db, id); err != nil {
+		return nil, err
+	}
+	switch {
+	case limit <= 0:
+		limit = defaultVersions
+	case limit > maxVersionsList:
+		limit = maxVersionsList
+	}
+	return s.listVersions(ctx, id, limit)
+}
+
+// GetVersion returns one version of a source.
+func (s *Service) GetVersion(ctx context.Context, id, versionID string) (*Version, error) {
+	v, err := s.getVersionRow(ctx, s.db, id, versionID)
+	if err != nil {
+		return nil, err
+	}
+	return &v.Version, nil
+}
+
+// Activate makes a staged or retired version active: a review approval or
+// a rollback. Every node serves it within moments.
+func (s *Service) Activate(ctx context.Context, by, id, versionID string) error {
+	changed, err := s.activate(ctx, by, id, versionID, false)
+	if err != nil {
+		return err
+	}
+	if changed {
+		s.log.Info("skillhub: version activated", "source", id, "version", versionID, "by", by)
+		s.changed(ctx, id)
+	}
+	return nil
+}
+
+// Reject marks a staged version rejected.
+func (s *Service) Reject(ctx context.Context, by, id, versionID, note string) error {
+	v, err := s.getVersionRow(ctx, s.db, id, versionID)
+	if err != nil {
+		return err
+	}
+	if v.Status != VersionStaged {
+		return fmt.Errorf("%w: version %s is %s; only a staged version can be rejected", ErrConflict, versionID, v.Status)
+	}
+	if len(note) > 2000 {
+		note = note[:2000]
+	}
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("skillhub: reject: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	res, err := tx.ExecContext(ctx, `UPDATE skill_versions SET status = ?, decided_by = ?, note = ? WHERE id = ? AND source_id = ? AND status = ?`,
+		string(VersionRejected), by, note, versionID, id, string(VersionStaged))
+	if err != nil {
+		return fmt.Errorf("skillhub: reject: %w", err)
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return fmt.Errorf("%w: version %s is no longer staged", ErrConflict, versionID)
+	}
+	if _, err := tx.ExecContext(ctx, `UPDATE skill_sources SET pending_version_id = '' WHERE id = ? AND pending_version_id = ?`, id, versionID); err != nil {
+		return fmt.Errorf("skillhub: reject: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("skillhub: reject: %w", err)
+	}
+	s.log.Info("skillhub: version rejected", "source", id, "version", versionID, "by", by)
+	return nil
+}
+
+// Skills lists the skills of a source's active version with where they
+// run and their reads in the last 30 days.
+func (s *Service) Skills(ctx context.Context, id string) ([]SkillUsage, error) {
+	r, err := s.getSourceRow(ctx, s.db, id)
+	if err != nil {
+		return nil, err
+	}
+	out := []SkillUsage{}
+	if r.ActiveVersionID == "" {
+		return out, nil
+	}
+	if err := s.flushUsage(ctx); err != nil {
+		s.log.Warn("skillhub: writing read counts failed", "err", err.Error())
+	}
+	entries, err := s.versionEntries(ctx, r.ActiveVersionID)
+	if err != nil {
+		return nil, err
+	}
+	overrides, err := s.runsOverrides(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	reads, err := s.reads30d(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	for _, e := range entries {
+		out = append(out, SkillUsage{
+			Path: e.path, Name: e.name, Runs: effectiveRuns(overrides[e.path], Runs(e.runs), r.DefaultRuns),
+			RunsOverride: overrides[e.path], Reads30d: reads[e.path],
+		})
+	}
+	return out, nil
+}
+
+// SetRuns overrides where one skill of the active version runs; "" clears
+// the override.
+func (s *Service) SetRuns(ctx context.Context, by, id, skillPath string, runs Runs) error {
+	r, err := s.getSourceRow(ctx, s.db, id)
+	if err != nil {
+		return err
+	}
+	skillPath = strings.Trim(strings.TrimSpace(skillPath), "/")
+	switch runs {
+	case "", RunsAnywhere, RunsHost:
+	default:
+		return fmt.Errorf("%w: runs %q: use anywhere, host or empty", ErrInvalid, runs)
+	}
+	if runs != "" {
+		var n int64
+		if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM skill_entries WHERE version_id = ? AND path = ?`,
+			r.ActiveVersionID, skillPath).Scan(&n); err != nil {
+			return fmt.Errorf("skillhub: set runs: %w", err)
+		}
+		if n == 0 {
+			return fmt.Errorf("%w: source %s serves no skill at %q", ErrNotFound, r.Slug, skillPath)
+		}
+	}
+	now := s.now().UnixMilli()
+	tx, err := s.db.BeginTx(ctx, nil)
+	if err != nil {
+		return fmt.Errorf("skillhub: set runs: %w", err)
+	}
+	defer func() { _ = tx.Rollback() }()
+	if runs == "" {
+		_, err = tx.ExecContext(ctx, `DELETE FROM skill_runs_overrides WHERE source_id = ? AND skill_path = ?`, id, skillPath)
+	} else {
+		_, err = tx.ExecContext(ctx, `INSERT INTO skill_runs_overrides (source_id, skill_path, runs, set_by, updated_at)
+			VALUES (?, ?, ?, ?, ?) ON CONFLICT (source_id, skill_path) DO UPDATE SET runs = excluded.runs,
+			set_by = excluded.set_by, updated_at = excluded.updated_at`, id, skillPath, string(runs), by, now)
+	}
+	if err != nil {
+		return fmt.Errorf("skillhub: set runs: %w", err)
+	}
+	// The source's updated_at tells every node's index to reload it.
+	if _, err := tx.ExecContext(ctx, `UPDATE skill_sources SET updated_at = ? WHERE id = ?`, max(now, r.UpdatedAt.UnixMilli()+1), id); err != nil {
+		return fmt.Errorf("skillhub: set runs: %w", err)
+	}
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("skillhub: set runs: %w", err)
+	}
+	s.changed(ctx, id)
+	return nil
+}
+
+// RotateWebhookSecret makes a new webhook secret, stores it sealed and
+// returns it once.
+func (s *Service) RotateWebhookSecret(ctx context.Context, by, id string) (string, error) {
+	if _, err := s.getSourceRow(ctx, s.db, id); err != nil {
+		return "", err
+	}
+	var b [webhookSecretLen]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		return "", fmt.Errorf("skillhub: make secret: %w", err)
+	}
+	secret := hex.EncodeToString(b[:])
+	sealed, err := s.seal(secret, webhookAAD(id))
+	if err != nil {
+		return "", err
+	}
+	if _, err := s.db.ExecContext(ctx, `UPDATE skill_sources SET webhook_secret_sealed = ? WHERE id = ?`, sealed, id); err != nil {
+		return "", fmt.Errorf("skillhub: store webhook secret: %w", err)
+	}
+	s.log.Info("skillhub: webhook secret rotated", "source", id, "by", by)
+	return secret, nil
+}
+
+// HandleWebhook takes a GitHub webhook delivery for a source. The
+// X-Hub-Signature-256 header must be the HMAC-SHA256 of the body with the
+// source's secret. "ping" is accepted; a "push" to the source's branch
+// starts a sync on this node (in the background: GitHub waits 10 seconds
+// at most). Other events are ignored.
+func (s *Service) HandleWebhook(ctx context.Context, id, event string, body []byte, signature string) error {
+	r, err := s.getSourceRow(ctx, s.db, id)
+	if err != nil {
+		return err
+	}
+	if r.webhookSealed == "" || s.cipher == nil {
+		return ErrBadSignature
+	}
+	secret, err := s.cipher.Open(r.webhookSealed, webhookAAD(id))
+	if err != nil || !validSignature(secret, body, signature) {
+		return ErrBadSignature
+	}
+	switch event {
+	case "ping":
+		return nil
+	case "push":
+	default:
+		return nil
+	}
+	if len(body) > maxWebhookBody {
+		return fmt.Errorf("%w: webhook body too large", ErrInvalid)
+	}
+	var push struct {
+		Ref     string `json:"ref"`
+		Deleted bool   `json:"deleted"`
+	}
+	if err := json.Unmarshal(body, &push); err != nil {
+		return fmt.Errorf("%w: the push payload is not JSON", ErrInvalid)
+	}
+	if push.Ref != "refs/heads/"+r.Branch || push.Deleted || !r.Enabled || r.Mode == ModePinned {
+		return nil
+	}
+	s.requestSync(id, triggerWebhook)
+	return nil
+}
+
+// validSignature checks "sha256=<hex>" against the body's HMAC-SHA256, in
+// constant time.
+func validSignature(secret, body []byte, signature string) bool {
+	sig, ok := strings.CutPrefix(strings.TrimSpace(signature), "sha256=")
+	if !ok {
+		return false
+	}
+	got, err := hex.DecodeString(sig)
+	if err != nil {
+		return false
+	}
+	mac := hmac.New(sha256.New, secret)
+	mac.Write(body)
+	return hmac.Equal(got, mac.Sum(nil))
+}

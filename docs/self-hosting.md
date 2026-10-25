@@ -516,6 +516,51 @@ answers with a job id at once (`always`), or after a wait (`after`,
   lease its replica renews, and a replica that stops leaves its running
   jobs `outcome_unknown` (never re-run) once the lease ends (60 s).
 
+## Skills hub
+
+The skills hub serves [Agent Skills](https://agentskills.io/specification)
+from GitHub repositories to every client: MCP tools, code mode, REST and
+the MCP Skills extension. An admin adds a *skill source* (a repository,
+a branch and a folder); toolyard copies its skills at an exact commit into
+the database and serves only that copy. How sync, review and limits work:
+[skills-hub.md](skills-hub.md).
+
+- **`-skills`** (`TOOLYARD_SKILLS`): `on` (the default; `auto` also means
+  on) or `off`. Off serves no skills and runs no sync. The flags of the
+  removed local skills folder (`-skills-dir`, `-skills-sync-interval`,
+  `-claude-skills-dir`) are still accepted, ignored, and logged once as
+  deprecated.
+- **`skills_trusted_github_owners`** (Settings; comma list of GitHub
+  owners, default empty): a new source from one of these owners syncs in
+  mode `auto` by default (a new commit goes live once it is synced); every other
+  source defaults to `review` (a new commit waits for an admin).
+- **Network.** toolyard calls only the GitHub API
+  (`https://api.github.com`) and `codeload.github.com`, where GitHub
+  redirects archive downloads. Allow both through an egress proxy or
+  firewall. Agents never call GitHub themselves.
+- **Credentials.** A private repository needs a read-only token
+  (fine-grained, *Contents: read* on that repository). toolyard seals it
+  with `secrets.key`, never shows it again, never logs it, and never sends
+  it to the archive host. Webhook secrets are sealed the same way.
+- **Webhook (optional).** Polling checks each source every 5 minutes (its
+  `poll_seconds`, at least 60) with a conditional request that costs no
+  rate limit when nothing changed. For updates within seconds, add a
+  GitHub webhook to the repository: payload URL
+  `<public-url>/v1/skills/sources/<id>/webhook`, content type
+  `application/json`, the secret the dashboard shows once (Rotate secret),
+  event *Just the push event*. The payload URL must be reachable from
+  GitHub.
+- **Replicas.** Each replica keeps an in-memory index of the live
+  versions (skills and file lists, not file contents). The leader runs the
+  poll loop; a "Sync now" or a webhook syncs on the replica that received
+  it, under a per-source lock, so two syncs of one source never overlap.
+- **Storage.** Each file's contents are stored once, by SHA-256, however
+  many versions use them. Each source keeps its live version, the one
+  waiting for review, and the last 10 others; older versions and contents
+  no version uses are deleted.
+- **Rollback.** Migration `0068_skill_hub` only adds tables. An older
+  binary ignores them (and the old `skills_sync` table is left as it was).
+
 ## Inbox and permissions
 
 Settings → **Inbox & permissions**:
@@ -870,7 +915,8 @@ one connection, and the flag does nothing there.
 - Inbox attachments (uploads, copied links and voice notes) are kept in
   the database too, in 1 MiB chunks, instead of under
   `<data>/inbox/blobs`. The data directory still holds keys (unless they
-  come from a credentials directory), crash dumps, notes and skills.
+  come from a credentials directory), crash dumps and notes. The skills
+  hub keeps its copies in the database on both engines.
 - Back up the database with Postgres tools (`pg_dump`, or snapshots on
   Aurora) instead of copying `toolyard.db`. Back up the keys with it, but
   store them apart from it, as for SQLite.
@@ -929,7 +975,8 @@ How the replicas share the work:
   refresher, the Clerk membership sync, the session purge, the retention
   compactor, the auto-approval proposer, the anomaly detector and reason
   scorer, the events pollers and retention, the Telegram poller and chat
-  reconciler, the memory-webhook worker, the notes and skills scanners,
+  reconciler, the memory-webhook worker, the notes scanner, the skills
+  hub's sync loop (`skills-sync`),
   the retry of failed identity-key removals, and the recovery of stopped
   replicas' work. Each holds a Postgres advisory lock (a leader lease).
   A replica that stops cleanly hands its jobs over when its drain starts,
@@ -1016,11 +1063,13 @@ Things to set:
   so a container that restarts in the same pod, or two replicas given the
   same name, never share an ID. Without the flag the host name is used.
 - **Files under `-data`** are per replica: crash dumps, the price list
-  cache, temporary uploads, and the notes, skills and MemPalace stores.
+  cache, temporary uploads, and the notes and MemPalace stores.
   With several replicas, run `-mempalace=off` (MemPalace keeps its store
   on one replica's disk, so memories written through one replica are
-  missing on the others), and put notes and skills on a shared volume or
-  turn them off (`-notes=off -skills=off`). Keys come from the shared
+  missing on the others), and put notes on a shared volume or turn them
+  off (`-notes=off`). The skills hub needs nothing shared: its copies live
+  in the database, and an activation reaches every replica's catalog
+  within moments. Keys come from the shared
   credentials, not from `-data`.
 - **The first move to v0.1 must stop the old gateway first.** A gateway
   older than v0.1 (no replica support) must never run next to another

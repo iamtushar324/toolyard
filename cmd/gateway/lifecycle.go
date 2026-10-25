@@ -39,7 +39,7 @@ const (
 	loopInboxAttention = "inbox-attention"
 	loopCallbacks      = "callback-delivery"
 	loopNotesScanner   = "notes-scanner"
-	loopSkillsScanner  = "skills-scanner"
+	loopSkillsSync     = "skills-sync" // skillhub (slice A)
 	loopIdleSweeper    = "upstream-idle-sweeper"
 	loopCatalogRefresh = "upstream-catalog-refresh"
 	goCodemodeProbe    = "codemode-probe"
