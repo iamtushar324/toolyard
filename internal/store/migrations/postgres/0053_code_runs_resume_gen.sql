@@ -7,4 +7,5 @@
 -- second one claims.
 --
 -- Same change as migrations/sqlite/0053_code_runs_resume_gen.sql.
+-- Rollback: an older binary ignores the column (and claims a resume by status alone).
 ALTER TABLE code_runs ADD COLUMN IF NOT EXISTS resume_gen BIGINT NOT NULL DEFAULT 0;

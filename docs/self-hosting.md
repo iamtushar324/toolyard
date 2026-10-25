@@ -296,8 +296,8 @@ many scripts run at once:
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `-codemode-max-concurrent` | 4 | Scripts running at once on this gateway (MCP and REST together). Each is a worker of up to 256 MiB, so size it with the service's memory limit. |
-| `-codemode-max-per-agent` | 3 | Scripts one agent runs at once. |
+| `-codemode-max-concurrent` | 4 | Scripts running at once on this gateway (MCP and REST together). Each is a worker of up to 256 MiB, so size it with the service's memory limit. With several replicas the limit is per replica. |
+| `-codemode-max-per-agent` | 3 | Scripts one agent runs at once on this gateway; with several replicas, per replica. |
 | `-codemode-queue-wait` | 30s | How long a script past either cap waits for a slot. |
 
 A script past either cap waits in one fair queue for up to
@@ -969,7 +969,14 @@ Things to set:
   replica. An earlier client opens a session (`Mcp-Session-Id`) that lives
   in one replica's memory: with several replicas run `-stateless-mcp`, or
   make the load balancer send each session to one replica (sticky routing
-  on the `Mcp-Session-Id` header).
+  on the `Mcp-Session-Id` header). A replica started with replica support
+  on and `-stateless-mcp` off logs a warning that says so.
+- **Code-mode limits are per replica.** `-codemode-max-concurrent` (4)
+  and `-codemode-max-per-agent` (3) count the scripts that run on one
+  replica, so with N replicas up to N × 4 scripts run in all, and one agent
+  may run up to N × 3. Size each replica's memory for its own
+  `-codemode-max-concurrent` workers (up to 256 MiB each), and lower the
+  per-agent cap when an agent must stay under a total limit.
 - **`-instance-id`** names the replica in leases and logs (for example the
   pod name: `TOOLYARD_INSTANCE_ID` from the Kubernetes downward API).
   Every process adds a random suffix of its own (`<name>-<8 hex digits>`),

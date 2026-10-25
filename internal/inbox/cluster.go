@@ -75,6 +75,27 @@ func (s *Service) lockSubmit(ctx context.Context, agentID string) (func(), error
 	return s.opts.Cluster.Lock(ctx, "inbox-submit:"+agentID)
 }
 
+// checkLockWait bounds how long a background check waits for another
+// node's check of the same request: longer than one check takes (the judge
+// call, the media fetches), so a wait that ends means that node is stuck,
+// and the next start's RecheckUnchecked tries again.
+const checkLockWait = 5 * time.Minute
+
+// lockCheck claims the background check of one request on a multi-node
+// database (a cluster lock per request), so the check runs once however
+// many nodes ask for it: the node that received the request, and a
+// starting node's RecheckUnchecked. The caller re-reads Checked under the
+// lock. Without a multi-node cluster it does nothing: one process runs
+// every check.
+func (s *Service) lockCheck(ctx context.Context, id string) (func(), error) {
+	if !s.multiNode() {
+		return func() {}, nil
+	}
+	wctx, cancel := context.WithTimeout(ctx, checkLockWait)
+	defer cancel()
+	return s.opts.Cluster.Lock(wctx, "inbox-check:"+id)
+}
+
 // lockBlob serializes the steps that adopt or delete one blob's bytes (an
 // upload and the upload sweep). On a multi-node database it is a cluster
 // lock per sha256, otherwise the process-wide uploadMu, as before.

@@ -22,6 +22,7 @@ import (
 	"github.com/tusharbhardwaj/toolyard/internal/goroutines"
 	"github.com/tusharbhardwaj/toolyard/internal/inbox"
 	"github.com/tusharbhardwaj/toolyard/internal/keyguard"
+	"github.com/tusharbhardwaj/toolyard/internal/mcpauth"
 	"github.com/tusharbhardwaj/toolyard/internal/realtime"
 	"github.com/tusharbhardwaj/toolyard/internal/store"
 )
@@ -29,6 +30,42 @@ import (
 // workRecoveryEvery is how often the leader of a multi-node database looks
 // for durable work whose owner stopped (its lease ended).
 const workRecoveryEvery = 30 * time.Second
+
+// Goroutine and loop names (metric labels) of the v0.1 HA follow-ups.
+const (
+	// goInboxRecheck re-runs the unfinished Inbox background checks at
+	// start; with replicas it is also the leader lease's name.
+	goInboxRecheck = "inbox-recheck"
+	// loopMCPAuthSweep is the MCP OAuth server's sweeper (mcpauth Sweep).
+	loopMCPAuthSweep = "mcp-oauth-sweeper"
+)
+
+// mcpAuthSweepEvery is how often the MCP OAuth sweeper runs (as
+// mcpauth's own Run did).
+const mcpAuthSweepEvery = 10 * time.Minute
+
+// runMCPAuthSweeper sweeps the MCP OAuth server's expired codes, tokens
+// and pending consents every mcpAuthSweepEvery until ctx ends, and records
+// each clean pass (loopDone). It runs on every node (a sweep is safe
+// there, mcpauth sweep.go) under goroutines.Loop, so a panic restarts it.
+func runMCPAuthSweeper(ctx context.Context, svc *mcpauth.Service) {
+	t := time.NewTicker(mcpAuthSweepEvery)
+	defer t.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-t.C:
+		}
+		if err := svc.Sweep(ctx); err != nil {
+			if ctx.Err() == nil {
+				log.Printf("mcpauth: WARN sweep: %v", err)
+			}
+			continue
+		}
+		loopDone(loopMCPAuthSweep)
+	}
+}
 
 // leaderLoop is goroutines.Loop for a loop that must run on one replica
 // at a time: fn runs while this replica holds the lease name (its context

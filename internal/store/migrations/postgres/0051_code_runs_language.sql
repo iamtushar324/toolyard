@@ -6,4 +6,6 @@
 -- were Starlark.
 --
 -- Same change as migrations/sqlite/0051_code_runs_language.sql.
+-- Rollback: an older binary ignores the column (and would run a stored
+-- JavaScript script as Starlark on a resume, which fails to parse).
 ALTER TABLE code_runs ADD COLUMN IF NOT EXISTS language TEXT NOT NULL DEFAULT 'starlark';

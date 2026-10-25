@@ -42,6 +42,7 @@
 -- Times are Unix milliseconds.
 --
 -- Same tables as migrations/sqlite/0055_mcp_oauth_server.sql.
+-- Rollback: an older binary ignores the tables.
 
 CREATE TABLE IF NOT EXISTS mcp_oauth_clients (
     client_id                  TEXT PRIMARY KEY,

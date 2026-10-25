@@ -9,5 +9,6 @@
 -- once while writes to the table wait. A fresh database sees no wait.
 --
 -- Same change as migrations/sqlite/0050_audit_run_id.sql.
+-- Rollback: an older binary neither writes nor reads the column.
 ALTER TABLE audit_events ADD COLUMN IF NOT EXISTS run_id TEXT;
 CREATE INDEX IF NOT EXISTS idx_audit_run ON audit_events (run_id) WHERE run_id IS NOT NULL;
