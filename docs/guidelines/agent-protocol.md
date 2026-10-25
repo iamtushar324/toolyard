@@ -690,7 +690,8 @@ curl -fsS "$TOOLYARD_URL/v1/code/ty" -o ty && chmod +x ty
 ./ty stub github/create_issue   # one stub, like readToolFile
 ```
 
-**Run a script.** Write the same Starlark you'd pass to `executeToolCode`:
+**Run a script.** Write the same Starlark you'd pass to `executeToolCode`
+(or JavaScript: a `.js` file runs as JavaScript, see the code-mode guide):
 
 ```sh
 ./ty run review.star --reason "List the open pull requests to pick the next one to review"

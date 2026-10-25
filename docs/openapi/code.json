@@ -107,6 +107,13 @@
               },
               "example": "result = context7.resolve_library_id(libraryName=\"react\")\n"
             },
+            "text/javascript": {
+              "schema": {
+                "type": "string",
+                "description": "A JavaScript script (UTF-8, also accepted as application/javascript), at most 1 MiB: the body of an async function. `await tools.Server.tool({param: value})`, `tools.call`, `tools.tryCall`, `tools.parallel`, `tools.search`, `console.log`, and `return` the result."
+              },
+              "example": "const lib = await tools.context7.resolve_library_id({ libraryName: \"react\" });\nreturn lib;\n"
+            },
             "application/json": {
               "schema": { "$ref": "#/components/schemas/RunRequest" },
               "example": {
@@ -193,7 +200,15 @@
         "tags": ["stubs"],
         "operationId": "listToolFiles",
         "summary": "List the tool stubs",
-        "description": "The same listing as `listToolFiles`: only the tools this agent may see.",
+        "description": "The same listing as `listToolFiles`: only the tools this agent may see. `?language=javascript` lists the TypeScript stubs (`.d.ts`) instead of the Starlark ones (`.pyi`).",
+        "parameters": [
+          {
+            "name": "language",
+            "in": "query",
+            "required": false,
+            "schema": { "type": "string", "enum": ["starlark", "javascript"], "default": "starlark" }
+          }
+        ],
         "responses": {
           "200": { "$ref": "#/components/responses/Text" },
           "401": { "$ref": "#/components/responses/Unauthorized" },
@@ -217,6 +232,60 @@
           "401": { "$ref": "#/components/responses/Unauthorized" },
           "403": { "$ref": "#/components/responses/Forbidden" },
           "404": { "$ref": "#/components/responses/NotFound" },
+          "503": { "$ref": "#/components/responses/Unavailable" }
+        }
+      }
+    },
+    "/v1/code/files/{server}/{tool}.d.ts": {
+      "get": {
+        "tags": ["stubs"],
+        "operationId": "readToolFileTypeScript",
+        "summary": "Read one tool's TypeScript stub",
+        "description": "The tool's `Input` and `Output` types and its `Call` signature, generated from its input and output schemas, for JavaScript scripts. `/v1/code/files/{server}.d.ts` is one server's tools, and `/v1/code/files/index.d.ts` declares the `tools` object, its helpers (`call`, `tryCall`, `parallel`, `search`) and `console`. Unknown files, and tools this agent may not see, are 404.",
+        "parameters": [
+          { "$ref": "#/components/parameters/Server" },
+          { "$ref": "#/components/parameters/Tool" }
+        ],
+        "responses": {
+          "200": { "$ref": "#/components/responses/Text" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" },
+          "404": { "$ref": "#/components/responses/NotFound" },
+          "503": { "$ref": "#/components/responses/Unavailable" }
+        }
+      }
+    },
+    "/v1/code/search": {
+      "get": {
+        "tags": ["stubs"],
+        "operationId": "searchTools",
+        "summary": "Search the tools",
+        "description": "The same search as the `tools.search` tool, over the tools this agent may use. `mode=keyword` (default) ranks by BM25 over tool names, descriptions, parameter names and parameter descriptions; `mode=regex` matches an RE2 pattern of at most 200 characters, case-insensitive unless the pattern turns that off; `auto` is keyword; `semantic` answers 400 unless the server configured it. `detail` is `name`, `summary` (default) or `full` (with the input and output schemas).",
+        "parameters": [
+          { "name": "q", "in": "query", "required": false, "description": "Words (keyword) or a pattern (regex). Empty lists every tool by name.", "schema": { "type": "string" } },
+          { "name": "mode", "in": "query", "required": false, "schema": { "type": "string", "enum": ["keyword", "regex", "semantic", "auto"], "default": "keyword" } },
+          { "name": "detail", "in": "query", "required": false, "schema": { "type": "string", "enum": ["name", "summary", "full"], "default": "summary" } },
+          { "name": "limit", "in": "query", "required": false, "schema": { "type": "integer", "minimum": 1, "maximum": 200, "default": 50 } },
+          { "name": "upstream", "in": "query", "required": false, "description": "Only the tools of this upstream server.", "schema": { "type": "string" } }
+        ],
+        "responses": {
+          "200": {
+            "description": "The ranked tools.",
+            "content": {
+              "application/json": {
+                "schema": { "$ref": "#/components/schemas/SearchResult" },
+                "example": {
+                  "total": 1,
+                  "matched": 7,
+                  "mode": "keyword",
+                  "results": [{ "name": "Linear.save_issue", "upstream": "Linear", "description": "Create or update an issue.", "code": "Linear.save_issue", "score": 7.4213 }]
+                }
+              }
+            }
+          },
+          "400": { "$ref": "#/components/responses/BadRequest" },
+          "401": { "$ref": "#/components/responses/Unauthorized" },
+          "403": { "$ref": "#/components/responses/Forbidden" },
           "503": { "$ref": "#/components/responses/Unavailable" }
         }
       }
@@ -425,7 +494,7 @@
         "content": { "application/json": { "schema": { "$ref": "#/components/schemas/Error" } } }
       },
       "Busy": {
-        "description": "Code mode is busy. No run is created; try again after `Retry-After` seconds.",
+        "description": "Code mode is busy: every script slot is in use, or this agent already runs as many scripts as one agent may at once (2 by default). A start waits up to 2 seconds in a fair queue first. No run is created; try again after `Retry-After` seconds.",
         "headers": {
           "Retry-After": { "$ref": "#/components/headers/RetryAfter" }
         },
@@ -492,6 +561,12 @@
             "maxLength": 2000,
             "description": "Why the script runs, for the audit record."
           },
+          "language": {
+            "type": "string",
+            "enum": ["starlark", "javascript"],
+            "default": "starlark",
+            "description": "The script's language."
+          },
           "wait_seconds": {
             "type": "integer",
             "minimum": 0,
@@ -548,7 +623,33 @@
             "description": "True when a resume answered the call from the call record instead of sending it upstream again."
           },
           "started_at": { "type": "integer", "description": "Unix time in milliseconds." },
-          "finished_at": { "type": ["integer", "null"], "description": "Unix time in milliseconds." }
+          "finished_at": { "type": ["integer", "null"], "description": "Unix time in milliseconds." },
+          "ms": { "type": "integer", "description": "How long the call took in milliseconds; 0 until it finished." }
+        }
+      },
+      "SearchResult": {
+        "type": "object",
+        "required": ["total", "matched", "mode", "results"],
+        "properties": {
+          "total": { "type": "integer", "description": "Results returned." },
+          "matched": { "type": "integer", "description": "Tools that matched, before the limit." },
+          "mode": { "type": "string", "enum": ["keyword", "regex", "semantic"] },
+          "results": {
+            "type": "array",
+            "items": {
+              "type": "object",
+              "required": ["name"],
+              "properties": {
+                "name": { "type": "string", "description": "The catalog name." },
+                "upstream": { "type": "string" },
+                "description": { "type": "string" },
+                "code": { "type": "string", "description": "The name a script calls it by: tools.<code> in JavaScript, <code>(...) in Starlark." },
+                "score": { "type": "number" },
+                "input_schema": { "type": "object" },
+                "output_schema": { "type": "object" }
+              }
+            }
+          }
         }
       },
       "Held": {
@@ -585,7 +686,8 @@
         "type": "object",
         "required": ["run_id", "status", "created_at", "updated_at", "links"],
         "properties": {
-          "run_id": { "type": "string", "examples": ["cr_…"] },
+          "run_id": { "type": "string", "examples": ["cr_…"], "description": "Also the run_id of every audit row of the run." },
+          "language": { "type": "string", "enum": ["starlark", "javascript"] },
           "status": { "$ref": "#/components/schemas/RunStatus" },
           "result": { "description": "The JSON value the script assigned to `result`; null when none." },
           "error": {
