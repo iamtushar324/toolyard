@@ -479,12 +479,21 @@ func TestChangeSweepSettlesAndResumes(t *testing.T) {
 	if row := e.row(t, resumed.ID); row.Status != proposalApproved || e.git.count("POST pulls") != 1 {
 		t.Fatalf("a fresh approved row was resumed: %+v", row)
 	}
-	e.advance(inbox.SystemItemTTL + time.Hour)
+	// Stale after a few minutes: the sweep resumes it (well inside the
+	// retry limits of changeMaxAttempts and changeMaxAge).
+	e.advance(changeStaleAfter + time.Minute)
 	if err := e.changes.Sweep(ctx); err != nil {
 		t.Fatal(err)
 	}
 	if row := e.row(t, resumed.ID); row.Status != proposalDone || row.Result != "https://github.com/acme/skills/pull/1" {
 		t.Fatalf("not resumed: %+v", row)
+	}
+	if row := e.row(t, idle.ID); row.Status != proposalPending {
+		t.Fatalf("an open item was settled: %+v", row)
+	}
+	e.advance(inbox.SystemItemTTL + time.Hour)
+	if err := e.changes.Sweep(ctx); err != nil {
+		t.Fatal(err)
 	}
 	if row := e.row(t, idle.ID); row.Status != proposalRejected || !strings.Contains(row.Error, "expired") {
 		t.Fatalf("expired item: %+v", row)
