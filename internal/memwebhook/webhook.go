@@ -345,32 +345,52 @@ func (s *Service) recordIngestion(ctx context.Context, wh *Webhook, requestID, s
 }
 
 // recordIngestionRow writes one terminal audit row to the ledger from
-// denormalized fields. The background job worker uses it (it carries a job row,
-// not a *Webhook); recordIngestion is the *Webhook convenience wrapper.
+// denormalized fields; recordIngestion is the *Webhook convenience wrapper.
+// The background job worker writes its row inside its terminal transition
+// instead (finishJob).
 func (s *Service) recordIngestionRow(ctx context.Context, id, webhookID, webhookName, wing, source string, size int64, status, detail string, mempalaceOK bool) {
 	if s.db == nil {
 		return
 	}
-	_, _ = s.db.ExecContext(ctx,
-		`INSERT INTO memory_webhook_ingestions(id, webhook_id, webhook_name, wing, source, received_at, payload_size, status, detail, mempalace_ok)
-		 VALUES(?,?,?,?,?,?,?,?,?,?)`,
-		id, webhookID, webhookName, wing, nullStr(source), time.Now().UnixMilli(), size, status, nullStr(truncate(detail, maxDetail)), boolToInt(mempalaceOK))
+	_ = insertIngestionRow(ctx, s.db, id, webhookID, webhookName, wing, source, size, status, detail, mempalaceOK)
 }
 
 func (s *Service) bumpCounters(ctx context.Context, id string, ok bool) {
 	if s.db == nil {
 		return
 	}
+	_ = bumpCountersOn(ctx, s.db, id, ok)
+}
+
+// execer is a *sql.DB or a *sql.Tx.
+type execer interface {
+	ExecContext(ctx context.Context, query string, args ...any) (sql.Result, error)
+}
+
+// insertIngestionRow writes one ledger row on ex. A row with the same id is
+// kept (a ledger row is written once per request).
+func insertIngestionRow(ctx context.Context, ex execer, id, webhookID, webhookName, wing, source string, size int64, status, detail string, mempalaceOK bool) error {
+	_, err := ex.ExecContext(ctx,
+		`INSERT INTO memory_webhook_ingestions(id, webhook_id, webhook_name, wing, source, received_at, payload_size, status, detail, mempalace_ok)
+		 VALUES(?,?,?,?,?,?,?,?,?,?) ON CONFLICT(id) DO NOTHING`,
+		id, webhookID, webhookName, wing, nullStr(source), time.Now().UnixMilli(), size, status, nullStr(truncate(detail, maxDetail)), boolToInt(mempalaceOK))
+	return err
+}
+
+// bumpCountersOn counts one ingestion (and one failure unless ok) on the
+// webhook, on ex.
+func bumpCountersOn(ctx context.Context, ex execer, id string, ok bool) error {
 	now := time.Now().UnixMilli()
 	if ok {
-		_, _ = s.db.ExecContext(ctx,
+		_, err := ex.ExecContext(ctx,
 			`UPDATE memory_webhooks SET ingest_count=ingest_count+1, last_used_at=?, updated_at=? WHERE id=?`,
 			now, now, id)
-		return
+		return err
 	}
-	_, _ = s.db.ExecContext(ctx,
+	_, err := ex.ExecContext(ctx,
 		`UPDATE memory_webhooks SET ingest_count=ingest_count+1, fail_count=fail_count+1, last_used_at=?, updated_at=? WHERE id=?`,
 		now, now, id)
+	return err
 }
 
 func (s *Service) audit2(ctx context.Context, eventType, toolName, summary string) {

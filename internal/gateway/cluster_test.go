@@ -129,6 +129,7 @@ func TestTwoNodeGateways(t *testing.T) {
 	}()
 	time.Sleep(300 * time.Millisecond) // replica 2's wait is under way
 	owner := actor.Decider{UserID: "u_alice", Email: "alice@example.com", Name: "Alice", Via: actor.ViaDashboard}
+	decidedAt := time.Now()
 	if _, err := one.svc.Decide(ctx, sub.RequestID, inbox.Decision{Action: "submit", RequestRevision: 1, SubmissionID: "two_node_test",
 		Verdicts: map[string]inbox.CallVerdict{"run_once": {Verdict: inbox.VerdictAccepted}}, Decider: owner}); err != nil {
 		t.Fatalf("decide on replica 1: %v", err)
@@ -137,6 +138,12 @@ func TestTwoNodeGateways(t *testing.T) {
 	case res := <-waited:
 		if res.IsError || strings.Contains(resultText(res), `"status":"pending"`) || !strings.Contains(resultText(res), "approved") {
 			t.Fatalf("replica 2's wait: %s", resultText(res))
+		}
+		// The Inbox's fallback poll runs every 2 s from the start of the
+		// wait (about 1.7 s after this decision): a wake-up well inside
+		// that came through the cluster message.
+		if took := time.Since(decidedAt); took >= time.Second {
+			t.Fatalf("replica 2's wait returned %s after the decision: the cluster wake-up did not arrive, only the poll", took)
 		}
 	case <-time.After(15 * time.Second):
 		t.Fatal("replica 2's inbox.wait did not wake after replica 1's decision")
