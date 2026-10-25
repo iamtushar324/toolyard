@@ -278,6 +278,11 @@ func (g *Gateway) startJob(ctx context.Context, plan *asyncPlan, c jobCall, ev *
 		started := time.Now()
 		res, derr := run(withProgressSink(rctx, progress), jobEntry, &jev)
 		g.jobMetrics(started, res, derr, &jev)
+		if rctx.Err() != nil && jev.ErrorClass == "audit_unavailable" {
+			// The cancel came before dispatch could record its intent: the
+			// tool was never called.
+			return jobs.Outcome{Status: jobs.StatusCancelled, Error: "cancelled before the call was sent; nothing ran"}
+		}
 		return jobOutcome(res, derr)
 	})
 	if plan.req != nil {

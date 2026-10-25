@@ -844,12 +844,14 @@ func TestNeverStartedJobIsAudited(t *testing.T) {
 	aud := &recAuditor{}
 	svc.SetAuditor(aud)
 	ctx := context.Background()
-	if _, _, err := svc.Start(ctx, startReq("ag_1", "alpha.get_slow"), func(ctx context.Context, _ jobs.ProgressFunc) jobs.Outcome {
+	first, _, err := svc.Start(ctx, startReq("ag_1", "alpha.get_slow"), func(ctx context.Context, _ jobs.ProgressFunc) jobs.Outcome {
 		<-ctx.Done()
 		return jobs.Outcome{Status: jobs.StatusOutcomeUnknown}
-	}); err != nil {
+	})
+	if err != nil {
 		t.Fatal(err)
 	}
+	waitUntil(t, "the first job running", func() bool { j, _ := svc.Get(ctx, first.ID); return j != nil && j.Status == jobs.StatusRunning })
 	queued, _, err := svc.Start(ctx, startReq("ag_2", "alpha.get_other"), blockUntil(make(chan struct{})))
 	if err != nil {
 		t.Fatal(err)

@@ -219,16 +219,11 @@ func TestMCPTasksCancelARunningTask(t *testing.T) {
 	})
 	task, _ := created["task"].(map[string]any)
 	taskID, _ := task["taskId"].(string)
-	deadline := time.Now().Add(10 * time.Second)
-	for {
-		j, err := f.svc.Get(context.Background(), taskID)
-		if err == nil && j.Status == jobs.StatusRunning {
-			break
-		}
-		if time.Now().After(deadline) {
-			t.Fatalf("task never started: %v %v", j, err)
-		}
-		time.Sleep(10 * time.Millisecond)
+	// The upstream call is in flight before the cancel.
+	select {
+	case <-f.slowStarted:
+	case <-time.After(10 * time.Second):
+		t.Fatalf("the task's call never started (%s)", taskID)
 	}
 	cancelled := c.result("tasks/cancel", map[string]any{"taskId": taskID})
 	if cancelled["status"] != string(mcp.TaskStatusCancelled) {
