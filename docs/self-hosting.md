@@ -794,7 +794,7 @@ still shows; afterwards only the new owner can sign in, and the previous
 owner's browser sessions stop working. In the same transaction the
 transfer disables the previous owner's agents and revokes every operator
 token that is not the new owner's; right after it, it revokes the previous
-owner's Beknown key (that calls the key registries; a failure shows in the
+owner's identity key (that calls the key registries; a failure shows in the
 dashboard and the removal is retried). Allow the new owner's Google account
 in the Clerk app too.
 
