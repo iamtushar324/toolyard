@@ -687,7 +687,7 @@ test('approving sends the waiting commit shown on the page; an admin hides or sh
   h.run(`skillsUI.openId = 'src_1'; skillsUI.detail = { id: 'src_1', source: s, versions: [{ id: 'skv_2', sha: 'abcabcabcabcabcabcabcabcabcabcabcabcabca', status: 'staged' }], skills: [] };`);
   await h.run(`decideSkillSource(s, 'approve')`);
   const approve = h.requests.find((r) => r.path === '/v1/skills/sources/src_1/approval');
-  assert.deepEqual(plain(approve.body), { decision: 'approve', sha: 'abcabcabcabcabcabcabcabcabcabcabcabcabca' });
+  assert.deepEqual(plain(approve.body), { decision: 'approve', sha: 'abcabcabcabcabcabcabcabcabcabcabcabcabca', version_id: 'skv_2' });
 
   await h.run(`hideSkillSource(s)`);
   const hide = h.requests.find((r) => r.path === '/v1/skills/sources/src_1' && r.method === 'PATCH');
