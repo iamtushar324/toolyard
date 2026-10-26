@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"errors"
 	"strings"
 	"testing"
 
@@ -19,7 +20,7 @@ func TestOwnerCommand(t *testing.T) {
 	run := func(sub, to string, unblock bool) (string, error) {
 		t.Helper()
 		var out bytes.Buffer
-		err := ownerCommand(ctx, ids, sub, to, unblock, &out)
+		err := ownerCommand(ctx, ids, sub, to, unblock, true, &out)
 		return out.String(), err
 	}
 
@@ -43,7 +44,11 @@ func TestOwnerCommand(t *testing.T) {
 	if _, err := run("transfer", "nobody", false); err == nil {
 		t.Fatal("transfer to an unknown user succeeded")
 	}
-	// The owner left the organisation and the sync suspended them.
+	// The owner left the organisation and the sync suspended them (m is
+	// another admin, so the sync may).
+	if err := ids.SetRole(ctx, m.ID, identity.RoleAdmin); err != nil {
+		t.Fatal(err)
+	}
 	if changed, err := ids.SuspendDepartedOwner(ctx, admin.ID); err != nil || !changed {
 		t.Fatalf("suspend: %v %v", changed, err)
 	}
@@ -76,5 +81,47 @@ func TestOwnerCommand(t *testing.T) {
 	}
 	if _, err := run("rename", "", false); err == nil {
 		t.Fatal("unknown subcommand succeeded")
+	}
+}
+
+// transfer shows the account and changes nothing without --yes; --to never
+// picks one of two accounts with the same email, and never folds Unicode.
+func TestOwnerTransferConfirmsAndRefusesAmbiguity(t *testing.T) {
+	ctx := context.Background()
+	db := storetest.Open(t)
+	t.Cleanup(func() { _ = db.Close() })
+	ids := identity.New(db)
+	admin, err := ids.CreateUser(ctx, "admin", "long-enough-password")
+	if err != nil {
+		t.Fatal(err)
+	}
+	m, err := ids.UpsertClerkUser(ctx, identity.ClerkProfile{ClerkUserID: "user_m", Email: "m@example.com"}, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	if err := ownerCommand(ctx, ids, "transfer", "M@Example.com", false, false, &out); !errors.Is(err, errOwnerConfirm) || !strings.Contains(out.String(), m.ID) {
+		t.Fatalf("without --yes: %q %v", out.String(), err)
+	}
+	if o, _ := ids.Owner(ctx); o == nil || o.ID != admin.ID {
+		t.Fatal("transfer without --yes changed the owner")
+	}
+	// A second account with the same email: the email is ambiguous, the id
+	// is not.
+	if _, err := ids.UpsertClerkUser(ctx, identity.ClerkProfile{ClerkUserID: "user_m2", Email: "M@example.com"}, ""); err != nil {
+		t.Fatal(err)
+	}
+	if err := ownerCommand(ctx, ids, "transfer", "m@example.com", false, true, &out); err == nil || !strings.Contains(err.Error(), "more than one account") {
+		t.Fatalf("ambiguous email: %v", err)
+	}
+	if err := ownerCommand(ctx, ids, "transfer", "m@\u212Aexample.com", false, true, &out); err == nil || !strings.Contains(err.Error(), "no user matches") {
+		t.Fatalf("look-alike email: %v", err)
+	}
+	out.Reset()
+	if err := ownerCommand(ctx, ids, "transfer", m.ID, false, true, &out); err != nil {
+		t.Fatalf("by id: %v", err)
+	}
+	if o, _ := ids.Owner(ctx); o == nil || o.ID != m.ID {
+		t.Fatal("transfer by id did not move the owner")
 	}
 }

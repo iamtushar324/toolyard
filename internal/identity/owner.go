@@ -26,18 +26,25 @@ import (
 //   - the first verified Clerk sign-in (UpsertClerkUser): with an owner
 //     email configured (-owner-email), only that person, on their first
 //     sign-in; without one, whoever the sign-in makes the first admin;
-//   - for an install that had users before 0072, EnsureOwner at startup:
-//     the active user with the configured owner email, else the oldest
-//     active admin.
+//   - for an install that had users before 0072 and no owner email
+//     configured, EnsureOwner at startup: the oldest active admin. With an
+//     owner email configured, startup never picks anyone (a stored email
+//     may be unverified); the configured person's next verified sign-in
+//     claims the role, through the link to the setup account or as a
+//     returning user.
 //
 // The configured owner email only seeds the owner. Once there is one, the
 // stored owner is what counts (OwnerSignInEmail for personal sign-in).
-// While an owner email is configured and nobody with that address exists
-// yet, the role stays vacant: no fallback hands it to someone else.
+// While an owner email is configured and that person has not signed in
+// with a verified address yet, the role stays vacant: no fallback hands it
+// to someone else.
 //
 // Every owner change and every automatic promotion writes an audit row in
 // the same transaction (auditTx): user.owner and user.role, by the person
-// or by one of the system actors below. The one exception to "always an
+// or by one of the system actors below. These rows go straight into
+// audit_events (they hold ids, usernames and counts, nothing to redact):
+// GET /v1/audit and the exports list them, the live audit stream does not
+// push them. The one exception to "always an
 // active admin" is SuspendDepartedOwner: the Clerk sync blocks an owner who
 // left the organisation; a host operator then moves the role with
 // `toolyard owner transfer` (ForceTransferOwnership).
@@ -105,15 +112,30 @@ func (s *Service) Owner(ctx context.Context) (*User, error) {
 	return u, nil
 }
 
-// OwnerOrPrimary is the person in charge: the owner, else (an install
-// with users but no owner yet) the oldest account, as before 0072. Owner
-// notifications (push, the Inbox, events, reauthorisation) go to them.
-func (s *Service) OwnerOrPrimary(ctx context.Context) (*User, error) {
+// ActiveOwnerOrAdmin is who acts for the install: the owner while they are
+// active, else the oldest active admin (no owner yet, or a blocked owner,
+// such as one who left the organisation). ErrNoUser when nobody active is
+// an admin. Owner notifications (push, the Inbox, events,
+// reauthorisation) and the skills hub's fallback reviewer go to them, so a
+// blocked owner never gets them.
+func (s *Service) ActiveOwnerOrAdmin(ctx context.Context) (*User, error) {
 	u, err := s.Owner(ctx)
-	if errors.Is(err, ErrNoUser) {
-		return s.PrimaryUser(ctx)
+	if err == nil && u.Status == StatusActive {
+		return u, nil
 	}
-	return u, err
+	if err != nil && !errors.Is(err, ErrNoUser) {
+		return nil, err
+	}
+	u, err = scanUser(s.db.QueryRowContext(ctx,
+		`SELECT `+userColumns+` FROM users u WHERE u.role = ? AND u.status = ? ORDER BY u.created_at, u.id LIMIT 1`,
+		RoleAdmin, StatusActive))
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrNoUser
+	}
+	if err != nil {
+		return nil, err
+	}
+	return u, nil
 }
 
 // OwnerSignInEmail is the one Google address personal sign-in
@@ -137,27 +159,32 @@ func (s *Service) OwnerSignInEmail(ctx context.Context, seed string) (string, er
 	return seed, nil
 }
 
-// EnsureOwner gives an install that has users but no owner one. With an
-// owner email configured (the -owner-email, ownerEmail) it is the active
-// user with that address (made an admin if they were a member); when
-// nobody has it yet the role stays vacant, for that person's first sign-in
-// to claim. Without an owner email it is the oldest active admin. An
-// install with an owner is left alone, and so is one without users or
-// without an active admin (the next bootstrap sign-in claims the role). It
-// returns the owner, or ErrNoUser when there still is none, and audits a
-// claim as system:startup. Every replica may run it at startup at the same
-// time: the claim is conditional and the unique index refuses a second
-// owner.
+// EnsureOwner gives an install that has users but no owner one: the
+// oldest active admin, when no owner email is configured (ownerEmail, the
+// -owner-email). With an owner email it picks nobody: a stored email may
+// never have been verified, so that person's next verified sign-in claims
+// the role instead (UpsertClerkUser). An install with an owner is left
+// alone, and so is one without an active admin (the next bootstrap
+// sign-in claims the role). It returns the owner, or ErrNoUser when there
+// still is none, and audits a claim as system:startup. Every replica may
+// run it at startup at the same time: the claim is conditional and the
+// unique index refuses a second owner.
 func (s *Service) EnsureOwner(ctx context.Context, ownerEmail string) (*User, error) {
 	if u, err := s.Owner(ctx); !errors.Is(err, ErrNoUser) {
 		return u, err
 	}
-	id, err := s.ownerCandidate(ctx, strings.TrimSpace(ownerEmail))
+	if strings.TrimSpace(ownerEmail) != "" {
+		return nil, ErrNoUser
+	}
+	var id string
+	err := s.db.QueryRowContext(ctx,
+		`SELECT id FROM users WHERE role = ? AND status = ? ORDER BY created_at, id LIMIT 1`,
+		RoleAdmin, StatusActive).Scan(&id)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrNoUser
+	}
 	if err != nil {
 		return nil, err
-	}
-	if id == "" {
-		return nil, ErrNoUser
 	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
@@ -178,39 +205,6 @@ func (s *Service) EnsureOwner(ctx context.Context, ownerEmail string) (*User, er
 		return nil, err
 	}
 	return s.Owner(ctx)
-}
-
-// ownerCandidate is who EnsureOwner makes the owner, "" for nobody.
-func (s *Service) ownerCandidate(ctx context.Context, ownerEmail string) (string, error) {
-	if ownerEmail != "" {
-		// Compared in Go (EmailEqual), not with SQL LOWER, so the rule is
-		// the same on both engines and ASCII-only.
-		rows, err := s.db.QueryContext(ctx,
-			`SELECT id, email FROM users WHERE status = ? AND email IS NOT NULL AND email != '' ORDER BY created_at, id`,
-			StatusActive)
-		if err != nil {
-			return "", err
-		}
-		defer rows.Close()
-		for rows.Next() {
-			var id, email string
-			if err := rows.Scan(&id, &email); err != nil {
-				return "", err
-			}
-			if EmailEqual(email, ownerEmail) {
-				return id, nil
-			}
-		}
-		return "", rows.Err()
-	}
-	var id string
-	err := s.db.QueryRowContext(ctx,
-		`SELECT id FROM users WHERE role = ? AND status = ? ORDER BY created_at, id LIMIT 1`,
-		RoleAdmin, StatusActive).Scan(&id)
-	if errors.Is(err, sql.ErrNoRows) {
-		return "", nil
-	}
-	return id, err
 }
 
 // RepromoteOwner makes a stored owner who is not an admin one again: an
@@ -257,15 +251,40 @@ func (s *Service) RepromoteOwner(ctx context.Context) (bool, error) {
 // audits the move as user:<fromID> in the same transaction (auditOwnerMove);
 // the caller checks who may ask (the owner in a browser session).
 func (s *Service) TransferOwnership(ctx context.Context, fromID, toID string) error {
+	_, err := s.TransferOwnershipWith(ctx, fromID, toID, TransferOptions{})
+	return err
+}
+
+// TransferOptions are the extra revocations a transfer makes in its own
+// transaction.
+type TransferOptions struct {
+	// RevokePrevious disables the previous owner's enrolled agents and
+	// revokes their operator tokens.
+	RevokePrevious bool
+	// RevokeOtherOperatorTokens revokes every operator token that is not
+	// the new owner's (personal sign-in, where only the owner signs in).
+	RevokeOtherOperatorTokens bool
+}
+
+// TransferResult counts what a transfer revoked.
+type TransferResult struct {
+	AgentsDisabled        int64
+	OperatorTokensRevoked int64
+}
+
+// TransferOwnershipWith is TransferOwnership plus the revocations in opts,
+// all in one transaction with the move and its audit rows.
+func (s *Service) TransferOwnershipWith(ctx context.Context, fromID, toID string, opts TransferOptions) (TransferResult, error) {
+	var out TransferResult
 	if fromID == "" || toID == "" {
-		return ErrNoUser
+		return out, ErrNoUser
 	}
 	if fromID == toID {
-		return ErrAlreadyOwner
+		return out, ErrAlreadyOwner
 	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
-		return err
+		return out, err
 	}
 	defer func() { _ = tx.Rollback() }()
 	// Both rows locked in id order, the order ensureOtherActiveAdmin locks
@@ -276,7 +295,7 @@ func (s *Service) TransferOwnership(ctx context.Context, fromID, toID string) er
 		`SELECT id, username, role, COALESCE(is_owner,0), status FROM users WHERE id IN (?, ?) ORDER BY id`+s.db.Dialect.ForUpdate(),
 		fromID, toID)
 	if err != nil {
-		return err
+		return out, err
 	}
 	fromOwner, toFound, toStatus := false, false, ""
 	var fromName, toName, toRole string
@@ -285,7 +304,7 @@ func (s *Service) TransferOwnership(ctx context.Context, fromID, toID string) er
 		var owner int64
 		if err := rows.Scan(&id, &username, &role, &owner, &status); err != nil {
 			rows.Close()
-			return err
+			return out, err
 		}
 		switch id {
 		case fromID:
@@ -296,43 +315,76 @@ func (s *Service) TransferOwnership(ctx context.Context, fromID, toID string) er
 	}
 	if err := rows.Err(); err != nil {
 		rows.Close()
-		return err
+		return out, err
 	}
 	rows.Close()
 	if !fromOwner {
-		return ErrNotOwner
+		return out, ErrNotOwner
 	}
 	if !toFound {
-		return ErrNoUser
+		return out, ErrNoUser
 	}
 	if toStatus != StatusActive {
-		return ErrUserBlocked
+		return out, ErrUserBlocked
 	}
 	now := time.Now().UnixMilli()
 	// Clear first: the unique index allows one owner at any moment.
 	res, err := tx.ExecContext(ctx, `UPDATE users SET is_owner = 0, updated_at = ? WHERE id = ? AND is_owner = 1`, now, fromID)
 	if err != nil {
-		return err
+		return out, err
 	}
 	if n, err := res.RowsAffected(); err != nil {
-		return err
+		return out, err
 	} else if n != 1 {
-		return ErrNotOwner
+		return out, ErrNotOwner
 	}
 	res, err = tx.ExecContext(ctx, `UPDATE users SET is_owner = 1, role = ?, updated_at = ? WHERE id = ? AND status = ?`,
 		RoleAdmin, now, toID, StatusActive)
 	if err != nil {
-		return err
+		return out, err
 	}
 	if n, err := res.RowsAffected(); err != nil {
-		return err
+		return out, err
 	} else if n != 1 {
-		return ErrUserBlocked
+		return out, ErrUserBlocked
 	}
 	if err := auditOwnerMove(ctx, tx, "user:"+fromID, "transfer", fromID, fromName, toID, toName, toRole); err != nil {
-		return err
+		return out, err
 	}
-	return tx.Commit()
+	if opts.RevokePrevious {
+		agents, tokens, err := revokeCredentialsTx(ctx, tx, fromID, now)
+		if err != nil {
+			return out, err
+		}
+		if err := revokeLocalConnectionsTx(ctx, tx, `user_id=?`, []any{fromID}, now); err != nil {
+			return out, err
+		}
+		out.AgentsDisabled, out.OperatorTokensRevoked = agents, tokens
+		if err := auditTx(ctx, tx, "user.credentials_revoked", "user:"+fromID, "previous_owner",
+			fmt.Sprintf("%s: %d agents disabled, %d operator tokens revoked", fromName, agents, tokens),
+			map[string]any{"user_id": fromID, "agents_disabled": agents, "operator_tokens_revoked": tokens}); err != nil {
+			return out, err
+		}
+	}
+	if opts.RevokeOtherOperatorTokens {
+		res, err := tx.ExecContext(ctx, `UPDATE operator_tokens SET revoked_at = ? WHERE user_id <> ? AND revoked_at IS NULL`, now, toID)
+		if err != nil {
+			return out, err
+		}
+		n, err := res.RowsAffected()
+		if err != nil {
+			return out, err
+		}
+		out.OperatorTokensRevoked += n
+		if n > 0 {
+			if err := auditTx(ctx, tx, "operator_token.revoke", "user:"+fromID, "personal_owner_transfer",
+				fmt.Sprintf("%d operator tokens of people other than the new owner %s revoked", n, toName),
+				map[string]any{"owner_user_id": toID, "operator_tokens_revoked": n}); err != nil {
+				return out, err
+			}
+		}
+	}
+	return out, tx.Commit()
 }
 
 // auditOwnerMove writes the user.owner row of a move of the owner role
@@ -443,25 +495,40 @@ func (s *Service) ForceTransferOwnership(ctx context.Context, toID, actorID stri
 
 // SuspendDepartedOwner is what the Clerk sync does to an owner who left
 // the organisation: block them (reason left_org), which ends their browser
-// sessions and stops their agent and operator tokens, then also disable
-// their agents and revoke their operator tokens for good, all audited as
+// sessions and stops their agent and operator tokens, then disable their
+// agents, revoke their operator tokens and delete their push subscriptions
+// (a notification tap needs no session), all audited as
 // system:clerk-sync. The row and the owner role stay; an admin unblocks a
 // mistaken departure in the dashboard, and a host operator moves the role
 // with ForceTransferOwnership. It reports whether it changed anything (an
-// owner already blocked is left alone).
+// owner already blocked is left alone). ErrNotOwner: id is active but no
+// longer the owner (ownership moved since the caller looked), so the
+// caller blocks them as anyone else. ErrLastAdmin: nobody else is an
+// active admin, so it changes nothing (a partial member list must not lock
+// everyone out); the caller warns.
 func (s *Service) SuspendDepartedOwner(ctx context.Context, id string) (bool, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return false, err
 	}
 	defer func() { _ = tx.Rollback() }()
-	var username string
-	err = tx.QueryRowContext(ctx, `SELECT username FROM users WHERE id = ? AND is_owner = 1 AND status = ?`+s.db.Dialect.ForUpdate(),
-		id, StatusActive).Scan(&username)
+	var username, status string
+	var owner int64
+	err = tx.QueryRowContext(ctx, `SELECT username, status, COALESCE(is_owner,0) FROM users WHERE id = ?`+s.db.Dialect.ForUpdate(),
+		id).Scan(&username, &status, &owner)
 	if errors.Is(err, sql.ErrNoRows) {
-		return false, nil
+		return false, ErrNoUser
 	}
 	if err != nil {
+		return false, err
+	}
+	if status != StatusActive {
+		return false, nil
+	}
+	if owner != 1 {
+		return false, ErrNotOwner
+	}
+	if err := ensureOtherActiveAdmin(ctx, tx, s.db.Dialect, id); err != nil {
 		return false, err
 	}
 	now := time.Now().UnixMilli()
@@ -479,43 +546,20 @@ func (s *Service) SuspendDepartedOwner(ctx context.Context, id string) (bool, er
 	if err != nil {
 		return false, err
 	}
+	res, err := tx.ExecContext(ctx, `DELETE FROM push_subscriptions WHERE user_id = ?`, id)
+	if err != nil {
+		return false, err
+	}
+	pushes, err := res.RowsAffected()
+	if err != nil {
+		return false, err
+	}
 	if err := auditTx(ctx, tx, "user.status", ActorClerkSync, "left_org",
-		fmt.Sprintf("%s status=blocked: the owner left the organisation; sessions ended, %d agents disabled, %d operator tokens revoked; still the owner until `toolyard owner transfer`", username, agents, tokens),
-		map[string]any{"user_id": id, "agents_disabled": agents, "operator_tokens_revoked": tokens}); err != nil {
+		fmt.Sprintf("%s status=blocked: the owner left the organisation; sessions ended, %d agents disabled, %d operator tokens revoked, %d push subscriptions deleted; still the owner until `toolyard owner transfer`", username, agents, tokens, pushes),
+		map[string]any{"user_id": id, "agents_disabled": agents, "operator_tokens_revoked": tokens, "push_subscriptions_deleted": pushes}); err != nil {
 		return false, err
 	}
 	return true, tx.Commit()
-}
-
-// RevokeUserCredentials disables id's agents and revokes their operator
-// tokens, audited as actorID with reason. A transfer in personal sign-in
-// mode offers it for the previous owner, who can no longer sign in.
-func (s *Service) RevokeUserCredentials(ctx context.Context, id, actorID, reason string) (agents, tokens int64, err error) {
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return 0, 0, err
-	}
-	defer func() { _ = tx.Rollback() }()
-	var username string
-	if err := tx.QueryRowContext(ctx, `SELECT username FROM users WHERE id = ?`, id).Scan(&username); err != nil {
-		if errors.Is(err, sql.ErrNoRows) {
-			return 0, 0, ErrNoUser
-		}
-		return 0, 0, err
-	}
-	now := time.Now().UnixMilli()
-	if agents, tokens, err = revokeCredentialsTx(ctx, tx, id, now); err != nil {
-		return 0, 0, err
-	}
-	if err := revokeLocalConnectionsTx(ctx, tx, `user_id=?`, []any{id}, now); err != nil {
-		return 0, 0, err
-	}
-	if err := auditTx(ctx, tx, "user.credentials_revoked", actorID, reason,
-		fmt.Sprintf("%s: %d agents disabled, %d operator tokens revoked", username, agents, tokens),
-		map[string]any{"user_id": id, "agents_disabled": agents, "operator_tokens_revoked": tokens}); err != nil {
-		return 0, 0, err
-	}
-	return agents, tokens, tx.Commit()
 }
 
 // revokeCredentialsTx disables uid's enrolled agents (OAuth clients' agents
@@ -540,14 +584,98 @@ func revokeCredentialsTx(ctx context.Context, tx *sql.Tx, uid string, now int64)
 	return agents, tokens, nil
 }
 
-// AgentName is the name of the agent agentID, whoever owns it, or "" when
-// there is no such agent.
+// IsReservedAgentName reports a name that reads as toolyard itself
+// ("toolyard", "Toolyard system", "toolyard:inbox", …): only its letters
+// and digits, lower-cased, starting with "toolyard". The Inbox names
+// toolyard as the sender of its own items, so no agent may take such a
+// name (CreateEnrollment, CreateAgentWithToken), and AgentName marks one
+// that already has it.
+func IsReservedAgentName(name string) bool {
+	var b strings.Builder
+	for _, r := range strings.ToLower(name) {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') {
+			b.WriteRune(r)
+		}
+	}
+	return strings.HasPrefix(b.String(), "toolyard")
+}
+
+// AgentName is how an agent is named on Inbox items and proposals: its
+// name, whoever owns it, with the owner's name after it when the owner is
+// not the install's owner (so another person's agent never passes for one
+// of the owner's, or for toolyard), and quoted as "agent ..." when the name
+// reads as toolyard (agents enrolled by other routes: an OAuth client, a
+// host). "" when there is no such agent.
 func (s *Service) AgentName(ctx context.Context, agentID string) string {
-	var name string
-	if err := s.db.QueryRowContext(ctx, `SELECT name FROM agents WHERE id = ?`, agentID).Scan(&name); err != nil {
+	var name, ownerLabel string
+	var owner int64
+	err := s.db.QueryRowContext(ctx,
+		`SELECT a.name, COALESCE(NULLIF(u.display_name,''), u.username, ''), COALESCE(u.is_owner,0)
+         FROM agents a LEFT JOIN users u ON u.id = a.owner_user WHERE a.id = ?`, agentID).Scan(&name, &ownerLabel, &owner)
+	if err != nil {
 		return ""
 	}
+	if IsReservedAgentName(name) {
+		name = fmt.Sprintf("agent %q", name)
+	}
+	if owner != 1 && ownerLabel != "" {
+		name += " · " + ownerLabel
+	}
 	return name
+}
+
+// ErrAmbiguousUser: a user reference names more than one account.
+var ErrAmbiguousUser = errors.New("more than one user matches; use the user id")
+
+// ResolveUserRef finds the one user a host command names: by exact id,
+// else exact username, else email (EmailEqual: ASCII-only, ignoring case).
+// ErrNoUser when nothing matches, ErrAmbiguousUser when more than one
+// account has that email.
+func (s *Service) ResolveUserRef(ctx context.Context, ref string) (*User, error) {
+	ref = strings.TrimSpace(ref)
+	if ref == "" {
+		return nil, ErrNoUser
+	}
+	if u, err := s.GetUserByID(ctx, ref); err == nil {
+		return u, nil
+	} else if !errors.Is(err, ErrNoUser) {
+		return nil, err
+	}
+	u, err := scanUser(s.db.QueryRowContext(ctx, `SELECT `+userColumns+` FROM users u WHERE u.username = ?`, ref))
+	if err == nil {
+		return u, nil
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		return nil, err
+	}
+	rows, err := s.db.QueryContext(ctx, `SELECT u.id, COALESCE(u.email,'') FROM users u WHERE u.email IS NOT NULL AND u.email != '' ORDER BY u.created_at, u.id`)
+	if err != nil {
+		return nil, err
+	}
+	var match []string
+	for rows.Next() {
+		var id, email string
+		if err := rows.Scan(&id, &email); err != nil {
+			rows.Close()
+			return nil, err
+		}
+		if EmailEqual(email, ref) {
+			match = append(match, id)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		rows.Close()
+		return nil, err
+	}
+	rows.Close()
+	switch len(match) {
+	case 0:
+		return nil, ErrNoUser
+	case 1:
+		return s.GetUserByID(ctx, match[0])
+	default:
+		return nil, ErrAmbiguousUser
+	}
 }
 
 // auditTx writes one audit row (the audit_events table audit.Logger

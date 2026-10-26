@@ -54,6 +54,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
@@ -74,7 +75,6 @@ import (
 	"github.com/tusharbhardwaj/toolyard/internal/identitykeys"
 	"github.com/tusharbhardwaj/toolyard/internal/inbox"
 	"github.com/tusharbhardwaj/toolyard/internal/jobs"
-	"github.com/tusharbhardwaj/toolyard/internal/logx"
 	"github.com/tusharbhardwaj/toolyard/internal/marketplace"
 	"github.com/tusharbhardwaj/toolyard/internal/mcpauth"
 	"github.com/tusharbhardwaj/toolyard/internal/memory"
@@ -164,6 +164,10 @@ type Server struct {
 	clerkFrontendAPI    string
 	ownerEmail          string
 	clerkOwnerOnly      bool
+	// clerkOwnerKept holds the ids of departed owners the offboarding sync
+	// left active because nobody else is an active admin, audited once per
+	// process (clerk_sync.go).
+	clerkOwnerKept sync.Map
 	// connect is POST /v1/connect/t3 (connect_routes.go); nil = off.
 	connect *connectConfig
 	// probes answers /v1/livez and /v1/readyz (and their aliases).
@@ -766,7 +770,9 @@ func (s *Server) authSetup(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	u, err := s.identity.CreateUser(r.Context(), body.Username, body.Password)
+	// The first account is the owner and an admin; both automatic changes
+	// are audited as the setup, in the same transaction as the insert.
+	u, err := s.identity.CreateUserAs(r.Context(), body.Username, body.Password, identity.ActorSetup)
 	if errors.Is(err, identity.ErrUserExists) {
 		writeError(w, http.StatusConflict, "user already configured")
 		return
@@ -774,19 +780,6 @@ func (s *Server) authSetup(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
-	}
-	// The first account is the owner and an admin: both are automatic, so
-	// both are audited (identity audits every later automatic claim in
-	// its own transaction).
-	if s.audit != nil {
-		for _, ev := range []audit.Event{
-			{EventType: "user.owner", AgentID: identity.ActorSetup, Reason: "setup", ResultSummary: fmt.Sprintf("owner -> %s (%s)", u.Username, u.ID)},
-			{EventType: "user.role", AgentID: identity.ActorSetup, Reason: "setup", ResultSummary: fmt.Sprintf("%s role=admin", u.Username)},
-		} {
-			if err := s.audit.Write(r.Context(), ev); err != nil {
-				logx.For("auth").Warn("audit of the first account failed", "event", ev.EventType, "err", err.Error())
-			}
-		}
 	}
 	if err := s.issueSession(w, r, u.ID); err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
@@ -1278,9 +1271,15 @@ func (s *Server) approvalsDecideByToken(w http.ResponseWriter, r *http.Request) 
 	if u, ok := s.sessionUser(r); ok {
 		decider = s.dashboardDecider(r, u, actor.ViaPushToken)
 	} else if recipient != "" {
-		if u, err := s.identity.GetUserByID(r.Context(), recipient); err == nil {
-			decider.Email, decider.Name = u.Email, u.Label()
+		// A tap needs no session: it counts only while the person the
+		// token was minted for is still active (a blocked owner who left
+		// the organisation keeps old notifications).
+		u, err := s.identity.GetUserByID(r.Context(), recipient)
+		if err != nil || u.Status != identity.StatusActive {
+			writeError(w, http.StatusForbidden, "blocked")
+			return
 		}
+		decider.Email, decider.Name = u.Email, u.Label()
 	}
 	req, err := s.approval.DecideAs(r.Context(), id, body.Action, decider)
 	if err != nil {

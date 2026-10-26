@@ -33,10 +33,11 @@ func seed0072(t *testing.T, exec func(string, ...any) error) {
 	}
 }
 
-// check0072: nobody is the owner straight after the migration, the index
-// allows one owner only, and the startup backfill (identity.EnsureOwner)
-// picks the user with the configured owner email, else the oldest active
-// admin.
+// check0072: nobody is the owner straight after the migration, the
+// startup backfill (identity.EnsureOwner) never trusts a stored email (a
+// configured owner email leaves the role for that person's verified
+// sign-in), picks the oldest active admin without one, and the index and
+// CHECK allow one owner only.
 func check0072(t *testing.T, db *store.DB) {
 	t.Helper()
 	ctx := context.Background()
@@ -45,33 +46,22 @@ func check0072(t *testing.T, db *store.DB) {
 		t.Fatalf("owners after 0072 = %d %v, want 0 (no SQL backfill)", owners, err)
 	}
 	id := identity.New(db)
-	u, err := id.EnsureOwner(ctx, "owner@example.com")
-	if err != nil || u.ID != "u_owner" || !u.Owner || u.Role != identity.RoleAdmin {
-		t.Fatalf("backfill with the owner email = %+v %v, want u_owner", u, err)
+	if _, err := id.EnsureOwner(ctx, "owner@example.com"); !errors.Is(err, identity.ErrNoUser) {
+		t.Fatalf("backfill with an owner email: %v, want ErrNoUser (u_owner's stored email is not proof)", err)
 	}
-	if _, err := db.Exec(`UPDATE users SET is_owner = 1 WHERE id = 'u_setup'`); err == nil || !store.IsUniqueViolation(err) {
+	u, err := id.EnsureOwner(ctx, "")
+	if err != nil || u.ID != "u_setup" || !u.Owner || u.Role != identity.RoleAdmin {
+		t.Fatalf("backfill without an owner email = %+v %v, want u_setup", u, err)
+	}
+	if _, err := db.Exec(`UPDATE users SET is_owner = 1 WHERE id = 'u_owner'`); err == nil || !store.IsUniqueViolation(err) {
 		t.Fatalf("second owner: err %v, want a unique violation", err)
 	}
 	if _, err := db.Exec(`UPDATE users SET is_owner = 2 WHERE id = 'u_member'`); err == nil {
 		t.Fatal("is_owner = 2 accepted: the CHECK is missing")
 	}
-	// An owner email nobody has leaves the role vacant (that person's
-	// first sign-in claims it); without an owner email, the oldest admin.
-	if _, err := db.Exec(`UPDATE users SET is_owner = 0`); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := id.EnsureOwner(ctx, "nobody@example.com"); !errors.Is(err, identity.ErrNoUser) {
-		t.Fatalf("backfill with an owner email nobody has: %v, want ErrNoUser", err)
-	}
-	if u, err := id.EnsureOwner(ctx, ""); err != nil || u.ID != "u_setup" {
-		t.Fatalf("backfill without an owner email = %+v %v, want u_setup", u, err)
-	}
 	var actor string
-	if err := db.QueryRow(`SELECT agent_id FROM audit_events WHERE event_type = 'user.owner' ORDER BY ts DESC LIMIT 1`).Scan(&actor); err != nil || actor != identity.ActorStartup {
+	if err := db.QueryRow(`SELECT agent_id FROM audit_events WHERE event_type = 'user.owner'`).Scan(&actor); err != nil || actor != identity.ActorStartup {
 		t.Fatalf("backfill audit actor = %q %v", actor, err)
-	}
-	if u, err := id.Owner(ctx); err != nil || u.ID != "u_setup" {
-		t.Fatalf("Owner after the backfill = %+v %v", u, err)
 	}
 }
 

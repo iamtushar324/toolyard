@@ -6,10 +6,11 @@
 -- one row, so two first sign-ins racing for an empty install cannot both
 -- become the owner. Who becomes the owner: the first account
 -- /v1/auth/setup creates, else the first verified Clerk sign-in (with
--- -owner-email set, only that person). Existing installs get theirs at
--- startup (identity.EnsureOwner): the active user with the configured
--- -owner-email, else the oldest active admin. No backfill here: the owner
--- email is configuration the migration cannot see.
+-- -owner-email set, only that person, on a verified sign-in). Existing
+-- installs without -owner-email get theirs at startup
+-- (identity.EnsureOwner): the oldest active admin; with -owner-email the
+-- role waits for that person's verified sign-in. No backfill here: the
+-- owner email is configuration the migration cannot see.
 --
 -- Same column and index as migrations/postgres/0072_users_owner.sql.
 -- Rollback: an older binary ignores the column and the index, and treats

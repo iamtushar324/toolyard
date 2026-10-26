@@ -20,16 +20,22 @@ import (
 // blocked by the Clerk sync).
 //
 //	toolyard owner show     --data DIR
-//	toolyard owner transfer --data DIR --to USER [--unblock]
+//	toolyard owner transfer --data DIR --to USER [--unblock] [--yes]
+//
+// transfer prints the account --to names (exact id, else exact username,
+// else the one account with that email, ASCII-only and ignoring case; two
+// accounts with the email are refused) and changes nothing until it is
+// run again with --yes.
 func runOwner(argv []string, out io.Writer) error {
 	if len(argv) == 0 {
-		return errors.New("usage: toolyard owner show|transfer --data DIR [--to USER] [--unblock]")
+		return errors.New("usage: toolyard owner show|transfer --data DIR [--to USER] [--unblock] [--yes]")
 	}
 	sub, argv := argv[0], argv[1:]
 	fs := flag.NewFlagSet("owner "+sub, flag.ExitOnError)
 	dataDir := fs.String("data", defaultDataDir(), "toolyard data directory")
 	to := fs.String("to", "", "the new owner: username, email or user id (transfer; required)")
 	unblock := fs.Bool("unblock", false, "re-activate the new owner if they are blocked (transfer)")
+	yes := fs.Bool("yes", false, "make the change; without it transfer only shows the account --to names (transfer)")
 	credentialsDir := fs.String("credentials-dir", os.Getenv("TOOLYARD_CREDENTIALS_DIR"), "directory searched for toolyard.env and database-url after $CREDENTIALS_DIRECTORY, as for serve. Defaults to $TOOLYARD_CREDENTIALS_DIR.")
 	if err := fs.Parse(argv); err != nil {
 		return err
@@ -52,11 +58,15 @@ func runOwner(argv []string, out io.Writer) error {
 		return fmt.Errorf("open db (%s): %w", target.describe(), err)
 	}
 	defer db.Close()
-	return ownerCommand(ctx, identity.New(db), sub, *to, *unblock, out)
+	return ownerCommand(ctx, identity.New(db), sub, *to, *unblock, *yes, out)
 }
 
+// errOwnerConfirm: transfer ran without --yes; it showed the account and
+// changed nothing.
+var errOwnerConfirm = errors.New("nothing changed: check the account above, then run the same command with --yes")
+
 // ownerCommand runs one owner subcommand against ids.
-func ownerCommand(ctx context.Context, ids *identity.Service, sub, to string, unblock bool, out io.Writer) error {
+func ownerCommand(ctx context.Context, ids *identity.Service, sub, to string, unblock, yes bool, out io.Writer) error {
 	switch sub {
 	case "show":
 		u, err := ids.Owner(ctx)
@@ -76,9 +86,18 @@ func ownerCommand(ctx context.Context, ids *identity.Service, sub, to string, un
 		if strings.TrimSpace(to) == "" {
 			return errors.New("--to USER is required (username, email or user id)")
 		}
-		u, err := ids.FindUserForOperator(ctx, to)
-		if err != nil {
+		u, err := ids.ResolveUserRef(ctx, to)
+		switch {
+		case errors.Is(err, identity.ErrNoUser):
+			return fmt.Errorf("no user matches %q (give a user id, username or email)", to)
+		case errors.Is(err, identity.ErrAmbiguousUser):
+			return fmt.Errorf("more than one account has the email %q; give the user id instead", to)
+		case err != nil:
 			return err
+		}
+		fmt.Fprintf(out, "new owner: %s (%s) email=%s role=%s status=%s\n", u.Username, u.ID, orDefault(u.Email, "-"), u.Role, u.Status)
+		if !yes {
+			return errOwnerConfirm
 		}
 		prev, err := ids.ForceTransferOwnership(ctx, u.ID, identity.ActorCLI, unblock)
 		switch {

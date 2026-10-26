@@ -858,6 +858,11 @@ func (s *Service) DecideByTap(ctx context.Context, token, action string) (*Reque
 	if err != nil {
 		return nil, err
 	}
+	// The token was sent to a person who is blocked now (an owner who left
+	// the organisation, say): their old notification decides nothing.
+	if userID != "" && s.opts.UserActive != nil && !s.opts.UserActive(ctx, userID) {
+		return nil, ErrTapToken
+	}
 	d := Decision{By: "notification", Decider: actor.Decider{UserID: userID, Via: actor.ViaPushToken}}
 	switch {
 	case action == TapDeny:

@@ -61,8 +61,8 @@ func TestCreateUserIsOwner(t *testing.T) {
 	if err != nil || len(users) != 2 || !users[0].Owner || users[1].Owner {
 		t.Fatalf("ListUsers owner flags = %+v %v", users, err)
 	}
-	if p, _ := s.OwnerOrPrimary(ctx); p == nil || p.ID != admin {
-		t.Fatalf("OwnerOrPrimary = %+v", p)
+	if p, _ := s.ActiveOwnerOrAdmin(ctx); p == nil || p.ID != admin {
+		t.Fatalf("ActiveOwnerOrAdmin = %+v", p)
 	}
 }
 
@@ -182,13 +182,22 @@ func TestEnsureOwner(t *testing.T) {
 		}
 	})
 
-	t.Run("configured owner email first, made admin", func(t *testing.T) {
+	t.Run("an owner email never picks by stored email", func(t *testing.T) {
+		// A member whose stored email equals the owner email (it may never
+		// have been verified) is not made the owner at startup; their
+		// verified sign-in is.
 		s, admin := newTestIdentity(t)
 		m := clerkUser(t, s, "user_m", "Owner@Beknown.work", "")
 		clearOwner(t, s)
-		u, err := s.EnsureOwner(ctx, "owner@beknown.work")
-		if err != nil || u.ID != m.ID || !u.Owner || u.Role != RoleAdmin {
-			t.Fatalf("EnsureOwner = %+v %v, want the configured owner %s", u, err, m.ID)
+		if _, err := s.EnsureOwner(ctx, "owner@beknown.work"); !errors.Is(err, ErrNoUser) {
+			t.Fatalf("EnsureOwner with the owner email: %v, want the role vacant", err)
+		}
+		if u, _ := s.GetUserByID(ctx, m.ID); u.Owner || u.Role != RoleMember {
+			t.Fatalf("member after a restart = %+v, want a member", u)
+		}
+		again := clerkUser(t, s, "user_m", "Owner@Beknown.work", "owner@beknown.work")
+		if !again.Owner || again.Role != RoleAdmin {
+			t.Fatalf("verified sign-in = %+v, want the owner", again)
 		}
 		if a, _ := s.GetUserByID(ctx, admin); a.Owner || a.Role != RoleAdmin {
 			t.Fatalf("setup account after = %+v", a)
@@ -249,9 +258,10 @@ func TestEnsureOwner(t *testing.T) {
 		if ownerCount(t, s) != 0 {
 			t.Fatal("an owner appeared")
 		}
-		if p, err := s.OwnerOrPrimary(ctx); err != nil || p.ID != admin {
-			t.Fatalf("OwnerOrPrimary without an owner = %+v %v, want the oldest account", p, err)
+		if p, err := s.ActiveOwnerOrAdmin(ctx); !errors.Is(err, ErrNoUser) {
+			t.Fatalf("ActiveOwnerOrAdmin without an active admin = %+v %v, want ErrNoUser", p, err)
 		}
+		_ = admin
 	})
 }
 
@@ -309,8 +319,8 @@ func TestTransferOwnership(t *testing.T) {
 	if err := s.TransferOwnership(ctx, admin, x.ID); !errors.Is(err, ErrNotOwner) {
 		t.Errorf("transfer by the previous owner: %v", err)
 	}
-	if p, _ := s.OwnerOrPrimary(ctx); p == nil || p.ID != m.ID {
-		t.Fatalf("OwnerOrPrimary after the transfer = %+v", p)
+	if p, _ := s.ActiveOwnerOrAdmin(ctx); p == nil || p.ID != m.ID {
+		t.Fatalf("ActiveOwnerOrAdmin after the transfer = %+v", p)
 	}
 	if p, _ := s.PrimaryUser(ctx); p == nil || p.ID != admin {
 		t.Fatalf("PrimaryUser stays the oldest account: %+v", p)
@@ -497,7 +507,11 @@ func TestForceTransferOwnership(t *testing.T) {
 	s, admin := newTestIdentity(t)
 	m := clerkUser(t, s, "user_m", "m@beknown.work", "")
 	x := clerkUser(t, s, "user_x", "x@beknown.work", "")
-	// The owner left and was suspended.
+	a2 := clerkUser(t, s, "user_a2", "a2@beknown.work", "")
+	if err := s.SetRole(ctx, a2.ID, RoleAdmin); err != nil {
+		t.Fatal(err)
+	}
+	// The owner left and was suspended (another admin remains).
 	if changed, err := s.SuspendDepartedOwner(ctx, admin); err != nil || !changed {
 		t.Fatalf("suspend: %v %v", changed, err)
 	}
@@ -544,10 +558,166 @@ func TestAgentName(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := s.AgentName(ctx, ag.ID); got != "member-bot" {
+	// Another person's agent carries its owner's name.
+	if got := s.AgentName(ctx, ag.ID); got != "member-bot · Name user_m" {
 		t.Fatalf("AgentName = %q", got)
 	}
 	if got := s.AgentName(ctx, "ag_missing"); got != "" {
 		t.Fatalf("AgentName(missing) = %q", got)
+	}
+}
+
+// A blocked owner gets no owner notifications: the oldest active admin
+// does.
+func TestActiveOwnerOrAdminSkipsBlockedOwner(t *testing.T) {
+	ctx := context.Background()
+	s, admin := newTestIdentity(t)
+	a2 := clerkUser(t, s, "user_a2", "a2@beknown.work", "")
+	if err := s.SetRole(ctx, a2.ID, RoleAdmin); err != nil {
+		t.Fatal(err)
+	}
+	if u, err := s.ActiveOwnerOrAdmin(ctx); err != nil || u.ID != admin {
+		t.Fatalf("active owner: %+v %v", u, err)
+	}
+	if changed, err := s.SuspendDepartedOwner(ctx, admin); err != nil || !changed {
+		t.Fatalf("suspend: %v %v", changed, err)
+	}
+	if u, err := s.ActiveOwnerOrAdmin(ctx); err != nil || u.ID != a2.ID {
+		t.Fatalf("blocked owner: %+v %v, want the other admin", u, err)
+	}
+}
+
+// SuspendDepartedOwner refuses to take out the only active admin, deletes
+// push subscriptions, and answers ErrNotOwner for someone who is no longer
+// the owner.
+func TestSuspendDepartedOwnerGuards(t *testing.T) {
+	ctx := context.Background()
+	s, admin := newTestIdentity(t)
+	m := clerkUser(t, s, "user_m", "m@beknown.work", "")
+	if _, err := s.SuspendDepartedOwner(ctx, admin); !errors.Is(err, ErrLastAdmin) {
+		t.Fatalf("sole admin owner: %v, want ErrLastAdmin", err)
+	}
+	if u, _ := s.GetUserByID(ctx, admin); u.Status != StatusActive {
+		t.Fatalf("sole admin owner was blocked: %+v", u)
+	}
+	if _, err := s.SuspendDepartedOwner(ctx, m.ID); !errors.Is(err, ErrNotOwner) {
+		t.Fatalf("not the owner: %v, want ErrNotOwner", err)
+	}
+	if err := s.SetRole(ctx, m.ID, RoleAdmin); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.db.Exec(`INSERT INTO push_subscriptions(id, user_id, endpoint, p256dh, auth, created_at) VALUES('ps_1', ?, 'https://push.example/1', 'k', 'a', 1)`, admin); err != nil {
+		t.Fatal(err)
+	}
+	if changed, err := s.SuspendDepartedOwner(ctx, admin); err != nil || !changed {
+		t.Fatalf("suspend: %v %v", changed, err)
+	}
+	var n int
+	if err := s.db.QueryRow(`SELECT count(*) FROM push_subscriptions WHERE user_id = ?`, admin).Scan(&n); err != nil || n != 0 {
+		t.Fatalf("push subscriptions left = %d %v", n, err)
+	}
+}
+
+// No agent may take a name that reads as toolyard; one that has it (from
+// another route) is quoted.
+func TestReservedAgentNames(t *testing.T) {
+	ctx := context.Background()
+	s, admin := newTestIdentity(t)
+	for _, name := range []string{"toolyard", "Toolyard system", "TOOLYARD:inbox", "tool-yard"} {
+		if _, _, err := s.CreateAgentWithToken(ctx, admin, name); !errors.Is(err, ErrReservedAgentName) {
+			t.Errorf("CreateAgentWithToken(%q): %v, want ErrReservedAgentName", name, err)
+		}
+		if _, _, err := s.CreateEnrollment(ctx, admin, name, time.Minute); !errors.Is(err, ErrReservedAgentName) {
+			t.Errorf("CreateEnrollment(%q): %v, want ErrReservedAgentName", name, err)
+		}
+	}
+	if _, _, err := s.CreateAgentWithToken(ctx, admin, "my toolyard bot"); err != nil {
+		t.Errorf("a name that only contains toolyard: %v", err)
+	}
+	if _, err := s.db.Exec(`INSERT INTO agents(id, name, owner_user, token_hash, created_at) VALUES('ag_t', 'toolyard', ?, 'h', 1)`, admin); err != nil {
+		t.Fatal(err)
+	}
+	if got := s.AgentName(ctx, "ag_t"); got != `agent "toolyard"` {
+		t.Fatalf("AgentName of a reserved name = %q", got)
+	}
+}
+
+// ResolveUserRef: exact id, then exact username, then one ASCII email match.
+func TestResolveUserRef(t *testing.T) {
+	ctx := context.Background()
+	s, admin := newTestIdentity(t)
+	m := clerkUser(t, s, "user_m", "m@beknown.work", "")
+	if u, err := s.ResolveUserRef(ctx, admin); err != nil || u.ID != admin {
+		t.Fatalf("by id: %+v %v", u, err)
+	}
+	if u, err := s.ResolveUserRef(ctx, "admin"); err != nil || u.ID != admin {
+		t.Fatalf("by username: %+v %v", u, err)
+	}
+	if u, err := s.ResolveUserRef(ctx, " M@BEKNOWN.work "); err != nil || u.ID != m.ID {
+		t.Fatalf("by email: %+v %v", u, err)
+	}
+	if _, err := s.ResolveUserRef(ctx, "m@be\u212Anown.work"); !errors.Is(err, ErrNoUser) {
+		t.Fatalf("look-alike email: %v", err)
+	}
+	clerkUser(t, s, "user_m2", "m@BEKNOWN.work", "")
+	if _, err := s.ResolveUserRef(ctx, "m@beknown.work"); !errors.Is(err, ErrAmbiguousUser) {
+		t.Fatalf("two accounts with the email: %v", err)
+	}
+	if _, err := s.ResolveUserRef(ctx, ""); !errors.Is(err, ErrNoUser) {
+		t.Fatalf("empty ref: %v", err)
+	}
+}
+
+// A transfer can revoke the previous owner's credentials and every other
+// person's operator tokens in its own transaction.
+func TestTransferOwnershipWithRevocations(t *testing.T) {
+	ctx := context.Background()
+	s, admin := newTestIdentity(t)
+	m := clerkUser(t, s, "user_m", "m@beknown.work", "")
+	x := clerkUser(t, s, "user_x", "x@beknown.work", "")
+	if err := s.SetRole(ctx, x.ID, RoleAdmin); err != nil {
+		t.Fatal(err)
+	}
+	agentTok, _, err := s.CreateAgentWithToken(ctx, admin, "bot")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, uid := range []string{admin, x.ID} {
+		if _, _, err := s.CreateOperatorToken(ctx, uid, "cli", []string{ScopeRead}, 0, "test"); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := s.SetRole(ctx, m.ID, RoleAdmin); err != nil {
+		t.Fatal(err)
+	}
+	mTok, _, err := s.CreateOperatorToken(ctx, m.ID, "cli", []string{ScopeRead}, 0, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	res, err := s.TransferOwnershipWith(ctx, admin, m.ID, TransferOptions{RevokePrevious: true, RevokeOtherOperatorTokens: true})
+	if err != nil || res.AgentsDisabled != 1 || res.OperatorTokensRevoked != 2 {
+		t.Fatalf("transfer = %+v %v, want 1 agent and 2 operator tokens", res, err)
+	}
+	if _, err := s.VerifyAgentToken(ctx, agentTok); err == nil {
+		t.Error("the previous owner's agent still authenticates")
+	}
+	if _, _, err := s.VerifyOperatorToken(ctx, mTok); err != nil {
+		t.Errorf("the new owner's operator token was revoked: %v", err)
+	}
+	var live int
+	if err := s.db.QueryRow(`SELECT count(*) FROM operator_tokens WHERE revoked_at IS NULL`).Scan(&live); err != nil || live != 1 {
+		t.Fatalf("live operator tokens = %d %v, want only the new owner's", live, err)
+	}
+}
+
+// The first account created by the setup is audited in its transaction.
+func TestCreateUserAsAudits(t *testing.T) {
+	ctx := context.Background()
+	s := newEmptyIdentity(t)
+	if _, err := s.CreateUserAs(ctx, "admin", "long-enough-password", ActorSetup); err != nil {
+		t.Fatal(err)
+	}
+	if auditCount(t, s, "user.owner", ActorSetup) != 1 || auditCount(t, s, "user.role", ActorSetup) != 1 {
+		t.Fatal("the setup is not audited")
 	}
 }
