@@ -229,6 +229,14 @@ func memberAllowed(method, path string) bool {
 		(path == skillsSourcesPath && method == http.MethodGet) {
 		return true
 	}
+	// Skill contributors (members an admin named on the Skills page) add
+	// skill sources and manage their own; the handlers refuse every other
+	// member and check that the source is theirs (skillManagerUser,
+	// skills_sharing_routes.go). Activating, rejecting and approving stay
+	// admin routes, as do the GitHub token and the contributor list.
+	if skillsManagerRoute(method, path) {
+		return true
+	}
 	// A native Inbox upload: the single-use ticket in the path is the
 	// credential (upload_routes.go); a cookie riding along changes nothing.
 	if ticket, ok := strings.CutPrefix(path, uploadsPathPrefix); ok {
@@ -277,6 +285,43 @@ func memberAllowed(method, path string) bool {
 		case (sub == "rotate" || sub == "disable" || sub == "enable") && method == http.MethodPost:
 			return true
 		}
+	}
+	return false
+}
+
+// skillsManagerRoute reports a Skills page route a skill contributor may
+// use (the handler decides whether this member is one):
+//
+//	GET    /v1/skills/admin/me, /v1/skills/admin/sources, /v1/skills/admin/people
+//	POST   /v1/skills/sources, /v1/skills/sources/inspect, /v1/skills/sources/preview
+//	GET    PATCH DELETE /v1/skills/sources/{id}
+//	POST   /v1/skills/sources/{id}/sync, /v1/skills/sources/{id}/webhook-secret
+//	GET    /v1/skills/sources/{id}/versions, /v1/skills/sources/{id}/skills
+//	PUT    /v1/skills/sources/{id}/skills/runs, /v1/skills/sources/{id}/skills/sharing
+func skillsManagerRoute(method, path string) bool {
+	switch path {
+	case skillMePath, skillPeoplePath, "/v1/skills/admin/sources":
+		return method == http.MethodGet
+	case skillsSourcesPath, skillAdminSourcesPrefix + "inspect", skillAdminSourcesPrefix + "preview":
+		return method == http.MethodPost
+	}
+	rest, ok := strings.CutPrefix(path, skillAdminSourcesPrefix)
+	if !ok {
+		return false
+	}
+	parts := strings.Split(rest, "/")
+	if !skillAdminIDPattern.MatchString(parts[0]) || parts[0] == "inspect" || parts[0] == "preview" {
+		return false
+	}
+	switch {
+	case len(parts) == 1:
+		return method == http.MethodGet || method == http.MethodPatch || method == http.MethodDelete
+	case len(parts) == 2 && (parts[1] == "sync" || parts[1] == "webhook-secret"):
+		return method == http.MethodPost
+	case len(parts) == 2 && (parts[1] == "versions" || parts[1] == "skills"):
+		return method == http.MethodGet
+	case len(parts) == 3 && parts[1] == "skills" && (parts[2] == "runs" || parts[2] == "sharing"):
+		return method == http.MethodPut
 	}
 	return false
 }

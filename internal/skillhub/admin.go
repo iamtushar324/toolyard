@@ -35,13 +35,24 @@ const (
 // list). Without a token, a private or missing repository answers with
 // NeedsToken set.
 func (s *Service) Inspect(ctx context.Context, rawURL, token string) (*RepoInfo, error) {
+	return s.inspect(ctx, rawURL, token, false)
+}
+
+// InspectAnonymous is Inspect with no token at all, not even the default
+// one: what a skill contributor without their own credential may read.
+// A private repository answers with NeedsToken set.
+func (s *Service) InspectAnonymous(ctx context.Context, rawURL string) (*RepoInfo, error) {
+	return s.inspect(ctx, rawURL, "", true)
+}
+
+func (s *Service) inspect(ctx context.Context, rawURL, token string, anonymous bool) (*RepoInfo, error) {
 	ref, rest, err := parseRepoURL(rawURL)
 	if err != nil {
 		return nil, err
 	}
 	token = strings.TrimSpace(token)
 	gh := s.newClient(token)
-	if token == "" {
+	if token == "" && !anonymous {
 		gh = s.publicClient()
 	}
 	repo, err := gh.repo(ctx, ref.Owner, ref.Repo)
@@ -106,6 +117,12 @@ func (s *Service) prepareSource(ctx context.Context, by string, in SourceInput) 
 			return nil, nil, fmt.Errorf("%w: a token was given but auth is none", ErrInvalid)
 		}
 		gh = s.publicClient()
+		if in.PendingApproval {
+			// A skill contributor never reads with the admins' default
+			// token: only a public repository is readable without their
+			// own token or GitHub connection.
+			gh = s.newClient("")
+		}
 	case AuthToken:
 		if token == "" {
 			return nil, nil, fmt.Errorf("%w: auth token needs a token", ErrInvalid)
@@ -175,9 +192,23 @@ func (s *Service) applyInput(ctx context.Context, r *sourceRow, in SourceInput) 
 	r.PinnedSHA = strings.ToLower(strings.TrimSpace(in.PinnedSHA))
 	r.PollSeconds = in.PollSeconds
 	r.Enabled = in.Enabled == nil || *in.Enabled
-	r.Visibility, r.Members, r.DefaultRuns = in.Visibility, in.Members, in.DefaultRuns
+	r.Visibility, r.Members, r.Blocked, r.DefaultRuns = in.Visibility, in.Members, in.Blocked, in.DefaultRuns
 	if in.Limits != nil {
 		r.Limits = *in.Limits
+	}
+	if in.PendingApproval {
+		// A skill contributor's source: review, or auto for a repository
+		// owner an admin trusts (the owner GitHub answered with, not the
+		// one in the URL); never pinned, never other limits.
+		r.Approval = ApprovalPending
+		switch {
+		case r.Mode == ModePinned:
+			return fmt.Errorf("%w: only an admin can pin a source", ErrInvalid)
+		case r.Mode == ModeAuto && !s.TrustedOwner(ctx, r.Owner):
+			return fmt.Errorf("%w: automatic updates are for trusted repository owners only; %s is not one", ErrInvalid, r.Owner)
+		case in.Limits != nil:
+			return fmt.Errorf("%w: only an admin can set a source's limits", ErrInvalid)
+		}
 	}
 	return normalizeSource(r)
 }
@@ -210,15 +241,17 @@ func normalizeSource(r *sourceRow) error {
 	switch r.Visibility {
 	case "":
 		r.Visibility = VisibleEveryone
-	case VisibleEveryone, VisibleMembers:
+	case VisibleEveryone, VisibleMembers, VisibleNobody:
 	default:
-		return fmt.Errorf("%w: visibility %q: use everyone or members", ErrInvalid, r.Visibility)
+		return fmt.Errorf("%w: visibility %q: use everyone, members or nobody", ErrInvalid, r.Visibility)
 	}
-	members := uniqueStrings(trimAll(r.Members))
-	if len(members) > maxMembers {
-		return fmt.Errorf("%w: at most %d members", ErrInvalid, maxMembers)
+	var err error
+	if r.Members, err = cleanUserList(r.Members, "members"); err != nil {
+		return err
 	}
-	r.Members = members
+	if r.Blocked, err = cleanUserList(r.Blocked, "blocked"); err != nil {
+		return err
+	}
 	switch r.DefaultRuns {
 	case "":
 		r.DefaultRuns = RunsAnywhere
@@ -233,6 +266,15 @@ func normalizeSource(r *sourceRow) error {
 			ErrInvalid, ceilFileBytes, ceilTotalBytes, ceilSkills, ceilFiles)
 	}
 	return nil
+}
+
+// cleanUserList trims, de-duplicates and caps a list of user IDs.
+func cleanUserList(ids []string, field string) ([]string, error) {
+	out := uniqueStrings(trimAll(ids))
+	if len(out) > maxMembers {
+		return nil, fmt.Errorf("%w: %s: at most %d people", ErrInvalid, field, maxMembers)
+	}
+	return out, nil
 }
 
 func trimAll(xs []string) []string {
@@ -259,6 +301,28 @@ func (s *Service) Preview(ctx context.Context, by string, in SourceInput) (*Prev
 	if reservedSlug(r.Slug) && strings.TrimSpace(in.Slug) == "" {
 		r.Slug = slugCandidate(r.Slug, 2)
 	}
+	return s.previewRow(ctx, r, gh)
+}
+
+// PreviewSource is a dry run of a stored source with its own settings and
+// credential (anonymous for a contributor's source without one). Nothing
+// is stored.
+func (s *Service) PreviewSource(ctx context.Context, id string) (*Preview, error) {
+	r, err := s.getSourceRow(ctx, s.db, id)
+	if err != nil {
+		return nil, err
+	}
+	gh, err := s.clientFor(ctx, r)
+	if err != nil {
+		return nil, err
+	}
+	return s.previewRow(ctx, r, gh)
+}
+
+// previewRow is the dry run of r with gh: the commit it would serve, the
+// skills found, warnings, a sample and sizes.
+func (s *Service) previewRow(ctx context.Context, r *sourceRow, gh *ghClient) (*Preview, error) {
+	var err error
 	sha := r.PinnedSHA
 	if r.Mode != ModePinned {
 		if sha, _, _, err = gh.head(ctx, r.Owner, r.Repo, r.Branch, "", true); err != nil {
@@ -425,6 +489,12 @@ func (s *Service) UpdateSource(ctx context.Context, by, id string, up SourceUpda
 	if up.Members != nil {
 		r.Members = *up.Members
 	}
+	if up.Blocked != nil {
+		r.Blocked = *up.Blocked
+	}
+	if up.Hidden != nil {
+		r.Hidden = *up.Hidden
+	}
 	if up.DefaultRuns != nil {
 		r.DefaultRuns = *up.DefaultRuns
 	}
@@ -503,6 +573,7 @@ func (s *Service) DeleteSource(ctx context.Context, by, id string) error {
 		`DELETE FROM skill_versions WHERE source_id = ?`,
 		`DELETE FROM skill_usage WHERE source_id = ?`,
 		`DELETE FROM skill_runs_overrides WHERE source_id = ?`,
+		`DELETE FROM skill_sharing WHERE source_id = ?`,
 	} {
 		if _, err := tx.ExecContext(ctx, q, id); err != nil {
 			return fmt.Errorf("skillhub: delete source: %w", err)
@@ -644,15 +715,23 @@ func (s *Service) Skills(ctx context.Context, id string) ([]SkillUsage, error) {
 	if err != nil {
 		return nil, err
 	}
+	shares, err := s.skillShares(ctx, id)
+	if err != nil {
+		return nil, err
+	}
 	reads, err := s.reads30d(ctx, id)
 	if err != nil {
 		return nil, err
 	}
 	for _, e := range entries {
-		out = append(out, SkillUsage{
+		u := SkillUsage{
 			Path: e.path, Name: e.name, Runs: effectiveRuns(overrides[e.path], Runs(e.runs), r.DefaultRuns),
 			RunsOverride: overrides[e.path], Reads30d: reads[e.path],
-		})
+		}
+		if sh, ok := shares[e.path]; ok {
+			u.Sharing = &sh
+		}
+		out = append(out, u)
 	}
 	return out, nil
 }

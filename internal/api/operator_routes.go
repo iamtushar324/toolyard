@@ -111,6 +111,8 @@ var operatorOwnerPrefixes = []string{
 	// Skill sources: what every agent reads, and their read tokens.
 	"/v1/skills/sources",
 	"/v1/skills/admin/github-token",
+	// Who may add skill sources.
+	"/v1/skills/admin/contributors",
 }
 
 // operatorScopeFor returns the scope an operator token needs for method on
@@ -540,9 +542,13 @@ var operatorCatalog = []operatorCatalogEntry{
 	{"/v1/marketplace", "GET", "curated server recipes"},
 	{"/v1/secrets", "GET POST", "secrets metadata; POST {name, description, request:true} asks the owner for a value"},
 	{"/v1/secrets/{id}", "PUT DELETE", "set/rotate (?reconnect=1) or delete a secret value"},
-	{"/v1/skills/admin/sources", "GET", "skills hub: every skill source, with status (admin)"},
+	{"/v1/skills/admin/sources", "GET", "skills hub: every skill source, with status (admin; a skill contributor gets their own)"},
+	{"/v1/skills/admin/me", "GET", "skills hub: {user_id, admin, contributor}: what the signed-in person may do on the Skills page"},
+	{"/v1/skills/admin/people", "GET", "skills hub: the active people a source or skill can be shared with or blocked from (admins and skill contributors)"},
+	{"/v1/skills/admin/contributors", "GET", "skills hub: the skill contributors, members who may add sources that wait for an admin's approval (admin)"},
+	{"/v1/skills/admin/contributors/{id}", "PUT DELETE", "skills hub: add or remove a skill contributor by user ID (admin; owner scope); their sources stay"},
 	{"/v1/skills/admin/github-token", "GET PUT", "skills hub: the default GitHub read token for sources without their own: GET {set, rate, paused_until}; PUT {token} sets it (checked with GitHub) or, empty, clears it; never returned"},
-	{"/v1/skills/sources/{id}", "GET POST PATCH PUT DELETE", "skills hub admin: POST /v1/skills/sources creates a source; /inspect and /preview try one; /{id} reads, PATCHes or DELETEs it; /{id}/sync, /{id}/versions, /{id}/versions/{vid}/activate|reject, /{id}/skills, PUT /{id}/skills/runs; /{id}/webhook-secret rotates the webhook secret (never via operator token); /{id}/webhook is GitHub's signed push webhook (no token)"},
+	{"/v1/skills/sources/{id}", "GET POST PATCH PUT DELETE", "skills hub admin: POST /v1/skills/sources creates a source; /inspect and /preview try one; /{id} reads, PATCHes or DELETEs it; /{id}/sync, /{id}/versions, /{id}/versions/{vid}/activate|reject, /{id}/skills, PUT /{id}/skills/runs, PUT /{id}/skills/sharing {path, mode, members, blocked}, POST /{id}/approval {decision, note} (admin); /{id}/webhook-secret rotates the webhook secret (never via operator token); /{id}/webhook is GitHub's signed push webhook (no token)"},
 	{"/v1/policies", "GET POST", "tool policies"},
 	{"/v1/policies/{id}", "PATCH DELETE", "one policy"},
 	{"/v1/settings", "GET PATCH", "settings (secret values masked)"},

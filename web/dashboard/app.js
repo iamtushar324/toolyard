@@ -187,8 +187,15 @@ function skillsHubOn() {
   return !!(state.authConfig && state.authConfig.capabilities && state.authConfig.capabilities.skills);
 }
 
+// skillsContributorOn reports a member the skills hub names a skill
+// contributor (skills.js loadSkillsMe): they get the Skills page for their
+// own sources. skillsUI lives in skills.js, which may not be loaded.
+function skillsContributorOn() {
+  return skillsHubOn() && typeof skillsUI !== 'undefined' && !!skillsUI.contributor;
+}
+
 function routeAllowed(route) {
-  if (route === 'skills' && !skillsHubOn()) return false;
+  if (route === 'skills') return skillsHubOn() && (isAdmin() || skillsContributorOn());
   return isAdmin() || MEMBER_ROUTES.includes(route);
 }
 
@@ -4852,7 +4859,8 @@ function shell(content) {
         navBtn('tools', 'Tools', 'tools'),
         skillsHubOn() ? navBtn('skills', 'Skills', 'book') : null,
         navBtn('settings', 'Settings', 'sliders')) : el('nav', { 'aria-label': 'Main navigation' },
-        navBtn('inbox', 'Inbox', 'inbox', inboxBadgeCount()), navBtn('agents', 'Agents', 'people'), navBtn('apps', 'Connected apps', 'key'), navBtn('myservers', 'Available services', 'tools'), navBtn('connections', 'Connections', 'plug')),
+        navBtn('inbox', 'Inbox', 'inbox', inboxBadgeCount()), navBtn('agents', 'Agents', 'people'), navBtn('apps', 'Connected apps', 'key'), navBtn('myservers', 'Available services', 'tools'), navBtn('connections', 'Connections', 'plug'),
+        skillsContributorOn() ? navBtn('skills', 'Skills', 'book') : null),
       el('div', { class: 'sidebar-footer' }, admin ? renderStreamPill() : null,
         el('div', { class: 'sidebar-account' }, el('span', { class: 'user-chip', title: state.user.email || '' },
           userAvatar(state.user), el('span', { class: 'account-copy' }, userLabel(state.user), el('small', {}, admin ? 'Administrator' : 'Member'))),
@@ -4891,6 +4899,7 @@ function renderMoreSheet() {
         item('apps',      'Connected apps', 'Apps added by URL, like ChatGPT and Claude'),
         item('myservers', 'My servers', 'Servers your agents may use'),
         item('connections', 'My connections', 'Sign in to servers that act as you'),
+        skillsContributorOn() ? item('skills', 'Skills', 'Skill sources you added') : null,
       ],
       el('div', { class: 'mobile-account' }, userAvatar(state.user), el('span', {}, userLabel(state.user)), el('button', { on: { click: logoutWorkspace } }, 'Sign out')),
       el('div', { class: 'row', style: 'margin-top: 12px; justify-content: flex-end;' },
@@ -7621,7 +7630,9 @@ Read the full rules with inbox.guide().`;
   if (state.user && appsResumeOAuth()) return;
   if (state.user && !isAdmin()) {
     // Members: their agents and granted servers only. No event stream and
-    // no admin fetches (they'd all be 403 admin_only).
+    // no admin fetches (they'd all be 403 admin_only). A skill contributor
+    // also gets Skills: asked first, so a #skills link survives the load.
+    if (skillsHubOn()) await loadSkillsMe();
     await loadAll();
     if (state.route === 'connections') loadConnections(true);
     if(deepInbox)openInboxRequest(deepInbox);
