@@ -1,8 +1,8 @@
 # Starlark in code mode
 
 Starlark is the default language of `executeToolCode` (`language` omitted,
-`"starlark"` or `"python"`). Its output matches the Bifrost gateway's code
-mode byte for byte, so skills that parse that output keep working.
+`"starlark"` or `"python"`). Its output format is stable, so skills and
+scripts that parse that output keep working.
 
 ## Shape of a script
 

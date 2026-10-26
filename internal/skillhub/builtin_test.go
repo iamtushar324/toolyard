@@ -146,7 +146,10 @@ func TestBuiltinSkillsAreValid(t *testing.T) {
 
 	// Public text only: no organisation, people, internal hosts or
 	// addresses, nothing that looks like a credential.
-	forbidden := regexp.MustCompile(`(?i)beknown|tushar|\.live\b|\bts\.net\b|tailnet|dev-server|\b(?:\d{1,3}\.){3}\d{1,3}\b`)
+	forbidden := regexp.MustCompile(`(?i)beknown|tushar|\.live\b|\bts\.net\b|tailnet|dev-server`)
+	ipv4 := regexp.MustCompile(`\b(?:\d{1,3}\.){3}\d{1,3}\b`)
+	generic := map[string]bool{"127.0.0.1": true, "0.0.0.0": true} // loopback and "any" only
+	scheme := regexp.MustCompile(`^[a-zA-Z][a-zA-Z0-9+.-]*:`)
 	link := regexp.MustCompile(`\]\(([^)\s]+)\)`)
 	ref := regexp.MustCompile(`toolyard/(toolyard-[a-z0-9-]+)`)
 	for p, content := range files {
@@ -160,10 +163,15 @@ func TestBuiltinSkillsAreValid(t *testing.T) {
 		if m := forbidden.FindString(text); m != "" {
 			t.Errorf("%s mentions %q: built-in skills describe toolyard for any deployment", p, m)
 		}
+		for _, ip := range ipv4.FindAllString(text, -1) {
+			if !generic[ip] {
+				t.Errorf("%s mentions the address %s: built-in skills describe toolyard for any deployment", p, ip)
+			}
+		}
 		for _, m := range link.FindAllStringSubmatch(text, -1) {
 			target := m[1]
-			if strings.Contains(target, "://") || strings.HasPrefix(target, "#") || strings.HasPrefix(target, "mailto:") {
-				continue
+			if scheme.MatchString(target) || strings.HasPrefix(target, "#") {
+				continue // a URL or another scheme (upload:<sha256>), or an anchor
 			}
 			target, _, _ = strings.Cut(target, "#")
 			if _, ok := files[path.Join(path.Dir(p), target)]; !ok {

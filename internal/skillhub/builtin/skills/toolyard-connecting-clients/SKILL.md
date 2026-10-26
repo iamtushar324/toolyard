@@ -50,8 +50,8 @@ Step-by-step setup for each client: [client setup](references/client-setup.md).
 ## Recipe: OAuth
 
 1. Give the person the URL and the steps for their client.
-2. The client opens toolyard in their browser. They sign in (password or the
-   toolyard's single sign-on).
+2. The client opens toolyard in their browser. They sign in with their
+   toolyard account (password, or Google sign-in where the toolyard offers it).
 3. They read the consent screen and select **Allow**:
    - **Who the app is**: "Identified by `<host>`" or "Self-registered app".
      The name and logo are the app's own claim and are not checked.

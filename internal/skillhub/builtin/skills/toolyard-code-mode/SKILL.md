@@ -75,8 +75,8 @@ Inbox grant (`_grant`) that you already hold.
 | Fan-out | `parallel([...], limit=4)` | `tools.parallel([...], {limit: 4})` |
 | Stubs | `.pyi` | `.d.ts` |
 
-Pick Starlark when a skill or a parser expects Bifrost's exact output, or for
-a short linear script. Pick JavaScript when you need `try`/`catch`, regular
+Pick Starlark when a skill or a parser expects the established code-mode
+output format, or for a short linear script. Pick JavaScript when you need `try`/`catch`, regular
 expressions, classes or heavy JSON reshaping. `language` also accepts
 `python` (Starlark) and `js`. Details: [Starlark](references/starlark.md),
 [JavaScript](references/javascript.md).
