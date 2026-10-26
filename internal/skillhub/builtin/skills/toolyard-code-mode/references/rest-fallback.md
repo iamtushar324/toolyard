@@ -42,7 +42,8 @@ curl -fsS "$TOOLYARD_URL/v1/code/ty" -o ty && chmod +x ty
 - A file ending in `.js` or `.mjs` runs as JavaScript unless `--language`
   says otherwise.
 - `--reason` (20 to 2000 characters) goes to the audit record, like
-  `_reason`. Without it `ty` writes one from the file name and first line.
+  `_reason`. Without it `ty` writes one from the file name and the first
+  line that is not a comment.
 - `ty` prints the run view as JSON on stdout. Exit codes:
 
 | Exit | HTTP | Run status | What to do |
@@ -51,7 +52,7 @@ curl -fsS "$TOOLYARD_URL/v1/code/ty" -o ty && chmod +x ty
 | 1 | 200 | `failed` | Read `error.kind` and `error.message`; fix the script. |
 | 3 | 403 | `permission_required` | A call needs your owner's approval. See below. |
 | 4 | 202 | `queued`, `running`, `deferred` | Still running, or a legacy approval waits: `./ty status cr_… --wait 120`. |
-| 5 | 429 | none | Busy, and nothing ran. Wait `Retry-After` seconds, then run again. |
+| 5 | 429 | none, or `failed` with kind `busy` | Busy, and nothing ran. Wait `Retry-After` seconds, then run again. |
 | 6 | 409 | `outcome_unknown` | A call may have committed. Check the target; never repeat it blindly. |
 | 2 | other | none | Usage or transport error (401: missing, expired or revoked token; 404: unknown run). |
 
@@ -147,7 +148,7 @@ answers within its wait.
 `run_id` (`cr_…`), `language`, `status`, `result`, `error`
 (`{"kind", "message"}`), `logs`, `calls` (the ledger: `seq`, `tool`,
 `status`, `replayed`, `ms`), `held`, `created_at`, `updated_at`, and `links`
-(`resume` only while the run is held).
+(`self`, and `resume` only while the run is held).
 
 | Run status | HTTP |
 |---|---|

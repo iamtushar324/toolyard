@@ -11,14 +11,14 @@ the server `callbacks`. Each tool acts only on your own receivers.
 |---|---|
 | `callback_ref` | the opaque reference (`cb_…`) you pass on items, calls and jobs |
 | `destination` | the HTTPS URL toolyard POSTs to (fixed) |
-| `transport` | `push` (toolyard POSTs) or `pull` (a host connection fetches events) |
+| `transport` | `push` (toolyard POSTs) or `pull` (a host or local connection fetches events over REST) |
 | `status` | `active`, `disabled` or `removed` |
 | `revision` | starts at 1 and rises with each change you make; pass it as `expected_revision` |
 | `client_receiver_id` | your stable key for this receiver |
 | `default` | whether it is your default receiver |
 | `events` | the event types it accepts, sorted |
 | `v3` | whether it accepts the schema version 3 decision shape |
-| `environment_id` | only for a host connection's own session webhook |
+| `environment_id` | only for a federated client environment's own session webhook |
 | `disabled_reason` | `idle` when the 30-day idle sweep disabled it; using it again wakes it |
 
 ## callbacks.register
@@ -28,7 +28,7 @@ the server `callbacks`. Each tool acts only on your own receivers.
 | `destination` | string, required | public `https` URL on port 443, no credentials or fragment |
 | `secret` | string | Standard Webhooks secret: `whsec_` and 24 to 64 random bytes in Base64. Omitted: toolyard generates 32 random bytes and returns the secret once |
 | `client_receiver_id` | string, at most 120 | your stable key, so a retry returns the same `callback_ref`. Default: derived from the destination |
-| `environment_id` | string | only for a host connection registering its own session-webhook URL |
+| `environment_id` | string | only for a federated client environment registering its own session-webhook URL |
 | `make_default` | boolean | also make it your default receiver |
 | `events` | array of strings, at most 24 | names, `"<prefix>.*"` or `"*"`. Default: `inbox.decision`, `inbox.expired`, `inbox.cancelled` |
 | `v3` | boolean | accept the version 3 decision shape (`answers`, more than 12 calls). Default false |
@@ -46,9 +46,11 @@ Repeats:
   events, `v3`, and the same secret if you give one) returns the same
   `callback_ref`. Given with the same `secret`, it also wakes a receiver
   the idle sweep disabled.
-- A retry without `secret` of a receiver whose secret toolyard generated
-  returns it with `secret_returned: false`: the secret is never shown
-  again. Rotate if you lost it.
+- A retry without `secret` (same `client_receiver_id` and settings) returns
+  the existing active receiver with `secret_returned: false`: the secret is
+  never shown again. Rotate if you lost it. Without `secret` it does not
+  wake an idle receiver (that is a `conflict`): give the same `secret`, or
+  use the receiver again in another way.
 - The same `client_receiver_id` with any other setting is a `conflict`.
 
 ## callbacks.list
@@ -78,7 +80,7 @@ Inbox item, approval or job ID; empty for a ping), `type`, `status`,
 - `disable` and `remove` fail the receiver's pending events. `remove` also
   clears it as your default. A receiver you disabled is never woken by use.
 - The same change repeated with the old `expected_revision` answers as the
-  first one did.
+  first one did (for `rotate`, only when you gave the `secret` yourself).
 
 Answer: the receiver after the change, plus `secret` and `secret_note` when
 toolyard generated a new secret.
@@ -112,7 +114,7 @@ one. Each agent may send 10 pings a minute.
 | `destination: give the https URL …` | no destination | pass `destination` |
 | `destination must be an HTTPS URL without credentials or fragment` / `must use HTTPS port 443` | bad URL | fix the URL |
 | `destination DNS resolution failed` | the host name did not resolve | fix DNS or the URL |
-| `private destinations require administrator registration` | the address is not public | ask an administrator, or use your host's session webhook |
+| `private destinations require administrator registration` | the address is not public | an administrator can register it only for an agent they own; otherwise use your host's session webhook |
 | `environment_id: … (environment_destination_mismatch)` | the URL is not that environment's session webhook | leave `environment_id` out |
 | `secret must use Standard Webhooks whsec_ encoding` / `must contain 24 to 64 random bytes` | bad secret | fix it, or omit it |
 | `events: … is not an event type` / `events: at most 24 entries` | bad `events` | use the known names, `"<prefix>.*"` or `"*"` |
@@ -123,8 +125,9 @@ one. Each agent may send 10 pings a minute.
 | `at most 10 pings a minute …` | ping quota | wait, then test again |
 
 On `inbox.request` / `inbox.ask`, problems and warnings on `callback_ref`
-say why a receiver cannot follow the item: it takes no `inbox.*` event, or
-takes the version 2 shape and the item has more than 12 calls. A named
+say why a receiver cannot follow the item: it is not one of your active
+receivers, it takes no `inbox.*` event, or it takes the version 2 shape and
+the item has more than 12 calls. A named
 receiver's problem stops the item; a default receiver's warning does not.
 
 ## REST (agent token as the bearer)
@@ -142,10 +145,10 @@ message; `GET` and `PATCH` answer `409 conflict` or
 `404 receiver_unavailable`. There is no REST route for `set_default` or
 `test`: use the tools.
 
-## Pull delivery (host connections only)
+## Pull delivery (host and local connections only)
 
-A host connection whose machine has no public address can register a pull
-receiver for its own environment: `POST /v1/callbacks/receivers` with
+A host or local connection whose machine has no public address can
+register a pull receiver for its own environment: `POST /v1/callbacks/receivers` with
 `transport: "pull"`, its `environment_id`, `client_receiver_id`, `secret`,
 and no `destination`. It then reads up to 10 pending signed events at a
 time with `GET /v1/callbacks/receivers/<ref>/events` (each with `event_id`,

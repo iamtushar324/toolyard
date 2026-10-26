@@ -27,7 +27,7 @@ not the extension's methods.
 | `skills/get` | `uri` of a `SKILL.md` | `skill`: one entry |
 | `resources/read` | `uri` of any `skill://` file | the whole file as text, with its `mimeType` |
 | `resources/templates/list` | none | the template `skill://{+path}` |
-| `resources/directory/read` | `uri` of a skill folder or a folder in it | its direct children; folders have `mimeType: "inode/directory"` |
+| `resources/directory/read` | `uri` of a folder: a source's, a skill's, or a folder in them | its direct children; folders have `mimeType: "inode/directory"` |
 
 `resources/read` always returns the whole file, whose bytes match its
 digest; the `skills.read` tool returns large files in parts instead.
@@ -39,8 +39,10 @@ digest; the `skills.read` tool returns large files in parts instead.
 - Each path segment is percent-encoded: a space is `%20`, `#` is `%23`,
   `%` is `%25`, non-ASCII text is its UTF-8 bytes.
 - A skill at a source's own folder is served as
-  `skill://<source>/<name>/SKILL.md`, so the last segment is always the
-  skill's name; `skill://<source>/SKILL.md` still resolves.
+  `skill://<source>/<name>/SKILL.md`, so the last segment is the skill's
+  name; `skill://<source>/SKILL.md` still resolves. When the source already
+  has a file or folder with that name, the skill keeps
+  `skill://<source>/SKILL.md`.
 - Listing a source's folder, or a folder above skills, leaves out the
   folders of skills marked `runs: host` unless you run on that host; a
   skill's own folder lists everything.

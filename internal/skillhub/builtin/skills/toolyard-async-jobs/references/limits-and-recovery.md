@@ -9,14 +9,14 @@ Defaults. An administrator can change the run time limit
 |---|---|
 | One job's run time | 1 hour; it replaces the per-call upstream timeout for that call |
 | Queued and running jobs | 32 per agent; 64 for all agents of one owner; 8 for all anonymous callers together |
-| Over that cap | A tool the administrator made async runs inline instead. `jobs.start`, `POST /v1/jobs` (429) and MCP tasks are refused with `job_budget_exceeded`; nothing ran. List them with `jobs.list` `{"status": "active"}` |
+| Over that cap | A tool the administrator made async runs inline instead. `jobs.start` and MCP tasks answer `job_budget_exceeded`, `POST /v1/jobs` answers 429; nothing ran. List them with `jobs.list` `{"status": "active"}` |
 | Jobs running at once per replica | 64, at most 16 of them one agent's; more wait `queued` |
 | One wait (`jobs.wait`, `Prefer: wait`) | 60 seconds |
 | Waits in progress per agent, per replica | 8 (`jobs.wait`, `tasks/result`, `Prefer: wait`); past it `jobs.wait` and `tasks/result` answer an error, and `Prefer: wait` answers the current state at once |
 | `jobs.wait` job ids | 32 per call |
 | Result carried by `jobs.status` and `jobs.wait` | 256 KiB; a larger one says `result_omitted`: read it with `jobs.result` |
-| Largest result kept | 32 MiB; above it the job records the size and an error, not the bytes |
-| Result bytes kept | 256 MiB per agent, 1 GiB per owner over the retention; a result past either is not kept (the job still ends with its status and says why in `error`) |
+| Largest result kept | 32 MiB; above it the result is not kept (`result_bytes` 0), and `error` says why with its size, unless the job already has an error |
+| Result bytes kept | 256 MiB per agent, 1 GiB per owner over the retention; a result past either is not kept (the job still ends with its status; `error` says why unless it already holds another error) |
 | `callback_ref` | at most 512 characters |
 | Retention | 7 days after the job ends; a task recorded for a call answered at once, 1 hour |
 

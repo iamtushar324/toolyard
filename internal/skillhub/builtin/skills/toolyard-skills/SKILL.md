@@ -13,7 +13,7 @@ repository (a *source*); toolyard copies its skills at an exact commit and
 serves only that copy, so you never call GitHub yourself. toolyard also
 ships built-in skills about itself, like this one, in the read-only source
 `toolyard` (an admin may hide it). Their `repo` is
-`toolyard/builtin@<digest>`: they change with the toolyard version, and
+`toolyard/builtin@<12-hex digest>`: they change with the toolyard version, and
 `skills.propose_change` refuses them (tell your owner what should change).
 Start with `skills.get {"skill": "toolyard/toolyard-basics"}` if toolyard
 is new to you.
@@ -124,9 +124,9 @@ existing folder).
   `skills/get`, `resources/read`, `resources/directory/read`. See
   [MCP extension](references/mcp-extension.md).
 
-The skills tools are on for every active caller. An owner can switch them
-off for one agent (its deny list) or for everyone (an explicit deny
-policy); on a server without the skills hub the tools are absent or answer
+The skills tools are on for every active caller. An agent's owner can
+switch them off for that agent (its deny list), and an admin for everyone
+(an explicit deny policy); on a server without the skills hub the tools are absent or answer
 `unavailable`.
 
 ## Errors

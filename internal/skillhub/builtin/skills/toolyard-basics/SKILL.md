@@ -16,7 +16,8 @@ and you never need them.
 Every call takes the same path:
 
 1. **Access**: may your owner use this server, and does this agent's own limit
-   allow the tool? If not, the tool looks like it does not exist.
+   allow the tool? If your owner may not, the tool looks like it does not
+   exist; if only this agent's limit refuses it, the call says so.
 2. **Policy**: the tool is `allow` (runs), `ask` (needs your owner's
    permission) or `deny` (never runs).
 3. **Permission**: an `ask` call runs only with a grant from the Inbox.
@@ -117,12 +118,14 @@ explicit rule allows it. Declaring `read` never lets a call skip approval.
   `upstream`, `description`, `code`, `score`, schemas). When toolyard serves
   skills it also names up to 3 matching skills under `skills`: read one with
   `skills.get`.
-- `tools.execute`: call any tool by its catalog name, including one your
-  catalog does not show. The target's access, policy and approval rules apply
-  unchanged. The outer `_reason` is used when `arguments` has none.
+- `tools.execute`: call any tool you may use by its catalog name, including
+  one a surface mode hides from your catalog. The target's access, policy and
+  approval rules apply unchanged. The outer `_reason` is used when
+  `arguments` has none.
 - `servers.list`: each server you may use, with `status` (`ok`, `error`,
   `waiting_signin`, `disabled`, `idle`, `unknown`), `tool_count`,
-  `auth_mode` (`shared` or `per_user`) and sign-in state. Never URLs or secrets.
+  `auth_mode` (`shared` or `per_user`) and sign-in state. No secrets; an
+  `error` keeps only a URL's scheme and host.
 - Code mode (`listToolFiles`, `readToolFile`, `getToolDocs`,
   `executeToolCode`) runs a script that calls many tools in one turn. See the
   `toolyard-code-mode` skill.
@@ -133,9 +136,11 @@ tools.execute
  "_reason": "List the open pull requests to pick the next one to review"}
 ```
 
-A tool outside your access answers exactly like a tool that does not exist:
-`tool "x" not found in catalog`. Do not probe names. Ask your owner to get the
-server granted, or check `agent_limits`.
+A tool on a server your owner may not use answers exactly like a tool that
+does not exist: `tool "x" not found in catalog`. Do not probe names. Ask your
+owner to get the server granted. A tool that only this agent's own limit
+refuses answers `tool "x" is not allowed for this agent: …`; check
+`agent_limits`.
 
 ## How policy decides
 
@@ -150,7 +155,9 @@ For a call with no grant, toolyard takes the first rule that applies:
    `ls`) runs.
 6. Everything else needs approval.
 
-toolyard's own built-in tools have a fixed decision. The results:
+Most of toolyard's own tools always run (`policies.explain` names the rule);
+`memory.set` and `memory.delete` follow the rules above like any write. The
+results:
 
 - `allow`: the call runs.
 - `ask`: the call returns `permission_required` with a draft request. Nothing

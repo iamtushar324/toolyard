@@ -119,8 +119,9 @@ again in a few seconds and do not start the work again.
 - A queued or running job stops when its agent or owner loses access
   (disabled, blocked, server access withdrawn). A job stopped before its call
   was sent says nothing ran.
-- GitHub writes never become jobs that wait: they return a deferred
-  `approval_id` (see the `toolyard-github-writes` skill).
+- GitHub writes never become jobs: they always need the owner's approval, so
+  they answer at once with a deferred `approval_id` (see the
+  `toolyard-github-writes` skill).
 
 ## Callbacks
 
@@ -168,9 +169,9 @@ See the `toolyard-code-mode` skill.
 - One job runs at most 1 hour by default (the administrator's
   `-async-job-timeout`).
 - At most 32 queued and running jobs per agent, 64 for all agents of one
-  owner. Over the cap, `jobs.start` (and `POST /v1/jobs`, 429) is refused with
-  `job_budget_exceeded` and nothing runs; a tool the administrator made async
-  runs inline instead.
+  owner. Over the cap, `jobs.start` is refused with `job_budget_exceeded`
+  (`POST /v1/jobs` with 429) and nothing runs; a tool the administrator made
+  async runs inline instead.
 - At most 8 waits in progress per agent on one replica. Past that,
   `jobs.wait` answers an error: use `jobs.status`.
 

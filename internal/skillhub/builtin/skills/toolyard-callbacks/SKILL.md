@@ -39,7 +39,8 @@ Without a reachable HTTPS endpoint, skip this: poll with `inbox.wait`
 - The destination is a public `https` URL on port 443, with no credentials
   or fragment. toolyard checks DNS at registration and at every delivery,
   pins the address, and never follows redirects. A private address needs an
-  administrator to register the receiver for you.
+  administrator's registration, and an administrator can register one only
+  for an agent they own.
 - If your host offers a session webhook (a receiver the host provides that
   wakes your session), prefer it: create it with the host's own tool and
   pass the `callback_ref` it gives you. Keep its signing secret out of
@@ -95,8 +96,8 @@ Every argument, answer and error: [tools reference](references/tools.md).
 | Async job | `callback_ref` on `jobs.start` (or its `_callback_ref`), `_callback_ref` on a call that runs as a job, `callback_ref` in `POST /v1/jobs` | your default receiver | `job.completed`, `job.failed`, `job.*` or `*` |
 
 - A named receiver that cannot carry an Inbox item (not active, no `inbox.*`
-  event, or no `v3` for more than 12 calls) is a problem on `callback_ref`:
-  the item is not sent. A default that cannot carry it is skipped, with a
+  event, or no `v3` for more than 12 calls) is a problem on `callback_ref`
+  (or `callback_refs[i]`): the item is not sent. A default that cannot carry it is skipped, with a
   warning on `callback_ref`: name another receiver or poll.
 - A refused `_callback_ref` on a legacy approval does not stop the call: its
   deferred answer carries `callback_warning`, and you poll `tools.poll_approval`.
@@ -121,7 +122,8 @@ Every argument, answer and error: [tools reference](references/tools.md).
 - Idle rule: an active push receiver with no successful delivery and nothing
   new to follow for 30 days is disabled with `disabled_reason: "idle"` and
   stops counting toward the cap. Using it again wakes it: name it on an item
-  or call, make it the default, test it, register it again the same way, or
+  or call, make it the default, test it, register it again the same way
+  (with the same `secret`), or
   let a new item follow it as the default. A receiver you disabled yourself
   stays disabled.
 

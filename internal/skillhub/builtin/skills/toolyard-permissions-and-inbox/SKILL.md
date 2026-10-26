@@ -194,7 +194,8 @@ An older call may answer `status: "pending_approval"` with an `approval_id`
 it is allowed. Collect it with `tools.poll_approval` or
 `tools.wait_for_approval` (several: `tools.poll_approvals`,
 `tools.wait_for_approvals`); find lost IDs with
-`tools.list_my_pending_approvals`; withdraw with `tools.cancel_my_approval`.
+`tools.list_my_pending_approvals`; withdraw with `tools.cancel_my_approval`
+(not an owner-only GitHub request: only the account owner can decide it).
 Never reissue the original write: the saved result is in the poll answer. See
 [grants and execution](references/grants-and-execution.md) (section "Legacy approvals").
 

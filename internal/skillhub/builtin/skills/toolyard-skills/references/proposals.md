@@ -108,7 +108,7 @@ status means for you.
 | `pending` | the person has not decided | continue other work; poll again later |
 | `approved` | toolyard is applying it (for a change: opening the pull request, or checking what GitHub did after a lost answer) | poll again in a few minutes |
 | `done` | `result` holds the new source's ID, or the pull request URL | for a source, `skills.sources` lists it once its first sync ends |
-| `rejected` | the person said no; `error` holds why | do not propose it again unless they ask |
+| `rejected` | the person said no, or the question expired or was withdrawn; `error` holds why | do not propose it again unless they ask |
 | `failed` | it could not be applied; `error` holds why | tell your owner; do not retry on your own |
 
 An Inbox question that expires (after 7 days) or is withdrawn stops the

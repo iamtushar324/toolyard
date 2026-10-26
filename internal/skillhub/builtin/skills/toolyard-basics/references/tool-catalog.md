@@ -5,9 +5,17 @@ turned the feature on (noted below). Upstream servers add their own tools as
 `<server>.<tool>`. Every call needs `_reason`. Read a tool's full schema with
 `tools.search` (`detail: "full"`) or, in code mode, `getToolDocs`.
 
-Which built-in groups you have: `access.whoami` lists them under `always_on`.
-`memory` and `events` are shared data groups that an admin grants like a
-server, so a member's agent sees them only after that grant.
+Which built-in groups you have: `access.whoami` lists them under `always_on`
+(`tools`, `inbox`, `session`, `policies`, `servers`, `audit`, `access`,
+`connections`, `jobs`, `callbacks`, `skills`). Every active caller has these
+without a grant. `memory`, `events` and `notes` are shared data groups that an
+admin grants like a server, so a member's agent sees them only after that
+grant.
+
+Pinned tools stay in your catalog in every surface mode (`top_n`,
+`router_only`): the discovery, code-mode, approval, Inbox, session, access,
+connections, jobs, callbacks and skills read tools, plus `memory.*` and
+`events.*` when you have those groups.
 
 ## Discovery and proxy (`tools`)
 
@@ -39,7 +47,7 @@ writes, and approvals that were already pending before the Inbox).
 | `tools.wait_for_approval` | Block up to 300 seconds for one approval to finish. |
 | `tools.wait_for_approvals` | Block on up to 32 approvals, mode `all` or `any`. |
 | `tools.list_my_pending_approvals` | Your approvals still waiting. |
-| `tools.cancel_my_approval` | Withdraw one of your pending approvals. |
+| `tools.cancel_my_approval` | Withdraw one of your pending approvals (not a GitHub request: only its account owner can decide it). |
 | `tools.approval_stats` | How long reviewers recently took to decide, so you can pace your polling. |
 
 Details: the `toolyard-permissions-and-inbox` and `toolyard-github-writes`

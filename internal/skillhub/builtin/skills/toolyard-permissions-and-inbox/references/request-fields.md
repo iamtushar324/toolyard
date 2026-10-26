@@ -24,7 +24,7 @@ record. `inbox.guide({"topic": "requests"})`, `"tools"`, `"attachments"` and
 | `client_request_id` | no | Your stable retry key: at most 128 bytes of printable ASCII, no backslash. The same key with the same content returns the stored request; the same key with changed content is a conflict. |
 | `callback_ref` | no | An opaque receiver reference (at most 512 bytes) for the decision callback. |
 | `callback_refs` | no | Up to 5 more receivers. With neither, your default receiver follows the item. |
-| `pending_ttl_seconds` | no | Deadline for the owner's decision: 60 to 604800 seconds, default 86400 (24 hours). An administrator limit can be lower. |
+| `pending_ttl_seconds` | no | Deadline for the owner's decision: 60 to 604800 seconds, default 86400 (24 hours). An administrator limit can be lower: a deadline above it, the default included, is refused with `exceeds the administrator deadline limit`. |
 | `ttl_seconds` | no | How long grants last after acceptance: 60 to 86400 seconds, default 1800. Ask for the shortest that works. |
 | `session_id` | no | From `session.start`; ties related requests to one piece of work. |
 | `dry_run` | no | `true` checks the request and shows its flags without sending it. |

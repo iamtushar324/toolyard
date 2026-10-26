@@ -120,7 +120,8 @@ be fixed, and `APPROVE` only after you reviewed the current head.
   `result`. If `result.is_error` is true, read the error; do not retry
   blindly.
 - **"request fresh approval".** The pull request head, the GitHub account or
-  the connection changed before the write was sent. Nothing was posted. Read
+  the connection token (a reconnect or a token refresh) changed before the
+  write was sent. Nothing was posted. Read
   the pull request again, check that your text still applies to the new head,
   then make one new proposal.
 - **Denied.** Do not send the same call again. Tell your user what the owner
@@ -128,8 +129,9 @@ be fixed, and `APPROVE` only after you reviewed the current head.
 - **Expired.** Nobody decided before `expires_at` (by default 3 hours after
   the call; the operator can change this). Nothing was posted. If it is still
   relevant, call the write tool again to create a fresh request.
-- **Cancelled.** You or an operator withdrew it (`tools.cancel_my_approval`).
-  Nothing was posted.
+- **No longer needed.** You cannot withdraw a GitHub request:
+  `tools.cancel_my_approval` answers `only the account owner can decide this
+  GitHub request`. Ask the owner to deny it, or let it expire.
 - **outcome_unknown.** The write may have reached GitHub. Read the pull
   request's comments or reviews before anything else. Never repeat it.
 
@@ -138,16 +140,18 @@ Statuses, answer fields and every error message:
 
 ## Pitfalls
 
-- Re-calling an identical write while its request is pending joins the same
-  request; it never speeds up the decision. Do not do it.
+- Re-calling an identical write (same arguments, same head commit) while its
+  request is pending joins the same request; it never speeds up the decision.
+  Do not do it.
 - `tools.list_my_pending_approvals` finds lost approval IDs; do not re-issue a
   write to find out where it stands.
 - A connection error ("connect your GitHub account in My connections") means
   your owner must connect GitHub in toolyard. Tell them; never ask for a token.
-- A review is pinned to the commit seen when you proposed it. A new push
-  before the owner allows it stops the write.
+- Every write is pinned to the head commit seen when you proposed it. A new
+  push before the owner allows it stops the write.
 - To be told about the decision instead of polling, add `_callback_ref` to the
-  write call. See the `toolyard-callbacks` skill
+  write call (the tool schema does not list it; toolyard reads and strips it).
+  See the `toolyard-callbacks` skill
   (`skills.get toolyard/toolyard-callbacks`).
 - Inbox permission flows, legacy approvals in general and `outcome_unknown`
   handling for other tools: see the `toolyard-permissions-and-inbox` skill

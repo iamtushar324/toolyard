@@ -73,7 +73,7 @@ Call the accepted tool with `_grant` added to its arguments:
 - A grant only matters for a call that needs permission. An explicit deny
   still wins, and an open tool does not use a grant up.
 - Grants need an enrolled agent token; an anonymous connection cannot use one.
-- If the tool is asynchronous, the granted call answers with a `job_id`
+- If the tool is asynchronous, the granted call can answer with a `job_id`
   instead of the result. Read it with `jobs.wait`, `jobs.status` or
   `jobs.result` and never call the tool again for the same work. See the
   `toolyard-async-jobs` skill (`skills.get toolyard/toolyard-async-jobs`).
@@ -144,7 +144,7 @@ arguments it saved. The owner cannot change those arguments.
 | `tools.wait_for_approval` | `approval_id`, `timeout_seconds` (1-300, default 60). Blocks until executed, denied, expired or cancelled. |
 | `tools.wait_for_approvals` | `approval_ids` (up to 32), `mode` `all` (default) or `any`, `timeout_seconds` (1-300, default 60). |
 | `tools.list_my_pending_approvals` | Your still-pending approvals, after a restart or lost IDs. |
-| `tools.cancel_my_approval` | `approval_id`. Withdraw one of your own pending approvals. |
+| `tools.cancel_my_approval` | `approval_id`. Withdraw one of your own pending approvals. It refuses an owner-only GitHub request (`only the account owner can decide this GitHub request`). |
 | `tools.approval_stats` | Recent decision times (optional `tool_name`, `upstream`) and your pending count. |
 
 ```text
@@ -160,7 +160,7 @@ tools.wait_for_approval
 | `executed` | Done. `result.content` and `result.structured_content` (with `is_error`) are what the tool returned; `execution_error` is set when it failed. |
 | `denied` | Do not fire the same call again. Tell the user what was declined and ask for an alternative. |
 | `expired` | Nobody decided in time. The call never ran. If still needed, ask again (for a restricted tool on an Inbox gateway that means a new `inbox.request`). |
-| `cancelled` | Withdrawn by you or an operator. The call never ran. |
+| `cancelled` | Withdrawn by you (`tools.cancel_my_approval`), or by toolyard when your app was revoked. The call never ran. |
 | `outcome_unknown` | The upstream outcome is uncertain. Inspect upstream state. Do not repeat the write with this approval. |
 
 Every snapshot carries a `how_to_proceed`, `how_to_get_result` or

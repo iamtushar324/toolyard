@@ -25,11 +25,13 @@ Useful fields:
 | `tools.wait_for_approval` | `approval_id`, `timeout_seconds` (1-300, default 60) |
 | `tools.wait_for_approvals` | `approval_ids` (up to 32), `mode` `all` (default) or `any`, `timeout_seconds` (1-300, default 60) |
 | `tools.list_my_pending_approvals` | none: your pending approvals |
-| `tools.cancel_my_approval` | `approval_id`: withdraw your own pending request |
+| `tools.cancel_my_approval` | `approval_id`: refuses a GitHub request (`only the account owner can decide this GitHub request`) |
 
-Every answer is a snapshot with `approval_id`, `status`, `raw_status`,
+An answer is a snapshot with `approval_id`, `status`, `raw_status`,
 `tool`, `queued_at`, `expires_at`, and, once decided, `decided_at` and
-`decision_latency_seconds`. Follow its `how_to_proceed`, `how_to_get_result`
+`decision_latency_seconds` (an `outcome_unknown` answer carries only
+`approval_id`, `status`, `raw_status`, `execution_state` and
+`how_to_proceed`). Follow its `how_to_proceed`, `how_to_get_result`
 or `how_to_use_result` hint. Only the agent that raised an owner-only GitHub
 request, under the same owner, can read it; any other caller gets
 `unknown approval_id`.
@@ -43,7 +45,7 @@ request, under the same owner, can read it; any other caller gets
 | `executed` | Toolyard sent the write and saved the answer. | Read `result.content` and `result.structured_content`; check `result.is_error` and `execution_error`. |
 | `denied` | The owner refused it. | Do not send the same call again. Tell your user and ask for another way forward. |
 | `expired` | No decision before `expires_at`. Nothing was posted. | If still relevant, call the write tool again for a fresh request. |
-| `cancelled` | Withdrawn by you or an operator. Nothing was posted. | Call again only if it is needed again. |
+| `cancelled` | Withdrawn. Nothing was posted. | Call again only if it is needed again. |
 | `outcome_unknown` | The write may have reached GitHub. | Read the pull request's comments or reviews first. Never repeat it with this approval. |
 
 `unknown` in a batch answer means the ID does not exist or is not yours.
@@ -76,7 +78,7 @@ come back in the executed result; nothing was posted.
 |---|---|
 | `the pull request changed; request fresh approval` | A new commit was pushed, or the pull request closed, after you proposed. |
 | `the GitHub account changed; request fresh approval` | The owner's connection now points at a different GitHub account. |
-| `the GitHub connection changed; request fresh approval` | The owner reconnected or the connection changed. |
+| `the GitHub connection changed; request fresh approval` | The token behind the owner's GitHub connection is not the one seen when you proposed: a reconnect, or a routine token refresh. |
 | `the GitHub write could not be serialized: …` | Toolyard could not lock the write safely. |
 
 After one of these, read the pull request again. Make one new proposal only

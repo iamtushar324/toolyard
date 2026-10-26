@@ -29,7 +29,7 @@ and with the client's own error when it does not.
 | Expected tools are missing | The consent screen limited the app (`agent_limits` in `access.whoami`), or the owner has no grant for that server, or the surface mode hides it. | Change access on **Connected apps**; ask an admin to grant the server; find hidden tools with `tools.search` and call them with `tools.execute`. |
 | A call says `not allowed for this agent: its owner limited what it may use` | The app's own limits. | The owner changes the app's access on **Connected apps**. |
 | A call answers with a connect link | The connection works; that server needs its own sign-in. | Show the link as a clickable Markdown link and retry after the person is done. |
-| `policies.set` or `servers.reconnect` is refused for an admin's app | May manage toolyard is off (the default), or the agent has its own limits. | Leave it off unless the app must manage toolyard. Only the app's owner, while an admin, can turn it on. |
+| `policies.set` or `servers.reconnect` is refused for an admin's app | May manage toolyard is off (the default). | Leave it off unless the app must manage toolyard. Only the app's owner, while an admin, can turn it on. |
 
 ## It worked, then stopped
 
@@ -47,4 +47,4 @@ and with the client's own error when it does not.
 | `ty` refuses an `http://` URL | Tokens would travel in clear text. | Use `https://`. `TOOLYARD_URL_INSECURE=1` exists only for a network you trust. |
 | `403` on `/v1/code/*` | An operator token (`tyop_…`) never works there. | Use an agent token or a session token. |
 | An OAuth access token fails on a REST route | OAuth access tokens are valid only on `/mcp`. | Use an agent token or a session token for REST. |
-| A session token fails on `/mcp` | Session tokens (`tys_…`) work on the code routes and `GET /v1/agents/whoami` only. | Use OAuth or an agent token for MCP. |
+| A session token fails on `/mcp` | Session tokens (`tys_…`) work only on the code, jobs and skills REST routes, `/v1/agents/approvals/…` and `GET /v1/agents/whoami`. | Use OAuth or an agent token for MCP. |

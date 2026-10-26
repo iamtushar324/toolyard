@@ -136,7 +136,8 @@ token-based agents the same way. Admins can select **Show everyone's apps**.
   `toolyard-code-mode` skill.
 - A session token (`tys_…`) is minted with an agent token at
   `POST /v1/agents/session-tokens` for one work session (60-3600 seconds). It
-  works on the code routes and `GET /v1/agents/whoami`, not on `/mcp`.
+  works on the code, jobs and skills REST routes, `/v1/agents/approvals/…`
+  and `GET /v1/agents/whoami`, not on `/mcp`.
 - Operator tokens (`tyop_…`) never work on the code routes. OAuth access tokens
   work only on `/mcp`.
 - `GET /v1/agents/whoami` with `Authorization: Bearer` returns the token's

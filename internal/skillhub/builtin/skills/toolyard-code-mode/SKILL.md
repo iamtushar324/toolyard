@@ -194,7 +194,8 @@ as busy. Full table: [limits](references/limits.md).
   `getToolDocs` header says to wrap loops in a function.
 - A Starlark script that hits a failed call stops there; nothing after it
   runs. Use `try_call` where a failure is expected.
-- `busy`: every script slot stayed taken. Wait a moment, then run again.
+- `busy`: no script slot came free in time (every slot taken, or your own
+  per-agent cap reached). Wait a moment, then run again.
 
 ## Related skills
 

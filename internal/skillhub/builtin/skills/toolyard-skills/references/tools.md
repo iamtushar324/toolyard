@@ -53,14 +53,14 @@ true` and `next_offset`. Call again with `offset: next_offset` until
 |---|---|---|
 | `pattern` | string, required | RE2, matched against each line |
 | `source` | string | only this source |
-| `path` | string | glob on the file path inside the skill, e.g. `**/*.md`, `scripts/*` |
+| `path` | string | a glob: without `/` it matches the file name (`*.md`); with `/` it matches the path from the source's folder (`**/scripts/*`) |
 | `ignore_case` | boolean | case-insensitive match |
 | `limit` | integer 1 to 200 | default 50 |
 | `include_host` | boolean | also search skills marked `runs: host` |
 
 Answer: `pattern`, `total`, `hits`: each `uri`, `skill`, `line` (1-based),
-`text`, `repo`, `commit`, `source`. Grep stops at 200 lines, 5,000 files,
-20 MB scanned or 2 seconds, and returns what it found by then.
+`text`, `repo`, `commit`, `source`. Grep stops at `limit` hits, 5,000
+files, 20 MiB scanned or 2 seconds, and returns what it found by then.
 
 ### skills.sources
 

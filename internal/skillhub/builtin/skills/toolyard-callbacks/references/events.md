@@ -18,7 +18,7 @@ Headers:
 | `Content-Type` | `application/json` |
 | `webhook-id` | the event ID (the same as `event_id`) |
 | `webhook-timestamp` | Unix time in seconds when this attempt was signed |
-| `webhook-signature` | `v1,` and the Base64 HMAC-SHA256 signature; the header may hold several space-separated signatures |
+| `webhook-signature` | `v1,` and the Base64 HMAC-SHA256 signature. toolyard sends one; Standard Webhooks allows several, space-separated, so accept any that matches |
 
 Each receiver gets its own `event_id` for the same happening, so two
 receivers that follow one item see two different IDs.
@@ -130,8 +130,10 @@ target before any new call). The result is not included: read it with
   current state from `status_ref`.
 - One attempt has 20 seconds. Any 2xx means delivered.
 - `410 Gone` and any 3xx (redirects are never followed) fail the event at
-  once. Other status codes and network errors retry after 5 s, 1 min,
-  5 min, 30 min, 2 h, 6 h, 12 h and 24 h; after that the event is `failed`.
+  once, and so does a destination that no longer resolves to a public
+  address (`destination_invalid`). Other status codes and network errors
+  retry after 5 s, 1 min, 5 min, 30 min, 2 h, 6 h, 12 h and 24 h (9 attempts
+  in all); after that the event is `failed`.
 - `callbacks.list {"callback_ref": "cb_…"}` shows each delivery's `status`
   (`pending`, `delivering`, `delivered`, `failed`), `attempts`,
   `terminal_reason`, and per attempt `at`, `http_status` and `outcome`.

@@ -7,7 +7,7 @@ scripts that parse that output keep working.
 ## Shape of a script
 
 ```python
-# Count open bugs per label (this first comment becomes the nested calls' reason)
+# Count open bugs per label (without an outer _reason, this first comment becomes the nested calls' reason)
 issues = github.list_issues(owner="acme", repo="api", state="open")
 counts = {}
 for i in issues:
@@ -19,7 +19,8 @@ result = counts
 
 - Servers are global objects: `result = server.tool(param="value")`.
   A single dict also works: `server.tool({"param": "value"})`.
-- Calls are synchronous. Keyword arguments only.
+- Calls are synchronous. Keyword arguments, or that one dict; no other
+  positional arguments.
 - Assign the value you want back to `result`. `print()` writes log lines.
 - Each run starts in a fresh, isolated scope: nothing carries over between
   runs.

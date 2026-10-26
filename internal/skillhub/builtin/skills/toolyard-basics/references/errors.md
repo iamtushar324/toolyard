@@ -30,7 +30,7 @@ Quoted texts below are what toolyard answers; `<…>` marks a part that varies.
 | `grants only work with an enrolled agent token; this connection is anonymous` | The connection has no agent. | Connect with an agent token or OAuth (the `toolyard-connecting-clients` skill). |
 | `call parameters no longer match the tool schema; permission was not consumed: …` | The tool's schema changed since the grant. | Check the schema with `tools.search`, then ask again if needed. |
 | `status: "pending_approval"` with an `approval_id` | A held call: a GitHub write, or a legacy approval. | Collect it with `tools.poll_approval` or `tools.wait_for_approval` (at most 300 seconds). Never send the write again. See `toolyard-github-writes`. |
-| `Per-agent pending-approval budget exceeded: you have <n> pendings (max <m>). …` (`status: "agent_pending_budget_exceeded"`) | Too many of your approvals are waiting (16 by default). | `tools.list_my_pending_approvals`, then poll or `tools.cancel_my_approval` the ones you no longer need. |
+| `Per-agent pending-approval budget exceeded: you have <n> pendings (max <m>). …` (`status: "agent_pending_budget_exceeded"`) | Too many of your approvals are waiting (16 by default). | `tools.list_my_pending_approvals`, then poll, or `tools.cancel_my_approval` the ones you no longer need (a GitHub request cannot be cancelled this way). |
 | `unknown approval "<id>"` | The id is wrong, not yours, or for another tool. | Use the exact id from the earlier answer, on the same tool. |
 | `dry-run limit reached (20 per hour)` | Too many `inbox.request` dry runs. | Fix the problems it listed before, then send the request. |
 

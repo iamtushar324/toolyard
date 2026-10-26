@@ -35,9 +35,9 @@ enforces.
 | Wait for a free slot | 30 seconds, in one fair queue |
 | Queue length | twice the per-agent cap for one agent; four times the global cap (16 at least) in all |
 
-A program past a cap waits for a slot. After the wait it is refused as busy
-(`code mode is busy: every script slot is in use; try again in a moment`).
-Over REST that run ends `failed` with kind `busy`, HTTP 429 with
+A program past a cap waits for a slot. After the wait it is refused as busy:
+the message starts `code mode is busy:` and says which cap was full (all
+scripts running, or your own per-agent cap). Over REST that run ends `failed` with kind `busy`, HTTP 429 with
 `Retry-After`, and its `Idempotency-Key` is free again. A program past the
 queue length is refused at once. A freed slot goes to the earliest waiter
 whose agent is under its own cap, so one agent's backlog never holds another
@@ -48,8 +48,8 @@ agent up.
 A run that toolyard stops because the server shuts down, or because the
 client went away, is kind `interrupted`: `failed` (nothing ran) when no tool
 call had been sent, `outcome_unknown` once one had. A REST run still
-`running` or `queued` when the process dies is settled the same way after the
-restart.
+`queued` when the process dies is `failed` after the restart, and one still
+`running` is `outcome_unknown`, both with kind `interrupted`.
 
 ## tools.search
 

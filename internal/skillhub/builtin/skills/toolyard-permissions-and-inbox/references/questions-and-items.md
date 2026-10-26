@@ -48,7 +48,7 @@ Every question has:
 | `single_choice` | `options` (2-12), `allow_other` | one option ID |
 | `multiple_choice` | `options` (2-12), `min_selections`, `max_selections`, `allow_other` | a list of option IDs |
 | `yes_no` | none | `true` or `false` |
-| `number` | `min`, `max`, `step` (positive), `unit` (at most 24 characters) | a number in range, a whole number of steps from `min` |
+| `number` | `min`, `max`, `step` (positive), `unit` (at most 24 characters) | a number in range, a whole number of steps from `min` (or 0) |
 | `date` | none | `"YYYY-MM-DD"` |
 | `datetime` | none | RFC 3339, e.g. `"2026-10-25T14:30:00+05:30"` |
 | `scale` | `scale` (2-10 points, default 5), `min_label`, `max_label` (at most 80 characters each) | a whole number from 1 to `scale` |

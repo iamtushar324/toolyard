@@ -45,9 +45,9 @@ curl -sS "$TOOLYARD_URL/v1/jobs/job_…/result" -H @<(auth)
 ## MCP Tasks
 
 Clients that speak MCP Tasks (protocol 2025-11-25) add `"task": {}` to
-`tools/call`. `tools/list` marks every tool `execution.taskSupport:
-"optional"`, because any tool can run as a job; the mark does not mean the
-tool is slow.
+`tools/call`. `tools/list` marks every tool except the `jobs.*` tools
+`execution.taskSupport: "optional"`, because any tool can run as a job; the
+mark does not mean the tool is slow.
 
 - toolyard answers `CreateTaskResult`; the task id is the job id.
 - `tasks/get`: the task's status. `tasks/result`: waits until the task ends,
