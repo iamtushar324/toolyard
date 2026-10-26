@@ -132,7 +132,7 @@ func (ri *ReviewInbox) decideApproval(ctx context.Context, r *inbox.Request) (st
 	if ok, err := ri.store.move(ctx, row.ID, []string{proposalPending}, proposalRejected, proposalUpdate{DecidedBy: decider}); err != nil || !ok {
 		return "This approval was already settled.", err
 	}
-	src, err := sa.DecideApproval(ctx, decider, row.SourceID, false, note)
+	src, err := sa.DecideApproval(ctx, decider, row.SourceID, false, note, "")
 	if err != nil {
 		_, _ = ri.store.move(ctx, row.ID, []string{proposalRejected}, proposalFailed, proposalUpdate{Error: reviewClip(err.Error(), 500)})
 		return "", fmt.Errorf("reject the source: %w", err)
@@ -143,9 +143,12 @@ func (ri *ReviewInbox) decideApproval(ctx context.Context, r *inbox.Request) (st
 
 // applyApproval makes an approved row's source live and records the
 // outcome; the row is approved (the caller won that move or a resume's
-// claim).
+// claim). Only a waiting version at the commit the question showed goes
+// live with it.
 func (ri *ReviewInbox) applyApproval(ctx context.Context, sa SharingAdmin, row *proposalRow, decider, via string) (string, error) {
-	src, err := sa.DecideApproval(ctx, decider, row.SourceID, true, "")
+	var in approvalInput
+	_ = json.Unmarshal([]byte(row.Input), &in)
+	src, err := sa.DecideApproval(ctx, decider, row.SourceID, true, "", in.SHA)
 	if err != nil {
 		to := proposalFailed
 		if errors.Is(err, ErrNotFound) || errors.Is(err, ErrConflict) {

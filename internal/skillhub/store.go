@@ -32,7 +32,7 @@ const sourceColumns = `s.id, s.slug, s.kind, s.owner, s.repo, s.branch, s.path, 
 	s.auth, s.token_sealed, s.poll_seconds, s.enabled, s.visibility, s.members_json, s.default_runs,
 	s.limits_json, s.webhook_secret_sealed, s.created_by, s.created_at, s.updated_at,
 	s.active_version_id, s.pending_version_id, s.head_sha, s.head_etag, s.last_checked_at,
-	s.next_check_at, s.last_error, s.failures, s.blocked_json, s.approval, s.approval_note, s.approval_by,
+	s.next_check_at, s.last_error, s.failures, s.blocked_json, s.hidden, s.approval, s.approval_note, s.approval_by,
 	COALESCE(v.sha, ''), COALESCE(v.skill_count, 0), COALESCE(v.warning_count, 0)`
 
 const sourceFrom = ` FROM skill_sources s LEFT JOIN skill_versions v ON v.id = s.active_version_id`
@@ -47,6 +47,7 @@ func scanSource(sc rowScanner) (*sourceRow, error) {
 		exclude, members, limits, blocked  string
 		mode, auth, vis, runs, approval    string
 		poll, enabled, created, updated    int64
+		hidden                             int64
 		lastChecked, nextCheck             sql.NullInt64
 		failures, skillCount, warningCount int64
 	)
@@ -54,13 +55,13 @@ func scanSource(sc rowScanner) (*sourceRow, error) {
 		&auth, &r.tokenSealed, &poll, &enabled, &vis, &members, &runs,
 		&limits, &r.webhookSealed, &r.CreatedBy, &created, &updated,
 		&r.ActiveVersionID, &r.PendingVersionID, &r.headSHA, &r.headETag, &lastChecked,
-		&nextCheck, &r.LastError, &failures, &blocked, &approval, &r.ApprovalNote, &r.ApprovalBy,
+		&nextCheck, &r.LastError, &failures, &blocked, &hidden, &approval, &r.ApprovalNote, &r.ApprovalBy,
 		&r.ActiveSHA, &skillCount, &warningCount)
 	if err != nil {
 		return nil, err
 	}
 	r.Mode, r.Auth, r.Visibility, r.DefaultRuns = UpdateMode(mode), AuthMode(auth), Visibility(vis), Runs(runs)
-	r.Approval = Approval(approval)
+	r.Approval, r.Hidden = Approval(approval), hidden != 0
 	r.PollSeconds, r.Enabled = int(poll), enabled != 0
 	r.CreatedAt, r.UpdatedAt = time.UnixMilli(created).UTC(), time.UnixMilli(updated).UTC()
 	if lastChecked.Valid {
@@ -164,10 +165,10 @@ func (s *Service) updateSourceSettings(ctx context.Context, r *sourceRow, due bo
 	now := max(s.now().UnixMilli(), r.UpdatedAt.UnixMilli()+1)
 	q := `UPDATE skill_sources SET branch = ?, path = ?, exclude_json = ?, mode = ?, pinned_sha = ?, auth = ?,
 		token_sealed = ?, poll_seconds = ?, enabled = ?, visibility = ?, members_json = ?, default_runs = ?,
-		limits_json = ?, blocked_json = ?, updated_at = ?`
+		limits_json = ?, blocked_json = ?, hidden = ?, updated_at = ?`
 	args := []any{r.Branch, r.Path, string(exclude), string(r.Mode), r.PinnedSHA, string(r.Auth),
 		r.tokenSealed, int64(r.PollSeconds), boolInt(r.Enabled), string(r.Visibility), string(members), string(r.DefaultRuns),
-		string(limits), string(blocked), now}
+		string(limits), string(blocked), boolInt(r.Hidden), now}
 	if due {
 		q += `, next_check_at = ?, head_sha = '', head_etag = '', failures = 0`
 		args = append(args, now)
@@ -822,6 +823,11 @@ func (s *Service) recordCheck(ctx context.Context, src *sourceRow, out *syncOutc
 	}
 	now := s.now()
 	poll := time.Duration(max(src.PollSeconds, MinPollSeconds)) * time.Second
+	if src.Approval == ApprovalPending {
+		// A contributor's source that waits for an admin is checked at
+		// most hourly: it serves nobody yet.
+		poll = max(poll, pendingPoll)
+	}
 	var res sql.Result
 	var err error
 	if cause == nil {

@@ -228,7 +228,7 @@ func (s *Server) skillSourceCreate(w http.ResponseWriter, r *http.Request) {
 			writeSkillAdminError(w, err)
 			return
 		}
-		if s.refuseContributorSettings(w, r, m, ref.Owner, &in.Mode, in.Limits != nil) {
+		if s.refuseContributorCreate(w, r, m, ref.Owner, in.Mode, in.Limits != nil) {
 			return
 		}
 	}
@@ -238,6 +238,9 @@ func (s *Server) skillSourceCreate(w http.ResponseWriter, r *http.Request) {
 	}
 	var prev *skillhub.Preview
 	if !m.admin {
+		if s.refuseTooManyPending(w, r, m) {
+			return
+		}
 		in.PendingApproval = true
 		var err error
 		if prev, err = s.skillsAdmin.Preview(r.Context(), u.ID, in); err != nil {
@@ -316,14 +319,14 @@ func (s *Server) recentSkillSource(ctx context.Context, uid string, in skillhub.
 // skillSourceStatus is the word the dashboard shows for a source.
 func skillSourceStatus(src *skillhub.Source) string {
 	switch {
-	case !src.Enabled:
-		return "paused"
-	case src.LastCheckedAt == nil:
-		return "syncing"
-	case src.Approval == skillhub.ApprovalPending:
-		return "pending approval"
 	case src.Approval == skillhub.ApprovalRejected:
 		return "rejected"
+	case !src.Enabled:
+		return "paused"
+	case src.Approval == skillhub.ApprovalPending:
+		return "pending approval"
+	case src.LastCheckedAt == nil:
+		return "syncing"
 	case src.LastError != "":
 		return "error"
 	case src.PendingVersionID != "":
@@ -451,9 +454,18 @@ func (s *Server) skillInspect(w http.ResponseWriter, r *http.Request, m *skillMa
 	}
 	var info *skillhub.RepoInfo
 	var err error
-	if body.Auth == string(skillhub.AuthGitHub) {
+	switch {
+	case body.Auth == string(skillhub.AuthGitHub):
 		info, err = s.skillInspectWithConnection(r, m.u, body.URL)
-	} else {
+	case !m.admin && strings.TrimSpace(body.Token) == "":
+		// A contributor never reads with the admins' default token.
+		sa, ok := s.skillsAdmin.(skillhub.SharingAdmin)
+		if !ok {
+			writeError(w, http.StatusNotFound, "skill contributors are not available on this server")
+			return
+		}
+		info, err = sa.InspectAnonymous(r.Context(), body.URL)
+	default:
 		info, err = s.skillsAdmin.Inspect(r.Context(), body.URL, body.Token)
 	}
 	if err != nil {
@@ -515,7 +527,7 @@ func (s *Server) skillSource(w http.ResponseWriter, r *http.Request, m *skillMan
 		if in.Mode != nil && *in.Mode == before.Mode {
 			in.Mode = nil // unchanged: not a contributor's choice to check
 		}
-		if s.refuseContributorSettings(w, r, m, before.Owner, in.Mode, in.Limits != nil) {
+		if s.refuseContributorUpdate(w, r, m, before, &in) {
 			return
 		}
 		src, err := s.skillsAdmin.UpdateSource(r.Context(), u.ID, id, in)
@@ -528,6 +540,14 @@ func (s *Server) skillSource(w http.ResponseWriter, r *http.Request, m *skillMan
 		// version the new settings did not produce.
 		if what := skillReviewChanges(before, src); what != "" {
 			s.settleSkillReviews(r.Context(), id, "", "the source's "+what+" changed on the Skills page")
+		}
+		// A contributor's source that waits for approval: a change of what
+		// is fetched makes the open approval question outdated. It is
+		// closed and asked again with a new dry run.
+		if src.Approval == skillhub.ApprovalPending {
+			if what := skillApprovalChanges(before, src, in); what != "" {
+				s.reaskSkillApproval(r.Context(), src, "the source's "+what+" changed on the Skills page")
+			}
 		}
 		s.auditSkillAdmin(r, u, "skills.source_update", id, skillUpdateSummary(in))
 		if sourceSharingChanged(before, src) {

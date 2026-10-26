@@ -6,6 +6,9 @@
 --                  whatever its audience (visibility everyone, members or
 --                  the new nobody: only admins and the source's creator, in
 --                  the dashboard; agents never).
+--   hidden         1 when an admin hid the source: no agent sees any of its
+--                  skills, whatever its audience or its skills' own
+--                  settings; only an admin sets or clears it.
 --   approval       '' (added by an admin: nothing to approve), 'pending' (a
 --                  skill contributor added it: it syncs, agents see
 --                  nothing), 'approved' or 'rejected' (disabled, agents see
@@ -22,11 +25,14 @@
 -- milliseconds.
 --
 -- Same schema as migrations/sqlite/0073_skill_sharing.sql.
--- Rollback: an older binary ignores the new columns and the table, so it
--- shows every source by its visibility alone (a 'nobody' source to admins
--- only, a pending contributor source to everyone it names); drop them by
--- hand only after the rollback.
+-- Rollback: an older binary ignores the new columns and the table, and
+-- its rule knows only 'members': it shows a 'nobody', hidden, blocked or
+-- pending contributor source to everyone. So do not hide, block or set
+-- 'nobody', and add no skill contributors, while an older replica runs;
+-- before a rollback, delete or set to 'members' the sources that rely on
+-- them. Drop the columns and the table by hand only after the rollback.
 ALTER TABLE skill_sources ADD COLUMN blocked_json TEXT NOT NULL DEFAULT '[]';
+ALTER TABLE skill_sources ADD COLUMN hidden BIGINT NOT NULL DEFAULT 0;
 ALTER TABLE skill_sources ADD COLUMN approval TEXT NOT NULL DEFAULT '';
 ALTER TABLE skill_sources ADD COLUMN approval_note TEXT NOT NULL DEFAULT '';
 ALTER TABLE skill_sources ADD COLUMN approval_by TEXT NOT NULL DEFAULT '';

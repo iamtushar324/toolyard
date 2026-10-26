@@ -87,15 +87,18 @@ func (si *srcIndex) repoLabel() string { return RepoLabel(si.src.Owner, si.src.R
 // directory reads, bundles, sources, the MCP Skills extension, tools.search
 // and REST) asks skillVisible or visibleTo, so none can show more:
 //
-//   - A source that waits for an admin's approval, or was rejected (a skill
-//     contributor's source), counts as audience nobody for every skill.
+//   - A source an admin hid (Source.Hidden), and a skill contributor's
+//     source that waits for an admin's approval or was rejected, count as
+//     audience nobody for every skill: this is checked first, so no
+//     skill's own setting can show one.
 //   - Otherwise audience(skill) is the skill's own mode when it has one
 //     (everyone, members or nobody), else the source's audience (its
 //     visibility: everyone, members or nobody).
 //   - blocked(skill) is the source's block list plus the skill's own.
-//   - Audience nobody: only a dashboard viewer (no agent) who is an admin,
-//     or the source's creator, sees the skill. Agents never do, an admin's
-//     included.
+//   - Audience nobody: only a person in the dashboard (no agent ID, not a
+//     delegated caller such as an operator token's CLI or the voice
+//     assistant) who is an admin, or the source's creator, sees the skill.
+//     Agents never do, an admin's included.
 //   - Otherwise a viewer sees the skill when they are an admin, or when
 //     they are in the audience (everyone; members: listed) and not blocked.
 //   - An agent is the viewer its owner is (UserID is the owner, Admin the
@@ -106,10 +109,15 @@ func (si *srcIndex) repoLabel() string { return RepoLabel(si.src.Owner, si.src.R
 // outer skill's file list and bundle). A source is visible when one of its
 // skills is (a source with no skills: by the source's audience alone).
 
-// sourceAudience is the source's audience after its approval state, with
-// its member set.
+// locked reports a source that counts as audience nobody whatever its
+// skills say: hidden by an admin, or a contributor's source that is not
+// approved.
+func (si *srcIndex) locked() bool { return si.src.Hidden || !si.src.Approval.Live() }
+
+// sourceAudience is the source's audience after the lock, with its member
+// set.
 func (si *srcIndex) sourceAudience() (Visibility, map[string]bool) {
-	if !si.src.Approval.Live() {
+	if si.locked() {
 		return VisibleNobody, nil
 	}
 	switch si.src.Visibility {
@@ -131,11 +139,11 @@ func (si *srcIndex) visibleWith(v Viewer, sh *skillShare) bool {
 		return false
 	}
 	mode, members := si.sourceAudience()
-	if sh != nil && sh.mode != VisibleInherit && si.src.Approval.Live() {
+	if sh != nil && sh.mode != VisibleInherit && !si.locked() {
 		mode, members = sh.mode, sh.members
 	}
 	if mode == VisibleNobody {
-		return v.AgentID == "" && (v.Admin || (v.UserID != "" && v.UserID == si.src.CreatedBy))
+		return v.AgentID == "" && !v.Delegated && (v.Admin || (v.UserID != "" && v.UserID == si.src.CreatedBy))
 	}
 	if v.Admin {
 		return true

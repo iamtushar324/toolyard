@@ -148,6 +148,11 @@ type Source struct {
 	DefaultRuns Runs     `json:"default_runs"`
 	Limits      Limits   `json:"limits"`
 
+	// Hidden is an admin's lock: no agent sees any of the source's skills,
+	// whatever its audience or its skills' own settings. Only an admin can
+	// set or clear it.
+	Hidden bool `json:"hidden,omitempty"`
+
 	// Approval is a contributor's source's state with the admins ("" for
 	// a source an admin added); ApprovalNote is a rejection's reason and
 	// ApprovalBy the deciding admin.
@@ -224,6 +229,7 @@ type SourceUpdate struct {
 	Visibility  *Visibility `json:"visibility,omitempty"`
 	Members     *[]string   `json:"members,omitempty"`
 	Blocked     *[]string   `json:"blocked,omitempty"`
+	Hidden      *bool       `json:"hidden,omitempty"` // admins only (the API refuses it from anyone else)
 	DefaultRuns *Runs       `json:"default_runs,omitempty"`
 	Limits      *Limits     `json:"limits,omitempty"`
 }
@@ -348,6 +354,10 @@ type Viewer struct {
 	// and federation agents). Others see RunsHost skills only with
 	// SearchQuery.IncludeHost / ListQuery.IncludeHost.
 	OnHost bool
+	// Delegated is a caller without an agent ID that still acts for the
+	// person (an operator token's CLI, the voice assistant): the sharing
+	// rule treats it as an agent, so it never sees audience nobody.
+	Delegated bool
 }
 
 // SkillSummary is one skill in a search result or listing.
@@ -524,11 +534,21 @@ type SharingAdmin interface {
 	// it) and returns the setting it replaced. Every node applies it
 	// within moments.
 	SetSkillSharing(ctx context.Context, by, id, skillPath string, sh SkillSharing) (SkillSharing, error)
-	// DecideApproval approves (the source goes live: its waiting version
-	// is made active) or rejects (the source is disabled, with note) a
-	// contributor's source that waits for approval. Deciding a source
-	// that needs no approval is ErrConflict.
-	DecideApproval(ctx context.Context, by, id string, approve bool, note string) (*Source, error)
+	// DecideApproval approves or rejects (the source is disabled, with
+	// note) a contributor's source that waits for approval. Approving
+	// makes the source live; its waiting version goes live with it only
+	// when that version is at sha, the commit the approver saw (else it
+	// waits for a normal review). Deciding a source that needs no
+	// approval is ErrConflict.
+	DecideApproval(ctx context.Context, by, id string, approve bool, note, sha string) (*Source, error)
+	// PreviewSource is a dry run of a stored source with its own settings
+	// and credential (a new approval question after a contributor changed
+	// what is fetched).
+	PreviewSource(ctx context.Context, id string) (*Preview, error)
+	// InspectAnonymous is Inspect without any token, the default one
+	// included: what a skill contributor without their own credential may
+	// read (public repositories only).
+	InspectAnonymous(ctx context.Context, url string) (*RepoInfo, error)
 }
 
 // ContributorsAdmin keeps the skill contributors (*Service implements it).

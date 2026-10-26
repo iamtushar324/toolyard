@@ -48,6 +48,9 @@ const (
 	// refreshEvery is how often a node compares its index with the
 	// database, on top of the cluster messages and resyncs.
 	refreshEvery = 5 * time.Minute
+	// pendingPoll is the shortest check interval of a contributor's source
+	// that waits for an admin's approval.
+	pendingPoll = time.Hour
 	// blobGrace keeps a blob a sync touched this recently out of the
 	// unreferenced-blob purge, so a version being written never loses one.
 	blobGrace = time.Hour

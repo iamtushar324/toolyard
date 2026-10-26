@@ -508,7 +508,9 @@ func (s *Service) ListDir(_ context.Context, v Viewer, dirURI string) ([]DirEntr
 	if si == nil || !si.visibleTo(v) {
 		return nil, fmt.Errorf("%w: %s", ErrNotFound, dirURI)
 	}
-	if si.byFile[dir] != nil {
+	if f := si.byFile[dir]; f != nil && si.fileVisible(v, f) {
+		// Only a file the viewer sees is named as one: a hidden file
+		// answers like a missing folder.
 		return nil, fmt.Errorf("%w: %s is a file, not a folder", ErrNotFound, dirURI)
 	}
 	var aliased bool

@@ -35,6 +35,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log"
 	"net/http"
 	"strings"
@@ -149,33 +150,135 @@ func (s *Server) skillOwnedSource(w http.ResponseWriter, r *http.Request, m *ski
 	return src, true
 }
 
-// refuseContributorSettings guards what a contributor may set on their own
-// source: updates review, or automatic for a trusted owner (an admin's
-// list); never pinned; never other limits. owner is the repository owner.
-func (s *Server) refuseContributorSettings(w http.ResponseWriter, r *http.Request, m *skillManager, owner string, mode *skillhub.UpdateMode, limits bool) bool {
+// maxPendingContributorSources caps the sources one contributor may have
+// waiting for approval at once.
+const maxPendingContributorSources = 3
+
+// refuseContributor answers 403 contributor_limit with msg.
+func refuseContributor(w http.ResponseWriter, msg string) bool {
+	writeJSON(w, http.StatusForbidden, map[string]string{"error": msg, "code": "contributor_limit"})
+	return true
+}
+
+// refuseContributorCreate guards what a contributor may choose for a new
+// source: updates by review, or automatic for a trusted owner (an
+// admin's list); never pinned; never other limits. owner is the
+// repository owner (the engine checks again with the owner GitHub
+// answers with).
+func (s *Server) refuseContributorCreate(w http.ResponseWriter, r *http.Request, m *skillManager, owner string, mode skillhub.UpdateMode, limits bool) bool {
+	switch {
+	case m.admin:
+		return false
+	case limits:
+		return refuseContributor(w, "only an admin can change a source's limits")
+	case mode == skillhub.ModePinned:
+		return refuseContributor(w, "a skill contributor's source updates by review (or automatically for a trusted owner); only an admin can pin one")
+	case mode == skillhub.ModeAuto && !s.skillsAdmin.TrustedOwner(r.Context(), owner):
+		return refuseContributor(w, "automatic updates are for trusted repository owners only; choose review, so an admin approves each new commit")
+	}
+	return false
+}
+
+// refuseContributorUpdate guards what a contributor may change on their
+// own source (in.Mode is nil when unchanged). Only an admin hides or
+// shows a source, changes its limits or pinned commit, re-enables a
+// rejected source, or changes what a source fetches when its new commits
+// go live without review (pinned, or automatic for an owner who is not
+// trusted).
+func (s *Server) refuseContributorUpdate(w http.ResponseWriter, r *http.Request, m *skillManager, before *skillhub.Source, in *skillhub.SourceUpdate) bool {
 	if m.admin {
 		return false
 	}
-	refuse := func(msg string) bool {
-		writeJSON(w, http.StatusForbidden, map[string]string{"error": msg, "code": "contributor_limit"})
-		return true
-	}
-	if limits {
-		return refuse("only an admin can change a source's limits")
-	}
-	if mode == nil {
-		return false
-	}
-	switch *mode {
-	case "", skillhub.ModeReview:
-	case skillhub.ModeAuto:
-		if !s.skillsAdmin.TrustedOwner(r.Context(), owner) {
-			return refuse("automatic updates are for trusted repository owners only; choose review, so an admin approves each new commit")
-		}
-	default:
-		return refuse("a skill contributor's source updates by review (or automatically for a trusted owner); only an admin can pin one")
+	trusted := s.skillsAdmin.TrustedOwner(r.Context(), before.Owner)
+	fetch := (in.Branch != nil && strings.TrimSpace(*in.Branch) != before.Branch) ||
+		(in.Path != nil && strings.Trim(strings.TrimSpace(*in.Path), "/") != strings.Trim(before.Path, "/")) || in.Exclude != nil
+	unreviewed := before.Mode == skillhub.ModePinned || (before.Mode == skillhub.ModeAuto && !trusted)
+	switch {
+	case in.Hidden != nil:
+		return refuseContributor(w, "only an admin can hide or show a source")
+	case in.Limits != nil:
+		return refuseContributor(w, "only an admin can change a source's limits")
+	case in.PinnedSHA != nil && strings.TrimSpace(*in.PinnedSHA) != before.PinnedSHA:
+		return refuseContributor(w, "only an admin can change a source's pinned commit")
+	case in.Mode != nil && *in.Mode == skillhub.ModePinned:
+		return refuseContributor(w, "a skill contributor's source updates by review (or automatically for a trusted owner); only an admin can pin one")
+	case in.Mode != nil && *in.Mode == skillhub.ModeAuto && !trusted:
+		return refuseContributor(w, "automatic updates are for trusted repository owners only; choose review, so an admin approves each new commit")
+	case fetch && unreviewed && in.Mode == nil:
+		return refuseContributor(w, "this source's new commits go live without review, so only an admin can change its branch, folder or excludes; switch it to review first")
+	case in.Enabled != nil && *in.Enabled && before.Approval == skillhub.ApprovalRejected:
+		return refuseContributor(w, "an admin rejected this source; only an admin can turn it on again")
 	}
 	return false
+}
+
+// refuseTooManyPending answers 409 when a contributor already has
+// maxPendingContributorSources sources waiting for approval.
+func (s *Server) refuseTooManyPending(w http.ResponseWriter, r *http.Request, m *skillManager) bool {
+	list, err := s.skillsAdmin.ListSources(r.Context())
+	if err != nil {
+		writeSkillAdminError(w, err)
+		return true
+	}
+	n := 0
+	for i := range list {
+		if list[i].CreatedBy == m.u.ID && list[i].Approval == skillhub.ApprovalPending {
+			n++
+		}
+	}
+	if n < maxPendingContributorSources {
+		return false
+	}
+	writeJSON(w, http.StatusConflict, map[string]string{
+		"error": fmt.Sprintf("you already have %d sources waiting for an admin's approval; wait for a decision, or delete one", n), "code": "conflict"})
+	return true
+}
+
+// skillApprovalChanges names what changed between before and after that
+// makes an open approval question outdated (what is fetched, how, and how
+// commits go live), or "".
+func skillApprovalChanges(before, after *skillhub.Source, in skillhub.SourceUpdate) string {
+	var f []string
+	add := func(changed bool, name string) {
+		if changed {
+			f = append(f, name)
+		}
+	}
+	add(before.Branch != after.Branch, "branch")
+	add(strings.Trim(before.Path, "/") != strings.Trim(after.Path, "/"), "folder")
+	add(in.Exclude != nil && strings.Join(before.Exclude, "\n") != strings.Join(after.Exclude, "\n"), "excludes")
+	add(before.Auth != after.Auth || (in.Token != nil && strings.TrimSpace(*in.Token) != "") || in.ClearToken, "credential")
+	add(before.Mode != after.Mode || before.PinnedSHA != after.PinnedSHA, "update mode")
+	return strings.Join(f, ", ")
+}
+
+// reaskSkillApproval closes a pending source's approval question and asks
+// again with a dry run of its new settings (counts unknown when the dry
+// run fails).
+func (s *Server) reaskSkillApproval(ctx context.Context, src *skillhub.Source, reason string) {
+	ap, ok := s.skillReviews.(skillApprovals)
+	if !ok {
+		return
+	}
+	if err := ap.SettleApproval(ctx, src.ID, reason); err != nil {
+		log.Printf("skills: close the approval question of %s: %v", src.ID, err)
+	}
+	var prev *skillhub.Preview
+	if sa, ok := s.skillsAdmin.(skillhub.SharingAdmin); ok {
+		p, err := sa.PreviewSource(ctx, src.ID)
+		if err != nil {
+			log.Printf("skills: dry run for the approval question of %s: %s", src.ID, skillAdminErrorText(err))
+		} else {
+			prev = p
+		}
+	}
+	who := src.CreatedBy
+	if u, err := s.identity.GetUserByID(ctx, src.CreatedBy); err == nil {
+		who = u.Label()
+	}
+	if err := ap.RequestApproval(ctx, *src, prev, who); err != nil {
+		log.Printf("skills: approval question for %s: %v", src.ID, err)
+	}
 }
 
 // skillMe is GET /v1/skills/admin/me: what the signed-in person may do on
@@ -363,7 +466,8 @@ func nonNilIDs(ids []string) []string {
 
 // sourceSharingArgs is a source's sharing, for the audit row.
 func sourceSharingArgs(src *skillhub.Source) map[string]any {
-	return map[string]any{"visibility": string(src.Visibility), "members": nonNilIDs(src.Members), "blocked": nonNilIDs(src.Blocked)}
+	return map[string]any{"visibility": string(src.Visibility), "members": nonNilIDs(src.Members), "blocked": nonNilIDs(src.Blocked),
+		"hidden": src.Hidden}
 }
 
 // sourceSharingChanged reports whether a source's audience, members or
@@ -389,6 +493,9 @@ func (s *Server) skillDecideApproval(w http.ResponseWriter, r *http.Request, m *
 	var body struct {
 		Decision string `json:"decision"`
 		Note     string `json:"note,omitempty"`
+		// SHA is the commit of the waiting version the admin saw on the
+		// source page: only that version goes live with the approval.
+		SHA string `json:"sha,omitempty"`
 	}
 	if err := decode(r, &body); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
@@ -416,7 +523,7 @@ func (s *Server) skillDecideApproval(w http.ResponseWriter, r *http.Request, m *
 		writeSkillAdminError(w, err)
 		return
 	}
-	src, err := sa.DecideApproval(r.Context(), m.u.ID, id, approve, note)
+	src, err := sa.DecideApproval(r.Context(), m.u.ID, id, approve, note, strings.TrimSpace(body.SHA))
 	if err != nil {
 		writeSkillAdminError(w, err)
 		return

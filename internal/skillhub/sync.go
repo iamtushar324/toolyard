@@ -626,6 +626,12 @@ func (s *Service) clientFor(ctx context.Context, row *sourceRow) (*ghClient, err
 	case AuthGitHub:
 		return s.userClient(ctx, row.CreatedBy)
 	}
+	if row.Approval != ApprovalNone {
+		// A skill contributor's source without its own credential reads
+		// anonymously: the admins' default token could read private
+		// repositories the contributor cannot.
+		return s.newClient(""), nil
+	}
 	return s.publicClient(), nil
 }
 
@@ -681,7 +687,7 @@ func (s *Service) housekeeping(ctx context.Context) {
 // pollDue syncs the sources whose check is due, pollConcurrency at a time,
 // so one slow source does not hold up the others.
 func (s *Service) pollDue(ctx context.Context) {
-	rows, err := s.db.QueryContext(ctx, `SELECT id, auth FROM skill_sources WHERE enabled = 1
+	rows, err := s.db.QueryContext(ctx, `SELECT id, auth, approval FROM skill_sources WHERE enabled = 1
 		AND (next_check_at IS NULL OR next_check_at <= ?) ORDER BY next_check_at LIMIT 50`, s.now().UnixMilli())
 	if err != nil {
 		if ctx.Err() == nil {
@@ -693,14 +699,17 @@ func (s *Service) pollDue(ctx context.Context) {
 	// without their own token (anonymous, or the default token), those
 	// wait for it together; sources with their own token go on.
 	publicPaused, paused := s.limits.blockedUntil(s.publicClient().key)
+	// Contributors' sources without their own credential read anonymously
+	// (clientFor), under the anonymous limit.
+	_, anonPaused := s.limits.blockedUntil(s.newClient("").key)
 	var ids []string
 	skipped := 0
 	for rows.Next() {
-		var id, auth string
-		if rows.Scan(&id, &auth) != nil {
+		var id, auth, approval string
+		if rows.Scan(&id, &auth, &approval) != nil {
 			continue
 		}
-		if paused && AuthMode(auth) == AuthNone {
+		if AuthMode(auth) == AuthNone && ((Approval(approval) == ApprovalNone && paused) || (Approval(approval) != ApprovalNone && anonPaused)) {
 			skipped++
 			continue
 		}
