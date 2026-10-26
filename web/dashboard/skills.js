@@ -784,8 +784,10 @@ function skillsGroup(label, content, hint) {
 }
 
 // skillsRadio is one radio of a group; pick runs when it is chosen.
+// The label sits in its own span so a long one wraps beside the radio,
+// not onto a line of its own.
 function skillsRadio(name, checked, label, pick) {
-  return el('label', { class: 'row' }, el('input', { type: 'radio', name, checked, on: { change: () => { pick(); render(); } } }), label);
+  return el('label', { class: 'row skills-radio' }, el('input', { type: 'radio', name, checked, on: { change: () => { pick(); render(); } } }), el('span', {}, label));
 }
 
 function skillsChip(src) {
