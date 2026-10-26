@@ -20,6 +20,9 @@ type skillsSharingFake struct {
 	owners       map[string]string // source ID -> creator
 	contributors map[string]bool
 	approval     map[string]skillhub.Approval
+	modes        map[string]skillhub.UpdateMode
+	hidden       map[string]bool
+	ghOwners     map[string]string // source ID -> repository owner (default acme, trusted)
 	lastSharing  skillhub.SkillSharing
 	lastPath     string
 	decisions    []string
@@ -38,6 +41,13 @@ func (f *skillsSharingFake) source(id string) *skillhub.Source {
 		src.CreatedBy = o
 	}
 	src.Approval = f.approval[id]
+	if m, ok := f.modes[id]; ok {
+		src.Mode = m
+	}
+	src.Hidden = f.hidden[id]
+	if o, ok := f.ghOwners[id]; ok {
+		src.Owner = o
+	}
 	return src
 }
 
@@ -99,7 +109,27 @@ func (f *skillsSharingFake) UpdateSource(ctx context.Context, by, id string, in 
 	if in.Blocked != nil {
 		src.Blocked = *in.Blocked
 	}
+	if in.Hidden != nil {
+		src.Hidden = *in.Hidden
+	}
+	if in.Branch != nil {
+		src.Branch = *in.Branch
+	}
 	return src, nil
+}
+
+func (f *skillsSharingFake) PreviewSource(_ context.Context, id string) (*skillhub.Preview, error) {
+	if err := f.record("PreviewSource " + id); err != nil {
+		return nil, err
+	}
+	return &skillhub.Preview{Source: *f.source(id), SHA: strings.Repeat("b", 40), SkillCount: 3}, nil
+}
+
+func (f *skillsSharingFake) InspectAnonymous(_ context.Context, url string) (*skillhub.RepoInfo, error) {
+	if err := f.record("InspectAnonymous"); err != nil {
+		return nil, err
+	}
+	return &skillhub.RepoInfo{RepoRef: skillhub.RepoRef{Owner: "acme", Repo: "skills"}, DefaultBranch: "main", Branches: []string{"main"}}, nil
 }
 
 func (f *skillsSharingFake) SetSkillSharing(_ context.Context, by, id, path string, sh skillhub.SkillSharing) (skillhub.SkillSharing, error) {
@@ -113,12 +143,12 @@ func (f *skillsSharingFake) SetSkillSharing(_ context.Context, by, id, path stri
 	return before, nil
 }
 
-func (f *skillsSharingFake) DecideApproval(_ context.Context, by, id string, approve bool, note string) (*skillhub.Source, error) {
+func (f *skillsSharingFake) DecideApproval(_ context.Context, by, id string, approve bool, note, sha string) (*skillhub.Source, error) {
 	if err := f.record("DecideApproval " + id); err != nil {
 		return nil, err
 	}
 	f.smu.Lock()
-	f.decisions = append(f.decisions, by+"|"+id+"|"+map[bool]string{true: "approve", false: "reject"}[approve]+"|"+note)
+	f.decisions = append(f.decisions, by+"|"+id+"|"+map[bool]string{true: "approve", false: "reject"}[approve]+"|"+note+"|"+sha)
 	if approve {
 		f.approval[id] = skillhub.ApprovalApproved
 	} else {
@@ -203,7 +233,8 @@ func newSkillsSharingEnv(t *testing.T) *skillsSharingEnv {
 	m := e.member(t, "user_m", "morgan@beknown.work")
 	fake := &skillsSharingFake{skillsAdminFake: &skillsAdminFake{},
 		owners:       map[string]string{"src_admin": e.admin.ID, "src_mine": c.ID},
-		contributors: map[string]bool{c.ID: true}, approval: map[string]skillhub.Approval{}}
+		contributors: map[string]bool{c.ID: true}, approval: map[string]skillhub.Approval{},
+		modes: map[string]skillhub.UpdateMode{}, hidden: map[string]bool{}, ghOwners: map[string]string{}}
 	settler := &skillsApprovalSettler{}
 	e.srv.skillsAdmin, e.srv.skillReviews = fake, settler
 	return &skillsSharingEnv{accessTestEnv: e, fake: fake, settler: settler, adminCookie: e.cookieFor(t, e.admin.ID),
@@ -464,7 +495,7 @@ func TestSkillApprovalRoute(t *testing.T) {
 	if rec := e.do(t, e.adminCookie, http.MethodPost, "/v1/skills/sources/src_mine/approval", `{"decision":"maybe"}`); rec.Code != http.StatusBadRequest {
 		t.Fatalf("bad decision: %d", rec.Code)
 	}
-	rec := e.do(t, e.adminCookie, http.MethodPost, "/v1/skills/sources/src_mine/approval", `{"decision":"approve"}`)
+	rec := e.do(t, e.adminCookie, http.MethodPost, "/v1/skills/sources/src_mine/approval", `{"decision":"approve","sha":" abc "}`)
 	if rec.Code != http.StatusOK || skillsJSON(t, rec)["source"].(map[string]any)["approval"] != "approved" {
 		t.Fatalf("approve: %d %s", rec.Code, rec.Body.String())
 	}
@@ -475,7 +506,7 @@ func TestSkillApprovalRoute(t *testing.T) {
 	e.fake.smu.Lock()
 	decisions := append([]string(nil), e.fake.decisions...)
 	e.fake.smu.Unlock()
-	if len(decisions) != 2 || decisions[0] != e.admin.ID+"|src_mine|approve|" || decisions[1] != e.admin.ID+"|src_mine|reject|duplicate" {
+	if len(decisions) != 2 || decisions[0] != e.admin.ID+"|src_mine|approve||abc" || decisions[1] != e.admin.ID+"|src_mine|reject|duplicate|" {
 		t.Fatalf("decisions %v", decisions)
 	}
 	e.settler.mu.Lock()
@@ -555,5 +586,112 @@ func TestSkillPeopleRoute(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("admin people lack emails: %s", rec.Body.String())
+	}
+}
+
+// The review fixes: what a contributor may not change on their own source,
+// the pending cap, anonymous inspect, a new approval question when a
+// pending source's fetch settings change, and the admin's hide lock.
+func TestSkillContributorGuards(t *testing.T) {
+	e := newSkillsSharingEnv(t)
+	for _, c := range []struct {
+		name, body string
+		setup      func()
+	}{
+		{"hide", `{"hidden":true}`, nil},
+		{"pinned commit", `{"pinned_sha":"0123456789abcdef0123456789abcdef01234567"}`, nil},
+		{"branch of a pinned source", `{"branch":"other"}`, func() { e.fake.modes["src_mine"] = skillhub.ModePinned }},
+		{"folder of an untrusted automatic source", `{"path":"x"}`, func() {
+			e.fake.modes["src_mine"] = skillhub.ModeAuto
+			e.fake.ghOwners["src_mine"] = "other"
+		}},
+		{"turn on a rejected source", `{"enabled":true}`, func() { e.fake.approval["src_mine"] = skillhub.ApprovalRejected }},
+	} {
+		e.fake.smu.Lock()
+		e.fake.modes, e.fake.approval, e.fake.ghOwners = map[string]skillhub.UpdateMode{}, map[string]skillhub.Approval{}, map[string]string{}
+		if c.setup != nil {
+			c.setup()
+		}
+		e.fake.smu.Unlock()
+		rec := e.do(t, e.contribCk, http.MethodPatch, "/v1/skills/sources/src_mine", c.body)
+		if rec.Code != http.StatusForbidden || skillsJSON(t, rec)["code"] != "contributor_limit" {
+			t.Errorf("%s: %d %s", c.name, rec.Code, rec.Body.String())
+		}
+	}
+	// skillsTestSource's owner is acme (trusted): a branch change of an
+	// automatic source is the contributor's to make; so is a branch change
+	// that switches a pinned source to review.
+	e.fake.smu.Lock()
+	e.fake.modes = map[string]skillhub.UpdateMode{"src_mine": skillhub.ModePinned}
+	e.fake.approval, e.fake.ghOwners = map[string]skillhub.Approval{}, map[string]string{}
+	e.fake.smu.Unlock()
+	if rec := e.do(t, e.contribCk, http.MethodPatch, "/v1/skills/sources/src_mine", `{"branch":"other","mode":"review"}`); rec.Code != http.StatusOK {
+		t.Errorf("pinned to review with a branch: %d %s", rec.Code, rec.Body.String())
+	}
+
+	// An admin hides and shows a source; the audit row names the lock.
+	if rec := e.do(t, e.adminCookie, http.MethodPatch, "/v1/skills/sources/src_mine", `{"hidden":true}`); rec.Code != http.StatusOK ||
+		skillsJSON(t, rec)["hidden"] != true {
+		t.Fatalf("admin hide: %d %s", rec.Code, rec.Body.String())
+	}
+	var args string
+	if err := e.db.QueryRow(`SELECT COALESCE(arguments,'') FROM audit_events WHERE event_type = ?`, "skills.source_sharing").Scan(&args); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(args, `"hidden":false`) || !strings.Contains(args, `"hidden":true`) {
+		t.Fatalf("hide audit %s", args)
+	}
+
+	// A contributor's inspect without a token never uses the default one.
+	e.resetCalls()
+	if rec := e.do(t, e.contribCk, http.MethodPost, "/v1/skills/sources/inspect", `{"url":"acme/skills"}`); rec.Code != http.StatusOK {
+		t.Fatalf("contributor inspect: %d %s", rec.Code, rec.Body.String())
+	}
+	if c := strings.Join(e.calls(), ","); !strings.Contains(c, "InspectAnonymous") || strings.Contains(c, "Inspect,") || strings.HasSuffix(c, ",Inspect") {
+		t.Fatalf("contributor inspect calls %s", c)
+	}
+	e.resetCalls()
+	if rec := e.do(t, e.adminCookie, http.MethodPost, "/v1/skills/sources/inspect", `{"url":"acme/skills"}`); rec.Code != http.StatusOK {
+		t.Fatalf("admin inspect: %d", rec.Code)
+	}
+	if c := strings.Join(e.calls(), ","); strings.Contains(c, "InspectAnonymous") {
+		t.Fatalf("admin inspect calls %s", c)
+	}
+
+	// A pending source whose branch changes gets a new approval question.
+	e.fake.smu.Lock()
+	e.fake.modes = map[string]skillhub.UpdateMode{}
+	e.fake.approval = map[string]skillhub.Approval{"src_mine": skillhub.ApprovalPending}
+	e.fake.smu.Unlock()
+	if rec := e.do(t, e.contribCk, http.MethodPatch, "/v1/skills/sources/src_mine", `{"branch":"next"}`); rec.Code != http.StatusOK {
+		t.Fatalf("pending branch change: %d %s", rec.Code, rec.Body.String())
+	}
+	e.settler.mu.Lock()
+	settled, reqs := append([]string(nil), e.settler.settled...), append([]string(nil), e.settler.requests...)
+	e.settler.mu.Unlock()
+	if len(settled) != 1 || !strings.Contains(settled[0], "branch changed") || len(reqs) != 1 || !strings.HasPrefix(reqs[0], "src_mine|pending|casey@beknown.work|xxx") {
+		t.Fatalf("re-ask: settled %v requests %v", settled, reqs)
+	}
+	// A sharing change of a pending source asks nothing new.
+	_ = e.do(t, e.contribCk, http.MethodPatch, "/v1/skills/sources/src_mine", `{"visibility":"nobody"}`)
+	e.settler.mu.Lock()
+	n := len(e.settler.requests)
+	e.settler.mu.Unlock()
+	if n != 1 {
+		t.Fatalf("a sharing change asked again: %d requests", n)
+	}
+
+	// At most three sources wait for approval per contributor.
+	e.fake.smu.Lock()
+	for _, id := range []string{"src_p1", "src_p2", "src_p3"} {
+		e.fake.owners[id], e.fake.approval[id] = e.contrib.ID, skillhub.ApprovalPending
+	}
+	e.fake.smu.Unlock()
+	rec := e.do(t, e.contribCk, http.MethodPost, "/v1/skills/sources", `{"url":"acme/skills","branch":"cap"}`)
+	if rec.Code != http.StatusConflict || !strings.Contains(skillsJSON(t, rec)["error"].(string), "waiting for an admin") {
+		t.Fatalf("pending cap: %d %s", rec.Code, rec.Body.String())
+	}
+	if rec := e.do(t, e.adminCookie, http.MethodPost, "/v1/skills/sources", `{"url":"acme/skills","branch":"admin-cap"}`); rec.Code != http.StatusCreated {
+		t.Fatalf("admins have no cap: %d %s", rec.Code, rec.Body.String())
 	}
 }

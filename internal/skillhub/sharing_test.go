@@ -113,6 +113,29 @@ func TestSharingRuleMatrix(t *testing.T) {
 	if si.skillVisible(adminDash, "") || si.visibleTo(adminDash) {
 		t.Fatal("a source without an active version is visible")
 	}
+
+	// An admin's hide lock beats a skill shared with everyone; a
+	// delegated caller (an operator token's CLI, the voice assistant) is
+	// an agent for audience nobody.
+	hidden := &srcIndex{src: Source{Visibility: VisibleEveryone, Hidden: true, CreatedBy: creator}, versionID: "skv_x",
+		shares: map[string]*skillShare{"s": {mode: VisibleEveryone}}, byPath: map[string]*skillEntry{}}
+	delegatedAdmin := Viewer{UserID: "usr_admin", Admin: true, Delegated: true}
+	for name, c := range map[string]struct {
+		v    Viewer
+		want bool
+	}{
+		"admin in the dashboard": {adminDash, true}, "admin's agent": {adminAgent, false}, "member": {other, false},
+		"creator in the dashboard": {creatorDash, true}, "delegated admin": {delegatedAdmin, false},
+		"delegated creator": {Viewer{UserID: creator, Delegated: true}, false},
+	} {
+		if got := hidden.skillVisible(c.v, "s"); got != c.want {
+			t.Errorf("hidden source, %s: %v, want %v", name, got, c.want)
+		}
+	}
+	shared := &srcIndex{src: Source{Visibility: VisibleEveryone}, versionID: "skv_x", shares: map[string]*skillShare{}}
+	if !shared.skillVisible(delegatedAdmin, "s") {
+		t.Fatal("a delegated caller does not see a skill shared with everyone")
+	}
 }
 
 func TestNormalizeSharing(t *testing.T) {
@@ -203,6 +226,10 @@ func TestSkillNobodyOnEveryReadPath(t *testing.T) {
 		if _, err := svc.ListDir(ctx, v, "skill://skills/pr-review/nested-helper"); !errors.Is(err, ErrNotFound) {
 			t.Errorf("%s list dir of the hidden skill: %v", name, err)
 		}
+		// A hidden file is not even named as a file.
+		if _, err := svc.ListDir(ctx, v, "skill://skills/pr-review/nested-helper/notes.md"); !errors.Is(err, ErrNotFound) || strings.Contains(err.Error(), "is a file") {
+			t.Errorf("%s list dir of a hidden file: %v", name, err)
+		}
 		dir, err := svc.ListDir(ctx, v, "skill://skills/pr-review")
 		if err != nil {
 			t.Fatalf("%s list dir: %v", name, err)
@@ -258,6 +285,9 @@ func TestSkillNobodyOnEveryReadPath(t *testing.T) {
 	// An admin in the dashboard sees it everywhere.
 	if _, err := svc.Get(ctx, adminViewer, hidden, true); err != nil {
 		t.Fatalf("admin get: %v", err)
+	}
+	if _, err := svc.ListDir(ctx, adminViewer, "skill://skills/pr-review/nested-helper/notes.md"); err == nil || !strings.Contains(err.Error(), "is a file") {
+		t.Fatalf("admin list dir of a file: %v", err)
 	}
 	if hits, _ := svc.Grep(ctx, adminViewer, GrepQuery{Pattern: "secret-word"}); len(hits) != 2 {
 		t.Fatalf("admin grep: %+v", hits)
@@ -477,15 +507,33 @@ func TestContributorSourceApproval(t *testing.T) {
 	if srcs, _ := svc.Sources(ctx, memberViewer); len(srcs) != 0 {
 		t.Fatalf("pending source shown: %+v", srcs)
 	}
-	got, err := svc.DecideApproval(ctx, "usr_admin", src.ID, true, "")
+	// A waiting source is checked at most hourly.
+	if p, _ := svc.GetSource(ctx, src.ID); p.NextCheckAt == nil || p.LastCheckedAt == nil || p.NextCheckAt.Sub(*p.LastCheckedAt) < pendingPoll {
+		t.Fatalf("pending source checks: last %v next %v", p.LastCheckedAt, p.NextCheckAt)
+	}
+	got, err := svc.DecideApproval(ctx, "usr_admin", src.ID, true, "", res.SHA)
 	if err != nil || got.Approval != ApprovalApproved || got.ApprovalBy != "usr_admin" || got.ActiveVersionID == "" || got.PendingVersionID != "" {
 		t.Fatalf("approve: %+v %v", got, err)
 	}
 	if srcs, _ := svc.Sources(ctx, memberViewer); len(srcs) != 1 {
 		t.Fatalf("approved source hidden: %+v", srcs)
 	}
-	if _, err := svc.DecideApproval(ctx, "usr_admin", src.ID, true, ""); !errors.Is(err, ErrConflict) {
+	if _, err := svc.DecideApproval(ctx, "usr_admin", src.ID, true, "", ""); !errors.Is(err, ErrConflict) {
 		t.Fatalf("approve twice: %v", err)
+	}
+	// An approval whose question showed another commit makes the source
+	// live but leaves the waiting version to a normal review question.
+	stale, err := svc.CreateSource(ctx, "usr_contrib", SourceInput{URL: "acme/skills", Slug: "stale", Path: "skills", Mode: ModeReview, PendingApproval: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res, err := svc.SyncNow(ctx, stale.ID); err != nil || !res.Staged {
+		t.Fatalf("stale sync: %+v %v", res, err)
+	}
+	before := hook.n
+	st, err := svc.DecideApproval(ctx, "usr_admin", stale.ID, true, "", strings.Repeat("e", 40))
+	if err != nil || st.Approval != ApprovalApproved || st.ActiveVersionID != "" || st.PendingVersionID == "" || hook.n != before+1 {
+		t.Fatalf("approve with another commit: %+v %v (hook %d -> %d)", st, err, before, hook.n)
 	}
 
 	// Reject, then approve after all.
@@ -499,14 +547,14 @@ func TestContributorSourceApproval(t *testing.T) {
 	if srcs, _ := svc.Sources(ctx, memberViewer); len(srcs) != 1 {
 		t.Fatalf("an auto-mode source pending approval is shown: %+v", srcs)
 	}
-	rej, err := svc.DecideApproval(ctx, "usr_admin", two.ID, false, "not ours")
+	rej, err := svc.DecideApproval(ctx, "usr_admin", two.ID, false, "not ours", "")
 	if err != nil || rej.Approval != ApprovalRejected || rej.Enabled || rej.ApprovalNote != "not ours" {
 		t.Fatalf("reject: %+v %v", rej, err)
 	}
-	if _, err := svc.DecideApproval(ctx, "usr_admin", two.ID, false, ""); !errors.Is(err, ErrConflict) {
+	if _, err := svc.DecideApproval(ctx, "usr_admin", two.ID, false, "", ""); !errors.Is(err, ErrConflict) {
 		t.Fatalf("reject twice: %v", err)
 	}
-	if again, err := svc.DecideApproval(ctx, "usr_admin", two.ID, true, ""); err != nil || again.Approval != ApprovalApproved || !again.Enabled {
+	if again, err := svc.DecideApproval(ctx, "usr_admin", two.ID, true, "", ""); err != nil || again.Approval != ApprovalApproved || !again.Enabled {
 		t.Fatalf("approve after a rejection: %+v %v", again, err)
 	}
 	// An admin's source needs no approval.
@@ -514,14 +562,123 @@ func TestContributorSourceApproval(t *testing.T) {
 	if adminSrc.Approval != ApprovalNone {
 		t.Fatalf("admin source approval %q", adminSrc.Approval)
 	}
-	if _, err := svc.DecideApproval(ctx, "usr_admin", adminSrc.ID, true, ""); !errors.Is(err, ErrConflict) {
+	if _, err := svc.DecideApproval(ctx, "usr_admin", adminSrc.ID, true, "", ""); !errors.Is(err, ErrConflict) {
 		t.Fatalf("approving an admin's source: %v", err)
 	}
 	// After approval a review-mode source's next commit asks for review
 	// as usual.
 	gh.commit("main", map[string]string{"skills/pr-review/checks.md": "v2\n"})
-	if res, err := svc.SyncNow(ctx, src.ID); err != nil || !res.Staged || hook.n != 1 {
-		t.Fatalf("next commit of an approved source: %+v %v (hook %d)", res, err, hook.n)
+	before = hook.n
+	if res, err := svc.SyncNow(ctx, src.ID); err != nil || !res.Staged || hook.n != before+1 {
+		t.Fatalf("next commit of an approved source: %+v %v (hook %d -> %d)", res, err, before, hook.n)
+	}
+	// The engine bounds a contributor's choices too: no pin, automatic
+	// only for a trusted owner (nobody is trusted here), no limits.
+	for name, in := range map[string]SourceInput{
+		"pinned": {Mode: ModePinned, PinnedSHA: strings.Repeat("a", 40)},
+		"auto":   {Mode: ModeAuto},
+		"limits": {Mode: ModeReview, Limits: &Limits{MaxSkills: 5}},
+	} {
+		in.URL, in.Slug, in.Path, in.PendingApproval = "acme/skills", "bound-"+name, "skills", true
+		if _, err := svc.CreateSource(ctx, "usr_contrib", in); !errors.Is(err, ErrInvalid) {
+			t.Errorf("contributor %s: %v", name, err)
+		}
+	}
+}
+
+// An admin's hide lock hides every skill of a source from agents, even
+// one shared with everyone; showing it again restores them.
+func TestAdminHideLock(t *testing.T) {
+	svc, _, src := sharingFixture(t)
+	ctx := context.Background()
+	if _, err := svc.SetSkillSharing(ctx, "usr_admin", src.ID, "pr-review", SkillSharing{Mode: VisibleEveryone}); err != nil {
+		t.Fatal(err)
+	}
+	on := true
+	got, err := svc.UpdateSource(ctx, "usr_admin", src.ID, SourceUpdate{Hidden: &on})
+	if err != nil || !got.Hidden {
+		t.Fatalf("hide: %+v %v", got, err)
+	}
+	adminAgent := Viewer{UserID: "usr_admin", AgentID: "agt_admin", Admin: true}
+	for name, v := range map[string]Viewer{"member": memberViewer, "admin's agent": adminAgent} {
+		if srcs, _ := svc.Sources(ctx, v); len(srcs) != 0 {
+			t.Errorf("%s sees a hidden source: %+v", name, srcs)
+		}
+		if _, err := svc.Get(ctx, v, "pr-review", false); !errors.Is(err, ErrNotFound) {
+			t.Errorf("%s gets a skill of a hidden source: %v", name, err)
+		}
+	}
+	if _, err := svc.Get(ctx, adminViewer, "pr-review", false); err != nil {
+		t.Fatalf("admin in the dashboard: %v", err)
+	}
+	off := false
+	if _, err := svc.UpdateSource(ctx, "usr_admin", src.ID, SourceUpdate{Hidden: &off}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.Get(ctx, memberViewer, "pr-review", false); err != nil {
+		t.Fatalf("after showing it again: %v", err)
+	}
+}
+
+// A contributor never reads with the admins' default token: their dry run,
+// create and syncs read anonymously, so a private repository needs their
+// own token or GitHub connection. An admin's source still reads with it.
+func TestContributorReadsAnonymously(t *testing.T) {
+	gh := newFakeGitHub(t, "acme", "skills")
+	gh.commit("main", baseTree())
+	svc, _ := newAccessTest(t, gh)
+	ctx := context.Background()
+	if _, err := svc.SetGitHubToken(ctx, "usr_admin", accessDefaultToken); err != nil {
+		t.Fatal(err)
+	}
+	mark := gh.authMark()
+	in := SourceInput{URL: "acme/skills", Path: "skills", Mode: ModeReview, PendingApproval: true}
+	if _, err := svc.Preview(ctx, "usr_contrib", in); err != nil {
+		t.Fatal(err)
+	}
+	src, err := svc.CreateSource(ctx, "usr_contrib", in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.SyncNow(ctx, src.ID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.InspectAnonymous(ctx, "acme/skills"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.PreviewSource(ctx, src.ID); err != nil {
+		t.Fatal(err)
+	}
+	for _, a := range gh.auths(mark) {
+		if a != "" {
+			t.Fatalf("a contributor's read sent %q", a)
+		}
+	}
+	mark = gh.authMark()
+	if _, err := svc.Inspect(ctx, "acme/skills", ""); err != nil {
+		t.Fatal(err)
+	}
+	if got := gh.auths(mark); len(got) == 0 || got[0] != "Bearer "+accessDefaultToken {
+		t.Fatalf("an admin's inspect sent %v", got)
+	}
+
+	// A private repository: the default token could read it, a
+	// contributor cannot.
+	gh.mu.Lock()
+	gh.private, gh.token = true, accessDefaultToken
+	gh.mu.Unlock()
+	info, err := svc.InspectAnonymous(ctx, "acme/skills")
+	if err != nil || !info.NeedsToken {
+		t.Fatalf("anonymous inspect of a private repository: %+v %v", info, err)
+	}
+	if _, err := svc.Preview(ctx, "usr_contrib", SourceInput{URL: "acme/skills", Path: "skills", PendingApproval: true}); !errors.Is(err, ErrNeedsToken) {
+		t.Fatalf("contributor preview of a private repository: %v", err)
+	}
+	if res, err := svc.SyncNow(ctx, src.ID); err == nil && res.Error == "" {
+		t.Fatalf("a contributor's source synced a private repository: %+v", res)
+	}
+	if _, err := svc.Inspect(ctx, "acme/skills", ""); err != nil {
+		t.Fatalf("admin inspect with the default token: %v", err)
 	}
 }
 
@@ -662,6 +819,34 @@ func TestApprovalInboxItem(t *testing.T) {
 		t.Fatalf("after the Inbox rejection: %+v", got)
 	}
 
+	// A question whose commit is no longer the waiting one: the Inbox
+	// approval makes the source live and leaves the new commit to a
+	// normal review question.
+	four, err := svc.CreateSource(ctx, "usr_contrib", SourceInput{URL: "acme/skills", Slug: "four", Path: "skills", Mode: ModeReview, PendingApproval: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fourPrev, err := svc.PreviewSource(ctx, four.ID)
+	if err != nil || fourPrev.SHA == "" || fourPrev.SkillCount != 2 {
+		t.Fatalf("preview of a stored source: %+v %v", fourPrev, err)
+	}
+	if err := ri.RequestApproval(ctx, *four, fourPrev, "Casey"); err != nil {
+		t.Fatal(err)
+	}
+	gh.commit("main", map[string]string{"skills/pr-review/checks.md": "pushed after the question\n"})
+	if res, err := svc.SyncNow(ctx, four.ID); err != nil || !res.Staged {
+		t.Fatalf("four sync: %+v %v", res, err)
+	}
+	rows, _ = ri.store.pendingForSource(ctx, proposalKindApproval, four.ID)
+	decide(rows[0].InboxID, "u_owner", reviewApprove)
+	fourNow, _ := svc.GetSource(ctx, four.ID)
+	if fourNow.Approval != ApprovalApproved || fourNow.ActiveVersionID != "" || fourNow.PendingVersionID == "" {
+		t.Fatalf("approval of a stale question: %+v", fourNow)
+	}
+	if open, err := ri.store.pendingReviews(ctx, four.ID, fourNow.PendingVersionID); err != nil || len(open) != 1 {
+		t.Fatalf("review question for the newer commit: %+v %v", open, err)
+	}
+
 	// Decided on the Skills page: the open question is withdrawn.
 	three, err := svc.CreateSource(ctx, "usr_contrib", SourceInput{URL: "acme/skills", Slug: "three", Path: "skills", Mode: ModeAuto, PendingApproval: true})
 	if err != nil {
@@ -671,7 +856,7 @@ func TestApprovalInboxItem(t *testing.T) {
 		t.Fatal(err)
 	}
 	rows, _ = ri.store.pendingForSource(ctx, proposalKindApproval, three.ID)
-	if _, err := svc.DecideApproval(ctx, "usr_admin", three.ID, true, ""); err != nil {
+	if _, err := svc.DecideApproval(ctx, "usr_admin", three.ID, true, "", ""); err != nil {
 		t.Fatal(err)
 	}
 	if err := ri.SettleApproval(ctx, three.ID, "approved on the Skills page"); err != nil {

@@ -116,7 +116,8 @@ func newSharingFixture(t *testing.T) (*skillsFixture, *skillhub.Service, *skillh
 	}
 	f := &skillsFixture{
 		db: db, aud: audit.New(db), pol: policy.New(db), props: &fakeProposals{}, hosts: &fakeHosts{on: map[string]bool{}},
-		res: &fakeResolver{scopes: map[string]access.Scope{"ag_member": groups(), "ag_admin": {All: true}, "ag_blk": groups()}},
+		res: &fakeResolver{scopes: map[string]access.Scope{"ag_member": groups(), "ag_admin": {All: true}, "ag_blk": groups(),
+			"dashboard:u_admin": {All: true}, "voice:u_admin": {All: true}}},
 	}
 	f.gw = New(Options{
 		Policy: f.pol, Approval: bus, Audit: f.aud, Hub: realtime.NewHub(), Memory: memory.New(db), Access: f.res,
@@ -262,5 +263,34 @@ func TestBlockedPersonOnEveryAgentPath(t *testing.T) {
 	// Another member is unaffected.
 	if res := f.call(t, f.member, SkillsGetTool, map[string]any{"skill": sharingOpen}); res.IsError {
 		t.Fatalf("member get: %s", textOf(res))
+	}
+}
+
+// An operator token's CLI (which runs tools as "dashboard:<uid>") and the
+// voice assistant act for the person like an agent: they do not see a
+// skill shared with nobody, as the person in their own dashboard page
+// does.
+func TestDelegatedCallersDoNotSeeNobody(t *testing.T) {
+	f, svc, src := newSharingFixture(t)
+	if _, err := svc.SetSkillSharing(context.Background(), "u_admin", src.ID, "secret", skillhub.SkillSharing{Mode: skillhub.VisibleNobody}); err != nil {
+		t.Fatal(err)
+	}
+	bg := context.Background()
+	raiser := func(kind string) actor.Raiser {
+		return actor.Raiser{CallerID: "dashboard:u_admin", AgentKind: "dashboard", OwnerUserID: "u_admin", ClientKind: kind, Via: kind}
+	}
+	browser := actor.WithRaiser(WithAgentID(bg, "dashboard:u_admin"), raiser("browser"))
+	cli := actor.WithRaiser(WithAgentID(bg, "dashboard:u_admin"), raiser("cli"))
+	voice := WithAgentID(bg, "voice:u_admin")
+	if res := f.call(t, browser, SkillsGetTool, map[string]any{"skill": sharingHidden}); res.IsError {
+		t.Fatalf("the admin in their dashboard page: %s", textOf(res))
+	}
+	for name, ctx := range map[string]context.Context{"operator CLI": cli, "voice assistant": voice} {
+		if res := f.call(t, ctx, SkillsGetTool, map[string]any{"skill": sharingHidden}); !res.IsError {
+			t.Errorf("%s sees a skill shared with nobody: %s", name, textOf(res))
+		}
+		if res := f.call(t, ctx, SkillsGetTool, map[string]any{"skill": sharingOpen}); res.IsError {
+			t.Errorf("%s cannot read a shared skill: %s", name, textOf(res))
+		}
 	}
 }

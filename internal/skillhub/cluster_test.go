@@ -193,7 +193,7 @@ func TestTwoNodeSharingReload(t *testing.T) {
 	if sees(other, "skill://two/pr-review/SKILL.md") {
 		t.Fatal("node 2 shows a source pending approval")
 	}
-	if _, err := node1.DecideApproval(ctx, "usr_admin", two.ID, true, ""); err != nil {
+	if _, err := node1.DecideApproval(ctx, "usr_admin", two.ID, true, "", ""); err != nil {
 		t.Fatal(err)
 	}
 	waitFor("the approval did not arrive", func() bool { return sees(other, "skill://two/pr-review/SKILL.md") })
