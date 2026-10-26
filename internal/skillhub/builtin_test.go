@@ -283,12 +283,16 @@ func TestBuiltinUpgradeMakesOneVersion(t *testing.T) {
 	a := newBuiltinService(t, db, nil, v1)
 	b := newBuiltinService(t, db, nil, v1)
 	ctx := context.Background()
+	runCtx, cancel := context.WithCancel(ctx)
+	t.Cleanup(cancel)
 	var wg sync.WaitGroup
 	for _, svc := range []*Service{a, b} {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			startService(t, svc)
+			if err := svc.Start(runCtx); err != nil {
+				t.Error(err)
+			}
 		}()
 	}
 	wg.Wait()

@@ -234,7 +234,12 @@ func (s *Service) ensureBuiltin(ctx context.Context) (*SyncResult, error) {
 // installBuiltin is ensureBuiltin's work; the caller holds the lock.
 func (s *Service) installBuiltin(ctx context.Context, row *sourceRow, tree *builtinTree, res *SyncResult) error {
 	if row.ActiveSHA == tree.digest {
+		// Another replica made it live: serve it here too, in case its
+		// cluster message has not arrived (one small read when it has).
 		res.Unchanged, res.VersionID = true, row.ActiveVersionID
+		if err := s.reloadSource(ctx, row.ID); err != nil {
+			s.log.Warn("skillhub: reloading the built-in source failed", "err", err.Error())
+		}
 		return nil
 	}
 	cfg := row.configHash()
