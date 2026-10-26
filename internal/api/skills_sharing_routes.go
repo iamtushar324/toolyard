@@ -35,7 +35,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"log"
 	"net/http"
 	"strings"
@@ -152,10 +151,6 @@ func (s *Server) skillOwnedSource(w http.ResponseWriter, r *http.Request, m *ski
 	return src, true
 }
 
-// maxPendingContributorSources caps the sources one contributor may have
-// waiting for approval at once.
-const maxPendingContributorSources = 3
-
 // refuseContributor answers 403 contributor_limit with msg.
 func refuseContributor(w http.ResponseWriter, msg string) bool {
 	writeJSON(w, http.StatusForbidden, map[string]string{"error": msg, "code": "contributor_limit"})
@@ -215,7 +210,9 @@ func (s *Server) refuseContributorUpdate(w http.ResponseWriter, r *http.Request,
 }
 
 // refuseTooManyPending answers 409 when a contributor already has
-// maxPendingContributorSources sources waiting for approval.
+// skillhub.MaxPendingContributorSources sources waiting for approval: an
+// early answer, before the dry run. CreateSource enforces the cap itself,
+// under a cluster lock per contributor, so parallel creates cannot pass it.
 func (s *Server) refuseTooManyPending(w http.ResponseWriter, r *http.Request, m *skillManager) bool {
 	list, err := s.skillsAdmin.ListSources(r.Context())
 	if err != nil {
@@ -228,11 +225,10 @@ func (s *Server) refuseTooManyPending(w http.ResponseWriter, r *http.Request, m 
 			n++
 		}
 	}
-	if n < maxPendingContributorSources {
+	if n < skillhub.MaxPendingContributorSources {
 		return false
 	}
-	writeJSON(w, http.StatusConflict, map[string]string{
-		"error": fmt.Sprintf("you already have %d sources waiting for an admin's approval; wait for a decision, or delete one", n), "code": "conflict"})
+	writeJSON(w, http.StatusConflict, map[string]string{"error": skillhub.TooManyPendingMessage(n), "code": "conflict"})
 	return true
 }
 

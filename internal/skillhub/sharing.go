@@ -29,6 +29,28 @@ var (
 // maxApprovalNote caps a rejection's reason.
 const maxApprovalNote = 2000
 
+// MaxPendingContributorSources caps the sources one skill contributor may
+// have waiting for approval at once. CreateSource enforces it under a
+// cluster lock per contributor, so parallel creates (on any replica)
+// cannot pass it.
+const MaxPendingContributorSources = 3
+
+// pendingSourcesOf counts the sources userID added that wait for approval.
+func (s *Service) pendingSourcesOf(ctx context.Context, userID string) (int, error) {
+	var n int64
+	if err := s.db.QueryRowContext(ctx, `SELECT COUNT(*) FROM skill_sources WHERE created_by = ? AND approval = ?`,
+		userID, string(ApprovalPending)).Scan(&n); err != nil {
+		return 0, fmt.Errorf("skillhub: count waiting sources: %w", err)
+	}
+	return int(n), nil
+}
+
+// TooManyPendingMessage is the refusal of a contributor's create past
+// MaxPendingContributorSources.
+func TooManyPendingMessage(n int) string {
+	return fmt.Sprintf("you already have %d sources waiting for an admin's approval; wait for a decision, or delete one", n)
+}
+
 // skillShares reads a source's per-skill sharing settings, by skill path.
 func (s *Service) skillShares(ctx context.Context, sourceID string) (map[string]SkillSharing, error) {
 	rows, err := s.db.QueryContext(ctx, `SELECT skill_path, mode, members_json, blocked_json FROM skill_sharing WHERE source_id = ?`, sourceID)

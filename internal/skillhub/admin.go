@@ -361,7 +361,10 @@ func (s *Service) previewRow(ctx context.Context, r *sourceRow, gh *ghClient) (*
 
 // CreateSource stores a new source. Its first check is due at once: the
 // leader's poll loop runs it within moments, or call SyncNow for a sync on
-// this node.
+// this node. A skill contributor's source (PendingApproval) is refused
+// with ErrConflict when they already have MaxPendingContributorSources
+// waiting: the count and the insert run under a cluster lock per
+// contributor, so parallel creates on any replica cannot pass the cap.
 func (s *Service) CreateSource(ctx context.Context, by string, in SourceInput) (*Source, error) {
 	r, gh, err := s.prepareSource(ctx, by, in)
 	if err != nil {
@@ -371,6 +374,21 @@ func (s *Service) CreateSource(ctx context.Context, by string, in SourceInput) (
 	if gh.token != "" && r.Auth == AuthToken {
 		if r.tokenSealed, err = s.seal(gh.token, tokenAAD(r.ID)); err != nil {
 			return nil, err
+		}
+	}
+	if in.PendingApproval {
+		lctx, unlock, err := s.cluster.LockCtx(ctx, "skillhub:contributor:"+by)
+		if err != nil {
+			return nil, fmt.Errorf("skillhub: lock the sources of %s: %w", by, err)
+		}
+		defer unlock()
+		ctx = lctx
+		n, err := s.pendingSourcesOf(ctx, by)
+		if err != nil {
+			return nil, err
+		}
+		if n >= MaxPendingContributorSources {
+			return nil, fmt.Errorf("%w: %s", ErrConflict, TooManyPendingMessage(n))
 		}
 	}
 	if err := s.insertWithSlug(ctx, r, strings.TrimSpace(in.Slug)); err != nil {
