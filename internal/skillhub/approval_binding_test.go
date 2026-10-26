@@ -9,6 +9,7 @@ import (
 	"context"
 	"errors"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/tusharbhardwaj/toolyard/internal/actor"
@@ -259,5 +260,119 @@ func TestPendingSourceFindsItsStagedVersionAgain(t *testing.T) {
 	ok, err := svc.DecideApproval(ctx, "usr_admin", src.ID, true, "", a.SHA)
 	if err != nil || ok.ActiveVersionID != a.VersionID {
 		t.Fatalf("approve the commit: %+v %v", ok, err)
+	}
+}
+
+// The approval question is never lost: an answer that cannot apply asks
+// again for the commit the source waits with (or, with nothing synced yet,
+// the sync that stages one asks); a check with no open question asks; a
+// newer commit is asked about while an answer is applied; parallel asks
+// add one question.
+func TestApprovalQuestionIsNeverLost(t *testing.T) {
+	gh := newFakeGitHub(t, "acme", "skills")
+	first := gh.commit("main", baseTree())
+	svc := newTestService(t, gh, trustAcme)
+	ri, ib := newApprovalInbox(t, svc)
+	ctx := context.Background()
+	src, err := svc.CreateSource(ctx, "usr_contrib", SourceInput{URL: "acme/skills", Path: "skills", Mode: ModeAuto, PendingApproval: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	open := func() []proposalRow {
+		t.Helper()
+		rows, err := ri.store.pendingForSource(ctx, proposalKindApproval, src.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return rows
+	}
+	shows := func(rows []proposalRow, sha string) bool {
+		return len(rows) == 1 && strings.Contains(rows[0].Input, sha) && strings.Contains(rows[0].Input, "Casey")
+	}
+	// The owner approves before the first sync: refused (nothing synced),
+	// and there is nothing to ask about yet.
+	if err := ri.RequestApproval(ctx, *src, &Preview{SHA: first, SkillCount: 2}, "Casey"); err != nil {
+		t.Fatal(err)
+	}
+	rows := open()
+	if !shows(rows, first) {
+		t.Fatalf("first question: %+v", rows)
+	}
+	decideApprovalItem(t, ib, rows[0].InboxID, "u_owner", reviewApprove)
+	if r, _ := ri.store.get(ctx, rows[0].ID); r.Status != proposalCancelled {
+		t.Fatalf("an approval before the first sync: %+v", r)
+	}
+	if got, _ := svc.GetSource(ctx, src.ID); got.Approval != ApprovalPending {
+		t.Fatalf("approved with nothing synced: %+v", got)
+	}
+	// The first sync stages the commit and asks again; later checks add
+	// nothing.
+	res, err := svc.SyncNow(ctx, src.ID)
+	if err != nil || !res.Staged || res.SHA != first {
+		t.Fatalf("first sync: %+v %v", res, err)
+	}
+	if rows = open(); !shows(rows, first) {
+		t.Fatalf("question after the first sync: %+v", rows)
+	}
+	if _, err := svc.SyncNow(ctx, src.ID); err != nil {
+		t.Fatal(err)
+	}
+	if rows = open(); len(rows) != 1 {
+		t.Fatalf("a check asked twice: %+v", rows)
+	}
+	// An answer is being applied while a newer commit is staged: the
+	// answer is refused (another commit would go live) and the question
+	// is asked for the newer commit.
+	if ok, err := ri.store.move(ctx, rows[0].ID, []string{proposalPending}, proposalApproved, proposalUpdate{DecidedBy: "u_owner"}); err != nil || !ok {
+		t.Fatalf("claim the answer: %v %v", ok, err)
+	}
+	pushed := gh.commit("main", map[string]string{"skills/pr-review/checks.md": "pushed while the answer was applied\n"})
+	if res, err := svc.SyncNow(ctx, src.ID); err != nil || !res.Staged || res.SHA != pushed {
+		t.Fatalf("sync of the newer commit: %+v %v", res, err)
+	}
+	if rows := open(); len(rows) != 0 {
+		t.Fatalf("asked while an answer was applied: %+v", rows)
+	}
+	claimed, err := ri.store.get(ctx, rows[0].ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ri.applyApproval(ctx, svc, claimed, "u_owner", "inbox"); !errors.Is(err, ErrConflict) {
+		t.Fatalf("an answer for the older commit: %v", err)
+	}
+	if rows = open(); !shows(rows, pushed) {
+		t.Fatalf("question after a refused answer: %+v", rows)
+	}
+	// The question closed out of band: the next check asks again.
+	if err := ri.SettleApproval(ctx, src.ID, "withdrawn by the test"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.SyncNow(ctx, src.ID); err != nil {
+		t.Fatal(err)
+	}
+	if rows = open(); !shows(rows, pushed) {
+		t.Fatalf("question after a check with none open: %+v", rows)
+	}
+	// Parallel asks add one question.
+	if err := ri.SettleApproval(ctx, src.ID, "withdrawn by the test"); err != nil {
+		t.Fatal(err)
+	}
+	cur, _ := svc.GetSource(ctx, src.ID)
+	var wg sync.WaitGroup
+	for i := 0; i < 6; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_ = ri.RequestApproval(ctx, *cur, &Preview{SHA: pushed, SkillCount: 2}, "Casey")
+		}()
+	}
+	wg.Wait()
+	if rows = open(); !shows(rows, pushed) {
+		t.Fatalf("parallel asks: %+v", rows)
+	}
+	// Approving that question makes the waiting commit live.
+	decideApprovalItem(t, ib, rows[0].InboxID, "u_owner", reviewApprove)
+	if got, _ := svc.GetSource(ctx, src.ID); got.Approval != ApprovalApproved || got.ActiveSHA != pushed {
+		t.Fatalf("after the approval: %+v", got)
 	}
 }

@@ -12,6 +12,7 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"strings"
 	"time"
 
@@ -214,6 +215,76 @@ func (st proposalStore) openReviewFor(ctx context.Context, sourceID, versionID s
 func (st proposalStore) remove(ctx context.Context, id string) error {
 	_, err := st.db.ExecContext(ctx, `DELETE FROM skill_proposals WHERE id = ?`, id)
 	return err
+}
+
+// insertIfNoneOpen inserts row (about row.SourceID) unless that source has
+// a row of row.Kind that is open (pending, or approved and being applied),
+// the rows in except left aside, and reports whether it inserted. The
+// count and the insert run in one transaction that holds the source's row
+// (FOR UPDATE on Postgres; SQLite has one writer), so two callers on any
+// replica never both add one. A source that is gone is ErrNotFound.
+func (st proposalStore) insertIfNoneOpen(ctx context.Context, row *proposalRow, except []string) (bool, error) {
+	tx, err := st.db.BeginTx(ctx, nil)
+	if err != nil {
+		return false, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	var id string
+	err = tx.QueryRowContext(ctx, `SELECT id FROM skill_sources WHERE id = ?`+st.db.Dialect.ForUpdate(), row.SourceID).Scan(&id)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, fmt.Errorf("%w: source %s", ErrNotFound, row.SourceID)
+	}
+	if err != nil {
+		return false, err
+	}
+	q := `SELECT COUNT(*) FROM skill_proposals WHERE kind = ? AND source_id = ? AND status IN (?, ?)`
+	args := []any{row.Kind, row.SourceID, proposalPending, proposalApproved}
+	if len(except) > 0 {
+		q += ` AND id NOT IN (` + placeholders(len(except)) + `)`
+		for _, e := range except {
+			args = append(args, e)
+		}
+	}
+	var n int
+	if err := tx.QueryRowContext(ctx, q, args...).Scan(&n); err != nil {
+		return false, err
+	}
+	if n > 0 {
+		return false, nil
+	}
+	now := st.now().UnixMilli()
+	row.CreatedAt, row.UpdatedAt = now, now
+	if row.Input == "" {
+		row.Input = "{}"
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO skill_proposals(`+proposalColumns+`) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		row.ID, row.Kind, row.Status, row.AgentID, row.UserID, row.SourceID, row.VersionID, row.InboxID,
+		row.Input, row.Reason, row.Result, row.Error, row.DecidedBy, row.CreatedAt, row.UpdatedAt); err != nil {
+		return false, err
+	}
+	return true, tx.Commit()
+}
+
+// openForSource lists the open rows (pending, or approved and being
+// applied) of one kind about a source, oldest first.
+func (st proposalStore) openForSource(ctx context.Context, kind, sourceID string) ([]proposalRow, error) {
+	rows, err := st.db.QueryContext(ctx, `SELECT `+proposalColumns+` FROM skill_proposals WHERE kind = ? AND source_id = ? AND status IN (?, ?) ORDER BY created_at`,
+		kind, sourceID, proposalPending, proposalApproved)
+	if err != nil {
+		return nil, err
+	}
+	return collectProposals(rows)
+}
+
+// latestForSource is the newest row of one kind about a source, any
+// status, or nil.
+func (st proposalStore) latestForSource(ctx context.Context, kind, sourceID string) (*proposalRow, error) {
+	r, err := scanProposal(st.db.QueryRowContext(ctx, `SELECT `+proposalColumns+` FROM skill_proposals WHERE kind = ? AND source_id = ?
+		ORDER BY created_at DESC, id DESC LIMIT 1`, kind, sourceID))
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	return r, err
 }
 
 // pendingForSource lists the pending rows of one kind about a source.

@@ -768,7 +768,15 @@ func TestApprovalInboxItem(t *testing.T) {
 	admins := map[string]bool{"u_owner": true}
 	ri, err := NewReviewInbox(ReviewOptions{DB: svc.db, Inbox: ib, Admin: svc, DashboardURL: "https://toolyard.example",
 		IsAdmin:          func(_ context.Context, uid string) bool { return admins[uid] },
-		FallbackReviewer: func(context.Context) (string, error) { return "u_owner", nil }})
+		FallbackReviewer: func(context.Context) (string, error) { return "u_owner", nil },
+		// The sync asks the first question (no question is open yet); it
+		// names the contributor.
+		UserLabel: func(_ context.Context, uid string) string {
+			if uid == "usr_contrib" {
+				return "Casey Contributor"
+			}
+			return ""
+		}})
 	if err != nil {
 		t.Fatal(err)
 	}

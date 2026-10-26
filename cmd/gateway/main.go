@@ -1455,6 +1455,15 @@ func runServe(argv []string) error {
 		}
 		reviews, err := skillhub.NewReviewInbox(skillhub.ReviewOptions{DB: db, Inbox: inboxSvc, Admin: skillHubAdmin,
 			IsAdmin: skillHubIsAdmin, DashboardURL: *publicURL, Audit: auditSvc,
+			// An approval question the sync engine asks names who added
+			// the source.
+			UserLabel: func(ctx context.Context, userID string) string {
+				u, err := idSvc.GetUserByID(ctx, userID)
+				if err != nil {
+					return ""
+				}
+				return u.Label()
+			},
 			// A review goes to the owner when the source's creator is no
 			// longer an active admin.
 			FallbackReviewer: func(ctx context.Context) (string, error) {
