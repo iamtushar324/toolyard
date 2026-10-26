@@ -616,7 +616,7 @@ def main():
             r = msess.post(BASE + "/v1/skills/sources", json={"url": url, "mode": "review"}, timeout=60)
             check("a member who is not a contributor cannot add a source", r.status_code in (401, 403, 404), r.status_code)
             admin.j("PUT", "/v1/skills/admin/contributors/%s" % member_id)
-            r = msess.post(BASE + "/v1/skills/sources", json={"url": url, "mode": "review", "slug": "e2e-contrib"}, timeout=120)
+            r = msess.post(BASE + "/v1/skills/sources", json={"url": url, "mode": "auto", "slug": "e2e-contrib"}, timeout=120)
             body = r.json() if r.content else {}
             src = body.get("source", body)
             check("a contributor can add a source; it waits for approval", r.status_code in (200, 201) and src.get("approval") == "pending",
@@ -638,6 +638,10 @@ def main():
             vs = admin.j("GET", "/v1/skills/sources/%s/versions" % cid)
             vs = vs.get("versions", vs) if isinstance(vs, dict) else vs
             pend = next((v for v in vs or [] if v.get("id") == s.get("pending_version_id")), {})
+            check("a contributor's source in Auto mode waits: nothing is live before approval",
+                  bool(pend.get("sha")) and not s.get("active_version_id"), {"pending": pend.get("sha"), "active": s.get("active_sha")})
+            r = admin.req("POST", "/v1/skills/sources/%s/approval" % cid, json={"decision": "approve", "sha": "0" * 40})
+            check("an approval for another commit is refused", r.status_code == 409, r.status_code)
             admin.j("POST", "/v1/skills/sources/%s/approval" % cid, json={"decision": "approve", "sha": pend.get("sha", "")})
             s = admin.j("GET", "/v1/skills/sources/%s" % cid)
             s = s.get("source", s)
