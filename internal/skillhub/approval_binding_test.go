@@ -585,3 +585,197 @@ func TestPageApprovalIsBoundToTheVersionShown(t *testing.T) {
 		t.Fatalf("after the approval: %+v", got)
 	}
 }
+
+// An automatic source waits; an admin makes its staged version live; the
+// contributor changes the folder. An approval of the live version, by its
+// ID or by its commit only, is refused: the next sync would make the new
+// folder live unapproved.
+func TestApprovalRefusesALiveVersionWithOlderSettings(t *testing.T) {
+	gh := newFakeGitHub(t, "acme", "skills")
+	tree := baseTree()
+	tree["other/pr-review/SKILL.md"] = skillMD("pr-review", "Review a pull request, the other way.", "", "# Other\n")
+	gh.commit("main", tree)
+	svc := newTestService(t, gh, trustAcme)
+	ctx := context.Background()
+	src, err := svc.CreateSource(ctx, "usr_contrib", SourceInput{URL: "acme/skills", Path: "skills", Mode: ModeAuto, PendingApproval: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	a, err := svc.SyncNow(ctx, src.ID)
+	if err != nil || !a.Staged {
+		t.Fatalf("sync: %+v %v", a, err)
+	}
+	if err := svc.Activate(ctx, "usr_admin", src.ID, a.VersionID); err != nil {
+		t.Fatal(err)
+	}
+	other := "other"
+	if _, err := svc.UpdateSource(ctx, "usr_contrib", src.ID, SourceUpdate{Path: &other}); err != nil {
+		t.Fatal(err)
+	}
+	for name, bind := range map[string]ApprovalBinding{"version": {SHA: a.SHA, Version: a.VersionID}, "commit only": {SHA: a.SHA}} {
+		if _, err := svc.DecideApprovalFrom(ctx, "usr_admin", src.ID, ApprovalPending, true, "", bind); !errors.Is(err, ErrConflict) {
+			t.Fatalf("approval of a live version with older settings (%s): %v", name, err)
+		}
+	}
+	if got, _ := svc.GetSource(ctx, src.ID); got.Approval != ApprovalPending {
+		t.Fatalf("approved: %+v", got)
+	}
+}
+
+// A dry run of a branch the source no longer has (the branch changed twice
+// quickly) asks nothing; a dry run of the current branch asks.
+func TestDryRunOfAnotherBranchAsksNothing(t *testing.T) {
+	gh := newFakeGitHub(t, "acme", "skills")
+	gh.commit("main", baseTree())
+	gh.commit("dev", baseTree())
+	gh.commit("feature", baseTree())
+	svc := newTestService(t, gh, trustAcme)
+	ri, _ := newApprovalInbox(t, svc)
+	ctx := context.Background()
+	src, err := svc.CreateSource(ctx, "usr_contrib", SourceInput{URL: "acme/skills", Path: "skills", Mode: ModeReview, PendingApproval: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	branch := func(b string) {
+		t.Helper()
+		if _, err := svc.UpdateSource(ctx, "usr_contrib", src.ID, SourceUpdate{Branch: &b}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	branch("dev")
+	devPrev, err := svc.PreviewSource(ctx, src.ID)
+	if err != nil || devPrev.Source.Branch != "dev" {
+		t.Fatalf("dry run of dev: %+v %v", devPrev, err)
+	}
+	branch("feature")
+	cur, _ := svc.GetSource(ctx, src.ID)
+	if err := ri.RequestApproval(ctx, *cur, devPrev, "Casey"); err != nil {
+		t.Fatal(err)
+	}
+	if rows, _ := ri.store.pendingForSource(ctx, proposalKindApproval, src.ID); len(rows) != 0 {
+		t.Fatalf("a dry run of another branch asked: %+v", rows)
+	}
+	featurePrev, err := svc.PreviewSource(ctx, src.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ri.RequestApproval(ctx, *cur, featurePrev, "Casey"); err != nil {
+		t.Fatal(err)
+	}
+	if rows, _ := ri.store.pendingForSource(ctx, proposalKindApproval, src.ID); len(rows) != 1 {
+		t.Fatalf("a dry run of the current branch: %+v", rows)
+	}
+}
+
+// A question closed while its Inbox item is created keeps no item, and the
+// item is withdrawn; a question closed by a caller that read it before its
+// item was recorded withdraws the item too.
+func TestQuestionClosedWhileAskedWithdrawsItsItem(t *testing.T) {
+	gh := newFakeGitHub(t, "acme", "skills")
+	gh.commit("main", baseTree())
+	svc := newTestService(t, gh, trustAcme)
+	ri, ib := newApprovalInbox(t, svc)
+	ctx := context.Background()
+	src, err := svc.CreateSource(ctx, "usr_contrib", SourceInput{URL: "acme/skills", Path: "skills", Mode: ModeReview, PendingApproval: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	newRow := func() *proposalRow {
+		t.Helper()
+		row := ri.approvalRow("u_owner", src.ID, approvalInput{Contributor: "Casey"})
+		if err := ri.store.insert(ctx, row); err != nil {
+			t.Fatal(err)
+		}
+		return row
+	}
+	itemOf := func(rowID string) *inbox.Request {
+		t.Helper()
+		items, err := ib.List(ctx, inbox.ListFilter{AgentID: inbox.SystemAgentID("u_owner")})
+		if err != nil {
+			t.Fatal(err)
+		}
+		for i := range items {
+			if items[i].System != nil && items[i].System.Ref == rowID {
+				return &items[i]
+			}
+		}
+		t.Fatalf("no Inbox item for %s", rowID)
+		return nil
+	}
+	// Closed before its item is recorded.
+	closed := newRow()
+	if ok, err := ri.store.move(ctx, closed.ID, []string{proposalPending}, proposalCancelled, proposalUpdate{Error: "replaced"}); err != nil || !ok {
+		t.Fatalf("close: %v %v", ok, err)
+	}
+	if err := ri.approvalItem(ctx, closed, *src, nil, "Casey"); err != nil {
+		t.Fatal(err)
+	}
+	if r, _ := ri.store.get(ctx, closed.ID); r.InboxID != "" {
+		t.Fatalf("a closed question got an item: %+v", r)
+	}
+	if it := itemOf(closed.ID); it.Status != inbox.StatusCancelled {
+		t.Fatalf("the item of a closed question: %s", it.Status)
+	}
+	// Read by the closer before its item was recorded.
+	asked := newRow()
+	stale := *asked
+	if err := ri.approvalItem(ctx, asked, *src, nil, "Casey"); err != nil {
+		t.Fatal(err)
+	}
+	if err := ri.settleRows(ctx, []proposalRow{stale}, "replaced"); err != nil {
+		t.Fatal(err)
+	}
+	if it := itemOf(asked.ID); it.Status != inbox.StatusCancelled {
+		t.Fatalf("the item of a question closed from an older read: %s", it.Status)
+	}
+}
+
+// A pending source rolled back to an older version (nothing waits) whose
+// question names another version: the refused answer asks again about the
+// live version, and approving that question approves it.
+func TestRefusedAnswerAsksAboutTheLiveVersion(t *testing.T) {
+	gh := newFakeGitHub(t, "acme", "skills")
+	gh.commit("main", baseTree())
+	svc := newTestService(t, gh, trustAcme)
+	ri, ib := newApprovalInbox(t, svc)
+	ctx := context.Background()
+	src, err := svc.CreateSource(ctx, "usr_contrib", SourceInput{URL: "acme/skills", Path: "skills", Mode: ModeAuto, PendingApproval: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	r1, err := svc.SyncNow(ctx, src.ID)
+	if err != nil || !r1.Staged {
+		t.Fatalf("first sync: %+v %v", r1, err)
+	}
+	if err := svc.Activate(ctx, "usr_admin", src.ID, r1.VersionID); err != nil {
+		t.Fatal(err)
+	}
+	gh.commit("main", map[string]string{"skills/pr-review/checks.md": "a newer commit\n"})
+	l, err := svc.SyncNow(ctx, src.ID)
+	if err != nil || !l.Staged {
+		t.Fatalf("second sync: %+v %v", l, err)
+	}
+	if err := svc.Activate(ctx, "usr_admin", src.ID, l.VersionID); err != nil {
+		t.Fatal(err)
+	}
+	rows, _ := ri.store.pendingForSource(ctx, proposalKindApproval, src.ID)
+	if len(rows) != 1 || parseApprovalInput(rows[0].Input).Version != l.VersionID {
+		t.Fatalf("question about the newer version: %+v", rows)
+	}
+	// The admin rolls back to the first version: nothing waits.
+	if err := svc.Activate(ctx, "usr_admin", src.ID, r1.VersionID); err != nil {
+		t.Fatal(err)
+	}
+	decideApprovalItem(t, ib, rows[0].InboxID, "u_owner", reviewApprove)
+	if r, _ := ri.store.get(ctx, rows[0].ID); r.Status != proposalCancelled {
+		t.Fatalf("an answer about a version no longer live: %+v", r)
+	}
+	rows, _ = ri.store.pendingForSource(ctx, proposalKindApproval, src.ID)
+	if len(rows) != 1 || parseApprovalInput(rows[0].Input).Version != r1.VersionID {
+		t.Fatalf("question asked again about the live version: %+v", rows)
+	}
+	decideApprovalItem(t, ib, rows[0].InboxID, "u_owner", reviewApprove)
+	if got, _ := svc.GetSource(ctx, src.ID); got.Approval != ApprovalApproved || got.ActiveVersionID != r1.VersionID {
+		t.Fatalf("after approving the live version: %+v", got)
+	}
+}

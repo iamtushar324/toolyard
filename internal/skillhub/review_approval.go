@@ -71,6 +71,16 @@ func (in approvalInput) currentFor(w *versionRow, cfg string) bool {
 	return in.Config == cfg && strings.EqualFold(in.SHA, w.SHA)
 }
 
+// approvalSubject is the version approving a contributor's source would
+// make (or keep) live: the waiting one, else the live one an admin made
+// live while the source waits.
+func approvalSubject(waiting, live *versionRow) *versionRow {
+	if waiting != nil {
+		return waiting
+	}
+	return live
+}
+
 // versionPreview is the counts and warnings of version v, as an approval
 // question shows them.
 func versionPreview(src Source, v *versionRow) *Preview {
@@ -83,11 +93,13 @@ func versionPreview(src Source, v *versionRow) *Preview {
 // source that waits for approval. prev is the dry run the contributor's
 // add (or change) was checked with: it must be of the settings the source
 // has now, else nothing is asked (a newer change asks). nil asks about the
-// waiting version, when the source has a current one, else with unknown
-// counts. contributor names who added it. A source that already has an
-// open question (waiting, or an answer being applied) gets no second one,
-// on any replica. The question shows the source as it is when it is
-// asked.
+// waiting version, else the live one (when it was built with the source's
+// current settings; one built with older settings asks nothing: the check
+// that stages the current version asks), and with unknown counts when the
+// source has neither. contributor names who added it. A source that
+// already has an open question (waiting, or an answer being applied) gets
+// no second one, on any replica. The question shows the source as it is
+// when it is asked.
 func (ri *ReviewInbox) RequestApproval(ctx context.Context, src Source, prev *Preview, contributor string) error {
 	if src.Approval != ApprovalPending {
 		return fmt.Errorf("%w: source %s does not wait for approval", ErrInvalid, src.Slug)
@@ -98,22 +110,25 @@ func (ri *ReviewInbox) RequestApproval(ctx context.Context, src Source, prev *Pr
 	}
 	var shown Source
 	var card *Preview
-	row, err := ri.store.lockedApproval(ctx, src.ID, func(cur *sourceRow, w *versionRow, open []proposalRow) *proposalRow {
+	row, err := ri.store.lockedApproval(ctx, src.ID, func(cur *sourceRow, w, live *versionRow, open []proposalRow) *proposalRow {
 		if cur.Approval != ApprovalPending || len(open) > 0 {
 			return nil
 		}
 		cfg := cur.configHash()
 		in := approvalInput{Contributor: contributor}
+		subject := approvalSubject(w, live)
 		switch {
 		case prev != nil:
-			if configOf(prev.Source) != cfg {
-				return nil // a dry run of settings the source no longer has
+			if configOf(prev.Source) != cfg || prev.Source.Branch != cur.Branch || prev.Source.PinnedSHA != cur.PinnedSHA {
+				return nil // a dry run of a branch or settings the source no longer has
 			}
 			in.SHA, in.Skills, in.Warnings, in.Config = prev.SHA, prev.SkillCount, len(prev.Warnings), cfg
 			card = prev
-		case w != nil && w.config == cfg:
-			in.SHA, in.Skills, in.Warnings, in.Version, in.Config = w.SHA, w.SkillCount, len(w.Warnings), w.ID, cfg
-			card = versionPreview(cur.Source, w)
+		case subject != nil && subject.config == cfg:
+			in.SHA, in.Skills, in.Warnings, in.Version, in.Config = subject.SHA, subject.SkillCount, len(subject.Warnings), subject.ID, cfg
+			card = versionPreview(cur.Source, subject)
+		case subject != nil:
+			return nil // built with older settings: the check that stages the current version asks
 		}
 		shown = cur.Source
 		return ri.approvalRow(reviewer, cur.ID, in)
@@ -156,7 +171,17 @@ func (ri *ReviewInbox) approvalItem(ctx context.Context, row *proposalRow, src S
 		_ = ri.store.remove(ctx, row.ID)
 		return fmt.Errorf("skillhub: approval item for %s: %w", src.Slug, err)
 	}
-	return ri.store.setInbox(ctx, row.ID, item.ID)
+	ok, err := ri.store.setInboxIfPending(ctx, row.ID, item.ID)
+	if err != nil || ok {
+		return err
+	}
+	// The row was closed while its item was being created: withdraw the
+	// item, which nobody else knows of.
+	if _, err := ri.o.Inbox.CancelBySystem(ctx, inbox.SystemAgentID(row.UserID), item.ID, "this question was closed while it was asked"); err != nil &&
+		!errors.Is(err, inbox.ErrNotPending) && !errors.Is(err, inbox.ErrNotFound) {
+		return err
+	}
+	return nil
 }
 
 var _ ApprovalHook = (*ReviewInbox)(nil)
@@ -166,8 +191,9 @@ var _ ApprovalHook = (*ReviewInbox)(nil)
 // sync stages a version, or finds one still waiting, so at every check).
 // src and v are what the caller read and may be outdated: under the
 // source's row lock (lockedApproval) the source is read again, and nothing
-// is asked unless v is still its waiting version, built with the settings
-// it has now (else the check that reads the current version asks). An
+// is asked unless v is still its waiting version (or, with nothing
+// waiting, its live version: approvalSubject), built with the settings it
+// has now (else the check that reads the current version asks). An
 // approval is bound to the question's version, so the source keeps one
 // open question that shows its waiting version, as it is now:
 //
@@ -204,8 +230,9 @@ func (ri *ReviewInbox) PendingApprovalVersion(ctx context.Context, src Source, v
 		card    *Preview
 		who     string
 	)
-	row, err := ri.store.lockedApproval(ctx, src.ID, func(cur *sourceRow, w *versionRow, open []proposalRow) *proposalRow {
+	row, err := ri.store.lockedApproval(ctx, src.ID, func(cur *sourceRow, waiting, live *versionRow, open []proposalRow) *proposalRow {
 		cfg := cur.configHash()
+		w := approvalSubject(waiting, live)
 		if cur.Approval != ApprovalPending || w == nil || w.ID != v.ID || w.config != cfg {
 			return nil
 		}
@@ -251,18 +278,26 @@ func (ri *ReviewInbox) PendingApprovalVersion(ctx context.Context, src Source, v
 }
 
 // askAgainForWaiting asks the approval question again, for its waiting
-// version, of a source that still waits after an answer could not apply
-// (another commit or other settings would go live). With no waiting
-// version (nothing synced yet), or one built with settings the source no
-// longer has, nothing is asked now: the sync that stages the current
-// version asks (PendingApprovalVersion). A failure is left to the next
-// check, which asks when no question is open.
+// version (else its live one, which an admin made live while it waits), of
+// a source that still waits after an answer could not apply (another
+// commit or other settings would go live). With no such version (nothing
+// synced yet), or one built with settings the source no longer has,
+// nothing is asked now: the sync that stages the current version asks
+// (PendingApprovalVersion; a settings change makes that check due). A
+// failure is left to the next check, which asks when no question is open.
 func (ri *ReviewInbox) askAgainForWaiting(ctx context.Context, sourceID string) {
 	src, err := ri.o.Admin.GetSource(ctx, sourceID)
-	if err != nil || src.Approval != ApprovalPending || src.PendingVersionID == "" {
+	if err != nil || src.Approval != ApprovalPending {
 		return
 	}
-	v, err := ri.o.Admin.GetVersion(ctx, sourceID, src.PendingVersionID)
+	id := src.PendingVersionID
+	if id == "" {
+		id = src.ActiveVersionID
+	}
+	if id == "" {
+		return
+	}
+	v, err := ri.o.Admin.GetVersion(ctx, sourceID, id)
 	if err != nil {
 		return
 	}

@@ -66,10 +66,18 @@ func closeProposalRows(ctx context.Context, st proposalStore, ib *inbox.Service,
 		if err != nil {
 			return err
 		}
-		if !moved || row.InboxID == "" {
+		inboxID := row.InboxID
+		if moved && inboxID == "" {
+			// Read before its item was recorded: the item may be recorded
+			// now (an asker records it only while the row is pending).
+			if cur, err := st.get(ctx, row.ID); err == nil {
+				inboxID = cur.InboxID
+			}
+		}
+		if !moved || inboxID == "" {
 			continue
 		}
-		if _, err := ib.CancelBySystem(ctx, inbox.SystemAgentID(row.UserID), row.InboxID, reason); err != nil &&
+		if _, err := ib.CancelBySystem(ctx, inbox.SystemAgentID(row.UserID), inboxID, reason); err != nil &&
 			!errors.Is(err, inbox.ErrNotPending) && !errors.Is(err, inbox.ErrNotFound) {
 			return err
 		}

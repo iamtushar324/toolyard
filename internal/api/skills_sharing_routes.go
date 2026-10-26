@@ -487,7 +487,8 @@ func sourceSharingChanged(a, b *skillhub.Source) bool {
 // the open Inbox question. An approval is bound to the version the page
 // showed: sha and version_id (the dashboard always sends both: the
 // waiting version's, else the live one's). Without version_id (an API
-// client) it is bound to the commit with the source's current settings.
+// client) it is bound to the commit, and for an automatic or pinned source
+// the version that goes live must have the source's current settings.
 // When another version would go live, or the source was decided meanwhile,
 // it answers 409, and a source that still waits keeps (or gets) its
 // approval question for the version it waits with.
@@ -562,16 +563,17 @@ func (s *Server) skillDecideApproval(w http.ResponseWriter, r *http.Request, m *
 
 // askAgainAfterRefusal makes sure a source whose approval on the page was
 // refused (another version would go live) still has an approval question
-// when it waits with a version: the open one stays (it follows the waiting
-// version at every check), else one is asked about the waiting version.
-// Best effort: the next check of the source asks too.
+// when it has a waiting version, or else a live one: the open one stays (it
+// follows that version at every check), else one is asked about it (none
+// when it was built with older settings: the check that stages the current
+// version asks). Best effort: the next check of the source asks too.
 func (s *Server) askAgainAfterRefusal(ctx context.Context, id string) {
 	ap, ok := s.skillReviews.(skillApprovals)
 	if !ok {
 		return
 	}
 	src, err := s.skillsAdmin.GetSource(ctx, id)
-	if err != nil || src.Approval != skillhub.ApprovalPending || src.PendingVersionID == "" {
+	if err != nil || src.Approval != skillhub.ApprovalPending || (src.PendingVersionID == "" && src.ActiveVersionID == "") {
 		return
 	}
 	who := src.CreatedBy

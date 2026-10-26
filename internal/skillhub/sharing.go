@@ -238,8 +238,9 @@ func (s *Service) decideApproval(ctx context.Context, by, id string, from *Appro
 //     live. Of an automatic or pinned source, the next check would make
 //     it live: the approval is refused (ErrConflict).
 //   - Otherwise a live version that does not match b is refused, and so
-//     is an automatic or pinned source that synced nothing yet (its first
-//     sync would make an unseen commit live).
+//     is an automatic or pinned source that synced nothing yet, or whose
+//     live version was built with settings it no longer has (its next
+//     sync would make an unseen version live).
 //
 // The approval is stored only while the source still has the live and
 // waiting versions this checked, so a sync in between cannot slip in a
@@ -260,11 +261,9 @@ func (s *Service) approveSource(ctx context.Context, by string, r *sourceRow, b 
 	if err != nil {
 		return nil, err
 	}
-	var live *versionRow
-	if b.Version != "" || b.Config != "" {
-		if live, err = version(r.ActiveVersionID); err != nil {
-			return nil, err
-		}
+	live, err := version(r.ActiveVersionID)
+	if err != nil {
+		return nil, err
 	}
 	// bound reports a version that is what the approver saw.
 	bound := func(v *versionRow) bool {
@@ -286,6 +285,10 @@ func (s *Service) approveSource(ctx context.Context, by string, r *sourceRow, b 
 	case live != nil && !bound(live):
 		return nil, fmt.Errorf("%w: source %s serves commit %s with other settings than the approval showed; look at it on the Skills page and approve that",
 			ErrConflict, r.Slug, reviewShort(live.SHA))
+	case waiting == nil && live != nil && r.Mode != ModeReview && live.config != r.configHash():
+		// Its live version was built with settings it no longer has: the
+		// next check builds the current ones and would make them live.
+		return nil, fmt.Errorf("%w: source %s serves commit %s built with settings it no longer has; approve it after its next sync", ErrConflict, r.Slug, reviewShort(live.SHA))
 	case r.ActiveVersionID == "" && waiting == nil && r.Mode != ModeReview:
 		return nil, fmt.Errorf("%w: source %s has synced no commit yet; approve it after its first sync", ErrConflict, r.Slug)
 	}

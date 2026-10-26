@@ -184,6 +184,12 @@ func (s *Service) syncKnown(ctx context.Context, row *sourceRow, known *versionR
 	activate := false
 	switch {
 	case known.Status == VersionActive:
+		if !row.Approval.Live() && row.PendingVersionID == "" {
+			// A contributor's waiting source whose live version (an admin
+			// made it live) is the head, with nothing waiting: its approval
+			// question follows that version.
+			s.notifyReview(ctx, row, known)
+		}
 	case known.Status == VersionFailed && req.tr == triggerManual:
 		// "Sync now" tries a failed commit again.
 		if err := s.dropVersion(ctx, known.ID); err != nil {

@@ -110,6 +110,20 @@ func (st proposalStore) setInbox(ctx context.Context, id, inboxID string) error 
 	return err
 }
 
+// setInboxIfPending records a row's Inbox item while the row is still
+// pending, and reports whether it did: a row closed while its item was
+// being created (another check replaced it, the source was decided) keeps
+// no item, and the caller withdraws the item.
+func (st proposalStore) setInboxIfPending(ctx context.Context, id, inboxID string) (bool, error) {
+	res, err := st.db.ExecContext(ctx, `UPDATE skill_proposals SET inbox_id = ?, updated_at = ? WHERE id = ? AND status = ?`,
+		inboxID, st.now().UnixMilli(), id, proposalPending)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	return n == 1, err
+}
+
 // move changes a row's status from one of from to to, and reports whether
 // it did (false: the row was not in one of those statuses, for example a
 // decision another path already applied).
@@ -219,15 +233,15 @@ func (st proposalStore) remove(ctx context.Context, id string) error {
 
 // lockedApproval runs decide in one transaction that holds the row of
 // source sourceID (FOR UPDATE on Postgres; SQLite has one writer), with
-// the source as it is now, its waiting version (nil when none) and its
-// open approval rows (pending, or approved and being applied). A row
+// the source as it is now, its waiting and live versions (nil when none)
+// and its open approval rows (pending, or approved and being applied). A row
 // decide returns is inserted in the same transaction and returned: two
 // askers on any replica never both add a question, and none adds one
 // that shows the source otherwise than it is. decide must not use the
 // database (on SQLite the transaction holds the only connection). A
 // source that is gone is ErrNotFound.
 func (st proposalStore) lockedApproval(ctx context.Context, sourceID string,
-	decide func(src *sourceRow, waiting *versionRow, open []proposalRow) *proposalRow) (*proposalRow, error) {
+	decide func(src *sourceRow, waiting, live *versionRow, open []proposalRow) *proposalRow) (*proposalRow, error) {
 	tx, err := st.db.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, err
@@ -245,16 +259,23 @@ func (st proposalStore) lockedApproval(ctx context.Context, sourceID string,
 	if err != nil {
 		return nil, err
 	}
-	var waiting *versionRow
-	if src.PendingVersionID != "" {
-		v, err := scanVersion(tx.QueryRowContext(ctx, `SELECT `+versionColumns+` FROM skill_versions WHERE id = ? AND source_id = ?`,
-			src.PendingVersionID, sourceID))
-		switch {
-		case err == nil:
-			waiting = v
-		case !errors.Is(err, sql.ErrNoRows):
-			return nil, err
+	version := func(id string) (*versionRow, error) {
+		if id == "" {
+			return nil, nil
 		}
+		v, err := scanVersion(tx.QueryRowContext(ctx, `SELECT `+versionColumns+` FROM skill_versions WHERE id = ? AND source_id = ?`, id, sourceID))
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil
+		}
+		return v, err
+	}
+	waiting, err := version(src.PendingVersionID)
+	if err != nil {
+		return nil, err
+	}
+	live, err := version(src.ActiveVersionID)
+	if err != nil {
+		return nil, err
 	}
 	rows, err := tx.QueryContext(ctx, `SELECT `+proposalColumns+` FROM skill_proposals WHERE kind = ? AND source_id = ? AND status IN (?, ?) ORDER BY created_at`,
 		proposalKindApproval, sourceID, proposalPending, proposalApproved)
@@ -265,7 +286,7 @@ func (st proposalStore) lockedApproval(ctx context.Context, sourceID string,
 	if err != nil {
 		return nil, err
 	}
-	row := decide(src, waiting, open)
+	row := decide(src, waiting, live, open)
 	if row == nil {
 		return nil, nil
 	}
