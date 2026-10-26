@@ -197,10 +197,25 @@ func (s *Service) syncKnown(ctx context.Context, row *sourceRow, known *versionR
 		// A skill contributor's source that is not approved makes no
 		// commit live, whatever its mode (as review mode: a new commit
 		// waits, syncLocked). The waiting version tells the hook again,
-		// so an approval question that shows another commit is asked
-		// again for this one.
-		if known.Status == VersionStaged && known.ID == row.PendingVersionID {
+		// so an approval question that shows another commit, or no open
+		// question, is asked again for this one.
+		switch {
+		case known.Status == VersionStaged && known.ID == row.PendingVersionID:
 			s.notifyReview(ctx, row, known)
+		case known.Status == VersionStaged:
+			// A staged version of the commit and settings the source has
+			// now that is not the waiting one (the folder went A, B, A with
+			// no new commit): it becomes the waiting version again, so an
+			// approval of this commit has the version it would serve.
+			err := s.stage(ctx, row, known)
+			switch {
+			case errors.Is(err, errSourceChanged):
+			case err != nil:
+				return res, out, err
+			default:
+				res.Staged = true
+				return res, out, nil
+			}
 		}
 	case row.Mode == ModePinned:
 		// A pinned source serves its commit whatever happened to it.

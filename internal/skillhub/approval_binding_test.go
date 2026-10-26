@@ -218,3 +218,46 @@ func TestInboxAnswerNeverUndoesAPageDecision(t *testing.T) {
 		t.Fatalf("decide from pending an approved source: %v", err)
 	}
 }
+
+// A waiting source whose folder goes A, B and back to A with no new commit
+// finds A's staged version again: it becomes the waiting version again,
+// so approving the commit serves the folder the source has now.
+func TestPendingSourceFindsItsStagedVersionAgain(t *testing.T) {
+	gh := newFakeGitHub(t, "acme", "skills")
+	tree := baseTree()
+	tree["other/pr-review/SKILL.md"] = skillMD("pr-review", "Review a pull request, the other way.", "", "# Other\n")
+	gh.commit("main", tree)
+	svc := newTestService(t, gh, trustAcme)
+	ctx := context.Background()
+	src, err := svc.CreateSource(ctx, "usr_contrib", SourceInput{URL: "acme/skills", Path: "skills", Mode: ModeAuto, PendingApproval: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	a, err := svc.SyncNow(ctx, src.ID)
+	if err != nil || !a.Staged {
+		t.Fatalf("sync of folder skills: %+v %v", a, err)
+	}
+	folder := func(p string) {
+		t.Helper()
+		if _, err := svc.UpdateSource(ctx, "usr_contrib", src.ID, SourceUpdate{Path: &p}); err != nil {
+			t.Fatal(err)
+		}
+	}
+	folder("other")
+	b, err := svc.SyncNow(ctx, src.ID)
+	if err != nil || !b.Staged || b.VersionID == a.VersionID || b.SHA != a.SHA {
+		t.Fatalf("sync of folder other: %+v %v (first %+v)", b, err, a)
+	}
+	folder("skills")
+	again, err := svc.SyncNow(ctx, src.ID)
+	if err != nil || !again.Staged || again.VersionID != a.VersionID {
+		t.Fatalf("sync back to folder skills: %+v %v, want version %s waiting", again, err, a.VersionID)
+	}
+	if got, _ := svc.GetSource(ctx, src.ID); got.PendingVersionID != a.VersionID {
+		t.Fatalf("waiting version %q, want %q", got.PendingVersionID, a.VersionID)
+	}
+	ok, err := svc.DecideApproval(ctx, "usr_admin", src.ID, true, "", a.SHA)
+	if err != nil || ok.ActiveVersionID != a.VersionID {
+		t.Fatalf("approve the commit: %+v %v", ok, err)
+	}
+}
