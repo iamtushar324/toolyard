@@ -44,16 +44,44 @@ const (
 	AuthGitHub AuthMode = "github"
 )
 
-// Visibility says who sees a source's skills. Admins and the owner always
-// see every source; an agent sees what its owner sees.
+// Visibility is the audience of a source, or of one skill (SkillSharing).
+// Admins and the owner see every skill whose audience is not nobody; an
+// agent sees what its owner sees. See the sharing rule in index.go
+// (srcIndex.skillVisible).
 type Visibility string
 
 const (
-	// VisibleEveryone shows the source to every active member.
+	// VisibleEveryone shows the skills to every active member.
 	VisibleEveryone Visibility = "everyone"
-	// VisibleMembers shows the source only to Source.Members.
+	// VisibleMembers shows the skills only to the listed members.
 	VisibleMembers Visibility = "members"
+	// VisibleNobody hides the skills from every agent: only admins and the
+	// source's creator see them, in the dashboard.
+	VisibleNobody Visibility = "nobody"
+	// VisibleInherit is a skill's own setting that follows its source's
+	// audience (SkillSharing.Mode).
+	VisibleInherit Visibility = ""
 )
+
+// Approval is where a skill contributor's source stands with the admins.
+// Agents see nothing of a source that is pending or rejected.
+type Approval string
+
+const (
+	// ApprovalNone is a source an admin added: nothing to approve.
+	ApprovalNone Approval = ""
+	// ApprovalPending is a contributor's source that waits for an admin:
+	// it syncs, and agents see nothing of it.
+	ApprovalPending Approval = "pending"
+	// ApprovalApproved is a contributor's source an admin approved.
+	ApprovalApproved Approval = "approved"
+	// ApprovalRejected is a contributor's source an admin rejected; it is
+	// disabled.
+	ApprovalRejected Approval = "rejected"
+)
+
+// Live reports whether agents may see a source in this approval state.
+func (a Approval) Live() bool { return a == ApprovalNone || a == ApprovalApproved }
 
 // Runs says where a skill can be followed.
 type Runs string
@@ -114,8 +142,18 @@ type Source struct {
 	Enabled     bool       `json:"enabled"`
 	Visibility  Visibility `json:"visibility"`
 	Members     []string   `json:"members,omitempty"` // user IDs when Visibility is members
-	DefaultRuns Runs       `json:"default_runs"`
-	Limits      Limits     `json:"limits"`
+	// Blocked are user IDs who never see the source's skills, whatever
+	// the audience (admins excepted).
+	Blocked     []string `json:"blocked,omitempty"`
+	DefaultRuns Runs     `json:"default_runs"`
+	Limits      Limits   `json:"limits"`
+
+	// Approval is a contributor's source's state with the admins ("" for
+	// a source an admin added); ApprovalNote is a rejection's reason and
+	// ApprovalBy the deciding admin.
+	Approval     Approval `json:"approval,omitempty"`
+	ApprovalNote string   `json:"approval_note,omitempty"`
+	ApprovalBy   string   `json:"approval_by,omitempty"`
 
 	CreatedBy string    `json:"created_by"` // user ID
 	CreatedAt time.Time `json:"created_at"`
@@ -161,8 +199,13 @@ type SourceInput struct {
 	Enabled     *bool      `json:"enabled,omitempty"` // default true
 	Visibility  Visibility `json:"visibility,omitempty"`
 	Members     []string   `json:"members,omitempty"`
+	Blocked     []string   `json:"blocked,omitempty"`
 	DefaultRuns Runs       `json:"default_runs,omitempty"`
 	Limits      *Limits    `json:"limits,omitempty"`
+	// PendingApproval starts the source pending an admin's approval (a
+	// skill contributor's source). It is never read from JSON: the API
+	// sets it from who is asking.
+	PendingApproval bool `json:"-"`
 }
 
 // SourceUpdate changes a source. Nil fields stay as they are. Token "" with
@@ -180,6 +223,7 @@ type SourceUpdate struct {
 	Enabled     *bool       `json:"enabled,omitempty"`
 	Visibility  *Visibility `json:"visibility,omitempty"`
 	Members     *[]string   `json:"members,omitempty"`
+	Blocked     *[]string   `json:"blocked,omitempty"`
 	DefaultRuns *Runs       `json:"default_runs,omitempty"`
 	Limits      *Limits     `json:"limits,omitempty"`
 }
@@ -270,6 +314,29 @@ type SkillUsage struct {
 	Runs         Runs   `json:"runs"`
 	RunsOverride Runs   `json:"runs_override,omitempty"`
 	Reads30d     int    `json:"reads_30d"`
+	// Sharing is the skill's own sharing setting; nil when it follows the
+	// source entirely.
+	Sharing *SkillSharing `json:"sharing,omitempty"`
+}
+
+// SkillSharing is one skill's own sharing setting, kept by source and skill
+// path so it survives new versions. Mode VisibleInherit ("") follows the
+// source's audience; everyone, members (Members) or nobody replace it for
+// this skill. Blocked always adds to the source's block list.
+type SkillSharing struct {
+	Mode    Visibility `json:"mode"`
+	Members []string   `json:"members,omitempty"`
+	Blocked []string   `json:"blocked,omitempty"`
+}
+
+// IsZero reports a setting that follows the source entirely.
+func (sh SkillSharing) IsZero() bool { return sh.Mode == VisibleInherit && len(sh.Blocked) == 0 }
+
+// Contributor is a member an admin allowed to add skill sources.
+type Contributor struct {
+	UserID  string    `json:"user_id"`
+	AddedBy string    `json:"added_by"`
+	AddedAt time.Time `json:"added_at"`
 }
 
 // Viewer is who asks. The gateway and the API build it from the caller.
@@ -448,6 +515,29 @@ type Admin interface {
 	// TrustedOwner reports whether a GitHub owner is in the setting
 	// skills_trusted_github_owners (default mode auto).
 	TrustedOwner(ctx context.Context, owner string) bool
+}
+
+// SharingAdmin is the per-skill sharing and the source approval part of
+// the admin service (*Service implements it).
+type SharingAdmin interface {
+	// SetSkillSharing sets one skill's own sharing (a zero setting clears
+	// it) and returns the setting it replaced. Every node applies it
+	// within moments.
+	SetSkillSharing(ctx context.Context, by, id, skillPath string, sh SkillSharing) (SkillSharing, error)
+	// DecideApproval approves (the source goes live: its waiting version
+	// is made active) or rejects (the source is disabled, with note) a
+	// contributor's source that waits for approval. Deciding a source
+	// that needs no approval is ErrConflict.
+	DecideApproval(ctx context.Context, by, id string, approve bool, note string) (*Source, error)
+}
+
+// ContributorsAdmin keeps the skill contributors (*Service implements it).
+type ContributorsAdmin interface {
+	Contributors(ctx context.Context) ([]Contributor, error)
+	IsContributor(ctx context.Context, userID string) (bool, error)
+	// SetContributor adds (on) or removes a contributor; both are
+	// idempotent.
+	SetContributor(ctx context.Context, by, userID string, on bool) error
 }
 
 // ReviewHook is called when a review-mode source has a new staged version.
