@@ -173,8 +173,10 @@ wiring in `cmd/gateway`.
    rows), compute a diff against the active version (skills added, changed,
    removed, by SKILL.md digest and file set), then per mode: `auto` →
    activate; `review` → keep staged and call `ReviewHook.PendingVersion`;
-   `pinned` → only the pinned SHA is ever fetched. Activation publishes on
-   `skillhub`. Retention after each sync.
+   `pinned` → only the pinned SHA is ever fetched. A skill contributor's
+   source that is not approved keeps every new version staged, whatever
+   its mode (section F). Activation publishes on `skillhub`. Retention
+   after each sync.
 5. **Loops**: the leader checks each enabled source when its
    `poll_seconds` (default 300, min 60) has passed since the last check;
    `SyncNow` and `HandleWebhook` run a sync at once on the calling node
@@ -314,6 +316,49 @@ UI in `app.js`.
    (`TokenSource`), shown in the wizard when the creator has one.
 3. `ty skills pull <skill>...`: download a bundle into `~/.claude/skills`.
 4. Docs for all of the above.
+
+## F. Sharing and contributors (worker F2 and the review fixes)
+
+1. **Who is a viewer.** The sharing rule is `srcIndex.skillVisible`
+   (`index.go`); every read path asks it. `Viewer.Delegated` is false
+   only for a person in their own dashboard page (a `dashboard:<uid>`
+   caller with the browser raiser, `gateway/skills_viewer.go`); every
+   other caller is delegated, a caller with no ID at all (anonymous
+   `/mcp`, stdio) included, so audience nobody, a hidden source and a
+   source that is not approved stay out of every agent's view.
+2. **Contributors read anonymously.** Every GitHub read made for a skill
+   contributor is anonymous unless it carries their own token or GitHub
+   connection; the admins' default token (`skills_github_token`) is never
+   used for them. The API derives this in one place
+   (`skillSourceInput`: `SourceInput.PendingApproval` for preview and
+   create); inspect without a token is `InspectAnonymous`; a stored
+   source of a contributor reads through `clientFor`, which is anonymous
+   for any source with an approval state and no credential of its own
+   (sync now, webhook and scheduled syncs, `PreviewSource`).
+3. **Approval is bound to a commit.** While a contributor's source is
+   not approved, a sync stages every new version (as review mode) and
+   never activates one; the hook's `ApprovalHook.PendingApprovalVersion`
+   asks the open approval question again when it shows another commit.
+   `DecideApproval(approve, sha)` makes the waiting version at `sha`
+   live (before the approval is stored), and refuses with `ErrConflict`
+   when another commit would go live: a waiting version of an automatic
+   or pinned source not at `sha`, a live version not at `sha`, or an
+   automatic or pinned source with nothing synced. The approval is stored
+   only while the live and waiting versions are the ones checked. The
+   Inbox decides with `DecideApprovalFrom(..., ApprovalPending, ...)`, so
+   a late answer never undoes a decision made on the source page; such a
+   question is settled as cancelled.
+4. **At most three waiting sources per contributor.** `CreateSource`
+   counts and inserts under `cluster.LockCtx(ctx,
+   "skillhub:contributor:"+userID)`, so parallel creates on any replica
+   (Postgres) or on one node (SQLite) cannot pass the cap; the API's own
+   count only answers early, before the dry run.
+5. **Source updates.** `UpdateSource` writes only the fields the update
+   names (the hide lock changes only through the admin hide path), only
+   while `updated_at` is still the value it read, and moves `updated_at`
+   with `bumpUpdatedAt`; a write in between makes it read again (at most
+   five rounds), and a change of the approval, hide lock, mode, branch,
+   folder or credential in between answers `ErrConflict`.
 
 ## E. Integration (orchestrator)
 
