@@ -1,6 +1,6 @@
 ---
 name: release-notes
-description: Write release notes from merged pull requests (review update 10:31:29).
+description: Write release notes from merged pull requests (auto update 10:51:48).
 license: MIT
 metadata:
   author: toolyard-tests
