@@ -405,3 +405,266 @@ test('typing in a wizard field enables the next button without a re-render', () 
   })()`);
   assert.deepEqual(plain(out), { empty: true, typed: false });
 });
+
+// ---- sharing controls and skill contributors (TEC-1782 F2) -------------------
+
+test('a contributor source shows pending approval, a rejected one rejected', () => {
+  const h = harness();
+  h.context.s = source1;
+  assert.equal(h.run('skillsStatus(Object.assign({}, s, { approval: "pending" }))'), 'pending approval');
+  assert.equal(h.run('skillsStatus(Object.assign({}, s, { approval: "pending", enabled: false }))'), 'paused');
+  assert.equal(h.run('skillsStatus(Object.assign({}, s, { approval: "rejected", enabled: false }))'), 'rejected');
+  assert.equal(h.run('skillsStatus(Object.assign({}, s, { approval: "approved" }))'), 'ok');
+  assert.equal(h.run('skillsStatus(Object.assign({}, s, { approval: "pending" }), true)'), 'syncing');
+  assert.equal(h.run('skillsStatusClass("pending approval")'), 'pending');
+  assert.equal(h.run('skillsStatusClass("rejected")'), 'denied');
+});
+
+test('the Shared with label names each mode and the block list', () => {
+  const h = harness();
+  assert.equal(h.run(`skillsSharingLabel({ path: 'pdf' })`), 'Same as source');
+  assert.equal(h.run(`skillsSharingLabel({ sharing: { mode: '', blocked: ['u_2', 'u_3'] } })`), 'Same as source · 2 blocked');
+  assert.equal(h.run(`skillsSharingLabel({ sharing: { mode: 'everyone' } })`), 'Everyone');
+  assert.equal(h.run(`skillsSharingLabel({ sharing: { mode: 'members', members: ['u_2', 'u_3'] } })`), '2 members');
+  assert.equal(h.run(`skillsSharingLabel({ sharing: { mode: 'members', members: ['u_2'], blocked: ['u_4'] } })`), '1 member · 1 blocked');
+  assert.equal(h.run(`skillsSharingLabel({ sharing: { mode: 'nobody' } })`), 'Nobody (admins only)');
+});
+
+test('a skill sharing body sends mode "" to follow the source, and members only with mode members', () => {
+  const h = harness();
+  const out = h.run(`({
+    inherit: skillsSharingBody({ mode: '', members: ['u_9'], blocked: ['u_3', 'u_2'] }, 'pdf'),
+    inheritWord: skillsSharingBody({ mode: 'inherit', members: [], blocked: [] }, 'pdf'),
+    members: skillsSharingBody({ mode: 'members', members: ['u_3', 'u_2'], blocked: [] }, 'team/x'),
+    nobody: skillsSharingBody({ mode: 'nobody', members: ['u_2'], blocked: ['u_5'] }, 'pdf'),
+  })`);
+  assert.deepEqual(plain(out.inherit), { path: 'pdf', mode: '', blocked: ['u_3', 'u_2'] });
+  assert.deepEqual(plain(out.inheritWord), { path: 'pdf', mode: '', blocked: [] });
+  assert.deepEqual(plain(out.members), { path: 'team/x', mode: 'members', members: ['u_2', 'u_3'], blocked: [] });
+  assert.deepEqual(plain(out.nobody), { path: 'pdf', mode: 'nobody', blocked: ['u_5'] });
+});
+
+test('the facts say who sees a source and where its approval stands', () => {
+  const h = harness();
+  assert.equal(h.run(`skillsAudienceText({ visibility: 'everyone', blocked: ['u_2', 'u_3'] })`), 'everyone · 2 blocked');
+  assert.equal(h.run(`skillsAudienceText({ visibility: 'members', members: ['u_2'] })`), '1 chosen member');
+  assert.match(h.run(`skillsAudienceText({ visibility: 'nobody' })`), /^nobody \(only admins and the person who added it/);
+  assert.equal(h.run(`skillsAudienceText({})`), 'everyone');
+  h.run(`skillsUI.users = [{ id: 'u_1', username: 'ada', role: 'admin' }]`);
+  assert.equal(h.run(`skillsApprovalText({ approval: 'pending' })`), 'waits for an admin');
+  assert.equal(h.run(`skillsApprovalText({ approval: 'approved', approval_by: 'u_1' })`), 'approved by ada');
+  assert.equal(h.run(`skillsApprovalText({ approval: 'approved', approval_by: 'u_9' })`), 'approved by u_9');
+  assert.equal(h.run(`skillsApprovalText({ approval: 'rejected', approval_note: 'not ours' })`), 'rejected: not ours');
+  assert.equal(h.run(`skillsApprovalText({})`), '');
+});
+
+test('a contributor chooses review, or automatic for a trusted owner, never pinned', () => {
+  const h = harness();
+  const out = h.run(`(() => {
+    const values = (list) => list.map(([v]) => v);
+    const untrusted = { info: { trusted_owner: false } }, trusted = { info: { trusted_owner: true } };
+    return {
+      admin: values(skillsWizardModes(untrusted, false)),
+      untrusted: values(skillsWizardModes(untrusted, true)),
+      trusted: values(skillsWizardModes(trusted, true)),
+      editAdmin: values(skillsEditModes({ mode: 'review' }, false)),
+      editReview: values(skillsEditModes({ mode: 'review' }, true)),
+      editAuto: values(skillsEditModes({ mode: 'auto' }, true)),
+    };
+  })()`);
+  assert.deepEqual(plain(out), { admin: ['auto', 'review', 'pinned'], untrusted: ['review'], trusted: ['auto', 'review'],
+    editAdmin: ['auto', 'review', 'pinned'], editReview: ['review'], editAuto: ['auto', 'review'] });
+  // The review step a contributor sees: no pinned or automatic mode for an
+  // untrusted owner, and a "nobody yet" audience that sends no members.
+  h.context.state.user.role = 'member';
+  const step = h.run(`(() => {
+    const w = skillsWizardAfterInspect(skillsWizardNew(), { owner: 'o', repo: 'r', default_branch: 'main', branches: ['main'], trusted_owner: false });
+    w.url = 'o/r'; w.preview = { sha: 'abc', skill_count: 1, file_count: 1, warnings: [], sample: [] }; w.step = 'review';
+    const view = renderSkillsWizardReview(w);
+    w.visibility = 'nobody'; w.members = ['u_2'];
+    return { view, input: skillsWizardInput(w, true) };
+  })()`);
+  const review = text(step.view);
+  assert.doesNotMatch(review, /Pinned/);
+  assert.doesNotMatch(review, /Automatic/);
+  assert.match(review, /Nobody yet \(only admins and me, in the dashboard\)/);
+  assert.match(review, /an admin approves each new commit/);
+  assert.equal(step.input.mode, 'review');
+  assert.equal(step.input.visibility, 'nobody');
+  assert.equal(Object.hasOwn(step.input, 'members'), false);
+});
+
+test('the source Sharing panel sends only what changed, and members only with the members audience', () => {
+  const h = harness();
+  h.context.orig = Object.assign({}, source1, { visibility: 'members', members: ['u_2'] });
+  const out = h.run(`(() => {
+    const d = skillsSharingDraft(orig);
+    const r = { none: skillsSourceSharingPatch(orig, d) };
+    d.blocked = ['u_4']; r.block = skillsSourceSharingPatch(orig, d);
+    d.blocked = []; d.members = ['u_3', 'u_2']; r.members = skillsSourceSharingPatch(orig, d);
+    d.visibility = 'everyone'; r.everyone = skillsSourceSharingPatch(orig, d);
+    d.visibility = 'nobody'; d.blocked = ['u_5']; r.nobody = skillsSourceSharingPatch(orig, d);
+    return r;
+  })()`);
+  assert.deepEqual(plain(out.none), {});
+  assert.deepEqual(plain(out.block), { blocked: ['u_4'] });
+  assert.deepEqual(plain(out.members), { members: ['u_2', 'u_3'] });
+  assert.deepEqual(plain(out.everyone), { visibility: 'everyone' });
+  assert.deepEqual(plain(out.nobody), { visibility: 'nobody', blocked: ['u_5'] });
+  // Becoming members sends the members, even when the stored list is the same.
+  h.context.pub = Object.assign({}, source1, { members: ['u_2'] });
+  assert.deepEqual(plain(h.run(`skillsSourceSharingPatch(pub, Object.assign(skillsSharingDraft(pub), { visibility: 'members' }))`)),
+    { visibility: 'members', members: ['u_2'] });
+  // The Edit modal sends nobody without members as well.
+  const edit = h.run(`(() => { openSkillsEdit(orig); const d = skillsUI.edit.draft; d.visibility = 'nobody'; return skillsEditPatch(orig, d); })()`);
+  assert.deepEqual(plain(edit), { visibility: 'nobody' });
+});
+
+test('the source page Sharing panel saves the audience and block list with one PATCH', async () => {
+  const h = harness({ '/v1/skills/admin/sources': { sources: [] } });
+  h.context.s = source1;
+  h.run(`skillsUI.loaded = true; skillsUI.openId = 'src_1';
+    skillsUI.users = [{ id: 'u_2', username: 'bea', role: 'member' }, { id: 'u_1', username: 'ada', role: 'admin' }];
+    skillsUI.detail = { id: 'src_1', source: s, versions: [], skills: [], busy: '', secret: null, error: '' };`);
+  const page = text(h.run('viewSkills()'));
+  assert.match(page, /Sharing/);
+  assert.match(page, /Block list/);
+  assert.match(page, /Nobody: only admins and the person who added it, in the dashboard; agents never/);
+  assert.match(page, /admin: sees every skill anyway/);
+  h.run(`skillsUI.detail.sharing.visibility = 'nobody'; skillsUI.detail.sharing.blocked = ['u_2'];`);
+  h.run('viewSkills()');
+  assert.equal(h.run('skillsUI.detail.sharing.visibility'), 'nobody', 'a render keeps the unsaved draft');
+  await h.run('saveSkillsSharing(s)');
+  const patch = h.requests.find((r) => r.path === '/v1/skills/sources/src_1' && r.method === 'PATCH');
+  assert.deepEqual(plain(patch.body), { visibility: 'nobody', blocked: ['u_2'] });
+});
+
+test('the skills table says who sees each skill, and its modal saves one PUT', async () => {
+  const h = harness();
+  h.context.s = source1;
+  h.run(`skillsUI.loaded = true; skillsUI.openId = 'src_1'; skillsUI.users = [{ id: 'u_2', username: 'bea', role: 'member' }];
+    skillsUI.detail = { id: 'src_1', source: s, versions: [], busy: '', secret: null, error: '',
+      skills: [{ path: 'pdf', name: 'pdf', runs: 'anywhere', reads_30d: 7, sharing: { mode: 'members', members: ['u_2'], blocked: ['u_3'] } },
+        { path: 'xlsx', name: 'xlsx', runs: 'anywhere', reads_30d: 0 }] };`);
+  const page = text(h.run('viewSkills()'));
+  assert.match(page, /Shared with/);
+  assert.match(page, /1 member · 1 blocked/);
+  assert.match(page, /Same as source/);
+  h.run(`openSkillsShare(s, skillsUI.detail.skills[0])`);
+  assert.deepEqual(plain(h.run('skillsUI.share.draft')), { mode: 'members', members: ['u_2'], blocked: ['u_3'], memberFilter: '', blockFilter: '' });
+  assert.match(text(h.run('viewSkills()')), /Who sees pdf/);
+  h.run(`skillsUI.share.draft.mode = 'nobody';`);
+  await h.run('saveSkillsShare()');
+  const put = h.requests.find((r) => r.path === '/v1/skills/sources/src_1/skills/sharing');
+  assert.equal(put.method, 'PUT');
+  assert.deepEqual(plain(put.body), { path: 'pdf', mode: 'nobody', blocked: ['u_3'] });
+  assert.equal(h.run('skillsUI.share'), null);
+});
+
+test('only an admin sees the Skill contributors panel; Add and Remove call the contributors routes', async () => {
+  const h = harness();
+  h.run(`skillsUI.loaded = true; skillsUI.sources = [];
+    skillsUI.users = [{ id: 'u_1', username: 'ada', role: 'admin' }, { id: 'u_2', username: 'bea', role: 'member' }, { id: 'u_3', username: 'cal', role: 'member' }];
+    skillsUI.contributors = [{ user_id: 'u_2', added_by: 'u_1', added_at: '2026-10-25T09:00:00Z' }];`);
+  const page = text(h.run('viewSkills()'));
+  assert.match(page, /Skill contributors/);
+  assert.match(page, /Members you name here can add skill sources/);
+  assert.match(page, /bea/);
+  assert.match(page, /added just now by ada/);
+  const options = [];
+  const walk = (n) => { if (n && typeof n === 'object') { if (n.tag === 'option') options.push(n.attrs.value); (n.children || []).forEach(walk); } };
+  walk(h.run('renderSkillsContributors()'));
+  assert.deepEqual(options, ['', 'u_3'], 'only members who are not contributors yet');
+  await h.run(`addSkillsContributor('u_3')`);
+  const put = h.requests.find((r) => r.path === '/v1/skills/admin/contributors/u_3');
+  assert.equal(put.method, 'PUT');
+  assert.ok(h.requests.find((r) => r.path === '/v1/skills/admin/contributors' && r.method === 'GET'), 'the list reloads');
+  await h.run(`removeSkillsContributor('u_2')`);
+  assert.ok(h.requests.find((r) => r.path === '/v1/skills/admin/contributors/u_2' && r.method === 'DELETE'));
+  // A contributor (a member) gets their own list, without the panel.
+  h.run(`state.user.role = 'member'; skillsUI.contributor = true; skillsUI.contributors = [{ user_id: 'u_2' }];`);
+  const mine = text(h.run('viewSkills()'));
+  assert.doesNotMatch(mine, /Skill contributors/);
+  assert.match(mine, /Your skill sources/);
+  assert.match(mine, /A new source waits for an admin's approval/);
+});
+
+test('an admin approves or rejects a contributor source; reject sends the reason', async () => {
+  const h = harness({ '/v1/skills/admin/sources': { sources: [] } });
+  h.context.s = Object.assign({}, source1, { approval: 'pending', created_by: 'u_2' });
+  h.run(`skillsUI.openId = null; skillsUI.detail = null;`);
+  await h.run(`decideSkillSource(s, 'approve')`);
+  const approve = h.requests.find((r) => r.path === '/v1/skills/sources/src_1/approval');
+  assert.equal(approve.method, 'POST');
+  assert.deepEqual(plain(approve.body), { decision: 'approve' });
+  h.run(`prompt = () => '  not our repository '`);
+  await h.run(`decideSkillSource(s, 'reject')`);
+  const reject = h.requests.filter((r) => r.path === '/v1/skills/sources/src_1/approval').pop();
+  assert.deepEqual(plain(reject.body), { decision: 'reject', note: 'not our repository' });
+  // Cancelling the reason prompt sends nothing.
+  h.run(`prompt = () => null`);
+  await h.run(`decideSkillSource(s, 'reject')`);
+  assert.equal(h.requests.filter((r) => r.path === '/v1/skills/sources/src_1/approval').length, 2);
+});
+
+test('a contributor source page hides version and approval buttons; an admin gets them', () => {
+  const h = harness();
+  h.context.state.user.role = 'member';
+  h.context.s = Object.assign({}, source1, { pending_version_id: 'skv_3', approval: 'pending', created_by: 'u_1' });
+  h.run(`skillsUI.contributor = true; skillsUI.loaded = true; skillsUI.openId = 'src_1'; skillsUI.users = [];
+    skillsUI.detail = { id: 'src_1', source: s, busy: '', secret: null, error: '',
+      versions: [
+        { id: 'skv_3', sha: 'cccccccccccccccc', status: 'staged', skill_count: 13, warnings: [], diff: { added: ['new-skill'], changed: [], removed: [] }, created_at: '2026-10-25T09:00:00Z' },
+        { id: 'skv_1', sha: '0123456789abcdef', status: 'active', skill_count: 12, warnings: [], created_at: '2026-10-24T09:00:00Z' },
+        { id: 'skv_0', sha: 'aaaaaaaaaaaaaaaa', status: 'retired', skill_count: 11, warnings: [], created_at: '2026-10-23T09:00:00Z' },
+      ],
+      skills: [{ path: 'pdf', name: 'pdf', runs: 'anywhere', reads_30d: 7 }] };`);
+  const page = text(h.run('viewSkills()'));
+  assert.doesNotMatch(page, /\bApprove\b/);
+  assert.doesNotMatch(page, /\bReject\b/);
+  assert.doesNotMatch(page, /\bActivate\b/);
+  assert.match(page, /An admin makes versions live/);
+  assert.match(page, /Waiting for approval/);
+  assert.match(page, /Waits for an admin's approval\./);
+  assert.match(page, /Approval\s+waits for an admin/);
+  assert.match(page, /Waiting for review/);
+  assert.match(page, /pending approval/);
+  h.context.state.user.role = 'admin';
+  const admin = text(h.run('viewSkills()'));
+  assert.match(admin, /\bApprove\b/);
+  assert.match(admin, /\bReject\b/);
+  assert.match(admin, /\bActivate\b/);
+});
+
+test('loadSkillsMe makes a member a contributor; a contributor never loads the admin panels', async () => {
+  const h = harness({ '/v1/skills/admin/me': { user_id: 'u_1', admin: false, contributor: true }, '/v1/skills/admin/sources': { sources: [] } });
+  h.context.state.user.role = 'member';
+  await h.run('loadSkillsMe()');
+  assert.equal(h.run('skillsUI.contributor'), true);
+  await h.run('loadSkills()');
+  assert.ok(h.requests.find((r) => r.path === '/v1/skills/admin/sources'));
+  assert.equal(h.requests.some((r) => r.path === '/v1/skills/admin/github-token'), false);
+  assert.equal(h.requests.some((r) => r.path === '/v1/skills/admin/contributors'), false);
+  // An admin is never a contributor, and a hub that is off (404) leaves it off.
+  const admin = harness({ '/v1/skills/admin/me': { user_id: 'u_1', admin: true, contributor: true } });
+  await admin.run('loadSkillsMe()');
+  assert.equal(admin.run('skillsUI.contributor'), false);
+  const off = harness({ '/v1/skills/admin/me': { __throw: Object.assign(new Error('not found'), { status: 404 }) } });
+  await off.run('loadSkillsMe()');
+  assert.equal(off.run('skillsUI.contributor'), false);
+});
+
+test('the people pickers read /v1/skills/admin/people', async () => {
+  const h = harness({ '/v1/skills/admin/people': { people: [{ id: 'u_2', username: 'bea', role: 'member' }] } });
+  await h.run('loadSkillsUsers()');
+  assert.ok(h.requests.find((r) => r.path === '/v1/skills/admin/people'));
+  assert.equal(h.requests.some((r) => r.path === '/v1/users'), false);
+  assert.deepEqual(plain(h.run('skillsUI.users')).map((u) => u.id), ['u_2']);
+});
+
+test('the wizard says a contributor source waits for an admin', () => {
+  const h = harness();
+  h.run(`skillsUI.wizard = skillsWizardNew(); skillsUI.wizard.step = 'done';
+    skillsUI.wizard.result = { status: 'pending approval', source: { id: 'src_2', slug: 'mine', approval: 'pending' } };`);
+  assert.match(text(h.run('renderSkillsWizard()')), /agents see nothing of it until an admin approves it\. The owner has the question in the Inbox\./);
+});
