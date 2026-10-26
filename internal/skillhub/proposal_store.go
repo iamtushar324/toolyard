@@ -233,15 +233,16 @@ func (st proposalStore) remove(ctx context.Context, id string) error {
 
 // lockedApproval runs decide in one transaction that holds the row of
 // source sourceID (FOR UPDATE on Postgres; SQLite has one writer), with
-// the source as it is now, its waiting and live versions (nil when none)
-// and its open approval rows (pending, or approved and being applied). A row
-// decide returns is inserted in the same transaction and returned: two
-// askers on any replica never both add a question, and none adds one
-// that shows the source otherwise than it is. decide must not use the
+// the source as it is now, its waiting and live versions, the version it
+// would serve next with its current settings (nextVersion; each nil when
+// none) and its open approval rows (pending, or approved and being
+// applied). A row decide returns is inserted in the same transaction and
+// returned: two askers on any replica never both add a question, and none
+// adds one that shows the source otherwise than it is. decide must not use the
 // database (on SQLite the transaction holds the only connection). A
 // source that is gone is ErrNotFound.
 func (st proposalStore) lockedApproval(ctx context.Context, sourceID string,
-	decide func(src *sourceRow, waiting, live *versionRow, open []proposalRow) *proposalRow) (*proposalRow, error) {
+	decide func(src *sourceRow, waiting, live, next *versionRow, open []proposalRow) *proposalRow) (*proposalRow, error) {
 	tx, err := st.db.BeginTx(ctx, nil)
 	if err != nil {
 		return nil, err
@@ -277,6 +278,20 @@ func (st proposalStore) lockedApproval(ctx context.Context, sourceID string,
 	if err != nil {
 		return nil, err
 	}
+	var next *versionRow
+	if target := src.headSHA; target != "" || src.Mode == ModePinned {
+		if src.Mode == ModePinned {
+			target = src.PinnedSHA
+		}
+		next, err = scanVersion(tx.QueryRowContext(ctx, `SELECT `+versionColumns+` FROM skill_versions
+			WHERE source_id = ? AND sha = ? AND config = ? ORDER BY created_at DESC, id DESC LIMIT 1`, sourceID, target, src.configHash()))
+		if errors.Is(err, sql.ErrNoRows) {
+			next, err = nil, nil
+		}
+		if err != nil {
+			return nil, err
+		}
+	}
 	rows, err := tx.QueryContext(ctx, `SELECT `+proposalColumns+` FROM skill_proposals WHERE kind = ? AND source_id = ? AND status IN (?, ?) ORDER BY created_at`,
 		proposalKindApproval, sourceID, proposalPending, proposalApproved)
 	if err != nil {
@@ -286,7 +301,7 @@ func (st proposalStore) lockedApproval(ctx context.Context, sourceID string,
 	if err != nil {
 		return nil, err
 	}
-	row := decide(src, waiting, live, open)
+	row := decide(src, waiting, live, next, open)
 	if row == nil {
 		return nil, nil
 	}

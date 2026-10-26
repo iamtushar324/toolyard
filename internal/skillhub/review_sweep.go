@@ -26,6 +26,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"time"
 
 	"github.com/tusharbhardwaj/toolyard/internal/inbox"
@@ -61,6 +62,7 @@ func lostSystemTag(item *inbox.Request, kind string) bool {
 // closeProposalRows moves pending rows to status to with reason, and
 // withdraws their Inbox items (sent by toolyard for row.UserID).
 func closeProposalRows(ctx context.Context, st proposalStore, ib *inbox.Service, rows []proposalRow, to, reason string) error {
+	var unread error
 	for _, row := range rows {
 		moved, err := st.move(ctx, row.ID, []string{proposalPending}, to, proposalUpdate{Error: reason})
 		if err != nil {
@@ -69,10 +71,16 @@ func closeProposalRows(ctx context.Context, st proposalStore, ib *inbox.Service,
 		inboxID := row.InboxID
 		if moved && inboxID == "" {
 			// Read before its item was recorded: the item may be recorded
-			// now (an asker records it only while the row is pending).
-			if cur, err := st.get(ctx, row.ID); err == nil {
-				inboxID = cur.InboxID
+			// now (an asker records it only while the row is pending). A
+			// failed read is reported once the other rows are closed.
+			cur, err := st.get(ctx, row.ID)
+			if err != nil {
+				if unread == nil {
+					unread = fmt.Errorf("skillhub: read the Inbox item of closed row %s: %w", row.ID, err)
+				}
+				continue
 			}
+			inboxID = cur.InboxID
 		}
 		if !moved || inboxID == "" {
 			continue
@@ -82,7 +90,7 @@ func closeProposalRows(ctx context.Context, st proposalStore, ib *inbox.Service,
 			return err
 		}
 	}
-	return nil
+	return unread
 }
 
 // InboxSweeper is a feature whose Inbox questions need a periodic sweep:

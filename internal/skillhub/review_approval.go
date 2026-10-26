@@ -81,6 +81,25 @@ func approvalSubject(waiting, live *versionRow) *versionRow {
 	return live
 }
 
+// subjectFor is the version an approval question about cur may show now:
+// its waiting version when built with cur's settings, else (nothing
+// waiting) its live version when approving it is allowed (liveApproval;
+// in review mode, when built with cur's settings). nil when there is none.
+func subjectFor(cur *sourceRow, waiting, live, next *versionRow) *versionRow {
+	cfg := cur.configHash()
+	switch {
+	case waiting != nil && waiting.config == cfg:
+		return waiting
+	case waiting != nil || live == nil:
+		return nil
+	case cur.Mode == ModeReview && live.config == cfg:
+		return live
+	case cur.Mode != ModeReview && liveApproval(cur, live, next) == nil:
+		return live
+	}
+	return nil
+}
+
 // versionPreview is the counts and warnings of version v, as an approval
 // question shows them.
 func versionPreview(src Source, v *versionRow) *Preview {
@@ -110,13 +129,13 @@ func (ri *ReviewInbox) RequestApproval(ctx context.Context, src Source, prev *Pr
 	}
 	var shown Source
 	var card *Preview
-	row, err := ri.store.lockedApproval(ctx, src.ID, func(cur *sourceRow, w, live *versionRow, open []proposalRow) *proposalRow {
+	row, err := ri.store.lockedApproval(ctx, src.ID, func(cur *sourceRow, w, live, next *versionRow, open []proposalRow) *proposalRow {
 		if cur.Approval != ApprovalPending || len(open) > 0 {
 			return nil
 		}
 		cfg := cur.configHash()
 		in := approvalInput{Contributor: contributor}
-		subject := approvalSubject(w, live)
+		subject := subjectFor(cur, w, live, next)
 		switch {
 		case prev != nil:
 			if configOf(prev.Source) != cfg || prev.Source.Branch != cur.Branch || prev.Source.PinnedSHA != cur.PinnedSHA {
@@ -124,11 +143,11 @@ func (ri *ReviewInbox) RequestApproval(ctx context.Context, src Source, prev *Pr
 			}
 			in.SHA, in.Skills, in.Warnings, in.Config = prev.SHA, prev.SkillCount, len(prev.Warnings), cfg
 			card = prev
-		case subject != nil && subject.config == cfg:
+		case subject != nil:
 			in.SHA, in.Skills, in.Warnings, in.Version, in.Config = subject.SHA, subject.SkillCount, len(subject.Warnings), subject.ID, cfg
 			card = versionPreview(cur.Source, subject)
-		case subject != nil:
-			return nil // built with older settings: the check that stages the current version asks
+		case approvalSubject(w, live) != nil:
+			return nil // not approvable now (older branch or settings): the check that stages the current version asks
 		}
 		shown = cur.Source
 		return ri.approvalRow(reviewer, cur.ID, in)
@@ -172,16 +191,21 @@ func (ri *ReviewInbox) approvalItem(ctx context.Context, row *proposalRow, src S
 		return fmt.Errorf("skillhub: approval item for %s: %w", src.Slug, err)
 	}
 	ok, err := ri.store.setInboxIfPending(ctx, row.ID, item.ID)
-	if err != nil || ok {
-		return err
+	if ok && err == nil {
+		return nil
 	}
-	// The row was closed while its item was being created: withdraw the
-	// item, which nobody else knows of.
-	if _, err := ri.o.Inbox.CancelBySystem(ctx, inbox.SystemAgentID(row.UserID), item.ID, "this question was closed while it was asked"); err != nil &&
-		!errors.Is(err, inbox.ErrNotPending) && !errors.Is(err, inbox.ErrNotFound) {
-		return err
+	if err != nil {
+		// The item could not be recorded on the row: drop the row, so the
+		// next check, which finds no open question, asks again.
+		_ = ri.store.remove(ctx, row.ID)
 	}
-	return nil
+	// The row was closed while its item was being created, or the item is
+	// recorded nowhere: withdraw the item, which nobody else knows of.
+	if _, cerr := ri.o.Inbox.CancelBySystem(ctx, inbox.SystemAgentID(row.UserID), item.ID, "this question was closed while it was asked"); cerr != nil &&
+		!errors.Is(cerr, inbox.ErrNotPending) && !errors.Is(cerr, inbox.ErrNotFound) && err == nil {
+		err = cerr
+	}
+	return err
 }
 
 var _ ApprovalHook = (*ReviewInbox)(nil)
@@ -191,9 +215,11 @@ var _ ApprovalHook = (*ReviewInbox)(nil)
 // sync stages a version, or finds one still waiting, so at every check).
 // src and v are what the caller read and may be outdated: under the
 // source's row lock (lockedApproval) the source is read again, and nothing
-// is asked unless v is still its waiting version (or, with nothing
-// waiting, its live version: approvalSubject), built with the settings it
-// has now (else the check that reads the current version asks). An
+// is asked unless the caller read the source's current branch and pin, and
+// v is still the version a question may show (subjectFor: its waiting
+// version built with the settings it has now, or, with nothing waiting,
+// its live version when approving it is allowed); else the check that
+// reads the current version asks. An
 // approval is bound to the question's version, so the source keeps one
 // open question that shows its waiting version, as it is now:
 //
@@ -230,10 +256,10 @@ func (ri *ReviewInbox) PendingApprovalVersion(ctx context.Context, src Source, v
 		card    *Preview
 		who     string
 	)
-	row, err := ri.store.lockedApproval(ctx, src.ID, func(cur *sourceRow, waiting, live *versionRow, open []proposalRow) *proposalRow {
+	row, err := ri.store.lockedApproval(ctx, src.ID, func(cur *sourceRow, waiting, live, next *versionRow, open []proposalRow) *proposalRow {
 		cfg := cur.configHash()
-		w := approvalSubject(waiting, live)
-		if cur.Approval != ApprovalPending || w == nil || w.ID != v.ID || w.config != cfg {
+		w := subjectFor(cur, waiting, live, next)
+		if cur.Approval != ApprovalPending || src.Branch != cur.Branch || src.PinnedSHA != cur.PinnedSHA || w == nil || w.ID != v.ID {
 			return nil
 		}
 		for _, r := range open {

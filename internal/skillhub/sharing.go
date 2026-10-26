@@ -265,6 +265,12 @@ func (s *Service) approveSource(ctx context.Context, by string, r *sourceRow, b 
 	if err != nil {
 		return nil, err
 	}
+	var head *versionRow
+	if waiting == nil && r.Mode != ModeReview {
+		if head, err = s.nextVersion(ctx, r); err != nil {
+			return nil, err
+		}
+	}
 	// bound reports a version that is what the approver saw.
 	bound := func(v *versionRow) bool {
 		return v != nil && sha != "" && strings.EqualFold(v.SHA, sha) && (b.Version == "" || b.Version == v.ID) &&
@@ -285,12 +291,10 @@ func (s *Service) approveSource(ctx context.Context, by string, r *sourceRow, b 
 	case live != nil && !bound(live):
 		return nil, fmt.Errorf("%w: source %s serves commit %s with other settings than the approval showed; look at it on the Skills page and approve that",
 			ErrConflict, r.Slug, reviewShort(live.SHA))
-	case waiting == nil && live != nil && r.Mode != ModeReview && live.config != r.configHash():
-		// Its live version was built with settings it no longer has: the
-		// next check builds the current ones and would make them live.
-		return nil, fmt.Errorf("%w: source %s serves commit %s built with settings it no longer has; approve it after its next sync", ErrConflict, r.Slug, reviewShort(live.SHA))
-	case r.ActiveVersionID == "" && waiting == nil && r.Mode != ModeReview:
-		return nil, fmt.Errorf("%w: source %s has synced no commit yet; approve it after its first sync", ErrConflict, r.Slug)
+	case waiting == nil && r.Mode != ModeReview:
+		if err := liveApproval(r, live, head); err != nil {
+			return nil, err
+		}
 	}
 	active, pending := r.ActiveVersionID, r.PendingVersionID
 	if match {
@@ -322,6 +326,55 @@ func (s *Service) approveSource(ctx context.Context, by string, r *sourceRow, b 
 	}
 	s.changed(ctx, r.ID)
 	return s.GetSource(ctx, r.ID)
+}
+
+// nextVersion is the version of what a contributor's automatic or pinned
+// source would serve next with its current settings: its pinned commit,
+// else the branch head it last saw (none since its branch, pin or settings
+// changed: every such change clears head_sha, and only a check of the
+// current branch records it again). nil when that version does not exist
+// (yet).
+func (s *Service) nextVersion(ctx context.Context, r *sourceRow) (*versionRow, error) {
+	target := r.headSHA
+	if r.Mode == ModePinned {
+		target = r.PinnedSHA
+	}
+	if target == "" {
+		return nil, nil
+	}
+	return s.findVersion(ctx, r.ID, target, r.configHash())
+}
+
+// liveApproval checks the approval of a contributor's automatic or pinned
+// source that has nothing waiting, whose live version (nil: none) would
+// stay live. After the approval its syncs make versions of its current
+// branch (or pin) and settings live without asking, so the live version
+// must be what it would serve next (next, nextVersion), or that version
+// must exist as retired or rejected, which no sync makes live (an
+// automatic source only), with the live one built with the current
+// settings. Otherwise the refusal says when approving works: after the
+// next sync (it builds, or stages again, what it would serve), or after a
+// new commit or a settings change (the version of the head failed, or was
+// rejected or retired with no current live version).
+func liveApproval(r *sourceRow, live, next *versionRow) error {
+	cfg := r.configHash()
+	current := live != nil && live.config == cfg
+	target := r.headSHA
+	if r.Mode == ModePinned {
+		target = r.PinnedSHA
+	}
+	switch {
+	case target == "" || next == nil || next.Status == VersionStaged:
+		return fmt.Errorf("%w: source %s has no version of its current branch and settings to approve yet; approve it after its next sync", ErrConflict, r.Slug)
+	case current && strings.EqualFold(live.SHA, target):
+		return nil
+	case next.Status == VersionFailed:
+		return fmt.Errorf("%w: the version of source %s's commit %s failed to build; approve it after a new commit or a settings change", ErrConflict, r.Slug, reviewShort(target))
+	case current && r.Mode == ModeAuto && (next.Status == VersionRetired || next.Status == VersionRejected):
+		return nil
+	}
+	return fmt.Errorf("%w: source %s has no version of its current branch and settings to approve: the one of commit %s is %s; approve it after a new commit or a settings change",
+		ErrConflict, r.Slug, reviewShort(target), next.Status)
 }
 
 // approvedLabel names the commit an approval was given for.
