@@ -658,6 +658,11 @@ def main():
                   r.status_code)
             r = msess.post(BASE + "/v1/users/%s/make-owner" % me_admin.get("id"), json={"confirm": me_admin.get("username")}, timeout=20)
             check("the new owner can transfer it back", r.status_code == 200 and admin.j("GET", "/v1/auth/me").get("is_owner") is True, r.status_code)
+            # A transfer makes the new owner an admin; set the test account back
+            # to member so the next run starts from the same state.
+            r = admin.req("PATCH", "/v1/users/%s" % member_id, json={"role": "member"})
+            check("the owner can set the former owner back to member", r.status_code == 200 and msess.get(BASE + "/v1/auth/me", timeout=20).json().get("role") == "member",
+                  r.status_code)
         step("owner transfer", owner_transfer)
 
         if mag_id:
