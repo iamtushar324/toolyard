@@ -46,15 +46,18 @@ func (g *Gateway) skillsAllowed(ctx context.Context, tool string) bool {
 //     agent is still an admin viewer. Admins see every source.
 //   - OnHost is true only for an agent that runs on the T3 host (see
 //     agentOnHost).
-//   - Delegated is true for a caller with no agent ID that still acts for
-//     the person: the voice assistant, and a dashboard caller that is not
-//     the person's own browser (an operator token's CLI runs tools as
-//     "dashboard:<uid>"). The sharing rule treats it as an agent, so it
-//     never sees a skill shared with nobody or a source waiting for
-//     approval.
+//   - Delegated is false only for a person in their own dashboard page: a
+//     "dashboard:<uid>" caller whose raiser is the browser. Every other
+//     caller is delegated: an agent, the voice assistant, a dashboard
+//     caller that is not the person's own browser (an operator token's
+//     CLI runs tools as "dashboard:<uid>"), and a caller with no ID at all
+//     (an anonymous /mcp call on a gateway without -require-auth-on-mcp,
+//     or stdio), which names no person. The sharing rule treats a
+//     delegated caller as an agent, so it never sees a skill shared with
+//     nobody, a hidden source or one waiting for approval.
 func (g *Gateway) skillViewer(ctx context.Context, hub *skillHubConfig) skillhub.Viewer {
 	caller := agentIDFromContext(ctx)
-	v := skillhub.Viewer{Admin: g.scopeFor(ctx, caller).OwnerIsAdmin()}
+	v := skillhub.Viewer{Admin: g.scopeFor(ctx, caller).OwnerIsAdmin(), Delegated: true}
 	switch kind, owner := callerKind(caller); kind {
 	case agentKindDashboard, agentKindVoice:
 		v.UserID = owner

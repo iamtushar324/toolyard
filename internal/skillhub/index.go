@@ -96,9 +96,10 @@ func (si *srcIndex) repoLabel() string { return RepoLabel(si.src.Owner, si.src.R
 //     visibility: everyone, members or nobody).
 //   - blocked(skill) is the source's block list plus the skill's own.
 //   - Audience nobody: only a person in the dashboard (no agent ID, not a
-//     delegated caller such as an operator token's CLI or the voice
-//     assistant) who is an admin, or the source's creator, sees the skill.
-//     Agents never do, an admin's included.
+//     delegated caller such as an operator token's CLI, the voice
+//     assistant or a caller with no ID at all) who is an admin, or the
+//     source's creator, sees the skill. Agents never do, an admin's
+//     included.
 //   - Otherwise a viewer sees the skill when they are an admin, or when
 //     they are in the audience (everyone; members: listed) and not blocked.
 //   - An agent is the viewer its owner is (UserID is the owner, Admin the

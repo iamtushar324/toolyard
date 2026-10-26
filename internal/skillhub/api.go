@@ -354,8 +354,9 @@ type Viewer struct {
 	// and federation agents). Others see RunsHost skills only with
 	// SearchQuery.IncludeHost / ListQuery.IncludeHost.
 	OnHost bool
-	// Delegated is a caller without an agent ID that still acts for the
-	// person (an operator token's CLI, the voice assistant): the sharing
+	// Delegated is every caller but a person in their own dashboard page:
+	// an agent, a caller that acts for the person (an operator token's
+	// CLI, the voice assistant) and a caller with no ID at all. The sharing
 	// rule treats it as an agent, so it never sees audience nobody.
 	Delegated bool
 }
