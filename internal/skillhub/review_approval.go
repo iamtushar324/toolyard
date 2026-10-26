@@ -2,14 +2,18 @@ package skillhub
 
 // Approval of a skill contributor's source (docs/skills-hub.md
 // "Contributors"). A source a contributor adds starts pending approval: it
-// syncs, and agents see nothing of it. RequestApproval puts one Inbox
-// question for the owner (the review hook's fallback reviewer) with the
-// repository, branch, folder, audience, the preview's counts and warnings;
-// approve makes the source live (SharingAdmin.DecideApproval, which also
-// makes its waiting version active), reject disables it with the reason.
-// An admin may decide on the source page instead; the API then closes the
-// open item (SettleApproval). The Inbox sweep settles what the handler
-// could not (SweepApprovals, run by ReviewInbox.Sweep).
+// syncs, every new commit waits (whatever the update mode), and agents see
+// nothing of it. RequestApproval puts one Inbox question for the owner
+// (the review hook's fallback reviewer) with the repository, branch,
+// folder, audience, the commit and its counts and warnings; when a newer
+// commit comes to wait, the question is asked again for it
+// (PendingApprovalVersion). Approve makes the source live, bound to the
+// question's commit (SharingAdmin.DecideApprovalFrom, which makes that
+// waiting version active and refuses when another commit would go live);
+// reject disables it with the reason. Both apply only while the source
+// still waits. An admin may decide on the source page instead; the API
+// then closes the open item (SettleApproval). The Inbox sweep settles what
+// the handler could not (SweepApprovals, run by ReviewInbox.Sweep).
 
 import (
 	"context"
@@ -86,6 +90,43 @@ func (ri *ReviewInbox) RequestApproval(ctx context.Context, src Source, prev *Pr
 	return ri.store.setInbox(ctx, row.ID, item.ID)
 }
 
+var _ ApprovalHook = (*ReviewInbox)(nil)
+
+// PendingApprovalVersion follows a contributor's source that waits for
+// approval to its waiting version v (the sync engine calls it whenever a
+// sync stages a version, or finds one still waiting). An approval is
+// bound to the commit its question shows, so an open question that shows
+// another commit is closed and asked again for v's commit, with v's
+// counts and warnings. A question that shows v's commit, or no open
+// question (an admin decides on the Skills page then), adds nothing.
+func (ri *ReviewInbox) PendingApprovalVersion(ctx context.Context, src Source, v Version) error {
+	if src.Approval != ApprovalPending || v.SHA == "" {
+		return nil
+	}
+	open, err := ri.store.pendingForSource(ctx, proposalKindApproval, src.ID)
+	if err != nil || len(open) == 0 {
+		return err
+	}
+	contributor := ""
+	for _, row := range open {
+		var in approvalInput
+		_ = json.Unmarshal([]byte(row.Input), &in)
+		if strings.EqualFold(in.SHA, v.SHA) {
+			return nil
+		}
+		if contributor == "" {
+			contributor = in.Contributor
+		}
+	}
+	if err := ri.settleRows(ctx, open, "a newer commit of the source waits for approval: commit "+reviewShort(v.SHA)); err != nil {
+		return err
+	}
+	src.PendingVersionID = v.ID
+	prev := &Preview{Source: src, SHA: v.SHA, SkillCount: v.SkillCount, FileCount: v.FileCount, TotalBytes: v.TotalBytes,
+		Warnings: nonNilWarnings(v.Warnings), Sample: []SkillSummary{}}
+	return ri.RequestApproval(ctx, src, prev, contributor)
+}
+
 // SettleApproval closes the open approval question of a source after an
 // admin decided on the Skills page or deleted the source.
 func (ri *ReviewInbox) SettleApproval(ctx context.Context, sourceID, reason string) error {
@@ -132,9 +173,15 @@ func (ri *ReviewInbox) decideApproval(ctx context.Context, r *inbox.Request) (st
 	if ok, err := ri.store.move(ctx, row.ID, []string{proposalPending}, proposalRejected, proposalUpdate{DecidedBy: decider}); err != nil || !ok {
 		return "This approval was already settled.", err
 	}
-	src, err := sa.DecideApproval(ctx, decider, row.SourceID, false, note, "")
+	// Only a source that still waits: one decided on the Skills page
+	// meanwhile keeps that decision.
+	src, err := sa.DecideApprovalFrom(ctx, decider, row.SourceID, ApprovalPending, false, note, "")
 	if err != nil {
-		_, _ = ri.store.move(ctx, row.ID, []string{proposalRejected}, proposalFailed, proposalUpdate{Error: reviewClip(err.Error(), 500)})
+		to := proposalFailed
+		if errors.Is(err, ErrNotFound) || errors.Is(err, ErrConflict) {
+			to = proposalCancelled // deleted, or decided on the Skills page meanwhile
+		}
+		_, _ = ri.store.move(ctx, row.ID, []string{proposalRejected}, to, proposalUpdate{Error: reviewClip(err.Error(), 500)})
 		return "", fmt.Errorf("reject the source: %w", err)
 	}
 	ri.auditApproval(ctx, "skills.source_reject", decider, row, note)
@@ -143,16 +190,18 @@ func (ri *ReviewInbox) decideApproval(ctx context.Context, r *inbox.Request) (st
 
 // applyApproval makes an approved row's source live and records the
 // outcome; the row is approved (the caller won that move or a resume's
-// claim). Only a waiting version at the commit the question showed goes
-// live with it.
+// claim). The approval is bound to the commit the question showed, and
+// applies only while the source still waits: a source an admin rejected
+// (or approved) on the Skills page meanwhile keeps that decision, and the
+// row is cancelled.
 func (ri *ReviewInbox) applyApproval(ctx context.Context, sa SharingAdmin, row *proposalRow, decider, via string) (string, error) {
 	var in approvalInput
 	_ = json.Unmarshal([]byte(row.Input), &in)
-	src, err := sa.DecideApproval(ctx, decider, row.SourceID, true, "", in.SHA)
+	src, err := sa.DecideApprovalFrom(ctx, decider, row.SourceID, ApprovalPending, true, "", in.SHA)
 	if err != nil {
 		to := proposalFailed
 		if errors.Is(err, ErrNotFound) || errors.Is(err, ErrConflict) {
-			to = proposalCancelled // deleted, or decided on the Skills page meanwhile
+			to = proposalCancelled // deleted, decided on the Skills page, or another commit would go live
 		}
 		_, _ = ri.store.move(ctx, row.ID, []string{proposalApproved}, to, proposalUpdate{Error: reviewClip(err.Error(), 500)})
 		return "", fmt.Errorf("approve the source: %w", err)

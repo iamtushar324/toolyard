@@ -13,7 +13,6 @@ package skillhub
 
 import (
 	"context"
-	"database/sql"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -169,15 +168,25 @@ func (s *Service) SetSkillSharing(ctx context.Context, by, id, skillPath string,
 const bumpUpdatedAt = `CASE WHEN updated_at >= ? THEN updated_at + 1 ELSE ? END`
 
 // DecideApproval approves or rejects a skill contributor's source that
-// waits for approval (or was rejected: an admin may still approve it).
-// Approve makes the source live: approval "approved" and the source
-// enabled. Its waiting version (review mode) goes live with it only when
-// that version is at sha, the commit the approver saw on the approval
-// question; any other waiting version becomes a normal review question
-// for an admin, so nothing goes live that the approver did not see.
-// Reject disables the source, with note as the reason. A source that
-// needs no approval, or one already approved, is ErrConflict.
+// waits for approval (or was rejected: an admin may still approve it on
+// the Skills page). Approve makes the source live (approval "approved",
+// the source enabled), bound to sha, the commit the approver saw
+// (approveSource). Reject disables the source, with note as the reason.
+// A source that needs no approval, or one already approved, is
+// ErrConflict.
 func (s *Service) DecideApproval(ctx context.Context, by, id string, approve bool, note, sha string) (*Source, error) {
+	return s.decideApproval(ctx, by, id, nil, approve, note, sha)
+}
+
+// DecideApprovalFrom is DecideApproval for a source still in approval
+// state from: any other state is ErrConflict. The Inbox decides with
+// ApprovalPending, so a late answer to the question never approves a
+// source an admin rejected on the Skills page meanwhile.
+func (s *Service) DecideApprovalFrom(ctx context.Context, by, id string, from Approval, approve bool, note, sha string) (*Source, error) {
+	return s.decideApproval(ctx, by, id, &from, approve, note, sha)
+}
+
+func (s *Service) decideApproval(ctx context.Context, by, id string, from *Approval, approve bool, note, sha string) (*Source, error) {
 	r, err := s.getSourceRow(ctx, s.db, id)
 	if err != nil {
 		return nil, err
@@ -185,59 +194,113 @@ func (s *Service) DecideApproval(ctx context.Context, by, id string, approve boo
 	switch {
 	case r.Approval == ApprovalNone:
 		return nil, fmt.Errorf("%w: source %s was added by an admin: there is nothing to approve", ErrConflict, r.Slug)
+	case from != nil && r.Approval != *from:
+		return nil, fmt.Errorf("%w: source %s is %s now, not %s: it was decided meanwhile", ErrConflict, r.Slug, r.Approval, *from)
 	case r.Approval == ApprovalApproved:
 		return nil, fmt.Errorf("%w: source %s is approved already", ErrConflict, r.Slug)
 	case r.Approval == ApprovalRejected && !approve:
 		return nil, fmt.Errorf("%w: source %s is rejected already", ErrConflict, r.Slug)
+	}
+	if approve {
+		return s.approveSource(ctx, by, r, strings.ToLower(strings.TrimSpace(sha)))
 	}
 	note = strings.TrimSpace(note)
 	if len(note) > maxApprovalNote {
 		note = note[:maxApprovalNote]
 	}
 	now := s.now().UnixMilli()
-	var res sql.Result
-	if approve {
-		res, err = s.db.ExecContext(ctx, `UPDATE skill_sources SET approval = ?, approval_note = '', approval_by = ?, enabled = 1,
-			updated_at = `+bumpUpdatedAt+` WHERE id = ? AND approval = ?`, string(ApprovalApproved), by, now, now, id, string(r.Approval))
-	} else {
-		res, err = s.db.ExecContext(ctx, `UPDATE skill_sources SET approval = ?, approval_note = ?, approval_by = ?, enabled = 0,
-			updated_at = `+bumpUpdatedAt+` WHERE id = ? AND approval = ?`, string(ApprovalRejected), note, by, now, now, id, string(r.Approval))
-	}
+	res, err := s.db.ExecContext(ctx, `UPDATE skill_sources SET approval = ?, approval_note = ?, approval_by = ?, enabled = 0,
+		updated_at = `+bumpUpdatedAt+` WHERE id = ? AND approval = ?`, string(ApprovalRejected), note, by, now, now, id, string(r.Approval))
 	if err != nil {
 		return nil, fmt.Errorf("skillhub: decide approval: %w", err)
 	}
 	if n, _ := res.RowsAffected(); n == 0 {
 		return nil, fmt.Errorf("%w: source %s was decided meanwhile", ErrConflict, r.Slug)
 	}
-	s.log.Info("skillhub: contributor source decided", "source", id, "approved", approve, "by", by)
-	if approve && r.PendingVersionID != "" {
-		s.approveWaitingVersion(ctx, by, r, sha)
-	}
-	if approve && !r.Enabled {
-		s.pokePoller()
-	}
+	s.log.Info("skillhub: contributor source decided", "source", id, "approved", false, "by", by)
 	s.changed(ctx, id)
 	return s.GetSource(ctx, id)
 }
 
-// approveWaitingVersion settles an approved source's waiting version: live
-// when it is at sha (the commit the approver saw), else a normal review
-// question, which the source no longer skips now that it is approved.
-func (s *Service) approveWaitingVersion(ctx context.Context, by string, r *sourceRow, sha string) {
-	v, err := s.getVersionRow(ctx, s.db, r.ID, r.PendingVersionID)
-	if err != nil {
-		s.log.Warn("skillhub: reading an approved source's waiting version failed", "source", r.ID, "err", err.Error())
-		return
-	}
-	if sha != "" && strings.EqualFold(v.SHA, sha) {
-		if err := s.Activate(ctx, by, r.ID, v.ID); err != nil && !errors.Is(err, ErrConflict) {
-			s.log.Warn("skillhub: making an approved source's waiting version live failed", "source", r.ID, "err", err.Error())
+// approveSource approves a contributor's source, bound to sha, the commit
+// the approver saw (on the Inbox question, or on the source page):
+// nothing goes live that the approver did not see.
+//
+//   - A waiting version at sha (built with the source's current settings)
+//     is made live first, while agents still see nothing of the source;
+//     the approval then serves exactly it.
+//   - Another waiting version of a review-mode source becomes a normal
+//     review question once the source is approved: only an admin makes it
+//     live. Of an automatic or pinned source, the next check would make
+//     it live: the approval is refused (ErrConflict).
+//   - Otherwise a live version not at sha is refused, and so is an
+//     automatic or pinned source that synced nothing yet (its first sync
+//     would make an unseen commit live).
+//
+// The approval is stored only while the source still has the live and
+// waiting versions this checked, so a sync in between cannot slip in a
+// commit nobody saw: that is ErrConflict too, and the admin looks again.
+func (s *Service) approveSource(ctx context.Context, by string, r *sourceRow, sha string) (*Source, error) {
+	var waiting *versionRow
+	if r.PendingVersionID != "" {
+		v, err := s.getVersionRow(ctx, s.db, r.ID, r.PendingVersionID)
+		switch {
+		case err == nil:
+			waiting = v
+		case !errors.Is(err, ErrNotFound):
+			return nil, err
 		}
-		return
 	}
-	src := r.Source
-	src.Approval = ApprovalApproved
-	s.notifyReview(ctx, &sourceRow{Source: src}, v)
+	match := waiting != nil && sha != "" && strings.EqualFold(waiting.SHA, sha) && waiting.config == r.configHash()
+	switch {
+	case match:
+	case waiting != nil && r.Mode != ModeReview:
+		return nil, fmt.Errorf("%w: source %s would serve commit %s, not %s, the commit that was approved; look at it on the Skills page and approve that",
+			ErrConflict, r.Slug, reviewShort(waiting.SHA), approvedLabel(sha))
+	case r.ActiveVersionID != "" && !strings.EqualFold(r.ActiveSHA, sha):
+		return nil, fmt.Errorf("%w: source %s serves commit %s, not %s, the commit that was approved; look at it on the Skills page and approve that",
+			ErrConflict, r.Slug, reviewShort(r.ActiveSHA), approvedLabel(sha))
+	case r.ActiveVersionID == "" && waiting == nil && r.Mode != ModeReview:
+		return nil, fmt.Errorf("%w: source %s has synced no commit yet; approve it after its first sync", ErrConflict, r.Slug)
+	}
+	active, pending := r.ActiveVersionID, r.PendingVersionID
+	if match {
+		if err := s.Activate(ctx, by, r.ID, waiting.ID); err != nil {
+			return nil, fmt.Errorf("skillhub: approve source %s: make commit %s live: %w", r.Slug, reviewShort(waiting.SHA), err)
+		}
+		active, pending = waiting.ID, ""
+	}
+	now := s.now().UnixMilli()
+	res, err := s.db.ExecContext(ctx, `UPDATE skill_sources SET approval = ?, approval_note = '', approval_by = ?, enabled = 1,
+		updated_at = `+bumpUpdatedAt+` WHERE id = ? AND approval = ? AND active_version_id = ? AND pending_version_id = ?`,
+		string(ApprovalApproved), by, now, now, r.ID, string(r.Approval), active, pending)
+	if err != nil {
+		return nil, fmt.Errorf("skillhub: decide approval: %w", err)
+	}
+	if n, _ := res.RowsAffected(); n == 0 {
+		return nil, fmt.Errorf("%w: source %s was decided, or synced another commit, meanwhile; look again", ErrConflict, r.Slug)
+	}
+	s.log.Info("skillhub: contributor source decided", "source", r.ID, "approved", true, "by", by, "sha", sha)
+	if waiting != nil && !match {
+		// Review mode, another commit: a normal review question, which
+		// the source no longer skips now that it is approved.
+		src := r.Source
+		src.Approval = ApprovalApproved
+		s.notifyReview(ctx, &sourceRow{Source: src}, waiting)
+	}
+	if !r.Enabled {
+		s.pokePoller()
+	}
+	s.changed(ctx, r.ID)
+	return s.GetSource(ctx, r.ID)
+}
+
+// approvedLabel names the commit an approval was given for.
+func approvedLabel(sha string) string {
+	if sha == "" {
+		return "none (no commit was named)"
+	}
+	return reviewShort(sha)
 }
 
 // Contributors lists the skill contributors, oldest first.

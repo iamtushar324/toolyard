@@ -568,11 +568,13 @@ function decideSkillSource(src, decision) {
   } else if (!confirm('Approve ' + src.slug + '? The people it is shared with, and their agents, get its skills at once.')) return null;
   const body = { decision };
   if (note.trim()) body.note = note.trim();
-  // Approval makes live only the waiting commit shown on this page; a
-  // newer one waits for a normal review.
+  // The approval is bound to the commit shown on this page: the waiting
+  // one, else the live one. The server refuses it when another commit
+  // would go live, so nothing goes live that the admin did not see.
   const d = skillsUI.detail;
   const waiting = decision === 'approve' && d && d.id === src.id && (d.versions || []).find((v) => v.id === src.pending_version_id);
   if (waiting && waiting.sha) body.sha = waiting.sha;
+  else if (decision === 'approve' && !src.pending_version_id && src.active_sha) body.sha = src.active_sha;
   return skillsBusy('approval', () => api('/v1/skills/sources/' + encodeURIComponent(src.id) + '/approval', { method: 'POST', body }),
     decision === 'approve' ? src.slug + ' approved: agents it is shared with get its skills now.' : src.slug + ' rejected and turned off.');
 }

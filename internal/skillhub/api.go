@@ -539,12 +539,20 @@ type SharingAdmin interface {
 	// within moments.
 	SetSkillSharing(ctx context.Context, by, id, skillPath string, sh SkillSharing) (SkillSharing, error)
 	// DecideApproval approves or rejects (the source is disabled, with
-	// note) a contributor's source that waits for approval. Approving
-	// makes the source live; its waiting version goes live with it only
-	// when that version is at sha, the commit the approver saw (else it
-	// waits for a normal review). Deciding a source that needs no
-	// approval is ErrConflict.
+	// note) a contributor's source that waits for approval; an admin may
+	// also approve one that was rejected. Approving is bound to sha, the
+	// commit the approver saw: a waiting version at sha goes live with
+	// the approval; when another commit would go live (a waiting version
+	// of an automatic or pinned source, or a live version not at sha) the
+	// approval is refused with ErrConflict. A review-mode source's
+	// waiting version at another commit waits for a normal review.
+	// Deciding a source that needs no approval is ErrConflict.
 	DecideApproval(ctx context.Context, by, id string, approve bool, note, sha string) (*Source, error)
+	// DecideApprovalFrom is DecideApproval for a source that is still in
+	// approval state from (the Inbox decides only a source that still
+	// waits: ApprovalPending). A source in any other state is ErrConflict,
+	// so a question answered late never undoes a decision made meanwhile.
+	DecideApprovalFrom(ctx context.Context, by, id string, from Approval, approve bool, note, sha string) (*Source, error)
 	// PreviewSource is a dry run of a stored source with its own settings
 	// and credential (a new approval question after a contributor changed
 	// what is fetched).
@@ -567,6 +575,15 @@ type ContributorsAdmin interface {
 // ReviewHook is called when a review-mode source has a new staged version.
 type ReviewHook interface {
 	PendingVersion(ctx context.Context, src Source, v Version) error
+}
+
+// ApprovalHook is an optional part of a ReviewHook (*ReviewInbox
+// implements it). The sync engine calls it, instead of PendingVersion,
+// when a skill contributor's source that waits for approval has a waiting
+// version: the open approval question follows the commit that approving
+// would make live.
+type ApprovalHook interface {
+	PendingApprovalVersion(ctx context.Context, src Source, v Version) error
 }
 
 // TokenSource returns a GitHub token that can read a repository for a user.

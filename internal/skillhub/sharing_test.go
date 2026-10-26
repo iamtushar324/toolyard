@@ -538,13 +538,18 @@ func TestContributorSourceApproval(t *testing.T) {
 		t.Fatalf("approve with another commit: %+v %v (hook %d -> %d)", st, err, before, hook.n)
 	}
 
-	// Reject, then approve after all.
+	// Reject, then approve after all. An automatic source makes no commit
+	// live while it waits: the commit waits for the approval.
 	two, err := svc.CreateSource(ctx, "usr_contrib", SourceInput{URL: "acme/skills", Slug: "two", Path: "skills", Mode: ModeAuto, PendingApproval: true})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if res, err := svc.SyncNow(ctx, two.ID); err != nil || !res.Activated {
-		t.Fatalf("auto sync: %+v %v", res, err)
+	twoRes, err := svc.SyncNow(ctx, two.ID)
+	if err != nil || !twoRes.Staged || twoRes.Activated {
+		t.Fatalf("auto sync of a pending source: %+v %v", twoRes, err)
+	}
+	if p, _ := svc.GetSource(ctx, two.ID); p.ActiveVersionID != "" || p.PendingVersionID != twoRes.VersionID {
+		t.Fatalf("pending auto source: active %q pending %q", p.ActiveVersionID, p.PendingVersionID)
 	}
 	if srcs, _ := svc.Sources(ctx, memberViewer); len(srcs) != 1 {
 		t.Fatalf("an auto-mode source pending approval is shown: %+v", srcs)
@@ -556,7 +561,15 @@ func TestContributorSourceApproval(t *testing.T) {
 	if _, err := svc.DecideApproval(ctx, "usr_admin", two.ID, false, "", ""); !errors.Is(err, ErrConflict) {
 		t.Fatalf("reject twice: %v", err)
 	}
-	if again, err := svc.DecideApproval(ctx, "usr_admin", two.ID, true, "", ""); err != nil || again.Approval != ApprovalApproved || !again.Enabled {
+	// An approval that names no commit, or another one, would make an
+	// unseen commit live: refused.
+	for _, sha := range []string{"", strings.Repeat("e", 40)} {
+		if _, err := svc.DecideApproval(ctx, "usr_admin", two.ID, true, "", sha); !errors.Is(err, ErrConflict) {
+			t.Fatalf("approve an automatic source with commit %q: %v", sha, err)
+		}
+	}
+	again, err := svc.DecideApproval(ctx, "usr_admin", two.ID, true, "", strings.ToUpper(twoRes.SHA))
+	if err != nil || again.Approval != ApprovalApproved || !again.Enabled || again.ActiveVersionID != twoRes.VersionID || again.PendingVersionID != "" {
 		t.Fatalf("approve after a rejection: %+v %v", again, err)
 	}
 	// An admin's source needs no approval.
@@ -841,9 +854,9 @@ func TestApprovalInboxItem(t *testing.T) {
 		t.Fatalf("after the Inbox rejection: %+v", got)
 	}
 
-	// A question whose commit is no longer the waiting one: the Inbox
-	// approval makes the source live and leaves the new commit to a
-	// normal review question.
+	// A commit pushed after the question was asked: the sync makes it the
+	// waiting version, the old question is withdrawn and the question is
+	// asked again for the new commit, whose approval makes it live.
 	four, err := svc.CreateSource(ctx, "usr_contrib", SourceInput{URL: "acme/skills", Slug: "four", Path: "skills", Mode: ModeReview, PendingApproval: true})
 	if err != nil {
 		t.Fatal(err)
@@ -855,18 +868,25 @@ func TestApprovalInboxItem(t *testing.T) {
 	if err := ri.RequestApproval(ctx, *four, fourPrev, "Casey"); err != nil {
 		t.Fatal(err)
 	}
-	gh.commit("main", map[string]string{"skills/pr-review/checks.md": "pushed after the question\n"})
-	if res, err := svc.SyncNow(ctx, four.ID); err != nil || !res.Staged {
+	oldRows, _ := ri.store.pendingForSource(ctx, proposalKindApproval, four.ID)
+	pushed := gh.commit("main", map[string]string{"skills/pr-review/checks.md": "pushed after the question\n"})
+	if res, err := svc.SyncNow(ctx, four.ID); err != nil || !res.Staged || res.SHA != pushed {
 		t.Fatalf("four sync: %+v %v", res, err)
 	}
+	if it, _ := ib.Get(ctx, oldRows[0].InboxID); it.Status != inbox.StatusCancelled {
+		t.Fatalf("the question of the old commit: %s", it.Status)
+	}
 	rows, _ = ri.store.pendingForSource(ctx, proposalKindApproval, four.ID)
+	if len(rows) != 1 || !strings.Contains(rows[0].Input, pushed) || !strings.Contains(rows[0].Input, "Casey") {
+		t.Fatalf("question asked again: %+v", rows)
+	}
+	if item, _ := ib.Get(ctx, rows[0].InboxID); !strings.Contains(item.Message, reviewShort(pushed)) {
+		t.Fatalf("the new question does not show the new commit:\n%s", item.Message)
+	}
 	decide(rows[0].InboxID, "u_owner", reviewApprove)
 	fourNow, _ := svc.GetSource(ctx, four.ID)
-	if fourNow.Approval != ApprovalApproved || fourNow.ActiveVersionID != "" || fourNow.PendingVersionID == "" {
-		t.Fatalf("approval of a stale question: %+v", fourNow)
-	}
-	if open, err := ri.store.pendingReviews(ctx, four.ID, fourNow.PendingVersionID); err != nil || len(open) != 1 {
-		t.Fatalf("review question for the newer commit: %+v %v", open, err)
+	if fourNow.Approval != ApprovalApproved || fourNow.ActiveSHA != pushed || fourNow.PendingVersionID != "" {
+		t.Fatalf("approval of the asked-again question: %+v", fourNow)
 	}
 
 	// Decided on the Skills page: the open question is withdrawn.
@@ -874,11 +894,15 @@ func TestApprovalInboxItem(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	threeRes, err := svc.SyncNow(ctx, three.ID)
+	if err != nil || !threeRes.Staged {
+		t.Fatalf("three sync: %+v %v", threeRes, err)
+	}
 	if err := ri.RequestApproval(ctx, *three, nil, "Casey"); err != nil {
 		t.Fatal(err)
 	}
 	rows, _ = ri.store.pendingForSource(ctx, proposalKindApproval, three.ID)
-	if _, err := svc.DecideApproval(ctx, "usr_admin", three.ID, true, "", ""); err != nil {
+	if _, err := svc.DecideApproval(ctx, "usr_admin", three.ID, true, "", threeRes.SHA); err != nil {
 		t.Fatal(err)
 	}
 	if err := ri.SettleApproval(ctx, three.ID, "approved on the Skills page"); err != nil {
