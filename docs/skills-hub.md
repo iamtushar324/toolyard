@@ -179,20 +179,27 @@ they added as a contributor and the Add source wizard.
   live while it waits, whatever its update mode: each new commit becomes
   its waiting version. The owner gets one Inbox question with the
   repository, branch, folder, audience, and the commit with its counts
-  and warnings; when a newer commit comes to wait, the question is asked
-  again for that commit (and the old one closed). **Approve** is bound to
-  the commit the question (or the source page) shows: that commit goes
-  live with the approval. When another commit would go live instead (a
-  newer waiting commit of an automatic source, a live commit that is not
-  the one shown, or nothing synced yet), the approval is refused, the
-  source keeps waiting, and the question is asked again for the commit it
-  waits with; a review-mode source's newer commit waits for a normal
-  review. The question is never lost: a check of a waiting source that
-  finds no open question (the first ask failed, or it expired) asks
-  again.
+  and warnings; when a newer commit (or the same commit with other
+  settings) comes to wait, the question is asked again for it (and the
+  old one closed). The question always shows the source as it is when it
+  is asked. **Approve** is bound to what the question shows: its commit,
+  built with the folder, excludes and limits it showed (on the source
+  page: the commit, with the source's current settings); exactly that
+  version goes live with the approval. When another version would go
+  live instead (a newer waiting commit of an automatic source, the same
+  commit with other settings, a live commit that is not the one shown, or
+  nothing synced yet), the approval is refused and the source keeps
+  waiting: the question is asked again for the version it waits with, or,
+  with nothing synced yet, by the first sync. A review-mode source's newer
+  commit waits for a normal review. The question is never lost: a check
+  of a waiting source that finds no open question (the first ask failed,
+  or it expired) asks again, and one that finds a question left over next
+  to the current one closes it.
   **Reject** disables it, with the reason. A change of branch, folder,
   excludes, credential or update mode while it waits closes the question
-  and asks again with a new dry run. Admins can also approve or reject on
+  and asks again with a new dry run; a change of branch, folder or
+  excludes also drops the waiting version, which the old settings built
+  (the next check stages the new one). Admins can also approve or reject on
   the source page (an admin may approve a rejected source there), and
   **hide** or delete any contributor's source at any time. An Inbox answer
   applies only while the source still waits: a late one never undoes a
@@ -392,7 +399,7 @@ answers them 403 `admin_only`. Errors are `{"error", "code"}` with the codes `in
 | `GET /v1/skills/sources/{id}/versions?limit=` | *contributor*. The last versions (default 20, at most 100) |
 | `POST /v1/skills/sources/{id}/versions/{vid}/activate` | make a version live (approve or roll back) |
 | `POST /v1/skills/sources/{id}/versions/{vid}/reject` | `{note?}`: reject a staged version |
-| `POST /v1/skills/sources/{id}/approval` | `{decision: "approve" or "reject", note?, sha?}`: decide a contributor's source; closes its Inbox question. The approval is bound to `sha`, the commit you saw: a waiting version at that commit goes live with it; 409 `conflict` when another commit would go live (a waiting commit of an automatic source, a live commit not at `sha`, or an automatic source that synced nothing yet). A review-mode source's waiting version at another commit waits for review |
+| `POST /v1/skills/sources/{id}/approval` | `{decision: "approve" or "reject", note?, sha?}`: decide a contributor's source; closes its Inbox question. The approval is bound to `sha`, the commit you saw: a waiting version at that commit, built with the source's current settings, goes live with it; 409 `conflict` when another version would go live (a waiting commit of an automatic source not at `sha` or built with older settings, a live commit not at `sha`, or an automatic source that synced nothing yet). A review-mode source's waiting version at another commit waits for review |
 | `GET /v1/skills/sources/{id}/skills` | *contributor*. Skills with where they run, their own sharing (`sharing`, absent when they follow the source) and reads in 30 days |
 | `PUT /v1/skills/sources/{id}/skills/runs` | *contributor*. `{path, runs}`: `anywhere`, `host`, or `""` to clear the override |
 | `PATCH /v1/skills/sources/{id}` with `{hidden}` | admin: hide the source from every agent (`true`) or show it again |

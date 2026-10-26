@@ -343,23 +343,39 @@ UI in `app.js`.
    not approved, a sync stages every new version (as review mode) and
    never activates one; a staged version found again for the source's
    commit and settings (the folder went A, B, A) becomes the waiting
-   version again. At every check the hook's
-   `ApprovalHook.PendingApprovalVersion` keeps one open approval question
-   for the waiting commit: it asks a new one first and then closes one
-   that shows another commit, asks when none is open (the first ask
-   failed, it expired), and waits while an answer is being applied. An
-   answer refused for its commit asks again for the waiting commit. Asks
-   are idempotent across replicas (`insertIfNoneOpen` counts and inserts
-   under the source's row lock).
-   `DecideApproval(approve, sha)` makes the waiting version at `sha`
-   live (before the approval is stored), and refuses with `ErrConflict`
-   when another commit would go live: a waiting version of an automatic
-   or pinned source not at `sha`, a live version not at `sha`, or an
-   automatic or pinned source with nothing synced. The approval is stored
-   only while the live and waiting versions are the ones checked. The
-   Inbox decides with `DecideApprovalFrom(..., ApprovalPending, ...)`, so
-   a late answer never undoes a decision made on the source page; such a
-   question is settled as cancelled.
+   version again, and `UpdateSource` drops the waiting version when the
+   branch, pinned commit, folder, excludes or limits change. A question
+   is bound to a version: its input keeps the commit, the waiting version
+   ID (none for the dry run of a new or changed source) and the settings
+   digest (`configHash`); it is current for a waiting version it names, or
+   whose commit and settings it shows. Every ask runs in
+   `lockedApproval`: one transaction that holds the source's row, reads
+   the source, its waiting version and its open questions again, and
+   inserts only what still holds, so a caller's outdated source or
+   version (a sync that read it before a settings change) asks nothing,
+   a dry run of settings the source no longer has asks nothing, the card
+   shows the source as locked, and two askers on any replica never both
+   add one. At every check the hook's
+   `ApprovalHook.PendingApprovalVersion` keeps one open question that is
+   current for the waiting version: it asks a new one first and then
+   closes the others, closes leftovers next to a current one, asks when
+   none is open (the first ask failed, it expired), and waits while an
+   answer is being applied. An answer refused for its version asks again
+   for the waiting version (none, or one built with old settings: the sync
+   that stages the current one asks).
+   `DecideApproval(approve, sha)` (the source page) makes the waiting
+   version at `sha` with the source's current settings live (before the
+   approval is stored), and refuses with `ErrConflict` when another
+   version would go live: a waiting version of an automatic or pinned
+   source that does not match, a live version not at `sha`, or an
+   automatic or pinned source with nothing synced. The Inbox decides with
+   `DecideApprovalFrom(..., ApprovalPending, ..., binding)`, the binding
+   being the question's commit, version and settings digest: only a
+   waiting (or live) version that matches all of them goes live, so a
+   card never approves a version built with other settings; and a late
+   answer never undoes a decision made on the source page (the question
+   is settled as cancelled). The approval is stored only while the live
+   and waiting versions are the ones checked.
 4. **At most three waiting sources per contributor.** `CreateSource`
    counts and inserts under `cluster.LockCtx(ctx,
    "skillhub:contributor:"+userID)`, so parallel creates on any replica
