@@ -534,6 +534,13 @@ the database and serves only that copy. How sync, review and limits work:
   owners, default empty): a new source from one of these owners syncs in
   mode `auto` by default (a new commit goes live once it is synced); every other
   source defaults to `review` (a new commit waits for an admin).
+- **Sharing and contributors** (no flag or setting; data in the
+  database, migrations `0073` and `0074`). Admins choose who sees each
+  source and each skill (everyone, chosen members, nobody, and block
+  lists), and which members may add skill sources (skill contributors,
+  whose sources wait for an admin's approval). See
+  [skills-hub.md](skills-hub.md#sharing). Rollback: an older binary
+  ignores both, so it shows every source by its visibility alone.
 - **Network.** toolyard calls only the GitHub API
   (`https://api.github.com`) and `codeload.github.com`, where GitHub
   redirects archive downloads. Allow both through an egress proxy or

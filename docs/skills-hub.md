@@ -37,7 +37,9 @@ contract between the parts are in
 ## For admins
 
 The skills hub is on with `-skills=on` (`TOOLYARD_SKILLS=on`). Everything
-below needs the owner or an admin; members do not see the Skills page.
+below needs the owner or an admin, except what [skill
+contributors](#contributors) may do with their own sources; other members
+do not see the Skills page.
 
 ### Add a source
 
@@ -94,14 +96,88 @@ offered.
 ### Who sees a source, and where skills run
 
 **Everyone** shows the source to every active member and their agents;
-**chosen members** to the people you pick (and their agents). Admins and
-the owner always see every source.
+**chosen members** to the people you pick (and their agents); **nobody**
+hides it from every agent (admins and the person who added it still see it
+in the dashboard). Admins and the owner see every skill that is not set to
+nobody. [Sharing](#sharing) below adds a block list and a setting per
+skill.
 
 A skill **runs anywhere** (Claude.ai, ChatGPT, laptops, the T3 host) or
 **on the T3 host only** (it uses the host's paths and tools; agents
 elsewhere see it only when they ask for host skills). The order of
 precedence: the override on the source page's skills table, then the
 skill's own `metadata.toolyard-runs`, then the source default.
+
+### Sharing
+
+Who sees what is set on the source page, in two places.
+
+- **Sharing** (a panel on the source page): the source's **audience**
+  (everyone, only the members you choose, or nobody) and its **block
+  list**: people who never see any of its skills, whatever the audience.
+- **Shared with** (a column of the skills table): one skill's own
+  setting. **Same as source** (the default) follows the source; or the
+  skill is shared with **everyone**, **only these people**, or **nobody**,
+  whatever the source says. A skill can also have its own block list,
+  which adds to the source's.
+
+The rule, for each skill:
+
+1. A [contributor's](#contributors) source that waits for approval, or
+   was rejected, counts as audience nobody for every skill.
+2. Otherwise the skill's audience is its own setting when it has one,
+   else the source's audience.
+3. Its block list is the source's block list plus its own.
+4. Audience **nobody**: only an admin, or the person who added the
+   source, sees the skill, in the dashboard. No agent sees it, an admin's
+   agent included.
+5. Otherwise a person sees the skill when they are an admin, or when they
+   are in the audience (everyone; or listed) and not blocked.
+6. An agent, an OAuth app (Claude.ai, ChatGPT) included, sees what its
+   owner sees.
+
+A file belongs to the innermost skill that holds it, so a skill set to
+nobody inside a shared skill stays hidden: its files are left out of the
+outer skill's file list and bundle. A source shows in `skills.sources`
+when one of its skills is visible, with the count of visible skills only.
+Every read path applies the rule: search, get, read, grep, list, folder
+reads, bundles (when the link is made and again when it is used),
+sources, the MCP Skills extension, `tools.search`, code mode and REST. A
+hidden skill answers exactly like one that does not exist.
+
+A skill's setting is kept by source and skill path, so it survives new
+versions; a skill that disappears keeps its setting harmlessly, and it
+applies again if the skill comes back. A change reaches every replica
+within moments. Every change is in the audit log with who made it and the
+setting before and after (`skills.source_sharing`, `skills.skill_sharing`).
+
+### Contributors
+
+An admin can let chosen members add skill sources: the **Skill
+contributors** panel on the Skills page (admins only) adds and removes
+them. A contributor sees the Skills page in a limited view: the sources
+they added and the Add source wizard.
+
+- A contributor can inspect, preview and add a source, and edit, sync,
+  pause or delete their own sources, their sharing included. Other
+  people's sources, the trusted owners, the default GitHub token and the
+  Contributors panel stay hidden from them.
+- Their new source starts **pending approval**: it syncs, but agents see
+  nothing of it. The owner gets one Inbox question with the repository,
+  branch, folder, audience, the dry run's counts and warnings. **Approve**
+  makes the source live (its waiting version goes live with it);
+  **reject** disables it, with the reason. Admins can also approve or
+  reject on the source page, and hide (audience nobody) or delete any
+  contributor's source at any time.
+- Their updates are **review** (each new commit waits for an admin: only
+  an admin makes a version live), or **auto** when the repository owner is
+  trusted. Only an admin can pin a source or change its limits.
+- They read a private repository with a read-only token or their own
+  GitHub connection. A public repository reads with the default GitHub
+  token, as an admin's does.
+- A contributor who is removed keeps their sources; only admins can
+  change them then. An agent is never a contributor: the list holds
+  people, and an operator token needs the owner scope to change it.
 
 ### GitHub access and rate limits
 
@@ -262,25 +338,33 @@ days) or is withdrawn stops counting as waiting.
 
 Session-authenticated like the rest of the dashboard API (owner or admin;
 operator tokens need the owner scope for writes and never rotate a webhook
-secret). Errors are `{"error", "code"}` with the codes `invalid` (400),
+secret). A skill contributor may use the routes marked *contributor* for
+their own sources (another person's source answers 404); everything else
+answers them 403 `admin_only`. Errors are `{"error", "code"}` with the codes `invalid` (400),
 `not_found` (404), `conflict` (409), `needs_token` and `limit` (422),
 `rate_limited` (429, with `retry_after` in seconds, `reset_at` and a
 `Retry-After` header), `skills_hub_off` (404 while the hub is off).
 
 | Method and path | What it does |
 | --- | --- |
-| `POST /v1/skills/sources/inspect` | `{url, token?, auth?}`: owner, repo, private, default branch, branches, the branch and folder in the URL, `trusted_owner`; `auth: "github"` reads with your GitHub connection (never with an operator token) |
-| `POST /v1/skills/sources/preview` | a source (as for create): dry run with commit, counts, warnings, sample |
-| `GET /v1/skills/admin/sources` | every source with its status (the agent list is `GET /v1/skills/sources`) |
-| `POST /v1/skills/sources` | create `{url, branch?, path?, exclude?, mode?, pinned_sha?, auth?, token?, poll_seconds?, enabled?, visibility?, members?, default_runs?}`; `201 {source, status: "syncing"}` at once, the first sync running in the background (poll `GET /v1/skills/sources/{id}` until `last_checked_at` is set); the same create by the same person within two minutes answers `200 {source, existing: true}` |
-| `GET`, `PATCH`, `DELETE /v1/skills/sources/{id}` | read, change (only the fields sent; `token` replaces, `clear_token` removes) or delete a source; a change of mode, branch, folder or pinned commit, and a delete, close the open review question |
-| `POST /v1/skills/sources/{id}/sync` | sync now |
-| `GET /v1/skills/sources/{id}/versions?limit=` | the last versions (default 20, at most 100) |
+| `GET /v1/skills/admin/me` | `{user_id, admin, contributor}`: what the signed-in person may do on the Skills page (any signed-in person) |
+| `POST /v1/skills/sources/inspect` | *contributor*. `{url, token?, auth?}`: owner, repo, private, default branch, branches, the branch and folder in the URL, `trusted_owner`; `auth: "github"` reads with your GitHub connection (never with an operator token) |
+| `POST /v1/skills/sources/preview` | *contributor*. A source (as for create): dry run with commit, counts, warnings, sample |
+| `GET /v1/skills/admin/sources` | *contributor*. Every source with its status (a contributor: their own); the agent list is `GET /v1/skills/sources` |
+| `POST /v1/skills/sources` | *contributor*. Create `{url, branch?, path?, exclude?, mode?, pinned_sha?, auth?, token?, poll_seconds?, enabled?, visibility?, members?, blocked?, default_runs?}`; `201 {source, status: "syncing"}` at once, the first sync running in the background (poll `GET /v1/skills/sources/{id}` until `last_checked_at` is set); the same create by the same person within two minutes answers `200 {source, existing: true}`. A contributor's source has `approval: "pending"`; a contributor's mode `pinned`, mode `auto` for an untrusted owner, or `limits` answer 403 `contributor_limit` |
+| `GET`, `PATCH`, `DELETE /v1/skills/sources/{id}` | *contributor*. Read, change (only the fields sent; `token` replaces, `clear_token` removes; `visibility`, `members` and `blocked` are the source's sharing) or delete a source; a change of mode, branch, folder or pinned commit, and a delete, close the open review question |
+| `POST /v1/skills/sources/{id}/sync` | *contributor*. Sync now |
+| `GET /v1/skills/sources/{id}/versions?limit=` | *contributor*. The last versions (default 20, at most 100) |
 | `POST /v1/skills/sources/{id}/versions/{vid}/activate` | make a version live (approve or roll back) |
 | `POST /v1/skills/sources/{id}/versions/{vid}/reject` | `{note?}`: reject a staged version |
-| `GET /v1/skills/sources/{id}/skills` | skills with where they run and reads in 30 days |
-| `PUT /v1/skills/sources/{id}/skills/runs` | `{path, runs}`: `anywhere`, `host`, or `""` to clear the override |
-| `POST /v1/skills/sources/{id}/webhook-secret` | a new webhook secret, once, with the payload URL |
+| `POST /v1/skills/sources/{id}/approval` | `{decision: "approve" or "reject", note?}`: decide a contributor's source; closes its Inbox question |
+| `GET /v1/skills/sources/{id}/skills` | *contributor*. Skills with where they run, their own sharing (`sharing`, absent when they follow the source) and reads in 30 days |
+| `PUT /v1/skills/sources/{id}/skills/runs` | *contributor*. `{path, runs}`: `anywhere`, `host`, or `""` to clear the override |
+| `PUT /v1/skills/sources/{id}/skills/sharing` | *contributor*. `{path, mode, members?, blocked?}`: one skill's sharing; `mode` `everyone`, `members`, `nobody`, or `""` (`inherit`) to follow the source; inherit with no `blocked` clears the setting |
+| `POST /v1/skills/sources/{id}/webhook-secret` | *contributor*. A new webhook secret, once, with the payload URL |
+| `GET /v1/skills/admin/people` | *contributor*. The active people a skill can be shared with or blocked from (emails for admins only) |
+| `GET /v1/skills/admin/contributors` | the skill contributors `{user_id, added_by, added_at}` |
+| `PUT`, `DELETE /v1/skills/admin/contributors/{user id}` | add an active person as a skill contributor, or remove one (their sources stay); operator tokens need the owner scope |
 | `POST /v1/skills/sources/{id}/webhook` | GitHub's push webhook (public, signed) |
 | `GET /v1/skills/admin/github-token` | `{set, rate: {limit, remaining, used, reset}, paused_until?}`: the default read token's state, never the token |
 | `PUT /v1/skills/admin/github-token` | `{token}`: set the default read token (checked with GitHub first) or, with `""`, clear it; answers like the GET |
@@ -289,6 +373,9 @@ Every change is in the audit log (`skills.source_create`,
 `skills.source_update`, `skills.source_delete`, `skills.source_sync`,
 `skills.version_activate`, `skills.version_reject`,
 `skills.runs_override`, `skills.webhook_secret_rotate`,
+`skills.source_sharing`, `skills.skill_sharing` (with the setting before
+and after), `skills.contributor_add`, `skills.contributor_remove`,
+`skills.source_approve`, `skills.source_reject`,
 `skills.source_propose`, `skills.source_proposal_reject`,
 `skills.change_propose`, `skills.change_proposal_reject`,
 `skills.change_pull_request`, `skills.change_proposal_fail`). No response and
@@ -297,11 +384,13 @@ response.
 
 ### How the Inbox carries these questions
 
-Review questions, source proposals and change proposals are Inbox
-*system items*: questions that toolyard itself raises
-(`internal/inbox/system.go`). A review question and a change proposal come
-from the sender "toolyard" and go only to the person who added the source;
-a source proposal comes from the proposing agent and goes to its owner.
+Review questions, approvals of contributors' sources, source proposals
+and change proposals are Inbox *system items*: questions that toolyard
+itself raises (`internal/inbox/system.go`). A review question and a change
+proposal come from the sender "toolyard" and go only to the person who
+added the source (the owner, when that person is no longer an admin); an
+approval question goes to the owner; a source proposal comes from the
+proposing agent and goes to its owner.
 In the Inbox they carry a **toolyard** badge, which only toolyard can set:
 an agent that calls itself "toolyard" gets none. When the answer is
 recorded, toolyard applies it at once and adds the outcome ("Version … is
@@ -324,8 +413,9 @@ open, or its answer is being applied, the checks add nothing.
 
 ### What you see
 
-The catalog shows each caller only the skill sources its owner may see
-(an agent sees what its owner sees; admins see every source). A skill
+The catalog shows each caller only the skills its owner may see (an
+agent sees what its owner sees; admins see every skill that is not set to
+nobody; see [Sharing](#sharing)). A skill
 marked `runs: host` needs the T3 host (its paths and `tools/*.sh`): agents
 that run on the host (T3 host connections and federated T3 environments)
 see those skills; everyone else (ordinary agent keys, identity keys, OAuth
