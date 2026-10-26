@@ -22,13 +22,16 @@ import (
 // grep, listings, the MCP Skills extension, bundles, the per-node index and
 // the cluster messages work unchanged; it never calls GitHub.
 //
-// The version's "commit" is builtin.Digest of the embedded tree. At start,
-// and every builtinCheckEvery after, each node compares the active
-// version's commit with its own tree; when they differ it takes the
-// source's sync lock, looks again, and makes its tree live: an existing
-// version of that tree (a downgrade, or a replica that won the race) or a
-// new one. Two replicas starting together therefore make one version. An
-// older version follows the normal retention.
+// The version's "commit" is builtin.Digest of the embedded tree. At start
+// each node compares the active version's commit with its own tree; when
+// they differ it takes the source's sync lock, looks again, and makes its
+// tree live: an existing version of that tree (a downgrade, or a replica
+// that won the race) or a new one. Two replicas starting together
+// therefore make one version, and while replicas of two toolyard versions
+// run side by side the one that started last decides (no flapping). Every
+// builtinCheckEvery a node retries a start that failed and reinstalls a
+// source that went missing. An older version follows the normal
+// retention.
 //
 // Admins can change who sees the source and where its skills run (the
 // sharing fields and the per-skill runs override); everything about what
@@ -73,6 +76,10 @@ const (
 	builtinRetry = 15 * time.Second
 	// builtinTimeout bounds one install.
 	builtinTimeout = time.Minute
+	// builtinNever is the next_check_at the source keeps (9999-12-31): a
+	// poller of any build, this one's or an older one's, never finds it
+	// due, so nothing ever reads GitHub for it.
+	builtinNever int64 = 253402300799999
 )
 
 // builtinState is the Service's built-in source state.
@@ -82,6 +89,9 @@ type builtinState struct {
 	// load returns the tree; nil is builtin.Files (tests replace it).
 	load func() (map[string][]byte, error)
 	tree *builtinTree
+	// installedAt is when the version this node confirmed live (its own
+	// tree, installed or found) went live; zero until then.
+	installedAt time.Time
 	// lastErr is the last install error logged by the background check,
 	// so a lasting one is logged once.
 	lastErr string
@@ -101,12 +111,23 @@ func reservedSlug(slug string) bool { return slug == BuiltinSlug }
 
 // BuiltinGuide is the skill reference the server instructions point new
 // agents at ("toolyard/toolyard-basics"), or "" when the built-in skills
-// are off.
+// are off or this node does not serve them under their slug (another
+// source held it first). Start installs them before the gateway asks.
 func (s *Service) BuiltinGuide() string {
 	if !s.bi.on {
 		return ""
 	}
+	if si := s.idx.slug(BuiltinSlug); si == nil || si.src.ID != BuiltinSourceID || si.versionID == "" {
+		return ""
+	}
 	return BuiltinSlug + "/" + BuiltinGuideSkill
+}
+
+// builtinInstalledAt is when the version this node confirmed went live.
+func (s *Service) builtinInstalledAt() time.Time {
+	s.bi.mu.Lock()
+	defer s.bi.mu.Unlock()
+	return s.bi.installedAt
 }
 
 // builtinTree returns the tree this binary serves.
@@ -189,20 +210,40 @@ func (s *Service) runBuiltin(ctx context.Context, failed bool) {
 
 // checkBuiltin installs this node's tree when the source does not serve
 // it: one small read when it does.
+//
+// Once this node has confirmed its tree, it leaves a different live
+// version alone when that went live later: a replica that started after
+// this one made its own skills live, and the newest start decides.
 func (s *Service) checkBuiltin(ctx context.Context) error {
 	tree, err := s.builtinTree()
 	if err != nil {
 		return err
 	}
 	row, err := s.getSourceRow(ctx, s.db, BuiltinSourceID)
-	if err == nil && row.ActiveSHA == tree.digest {
-		return nil
-	}
-	if err != nil && !isNotFound(err) {
+	switch {
+	case err != nil && !isNotFound(err):
 		return err
+	case err == nil && row.ActiveSHA == tree.digest:
+		if row.LastError != "" {
+			s.recordBuiltinCheck(ctx, nil) // an old failure, healed since
+		}
+		return nil
+	case err == nil && s.newerBuiltinLive(ctx, row):
+		return nil
 	}
 	_, err = s.ensureBuiltin(ctx)
 	return err
+}
+
+// newerBuiltinLive reports that the live built-in version went live after
+// the one this node confirmed.
+func (s *Service) newerBuiltinLive(ctx context.Context, row *sourceRow) bool {
+	installed := s.builtinInstalledAt()
+	if installed.IsZero() || row.ActiveVersionID == "" {
+		return false
+	}
+	v, err := s.getVersionRow(ctx, s.db, row.ID, row.ActiveVersionID)
+	return err == nil && v.ActivatedAt != nil && v.ActivatedAt.After(installed)
 }
 
 // ensureBuiltin makes this binary's tree the built-in source's active
@@ -225,10 +266,21 @@ func (s *Service) ensureBuiltin(ctx context.Context) (*SyncResult, error) {
 	}
 	res := &SyncResult{SourceID: row.ID, SHA: tree.digest, Full: true}
 	err = s.installBuiltin(lctx, row, tree, res)
+	if err != nil && lctx.Err() != nil {
+		// The lock was lost or the node is stopping: not the source's
+		// failure, so nothing is recorded.
+		res.Error = "the install was interrupted"
+		return res, err
+	}
 	s.recordBuiltinCheck(context.WithoutCancel(lctx), err)
 	if err != nil {
 		res.Error = cleanMessage(err.Error())
 		return res, err
+	}
+	if v, verr := s.getVersionRow(lctx, s.db, row.ID, res.VersionID); verr == nil && v.ActivatedAt != nil {
+		s.bi.mu.Lock()
+		s.bi.installedAt = *v.ActivatedAt
+		s.bi.mu.Unlock()
 	}
 	return res, nil
 }
@@ -329,19 +381,22 @@ func (s *Service) builtinRow(ctx context.Context) (*sourceRow, error) {
 		return nil, fmt.Errorf("%w: another skill source already uses the slug %q, which is reserved for toolyard's built-in skills; delete that source and add its repository again under another slug",
 			ErrConflict, BuiltinSlug)
 	}
+	if _, err := s.db.ExecContext(ctx, `UPDATE skill_sources SET next_check_at = ? WHERE id = ?`, builtinNever, BuiltinSourceID); err != nil {
+		return nil, fmt.Errorf("skillhub: store the built-in source: %w", err)
+	}
 	return s.getSourceRow(ctx, s.db, BuiltinSourceID)
 }
 
 // recordBuiltinCheck records an install's outcome on the source, for the
 // dashboard. It never schedules a check: the poller leaves the built-in
-// source alone.
+// source alone (kind, and a next check that never comes).
 func (s *Service) recordBuiltinCheck(ctx context.Context, cause error) {
 	msg := ""
 	if cause != nil {
 		msg = cleanMessage(cause.Error())
 	}
-	if _, err := s.db.ExecContext(ctx, `UPDATE skill_sources SET last_checked_at = ?, next_check_at = NULL, last_error = ?,
-		failures = 0 WHERE id = ? AND kind = ?`, s.now().UnixMilli(), msg, BuiltinSourceID, KindBuiltin); err != nil {
+	if _, err := s.db.ExecContext(ctx, `UPDATE skill_sources SET last_checked_at = ?, next_check_at = ?, last_error = ?,
+		failures = 0 WHERE id = ? AND kind = ?`, s.now().UnixMilli(), builtinNever, msg, BuiltinSourceID, KindBuiltin); err != nil {
 		s.log.Warn("skillhub: recording the built-in source's check failed", "err", err.Error())
 	}
 }

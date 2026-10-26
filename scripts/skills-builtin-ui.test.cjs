@@ -18,7 +18,7 @@ function harness() {
   });
   vm.runInContext(source, context);
   vm.runInContext(`
-    el = (tag, attrs = {}, ...children) => ({ tag, attrs, children: children.flat(Infinity).filter(x => x != null && x !== false) });
+    el = (tag, attrs = {}, ...children) => ({ tag, attrs, children: children.flat().filter(x => x != null && x !== false) });
     render = () => {};
     toast = () => {};
     relTime = () => 'just now';

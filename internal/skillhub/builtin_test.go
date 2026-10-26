@@ -346,6 +346,22 @@ func TestBuiltinUpgradeMakesOneVersion(t *testing.T) {
 	if src, _ := a.GetSource(ctx, BuiltinSourceID); src.ActiveSHA != builtin.Digest(v1) {
 		t.Fatalf("after the downgrade: %+v", src)
 	}
+	// The replica that installed last decides: b's periodic check leaves
+	// a's later install alone (no flapping between two versions), and its
+	// "Sync now" installs its own tree on purpose.
+	if err := b.checkBuiltin(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if src, _ := b.GetSource(ctx, BuiltinSourceID); src.ActiveSHA != builtin.Digest(v1) {
+		t.Fatalf("an older replica's periodic check took the source back: %+v", src)
+	}
+	if res, err := b.SyncNow(ctx, BuiltinSourceID); err != nil || !res.Activated {
+		t.Fatalf("sync now: %+v %v", res, err)
+	}
+	if src, _ := b.GetSource(ctx, BuiltinSourceID); src.ActiveSHA != builtin.Digest(v2) || src.LastError != "" ||
+		src.NextCheckAt == nil || src.NextCheckAt.Year() != 9999 {
+		t.Fatalf("after sync now: %+v", src)
+	}
 }
 
 // Two replicas with a real cluster (one Postgres database) make one
@@ -535,6 +551,9 @@ func TestBuiltinSlugTakenBeforehand(t *testing.T) {
 	startService(t, svc)
 	if _, err := svc.GetSource(context.Background(), BuiltinSourceID); !errors.Is(err, ErrNotFound) {
 		t.Fatalf("the built-in source was installed over a taken slug: %v", err)
+	}
+	if g := svc.BuiltinGuide(); g != "" {
+		t.Fatalf("the instructions would point at another source's skill: %q", g)
 	}
 	if _, err := svc.ensureBuiltin(context.Background()); !errors.Is(err, ErrConflict) || !strings.Contains(err.Error(), "reserved") {
 		t.Fatalf("install over a taken slug: %v", err)

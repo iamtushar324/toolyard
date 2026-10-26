@@ -491,16 +491,17 @@ bundles, `ty skills pull` and the MCP Skills extension. The source never
 calls GitHub.
 
 **How they upgrade.** The version's commit is the SHA-256 of the embedded
-files (every path and the SHA-256 of its content). At start, and every
-five minutes after, each replica compares the live version with its own
-files; when they differ it takes the source's sync lock, looks again, and
-makes its files live: a version it already has (a downgrade) or a new one
-built through the same checks as a GitHub commit (text only, no secrets,
-the Agent Skills validation). Two replicas that start together make one
-version; a restart with the same files makes none. While replicas of two
-toolyard versions run side by side, the one that checked last is live;
-once only one version runs, every replica serves it within five minutes.
-Older versions follow the usual retention.
+files (every path and the SHA-256 of its content). At start each replica
+compares the live version with its own files; when they differ it takes
+the source's sync lock, looks again, and makes its files live: a version
+it already has (a downgrade) or a new one built through the same checks
+as a GitHub commit (text only, no secrets, the Agent Skills validation).
+Two replicas that start together make one version; a restart with the
+same files makes none. While replicas of two toolyard versions run side
+by side, the one that started last decides, so a rolling upgrade or a
+rollback never flips the skills back and forth. Every five minutes a
+replica retries a start that failed and puts back a source that went
+missing. Older versions follow the usual retention.
 
 **What admins can change.** On the Skills page the source carries a
 **Built in** badge. Admins choose who sees it (**Who sees it**, the same
