@@ -8,8 +8,10 @@ package api
 //   - An admin manages every source and every route.
 //   - A skill contributor (a member an admin named in the Contributors
 //     panel) uses the Skills page in a limited view: the add-source
-//     wizard (inspect, preview, create) and the sources they created
-//     (read, edit, sync, pause, delete, runs and sharing, webhook secret).
+//     wizard (inspect, preview, create) and the sources they created as
+//     a contributor (read, edit, sync, pause, delete, runs and sharing,
+//     webhook secret); a source they added while an admin stays
+//     admin-managed (404 to them).
 //     Their new source waits for an admin's approval: it syncs, and agents
 //     see nothing of it until an admin approves it in the Inbox or on the
 //     source page. They choose review updates, or automatic ones only for
@@ -60,11 +62,15 @@ type skillManager struct {
 	admin bool
 }
 
-// owns reports whether the manager may change src. A contributor never
-// owns the built-in source (toolyard's own skills), whatever it names as
-// its creator.
+// owns reports whether the manager may see and change src. A contributor
+// owns only the sources they added as a contributor (with an approval
+// state): a source they added while they were an admin (no approval
+// state) reads with the admins' default token and goes live without an
+// approval, so it stays admin-managed after they lose the role. Nor do
+// they ever own the built-in source (toolyard's own skills), whatever it
+// names as its creator.
 func (m *skillManager) owns(src *skillhub.Source) bool {
-	return m.admin || (src != nil && src.Kind != skillhub.KindBuiltin && src.CreatedBy == m.u.ID)
+	return m.admin || (src != nil && src.Kind != skillhub.KindBuiltin && src.Approval != skillhub.ApprovalNone && src.CreatedBy == m.u.ID)
 }
 
 // skillApprovals is the part of the review settler that asks for and

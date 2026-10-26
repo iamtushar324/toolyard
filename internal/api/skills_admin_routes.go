@@ -218,7 +218,7 @@ func (s *Server) skillSourceCreate(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	if existing := s.recentSkillSource(r.Context(), u.ID, in); existing != nil {
+	if existing := s.recentSkillSource(r.Context(), u.ID, in); existing != nil && m.owns(existing) {
 		writeJSON(w, http.StatusOK, map[string]any{"source": existing, "status": skillSourceStatus(existing), "existing": true})
 		return
 	}
