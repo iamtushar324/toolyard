@@ -192,3 +192,26 @@ func TestDecideByTapBindsRecipient(t *testing.T) {
 		t.Fatalf("legacy tap decider: user=%q via=%q", got.DeciderUserID, got.DeciderVia)
 	}
 }
+
+// A bound tap counts only while its person is active (a blocked owner
+// keeps old notifications on their phone).
+func TestDecideByTapRefusesInactivePerson(t *testing.T) {
+	e, log := newAttnEnv(t, AttentionConfig{Details: true})
+	ctx := context.Background()
+	s := deploySubmission()
+	s.Urgency = UrgencyNow
+	_, r := mustSubmit(t, e, "ag_1", s)
+	p := log.take()[0]
+	active := map[string]bool{"u_owner": false, "u_admin": true}
+	e.svc.opts.UserActive = func(_ context.Context, uid string) bool { return active[uid] }
+	if _, err := e.svc.DecideByTap(ctx, p.TapTokenFor("u_owner"), TapDeny); !errors.Is(err, ErrTapToken) {
+		t.Fatalf("blocked person's tap: %v, want ErrTapToken", err)
+	}
+	if got, err := e.svc.Get(ctx, r.ID); err != nil || got.Status == StatusDenied {
+		t.Fatalf("request after a refused tap: %+v %v", got, err)
+	}
+	got, err := e.svc.DecideByTap(ctx, p.TapTokenFor("u_admin"), TapDeny)
+	if err != nil || got.Status != StatusDenied {
+		t.Fatalf("active person's tap: %+v %v", got, err)
+	}
+}

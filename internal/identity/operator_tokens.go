@@ -255,21 +255,23 @@ func (s *Service) getOperatorToken(ctx context.Context, id string) (*OperatorTok
 }
 
 // FindUserForOperator resolves a username, email or user id to a user, for
-// the local bootstrap command. An empty ref picks the owner (always an
-// active admin), else the oldest active admin.
+// the local bootstrap command, the way ResolveUserRef does (exact id, then
+// exact username, then one ASCII email match; ErrAmbiguousUser for two).
+// An empty ref picks the owner (always an active admin), else the oldest
+// active admin.
 func (s *Service) FindUserForOperator(ctx context.Context, ref string) (*User, error) {
 	ref = strings.TrimSpace(ref)
-	var id string
-	var err error
-	if ref == "" {
-		err = s.db.QueryRowContext(ctx,
-			`SELECT id FROM users WHERE role = ? AND status = ? ORDER BY is_owner DESC, created_at, id LIMIT 1`,
-			RoleAdmin, StatusActive).Scan(&id)
-	} else {
-		err = s.db.QueryRowContext(ctx,
-			`SELECT id FROM users WHERE id = ? OR username = ? OR lower(email) = lower(?) LIMIT 1`,
-			ref, ref, ref).Scan(&id)
+	if ref != "" {
+		u, err := s.ResolveUserRef(ctx, ref)
+		if errors.Is(err, ErrNoUser) {
+			return nil, fmt.Errorf("no matching user %q", ref)
+		}
+		return u, err
 	}
+	var id string
+	err := s.db.QueryRowContext(ctx,
+		`SELECT id FROM users WHERE role = ? AND status = ? ORDER BY is_owner DESC, created_at, id LIMIT 1`,
+		RoleAdmin, StatusActive).Scan(&id)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, fmt.Errorf("no matching user %q", ref)
 	}

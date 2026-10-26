@@ -134,6 +134,10 @@ type Options struct {
 	Passkeys PasskeyGate
 	// AgentName resolves an agent ID to a display name.
 	AgentName func(ctx context.Context, agentID string) string
+	// UserActive, when set, reports whether a person may still decide:
+	// DecideByTap refuses a bound token whose person is not (blocked, or
+	// gone), since a notification tap needs no session.
+	UserActive func(ctx context.Context, userID string) bool
 	// RichEnabled, when set and false, refuses schema_version 3 items: an
 	// operator turns it off while replicas that predate it still run
 	// (they would drop the version 3 fields when they rewrite an item).

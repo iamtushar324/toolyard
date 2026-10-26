@@ -358,8 +358,11 @@ func (s *Server) usersPatch(w http.ResponseWriter, r *http.Request, caller, targ
 // owner becomes an admin and the caller stays one; identity audits the
 // move (user.owner, with both user ids) in the same transaction. With
 // revoke_previous the caller's agents are disabled and their operator
-// tokens revoked too (the dialog offers it in personal mode, where the
-// previous owner can no longer sign in).
+// tokens revoked in that transaction too. In personal sign-in mode that is
+// always done, every operator token that is not the new owner's is revoked
+// as well (only the owner signs in there), and after the commit the
+// caller's identity key is revoked (identitykeys, which calls the
+// registries; a failure is reported in the answer as identity_key_error).
 func (s *Server) usersMakeOwner(w http.ResponseWriter, r *http.Request, caller, target *identity.User) {
 	ctx := r.Context()
 	if operatorFromContext(ctx) != nil {
@@ -407,17 +410,18 @@ func (s *Server) usersMakeOwner(w http.ResponseWriter, r *http.Request, caller, 
 			}
 		}
 	}
-	if err := s.identity.TransferOwnership(ctx, caller.ID, target.ID); err != nil {
+	opts := identity.TransferOptions{RevokePrevious: body.RevokePrevious}
+	if s.clerkOwnerOnly {
+		opts = identity.TransferOptions{RevokePrevious: true, RevokeOtherOperatorTokens: true}
+	}
+	if _, err := s.identity.TransferOwnershipWith(ctx, caller.ID, target.ID, opts); err != nil {
 		s.writeUserChangeError(w, err)
 		return
 	}
-	if body.RevokePrevious {
-		if _, _, err := s.identity.RevokeUserCredentials(ctx, caller.ID, "user:"+caller.ID, "previous_owner"); err != nil {
-			writeError(w, http.StatusInternalServerError, "ownership moved, but revoking your agents and operator tokens failed: "+err.Error())
-			return
-		}
-		if s.identityKeys != nil {
-			s.identityKeys.Invalidate(caller.ID)
+	identityKeyErr := ""
+	if s.clerkOwnerOnly && s.identityKeys != nil {
+		if _, err := s.identityKeys.Revoke(ctx, caller.ID, caller.ID); err != nil && !errors.Is(err, identitykeys.ErrNoKey) {
+			identityKeyErr = err.Error()
 		}
 	}
 	// The new owner is an admin now: their agents see every server on the
@@ -434,6 +438,10 @@ func (s *Server) usersMakeOwner(w http.ResponseWriter, r *http.Request, caller, 
 	view, err := s.userViewFor(ctx, updated)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if identityKeyErr != "" {
+		writeJSON(w, http.StatusOK, map[string]any{"user": view, "identity_key_error": identityKeyErr})
 		return
 	}
 	writeJSON(w, http.StatusOK, view)

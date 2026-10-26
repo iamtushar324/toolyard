@@ -18,7 +18,7 @@ const state = {
   // Users page (admin): /v1/users rows + the grantable groups.
   users: { rows: [], groups: [], loaded: false, loading: false, error: '', keyBusy: '', keyOpen: {} },
   userAccessModal: null,   // { id, name, selected: {group: bool}, dropped: [], error, saving } while editing access
-  ownerModal: null,        // { id, name, hint, expect: [names], google, typed, revoke, error, saving } while the owner transfers ownership
+  ownerModal: null,        // { id, name, hint, expect: [names], google, typed, error, saving } while the owner transfers ownership
   // "Your Beknown key" card: /v1/me/identity-key status, plus the raw key
   // held only in memory from a reveal until the owner dismisses it.
   myKey: freshMyKey(),
@@ -2147,9 +2147,6 @@ function openOwnerTransfer(u) {
     expect: [u.username, u.email, u.display_name].filter(Boolean),
     google: u.auth === 'clerk',
     typed: '',
-    // Personal sign-in: the previous owner can no longer sign in, so their
-    // agents and operator tokens are revoked with the move unless unticked.
-    revoke: !!(state.authConfig && state.authConfig.owner_only),
     error: '',
     saving: false,
   };
@@ -2174,9 +2171,10 @@ async function submitOwnerTransfer() {
   if (!m || m.saving || !ownerTypedOK(m)) return;
   m.saving = true; m.error = ''; render();
   try {
-    await api(`/v1/users/${encodeURIComponent(m.id)}/make-owner`, { method: 'POST', body: { confirm: m.typed.trim(), revoke_previous: !!m.revoke } });
+    const r = await api(`/v1/users/${encodeURIComponent(m.id)}/make-owner`, { method: 'POST', body: { confirm: m.typed.trim() } });
     if (state.ownerModal === m) state.ownerModal = null;
-    toast(`${m.name} is now the owner`);
+    if (r && r.identity_key_error) toast(`${m.name} is now the owner, but revoking your Beknown key failed: ${r.identity_key_error}`, 'error');
+    else toast(`${m.name} is now the owner`);
     // Personal sign-in admits only the owner: this session has ended.
     if (state.authConfig && state.authConfig.owner_only) { history.replaceState(null, '', '/'); location.reload(); return; }
     state.users.error = '';
@@ -2209,9 +2207,7 @@ function renderOwnerTransferModal() {
         ? el('p', { class: 'err' }, `${m.name} has never signed in with Google, so they could not sign in as the owner. The server refuses this transfer.`)
         : null,
       ownerOnly
-        ? el('label', { class: 'access-opt' },
-            el('input', { type: 'checkbox', checked: m.revoke, on: { change: (e) => { m.revoke = e.target.checked; } } }),
-            el('span', {}, 'Also disable my agents and revoke my operator tokens (recommended: I cannot sign in after this)'))
+        ? el('p', { class: 'meta' }, "The transfer also disables your agents, revokes your Beknown key, and revokes every operator token that is not the new owner's.")
         : null,
       el('label', {},
         el('div', { class: 'meta' }, 'To confirm, type ', el('code', {}, m.hint)),

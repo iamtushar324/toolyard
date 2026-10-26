@@ -273,6 +273,13 @@ func (s *Service) HasUser(ctx context.Context) (bool, error) {
 }
 
 func (s *Service) CreateUser(ctx context.Context, username, password string) (*User, error) {
+	return s.CreateUserAs(ctx, username, password, "")
+}
+
+// CreateUserAs is CreateUser that also audits the new owner and admin as
+// actorID (POST /v1/auth/setup passes ActorSetup), in the same transaction
+// as the insert; actorID "" writes no audit row.
+func (s *Service) CreateUserAs(ctx context.Context, username, password, actorID string) (*User, error) {
 	if !usernameRE.MatchString(username) {
 		return nil, errors.New("username must be 2-64 chars of [A-Za-z0-9._-]")
 	}
@@ -321,6 +328,16 @@ func (s *Service) CreateUser(ctx context.Context, username, password string) (*U
 		`INSERT INTO users(id, username, password_hash, role, status, created_at, updated_at, is_owner) VALUES(?,?,?,?,?,?,?,1)`,
 		id, username, hash, RoleAdmin, StatusActive, now, now); err != nil {
 		return nil, err
+	}
+	if actorID != "" {
+		if err := auditTx(ctx, tx, "user.owner", actorID, "setup",
+			fmt.Sprintf("owner -> %s (%s)", username, id), map[string]any{"to_user_id": id}); err != nil {
+			return nil, err
+		}
+		if err := auditTx(ctx, tx, "user.role", actorID, "setup",
+			fmt.Sprintf("%s role=admin", username), map[string]any{"user_id": id}); err != nil {
+			return nil, err
+		}
 	}
 	if err := tx.Commit(); err != nil {
 		return nil, err
@@ -383,7 +400,7 @@ func (s *Service) GetUserByEmail(ctx context.Context, email string) (*User, erro
 
 // PrimaryUser is the oldest account: the person who set toolyard up. It is
 // not the owner (Owner) once ownership has moved, so the person in charge
-// is OwnerOrPrimary; this stays for what is tied to the oldest account
+// is ActiveOwnerOrAdmin; this stays for what is tied to the oldest account
 // itself (the first Google sign-in with -owner-email links to it).
 func (s *Service) PrimaryUser(ctx context.Context) (*User, error) {
 	u, err := scanUser(s.db.QueryRowContext(ctx,
@@ -812,14 +829,29 @@ func ensureOtherActiveAdmin(ctx context.Context, tx *sql.Tx, d store.Dialect, ex
 
 // ---- agent enrollment --------------------------------------------------------
 
+// ErrReservedAgentName: the name reads as toolyard itself, which names its
+// own Inbox items (IsReservedAgentName).
+var ErrReservedAgentName = errors.New(`agent names starting with "toolyard" are reserved`)
+
+// checkAgentName is the rule for a name a person gives an agent.
+func checkAgentName(name string) error {
+	if !agentNameRE.MatchString(name) {
+		return errors.New("agent name must be 1-64 chars of [A-Za-z0-9 ._:()-]")
+	}
+	if IsReservedAgentName(name) {
+		return ErrReservedAgentName
+	}
+	return nil
+}
+
 // CreateEnrollment returns a short-lived code an operator pastes into an agent's
 // MCP config. The agent then exchanges it for a long-lived token.
 func (s *Service) CreateEnrollment(ctx context.Context, ownerUserID, agentName string, ttl time.Duration) (string, *Agent, error) {
 	if agentName == "" {
 		agentName = "agent"
 	}
-	if !agentNameRE.MatchString(agentName) {
-		return "", nil, errors.New("agent name must be 1-64 chars of [A-Za-z0-9 ._:()-]")
+	if err := checkAgentName(agentName); err != nil {
+		return "", nil, err
 	}
 	code, err := randCode(8)
 	if err != nil {
@@ -846,8 +878,8 @@ func (s *Service) CreateAgentWithToken(ctx context.Context, ownerUserID, agentNa
 	if agentName == "" {
 		agentName = "agent"
 	}
-	if !agentNameRE.MatchString(agentName) {
-		return "", nil, errors.New("agent name must be 1-64 chars of [A-Za-z0-9 ._:()-]")
+	if err := checkAgentName(agentName); err != nil {
+		return "", nil, err
 	}
 	id := "ag_" + uuid.NewString()
 	now := time.Now()
