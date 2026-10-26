@@ -954,6 +954,7 @@ a.btn.primary:hover { background: var(--accent-hover); }
 .reg-table th, .reg-table td { padding: 6px; }
 .reg-error { color: var(--danger); font-size: 12px; }
 .badge.identity { color: var(--link); border-color: var(--link); }
+.badge.owner { color: var(--accent); border-color: var(--accent); margin-left: 6px; }
 .inline-badge { margin-left: 6px; }
 .key-regs { font-size: 12px; }
 .key-regs .meta { margin: 6px 0 2px; }

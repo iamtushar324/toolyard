@@ -95,6 +95,12 @@ func TestClerkSyncKeepsLastAdmin(t *testing.T) {
 	if owner.ID != e.admin.ID || owner.Role != identity.RoleAdmin {
 		t.Fatalf("owner link precondition: %+v", owner)
 	}
+	// A store without an owner (before 0072's startup backfill): the
+	// last-admin rule alone keeps them. An owner who left is suspended
+	// instead (TestClerkSyncSuspendsDepartedOwner).
+	if _, err := e.db.Exec(`UPDATE users SET is_owner = 0`); err != nil {
+		t.Fatal(err)
+	}
 	other := e.member(t, "user_other", "other@beknown.work")
 	e.clerk.set(func(f *fakeClerk) {
 		f.members = map[string]clerk.Member{"user_someone_else": {IsMember: true}}

@@ -18,6 +18,7 @@ const state = {
   // Users page (admin): /v1/users rows + the grantable groups.
   users: { rows: [], groups: [], loaded: false, loading: false, error: '', keyBusy: '', keyOpen: {} },
   userAccessModal: null,   // { id, name, selected: {group: bool}, dropped: [], error, saving } while editing access
+  ownerModal: null,        // { id, name, hint, expect: [names], google, typed, revoke, error, saving } while the owner transfers ownership
   // "Your Beknown key" card: /v1/me/identity-key status, plus the raw key
   // held only in memory from a reveal until the owner dismisses it.
   myKey: freshMyKey(),
@@ -2081,11 +2082,29 @@ async function loadUsers(clearError) {
   render();
 }
 
+// USER_ERRORS turns the Users API's error codes into a sentence.
+const USER_ERRORS = {
+  last_admin: 'Someone must stay an active admin.',
+  owner_protected: 'The owner is always an active admin. Transfer ownership to someone else first, then change their role or block them.',
+  not_owner: 'Only the owner can transfer ownership.',
+  already_owner: 'That person is already the owner.',
+  user_blocked: 'Unblock that person first: the owner must be an active user.',
+  confirm_mismatch: "What you typed doesn't match that person's username, email or name.",
+  no_sign_in: 'That person has never signed in with Google, and on this server only the owner can sign in. They must sign in with Google once first.',
+  no_google_sign_in: 'Clerk shows no verified Google account with that person\'s email, so they could not sign in as the owner.',
+  clerk_unavailable: 'Clerk did not answer. Try again in a minute.',
+  session_required: 'This needs a person signed in to the dashboard.',
+};
+
+function userErrorText(e) {
+  return USER_ERRORS[e.message] || e.message;
+}
+
 // usersFail keeps a 400/409 reason on the page (the toast fades) until the
 // next change goes through.
 function usersFail(e) {
-  state.users.error = e.message;
-  toast(e.message, 'error');
+  state.users.error = userErrorText(e);
+  toast(state.users.error, 'error');
 }
 
 async function patchUser(u, patch, okMsg) {
@@ -2104,6 +2123,109 @@ async function setUserRole(u, role) {
     : `Make ${name} a member? They keep their own agents and only reach the servers granted to them.`;
   if (!confirm(msg)) { render(); return; } // re-render resets the <select>
   await patchUser(u, { role }, `${name} is now ${role === 'admin' ? 'an admin' : 'a member'}`);
+}
+
+// ---- Ownership (Users page) ----
+//
+// The owner is the one person in charge: always an active admin, never
+// demoted or blocked, and the only one who can hand the role on. POST
+// /v1/users/{id}/make-owner must repeat the new owner's username, email or
+// name, so the dialog asks for it typed out.
+
+function openOwnerTransfer(u) {
+  state.ownerModal = {
+    id: u.id,
+    name: userLabel(u),
+    hint: u.email || u.username,
+    expect: [u.username, u.email, u.display_name].filter(Boolean),
+    google: u.auth === 'clerk',
+    typed: '',
+    // Personal sign-in: the previous owner can no longer sign in, so their
+    // agents and operator tokens are revoked with the move unless unticked.
+    revoke: !!(state.authConfig && state.authConfig.owner_only),
+    error: '',
+    saving: false,
+  };
+  render();
+  const input = document.getElementById('owner-transfer-typed');
+  if (input) input.focus();
+}
+
+function closeOwnerTransfer() {
+  if (state.ownerModal && state.ownerModal.saving) return;
+  state.ownerModal = null;
+  render();
+}
+
+function ownerTypedOK(m) {
+  const t = m.typed.trim().toLowerCase();
+  return !!t && m.expect.some((v) => v.trim().toLowerCase() === t);
+}
+
+async function submitOwnerTransfer() {
+  const m = state.ownerModal;
+  if (!m || m.saving || !ownerTypedOK(m)) return;
+  m.saving = true; m.error = ''; render();
+  try {
+    await api(`/v1/users/${encodeURIComponent(m.id)}/make-owner`, { method: 'POST', body: { confirm: m.typed.trim(), revoke_previous: !!m.revoke } });
+    if (state.ownerModal === m) state.ownerModal = null;
+    toast(`${m.name} is now the owner`);
+    // Personal sign-in admits only the owner: this session has ended.
+    if (state.authConfig && state.authConfig.owner_only) { history.replaceState(null, '', '/'); location.reload(); return; }
+    state.users.error = '';
+    await refreshUser();
+    await loadUsers();
+  } catch (e) {
+    m.saving = false;
+    m.error = userErrorText(e);
+    render();
+  }
+}
+
+function renderOwnerTransferModal() {
+  const m = state.ownerModal;
+  const ownerOnly = !!(state.authConfig && state.authConfig.owner_only);
+  const syncGo = () => {
+    const b = document.getElementById('owner-transfer-go');
+    if (b) b.disabled = m.saving || !ownerTypedOK(m);
+  };
+  return el('div', { class: 'modal-bg', on: { click: (e) => { if (e.target === e.currentTarget) closeOwnerTransfer(); } } },
+    el('div', { class: 'modal', role: 'dialog', 'aria-label': 'Transfer ownership' },
+      el('h3', {}, 'Transfer ownership · ' + m.name),
+      el('p', { class: 'meta' },
+        `${m.name} becomes the owner and an admin. You stay an admin until the new owner changes that. ` +
+        "Only the owner can transfer ownership, and nobody can demote or block the owner."),
+      ownerOnly
+        ? el('p', { class: 'err' }, `Only the owner can sign in to this server. After the transfer only ${m.name} can sign in with Google, and you can no longer sign in at all: this browser is signed out.`)
+        : null,
+      ownerOnly && !m.google
+        ? el('p', { class: 'err' }, `${m.name} has never signed in with Google, so they could not sign in as the owner. The server refuses this transfer.`)
+        : null,
+      ownerOnly
+        ? el('label', { class: 'access-opt' },
+            el('input', { type: 'checkbox', checked: m.revoke, on: { change: (e) => { m.revoke = e.target.checked; } } }),
+            el('span', {}, 'Also disable my agents and revoke my operator tokens (recommended: I cannot sign in after this)'))
+        : null,
+      el('label', {},
+        el('div', { class: 'meta' }, 'To confirm, type ', el('code', {}, m.hint)),
+        el('input', {
+          id: 'owner-transfer-typed', autocomplete: 'off', value: m.typed,
+          on: {
+            input: (e) => { m.typed = e.target.value; syncGo(); },
+            keydown: (e) => { if (e.key === 'Enter') submitOwnerTransfer(); },
+          },
+        }),
+      ),
+      m.error ? el('div', { class: 'err' }, m.error) : null,
+      el('div', { class: 'row', style: 'margin-top: 16px; justify-content: flex-end;' },
+        el('button', { disabled: m.saving, on: { click: closeOwnerTransfer } }, 'Cancel'),
+        el('button', {
+          id: 'owner-transfer-go', class: 'danger', disabled: m.saving || !ownerTypedOK(m),
+          on: { click: submitOwnerTransfer },
+        }, m.saving ? 'Transferring…' : 'Transfer ownership'),
+      ),
+    ),
+  );
 }
 
 async function blockUser(u) {
@@ -2389,23 +2511,34 @@ function viewUsers() {
           const self = row.id === me.id;
           const admin = row.role === 'admin';
           const blocked = row.status === 'blocked';
+          const owner = !!row.is_owner;
+          const roleLock = self ? "You can't change your own role"
+            : owner ? 'The owner is always an admin. Transfer ownership first.' : '';
           return el('tr', { style: blocked ? 'opacity: 0.75;' : '' },
             el('td', {}, el('div', { class: 'user-cell' },
               userAvatar(row, true),
               el('div', { class: 'who' },
-                el('span', {}, userLabel(row), self ? el('span', { class: 'meta' }, ' (you)') : null),
+                el('span', {}, userLabel(row), self ? el('span', { class: 'meta' }, ' (you)') : null,
+                  owner ? el('span', { class: 'badge owner inline-badge', title: 'The person in charge of this toolyard' }, 'owner') : null),
                 el('span', { class: 'meta' },
                   row.auth === 'clerk' ? 'Google' : row.auth === 'password' ? 'password' : (row.username || '')),
               ),
             )),
             el('td', { class: 'meta' }, row.email || '—'),
-            el('td', {}, el('select', {
-              disabled: self,
-              title: self ? "You can't change your own role" : '',
-              on: { change: (e) => setUserRole(row, e.target.value) },
-            },
-              el('option', { value: 'admin',  selected: admin }, 'admin'),
-              el('option', { value: 'member', selected: !admin }, 'member'),
+            el('td', {}, el('div', { class: 'stack' },
+              el('select', {
+                disabled: !!roleLock,
+                title: roleLock,
+                'aria-label': 'Role of ' + userLabel(row),
+                on: { change: (e) => setUserRole(row, e.target.value) },
+              },
+                el('option', { value: 'admin',  selected: admin }, 'admin'),
+                el('option', { value: 'member', selected: !admin }, 'member'),
+              ),
+              // Only the owner hands the role on, to another active person.
+              me.is_owner && !self && !blocked
+                ? el('button', { on: { click: () => openOwnerTransfer(row) } }, 'Make owner')
+                : null,
             )),
             el('td', {}, el('div', { class: 'stack' },
               blocked ? el('span', { class: 'badge denied' }, 'blocked') : el('span', { class: 'badge allowed' }, 'active'),
@@ -2413,8 +2546,8 @@ function viewUsers() {
               blocked
                 ? el('button', { on: { click: () => unblockUser(row) } }, 'Unblock')
                 : el('button', {
-                    class: 'danger', disabled: self,
-                    title: self ? "You can't block yourself" : '',
+                    class: 'danger', disabled: self || owner,
+                    title: self ? "You can't block yourself" : owner ? 'The owner cannot be blocked. Transfer ownership first.' : '',
                     on: { click: () => blockUser(row) },
                   }, 'Block'),
             )),
@@ -2439,13 +2572,15 @@ function viewUsers() {
 
   return el('div', {},
     state.userAccessModal ? renderUserAccessModal() : null,
+    state.ownerModal ? renderOwnerTransferModal() : null,
     el('div', { class: 'card' },
       el('div', { class: 'agent-add-bar' },
         el('h2', { style: 'margin: 0;' }, 'People'),
         el('button', { disabled: u.loading, on: { click: () => loadUsers(true) } }, u.loading ? 'Refreshing…' : 'Refresh'),
       ),
       el('p', { class: 'meta', style: 'margin: 4px 0 12px;' },
-        'Members manage only their own agents, and those agents reach only the servers granted here. Admins see and manage everything.'),
+        'Members manage only their own agents, and those agents reach only the servers granted here. Admins see and manage everything, and can make anyone an admin. ' +
+        'The owner, the first person to sign in, is always an admin and cannot be demoted or blocked; only the owner can make someone else the owner (Make owner).'),
       u.error ? el('div', { class: 'err', style: 'margin: 0 0 12px;' }, u.error) : null,
       table,
     ),

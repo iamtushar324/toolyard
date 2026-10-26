@@ -43,7 +43,10 @@ type Service struct {
 	// Membership obtains the current organisation membership from the IdP,
 	// independently of claims in the environment's signed assertion.
 	Membership func(context.Context, string) (Profile, error)
-	now        func() time.Time
+	// OwnerOnly is personal sign-in (-clerk-owner-only): an assertion
+	// counts only for the owner.
+	OwnerOnly bool
+	now       func() time.Time
 	// mu serializes the connection writes in this process; with a
 	// multi-node cluster a cluster lock replaces it (lock, cluster.go).
 	mu      sync.Mutex
@@ -187,14 +190,18 @@ func (s *Service) verify(ctx context.Context, assertion string, cleanup bool) (*
 	if err != nil {
 		return nil, err
 	}
-	// New users are members. This path never assigns an administrator role or
-	// links an owner by email. Returning identity is matched by verified subject.
-	u, err := s.identity.UpsertClerkUser(ctx, identity.ClerkProfile{ClerkUserID: c.Subject, Email: profile.Email, DisplayName: profile.Name, AvatarURL: profile.Avatar}, "")
+	// New users are members. This path never assigns an administrator role,
+	// never makes anyone the owner and never links an owner by email
+	// (NoBootstrap). Returning identity is matched by verified subject.
+	u, err := s.identity.UpsertClerkUser(ctx, identity.ClerkProfile{ClerkUserID: c.Subject, Email: profile.Email, DisplayName: profile.Name, AvatarURL: profile.Avatar, NoBootstrap: true}, "")
 	if err != nil {
 		return nil, err
 	}
 	if u.Status != identity.StatusActive {
 		return nil, ErrRevoked
+	}
+	if s.OwnerOnly && !u.Owner {
+		return nil, ErrUnauthorized
 	}
 	return &Principal{Issuer: c.Issuer, Subject: c.Subject, Origin: origin, User: u}, nil
 }

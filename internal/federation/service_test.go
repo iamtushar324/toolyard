@@ -308,3 +308,32 @@ func TestFederationHandoffConsumptionRejectsInactiveAccess(t *testing.T) {
 		})
 	}
 }
+
+// A federated sign-in only ever provisions a member: never an admin or the
+// owner, even with no admin left and the owner email configured. With
+// personal sign-in only the owner's assertions count.
+func TestFederationNeverPromotesAndOwnerOnly(t *testing.T) {
+	s, admin, key := federationFixture(t)
+	ctx := t.Context()
+	if _, e := s.db.Exec(`UPDATE users SET role = 'member', is_owner = 0`); e != nil {
+		t.Fatal(e)
+	}
+	s.identity.SetOwnerEmail("dave@example.test")
+	p, e := s.Verify(ctx, assertion(t, s, key, "stage", "dave"))
+	if e != nil {
+		t.Fatal(e)
+	}
+	if p.User.Role != identity.RoleMember || p.User.Owner {
+		t.Fatalf("federated sign-in = %+v, want a member", p.User)
+	}
+	if _, e = s.db.Exec(`UPDATE users SET role = 'admin', is_owner = 1 WHERE id = ?`, admin.ID); e != nil {
+		t.Fatal(e)
+	}
+	s.OwnerOnly = true
+	if _, e = s.Verify(ctx, assertion(t, s, key, "stage", "erin")); !errors.Is(e, ErrUnauthorized) {
+		t.Fatalf("non-owner in personal mode: %v, want ErrUnauthorized", e)
+	}
+	if p, e = s.Verify(ctx, assertion(t, s, key, "stage", "user-admin")); e != nil || p.User.ID != admin.ID {
+		t.Fatalf("the owner in personal mode: %+v %v", p, e)
+	}
+}
