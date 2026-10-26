@@ -175,6 +175,9 @@ func (s *Service) Sources(_ context.Context, v Viewer) ([]SourceInfo, error) {
 
 // htmlURL links to a folder of the source at its commit.
 func (si *srcIndex) htmlURL(rel string) string {
+	if si.src.IsBuiltin() {
+		return "" // compiled into toolyard: no repository to link
+	}
 	u := "https://github.com/" + si.src.Owner + "/" + si.src.Repo + "/tree/" + si.sha
 	if p := repoPath(si.src.Path, rel); p != "" {
 		u += "/" + escapePath(p)

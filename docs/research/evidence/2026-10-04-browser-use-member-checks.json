@@ -4,14 +4,14 @@
   "settings_status": 403,
   "pages": [
     {
-      "url": "https://toolyard.stage.dev.beknown.live/#myservers",
+      "url": "https://toolyard-stage.example.com/#myservers",
       "title": "Available services",
       "width": 1536,
       "bodyWidth": 1521,
-      "text": "Available services\n\nServices your agents can use.\n\nYour Beknown key\n\nBeknown services (BkCoreServices, BkDocsServices) use this key to record who made each change. It replaces your Bifrost virtual key.\n\nAsk a toolyard admin to provision your Beknown key.\nMy servers\n\nThe MCP servers and built-in data tools your agents can reach through toolyard.\n\nNo servers granted to you yet.\n\nAsk an admin for access to more servers."
+      "text": "Available services\n\nServices your agents can use.\n\nYour identity key\n\nConnected services use this key to record who made each change. It replaces your Bifrost virtual key.\n\nAsk a toolyard admin to provision your identity key.\nMy servers\n\nThe MCP servers and built-in data tools your agents can reach through toolyard.\n\nNo servers granted to you yet.\n\nAsk an admin for access to more servers."
     },
     {
-      "url": "https://toolyard.stage.dev.beknown.live/#connections",
+      "url": "https://toolyard-stage.example.com/#connections",
       "title": "Connections",
       "width": 1536,
       "bodyWidth": 1536,

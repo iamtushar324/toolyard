@@ -256,6 +256,9 @@ func (s *Service) Preview(ctx context.Context, by string, in SourceInput) (*Prev
 	if r.Slug == "" {
 		r.Slug = slugify(r.Repo)
 	}
+	if reservedSlug(r.Slug) && strings.TrimSpace(in.Slug) == "" {
+		r.Slug = slugCandidate(r.Slug, 2)
+	}
 	sha := r.PinnedSHA
 	if r.Mode != ModePinned {
 		if sha, _, _, err = gh.head(ctx, r.Owner, r.Repo, r.Branch, "", true); err != nil {
@@ -320,6 +323,9 @@ func (s *Service) insertWithSlug(ctx context.Context, r *sourceRow, slug string)
 		if len(slug) > maxSlugLen || !slugRe.MatchString(slug) {
 			return fmt.Errorf("%w: slug %q: lowercase letters, digits and single hyphens, at most %d characters", ErrInvalid, slug, maxSlugLen)
 		}
+		if reservedSlug(slug) {
+			return fmt.Errorf("%w: slug %q is reserved for toolyard's built-in skills; choose another", ErrConflict, slug)
+		}
 		r.Slug = slug
 		if err := s.insertSource(ctx, r); err != nil {
 			if store.IsUniqueViolation(err) {
@@ -332,6 +338,9 @@ func (s *Service) insertWithSlug(ctx context.Context, r *sourceRow, slug string)
 	base := slugify(r.Repo)
 	for n := 1; n <= 100; n++ {
 		r.Slug = slugCandidate(base, n)
+		if reservedSlug(r.Slug) {
+			continue
+		}
 		err := s.insertSource(ctx, r)
 		if err == nil {
 			return nil
@@ -361,6 +370,9 @@ func (s *Service) seal(secret string, aad []byte) (string, error) {
 func (s *Service) UpdateSource(ctx context.Context, by, id string, up SourceUpdate) (*Source, error) {
 	r, err := s.getSourceRow(ctx, s.db, id)
 	if err != nil {
+		return nil, err
+	}
+	if err := refuseBuiltinUpdate(r, up); err != nil {
 		return nil, err
 	}
 	due := false
@@ -467,6 +479,9 @@ func (s *Service) updateCredential(r *sourceRow, up SourceUpdate, due *bool) err
 // DeleteSource deletes a source with its versions, usage and overrides.
 // File contents no other version uses are purged.
 func (s *Service) DeleteSource(ctx context.Context, by, id string) error {
+	if err := refuseBuiltin(id, "it cannot be deleted (hide it from everyone instead)"); err != nil {
+		return err
+	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("skillhub: delete source: %w", err)
@@ -555,6 +570,9 @@ func (s *Service) GetVersion(ctx context.Context, id, versionID string) (*Versio
 // not the one waiting for review (a newer commit replaced it) is refused
 // with ErrConflict. Every node serves the version within moments.
 func (s *Service) Activate(ctx context.Context, by, id, versionID string) error {
+	if err := refuseBuiltin(id, "it serves the skills of the running toolyard version"); err != nil {
+		return err
+	}
 	changed, _, err := s.activate(ctx, activation{by: by, sourceID: id, versionID: versionID})
 	if err != nil {
 		return err
@@ -568,6 +586,9 @@ func (s *Service) Activate(ctx context.Context, by, id, versionID string) error 
 
 // Reject marks a staged version rejected.
 func (s *Service) Reject(ctx context.Context, by, id, versionID, note string) error {
+	if err := refuseBuiltin(id, "it has no versions to review"); err != nil {
+		return err
+	}
 	v, err := s.getVersionRow(ctx, s.db, id, versionID)
 	if err != nil {
 		return err
@@ -689,6 +710,9 @@ func (s *Service) SetRuns(ctx context.Context, by, id, skillPath string, runs Ru
 // RotateWebhookSecret makes a new webhook secret, stores it sealed and
 // returns it once.
 func (s *Service) RotateWebhookSecret(ctx context.Context, by, id string) (string, error) {
+	if err := refuseBuiltin(id, "it has no repository and takes no webhook"); err != nil {
+		return "", err
+	}
 	if _, err := s.getSourceRow(ctx, s.db, id); err != nil {
 		return "", err
 	}

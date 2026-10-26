@@ -33,7 +33,9 @@ A FILE ending in .js or .mjs runs as JavaScript (await tools.Server.tool({...}),
 return the result); anything else as Starlark, unless --language says.
 
 Environment:
-  TOOLYARD_URL         default https://toolyard.beknown.live
+  TOOLYARD_URL         your toolyard's base URL (https://toolyard.example.com).
+                       Required, unless this copy came from GET /v1/code/ty:
+                       then it defaults to the toolyard that served it.
   TOOLYARD_TOKEN_FILE  required: the file that holds your toolyard token. It
                        must not be readable by group or others (chmod 600)
                        unless TOOLYARD_TOKEN_FILE_INSECURE=1.
@@ -68,7 +70,7 @@ import urllib.parse
 import urllib.request
 import uuid
 
-DEFAULT_URL = "https://toolyard.beknown.live"
+DEFAULT_URL = ""  # toolyard:served-url
 MAX_SCRIPT_BYTES = 1 << 20
 MAX_TOKEN_BYTES = 64 * 1024
 MAX_SERVER_WAIT = 60
@@ -144,6 +146,9 @@ def warn(message):
 
 def base_url():
     url = (os.environ.get("TOOLYARD_URL", "").strip() or DEFAULT_URL).rstrip("/")
+    if not url:
+        raise TyError("TOOLYARD_URL is not set: set it to your toolyard's base URL, "
+                      "for example https://toolyard.example.com")
     try:
         parts = urllib.parse.urlsplit(url)
         host = parts.hostname

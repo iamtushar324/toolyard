@@ -4,6 +4,7 @@ import (
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/base64"
+	"errors"
 	"strings"
 	"testing"
 	"time"
@@ -110,6 +111,12 @@ func TestPullRotationAndDisable(t *testing.T) {
 	_, err = db.Exec(`INSERT INTO callback_outbox(id,request_id,decision_revision,receiver_id,receiver_revision,payload,next_attempt_at) VALUES('evt-one','req',1,?,1,'{}',0)`, r.ID)
 	if err != nil {
 		t.Fatal(err)
+	}
+	// A bad action or secret is the caller's mistake, not a server error.
+	for _, c := range [][2]string{{"pause", ""}, {"rotate", "not-a-secret"}, {"rotate", "whsec_c2hvcnQ="}} {
+		if _, err := s.Change(ctx, "agent", r.ID, c[0], c[1], r.Revision); !errors.Is(err, ErrInvalidChange) || err.Error() == ErrInvalidChange.Error() {
+			t.Fatalf("change %v: %v (want ErrInvalidChange with its reason)", c, err)
+		}
 	}
 	rotated := "whsec_" + base64.StdEncoding.EncodeToString([]byte(strings.Repeat("x", 32)))
 	r, err = s.Change(ctx, "agent", r.ID, "rotate", rotated, r.Revision)

@@ -8,8 +8,8 @@
   },
   "servers": [
     {
-      "url": "https://toolyard.beknown.live",
-      "description": "The hosted instance. A self-hosted instance serves the same paths under its own URL."
+      "url": "https://toolyard.example.com",
+      "description": "The toolyard that serves this document (GET /v1/code/openapi.json names its own URL here). Every instance serves the same paths under its own URL."
     }
   ],
   "x-run-status-http": {

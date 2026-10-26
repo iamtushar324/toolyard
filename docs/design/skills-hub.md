@@ -51,7 +51,7 @@ with the new meaning below.
   has its own entry) and are also ordinary supporting files of the enclosing
   skill (SEP-2640 "Nested content").
 - **Runs**: `anywhere` or `host`. A `host` skill needs the T3 host
-  (dev-server-1 paths, `tools/*.sh`) and is hidden from callers that are not
+  (its paths, `tools/*.sh`) and is hidden from callers that are not
   on the host unless they ask for host skills. Order of precedence: an
   admin override for that skill, then frontmatter `metadata.toolyard-runs`
   (`host` | `anywhere`), then the source default (`default_runs`).

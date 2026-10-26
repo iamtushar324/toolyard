@@ -374,6 +374,10 @@ func (s *Server) callbackReceiver(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		receiver, err := s.callbacks.Change(r.Context(), a.ID, ref, b.Action, b.Secret, b.ExpectedRevision)
+		if errors.Is(err, callbacks.ErrInvalidChange) {
+			writeError(w, 400, "invalid_change: "+err.Error())
+			return
+		}
 		if err != nil {
 			federationError(w, err)
 			return
