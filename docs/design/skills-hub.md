@@ -348,19 +348,31 @@ UI in `app.js`.
    is bound to a version: its input keeps the commit, the waiting version
    ID (none for the dry run of a new or changed source) and the settings
    digest (`configHash`); it is current for a waiting version it names, or
-   whose commit and settings it shows. The version a question is about is
-   the waiting one, else the live one an admin made live while the source
-   waits (`approvalSubject`). Every ask runs in `lockedApproval`: one
-   transaction that holds the source's row, reads the source, its waiting
-   and live versions and its open questions again, and inserts only what
-   still holds, so a caller's outdated source or version (a sync that read
-   it before a settings change) asks nothing, a dry run of a branch,
-   pinned commit or settings the source no longer has asks nothing, the
-   card shows the source as locked, and two askers on any replica never
-   both add one. A new question records its Inbox item only while it is
-   still pending (`setInboxIfPending`); one closed meanwhile has its item
+   whose commit and settings it shows. The version a question is about
+   (`subjectFor`) is the waiting one built with the current settings, else
+   the live one an admin made live while the source waits, when approving
+   it is allowed (`liveApproval`): for an automatic or pinned source the
+   syncs after the approval must not make another version live, so the
+   live version must be what the source would serve next, its pinned
+   commit or the branch head it last saw (`nextVersion`; `head_sha`, which
+   every branch, pin or settings change clears and only a check of the
+   current branch records), with the current settings; or, for an
+   automatic source, that head's version with the current settings exists
+   as retired or rejected (no sync makes either live) and the live one has
+   the current settings. Versions store no branch; this needs no
+   migration. Every ask runs in `lockedApproval`: one transaction that
+   holds the source's row, reads the source, its waiting and live
+   versions, the version it would serve next and its open questions
+   again, and inserts only what still holds, so a caller's outdated
+   source or version (a sync that read it before a settings or branch
+   change) asks nothing, a dry run of a branch, pinned commit or settings
+   the source no longer has asks nothing, the card shows the source as
+   locked, and two askers on any replica never both add one. A new
+   question records its Inbox item only while it is still pending
+   (`setInboxIfPending`); one closed meanwhile, or whose record fails (the
+   row is then dropped, and the next check asks again), has its item
    withdrawn, and `closeProposalRows` reads the item of a row it read
-   before the item was recorded. At every check the hook's
+   before the item was recorded (and reports a read that fails). At every check the hook's
    `ApprovalHook.PendingApprovalVersion` keeps one open question that is
    current for the waiting version: it asks a new one first and then
    closes the others, closes leftovers next to a current one, asks when
@@ -374,10 +386,10 @@ UI in `app.js`.
    binding)`: only a waiting (or live) version that matches the binding
    goes live (before the approval is stored), else `ErrConflict`: a
    waiting version of an automatic or pinned source that does not match,
-   a live version that does not, a live version of an automatic or pinned
-   source built with older settings (nothing waiting: its next sync would
-   make the current settings live), or an automatic or pinned source with
-   nothing synced. The Inbox binds to the question's commit, version and
+   a live version that does not, or, with nothing waiting, a live version
+   (or none) of an automatic or pinned source that `liveApproval`
+   refuses, its message naming what helps: the next sync, or a new commit
+   or a settings change. The Inbox binds to the question's commit, version and
    settings digest, with `from` = `ApprovalPending`, so a card never
    approves a version built with other settings and a late answer never
    undoes a decision made on the source page (the question is settled as
