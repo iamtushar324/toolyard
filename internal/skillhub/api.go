@@ -207,9 +207,12 @@ type SourceInput struct {
 	Blocked     []string   `json:"blocked,omitempty"`
 	DefaultRuns Runs       `json:"default_runs,omitempty"`
 	Limits      *Limits    `json:"limits,omitempty"`
-	// PendingApproval starts the source pending an admin's approval (a
-	// skill contributor's source). It is never read from JSON: the API
-	// sets it from who is asking.
+	// PendingApproval marks a skill contributor's input: the source starts
+	// pending an admin's approval, and every GitHub read for it (the dry
+	// run included) is anonymous unless the input carries the
+	// contributor's own credential: never the admins' default token. It is
+	// never read from JSON: the API sets it from who is asking, in one
+	// place (skillSourceInput).
 	PendingApproval bool `json:"-"`
 }
 
@@ -232,6 +235,11 @@ type SourceUpdate struct {
 	Hidden      *bool       `json:"hidden,omitempty"` // admins only (the API refuses it from anyone else)
 	DefaultRuns *Runs       `json:"default_runs,omitempty"`
 	Limits      *Limits     `json:"limits,omitempty"`
+	// IfUpdatedAt, when set, is the updated_at of the source the caller
+	// checked this update against (who may change what): UpdateSource
+	// refuses with ErrConflict when the source changed since. It is never
+	// read from JSON: the API sets it from the source it read.
+	IfUpdatedAt time.Time `json:"-"`
 }
 
 // RepoRef is a parsed GitHub URL.
@@ -354,8 +362,9 @@ type Viewer struct {
 	// and federation agents). Others see RunsHost skills only with
 	// SearchQuery.IncludeHost / ListQuery.IncludeHost.
 	OnHost bool
-	// Delegated is a caller without an agent ID that still acts for the
-	// person (an operator token's CLI, the voice assistant): the sharing
+	// Delegated is every caller but a person in their own dashboard page:
+	// an agent, a caller that acts for the person (an operator token's
+	// CLI, the voice assistant) and a caller with no ID at all. The sharing
 	// rule treats it as an agent, so it never sees audience nobody.
 	Delegated bool
 }
@@ -535,12 +544,23 @@ type SharingAdmin interface {
 	// within moments.
 	SetSkillSharing(ctx context.Context, by, id, skillPath string, sh SkillSharing) (SkillSharing, error)
 	// DecideApproval approves or rejects (the source is disabled, with
-	// note) a contributor's source that waits for approval. Approving
-	// makes the source live; its waiting version goes live with it only
-	// when that version is at sha, the commit the approver saw (else it
-	// waits for a normal review). Deciding a source that needs no
-	// approval is ErrConflict.
+	// note) a contributor's source that waits for approval; an admin may
+	// also approve one that was rejected. Approving is bound to sha, the
+	// commit the approver saw: a waiting version at sha goes live with
+	// the approval; when another commit would go live (a waiting version
+	// of an automatic or pinned source, or a live version not at sha) the
+	// approval is refused with ErrConflict. A review-mode source's
+	// waiting version at another commit waits for a normal review.
+	// Deciding a source that needs no approval is ErrConflict.
 	DecideApproval(ctx context.Context, by, id string, approve bool, note, sha string) (*Source, error)
+	// DecideApprovalFrom is DecideApproval for a source that is still in
+	// approval state from (the Inbox decides only a source that still
+	// waits: ApprovalPending), bound to what the question showed (b: its
+	// commit, and its waiting version or settings). A source in any other
+	// state is ErrConflict, so a question answered late never undoes a
+	// decision made meanwhile; so is an approval whose waiting version or
+	// settings are not the ones that would go live.
+	DecideApprovalFrom(ctx context.Context, by, id string, from Approval, approve bool, note string, b ApprovalBinding) (*Source, error)
 	// PreviewSource is a dry run of a stored source with its own settings
 	// and credential (a new approval question after a contributor changed
 	// what is fetched).
@@ -549,6 +569,16 @@ type SharingAdmin interface {
 	// included: what a skill contributor without their own credential may
 	// read (public repositories only).
 	InspectAnonymous(ctx context.Context, url string) (*RepoInfo, error)
+}
+
+// ApprovalBinding is what an approval of a contributor's source was given
+// for: the commit, and, when the question showed one waiting version, that
+// version, and the settings the question showed (an opaque digest of the
+// folder, excludes and limits). Empty Version and Config are not checked.
+type ApprovalBinding struct {
+	SHA     string
+	Version string
+	Config  string
 }
 
 // ContributorsAdmin keeps the skill contributors (*Service implements it).
@@ -563,6 +593,15 @@ type ContributorsAdmin interface {
 // ReviewHook is called when a review-mode source has a new staged version.
 type ReviewHook interface {
 	PendingVersion(ctx context.Context, src Source, v Version) error
+}
+
+// ApprovalHook is an optional part of a ReviewHook (*ReviewInbox
+// implements it). The sync engine calls it, instead of PendingVersion,
+// when a skill contributor's source that waits for approval has a waiting
+// version: the open approval question follows the commit that approving
+// would make live.
+type ApprovalHook interface {
+	PendingApprovalVersion(ctx context.Context, src Source, v Version) error
 }
 
 // TokenSource returns a GitHub token that can read a repository for a user.

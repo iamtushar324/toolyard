@@ -56,6 +56,10 @@ type ReviewOptions struct {
 	// DashboardURL is toolyard's public base URL; when set, items link to
 	// the source page (<DashboardURL>/#skills/<source id>).
 	DashboardURL string
+	// UserLabel names a person (display name or email) in an approval
+	// question the sync engine asks when no earlier question named the
+	// contributor. nil, or "", leaves "a skill contributor".
+	UserLabel func(ctx context.Context, userID string) string
 	// Audit, when set, records every applied decision.
 	Audit *audit.Logger
 	Now   func() time.Time

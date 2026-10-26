@@ -173,8 +173,10 @@ wiring in `cmd/gateway`.
    rows), compute a diff against the active version (skills added, changed,
    removed, by SKILL.md digest and file set), then per mode: `auto` →
    activate; `review` → keep staged and call `ReviewHook.PendingVersion`;
-   `pinned` → only the pinned SHA is ever fetched. Activation publishes on
-   `skillhub`. Retention after each sync.
+   `pinned` → only the pinned SHA is ever fetched. A skill contributor's
+   source that is not approved keeps every new version staged, whatever
+   its mode (section F). Activation publishes on `skillhub`. Retention
+   after each sync.
 5. **Loops**: the leader checks each enabled source when its
    `poll_seconds` (default 300, min 60) has passed since the last check;
    `SyncNow` and `HandleWebhook` run a sync at once on the calling node
@@ -314,6 +316,107 @@ UI in `app.js`.
    (`TokenSource`), shown in the wizard when the creator has one.
 3. `ty skills pull <skill>...`: download a bundle into `~/.claude/skills`.
 4. Docs for all of the above.
+
+## F. Sharing and contributors (worker F2 and the review fixes)
+
+1. **Who is a viewer.** The sharing rule is `srcIndex.skillVisible`
+   (`index.go`); every read path asks it. `Viewer.Delegated` is false
+   only for a person in their own dashboard page (a `dashboard:<uid>`
+   caller with the browser raiser, `gateway/skills_viewer.go`); every
+   other caller is delegated, a caller with no ID at all (anonymous
+   `/mcp`, stdio) included, so audience nobody, a hidden source and a
+   source that is not approved stay out of every agent's view.
+2. **Contributors read anonymously.** Every GitHub read made for a skill
+   contributor is anonymous unless it carries their own token or GitHub
+   connection; the admins' default token (`skills_github_token`) is never
+   used for them. The API derives this in one place
+   (`skillSourceInput`: `SourceInput.PendingApproval` for preview and
+   create); inspect without a token is `InspectAnonymous`; a stored
+   source of a contributor reads through `clientFor`, which is anonymous
+   for any source with an approval state and no credential of its own
+   (sync now, webhook and scheduled syncs, `PreviewSource`). A
+   contributor manages only sources with an approval state
+   (`skillManager.owns`, on every source route and the list): a source
+   they added while an admin (`ApprovalNone`, read with the default token,
+   no approval) stays admin-managed after they lose the role.
+3. **Approval is bound to a commit.** While a contributor's source is
+   not approved, a sync stages every new version (as review mode) and
+   never activates one; a staged version found again for the source's
+   commit and settings (the folder went A, B, A) becomes the waiting
+   version again, and `UpdateSource` drops the waiting version when the
+   branch, pinned commit, folder, excludes or limits change. A question
+   is bound to a version: its input keeps the commit, the waiting version
+   ID (none for the dry run of a new or changed source) and the settings
+   digest (`configHash`); it is current for a waiting version it names, or
+   whose commit and settings it shows. The version a question is about
+   (`subjectFor`) is the waiting one built with the current settings, else
+   the live one an admin made live while the source waits, when approving
+   it is allowed (`liveApproval`): for an automatic or pinned source the
+   syncs after the approval must not make another version live, so the
+   live version must be what the source would serve next, its pinned
+   commit or the branch head it last saw (`nextVersion`; `head_sha`, which
+   every branch, pin or settings change clears and only a check of the
+   current branch records), with the current settings; or, for an
+   automatic source, that head's version with the current settings exists
+   as retired or rejected (no sync makes either live) and the live one has
+   the current settings. Versions store no branch; this needs no
+   migration. Every ask runs in `lockedApproval`: one transaction that
+   holds the source's row, reads the source, its waiting and live
+   versions, the version it would serve next and its open questions
+   again, and inserts only what still holds, so a caller's outdated
+   source or version (a sync that read it before a settings or branch
+   change) asks nothing, a dry run of a branch, pinned commit or settings
+   the source no longer has asks nothing, the card shows the source as
+   locked, and two askers on any replica never both add one. A new
+   question records its Inbox item only while it is still pending
+   (`setInboxIfPending`); one closed meanwhile, or whose record fails (the
+   row is then dropped, and the next check asks again), has its item
+   withdrawn, and `closeProposalRows` reads the item of a row it read
+   before the item was recorded (and reports a read that fails). At every check the hook's
+   `ApprovalHook.PendingApprovalVersion` keeps one open question that is
+   current for the waiting version: it asks a new one first and then
+   closes the others, closes leftovers next to a current one, asks when
+   none is open (the first ask failed, it expired), and waits while an
+   answer is being applied; a check that finds the live version at the
+   head with nothing waiting does the same for it. An answer refused for
+   its version asks again for the waiting version, else the live one
+   (none, or one built with old settings: the sync that stages the
+   current one asks; a settings change makes that check due).
+   An approval goes through `DecideApprovalFrom(..., from, ...,
+   binding)`: only a waiting (or live) version that matches the binding
+   goes live (before the approval is stored), else `ErrConflict`: a
+   waiting version of an automatic or pinned source that does not match,
+   a live version that does not, or, with nothing waiting, a live version
+   (or none) of an automatic or pinned source that `liveApproval`
+   refuses, its message naming what helps: the next sync, or a new commit
+   or a settings change. The Inbox binds to the question's commit, version and
+   settings digest, with `from` = `ApprovalPending`, so a card never
+   approves a version built with other settings and a late answer never
+   undoes a decision made on the source page (the question is settled as
+   cancelled). The source page (`POST .../approval`) binds to the version
+   the page showed, `sha` and `version_id` (the dashboard sends the
+   waiting version's, else the live one's), with `from` = the state the
+   request read; without `version_id` (an API client) to the commit (for
+   an automatic or pinned source, the version that goes live must have the
+   source's current settings). A refused
+   page approval leaves the source its open question, or asks one about
+   the waiting (else live) version. The approval is stored only while the live and
+   waiting versions are the ones checked.
+4. **At most three waiting sources per contributor.** `CreateSource`
+   counts and inserts under `cluster.LockCtx(ctx,
+   "skillhub:contributor:"+userID)`, so parallel creates on any replica
+   (Postgres) or on one node (SQLite) cannot pass the cap; the API's own
+   count only answers early, before the dry run.
+5. **Source updates.** `UpdateSource` writes only the fields the update
+   names (the hide lock changes only through the admin hide path), only
+   while `updated_at` is still the value it read, and moves `updated_at`
+   with `bumpUpdatedAt`; a write in between makes it read again (at most
+   five rounds), and a change of the approval, hide lock, paused state,
+   mode, branch, folder, excludes, pinned commit, limits, read access or
+   token in between answers `ErrConflict`. The API passes the `updated_at`
+   of the source its checks read (`SourceUpdate.IfUpdatedAt`): a source
+   that changed since is `ErrConflict` too, so a check never applies to a
+   newer source.
 
 ## E. Integration (orchestrator)
 

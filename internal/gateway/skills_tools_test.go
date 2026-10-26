@@ -165,7 +165,8 @@ func TestSkillsToolsAreAlwaysOnAndAllowed(t *testing.T) {
 func TestSkillsViewerAndOnHost(t *testing.T) {
 	f := newSkillsFixture(t)
 	f.ok(t, f.member, SkillsSearchTool, map[string]any{"query": "deploy"})
-	if v := f.reader.lastViewer(t); v != (skillhub.Viewer{UserID: "u_member", AgentID: "ag_member"}) {
+	// An agent is a delegated viewer (it never sees audience nobody).
+	if v := f.reader.lastViewer(t); v != (skillhub.Viewer{UserID: "u_member", AgentID: "ag_member", Delegated: true}) {
 		t.Fatalf("member viewer = %+v", v)
 	}
 	f.ok(t, f.admin, SkillsSearchTool, map[string]any{"query": "deploy"})

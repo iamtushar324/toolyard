@@ -137,7 +137,9 @@ The rule, for each skill:
 4. Audience **nobody**: only an admin, or the person who added the
    source, sees the skill, in their own dashboard page. No agent sees it,
    an admin's agent included, and neither does a caller that acts for a
-   person: an operator token's CLI, or the voice assistant.
+   person (an operator token's CLI, or the voice assistant) or a caller
+   that names nobody (an anonymous `/mcp` call on a server without
+   `-require-auth-on-mcp`, or stdio).
 5. Otherwise a person sees the skill when they are an admin, or when they
    are in the audience (everyone; or listed) and not blocked.
 6. An agent, an OAuth app (Claude.ai, ChatGPT) included, sees what its
@@ -163,24 +165,57 @@ setting before and after (`skills.source_sharing`, `skills.skill_sharing`).
 An admin can let chosen members add skill sources: the **Skill
 contributors** panel on the Skills page (admins only) adds and removes
 them. A contributor sees the Skills page in a limited view: the sources
-they added and the Add source wizard.
+they added as a contributor and the Add source wizard.
 
 - A contributor can inspect, preview and add a source, and edit, sync,
   pause or delete their own sources, their sharing included. Other
   people's sources, the trusted owners, the default GitHub token and the
-  Contributors panel stay hidden from them.
+  Contributors panel stay hidden from them. A source they added while
+  they were an admin stays admin-managed when they lose the role (it
+  reads with the default token and needs no approval): they no longer
+  see or change it.
 - Their new source starts **pending approval**: it syncs (at most once an
-  hour while it waits), but agents see nothing of it. The owner gets one
-  Inbox question with the repository, branch, folder, audience, and the
-  dry run's commit, counts and warnings. **Approve** makes the source
-  live; its waiting version goes live with it only when that version is
-  at the commit the question showed (a newer commit waits for a normal
-  review). **Reject** disables it, with the reason. A change of branch,
-  folder, excludes, credential or update mode while it waits closes the
-  question and asks again with a new dry run. Admins can also approve or
-  reject on the source page, and **hide** or delete any contributor's
-  source at any time. A contributor may have at most three sources
-  waiting at once.
+  hour while it waits), but agents see nothing of it, and no commit goes
+  live while it waits, whatever its update mode: each new commit becomes
+  its waiting version. The owner gets one Inbox question with the
+  repository, branch, folder, audience, and the commit with its counts
+  and warnings; when a newer commit (or the same commit with other
+  settings) comes to wait, the question is asked again for it (and the
+  old one closed). The question always shows the source as it is when it
+  is asked. **Approve** is bound to what the question shows: its commit,
+  built with the folder, excludes and limits it showed (on the source
+  page: the version the page shows, by its commit and ID); exactly that
+  version goes live with the approval. With nothing waiting, the question
+  and the approval are about the live version (one an admin made live
+  while the source waits), but only when the source's syncs would not
+  make another version live after the approval: the live version is the
+  head of the branch it follows now (or its pinned commit), built with its
+  current settings, or, for an automatic source, the version of that head
+  with the current settings was rejected or retired (no sync makes it
+  live) and the live one has the current settings. When another version
+  would go live instead (a newer waiting commit of an automatic source,
+  the same commit with other settings, a live commit that is not the one
+  shown, a live version of another branch or older settings, or nothing
+  synced yet), the approval is refused and the source keeps waiting, and
+  the refusal says when approving works: after the next sync (it stages
+  the version to approve, and the question follows it), or after a new
+  commit or a settings change (the head's version failed to build, or was
+  rejected with no live version to approve). A review-mode source's newer
+  commit waits for a normal review. The question is never lost: a check
+  of a waiting source that finds no open question (the first ask failed,
+  or it expired) asks again, and one that finds a question left over next
+  to the current one closes it.
+  **Reject** disables it, with the reason. A change of branch, folder,
+  excludes, credential or update mode while it waits closes the question
+  and asks again with a new dry run; a change of branch, folder or
+  excludes also drops the waiting version, which the old settings built
+  (the next check stages the new one). Admins can also approve or reject on
+  the source page (an admin may approve a rejected source there), and
+  **hide** or delete any contributor's source at any time. An Inbox answer
+  applies only while the source still waits: a late one never undoes a
+  decision made on the source page. A contributor may have at most three
+  sources waiting at once, also when they add several at the same
+  moment.
 - Their updates are **review** (each new commit waits for an admin: only
   an admin makes a version live), or **auto** when the repository owner is
   trusted. Only an admin can pin a source, change its pinned commit or
@@ -188,9 +223,10 @@ they added and the Add source wizard.
   branch, folder or excludes of a source whose commits go live without
   review (pinned, or automatic for an owner who is not trusted).
 - They never read with the admins' default GitHub token: without their
-  own credential, their inspect, dry run and syncs read anonymously, so
-  only a public repository works. A private repository needs a read-only
-  token or their own GitHub connection.
+  own credential, every read made for them (inspect, preview, add, sync
+  now, webhook and scheduled syncs, the dry run of a new approval
+  question) is anonymous, so only a public repository works. A private
+  repository needs a read-only token or their own GitHub connection.
 - A contributor who is removed keeps their sources; only admins can
   change them then. An agent is never a contributor: the list holds
   people, and an operator token needs the owner scope to change it.
@@ -365,15 +401,15 @@ answers them 403 `admin_only`. Errors are `{"error", "code"}` with the codes `in
 | --- | --- |
 | `GET /v1/skills/admin/me` | `{user_id, admin, contributor}`: what the signed-in person may do on the Skills page (any signed-in person) |
 | `POST /v1/skills/sources/inspect` | *contributor*. `{url, token?, auth?}`: owner, repo, private, default branch, branches, the branch and folder in the URL, `trusted_owner`; `auth: "github"` reads with your GitHub connection (never with an operator token) |
-| `POST /v1/skills/sources/preview` | *contributor*. A source (as for create): dry run with commit, counts, warnings, sample |
+| `POST /v1/skills/sources/preview` | *contributor*. A source (as for create): dry run with commit, counts, warnings, sample. A contributor's dry run never reads with the default token, and has the bounds of their create (403 `contributor_limit`) |
 | `GET /v1/skills/admin/sources` | *contributor*. Every source with its status (a contributor: their own); the agent list is `GET /v1/skills/sources` |
 | `POST /v1/skills/sources` | *contributor*. Create `{url, branch?, path?, exclude?, mode?, pinned_sha?, auth?, token?, poll_seconds?, enabled?, visibility?, members?, blocked?, default_runs?}`; `201 {source, status: "syncing"}` at once, the first sync running in the background (poll `GET /v1/skills/sources/{id}` until `last_checked_at` is set); the same create by the same person within two minutes answers `200 {source, existing: true}`. A contributor's source has `approval: "pending"`; a contributor's mode `pinned`, mode `auto` for an untrusted owner, or `limits` answer 403 `contributor_limit` |
-| `GET`, `PATCH`, `DELETE /v1/skills/sources/{id}` | *contributor*. Read, change (only the fields sent; `token` replaces, `clear_token` removes; `visibility`, `members` and `blocked` are the source's sharing) or delete a source; a change of mode, branch, folder or pinned commit, and a delete, close the open review question |
+| `GET`, `PATCH`, `DELETE /v1/skills/sources/{id}` | *contributor*. Read, change (only the fields sent; `token` replaces, `clear_token` removes; `visibility`, `members` and `blocked` are the source's sharing) or delete a source; a change of mode, branch, folder or pinned commit, and a delete, close the open review question. A PATCH writes only the fields it sends, and only to the source as it was read when the request was checked: one that meets a change made since answers 409 `conflict` (read the source again) |
 | `POST /v1/skills/sources/{id}/sync` | *contributor*. Sync now |
 | `GET /v1/skills/sources/{id}/versions?limit=` | *contributor*. The last versions (default 20, at most 100) |
 | `POST /v1/skills/sources/{id}/versions/{vid}/activate` | make a version live (approve or roll back) |
 | `POST /v1/skills/sources/{id}/versions/{vid}/reject` | `{note?}`: reject a staged version |
-| `POST /v1/skills/sources/{id}/approval` | `{decision: "approve" or "reject", note?, sha?}`: decide a contributor's source; closes its Inbox question. With `sha`, a waiting version at that commit goes live with the approval; any other waits for review |
+| `POST /v1/skills/sources/{id}/approval` | `{decision: "approve" or "reject", note?, sha?, version_id?}`: decide a contributor's source; closes its Inbox question. The approval is bound to the version you saw: `sha` and `version_id` of the waiting version, or of the live one when nothing waits (the dashboard always sends both). That version goes live, or stays live, with the approval; 409 `conflict` when another version would (a waiting or live version with another ID or commit, a live version of an automatic or pinned source that is not of its current branch, pin and settings, or an automatic source with no version to approve yet; the message says whether the next sync, or a new commit or a settings change, helps), or when the source was decided meanwhile, and a source that still waits keeps its approval question. Without `version_id` (an API client), the approval is bound to the commit `sha`, and for an automatic or pinned source the version that goes live must have the source's current settings. A review-mode source's waiting version that is not the one named waits for review |
 | `GET /v1/skills/sources/{id}/skills` | *contributor*. Skills with where they run, their own sharing (`sharing`, absent when they follow the source) and reads in 30 days |
 | `PUT /v1/skills/sources/{id}/skills/runs` | *contributor*. `{path, runs}`: `anywhere`, `host`, or `""` to clear the override |
 | `PATCH /v1/skills/sources/{id}` with `{hidden}` | admin: hide the source from every agent (`true`) or show it again |

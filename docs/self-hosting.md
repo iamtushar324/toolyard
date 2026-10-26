@@ -1500,8 +1500,9 @@ probes; every other path is a 404. The main listener never serves
 
 ```bash
 ./toolyard serve -ops-addr 127.0.0.1:9090
-# several addresses, one of them reachable by a scraper on the LAN:
-./toolyard serve -ops-addr 127.0.0.1:9090,10.0.0.5:9090
+# several addresses, one of them the host's private LAN address (in
+# LAN_ADDR), reachable by a scraper on the LAN:
+./toolyard serve -ops-addr "127.0.0.1:9090,$LAN_ADDR:9090"
 ```
 
 - Without `-ops-token-file`, every address must be loopback, private
@@ -1659,7 +1660,7 @@ variables. A production set:
 
 ```bash
 TOOLYARD_PUBLIC_URL=https://toolyard.example.com
-TOOLYARD_TRUSTED_PROXY=10.200.0.0/24   # the proxy's subnet, nothing wider
+TOOLYARD_TRUSTED_PROXY=198.51.100.0/24 # the proxy's subnet, nothing wider
 TOOLYARD_KEYS=require
 TOOLYARD_MIGRATE=off
 TOOLYARD_OPS_ADDR=0.0.0.0:9090

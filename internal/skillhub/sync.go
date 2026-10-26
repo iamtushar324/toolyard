@@ -151,7 +151,12 @@ func (s *Service) syncLocked(ctx context.Context, row *sourceRow, req syncReques
 		return res, out, err
 	}
 	res.VersionID, res.Full, res.Diff = v.ID, full, diff
-	if row.Mode == ModeReview {
+	if row.Mode == ModeReview || !row.Approval.Live() {
+		// Review mode waits for an admin; so does every new commit of a
+		// skill contributor's source that is not approved, whatever its
+		// mode: approving it makes live only the commit the approver saw
+		// (approveSource), and the approval question follows the waiting
+		// version (notifyReview).
 		err = s.stage(ctx, row, v)
 		res.Staged = err == nil
 	} else {
@@ -179,6 +184,12 @@ func (s *Service) syncKnown(ctx context.Context, row *sourceRow, known *versionR
 	activate := false
 	switch {
 	case known.Status == VersionActive:
+		if !row.Approval.Live() && row.PendingVersionID == "" {
+			// A contributor's waiting source whose live version (an admin
+			// made it live) is the head, with nothing waiting: its approval
+			// question follows that version.
+			s.notifyReview(ctx, row, known)
+		}
 	case known.Status == VersionFailed && req.tr == triggerManual:
 		// "Sync now" tries a failed commit again.
 		if err := s.dropVersion(ctx, known.ID); err != nil {
@@ -188,6 +199,30 @@ func (s *Service) syncKnown(ctx context.Context, row *sourceRow, known *versionR
 	case known.Status == VersionFailed:
 		res.Unchanged = true
 		return res, out, errors.New(known.Error)
+	case !row.Approval.Live():
+		// A skill contributor's source that is not approved makes no
+		// commit live, whatever its mode (as review mode: a new commit
+		// waits, syncLocked). The waiting version tells the hook again,
+		// so an approval question that shows another commit, or no open
+		// question, is asked again for this one.
+		switch {
+		case known.Status == VersionStaged && known.ID == row.PendingVersionID:
+			s.notifyReview(ctx, row, known)
+		case known.Status == VersionStaged:
+			// A staged version of the commit and settings the source has
+			// now that is not the waiting one (the folder went A, B, A with
+			// no new commit): it becomes the waiting version again, so an
+			// approval of this commit has the version it would serve.
+			err := s.stage(ctx, row, known)
+			switch {
+			case errors.Is(err, errSourceChanged):
+			case err != nil:
+				return res, out, err
+			default:
+				res.Staged = true
+				return res, out, nil
+			}
+		}
 	case row.Mode == ModePinned:
 		// A pinned source serves its commit whatever happened to it.
 		activate = true
@@ -358,17 +393,32 @@ func (s *Service) stage(ctx context.Context, row *sourceRow, v *versionRow) erro
 
 // notifyReview calls the review hook for a pending version. A failure is
 // logged: the next check of the source calls it again. A contributor's
-// source that waits for approval (or was rejected) asks nothing: the
-// approval question covers its waiting version, and approving it makes
-// that version live (DecideApproval).
+// source that waits for approval gets no review question: the approval
+// question covers its waiting version (approving it makes that version
+// live, approveSource), so the hook's ApprovalHook part is told instead,
+// and asks that question again when it shows another commit. A rejected
+// source asks nothing.
 func (s *Service) notifyReview(ctx context.Context, row *sourceRow, v *versionRow) {
 	h := s.reviewHook()
-	if h == nil || !row.Approval.Live() {
+	if h == nil {
 		return
 	}
 	src := row.Source
 	src.PendingVersionID = v.ID
-	if err := h.PendingVersion(context.WithoutCancel(ctx), src, v.Version); err != nil {
+	var err error
+	switch {
+	case row.Approval.Live():
+		err = h.PendingVersion(context.WithoutCancel(ctx), src, v.Version)
+	case row.Approval == ApprovalPending:
+		ah, ok := h.(ApprovalHook)
+		if !ok {
+			return
+		}
+		err = ah.PendingApprovalVersion(context.WithoutCancel(ctx), src, v.Version)
+	default:
+		return
+	}
+	if err != nil {
 		s.log.Warn("skillhub: the review hook failed; it is called again at the next check", "source", row.Slug, "version", v.ID, "err", err.Error())
 	}
 }

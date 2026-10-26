@@ -27,6 +27,11 @@ type skillsSharingFake struct {
 	lastSharing  skillhub.SkillSharing
 	lastPath     string
 	decisions    []string
+	// lastBinding is the binding of the last DecideApprovalFrom; decideErr
+	// makes it fail; waitingVersion gives sources a waiting version.
+	lastBinding    skillhub.ApprovalBinding
+	decideErr      error
+	waitingVersion map[string]string
 }
 
 var (
@@ -34,8 +39,12 @@ var (
 	_ skillhub.ContributorsAdmin = (*skillsSharingFake)(nil)
 )
 
+// skillsFakeUpdatedAt is every fake source's updated_at.
+var skillsFakeUpdatedAt = time.Unix(1_800_000_000, 0).UTC()
+
 func (f *skillsSharingFake) source(id string) *skillhub.Source {
 	src := skillsTestSource(id)
+	src.UpdatedAt = skillsFakeUpdatedAt
 	f.smu.Lock()
 	defer f.smu.Unlock()
 	if o, ok := f.owners[id]; ok {
@@ -52,6 +61,7 @@ func (f *skillsSharingFake) source(id string) *skillhub.Source {
 	if k, ok := f.kinds[id]; ok {
 		src.Kind = k
 	}
+	src.PendingVersionID = f.waitingVersion[id]
 	return src
 }
 
@@ -162,6 +172,20 @@ func (f *skillsSharingFake) DecideApproval(_ context.Context, by, id string, app
 	return f.source(id), nil
 }
 
+func (f *skillsSharingFake) DecideApprovalFrom(ctx context.Context, by, id string, from skillhub.Approval, approve bool, note string, b skillhub.ApprovalBinding) (*skillhub.Source, error) {
+	f.smu.Lock()
+	cur, fail := f.approval[id], f.decideErr
+	f.lastBinding = b
+	f.smu.Unlock()
+	if cur != from || fail != nil {
+		if fail == nil {
+			fail = skillhub.ErrConflict
+		}
+		return nil, fail
+	}
+	return f.DecideApproval(ctx, by, id, approve, note, b.SHA)
+}
+
 func (f *skillsSharingFake) Contributors(context.Context) ([]skillhub.Contributor, error) {
 	f.smu.Lock()
 	defer f.smu.Unlock()
@@ -229,7 +253,8 @@ type skillsSharingEnv struct {
 }
 
 // newSkillsSharingEnv: src_admin was added by the admin, src_mine by the
-// contributor (a member the admin named).
+// contributor (a member the admin named; approved, so it has an approval
+// state: a contributor manages only such sources).
 func newSkillsSharingEnv(t *testing.T) *skillsSharingEnv {
 	t.Helper()
 	e := newAccessTestServer(t)
@@ -237,7 +262,7 @@ func newSkillsSharingEnv(t *testing.T) *skillsSharingEnv {
 	m := e.member(t, "user_m", "morgan@beknown.work")
 	fake := &skillsSharingFake{skillsAdminFake: &skillsAdminFake{},
 		owners:       map[string]string{"src_admin": e.admin.ID, "src_mine": c.ID},
-		contributors: map[string]bool{c.ID: true}, approval: map[string]skillhub.Approval{},
+		contributors: map[string]bool{c.ID: true}, approval: map[string]skillhub.Approval{"src_mine": skillhub.ApprovalApproved},
 		modes: map[string]skillhub.UpdateMode{}, hidden: map[string]bool{}, ghOwners: map[string]string{}, kinds: map[string]string{}}
 	settler := &skillsApprovalSettler{}
 	e.srv.skillsAdmin, e.srv.skillReviews = fake, settler
@@ -499,9 +524,15 @@ func TestSkillApprovalRoute(t *testing.T) {
 	if rec := e.do(t, e.adminCookie, http.MethodPost, "/v1/skills/sources/src_mine/approval", `{"decision":"maybe"}`); rec.Code != http.StatusBadRequest {
 		t.Fatalf("bad decision: %d", rec.Code)
 	}
-	rec := e.do(t, e.adminCookie, http.MethodPost, "/v1/skills/sources/src_mine/approval", `{"decision":"approve","sha":" abc "}`)
+	rec := e.do(t, e.adminCookie, http.MethodPost, "/v1/skills/sources/src_mine/approval", `{"decision":"approve","sha":" abc ","version_id":" skv_9 "}`)
 	if rec.Code != http.StatusOK || skillsJSON(t, rec)["source"].(map[string]any)["approval"] != "approved" {
 		t.Fatalf("approve: %d %s", rec.Code, rec.Body.String())
+	}
+	e.fake.smu.Lock()
+	bind := e.fake.lastBinding
+	e.fake.smu.Unlock()
+	if bind != (skillhub.ApprovalBinding{SHA: "abc", Version: "skv_9"}) {
+		t.Fatalf("the approval is not bound to the version the page showed: %+v", bind)
 	}
 	rec = e.do(t, e.adminCookie, http.MethodPost, "/v1/skills/sources/src_mine/approval", `{"decision":"reject","note":"duplicate"}`)
 	if rec.Code != http.StatusOK {
@@ -612,7 +643,8 @@ func TestSkillContributorGuards(t *testing.T) {
 		{"turn on a rejected source", `{"enabled":true}`, func() { e.fake.approval["src_mine"] = skillhub.ApprovalRejected }},
 	} {
 		e.fake.smu.Lock()
-		e.fake.modes, e.fake.approval, e.fake.ghOwners = map[string]skillhub.UpdateMode{}, map[string]skillhub.Approval{}, map[string]string{}
+		e.fake.modes, e.fake.ghOwners = map[string]skillhub.UpdateMode{}, map[string]string{}
+		e.fake.approval = map[string]skillhub.Approval{"src_mine": skillhub.ApprovalApproved}
 		if c.setup != nil {
 			c.setup()
 		}
@@ -627,7 +659,7 @@ func TestSkillContributorGuards(t *testing.T) {
 	// that switches a pinned source to review.
 	e.fake.smu.Lock()
 	e.fake.modes = map[string]skillhub.UpdateMode{"src_mine": skillhub.ModePinned}
-	e.fake.approval, e.fake.ghOwners = map[string]skillhub.Approval{}, map[string]string{}
+	e.fake.approval, e.fake.ghOwners = map[string]skillhub.Approval{"src_mine": skillhub.ApprovalApproved}, map[string]string{}
 	e.fake.smu.Unlock()
 	if rec := e.do(t, e.contribCk, http.MethodPatch, "/v1/skills/sources/src_mine", `{"branch":"other","mode":"review"}`); rec.Code != http.StatusOK {
 		t.Errorf("pinned to review with a branch: %d %s", rec.Code, rec.Body.String())
@@ -660,6 +692,30 @@ func TestSkillContributorGuards(t *testing.T) {
 	}
 	if c := strings.Join(e.calls(), ","); strings.Contains(c, "InspectAnonymous") {
 		t.Fatalf("admin inspect calls %s", c)
+	}
+	// A contributor's dry run is marked as theirs (anonymous reads, the
+	// contributor's bounds); an admin's is not.
+	if rec := e.do(t, e.contribCk, http.MethodPost, "/v1/skills/sources/preview", `{"url":"acme/skills","path":"skills"}`); rec.Code != http.StatusOK {
+		t.Fatalf("contributor preview: %d %s", rec.Code, rec.Body.String())
+	}
+	e.fake.mu.Lock()
+	contribIn := e.fake.lastInput
+	e.fake.mu.Unlock()
+	if !contribIn.PendingApproval {
+		t.Fatalf("a contributor's preview reads as an admin: %+v", contribIn)
+	}
+	if rec := e.do(t, e.contribCk, http.MethodPost, "/v1/skills/sources/preview", `{"url":"acme/skills","mode":"pinned","pinned_sha":"0123456789abcdef0123456789abcdef01234567"}`); rec.Code != http.StatusForbidden ||
+		skillsJSON(t, rec)["code"] != "contributor_limit" {
+		t.Fatalf("contributor preview of a pinned source: %d %s", rec.Code, rec.Body.String())
+	}
+	if rec := e.do(t, e.adminCookie, http.MethodPost, "/v1/skills/sources/preview", `{"url":"acme/skills","path":"skills"}`); rec.Code != http.StatusOK {
+		t.Fatalf("admin preview: %d %s", rec.Code, rec.Body.String())
+	}
+	e.fake.mu.Lock()
+	adminIn := e.fake.lastInput
+	e.fake.mu.Unlock()
+	if adminIn.PendingApproval {
+		t.Fatalf("an admin's preview is marked as a contributor's: %+v", adminIn)
 	}
 
 	// A pending source whose branch changes gets a new approval question.
@@ -725,5 +781,92 @@ func TestSkillContributorNeverOwnsBuiltin(t *testing.T) {
 	}
 	if rec := e.do(t, e.adminCookie, http.MethodPatch, "/v1/skills/sources/"+id, `{"hidden":true}`); rec.Code != http.StatusOK || skillsJSON(t, rec)["hidden"] != true {
 		t.Fatalf("admin hides the built-in source: %d %s", rec.Code, rec.Body.String())
+	}
+}
+
+// A contributor who added a source while they were an admin (no approval
+// state) does not manage it once they lost the role: it reads with the
+// admins' default token and its commits go live without an approval, so
+// it stays admin-managed. Every source route answers 404, and the list
+// leaves it out; their contributor sources stay theirs.
+func TestSkillContributorDoesNotOwnSourcesAddedAsAdmin(t *testing.T) {
+	e := newSkillsSharingEnv(t)
+	e.fake.smu.Lock()
+	e.fake.owners["src_old"] = e.contrib.ID // no approval state: added while an admin
+	e.fake.smu.Unlock()
+	rec := e.do(t, e.contribCk, http.MethodGet, "/v1/skills/admin/sources", "")
+	list, _ := skillsJSON(t, rec)["sources"].([]any)
+	if rec.Code != http.StatusOK || len(list) != 1 || list[0].(map[string]any)["id"] != "src_mine" {
+		t.Fatalf("contributor list: %d %v", rec.Code, list)
+	}
+	e.resetCalls()
+	for _, rt := range []struct{ method, path, body string }{
+		{http.MethodGet, "/v1/skills/sources/src_old", ""},
+		{http.MethodPatch, "/v1/skills/sources/src_old", `{"branch":"other"}`},
+		{http.MethodPost, "/v1/skills/sources/src_old/sync", ""},
+		{http.MethodGet, "/v1/skills/sources/src_old/versions", ""},
+		{http.MethodGet, "/v1/skills/sources/src_old/skills", ""},
+		{http.MethodPut, "/v1/skills/sources/src_old/skills/runs", `{"path":"pdf","runs":"host"}`},
+		{http.MethodPut, "/v1/skills/sources/src_old/skills/sharing", `{"path":"pdf","mode":"everyone"}`},
+		{http.MethodPost, "/v1/skills/sources/src_old/webhook-secret", ""},
+		{http.MethodDelete, "/v1/skills/sources/src_old", ""},
+	} {
+		if rec := e.do(t, e.contribCk, rt.method, rt.path, rt.body); rec.Code != http.StatusNotFound {
+			t.Errorf("contributor %s %s on a source added as an admin: %d %s", rt.method, rt.path, rec.Code, rec.Body.String())
+		}
+	}
+	for _, c := range e.calls() {
+		if c != "GetSource src_old" {
+			t.Fatalf("a refused request reached the service: %v", e.calls())
+		}
+	}
+	if rec := e.do(t, e.adminCookie, http.MethodPatch, "/v1/skills/sources/src_old", `{"branch":"other"}`); rec.Code != http.StatusOK {
+		t.Fatalf("admin edits it: %d %s", rec.Code, rec.Body.String())
+	}
+	if rec := e.do(t, e.contribCk, http.MethodGet, "/v1/skills/sources/src_mine", ""); rec.Code != http.StatusOK {
+		t.Fatalf("contributor reads their own source: %d %s", rec.Code, rec.Body.String())
+	}
+}
+
+// A PATCH applies only to the source its checks read: the handler passes
+// that read's updated_at, so the engine refuses (409, ErrConflict) a
+// source that changed since, for example one an admin rejected meanwhile
+// (TestUpdateSourceChecksTheCallersRead in skillhub).
+func TestSkillSourcePatchIsBoundToItsRead(t *testing.T) {
+	e := newSkillsSharingEnv(t)
+	if rec := e.do(t, e.contribCk, http.MethodPatch, "/v1/skills/sources/src_mine", `{"visibility":"nobody"}`); rec.Code != http.StatusOK {
+		t.Fatalf("patch: %d %s", rec.Code, rec.Body.String())
+	}
+	e.fake.mu.Lock()
+	upd := e.fake.lastUpdate
+	e.fake.mu.Unlock()
+	if !upd.IfUpdatedAt.Equal(skillsFakeUpdatedAt) {
+		t.Fatalf("the update is not bound to the source it was checked against: %v", upd.IfUpdatedAt)
+	}
+}
+
+// A page approval the engine refuses (another version would go live)
+// answers 409, and the source, which still waits with a version, keeps an
+// approval question: the route asks (the settler adds one only when none
+// is open).
+func TestSkillApprovalRouteRefusalAsksAgain(t *testing.T) {
+	e := newSkillsSharingEnv(t)
+	e.fake.smu.Lock()
+	e.fake.approval["src_mine"] = skillhub.ApprovalPending
+	e.fake.waitingVersion = map[string]string{"src_mine": "skv_2"}
+	e.fake.decideErr = skillhub.ErrConflict
+	e.fake.smu.Unlock()
+	rec := e.do(t, e.adminCookie, http.MethodPost, "/v1/skills/sources/src_mine/approval", `{"decision":"approve","sha":"abc","version_id":"skv_1"}`)
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("refused approval: %d %s", rec.Code, rec.Body.String())
+	}
+	e.settler.mu.Lock()
+	reqs, settled := append([]string(nil), e.settler.requests...), append([]string(nil), e.settler.settled...)
+	e.settler.mu.Unlock()
+	if len(reqs) != 1 || !strings.HasPrefix(reqs[0], "src_mine|pending|") || len(settled) != 0 {
+		t.Fatalf("after a refused approval: requests %v settled %v", reqs, settled)
+	}
+	if e.auditRows(t, "skills.source_approve", "") != 0 {
+		t.Fatal("a refused approval was audited as an approval")
 	}
 }

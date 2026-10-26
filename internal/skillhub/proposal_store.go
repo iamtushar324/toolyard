@@ -12,6 +12,7 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"strings"
 	"time"
 
@@ -107,6 +108,20 @@ func (st proposalStore) get(ctx context.Context, id string) (*proposalRow, error
 func (st proposalStore) setInbox(ctx context.Context, id, inboxID string) error {
 	_, err := st.db.ExecContext(ctx, `UPDATE skill_proposals SET inbox_id = ?, updated_at = ? WHERE id = ?`, inboxID, st.now().UnixMilli(), id)
 	return err
+}
+
+// setInboxIfPending records a row's Inbox item while the row is still
+// pending, and reports whether it did: a row closed while its item was
+// being created (another check replaced it, the source was decided) keeps
+// no item, and the caller withdraws the item.
+func (st proposalStore) setInboxIfPending(ctx context.Context, id, inboxID string) (bool, error) {
+	res, err := st.db.ExecContext(ctx, `UPDATE skill_proposals SET inbox_id = ?, updated_at = ? WHERE id = ? AND status = ?`,
+		inboxID, st.now().UnixMilli(), id, proposalPending)
+	if err != nil {
+		return false, err
+	}
+	n, err := res.RowsAffected()
+	return n == 1, err
 }
 
 // move changes a row's status from one of from to to, and reports whether
@@ -214,6 +229,107 @@ func (st proposalStore) openReviewFor(ctx context.Context, sourceID, versionID s
 func (st proposalStore) remove(ctx context.Context, id string) error {
 	_, err := st.db.ExecContext(ctx, `DELETE FROM skill_proposals WHERE id = ?`, id)
 	return err
+}
+
+// lockedApproval runs decide in one transaction that holds the row of
+// source sourceID (FOR UPDATE on Postgres; SQLite has one writer), with
+// the source as it is now, its waiting and live versions, the version it
+// would serve next with its current settings (nextVersion; each nil when
+// none) and its open approval rows (pending, or approved and being
+// applied). A row decide returns is inserted in the same transaction and
+// returned: two askers on any replica never both add a question, and none
+// adds one that shows the source otherwise than it is. decide must not use the
+// database (on SQLite the transaction holds the only connection). A
+// source that is gone is ErrNotFound.
+func (st proposalStore) lockedApproval(ctx context.Context, sourceID string,
+	decide func(src *sourceRow, waiting, live, next *versionRow, open []proposalRow) *proposalRow) (*proposalRow, error) {
+	tx, err := st.db.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = tx.Rollback() }()
+	var id string
+	err = tx.QueryRowContext(ctx, `SELECT id FROM skill_sources WHERE id = ?`+st.db.Dialect.ForUpdate(), sourceID).Scan(&id)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, fmt.Errorf("%w: source %s", ErrNotFound, sourceID)
+	}
+	if err != nil {
+		return nil, err
+	}
+	src, err := scanSource(tx.QueryRowContext(ctx, `SELECT `+sourceColumns+sourceFrom+` WHERE s.id = ?`, sourceID))
+	if err != nil {
+		return nil, err
+	}
+	version := func(id string) (*versionRow, error) {
+		if id == "" {
+			return nil, nil
+		}
+		v, err := scanVersion(tx.QueryRowContext(ctx, `SELECT `+versionColumns+` FROM skill_versions WHERE id = ? AND source_id = ?`, id, sourceID))
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil
+		}
+		return v, err
+	}
+	waiting, err := version(src.PendingVersionID)
+	if err != nil {
+		return nil, err
+	}
+	live, err := version(src.ActiveVersionID)
+	if err != nil {
+		return nil, err
+	}
+	var next *versionRow
+	if target := src.headSHA; target != "" || src.Mode == ModePinned {
+		if src.Mode == ModePinned {
+			target = src.PinnedSHA
+		}
+		next, err = scanVersion(tx.QueryRowContext(ctx, `SELECT `+versionColumns+` FROM skill_versions
+			WHERE source_id = ? AND sha = ? AND config = ? ORDER BY created_at DESC, id DESC LIMIT 1`, sourceID, target, src.configHash()))
+		if errors.Is(err, sql.ErrNoRows) {
+			next, err = nil, nil
+		}
+		if err != nil {
+			return nil, err
+		}
+	}
+	rows, err := tx.QueryContext(ctx, `SELECT `+proposalColumns+` FROM skill_proposals WHERE kind = ? AND source_id = ? AND status IN (?, ?) ORDER BY created_at`,
+		proposalKindApproval, sourceID, proposalPending, proposalApproved)
+	if err != nil {
+		return nil, err
+	}
+	open, err := collectProposals(rows)
+	if err != nil {
+		return nil, err
+	}
+	row := decide(src, waiting, live, next, open)
+	if row == nil {
+		return nil, nil
+	}
+	now := st.now().UnixMilli()
+	row.CreatedAt, row.UpdatedAt = now, now
+	if row.Input == "" {
+		row.Input = "{}"
+	}
+	if _, err := tx.ExecContext(ctx, `INSERT INTO skill_proposals(`+proposalColumns+`) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
+		row.ID, row.Kind, row.Status, row.AgentID, row.UserID, row.SourceID, row.VersionID, row.InboxID,
+		row.Input, row.Reason, row.Result, row.Error, row.DecidedBy, row.CreatedAt, row.UpdatedAt); err != nil {
+		return nil, err
+	}
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return row, nil
+}
+
+// latestForSource is the newest row of one kind about a source, any
+// status, or nil.
+func (st proposalStore) latestForSource(ctx context.Context, kind, sourceID string) (*proposalRow, error) {
+	r, err := scanProposal(st.db.QueryRowContext(ctx, `SELECT `+proposalColumns+` FROM skill_proposals WHERE kind = ? AND source_id = ?
+		ORDER BY created_at DESC, id DESC LIMIT 1`, kind, sourceID))
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, nil
+	}
+	return r, err
 }
 
 // pendingForSource lists the pending rows of one kind about a source.

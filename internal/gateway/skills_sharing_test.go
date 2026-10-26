@@ -293,4 +293,23 @@ func TestDelegatedCallersDoNotSeeNobody(t *testing.T) {
 			t.Errorf("%s cannot read a shared skill: %s", name, textOf(res))
 		}
 	}
+
+	// A caller with no ID at all (an anonymous /mcp call on a gateway
+	// without -require-auth-on-mcp, or stdio) names no person: it is a
+	// delegated viewer, so even with an admin's reach it never sees a
+	// skill shared with nobody.
+	f.res.set("", access.Scope{All: true})
+	anon := f.gw.SkillViewer(bg)
+	if !anon.Delegated || !anon.Admin || anon.AgentID != "" || anon.UserID != "" {
+		t.Fatalf("viewer of a caller with no ID = %+v", anon)
+	}
+	if _, err := svc.Get(bg, anon, sharingHidden, false); !errors.Is(err, skillhub.ErrNotFound) {
+		t.Fatalf("a caller with no ID sees a skill shared with nobody: %v", err)
+	}
+	if _, err := svc.Get(bg, anon, sharingOpen, false); err != nil {
+		t.Fatalf("a caller with no ID cannot read a shared skill: %v", err)
+	}
+	if res, err := f.gw.RouteCall(bg, "test", SkillsGetTool, map[string]any{ReasonField: testReason, "skill": sharingHidden}); err == nil && !res.IsError {
+		t.Errorf("skills.get for a caller with no ID returns a skill shared with nobody: %s", textOf(res))
+	}
 }

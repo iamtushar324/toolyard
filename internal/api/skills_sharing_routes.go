@@ -8,8 +8,10 @@ package api
 //   - An admin manages every source and every route.
 //   - A skill contributor (a member an admin named in the Contributors
 //     panel) uses the Skills page in a limited view: the add-source
-//     wizard (inspect, preview, create) and the sources they created
-//     (read, edit, sync, pause, delete, runs and sharing, webhook secret).
+//     wizard (inspect, preview, create) and the sources they created as
+//     a contributor (read, edit, sync, pause, delete, runs and sharing,
+//     webhook secret); a source they added while an admin stays
+//     admin-managed (404 to them).
 //     Their new source waits for an admin's approval: it syncs, and agents
 //     see nothing of it until an admin approves it in the Inbox or on the
 //     source page. They choose review updates, or automatic ones only for
@@ -27,7 +29,7 @@ package api
 //	PUT    /v1/skills/admin/contributors/{user id}   admin: add one
 //	DELETE /v1/skills/admin/contributors/{user id}   admin: remove one (their sources stay)
 //	PUT    /v1/skills/sources/{id}/skills/sharing    {path, mode, members, blocked}: one skill's sharing; mode "" or "inherit" clears
-//	POST   /v1/skills/sources/{id}/approval          admin: {decision: "approve"|"reject", note?} for a contributor's source
+//	POST   /v1/skills/sources/{id}/approval          admin: {decision: "approve"|"reject", note?, sha?, version_id?} for a contributor's source
 //
 // Every change is audited with who did it and the setting before and after.
 
@@ -35,7 +37,6 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
-	"fmt"
 	"log"
 	"net/http"
 	"strings"
@@ -61,11 +62,15 @@ type skillManager struct {
 	admin bool
 }
 
-// owns reports whether the manager may change src. A contributor never
-// owns the built-in source (toolyard's own skills), whatever it names as
-// its creator.
+// owns reports whether the manager may see and change src. A contributor
+// owns only the sources they added as a contributor (with an approval
+// state): a source they added while they were an admin (no approval
+// state) reads with the admins' default token and goes live without an
+// approval, so it stays admin-managed after they lose the role. Nor do
+// they ever own the built-in source (toolyard's own skills), whatever it
+// names as its creator.
 func (m *skillManager) owns(src *skillhub.Source) bool {
-	return m.admin || (src != nil && src.Kind != skillhub.KindBuiltin && src.CreatedBy == m.u.ID)
+	return m.admin || (src != nil && src.Kind != skillhub.KindBuiltin && src.Approval != skillhub.ApprovalNone && src.CreatedBy == m.u.ID)
 }
 
 // skillApprovals is the part of the review settler that asks for and
@@ -152,10 +157,6 @@ func (s *Server) skillOwnedSource(w http.ResponseWriter, r *http.Request, m *ski
 	return src, true
 }
 
-// maxPendingContributorSources caps the sources one contributor may have
-// waiting for approval at once.
-const maxPendingContributorSources = 3
-
 // refuseContributor answers 403 contributor_limit with msg.
 func refuseContributor(w http.ResponseWriter, msg string) bool {
 	writeJSON(w, http.StatusForbidden, map[string]string{"error": msg, "code": "contributor_limit"})
@@ -215,7 +216,9 @@ func (s *Server) refuseContributorUpdate(w http.ResponseWriter, r *http.Request,
 }
 
 // refuseTooManyPending answers 409 when a contributor already has
-// maxPendingContributorSources sources waiting for approval.
+// skillhub.MaxPendingContributorSources sources waiting for approval: an
+// early answer, before the dry run. CreateSource enforces the cap itself,
+// under a cluster lock per contributor, so parallel creates cannot pass it.
 func (s *Server) refuseTooManyPending(w http.ResponseWriter, r *http.Request, m *skillManager) bool {
 	list, err := s.skillsAdmin.ListSources(r.Context())
 	if err != nil {
@@ -228,11 +231,10 @@ func (s *Server) refuseTooManyPending(w http.ResponseWriter, r *http.Request, m 
 			n++
 		}
 	}
-	if n < maxPendingContributorSources {
+	if n < skillhub.MaxPendingContributorSources {
 		return false
 	}
-	writeJSON(w, http.StatusConflict, map[string]string{
-		"error": fmt.Sprintf("you already have %d sources waiting for an admin's approval; wait for a decision, or delete one", n), "code": "conflict"})
+	writeJSON(w, http.StatusConflict, map[string]string{"error": skillhub.TooManyPendingMessage(n), "code": "conflict"})
 	return true
 }
 
@@ -482,7 +484,14 @@ func sourceSharingChanged(a, b *skillhub.Source) bool {
 
 // skillDecideApproval is POST /v1/skills/sources/{id}/approval (admin):
 // approve or reject a contributor's source on the source page. It closes
-// the open Inbox question.
+// the open Inbox question. An approval is bound to the version the page
+// showed: sha and version_id (the dashboard always sends both: the
+// waiting version's, else the live one's). Without version_id (an API
+// client) it is bound to the commit, and for an automatic or pinned source
+// the version that goes live must have the source's current settings.
+// When another version would go live, or the source was decided meanwhile,
+// it answers 409, and a source that still waits keeps (or gets) its
+// approval question for the version it waits with.
 func (s *Server) skillDecideApproval(w http.ResponseWriter, r *http.Request, m *skillManager, id string) {
 	if !skillAdminMethod(w, r, http.MethodPost) || !requireSkillAdmin(w, m) {
 		return
@@ -495,9 +504,11 @@ func (s *Server) skillDecideApproval(w http.ResponseWriter, r *http.Request, m *
 	var body struct {
 		Decision string `json:"decision"`
 		Note     string `json:"note,omitempty"`
-		// SHA is the commit of the waiting version the admin saw on the
-		// source page: only that version goes live with the approval.
-		SHA string `json:"sha,omitempty"`
+		// SHA and VersionID are the commit and the ID of the version the
+		// admin saw on the source page (the waiting one, else the live
+		// one): only that version goes live with the approval.
+		SHA       string `json:"sha,omitempty"`
+		VersionID string `json:"version_id,omitempty"`
 	}
 	if err := decode(r, &body); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
@@ -525,8 +536,14 @@ func (s *Server) skillDecideApproval(w http.ResponseWriter, r *http.Request, m *
 		writeSkillAdminError(w, err)
 		return
 	}
-	src, err := sa.DecideApproval(r.Context(), m.u.ID, id, approve, note, strings.TrimSpace(body.SHA))
+	// Decided only from the state this request read (a decision made
+	// meanwhile is 409), and bound to the version the page showed.
+	bind := skillhub.ApprovalBinding{SHA: strings.TrimSpace(body.SHA), Version: strings.TrimSpace(body.VersionID)}
+	src, err := sa.DecideApprovalFrom(r.Context(), m.u.ID, id, before.Approval, approve, note, bind)
 	if err != nil {
+		if approve && errors.Is(err, skillhub.ErrConflict) {
+			s.askAgainAfterRefusal(r.Context(), id)
+		}
 		writeSkillAdminError(w, err)
 		return
 	}
@@ -542,6 +559,30 @@ func (s *Server) skillDecideApproval(w http.ResponseWriter, r *http.Request, m *
 	s.auditSkillChange(r, m.u, event, id, map[string]any{"approval": string(before.Approval), "enabled": before.Enabled},
 		map[string]any{"approval": string(src.Approval), "enabled": src.Enabled, "note": note})
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "source": src})
+}
+
+// askAgainAfterRefusal makes sure a source whose approval on the page was
+// refused (another version would go live) still has an approval question
+// when it has a waiting version, or else a live one: the open one stays (it
+// follows that version at every check), else one is asked about it (none
+// when it was built with older settings: the check that stages the current
+// version asks). Best effort: the next check of the source asks too.
+func (s *Server) askAgainAfterRefusal(ctx context.Context, id string) {
+	ap, ok := s.skillReviews.(skillApprovals)
+	if !ok {
+		return
+	}
+	src, err := s.skillsAdmin.GetSource(ctx, id)
+	if err != nil || src.Approval != skillhub.ApprovalPending || (src.PendingVersionID == "" && src.ActiveVersionID == "") {
+		return
+	}
+	who := src.CreatedBy
+	if u, err := s.identity.GetUserByID(ctx, src.CreatedBy); err == nil {
+		who = u.Label()
+	}
+	if err := ap.RequestApproval(ctx, *src, nil, who); err != nil {
+		log.Printf("skills: approval question for %s: %v", id, err)
+	}
 }
 
 // requestSkillApproval asks the owner to approve a contributor's new

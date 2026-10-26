@@ -361,7 +361,10 @@ func (s *Service) previewRow(ctx context.Context, r *sourceRow, gh *ghClient) (*
 
 // CreateSource stores a new source. Its first check is due at once: the
 // leader's poll loop runs it within moments, or call SyncNow for a sync on
-// this node.
+// this node. A skill contributor's source (PendingApproval) is refused
+// with ErrConflict when they already have MaxPendingContributorSources
+// waiting: the count and the insert run under a cluster lock per
+// contributor, so parallel creates on any replica cannot pass the cap.
 func (s *Service) CreateSource(ctx context.Context, by string, in SourceInput) (*Source, error) {
 	r, gh, err := s.prepareSource(ctx, by, in)
 	if err != nil {
@@ -371,6 +374,21 @@ func (s *Service) CreateSource(ctx context.Context, by string, in SourceInput) (
 	if gh.token != "" && r.Auth == AuthToken {
 		if r.tokenSealed, err = s.seal(gh.token, tokenAAD(r.ID)); err != nil {
 			return nil, err
+		}
+	}
+	if in.PendingApproval {
+		lctx, unlock, err := s.cluster.LockCtx(ctx, "skillhub:contributor:"+by)
+		if err != nil {
+			return nil, fmt.Errorf("skillhub: lock the sources of %s: %w", by, err)
+		}
+		defer unlock()
+		ctx = lctx
+		n, err := s.pendingSourcesOf(ctx, by)
+		if err != nil {
+			return nil, err
+		}
+		if n >= MaxPendingContributorSources {
+			return nil, fmt.Errorf("%w: %s", ErrConflict, TooManyPendingMessage(n))
 		}
 	}
 	if err := s.insertWithSlug(ctx, r, strings.TrimSpace(in.Slug)); err != nil {
@@ -428,16 +446,104 @@ func (s *Service) seal(secret string, aad []byte) (string, error) {
 	return sealed, nil
 }
 
+// maxUpdateAttempts bounds UpdateSource's read-modify-write rounds when
+// other writes (a sync's activation, a sharing change) move the source in
+// between.
+const maxUpdateAttempts = 5
+
+// updateGuard is the part of a source the caller of UpdateSource decided
+// on (who may change what, which open questions to close): a round after a
+// write in between goes on only while it is unchanged.
+type updateGuard struct {
+	approval             Approval
+	hidden, enabled      bool
+	mode                 UpdateMode
+	branch, path, pinned string
+	exclude, limits      string
+	auth                 AuthMode
+	token                string // sealed
+}
+
+func guardOf(r *sourceRow) updateGuard {
+	ex, _ := json.Marshal(nonNil(r.Exclude))
+	lim, _ := json.Marshal(r.Limits)
+	return updateGuard{approval: r.Approval, hidden: r.Hidden, enabled: r.Enabled, mode: r.Mode, branch: r.Branch, path: r.Path,
+		pinned: r.PinnedSHA, exclude: string(ex), limits: string(lim), auth: r.Auth, token: r.tokenSealed}
+}
+
 // UpdateSource changes a source's settings. A change to what is fetched
 // (branch, folder, excludes, limits, mode, pinned commit, credential)
 // makes its next check due at once.
+//
+// A contributor's source that is not approved forgets its waiting version
+// when its branch, pinned commit, folder, excludes or limits change.
+//
+// Only the fields the update names are written (the hide lock, for one,
+// changes only when the update names it: the admin hide path), and only
+// while the source is still as read (its updated_at); a write in between
+// makes it read again, at most maxUpdateAttempts times. When the approval,
+// the hide lock, the paused state, the mode, what is fetched (branch,
+// folder, excludes, pinned commit, limits) or the credential (read access,
+// token) changed in between, it answers ErrConflict instead: the caller's
+// checks read the old source. With up.IfUpdatedAt set, the first read must
+// be the source the caller checked (that updated_at), else ErrConflict.
 func (s *Service) UpdateSource(ctx context.Context, by, id string, up SourceUpdate) (*Source, error) {
-	r, err := s.getSourceRow(ctx, s.db, id)
-	if err != nil {
-		return nil, err
+	var first *updateGuard
+	due := false
+	for attempt := 1; ; attempt++ {
+		r, err := s.getSourceRow(ctx, s.db, id)
+		if err != nil {
+			return nil, err
+		}
+		g := guardOf(r)
+		switch {
+		case first == nil && !up.IfUpdatedAt.IsZero() && r.UpdatedAt.UnixMilli() != up.IfUpdatedAt.UnixMilli():
+			return nil, fmt.Errorf("%w: source %s changed since it was read; look again and retry", ErrConflict, r.Slug)
+		case first == nil:
+			first = &g
+		case g != *first:
+			return nil, fmt.Errorf("%w: source %s changed meanwhile (its approval, hide lock, paused state, mode, what it fetches or its credential); look again and retry", ErrConflict, r.Slug)
+		}
+		read, fetched := r.UpdatedAt.UnixMilli(), fetchKey(r)
+		if due, err = s.applyUpdate(r, up); err != nil {
+			return nil, err
+		}
+		// A contributor's source that is not approved forgets its waiting
+		// version when what it fetches changed: built from the old branch
+		// or settings, it can no longer be shown or approved (the next
+		// check stages the new one, and finds an older one again when the
+		// settings come back). Also when this read saw none: a sync may
+		// stage one (setPending moves no updated_at) before this write.
+		dropWaiting := !r.Approval.Live() && fetchKey(r) != fetched
+		ok, err := s.updateSourceSettings(ctx, r, up, read, due, dropWaiting)
+		if err != nil {
+			return nil, err
+		}
+		if ok {
+			break
+		}
+		if attempt == maxUpdateAttempts {
+			return nil, fmt.Errorf("%w: source %s keeps changing; try again", ErrConflict, r.Slug)
+		}
 	}
+	s.changed(ctx, id)
+	if due {
+		s.pokePoller()
+	}
+	return s.GetSource(ctx, id)
+}
+
+// fetchKey is what a source's versions are built from: its branch, pinned
+// commit and settings (configHash).
+func fetchKey(r *sourceRow) string {
+	return r.Branch + "\n" + r.PinnedSHA + "\n" + r.configHash()
+}
+
+// applyUpdate applies an update to r as read and validates the result. It
+// reports whether what is fetched changed (the next check is due at once).
+func (s *Service) applyUpdate(r *sourceRow, up SourceUpdate) (bool, error) {
 	if err := refuseBuiltinUpdate(r, up); err != nil {
-		return nil, err
+		return false, err
 	}
 	due := false
 	set := func(dst *string, v *string) {
@@ -450,7 +556,7 @@ func (s *Service) UpdateSource(ctx context.Context, by, id string, up SourceUpda
 	if up.Path != nil {
 		p, err := cleanFolder(*up.Path)
 		if err != nil {
-			return nil, err
+			return false, err
 		}
 		due = due || p != r.Path
 		r.Path = p
@@ -458,7 +564,7 @@ func (s *Service) UpdateSource(ctx context.Context, by, id string, up SourceUpda
 	if up.Exclude != nil {
 		ex, err := validateGlobs(*up.Exclude)
 		if err != nil {
-			return nil, err
+			return false, err
 		}
 		r.Exclude, due = ex, true
 	}
@@ -474,7 +580,7 @@ func (s *Service) UpdateSource(ctx context.Context, by, id string, up SourceUpda
 		r.Limits, due = *up.Limits, true
 	}
 	if err := s.updateCredential(r, up, &due); err != nil {
-		return nil, err
+		return false, err
 	}
 	if up.PollSeconds != nil {
 		r.PollSeconds = *up.PollSeconds
@@ -499,19 +605,12 @@ func (s *Service) UpdateSource(ctx context.Context, by, id string, up SourceUpda
 		r.DefaultRuns = *up.DefaultRuns
 	}
 	if r.Branch == "" {
-		return nil, fmt.Errorf("%w: a branch is required", ErrInvalid)
+		return false, fmt.Errorf("%w: a branch is required", ErrInvalid)
 	}
 	if err := normalizeSource(r); err != nil {
-		return nil, err
+		return false, err
 	}
-	if err := s.updateSourceSettings(ctx, r, due); err != nil {
-		return nil, err
-	}
-	s.changed(ctx, id)
-	if due {
-		s.pokePoller()
-	}
-	return s.GetSource(ctx, id)
+	return due, nil
 }
 
 // updateCredential applies an update's auth and token fields.
@@ -775,8 +874,9 @@ func (s *Service) SetRuns(ctx context.Context, by, id, skillPath string, runs Ru
 	if err != nil {
 		return fmt.Errorf("skillhub: set runs: %w", err)
 	}
-	// The source's updated_at tells every node's index to reload it.
-	if _, err := tx.ExecContext(ctx, `UPDATE skill_sources SET updated_at = ? WHERE id = ?`, max(now, r.UpdatedAt.UnixMilli()+1), id); err != nil {
+	// The source's updated_at tells every node's index to reload it; it
+	// always moves forward, even past a write made after r was read.
+	if _, err := tx.ExecContext(ctx, `UPDATE skill_sources SET updated_at = `+bumpUpdatedAt+` WHERE id = ?`, now, now, id); err != nil {
 		return fmt.Errorf("skillhub: set runs: %w", err)
 	}
 	if err := tx.Commit(); err != nil {

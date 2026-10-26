@@ -187,15 +187,15 @@ func TestTwoNodeSharingReload(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := node1.SyncNow(ctx, two.ID); err != nil {
-		t.Fatal(err)
+	res, err := node1.SyncNow(ctx, two.ID)
+	if err != nil || !res.Staged {
+		t.Fatalf("pending source sync: %+v %v", res, err)
 	}
 	other := Viewer{UserID: "usr_other", AgentID: "agt_other"}
-	waitFor("the pending source arrived visible or not at all", func() bool { return sees(adminViewer, "skill://two/pr-review/SKILL.md") })
-	if sees(other, "skill://two/pr-review/SKILL.md") {
-		t.Fatal("node 2 shows a source pending approval")
+	if sees(other, "skill://two/pr-review/SKILL.md") || sees(adminViewer, "skill://two/pr-review/SKILL.md") {
+		t.Fatal("node 2 serves a commit of a source pending approval")
 	}
-	if _, err := node1.DecideApproval(ctx, "usr_admin", two.ID, true, "", ""); err != nil {
+	if _, err := node1.DecideApproval(ctx, "usr_admin", two.ID, true, "", res.SHA); err != nil {
 		t.Fatal(err)
 	}
 	waitFor("the approval did not arrive", func() bool { return sees(other, "skill://two/pr-review/SKILL.md") })
