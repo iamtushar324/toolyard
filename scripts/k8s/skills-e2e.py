@@ -21,6 +21,9 @@ Inputs (environment):
                        fixture repository's owner)
   FIXTURE_WORKTREE     a local checkout of FIXTURE_BRANCH; when set, the Auto
                        and Review update checks push commits to it
+  MEMBER_FILE          JSON {"username", "password"} of a second, non-admin
+                       account; turns on the sharing, contributor and owner
+                       transfer checks
   PRIVATE_URL          optional private repository URL (e.g. a bk-docs folder)
   PRIVATE_TOKEN_FILE   file with a read-only token for PRIVATE_URL
   REPORT               path of the JSON report (default /tmp/skills-e2e.json)
@@ -538,6 +541,128 @@ def main():
         if new_src:
             admin.req("DELETE", "/v1/skills/sources/%s" % new_src["id"])
     step("proposal", propose)
+
+    # --- Built-in toolyard skills --------------------------------------------
+    def builtin():
+        src = agent.tool("skills.sources", {})
+        slugs = [x.get("slug") for x in src.get("sources", [])]
+        check("the built-in source 'toolyard' is served", "toolyard" in slugs, slugs)
+        g = agent.tool("skills.get", {"skill": "toolyard/toolyard-basics"})
+        check("skills.get toolyard/toolyard-basics returns the guide", g.get("name") == "toolyard-basics" and len(g.get("body", "")) > 200,
+              {"files": [f.get("path") for f in g.get("files", [])][:6]})
+        s = agent.tool("skills.search", {"query": "permission inbox grant", "source": "toolyard"})
+        names = [x.get("name") for x in s.get("skills", [])]
+        check("a built-in skill teaches permissions and the Inbox", any("inbox" in (n or "") or "permission" in (n or "") for n in names), names)
+        bi = find_source(admin, "toolyard")
+        r = admin.req("DELETE", "/v1/skills/sources/%s" % bi["id"]) if bi else None
+        check("the built-in source cannot be deleted", r is not None and r.status_code in (400, 403, 409), getattr(r, "status_code", None))
+    step("built-in skills", builtin)
+
+    # --- Owner, sharing and contributors (needs a member account) ------------
+    member_file = os.environ.get("MEMBER_FILE")
+    if member_file:
+        creds = json.load(open(member_file))
+        msess = requests.Session()
+        msess.headers.update({"Origin": BASE, "X-Requested-With": "skills-e2e"})
+        msess.post(BASE + "/v1/auth/login", json=creds, timeout=30).raise_for_status()
+        me_member = msess.get(BASE + "/v1/auth/me", timeout=20).json()
+        member_id = me_member.get("id")
+        me_admin = admin.j("GET", "/v1/auth/me")
+        check("the first admin is the owner", me_admin.get("is_owner") is True, {"admin": me_admin.get("username")})
+        mag = msess.post(BASE + "/v1/agents", json={"name": "skills-e2e-member-" + uuid.uuid4().hex[:6]}, timeout=30).json()
+        magent = Agent(mag["token"])
+        magent.init()
+        mag_id = mag.get("id") or mag.get("agent", {}).get("id")
+        fx_id = fx["id"]
+
+        def visible(ag, ref):
+            try:
+                return ag.tool("skills.get", {"skill": ref}).get("name") is not None
+            except RuntimeError:
+                return False
+
+        def sharing():
+            put = lambda body: admin.j("PUT", "/v1/skills/sources/%s/skills/sharing" % fx_id, json=body)
+            check("a member's agent sees an everyone skill", visible(magent, "fixture/release-notes"))
+            put({"path": "release-notes", "mode": "nobody"})
+            time.sleep(2)
+            check("skill shared with nobody: hidden from the member's agent", not visible(magent, "fixture/release-notes"))
+            check("skill shared with nobody: hidden from every agent, the admin's too", not visible(agent, "fixture/release-notes"))
+            rows = admin.j("GET", "/v1/skills/sources/%s/skills" % fx_id)
+            rows = rows.get("skills", rows) if isinstance(rows, dict) else rows
+            check("the admin's Skills page still lists it", any(x.get("path") == "release-notes" for x in rows or []))
+            hits = magent.tool("skills.search", {"query": "release notes", "source": "fixture"}).get("skills", [])
+            check("skill shared with nobody: not in the member's search", all(h.get("name") != "release-notes" for h in hits))
+            listed = [e.get("uri", "") for e in magent.rpc("skills/list", {}).get("result", {}).get("skills", [])]
+            check("skill shared with nobody: not in the member's skills/list", all("release-notes" not in u for u in listed))
+            put({"path": "release-notes", "mode": "members", "members": [member_id]})
+            time.sleep(2)
+            check("skill shared with chosen members: the member sees it", visible(magent, "fixture/release-notes"))
+            put({"path": "release-notes", "mode": "members", "members": [member_id], "blocked": [member_id]})
+            time.sleep(2)
+            check("a blocked member does not see the skill", not visible(magent, "fixture/release-notes"))
+            put({"path": "release-notes", "mode": ""})
+            time.sleep(2)
+            check("inherit again: the member sees the skill", visible(magent, "fixture/release-notes"))
+            admin.j("PATCH", "/v1/skills/sources/%s" % fx_id, json={"visibility": "nobody"})
+            time.sleep(2)
+            slugs = [x.get("slug") for x in magent.tool("skills.sources", {}).get("sources", [])]
+            check("source shared with nobody: hidden from the member", "fixture" not in slugs, slugs)
+            admin.j("PATCH", "/v1/skills/sources/%s" % fx_id, json={"visibility": "everyone"})
+        step("sharing", sharing)
+
+        def contributors():
+            url = "https://github.com/%s/tree/%s/skills/incident-triage" % (FIXTURE_REPO, FIXTURE_BRANCH)
+            r = msess.post(BASE + "/v1/skills/sources", json={"url": url, "mode": "review"}, timeout=60)
+            check("a member who is not a contributor cannot add a source", r.status_code in (401, 403, 404), r.status_code)
+            admin.j("PUT", "/v1/skills/admin/contributors/%s" % member_id)
+            r = msess.post(BASE + "/v1/skills/sources", json={"url": url, "mode": "review", "slug": "e2e-contrib"}, timeout=120)
+            body = r.json() if r.content else {}
+            src = body.get("source", body)
+            check("a contributor can add a source; it waits for approval", r.status_code in (200, 201) and src.get("approval") == "pending",
+                  {"status": r.status_code, "approval": src.get("approval")})
+            cid = src.get("id")
+            r = msess.get(BASE + "/v1/skills/sources/%s" % fx_id, timeout=20)
+            check("a contributor cannot read another person's source settings", r.status_code in (403, 404), r.status_code)
+            deadline = time.time() + 90
+            while time.time() < deadline:
+                s = admin.j("GET", "/v1/skills/sources/%s" % cid)
+                s = s.get("source", s)
+                if s.get("pending_version_id") or s.get("active_sha"):
+                    break
+                time.sleep(3)
+            slugs = [x.get("slug") for x in agent.tool("skills.sources", {}).get("sources", [])]
+            check("a pending contributor source is hidden from agents", "e2e-contrib" not in slugs, slugs)
+            s = admin.j("GET", "/v1/skills/sources/%s" % cid)
+            s = s.get("source", s)
+            vs = admin.j("GET", "/v1/skills/sources/%s/versions" % cid)
+            vs = vs.get("versions", vs) if isinstance(vs, dict) else vs
+            pend = next((v for v in vs or [] if v.get("id") == s.get("pending_version_id")), {})
+            admin.j("POST", "/v1/skills/sources/%s/approval" % cid, json={"decision": "approve", "sha": pend.get("sha", "")})
+            s = admin.j("GET", "/v1/skills/sources/%s" % cid)
+            s = s.get("source", s)
+            if s.get("pending_version_id"):
+                admin.j("POST", "/v1/skills/sources/%s/versions/%s/activate" % (cid, s["pending_version_id"]))
+            time.sleep(2)
+            slugs = [x.get("slug") for x in agent.tool("skills.sources", {}).get("sources", [])]
+            check("after approval the contributor source is served", "e2e-contrib" in slugs, slugs)
+            admin.req("DELETE", "/v1/skills/sources/%s" % cid)
+            admin.req("DELETE", "/v1/skills/admin/contributors/%s" % member_id)
+        step("contributors", contributors)
+
+        def owner_transfer():
+            r = msess.patch(BASE + "/v1/users/%s" % me_admin.get("id"), json={"role": "member"}, timeout=20)
+            check("a member cannot change roles", r.status_code in (401, 403), r.status_code)
+            r = admin.req("POST", "/v1/users/%s/make-owner" % member_id, json={"confirm": creds["username"]})
+            check("the owner can transfer ownership", r.status_code == 200 and msess.get(BASE + "/v1/auth/me", timeout=20).json().get("is_owner") is True,
+                  r.status_code)
+            r = msess.post(BASE + "/v1/users/%s/make-owner" % me_admin.get("id"), json={"confirm": me_admin.get("username")}, timeout=20)
+            check("the new owner can transfer it back", r.status_code == 200 and admin.j("GET", "/v1/auth/me").get("is_owner") is True, r.status_code)
+        step("owner transfer", owner_transfer)
+
+        if mag_id:
+            msess.delete(BASE + "/v1/agents/%s" % mag_id, timeout=20)
+        msess.post(BASE + "/v1/auth/logout", timeout=20)
 
     # Clean up the agent key.
     if agent_id:
