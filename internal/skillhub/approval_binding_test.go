@@ -530,3 +530,58 @@ func TestCheckClosesALeftoverQuestion(t *testing.T) {
 		t.Fatalf("the leftover question: %+v", r)
 	}
 }
+
+// The Skills page approval is bound to the version the page showed (the
+// route passes its version_id): after a folder change on the same commit,
+// an approval naming the old version is refused, whether the new version
+// waits or an admin made it live; naming the version that goes live
+// approves.
+func TestPageApprovalIsBoundToTheVersionShown(t *testing.T) {
+	gh := newFakeGitHub(t, "acme", "skills")
+	tree := baseTree()
+	tree["other/pr-review/SKILL.md"] = skillMD("pr-review", "Review a pull request, the other way.", "", "# Other\n")
+	gh.commit("main", tree)
+	svc := newTestService(t, gh, trustAcme)
+	ctx := context.Background()
+	src, err := svc.CreateSource(ctx, "usr_contrib", SourceInput{URL: "acme/skills", Path: "skills", Mode: ModeAuto, PendingApproval: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	a, err := svc.SyncNow(ctx, src.ID)
+	if err != nil || !a.Staged {
+		t.Fatalf("sync of folder skills: %+v %v", a, err)
+	}
+	other := "other"
+	if _, err := svc.UpdateSource(ctx, "usr_contrib", src.ID, SourceUpdate{Path: &other}); err != nil {
+		t.Fatal(err)
+	}
+	b, err := svc.SyncNow(ctx, src.ID)
+	if err != nil || !b.Staged || b.SHA != a.SHA || b.VersionID == a.VersionID {
+		t.Fatalf("sync of folder other: %+v %v", b, err)
+	}
+	page := func(versionID string) error {
+		_, err := svc.DecideApprovalFrom(ctx, "usr_admin", src.ID, ApprovalPending, true, "", ApprovalBinding{SHA: a.SHA, Version: versionID})
+		return err
+	}
+	// The page showed folder skills' version; folder other's waits now.
+	if err := page(a.VersionID); !errors.Is(err, ErrConflict) {
+		t.Fatalf("a page approval of the old version, the new one waiting: %v", err)
+	}
+	// An admin makes the new version live while the source waits: a page
+	// that showed the old version is still refused.
+	if err := svc.Activate(ctx, "usr_admin", src.ID, b.VersionID); err != nil {
+		t.Fatal(err)
+	}
+	if err := page(a.VersionID); !errors.Is(err, ErrConflict) {
+		t.Fatalf("a page approval of the old version, the new one live: %v", err)
+	}
+	if got, _ := svc.GetSource(ctx, src.ID); got.Approval != ApprovalPending {
+		t.Fatalf("approved by a refused page approval: %+v", got)
+	}
+	if err := page(b.VersionID); err != nil {
+		t.Fatalf("a page approval of the live version: %v", err)
+	}
+	if got, _ := svc.GetSource(ctx, src.ID); got.Approval != ApprovalApproved || got.ActiveVersionID != b.VersionID {
+		t.Fatalf("after the approval: %+v", got)
+	}
+}

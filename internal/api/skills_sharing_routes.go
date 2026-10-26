@@ -29,7 +29,7 @@ package api
 //	PUT    /v1/skills/admin/contributors/{user id}   admin: add one
 //	DELETE /v1/skills/admin/contributors/{user id}   admin: remove one (their sources stay)
 //	PUT    /v1/skills/sources/{id}/skills/sharing    {path, mode, members, blocked}: one skill's sharing; mode "" or "inherit" clears
-//	POST   /v1/skills/sources/{id}/approval          admin: {decision: "approve"|"reject", note?} for a contributor's source
+//	POST   /v1/skills/sources/{id}/approval          admin: {decision: "approve"|"reject", note?, sha?, version_id?} for a contributor's source
 //
 // Every change is audited with who did it and the setting before and after.
 
@@ -484,7 +484,13 @@ func sourceSharingChanged(a, b *skillhub.Source) bool {
 
 // skillDecideApproval is POST /v1/skills/sources/{id}/approval (admin):
 // approve or reject a contributor's source on the source page. It closes
-// the open Inbox question.
+// the open Inbox question. An approval is bound to the version the page
+// showed: sha and version_id (the dashboard always sends both: the
+// waiting version's, else the live one's). Without version_id (an API
+// client) it is bound to the commit with the source's current settings.
+// When another version would go live, or the source was decided meanwhile,
+// it answers 409, and a source that still waits keeps (or gets) its
+// approval question for the version it waits with.
 func (s *Server) skillDecideApproval(w http.ResponseWriter, r *http.Request, m *skillManager, id string) {
 	if !skillAdminMethod(w, r, http.MethodPost) || !requireSkillAdmin(w, m) {
 		return
@@ -497,9 +503,11 @@ func (s *Server) skillDecideApproval(w http.ResponseWriter, r *http.Request, m *
 	var body struct {
 		Decision string `json:"decision"`
 		Note     string `json:"note,omitempty"`
-		// SHA is the commit of the waiting version the admin saw on the
-		// source page: only that version goes live with the approval.
-		SHA string `json:"sha,omitempty"`
+		// SHA and VersionID are the commit and the ID of the version the
+		// admin saw on the source page (the waiting one, else the live
+		// one): only that version goes live with the approval.
+		SHA       string `json:"sha,omitempty"`
+		VersionID string `json:"version_id,omitempty"`
 	}
 	if err := decode(r, &body); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
@@ -527,8 +535,14 @@ func (s *Server) skillDecideApproval(w http.ResponseWriter, r *http.Request, m *
 		writeSkillAdminError(w, err)
 		return
 	}
-	src, err := sa.DecideApproval(r.Context(), m.u.ID, id, approve, note, strings.TrimSpace(body.SHA))
+	// Decided only from the state this request read (a decision made
+	// meanwhile is 409), and bound to the version the page showed.
+	bind := skillhub.ApprovalBinding{SHA: strings.TrimSpace(body.SHA), Version: strings.TrimSpace(body.VersionID)}
+	src, err := sa.DecideApprovalFrom(r.Context(), m.u.ID, id, before.Approval, approve, note, bind)
 	if err != nil {
+		if approve && errors.Is(err, skillhub.ErrConflict) {
+			s.askAgainAfterRefusal(r.Context(), id)
+		}
 		writeSkillAdminError(w, err)
 		return
 	}
@@ -544,6 +558,29 @@ func (s *Server) skillDecideApproval(w http.ResponseWriter, r *http.Request, m *
 	s.auditSkillChange(r, m.u, event, id, map[string]any{"approval": string(before.Approval), "enabled": before.Enabled},
 		map[string]any{"approval": string(src.Approval), "enabled": src.Enabled, "note": note})
 	writeJSON(w, http.StatusOK, map[string]any{"ok": true, "source": src})
+}
+
+// askAgainAfterRefusal makes sure a source whose approval on the page was
+// refused (another version would go live) still has an approval question
+// when it waits with a version: the open one stays (it follows the waiting
+// version at every check), else one is asked about the waiting version.
+// Best effort: the next check of the source asks too.
+func (s *Server) askAgainAfterRefusal(ctx context.Context, id string) {
+	ap, ok := s.skillReviews.(skillApprovals)
+	if !ok {
+		return
+	}
+	src, err := s.skillsAdmin.GetSource(ctx, id)
+	if err != nil || src.Approval != skillhub.ApprovalPending || src.PendingVersionID == "" {
+		return
+	}
+	who := src.CreatedBy
+	if u, err := s.identity.GetUserByID(ctx, src.CreatedBy); err == nil {
+		who = u.Label()
+	}
+	if err := ap.RequestApproval(ctx, *src, nil, who); err != nil {
+		log.Printf("skills: approval question for %s: %v", id, err)
+	}
 }
 
 // requestSkillApproval asks the owner to approve a contributor's new

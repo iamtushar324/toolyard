@@ -27,6 +27,11 @@ type skillsSharingFake struct {
 	lastSharing  skillhub.SkillSharing
 	lastPath     string
 	decisions    []string
+	// lastBinding is the binding of the last DecideApprovalFrom; decideErr
+	// makes it fail; waitingVersion gives sources a waiting version.
+	lastBinding    skillhub.ApprovalBinding
+	decideErr      error
+	waitingVersion map[string]string
 }
 
 var (
@@ -56,6 +61,7 @@ func (f *skillsSharingFake) source(id string) *skillhub.Source {
 	if k, ok := f.kinds[id]; ok {
 		src.Kind = k
 	}
+	src.PendingVersionID = f.waitingVersion[id]
 	return src
 }
 
@@ -168,10 +174,14 @@ func (f *skillsSharingFake) DecideApproval(_ context.Context, by, id string, app
 
 func (f *skillsSharingFake) DecideApprovalFrom(ctx context.Context, by, id string, from skillhub.Approval, approve bool, note string, b skillhub.ApprovalBinding) (*skillhub.Source, error) {
 	f.smu.Lock()
-	cur := f.approval[id]
+	cur, fail := f.approval[id], f.decideErr
+	f.lastBinding = b
 	f.smu.Unlock()
-	if cur != from {
-		return nil, skillhub.ErrConflict
+	if cur != from || fail != nil {
+		if fail == nil {
+			fail = skillhub.ErrConflict
+		}
+		return nil, fail
 	}
 	return f.DecideApproval(ctx, by, id, approve, note, b.SHA)
 }
@@ -514,9 +524,15 @@ func TestSkillApprovalRoute(t *testing.T) {
 	if rec := e.do(t, e.adminCookie, http.MethodPost, "/v1/skills/sources/src_mine/approval", `{"decision":"maybe"}`); rec.Code != http.StatusBadRequest {
 		t.Fatalf("bad decision: %d", rec.Code)
 	}
-	rec := e.do(t, e.adminCookie, http.MethodPost, "/v1/skills/sources/src_mine/approval", `{"decision":"approve","sha":" abc "}`)
+	rec := e.do(t, e.adminCookie, http.MethodPost, "/v1/skills/sources/src_mine/approval", `{"decision":"approve","sha":" abc ","version_id":" skv_9 "}`)
 	if rec.Code != http.StatusOK || skillsJSON(t, rec)["source"].(map[string]any)["approval"] != "approved" {
 		t.Fatalf("approve: %d %s", rec.Code, rec.Body.String())
+	}
+	e.fake.smu.Lock()
+	bind := e.fake.lastBinding
+	e.fake.smu.Unlock()
+	if bind != (skillhub.ApprovalBinding{SHA: "abc", Version: "skv_9"}) {
+		t.Fatalf("the approval is not bound to the version the page showed: %+v", bind)
 	}
 	rec = e.do(t, e.adminCookie, http.MethodPost, "/v1/skills/sources/src_mine/approval", `{"decision":"reject","note":"duplicate"}`)
 	if rec.Code != http.StatusOK {
@@ -826,5 +842,31 @@ func TestSkillSourcePatchIsBoundToItsRead(t *testing.T) {
 	e.fake.mu.Unlock()
 	if !upd.IfUpdatedAt.Equal(skillsFakeUpdatedAt) {
 		t.Fatalf("the update is not bound to the source it was checked against: %v", upd.IfUpdatedAt)
+	}
+}
+
+// A page approval the engine refuses (another version would go live)
+// answers 409, and the source, which still waits with a version, keeps an
+// approval question: the route asks (the settler adds one only when none
+// is open).
+func TestSkillApprovalRouteRefusalAsksAgain(t *testing.T) {
+	e := newSkillsSharingEnv(t)
+	e.fake.smu.Lock()
+	e.fake.approval["src_mine"] = skillhub.ApprovalPending
+	e.fake.waitingVersion = map[string]string{"src_mine": "skv_2"}
+	e.fake.decideErr = skillhub.ErrConflict
+	e.fake.smu.Unlock()
+	rec := e.do(t, e.adminCookie, http.MethodPost, "/v1/skills/sources/src_mine/approval", `{"decision":"approve","sha":"abc","version_id":"skv_1"}`)
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("refused approval: %d %s", rec.Code, rec.Body.String())
+	}
+	e.settler.mu.Lock()
+	reqs, settled := append([]string(nil), e.settler.requests...), append([]string(nil), e.settler.settled...)
+	e.settler.mu.Unlock()
+	if len(reqs) != 1 || !strings.HasPrefix(reqs[0], "src_mine|pending|") || len(settled) != 0 {
+		t.Fatalf("after a refused approval: requests %v settled %v", reqs, settled)
+	}
+	if e.auditRows(t, "skills.source_approve", "") != 0 {
+		t.Fatal("a refused approval was audited as an approval")
 	}
 }

@@ -596,8 +596,9 @@ test('an admin approves or rejects a contributor source; reject sends the reason
   await h.run(`decideSkillSource(s, 'approve')`);
   const approve = h.requests.find((r) => r.path === '/v1/skills/sources/src_1/approval');
   assert.equal(approve.method, 'POST');
-  // Nothing waits, so the approval names the live commit shown on the page.
-  assert.deepEqual(plain(approve.body), { decision: 'approve', sha: source1.active_sha });
+  // Nothing waits, so the approval names the live version shown on the
+  // page: its commit and its ID.
+  assert.deepEqual(plain(approve.body), { decision: 'approve', sha: source1.active_sha, version_id: 'skv_1' });
   h.run(`prompt = () => '  not our repository '`);
   await h.run(`decideSkillSource(s, 'reject')`);
   const reject = h.requests.filter((r) => r.path === '/v1/skills/sources/src_1/approval').pop();
@@ -606,6 +607,16 @@ test('an admin approves or rejects a contributor source; reject sends the reason
   h.run(`prompt = () => null`);
   await h.run(`decideSkillSource(s, 'reject')`);
   assert.equal(h.requests.filter((r) => r.path === '/v1/skills/sources/src_1/approval').length, 2);
+  // A waiting version shown on the page: the approval names it.
+  h.context.waitingSrc = Object.assign({}, source1, { approval: 'pending', created_by: 'u_2', pending_version_id: 'skv_3' });
+  h.run(`skillsUI.openId = 'src_1'; skillsUI.detail = { id: 'src_1', source: waitingSrc, busy: '', secret: null, error: '',
+    versions: [
+      { id: 'skv_3', sha: 'cccccccccccccccc', status: 'staged', skill_count: 13, warnings: [], created_at: '2026-10-25T09:00:00Z' },
+      { id: 'skv_1', sha: '0123456789abcdef', status: 'active', skill_count: 12, warnings: [], created_at: '2026-10-24T09:00:00Z' },
+    ], skills: [] };`);
+  await h.run(`decideSkillSource(waitingSrc, 'approve')`);
+  const waiting = h.requests.filter((r) => r.path === '/v1/skills/sources/src_1/approval').pop();
+  assert.deepEqual(plain(waiting.body), { decision: 'approve', sha: 'cccccccccccccccc', version_id: 'skv_3' });
 });
 
 test('a contributor source page hides version and approval buttons; an admin gets them', () => {

@@ -363,19 +363,23 @@ UI in `app.js`.
    answer is being applied. An answer refused for its version asks again
    for the waiting version (none, or one built with old settings: the sync
    that stages the current one asks).
-   `DecideApproval(approve, sha)` (the source page) makes the waiting
-   version at `sha` with the source's current settings live (before the
-   approval is stored), and refuses with `ErrConflict` when another
-   version would go live: a waiting version of an automatic or pinned
-   source that does not match, a live version not at `sha`, or an
-   automatic or pinned source with nothing synced. The Inbox decides with
-   `DecideApprovalFrom(..., ApprovalPending, ..., binding)`, the binding
-   being the question's commit, version and settings digest: only a
-   waiting (or live) version that matches all of them goes live, so a
-   card never approves a version built with other settings; and a late
-   answer never undoes a decision made on the source page (the question
-   is settled as cancelled). The approval is stored only while the live
-   and waiting versions are the ones checked.
+   An approval goes through `DecideApprovalFrom(..., from, ...,
+   binding)`: only a waiting (or live) version that matches the binding
+   goes live (before the approval is stored), else `ErrConflict`: a
+   waiting version of an automatic or pinned source that does not match,
+   a live version that does not, or an automatic or pinned source with
+   nothing synced. The Inbox binds to the question's commit, version and
+   settings digest, with `from` = `ApprovalPending`, so a card never
+   approves a version built with other settings and a late answer never
+   undoes a decision made on the source page (the question is settled as
+   cancelled). The source page (`POST .../approval`) binds to the version
+   the page showed, `sha` and `version_id` (the dashboard sends the
+   waiting version's, else the live one's), with `from` = the state the
+   request read; without `version_id` (an API client) to the commit with
+   the source's current settings. A refused page
+   approval leaves the source its open question, or asks one about the
+   waiting version. The approval is stored only while the live and
+   waiting versions are the ones checked.
 4. **At most three waiting sources per contributor.** `CreateSource`
    counts and inserts under `cluster.LockCtx(ctx,
    "skillhub:contributor:"+userID)`, so parallel creates on any replica

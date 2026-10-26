@@ -184,7 +184,7 @@ they added as a contributor and the Add source wizard.
   old one closed). The question always shows the source as it is when it
   is asked. **Approve** is bound to what the question shows: its commit,
   built with the folder, excludes and limits it showed (on the source
-  page: the commit, with the source's current settings); exactly that
+  page: the version the page shows, by its commit and ID); exactly that
   version goes live with the approval. When another version would go
   live instead (a newer waiting commit of an automatic source, the same
   commit with other settings, a live commit that is not the one shown, or
@@ -399,7 +399,7 @@ answers them 403 `admin_only`. Errors are `{"error", "code"}` with the codes `in
 | `GET /v1/skills/sources/{id}/versions?limit=` | *contributor*. The last versions (default 20, at most 100) |
 | `POST /v1/skills/sources/{id}/versions/{vid}/activate` | make a version live (approve or roll back) |
 | `POST /v1/skills/sources/{id}/versions/{vid}/reject` | `{note?}`: reject a staged version |
-| `POST /v1/skills/sources/{id}/approval` | `{decision: "approve" or "reject", note?, sha?}`: decide a contributor's source; closes its Inbox question. The approval is bound to `sha`, the commit you saw: a waiting version at that commit, built with the source's current settings, goes live with it; 409 `conflict` when another version would go live (a waiting commit of an automatic source not at `sha` or built with older settings, a live commit not at `sha`, or an automatic source that synced nothing yet). A review-mode source's waiting version at another commit waits for review |
+| `POST /v1/skills/sources/{id}/approval` | `{decision: "approve" or "reject", note?, sha?, version_id?}`: decide a contributor's source; closes its Inbox question. The approval is bound to the version you saw: `sha` and `version_id` of the waiting version, or of the live one when nothing waits (the dashboard always sends both). That version goes live, or stays live, with the approval; 409 `conflict` when another version would (a waiting or live version with another ID or commit, or an automatic source that synced nothing yet), or when the source was decided meanwhile, and a source that still waits keeps its approval question. Without `version_id` (an API client), the approval is bound to the commit `sha` with the source's current settings. A review-mode source's waiting version that is not the one named waits for review |
 | `GET /v1/skills/sources/{id}/skills` | *contributor*. Skills with where they run, their own sharing (`sharing`, absent when they follow the source) and reads in 30 days |
 | `PUT /v1/skills/sources/{id}/skills/runs` | *contributor*. `{path, runs}`: `anywhere`, `host`, or `""` to clear the override |
 | `PATCH /v1/skills/sources/{id}` with `{hidden}` | admin: hide the source from every agent (`true`) or show it again |
