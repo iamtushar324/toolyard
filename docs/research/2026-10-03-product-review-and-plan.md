@@ -145,7 +145,7 @@ U17 has strong source support for a mismatch. The live latency pattern is consis
 
 | ID | Evidence | Finding | Proposed change |
 | --- | --- | --- | --- |
-| C01 | Live | A Beknown identity check reports a registry 403 without enough task-level recovery context. | Explain the affected connection, owner, consequence, and exact repair action. Do not label every connection broken. |
+| C01 | Live | An identity key check reports a registry 403 without enough task-level recovery context. | Explain the affected connection, owner, consequence, and exact repair action. Do not label every connection broken. |
 | C02 | Live + Source | Enabled agents can appear active despite stale last-seen times. | Separate enabled identity, online connection, active session, and last activity. |
 | C03 | Source | Mobile More omits destinations that desktop exposes, including Events and MemPalace. | Use one route registry for desktop, mobile, roles, and extension visibility. |
 | C04 | Live + Source | Insights mixes test traffic, intentional waits, policy coaching, and operational failures. | Add traffic labels and separate waiting time from execution time. Show a meaningful denominator. |

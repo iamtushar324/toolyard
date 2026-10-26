@@ -57,6 +57,11 @@ var errSourceChanged = errors.New("skillhub: the source changed while it was syn
 // to answer, so a push a moment ago is seen. A sync failure is reported in
 // the result's Error and also returned.
 func (s *Service) SyncNow(ctx context.Context, id string) (*SyncResult, error) {
+	if id == BuiltinSourceID {
+		// The built-in source never reads GitHub: "Sync now" installs
+		// this binary's skills if they are not live.
+		return s.ensureBuiltin(ctx)
+	}
 	return s.syncSource(ctx, id, syncRequest{tr: triggerManual})
 }
 
@@ -71,6 +76,10 @@ func (s *Service) syncSource(ctx context.Context, id string, req syncRequest) (*
 	row, err := s.getSourceRow(lctx, s.db, id)
 	if err != nil {
 		return nil, err
+	}
+	if row.IsBuiltin() {
+		// Never synced from GitHub (builtin.go installs it).
+		return &SyncResult{SourceID: id, SHA: row.ActiveSHA, Unchanged: true}, nil
 	}
 	if req.tr == triggerPoll && (!row.Enabled || (row.NextCheckAt != nil && row.NextCheckAt.After(s.now()))) {
 		// Another node, a webhook or "Sync now" checked it meanwhile.
@@ -687,8 +696,8 @@ func (s *Service) housekeeping(ctx context.Context) {
 // pollDue syncs the sources whose check is due, pollConcurrency at a time,
 // so one slow source does not hold up the others.
 func (s *Service) pollDue(ctx context.Context) {
-	rows, err := s.db.QueryContext(ctx, `SELECT id, auth, approval FROM skill_sources WHERE enabled = 1
-		AND (next_check_at IS NULL OR next_check_at <= ?) ORDER BY next_check_at LIMIT 50`, s.now().UnixMilli())
+	rows, err := s.db.QueryContext(ctx, `SELECT id, auth, approval FROM skill_sources WHERE enabled = 1 AND kind <> ?
+		AND (next_check_at IS NULL OR next_check_at <= ?) ORDER BY next_check_at LIMIT 50`, KindBuiltin, s.now().UnixMilli())
 	if err != nil {
 		if ctx.Err() == nil {
 			s.log.Warn("skillhub: listing due sources failed", "err", err.Error())

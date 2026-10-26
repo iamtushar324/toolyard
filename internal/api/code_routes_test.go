@@ -552,14 +552,25 @@ func TestCodeStubsAndDiscovery(t *testing.T) {
 	rec := e.do(t, http.MethodGet, "/v1/code/openapi.json", "", "")
 	var doc struct {
 		OpenAPI string `json:"openapi"`
+		Servers []struct {
+			URL string `json:"url"`
+		} `json:"servers"`
 	}
 	if rec.Code != http.StatusOK || json.Unmarshal(rec.Body.Bytes(), &doc) != nil || !strings.HasPrefix(doc.OpenAPI, "3.1") {
 		t.Fatalf("openapi.json: %d %.200s", rec.Code, rec.Body.String())
+	}
+	if len(doc.Servers) != 1 || doc.Servers[0].URL != "https://toolyard.example" {
+		t.Fatalf("openapi.json names %+v, want this toolyard's public URL", doc.Servers)
 	}
 	rec = e.do(t, http.MethodGet, "/v1/code/ty", "", "")
 	if rec.Code != http.StatusOK || !strings.HasPrefix(rec.Body.String(), "#!/usr/bin/env python3\n") ||
 		!strings.HasPrefix(rec.Header().Get("Content-Type"), "text/plain") {
 		t.Fatalf("ty: %d %q", rec.Code, rec.Header().Get("Content-Type"))
+	}
+	// The served ty defaults to the toolyard that served it, never to a
+	// host the reader did not choose.
+	if body := rec.Body.String(); !strings.Contains(body, `DEFAULT_URL = "https://toolyard.example"`) || strings.Contains(body, "toolyard:served-url") {
+		t.Fatalf("served ty does not default to this toolyard's public URL")
 	}
 	if rec := e.do(t, http.MethodPost, "/v1/code/ty", "", ""); rec.Code != http.StatusMethodNotAllowed {
 		t.Fatalf("POST ty: %d", rec.Code)

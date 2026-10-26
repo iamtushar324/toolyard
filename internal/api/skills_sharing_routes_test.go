@@ -23,6 +23,7 @@ type skillsSharingFake struct {
 	modes        map[string]skillhub.UpdateMode
 	hidden       map[string]bool
 	ghOwners     map[string]string // source ID -> repository owner (default acme, trusted)
+	kinds        map[string]string // source ID -> kind (default github)
 	lastSharing  skillhub.SkillSharing
 	lastPath     string
 	decisions    []string
@@ -47,6 +48,9 @@ func (f *skillsSharingFake) source(id string) *skillhub.Source {
 	src.Hidden = f.hidden[id]
 	if o, ok := f.ghOwners[id]; ok {
 		src.Owner = o
+	}
+	if k, ok := f.kinds[id]; ok {
+		src.Kind = k
 	}
 	return src
 }
@@ -234,7 +238,7 @@ func newSkillsSharingEnv(t *testing.T) *skillsSharingEnv {
 	fake := &skillsSharingFake{skillsAdminFake: &skillsAdminFake{},
 		owners:       map[string]string{"src_admin": e.admin.ID, "src_mine": c.ID},
 		contributors: map[string]bool{c.ID: true}, approval: map[string]skillhub.Approval{},
-		modes: map[string]skillhub.UpdateMode{}, hidden: map[string]bool{}, ghOwners: map[string]string{}}
+		modes: map[string]skillhub.UpdateMode{}, hidden: map[string]bool{}, ghOwners: map[string]string{}, kinds: map[string]string{}}
 	settler := &skillsApprovalSettler{}
 	e.srv.skillsAdmin, e.srv.skillReviews = fake, settler
 	return &skillsSharingEnv{accessTestEnv: e, fake: fake, settler: settler, adminCookie: e.cookieFor(t, e.admin.ID),
@@ -693,5 +697,33 @@ func TestSkillContributorGuards(t *testing.T) {
 	}
 	if rec := e.do(t, e.adminCookie, http.MethodPost, "/v1/skills/sources", `{"url":"acme/skills","branch":"admin-cap"}`); rec.Code != http.StatusCreated {
 		t.Fatalf("admins have no cap: %d %s", rec.Code, rec.Body.String())
+	}
+}
+
+// A contributor never reaches the built-in source, even if it named them as
+// its creator; an admin can hide it.
+func TestSkillContributorNeverOwnsBuiltin(t *testing.T) {
+	e := newSkillsSharingEnv(t)
+	id := skillhub.BuiltinSourceID
+	e.fake.smu.Lock()
+	e.fake.owners[id], e.fake.kinds[id] = e.contrib.ID, skillhub.KindBuiltin
+	e.fake.smu.Unlock()
+	for _, rt := range []struct{ method, path, body string }{
+		{http.MethodGet, "/v1/skills/sources/" + id, ""},
+		{http.MethodPatch, "/v1/skills/sources/" + id, `{"visibility":"nobody"}`},
+		{http.MethodPut, "/v1/skills/sources/" + id + "/skills/sharing", `{"path":"x","mode":"nobody"}`},
+	} {
+		if rec := e.do(t, e.contribCk, rt.method, rt.path, rt.body); rec.Code != http.StatusNotFound {
+			t.Errorf("contributor %s %s: %d %s", rt.method, rt.path, rec.Code, rec.Body.String())
+		}
+	}
+	rec := e.do(t, e.contribCk, http.MethodGet, "/v1/skills/admin/sources", "")
+	for _, src := range skillsJSON(t, rec)["sources"].([]any) {
+		if src.(map[string]any)["id"] == id {
+			t.Fatal("a contributor lists the built-in source")
+		}
+	}
+	if rec := e.do(t, e.adminCookie, http.MethodPatch, "/v1/skills/sources/"+id, `{"hidden":true}`); rec.Code != http.StatusOK || skillsJSON(t, rec)["hidden"] != true {
+		t.Fatalf("admin hides the built-in source: %d %s", rec.Code, rec.Body.String())
 	}
 }

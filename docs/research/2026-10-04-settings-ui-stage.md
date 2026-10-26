@@ -2,7 +2,7 @@
 
 ## Delivered
 
-- Stage URL: https://toolyard.stage.dev.beknown.live/?build=af4c912#settings/general
+- Stage URL: https://toolyard-stage.example.com/?build=af4c912#settings/general
 - Deployed version: `stage-af4c912`.
 - Source: `af4c912aa7c4aa9d3a7b95814aa015457ddc46a8`, branch `t3code/jakarta`, pushed to origin.
 - Release directory: `/opt/toolyard-stage/releases/af4c912`.
@@ -19,7 +19,7 @@ Credential values stay only in memory. Logout clears the settings drafts.
 Tools now separates Catalog, Policies, and Approval queue. Search retains focus,
 tool rows are keyboard buttons, and Run is disabled while a call is in progress.
 Connection panels retain their open state after a render. Advanced notification
-controls and the Beknown identity card no longer dominate the primary views.
+controls and the identity key card no longer dominate the primary views.
 Secrets use password fields in the add and replacement forms.
 
 ## Measured checks

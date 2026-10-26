@@ -86,6 +86,10 @@ type Options struct {
 	Now func() time.Time
 	// Logger; default logx.For("skillhub").
 	Logger *slog.Logger
+	// BuiltinSkills serves the skills compiled into toolyard as the
+	// read-only source "toolyard" (builtin.go). The gateway turns it on;
+	// tests leave it off unless they test it.
+	BuiltinSkills bool
 }
 
 // Service stores, syncs and serves skill sources. It implements Reader and
@@ -131,6 +135,8 @@ type Service struct {
 	badToken   string
 	// reloads queues the sources the cluster asked this node to reload.
 	reloads reloadQueue
+	// bi is the built-in source (builtin.go).
+	bi builtinState
 }
 
 var (
@@ -183,6 +189,7 @@ func New(opts Options) (*Service, error) {
 		queued:   map[string]*pendingSync{},
 		wake:     make(chan struct{}, 1),
 	}
+	s.bi.on = opts.BuiltinSkills
 	s.usage.counts = map[usageKey]int64{}
 	s.reloads.ids = map[string]bool{}
 	s.reloads.wake = make(chan struct{}, 1)
@@ -190,8 +197,9 @@ func New(opts Options) (*Service, error) {
 }
 
 // Start loads the index and starts this node's own work: reloading
-// sources the cluster names, a periodic comparison with the database, and
-// the read-count flush. Everything stops when ctx ends. The returned error
+// sources the cluster names, a periodic comparison with the database, the
+// read-count flush and, with Options.BuiltinSkills, the built-in source
+// (installed before the first load; see builtin.go). Everything stops when ctx ends. The returned error
 // is the first load's; the node then serves an empty catalog until the
 // next refresh succeeds.
 func (s *Service) Start(ctx context.Context) error {
@@ -210,6 +218,7 @@ func (s *Service) Start(ctx context.Context) error {
 		s.runReloads(ctx)
 	})
 	goroutines.Go(goUsage, func() { s.runUsageFlush(ctx) })
+	s.startBuiltin(ctx)
 	return s.refreshAll(ctx)
 }
 

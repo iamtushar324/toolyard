@@ -961,7 +961,7 @@ Turn it on by listing bkt3's origins (Clerk sign-in must be on):
 
 ```bash
 ./toolyard serve -public-url https://toolyard.example.com \
-  -connect-azp https://stagebkt3.dev.beknown.live
+  -connect-azp https://t3.example.com
 ```
 
 - Comma-separated `https` origins (plain `http` only for `localhost`,
@@ -979,7 +979,7 @@ Turn it on by listing bkt3's origins (Clerk sign-in must be on):
   leeway either way), and has no `aud` claim (JWT templates do). bkt3
   should mint a token right before each call. Then it checks the
   organisation membership, creates or refreshes the person's toolyard user
-  exactly as a Google sign-in does, issues their Beknown identity key if
+  exactly as a Google sign-in does, issues their identity key if
   they never had one (never rotating or replacing one: a person whose key
   an admin revoked stays without a key, `identity_key=missing` in the
   audit row, until an admin issues a new one), and creates their one

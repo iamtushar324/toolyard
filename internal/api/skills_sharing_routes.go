@@ -61,9 +61,11 @@ type skillManager struct {
 	admin bool
 }
 
-// owns reports whether the manager may change src.
+// owns reports whether the manager may change src. A contributor never
+// owns the built-in source (toolyard's own skills), whatever it names as
+// its creator.
 func (m *skillManager) owns(src *skillhub.Source) bool {
-	return m.admin || (src != nil && src.CreatedBy == m.u.ID)
+	return m.admin || (src != nil && src.Kind != skillhub.KindBuiltin && src.CreatedBy == m.u.ID)
 }
 
 // skillApprovals is the part of the review settler that asks for and

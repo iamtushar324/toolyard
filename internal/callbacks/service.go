@@ -37,6 +37,17 @@ import (
 var ErrReceiver = errors.New("callback receiver is unavailable or belongs to another agent")
 var ErrConflict = errors.New("callback receiver revision or registration changed")
 
+// ErrInvalidChange marks a receiver change the caller got wrong (an
+// unknown action, a malformed secret); the REST route answers 400 with the
+// reason. errors.Is matches it; the message stays the reason itself.
+var ErrInvalidChange = errors.New("invalid receiver change")
+
+// invalidChange is a reason that matches ErrInvalidChange.
+type invalidChange struct{ reason string }
+
+func (e invalidChange) Error() string        { return e.reason }
+func (e invalidChange) Is(target error) bool { return target == ErrInvalidChange }
+
 // ErrTooManyReceivers refuses a new registration while the agent keeps
 // as many active receivers as the cap (Service.MaxReceivers). Errors
 // that match it say the cap.
@@ -360,14 +371,14 @@ func (s *Service) Change(ctx context.Context, agentID, id, action, secret string
 			return nil, ErrReceiver
 		}
 		if _, err = secretBytes(secret); err != nil {
-			return nil, err
+			return nil, invalidChange{err.Error()}
 		}
 		enc, err = s.cipher.Seal([]byte(secret), []byte("callback|"+id))
 		if err != nil {
 			return nil, err
 		}
 	default:
-		return nil, errors.New("action must be disable, rotate or remove")
+		return nil, invalidChange{"action must be disable, rotate or remove"}
 	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {

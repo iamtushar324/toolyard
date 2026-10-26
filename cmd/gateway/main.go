@@ -306,7 +306,7 @@ func runServe(argv []string) error {
 	publicURL := fs.String("public-url", "", "public origin (e.g. https://toolyard.example.com). When set, enables HSTS, secure cookies, and Origin enforcement.")
 	clerkOwnerOnly := fs.Bool("clerk-owner-only", false, "allow only the verified Google account at -owner-email; disable local password login and organization sync")
 	ownerEmail := fs.String("owner-email", "", "email of the local owner account. The first Clerk (Google) sign-in with this address attaches to the existing password admin instead of creating a new member. Case-insensitive.")
-	connectAZPFlag := fs.String("connect-azp", "", "comma-separated bkt3 (T3 Code) browser origins, e.g. https://stagebkt3.dev.beknown.live, whose Clerk session tokens POST /v1/connect/t3 swaps for the person's agent token. https only (http just on loopback). Needs Clerk sign-in; must not include -public-url's origin. Empty disables the endpoint (404).")
+	connectAZPFlag := fs.String("connect-azp", "", "comma-separated T3 Code browser origins, e.g. https://t3.example.com, whose Clerk session tokens POST /v1/connect/t3 swaps for the person's agent token. https only (http just on loopback). Needs Clerk sign-in; must not include -public-url's origin. Empty disables the endpoint (404).")
 	clerkSyncEvery := fs.Duration("clerk-sync-interval", time.Hour, "how often to list the Clerk organisation's members and block users who left (sessions revoked, agents stopped). Only runs when the TOOLYARD_CLERK_* env vars are set.")
 	trustedProxies := fs.String("trusted-proxy", "", "comma-separated CIDRs to trust for X-Forwarded-* headers (e.g. 127.0.0.1/32,::1/128,10.0.0.0/8)")
 	// TEC-1626 keys and ops listener
@@ -728,7 +728,7 @@ func runServe(argv []string) error {
 		return err
 	}
 
-	// Per-person identity keys ("Beknown keys"). Their own identity.key
+	// Per-person identity keys. Their own identity.key
 	// (blast-radius partitioning, as oauth.key and secrets.key): the raw
 	// keys are sealed under it so they can be forwarded to upstreams that
 	// name an identity header. The gateway asks this service for the
@@ -1337,6 +1337,9 @@ func runServe(argv []string) error {
 			Cluster:  clusterSvc,
 			Cipher:   secretsCipher,
 			Settings: settingsSvc,
+			// The skills compiled into toolyard, served as the read-only
+			// source "toolyard" (docs/skills-hub.md#built-in-skills).
+			BuiltinSkills: true,
 		})
 		if err != nil {
 			return fmt.Errorf("skills hub: %w", err)
@@ -1554,6 +1557,7 @@ func runServe(argv []string) error {
 			Proposals: skillHubProposals, // slice C's SourceProposals
 			Tickets:   gateway.NewSkillBundleTickets(db),
 			OnHost:    federationSvc.OnHost,
+			Guide:     skillhubSvc.BuiltinGuide,
 		})
 		// skillhub (slice A): the leader checks each source on its own
 		// schedule (skills-sync). Started after SetReviewHook above, so a
@@ -1618,8 +1622,8 @@ func runServe(argv []string) error {
 
 	// Streamable HTTP MCP transport at /mcp. Agents use this if they prefer
 	// HTTP over stdio. Auth via Authorization: Bearer <agent-token>, or
-	// x-bf-vk: <token> from a proxy that strips Authorization (bkt3's
-	// Bifrost proxy sends a person's Beknown key that way); see
+	// x-bf-vk: <token> from a proxy that strips Authorization (a
+	// gateway proxy may send a person's identity key that way); see
 	// mcpCredential. The token is verified once per request, by the
 	// guard, which also works out who raised the call (agent, owner,
 	// client, session) for the audit log. -require-auth-on-mcp
@@ -2407,11 +2411,12 @@ func cancelAgentWork(ctx context.Context, bus *approval.Bus, inboxSvc *inbox.Ser
 }
 
 // mcpCredential is the agent token an /mcp request presents: the
-// Authorization bearer when there is one, else the x-bf-vk header (the
-// Bifrost virtual-key slot: bkt3's proxy strips Authorization and sends a
-// person's Beknown key there). Authorization always wins when both are
-// present, so a stale bearer never falls through to a different key. ok
-// is false when neither carries a token.
+// Authorization bearer when there is one, else the x-bf-vk header (a
+// virtual-key slot: a proxy that strips Authorization may send a person's
+// identity key there). x-bf-vk is read only when the request has no
+// Authorization header at all, so a stale or foreign Authorization never
+// falls through to a different key. ok is false when neither carries a
+// token.
 func mcpCredential(r *http.Request) (token string, ok bool) {
 	if auth := r.Header.Get("Authorization"); strings.HasPrefix(auth, "Bearer ") {
 		return strings.TrimPrefix(auth, "Bearer "), true

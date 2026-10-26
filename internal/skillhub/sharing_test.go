@@ -14,6 +14,7 @@ import (
 	"github.com/tusharbhardwaj/toolyard/internal/actor"
 	"github.com/tusharbhardwaj/toolyard/internal/inbox"
 	"github.com/tusharbhardwaj/toolyard/internal/settings"
+	"github.com/tusharbhardwaj/toolyard/internal/store/storetest"
 )
 
 // The sharing rule (index.go, srcIndex.skillVisible) over a hand-built
@@ -893,5 +894,37 @@ func TestApprovalInboxItem(t *testing.T) {
 	// Only a pending source can be asked about.
 	if err := ri.RequestApproval(ctx, *got, nil, ""); !errors.Is(err, ErrInvalid) {
 		t.Fatalf("approval for an approved source: %v", err)
+	}
+}
+
+// An admin can hide the built-in source and set who sees its skills (its
+// repository fields stay read-only); it needs no approval.
+func TestBuiltinSourceSharingAndHide(t *testing.T) {
+	svc := newBuiltinService(t, storetest.Open(t), nil, nil)
+	startService(t, svc)
+	ctx := context.Background()
+	if srcs, _ := svc.Sources(ctx, memberViewer); len(srcs) != 1 {
+		t.Fatalf("built-in source not served: %+v", srcs)
+	}
+	on := true
+	if got, err := svc.UpdateSource(ctx, "usr_admin", BuiltinSourceID, SourceUpdate{Hidden: &on}); err != nil || !got.Hidden {
+		t.Fatalf("hide the built-in source: %+v %v", got, err)
+	}
+	if srcs, _ := svc.Sources(ctx, memberViewer); len(srcs) != 0 {
+		t.Fatalf("hidden built-in source shown: %+v", srcs)
+	}
+	off := false
+	blocked := []string{"usr_member"}
+	if _, err := svc.UpdateSource(ctx, "usr_admin", BuiltinSourceID, SourceUpdate{Hidden: &off, Blocked: &blocked}); err != nil {
+		t.Fatalf("block list on the built-in source: %v", err)
+	}
+	if srcs, _ := svc.Sources(ctx, memberViewer); len(srcs) != 0 {
+		t.Fatalf("blocked member sees the built-in source: %+v", srcs)
+	}
+	if srcs, _ := svc.Sources(ctx, Viewer{UserID: "usr_other", AgentID: "agt_other"}); len(srcs) != 1 {
+		t.Fatalf("another member: %+v", srcs)
+	}
+	if _, err := svc.DecideApproval(ctx, "usr_admin", BuiltinSourceID, true, "", ""); !errors.Is(err, ErrConflict) {
+		t.Fatalf("approving the built-in source: %v", err)
 	}
 }
