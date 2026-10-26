@@ -259,12 +259,12 @@ The [prototype probe record](evidence/2026-10-03-stage-prototype-probes.json) co
 | --- | --- |
 | Host | the build server |
 | Requested hostname | toolyard-stage.example.com |
-| DNS | Both the current and requested Toolyard names resolve to 13.232.74.51 |
+| DNS | Both the current and requested Toolyard names resolve to the host's one public address |
 | Current Toolyard HTTPS | Valid certificate and HTTP 200 health response |
 | Stage HTTPS | Certificate verification fails with a self-signed certificate |
 | Existing edge | Traefik v3.7.5 owns ports 80 and 443 |
 | Existing application | systemd service toolyard-inbox.service |
-| Existing private listener | 172.23.0.1:18790 |
+| Existing private listener | the host's private bridge address, port 18790 |
 | Existing proxy | toolyard-proxy on the bk-dev overlay network |
 | Existing TLS pattern | Exact host rule, websecure entrypoint, le certificate resolver |
 | Current resource snapshot | About 14GB available memory; about 3GB free; load about 3; swap nearly full |
@@ -291,7 +291,7 @@ Proposed deployment values, subject to a final collision check:
 | Current release link | /opt/toolyard-stage/current |
 | Data directory | /var/lib/toolyard-stage |
 | Environment file | /etc/toolyard-stage/stage.env |
-| Private listener | 172.23.0.1:18792 |
+| Private listener | the same private bridge address, port 18792 |
 | Edge proxy and route names | Dedicated toolyard-stage names |
 | Public origin | https://toolyard-stage.example.com |
 | Initial limits | CPU quota of one core; memory high watermark 384MB; memory maximum 768MB |
