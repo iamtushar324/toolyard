@@ -214,23 +214,9 @@ func (s *Server) skillSourceCreate(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	u := m.u
-	var in skillhub.SourceInput
-	if err := decode(r, &in); err != nil {
-		writeError(w, http.StatusBadRequest, redactSkillSecrets(err.Error(), in.Token))
+	in, ok := s.skillSourceInput(w, r, m)
+	if !ok {
 		return
-	}
-	if s.refuseGitHubConnectionUse(w, r, in.Auth) {
-		return
-	}
-	if !m.admin {
-		ref, err := s.skillsAdmin.ParseURL(in.URL)
-		if err != nil {
-			writeSkillAdminError(w, err)
-			return
-		}
-		if s.refuseContributorCreate(w, r, m, ref.Owner, in.Mode, in.Limits != nil) {
-			return
-		}
 	}
 	if existing := s.recentSkillSource(r.Context(), u.ID, in); existing != nil {
 		writeJSON(w, http.StatusOK, map[string]any{"source": existing, "status": skillSourceStatus(existing), "existing": true})
@@ -238,10 +224,11 @@ func (s *Server) skillSourceCreate(w http.ResponseWriter, r *http.Request) {
 	}
 	var prev *skillhub.Preview
 	if !m.admin {
+		// An early answer before the dry run; CreateSource enforces the
+		// cap itself, under a lock, against parallel creates.
 		if s.refuseTooManyPending(w, r, m) {
 			return
 		}
-		in.PendingApproval = true
 		var err error
 		if prev, err = s.skillsAdmin.Preview(r.Context(), u.ID, in); err != nil {
 			writeSkillAdminError(w, err, in.Token)
@@ -355,7 +342,7 @@ func (s *Server) skillSourcesItem(w http.ResponseWriter, r *http.Request) {
 		s.skillInspect(w, r, m)
 		return
 	case len(parts) == 1 && id == "preview":
-		s.skillPreview(w, r, u)
+		s.skillPreview(w, r, m)
 		return
 	}
 	if !skillAdminIDPattern.MatchString(id) || (len(parts) == 4 && !skillAdminIDPattern.MatchString(parts[2])) {
@@ -480,24 +467,52 @@ func (s *Server) skillInspect(w http.ResponseWriter, r *http.Request, m *skillMa
 	}{info, s.skillsAdmin.TrustedOwner(r.Context(), info.Owner)})
 }
 
-func (s *Server) skillPreview(w http.ResponseWriter, r *http.Request, u *identity.User) {
+func (s *Server) skillPreview(w http.ResponseWriter, r *http.Request, m *skillManager) {
 	if !skillAdminMethod(w, r, http.MethodPost) {
 		return
 	}
-	var in skillhub.SourceInput
-	if err := decode(r, &in); err != nil {
-		writeError(w, http.StatusBadRequest, redactSkillSecrets(err.Error(), in.Token))
+	in, ok := s.skillSourceInput(w, r, m)
+	if !ok {
 		return
 	}
-	if s.refuseGitHubConnectionUse(w, r, in.Auth) {
-		return
-	}
-	prev, err := s.skillsAdmin.Preview(r.Context(), u.ID, in)
+	prev, err := s.skillsAdmin.Preview(r.Context(), m.u.ID, in)
 	if err != nil {
 		writeSkillAdminError(w, err, in.Token)
 		return
 	}
 	writeJSON(w, http.StatusOK, prev)
+}
+
+// skillSourceInput decodes the source of a preview or a create and marks
+// it with who asks. It is the one place that derives this from the
+// caller, so no route can forget it: a skill contributor's input gets
+// PendingApproval, so the source starts pending approval and every GitHub
+// read for it (the dry run included) is anonymous unless the input
+// carries the contributor's own token or GitHub connection: never the
+// admins' default token. It also refuses what a contributor may not
+// choose (contributor_limit), and a person's GitHub connection for an
+// operator token. It answers the refusals itself.
+func (s *Server) skillSourceInput(w http.ResponseWriter, r *http.Request, m *skillManager) (skillhub.SourceInput, bool) {
+	var in skillhub.SourceInput
+	if err := decode(r, &in); err != nil {
+		writeError(w, http.StatusBadRequest, redactSkillSecrets(err.Error(), in.Token))
+		return in, false
+	}
+	in.PendingApproval = !m.admin
+	if s.refuseGitHubConnectionUse(w, r, in.Auth) {
+		return in, false
+	}
+	if !m.admin {
+		ref, err := s.skillsAdmin.ParseURL(in.URL)
+		if err != nil {
+			writeSkillAdminError(w, err)
+			return in, false
+		}
+		if s.refuseContributorCreate(w, r, m, ref.Owner, in.Mode, in.Limits != nil) {
+			return in, false
+		}
+	}
+	return in, true
 }
 
 func (s *Server) skillSource(w http.ResponseWriter, r *http.Request, m *skillManager, id string) {

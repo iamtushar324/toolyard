@@ -661,6 +661,30 @@ func TestSkillContributorGuards(t *testing.T) {
 	if c := strings.Join(e.calls(), ","); strings.Contains(c, "InspectAnonymous") {
 		t.Fatalf("admin inspect calls %s", c)
 	}
+	// A contributor's dry run is marked as theirs (anonymous reads, the
+	// contributor's bounds); an admin's is not.
+	if rec := e.do(t, e.contribCk, http.MethodPost, "/v1/skills/sources/preview", `{"url":"acme/skills","path":"skills"}`); rec.Code != http.StatusOK {
+		t.Fatalf("contributor preview: %d %s", rec.Code, rec.Body.String())
+	}
+	e.fake.mu.Lock()
+	contribIn := e.fake.lastInput
+	e.fake.mu.Unlock()
+	if !contribIn.PendingApproval {
+		t.Fatalf("a contributor's preview reads as an admin: %+v", contribIn)
+	}
+	if rec := e.do(t, e.contribCk, http.MethodPost, "/v1/skills/sources/preview", `{"url":"acme/skills","mode":"pinned","pinned_sha":"0123456789abcdef0123456789abcdef01234567"}`); rec.Code != http.StatusForbidden ||
+		skillsJSON(t, rec)["code"] != "contributor_limit" {
+		t.Fatalf("contributor preview of a pinned source: %d %s", rec.Code, rec.Body.String())
+	}
+	if rec := e.do(t, e.adminCookie, http.MethodPost, "/v1/skills/sources/preview", `{"url":"acme/skills","path":"skills"}`); rec.Code != http.StatusOK {
+		t.Fatalf("admin preview: %d %s", rec.Code, rec.Body.String())
+	}
+	e.fake.mu.Lock()
+	adminIn := e.fake.lastInput
+	e.fake.mu.Unlock()
+	if adminIn.PendingApproval {
+		t.Fatalf("an admin's preview is marked as a contributor's: %+v", adminIn)
+	}
 
 	// A pending source whose branch changes gets a new approval question.
 	e.fake.smu.Lock()

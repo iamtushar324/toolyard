@@ -207,9 +207,12 @@ type SourceInput struct {
 	Blocked     []string   `json:"blocked,omitempty"`
 	DefaultRuns Runs       `json:"default_runs,omitempty"`
 	Limits      *Limits    `json:"limits,omitempty"`
-	// PendingApproval starts the source pending an admin's approval (a
-	// skill contributor's source). It is never read from JSON: the API
-	// sets it from who is asking.
+	// PendingApproval marks a skill contributor's input: the source starts
+	// pending an admin's approval, and every GitHub read for it (the dry
+	// run included) is anonymous unless the input carries the
+	// contributor's own credential: never the admins' default token. It is
+	// never read from JSON: the API sets it from who is asking, in one
+	// place (skillSourceInput).
 	PendingApproval bool `json:"-"`
 }
 
