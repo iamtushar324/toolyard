@@ -596,7 +596,8 @@ test('an admin approves or rejects a contributor source; reject sends the reason
   await h.run(`decideSkillSource(s, 'approve')`);
   const approve = h.requests.find((r) => r.path === '/v1/skills/sources/src_1/approval');
   assert.equal(approve.method, 'POST');
-  assert.deepEqual(plain(approve.body), { decision: 'approve' });
+  // Nothing waits, so the approval names the live commit shown on the page.
+  assert.deepEqual(plain(approve.body), { decision: 'approve', sha: source1.active_sha });
   h.run(`prompt = () => '  not our repository '`);
   await h.run(`decideSkillSource(s, 'reject')`);
   const reject = h.requests.filter((r) => r.path === '/v1/skills/sources/src_1/approval').pop();
