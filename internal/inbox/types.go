@@ -230,6 +230,10 @@ type Request struct {
 	// InlineImages are the uploads that Markdown images in the message or
 	// a markdown attachment cite, resolved when the item was sent.
 	InlineImages []InlineImage `json:"inline_images,omitempty"`
+	// System marks an item toolyard raised itself (system.go): Decide
+	// runs the handler registered for System.Kind. Never set from a
+	// Submission.
+	System *SystemTag `json:"system,omitempty"`
 
 	// Set by toolyard.
 	Flags        []Flag   `json:"flags,omitempty"` // request-level (questions, blockers)

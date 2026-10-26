@@ -182,11 +182,26 @@ func TestListUsers(t *testing.T) {
 	}
 }
 
+// clearOwner takes the owner flag off every row: a store as an install
+// had it before 0072 and before EnsureOwner ran, where the last-admin rule
+// is the only guard.
+func clearOwner(t *testing.T, s *Service) {
+	t.Helper()
+	if _, err := s.db.Exec(`UPDATE users SET is_owner = 0`); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestSetRole(t *testing.T) {
 	s, admin := newTestIdentity(t)
 	ctx := context.Background()
 	m := clerkUser(t, s, "user_m", "m@beknown.work", "")
 
+	// The setup account is the owner: never demoted, even with another admin.
+	if err := s.SetRole(ctx, admin, RoleMember); !errors.Is(err, ErrOwner) {
+		t.Errorf("demote the owner: %v, want ErrOwner", err)
+	}
+	clearOwner(t, s)
 	if err := s.SetRole(ctx, admin, RoleMember); !errors.Is(err, ErrLastAdmin) {
 		t.Errorf("demote last admin: %v, want ErrLastAdmin", err)
 	}
@@ -218,6 +233,10 @@ func TestSetStatusBlocksRevokesAndProtectsLastAdmin(t *testing.T) {
 	ctx := context.Background()
 	m := clerkUser(t, s, "user_m", "m@beknown.work", "")
 
+	if err := s.SetStatus(ctx, admin, StatusBlocked, "x"); !errors.Is(err, ErrOwner) {
+		t.Errorf("block the owner: %v, want ErrOwner", err)
+	}
+	clearOwner(t, s)
 	if err := s.SetStatus(ctx, admin, StatusBlocked, "x"); !errors.Is(err, ErrLastAdmin) {
 		t.Errorf("block last admin: %v, want ErrLastAdmin", err)
 	}

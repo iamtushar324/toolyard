@@ -29,12 +29,13 @@ func TestValidateRefusesGatewayNames(t *testing.T) {
 }
 
 // A server an older version saved under a name v0.1 reserves (jobs,
-// callbacks) is not loaded, and its status says why and how to fix it.
+// callbacks) or the skills hub reserves (skills) is not loaded, and its
+// status says why and how to fix it.
 func TestLoadAllExplainsNewlyReservedNames(t *testing.T) {
 	ctx := context.Background()
 	svc, db, _ := newServiceFixture(t)
 	now := time.Now().UnixMilli()
-	for _, name := range []string{"jobs", "callbacks"} {
+	for _, name := range []string{"jobs", "callbacks", "skills"} {
 		if _, err := db.ExecContext(ctx, `INSERT INTO upstream_servers(name, transport, url, env_json, headers_json, enabled, created_at, updated_at)
         VALUES(?, 'http', 'http://127.0.0.1:1/mcp', '{}', '{}', 1, ?, ?)`, name, now, now); err != nil {
 			t.Fatal(err)
@@ -51,5 +52,13 @@ func TestLoadAllExplainsNewlyReservedNames(t *testing.T) {
 		if got.LastStatus == "ok" || !strings.Contains(got.LastError, "reserved since toolyard v0.1") || !strings.Contains(got.LastError, "another name") {
 			t.Fatalf("%s: status %q, error %q", name, got.LastStatus, got.LastError)
 		}
+	}
+	// skillhub: the old skills workspace server's row.
+	got, err := svc.Get(ctx, "skills")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.LastStatus == "ok" || !strings.Contains(got.LastError, "reserved since the skills hub") || !strings.Contains(got.LastError, "Delete this server") {
+		t.Fatalf("skills: status %q, error %q", got.LastStatus, got.LastError)
 	}
 }

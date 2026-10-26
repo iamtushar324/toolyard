@@ -83,7 +83,7 @@ import (
 	"github.com/tusharbhardwaj/toolyard/internal/sealbox"
 	"github.com/tusharbhardwaj/toolyard/internal/secrets"
 	"github.com/tusharbhardwaj/toolyard/internal/settings"
-	skillspkg "github.com/tusharbhardwaj/toolyard/internal/skills"
+	"github.com/tusharbhardwaj/toolyard/internal/skillhub"
 	"github.com/tusharbhardwaj/toolyard/internal/store"
 	"github.com/tusharbhardwaj/toolyard/internal/upstreams"
 	usagepkg "github.com/tusharbhardwaj/toolyard/internal/usage"
@@ -127,6 +127,8 @@ func main() {
 		err = runProbe(args)
 	case "operator-token":
 		err = runOperatorToken(args)
+	case "owner":
+		err = runOwner(args, os.Stdout)
 	case "healthcheck":
 		err = runHealthcheck(args)
 	case "keys-check":
@@ -262,6 +264,8 @@ Commands:
   exchange    swap an enrollment code for an agent token
   probe       dry-run a tool against an upstream MCP server
   operator-token  create | list | revoke CLI operator tokens (local, from -data)
+  owner       show | transfer --to <username|email|id> [--unblock]: the owner, and the host break-glass
+              that moves the owner role (local, from -data; audited as system:cli)
   healthcheck check a probe: -url <probe URL> -expect ready|live [-token-file <path>] (exit 0 or 1)
   keys-check  read-only check that every master key would load: -data <dir> [-credentials-dir <dir>] (exit 0 or 78)
   keys        generate -name identity|oauth|secrets|session [-out <file>]: one fresh key to stdout or a new file
@@ -276,7 +280,7 @@ Environment:
   (-public-url is TOOLYARD_PUBLIC_URL, -db-max-conns is TOOLYARD_DB_MAX_CONNS, -migrate is
   TOOLYARD_MIGRATE). The command line wins; an empty variable counts as unset. They may also come
   from toolyard.env in the credentials directory, except TOOLYARD_CREDENTIALS_DIR. keys-check,
-  operator-token and db migrate read TOOLYARD_DATA (or TOOLYARD_DATA_DIR) and TOOLYARD_CREDENTIALS_DIR,
+  operator-token, owner and db migrate read TOOLYARD_DATA (or TOOLYARD_DATA_DIR) and TOOLYARD_CREDENTIALS_DIR,
   keys-check also TOOLYARD_KEYS; healthcheck reads TOOLYARD_HEALTHCHECK_URL, _EXPECT and _TOKEN_FILE.
   -inbox-reset-passkeys is command line only. serve warns about a TOOLYARD_ variable that sets no
   flag and that nothing reads (a misspelt name). Secrets go in files, never in variables.
@@ -302,7 +306,7 @@ func runServe(argv []string) error {
 	publicURL := fs.String("public-url", "", "public origin (e.g. https://toolyard.example.com). When set, enables HSTS, secure cookies, and Origin enforcement.")
 	clerkOwnerOnly := fs.Bool("clerk-owner-only", false, "allow only the verified Google account at -owner-email; disable local password login and organization sync")
 	ownerEmail := fs.String("owner-email", "", "email of the local owner account. The first Clerk (Google) sign-in with this address attaches to the existing password admin instead of creating a new member. Case-insensitive.")
-	connectAZPFlag := fs.String("connect-azp", "", "comma-separated bkt3 (T3 Code) browser origins, e.g. https://stagebkt3.dev.beknown.live, whose Clerk session tokens POST /v1/connect/t3 swaps for the person's agent token. https only (http just on loopback). Needs Clerk sign-in; must not include -public-url's origin. Empty disables the endpoint (404).")
+	connectAZPFlag := fs.String("connect-azp", "", "comma-separated T3 Code browser origins, e.g. https://t3.example.com, whose Clerk session tokens POST /v1/connect/t3 swaps for the person's agent token. https only (http just on loopback). Needs Clerk sign-in; must not include -public-url's origin. Empty disables the endpoint (404).")
 	clerkSyncEvery := fs.Duration("clerk-sync-interval", time.Hour, "how often to list the Clerk organisation's members and block users who left (sessions revoked, agents stopped). Only runs when the TOOLYARD_CLERK_* env vars are set.")
 	trustedProxies := fs.String("trusted-proxy", "", "comma-separated CIDRs to trust for X-Forwarded-* headers (e.g. 127.0.0.1/32,::1/128,10.0.0.0/8)")
 	// TEC-1626 keys and ops listener
@@ -337,10 +341,12 @@ func runServe(argv []string) error {
 	notesFlag := fs.String("notes", "auto", "Notes (markdown workspace) upstream mode: on|off|auto. auto=register the filesystem MCP if npx is on PATH; on=fail boot when npx missing; off=skip the integration entirely.")
 	notesDir := fs.String("notes-dir", "", "Directory the notes filesystem upstream exposes (defaults to <data-dir>/notes). Lives under <data-dir> so the existing data-dir backup captures it.")
 	notesSyncEvery := fs.Duration("notes-sync-interval", notespkg.DefaultScanEvery, "How often the notes->mempalace background sync walks the notes dir. Use a negative value to disable scanning (notes.publish still works).")
-	skillsFlag := fs.String("skills", "auto", "Skills (centralised Claude Code skills workspace) upstream mode: on|off|auto. auto=register the filesystem MCP if npx is on PATH; on=fail boot when npx missing; off=skip the integration entirely.")
-	skillsDir := fs.String("skills-dir", "", "Directory the skills filesystem upstream exposes (defaults to <data-dir>/skills). Lives under <data-dir> so the existing data-dir backup captures it.")
-	skillsSyncEvery := fs.Duration("skills-sync-interval", skillspkg.DefaultScanEvery, "How often the skills->mempalace background sync walks the skills dir. Use a negative value to disable scanning (skills.publish still works).")
-	claudeSkillsDir := fs.String("claude-skills-dir", "", "Default parent directory `skills.install` symlinks/copies into when the caller doesn't pass `target`. Empty means callers must pass `target` explicitly; a typical value is `~/.claude/skills`.")
+	// skillhub (slice A): -skills switches the skills hub; the three flags
+	// of the old local skills folder still parse and are ignored.
+	skillsFlag := fs.String("skills", "on", "skills hub (docs/skills-hub.md): on | off (auto means on). Admins add GitHub repositories of Agent Skills; toolyard copies them into its database and serves them to every client.")
+	_ = fs.String("skills-dir", "", "DEPRECATED: ignored. The skills hub replaced the local skills folder.")
+	_ = fs.Duration("skills-sync-interval", 0, "DEPRECATED: ignored. Each skill source has its own poll interval.")
+	_ = fs.String("claude-skills-dir", "", "DEPRECATED: ignored. skills.install was removed; use skills.bundle.")
 	voiceFlag := fs.String("voice", "auto", "Voice (live call dashboard panel) mode: on|off|auto. auto=enable iff GEMINI_API_KEY is set in the environment; on=fail boot when the key is missing; off=expose no /v1/voice/* routes.")
 	voiceDir := fs.String("voice-dir", "", "Directory holding the voice persona file (soul.md). Defaults to <data-dir>/voice. Seeded on first run with toolyard's embedded default persona.")
 	voiceModelDefault := os.Getenv("TOOLYARD_VOICE_MODEL")
@@ -428,6 +434,11 @@ func runServe(argv []string) error {
 	if strings.TrimSpace(*clickhouseRuntimeEnvPath) != "" {
 		rootLog.Warn("--clickhouse-runtime-env is deprecated and ignored")
 	}
+	// skillhub (slice A)
+	skillsOn := parseSkillsMode(*skillsFlag, rootLog)
+	if names := setFlagNames(fs, deprecatedSkillsFlags...); len(names) > 0 {
+		rootLog.Warn("deprecated flags ignored: the skills hub replaced the local skills folder", "flags", strings.Join(names, ","))
+	}
 
 	// Public mode auto-enables matching safeguards.
 	if *publicURL != "" {
@@ -509,6 +520,44 @@ func runServe(argv []string) error {
 	}
 
 	idSvc := identity.New(db)
+	// The configured owner email only seeds the owner (identity/owner.go):
+	// on an install without one, only that person's sign-in claims the
+	// role. It matters only with Clerk sign-in on.
+	ownerSeed := *ownerEmail
+	if clerkClient == nil {
+		ownerSeed = ""
+	}
+	idSvc.SetOwnerEmail(ownerSeed)
+	// A rolling deploy may have run an older binary that demoted the
+	// owner: make them an admin again (audited).
+	if changed, err := idSvc.RepromoteOwner(ctx); err != nil {
+		log.Printf("toolyard: WARN checking the owner's role: %v", err)
+	} else if changed {
+		log.Printf("toolyard: WARN the owner was not an admin (an older binary may have demoted them); made them an admin again")
+	}
+	// An install that had users before the owner existed gets one now:
+	// the oldest active admin, when no owner email is set. With an owner
+	// email it stays vacant until that person's verified sign-in.
+	switch owner, err := idSvc.EnsureOwner(ctx, ownerSeed); {
+	case err == nil && owner.Status != identity.StatusActive:
+		log.Printf("toolyard: WARN the owner %s is blocked (%s); an admin can unblock them, or move the owner role on this host with: toolyard owner transfer --to <username|email>", owner.Username, owner.BlockedReason)
+	case err == nil:
+		log.Printf("toolyard: owner is %s", owner.Username)
+	case errors.Is(err, identity.ErrNoUser):
+		if ownerSeed != "" {
+			log.Printf("toolyard: no owner yet; the first verified sign-in with -owner-email %s becomes the owner", ownerSeed)
+		}
+	default:
+		log.Printf("toolyard: WARN choosing the owner: %v", err)
+	}
+	// Personal sign-in follows the stored owner, so a transfer of
+	// ownership moves it to the new owner.
+	if clerkClient != nil && *clerkOwnerOnly {
+		seed := *ownerEmail
+		clerkClient.SetAllowedGoogleEmailFunc(func(ctx context.Context) (string, error) {
+			return idSvc.OwnerSignInEmail(ctx, seed)
+		})
+	}
 	auditSvc := audit.New(db)
 	memSvc := memory.New(db)
 	// Roles and per-user tool-group grants. The gateway asks it on every
@@ -549,7 +598,7 @@ func runServe(argv []string) error {
 	bus.AddNotifierFunc(func(ctx context.Context, req *approval.Request, eventType string) {
 		hub.Publish(realtime.Event{Type: "approval", Data: req})
 		if eventType == "approval.create" {
-			user, err := idSvc.PrimaryUser(ctx)
+			user, err := idSvc.ActiveOwnerOrAdmin(ctx)
 			if uid := req.PersonalOwner(); uid != "" {
 				user, err = idSvc.GetUserByID(ctx, uid)
 			}
@@ -679,7 +728,7 @@ func runServe(argv []string) error {
 		return err
 	}
 
-	// Per-person identity keys ("Beknown keys"). Their own identity.key
+	// Per-person identity keys. Their own identity.key
 	// (blast-radius partitioning, as oauth.key and secrets.key): the raw
 	// keys are sealed under it so they can be forwarded to upstreams that
 	// name an identity header. The gateway asks this service for the
@@ -787,22 +836,9 @@ func runServe(argv []string) error {
 			inboxJudge = j
 		}
 	}
-	agentName := func(ctx context.Context, id string) string {
-		u, err := idSvc.PrimaryUser(ctx)
-		if err != nil {
-			return ""
-		}
-		ags, err := idSvc.ListAgents(ctx, u.ID)
-		if err != nil {
-			return ""
-		}
-		for _, a := range ags {
-			if a.ID == id {
-				return a.Name
-			}
-		}
-		return ""
-	}
+	// An agent's name, whoever owns it (the Inbox and skill proposals
+	// name the agent behind a request).
+	agentName := func(ctx context.Context, id string) string { return idSvc.AgentName(ctx, id) }
 	var geminiInboxVoice inbox.Voice
 	if key := os.Getenv("GEMINI_API_KEY"); key != "" {
 		if v, verr := inbox.NewGeminiVoice(ctx, key, os.Getenv("TOOLYARD_INBOX_VOICE_MODEL"), func() string {
@@ -865,8 +901,14 @@ func runServe(argv []string) error {
 		AllowPrivateMedia: *inboxFetchPrivate,
 		Publish:           func(t string, d any) { hub.Publish(realtime.Event{Type: t, Data: d}) },
 		AgentName:         agentName,
+		// A notification tap needs no session: it counts only while the
+		// person it was sent to is still active.
+		UserActive: func(ctx context.Context, uid string) bool {
+			u, err := idSvc.GetUserByID(ctx, uid)
+			return err == nil && u.Status == identity.StatusActive
+		},
 		Notify: func(ctx context.Context, p inbox.Push) {
-			user, err := idSvc.PrimaryUser(ctx)
+			user, err := idSvc.ActiveOwnerOrAdmin(ctx)
 			if err != nil {
 				return
 			}
@@ -1123,7 +1165,7 @@ func runServe(argv []string) error {
 		if len(src.NotifyTypes) > 0 && !containsStr(src.NotifyTypes, ev.Type) {
 			return
 		}
-		user, uerr := idSvc.PrimaryUser(ctx)
+		user, uerr := idSvc.ActiveOwnerOrAdmin(ctx)
 		if uerr != nil {
 			return
 		}
@@ -1286,72 +1328,40 @@ func runServe(argv []string) error {
 		log.Printf("notes-sync: scanner started (interval=%s, dir=%s)", *notesSyncEvery, resolvedNotesDir)
 	}
 
-	// Skills workspace: sibling to notes. Same filesystem-MCP-upstream
-	// recipe (zero custom CRUD), same MemPalace ingest pattern, same
-	// dataDir-captures-it-all backup story. Two custom built-in tools on
-	// top — skills.publish (validate + write + index) and skills.install
-	// (symlink/copy into the user's local Claude install).
-	skillsMode := strings.ToLower(strings.TrimSpace(*skillsFlag))
-	if skillsMode == "" {
-		skillsMode = "auto"
-	}
-	resolvedSkillsDir := *skillsDir
-	if resolvedSkillsDir == "" {
-		resolvedSkillsDir = filepath.Join(*dataDir, "skills")
-	}
-	switch skillsMode {
-	case "off":
-		log.Printf("skills: disabled (-skills=off)")
-	case "on", "auto":
-		if err := os.MkdirAll(resolvedSkillsDir, 0o750); err != nil {
-			if skillsMode == "on" {
-				return fmt.Errorf("skills: mkdir %s: %w", resolvedSkillsDir, err)
-			}
-			log.Printf("skills: mkdir %s: %v", resolvedSkillsDir, err)
-			break
-		}
-		npxPath, lookErr := exec.LookPath("npx")
-		if lookErr != nil {
-			if skillsMode == "on" {
-				return fmt.Errorf("skills: npx not on PATH (-skills=on); install Node.js or set -skills=off")
-			}
-			log.Printf("skills: npx not on PATH; integration inactive (-skills=auto)")
-			break
-		}
-		if _, err := upstreamSvc.UpsertBuiltin(ctx, upstreams.Server{
-			Name:      "skills",
-			Transport: "stdio",
-			Command:   npxPath,
-			Args:      []string{"-y", "@modelcontextprotocol/server-filesystem", resolvedSkillsDir},
-			Enabled:   true,
-		}); err != nil {
-			log.Printf("skills upstream: %v", err)
-		} else {
-			log.Printf("skills: connected (dir=%s)", resolvedSkillsDir)
-		}
-	default:
-		log.Printf("skills: unknown mode %q; treating as auto", skillsMode)
-	}
-
-	// Same shape as notes: construct the Service regardless of the
-	// upstream's status. Publish/Install short-circuit if the filesystem
-	// MCP isn't registered yet (falls back to direct disk write), and the
-	// scanner retries on every tick.
-	var skillsSvc *skillspkg.Service
-	if skillsMode != "off" {
-		skillsSvc = skillspkg.New(skillspkg.Options{
-			DB:              db,
-			Gateway:         gw,
-			SkillsDir:       resolvedSkillsDir,
-			Interval:        *skillsSyncEvery,
-			ClaudeSkillsDir: *claudeSkillsDir,
+	// skillhub (slice A): the skills hub (docs/skills-hub.md). Admins add
+	// skill sources (a GitHub repository, branch and folder); toolyard
+	// copies their skills at an exact commit into the database and serves
+	// only that copy. Every replica keeps an index of the active versions
+	// (Start; activations reach it through the cluster); the leader checks
+	// each source on its own schedule (skills-sync). Source tokens and
+	// webhook secrets are sealed with secrets.key. -skills=off leaves
+	// skillhubSvc nil.
+	var skillhubSvc *skillhub.Service
+	if skillsOn {
+		skillhubSvc, err = skillhub.New(skillhub.Options{
+			DB:       db,
+			Cluster:  clusterSvc,
+			Cipher:   secretsCipher,
+			Settings: settingsSvc,
+			// The skills compiled into toolyard, served as the read-only
+			// source "toolyard" (docs/skills-hub.md#built-in-skills).
+			BuiltinSkills: true,
 		})
-		gw.RegisterSkillsBuiltins(skillsAdapter{skillsSvc})
-		leaderLoop(ctx, clusterSvc, loopSkillsScanner, time.Minute, skillsSvc.StartScanner)
-		log.Printf("skills-sync: scanner started (interval=%s, dir=%s)", *skillsSyncEvery, resolvedSkillsDir)
+		if err != nil {
+			return fmt.Errorf("skills hub: %w", err)
+		}
+		if err := skillhubSvc.Start(ctx); err != nil {
+			rootLog.Warn("skills hub: the first catalog load failed; it is retried in the background", "err", err.Error())
+		}
+		log.Printf("skills hub: on")
+		// skillhub: the admin surface (slice C) and the agent surface
+		// (slice B) are wired below, before api.New; the leader's sync
+		// loop starts there too, once the review hook is set.
+	} else {
+		log.Printf("skills hub: off (-skills=off)")
 	}
 
-	// Voice ("live call" dashboard panel). Mirrors notes/skills: present a
+	// Voice ("live call" dashboard panel). Mirrors notes: present a
 	// Service object regardless of whether the GEMINI_API_KEY is set, so the
 	// /v1/voice/* routes can return a clear 503 rather than 404 when the
 	// operator hasn't configured the key yet.
@@ -1417,6 +1427,160 @@ func runServe(argv []string) error {
 		log.Printf("mcp-oauth: authorization server on (issuer %s, resource %s)", mcpAuthSvc.Issuer(), mcpAuthSvc.Resource())
 	}
 
+	// skillhub (slice C): the skills hub admin surface: the admin REST
+	// routes and the dashboard Skills page (api), one Inbox review item per
+	// staged version of a review-mode source (skillhub.ReviewInbox, the
+	// hub's ReviewHook), and agents' source proposals
+	// (skillhub.SourceProposals). skillHubAdmin is the hub's admin service:
+	// set it to slice A's *skillhub.Service (a nil interface while the hub
+	// is off, never a typed nil pointer). While it is nil the admin routes
+	// answer 404 "skills hub is off" and no review or proposal handler is
+	// registered. skillHubProposals is what the agent surface (slice B)
+	// passes on for skills.propose_source and skills.propose_change.
+	var (
+		skillHubAdmin     skillhub.Admin
+		skillHubReviews   api.SkillReviewSettler
+		skillHubProposals skillhub.Proposals
+		skillHubSweepers  []skillhub.InboxSweeper // run by the Inbox sweep loop below
+	)
+	if skillhubSvc != nil {
+		// skillhub: assigned only here, so a hub that is off stays a nil
+		// interface, never a typed nil *skillhub.Service.
+		skillHubAdmin = skillhubSvc
+	}
+	if skillHubAdmin != nil {
+		skillHubIsAdmin := func(ctx context.Context, uid string) bool {
+			u, err := idSvc.GetUserByID(ctx, uid)
+			return err == nil && u.Status == identity.StatusActive && u.Role == identity.RoleAdmin
+		}
+		reviews, err := skillhub.NewReviewInbox(skillhub.ReviewOptions{DB: db, Inbox: inboxSvc, Admin: skillHubAdmin,
+			IsAdmin: skillHubIsAdmin, DashboardURL: *publicURL, Audit: auditSvc,
+			// An approval question the sync engine asks names who added
+			// the source.
+			UserLabel: func(ctx context.Context, userID string) string {
+				u, err := idSvc.GetUserByID(ctx, userID)
+				if err != nil {
+					return ""
+				}
+				return u.Label()
+			},
+			// A review goes to the owner when the source's creator is no
+			// longer an active admin.
+			FallbackReviewer: func(ctx context.Context) (string, error) {
+				u, err := idSvc.ActiveOwnerOrAdmin(ctx)
+				if err != nil {
+					return "", err
+				}
+				return u.ID, nil
+			}})
+		if err != nil {
+			return fmt.Errorf("skills hub reviews: %w", err)
+		}
+		skillHubAdmin.SetReviewHook(reviews)
+		skillHubReviews = reviews
+		proposals, err := skillhub.NewSourceProposals(skillhub.ProposalOptions{DB: db, Inbox: inboxSvc, Admin: skillHubAdmin,
+			IsAdmin: skillHubIsAdmin, AgentName: agentName, Audit: auditSvc})
+		if err != nil {
+			return fmt.Errorf("skills hub proposals: %w", err)
+		}
+		skillHubProposals = proposals
+		skillHubSweepers = append(skillHubSweepers, reviews, proposals)
+	}
+
+	// skillhub (slice D): people's own toolyard GitHub connections (the
+	// enabled per-user GitHub servers on the Servers page, connected in My
+	// connections). A source with auth "github" reads with its creator's
+	// connection, and an approved change proposal (skills.propose_change)
+	// opens its pull request with the source creator's connection. Every
+	// such GitHub write waits for that person's own Inbox approval; no
+	// grant or policy can approve it. A blocked person's connection is
+	// never used.
+	if skillHubAdmin != nil && skillhubSvc != nil {
+		githubConns := &skillhub.GitHubConnections{
+			Servers: func(ctx context.Context) ([]string, error) {
+				list, err := upstreamSvc.List(ctx)
+				if err != nil {
+					return nil, err
+				}
+				var names []string
+				for _, sv := range list {
+					if sv.Transport == "github" && sv.Enabled && sv.AuthMode == upstreams.AuthPerUser {
+						names = append(names, sv.Name)
+					}
+				}
+				return names, nil
+			},
+			Freshen: oauthSvc.FreshenUserToken,
+			Token: func(ctx context.Context, server, uid string) (string, error) {
+				rec, err := oauthSvc.GetUserToken(ctx, server, uid)
+				if err != nil || rec == nil || rec.State == oauth.StateNeedsReauth {
+					return "", err
+				}
+				return rec.AccessToken, nil
+			},
+			Active: func(ctx context.Context, uid string) bool {
+				u, err := idSvc.GetUserByID(ctx, uid)
+				return err == nil && u.Status == identity.StatusActive
+			},
+		}
+		githubTokens := githubConns.TokenSource()
+		skillHubAdmin.SetTokenSource(githubTokens)
+		changes, err := skillhub.NewChangeProposals(skillhub.ChangeOptions{DB: db, Inbox: inboxSvc, Reader: skillhubSvc,
+			Admin: skillHubAdmin, Tokens: githubTokens, AgentName: agentName, Audit: auditSvc,
+			// skillhub (slice D2): CI and build files stay refused unless
+			// an admin turns this on (default off).
+			AllowBuildFiles: func(context.Context) bool { return settingsSvc.GetBool(settings.SkillsChangeAllowBuildFiles) },
+			UserName: func(ctx context.Context, uid string) string {
+				u, err := idSvc.GetUserByID(ctx, uid)
+				if err != nil {
+					return ""
+				}
+				if u.DisplayName != "" {
+					return u.DisplayName
+				}
+				return u.Username
+			}})
+		if err != nil {
+			return fmt.Errorf("skills hub change proposals: %w", err)
+		}
+		if sp, ok := skillHubProposals.(*skillhub.SourceProposals); ok {
+			sp.SetChangeProposals(changes)
+		}
+		skillHubSweepers = append(skillHubSweepers, changes)
+	}
+	// skillhub (slices C, D): settle the review, source-proposal and
+	// change-proposal questions the Inbox handler could not (expired,
+	// withdrawn, decided while no handler ran, an approved change whose pull
+	// request write was left uncertain).
+	if len(skillHubSweepers) > 0 {
+		leaderLoop(ctx, clusterSvc, skillhub.InboxSweepLoop, time.Minute, func(ctx context.Context) {
+			skillhub.RunInboxSweeps(ctx, skillhub.InboxSweepInterval, skillHubSweepers...)
+		})
+	}
+
+	// skillhub (slice B): the agent surface: the skills.* tools, the MCP
+	// Skills extension (capability, instructions, skill:// resources) and
+	// the bundle download tickets. Registered after RegisterBuiltins and
+	// before the MCP transport and the HTTP server start. With -skills=off
+	// nothing is registered: the agent REST routes answer 503 "the skills
+	// hub is off", the tools are absent and gw.MCPSkills passes every
+	// request through. The Reader is set only while skillhubSvc is non-nil
+	// (never a typed nil in the interface).
+	if skillhubSvc != nil {
+		gw.RegisterSkillHub(gateway.SkillHub{
+			Reader:    skillhubSvc,
+			Proposals: skillHubProposals, // slice C's SourceProposals
+			Tickets:   gateway.NewSkillBundleTickets(db),
+			OnHost:    federationSvc.OnHost,
+			Guide:     skillhubSvc.BuiltinGuide,
+		})
+		// skillhub (slice A): the leader checks each source on its own
+		// schedule (skills-sync). Started after SetReviewHook above, so a
+		// first poll at startup that stages a version in review mode
+		// always raises its Inbox question.
+		leaderLoop(ctx, clusterSvc, loopSkillsSync, time.Minute, skillhubSvc.RunPoller)
+	}
+
 	// REST API + dashboard.
 	apiSrv := api.New(ctx, api.Options{
 		Federation: federationSvc, Callbacks: callbackSvc,
@@ -1440,7 +1604,6 @@ func runServe(argv []string) error {
 		Hooks:           hooksSvc,
 		Mempalace:       mpSvc,
 		Notes:           notesSvc,
-		Skills:          skillsSvc,
 		Voice:           voiceSvc,
 		Secrets:         secretsSvc,
 		ChatTelegram:    telegramSvc,
@@ -1462,6 +1625,8 @@ func runServe(argv []string) error {
 		ConnectAZP:      connectOrigins,
 		CodeRuns:        codeRuns,
 		Jobs:            jobsSvc,
+		SkillsAdmin:     skillHubAdmin,   // skillhub (slice C)
+		SkillReviews:    skillHubReviews, // skillhub (slice C)
 	})
 
 	// Rate limits and the connect-t3 lock hold across replicas.
@@ -1472,8 +1637,8 @@ func runServe(argv []string) error {
 
 	// Streamable HTTP MCP transport at /mcp. Agents use this if they prefer
 	// HTTP over stdio. Auth via Authorization: Bearer <agent-token>, or
-	// x-bf-vk: <token> from a proxy that strips Authorization (bkt3's
-	// Bifrost proxy sends a person's Beknown key that way); see
+	// x-bf-vk: <token> from a proxy that strips Authorization (a
+	// gateway proxy may send a person's identity key that way); see
 	// mcpCredential. The token is verified once per request, by the
 	// guard, which also works out who raised the call (agent, owner,
 	// client, session) for the audit log. -require-auth-on-mcp
@@ -1529,6 +1694,11 @@ func runServe(argv []string) error {
 	// of the transport and after the token check, with the transport's
 	// own DNS rebinding protection (off with -public-url, as above).
 	mcpHandler := gw.MCPTasks(streamable, mcpAuthn.contextFunc, *publicURL == "")
+	// skillhub (slice B): the MCP Skills extension methods mcp-go has no
+	// route for (skills/list, skills/get, resources/directory/read), in
+	// front of the transport like MCP Tasks. It passes every request
+	// through until gw.RegisterSkillHub turns the skills hub on.
+	mcpHandler = gw.MCPSkills(mcpHandler, mcpAuthn.contextFunc, *publicURL == "")
 	mux.Handle("/mcp", mcpStreams.wrap(api.LimitBody(gateway.PreserveToolCallNumbers(mcpAuthn.guard(mcpHandler)), 16<<20)))
 	mux.Handle("/mcp/", mcpStreams.wrap(api.LimitBody(gateway.PreserveToolCallNumbers(mcpAuthn.guard(mcpHandler)), 16<<20)))
 
@@ -1580,6 +1750,9 @@ func runServe(argv []string) error {
 		// Native Inbox uploads (PUT /v1/uploads/{ticket}) carry up to a
 		// 50 MB video; the handler caps each body at its ticket's size.
 		"/v1/uploads/": inbox.MaxVideoBytes,
+		// skillhub (slice C): a skill source's GitHub webhook takes up to
+		// 5 MiB; HardenAPI keeps the other routes here at 64 KiB.
+		"/v1/skills/sources/": api.SkillWebhookMaxBytes,
 	})
 	handler = apiSrv.HardenAPI(handler)
 	handler = apiSrv.EnforceOriginOnMutations(handler)
@@ -2066,6 +2239,7 @@ func staticHandler() http.Handler {
 	cssHash := assetHash(sub, "style.css")
 	settingsHash := assetHash(sub, "settings.js")
 	appsHash := assetHash(sub, "apps.js")
+	skillsHash := assetHash(sub, "skills.js") // skillhub (slice C)
 	workspaceHash := assetHash(sub, "workspace.css")
 	swHash := assetHash(sub, "sw.js")
 	loginHash := assetHash(sub, "login.js")
@@ -2074,6 +2248,7 @@ func staticHandler() http.Handler {
 		out = strings.ReplaceAll(out, `href="/style.css"`, `href="/style.css?v=`+cssHash+`"`)
 		out = strings.ReplaceAll(out, `src="/settings.js"`, `src="/settings.js?v=`+settingsHash+`"`)
 		out = strings.ReplaceAll(out, `src="/apps.js"`, `src="/apps.js?v=`+appsHash+`"`)
+		out = strings.ReplaceAll(out, `src="/skills.js"`, `src="/skills.js?v=`+skillsHash+`"`) // skillhub (slice C)
 		out = strings.ReplaceAll(out, `href="/workspace.css"`, `href="/workspace.css?v=`+workspaceHash+`"`)
 		return []byte(out)
 	}
@@ -2215,7 +2390,8 @@ func (h hubEventBus) Publish(eventType string, data any) {
 	h.hub.Publish(realtime.Event{Type: eventType, Data: data})
 }
 
-// identityResolver adapts identity.Service.PrimaryUser → oauth.IdentityResolver.
+// identityResolver adapts identity.Service.ActiveOwnerOrAdmin (the person in
+// charge, who gets reauthorisation pushes) → oauth.IdentityResolver.
 // cancelAgentWork cancels a revoked OAuth client's pending approvals
 // (personal ones included) and Inbox requests and revokes its Inbox
 // grants, each recorded as done by the system because the grant was
@@ -2250,11 +2426,12 @@ func cancelAgentWork(ctx context.Context, bus *approval.Bus, inboxSvc *inbox.Ser
 }
 
 // mcpCredential is the agent token an /mcp request presents: the
-// Authorization bearer when there is one, else the x-bf-vk header (the
-// Bifrost virtual-key slot: bkt3's proxy strips Authorization and sends a
-// person's Beknown key there). Authorization always wins when both are
-// present, so a stale bearer never falls through to a different key. ok
-// is false when neither carries a token.
+// Authorization bearer when there is one, else the x-bf-vk header (a
+// virtual-key slot: a proxy that strips Authorization may send a person's
+// identity key there). x-bf-vk is read only when the request has no
+// Authorization header at all, so a stale or foreign Authorization never
+// falls through to a different key. ok is false when neither carries a
+// token.
 func mcpCredential(r *http.Request) (token string, ok bool) {
 	if auth := r.Header.Get("Authorization"); strings.HasPrefix(auth, "Bearer ") {
 		return strings.TrimPrefix(auth, "Bearer "), true
@@ -2285,7 +2462,7 @@ func registryUpstreams(servers []upstreams.Server) []string {
 type identityResolver struct{ id *identity.Service }
 
 func (r identityResolver) PrimaryUserID(ctx context.Context) (string, error) {
-	u, err := r.id.PrimaryUser(ctx)
+	u, err := r.id.ActiveOwnerOrAdmin(ctx)
 	if err != nil {
 		return "", err
 	}
@@ -2302,31 +2479,6 @@ func (a notesAdapter) Publish(ctx context.Context, agentID, path, content, topic
 	return a.s.Publish(ctx, agentID, path, content, topic)
 }
 func (a notesAdapter) NotesDir() string { return a.s.NotesDir() }
-
-// skillsAdapter bridges *skills.Service to the gateway's SkillsPublisher
-// contract — flattens the typed return into `(any, error)` so
-// internal/gateway doesn't need to import internal/skills.
-type skillsAdapter struct{ s *skillspkg.Service }
-
-func (a skillsAdapter) Publish(ctx context.Context, agentID, slug, skillMD, agentsYAML string, scripts map[string]string, topic string) (any, error) {
-	return a.s.Publish(ctx, agentID, slug, skillMD, agentsYAML, scripts, topic)
-}
-func (a skillsAdapter) Install(ctx context.Context, agentID, slug, mode, target string) (any, error) {
-	return a.s.Install(ctx, agentID, slug, mode, target)
-}
-func (a skillsAdapter) List(ctx context.Context, tagFilter []string) (any, error) {
-	return a.s.List(ctx, tagFilter)
-}
-func (a skillsAdapter) ListTags(ctx context.Context) (any, error) {
-	return a.s.ListTags(ctx)
-}
-func (a skillsAdapter) Get(ctx context.Context, slug string, includeFiles bool) (any, error) {
-	return a.s.Get(ctx, slug, includeFiles)
-}
-func (a skillsAdapter) Bundle(ctx context.Context, slugs []string) (any, error) {
-	return a.s.Bundle(ctx, slugs)
-}
-func (a skillsAdapter) SkillsDir() string { return a.s.SkillsDir() }
 
 // silence unused-import warnings in case build tags drop something.
 var _ = net.Listen

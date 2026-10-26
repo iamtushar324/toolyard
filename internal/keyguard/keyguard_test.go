@@ -398,6 +398,36 @@ func TestSealedTablesMatchTheSchema(t *testing.T) {
 	}
 }
 
+// The skills hub's sealed values make a database not fresh: a source's
+// read token or webhook secret, and the default GitHub token setting (a
+// cleared one is not sealed data).
+func TestSkillHubSealedValuesAreNotFresh(t *testing.T) {
+	ctx := context.Background()
+	e := newEnv(t)
+	if _, err := e.db.Exec(`INSERT INTO system_settings(key, value, updated_at) VALUES('skills_github_token', '""', 1)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.db.Exec(`INSERT INTO skill_sources(id, slug, owner, repo, branch, mode, created_by, created_at, updated_at)
+		VALUES('src_plain', 'plain', 'acme', 'plain', 'main', 'auto', 'usr_1', 1, 1)`); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := sealedTables(ctx, e.db.DB, e.db.Dialect); err != nil || len(got) != 0 {
+		t.Fatalf("no sealed skills values yet: %v %v", got, err)
+	}
+	for _, q := range []string{
+		`UPDATE skill_sources SET webhook_secret_sealed = 'c2VhbGVk' WHERE id = 'src_plain'`,
+		`UPDATE system_settings SET value = '"c2VhbGVk"' WHERE key = 'skills_github_token'`,
+	} {
+		if _, err := e.db.Exec(q); err != nil {
+			t.Fatal(err)
+		}
+	}
+	got, err := sealedTables(ctx, e.db.DB, e.db.Dialect)
+	if err != nil || strings.Join(got, ",") != "skill_sources,system_settings" {
+		t.Fatalf("sealed skills values: %v %v", got, err)
+	}
+}
+
 func TestExistingKeysAreAdopted(t *testing.T) {
 	e := newEnv(t)
 	// An installation from before canaries: key files and sealed rows.

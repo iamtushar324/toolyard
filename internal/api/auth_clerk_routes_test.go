@@ -185,9 +185,9 @@ func TestAuthClerkSessionThrottle(t *testing.T) {
 
 func TestPasswordLoginBlocked(t *testing.T) {
 	e := newAccessTestServer(t)
-	// Promote a member so the admin can be blocked.
+	// Make a member the owner (and so an admin) so the admin can be blocked.
 	m := e.member(t, "user_m", "m@beknown.work")
-	if err := e.id.SetRole(t.Context(), m.ID, identity.RoleAdmin); err != nil {
+	if err := e.id.TransferOwnership(t.Context(), e.admin.ID, m.ID); err != nil {
 		t.Fatal(err)
 	}
 	if err := e.id.SetStatus(t.Context(), e.admin.ID, identity.StatusBlocked, "x"); err != nil {
@@ -303,5 +303,25 @@ func TestPersonalClerkOnly(t *testing.T) {
 	}
 	if me := e.do(t, sessionCookie(t, rec), http.MethodGet, "/v1/auth/me", ""); me.Code != http.StatusOK {
 		t.Fatalf("owner session %d %s", me.Code, me.Body.String())
+	}
+}
+
+// TestAuthConfigSkillsCapability: the dashboard shows the Skills page only
+// while the skills hub is on (it is off with -skills=off).
+func TestAuthConfigSkillsCapability(t *testing.T) {
+	e := newAccessTestServer(t)
+	caps := func() map[string]any {
+		t.Helper()
+		got := decodeJSON(t, e.do(t, nil, http.MethodGet, "/v1/auth/config", ""))
+		c, _ := got["capabilities"].(map[string]any)
+		return c
+	}
+	e.srv.skillsAdmin = nil
+	if c := caps(); c["skills"] != false {
+		t.Fatalf("hub off: capabilities %v", c)
+	}
+	e.srv.skillsAdmin = &skillsAdminFake{}
+	if c := caps(); c["skills"] != true {
+		t.Fatalf("hub on: capabilities %v", c)
 	}
 }

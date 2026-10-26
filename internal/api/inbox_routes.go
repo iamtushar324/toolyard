@@ -62,6 +62,9 @@ func (s *Server) agentNames(ctx context.Context, uid string) map[string]string {
 			out[a.ID] = a.Name
 		}
 	}
+	// The person's own system items (internal/inbox system.go): toolyard
+	// is their sender.
+	out[inbox.SystemAgentID(uid)] = inbox.SystemSenderName
 	// Import records retain their original owner after agent deletion.
 	if s.inbox != nil {
 		if legacy, err := s.inbox.LegacyAgentNames(ctx, uid); err == nil {
@@ -368,7 +371,13 @@ func (s *Server) inboxDecide(w http.ResponseWriter, r *http.Request, uid, id str
 		}
 	}
 	body.By = u.Label()
-	body.Decider = s.dashboardDecider(r, u, actor.ViaDashboard)
+	// An operator token decides as itself (Via operator), never as the
+	// person in the dashboard: a HumanOnly system item refuses it.
+	via := actor.ViaDashboard
+	if isOperatorRequest(r) {
+		via = actor.ViaOperator
+	}
+	body.Decider = s.dashboardDecider(r, u, via)
 	req, err := s.inbox.Decide(r.Context(), id, body)
 	if err != nil {
 		writeInboxErr(w, err)
@@ -672,6 +681,9 @@ func (s *Server) inboxBatch(w http.ResponseWriter, r *http.Request, uid string) 
 	}
 	// One batch id on every request this click decides.
 	decider := s.batchDecider(r, u)
+	if isOperatorRequest(r) {
+		decider.Via = actor.ViaOperator
+	}
 	done, failed := 0, map[string]string{}
 	owned := s.agentNames(r.Context(), uid)
 	for _, id := range body.IDs {
@@ -756,6 +768,8 @@ func writeInboxErr(w http.ResponseWriter, err error) {
 		writeJSON(w, http.StatusPreconditionRequired, map[string]any{"error": err.Error(), "code": "passkey_required"})
 	case errors.Is(err, inbox.ErrPasskeyFailed):
 		writeJSON(w, http.StatusForbidden, map[string]any{"error": err.Error(), "code": "passkey_failed"})
+	case errors.Is(err, inbox.ErrHumanOnly):
+		writeJSON(w, http.StatusForbidden, map[string]any{"error": err.Error(), "code": "human_only"})
 	case errors.Is(err, inbox.ErrRequiredRefused), errors.Is(err, inbox.ErrNothingAllowed), errors.Is(err, inbox.ErrBadDecision), errors.Is(err, inbox.ErrWiden):
 		writeError(w, http.StatusBadRequest, err.Error())
 	default:

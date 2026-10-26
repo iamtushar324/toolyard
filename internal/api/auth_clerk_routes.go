@@ -18,6 +18,11 @@ type clerkDirectory interface {
 	VerifySessionToken(ctx context.Context, token string) (clerk.Claims, error)
 	OrgMembership(ctx context.Context, clerkUserID string) (clerk.Member, error)
 	OrgMembers(ctx context.Context) (map[string]clerk.Member, error)
+	// VerifiedPrimaryEmail and VerifyGoogleAccount guard the owner role:
+	// an owner-email sign-in must show a verified primary address, and a
+	// transfer in personal mode a verified Google account.
+	VerifiedPrimaryEmail(ctx context.Context, clerkUserID string) (string, error)
+	VerifyGoogleAccount(ctx context.Context, clerkUserID, email string) error
 }
 
 // Per-IP budget for POST /v1/auth/clerk/session. Every attempt costs a
@@ -48,7 +53,9 @@ func (s *Server) authConfig(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{
 		"clerk":   clerkCfg,
 		"version": s.buildVersion, "environment": s.environment,
-		"capabilities": map[string]bool{"voice": s.voice != nil, "notes": s.notes != nil && s.notes.Enabled(), "memory": s.mempalace != nil},
+		"capabilities": map[string]bool{"voice": s.voice != nil, "notes": s.notes != nil && s.notes.Enabled(), "memory": s.mempalace != nil,
+			// The skills hub (-skills): the dashboard shows the Skills page only while it is on.
+			"skills": s.skillsAdmin != nil},
 		// The local password account stays as the break-glass login.
 		"password_login": !s.clerkOwnerOnly,
 		"owner_only":     s.clerkOwnerOnly,
@@ -115,13 +122,39 @@ func (s *Server) authClerkSession(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, "clerk_unavailable")
 		return
 	}
-	if s.clerkOwnerOnly && (s.ownerEmail == "" || !strings.EqualFold(member.Email, s.ownerEmail)) {
-		writeError(w, http.StatusForbidden, "not_org_member")
-		return
+	// Personal sign-in admits only the owner: the stored owner's email,
+	// or the configured -owner-email until there is an owner with one
+	// (identity.OwnerSignInEmail). The Clerk client checks the same
+	// address on the verified Google account.
+	if s.clerkOwnerOnly {
+		allowed, err := s.identity.OwnerSignInEmail(ctx, s.ownerEmail)
+		if err != nil {
+			writeError(w, http.StatusServiceUnavailable, "owner lookup failed")
+			return
+		}
+		if !identity.EmailEqual(member.Email, allowed) {
+			writeError(w, http.StatusForbidden, "not_org_member")
+			return
+		}
 	}
 	u, err := s.upsertClerkMember(ctx, claims.Subject, member)
+	if errors.Is(err, clerk.ErrUnavailable) {
+		writeError(w, http.StatusServiceUnavailable, "clerk_unavailable")
+		return
+	}
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	// The row must be the owner, too: a concurrent first sign-in may have
+	// claimed the role, or the address may belong to someone who is not
+	// (or no longer) the owner.
+	if s.clerkOwnerOnly && !u.Owner {
+		_ = s.audit.Write(ctx, audit.Event{
+			EventType: audit.EventUserLogin, AgentID: "user:" + u.ID, Decision: "denied", Reason: "not_owner",
+			ResultSummary: u.Username,
+		})
+		writeError(w, http.StatusForbidden, "not_org_member")
 		return
 	}
 	if u.Status != identity.StatusActive {
@@ -146,14 +179,35 @@ func (s *Server) authClerkSession(w http.ResponseWriter, r *http.Request) {
 // upsertClerkMember records a verified Clerk user who is a member of the
 // organisation as a local user (profile and org role from the membership),
 // the one way every Clerk-authenticated route creates or refreshes users.
+//
+// An address equal to the owner email links the setup account and may
+// claim the owner role, so it must be the person's verified primary email:
+// personal access already checked that (member.EmailVerified); an
+// organisation membership's identifier is checked with the Backend API
+// here. Not verified: the sign-in goes on as a plain one. Clerk
+// unreachable: clerk.ErrUnavailable, and the caller refuses the sign-in
+// rather than record the owner as someone else.
 func (s *Server) upsertClerkMember(ctx context.Context, clerkUserID string, member clerk.Member) (*identity.User, error) {
-	return s.identity.UpsertClerkUser(ctx, identity.ClerkProfile{
+	p := identity.ClerkProfile{
 		ClerkUserID: clerkUserID,
 		Email:       member.Email,
 		DisplayName: clerkDisplayName(member),
 		AvatarURL:   member.ImageURL,
 		OrgRole:     member.Role,
-	}, s.ownerEmail)
+	}
+	if !member.EmailVerified && identity.EmailEqual(member.Email, s.ownerEmail) {
+		p.EmailUnverified = true
+		if s.clerk != nil {
+			v, err := s.clerk.VerifiedPrimaryEmail(ctx, clerkUserID)
+			switch {
+			case errors.Is(err, clerk.ErrUnavailable):
+				return nil, err
+			case err == nil && identity.EmailEqual(v, member.Email):
+				p.EmailUnverified = false
+			}
+		}
+	}
+	return s.identity.UpsertClerkUser(ctx, p, s.ownerEmail)
 }
 
 // clerkDisplayName is "First Last", falling back to the email when Clerk

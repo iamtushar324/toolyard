@@ -75,7 +75,7 @@ be reported as fixed by the feature removals.
 
 ## Stage release and measured laptop checks
 
-Application commit `0492eb1` is deployed at <https://toolyard.stage.dev.beknown.live/>.
+Application commit `0492eb1` is deployed at <https://toolyard-stage.example.com/>.
 Health reports `stage-0492eb1`, `ok: true`, two live upstreams and zero dropped
 metrics. The SQLite backup is
 `/var/lib/toolyard-stage/backups/before-0492eb1.sqlite`; rollback metadata is
@@ -93,7 +93,7 @@ cookie, unauthenticated refusal, cross-origin refusal, both synthetic connectors
 question idempotency, permission refusal, changed-parameter refusal, one-use grant,
 logical failure, slow response, and simulated sign-in failure.
 
-The Mac's Beknown Chrome profile opened the owner dashboard as Administrator.
+The Mac's admin Chrome profile opened the owner dashboard as Administrator.
 The local browser's read-only evaluation API does not expose `fetch`; direct JSON
 navigation was blocked by the browser. Thus the local session's raw `/v1/auth/me`
 HTTP status was not separately captured. The rendered Admin dashboard and its

@@ -134,6 +134,10 @@ type Options struct {
 	Passkeys PasskeyGate
 	// AgentName resolves an agent ID to a display name.
 	AgentName func(ctx context.Context, agentID string) string
+	// UserActive, when set, reports whether a person may still decide:
+	// DecideByTap refuses a bound token whose person is not (blocked, or
+	// gone), since a notification tap needs no session.
+	UserActive func(ctx context.Context, userID string) bool
 	// RichEnabled, when set and false, refuses schema_version 3 items: an
 	// operator turns it off while replicas that predate it still run
 	// (they would drop the version 3 fields when they rewrite an item).
@@ -196,6 +200,12 @@ type Service struct {
 	legacyMu    sync.Mutex
 	legacySig   string
 	legacyClean bool
+
+	// system holds the handlers of system items by kind, and systemOpts
+	// how each kind may be decided (system.go).
+	systemMu   sync.RWMutex
+	system     map[string]SystemHandler
+	systemOpts map[string]SystemOptions
 }
 
 // New creates the service and loads (or creates) the grant signing key.
@@ -295,6 +305,9 @@ func (s *Service) publish(t string, data any) {
 }
 
 func (s *Service) agentName(ctx context.Context, id string) string {
+	if _, ok := SystemAgentUser(id); ok {
+		return SystemSenderName
+	}
 	if s.opts.AgentName != nil {
 		if n := s.opts.AgentName(ctx, id); n != "" {
 			return n
@@ -887,6 +900,9 @@ func (s *Service) Decide(ctx context.Context, id string, d Decision) (*Request, 
 		if d.Action != "snooze" && r.Status != StatusPending {
 			return ErrNotPending
 		}
+		if err := s.checkSystemDecider(r, d.Action, dec); err != nil {
+			return err
+		}
 		if r.Kind == KindAccess && d.Action == "approve" {
 			if d.RequestRevision != r.Revision || d.SubmissionID == "" || len(d.SubmissionID) > 128 {
 				return fmt.Errorf("%w: a decision needs request_revision and submission_id", ErrConflict)
@@ -1056,6 +1072,8 @@ func (s *Service) Decide(ctx context.Context, id string, d Decision) (*Request, 
 	if d.Action == "snooze" {
 		s.enqueuePush(ctx, out, "snooze_end", out.ID, time.UnixMilli(out.SnoozedUntil))
 	}
+	// A system item's handler acts on the committed decision (system.go).
+	out = s.afterSystemDecision(ctx, out)
 	s.publish("inbox", s.cardView(ctx, out))
 	return out, nil
 }

@@ -1,6 +1,6 @@
 # Toolyard stage delivery
 
-Stage URL: https://toolyard.stage.dev.beknown.live
+Stage URL: https://toolyard-stage.example.com
 
 Release: `stage-9eac6b2`
 Source commit: `9eac6b24d745894efdf1bd15a2cc1256adc2e5f8`

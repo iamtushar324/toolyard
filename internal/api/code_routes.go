@@ -602,20 +602,39 @@ func (s *Server) codeOpenAPI(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusMethodNotAllowed, "GET only")
 		return
 	}
+	base := s.codeServedBase(w, r)
 	w.Header().Set("Content-Type", "application/json")
-	w.Header().Set("Cache-Control", "public, max-age=300")
-	_, _ = io.WriteString(w, docs.CodeOpenAPI)
+	_, _ = io.WriteString(w, docs.ServedCodeOpenAPI(base))
+}
+
+// codeServedBase is the base URL the served ty and OpenAPI document name:
+// the configured public URL, else this request's scheme and host. It sets
+// the cache headers: an answer built from the request's Host header is
+// never cached, so a shared cache cannot hand one caller's host to
+// another.
+func (s *Server) codeServedBase(w http.ResponseWriter, r *http.Request) string {
+	if base := strings.TrimRight(s.security.PublicURL, "/"); base != "" {
+		w.Header().Set("Cache-Control", "public, max-age=300")
+		return base
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	scheme := "http"
+	if s.security.IsBehindHTTPS(r) {
+		scheme = "https"
+	}
+	return scheme + "://" + r.Host
 }
 
 // GET /v1/code/ty — the ty command (Python 3, standard library); public.
+// Its default TOOLYARD_URL is this toolyard (docs.ServedTy).
 func (s *Server) codeTy(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
 		writeError(w, http.StatusMethodNotAllowed, "GET only")
 		return
 	}
+	base := s.codeServedBase(w, r)
 	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
-	w.Header().Set("Cache-Control", "public, max-age=300")
-	_, _ = io.WriteString(w, docs.TyScript)
+	_, _ = io.WriteString(w, docs.ServedTy(base))
 }
 
 // writeText writes a plain-text answer.

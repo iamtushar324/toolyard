@@ -18,6 +18,7 @@ require (
 	golang.org/x/net v0.52.0
 	golang.org/x/sys v0.44.0
 	google.golang.org/genai v1.57.0
+	gopkg.in/yaml.v3 v3.0.1
 )
 
 require (

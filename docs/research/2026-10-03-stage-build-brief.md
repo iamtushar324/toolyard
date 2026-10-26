@@ -4,7 +4,7 @@ Date: 3 October 2026. Reviewed source: dacb8d387b132e789b0e5434ea1620a9076ce9e2.
 
 **Build a small, complete stage product around Inbox, Connections, and Activity. Make questions a first-class interaction. Use a calm, Linear-inspired interface.**
 
-The requested destination is [Toolyard stage](https://toolyard.stage.dev.beknown.live), on dev-server-1. The user selected **fresh stage data and test connectors**. This brief replaces the earlier four-destination proposal for the first stage release.
+The requested destination is [Toolyard stage](https://toolyard-stage.example.com), on the build server. The user selected **fresh stage data and test connectors**. This brief replaces the earlier four-destination proposal for the first stage release.
 
 This is a research and design deliverable. It does not deploy Toolyard, change DNS, configure identity providers, or modify the application. The [interactive design prototype](2026-10-03-stage-ui-prototype.html) runs only local demonstrations. It uses no application API.
 
@@ -257,14 +257,14 @@ The [prototype probe record](evidence/2026-10-03-stage-prototype-probes.json) co
 
 | Item | Current evidence |
 | --- | --- |
-| Host | dev-server-1, hostname ip-10-31-39-131 |
-| Requested hostname | toolyard.stage.dev.beknown.live |
-| DNS | Both the current and requested Toolyard names resolve to 13.232.74.51 |
+| Host | the build server |
+| Requested hostname | toolyard-stage.example.com |
+| DNS | Both the current and requested Toolyard names resolve to the host's one public address |
 | Current Toolyard HTTPS | Valid certificate and HTTP 200 health response |
 | Stage HTTPS | Certificate verification fails with a self-signed certificate |
 | Existing edge | Traefik v3.7.5 owns ports 80 and 443 |
 | Existing application | systemd service toolyard-inbox.service |
-| Existing private listener | 172.23.0.1:18790 |
+| Existing private listener | the host's private bridge address, port 18790 |
 | Existing proxy | toolyard-proxy on the bk-dev overlay network |
 | Existing TLS pattern | Exact host rule, websecure entrypoint, le certificate resolver |
 | Current resource snapshot | About 14GB available memory; about 3GB free; load about 3; swap nearly full |
@@ -274,7 +274,7 @@ No route or service changed during these checks. A failed certificate check is n
 ### Proposed topology
 
     Browser or test agent
-        → HTTPS: toolyard.stage.dev.beknown.live
+        → HTTPS: toolyard-stage.example.com
         → existing Traefik edge
         → dedicated stage proxy
         → dedicated Toolyard stage process
@@ -291,9 +291,9 @@ Proposed deployment values, subject to a final collision check:
 | Current release link | /opt/toolyard-stage/current |
 | Data directory | /var/lib/toolyard-stage |
 | Environment file | /etc/toolyard-stage/stage.env |
-| Private listener | 172.23.0.1:18792 |
+| Private listener | the same private bridge address, port 18792 |
 | Edge proxy and route names | Dedicated toolyard-stage names |
-| Public origin | https://toolyard.stage.dev.beknown.live |
+| Public origin | https://toolyard-stage.example.com |
 | Initial limits | CPU quota of one core; memory high watermark 384MB; memory maximum 768MB |
 
 The port was not present in the listener inventory. These names and limits are proposals, not reserved resources. Recheck them immediately before deployment.

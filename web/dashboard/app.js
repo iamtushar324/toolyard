@@ -18,6 +18,7 @@ const state = {
   // Users page (admin): /v1/users rows + the grantable groups.
   users: { rows: [], groups: [], loaded: false, loading: false, error: '', keyBusy: '', keyOpen: {} },
   userAccessModal: null,   // { id, name, selected: {group: bool}, dropped: [], error, saving } while editing access
+  ownerModal: null,        // { id, name, hint, expect: [names], google, typed, error, saving } while the owner transfers ownership
   // "Your Beknown key" card: /v1/me/identity-key status, plus the raw key
   // held only in memory from a reveal until the owner dismisses it.
   myKey: freshMyKey(),
@@ -179,7 +180,22 @@ function defaultRoute() {
   return 'inbox';
 }
 
+// skillsHubOn reports the skills hub (-skills): /v1/auth/config lists it
+// under capabilities. While it is off the Skills page and its nav item are
+// hidden.
+function skillsHubOn() {
+  return !!(state.authConfig && state.authConfig.capabilities && state.authConfig.capabilities.skills);
+}
+
+// skillsContributorOn reports a member the skills hub names a skill
+// contributor (skills.js loadSkillsMe): they get the Skills page for their
+// own sources. skillsUI lives in skills.js, which may not be loaded.
+function skillsContributorOn() {
+  return skillsHubOn() && typeof skillsUI !== 'undefined' && !!skillsUI.contributor;
+}
+
 function routeAllowed(route) {
+  if (route === 'skills') return skillsHubOn() && (isAdmin() || skillsContributorOn());
   return isAdmin() || MEMBER_ROUTES.includes(route);
 }
 
@@ -977,7 +993,7 @@ const AGENT_KIND_LABEL = { dashboard: 'Dashboard', voice: 'Voice', cli: 'CLI', s
 const DECIDED_VIA_LABEL = {
   dashboard: 'dashboard', dashboard_batch: 'batch', push_token: 'notification tap', passkey: 'passkey',
   telegram: 'Telegram', auto_rule: 'auto-rule', policy: 'policy rule', inbox_grant: 'inbox grant',
-  agent_cancel: 'cancelled by agent', expiry: 'expired',
+  agent_cancel: 'cancelled by agent', expiry: 'expired', operator: 'operator token',
 };
 
 function shortId(id, n = 12) {
@@ -2073,11 +2089,29 @@ async function loadUsers(clearError) {
   render();
 }
 
+// USER_ERRORS turns the Users API's error codes into a sentence.
+const USER_ERRORS = {
+  last_admin: 'Someone must stay an active admin.',
+  owner_protected: 'The owner is always an active admin. Transfer ownership to someone else first, then change their role or block them.',
+  not_owner: 'Only the owner can transfer ownership.',
+  already_owner: 'That person is already the owner.',
+  user_blocked: 'Unblock that person first: the owner must be an active user.',
+  confirm_mismatch: "What you typed doesn't match that person's username, email or name.",
+  no_sign_in: 'That person has never signed in with Google, and on this server only the owner can sign in. They must sign in with Google once first.',
+  no_google_sign_in: 'Clerk shows no verified Google account with that person\'s email, so they could not sign in as the owner.',
+  clerk_unavailable: 'Clerk did not answer. Try again in a minute.',
+  session_required: 'This needs a person signed in to the dashboard.',
+};
+
+function userErrorText(e) {
+  return USER_ERRORS[e.message] || e.message;
+}
+
 // usersFail keeps a 400/409 reason on the page (the toast fades) until the
 // next change goes through.
 function usersFail(e) {
-  state.users.error = e.message;
-  toast(e.message, 'error');
+  state.users.error = userErrorText(e);
+  toast(state.users.error, 'error');
 }
 
 async function patchUser(u, patch, okMsg) {
@@ -2096,6 +2130,105 @@ async function setUserRole(u, role) {
     : `Make ${name} a member? They keep their own agents and only reach the servers granted to them.`;
   if (!confirm(msg)) { render(); return; } // re-render resets the <select>
   await patchUser(u, { role }, `${name} is now ${role === 'admin' ? 'an admin' : 'a member'}`);
+}
+
+// ---- Ownership (Users page) ----
+//
+// The owner is the one person in charge: always an active admin, never
+// demoted or blocked, and the only one who can hand the role on. POST
+// /v1/users/{id}/make-owner must repeat the new owner's username, email or
+// name, so the dialog asks for it typed out.
+
+function openOwnerTransfer(u) {
+  state.ownerModal = {
+    id: u.id,
+    name: userLabel(u),
+    hint: u.email || u.username,
+    expect: [u.username, u.email, u.display_name].filter(Boolean),
+    google: u.auth === 'clerk',
+    typed: '',
+    error: '',
+    saving: false,
+  };
+  render();
+  const input = document.getElementById('owner-transfer-typed');
+  if (input) input.focus();
+}
+
+function closeOwnerTransfer() {
+  if (state.ownerModal && state.ownerModal.saving) return;
+  state.ownerModal = null;
+  render();
+}
+
+function ownerTypedOK(m) {
+  const t = m.typed.trim().toLowerCase();
+  return !!t && m.expect.some((v) => v.trim().toLowerCase() === t);
+}
+
+async function submitOwnerTransfer() {
+  const m = state.ownerModal;
+  if (!m || m.saving || !ownerTypedOK(m)) return;
+  m.saving = true; m.error = ''; render();
+  try {
+    const r = await api(`/v1/users/${encodeURIComponent(m.id)}/make-owner`, { method: 'POST', body: { confirm: m.typed.trim() } });
+    if (state.ownerModal === m) state.ownerModal = null;
+    if (r && r.identity_key_error) toast(`${m.name} is now the owner, but revoking your Beknown key failed: ${r.identity_key_error}`, 'error');
+    else toast(`${m.name} is now the owner`);
+    // Personal sign-in admits only the owner: this session has ended.
+    if (state.authConfig && state.authConfig.owner_only) { history.replaceState(null, '', '/'); location.reload(); return; }
+    state.users.error = '';
+    await refreshUser();
+    await loadUsers();
+  } catch (e) {
+    m.saving = false;
+    m.error = userErrorText(e);
+    render();
+  }
+}
+
+function renderOwnerTransferModal() {
+  const m = state.ownerModal;
+  const ownerOnly = !!(state.authConfig && state.authConfig.owner_only);
+  const syncGo = () => {
+    const b = document.getElementById('owner-transfer-go');
+    if (b) b.disabled = m.saving || !ownerTypedOK(m);
+  };
+  return el('div', { class: 'modal-bg', on: { click: (e) => { if (e.target === e.currentTarget) closeOwnerTransfer(); } } },
+    el('div', { class: 'modal', role: 'dialog', 'aria-label': 'Transfer ownership' },
+      el('h3', {}, 'Transfer ownership · ' + m.name),
+      el('p', { class: 'meta' },
+        `${m.name} becomes the owner and an admin. You stay an admin until the new owner changes that. ` +
+        "Only the owner can transfer ownership, and nobody can demote or block the owner."),
+      ownerOnly
+        ? el('p', { class: 'err' }, `Only the owner can sign in to this server. After the transfer only ${m.name} can sign in with Google, and you can no longer sign in at all: this browser is signed out.`)
+        : null,
+      ownerOnly && !m.google
+        ? el('p', { class: 'err' }, `${m.name} has never signed in with Google, so they could not sign in as the owner. The server refuses this transfer.`)
+        : null,
+      ownerOnly
+        ? el('p', { class: 'meta' }, "The transfer also disables your agents, revokes your Beknown key, and revokes every operator token that is not the new owner's.")
+        : null,
+      el('label', {},
+        el('div', { class: 'meta' }, 'To confirm, type ', el('code', {}, m.hint)),
+        el('input', {
+          id: 'owner-transfer-typed', autocomplete: 'off', value: m.typed,
+          on: {
+            input: (e) => { m.typed = e.target.value; syncGo(); },
+            keydown: (e) => { if (e.key === 'Enter') submitOwnerTransfer(); },
+          },
+        }),
+      ),
+      m.error ? el('div', { class: 'err' }, m.error) : null,
+      el('div', { class: 'row', style: 'margin-top: 16px; justify-content: flex-end;' },
+        el('button', { disabled: m.saving, on: { click: closeOwnerTransfer } }, 'Cancel'),
+        el('button', {
+          id: 'owner-transfer-go', class: 'danger', disabled: m.saving || !ownerTypedOK(m),
+          on: { click: submitOwnerTransfer },
+        }, m.saving ? 'Transferring…' : 'Transfer ownership'),
+      ),
+    ),
+  );
 }
 
 async function blockUser(u) {
@@ -2381,23 +2514,34 @@ function viewUsers() {
           const self = row.id === me.id;
           const admin = row.role === 'admin';
           const blocked = row.status === 'blocked';
+          const owner = !!row.is_owner;
+          const roleLock = self ? "You can't change your own role"
+            : owner ? 'The owner is always an admin. Transfer ownership first.' : '';
           return el('tr', { style: blocked ? 'opacity: 0.75;' : '' },
             el('td', {}, el('div', { class: 'user-cell' },
               userAvatar(row, true),
               el('div', { class: 'who' },
-                el('span', {}, userLabel(row), self ? el('span', { class: 'meta' }, ' (you)') : null),
+                el('span', {}, userLabel(row), self ? el('span', { class: 'meta' }, ' (you)') : null,
+                  owner ? el('span', { class: 'badge owner inline-badge', title: 'The person in charge of this toolyard' }, 'owner') : null),
                 el('span', { class: 'meta' },
                   row.auth === 'clerk' ? 'Google' : row.auth === 'password' ? 'password' : (row.username || '')),
               ),
             )),
             el('td', { class: 'meta' }, row.email || '—'),
-            el('td', {}, el('select', {
-              disabled: self,
-              title: self ? "You can't change your own role" : '',
-              on: { change: (e) => setUserRole(row, e.target.value) },
-            },
-              el('option', { value: 'admin',  selected: admin }, 'admin'),
-              el('option', { value: 'member', selected: !admin }, 'member'),
+            el('td', {}, el('div', { class: 'stack' },
+              el('select', {
+                disabled: !!roleLock,
+                title: roleLock,
+                'aria-label': 'Role of ' + userLabel(row),
+                on: { change: (e) => setUserRole(row, e.target.value) },
+              },
+                el('option', { value: 'admin',  selected: admin }, 'admin'),
+                el('option', { value: 'member', selected: !admin }, 'member'),
+              ),
+              // Only the owner hands the role on, to another active person.
+              me.is_owner && !self && !blocked
+                ? el('button', { on: { click: () => openOwnerTransfer(row) } }, 'Make owner')
+                : null,
             )),
             el('td', {}, el('div', { class: 'stack' },
               blocked ? el('span', { class: 'badge denied' }, 'blocked') : el('span', { class: 'badge allowed' }, 'active'),
@@ -2405,8 +2549,8 @@ function viewUsers() {
               blocked
                 ? el('button', { on: { click: () => unblockUser(row) } }, 'Unblock')
                 : el('button', {
-                    class: 'danger', disabled: self,
-                    title: self ? "You can't block yourself" : '',
+                    class: 'danger', disabled: self || owner,
+                    title: self ? "You can't block yourself" : owner ? 'The owner cannot be blocked. Transfer ownership first.' : '',
                     on: { click: () => blockUser(row) },
                   }, 'Block'),
             )),
@@ -2431,13 +2575,15 @@ function viewUsers() {
 
   return el('div', {},
     state.userAccessModal ? renderUserAccessModal() : null,
+    state.ownerModal ? renderOwnerTransferModal() : null,
     el('div', { class: 'card' },
       el('div', { class: 'agent-add-bar' },
         el('h2', { style: 'margin: 0;' }, 'People'),
         el('button', { disabled: u.loading, on: { click: () => loadUsers(true) } }, u.loading ? 'Refreshing…' : 'Refresh'),
       ),
       el('p', { class: 'meta', style: 'margin: 4px 0 12px;' },
-        'Members manage only their own agents, and those agents reach only the servers granted here. Admins see and manage everything.'),
+        'Members manage only their own agents, and those agents reach only the servers granted here. Admins see and manage everything, and can make anyone an admin. ' +
+        'The owner, the first person to sign in, is always an admin and cannot be demoted or blocked; only the owner can make someone else the owner (Make owner).'),
       u.error ? el('div', { class: 'err', style: 'margin: 0 0 12px;' }, u.error) : null,
       table,
     ),
@@ -4620,6 +4766,7 @@ function uiIcon(name) {
     menu: 'M2 5h16 M2 10h16 M2 15h16',
     logout: 'M8 2H2v16h6 M7 10h12 M15 6l4 4-4 4',
     chevron: 'M7 4l6 6-6 6',
+    book: 'M2 3h5a3 3 0 0 1 3 3v12a2 2 0 0 0-2-2H2z M18 3h-5a3 3 0 0 0-3 3v12a2 2 0 0 1 2-2h6z',
   };
   const svg = document.createElementNS('http://www.w3.org/2000/svg', 'svg');
   for (const [key, value] of Object.entries({ viewBox: '-1 -1 22 22', width: '18', height: '18', fill: 'none', stroke: 'currentColor', 'stroke-width': '1.5', 'stroke-linecap': 'round', 'stroke-linejoin': 'round', 'aria-hidden': 'true', class: 'ui-icon' })) svg.setAttribute(key, value);
@@ -4661,6 +4808,7 @@ function navigate(route) {
   let hashRoute = route;
   if (route.startsWith('settings/')) route = settingsRoute(route);
   else if (route === 'settings') hashRoute = 'settings/' + settingsUI.page;
+  else if (route === 'skills' || route.startsWith('skills/')) route = skillsRoute(route);
   if (!routeAllowed(route)) route = defaultRoute();
   if (route === 'inbox' || state.route === 'inbox') {
     if (state.inbox.openId) { ibHalt(); state.inbox.openId = null; state.inbox.detail = null; ibNode = null; }
@@ -4678,6 +4826,7 @@ function navigate(route) {
   if (route === 'agents' || route === 'myservers') loadMyKey();
   if (route === 'agents') void loadHostConnections();
   if (route === 'apps') loadApps();
+  if (route === 'skills') loadSkills();
   render();
 }
 
@@ -4708,8 +4857,10 @@ function shell(content) {
         navBtn('agents', 'People & agents', 'people'),
         navBtn('apps', 'Connected apps', 'key'),
         navBtn('tools', 'Tools', 'tools'),
+        skillsHubOn() ? navBtn('skills', 'Skills', 'book') : null,
         navBtn('settings', 'Settings', 'sliders')) : el('nav', { 'aria-label': 'Main navigation' },
-        navBtn('inbox', 'Inbox', 'inbox', inboxBadgeCount()), navBtn('agents', 'Agents', 'people'), navBtn('apps', 'Connected apps', 'key'), navBtn('myservers', 'Available services', 'tools'), navBtn('connections', 'Connections', 'plug')),
+        navBtn('inbox', 'Inbox', 'inbox', inboxBadgeCount()), navBtn('agents', 'Agents', 'people'), navBtn('apps', 'Connected apps', 'key'), navBtn('myservers', 'Available services', 'tools'), navBtn('connections', 'Connections', 'plug'),
+        skillsContributorOn() ? navBtn('skills', 'Skills', 'book') : null),
       el('div', { class: 'sidebar-footer' }, admin ? renderStreamPill() : null,
         el('div', { class: 'sidebar-account' }, el('span', { class: 'user-chip', title: state.user.email || '' },
           userAvatar(state.user), el('span', { class: 'account-copy' }, userLabel(state.user), el('small', {}, admin ? 'Administrator' : 'Member'))),
@@ -4741,12 +4892,14 @@ function renderMoreSheet() {
         item('agents', 'People & agents', 'Manage access and enrolled agents'),
         item('apps', 'Connected apps', 'Apps added by URL, like ChatGPT and Claude'),
         item('tools', 'Tools', 'Browse tools and review access policies'),
+        skillsHubOn() ? item('skills', 'Skills', 'Skill sources toolyard serves to agents') : null,
         item('settings', 'Settings', 'Workspace preferences'),
       ] : [
         item('agents',    'Agents',     'Manage your enrolled agents'),
         item('apps',      'Connected apps', 'Apps added by URL, like ChatGPT and Claude'),
         item('myservers', 'My servers', 'Servers your agents may use'),
         item('connections', 'My connections', 'Sign in to servers that act as you'),
+        skillsContributorOn() ? item('skills', 'Skills', 'Skill sources you added') : null,
       ],
       el('div', { class: 'mobile-account' }, userAvatar(state.user), el('span', {}, userLabel(state.user)), el('button', { on: { click: logoutWorkspace } }, 'Sign out')),
       el('div', { class: 'row', style: 'margin-top: 12px; justify-content: flex-end;' },
@@ -4853,6 +5006,7 @@ function render() {
     case 'audit':         body = viewAudit();         break;
     case 'agents':        body = viewAgents();        break;
     case 'apps':          body = viewApps();          break;
+    case 'skills':        body = viewSkills();        break;
     case 'servers':       body = viewConnectionHub();       break;
     case 'policies':      body = viewPolicies();       break;
     case 'tools':         body = viewTools();         break;
@@ -5239,6 +5393,7 @@ function withSectionTabs(body) {
     insights: ['Activity', 'Review tool calls, permission decisions, and results.'],
     settings: ['Settings', 'Workspace preferences and access controls.'],
     myservers: ['Available services', 'Services your agents can use.'],
+    skills: ['Skills', 'Skill sources: GitHub repositories whose Agent Skills toolyard copies and serves to agents.'],
   };
   const groups = isAdmin() ? [
     [['servers', 'Services'], ['connections', 'My accounts']],
@@ -5804,6 +5959,14 @@ function ibFlagChip(f) {
 function ibAvatar(name, big) {
   return el('span', { class: 'ib-av' + (big ? ' big' : '') }, (name || '?').trim().charAt(0).toUpperCase());
 }
+// ibSystemBadge marks an item toolyard raised itself (a skills review, an
+// agent's skill source proposal). Only the server sets r.system, so an
+// agent that calls itself "toolyard" never gets the badge.
+function ibSystemBadge(r) {
+  if (!r || !r.system) return null;
+  const own = String(r.agent_id || '').startsWith('toolyard:');
+  return el('span', { class: 'ib-pill sys', title: own ? 'Sent by toolyard itself, not by an agent' : 'toolyard asks on behalf of this agent' }, 'toolyard');
+}
 function ibAge(ms) {
   const m = Math.max(0, Math.round((Date.now() - ms) / 60000));
   if (m < 1) return 'now';
@@ -6045,7 +6208,7 @@ function ibCard(r) {
       keydown: (e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); openInboxRequest(r.id); } },
     },
   },
-    el('div', { class: 'ib-sender' }, ibAvatar(r.agent_name), el('b', {}, r.agent_name),
+    el('div', { class: 'ib-sender' }, ibAvatar(r.agent_name), el('b', {}, r.agent_name), ibSystemBadge(r),
       el('span', { class: 's' }, r.session_title || ''), el('span', { class: 't' }, ibAge(r.created_at))),
     el('div', { class: 'ib-kindrow' }, el('span', { class: 'ib-kind' }, ibKindLabel(r)), ibStatusPill(r),
       ...ibAttnPills(r), r.checked ? null : el('span', { class: 'ib-pill mute' }, 'Checking…')),
@@ -6180,7 +6343,7 @@ function ibHeadEl(r) {
   const ses = [r.session_title, r.session_repo, r.session_host].filter(Boolean).join(' · ');
   return el('div', { class: 'ib-dh' },
     el('div', { class: 'ib-from' }, ibAvatar(r.agent_name, true),
-      el('div', {}, el('b', {}, r.agent_name), el('span', {}, IB_VERB[r.kind] + (ses ? ' · ' + ses : '')))),
+      el('div', {}, el('b', {}, r.agent_name), ibSystemBadge(r), el('span', {}, IB_VERB[r.kind] + (ses ? ' · ' + ses : '')))),
     el('div', { class: 'ib-kindrow' },
       el('span', { class: 'ib-kind' }, ibKindLabel(r)),
       ibStatusPill(r), ...ibAttnPills(r), el('span', { class: 'meta' }, relTime(r.created_at))),
@@ -7422,7 +7585,6 @@ function agentRulesSnippet(base, tok) {
 mkdir -p ~/.claude/skills/toolyard-inbox
 curl -fsSL -H "Authorization: Bearer ${tok}" ${base}/v1/guide/skill \\
   -o ~/.claude/skills/toolyard-inbox/SKILL.md
-# (or, with the toolyard CLI: toolyard skills install toolyard-inbox)
 
 # Codex, Cursor, hermes and others: add this to AGENTS.md / your rules
 ## Asking for permission (toolyard)
@@ -7451,6 +7613,7 @@ Read the full rules with inbox.guide().`;
   if (routeParam) state.route = workspaceRoute(routeParam);
   let deepInbox = null;
   if (state.route.startsWith('settings/')) state.route = settingsRoute(state.route);
+  if (state.route.startsWith('skills/')) state.route = skillsRoute(state.route);
   if (state.route.startsWith('inbox/')) { deepInbox = state.route.slice(6); state.route = 'inbox'; }
   if (IB_FILTERS.includes(deepInbox)) { state.inbox.filter = deepInbox; deepInbox = null; }
   // Push deep link: notifications open /?approval=<id>. Land on the
@@ -7467,7 +7630,9 @@ Read the full rules with inbox.guide().`;
   if (state.user && appsResumeOAuth()) return;
   if (state.user && !isAdmin()) {
     // Members: their agents and granted servers only. No event stream and
-    // no admin fetches (they'd all be 403 admin_only).
+    // no admin fetches (they'd all be 403 admin_only). A skill contributor
+    // also gets Skills: asked first, so a #skills link survives the load.
+    if (skillsHubOn()) await loadSkillsMe();
     await loadAll();
     if (state.route === 'connections') loadConnections(true);
     if(deepInbox)openInboxRequest(deepInbox);
@@ -7521,6 +7686,8 @@ Read the full rules with inbox.guide().`;
       } else if (id && state.inbox.openId !== id) openInboxRequest(id);
     } else if (h === 'inbox' && state.inbox.openId) {
       closeInboxRequest();
+    } else if (h === 'skills' && skillsUI.openId) {
+      navigate('skills');
     } else if (h && h !== state.route) {
       navigate(h);
     }

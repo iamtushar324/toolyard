@@ -28,7 +28,7 @@ func runOperatorToken(argv []string) error {
 	sub, argv := argv[0], argv[1:]
 	fs := flag.NewFlagSet("operator-token "+sub, flag.ExitOnError)
 	dataDir := fs.String("data", defaultDataDir(), "toolyard data directory")
-	user := fs.String("user", "", "owner: username, email or user id (default: oldest active admin)")
+	user := fs.String("user", "", "owner: username, email or user id (default: the owner, else the oldest active admin)")
 	name := fs.String("name", "", "token name, e.g. \"claude-code on hypnos\" (create)")
 	scopes := fs.String("scopes", "read,write", "comma-separated scopes: read, write, owner (create)")
 	ttl := fs.Duration("ttl", 0, "expiry, e.g. 720h; 0 never expires (create)")

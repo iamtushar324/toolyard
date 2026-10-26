@@ -28,7 +28,9 @@ import (
 //	       approval-related settings, secret values, audit purges
 //
 // Nothing that returns a secret value (/reveal routes) or manages browser
-// sessions is reachable with an operator token, whatever its scopes.
+// sessions is reachable with an operator token, whatever its scopes, and
+// neither is changing a person's role or transferring ownership: those
+// need a person in a dashboard session (users_routes.go).
 
 const ctxOperatorKey ctxKey = 100
 
@@ -106,6 +108,11 @@ var operatorOwnerPrefixes = []string{
 	"/v1/me/agent-scopes",
 	"/v1/me/apps/scope",
 	"/v1/me/apps/revoke",
+	// Skill sources: what every agent reads, and their read tokens.
+	"/v1/skills/sources",
+	"/v1/skills/admin/github-token",
+	// Who may add skill sources.
+	"/v1/skills/admin/contributors",
 }
 
 // operatorScopeFor returns the scope an operator token needs for method on
@@ -118,10 +125,21 @@ func operatorScopeFor(method, path string) (scope string, ok bool) {
 	// path is the credential, so no token may redeem one.
 	// Likewise an upload ticket (upload_routes.go) is its own credential.
 	// Code mode over REST runs as an agent, and session tokens belong to
-	// an agent: a person's operator token reaches neither.
+	// an agent: a person's operator token reaches neither. The agent
+	// skills routes and a bundle download (its ticket is the credential)
+	// are an agent's too.
+	// A skill source's webhook secret is shown once, to a person on the
+	// Skills page; GitHub's webhook itself takes no token.
+	if strings.HasPrefix(path, skillAdminSourcesPrefix) && (strings.HasSuffix(path, "/webhook-secret") || strings.HasSuffix(path, "/webhook")) {
+		return "", false
+	}
+	// Transferring ownership is the owner's own act, in their browser.
+	if strings.HasPrefix(path, "/v1/users/") && strings.HasSuffix(path, "/make-owner") {
+		return "", false
+	}
 	if operatorNeverPaths[path] || strings.Contains(path, "/reveal") || strings.HasPrefix(path, connectLinkPath) || strings.HasPrefix(path, uploadsPathPrefix) ||
 		strings.HasPrefix(path, codePathPrefix) || strings.HasPrefix(path, sessionTokensPrefix) ||
-		path == jobsPath || strings.HasPrefix(path, jobsPrefix) {
+		path == jobsPath || strings.HasPrefix(path, jobsPrefix) || skillsAgentPath(path) {
 		return "", false
 	}
 	switch method {
@@ -144,6 +162,10 @@ func operatorScopeFor(method, path string) (scope string, ok bool) {
 // approval prompts go, how long the audit trail lives, or hold credentials.
 // Patching any of them with an operator token needs the owner scope.
 var ownerSettingKeys = map[string]bool{
+	// What an agent's skill change may push to GitHub, and whose new skill
+	// sources (an approved agent proposal included) go live without review.
+	settings.SkillsChangeAllowBuildFiles:     true,
+	settings.SkillsTrustedGitHubOwners:       true,
 	settings.ApprovalMode:                    true,
 	settings.AutoApprovalEnabled:             true,
 	settings.AutoApprovalPatternMinApprovals: true,
@@ -459,7 +481,7 @@ var operatorCatalog = []operatorCatalogEntry{
 	{"/v1/operator/routes", "GET", "this catalog"},
 	{"/v1/operator/guide", "GET", "operator guide (markdown)"},
 	{"/v1/users", "GET POST", "users: list, create"},
-	{"/v1/users/{id}", "GET PATCH DELETE POST", "one user: role, status, access, identity key"},
+	{"/v1/users/{id}", "GET PATCH DELETE POST", "one user: role (browser session only), status, access, identity key; POST /make-owner transfers ownership (the owner's browser session only)"},
 	{"/v1/me/servers", "GET", "servers and data groups the caller may use"},
 	{"/v1/me/apps", "GET", "the caller's connected apps (OAuth clients); ?all=true lists everyone's for an admin"},
 	{"/v1/me/apps/config", "GET", "how to connect an MCP client by URL, and for an admin the OAuth settings"},
@@ -493,6 +515,15 @@ var operatorCatalog = []operatorCatalogEntry{
 	{"/v1/code/ty", "GET", "the ty command for code mode over REST, Python 3 (no token)"},
 	{"/v1/jobs", "GET POST", "agent: POST starts a tool call as an async job {tool, arguments, reason, callback_ref, wait_seconds} (Idempotency-Key, Prefer: wait=N); GET lists the agent's jobs ?status=&limit=&before= (agent or session token; never via operator token)"},
 	{"/v1/jobs/{id}", "GET POST", "agent: GET a job (Prefer: wait=N); GET /result its tool result; POST /cancel cancels it (never via operator token)"},
+	{"/v1/skills/search", "GET", "agent: skills.search ?query=, mode=keyword|regex, source, limit, include_host (agent or session token; never via operator token)"},
+	{"/v1/skills/get", "GET", "agent: skills.get ?skill=, include_files (agent or session token; never via operator token)"},
+	{"/v1/skills/read", "GET", "agent: skills.read ?uri=, offset, limit (agent or session token; never via operator token)"},
+	{"/v1/skills/grep", "GET", "agent: skills.grep ?pattern=, source, path, ignore_case, limit, include_host (agent or session token; never via operator token)"},
+	{"/v1/skills/sources", "GET", "agent: skills.sources, the skill sources the caller sees (agent or session token)"},
+	{"/v1/skills/list", "GET", "agent: skills.list ?cursor=, limit, source, include_host (agent or session token; never via operator token)"},
+	{"/v1/skills/proposal", "GET", "agent: skills.proposal ?id=, one of the calling agent's skill proposals (agent or session token; never via operator token)"},
+	{"/v1/skills/bundle", "POST", "agent: skills.bundle {skills, reason} -> a single-use download URL for a .tar.gz (agent or session token; never via operator token)"},
+	{"/v1/skills/bundle/{id}", "GET", "download a skills bundle (.tar.gz): the single-use ticket in the path is the credential, for 10 minutes (no token; never via operator token)"},
 	{"/v1/approvals", "GET", "approval queue"},
 	{"/v1/approvals/{id}", "GET POST", "one approval; POST decides it"},
 	{"/v1/approvals/decide-batch", "POST", "decide many approvals"},
@@ -511,6 +542,13 @@ var operatorCatalog = []operatorCatalogEntry{
 	{"/v1/marketplace", "GET", "curated server recipes"},
 	{"/v1/secrets", "GET POST", "secrets metadata; POST {name, description, request:true} asks the owner for a value"},
 	{"/v1/secrets/{id}", "PUT DELETE", "set/rotate (?reconnect=1) or delete a secret value"},
+	{"/v1/skills/admin/sources", "GET", "skills hub: every skill source, with status (admin; a skill contributor gets their own)"},
+	{"/v1/skills/admin/me", "GET", "skills hub: {user_id, admin, contributor}: what the signed-in person may do on the Skills page"},
+	{"/v1/skills/admin/people", "GET", "skills hub: the active people a source or skill can be shared with or blocked from (admins and skill contributors)"},
+	{"/v1/skills/admin/contributors", "GET", "skills hub: the skill contributors, members who may add sources that wait for an admin's approval (admin)"},
+	{"/v1/skills/admin/contributors/{id}", "PUT DELETE", "skills hub: add or remove a skill contributor by user ID (admin; owner scope); their sources stay"},
+	{"/v1/skills/admin/github-token", "GET PUT", "skills hub: the default GitHub read token for sources without their own: GET {set, rate, paused_until}; PUT {token} sets it (checked with GitHub) or, empty, clears it; never returned"},
+	{"/v1/skills/sources/{id}", "GET POST PATCH PUT DELETE", "skills hub admin: POST /v1/skills/sources creates a source; /inspect and /preview try one; /{id} reads, PATCHes or DELETEs it; /{id}/sync, /{id}/versions, /{id}/versions/{vid}/activate|reject, /{id}/skills, PUT /{id}/skills/runs, PUT /{id}/skills/sharing {path, mode, members, blocked}, POST /{id}/approval {decision, note} (admin); /{id}/webhook-secret rotates the webhook secret (never via operator token); /{id}/webhook is GitHub's signed push webhook (no token)"},
 	{"/v1/policies", "GET POST", "tool policies"},
 	{"/v1/policies/{id}", "PATCH DELETE", "one policy"},
 	{"/v1/settings", "GET PATCH", "settings (secret values masked)"},

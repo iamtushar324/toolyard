@@ -107,6 +107,22 @@ const (
 	// CallbackMaxReceivers caps each agent's active callback receivers.
 	// Default 500 (callbacks.DefaultMaxReceiversPerAgent).
 	CallbackMaxReceivers = "callback_max_receivers_per_agent"
+	// SkillsTrustedGitHubOwners is a comma list of GitHub owners whose
+	// repositories a new skill source syncs in mode auto by default (the
+	// others default to review; docs/skills-hub.md). Default empty.
+	SkillsTrustedGitHubOwners = "skills_trusted_github_owners"
+	// SkillsGitHubToken holds the skills hub's instance-wide default
+	// GitHub read token, sealed with secrets.key (internal/skillhub
+	// github_access.go). It is an internal key: never returned by All,
+	// refused by Patch and Reveal; only PUT /v1/skills/admin/github-token
+	// writes it.
+	SkillsGitHubToken = "skills_github_token"
+	// SkillsChangeAllowBuildFiles lets an agent's skill change proposal
+	// write CI or build configuration (a Makefile, package.json, a
+	// workflow file, ...) that sits directly in the skill's own folder.
+	// Default false: every such path is refused (docs/skills-hub.md,
+	// change proposals).
+	SkillsChangeAllowBuildFiles = "skills_change_allow_build_files"
 
 	// Inbox attention (when the phone buzzes; inbox-spec.md §6).
 	//
@@ -159,6 +175,19 @@ var secretKeys = map[string]struct{}{
 // was the password of the removed ClickHouse lake.
 var retiredKeys = map[string]struct{}{
 	"clickhouse_password": {},
+}
+
+// internalKeys are settings that only their own feature reads and writes,
+// through its own endpoint: All never returns them, and Patch refuses
+// them. They are not secret keys, so Reveal refuses them too.
+var internalKeys = map[string]struct{}{
+	SkillsGitHubToken: {},
+}
+
+// isInternalKey reports whether key is one of internalKeys.
+func isInternalKey(key string) bool {
+	_, ok := internalKeys[key]
+	return ok
 }
 
 // isRetiredKey reports whether key is one of retiredKeys.
@@ -236,7 +265,7 @@ func (s *Service) All(ctx context.Context) (map[string]any, error) {
 	defer s.mu.RUnlock()
 	out := make(map[string]any, len(s.cache))
 	for k, v := range s.cache {
-		if k == CostInputUsdPerM || k == CostOutputUsdPerM || isRetiredKey(k) {
+		if k == CostInputUsdPerM || k == CostOutputUsdPerM || isRetiredKey(k) || isInternalKey(k) {
 			continue
 		}
 		if IsSecretKey(k) {
@@ -302,6 +331,12 @@ func (s *Service) All(ctx context.Context) (map[string]any, error) {
 	}
 	if _, ok := out[InboxVoiceEnabled]; !ok {
 		out[InboxVoiceEnabled] = false
+	}
+	if _, ok := out[SkillsTrustedGitHubOwners]; !ok {
+		out[SkillsTrustedGitHubOwners] = ""
+	}
+	if _, ok := out[SkillsChangeAllowBuildFiles]; !ok {
+		out[SkillsChangeAllowBuildFiles] = false
 	}
 	// Virtual alias: keep router_only_mode boolean in sync for older callers.
 	if mode, _ := out[SurfaceMode].(string); mode == SurfaceRouterOnly {
@@ -464,6 +499,9 @@ func (s *Service) Patch(ctx context.Context, updates map[string]any) error {
 		}
 		if isRetiredKey(k) {
 			return errors.New("retired setting: " + k)
+		}
+		if isInternalKey(k) {
+			return errors.New("this setting is written only by its own endpoint: " + k)
 		}
 	}
 	updates = normalise(updates)

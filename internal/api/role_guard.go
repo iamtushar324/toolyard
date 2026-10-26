@@ -68,16 +68,16 @@ func (s *Server) RoleGuard(next http.Handler) http.Handler {
 }
 
 // sessionTokenAllowed reports whether a session token may call path: the
-// code routes, whoami, the agent's approval polling, and the session token
-// routes (whose handlers allow only revoking the token itself). Methods
-// are left to the handlers. A path that is not clean gets no benefit of
-// the doubt.
+// code routes, the job and agent skills routes, whoami, the agent's
+// approval polling, and the session token routes (whose handlers allow
+// only revoking the token itself). Methods are left to the handlers. A
+// path that is not clean gets no benefit of the doubt.
 func sessionTokenAllowed(path string) bool {
 	if path != pathpkg.Clean(path) {
 		return false
 	}
 	return strings.HasPrefix(path, codePathPrefix) ||
-		path == jobsPath || strings.HasPrefix(path, jobsPrefix) ||
+		path == jobsPath || strings.HasPrefix(path, jobsPrefix) || skillsAgentPath(path) || path == skillsSourcesPath ||
 		path == "/v1/agents/whoami" ||
 		strings.HasPrefix(path, "/v1/agents/approvals/") ||
 		path == sessionTokensPath || strings.HasPrefix(path, sessionTokensPrefix)
@@ -219,9 +219,22 @@ func memberAllowed(method, path string) bool {
 		return true
 	}
 	// Bearer-only routes (agent or session token) that never read a
-	// cookie: session tokens, code mode over REST and async jobs.
+	// cookie: session tokens, code mode over REST, async jobs and the
+	// agent skills routes, whose bundle download is authenticated by the
+	// single-use ticket in its path (skills_routes.go). Of
+	// /v1/skills/sources only the GET is: it answers only an agent bearer
+	// (the agent listing); its POST creates a source (admin).
 	if strings.HasPrefix(path, sessionTokensPrefix) || strings.HasPrefix(path, codePathPrefix) ||
-		path == jobsPath || strings.HasPrefix(path, jobsPrefix) {
+		path == jobsPath || strings.HasPrefix(path, jobsPrefix) || skillsAgentPath(path) ||
+		(path == skillsSourcesPath && method == http.MethodGet) {
+		return true
+	}
+	// Skill contributors (members an admin named on the Skills page) add
+	// skill sources and manage their own; the handlers refuse every other
+	// member and check that the source is theirs (skillManagerUser,
+	// skills_sharing_routes.go). Activating, rejecting and approving stay
+	// admin routes, as do the GitHub token and the contributor list.
+	if skillsManagerRoute(method, path) {
 		return true
 	}
 	// A native Inbox upload: the single-use ticket in the path is the
@@ -272,6 +285,43 @@ func memberAllowed(method, path string) bool {
 		case (sub == "rotate" || sub == "disable" || sub == "enable") && method == http.MethodPost:
 			return true
 		}
+	}
+	return false
+}
+
+// skillsManagerRoute reports a Skills page route a skill contributor may
+// use (the handler decides whether this member is one):
+//
+//	GET    /v1/skills/admin/me, /v1/skills/admin/sources, /v1/skills/admin/people
+//	POST   /v1/skills/sources, /v1/skills/sources/inspect, /v1/skills/sources/preview
+//	GET    PATCH DELETE /v1/skills/sources/{id}
+//	POST   /v1/skills/sources/{id}/sync, /v1/skills/sources/{id}/webhook-secret
+//	GET    /v1/skills/sources/{id}/versions, /v1/skills/sources/{id}/skills
+//	PUT    /v1/skills/sources/{id}/skills/runs, /v1/skills/sources/{id}/skills/sharing
+func skillsManagerRoute(method, path string) bool {
+	switch path {
+	case skillMePath, skillPeoplePath, "/v1/skills/admin/sources":
+		return method == http.MethodGet
+	case skillsSourcesPath, skillAdminSourcesPrefix + "inspect", skillAdminSourcesPrefix + "preview":
+		return method == http.MethodPost
+	}
+	rest, ok := strings.CutPrefix(path, skillAdminSourcesPrefix)
+	if !ok {
+		return false
+	}
+	parts := strings.Split(rest, "/")
+	if !skillAdminIDPattern.MatchString(parts[0]) || parts[0] == "inspect" || parts[0] == "preview" {
+		return false
+	}
+	switch {
+	case len(parts) == 1:
+		return method == http.MethodGet || method == http.MethodPatch || method == http.MethodDelete
+	case len(parts) == 2 && (parts[1] == "sync" || parts[1] == "webhook-secret"):
+		return method == http.MethodPost
+	case len(parts) == 2 && (parts[1] == "versions" || parts[1] == "skills"):
+		return method == http.MethodGet
+	case len(parts) == 3 && parts[1] == "skills" && (parts[2] == "runs" || parts[2] == "sharing"):
+		return method == http.MethodPut
 	}
 	return false
 }

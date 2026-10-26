@@ -1,6 +1,6 @@
 // Package access decides which tool groups a dashboard user, and every agent
 // that user owns, may use. A tool group is an upstream server name or a
-// built-in data group (memory, events, notes, skills).
+// built-in data group (memory, events, notes).
 //
 // Admins reach everything. Members reach only the groups an admin granted
 // them in user_server_access, plus the always-on groups (the meta-tools and
@@ -29,8 +29,8 @@ import (
 // self-scoped access tools (policies, servers, audit, access) that tell an
 // agent what it may do and why (the ones that change anything check the
 // owner's role themselves), the connections tools it finds its owner's
-// sign-in links with, the jobs tools for its own async jobs, and the
-// callbacks tools for its own webhook receivers.
+// sign-in links with, the jobs tools for its own async jobs, the
+// callbacks tools for its own webhook receivers, and the skills tools.
 var alwaysOn = map[string]bool{
 	"tools": true, "inbox": true, "session": true,
 	"policies": true, "servers": true, "audit": true, "access": true,
@@ -39,11 +39,18 @@ var alwaysOn = map[string]bool{
 	"jobs": true,
 	// callbacks.*: an agent manages only its own webhook receivers.
 	"callbacks": true,
+	// skills.*: the skills hub shows each caller only the skill sources
+	// its owner may see (skillhub.Reader filters by the viewer), so the
+	// tools need no grant. A grant of skills stored before the hub (when
+	// skills was a built-in data group) grants nothing more: it is not
+	// listed and the next SetGroups drops it. An agent's deny list still
+	// switches the tools off for that agent.
+	"skills": true,
 }
 
 // BuiltinGroups are the built-in data tools an admin grants like servers.
 // They are shared across all agents, so members don't get them by default.
-var BuiltinGroups = []string{"memory", "events", "notes", "skills"}
+var BuiltinGroups = []string{"memory", "events", "notes"}
 
 // retiredGroups are groups toolyard no longer has. A stored grant for one
 // grants nothing and is not listed; the next SetGroups for that user drops
@@ -330,7 +337,8 @@ func (s *Service) agentOwner(ctx context.Context, agentID string) (string, error
 }
 
 // Groups lists the groups granted to userID, sorted. Grants for retired
-// groups are left out.
+// and always-on groups are left out: they grant nothing (an always-on
+// group needs no grant; skills became one after grants for it existed).
 func (s *Service) Groups(ctx context.Context, userID string) ([]string, error) {
 	rows, err := s.db.QueryContext(ctx,
 		`SELECT server FROM user_server_access WHERE user_id = ? ORDER BY server`, userID)
@@ -344,7 +352,7 @@ func (s *Service) Groups(ctx context.Context, userID string) ([]string, error) {
 		if err := rows.Scan(&g); err != nil {
 			return nil, err
 		}
-		if retiredGroups[g] {
+		if retiredGroups[g] || alwaysOn[g] {
 			continue
 		}
 		out = append(out, g)

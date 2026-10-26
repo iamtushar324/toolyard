@@ -166,6 +166,9 @@ func TestConcurrentLastTwoAdminsKeepsOne(t *testing.T) {
 	s, first := newTestIdentity(t)
 	ctx := context.Background()
 	second := clerkUser(t, s, "user_second", "second@beknown.work", "")
+	// Without an owner (as before 0072): the owner would always stay, so
+	// only an ownerless store tests the last-admin rule.
+	clearOwner(t, s)
 	activeAdmins := func() int {
 		t.Helper()
 		var n int
@@ -227,5 +230,109 @@ func TestConcurrentLastTwoAdminsKeepsOne(t *testing.T) {
 				t.Fatalf("%s (round %d): %d active admins left, want 1", op.name, round, got)
 			}
 		}
+	}
+}
+
+// Concurrent first sign-ins on an empty install leave exactly one owner;
+// every other sign-in succeeds as a member. On Postgres the partial unique
+// index refuses the second owner and UpsertClerkUser retries it.
+func TestConcurrentFirstSignInsOneOwner(t *testing.T) {
+	for round := 0; round < 5; round++ {
+		s := newEmptyIdentity(t)
+		ctx := context.Background()
+		const n = 6
+		users := make([]*User, n)
+		errs := race(n, func(i int) error {
+			u, err := s.UpsertClerkUser(ctx, ClerkProfile{
+				ClerkUserID: fmt.Sprintf("user_%d", i), Email: fmt.Sprintf("p%d@beknown.work", i),
+			}, "")
+			users[i] = u
+			return err
+		})
+		owners := 0
+		for i, err := range errs {
+			if err != nil {
+				t.Fatalf("round %d sign-in %d: %v", round, i, err)
+			}
+			if users[i].Owner {
+				owners++
+				if users[i].Role != RoleAdmin {
+					t.Fatalf("round %d: owner %+v is not an admin", round, users[i])
+				}
+			} else if users[i].Role != RoleMember {
+				t.Fatalf("round %d: non-owner %+v is not a member", round, users[i])
+			}
+		}
+		if owners != 1 || ownerCount(t, s) != 1 {
+			t.Fatalf("round %d: %d owners returned, %d stored; want 1", round, owners, ownerCount(t, s))
+		}
+	}
+}
+
+// The password setup racing a first Clerk sign-in: one of them creates the
+// first account and is the owner; the other is refused (setup) or a member.
+func TestConcurrentSetupAndFirstSignInOneOwner(t *testing.T) {
+	for round := 0; round < 5; round++ {
+		s := newEmptyIdentity(t)
+		ctx := context.Background()
+		var setupUser, clerkUserRow *User
+		errs := race(2, func(i int) error {
+			var err error
+			if i == 0 {
+				setupUser, err = s.CreateUser(ctx, "admin", "long-enough-password")
+				if errors.Is(err, ErrUserExists) {
+					return nil
+				}
+				return err
+			}
+			clerkUserRow, err = s.UpsertClerkUser(ctx, ClerkProfile{ClerkUserID: "user_c", Email: "c@beknown.work"}, "")
+			return err
+		})
+		for i, err := range errs {
+			if err != nil {
+				t.Fatalf("round %d call %d: %v", round, i, err)
+			}
+		}
+		if ownerCount(t, s) != 1 {
+			t.Fatalf("round %d: %d owners, want 1", round, ownerCount(t, s))
+		}
+		if setupUser != nil && (!setupUser.Owner || clerkUserRow.Owner || clerkUserRow.Role != RoleMember) {
+			t.Fatalf("round %d: setup won but setup=%+v clerk=%+v", round, setupUser, clerkUserRow)
+		}
+		if setupUser == nil && !clerkUserRow.Owner {
+			t.Fatalf("round %d: setup refused but the Clerk sign-in is not the owner: %+v", round, clerkUserRow)
+		}
+	}
+}
+
+// Two transfers by the owner at the same time: one wins, the other is
+// ErrNotOwner, and there is still exactly one owner.
+func TestConcurrentTransfersOneWins(t *testing.T) {
+	s, owner := newTestIdentity(t)
+	ctx := context.Background()
+	b := clerkUser(t, s, "user_b", "b@beknown.work", "")
+	c := clerkUser(t, s, "user_c", "c@beknown.work", "")
+	errs := race(2, func(i int) error {
+		to := b.ID
+		if i == 1 {
+			to = c.ID
+		}
+		return s.TransferOwnership(ctx, owner, to)
+	})
+	ok := 0
+	for i, err := range errs {
+		switch {
+		case err == nil:
+			ok++
+		case errors.Is(err, ErrNotOwner):
+		default:
+			t.Fatalf("transfer %d: %v", i, err)
+		}
+	}
+	if ok != 1 || ownerCount(t, s) != 1 {
+		t.Fatalf("%d transfers succeeded, %d owners; want 1 and 1", ok, ownerCount(t, s))
+	}
+	if got := ownerID(t, s); got != b.ID && got != c.ID {
+		t.Fatalf("owner = %s, want b or c", got)
 	}
 }

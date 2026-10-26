@@ -10,7 +10,8 @@ go build -o toolyard ./cmd/gateway
 ```
 
 Open <http://localhost:8787>. The first visit asks you to create the local
-admin account. Subsequent visits land on `/Approvals`.
+admin account; that first account is the **owner** ([The owner and
+admins](#the-owner-and-admins)). Subsequent visits land on `/Approvals`.
 
 ## Quickstart (Docker)
 
@@ -516,6 +517,114 @@ answers with a job id at once (`always`), or after a wait (`after`,
   lease its replica renews, and a replica that stops leaves its running
   jobs `outcome_unknown` (never re-run) once the lease ends (60 s).
 
+## Skills hub
+
+The skills hub serves [Agent Skills](https://agentskills.io/specification)
+from GitHub repositories to every client: MCP tools, code mode, REST and
+the MCP Skills extension. An admin adds a *skill source* (a repository,
+a branch and a folder); toolyard copies its skills at an exact commit into
+the database and serves only that copy. How sync, review and limits work:
+[skills-hub.md](skills-hub.md).
+
+- **`-skills`** (`TOOLYARD_SKILLS`): `on` (the default; `auto` also means
+  on) or `off`. Off serves no skills and runs no sync. The flags of the
+  removed local skills folder (`-skills-dir`, `-skills-sync-interval`,
+  `-claude-skills-dir`) are still accepted, ignored, and logged once as
+  deprecated.
+- **`skills_trusted_github_owners`** (Settings; comma list of GitHub
+  owners, default empty): a new source from one of these owners syncs in
+  mode `auto` by default (a new commit goes live once it is synced); every other
+  source defaults to `review` (a new commit waits for an admin).
+- **Sharing and contributors** (no flag or setting; data in the
+  database, migrations `0073` and `0074`). Admins choose who sees each
+  source and each skill (everyone, chosen members, nobody, and block
+  lists), and which members may add skill sources (skill contributors,
+  whose sources wait for an admin's approval). See
+  [skills-hub.md](skills-hub.md#sharing). Rollback: an older binary
+  knows only the `members` audience, so it shows a hidden, blocked,
+  `nobody` or pending contributor source to everyone. Use these controls
+  only once every replica runs this version; before a rollback, delete or
+  set to `members` the sources that rely on them.
+- **Network.** toolyard calls only the GitHub API
+  (`https://api.github.com`) and `codeload.github.com`, where GitHub
+  redirects archive downloads. Allow both through an egress proxy or
+  firewall. Agents never call GitHub themselves.
+- **Credentials.** A private repository needs a read-only token
+  (fine-grained, *Contents: read* on that repository). toolyard seals it
+  with `secrets.key`, never shows it again, never logs it, and never sends
+  it to the archive host. Webhook secrets are sealed the same way. Instead
+  of a token, an admin who has connected the per-user GitHub server (My
+  connections) can let a source read with their own connection
+  (`auth: github`); the toolyard GitHub App then needs *Contents: read* and
+  *Metadata: read* on that repository.
+- **Change proposals.** An agent's `skills.propose_change` becomes an
+  Inbox question for the person who added the source; their approval opens
+  a pull request with their own GitHub connection (no flag or setting; it
+  needs the per-user GitHub server). For that, the toolyard GitHub App
+  needs *Contents: write* and *Pull requests: write* on the repository:
+  the App that the GitHub setup creates asks for *Pull requests: write*
+  and *Contents: read*, so add *Contents: write* in the App's settings on
+  GitHub (and accept it on each installation) to use change proposals.
+  The writes go to `https://api.github.com` only. Only the source's
+  creator approves one, in person; an operator token cannot.
+- **`skills_change_allow_build_files`** (Settings; default false; owner
+  scope for operator tokens): lets a change proposal write CI or build
+  configuration (a `Makefile`, `package.json`, a workflow file, ...) that
+  sits directly in the skill's own folder. Off, every such path is
+  refused; a CI folder such as `.github/` is refused either way.
+- **`skills_github_token`** (set on the Skills page, GitHub access, or
+  `PUT /v1/skills/admin/github-token`; never through the settings API,
+  which neither returns nor accepts it): a default read token for every
+  source with `auth: none` (a source's own token and `auth: github`
+  win). Without it GitHub allows this server's address
+  60 calls an hour, and anonymous `304`s count, so a few public sources
+  and some admin use reach the limit; with it, 5,000 calls an hour. A
+  fine-grained token with read access to public repositories is enough.
+  It is sealed with `secrets.key` like a source's token: replacing
+  `secrets.key` makes it unreadable (sources then read anonymously; set
+  it again). On a rate limit, the sources that read with the same
+  credential wait together until it resets, and the API answers `429`
+  with `retry_after`.
+- **Webhook (optional).** Polling checks each source every 5 minutes (its
+  `poll_seconds`, at least 60) with a conditional request that costs no
+  rate limit when nothing changed. For updates within seconds, add a
+  GitHub webhook to the repository: payload URL
+  `<public-url>/v1/skills/sources/<id>/webhook`, content type
+  `application/json`, the secret the dashboard shows once (Rotate secret),
+  event *Just the push event*. The payload URL must be reachable from
+  GitHub.
+- **Replicas.** Each replica keeps an in-memory index of the live
+  versions (skills and file lists, not file contents). The leader runs the
+  poll loop and the Inbox sweep (`skills-inbox-sweep`: review and proposal
+  questions that expired, were withdrawn, or were decided while no handler
+  ran); a "Sync now" or a webhook syncs on the replica that received it,
+  under a per-source lock, so two syncs of one source never overlap.
+- **Rollout.** Run this version on every replica before you turn the hub
+  on. Review questions and agents' source proposals are Inbox *system
+  items*, tagged in the stored item; a replica that predates them drops the
+  tag when it rewrites the item (a snooze, a reminder), and the owner's
+  answer then does nothing.
+- **Storage.** Each file's contents are stored once, by SHA-256, however
+  many versions use them. Each source keeps its live version, the one
+  waiting for review, and the last 10 others; older versions and contents
+  no version uses are deleted.
+- **Rollback.** Migrations `0068_skill_hub`, `0070_skill_proposals` and
+  `0071_skill_bundle_tickets` only add tables. An older binary ignores
+  them (and the old `skills_sync` table is left as it was).
+- **Upgrade.** The old skills workspace server (the built-in upstream
+  named `skills`) is gone: the name now belongs to the hub's own
+  `skills.*` tools. A stored server under that name is not loaded, and its
+  status says so; delete it on the Servers page.
+- **Upgrade: API changes to watch.** An Inbox decision sent with an
+  operator token is now recorded with `decided_via: operator` (it was
+  `dashboard`) in the item and its audit row; scripts that
+  filter on `decided_via` should accept it. `GET /v1/settings` gains the
+  skills keys `skills_trusted_github_owners` (default `""`) and
+  `skills_change_allow_build_files` (default `false`); both need an
+  operator token's owner scope to change. `GET /v1/auth/config` lists
+  `skills` under `capabilities`; with `-skills=off` it is `false`, and the
+  dashboard hides the Skills page.
+
 ## Inbox and permissions
 
 Settings → **Inbox & permissions**:
@@ -652,10 +761,17 @@ stays as the break-glass login.
      -owner-email you@example.com
    ```
 
+   On a fresh install with no password account, `-owner-email` decides who
+   becomes the owner: only that person's first sign-in claims it. Without
+   it, the first person to sign in becomes the owner. See [The owner and
+   admins](#the-owner-and-admins).
+
 Everyone else who signs in becomes a **member**: they see their own profile,
 manage their own agents, and their agents reach only the servers and data
-groups (memory, events, notes, skills) an admin grants them on the
-**Users** page. Every approval and inbox decision stays with admins.
+groups (memory, events, notes) an admin grants them on the **Users** page.
+The skills tools need no grant: each person sees the skill sources shared
+with them ([skills-hub.md](skills-hub.md)). Every approval and inbox
+decision stays with admins.
 
 Once an hour (`-clerk-sync-interval`) toolyard lists the organisation's
 members; anyone who left is blocked (`left_org`), their dashboard sessions
@@ -679,6 +795,19 @@ browser sessions cannot access the dashboard API. The first permitted
 login links to the existing owner account, retaining its agents, grants,
 passkeys, and data. Agent and operator token authentication is preserved.
 
+In this mode only the **owner** signs in, through every Clerk route (the
+dashboard, `/v1/connect/t3` and federation). `-owner-email` names them
+until there is an owner with an email on file; after that the stored
+owner's email is the address that counts. A transfer needs a new owner who
+has signed in with Google before and whose verified Google account Clerk
+still shows; afterwards only the new owner can sign in, and the previous
+owner's browser sessions stop working. In the same transaction the
+transfer disables the previous owner's agents and revokes every operator
+token that is not the new owner's; right after it, it revokes the previous
+owner's identity key (that calls the key registries; a failure shows in the
+dashboard and the removal is retried). Allow the new owner's Google account
+in the Clerk app too.
+
 Enable only Google in the dedicated Clerk app. Restrict Clerk signups to
 the same email, using an allowlist or invite-only access as available on
 your plan. The Toolyard server check remains mandatory: signup restrictions
@@ -686,6 +815,114 @@ alone do not authorize existing accounts. Store keys outside Git and argv.
 
 Rollback: remove `-clerk-owner-only` and the Clerk environment variables,
 and restore the prior image/configuration. No database migration is added.
+
+## The owner and admins
+
+Every install has one **owner**: the person in charge. The owner is always
+an admin; nobody can demote or block them in the dashboard, and only the
+owner can make someone else the owner.
+
+Who becomes the owner on an install that has none:
+
+- the account the first-visit setup (`POST /v1/auth/setup`) creates;
+- else the first verified Google (Clerk) sign-in:
+  - **without `-owner-email`, the first person to sign in becomes the owner
+    and an admin, whatever their role in the Clerk organisation.** On an
+    organisation install where someone else could sign in before you, set
+    `-owner-email` (or run the setup) before you open the sign-in page;
+  - with `-owner-email`, only that person becomes the owner, on their first
+    sign-in, and nobody else can claim it. Anyone who signs in before them
+    is a member (or an admin, if they are an admin of the Clerk
+    organisation and there is no admin yet), never the owner. The address
+    must be the person's verified primary email in Clerk; toolyard checks it
+    with the Clerk Backend API, refuses the sign-in while Clerk cannot be
+    reached, and compares addresses ASCII-only, ignoring case.
+
+Of two first sign-ins at the same moment exactly one becomes the owner; the
+other is a member. Everyone who signs in later is a member until an admin
+changes that. A federated sign-in (a T3 server's assertion) and the
+registration of a T3 server never make anyone an admin or the owner.
+
+`-owner-email` only seeds the owner. Once there is one, the stored owner is
+what counts: changing the flag does not move ownership, and a transfer does
+not need the flag changed.
+
+**Upgrading.** An install that had users before the owner existed gets one
+when it starts, if `-owner-email` is not set (or Clerk sign-in is off): the
+oldest active admin (on a typical install, the password account created at
+setup). With `-owner-email` set, startup picks nobody, because an email
+stored on an account may never have been verified: the role stays vacant
+until that person signs in with the verified address, which links them to
+the setup account or makes their own account the owner. The server logs
+`toolyard: owner is <username>`, or that the role waits for that sign-in.
+If an older binary demoted the owner during a rolling deploy, the next
+start makes them an admin again and logs a warning.
+
+**Transfer ownership.** On **People & agents → People**, the owner clicks
+**Make owner** on another active person's row and types that person's
+username or email to confirm. The new owner becomes an admin; the previous
+owner stays an admin until the new owner changes that. Over REST it is
+`POST /v1/users/{id}/make-owner {"confirm":"<username, email or name>"}`
+from the owner's browser session. Add `"revoke_previous": true` to also
+disable your agents and revoke your operator tokens, in the same
+transaction as the move.
+
+**Make anyone admin.** The owner and every admin can promote any person to
+admin and demote admins (`PATCH /v1/users/{id} {"role":"admin"|"member"}`).
+Two limits hold: nobody changes their own role, and someone must stay an
+active admin. To demote or block the owner, transfer ownership first.
+
+Agents and operator tokens cannot change roles or ownership, whatever
+their scopes: both need a person signed in to the dashboard (role changes
+an admin, a transfer the owner).
+
+**When the owner is gone.** If the hourly Clerk sync finds that the owner
+left the organisation, it blocks them (`left_org`): their sessions end,
+their agents are disabled, their operator tokens revoked and their push
+subscriptions deleted, and a notification they still have can no longer
+decide anything (a tap counts only for an active person). They stay the
+owner, and the server logs an error. Owner notifications go to the oldest
+active admin meanwhile. If the owner is the only active admin, the sync
+leaves them active instead (a member list that came back incomplete must
+not lock everyone out), logs an error on every pass and audits it once
+(`user.owner_left_org`): make another admin. An admin can unblock a
+mistaken departure on the People page. To move the role, run on the host
+(it reads the same database as `serve`, needs no sign-in, and works with
+the server running or stopped):
+
+```bash
+toolyard owner show     --data /var/lib/toolyard
+toolyard owner transfer --data /var/lib/toolyard --to alice@example.com        # shows the account
+toolyard owner transfer --data /var/lib/toolyard --to alice@example.com --yes  # moves the role
+```
+
+`--to` takes a user id, a username, or an email (ASCII letters only fold
+case; when two accounts have that email it refuses, and you give the id).
+Without `--yes` it only shows the account it found. The new owner must be
+active; `--unblock` re-activates a blocked one as part of the move (for
+example a lone admin who left and came back). The previous owner keeps
+their role and status. The same command recovers an owner who lost their
+account.
+
+**Audit trail.** Every owner change and every automatic promotion writes
+`user.owner` and `user.role` audit rows, in the same transaction as the
+change: by the person for a transfer (`user:<id>`, with both user ids), and
+for automatic ones by `system:setup` (the first account), `system:sign-in`
+(a sign-in that claims the role or bootstraps an admin), `system:startup`
+(the upgrade backfill and a re-promotion), `system:cli` (`toolyard owner
+transfer`) and `system:clerk-sync` (a departed owner, as `user.status`).
+These rows hold user ids, usernames and counts only; `GET /v1/audit` and
+the exports list them, but the live audit stream does not push them, so
+reload the Audit page to see one.
+
+No agent may take a name that reads as toolyard itself (`toolyard`,
+`Toolyard system`, …): the Inbox names toolyard as the sender of its own
+items. An agent that has such a name from another route (an OAuth client,
+a host) shows as `agent "toolyard"`, and an agent that is not the owner's
+shows its owner's name after its own.
+
+Rollback: an older binary ignores the owner column (migration 0072) and
+treats the oldest account as the owner again.
 
 ## Inbox voice notes with ElevenLabs
 
@@ -748,7 +985,7 @@ Turn it on by listing bkt3's origins (Clerk sign-in must be on):
 
 ```bash
 ./toolyard serve -public-url https://toolyard.example.com \
-  -connect-azp https://stagebkt3.dev.beknown.live
+  -connect-azp https://t3.example.com
 ```
 
 - Comma-separated `https` origins (plain `http` only for `localhost`,
@@ -766,7 +1003,7 @@ Turn it on by listing bkt3's origins (Clerk sign-in must be on):
   leeway either way), and has no `aud` claim (JWT templates do). bkt3
   should mint a token right before each call. Then it checks the
   organisation membership, creates or refreshes the person's toolyard user
-  exactly as a Google sign-in does, issues their Beknown identity key if
+  exactly as a Google sign-in does, issues their identity key if
   they never had one (never rotating or replacing one: a person whose key
   an admin revoked stays without a key, `identity_key=missing` in the
   audit row, until an admin issues a new one), and creates their one
@@ -870,7 +1107,8 @@ one connection, and the flag does nothing there.
 - Inbox attachments (uploads, copied links and voice notes) are kept in
   the database too, in 1 MiB chunks, instead of under
   `<data>/inbox/blobs`. The data directory still holds keys (unless they
-  come from a credentials directory), crash dumps, notes and skills.
+  come from a credentials directory), crash dumps and notes. The skills
+  hub keeps its copies in the database on both engines.
 - Back up the database with Postgres tools (`pg_dump`, or snapshots on
   Aurora) instead of copying `toolyard.db`. Back up the keys with it, but
   store them apart from it, as for SQLite.
@@ -929,7 +1167,8 @@ How the replicas share the work:
   refresher, the Clerk membership sync, the session purge, the retention
   compactor, the auto-approval proposer, the anomaly detector and reason
   scorer, the events pollers and retention, the Telegram poller and chat
-  reconciler, the memory-webhook worker, the notes and skills scanners,
+  reconciler, the memory-webhook worker, the notes scanner, the skills
+  hub's sync loop (`skills-sync`) and Inbox sweep (`skills-inbox-sweep`),
   the retry of failed identity-key removals, and the recovery of stopped
   replicas' work. Each holds a Postgres advisory lock (a leader lease).
   A replica that stops cleanly hands its jobs over when its drain starts,
@@ -1016,11 +1255,13 @@ Things to set:
   so a container that restarts in the same pod, or two replicas given the
   same name, never share an ID. Without the flag the host name is used.
 - **Files under `-data`** are per replica: crash dumps, the price list
-  cache, temporary uploads, and the notes, skills and MemPalace stores.
+  cache, temporary uploads, and the notes and MemPalace stores.
   With several replicas, run `-mempalace=off` (MemPalace keeps its store
   on one replica's disk, so memories written through one replica are
-  missing on the others), and put notes and skills on a shared volume or
-  turn them off (`-notes=off -skills=off`). Keys come from the shared
+  missing on the others), and put notes on a shared volume or turn them
+  off (`-notes=off`). The skills hub needs nothing shared: its copies live
+  in the database, and an activation reaches every replica's catalog
+  within moments. Keys come from the shared
   credentials, not from `-data`.
 - **The first move to v0.1 must stop the old gateway first.** A gateway
   older than v0.1 (no replica support) must never run next to another
@@ -1259,8 +1500,9 @@ probes; every other path is a 404. The main listener never serves
 
 ```bash
 ./toolyard serve -ops-addr 127.0.0.1:9090
-# several addresses, one of them reachable by a scraper on the LAN:
-./toolyard serve -ops-addr 127.0.0.1:9090,10.0.0.5:9090
+# several addresses, one of them the host's private LAN address (in
+# LAN_ADDR), reachable by a scraper on the LAN:
+./toolyard serve -ops-addr "127.0.0.1:9090,$LAN_ADDR:9090"
 ```
 
 - Without `-ops-token-file`, every address must be loopback, private
@@ -1418,7 +1660,7 @@ variables. A production set:
 
 ```bash
 TOOLYARD_PUBLIC_URL=https://toolyard.example.com
-TOOLYARD_TRUSTED_PROXY=10.200.0.0/24   # the proxy's subnet, nothing wider
+TOOLYARD_TRUSTED_PROXY=198.51.100.0/24 # the proxy's subnet, nothing wider
 TOOLYARD_KEYS=require
 TOOLYARD_MIGRATE=off
 TOOLYARD_OPS_ADDR=0.0.0.0:9090

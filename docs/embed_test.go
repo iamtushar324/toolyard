@@ -78,12 +78,12 @@ func TestTyScript(t *testing.T) {
 	if !strings.HasPrefix(TyScript, "#!/usr/bin/env python3\n") {
 		t.Errorf("ty must start with #!/usr/bin/env python3")
 	}
-	for _, cmd := range []string{"run", "status", "resume", "files", "stub", "call"} {
+	for _, cmd := range []string{"run", "status", "resume", "files", "stub", "call", "skills"} {
 		if !strings.Contains(TyScript, `add_parser("`+cmd+`"`) {
 			t.Errorf("ty has no %q subcommand", cmd)
 		}
 	}
-	for _, want := range []string{"TOOLYARD_URL", "TOOLYARD_TOKEN_FILE", "https://toolyard.beknown.live", "Idempotency-Key", "X-Toolyard-Reason", "text/x-starlark"} {
+	for _, want := range []string{"TOOLYARD_URL", "TOOLYARD_TOKEN_FILE", TyServedURLLine, "TOOLYARD_URL is not set", "Idempotency-Key", "X-Toolyard-Reason", "text/x-starlark"} {
 		if !strings.Contains(TyScript, want) {
 			t.Errorf("ty should mention %q", want)
 		}

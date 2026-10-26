@@ -134,6 +134,14 @@ func memberAllowlist() map[string]bool {
 		// A one-time connect link an agent gave the member (the ticket is
 		// the credential; the handler starts only their own sign-in).
 		"GET /v1/connect/link/x", "POST /v1/connect/link/x",
+		// The agent skills listing answers only an agent bearer; a member's
+		// cookie riding along changes nothing.
+		"GET /v1/skills/sources",
+		// The Skills page routes a skill contributor uses; the handlers
+		// refuse every other member and other people's sources
+		// (skillsManagerRoute, skills_sharing_routes.go).
+		"POST /v1/skills/sources", "GET /v1/skills/sources/x", "PATCH /v1/skills/sources/x", "DELETE /v1/skills/sources/x",
+		"GET /v1/skills/admin/me", "GET /v1/skills/admin/people", "GET /v1/skills/admin/sources",
 	} {
 		allowed[mp] = true
 	}
@@ -147,6 +155,11 @@ func memberAllowlist() map[string]bool {
 		"/v1/code/docs/x", "/v1/code/docs/x/y", "/v1/code/search",
 		"/v1/code/openapi.json", "/v1/code/ty",
 		"/v1/jobs", "/v1/jobs/x", "/v1/jobs/x/y",
+		// Agent skills routes; a bundle download's ticket is its own
+		// credential. Of /v1/skills/sources only the GET (the agent
+		// listing) and the POST (a contributor's source), listed above.
+		"/v1/skills/search", "/v1/skills/get", "/v1/skills/read", "/v1/skills/grep", "/v1/skills/list", "/v1/skills/proposal",
+		"/v1/skills/bundle", "/v1/skills/bundle/x",
 	} {
 		for _, m := range guardMethods {
 			allowed[m+" "+p] = true

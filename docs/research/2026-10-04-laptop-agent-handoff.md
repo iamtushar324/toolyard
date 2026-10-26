@@ -29,12 +29,12 @@ Three application commits contain the work:
 
 ## Stage that the user can use
 
-- Stage: <https://toolyard.stage.dev.beknown.live/>.
-- Settings: <https://toolyard.stage.dev.beknown.live/?build=a9aec1f#settings/general>.
-- Health: <https://toolyard.stage.dev.beknown.live/v1/health>.
+- Stage: <https://toolyard-stage.example.com/>.
+- Settings: <https://toolyard-stage.example.com/?build=a9aec1f#settings/general>.
+- Health: <https://toolyard-stage.example.com/v1/health>.
 - Latest handoff check: `ok: true`, `environment: stage`, `version: stage-a9aec1f`, `metrics_dropped: 0`.
-- Server: dev-server-1 (`ip-10-31-39-131`, tailnet `dev-server-1.tailab6257.ts.net`).
-- Server source worktree: `/home/ubuntu/.t3/bkt3-dev/worktrees/toolyard/jakarta`.
+- Server: the build server.
+- Server source worktree: a worktree on the build server.
 - Stage gateway unit: `toolyard-stage.service`.
 - Synthetic connector unit: `toolyard-stage-fixtures.service`.
 - Live unit, outside the authorized stage work: `toolyard-inbox.service`.

@@ -151,9 +151,11 @@ func (s *Server) federationRegister(w http.ResponseWriter, r *http.Request) {
 		}
 		return
 	}
-	// Registration cannot turn a new eligible member into an administrator.
-	u, err := s.identity.UpsertClerkUser(r.Context(), identity.ClerkProfile{ClerkUserID: claims.Subject, Email: member.Email, DisplayName: clerkDisplayName(member), AvatarURL: member.ImageURL}, "")
-	if err != nil || u.Role != identity.RoleAdmin || u.Status != identity.StatusActive {
+	// Registration cannot turn a new eligible member into an administrator
+	// or the owner (NoBootstrap); in personal sign-in only the owner
+	// registers.
+	u, err := s.identity.UpsertClerkUser(r.Context(), identity.ClerkProfile{ClerkUserID: claims.Subject, Email: member.Email, DisplayName: clerkDisplayName(member), AvatarURL: member.ImageURL, NoBootstrap: true}, "")
+	if err != nil || u.Role != identity.RoleAdmin || u.Status != identity.StatusActive || (s.clerkOwnerOnly && !u.Owner) {
 		writeError(w, 403, "admin_required")
 		return
 	}
@@ -372,6 +374,10 @@ func (s *Server) callbackReceiver(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		receiver, err := s.callbacks.Change(r.Context(), a.ID, ref, b.Action, b.Secret, b.ExpectedRevision)
+		if errors.Is(err, callbacks.ErrInvalidChange) {
+			writeError(w, 400, "invalid_change: "+err.Error())
+			return
+		}
 		if err != nil {
 			federationError(w, err)
 			return

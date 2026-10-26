@@ -455,12 +455,18 @@ func (s *Server) HardenAPI(next http.Handler) http.Handler {
 // unbounded data on a small handler.
 func perRouteBodyCap(path string) int64 {
 	switch {
+	case skillWebhookPath(path):
+		return SkillWebhookMaxBytes // 5 MiB: a GitHub push delivery; the handler caps it again
+	case skillAdminPath(path):
+		return skillAdminBodyMax // 64 KiB: a skill source with its excludes and members
 	case path == codeRunPath:
 		return maxCodeRunBody // 4 MiB: a 1 MiB script after JSON escaping, plus the envelope and reason
 	case strings.HasPrefix(path, codePathPrefix):
 		return 8 << 10 // 8 KiB — a resume body; the other code routes are GETs
 	case path == jobsPath:
 		return maxJobStartBody // 4 MiB: a tool call's arguments (POST /v1/jobs)
+	case path == skillsBundlePath:
+		return maxSkillsBundleBody // 64 KiB: skill references and a reason (POST /v1/skills/bundle)
 	case strings.HasPrefix(path, "/v1/tools/run"),
 		strings.HasPrefix(path, "/v1/agents/tools/run"):
 		// The reader allows 4 MiB, but decode() stops JSON bodies at 1 MiB
@@ -520,17 +526,24 @@ func exemptFromCSRFHeader(path string) bool {
 	if mcpOAuthProtocolPath(path) {
 		return true
 	}
-	// Code mode over REST and session tokens are bearer-only (agent or
-	// session token); no cookie is read, so they aren't CSRF-replayable.
-	// This also lifts the Origin check (exemptFromOriginCheck).
+	// Code mode over REST, session tokens, async jobs and the agent skills
+	// routes are bearer-only (agent or session token); no cookie is read,
+	// so they aren't CSRF-replayable. This also lifts the Origin check
+	// (exemptFromOriginCheck).
 	if strings.HasPrefix(path, codePathPrefix) || path == sessionTokensPath || strings.HasPrefix(path, sessionTokensPrefix) ||
-		path == jobsPath || strings.HasPrefix(path, jobsPrefix) {
+		path == jobsPath || strings.HasPrefix(path, jobsPrefix) || skillsAgentPath(path) {
 		return true
 	}
 	// Webhook event ingest is bearer-authenticated (source token); no cookie
 	// or dashboard origin, so the CSRF custom-header check doesn't apply. The
 	// path-token form lives under the /v1/ingest/ subtree.
 	if path == "/v1/ingest" || strings.HasPrefix(path, "/v1/ingest/") {
+		return true
+	}
+	// A skill source's GitHub webhook is authenticated by the
+	// X-Hub-Signature-256 HMAC over its body; the handler reads no cookie,
+	// so it isn't CSRF-replayable. This also lifts the Origin check.
+	if skillWebhookPath(path) {
 		return true
 	}
 	// A connect link's Continue button is a plain browser form: it cannot
@@ -619,6 +632,10 @@ func unauthRouteLimit(path string) *unauthRouteRule {
 		// Memory-webhook ingest (n8n). Same generous per-IP budget; a bad
 		// token still fails auth, this just caps spray on the unauth surface.
 		return &unauthRouteRule{"mem-ingest", 1200, time.Hour}
+	case skillWebhookPath(path):
+		// Skill source webhooks from GitHub. A bad signature still fails;
+		// this caps spray on the unauthenticated surface.
+		return &unauthRouteRule{"skill-webhook", 1200, time.Hour}
 	case strings.HasPrefix(path, MemoryWebhookJobsPrefix):
 		// Async job-status polling (TEC-482). Higher budget than ingest so
 		// once-per-second polling of an in-flight job is comfortable, while
@@ -632,6 +649,10 @@ func unauthRouteLimit(path string) *unauthRouteRule {
 		// Connect links: a person opens a handful per hour at most. The
 		// ticket is 256 random bits, so this caps spray, not guessing.
 		return &unauthRouteRule{"connect-link", 120, time.Hour}
+	case skillsBundleDownloadPath(path):
+		// Skill bundle downloads: the ticket is 256 random bits and works
+		// once, so this caps spray, not guessing.
+		return &unauthRouteRule{"skills-bundle", 600, time.Hour}
 	case path == codeOpenAPIPath, path == codeTyPath:
 		// Code-mode discovery documents need no token: an agent fetches
 		// them once per session at most.

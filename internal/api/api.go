@@ -2,16 +2,17 @@
 //
 // Routes (all under /v1):
 //
-//	POST /v1/auth/setup           one-time create the local user
+//	POST /v1/auth/setup           one-time create the local user (the owner)
 //	POST /v1/auth/login           username + password -> session cookie
 //	POST /v1/auth/clerk/session   Clerk session JWT -> session cookie
 //	GET  /v1/auth/config          which sign-in methods are on (public)
 //	POST /v1/connect/t3           bkt3: Clerk session JWT -> the person's agent token
 //	POST /v1/auth/logout
-//	GET  /v1/auth/me              current user, with role
+//	GET  /v1/auth/me              current user, with role and is_owner
 //
 //	GET  /v1/users                admin: every user + grantable groups
 //	PATCH /v1/users/{id}          admin: role / status / servers
+//	POST /v1/users/{id}/make-owner      the owner: transfer ownership
 //	POST /v1/users/{id}/revoke-sessions
 //	GET  /v1/me/servers           groups the caller may use
 //	GET  /v1/me/connections       per_user servers the caller may connect, with state
@@ -41,6 +42,7 @@
 //
 //	POST /v1/agents/session-tokens          agent: mint a session token
 //	POST /v1/code/run                       code mode over REST (code_routes.go)
+//	/v1/skills/sources/*                    admin: skills hub sources (skills_admin_routes.go)
 package api
 
 import (
@@ -52,6 +54,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/golang-jwt/jwt/v5"
@@ -88,7 +91,7 @@ import (
 	"github.com/tusharbhardwaj/toolyard/internal/realtime"
 	"github.com/tusharbhardwaj/toolyard/internal/secrets"
 	"github.com/tusharbhardwaj/toolyard/internal/settings"
-	"github.com/tusharbhardwaj/toolyard/internal/skills"
+	"github.com/tusharbhardwaj/toolyard/internal/skillhub"
 	"github.com/tusharbhardwaj/toolyard/internal/upstreams"
 	"github.com/tusharbhardwaj/toolyard/internal/usage"
 	"github.com/tusharbhardwaj/toolyard/internal/voice"
@@ -137,7 +140,6 @@ type Server struct {
 	identityKeys    *identitykeys.Service
 	guide           *inbox.Guide
 	notes           *notes.Service
-	skills          *skills.Service
 	voice           *voice.Service
 	secrets         *secrets.Service
 	chatTelegram    ChatTelegram
@@ -162,6 +164,10 @@ type Server struct {
 	clerkFrontendAPI    string
 	ownerEmail          string
 	clerkOwnerOnly      bool
+	// clerkOwnerKept holds the ids of departed owners the offboarding sync
+	// left active because nobody else is an active admin, audited once per
+	// process (clerk_sync.go).
+	clerkOwnerKept sync.Map
 	// connect is POST /v1/connect/t3 (connect_routes.go); nil = off.
 	connect *connectConfig
 	// probes answers /v1/livez and /v1/readyz (and their aliases).
@@ -172,6 +178,12 @@ type Server struct {
 	// jobs backs the async job routes (/v1/jobs, jobs_routes.go); nil
 	// answers 503.
 	jobs *jobs.Service
+	// skillsAdmin backs the skills hub admin routes
+	// (skills_admin_routes.go); nil answers 404 "skills hub is off".
+	// skillReviews closes open Inbox review items after a decision on the
+	// Skills page; optional.
+	skillsAdmin  skillhub.Admin
+	skillReviews SkillReviewSettler
 }
 
 type Options struct {
@@ -206,11 +218,6 @@ type Options struct {
 	// background MemPalace sync. The Service itself nil-checks so an
 	// unwired install just returns 503 from the routes.
 	Notes *notes.Service
-	// Skills, when set, holds the centralised Claude Code skills workspace
-	// + background MemPalace sync. No /v1/skills/* HTTP routes in v1 —
-	// the field is present so the dashboard can consume snapshots later
-	// without another Options refactor.
-	Skills *skills.Service
 	// Voice, when set, enables /v1/voice/* — the dashboard "live call"
 	// panel. Requires GEMINI_API_KEY to be wired into the voice.Service
 	// itself; the api layer just gates auth and reverse-checks
@@ -254,6 +261,8 @@ type Options struct {
 	// OwnerEmail: the first Clerk sign-in with this email (case-insensitive)
 	// attaches to the existing primary password user instead of creating a
 	// new member, so the owner keeps their admin role, agents and passkeys.
+	// On an install without an owner, it names who may claim the role; it
+	// only seeds the owner (identity/owner.go).
 	OwnerEmail     string
 	ClerkOwnerOnly bool
 	// ConnectAZP (-connect-azp) lists the bkt3 browser origins whose Clerk
@@ -269,6 +278,14 @@ type Options struct {
 	// Jobs backs async tool jobs over REST (/v1/jobs). Optional; without
 	// it the job routes answer 503.
 	Jobs *jobs.Service
+	// SkillsAdmin backs the skills hub admin routes (/v1/skills/sources/*,
+	// POST /v1/skills/sources, /v1/skills/admin/sources). nil answers 404
+	// "skills hub is off". Pass a nil interface, not a typed nil pointer.
+	SkillsAdmin skillhub.Admin
+	// SkillReviews closes the open Inbox review item of a version an admin
+	// activated or rejected on the Skills page (skillhub.ReviewInbox).
+	// Optional.
+	SkillReviews SkillReviewSettler
 }
 
 func New(ctx context.Context, opts Options) *Server {
@@ -293,7 +310,6 @@ func New(ctx context.Context, opts Options) *Server {
 		hooks:           opts.Hooks,
 		mempalace:       opts.Mempalace,
 		notes:           opts.Notes,
-		skills:          opts.Skills,
 		voice:           opts.Voice,
 		secrets:         opts.Secrets,
 		chatTelegram:    opts.ChatTelegram,
@@ -314,6 +330,8 @@ func New(ctx context.Context, opts Options) *Server {
 		clerkOwnerOnly:  opts.ClerkOwnerOnly,
 		codeRuns:        opts.CodeRuns,
 		jobs:            opts.Jobs,
+		skillsAdmin:     opts.SkillsAdmin,
+		skillReviews:    opts.SkillReviews,
 	}
 	if s.webhookMaxBytes <= 0 {
 		s.webhookMaxBytes = DefaultWebhookMaxBytes
@@ -332,6 +350,8 @@ func New(ctx context.Context, opts Options) *Server {
 	}
 	s.federation, s.callbacks = opts.Federation, opts.Callbacks
 	if s.federation != nil {
+		// Personal sign-in: a federated sign-in counts only for the owner.
+		s.federation.OwnerOnly = opts.ClerkOwnerOnly
 		s.federation.Membership = func(ctx context.Context, subject string) (federation.Profile, error) {
 			if s.clerk == nil {
 				return federation.Profile{}, federation.ErrUnavailable
@@ -480,6 +500,12 @@ func (s *Server) Routes(mux *http.ServeMux) {
 	s.registerSessionTokenRoutes(mux)
 	s.registerCodeRoutes(mux)
 	s.registerJobsRoutes(mux)
+	// skillhub: the agent routes (slice B) and the admin routes (slice C)
+	// share /v1/skills/sources: B registers the plain path (an agent's
+	// GET), C the more specific method pattern POST /v1/skills/sources
+	// (create) and the /v1/skills/sources/ subtree.
+	s.registerSkillsRoutes(mux)
+	s.registerSkillsAdminRoutes(mux)
 }
 
 // ---- helpers ----------------------------------------------------------------
@@ -683,7 +709,9 @@ func (s *Server) sessionUser(r *http.Request) (*identity.User, bool) {
 		return nil, false
 	}
 	u, err := s.identity.GetUserByID(r.Context(), id)
-	if err != nil || u.Status != identity.StatusActive || (s.clerkOwnerOnly && (u.Auth != identity.AuthClerk || !strings.EqualFold(u.Email, s.ownerEmail))) {
+	// Personal sign-in (-clerk-owner-only): only the owner's Google
+	// session counts, so a transfer ends the previous owner's sessions.
+	if err != nil || u.Status != identity.StatusActive || (s.clerkOwnerOnly && (u.Auth != identity.AuthClerk || !u.Owner)) {
 		return nil, false
 	}
 	return u, true
@@ -742,7 +770,9 @@ func (s *Server) authSetup(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
 	}
-	u, err := s.identity.CreateUser(r.Context(), body.Username, body.Password)
+	// The first account is the owner and an admin; both automatic changes
+	// are audited as the setup, in the same transaction as the insert.
+	u, err := s.identity.CreateUserAs(r.Context(), body.Username, body.Password, identity.ActorSetup)
 	if errors.Is(err, identity.ErrUserExists) {
 		writeError(w, http.StatusConflict, "user already configured")
 		return
@@ -1241,9 +1271,15 @@ func (s *Server) approvalsDecideByToken(w http.ResponseWriter, r *http.Request) 
 	if u, ok := s.sessionUser(r); ok {
 		decider = s.dashboardDecider(r, u, actor.ViaPushToken)
 	} else if recipient != "" {
-		if u, err := s.identity.GetUserByID(r.Context(), recipient); err == nil {
-			decider.Email, decider.Name = u.Email, u.Label()
+		// A tap needs no session: it counts only while the person the
+		// token was minted for is still active (a blocked owner who left
+		// the organisation keeps old notifications).
+		u, err := s.identity.GetUserByID(r.Context(), recipient)
+		if err != nil || u.Status != identity.StatusActive {
+			writeError(w, http.StatusForbidden, "blocked")
+			return
 		}
+		decider.Email, decider.Name = u.Email, u.Label()
 	}
 	req, err := s.approval.DecideAs(r.Context(), id, body.Action, decider)
 	if err != nil {
