@@ -348,26 +348,35 @@ UI in `app.js`.
    is bound to a version: its input keeps the commit, the waiting version
    ID (none for the dry run of a new or changed source) and the settings
    digest (`configHash`); it is current for a waiting version it names, or
-   whose commit and settings it shows. Every ask runs in
-   `lockedApproval`: one transaction that holds the source's row, reads
-   the source, its waiting version and its open questions again, and
-   inserts only what still holds, so a caller's outdated source or
-   version (a sync that read it before a settings change) asks nothing,
-   a dry run of settings the source no longer has asks nothing, the card
-   shows the source as locked, and two askers on any replica never both
-   add one. At every check the hook's
+   whose commit and settings it shows. The version a question is about is
+   the waiting one, else the live one an admin made live while the source
+   waits (`approvalSubject`). Every ask runs in `lockedApproval`: one
+   transaction that holds the source's row, reads the source, its waiting
+   and live versions and its open questions again, and inserts only what
+   still holds, so a caller's outdated source or version (a sync that read
+   it before a settings change) asks nothing, a dry run of a branch,
+   pinned commit or settings the source no longer has asks nothing, the
+   card shows the source as locked, and two askers on any replica never
+   both add one. A new question records its Inbox item only while it is
+   still pending (`setInboxIfPending`); one closed meanwhile has its item
+   withdrawn, and `closeProposalRows` reads the item of a row it read
+   before the item was recorded. At every check the hook's
    `ApprovalHook.PendingApprovalVersion` keeps one open question that is
    current for the waiting version: it asks a new one first and then
    closes the others, closes leftovers next to a current one, asks when
    none is open (the first ask failed, it expired), and waits while an
-   answer is being applied. An answer refused for its version asks again
-   for the waiting version (none, or one built with old settings: the sync
-   that stages the current one asks).
+   answer is being applied; a check that finds the live version at the
+   head with nothing waiting does the same for it. An answer refused for
+   its version asks again for the waiting version, else the live one
+   (none, or one built with old settings: the sync that stages the
+   current one asks; a settings change makes that check due).
    An approval goes through `DecideApprovalFrom(..., from, ...,
    binding)`: only a waiting (or live) version that matches the binding
    goes live (before the approval is stored), else `ErrConflict`: a
    waiting version of an automatic or pinned source that does not match,
-   a live version that does not, or an automatic or pinned source with
+   a live version that does not, a live version of an automatic or pinned
+   source built with older settings (nothing waiting: its next sync would
+   make the current settings live), or an automatic or pinned source with
    nothing synced. The Inbox binds to the question's commit, version and
    settings digest, with `from` = `ApprovalPending`, so a card never
    approves a version built with other settings and a late answer never
@@ -375,10 +384,11 @@ UI in `app.js`.
    cancelled). The source page (`POST .../approval`) binds to the version
    the page showed, `sha` and `version_id` (the dashboard sends the
    waiting version's, else the live one's), with `from` = the state the
-   request read; without `version_id` (an API client) to the commit with
-   the source's current settings. A refused page
-   approval leaves the source its open question, or asks one about the
-   waiting version. The approval is stored only while the live and
+   request read; without `version_id` (an API client) to the commit (for
+   an automatic or pinned source, the version that goes live must have the
+   source's current settings). A refused
+   page approval leaves the source its open question, or asks one about
+   the waiting (else live) version. The approval is stored only while the live and
    waiting versions are the ones checked.
 4. **At most three waiting sources per contributor.** `CreateSource`
    counts and inserts under `cluster.LockCtx(ctx,
