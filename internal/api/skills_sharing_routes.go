@@ -73,10 +73,11 @@ type skillApprovals interface {
 }
 
 func (s *Server) registerSkillsSharingRoutes(mux *http.ServeMux) {
-	mux.HandleFunc(skillMePath, s.skillMe)
-	mux.HandleFunc(skillPeoplePath, s.skillPeople)
-	mux.HandleFunc(skillContributorsPath, s.skillContributors)
-	mux.HandleFunc(skillContributorsPrefix, s.skillContributor)
+	// Literal paths: the route tests read them from the source.
+	mux.HandleFunc("/v1/skills/admin/me", s.skillMe)
+	mux.HandleFunc("/v1/skills/admin/people", s.skillPeople)
+	mux.HandleFunc("/v1/skills/admin/contributors", s.skillContributors)
+	mux.HandleFunc("/v1/skills/admin/contributors/", s.skillContributor)
 }
 
 // skillContributorAdmin is the contributors store, or nil when the hub has
