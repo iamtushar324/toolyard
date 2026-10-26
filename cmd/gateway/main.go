@@ -1308,6 +1308,9 @@ func runServe(argv []string) error {
 			Cluster:  clusterSvc,
 			Cipher:   secretsCipher,
 			Settings: settingsSvc,
+			// The skills compiled into toolyard, served as the read-only
+			// source "toolyard" (docs/skills-hub.md#built-in-skills).
+			BuiltinSkills: true,
 		})
 		if err != nil {
 			return fmt.Errorf("skills hub: %w", err)
@@ -1525,6 +1528,7 @@ func runServe(argv []string) error {
 			Proposals: skillHubProposals, // slice C's SourceProposals
 			Tickets:   gateway.NewSkillBundleTickets(db),
 			OnHost:    federationSvc.OnHost,
+			Guide:     skillhubSvc.BuiltinGuide(),
 		})
 		// skillhub (slice A): the leader checks each source on its own
 		// schedule (skills-sync). Started after SetReviewHook above, so a
