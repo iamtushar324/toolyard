@@ -446,16 +446,80 @@ func (s *Service) seal(secret string, aad []byte) (string, error) {
 	return sealed, nil
 }
 
+// maxUpdateAttempts bounds UpdateSource's read-modify-write rounds when
+// other writes (a sync's activation, a sharing change) move the source in
+// between.
+const maxUpdateAttempts = 5
+
+// updateGuard is the part of a source the caller of UpdateSource decided
+// on (who may change what, which open questions to close): a round after a
+// write in between goes on only while it is unchanged.
+type updateGuard struct {
+	approval     Approval
+	hidden       bool
+	mode         UpdateMode
+	branch, path string
+	pinned       string
+	auth         AuthMode
+}
+
+func guardOf(r *sourceRow) updateGuard {
+	return updateGuard{approval: r.Approval, hidden: r.Hidden, mode: r.Mode, branch: r.Branch, path: r.Path, pinned: r.PinnedSHA, auth: r.Auth}
+}
+
 // UpdateSource changes a source's settings. A change to what is fetched
 // (branch, folder, excludes, limits, mode, pinned commit, credential)
 // makes its next check due at once.
+//
+// Only the fields the update names are written (the hide lock, for one,
+// changes only when the update names it: the admin hide path), and only
+// while the source is still as read (its updated_at); a write in between
+// makes it read again, at most maxUpdateAttempts times. When the approval,
+// the hide lock, the mode, what is fetched or the credential changed in
+// between, it answers ErrConflict instead: the caller's checks read the
+// old source.
 func (s *Service) UpdateSource(ctx context.Context, by, id string, up SourceUpdate) (*Source, error) {
-	r, err := s.getSourceRow(ctx, s.db, id)
-	if err != nil {
-		return nil, err
+	var first *updateGuard
+	due := false
+	for attempt := 1; ; attempt++ {
+		r, err := s.getSourceRow(ctx, s.db, id)
+		if err != nil {
+			return nil, err
+		}
+		g := guardOf(r)
+		switch {
+		case first == nil:
+			first = &g
+		case g != *first:
+			return nil, fmt.Errorf("%w: source %s changed meanwhile (its approval, hide lock, mode, branch, folder or credential); look again and retry", ErrConflict, r.Slug)
+		}
+		read := r.UpdatedAt.UnixMilli()
+		if due, err = s.applyUpdate(r, up); err != nil {
+			return nil, err
+		}
+		ok, err := s.updateSourceSettings(ctx, r, up, read, due)
+		if err != nil {
+			return nil, err
+		}
+		if ok {
+			break
+		}
+		if attempt == maxUpdateAttempts {
+			return nil, fmt.Errorf("%w: source %s keeps changing; try again", ErrConflict, r.Slug)
+		}
 	}
+	s.changed(ctx, id)
+	if due {
+		s.pokePoller()
+	}
+	return s.GetSource(ctx, id)
+}
+
+// applyUpdate applies an update to r as read and validates the result. It
+// reports whether what is fetched changed (the next check is due at once).
+func (s *Service) applyUpdate(r *sourceRow, up SourceUpdate) (bool, error) {
 	if err := refuseBuiltinUpdate(r, up); err != nil {
-		return nil, err
+		return false, err
 	}
 	due := false
 	set := func(dst *string, v *string) {
@@ -468,7 +532,7 @@ func (s *Service) UpdateSource(ctx context.Context, by, id string, up SourceUpda
 	if up.Path != nil {
 		p, err := cleanFolder(*up.Path)
 		if err != nil {
-			return nil, err
+			return false, err
 		}
 		due = due || p != r.Path
 		r.Path = p
@@ -476,7 +540,7 @@ func (s *Service) UpdateSource(ctx context.Context, by, id string, up SourceUpda
 	if up.Exclude != nil {
 		ex, err := validateGlobs(*up.Exclude)
 		if err != nil {
-			return nil, err
+			return false, err
 		}
 		r.Exclude, due = ex, true
 	}
@@ -492,7 +556,7 @@ func (s *Service) UpdateSource(ctx context.Context, by, id string, up SourceUpda
 		r.Limits, due = *up.Limits, true
 	}
 	if err := s.updateCredential(r, up, &due); err != nil {
-		return nil, err
+		return false, err
 	}
 	if up.PollSeconds != nil {
 		r.PollSeconds = *up.PollSeconds
@@ -517,19 +581,12 @@ func (s *Service) UpdateSource(ctx context.Context, by, id string, up SourceUpda
 		r.DefaultRuns = *up.DefaultRuns
 	}
 	if r.Branch == "" {
-		return nil, fmt.Errorf("%w: a branch is required", ErrInvalid)
+		return false, fmt.Errorf("%w: a branch is required", ErrInvalid)
 	}
 	if err := normalizeSource(r); err != nil {
-		return nil, err
+		return false, err
 	}
-	if err := s.updateSourceSettings(ctx, r, due); err != nil {
-		return nil, err
-	}
-	s.changed(ctx, id)
-	if due {
-		s.pokePoller()
-	}
-	return s.GetSource(ctx, id)
+	return due, nil
 }
 
 // updateCredential applies an update's auth and token fields.
@@ -793,8 +850,9 @@ func (s *Service) SetRuns(ctx context.Context, by, id, skillPath string, runs Ru
 	if err != nil {
 		return fmt.Errorf("skillhub: set runs: %w", err)
 	}
-	// The source's updated_at tells every node's index to reload it.
-	if _, err := tx.ExecContext(ctx, `UPDATE skill_sources SET updated_at = ? WHERE id = ?`, max(now, r.UpdatedAt.UnixMilli()+1), id); err != nil {
+	// The source's updated_at tells every node's index to reload it; it
+	// always moves forward, even past a write made after r was read.
+	if _, err := tx.ExecContext(ctx, `UPDATE skill_sources SET updated_at = `+bumpUpdatedAt+` WHERE id = ?`, now, now, id); err != nil {
 		return fmt.Errorf("skillhub: set runs: %w", err)
 	}
 	if err := tx.Commit(); err != nil {

@@ -154,35 +154,57 @@ func (s *Service) insertSource(ctx context.Context, r *sourceRow) error {
 	return err
 }
 
-// updateSourceSettings stores a changed source's settings. due makes its
-// next check due now and forgets the branch head it saw.
-func (s *Service) updateSourceSettings(ctx context.Context, r *sourceRow, due bool) error {
-	exclude, _ := json.Marshal(nonNil(r.Exclude))
-	members, _ := json.Marshal(nonNil(r.Members))
-	blocked, _ := json.Marshal(nonNil(r.Blocked))
-	limits, _ := json.Marshal(r.Limits)
-	// updated_at always moves, so every node's index sees the change.
-	now := max(s.now().UnixMilli(), r.UpdatedAt.UnixMilli()+1)
-	q := `UPDATE skill_sources SET branch = ?, path = ?, exclude_json = ?, mode = ?, pinned_sha = ?, auth = ?,
-		token_sealed = ?, poll_seconds = ?, enabled = ?, visibility = ?, members_json = ?, default_runs = ?,
-		limits_json = ?, blocked_json = ?, hidden = ?, updated_at = ?`
-	args := []any{r.Branch, r.Path, string(exclude), string(r.Mode), r.PinnedSHA, string(r.Auth),
-		r.tokenSealed, int64(r.PollSeconds), boolInt(r.Enabled), string(r.Visibility), string(members), string(r.DefaultRuns),
-		string(limits), string(blocked), boolInt(r.Hidden), now}
+// updateSourceSettings stores the settings of r that up names, and only
+// those: a setting the update does not name keeps what another write put
+// there (the hide lock changes only when the update names it). It writes
+// only while the source's updated_at is still read, the value r was read
+// with, and reports false when it moved (another write came in between;
+// the caller reads again) or the source is gone (the next read says so).
+// updated_at moves forward with bumpUpdatedAt, so every node's index sees
+// the change. due makes the next check due now and forgets the branch
+// head it saw.
+func (s *Service) updateSourceSettings(ctx context.Context, r *sourceRow, up SourceUpdate, read int64, due bool) (bool, error) {
+	var sets []string
+	var args []any
+	set := func(named bool, col string, v any) {
+		if named {
+			sets = append(sets, col+" = ?")
+			args = append(args, v)
+		}
+	}
+	jsonOf := func(v any) string {
+		b, _ := json.Marshal(v)
+		return string(b)
+	}
+	cred := up.Auth != nil || up.Token != nil || up.ClearToken
+	set(up.Branch != nil, "branch", r.Branch)
+	set(up.Path != nil, "path", r.Path)
+	set(up.Exclude != nil, "exclude_json", jsonOf(nonNil(r.Exclude)))
+	set(up.Mode != nil, "mode", string(r.Mode))
+	set(up.PinnedSHA != nil, "pinned_sha", r.PinnedSHA)
+	set(up.Limits != nil, "limits_json", jsonOf(r.Limits))
+	set(cred, "auth", string(r.Auth))
+	set(cred, "token_sealed", r.tokenSealed)
+	set(up.PollSeconds != nil, "poll_seconds", int64(r.PollSeconds))
+	set(up.Enabled != nil, "enabled", boolInt(r.Enabled))
+	set(up.Visibility != nil, "visibility", string(r.Visibility))
+	set(up.Members != nil, "members_json", jsonOf(nonNil(r.Members)))
+	set(up.Blocked != nil, "blocked_json", jsonOf(nonNil(r.Blocked)))
+	set(up.Hidden != nil, "hidden", boolInt(r.Hidden))
+	set(up.DefaultRuns != nil, "default_runs", string(r.DefaultRuns))
+	now := s.now().UnixMilli()
 	if due {
-		q += `, next_check_at = ?, head_sha = '', head_etag = '', failures = 0`
+		sets = append(sets, "next_check_at = ?", "head_sha = ''", "head_etag = ''", "failures = 0")
 		args = append(args, now)
 	}
-	q += ` WHERE id = ?`
-	args = append(args, r.ID)
-	res, err := s.db.ExecContext(ctx, q, args...)
+	sets = append(sets, "updated_at = "+bumpUpdatedAt)
+	args = append(args, now, now, r.ID, read)
+	res, err := s.db.ExecContext(ctx, `UPDATE skill_sources SET `+strings.Join(sets, ", ")+` WHERE id = ? AND updated_at = ?`, args...)
 	if err != nil {
-		return fmt.Errorf("skillhub: update source %s: %w", r.ID, err)
+		return false, fmt.Errorf("skillhub: update source %s: %w", r.ID, err)
 	}
-	if n, _ := res.RowsAffected(); n == 0 {
-		return fmt.Errorf("%w: source %s", ErrNotFound, r.ID)
-	}
-	return nil
+	n, _ := res.RowsAffected()
+	return n > 0, nil
 }
 
 func nonNil(xs []string) []string {
