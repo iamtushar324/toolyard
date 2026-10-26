@@ -455,16 +455,20 @@ const maxUpdateAttempts = 5
 // on (who may change what, which open questions to close): a round after a
 // write in between goes on only while it is unchanged.
 type updateGuard struct {
-	approval     Approval
-	hidden       bool
-	mode         UpdateMode
-	branch, path string
-	pinned       string
-	auth         AuthMode
+	approval             Approval
+	hidden, enabled      bool
+	mode                 UpdateMode
+	branch, path, pinned string
+	exclude, limits      string
+	auth                 AuthMode
+	token                string // sealed
 }
 
 func guardOf(r *sourceRow) updateGuard {
-	return updateGuard{approval: r.Approval, hidden: r.Hidden, mode: r.Mode, branch: r.Branch, path: r.Path, pinned: r.PinnedSHA, auth: r.Auth}
+	ex, _ := json.Marshal(nonNil(r.Exclude))
+	lim, _ := json.Marshal(r.Limits)
+	return updateGuard{approval: r.Approval, hidden: r.Hidden, enabled: r.Enabled, mode: r.Mode, branch: r.Branch, path: r.Path,
+		pinned: r.PinnedSHA, exclude: string(ex), limits: string(lim), auth: r.Auth, token: r.tokenSealed}
 }
 
 // UpdateSource changes a source's settings. A change to what is fetched
@@ -475,9 +479,11 @@ func guardOf(r *sourceRow) updateGuard {
 // changes only when the update names it: the admin hide path), and only
 // while the source is still as read (its updated_at); a write in between
 // makes it read again, at most maxUpdateAttempts times. When the approval,
-// the hide lock, the mode, what is fetched or the credential changed in
-// between, it answers ErrConflict instead: the caller's checks read the
-// old source.
+// the hide lock, the paused state, the mode, what is fetched (branch,
+// folder, excludes, pinned commit, limits) or the credential (read access,
+// token) changed in between, it answers ErrConflict instead: the caller's
+// checks read the old source. With up.IfUpdatedAt set, the first read must
+// be the source the caller checked (that updated_at), else ErrConflict.
 func (s *Service) UpdateSource(ctx context.Context, by, id string, up SourceUpdate) (*Source, error) {
 	var first *updateGuard
 	due := false
@@ -488,10 +494,12 @@ func (s *Service) UpdateSource(ctx context.Context, by, id string, up SourceUpda
 		}
 		g := guardOf(r)
 		switch {
+		case first == nil && !up.IfUpdatedAt.IsZero() && r.UpdatedAt.UnixMilli() != up.IfUpdatedAt.UnixMilli():
+			return nil, fmt.Errorf("%w: source %s changed since it was read; look again and retry", ErrConflict, r.Slug)
 		case first == nil:
 			first = &g
 		case g != *first:
-			return nil, fmt.Errorf("%w: source %s changed meanwhile (its approval, hide lock, mode, branch, folder or credential); look again and retry", ErrConflict, r.Slug)
+			return nil, fmt.Errorf("%w: source %s changed meanwhile (its approval, hide lock, paused state, mode, what it fetches or its credential); look again and retry", ErrConflict, r.Slug)
 		}
 		read := r.UpdatedAt.UnixMilli()
 		if due, err = s.applyUpdate(r, up); err != nil {

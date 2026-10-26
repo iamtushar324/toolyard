@@ -545,6 +545,10 @@ func (s *Server) skillSource(w http.ResponseWriter, r *http.Request, m *skillMan
 		if s.refuseContributorUpdate(w, r, m, before, &in) {
 			return
 		}
+		// The checks above read before: the update applies only to that
+		// source (409 when it changed since, for example an admin rejected
+		// it or changed its mode meanwhile).
+		in.IfUpdatedAt = before.UpdatedAt
 		src, err := s.skillsAdmin.UpdateSource(r.Context(), u.ID, id, in)
 		if err != nil {
 			writeSkillAdminError(w, err, skillAdminDeref(in.Token))

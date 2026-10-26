@@ -235,6 +235,11 @@ type SourceUpdate struct {
 	Hidden      *bool       `json:"hidden,omitempty"` // admins only (the API refuses it from anyone else)
 	DefaultRuns *Runs       `json:"default_runs,omitempty"`
 	Limits      *Limits     `json:"limits,omitempty"`
+	// IfUpdatedAt, when set, is the updated_at of the source the caller
+	// checked this update against (who may change what): UpdateSource
+	// refuses with ErrConflict when the source changed since. It is never
+	// read from JSON: the API sets it from the source it read.
+	IfUpdatedAt time.Time `json:"-"`
 }
 
 // RepoRef is a parsed GitHub URL.

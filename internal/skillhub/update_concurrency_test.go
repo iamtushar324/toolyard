@@ -65,3 +65,66 @@ func TestUpdateSourceKeepsAConcurrentHide(t *testing.T) {
 		t.Fatalf("update of a deleted source: %v", err)
 	}
 }
+
+// An update checked against an older read of the source (the API's
+// before) is refused when the source changed since that read: an admin's
+// rejection in between is never undone by a contributor's
+// {"enabled": true}.
+func TestUpdateSourceChecksTheCallersRead(t *testing.T) {
+	gh := newFakeGitHub(t, "acme", "skills")
+	gh.commit("main", baseTree())
+	svc := newTestService(t, gh)
+	ctx := context.Background()
+	src, err := svc.CreateSource(ctx, "usr_contrib", SourceInput{URL: "acme/skills", Path: "skills", Mode: ModeReview, PendingApproval: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	before, err := svc.GetSource(ctx, src.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.DecideApproval(ctx, "usr_admin", src.ID, false, "not ours", ""); err != nil {
+		t.Fatal(err)
+	}
+	on := true
+	if _, err := svc.UpdateSource(ctx, "usr_contrib", src.ID, SourceUpdate{Enabled: &on, IfUpdatedAt: before.UpdatedAt}); !errors.Is(err, ErrConflict) {
+		t.Fatalf("an update checked against the read before the rejection: %v", err)
+	}
+	if got, _ := svc.GetSource(ctx, src.ID); got.Enabled || got.Approval != ApprovalRejected {
+		t.Fatalf("a rejected source was turned on: %+v", got)
+	}
+	cur, err := svc.GetSource(ctx, src.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	poll := 900
+	if got, err := svc.UpdateSource(ctx, "usr_admin", src.ID, SourceUpdate{PollSeconds: &poll, IfUpdatedAt: cur.UpdatedAt}); err != nil || got.PollSeconds != poll {
+		t.Fatalf("an update checked against the current read: %+v %v", got, err)
+	}
+}
+
+// The guard of a retried update covers the credential (read access and
+// token), what is fetched (excludes, limits) and the paused state, as well
+// as the approval.
+func TestUpdateGuardCoversTheCredentialAndWhatIsFetched(t *testing.T) {
+	base := sourceRow{Source: Source{Mode: ModeReview, Branch: "main", Path: "skills", Auth: AuthToken}, tokenSealed: "sealed-1"}
+	g := guardOf(&base)
+	for name, change := range map[string]func(r *sourceRow){
+		"token":    func(r *sourceRow) { r.tokenSealed = "sealed-2" },
+		"auth":     func(r *sourceRow) { r.Auth = AuthGitHub },
+		"exclude":  func(r *sourceRow) { r.Exclude = []string{"*.tmp"} },
+		"limits":   func(r *sourceRow) { r.Limits.MaxSkills = 5 },
+		"enabled":  func(r *sourceRow) { r.Enabled = true },
+		"approval": func(r *sourceRow) { r.Approval = ApprovalRejected },
+		"hidden":   func(r *sourceRow) { r.Hidden = true },
+	} {
+		r := base
+		change(&r)
+		if guardOf(&r) == g {
+			t.Errorf("a change of %s passes the guard", name)
+		}
+	}
+	if same := base; guardOf(&same) != g {
+		t.Fatal("an unchanged source fails the guard")
+	}
+}

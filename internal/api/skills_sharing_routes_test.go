@@ -34,8 +34,12 @@ var (
 	_ skillhub.ContributorsAdmin = (*skillsSharingFake)(nil)
 )
 
+// skillsFakeUpdatedAt is every fake source's updated_at.
+var skillsFakeUpdatedAt = time.Unix(1_800_000_000, 0).UTC()
+
 func (f *skillsSharingFake) source(id string) *skillhub.Source {
 	src := skillsTestSource(id)
+	src.UpdatedAt = skillsFakeUpdatedAt
 	f.smu.Lock()
 	defer f.smu.Unlock()
 	if o, ok := f.owners[id]; ok {
@@ -805,5 +809,22 @@ func TestSkillContributorDoesNotOwnSourcesAddedAsAdmin(t *testing.T) {
 	}
 	if rec := e.do(t, e.contribCk, http.MethodGet, "/v1/skills/sources/src_mine", ""); rec.Code != http.StatusOK {
 		t.Fatalf("contributor reads their own source: %d %s", rec.Code, rec.Body.String())
+	}
+}
+
+// A PATCH applies only to the source its checks read: the handler passes
+// that read's updated_at, so the engine refuses (409, ErrConflict) a
+// source that changed since, for example one an admin rejected meanwhile
+// (TestUpdateSourceChecksTheCallersRead in skillhub).
+func TestSkillSourcePatchIsBoundToItsRead(t *testing.T) {
+	e := newSkillsSharingEnv(t)
+	if rec := e.do(t, e.contribCk, http.MethodPatch, "/v1/skills/sources/src_mine", `{"visibility":"nobody"}`); rec.Code != http.StatusOK {
+		t.Fatalf("patch: %d %s", rec.Code, rec.Body.String())
+	}
+	e.fake.mu.Lock()
+	upd := e.fake.lastUpdate
+	e.fake.mu.Unlock()
+	if !upd.IfUpdatedAt.Equal(skillsFakeUpdatedAt) {
+		t.Fatalf("the update is not bound to the source it was checked against: %v", upd.IfUpdatedAt)
 	}
 }
