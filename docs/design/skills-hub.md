@@ -334,11 +334,23 @@ UI in `app.js`.
    create); inspect without a token is `InspectAnonymous`; a stored
    source of a contributor reads through `clientFor`, which is anonymous
    for any source with an approval state and no credential of its own
-   (sync now, webhook and scheduled syncs, `PreviewSource`).
+   (sync now, webhook and scheduled syncs, `PreviewSource`). A
+   contributor manages only sources with an approval state
+   (`skillManager.owns`, on every source route and the list): a source
+   they added while an admin (`ApprovalNone`, read with the default token,
+   no approval) stays admin-managed after they lose the role.
 3. **Approval is bound to a commit.** While a contributor's source is
    not approved, a sync stages every new version (as review mode) and
-   never activates one; the hook's `ApprovalHook.PendingApprovalVersion`
-   asks the open approval question again when it shows another commit.
+   never activates one; a staged version found again for the source's
+   commit and settings (the folder went A, B, A) becomes the waiting
+   version again. At every check the hook's
+   `ApprovalHook.PendingApprovalVersion` keeps one open approval question
+   for the waiting commit: it asks a new one first and then closes one
+   that shows another commit, asks when none is open (the first ask
+   failed, it expired), and waits while an answer is being applied. An
+   answer refused for its commit asks again for the waiting commit. Asks
+   are idempotent across replicas (`insertIfNoneOpen` counts and inserts
+   under the source's row lock).
    `DecideApproval(approve, sha)` makes the waiting version at `sha`
    live (before the approval is stored), and refuses with `ErrConflict`
    when another commit would go live: a waiting version of an automatic
@@ -357,8 +369,12 @@ UI in `app.js`.
    names (the hide lock changes only through the admin hide path), only
    while `updated_at` is still the value it read, and moves `updated_at`
    with `bumpUpdatedAt`; a write in between makes it read again (at most
-   five rounds), and a change of the approval, hide lock, mode, branch,
-   folder or credential in between answers `ErrConflict`.
+   five rounds), and a change of the approval, hide lock, paused state,
+   mode, branch, folder, excludes, pinned commit, limits, read access or
+   token in between answers `ErrConflict`. The API passes the `updated_at`
+   of the source its checks read (`SourceUpdate.IfUpdatedAt`): a source
+   that changed since is `ErrConflict` too, so a check never applies to a
+   newer source.
 
 ## E. Integration (orchestrator)
 

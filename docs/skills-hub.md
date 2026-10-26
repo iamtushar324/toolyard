@@ -165,24 +165,31 @@ setting before and after (`skills.source_sharing`, `skills.skill_sharing`).
 An admin can let chosen members add skill sources: the **Skill
 contributors** panel on the Skills page (admins only) adds and removes
 them. A contributor sees the Skills page in a limited view: the sources
-they added and the Add source wizard.
+they added as a contributor and the Add source wizard.
 
 - A contributor can inspect, preview and add a source, and edit, sync,
   pause or delete their own sources, their sharing included. Other
   people's sources, the trusted owners, the default GitHub token and the
-  Contributors panel stay hidden from them.
+  Contributors panel stay hidden from them. A source they added while
+  they were an admin stays admin-managed when they lose the role (it
+  reads with the default token and needs no approval): they no longer
+  see or change it.
 - Their new source starts **pending approval**: it syncs (at most once an
   hour while it waits), but agents see nothing of it, and no commit goes
   live while it waits, whatever its update mode: each new commit becomes
   its waiting version. The owner gets one Inbox question with the
   repository, branch, folder, audience, and the commit with its counts
-  and warnings; when a newer commit comes to wait, the question is closed
-  and asked again for that commit. **Approve** is bound to the commit the
-  question (or the source page) shows: that commit goes live with the
-  approval. When another commit would go live instead (a newer waiting
-  commit of an automatic source, or a live commit that is not the one
-  shown), the approval is refused and the source keeps waiting; a
-  review-mode source's newer commit waits for a normal review.
+  and warnings; when a newer commit comes to wait, the question is asked
+  again for that commit (and the old one closed). **Approve** is bound to
+  the commit the question (or the source page) shows: that commit goes
+  live with the approval. When another commit would go live instead (a
+  newer waiting commit of an automatic source, a live commit that is not
+  the one shown, or nothing synced yet), the approval is refused, the
+  source keeps waiting, and the question is asked again for the commit it
+  waits with; a review-mode source's newer commit waits for a normal
+  review. The question is never lost: a check of a waiting source that
+  finds no open question (the first ask failed, or it expired) asks
+  again.
   **Reject** disables it, with the reason. A change of branch, folder,
   excludes, credential or update mode while it waits closes the question
   and asks again with a new dry run. Admins can also approve or reject on
@@ -380,7 +387,7 @@ answers them 403 `admin_only`. Errors are `{"error", "code"}` with the codes `in
 | `POST /v1/skills/sources/preview` | *contributor*. A source (as for create): dry run with commit, counts, warnings, sample. A contributor's dry run never reads with the default token, and has the bounds of their create (403 `contributor_limit`) |
 | `GET /v1/skills/admin/sources` | *contributor*. Every source with its status (a contributor: their own); the agent list is `GET /v1/skills/sources` |
 | `POST /v1/skills/sources` | *contributor*. Create `{url, branch?, path?, exclude?, mode?, pinned_sha?, auth?, token?, poll_seconds?, enabled?, visibility?, members?, blocked?, default_runs?}`; `201 {source, status: "syncing"}` at once, the first sync running in the background (poll `GET /v1/skills/sources/{id}` until `last_checked_at` is set); the same create by the same person within two minutes answers `200 {source, existing: true}`. A contributor's source has `approval: "pending"`; a contributor's mode `pinned`, mode `auto` for an untrusted owner, or `limits` answer 403 `contributor_limit` |
-| `GET`, `PATCH`, `DELETE /v1/skills/sources/{id}` | *contributor*. Read, change (only the fields sent; `token` replaces, `clear_token` removes; `visibility`, `members` and `blocked` are the source's sharing) or delete a source; a change of mode, branch, folder or pinned commit, and a delete, close the open review question. A PATCH writes only the fields it sends; one that meets a change of the source's approval, hide lock, mode, branch, folder or credential made meanwhile answers 409 `conflict` (read the source again) |
+| `GET`, `PATCH`, `DELETE /v1/skills/sources/{id}` | *contributor*. Read, change (only the fields sent; `token` replaces, `clear_token` removes; `visibility`, `members` and `blocked` are the source's sharing) or delete a source; a change of mode, branch, folder or pinned commit, and a delete, close the open review question. A PATCH writes only the fields it sends, and only to the source as it was read when the request was checked: one that meets a change made since answers 409 `conflict` (read the source again) |
 | `POST /v1/skills/sources/{id}/sync` | *contributor*. Sync now |
 | `GET /v1/skills/sources/{id}/versions?limit=` | *contributor*. The last versions (default 20, at most 100) |
 | `POST /v1/skills/sources/{id}/versions/{vid}/activate` | make a version live (approve or roll back) |
