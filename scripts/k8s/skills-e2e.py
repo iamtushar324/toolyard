@@ -259,7 +259,7 @@ def main():
     name = "skills-e2e-" + uuid.uuid4().hex[:6]
     ag = admin.j("POST", "/v1/agents", json={"name": name})
     agent = Agent(ag["token"])
-    agent_id = ag.get("id") or ag.get("agent", {}).get("id")
+    agent_id = ag.get("agent_id") or ag.get("id")
 
     # --- Admin: inspect and preview the fixture -------------------------
     fx_url = "https://github.com/%s/tree/%s/skills" % (FIXTURE_REPO, FIXTURE_BRANCH)
@@ -572,7 +572,7 @@ def main():
         mag = msess.post(BASE + "/v1/agents", json={"name": "skills-e2e-member-" + uuid.uuid4().hex[:6]}, timeout=30).json()
         magent = Agent(mag["token"])
         magent.init()
-        mag_id = mag.get("id") or mag.get("agent", {}).get("id")
+        mag_id = mag.get("agent_id") or mag.get("id")
         fx_id = fx["id"]
 
         def visible(ag, ref):
