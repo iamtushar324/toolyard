@@ -18,7 +18,7 @@ const state = {
   // Users page (admin): /v1/users rows + the grantable groups.
   users: { rows: [], groups: [], loaded: false, loading: false, error: '', keyBusy: '', keyOpen: {} },
   userAccessModal: null,   // { id, name, selected: {group: bool}, dropped: [], error, saving } while editing access
-  ownerModal: null,        // { id, name, hint, expect: [names], typed, error, saving } while the owner transfers ownership
+  ownerModal: null,        // { id, name, hint, expect: [names], google, typed, revoke, error, saving } while the owner transfers ownership
   // "Your Beknown key" card: /v1/me/identity-key status, plus the raw key
   // held only in memory from a reveal until the owner dismisses it.
   myKey: freshMyKey(),
@@ -2090,7 +2090,9 @@ const USER_ERRORS = {
   already_owner: 'That person is already the owner.',
   user_blocked: 'Unblock that person first: the owner must be an active user.',
   confirm_mismatch: "What you typed doesn't match that person's username, email or name.",
-  no_sign_in: 'That person has no email to sign in with Google, and on this server only the owner can sign in.',
+  no_sign_in: 'That person has never signed in with Google, and on this server only the owner can sign in. They must sign in with Google once first.',
+  no_google_sign_in: 'Clerk shows no verified Google account with that person\'s email, so they could not sign in as the owner.',
+  clerk_unavailable: 'Clerk did not answer. Try again in a minute.',
   session_required: 'This needs a person signed in to the dashboard.',
 };
 
@@ -2136,7 +2138,11 @@ function openOwnerTransfer(u) {
     name: userLabel(u),
     hint: u.email || u.username,
     expect: [u.username, u.email, u.display_name].filter(Boolean),
+    google: u.auth === 'clerk',
     typed: '',
+    // Personal sign-in: the previous owner can no longer sign in, so their
+    // agents and operator tokens are revoked with the move unless unticked.
+    revoke: !!(state.authConfig && state.authConfig.owner_only),
     error: '',
     saving: false,
   };
@@ -2161,7 +2167,7 @@ async function submitOwnerTransfer() {
   if (!m || m.saving || !ownerTypedOK(m)) return;
   m.saving = true; m.error = ''; render();
   try {
-    await api(`/v1/users/${encodeURIComponent(m.id)}/make-owner`, { method: 'POST', body: { confirm: m.typed.trim() } });
+    await api(`/v1/users/${encodeURIComponent(m.id)}/make-owner`, { method: 'POST', body: { confirm: m.typed.trim(), revoke_previous: !!m.revoke } });
     if (state.ownerModal === m) state.ownerModal = null;
     toast(`${m.name} is now the owner`);
     // Personal sign-in admits only the owner: this session has ended.
@@ -2190,7 +2196,15 @@ function renderOwnerTransferModal() {
         `${m.name} becomes the owner and an admin. You stay an admin until the new owner changes that. ` +
         "Only the owner can transfer ownership, and nobody can demote or block the owner."),
       ownerOnly
-        ? el('p', { class: 'err' }, `Only the owner can sign in to this server. After the transfer only ${m.name} can sign in, and this browser is signed out.`)
+        ? el('p', { class: 'err' }, `Only the owner can sign in to this server. After the transfer only ${m.name} can sign in with Google, and you can no longer sign in at all: this browser is signed out.`)
+        : null,
+      ownerOnly && !m.google
+        ? el('p', { class: 'err' }, `${m.name} has never signed in with Google, so they could not sign in as the owner. The server refuses this transfer.`)
+        : null,
+      ownerOnly
+        ? el('label', { class: 'access-opt' },
+            el('input', { type: 'checkbox', checked: m.revoke, on: { change: (e) => { m.revoke = e.target.checked; } } }),
+            el('span', {}, 'Also disable my agents and revoke my operator tokens (recommended: I cannot sign in after this)'))
         : null,
       el('label', {},
         el('div', { class: 'meta' }, 'To confirm, type ', el('code', {}, m.hint)),

@@ -95,25 +95,21 @@ func TestClerkSyncKeepsLastAdmin(t *testing.T) {
 	if owner.ID != e.admin.ID || owner.Role != identity.RoleAdmin {
 		t.Fatalf("owner link precondition: %+v", owner)
 	}
+	// A store without an owner (before 0072's startup backfill): the
+	// last-admin rule alone keeps them. An owner who left is suspended
+	// instead (TestClerkSyncSuspendsDepartedOwner).
+	if _, err := e.db.Exec(`UPDATE users SET is_owner = 0`); err != nil {
+		t.Fatal(err)
+	}
 	other := e.member(t, "user_other", "other@beknown.work")
 	e.clerk.set(func(f *fakeClerk) {
 		f.members = map[string]clerk.Member{"user_someone_else": {IsMember: true}}
 	})
 	if n := e.srv.runClerkSync(ctx); n != 1 {
-		t.Errorf("blocked = %d, want 1 (the member, not the owner and last admin)", n)
+		t.Errorf("blocked = %d, want 1 (the member, not the last admin)", n)
 	}
 	if a, _ := e.id.GetUserByID(ctx, e.admin.ID); a.Status != identity.StatusActive {
 		t.Errorf("last admin was blocked: %+v", a)
-	}
-	// Without an owner the last-admin rule alone keeps them.
-	if _, err := e.db.Exec(`UPDATE users SET is_owner = 0`); err != nil {
-		t.Fatal(err)
-	}
-	if n := e.srv.runClerkSync(ctx); n != 0 {
-		t.Errorf("ownerless pass blocked %d, want 0 (the last admin)", n)
-	}
-	if a, _ := e.id.GetUserByID(ctx, e.admin.ID); a.Status != identity.StatusActive {
-		t.Errorf("last admin was blocked without an owner: %+v", a)
 	}
 	if o, _ := e.id.GetUserByID(ctx, other.ID); o.Status != identity.StatusBlocked {
 		t.Errorf("member not blocked: %+v", o)

@@ -599,6 +599,10 @@ type Member struct {
 	FirstName string
 	LastName  string
 	ImageURL  string
+	// EmailVerified: Email is the user's verified primary address, read
+	// from the Backend API (personal access checks it; an organisation
+	// membership's identifier is not checked).
+	EmailVerified bool
 }
 
 // membershipList mirrors the Backend API's OrganizationMemberships schema:

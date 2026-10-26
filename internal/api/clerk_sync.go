@@ -41,8 +41,11 @@ func (s *Server) StartClerkSync(ctx context.Context, every time.Duration) {
 // It fails safe: any error listing the org, or an org that reports zero
 // members, changes nothing — a Clerk outage must never read as "everyone
 // left". Users without a clerk_user_id (password accounts) are never
-// touched, and the owner and the last active admin are skipped with a log
-// line.
+// touched, and the last active admin is skipped with a log line. An owner
+// who left is suspended instead (identity.SuspendDepartedOwner): blocked,
+// sessions ended, agents disabled and operator tokens revoked, but still
+// the owner, so a host operator moves the role with `toolyard owner
+// transfer`; that is logged as an error and audited.
 func (s *Server) runClerkSync(ctx context.Context) int {
 	lg := logx.For("clerk-sync")
 	members, err := s.clerk.OrgMembers(ctx)
@@ -70,7 +73,23 @@ func (s *Server) runClerkSync(ctx context.Context) int {
 		err := s.identity.SetStatus(ctx, u.ID, identity.StatusBlocked, "left_org")
 		switch {
 		case errors.Is(err, identity.ErrOwner):
-			lg.Warn("user left the org but is the owner; left active (transfer ownership to block them)", "user", u.Username)
+			changed, serr := s.identity.SuspendDepartedOwner(ctx, u.ID)
+			if serr != nil {
+				lg.Error("the owner left the org; suspending them failed", "user", u.Username, "err", serr.Error())
+				continue
+			}
+			if !changed {
+				continue
+			}
+			lg.Error("the owner left the org: blocked, sessions ended, agents disabled, operator tokens revoked; they stay the owner until a host operator runs: toolyard owner transfer --to <username|email>", "user", u.Username)
+			// SuspendDepartedOwner wrote its own audit row.
+			if s.access != nil {
+				s.access.Invalidate(u.ID)
+			}
+			if s.identityKeys != nil {
+				s.identityKeys.Invalidate(u.ID)
+			}
+			blocked++
 			continue
 		case errors.Is(err, identity.ErrLastAdmin):
 			lg.Warn("user left the org but is the last active admin; left active", "user", u.Username)

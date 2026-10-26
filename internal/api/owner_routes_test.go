@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"strings"
 	"testing"
 	"time"
 
@@ -14,7 +15,12 @@ import (
 // makeOwner posts a transfer of ownership to uid with the typed confirm.
 func (e *accessTestEnv) makeOwner(t *testing.T, cookie *http.Cookie, uid, confirm string) (int, map[string]any) {
 	t.Helper()
-	body, err := json.Marshal(map[string]string{"confirm": confirm})
+	return e.makeOwnerBody(t, cookie, uid, map[string]any{"confirm": confirm})
+}
+
+func (e *accessTestEnv) makeOwnerBody(t *testing.T, cookie *http.Cookie, uid string, fields map[string]any) (int, map[string]any) {
+	t.Helper()
+	body, err := json.Marshal(fields)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -53,6 +59,14 @@ func TestAuthSetupCreatesOwner(t *testing.T) {
 	if me["is_owner"] != true {
 		t.Fatalf("/me = %v", me)
 	}
+	// Both automatic changes are audited as the setup.
+	if e.auditRows(t, "user.owner", "setup") != 1 || e.auditRows(t, "user.role", "setup") != 1 {
+		t.Fatal("the first account's owner and admin roles are not audited")
+	}
+	var actor string
+	if err := e.db.QueryRow(`SELECT agent_id FROM audit_events WHERE event_type = 'user.owner'`).Scan(&actor); err != nil || actor != identity.ActorSetup {
+		t.Fatalf("setup audit actor = %q %v", actor, err)
+	}
 }
 
 // With no owner email configured, the first verified Clerk sign-in is the
@@ -70,6 +84,9 @@ func TestFirstClerkSignInIsOwner(t *testing.T) {
 	}
 	if u := decodeJSON(t, rec); u["is_owner"] != true || u["role"] != identity.RoleAdmin {
 		t.Fatalf("first sign-in = %v, want the owner", u)
+	}
+	if e.auditRows(t, "user.owner", "first_sign_in") != 1 || e.auditRows(t, "user.role", "owner") != 1 {
+		t.Fatal("the first sign-in's owner and admin roles are not audited")
 	}
 	// The next person is a member.
 	e.clerk.set(func(f *fakeClerk) { f.claims.Subject = "user_bob"; f.member.Email = "bob@beknown.work" })
@@ -89,13 +106,33 @@ func TestConfiguredOwnerEmailWins(t *testing.T) {
 	if u := decodeJSON(t, e.do(t, nil, http.MethodPost, "/v1/auth/clerk/session", `{"token":"good-token"}`)); u["is_owner"] != false {
 		t.Fatalf("org admin first = %v, want not the owner", u)
 	}
+	// The owner email, but Clerk cannot confirm it is the verified primary
+	// address: refused while Clerk is down, a plain member when it says no.
 	e.clerk.set(func(f *fakeClerk) {
 		f.claims.Subject = "user_owner"
 		f.member.Email = "Owner@beknown.work"
 		f.member.Role = "org:member"
+		f.verifiedErr = clerk.ErrUnavailable
 	})
+	if rec := e.do(t, nil, http.MethodPost, "/v1/auth/clerk/session", `{"token":"good-token"}`); rec.Code != http.StatusServiceUnavailable {
+		t.Fatalf("owner email while Clerk is down: %d %s", rec.Code, rec.Body.String())
+	}
+	e.clerk.set(func(f *fakeClerk) { f.verifiedErr = clerk.ErrNotMember })
+	if u := decodeJSON(t, e.do(t, nil, http.MethodPost, "/v1/auth/clerk/session", `{"token":"good-token"}`)); u["is_owner"] != false {
+		t.Fatalf("unverified owner email = %v, want not the owner", u)
+	}
+	// Verified: the same person claims the vacant role on their next sign-in.
+	e.clerk.set(func(f *fakeClerk) { f.verifiedErr = nil })
 	if u := decodeJSON(t, e.do(t, nil, http.MethodPost, "/v1/auth/clerk/session", `{"token":"good-token"}`)); u["is_owner"] != true || u["role"] != identity.RoleAdmin {
 		t.Fatalf("configured owner = %v, want the owner", u)
+	}
+	if e.auditRows(t, "user.owner", "configured_owner_sign_in") != 1 {
+		t.Fatal("the configured owner's claim is not audited")
+	}
+	// A look-alike address (U+212A KELVIN SIGN for k) never matches.
+	e.clerk.set(func(f *fakeClerk) { f.claims.Subject = "user_kelvin"; f.member.Email = "owner@be\u212Anown.work" })
+	if u := decodeJSON(t, e.do(t, nil, http.MethodPost, "/v1/auth/clerk/session", `{"token":"good-token"}`)); u["is_owner"] != false || u["role"] != identity.RoleMember {
+		t.Fatalf("look-alike owner email = %v", u)
 	}
 }
 
@@ -133,8 +170,13 @@ func TestMakeOwnerByOwner(t *testing.T) {
 	if prev["is_owner"] != false || prev["role"] != identity.RoleAdmin {
 		t.Fatalf("previous owner = %v, want a plain admin", prev)
 	}
-	if e.auditRows(t, "user.owner", "transfer") != 1 {
+	if e.auditRows(t, "user.owner", "transfer") != 1 || e.auditRows(t, "user.role", "transfer") != 1 {
 		t.Fatal("transfer not audited")
+	}
+	var actor, summary, args string
+	if err := e.db.QueryRow(`SELECT agent_id, result_summary, arguments FROM audit_events WHERE event_type = 'user.owner' AND reason = 'transfer'`).Scan(&actor, &summary, &args); err != nil ||
+		actor != "user:"+e.admin.ID || !strings.Contains(summary, m.ID) || !strings.Contains(summary, e.admin.ID) || !strings.Contains(args, `"to_user_id":"`+m.ID+`"`) {
+		t.Fatalf("transfer audit row = %q %q %q %v", actor, summary, args, err)
 	}
 	// The previous owner is an admin, not the owner: no second transfer,
 	// and the new owner may now demote them.
@@ -272,10 +314,36 @@ func TestPersonalSignInFollowsTransfer(t *testing.T) {
 		t.Fatalf("m before the transfer: %d", code)
 	}
 	if code, out := e.makeOwner(t, ownerCookie, "u_plain", "plain"); code != http.StatusConflict || out["error"] != "no_sign_in" {
-		t.Fatalf("transfer to a user without an email: %d %v", code, out)
+		t.Fatalf("transfer to a user without a Google sign-in: %d %v", code, out)
 	}
-	if code, out := e.makeOwner(t, ownerCookie, m.ID, "m@beknown.work"); code != http.StatusOK || out["is_owner"] != true {
+	// Clerk no longer shows a verified Google account for m, or is down.
+	e.clerk.set(func(f *fakeClerk) { f.googleErr = clerk.ErrNotMember })
+	if code, out := e.makeOwner(t, ownerCookie, m.ID, "m@beknown.work"); code != http.StatusConflict || out["error"] != "no_google_sign_in" {
+		t.Fatalf("transfer to an account without Google: %d %v", code, out)
+	}
+	e.clerk.set(func(f *fakeClerk) { f.googleErr = clerk.ErrUnavailable })
+	if code, out := e.makeOwner(t, ownerCookie, m.ID, "m@beknown.work"); code != http.StatusServiceUnavailable || out["error"] != "clerk_unavailable" {
+		t.Fatalf("transfer while Clerk is down: %d %v", code, out)
+	}
+	e.clerk.set(func(f *fakeClerk) { f.googleErr = nil })
+	// The previous owner's agent and operator token, revoked with the move.
+	agentTok, _ := e.agentFor(t, e.admin.ID)
+	opTok, _, err := e.id.CreateOperatorToken(context.Background(), e.admin.ID, "cli", []string{identity.ScopeRead}, 0, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	code, out := e.makeOwnerBody(t, ownerCookie, m.ID, map[string]any{"confirm": "m@beknown.work", "revoke_previous": true})
+	if code != http.StatusOK || out["is_owner"] != true {
 		t.Fatalf("transfer: %d %v", code, out)
+	}
+	if _, err := e.id.VerifyAgentToken(context.Background(), agentTok); err == nil {
+		t.Error("the previous owner's agent still authenticates")
+	}
+	if _, _, err := e.id.VerifyOperatorToken(context.Background(), opTok); err == nil {
+		t.Error("the previous owner's operator token still works")
+	}
+	if e.auditRows(t, "user.credentials_revoked", "previous_owner") != 1 {
+		t.Error("revoking the previous owner's credentials is not audited")
 	}
 	// The previous owner's session ends; the new owner signs in.
 	if rec := e.do(t, ownerCookie, http.MethodGet, "/v1/auth/me", ""); rec.Code != http.StatusUnauthorized {
@@ -293,21 +361,62 @@ func TestPersonalSignInFollowsTransfer(t *testing.T) {
 	}
 }
 
-// The owner who left the Clerk organisation stays active (transfer first).
-func TestClerkSyncSkipsOwner(t *testing.T) {
+// An owner who left the Clerk organisation is suspended: blocked, sessions
+// ended, agents disabled, operator tokens revoked, but still the owner;
+// later passes change nothing.
+func TestClerkSyncSuspendsDepartedOwner(t *testing.T) {
 	e := newAccessTestServer(t)
 	ctx := context.Background()
 	m := e.member(t, "user_m", "m@beknown.work")
 	if err := e.id.TransferOwnership(ctx, e.admin.ID, m.ID); err != nil {
 		t.Fatal(err)
 	}
+	mCookie := e.cookieFor(t, m.ID)
+	agentTok, _ := e.agentFor(t, m.ID)
+	opTok, _, err := e.id.CreateOperatorToken(ctx, m.ID, "cli", []string{identity.ScopeRead}, 0, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
 	e.clerk.set(func(f *fakeClerk) {
 		f.members = map[string]clerk.Member{"user_someone": {IsMember: true}}
 	})
-	if n := e.srv.runClerkSync(ctx); n != 0 {
-		t.Errorf("blocked %d, want 0 (the only Clerk user is the owner)", n)
+	if n := e.srv.runClerkSync(ctx); n != 1 {
+		t.Fatalf("suspended %d, want 1 (the owner)", n)
 	}
-	if u, _ := e.id.GetUserByID(ctx, m.ID); u.Status != identity.StatusActive || !u.Owner {
-		t.Errorf("owner after the sync = %+v", u)
+	u, _ := e.id.GetUserByID(ctx, m.ID)
+	if u.Status != identity.StatusBlocked || u.BlockedReason != "left_org" || !u.Owner {
+		t.Fatalf("departed owner = %+v, want blocked and still the owner", u)
+	}
+	if rec := e.do(t, mCookie, http.MethodGet, "/v1/auth/me", ""); rec.Code != http.StatusUnauthorized {
+		t.Errorf("departed owner's session: %d", rec.Code)
+	}
+	if _, err := e.id.VerifyAgentToken(ctx, agentTok); err == nil {
+		t.Error("departed owner's agent still authenticates")
+	}
+	var disabled int
+	if err := e.db.QueryRow(`SELECT count(*) FROM agents WHERE owner_user = ? AND disabled = 1`, m.ID).Scan(&disabled); err != nil || disabled != 1 {
+		t.Errorf("disabled agents = %d %v, want 1", disabled, err)
+	}
+	if _, _, err := e.id.VerifyOperatorToken(ctx, opTok); err == nil {
+		t.Error("departed owner's operator token still works")
+	}
+	var revoked int64
+	if err := e.db.QueryRow(`SELECT COALESCE(revoked_at,0) FROM operator_tokens WHERE user_id = ?`, m.ID).Scan(&revoked); err != nil || revoked == 0 {
+		t.Errorf("operator token revoked_at = %d %v", revoked, err)
+	}
+	var actor string
+	if err := e.db.QueryRow(`SELECT agent_id FROM audit_events WHERE event_type = 'user.status' AND reason = 'left_org'`).Scan(&actor); err != nil || actor != identity.ActorClerkSync {
+		t.Errorf("suspension audit actor = %q %v", actor, err)
+	}
+	if n := e.srv.runClerkSync(ctx); n != 0 {
+		t.Errorf("second pass changed %d", n)
+	}
+	if e.auditRows(t, "user.status", "left_org") != 1 {
+		t.Errorf("left_org rows = %d, want 1", e.auditRows(t, "user.status", "left_org"))
+	}
+	// An admin can still unblock a mistaken departure: the owner rule does
+	// not stop re-activating.
+	if rec := e.do(t, e.cookieFor(t, e.admin.ID), http.MethodPatch, "/v1/users/"+m.ID, `{"status":"active"}`); rec.Code != http.StatusOK {
+		t.Fatalf("unblock the owner: %d %s", rec.Code, rec.Body.String())
 	}
 }

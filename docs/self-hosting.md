@@ -785,12 +785,15 @@ browser sessions cannot access the dashboard API. The first permitted
 login links to the existing owner account, retaining its agents, grants,
 passkeys, and data. Agent and operator token authentication is preserved.
 
-In this mode only the **owner** signs in. `-owner-email` names them until
-there is an owner with an email on file; after that the stored owner's
-email is the address that counts. When the owner transfers ownership, only
-the new owner can sign in from then on (the transfer needs them to have an
-email), and the previous owner's browser sessions stop working. Allow the
-new owner's Google account in the Clerk app too.
+In this mode only the **owner** signs in, through every Clerk route (the
+dashboard, `/v1/connect/t3` and federation). `-owner-email` names them
+until there is an owner with an email on file; after that the stored
+owner's email is the address that counts. A transfer needs a new owner who
+has signed in with Google before and whose verified Google account Clerk
+still shows; afterwards only the new owner can sign in, and the previous
+owner's browser sessions stop working. The dialog revokes the previous
+owner's agents and operator tokens too unless you untick it. Allow the new
+owner's Google account in the Clerk app too.
 
 Enable only Google in the dedicated Clerk app. Restrict Clerk signups to
 the same email, using an allowlist or invite-only access as available on
@@ -803,38 +806,51 @@ and restore the prior image/configuration. No database migration is added.
 ## The owner and admins
 
 Every install has one **owner**: the person in charge. The owner is always
-an active admin; nobody can demote or block them, and only the owner can
-make someone else the owner.
+an admin; nobody can demote or block them in the dashboard, and only the
+owner can make someone else the owner.
 
 Who becomes the owner on an install that has none:
 
 - the account the first-visit setup (`POST /v1/auth/setup`) creates;
-- else the first verified Google (Clerk) sign-in. With `-owner-email` set,
-  only that person becomes the owner, on their first sign-in, and nobody
-  else can claim it; anyone who signs in before them is a member (or an
-  admin, if they are an admin of the Clerk organisation and there is no
-  admin yet). Without `-owner-email`, the first person to sign in becomes
-  the owner and an admin. Of two first sign-ins at the same moment exactly
-  one becomes the owner; the other is a member.
+- else the first verified Google (Clerk) sign-in:
+  - **without `-owner-email`, the first person to sign in becomes the owner
+    and an admin, whatever their role in the Clerk organisation.** On an
+    organisation install where someone else could sign in before you, set
+    `-owner-email` (or run the setup) before you open the sign-in page;
+  - with `-owner-email`, only that person becomes the owner, on their first
+    sign-in, and nobody else can claim it. Anyone who signs in before them
+    is a member (or an admin, if they are an admin of the Clerk
+    organisation and there is no admin yet), never the owner. The address
+    must be the person's verified primary email in Clerk; toolyard checks it
+    with the Clerk Backend API, refuses the sign-in while Clerk cannot be
+    reached, and compares addresses ASCII-only, ignoring case.
 
-Everyone who signs in later is a member until an admin changes that.
+Of two first sign-ins at the same moment exactly one becomes the owner; the
+other is a member. Everyone who signs in later is a member until an admin
+changes that. A federated sign-in (a T3 server's assertion) and the
+registration of a T3 server never make anyone an admin or the owner.
 
-`-owner-email` only seeds the owner. Once there is one, the stored owner
-is what counts: changing the flag does not move ownership, and a transfer
-does not need the flag changed.
+`-owner-email` only seeds the owner. Once there is one, the stored owner is
+what counts: changing the flag does not move ownership, and a transfer does
+not need the flag changed.
 
 **Upgrading.** An install that had users before the owner existed gets one
-when it starts: the active user whose email is `-owner-email`, else the
-oldest active admin (on a typical install, the password account created at
-setup). The server logs `toolyard: owner is <username>`.
+when it starts: the active user whose email is `-owner-email`; without
+`-owner-email` (or with Clerk sign-in off), the oldest active admin (on a
+typical install, the password account created at setup). When
+`-owner-email` is set and nobody has that address yet, the role stays
+vacant until that person signs in; it never falls to someone else. The
+server logs `toolyard: owner is <username>`. If an older binary demoted the
+owner during a rolling deploy, the next start makes them an admin again and
+logs a warning.
 
 **Transfer ownership.** On **People & agents → People**, the owner clicks
 **Make owner** on another active person's row and types that person's
 username or email to confirm. The new owner becomes an admin; the previous
-owner stays an admin until the new owner changes that. Each transfer
-writes a `user.owner` audit row. Over REST it is
+owner stays an admin until the new owner changes that. Over REST it is
 `POST /v1/users/{id}/make-owner {"confirm":"<username, email or name>"}`
-from the owner's browser session.
+from the owner's browser session. Add `"revoke_previous": true` to also
+disable your agents and revoke your operator tokens.
 
 **Make anyone admin.** The owner and every admin can promote any person to
 admin and demote admins (`PATCH /v1/users/{id} {"role":"admin"|"member"}`).
@@ -844,6 +860,32 @@ active admin. To demote or block the owner, transfer ownership first.
 Agents and operator tokens cannot change roles or ownership, whatever
 their scopes: both need a person signed in to the dashboard (role changes
 an admin, a transfer the owner).
+
+**When the owner is gone.** If the hourly Clerk sync finds that the owner
+left the organisation, it blocks them (`left_org`): their sessions end,
+their agents are disabled and their operator tokens revoked. They stay the
+owner, and the server logs an error. An admin can unblock a mistaken
+departure on the People page. To move the role, run on the host (it reads
+the same database as `serve`, needs no sign-in, and works with the server
+running or stopped):
+
+```bash
+toolyard owner show     --data /var/lib/toolyard
+toolyard owner transfer --data /var/lib/toolyard --to alice@example.com
+```
+
+`--to` takes a username, email or user id. The new owner must be active;
+`--unblock` re-activates a blocked one as part of the move (for example a
+lone admin who left and came back). The previous owner keeps their role and
+status. The same command recovers an owner who lost their account.
+
+**Audit trail.** Every owner change and every automatic promotion writes
+`user.owner` and `user.role` audit rows, in the same transaction as the
+change: by the person for a transfer (`user:<id>`, with both user ids), and
+for automatic ones by `system:setup` (the first account), `system:sign-in`
+(a sign-in that claims the role or bootstraps an admin), `system:startup`
+(the upgrade backfill and a re-promotion), `system:cli` (`toolyard owner
+transfer`) and `system:clerk-sync` (a departed owner, as `user.status`).
 
 Rollback: an older binary ignores the owner column (migration 0072) and
 treats the oldest account as the owner again.

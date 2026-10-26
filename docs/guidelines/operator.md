@@ -40,6 +40,10 @@ toolyard-gateway operator-token revoke --data /var/lib/toolyard op_…
 `--user` picks the user (username, email or id; default: the owner, else the
 oldest active admin), `--scopes read,write[,owner]`, `--ttl 720h` sets an expiry.
 
+`toolyard-gateway owner show` and `owner transfer --to <user> [--unblock]` are
+the host break-glass for the owner role (for example when the owner left the
+organisation); see "The owner and admins" in self-hosting.md.
+
 From the API, an admin can mint one with `POST /v1/operator-tokens
 {"name":"…","scopes":["read","write"],"ttl_hours":0}`. The plaintext is
 returned once.

@@ -74,6 +74,7 @@ import (
 	"github.com/tusharbhardwaj/toolyard/internal/identitykeys"
 	"github.com/tusharbhardwaj/toolyard/internal/inbox"
 	"github.com/tusharbhardwaj/toolyard/internal/jobs"
+	"github.com/tusharbhardwaj/toolyard/internal/logx"
 	"github.com/tusharbhardwaj/toolyard/internal/marketplace"
 	"github.com/tusharbhardwaj/toolyard/internal/mcpauth"
 	"github.com/tusharbhardwaj/toolyard/internal/memory"
@@ -345,6 +346,8 @@ func New(ctx context.Context, opts Options) *Server {
 	}
 	s.federation, s.callbacks = opts.Federation, opts.Callbacks
 	if s.federation != nil {
+		// Personal sign-in: a federated sign-in counts only for the owner.
+		s.federation.OwnerOnly = opts.ClerkOwnerOnly
 		s.federation.Membership = func(ctx context.Context, subject string) (federation.Profile, error) {
 			if s.clerk == nil {
 				return federation.Profile{}, federation.ErrUnavailable
@@ -771,6 +774,19 @@ func (s *Server) authSetup(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
+	}
+	// The first account is the owner and an admin: both are automatic, so
+	// both are audited (identity audits every later automatic claim in
+	// its own transaction).
+	if s.audit != nil {
+		for _, ev := range []audit.Event{
+			{EventType: "user.owner", AgentID: identity.ActorSetup, Reason: "setup", ResultSummary: fmt.Sprintf("owner -> %s (%s)", u.Username, u.ID)},
+			{EventType: "user.role", AgentID: identity.ActorSetup, Reason: "setup", ResultSummary: fmt.Sprintf("%s role=admin", u.Username)},
+		} {
+			if err := s.audit.Write(r.Context(), ev); err != nil {
+				logx.For("auth").Warn("audit of the first account failed", "event", ev.EventType, "err", err.Error())
+			}
+		}
 	}
 	if err := s.issueSession(w, r, u.ID); err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())

@@ -10,6 +10,7 @@ import (
 
 	"github.com/tusharbhardwaj/toolyard/internal/access"
 	"github.com/tusharbhardwaj/toolyard/internal/audit"
+	"github.com/tusharbhardwaj/toolyard/internal/clerk"
 	"github.com/tusharbhardwaj/toolyard/internal/identity"
 	"github.com/tusharbhardwaj/toolyard/internal/identitykeys"
 )
@@ -153,7 +154,7 @@ func (s *Server) usersList(w http.ResponseWriter, r *http.Request) {
 // usersItem dispatches the per-user admin actions:
 //
 //	PATCH  /v1/users/{id}                       {"role"?, "status"?, "blocked_reason"?, "servers"?:[…]}
-//	POST   /v1/users/{id}/make-owner            {"confirm":"<their username, email or name>"} (the owner only)
+//	POST   /v1/users/{id}/make-owner            {"confirm":"<their username, email or name>", "revoke_previous"?:bool} (the owner only)
 //	POST   /v1/users/{id}/revoke-sessions
 //	POST   /v1/users/{id}/identity-key          issue or rotate the Beknown key
 //	DELETE /v1/users/{id}/identity-key          revoke it
@@ -349,11 +350,16 @@ func (s *Server) usersPatch(w http.ResponseWriter, r *http.Request, caller, targ
 // already refuses the path to operator tokens, operatorScopeFor). The body
 // must repeat the new owner's username, email or display name (a fresh,
 // typed confirmation; 400 confirm_mismatch otherwise). The target must be
-// another active user (409 already_owner, user_blocked); in personal
-// sign-in mode (-clerk-owner-only) they also need an email to sign in with
-// (409 no_sign_in), because after the transfer only they can sign in. The
-// new owner becomes an admin, the caller stays one, and an audit row
-// (user.owner) records both.
+// another active user (409 already_owner, user_blocked). In personal
+// sign-in mode (-clerk-owner-only) only the owner signs in, so the target
+// must have signed in with Google before (409 no_sign_in) and Clerk must
+// still show a verified Google account with their email (409
+// no_google_sign_in; 503 clerk_unavailable when Clerk cannot say). The new
+// owner becomes an admin and the caller stays one; identity audits the
+// move (user.owner, with both user ids) in the same transaction. With
+// revoke_previous the caller's agents are disabled and their operator
+// tokens revoked too (the dialog offers it in personal mode, where the
+// previous owner can no longer sign in).
 func (s *Server) usersMakeOwner(w http.ResponseWriter, r *http.Request, caller, target *identity.User) {
 	ctx := r.Context()
 	if operatorFromContext(ctx) != nil {
@@ -365,7 +371,8 @@ func (s *Server) usersMakeOwner(w http.ResponseWriter, r *http.Request, caller, 
 		return
 	}
 	var body struct {
-		Confirm string `json:"confirm"`
+		Confirm        string `json:"confirm"`
+		RevokePrevious bool   `json:"revoke_previous"`
 	}
 	if err := decode(r, &body); err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
@@ -383,18 +390,36 @@ func (s *Server) usersMakeOwner(w http.ResponseWriter, r *http.Request, caller, 
 		writeError(w, http.StatusBadRequest, "confirm_mismatch")
 		return
 	}
-	if s.clerkOwnerOnly && strings.TrimSpace(target.Email) == "" {
-		writeError(w, http.StatusConflict, "no_sign_in")
-		return
+	if s.clerkOwnerOnly {
+		if target.ClerkUserID == "" || strings.TrimSpace(target.Email) == "" {
+			writeError(w, http.StatusConflict, "no_sign_in")
+			return
+		}
+		if s.clerk != nil {
+			err := s.clerk.VerifyGoogleAccount(ctx, target.ClerkUserID, target.Email)
+			switch {
+			case errors.Is(err, clerk.ErrNotMember):
+				writeError(w, http.StatusConflict, "no_google_sign_in")
+				return
+			case err != nil:
+				writeError(w, http.StatusServiceUnavailable, "clerk_unavailable")
+				return
+			}
+		}
 	}
 	if err := s.identity.TransferOwnership(ctx, caller.ID, target.ID); err != nil {
 		s.writeUserChangeError(w, err)
 		return
 	}
-	_ = s.audit.Write(ctx, audit.Event{
-		EventType: "user.owner", AgentID: "user:" + caller.ID, Reason: "transfer",
-		ResultSummary: fmt.Sprintf("owner %s -> %s", caller.Username, target.Username),
-	})
+	if body.RevokePrevious {
+		if _, _, err := s.identity.RevokeUserCredentials(ctx, caller.ID, "user:"+caller.ID, "previous_owner"); err != nil {
+			writeError(w, http.StatusInternalServerError, "ownership moved, but revoking your agents and operator tokens failed: "+err.Error())
+			return
+		}
+		if s.identityKeys != nil {
+			s.identityKeys.Invalidate(caller.ID)
+		}
+	}
 	// The new owner is an admin now: their agents see every server on the
 	// next call.
 	if s.access != nil {

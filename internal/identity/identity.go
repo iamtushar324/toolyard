@@ -132,6 +132,14 @@ type ClerkProfile struct {
 	// org:member, …). It only matters for a brand-new user on a store with
 	// no active admin; see UpsertClerkUser.
 	OrgRole string
+	// NoBootstrap marks a route that only ever provisions members
+	// (federation): the sign-in never makes anyone an admin or the owner,
+	// whatever the store holds, and never claims by email.
+	NoBootstrap bool
+	// EmailUnverified: the caller could not confirm that Email is the
+	// person's verified primary address. The sign-in then never links to
+	// the primary account and never claims the owner role by email.
+	EmailUnverified bool
 }
 
 // IsOrgAdminRole reports whether a Clerk organisation role is an admin
@@ -376,8 +384,7 @@ func (s *Service) GetUserByEmail(ctx context.Context, email string) (*User, erro
 // PrimaryUser is the oldest account: the person who set toolyard up. It is
 // not the owner (Owner) once ownership has moved, so the person in charge
 // is OwnerOrPrimary; this stays for what is tied to the oldest account
-// itself (the Inbox's agent names, the first Google sign-in with
-// -owner-email linking to that account).
+// itself (the first Google sign-in with -owner-email links to it).
 func (s *Service) PrimaryUser(ctx context.Context) (*User, error) {
 	u, err := scanUser(s.db.QueryRowContext(ctx,
 		`SELECT `+userColumns+` FROM users u ORDER BY u.created_at, u.id LIMIT 1`))
@@ -463,8 +470,12 @@ func (s *Service) upsertClerkUserOnce(ctx context.Context, p ClerkProfile, owner
 	if err != nil && !errors.Is(err, sql.ErrNoRows) {
 		return nil, err
 	}
-	isOwner := ownerEmail != "" && p.Email != "" && strings.EqualFold(p.Email, ownerEmail)
-	isSeed := seed != "" && p.Email != "" && strings.EqualFold(p.Email, seed)
+	// Email matches are ASCII-only and case-insensitive (EmailEqual), and
+	// count only for an address the caller confirmed and a route that may
+	// bootstrap.
+	trusted := !p.EmailUnverified && !p.NoBootstrap
+	isOwner := trusted && EmailEqual(p.Email, ownerEmail)
+	isSeed := trusted && EmailEqual(p.Email, seed)
 	if id == "" && isOwner {
 		var pid string
 		var linked sql.NullString
@@ -502,11 +513,11 @@ func (s *Service) upsertClerkUserOnce(ctx context.Context, p ClerkProfile, owner
 			nullStr(p.Email), nullStr(p.DisplayName), nullStr(p.AvatarURL), now, now, id); err != nil {
 			return nil, err
 		}
-		// The configured owner signing in again on an install that has no
-		// owner (every admin blocked before EnsureOwner could pick one)
-		// takes the vacant role, if they are active.
+		// The configured owner signing in again (or linking to the setup
+		// account above) on an install that has no owner takes the vacant
+		// role, if they are active.
 		if vacant && isSeed {
-			if err := claimOwnerTx(ctx, tx, id, now); err != nil {
+			if _, err := claimOwnerTx(ctx, tx, id, now, ActorSignIn, "configured_owner_sign_in"); err != nil {
 				return nil, err
 			}
 		}
@@ -516,9 +527,11 @@ func (s *Service) upsertClerkUserOnce(ctx context.Context, p ClerkProfile, owner
 			return nil, err
 		}
 		role := RoleMember
-		bootstrap, err := noActiveAdmin(ctx, tx)
-		if err != nil {
-			return nil, err
+		bootstrap := false
+		if !p.NoBootstrap {
+			if bootstrap, err = noActiveAdmin(ctx, tx); err != nil {
+				return nil, err
+			}
 		}
 		if bootstrap {
 			first := false
@@ -536,7 +549,7 @@ func (s *Service) upsertClerkUserOnce(ctx context.Context, p ClerkProfile, owner
 		// unique index refuses a second owner from a concurrent sign-in;
 		// UpsertClerkUser retries that one, and it finds the owner.
 		owner := 0
-		if vacant && (isSeed || (seed == "" && role == RoleAdmin)) {
+		if !p.NoBootstrap && vacant && (isSeed || (seed == "" && role == RoleAdmin)) {
 			role, owner = RoleAdmin, 1
 		}
 		id = "u_" + uuid.NewString()
@@ -548,6 +561,28 @@ func (s *Service) upsertClerkUserOnce(ctx context.Context, p ClerkProfile, owner
 			nullStr(p.Email), nullStr(p.DisplayName), nullStr(p.AvatarURL),
 			role, StatusActive, p.ClerkUserID, now, owner); err != nil {
 			return nil, err
+		}
+		// Every automatic promotion and claim leaves an audit row, in the
+		// same transaction.
+		if role == RoleAdmin {
+			reason := "bootstrap_admin"
+			if owner == 1 {
+				reason = "owner"
+			}
+			if err := auditTx(ctx, tx, "user.role", ActorSignIn, reason,
+				fmt.Sprintf("%s role=admin", username), map[string]any{"user_id": id}); err != nil {
+				return nil, err
+			}
+		}
+		if owner == 1 {
+			reason := "first_sign_in"
+			if isSeed {
+				reason = "configured_owner_sign_in"
+			}
+			if err := auditTx(ctx, tx, "user.owner", ActorSignIn, reason,
+				fmt.Sprintf("owner -> %s (%s)", username, id), map[string]any{"to_user_id": id}); err != nil {
+				return nil, err
+			}
 		}
 	}
 	u, err := scanUser(tx.QueryRowContext(ctx, `SELECT `+userColumns+` FROM users u WHERE u.id = ?`, id))

@@ -3,6 +3,7 @@ package store_test
 import (
 	"context"
 	"database/sql"
+	"errors"
 	"path/filepath"
 	"testing"
 
@@ -54,12 +55,20 @@ func check0072(t *testing.T, db *store.DB) {
 	if _, err := db.Exec(`UPDATE users SET is_owner = 2 WHERE id = 'u_member'`); err == nil {
 		t.Fatal("is_owner = 2 accepted: the CHECK is missing")
 	}
-	// Without an owner email (or with one nobody has), the oldest admin.
+	// An owner email nobody has leaves the role vacant (that person's
+	// first sign-in claims it); without an owner email, the oldest admin.
 	if _, err := db.Exec(`UPDATE users SET is_owner = 0`); err != nil {
 		t.Fatal(err)
 	}
-	if u, err := id.EnsureOwner(ctx, "nobody@example.com"); err != nil || u.ID != "u_setup" {
-		t.Fatalf("backfill without a matching email = %+v %v, want u_setup", u, err)
+	if _, err := id.EnsureOwner(ctx, "nobody@example.com"); !errors.Is(err, identity.ErrNoUser) {
+		t.Fatalf("backfill with an owner email nobody has: %v, want ErrNoUser", err)
+	}
+	if u, err := id.EnsureOwner(ctx, ""); err != nil || u.ID != "u_setup" {
+		t.Fatalf("backfill without an owner email = %+v %v, want u_setup", u, err)
+	}
+	var actor string
+	if err := db.QueryRow(`SELECT agent_id FROM audit_events WHERE event_type = 'user.owner' ORDER BY ts DESC LIMIT 1`).Scan(&actor); err != nil || actor != identity.ActorStartup {
+		t.Fatalf("backfill audit actor = %q %v", actor, err)
 	}
 	if u, err := id.Owner(ctx); err != nil || u.ID != "u_setup" {
 		t.Fatalf("Owner after the backfill = %+v %v", u, err)

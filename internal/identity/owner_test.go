@@ -199,7 +199,19 @@ func TestEnsureOwner(t *testing.T) {
 		}
 	})
 
-	t.Run("else the oldest active admin", func(t *testing.T) {
+	t.Run("an owner email nobody has leaves it vacant", func(t *testing.T) {
+		s, _ := newTestIdentity(t)
+		clerkUser(t, s, "user_2", "two@beknown.work", "")
+		clearOwner(t, s)
+		if _, err := s.EnsureOwner(ctx, "nobody@beknown.work"); !errors.Is(err, ErrNoUser) {
+			t.Fatalf("EnsureOwner with an unknown owner email: %v, want ErrNoUser", err)
+		}
+		if ownerCount(t, s) != 0 {
+			t.Fatal("the role went to someone else")
+		}
+	})
+
+	t.Run("without an owner email, the oldest active admin", func(t *testing.T) {
 		s, admin := newTestIdentity(t)
 		time.Sleep(2 * time.Millisecond)
 		second := clerkUser(t, s, "user_2", "two@beknown.work", "")
@@ -207,9 +219,12 @@ func TestEnsureOwner(t *testing.T) {
 			t.Fatal(err)
 		}
 		clearOwner(t, s)
-		u, err := s.EnsureOwner(ctx, "nobody@beknown.work")
+		u, err := s.EnsureOwner(ctx, "")
 		if err != nil || u.ID != admin {
 			t.Fatalf("EnsureOwner = %+v %v, want the oldest admin %s", u, err, admin)
+		}
+		if auditCount(t, s, "user.owner", ActorStartup) != 1 {
+			t.Fatal("the startup claim is not audited")
 		}
 		// The oldest admin blocked: the next active admin.
 		clearOwner(t, s)
@@ -342,5 +357,197 @@ func TestFindUserForOperatorPrefersOwner(t *testing.T) {
 	}
 	if u, err := s.FindUserForOperator(ctx, ""); err != nil || u.ID != m.ID {
 		t.Fatalf("default after a transfer = %+v %v, want the new owner", u, err)
+	}
+}
+
+// auditCount counts audit rows of eventType written by actorID.
+func auditCount(t *testing.T, s *Service, eventType, actorID string) int {
+	t.Helper()
+	var n int
+	if err := s.db.QueryRow(`SELECT count(*) FROM audit_events WHERE event_type = ? AND agent_id = ?`, eventType, actorID).Scan(&n); err != nil {
+		t.Fatal(err)
+	}
+	return n
+}
+
+// The review's scenario: a fresh organisation install with an owner email.
+// An org admin signs in first and bootstraps as an admin, not the owner;
+// a restart (EnsureOwner) must not hand them the role; the configured
+// owner claims it on their first sign-in.
+func TestOwnerEmailIsNeverPassedOver(t *testing.T) {
+	ctx := context.Background()
+	s := newEmptyIdentity(t)
+	s.SetOwnerEmail("alice@beknown.work")
+	bob := upsertOrg(t, s, "user_bob", "bob@beknown.work", "org:admin", "alice@beknown.work")
+	if bob.Owner || bob.Role != RoleAdmin {
+		t.Fatalf("bob = %+v, want a bootstrap admin who is not the owner", bob)
+	}
+	if _, err := s.EnsureOwner(ctx, "alice@beknown.work"); !errors.Is(err, ErrNoUser) {
+		t.Fatalf("restart: %v, want the role still vacant", err)
+	}
+	if b, _ := s.GetUserByID(ctx, bob.ID); b.Owner {
+		t.Fatal("the restart made bob the owner")
+	}
+	alice := upsertOrg(t, s, "user_alice", "Alice@beknown.work", "org:member", "alice@beknown.work")
+	if !alice.Owner || alice.Role != RoleAdmin {
+		t.Fatalf("alice = %+v, want the owner and an admin", alice)
+	}
+	if auditCount(t, s, "user.owner", ActorSignIn) != 1 || auditCount(t, s, "user.role", ActorSignIn) != 2 {
+		t.Fatalf("sign-in audits: owner %d role %d, want 1 and 2 (bob's and alice's admin)",
+			auditCount(t, s, "user.owner", ActorSignIn), auditCount(t, s, "user.role", ActorSignIn))
+	}
+}
+
+// A route that only provisions members (federation) never bootstraps an
+// admin or the owner, even on an empty install or with the owner email.
+func TestNoBootstrapNeverPromotes(t *testing.T) {
+	ctx := context.Background()
+	s := newEmptyIdentity(t)
+	u, err := s.UpsertClerkUser(ctx, ClerkProfile{ClerkUserID: "user_f", Email: "f@beknown.work", OrgRole: "org:admin", NoBootstrap: true}, "")
+	if err != nil || u.Owner || u.Role != RoleMember {
+		t.Fatalf("federated first user = %+v %v, want a member", u, err)
+	}
+	s.SetOwnerEmail("owner@beknown.work")
+	o, err := s.UpsertClerkUser(ctx, ClerkProfile{ClerkUserID: "user_o", Email: "owner@beknown.work", NoBootstrap: true}, "")
+	if err != nil || o.Owner || o.Role != RoleMember {
+		t.Fatalf("federated owner email = %+v %v, want a member", o, err)
+	}
+	again, err := s.UpsertClerkUser(ctx, ClerkProfile{ClerkUserID: "user_o", Email: "owner@beknown.work", NoBootstrap: true}, "")
+	if err != nil || again.Owner {
+		t.Fatalf("returning federated owner email = %+v %v, want no claim", again, err)
+	}
+	if ownerCount(t, s) != 0 {
+		t.Fatal("an owner appeared")
+	}
+	// The same person through a sign-in that may bootstrap claims it.
+	if c := upsertOrg(t, s, "user_o", "owner@beknown.work", "", ""); !c.Owner {
+		t.Fatalf("configured owner's own sign-in = %+v, want the owner", c)
+	}
+}
+
+// An address the caller could not verify never links the setup account and
+// never claims the owner role.
+func TestUnverifiedEmailNeverClaims(t *testing.T) {
+	ctx := context.Background()
+	s, admin := newTestIdentity(t)
+	clearOwner(t, s)
+	u, err := s.UpsertClerkUser(ctx, ClerkProfile{ClerkUserID: "user_x", Email: "owner@beknown.work", EmailUnverified: true}, "owner@beknown.work")
+	if err != nil || u.ID == admin || u.Owner {
+		t.Fatalf("unverified owner email = %+v %v, want a separate member", u, err)
+	}
+	if ownerCount(t, s) != 0 {
+		t.Fatal("an unverified address claimed the role")
+	}
+}
+
+// Only ASCII letters fold: a Unicode look-alike never matches.
+func TestEmailEqual(t *testing.T) {
+	for _, c := range []struct {
+		a, b string
+		want bool
+	}{
+		{"Owner@Example.com", "owner@example.com", true},
+		{" owner@example.com ", "owner@example.com", true},
+		{"owner@example.com", "owner@example.org", false},
+		{"owner@\u212Aexample.com", "owner@kexample.com", false},
+		{"\u00c9ve@example.com", "\u00e9ve@example.com", false},
+		{"", "", false},
+		{"a@b", "", false},
+	} {
+		if got := EmailEqual(c.a, c.b); got != c.want {
+			t.Errorf("EmailEqual(%q, %q) = %v, want %v", c.a, c.b, got, c.want)
+		}
+	}
+}
+
+// A demoted owner (an older binary in a rolling deploy) is made an admin
+// again at startup, audited; a blocked owner stays blocked.
+func TestRepromoteOwner(t *testing.T) {
+	ctx := context.Background()
+	s, admin := newTestIdentity(t)
+	if changed, err := s.RepromoteOwner(ctx); err != nil || changed {
+		t.Fatalf("an admin owner: %v %v", changed, err)
+	}
+	if _, err := s.db.Exec(`UPDATE users SET role = ? WHERE id = ?`, RoleMember, admin); err != nil {
+		t.Fatal(err)
+	}
+	if changed, err := s.RepromoteOwner(ctx); err != nil || !changed {
+		t.Fatalf("a demoted owner: %v %v", changed, err)
+	}
+	if u, _ := s.GetUserByID(ctx, admin); u.Role != RoleAdmin || !u.Owner {
+		t.Fatalf("owner after repromotion = %+v", u)
+	}
+	if auditCount(t, s, "user.role", ActorStartup) != 1 {
+		t.Fatal("the repromotion is not audited")
+	}
+	if _, err := s.db.Exec(`UPDATE users SET status = ? WHERE id = ?`, StatusBlocked, admin); err != nil {
+		t.Fatal(err)
+	}
+	if changed, err := s.RepromoteOwner(ctx); err != nil || changed {
+		t.Fatalf("a blocked admin owner: %v %v", changed, err)
+	}
+	if u, _ := s.GetUserByID(ctx, admin); u.Status != StatusBlocked {
+		t.Fatalf("a blocked owner was re-activated: %+v", u)
+	}
+}
+
+// The host break-glass moves the role from any owner, even a blocked one.
+func TestForceTransferOwnership(t *testing.T) {
+	ctx := context.Background()
+	s, admin := newTestIdentity(t)
+	m := clerkUser(t, s, "user_m", "m@beknown.work", "")
+	x := clerkUser(t, s, "user_x", "x@beknown.work", "")
+	// The owner left and was suspended.
+	if changed, err := s.SuspendDepartedOwner(ctx, admin); err != nil || !changed {
+		t.Fatalf("suspend: %v %v", changed, err)
+	}
+	if _, err := s.ForceTransferOwnership(ctx, "u_missing", ActorCLI, false); !errors.Is(err, ErrNoUser) {
+		t.Errorf("unknown target: %v", err)
+	}
+	if err := s.SetStatus(ctx, x.ID, StatusBlocked, "x"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := s.ForceTransferOwnership(ctx, x.ID, ActorCLI, false); !errors.Is(err, ErrUserBlocked) {
+		t.Errorf("blocked target without unblock: %v", err)
+	}
+	prev, err := s.ForceTransferOwnership(ctx, m.ID, ActorCLI, false)
+	if err != nil || prev != admin {
+		t.Fatalf("break-glass: prev %q %v", prev, err)
+	}
+	if ownerID(t, s) != m.ID || ownerCount(t, s) != 1 {
+		t.Fatal("the role did not move to m")
+	}
+	if a, _ := s.GetUserByID(ctx, admin); a.Owner || a.Status != StatusBlocked {
+		t.Fatalf("previous owner = %+v, want blocked and not the owner", a)
+	}
+	if auditCount(t, s, "user.owner", ActorCLI) != 1 || auditCount(t, s, "user.role", ActorCLI) != 1 {
+		t.Fatal("the break-glass is not audited")
+	}
+	if _, err := s.ForceTransferOwnership(ctx, m.ID, ActorCLI, false); !errors.Is(err, ErrAlreadyOwner) {
+		t.Errorf("to the owner: %v", err)
+	}
+	// --unblock re-activates the target as part of the move.
+	if _, err := s.ForceTransferOwnership(ctx, x.ID, ActorCLI, true); err != nil {
+		t.Fatalf("break-glass with unblock: %v", err)
+	}
+	if u, _ := s.GetUserByID(ctx, x.ID); !u.Owner || u.Status != StatusActive || u.Role != RoleAdmin {
+		t.Fatalf("unblocked new owner = %+v", u)
+	}
+}
+
+// Agent names resolve whoever owns the agent.
+func TestAgentName(t *testing.T) {
+	ctx := context.Background()
+	s, _ := newTestIdentity(t)
+	m := clerkUser(t, s, "user_m", "m@beknown.work", "")
+	_, ag, err := s.CreateAgentWithToken(ctx, m.ID, "member-bot")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := s.AgentName(ctx, ag.ID); got != "member-bot" {
+		t.Fatalf("AgentName = %q", got)
+	}
+	if got := s.AgentName(ctx, "ag_missing"); got != "" {
+		t.Fatalf("AgentName(missing) = %q", got)
 	}
 }

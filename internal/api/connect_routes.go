@@ -177,6 +177,10 @@ func (s *Server) connectT3(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	u, err := s.upsertClerkMember(ctx, claims.Subject, member)
+	if errors.Is(err, clerk.ErrUnavailable) {
+		s.connectRefuse(ctx, w, at, http.StatusServiceUnavailable, "clerk_unavailable", err)
+		return
+	}
 	if err != nil {
 		s.connectRefuse(ctx, w, at, http.StatusInternalServerError, "internal_error", err)
 		return
@@ -184,6 +188,12 @@ func (s *Server) connectT3(w http.ResponseWriter, r *http.Request) {
 	at.user = u
 	if u.Status != identity.StatusActive {
 		s.connectRefuse(ctx, w, at, http.StatusForbidden, "user_disabled", nil)
+		return
+	}
+	// Personal sign-in: only the owner connects, as only the owner signs
+	// in (authClerkSession checks the same after its upsert).
+	if s.clerkOwnerOnly && !u.Owner {
+		s.connectRefuse(ctx, w, at, http.StatusForbidden, "not_org_member", nil)
 		return
 	}
 
