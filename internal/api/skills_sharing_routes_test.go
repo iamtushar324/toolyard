@@ -166,14 +166,14 @@ func (f *skillsSharingFake) DecideApproval(_ context.Context, by, id string, app
 	return f.source(id), nil
 }
 
-func (f *skillsSharingFake) DecideApprovalFrom(ctx context.Context, by, id string, from skillhub.Approval, approve bool, note, sha string) (*skillhub.Source, error) {
+func (f *skillsSharingFake) DecideApprovalFrom(ctx context.Context, by, id string, from skillhub.Approval, approve bool, note string, b skillhub.ApprovalBinding) (*skillhub.Source, error) {
 	f.smu.Lock()
 	cur := f.approval[id]
 	f.smu.Unlock()
 	if cur != from {
 		return nil, skillhub.ErrConflict
 	}
-	return f.DecideApproval(ctx, by, id, approve, note, sha)
+	return f.DecideApproval(ctx, by, id, approve, note, b.SHA)
 }
 
 func (f *skillsSharingFake) Contributors(context.Context) ([]skillhub.Contributor, error) {

@@ -555,9 +555,12 @@ type SharingAdmin interface {
 	DecideApproval(ctx context.Context, by, id string, approve bool, note, sha string) (*Source, error)
 	// DecideApprovalFrom is DecideApproval for a source that is still in
 	// approval state from (the Inbox decides only a source that still
-	// waits: ApprovalPending). A source in any other state is ErrConflict,
-	// so a question answered late never undoes a decision made meanwhile.
-	DecideApprovalFrom(ctx context.Context, by, id string, from Approval, approve bool, note, sha string) (*Source, error)
+	// waits: ApprovalPending), bound to what the question showed (b: its
+	// commit, and its waiting version or settings). A source in any other
+	// state is ErrConflict, so a question answered late never undoes a
+	// decision made meanwhile; so is an approval whose waiting version or
+	// settings are not the ones that would go live.
+	DecideApprovalFrom(ctx context.Context, by, id string, from Approval, approve bool, note string, b ApprovalBinding) (*Source, error)
 	// PreviewSource is a dry run of a stored source with its own settings
 	// and credential (a new approval question after a contributor changed
 	// what is fetched).
@@ -566,6 +569,16 @@ type SharingAdmin interface {
 	// included: what a skill contributor without their own credential may
 	// read (public repositories only).
 	InspectAnonymous(ctx context.Context, url string) (*RepoInfo, error)
+}
+
+// ApprovalBinding is what an approval of a contributor's source was given
+// for: the commit, and, when the question showed one waiting version, that
+// version, and the settings the question showed (an opaque digest of the
+// folder, excludes and limits). Empty Version and Config are not checked.
+type ApprovalBinding struct {
+	SHA     string
+	Version string
+	Config  string
 }
 
 // ContributorsAdmin keeps the skill contributors (*Service implements it).

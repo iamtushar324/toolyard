@@ -175,18 +175,20 @@ const bumpUpdatedAt = `CASE WHEN updated_at >= ? THEN updated_at + 1 ELSE ? END`
 // A source that needs no approval, or one already approved, is
 // ErrConflict.
 func (s *Service) DecideApproval(ctx context.Context, by, id string, approve bool, note, sha string) (*Source, error) {
-	return s.decideApproval(ctx, by, id, nil, approve, note, sha)
+	return s.decideApproval(ctx, by, id, nil, approve, note, ApprovalBinding{SHA: sha})
 }
 
 // DecideApprovalFrom is DecideApproval for a source still in approval
 // state from: any other state is ErrConflict. The Inbox decides with
 // ApprovalPending, so a late answer to the question never approves a
-// source an admin rejected on the Skills page meanwhile.
-func (s *Service) DecideApprovalFrom(ctx context.Context, by, id string, from Approval, approve bool, note, sha string) (*Source, error) {
-	return s.decideApproval(ctx, by, id, &from, approve, note, sha)
+// source an admin rejected on the Skills page meanwhile, and with the
+// question's binding (b), so it applies only to the waiting version, or
+// the settings, the question showed.
+func (s *Service) DecideApprovalFrom(ctx context.Context, by, id string, from Approval, approve bool, note string, b ApprovalBinding) (*Source, error) {
+	return s.decideApproval(ctx, by, id, &from, approve, note, b)
 }
 
-func (s *Service) decideApproval(ctx context.Context, by, id string, from *Approval, approve bool, note, sha string) (*Source, error) {
+func (s *Service) decideApproval(ctx context.Context, by, id string, from *Approval, approve bool, note string, b ApprovalBinding) (*Source, error) {
 	r, err := s.getSourceRow(ctx, s.db, id)
 	if err != nil {
 		return nil, err
@@ -202,7 +204,8 @@ func (s *Service) decideApproval(ctx context.Context, by, id string, from *Appro
 		return nil, fmt.Errorf("%w: source %s is rejected already", ErrConflict, r.Slug)
 	}
 	if approve {
-		return s.approveSource(ctx, by, r, strings.ToLower(strings.TrimSpace(sha)))
+		b.SHA = strings.ToLower(strings.TrimSpace(b.SHA))
+		return s.approveSource(ctx, by, r, b)
 	}
 	note = strings.TrimSpace(note)
 	if len(note) > maxApprovalNote {
@@ -222,44 +225,67 @@ func (s *Service) decideApproval(ctx context.Context, by, id string, from *Appro
 	return s.GetSource(ctx, id)
 }
 
-// approveSource approves a contributor's source, bound to sha, the commit
-// the approver saw (on the Inbox question, or on the source page):
-// nothing goes live that the approver did not see.
+// approveSource approves a contributor's source, bound to b, what the
+// approver saw (on the Inbox question, or on the source page): the commit
+// b.SHA and, when b names them, the waiting version b.Version and the
+// settings b.Config. Nothing goes live that the approver did not see.
 //
-//   - A waiting version at sha (built with the source's current settings)
-//     is made live first, while agents still see nothing of the source;
-//     the approval then serves exactly it.
+//   - A waiting version that matches b (built with the source's current
+//     settings) is made live first, while agents still see nothing of the
+//     source; the approval then serves exactly it.
 //   - Another waiting version of a review-mode source becomes a normal
 //     review question once the source is approved: only an admin makes it
 //     live. Of an automatic or pinned source, the next check would make
 //     it live: the approval is refused (ErrConflict).
-//   - Otherwise a live version not at sha is refused, and so is an
-//     automatic or pinned source that synced nothing yet (its first sync
-//     would make an unseen commit live).
+//   - Otherwise a live version that does not match b is refused, and so
+//     is an automatic or pinned source that synced nothing yet (its first
+//     sync would make an unseen commit live).
 //
 // The approval is stored only while the source still has the live and
 // waiting versions this checked, so a sync in between cannot slip in a
 // commit nobody saw: that is ErrConflict too, and the admin looks again.
-func (s *Service) approveSource(ctx context.Context, by string, r *sourceRow, sha string) (*Source, error) {
-	var waiting *versionRow
-	if r.PendingVersionID != "" {
-		v, err := s.getVersionRow(ctx, s.db, r.ID, r.PendingVersionID)
-		switch {
-		case err == nil:
-			waiting = v
-		case !errors.Is(err, ErrNotFound):
+func (s *Service) approveSource(ctx context.Context, by string, r *sourceRow, b ApprovalBinding) (*Source, error) {
+	sha := b.SHA
+	version := func(id string) (*versionRow, error) {
+		if id == "" {
+			return nil, nil
+		}
+		v, err := s.getVersionRow(ctx, s.db, r.ID, id)
+		if errors.Is(err, ErrNotFound) {
+			return nil, nil
+		}
+		return v, err
+	}
+	waiting, err := version(r.PendingVersionID)
+	if err != nil {
+		return nil, err
+	}
+	var live *versionRow
+	if b.Version != "" || b.Config != "" {
+		if live, err = version(r.ActiveVersionID); err != nil {
 			return nil, err
 		}
 	}
-	match := waiting != nil && sha != "" && strings.EqualFold(waiting.SHA, sha) && waiting.config == r.configHash()
+	// bound reports a version that is what the approver saw.
+	bound := func(v *versionRow) bool {
+		return v != nil && sha != "" && strings.EqualFold(v.SHA, sha) && (b.Version == "" || b.Version == v.ID) &&
+			(b.Config == "" || b.Config == v.config)
+	}
+	match := waiting != nil && waiting.config == r.configHash() && bound(waiting)
 	switch {
 	case match:
+	case waiting != nil && r.Mode != ModeReview && strings.EqualFold(waiting.SHA, sha):
+		return nil, fmt.Errorf("%w: source %s would serve commit %s with other settings (folder, excludes or limits) than the approval showed; look at it on the Skills page and approve that",
+			ErrConflict, r.Slug, reviewShort(waiting.SHA))
 	case waiting != nil && r.Mode != ModeReview:
 		return nil, fmt.Errorf("%w: source %s would serve commit %s, not %s, the commit that was approved; look at it on the Skills page and approve that",
 			ErrConflict, r.Slug, reviewShort(waiting.SHA), approvedLabel(sha))
 	case r.ActiveVersionID != "" && !strings.EqualFold(r.ActiveSHA, sha):
 		return nil, fmt.Errorf("%w: source %s serves commit %s, not %s, the commit that was approved; look at it on the Skills page and approve that",
 			ErrConflict, r.Slug, reviewShort(r.ActiveSHA), approvedLabel(sha))
+	case live != nil && !bound(live):
+		return nil, fmt.Errorf("%w: source %s serves commit %s with other settings than the approval showed; look at it on the Skills page and approve that",
+			ErrConflict, r.Slug, reviewShort(live.SHA))
 	case r.ActiveVersionID == "" && waiting == nil && r.Mode != ModeReview:
 		return nil, fmt.Errorf("%w: source %s has synced no commit yet; approve it after its first sync", ErrConflict, r.Slug)
 	}

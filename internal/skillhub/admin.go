@@ -475,6 +475,9 @@ func guardOf(r *sourceRow) updateGuard {
 // (branch, folder, excludes, limits, mode, pinned commit, credential)
 // makes its next check due at once.
 //
+// A contributor's source that is not approved forgets its waiting version
+// when its branch, pinned commit, folder, excludes or limits change.
+//
 // Only the fields the update names are written (the hide lock, for one,
 // changes only when the update names it: the admin hide path), and only
 // while the source is still as read (its updated_at); a write in between
@@ -501,11 +504,18 @@ func (s *Service) UpdateSource(ctx context.Context, by, id string, up SourceUpda
 		case g != *first:
 			return nil, fmt.Errorf("%w: source %s changed meanwhile (its approval, hide lock, paused state, mode, what it fetches or its credential); look again and retry", ErrConflict, r.Slug)
 		}
-		read := r.UpdatedAt.UnixMilli()
+		read, fetched := r.UpdatedAt.UnixMilli(), fetchKey(r)
 		if due, err = s.applyUpdate(r, up); err != nil {
 			return nil, err
 		}
-		ok, err := s.updateSourceSettings(ctx, r, up, read, due)
+		// A contributor's source that is not approved forgets its waiting
+		// version when what it fetches changed: built from the old branch
+		// or settings, it can no longer be shown or approved (the next
+		// check stages the new one, and finds an older one again when the
+		// settings come back). Also when this read saw none: a sync may
+		// stage one (setPending moves no updated_at) before this write.
+		dropWaiting := !r.Approval.Live() && fetchKey(r) != fetched
+		ok, err := s.updateSourceSettings(ctx, r, up, read, due, dropWaiting)
 		if err != nil {
 			return nil, err
 		}
@@ -521,6 +531,12 @@ func (s *Service) UpdateSource(ctx context.Context, by, id string, up SourceUpda
 		s.pokePoller()
 	}
 	return s.GetSource(ctx, id)
+}
+
+// fetchKey is what a source's versions are built from: its branch, pinned
+// commit and settings (configHash).
+func fetchKey(r *sourceRow) string {
+	return r.Branch + "\n" + r.PinnedSHA + "\n" + r.configHash()
 }
 
 // applyUpdate applies an update to r as read and validates the result. It

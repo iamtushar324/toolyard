@@ -217,40 +217,57 @@ func (st proposalStore) remove(ctx context.Context, id string) error {
 	return err
 }
 
-// insertIfNoneOpen inserts row (about row.SourceID) unless that source has
-// a row of row.Kind that is open (pending, or approved and being applied),
-// the rows in except left aside, and reports whether it inserted. The
-// count and the insert run in one transaction that holds the source's row
-// (FOR UPDATE on Postgres; SQLite has one writer), so two callers on any
-// replica never both add one. A source that is gone is ErrNotFound.
-func (st proposalStore) insertIfNoneOpen(ctx context.Context, row *proposalRow, except []string) (bool, error) {
+// lockedApproval runs decide in one transaction that holds the row of
+// source sourceID (FOR UPDATE on Postgres; SQLite has one writer), with
+// the source as it is now, its waiting version (nil when none) and its
+// open approval rows (pending, or approved and being applied). A row
+// decide returns is inserted in the same transaction and returned: two
+// askers on any replica never both add a question, and none adds one
+// that shows the source otherwise than it is. decide must not use the
+// database (on SQLite the transaction holds the only connection). A
+// source that is gone is ErrNotFound.
+func (st proposalStore) lockedApproval(ctx context.Context, sourceID string,
+	decide func(src *sourceRow, waiting *versionRow, open []proposalRow) *proposalRow) (*proposalRow, error) {
 	tx, err := st.db.BeginTx(ctx, nil)
 	if err != nil {
-		return false, err
+		return nil, err
 	}
 	defer func() { _ = tx.Rollback() }()
 	var id string
-	err = tx.QueryRowContext(ctx, `SELECT id FROM skill_sources WHERE id = ?`+st.db.Dialect.ForUpdate(), row.SourceID).Scan(&id)
+	err = tx.QueryRowContext(ctx, `SELECT id FROM skill_sources WHERE id = ?`+st.db.Dialect.ForUpdate(), sourceID).Scan(&id)
 	if errors.Is(err, sql.ErrNoRows) {
-		return false, fmt.Errorf("%w: source %s", ErrNotFound, row.SourceID)
+		return nil, fmt.Errorf("%w: source %s", ErrNotFound, sourceID)
 	}
 	if err != nil {
-		return false, err
+		return nil, err
 	}
-	q := `SELECT COUNT(*) FROM skill_proposals WHERE kind = ? AND source_id = ? AND status IN (?, ?)`
-	args := []any{row.Kind, row.SourceID, proposalPending, proposalApproved}
-	if len(except) > 0 {
-		q += ` AND id NOT IN (` + placeholders(len(except)) + `)`
-		for _, e := range except {
-			args = append(args, e)
+	src, err := scanSource(tx.QueryRowContext(ctx, `SELECT `+sourceColumns+sourceFrom+` WHERE s.id = ?`, sourceID))
+	if err != nil {
+		return nil, err
+	}
+	var waiting *versionRow
+	if src.PendingVersionID != "" {
+		v, err := scanVersion(tx.QueryRowContext(ctx, `SELECT `+versionColumns+` FROM skill_versions WHERE id = ? AND source_id = ?`,
+			src.PendingVersionID, sourceID))
+		switch {
+		case err == nil:
+			waiting = v
+		case !errors.Is(err, sql.ErrNoRows):
+			return nil, err
 		}
 	}
-	var n int
-	if err := tx.QueryRowContext(ctx, q, args...).Scan(&n); err != nil {
-		return false, err
+	rows, err := tx.QueryContext(ctx, `SELECT `+proposalColumns+` FROM skill_proposals WHERE kind = ? AND source_id = ? AND status IN (?, ?) ORDER BY created_at`,
+		proposalKindApproval, sourceID, proposalPending, proposalApproved)
+	if err != nil {
+		return nil, err
 	}
-	if n > 0 {
-		return false, nil
+	open, err := collectProposals(rows)
+	if err != nil {
+		return nil, err
+	}
+	row := decide(src, waiting, open)
+	if row == nil {
+		return nil, nil
 	}
 	now := st.now().UnixMilli()
 	row.CreatedAt, row.UpdatedAt = now, now
@@ -260,20 +277,12 @@ func (st proposalStore) insertIfNoneOpen(ctx context.Context, row *proposalRow, 
 	if _, err := tx.ExecContext(ctx, `INSERT INTO skill_proposals(`+proposalColumns+`) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		row.ID, row.Kind, row.Status, row.AgentID, row.UserID, row.SourceID, row.VersionID, row.InboxID,
 		row.Input, row.Reason, row.Result, row.Error, row.DecidedBy, row.CreatedAt, row.UpdatedAt); err != nil {
-		return false, err
-	}
-	return true, tx.Commit()
-}
-
-// openForSource lists the open rows (pending, or approved and being
-// applied) of one kind about a source, oldest first.
-func (st proposalStore) openForSource(ctx context.Context, kind, sourceID string) ([]proposalRow, error) {
-	rows, err := st.db.QueryContext(ctx, `SELECT `+proposalColumns+` FROM skill_proposals WHERE kind = ? AND source_id = ? AND status IN (?, ?) ORDER BY created_at`,
-		kind, sourceID, proposalPending, proposalApproved)
-	if err != nil {
 		return nil, err
 	}
-	return collectProposals(rows)
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return row, nil
 }
 
 // latestForSource is the newest row of one kind about a source, any

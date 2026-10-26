@@ -215,7 +215,7 @@ func TestInboxAnswerNeverUndoesAPageDecision(t *testing.T) {
 	}
 
 	// DecideApprovalFrom refuses any state but the one named.
-	if _, err := svc.DecideApprovalFrom(ctx, "usr_admin", rej.ID, ApprovalPending, true, "", ""); !errors.Is(err, ErrConflict) {
+	if _, err := svc.DecideApprovalFrom(ctx, "usr_admin", rej.ID, ApprovalPending, true, "", ApprovalBinding{}); !errors.Is(err, ErrConflict) {
 		t.Fatalf("decide from pending an approved source: %v", err)
 	}
 }
@@ -291,7 +291,11 @@ func TestApprovalQuestionIsNeverLost(t *testing.T) {
 	}
 	// The owner approves before the first sync: refused (nothing synced),
 	// and there is nothing to ask about yet.
-	if err := ri.RequestApproval(ctx, *src, &Preview{SHA: first, SkillCount: 2}, "Casey"); err != nil {
+	firstPrev, err := svc.PreviewSource(ctx, src.ID)
+	if err != nil || firstPrev.SHA != first {
+		t.Fatalf("dry run: %+v %v", firstPrev, err)
+	}
+	if err := ri.RequestApproval(ctx, *src, firstPrev, "Casey"); err != nil {
 		t.Fatal(err)
 	}
 	rows := open()
@@ -358,12 +362,16 @@ func TestApprovalQuestionIsNeverLost(t *testing.T) {
 		t.Fatal(err)
 	}
 	cur, _ := svc.GetSource(ctx, src.ID)
+	pushedPrev, err := svc.PreviewSource(ctx, src.ID)
+	if err != nil || pushedPrev.SHA != pushed {
+		t.Fatalf("dry run: %+v %v", pushedPrev, err)
+	}
 	var wg sync.WaitGroup
 	for i := 0; i < 6; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			_ = ri.RequestApproval(ctx, *cur, &Preview{SHA: pushed, SkillCount: 2}, "Casey")
+			_ = ri.RequestApproval(ctx, *cur, pushedPrev, "Casey")
 		}()
 	}
 	wg.Wait()
@@ -374,5 +382,151 @@ func TestApprovalQuestionIsNeverLost(t *testing.T) {
 	decideApprovalItem(t, ib, rows[0].InboxID, "u_owner", reviewApprove)
 	if got, _ := svc.GetSource(ctx, src.ID); got.Approval != ApprovalApproved || got.ActiveSHA != pushed {
 		t.Fatalf("after the approval: %+v", got)
+	}
+}
+
+// An approval question shows the settings that go live. A sync that read
+// the source before a folder change hands the hook its outdated source and
+// version, and a dry run of the old folder comes late: nothing is asked
+// from them. An approval bound to the old version, or to the old settings,
+// is refused, also once the new folder's version (the same commit) waits.
+// The question asked with a dry run of the new folder is the one whose
+// approval makes the new folder live.
+func TestApprovalQuestionShowsTheSettingsThatGoLive(t *testing.T) {
+	gh := newFakeGitHub(t, "acme", "skills")
+	tree := baseTree()
+	tree["other/pr-review/SKILL.md"] = skillMD("pr-review", "Review a pull request, the other way.", "", "# Other\n")
+	gh.commit("main", tree)
+	svc := newTestService(t, gh, trustAcme)
+	ri, ib := newApprovalInbox(t, svc)
+	ctx := context.Background()
+	src, err := svc.CreateSource(ctx, "usr_contrib", SourceInput{URL: "acme/skills", Path: "skills", Mode: ModeAuto, PendingApproval: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	open := func() []proposalRow {
+		t.Helper()
+		rows, err := ri.store.pendingForSource(ctx, proposalKindApproval, src.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return rows
+	}
+	// The sync stages folder skills and asks about that version.
+	a, err := svc.SyncNow(ctx, src.ID)
+	if err != nil || !a.Staged {
+		t.Fatalf("sync: %+v %v", a, err)
+	}
+	rows := open()
+	if len(rows) != 1 {
+		t.Fatalf("questions after the first sync: %+v", rows)
+	}
+	oldQ := parseApprovalInput(rows[0].Input)
+	if oldQ.Version != a.VersionID || oldQ.Config == "" || oldQ.SHA != a.SHA {
+		t.Fatalf("the question is not bound to the waiting version: %+v", oldQ)
+	}
+	staleSrc, _ := svc.GetSource(ctx, src.ID)
+	staleV, err := svc.GetVersion(ctx, src.ID, a.VersionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	oldPrev, err := svc.PreviewSource(ctx, src.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The contributor changes the folder: the waiting version is dropped,
+	// and the route closes the question.
+	other := "other"
+	if _, err := svc.UpdateSource(ctx, "usr_contrib", src.ID, SourceUpdate{Path: &other}); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := svc.GetSource(ctx, src.ID); got.PendingVersionID != "" {
+		t.Fatalf("the waiting version of the old folder stayed: %q", got.PendingVersionID)
+	}
+	if err := ri.SettleApproval(ctx, src.ID, "the folder changed"); err != nil {
+		t.Fatal(err)
+	}
+	if err := ri.PendingApprovalVersion(ctx, *staleSrc, *staleV); err != nil {
+		t.Fatal(err)
+	}
+	if err := ri.RequestApproval(ctx, *staleSrc, oldPrev, "Casey"); err != nil {
+		t.Fatal(err)
+	}
+	if rows := open(); len(rows) != 0 {
+		t.Fatalf("a question from an outdated read: %+v", rows)
+	}
+	oldSettings := ApprovalBinding{SHA: a.SHA, Config: oldQ.Config}
+	for name, bind := range map[string]ApprovalBinding{"old version": oldQ.binding(), "old settings": oldSettings} {
+		if _, err := svc.DecideApprovalFrom(ctx, "usr_admin", src.ID, ApprovalPending, true, "", bind); !errors.Is(err, ErrConflict) {
+			t.Fatalf("an approval bound to the %s: %v", name, err)
+		}
+	}
+	// The route asks with a dry run of the new folder; the sync builds the
+	// new folder's version of the same commit and keeps that question.
+	newPrev, err := svc.PreviewSource(ctx, src.ID)
+	if err != nil || newPrev.SHA != a.SHA {
+		t.Fatalf("dry run of the new folder: %+v %v", newPrev, err)
+	}
+	cur, _ := svc.GetSource(ctx, src.ID)
+	if err := ri.RequestApproval(ctx, *cur, newPrev, "Casey"); err != nil {
+		t.Fatal(err)
+	}
+	b, err := svc.SyncNow(ctx, src.ID)
+	if err != nil || !b.Staged || b.VersionID == a.VersionID || b.SHA != a.SHA {
+		t.Fatalf("sync of the new folder: %+v %v", b, err)
+	}
+	rows = open()
+	if len(rows) != 1 || parseApprovalInput(rows[0].Input).Config == oldQ.Config {
+		t.Fatalf("question for the new folder: %+v", rows)
+	}
+	for name, bind := range map[string]ApprovalBinding{"old version": oldQ.binding(), "old settings": oldSettings} {
+		if _, err := svc.DecideApprovalFrom(ctx, "usr_admin", src.ID, ApprovalPending, true, "", bind); !errors.Is(err, ErrConflict) {
+			t.Fatalf("an approval bound to the %s, the new folder waiting: %v", name, err)
+		}
+	}
+	decideApprovalItem(t, ib, rows[0].InboxID, "u_owner", reviewApprove)
+	if got, _ := svc.GetSource(ctx, src.ID); got.Approval != ApprovalApproved || got.ActiveVersionID != b.VersionID {
+		t.Fatalf("after the approval: %+v", got)
+	}
+	if s, err := svc.Get(ctx, memberViewer, "skill://"+src.Slug+"/pr-review/SKILL.md", false); err != nil || !strings.Contains(s.Body, "# Other") {
+		t.Fatalf("the approved folder is not live: %+v %v", s, err)
+	}
+}
+
+// Two open questions, one about the waiting version and one left over (a
+// crash between asking the new question and closing the old one): the
+// next check closes the leftover.
+func TestCheckClosesALeftoverQuestion(t *testing.T) {
+	gh := newFakeGitHub(t, "acme", "skills")
+	gh.commit("main", baseTree())
+	svc := newTestService(t, gh, trustAcme)
+	ri, _ := newApprovalInbox(t, svc)
+	ctx := context.Background()
+	src, err := svc.CreateSource(ctx, "usr_contrib", SourceInput{URL: "acme/skills", Path: "skills", Mode: ModeReview, PendingApproval: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.SyncNow(ctx, src.ID); err != nil {
+		t.Fatal(err)
+	}
+	rows, err := ri.store.pendingForSource(ctx, proposalKindApproval, src.ID)
+	if err != nil || len(rows) != 1 {
+		t.Fatalf("questions after the first sync: %+v %v", rows, err)
+	}
+	current := rows[0]
+	leftover := &proposalRow{ID: proposalNewID(), Kind: proposalKindApproval, Status: proposalPending, UserID: "u_owner",
+		SourceID: src.ID, Input: `{"sha":"` + strings.Repeat("e", 40) + `","skills":1,"warnings":0}`}
+	if err := ri.store.insert(ctx, leftover); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.SyncNow(ctx, src.ID); err != nil {
+		t.Fatal(err)
+	}
+	rows, err = ri.store.pendingForSource(ctx, proposalKindApproval, src.ID)
+	if err != nil || len(rows) != 1 || rows[0].ID != current.ID {
+		t.Fatalf("questions after a check: %+v %v", rows, err)
+	}
+	if r, _ := ri.store.get(ctx, leftover.ID); r.Status != proposalCancelled {
+		t.Fatalf("the leftover question: %+v", r)
 	}
 }

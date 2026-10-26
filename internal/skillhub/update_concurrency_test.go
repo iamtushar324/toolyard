@@ -26,7 +26,7 @@ func TestUpdateSourceKeepsAConcurrentHide(t *testing.T) {
 	vis, members := VisibleMembers, []string{"usr_team"}
 	up := SourceUpdate{Visibility: &vis, Members: &members}
 	stale.Visibility, stale.Members = vis, members
-	if ok, err := svc.updateSourceSettings(ctx, stale, up, stale.UpdatedAt.UnixMilli(), false); err != nil || ok {
+	if ok, err := svc.updateSourceSettings(ctx, stale, up, stale.UpdatedAt.UnixMilli(), false, false); err != nil || ok {
 		t.Fatalf("a write from a stale read: ok %v, err %v", ok, err)
 	}
 	if got, _ := svc.GetSource(ctx, src.ID); !got.Hidden || got.Visibility != VisibleEveryone {

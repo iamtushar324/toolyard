@@ -113,12 +113,16 @@ func (s *Service) listSourceRows(ctx context.Context) ([]*sourceRow, error) {
 
 // configHash is a digest of the settings a version is built with; an
 // incremental update starts only from a version with the same one.
-func (r *sourceRow) configHash() string {
+func (r *sourceRow) configHash() string { return configOf(r.Source) }
+
+// configOf is the configHash of a source's settings (its folder, excludes
+// and limits), for a source not stored yet too (a dry run's).
+func configOf(src Source) string {
 	b, _ := json.Marshal(struct {
 		Path    string   `json:"p"`
 		Exclude []string `json:"e"`
 		Limits  [4]int64 `json:"l"`
-	}{Path: r.Path, Exclude: nonNil(r.Exclude), Limits: limitsKey(r.Limits.effective())})
+	}{Path: src.Path, Exclude: nonNil(src.Exclude), Limits: limitsKey(src.Limits.effective())})
 	sum := sha256.Sum256(b)
 	return hex.EncodeToString(sum[:8])
 }
@@ -162,8 +166,8 @@ func (s *Service) insertSource(ctx context.Context, r *sourceRow) error {
 // the caller reads again) or the source is gone (the next read says so).
 // updated_at moves forward with bumpUpdatedAt, so every node's index sees
 // the change. due makes the next check due now and forgets the branch
-// head it saw.
-func (s *Service) updateSourceSettings(ctx context.Context, r *sourceRow, up SourceUpdate, read int64, due bool) (bool, error) {
+// head it saw; dropWaiting forgets the waiting version.
+func (s *Service) updateSourceSettings(ctx context.Context, r *sourceRow, up SourceUpdate, read int64, due, dropWaiting bool) (bool, error) {
 	var sets []string
 	var args []any
 	set := func(named bool, col string, v any) {
@@ -196,6 +200,9 @@ func (s *Service) updateSourceSettings(ctx context.Context, r *sourceRow, up Sou
 	if due {
 		sets = append(sets, "next_check_at = ?", "head_sha = ''", "head_etag = ''", "failures = 0")
 		args = append(args, now)
+	}
+	if dropWaiting {
+		sets = append(sets, "pending_version_id = ''")
 	}
 	sets = append(sets, "updated_at = "+bumpUpdatedAt)
 	args = append(args, now, now, r.ID, read)
