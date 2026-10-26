@@ -117,13 +117,35 @@ func (s *Server) authClerkSession(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusServiceUnavailable, "clerk_unavailable")
 		return
 	}
-	if s.clerkOwnerOnly && (s.ownerEmail == "" || !strings.EqualFold(member.Email, s.ownerEmail)) {
-		writeError(w, http.StatusForbidden, "not_org_member")
-		return
+	// Personal sign-in admits only the owner: the stored owner's email,
+	// or the configured -owner-email until there is an owner with one
+	// (identity.OwnerSignInEmail). The Clerk client checks the same
+	// address on the verified Google account.
+	if s.clerkOwnerOnly {
+		allowed, err := s.identity.OwnerSignInEmail(ctx, s.ownerEmail)
+		if err != nil {
+			writeError(w, http.StatusServiceUnavailable, "owner lookup failed")
+			return
+		}
+		if allowed == "" || !strings.EqualFold(member.Email, allowed) {
+			writeError(w, http.StatusForbidden, "not_org_member")
+			return
+		}
 	}
 	u, err := s.upsertClerkMember(ctx, claims.Subject, member)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	// The row must be the owner, too: a concurrent first sign-in may have
+	// claimed the role, or the address may belong to someone who is not
+	// (or no longer) the owner.
+	if s.clerkOwnerOnly && !u.Owner {
+		_ = s.audit.Write(ctx, audit.Event{
+			EventType: audit.EventUserLogin, AgentID: "user:" + u.ID, Decision: "denied", Reason: "not_owner",
+			ResultSummary: u.Username,
+		})
+		writeError(w, http.StatusForbidden, "not_org_member")
 		return
 	}
 	if u.Status != identity.StatusActive {

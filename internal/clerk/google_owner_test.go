@@ -1,6 +1,7 @@
 package clerk
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -66,5 +67,41 @@ func TestPersonalGoogleOwner(t *testing.T) {
 				t.Fatalf("got %+v %v, want %v", m, err, want)
 			}
 		})
+	}
+}
+
+// TestPersonalGoogleOwnerFollowsAllowedEmailFunc: with the allowed-email
+// function set (toolyard passes the stored owner's address), personal
+// access admits the address it returns, not the configured one; an empty
+// answer falls back to the configured address, and a failing lookup is an
+// outage.
+func TestPersonalGoogleOwnerFollowsAllowedEmailFunc(t *testing.T) {
+	f := newFakeClerk(t)
+	c := f.client(t)
+	c.allowedGoogleEmail = "owner@example.com"
+	signInAs := "owner@example.com"
+	f.membership = func(w http.ResponseWriter, r *http.Request) {
+		email := map[string]any{"id": "email_1", "email_address": signInAs, "verification": map[string]any{"status": "verified"}}
+		google := map[string]any{"provider": "oauth_google", "email_address": signInAs, "verification": map[string]any{"status": "verified"}}
+		json.NewEncoder(w).Encode(map[string]any{"id": "user_123", "primary_email_address_id": "email_1",
+			"email_addresses": []any{email}, "external_accounts": []any{google}})
+	}
+	current, lookupErr := "new@example.com", error(nil)
+	c.SetAllowedGoogleEmailFunc(func(context.Context) (string, error) { return current, lookupErr })
+
+	if _, err := c.OrgMembership(t.Context(), "user_123"); !errors.Is(err, ErrNotMember) {
+		t.Fatalf("configured address after a transfer: %v, want ErrNotMember", err)
+	}
+	signInAs = "New@example.com"
+	if m, err := c.OrgMembership(t.Context(), "user_123"); err != nil || m.Email != "New@example.com" {
+		t.Fatalf("current owner's address: %+v %v", m, err)
+	}
+	current, signInAs = "", "owner@example.com"
+	if _, err := c.OrgMembership(t.Context(), "user_123"); err != nil {
+		t.Fatalf("empty answer falls back to the configured address: %v", err)
+	}
+	lookupErr = errors.New("db down")
+	if _, err := c.OrgMembership(t.Context(), "user_123"); !errors.Is(err, ErrUnavailable) {
+		t.Fatalf("failing lookup: %v, want ErrUnavailable", err)
 	}
 }

@@ -2,16 +2,17 @@
 //
 // Routes (all under /v1):
 //
-//	POST /v1/auth/setup           one-time create the local user
+//	POST /v1/auth/setup           one-time create the local user (the owner)
 //	POST /v1/auth/login           username + password -> session cookie
 //	POST /v1/auth/clerk/session   Clerk session JWT -> session cookie
 //	GET  /v1/auth/config          which sign-in methods are on (public)
 //	POST /v1/connect/t3           bkt3: Clerk session JWT -> the person's agent token
 //	POST /v1/auth/logout
-//	GET  /v1/auth/me              current user, with role
+//	GET  /v1/auth/me              current user, with role and is_owner
 //
 //	GET  /v1/users                admin: every user + grantable groups
 //	PATCH /v1/users/{id}          admin: role / status / servers
+//	POST /v1/users/{id}/make-owner      the owner: transfer ownership
 //	POST /v1/users/{id}/revoke-sessions
 //	GET  /v1/me/servers           groups the caller may use
 //	GET  /v1/me/connections       per_user servers the caller may connect, with state
@@ -255,6 +256,8 @@ type Options struct {
 	// OwnerEmail: the first Clerk sign-in with this email (case-insensitive)
 	// attaches to the existing primary password user instead of creating a
 	// new member, so the owner keeps their admin role, agents and passkeys.
+	// On an install without an owner, it names who may claim the role; it
+	// only seeds the owner (identity/owner.go).
 	OwnerEmail     string
 	ClerkOwnerOnly bool
 	// ConnectAZP (-connect-azp) lists the bkt3 browser origins whose Clerk
@@ -699,7 +702,9 @@ func (s *Server) sessionUser(r *http.Request) (*identity.User, bool) {
 		return nil, false
 	}
 	u, err := s.identity.GetUserByID(r.Context(), id)
-	if err != nil || u.Status != identity.StatusActive || (s.clerkOwnerOnly && (u.Auth != identity.AuthClerk || !strings.EqualFold(u.Email, s.ownerEmail))) {
+	// Personal sign-in (-clerk-owner-only): only the owner's Google
+	// session counts, so a transfer ends the previous owner's sessions.
+	if err != nil || u.Status != identity.StatusActive || (s.clerkOwnerOnly && (u.Auth != identity.AuthClerk || !u.Owner)) {
 		return nil, false
 	}
 	return u, true

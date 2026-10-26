@@ -516,6 +516,24 @@ func runServe(argv []string) error {
 	}
 
 	idSvc := identity.New(db)
+	// The configured owner email only seeds the owner (identity/owner.go):
+	// on an install without one, only that person's sign-in claims the
+	// role. An install that had users before the owner existed gets one
+	// now: that person, else the oldest active admin.
+	idSvc.SetOwnerEmail(*ownerEmail)
+	if owner, err := idSvc.EnsureOwner(ctx, *ownerEmail); err == nil {
+		log.Printf("toolyard: owner is %s", owner.Username)
+	} else if !errors.Is(err, identity.ErrNoUser) {
+		log.Printf("toolyard: WARN choosing the owner: %v", err)
+	}
+	// Personal sign-in follows the stored owner, so a transfer of
+	// ownership moves it to the new owner.
+	if clerkClient != nil && *clerkOwnerOnly {
+		seed := *ownerEmail
+		clerkClient.SetAllowedGoogleEmailFunc(func(ctx context.Context) (string, error) {
+			return idSvc.OwnerSignInEmail(ctx, seed)
+		})
+	}
 	auditSvc := audit.New(db)
 	memSvc := memory.New(db)
 	// Roles and per-user tool-group grants. The gateway asks it on every
@@ -556,7 +574,7 @@ func runServe(argv []string) error {
 	bus.AddNotifierFunc(func(ctx context.Context, req *approval.Request, eventType string) {
 		hub.Publish(realtime.Event{Type: "approval", Data: req})
 		if eventType == "approval.create" {
-			user, err := idSvc.PrimaryUser(ctx)
+			user, err := idSvc.OwnerOrPrimary(ctx)
 			if uid := req.PersonalOwner(); uid != "" {
 				user, err = idSvc.GetUserByID(ctx, uid)
 			}
@@ -873,7 +891,7 @@ func runServe(argv []string) error {
 		Publish:           func(t string, d any) { hub.Publish(realtime.Event{Type: t, Data: d}) },
 		AgentName:         agentName,
 		Notify: func(ctx context.Context, p inbox.Push) {
-			user, err := idSvc.PrimaryUser(ctx)
+			user, err := idSvc.OwnerOrPrimary(ctx)
 			if err != nil {
 				return
 			}
@@ -1130,7 +1148,7 @@ func runServe(argv []string) error {
 		if len(src.NotifyTypes) > 0 && !containsStr(src.NotifyTypes, ev.Type) {
 			return
 		}
-		user, uerr := idSvc.PrimaryUser(ctx)
+		user, uerr := idSvc.OwnerOrPrimary(ctx)
 		if uerr != nil {
 			return
 		}
@@ -1420,7 +1438,7 @@ func runServe(argv []string) error {
 			// A review goes to the owner when the source's creator is no
 			// longer an active admin.
 			FallbackReviewer: func(ctx context.Context) (string, error) {
-				u, err := idSvc.PrimaryUser(ctx)
+				u, err := idSvc.OwnerOrPrimary(ctx)
 				if err != nil {
 					return "", err
 				}
@@ -2342,7 +2360,8 @@ func (h hubEventBus) Publish(eventType string, data any) {
 	h.hub.Publish(realtime.Event{Type: eventType, Data: data})
 }
 
-// identityResolver adapts identity.Service.PrimaryUser → oauth.IdentityResolver.
+// identityResolver adapts identity.Service.OwnerOrPrimary (the person in
+// charge, who gets reauthorisation pushes) → oauth.IdentityResolver.
 // cancelAgentWork cancels a revoked OAuth client's pending approvals
 // (personal ones included) and Inbox requests and revokes its Inbox
 // grants, each recorded as done by the system because the grant was
@@ -2412,7 +2431,7 @@ func registryUpstreams(servers []upstreams.Server) []string {
 type identityResolver struct{ id *identity.Service }
 
 func (r identityResolver) PrimaryUserID(ctx context.Context) (string, error) {
-	u, err := r.id.PrimaryUser(ctx)
+	u, err := r.id.OwnerOrPrimary(ctx)
 	if err != nil {
 		return "", err
 	}

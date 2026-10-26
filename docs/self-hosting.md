@@ -10,7 +10,8 @@ go build -o toolyard ./cmd/gateway
 ```
 
 Open <http://localhost:8787>. The first visit asks you to create the local
-admin account. Subsequent visits land on `/Approvals`.
+admin account; that first account is the **owner** ([The owner and
+admins](#the-owner-and-admins)). Subsequent visits land on `/Approvals`.
 
 ## Quickstart (Docker)
 
@@ -750,6 +751,11 @@ stays as the break-glass login.
      -owner-email you@example.com
    ```
 
+   On a fresh install with no password account, `-owner-email` decides who
+   becomes the owner: only that person's first sign-in claims it. Without
+   it, the first person to sign in becomes the owner. See [The owner and
+   admins](#the-owner-and-admins).
+
 Everyone else who signs in becomes a **member**: they see their own profile,
 manage their own agents, and their agents reach only the servers and data
 groups (memory, events, notes) an admin grants them on the **Users** page.
@@ -779,6 +785,13 @@ browser sessions cannot access the dashboard API. The first permitted
 login links to the existing owner account, retaining its agents, grants,
 passkeys, and data. Agent and operator token authentication is preserved.
 
+In this mode only the **owner** signs in. `-owner-email` names them until
+there is an owner with an email on file; after that the stored owner's
+email is the address that counts. When the owner transfers ownership, only
+the new owner can sign in from then on (the transfer needs them to have an
+email), and the previous owner's browser sessions stop working. Allow the
+new owner's Google account in the Clerk app too.
+
 Enable only Google in the dedicated Clerk app. Restrict Clerk signups to
 the same email, using an allowlist or invite-only access as available on
 your plan. The Toolyard server check remains mandatory: signup restrictions
@@ -786,6 +799,54 @@ alone do not authorize existing accounts. Store keys outside Git and argv.
 
 Rollback: remove `-clerk-owner-only` and the Clerk environment variables,
 and restore the prior image/configuration. No database migration is added.
+
+## The owner and admins
+
+Every install has one **owner**: the person in charge. The owner is always
+an active admin; nobody can demote or block them, and only the owner can
+make someone else the owner.
+
+Who becomes the owner on an install that has none:
+
+- the account the first-visit setup (`POST /v1/auth/setup`) creates;
+- else the first verified Google (Clerk) sign-in. With `-owner-email` set,
+  only that person becomes the owner, on their first sign-in, and nobody
+  else can claim it; anyone who signs in before them is a member (or an
+  admin, if they are an admin of the Clerk organisation and there is no
+  admin yet). Without `-owner-email`, the first person to sign in becomes
+  the owner and an admin. Of two first sign-ins at the same moment exactly
+  one becomes the owner; the other is a member.
+
+Everyone who signs in later is a member until an admin changes that.
+
+`-owner-email` only seeds the owner. Once there is one, the stored owner
+is what counts: changing the flag does not move ownership, and a transfer
+does not need the flag changed.
+
+**Upgrading.** An install that had users before the owner existed gets one
+when it starts: the active user whose email is `-owner-email`, else the
+oldest active admin (on a typical install, the password account created at
+setup). The server logs `toolyard: owner is <username>`.
+
+**Transfer ownership.** On **People & agents → People**, the owner clicks
+**Make owner** on another active person's row and types that person's
+username or email to confirm. The new owner becomes an admin; the previous
+owner stays an admin until the new owner changes that. Each transfer
+writes a `user.owner` audit row. Over REST it is
+`POST /v1/users/{id}/make-owner {"confirm":"<username, email or name>"}`
+from the owner's browser session.
+
+**Make anyone admin.** The owner and every admin can promote any person to
+admin and demote admins (`PATCH /v1/users/{id} {"role":"admin"|"member"}`).
+Two limits hold: nobody changes their own role, and someone must stay an
+active admin. To demote or block the owner, transfer ownership first.
+
+Agents and operator tokens cannot change roles or ownership, whatever
+their scopes: both need a person signed in to the dashboard (role changes
+an admin, a transfer the owner).
+
+Rollback: an older binary ignores the owner column (migration 0072) and
+treats the oldest account as the owner again.
 
 ## Inbox voice notes with ElevenLabs
 

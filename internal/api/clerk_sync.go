@@ -40,8 +40,9 @@ func (s *Server) StartClerkSync(ctx context.Context, every time.Duration) {
 //
 // It fails safe: any error listing the org, or an org that reports zero
 // members, changes nothing — a Clerk outage must never read as "everyone
-// left". Users without a clerk_user_id (the password owner) are never
-// touched, and the last active admin is skipped with a log line.
+// left". Users without a clerk_user_id (password accounts) are never
+// touched, and the owner and the last active admin are skipped with a log
+// line.
 func (s *Server) runClerkSync(ctx context.Context) int {
 	lg := logx.For("clerk-sync")
 	members, err := s.clerk.OrgMembers(ctx)
@@ -68,6 +69,9 @@ func (s *Server) runClerkSync(ctx context.Context) int {
 		}
 		err := s.identity.SetStatus(ctx, u.ID, identity.StatusBlocked, "left_org")
 		switch {
+		case errors.Is(err, identity.ErrOwner):
+			lg.Warn("user left the org but is the owner; left active (transfer ownership to block them)", "user", u.Username)
+			continue
 		case errors.Is(err, identity.ErrLastAdmin):
 			lg.Warn("user left the org but is the last active admin; left active", "user", u.Username)
 			continue

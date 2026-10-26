@@ -185,9 +185,9 @@ func TestAuthClerkSessionThrottle(t *testing.T) {
 
 func TestPasswordLoginBlocked(t *testing.T) {
 	e := newAccessTestServer(t)
-	// Promote a member so the admin can be blocked.
+	// Make a member the owner (and so an admin) so the admin can be blocked.
 	m := e.member(t, "user_m", "m@beknown.work")
-	if err := e.id.SetRole(t.Context(), m.ID, identity.RoleAdmin); err != nil {
+	if err := e.id.TransferOwnership(t.Context(), e.admin.ID, m.ID); err != nil {
 		t.Fatal(err)
 	}
 	if err := e.id.SetStatus(t.Context(), e.admin.ID, identity.StatusBlocked, "x"); err != nil {

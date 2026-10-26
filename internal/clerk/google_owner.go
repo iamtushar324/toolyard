@@ -17,6 +17,16 @@ func (c *Client) googleOwner(ctx context.Context, userID string) (Member, error)
 	if strings.TrimSpace(userID) == "" {
 		return Member{}, ErrNotMember
 	}
+	allowed := c.allowedGoogleEmail
+	if c.allowedEmailFn != nil {
+		e, err := c.allowedEmailFn(ctx)
+		if err != nil {
+			return Member{}, fmt.Errorf("%w: allowed email lookup", ErrUnavailable)
+		}
+		if e = strings.TrimSpace(e); e != "" {
+			allowed = e
+		}
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, c.apiBase+"/users/"+url.PathEscape(userID), nil)
 	if err != nil {
 		return Member{}, fmt.Errorf("%w: user request", ErrUnavailable)
@@ -65,7 +75,7 @@ func (c *Client) googleOwner(ctx context.Context, userID string) (Member, error)
 	}
 	email := ""
 	for _, e := range user.Emails {
-		if e.ID == user.PrimaryEmailID && e.Verification.Status == "verified" && strings.EqualFold(e.Email, c.allowedGoogleEmail) {
+		if e.ID == user.PrimaryEmailID && e.Verification.Status == "verified" && strings.EqualFold(e.Email, allowed) {
 			email = e.Email
 			break
 		}

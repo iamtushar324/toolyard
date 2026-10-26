@@ -1,6 +1,6 @@
-// Package identity manages dashboard users (the local password owner plus
-// Clerk-linked staff, each with a role and a status), their sessions, and
-// agent enrollment tokens.
+// Package identity manages dashboard users (the owner, local password
+// accounts and Clerk-linked staff, each with a role and a status), their
+// sessions, and agent enrollment tokens. owner.go holds the owner rules.
 package identity
 
 import (
@@ -80,6 +80,10 @@ const (
 
 type Service struct {
 	db *store.DB
+	// ownerEmail is the configured -owner-email (SetOwnerEmail): on an
+	// install without an owner, only a sign-in with this address claims
+	// the owner role, whichever route the sign-in came through.
+	ownerEmail string
 }
 
 func New(db *store.DB) *Service { return &Service{db: db} }
@@ -102,6 +106,10 @@ type User struct {
 	ClerkUserID string `json:"clerk_user_id,omitempty"`
 	CreatedAt   int64  `json:"created_at"`
 	LastSeenAt  int64  `json:"last_seen_at,omitempty"`
+	// Owner marks the one person in charge of the install (owner.go):
+	// always an active admin, never demoted or blocked, and the only one
+	// who can transfer the role.
+	Owner bool `json:"is_owner"`
 }
 
 // Label is how the person is shown: their display name, else their
@@ -142,7 +150,8 @@ type UserSummary struct {
 // userColumns is the SELECT list every user read shares (alias u); scanUser
 // reads it in the same order.
 const userColumns = `u.id, u.username, COALESCE(u.email,''), COALESCE(u.display_name,''), COALESCE(u.avatar_url,''),
-	u.role, u.status, COALESCE(u.blocked_reason,''), COALESCE(u.clerk_user_id,''), u.created_at, COALESCE(u.last_seen_at,0)`
+	u.role, u.status, COALESCE(u.blocked_reason,''), COALESCE(u.clerk_user_id,''), u.created_at, COALESCE(u.last_seen_at,0),
+	COALESCE(u.is_owner,0)`
 
 type rowScanner interface {
 	Scan(dest ...any) error
@@ -151,12 +160,14 @@ type rowScanner interface {
 // scanUser reads userColumns (plus any extra trailing columns) from row.
 func scanUser(row rowScanner, extra ...any) (*User, error) {
 	var u User
+	var owner int64
 	dest := []any{&u.ID, &u.Username, &u.Email, &u.DisplayName, &u.AvatarURL,
-		&u.Role, &u.Status, &u.BlockedReason, &u.ClerkUserID, &u.CreatedAt, &u.LastSeenAt}
+		&u.Role, &u.Status, &u.BlockedReason, &u.ClerkUserID, &u.CreatedAt, &u.LastSeenAt, &owner}
 	dest = append(dest, extra...)
 	if err := row.Scan(dest...); err != nil {
 		return nil, err
 	}
+	u.Owner = owner == 1
 	u.Auth = AuthPassword
 	if u.ClerkUserID != "" {
 		u.Auth = AuthClerk
@@ -276,7 +287,7 @@ func (s *Service) CreateUser(ctx context.Context, username, password string) (*U
 	// Stamp before the slow hash, as before: created_at orders users.
 	now := time.Now().UnixMilli()
 	hash := hashPassword(password)
-	// The first (and only) password user is the owner: an admin. The
+	// The first (and only) password user is the owner and an admin. The
 	// empty-store check and the insert share one transaction; on Postgres
 	// the users table is locked against writers for it (SQLite's single
 	// connection already serialises it), so two concurrent setups, or a
@@ -299,7 +310,7 @@ func (s *Service) CreateUser(ctx context.Context, username, password string) (*U
 		return nil, ErrUserExists
 	}
 	if _, err := tx.ExecContext(ctx,
-		`INSERT INTO users(id, username, password_hash, role, status, created_at, updated_at) VALUES(?,?,?,?,?,?,?)`,
+		`INSERT INTO users(id, username, password_hash, role, status, created_at, updated_at, is_owner) VALUES(?,?,?,?,?,?,?,1)`,
 		id, username, hash, RoleAdmin, StatusActive, now, now); err != nil {
 		return nil, err
 	}
@@ -362,7 +373,11 @@ func (s *Service) GetUserByEmail(ctx context.Context, email string) (*User, erro
 	return u, nil
 }
 
-// PrimaryUser is the oldest account: the local owner who set toolyard up.
+// PrimaryUser is the oldest account: the person who set toolyard up. It is
+// not the owner (Owner) once ownership has moved, so the person in charge
+// is OwnerOrPrimary; this stays for what is tied to the oldest account
+// itself (the Inbox's agent names, the first Google sign-in with
+// -owner-email linking to that account).
 func (s *Service) PrimaryUser(ctx context.Context) (*User, error) {
 	u, err := scanUser(s.db.QueryRowContext(ctx,
 		`SELECT `+userColumns+` FROM users u ORDER BY u.created_at, u.id LIMIT 1`))
@@ -380,14 +395,22 @@ func (s *Service) PrimaryUser(ctx context.Context) (*User, error) {
 // UpsertClerkUser records a verified Clerk sign-in and returns the local
 // user. A returning Clerk id updates the profile and last_seen_at. A new
 // Clerk id whose email equals ownerEmail (case-insensitive) attaches to the
-// primary user when that row isn't linked yet, so the owner keeps their
-// admin role, agents, passkeys and push subscriptions. Anyone else becomes
-// a member with a username derived from their email — except that while
-// the store has no active admin at all (a fresh install where nobody ran
-// the password setup, or every admin blocked), the owner or an admin of
-// the Clerk organisation becomes admin, so someone can always reach the
-// Users page: /v1/auth/setup closes as soon as any user exists. Blocked
-// users are returned as they are; the caller decides what that means.
+// primary user when that row isn't linked yet, so the person who set
+// toolyard up keeps their role, agents, passkeys and push subscriptions.
+// Anyone else becomes a member with a username derived from their email —
+// except that while the store has no active admin at all (a fresh install
+// where nobody ran the password setup, or every admin blocked), the owner
+// email, an admin of the Clerk organisation, or (with no owner email
+// configured) the very first account becomes admin, so someone can always
+// reach the Users page: /v1/auth/setup closes as soon as any user exists.
+//
+// On an install without an owner the sign-in may also claim the owner
+// role (owner.go): with an owner email configured (ownerEmail, else the
+// one SetOwnerEmail gave) only that person, new or returning; without one,
+// whoever this sign-in makes the bootstrap admin. The claim is atomic: of
+// two concurrent first sign-ins one becomes the owner, the other retries
+// and is a member. Blocked users are returned as they are; the caller
+// decides what that means.
 func (s *Service) UpsertClerkUser(ctx context.Context, p ClerkProfile, ownerEmail string) (*User, error) {
 	p.ClerkUserID = strings.TrimSpace(p.ClerkUserID)
 	if p.ClerkUserID == "" {
@@ -415,6 +438,13 @@ func (s *Service) UpsertClerkUser(ctx context.Context, p ClerkProfile, ownerEmai
 // profile.
 func (s *Service) upsertClerkUserOnce(ctx context.Context, p ClerkProfile, ownerEmail string) (*User, error) {
 	now := time.Now().UnixMilli()
+	// seed is the configured owner email that may claim a vacant owner
+	// role. ownerEmail (the caller's) only drives the link to the primary
+	// user below, as it always has.
+	seed := ownerEmail
+	if seed == "" {
+		seed = s.ownerEmail
+	}
 
 	// One transaction so two concurrent first sign-ins can't both pick the
 	// same username or both attach to the owner row (on Postgres the
@@ -434,6 +464,7 @@ func (s *Service) upsertClerkUserOnce(ctx context.Context, p ClerkProfile, owner
 		return nil, err
 	}
 	isOwner := ownerEmail != "" && p.Email != "" && strings.EqualFold(p.Email, ownerEmail)
+	isSeed := seed != "" && p.Email != "" && strings.EqualFold(p.Email, seed)
 	if id == "" && isOwner {
 		var pid string
 		var linked sql.NullString
@@ -460,6 +491,10 @@ func (s *Service) upsertClerkUserOnce(ctx context.Context, p ClerkProfile, owner
 			}
 		}
 	}
+	vacant, err := noOwner(ctx, tx)
+	if err != nil {
+		return nil, err
+	}
 	if id != "" {
 		if _, err := tx.ExecContext(ctx,
 			`UPDATE users SET email = ?, display_name = ?, avatar_url = ?, last_seen_at = ?, updated_at = ?
@@ -467,29 +502,51 @@ func (s *Service) upsertClerkUserOnce(ctx context.Context, p ClerkProfile, owner
 			nullStr(p.Email), nullStr(p.DisplayName), nullStr(p.AvatarURL), now, now, id); err != nil {
 			return nil, err
 		}
+		// The configured owner signing in again on an install that has no
+		// owner (every admin blocked before EnsureOwner could pick one)
+		// takes the vacant role, if they are active.
+		if vacant && isSeed {
+			if err := claimOwnerTx(ctx, tx, id, now); err != nil {
+				return nil, err
+			}
+		}
 	} else {
 		username, err := freeUsername(ctx, tx, usernameFromEmail(p.Email))
 		if err != nil {
 			return nil, err
 		}
 		role := RoleMember
-		if isOwner || IsOrgAdminRole(p.OrgRole) {
-			bootstrap, err := noActiveAdmin(ctx, tx)
-			if err != nil {
-				return nil, err
+		bootstrap, err := noActiveAdmin(ctx, tx)
+		if err != nil {
+			return nil, err
+		}
+		if bootstrap {
+			first := false
+			if seed == "" {
+				if first, err = noUsers(ctx, tx); err != nil {
+					return nil, err
+				}
 			}
-			if bootstrap {
+			if isOwner || isSeed || IsOrgAdminRole(p.OrgRole) || first {
 				role = RoleAdmin
 			}
+		}
+		// A vacant owner role goes to the configured owner, or, with no
+		// owner email configured, to the bootstrap admin. The partial
+		// unique index refuses a second owner from a concurrent sign-in;
+		// UpsertClerkUser retries that one, and it finds the owner.
+		owner := 0
+		if vacant && (isSeed || (seed == "" && role == RoleAdmin)) {
+			role, owner = RoleAdmin, 1
 		}
 		id = "u_" + uuid.NewString()
 		if _, err := tx.ExecContext(ctx,
 			`INSERT INTO users(id, username, password_hash, created_at, updated_at,
-                               email, display_name, avatar_url, role, status, clerk_user_id, last_seen_at)
-             VALUES(?,?,'',?,?,?,?,?,?,?,?,?)`,
+                               email, display_name, avatar_url, role, status, clerk_user_id, last_seen_at, is_owner)
+             VALUES(?,?,'',?,?,?,?,?,?,?,?,?,?)`,
 			id, username, now, now,
 			nullStr(p.Email), nullStr(p.DisplayName), nullStr(p.AvatarURL),
-			role, StatusActive, p.ClerkUserID, now); err != nil {
+			role, StatusActive, p.ClerkUserID, now, owner); err != nil {
 			return nil, err
 		}
 	}
@@ -568,8 +625,9 @@ func (s *Service) ListUsers(ctx context.Context) ([]UserSummary, error) {
 	return out, rows.Err()
 }
 
-// SetRole changes a user's role. Demoting the last active admin is
-// ErrLastAdmin: someone must always be able to approve.
+// SetRole changes a user's role. Demoting the owner is ErrOwner (transfer
+// ownership first); demoting the last active admin is ErrLastAdmin:
+// someone must always be able to approve.
 func (s *Service) SetRole(ctx context.Context, id, role string) error {
 	if role != RoleAdmin && role != RoleMember {
 		return ErrInvalidRole
@@ -579,26 +637,40 @@ func (s *Service) SetRole(ctx context.Context, id, role string) error {
 		return err
 	}
 	defer func() { _ = tx.Rollback() }()
-	curRole, curStatus, err := roleStatus(ctx, tx, id)
+	curRole, curStatus, owner, err := roleStatus(ctx, tx, id)
 	if err != nil {
 		return err
+	}
+	if owner && role != RoleAdmin {
+		return ErrOwner
 	}
 	if curRole == RoleAdmin && curStatus == StatusActive && role == RoleMember {
 		if err := ensureOtherActiveAdmin(ctx, tx, s.db.Dialect, id); err != nil {
 			return err
 		}
 	}
-	if _, err := tx.ExecContext(ctx, `UPDATE users SET role = ?, updated_at = ? WHERE id = ?`,
-		role, time.Now().UnixMilli(), id); err != nil {
+	// A demotion matches only a row that is not the owner: a transfer to
+	// this user that committed after the read above makes it ErrOwner.
+	q := `UPDATE users SET role = ?, updated_at = ? WHERE id = ?`
+	if role != RoleAdmin {
+		q += ` AND is_owner = 0`
+	}
+	res, err := tx.ExecContext(ctx, q, role, time.Now().UnixMilli(), id)
+	if err != nil {
 		return err
+	}
+	if n, err := res.RowsAffected(); err != nil {
+		return err
+	} else if n == 0 {
+		return ErrOwner
 	}
 	return tx.Commit()
 }
 
 // SetStatus blocks or re-activates a user. Blocking records reason, revokes
 // every session (the agents stop on their next token check), and refuses
-// to take out the last active admin. Re-activating clears the reason but
-// leaves revoked sessions revoked.
+// to take out the owner (ErrOwner) or the last active admin. Re-activating
+// clears the reason but leaves revoked sessions revoked.
 func (s *Service) SetStatus(ctx context.Context, id, status, reason string) error {
 	if status != StatusActive && status != StatusBlocked {
 		return ErrInvalidStatus
@@ -608,21 +680,31 @@ func (s *Service) SetStatus(ctx context.Context, id, status, reason string) erro
 		return err
 	}
 	defer func() { _ = tx.Rollback() }()
-	curRole, curStatus, err := roleStatus(ctx, tx, id)
+	curRole, curStatus, owner, err := roleStatus(ctx, tx, id)
 	if err != nil {
 		return err
 	}
 	now := time.Now().UnixMilli()
 	if status == StatusBlocked {
+		if owner {
+			return ErrOwner
+		}
 		if curRole == RoleAdmin && curStatus == StatusActive {
 			if err := ensureOtherActiveAdmin(ctx, tx, s.db.Dialect, id); err != nil {
 				return err
 			}
 		}
-		if _, err := tx.ExecContext(ctx,
-			`UPDATE users SET status = ?, blocked_reason = ?, updated_at = ? WHERE id = ?`,
-			status, nullStr(strings.TrimSpace(reason)), now, id); err != nil {
+		// As in SetRole: never the owner, even one made so meanwhile.
+		res, err := tx.ExecContext(ctx,
+			`UPDATE users SET status = ?, blocked_reason = ?, updated_at = ? WHERE id = ? AND is_owner = 0`,
+			status, nullStr(strings.TrimSpace(reason)), now, id)
+		if err != nil {
 			return err
+		}
+		if n, err := res.RowsAffected(); err != nil {
+			return err
+		} else if n == 0 {
+			return ErrOwner
 		}
 		if err := revokeAllForUser(ctx, tx, id, now); err != nil {
 			return err
@@ -640,12 +722,13 @@ func (s *Service) SetStatus(ctx context.Context, id, status, reason string) erro
 	return tx.Commit()
 }
 
-func roleStatus(ctx context.Context, tx *sql.Tx, id string) (role, status string, err error) {
-	err = tx.QueryRowContext(ctx, `SELECT role, status FROM users WHERE id = ?`, id).Scan(&role, &status)
+func roleStatus(ctx context.Context, tx *sql.Tx, id string) (role, status string, owner bool, err error) {
+	var isOwner int64
+	err = tx.QueryRowContext(ctx, `SELECT role, status, COALESCE(is_owner,0) FROM users WHERE id = ?`, id).Scan(&role, &status, &isOwner)
 	if errors.Is(err, sql.ErrNoRows) {
-		return "", "", ErrNoUser
+		return "", "", false, ErrNoUser
 	}
-	return role, status, err
+	return role, status, isOwner == 1, err
 }
 
 // noActiveAdmin reports whether the store has no admin who could sign in.
