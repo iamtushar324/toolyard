@@ -612,6 +612,13 @@ def main():
         step("sharing", sharing)
 
         def contributors():
+            # Start from a member who is not a contributor and has no sources,
+            # whatever an interrupted earlier run left behind.
+            admin.req("DELETE", "/v1/skills/admin/contributors/%s" % member_id)
+            left = admin.j("GET", "/v1/skills/admin/sources")
+            for x in (left.get("sources", left) if isinstance(left, dict) else left) or []:
+                if x.get("created_by") == member_id:
+                    admin.req("DELETE", "/v1/skills/sources/%s" % x["id"])
             url = "https://github.com/%s/tree/%s/skills/incident-triage" % (FIXTURE_REPO, FIXTURE_BRANCH)
             r = msess.post(BASE + "/v1/skills/sources", json={"url": url, "mode": "review"}, timeout=60)
             check("a member who is not a contributor cannot add a source", r.status_code in (401, 403, 404), r.status_code)
@@ -642,7 +649,9 @@ def main():
                   bool(pend.get("sha")) and not s.get("active_version_id"), {"pending": pend.get("sha"), "active": s.get("active_sha")})
             r = admin.req("POST", "/v1/skills/sources/%s/approval" % cid, json={"decision": "approve", "sha": "0" * 40})
             check("an approval for another commit is refused", r.status_code == 409, r.status_code)
-            admin.j("POST", "/v1/skills/sources/%s/approval" % cid, json={"decision": "approve", "sha": pend.get("sha", "")})
+            r = admin.req("POST", "/v1/skills/sources/%s/approval" % cid, json={"decision": "approve", "sha": pend.get("sha", ""), "version_id": "skv_not_this_one"})
+            check("an approval for another version of the same commit is refused", r.status_code == 409, r.status_code)
+            admin.j("POST", "/v1/skills/sources/%s/approval" % cid, json={"decision": "approve", "sha": pend.get("sha", ""), "version_id": pend.get("id", "")})
             s = admin.j("GET", "/v1/skills/sources/%s" % cid)
             s = s.get("source", s)
             if s.get("pending_version_id"):
