@@ -2,16 +2,17 @@
 //
 // Routes (all under /v1):
 //
-//	POST /v1/auth/setup           one-time create the local user
+//	POST /v1/auth/setup           one-time create the local user (the owner)
 //	POST /v1/auth/login           username + password -> session cookie
 //	POST /v1/auth/clerk/session   Clerk session JWT -> session cookie
 //	GET  /v1/auth/config          which sign-in methods are on (public)
 //	POST /v1/connect/t3           bkt3: Clerk session JWT -> the person's agent token
 //	POST /v1/auth/logout
-//	GET  /v1/auth/me              current user, with role
+//	GET  /v1/auth/me              current user, with role and is_owner
 //
 //	GET  /v1/users                admin: every user + grantable groups
 //	PATCH /v1/users/{id}          admin: role / status / servers
+//	POST /v1/users/{id}/make-owner      the owner: transfer ownership
 //	POST /v1/users/{id}/revoke-sessions
 //	GET  /v1/me/servers           groups the caller may use
 //	GET  /v1/me/connections       per_user servers the caller may connect, with state
@@ -73,6 +74,7 @@ import (
 	"github.com/tusharbhardwaj/toolyard/internal/identitykeys"
 	"github.com/tusharbhardwaj/toolyard/internal/inbox"
 	"github.com/tusharbhardwaj/toolyard/internal/jobs"
+	"github.com/tusharbhardwaj/toolyard/internal/logx"
 	"github.com/tusharbhardwaj/toolyard/internal/marketplace"
 	"github.com/tusharbhardwaj/toolyard/internal/mcpauth"
 	"github.com/tusharbhardwaj/toolyard/internal/memory"
@@ -255,6 +257,8 @@ type Options struct {
 	// OwnerEmail: the first Clerk sign-in with this email (case-insensitive)
 	// attaches to the existing primary password user instead of creating a
 	// new member, so the owner keeps their admin role, agents and passkeys.
+	// On an install without an owner, it names who may claim the role; it
+	// only seeds the owner (identity/owner.go).
 	OwnerEmail     string
 	ClerkOwnerOnly bool
 	// ConnectAZP (-connect-azp) lists the bkt3 browser origins whose Clerk
@@ -342,6 +346,8 @@ func New(ctx context.Context, opts Options) *Server {
 	}
 	s.federation, s.callbacks = opts.Federation, opts.Callbacks
 	if s.federation != nil {
+		// Personal sign-in: a federated sign-in counts only for the owner.
+		s.federation.OwnerOnly = opts.ClerkOwnerOnly
 		s.federation.Membership = func(ctx context.Context, subject string) (federation.Profile, error) {
 			if s.clerk == nil {
 				return federation.Profile{}, federation.ErrUnavailable
@@ -699,7 +705,9 @@ func (s *Server) sessionUser(r *http.Request) (*identity.User, bool) {
 		return nil, false
 	}
 	u, err := s.identity.GetUserByID(r.Context(), id)
-	if err != nil || u.Status != identity.StatusActive || (s.clerkOwnerOnly && (u.Auth != identity.AuthClerk || !strings.EqualFold(u.Email, s.ownerEmail))) {
+	// Personal sign-in (-clerk-owner-only): only the owner's Google
+	// session counts, so a transfer ends the previous owner's sessions.
+	if err != nil || u.Status != identity.StatusActive || (s.clerkOwnerOnly && (u.Auth != identity.AuthClerk || !u.Owner)) {
 		return nil, false
 	}
 	return u, true
@@ -766,6 +774,19 @@ func (s *Server) authSetup(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		writeError(w, http.StatusBadRequest, err.Error())
 		return
+	}
+	// The first account is the owner and an admin: both are automatic, so
+	// both are audited (identity audits every later automatic claim in
+	// its own transaction).
+	if s.audit != nil {
+		for _, ev := range []audit.Event{
+			{EventType: "user.owner", AgentID: identity.ActorSetup, Reason: "setup", ResultSummary: fmt.Sprintf("owner -> %s (%s)", u.Username, u.ID)},
+			{EventType: "user.role", AgentID: identity.ActorSetup, Reason: "setup", ResultSummary: fmt.Sprintf("%s role=admin", u.Username)},
+		} {
+			if err := s.audit.Write(r.Context(), ev); err != nil {
+				logx.For("auth").Warn("audit of the first account failed", "event", ev.EventType, "err", err.Error())
+			}
+		}
 	}
 	if err := s.issueSession(w, r, u.ID); err != nil {
 		writeError(w, http.StatusInternalServerError, err.Error())

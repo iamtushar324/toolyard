@@ -61,6 +61,10 @@ type fakeClerk struct {
 	members    map[string]clerk.Member
 	membersErr error
 	calls      int
+	// verifiedErr answers VerifiedPrimaryEmail (nil: member.Email is the
+	// verified primary address); googleErr answers VerifyGoogleAccount.
+	verifiedErr error
+	googleErr   error
 }
 
 func (f *fakeClerk) set(fn func(*fakeClerk)) { f.mu.Lock(); defer f.mu.Unlock(); fn(f) }
@@ -84,6 +88,21 @@ func (f *fakeClerk) OrgMembership(_ context.Context, _ string) (clerk.Member, er
 		return clerk.Member{}, f.memberErr
 	}
 	return f.member, nil
+}
+
+func (f *fakeClerk) VerifiedPrimaryEmail(_ context.Context, _ string) (string, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.verifiedErr != nil {
+		return "", f.verifiedErr
+	}
+	return f.member.Email, nil
+}
+
+func (f *fakeClerk) VerifyGoogleAccount(_ context.Context, _, _ string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.googleErr
 }
 
 func (f *fakeClerk) OrgMembers(_ context.Context) (map[string]clerk.Member, error) {

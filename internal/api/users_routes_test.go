@@ -158,11 +158,15 @@ func TestUsersPatch(t *testing.T) {
 	if e.auditRows(t, "user.role", "") != 1 {
 		t.Error("user.role not audited")
 	}
-	// Two admins now: the second may demote the first...
+	// Two admins now, but the original one is the owner: nobody demotes
+	// or blocks the owner (409 owner_protected); transfer first.
 	mCookie := e.cookieFor(t, m.ID)
 	rec = e.do(t, mCookie, http.MethodPatch, "/v1/users/"+e.admin.ID, `{"role":"member"}`)
-	if rec.Code != http.StatusOK {
-		t.Fatalf("demote original admin: %d %s", rec.Code, rec.Body.String())
+	if rec.Code != http.StatusConflict || decodeJSON(t, rec)["error"] != "owner_protected" {
+		t.Fatalf("demote the owner: %d %s", rec.Code, rec.Body.String())
+	}
+	if rec := e.do(t, mCookie, http.MethodPatch, "/v1/users/"+e.admin.ID, `{"status":"blocked"}`); rec.Code != http.StatusConflict || decodeJSON(t, rec)["error"] != "owner_protected" {
+		t.Fatalf("block the owner: %d %s", rec.Code, rec.Body.String())
 	}
 	// ...but not themselves (409), and not the last admin (409 last_admin).
 	rec = e.do(t, mCookie, http.MethodPatch, path, `{"role":"member"}`)
