@@ -288,7 +288,8 @@ ty call SERVER.TOOL '{"json": "arguments"}' [--reason TEXT]
 A file ending in `.js` or `.mjs` runs as JavaScript unless `--language` says
 otherwise.
 
-- `TOOLYARD_URL` (default `https://toolyard.beknown.live`) and
+- `TOOLYARD_URL` (required; the copy `GET /v1/code/ty` serves defaults to
+  the toolyard that served it) and
   `TOOLYARD_TOKEN_FILE` (required). The token never appears in argv, the
   environment of child processes, or the output.
 - `run` sends an `Idempotency-Key` (the given one, or a random one it prints),
