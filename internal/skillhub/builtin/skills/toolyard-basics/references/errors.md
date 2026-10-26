@@ -8,8 +8,8 @@ Quoted texts below are what toolyard answers; `<…>` marks a part that varies.
 
 | Answer | Meaning | Do this |
 |---|---|---|
-| `_reason is required: provide a one-sentence rationale (20-2000 chars)` | No `_reason`. Nothing ran. | Add one sentence on why, 20-2000 characters, and call again. |
-| `_reason too short (got <n> chars, need 20)`, `_reason too long (…)`, `_reason must be a string` | Bad `_reason`. Nothing ran. | Fix it and call again. If the tool's schema names `__toolyard_reason`, use that field. |
+| `_reason is required: provide a one-sentence rationale (20-2000 chars)` | No `_reason`. Nothing ran. | Add one sentence on why, 20-2000 bytes (non-ASCII letters count more than one), and call again. |
+| `_reason too short (got <n> chars, need 20)`, `_reason too long (…)`, `_reason must be a string` | Bad `_reason`. Nothing ran. The counts are bytes, despite the word "chars". | Fix it and call again. If the tool's schema names `__toolyard_reason`, use that field. |
 | `tool "<name>" not found in catalog` (or a protocol error `tool '<name>' not found`) | The tool does not exist, or your owner has no access to its server. Both answer the same way. | Check the name with `tools.search` and `servers.list`. Do not probe other names. Ask your owner to get the server granted. |
 | `tool "<name>" is not allowed for this agent: its owner limited what it may use. …` | Your owner narrowed this agent (Connected apps). | Read `agent_limits` in `access.whoami`. Ask your owner to change the agent's access. |
 | `server restarting, call again: …` (`status: "server_restarting"`, `retryable: true`, `retry_after_seconds`) | toolyard is draining for a restart. Nothing ran and no permission was used. | Call again with the same arguments after a few seconds. |

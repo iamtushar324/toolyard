@@ -57,12 +57,24 @@ const (
 	// agents at.
 	BuiltinGuideSkill = "toolyard-basics"
 
-	// builtinOwner and builtinRepo make the version label
-	// "toolyard/builtin@<digest12>"; builtinBranch keeps the source's
-	// settings valid (a source always names a branch).
-	builtinOwner  = "toolyard"
-	builtinRepo   = "builtin"
+	// The built-in source's fixed repository settings. They make the
+	// version label "toolyard.builtin/skills@<digest12>", and they point
+	// at nothing GitHub can ever serve, so a toolyard build that does not
+	// know the builtin kind (a rollback, an older replica) cannot fetch
+	// anything for the row either:
+	//   - builtinOwner holds a dot: GitHub user and organisation names
+	//     take only letters, digits and single hyphens (managed users add
+	//     one underscore), never a dot, so no account can own this repository;
+	//   - the mode is pinned to builtinPin, the all-zero SHA, which names
+	//     no commit, so such a build never asks for a branch head;
+	//   - auth none, no token, no webhook secret, and a next check in year
+	//     9999 (builtinNever), so no poller finds it due.
+	// builtinBranch keeps the settings valid (a source names a branch).
+	// builtinRow puts these back if an older build's admin changed them.
+	builtinOwner  = "toolyard.builtin"
+	builtinRepo   = "skills"
 	builtinBranch = "builtin"
+	builtinPin    = "0000000000000000000000000000000000000000"
 	// builtinCreator is the source's created_by: toolyard itself, not a
 	// user (change proposals are refused for the source).
 	builtinCreator = "toolyard"
@@ -363,12 +375,17 @@ func buildBuiltin(files map[string][]byte, row *sourceRow) (*built, error) {
 // builtinRow reads the built-in source, creating it when it is missing.
 func (s *Service) builtinRow(ctx context.Context) (*sourceRow, error) {
 	row, err := s.getSourceRow(ctx, s.db, BuiltinSourceID)
-	if err == nil || !isNotFound(err) {
-		return row, err
+	switch {
+	case err == nil && builtinFixed(row):
+		return row, nil
+	case err == nil:
+		return s.fixBuiltinRow(ctx, row)
+	case !isNotFound(err):
+		return nil, err
 	}
 	r := &sourceRow{Source: Source{
 		ID: BuiltinSourceID, Slug: BuiltinSlug, Kind: KindBuiltin, Owner: builtinOwner, Repo: builtinRepo, Branch: builtinBranch,
-		Mode: ModeAuto, Auth: AuthNone, PollSeconds: DefaultPollSeconds, Enabled: true,
+		Mode: ModePinned, PinnedSHA: builtinPin, Auth: AuthNone, PollSeconds: DefaultPollSeconds, Enabled: true,
 		Visibility: VisibleEveryone, DefaultRuns: RunsAnywhere, CreatedBy: builtinCreator,
 	}}
 	if err := s.insertSource(ctx, r); err != nil {
@@ -384,6 +401,33 @@ func (s *Service) builtinRow(ctx context.Context) (*sourceRow, error) {
 	if _, err := s.db.ExecContext(ctx, `UPDATE skill_sources SET next_check_at = ? WHERE id = ?`, builtinNever, BuiltinSourceID); err != nil {
 		return nil, fmt.Errorf("skillhub: store the built-in source: %w", err)
 	}
+	return s.getSourceRow(ctx, s.db, BuiltinSourceID)
+}
+
+// builtinFixed reports whether a row holds the built-in source's fixed
+// settings (sharing and runs are the admins' to change).
+func builtinFixed(r *sourceRow) bool {
+	return r.Kind == KindBuiltin && r.Owner == builtinOwner && r.Repo == builtinRepo && r.Branch == builtinBranch &&
+		r.Path == "" && len(r.Exclude) == 0 && r.Mode == ModePinned && r.PinnedSHA == builtinPin && r.Auth == AuthNone &&
+		!r.HasToken && !r.HasWebhookSecret && r.Enabled && r.PollSeconds == DefaultPollSeconds && r.Limits == (Limits{}) &&
+		r.NextCheckAt != nil && r.NextCheckAt.UnixMilli() == builtinNever
+}
+
+// fixBuiltinRow puts the fixed settings back (a row made by an earlier
+// build of this branch, or changed by a build that does not know the
+// builtin kind), keeping who sees it and where its skills run. The
+// source's updated_at moves, so every node reloads it.
+func (s *Service) fixBuiltinRow(ctx context.Context, row *sourceRow) (*sourceRow, error) {
+	now := max(s.now().UnixMilli(), row.UpdatedAt.UnixMilli()+1)
+	if _, err := s.db.ExecContext(ctx, `UPDATE skill_sources SET kind = ?, owner = ?, repo = ?, branch = ?, path = '', exclude_json = '[]',
+		mode = ?, pinned_sha = ?, auth = ?, token_sealed = '', webhook_secret_sealed = '', poll_seconds = ?, enabled = 1,
+		limits_json = '{}', next_check_at = ?, updated_at = ? WHERE id = ?`,
+		KindBuiltin, builtinOwner, builtinRepo, builtinBranch, string(ModePinned), builtinPin, string(AuthNone),
+		int64(DefaultPollSeconds), builtinNever, now, BuiltinSourceID); err != nil {
+		return nil, fmt.Errorf("skillhub: restore the built-in source's settings: %w", err)
+	}
+	s.log.Info("skillhub: restored the built-in source's fixed settings")
+	s.changed(ctx, BuiltinSourceID)
 	return s.getSourceRow(ctx, s.db, BuiltinSourceID)
 }
 

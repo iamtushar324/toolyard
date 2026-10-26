@@ -44,8 +44,8 @@ function buttons(node, out = []) {
 }
 
 const builtinSource = {
-  id: 'src_toolyard_builtin', slug: 'toolyard', kind: 'builtin', owner: 'toolyard', repo: 'builtin', branch: 'builtin', path: '',
-  mode: 'auto', enabled: true, active_version_id: 'skv_1', active_sha: 'a'.repeat(64), skill_count: 8, warning_count: 0,
+  id: 'src_toolyard_builtin', slug: 'toolyard', kind: 'builtin', owner: 'toolyard.builtin', repo: 'skills', branch: 'builtin', path: '',
+  mode: 'pinned', pinned_sha: '0'.repeat(40), enabled: true, active_version_id: 'skv_1', active_sha: 'a'.repeat(64), skill_count: 8, warning_count: 0,
   visibility: 'everyone', default_runs: 'anywhere', has_token: false, auth: 'none', poll_seconds: 300,
   last_checked_at: '2026-10-26T09:00:00Z', webhook_url_path: '/v1/skills/sources/src_toolyard_builtin/webhook',
 };
@@ -58,7 +58,7 @@ test('the list marks the built-in source and shows no repository or mode', () =>
   assert.match(page, /Built in/);
   assert.match(page, /built into toolyard/);
   assert.match(page, /with toolyard/);
-  assert.doesNotMatch(page, /toolyard\/builtin@/);
+  assert.doesNotMatch(page, /toolyard\.builtin\/skills@/);
   assert.equal(h.run('skillsBuiltin(b)'), true);
   assert.equal(h.run('skillsBuiltin({ kind: "github" })'), false);
 });

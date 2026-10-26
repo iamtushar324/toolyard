@@ -1,7 +1,8 @@
 # Starlark in code mode
 
 Starlark is the default language of `executeToolCode` (`language` omitted,
-`"starlark"` or `"python"`). Its output format is stable, so skills and
+`"starlark"`; send that value, since the schema lists only `starlark` and
+`javascript`, though the server also takes `python`). Its output format is stable, so skills and
 scripts that parse that output keep working.
 
 ## Shape of a script
@@ -86,7 +87,9 @@ Inside a script `detail` defaults to `summary` (name, upstream, description,
 
 - 50,000,000 execution steps: a tight loop stops long before the clock.
 - One call's arguments: at most 4 MiB as JSON.
-- One tool result: at most 6 MiB (a larger one is a failed call, kind `limit`).
+- One tool result: at most 6 MiB. A larger one is a failed call, kind
+  `limit`, but the tool already ran: check the target before any retry, and
+  never repeat a write blindly.
 - The returned `result`: at most 1 MiB as JSON. Return less, or print a
   summary and return the key fields.
 - One `print()` line: at most 1 MiB. All output: 1 MiB.

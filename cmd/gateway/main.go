@@ -1557,7 +1557,7 @@ func runServe(argv []string) error {
 			Proposals: skillHubProposals, // slice C's SourceProposals
 			Tickets:   gateway.NewSkillBundleTickets(db),
 			OnHost:    federationSvc.OnHost,
-			Guide:     skillhubSvc.BuiltinGuide(),
+			Guide:     skillhubSvc.BuiltinGuide,
 		})
 		// skillhub (slice A): the leader checks each source on its own
 		// schedule (skills-sync). Started after SetReviewHook above, so a

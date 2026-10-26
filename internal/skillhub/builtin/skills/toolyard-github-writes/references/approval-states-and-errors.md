@@ -3,7 +3,12 @@
 ## The deferred answer
 
 Calling a GitHub write tool answers at once with `status: "pending_approval"`.
-Useful fields:
+On a gateway whose operator set an in-line wait (`-in-line-wait` above 0),
+the call instead stays open up to that long; when the owner decides in that
+time it answers with the final result, or the denial, rather than
+`pending_approval`. Handle both answers, and never send the write again.
+
+Useful fields of the deferred answer:
 
 | field | meaning |
 |---|---|

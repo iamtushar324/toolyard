@@ -218,13 +218,43 @@ type skillsServedKey struct{}
 func (g *Gateway) declareSkillsOnInitialize(ctx context.Context, _ any, _ *mcp.InitializeRequest, res *mcp.InitializeResult) {
 	if res != nil {
 		declareSkills(ctx, &res.Capabilities)
+		res.Instructions += g.skillsGuideFor(ctx)
 	}
 }
 
 func (g *Gateway) declareSkillsOnDiscover(ctx context.Context, _ any, _ *mcp.DiscoverRequest, res *mcp.DiscoverResult) {
 	if res != nil {
 		declareSkills(ctx, &res.Capabilities)
+		res.Instructions += g.skillsGuideFor(ctx)
 	}
+}
+
+// skillsGuideFor is the sentence that points this caller at toolyard's
+// built-in guide, or "": the hub must serve the guide now (installed, under
+// its slug) and the caller must see it (a source an admin hid answers ""). It
+// lists the guide's source rather than reading the skill, so an initialize
+// is not counted as a read.
+func (g *Gateway) skillsGuideFor(ctx context.Context) string {
+	hub := g.skillHub.Load()
+	if hub == nil || hub.guide == nil {
+		return ""
+	}
+	ref := hub.guide()
+	slug, _, ok := strings.Cut(ref, "/")
+	if !ok || slug == "" {
+		return ""
+	}
+	want := "skill://" + ref + "/" + skillFileName
+	list, _, err := hub.reader.List(ctx, g.skillViewer(ctx, hub), skillhub.ListQuery{Source: slug, Limit: skillsListMax, IncludeHost: true})
+	if err != nil {
+		return ""
+	}
+	for _, sk := range list {
+		if sk.URI == want {
+			return skillsGuideInstructions(ref)
+		}
+	}
+	return ""
 }
 
 func declareSkills(ctx context.Context, caps *mcp.ServerCapabilities) {

@@ -22,7 +22,7 @@ enforces.
 | Limit | Value |
 |---|---|
 | Arguments | 4 MiB as JSON |
-| One tool result | 6 MiB (a larger one is a failed call, kind `limit`) |
+| One tool result | 6 MiB (a larger one is a failed call, kind `limit`, but the tool already ran: check the target before any retry, never repeat a write blindly) |
 | One print line | 1 MiB |
 | A failed call's error text | 64 KiB |
 

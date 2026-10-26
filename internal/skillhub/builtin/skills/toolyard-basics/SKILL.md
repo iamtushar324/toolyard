@@ -65,7 +65,15 @@ tools.search
 Each authenticated connection runs as one **agent** (an `ag_…` id) owned by
 one person, your **owner**. An MCP client that signed in with OAuth is an
 agent of kind `oauth_client`, named by the nickname chosen on the consent
-screen. `access.whoami` returns:
+screen.
+
+People have roles: `admin` (manages servers, policies and people) or
+`member`, and an account can be `blocked`. Separately, each toolyard has one
+install owner: the first person to sign in, or the person whose email the
+operator configured. The install owner is always an admin, can hand that
+role to another person, and admins change other people's roles. Your owner
+(the person your agent belongs to) is often not the install owner.
+`access.whoami` returns:
 
 | Field | Meaning |
 |---|---|
@@ -85,8 +93,9 @@ connect properly with the `toolyard-connecting-clients` skill.
 
 ## The `_reason` field
 
-- Send `_reason` on **every** call: a string, 20-2000 characters after
-  trimming. Say why this call, for this task, in one sentence.
+- Send `_reason` on **every** call: a string of 20-2000 bytes after
+  trimming (toolyard counts bytes, so a letter outside ASCII counts two to
+  four). Say why this call, for this task, in one sentence.
 - toolyard records it in the audit log and shows it verbatim to a person who
   reviews the call. It is never permission: a restricted call still needs a
   grant, however long or urgent the reason is.
@@ -235,7 +244,8 @@ their own skill:
 - Skills catalog (`skills.*`): `toolyard-skills`.
 - Code mode and the HTTPS fallback (`POST /v1/code/run`, the `ty` command, or
   `inbox.guide` topic `fallback`) when your MCP connection fails:
-  `toolyard-code-mode`.
+  `toolyard-code-mode`. The fallback needs `TOOLYARD_URL` (required: your
+  toolyard's base URL) and `TOOLYARD_TOKEN_FILE`.
 
 ## Pitfalls
 

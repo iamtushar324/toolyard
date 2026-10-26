@@ -40,7 +40,8 @@ Without a reachable HTTPS endpoint, skip this: poll with `inbox.wait`
   or fragment. toolyard checks DNS at registration and at every delivery,
   pins the address, and never follows redirects. A private address needs an
   administrator's registration, and an administrator can register one only
-  for an agent they own.
+  for an agent they own. Such a receiver gets only `inbox.decision`,
+  `inbox.expired` and `inbox.cancelled`, in the version 2 shape.
 - If your host offers a session webhook (a receiver the host provides that
   wakes your session), prefer it: create it with the host's own tool and
   pass the `callback_ref` it gives you. Keep its signing secret out of

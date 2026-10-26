@@ -67,7 +67,9 @@ the account owner decides.
    GitHub, and a `_reason` the owner can decide from (see below).
 3. **Call the write tool once.** The answer is deferred: `status:
    "pending_approval"`, `approval_id` (`ap_…`), `expires_at` and
-   `reason_to_human`. Nothing is posted yet.
+   `reason_to_human`. Nothing is posted yet. (With an operator's in-line
+   wait above 0, the call may instead stay open and return the final result
+   or the denial if the owner decides within that wait. Handle both.)
 4. **Tell your user** that the owner must allow it in toolyard Approvals.
    Continue other work, or end the turn.
 5. **Collect the result** with `tools.poll_approval` (non-blocking) or
@@ -95,7 +97,7 @@ tools.wait_for_approval
 
 The owner sees the card, not your conversation. Make the card enough.
 
-`_reason` (20-2000 characters, shown verbatim): one or two sentences.
+`_reason` (20-2000 bytes, shown verbatim): one or two sentences.
 
 - What you propose: the event (or comment) and the pull request.
 - The commit you reviewed, so it matches the commit on the card.

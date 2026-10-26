@@ -116,8 +116,10 @@ from the URL:
 
 A client without MCP authorization can still connect if it can send a header:
 use an agent token as `Authorization: Bearer <token>`. A proxy that strips the
-`Authorization` header can send the token in an `x-bf-vk` header instead; when
-both are present, `Authorization` wins.
+`Authorization` header can send the token in an `x-bf-vk` header instead.
+toolyard reads `x-bf-vk` only when the request has no `Authorization` header
+at all: any `Authorization` header, even one that is not a bearer token,
+hides it.
 
 ## Lifetimes
 

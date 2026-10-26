@@ -1,6 +1,8 @@
 # JavaScript in code mode
 
-Pass `"language": "javascript"` (or `"js"`) to `executeToolCode`. The engine
+Pass `"language": "javascript"` to `executeToolCode` (the schema lists only
+`starlark` and `javascript`; the server also takes `js`, but send the listed
+value). The engine
 is QuickJS-NG (ES2023: `async`/`await`, arrow functions, classes,
 destructuring, `Map`, `Set`, template strings), run in the same sandboxed
 worker as Starlark.

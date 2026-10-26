@@ -129,11 +129,13 @@ token-based agents the same way. Admins can select **Show everyone's apps**.
 
 ## Tokens outside MCP
 
-- `TOOLYARD_TOKEN_FILE`: a file that holds a toolyard token, used by the HTTPS
-  fallback (`POST /v1/code/run`, or the `ty` command from `GET /v1/code/ty`)
-  when MCP fails. It holds an agent token or a session token. `ty` refuses a
-  file that group or others can read: `chmod 600` it. See the
-  `toolyard-code-mode` skill.
+- `TOOLYARD_URL` and `TOOLYARD_TOKEN_FILE`: the HTTPS fallback
+  (`POST /v1/code/run`, or the `ty` command from `GET /v1/code/ty`) when MCP
+  fails needs both. `TOOLYARD_URL` is required: the toolyard's base URL (the
+  MCP URL without `/mcp`); `ty` sends the token there, so set it to the
+  person's own toolyard. `TOOLYARD_TOKEN_FILE` is a file that holds an agent
+  token or a session token; `ty` refuses a file that group or others can
+  read: `chmod 600` it. See the `toolyard-code-mode` skill.
 - A session token (`tys_…`) is minted with an agent token at
   `POST /v1/agents/session-tokens` for one work session (60-3600 seconds). It
   works on the code, jobs and skills REST routes, `/v1/agents/approvals/…`

@@ -139,8 +139,9 @@ inbox.post
 ## Sessions
 
 `session.start` (`title`, optional `repo`, `branch`, `host`) names the piece
-of work so the owner can see it among their agents. Pass the returned
-`session_id` on Inbox items, and `_session_id` on other calls for attribution.
+of work so the owner can see it among their agents. It returns the session
+with its `id` (`ses_…`): pass that id as `session_id` on Inbox items, and as
+`_session_id` on other calls for attribution.
 `session.update` reports `working`, `waiting_on_owner`, `blocked_on_owner`,
 `idle` or `done` (with an optional `note`) and counts as a heartbeat. A
 session ID grants no permission.

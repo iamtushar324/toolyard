@@ -6,7 +6,7 @@ id, and a job started over REST shows in `jobs.list`.
 ## REST
 
 Use an agent token or a session token in `Authorization: Bearer <token>`,
-never an operator token. `TOOLYARD_URL` is your toolyard's base URL and
+never an operator token. `TOOLYARD_URL` (required) is your toolyard's base URL and
 `TOOLYARD_TOKEN_FILE` the file that holds your token (`chmod 600`). Read the
 header from that file, as below, so the token never appears in argv.
 

@@ -201,11 +201,15 @@ func TestBuiltinSourceInstalledAtStart(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if src.Owner != builtinOwner || src.Repo != builtinRepo || src.Mode != ModePinned || src.PinnedSHA != builtinPin || src.Auth != AuthNone ||
+		src.HasToken || src.HasWebhookSecret || src.NextCheckAt == nil || src.NextCheckAt.Year() != 9999 {
+		t.Fatalf("the built-in row must point at nothing GitHub can serve: %+v", src)
+	}
 	if src.Kind != KindBuiltin || src.Slug != BuiltinSlug || src.ActiveSHA != digest || src.LastCheckedAt == nil || src.LastError != "" ||
 		src.Visibility != VisibleEveryone || src.DefaultRuns != RunsAnywhere || src.SkillCount != len(builtinSkillNames(files)) || src.WarningCount != 0 {
 		t.Fatalf("built-in source %+v (digest %s)", src, digest)
 	}
-	label := "toolyard/builtin@" + digest[:12]
+	label := "toolyard.builtin/skills@" + digest[:12]
 	infos, err := svc.Sources(ctx, memberViewer)
 	if err != nil || len(infos) != 1 || infos[0].Slug != BuiltinSlug || infos[0].Repo != label || infos[0].Commit != digest || infos[0].HTMLURL != "" {
 		t.Fatalf("member sources %+v %v", infos, err)
@@ -471,7 +475,7 @@ func TestBuiltinSourceIsReadOnly(t *testing.T) {
 	// Sharing: hide it from members, then show it again. Unchanged
 	// fields sent along are fine.
 	members := VisibleMembers
-	if _, err := svc.UpdateSource(ctx, "usr_admin", BuiltinSourceID, SourceUpdate{Visibility: &members, Members: &[]string{"usr_other"}, Mode: mode(ModeAuto)}); err != nil {
+	if _, err := svc.UpdateSource(ctx, "usr_admin", BuiltinSourceID, SourceUpdate{Visibility: &members, Members: &[]string{"usr_other"}, Mode: mode(ModePinned)}); err != nil {
 		t.Fatal(err)
 	}
 	if got, _ := svc.Sources(ctx, memberViewer); len(got) != 0 {
@@ -516,6 +520,25 @@ func TestBuiltinSourceIsReadOnly(t *testing.T) {
 	}
 	if _, err := svc.GetSource(ctx, BuiltinSourceID); err != nil {
 		t.Fatalf("the built-in source is gone: %v", err)
+	}
+
+	// A build that does not know the builtin kind may let an admin edit
+	// the row: the next install puts the fixed settings back and keeps
+	// the sharing.
+	if _, err := db.Exec(`UPDATE skill_sources SET owner = 'acme', repo = 'skills', branch = 'main', mode = 'auto', pinned_sha = '',
+		enabled = 0, next_check_at = 0, visibility = 'members', members_json = '["usr_member"]' WHERE id = ?`, BuiltinSourceID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := svc.SyncNow(ctx, BuiltinSourceID); err != nil {
+		t.Fatal(err)
+	}
+	src, _ = svc.GetSource(ctx, BuiltinSourceID)
+	if src.Owner != builtinOwner || src.Repo != builtinRepo || src.Mode != ModePinned || src.PinnedSHA != builtinPin || !src.Enabled ||
+		src.NextCheckAt == nil || src.NextCheckAt.Year() != 9999 || src.Visibility != VisibleMembers || len(src.Members) != 1 {
+		t.Fatalf("the fixed settings were not restored, or the sharing was lost: %+v", src)
+	}
+	if got, _ := svc.Sources(ctx, memberViewer); len(got) != 1 || !strings.HasPrefix(got[0].Repo, builtinOwner+"/"+builtinRepo+"@") {
+		t.Fatalf("after the restore: %+v", got)
 	}
 }
 

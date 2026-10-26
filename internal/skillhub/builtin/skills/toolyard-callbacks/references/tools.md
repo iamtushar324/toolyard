@@ -1,6 +1,6 @@
 # callbacks.* tools: arguments, answers and errors
 
-Every call also takes `_reason` (20 to 2000 characters), like any toolyard
+Every call also takes `_reason` (20 to 2000 bytes), like any toolyard
 call. In code mode the tools are `toolyard.callbacks_register(...)`,
 `toolyard.callbacks_list(...)` and so on; `tools.search` lists them under
 the server `callbacks`. Each tool acts only on your own receivers.
@@ -142,7 +142,9 @@ receiver's problem stops the item; a default receiver's warning does not.
 REST errors: registration answers `409 too_many_receivers`,
 `403 environment_destination_mismatch`, or `400` with the validation
 message; `GET` and `PATCH` answer `409 conflict` or
-`404 receiver_unavailable`. There is no REST route for `set_default` or
+`404 receiver_unavailable`, and `PATCH` answers
+`400 invalid_change: <reason>` for an unknown `action` or a malformed
+`secret`. There is no REST route for `set_default` or
 `test`: use the tools.
 
 ## Pull delivery (host and local connections only)

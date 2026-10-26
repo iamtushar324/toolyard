@@ -482,13 +482,20 @@ toolyard works and how to use it well. They live in the repository under
 | `toolyard-connecting-clients` | helping a person connect Claude.ai, ChatGPT, Claude Code or another MCP client |
 
 While the hub is on, toolyard serves them as the source **`toolyard`**
-(kind `builtin`, version label `toolyard/builtin@<digest>`), seen by
-everyone and runnable anywhere by default. The server instructions gain
-one line that points new agents at `skills.get` with
-`toolyard/toolyard-basics`. Agents use them like any other skills:
-`skills.search`, `skills.get`, `skills.read`, `skills.grep`, `skills.list`,
-bundles, `ty skills pull` and the MCP Skills extension. The source never
-calls GitHub.
+(kind `builtin`, version label `toolyard.builtin/skills@<digest>`), seen by
+everyone and runnable anywhere by default. The server instructions a
+caller gets at `initialize` (and `server/discover`) gain one line that
+points it at `skills.get` with `toolyard/toolyard-basics`, while that
+caller can see the guide: worked out per request, so a late install adds
+the line and hiding the source removes it. Agents use them like any other
+skills: `skills.search`, `skills.get`, `skills.read`, `skills.grep`,
+`skills.list`, bundles, `ty skills pull` and the MCP Skills extension. The
+source never calls GitHub. Its stored repository settings point at nothing
+GitHub can serve (an owner name with a dot, which no GitHub account can
+have; a pin to the all-zero commit; no token; a next check in year 9999),
+so a toolyard build that does not know built-in sources, such as an older
+one after a rollback, cannot fetch anything for it either; a current build
+puts those settings back if such a build changed them.
 
 **How they upgrade.** The version's commit is the SHA-256 of the embedded
 files (every path and the SHA-256 of its content). At start each replica
@@ -513,8 +520,7 @@ hand, and it cannot be deleted. The admin routes answer `409 conflict`
 with the reason; "Sync now" only installs the running binary's skills if
 they are not live. Agents cannot propose changes to it
 (`skills.propose_change` answers `invalid`): change the skills in the
-toolyard repository instead. Hiding the source leaves the one line in the
-server instructions; an agent that follows it gets `not_found`.
+toolyard repository instead.
 
 **The slug is reserved.** No source can be created with the slug
 `toolyard`, and a repository named `toolyard` gets `toolyard-2` by

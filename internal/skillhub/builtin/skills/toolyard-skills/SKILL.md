@@ -13,7 +13,7 @@ repository (a *source*); toolyard copies its skills at an exact commit and
 serves only that copy, so you never call GitHub yourself. toolyard also
 ships built-in skills about itself, like this one, in the read-only source
 `toolyard` (an admin may hide it). Their `repo` is
-`toolyard/builtin@<12-hex digest>`: they change with the toolyard version, and
+`toolyard.builtin/skills@<12-hex digest>`: they change with the toolyard version, and
 `skills.propose_change` refuses them (tell your owner what should change).
 Start with `skills.get {"skill": "toolyard/toolyard-basics"}` if toolyard
 is new to you.
@@ -110,7 +110,8 @@ directly: inside code mode or an async job it is refused, because the link
 would come back redacted. From a shell, `ty skills pull <skill>
 [<skill> ...]` does the same and unpacks each skill safely into its own
 folder under `--dir` (default `~/.claude/skills`; `--force` replaces an
-existing folder).
+existing folder). `ty` needs `TOOLYARD_URL` (required: your toolyard's base
+URL) and `TOOLYARD_TOKEN_FILE`; see the `toolyard-code-mode` skill.
 
 ## Other ways in
 

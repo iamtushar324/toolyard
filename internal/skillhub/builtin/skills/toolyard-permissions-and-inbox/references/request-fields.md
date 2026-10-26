@@ -1,6 +1,6 @@
 # inbox.request: fields, constraints and limits
 
-Every Inbox tool also takes `_reason` (20-2000 characters) for the audit
+Every Inbox tool also takes `_reason` (20-2000 bytes) for the audit
 record. `inbox.guide({"topic": "requests"})`, `"tools"`, `"attachments"` and
 `"dry-run"` serve the same contract from the server.
 

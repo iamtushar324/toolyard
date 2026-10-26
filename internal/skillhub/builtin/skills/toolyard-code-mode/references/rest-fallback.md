@@ -11,10 +11,13 @@ restricted tool or a denial.
 
 ## What you need
 
-- `TOOLYARD_URL`: the base URL of your toolyard, for example
-  `https://<your-toolyard>`. Set it yourself: `ty` has a built-in default
-  that may not be your gateway. `ty` refuses `http://` unless
-  `TOOLYARD_URL_INSECURE=1`.
+- `TOOLYARD_URL` (required): the base URL of your toolyard, the address
+  your MCP client uses without `/mcp`, for example
+  `https://<your-toolyard>`. Set it yourself before you fetch or run `ty`.
+  The `ty` that your toolyard serves defaults to that toolyard; a copy from
+  anywhere else has no default and refuses to run without `TOOLYARD_URL`.
+  Never point it at a host your owner did not give you: `ty` sends your
+  token there. `ty` refuses `http://` unless `TOOLYARD_URL_INSECURE=1`.
 - `TOOLYARD_TOKEN_FILE`: a file that holds your toolyard token, readable only
   by you (`chmod 600`; `ty` refuses a file others can read unless
   `TOOLYARD_TOKEN_FILE_INSECURE=1`). Use an agent token (`ag_…`) or a session
@@ -41,7 +44,7 @@ curl -fsS "$TOOLYARD_URL/v1/code/ty" -o ty && chmod +x ty
 
 - A file ending in `.js` or `.mjs` runs as JavaScript unless `--language`
   says otherwise.
-- `--reason` (20 to 2000 characters) goes to the audit record, like
+- `--reason` (20 to 2000 bytes) goes to the audit record, like
   `_reason`. Without it `ty` writes one from the file name and the first
   line that is not a comment.
 - `ty` prints the run view as JSON on stdout. Exit codes:

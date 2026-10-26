@@ -54,7 +54,7 @@ func TestBuiltinSkillsThroughTheGateway(t *testing.T) {
 	if hub.BuiltinGuide() != "toolyard/toolyard-basics" {
 		t.Fatalf("guide = %q", hub.BuiltinGuide())
 	}
-	gw.RegisterSkillHub(SkillHub{Reader: hub, Guide: hub.BuiltinGuide()})
+	gw.RegisterSkillHub(SkillHub{Reader: hub, Guide: hub.BuiltinGuide})
 	member := WithAgentID(context.Background(), "ag_member")
 	call := func(tool string, args map[string]any) map[string]any {
 		t.Helper()
@@ -74,7 +74,7 @@ func TestBuiltinSkillsThroughTheGateway(t *testing.T) {
 	for _, s := range asList(found["skills"]) {
 		m := s.(map[string]any)
 		if m["uri"] == "skill://toolyard/toolyard-basics/SKILL.md" {
-			hit = m["source"] == "toolyard" && strings.HasPrefix(m["repo"].(string), "toolyard/builtin@") && m["runs"] == "anywhere"
+			hit = m["source"] == "toolyard" && strings.HasPrefix(m["repo"].(string), "toolyard.builtin/skills@") && m["runs"] == "anywhere"
 		}
 	}
 	if !hit {
@@ -110,5 +110,21 @@ func TestBuiltinSkillsThroughTheGateway(t *testing.T) {
 	}
 	if !listed {
 		t.Fatalf("skills/list leaves out the built-in guide: %v", list)
+	}
+
+	// Hidden from this member, the guide drops out of their instructions
+	// at the next initialize; shown again, it comes back.
+	members, everyone := skillhub.VisibleMembers, skillhub.VisibleEveryone
+	if _, err := hub.UpdateSource(context.Background(), "u_admin", skillhub.BuiltinSourceID, skillhub.SourceUpdate{Visibility: &members, Members: &[]string{"u_other"}}); err != nil {
+		t.Fatal(err)
+	}
+	if instr, _ := newSkillsMCPClient(t, gw, "ag_member", false, false).initialize()["instructions"].(string); strings.Contains(instr, "toolyard/toolyard-basics") || !strings.Contains(instr, "SKILLS:") {
+		t.Fatalf("instructions for a member who cannot see the guide: %q", instr)
+	}
+	if _, err := hub.UpdateSource(context.Background(), "u_admin", skillhub.BuiltinSourceID, skillhub.SourceUpdate{Visibility: &everyone}); err != nil {
+		t.Fatal(err)
+	}
+	if instr, _ := newSkillsMCPClient(t, gw, "ag_member", false, false).initialize()["instructions"].(string); !strings.Contains(instr, `"toolyard/toolyard-basics"`) {
+		t.Fatalf("instructions once the guide is shown again: %q", instr)
 	}
 }

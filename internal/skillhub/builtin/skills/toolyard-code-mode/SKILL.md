@@ -21,7 +21,8 @@ direct call (recorded with via `code_mode`).
 - A tool answers far more than you need: filter it in code, return a summary.
 - Independent reads you want at once (`parallel`, `tools.parallel`).
 - Your MCP connection to toolyard is broken: run the same code over HTTPS
-  (see [REST fallback](references/rest-fallback.md)).
+  (see [REST fallback](references/rest-fallback.md); it needs `TOOLYARD_URL`,
+  your toolyard's base URL, and `TOOLYARD_TOKEN_FILE`).
 
 Call a tool directly instead when you make one call, or when the call needs an
 Inbox grant (`_grant`) that you already hold.
@@ -77,8 +78,10 @@ Inbox grant (`_grant`) that you already hold.
 
 Pick Starlark when a skill or a parser expects the established code-mode
 output format, or for a short linear script. Pick JavaScript when you need `try`/`catch`, regular
-expressions, classes or heavy JSON reshaping. `language` also accepts
-`python` (Starlark) and `js`. Details: [Starlark](references/starlark.md),
+expressions, classes or heavy JSON reshaping. Send `language` as `starlark`
+or `javascript`: those are the values the tool schema lists (the server also
+takes `python` and `js`, but a client that checks the schema may refuse
+them). Details: [Starlark](references/starlark.md),
 [JavaScript](references/javascript.md).
 
 ## How tool names become code names
@@ -178,7 +181,8 @@ before you run anything again.
 ## Limits
 
 Per run: 5 minutes, 100 tool calls, 1 MiB of output, a 1 MiB returned value,
-6 MiB per tool result, at most 8 calls in flight. At most 3 scripts per agent
+6 MiB per tool result (a larger result fails the call after the tool
+already ran: check the target before any retry), at most 8 calls in flight. At most 3 scripts per agent
 and 4 per gateway run at once; more wait up to 30 seconds, then are refused
 as busy. Full table: [limits](references/limits.md).
 

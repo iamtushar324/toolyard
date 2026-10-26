@@ -1,6 +1,6 @@
 # skills.* tools: arguments, answers, REST and ty
 
-Every call also takes `_reason` (20 to 2000 characters). In code mode the
+Every call also takes `_reason` (20 to 2000 bytes). In code mode the
 tools are `toolyard.skills_<name>` (Starlark) and
 `tools.toolyard.skills_<name>` (JavaScript); `tools.search` lists them
 under `skills`. `skills.bundle` is refused in code mode and in async jobs.
@@ -128,7 +128,7 @@ normal call pipeline (access, policy, audit).
 | `POST /v1/skills/bundle` `{"skills": [...], "reason": "..."}` | `skills.bundle` |
 | `GET /v1/skills/bundle/{ticket}` | the `.tar.gz` (no token: the ticket is the credential) |
 
-Each GET takes `?reason=` for the audit record (20 to 2000 characters).
+Each GET takes `?reason=` for the audit record (20 to 2000 bytes).
 An unknown query parameter is refused. Errors are
 `{"error": "...", "code": "..."}`: `not_found` 404, `conflict` 409,
 `invalid` 400, `limit` 422, `rate_limited` 429, `unavailable` 503 (also
@@ -138,8 +138,10 @@ propose tools: call them as tools.
 
 ## ty
 
-The `ty` command (download it from `GET /v1/code/ty`) wraps these routes
-and keeps the token out of argv and logs:
+The `ty` command (download it from `GET /v1/code/ty` on your toolyard)
+wraps these routes and keeps the token out of argv and logs. It needs
+`TOOLYARD_URL` (required: your toolyard's base URL; `ty` sends your token
+there) and `TOOLYARD_TOKEN_FILE` (the file that holds your token):
 
 ```sh
 ty skills search QUERY [--mode keyword|regex] [--source SLUG] [--limit N] [--include-host]
