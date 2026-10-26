@@ -791,9 +791,12 @@ until there is an owner with an email on file; after that the stored
 owner's email is the address that counts. A transfer needs a new owner who
 has signed in with Google before and whose verified Google account Clerk
 still shows; afterwards only the new owner can sign in, and the previous
-owner's browser sessions stop working. The dialog revokes the previous
-owner's agents and operator tokens too unless you untick it. Allow the new
-owner's Google account in the Clerk app too.
+owner's browser sessions stop working. In the same transaction the
+transfer disables the previous owner's agents and revokes every operator
+token that is not the new owner's; right after it, it revokes the previous
+owner's Beknown key (that calls the key registries; a failure shows in the
+dashboard and the removal is retried). Allow the new owner's Google account
+in the Clerk app too.
 
 Enable only Google in the dedicated Clerk app. Restrict Clerk signups to
 the same email, using an allowlist or invite-only access as available on
@@ -835,14 +838,15 @@ what counts: changing the flag does not move ownership, and a transfer does
 not need the flag changed.
 
 **Upgrading.** An install that had users before the owner existed gets one
-when it starts: the active user whose email is `-owner-email`; without
-`-owner-email` (or with Clerk sign-in off), the oldest active admin (on a
-typical install, the password account created at setup). When
-`-owner-email` is set and nobody has that address yet, the role stays
-vacant until that person signs in; it never falls to someone else. The
-server logs `toolyard: owner is <username>`. If an older binary demoted the
-owner during a rolling deploy, the next start makes them an admin again and
-logs a warning.
+when it starts, if `-owner-email` is not set (or Clerk sign-in is off): the
+oldest active admin (on a typical install, the password account created at
+setup). With `-owner-email` set, startup picks nobody, because an email
+stored on an account may never have been verified: the role stays vacant
+until that person signs in with the verified address, which links them to
+the setup account or makes their own account the owner. The server logs
+`toolyard: owner is <username>`, or that the role waits for that sign-in.
+If an older binary demoted the owner during a rolling deploy, the next
+start makes them an admin again and logs a warning.
 
 **Transfer ownership.** On **People & agents → People**, the owner clicks
 **Make owner** on another active person's row and types that person's
@@ -850,7 +854,8 @@ username or email to confirm. The new owner becomes an admin; the previous
 owner stays an admin until the new owner changes that. Over REST it is
 `POST /v1/users/{id}/make-owner {"confirm":"<username, email or name>"}`
 from the owner's browser session. Add `"revoke_previous": true` to also
-disable your agents and revoke your operator tokens.
+disable your agents and revoke your operator tokens, in the same
+transaction as the move.
 
 **Make anyone admin.** The owner and every admin can promote any person to
 admin and demote admins (`PATCH /v1/users/{id} {"role":"admin"|"member"}`).
@@ -863,21 +868,31 @@ an admin, a transfer the owner).
 
 **When the owner is gone.** If the hourly Clerk sync finds that the owner
 left the organisation, it blocks them (`left_org`): their sessions end,
-their agents are disabled and their operator tokens revoked. They stay the
-owner, and the server logs an error. An admin can unblock a mistaken
-departure on the People page. To move the role, run on the host (it reads
-the same database as `serve`, needs no sign-in, and works with the server
-running or stopped):
+their agents are disabled, their operator tokens revoked and their push
+subscriptions deleted, and a notification they still have can no longer
+decide anything (a tap counts only for an active person). They stay the
+owner, and the server logs an error. Owner notifications go to the oldest
+active admin meanwhile. If the owner is the only active admin, the sync
+leaves them active instead (a member list that came back incomplete must
+not lock everyone out), logs an error on every pass and audits it once
+(`user.owner_left_org`): make another admin. An admin can unblock a
+mistaken departure on the People page. To move the role, run on the host
+(it reads the same database as `serve`, needs no sign-in, and works with
+the server running or stopped):
 
 ```bash
 toolyard owner show     --data /var/lib/toolyard
-toolyard owner transfer --data /var/lib/toolyard --to alice@example.com
+toolyard owner transfer --data /var/lib/toolyard --to alice@example.com        # shows the account
+toolyard owner transfer --data /var/lib/toolyard --to alice@example.com --yes  # moves the role
 ```
 
-`--to` takes a username, email or user id. The new owner must be active;
-`--unblock` re-activates a blocked one as part of the move (for example a
-lone admin who left and came back). The previous owner keeps their role and
-status. The same command recovers an owner who lost their account.
+`--to` takes a user id, a username, or an email (ASCII letters only fold
+case; when two accounts have that email it refuses, and you give the id).
+Without `--yes` it only shows the account it found. The new owner must be
+active; `--unblock` re-activates a blocked one as part of the move (for
+example a lone admin who left and came back). The previous owner keeps
+their role and status. The same command recovers an owner who lost their
+account.
 
 **Audit trail.** Every owner change and every automatic promotion writes
 `user.owner` and `user.role` audit rows, in the same transaction as the
@@ -886,6 +901,15 @@ for automatic ones by `system:setup` (the first account), `system:sign-in`
 (a sign-in that claims the role or bootstraps an admin), `system:startup`
 (the upgrade backfill and a re-promotion), `system:cli` (`toolyard owner
 transfer`) and `system:clerk-sync` (a departed owner, as `user.status`).
+These rows hold user ids, usernames and counts only; `GET /v1/audit` and
+the exports list them, but the live audit stream does not push them, so
+reload the Audit page to see one.
+
+No agent may take a name that reads as toolyard itself (`toolyard`,
+`Toolyard system`, …): the Inbox names toolyard as the sender of its own
+items. An agent that has such a name from another route (an OAuth client,
+a host) shows as `agent "toolyard"`, and an agent that is not the owner's
+shows its owner's name after its own.
 
 Rollback: an older binary ignores the owner column (migration 0072) and
 treats the oldest account as the owner again.

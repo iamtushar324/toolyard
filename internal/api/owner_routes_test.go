@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/tusharbhardwaj/toolyard/internal/approval"
 	"github.com/tusharbhardwaj/toolyard/internal/clerk"
 	"github.com/tusharbhardwaj/toolyard/internal/identity"
 )
@@ -326,9 +327,21 @@ func TestPersonalSignInFollowsTransfer(t *testing.T) {
 		t.Fatalf("transfer while Clerk is down: %d %v", code, out)
 	}
 	e.clerk.set(func(f *fakeClerk) { f.googleErr = nil })
-	// The previous owner's agent and operator token, revoked with the move.
+	// The previous owner's agent and operator token, and every other
+	// person's operator token, revoked with the move; the new owner's stays.
 	agentTok, _ := e.agentFor(t, e.admin.ID)
 	opTok, _, err := e.id.CreateOperatorToken(context.Background(), e.admin.ID, "cli", []string{identity.ScopeRead}, 0, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.db.Exec(`UPDATE users SET role = 'admin' WHERE id = 'u_plain'`); err != nil {
+		t.Fatal(err)
+	}
+	plainTok, _, err := e.id.CreateOperatorToken(context.Background(), "u_plain", "cli", []string{identity.ScopeRead}, 0, "test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	mTok, _, err := e.id.CreateOperatorToken(context.Background(), m.ID, "cli", []string{identity.ScopeRead}, 0, "test")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -344,6 +357,12 @@ func TestPersonalSignInFollowsTransfer(t *testing.T) {
 	}
 	if e.auditRows(t, "user.credentials_revoked", "previous_owner") != 1 {
 		t.Error("revoking the previous owner's credentials is not audited")
+	}
+	if _, _, err := e.id.VerifyOperatorToken(context.Background(), plainTok); err == nil {
+		t.Error("another person's operator token still works in personal mode")
+	}
+	if _, _, err := e.id.VerifyOperatorToken(context.Background(), mTok); err != nil {
+		t.Errorf("the new owner's operator token was revoked: %v", err)
 	}
 	// The previous owner's session ends; the new owner signs in.
 	if rec := e.do(t, ownerCookie, http.MethodGet, "/v1/auth/me", ""); rec.Code != http.StatusUnauthorized {
@@ -377,11 +396,18 @@ func TestClerkSyncSuspendsDepartedOwner(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	if _, err := e.db.Exec(`INSERT INTO push_subscriptions(id, user_id, endpoint, p256dh, auth, created_at) VALUES('ps_m', ?, 'https://push.example/m', 'k', 'a', 1)`, m.ID); err != nil {
+		t.Fatal(err)
+	}
 	e.clerk.set(func(f *fakeClerk) {
 		f.members = map[string]clerk.Member{"user_someone": {IsMember: true}}
 	})
 	if n := e.srv.runClerkSync(ctx); n != 1 {
 		t.Fatalf("suspended %d, want 1 (the owner)", n)
+	}
+	var pushes int
+	if err := e.db.QueryRow(`SELECT count(*) FROM push_subscriptions WHERE user_id = ?`, m.ID).Scan(&pushes); err != nil || pushes != 0 {
+		t.Errorf("departed owner's push subscriptions = %d %v, want 0", pushes, err)
 	}
 	u, _ := e.id.GetUserByID(ctx, m.ID)
 	if u.Status != identity.StatusBlocked || u.BlockedReason != "left_org" || !u.Owner {
@@ -418,5 +444,66 @@ func TestClerkSyncSuspendsDepartedOwner(t *testing.T) {
 	// not stop re-activating.
 	if rec := e.do(t, e.cookieFor(t, e.admin.ID), http.MethodPatch, "/v1/users/"+m.ID, `{"status":"active"}`); rec.Code != http.StatusOK {
 		t.Fatalf("unblock the owner: %d %s", rec.Code, rec.Body.String())
+	}
+}
+
+// A departed owner who is the only active admin is left active (a partial
+// member list must not lock everyone out), with one audit row however
+// often the sync runs.
+func TestClerkSyncKeepsDepartedSoleOwner(t *testing.T) {
+	e := newAccessTestServer(t)
+	ctx := context.Background()
+	m := e.member(t, "user_m", "m@beknown.work")
+	if err := e.id.TransferOwnership(ctx, e.admin.ID, m.ID); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.id.SetRole(ctx, e.admin.ID, identity.RoleMember); err != nil {
+		t.Fatal(err)
+	}
+	e.clerk.set(func(f *fakeClerk) {
+		f.members = map[string]clerk.Member{"user_someone": {IsMember: true}}
+	})
+	for i := 0; i < 2; i++ {
+		if n := e.srv.runClerkSync(ctx); n != 0 {
+			t.Fatalf("pass %d blocked %d, want 0", i, n)
+		}
+	}
+	if u, _ := e.id.GetUserByID(ctx, m.ID); u.Status != identity.StatusActive || !u.Owner {
+		t.Fatalf("sole admin owner = %+v, want active", u)
+	}
+	if n := e.auditRows(t, "user.owner_left_org", "last_admin"); n != 1 {
+		t.Fatalf("user.owner_left_org rows = %d, want 1", n)
+	}
+}
+
+// A notification tap counts only while its person is active: a blocked
+// person's approval token decides nothing.
+func TestApprovalTapRefusedForBlockedUser(t *testing.T) {
+	e := newAccessTestServer(t)
+	ctx := context.Background()
+	bus, err := approval.New(ctx, e.db)
+	if err != nil {
+		t.Fatal(err)
+	}
+	e.srv.approval = bus
+	m := e.member(t, "user_m", "m@beknown.work")
+	req, err := bus.Hold(ctx, approval.NewRequest{AgentID: "ag_1", UpstreamName: "github", ToolName: "t", Arguments: map[string]any{"a": 1}}, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := e.id.SetStatus(ctx, m.ID, identity.StatusBlocked, "left_org"); err != nil {
+		t.Fatal(err)
+	}
+	rec := e.do(t, nil, http.MethodPost, "/v1/approvals/decide-by-token", `{"token":"`+bus.DecisionTokenFor(req.ID, m.ID)+`","action":"denied"}`)
+	if rec.Code != http.StatusForbidden {
+		t.Fatalf("blocked person's tap: %d %s", rec.Code, rec.Body.String())
+	}
+	if got, _ := bus.Get(ctx, req.ID); got == nil || got.Status != approval.StatusPending {
+		t.Fatalf("approval after a refused tap = %+v", got)
+	}
+	// The active admin's tap still works.
+	rec = e.do(t, nil, http.MethodPost, "/v1/approvals/decide-by-token", `{"token":"`+bus.DecisionTokenFor(req.ID, e.admin.ID)+`","action":"denied"}`)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("active admin's tap: %d %s", rec.Code, rec.Body.String())
 	}
 }

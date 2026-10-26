@@ -536,8 +536,8 @@ func runServe(argv []string) error {
 		log.Printf("toolyard: WARN the owner was not an admin (an older binary may have demoted them); made them an admin again")
 	}
 	// An install that had users before the owner existed gets one now:
-	// the user with the owner email, else (no owner email) the oldest
-	// active admin. With an owner email nobody has yet, it stays vacant.
+	// the oldest active admin, when no owner email is set. With an owner
+	// email it stays vacant until that person's verified sign-in.
 	switch owner, err := idSvc.EnsureOwner(ctx, ownerSeed); {
 	case err == nil && owner.Status != identity.StatusActive:
 		log.Printf("toolyard: WARN the owner %s is blocked (%s); an admin can unblock them, or move the owner role on this host with: toolyard owner transfer --to <username|email>", owner.Username, owner.BlockedReason)
@@ -545,7 +545,7 @@ func runServe(argv []string) error {
 		log.Printf("toolyard: owner is %s", owner.Username)
 	case errors.Is(err, identity.ErrNoUser):
 		if ownerSeed != "" {
-			log.Printf("toolyard: no owner yet; the first sign-in with -owner-email %s becomes the owner", ownerSeed)
+			log.Printf("toolyard: no owner yet; the first verified sign-in with -owner-email %s becomes the owner", ownerSeed)
 		}
 	default:
 		log.Printf("toolyard: WARN choosing the owner: %v", err)
@@ -598,7 +598,7 @@ func runServe(argv []string) error {
 	bus.AddNotifierFunc(func(ctx context.Context, req *approval.Request, eventType string) {
 		hub.Publish(realtime.Event{Type: "approval", Data: req})
 		if eventType == "approval.create" {
-			user, err := idSvc.OwnerOrPrimary(ctx)
+			user, err := idSvc.ActiveOwnerOrAdmin(ctx)
 			if uid := req.PersonalOwner(); uid != "" {
 				user, err = idSvc.GetUserByID(ctx, uid)
 			}
@@ -901,8 +901,14 @@ func runServe(argv []string) error {
 		AllowPrivateMedia: *inboxFetchPrivate,
 		Publish:           func(t string, d any) { hub.Publish(realtime.Event{Type: t, Data: d}) },
 		AgentName:         agentName,
+		// A notification tap needs no session: it counts only while the
+		// person it was sent to is still active.
+		UserActive: func(ctx context.Context, uid string) bool {
+			u, err := idSvc.GetUserByID(ctx, uid)
+			return err == nil && u.Status == identity.StatusActive
+		},
 		Notify: func(ctx context.Context, p inbox.Push) {
-			user, err := idSvc.OwnerOrPrimary(ctx)
+			user, err := idSvc.ActiveOwnerOrAdmin(ctx)
 			if err != nil {
 				return
 			}
@@ -1159,7 +1165,7 @@ func runServe(argv []string) error {
 		if len(src.NotifyTypes) > 0 && !containsStr(src.NotifyTypes, ev.Type) {
 			return
 		}
-		user, uerr := idSvc.OwnerOrPrimary(ctx)
+		user, uerr := idSvc.ActiveOwnerOrAdmin(ctx)
 		if uerr != nil {
 			return
 		}
@@ -1449,7 +1455,7 @@ func runServe(argv []string) error {
 			// A review goes to the owner when the source's creator is no
 			// longer an active admin.
 			FallbackReviewer: func(ctx context.Context) (string, error) {
-				u, err := idSvc.OwnerOrPrimary(ctx)
+				u, err := idSvc.ActiveOwnerOrAdmin(ctx)
 				if err != nil {
 					return "", err
 				}
@@ -2371,7 +2377,7 @@ func (h hubEventBus) Publish(eventType string, data any) {
 	h.hub.Publish(realtime.Event{Type: eventType, Data: data})
 }
 
-// identityResolver adapts identity.Service.OwnerOrPrimary (the person in
+// identityResolver adapts identity.Service.ActiveOwnerOrAdmin (the person in
 // charge, who gets reauthorisation pushes) → oauth.IdentityResolver.
 // cancelAgentWork cancels a revoked OAuth client's pending approvals
 // (personal ones included) and Inbox requests and revokes its Inbox
@@ -2442,7 +2448,7 @@ func registryUpstreams(servers []upstreams.Server) []string {
 type identityResolver struct{ id *identity.Service }
 
 func (r identityResolver) PrimaryUserID(ctx context.Context) (string, error) {
-	u, err := r.id.OwnerOrPrimary(ctx)
+	u, err := r.id.ActiveOwnerOrAdmin(ctx)
 	if err != nil {
 		return "", err
 	}
