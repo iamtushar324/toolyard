@@ -232,6 +232,8 @@ func (c *ChangeProposals) ProposeChange(ctx context.Context, v Viewer, in Change
 		return nil, err
 	}
 	switch {
+	case src.IsBuiltin():
+		return nil, fmt.Errorf("%w: the built-in toolyard skills ship with toolyard itself and take no change proposals; tell your owner what should change", ErrInvalid)
 	case src.CreatedBy == "":
 		return nil, fmt.Errorf("%w: the skill source %s has no owner who could open a pull request", ErrInvalid, src.Slug)
 	case sk.Commit == "":

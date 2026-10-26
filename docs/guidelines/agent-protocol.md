@@ -667,7 +667,7 @@ browser URL.
 
 ## Server-owned host connections
 
-BKT3's browser consent flow creates one dedicated Toolyard agent for the
+A host server's browser consent flow creates one dedicated Toolyard agent for the
 selected server environment and authenticated server profile. The Toolyard
 browser account is the agent owner. A hosted profile must match that account's
 verified Clerk subject; the fixed `local-user` profile uses explicit account
@@ -682,11 +682,11 @@ issuing another credential while its connection generation remains active.
 Replayed proof IDs, substituted environments/profiles, changed keys, and expired
 pending requests are rejected. Consent does not approve any restricted call.
 
-Host credentials remain in the destination server secret store. BKT3 clients
-and authenticated native MCP callers use the server proxy. Requests therefore
+Host credentials remain in the destination server secret store. The host's
+clients and authenticated native MCP callers use the server proxy. Requests therefore
 carry the dedicated agent and its real account owner rather than a shared key.
-Private hosts use outbound pull callbacks. A BKT3 connection token authorizes
-BKT3 access; it is not Toolyard consent.
+Private hosts use outbound pull callbacks. The host's own connection token
+authorizes access to the host; it is not Toolyard consent.
 
 Each host has a 30-day renewable connection lease. API status and the dashboard
 show the owner, host, agent, and expiry. Owners can revoke a host in Toolyard.
@@ -708,11 +708,13 @@ restricted tool or a denial (section 11).
 
 **What you need.**
 
-- `TOOLYARD_URL`: the toolyard base URL. The default is
-  `https://toolyard.beknown.live`.
+- `TOOLYARD_URL` (required): your toolyard's base URL, for example
+  `https://toolyard.example.com`. Set it yourself. The `ty` that
+  `GET /v1/code/ty` serves defaults to the toolyard that served it; any
+  other copy has no default and refuses to run without it.
 - `TOOLYARD_TOKEN_FILE`: a file that holds your toolyard token, readable
-  only by you (`chmod 600`). In T3 the server writes a session token
-  (`tys_…`) there for your session. Operator tokens (`tyop_…`) never work
+  only by you (`chmod 600`). Some hosts write a session token (`tys_…`)
+  there for your session. Operator tokens (`tyop_…`) never work
   here.
 
 Never print, `echo` or `cat` the token into your output. Never put it in a
@@ -910,7 +912,7 @@ than 12 calls refuses it. Give your own Standard Webhooks `secret`
 (`whsec_` and 24–64 random bytes in Base64), or leave it out and toolyard
 generates one and returns it **once**: store it. Destinations are public
 `https` URLs on port 443 and never change; register a new receiver for a new
-URL. In T3, use your session webhook instead (`t3_session_webhook_create`).
+URL. On a host that gives your session its own webhook, use that instead.
 
 **Use it.** Pass `callback_ref` (and up to 5 `callback_refs`) on
 `inbox.request` or `inbox.ask`; several receivers can follow one item. With

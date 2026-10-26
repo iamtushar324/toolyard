@@ -464,6 +464,71 @@ nothing then. A skill folder that already exists is replaced only with
 `--force` (the old folder is moved aside and removed once the new one is
 in place).
 
+## Built-in skills
+
+toolyard ships a few skills of its own that teach any connected agent how
+toolyard works and how to use it well. They live in the repository under
+`internal/skillhub/builtin/skills/` and are compiled into the binary:
+
+| Skill | What it teaches |
+| --- | --- |
+| `toolyard-basics` | what toolyard is, identity, `_reason`, finding tools, policies, connections, sessions, common errors (the starting point) |
+| `toolyard-permissions-and-inbox` | `inbox.check` and `inbox.request`, the owner's decision, grants (`_grant`), `outcome_unknown`, `inbox.post`, `inbox.ask`, uploads, legacy approvals |
+| `toolyard-code-mode` | `executeToolCode` in Starlark or JavaScript, stubs, limits, errors inside scripts, the REST fallback and `ty` |
+| `toolyard-async-jobs` | `jobs.*`, MCP Tasks, job callbacks, retries after `failed`, `cancelled` or `outcome_unknown` |
+| `toolyard-callbacks` | webhook receivers (`callbacks.*`), `callback_ref`, events, signatures, retries |
+| `toolyard-skills` | this hub from the agent's side: search, read, bundles, proposals, the MCP Skills extension |
+| `toolyard-github-writes` | GitHub comments and reviews that wait for the account owner's approval |
+| `toolyard-connecting-clients` | helping a person connect Claude.ai, ChatGPT, Claude Code or another MCP client |
+
+While the hub is on, toolyard serves them as the source **`toolyard`**
+(kind `builtin`, version label `toolyard.builtin/skills@<digest>`), seen by
+everyone and runnable anywhere by default. The server instructions a
+caller gets at `initialize` (and `server/discover`) gain one line that
+points it at `skills.get` with `toolyard/toolyard-basics`, while that
+caller can see the guide: worked out per request, so a late install adds
+the line and hiding the source removes it. Agents use them like any other
+skills: `skills.search`, `skills.get`, `skills.read`, `skills.grep`,
+`skills.list`, bundles, `ty skills pull` and the MCP Skills extension. The
+source never calls GitHub. Its stored repository settings point at nothing
+GitHub can serve (an owner name with a dot, which no GitHub account can
+have; a pin to the all-zero commit; no token; a next check in year 9999),
+so a toolyard build that does not know built-in sources, such as an older
+one after a rollback, cannot fetch anything for it either; a current build
+puts those settings back if such a build changed them.
+
+**How they upgrade.** The version's commit is the SHA-256 of the embedded
+files (every path and the SHA-256 of its content). At start each replica
+compares the live version with its own files; when they differ it takes
+the source's sync lock, looks again, and makes its files live: a version
+it already has (a downgrade) or a new one built through the same checks
+as a GitHub commit (text only, no secrets, the Agent Skills validation).
+Two replicas that start together make one version; a restart with the
+same files makes none. While replicas of two toolyard versions run side
+by side, the one that started last decides, so a rolling upgrade or a
+rollback never flips the skills back and forth. Every five minutes a
+replica retries a start that failed and puts back a source that went
+missing. Older versions follow the usual retention.
+
+**What admins can change.** On the Skills page the source carries a
+**Built in** badge. Admins choose who sees it (**Who sees it**, the same
+sharing as other sources) and where its skills run (the source default and
+the per-skill override). Nothing else applies: its branch, folder, excludes,
+limits, update mode, pinned commit, token, check interval, paused state and
+webhook cannot change, its versions cannot be activated or rejected by
+hand, and it cannot be deleted. The admin routes answer `409 conflict`
+with the reason; "Sync now" only installs the running binary's skills if
+they are not live. Agents cannot propose changes to it
+(`skills.propose_change` answers `invalid`): change the skills in the
+toolyard repository instead.
+
+**The slug is reserved.** No source can be created with the slug
+`toolyard`, and a repository named `toolyard` gets `toolyard-2` by
+default. A source that already held the slug before an upgrade keeps it;
+the built-in source is then not installed, and the log says why:
+delete that source and add its repository again under
+another slug.
+
 ## How sync works
 
 1. **Check.** The cluster leader looks every 15 seconds for sources whose

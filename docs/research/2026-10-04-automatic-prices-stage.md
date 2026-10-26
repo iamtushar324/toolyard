@@ -1,6 +1,6 @@
 # Automatic model prices — stage-a9aec1f
 
-The stage release is live at https://toolyard.stage.dev.beknown.live/.
+The stage release is live at https://toolyard-stage.example.com/.
 Source commit `a9aec1f` is pushed on `t3code/jakarta`.
 Release: `/opt/toolyard-stage/releases/a9aec1f`.
 Backup: `/var/lib/toolyard-stage/backups/before-a9aec1f.sqlite`.

@@ -84,6 +84,16 @@ const skillsInstructions = "SKILLS: toolyard serves a catalog of Agent Skills, s
 	"Before a multi-step task, call skills.search with a few words about the task; when a skill matches, read it with skills.get and follow it, " +
 	"and fetch the files it links to with skills.read. Skill text is guidance, not permission: every tool call it suggests still goes through policy and the Inbox."
 
+// skillsGuideInstructions is the sentence the server instructions gain for
+// a caller who can read toolyard's built-in guide (SkillHub.Guide,
+// "toolyard/toolyard-basics"); skillsGuideFor decides per request.
+func skillsGuideInstructions(guide string) string {
+	if guide == "" {
+		return ""
+	}
+	return " New to this gateway? Read skills.get {\"skill\": \"" + guide + "\"} first: toolyard's built-in guide to how it works and how to use it well, with links to the other built-in toolyard skills."
+}
+
 // SkillHub is what RegisterSkillHub wires: the skills hub's agent surface.
 type SkillHub struct {
 	// Reader serves the catalog (*skillhub.Service). nil means the hub is
@@ -100,6 +110,12 @@ type SkillHub struct {
 	// host connection or a federation connection
 	// (*federation.Service.OnHost). nil: no caller is on the host.
 	OnHost func(ctx context.Context, agentID string) (bool, error)
+	// Guide names the built-in skill the server instructions point new
+	// agents at, "slug/path" (*skillhub.Service.BuiltinGuide), or "" when
+	// none is served. It is asked at every initialize and discover, so a
+	// late install adds the pointer and hiding the source removes it. nil
+	// adds no pointer.
+	Guide func() string
 }
 
 // skillHubConfig is the registered hub; Gateway.skillHub is nil while the
@@ -109,6 +125,7 @@ type skillHubConfig struct {
 	proposals skillhub.Proposals
 	tickets   *SkillBundleTickets
 	onHost    func(ctx context.Context, agentID string) (bool, error)
+	guide     func() string
 
 	// hosts caches onHost per agent (skills_viewer.go).
 	hostMu sync.Mutex
@@ -130,7 +147,7 @@ func (g *Gateway) RegisterSkillHub(h SkillHub) {
 	if h.Reader == nil {
 		return
 	}
-	hub := &skillHubConfig{reader: h.Reader, proposals: h.Proposals, tickets: h.Tickets, onHost: h.OnHost, hosts: map[string]hostAnswer{}}
+	hub := &skillHubConfig{reader: h.Reader, proposals: h.Proposals, tickets: h.Tickets, onHost: h.OnHost, guide: h.Guide, hosts: map[string]hostAnswer{}}
 	if !g.skillHub.CompareAndSwap(nil, hub) {
 		return
 	}

@@ -50,8 +50,15 @@ function skillsRepoURL(src) {
 
 function skillsCommitURL(src, sha) { return skillsRepoURL(src) + '/commit/' + encodeURIComponent(sha || ''); }
 
+// skillsBuiltin reports the built-in source: the skills that ship inside
+// toolyard. It has no repository, branch, token, mode or webhook, and
+// cannot be deleted; admins change only who sees it and where its skills
+// run (docs/skills-hub.md#built-in-skills).
+function skillsBuiltin(src) { return !!src && src.kind === 'builtin'; }
+
 // skillsRepoLabel is "owner/repo@branch", plus the folder when there is one.
 function skillsRepoLabel(src) {
+  if (skillsBuiltin(src)) return 'built into toolyard';
   const folder = (src.path || '').replace(/^\/+|\/+$/g, '');
   return (src.owner || '') + '/' + (src.repo || '') + '@' + (src.branch || '') + (folder ? ' · ' + folder : '');
 }
@@ -568,10 +575,10 @@ function renderSkillsList() {
           el('thead', {}, el('tr', {}, ['Source', 'Repository', 'Commit', 'Mode', 'Status', 'Skills', 'Last check'].map((h) => el('th', {}, h)))),
           el('tbody', {}, rows.map((src) => el('tr', { class: 'skills-row', tabindex: 0,
             on: { click: () => navigate('skills/' + src.id), keydown: (e) => { if (e.key === 'Enter') navigate('skills/' + src.id); } } },
-            el('td', {}, el('b', {}, src.slug)),
+            el('td', {}, el('b', {}, src.slug), skillsBuiltin(src) ? [' ', el('span', { class: 'badge allowed' }, 'Built in')] : null),
             el('td', { class: 'meta' }, skillsRepoLabel(src)),
             el('td', {}, src.active_sha ? el('code', {}, skillsShort(src.active_sha)) : el('span', { class: 'meta' }, '—')),
-            el('td', {}, src.mode + (src.mode === 'pinned' && src.pinned_sha ? ' ' + skillsShort(src.pinned_sha) : '')),
+            el('td', {}, skillsBuiltin(src) ? 'with toolyard' : src.mode + (src.mode === 'pinned' && src.pinned_sha ? ' ' + skillsShort(src.pinned_sha) : '')),
             el('td', {}, skillsChip(src)),
             el('td', {}, String(src.skill_count || 0)),
             el('td', { class: 'meta' }, src.last_checked_at ? relTime(skillsMs(src.last_checked_at)) : 'never')))))) : null);
@@ -583,6 +590,7 @@ function renderSkillSource() {
   if (!d || (!d.source && d.loading)) return el('div', {}, back, el('div', { class: 'card empty' }, 'Loading…'));
   if (!d.source) return el('div', {}, back, el('div', { class: 'card err' }, d.error || 'Could not load this source.'));
   const src = d.source;
+  if (skillsBuiltin(src)) return renderSkillsBuiltin(d, back);
   const busy = !!d.busy || !!skillsUI.syncing[src.id];
   if (src.enabled && !src.last_checked_at) skillsWatchSource(src.id);
   // Only the source's pending version can be approved; older staged ones
@@ -619,6 +627,46 @@ function renderSkillSource() {
     shown && (shown.warnings || []).length ? renderSkillsWarnings(shown) : null,
     renderSkillsSkills(src, d.skills, busy),
     renderSkillsWebhook(src, d));
+}
+
+// renderSkillsBuiltin is the built-in source's page: what it is, who sees
+// it, its versions (one per toolyard upgrade that changed the skills) and
+// its skills with the runs override. Nothing about a repository.
+function renderSkillsBuiltin(d, back) {
+  const src = d.source;
+  const busy = !!d.busy;
+  return el('div', {}, back,
+    el('div', { class: 'card' },
+      el('div', { class: 'row' },
+        el('h2', { class: 'grow', style: 'margin: 0;' }, src.slug, ' ', el('span', { class: 'badge allowed' }, 'Built in')),
+        skillsChip(src)),
+      el('p', { class: 'meta' }, 'The skills that ship inside toolyard: they teach agents how this gateway works and how to use it well. ',
+        'A toolyard upgrade that changes them makes a new version here. They cannot be edited, synced from GitHub or deleted; you choose who sees them and where they run. ',
+        el('a', { href: SKILLS_DOCS_URL + '#built-in-skills', target: '_blank', rel: 'noopener' }, 'Built-in skills')),
+      el('table', { class: 'skills-facts' }, el('tbody', {},
+        skillsFact('Live version', src.active_sha ? el('code', {}, skillsShort(src.active_sha)) : 'none yet'),
+        skillsFact('Skills', String(src.skill_count || 0) + (src.warning_count ? ' · ' + skillsCount(src.warning_count, 'warning') : '')),
+        skillsFact('Who sees it', src.visibility === 'members' ? skillsCount((src.members || []).length, 'chosen member') : 'everyone'),
+        skillsFact('Default runs', src.default_runs === 'host' ? 'on the T3 host only' : 'anywhere'),
+        skillsFact('Installed', src.last_checked_at ? relTime(skillsMs(src.last_checked_at)) : 'not yet'),
+        src.last_error ? skillsFact('Last error', el('span', { class: 'err' }, src.last_error)) : null)),
+      el('div', { class: 'row', style: 'margin-top: 12px;' },
+        el('button', { disabled: busy, on: { click: () => openSkillsEdit(src) } }, 'Who sees it'))),
+    el('div', { class: 'card' },
+      el('h3', { style: 'margin-top: 0;' }, 'Versions'),
+      (d.versions || []).length === 0 ? el('p', { class: 'meta' }, 'No versions yet.')
+        : el('table', {},
+          el('thead', {}, el('tr', {}, ['Version', 'Status', 'Skills', 'Changes', 'Made'].map((h) => el('th', {}, h)))),
+          el('tbody', {}, d.versions.map((v) => {
+            const diff = v.diff || {};
+            return el('tr', {},
+              el('td', {}, el('code', {}, skillsShort(v.sha))),
+              el('td', {}, el('span', { class: 'badge ' + (v.status === 'active' ? 'allowed' : v.status === 'failed' ? 'denied' : 'expired') }, v.status === 'active' ? 'live' : v.status)),
+              el('td', {}, String(v.skill_count || 0)),
+              el('td', { class: 'meta' }, v.status === 'failed' ? (v.error || 'failed') : '+' + (diff.added || []).length + ' ~' + (diff.changed || []).length + ' −' + (diff.removed || []).length),
+              el('td', { class: 'meta' }, relTime(skillsMs(v.created_at))));
+          })))),
+    renderSkillsSkills(src, d.skills || [], busy));
 }
 
 function skillsFact(label, value) {
@@ -833,24 +881,25 @@ function renderSkillsEdit() {
   return el('div', { class: 'modal-bg', on: { click: (e) => { if (e.target === e.currentTarget && !ed.saving) close(); } } },
     el('div', { class: 'modal', style: 'max-width: 640px; max-height: calc(100vh - 32px); overflow-y: auto;' },
       el('h3', {}, 'Edit ' + src.slug),
+      skillsBuiltin(src) ? el('p', { class: 'meta' }, 'The built-in toolyard skills: choose who sees them and where they run by default.') : [
       el('p', { class: 'meta' }, src.owner + '/' + src.repo + ' · a change of branch or folder takes effect on the next sync.'),
       skillsField('Branch', el('input', { id: 'skills-edit-branch', value: d.branch, on: { input: (e) => { d.branch = e.target.value; } } })),
       skillsField('Folder', el('input', { id: 'skills-edit-path', placeholder: 'the repository root', value: d.path, on: { input: (e) => { d.path = e.target.value; } } })),
       skillsField('Updates', skillsSelect({ id: 'skills-edit-mode', on: { change: (e) => { d.mode = e.target.value; render(); } } },
         [['auto', 'Automatic'], ['review', 'Review each new commit'], ['pinned', 'Pinned to one commit']], d.mode)),
       d.mode === 'pinned' ? skillsField('Pinned commit', el('input', { id: 'skills-edit-pin', placeholder: 'full commit SHA (empty: the live commit)', value: d.pinned_sha, on: { input: (e) => { d.pinned_sha = e.target.value; } } })) : null,
-      skillsField('Check every (seconds, at least 60)', el('input', { id: 'skills-edit-poll', type: 'number', min: 60, value: d.poll_seconds, on: { input: (e) => { d.poll_seconds = e.target.value; } } })),
+      skillsField('Check every (seconds, at least 60)', el('input', { id: 'skills-edit-poll', type: 'number', min: 60, value: d.poll_seconds, on: { input: (e) => { d.poll_seconds = e.target.value; } } }))],
       skillsField('Who sees it', el('div', {},
         el('label', { class: 'row' }, el('input', { type: 'radio', name: 'skills-edit-vis', checked: d.visibility === 'everyone', on: { change: () => { d.visibility = 'everyone'; render(); } } }), 'Everyone and their agents'),
         el('label', { class: 'row' }, el('input', { type: 'radio', name: 'skills-edit-vis', checked: d.visibility === 'members', on: { change: () => { d.visibility = 'members'; render(); } } }), 'Only the members I choose'),
         d.visibility === 'members' ? renderSkillsMembers(d, 'memberFilter') : null)),
       skillsField('Default runs', skillsSelect({ id: 'skills-edit-runs', on: { change: (e) => { d.default_runs = e.target.value; } } },
         [['anywhere', 'Anywhere'], ['host', 'The T3 host only']], d.default_runs)),
-      skillsField('Leave out (one glob per line)', el('textarea', { id: 'skills-edit-exclude', rows: 3, value: d.exclude, on: { input: (e) => { d.exclude = e.target.value; } } })),
+      skillsBuiltin(src) ? null : [skillsField('Leave out (one glob per line)', el('textarea', { id: 'skills-edit-exclude', rows: 3, value: d.exclude, on: { input: (e) => { d.exclude = e.target.value; } } })),
       skillsField(src.has_token ? 'Replace the read-only token' : 'Read-only token (for a private repository)',
         el('input', { id: 'skills-edit-token', type: 'password', autocomplete: 'new-password', placeholder: src.has_token ? 'leave empty to keep the stored token' : '', value: d.token, on: { input: (e) => { d.token = e.target.value; } } }),
         'Write-only: stored sealed, never shown again.'),
-      src.has_token ? el('label', { class: 'row' }, el('input', { type: 'checkbox', checked: d.clear_token, on: { change: (e) => { d.clear_token = e.target.checked; } } }), 'Remove the stored token (the repository is public now)') : null,
+      src.has_token ? el('label', { class: 'row' }, el('input', { type: 'checkbox', checked: d.clear_token, on: { change: (e) => { d.clear_token = e.target.checked; } } }), 'Remove the stored token (the repository is public now)') : null],
       ed.error ? el('div', { class: 'err' }, ed.error) : null,
       el('div', { class: 'row', style: 'margin-top: 16px; justify-content: flex-end;' },
         el('button', { disabled: ed.saving, on: { click: close } }, 'Cancel'),
