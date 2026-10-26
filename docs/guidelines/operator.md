@@ -21,8 +21,9 @@ operator token go through the same policy and approval queue as any other
 call; the approval card names the token.
 
 Never available to operator tokens, whatever the scope: `/reveal` routes,
-login, logout and first-user setup. Secret values are never returned by any
-route.
+login, logout, first-user setup, changing a person's role, and transferring
+ownership (`POST /v1/users/{id}/make-owner`): those need a person signed in to
+the dashboard. Secret values are never returned by any route.
 
 ## Getting a token
 
@@ -36,8 +37,12 @@ toolyard-gateway operator-token list   --data /var/lib/toolyard
 toolyard-gateway operator-token revoke --data /var/lib/toolyard op_…
 ```
 
-`--user` picks the user (username, email or id; default: the oldest active
-admin), `--scopes read,write[,owner]`, `--ttl 720h` sets an expiry.
+`--user` picks the user (username, email or id; default: the owner, else the
+oldest active admin), `--scopes read,write[,owner]`, `--ttl 720h` sets an expiry.
+
+`toolyard-gateway owner show` and `owner transfer --to <user> [--unblock]` are
+the host break-glass for the owner role (for example when the owner left the
+organisation); see "The owner and admins" in self-hosting.md.
 
 From the API, an admin can mint one with `POST /v1/operator-tokens
 {"name":"…","scopes":["read","write"],"ttl_hours":0}`. The plaintext is

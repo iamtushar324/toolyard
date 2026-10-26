@@ -131,12 +131,16 @@ type Client struct {
 	frontendAPI        string
 	orgID              string
 	allowedGoogleEmail string
-	azp                map[string]bool
-	http               *http.Client
-	apiBase            string
-	jwksURL            string
-	issuer             string
-	now                func() time.Time
+	// allowedEmailFn, when set, names the address personal access admits
+	// now (the stored owner's, which a transfer changes); "" falls back
+	// to allowedGoogleEmail. SetAllowedGoogleEmailFunc sets it.
+	allowedEmailFn func(context.Context) (string, error)
+	azp            map[string]bool
+	http           *http.Client
+	apiBase        string
+	jwksURL        string
+	issuer         string
+	now            func() time.Time
 
 	mu          sync.Mutex
 	keys        map[string]*rsa.PublicKey
@@ -188,6 +192,16 @@ func New(cfg Config) (*Client, error) {
 		c.issuer = "https://" + fapi
 	}
 	return c, nil
+}
+
+// SetAllowedGoogleEmailFunc makes personal access (AllowedGoogleEmail)
+// admit the address fn returns at each sign-in instead of the configured
+// one, which then only applies while fn returns "". toolyard passes the
+// stored owner's email, so a transfer of ownership moves personal sign-in
+// to the new owner. An error from fn fails the sign-in as ErrUnavailable.
+// Call it once, before the client serves sign-ins.
+func (c *Client) SetAllowedGoogleEmailFunc(fn func(context.Context) (string, error)) {
+	c.allowedEmailFn = fn
 }
 
 // PublishableKey is what the browser needs to load Clerk.
@@ -585,6 +599,10 @@ type Member struct {
 	FirstName string
 	LastName  string
 	ImageURL  string
+	// EmailVerified: Email is the user's verified primary address, read
+	// from the Backend API (personal access checks it; an organisation
+	// membership's identifier is not checked).
+	EmailVerified bool
 }
 
 // membershipList mirrors the Backend API's OrganizationMemberships schema:

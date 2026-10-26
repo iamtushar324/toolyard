@@ -127,6 +127,8 @@ func main() {
 		err = runProbe(args)
 	case "operator-token":
 		err = runOperatorToken(args)
+	case "owner":
+		err = runOwner(args, os.Stdout)
 	case "healthcheck":
 		err = runHealthcheck(args)
 	case "keys-check":
@@ -262,6 +264,8 @@ Commands:
   exchange    swap an enrollment code for an agent token
   probe       dry-run a tool against an upstream MCP server
   operator-token  create | list | revoke CLI operator tokens (local, from -data)
+  owner       show | transfer --to <username|email|id> [--unblock]: the owner, and the host break-glass
+              that moves the owner role (local, from -data; audited as system:cli)
   healthcheck check a probe: -url <probe URL> -expect ready|live [-token-file <path>] (exit 0 or 1)
   keys-check  read-only check that every master key would load: -data <dir> [-credentials-dir <dir>] (exit 0 or 78)
   keys        generate -name identity|oauth|secrets|session [-out <file>]: one fresh key to stdout or a new file
@@ -276,7 +280,7 @@ Environment:
   (-public-url is TOOLYARD_PUBLIC_URL, -db-max-conns is TOOLYARD_DB_MAX_CONNS, -migrate is
   TOOLYARD_MIGRATE). The command line wins; an empty variable counts as unset. They may also come
   from toolyard.env in the credentials directory, except TOOLYARD_CREDENTIALS_DIR. keys-check,
-  operator-token and db migrate read TOOLYARD_DATA (or TOOLYARD_DATA_DIR) and TOOLYARD_CREDENTIALS_DIR,
+  operator-token, owner and db migrate read TOOLYARD_DATA (or TOOLYARD_DATA_DIR) and TOOLYARD_CREDENTIALS_DIR,
   keys-check also TOOLYARD_KEYS; healthcheck reads TOOLYARD_HEALTHCHECK_URL, _EXPECT and _TOKEN_FILE.
   -inbox-reset-passkeys is command line only. serve warns about a TOOLYARD_ variable that sets no
   flag and that nothing reads (a misspelt name). Secrets go in files, never in variables.
@@ -516,6 +520,44 @@ func runServe(argv []string) error {
 	}
 
 	idSvc := identity.New(db)
+	// The configured owner email only seeds the owner (identity/owner.go):
+	// on an install without one, only that person's sign-in claims the
+	// role. It matters only with Clerk sign-in on.
+	ownerSeed := *ownerEmail
+	if clerkClient == nil {
+		ownerSeed = ""
+	}
+	idSvc.SetOwnerEmail(ownerSeed)
+	// A rolling deploy may have run an older binary that demoted the
+	// owner: make them an admin again (audited).
+	if changed, err := idSvc.RepromoteOwner(ctx); err != nil {
+		log.Printf("toolyard: WARN checking the owner's role: %v", err)
+	} else if changed {
+		log.Printf("toolyard: WARN the owner was not an admin (an older binary may have demoted them); made them an admin again")
+	}
+	// An install that had users before the owner existed gets one now:
+	// the user with the owner email, else (no owner email) the oldest
+	// active admin. With an owner email nobody has yet, it stays vacant.
+	switch owner, err := idSvc.EnsureOwner(ctx, ownerSeed); {
+	case err == nil && owner.Status != identity.StatusActive:
+		log.Printf("toolyard: WARN the owner %s is blocked (%s); an admin can unblock them, or move the owner role on this host with: toolyard owner transfer --to <username|email>", owner.Username, owner.BlockedReason)
+	case err == nil:
+		log.Printf("toolyard: owner is %s", owner.Username)
+	case errors.Is(err, identity.ErrNoUser):
+		if ownerSeed != "" {
+			log.Printf("toolyard: no owner yet; the first sign-in with -owner-email %s becomes the owner", ownerSeed)
+		}
+	default:
+		log.Printf("toolyard: WARN choosing the owner: %v", err)
+	}
+	// Personal sign-in follows the stored owner, so a transfer of
+	// ownership moves it to the new owner.
+	if clerkClient != nil && *clerkOwnerOnly {
+		seed := *ownerEmail
+		clerkClient.SetAllowedGoogleEmailFunc(func(ctx context.Context) (string, error) {
+			return idSvc.OwnerSignInEmail(ctx, seed)
+		})
+	}
 	auditSvc := audit.New(db)
 	memSvc := memory.New(db)
 	// Roles and per-user tool-group grants. The gateway asks it on every
@@ -556,7 +598,7 @@ func runServe(argv []string) error {
 	bus.AddNotifierFunc(func(ctx context.Context, req *approval.Request, eventType string) {
 		hub.Publish(realtime.Event{Type: "approval", Data: req})
 		if eventType == "approval.create" {
-			user, err := idSvc.PrimaryUser(ctx)
+			user, err := idSvc.OwnerOrPrimary(ctx)
 			if uid := req.PersonalOwner(); uid != "" {
 				user, err = idSvc.GetUserByID(ctx, uid)
 			}
@@ -794,22 +836,9 @@ func runServe(argv []string) error {
 			inboxJudge = j
 		}
 	}
-	agentName := func(ctx context.Context, id string) string {
-		u, err := idSvc.PrimaryUser(ctx)
-		if err != nil {
-			return ""
-		}
-		ags, err := idSvc.ListAgents(ctx, u.ID)
-		if err != nil {
-			return ""
-		}
-		for _, a := range ags {
-			if a.ID == id {
-				return a.Name
-			}
-		}
-		return ""
-	}
+	// An agent's name, whoever owns it (the Inbox and skill proposals
+	// name the agent behind a request).
+	agentName := func(ctx context.Context, id string) string { return idSvc.AgentName(ctx, id) }
 	var geminiInboxVoice inbox.Voice
 	if key := os.Getenv("GEMINI_API_KEY"); key != "" {
 		if v, verr := inbox.NewGeminiVoice(ctx, key, os.Getenv("TOOLYARD_INBOX_VOICE_MODEL"), func() string {
@@ -873,7 +902,7 @@ func runServe(argv []string) error {
 		Publish:           func(t string, d any) { hub.Publish(realtime.Event{Type: t, Data: d}) },
 		AgentName:         agentName,
 		Notify: func(ctx context.Context, p inbox.Push) {
-			user, err := idSvc.PrimaryUser(ctx)
+			user, err := idSvc.OwnerOrPrimary(ctx)
 			if err != nil {
 				return
 			}
@@ -1130,7 +1159,7 @@ func runServe(argv []string) error {
 		if len(src.NotifyTypes) > 0 && !containsStr(src.NotifyTypes, ev.Type) {
 			return
 		}
-		user, uerr := idSvc.PrimaryUser(ctx)
+		user, uerr := idSvc.OwnerOrPrimary(ctx)
 		if uerr != nil {
 			return
 		}
@@ -1420,7 +1449,7 @@ func runServe(argv []string) error {
 			// A review goes to the owner when the source's creator is no
 			// longer an active admin.
 			FallbackReviewer: func(ctx context.Context) (string, error) {
-				u, err := idSvc.PrimaryUser(ctx)
+				u, err := idSvc.OwnerOrPrimary(ctx)
 				if err != nil {
 					return "", err
 				}
@@ -2342,7 +2371,8 @@ func (h hubEventBus) Publish(eventType string, data any) {
 	h.hub.Publish(realtime.Event{Type: eventType, Data: data})
 }
 
-// identityResolver adapts identity.Service.PrimaryUser → oauth.IdentityResolver.
+// identityResolver adapts identity.Service.OwnerOrPrimary (the person in
+// charge, who gets reauthorisation pushes) → oauth.IdentityResolver.
 // cancelAgentWork cancels a revoked OAuth client's pending approvals
 // (personal ones included) and Inbox requests and revokes its Inbox
 // grants, each recorded as done by the system because the grant was
@@ -2412,7 +2442,7 @@ func registryUpstreams(servers []upstreams.Server) []string {
 type identityResolver struct{ id *identity.Service }
 
 func (r identityResolver) PrimaryUserID(ctx context.Context) (string, error) {
-	u, err := r.id.PrimaryUser(ctx)
+	u, err := r.id.OwnerOrPrimary(ctx)
 	if err != nil {
 		return "", err
 	}

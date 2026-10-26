@@ -320,7 +320,9 @@ func TestSharedFlowBoundToAdminBrowser(t *testing.T) {
 	// A flow whose admin was demoted meanwhile cannot be finished with the cookie.
 	state, flow = begin(adminCookie)
 	other := e.member(t, "user_x", "x@beknown.work")
-	if err := e.id.SetRole(context.Background(), other.ID, "admin"); err != nil {
+	// The admin is the owner: hand the role to other before the demotion,
+	// and take it back afterwards.
+	if err := e.id.TransferOwnership(context.Background(), e.admin.ID, other.ID); err != nil {
 		t.Fatal(err)
 	}
 	if err := e.id.SetRole(context.Background(), e.admin.ID, "member"); err != nil {
@@ -330,6 +332,9 @@ func TestSharedFlowBoundToAdminBrowser(t *testing.T) {
 		t.Fatalf("demoted admin's flow cookie: %d %s", rec.Code, rec.Body.String())
 	}
 	if err := e.id.SetRole(context.Background(), e.admin.ID, "admin"); err != nil {
+		t.Fatal(err)
+	}
+	if err := e.id.TransferOwnership(context.Background(), other.ID, e.admin.ID); err != nil {
 		t.Fatal(err)
 	}
 

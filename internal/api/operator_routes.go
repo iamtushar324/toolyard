@@ -28,7 +28,9 @@ import (
 //	       approval-related settings, secret values, audit purges
 //
 // Nothing that returns a secret value (/reveal routes) or manages browser
-// sessions is reachable with an operator token, whatever its scopes.
+// sessions is reachable with an operator token, whatever its scopes, and
+// neither is changing a person's role or transferring ownership: those
+// need a person in a dashboard session (users_routes.go).
 
 const ctxOperatorKey ctxKey = 100
 
@@ -129,6 +131,10 @@ func operatorScopeFor(method, path string) (scope string, ok bool) {
 	// A skill source's webhook secret is shown once, to a person on the
 	// Skills page; GitHub's webhook itself takes no token.
 	if strings.HasPrefix(path, skillAdminSourcesPrefix) && (strings.HasSuffix(path, "/webhook-secret") || strings.HasSuffix(path, "/webhook")) {
+		return "", false
+	}
+	// Transferring ownership is the owner's own act, in their browser.
+	if strings.HasPrefix(path, "/v1/users/") && strings.HasSuffix(path, "/make-owner") {
 		return "", false
 	}
 	if operatorNeverPaths[path] || strings.Contains(path, "/reveal") || strings.HasPrefix(path, connectLinkPath) || strings.HasPrefix(path, uploadsPathPrefix) ||
@@ -475,7 +481,7 @@ var operatorCatalog = []operatorCatalogEntry{
 	{"/v1/operator/routes", "GET", "this catalog"},
 	{"/v1/operator/guide", "GET", "operator guide (markdown)"},
 	{"/v1/users", "GET POST", "users: list, create"},
-	{"/v1/users/{id}", "GET PATCH DELETE POST", "one user: role, status, access, identity key"},
+	{"/v1/users/{id}", "GET PATCH DELETE POST", "one user: role (browser session only), status, access, identity key; POST /make-owner transfers ownership (the owner's browser session only)"},
 	{"/v1/me/servers", "GET", "servers and data groups the caller may use"},
 	{"/v1/me/apps", "GET", "the caller's connected apps (OAuth clients); ?all=true lists everyone's for an admin"},
 	{"/v1/me/apps/config", "GET", "how to connect an MCP client by URL, and for an admin the OAuth settings"},

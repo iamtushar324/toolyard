@@ -218,7 +218,7 @@ scripts/k8s-test-deploy.sh
 | `INGRESS_NAMESPACE` | The ingress controller's namespace, let in by the NetworkPolicy (default `kube-system`, where K3s runs Traefik). |
 | `TLS_SECRET` | A TLS Secret for the Ingress; without it the controller serves its default certificate (for example a wildcard certificate). |
 | `EXTRA_EGRESS_CIDRS` | Comma-separated CIDRs the gateway may also reach, for upstream MCP servers on private addresses (for example another namespace's pod range). |
-| `OWNER_EMAIL` | `TOOLYARD_OWNER_EMAIL` (links the first Clerk sign-in with that address to the admin account; it does not create one). |
+| `OWNER_EMAIL` | `TOOLYARD_OWNER_EMAIL` (links the first Clerk sign-in with that address to the admin account; it does not create one. On an install without an owner yet, only that address can become the owner: docs/self-hosting.md, The owner and admins). |
 | `ADMIN_USERNAME` | Username of the first admin account (default `admin`). |
 | `TOKEN_FILE` | A file with a toolyard agent token, for the authenticated smoke checks. |
 | `SMOKE_INSECURE` | `1` skips certificate checks in the smoke test. |

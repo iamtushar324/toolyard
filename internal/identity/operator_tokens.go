@@ -255,14 +255,15 @@ func (s *Service) getOperatorToken(ctx context.Context, id string) (*OperatorTok
 }
 
 // FindUserForOperator resolves a username, email or user id to a user, for
-// the local bootstrap command. An empty ref picks the oldest active admin.
+// the local bootstrap command. An empty ref picks the owner (always an
+// active admin), else the oldest active admin.
 func (s *Service) FindUserForOperator(ctx context.Context, ref string) (*User, error) {
 	ref = strings.TrimSpace(ref)
 	var id string
 	var err error
 	if ref == "" {
 		err = s.db.QueryRowContext(ctx,
-			`SELECT id FROM users WHERE role = ? AND status = ? ORDER BY created_at, id LIMIT 1`,
+			`SELECT id FROM users WHERE role = ? AND status = ? ORDER BY is_owner DESC, created_at, id LIMIT 1`,
 			RoleAdmin, StatusActive).Scan(&id)
 	} else {
 		err = s.db.QueryRowContext(ctx,
