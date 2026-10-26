@@ -109,6 +109,8 @@ var operatorOwnerPrefixes = []string{
 	// Skill sources: what every agent reads, and their read tokens.
 	"/v1/skills/sources",
 	"/v1/skills/admin/github-token",
+	// Who may add skill sources.
+	"/v1/skills/admin/contributors",
 }
 
 // operatorScopeFor returns the scope an operator token needs for method on

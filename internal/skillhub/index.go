@@ -38,12 +38,16 @@ type srcIndex struct {
 	versionID string // "" when nothing is active
 	sha       string
 	syncedAt  time.Time
-	members   map[string]bool
-	skills    []*skillEntry // by path
-	byPath    map[string]*skillEntry
-	files     []*fileEntry // by path
-	byFile    map[string]*fileEntry
-	warnings  []Warning
+	members   map[string]bool // the source's audience when it is members
+	blocked   map[string]bool // the source's block list
+	// shares are the skills' own sharing settings, by skill path (only
+	// the skills that have one).
+	shares   map[string]*skillShare
+	skills   []*skillEntry // by path
+	byPath   map[string]*skillEntry
+	files    []*fileEntry // by path
+	byFile   map[string]*fileEntry
+	warnings []Warning
 	// skillFiles and skillOmitted are each skill's files (nested skills'
 	// included) and left-out files, by skill path.
 	skillFiles   map[string][]*fileEntry
@@ -61,6 +65,13 @@ type skillEntry struct {
 	override    Runs
 }
 
+// skillShare is one skill's own sharing setting (SkillSharing), as sets.
+type skillShare struct {
+	mode    Visibility // VisibleInherit follows the source
+	members map[string]bool
+	blocked map[string]bool
+}
+
 // fileEntry is one file of an active version.
 type fileEntry struct {
 	path  string // relative to the source folder
@@ -72,15 +83,105 @@ type fileEntry struct {
 
 func (si *srcIndex) repoLabel() string { return RepoLabel(si.src.Owner, si.src.Repo, si.sha) }
 
-// visibleTo reports whether the viewer sees the source.
+// The sharing rule. Every read path (search, get, read, grep, list,
+// directory reads, bundles, sources, the MCP Skills extension, tools.search
+// and REST) asks skillVisible or visibleTo, so none can show more:
+//
+//   - A source that waits for an admin's approval, or was rejected (a skill
+//     contributor's source), counts as audience nobody for every skill.
+//   - Otherwise audience(skill) is the skill's own mode when it has one
+//     (everyone, members or nobody), else the source's audience (its
+//     visibility: everyone, members or nobody).
+//   - blocked(skill) is the source's block list plus the skill's own.
+//   - Audience nobody: only a dashboard viewer (no agent) who is an admin,
+//     or the source's creator, sees the skill. Agents never do, an admin's
+//     included.
+//   - Otherwise a viewer sees the skill when they are an admin, or when
+//     they are in the audience (everyone; members: listed) and not blocked.
+//   - An agent is the viewer its owner is (UserID is the owner, Admin the
+//     owner's role); an OAuth app's agent likewise.
+//
+// A file is visible when the innermost skill that holds it is, so a hidden
+// skill nested in a visible one stays hidden (its files are left out of the
+// outer skill's file list and bundle). A source is visible when one of its
+// skills is (a source with no skills: by the source's audience alone).
+
+// sourceAudience is the source's audience after its approval state, with
+// its member set.
+func (si *srcIndex) sourceAudience() (Visibility, map[string]bool) {
+	if !si.src.Approval.Live() {
+		return VisibleNobody, nil
+	}
+	switch si.src.Visibility {
+	case VisibleMembers, VisibleNobody:
+		return si.src.Visibility, si.members
+	}
+	return VisibleEveryone, nil
+}
+
+// skillVisible applies the sharing rule (above) to the skill at path.
+func (si *srcIndex) skillVisible(v Viewer, path string) bool {
+	return si.visibleWith(v, si.shares[path])
+}
+
+// visibleWith applies the sharing rule to a skill whose own setting is sh
+// (nil: none).
+func (si *srcIndex) visibleWith(v Viewer, sh *skillShare) bool {
+	if si.versionID == "" {
+		return false
+	}
+	mode, members := si.sourceAudience()
+	if sh != nil && sh.mode != VisibleInherit && si.src.Approval.Live() {
+		mode, members = sh.mode, sh.members
+	}
+	if mode == VisibleNobody {
+		return v.AgentID == "" && (v.Admin || (v.UserID != "" && v.UserID == si.src.CreatedBy))
+	}
+	if v.Admin {
+		return true
+	}
+	if v.UserID != "" && (si.blocked[v.UserID] || (sh != nil && sh.blocked[v.UserID])) {
+		return false
+	}
+	if mode == VisibleMembers {
+		return v.UserID != "" && members[v.UserID]
+	}
+	return true
+}
+
+// visibleTo reports whether the viewer sees the source: one of its skills
+// (a source without skills: by its own audience).
 func (si *srcIndex) visibleTo(v Viewer) bool {
 	if si.versionID == "" {
 		return false
 	}
-	if v.Admin || si.src.Visibility != VisibleMembers {
-		return true
+	if len(si.shares) == 0 || len(si.skills) == 0 {
+		// Without per-skill settings every skill gets the same answer.
+		return si.visibleWith(v, nil)
 	}
-	return v.UserID != "" && si.members[v.UserID]
+	for _, e := range si.skills {
+		if si.skillVisible(v, e.path) {
+			return true
+		}
+	}
+	return false
+}
+
+// visibleSkills counts the skills the viewer sees.
+func (si *srcIndex) visibleSkills(v Viewer) int {
+	n := 0
+	for _, e := range si.skills {
+		if si.skillVisible(v, e.path) {
+			n++
+		}
+	}
+	return n
+}
+
+// fileVisible reports whether the viewer sees a file: its innermost skill
+// is visible.
+func (si *srcIndex) fileVisible(v Viewer, f *fileEntry) bool {
+	return si.skillVisible(v, f.skill)
 }
 
 // showRuns reports whether a listing shows a skill that runs r.
@@ -274,15 +375,16 @@ func (s *Service) refreshAll(ctx context.Context) error {
 // buildSrcIndex reads a source's active version.
 func (s *Service) buildSrcIndex(ctx context.Context, row *sourceRow) (*srcIndex, error) {
 	si := &srcIndex{
-		src: row.Source, members: map[string]bool{},
+		src: row.Source, members: setOf(row.Members), blocked: setOf(row.Blocked), shares: map[string]*skillShare{},
 		byPath: map[string]*skillEntry{}, byFile: map[string]*fileEntry{},
 		skillFiles: map[string][]*fileEntry{}, skillOmitted: map[string][]Warning{},
 	}
-	for _, m := range row.Members {
-		si.members[m] = true
-	}
 	if row.ActiveVersionID == "" {
 		return si, nil
+	}
+	shares, err := s.skillShares(ctx, row.ID)
+	if err != nil {
+		return nil, err
 	}
 	v, err := s.getVersionRow(ctx, s.db, row.ID, row.ActiveVersionID)
 	if err != nil {
@@ -302,6 +404,9 @@ func (s *Service) buildSrcIndex(ctx context.Context, row *sourceRow) (*srcIndex,
 		return nil, err
 	}
 	for _, e := range entries {
+		if sh, ok := shares[e.path]; ok {
+			si.shares[e.path] = &skillShare{mode: sh.Mode, members: setOf(sh.Members), blocked: setOf(sh.Blocked)}
+		}
 		se := &skillEntry{
 			path: e.path, name: e.name, description: e.description,
 			frontmatter: json.RawMessage(e.frontmatter), skillMD: e.skillMD, override: overrides[e.path],
@@ -335,6 +440,15 @@ func (s *Service) buildSrcIndex(ctx context.Context, row *sourceRow) (*srcIndex,
 		}
 	}
 	return si, nil
+}
+
+// setOf is a list of IDs as a set.
+func setOf(ids []string) map[string]bool {
+	out := make(map[string]bool, len(ids))
+	for _, id := range ids {
+		out[id] = true
+	}
+	return out
 }
 
 // effectiveRuns applies the order of precedence: an admin override, then

@@ -167,7 +167,7 @@ func (s *Service) Sources(_ context.Context, v Viewer) ([]SourceInfo, error) {
 		}
 		out = append(out, SourceInfo{
 			Slug: si.src.Slug, Repo: si.repoLabel(), Branch: si.src.Branch, Path: si.src.Path,
-			Commit: si.sha, SyncedAt: si.syncedAt, SkillCount: len(si.skills), HTMLURL: si.htmlURL(""),
+			Commit: si.sha, SyncedAt: si.syncedAt, SkillCount: si.visibleSkills(v), HTMLURL: si.htmlURL(""),
 		})
 	}
 	return out, nil
@@ -227,7 +227,7 @@ func (s *Service) Search(ctx context.Context, v Viewer, q SearchQuery) ([]SkillS
 	var tools []toolsearch.Tool
 	for _, si := range s.visibleSources(v, q.Source) {
 		for _, e := range si.skills {
-			if !showRuns(v, q.IncludeHost, e.runs) {
+			if !showRuns(v, q.IncludeHost, e.runs) || !si.skillVisible(v, e.path) {
 				continue
 			}
 			// The name field is slug/path (a skill at the source folder
@@ -301,7 +301,7 @@ func (s *Service) resolve(v Viewer, ref string) (*srcIndex, *skillEntry, error) 
 		p, _ = si.unalias(p)
 	}
 	e := si.byPath[p]
-	if e == nil {
+	if e == nil || !si.skillVisible(v, e.path) {
 		return nil, nil, fmt.Errorf("%w: skill %s", ErrNotFound, ref)
 	}
 	return si, e, nil
@@ -314,7 +314,7 @@ func (s *Service) resolveName(v Viewer, name string) (*srcIndex, *skillEntry, er
 	var hitE *skillEntry
 	for _, si := range s.visibleSources(v, "") {
 		for _, e := range si.skills {
-			if e.name == name {
+			if e.name == name && si.skillVisible(v, e.path) {
 				hits = append(hits, si.skillURI(e.path))
 				hitSI, hitE = si, e
 			}
@@ -332,10 +332,27 @@ func (s *Service) resolveName(v Viewer, name string) (*srcIndex, *skillEntry, er
 	return nil, nil, fmt.Errorf("%w: %d skills are named %q; use a URI: %s", ErrConflict, len(hits), name, strings.Join(hits, ", "))
 }
 
-// fileRefs is the complete file list of a skill (nested skills' files
-// included), with paths relative to the skill folder.
-func (si *srcIndex) fileRefs(e *skillEntry) []FileRef {
+// visibleFiles is a skill's files (nested skills' included) that the
+// viewer sees: a nested skill hidden from the viewer keeps its files out.
+func (si *srcIndex) visibleFiles(v Viewer, e *skillEntry) []*fileEntry {
 	files := si.skillFiles[e.path]
+	if len(si.shares) == 0 {
+		return files // every skill of the source has the same audience
+	}
+	out := make([]*fileEntry, 0, len(files))
+	for _, f := range files {
+		if si.fileVisible(v, f) {
+			out = append(out, f)
+		}
+	}
+	return out
+}
+
+// fileRefs is the complete file list of a skill (nested skills' files
+// included, unless hidden from the viewer), with paths relative to the
+// skill folder.
+func (si *srcIndex) fileRefs(v Viewer, e *skillEntry) []FileRef {
+	files := si.visibleFiles(v, e)
 	out := make([]FileRef, 0, len(files))
 	for _, f := range files {
 		out = append(out, FileRef{URI: si.fileURI(e.path, f.path), Path: relTo(e.path, f.path), Digest: f.sha, Size: f.size, Type: f.media})
@@ -343,14 +360,30 @@ func (si *srcIndex) fileRefs(e *skillEntry) []FileRef {
 	return out
 }
 
-// omitted is the version's warnings about files inside a skill's folder.
-func (si *srcIndex) omitted(e *skillEntry) []Warning {
-	return si.skillOmitted[e.path]
+// omitted is the version's warnings about files inside a skill's folder,
+// but not inside a nested skill hidden from the viewer.
+func (si *srcIndex) omitted(v Viewer, e *skillEntry) []Warning {
+	all := si.skillOmitted[e.path]
+	if len(si.shares) == 0 {
+		return all
+	}
+	var out []Warning
+	for _, w := range all {
+		rel, ok := underFolder(w.Path, si.src.Path)
+		if !ok {
+			continue
+		}
+		if inner, found := innermostSkill(rel, si.byPath); found && !si.skillVisible(v, inner) {
+			continue
+		}
+		out = append(out, w)
+	}
+	return out
 }
 
 // skillOf builds the Skill (frontmatter and file list; body when raw is
-// given).
-func (si *srcIndex) skillOf(e *skillEntry, raw []byte, includeFiles bool) *Skill {
+// given) as the viewer sees it.
+func (si *srcIndex) skillOf(v Viewer, e *skillEntry, raw []byte, includeFiles bool) *Skill {
 	sk := &Skill{SkillSummary: si.summary(e), Frontmatter: map[string]any{}}
 	// Numbers stay json.Number, so a big integer or a precise decimal in
 	// the frontmatter is passed on exactly as written (SEP-2640: verbatim).
@@ -367,8 +400,8 @@ func (si *srcIndex) skillOf(e *skillEntry, raw []byte, includeFiles bool) *Skill
 		}
 	}
 	if includeFiles {
-		sk.Files = si.fileRefs(e)
-		sk.Omitted = si.omitted(e)
+		sk.Files = si.fileRefs(v, e)
+		sk.Omitted = si.omitted(v, e)
 	}
 	return sk
 }
@@ -385,7 +418,7 @@ func (s *Service) Get(ctx context.Context, v Viewer, ref string, includeFiles bo
 		return nil, err
 	}
 	s.countRead(si.src.ID, e.path)
-	return si.skillOf(e, raw, includeFiles), nil
+	return si.skillOf(v, e, raw, includeFiles), nil
 }
 
 // fileOf finds a visible file by URI. aliased reports a URI under the
@@ -404,7 +437,7 @@ func (s *Service) fileOf(v Viewer, uri string) (si *srcIndex, f *fileEntry, alia
 			f = si.byFile[p]
 		}
 	}
-	if f == nil {
+	if f == nil || !si.fileVisible(v, f) {
 		return nil, nil, false, fmt.Errorf("%w: %s", ErrNotFound, uri)
 	}
 	return si, f, aliased, nil
@@ -489,7 +522,7 @@ func (s *Service) ListDir(_ context.Context, v Viewer, dirURI string) ([]DirEntr
 		if dir != "" && !strings.HasPrefix(f.path, dir+"/") {
 			continue
 		}
-		if !inSkill && !si.fileShown(v, false, f) {
+		if !si.fileVisible(v, f) || (!inSkill && !si.fileShown(v, false, f)) {
 			continue
 		}
 		rest := relTo(dir, f.path)
@@ -561,14 +594,14 @@ func (s *Service) List(_ context.Context, v Viewer, q ListQuery) ([]Skill, strin
 			if q.Cursor != "" && si.src.Slug == afterSlug && e.path <= afterPath {
 				continue
 			}
-			if !showRuns(v, q.IncludeHost, e.runs) {
+			if !showRuns(v, q.IncludeHost, e.runs) || !si.skillVisible(v, e.path) {
 				continue
 			}
 			if len(out) == limit {
 				last := out[len(out)-1]
 				return out, encodeCursor(last.Source, last.Path), nil
 			}
-			out = append(out, *si.skillOf(e, nil, true))
+			out = append(out, *si.skillOf(v, e, nil, true))
 		}
 	}
 	return out, "", nil
@@ -623,7 +656,7 @@ func (s *Service) Grep(ctx context.Context, v Viewer, q GrepQuery) ([]GrepHit, e
 			if glob != nil && !globMatch(glob, anchored, f.path) {
 				continue
 			}
-			if !si.fileShown(v, q.IncludeHost, f) {
+			if !si.fileVisible(v, f) || !si.fileShown(v, q.IncludeHost, f) {
 				continue
 			}
 			batch = append(batch, f)
@@ -778,7 +811,7 @@ func (s *Service) Bundle(ctx context.Context, v Viewer, refs []string, w io.Writ
 			return fmt.Errorf("%w: two chosen skills are named %q (%s, %s)", ErrConflict, e.name, prev, uri)
 		}
 		names[e.name] = uri
-		for _, f := range si.skillFiles[e.path] {
+		for _, f := range si.visibleFiles(v, e) {
 			total += f.size
 		}
 		picks = append(picks, chosen{si, e})
@@ -789,7 +822,7 @@ func (s *Service) Bundle(ctx context.Context, v Viewer, refs []string, w io.Writ
 	gz := gzip.NewWriter(w)
 	tw := tar.NewWriter(gz)
 	for _, p := range picks {
-		if err := s.bundleSkill(ctx, tw, p.si, p.e); err != nil {
+		if err := s.bundleSkill(ctx, tw, p.si, p.e, p.si.visibleFiles(v, p.e)); err != nil {
 			return err
 		}
 		s.countRead(p.si.src.ID, p.e.path)
@@ -803,9 +836,9 @@ func (s *Service) Bundle(ctx context.Context, v Viewer, refs []string, w io.Writ
 	return nil
 }
 
-// bundleSkill writes one skill's folder into a bundle.
-func (s *Service) bundleSkill(ctx context.Context, tw *tar.Writer, si *srcIndex, e *skillEntry) error {
-	files := si.skillFiles[e.path] // by path
+// bundleSkill writes one skill's folder, the files the viewer sees (by
+// path), into a bundle.
+func (s *Service) bundleSkill(ctx context.Context, tw *tar.Writer, si *srcIndex, e *skillEntry, files []*fileEntry) error {
 	for start := 0; start < len(files); start += blobBatch {
 		batch := files[start:min(start+blobBatch, len(files))]
 		shas := make([]string, len(batch))

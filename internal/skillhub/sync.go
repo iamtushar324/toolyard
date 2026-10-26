@@ -348,10 +348,13 @@ func (s *Service) stage(ctx context.Context, row *sourceRow, v *versionRow) erro
 }
 
 // notifyReview calls the review hook for a pending version. A failure is
-// logged: the next check of the source calls it again.
+// logged: the next check of the source calls it again. A contributor's
+// source that waits for approval (or was rejected) asks nothing: the
+// approval question covers its waiting version, and approving it makes
+// that version live (DecideApproval).
 func (s *Service) notifyReview(ctx context.Context, row *sourceRow, v *versionRow) {
 	h := s.reviewHook()
-	if h == nil {
+	if h == nil || !row.Approval.Live() {
 		return
 	}
 	src := row.Source

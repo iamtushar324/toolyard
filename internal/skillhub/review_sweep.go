@@ -132,6 +132,10 @@ func (ri *ReviewInbox) Sweep(ctx context.Context) error {
 			first = err
 		}
 	}
+	// Contributor sources' approval questions (review_approval.go).
+	if err := ri.sweepApprovals(ctx); err != nil && first == nil {
+		first = err
+	}
 	stale, err := ri.store.staleApproved(ctx, proposalKindReview, ri.o.Now().Add(-approvedStaleAfter).UnixMilli(), inboxSweepBatch)
 	if err != nil {
 		if first == nil {

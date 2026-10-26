@@ -505,11 +505,7 @@ func (p *SourceProposals) message(ctx context.Context, agent string, prev *Previ
 	default:
 		b.WriteString("- Updates: each new commit waits for your review\n")
 	}
-	if src.Visibility == VisibleMembers {
-		fmt.Fprintf(&b, "- Who sees it: %d chosen members\n", len(src.Members))
-	} else {
-		b.WriteString("- Who sees it: every member and their agents\n")
-	}
+	fmt.Fprintf(&b, "- Who sees it: %s\n", audienceText(src.Visibility, len(src.Members), len(src.Blocked)))
 	b.WriteString("\n**Why, in the agent's words:**\n\n")
 	for _, line := range strings.Split(reason, "\n") {
 		b.WriteString("> " + reviewMD(line) + "\n")

@@ -80,6 +80,7 @@ func NewReviewInbox(o ReviewOptions) (*ReviewInbox, error) {
 	}
 	ri := &ReviewInbox{o: o, store: proposalStore{db: o.DB, now: o.Now}}
 	o.Inbox.HandleSystem(ReviewItemKind, ri.decide)
+	o.Inbox.HandleSystem(ApprovalItemKind, ri.decideApproval)
 	return ri, nil
 }
 
@@ -182,10 +183,14 @@ func (ri *ReviewInbox) settleRows(ctx context.Context, rows []proposalRow, reaso
 }
 
 // SourceDeleted closes every open question about a deleted source: its
-// review items, and the agents' change proposals against it (rejected, so
-// the proposing agent sees why; their Inbox items are withdrawn).
+// review items, its approval question, and the agents' change proposals
+// against it (rejected, so the proposing agent sees why; their Inbox items
+// are withdrawn).
 func (ri *ReviewInbox) SourceDeleted(ctx context.Context, sourceID, reason string) error {
 	if err := ri.Settle(ctx, sourceID, "", reason); err != nil {
+		return err
+	}
+	if err := ri.SettleApproval(ctx, sourceID, reason); err != nil {
 		return err
 	}
 	rows, err := ri.store.pendingForSource(ctx, proposalKindChange, sourceID)

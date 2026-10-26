@@ -1,9 +1,11 @@
 package api
 
 // Skills hub admin routes (TEC-1782, slice C; docs/skills-hub.md "For
-// admins"). Owner and admin only, through the role guard and requireAdmin;
-// the webhook is the one public route, authenticated by GitHub's
-// signature.
+// admins"). Owner and admin, through the role guard and requireAdmin; a
+// skill contributor reaches the add-source routes and their own sources
+// (skillManagerUser, skills_sharing_routes.go), never activate, reject,
+// approval or the GitHub token. The webhook is the one public route,
+// authenticated by GitHub's signature.
 //
 //	POST   /v1/skills/sources/inspect                       {url, token?, auth?} -> repository, branches, trusted_owner
 //	POST   /v1/skills/sources/preview                       SourceInput -> dry run; nothing is stored
@@ -18,6 +20,8 @@ package api
 //	POST   /v1/skills/sources/{id}/versions/{vid}/reject    {note?}
 //	GET    /v1/skills/sources/{id}/skills                   skills with runs and 30-day reads
 //	PUT    /v1/skills/sources/{id}/skills/runs              {path, runs}; runs "" clears the override
+//	PUT    /v1/skills/sources/{id}/skills/sharing           {path, mode, members, blocked} (skills_sharing_routes.go)
+//	POST   /v1/skills/sources/{id}/approval                 admin: approve or reject a contributor's source
 //	POST   /v1/skills/sources/{id}/webhook                  GitHub push webhook (public, signed)
 //	POST   /v1/skills/sources/{id}/webhook-secret           rotate: the secret once, with the payload URL
 //	GET    /v1/skills/admin/github-token                    {set, rate, paused_until}: the default GitHub read token's state
@@ -91,7 +95,7 @@ func skillWebhookPath(path string) bool {
 // (for the per-route body cap).
 func skillAdminPath(path string) bool {
 	return path == "/v1/skills/sources" || strings.HasPrefix(path, skillAdminSourcesPrefix) || path == "/v1/skills/admin/sources" ||
-		path == skillGitHubTokenPath
+		path == skillGitHubTokenPath || strings.HasPrefix(path, skillContributorsPrefix)
 }
 
 // skillGitHubTokenPath is the default GitHub read token's route.
@@ -112,6 +116,7 @@ func (s *Server) registerSkillsAdminRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/v1/skills/sources/", s.skillSourcesItem)
 	mux.HandleFunc("/v1/skills/admin/sources", s.skillAdminSources)
 	mux.HandleFunc("/v1/skills/admin/github-token", s.skillGitHubToken)
+	s.registerSkillsSharingRoutes(mux)
 }
 
 // skillGitHubToken reads or sets the default GitHub read token: write-only,
@@ -174,8 +179,11 @@ func (s *Server) skillAdminUser(w http.ResponseWriter, r *http.Request) (*identi
 	return u, true
 }
 
+// skillAdminSources lists every source for an admin, and a contributor's
+// own sources for a skill contributor.
 func (s *Server) skillAdminSources(w http.ResponseWriter, r *http.Request) {
-	if _, ok := s.skillAdminUser(w, r); !ok {
+	m, ok := s.skillManagerUser(w, r)
+	if !ok {
 		return
 	}
 	if r.Method != http.MethodGet {
@@ -187,17 +195,25 @@ func (s *Server) skillAdminSources(w http.ResponseWriter, r *http.Request) {
 		writeSkillAdminError(w, err)
 		return
 	}
-	if list == nil {
-		list = []skillhub.Source{}
+	out := []skillhub.Source{}
+	for i := range list {
+		if m.owns(&list[i]) {
+			out = append(out, list[i])
+		}
 	}
-	writeJSON(w, http.StatusOK, map[string]any{"sources": list})
+	writeJSON(w, http.StatusOK, map[string]any{"sources": out})
 }
 
+// skillSourceCreate adds a source. A skill contributor's source starts
+// pending approval: it is checked with a dry run first (the Inbox question
+// to the owner carries its counts and warnings), and agents see nothing of
+// it until an admin approves it.
 func (s *Server) skillSourceCreate(w http.ResponseWriter, r *http.Request) {
-	u, ok := s.skillAdminUser(w, r)
+	m, ok := s.skillManagerUser(w, r)
 	if !ok {
 		return
 	}
+	u := m.u
 	var in skillhub.SourceInput
 	if err := decode(r, &in); err != nil {
 		writeError(w, http.StatusBadRequest, redactSkillSecrets(err.Error(), in.Token))
@@ -206,16 +222,40 @@ func (s *Server) skillSourceCreate(w http.ResponseWriter, r *http.Request) {
 	if s.refuseGitHubConnectionUse(w, r, in.Auth) {
 		return
 	}
+	if !m.admin {
+		ref, err := s.skillsAdmin.ParseURL(in.URL)
+		if err != nil {
+			writeSkillAdminError(w, err)
+			return
+		}
+		if s.refuseContributorSettings(w, r, m, ref.Owner, &in.Mode, in.Limits != nil) {
+			return
+		}
+	}
 	if existing := s.recentSkillSource(r.Context(), u.ID, in); existing != nil {
 		writeJSON(w, http.StatusOK, map[string]any{"source": existing, "status": skillSourceStatus(existing), "existing": true})
 		return
+	}
+	var prev *skillhub.Preview
+	if !m.admin {
+		in.PendingApproval = true
+		var err error
+		if prev, err = s.skillsAdmin.Preview(r.Context(), u.ID, in); err != nil {
+			writeSkillAdminError(w, err, in.Token)
+			return
+		}
 	}
 	src, err := s.skillsAdmin.CreateSource(r.Context(), u.ID, in)
 	if err != nil {
 		writeSkillAdminError(w, err, in.Token)
 		return
 	}
-	s.auditSkillAdmin(r, u, "skills.source_create", src.ID+" "+skillhub.RepoLabel(src.Owner, src.Repo, ""), "")
+	reason := ""
+	if !m.admin {
+		reason = "skill contributor: waits for an admin's approval"
+		s.requestSkillApproval(r.Context(), src, prev, u)
+	}
+	s.auditSkillAdmin(r, u, "skills.source_create", src.ID+" "+skillhub.RepoLabel(src.Owner, src.Repo, ""), reason)
 	// The first sync runs in the background: a large repository can take
 	// longer than a request should wait. The dashboard polls the source
 	// until its first check is recorded.
@@ -280,6 +320,10 @@ func skillSourceStatus(src *skillhub.Source) string {
 		return "paused"
 	case src.LastCheckedAt == nil:
 		return "syncing"
+	case src.Approval == skillhub.ApprovalPending:
+		return "pending approval"
+	case src.Approval == skillhub.ApprovalRejected:
+		return "rejected"
 	case src.LastError != "":
 		return "error"
 	case src.PendingVersionID != "":
@@ -297,14 +341,15 @@ func (s *Server) skillSourcesItem(w http.ResponseWriter, r *http.Request) {
 		s.skillWebhook(w, r, parts[0])
 		return
 	}
-	u, ok := s.skillAdminUser(w, r)
+	m, ok := s.skillManagerUser(w, r)
 	if !ok {
 		return
 	}
+	u := m.u
 	id := parts[0]
 	switch {
 	case len(parts) == 1 && id == "inspect":
-		s.skillInspect(w, r)
+		s.skillInspect(w, r, m)
 		return
 	case len(parts) == 1 && id == "preview":
 		s.skillPreview(w, r, u)
@@ -314,9 +359,21 @@ func (s *Server) skillSourcesItem(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
+	// Versions are made live or rejected, and contributor sources
+	// approved, by admins only.
+	if (len(parts) == 4 && parts[1] == "versions") || (len(parts) == 2 && parts[1] == "approval") {
+		if !requireSkillAdmin(w, m) {
+			return
+		}
+	}
+	if !m.admin {
+		if _, ok := s.skillOwnedSource(w, r, m, id); !ok {
+			return
+		}
+	}
 	switch {
 	case len(parts) == 1:
-		s.skillSource(w, r, u, id)
+		s.skillSource(w, r, m, id)
 	case len(parts) == 2 && parts[1] == "sync":
 		if !skillAdminMethod(w, r, http.MethodPost) {
 			return
@@ -364,6 +421,10 @@ func (s *Server) skillSourcesItem(w http.ResponseWriter, r *http.Request) {
 		writeJSON(w, http.StatusOK, map[string]any{"skills": list})
 	case len(parts) == 3 && parts[1] == "skills" && parts[2] == "runs":
 		s.skillSetRuns(w, r, u, id)
+	case len(parts) == 3 && parts[1] == "skills" && parts[2] == "sharing":
+		s.skillSetSharing(w, r, m, id)
+	case len(parts) == 2 && parts[1] == "approval":
+		s.skillDecideApproval(w, r, m, id)
 	case len(parts) == 2 && parts[1] == "webhook-secret":
 		s.skillRotateSecret(w, r, u, id)
 	default:
@@ -371,7 +432,7 @@ func (s *Server) skillSourcesItem(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func (s *Server) skillInspect(w http.ResponseWriter, r *http.Request) {
+func (s *Server) skillInspect(w http.ResponseWriter, r *http.Request, m *skillManager) {
 	if !skillAdminMethod(w, r, http.MethodPost) {
 		return
 	}
@@ -391,7 +452,7 @@ func (s *Server) skillInspect(w http.ResponseWriter, r *http.Request) {
 	var info *skillhub.RepoInfo
 	var err error
 	if body.Auth == string(skillhub.AuthGitHub) {
-		info, err = s.skillInspectWithConnection(r, body.URL)
+		info, err = s.skillInspectWithConnection(r, m.u, body.URL)
 	} else {
 		info, err = s.skillsAdmin.Inspect(r.Context(), body.URL, body.Token)
 	}
@@ -427,7 +488,8 @@ func (s *Server) skillPreview(w http.ResponseWriter, r *http.Request, u *identit
 	writeJSON(w, http.StatusOK, prev)
 }
 
-func (s *Server) skillSource(w http.ResponseWriter, r *http.Request, u *identity.User, id string) {
+func (s *Server) skillSource(w http.ResponseWriter, r *http.Request, m *skillManager, id string) {
+	u := m.u
 	switch r.Method {
 	case http.MethodGet:
 		src, err := s.skillsAdmin.GetSource(r.Context(), id)
@@ -450,6 +512,12 @@ func (s *Server) skillSource(w http.ResponseWriter, r *http.Request, u *identity
 		if in.Auth != nil && s.refuseGitHubSwitch(w, r, u, before, *in.Auth) {
 			return
 		}
+		if in.Mode != nil && *in.Mode == before.Mode {
+			in.Mode = nil // unchanged: not a contributor's choice to check
+		}
+		if s.refuseContributorSettings(w, r, m, before.Owner, in.Mode, in.Limits != nil) {
+			return
+		}
 		src, err := s.skillsAdmin.UpdateSource(r.Context(), u.ID, id, in)
 		if err != nil {
 			writeSkillAdminError(w, err, skillAdminDeref(in.Token))
@@ -462,6 +530,9 @@ func (s *Server) skillSource(w http.ResponseWriter, r *http.Request, u *identity
 			s.settleSkillReviews(r.Context(), id, "", "the source's "+what+" changed on the Skills page")
 		}
 		s.auditSkillAdmin(r, u, "skills.source_update", id, skillUpdateSummary(in))
+		if sourceSharingChanged(before, src) {
+			s.auditSkillChange(r, u, "skills.source_sharing", id, sourceSharingArgs(before), sourceSharingArgs(src))
+		}
 		writeJSON(w, http.StatusOK, src)
 	case http.MethodDelete:
 		if err := s.skillsAdmin.DeleteSource(r.Context(), u.ID, id); err != nil {
@@ -801,6 +872,7 @@ func skillUpdateSummary(in skillhub.SourceUpdate) string {
 	add(in.Enabled != nil, "enabled")
 	add(in.Visibility != nil, "visibility")
 	add(in.Members != nil, "members")
+	add(in.Blocked != nil, "blocked")
 	add(in.DefaultRuns != nil, "default_runs")
 	add(in.Limits != nil, "limits")
 	return "changed: " + strings.Join(f, ", ")
