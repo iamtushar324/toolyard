@@ -8,6 +8,7 @@ import (
 
 	"github.com/tusharbhardwaj/toolyard/internal/cluster"
 	"github.com/tusharbhardwaj/toolyard/internal/sealbox"
+	"github.com/tusharbhardwaj/toolyard/internal/settings"
 	"github.com/tusharbhardwaj/toolyard/internal/store"
 	"github.com/tusharbhardwaj/toolyard/internal/store/storetest"
 )
@@ -134,7 +135,8 @@ func TestTwoNodeSharingReload(t *testing.T) {
 			cancel()
 			t.Fatal(err)
 		}
-		svc, err := New(Options{DB: db, Cluster: c, Cipher: cipher, GitHubAPI: gh.srv.URL, HTTPClient: gh.srv.Client()})
+		svc, err := New(Options{DB: db, Cluster: c, Cipher: cipher, GitHubAPI: gh.srv.URL, HTTPClient: gh.srv.Client(),
+			Settings: staticSettings{settings.SkillsTrustedGitHubOwners: "acme"}})
 		if err != nil {
 			cancel()
 			t.Fatal(err)

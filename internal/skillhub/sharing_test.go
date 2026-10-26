@@ -13,6 +13,7 @@ import (
 
 	"github.com/tusharbhardwaj/toolyard/internal/actor"
 	"github.com/tusharbhardwaj/toolyard/internal/inbox"
+	"github.com/tusharbhardwaj/toolyard/internal/settings"
 )
 
 // The sharing rule (index.go, srcIndex.skillVisible) over a hand-built
@@ -486,7 +487,7 @@ func (r *reviewCounter) PendingVersion(context.Context, Source, Version) error {
 func TestContributorSourceApproval(t *testing.T) {
 	gh := newFakeGitHub(t, "acme", "skills")
 	gh.commit("main", baseTree())
-	svc := newTestService(t, gh)
+	svc := newTestService(t, gh, trustAcme)
 	hook := &reviewCounter{}
 	svc.SetReviewHook(hook)
 	ctx := context.Background()
@@ -572,8 +573,20 @@ func TestContributorSourceApproval(t *testing.T) {
 	if res, err := svc.SyncNow(ctx, src.ID); err != nil || !res.Staged || hook.n != before+1 {
 		t.Fatalf("next commit of an approved source: %+v %v (hook %d -> %d)", res, err, before, hook.n)
 	}
-	// The engine bounds a contributor's choices too: no pin, automatic
-	// only for a trusted owner (nobody is trusted here), no limits.
+}
+
+// trustAcme makes the GitHub owner acme a trusted owner.
+func trustAcme(o *Options) {
+	o.Settings = staticSettings{settings.SkillsTrustedGitHubOwners: "acme"}
+}
+
+// The engine bounds a contributor's choices too: no pin, automatic only
+// for a trusted owner (nobody is trusted here), no limits.
+func TestContributorSourceBounds(t *testing.T) {
+	gh := newFakeGitHub(t, "acme", "skills")
+	gh.commit("main", baseTree())
+	svc := newTestService(t, gh)
+	ctx := context.Background()
 	for name, in := range map[string]SourceInput{
 		"pinned": {Mode: ModePinned, PinnedSHA: strings.Repeat("a", 40)},
 		"auto":   {Mode: ModeAuto},
@@ -583,6 +596,14 @@ func TestContributorSourceApproval(t *testing.T) {
 		if _, err := svc.CreateSource(ctx, "usr_contrib", in); !errors.Is(err, ErrInvalid) {
 			t.Errorf("contributor %s: %v", name, err)
 		}
+	}
+	// The default for a contributor is review; an admin may choose any.
+	src, err := svc.CreateSource(ctx, "usr_contrib", SourceInput{URL: "acme/skills", Slug: "default", Path: "skills", PendingApproval: true})
+	if err != nil || src.Mode != ModeReview {
+		t.Fatalf("contributor default mode: %+v %v", src, err)
+	}
+	if _, err := svc.CreateSource(ctx, "usr_admin", SourceInput{URL: "acme/skills", Slug: "admins", Path: "skills", Mode: ModeAuto}); err != nil {
+		t.Fatalf("admin auto: %v", err)
 	}
 }
 
@@ -723,7 +744,7 @@ func TestContributorsStore(t *testing.T) {
 func TestApprovalInboxItem(t *testing.T) {
 	gh := newFakeGitHub(t, "acme", "skills")
 	gh.commit("main", baseTree())
-	svc := newTestService(t, gh)
+	svc := newTestService(t, gh, trustAcme)
 	ctx := context.Background()
 	ib, err := inbox.New(ctx, inbox.Options{DB: svc.db})
 	if err != nil {

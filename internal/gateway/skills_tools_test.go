@@ -209,10 +209,19 @@ func TestSkillsViewerAndOnHost(t *testing.T) {
 	if v := f.reader.lastViewer(t); v.OnHost || f.hosts.count("ag_lookup_fails") != 2 {
 		t.Fatalf("failed lookup viewer = %+v after %d lookups", v, f.hosts.count("ag_lookup_fails"))
 	}
-	// A dashboard user is that user, never an agent on the host.
-	f.ok(t, WithAgentID(context.Background(), "dashboard:u_member"), SkillsSourcesTool, nil)
+	// A dashboard user in their own browser page is that user, never an
+	// agent on the host.
+	browser := actor.WithRaiser(WithAgentID(context.Background(), "dashboard:u_member"),
+		actor.Raiser{CallerID: "dashboard:u_member", AgentKind: "dashboard", OwnerUserID: "u_member", ClientKind: "browser"})
+	f.ok(t, browser, SkillsSourcesTool, nil)
 	if v := f.reader.lastViewer(t); v != (skillhub.Viewer{UserID: "u_member"}) {
 		t.Fatalf("dashboard viewer = %+v", v)
+	}
+	// Any other dashboard caller (an operator token's CLI) acts for the
+	// user like an agent: a delegated viewer.
+	f.ok(t, WithAgentID(context.Background(), "dashboard:u_member"), SkillsSourcesTool, nil)
+	if v := f.reader.lastViewer(t); v != (skillhub.Viewer{UserID: "u_member", Delegated: true}) {
+		t.Fatalf("non-browser dashboard viewer = %+v", v)
 	}
 	if got := f.gw.SkillViewer(f.admin); !got.Admin || got.AgentID != "ag_admin" {
 		t.Fatalf("SkillViewer = %+v", got)
