@@ -541,7 +541,10 @@ the database and serves only that copy. How sync, review and limits work:
   lists), and which members may add skill sources (skill contributors,
   whose sources wait for an admin's approval). See
   [skills-hub.md](skills-hub.md#sharing). Rollback: an older binary
-  ignores both, so it shows every source by its visibility alone.
+  knows only the `members` audience, so it shows a hidden, blocked,
+  `nobody` or pending contributor source to everyone. Use these controls
+  only once every replica runs this version; before a rollback, delete or
+  set to `members` the sources that rely on them.
 - **Network.** toolyard calls only the GitHub API
   (`https://api.github.com`) and `codeload.github.com`, where GitHub
   redirects archive downloads. Allow both through an egress proxy or

@@ -668,3 +668,24 @@ test('the wizard says a contributor source waits for an admin', () => {
     skillsUI.wizard.result = { status: 'pending approval', source: { id: 'src_2', slug: 'mine', approval: 'pending' } };`);
   assert.match(text(h.run('renderSkillsWizard()')), /agents see nothing of it until an admin approves it\. The owner has the question in the Inbox\./);
 });
+
+test('approving sends the waiting commit shown on the page; an admin hides or shows a source', async () => {
+  const h = harness({ '/v1/skills/admin/sources': { sources: [] } });
+  h.context.s = Object.assign({}, source1, { approval: 'pending', pending_version_id: 'skv_2', created_by: 'u_2' });
+  h.run(`skillsUI.openId = 'src_1'; skillsUI.detail = { id: 'src_1', source: s, versions: [{ id: 'skv_2', sha: 'abcabcabcabcabcabcabcabcabcabcabcabcabca', status: 'staged' }], skills: [] };`);
+  await h.run(`decideSkillSource(s, 'approve')`);
+  const approve = h.requests.find((r) => r.path === '/v1/skills/sources/src_1/approval');
+  assert.deepEqual(plain(approve.body), { decision: 'approve', sha: 'abcabcabcabcabcabcabcabcabcabcabcabcabca' });
+
+  await h.run(`hideSkillSource(s)`);
+  const hide = h.requests.find((r) => r.path === '/v1/skills/sources/src_1' && r.method === 'PATCH');
+  assert.deepEqual(plain(hide.body), { hidden: true });
+  assert.equal(h.run('skillsStatus(Object.assign({}, s, { approval: "", hidden: true }))'), 'hidden');
+  assert.match(h.run('skillsAudienceText(Object.assign({}, s, { hidden: true }))'), /hidden by an admin/);
+
+  // The page offers the lock to admins only.
+  h.run(`skillsUI.detail.source = Object.assign({}, s, { approval: '' });`);
+  assert.match(text(h.run('renderSkillSource()')), /Hide from agents/);
+  h.run(`state.user.role = 'member';`);
+  assert.doesNotMatch(text(h.run('renderSkillSource()')), /Hide from agents/);
+});

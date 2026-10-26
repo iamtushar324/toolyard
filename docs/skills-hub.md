@@ -115,6 +115,11 @@ Who sees what is set on the source page, in two places.
 - **Sharing** (a panel on the source page): the source's **audience**
   (everyone, only the members you choose, or nobody) and its **block
   list**: people who never see any of its skills, whatever the audience.
+- **Hide from agents** (a button on the source page, admins only): a lock
+  that hides every skill of the source from every agent, whatever its
+  audience or its skills' own settings say. The person who added the
+  source cannot clear it. Use it to take a source away from agents at
+  once; **Show to agents** clears it.
 - **Shared with** (a column of the skills table): one skill's own
   setting. **Same as source** (the default) follows the source; or the
   skill is shared with **everyone**, **only these people**, or **nobody**,
@@ -123,14 +128,16 @@ Who sees what is set on the source page, in two places.
 
 The rule, for each skill:
 
-1. A [contributor's](#contributors) source that waits for approval, or
-   was rejected, counts as audience nobody for every skill.
+1. A source an admin hid, and a [contributor's](#contributors) source
+   that waits for approval or was rejected, count as audience nobody for
+   every skill. This comes first: no skill's own setting can show one.
 2. Otherwise the skill's audience is its own setting when it has one,
    else the source's audience.
 3. Its block list is the source's block list plus its own.
 4. Audience **nobody**: only an admin, or the person who added the
-   source, sees the skill, in the dashboard. No agent sees it, an admin's
-   agent included.
+   source, sees the skill, in their own dashboard page. No agent sees it,
+   an admin's agent included, and neither does a caller that acts for a
+   person: an operator token's CLI, or the voice assistant.
 5. Otherwise a person sees the skill when they are an admin, or when they
    are in the audience (everyone; or listed) and not blocked.
 6. An agent, an OAuth app (Claude.ai, ChatGPT) included, sees what its
@@ -162,19 +169,28 @@ they added and the Add source wizard.
   pause or delete their own sources, their sharing included. Other
   people's sources, the trusted owners, the default GitHub token and the
   Contributors panel stay hidden from them.
-- Their new source starts **pending approval**: it syncs, but agents see
-  nothing of it. The owner gets one Inbox question with the repository,
-  branch, folder, audience, the dry run's counts and warnings. **Approve**
-  makes the source live (its waiting version goes live with it);
-  **reject** disables it, with the reason. Admins can also approve or
-  reject on the source page, and hide (audience nobody) or delete any
-  contributor's source at any time.
+- Their new source starts **pending approval**: it syncs (at most once an
+  hour while it waits), but agents see nothing of it. The owner gets one
+  Inbox question with the repository, branch, folder, audience, and the
+  dry run's commit, counts and warnings. **Approve** makes the source
+  live; its waiting version goes live with it only when that version is
+  at the commit the question showed (a newer commit waits for a normal
+  review). **Reject** disables it, with the reason. A change of branch,
+  folder, excludes, credential or update mode while it waits closes the
+  question and asks again with a new dry run. Admins can also approve or
+  reject on the source page, and **hide** or delete any contributor's
+  source at any time. A contributor may have at most three sources
+  waiting at once.
 - Their updates are **review** (each new commit waits for an admin: only
   an admin makes a version live), or **auto** when the repository owner is
-  trusted. Only an admin can pin a source or change its limits.
-- They read a private repository with a read-only token or their own
-  GitHub connection. A public repository reads with the default GitHub
-  token, as an admin's does.
+  trusted. Only an admin can pin a source, change its pinned commit or
+  limits, hide or show it, turn on a rejected source, or change the
+  branch, folder or excludes of a source whose commits go live without
+  review (pinned, or automatic for an owner who is not trusted).
+- They never read with the admins' default GitHub token: without their
+  own credential, their inspect, dry run and syncs read anonymously, so
+  only a public repository works. A private repository needs a read-only
+  token or their own GitHub connection.
 - A contributor who is removed keeps their sources; only admins can
   change them then. An agent is never a contributor: the list holds
   people, and an operator token needs the owner scope to change it.
@@ -357,9 +373,10 @@ answers them 403 `admin_only`. Errors are `{"error", "code"}` with the codes `in
 | `GET /v1/skills/sources/{id}/versions?limit=` | *contributor*. The last versions (default 20, at most 100) |
 | `POST /v1/skills/sources/{id}/versions/{vid}/activate` | make a version live (approve or roll back) |
 | `POST /v1/skills/sources/{id}/versions/{vid}/reject` | `{note?}`: reject a staged version |
-| `POST /v1/skills/sources/{id}/approval` | `{decision: "approve" or "reject", note?}`: decide a contributor's source; closes its Inbox question |
+| `POST /v1/skills/sources/{id}/approval` | `{decision: "approve" or "reject", note?, sha?}`: decide a contributor's source; closes its Inbox question. With `sha`, a waiting version at that commit goes live with the approval; any other waits for review |
 | `GET /v1/skills/sources/{id}/skills` | *contributor*. Skills with where they run, their own sharing (`sharing`, absent when they follow the source) and reads in 30 days |
 | `PUT /v1/skills/sources/{id}/skills/runs` | *contributor*. `{path, runs}`: `anywhere`, `host`, or `""` to clear the override |
+| `PATCH /v1/skills/sources/{id}` with `{hidden}` | admin: hide the source from every agent (`true`) or show it again |
 | `PUT /v1/skills/sources/{id}/skills/sharing` | *contributor*. `{path, mode, members?, blocked?}`: one skill's sharing; `mode` `everyone`, `members`, `nobody`, or `""` (`inherit`) to follow the source; inherit with no `blocked` clears the setting |
 | `POST /v1/skills/sources/{id}/webhook-secret` | *contributor*. A new webhook secret, once, with the payload URL |
 | `GET /v1/skills/admin/people` | *contributor*. The active people a skill can be shared with or blocked from (emails for admins only) |

@@ -72,6 +72,7 @@ function skillsStatus(src, syncing) {
   if (syncing) return 'syncing';
   if (src.approval === 'rejected') return 'rejected';
   if (!src.enabled) return 'paused';
+  if (src.hidden) return 'hidden';
   if (src.approval === 'pending') return 'pending approval';
   if (src.last_error && /rate limit/i.test(src.last_error)) return 'rate limited';
   if (src.last_error) return 'error';
@@ -81,7 +82,7 @@ function skillsStatus(src, syncing) {
 }
 
 function skillsStatusClass(status) {
-  return ({ ok: 'allowed', 'pending review': 'pending', 'pending approval': 'pending', 'rate limited': 'pending', error: 'denied', rejected: 'denied', paused: 'expired', syncing: 'ask' })[status] || '';
+  return ({ ok: 'allowed', 'pending review': 'pending', 'pending approval': 'pending', 'rate limited': 'pending', error: 'denied', rejected: 'denied', paused: 'expired', hidden: 'expired', syncing: 'ask' })[status] || '';
 }
 
 // skillsIsAdmin is app.js's isAdmin: an owner or admin. A member on the
@@ -105,7 +106,7 @@ function skillsAudienceText(src) {
   const who = v === 'members' ? skillsCount((src.members || []).length, 'chosen member')
     : v === 'nobody' ? 'nobody (only admins and the person who added it, in the dashboard)' : 'everyone';
   const blocked = (src.blocked || []).length;
-  return who + (blocked ? ' · ' + blocked + ' blocked' : '');
+  return (src.hidden ? 'hidden by an admin: no agent sees its skills · ' : '') + who + (blocked ? ' · ' + blocked + ' blocked' : '');
 }
 
 // skillsApprovalText is the Approval fact of a contributor's source ('' for
@@ -503,6 +504,16 @@ function skillsSyncSummary(res) {
   return 'Synced ' + skillsShort(res.sha) + '.';
 }
 
+// hideSkillSource sets or clears an admin's hide lock: while it is set no
+// agent sees any of the source's skills, whatever its sharing says, and a
+// contributor cannot change it.
+function hideSkillSource(src) {
+  const on = !src.hidden;
+  if (on && !confirm('Hide ' + src.slug + '? No agent sees any of its skills until an admin shows it again, whatever its sharing says. The person who added it cannot undo this.')) return null;
+  return skillsBusy('hide', () => api('/v1/skills/sources/' + encodeURIComponent(src.id), { method: 'PATCH', body: { hidden: on } }),
+    on ? src.slug + ' is hidden from every agent.' : src.slug + ' is shown again, by its sharing settings.');
+}
+
 function toggleSkillSource(src) {
   const on = !src.enabled;
   return skillsBusy('pause', () => api('/v1/skills/sources/' + encodeURIComponent(src.id), { method: 'PATCH', body: { enabled: on } }),
@@ -550,6 +561,11 @@ function decideSkillSource(src, decision) {
   } else if (!confirm('Approve ' + src.slug + '? The people it is shared with, and their agents, get its skills at once.')) return null;
   const body = { decision };
   if (note.trim()) body.note = note.trim();
+  // Approval makes live only the waiting commit shown on this page; a
+  // newer one waits for a normal review.
+  const d = skillsUI.detail;
+  const waiting = decision === 'approve' && d && d.id === src.id && (d.versions || []).find((v) => v.id === src.pending_version_id);
+  if (waiting && waiting.sha) body.sha = waiting.sha;
   return skillsBusy('approval', () => api('/v1/skills/sources/' + encodeURIComponent(src.id) + '/approval', { method: 'POST', body }),
     decision === 'approve' ? src.slug + ' approved: agents it is shared with get its skills now.' : src.slug + ' rejected and turned off.');
 }
@@ -841,7 +857,8 @@ function renderSkillSource() {
         src.last_error ? skillsFact('Last error', el('span', { class: 'err' }, src.last_error)) : null)),
       el('div', { class: 'row', style: 'margin-top: 12px;' },
         el('button', { class: 'primary', disabled: busy || !src.enabled, on: { click: () => syncSkillSource(src.id) } }, skillsUI.syncing[src.id] ? 'Syncing…' : 'Sync now'),
-        el('button', { disabled: busy, on: { click: () => toggleSkillSource(src) } }, src.enabled ? 'Pause' : 'Resume'),
+        admin || src.approval !== 'rejected' ? el('button', { disabled: busy, on: { click: () => toggleSkillSource(src) } }, src.enabled ? 'Pause' : 'Resume') : null,
+        admin ? el('button', { disabled: busy, title: 'An admin lock: no agent sees any of its skills', on: { click: () => hideSkillSource(src) } }, src.hidden ? 'Show to agents' : 'Hide from agents') : null,
         el('button', { disabled: busy, on: { click: () => openSkillsEdit(src) } }, 'Edit'),
         el('button', { class: 'danger', disabled: busy, on: { click: () => deleteSkillSource(src) } }, 'Delete'))),
     renderSkillsApproval(src, busy),
