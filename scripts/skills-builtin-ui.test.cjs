@@ -44,7 +44,7 @@ function buttons(node, out = []) {
 }
 
 const builtinSource = {
-  id: 'src_toolyard_builtin', slug: 'toolyard', kind: 'builtin', owner: 'toolyard', repo: 'builtin', branch: '', path: '',
+  id: 'src_toolyard_builtin', slug: 'toolyard', kind: 'builtin', owner: 'toolyard', repo: 'builtin', branch: 'builtin', path: '',
   mode: 'auto', enabled: true, active_version_id: 'skv_1', active_sha: 'a'.repeat(64), skill_count: 8, warning_count: 0,
   visibility: 'everyone', default_runs: 'anywhere', has_token: false, auth: 'none', poll_seconds: 300,
   last_checked_at: '2026-10-26T09:00:00Z', webhook_url_path: '/v1/skills/sources/src_toolyard_builtin/webhook',

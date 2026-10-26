@@ -55,9 +55,11 @@ const (
 	BuiltinGuideSkill = "toolyard-basics"
 
 	// builtinOwner and builtinRepo make the version label
-	// "toolyard/builtin@<digest12>".
-	builtinOwner = "toolyard"
-	builtinRepo  = "builtin"
+	// "toolyard/builtin@<digest12>"; builtinBranch keeps the source's
+	// settings valid (a source always names a branch).
+	builtinOwner  = "toolyard"
+	builtinRepo   = "builtin"
+	builtinBranch = "builtin"
 	// builtinCreator is the source's created_by: toolyard itself, not a
 	// user (change proposals are refused for the source).
 	builtinCreator = "toolyard"
@@ -313,7 +315,7 @@ func (s *Service) builtinRow(ctx context.Context) (*sourceRow, error) {
 		return row, err
 	}
 	r := &sourceRow{Source: Source{
-		ID: BuiltinSourceID, Slug: BuiltinSlug, Kind: KindBuiltin, Owner: builtinOwner, Repo: builtinRepo,
+		ID: BuiltinSourceID, Slug: BuiltinSlug, Kind: KindBuiltin, Owner: builtinOwner, Repo: builtinRepo, Branch: builtinBranch,
 		Mode: ModeAuto, Auth: AuthNone, PollSeconds: DefaultPollSeconds, Enabled: true,
 		Visibility: VisibleEveryone, DefaultRuns: RunsAnywhere, CreatedBy: builtinCreator,
 	}}
