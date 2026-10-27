@@ -538,16 +538,20 @@ func (c *Client) checkSecret(secret string) bool {
 
 // cimdDocument is the subset of a client metadata document we read.
 type cimdDocument struct {
-	ClientID                string          `json:"client_id"`
-	ClientName              string          `json:"client_name"`
-	ClientURI               string          `json:"client_uri"`
-	LogoURI                 string          `json:"logo_uri"`
-	RedirectURIs            []string        `json:"redirect_uris"`
-	TokenEndpointAuthMethod string          `json:"token_endpoint_auth_method"`
-	GrantTypes              []string        `json:"grant_types"`
-	ResponseTypes           []string        `json:"response_types"`
-	ClientSecret            json.RawMessage `json:"client_secret"`
-	ClientSecretExpiresAt   json.RawMessage `json:"client_secret_expires_at"`
+	ClientID                string   `json:"client_id"`
+	ClientName              string   `json:"client_name"`
+	ClientURI               string   `json:"client_uri"`
+	LogoURI                 string   `json:"logo_uri"`
+	RedirectURIs            []string `json:"redirect_uris"`
+	TokenEndpointAuthMethod string   `json:"token_endpoint_auth_method"`
+	// TokenEndpointAuthMethods lists every method the client can use
+	// (ChatGPT's document has it); the singular field is its preference.
+	// Raw, so a value of another type is ignored, not a reason to refuse.
+	TokenEndpointAuthMethods json.RawMessage `json:"token_endpoint_auth_methods_supported"`
+	GrantTypes               []string        `json:"grant_types"`
+	ResponseTypes            []string        `json:"response_types"`
+	ClientSecret             json.RawMessage `json:"client_secret"`
+	ClientSecretExpiresAt    json.RawMessage `json:"client_secret_expires_at"`
 }
 
 // Metadata document fetch limits.
@@ -710,10 +714,9 @@ func (s *Service) fetchAndStore(ctx context.Context, clientID string, cached *Cl
 	if len(doc.ClientSecret) > 0 || len(doc.ClientSecretExpiresAt) > 0 {
 		return fail("it carries a client secret", true)
 	}
-	method := strings.TrimSpace(doc.TokenEndpointAuthMethod)
-	if method == "" {
-		method = AuthNone
-	}
+	var supported []string
+	_ = json.Unmarshal(doc.TokenEndpointAuthMethods, &supported)
+	method := cimdAuthMethod(doc.TokenEndpointAuthMethod, supported)
 	if _, oerr := s.validateClientMetadata(doc.RedirectURIs, method, doc.GrantTypes, doc.ResponseTypes, false); oerr != nil {
 		return fail(oerr.Description, true)
 	}
@@ -741,6 +744,34 @@ func (s *Service) fetchAndStore(ctx context.Context, clientID string, cached *Cl
 		c.CreatedAt = cached.CreatedAt
 	}
 	return c, nil, false
+}
+
+// cimdAuthMethod picks the token endpoint auth method of a metadata
+// document client. toolyard takes only none from a document: it holds no
+// secret for one and does not verify client assertions. A document names
+// its preference in token_endpoint_auth_method and may list every method
+// it can use in token_endpoint_auth_methods_supported (ChatGPT's prefers
+// private_key_jwt and lists none too); such a client picks from the
+// methods both sides list, its preference first when toolyard lists it
+// too. toolyard advertises none and the two secret methods, so a client
+// that prefers a secret method keeps it (and validateClientMetadata refuses
+// it: a document has no secret); one that prefers a method toolyard does
+// not list (private_key_jwt) gets none when it offers none. Otherwise the
+// preference stands and validateClientMetadata refuses it with its reason.
+func cimdAuthMethod(preferred string, supported []string) string {
+	preferred = strings.TrimSpace(preferred)
+	switch preferred {
+	case "", AuthNone:
+		return AuthNone
+	case AuthSecretPost, AuthSecretBasic:
+		return preferred
+	}
+	for _, m := range supported {
+		if strings.TrimSpace(m) == AuthNone {
+			return AuthNone
+		}
+	}
+	return preferred
 }
 
 // blockedPrefixes are the special-use ranges a metadata document may never

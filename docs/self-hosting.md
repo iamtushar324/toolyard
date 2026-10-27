@@ -233,6 +233,13 @@ static agent token (rotation and enrolment refuse it).
   for at most 7 days after it expired. The requester gets a generic error
   (the detail goes to the log). A document is cached for its `max-age` (5
   minutes to 24 hours).
+- A client metadata document client is always public: PKCE, no client
+  authentication (`none`). A document that prefers another method is
+  accepted when its `token_endpoint_auth_methods_supported` also lists
+  `none` (ChatGPT's prefers `private_key_jwt` and lists `none`; it picks
+  from the methods both sides list). toolyard does not verify
+  `private_key_jwt` client assertions, so a document that offers only that
+  method is refused.
 - Rate limits count per address (IPv6 by /64) and per network (IPv4 /24,
   IPv6 /48), and requests without a known address in one strict bucket.
   Global caps apply to registering a client and fetching a metadata

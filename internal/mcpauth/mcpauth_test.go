@@ -934,6 +934,78 @@ func TestClientsMayListUnsupportedGrantTypes(t *testing.T) {
 	}
 }
 
+// ChatGPT's metadata document prefers private_key_jwt but lists none among
+// the methods it can use (token_endpoint_auth_methods_supported); it picks
+// from the methods both sides list, so toolyard takes it as a public
+// client. A document that offers only private_key_jwt is still refused.
+func TestDocumentsMayOfferNoneAmongAuthMethods(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	srv, _ := cimdServer(t, func(u string) any {
+		return map[string]any{
+			"client_id": u, "client_name": "ChatGPT", "redirect_uris": []string{"https://a.example/cb"},
+			"token_endpoint_auth_method":            "private_key_jwt",
+			"token_endpoint_auth_methods_supported": []string{"none", "private_key_jwt"},
+			"token_endpoint_auth_signing_alg":       "RS256",
+			"jwks_uri":                              u + "/jwks.json",
+			"grant_types":                           []string{"authorization_code", "refresh_token"},
+			"response_types":                        []string{"code"},
+		}
+	}, http.StatusOK)
+	svc := cimdService(f, srv, true)
+	c, oerr := svc.ResolveClient(ctx, srv.URL+"/doc.json", "198.51.100.7")
+	if oerr != nil {
+		t.Fatalf("a document that also offers none was refused: %v", oerr)
+	}
+	if c.Name != "ChatGPT" || !c.Public() || c.AuthMethod != AuthNone {
+		t.Fatalf("client: %+v", c)
+	}
+	if stored, oerr := svc.Client(ctx, srv.URL+"/doc.json"); oerr != nil || !stored.Public() {
+		t.Fatalf("stored client: %+v %v", stored, oerr)
+	}
+	for name, tc := range map[string]struct {
+		preferred string
+		supported any
+		ok        bool
+	}{
+		"only private_key_jwt listed":    {"private_key_jwt", []string{"private_key_jwt"}, false},
+		"no list":                        {"private_key_jwt", nil, false},
+		"a secret method preferred":      {"client_secret_post", []string{"none"}, false},
+		"a list of the wrong type":       {"none", "none", true},
+		"private_key_jwt, list a string": {"private_key_jwt", "none", false},
+	} {
+		docSrv, _ := cimdServer(t, func(u string) any {
+			doc := map[string]any{"client_id": u, "redirect_uris": []string{"https://a.example/cb"}, "token_endpoint_auth_method": tc.preferred}
+			if tc.supported != nil {
+				doc["token_endpoint_auth_methods_supported"] = tc.supported
+			}
+			return doc
+		}, http.StatusOK)
+		_, oerr := cimdService(f, docSrv, true).ResolveClient(ctx, docSrv.URL+"/doc.json", "198.51.100.8")
+		if tc.ok && oerr != nil {
+			t.Errorf("%s: refused: %v", name, oerr)
+		}
+		if !tc.ok && (oerr == nil || oerr.Code != "invalid_client") {
+			t.Errorf("%s: accepted: %v", name, oerr)
+		}
+	}
+	for _, tc := range []struct {
+		preferred string
+		supported []string
+		want      string
+	}{
+		{"", nil, AuthNone},
+		{"none", []string{"private_key_jwt"}, AuthNone},
+		{"private_key_jwt", []string{" none "}, AuthNone},
+		{"private_key_jwt", []string{"client_secret_post"}, "private_key_jwt"},
+		{"client_secret_post", []string{"none"}, "client_secret_post"},
+	} {
+		if got := cimdAuthMethod(tc.preferred, tc.supported); got != tc.want {
+			t.Errorf("cimdAuthMethod(%q, %q) = %q, want %q", tc.preferred, tc.supported, got, tc.want)
+		}
+	}
+}
+
 func TestHTTPEndpoints(t *testing.T) {
 	f := newFixture(t)
 	mux := http.NewServeMux()
