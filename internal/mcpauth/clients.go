@@ -546,7 +546,8 @@ type cimdDocument struct {
 	TokenEndpointAuthMethod string   `json:"token_endpoint_auth_method"`
 	// TokenEndpointAuthMethods lists every method the client can use
 	// (ChatGPT's document has it); the singular field is its preference.
-	TokenEndpointAuthMethods []string        `json:"token_endpoint_auth_methods_supported"`
+	// Raw, so a value of another type is ignored, not a reason to refuse.
+	TokenEndpointAuthMethods json.RawMessage `json:"token_endpoint_auth_methods_supported"`
 	GrantTypes               []string        `json:"grant_types"`
 	ResponseTypes            []string        `json:"response_types"`
 	ClientSecret             json.RawMessage `json:"client_secret"`
@@ -713,7 +714,9 @@ func (s *Service) fetchAndStore(ctx context.Context, clientID string, cached *Cl
 	if len(doc.ClientSecret) > 0 || len(doc.ClientSecretExpiresAt) > 0 {
 		return fail("it carries a client secret", true)
 	}
-	method := cimdAuthMethod(doc.TokenEndpointAuthMethod, doc.TokenEndpointAuthMethods)
+	var supported []string
+	_ = json.Unmarshal(doc.TokenEndpointAuthMethods, &supported)
+	method := cimdAuthMethod(doc.TokenEndpointAuthMethod, supported)
 	if _, oerr := s.validateClientMetadata(doc.RedirectURIs, method, doc.GrantTypes, doc.ResponseTypes, false); oerr != nil {
 		return fail(oerr.Description, true)
 	}
@@ -749,13 +752,19 @@ func (s *Service) fetchAndStore(ctx context.Context, clientID string, cached *Cl
 // its preference in token_endpoint_auth_method and may list every method
 // it can use in token_endpoint_auth_methods_supported (ChatGPT's prefers
 // private_key_jwt and lists none too); such a client picks from the
-// methods both sides list, and toolyard advertises none. So none is chosen
-// when either field allows it; otherwise the preference stands and
-// validateClientMetadata refuses it with its reason.
+// methods both sides list, its preference first when toolyard lists it
+// too. toolyard advertises none and the two secret methods, so a client
+// that prefers a secret method keeps it (and validateClientMetadata refuses
+// it: a document has no secret); one that prefers a method toolyard does
+// not list (private_key_jwt) gets none when it offers none. Otherwise the
+// preference stands and validateClientMetadata refuses it with its reason.
 func cimdAuthMethod(preferred string, supported []string) string {
 	preferred = strings.TrimSpace(preferred)
-	if preferred == "" || preferred == AuthNone {
+	switch preferred {
+	case "", AuthNone:
 		return AuthNone
+	case AuthSecretPost, AuthSecretBasic:
+		return preferred
 	}
 	for _, m := range supported {
 		if strings.TrimSpace(m) == AuthNone {
