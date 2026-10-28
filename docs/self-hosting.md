@@ -139,7 +139,7 @@ to `/mcp` and the dashboard:
 | `/.well-known/oauth-protected-resource` (and `…/mcp`) | RFC 9728 protected-resource metadata |
 | `/.well-known/oauth-authorization-server` | RFC 8414 authorization server metadata |
 | `/oauth/register` | RFC 7591 dynamic client registration (60 per client IP per hour) |
-| `/oauth/authorize`, `/oauth/consent` | the browser steps: sign-in, then the consent screen |
+| `/oauth/authorize`, `/oauth/consent`, `/oauth/return/<ticket>`, `/oauth/copy.js` | the browser steps: a stop page, sign-in, the consent screen, then the return link (see "Finishing in another browser") |
 | `/oauth/token` | `authorization_code` (PKCE `S256` required) and `refresh_token` |
 | `/oauth/revoke` | RFC 7009 revocation |
 
@@ -196,6 +196,40 @@ sessions" (a client metadata document client shares one client_id across
 installs, so one person's devices share a grant). An app's agent cannot be given a
 static agent token (rotation and enrolment refuse it).
 
+**Finishing in another browser.** The browser steps never move on by
+themselves, so a person can start a connection in one browser or Chrome
+profile and answer in another (for example to connect the account of
+another profile):
+
+1. `/oauth/authorize` stops on a page "<app> wants to connect to your
+   toolyard" with **Continue in this browser** and **Copy link for another
+   browser**: the consent step's address,
+   `<public-url>/oauth/consent?request=<id>`. It works in any browser where
+   the person signs in to toolyard, for the 10 minutes the request lives.
+2. After **Allow**, toolyard does not send the browser to the app. It shows
+   **Approved. Return to <app>** (where it sends the person back to, whose
+   toolyard and which nickname) with **Continue in this browser** and
+   **Copy return link**, `<public-url>/oauth/return/<ticket>`. The person
+   opens it in the browser where the app waits. A return link works once,
+   for 10 minutes after the consent, and needs no toolyard session.
+   Opening it changes nothing (a link previewer cannot use it up); its
+   **Continue** button, a same-origin form with a `SameSite=Strict` nonce
+   cookie, mints the authorization code then (so the code's 60 seconds
+   start there) and sends the browser to the app's registered redirect URI
+   with `code`, `state` and `iss`. A newer consent for the same app ends
+   the unused return link of the earlier one, and a revoked connection's
+   link gives no code.
+3. After **Deny**, the page links to the app's redirect URI with
+   `error=access_denied`, to follow here or copy to the other browser.
+
+A return link is a capability like the code it stands for: whoever holds
+it can have a code sent to the app's registered redirect URI and nowhere
+else, and the app's `state` and PKCE verifier, which never leave the app,
+make that code useless to anyone else. The page names the toolyard account
+the app connects to. Only the link's SHA-256 is stored
+(`mcp_oauth_return_tickets`), and the token endpoint records the consent's
+time, not the link's, as the sign-in time.
+
 **Security notes.**
 
 - Redirect URIs must be `https` to a valid host name or IP address, `http`
@@ -210,8 +244,9 @@ static agent token (rotation and enrolment refuse it).
   `mcp_oauth_redirect_hosts` names the redirect host. Neither a
   self-registered client nor a client metadata document makes a redirect
   URI trusted (anyone can host a document that lists their own site), so
-  toolyard is never an open redirect. After the person answers, allow and
-  deny always redirect.
+  toolyard is never an open redirect. After the person answers, toolyard
+  shows a page of its own: a return link for allow, a link carrying
+  `access_denied` for deny (see "Finishing in another browser").
   `state` is optional (PKCE is required); a request without `resource` gets
   `<public-url>/mcp`.
 - Client ID metadata documents are fetched only while handling an
@@ -260,8 +295,10 @@ static agent token (rotation and enrolment refuse it).
   reuse detection) also cancels its agent's pending approvals (personal
   ones included) and Inbox requests, recorded as cancelled by the system
   because the grant was revoked, and nothing it queued can run.
-- Tokens, codes and client secrets are stored as SHA-256 hashes. Access
-  tokens start `tyat_`, refresh tokens `tyrt_`.
+- Tokens, codes, return links and client secrets are stored as SHA-256
+  hashes. Access tokens start `tyat_`, refresh tokens `tyrt_`, return
+  links `tyrl_`. A return link page allows 60 requests per client address
+  per 10 minutes (and its network 240).
 - All of this state is in the database (`mcp_oauth_*` tables), so several
   replicas on one Postgres database share it. The sweeper that deletes
   expired rows is safe to run on every node.
@@ -515,6 +552,44 @@ upstream that restarted and forgot toolyard's session gets a new one, and
 its catalog is read again in the same refresh. An upstream tool whose
 `x-mcp-header` annotations are invalid is left out (logged), not
 registered.
+
+### Signing in to a server from another browser
+
+Every browser sign-in the dashboard starts for an upstream server stops
+before it leaves toolyard: **Connect** on My connections (a person's own
+account, GitHub included), **Auth…** on a shared server, a marketplace
+install, and **Register GitHub App**. The person chooses one of two:
+
+- **Continue in this browser** runs the sign-in as before. The flow is
+  bound to this browser, and the provider's return must come back to it.
+- **Copy link for another browser** shows a one-time connect link, the
+  same kind of link an agent gets from `connections.link`. It works once,
+  for 10 minutes. Open it in another browser profile, for example one that
+  is signed in to a different provider account. The sign-in starts there
+  and is bound to that browser.
+
+The link keeps the rules of a connect link:
+
+- **Own account.** The provider account must use the person's toolyard
+  email. A different email is refused and nothing is stored. When the
+  provider does not report a verified email (GitHub, for example), the
+  other browser must also hold the person's toolyard session.
+- **Shared account.** The other browser must be signed in to toolyard as
+  an admin. A link never replaces a shared account that works (a link can
+  be forwarded). To sign in again or switch accounts, use **Continue in
+  this browser**. After **Reauthorize**, a link renews the sign-in as the
+  same account only.
+- **GitHub App.** The other browser must be signed in to toolyard as an
+  admin. **Continue** there shows GitHub's App form behind a **Continue to
+  GitHub** button, and GitHub returns to that browser.
+
+The dashboard asks for the link with `{"mode": "link"}` on the route that
+starts the sign-in: `POST /v1/me/connections/{server}/begin`,
+`POST /v1/servers/{name}/oauth/begin` (admin) or `POST /v1/github/setup/begin`
+(admin). The answer is `{"mode": "link", "connect_link": "https://toolyard.example.com/v1/connect/link/…", "expires_in": 600}`.
+The link uses `-public-url`, or the host the dashboard was reached on. Each
+link is a `connect.link_issued` audit row for the person who copied it.
+The paste and device-code modes of **Auth…** stay as they are.
 
 ### MCP protocol versions
 

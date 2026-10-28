@@ -250,8 +250,8 @@ func TestAgentToolListRoundTripsThroughTheScopeRoutes(t *testing.T) {
 	}
 	rec := httptest.NewRecorder()
 	mux.ServeHTTP(rec, r)
-	if rec.Code != http.StatusFound {
-		t.Fatalf("consent again: %d %s", rec.Code, rec.Body)
+	if rec.Code != http.StatusSeeOther || !strings.HasPrefix(rec.Header().Get("Location"), mcpauth.ReturnPath) {
+		t.Fatalf("consent again: %d %s %s", rec.Code, rec.Header().Get("Location"), rec.Body)
 	}
 	if got := e.access.ToolListFor(ctx, apps[0].AgentID); got != access.ToolListFull {
 		t.Fatalf("connecting again reset the tool list to %q", got)

@@ -2,8 +2,10 @@ package mcpauth
 
 // authorize.go is the authorization request and the person's answer: the
 // request is checked and stored (BeginAuthorize), the consent screen reads
-// it back (PendingRequest), and Approve or Deny claims it once, creates or
-// reuses the grant and its agent, and returns where to send the browser.
+// it back (PendingRequest), and Approve or Deny claims it once. Approve
+// creates or reuses the grant and its agent and returns a one-time return
+// ticket (return.go), whose link mints the code; Deny returns where to send
+// the browser.
 
 import (
 	"context"
@@ -116,8 +118,8 @@ func (s *Service) trustedRedirect(redirect string) bool {
 // Errors before the person answers are shown to the person, except that
 // one goes back to the client once the client, its redirect URI and
 // response_type=code are all valid and the admin's allow list names the
-// redirect URI (trustedRedirect). After the person answers, allow and deny
-// redirect.
+// redirect URI (trustedRedirect). After the person answers, allow gives a
+// return link (return.go) and deny the error for the client.
 func (s *Service) BeginAuthorize(ctx context.Context, q url.Values, ip string) (*AuthorizeRequest, *AuthorizeError) {
 	show := func(status int, code, desc string) *AuthorizeError {
 		return &AuthorizeError{Error: oauthErr(status, code, desc)}
@@ -351,8 +353,10 @@ func (s *Service) claimRequest(ctx context.Context, q store.Querier, id, userID 
 
 // Approve answers request id with the person's yes: it creates the grant
 // and its agent (or reuses the person's earlier grant for this client,
-// renamed and re-enabled), sets the agent's tool scope, issues a code, and
-// returns the redirect that carries the code back to the client.
+// renamed and re-enabled), sets the agent's tool scope, stores a one-time
+// return ticket and returns it. The return link (ReturnPath + ticket) sends
+// the person back to the client, with a code minted then (RedeemReturn),
+// from whichever browser they open it in.
 func (s *Service) Approve(ctx context.Context, id string, u *identity.User, c Consent) (string, error) {
 	nickname, err := CheckNickname(c.Nickname)
 	if err != nil {
@@ -438,9 +442,13 @@ func (s *Service) Approve(ctx context.Context, id string, u *identity.User, c Co
 				return "", err
 			}
 		}
-		// Unused codes from before this consent always stop: only the
-		// code issued below is valid afterwards.
+		// Unused codes and return links from before this consent always
+		// stop: only the return link issued below is valid afterwards.
 		if _, err = tx.ExecContext(ctx, `UPDATE mcp_oauth_codes SET used_at = ? WHERE grant_id = ? AND used_at IS NULL`, now, grantID); err != nil {
+			return "", err
+		}
+		if _, err = tx.ExecContext(ctx, `UPDATE mcp_oauth_return_tickets SET expires_at = ? WHERE grant_id = ? AND used_at IS NULL AND expires_at > ?`,
+			now, grantID, now); err != nil {
 			return "", err
 		}
 		if _, err = tx.ExecContext(ctx,
@@ -452,15 +460,8 @@ func (s *Service) Approve(ctx context.Context, id string, u *identity.User, c Co
 	if _, err = access.WriteAgentScope(ctx, tx, agentID, scope, u.ID); err != nil {
 		return "", err
 	}
-	code, err := newSecret(codePrefix)
+	ticket, err := s.insertReturnTicketTx(ctx, tx, grantID, u.ID, req, now)
 	if err != nil {
-		return "", err
-	}
-	if _, err = tx.ExecContext(ctx,
-		`INSERT INTO mcp_oauth_codes(code_hash, grant_id, client_id, redirect_uri, code_challenge, resource, scope, family_id, created_at, expires_at)
-         VALUES(?,?,?,?,?,?,?,?,?,?)`,
-		hashSecret(code), grantID, req.clientID, req.redirect, req.challenge, req.resource, req.scope, newFamily(),
-		now, s.now().Add(CodeTTL).UnixMilli()); err != nil {
 		return "", err
 	}
 	if err = s.auditTx(ctx, tx, auditRow{event: "mcp_oauth.authorized", agentID: agentID, nickname: nickname, owner: u, decider: u,
@@ -475,7 +476,7 @@ func (s *Service) Approve(ctx context.Context, id string, u *identity.User, c Co
 	if s.access != nil {
 		s.access.InvalidateAgent(agentID)
 	}
-	return withParams(req.redirect, map[string]string{"code": code, "state": req.state, "iss": s.Issuer()}), nil
+	return ticket, nil
 }
 
 // revivalOf reports the agent of userID's grant for clientID and whether a

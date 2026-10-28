@@ -13,6 +13,7 @@ import (
 
 	"github.com/tusharbhardwaj/toolyard/internal/actor"
 	"github.com/tusharbhardwaj/toolyard/internal/audit"
+	"github.com/tusharbhardwaj/toolyard/internal/gateway"
 	"github.com/tusharbhardwaj/toolyard/internal/identity"
 	"github.com/tusharbhardwaj/toolyard/internal/oauth"
 	"github.com/tusharbhardwaj/toolyard/internal/upstreams"
@@ -52,6 +53,18 @@ import (
 // lifted for it (the nonce is the CSRF proof), the Origin check stays, a
 // member's session passes RoleGuard, an operator token can never use it,
 // and the unauthenticated per-IP throttle applies (security.go).
+//
+// The dashboard mints the same links ("Copy link for another browser"):
+// every sign-in it starts stops first and offers either to continue in
+// this browser or to copy a link, so a person can finish the sign-in in
+// another browser profile. The begin routes take {"mode":"link"} for that:
+// POST /v1/me/connections/{server}/begin (the caller's own account),
+// POST /v1/servers/{name}/oauth/begin (admin, a shared account) and
+// POST /v1/github/setup/begin (admin, the GitHub App). Such a ticket
+// records ConnectMintedBy(person) instead of an agent, and is honoured on
+// exactly the terms an agent's link is. A GitHub App setup ticket is a
+// kind of its own: its Continue shows GitHub's manifest form in this
+// browser instead of starting a sign-in (github_setup.go).
 
 // connectLinkPath is the route prefix; the ticket is the rest of the path.
 // It is oauth.ConnectLinkPath, which the gateway builds links with (a test
@@ -63,6 +76,10 @@ const connectLinkPath = "/v1/connect/link/"
 // name is a prefix of the ticket's hash, so two links open in one browser
 // do not clobber each other.
 const connectNoncePrefix = "toolyard_connect_"
+
+// connectModeLink is the begin routes' mode that mints a connect link for
+// another browser instead of starting the flow in this one.
+const connectModeLink = "link"
 
 // Audit event types.
 const (
@@ -158,6 +175,11 @@ func (s *Server) lookupConnectLink(r *http.Request) (*connectLinkLookup, *connec
 		return nil, &connectLinkRefusal{reason: reason, text: connectLinkDeadText}
 	}
 	l := &connectLinkLookup{ticket: ticket, tk: tk}
+	if tk.Kind != oauth.ConnectKindSignIn {
+		// A GitHub App setup ticket never starts a sign-in (the handlers
+		// send it to github_setup.go before this runs).
+		return l, &connectLinkRefusal{reason: "bad_purpose", text: connectLinkDeadText}
+	}
 	u, err := s.identity.GetUserByID(ctx, tk.UserID)
 	if err != nil || u.Status != identity.StatusActive {
 		return l, &connectLinkRefusal{reason: "user_inactive", text: "The toolyard account this link was made for is not active, so it can't be used. Ask a toolyard admin."}
@@ -220,6 +242,10 @@ func (s *Server) connectLinkConfirm(w http.ResponseWriter, r *http.Request) {
 	if s.oauth == nil || s.upstreams == nil {
 		writeConnectPage(w, http.StatusServiceUnavailable, "Not available",
 			"<h1>Not available</h1><p>toolyard is not set up for sign-in links. Ask an admin to connect the server from the dashboard.</p>")
+		return
+	}
+	if s.connectLinkKind(r) == oauth.ConnectKindGitHubAppSetup {
+		s.githubSetupLinkConfirm(w, r)
 		return
 	}
 	l, refusal := s.lookupConnectLink(r)
@@ -286,7 +312,15 @@ func (s *Server) connectConfirmHTML(l *connectLinkLookup, nonce string, shared, 
 	} else {
 		b.WriteString("<p>This signs in the account only " + person + "'s agents use.</p>")
 	}
-	b.WriteString("<p>You'll be sent" + provider + " to sign in, then come back here. Afterwards, tell your agent to retry.</p>")
+	if l.tk.MintedInDashboard() {
+		// The person copied it from the dashboard for this browser.
+		if !shared && l.user.Email != "" {
+			b.WriteString("<p>Sign in there with the account for <strong>" + htmlEscape(l.user.Email) + "</strong>: an account with another email is refused.</p>")
+		}
+		b.WriteString("<p>You'll be sent" + provider + " to sign in, then come back here. The toolyard dashboard then shows the connection.</p>")
+	} else {
+		b.WriteString("<p>You'll be sent" + provider + " to sign in, then come back here. Afterwards, tell your agent to retry.</p>")
+	}
 	b.WriteString(`<form method="post" action="` + htmlEscape(connectLinkPath+l.ticket) + `">` +
 		`<input type="hidden" name="nonce" value="` + htmlEscape(nonce) + `">` +
 		`<button type="submit">Continue</button></form>`)
@@ -326,6 +360,10 @@ func (s *Server) connectLinkContinue(w http.ResponseWriter, r *http.Request) {
 	}
 	s.clearConnectNonce(w, r, ticket)
 
+	if s.connectLinkKind(r) == oauth.ConnectKindGitHubAppSetup {
+		s.githubSetupLinkContinue(w, r, ticket)
+		return
+	}
 	l, refusal := s.lookupConnectLink(r)
 	if refusal != nil {
 		upstream := ""
@@ -411,7 +449,79 @@ func (s *Server) connectLinkContinue(w http.ResponseWriter, r *http.Request) {
 
 // connectLinkDeadText is what the person reads for a link that cannot be
 // told apart from a stale one.
-const connectLinkDeadText = "This link has expired or was already used — ask your agent for a new one."
+const connectLinkDeadText = "This link has expired or was already used — ask your agent for a new one, or copy a new link in the toolyard dashboard."
+
+// connectLinkKind is the kind of the ticket in the path, or
+// ConnectKindSignIn when it cannot be read (lookupConnectLink then says
+// why). It redeems nothing.
+func (s *Server) connectLinkKind(r *http.Request) string {
+	tk, err := s.oauth.PeekConnectTicket(r.Context(), connectTicketFromPath(r.URL.Path))
+	if err != nil {
+		return oauth.ConnectKindSignIn
+	}
+	return tk.Kind
+}
+
+// connectLinkBase is the origin a link minted in the dashboard points at:
+// PublicURL, else the host the dashboard was reached on (the person who
+// copies the link is on it).
+func (s *Server) connectLinkBase(r *http.Request) string {
+	if base := strings.TrimRight(s.security.PublicURL, "/"); base != "" {
+		return base
+	}
+	scheme := "http"
+	if s.security.IsBehindHTTPS(r) {
+		scheme = "https"
+	}
+	return scheme + "://" + r.Host
+}
+
+// linkableClient reports whether the server's sign-in can be handed to
+// another browser: it needs an OAuth client with a real authorization
+// endpoint (a pasted token has no browser flow). It answers the request
+// when not.
+func (s *Server) linkableClient(w http.ResponseWriter, r *http.Request, name string) bool {
+	cli, err := s.oauth.GetClient(r.Context(), name)
+	switch {
+	case errors.Is(err, oauth.ErrClientNotFound):
+		writeError(w, http.StatusConflict, "an admin still has to finish this server's OAuth setup (Servers → Auth…)")
+		return false
+	case err != nil:
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return false
+	case cli.AuthorizationEndpoint == "" || cli.AuthorizationEndpoint == "(pat)":
+		writeError(w, http.StatusConflict, "this server uses a pasted token: there is no browser sign-in to finish elsewhere")
+		return false
+	}
+	return true
+}
+
+// writeDashboardLink answers a begin in link mode: mint runs the ticket's
+// insert (the caller has checked that u may do this sign-in), the link is
+// audited the way the gateway audits an agent's (the ticket never is), and
+// the absolute link goes back to the dashboard, never cached.
+func (s *Server) writeDashboardLink(w http.ResponseWriter, r *http.Request, u *identity.User, upstream, what string, mint func() (string, error)) {
+	ticket, err := mint()
+	if errors.Is(err, oauth.ErrTooManyTickets) {
+		writeError(w, http.StatusTooManyRequests, err.Error())
+		return
+	}
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	_ = s.audit.Write(r.Context(), audit.Event{
+		EventType: gateway.EventConnectLinkIssued, AgentID: oauth.ConnectMintedBy(u.ID), UpstreamName: upstream,
+		ResultSummary: what + " connect link for " + upstream + ", copied in the dashboard",
+		Raiser:        actor.Raiser{OwnerUserID: u.ID, OwnerEmail: u.Email, OwnerName: u.Label()},
+	})
+	w.Header().Set("Cache-Control", "no-store")
+	writeJSON(w, http.StatusOK, map[string]any{
+		"mode":         connectModeLink,
+		"connect_link": s.connectLinkBase(r) + connectLinkPath + ticket,
+		"expires_in":   int(oauth.ConnectTicketTTL.Seconds()),
+	})
+}
 
 // connectLinkRefuse audits why a Continue was not honoured and shows the
 // page. The ticket itself is never recorded.
@@ -614,7 +724,9 @@ func (s *Server) connectAuditUnverified(r *http.Request, u *identity.User, upstr
 }
 
 // connectDonePage is the success page for a flow a link started: the
-// person came from their agent, so that is where they go back to.
+// person came from their agent, so that is where they go back to, or from
+// the dashboard's "Copy link for another browser", which picks the change
+// up on its own (the flow does not record which).
 func connectDonePage(w http.ResponseWriter, upstream, account string) {
 	as := ""
 	if account != "" {
@@ -622,7 +734,8 @@ func connectDonePage(w http.ResponseWriter, upstream, account string) {
 	}
 	writeConnectPage(w, http.StatusOK, "Connected",
 		"<h1>Connected</h1><p><strong>"+htmlEscape(upstream)+"</strong> is connected"+as+".</p>"+
-			"<p>Go back to T3 Code and tell your agent to retry. You can close this tab.</p>")
+			"<p>Go back to T3 Code and tell your agent to retry. You can close this tab.</p>"+
+			"<p>Copied this link from the toolyard dashboard? Nothing more to do: the dashboard shows the connection.</p>")
 }
 
 // writeConnectPage renders one of the connect pages. body is HTML the

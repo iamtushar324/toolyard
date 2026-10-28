@@ -14,6 +14,7 @@ import (
 	"github.com/tusharbhardwaj/toolyard/internal/goroutines"
 	"github.com/tusharbhardwaj/toolyard/internal/identity"
 	"github.com/tusharbhardwaj/toolyard/internal/oauth"
+	"github.com/tusharbhardwaj/toolyard/internal/upstreams"
 )
 
 // reconnectAfterAuthName names the reconnect a sign-in starts in the
@@ -258,6 +259,10 @@ func (s *Server) oauthBegin(w http.ResponseWriter, r *http.Request, name string)
 		writeError(w, http.StatusBadRequest, "use /device-begin for the device flow")
 		return
 	}
+	if body.Mode == connectModeLink {
+		s.oauthBeginLink(w, r, name)
+		return
+	}
 	// A flow started from a browser is bound to it: the begin response
 	// sets a flow cookie the callback checks (see oauth_flow_cookie.go).
 	// An operator token has no browser to bind, so its flow stays open
@@ -280,6 +285,67 @@ func (s *Server) oauthBegin(w http.ResponseWriter, r *http.Request, name string)
 		"state":         state,
 		"mode":          body.Mode,
 		"expires_in":    int(oauth.PendingTTL.Seconds()),
+	})
+}
+
+// oauthBeginLink is oauthBegin's {"mode":"link"} ("Copy link for another
+// browser"): instead of a flow in this browser, the admin gets a one-time
+// shared-account connect link (connect_link_routes.go) to open in another
+// browser profile, where Continue needs a toolyard admin session and the
+// flow is bound to that browser. The link's rules are the agent link's:
+// an admin only, an enabled shared server whose sign-in is a browser one,
+// and never for a shared account that works. A working account is not
+// replaced through a link, because a link can be forwarded; signing in
+// again, or as another account, stays "Continue in this browser". After
+// Reauthorize (the token marked for a new sign-in) a link may renew it,
+// as the same account only.
+func (s *Server) oauthBeginLink(w http.ResponseWriter, r *http.Request, name string) {
+	ctx := r.Context()
+	u, err := s.requireAdmin(r)
+	if err != nil {
+		writeAuthError(w, err)
+		return
+	}
+	if operatorFromContext(ctx) != nil {
+		writeError(w, http.StatusConflict, "connect links are not handed out to an operator token; copy one in the dashboard")
+		return
+	}
+	sv, err := s.upstreams.Get(ctx, name)
+	if err != nil {
+		if errors.Is(err, upstreams.ErrNotFound) {
+			writeError(w, http.StatusNotFound, "server not found")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if sv.AuthMode == upstreams.AuthPerUser {
+		writeError(w, http.StatusBadRequest, "this server acts as each person's own account: each person connects theirs on My connections")
+		return
+	}
+	if !sv.Enabled {
+		writeError(w, http.StatusConflict, "this server is disabled; enable it before anyone signs in")
+		return
+	}
+	if !s.linkableClient(w, r, name) {
+		return
+	}
+	conn, err := s.oauth.SharedConnection(ctx, name)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, err.Error())
+		return
+	}
+	if conn.Usable() {
+		as := ""
+		if conn.AccountLabel != "" {
+			as = " as " + conn.AccountLabel
+		}
+		writeError(w, http.StatusConflict, name+" is already signed in"+as+
+			", and a link never replaces a working shared account (a link can be forwarded). To sign in again or switch accounts, use Continue in this browser.")
+		return
+	}
+	s.writeDashboardLink(w, r, u, name, oauth.ConnectPurposeShared, func() (string, error) {
+		return s.oauth.IssueConnectTicket(ctx, u.ID, name, oauth.ConnectPurposeShared, oauth.ConnectMintedBy(u.ID))
 	})
 }
 

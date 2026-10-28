@@ -19,6 +19,7 @@ import (
 	"errors"
 	"fmt"
 	"net/url"
+	"strings"
 	"time"
 
 	"github.com/tusharbhardwaj/toolyard/internal/githubapi"
@@ -41,6 +42,28 @@ const (
 	// an admin is given such a link.
 	ConnectPurposeShared = "shared"
 )
+
+// Connect kinds: what opening the link does. A sign-in link (the empty
+// kind) starts an OAuth flow; a GitHub App setup link shows the GitHub
+// manifest form in the browser that opens it, so an admin can register
+// the App from another browser profile than the dashboard's.
+const (
+	ConnectKindSignIn         = ""
+	ConnectKindGitHubAppSetup = "github_app_setup"
+)
+
+// connectAgentGitHubAppSetup is what a GitHub App setup ticket stores in
+// agent_id: the table's purpose column allows only per_user and shared, so
+// the kind rides in the free-text column instead of a migration. No agent
+// id can take this value (IssueConnectTicket refuses it; agent ids are
+// "ag_<uuid>"), and loadConnectTicket turns it back into Kind.
+const connectAgentGitHubAppSetup = "toolyard:github_app_setup"
+
+// ConnectMintedBy is the agent_id a ticket a person minted for themselves
+// in the dashboard records ("Copy link for another browser"): the audit
+// rows of the link then name the person, as the dashboard's own sign-in
+// rows do ("user:<id>").
+func ConnectMintedBy(userID string) string { return "user:" + userID }
 
 // Ticket errors. Redeem tells them apart so the audit row can say why a
 // link was refused; the page the person sees is the same for all three.
@@ -65,12 +88,22 @@ var ErrAccountMismatch = errors.New("oauth: the provider account is not this per
 
 // ConnectTicket is a redeemed ticket's row, without the ticket itself.
 type ConnectTicket struct {
-	UserID    string
-	Upstream  string
-	Purpose   string
-	AgentID   string
+	UserID   string
+	Upstream string
+	Purpose  string
+	// AgentID is the agent that asked for the link, or ConnectMintedBy of
+	// the person who made it in the dashboard.
+	AgentID string
+	// Kind is ConnectKindSignIn or ConnectKindGitHubAppSetup.
+	Kind      string
 	CreatedAt time.Time
 	ExpiresAt time.Time
+}
+
+// MintedInDashboard reports a ticket the person made for themselves in the
+// dashboard rather than one an agent asked for.
+func (t *ConnectTicket) MintedInDashboard() bool {
+	return t != nil && strings.HasPrefix(t.AgentID, "user:")
 }
 
 // hashConnectTicket is what a ticket is stored as.
@@ -84,6 +117,22 @@ func hashConnectTicket(ticket string) string {
 // only its hash is stored. The link is valid for ConnectTicketTTL and can
 // be redeemed once.
 func (s *Service) IssueConnectTicket(ctx context.Context, userID, upstream, purpose, agentID string) (string, error) {
+	if agentID == connectAgentGitHubAppSetup {
+		return "", errors.New("oauth: reserved agent id on a connect ticket")
+	}
+	return s.issueConnectTicket(ctx, userID, upstream, purpose, agentID)
+}
+
+// IssueGitHubAppSetupTicket mints a GitHub App setup link for the admin
+// userID on the GitHub server upstream: opening it shows GitHub's manifest
+// form in that browser (the API checks who may continue). It is stored as
+// a shared ticket of its own kind, valid for ConnectTicketTTL, once.
+func (s *Service) IssueGitHubAppSetupTicket(ctx context.Context, userID, upstream string) (string, error) {
+	return s.issueConnectTicket(ctx, userID, upstream, ConnectPurposeShared, connectAgentGitHubAppSetup)
+}
+
+// issueConnectTicket is the insert both kinds share.
+func (s *Service) issueConnectTicket(ctx context.Context, userID, upstream, purpose, agentID string) (string, error) {
 	if userID == "" || upstream == "" {
 		return "", errors.New("oauth: a connect ticket needs a user and a server")
 	}
@@ -135,6 +184,11 @@ func (s *Service) loadConnectTicket(ctx context.Context, hash string) (*ConnectT
 	}
 	t.CreatedAt = time.UnixMilli(created)
 	t.ExpiresAt = time.UnixMilli(exp)
+	if t.AgentID == connectAgentGitHubAppSetup {
+		// The admin made it in the dashboard; the marker is only the kind.
+		t.Kind = ConnectKindGitHubAppSetup
+		t.AgentID = ConnectMintedBy(t.UserID)
+	}
 	return &t, usedAt, nil
 }
 
