@@ -3,6 +3,7 @@ package access
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 )
@@ -213,6 +214,86 @@ func TestOAuthClientsNeverInheritAdminControl(t *testing.T) {
 	}
 	if svc.ScopeFor(ctx, "ag_plain").CanAdminister() {
 		t.Fatal("a limited ordinary agent kept admin control")
+	}
+}
+
+// TestAgentToolList: the tool list lives in the scope's rules JSON (no
+// migration), is small for every agent by default (rows written before it
+// existed included), keeps a row of its own when it is full, and never
+// changes an access decision. Callers without an agent scope get the full
+// list.
+func TestAgentToolList(t *testing.T) {
+	ctx := context.Background()
+	db := openTestDB(t)
+	addUser(t, db, "u_admin", "admin", "active")
+	addAgent(t, db, "ag_1", "u_admin")
+	addAgent(t, db, "ag_old", "u_admin")
+	svc := New(db)
+
+	if got := svc.ToolListFor(ctx, "ag_1"); got != ToolListSmall {
+		t.Fatalf("default tool list = %q, want small", got)
+	}
+	if sc, err := svc.AgentScope(ctx, "ag_1"); err != nil || sc.ToolList != ToolListSmall || sc.FullToolList() {
+		t.Fatalf("default scope: %+v %v", sc, err)
+	}
+	// A row written before the tool list existed is the small list.
+	if _, err := db.Exec(`INSERT INTO agent_scopes(agent_id, mode, rules, updated_at) VALUES('ag_old', 'all', '{"deny_servers":["x"]}', 1)`); err != nil {
+		t.Fatal(err)
+	}
+	if got := svc.ToolListFor(ctx, "ag_old"); got != ToolListSmall {
+		t.Fatalf("an older row's tool list = %q, want small", got)
+	}
+
+	// Full alone keeps a row, and the agent keeps exactly its owner's scope.
+	saved, err := svc.SetAgentScope(ctx, "ag_1", AgentScope{ToolList: " full "}, "u_admin")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if saved.ToolList != ToolListFull || saved.Mode != ScopeModeAll || saved.Summary() != "everything its owner can use, full tool list" {
+		t.Fatalf("saved: %+v %q", saved, saved.Summary())
+	}
+	var rules string
+	if err := db.QueryRow(`SELECT rules FROM agent_scopes WHERE agent_id = 'ag_1'`).Scan(&rules); err != nil || !strings.Contains(rules, `"tool_list":"full"`) {
+		t.Fatalf("stored rules: %q %v", rules, err)
+	}
+	if read, err := svc.AgentScope(ctx, "ag_1"); err != nil || !read.FullToolList() {
+		t.Fatalf("read back: %+v %v", read, err)
+	}
+	if got := svc.ToolListFor(ctx, "ag_1"); got != ToolListFull {
+		t.Fatalf("tool list after the switch = %q, want full", got)
+	}
+	if sc := svc.ScopeFor(ctx, "ag_1"); !sc.All || sc.Limits != nil || !sc.CanAdminister() {
+		t.Fatalf("the full tool list changed access: %+v", sc)
+	}
+	// With limits, the limits apply and the tool list stays.
+	if _, err := svc.SetAgentScope(ctx, "ag_1", AgentScope{Mode: ScopeModeAll, DenyServers: []string{"x"}, ToolList: ToolListFull}, "u_admin"); err != nil {
+		t.Fatal(err)
+	}
+	if sc := svc.ScopeFor(ctx, "ag_1"); sc.Limits == nil || sc.AllowsTool("x", "x.y") || svc.ToolListFor(ctx, "ag_1") != ToolListFull {
+		t.Fatalf("limits with the full tool list: %+v", sc)
+	}
+	// Back to small with no limits deletes the row again.
+	if _, err := svc.SetAgentScope(ctx, "ag_1", AgentScope{ToolList: ToolListSmall}, "u_admin"); err != nil {
+		t.Fatal(err)
+	}
+	var n int
+	if err := db.QueryRow(`SELECT COUNT(*) FROM agent_scopes WHERE agent_id = 'ag_1'`).Scan(&n); err != nil || n != 0 {
+		t.Fatalf("rows after switching back: %d %v", n, err)
+	}
+	if got := svc.ToolListFor(ctx, "ag_1"); got != ToolListSmall {
+		t.Fatalf("tool list after switching back = %q, want small", got)
+	}
+
+	for _, id := range []string{"", "dashboard:u_admin", "voice:u_admin"} {
+		if got := svc.ToolListFor(ctx, id); got != ToolListFull {
+			t.Errorf("ToolListFor(%q) = %q, want full", id, got)
+		}
+	}
+	if _, err := (AgentScope{ToolList: "tiny"}).Normalize(); !errors.Is(err, ErrInvalidScope) {
+		t.Errorf("an unknown tool list: %v", err)
+	}
+	if full := (AgentScope{ToolList: ToolListFull}); !full.Unlimited() || full.Compile() != nil {
+		t.Error("the tool list must not count as a limit")
 	}
 }
 

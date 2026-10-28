@@ -55,14 +55,16 @@ call had been sent, `outcome_unknown` once one had. A REST run still
 
 | Argument | Values |
 |---|---|
-| `query` | Words (keyword) or a pattern (regex). Empty lists every tool by name. At most 1,000 characters; only the first 32 distinct words count. |
-| `mode` | `keyword` (default, ranked), `regex` (RE2, at most 200 characters, case-insensitive unless `(?-i)`), `auto` (keyword). `semantic` is an error unless the operator configured it. |
+| `query` | The task in plain words (auto, semantic, keyword) or a pattern (regex). Empty lists every tool by name. At most 1,000 characters; only the first 32 distinct words count. |
+| `mode` | `auto` (default: by meaning with Jev where the operator turned it on, else keyword; also keyword when Jev is slow or fails), `semantic` (Jev only, an error where it is off), `keyword` (ranked words), `regex` (RE2, at most 200 characters, case-insensitive unless `(?-i)`). The answer's `ranked_by` and `fallback` say which ran and why; each result's `run` is `now`, `needs_approval` or `blocked`. In JavaScript `tools.search` returns only the results; `tools.call("toolyard.tools_search", {...})` returns the whole answer. |
 | `detail` | `name`, `summary`, `full` (adds input and output schemas). Default `full` for a direct MCP call, `summary` inside a script and over REST. |
 | `limit` | 50 by default, 200 at most. |
 | `upstream` | Only one server's tools. |
 
 A regex search stops after 250 ms; one agent runs at most 2 at once, and a
-third waits up to 2 seconds, then is refused. A too-complex pattern is
+third waits up to 2 seconds, then is refused. A search that would ask Jev takes
+one of the same 2 slots but never waits: with both taken it ranks by keyword
+and says `fallback: "busy"`. A too-complex pattern is
 refused before it runs: simplify it, or use `keyword`.
 
 ## Retention

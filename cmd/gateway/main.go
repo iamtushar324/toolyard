@@ -85,6 +85,7 @@ import (
 	"github.com/tusharbhardwaj/toolyard/internal/settings"
 	"github.com/tusharbhardwaj/toolyard/internal/skillhub"
 	"github.com/tusharbhardwaj/toolyard/internal/store"
+	"github.com/tusharbhardwaj/toolyard/internal/toolsearch"
 	"github.com/tusharbhardwaj/toolyard/internal/upstreams"
 	usagepkg "github.com/tusharbhardwaj/toolyard/internal/usage"
 	"github.com/tusharbhardwaj/toolyard/internal/visibility"
@@ -362,6 +363,8 @@ func runServe(argv []string) error {
 	// TEC-1630 high availability
 	instanceID := fs.String("instance-id", "", "name of this replica in work leases and logs when several replicas share one Postgres database (e.g. the pod name). Every process adds a random suffix of its own: <name>-<8 hex digits>. Empty = the host name.")
 	clusterFlag := fs.String("cluster", string(clusterAuto), "replicas on one database: auto (on for Postgres, off for SQLite) | on (several replicas may share this Postgres database: leader leases, cross-replica messages and locks; refused on SQLite) | off (one gateway per database, also on Postgres: no LISTEN, no periodic recovery, rate limits in process)")
+	// TEC-1807 tools.search ranking
+	toolSearch := registerToolSearchFlags(fs)
 	_ = fs.Parse(argv)
 
 	// TEC-1638: every flag not given on the command line may come from
@@ -383,6 +386,10 @@ func runServe(argv []string) error {
 		return err
 	}
 	if err := checkConnectTimeout(*dbConnectTimeout); err != nil {
+		return err
+	}
+	toolSearchRanked, err := toolSearch.check()
+	if err != nil {
 		return err
 	}
 	// A TOOLYARD_ variable that sets no flag and that nothing reads is most
@@ -1111,6 +1118,17 @@ func runServe(argv []string) error {
 	// agents or API responses.
 	// secretsCipher (secrets.key) is built above, with the callbacks.
 	secretsSvc := secrets.New(db, secretsCipher, auditSvc)
+	// tools.search ranks by meaning (Jev) when -tool-search-ranker says so;
+	// its API key is a secret, read at search time, so the owner can set
+	// it on the dashboard without a restart.
+	if toolSearchRanked {
+		gw.SetToolSearch(toolSearch.engine(secretsSvc.Resolve))
+		rootLog.Info("tool search ranker on: tools.search ranks by meaning, with keyword fallback",
+			"ranker", toolSearchRankerDecisions, "model", strings.TrimSpace(*toolSearch.model),
+			"key_secret", strings.TrimSpace(*toolSearch.keySecret), "timeout", toolSearch.timeout.String(), "zdr", *toolSearch.zdr)
+	} else {
+		rootLog.Info("tool search ranker off: tools.search ranks by keyword")
+	}
 	leaderLoop(ctx, clusterSvc, inbox.SweeperLoop, time.Minute, func(ctx context.Context) { inboxSvc.RunSweeper(ctx, time.Minute) })
 	leaderLoop(ctx, clusterSvc, loopInboxAttention, time.Minute, func(ctx context.Context) { inboxSvc.RunAttention(ctx, 15*time.Second) })
 	// Every replica delivers callbacks: each delivery is claimed with a
@@ -2479,6 +2497,82 @@ func (a notesAdapter) Publish(ctx context.Context, agentID, path, content, topic
 	return a.s.Publish(ctx, agentID, path, content, topic)
 }
 func (a notesAdapter) NotesDir() string { return a.s.NotesDir() }
+
+// The tools.search ranker (TEC-1807). -tool-search-ranker turns on ranking
+// by meaning: Jev, a classification model, through the OpenRouter
+// Decisions API (toolsearch.DecisionsRanker), with keyword ranking as the
+// fallback. The API key is not a flag: it is a secret in the secrets store
+// (-tool-search-key-secret names it), read at search time.
+const (
+	toolSearchRankerOff        = "off"
+	toolSearchRankerDecisions  = "openrouter-decisions"
+	defaultToolSearchKeySecret = "OPENROUTER_TOOLSEARCH_KEY"
+	// toolSearchKeyTTL is how long a read key (or its absence) is reused:
+	// one secret read, and audit row, per minute rather than per search.
+	toolSearchKeyTTL = time.Minute
+)
+
+// toolSearchFlags are serve's -tool-search-* flags.
+type toolSearchFlags struct {
+	ranker, model, keySecret *string
+	timeout                  *time.Duration
+	zdr                      *bool
+}
+
+// registerToolSearchFlags defines the -tool-search-* flags on fs.
+func registerToolSearchFlags(fs *flag.FlagSet) *toolSearchFlags {
+	return &toolSearchFlags{
+		ranker: fs.String("tool-search-ranker", toolSearchRankerOff, "how tools.search ranks by meaning: off (keyword ranking only) | "+toolSearchRankerDecisions+
+			" (Jev through the OpenRouter Decisions API, with keyword ranking as the fallback; the task text and the names, servers, short descriptions and parameter names of up to 60 candidate tools go to OpenRouter)"),
+		model:     fs.String("tool-search-model", toolsearch.DefaultDecisionsModel, "the model -tool-search-ranker "+toolSearchRankerDecisions+" asks"),
+		keySecret: fs.String("tool-search-key-secret", defaultToolSearchKeySecret, "the secret (Settings → Secrets) that holds the OpenRouter API key; without it searches fall back to keyword ranking (fallback no_key). Read at search time and reused for a minute, so setting it needs no restart."),
+		timeout:   fs.Duration("tool-search-timeout", toolsearch.DefaultDecisionsTimeout, "one search's whole budget for the ranker (both of its requests); past it the search falls back to keyword ranking"),
+		zdr:       fs.Bool("tool-search-zdr", false, "ask OpenRouter to route the ranker's requests only to providers that keep no data (zero data retention)"),
+	}
+}
+
+// check validates the flags and reports whether the ranker is on. A bad
+// value is a configuration error (exit 78) naming the flag.
+func (f *toolSearchFlags) check() (bool, error) {
+	switch strings.ToLower(strings.TrimSpace(*f.ranker)) {
+	case toolSearchRankerOff:
+		return false, nil
+	case toolSearchRankerDecisions:
+	default:
+		return false, configErrorf("-tool-search-ranker must be %q or %q, not %q", toolSearchRankerOff, toolSearchRankerDecisions, *f.ranker)
+	}
+	if strings.TrimSpace(*f.model) == "" {
+		return false, configErrorf("-tool-search-model must not be empty")
+	}
+	if !secrets.ValidName(strings.TrimSpace(*f.keySecret)) {
+		return false, configErrorf("-tool-search-key-secret %q is not a secret name: upper-case letters, digits and _, starting with a letter", *f.keySecret)
+	}
+	if *f.timeout <= 0 {
+		return false, configErrorf("-tool-search-timeout must be above 0")
+	}
+	return true, nil
+}
+
+// engine is the tools.search engine the flags ask for. resolve reads a
+// secret (secrets.Service.Resolve); a secret that is missing or waiting for
+// its value is no key, and the search falls back to keyword ranking.
+func (f *toolSearchFlags) engine(resolve func(context.Context, string) (string, error)) *toolsearch.Engine {
+	name := strings.TrimSpace(*f.keySecret)
+	key := toolsearch.CachedKey(func(ctx context.Context) (string, error) {
+		v, err := resolve(ctx, name)
+		if errors.Is(err, secrets.ErrNotFound) || errors.Is(err, secrets.ErrPending) {
+			return "", nil
+		}
+		return v, err
+	}, toolSearchKeyTTL)
+	return toolsearch.New(toolsearch.Options{Semantic: toolsearch.NewDecisionsRanker(toolsearch.DecisionsOptions{
+		Model:   strings.TrimSpace(*f.model),
+		Key:     key,
+		Timeout: *f.timeout,
+		ZDR:     *f.zdr,
+		Observe: opsmetrics.ObserveToolSearchRanker,
+	})})
+}
 
 // silence unused-import warnings in case build tags drop something.
 var _ = net.Listen

@@ -11,12 +11,23 @@ permission decision. New requests issue grants; the agent executes the calls.
 
 ## Prepare one concrete batch
 
-1. Use `inbox.check({ calls })` to identify restricted tools.
-2. Give every proposed call a stable, unique `call_id`. The ID identifies the
+`inbox.request` is the one way to get permission, and `inbox.status` reads the
+decision; both are among the five tools you see by default. Other inbox tools
+named here run in `executeToolCode` as `toolyard.inbox_<name>`.
+
+1. Find the restricted calls: `tools.search` gives each tool's `run`
+   (`now`, `needs_approval` or `blocked`), and a call that answered
+   `permission_required` needs approval too. In a script, `tools.tryCall` or
+   `try_call` returns that status instead of stopping, so collect every one.
+   `inbox.check({ calls })` is optional; it answers for concrete arguments.
+2. Put every restricted call of this round, and every question you have for
+   your owner (`questions[]` with `schema_version: 3`), into ONE request. Ask
+   again only for what the answers open, never one call at a time.
+3. Give every proposed call a stable, unique `call_id`. The ID identifies the
    call, not the tool. The same tool can appear repeatedly with different params.
-3. Mark `required` only as a planning hint. The owner can reject that call or
+4. Mark `required` only as a planning hint. The owner can reject that call or
    reject the entire batch and still complete the decision.
-4. If callbacks are available, create or obtain an authorized receiver. In T3,
+5. If callbacks are available, create or obtain an authorized receiver. In T3,
    use its actual session webhook capability and keep the signing secret out of
    prompts. Pass the opaque destination reference as `callback_ref`.
 
@@ -69,6 +80,9 @@ is 30 minutes. These are different deadlines.
 - A callback is an announcement, not permission. Read `inbox.status` for current
   verdicts, reasons, `owner_note`, granted scope, expiry, and execution state.
 - Execute accepted calls with `_grant: "tyg_…"` and the exact approved scope.
+  In `executeToolCode` the grant is one more argument of the call:
+  `server.tool(param="value", _grant="tyg_…")` in Starlark,
+  `await tools.server.tool({ param: "value", _grant: "tyg_…" })` in JavaScript.
   If `narrowed` is true, use the returned `params`.
 - A grant is single-use and bound to the user, agent, call, scope and expiry.
   Rejected calls have no grant. Do not execute them.

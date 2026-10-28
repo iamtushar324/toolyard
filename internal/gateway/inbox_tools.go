@@ -143,7 +143,7 @@ func (g *Gateway) coach(ctx context.Context, entry toolEntry, args map[string]an
 
 	msg := fmt.Sprintf("%s is restricted. Nothing ran and nothing was sent to your owner. "+
 		"Ask with inbox.request, starting from the draft below: fill in the message, the voice-note script and the evidence, "+
-		"and add every other restricted tool your task needs so your owner decides once.", entry.tool.Name)
+		"and add every other restricted call and every question of this round so your owner decides once.", entry.tool.Name)
 	body := map[string]any{
 		"status":                 "permission_required",
 		"executed":               false,
@@ -528,7 +528,7 @@ func (g *Gateway) inboxTools() []toolEntry {
 				return mcp.NewToolResultText(text), nil
 			}),
 		inboxEntry("inbox.check", inboxUpstream,
-			"Before a task: for each call you plan, is it open (call it now), granted (a live grant covers it), restricted (put it in your inbox.request), denied, or unknown?",
+			"Optional: tools.search already says whether each tool runs now, needs approval or is blocked. For each call you plan, is it open (call it now), granted (a live grant covers it), restricted (put it in your inbox.request), denied, or unknown?",
 			obj([]string{"calls"}, map[string]any{"calls": map[string]any{
 				"type": "array", "minItems": 1, "maxItems": 50,
 				"items": map[string]any{"type": "object", "required": []string{"tool"}, "properties": map[string]any{
@@ -553,7 +553,9 @@ func (g *Gateway) inboxTools() []toolEntry {
 				return inboxJSON(map[string]any{"calls": res}), nil
 			}),
 		inboxEntry("inbox.request", inboxUpstream,
-			"Ask your owner for permission to use restricted tools: one request per task, with every tool it needs (up to 12 calls; 50 with schema_version 3), and with schema_version 3 any questions[] the task also needs answered. "+
+			"Ask your owner for permission: inbox.request is the one way an agent gets permission for restricted tools. "+
+				"Batch the round into ONE request: every restricted call it needs (up to 12 calls; 50 with schema_version 3) and every question you have for your owner (questions[], schema_version 3). "+
+				"Send another request only for what the answers open, never one per call. "+
 				"Write it as yourself: a first-person message, facts (why_now, if_it_goes_wrong, undo), a ≤75-word voice-note script, and evidence attachments. "+
 				"Supply task.objective and run it with dry_run: true first. Include an authorized callback_ref, then continue unrelated work or end the turn. "+
 				"After a callback, read inbox.status for authoritative decisions and valid grants before execution. inbox.wait is optional. Read inbox.guide for the format.",
@@ -570,8 +572,10 @@ func (g *Gateway) inboxTools() []toolEntry {
 			obj([]string{"title", "summary", "message"}, postProps),
 			submit(inbox.KindUpdate)),
 		inboxEntry("inbox.status", inboxUpstream,
-			"Read authoritative decisions without blocking. Status reads never consume grants. Accepted calls include their same still-valid unused grant token. "+
-				"Recover that token after a lost response and pass it as _grant for the approved call. Expired, revoked, or consumed grants cannot be recovered.",
+			"Read authoritative decisions on your inbox.request items without blocking: each call's verdict and reason, the owner's note, the answers to your questions, execution state and grants. "+
+				"Status reads never consume grants. Accepted calls include their same still-valid unused grant token: pass it as _grant on the approved call with exactly the approved parameters (in executeToolCode, as one more argument of that call). "+
+				"Recover that token after a lost response and pass it as _grant for the approved call. Expired, revoked, or consumed grants cannot be recovered. "+
+				"If the answers open more restricted work, ask for all of it in one new inbox.request.",
 			obj([]string{"ids"}, map[string]any{"ids": idsProp}),
 			func(ctx context.Context, args map[string]any) (*mcp.CallToolResult, error) {
 				agentID, errRes := requireAgentID(ctx)

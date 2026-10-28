@@ -15,6 +15,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 	"testing"
 	"time"
@@ -92,6 +93,13 @@ func mustLogin(t *testing.T, h *httpClient) {
 }
 
 func enrollAgent(t *testing.T, h *httpClient, name string) string {
+	tok, _ := enrollAgentWithID(t, h, name)
+	return tok
+}
+
+// enrollAgentWithID is enrollAgent that also returns the agent's id
+// (ag_…), which the agent-scope routes take.
+func enrollAgentWithID(t *testing.T, h *httpClient, name string) (token, agentID string) {
 	var enr map[string]any
 	h.raw(t, "POST", "/v1/agents/enroll", map[string]string{"Name": name}, &enr)
 	code, _ := enr["enrollment_code"].(string)
@@ -104,7 +112,36 @@ func enrollAgent(t *testing.T, h *httpClient, name string) string {
 	if tok == "" {
 		t.Fatal("no token")
 	}
-	return tok
+	id, _ := xch["agent_id"].(string)
+	if id == "" {
+		t.Fatal("no agent_id")
+	}
+	return tok, id
+}
+
+// useFullToolList switches one agent to the full tool list. By default an
+// agent's tools/list shows only the five tools of gateway.SmallToolList;
+// a test that counts or names listed tools needs every tool listed. It
+// reads the agent's scope first and sends it back with tool_list "full",
+// because a POST replaces the whole scope.
+func useFullToolList(t *testing.T, h *httpClient, agentID string) {
+	t.Helper()
+	var cur struct {
+		Scope map[string]any `json:"scope"`
+	}
+	h.raw(t, "GET", "/v1/me/agent-scopes?agent_id="+url.QueryEscape(agentID), nil, &cur)
+	scope := cur.Scope
+	if scope == nil {
+		scope = map[string]any{}
+	}
+	scope["tool_list"] = "full"
+	var out struct {
+		Scope map[string]any `json:"scope"`
+	}
+	h.raw(t, "POST", "/v1/me/agent-scopes", map[string]any{"agent_id": agentID, "scope": scope}, &out)
+	if out.Scope["tool_list"] != "full" {
+		t.Fatalf("agent %s: tool_list = %v after switching it to the full list", agentID, out.Scope["tool_list"])
+	}
 }
 
 func mcpClient(t *testing.T, base, token string) *client.Client {
@@ -575,7 +612,10 @@ func TestE2ERouterOnlyMode(t *testing.T) {
 	flag.Parse()
 	h := &httpClient{base: *toolyardURL}
 	mustLogin(t, h)
-	token := enrollAgent(t, h, "router-only-test")
+	token, agentID := enrollAgentWithID(t, h, "router-only-test")
+	// This test counts the listed tools and the visibility modes shorten
+	// the full list, so the agent lists every tool it may use.
+	useFullToolList(t, h, agentID)
 
 	// First, baseline: with router_only_mode off, the agent should see >2
 	// tools.
@@ -735,7 +775,10 @@ func TestE2EUsageAndTopN(t *testing.T) {
 
 	// The pinned set, from a full-mode listing (it grows as features add
 	// always-visible tools).
-	fullTok := enrollAgent(t, h, "topn-full")
+	// Both agents here list every tool they may use: the visibility modes
+	// under test shorten the full tool list, not the five-tool default.
+	fullTok, fullID := enrollAgentWithID(t, h, "topn-full")
+	useFullToolList(t, h, fullID)
 	cf := mcpClient(t, *toolyardURL, fullTok)
 	fctx, fcancel := context.WithTimeout(context.Background(), 20*time.Second)
 	fullList, err := cf.ListTools(fctx, mcp.ListToolsRequest{})
@@ -753,7 +796,8 @@ func TestE2EUsageAndTopN(t *testing.T) {
 	}, &s)
 
 	// New agent → cold start → sees pinned + overall top-2.
-	token := enrollAgent(t, h, "topn-cold")
+	token, coldID := enrollAgentWithID(t, h, "topn-cold")
+	useFullToolList(t, h, coldID)
 	c := mcpClient(t, *toolyardURL, token)
 	defer c.Close()
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)

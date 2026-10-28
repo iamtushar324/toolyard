@@ -14,11 +14,25 @@ How agents are taught this, and why it's layered, is in
 
 ## The short version
 
+By default your tool list shows five tools: `tools.search` (find a tool),
+`getToolDocs` (read its parameters), `executeToolCode` (run it),
+`inbox.request` (ask for permission) and `inbox.status` (read the
+decision). Every other tool you may use still works. The other toolyard
+tools named here (`inbox.guide`, `inbox.upload`, `inbox.wait`, `inbox.ask`,
+`inbox.post`, `inbox.cancel`, `inbox.check`, `session.start`, …) run inside
+`executeToolCode` as `toolyard.<group>_<name>`, for example
+`toolyard.inbox_guide(topic="requests")`.
+
 1. Some tools are **restricted**. Calling one without permission does
    nothing and returns `permission_required` with a draft request. Nothing
    reaches your owner until you send a proper request.
-2. Before a task, run `inbox.check` on the calls you plan to make. Put
-   **every** restricted tool the task needs into **one** `inbox.request`.
+2. `inbox.request` is the one way to get permission. `tools.search` says for
+   each tool whether a call runs now, needs approval or is blocked (`run`:
+   `now`, `needs_approval`, `blocked`). Plan the round, then put **every**
+   restricted call it needs, and every question you have for your owner,
+   into **one** `inbox.request` (`tools[]`, and `questions[]` with
+   `schema_version: 3`, §14). Ask again only for what the answers open,
+   never one call at a time. `inbox.check` is optional (§1).
 3. Write the request as yourself, in the first person: a message, a voice-note
    script, and the evidence. Your owner reads it on a phone and often listens
    first.
@@ -28,7 +42,8 @@ How agents are taught this, and why it's layered, is in
    Pass `callback_ref`, continue independent work, and retrieve authoritative `inbox.status` after the callback.
    `inbox.wait` remains optional.
 6. For each allowed tool you get a **grant**. Call the tool with
-   `_grant: "tyg_…"`, exactly within its parameters.
+   `_grant: "tyg_…"`, exactly within its parameters. In `executeToolCode`
+   the grant is one more argument of the call (§9).
 7. When you're done, `inbox.post` an update, also in the first person.
 8. A denial is an answer. Ask again only with new information.
 9. When a call answers that a server isn't connected (your owner has to
@@ -42,7 +57,17 @@ How agents are taught this, and why it's layered, is in
 
 ## 1. Which tools are restricted
 
-You can't tell from the name. Ask:
+You can't tell from the name. `tools.search` tells you: each result's `run`
+is `now` (call it), `needs_approval` (put it in your request) or `blocked`
+(denied by policy: don't ask). That is the answer for a call with no
+arguments. Arguments can escalate a call, so a call that search says runs
+`now` may still answer `permission_required`. In a script, call tools that
+may be restricted with `tools.tryCall` (JavaScript) or `try_call`
+(Starlark): they return `permission_required` instead of stopping the
+script, so you can collect every such call into your one request.
+
+`inbox.check` is optional. It answers for concrete calls, with their
+arguments:
 
 ```json
 inbox.check({ "calls": [
@@ -93,8 +118,8 @@ You get this back (`isError: true`, because nothing ran):
 }
 ```
 
-Don't retry the call. Fill in the draft, add any other tools the task needs,
-and send it.
+Don't retry the call. Fill in the draft, add every other restricted call
+and every question of this round, and send it as one request.
 
 ## 3. The request
 
@@ -397,7 +422,13 @@ had questions (§14), `answers` holds your owner's answers keyed by question ID.
 - Status reads do not consume grants. The authorized agent can recover the same still-valid unused token after a lost response.
   Recovery adds no use and never extends or replaces permission. Keep tokens out of logs, commits, and callbacks.
 - Call the tool with `_grant` added to its arguments. Stay inside the
-  parameters you asked for, or the call is blocked.
+  parameters you asked for, or the call is blocked. In `executeToolCode`
+  the grant is one more argument of the call: Starlark
+  `server.tool(param="value", _grant="tyg_…")`, JavaScript
+  `await tools.server.tool({ param: "value", _grant: "tyg_…" })`. A REST run
+  (§13) never holds a token in its script: resume it with the `request_id`.
+- If the answers open more restricted work, ask for all of it in one new
+  `inbox.request`.
 - Your owner can **narrow** a tool before allowing it: fewer values, an
   exact value instead of a `limit`, a tighter range, or a shorter
   `grants_expire_at`. They can never widen it. A narrowed tool has
@@ -455,6 +486,8 @@ Withdraw requests you no longer need with `inbox.cancel`.
 - Never get around a restricted tool: no other credentials, no direct API
   calls, no asking another agent to do it.
 - Never split one risky action into small requests to avoid a flag.
+- Never ask one call at a time: every restricted call and every question of
+  a round goes into one request.
 - Never tune your wording across dry runs to hide what a call does.
 - Never claim urgency you don't have.
 - Never ask your owner for a password, token or one-time code to get past a
@@ -821,7 +854,8 @@ With `"schema_version": 3` one Inbox item can unblock a whole session: up to
 Your owner answers everything in **one** decision; drafts and partial answers
 are never sent to you.
 
-- `inbox.request` with `questions`: tool approvals and questions together.
+- `inbox.request` with `questions`: tool approvals and questions together,
+  the usual shape of a round (one request for everything the round needs).
 - `inbox.ask` with `questions`: questions only. `title`, `summary` and
   `message` may be left out when there is exactly one question; its prompt
   stands in.

@@ -3,20 +3,25 @@
 // code-mode scripts (tools.search in JavaScript, toolyard.tools_search in
 // Starlark), so every surface ranks the same way:
 //
-//   - keyword (the default): BM25F over the tool name (split at dots,
-//     underscores, dashes and camelCase), its description, its parameter
-//     names and its parameter descriptions, each field with its own weight;
+//   - auto (the default): semantic when the engine has a SemanticProvider,
+//     else keyword;
+//   - semantic: delegated to the SemanticProvider (DecisionsRanker asks
+//     Jev, a classification model, through the OpenRouter Decisions API),
+//     refused with ErrSemanticOff where none is configured. When the
+//     provider fails, times out or has no key, the search falls back to
+//     keyword and says why (Result.Fallback);
+//   - keyword: BM25F over the tool name (split at dots, underscores, dashes
+//     and camelCase), its description, its parameter names and its
+//     parameter descriptions, each field with its own weight;
 //   - regex: an RE2 pattern of at most 200 characters, case-insensitive
-//     unless the pattern says otherwise, over the same fields;
-//   - semantic: delegated to a SemanticProvider when one is configured,
-//     else refused with ErrSemanticOff (no provider ships today);
-//   - auto: keyword.
+//     unless the pattern says otherwise, over the same fields.
 //
 // The engine never decides what a caller may see: the caller passes the
 // tools it may use (Gateway.CatalogFor's scope), and the engine ranks those.
-// Keyword indexes are cached by a hash of the tools they were built from,
-// so a changed catalog builds a new index and other nodes need no
-// invalidation message (the cache is content-addressed).
+// Keyword indexes and a provider's scores are cached by a hash of the tools
+// they were built from, so a changed catalog builds a new index (and asks
+// the provider again) and other nodes need no invalidation message (the
+// caches are content-addressed).
 package toolsearch
 
 import (
@@ -27,6 +32,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"net"
 	"sort"
 	"strings"
 	"sync"
@@ -64,11 +70,11 @@ const (
 	ModeAuto     Mode = "auto"
 )
 
-// ParseMode reads a mode name; "" is keyword.
+// ParseMode reads a mode name; "" is auto.
 func ParseMode(s string) (Mode, error) {
 	switch m := Mode(strings.ToLower(strings.TrimSpace(s))); m {
 	case "":
-		return ModeKeyword, nil
+		return ModeAuto, nil
 	case ModeKeyword, ModeRegex, ModeSemantic, ModeAuto:
 		return m, nil
 	}
@@ -120,11 +126,62 @@ const (
 	// works), then is refused.
 	MaxSearchesPerCaller = 2
 	searchWait           = 2 * time.Second
+	// rankCacheSize and rankCacheTTL bound the cache of a provider's
+	// scores: one entry per query and catalog, kept 10 minutes.
+	rankCacheSize = 1024
+	rankCacheTTL  = 10 * time.Minute
+)
+
+// RankedBy values: what ordered a result.
+const (
+	// RankedJev is the semantic provider's ranking (Jev).
+	RankedJev = "jev"
+	// RankedKeyword is BM25F.
+	RankedKeyword = "keyword"
+	// RankedRegex is a regex search.
+	RankedRegex = "regex"
+	// RankedName is an empty query's list, sorted by name.
+	RankedName = "name"
+)
+
+// Fallback values: why an auto or semantic search ranked by keyword.
+const (
+	// FallbackOff: no semantic provider is configured (mode auto).
+	FallbackOff = "off"
+	// FallbackNoKey: the provider has no API key.
+	FallbackNoKey = "no_key"
+	// FallbackTimeout: the provider did not answer within its budget.
+	FallbackTimeout = "timeout"
+	// FallbackError: the provider failed or answered something invalid.
+	FallbackError = "error"
+	// FallbackEmpty: the caller has no tools to rank.
+	FallbackEmpty = "empty"
+	// FallbackBusy: the caller already runs MaxSearchesPerCaller searches;
+	// a search that would pay the provider does not queue behind them.
+	FallbackBusy = "busy"
 )
 
 // ErrSemanticOff answers a semantic search on a server without a
 // SemanticProvider.
 var ErrSemanticOff = errors.New("semantic search is not configured on this server: use mode \"keyword\" (ranked words) or \"regex\" (a pattern)")
+
+// fallbackReason is the Fallback value for a provider's error.
+func fallbackReason(err error) string {
+	var re *rankError
+	switch {
+	case errors.Is(err, ErrNoKey):
+		return FallbackNoKey
+	case errors.Is(err, context.DeadlineExceeded):
+		return FallbackTimeout
+	case errors.As(err, &re) && re.outcome == FallbackTimeout:
+		return FallbackTimeout
+	}
+	var ne net.Error
+	if errors.As(err, &ne) && ne.Timeout() {
+		return FallbackTimeout
+	}
+	return FallbackError
+}
 
 // QueryError is a query the engine refuses (a bad pattern, a bad limit).
 type QueryError struct{ Message string }
@@ -155,23 +212,42 @@ type Hit struct {
 
 // Result is what a search found.
 type Result struct {
-	// Mode is the mode that ran (auto runs keyword).
+	// Mode is the mode that ran: semantic when the provider ranked, keyword
+	// for auto without one and for a fallback.
 	Mode Mode
+	// RankedBy says what ordered the hits: RankedJev, RankedKeyword,
+	// RankedRegex or RankedName.
+	RankedBy string
+	// Fallback says why an auto or semantic search ranked by keyword
+	// (FallbackOff, FallbackNoKey, FallbackTimeout, FallbackError,
+	// FallbackEmpty); "" when it did not fall back.
+	Fallback string
 	// Matched counts the tools that matched, before the limit.
 	Matched int
 	Hits    []Hit
 }
 
 // SemanticProvider ranks tools by meaning. A server that wants semantic
-// search plugs one in (an embeddings model, say); the engine hands it the
-// caller's tools and the query and returns its ranking as it is.
+// search plugs one in (DecisionsRanker, an embeddings model); the engine
+// hands it the caller's tools and the query and returns its ranking as it
+// is, or the keyword ranking when it fails.
 type SemanticProvider interface {
 	Rank(ctx context.Context, tools []Tool, query string) ([]Hit, error)
 }
 
+// scorer is a SemanticProvider that judges the engine's keyword ranking
+// rather than ranking alone (DecisionsRanker): it returns a score for each
+// tool it judged, by name, and the engine orders, caches and falls back.
+// complete is false when the scores are good for this search but should
+// not be cached (a second round was skipped or failed).
+type scorer interface {
+	score(ctx context.Context, tools []Tool, query string, keyword []Hit) (scores map[string]float64, complete bool, err error)
+}
+
 // Options configure an Engine.
 type Options struct {
-	// Semantic serves mode semantic; nil refuses it with ErrSemanticOff.
+	// Semantic serves modes semantic and auto; nil refuses semantic with
+	// ErrSemanticOff and makes auto keyword.
 	Semantic SemanticProvider
 }
 
@@ -182,11 +258,31 @@ type Engine struct {
 	mu      sync.Mutex
 	indexes map[string]*index
 	order   []string // index keys, oldest first
+	// ranks caches a scorer's answers by rankKey; rankOrder is their keys,
+	// oldest first (an entry stored again leaves a stale reference, which
+	// seq tells apart).
+	ranks     map[string]rankEntry
+	rankOrder []rankRef
+	rankSeq   uint64
+	// now is the clock of the rank cache (tests).
+	now func() time.Time
 	// running holds each caller's search slots while it has searches
 	// running or waiting.
 	running map[string]*callerSlots
 	// wait is how long a search past the per-caller cap waits (tests).
 	wait time.Duration
+}
+
+// rankEntry is one cached answer of a scorer.
+type rankEntry struct {
+	scores map[string]float64
+	at     time.Time
+	seq    uint64
+}
+
+type rankRef struct {
+	key string
+	seq uint64
 }
 
 // callerSlots are one caller's search slots and how many searches use or
@@ -198,7 +294,8 @@ type callerSlots struct {
 
 // New returns an Engine.
 func New(opts Options) *Engine {
-	return &Engine{semantic: opts.Semantic, indexes: map[string]*index{}, running: map[string]*callerSlots{}, wait: searchWait}
+	return &Engine{semantic: opts.Semantic, indexes: map[string]*index{}, ranks: map[string]rankEntry{},
+		now: time.Now, running: map[string]*callerSlots{}, wait: searchWait}
 }
 
 // SemanticEnabled reports whether mode semantic can run.
@@ -208,7 +305,7 @@ func (e *Engine) SemanticEnabled() bool { return e != nil && e.semantic != nil }
 func (e *Engine) Search(ctx context.Context, tools []Tool, q Query) (*Result, error) {
 	mode := q.Mode
 	if mode == "" {
-		mode = ModeKeyword
+		mode = ModeAuto
 	}
 	limit := q.Limit
 	switch {
@@ -236,12 +333,17 @@ func (e *Engine) Search(ctx context.Context, tools []Tool, q Query) (*Result, er
 	}
 	var hits []Hit
 	var err error
+	rankedBy, fallback := RankedKeyword, ""
 	switch {
 	case mode == ModeSemantic && e.semantic == nil:
 		return nil, ErrSemanticOff
 	case text == "":
-		hits = byName(tools)
+		hits, rankedBy = byName(tools), RankedName
+		if mode == ModeAuto {
+			mode = ModeKeyword
+		}
 	case mode == ModeRegex:
+		rankedBy = RankedRegex
 		if q.Caller != "" {
 			// Only a regex search scans the catalog's text; cap how many one
 			// caller runs at once.
@@ -252,22 +354,137 @@ func (e *Engine) Search(ctx context.Context, tools []Tool, q Query) (*Result, er
 			defer release()
 		}
 		hits, err = regexSearch(ctx, tools, q.Text)
-	case mode == ModeSemantic:
-		hits, err = e.semantic.Rank(ctx, tools, text)
-	default: // keyword, auto
-		if mode == ModeAuto {
+	case mode == ModeKeyword:
+		hits = e.index(tools).search(text)
+	case e.semantic == nil: // auto without a provider
+		mode, fallback = ModeKeyword, FallbackOff
+		hits = e.index(tools).search(text)
+	default: // auto or semantic, with a provider
+		if release, ok := e.tryEnter(q.Caller); ok {
+			hits, fallback = e.rank(ctx, tools, text)
+			release()
+		} else {
+			hits, fallback = e.index(tools).search(text), FallbackBusy
+		}
+		if fallback == "" {
+			mode, rankedBy = ModeSemantic, RankedJev
+		} else {
 			mode = ModeKeyword
 		}
-		hits = e.index(tools).search(text)
 	}
 	if err != nil {
 		return nil, err
 	}
-	res := &Result{Mode: mode, Matched: len(hits), Hits: hits}
+	res := &Result{Mode: mode, RankedBy: rankedBy, Fallback: fallback, Matched: len(hits), Hits: hits}
 	if len(res.Hits) > limit {
 		res.Hits = res.Hits[:limit]
 	}
 	return res, nil
+}
+
+// rank is a semantic search: the provider's ranking, or, when it fails,
+// times out, has no key or has nothing to rank, the keyword ranking and
+// why (a Fallback value). A scorer's answers are cached by query and
+// catalog for rankCacheTTL.
+func (e *Engine) rank(ctx context.Context, tools []Tool, text string) ([]Hit, string) {
+	catalog := catalogKey(tools)
+	keyword := e.indexFor(catalog, tools).search(text)
+	if len(tools) == 0 {
+		return keyword, FallbackEmpty
+	}
+	s, ok := e.semantic.(scorer)
+	if !ok {
+		hits, err := e.semantic.Rank(ctx, tools, text)
+		if err != nil {
+			return keyword, fallbackReason(err)
+		}
+		return hits, ""
+	}
+	key := rankKey(text, catalog)
+	if scores, ok := e.cachedScores(key); ok {
+		return merge(tools, scores, keyword), ""
+	}
+	scores, complete, err := s.score(ctx, tools, text, keyword)
+	if err != nil {
+		return keyword, fallbackReason(err)
+	}
+	if complete {
+		e.storeScores(key, scores)
+	}
+	return merge(tools, scores, keyword), ""
+}
+
+// rankKey is the rank cache key of a query over a catalog (catalogKey).
+func rankKey(text, catalog string) string {
+	h := sha256.New()
+	fmt.Fprintf(h, "%d:%s\x00%s", len(text), text, catalog)
+	return hex.EncodeToString(h.Sum(nil))
+}
+
+// cachedScores returns the scores cached under key, unless they are older
+// than rankCacheTTL.
+func (e *Engine) cachedScores(key string) (map[string]float64, bool) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	ent, ok := e.ranks[key]
+	if !ok {
+		return nil, false
+	}
+	if age := e.now().Sub(ent.at); age < 0 || age >= rankCacheTTL {
+		delete(e.ranks, key)
+		return nil, false
+	}
+	return ent.scores, true
+}
+
+// storeScores caches scores under key, dropping the oldest entries past
+// rankCacheSize.
+func (e *Engine) storeScores(key string, scores map[string]float64) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.rankSeq++
+	e.ranks[key] = rankEntry{scores: scores, at: e.now(), seq: e.rankSeq}
+	e.rankOrder = append(e.rankOrder, rankRef{key: key, seq: e.rankSeq})
+	for len(e.rankOrder) > rankCacheSize {
+		old := e.rankOrder[0]
+		e.rankOrder = e.rankOrder[1:]
+		if ent, ok := e.ranks[old.key]; ok && ent.seq == old.seq {
+			delete(e.ranks, old.key)
+		}
+	}
+}
+
+// merge orders the tools a scorer judged by their scores (ties by keyword
+// score, then name), then every other keyword match in keyword order and
+// without a score: the result still holds every keyword match, and a score
+// is always the scorer's.
+func merge(tools []Tool, scores map[string]float64, keyword []Hit) []Hit {
+	kw := make(map[string]float64, len(keyword))
+	for _, h := range keyword {
+		kw[h.Tool.Name] = h.Score
+	}
+	out := make([]Hit, 0, len(scores)+len(keyword))
+	for _, t := range tools {
+		if p, ok := scores[t.Name]; ok {
+			out = append(out, Hit{Tool: t, Score: p})
+		}
+	}
+	sort.Slice(out, func(i, j int) bool {
+		a, b := out[i], out[j]
+		if a.Score != b.Score {
+			return a.Score > b.Score
+		}
+		if kw[a.Tool.Name] != kw[b.Tool.Name] {
+			return kw[a.Tool.Name] > kw[b.Tool.Name]
+		}
+		return a.Tool.Name < b.Tool.Name
+	})
+	for _, h := range keyword {
+		if _, ok := scores[h.Tool.Name]; !ok {
+			out = append(out, Hit{Tool: h.Tool})
+		}
+	}
+	return out
 }
 
 // enter takes one of caller's search slots, waiting up to e.wait when the
@@ -309,6 +526,39 @@ func (e *Engine) enter(ctx context.Context, caller string) (func(), error) {
 	}
 }
 
+// tryEnter takes one of caller's search slots without waiting: a search
+// that would pay the semantic provider ranks by keyword instead of queueing
+// behind the caller's others, so one script cannot start many paid searches
+// at once. ok is false when every slot is taken; an empty caller always
+// gets in.
+func (e *Engine) tryEnter(caller string) (func(), bool) {
+	if caller == "" {
+		return func() {}, true
+	}
+	e.mu.Lock()
+	cs := e.running[caller]
+	if cs == nil {
+		cs = &callerSlots{slots: make(chan struct{}, MaxSearchesPerCaller)}
+		e.running[caller] = cs
+	}
+	cs.users++
+	e.mu.Unlock()
+	leave := func() {
+		e.mu.Lock()
+		defer e.mu.Unlock()
+		if cs.users--; cs.users == 0 {
+			delete(e.running, caller)
+		}
+	}
+	select {
+	case cs.slots <- struct{}{}:
+		return func() { <-cs.slots; leave() }, true
+	default:
+		leave()
+		return nil, false
+	}
+}
+
 // byName is every tool, sorted by name, unscored.
 func byName(tools []Tool) []Hit {
 	hits := make([]Hit, len(tools))
@@ -331,8 +581,10 @@ func sortHits(hits []Hit) {
 
 // index returns the keyword index of tools, building it when this catalog
 // has none cached.
-func (e *Engine) index(tools []Tool) *index {
-	key := catalogKey(tools)
+func (e *Engine) index(tools []Tool) *index { return e.indexFor(catalogKey(tools), tools) }
+
+// indexFor is index with the catalog's key already computed.
+func (e *Engine) indexFor(key string, tools []Tool) *index {
 	e.mu.Lock()
 	ix, ok := e.indexes[key]
 	e.mu.Unlock()
@@ -376,11 +628,15 @@ func catalogKey(tools []Tool) string {
 // Entry is one result as the surfaces return it. Name and Upstream keep
 // the keys tools.search has always used.
 type Entry struct {
-	Name         string         `json:"name"`
-	Upstream     string         `json:"upstream,omitempty"`
-	Description  string         `json:"description,omitempty"`
-	Code         string         `json:"code,omitempty"`
-	Score        float64        `json:"score,omitempty"`
+	Name        string  `json:"name"`
+	Upstream    string  `json:"upstream,omitempty"`
+	Description string  `json:"description,omitempty"`
+	Code        string  `json:"code,omitempty"`
+	Score       float64 `json:"score,omitempty"`
+	// Run is what a call with no arguments would get now ("now",
+	// "needs_approval" or "blocked"); the gateway fills it in, Render
+	// leaves it empty.
+	Run          string         `json:"run,omitempty"`
 	InputSchema  map[string]any `json:"input_schema,omitempty"`
 	OutputSchema map[string]any `json:"output_schema,omitempty"`
 }
@@ -414,16 +670,23 @@ func summarize(desc string) string {
 	if i := strings.Index(desc, "\n\n"); i >= 0 {
 		desc = desc[:i]
 	}
-	desc = strings.Join(strings.Fields(desc), " ")
-	if len(desc) <= summaryLen {
-		return desc
+	return clip(desc, summaryLen)
+}
+
+// clip is s with its whitespace collapsed, cut at n bytes on a word
+// boundary (or inside a long word, never inside a character) with an
+// ellipsis.
+func clip(s string, n int) string {
+	s = strings.Join(strings.Fields(s), " ")
+	if len(s) <= n {
+		return s
 	}
-	cut := strings.LastIndexByte(desc[:summaryLen], ' ')
-	if cut < summaryLen/2 {
-		cut = summaryLen
-		for cut > 0 && desc[cut]&0xC0 == 0x80 {
+	cut := strings.LastIndexByte(s[:n], ' ')
+	if cut < n/2 {
+		cut = n
+		for cut > 0 && s[cut]&0xC0 == 0x80 {
 			cut--
 		}
 	}
-	return strings.TrimSpace(desc[:cut]) + "…"
+	return strings.TrimSpace(s[:cut]) + "…"
 }

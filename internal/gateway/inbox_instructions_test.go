@@ -8,15 +8,50 @@ import (
 
 func TestInboxAgentInstructionsDescribeDecisionAndRecovery(t *testing.T) {
 	text := buildInstructions(nil, time.Second)
-	for _, want := range []string{"call_id", "task.objective", "material_risks", "callback_ref", "inbox.wait remains optional", "same still-valid unused token", "outcome_unknown", "Rejected calls receive no grant", "required is a planning hint", "FALLBACK", "POST /v1/code/run", "TOOLYARD_TOKEN_FILE", "GET /v1/code/ty", "topic fallback"} {
+	for _, want := range []string{"_reason", "call_id", "task.objective", "material_risks", "callback_ref", "inbox.wait remains optional", "same still-valid unused token", "outcome_unknown", "Rejected calls receive no grant", "required is a planning hint", "_grant", "FALLBACK", "POST /v1/code/run", "TOOLYARD_TOKEN_FILE", "GET /v1/code/ty", "topic fallback"} {
 		if !strings.Contains(text, want) {
 			t.Errorf("missing %q", want)
 		}
 	}
-	for _, stale := range []string{"AUTO-EXECUTE ON APPROVE", "auto-approval rule", "invoke them in parallel", "token is shown once"} {
+	for _, stale := range []string{"AUTO-EXECUTE ON APPROVE", "auto-approval rule", "invoke them in parallel", "token is shown once",
+		"run inbox.check for concrete planned calls", "tools.execute to discover tools outside your visible catalog"} {
 		if strings.Contains(text, stale) {
 			t.Errorf("obsolete instruction %q", stale)
 		}
+	}
+}
+
+// TestInstructionsTeachTheFiveToolFlow: the instructions name the five
+// tools and the flow (find, read, run, ask once per round, read the
+// decision), and still read true for an agent on the full tool list.
+func TestInstructionsTeachTheFiveToolFlow(t *testing.T) {
+	text := buildInstructions(nil, time.Second)
+	for _, name := range SmallToolList {
+		if !strings.Contains(text, name) {
+			t.Errorf("the instructions do not name %s", name)
+		}
+	}
+	for _, want := range []string{
+		"by default you see five tools",
+		"run: now, needs_approval or blocked",
+		"inbox.request is the one way to get permission",
+		"ONE inbox.request with every restricted call (run: needs_approval) and every question",
+		"Start another round only for what the answers open",
+		"tools.tryCall",
+		"inbox.check stays available but is optional",
+		"full tool list",
+		"PERMISSIONS:",
+	} {
+		if !strings.Contains(text, want) {
+			t.Errorf("missing %q", want)
+		}
+	}
+	if skills := buildInstructions(nil, time.Second) + " " + skillsInstructions; !strings.Contains(skills, "SKILLS:") || !strings.Contains(skills, "skills.search") ||
+		!strings.Contains(skills, "tools.search") || !strings.Contains(skills, "toolyard.skills_get") {
+		t.Errorf("the skills paragraph does not point at tools.search and code mode: %q", skillsInstructions)
+	}
+	if guide := skillsGuideInstructions("toolyard/toolyard-basics"); !strings.Contains(guide, `"toolyard/toolyard-basics"`) || !strings.Contains(guide, "toolyard.skills_get") {
+		t.Errorf("the guide sentence: %q", guide)
 	}
 }
 
@@ -27,7 +62,8 @@ func TestInboxMCPMetadataDescribesCallbacksAndRecoverableGrants(t *testing.T) {
 		found[entry.tool.Name] = true
 		switch entry.tool.Name {
 		case "inbox.request":
-			for _, want := range []string{"task.objective", "callback_ref", "continue unrelated work or end the turn", "inbox.status", "authoritative decisions", "inbox.wait is optional"} {
+			for _, want := range []string{"task.objective", "callback_ref", "continue unrelated work or end the turn", "inbox.status", "authoritative decisions", "inbox.wait is optional",
+				"the one way an agent gets permission", "ONE request", "every question", "only for what the answers open"} {
 				if !strings.Contains(entry.tool.Description, want) {
 					t.Errorf("inbox.request description is missing %q", want)
 				}
@@ -55,7 +91,8 @@ func TestInboxMCPMetadataDescribesCallbacksAndRecoverableGrants(t *testing.T) {
 				}
 			}
 		case "inbox.status":
-			for _, want := range []string{"Status reads never consume grants", "same still-valid unused grant token", "lost response", "Expired, revoked, or consumed"} {
+			for _, want := range []string{"Status reads never consume grants", "same still-valid unused grant token", "lost response", "Expired, revoked, or consumed",
+				"answers to your questions", "_grant", "one new inbox.request"} {
 				if !strings.Contains(entry.tool.Description, want) {
 					t.Errorf("inbox.status description is missing %q", want)
 				}

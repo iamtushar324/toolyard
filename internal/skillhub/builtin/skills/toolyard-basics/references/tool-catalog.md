@@ -3,7 +3,14 @@
 toolyard's own tools, by family. Some families exist only when the operator
 turned the feature on (noted below). Upstream servers add their own tools as
 `<server>.<tool>`. Every call needs `_reason`. Read a tool's full schema with
-`tools.search` (`detail: "full"`) or, in code mode, `getToolDocs`.
+`getToolDocs` or `tools.search` (`detail: "full"`).
+
+By default your tool list shows five tools: `tools.search`, `getToolDocs`,
+`executeToolCode`, `inbox.request` and `inbox.status`. Every other tool here
+still works: run it in `executeToolCode` as `toolyard.<group>_<name>` (for
+example `toolyard.inbox_guide(topic="requests")`), or call it directly where
+your client allows. An agent its owner switched to the full list sees them
+all.
 
 Which built-in groups you have: `access.whoami` lists them under `always_on`
 (`tools`, `inbox`, `session`, `policies`, `servers`, `audit`, `access`,
@@ -12,8 +19,8 @@ without a grant. `memory`, `events` and `notes` are shared data groups that an
 admin grants like a server, so a member's agent sees them only after that
 grant.
 
-Pinned tools stay in your catalog in every surface mode (`top_n`,
-`router_only`): the discovery, code-mode, approval, Inbox, session, access,
+On the full list, pinned tools stay in your catalog in every surface mode
+(`top_n`, `router_only`): the discovery, code-mode, approval, Inbox, session, access,
 connections, jobs, callbacks and skills read tools, plus `memory.*` and
 `events.*` when you have those groups.
 
@@ -21,7 +28,7 @@ connections, jobs, callbacks and skills read tools, plus `memory.*` and
 
 | Tool | What it does |
 |---|---|
-| `tools.search` | Rank the tools you may use by keyword or RE2 regex; may also name up to 3 matching skills. |
+| `tools.search` | Find the tools you may use, ranked by meaning (Jev, where the operator turned it on), keyword or RE2 regex. Each result says whether a call runs now, needs approval or is blocked (`run`). May also name up to 3 matching skills. |
 | `tools.execute` | Call any tool by catalog name under its normal access, policy and approval rules. |
 
 ## Code mode (`tools` group)
@@ -30,7 +37,7 @@ connections, jobs, callbacks and skills read tools, plus `memory.*` and
 |---|---|
 | `listToolFiles` | Tree of the stub files for the servers you may use. |
 | `readToolFile` | One tool's or one server's stub (compact signatures). |
-| `getToolDocs` | Full parameter docs and a usage example for one tool. |
+| `getToolDocs` | Full parameter docs and a usage example for one tool (`server` and `tool`: the two halves of a search result's `code`). |
 | `executeToolCode` | Run a script (Starlark, or JavaScript) that calls tools; each nested call is checked like a direct one. |
 
 Details: the `toolyard-code-mode` skill.
@@ -60,11 +67,11 @@ Present when the Inbox is on. They need an enrolled agent.
 | Tool | What it does |
 |---|---|
 | `inbox.guide` | The agent protocol, by topic (for example `requests`, `grants`, `examples`, `fallback`, `callbacks`). |
-| `inbox.check` | For each planned call: `open`, `granted`, `restricted`, `denied` or `unknown`. |
-| `inbox.request` | One access request for every restricted call a task needs (`dry_run: true` first). |
+| `inbox.check` | Optional (search's `run` says the same per tool): for each planned call with its arguments, `open`, `granted`, `restricted`, `denied` or `unknown`. |
+| `inbox.request` | The one way to get permission: every restricted call and every question of a round in one request (`dry_run: true` first). |
 | `inbox.ask` | Ask your owner a question, or report a blocker. |
 | `inbox.post` | Report an outcome (`kind: "update"`). |
-| `inbox.status` | Decisions, grants and execution state. Non-blocking. |
+| `inbox.status` | Decisions, answers, grants and execution state. Non-blocking. |
 | `inbox.wait` | Block until items are decided. Optional when you have a callback. |
 | `inbox.cancel` | Withdraw a request. |
 | `inbox.upload` | A single-use URL to upload a local screenshot, recording or file as evidence. |

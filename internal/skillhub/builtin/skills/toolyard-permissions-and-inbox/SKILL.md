@@ -1,6 +1,6 @@
 ---
 name: toolyard-permissions-and-inbox
-description: Ask the account owner for permission through the toolyard Inbox and act on what they decide. Covers inbox.check, inbox.request (stable call_id values, task, facts, bounded params, dry_run), the owner's accepted/rejected decision and owner_note, inbox.status, single-use scoped grants passed as _grant, outcome_unknown, inbox.cancel, inbox.wait versus callbacks, inbox.post updates, inbox.ask questions (schema_version 3 question types), evidence attachments, inbox.upload and the inbox.guide topics, plus legacy approvals (tools.poll_approval, tools.wait_for_approval, tools.list_my_pending_approvals, tools.cancel_my_approval). Use before a task that needs a restricted tool, when a call returns permission_required, grant_invalid or outcome_unknown, when you need an answer or decision only your owner can give, when you report a finished task, or when you hold an approval_id from an earlier call.
+description: Ask the account owner for permission through the toolyard Inbox and act on what they decide. Covers the one-request rule (every restricted call and question of a round in one inbox.request), tools.search's run status, inbox.request (stable call_id values, task, facts, bounded params, dry_run), the owner's accepted/rejected decision and owner_note, inbox.status, single-use scoped grants passed as _grant, outcome_unknown, inbox.cancel, inbox.wait versus callbacks, inbox.post updates, inbox.ask questions (schema_version 3 question types), evidence attachments, inbox.upload and the inbox.guide topics, plus legacy approvals (tools.poll_approval, tools.wait_for_approval, tools.list_my_pending_approvals, tools.cancel_my_approval). Use before a task that needs a restricted tool, when a call returns permission_required, grant_invalid or outcome_unknown, when you need an answer or decision only your owner can give, when you report a finished task, or when you hold an approval_id from an earlier call.
 metadata:
   toolyard-runs: anywhere
 ---
@@ -21,6 +21,23 @@ call still goes through policy and the owner's decision.
 GitHub writes follow a different path (an owner approval, never a grant): see
 the `toolyard-github-writes` skill (`skills.get toolyard/toolyard-github-writes`).
 
+## The rule: one request per round
+
+`inbox.request` is the one way to get permission, and `inbox.status` reads the
+decision. Both are among the five tools you see by default (with
+`tools.search`, `getToolDocs` and `executeToolCode`). Plan the round first.
+Then put every restricted call it needs, and every question you have for your
+owner, into ONE `inbox.request`: `tools[]`, and `questions[]` with
+`schema_version: 3`. Start another round only for what the answers open,
+never one request per call. A round with questions but no restricted call
+uses `inbox.ask` instead.
+
+The other Inbox tools named here (`inbox.guide`, `inbox.upload`, `inbox.wait`,
+`inbox.ask`, `inbox.post`, `inbox.cancel`, `inbox.check`) and the legacy
+`tools.*_approval` tools may not be in your list. Run them in `executeToolCode`
+as `toolyard.inbox_<name>` and `toolyard.tools_<name>`, for example
+`toolyard.inbox_guide(topic="requests")`.
+
 ## When to use
 
 - Before a task that may need restricted tools.
@@ -31,13 +48,18 @@ the `toolyard-github-writes` skill (`skills.get toolyard/toolyard-github-writes`
 
 ## The recipe
 
-1. **Check.** Send every concrete call you plan to `inbox.check` (up to 50
-   `{tool, args}` pairs). Each comes back `open` (call it now), `granted` (a
-   live grant covers it), `restricted` (put it in your request), `denied`
-   (blocked for you: do not ask) or `unknown` (not a tool you can reach; check
-   the name with `tools.search`).
-2. **Plan one batch.** Put every restricted call the task needs into ONE
-   `inbox.request`, so the owner decides once. Give each call a stable, unique
+1. **Find what needs approval.** `tools.search` gives each tool's `run`:
+   `now` (call it), `needs_approval` (put it in your request) or `blocked`
+   (denied by policy: do not ask). That is the answer for a call with no
+   arguments; arguments can escalate a call, so one that says `now` may still
+   answer `permission_required`. In a script, call tools that may be
+   restricted with `tools.tryCall` (JavaScript) or `try_call` (Starlark): they
+   return `permission_required` instead of stopping, so collect every one.
+   `inbox.check` is optional: it answers the same for up to 50 concrete
+   `{tool, args}` pairs (`open`, `granted`, `restricted`, `denied`, `unknown`).
+2. **Plan one batch.** Put every restricted call of the round, and every
+   question you have for your owner, into ONE `inbox.request`, so the owner
+   decides once. Give each call a stable, unique
    `call_id` (1-80 letters, digits, `.`, `:`, `_`, `-`). The ID names the call,
    not the tool: the same tool can appear several times with different params.
 3. **Explain it as yourself.** Write in the first person. Required: `title`
@@ -62,8 +84,12 @@ the `toolyard-github-writes` skill (`skills.get toolyard/toolyard-github-writes`
    Continue unrelated work or end the turn.
 8. **Read the decision** with `inbox.status`. A callback only announces it.
 9. **Execute** each accepted call yourself with `_grant` and exactly the
-   approved params. Skip rejected calls. Honour every per-call `reason` and the
-   `owner_note`, also for accepted calls.
+   approved params. In `executeToolCode` the grant is one more argument of the
+   call: `server.tool(param="value", _grant="tyg_…")` in Starlark,
+   `await tools.server.tool({ param: "value", _grant: "tyg_…" })` in
+   JavaScript. Skip rejected calls. Honour every per-call `reason` and the
+   `owner_note`, also for accepted calls. If the answers open more restricted
+   work, ask for all of it in one new request.
 10. **Close the loop** with an `inbox.post` update that sets `request_id`.
 
 Field tables, constraint rules, limits and attachment shapes:
@@ -97,8 +123,8 @@ inbox.request
  "dry_run": true}
 ```
 
-The tool names above are examples. Use the catalog names `inbox.check` and
-`tools.search` give you.
+The tool names above are examples. Use the catalog names `tools.search` gives
+you.
 
 ## Read the decision, then use the grants
 
@@ -162,12 +188,13 @@ inbox.cancel
 
 ## Questions and updates
 
-- `inbox.ask` asks the owner questions. With `schema_version: 3` one item
-  carries up to 20 `questions` of type `free_text`, `single_choice`,
-  `multiple_choice`, `yes_no`, `number`, `date`, `datetime`, `scale` or
-  `ranking`; answers come back keyed by question `id`. To ask questions next
-  to tool approvals, put `questions` (with `schema_version: 3`) in
-  `inbox.request`. Answers never grant a tool.
+- Questions of a round that also needs tool approvals go in that round's
+  `inbox.request` (`questions` with `schema_version: 3`). With
+  `schema_version: 3` one item carries up to 20 `questions` of type
+  `free_text`, `single_choice`, `multiple_choice`, `yes_no`, `number`, `date`,
+  `datetime`, `scale` or `ranking`; answers come back keyed by question `id`
+  in `inbox.status`. `inbox.ask` asks questions alone, when the round needs
+  no restricted call. Answers never grant a tool.
 - `inbox.post` sends an update: what happened and how you checked it. Set
   `request_id` to close that request's loop. Use `urgency: "fyi"`; toolyard
   lowers `now` and `soon` on an update to `fyi`.
@@ -202,8 +229,8 @@ Never reissue the original write: the saved result is in the poll answer. See
 ## Pitfalls and never
 
 - Do not retry a restricted call without a grant; it answers the same way.
-- Do not send many small requests where one batch fits; at most 16 of your
-  items can be pending at once.
+- Do not send many small requests where one batch fits: one round, one
+  request. At most 16 of your items can be pending at once.
 - `required` is a planning hint. The owner can reject any call, or all of
   them, and the decision is still complete. Rejected calls get no grant.
 - A denial is an answer. Ask again only with new information, and say what
@@ -214,5 +241,7 @@ Never reissue the original write: the saved result is in the poll answer. See
 - When a server is not connected, show the owner the connect link the answer
   gives you and wait. Never ask for a password, token or one-time code.
 - In code mode the same tools are `toolyard.inbox_request`,
-  `toolyard.inbox_status` and so on. See the `toolyard-code-mode` skill
+  `toolyard.inbox_status` and so on. Send the request itself outside the
+  script that collected the `permission_required` calls, then run that script
+  again with the grants. See the `toolyard-code-mode` skill
   (`skills.get toolyard/toolyard-code-mode`).

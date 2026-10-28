@@ -35,6 +35,56 @@ policies, reconnect servers or sign in shared connections, even when its
 owner is an admin; neither can an OAuth client unless its admin owner chose
 "May manage toolyard" for it (`access.whoami` shows `can_change_policies`).
 
+## The tool list: five tools by default
+
+Every MCP agent's `tools/list` shows five tools by default (the small tool
+list):
+
+| Tool | What the agent does with it |
+|---|---|
+| `tools.search` | Find a tool by what it does. Each result gives its code-mode name (`code`) and whether it runs now, needs approval or is blocked (`run`: `now`, `needs_approval` or `blocked`). |
+| `getToolDocs` | Read one tool's full parameters (`server` and `tool`: the two halves of a result's `code`). |
+| `executeToolCode` | Run tools in a Starlark or JavaScript script. |
+| `inbox.request` | Ask the owner for permission. |
+| `inbox.status` | Read the decision, the answers and the grants. |
+
+The list is only what the agent sees. Every other tool the agent may use
+still works: called directly (`tools/call`), through `tools.execute`, and
+from code mode. Search, code-mode catalogs and the REST catalog routes are
+unchanged. The small list is applied after access, so it only hides
+tools: one of the five that the agent's own limits deny stays hidden.
+Callers without an agent scope (a local unauthenticated stdio caller, a
+dashboard session) list every tool, as before.
+
+**Switching one agent to the full list.** The scope editor (Connected apps
+page, **Change access**) has a **Tool list** choice: *Small: 5 tools* (the
+default) or *Full: every tool it may use*. The REST routes carry it as
+`tool_list` (`small` or `full`) in the agent's scope, under the same
+permission checks as the rest of the scope: the agent's owner, or an
+admin, through `POST /v1/me/agent-scopes` or `POST /v1/me/apps/scope`. A
+scope sent without `tool_list` is the small list, so read the scope first
+(`GET /v1/me/agent-scopes?agent_id=`) when you change one field. The value
+is stored in the agent's scope row (`agent_scopes.rules`), so existing
+agents became small without a migration. It is not access: it changes no
+access decision, and switching an agent between the lists leaves its
+access exactly as it was. Connecting an OAuth client again keeps the tool
+list its owner chose.
+
+**The permission and batching rule.** `inbox.request` is the one way an
+agent gets permission. In each round the agent puts every restricted call
+(search says `run: needs_approval`, or a call returned
+`permission_required`) and every question it has for its owner into one
+`inbox.request` (`tools[]` and `questions[]` with `schema_version` 3). It
+starts another round only for what the answers open. In a script,
+`tools.tryCall` (JavaScript) or `try_call` (Starlark) returns
+`permission_required` instead of stopping, so the script can collect every
+such call; the agent asks once, outside the script, reads the decision with
+`inbox.status`, and runs the script again with each grant as the call's
+`_grant` argument (`server.tool(param="value", _grant="<token>")`, or
+`tools.server.tool({ param: "value", _grant: "<token>" })`), with exactly
+the approved parameters. `inbox.check` still answers from code mode, but
+search's run status replaces it.
+
 ## The ask rule
 
 Policies are global to a toolyard, so **only an enrolled agent whose owner

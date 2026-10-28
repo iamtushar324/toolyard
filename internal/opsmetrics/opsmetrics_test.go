@@ -48,6 +48,9 @@ func TestExpositionGolden(t *testing.T) {
 	r.legacySyncFailures.with().inc()
 	r.logRecords.with("warn").inc()
 	r.httpPanics.with().inc()
+	r.observeToolSearchRanker("ok", 0.000078372)
+	r.observeToolSearchRanker("ok", 0.0000004)
+	r.observeToolSearchRanker("timeout", 0)
 
 	const want = `# HELP toolyard_build_info Build information; the value is always 1.
 # TYPE toolyard_build_info gauge
@@ -112,6 +115,16 @@ toolyard_log_records_total{level="warn"} 1
 # HELP toolyard_http_panics_total Panics recovered in HTTP handlers.
 # TYPE toolyard_http_panics_total counter
 toolyard_http_panics_total 1
+# HELP toolyard_tool_search_ranker_requests_total Requests of the tools.search ranker (-tool-search-ranker) by outcome: ok, or why the search fell back to keyword ranking.
+# TYPE toolyard_tool_search_ranker_requests_total counter
+toolyard_tool_search_ranker_requests_total{outcome="bad_response"} 0
+toolyard_tool_search_ranker_requests_total{outcome="error"} 0
+toolyard_tool_search_ranker_requests_total{outcome="no_key"} 0
+toolyard_tool_search_ranker_requests_total{outcome="ok"} 2
+toolyard_tool_search_ranker_requests_total{outcome="timeout"} 1
+# HELP toolyard_tool_search_ranker_cost_microdollars_total What the ranker's provider reported its requests cost, in millionths of a US dollar.
+# TYPE toolyard_tool_search_ranker_cost_microdollars_total counter
+toolyard_tool_search_ranker_cost_microdollars_total 78
 `
 	if got := render(r); got != want {
 		t.Fatalf("exposition mismatch\n--- got ---\n%s\n--- want ---\n%s", got, want)

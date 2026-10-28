@@ -72,13 +72,16 @@ task, in their own words, with a voice note and evidence. You review it on
 your phone and allow some or all of the tools; each allowed tool gets a
 single-use permission (a grant) tied to the exact parameters you saw.
 
-- **Agents** call `inbox.check` to see which planned calls are restricted,
-  then one `inbox.request` with a first-person message, a ≤75-word voice-note
-  script, attachments (tables, charts, diffs, logs, links; images, video and
-  files as links toolyard copies), and every tool with its parameters. When
-  you approve, `inbox.wait` hands each allowed tool a `tyg_…` token; the
-  agent passes it as `_grant` on the call. Questions and blockers go through
-  `inbox.ask`, outcomes through `inbox.post`.
+- **Agents** see five tools by default: `tools.search` (whose `run` says
+  which tools run now, need approval or are blocked), `getToolDocs`,
+  `executeToolCode`, `inbox.request` and `inbox.status`. In each round an
+  agent sends one `inbox.request` with every restricted call and every
+  question it has: a first-person message, a ≤75-word voice-note script,
+  attachments (tables, charts, diffs, logs, links; images, video and files
+  as links toolyard copies), and every tool with its parameters. When you
+  approve, `inbox.status` hands each allowed tool a `tyg_…` token; the agent
+  passes it as `_grant` on the call. Questions and blockers with no restricted
+  call go through `inbox.ask`, outcomes through `inbox.post`.
 - **Toolyard** checks each request in the background and adds only flags
   (Production, Can't be undone, Deletes data, Value not known yet, …).
   An optional judge model (Gemini, off by default) flags calls that

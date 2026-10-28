@@ -295,8 +295,9 @@ and the WebAssembly memory, so a JavaScript worker splits it: at 256 MiB,
 environment and no network. The
 agent-facing guide is [guidelines/code-mode.md](guidelines/code-mode.md): the
 JavaScript API, TypeScript stubs, Starlark `try_call` and `parallel`, `echo`,
-the call ledger, and `tools.search` (BM25 keyword and RE2 regex search;
-semantic search is not available).
+the call ledger, and `tools.search` (ranked by meaning where the operator
+turned on a ranker, see [Tool search ranking](#tool-search-ranking), else
+BM25 keyword; RE2 regex search on request).
 
 Three flags (or `TOOLYARD_CODEMODE_MAX_CONCURRENT`,
 `TOOLYARD_CODEMODE_MAX_PER_AGENT` and `TOOLYARD_CODEMODE_QUEUE_WAIT`) bound how
@@ -412,6 +413,54 @@ Size `MemoryMax=` for the gateway plus the workers: four at 256 MiB is
 Decoding a tool result into script values takes many times the JSON's size;
 256 MiB is what lets a result at the 6 MiB cap decode, so lowering the cap
 means smaller results, not just fewer of them.
+
+## Tool search ranking
+
+`tools.search` (the MCP tool, `GET /v1/code/search` and code mode's
+`tools.search` / `toolyard.tools_search`) ranks by keyword (BM25) out of
+the box. With a ranker on, its default mode, `auto`, ranks by meaning: it
+asks Jev, a classification model, through the OpenRouter Decisions API
+(`POST https://openrouter.ai/api/alpha/decisions`), which of the caller's
+tools do what the task asks. Each answer says
+`ranked_by` (`jev`, `keyword`, `regex` or `name`) and `fallback`, and each
+result says `run`: `now`, `needs_approval` or `blocked`, the policy decision
+a call with no arguments would get.
+
+- **`-tool-search-ranker`** (`TOOLYARD_TOOL_SEARCH_RANKER`): `off` (the
+  default: keyword ranking only) or `openrouter-decisions`.
+- **`-tool-search-model`** (`TOOLYARD_TOOL_SEARCH_MODEL`): the model to ask;
+  default `typesafe/jev-1.13`.
+- **`-tool-search-key-secret`** (`TOOLYARD_TOOL_SEARCH_KEY_SECRET`): the
+  secret that holds the OpenRouter API key; default
+  `OPENROUTER_TOOLSEARCH_KEY`. Set it under Settings → Secrets. toolyard
+  reads it at search time and reuses it for a minute, so a new key works
+  without a restart. The key is never a flag and never logged.
+- **`-tool-search-timeout`** (`TOOLYARD_TOOL_SEARCH_TIMEOUT`): one search's
+  whole budget for the ranker, both of its requests included; default
+  `1.5s`.
+- **`-tool-search-zdr`** (`TOOLYARD_TOOL_SEARCH_ZDR`): `true` asks OpenRouter
+  to route only to providers with zero data retention; default `false`.
+
+**What goes to OpenRouter.** The task text the agent searched for, and for
+up to 30 candidate tools (the best keyword matches) their catalog name,
+server, description cut to 300 bytes and parameter names. When the caller's
+tools span several servers, also up to 25 server names, each with its tool
+count and a few tool names. When no candidate fits but a server does, a
+second request sends up to 30 more tools of that server the same way. Never
+call arguments, results, secrets or the caller's identity. Only the tools the
+caller may use are sent.
+
+**Fallback.** When the ranker is off (`fallback: off`), the secret is not
+set (`no_key`), the budget runs out (`timeout`), OpenRouter answers with an
+error or with an answer that does not validate (`error`), the caller has
+no tools (`empty`), or the caller already runs two searches at once (`busy`,
+so one script cannot start many paid searches together), the search ranks by
+keyword, as before, and says why in `fallback`. Mode `semantic` asks for Jev explicitly (refused when the ranker
+is off); `keyword` and `regex` never call OpenRouter. Answers are cached in
+memory for 10 minutes per query and catalog (at most 1024), so a repeated
+search costs nothing; each replica keeps its own cache. toolyard logs one
+line at startup saying whether the ranker is on, and never logs the task
+text, the key or what OpenRouter said.
 
 ## Adding upstream MCP servers
 

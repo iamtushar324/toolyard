@@ -862,3 +862,25 @@ func TestCodeModeWorkerDeathLeavesGatewayUp(t *testing.T) {
 		t.Fatalf("script after the crash: %s", textOf(res))
 	}
 }
+
+// TestCodeModeDescriptionsTeachTheFlow: getToolDocs and executeToolCode
+// teach the five-tool flow (search, read the docs, run) and the one
+// inbox.request for every permission_required call of a script, with each
+// grant passed back as the call's _grant argument.
+func TestCodeModeDescriptionsTeachTheFlow(t *testing.T) {
+	desc := map[string]string{}
+	for _, e := range (&Gateway{}).codeModeTools() {
+		desc[e.tool.Name] = e.tool.Description
+	}
+	for name, wants := range map[string][]string{
+		CodeModeGetToolDocs: {"tools.search", "executeToolCode", "before the dot", "does not have to be in your tool list"},
+		CodeModeExecuteToolCode: {"tools.search", "getToolDocs", "permission_required", "tools.tryCall", "try_call",
+			"ONCE with inbox.request, outside the script", "inbox.status", `_grant="<token>"`, `_grant: "<token>"`, "exactly the approved parameters"},
+	} {
+		for _, want := range wants {
+			if !strings.Contains(desc[name], want) {
+				t.Errorf("%s description is missing %q", name, want)
+			}
+		}
+	}
+}

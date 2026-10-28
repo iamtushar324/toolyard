@@ -928,8 +928,10 @@ def build_parser():
 
     s = sub.add_parser("search", help="search the tools you may use (like tools.search)")
     s.add_argument("query", metavar="QUERY")
-    s.add_argument("--mode", choices=("keyword", "regex", "semantic", "auto"),
-                   help="keyword (default): ranked words; regex: an RE2 pattern of at most 200 characters")
+    s.add_argument("--mode", choices=("auto", "semantic", "keyword", "regex"),
+                   help="auto (default): by meaning where the server's ranker is on, else keyword; "
+                        "semantic: the ranker only (refused where it is off); keyword: ranked words; "
+                        "regex: an RE2 pattern of at most 200 characters")
     s.add_argument("--detail", choices=("name", "summary", "full"), help="full adds the input and output schemas")
     s.add_argument("--limit", type=int, metavar="N", help="at most N results (default 50, at most 200)")
     s.add_argument("--upstream", metavar="SERVER", help="only the tools of this upstream server")

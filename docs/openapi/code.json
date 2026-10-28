@@ -260,10 +260,10 @@
         "tags": ["stubs"],
         "operationId": "searchTools",
         "summary": "Search the tools",
-        "description": "The same search as the `tools.search` tool, over the tools this agent may use. `mode=keyword` (default) ranks by BM25 over tool names, descriptions, parameter names and parameter descriptions; `mode=regex` matches an RE2 pattern of at most 200 characters, case-insensitive unless the pattern turns that off; `auto` is keyword; `semantic` answers 400 unless the server configured it. `detail` is `name`, `summary` (default) or `full` (with the input and output schemas).",
+        "description": "The same search as the `tools.search` tool, over the tools this agent may use. `mode=auto` (default) ranks by meaning with Jev, a classification model, where the operator turned the ranker on, and by keyword where it is off or when Jev is slow or fails; `mode=semantic` is Jev with the same fallback, and answers 400 where the ranker is off; `mode=keyword` ranks by BM25 over tool names, descriptions, parameter names and parameter descriptions; `mode=regex` matches an RE2 pattern of at most 200 characters, case-insensitive unless the pattern turns that off. `ranked_by` says what ordered the answer and `fallback` why Jev did not. Each result's `run` says what a call gets now: `now`, `needs_approval` (ask with `inbox.request`, every restricted call of the round in one request) or `blocked`. `detail` is `name` (names only, no `run`), `summary` (default) or `full` (with the input and output schemas).",
         "parameters": [
-          { "name": "q", "in": "query", "required": false, "description": "Words (keyword) or a pattern (regex). Empty lists every tool by name.", "schema": { "type": "string" } },
-          { "name": "mode", "in": "query", "required": false, "schema": { "type": "string", "enum": ["keyword", "regex", "semantic", "auto"], "default": "keyword" } },
+          { "name": "q", "in": "query", "required": false, "description": "The task in plain words (auto, semantic, keyword) or a pattern (regex). Empty lists every tool by name.", "schema": { "type": "string" } },
+          { "name": "mode", "in": "query", "required": false, "schema": { "type": "string", "enum": ["auto", "semantic", "keyword", "regex"], "default": "auto" } },
           { "name": "detail", "in": "query", "required": false, "schema": { "type": "string", "enum": ["name", "summary", "full"], "default": "summary" } },
           { "name": "limit", "in": "query", "required": false, "schema": { "type": "integer", "minimum": 1, "maximum": 200, "default": 50 } },
           { "name": "upstream", "in": "query", "required": false, "description": "Only the tools of this upstream server.", "schema": { "type": "string" } }
@@ -278,7 +278,9 @@
                   "total": 1,
                   "matched": 7,
                   "mode": "keyword",
-                  "results": [{ "name": "Linear.save_issue", "upstream": "Linear", "description": "Create or update an issue.", "code": "Linear.save_issue", "score": 7.4213 }]
+                  "ranked_by": "keyword",
+                  "fallback": "off",
+                  "results": [{ "name": "Linear.save_issue", "upstream": "Linear", "description": "Create or update an issue.", "code": "Linear.save_issue", "score": 7.4213, "run": "needs_approval" }]
                 }
               }
             }
@@ -629,11 +631,21 @@
       },
       "SearchResult": {
         "type": "object",
-        "required": ["total", "matched", "mode", "results"],
+        "required": ["total", "matched", "mode", "ranked_by", "fallback", "results"],
         "properties": {
           "total": { "type": "integer", "description": "Results returned." },
           "matched": { "type": "integer", "description": "Tools that matched, before the limit." },
-          "mode": { "type": "string", "enum": ["keyword", "regex", "semantic"] },
+          "mode": { "type": "string", "enum": ["keyword", "regex", "semantic"], "description": "The mode that ran: `semantic` when Jev ranked, `keyword` for `auto` without Jev and for a fallback." },
+          "ranked_by": {
+            "type": "string",
+            "enum": ["jev", "keyword", "regex", "name"],
+            "description": "What ordered the results: Jev, BM25 keyword ranking, a regex, or the name (an empty query)."
+          },
+          "fallback": {
+            "type": "string",
+            "enum": ["", "off", "no_key", "timeout", "error", "empty", "busy"],
+            "description": "Why an `auto` or `semantic` search ranked by keyword: the ranker is off, its key is not set, it ran out of time, it failed or answered something invalid, the agent has no tools, or the agent already runs two searches. `\"\"` when Jev ranked, and for `keyword`, `regex` and an empty query."
+          },
           "results": {
             "type": "array",
             "items": {
@@ -644,7 +656,12 @@
                 "upstream": { "type": "string" },
                 "description": { "type": "string" },
                 "code": { "type": "string", "description": "The name a script calls it by: tools.<code> in JavaScript, <code>(...) in Starlark." },
-                "score": { "type": "number" },
+                "score": { "type": "number", "description": "With `ranked_by` `jev`, Jev's probability (0 to 1) that the tool fits; tools Jev did not judge follow without one. Else the keyword or regex score." },
+                "run": {
+                  "type": "string",
+                  "enum": ["now", "needs_approval", "blocked"],
+                  "description": "What a call with no arguments gets now: `now` runs; `needs_approval` needs the owner's yes (ask with `inbox.request`); `blocked` is denied by policy. A call whose arguments escalate it may still need approval where this says `now`. Absent at `detail=name`."
+                },
                 "input_schema": { "type": "object" },
                 "output_schema": { "type": "object" }
               }

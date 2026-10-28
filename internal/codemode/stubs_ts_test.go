@@ -152,6 +152,7 @@ func TestTypeScriptFilesThroughTheRuntime(t *testing.T) {
 	}
 	index, ok := rt.ReadToolFile(ctx, "servers/index.d.ts", nil, nil)
 	for _, want := range []string{"export type TryResult<T = unknown>", "export interface SearchOptions", "parallel<T>(fns: Array<() => Promise<T>>",
+		`mode?: "auto" | "semantic" | "keyword" | "regex";`, `run?: "now" | "needs_approval" | "blocked";`,
 		"export interface Tools extends ToolHelpers {\n  Linear: import(\"./Linear\").Tools;\n  bk_core: import(\"./bk_core\").Tools;\n}", "declare global {\n  const tools: Tools;"} {
 		if !ok || !strings.Contains(index, want) {
 			t.Errorf("index missing %q (ok=%v):\n%s", want, ok, index)

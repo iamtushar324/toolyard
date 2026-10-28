@@ -418,8 +418,12 @@ func New(opts Options) *Gateway {
 	// filters on every tools/call, which would refuse a tool the
 	// visibility mode hides from the list (router_only, top_n) before
 	// handlerFor can answer or audit it. Access first, so the visibility
-	// provider only ever ranks tools the caller may use. The gateway sets
-	// no pagination limit, so the hook sees the whole filtered list.
+	// provider only ever ranks tools the caller may use. The tool list
+	// (tool_list.go) comes next: an agent on the small list (the default)
+	// sees only SmallToolList, of what access kept, and reaches the rest
+	// through search and code mode; the hidden tools stay callable, which
+	// is why this too is a list hook. The gateway sets no pagination
+	// limit, so the hook sees the whole filtered list.
 	filterAccess, vp := opts.Access != nil, opts.Visibility
 	if filterAccess || vp != nil {
 		hooks.AddAfterListTools(func(ctx context.Context, _ any, _ *mcp.ListToolsRequest, res *mcp.ListToolsResult) {
@@ -428,6 +432,7 @@ func New(opts Options) *Gateway {
 			}
 			if filterAccess {
 				res.Tools = g.accessToolFilter(ctx, res.Tools)
+				res.Tools = g.toolListFilter(ctx, res.Tools)
 			}
 			if vp != nil {
 				res.Tools = vp.List(ctx, res.Tools)
@@ -2493,18 +2498,29 @@ func AgentIDFromContext(ctx context.Context) string {
 	return agentIDFromContext(ctx)
 }
 
-// buildInstructions describes the Inbox contract and agent execution path.
+// buildInstructions is the MCP initialize instructions: the five-tool flow
+// (find with tools.search, read with getToolDocs, run in executeToolCode,
+// ask with inbox.request and read the decision with inbox.status) and the
+// Inbox contract. They are server-wide, so every sentence also holds for an
+// agent switched to the full tool list.
 func buildInstructions(bus *approval.Bus, inLineWait time.Duration) string {
 	var b strings.Builder
-	b.WriteString("toolyard gateway. Every tool call requires `_reason` (20-2000 chars) for the audit record. A short reason never authorizes a restricted call. ")
-	b.WriteString("PERMISSIONS: run inbox.check for concrete planned calls. Submit one inbox.request with stable unique call_id values; repeated calls to the same tool are supported. Supply task.objective, message, facts.why_now, each call's summary relating its purpose to the task, target, exact params or explicit bounded constraints, operation and expected_effects. Writes also require affected_scope, material_risks and a concrete undo path or an explicit irreversible statement. Include useful evidence without secrets; for local screenshots, diagrams or recordings call inbox.upload, PUT the bytes to its single-use URL, and cite the returned upload:<sha256> ref in an attachment. Server validation rejects missing context and placeholders; it cannot establish that an explanation is true. Use inbox.guide for schemas and examples. ")
-	b.WriteString("Restricted calls without grants return permission_required and run nothing. New requests always use agent execution. The human selects accepted and rejected calls, adds optional per-call reasons and an overall note, and explicitly submits one complete decision. required is a planning hint; its rejection and all-rejected batches are valid. Rejected calls receive no grant. ")
+	b.WriteString("toolyard gateway. Every tool call requires `_reason` (20-2000 chars) for the audit record; inside an executeToolCode script it is optional. A short reason never authorizes a restricted call. ")
+	b.WriteString("TOOLS: by default you see five tools: tools.search, getToolDocs, executeToolCode, inbox.request and inbox.status. They reach every other tool you may use; an agent its owner switched to the full tool list sees more tools, and this flow works the same. " +
+		"FIND: call tools.search with a few words about the task. Each result gives the tool's name, its code-mode name (code) and whether it runs now, needs approval or is blocked (run: now, needs_approval or blocked). " +
+		"READ: call getToolDocs with the two halves of a result's code (server before the dot, tool after it) for its full parameters. " +
+		"RUN: call tools inside executeToolCode: Starlark `result = server.tool(param=\"value\")`, or JavaScript with language \"javascript\": `return await tools.server.tool({ param: \"value\" })`. " +
+		"toolyard's own tools are the server toolyard, called as toolyard.<group>_<name>: the tools named below that you do not see (inbox.guide, inbox.upload, inbox.wait, tools.poll_approval, session.start) run that way, e.g. toolyard.inbox_guide(topic=\"requests\"). " +
+		"Every call a script makes goes through the same access, policy and approval rules as a direct call. ")
+	b.WriteString("PERMISSIONS: inbox.request is the one way to get permission. Plan the round first, then send ONE inbox.request with every restricted call (run: needs_approval) and every question you have for your owner in this round: tools[] with stable unique call_id values (repeated calls to the same tool are supported) and questions[] with schema_version 3. Start another round only for what the answers open. A round with only questions and no tool call uses inbox.ask, run in a script as toolyard.inbox_ask (same questions[]). " +
+		"Supply task.objective, message, facts.why_now, each call's summary relating its purpose to the task, target, exact params or explicit bounded constraints, operation and expected_effects. Writes also require affected_scope, material_risks and a concrete undo path or an explicit irreversible statement. Include useful evidence without secrets; for local screenshots, diagrams or recordings call inbox.upload, PUT the bytes to its single-use URL, and cite the returned upload:<sha256> ref in an attachment. Server validation rejects missing context and placeholders; it cannot establish that an explanation is true. Send it with dry_run: true first. Use inbox.guide for schemas and examples. inbox.check stays available but is optional: tools.search already says what runs now. ")
+	b.WriteString("Restricted calls without grants return permission_required and run nothing. In a script, tools.tryCall (JavaScript) or try_call (Starlark) returns that status instead of stopping: collect every such call of the script into the one inbox.request, then run the script again with the grants. New requests always use agent execution. The human selects accepted and rejected calls, adds optional per-call reasons and an overall note, and explicitly submits one complete decision. required is a planning hint; its rejection and all-rejected batches are valid. Rejected calls receive no grant. ")
 	b.WriteString("CALLBACKS: obtain an authorized receiver or an available T3 session webhook, then pass its opaque callback_ref to inbox.request. Continue unrelated work or end the turn. The callback announces the complete committed decision and contains no grant tokens. It is not permission. Read inbox.status for authoritative verdicts, notes, execution state and grants. inbox.wait remains optional for callers without callbacks. Pending decision deadline defaults to 24 hours, bounded by administrator limits; grant lifetime defaults to 30 minutes and is separate. ")
-	b.WriteString("EXECUTION: call each accepted tool with its scoped single-use token in _grant and exactly the approved parameters. Read-only inbox.status can recover the same still-valid unused token after a lost response; it does not consume or renew permission. Never log tokens. Follow per-call reasons and owner_note. Revoked or expired grants never revive automatically. A used grant has one execution claim. Inspect its recorded outcome before any recovery. If a write times out after dispatch, outcome_unknown means it may already have committed; reconcile it and never blindly repeat it. ")
+	b.WriteString("EXECUTION: call each accepted tool with its scoped single-use token in _grant and exactly the approved parameters; in a script _grant is one more argument: Starlark `server.tool(param=\"value\", _grant=\"<token>\")`, JavaScript `await tools.server.tool({ param: \"value\", _grant: \"<token>\" })`. Read-only inbox.status can recover the same still-valid unused token after a lost response; it does not consume or renew permission. Never log tokens. Follow per-call reasons and owner_note. Revoked or expired grants never revive automatically. A used grant has one execution claim. Inspect its recorded outcome before any recovery. If a write times out after dispatch, outcome_unknown means it may already have committed; reconcile it and never blindly repeat it. ")
 	b.WriteString("LEGACY: already-pending approvals retain their original execution mode and Toolyard can execute them after an Inbox decision. Inspect tools.poll_approval for their saved result; never reissue the original write. This compatibility path does not apply to new requests. ")
-	b.WriteString("GITHUB: GitHub writes always require the account owner's explicit approval and never run on inbox grants or automatic policy rules. Call the GitHub tool directly to create the request; it returns a deferred approval_id. Collect the result with tools.poll_approval or tools.wait_for_approval, and never re-issue the write. Agents may propose COMMENT, REQUEST_CHANGES, or APPROVE reviews; Toolyard submits each review only after the account owner explicitly allows the request. ")
+	b.WriteString("GITHUB: GitHub writes always require the account owner's explicit approval and never run on inbox grants or automatic policy rules. Call the GitHub tool (directly, or with tools.tryCall in a script) to create the request; it returns a deferred approval_id. Collect the result with tools.poll_approval or tools.wait_for_approval, and never re-issue the write. Agents may propose COMMENT, REQUEST_CHANGES, or APPROVE reviews; Toolyard submits each review only after the account owner explicitly allows the request. ")
 	b.WriteString("FALLBACK: if your MCP connection to toolyard fails, run the same code over HTTPS under the same identity, policy and approvals: POST /v1/code/run with your toolyard token from TOOLYARD_TOKEN_FILE, or the ty command from GET /v1/code/ty. inbox.guide topic fallback explains it. ")
-	b.WriteString("Use tools.search and tools.execute to discover tools outside your visible catalog. After session.start, pass its id as _session_id for attribution; session identifiers do not stream a full session or grant permission.")
+	b.WriteString("After session.start, pass its id as _session_id for attribution; session identifiers do not stream a full session or grant permission.")
 	return b.String()
 }
 

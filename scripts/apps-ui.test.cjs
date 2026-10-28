@@ -38,6 +38,7 @@ test('a scope round-trips through the editor draft', () => {
     mode: 'listed',
     allow_servers: ['memory'], allow_tools: [{ server: 'Linear', tool: 'Linear_get_issue' }],
     deny_servers: ['events'], deny_tools: [{ server: 'memory', tool: 'memory.delete' }],
+    tool_list: 'full',
   };
   h.context.scope = scope;
   const back = h.run('appsScopeFromDraft(appsDraftFromScope(scope))');
@@ -54,6 +55,7 @@ test('allows are dropped in "everything" mode, blocks are kept', () => {
   })()`);
   assert.equal(out.mode, 'all');
   assert.equal(out.allow_servers.length, 0);
+  assert.equal(out.tool_list, 'small', 'the small tool list is the default');
   assert.deepEqual(JSON.parse(JSON.stringify(out.deny_tools)), [{ server: 'fixture', tool: 'fixture.echo' }]);
 });
 
@@ -63,6 +65,8 @@ test('the summary says what a scope allows in plain words', () => {
   assert.equal(h.run('appsScopeSummary({ mode: "listed", allow_servers: ["a"], allow_tools: [] })'), 'Only 1 server and 0 tools');
   assert.equal(h.run('appsScopeSummary({ mode: "all", deny_tools: [{ server: "a", tool: "b" }] })'),
     'Everything its owner can use, except 0 blocked servers and 1 blocked tool');
+  assert.equal(h.run('appsScopeSummary({ mode: "all", tool_list: "full" })'), 'Everything its owner can use, full tool list');
+  assert.equal(h.run('appsScopeSummary({ mode: "all", tool_list: "small" })'), 'Everything its owner can use');
 });
 
 test('after a password sign-in, only a well-formed request id returns to the consent screen', () => {
@@ -140,4 +144,30 @@ test('saving the editor posts the app scope', async () => {
   assert.equal(post.body.id, 'grt_1');
   assert.deepEqual(JSON.parse(JSON.stringify(post.body.scope.allow_servers)), ['memory']);
   assert.equal(h.run('appsUI.editor'), null);
+});
+
+test('the editor offers the tool list, small by default, and saves the choice', async () => {
+  const h = harness();
+  h.run(`appsUI.editor = { agentId: 'ag_1', name: 'bot', servers: [], error: '', saving: false, open: {},
+    draft: appsDraftFromScope({ mode: 'all' }) };`);
+  const radios = [];
+  const walk = (n) => {
+    if (!n || typeof n !== 'object') return;
+    if (n.tag === 'input' && n.attrs.name === 'apps-tool-list') radios.push(n);
+    (n.children || []).forEach(walk);
+  };
+  const modal = h.run('renderScopeEditor()');
+  walk(modal);
+  const page = text(modal);
+  assert.match(page, /Tool list/);
+  assert.match(page, /Small: 5 tools \(search, docs, run code, inbox\)/);
+  assert.match(page, /Full: every tool it may use/);
+  assert.deepEqual(radios.map(r => [r.attrs.value, r.attrs.checked]), [['small', true], ['full', false]]);
+  radios[1].attrs.on.change();
+  assert.equal(h.run('appsUI.editor.draft.toolList'), 'full');
+  await h.run('saveScopeEditor()');
+  const post = h.requests.find(r => r.path === '/v1/me/agent-scopes');
+  assert.ok(post, 'no scope request');
+  assert.equal(post.body.agent_id, 'ag_1');
+  assert.equal(post.body.scope.tool_list, 'full');
 });

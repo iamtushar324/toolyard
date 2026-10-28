@@ -24,8 +24,10 @@ direct call (recorded with via `code_mode`).
   (see [REST fallback](references/rest-fallback.md); it needs `TOOLYARD_URL`,
   your toolyard's base URL, and `TOOLYARD_TOKEN_FILE`).
 
-Call a tool directly instead when you make one call, or when the call needs an
-Inbox grant (`_grant`) that you already hold.
+By default your tool list shows five tools (`tools.search`, `getToolDocs`,
+`executeToolCode`, `inbox.request`, `inbox.status`), so a script is also how
+you run any other tool. Call a tool directly instead when you make one call
+and it is in your list.
 
 ## Recipe
 
@@ -39,7 +41,9 @@ Inbox grant (`_grant`) that you already hold.
 
    Or list every stub: `listToolFiles` (`{"language": "javascript"}` for
    TypeScript stubs).
-2. Read the stub. Never guess a name or a parameter.
+2. Read its parameters with `getToolDocs` (`server` and `tool`: the two halves
+   of the hit's `code`), or its stub with `readToolFile` when your list shows
+   it. Never guess a name or a parameter.
 
    ```text
    readToolFile
@@ -122,18 +126,22 @@ them). Details: [Starlark](references/starlark.md),
   `try_call` and `tools.tryCall` return `{ok: false, status, error}` instead,
   and the script carries on. The run's `toolyard.status` says
   `permission_required`, and the error text is the gateway's next step.
-- Ask exactly as the `toolyard-permissions-and-inbox` skill says
-  (`skills.get toolyard/toolyard-permissions-and-inbox`). From code, those
-  tools are `toolyard.inbox_check` and `toolyard.inbox_request`.
-- `executeToolCode` over MCP has no resume. Once the owner accepts, make the
-  granted call directly (not in a script) with its `_grant` and exactly the
-  approved parameters. Then run the rest of the work again, without the
-  calls that already ran.
+- Collect every `permission_required` call of the script, then ask for all
+  of them, and every question you have, ONCE with `inbox.request` outside the
+  script, exactly as the `toolyard-permissions-and-inbox` skill says
+  (`skills.get toolyard/toolyard-permissions-and-inbox`). Read the decision
+  with `inbox.status`.
+- `executeToolCode` over MCP has no resume. Once the owner accepts, run the
+  script again with each grant as one more argument of its call and exactly
+  the approved parameters: Starlark `server.tool(param="value", _grant="tyg_…")`,
+  JavaScript `await tools.server.tool({ param: "value", _grant: "tyg_…" })`.
+  Leave out the calls that already ran.
 - Need a script that resumes? Use a REST run: `POST /v1/code/runs/{id}/resume`
   with the `request_id` replays the recorded calls and adds the grants. See
   [REST fallback](references/rest-fallback.md).
-- Never paste a grant token (`tyg_…`) into a script. The REST route refuses
-  such a script (400), because it stores scripts.
+- A REST run never holds a grant token (`tyg_…`) in its script: the REST
+  route refuses such a script (400), because it stores scripts. Resume the
+  held run with its `request_id` instead.
 - `deferred` (a legacy approval, or a GitHub write) carries an
   `approval_id` (`try_call` returns it as `approval_id`, a `ToolCallError` as
   `approvalId`). Collect the result with `tools.poll_approval` and never send
