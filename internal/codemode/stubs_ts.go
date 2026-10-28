@@ -325,7 +325,16 @@ func tsType(v any, indent string, depth int) string {
 	if !ok || depth > tsMaxDepth {
 		return "unknown"
 	}
-	if enum := enumValues(p); len(enum) > 0 {
+	if enum := enumValues(p); len(enum) > maxInlineEnum {
+		// A long enum is its base type here; propDoc lists its first
+		// values once.
+		if len(typeNames(p)) == 0 {
+			if _, ok := enum[0].(string); ok {
+				return "string"
+			}
+			return "unknown"
+		}
+	} else if len(enum) > 0 {
 		parts := make([]string, len(enum))
 		for i, e := range enum {
 			parts[i] = tsLiteral(e)
@@ -454,10 +463,16 @@ func tsObjectBody(props map[string]any, required map[string]bool, addl any, inde
 	return b.String()
 }
 
-// propDoc is a property's JSDoc text: its description, and its default.
+// propDoc is a property's JSDoc text: its description (else that of its
+// single non-null anyOf/oneOf branch), and its default.
 func propDoc(p map[string]any) string {
-	desc, _ := p["description"].(string)
-	desc = strings.TrimSpace(desc)
+	desc := schemaDescription(p, nil)
+	if enum := enumOf(p, nil); len(enum) > maxInlineEnum {
+		if desc != "" {
+			desc += "\n"
+		}
+		desc += longEnumText(enum, tsLiteral)
+	}
 	if d, ok := p["default"]; ok {
 		if raw, err := json.Marshal(d); err == nil {
 			if desc != "" {

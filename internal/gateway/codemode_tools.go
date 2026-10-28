@@ -429,6 +429,7 @@ func (c codeModeCaller) Tools(ctx context.Context) []codemode.Tool {
 			Description:  strings.TrimPrefix(e.tool.Description, descriptionBanner),
 			Properties:   props,
 			Required:     required,
+			Defs:         e.tool.InputSchema.Defs,
 			OutputSchema: outputSchemaOf(e.tool),
 			ReasonField:  e.reasonField,
 		})

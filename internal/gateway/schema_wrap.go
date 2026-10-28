@@ -91,6 +91,7 @@ func wrapSchema(t mcp.Tool) (mcp.Tool, string) {
 	props := map[string]any{}
 	required := []string{}
 	additional := any(nil)
+	var defs map[string]any
 
 	// Decide source schema: prefer InputSchema (parsed), fall back to
 	// RawInputSchema (json.RawMessage from upstream).
@@ -101,6 +102,7 @@ func wrapSchema(t mcp.Tool) (mcp.Tool, string) {
 		}
 		required = append([]string(nil), t.InputSchema.Required...)
 		additional = t.InputSchema.AdditionalProperties
+		defs = t.InputSchema.Defs
 	} else if len(t.RawInputSchema) > 0 {
 		var raw map[string]any
 		if err := json.Unmarshal(t.RawInputSchema, &raw); err == nil {
@@ -117,6 +119,7 @@ func wrapSchema(t mcp.Tool) (mcp.Tool, string) {
 				}
 			}
 			additional = raw["additionalProperties"]
+			defs = rawDefs(raw, props)
 		}
 	}
 
@@ -172,10 +175,48 @@ func wrapSchema(t mcp.Tool) (mcp.Tool, string) {
 		Properties:           props,
 		Required:             required,
 		AdditionalProperties: additional,
+		Defs:                 defs,
 	}
 	out.RawInputSchema = nil // we have a structured schema now
 	out.Description = descriptionBanner + t.Description
 	return out, field
+}
+
+// rawDefs is a raw input schema's root $defs, so a property's local $ref
+// stays resolvable once the schema is rebuilt. A draft-07 schema keeps
+// them under "definitions"; the rebuilt schema emits them as $defs, so
+// its "#/definitions/X" refs are rewritten in place to "#/$defs/X".
+func rawDefs(raw map[string]any, props map[string]any) map[string]any {
+	if d, ok := raw["$defs"].(map[string]any); ok {
+		return d
+	}
+	d, ok := raw["definitions"].(map[string]any)
+	if !ok {
+		return nil
+	}
+	rewriteDefinitionRefs(d)
+	rewriteDefinitionRefs(props)
+	rewriteDefinitionRefs(raw["additionalProperties"])
+	return d
+}
+
+// rewriteDefinitionRefs turns every "#/definitions/X" $ref under node into
+// "#/$defs/X".
+func rewriteDefinitionRefs(node any) {
+	const prefix = "#/definitions/"
+	switch v := node.(type) {
+	case map[string]any:
+		if ref, ok := v["$ref"].(string); ok && strings.HasPrefix(ref, prefix) {
+			v["$ref"] = "#/$defs/" + strings.TrimPrefix(ref, prefix)
+		}
+		for _, child := range v {
+			rewriteDefinitionRefs(child)
+		}
+	case []any:
+		for _, child := range v {
+			rewriteDefinitionRefs(child)
+		}
+	}
 }
 
 func appendUnique(xs []string, s string) []string {

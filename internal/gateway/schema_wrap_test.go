@@ -1,6 +1,7 @@
 package gateway
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 
@@ -97,5 +98,46 @@ func TestExtractReason(t *testing.T) {
 	// Missing
 	if _, _, _, err := extractReason(map[string]any{}, ReasonField); err == nil {
 		t.Error("expected error for missing reason")
+	}
+}
+
+func TestWrapSchemaKeepsDefs(t *testing.T) {
+	filter := map[string]any{"type": "object", "properties": map[string]any{"threadId": map[string]any{"type": "string"}}}
+	parsed := mcp.Tool{
+		Name: "brief",
+		InputSchema: mcp.ToolInputSchema{
+			Type:       "object",
+			Properties: map[string]any{"filter": map[string]any{"$ref": "#/$defs/Filter"}},
+			Defs:       map[string]any{"Filter": filter},
+		},
+	}
+	out, _ := wrapSchema(parsed)
+	if out.InputSchema.Defs["Filter"] == nil {
+		t.Fatalf("parsed schema lost $defs: %#v", out.InputSchema.Defs)
+	}
+
+	raw := mcp.Tool{
+		Name:           "brief_raw",
+		RawInputSchema: []byte(`{"type":"object","properties":{"filter":{"$ref":"#/$defs/Filter"}},"$defs":{"Filter":{"type":"object"}}}`),
+	}
+	out, _ = wrapSchema(raw)
+	if out.InputSchema.Defs["Filter"] == nil {
+		t.Fatalf("raw schema lost $defs: %#v", out.InputSchema.Defs)
+	}
+
+	draft07 := mcp.Tool{
+		Name:           "brief_draft07",
+		RawInputSchema: []byte(`{"type":"object","properties":{"filter":{"anyOf":[{"$ref":"#/definitions/Filter"},{"type":"null"}]}},"definitions":{"Filter":{"type":"object"}}}`),
+	}
+	out, _ = wrapSchema(draft07)
+	if out.InputSchema.Defs["Filter"] == nil {
+		t.Fatalf("draft-07 schema lost definitions: %#v", out.InputSchema.Defs)
+	}
+	b, err := json.Marshal(out.InputSchema)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(b), `"$ref":"#/$defs/Filter"`) || !strings.Contains(string(b), `"$defs":{"Filter"`) {
+		t.Errorf("draft-07 refs not rewritten to $defs: %s", b)
 	}
 }

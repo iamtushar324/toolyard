@@ -292,7 +292,7 @@ func (g *Gateway) searchCatalog(ctx context.Context) []toolsearch.Tool {
 			Name:         e.tool.Name,
 			Server:       e.upstream,
 			Description:  desc,
-			InputSchema:  map[string]any{"type": "object", "properties": props, "required": reqAny},
+			InputSchema:  inputSchemaMap(props, reqAny, e.tool.InputSchema.Defs),
 			OutputSchema: outputSchemaOf(e.tool),
 		})
 	}
@@ -301,6 +301,16 @@ func (g *Gateway) searchCatalog(ctx context.Context) []toolsearch.Tool {
 		out[i].CodeName = names[out[i].Name]
 	}
 	return out
+}
+
+// inputSchemaMap is a search result's input schema, with the root $defs
+// its properties' $ref point at.
+func inputSchemaMap(props map[string]any, required []any, defs map[string]any) map[string]any {
+	m := map[string]any{"type": "object", "properties": props, "required": required}
+	if len(defs) > 0 {
+		m["$defs"] = defs
+	}
+	return m
 }
 
 // handleSearchTools answers tools.search. Read-only: never holds for

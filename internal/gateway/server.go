@@ -1392,6 +1392,9 @@ func (g *Gateway) catalog(keep func(toolEntry) bool) []CatalogEntry {
 			"properties": e.tool.InputSchema.Properties,
 			"required":   e.tool.InputSchema.Required,
 		}
+		if len(e.tool.InputSchema.Defs) > 0 {
+			schema["$defs"] = e.tool.InputSchema.Defs
+		}
 		out = append(out, CatalogEntry{
 			Name:        e.tool.Name,
 			Upstream:    e.upstream,

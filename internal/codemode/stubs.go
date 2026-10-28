@@ -249,7 +249,7 @@ func compactSignatures(srv *server, tools []binding, toolLevel bool) string {
 	}
 	b.WriteString("\n")
 	for _, t := range tools {
-		params := pythonParams(t.tool.Properties, t.tool.Required)
+		params := pythonParams(t.tool.Properties, t.tool.Required, t.tool.Defs)
 		if desc := shortDescription(t.tool.Description); desc != "" {
 			fmt.Fprintf(&b, "def %s(%s) -> dict:  # %s\n", t.ident, params, desc)
 		} else {
@@ -274,7 +274,7 @@ func shortDescription(desc string) string {
 
 // pythonParams renders required parameters first, then optional ones with
 // `= None`, each group alphabetical.
-func pythonParams(props map[string]any, required []string) string {
+func pythonParams(props map[string]any, required []string, defs map[string]any) string {
 	req := map[string]bool{}
 	for _, name := range required {
 		req[name] = true
@@ -291,32 +291,53 @@ func pythonParams(props map[string]any, required []string) string {
 	sort.Strings(optNames)
 	parts := make([]string, 0, len(props))
 	for _, name := range reqNames {
-		parts = append(parts, fmt.Sprintf("%s: %s", name, pythonType(props[name])))
+		parts = append(parts, fmt.Sprintf("%s: %s", name, pyType(props[name], defs, 0)))
 	}
 	for _, name := range optNames {
-		parts = append(parts, fmt.Sprintf("%s: %s = None", name, pythonType(props[name])))
+		parts = append(parts, fmt.Sprintf("%s: %s = None", name, pyType(props[name], defs, 0)))
 	}
 	return strings.Join(parts, ", ")
 }
 
+// maxSchemaDepth bounds how far a type, a description or a nested field
+// list follows $ref, anyOf/oneOf and items, so a cyclic schema still ends.
+const maxSchemaDepth = 8
+
+// maxInlineEnum is the longest enum the stubs spell out as a Literal; a
+// longer one is shown as its base type, and getToolDocs lists its first
+// enumShown values once.
+const (
+	maxInlineEnum = 25
+	enumShown     = 20
+)
+
+// maxNestedFields caps the fields getToolDocs lists under one object
+// parameter.
+const maxNestedFields = 20
+
 // pythonType maps one JSON Schema property to a Python type annotation.
-func pythonType(prop any) string {
+func pythonType(prop any) string { return pyType(prop, nil, 0) }
+
+// pyType is pythonType with the tool's root $defs, so a local $ref
+// resolves.
+func pyType(prop any, defs map[string]any, depth int) string {
 	p, ok := prop.(map[string]any)
-	if !ok {
+	if !ok || depth > maxSchemaDepth {
+		return "Any"
+	}
+	if _, ok := p["$ref"]; ok {
+		if r := resolveRef(p, defs); r != nil {
+			return pyType(r, defs, depth+1)
+		}
 		return "Any"
 	}
 	// An enum decoded from JSON is []any; one a built-in tool declares in
 	// Go is []string.
-	var enum []any
-	switch v := p["enum"].(type) {
-	case []any:
-		enum = v
-	case []string:
-		for _, s := range v {
-			enum = append(enum, s)
+	if enum := enumValues(p); len(enum) > maxInlineEnum {
+		if len(typeNames(p)) == 0 {
+			return enumBaseType(enum)
 		}
-	}
-	if len(enum) > 0 {
+	} else if len(enum) > 0 {
 		vals := make([]string, len(enum))
 		for i, e := range enum {
 			vals[i] = literal(e)
@@ -326,27 +347,243 @@ func pythonType(prop any) string {
 	if c, ok := p["const"]; ok {
 		return "Literal[" + literal(c) + "]"
 	}
-	switch p["type"] {
-	case "string":
-		return "str"
-	case "number":
-		return "float"
-	case "integer":
-		return "int"
-	case "boolean":
-		return "bool"
-	case "array":
-		items := "Any"
-		if it, ok := p["items"].(map[string]any); ok {
-			items = pythonType(it)
+	for _, key := range []string{"anyOf", "oneOf"} {
+		alts, ok := p[key].([]any)
+		if !ok || len(alts) == 0 {
+			continue
 		}
-		return "list[" + items + "]"
-	case "object":
-		return "dict"
-	case "null":
+		var parts []string
+		nullable := false
+		for _, a := range alts {
+			if isNullSchema(a) {
+				nullable = true
+				continue
+			}
+			parts = appendDistinct(parts, pyType(a, defs, depth+1))
+		}
+		return pyUnion(parts, nullable)
+	}
+	var parts []string
+	nullable := false
+	for _, t := range typeNames(p) {
+		switch t {
+		case "string":
+			parts = appendDistinct(parts, "str")
+		case "number":
+			parts = appendDistinct(parts, "float")
+		case "integer":
+			parts = appendDistinct(parts, "int")
+		case "boolean":
+			parts = appendDistinct(parts, "bool")
+		case "array":
+			items := "Any"
+			if it, ok := p["items"].(map[string]any); ok {
+				items = pyType(it, defs, depth+1)
+			}
+			parts = appendDistinct(parts, "list["+items+"]")
+		case "object":
+			parts = appendDistinct(parts, "dict")
+		case "null":
+			nullable = true
+		default:
+			parts = appendDistinct(parts, "Any")
+		}
+	}
+	if len(parts) == 0 && nullable {
 		return "None"
 	}
+	return pyUnion(parts, nullable)
+}
+
+// pyUnion joins the non-null alternatives of a type: one is itself, more
+// are a Union, and a nullable one is Optional.
+func pyUnion(parts []string, nullable bool) string {
+	var t string
+	switch len(parts) {
+	case 0:
+		return "Any"
+	case 1:
+		t = parts[0]
+	default:
+		for _, x := range parts {
+			if x == "Any" {
+				return "Any"
+			}
+		}
+		t = "Union[" + strings.Join(parts, ", ") + "]"
+	}
+	if nullable && t != "Any" {
+		return "Optional[" + t + "]"
+	}
+	return t
+}
+
+func appendDistinct(xs []string, s string) []string {
+	for _, x := range xs {
+		if x == s {
+			return xs
+		}
+	}
+	return append(xs, s)
+}
+
+// isNullSchema reports whether a schema admits only null.
+func isNullSchema(v any) bool {
+	p, ok := v.(map[string]any)
+	if !ok {
+		return false
+	}
+	types := typeNames(p)
+	return len(types) == 1 && types[0] == "null"
+}
+
+// resolveRef is the schema a local $ref ("#/$defs/X" or
+// "#/definitions/X") names in defs, nil when it names nothing there.
+func resolveRef(p map[string]any, defs map[string]any) map[string]any {
+	ref, _ := p["$ref"].(string)
+	var name string
+	switch {
+	case strings.HasPrefix(ref, "#/$defs/"):
+		name = strings.TrimPrefix(ref, "#/$defs/")
+	case strings.HasPrefix(ref, "#/definitions/"):
+		name = strings.TrimPrefix(ref, "#/definitions/")
+	default:
+		return nil
+	}
+	name = strings.NewReplacer("~1", "/", "~0", "~").Replace(name)
+	r, _ := defs[name].(map[string]any)
+	return r
+}
+
+// innerSchema is the one schema p stands for: the schema its $ref names,
+// or its single non-null anyOf/oneOf branch. nil when there is none.
+func innerSchema(p map[string]any, defs map[string]any) map[string]any {
+	if _, ok := p["$ref"]; ok {
+		return resolveRef(p, defs)
+	}
+	for _, key := range []string{"anyOf", "oneOf"} {
+		alts, ok := p[key].([]any)
+		if !ok || len(alts) == 0 {
+			continue
+		}
+		var only map[string]any
+		for _, a := range alts {
+			if isNullSchema(a) {
+				continue
+			}
+			m, ok := a.(map[string]any)
+			if !ok || only != nil {
+				return nil
+			}
+			only = m
+		}
+		return only
+	}
+	return nil
+}
+
+// schemaDescription is a property's description: its own, else that of
+// the schema its $ref names or of its single non-null anyOf/oneOf branch.
+func schemaDescription(prop any, defs map[string]any) string {
+	p, _ := prop.(map[string]any)
+	for depth := 0; p != nil && depth <= maxSchemaDepth; depth++ {
+		if d, ok := p["description"].(string); ok && strings.TrimSpace(d) != "" {
+			return strings.TrimSpace(d)
+		}
+		p = innerSchema(p, defs)
+	}
+	return ""
+}
+
+// objectSchema is the object schema a property stands for, directly or
+// through its $ref or single non-null branch; nil when it has no
+// properties.
+func objectSchema(prop any, defs map[string]any) map[string]any {
+	p, _ := prop.(map[string]any)
+	for depth := 0; p != nil && depth <= maxSchemaDepth; depth++ {
+		if props, ok := p["properties"].(map[string]any); ok && len(props) > 0 {
+			return p
+		}
+		p = innerSchema(p, defs)
+	}
+	return nil
+}
+
+// writeNestedFields lists an object parameter's fields one level deep
+// under its Args line, required first, each group alphabetical, at most
+// maxNestedFields of them.
+func writeNestedFields(b *strings.Builder, obj map[string]any, defs map[string]any) {
+	props, _ := obj["properties"].(map[string]any)
+	req := stringSet(obj["required"])
+	var reqNames, optNames []string
+	for n := range props {
+		if req[n] {
+			reqNames = append(reqNames, n)
+		} else {
+			optNames = append(optNames, n)
+		}
+	}
+	sort.Strings(reqNames)
+	sort.Strings(optNames)
+	names := append(reqNames, optNames...)
+	shown := names
+	if len(shown) > maxNestedFields {
+		shown = shown[:maxNestedFields]
+	}
+	for _, n := range shown {
+		note := "optional"
+		if req[n] {
+			note = "required"
+		}
+		line := fmt.Sprintf("            - %s (%s, %s)", n, pyType(props[n], defs, 1), note)
+		if d := schemaDescription(props[n], defs); d != "" {
+			line += ": " + firstLine(d)
+		}
+		b.WriteString(line + "\n")
+	}
+	if extra := len(names) - len(shown); extra > 0 {
+		fmt.Fprintf(b, "            - ... and %d more fields\n", extra)
+	}
+}
+
+// enumOf is the enum a property stands for, directly or through its $ref
+// or single non-null branch; nil when it has none.
+func enumOf(prop any, defs map[string]any) []any {
+	p, _ := prop.(map[string]any)
+	for depth := 0; p != nil && depth <= maxSchemaDepth; depth++ {
+		if enum := enumValues(p); len(enum) > 0 {
+			return enum
+		}
+		p = innerSchema(p, defs)
+	}
+	return nil
+}
+
+// enumBaseType is the Python type of a long enum's values, which the
+// signature shows instead of a Literal of every value.
+func enumBaseType(enum []any) string {
+	switch enum[0].(type) {
+	case string:
+		return "str"
+	case bool:
+		return "bool"
+	case float64, float32:
+		return "float"
+	case int, int64, int32:
+		return "int"
+	}
 	return "Any"
+}
+
+// longEnumText lists the first enumShown values of a long enum once, and
+// how many more there are.
+func longEnumText(enum []any, lit func(any) string) string {
+	vals := make([]string, 0, enumShown)
+	for _, e := range enum[:enumShown] {
+		vals = append(vals, lit(e))
+	}
+	return fmt.Sprintf("Allowed values: %s … and %d more (see tools.search or the server's list tool)",
+		strings.Join(vals, ", "), len(enum)-enumShown)
 }
 
 func literal(v any) string {
@@ -421,7 +658,7 @@ func toolDocs(serverName string, bd binding) string {
 	b.WriteString("\n")
 
 	t := bd.tool
-	fmt.Fprintf(&b, "def %s(%s) -> dict:\n", bd.ident, pythonParams(t.Properties, t.Required))
+	fmt.Fprintf(&b, "def %s(%s) -> dict:\n", bd.ident, pythonParams(t.Properties, t.Required, t.Defs))
 	b.WriteString("    \"\"\"\n")
 	if desc := strings.TrimSpace(t.Description); desc != "" {
 		fmt.Fprintf(&b, "    %s\n\n", desc)
@@ -438,17 +675,21 @@ func toolDocs(serverName string, bd binding) string {
 		sort.Strings(names)
 		b.WriteString("    Args:\n")
 		for _, n := range names {
-			desc := n + " parameter"
-			if p, ok := t.Properties[n].(map[string]any); ok {
-				if d, ok := p["description"].(string); ok && d != "" {
-					desc = d
-				}
+			desc := schemaDescription(t.Properties[n], t.Defs)
+			if desc == "" {
+				desc = n + " parameter"
 			}
 			note := " (optional)"
 			if req[n] {
 				note = " (required)"
 			}
-			fmt.Fprintf(&b, "        %s (%s): %s%s\n", n, pythonType(t.Properties[n]), desc, note)
+			fmt.Fprintf(&b, "        %s (%s): %s%s\n", n, pyType(t.Properties[n], t.Defs, 0), desc, note)
+			if enum := enumOf(t.Properties[n], t.Defs); len(enum) > maxInlineEnum {
+				fmt.Fprintf(&b, "            %s\n", longEnumText(enum, literal))
+			}
+			if obj := objectSchema(t.Properties[n], t.Defs); obj != nil {
+				writeNestedFields(&b, obj, t.Defs)
+			}
 		}
 		b.WriteString("\n")
 	}
