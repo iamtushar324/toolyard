@@ -1,6 +1,7 @@
 package audit
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 )
@@ -27,4 +28,27 @@ func TestRedactConnectLink(t *testing.T) {
 	if strings.Contains(string(js), ticket) || !strings.Contains(string(js), `"n":1`) {
 		t.Fatalf("json redaction = %s", js)
 	}
+}
+
+// TestRedactGrantToken (TEC-1807): a grant token inside script source never
+// survives into an audit row or the live feed; a grant id without its
+// secret part is left alone.
+func TestRedactGrantToken(t *testing.T) {
+	token := "tyg_8f2d1c0b." + strings.Repeat("Ab9_-", 9)
+	code := `return await tools.memory.set({ key: "k", value: "v", _grant: "` + token + `" })`
+	if out := RedactString(code); strings.Contains(out, token) || !strings.Contains(out, redactionPlaceholder) {
+		t.Fatalf("grant survived redaction: %s", out)
+	}
+	js := RedactJSONBytes([]byte(`{"language":"javascript","code":` + strconvQuote(code) + `}`))
+	if strings.Contains(string(js), token) {
+		t.Fatalf("json redaction = %s", js)
+	}
+	if keep := "tyg_8f2d1c0b"; RedactString(keep) != keep {
+		t.Errorf("a grant id was redacted to %q", RedactString(keep))
+	}
+}
+
+func strconvQuote(s string) string {
+	b, _ := json.Marshal(s)
+	return string(b)
 }

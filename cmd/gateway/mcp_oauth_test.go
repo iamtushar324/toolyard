@@ -172,6 +172,19 @@ func (e *oauthEnv) toolNames(token string) map[string]bool {
 	for _, t := range out["result"].(map[string]any)["tools"].([]any) {
 		names[t.(map[string]any)["name"].(string)] = true
 	}
+	// An agent's tools/list shows only the small tool list (TEC-1807); the
+	// rest of what it may use is what tools.search finds.
+	if msg, res := e.call(token, "tools.search", map[string]any{"query": "", "detail": "name", "limit": 200}); msg == "" && res != nil {
+		sc, _ := res["structuredContent"].(map[string]any)
+		rs, _ := sc["results"].([]any)
+		for _, r := range rs {
+			if m, ok := r.(map[string]any); ok {
+				if n, ok := m["name"].(string); ok {
+					names[n] = true
+				}
+			}
+		}
+	}
 	return names
 }
 

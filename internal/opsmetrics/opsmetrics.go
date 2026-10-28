@@ -187,6 +187,8 @@ type registry struct {
 	legacySyncFailures *family
 	logRecords         *family
 	httpPanics         *family
+	searchRanker       *family
+	searchRankerCost   *family
 	families           []*family
 }
 
@@ -212,10 +214,15 @@ func newRegistry(state *ops.State, start time.Time, now func() time.Time, gorout
 		"Log records written, by level.", "level")
 	r.httpPanics = newFamily("toolyard_http_panics_total", typeCounter,
 		"Panics recovered in HTTP handlers.")
+	r.searchRanker = newFamily("toolyard_tool_search_ranker_requests_total", typeCounter,
+		"Requests of the tools.search ranker (-tool-search-ranker) by outcome: ok, or why the search fell back to keyword ranking.", "outcome")
+	r.searchRankerCost = newFamily("toolyard_tool_search_ranker_cost_microdollars_total", typeCounter,
+		"What the ranker's provider reported its requests cost, in millionths of a US dollar.")
 	r.families = []*family{
 		r.toolCalls, r.inflight, r.auditFailures, r.outcomeUnknown,
 		r.goroutinePanics, r.loopLastSuccess, r.legacySyncLast,
 		r.legacySyncFailures, r.logRecords, r.httpPanics,
+		r.searchRanker, r.searchRankerCost,
 	}
 	// Known label values start at zero, so increase() and alerts work
 	// from the first scrape.
@@ -228,6 +235,10 @@ func newRegistry(state *ops.State, start time.Time, now func() time.Time, gorout
 	for _, l := range []string{"debug", "info", "warn", "error"} {
 		r.logRecords.with(l)
 	}
+	for _, o := range []string{"ok", "no_key", "timeout", "error", "bad_response"} {
+		r.searchRanker.with(o)
+	}
+	r.searchRankerCost.with()
 	return r
 }
 
@@ -267,6 +278,19 @@ func IncOutcomeUnknown(path, cause string) { std.outcomeUnknown.with(path, cause
 // IncToolCall counts a tool call. outcome is "ok", "error", "denied",
 // "approval" or "refused_draining".
 func IncToolCall(outcome string) { std.toolCalls.with(outcome).inc() }
+
+// ObserveToolSearchRanker counts one tools.search ranker request by outcome
+// and adds the cost its provider reported (US dollars; 0 when none).
+func ObserveToolSearchRanker(outcome string, cost float64) {
+	std.observeToolSearchRanker(outcome, cost)
+}
+
+func (r *registry) observeToolSearchRanker(outcome string, cost float64) {
+	r.searchRanker.with(outcome).inc()
+	if cost > 0 && !math.IsInf(cost, 0) {
+		r.searchRankerCost.with().n.Add(uint64(math.Round(cost * 1e6)))
+	}
+}
 
 // SetInflightExecutions sets the number of tool executions in flight.
 func SetInflightExecutions(n int) { std.inflight.with().set(float64(n)) }

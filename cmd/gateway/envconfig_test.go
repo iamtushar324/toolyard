@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"flag"
 	"io"
@@ -13,6 +14,8 @@ import (
 	"time"
 
 	"github.com/tusharbhardwaj/toolyard/internal/keyguard"
+	"github.com/tusharbhardwaj/toolyard/internal/secrets"
+	"github.com/tusharbhardwaj/toolyard/internal/toolsearch"
 )
 
 // mapLookup is an environment holding exactly m.
@@ -417,5 +420,98 @@ func TestKnownEnvCoversEveryVariableTheCodeReads(t *testing.T) {
 	if len(missing) > 0 {
 		t.Fatalf("TOOLYARD_ variables the code reads but knownEnv does not list (unknownEnvWarnings would warn about them):\n%s",
 			strings.Join(missing, "\n"))
+	}
+}
+
+// The -tool-search-* flags (TEC-1807) follow the TOOLYARD_<FLAG> contract:
+// each is set by its variable, a bad value is a configuration error, and
+// none draws an unknown-variable warning.
+func TestToolSearchFlagsFromTheEnvironment(t *testing.T) {
+	newFlags := func(args ...string) (*flag.FlagSet, *toolSearchFlags) {
+		t.Helper()
+		fs := flag.NewFlagSet("serve", flag.ContinueOnError)
+		fs.SetOutput(io.Discard)
+		ts := registerToolSearchFlags(fs)
+		if err := fs.Parse(args); err != nil {
+			t.Fatal(err)
+		}
+		return fs, ts
+	}
+	fs, ts := newFlags()
+	if on, err := ts.check(); on || err != nil {
+		t.Fatalf("defaults: on %v, %v", on, err)
+	}
+	if *ts.model != "typesafe/jev-1.13" || *ts.keySecret != "OPENROUTER_TOOLSEARCH_KEY" || *ts.timeout != 1500*time.Millisecond || *ts.zdr {
+		t.Fatalf("defaults: model %q, key secret %q, timeout %s, zdr %v", *ts.model, *ts.keySecret, *ts.timeout, *ts.zdr)
+	}
+	env := map[string]string{
+		"TOOLYARD_TOOL_SEARCH_RANKER":     "openrouter-decisions",
+		"TOOLYARD_TOOL_SEARCH_MODEL":      "typesafe/jev-1.14",
+		"TOOLYARD_TOOL_SEARCH_KEY_SECRET": "MY_RANKER_KEY",
+		"TOOLYARD_TOOL_SEARCH_TIMEOUT":    "2s",
+		"TOOLYARD_TOOL_SEARCH_ZDR":        "true",
+	}
+	layer := newEnvLayer(fs, envPrefix)
+	if err := layer.apply(mapLookup(env)); err != nil {
+		t.Fatal(err)
+	}
+	if *ts.ranker != "openrouter-decisions" || *ts.model != "typesafe/jev-1.14" || *ts.keySecret != "MY_RANKER_KEY" || *ts.timeout != 2*time.Second || !*ts.zdr {
+		t.Fatalf("from the environment: %q %q %q %s %v", *ts.ranker, *ts.model, *ts.keySecret, *ts.timeout, *ts.zdr)
+	}
+	want := "TOOLYARD_TOOL_SEARCH_KEY_SECRET,TOOLYARD_TOOL_SEARCH_MODEL,TOOLYARD_TOOL_SEARCH_RANKER,TOOLYARD_TOOL_SEARCH_TIMEOUT,TOOLYARD_TOOL_SEARCH_ZDR"
+	if got := strings.Join(layer.variables(), ","); got != want {
+		t.Fatalf("variables = %s, want %s", got, want)
+	}
+	if on, err := ts.check(); !on || err != nil {
+		t.Fatalf("ranker on: %v, %v", on, err)
+	}
+	var environ []string
+	for k, v := range env {
+		environ = append(environ, k+"="+v)
+	}
+	if w := unknownEnvWarnings(fs, environ); len(w) != 0 {
+		t.Fatalf("warnings: %v", w)
+	}
+
+	for _, c := range []struct {
+		args     []string
+		flagName string
+	}{
+		{[]string{"-tool-search-ranker=fuzzy"}, "-tool-search-ranker"},
+		{[]string{"-tool-search-ranker=openrouter-decisions", "-tool-search-timeout=0s"}, "-tool-search-timeout"},
+		{[]string{"-tool-search-ranker=openrouter-decisions", "-tool-search-key-secret=lower"}, "-tool-search-key-secret"},
+		{[]string{"-tool-search-ranker=openrouter-decisions", "-tool-search-model= "}, "-tool-search-model"},
+	} {
+		_, bad := newFlags(c.args...)
+		if _, err := bad.check(); !errors.Is(err, keyguard.ErrConfig) || !strings.Contains(err.Error(), c.flagName) {
+			t.Errorf("%v: %v, want a configuration error naming %s", c.args, err, c.flagName)
+		}
+	}
+	fresh, _ := newFlags()
+	if err := newEnvLayer(fresh, envPrefix).apply(mapLookup(map[string]string{"TOOLYARD_TOOL_SEARCH_TIMEOUT": "15"})); !errors.Is(err, keyguard.ErrConfig) ||
+		!strings.Contains(err.Error(), "TOOLYARD_TOOL_SEARCH_TIMEOUT") {
+		t.Fatalf("TOOLYARD_TOOL_SEARCH_TIMEOUT=15: %v", err)
+	}
+
+	// The engine reads the key at search time: a missing secret is no key,
+	// and the search falls back to keyword ranking without a request.
+	_, on := newFlags("-tool-search-ranker", "openrouter-decisions")
+	reads := 0
+	engine := on.engine(func(_ context.Context, name string) (string, error) {
+		reads++
+		if name != "OPENROUTER_TOOLSEARCH_KEY" {
+			t.Errorf("read secret %q", name)
+		}
+		return "", secrets.ErrNotFound
+	})
+	tools := []toolsearch.Tool{{Name: "demo.create_issue", Server: "demo", Description: "Create an issue."}}
+	for i := 0; i < 3; i++ {
+		res, err := engine.Search(context.Background(), tools, toolsearch.Query{Text: "create an issue"})
+		if err != nil || res.Fallback != toolsearch.FallbackNoKey || res.RankedBy != toolsearch.RankedKeyword || len(res.Hits) != 1 {
+			t.Fatalf("no key: %+v, %v", res, err)
+		}
+	}
+	if reads != 1 {
+		t.Fatalf("the secret was read %d times in a minute, want 1", reads)
 	}
 }

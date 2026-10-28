@@ -306,8 +306,11 @@ func (h *mcpOAuthHandlers) consentSubmit(w http.ResponseWriter, r *http.Request,
 		groups := h.s.ownerCatalog(r, u.ID)
 		draft := &consentDraft{nickname: r.PostForm.Get("nickname"), scope: scopeFromForm(r.PostForm, groups),
 			mayManage: u.Role == identity.RoleAdmin && r.PostForm.Get("may_manage") == "1", signOutOthers: r.PostForm.Get("sign_out_others") == "1"}
-		if prev, err := h.svc.Existing(r.Context(), u.ID, pending.Client.ID); err == nil && prev != nil && !prev.Revoked {
-			draft.connected = true
+		if prev, err := h.svc.Existing(r.Context(), u.ID, pending.Client.ID); err == nil && prev != nil {
+			draft.connected = !prev.Revoked
+			// The consent screen does not show the tool list (the Connected
+			// apps page sets it), so connecting again keeps the one chosen.
+			draft.scope.ToolList = prev.Scope.ToolList
 		}
 		loc, err = h.svc.Approve(r.Context(), pending.ID, u, mcpauth.Consent{Nickname: draft.nickname, Scope: draft.scope,
 			MayManage: draft.mayManage, SignOutOthers: draft.signOutOthers})
@@ -755,7 +758,9 @@ func (h *mcpOAuthHandlers) appAudit(w http.ResponseWriter, r *http.Request) {
 
 // agentScope reads (GET ?agent_id=) or replaces (POST {agent_id, scope})
 // the per-agent scope of any agent the caller may manage. For an OAuth
-// app the Connected apps routes say the same with an audit row.
+// app the Connected apps routes say the same with an audit row. The scope
+// carries the agent's tool list too (tool_list: small, the default, or
+// full), under the same checks: a POST without it sets small.
 func (h *mcpOAuthHandlers) agentScope(w http.ResponseWriter, r *http.Request) {
 	if h.s.access == nil {
 		writeError(w, http.StatusNotFound, "access_unavailable")

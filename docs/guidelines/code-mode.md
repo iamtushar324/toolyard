@@ -18,12 +18,31 @@ gateway work unchanged:
 
 `tools.search` finds tools by what they do (see [Finding tools](#finding-tools)).
 
+By default an agent's tool list shows five tools: `tools.search`,
+`getToolDocs`, `executeToolCode`, `inbox.request` and `inbox.status` (see
+[the tool list](access-tools.md#the-tool-list-five-tools-by-default)).
+`listToolFiles` and `readToolFile` are not among them, but they still answer
+a direct call, and an agent its owner switched to the full list sees them.
+
 ## The workflow
 
-1. Find the tool: `tools.search` with a few words, or `listToolFiles`.
-2. Read its stub: `readToolFile` (the `.d.ts` for JavaScript, the `.pyi` for
-   Starlark). Never guess a name or a parameter.
+1. Find the tool: `tools.search` with a few words about the task. Each
+   result's `code` is the name to call it by, and its `run` says whether a
+   call runs now (`now`), needs your owner's yes (`needs_approval`) or is
+   denied by policy (`blocked`).
+2. Read its parameters: `getToolDocs` with the two halves of `code`
+   (`server` before the dot, `tool` after it), or its stub with
+   `readToolFile` (the `.d.ts` for JavaScript, the `.pyi` for Starlark).
+   Never guess a name or a parameter.
 3. Run the program with `executeToolCode`.
+4. Ask for permission once per round. Call restricted tools with
+   `tools.tryCall` (JavaScript) or `try_call` (Starlark), which answer
+   `permission_required` instead of stopping the program. Put every such
+   call, and every question you have for your owner, into one
+   `inbox.request` (`tools[]` and `questions[]`), read the decision with
+   `inbox.status`, and run the program again with each grant as the call's
+   `_grant` argument and exactly the approved parameters. Ask again only for
+   what the answers open.
 
 ## JavaScript
 
@@ -58,7 +77,7 @@ return { team: team.name, titles: all.map((i) => i.title) };
 | `tools.call("Server.tool", args)` | The same, by name. Any form `readToolFile` accepts works on either side of the dot. |
 | `tools.tryCall(nameOrFunction, args)` | `{ok: true, status: "succeeded", result}` or `{ok: false, status, error, approval_id?}`. Never rejects. |
 | `tools.parallel(fns, {limit})` | The results in order, like `Promise.all`: rejects on the first failure. Use `tryCall` inside the functions to collect every outcome. |
-| `tools.search(query, opts)` | The matching tools (`name`, `upstream`, `description`, `code`, `score`). See below. |
+| `tools.search(query, opts)` | The matching tools only, the answer's `results` (`name`, `upstream`, `description`, `code`, `score`, `run`). `tools.call("toolyard.tools_search", { query })` returns the whole answer, with `ranked_by` and `fallback`. See below. |
 | `console.log` (`info`, `warn`, `error`, `debug`) | One print line; objects are printed as JSON. |
 
 A result is the tool's `structuredContent` when it sends one, else its text
@@ -158,11 +177,27 @@ every audit row of the run: the outer call's and every nested call's
 
 | Argument | Values |
 |---|---|
-| `query` | Words (keyword) or a pattern (regex). Empty lists every tool by name. |
-| `mode` | `keyword` (default): BM25 ranking over tool names (split at dots, underscores, dashes and camelCase), descriptions, parameter names and parameter descriptions, with the name weighted most. `regex`: an RE2 pattern of at most 200 characters, case-insensitive unless the pattern says `(?-i)`. `auto`: keyword. `semantic`: an error unless the operator configured semantic search (not available today). |
-| `detail` | `summary`: `name`, `upstream`, `description`, `code` (the name to call it by), `score`. `name`: the name only. `full`: also `input_schema` and `output_schema`. The default is `full` for an agent's own call of the MCP tool `tools.search` (its answer has always carried the input schemas) and `summary` inside a script (JavaScript and Starlark, also through `tools.execute`) and for `GET /v1/code/search`. |
+| `query` | The task in plain words (auto, semantic, keyword) or a pattern (regex). Empty lists every tool by name. |
+| `mode` | `auto` (default): ranked by meaning with Jev, a classification model, where the operator turned the ranker on (see [Tool search ranking](../self-hosting.md#tool-search-ranking)), else by keyword; it also falls back to keyword when Jev is slow or fails. `semantic`: Jev with the same fallback, refused where the ranker is off. `keyword`: BM25 ranking over tool names (split at dots, underscores, dashes and camelCase), descriptions, parameter names and parameter descriptions, with the name weighted most. `regex`: an RE2 pattern of at most 200 characters, case-insensitive unless the pattern says `(?-i)`. `keyword` and `regex` never ask Jev. |
+| `detail` | `summary`: `name`, `upstream`, `description`, `code` (the name to call it by), `score`, `run`. `name`: the name only (no `run`). `full`: also `input_schema` and `output_schema`. The default is `full` for an agent's own call of the MCP tool `tools.search` (its answer has always carried the input schemas) and `summary` inside a script (JavaScript and Starlark, also through `tools.execute`) and for `GET /v1/code/search`. |
 | `limit` | 50 by default, 200 at most. |
 | `upstream` | Only one server's tools. |
+
+The answer has `total`, `matched` (before the limit), `mode` (the mode that
+ran: `semantic` when Jev ranked, else `keyword` or `regex`), `ranked_by`
+(`jev`, `keyword`, `regex`, or `name` for an empty query), `fallback` and
+`results`. `fallback` says why an `auto` or `semantic` search ranked by
+keyword: `off` (no ranker), `no_key`, `timeout`, `error`, `empty` (you have
+no tools) or `busy`; it is `""` when Jev ranked, and for `keyword`, `regex`
+and an empty query. With `ranked_by: "jev"` a result's `score` is Jev's
+probability (0 to 1) that the tool fits; tools Jev did not judge follow,
+without a score. Each result's `run` is what a call with no arguments gets
+now: `now`, `needs_approval` (ask with `inbox.request`) or `blocked`. A call
+whose arguments escalate it may still need approval where it says `now`.
+
+In JavaScript `tools.search` returns only `results`; the whole answer is
+`tools.call("toolyard.tools_search", { query, ... })`. Starlark's
+`toolyard.tools_search(query="...")` returns the whole answer.
 
 A keyword query is at most 1,000 characters, and only its first 32
 distinct words count. A regex may repeat something at most `{100}` times and
@@ -172,7 +207,9 @@ instructions times the bytes of text to scan pass a fixed budget is
 refused before it runs (make it simpler, or use `keyword`), and one regex
 search stops after 250 ms. One agent runs at most 2 regex searches at
 once; a third waits up to 2 seconds for one of them to finish, then is
-refused. Keyword searches are not capped.
+refused. Keyword searches are not capped. An `auto` or `semantic` search
+that would ask Jev takes one of the same 2 slots but never waits: with both
+taken it ranks by keyword at once and says `fallback: "busy"`.
 
 ## Limits
 

@@ -31,6 +31,10 @@ var secretPatterns = []*regexp.Regexp{
 	regexp.MustCompile(`\b[a-f0-9]{40,}\b`),
 	// Standard Webhooks signing secrets (callbacks.register / update)
 	regexp.MustCompile(`whsec_[A-Za-z0-9+/=_-]{16,}`),
+	// Inbox grant tokens (tyg_<id>.<secret>): an agent passes one as an
+	// argument inside an executeToolCode script, so the script source the
+	// audit row records can hold a valid, unused grant.
+	regexp.MustCompile(`tyg_[A-Za-z0-9_-]+\.[A-Za-z0-9_-]{40,}`),
 	connectLinkRE,
 	skillBundleRE,
 }

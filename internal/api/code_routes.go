@@ -552,8 +552,9 @@ func (s *Server) codeStubs(w http.ResponseWriter, r *http.Request) (*codemode.Ru
 	return rt, gateway.WithAgentID(r.Context(), ag.ID), true
 }
 
-// GET /v1/code/search?q=...&mode=keyword|regex&detail=name|summary|full&limit=N&upstream=...
-// — tools.search for the caller, as JSON.
+// GET /v1/code/search?q=...&mode=auto|semantic|keyword|regex&detail=name|summary|full&limit=N&upstream=...
+// — tools.search for the caller, as JSON: ranked_by, fallback and each
+// result's run as the MCP tool answers them.
 func (s *Server) codeSearch(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet && r.Method != http.MethodHead {
 		writeError(w, http.StatusMethodNotAllowed, "GET only")

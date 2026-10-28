@@ -55,7 +55,11 @@ func TestE2EInbox(t *testing.T) {
 	h.raw(t, "PATCH", "/v1/settings", map[string]any{"approval_mode": "inbox"}, &dummy)
 	t.Cleanup(func() { h.raw(t, "PATCH", "/v1/settings", map[string]any{"approval_mode": "execute"}, &dummy) })
 
-	token := enrollAgent(t, h, "inbox-e2e")
+	// The test checks that the inbox tools are listed, so the agent lists
+	// every tool it may use (the default shows only inbox.request and
+	// inbox.status of them).
+	token, agentID := enrollAgentWithID(t, h, "inbox-e2e")
+	useFullToolList(t, h, agentID)
 	c := mcpClient(t, *toolyardURL, token)
 	defer c.Close()
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)

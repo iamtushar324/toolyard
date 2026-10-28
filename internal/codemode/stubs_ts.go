@@ -198,7 +198,7 @@ const tsIndexHead = `// toolyard code mode: what a JavaScript script sees (execu
 //   const issue = await tools.Linear.get_issue({ id: "TEC-1" });
 //   const s = await tools.tryCall("Linear.get_issue", { id: "x" }); // { ok, status, result | error }
 //   const all = await tools.parallel([() => tools.A.x({}), () => tools.B.y({})], { limit: 4 });
-//   const found = await tools.search("create a linear issue", { mode: "keyword", limit: 5 });
+//   const found = await tools.search("create a linear issue", { limit: 5 }); // [{ name, code, run, ... }]
 //   console.log("...");
 //   return { summary: "..." };
 
@@ -208,8 +208,8 @@ export type TryResult<T = unknown> =
   | { ok: false; status: "failed" | "permission_required" | "deferred" | "outcome_unknown"; error: string; approval_id?: string };
 
 export interface SearchOptions {
-  /** keyword (the default: ranked words), regex (an RE2 pattern of at most 200 characters, case-insensitive), semantic (only where configured) or auto (keyword). */
-  mode?: "keyword" | "regex" | "semantic" | "auto";
+  /** auto (the default: by meaning with Jev where the operator turned it on, else keyword), semantic (Jev, refused where it is off; falls back to keyword when Jev fails), keyword (ranked words) or regex (an RE2 pattern of at most 200 characters, case-insensitive). */
+  mode?: "auto" | "semantic" | "keyword" | "regex";
   /** name, summary (the default) or full (with the input and output schemas). */
   detail?: "name" | "summary" | "full";
   /** At most this many results: 50 by default, 200 at most. */
@@ -225,7 +225,10 @@ export interface SearchResult {
   description?: string;
   /** The name to call it by: tools.<code>, or tools.call("<code>", args). */
   code?: string;
+  /** Jev's probability (0 to 1) that the tool fits when Jev ranked, else the keyword or regex score; absent when not scored. */
   score?: number;
+  /** What a call gets now: "now" runs; "needs_approval" needs your owner's yes (ask with toolyard.inbox_request, every restricted call of this round in one request); "blocked" is denied by policy. Absent at detail "name". */
+  run?: "now" | "needs_approval" | "blocked";
   input_schema?: Record<string, unknown>;
   output_schema?: Record<string, unknown>;
 }
@@ -240,7 +243,7 @@ export interface ToolHelpers {
   tryCall<T = unknown>(tool: string | ToolFunction, args?: Record<string, unknown>): Promise<TryResult<T>>;
   /** Run the functions at most limit at a time (4 by default, 8 at most); rejects on the first failure, like Promise.all. */
   parallel<T>(fns: Array<() => Promise<T>>, opts?: { limit?: number }): Promise<T[]>;
-  /** Search the tools you may use (toolyard.tools_search). */
+  /** Search the tools you may use (toolyard.tools_search); the results only. tools.call("toolyard.tools_search", { query }) returns the whole answer, with ranked_by and fallback. */
   search(query: string, opts?: SearchOptions): Promise<SearchResult[]>;
 }
 `

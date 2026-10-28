@@ -7587,17 +7587,23 @@ curl -fsSL -H "Authorization: Bearer ${tok}" ${base}/v1/guide/skill \\
   -o ~/.claude/skills/toolyard-inbox/SKILL.md
 
 # Codex, Cursor, hermes and others: add this to AGENTS.md / your rules
+## Using toolyard
+toolyard lists five tools: tools.search, getToolDocs, executeToolCode,
+inbox.request and inbox.status. Find any other tool with tools.search (its
+run status says now, needs_approval or blocked), read it with getToolDocs,
+and run it inside executeToolCode.
 ## Asking for permission (toolyard)
 Some toolyard tools are restricted and need the owner's approval.
-- Before a task, run inbox.check on the calls you plan to make.
-- Ask for every restricted tool in ONE inbox.request: a first-person message,
-  facts (why_now, if_it_goes_wrong, undo), a voice-note script of at most
-  75 words, and evidence attachments. Run it with dry_run: true first.
-- Keep working while you wait; use inbox.wait when you run out of work.
+- inbox.request is the one way to get permission. Put every restricted call
+  and every question of this round in ONE inbox.request: a first-person
+  message, facts (why_now, if_it_goes_wrong, undo), a voice-note script of
+  at most 75 words, and evidence attachments. Run it with dry_run: true first.
+- Ask again only for what the answers open.
+- Keep working while you wait; read the decision with inbox.status.
 - Call each allowed tool with _grant set to its token, within the
   parameters you asked for. Report back with inbox.post.
 - If a call returns permission_required, nothing ran: fill in its draft.
-Read the full rules with inbox.guide().`;
+Read the full rules with inbox.guide() (in executeToolCode: toolyard.inbox_guide()).`;
 }
 
 (async () => {

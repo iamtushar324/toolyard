@@ -21,8 +21,17 @@ function appsScopeSummary(scope) {
   const denyS = (s.deny_servers || []).length, denyT = (s.deny_tools || []).length;
   let out = s.mode === 'listed' ? 'Only ' + appsCount(allowS, 'server') + ' and ' + appsCount(allowT, 'tool') : 'Everything its owner can use';
   if (denyS + denyT > 0) out += ', except ' + appsCount(denyS, 'blocked server') + ' and ' + appsCount(denyT, 'blocked tool');
+  if (s.tool_list === 'full') out += ', full tool list';
   return out;
 }
+
+// The tool list choices: what the agent's MCP tools/list shows. Small is
+// every agent's default; the other tools stay reachable through search and
+// code mode either way.
+const APPS_TOOL_LISTS = [
+  { value: 'small', label: 'Small: 5 tools (search, docs, run code, inbox)' },
+  { value: 'full', label: 'Full: every tool it may use' },
+];
 
 // appsDraftFromScope turns a stored scope into the editor's sets.
 function appsDraftFromScope(scope) {
@@ -32,12 +41,14 @@ function appsDraftFromScope(scope) {
     mode: s.mode === 'listed' ? 'listed' : 'all',
     allowServers: new Set(s.allow_servers || []), denyServers: new Set(s.deny_servers || []),
     allowTools: tools(s.allow_tools), denyTools: tools(s.deny_tools),
+    toolList: s.tool_list === 'full' ? 'full' : 'small',
     filter: '',
   };
 }
 
 // appsScopeFromDraft is the request body's scope. Allows only count in
-// "listed" mode, so they are left out in "all" mode.
+// "listed" mode, so they are left out in "all" mode. The tool list is
+// always sent: a scope without it is the small list.
 function appsScopeFromDraft(d) {
   const tools = (set) => [...set].sort().map((k) => { const [server, tool] = k.split('\u0000'); return { server, tool }; });
   return {
@@ -46,6 +57,7 @@ function appsScopeFromDraft(d) {
     allow_tools: d.mode === 'listed' ? tools(d.allowTools) : [],
     deny_servers: [...d.denyServers].sort(),
     deny_tools: tools(d.denyTools),
+    tool_list: d.toolList === 'full' ? 'full' : 'small',
   };
 }
 
@@ -279,6 +291,11 @@ function renderScopeEditor() {
       el('div', {},
         el('label', { class: 'row' }, el('input', { type: 'radio', name: 'apps-mode', checked: !listed, on: { change: () => { d.mode = 'all'; render(); } } }), 'Everything the owner can use'),
         el('label', { class: 'row' }, el('input', { type: 'radio', name: 'apps-mode', checked: listed, on: { change: () => { d.mode = 'listed'; render(); } } }), 'Only the servers and tools I allow')),
+      el('fieldset', { class: 'apps-tool-list' },
+        el('legend', {}, 'Tool list'),
+        el('p', { class: 'meta' }, 'What the agent sees in its tool list. It finds and runs every other tool it may use with search and code mode, and asks for permission in the Inbox.'),
+        APPS_TOOL_LISTS.map((o) => el('label', { class: 'row' },
+          el('input', { type: 'radio', name: 'apps-tool-list', value: o.value, checked: d.toolList === o.value, on: { change: () => { d.toolList = o.value; render(); } } }), o.label))),
       el('input', { id: 'apps-scope-filter', type: 'search', placeholder: 'Find a server or tool', value: d.filter, on: { input: (e) => { d.filter = e.target.value; render(); } } }),
       ed.servers === null && !ed.error ? el('p', { class: 'meta' }, 'Loading tools…') : null,
       el('div', { class: 'access-list', style: 'max-height: 50vh; overflow: auto;' }, servers.map(({ g, tools }) => {

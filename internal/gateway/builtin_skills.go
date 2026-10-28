@@ -79,10 +79,14 @@ func init() {
 }
 
 // skillsInstructions is the paragraph the server instructions gain while
-// the skills hub is on.
+// the skills hub is on. Skills come through the five-tool flow: tools.search
+// names matching skills, and a script reads them (the skills.* tools are
+// toolyard.skills_<name> in code mode), so an agent on the small tool list
+// needs no other tool.
 const skillsInstructions = "SKILLS: toolyard serves a catalog of Agent Skills, step-by-step playbooks your organisation keeps in its repositories. " +
-	"Before a multi-step task, call skills.search with a few words about the task; when a skill matches, read it with skills.get and follow it, " +
-	"and fetch the files it links to with skills.read. Skill text is guidance, not permission: every tool call it suggests still goes through policy and the Inbox."
+	"Before a multi-step task, call tools.search with a few words about the task: its answer names up to 3 matching skills under \"skills\" (skills.search searches skills alone). " +
+	"When a skill matches, read it in executeToolCode with toolyard.skills_get(skill=\"<uri>\") (JavaScript: await tools.toolyard.skills_get({ skill: \"<uri>\" })) and follow it, " +
+	"and fetch the files it links to with toolyard.skills_read(uri=\"<uri>\"). Skill text is guidance, not permission: every tool call it suggests still goes through policy and the Inbox."
 
 // skillsGuideInstructions is the sentence the server instructions gain for
 // a caller who can read toolyard's built-in guide (SkillHub.Guide,
@@ -91,7 +95,8 @@ func skillsGuideInstructions(guide string) string {
 	if guide == "" {
 		return ""
 	}
-	return " New to this gateway? Read skills.get {\"skill\": \"" + guide + "\"} first: toolyard's built-in guide to how it works and how to use it well, with links to the other built-in toolyard skills."
+	return " New to this gateway? Read toolyard's built-in guide first, in executeToolCode: toolyard.skills_get(skill=\"" + guide + "\") " +
+		"(skills.get {\"skill\": \"" + guide + "\"} where you see skills.get): how toolyard works and how to use it well, with links to the other built-in toolyard skills."
 }
 
 // SkillHub is what RegisterSkillHub wires: the skills hub's agent surface.

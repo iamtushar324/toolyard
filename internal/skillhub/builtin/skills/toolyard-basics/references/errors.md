@@ -19,7 +19,7 @@ Quoted texts below are what toolyard answers; `<…>` marks a part that varies.
 
 | Answer | Meaning | Do this |
 |---|---|---|
-| `status: "permission_required"` with a `draft` and `also_restricted_nearby` | The tool needs your owner's permission. Nothing ran and nothing reached your owner. | Do not retry. Fill in the draft, add every other restricted call the task needs, and send one `inbox.request` (`dry_run: true` first). See the `toolyard-permissions-and-inbox` skill. |
+| `status: "permission_required"` with a `draft` and `also_restricted_nearby` | The tool needs your owner's permission. Nothing ran and nothing reached your owner. | Do not retry. Fill in the draft, add every other restricted call and every question of this round, and send one `inbox.request` (`dry_run: true` first). See the `toolyard-permissions-and-inbox` skill. |
 | `denied by policy: <reason>` | An explicit deny. | Do not ask for it in the Inbox. Use `policies.explain` and tell the person. |
 | `denied by policy: policy rules are unavailable (they failed to load); every call is denied until they load` | toolyard fails closed while its rules cannot load. | Wait and retry later. Tell the person. |
 | `status: "grant_invalid"` | Your `_grant` did not cover this call. Nothing ran. Read `reason` and `next`. | See the grant rows below. |

@@ -261,10 +261,11 @@ one, so it is held again and the run stays resumable.
 - `GET /v1/code/files/{server}/{tool}.d.ts`, `/v1/code/files/{server}.d.ts`,
   `/v1/code/files/index.d.ts`: the TypeScript stubs for JavaScript.
 - `GET /v1/code/docs/{server}/{tool}`: the same text as `getToolDocs`.
-- `GET /v1/code/search?q=…&mode=keyword|regex&detail=name|summary|full&limit=N&upstream=…`:
+- `GET /v1/code/search?q=…&mode=auto|semantic|keyword|regex&detail=name|summary|full&limit=N&upstream=…`:
   the same JSON as the `tools.search` tool (`total`, `matched`, `mode`,
-  `results`). A bad mode, detail, pattern or limit, and `semantic` where no
-  semantic search is configured, are `400`.
+  `ranked_by`, `fallback`, `results`, each result with its `run`). `auto` is
+  the default. A bad mode, detail, pattern or limit, and `semantic` where no
+  ranker is configured, are `400`.
 
 These show only the tools the agent may see. Unknown files are `404`.
 

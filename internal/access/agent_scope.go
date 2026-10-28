@@ -11,6 +11,10 @@ package access
 // The always-on groups (meta-tools, inbox, session, ...) stay reachable
 // unless denied by name, so a limited agent can still search, ask for
 // approval and tag its session.
+//
+// The same row also holds the agent's tool list (ToolList): how much of
+// what it may use its MCP tools/list shows. It is presentation only: no
+// access decision reads it.
 
 import (
 	"context"
@@ -35,6 +39,17 @@ const (
 	ScopeModeListed = "listed"
 )
 
+// Agent tool lists (AgentScope.ToolList): what an agent's MCP tools/list
+// shows of the tools it may use. Every other tool stays callable (directly,
+// through tools.execute and from code mode); only the list changes.
+const (
+	// ToolListSmall, the default: only the five tools of the search, docs,
+	// run-code and Inbox flow (the gateway's SmallToolList).
+	ToolListSmall = "small"
+	// ToolListFull: every tool the agent may use, as before the small list.
+	ToolListFull = "full"
+)
+
 // maxScopeEntries bounds each list of one agent's scope.
 const maxScopeEntries = 1000
 
@@ -49,21 +64,28 @@ type ToolRef struct {
 
 // AgentScope is one agent's limits as stored and as the REST API shows
 // them. The zero value (mode "" or "all", no denies) is "no limits".
+// ToolList ("" or "small", or "full") is the agent's tool list; it is not a
+// limit, so Unlimited and Compile ignore it.
 type AgentScope struct {
 	Mode         string    `json:"mode"`
 	AllowServers []string  `json:"allow_servers"`
 	AllowTools   []ToolRef `json:"allow_tools"`
 	DenyServers  []string  `json:"deny_servers"`
 	DenyTools    []ToolRef `json:"deny_tools"`
+	ToolList     string    `json:"tool_list"`
 	UpdatedAt    int64     `json:"updated_at,omitempty"`
 	UpdatedBy    string    `json:"updated_by,omitempty"`
 }
 
 // Unlimited reports whether sc changes nothing: everything the owner may
-// use, nothing denied.
+// use, nothing denied. The tool list does not count: it limits nothing.
 func (sc AgentScope) Unlimited() bool {
 	return sc.Mode != ScopeModeListed && len(sc.DenyServers) == 0 && len(sc.DenyTools) == 0
 }
+
+// FullToolList reports whether the agent's tools/list shows every tool it
+// may use; otherwise ("" or "small") it shows the small list.
+func (sc AgentScope) FullToolList() bool { return sc.ToolList == ToolListFull }
 
 // Summary is a short, plain description of sc for lists and audit rows.
 func (sc AgentScope) Summary() string {
@@ -75,6 +97,9 @@ func (sc AgentScope) Summary() string {
 	}
 	if n := len(sc.DenyServers) + len(sc.DenyTools); n > 0 {
 		parts = append(parts, "except "+countOf(len(sc.DenyServers), "denied server")+" and "+countOf(len(sc.DenyTools), "denied tool"))
+	}
+	if sc.FullToolList() {
+		parts = append(parts, "full tool list")
 	}
 	return strings.Join(parts, ", ")
 }
@@ -195,17 +220,24 @@ func (sc AgentScope) Compile() *Limits {
 	return l
 }
 
-// Normalize checks sc and returns it cleaned: a known mode, trimmed and
-// de-duplicated sorted lists, every server a valid group name and every
-// tool a plain name of at most 200 characters.
+// Normalize checks sc and returns it cleaned: a known mode and tool list
+// ("" becomes small), trimmed and de-duplicated sorted lists, every server
+// a valid group name and every tool a plain name of at most 200 characters.
 func (sc AgentScope) Normalize() (AgentScope, error) {
-	out := AgentScope{Mode: strings.TrimSpace(sc.Mode)}
+	out := AgentScope{Mode: strings.TrimSpace(sc.Mode), ToolList: strings.TrimSpace(sc.ToolList)}
 	switch out.Mode {
 	case "":
 		out.Mode = ScopeModeAll
 	case ScopeModeAll, ScopeModeListed:
 	default:
 		return AgentScope{}, fmt.Errorf("%w: mode must be all or listed", ErrInvalidScope)
+	}
+	switch out.ToolList {
+	case "":
+		out.ToolList = ToolListSmall
+	case ToolListSmall, ToolListFull:
+	default:
+		return AgentScope{}, fmt.Errorf("%w: tool_list must be small or full", ErrInvalidScope)
 	}
 	var err error
 	if out.AllowServers, err = cleanServers(sc.AllowServers); err != nil {
@@ -286,23 +318,26 @@ func plainToolName(name string) bool {
 	return true
 }
 
-// storedRules is the JSON in agent_scopes.rules.
+// storedRules is the JSON in agent_scopes.rules. ToolList is kept only
+// when it is "full", so a row without it (every row written before the
+// tool list existed) is the small list and needs no migration.
 type storedRules struct {
 	AllowServers []string  `json:"allow_servers,omitempty"`
 	AllowTools   []ToolRef `json:"allow_tools,omitempty"`
 	DenyServers  []string  `json:"deny_servers,omitempty"`
 	DenyTools    []ToolRef `json:"deny_tools,omitempty"`
+	ToolList     string    `json:"tool_list,omitempty"`
 }
 
 // AgentScope returns agentID's limits; an agent without a row gets the
-// unlimited scope (mode "all", empty lists).
+// unlimited scope (mode "all", empty lists) and the small tool list.
 func (s *Service) AgentScope(ctx context.Context, agentID string) (AgentScope, error) {
 	return ReadAgentScope(ctx, s.db, agentID)
 }
 
 // ReadAgentScope is AgentScope on any querier (a transaction included).
 func ReadAgentScope(ctx context.Context, q store.Querier, agentID string) (AgentScope, error) {
-	sc := AgentScope{Mode: ScopeModeAll, AllowServers: []string{}, AllowTools: []ToolRef{}, DenyServers: []string{}, DenyTools: []ToolRef{}}
+	sc := AgentScope{Mode: ScopeModeAll, AllowServers: []string{}, AllowTools: []ToolRef{}, DenyServers: []string{}, DenyTools: []ToolRef{}, ToolList: ToolListSmall}
 	var mode, rules string
 	var updatedAt int64
 	var updatedBy sql.NullString
@@ -331,12 +366,39 @@ func ReadAgentScope(ctx context.Context, q store.Querier, agentID string) (Agent
 	if r.DenyTools != nil {
 		sc.DenyTools = r.DenyTools
 	}
+	if r.ToolList == ToolListFull {
+		sc.ToolList = ToolListFull
+	}
 	return sc, nil
 }
 
+// ToolListFor is the tool list callerID's MCP tools/list shows: an
+// agent's own (small unless its scope says full); the full list for a
+// dashboard or voice session, which picks tools from the whole catalog
+// itself; and the small list for every other MCP caller, a local
+// unauthenticated one included, which has no scope to switch (give it an
+// agent key for that). A failed read is the default, small: the list is
+// presentation, and every tool stays callable either way. It reads the row
+// on every call, without the scope cache: tools/list is rare next to tool
+// calls.
+func (s *Service) ToolListFor(ctx context.Context, callerID string) string {
+	switch {
+	case strings.HasPrefix(callerID, "dashboard:"), strings.HasPrefix(callerID, "voice:"):
+		return ToolListFull
+	case !strings.HasPrefix(callerID, "ag_"):
+		return ToolListSmall
+	}
+	sc, err := ReadAgentScope(ctx, s.db, callerID)
+	if err != nil || !sc.FullToolList() {
+		return ToolListSmall
+	}
+	return ToolListFull
+}
+
 // SetAgentScope replaces agentID's limits with sc (normalized first) and
-// drops the cached copy. An unlimited sc deletes the row, so the agent is
-// back to exactly its owner's scope. by is recorded as updated_by.
+// drops the cached copy. An unlimited sc on the small tool list deletes
+// the row, so the agent is back to exactly its owner's scope and the
+// default list. by is recorded as updated_by.
 func (s *Service) SetAgentScope(ctx context.Context, agentID string, sc AgentScope, by string) (AgentScope, error) {
 	out, err := WriteAgentScope(ctx, s.db, agentID, sc, by)
 	if err != nil {
@@ -358,13 +420,19 @@ func WriteAgentScope(ctx context.Context, q store.Querier, agentID string, sc Ag
 	if err != nil {
 		return AgentScope{}, err
 	}
-	if out.Unlimited() {
+	// An unlimited agent on the full tool list keeps its row (mode all, no
+	// lists) for the tool list alone; Compile still finds no limits in it.
+	if out.Unlimited() && !out.FullToolList() {
 		if _, err := q.ExecContext(ctx, `DELETE FROM agent_scopes WHERE agent_id = ?`, agentID); err != nil {
 			return AgentScope{}, err
 		}
 		return out, nil
 	}
-	rules, err := json.Marshal(storedRules{AllowServers: out.AllowServers, AllowTools: out.AllowTools, DenyServers: out.DenyServers, DenyTools: out.DenyTools})
+	stored := storedRules{AllowServers: out.AllowServers, AllowTools: out.AllowTools, DenyServers: out.DenyServers, DenyTools: out.DenyTools}
+	if out.FullToolList() {
+		stored.ToolList = ToolListFull
+	}
+	rules, err := json.Marshal(stored)
 	if err != nil {
 		return AgentScope{}, err
 	}

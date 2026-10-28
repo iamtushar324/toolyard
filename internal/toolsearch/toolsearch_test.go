@@ -285,23 +285,106 @@ func TestSemanticNeedsAProvider(t *testing.T) {
 	if _, err := off.Search(context.Background(), tools, Query{Mode: ModeSemantic, Text: "post to chat"}); !errors.Is(err, ErrSemanticOff) {
 		t.Fatalf("semantic without a provider: %v", err)
 	}
-	// auto is keyword, provider or not.
-	if res := search(t, off, tools, Query{Mode: ModeAuto, Text: "create a linear issue"}); res.Mode != ModeKeyword || res.Hits[0].Tool.Name != "Linear.create_issue" {
-		t.Fatalf("auto: %s %v", res.Mode, names(res.Hits))
+	// auto without a provider is keyword, and says the provider is off.
+	if res := search(t, off, tools, Query{Mode: ModeAuto, Text: "create a linear issue"}); res.Mode != ModeKeyword || res.Hits[0].Tool.Name != "Linear.create_issue" ||
+		res.RankedBy != RankedKeyword || res.Fallback != FallbackOff {
+		t.Fatalf("auto: %s %s %s %v", res.Mode, res.RankedBy, res.Fallback, names(res.Hits))
 	}
 	f := &fakeSemantic{}
 	on := New(Options{Semantic: f})
 	res := search(t, on, tools, Query{Mode: ModeSemantic, Text: "post to chat", Limit: 2})
-	if !on.SemanticEnabled() || f.seen != "post to chat" || res.Mode != ModeSemantic || len(res.Hits) != 2 || res.Matched != 5 {
+	if !on.SemanticEnabled() || f.seen != "post to chat" || res.Mode != ModeSemantic || len(res.Hits) != 2 || res.Matched != 5 ||
+		res.RankedBy != RankedJev || res.Fallback != "" {
 		t.Fatalf("semantic with a provider: %+v", res)
 	}
-	if res := search(t, on, tools, Query{Mode: ModeAuto, Text: "create a linear issue"}); res.Mode != ModeKeyword {
-		t.Fatalf("auto with a provider is still keyword: %s", res.Mode)
+	// auto (and the default, "") with a provider is semantic.
+	for _, mode := range []Mode{ModeAuto, ""} {
+		if res := search(t, on, tools, Query{Mode: mode, Text: "post to chat"}); res.Mode != ModeSemantic || res.RankedBy != RankedJev {
+			t.Fatalf("auto %q with a provider: %s %s", mode, res.Mode, res.RankedBy)
+		}
+	}
+}
+
+type failingSemantic struct{ err error }
+
+func (f failingSemantic) Rank(context.Context, []Tool, string) ([]Hit, error) { return nil, f.err }
+
+// TestModesRankAndFallBack (TEC-1807): auto is the default; each search
+// says what ranked it and, for auto and semantic, why it fell back to
+// keyword; keyword and regex are unchanged.
+func TestModesRankAndFallBack(t *testing.T) {
+	tools := fixture()
+	off := New(Options{})
+	cases := []struct {
+		engine   *Engine
+		q        Query
+		mode     Mode
+		rankedBy string
+		fallback string
+	}{
+		{off, Query{Text: "create a linear issue"}, ModeKeyword, RankedKeyword, FallbackOff},
+		{off, Query{Text: "create a linear issue", Mode: ModeKeyword}, ModeKeyword, RankedKeyword, ""},
+		{off, Query{Text: `^linear\.`, Mode: ModeRegex}, ModeRegex, RankedRegex, ""},
+		{off, Query{}, ModeKeyword, RankedName, ""},
+		{New(Options{Semantic: failingSemantic{errors.New("boom")}}), Query{Text: "create a linear issue"}, ModeKeyword, RankedKeyword, FallbackError},
+		{New(Options{Semantic: failingSemantic{ErrNoKey}}), Query{Text: "create a linear issue", Mode: ModeSemantic}, ModeKeyword, RankedKeyword, FallbackNoKey},
+		{New(Options{Semantic: failingSemantic{context.DeadlineExceeded}}), Query{Text: "create a linear issue"}, ModeKeyword, RankedKeyword, FallbackTimeout},
+		{New(Options{Semantic: failingSemantic{errors.New("boom")}}), Query{Text: "create a linear issue", Mode: ModeKeyword}, ModeKeyword, RankedKeyword, ""},
+	}
+	for i, c := range cases {
+		res := search(t, c.engine, tools, c.q)
+		if res.Mode != c.mode || res.RankedBy != c.rankedBy || res.Fallback != c.fallback {
+			t.Errorf("case %d %+v: mode %s ranked_by %s fallback %q, want %s %s %q", i, c.q, res.Mode, res.RankedBy, res.Fallback, c.mode, c.rankedBy, c.fallback)
+		}
+		if c.rankedBy == RankedKeyword && (len(res.Hits) == 0 || res.Hits[0].Tool.Name != "Linear.create_issue") {
+			t.Errorf("case %d: a keyword ranking or fallback put %v first", i, names(res.Hits))
+		}
+	}
+	// No tools to rank: the provider is not asked.
+	f := &fakeSemantic{}
+	res := search(t, New(Options{Semantic: f}), tools, Query{Text: "post to chat", Server: "nowhere"})
+	if res.Fallback != FallbackEmpty || f.seen != "" || len(res.Hits) != 0 {
+		t.Fatalf("empty catalog: %+v, provider saw %q", res, f.seen)
+	}
+}
+
+// TestBusyCallerFallsBackToKeyword (TEC-1807): a caller whose search slots
+// are all taken gets a keyword ranking at once (fallback busy), and the
+// provider is not asked, so one script cannot start many paid searches.
+func TestBusyCallerFallsBackToKeyword(t *testing.T) {
+	f := &fakeSemantic{}
+	e := New(Options{Semantic: f})
+	var releases []func()
+	for i := 0; i < MaxSearchesPerCaller; i++ {
+		release, ok := e.tryEnter("ag_busy")
+		if !ok {
+			t.Fatalf("slot %d refused", i)
+		}
+		releases = append(releases, release)
+	}
+	res := search(t, e, fixture(), Query{Text: "create a linear issue", Caller: "ag_busy"})
+	if res.Fallback != FallbackBusy || res.RankedBy != RankedKeyword || f.seen != "" {
+		t.Fatalf("busy caller: fallback %q ranked_by %s, provider saw %q", res.Fallback, res.RankedBy, f.seen)
+	}
+	if res := search(t, e, fixture(), Query{Text: "create a linear issue", Caller: "ag_other"}); res.RankedBy != RankedJev {
+		t.Fatalf("another caller: ranked_by %s fallback %q", res.RankedBy, res.Fallback)
+	}
+	for _, release := range releases {
+		release()
+	}
+	if res := search(t, e, fixture(), Query{Text: "create a linear issue", Caller: "ag_busy"}); res.RankedBy != RankedJev {
+		t.Fatalf("after the slots free: ranked_by %s fallback %q", res.RankedBy, res.Fallback)
+	}
+	e.mu.Lock()
+	left := len(e.running)
+	e.mu.Unlock()
+	if left != 0 {
+		t.Fatalf("%d callers still hold slots", left)
 	}
 }
 
 func TestParseModeAndDetail(t *testing.T) {
-	for in, want := range map[string]Mode{"": ModeKeyword, "keyword": ModeKeyword, "REGEX": ModeRegex, " semantic ": ModeSemantic, "auto": ModeAuto} {
+	for in, want := range map[string]Mode{"": ModeAuto, "keyword": ModeKeyword, "REGEX": ModeRegex, " semantic ": ModeSemantic, "auto": ModeAuto} {
 		if got, err := ParseMode(in); err != nil || got != want {
 			t.Errorf("ParseMode(%q) = %q, %v", in, got, err)
 		}

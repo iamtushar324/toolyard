@@ -61,8 +61,9 @@ The dashboard's agent-enrolment modal already shows setup snippets per client
   `~/.claude/skills/toolyard-inbox/SKILL.md` (shown with the agent's token),
   or `toolyard skills install toolyard-inbox`.
 - **Codex, Cursor, others:** a 10-line AGENTS.md / rules block to paste. It
-  says restricted tools exist, names `inbox.check` and `inbox.request`, and
-  points to `inbox.guide`.
+  says restricted tools exist, names `tools.search` (whose `run` says what
+  needs approval), `inbox.request` and `inbox.status`, and points to
+  `inbox.guide`.
 - **hermes:** the same block, added to the system prompt in
   `~/.hermes/config.yaml`.
 
@@ -71,15 +72,25 @@ layers 1–5 if the agent skips it.
 
 ## Layer 1: the connection instructions
 
-`buildInstructions` (`internal/gateway/server.go`) now opens with a
-PERMISSIONS paragraph, ahead of the existing approval text (which still
-applies in `execute` mode):
+`buildInstructions` (`internal/gateway/server.go`) teaches the five-tool
+flow first, then the PERMISSIONS paragraph. By default an agent's tool list
+shows five tools (`tools.search`, `getToolDocs`, `executeToolCode`,
+`inbox.request`, `inbox.status`; see
+[access-tools.md](access-tools.md#the-tool-list-five-tools-by-default)), so
+the instructions name only what those five reach:
 
-> PERMISSIONS: some tools are restricted and need your owner's approval.
-> Before a task, run `inbox.check` on the calls you plan, then ask for every
-> restricted tool in ONE `inbox.request` (call `inbox.guide` first …). When
-> approved, call each tool with `_grant` set to its token. If a call returns
-> status `permission_required`, nothing ran: fill in the draft it gives you.
+> TOOLS: find a tool with `tools.search` (each result's `run` says whether it
+> runs now, needs approval or is blocked), read it with `getToolDocs`, run it
+> in `executeToolCode`. PERMISSIONS: `inbox.request` is the one way to get
+> permission. Plan the round first, then send ONE `inbox.request` with every
+> restricted call and every question you have for your owner; start another
+> round only for what the answers open (call `inbox.guide` first …). In a
+> script, `tools.tryCall` / `try_call` return `permission_required` instead of
+> stopping, so collect every such call into that one request. When approved,
+> call each tool with `_grant` set to its token (in a script, one more
+> argument of the call). If a call returns status `permission_required`,
+> nothing ran: fill in the draft it gives you. `inbox.check` stays available
+> but is optional.
 
 ## Layer 2: the coaching result
 
@@ -151,14 +162,16 @@ owner turn copying off and have the phone load the original URLs directly.
 
 ## New tools, all under `inbox.*`
 
-All of them are always visible, need no approval, and act only on the calling
-agent's own requests.
+All of them need no approval and act only on the calling agent's own
+requests. On the default tool list only `inbox.request` and `inbox.status` are
+visible; the others run in `executeToolCode` as `toolyard.inbox_<name>`, and
+an agent switched to the full list sees them all.
 
 | tool | purpose |
 |---|---|
 | `inbox.guide(topic?)` | The protocol, split by topic |
-| `inbox.check(calls[])` | For each call: `open`, `granted`, `restricted` or `denied` |
-| `inbox.request({…, dry_run?})` | An access request with 1–12 tools |
+| `inbox.check(calls[])` | Optional (`tools.search` gives each tool's `run`): for each call, `open`, `granted`, `restricted` or `denied` |
+| `inbox.request({…, dry_run?})` | The one way to get permission: every restricted call (1–12 tools; 50 with `schema_version: 3`) and every question of a round in one request |
 | `inbox.ask({…, options, kind?})` | A question, or a blocker |
 | `inbox.post({kind: "update", …})` | An outcome report |
 | `inbox.status(ids)` / `inbox.wait(ids, mode, timeout)` | Decisions, per-tool grants and the owner's note |

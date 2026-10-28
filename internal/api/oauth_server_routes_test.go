@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"regexp"
 	"strings"
 	"testing"
 
@@ -134,6 +135,126 @@ func TestOnlyTheOwnerAdminMayLetAnAppManageToolyard(t *testing.T) {
 	}
 	if code := post(adminCookie, adminApp, false); code != http.StatusOK {
 		t.Fatalf("the admin owner could not turn may_manage off: %d", code)
+	}
+}
+
+// TestAgentToolListRoundTripsThroughTheScopeRoutes: tool_list is part of
+// the scope the REST routes read and write, under the same checks as the
+// rest of it: the owner switches an agent to the full list and back, an
+// unknown value is refused, another member cannot change it, and the
+// switch changes no access. A connected app's list is set on the Connected
+// apps route and survives connecting again (the consent screen does not
+// show it).
+func TestAgentToolListRoundTripsThroughTheScopeRoutes(t *testing.T) {
+	e := newAccessTestServer(t)
+	ctx := t.Context()
+	svc := mcpauth.New(mcpauth.Options{DB: e.db, PublicURL: "https://toolyard.example.com", Access: e.access})
+	mux := http.NewServeMux()
+	e.srv.MCPOAuthRoutes(mux, svc)
+	handler := e.srv.HardenAPI(e.srv.RoleGuard(mux))
+	send := func(cookie *http.Cookie, method, path, body string) (int, map[string]any) {
+		t.Helper()
+		req := httptest.NewRequest(method, path, strings.NewReader(body))
+		if body != "" {
+			req.Header.Set("Content-Type", "application/json")
+		}
+		req.Header.Set("X-Requested-With", "toolyard")
+		req.AddCookie(cookie)
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+		var out map[string]any
+		_ = json.Unmarshal(rec.Body.Bytes(), &out)
+		return rec.Code, out
+	}
+	toolList := func(out map[string]any) string {
+		sc, _ := out["scope"].(map[string]any)
+		v, _ := sc["tool_list"].(string)
+		return v
+	}
+	adminCookie := e.cookieFor(t, e.admin.ID)
+	_, agent := e.agentFor(t, e.admin.ID)
+	scopeBody := func(list string) string {
+		return `{"agent_id":"` + agent + `","scope":{"mode":"all","tool_list":"` + list + `"}}`
+	}
+
+	if code, out := send(adminCookie, http.MethodGet, "/v1/me/agent-scopes?agent_id="+agent, ""); code != http.StatusOK || toolList(out) != access.ToolListSmall {
+		t.Fatalf("default scope: %d %v", code, out)
+	}
+	code, out := send(adminCookie, http.MethodPost, "/v1/me/agent-scopes", scopeBody("full"))
+	if summary, _ := out["scope_summary"].(string); code != http.StatusOK || toolList(out) != access.ToolListFull || !strings.Contains(summary, "full tool list") {
+		t.Fatalf("switch to full: %d %v", code, out)
+	}
+	if code, out := send(adminCookie, http.MethodGet, "/v1/me/agent-scopes?agent_id="+agent, ""); code != http.StatusOK || toolList(out) != access.ToolListFull {
+		t.Fatalf("read back: %d %v", code, out)
+	}
+	if e.access.ToolListFor(ctx, agent) != access.ToolListFull || !e.access.ScopeFor(ctx, agent).All {
+		t.Fatal("the full list must be stored, and must not limit the agent")
+	}
+	if code, _ := send(adminCookie, http.MethodPost, "/v1/me/agent-scopes", scopeBody("everything")); code != http.StatusBadRequest {
+		t.Fatalf("an unknown tool list: %d, want 400", code)
+	}
+	m := e.member(t, "user_m", "m@example.com")
+	if code, _ := send(e.cookieFor(t, m.ID), http.MethodPost, "/v1/me/agent-scopes", scopeBody("small")); code != http.StatusNotFound {
+		t.Fatalf("a member changing another person's agent: %d, want 404", code)
+	}
+	if e.access.ToolListFor(ctx, agent) != access.ToolListFull {
+		t.Fatal("a refused change switched the tool list")
+	}
+	if code, out := send(adminCookie, http.MethodPost, "/v1/me/agent-scopes", `{"agent_id":"`+agent+`","scope":{"mode":"all"}}`); code != http.StatusOK || toolList(out) != access.ToolListSmall {
+		t.Fatalf("a scope without tool_list is the small list: %d %v", code, out)
+	}
+
+	// A connected app.
+	reg, oerr := svc.Register(ctx, []byte(`{"redirect_uris":["https://a.example/cb"],"token_endpoint_auth_method":"none"}`), "198.51.100.7")
+	if oerr != nil {
+		t.Fatal(oerr)
+	}
+	authorize := func() *mcpauth.AuthorizeRequest {
+		t.Helper()
+		q := url.Values{"response_type": {"code"}, "client_id": {reg.ClientID}, "redirect_uri": {"https://a.example/cb"},
+			"code_challenge": {strings.Repeat("a", 43)}, "code_challenge_method": {"S256"}}
+		req, aerr := svc.BeginAuthorize(ctx, q, "198.51.100.7")
+		if aerr != nil {
+			t.Fatalf("authorize: %+v", aerr)
+		}
+		return req
+	}
+	if _, err := svc.Approve(ctx, authorize().ID, e.admin, mcpauth.Consent{Nickname: "App"}); err != nil {
+		t.Fatal(err)
+	}
+	apps, err := svc.ListApps(ctx, e.admin.ID)
+	if err != nil || len(apps) != 1 || apps[0].Scope.ToolList != access.ToolListSmall {
+		t.Fatalf("a new app: %+v %v", apps, err)
+	}
+	code, out = send(adminCookie, http.MethodPost, "/v1/me/apps/scope", `{"id":"`+apps[0].ID+`","scope":{"mode":"all","tool_list":"full"}}`)
+	if app, _ := out["app"].(map[string]any); code != http.StatusOK || toolList(app) != access.ToolListFull {
+		t.Fatalf("app switch to full: %d %v", code, out)
+	}
+	// Connecting again through the consent screen keeps it.
+	pending := authorize()
+	consentURL := mcpauth.ConsentPath + "?request=" + url.QueryEscape(pending.ID)
+	r := httptest.NewRequest(http.MethodGet, consentURL, nil)
+	r.AddCookie(adminCookie)
+	page := httptest.NewRecorder()
+	mux.ServeHTTP(page, r)
+	nonce := regexp.MustCompile(`name="nonce" value="([^"]+)"`).FindStringSubmatch(page.Body.String())
+	if page.Code != http.StatusOK || nonce == nil {
+		t.Fatalf("consent page: %d %s", page.Code, page.Body)
+	}
+	form := url.Values{"verdict": {"allow"}, "nonce": {nonce[1]}, "nickname": {"App"}, "scope_mode": {"all"}}
+	r = httptest.NewRequest(http.MethodPost, consentURL, strings.NewReader(form.Encode()))
+	r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	r.AddCookie(adminCookie)
+	for _, c := range page.Result().Cookies() {
+		r.AddCookie(c)
+	}
+	rec := httptest.NewRecorder()
+	mux.ServeHTTP(rec, r)
+	if rec.Code != http.StatusFound {
+		t.Fatalf("consent again: %d %s", rec.Code, rec.Body)
+	}
+	if got := e.access.ToolListFor(ctx, apps[0].AgentID); got != access.ToolListFull {
+		t.Fatalf("connecting again reset the tool list to %q", got)
 	}
 }
 

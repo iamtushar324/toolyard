@@ -30,11 +30,16 @@ const metaSearchSkillsSentence = "When toolyard serves skills, the answer also n
 // metaSearchDescription is the tools.search description, with the skills
 // sentence when skills is set.
 func metaSearchDescription(skills bool) string {
-	d := descriptionBanner + "Search the toolyard catalog for the tools you may use, ranked. " +
-		"mode \"keyword\" (default) ranks by BM25 over tool names (split at dots, underscores and camelCase), descriptions, parameter names and parameter descriptions: query \"create a linear issue\". " +
-		"mode \"regex\" matches an RE2 pattern (at most 200 characters, case-insensitive unless the pattern turns that off) against the same fields: query \"^github\\\\..*pull\". " +
-		"mode \"auto\" is keyword; \"semantic\" works only where an operator configured it. " +
-		"detail \"full\" (default) returns name, upstream, description, the code-mode name, score and the input and output schemas; \"summary\" leaves out the schemas; \"name\" only names. "
+	d := descriptionBanner + "Find the tools you may use, best first: your one way to discover tools. Describe the task in plain words. " +
+		"mode \"auto\" (default) ranks by meaning with Jev, a classification model, where the operator turned it on, and falls back to keyword ranking when it is off, slow or failing; " +
+		"\"semantic\" is Jev with the same fallback (refused where Jev is off); " +
+		"\"keyword\" ranks by BM25 over tool names, descriptions and parameters: query \"create a linear issue\"; " +
+		"\"regex\" matches an RE2 pattern (at most 200 characters, case-insensitive unless the pattern turns that off) against the same fields: query \"^github\\\\..*pull\". " +
+		"The answer's ranked_by says what ordered it (jev, keyword, regex or name) and fallback why Jev did not (off, no_key, timeout, error, empty, busy; \"\" when it did). " +
+		"With ranked_by jev, score is Jev's probability (0 to 1) that the tool fits; tools Jev did not judge follow without one. " +
+		"Each result's run says what a call gets now: \"now\" runs, \"needs_approval\" needs your owner's yes, \"blocked\" is denied by policy (do not call it). " +
+		"For tools that need approval, ask with inbox.request: put every restricted call and every question of this round into ONE request, and ask again only for what the answers open. " +
+		"detail \"full\" (default) returns name, upstream, description, the code-mode name, score, run and the input and output schemas; \"summary\" leaves out the schemas; \"name\" only names. "
 	if skills {
 		d += metaSearchSkillsSentence
 	}
@@ -53,12 +58,12 @@ func (g *Gateway) metaTools() []toolEntry {
 			Properties: addMetaProps(map[string]any{
 				"query": map[string]any{
 					"type":        "string",
-					"description": "Words to rank by (keyword), or an RE2 pattern (regex). Empty lists every tool, by name.",
+					"description": "The task in plain words (auto, semantic, keyword), or an RE2 pattern (regex). Empty lists every tool, by name.",
 				},
 				"mode": map[string]any{
 					"type":        "string",
-					"enum":        []string{string(toolsearch.ModeKeyword), string(toolsearch.ModeRegex), string(toolsearch.ModeSemantic), string(toolsearch.ModeAuto)},
-					"description": "keyword (default), regex, semantic (only where configured) or auto (keyword).",
+					"enum":        []string{string(toolsearch.ModeAuto), string(toolsearch.ModeSemantic), string(toolsearch.ModeKeyword), string(toolsearch.ModeRegex)},
+					"description": "auto (default: Jev where on, else keyword), semantic (Jev, refused where off), keyword or regex.",
 				},
 				"detail": map[string]any{
 					"type":        "string",
@@ -122,8 +127,9 @@ type SearchError struct{ Message string }
 
 func (e *SearchError) Error() string { return e.Message }
 
-// SetToolSearch replaces the search engine (a semantic provider, say).
-// Without it the gateway uses keyword and regex search.
+// SetToolSearch replaces the search engine (one with a semantic provider,
+// such as toolsearch.DecisionsRanker). Without it the gateway ranks by
+// keyword (auto) and regex.
 func (g *Gateway) SetToolSearch(e *toolsearch.Engine) { g.search.Store(e) }
 
 func (g *Gateway) toolSearch() *toolsearch.Engine {
@@ -136,9 +142,10 @@ func (g *Gateway) toolSearch() *toolsearch.Engine {
 
 // SearchTools ranks the tools the ctx caller may use (CatalogFor's scope)
 // and returns the body tools.search answers with: total (results
-// returned), matched (before the limit), mode and results. The meta-tools
-// themselves are left out, so a model can't recurse tools.execute ->
-// tools.execute.
+// returned), matched (before the limit), mode, ranked_by, fallback and
+// results, each with its run status (search_run.go) unless detail is name.
+// The meta-tools themselves are left out, so a model can't recurse
+// tools.execute -> tools.execute.
 func (g *Gateway) SearchTools(ctx context.Context, req SearchRequest) (map[string]any, error) {
 	mode, err := toolsearch.ParseMode(req.Mode)
 	if err != nil {
@@ -162,11 +169,18 @@ func (g *Gateway) SearchTools(ctx context.Context, req SearchRequest) (map[strin
 		return nil, err
 	}
 	results := toolsearch.Render(res.Hits, detail)
+	if detail != toolsearch.DetailName {
+		for i, run := range g.runStatuses(ctx, res.Hits) {
+			results[i].Run = run
+		}
+	}
 	body := map[string]any{
-		"total":   len(results),
-		"matched": res.Matched,
-		"mode":    string(res.Mode),
-		"results": results,
+		"total":     len(results),
+		"matched":   res.Matched,
+		"mode":      string(res.Mode),
+		"ranked_by": res.RankedBy,
+		"fallback":  res.Fallback,
+		"results":   results,
 	}
 	if skills := g.searchSkillsFor(ctx, req.Query, res.Mode); len(skills) > 0 {
 		body["skills"] = skills

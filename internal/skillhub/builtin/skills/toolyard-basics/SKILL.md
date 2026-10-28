@@ -1,6 +1,6 @@
 ---
 name: toolyard-basics
-description: Start here on a toolyard MCP gateway. Explains what toolyard is (one gateway in front of many upstream MCP servers, with per-user access, policies, the Inbox and an audit log), who you are to it (access.whoami), the _reason field every call needs, how to find tools (tools.search, servers.list, tools.execute), how policy decides allow, ask or deny (policies.list, policies.explain), sign-ins (connections.status, connections.link), work sessions (session.start, session.update, _session_id) and your own audit trail (audit.mine). Use it when you first connect to toolyard, before you pick another toolyard skill, when a tool you expect is missing, or when a call fails with "_reason is required", "tool not found in catalog", "not allowed for this agent", "denied by policy", permission_required, grant_invalid, outcome_unknown, "server restarting", a pending-approval budget error, "upstream not connected" or a connect link that says the server is not connected yet.
+description: Start here on a toolyard MCP gateway. Explains what toolyard is (one gateway in front of many MCP servers, with access, policies, the Inbox and audit), the five tools you see by default (tools.search, getToolDocs, executeToolCode, inbox.request, inbox.status) and how they reach the rest, who you are to it (access.whoami), the _reason field every call needs, servers.list, how policy decides allow, ask or deny (policies.list, policies.explain), sign-ins (connections.status, connections.link), work sessions (session.start, session.update, _session_id) and your own audit trail (audit.mine). Use it when you first connect to toolyard, before you pick another toolyard skill, when a tool you expect is missing, or when a call fails with "_reason is required", "tool not found in catalog", "not allowed for this agent", "denied by policy", permission_required, grant_invalid, outcome_unknown, "server restarting", a pending-approval budget error, "upstream not connected" or a connect link.
 metadata:
   toolyard-runs: anywhere
 ---
@@ -8,8 +8,8 @@ metadata:
 # toolyard basics
 
 toolyard is one MCP gateway in front of many upstream MCP servers. You connect
-to it once. It lists the tools of every server your owner may use, named
-`<server>.<tool>`, beside its own built-in tools (`tools.*`, `inbox.*`,
+to it once. It reaches the tools of every server your owner may use, named
+`<server>.<tool>`, and its own built-in tools (`tools.*`, `inbox.*`,
 `access.*`, …). Upstream credentials stay inside toolyard: you never see them
 and you never need them.
 
@@ -27,16 +27,48 @@ Every call takes the same path:
 This skill is guidance, not permission: every call it suggests still goes
 through policy and the Inbox.
 
+## The five tools you see
+
+By default your tool list shows five tools. They reach every other tool you
+may use:
+
+| Tool | What you do with it |
+|---|---|
+| `tools.search` | Find a tool by what it does. Each result gives the name to call it by (`code`) and `run`: `now`, `needs_approval` or `blocked`. |
+| `getToolDocs` | Read one tool's parameters: `server` and `tool` are the two halves of a result's `code`. |
+| `executeToolCode` | Run tools in a short Starlark (default) or JavaScript script. |
+| `inbox.request` | Ask your owner for permission: every restricted call and every question of a round in one request. |
+| `inbox.status` | Read the decision, the answers and the grants. |
+
+The flow is find, read, run, and ask once per round when something needs
+approval. In a script toolyard's own tools are the server `toolyard`, named
+`toolyard.<group>_<name>`: `access.whoami` is `toolyard.access_whoami()` and
+`session.start` is `toolyard.session_start(title="…")`. The calls in this
+skill are written as direct calls (the tool, then its JSON arguments). A tool
+that is not in your list still answers a direct call, but most clients call
+only listed tools: make the same call in `executeToolCode`. Inside a script
+`_reason` is optional, because nested calls carry the run's reason. An owner
+can switch one agent to the full tool list; the same flow works there.
+
+```text
+executeToolCode
+{"code": "me = toolyard.access_whoami()\nses = toolyard.session_start(title=\"Fix the flaky billing export test\", repo=\"acme/api\")\nresult = {\"agent\": me[\"agent_name\"], \"session\": ses[\"id\"]}",
+ "_reason": "Learn which agent I run as and name this piece of work for my owner"}
+```
+
 ## First five minutes
 
 1. Learn who you are: `access.whoami`. Check `owner.role`,
    `granted_servers`, `agent_limits` and `can_change_policies`.
 2. Name your work: `session.start`, then pass its `id` as `_session_id`.
-3. Find a playbook and the tools: `skills.search` (when toolyard serves
-   skills) and `tools.search` with a few words about the task.
-4. Before restricted work, run `inbox.check` on the calls you plan and ask once
-   with `inbox.request`. See the `toolyard-permissions-and-inbox` skill
-   (`skills.get toolyard/toolyard-permissions-and-inbox`).
+3. Find the tools and a playbook: `tools.search` with a few words about the
+   task. When toolyard serves skills its answer also names matching skills
+   under `skills`.
+4. Before restricted work, plan the round: every call that search marks
+   `run: needs_approval`, and every question you have for your owner, goes
+   into ONE `inbox.request`; read the decision with `inbox.status`. Ask again
+   only for what the answers open. See the `toolyard-permissions-and-inbox`
+   skill (`skills.get toolyard/toolyard-permissions-and-inbox`).
 5. When a call fails, read its message and structured content first, then
    [errors](references/errors.md). Finish with `session.update` status `done`.
 
@@ -114,30 +146,37 @@ explicit rule allows it. Declaring `read` never lets a call skip approval.
 
 ## Find tools
 
-- Your catalog shows only the tools you may use. An administrator can also set
-  a surface mode: `full` (everything), `top_n` (the pinned tools plus the
+- Your catalog holds only the tools you may use, and by default your list
+  shows the five tools above. On the full tool list an administrator can also
+  set a surface mode: `full` (everything), `top_n` (the pinned tools plus the
   tools used most, 20 by default) or `router_only` (the pinned tools only).
-  The built-in tools are pinned, so `tools.search` and `tools.execute` are
-  always there.
-- `tools.search`: `query`, `mode` (`keyword` default, `regex` with an RE2
-  pattern of at most 200 characters, `semantic` only where an operator
-  configured it), `detail` (`full` default with input and output schemas,
-  `summary`, `name`), `upstream` (one server), `limit` (default 50, at most
-  200). The answer has `total`, `matched`, `mode` and `results` (`name`,
-  `upstream`, `description`, `code`, `score`, schemas). When toolyard serves
-  skills it also names up to 3 matching skills under `skills`: read one with
-  `skills.get`.
-- `tools.execute`: call any tool you may use by its catalog name, including
-  one a surface mode hides from your catalog. The target's access, policy and
+  The built-in tools are pinned. Neither list changes what you may call.
+- `tools.search`: `query` (the task in plain words), `mode`, `detail` (`full`
+  default with input and output schemas, `summary`, `name`), `upstream` (one
+  server), `limit` (default 50, at most 200). `mode` `auto` (default) ranks by
+  meaning with Jev, a classification model, where the operator turned it on,
+  else by keyword; `semantic` is Jev only (refused where it is off);
+  `keyword` ranks by BM25; `regex` takes an RE2 pattern of at most 200
+  characters. The answer has `total`, `matched`, `mode`, `ranked_by` (`jev`,
+  `keyword`, `regex` or `name`), `fallback` (why Jev did not rank: `off`,
+  `no_key`, `timeout`, `error`, `empty`, `busy`; `""` when it did) and
+  `results` (`name`, `upstream`, `description`, `code`, `score`, `run`,
+  schemas). `run` is what a call with no arguments gets now: `now`,
+  `needs_approval` or `blocked`. When toolyard serves skills the answer also
+  names up to 3 matching skills under `skills`: read one with `skills.get`
+  (in a script, `toolyard.skills_get(skill="…")`).
+- `tools.execute` (full tool list): call any tool you may use by its catalog
+  name, including one a surface mode hides. The target's access, policy and
   approval rules apply unchanged. The outer `_reason` is used when
-  `arguments` has none.
+  `arguments` has none. On the default list, call the tool in
+  `executeToolCode` instead.
 - `servers.list`: each server you may use, with `status` (`ok`, `error`,
   `waiting_signin`, `disabled`, `idle`, `unknown`), `tool_count`,
   `auth_mode` (`shared` or `per_user`) and sign-in state. No secrets; an
   `error` keeps only a URL's scheme and host.
-- Code mode (`listToolFiles`, `readToolFile`, `getToolDocs`,
-  `executeToolCode`) runs a script that calls many tools in one turn. See the
-  `toolyard-code-mode` skill.
+- Code mode (`getToolDocs` and `executeToolCode`, plus `listToolFiles` and
+  `readToolFile` on the full list) runs a script that calls many tools in one
+  turn. See the `toolyard-code-mode` skill.
 
 ```text
 tools.execute
@@ -171,7 +210,8 @@ results:
 - `allow`: the call runs.
 - `ask`: the call returns `permission_required` with a draft request. Nothing
   ran and nothing reached your owner. Do not retry it: follow the
-  `toolyard-permissions-and-inbox` skill.
+  `toolyard-permissions-and-inbox` skill. `tools.search` shows this ahead of
+  time as `run: needs_approval` (`allow` is `now`, `deny` is `blocked`).
 - `deny`: `denied by policy: <reason>`. Do not ask for it in the Inbox.
 - GitHub writes always wait for the account owner's own approval and answer
   with an `approval_id`. See the `toolyard-github-writes` skill.
@@ -253,6 +293,8 @@ their own skill:
   API call, no other agent. A workaround is treated as a security incident.
 - Never retry a `permission_required` call without a grant. It answers the
   same way again.
+- Never ask for one call at a time. Every restricted call and every question
+  of a round goes into one `inbox.request`.
 - Never repeat a write that answered `outcome_unknown`. It may have committed.
   Check the upstream state, `audit.mine` and `inbox.status` first.
 - Never put a token, password or grant in `_reason`, arguments, logs or

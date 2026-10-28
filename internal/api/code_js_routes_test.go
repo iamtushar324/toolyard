@@ -148,20 +148,31 @@ func TestCodeSearchAndTypeScriptFilesOverREST(t *testing.T) {
 		t.Fatalf("search: %d %s", rec.Code, rec.Body.String())
 	}
 	var body struct {
-		Total   int    `json:"total"`
-		Mode    string `json:"mode"`
-		Results []struct {
+		Total    int     `json:"total"`
+		Mode     string  `json:"mode"`
+		RankedBy string  `json:"ranked_by"`
+		Fallback *string `json:"fallback"`
+		Results  []struct {
 			Name string `json:"name"`
 			Code string `json:"code"`
+			Run  string `json:"run"`
 		} `json:"results"`
 	}
-	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil || body.Mode != "regex" || body.Total == 0 || len(body.Results) > 5 {
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil || body.Mode != "regex" || body.Total == 0 || len(body.Results) > 5 ||
+		body.RankedBy != "regex" || body.Fallback == nil || *body.Fallback != "" {
 		t.Fatalf("search body: %v %s", err, rec.Body.String())
 	}
 	for _, r := range body.Results {
-		if !strings.Contains(r.Name, "memory") || !strings.HasPrefix(r.Code, "toolyard.memory_") {
+		if !strings.Contains(r.Name, "memory") || !strings.HasPrefix(r.Code, "toolyard.memory_") ||
+			(r.Run != "now" && r.Run != "needs_approval" && r.Run != "blocked") {
 			t.Fatalf("result %+v", r)
 		}
+	}
+	// The default mode is auto: keyword here, where no ranker is configured.
+	rec = e.do(t, http.MethodGet, "/v1/code/search?q=memory&detail=summary", e.tokA, "")
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil || rec.Code != http.StatusOK || body.Mode != "keyword" ||
+		body.RankedBy != "keyword" || body.Fallback == nil || *body.Fallback != "off" || len(body.Results) == 0 || body.Results[0].Run == "" {
+		t.Fatalf("auto search: %d %v %s", rec.Code, err, rec.Body.String())
 	}
 	for path, want := range map[string]int{
 		"/v1/code/search?q=x&mode=fuzzy":    http.StatusBadRequest,
