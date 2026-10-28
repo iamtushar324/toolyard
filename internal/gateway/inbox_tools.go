@@ -799,10 +799,14 @@ func submitResult(res *inbox.SubmitResult) *mcp.CallToolResult {
 	for _, p := range res.Problems {
 		fmt.Fprintf(&b, "\n- %s: %s", p.Path, p.Message)
 	}
-	out := mcp.NewToolResultText(b.String())
-	if !res.OK {
-		out.IsError = !res.DryRun
+	if res.DryRun {
+		valid := res.OK
+		res.Valid = &valid
 	}
+	out := mcp.NewToolResultText(b.String())
+	// A dry run with problems is an error too, so a script's try_call
+	// reports it as failed rather than succeeded.
+	out.IsError = !res.OK
 	out.StructuredContent = res
 	return out
 }

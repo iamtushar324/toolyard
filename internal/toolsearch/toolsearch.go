@@ -58,6 +58,10 @@ type Tool struct {
 	// ("BkCoreServices.get_client", "toolyard.inbox_request"), "" when it
 	// has none.
 	CodeName string
+	// ReadOnly is the tool's readOnlyHint annotation: true when the
+	// catalog says the tool changes nothing, so a request may ask for it
+	// with operation "read".
+	ReadOnly bool
 }
 
 // Mode picks how a query matches.
@@ -614,9 +618,9 @@ func catalogKey(tools []Tool) string {
 		t := tools[i]
 		schema, _ := json.Marshal(t.InputSchema)
 		output, _ := json.Marshal(t.OutputSchema)
-		fmt.Fprintf(h, "%d:%s\x00%d:%s\x00%d:%s\x00%d:%s\x00%d:%s\x00%d:%s\x00",
+		fmt.Fprintf(h, "%d:%s\x00%d:%s\x00%d:%s\x00%d:%s\x00%d:%s\x00%d:%s\x00%t\x00",
 			len(t.Name), t.Name, len(t.Server), t.Server, len(t.Description), t.Description,
-			len(t.CodeName), t.CodeName, len(schema), schema, len(output), output)
+			len(t.CodeName), t.CodeName, len(schema), schema, len(output), output, t.ReadOnly)
 	}
 	return hex.EncodeToString(h.Sum(nil))
 }
@@ -636,7 +640,10 @@ type Entry struct {
 	// Run is what a call with no arguments would get now ("now",
 	// "needs_approval" or "blocked"); the gateway fills it in, Render
 	// leaves it empty.
-	Run          string         `json:"run,omitempty"`
+	Run string `json:"run,omitempty"`
+	// ReadOnly is the tool's readOnlyHint: only a read-only tool may be
+	// requested with operation "read". Left out at detail name.
+	ReadOnly     *bool          `json:"read_only,omitempty"`
 	InputSchema  map[string]any `json:"input_schema,omitempty"`
 	OutputSchema map[string]any `json:"output_schema,omitempty"`
 }
@@ -646,6 +653,10 @@ func Render(hits []Hit, d Detail) []Entry {
 	out := make([]Entry, len(hits))
 	for i, h := range hits {
 		e := Entry{Name: h.Tool.Name}
+		if d != DetailName {
+			readOnly := h.Tool.ReadOnly
+			e.ReadOnly = &readOnly
+		}
 		switch d {
 		case DetailName:
 		case DetailFull:

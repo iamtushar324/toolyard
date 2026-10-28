@@ -294,6 +294,7 @@ func (g *Gateway) searchCatalog(ctx context.Context) []toolsearch.Tool {
 			Description:  desc,
 			InputSchema:  map[string]any{"type": "object", "properties": props, "required": reqAny},
 			OutputSchema: outputSchemaOf(e.tool),
+			ReadOnly:     e.tool.Annotations.ReadOnlyHint != nil && *e.tool.Annotations.ReadOnlyHint,
 		})
 	}
 	names := codemode.CodeNames(codeTools)
