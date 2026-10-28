@@ -596,8 +596,10 @@ func TestLongEnumIsListedOnceAndShort(t *testing.T) {
 	if b == nil {
 		t.Fatal("no tool BkT3.t3_ui_call")
 	}
+	// The usage line may name one value as its example; the list itself
+	// appears once.
 	ts := tsTool(srv, *b)
-	if len(ts) > 3000 || strings.Count(ts, `"action_000"`) != 1 || strings.Contains(ts, "action_020") || !strings.Contains(ts, "action: string;") {
+	if len(ts) > 3000 || strings.Count(ts, `"action_000", "action_001"`) != 1 || strings.Contains(ts, "action_020") || !strings.Contains(ts, "action: string;") {
 		t.Errorf("TypeScript stub (%d bytes) does not list the enum once and short:\n%s", len(ts), ts)
 	}
 	if got := pythonType(map[string]any{"enum": enum}); got != "str" {
