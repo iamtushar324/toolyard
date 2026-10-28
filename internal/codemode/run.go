@@ -76,6 +76,19 @@ const (
 // not be audited. A run ends outcome_unknown on such a call.
 const OutcomeUnknownMarker = "toolyard.outcome_unknown"
 
+// DispatchIDMarker is the result metadata key (a string) by which the
+// gateway names the dispatch a call went through.
+const DispatchIDMarker = "toolyard.dispatch_id"
+
+// dispatchIDOf is the dispatch id in res's metadata, or "".
+func dispatchIDOf(res *mcp.CallToolResult) string {
+	if res == nil || res.Meta == nil {
+		return ""
+	}
+	id, _ := res.Meta.AdditionalFields[DispatchIDMarker].(string)
+	return id
+}
+
 // grantInvalidMarker is the metadata key of the gateway's answer to a
 // call whose _grant it refused.
 const grantInvalidMarker = "toolyard.grant_invalid"

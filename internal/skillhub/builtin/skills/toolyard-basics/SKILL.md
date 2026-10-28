@@ -269,10 +269,13 @@ member's agent is told which admins to ask.
 ## Your audit trail
 
 `audit.mine` (`limit` default 50, at most 200; `since` as RFC 3339, or
-`since_minutes`) returns your own recent rows: `ts`, `tool`, `server`,
-`event`, `decision`, `reason`, `via`, `approval_id`, `decided_via`,
-`decided_by`. It never shows another agent's rows, arguments or results. Use it
-to check what ran after a lost response, before you decide to repeat anything.
+`since_minutes`; `dispatch_id` for the rows of one dispatch) returns your own
+recent rows: `ts`, `tool`, `server`, `event`, `outcome` (`started`,
+`succeeded` or `failed` for a dispatch row), `dispatch_id`, `decision`,
+`reason`, `via`, `approval_id`, `decided_via`, `decided_by`. It never shows
+another agent's rows, arguments or results. Use it to check what ran after a
+lost response, before you decide to repeat anything. An `outcome_unknown`
+answer and `try_call` name the `dispatch_id` to look up.
 
 ## Other built-in tools
 

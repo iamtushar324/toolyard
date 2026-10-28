@@ -39,7 +39,8 @@ Quoted texts below are what toolyard answers; `<…>` marks a part that varies.
 | Answer | Meaning | Do this |
 |---|---|---|
 | `outcome_unknown` (execution state, job status, code-mode status) | A write may have committed before the answer was lost. | Read the upstream state with read tools, `audit.mine` and `inbox.status`. Never repeat the write blindly. |
-| `Tool outcome unknown: completion audit failed. Do not retry. Review dispatch <id> before another action.` | The call was sent but its outcome was not recorded. | The same: reconcile first. |
+| `Tool outcome unknown: the upstream call <succeeded \| returned an error \| failed: …>, but its audit record was not saved. Do not repeat the write. Check it with audit.mine dispatch_id="<id>" or with the target system.` | A write was sent and the upstream answered as shown, but toolyard could not save its audit record. | Do not repeat the write. Run `audit.mine` with that `dispatch_id`, or read the target system, before another action. |
+| A result that ends with `Warning: the audit record for dispatch <id> was not saved. The result above is complete.` | A read-only call ran and its result is complete; only its audit record is missing. | Use the result. Nothing to reconcile. |
 | `execution outcome could not be recorded; do not repeat this call; inspect Inbox status` | A granted call ran but its outcome could not be saved. | Read `inbox.status` and the upstream state. Do not repeat it. |
 
 ## Sign-ins and connections

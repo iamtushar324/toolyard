@@ -250,9 +250,13 @@ func replyValue(reply parentMsg) starlark.Value {
 
 // tryValue is an answer as try_call returns it: {"ok": True, "status":
 // "succeeded", "result": ...} or {"ok": False, "status": ..., "error":
-// ...} (with "approval_id" for a deferred call).
+// ...} (with "approval_id" for a deferred call). Either has "dispatch_id"
+// when the call reached a gateway dispatch.
 func tryValue(reply parentMsg) starlark.Value {
-	d := starlark.NewDict(4)
+	d := starlark.NewDict(5)
+	if reply.DispatchID != "" {
+		_ = d.SetKey(starlark.String("dispatch_id"), starlark.String(reply.DispatchID))
+	}
 	if reply.Error == "" {
 		_ = d.SetKey(starlark.String("ok"), starlark.True)
 		_ = d.SetKey(starlark.String("status"), starlark.String(StatusSucceeded))

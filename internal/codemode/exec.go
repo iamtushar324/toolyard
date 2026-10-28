@@ -514,6 +514,13 @@ func (s *session) perform(pc *preparedCall) (reply parentMsg) {
 	}
 
 	var res *mcp.CallToolResult
+	// Every answer to a call that reached a dispatch names it, success or
+	// failure, so try_call can hand the id to the script.
+	defer func() {
+		if reply.DispatchID == "" {
+			reply.DispatchID = dispatchIDOf(res)
+		}
+	}()
 	handled := false
 	if s.hooks != nil {
 		var herr error

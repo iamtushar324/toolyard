@@ -122,6 +122,7 @@ type jsReply struct {
 	Status     string          `json:"status,omitempty"`
 	Error      string          `json:"error,omitempty"`
 	ApprovalID string          `json:"approvalId,omitempty"`
+	DispatchID string          `json:"dispatchId,omitempty"`
 }
 
 // jsBudget splits a worker's memory cap of mib MiB: QuickJS's heap limit,
@@ -310,7 +311,7 @@ func (h *jsHost) call(m jsMsg) {
 // is JSON goes as that JSON value, so the engine parses it once, with the
 // rest of the line, instead of receiving it as a string to parse again.
 func (h *jsHost) reply(jsID int, r parentMsg) {
-	rep := jsReply{ID: jsID, OK: r.Error == "", Status: r.Status, Error: r.Error, ApprovalID: r.ApprovalID}
+	rep := jsReply{ID: jsID, OK: r.Error == "", Status: r.Status, Error: r.Error, ApprovalID: r.ApprovalID, DispatchID: r.DispatchID}
 	var value []byte
 	switch {
 	case len(r.JSON) > 0:

@@ -178,13 +178,16 @@
       if (isTry) {
         if (reply.ok) {
           try {
-            return { ok: true, status: "succeeded", result: decode(reply) };
+            const ok = { ok: true, status: "succeeded", result: decode(reply) };
+            if (reply.dispatchId) ok.dispatch_id = reply.dispatchId;
+            return ok;
           } catch (e) {
             return { ok: false, status: "failed", error: String(e && e.message || e) };
           }
         }
         const res = { ok: false, status: reply.status || "failed", error: reply.error };
         if (reply.approvalId) res.approval_id = reply.approvalId;
+        if (reply.dispatchId) res.dispatch_id = reply.dispatchId;
         return res;
       }
       if (!reply.ok) throw new ToolCallError(reply.error, reply.status || "failed", id, reply.approvalId);

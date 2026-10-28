@@ -48,7 +48,9 @@ if not r["ok"]:
 It answers `{"ok": True, "status": "succeeded", "result": …}` or
 `{"ok": False, "status": …, "error": …}`, with `"approval_id"` added for a
 deferred call. `status` is `failed`, `permission_required`, `deferred` or
-`outcome_unknown`.
+`outcome_unknown`. Both carry `"dispatch_id"` when the call reached the
+gateway's dispatch: look an `outcome_unknown` call up with
+`toolyard.audit_mine(dispatch_id=r["dispatch_id"])` before you repeat a write.
 
 ## parallel
 

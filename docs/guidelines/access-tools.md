@@ -16,7 +16,7 @@ is for agents and for the admins who read the audit log.
 | `policies.clear` | admin-owned enrolled agents | Remove an explicit policy so the target falls back to the rules below it. Judged by the same rule. |
 | `servers.list` | everyone | The servers your owner may use: name, enabled, status (`ok`, `error`, `waiting_signin`, `disabled`), tool count, auth mode (`shared` or `per_user`) and, for servers with a stored sign-in, whether one exists (on a `per_user` server: whether *your owner* connected it). Never URLs, headers or secrets; a URL inside an error message is reduced to `scheme://host`. |
 | `servers.reconnect` | admin-owned enrolled agents | Drop a server's connection and dial again, e.g. after `servers.list` shows an error. Audited (`server.reconnect`). |
-| `audit.mine` | enrolled agents | Your own recent calls and how toolyard decided them (tool, event, decision, reason, time, via). Only your rows, never another agent's; no arguments or result bodies. `limit` (default 50, max 200), `since` (RFC 3339) or `since_minutes`. |
+| `audit.mine` | enrolled agents | Your own recent calls and how toolyard decided them (tool, event, outcome, dispatch_id, decision, reason, time, via). Only your rows, never another agent's; no arguments or result bodies. `limit` (default 50, max 200), `since` (RFC 3339) or `since_minutes`, `dispatch_id` (the rows of one dispatch). |
 | `access.whoami` | everyone | Your agent, its owner (email, role), the servers you were granted, the always-on groups, whether you may change policies, and `agent_limits` when your owner narrowed this agent (Connected apps). |
 
 A member sees only what is in their scope: `policies.list` and
