@@ -231,11 +231,39 @@ custom text field. Set `kind: "blocker"` when the question blocks progress.
 
 - **`summary` is yours**, and your owner reads it. Describe what the call
   does in plain words, not the tool's description.
+
+Fields of each `tools[]` entry:
+
+| field | read | write |
+|---|---|---|
+| `call_id`, `tool`, `summary`, `target`, `operation`, `expected_effects`, `params` | required | required |
+| `affected_scope`, `material_risks`, `undo` | — | required |
+| `required`, `after` | optional | optional |
+
 - **`call_id`** is a stable unique identifier, distinct from the tool name. Repeated tools need distinct call IDs.
 - **`summary`** explains the purpose and its relationship to the task.
-- **`target`**, **`operation`**, and **`expected_effects`** are required for every call.
+- **`operation`** is `read` or `write`. `read` is accepted only for a tool
+  the catalog marks read-only (its `readOnlyHint`). `tools.search` shows
+  `read_only` for each tool. When it is `false`, use `write`.
 - For writes, supply **`affected_scope`**, **`material_risks`**, and **`undo`**.
-  State explicitly when the action cannot be undone. Catalog metadata determines whether a tool is read-only.
+  State explicitly when the action cannot be undone.
+
+A minimal read:
+
+```json
+{ "call_id": "echo_hello", "tool": "fixture.echo", "summary": "Echo a test message to check the gateway path.",
+  "target": "fixture echo tool", "operation": "read", "expected_effects": "Returns the message; nothing changes.",
+  "params": { "message": { "eq": "hello" } } }
+```
+
+A minimal write:
+
+```json
+{ "call_id": "deploy_api", "tool": "deploy.run", "summary": "Deploy the api fix to prod.",
+  "target": "Production API service", "operation": "write", "expected_effects": "The API runs the fixed release.",
+  "affected_scope": "API service deployment", "material_risks": "A bad release can interrupt API requests.",
+  "undo": "Redeploy the previous release.", "params": { "service": { "eq": "api" }, "env": { "eq": "prod" } } }
+```
 - **`required`** is only a planning hint. The human can reject any call and complete the decision.
   Return rejected calls to the agent without permission.
 - **`params`**: give every argument you'll pass. **Your grant covers only
@@ -362,6 +390,8 @@ lowered, and returns a warning with `path: "urgency"`.
 ```json
 {
   "ok": false,
+  "dry_run": true,
+  "valid": false,
   "problems": [
     { "path": "audio.script", "message": "112 words; max 75. Keep the ask and one number." },
     { "path": "attachments[1].url", "message": "localhost isn't reachable from toolyard." }
@@ -375,7 +405,9 @@ lowered, and returns a warning with `path: "urgency"`.
 }
 ```
 
-- **Fix every problem.** A request with problems is rejected.
+- **Fix every problem.** A request with problems is rejected. A dry run
+  with problems is an error result (`isError: true`, `valid: false`), so
+  `try_call` reports it as failed. A passed dry run returns `valid: true`.
 - **Read the warnings.** They don't block sending, but your owner will notice
   what they point at.
 - **Flags aren't errors.** They're what your owner will see. Judge flags

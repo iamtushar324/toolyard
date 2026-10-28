@@ -22,7 +22,7 @@ func (g *Gateway) ValidateScope(ctx context.Context, agentID string, call inbox.
 	add := func(path, message string) { problems = append(problems, inbox.Problem{Path: path, Message: message}) }
 	readOnly := entry.tool.Annotations.ReadOnlyHint != nil && *entry.tool.Annotations.ReadOnlyHint
 	if call.Operation == "read" && !readOnly {
-		add("operation", "catalog does not establish this tool as read-only; use write and supply affected_scope, material_risks and undo")
+		add("operation", `catalog does not establish this tool as read-only; use operation "write" and supply affected_scope, material_risks and undo. tools.search shows read_only for each tool`)
 	}
 	b, err := json.Marshal(entry.tool.InputSchema)
 	if err != nil {
