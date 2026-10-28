@@ -327,8 +327,11 @@ func shortID(id string) string {
 
 // SubmitResult is what the agent gets back from inbox.request/ask/post.
 type SubmitResult struct {
-	OK        bool       `json:"ok"`
-	DryRun    bool       `json:"dry_run,omitempty"`
+	OK     bool `json:"ok"`
+	DryRun bool `json:"dry_run,omitempty"`
+	// Valid is set only on a dry run: true when it passed, false when it
+	// found problems, so a caller can tell the two apart without the text.
+	Valid     *bool      `json:"valid,omitempty"`
 	RequestID string     `json:"request_id,omitempty"`
 	Status    string     `json:"status,omitempty"`
 	Problems  []Problem  `json:"problems"`

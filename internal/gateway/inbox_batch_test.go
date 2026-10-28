@@ -5,6 +5,7 @@ import (
 	"errors"
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/tusharbhardwaj/toolyard/internal/inbox"
+	"strings"
 	"testing"
 	"time"
 )
@@ -70,5 +71,60 @@ func TestInboxBatchDispatchTimeoutPersistsUnknown(t *testing.T) {
 	}
 	if _, err := f.svc.Redeem(context.Background(), token, "ag_1", "deploy.run", deployArgs()); !errors.Is(err, inbox.ErrGrantUsed) {
 		t.Fatalf("used permission: %v", err)
+	}
+}
+
+// TEC-1811: a dry run that finds problems is an error with valid false, so
+// try_call reports it as failed; a passed one is valid true and no error.
+func TestInboxDryRunReportsValid(t *testing.T) {
+	f := newInboxFixture(t)
+	dry := requestArgs(deployArgs())
+	dry["dry_run"] = true
+	res := f.call(t, f.agent, "inbox.request", dry)
+	if s := structured(t, res); res.IsError || s["ok"] != true || s["valid"] != true || s["request_id"] != nil {
+		t.Fatalf("passed dry run: isError=%v %v", res.IsError, s)
+	}
+	bad := requestArgs(deployArgs())
+	bad["dry_run"] = true
+	bad["tools"].([]any)[0].(map[string]any)["operation"] = "read"
+	res = f.call(t, f.agent, "inbox.request", bad)
+	s := structured(t, res)
+	if !res.IsError || s["ok"] != false || s["valid"] != false || len(s["problems"].([]any)) == 0 {
+		t.Fatalf("failed dry run: isError=%v %v", res.IsError, s)
+	}
+	if !strings.Contains(textOf(res), "Dry run found") {
+		t.Fatalf("failed dry run text: %s", textOf(res))
+	}
+	// A real request has no valid field.
+	if s := structured(t, f.call(t, f.agent, "inbox.request", requestArgs(deployArgs()))); s["ok"] != true || s["valid"] != nil {
+		t.Fatalf("request: %v", s)
+	}
+}
+
+// TEC-1812: fixture.echo is read-only, so a request may ask for it as a
+// read; tools.search shows read_only for every result.
+func TestInboxReadOperationUsesReadOnlyHint(t *testing.T) {
+	f := newInboxFixture(t)
+	echo := f.gw.tools["fixture.echo"]
+	if h := echo.tool.Annotations.ReadOnlyHint; h == nil || !*h {
+		t.Fatal("fixture.echo is not read-only")
+	}
+	read := inbox.ToolRequest{Tool: "fixture.echo", Operation: "read", Params: map[string]inbox.Constraint{"message": {Op: "eq", Eq: "hello"}}}
+	if problems := f.gw.ValidateScope(f.agent, "ag_1", read); len(problems) != 0 {
+		t.Fatalf("read of fixture.echo: %+v", problems)
+	}
+	read = inbox.ToolRequest{Tool: "deploy.run", Operation: "read", Params: map[string]inbox.Constraint{}}
+	problems := f.gw.ValidateScope(f.agent, "ag_1", read)
+	if len(problems) == 0 || problems[0].Path != "operation" || !strings.Contains(problems[0].Message, "read_only") {
+		t.Fatalf("read of deploy.run: %+v", problems)
+	}
+	body := structured(t, f.call(t, f.agent, MetaSearchTool, map[string]any{"query": "", "detail": "summary", "limit": 200}))
+	got := map[string]any{}
+	for _, r := range body["results"].([]any) {
+		m := r.(map[string]any)
+		got[m["name"].(string)] = m["read_only"]
+	}
+	if got["fixture.echo"] != true || got["deploy.run"] != false {
+		t.Fatalf("read_only: fixture.echo %v, deploy.run %v", got["fixture.echo"], got["deploy.run"])
 	}
 }

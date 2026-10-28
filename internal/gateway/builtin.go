@@ -158,6 +158,8 @@ func (g *Gateway) staticFixtureTool() toolEntry {
 				"message": map[string]any{"type": "string"},
 			}),
 		},
+		// Echo changes nothing, so a request may ask for it as a read.
+		Annotations: mcp.ToolAnnotation{ReadOnlyHint: mcp.ToBoolPtr(true)},
 	}
 	handler := directHandler(func(_ context.Context, args map[string]any) (*mcp.CallToolResult, error) {
 		msg, _ := args["message"].(string)

@@ -337,6 +337,23 @@ func TestGitHubReviewSchemaAllowsAllEvents(t *testing.T) {
 	}
 }
 
+// TEC-1812: the GitHub read tools say they are read-only, so an inbox
+// request may ask for them as reads; the writes never do.
+func TestGitHubReadToolsAreReadOnly(t *testing.T) {
+	f, _, _, _, _ := githubFixture(t)
+	for _, name := range []string{"get_pull_request", "list_pull_request_files", "list_pull_request_comments", "list_pull_request_reviews", "list_review_comments", "create_pull_request_comment", "submit_pull_request_review", "create_review_comment"} {
+		e, ok := f.gw.tools["github."+name]
+		if !ok {
+			t.Fatalf("%s is missing", name)
+		}
+		hint := e.tool.Annotations.ReadOnlyHint
+		want := strings.HasPrefix(name, "get_") || strings.HasPrefix(name, "list_")
+		if hint == nil || *hint != want {
+			t.Errorf("%s readOnlyHint = %v, want %v", name, hint, want)
+		}
+	}
+}
+
 func TestGitHubDeniedRequestSendsNoWrite(t *testing.T) {
 	f, _, h, alice, _ := githubFixture(t)
 	r := githubPending(t, f, alice, "create_pull_request_comment")

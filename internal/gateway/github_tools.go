@@ -42,6 +42,8 @@ func (g *Gateway) addGitHubUpstream(cfg UpstreamConfig) error {
 			mcp.WithString("owner", mcp.Required()), mcp.WithString("repo", mcp.Required()),
 			mcp.WithNumber("pull_number", mcp.Required()),
 			mcp.WithString(ReasonField, mcp.Required(), mcp.Description("Why this call is needed")),
+			// The get_ and list_ tools only read; inbox requests may ask for them as reads.
+			mcp.WithReadOnlyHintAnnotation(!write),
 		}
 		if strings.HasPrefix(name, "list_") {
 			opts = append(opts, mcp.WithNumber("page", mcp.Description("Page number; 100 results per page")))
