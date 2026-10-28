@@ -152,3 +152,22 @@ test('Escape closes the stop panel before the dialog under it', () => {
   assert.equal(h.run('state.handoff'), null);
   assert.equal(h.run('state.oauthFlow.name'), 'shared');
 });
+
+test('A recent earlier connection does not close an unused copied link (review r1-1)', async () => {
+  const recent = Date.now() - 5 * 1000;
+  let landed = 0;
+  const h = harness({
+    '/v1/me/connections/linear/begin': beginResponder,
+    '/v1/me/connections': () => [{ server: 'linear', state: 'connected', connected_at: landed || recent }],
+  });
+  await h.run('loadConnections()');
+  h.run("connectServer('linear')");
+  let tree = h.run('renderHandoffModal()');
+  await button(tree, 'Copy link for another browser').attrs.on.click();
+  await h.run('loadConnections()');
+  assert.equal(h.run('state.connections.pending'), 'linear', 'the panel must stay while the copied link is unused');
+  assert.ok(h.run('state.handoff'), 'the stop panel must stay open');
+  landed = recent + 10 * 1000;
+  await h.run('loadConnections()');
+  assert.equal(h.run('state.connections.pending'), null, 'a newer connection is this attempt landing');
+});

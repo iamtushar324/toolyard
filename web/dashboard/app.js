@@ -13,7 +13,7 @@ const state = {
   myServers: [],           // /v1/me/servers: the groups the signed-in user may use
   // My connections: /v1/me/connections rows for the signed-in person, plus
   // the server whose sign-in they just started (polled until it lands).
-  connections: { rows: [], loaded: false, loading: false, error: '', busy: '', pending: null, pendingSince: 0, pendingLink: false },
+  connections: { rows: [], loaded: false, loading: false, error: '', busy: '', pending: null, pendingSince: 0, pendingPrev: 0, pendingLink: false },
   // The stop before a sign-in leaves toolyard (openHandoff): { title, server,
   // kind, linkPath, linkBody, onContinue, onLinked, onClose, busy, error, link, expiresAt }.
   handoff: null,
@@ -1931,7 +1931,10 @@ async function loadConnections(clearError) {
     c.error = '';
     if (c.pending) {
       const p = c.rows.find((r) => r.server === c.pending);
-      if (p && p.state === 'connected' && (p.connected_at || 0) >= c.pendingSince) {
+      // Done only when this attempt landed: a newer connection than the
+      // one the row had when the attempt started (a recent earlier sign-in
+      // must not close an unused copied link's panel).
+      if (p && p.state === 'connected' && (p.connected_at || 0) >= c.pendingSince && (p.connected_at || 0) > c.pendingPrev) {
         toast(c.pending + ': connected.');
         if (state.handoff && state.handoff.server === c.pending) state.handoff = null;
         c.pending = null;
@@ -2070,6 +2073,17 @@ function renderHandoffModal() {
   );
 }
 
+// startPending marks name's sign-in as in flight. pendingSince allows for
+// clock skew between browser and server; pendingPrev is the connection the
+// row already had, so only a newer one counts as this attempt landing.
+function startPending(name, viaLink) {
+  const c = state.connections;
+  const row = (c.rows || []).find((r) => r.server === name);
+  c.pending = name; c.pendingLink = viaLink;
+  c.pendingSince = Date.now() - 60 * 1000;
+  c.pendingPrev = (row && row.connected_at) || 0;
+}
+
 // connectServer stops before the person's own sign-in leaves toolyard.
 function connectServer(name) {
   openHandoff({
@@ -2079,8 +2093,7 @@ function connectServer(name) {
     onLinked: () => {
       // The other browser finishes it; the list is re-read until it lands.
       const c = state.connections;
-      c.pending = name; c.pendingLink = true;
-      c.pendingSince = Date.now() - 60 * 1000;
+      startPending(name, true);
       pollConnections();
     },
   });
@@ -2091,8 +2104,7 @@ async function connectServerHere(name) {
   c.busy = name; c.error = ''; render();
   try {
     const out = await api('/v1/me/connections/' + encodeURIComponent(name) + '/begin', { method: 'POST', body: {} });
-    c.pending = name; c.pendingLink = false;
-    c.pendingSince = Date.now() - 60 * 1000; // allow for clock skew between browser and server
+    startPending(name, false);
     window.open(out.authorize_url, '_blank', 'noopener');
     pollConnections();
   } catch (e) { c.error = e.message; }
