@@ -24,9 +24,16 @@
 // Postgres database; codes and refresh tokens are claimed with
 // UPDATE ... WHERE used_at IS NULL RETURNING.
 //
+// The browser steps stop twice so a person can finish in another browser
+// or Chrome profile: /oauth/authorize shows a page with a link to the
+// consent screen instead of redirecting, and the person's yes stores a
+// one-time return ticket (return.go) instead of sending the browser back
+// to the client: the return link mints the code when it is used.
+//
 // The consent screen needs the dashboard's session cookie, so its HTTP
-// handlers live in internal/api (oauth_server_routes.go); this package
-// serves the endpoints that need no session (http.go).
+// handlers live in internal/api (oauth_server_routes.go,
+// oauth_return_routes.go); this package serves the endpoints that need no
+// session (http.go).
 package mcpauth
 
 import (
@@ -61,6 +68,7 @@ const (
 	AuthorizationServerPath  = "/.well-known/oauth-authorization-server"
 	AuthorizePath            = "/oauth/authorize"
 	ConsentPath              = "/oauth/consent"
+	ReturnPath               = "/oauth/return/" // the return link's prefix; the ticket is the rest
 	TokenPath                = "/oauth/token"
 	RegisterPath             = "/oauth/register"
 	RevokePath               = "/oauth/revoke"
@@ -116,6 +124,9 @@ const (
 	CodeTTL = 60 * time.Second
 	// RequestTTL: the person has ten minutes to sign in and answer.
 	RequestTTL = 10 * time.Minute
+	// ReturnTTL: a return link works once, for ten minutes after the
+	// person allowed the app.
+	ReturnTTL = 10 * time.Minute
 	// lastUsedEvery throttles the last-used write on the hot /mcp path.
 	lastUsedEvery = time.Minute
 )
@@ -132,6 +143,7 @@ const (
 	accessPrefix  = "tyat_"
 	refreshPrefix = "tyrt_"
 	codePrefix    = "tyoc_"
+	returnPrefix  = "tyrl_"
 	secretPrefix  = "tycs_"
 	clientPrefix  = "mcpc_"
 )
@@ -341,6 +353,17 @@ var (
 	ErrInvalidNickname = errors.New("mcpauth: nickname must be 1-64 characters of letters, digits, spaces and . _ : ( ) -")
 	// ErrAppNotFound: no such connected app.
 	ErrAppNotFound = errors.New("mcpauth: connected app not found")
+	// ErrReturnUnknown: no such return link (malformed, or swept an hour
+	// after it expired).
+	ErrReturnUnknown = errors.New("mcpauth: unknown return link")
+	// ErrReturnUsed: the return link was used already.
+	ErrReturnUsed = errors.New("mcpauth: the return link was already used")
+	// ErrReturnExpired: the return link expired, or a newer consent for the
+	// same app replaced it.
+	ErrReturnExpired = errors.New("mcpauth: the return link expired")
+	// ErrReturnRevoked: the connection was revoked (or its agent disabled,
+	// or its owner blocked) after the person allowed it.
+	ErrReturnRevoked = errors.New("mcpauth: the connection was revoked")
 )
 
 // ---- helpers -----------------------------------------------------------------

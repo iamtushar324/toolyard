@@ -234,25 +234,34 @@ func (e *oauthEnv) form(path string, v url.Values) (*httptest.ResponseRecorder, 
 	return w, out
 }
 
-var nonceRE = regexp.MustCompile(`name="nonce" value="([^"]+)"`)
+var (
+	nonceRE    = regexp.MustCompile(`name="nonce" value="([^"]+)"`)
+	stopLinkRE = regexp.MustCompile(`href="(/oauth/consent\?request=[A-Za-z0-9_-]{43})"`)
+	denyLinkRE = regexp.MustCompile(`<a class="btn primary" href="([^"]+)">Continue in this browser</a>`)
+)
 
-// consent walks authorize → consent page → consent POST and returns the
-// redirect the browser is sent to.
+// consent walks authorize (the stop page) → consent page → consent POST →
+// return page → its Continue, and returns the redirect the browser is
+// finally sent to. A deny stops on a page of ours; it returns that page's
+// link to the client.
 func (e *oauthEnv) consent(clientID, redirect, challenge string, form url.Values) *url.URL {
 	e.t.Helper()
 	q := url.Values{"response_type": {"code"}, "client_id": {clientID}, "redirect_uri": {redirect}, "state": {"xyz"},
 		"code_challenge": {challenge}, "code_challenge_method": {"S256"}, "resource": {oauthPublic + "/mcp"}, "scope": {"mcp"}}
 	// Without the session cookie (a cross-site navigation under SameSite=
-	// Strict) the browser is bounced through a page of our own.
-	bounce := e.do(http.MethodGet, "/oauth/authorize?"+q.Encode(), nil, nil)
-	if bounce.Code != http.StatusOK || !strings.Contains(bounce.Body.String(), `http-equiv="refresh"`) || !strings.Contains(bounce.Body.String(), "/oauth/consent?request=") {
-		e.t.Fatalf("authorize without a session: %d %s", bounce.Code, bounce.Body)
+	// Strict) and with it, authorize stops on a page of ours: continue to
+	// the consent step here, or copy its link into another browser.
+	var consentURL string
+	for _, cookies := range [][]*http.Cookie{nil, e.session} {
+		stop := e.do(http.MethodGet, "/oauth/authorize?"+q.Encode(), nil, nil, cookies...)
+		body := stop.Body.String()
+		m := stopLinkRE.FindStringSubmatch(body)
+		if stop.Code != http.StatusOK || stop.Header().Get("Location") != "" || m == nil || strings.Contains(body, `http-equiv="refresh"`) ||
+			!strings.Contains(body, "Continue in this browser") || !strings.Contains(body, `value="`+oauthPublic+m[1]+`"`) {
+			e.t.Fatalf("authorize stop page (session cookies: %d): %d %s", len(cookies), stop.Code, body)
+		}
+		consentURL = m[1]
 	}
-	w := e.do(http.MethodGet, "/oauth/authorize?"+q.Encode(), nil, nil, e.session...)
-	if w.Code != http.StatusFound || !strings.HasPrefix(w.Header().Get("Location"), "/oauth/consent?request=") {
-		e.t.Fatalf("authorize: %d %s %s", w.Code, w.Header().Get("Location"), w.Body)
-	}
-	consentURL := w.Header().Get("Location")
 	if anon := e.do(http.MethodGet, consentURL, nil, nil); anon.Code != http.StatusUnauthorized || !strings.Contains(anon.Body.String(), "/login?oauth_request=") {
 		e.t.Fatalf("consent without a session: %d %s", anon.Code, anon.Body)
 	}
@@ -260,8 +269,9 @@ func (e *oauthEnv) consent(clientID, redirect, challenge string, form url.Values
 	if page.Code != http.StatusOK {
 		e.t.Fatalf("consent page: %d %s", page.Code, page.Body)
 	}
-	if csp := page.Header().Get("Content-Security-Policy"); !strings.Contains(csp, "form-action 'self' "+mcpauth.CSPSource(redirect)) {
-		e.t.Fatalf("consent CSP does not allow the redirect target: %q", csp)
+	// The consent POST answers with a page of ours, never the client.
+	if csp := page.Header().Get("Content-Security-Policy"); !strings.HasSuffix(csp, "form-action 'self'") {
+		e.t.Fatalf("consent CSP allows posting elsewhere: %q", csp)
 	}
 	if !strings.Contains(page.Body.String(), mcpauth.RedirectHost(redirect)) {
 		e.t.Fatalf("consent page does not show the redirect host %q", mcpauth.RedirectHost(redirect))
@@ -290,26 +300,72 @@ func (e *oauthEnv) consent(clientID, redirect, challenge string, form url.Values
 	if len(m) != 2 || nonceCookie == nil {
 		e.t.Fatal("consent nonce missing")
 	}
-	post := func(v url.Values, origin string, cookies ...*http.Cookie) *httptest.ResponseRecorder {
-		return e.do(http.MethodPost, consentURL, strings.NewReader(v.Encode()), map[string]string{
-			"Content-Type": "application/x-www-form-urlencoded", "Origin": origin, "Sec-Fetch-Site": "same-origin"}, cookies...)
+	post := func(target string, v url.Values, origin, site string, cookies ...*http.Cookie) *httptest.ResponseRecorder {
+		return e.do(http.MethodPost, target, strings.NewReader(v.Encode()), map[string]string{
+			"Content-Type": "application/x-www-form-urlencoded", "Origin": origin, "Sec-Fetch-Site": site}, cookies...)
 	}
 	form.Set("nonce", m[1])
-	if bad := post(form, "https://evil.example", append(e.session, nonceCookie)...); bad.Code != http.StatusForbidden {
+	if bad := post(consentURL, form, "https://evil.example", "same-origin", append(e.session, nonceCookie)...); bad.Code != http.StatusForbidden {
 		e.t.Fatalf("cross-origin consent: %d", bad.Code)
 	}
-	if bad := post(form, oauthPublic, e.session...); bad.Code != http.StatusForbidden {
+	if bad := post(consentURL, form, oauthPublic, "same-origin", e.session...); bad.Code != http.StatusForbidden {
 		e.t.Fatalf("consent without the nonce cookie: %d", bad.Code)
 	}
-	done := post(form, oauthPublic, append(e.session, nonceCookie)...)
-	if done.Code != http.StatusFound {
-		e.t.Fatalf("consent submit: %d %s", done.Code, done.Body)
+	done := post(consentURL, form, oauthPublic, "same-origin", append(e.session, nonceCookie)...)
+	checkClientRedirect := func(raw string) *url.URL {
+		e.t.Helper()
+		loc, err := url.Parse(raw)
+		if err != nil || !strings.HasPrefix(raw, redirect) || loc.Query().Get("state") != "xyz" || loc.Query().Get("iss") != oauthPublic {
+			e.t.Fatalf("redirect to the client %q", raw)
+		}
+		return loc
 	}
-	loc, err := url.Parse(done.Header().Get("Location"))
-	if err != nil || !strings.HasPrefix(done.Header().Get("Location"), redirect) || loc.Query().Get("state") != "xyz" || loc.Query().Get("iss") != oauthPublic {
-		e.t.Fatalf("consent redirect %q", done.Header().Get("Location"))
+	if form.Get("verdict") == "deny" {
+		dm := denyLinkRE.FindStringSubmatch(done.Body.String())
+		if done.Code != http.StatusOK || done.Header().Get("Location") != "" || dm == nil {
+			e.t.Fatalf("deny page: %d %q %s", done.Code, done.Header().Get("Location"), done.Body)
+		}
+		return checkClientRedirect(strings.ReplaceAll(dm[1], "&amp;", "&"))
 	}
-	return loc
+	returnURL := done.Header().Get("Location")
+	if done.Code != http.StatusSeeOther || !strings.HasPrefix(returnURL, mcpauth.ReturnPath) {
+		e.t.Fatalf("consent submit: %d %q %s", done.Code, returnURL, done.Body)
+	}
+	// The return page needs no toolyard session: the browser where the
+	// client waits may not be signed in.
+	ret := e.do(http.MethodGet, returnURL, nil, nil)
+	if ret.Code != http.StatusOK || !strings.Contains(ret.Body.String(), "Approved. Return to") ||
+		!strings.Contains(ret.Body.String(), `value="`+oauthPublic+returnURL+`"`) || !strings.Contains(ret.Body.String(), mcpauth.RedirectHost(redirect)) {
+		e.t.Fatalf("return page: %d %s", ret.Code, ret.Body)
+	}
+	if csp := ret.Header().Get("Content-Security-Policy"); !strings.Contains(csp, "form-action 'self' "+mcpauth.CSPSource(redirect)) {
+		e.t.Fatalf("return page CSP does not allow the redirect target: %q", csp)
+	}
+	rm := nonceRE.FindStringSubmatch(ret.Body.String())
+	var retCookie *http.Cookie
+	for _, c := range ret.Result().Cookies() {
+		if strings.HasPrefix(c.Name, "toolyard_oauth_return_") {
+			retCookie = c
+		}
+	}
+	if len(rm) != 2 || retCookie == nil {
+		e.t.Fatal("return page nonce missing")
+	}
+	nonce := url.Values{"nonce": {rm[1]}}
+	if bad := post(returnURL, nonce, "https://evil.example", "same-origin", retCookie); bad.Code != http.StatusForbidden {
+		e.t.Fatalf("cross-origin return: %d", bad.Code)
+	}
+	if bad := post(returnURL, nonce, oauthPublic, "cross-site", retCookie); bad.Code != http.StatusForbidden {
+		e.t.Fatalf("cross-site return: %d", bad.Code)
+	}
+	if bad := post(returnURL, nonce, oauthPublic, "same-origin"); bad.Code != http.StatusForbidden {
+		e.t.Fatalf("return without the nonce cookie: %d", bad.Code)
+	}
+	back := post(returnURL, nonce, oauthPublic, "same-origin", retCookie)
+	if back.Code != http.StatusSeeOther {
+		e.t.Fatalf("return continue: %d %s", back.Code, back.Body)
+	}
+	return checkClientRedirect(back.Header().Get("Location"))
 }
 
 func TestMCPOAuthDiscovery(t *testing.T) {

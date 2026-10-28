@@ -22,7 +22,8 @@ import (
 // ever returns a token.
 //
 //	GET    /v1/me/connections                 per_user servers the caller may use, with their state
-//	POST   /v1/me/connections/{server}/begin  start the caller's sign-in -> {authorize_url}
+//	POST   /v1/me/connections/{server}/begin  start the caller's sign-in -> {authorize_url}; with
+//	                                          {"mode":"link"} -> {connect_link} for another browser
 //	DELETE /v1/me/connections/{server}        drop the caller's token (revoked at the provider when it can be)
 //	GET    /v1/servers/{name}/connections     admin: who has connected the server, and in what state
 func (s *Server) connectionRoutes(mux *http.ServeMux) {
@@ -191,6 +192,7 @@ func (s *Server) meConnections(w http.ResponseWriter, r *http.Request) {
 // meConnectionsItem dispatches the per-server actions:
 //
 //	POST   /v1/me/connections/{server}/begin -> {"authorize_url","state","expires_in"}
+//	       body {"mode":"link"}              -> {"mode":"link","connect_link","expires_in"}
 //	DELETE /v1/me/connections/{server}       -> {"ok":true}
 func (s *Server) meConnectionsItem(w http.ResponseWriter, r *http.Request) {
 	u, ok := s.connectionUser(w, r)
@@ -215,8 +217,33 @@ func (s *Server) meConnectionsItem(w http.ResponseWriter, r *http.Request) {
 // meConnectionBegin starts the caller's own sign-in to a per_user server.
 // The pending row is flagged per_user, so the callback stores the token on
 // the caller's row and only if the caller's browser comes back.
+//
+// With {"mode":"link"} ("Copy link for another browser") nothing starts
+// here: the same checks run, then the caller gets a one-time connect link
+// for themselves (connect_link_routes.go), the one an agent would get, to
+// open in another browser profile. The sign-in starts and is bound there,
+// and the link's account rule applies: the provider account must be the
+// caller's toolyard email, or that browser must hold their toolyard
+// session when the provider names no account it vouches for. Asking for a
+// link on a server already connected is the caller's own request to sign
+// in again, as Reconnect is.
 func (s *Server) meConnectionBegin(w http.ResponseWriter, r *http.Request, u *identity.User, name string) {
 	ctx := r.Context()
+	var body struct {
+		Mode string `json:"mode"`
+	}
+	if r.ContentLength > 0 {
+		if err := decode(r, &body); err != nil {
+			writeError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+	}
+	switch body.Mode {
+	case "", oauth.ModeCallback, connectModeLink:
+	default:
+		writeError(w, http.StatusBadRequest, `mode must be "callback" or "link"`)
+		return
+	}
 	sv, err := s.upstreams.Get(ctx, name)
 	if err != nil {
 		if errors.Is(err, upstreams.ErrNotFound) {
@@ -250,6 +277,15 @@ func (s *Server) meConnectionBegin(w http.ResponseWriter, r *http.Request, u *id
 	// browser, so there is nothing to bind the return to.
 	if operatorFromContext(ctx) != nil {
 		writeError(w, http.StatusConflict, "a personal sign-in has to be started from the dashboard's My connections page, in the browser that will finish it")
+		return
+	}
+	if body.Mode == connectModeLink {
+		if !s.linkableClient(w, r, name) {
+			return
+		}
+		s.writeDashboardLink(w, r, u, name, oauth.ConnectPurposePerUser, func() (string, error) {
+			return s.oauth.IssueConnectTicket(ctx, u.ID, name, oauth.ConnectPurposePerUser, oauth.ConnectMintedBy(u.ID))
+		})
 		return
 	}
 	authURL, state, err := s.oauth.BeginForUser(ctx, name, u.ID)

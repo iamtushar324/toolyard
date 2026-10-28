@@ -100,17 +100,15 @@ func authorizeQuery(clientID, redirect, challenge string, extra map[string]strin
 	return q
 }
 
-// approve runs authorize and consent and returns the code.
+// approve runs authorize, consent and the return link, and returns the
+// code.
 func (f *fixture) approve(t *testing.T, u *identity.User, clientID, redirect, challenge string, c Consent) string {
 	t.Helper()
 	req, aerr := f.svc.BeginAuthorize(context.Background(), authorizeQuery(clientID, redirect, challenge, nil), "198.51.100.7")
 	if aerr != nil {
 		t.Fatalf("authorize: %v", aerr)
 	}
-	loc, err := f.svc.Approve(context.Background(), req.ID, u, c)
-	if err != nil {
-		t.Fatalf("approve: %v", err)
-	}
+	loc := f.approveAndReturn(t, req.ID, u, c)
 	parsed, err := url.Parse(loc)
 	if err != nil {
 		t.Fatal(err)
@@ -120,6 +118,21 @@ func (f *fixture) approve(t *testing.T, u *identity.User, clientID, redirect, ch
 		t.Fatalf("approve redirect %q lacks code, state or iss", loc)
 	}
 	return q.Get("code")
+}
+
+// approveAndReturn answers request id with yes and uses the return link it
+// gives, and returns the redirect that carries the code.
+func (f *fixture) approveAndReturn(t *testing.T, id string, u *identity.User, c Consent) string {
+	t.Helper()
+	ticket, err := f.svc.Approve(context.Background(), id, u, c)
+	if err != nil {
+		t.Fatalf("approve: %v", err)
+	}
+	loc, err := f.svc.RedeemReturn(context.Background(), ticket)
+	if err != nil {
+		t.Fatalf("return link: %v", err)
+	}
+	return loc
 }
 
 func codeForm(code, redirect, verifier string) url.Values {
@@ -322,9 +335,8 @@ func TestAuthorizeChecks(t *testing.T) {
 	if aerr != nil || req.State != "" || req.Resource != testPublic+"/mcp" {
 		t.Fatalf("no state, no resource: %+v %v", req, aerr)
 	}
-	loc, err := f.svc.Approve(ctx, req.ID, f.user, Consent{Nickname: "No state"})
-	if err != nil || strings.Contains(loc, "state=") {
-		t.Fatalf("approve without state: %q %v", loc, err)
+	if loc := f.approveAndReturn(t, req.ID, f.user, Consent{Nickname: "No state"}); strings.Contains(loc, "state=") {
+		t.Fatalf("approve without state: %q", loc)
 	}
 }
 
@@ -747,8 +759,8 @@ func TestSweepKeepsGrants(t *testing.T) {
 	if n := count(`SELECT COUNT(*) FROM mcp_oauth_tokens`); n != 0 {
 		t.Errorf("%d expired tokens left", n)
 	}
-	if n := count(`SELECT COUNT(*) FROM mcp_oauth_codes`) + count(`SELECT COUNT(*) FROM mcp_oauth_requests`); n != 0 {
-		t.Errorf("%d expired codes or requests left", n)
+	if n := count(`SELECT COUNT(*) FROM mcp_oauth_codes`) + count(`SELECT COUNT(*) FROM mcp_oauth_requests`) + count(`SELECT COUNT(*) FROM mcp_oauth_return_tickets`); n != 0 {
+		t.Errorf("%d expired codes, requests or return links left", n)
 	}
 	if n := count(`SELECT COUNT(*) FROM mcp_oauth_grants`); n != 1 {
 		t.Errorf("grants: %d, want 1", n)
@@ -827,7 +839,11 @@ func TestClientIDMetadataDocument(t *testing.T) {
 	if aerr != nil {
 		t.Fatal(aerr)
 	}
-	loc, err := svc.Approve(ctx, req.ID, f.user, Consent{Nickname: "Doc client"})
+	ticket, err := svc.Approve(ctx, req.ID, f.user, Consent{Nickname: "Doc client"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	loc, err := svc.RedeemReturn(ctx, ticket)
 	if err != nil {
 		t.Fatal(err)
 	}

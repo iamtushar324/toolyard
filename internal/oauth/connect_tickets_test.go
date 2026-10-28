@@ -107,6 +107,54 @@ func TestConnectTicketLifecycle(t *testing.T) {
 	}
 }
 
+// TestConnectTicketKinds: a ticket an agent asked for is a sign-in link
+// minted by that agent; one a person copied in the dashboard is a sign-in
+// link minted by them; a GitHub App setup ticket is a shared ticket of its
+// own kind that names the admin, peeked and redeemed alike, and no caller
+// can mint one by passing its marker as an agent id.
+func TestConnectTicketKinds(t *testing.T) {
+	f := newUserFixture(t)
+	ctx := context.Background()
+
+	agent, err := f.svc.IssueConnectTicket(ctx, "u_ada", "linear", ConnectPurposePerUser, "ag_1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tk, err := f.svc.PeekConnectTicket(ctx, agent); err != nil || tk.Kind != ConnectKindSignIn || tk.MintedInDashboard() || tk.AgentID != "ag_1" {
+		t.Fatalf("agent ticket = %+v %v", tk, err)
+	}
+	mine, err := f.svc.IssueConnectTicket(ctx, "u_ada", "linear", ConnectPurposePerUser, ConnectMintedBy("u_ada"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if tk, err := f.svc.PeekConnectTicket(ctx, mine); err != nil || tk.Kind != ConnectKindSignIn || !tk.MintedInDashboard() || tk.AgentID != "user:u_ada" {
+		t.Fatalf("dashboard ticket = %+v %v", tk, err)
+	}
+
+	setup, err := f.svc.IssueGitHubAppSetupTicket(ctx, "u_ada", "linear")
+	if err != nil {
+		t.Fatal(err)
+	}
+	tk, err := f.svc.PeekConnectTicket(ctx, setup)
+	if err != nil || tk.Kind != ConnectKindGitHubAppSetup || tk.Purpose != ConnectPurposeShared || tk.UserID != "u_ada" ||
+		tk.AgentID != ConnectMintedBy("u_ada") || !tk.MintedInDashboard() {
+		t.Fatalf("setup ticket = %+v %v", tk, err)
+	}
+	if ttl := time.Until(tk.ExpiresAt); ttl < ConnectTicketTTL-time.Minute || ttl > ConnectTicketTTL {
+		t.Fatalf("setup ticket lives %s, want about %s", ttl, ConnectTicketTTL)
+	}
+	if tk, err := f.svc.RedeemConnectTicket(ctx, setup); err != nil || tk.Kind != ConnectKindGitHubAppSetup {
+		t.Fatalf("redeemed setup ticket = %+v %v", tk, err)
+	}
+	if _, err := f.svc.RedeemConnectTicket(ctx, setup); !errors.Is(err, ErrTicketUsed) {
+		t.Fatalf("second redeem of a setup ticket: %v", err)
+	}
+
+	if _, err := f.svc.IssueConnectTicket(ctx, "u_ada", "linear", ConnectPurposeShared, connectAgentGitHubAppSetup); err == nil {
+		t.Fatal("a caller minted a setup ticket through IssueConnectTicket")
+	}
+}
+
 // TestConnectTicketRedeemsOnceUnderContention: many browsers submitting
 // the same link at once get exactly one sign-in.
 func TestConnectTicketRedeemsOnceUnderContention(t *testing.T) {

@@ -198,11 +198,11 @@ type flight struct {
 }
 
 // Sweep deletes what can no longer be used: answered or expired requests,
-// codes and tokens past their expiry (a used refresh token is kept until
-// then, for reuse detection), finished rate-limit windows, registered
-// clients nobody authorized within a day and cached metadata documents
-// no grant uses. Grants are never deleted here: they name the client in
-// the audit trail.
+// return links, codes and tokens past their expiry (a used refresh token
+// is kept until then, for reuse detection), finished rate-limit windows,
+// registered clients nobody authorized within a day and cached metadata
+// documents no grant uses. Grants are never deleted here: they name the
+// client in the audit trail.
 func (s *Service) Sweep(ctx context.Context) error {
 	now := s.now()
 	ms := now.UnixMilli()
@@ -211,6 +211,7 @@ func (s *Service) Sweep(ctx context.Context) error {
 		args []any
 	}{
 		{`DELETE FROM mcp_oauth_requests WHERE expires_at < ?`, []any{ms - time.Hour.Milliseconds()}},
+		{`DELETE FROM mcp_oauth_return_tickets WHERE expires_at < ?`, []any{ms - time.Hour.Milliseconds()}},
 		{`DELETE FROM mcp_oauth_codes WHERE expires_at < ?`, []any{ms - time.Hour.Milliseconds()}},
 		{`DELETE FROM mcp_oauth_tokens WHERE expires_at < ?`, []any{ms - 24*time.Hour.Milliseconds()}},
 		{`DELETE FROM mcp_oauth_rate_limits WHERE reset_at < ?`, []any{ms}},

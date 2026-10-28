@@ -5,16 +5,22 @@ package api
 //
 //   - The metadata documents, registration, token and revocation endpoints
 //     need no session; mcpauth serves them.
-//   - GET /oauth/authorize checks the request and stores it, then sends the
-//     browser to the consent screen. The dashboard's session cookie is
-//     SameSite=Strict behind HTTPS, so a cross-site navigation from the
-//     client arrives without it: the hop to /oauth/consent goes through a
-//     page of our own, after which the browser sends the cookie.
+//   - GET /oauth/authorize checks the request and stores it, then stops on
+//     a page of our own: "Continue in this browser" links to the consent
+//     screen, and "Copy link for another browser" shows that link to open
+//     in another browser or Chrome profile (any browser where the person
+//     signs in to toolyard). It never redirects there by itself. The
+//     dashboard's session cookie is SameSite=Strict behind HTTPS, so a
+//     cross-site navigation from the client arrives without it; the click
+//     on our own page is a same-site navigation, which carries it.
 //   - /oauth/consent shows the client, where it will send the person back
 //     to, and lets them choose a nickname and the tool scope. The POST is a
 //     plain form: a nonce cookie (SameSite=Strict, HttpOnly) proves it came
 //     from the page we rendered, and the Origin check of
-//     EnforceOriginOnMutations still applies.
+//     EnforceOriginOnMutations still applies. It stops again: allow sends
+//     the browser (303) to the return link (oauth_return_routes.go), which
+//     mints the code when it is used, in this browser or another; deny
+//     shows a page whose links tell the client.
 //   - /v1/me/apps... lists, renames, re-scopes and revokes connected apps;
 //     /v1/me/agent-scopes sets the same per-agent scope on any agent.
 //     Members see their own; admins may see and change everyone's.
@@ -25,6 +31,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"errors"
+	"io"
 	"net/http"
 	"net/url"
 	"sort"
@@ -71,6 +78,8 @@ func (s *Server) MCPOAuthRoutes(mux *http.ServeMux, svc *mcpauth.Service) {
 	mux.HandleFunc("/oauth/revoke", svc.HandleRevoke)
 	mux.HandleFunc("/oauth/authorize", h.authorize)
 	mux.HandleFunc("/oauth/consent", h.consent)
+	mux.HandleFunc("/oauth/return/", h.returnLink)
+	mux.HandleFunc("/oauth/copy.js", h.copyScript)
 	// Connected apps and per-agent scopes (member routes in role_guard.go).
 	mux.HandleFunc("/v1/me/apps", h.listApps)
 	mux.HandleFunc("/v1/me/apps/config", h.appsConfig)
@@ -109,18 +118,74 @@ func (h *mcpOAuthHandlers) authorize(w http.ResponseWriter, r *http.Request) {
 			`<h1>Toolyard cannot connect this app</h1><p>`+htmlEscape(aerr.Description)+`</p><p class="meta">Error: `+htmlEscape(aerr.Code)+`</p>`)
 		return
 	}
+	// Stop here, signed in or not, so the person can choose the browser.
+	// The consent screen asks for sign-in when this browser has no session
+	// (or did not send it: the cookie is SameSite=Strict and this request
+	// came from the client's site; the click below is same-site).
 	next := mcpauth.ConsentPath + "?request=" + url.QueryEscape(req.ID)
-	if _, ok := h.s.sessionUser(r); ok {
-		http.Redirect(w, r, next, http.StatusFound)
+	client := htmlEscape(req.Client.DisplayName())
+	minutes := strconv.Itoa(int(mcpauth.RequestTTL / time.Minute))
+	writeOAuthPage(w, http.StatusOK, "Connect "+req.Client.DisplayName(), oauthCopyScriptTag,
+		`<h1>`+client+` wants to connect to your toolyard</h1>`+
+			`<p class="meta">That name is the app's own claim. The next page shows who the app is, where toolyard sends you back to, and what it asks for.</p>`+
+			`<p><a class="btn primary" href="`+htmlEscape(next)+`">Continue in this browser</a></p>`+
+			`<h2>Copy link for another browser</h2>`+
+			`<p>To answer in another browser or Chrome profile, open this link there and sign in to toolyard. It works for `+minutes+` minutes. `+
+			`After you allow the app, toolyard gives you a link back to this browser, where `+client+` waits.</p>`+
+			oauthCopyField("oauth-consent-link", h.svc.Issuer()+next, "Link for another browser"))
+}
+
+// oauthCopyScriptTag loads the copy buttons' script. The pages' CSP
+// allows scripts from 'self' only, and this one is ours (copyScript).
+const oauthCopyScriptTag = `<script src="/oauth/copy.js" defer></script>`
+
+// oauthCopyField is a read-only field that shows link and a Copy button
+// for it. Without the script the field still shows the link, to select
+// and copy by hand.
+func oauthCopyField(id, link, label string) string {
+	return `<p class="row"><input id="` + id + `" class="oauth-copy-field" type="text" readonly size="60" value="` + htmlEscape(link) +
+		`" aria-label="` + htmlEscape(label) + `"> <button class="copy-btn" type="button" data-copy="` + id + `">Copy link</button></p>`
+}
+
+// oauthCopyScript wires the Copy buttons of the OAuth pages: a button with
+// data-copy copies the field it names, and a click in a field selects it.
+const oauthCopyScript = `// toolyard OAuth pages: Copy buttons (oauth_server_routes.go).
+(function () {
+  'use strict';
+  document.addEventListener('click', function (ev) {
+    var t = ev.target;
+    if (t && t.classList && t.classList.contains('oauth-copy-field')) { t.select(); return; }
+    var btn = t && t.closest ? t.closest('button[data-copy]') : null;
+    if (!btn) return;
+    var field = document.getElementById(btn.getAttribute('data-copy'));
+    if (!field) return;
+    field.focus();
+    field.select();
+    var copied = function () { btn.textContent = 'Copied'; btn.classList.add('copied'); };
+    var fallback = function () { try { if (document.execCommand('copy')) copied(); } catch (_) {} };
+    if (navigator.clipboard && navigator.clipboard.writeText) {
+      navigator.clipboard.writeText(field.value).then(copied, fallback);
+    } else {
+      fallback();
+    }
+  });
+})();
+`
+
+// copyScript serves oauthCopyScript.
+func (h *mcpOAuthHandlers) copyScript(w http.ResponseWriter, r *http.Request) {
+	if !h.svc.Enabled() {
+		http.NotFound(w, r)
 		return
 	}
-	// No cookie on this request: either nobody is signed in, or the cookie
-	// is SameSite=Strict and this navigation started on the client's site.
-	// A refresh from our own page is a same-site navigation, so the next
-	// request carries the cookie when there is one.
-	writeOAuthPage(w, http.StatusOK, "Continue to toolyard",
-		`<meta http-equiv="refresh" content="0;url=`+htmlEscape(next)+`">`,
-		`<h1>Continue to toolyard</h1><p><a class="btn primary" href="`+htmlEscape(next)+`">Continue</a></p>`)
+	if r.Method != http.MethodGet && r.Method != http.MethodHead {
+		w.Header().Set("Allow", "GET, HEAD")
+		writeError(w, http.StatusMethodNotAllowed, "GET only")
+		return
+	}
+	w.Header().Set("Content-Type", "text/javascript; charset=utf-8")
+	w.Header().Set("Cache-Control", "public, max-age=3600")
+	_, _ = io.WriteString(w, oauthCopyScript)
 }
 
 // writeOAuthPage is writeConnectPage with extra head elements.
@@ -298,8 +363,9 @@ func (h *mcpOAuthHandlers) consentSubmit(w http.ResponseWriter, r *http.Request,
 		http.SetCookie(w, &http.Cookie{Name: nonceName, Value: "", Path: noncePath, MaxAge: -1, HttpOnly: true,
 			Secure: h.s.security.IsBehindHTTPS(r), SameSite: http.SameSiteStrictMode})
 	}
-	var loc string
-	switch r.PostForm.Get("verdict") {
+	var loc, ticket string
+	verdict := r.PostForm.Get("verdict")
+	switch verdict {
 	case "deny":
 		loc, err = h.svc.Deny(r.Context(), pending.ID, u)
 	case "allow":
@@ -312,7 +378,7 @@ func (h *mcpOAuthHandlers) consentSubmit(w http.ResponseWriter, r *http.Request,
 			// apps page sets it), so connecting again keeps the one chosen.
 			draft.scope.ToolList = prev.Scope.ToolList
 		}
-		loc, err = h.svc.Approve(r.Context(), pending.ID, u, mcpauth.Consent{Nickname: draft.nickname, Scope: draft.scope,
+		ticket, err = h.svc.Approve(r.Context(), pending.ID, u, mcpauth.Consent{Nickname: draft.nickname, Scope: draft.scope,
 			MayManage: draft.mayManage, SignOutOthers: draft.signOutOthers})
 		if errors.Is(err, mcpauth.ErrInvalidNickname) || errors.Is(err, access.ErrInvalidScope) {
 			h.renderConsent(w, r, pending, u, err.Error(), draft)
@@ -333,13 +399,34 @@ func (h *mcpOAuthHandlers) consentSubmit(w http.ResponseWriter, r *http.Request,
 		return
 	}
 	clearNonce()
-	http.Redirect(w, r, loc, http.StatusFound)
+	if verdict == "deny" {
+		h.renderDenied(w, pending, loc)
+		return
+	}
+	// Never straight to the client: to the return link, a page of our own
+	// (303, so a reload shows the page again instead of posting twice).
+	http.Redirect(w, r, mcpauth.ReturnPath+ticket, http.StatusSeeOther)
 }
 
-// consentCSP is the page's Content-Security-Policy: the strict one, with
-// the client's redirect target allowed as a form-action (browsers apply
-// form-action to the redirect that follows the POST) and its logo's host
-// allowed for images.
+// renderDenied stops after a deny too: loc, the client's redirect URI with
+// error=access_denied, carries no code and no secret, so it is shown as is,
+// to follow here or copy to the browser where the client waits.
+func (h *mcpOAuthHandlers) renderDenied(w http.ResponseWriter, pending *mcpauth.AuthorizeRequest, loc string) {
+	client := htmlEscape(pending.Client.DisplayName())
+	writeOAuthPage(w, http.StatusOK, "Not allowed", oauthCopyScriptTag,
+		`<h1>You did not allow `+client+`</h1>`+
+			`<p>Nothing was connected. Tell `+client+` so it stops waiting: toolyard sends you back to <strong>`+htmlEscape(mcpauth.RedirectHost(pending.RedirectURI))+`</strong>.</p>`+
+			`<p><a class="btn primary" href="`+htmlEscape(loc)+`">Continue in this browser</a></p>`+
+			`<h2>Copy link for another browser</h2>`+
+			`<p>Did `+client+` start in another browser or Chrome profile? Open this link there instead.</p>`+
+			oauthCopyField("oauth-deny-link", loc, "Link for another browser"))
+}
+
+// consentCSP is an OAuth page's Content-Security-Policy: the strict one,
+// with the client's redirect target allowed as a form-action when redirect
+// is set (browsers apply form-action to the redirect that follows the
+// POST; the return page's Continue needs it, the consent screen does not)
+// and its logo's host allowed for images.
 func consentCSP(redirect, logo string) string {
 	csp := strictCSP
 	safe := func(v string) bool { return v != "" && !strings.ContainsAny(v, " ;,'\"\t\r\n") }
@@ -371,7 +458,10 @@ func (h *mcpOAuthHandlers) renderConsent(w http.ResponseWriter, r *http.Request,
 	name, path := h.s.hostCookie(r, consentNonceName(pending.ID), mcpauth.ConsentPath)
 	http.SetCookie(w, &http.Cookie{Name: name, Value: nonce + "." + u.ID, Path: path, HttpOnly: true,
 		Secure: h.s.security.IsBehindHTTPS(r), SameSite: http.SameSiteStrictMode, MaxAge: int(mcpauth.RequestTTL / time.Second)})
-	w.Header().Set("Content-Security-Policy", consentCSP(pending.RedirectURI, client.LogoURI))
+	// The form posts here and is answered with a page of our own (the
+	// return link or the deny page), never the client's redirect URI, so
+	// form-action stays 'self'.
+	w.Header().Set("Content-Security-Policy", consentCSP("", client.LogoURI))
 
 	var b strings.Builder
 	e := htmlEscape
@@ -397,7 +487,7 @@ func (h *mcpOAuthHandlers) renderConsent(w http.ResponseWriter, r *http.Request,
 		b.WriteString(`<p><strong>Self-registered app</strong></p>` +
 			`<p class="meta">The name it gives itself (not checked): ` + e(client.DisplayName()) + `. Toolyard cannot check who made it: check the address below before you allow it.</p>`)
 	}
-	b.WriteString(`<p>After you answer, toolyard sends you back to</p><p><strong>` + e(mcpauth.RedirectHost(pending.RedirectURI)) + `</strong></p>` +
+	b.WriteString(`<p>After you answer, toolyard gives you a link back to</p><p><strong>` + e(mcpauth.RedirectHost(pending.RedirectURI)) + `</strong></p>` +
 		`<p class="meta">` + e(pending.RedirectURI) + `</p></div>`)
 	b.WriteString(`<p>It asks to use toolyard's tools (` + e(pending.Scope) + `). It will act as an agent you own, named by the nickname below. ` +
 		`Toolyard records every call it makes, and calls that need approval still come to your Inbox. You can rename it, limit it or revoke it later on the Connected apps page.</p>`)

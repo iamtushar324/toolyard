@@ -11,6 +11,24 @@ Each user then selects **Connect** in My connections.
 Members must have access to the GitHub server in Users.
 GitHub limits access to the permissions of both the App and the user.
 
+## Use another browser profile
+
+Toolyard stops before it opens GitHub.
+Select **Continue in this browser** to use the GitHub account of the current browser.
+Select **Copy link for another browser** to use the GitHub account of another browser profile.
+The link works one time, for 10 minutes.
+
+To register the App from another profile, copy the link from **Register GitHub App**.
+Open the link in the other profile and sign in to Toolyard there as an admin.
+Select **Continue**, then **Continue to GitHub**.
+GitHub creates the App under the GitHub account of that profile and returns to Toolyard there.
+
+To connect your own account from another profile, copy the link from **Connect**.
+Open the link in the other profile and select **Continue**.
+GitHub does not give Toolyard a verified email.
+Thus, sign in to Toolyard as yourself in that profile before you select **Continue**.
+Otherwise, Toolyard stores nothing.
+
 The App requests Metadata read, Contents read, and Pull requests write.
 The connector provides these tools:
 

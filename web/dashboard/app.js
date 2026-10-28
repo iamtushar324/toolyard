@@ -13,7 +13,10 @@ const state = {
   myServers: [],           // /v1/me/servers: the groups the signed-in user may use
   // My connections: /v1/me/connections rows for the signed-in person, plus
   // the server whose sign-in they just started (polled until it lands).
-  connections: { rows: [], loaded: false, loading: false, error: '', busy: '', pending: null, pendingSince: 0 },
+  connections: { rows: [], loaded: false, loading: false, error: '', busy: '', pending: null, pendingSince: 0, pendingLink: false },
+  // The stop before a sign-in leaves toolyard (openHandoff): { title, server,
+  // kind, linkPath, linkBody, onContinue, onLinked, onClose, busy, error, link, expiresAt }.
+  handoff: null,
   serverConnectionsModal: null, // { name, loading, data, error } while an admin looks at who signed in to a server
   // Users page (admin): /v1/users rows + the grantable groups.
   users: { rows: [], groups: [], loaded: false, loading: false, error: '', keyBusy: '', keyOpen: {} },
@@ -436,6 +439,9 @@ function handleOAuthDone(payload) {
   }
   if (state.marketModal && state.marketModal.installedName === name) {
     state.marketModal = null;
+  }
+  if (state.handoff && state.handoff.server === name) {
+    state.handoff = null;
   }
   toast(name + ': authorized.');
   reloadServers().then(() => loadOAuthStatus(name)).then(render);
@@ -1904,11 +1910,12 @@ function viewMyServers() {
 // ---- My connections (every user) --------------------------------------------
 //
 // A server whose "Who signs in" is "Each person" acts as each person's own
-// account. This page is where a person connects theirs: Connect opens the
-// provider's authorize page in a new tab (as the admin OAuth modal does),
-// the callback stores the token on their row, and the list is re-read
-// until it shows up. Members have no event stream, so a short poll plus a
-// refresh on focus does the job; admins get the SSE event as well.
+// account. This page is where a person connects theirs: Connect asks where
+// to finish (openHandoff), then opens the provider's authorize page in a
+// new tab or hands out a link for another browser, the callback stores the
+// token on their row, and the list is re-read until it shows up. Members
+// have no event stream, so a short poll plus a refresh on focus does the
+// job; admins get the SSE event as well.
 
 let connectionsSeq = 0;
 async function loadConnections(clearError) {
@@ -1926,6 +1933,7 @@ async function loadConnections(clearError) {
       const p = c.rows.find((r) => r.server === c.pending);
       if (p && p.state === 'connected' && (p.connected_at || 0) >= c.pendingSince) {
         toast(c.pending + ': connected.');
+        if (state.handoff && state.handoff.server === c.pending) state.handoff = null;
         c.pending = null;
       }
     }
@@ -1958,12 +1966,132 @@ window.addEventListener('focus', () => {
   if (state.user && state.route === 'connections') loadConnections();
 });
 
-async function connectServer(name) {
+// ---- Finish a sign-in here or in another browser -----------------------------
+//
+// Every sign-in that sends the browser on to a provider stops here first:
+// an own account on My connections (GitHub included), a shared account's
+// Auth…, a marketplace install, and the GitHub App registration. "Continue
+// in this browser" runs the flow as before, bound to this browser. "Copy
+// link for another browser" asks the same begin route for {mode: 'link'}:
+// a one-time connect link (ten minutes, one use) to open in another browser
+// profile, where the sign-in starts and finishes. The server holds that
+// browser to the link's rules: an own account must sign in with the
+// person's toolyard email, and a shared account or the GitHub App needs an
+// admin's toolyard session there.
+
+function openHandoff(opts) {
+  state.handoff = { busy: false, error: '', link: '', expiresAt: 0, ...opts };
+  render();
+}
+
+// closeHandoff drops the panel without continuing here; onClose learns
+// whether a link was made.
+function closeHandoff() {
+  const h = state.handoff;
+  state.handoff = null;
+  if (h && h.onClose) h.onClose(!!h.link);
+  render();
+}
+
+function handoffContinue() {
+  const h = state.handoff;
+  if (!h || h.busy) return;
+  state.handoff = null;
+  render();
+  h.onContinue();
+}
+
+async function handoffCopyLink() {
+  const h = state.handoff;
+  if (!h || h.busy) return;
+  h.busy = true; h.error = ''; render();
+  try {
+    const out = await api(h.linkPath, { method: 'POST', body: h.linkBody });
+    h.link = out.connect_link;
+    h.expiresAt = Date.now() + (out.expires_in || 600) * 1000;
+    if (h.onLinked) h.onLinked();
+    try {
+      await navigator.clipboard.writeText(h.link);
+      toast('Link copied.');
+    } catch (_) { /* the Copy button below still works */ }
+  } catch (e) { h.error = e.message; }
+  h.busy = false;
+  render();
+}
+
+// handoffNote says what the other browser needs, by kind of sign-in.
+function handoffNote(h) {
+  const email = state.user && state.user.email;
+  switch (h.kind) {
+    case 'own':
+      return [
+        'Open it in the other browser profile. ',
+        email
+          ? ['Sign in there with the account for ', el('code', {}, email), ': an account with another email is refused. ']
+          : 'Sign in there with the account that uses your toolyard email: an account with another email is refused. ',
+        'If the provider does not report a verified email (GitHub, for example), sign in to toolyard as yourself in that browser first.',
+      ];
+    case 'github':
+      return 'Open it in the other browser profile and sign in to toolyard there as an admin. The GitHub App is created under the GitHub account signed in to that browser.';
+    default:
+      return 'Open it in the other browser profile and sign in to toolyard there as an admin: only an admin can sign in a shared account. ' +
+        'A link never switches a shared account to a different one; to switch accounts, continue in this browser.';
+  }
+}
+
+function renderHandoffModal() {
+  const h = state.handoff;
+  const until = h.expiresAt ? new Date(h.expiresAt).toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' }) : '';
+  return el('div', { class: 'modal-bg', on: { click: (e) => { if (e.target === e.currentTarget) closeHandoff(); } } },
+    el('div', { class: 'modal' },
+      el('h3', {}, h.title),
+      el('p', { class: 'meta' }, 'Where do you want to finish signing in? A link lets you finish in another browser profile, for example one signed in to a different account.'),
+      el('div', { class: 'row', style: 'margin-top: 8px; flex-wrap: wrap;' },
+        el('button', { class: 'primary', disabled: h.busy, on: { click: handoffContinue } }, 'Continue in this browser'),
+        el('button', { disabled: h.busy, on: { click: handoffCopyLink } },
+          h.busy ? 'Working…' : (h.link ? 'Copy a new link' : 'Copy link for another browser')),
+      ),
+      h.link ? el('div', { style: 'margin-top: 12px;' },
+        el('div', { class: 'snippet' },
+          el('div', { class: 'head' },
+            el('span', {}, 'One-time link · expires in 10 minutes' + (until ? ' (' + until + ')' : '')),
+            el('button', { class: 'copy-btn', on: { click: (e) => copyToButton(e.target, h.link) } }, 'Copy'),
+          ),
+          el('pre', { style: 'white-space: pre-wrap; word-break: break-all;' }, h.link),
+        ),
+        el('p', { class: 'meta', style: 'margin-top: 8px;' }, handoffNote(h)),
+        el('p', { class: 'meta' }, 'The link works once. Keep it to yourself: it starts a sign-in.'),
+      ) : null,
+      h.error ? el('div', { class: 'err' }, h.error) : null,
+      el('div', { class: 'row', style: 'margin-top: 12px; justify-content: flex-end;' },
+        el('button', { on: { click: closeHandoff } }, h.link ? 'Done' : 'Cancel'),
+      ),
+    ),
+  );
+}
+
+// connectServer stops before the person's own sign-in leaves toolyard.
+function connectServer(name) {
+  openHandoff({
+    title: 'Connect ' + name, server: name, kind: 'own',
+    linkPath: '/v1/me/connections/' + encodeURIComponent(name) + '/begin', linkBody: { mode: 'link' },
+    onContinue: () => connectServerHere(name),
+    onLinked: () => {
+      // The other browser finishes it; the list is re-read until it lands.
+      const c = state.connections;
+      c.pending = name; c.pendingLink = true;
+      c.pendingSince = Date.now() - 60 * 1000;
+      pollConnections();
+    },
+  });
+}
+
+async function connectServerHere(name) {
   const c = state.connections;
   c.busy = name; c.error = ''; render();
   try {
     const out = await api('/v1/me/connections/' + encodeURIComponent(name) + '/begin', { method: 'POST', body: {} });
-    c.pending = name;
+    c.pending = name; c.pendingLink = false;
     c.pendingSince = Date.now() - 60 * 1000; // allow for clock skew between browser and server
     window.open(out.authorize_url, '_blank', 'noopener');
     pollConnections();
@@ -1992,7 +2120,17 @@ function connectionStateBadge(st, lastError) {
   }
 }
 
-async function setupGitHubApp(server) {
+// setupGitHubApp stops before the GitHub App form leaves toolyard. A link
+// opens a toolyard page in the other browser that shows the same form there.
+function setupGitHubApp(server) {
+  openHandoff({
+    title: 'Register the GitHub App', server, kind: 'github',
+    linkPath: '/v1/github/setup/begin', linkBody: { server, mode: 'link' },
+    onContinue: () => setupGitHubAppHere(server),
+  });
+}
+
+async function setupGitHubAppHere(server) {
   try {
     const out = await api('/v1/github/setup/begin', { method: 'POST', body: { server } });
     const form = document.createElement('form');
@@ -2026,7 +2164,9 @@ function renderConnectionCard(r) {
       : el('p', { class: 'meta' }, 'An admin must finish the OAuth setup before anyone can connect.');
   } else if (waiting) {
     actions = el('div', { class: 'row key-actions' },
-      el('span', { class: 'meta grow' }, 'Finish signing in in the tab that just opened; this page updates on its own.'),
+      el('span', { class: 'meta grow' }, c.pendingLink
+        ? 'Finish signing in in the other browser with the link you copied; this page updates on its own.'
+        : 'Finish signing in in the tab that just opened; this page updates on its own.'),
       el('button', { on: { click: () => { c.pending = null; render(); } } }, 'Cancel'),
     );
   } else {
@@ -3512,7 +3652,9 @@ function renderMarketModal() {
     return el('div', { class: 'modal-bg', on: { click: (e) => { if (e.target === e.currentTarget) closeMarketModal(); } } },
       el('div', { class: 'modal' },
         el('h3', {}, 'Authorize ', modal.installedName),
-        el('div', { class: 'meta' }, 'Authorization page opened in a new tab — complete it there.'),
+        el('div', { class: 'meta' }, modal.viaLink
+          ? 'Finish signing in in the other browser with the link you copied.'
+          : 'Authorization page opened in a new tab — complete it there.'),
         el('div', { class: 'meta' }, 'This dialog closes automatically once the provider redirects back.'),
         el('label', { style: 'margin-top: 8px;' },
           el('div', { class: 'meta' }, 'Different browser? Paste the post-redirect URL here:'),
@@ -3774,12 +3916,36 @@ async function marketAuthorize(entry, modal, name) {
   } else {
     await api(base + '/discover', { method: 'POST', body: {} });
   }
-  const begun = await api(base + '/begin', { method: 'POST', body: { mode: 'callback' } });
-  window.open(begun.authorize_url, '_blank', 'noopener');
+  // The client is in place: stop before the sign-in leaves toolyard.
   modal.installedName = name;
-  modal.phase = 'waiting';
   modal.busy = false;
   await reloadServers();
+  openHandoff({
+    title: 'Authorize ' + name, server: name, kind: 'shared',
+    linkPath: base + '/begin', linkBody: { mode: 'link' },
+    onContinue: () => marketBeginHere(modal, name),
+    onLinked: () => { modal.phase = 'waiting'; modal.viaLink = true; },
+    onClose: (linked) => {
+      // Neither way chosen: the server stays installed without a sign-in.
+      if (!linked && state.marketModal === modal && modal.phase !== 'waiting') {
+        state.marketModal = null;
+        toast(name + ' installed. Sign it in later with Auth….');
+      }
+    },
+  });
+}
+
+// marketBeginHere is "Continue in this browser" after a marketplace install.
+async function marketBeginHere(modal, name) {
+  try {
+    const begun = await api('/v1/servers/' + encodeURIComponent(name) + '/oauth/begin', { method: 'POST', body: { mode: 'callback' } });
+    window.open(begun.authorize_url, '_blank', 'noopener');
+    modal.phase = 'waiting';
+    modal.viaLink = false;
+  } catch (e) {
+    if (state.marketModal === modal) modal.error = e.message;
+    else toast(e.message, 'error');
+  }
   render();
 }
 
@@ -4942,6 +5108,7 @@ function restoreFocus(f) {
 function closeTopmostOverlay() {
   const lb = document.querySelector('.ib-lightbox');
   if (lb) { lb.remove(); return true; }
+  if (state.handoff) { closeHandoff(); return true; }
   if (state.agentModal) { state.agentModal = null; render(); return true; }
   if (state.userAccessModal) { closeUserAccess(); return true; }
   if (state.serverConnectionsModal) { state.serverConnectionsModal = null; render(); return true; }
@@ -5017,6 +5184,8 @@ function render() {
     default:              body = viewInbox();
   }
   root.appendChild(shell(withSectionTabs(body)));
+  // The sign-in stop sits above whatever page or dialog opened it.
+  if (state.handoff) root.appendChild(renderHandoffModal());
   const settingsTabs = root.querySelector('[aria-label="Settings categories"]');
   if (settingsTabs && settingsTabs.scrollWidth > settingsTabs.clientWidth) {
     settingsTabs.scrollLeft = settingsTabScroll;
@@ -5122,7 +5291,7 @@ function renderOAuthModal() {
   );
 
   const modeRow = el('div', { class: 'row', style: 'gap: 16px;' },
-    radio('Same browser (recommended)', 'callback', f.mode, (v) => { state.oauthFlow.mode = v; render(); }),
+    radio('Browser sign-in, here or in another profile (recommended)', 'callback', f.mode, (v) => { state.oauthFlow.mode = v; render(); }),
     radio('Different browser → paste URL back', 'paste', f.mode, (v) => { state.oauthFlow.mode = v; render(); }),
     supportsDevice ? radio('Device code', 'device', f.mode, (v) => { state.oauthFlow.mode = v; render(); }) : null,
   );
@@ -5136,6 +5305,9 @@ function renderOAuthModal() {
             f.busy ? 'Working…' : 'Open authorization page'),
         )
       : renderActiveFlow(f),
+    f.viaLink && !f.authorize_url
+      ? el('div', { class: 'meta', style: 'margin-top: 8px;' }, 'A link for another browser was copied. This dialog closes once that sign-in finishes.')
+      : null,
   );
 
   const sectionConnected = el('div', { class: 'card', style: 'margin: 0 0 12px 0;' },
@@ -5250,8 +5422,23 @@ async function oauthDiscoverClick() {
   f.busy = false; render();
 }
 
-async function oauthBeginClick() {
+// oauthBeginClick: a browser sign-in (callback mode) stops first to ask
+// where to finish it; paste and device code start as they always did.
+function oauthBeginClick() {
   const f = state.oauthFlow;
+  if (f.mode !== 'callback') { oauthBeginHere(); return; }
+  openHandoff({
+    title: 'Authorize ' + f.name, server: f.name, kind: 'shared',
+    linkPath: '/v1/servers/' + encodeURIComponent(f.name) + '/oauth/begin', linkBody: { mode: 'link' },
+    onContinue: () => oauthBeginHere(),
+    onLinked: () => { if (state.oauthFlow === f) f.viaLink = true; },
+  });
+}
+
+async function oauthBeginHere() {
+  const f = state.oauthFlow;
+  if (!f) return;
+  f.viaLink = false;
   f.busy = true; f.error = ''; render();
   try {
     if (f.mode === 'device') {
