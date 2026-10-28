@@ -165,6 +165,11 @@ type upstream struct {
 	// settled is the version an auto-mode dial negotiated, asked for
 	// again on the next dial (requestedProtocol). Guarded by dialMu.
 	settled string
+
+	// selfDescription is what the upstream said about itself at its last
+	// initialize (initDescription): the fallback server description when
+	// the admin wrote none (server_descriptions.go).
+	selfDescription atomic.Value // string
 }
 
 // pooled reports whether the connection counts against the live-upstream
@@ -252,7 +257,8 @@ func newUpstream(ctx context.Context, cfg UpstreamConfig) (*upstream, error) {
 	initReq := mcp.InitializeRequest{}
 	initReq.Params.ProtocolVersion = requestedProtocol(cfg)
 	initReq.Params.ClientInfo = mcp.Implementation{Name: "toolyard-gateway", Version: "0.1.0"}
-	if _, err := c.Initialize(startCtx, initReq); err != nil {
+	initRes, err := c.Initialize(startCtx, initReq)
+	if err != nil {
 		// A server that answers the probe with UNSUPPORTED_PROTOCOL_VERSION
 		// and lists only session-based versions (an mcp-go v1 server
 		// restricted with WithStreamableHTTPProtocolVersions) knows
@@ -263,11 +269,12 @@ func newUpstream(ctx context.Context, cfg UpstreamConfig) (*upstream, error) {
 			return nil, fmt.Errorf("init upstream %s: %w", cfg.Name, err)
 		}
 		initReq.Params.ProtocolVersion = mcp.LATEST_LEGACY_PROTOCOL_VERSION
-		if _, err := c.Initialize(startCtx, initReq); err != nil {
+		if initRes, err = c.Initialize(startCtx, initReq); err != nil {
 			return nil, fmt.Errorf("init upstream %s: %w", cfg.Name, err)
 		}
 	}
 	u := &upstream{cfg: cfg, client: c}
+	u.selfDescription.Store(initDescription(initRes))
 	negotiated := c.ProtocolVersion()
 	u.modern.Store(mcp.IsModernProtocol(negotiated))
 	if cfg.ProtocolVersion == ProtocolAuto {
@@ -692,6 +699,7 @@ func (u *upstream) resume(ctx context.Context) error {
 	}
 	u.client = fresh.client
 	u.modern.Store(fresh.modern.Load())
+	u.selfDescription.Store(fresh.selfDesc())
 	if u.cfg.ProtocolVersion == ProtocolAuto {
 		// What this dial negotiated, even when it asked for the cached
 		// version: a server that went back to 2025-11-25 is then asked

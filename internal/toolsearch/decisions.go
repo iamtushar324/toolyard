@@ -253,6 +253,7 @@ func (r *DecisionsRanker) apiKey(ctx context.Context) (string, error) {
 // serverSummary is one server as the model sees it.
 type serverSummary struct {
 	name     string
+	desc     string // the server's description, "" when none
 	count    int
 	score    float64 // summed keyword score of its tools
 	examples []string
@@ -272,6 +273,9 @@ func summarizeServers(tools []Tool, keyword []Hit) []serverSummary {
 			i = len(list)
 			idx[t.Server] = i
 			list = append(list, serverSummary{name: t.Server})
+		}
+		if list[i].desc == "" {
+			list[i].desc = t.ServerDescription
 		}
 		list[i].count++
 		names[t.Server] = append(names[t.Server], t.Name)
@@ -394,9 +398,10 @@ type (
 		Parameters  []string `json:"parameters,omitempty"`
 	}
 	decisionsServer struct {
-		Name     string   `json:"name"`
-		Tools    int      `json:"tools"`
-		Examples []string `json:"examples,omitempty"`
+		Name        string   `json:"name"`
+		Description string   `json:"description,omitempty"`
+		Tools       int      `json:"tools"`
+		Examples    []string `json:"examples,omitempty"`
 	}
 	decisionsQuestion struct {
 		Type         string            `json:"type"`
@@ -454,7 +459,7 @@ func (r *DecisionsRanker) ask(ctx context.Context, key, task string, tools []Too
 	if len(choices) > 0 {
 		criteria := make(map[string]string, len(choices))
 		for _, s := range choices {
-			st.Servers = append(st.Servers, decisionsServer{Name: s.name, Tools: s.count, Examples: s.examples})
+			st.Servers = append(st.Servers, decisionsServer{Name: s.name, Description: clip(s.desc, decisionsDescLen), Tools: s.count, Examples: s.examples})
 			criteria[s.name] = "Choose " + s.name + " when the task is done with that server's tools."
 		}
 		questions[serverQuestion] = decisionsQuestion{

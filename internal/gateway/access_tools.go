@@ -82,6 +82,10 @@ type ServerInfo struct {
 	Name      string `json:"name"`
 	Transport string `json:"transport,omitempty"`
 	Enabled   bool   `json:"enabled"`
+	// Description tells this server apart from the others, mostly from
+	// one that serves the same tools: the admin's text, else the
+	// upstream's own initialize instructions (ServerDescription).
+	Description string `json:"description,omitempty"`
 	// Status: ok | error | waiting_signin | disabled | idle | unknown.
 	Status string `json:"status"`
 	// Error is the last connection error, redacted and shortened.
@@ -179,7 +183,7 @@ func (g *Gateway) accessTools() []toolEntry {
 				return g.changePolicy(ctx, args, true)
 			}),
 		accessEntry("servers.list", serversUpstream,
-			"The MCP servers your owner may use: name, enabled, connection status, tool count, auth mode (shared or per_user) and, for servers with a stored sign-in, whether one exists. Never URLs, headers or secrets. Read-only.",
+			"The MCP servers your owner may use: name, description (what tells it apart from the others), enabled, connection status, tool count, auth mode (shared or per_user) and, for servers with a stored sign-in, whether one exists. Never URLs, headers or secrets. Read-only.",
 			obj(nil, map[string]any{}),
 			g.handleServersList()),
 		accessEntry("servers.reconnect", serversUpstream,
@@ -874,6 +878,9 @@ func (g *Gateway) handleServersList() directHandler {
 				continue
 			}
 			r.Error = sanitizeServerError(r.Error)
+			if r.Description == "" {
+				r.Description = g.ServerDescription(r.Name)
+			}
 			out = append(out, r)
 		}
 		g.annotateAsync(out)

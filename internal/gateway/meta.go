@@ -50,6 +50,7 @@ func metaSearchDescription(skills, safe bool) string {
 	} else {
 		d += "detail \"full\" (default) returns name, upstream, description, the code-mode name, score, run and the input and output schemas; \"summary\" leaves out the schemas; \"name\" only names. "
 	}
+	d += "The first result of each server also gives server_description, what tells that server apart from the others. When the same tool exists on several servers, pick by server_description. "
 	if skills {
 		d += metaSearchSkillsSentence(safe)
 	}
@@ -299,6 +300,17 @@ func (g *Gateway) searchCatalog(ctx context.Context) []toolsearch.Tool {
 	names := codemode.CodeNames(codeTools)
 	for i := range out {
 		out[i].CodeName = names[out[i].Name]
+	}
+	// Each server's description, so search can tell apart servers that
+	// carry the same tools (server_descriptions.go).
+	descs := map[string]string{}
+	for i := range out {
+		desc, ok := descs[out[i].Server]
+		if !ok {
+			desc = g.ServerDescription(out[i].Server)
+			descs[out[i].Server] = desc
+		}
+		out[i].ServerDescription = desc
 	}
 	return out
 }

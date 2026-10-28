@@ -16,6 +16,7 @@ import (
 	"strings"
 	"sync"
 	"time"
+	"unicode/utf8"
 
 	"github.com/tusharbhardwaj/toolyard/internal/gateway"
 	"github.com/tusharbhardwaj/toolyard/internal/jobs"
@@ -52,6 +53,12 @@ type Server struct {
 	Args      []string          `json:"args,omitempty"`
 	URL       string            `json:"url,omitempty"`
 	Env       map[string]string `json:"env,omitempty"`
+	// Description is the admin's one or two sentences that tell this
+	// server apart from the others, mostly from one that serves the same
+	// tools ("bk t3 on the production server DS1"). Agents see it in
+	// servers.list and tools.search; "" falls back to the upstream's own
+	// initialize instructions. At most MaxDescription runes.
+	Description string `json:"description,omitempty"`
 	// Headers are static HTTP headers for http transports, persisted in
 	// headers_json. Values may be secret:// refs (resolved at dial time)
 	// and are merged with OAuth-provided headers — OAuth wins on a clash
@@ -85,6 +92,9 @@ type Server struct {
 	// SetAsync and filled by List and Get. nil when it has none.
 	Async *jobs.AsyncSetting `json:"async,omitempty"`
 }
+
+// MaxDescription is the longest Server.Description, in runes.
+const MaxDescription = gateway.MaxServerDescription
 
 // AuthMode values.
 const (
@@ -384,7 +394,18 @@ func validate(srv Server) error {
 	if err := validateAuthMode(srv); err != nil {
 		return err
 	}
+	if err := validateDescription(srv.Description); err != nil {
+		return err
+	}
 	return validateIdentity(srv)
+}
+
+// validateDescription caps the admin's description at MaxDescription runes.
+func validateDescription(desc string) error {
+	if utf8.RuneCountInString(desc) > MaxDescription {
+		return fmt.Errorf("%w: description must be at most %d characters", ErrInvalid, MaxDescription)
+	}
+	return nil
 }
 
 // validateAuthMode checks the sign-in mode: shared (or unset) is always
@@ -573,7 +594,7 @@ func (s *Service) list(ctx context.Context) ([]Server, error) {
             COALESCE(url,''), COALESCE(env_json,''), COALESCE(headers_json,''),
             COALESCE(identity_json,''), COALESCE(auth_mode,'shared'), enabled,
             COALESCE(last_status,''), COALESCE(last_error,''), tool_count,
-            created_at, updated_at
+            created_at, updated_at, COALESCE(description,'')
          FROM upstream_servers ORDER BY name`)
 	if err != nil {
 		return nil, err
@@ -586,7 +607,7 @@ func (s *Service) list(ctx context.Context) ([]Server, error) {
 		var enabled int
 		if err := rows.Scan(&srv.Name, &srv.Transport, &srv.Command, &argsRaw,
 			&srv.URL, &envRaw, &headersRaw, &identityRaw, &srv.AuthMode, &enabled, &srv.LastStatus, &srv.LastError,
-			&srv.ToolCount, &srv.CreatedAt, &srv.UpdatedAt); err != nil {
+			&srv.ToolCount, &srv.CreatedAt, &srv.UpdatedAt, &srv.Description); err != nil {
 			return nil, err
 		}
 		srv.Enabled = enabled != 0
@@ -619,6 +640,7 @@ func (s *Service) Get(ctx context.Context, name string) (*Server, error) {
 // row stays around (so the dashboard can show the error and the operator can
 // edit + retry); the call returns the connection error for the API layer.
 func (s *Service) Add(ctx context.Context, srv Server) (*Server, error) {
+	srv.Description = strings.TrimSpace(srv.Description)
 	if err := validate(srv); err != nil {
 		return nil, err
 	}
@@ -646,10 +668,10 @@ func (s *Service) Add(ctx context.Context, srv Server) (*Server, error) {
 
 	_, err := s.db.ExecContext(ctx,
 		`INSERT INTO upstream_servers(name, transport, command, args_json, url,
-            env_json, headers_json, identity_json, auth_mode, enabled, created_at, updated_at)
-         VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`,
+            env_json, headers_json, identity_json, auth_mode, enabled, created_at, updated_at, description)
+         VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)`,
 		srv.Name, srv.Transport, nullStr(srv.Command), string(argsBlob),
-		nullStr(srv.URL), string(envBlob), string(headersBlob), identityJSON(srv.Identity), srv.AuthMode, 1, now, now)
+		nullStr(srv.URL), string(envBlob), string(headersBlob), identityJSON(srv.Identity), srv.AuthMode, 1, now, now, srv.Description)
 	if err != nil {
 		if store.IsUniqueViolation(err) {
 			return nil, ErrAlreadyHere
@@ -798,6 +820,7 @@ func (s *Service) connect(ctx context.Context, srv Server) error {
 // records the status, so last_status does not flip between replicas).
 func (s *Service) connectWith(ctx context.Context, srv Server, record bool) error {
 	s.applied[srv.Name] = configFingerprint(srv)
+	s.gw.SetServerDescription(srv.Name, srv.Description)
 	err := s.gw.AddUpstream(ctx, s.toCfg(srv))
 	if errors.Is(err, gateway.ErrWaitingForSignIn) {
 		if record {
@@ -822,14 +845,14 @@ func (s *Service) get(ctx context.Context, name string) (*Server, error) {
             COALESCE(url,''), COALESCE(env_json,''), COALESCE(headers_json,''),
             COALESCE(identity_json,''), COALESCE(auth_mode,'shared'), enabled,
             COALESCE(last_status,''), COALESCE(last_error,''), tool_count,
-            created_at, updated_at
+            created_at, updated_at, COALESCE(description,'')
          FROM upstream_servers WHERE name = ?`, name)
 	var srv Server
 	var argsRaw, envRaw, headersRaw, identityRaw string
 	var enabled int
 	if err := row.Scan(&srv.Name, &srv.Transport, &srv.Command, &argsRaw,
 		&srv.URL, &envRaw, &headersRaw, &identityRaw, &srv.AuthMode, &enabled, &srv.LastStatus, &srv.LastError,
-		&srv.ToolCount, &srv.CreatedAt, &srv.UpdatedAt); err != nil {
+		&srv.ToolCount, &srv.CreatedAt, &srv.UpdatedAt, &srv.Description); err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, ErrNotFound
 		}
@@ -1073,6 +1096,17 @@ type Patch struct {
 	Identity OptionalIdentity   `json:"identity"`
 	AuthMode *string            `json:"auth_mode"`
 	Enabled  *bool              `json:"enabled"`
+	// Description replaces the admin's description ("" clears it). A
+	// patch that changes only the description saves it without
+	// reconnecting the server.
+	Description *string `json:"description"`
+}
+
+// onlyDescription reports whether p changes the description and nothing
+// else.
+func (p Patch) onlyDescription() bool {
+	return p.Description != nil && p.URL == nil && p.Headers == nil && p.Env == nil &&
+		!p.Identity.Set && p.AuthMode == nil && p.Enabled == nil
 }
 
 // OptionalIdentity tells "not in the body" (Set false) apart from an
@@ -1145,6 +1179,17 @@ func (s *Service) Update(ctx context.Context, name string, patch Patch) (*Server
 	if patch.Enabled != nil {
 		next.Enabled = *patch.Enabled
 	}
+	if patch.Description != nil {
+		next.Description = strings.TrimSpace(*patch.Description)
+	}
+	if patch.onlyDescription() {
+		// The description is not part of the connection: save it and tell
+		// the gateway, with no reconnect.
+		if err := validateDescription(next.Description); err != nil {
+			return nil, err
+		}
+		return s.saveDescription(ctx, name, next.Description, cur.UpdatedAt)
+	}
 	if err := validate(next); err != nil {
 		return nil, err
 	}
@@ -1184,10 +1229,10 @@ func (s *Service) Update(ctx context.Context, name string, patch Patch) (*Server
 		enabled = 1
 	}
 	res, err := s.db.ExecContext(ctx,
-		`UPDATE upstream_servers SET url=?, env_json=?, headers_json=?, identity_json=?, auth_mode=?, enabled=?, updated_at=?
+		`UPDATE upstream_servers SET url=?, env_json=?, headers_json=?, identity_json=?, auth_mode=?, enabled=?, description=?, updated_at=?
          WHERE name=? AND updated_at=?`,
 		nullStr(next.URL), string(envBlob), string(headersBlob), identityJSON(next.Identity),
-		normalizeAuthMode(next.AuthMode), enabled, time.Now().UnixMilli(), name, cur.UpdatedAt)
+		normalizeAuthMode(next.AuthMode), enabled, next.Description, time.Now().UnixMilli(), name, cur.UpdatedAt)
 	if err != nil {
 		return nil, err
 	}
@@ -1221,6 +1266,30 @@ func (s *Service) Update(ctx context.Context, name string, patch Patch) (*Server
 	}
 	final.OAuthReset = oauthReset
 	return final, connectErr
+}
+
+// saveDescription stores a server's description, on the same updated_at
+// condition as Update, and hands it to the gateway; the other replicas
+// pick it up from the sync message without reconnecting either. s.mu is
+// held.
+func (s *Service) saveDescription(ctx context.Context, name, desc string, updatedAt int64) (*Server, error) {
+	res, err := s.db.ExecContext(ctx,
+		`UPDATE upstream_servers SET description=?, updated_at=? WHERE name=? AND updated_at=?`,
+		desc, time.Now().UnixMilli(), name, updatedAt)
+	if err != nil {
+		return nil, err
+	}
+	if n, err := res.RowsAffected(); err != nil {
+		return nil, err
+	} else if n == 0 {
+		if _, err := s.get(ctx, name); errors.Is(err, ErrNotFound) {
+			return nil, ErrNotFound
+		}
+		return nil, ErrConflict
+	}
+	s.gw.SetServerDescription(name, desc)
+	s.publish(opSync, name, "")
+	return s.get(ctx, name)
 }
 
 // ConvertEnvToSecret extracts the plaintext value of env[envKey] on the named

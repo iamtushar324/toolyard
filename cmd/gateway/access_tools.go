@@ -45,7 +45,7 @@ func (a serversAdapter) ReconnectServer(ctx context.Context, name string) (*gate
 // stored client, or the owner's own connection on a per_user server.
 func (a serversAdapter) info(ctx context.Context, sv upstreams.Server, owner string) gateway.ServerInfo {
 	info := gateway.ServerInfo{
-		Name: sv.Name, Transport: sv.Transport, Enabled: sv.Enabled,
+		Name: sv.Name, Description: sv.Description, Transport: sv.Transport, Enabled: sv.Enabled,
 		ToolCount: sv.ToolCount, AuthMode: upstreams.AuthShared,
 	}
 	if sv.AuthMode == upstreams.AuthPerUser {

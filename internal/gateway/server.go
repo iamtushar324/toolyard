@@ -252,6 +252,9 @@ type Gateway struct {
 	// upstream name, one connection per user inside it. A name is in
 	// either upstreams or perUser, never both.
 	perUser map[string]*perUserGroup
+	// serverDescs is the admin's description of each upstream, by name
+	// (SetServerDescription, server_descriptions.go).
+	serverDescs map[string]string
 
 	// catalogMu serialises the steps that install or drop a shared
 	// upstream's whole catalog: AddUpstream's register, RemoveUpstream and
