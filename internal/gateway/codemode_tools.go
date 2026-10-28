@@ -141,6 +141,10 @@ func (g *Gateway) CodeModeContext(ctx context.Context, agentID, sessionID string
 // codeModeTools returns the four code-mode entries.
 func (g *Gateway) codeModeTools() []toolEntry {
 	rt := g.codeModeRuntime()
+	// n names an MCP-listed tool as tools/list does (its published name
+	// with safe tool names); code-mode names and the JavaScript helpers
+	// (tools.search, tools.tryCall inside a script) keep theirs.
+	n := g.mcpToolName
 	optional := func(props map[string]any, required ...string) mcp.ToolInputSchema {
 		return mcp.ToolInputSchema{Type: "object", Required: required, Properties: addMetaProps(props)}
 	}
@@ -154,7 +158,7 @@ func (g *Gateway) codeModeTools() []toolEntry {
 			"toolyard code mode: _reason is optional here; every call your code makes still goes through toolyard's access, policy and approval rules. " +
 			"toolyard's own tools (inbox.*, callbacks.*, jobs.*, memory.*, events.*, session.*, tools.*, policies.*, servers.*, audit.*, access.*) are one server, toolyard, called as toolyard.<group>_<name>(...), e.g. toolyard.inbox_request(...) or toolyard.policies_explain(tool=\"github.create_issue\"). " +
 			"For JavaScript scripts pass language=\"javascript\": the tree lists TypeScript stubs instead (servers/<serverName>/<toolName>.d.ts, and servers/index.d.ts for the tools object). " +
-			"To find a tool by what it does, call toolyard's tools.search (ranked keyword or regex search) instead of reading every stub.",
+			"To find a tool by what it does, call toolyard's " + n(MetaSearchTool) + " (ranked keyword or regex search) instead of reading every stub.",
 		InputSchema: optional(map[string]any{
 			"language": map[string]any{
 				"type":        "string",
@@ -187,19 +191,19 @@ func (g *Gateway) codeModeTools() []toolEntry {
 	docs := mcp.Tool{
 		Name: CodeModeGetToolDocs,
 		Description: "Get detailed documentation for a specific tool: full parameter descriptions, types and a usage example. " +
-			"Step two of the flow: find the tool with tools.search, read its docs here, then call it in executeToolCode. " +
-			"A tools.search result's code is server.tool: pass the part before the dot as server and the part after it as tool (toolyard's own tools are server \"toolyard\", e.g. tool \"memory_get\"). " +
+			"Step two of the flow: find the tool with " + n(MetaSearchTool) + ", read its docs here, then call it in executeToolCode. " +
+			"A " + n(MetaSearchTool) + " result's code is server.tool: pass the part before the dot as server and the part after it as tool (toolyard's own tools are server \"toolyard\", e.g. tool \"memory_get\"). " +
 			"The tool does not have to be in your tool list: every tool you may use is documented here and callable from executeToolCode. " +
 			"Requires both the server name and the tool name.",
 		InputSchema: optional(map[string]any{
-			"server": map[string]any{"type": "string", "description": "The server name: the part of a tools.search result's code before the dot (e.g. 'Linear', or 'toolyard' for toolyard's own tools)."},
+			"server": map[string]any{"type": "string", "description": "The server name: the part of a " + n(MetaSearchTool) + " result's code before the dot (e.g. 'Linear', or 'toolyard' for toolyard's own tools)."},
 			"tool":   map[string]any{"type": "string", "description": "The tool name: the part of the code after the dot (e.g. 'get_issue', or 'memory_get')."},
 		}, "server", "tool"),
 	}
 	exec := mcp.Tool{
 		Name: CodeModeExecuteToolCode,
 		Description: "Executes Python code in a sandboxed Starlark interpreter with tool access: the way to run any tool you may use, listed or not. Servers are global objects: result = serverName.toolName(param=\"value\"). " +
-			"FLOW: find the tool with tools.search (each result's code is the name to call, server.tool, and its run status says whether it runs now, needs approval or is blocked) -> read its parameters with getToolDocs (or its stub with readToolFile) -> call it here; never guess callable names. " +
+			"FLOW: find the tool with " + n(MetaSearchTool) + " (each result's code is the name to call, server.tool, and its run status says whether it runs now, needs approval or is blocked) -> read its parameters with getToolDocs (or its stub with readToolFile) -> call it here; never guess callable names. " +
 			"STARLARK DIFFERENCES FROM PYTHON: no try/except/finally/raise (a failed tool call aborts the script; use try_call(server.tool, param=value) to get {ok, status, result | error} instead); no classes; no imports, network or filesystem; no `is`; no f-strings (use % formatting); " +
 			"each call runs in a FRESH ISOLATED SCOPE with no state carried between calls. " +
 			"SYNTAX: synchronous calls, keyword arguments (server.tool(param=\"value\")), dict access with brackets (result[\"key\"]), print() for logging, assign the value to return to `result`. " +
@@ -212,7 +216,7 @@ func (g *Gateway) codeModeTools() []toolEntry {
 			"console.log(...) prints; return { summary } returns. Results are the tool's structuredContent when it sends one, else its JSON text parsed, else the text. Read the .d.ts stubs (listToolFiles with language=\"javascript\") first. " +
 			"PERMISSION: each tool call your code makes goes through toolyard's access, policy and approval rules. A restricted call without a grant runs nothing and aborts a Starlark script (and rejects in JavaScript) with status permission_required; " +
 			"call such tools with tools.tryCall (JavaScript) or try_call (Starlark), which return {ok: false, status: \"permission_required\"} instead, so the script goes on. " +
-			"Collect every permission_required call of the script, ask for all of them (and every question you have) ONCE with inbox.request, outside the script, and read the decision with inbox.status. " +
+			"Collect every permission_required call of the script, ask for all of them (and every question you have) ONCE with " + n("inbox.request") + ", outside the script, and read the decision with " + n("inbox.status") + ". " +
 			"Then run the script again with each accepted call's grant token as one more argument, with exactly the approved parameters: Starlark server.tool(param=\"value\", _grant=\"<token>\") or try_call(server.tool, param=\"value\", _grant=\"<token>\"), " +
 			"JavaScript await tools.server.tool({ param: \"value\", _grant: \"<token>\" }). A call held for a legacy approval comes back deferred with an approval_id: poll it with toolyard.tools_poll_approval(approval_id=\"...\"). " +
 			"echo=\"preview\" or \"none\" keeps tool answers out of the text (only the first 500 bytes, or nothing) and lists the calls instead; the default \"full\" echoes each answer as a [TOOL] line. " +

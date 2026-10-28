@@ -624,7 +624,11 @@ func catalogKey(tools []Tool) string {
 // Entry is one result as the surfaces return it. Name and Upstream keep
 // the keys tools.search has always used.
 type Entry struct {
-	Name        string  `json:"name"`
+	Name string `json:"name"`
+	// MCPName is the name the gateway's tools/list shows for the tool when
+	// it publishes OpenAI-safe names ("inbox_request" for
+	// "inbox.request"); the gateway fills it in, Render leaves it empty.
+	MCPName     string  `json:"mcp_name,omitempty"`
 	Upstream    string  `json:"upstream,omitempty"`
 	Description string  `json:"description,omitempty"`
 	Code        string  `json:"code,omitempty"`

@@ -58,6 +58,8 @@ type taskRequest struct {
 	id     json.RawMessage
 	method string
 	params json.RawMessage
+	// header is the HTTP request's headers, for the Mcp-Param-* check.
+	header http.Header
 	// modern is a 2026-07-28 request: errors carry an HTTP status and
 	// results a resultType.
 	modern bool
@@ -117,7 +119,7 @@ func (g *Gateway) MCPTasks(next http.Handler, contextFunc func(context.Context, 
 			next.ServeHTTP(w, r)
 			return
 		}
-		req := taskRequest{id: msg.ID, method: msg.Method, params: msg.Params}
+		req := taskRequest{id: msg.ID, method: msg.Method, params: msg.Params, header: r.Header}
 		var meta json.RawMessage
 		var p struct {
 			Meta json.RawMessage `json:"_meta"`
@@ -222,15 +224,17 @@ func (g *Gateway) taskToolCall(ctx context.Context, w http.ResponseWriter, req t
 		writeRPCError(w, req, mcp.INVALID_PARAMS, "invalid tools/call params: "+err.Error())
 		return
 	}
-	name := p.Name
-	args := exactArguments(ctx, name, p.Arguments)
+	// A published name (tool_names.go) runs its canonical tool, as on a
+	// plain tools/call; an unknown name is answered with the name sent.
+	name := g.resolveToolName(p.Name)
+	args := g.exactArguments(ctx, name, p.Arguments)
 	if args == nil {
 		args = map[string]any{}
 	}
 	g.mu.RLock()
 	entry, known := g.tools[name]
 	g.mu.RUnlock()
-	notFound := fmt.Sprintf("tool '%s' not found", name)
+	notFound := fmt.Sprintf("tool '%s' not found", p.Name)
 	if !known {
 		writeRPCError(w, req, mcp.INVALID_PARAMS, notFound)
 		return
@@ -249,6 +253,16 @@ func (g *Gateway) taskToolCall(ctx context.Context, w http.ResponseWriter, req t
 		_, _ = g.routeEntry(ctx, entry, viaDirect, args)
 		writeRPCError(w, req, mcp.INVALID_PARAMS, notFound)
 		return
+	}
+	// The 2026-07-28 Mcp-Param-* headers must match the tool that runs,
+	// whichever name the call used, as mcp-go checks a plain tools/call
+	// (this path never reaches mcp-go). Checked after access, so a
+	// mismatch never confirms a tool the caller may not use.
+	if req.modern {
+		if err := mcp.ValidateParamHeadersLookup(headerLookup(req.header), &entry.tool, req.params); err != nil {
+			writeRPCError(w, req, mcp.HEADER_MISMATCH, err.Error())
+			return
+		}
 	}
 	areq := &asyncRequest{via: jobViaTask}
 	// The same panic guard mcp-go's middleware gives a plain tools/call.

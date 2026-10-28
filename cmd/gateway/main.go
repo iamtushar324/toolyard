@@ -365,6 +365,8 @@ func runServe(argv []string) error {
 	clusterFlag := fs.String("cluster", string(clusterAuto), "replicas on one database: auto (on for Postgres, off for SQLite) | on (several replicas may share this Postgres database: leader leases, cross-replica messages and locks; refused on SQLite) | off (one gateway per database, also on Postgres: no LISTEN, no periodic recovery, rate limits in process)")
 	// TEC-1807 tools.search ranking
 	toolSearch := registerToolSearchFlags(fs)
+	// TEC-1807 tool names an OpenAI client accepts
+	safeToolNames := registerSafeToolNamesFlag(fs)
 	_ = fs.Parse(argv)
 
 	// TEC-1638: every flag not given on the command line may come from
@@ -802,6 +804,7 @@ func runServe(argv []string) error {
 		PublicURL:           *publicURL,
 		UpstreamProtocol:    upstreamProtocol,
 		Jobs:                jobsSvc,
+		SafeToolNames:       *safeToolNames,
 	})
 	// The kernel probe for the code-mode sandbox runs now, off the
 	// request path.
@@ -2511,6 +2514,18 @@ const (
 	// one secret read, and audit row, per minute rather than per search.
 	toolSearchKeyTTL = time.Minute
 )
+
+// registerSafeToolNamesFlag defines -mcp-safe-tool-names (TEC-1807),
+// TOOLYARD_MCP_SAFE_TOOL_NAMES through the environment layer. On (the
+// default), tools/list shows every tool under a name that matches
+// ^[a-zA-Z0-9_-]{1,64}$, the rule OpenAI's MCP connector applies to every
+// tool ("inbox.request" is listed as "inbox_request"); calls by either
+// name work. Off lists the dotted names, as before, without a code change.
+func registerSafeToolNamesFlag(fs *flag.FlagSet) *bool {
+	return fs.Bool("mcp-safe-tool-names", true, "list MCP tools under names that match ^[a-zA-Z0-9_-]{1,64}$, which OpenAI clients (ChatGPT) require: "+
+		"each character other than a letter, digit, _ or - becomes _ (inbox.request is listed as inbox_request; a name past 64 characters, or two tools that would share a name, get a short hash). "+
+		"Calls by the listed name or the dotted name both work, and policies, grants and audit keep the dotted name. false lists the dotted names, as before.")
+}
 
 // toolSearchFlags are serve's -tool-search-* flags.
 type toolSearchFlags struct {

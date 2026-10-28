@@ -40,13 +40,38 @@ owner is an admin; neither can an OAuth client unless its admin owner chose
 Every MCP agent's `tools/list` shows five tools by default (the small tool
 list):
 
-| Tool | What the agent does with it |
+| Tool (listed as) | What the agent does with it |
 |---|---|
-| `tools.search` | Find a tool by what it does. Each result gives its code-mode name (`code`) and whether it runs now, needs approval or is blocked (`run`: `now`, `needs_approval` or `blocked`). |
+| `tools.search` (`tools_search`) | Find a tool by what it does. Each result gives its catalog name (`name`), the name `tools/list` shows for it (`mcp_name`), its code-mode name (`code`) and whether it runs now, needs approval or is blocked (`run`: `now`, `needs_approval` or `blocked`). |
 | `getToolDocs` | Read one tool's full parameters (`server` and `tool`: the two halves of a result's `code`). |
 | `executeToolCode` | Run tools in a Starlark or JavaScript script. |
-| `inbox.request` | Ask the owner for permission. |
-| `inbox.status` | Read the decision, the answers and the grants. |
+| `inbox.request` (`inbox_request`) | Ask the owner for permission. |
+| `inbox.status` (`inbox_status`) | Read the decision, the answers and the grants. |
+
+**Listed names.** `tools/list` names every tool so it matches
+`^[a-zA-Z0-9_-]{1,64}$`, the rule OpenAI clients apply (an MCP connector
+in ChatGPT fails "action discovery" on one name outside it): each
+character other than a letter, digit, `_` or `-` becomes `_`, so
+`inbox.request` is listed as `inbox_request` and `github.get-issue` as
+`github_get-issue`. A name past 64 characters, or two tools that would
+share a name, get their first 55 characters, `_` and 8 hex digits of the
+SHA-256 of the catalog name; a catalog name that already matches the rule
+is never renamed. Uniqueness is checked after hashing, over the sorted
+catalog: a hashed name another tool already holds takes 16 hex digits,
+then 8 and a counter, so no listed name ever means two tools. The names
+follow from the catalog alone, so every replica lists the same ones. A call may name a tool either way, directly
+or in `tools.execute`, `jobs.start`, `inbox.request` and `inbox.check`;
+the call runs under the catalog name, so policies, grants, approvals, jobs
+and audit rows name the tool as before, and a grant for a call works under
+either name. An answer about a tool the caller may not use, or one that
+does not exist, repeats the name the caller sent, so a listed name never
+reveals a hidden tool. A 2026-07-28 call's `Mcp-Param-*` headers are
+checked against the tool that runs, under either name. The server instructions and the five tools' descriptions use
+the listed names. Code mode keeps its names (`server.tool`,
+`toolyard.<group>_<name>`). Claude clients already turned dots into `_`
+themselves, so their tool names do not change. An operator who sets
+`-mcp-safe-tool-names=false` gets the dotted names back
+([self-hosting](../self-hosting.md#mcp-protocol-versions)).
 
 The list is only what the agent sees. Every other tool the agent may use
 still works: called directly (`tools/call`), through `tools.execute`, and

@@ -1386,9 +1386,17 @@ func (s *Service) Check(ctx context.Context, agentID string, calls []CheckCall) 
 	}
 	out := make([]CheckResult, 0, len(calls))
 	for _, c := range calls {
+		// A listed (published) name of a tool the agent may use checks,
+		// and matches grants, as the catalog name; an unknown or hidden
+		// tool is answered under the name the agent sent.
+		supplied := c.Tool
+		c.Tool = canonicalTool(ctx, s.opts.Catalog, agentID, supplied)
 		access := AccessUnknown
 		if s.opts.Catalog != nil {
 			access, _ = s.opts.Catalog.Access(ctx, agentID, c.Tool, c.Args)
+		}
+		if access == AccessUnknown {
+			c.Tool = supplied
 		}
 		res := CheckResult{Tool: c.Tool, Status: access}
 		switch access {

@@ -75,7 +75,7 @@ func TestE2EInbox(t *testing.T) {
 		have[tl.Name] = true
 	}
 	for _, n := range []string{"inbox.guide", "inbox.check", "inbox.request", "inbox.wait", "session.start"} {
-		if !have[n] {
+		if !listedAs(have, n) {
 			t.Fatalf("%s missing from tools/list", n)
 		}
 	}

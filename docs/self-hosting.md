@@ -658,6 +658,20 @@ handled.
   client from each request's `_meta`.
 - `tools/list` answers 2026-07-28 clients with `cacheScope: private`
   (each caller sees its own catalog) and `ttlMs: 60000`.
+- **`-mcp-safe-tool-names`** (`TOOLYARD_MCP_SAFE_TOOL_NAMES`, default
+  `true`): `tools/list` names every tool so it matches
+  `^[a-zA-Z0-9_-]{1,64}$`, the rule OpenAI clients (ChatGPT) apply to
+  every tool of a connector. Each character other than a letter, digit,
+  `_` or `-` becomes `_` (`inbox.request` is listed as `inbox_request`,
+  `github.get-issue` as `github_get-issue`); a name longer than 64
+  characters, or two tools that would share a name, get their first 55
+  characters, `_` and 8 hex digits of the SHA-256 of the real name. The
+  server instructions and the five tools' descriptions use the listed
+  names. A call may use the listed name or the dotted name, also in
+  `tools.execute`, `jobs.start`, `inbox.request` and `inbox.check`;
+  policies, grants, jobs and audit rows keep the dotted name, and code
+  mode is unchanged. `false` lists the dotted names, as before; calls by
+  a listed name keep working, for clients that listed them earlier.
 - An earlier client initializes as before; `-stateless-mcp` still applies
   to it. Its session lives in one replica's memory: with several replicas
   use `-stateless-mcp` or sticky routing (see [Several replicas on one

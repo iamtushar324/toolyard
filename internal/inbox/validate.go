@@ -64,6 +64,26 @@ type Catalog interface {
 	Access(ctx context.Context, agentID, tool string, args map[string]any) (access, upstream string)
 }
 
+// ToolNamer is the optional part of a Catalog that maps a name an agent
+// may use for a tool to the catalog name: the gateway lists tools under
+// OpenAI-safe names ("inbox_request" for "inbox.request") and accepts
+// both. Requests and checks keep the catalog name, so a grant names the
+// tool as policies and audit do. Only a tool agentID may use is resolved:
+// any other name (unknown, or a tool outside the agent's scope) comes back
+// unchanged, so no answer reveals a tool the agent cannot see.
+type ToolNamer interface {
+	CanonicalTool(ctx context.Context, agentID, name string) string
+}
+
+// canonicalTool is name as the catalog names it for agentID, when cat is
+// a ToolNamer.
+func canonicalTool(ctx context.Context, cat Catalog, agentID, name string) string {
+	if namer, ok := cat.(ToolNamer); ok && name != "" {
+		return namer.CanonicalTool(ctx, agentID, name)
+	}
+	return name
+}
+
 // Tool access values.
 const (
 	AccessOpen       = "open"
@@ -281,6 +301,8 @@ func Validate(ctx context.Context, cat Catalog, agentID string, s *Submission, o
 		for i, st := range s.Tools {
 			p := fmt.Sprintf("tools[%d]", i)
 			tr := ToolRequest{CallID: st.CallID, Target: strings.TrimSpace(st.Target), ExpectedEffects: strings.TrimSpace(st.ExpectedEffects), Operation: st.Operation, AffectedScope: strings.TrimSpace(st.AffectedScope), MaterialRisks: strings.TrimSpace(st.MaterialRisks), Undo: strings.TrimSpace(st.Undo), Tool: strings.TrimSpace(st.Tool), Required: st.Required, Summary: strings.TrimSpace(st.Summary), After: st.After, Params: map[string]Constraint{}}
+			supplied := tr.Tool
+			tr.Tool = canonicalTool(ctx, cat, agentID, supplied)
 			if tr.Tool == "" {
 				add(p+".tool", "missing")
 			} else if cat != nil {
@@ -288,7 +310,10 @@ func Validate(ctx context.Context, cat Catalog, agentID string, s *Submission, o
 				tr.Upstream = upstream
 				switch access {
 				case AccessUnknown:
-					add(p+".tool", "%q isn't a toolyard tool. Use the catalog name, e.g. from tools.search.", tr.Tool)
+					// Named as the agent named it: an unknown tool and one
+					// outside its scope read the same.
+					tr.Tool = supplied
+					add(p+".tool", "%q isn't a toolyard tool. Use the catalog name, e.g. from tools.search.", supplied)
 				case AccessDenied:
 					add(p+".tool", "%q is blocked for you by your owner. Don't ask for it.", tr.Tool)
 				case AccessOpen:

@@ -57,8 +57,13 @@ func rawMCPBody(ctx context.Context) ([]byte, bool) {
 	return raw, ok
 }
 
-func exactArguments(ctx context.Context, name string, fallback map[string]any) map[string]any {
-	if exact, ok := ctx.Value(exactToolArgumentsKey{}).(exactToolArguments); ok && exact.Name == name {
+// exactArguments is the call's arguments with their original JSON numbers
+// when PreserveToolCallNumbers read them for this tool, else fallback. The
+// name on the wire may be the tool's published name (tool_names.go) while
+// name is the canonical one the handler runs as: both mean the same call.
+func (g *Gateway) exactArguments(ctx context.Context, name string, fallback map[string]any) map[string]any {
+	exact, ok := ctx.Value(exactToolArgumentsKey{}).(exactToolArguments)
+	if ok && (exact.Name == name || g.resolveToolName(exact.Name) == name) {
 		return exact.Args
 	}
 	return fallback

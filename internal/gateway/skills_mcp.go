@@ -251,7 +251,7 @@ func (g *Gateway) skillsGuideFor(ctx context.Context) string {
 	}
 	for _, sk := range list {
 		if sk.URI == want {
-			return skillsGuideInstructions(ref)
+			return skillsGuideInstructions(ref, g.safeToolNames)
 		}
 	}
 	return ""

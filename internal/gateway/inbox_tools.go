@@ -417,8 +417,22 @@ var (
 	}
 )
 
+// requestToolDescription describes inbox.request's tools[].tool. With safe
+// tool names it says that the listed name works too: the Inbox keeps the
+// catalog name either way (CanonicalTool).
+func requestToolDescription(safe bool) string {
+	if safe {
+		return "Catalog name, e.g. deploy.run; the name tools/list shows (deploy_run) works too."
+	}
+	return "Catalog name, e.g. deploy.run."
+}
+
 func (g *Gateway) inboxTools() []toolEntry {
 	svc := g.inbox
+	// n names an MCP-listed tool as tools/list does (its published name
+	// with safe tool names) in the descriptions of inbox.request and
+	// inbox.status, two of the five tools every agent sees.
+	n := g.mcpToolName
 	requestProps := commonProps()
 	requestProps["facts"] = schemaFacts
 	requestProps["task"] = map[string]any{"type": "object", "required": []string{"objective"}, "properties": map[string]any{"objective": map[string]any{"type": "string", "description": "The concrete task this batch advances."}, "title": map[string]any{"type": "string"}, "url": map[string]any{"type": "string"}}}
@@ -444,7 +458,7 @@ func (g *Gateway) inboxTools() []toolEntry {
 				"affected_scope":   map[string]any{"type": "string", "description": "Required for writes: resources that change."},
 				"material_risks":   map[string]any{"type": "string", "description": "Required for writes: concrete material risks."},
 				"undo":             map[string]any{"type": "string", "description": "Required for writes: concrete undo path or cannot be undone."},
-				"tool":             map[string]any{"type": "string", "description": "Catalog name, e.g. deploy.run."},
+				"tool":             map[string]any{"type": "string", "description": requestToolDescription(g.safeToolNames)},
 				"required":         map[string]any{"type": "boolean", "description": "Planning hint only. Your owner can reject this call and submit."},
 				"summary":          map[string]any{"type": "string", "description": "Explain this call's purpose and its relationship to task.objective in plain words."},
 				"params": map[string]any{
@@ -553,12 +567,12 @@ func (g *Gateway) inboxTools() []toolEntry {
 				return inboxJSON(map[string]any{"calls": res}), nil
 			}),
 		inboxEntry("inbox.request", inboxUpstream,
-			"Ask your owner for permission: inbox.request is the one way an agent gets permission for restricted tools. "+
+			"Ask your owner for permission: "+n("inbox.request")+" is the one way an agent gets permission for restricted tools. "+
 				"Batch the round into ONE request: every restricted call it needs (up to 12 calls; 50 with schema_version 3) and every question you have for your owner (questions[], schema_version 3). "+
 				"Send another request only for what the answers open, never one per call. "+
 				"Write it as yourself: a first-person message, facts (why_now, if_it_goes_wrong, undo), a ≤75-word voice-note script, and evidence attachments. "+
 				"Supply task.objective and run it with dry_run: true first. Include an authorized callback_ref, then continue unrelated work or end the turn. "+
-				"After a callback, read inbox.status for authoritative decisions and valid grants before execution. inbox.wait is optional. Read inbox.guide for the format.",
+				"After a callback, read "+n("inbox.status")+" for authoritative decisions and valid grants before execution. "+n("inbox.wait")+" is optional. Read "+n("inbox.guide")+" for the format.",
 			obj([]string{"title", "summary", "message", "facts", "urgency", "task", "tools"}, requestProps),
 			submit(inbox.KindAccess)),
 		inboxEntry("inbox.ask", inboxUpstream,
@@ -572,10 +586,10 @@ func (g *Gateway) inboxTools() []toolEntry {
 			obj([]string{"title", "summary", "message"}, postProps),
 			submit(inbox.KindUpdate)),
 		inboxEntry("inbox.status", inboxUpstream,
-			"Read authoritative decisions on your inbox.request items without blocking: each call's verdict and reason, the owner's note, the answers to your questions, execution state and grants. "+
+			"Read authoritative decisions on your "+n("inbox.request")+" items without blocking: each call's verdict and reason, the owner's note, the answers to your questions, execution state and grants. "+
 				"Status reads never consume grants. Accepted calls include their same still-valid unused grant token: pass it as _grant on the approved call with exactly the approved parameters (in executeToolCode, as one more argument of that call). "+
 				"Recover that token after a lost response and pass it as _grant for the approved call. Expired, revoked, or consumed grants cannot be recovered. "+
-				"If the answers open more restricted work, ask for all of it in one new inbox.request.",
+				"If the answers open more restricted work, ask for all of it in one new "+n("inbox.request")+".",
 			obj([]string{"ids"}, map[string]any{"ids": idsProp}),
 			func(ctx context.Context, args map[string]any) (*mcp.CallToolResult, error) {
 				agentID, errRes := requireAgentID(ctx)

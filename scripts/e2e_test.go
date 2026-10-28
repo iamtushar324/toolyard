@@ -671,7 +671,7 @@ func TestE2ERouterOnlyMode(t *testing.T) {
 		gotNames[tl.Name] = true
 	}
 	for name := range pinned {
-		if !gotNames[name] {
+		if !listedAs(gotNames, name) {
 			t.Errorf("pinned tool %q missing in router-only mode", name)
 		}
 	}
@@ -818,7 +818,7 @@ func TestE2EUsageAndTopN(t *testing.T) {
 		"memory.get", "memory.set", "memory.list", "memory.delete",
 	}
 	for _, p := range pinned {
-		if !gotNames[p] {
+		if !listedAs(gotNames, p) {
 			t.Errorf("pinned tool %q not visible in top_n cold-start; got %v", p, keysOf(gotNames))
 		}
 	}
@@ -1756,13 +1756,26 @@ func TestE2ELogoutInvalidatesSession(t *testing.T) {
 }
 
 // visiblePinned returns the names in a full tools/list that the gateway
-// pins (always visible in router_only and top_n modes).
+// pins (always visible in router_only and top_n modes), under the name
+// the list shows.
 func visiblePinned(tools []mcp.Tool) map[string]bool {
+	listed := map[string]bool{}
+	for p := range gateway.PinnedTools {
+		listed[p] = true
+		listed[gateway.PublishedToolName(p)] = true
+	}
 	out := map[string]bool{}
 	for _, tl := range tools {
-		if gateway.IsPinned(tl.Name) {
+		if listed[tl.Name] {
 			out[tl.Name] = true
 		}
 	}
 	return out
+}
+
+// listedAs reports whether a tools/list answer names the canonical tool:
+// as it is, or under its published name (inbox_request for inbox.request),
+// which the gateway lists by default (-mcp-safe-tool-names).
+func listedAs(names map[string]bool, canonical string) bool {
+	return names[canonical] || names[gateway.PublishedToolName(canonical)]
 }
