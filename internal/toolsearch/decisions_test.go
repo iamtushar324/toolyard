@@ -31,9 +31,10 @@ type seenRequest struct {
 			Parameters  []string `json:"parameters"`
 		} `json:"tools"`
 		Servers []struct {
-			Name     string   `json:"name"`
-			Tools    int      `json:"tools"`
-			Examples []string `json:"examples"`
+			Name        string   `json:"name"`
+			Description string   `json:"description"`
+			Tools       int      `json:"tools"`
+			Examples    []string `json:"examples"`
 		} `json:"servers"`
 	} `json:"state"`
 	Questions map[string]struct {
