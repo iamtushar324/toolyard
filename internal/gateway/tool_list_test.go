@@ -18,6 +18,7 @@ import (
 	"github.com/tusharbhardwaj/toolyard/internal/policy"
 	"github.com/tusharbhardwaj/toolyard/internal/realtime"
 	"github.com/tusharbhardwaj/toolyard/internal/store/storetest"
+	"github.com/tusharbhardwaj/toolyard/internal/toolsearch"
 )
 
 // toolListFixture is a gateway on the real access service, so each
@@ -93,8 +94,8 @@ func sorted(names []string) []string {
 }
 
 // TestSmallToolListIsEveryAgentsDefault: an agent with no scope row lists
-// exactly the five tools; switched to the full list it lists more, and
-// switched back the five again.
+// exactly the six tools; switched to the full list it lists more, and
+// switched back the six again.
 func TestSmallToolListIsEveryAgentsDefault(t *testing.T) {
 	f := newToolListFixture(t)
 	ctx := WithAgentID(context.Background(), "ag_small")
@@ -145,7 +146,7 @@ func TestLocalCallerGetsTheSmallList(t *testing.T) {
 }
 
 // TestSmallToolListKeepsAccessDenies: the small list only drops tools, so
-// one of the five that the agent's own limits deny stays hidden.
+// one of the six that the agent's own limits deny stays hidden.
 func TestSmallToolListKeepsAccessDenies(t *testing.T) {
 	f := newToolListFixture(t)
 	got := mcpToolsList(t, f.gw, WithAgentID(context.Background(), "ag_deny"))
@@ -182,5 +183,17 @@ func TestHiddenToolsStayCallable(t *testing.T) {
 	}
 	if n := f.calls.Load(); n != 3 {
 		t.Fatalf("the hidden tool ran %d times, want 3", n)
+	}
+}
+
+// TestSmallToolListRunsOneCallInTwoSteps (TEC-1815): tools.execute is on
+// the small list, so one call is tools.search then tools.execute, and a
+// search without a limit answers at most 10 results.
+func TestSmallToolListRunsOneCallInTwoSteps(t *testing.T) {
+	if !has(SmallToolList, MetaExecuteTool) || len(SmallToolList) != 6 {
+		t.Fatalf("SmallToolList = %v, want six tools with %s", SmallToolList, MetaExecuteTool)
+	}
+	if toolsearch.DefaultLimit != 10 || toolsearch.MaxLimit != 200 {
+		t.Fatalf("search limits = %d (default), %d (max), want 10 and 200", toolsearch.DefaultLimit, toolsearch.MaxLimit)
 	}
 }

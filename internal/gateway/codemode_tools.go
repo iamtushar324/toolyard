@@ -191,7 +191,7 @@ func (g *Gateway) codeModeTools() []toolEntry {
 	docs := mcp.Tool{
 		Name: CodeModeGetToolDocs,
 		Description: "Get detailed documentation for a specific tool: full parameter descriptions, types and a usage example. " +
-			"Step two of the flow: find the tool with " + n(MetaSearchTool) + ", read its docs here, then call it in executeToolCode. " +
+			"Use it only when the input_schema in a " + n(MetaSearchTool) + " result is unclear, before you call the tool with " + n(MetaExecuteTool) + " or in executeToolCode. " +
 			"A " + n(MetaSearchTool) + " result's code is server.tool: pass the part before the dot as server and the part after it as tool (toolyard's own tools are server \"toolyard\", e.g. tool \"memory_get\"). " +
 			"The tool does not have to be in your tool list: every tool you may use is documented here and callable from executeToolCode. " +
 			"Requires both the server name and the tool name.",
@@ -203,7 +203,7 @@ func (g *Gateway) codeModeTools() []toolEntry {
 	exec := mcp.Tool{
 		Name: CodeModeExecuteToolCode,
 		Description: "Executes Python code in a sandboxed Starlark interpreter with tool access: the way to run any tool you may use, listed or not. Servers are global objects: result = serverName.toolName(param=\"value\"). " +
-			"FLOW: find the tool with " + n(MetaSearchTool) + " (each result's code is the name to call, server.tool, and its run status says whether it runs now, needs approval or is blocked) -> read its parameters with getToolDocs (or its stub with readToolFile) -> call it here; never guess callable names. " +
+			"FLOW: find the tool with " + n(MetaSearchTool) + " (each result's code is the name to call, server.tool, its input_schema gives the parameters, and its run status says whether it runs now, needs approval or is blocked) -> read getToolDocs (or its stub with readToolFile) only when the schema is unclear -> call it here; never guess callable names. Use this tool for several calls, loops or result filtering; for one call " + n(MetaExecuteTool) + " is shorter. " +
 			"STARLARK DIFFERENCES FROM PYTHON: no try/except/finally/raise (a failed tool call aborts the script; use try_call(server.tool, param=value) to get {ok, status, result | error} instead); no classes; no imports, network or filesystem; no `is`; no f-strings (use % formatting); " +
 			"each call runs in a FRESH ISOLATED SCOPE with no state carried between calls. " +
 			"SYNTAX: synchronous calls, keyword arguments (server.tool(param=\"value\")), dict access with brackets (result[\"key\"]), print() for logging, assign the value to return to `result`. " +

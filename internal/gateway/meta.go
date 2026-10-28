@@ -53,7 +53,7 @@ func metaSearchDescription(skills, safe bool) string {
 	if skills {
 		d += metaSearchSkillsSentence(safe)
 	}
-	return d + "Use it before " + n(MetaExecuteTool) + ", or in code mode: JavaScript `await tools.search(\"query\", { limit: 5 })`, Starlark `toolyard.tools_search(query=\"...\")`."
+	return d + "Results include each tool's input_schema, so " + n(MetaExecuteTool) + " can follow directly for one call. In code mode: JavaScript `await tools.search(\"query\", { limit: 5 })`, Starlark `toolyard.tools_search(query=\"...\")`."
 }
 
 // metaTools returns the search/execute meta-tools as toolEntry values ready to
@@ -88,7 +88,7 @@ func (g *Gateway) metaTools() []toolEntry {
 					"type":        "integer",
 					"minimum":     1,
 					"maximum":     toolsearch.MaxLimit,
-					"description": "Max results (default 50).",
+					"description": "Max results (default 10, at most 200).",
 				},
 			}),
 		},
@@ -96,7 +96,7 @@ func (g *Gateway) metaTools() []toolEntry {
 
 	execute := mcp.Tool{
 		Name:        MetaExecuteTool,
-		Description: descriptionBanner + "Proxy a call to any registered tool. The target tool's policy/approval still applies, so writes will hold for human approval just like a direct call.",
+		Description: descriptionBanner + "Run one tool you may use: tool is a " + g.mcpToolName(MetaSearchTool) + " result's name, arguments match its input_schema. For several calls, loops or result filtering use executeToolCode. The target tool's access, policy and approval rules apply unchanged, exactly as for a direct call.",
 		InputSchema: mcp.ToolInputSchema{
 			Type:     "object",
 			Required: []string{ReasonField, "tool"},
@@ -127,7 +127,7 @@ type SearchRequest struct {
 	Mode     string
 	Detail   string
 	Upstream string
-	// Limit is 0 for the default (50); more than 200 is 200.
+	// Limit is 0 for the default (10); more than 200 is 200.
 	Limit int
 }
 

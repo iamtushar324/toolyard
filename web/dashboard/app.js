@@ -7787,10 +7787,12 @@ curl -fsSL -H "Authorization: Bearer ${tok}" ${base}/v1/guide/skill \\
 
 # Codex, Cursor, hermes and others: add this to AGENTS.md / your rules
 ## Using toolyard
-toolyard lists five tools: tools.search, getToolDocs, executeToolCode,
-inbox.request and inbox.status. Find any other tool with tools.search (its
-run status says now, needs_approval or blocked), read it with getToolDocs,
-and run it inside executeToolCode.
+toolyard lists six tools: tools.search, tools.execute, getToolDocs,
+executeToolCode, inbox.request and inbox.status. Find any other tool with
+tools.search (its run status says now, needs_approval or blocked, and its
+input_schema gives the parameters). Run one call with tools.execute; run
+several calls, loops or filtering inside executeToolCode. Read getToolDocs
+only when the schema is unclear.
 ## Asking for permission (toolyard)
 Some toolyard tools are restricted and need the owner's approval.
 - inbox.request is the one way to get permission. Put every restricted call

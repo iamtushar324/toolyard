@@ -265,7 +265,7 @@
           { "name": "q", "in": "query", "required": false, "description": "The task in plain words (auto, semantic, keyword) or a pattern (regex). Empty lists every tool by name.", "schema": { "type": "string" } },
           { "name": "mode", "in": "query", "required": false, "schema": { "type": "string", "enum": ["auto", "semantic", "keyword", "regex"], "default": "auto" } },
           { "name": "detail", "in": "query", "required": false, "schema": { "type": "string", "enum": ["name", "summary", "full"], "default": "summary" } },
-          { "name": "limit", "in": "query", "required": false, "schema": { "type": "integer", "minimum": 1, "maximum": 200, "default": 50 } },
+          { "name": "limit", "in": "query", "required": false, "schema": { "type": "integer", "minimum": 1, "maximum": 200, "default": 10 } },
           { "name": "upstream", "in": "query", "required": false, "description": "Only the tools of this upstream server.", "schema": { "type": "string" } }
         ],
         "responses": {

@@ -35,16 +35,17 @@ policies, reconnect servers or sign in shared connections, even when its
 owner is an admin; neither can an OAuth client unless its admin owner chose
 "May manage toolyard" for it (`access.whoami` shows `can_change_policies`).
 
-## The tool list: five tools by default
+## The tool list: six tools by default
 
-Every MCP agent's `tools/list` shows five tools by default (the small tool
+Every MCP agent's `tools/list` shows six tools by default (the small tool
 list):
 
 | Tool (listed as) | What the agent does with it |
 |---|---|
-| `tools.search` (`tools_search`) | Find a tool by what it does. Each result gives its catalog name (`name`), the name `tools/list` shows for it (`mcp_name`), its code-mode name (`code`) and whether it runs now, needs approval or is blocked (`run`: `now`, `needs_approval` or `blocked`). |
-| `getToolDocs` | Read one tool's full parameters (`server` and `tool`: the two halves of a result's `code`). |
-| `executeToolCode` | Run tools in a Starlark or JavaScript script. |
+| `tools.search` (`tools_search`) | Find a tool by what it does. Each result gives its catalog name (`name`), the name `tools/list` shows for it (`mcp_name`), its code-mode name (`code`), whether it runs now, needs approval or is blocked (`run`: `now`, `needs_approval` or `blocked`) and, at the default detail, its `input_schema`. Default `limit` 10, at most 200. |
+| `tools.execute` (`tools_execute`) | Run one call: `tool` is a result's name, `arguments` match its `input_schema`. Same access, policy and approval as a direct call. |
+| `getToolDocs` | Read one tool's full parameters when the schema is unclear (`server` and `tool`: the two halves of a result's `code`). |
+| `executeToolCode` | Run several calls, loops or result filtering in a Starlark or JavaScript script. |
 | `inbox.request` (`inbox_request`) | Ask the owner for permission. |
 | `inbox.status` (`inbox_status`) | Read the decision, the answers and the grants. |
 
@@ -66,7 +67,7 @@ and audit rows name the tool as before, and a grant for a call works under
 either name. An answer about a tool the caller may not use, or one that
 does not exist, repeats the name the caller sent, so a listed name never
 reveals a hidden tool. A 2026-07-28 call's `Mcp-Param-*` headers are
-checked against the tool that runs, under either name. The server instructions and the five tools' descriptions use
+checked against the tool that runs, under either name. The server instructions and the six tools' descriptions use
 the listed names. Code mode keeps its names (`server.tool`,
 `toolyard.<group>_<name>`). Claude clients already turned dots into `_`
 themselves, so their tool names do not change. An operator who sets

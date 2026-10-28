@@ -100,7 +100,8 @@ func TestBuiltinSkillsThroughTheGateway(t *testing.T) {
 
 	c := newSkillsMCPClient(t, gw, "ag_member", false, false)
 	init := c.initialize()
-	if instr, _ := init["instructions"].(string); !strings.Contains(instr, `"toolyard/toolyard-basics"`) || !strings.Contains(instr, "SKILLS:") {
+	if instr, _ := init["instructions"].(string); !strings.Contains(instr, `"toolyard/toolyard-basics"`) || !strings.Contains(instr, `"toolyard/toolyard-permissions-and-inbox"`) ||
+		!strings.Contains(instr, "references/request-fields.md") || !strings.Contains(instr, "SKILLS:") {
 		t.Fatalf("instructions: %q", instr)
 	}
 	list := c.result(MethodSkillsList, map[string]any{})

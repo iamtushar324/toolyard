@@ -1,6 +1,6 @@
 ---
 name: toolyard-basics
-description: Start here on a toolyard MCP gateway. Explains what toolyard is (one gateway in front of many MCP servers, with access, policies, the Inbox and audit), the five tools you see by default (tools.search, getToolDocs, executeToolCode, inbox.request, inbox.status) and how they reach the rest, who you are to it (access.whoami), the _reason field every call needs, servers.list, how policy decides allow, ask or deny (policies.list, policies.explain), sign-ins (connections.status, connections.link), work sessions (session.start, session.update, _session_id) and your own audit trail (audit.mine). Use it when you first connect to toolyard, before you pick another toolyard skill, when a tool you expect is missing, or when a call fails with "_reason is required", "tool not found in catalog", "not allowed for this agent", "denied by policy", permission_required, grant_invalid, outcome_unknown, "server restarting", a pending-approval budget error, "upstream not connected" or a connect link.
+description: Start here on a toolyard MCP gateway. Explains what toolyard is (one gateway in front of many MCP servers, with access, policies, the Inbox and audit), the six tools you see by default (tools.search, tools.execute, getToolDocs, executeToolCode, inbox.request, inbox.status) and how they reach the rest, who you are to it (access.whoami), the _reason field every call needs, servers.list, how policy decides allow, ask or deny (policies.list, policies.explain), sign-ins (connections.status, connections.link), work sessions (session.start, session.update, _session_id) and your own audit trail (audit.mine). Use it when you first connect to toolyard, before you pick another toolyard skill, when a tool you expect is missing, or when a call fails with "_reason is required", "tool not found in catalog", "not allowed for this agent", "denied by policy", permission_required, grant_invalid, outcome_unknown, "server restarting", a pending-approval budget error, "upstream not connected" or a connect link.
 metadata:
   toolyard-runs: anywhere
 ---
@@ -27,21 +27,33 @@ Every call takes the same path:
 This skill is guidance, not permission: every call it suggests still goes
 through policy and the Inbox.
 
-## The five tools you see
+## The six tools you see
 
-By default your tool list shows five tools. They reach every other tool you
+By default your tool list shows six tools. They reach every other tool you
 may use:
 
 | Tool | What you do with it |
 |---|---|
-| `tools.search` | Find a tool by what it does. Each result gives the name to call it by (`code`) and `run`: `now`, `needs_approval` or `blocked`. |
-| `getToolDocs` | Read one tool's parameters: `server` and `tool` are the two halves of a result's `code`. |
-| `executeToolCode` | Run tools in a short Starlark (default) or JavaScript script. |
+| `tools.search` | Find a tool by what it does. Each result gives its `name`, the name to call it by in a script (`code`), its `input_schema` and `run`: `now`, `needs_approval` or `blocked`. |
+| `tools.execute` | Run one call: `tool` is a result's `name`, `arguments` match its `input_schema`. |
+| `executeToolCode` | Run several calls, a loop or result filtering in a short Starlark (default) or JavaScript script. |
+| `getToolDocs` | Read one tool's parameters when the schema is unclear: `server` and `tool` are the two halves of a result's `code`. |
 | `inbox.request` | Ask your owner for permission: every restricted call and every question of a round in one request. |
 | `inbox.status` | Read the decision, the answers and the grants. |
 
-The flow is find, read, run, and ask once per round when something needs
-approval. In a script toolyard's own tools are the server `toolyard`, named
+The flow is find, then run: one call is `tools.search`, then `tools.execute`
+(two round trips); several calls, loops or result filtering go in
+`executeToolCode`. Read `getToolDocs` only when the schema is unclear. Ask
+once per round when something needs approval.
+
+First contact, in short: every call needs `_reason`; whether a call reads or
+writes follows the tool's `read_only` flag in search results; send
+`inbox.request` with `dry_run: true` first; send one `inbox.request` per
+round with every restricted call; in scripts call tools with `try_call` /
+`tools.tryCall`. Before your first request, read the
+`toolyard-permissions-and-inbox` skill
+(`skills.get toolyard/toolyard-permissions-and-inbox`) and its
+`references/request-fields.md`. In a script toolyard's own tools are the server `toolyard`, named
 `toolyard.<group>_<name>`: `access.whoami` is `toolyard.access_whoami()` and
 `session.start` is `toolyard.session_start(title="…")`. The calls in this
 skill are written as direct calls (the tool, then its JSON arguments). A tool
@@ -147,13 +159,13 @@ explicit rule allows it. Declaring `read` never lets a call skip approval.
 ## Find tools
 
 - Your catalog holds only the tools you may use, and by default your list
-  shows the five tools above. On the full tool list an administrator can also
+  shows the six tools above. On the full tool list an administrator can also
   set a surface mode: `full` (everything), `top_n` (the pinned tools plus the
   tools used most, 20 by default) or `router_only` (the pinned tools only).
   The built-in tools are pinned. Neither list changes what you may call.
 - `tools.search`: `query` (the task in plain words), `mode`, `detail` (`full`
   default with input and output schemas, `summary`, `name`), `upstream` (one
-  server), `limit` (default 50, at most 200). `mode` `auto` (default) ranks by
+  server), `limit` (default 10, at most 200). `mode` `auto` (default) ranks by
   meaning with Jev, a classification model, where the operator turned it on,
   else by keyword; `semantic` is Jev only (refused where it is off);
   `keyword` ranks by BM25; `regex` takes an RE2 pattern of at most 200
@@ -165,11 +177,11 @@ explicit rule allows it. Declaring `read` never lets a call skip approval.
   `needs_approval` or `blocked`. When toolyard serves skills the answer also
   names up to 3 matching skills under `skills`: read one with `skills.get`
   (in a script, `toolyard.skills_get(skill="…")`).
-- `tools.execute` (full tool list): call any tool you may use by its catalog
-  name, including one a surface mode hides. The target's access, policy and
+- `tools.execute` (on the default list too): call any tool you may use by its
+  catalog name, including one a surface mode hides, with `arguments` that
+  match the search result's `input_schema`. The target's access, policy and
   approval rules apply unchanged. The outer `_reason` is used when
-  `arguments` has none. On the default list, call the tool in
-  `executeToolCode` instead.
+  `arguments` has none.
 - `servers.list`: each server you may use, with `status` (`ok`, `error`,
   `waiting_signin`, `disabled`, `idle`, `unknown`), `tool_count`,
   `auth_mode` (`shared` or `per_user`) and sign-in state. No secrets; an

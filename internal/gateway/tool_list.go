@@ -10,13 +10,14 @@ import (
 
 // SmallToolList is every tool an agent on the small tool list (the
 // default, access.ToolListSmall) sees in tools/list: find a tool with
-// tools.search, read its schema with getToolDocs, run it inside
-// executeToolCode, and ask for permission with inbox.request and read the
-// decision with inbox.status. Every other tool the agent may use stays
-// callable (tools/call, tools.execute, code mode); only the list is
-// shorter. An owner switches one agent to the full list in its scope
+// tools.search (its results carry each tool's input schema), run one call
+// with tools.execute or several inside executeToolCode, read a schema with
+// getToolDocs when it is unclear, and ask for permission with inbox.request
+// and read the decision with inbox.status. Every other tool the agent may
+// use stays callable (tools/call, tools.execute, code mode); only the list
+// is shorter. An owner switches one agent to the full list in its scope
 // (access.AgentScope.ToolList).
-var SmallToolList = []string{MetaSearchTool, CodeModeGetToolDocs, CodeModeExecuteToolCode, "inbox.request", "inbox.status"}
+var SmallToolList = []string{MetaSearchTool, MetaExecuteTool, CodeModeGetToolDocs, CodeModeExecuteToolCode, "inbox.request", "inbox.status"}
 
 // smallToolListSet is SmallToolList as a set.
 var smallToolListSet = func() map[string]bool {
@@ -39,7 +40,7 @@ type ToolListResolver interface {
 
 // toolListFilter keeps only the small tool list for a caller whose
 // resolver says small. It runs after the access filter, so it only ever
-// drops tools: one of the five that the caller's scope removed stays
+// drops tools: one of the six that the caller's scope removed stays
 // removed.
 func (g *Gateway) toolListFilter(ctx context.Context, tools []mcp.Tool) []mcp.Tool {
 	r, ok := g.access.(ToolListResolver)

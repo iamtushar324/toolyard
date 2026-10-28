@@ -615,7 +615,7 @@ toolyard works and how to use it well. They live in the repository under
 
 | Skill | What it teaches |
 | --- | --- |
-| `toolyard-basics` | what toolyard is, the five tools an agent sees by default and how they reach the rest, identity, `_reason`, finding tools, policies, connections, sessions, common errors (the starting point) |
+| `toolyard-basics` | what toolyard is, the six tools an agent sees by default and how they reach the rest, identity, `_reason`, finding tools, policies, connections, sessions, common errors (the starting point) |
 | `toolyard-permissions-and-inbox` | the one-request rule (every restricted call and question of a round in one `inbox.request`), search's `run`, `inbox.status`, the owner's decision, grants (`_grant`), `outcome_unknown`, `inbox.post`, `inbox.ask`, uploads, legacy approvals |
 | `toolyard-code-mode` | `executeToolCode` in Starlark or JavaScript, stubs, limits, errors inside scripts, the REST fallback and `ty` |
 | `toolyard-async-jobs` | `jobs.*`, MCP Tasks, job callbacks, retries after `failed`, `cancelled` or `outcome_unknown` |

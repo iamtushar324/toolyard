@@ -43,8 +43,8 @@ const (
 // shows of the tools it may use. Every other tool stays callable (directly,
 // through tools.execute and from code mode); only the list changes.
 const (
-	// ToolListSmall, the default: only the five tools of the search, docs,
-	// run-code and Inbox flow (the gateway's SmallToolList).
+	// ToolListSmall, the default: only the six tools of the search, run,
+	// docs, run-code and Inbox flow (the gateway's SmallToolList).
 	ToolListSmall = "small"
 	// ToolListFull: every tool the agent may use, as before the small list.
 	ToolListFull = "full"

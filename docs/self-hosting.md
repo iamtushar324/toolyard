@@ -666,7 +666,7 @@ handled.
   `github.get-issue` as `github_get-issue`); a name longer than 64
   characters, or two tools that would share a name, get their first 55
   characters, `_` and 8 hex digits of the SHA-256 of the real name. The
-  server instructions and the five tools' descriptions use the listed
+  server instructions and the six tools' descriptions use the listed
   names. A call may use the listed name or the dotted name, also in
   `tools.execute`, `jobs.start`, `inbox.request` and `inbox.check`;
   policies, grants, jobs and audit rows keep the dotted name, and code

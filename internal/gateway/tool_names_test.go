@@ -175,7 +175,7 @@ func TestPublishedToolNamesCollisions(t *testing.T) {
 }
 
 // TestSafeToolNamesInToolsList: with safe names on, the small list is the
-// five published names and the full list publishes every tool the agent
+// six published names and the full list publishes every tool the agent
 // may use under a valid, unique name: a long upstream name and two names
 // that collide included. The access filter still applies first.
 func TestSafeToolNamesInToolsList(t *testing.T) {
@@ -192,7 +192,7 @@ func TestSafeToolNamesInToolsList(t *testing.T) {
 	if got := sorted(small); !reflect.DeepEqual(got, sorted(want)) {
 		t.Fatalf("small list = %v, want %v", got, sorted(want))
 	}
-	for _, n := range []string{"tools_search", "getToolDocs", "executeToolCode", "inbox_request", "inbox_status"} {
+	for _, n := range []string{"tools_search", "tools_execute", "getToolDocs", "executeToolCode", "inbox_request", "inbox_status"} {
 		if !has(small, n) {
 			t.Errorf("small list lacks %s: %v", n, small)
 		}
@@ -470,7 +470,7 @@ func TestSafeToolNamesOnMCPTasks(t *testing.T) {
 }
 
 // TestSafeToolNamesTexts: with safe names on, the instructions, the
-// skills paragraph and the descriptions of the five listed tools name the
+// skills paragraph and the descriptions of the six listed tools name the
 // MCP tools by their published names, say once that the dotted names work,
 // and keep the code-mode names; search results carry mcp_name.
 func TestSafeToolNamesTexts(t *testing.T) {
@@ -500,7 +500,7 @@ func TestSafeToolNamesTexts(t *testing.T) {
 	if s := skillsInstructions(true); !strings.Contains(s, "call tools_search") || !strings.Contains(s, "skills_search searches") || !strings.Contains(s, "toolyard.skills_get") {
 		t.Errorf("skills paragraph: %q", s)
 	}
-	if g := skillsGuideInstructions("toolyard/toolyard-basics", true); !strings.Contains(g, "(skills_get {") || !strings.Contains(g, "toolyard.skills_get(") {
+	if g := skillsGuideInstructions("toolyard/toolyard-basics", "toolyard/toolyard-permissions-and-inbox", true); !strings.Contains(g, "(skills_get {") || !strings.Contains(g, "toolyard.skills_get(") || !strings.Contains(g, "Before your first inbox_request") {
 		t.Errorf("guide sentence: %q", g)
 	}
 
@@ -508,9 +508,10 @@ func TestSafeToolNamesTexts(t *testing.T) {
 	ctx := WithAgentID(context.Background(), "ag_small")
 	descs := mcpToolDescriptions(t, f.gw, ctx)
 	checks := map[string][]string{
-		"tools_search":    {"ask with inbox_request", "Use it before tools_execute", "mcp_name", "await tools.search(", "toolyard.tools_search("},
-		"getToolDocs":     {"find the tool with tools_search", "A tools_search result's code"},
-		"executeToolCode": {"find the tool with tools_search", "ONCE with inbox_request", "decision with inbox_status", "await tools.search(", "tools.tryCall("},
+		"tools_search":    {"ask with inbox_request", "so tools_execute can follow directly", "input_schema", "mcp_name", "await tools.search(", "toolyard.tools_search("},
+		"getToolDocs":     {"input_schema in a tools_search result is unclear", "with tools_execute", "A tools_search result's code"},
+		"executeToolCode": {"find the tool with tools_search", "for one call tools_execute is shorter", "ONCE with inbox_request", "decision with inbox_status", "await tools.search(", "tools.tryCall("},
+		"tools_execute":   {"a tools_search result's name", "input_schema", "executeToolCode"},
 		"inbox_request":   {"inbox_request is the one way", "read inbox_status", "inbox_wait is optional", "inbox_guide for the format"},
 		"inbox_status":    {"your inbox_request items", "one new inbox_request"},
 	}

@@ -230,7 +230,8 @@ func (g *Gateway) declareSkillsOnDiscover(ctx context.Context, _ any, _ *mcp.Dis
 }
 
 // skillsGuideFor is the sentence that points this caller at toolyard's
-// built-in guide, or "": the hub must serve the guide now (installed, under
+// built-in guide (and its permissions skill, when the caller sees it), or
+// "": the hub must serve the guide now (installed, under
 // its slug) and the caller must see it (a source an admin hid answers ""). It
 // lists the guide's source rather than reading the skill, so an initialize
 // is not counted as a read.
@@ -245,17 +246,29 @@ func (g *Gateway) skillsGuideFor(ctx context.Context) string {
 		return ""
 	}
 	want := "skill://" + ref + "/" + skillFileName
+	inboxRef := slug + "/" + inboxGuideSkill
+	wantInbox := "skill://" + inboxRef + "/" + skillFileName
 	list, _, err := hub.reader.List(ctx, g.skillViewer(ctx, hub), skillhub.ListQuery{Source: slug, Limit: skillsListMax, IncludeHost: true})
 	if err != nil {
 		return ""
 	}
+	guide, inbox := false, false
 	for _, sk := range list {
-		if sk.URI == want {
-			return skillsGuideInstructions(ref, g.safeToolNames)
-		}
+		guide = guide || sk.URI == want
+		inbox = inbox || sk.URI == wantInbox
 	}
-	return ""
+	if !guide {
+		return ""
+	}
+	if !inbox {
+		inboxRef = ""
+	}
+	return skillsGuideInstructions(ref, inboxRef, g.safeToolNames)
 }
+
+// inboxGuideSkill is the built-in permissions skill the guide sentence
+// names next to the guide, in the guide's source.
+const inboxGuideSkill = "toolyard-permissions-and-inbox"
 
 func declareSkills(ctx context.Context, caps *mcp.ServerCapabilities) {
 	if served, _ := ctx.Value(skillsServedKey{}).(bool); !served {
