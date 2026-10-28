@@ -80,6 +80,26 @@ const OutcomeUnknownMarker = "toolyard.outcome_unknown"
 // gateway names the dispatch a call went through.
 const DispatchIDMarker = "toolyard.dispatch_id"
 
+// AuditMissingMarker (value true) says the gateway could not save the
+// completion audit row of a read-only call; its result is complete.
+// WarningMarker is the text the gateway gives with it.
+const (
+	AuditMissingMarker = "toolyard.audit_missing"
+	WarningMarker      = "toolyard.warning"
+)
+
+// auditWarningOf is the warning of a result whose audit row is missing,
+// or "" for any other result.
+func auditWarningOf(res *mcp.CallToolResult) string {
+	if !metaFlag(res, AuditMissingMarker) {
+		return ""
+	}
+	if w, _ := res.Meta.AdditionalFields[WarningMarker].(string); w != "" {
+		return w
+	}
+	return "Warning: the audit record of this call was not saved. The result is complete."
+}
+
 // dispatchIDOf is the dispatch id in res's metadata, or "".
 func dispatchIDOf(res *mcp.CallToolResult) string {
 	if res == nil || res.Meta == nil {
@@ -307,7 +327,8 @@ type RunResult struct {
 	// stopped; both are "" otherwise.
 	ErrorKind    string
 	ErrorMessage string
-	// Logs are the script's print() lines, up to the output limit.
+	// Logs are the script's print() lines, up to the output limit, and a
+	// "[TOOL] <tool> warning: …" line for a call the gateway warned about.
 	Logs []string
 	// Calls are the tool calls, in order.
 	Calls []CallRecord

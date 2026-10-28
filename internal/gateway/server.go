@@ -2318,9 +2318,11 @@ func (g *Gateway) dispatch(ctx context.Context, entry toolEntry, args map[string
 	}
 	res = withDispatchID(res, dispatchID)
 	if auditMissing {
-		res.Content = append(append([]mcp.Content(nil), res.Content...),
-			mcp.NewTextContent("Warning: the audit record for dispatch "+dispatchID+" was not saved. The result above is complete."))
+		// Only the metadata carries the warning: the content and the
+		// structured content stay exactly as the upstream sent them, so
+		// code mode decodes the same value (it surfaces the warning itself).
 		res.Meta.AdditionalFields[AuditMissingMarker] = true
+		res.Meta.AdditionalFields[WarningMarker] = "Warning: the audit record for dispatch " + dispatchID + " was not saved. The result is complete."
 	}
 	return res, nil
 }
@@ -2328,10 +2330,12 @@ func (g *Gateway) dispatch(ctx context.Context, entry toolEntry, args map[string
 // DispatchIDMarker is the result metadata key that names the dispatch a
 // result came from, so a caller (code mode's try_call) can look the call
 // up with audit.mine dispatch_id=… . AuditMissingMarker (value true) says
-// the completion audit row of a read-only call was not saved.
+// the completion audit row of a read-only call was not saved, and
+// WarningMarker carries the text that says so.
 const (
 	DispatchIDMarker   = codemode.DispatchIDMarker
-	AuditMissingMarker = "toolyard.audit_missing"
+	AuditMissingMarker = codemode.AuditMissingMarker
+	WarningMarker      = codemode.WarningMarker
 )
 
 // withDispatchID is res with the dispatch id in its metadata. It copies

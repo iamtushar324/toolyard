@@ -1,6 +1,7 @@
 package codemode
 
 import (
+	"context"
 	"strings"
 	"testing"
 	"time"
@@ -62,5 +63,54 @@ const b = await tools.tryCall("demo.write", { x: 1 });
 return [a.dispatch_id, b.dispatch_id, b.ok];`, RunOptions{})
 	if rr.Status != StatusSucceeded || !strings.Contains(string(rr.Result), `"dispatch_read"`) || !strings.Contains(string(rr.Result), `"dispatch_write"`) {
 		t.Fatalf("javascript = %+v (result %s)", rr, rr.Result)
+	}
+}
+
+// TestAuditMissingWarningKeepsValue: a read whose audit row is missing
+// keeps its value in both engines (JSON text and structured content);
+// the warning reaches try_call and the run's output, with echo off.
+func TestAuditMissingWarningKeepsValue(t *testing.T) {
+	f := newJSFake()
+	warned := func(res *mcp.CallToolResult) *mcp.CallToolResult {
+		res.Meta = &mcp.Meta{AdditionalFields: map[string]any{
+			AuditMissingMarker: true, WarningMarker: "Warning: W1", DispatchIDMarker: "dispatch_r"}}
+		return res
+	}
+	f.handlers["demo.read"] = func(map[string]any) (*mcp.CallToolResult, error) {
+		return warned(mcp.NewToolResultText(`{"n":1}`)), nil
+	}
+	f.handlers["demo.facts"] = func(map[string]any) (*mcp.CallToolResult, error) {
+		res := mcp.NewToolResultText("facts as text")
+		res.StructuredContent = map[string]any{"facts": []any{"a", "b"}}
+		return warned(res), nil
+	}
+	rt := inProcess(f, Limits{ScriptTimeout: 20 * time.Second})
+	hasWarning := func(logs []string, tool string) bool {
+		for _, l := range logs {
+			if l == "[TOOL] "+tool+" warning: Warning: W1" {
+				return true
+			}
+		}
+		return false
+	}
+
+	rr := mustRun(t, rt, "a = demo.read(q=\"x\")\nb = try_call(demo.read, q=\"y\")\nresult = [a, b[\"result\"], b[\"warning\"]]\n", RunOptions{})
+	if rr.Status != StatusSucceeded || canonical(t, rr.Result) != `[{"n":1},{"n":1},"Warning: W1"]` || !hasWarning(rr.Logs, "demo.read") {
+		t.Fatalf("starlark = %+v (result %s, logs %q)", rr, rr.Result, rr.Logs)
+	}
+
+	rr = jsRun(t, rt, `const a = await tools.demo.read({ q: "x" });
+const f = await tools.demo.facts();
+const t = await tools.tryCall("demo.facts", {});
+return { a, f, tf: t.result, w: t.warning };`, RunOptions{})
+	if rr.Status != StatusSucceeded || canonical(t, rr.Result) != `{"a":{"n":1},"f":{"facts":["a","b"]},"tf":{"facts":["a","b"]},"w":"Warning: W1"}` ||
+		!hasWarning(rr.Logs, "demo.read") || !hasWarning(rr.Logs, "demo.facts") {
+		t.Fatalf("javascript = %+v (result %s, logs %q)", rr, rr.Result, rr.Logs)
+	}
+
+	// A plain call with echo none: the warning is still in the output.
+	out := rt.Execute(context.Background(), "a = demo.read(q=\"x\")\nprint(a[\"n\"])\n", ExecOptions{Echo: EchoNone})
+	if out.Failed || !strings.Contains(out.Text, "demo.read warning: Warning: W1") {
+		t.Fatalf("echo none output:\n%s", out.Text)
 	}
 }

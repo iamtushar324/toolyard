@@ -89,7 +89,7 @@ func TestDispatchCompletionAuditMissing(t *testing.T) {
 		upstream *mcp.CallToolResult
 		want     []string
 	}{
-		{"read succeeded", true, mcp.NewToolResultText("the answer"), []string{"the answer", "Warning: the audit record for dispatch dispatch_", "The result above is complete."}},
+		{"read succeeded", true, mcp.NewToolResultText("the answer"), []string{"the answer"}},
 		{"write succeeded", false, mcp.NewToolResultText("saved"), []string{"Tool outcome unknown: the upstream call succeeded, but its audit record was not saved.", `audit.mine dispatch_id="dispatch_`}},
 		{"write returned an error", false, mcp.NewToolResultError("conflict"), []string{"the upstream call returned an error", "Do not repeat the write."}},
 	}
@@ -125,18 +125,24 @@ func TestDispatchCompletionAuditMissing(t *testing.T) {
 				}
 			}
 			id, _ := res.Meta.AdditionalFields[DispatchIDMarker].(string)
-			if !strings.HasPrefix(id, "dispatch_") || !strings.Contains(text, id) {
-				t.Fatalf("dispatch id %q not in meta or text: %s", id, text)
+			if !strings.HasPrefix(id, "dispatch_") {
+				t.Fatalf("no dispatch id in meta: %v", res.Meta.AdditionalFields)
 			}
 			unknown, _ := res.Meta.AdditionalFields[codemode.OutcomeUnknownMarker].(bool)
 			if c.readOnly {
+				// The content is the upstream's, unchanged; the warning is
+				// only in the metadata.
+				warning, _ := res.Meta.AdditionalFields[WarningMarker].(string)
+				if text != "the answer" || len(res.Content) != 1 || !strings.Contains(warning, "audit record for dispatch "+id+" was not saved") {
+					t.Fatalf("read-only content %q, warning %q", text, warning)
+				}
 				if unknown || res.IsError || ev.ErrorClass == "audit_outcome_unknown" || res.Meta.AdditionalFields[AuditMissingMarker] != true {
 					t.Fatalf("read-only result = %+v meta %v class %q", res, res.Meta.AdditionalFields, ev.ErrorClass)
 				}
 				if len(upstream.Content) != 1 || upstream.Meta != nil {
 					t.Fatalf("the handler's own result was changed: %+v", upstream)
 				}
-			} else if !unknown || !res.IsError || ev.ErrorClass != "audit_outcome_unknown" {
+			} else if !unknown || !res.IsError || ev.ErrorClass != "audit_outcome_unknown" || !strings.Contains(text, id) {
 				t.Fatalf("write result = %+v meta %v class %q", res, res.Meta.AdditionalFields, ev.ErrorClass)
 			}
 			// The intent row is there; the dispatch can be looked up.
