@@ -18,6 +18,7 @@ import (
 	"github.com/mark3labs/mcp-go/mcp"
 	"github.com/mark3labs/mcp-go/server"
 
+	"github.com/tusharbhardwaj/toolyard/internal/access"
 	"github.com/tusharbhardwaj/toolyard/internal/audit"
 	"github.com/tusharbhardwaj/toolyard/internal/inbox"
 	"github.com/tusharbhardwaj/toolyard/internal/policy"
@@ -868,5 +869,49 @@ func TestParamHeadersCheckedOnMCPTasks(t *testing.T) {
 				t.Errorf("%s task with Mcp-Param-Region %q: %d %v", name, region, c.status, out)
 			}
 		}
+	}
+}
+
+// TestPolicyWritesByPublishedNameBindTheTool (review r2-1): an admin's
+// OAuth client that may manage toolyard but whose own scope leaves out
+// beta sets and clears a policy by beta's published name. The rule is
+// stored under the canonical name, so it binds the tool and clear finds
+// it; the answers echo only the supplied name. (Deny, not ask: an agent
+// may never clear an ask.)
+func TestPolicyWritesByPublishedNameBindTheTool(t *testing.T) {
+	f := newAccessFixture(t, nil)
+	const scopedAdmin = "ag_scoped_admin"
+	f.res.scopes[scopedAdmin] = access.Scope{OwnerAll: true, Limits: &access.Limits{OAuthClient: true, Manage: true, DenyServers: map[string]bool{"beta": true}}}
+	ctx := WithAgentID(context.Background(), scopedAdmin)
+	denied := func() bool {
+		return f.gw.policy.Eval(policy.Request{UpstreamName: "beta", ToolName: "beta.run"}).Action == policy.ActionDeny
+	}
+
+	set := f.call(t, ctx, "policies.set", map[string]any{"scope": "tool", "target": "beta_run", "access": "deny"})
+	if set.IsError {
+		t.Fatalf("policies.set by published name: %s", textOf(set))
+	}
+	if body := textOf(set) + asJSON(set.StructuredContent); strings.Contains(body, "beta.run") {
+		t.Errorf("the answer names the hidden canonical tool: %s", body)
+	}
+	if !denied() {
+		t.Fatal("the deny policy set by beta_run does not bind beta.run")
+	}
+
+	clr := f.call(t, ctx, "policies.clear", map[string]any{"scope": "tool", "target": "beta_run"})
+	if clr.IsError {
+		t.Fatalf("policies.clear by published name: %s", textOf(clr))
+	}
+	if body := textOf(clr) + asJSON(clr.StructuredContent); strings.Contains(body, "beta.run") || strings.Contains(body, "nothing to clear") {
+		t.Errorf("policies.clear by published name missed the canonical rule or named it: %s", body)
+	}
+	if denied() {
+		t.Fatal("the cleared policy still binds beta.run")
+	}
+
+	// A tool the caller may use is answered by its canonical name, as before.
+	vis := f.call(t, f.admin, "policies.set", map[string]any{"scope": "tool", "target": "alpha_run", "access": "deny"})
+	if s := structured(t, vis); s["target"] != "alpha.run" {
+		t.Errorf("policies.set of a visible tool by published name = %v", s)
 	}
 }

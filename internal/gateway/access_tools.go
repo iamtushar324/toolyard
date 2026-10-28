@@ -605,13 +605,11 @@ func (g *Gateway) changePolicy(ctx context.Context, args map[string]any, clear b
 	if target == "" {
 		return mcp.NewToolResultError("target is required: a tool's catalog name (scope tool) or a server name (scope upstream)"), nil
 	}
-	// A tool rule is stored under the canonical name, the one routing
-	// matches: a published name (inbox_request) of a tool the caller may
-	// use names the same tool. Any other name is judged as supplied, as an
-	// unregistered name always was, so no answer reveals a hidden tool.
-	if scope == policy.ScopeTool {
-		target = g.resolveToolNameFor(ctx, agentID, target)
-	}
+	// shown is the target every answer names. It starts as supplied; a
+	// tool rule is stored under the canonical name (below, once the caller
+	// may change policies), and shown follows it only for a tool the caller
+	// may use, so no answer reveals a hidden tool.
+	shown := target
 	if !clear && want != AccessAllow && want != AccessAsk && want != AccessDeny {
 		return mcp.NewToolResultError("access must be allow, ask or deny"), nil
 	}
@@ -638,6 +636,26 @@ func (g *Gateway) changePolicy(ctx context.Context, args map[string]any, clear b
 		return refuse("admin_only", fmt.Sprintf("%s refused: policies apply to every agent on this toolyard, so only an admin's agent may change them, and your owner is a member. "+
 			"Ask an admin, or use policies.explain to tell your owner why a call needs approval.", verb))
 	}
+	// A tool rule is stored under the canonical name, the one routing
+	// matches, whichever name the caller used: policies apply to every
+	// agent, so a published name (inbox_request) always means its tool
+	// here, even one outside this agent's own scope (review r2-1: stored
+	// under the published name, the rule would bind nothing and clear would
+	// miss it). Answers name the canonical tool only when the caller may use
+	// it; otherwise they echo the supplied name and leave the per-tool
+	// detail out.
+	hidden := false
+	if scope == policy.ScopeTool {
+		if canonical := g.resolveToolName(target); canonical != target {
+			if g.resolveToolNameFor(ctx, agentID, target) == canonical {
+				shown = canonical
+			} else {
+				hidden = true
+			}
+			target = canonical
+			change["target"] = target
+		}
+	}
 
 	// What the change does, tool by tool, judged and written under the
 	// engine's write lock so no dashboard edit lands in between.
@@ -649,20 +667,25 @@ func (g *Gateway) changePolicy(ctx context.Context, args map[string]any, clear b
 		var rej *errPolicyChangeRejected
 		if errors.As(err, &rej) {
 			g.auditPolicyChange(ctx, agentID, scope, target, "rejected", reason, rej.msg, change, rej.changes)
+			if hidden {
+				res := mcp.NewToolResultError(fmt.Sprintf("%s rejected for %s.", verb, shown))
+				res.StructuredContent = map[string]any{"status": "rejected", "reason": rej.reason}
+				return res, nil
+			}
 			res := mcp.NewToolResultError(rej.msg)
 			res.StructuredContent = map[string]any{"status": "rejected", "reason": rej.reason, "would_change": rej.changes}
 			return res, nil
 		}
 		msg := verb + " failed: " + err.Error()
 		if errors.Is(err, policy.ErrForceRequired) {
-			msg = fmt.Sprintf("%s refused: %q looks destructive (delete, remove, drop, …) and agents never force-allow such a tool. A person can do it from the dashboard.", verb, target)
+			msg = fmt.Sprintf("%s refused: %q looks destructive (delete, remove, drop, …) and agents never force-allow such a tool. A person can do it from the dashboard.", verb, shown)
 		}
 		g.auditPolicyChange(ctx, agentID, scope, target, "refused", reason, msg, change, *changes)
 		return mcp.NewToolResultError(msg), nil
 	}
 	if clear && !existed {
-		res := mcp.NewToolResultText(fmt.Sprintf("no explicit %s policy for %s; nothing to clear", scope, target))
-		res.StructuredContent = map[string]any{"status": "unchanged", "scope": scope, "target": target}
+		res := mcp.NewToolResultText(fmt.Sprintf("no explicit %s policy for %s; nothing to clear", scope, shown))
+		res.StructuredContent = map[string]any{"status": "unchanged", "scope": scope, "target": shown}
 		return res, nil
 	}
 	// Anti-fight, as the dashboard does: an explicit ask or deny disables
@@ -692,6 +715,12 @@ func (g *Gateway) changePolicy(ctx context.Context, args map[string]any, clear b
 			"policy": pol, "changes": *changes, "agent_id": agentID, "agent_name": raiser.AgentName,
 			"owner_user_id": raiser.OwnerUserID, "owner_email": raiser.OwnerEmail, "reason": reason,
 		}})
+	}
+	if hidden {
+		// The rule is stored and audited under the canonical name; the
+		// answer names only what the caller sent.
+		return inboxJSON(map[string]any{"status": "applied", "scope": scope, "target": shown, "access": decision,
+			"message": fmt.Sprintf("%s %s %s: applied.", verb, scope, shown)}), nil
 	}
 	text := summary + "."
 	if len(*changes) == 0 {
