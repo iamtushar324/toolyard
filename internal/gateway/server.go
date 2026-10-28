@@ -648,10 +648,14 @@ func (g *Gateway) denyUngranted(ctx context.Context, entry toolEntry, agentID, a
 	})
 	ev.Outcome = metrics.OutcomeDenied
 	ev.ErrorClass = "access"
+	// The answer names the tool as the caller did (a published name stays
+	// published), so it never reveals the canonical name of a tool the
+	// caller may not use; the audit row above keeps the canonical name.
+	name := callerToolName(ctx, entry.tool.Name)
 	if limited {
-		return mcp.NewToolResultError(agentLimitedMessage(entry.tool.Name))
+		return mcp.NewToolResultError(agentLimitedMessage(name))
 	}
-	return notFoundResult(entry.tool.Name)
+	return notFoundResult(name)
 }
 
 // BeginDrain makes every new routed tool call answer with a retryable
@@ -1489,18 +1493,21 @@ func (g *Gateway) CallInternal(ctx context.Context, viaTool, targetName string, 
 // "cli" or "voice" for those callers.
 func (g *Gateway) RouteCall(ctx context.Context, viaTool, targetName string, args map[string]any) (*mcp.CallToolResult, error) {
 	// tools.execute (and the REST callers) may name the target by its
-	// published name; everything below sees the canonical one.
+	// published name; everything below sees the canonical one, and a
+	// refusal for a tool outside the caller's scope echoes the supplied
+	// name (denyUngranted), as for a tool that does not exist.
+	supplied := targetName
 	targetName = g.resolveToolName(targetName)
 	g.mu.RLock()
 	entry, ok := g.tools[targetName]
 	g.mu.RUnlock()
 	if !ok {
-		return notFoundResult(targetName), nil
+		return notFoundResult(supplied), nil
 	}
 	if targetName == viaTool {
 		return mcp.NewToolResultError("tools.execute cannot target itself"), nil
 	}
-	return g.routeEntry(ctx, entry, viaTool, args)
+	return g.routeEntry(withSuppliedToolName(ctx, targetName, supplied), entry, viaTool, args)
 }
 
 // routeEntry is the shared path used by both the MCP-side handler and
@@ -1810,6 +1817,12 @@ func (g *Gateway) handlerFor(toolName string) server.ToolHandlerFunc {
 		g.mu.RUnlock()
 		if !ok {
 			return mcp.NewToolResultErrorf("tool %q not registered", toolName), nil
+		}
+		// A 2026-07-28 call's Mcp-Param-* headers must match the tool that
+		// runs, also when the call named it by its published name, which
+		// mcp-go's own check cannot look up (checkParamHeaders).
+		if err := g.checkParamHeaders(ctx, entry, request); err != nil {
+			return nil, err
 		}
 		if g.visibility != nil && !g.visibility.IsVisible(ctx, entry.tool.Name) &&
 			g.allowsEntry(ctx, agentIDFromContext(ctx), entry) {

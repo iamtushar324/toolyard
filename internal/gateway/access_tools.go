@@ -535,15 +535,17 @@ func (g *Gateway) handlePoliciesExplain() directHandler {
 		if tool == "" {
 			return mcp.NewToolResultError("tool is required"), nil
 		}
-		// A published name (tools_search) explains its canonical tool,
-		// under the canonical name policies use.
-		tool = g.resolveToolName(tool)
+		// A published name (tools_search) of a tool the caller may use
+		// explains that tool, under the canonical name policies use; any
+		// other name is answered as supplied.
+		supplied := tool
+		tool = g.resolveToolNameFor(ctx, agentIDFromContext(ctx), supplied)
 		g.mu.RLock()
 		e, ok := g.tools[tool]
 		g.mu.RUnlock()
 		// Outside the caller's scope reads as unknown, like everywhere.
 		if !ok || !g.allowsEntry(ctx, agentIDFromContext(ctx), e) {
-			return notFoundResult(tool), nil
+			return notFoundResult(supplied), nil
 		}
 		t := targetOf(e)
 		st, d := effectiveAccess(g.policy, t)
@@ -604,9 +606,11 @@ func (g *Gateway) changePolicy(ctx context.Context, args map[string]any, clear b
 		return mcp.NewToolResultError("target is required: a tool's catalog name (scope tool) or a server name (scope upstream)"), nil
 	}
 	// A tool rule is stored under the canonical name, the one routing
-	// matches: a published name (inbox_request) names the same tool.
+	// matches: a published name (inbox_request) of a tool the caller may
+	// use names the same tool. Any other name is judged as supplied, as an
+	// unregistered name always was, so no answer reveals a hidden tool.
 	if scope == policy.ScopeTool {
-		target = g.resolveToolName(target)
+		target = g.resolveToolNameFor(ctx, agentID, target)
 	}
 	if !clear && want != AccessAllow && want != AccessAsk && want != AccessDeny {
 		return mcp.NewToolResultError("access must be allow, ask or deny"), nil

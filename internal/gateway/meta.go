@@ -354,18 +354,19 @@ func (g *Gateway) handleExecuteTool() directHandler {
 		if strings.TrimSpace(target) == "" {
 			return mcp.NewToolResultError("tool is required"), nil
 		}
-		// The target may be a published name (tools_search); the checks
-		// below and RouteCall see the canonical one.
-		target = g.resolveToolName(target)
+		// The target may be a published name (tools_search): the checks
+		// below use the canonical one, and RouteCall gets the name as
+		// supplied, so a refusal echoes it.
+		resolved := g.resolveToolName(target)
 		// A script may reach tools.execute (toolyard.tools_execute) but
 		// not code mode itself: a nested executeToolCode would only
 		// recurse, one worker slot per level. routeEntry refuses it at any
 		// depth (refuseNestedCodeMode); this answers the direct case early.
 		// tools.execute never targets itself (RouteCall refuses that).
-		if r, ok := actor.RaiserFrom(ctx); ok && (r.Via == codemode.Via || isWithinCodeMode(ctx)) && isCodeModeTool(target) {
+		if r, ok := actor.RaiserFrom(ctx); ok && (r.Via == codemode.Via || isWithinCodeMode(ctx)) && isCodeModeTool(resolved) {
 			return mcp.NewToolResultErrorf("%s cannot be called from code mode: call the tools you need directly in the script", target), nil
 		}
-		if target == MetaExecuteTool {
+		if resolved == MetaExecuteTool {
 			return mcp.NewToolResultError("tools.execute cannot target itself"), nil
 		}
 		inner, _ := args["arguments"].(map[string]any)

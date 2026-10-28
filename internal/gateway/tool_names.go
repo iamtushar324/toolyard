@@ -4,9 +4,14 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
+	"net/http"
+	"slices"
+	"strconv"
 	"strings"
 
 	"github.com/mark3labs/mcp-go/mcp"
+	"github.com/mark3labs/mcp-go/server"
 )
 
 // Published tool names (TEC-1807). A tool's canonical name is the one the
@@ -29,8 +34,13 @@ import (
 //     SHA-256 of the canonical name, when that is longer than 64
 //     characters, or when another tool of the catalog maps to the same
 //     name. A canonical name that already matches the rule is never
-//     renamed for a collision: the other tools are, so a name that is a
+//     renamed: it is its own published name, so a name that is a
 //     canonical name always means that tool.
+//
+// Names are allocated over the sorted catalog and checked for uniqueness
+// after hashing (publishedToolNames): a hashed name that another tool
+// already holds takes 16 hex digits, then 8 and a counter, so no
+// published name ever means two tools.
 //
 // The names depend only on the catalog, so every replica with the same
 // catalog publishes the same names, and resolving one needs no per-process
@@ -96,40 +106,80 @@ func sanitizeToolName(name string) string {
 // hashedToolName is the long or colliding form: the first 55 characters
 // of sanitized, "_", and the first 8 hex digits of SHA-256(canonical).
 func hashedToolName(canonical, sanitized string) string {
-	sum := sha256.Sum256([]byte(canonical))
-	prefix := sanitized
-	if len(prefix) > publishedHashPrefix {
-		prefix = prefix[:publishedHashPrefix]
+	return hashedCandidate(canonical, sanitized, 0)
+}
+
+// hashedCandidate is the attempt-th hashed form of canonical, for when the
+// earlier ones are taken: "_" and 8 hex digits of SHA-256(canonical)
+// (attempt 0), 16 hex digits (attempt 1), then 8 hex digits, "_" and the
+// attempt number. The sanitized name fills what is left of the 64
+// characters. Every attempt gives a different name, so a search over them
+// ends.
+func hashedCandidate(canonical, sanitized string, attempt int) string {
+	h := sha256.Sum256([]byte(canonical))
+	sum := hex.EncodeToString(h[:])
+	suffix := "_" + sum[:publishedHashLen]
+	switch {
+	case attempt == 1:
+		suffix = "_" + sum[:2*publishedHashLen]
+	case attempt > 1:
+		suffix += "_" + strconv.Itoa(attempt)
 	}
-	return prefix + "_" + hex.EncodeToString(sum[:])[:publishedHashLen]
+	prefix := sanitized
+	if room := maxPublishedNameLen - len(suffix); len(prefix) > room {
+		prefix = prefix[:room]
+	}
+	return prefix + suffix
 }
 
 // publishedToolNames maps every canonical name in names to its published
-// name, with the collision rule applied over all of them.
+// name. The answer depends on the set of names only, never on their order,
+// and no two names get the same published name:
+//
+//  1. a canonical name that already matches the rule keeps it;
+//  2. a name whose short form (PublishedToolName) no other name has, and
+//     that step 1 did not take, gets its short form;
+//  3. every other name, in sorted order, gets the first hashed form
+//     (hashedCandidate) no name holds yet.
 func publishedToolNames(names []string) map[string]string {
-	base := make(map[string]string, len(names))
-	groups := make(map[string][]string, len(names))
-	for _, n := range names {
-		if _, dup := base[n]; dup {
+	sorted := slices.Clone(names)
+	slices.Sort(sorted)
+	sorted = slices.Compact(sorted)
+	out := make(map[string]string, len(sorted))
+	taken := make(map[string]bool, len(sorted))
+	var rest []string
+	for _, n := range sorted {
+		if ValidPublishedToolName(n) {
+			out[n] = n
+			taken[n] = true
 			continue
 		}
+		rest = append(rest, n)
+	}
+	base := make(map[string]string, len(rest))
+	count := make(map[string]int, len(rest))
+	for _, n := range rest {
 		p := PublishedToolName(n)
 		base[n] = p
-		groups[p] = append(groups[p], n)
+		count[p]++
 	}
-	out := make(map[string]string, len(base))
-	for p, members := range groups {
-		if len(members) == 1 {
-			out[members[0]] = p
+	var hashed []string
+	for _, n := range rest {
+		if p := base[n]; count[p] == 1 && !taken[p] {
+			out[n] = p
+			taken[p] = true
 			continue
 		}
-		for _, n := range members {
-			if n == p {
-				// Already a valid name: it keeps it, the others move.
+		hashed = append(hashed, n)
+	}
+	for _, n := range hashed {
+		sanitized := sanitizeToolName(n)
+		for attempt := 0; ; attempt++ {
+			if p := hashedCandidate(n, sanitized, attempt); !taken[p] {
 				out[n] = p
-				continue
+				taken[p] = true
+				break
 			}
-			out[n] = hashedToolName(n, sanitizeToolName(n))
 		}
 	}
 	return out
@@ -205,11 +255,56 @@ func (g *Gateway) resolveToolName(name string) string {
 	return name
 }
 
+// resolveToolNameFor is resolveToolName limited to the tools callerID may
+// use: a published name of a tool outside the caller's access scope (or
+// its agent's own limits) stays as supplied, exactly as an unknown name
+// would, so an answer never names a tool the caller cannot see. Never call
+// it holding g.mu.
+func (g *Gateway) resolveToolNameFor(ctx context.Context, callerID, name string) string {
+	canonical := g.resolveToolName(name)
+	if canonical == name {
+		return name
+	}
+	g.mu.RLock()
+	entry, ok := g.tools[canonical]
+	g.mu.RUnlock()
+	if !ok || !g.allowsEntry(ctx, callerID, entry) {
+		return name
+	}
+	return canonical
+}
+
 // CanonicalTool implements inbox.ToolNamer: inbox.request and inbox.check
-// accept a published name and keep the canonical one, so a grant names
-// the tool the way policies and audit do and works for a call by either
-// name.
-func (g *Gateway) CanonicalTool(name string) string { return g.resolveToolName(name) }
+// accept a published name of a tool the agent may use and keep the
+// canonical one, so a grant names the tool the way policies and audit do
+// and works for a call by either name. Any other name stays as supplied.
+func (g *Gateway) CanonicalTool(ctx context.Context, agentID, name string) string {
+	return g.resolveToolNameFor(ctx, agentID, name)
+}
+
+// suppliedToolNameKey carries the name a routed call was made with when it
+// differs from the canonical one (RouteCall), so a refusal for a tool the
+// caller may not use echoes the caller's own name (denyUngranted).
+type suppliedToolNameKey struct{}
+
+type suppliedToolName struct{ canonical, supplied string }
+
+func withSuppliedToolName(ctx context.Context, canonical, supplied string) context.Context {
+	if canonical == supplied {
+		return ctx
+	}
+	return context.WithValue(ctx, suppliedToolNameKey{}, suppliedToolName{canonical: canonical, supplied: supplied})
+}
+
+// callerToolName is the name the caller used for canonical: the supplied
+// name RouteCall recorded for this tool, else canonical. Keyed by the
+// canonical name, so a nested call to another tool never borrows it.
+func callerToolName(ctx context.Context, canonical string) string {
+	if s, ok := ctx.Value(suppliedToolNameKey{}).(suppliedToolName); ok && s.canonical == canonical {
+		return s.supplied
+	}
+	return canonical
+}
 
 // mcpToolName is how a text the client reads names an MCP-listed tool:
 // its published name with safe names on, its canonical name otherwise.
@@ -254,4 +349,75 @@ func (g *Gateway) resolveCallName(_ context.Context, _ any, req *mcp.CallToolReq
 		return
 	}
 	req.Params.Name = g.resolveToolName(req.Params.Name)
+}
+
+// paramHeaderError is a Mcp-Param-* header that disagrees with the body,
+// answered as mcp-go answers one: JSON-RPC error HEADER_MISMATCH, which
+// the 2026-07-28 transport sends with HTTP 400.
+type paramHeaderError struct{ err error }
+
+func (e paramHeaderError) Error() string { return e.err.Error() }
+
+func (e paramHeaderError) Unwrap() error { return e.err }
+
+func (e paramHeaderError) JSONRPCError() mcp.JSONRPCError {
+	return mcp.JSONRPCError{
+		JSONRPC: mcp.JSONRPC_VERSION,
+		Error:   mcp.JSONRPCErrorDetails{Code: mcp.HEADER_MISMATCH, Message: e.err.Error()},
+	}
+}
+
+// checkParamHeaders checks a 2026-07-28 tools/call's Mcp-Param-* headers
+// (SEP-2243) against the tool that runs. mcp-go checks them before
+// dispatch, but finds the tool by the name the body sent: a published name
+// finds nothing, and its check is skipped. This repeats it with mcp-go's
+// own rules (mcp.ValidateParamHeadersLookup) on the body's own bytes where
+// PreserveToolCallNumbers kept them, so a call by either name is held to
+// the same headers, and a proxy that decides on them sees the parameters
+// that run. The Mcp-Name header stays checked by mcp-go against the name
+// sent. Requests without the protocol header (stdio, in-process, older
+// versions) are not checked, as in mcp-go.
+func (g *Gateway) checkParamHeaders(ctx context.Context, entry toolEntry, request mcp.CallToolRequest) error {
+	if !server.IsModernRequest(ctx) || request.Header.Get(mcp.HeaderProtocolVersion) == "" {
+		return nil
+	}
+	params := g.callParamsJSON(ctx, entry, request)
+	if err := mcp.ValidateParamHeadersLookup(headerLookup(request.Header), &entry.tool, params); err != nil {
+		return server.NewHandlerError(paramHeaderError{err: err})
+	}
+	return nil
+}
+
+// callParamsJSON is the call's params as JSON: the request body's own
+// bytes when PreserveToolCallNumbers kept them and they are this call,
+// else the decoded arguments marshalled again.
+func (g *Gateway) callParamsJSON(ctx context.Context, entry toolEntry, request mcp.CallToolRequest) json.RawMessage {
+	if raw, ok := rawMCPBody(ctx); ok {
+		var env struct {
+			Method string          `json:"method"`
+			Params json.RawMessage `json:"params"`
+		}
+		var call struct {
+			Name string `json:"name"`
+		}
+		if json.Unmarshal(raw, &env) == nil && env.Method == string(mcp.MethodToolsCall) &&
+			json.Unmarshal(env.Params, &call) == nil && g.resolveToolName(call.Name) == entry.tool.Name {
+			return env.Params
+		}
+	}
+	b, _ := json.Marshal(map[string]any{"arguments": request.Params.Arguments})
+	return b
+}
+
+// headerLookup reads one header and whether it was sent at all, as mcp-go
+// does, so a header sent with an empty value is not taken for a missing
+// one.
+func headerLookup(h http.Header) func(string) (string, bool) {
+	return func(name string) (string, bool) {
+		values := h.Values(name)
+		if len(values) == 0 {
+			return "", false
+		}
+		return values[0], true
+	}
 }

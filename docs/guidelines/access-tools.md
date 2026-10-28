@@ -56,12 +56,17 @@ character other than a letter, digit, `_` or `-` becomes `_`, so
 `github_get-issue`. A name past 64 characters, or two tools that would
 share a name, get their first 55 characters, `_` and 8 hex digits of the
 SHA-256 of the catalog name; a catalog name that already matches the rule
-is never renamed. The names follow from the catalog alone, so every
-replica lists the same ones. A call may name a tool either way, directly
+is never renamed. Uniqueness is checked after hashing, over the sorted
+catalog: a hashed name another tool already holds takes 16 hex digits,
+then 8 and a counter, so no listed name ever means two tools. The names
+follow from the catalog alone, so every replica lists the same ones. A call may name a tool either way, directly
 or in `tools.execute`, `jobs.start`, `inbox.request` and `inbox.check`;
 the call runs under the catalog name, so policies, grants, approvals, jobs
 and audit rows name the tool as before, and a grant for a call works under
-either name. The server instructions and the five tools' descriptions use
+either name. An answer about a tool the caller may not use, or one that
+does not exist, repeats the name the caller sent, so a listed name never
+reveals a hidden tool. A 2026-07-28 call's `Mcp-Param-*` headers are
+checked against the tool that runs, under either name. The server instructions and the five tools' descriptions use
 the listed names. Code mode keeps its names (`server.tool`,
 `toolyard.<group>_<name>`). Claude clients already turned dots into `_`
 themselves, so their tool names do not change. An operator who sets

@@ -1198,14 +1198,15 @@ func (g *Gateway) handleJobsStart() directHandler {
 			return mcp.NewToolResultError("tool is required"), nil
 		}
 		// A published name (jobs_status) is checked as its canonical
-		// name, so the guards below hold for either name.
-		target = g.resolveToolName(target)
-		if strings.HasPrefix(target, jobsUpstream+".") {
+		// name, so the guards below hold for either name; answers and
+		// RouteCall keep the name as supplied.
+		resolved := g.resolveToolName(target)
+		if strings.HasPrefix(resolved, jobsUpstream+".") {
 			return mcp.NewToolResultErrorf("%s cannot run as a job", target), nil
 		}
 		// Code mode cannot nest, however a script reaches it (routeEntry
 		// refuses it at any depth too; this answers early).
-		if r, ok := actor.RaiserFrom(ctx); ok && (r.Via == codemode.Via || isWithinCodeMode(ctx)) && isCodeModeTool(target) {
+		if r, ok := actor.RaiserFrom(ctx); ok && (r.Via == codemode.Via || isWithinCodeMode(ctx)) && isCodeModeTool(resolved) {
 			return mcp.NewToolResultErrorf("%s cannot be called from code mode: call the tools you need directly in the script", target), nil
 		}
 		ref := strings.TrimSpace(stringArg(args, "callback_ref"))
