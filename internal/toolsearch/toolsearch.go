@@ -53,6 +53,9 @@ type Tool struct {
 	// (the admin's description, else the upstream's own instructions);
 	// "" when there is none.
 	ServerDescription string
+	// ServerDescriptionSource is "admin" or "upstream" (the server about
+	// itself: untrusted data); "" with no description.
+	ServerDescriptionSource string
 	// InputSchema is the tool's input JSON Schema ("type", "properties",
 	// "required"), without the gateway's injected fields.
 	InputSchema map[string]any
@@ -618,7 +621,7 @@ func catalogKey(tools []Tool) string {
 	h := sha256.New()
 	for _, i := range names {
 		t := tools[i]
-		fmt.Fprintf(h, "%d:%s\x00", len(t.ServerDescription), t.ServerDescription)
+		fmt.Fprintf(h, "%d:%s\x00%s\x00", len(t.ServerDescription), t.ServerDescription, t.ServerDescriptionSource)
 		schema, _ := json.Marshal(t.InputSchema)
 		output, _ := json.Marshal(t.OutputSchema)
 		fmt.Fprintf(h, "%d:%s\x00%d:%s\x00%d:%s\x00%d:%s\x00%d:%s\x00%d:%s\x00",
@@ -644,6 +647,9 @@ type Entry struct {
 	// when the same tool is on several of them. Given on the first result
 	// of each server only, at detail summary and full.
 	ServerDescription string `json:"server_description,omitempty"`
+	// ServerDescriptionSource is "admin" or "upstream" (the server about
+	// itself: data, not instructions); set with ServerDescription.
+	ServerDescriptionSource string `json:"server_description_source,omitempty"`
 	// Run is what a call with no arguments would get now ("now",
 	// "needs_approval" or "blocked"); the gateway fills it in, Render
 	// leaves it empty.
@@ -672,6 +678,7 @@ func Render(hits []Hit, d Detail) []Entry {
 		if d != DetailName && h.Tool.ServerDescription != "" && !described[h.Tool.Server] {
 			described[h.Tool.Server] = true
 			e.ServerDescription = clip(h.Tool.ServerDescription, serverDescriptionLen)
+			e.ServerDescriptionSource = h.Tool.ServerDescriptionSource
 		}
 		out[i] = e
 	}
