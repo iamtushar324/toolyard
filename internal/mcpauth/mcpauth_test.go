@@ -335,7 +335,7 @@ func TestAuthorizeChecks(t *testing.T) {
 	if aerr != nil || req.State != "" || req.Resource != testPublic+"/mcp" {
 		t.Fatalf("no state, no resource: %+v %v", req, aerr)
 	}
-	if loc := f.approveAndReturn(t, req.ID, f.user, Consent{Nickname: "No state"}); strings.Contains(loc, "state=") {
+	if loc := f.approveAndReturn(t, req.ID, f.user, Consent{SameBrowser: true, Nickname: "No state"}); strings.Contains(loc, "state=") {
 		t.Fatalf("approve without state: %q", loc)
 	}
 }
@@ -386,7 +386,7 @@ func TestCodeExchangeChecks(t *testing.T) {
 	other := f.register(t, "none", redirect)
 	ctx := context.Background()
 	ca := ClientAuth{ClientID: c.ClientID}
-	consent := Consent{Nickname: "Laptop Claude", Scope: access.AgentScope{Mode: access.ScopeModeAll}}
+	consent := Consent{SameBrowser: true, Nickname: "Laptop Claude", Scope: access.AgentScope{Mode: access.ScopeModeAll}}
 
 	t.Run("PKCE mismatch uses the code up", func(t *testing.T) {
 		verifier, challenge := pkcePair(t)
@@ -461,7 +461,7 @@ func TestTokensRefreshRotateAndReuseRevokes(t *testing.T) {
 	ca := ClientAuth{ClientID: c.ClientID}
 	ctx := context.Background()
 	verifier, challenge := pkcePair(t)
-	code := f.approve(t, f.user, c.ClientID, redirect, challenge, Consent{Nickname: "Web ChatGPT", Scope: access.AgentScope{Mode: access.ScopeModeListed, AllowServers: []string{"memory"}}})
+	code := f.approve(t, f.user, c.ClientID, redirect, challenge, Consent{SameBrowser: true, Nickname: "Web ChatGPT", Scope: access.AgentScope{Mode: access.ScopeModeListed, AllowServers: []string{"memory"}}})
 	t1, oerr := f.svc.Exchange(ctx, codeForm(code, redirect, verifier), ca)
 	if oerr != nil {
 		t.Fatal(oerr)
@@ -513,7 +513,7 @@ func TestTokensRefreshRotateAndReuseRevokes(t *testing.T) {
 	}
 	// Connecting again re-enables the same agent under the new nickname.
 	verifier, challenge = pkcePair(t)
-	code = f.approve(t, f.user, c.ClientID, redirect, challenge, Consent{Nickname: "ChatGPT again"})
+	code = f.approve(t, f.user, c.ClientID, redirect, challenge, Consent{SameBrowser: true, Nickname: "ChatGPT again"})
 	t3, oerr := f.svc.Exchange(ctx, codeForm(code, redirect, verifier), ca)
 	if oerr != nil {
 		t.Fatal(oerr)
@@ -534,7 +534,7 @@ func TestRefreshScopeMayOnlyNarrow(t *testing.T) {
 	c := f.register(t, "none", redirect)
 	ca := ClientAuth{ClientID: c.ClientID}
 	verifier, challenge := pkcePair(t)
-	code := f.approve(t, f.user, c.ClientID, redirect, challenge, Consent{Nickname: "x"})
+	code := f.approve(t, f.user, c.ClientID, redirect, challenge, Consent{SameBrowser: true, Nickname: "x"})
 	tok, oerr := f.svc.Exchange(context.Background(), codeForm(code, redirect, verifier), ca)
 	if oerr != nil {
 		t.Fatal(oerr)
@@ -551,7 +551,7 @@ func TestConfidentialClientAuthentication(t *testing.T) {
 	c := f.register(t, AuthSecretPost, redirect)
 	ctx := context.Background()
 	verifier, challenge := pkcePair(t)
-	code := f.approve(t, f.user, c.ClientID, redirect, challenge, Consent{Nickname: "Secret client"})
+	code := f.approve(t, f.user, c.ClientID, redirect, challenge, Consent{SameBrowser: true, Nickname: "Secret client"})
 	_, oerr := f.svc.Exchange(ctx, codeForm(code, redirect, verifier), ClientAuth{ClientID: c.ClientID})
 	wantOAuthErr(t, oerr, "invalid_client")
 	_, oerr = f.svc.Exchange(ctx, codeForm(code, redirect, verifier), ClientAuth{ClientID: c.ClientID, Secret: "tycs_wrong"})
@@ -573,7 +573,7 @@ func TestRevoke(t *testing.T) {
 	ca := ClientAuth{ClientID: c.ClientID}
 	ctx := context.Background()
 	verifier, challenge := pkcePair(t)
-	code := f.approve(t, f.user, c.ClientID, redirect, challenge, Consent{Nickname: "Revoke me"})
+	code := f.approve(t, f.user, c.ClientID, redirect, challenge, Consent{SameBrowser: true, Nickname: "Revoke me"})
 	tok, oerr := f.svc.Exchange(ctx, codeForm(code, redirect, verifier), ca)
 	if oerr != nil {
 		t.Fatal(oerr)
@@ -627,7 +627,7 @@ func TestVerifyRefusesExpiredDisabledAndBlocked(t *testing.T) {
 	ca := ClientAuth{ClientID: c.ClientID}
 	issue := func(u *identity.User) *TokenResponse {
 		verifier, challenge := pkcePair(t)
-		code := f.approve(t, u, c.ClientID, redirect, challenge, Consent{Nickname: "Member app"})
+		code := f.approve(t, u, c.ClientID, redirect, challenge, Consent{SameBrowser: true, Nickname: "Member app"})
 		tok, oerr := f.svc.Exchange(ctx, codeForm(code, redirect, verifier), ca)
 		if oerr != nil {
 			t.Fatal(oerr)
@@ -680,21 +680,21 @@ func TestDenyAndAnsweredRequests(t *testing.T) {
 	if u.Query().Get("error") != "access_denied" || u.Query().Get("state") != "st-123" {
 		t.Fatalf("deny redirect %q", loc)
 	}
-	if _, err := f.svc.Approve(ctx, req.ID, f.user, Consent{Nickname: "late"}); err != ErrRequestNotFound {
+	if _, err := f.svc.Approve(ctx, req.ID, f.user, Consent{SameBrowser: true, Nickname: "late"}); err != ErrRequestNotFound {
 		t.Fatalf("approve after deny: %v", err)
 	}
 	if _, err := f.svc.PendingRequest(ctx, req.ID); err != ErrRequestNotFound {
 		t.Fatalf("answered request still pending: %v", err)
 	}
 	req, _ = f.svc.BeginAuthorize(ctx, authorizeQuery(c.ClientID, redirect, challenge, nil), "198.51.100.7")
-	if _, err := f.svc.Approve(ctx, req.ID, f.user, Consent{Nickname: "bad/name"}); err != ErrInvalidNickname {
+	if _, err := f.svc.Approve(ctx, req.ID, f.user, Consent{SameBrowser: true, Nickname: "bad/name"}); err != ErrInvalidNickname {
 		t.Fatalf("bad nickname: %v", err)
 	}
-	if _, err := f.svc.Approve(ctx, req.ID, f.user, Consent{Nickname: "ok", Scope: access.AgentScope{Mode: "some"}}); err == nil {
+	if _, err := f.svc.Approve(ctx, req.ID, f.user, Consent{SameBrowser: true, Nickname: "ok", Scope: access.AgentScope{Mode: "some"}}); err == nil {
 		t.Fatal("a bad scope was accepted")
 	}
 	f.clock = f.clock.Add(RequestTTL + time.Second)
-	if _, err := f.svc.Approve(ctx, req.ID, f.user, Consent{Nickname: "ok"}); err != ErrRequestNotFound {
+	if _, err := f.svc.Approve(ctx, req.ID, f.user, Consent{SameBrowser: true, Nickname: "ok"}); err != ErrRequestNotFound {
 		t.Fatalf("expired request: %v", err)
 	}
 }
@@ -741,7 +741,7 @@ func TestSweepKeepsGrants(t *testing.T) {
 	c := f.register(t, "none", redirect)
 	unused := f.register(t, "none", redirect)
 	verifier, challenge := pkcePair(t)
-	code := f.approve(t, f.user, c.ClientID, redirect, challenge, Consent{Nickname: "kept"})
+	code := f.approve(t, f.user, c.ClientID, redirect, challenge, Consent{SameBrowser: true, Nickname: "kept"})
 	if _, oerr := f.svc.Exchange(context.Background(), codeForm(code, redirect, verifier), ClientAuth{ClientID: c.ClientID}); oerr != nil {
 		t.Fatal(oerr)
 	}
@@ -839,7 +839,7 @@ func TestClientIDMetadataDocument(t *testing.T) {
 	if aerr != nil {
 		t.Fatal(aerr)
 	}
-	ticket, err := svc.Approve(ctx, req.ID, f.user, Consent{Nickname: "Doc client"})
+	ticket, err := svc.Approve(ctx, req.ID, f.user, Consent{SameBrowser: true, Nickname: "Doc client"})
 	if err != nil {
 		t.Fatal(err)
 	}

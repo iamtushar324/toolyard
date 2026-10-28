@@ -140,6 +140,7 @@ to `/mcp` and the dashboard:
 | `/.well-known/oauth-authorization-server` | RFC 8414 authorization server metadata |
 | `/oauth/register` | RFC 7591 dynamic client registration (60 per client IP per hour) |
 | `/oauth/authorize`, `/oauth/consent`, `/oauth/return/<ticket>`, `/oauth/copy.js` | the browser steps: a stop page, sign-in, the consent screen, then the return link (see "Finishing in another browser") |
+| `/oauth/wait`, `/oauth/wait/continue`, `/oauth/wait.js` | the stop page waits for the answer from another browser and continues where the app started (see "Finishing in another browser") |
 | `/oauth/token` | `authorization_code` (PKCE `S256` required) and `refresh_token` |
 | `/oauth/revoke` | RFC 7009 revocation |
 
@@ -206,20 +207,41 @@ another profile):
    browser**: the consent step's address,
    `<public-url>/oauth/consent?request=<id>`. It works in any browser where
    the person signs in to toolyard, for the 10 minutes the request lives.
-2. After **Allow**, toolyard does not send the browser to the app. It shows
+   Under the link the page shows the confirmation code to type there (see
+   "Confirmation code") and says "Keep this window open: after you allow
+   the app in the other browser, this window continues by itself."
+2. The stop page waits. Its script (`/oauth/wait.js`) asks
+   `POST /oauth/wait` every 2 seconds, for up to 10 minutes, with the
+   request id and the page's **waiter secret**, and gets `pending`,
+   `approved` (with the app's name), `denied`, `expired` or `used`. After
+   an allow in the other browser it shows **Approved in another browser**
+   and a **Continue** button; it never moves on by itself. Continue
+   (`POST /oauth/wait/continue`, a same-origin form with a
+   `SameSite=Strict` nonce cookie that the stop page set) uses the
+   approval, mints the code then and sends the browser to the app's
+   redirect URI with `code`, `state` and `iss`, in the window where the
+   app started (an app that keeps its OAuth state in its own pop-up needs
+   that). After a deny the page shows "You did not allow <app>" with the
+   deny page's link; for an expired or used sign-in it says to start again
+   from the app. Without JavaScript the page works as below: copy the
+   link, then use the return link.
+3. After **Allow**, toolyard does not send the browser to the app. It shows
    **Approved. Return to <app>** (where it sends the person back to, whose
    toolyard and which nickname) with **Continue in this browser** and
-   **Copy return link**, `<public-url>/oauth/return/<ticket>`. The person
-   opens it in the browser where the app waits. A return link works once,
-   for 10 minutes after the consent, and needs no toolyard session.
-   Opening it changes nothing (a link previewer cannot use it up); its
-   **Continue** button, a same-origin form with a `SameSite=Strict` nonce
-   cookie, mints the authorization code then (so the code's 60 seconds
-   start there) and sends the browser to the app's registered redirect URI
-   with `code`, `state` and `iss`. A newer consent for the same app ends
-   the unused return link of the earlier one, and a revoked connection's
-   link gives no code.
-3. After **Deny**, the page links to the app's redirect URI with
+   **Copy return link**, `<public-url>/oauth/return/<ticket>`. If the app
+   waits in its window in the other browser, the person continues there;
+   otherwise they copy the link into that same window (not a new tab). A
+   return link works once, for 10 minutes after the consent, and needs no
+   toolyard session. Opening it changes nothing (a link previewer cannot
+   use it up); its **Continue** button, a same-origin form with a
+   `SameSite=Strict` nonce cookie, mints the authorization code then (so
+   the code's 60 seconds start there) and sends the browser to the app's
+   registered redirect URI with `code`, `state` and `iss`. The return link
+   and the waiting page share one approval: whichever is used first gets
+   the code, and the other is refused as already used. A newer consent for
+   the same app ends the unused approval of the earlier one, and a revoked
+   connection's approval gives no code.
+4. After **Deny**, the page links to the app's redirect URI with
    `error=access_denied`, to follow here or copy to the other browser.
 
 A return link is a capability like the code it stands for: whoever holds
@@ -227,8 +249,39 @@ it can have a code sent to the app's registered redirect URI and nowhere
 else, and the app's `state` and PKCE verifier, which never leave the app,
 make that code useless to anyone else. The page names the toolyard account
 the app connects to. Only the link's SHA-256 is stored
-(`mcp_oauth_return_tickets`), and the token endpoint records the consent's
-time, not the link's, as the sign-in time.
+(`mcp_oauth_return_tickets`, which also names the request it answers), and
+the token endpoint records the consent's time, not the link's, as the
+sign-in time.
+
+The waiter secret is the waiting page's capability. Only the stop page has
+it, in its body (a hidden form field), never in a link: the consent link
+the person copies carries the request id alone, so whoever sees that link
+can neither watch the request nor finish it. It travels only in POST
+bodies (never in a URL or an access log), only its SHA-256 is stored
+(`mcp_oauth_requests.waiter_hash`, with the answer in `verdict`), and a
+missing or wrong waiter gets the same answer as an unknown request.
+`/oauth/wait` allows 1200 questions per client IP per 10 minutes (four
+waiting pages), `/oauth/wait/continue` 60.
+
+**Confirmation code.** The window where a connection started can finish it
+after an allow, so someone who sends a person a consent link of their own
+would get the connection if that person only clicked **Allow**. The stop
+page therefore shows a code, "Your code: K7P-2QX. Type it on the consent
+page in the other browser." (six symbols without `0`, `O`, `1`, `I` and
+`L`). The consent screen asks for it, in the field "Code from the window
+where you started", only in a browser that did not render that stop page:
+the stop page's `SameSite=Strict` cookie, whose value carries a MAC under
+the session key that binds it to the request, marks the same browser,
+which needs no code. An allow from another browser needs the right code
+(compared in constant time); it guards every such approval, so both the
+waiting page and the return link. A wrong code shows "That code is not
+right" and counts an attempt; the fifth wrong code ends the request
+(`verdict` `locked`, an `mcp_oauth.code_locked` audit row) and the person
+starts again from the app. Deny never needs the code. Only an HMAC of the
+code keyed with the request id is stored (`mcp_oauth_requests.code_hash`,
+with `code_attempts`); the code is never in a link, a cookie or a log.
+Requests stored before this version have no code and are allowed as
+before; they live 10 minutes.
 
 **Security notes.**
 

@@ -2,10 +2,11 @@ package mcpauth
 
 // authorize.go is the authorization request and the person's answer: the
 // request is checked and stored (BeginAuthorize), the consent screen reads
-// it back (PendingRequest), and Approve or Deny claims it once. Approve
-// creates or reuses the grant and its agent and returns a one-time return
-// ticket (return.go), whose link mints the code; Deny returns where to send
-// the browser.
+// it back (PendingRequest), and Approve or Deny claims it once and records
+// the verdict. Approve creates or reuses the grant and its agent and
+// returns a one-time return ticket (return.go), whose link mints the code;
+// Deny returns where to send the browser. The stop page that
+// BeginAuthorize's caller shows also waits for the verdict (wait.go).
 
 import (
 	"context"
@@ -47,6 +48,19 @@ type AuthorizeRequest struct {
 	Resource      string
 	Scope         string
 	ExpiresAt     int64
+	// Waiter is the raw waiter secret of the stop page (wait.go). Only
+	// BeginAuthorize sets it, once: only its SHA-256 is stored, and
+	// PendingRequest (the consent screen, in any browser) never has it.
+	Waiter string
+	// Code is the raw confirmation code the stop page shows (code.go; show
+	// it with FormatCode). Only BeginAuthorize sets it, once: only its HMAC
+	// is stored.
+	Code string
+	// HasCode: an allow from another browser needs the confirmation code.
+	// False only for a request stored before codes existed.
+	HasCode bool
+	// codeHash is the stored HMAC of the code (PendingRequest).
+	codeHash string
 }
 
 // AuthorizeError is a failed authorization request. With RedirectURI set
@@ -202,13 +216,24 @@ func (s *Service) BeginAuthorize(ctx context.Context, q url.Values, ip string) (
 	if err != nil {
 		return nil, show(http.StatusInternalServerError, "server_error", "Toolyard could not start the sign-in. Try again.")
 	}
+	// The stop page's waiter secret (wait.go) and confirmation code
+	// (code.go): only that page gets them.
+	waiter, err := newSecret(waiterPrefix)
+	if err != nil {
+		return nil, show(http.StatusInternalServerError, "server_error", "Toolyard could not start the sign-in. Try again.")
+	}
+	code, err := newConfirmCode()
+	if err != nil {
+		return nil, show(http.StatusInternalServerError, "server_error", "Toolyard could not start the sign-in. Try again.")
+	}
 	now := s.now()
 	req := &AuthorizeRequest{ID: id, Client: client, RedirectURI: redirect, State: state, CodeChallenge: challenge,
-		Resource: s.Resource(), Scope: grantedScope(q.Get("scope")), ExpiresAt: now.Add(RequestTTL).UnixMilli()}
+		Resource: s.Resource(), Scope: grantedScope(q.Get("scope")), ExpiresAt: now.Add(RequestTTL).UnixMilli(), Waiter: waiter,
+		Code: code, HasCode: true, codeHash: codeHash(id, code)}
 	if _, err := s.db.ExecContext(ctx,
-		`INSERT INTO mcp_oauth_requests(id, client_id, redirect_uri, state, code_challenge, resource, scope, created_at, expires_at)
-         VALUES(?,?,?,?,?,?,?,?,?)`,
-		req.ID, client.ID, redirect, state, challenge, req.Resource, req.Scope, now.UnixMilli(), req.ExpiresAt); err != nil {
+		`INSERT INTO mcp_oauth_requests(id, client_id, redirect_uri, state, code_challenge, resource, scope, created_at, expires_at, waiter_hash, code_hash)
+         VALUES(?,?,?,?,?,?,?,?,?,?,?)`,
+		req.ID, client.ID, redirect, state, challenge, req.Resource, req.Scope, now.UnixMilli(), req.ExpiresAt, hashSecret(waiter), req.codeHash); err != nil {
 		return nil, show(http.StatusInternalServerError, "server_error", "Toolyard could not start the sign-in. Try again.")
 	}
 	return req, nil
@@ -235,16 +260,18 @@ func (s *Service) PendingRequest(ctx context.Context, id string) (*AuthorizeRequ
 	}
 	var r AuthorizeRequest
 	var clientID string
+	var code sql.NullString
 	err := s.db.QueryRowContext(ctx,
-		`SELECT id, client_id, redirect_uri, state, code_challenge, resource, scope, expires_at
+		`SELECT id, client_id, redirect_uri, state, code_challenge, resource, scope, expires_at, code_hash
          FROM mcp_oauth_requests WHERE id = ? AND used_at IS NULL AND expires_at > ?`, id, s.now().UnixMilli()).
-		Scan(&r.ID, &clientID, &r.RedirectURI, &r.State, &r.CodeChallenge, &r.Resource, &r.Scope, &r.ExpiresAt)
+		Scan(&r.ID, &clientID, &r.RedirectURI, &r.State, &r.CodeChallenge, &r.Resource, &r.Scope, &r.ExpiresAt, &code)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrRequestNotFound
 	}
 	if err != nil {
 		return nil, err
 	}
+	r.codeHash, r.HasCode = code.String, code.Valid && code.String != ""
 	c, cerr := s.Client(ctx, clientID)
 	if cerr != nil {
 		return nil, cerr
@@ -297,6 +324,12 @@ type Consent struct {
 	// client shares one client_id across installs, so two devices of one
 	// person share the grant and must not sign each other out.
 	SignOutOthers bool
+	// SameBrowser: the answering browser rendered this request's stop page
+	// (the HTTP layer proves it with the stop page's cookie), so no
+	// confirmation code is needed. Otherwise an allow needs Code (code.go).
+	SameBrowser bool
+	// Code is the confirmation code the person typed.
+	Code string
 }
 
 // DefaultNickname turns a client name into a valid agent name.
@@ -333,17 +366,18 @@ type claimedRequest struct {
 	clientID, redirect, state, challenge, resource, scope string
 }
 
-// claimRequest marks the request answered by userID, once: of two answers
-// racing, exactly one gets the row.
-func (s *Service) claimRequest(ctx context.Context, q store.Querier, id, userID string) (*claimedRequest, error) {
+// claimRequest marks the request answered by userID with verdict
+// (verdictAllow or verdictDeny, which the waiting stop page reads), once:
+// of two answers racing, exactly one gets the row.
+func (s *Service) claimRequest(ctx context.Context, q store.Querier, id, userID, verdict string) (*claimedRequest, error) {
 	if !ValidRequestID(id) {
 		return nil, ErrRequestNotFound
 	}
 	var c claimedRequest
 	now := s.now().UnixMilli()
 	err := q.QueryRowContext(ctx,
-		`UPDATE mcp_oauth_requests SET used_at = ?, user_id = ? WHERE id = ? AND used_at IS NULL AND expires_at > ?
-         RETURNING client_id, redirect_uri, state, code_challenge, resource, scope`, now, userID, id, now).
+		`UPDATE mcp_oauth_requests SET used_at = ?, user_id = ?, verdict = ? WHERE id = ? AND used_at IS NULL AND expires_at > ?
+         RETURNING client_id, redirect_uri, state, code_challenge, resource, scope`, now, userID, verdict, id, now).
 		Scan(&c.clientID, &c.redirect, &c.state, &c.challenge, &c.resource, &c.scope)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrRequestNotFound
@@ -356,7 +390,8 @@ func (s *Service) claimRequest(ctx context.Context, q store.Querier, id, userID 
 // renamed and re-enabled), sets the agent's tool scope, stores a one-time
 // return ticket and returns it. The return link (ReturnPath + ticket) sends
 // the person back to the client, with a code minted then (RedeemReturn),
-// from whichever browser they open it in.
+// from whichever browser they open it in; the ticket names request id, so
+// the waiting stop page of that request can use it instead (RedeemWait).
 func (s *Service) Approve(ctx context.Context, id string, u *identity.User, c Consent) (string, error) {
 	nickname, err := CheckNickname(c.Nickname)
 	if err != nil {
@@ -373,6 +408,14 @@ func (s *Service) Approve(ctx context.Context, id string, u *identity.User, c Co
 	if err != nil {
 		return "", err
 	}
+	// From another browser, the confirmation code first (code.go).
+	if err := s.checkCode(ctx, pending, c); err != nil {
+		if errors.Is(err, ErrCodeLocked) {
+			_ = s.auditTx(ctx, s.db, auditRow{event: "mcp_oauth.code_locked", owner: u, decider: u, client: pending.Client,
+				details: map[string]any{"redirect_host": RedirectHost(pending.RedirectURI), "attempts": MaxCodeAttempts}})
+		}
+		return "", err
+	}
 	// Coming back from a revoke, a deleted or a disabled agent: cancel
 	// whatever the agent still has pending from before, while it is still
 	// disabled (nothing it queued can run until then), so re-enabling it
@@ -387,7 +430,7 @@ func (s *Service) Approve(ctx context.Context, id string, u *identity.User, c Co
 		return "", err
 	}
 	defer func() { _ = tx.Rollback() }()
-	req, err := s.claimRequest(ctx, tx, id, u.ID)
+	req, err := s.claimRequest(ctx, tx, id, u.ID, verdictAllow)
 	if err != nil {
 		return "", err
 	}
@@ -460,7 +503,7 @@ func (s *Service) Approve(ctx context.Context, id string, u *identity.User, c Co
 	if _, err = access.WriteAgentScope(ctx, tx, agentID, scope, u.ID); err != nil {
 		return "", err
 	}
-	ticket, err := s.insertReturnTicketTx(ctx, tx, grantID, u.ID, req, now)
+	ticket, err := s.insertReturnTicketTx(ctx, tx, grantID, u.ID, id, req, now)
 	if err != nil {
 		return "", err
 	}
@@ -511,7 +554,7 @@ func (s *Service) Deny(ctx context.Context, id string, u *identity.User) (string
 		return "", err
 	}
 	defer func() { _ = tx.Rollback() }()
-	req, err := s.claimRequest(ctx, tx, id, u.ID)
+	req, err := s.claimRequest(ctx, tx, id, u.ID, verdictDeny)
 	if err != nil {
 		return "", err
 	}
@@ -522,7 +565,20 @@ func (s *Service) Deny(ctx context.Context, id string, u *identity.User) (string
 	if err = tx.Commit(); err != nil {
 		return "", err
 	}
-	return withParams(req.redirect, map[string]string{"error": "access_denied", "error_description": "The person did not allow this app.", "state": req.state, "iss": s.Issuer()}), nil
+	return s.denyRedirect(req.redirect, req.state), nil
+}
+
+// denyRedirect is the redirect that tells the client the person said no
+// (error access_denied), with the request's state and the issuer.
+func (s *Service) denyRedirect(redirect, state string) string {
+	return withParams(redirect, map[string]string{"error": "access_denied", "error_description": "The person did not allow this app.", "state": state, "iss": s.Issuer()})
+}
+
+// DenyLocation is where a deny of req sends the browser: the link Deny
+// returns. It carries no code and no secret; the waiting stop page links to
+// it once the person said no in another browser.
+func (s *Service) DenyLocation(req *AuthorizeRequest) string {
+	return s.denyRedirect(req.RedirectURI, req.State)
 }
 
 // ---- audit ---------------------------------------------------------------------

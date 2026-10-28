@@ -473,10 +473,10 @@ func TestTwoDevicesDoNotSignEachOtherOut(t *testing.T) {
 		}
 		return tok
 	}
-	laptop := device(Consent{Nickname: "App"})
+	laptop := device(Consent{SameBrowser: true, Nickname: "App"})
 	_, unusedChallenge := pkcePair(t)
-	unused := f.approve(t, f.user, ca.ClientID, redirect, unusedChallenge, Consent{Nickname: "App"})
-	phone := device(Consent{Nickname: "App"})
+	unused := f.approve(t, f.user, ca.ClientID, redirect, unusedChallenge, Consent{SameBrowser: true, Nickname: "App"})
+	phone := device(Consent{SameBrowser: true, Nickname: "App"})
 	for name, tok := range map[string]*TokenResponse{"laptop": laptop, "phone": phone} {
 		if _, err := f.svc.VerifyAccessToken(ctx, tok.AccessToken); err != nil {
 			t.Fatalf("the %s was signed out by the other device's consent: %v", name, err)
@@ -488,7 +488,7 @@ func TestTwoDevicesDoNotSignEachOtherOut(t *testing.T) {
 	if _, oerr := f.svc.Exchange(ctx, refreshForm(laptop.RefreshToken), ca); oerr != nil {
 		t.Fatalf("the laptop cannot refresh: %v", oerr)
 	}
-	tablet := device(Consent{Nickname: "App", SignOutOthers: true})
+	tablet := device(Consent{SameBrowser: true, Nickname: "App", SignOutOthers: true})
 	if _, err := f.svc.VerifyAccessToken(ctx, phone.AccessToken); err == nil {
 		t.Fatal("sign out this app's other sessions kept the phone")
 	}
@@ -506,7 +506,7 @@ func TestDeleteAgentRevokesItsGrant(t *testing.T) {
 	ca := ClientAuth{ClientID: c.ClientID}
 	ctx := context.Background()
 	verifier, challenge := pkcePair(t)
-	code := f.approve(t, f.user, c.ClientID, redirect, challenge, Consent{Nickname: "Deleted"})
+	code := f.approve(t, f.user, c.ClientID, redirect, challenge, Consent{SameBrowser: true, Nickname: "Deleted"})
 	tok, oerr := f.svc.Exchange(ctx, codeForm(code, redirect, verifier), ca)
 	if oerr != nil {
 		t.Fatal(oerr)
@@ -538,7 +538,7 @@ func TestDeleteAgentRevokesItsGrant(t *testing.T) {
 	// Reconnecting recreates the agent under its id; nothing from before
 	// comes back.
 	verifier, challenge = pkcePair(t)
-	code = f.approve(t, f.user, c.ClientID, redirect, challenge, Consent{Nickname: "Back"})
+	code = f.approve(t, f.user, c.ClientID, redirect, challenge, Consent{SameBrowser: true, Nickname: "Back"})
 	if _, err := f.svc.VerifyAccessToken(ctx, tok.AccessToken); err == nil {
 		t.Fatal("an access token from before the delete works")
 	}
@@ -563,7 +563,7 @@ func TestRefreshRaceAndGrace(t *testing.T) {
 	ca := ClientAuth{ClientID: c.ClientID}
 	ctx := context.Background()
 	verifier, challenge := pkcePair(t)
-	code := f.approve(t, f.user, c.ClientID, redirect, challenge, Consent{Nickname: "Racer"})
+	code := f.approve(t, f.user, c.ClientID, redirect, challenge, Consent{SameBrowser: true, Nickname: "Racer"})
 	tok, oerr := f.svc.Exchange(ctx, codeForm(code, redirect, verifier), ca)
 	if oerr != nil {
 		t.Fatal(oerr)
@@ -607,7 +607,7 @@ func TestConcurrentCodeExchangeHasOneWinner(t *testing.T) {
 	c := f.register(t, "none", redirect)
 	ca := ClientAuth{ClientID: c.ClientID}
 	verifier, challenge := pkcePair(t)
-	code := f.approve(t, f.user, c.ClientID, redirect, challenge, Consent{Nickname: "Racer"})
+	code := f.approve(t, f.user, c.ClientID, redirect, challenge, Consent{SameBrowser: true, Nickname: "Racer"})
 	const n = 6
 	var wg sync.WaitGroup
 	var ok int32
@@ -637,7 +637,7 @@ func TestAbsoluteSessionLimit(t *testing.T) {
 	ca := ClientAuth{ClientID: c.ClientID}
 	ctx := context.Background()
 	verifier, challenge := pkcePair(t)
-	code := f.approve(t, f.user, c.ClientID, redirect, challenge, Consent{Nickname: "Short"})
+	code := f.approve(t, f.user, c.ClientID, redirect, challenge, Consent{SameBrowser: true, Nickname: "Short"})
 	tok, oerr := f.svc.Exchange(ctx, codeForm(code, redirect, verifier), ca)
 	if oerr != nil {
 		t.Fatal(oerr)
@@ -677,7 +677,7 @@ func TestRevocationDisablesTheAgentAndCallsOnRevoke(t *testing.T) {
 	ctx := context.Background()
 	issue := func() *TokenResponse {
 		verifier, challenge := pkcePair(t)
-		code := f.approve(t, f.user, c.ClientID, redirect, challenge, Consent{Nickname: "Revoked"})
+		code := f.approve(t, f.user, c.ClientID, redirect, challenge, Consent{SameBrowser: true, Nickname: "Revoked"})
 		tok, oerr := f.svc.Exchange(ctx, codeForm(code, redirect, verifier), ca)
 		if oerr != nil {
 			t.Fatal(oerr)
@@ -734,13 +734,13 @@ func TestReconnectAfterRevokeRevivesNothingOld(t *testing.T) {
 	ca := ClientAuth{ClientID: c.ClientID}
 	ctx := context.Background()
 	verifier, challenge := pkcePair(t)
-	code := f.approve(t, f.user, c.ClientID, redirect, challenge, Consent{Nickname: "Old"})
+	code := f.approve(t, f.user, c.ClientID, redirect, challenge, Consent{SameBrowser: true, Nickname: "Old"})
 	tok, oerr := f.svc.Exchange(ctx, codeForm(code, redirect, verifier), ca)
 	if oerr != nil {
 		t.Fatal(oerr)
 	}
 	staleVerifier, staleChallenge := pkcePair(t)
-	staleCode := f.approve(t, f.user, c.ClientID, redirect, staleChallenge, Consent{Nickname: "Old"})
+	staleCode := f.approve(t, f.user, c.ClientID, redirect, staleChallenge, Consent{SameBrowser: true, Nickname: "Old"})
 	// A grant marked revoked while its tokens were not (another node's
 	// half-finished revoke, an operator's SQL): reconnecting must not wake
 	// them up.
@@ -748,7 +748,7 @@ func TestReconnectAfterRevokeRevivesNothingOld(t *testing.T) {
 		t.Fatal(err)
 	}
 	verifier2, challenge2 := pkcePair(t)
-	code2 := f.approve(t, f.user, c.ClientID, redirect, challenge2, Consent{Nickname: "New"})
+	code2 := f.approve(t, f.user, c.ClientID, redirect, challenge2, Consent{SameBrowser: true, Nickname: "New"})
 	if _, err := f.svc.VerifyAccessToken(ctx, tok.AccessToken); err == nil {
 		t.Fatal("an access token from before the revoke works again")
 	}
@@ -775,7 +775,7 @@ func TestManageFlagGivesAdminControlOnlyWhenChosen(t *testing.T) {
 	agentFor := func(u *identity.User, redirect string, manage bool) string {
 		c := f.register(t, "none", redirect)
 		verifier, challenge := pkcePair(t)
-		code := f.approve(t, u, c.ClientID, redirect, challenge, Consent{Nickname: "App", MayManage: manage})
+		code := f.approve(t, u, c.ClientID, redirect, challenge, Consent{SameBrowser: true, Nickname: "App", MayManage: manage})
 		tok, oerr := f.svc.Exchange(ctx, codeForm(code, redirect, verifier), ClientAuth{ClientID: c.ClientID})
 		if oerr != nil {
 			t.Fatal(oerr)
@@ -848,7 +848,7 @@ func TestDeletedAgentKeepsItsGrantAsATombstone(t *testing.T) {
 	ca := ClientAuth{ClientID: c.ClientID}
 	ctx := context.Background()
 	verifier, challenge := pkcePair(t)
-	code := f.approve(t, f.user, c.ClientID, redirect, challenge, Consent{Nickname: "Tomb"})
+	code := f.approve(t, f.user, c.ClientID, redirect, challenge, Consent{SameBrowser: true, Nickname: "Tomb"})
 	tok, oerr := f.svc.Exchange(ctx, codeForm(code, redirect, verifier), ca)
 	if oerr != nil {
 		t.Fatal(oerr)
@@ -876,7 +876,7 @@ func TestDeletedAgentKeepsItsGrantAsATombstone(t *testing.T) {
 	}
 	// Connecting again recreates the agent under the same id.
 	verifier, challenge = pkcePair(t)
-	code = f.approve(t, f.user, c.ClientID, redirect, challenge, Consent{Nickname: "Back"})
+	code = f.approve(t, f.user, c.ClientID, redirect, challenge, Consent{SameBrowser: true, Nickname: "Back"})
 	tok, oerr = f.svc.Exchange(ctx, codeForm(code, redirect, verifier), ca)
 	if oerr != nil {
 		t.Fatal(oerr)
@@ -898,7 +898,7 @@ func TestAgentDeletedRunsTheCancelHook(t *testing.T) {
 	redirect := "https://client.example/cb"
 	c := f.register(t, "none", redirect)
 	verifier, challenge := pkcePair(t)
-	code := f.approve(t, f.user, c.ClientID, redirect, challenge, Consent{Nickname: "Gone"})
+	code := f.approve(t, f.user, c.ClientID, redirect, challenge, Consent{SameBrowser: true, Nickname: "Gone"})
 	tok, oerr := f.svc.Exchange(context.Background(), codeForm(code, redirect, verifier), ClientAuth{ClientID: c.ClientID})
 	if oerr != nil {
 		t.Fatal(oerr)
@@ -933,7 +933,7 @@ func TestGrantLocksComeFirst(t *testing.T) {
 	ca := ClientAuth{ClientID: c.ClientID}
 	ctx := context.Background()
 	verifier, challenge := pkcePair(t)
-	code := f.approve(t, f.user, c.ClientID, redirect, challenge, Consent{Nickname: "Locks"})
+	code := f.approve(t, f.user, c.ClientID, redirect, challenge, Consent{SameBrowser: true, Nickname: "Locks"})
 	tok, oerr := f.svc.Exchange(ctx, codeForm(code, redirect, verifier), ca)
 	if oerr != nil {
 		t.Fatal(oerr)
@@ -965,7 +965,7 @@ func TestGrantLocksComeFirst(t *testing.T) {
 				errs <- aerr.Error
 				return
 			}
-			if _, err := f.svc.Approve(ctx, req.ID, f.user, Consent{Nickname: "Locks"}); err != nil {
+			if _, err := f.svc.Approve(ctx, req.ID, f.user, Consent{SameBrowser: true, Nickname: "Locks"}); err != nil {
 				errs <- err
 			}
 		}()
@@ -998,7 +998,7 @@ func TestReusedCodeRevokesTheGrant(t *testing.T) {
 	c := f.register(t, "none", redirect)
 	ca := ClientAuth{ClientID: c.ClientID}
 	ctx := context.Background()
-	consent := Consent{Nickname: "Replayed"}
+	consent := Consent{SameBrowser: true, Nickname: "Replayed"}
 
 	staleVerifier, staleChallenge := pkcePair(t)
 	stale := f.approve(t, f.user, c.ClientID, redirect, staleChallenge, consent)
@@ -1066,7 +1066,7 @@ func TestAuditLoggerPutsTheClientOnAppRows(t *testing.T) {
 	c := f.register(t, "none", redirect)
 	ctx := context.Background()
 	verifier, challenge := pkcePair(t)
-	code := f.approve(t, f.user, c.ClientID, redirect, challenge, Consent{Nickname: "Logged"})
+	code := f.approve(t, f.user, c.ClientID, redirect, challenge, Consent{SameBrowser: true, Nickname: "Logged"})
 	tok, oerr := f.svc.Exchange(ctx, codeForm(code, redirect, verifier), ClientAuth{ClientID: c.ClientID})
 	if oerr != nil {
 		t.Fatal(oerr)

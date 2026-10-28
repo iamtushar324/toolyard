@@ -103,7 +103,7 @@ func TestOnlyTheOwnerAdminMayLetAnAppManageToolyard(t *testing.T) {
 		if aerr != nil {
 			t.Fatalf("authorize: %+v", aerr)
 		}
-		if _, err := svc.Approve(ctx, req.ID, u, mcpauth.Consent{Nickname: "App"}); err != nil {
+		if _, err := svc.Approve(ctx, req.ID, u, mcpauth.Consent{SameBrowser: true, Nickname: "App"}); err != nil {
 			t.Fatal(err)
 		}
 		apps, err := svc.ListApps(ctx, u.ID)
@@ -219,7 +219,7 @@ func TestAgentToolListRoundTripsThroughTheScopeRoutes(t *testing.T) {
 		}
 		return req
 	}
-	if _, err := svc.Approve(ctx, authorize().ID, e.admin, mcpauth.Consent{Nickname: "App"}); err != nil {
+	if _, err := svc.Approve(ctx, authorize().ID, e.admin, mcpauth.Consent{SameBrowser: true, Nickname: "App"}); err != nil {
 		t.Fatal(err)
 	}
 	apps, err := svc.ListApps(ctx, e.admin.ID)
@@ -241,7 +241,8 @@ func TestAgentToolListRoundTripsThroughTheScopeRoutes(t *testing.T) {
 	if page.Code != http.StatusOK || nonce == nil {
 		t.Fatalf("consent page: %d %s", page.Code, page.Body)
 	}
-	form := url.Values{"verdict": {"allow"}, "nonce": {nonce[1]}, "nickname": {"App"}, "scope_mode": {"all"}}
+	// This browser did not render the stop page: it types the code.
+	form := url.Values{"verdict": {"allow"}, "nonce": {nonce[1]}, "nickname": {"App"}, "scope_mode": {"all"}, "code": {pending.Code}}
 	r = httptest.NewRequest(http.MethodPost, consentURL, strings.NewReader(form.Encode()))
 	r.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 	r.AddCookie(adminCookie)
@@ -277,7 +278,7 @@ func TestDeletingAnAppAgentRunsTheCancelHook(t *testing.T) {
 	if aerr != nil {
 		t.Fatalf("authorize: %+v", aerr)
 	}
-	if _, err := svc.Approve(ctx, req.ID, e.admin, mcpauth.Consent{Nickname: "App"}); err != nil {
+	if _, err := svc.Approve(ctx, req.ID, e.admin, mcpauth.Consent{SameBrowser: true, Nickname: "App"}); err != nil {
 		t.Fatal(err)
 	}
 	apps, _ := svc.ListApps(ctx, e.admin.ID)
@@ -313,7 +314,7 @@ func TestAppAgentsReportTheirKindAndClient(t *testing.T) {
 	if aerr != nil {
 		t.Fatalf("authorize: %+v", aerr)
 	}
-	if _, err := svc.Approve(ctx, req.ID, e.admin, mcpauth.Consent{Nickname: "App"}); err != nil {
+	if _, err := svc.Approve(ctx, req.ID, e.admin, mcpauth.Consent{SameBrowser: true, Nickname: "App"}); err != nil {
 		t.Fatal(err)
 	}
 	_, plain := e.agentFor(t, e.admin.ID)
