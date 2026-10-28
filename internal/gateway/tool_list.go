@@ -30,8 +30,9 @@ var smallToolListSet = func() map[string]bool {
 // ToolListResolver is the optional part of an access.Resolver that says
 // which tool list a caller's tools/list shows (access.ToolListSmall or
 // access.ToolListFull). *access.Service implements it: an agent's own
-// setting, and the full list for every caller without an agent scope. A
-// resolver without it (or no resolver) lists every tool, as before.
+// setting, the full list for a dashboard or voice session, and the small
+// list for every other caller. A resolver without it (or no resolver)
+// lists every tool, as before.
 type ToolListResolver interface {
 	ToolListFor(ctx context.Context, callerID string) string
 }

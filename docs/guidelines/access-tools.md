@@ -53,8 +53,10 @@ still works: called directly (`tools/call`), through `tools.execute`, and
 from code mode. Search, code-mode catalogs and the REST catalog routes are
 unchanged. The small list is applied after access, so it only hides
 tools: one of the five that the agent's own limits deny stays hidden.
-Callers without an agent scope (a local unauthenticated stdio caller, a
-dashboard session) list every tool, as before.
+A dashboard or voice session picks tools from the whole catalog and keeps
+it. A local unauthenticated MCP caller (no agent key) gets the small list
+too, like every MCP client; it has no scope to switch, so give it an agent
+key for the full list.
 
 **Switching one agent to the full list.** The scope editor (Connected apps
 page, **Change access**) has a **Tool list** choice: *Small: 5 tools* (the

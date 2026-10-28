@@ -373,15 +373,20 @@ func ReadAgentScope(ctx context.Context, q store.Querier, agentID string) (Agent
 }
 
 // ToolListFor is the tool list callerID's MCP tools/list shows: an
-// agent's own (small unless its scope says full), and the full list for
-// every other caller (a local unauthenticated caller, a dashboard or voice
-// session), which has no agent scope. A failed read is the default, small:
-// the list is presentation, and every tool stays callable either way. It
-// reads the row on every call, without the scope cache: tools/list is rare
-// next to tool calls.
+// agent's own (small unless its scope says full); the full list for a
+// dashboard or voice session, which picks tools from the whole catalog
+// itself; and the small list for every other MCP caller, a local
+// unauthenticated one included, which has no scope to switch (give it an
+// agent key for that). A failed read is the default, small: the list is
+// presentation, and every tool stays callable either way. It reads the row
+// on every call, without the scope cache: tools/list is rare next to tool
+// calls.
 func (s *Service) ToolListFor(ctx context.Context, callerID string) string {
-	if !strings.HasPrefix(callerID, "ag_") {
+	switch {
+	case strings.HasPrefix(callerID, "dashboard:"), strings.HasPrefix(callerID, "voice:"):
 		return ToolListFull
+	case !strings.HasPrefix(callerID, "ag_"):
+		return ToolListSmall
 	}
 	sc, err := ReadAgentScope(ctx, s.db, callerID)
 	if err != nil || !sc.FullToolList() {

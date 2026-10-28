@@ -110,12 +110,11 @@ func TestSmallToolListIsEveryAgentsDefault(t *testing.T) {
 }
 
 // TestFullToolListShowsEverythingTheAgentMayUse: the full list is the
-// whole catalog the caller may use, as before the small list; callers
-// without an agent scope (a local unauthenticated caller, a dashboard
-// session) always get it.
+// whole catalog the caller may use, as before the small list; a dashboard
+// session always gets it.
 func TestFullToolListShowsEverythingTheAgentMayUse(t *testing.T) {
 	f := newToolListFixture(t)
-	for _, caller := range []string{"ag_full", "", "dashboard:u_admin"} {
+	for _, caller := range []string{"ag_full", "dashboard:u_admin"} {
 		ctx := WithAgentID(context.Background(), caller)
 		got, want := sorted(mcpToolsList(t, f.gw, ctx)), catalogNames(f.gw.CatalogFor(ctx))
 		if !reflect.DeepEqual(got, want) {
@@ -126,6 +125,16 @@ func TestFullToolListShowsEverythingTheAgentMayUse(t *testing.T) {
 				t.Errorf("%q: tools/list lacks %s", caller, n)
 			}
 		}
+	}
+}
+
+// TestLocalCallerGetsTheSmallList: a local unauthenticated MCP caller (no
+// agent id) gets the default small list, as every MCP client does.
+func TestLocalCallerGetsTheSmallList(t *testing.T) {
+	f := newToolListFixture(t)
+	got := sorted(mcpToolsList(t, f.gw, WithAgentID(context.Background(), "")))
+	if want := sorted(append([]string(nil), SmallToolList...)); !reflect.DeepEqual(got, want) {
+		t.Fatalf("local caller tools/list = %v, want %v", got, want)
 	}
 }
 

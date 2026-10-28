@@ -284,9 +284,16 @@ func TestAgentToolList(t *testing.T) {
 		t.Fatalf("tool list after switching back = %q, want small", got)
 	}
 
-	for _, id := range []string{"", "dashboard:u_admin", "voice:u_admin"} {
+	for _, id := range []string{"dashboard:u_admin", "voice:u_admin"} {
 		if got := svc.ToolListFor(ctx, id); got != ToolListFull {
 			t.Errorf("ToolListFor(%q) = %q, want full", id, got)
+		}
+	}
+	// A local unauthenticated MCP caller ("") has no scope to switch: it
+	// gets the default, as every MCP client does.
+	for _, id := range []string{"", "someone-else"} {
+		if got := svc.ToolListFor(ctx, id); got != ToolListSmall {
+			t.Errorf("ToolListFor(%q) = %q, want small", id, got)
 		}
 	}
 	if _, err := (AgentScope{ToolList: "tiny"}).Normalize(); !errors.Is(err, ErrInvalidScope) {

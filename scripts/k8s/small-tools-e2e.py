@@ -216,6 +216,33 @@ def main():
         check("run status agrees with policies.explain", not mism, mism or "%d hits" % len(hits))
     step("search", search)
 
+    # --- Done means 3: run status for ask and deny policies ---------------
+    def policy_statuses():
+        made = []
+        try:
+            for target, action in (("memory.set", "ask"), ("Context7.query-docs", "deny")):
+                p = admin.j("POST", "/v1/policies", json={"scope": "tool", "target": target, "action": action,
+                                                          "note": "small-tools-e2e (TEC-1807), removed at the end of the run"})
+                made.append(p.get("id"))
+            want = {"memory.set": "needs_approval", "Context7.query-docs": "blocked"}
+            got, mism = {}, []
+            for name in want:
+                res = agent.tool("tools.search", {"query": name.replace(".", " ").replace("-", " "), "limit": 10})
+                hit = next((x for x in res.get("results", []) if x.get("name") == name), None)
+                got[name] = hit and hit.get("run")
+                ex = agent.tool("policies.explain", {"tool": name})
+                acc = ex.get("access") or ex.get("effective_access") or (ex.get("effective") or {}).get("access")
+                if got[name] != want[name] or RUN_FOR_ACCESS.get(acc) != got[name]:
+                    mism.append((name, got[name], acc))
+            report["policy_statuses"] = got
+            check("an ask policy shows needs_approval and a deny policy shows blocked, as policies.explain says",
+                  not mism, mism or got)
+        finally:
+            for pid in made:
+                if pid:
+                    admin.j("DELETE", "/v1/policies/%s" % pid)
+    step("run status under policies", policy_statuses)
+
     # --- Done means 4: a tool that is not listed still runs ----------------
     def hidden_calls():
         direct = agent.tool("access.whoami", {})
@@ -229,6 +256,11 @@ return { top: found.map(x => [x.name, x.run]), caller: me.caller_id || null };
         out = agent.tool("executeToolCode", {"language": "javascript", "code": script})
         report["code_mode"] = out
         val = out.get("result", out)
+        text = out.get("text", "")
+        if "Return value:" in text:
+            # The text answer: print output, then "Return value: <JSON>",
+            # then the environment notes.
+            val = text.split("Return value:", 1)[1].split("\n\nEnvironment:", 1)[0]
         if isinstance(val, str):
             try:
                 val = json.loads(val)
@@ -251,7 +283,8 @@ return { top: found.map(x => [x.name, x.run]), caller: me.caller_id || null };
             "message": "This is an automated test of batched permission requests. Nothing needs a decision.",
             "facts": {"why_now": "End-to-end test of the five-tool list.", "if_it_goes_wrong": "Test data only.",
                       "undo": "The test cancels the request."},
-            "urgency": "low",
+            "urgency": "fyi",
+            "schema_version": 3,
             "tools": [dict(call, call_id="write_a", summary="Write test key A.",
                            params={"scope": "test", "key": key + "-a", "value": "a"}),
                       dict(call, call_id="write_b", summary="Write test key B.",
@@ -261,18 +294,20 @@ return { top: found.map(x => [x.name, x.run]), caller: me.caller_id || null };
         }
         res = agent.tool("inbox.request", args)
         rid = res.get("request_id")
-        report["inbox_request"] = {k: res.get(k) for k in ("ok", "request_id", "problems")}
+        report["inbox_request"] = {k: res.get(k) for k in ("ok", "request_id", "problems", "preview")}
         if not check("one inbox.request with two calls and a question is accepted", res.get("ok") and rid, report["inbox_request"]):
             return
+        pv = res.get("preview") or {}
+        check("the one request is one Inbox card with both calls and the question",
+              pv.get("tools") == 2 and pv.get("questions") == 1, pv)
         st = agent.tool("inbox.status", {"ids": [rid]})
         reqs = st.get("requests", [])
         tools_n = len(reqs[0].get("tools", [])) if reqs else 0
-        qs_n = len(reqs[0].get("questions", [])) if reqs else 0
-        check("inbox.status shows one item with both calls and the question", len(reqs) == 1 and tools_n == 2 and qs_n == 1,
-              {"items": len(reqs), "calls": tools_n, "questions": qs_n})
+        check("inbox.status shows one item with both calls", len(reqs) == 1 and tools_n == 2,
+              {"items": len(reqs), "calls": tools_n})
         report["inbox_request_id"] = rid
         if os.environ.get("KEEP_INBOX") != "1":
-            agent.tool("inbox.cancel", {"id": rid})
+            agent.tool("inbox.cancel", {"request_id": rid})
     step("batched inbox request", batch)
 
     if agent_id:

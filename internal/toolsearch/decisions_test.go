@@ -371,6 +371,61 @@ func TestDecisionsRankerFallsBack(t *testing.T) {
 	}
 }
 
+// TestDecisionsRankerBudgetCoversTheKeyRead (review r1-4): a slow secret
+// store counts against the budget, so the search falls back with timeout
+// instead of waiting for the key.
+func TestDecisionsRankerBudgetCoversTheKeyRead(t *testing.T) {
+	never := newFakeAPI(t, judge(only("x", 1), "", 1))
+	o := &observed{}
+	slowKey := func(ctx context.Context) (string, error) {
+		select {
+		case <-time.After(2 * time.Second):
+			return testKey, nil
+		case <-ctx.Done():
+			return "", ctx.Err()
+		}
+	}
+	start := time.Now()
+	res := search(t, New(Options{Semantic: newTestRanker(never, o, func(op *DecisionsOptions) {
+		op.Key, op.Timeout = slowKey, 50*time.Millisecond
+	})}), fixture(), Query{Text: "create a linear issue"})
+	if res.Fallback != FallbackTimeout || res.RankedBy != RankedKeyword || time.Since(start) > time.Second {
+		t.Fatalf("slow key: %q %s after %s", res.Fallback, res.RankedBy, time.Since(start))
+	}
+	if got := o.list(); !reflect.DeepEqual(got, []string{FallbackTimeout}) || len(never.requests()) != 0 {
+		t.Fatalf("slow key observed %v, %d requests", got, len(never.requests()))
+	}
+}
+
+// TestDecisionsRankerKeepsTheFirstRoundWhenTheSecondFails (review r1-3):
+// the first request already ranked every keyword candidate, so a failed
+// second request (the chosen server's other tools) keeps that ranking
+// (ranked_by jev) rather than throwing it away; it is not cached, so the
+// next search asks again.
+func TestDecisionsRankerKeepsTheFirstRoundWhenTheSecondFails(t *testing.T) {
+	const query = "tell the team in chat that the deploy finished"
+	first := judge(func(string) float64 { return 0.2 }, "Slack", 0.9)
+	api := newFakeAPI(t, func(n int, req seenRequest) (int, string) {
+		if n%2 == 1 { // each search's first request
+			return first(n, req)
+		}
+		return http.StatusBadGateway, `{"error":{"code":502,"message":"upstream"}}`
+	})
+	o := &observed{}
+	e := New(Options{Semantic: newTestRanker(api, o)})
+	res := search(t, e, fixture(), Query{Text: query})
+	if res.RankedBy != RankedJev || res.Fallback != "" || len(res.Hits) == 0 || res.Hits[0].Score != 0.2 {
+		t.Fatalf("second round failed: %s %q %v", res.RankedBy, res.Fallback, names(res.Hits))
+	}
+	if got := o.list(); !reflect.DeepEqual(got, []string{"ok", "http_502"}) {
+		t.Fatalf("observed %v", got)
+	}
+	search(t, e, fixture(), Query{Text: query})
+	if n := len(api.requests()); n != 4 {
+		t.Fatalf("%d requests: an incomplete ranking must not be cached", n)
+	}
+}
+
 // TestDecisionsRankerRefusesMalformedAnswers: an answer that misses a
 // question, has a probability outside [0, 1], the wrong type, a server
 // not offered, is not JSON or is too large fails the ranking.

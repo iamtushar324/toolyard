@@ -153,6 +153,10 @@ func (r *DecisionsRanker) Rank(ctx context.Context, tools []Tool, query string) 
 // tools. The second round is best effort: skipped or failed, the first
 // round's scores stand, marked incomplete.
 func (r *DecisionsRanker) score(ctx context.Context, tools []Tool, query string, keyword []Hit) (map[string]float64, bool, error) {
+	// The budget covers reading the key too: a slow secret store must not
+	// hold the search past it.
+	ctx, cancel := context.WithTimeout(ctx, r.timeout)
+	defer cancel()
 	key, err := r.apiKey(ctx)
 	if err != nil {
 		var re *rankError
@@ -163,8 +167,6 @@ func (r *DecisionsRanker) score(ctx context.Context, tools []Tool, query string,
 		}
 		return nil, false, err
 	}
-	ctx, cancel := context.WithTimeout(ctx, r.timeout)
-	defer cancel()
 
 	cands := make([]Tool, 0, min(len(keyword), decisionsCandidates))
 	for _, h := range keyword {
@@ -241,6 +243,8 @@ func (r *DecisionsRanker) apiKey(ctx context.Context) (string, error) {
 	switch {
 	case errors.Is(err, ErrNoKey):
 		return "", ErrNoKey
+	case err != nil && (errors.Is(err, context.DeadlineExceeded) || errors.Is(ctx.Err(), context.DeadlineExceeded)):
+		return "", &rankError{outcome: FallbackTimeout, msg: "the API key was not read within the budget"}
 	case err != nil:
 		return "", &rankError{outcome: "key_error", msg: "the API key could not be read"}
 	}
