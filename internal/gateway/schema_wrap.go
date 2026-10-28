@@ -207,11 +207,13 @@ func rawDefs(raw map[string]any, props map[string]any) map[string]any {
 // Schema keywords whose value is one schema (or, for items, a list of
 // them), a list of schemas, or a map of name to schema. Only these are
 // walked: a "$ref" inside const, enum, default or examples is data.
+// Draft-07 "dependencies" maps a name to a schema or to a list of
+// property names; a list holds strings, which the walk leaves alone.
 var (
 	subschemaKeys = []string{"items", "additionalProperties", "additionalItems", "contains", "propertyNames",
 		"not", "if", "then", "else", "unevaluatedItems", "unevaluatedProperties"}
 	subschemaListKeys = []string{"anyOf", "oneOf", "allOf", "prefixItems"}
-	subschemaMapKeys  = []string{"properties", "patternProperties", "$defs", "definitions", "dependentSchemas"}
+	subschemaMapKeys  = []string{"properties", "patternProperties", "$defs", "definitions", "dependentSchemas", "dependencies"}
 )
 
 // rewriteDefinitionRefs turns every "#/definitions/X" $ref in schema and

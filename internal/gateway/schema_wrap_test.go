@@ -174,3 +174,28 @@ func TestWrapSchemaRewritesOnlySchemaRefs(t *testing.T) {
 		}
 	}
 }
+
+// TestWrapSchemaRewritesDependencyRefs: draft-07 schema-valued
+// "dependencies" and 2019-09 "dependentSchemas" are schemas, so their refs
+// follow the definitions rename; a property-name list stays as it is.
+func TestWrapSchemaRewritesDependencyRefs(t *testing.T) {
+	raw := mcp.Tool{
+		Name: "deps",
+		RawInputSchema: []byte(`{"type":"object","definitions":{"F":{"type":"object"}},
+			"properties":{"card":{"type":"object",
+				"dependencies":{"a":{"$ref":"#/definitions/F"},"b":["c","#/definitions/F"]},
+				"dependentSchemas":{"d":{"$ref":"#/definitions/F"}}}}}`),
+	}
+	out, _ := wrapSchema(raw)
+	card := out.InputSchema.Properties["card"].(map[string]any)
+	deps := card["dependencies"].(map[string]any)
+	if got := deps["a"].(map[string]any)["$ref"]; got != "#/$defs/F" {
+		t.Errorf("dependencies schema ref not rewritten: %v", got)
+	}
+	if got := deps["b"].([]any); len(got) != 2 || got[0] != "c" || got[1] != "#/definitions/F" {
+		t.Errorf("dependencies name list changed: %v", got)
+	}
+	if got := card["dependentSchemas"].(map[string]any)["d"].(map[string]any)["$ref"]; got != "#/$defs/F" {
+		t.Errorf("dependentSchemas ref not rewritten: %v", got)
+	}
+}
