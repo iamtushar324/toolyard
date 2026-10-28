@@ -685,3 +685,124 @@ func TestMCPOAuthDenyAndStaticTokensWithAgentScope(t *testing.T) {
 		t.Fatalf("whoami does not report the limits and the owner's role: %v", res)
 	}
 }
+
+// TestMCPOAuthWaitingStopPageFinishesWhereTheClientStarted walks the
+// waiting path through the real handler chain: the stop page in browser A
+// (no toolyard session) carries its waiter secret only in its body and
+// sets a Strict nonce cookie; A asks /oauth/wait (Origin checked) while B,
+// signed in, allows the app through the copied consent link; A then sees
+// approved and its Continue sends the code to the client from A; the code
+// works with PKCE, and the return link B got is refused as used.
+func TestMCPOAuthWaitingStopPageFinishesWhereTheClientStarted(t *testing.T) {
+	e := newOAuthEnv(t)
+	redirect := "http://127.0.0.1:43124/callback"
+	reg := e.do(http.MethodPost, "/oauth/register", strings.NewReader(`{"redirect_uris":["`+redirect+`"],"token_endpoint_auth_method":"none","client_name":"Popup client"}`),
+		map[string]string{"Content-Type": "application/json"})
+	var client map[string]any
+	if err := json.Unmarshal(reg.Body.Bytes(), &client); err != nil || reg.Code != http.StatusCreated {
+		t.Fatalf("register: %d %s", reg.Code, reg.Body)
+	}
+	clientID := client["client_id"].(string)
+	verifier, challenge := newPKCE(t)
+	q := url.Values{"response_type": {"code"}, "client_id": {clientID}, "redirect_uri": {redirect}, "state": {"popup-state"},
+		"code_challenge": {challenge}, "code_challenge_method": {"S256"}, "resource": {oauthPublic + "/mcp"}, "scope": {"mcp"}}
+
+	// A: the stop page.
+	stop := e.do(http.MethodGet, "/oauth/authorize?"+q.Encode(), nil, nil)
+	body := stop.Body.String()
+	link := stopLinkRE.FindStringSubmatch(body)
+	waiter := regexp.MustCompile(`name="waiter" value="([^"]+)"`).FindStringSubmatch(body)
+	nonce := nonceRE.FindStringSubmatch(body)
+	var waitCookie *http.Cookie
+	for _, c := range stop.Result().Cookies() {
+		if strings.HasPrefix(c.Name, "toolyard_oauth_wait_") {
+			waitCookie = c
+		}
+	}
+	if stop.Code != http.StatusOK || link == nil || waiter == nil || nonce == nil || waitCookie == nil || waitCookie.SameSite != http.SameSiteStrictMode {
+		t.Fatalf("waiting stop page: %d %s", stop.Code, body)
+	}
+	consentURL := link[1]
+	id := strings.TrimPrefix(consentURL, "/oauth/consent?request=")
+	if strings.Contains(consentURL, waiter[1]) || strings.Count(body, waiter[1]) != 1 || strings.Contains(stop.Header().Get("Set-Cookie"), waiter[1]) {
+		t.Fatal("the waiter leaves the page body")
+	}
+	if csp := stop.Header().Get("Content-Security-Policy"); !strings.Contains(csp, "form-action 'self' "+mcpauth.CSPSource(redirect)) {
+		t.Fatalf("stop page CSP does not allow the redirect target: %q", csp)
+	}
+	poll := func(secret, origin string) (int, string) {
+		t.Helper()
+		raw, _ := json.Marshal(map[string]string{"request": id, "waiter": secret})
+		w := e.do(http.MethodPost, "/oauth/wait", strings.NewReader(string(raw)),
+			map[string]string{"Content-Type": "application/json", "Origin": origin, "Sec-Fetch-Site": "same-origin"})
+		var out map[string]string
+		_ = json.Unmarshal(w.Body.Bytes(), &out)
+		return w.Code, out["status"]
+	}
+	if code, st := poll(waiter[1], oauthPublic); code != http.StatusOK || st != mcpauth.WaitPending {
+		t.Fatalf("poll before consent: %d %q", code, st)
+	}
+	if code, _ := poll(waiter[1], "https://evil.example"); code != http.StatusForbidden {
+		t.Fatalf("cross-origin poll: %d", code)
+	}
+	if code, st := poll("tywt_"+strings.Repeat("A", 43), oauthPublic); code != http.StatusOK || st != mcpauth.WaitExpired {
+		t.Fatalf("poll with a wrong waiter: %d %q, want the unknown request's answer", code, st)
+	}
+
+	// B: the copied consent link, signed in.
+	page := e.do(http.MethodGet, consentURL, nil, nil, e.session...)
+	m := nonceRE.FindStringSubmatch(page.Body.String())
+	var consentCookie *http.Cookie
+	for _, c := range page.Result().Cookies() {
+		if strings.HasPrefix(c.Name, "ty_oauth_") {
+			consentCookie = c
+		}
+	}
+	if page.Code != http.StatusOK || m == nil || consentCookie == nil {
+		t.Fatalf("consent page: %d %s", page.Code, page.Body)
+	}
+	post := func(target string, v url.Values, origin, site string, cookies ...*http.Cookie) *httptest.ResponseRecorder {
+		return e.do(http.MethodPost, target, strings.NewReader(v.Encode()), map[string]string{
+			"Content-Type": "application/x-www-form-urlencoded", "Origin": origin, "Sec-Fetch-Site": site}, cookies...)
+	}
+	done := post(consentURL, url.Values{"nonce": {m[1]}, "verdict": {"allow"}, "nickname": {"Popup client"}, "scope_mode": {"all"}},
+		oauthPublic, "same-origin", append(e.session, consentCookie)...)
+	returnURL := done.Header().Get("Location")
+	if done.Code != http.StatusSeeOther || !strings.HasPrefix(returnURL, mcpauth.ReturnPath) {
+		t.Fatalf("consent submit: %d %q", done.Code, returnURL)
+	}
+	if code, st := poll(waiter[1], oauthPublic); code != http.StatusOK || st != mcpauth.WaitApproved {
+		t.Fatalf("poll after consent: %d %q", code, st)
+	}
+
+	// A: Continue.
+	cont := url.Values{"request": {id}, "waiter": {waiter[1]}, "nonce": {nonce[1]}}
+	if bad := post("/oauth/wait/continue", cont, "https://evil.example", "same-origin", waitCookie); bad.Code != http.StatusForbidden {
+		t.Fatalf("cross-origin Continue: %d", bad.Code)
+	}
+	if bad := post("/oauth/wait/continue", cont, oauthPublic, "cross-site", waitCookie); bad.Code != http.StatusForbidden {
+		t.Fatalf("cross-site Continue: %d", bad.Code)
+	}
+	if bad := post("/oauth/wait/continue", cont, oauthPublic, "same-origin"); bad.Code != http.StatusForbidden {
+		t.Fatalf("Continue without the nonce cookie: %d", bad.Code)
+	}
+	back := post("/oauth/wait/continue", cont, oauthPublic, "same-origin", waitCookie)
+	loc, err := url.Parse(back.Header().Get("Location"))
+	if back.Code != http.StatusSeeOther || err != nil || !strings.HasPrefix(back.Header().Get("Location"), redirect+"?") ||
+		loc.Query().Get("state") != "popup-state" || loc.Query().Get("iss") != oauthPublic || loc.Query().Get("code") == "" {
+		t.Fatalf("Continue: %d %q %s", back.Code, back.Header().Get("Location"), back.Body)
+	}
+	w, tok := e.form("/oauth/token", url.Values{"grant_type": {"authorization_code"}, "code": {loc.Query().Get("code")},
+		"redirect_uri": {redirect}, "code_verifier": {verifier}, "client_id": {clientID}, "resource": {oauthPublic + "/mcp"}})
+	if w.Code != http.StatusOK || tok["access_token"] == nil {
+		t.Fatalf("token: %d %s", w.Code, w.Body)
+	}
+
+	// The return link B got shares the approval: it is used now.
+	if ret := e.do(http.MethodGet, returnURL, nil, nil); ret.Code != http.StatusGone || !strings.Contains(ret.Body.String(), "already used") {
+		t.Fatalf("return link after the waiting page: %d %s", ret.Code, ret.Body)
+	}
+	if code, st := poll(waiter[1], oauthPublic); code != http.StatusOK || st != mcpauth.WaitUsed {
+		t.Fatalf("poll after Continue: %d %q", code, st)
+	}
+}

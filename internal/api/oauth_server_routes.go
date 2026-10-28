@@ -12,7 +12,10 @@ package api
 //     signs in to toolyard). It never redirects there by itself. The
 //     dashboard's session cookie is SameSite=Strict behind HTTPS, so a
 //     cross-site navigation from the client arrives without it; the click
-//     on our own page is a same-site navigation, which carries it.
+//     on our own page is a same-site navigation, which carries it. The page
+//     also waits (oauth_wait_routes.go): after the person allows the app in
+//     another browser, it offers Continue in this window, where the client
+//     started.
 //   - /oauth/consent shows the client, where it will send the person back
 //     to, and lets them choose a nickname and the tool scope. The POST is a
 //     plain form: a nonce cookie (SameSite=Strict, HttpOnly) proves it came
@@ -80,6 +83,9 @@ func (s *Server) MCPOAuthRoutes(mux *http.ServeMux, svc *mcpauth.Service) {
 	mux.HandleFunc("/oauth/consent", h.consent)
 	mux.HandleFunc("/oauth/return/", h.returnLink)
 	mux.HandleFunc("/oauth/copy.js", h.copyScript)
+	mux.HandleFunc("/oauth/wait", h.waitPoll)
+	mux.HandleFunc("/oauth/wait/continue", h.waitContinue)
+	mux.HandleFunc("/oauth/wait.js", h.waitScript)
 	// Connected apps and per-agent scopes (member routes in role_guard.go).
 	mux.HandleFunc("/v1/me/apps", h.listApps)
 	mux.HandleFunc("/v1/me/apps/config", h.appsConfig)
@@ -125,14 +131,29 @@ func (h *mcpOAuthHandlers) authorize(w http.ResponseWriter, r *http.Request) {
 	next := mcpauth.ConsentPath + "?request=" + url.QueryEscape(req.ID)
 	client := htmlEscape(req.Client.DisplayName())
 	minutes := strconv.Itoa(int(mcpauth.RequestTTL / time.Minute))
-	writeOAuthPage(w, http.StatusOK, "Connect "+req.Client.DisplayName(), oauthCopyScriptTag,
+	// The page waits for the answer from another browser (waitSection). Its
+	// Continue form posts to /oauth/wait/continue, which answers with a 303
+	// to the client: browsers apply form-action to that redirect, so the CSP
+	// allows the client's redirect target. The nonce cookie, SameSite=Strict,
+	// proves the form came from this page in this browser.
+	nonce, err := randomNonce()
+	if err != nil {
+		writeConnectPage(w, http.StatusInternalServerError, "Something went wrong", "<h1>Something went wrong</h1><p>Try again in a moment.</p>")
+		return
+	}
+	h.setWaitNonce(w, r, req.ID, nonce)
+	w.Header().Set("Content-Security-Policy", consentCSP(req.RedirectURI, ""))
+	// A form POST under no-referrer sends Origin: null, which the Origin
+	// check refuses; same-origin keeps the page's own origin on its form.
+	w.Header().Set("Referrer-Policy", "same-origin")
+	writeOAuthPage(w, http.StatusOK, "Connect "+req.Client.DisplayName(), oauthCopyScriptTag+oauthWaitScriptTag,
 		`<h1>`+client+` wants to connect to your toolyard</h1>`+
 			`<p class="meta">That name is the app's own claim. The next page shows who the app is, where toolyard sends you back to, and what it asks for.</p>`+
 			`<p><a class="btn primary" href="`+htmlEscape(next)+`">Continue in this browser</a></p>`+
 			`<h2>Copy link for another browser</h2>`+
-			`<p>To answer in another browser or Chrome profile, open this link there and sign in to toolyard. It works for `+minutes+` minutes. `+
-			`After you allow the app, toolyard gives you a link back to this browser, where `+client+` waits.</p>`+
-			oauthCopyField("oauth-consent-link", h.svc.Issuer()+next, "Link for another browser"))
+			`<p>To answer in another browser or Chrome profile, open this link there and sign in to toolyard. It works for `+minutes+` minutes.</p>`+
+			oauthCopyField("oauth-consent-link", h.svc.Issuer()+next, "Link for another browser")+
+			h.waitSection(req, nonce))
 }
 
 // oauthCopyScriptTag loads the copy buttons' script. The pages' CSP
@@ -491,6 +512,9 @@ func (h *mcpOAuthHandlers) renderConsent(w http.ResponseWriter, r *http.Request,
 		`<p class="meta">` + e(pending.RedirectURI) + `</p></div>`)
 	b.WriteString(`<p>It asks to use toolyard's tools (` + e(pending.Scope) + `). It will act as an agent you own, named by the nickname below. ` +
 		`Toolyard records every call it makes, and calls that need approval still come to your Inbox. You can rename it, limit it or revoke it later on the Connected apps page.</p>`)
+	// After an allow, the window where the connection started can finish
+	// it by itself (oauth_wait_routes.go), wherever that window is.
+	b.WriteString(`<p class="meta">Allow it only if you started this connection yourself, just now: after you allow it, the window where it started can finish it.</p>`)
 	if errMsg != "" {
 		b.WriteString(`<p class="err" role="alert">` + e(errMsg) + `</p>`)
 	}

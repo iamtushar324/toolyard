@@ -28,7 +28,9 @@
 // or Chrome profile: /oauth/authorize shows a page with a link to the
 // consent screen instead of redirecting, and the person's yes stores a
 // one-time return ticket (return.go) instead of sending the browser back
-// to the client: the return link mints the code when it is used.
+// to the client: the return link mints the code when it is used. The stop
+// page also waits (wait.go): after a yes in another browser, its Continue
+// uses the same approval in the window where the client started.
 //
 // The consent screen needs the dashboard's session cookie, so its HTTP
 // handlers live in internal/api (oauth_server_routes.go,
@@ -69,6 +71,8 @@ const (
 	AuthorizePath            = "/oauth/authorize"
 	ConsentPath              = "/oauth/consent"
 	ReturnPath               = "/oauth/return/" // the return link's prefix; the ticket is the rest
+	WaitPath                 = "/oauth/wait"    // the waiting stop page asks here whether the person answered
+	WaitContinuePath         = "/oauth/wait/continue"
 	TokenPath                = "/oauth/token"
 	RegisterPath             = "/oauth/register"
 	RevokePath               = "/oauth/revoke"
@@ -144,6 +148,7 @@ const (
 	refreshPrefix = "tyrt_"
 	codePrefix    = "tyoc_"
 	returnPrefix  = "tyrl_"
+	waiterPrefix  = "tywt_"
 	secretPrefix  = "tycs_"
 	clientPrefix  = "mcpc_"
 )
@@ -364,6 +369,13 @@ var (
 	// ErrReturnRevoked: the connection was revoked (or its agent disabled,
 	// or its owner blocked) after the person allowed it.
 	ErrReturnRevoked = errors.New("mcpauth: the connection was revoked")
+	// ErrWaitUnknown: the waiting page's request is unknown, or the waiter
+	// secret is missing or wrong (the same answer, so it tells nothing).
+	ErrWaitUnknown = errors.New("mcpauth: unknown waiting page")
+	// ErrWaitPending: the person has not answered the request yet.
+	ErrWaitPending = errors.New("mcpauth: the app is not allowed yet")
+	// ErrWaitDenied: the person did not allow the app.
+	ErrWaitDenied = errors.New("mcpauth: the person did not allow the app")
 )
 
 // ---- helpers -----------------------------------------------------------------

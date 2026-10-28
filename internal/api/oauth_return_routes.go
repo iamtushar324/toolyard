@@ -18,6 +18,10 @@ package api
 //	      sends the browser to the client's redirect URI with a 303.
 //	HEAD  answers headers only and never uses the ticket.
 //
+// The return link and the waiting stop page of the same request
+// (oauth_wait_routes.go) share one approval: whichever is used first gets
+// the code, and the other is refused as used.
+//
 // No toolyard session is needed (the browser where the client waits may
 // not be signed in to toolyard): the ticket is the capability. It can only
 // send a code to the client's registered redirect URI, and the client's
@@ -112,7 +116,8 @@ func (h *mcpOAuthHandlers) returnConfirm(w http.ResponseWriter, r *http.Request,
 		`<input type="hidden" name="nonce" value="` + e(nonce) + `">` +
 		`<p><button class="primary" type="submit">Continue in this browser</button></p></form>`)
 	b.WriteString(`<h2>Copy return link</h2>` +
-		`<p>Did ` + client + ` start in another browser or Chrome profile? Open this link there instead. ` +
+		`<p>Did ` + client + ` start in another browser or Chrome profile? If ` + client + ` is waiting in its window in the other browser, continue there: it is ready. ` +
+		`Otherwise copy this link into that same window (not a new tab). ` +
 		`It works once, within ` + strconv.Itoa(int(mcpauth.ReturnTTL/time.Minute)) + ` minutes of your approval, and needs no toolyard sign-in.</p>`)
 	b.WriteString(oauthCopyField("oauth-return-link", h.svc.Issuer()+mcpauth.ReturnPath+ticket, "Return link"))
 	writeOAuthPage(w, http.StatusOK, "Return to "+info.Client.DisplayName(), oauthCopyScriptTag, b.String())
@@ -165,7 +170,8 @@ func writeReturnRefusal(w http.ResponseWriter, info *mcpauth.ReturnInfo, err err
 	switch {
 	case errors.Is(err, mcpauth.ErrReturnUsed):
 		writeConnectPage(w, http.StatusGone, "Return link already used",
-			"<h1>This return link was already used</h1><p>A return link works once. If "+htmlEscape(client)+" is still waiting, it did not get the sign-in.</p>"+again)
+			"<h1>This return link was already used</h1><p>A sign-in finishes once: with its return link, or in the window where "+htmlEscape(client)+
+				" waits, whichever comes first. If "+htmlEscape(client)+" is still waiting, it did not get the sign-in.</p>"+again)
 	case errors.Is(err, mcpauth.ErrReturnExpired):
 		writeConnectPage(w, http.StatusGone, "Return link expired",
 			"<h1>This return link expired</h1><p>A return link works for "+strconv.Itoa(int(mcpauth.ReturnTTL/time.Minute))+

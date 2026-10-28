@@ -14,6 +14,11 @@ package mcpauth
 // state and PKCE verifier stay with the client instance that started the
 // request, so a code delivered to another browser's copy of the client is
 // useless. Only the ticket's SHA-256 is stored.
+//
+// The ticket also names the authorization request it answers, so the
+// waiting stop page of that request (wait.go) can use the same approval:
+// whichever of the two is used first gets the code (redeemTicket), and the
+// other is refused as used.
 
 import (
 	"context"
@@ -43,19 +48,19 @@ type ReturnInfo struct {
 	ExpiresAt int64
 }
 
-// insertReturnTicketTx stores a new return ticket for an approved request
-// in the caller's transaction and returns the raw ticket. consentedAt is
-// the consent's time: the ticket expires ReturnTTL after it.
-func (s *Service) insertReturnTicketTx(ctx context.Context, q store.Querier, grantID, userID string, req *claimedRequest, consentedAt int64) (string, error) {
+// insertReturnTicketTx stores a new return ticket for approved request
+// requestID in the caller's transaction and returns the raw ticket.
+// consentedAt is the consent's time: the ticket expires ReturnTTL after it.
+func (s *Service) insertReturnTicketTx(ctx context.Context, q store.Querier, grantID, userID, requestID string, req *claimedRequest, consentedAt int64) (string, error) {
 	ticket, err := newSecret(returnPrefix)
 	if err != nil {
 		return "", err
 	}
 	_, err = q.ExecContext(ctx,
-		`INSERT INTO mcp_oauth_return_tickets(ticket_hash, grant_id, user_id, client_id, redirect_uri, state, code_challenge, resource, scope, created_at, expires_at)
-         VALUES(?,?,?,?,?,?,?,?,?,?,?)`,
+		`INSERT INTO mcp_oauth_return_tickets(ticket_hash, grant_id, user_id, client_id, redirect_uri, state, code_challenge, resource, scope, created_at, expires_at, request_id)
+         VALUES(?,?,?,?,?,?,?,?,?,?,?,?)`,
 		hashSecret(ticket), grantID, userID, req.clientID, req.redirect, req.state, req.challenge, req.resource, req.scope,
-		consentedAt, consentedAt+ReturnTTL.Milliseconds())
+		consentedAt, consentedAt+ReturnTTL.Milliseconds(), requestID)
 	return ticket, err
 }
 
@@ -123,7 +128,14 @@ func (s *Service) RedeemReturn(ctx context.Context, ticket string) (string, erro
 	if !ValidReturnTicket(ticket) {
 		return "", ErrReturnUnknown
 	}
-	hash := hashSecret(ticket)
+	return s.redeemTicket(ctx, hashSecret(ticket))
+}
+
+// redeemTicket uses the return ticket whose hash is hash, once, for the
+// return link (RedeemReturn) and the waiting stop page (RedeemWait) alike:
+// the claim (UPDATE ... WHERE used_at IS NULL) lets exactly one of every
+// use racing get the code.
+func (s *Service) redeemTicket(ctx context.Context, hash string) (string, error) {
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return "", err
