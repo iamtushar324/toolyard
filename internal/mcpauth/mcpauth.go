@@ -376,6 +376,11 @@ var (
 	ErrWaitPending = errors.New("mcpauth: the app is not allowed yet")
 	// ErrWaitDenied: the person did not allow the app.
 	ErrWaitDenied = errors.New("mcpauth: the person did not allow the app")
+	// ErrCodeWrong: an allow from another browser came without the right
+	// confirmation code (code.go); the attempt was counted.
+	ErrCodeWrong = errors.New("mcpauth: that code is not right")
+	// ErrCodeLocked: too many wrong confirmation codes ended the request.
+	ErrCodeLocked = errors.New("mcpauth: too many wrong codes ended the sign-in")
 )
 
 // ---- helpers -----------------------------------------------------------------

@@ -27,6 +27,8 @@ type oauthFlowEnv struct {
 	clock               time.Time
 	clientID            string
 	verifier, challenge string
+	// codes are the confirmation codes the stop pages showed, by request.
+	codes map[string]string
 }
 
 const (
@@ -36,7 +38,7 @@ const (
 
 func newOAuthFlowEnv(t *testing.T) *oauthFlowEnv {
 	t.Helper()
-	f := &oauthFlowEnv{accessTestEnv: newAccessTestServer(t), t: t, clock: time.Now()}
+	f := &oauthFlowEnv{accessTestEnv: newAccessTestServer(t), t: t, clock: time.Now(), codes: map[string]string{}}
 	f.svc = mcpauth.New(mcpauth.Options{DB: f.db, PublicURL: flowPublic, Access: f.access, Now: func() time.Time { return f.clock }})
 	f.mux = http.NewServeMux()
 	f.srv.MCPOAuthRoutes(f.mux, f.svc)
@@ -85,23 +87,31 @@ func (f *oauthFlowEnv) authorizeURL() string {
 var (
 	stopConsentRE = regexp.MustCompile(`href="/oauth/consent\?request=([A-Za-z0-9_-]{43})"`)
 	formNonceRE   = regexp.MustCompile(`name="nonce" value="([^"]+)"`)
+	stopCodeRE    = regexp.MustCompile(`class="oauth-code">([2-9A-HJKMNP-Z]{3}-[2-9A-HJKMNP-Z]{3})</strong>`)
 )
 
-// pending runs authorize and returns the request id from the stop page.
+// pending runs authorize and returns the request id from the stop page,
+// keeping its confirmation code in f.codes.
 func (f *oauthFlowEnv) pending() string {
 	f.t.Helper()
 	page := f.do(http.MethodGet, f.authorizeURL(), nil, nil)
 	m := stopConsentRE.FindStringSubmatch(page.Body.String())
-	if page.Code != http.StatusOK || m == nil {
+	code := stopCodeRE.FindStringSubmatch(page.Body.String())
+	if page.Code != http.StatusOK || m == nil || code == nil {
 		f.t.Fatalf("authorize: %d %s", page.Code, page.Body)
 	}
+	f.codes[m[1]] = code[1]
 	return m[1]
 }
 
-// answer posts the consent form for request id as the admin and returns
-// the response.
+// answer posts the consent form for request id as the admin, from a
+// browser that did not render the stop page (it types the stop page's
+// code on an allow), and returns the response.
 func (f *oauthFlowEnv) answer(id string, form url.Values) *httptest.ResponseRecorder {
 	f.t.Helper()
+	if form.Get("verdict") == "allow" && !form.Has("code") && f.codes[id] != "" {
+		form.Set("code", f.codes[id])
+	}
 	consentURL := mcpauth.ConsentPath + "?request=" + url.QueryEscape(id)
 	session := f.cookieFor(f.t, f.admin.ID)
 	page := f.do(http.MethodGet, consentURL, nil, nil, session)

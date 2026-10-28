@@ -14,12 +14,14 @@ authorizations.
 The waiting page (the window where the client started continues by itself):
 
   - /oauth/authorize stops on a page of ours in A (no redirect), with
-    "Continue in this browser", a copyable consent link, and a waiter secret
-    in the page body only (never in the copied link); A keeps its cookies;
+    "Continue in this browser", a copyable consent link, a confirmation code
+    (XXX-XXX) and a waiter secret in the page body only (never in the copied
+    link); A keeps its cookies;
   - A's page asks POST /oauth/wait: pending; a wrong waiter gets the answer
     of an unknown request;
-  - B opens the copied consent link and allows the app; A's page then sees
-    approved;
+  - B opens the copied consent link: it asks for the code; B's Allow
+    without the code is refused; B types A's code and allows; A's page then
+    sees approved;
   - A's Continue (POST /oauth/wait/continue with the page's nonce) gets a
     303 to the client's redirect URI with code, state and iss; without the
     nonce cookie it is refused;
@@ -28,8 +30,8 @@ The waiting page (the window where the client started continues by itself):
 
 The return link (a separate authorization):
 
-  - B allows the app and lands on a return page with a one-time return link
-    (no redirect to the client);
+  - B types A's code, allows the app and lands on a return page with a
+    one-time return link (no redirect to the client);
   - A opens the return link (GET changes nothing), presses Continue (POST
     with the page's nonce), and only then gets a 303 to the client's
     redirect URI with code, state and iss;
@@ -45,8 +47,8 @@ Inputs (environment):
   ADMIN_FILE  JSON {"username", "password"} instead of the Secret
   REPORT      path of the JSON report (default /tmp/oauth-handoff-e2e.json)
 
-Secrets (password, waiter, nonces, codes, tokens) never appear in argv or
-output.
+Secrets (password, waiter, confirmation code, nonces, codes, tokens) never
+appear in argv or output.
 """
 
 import base64
@@ -118,13 +120,27 @@ def authorize(sess, client_id, state):
     return verifier, stop, (html.unescape(m.group(1)) if m else None)
 
 
-def allow_in_b(b, consent_url, nickname):
-    """B opens the copied consent link and allows the app; returns the
-    absolute return link the consent answered with."""
+def code_of(body):
+    m = re.search(r'class="oauth-code">([2-9A-HJKMNP-Z]{3}-[2-9A-HJKMNP-Z]{3})</strong>', body)
+    return m.group(1) if m else None
+
+
+def allow_in_b(b, consent_url, nickname, code, refused_first=False):
+    """B opens the copied consent link and allows the app with the code A's
+    stop page shows (refused_first: first checks that Allow without the
+    code is refused); returns the absolute return link the consent answered
+    with."""
     page = b.get(consent_url, timeout=30)
     nonce = nonce_of(page.text)
-    check("profile B sees the consent page for the copied link", page.status_code == 200 and nonce, page.status_code)
-    done = post_form(b, consent_url, {"nonce": nonce, "verdict": "allow", "nickname": nickname, "scope_mode": "all"})
+    check("profile B sees the consent page for the copied link, which asks for the code",
+          page.status_code == 200 and nonce and 'name="code"' in page.text, page.status_code)
+    if refused_first:
+        bad = post_form(b, consent_url, {"nonce": nonce, "verdict": "allow", "nickname": nickname, "scope_mode": "all"})
+        check("B's Allow without the code is refused", bad.status_code == 400 and "That code is not right" in bad.text
+              and "Location" not in bad.headers, bad.status_code)
+        page = b.get(consent_url, timeout=30)
+        nonce = nonce_of(page.text)
+    done = post_form(b, consent_url, {"nonce": nonce, "verdict": "allow", "nickname": nickname, "scope_mode": "all", "code": code or ""})
     ret_url = done.headers.get("Location", "")
     if ret_url.startswith("/"):
         ret_url = BASE + ret_url
@@ -178,11 +194,14 @@ def main():
     if not wconsent:
         return finish(t0)
     rid, waiter, wnonce = field_of(wstop.text, "request"), field_of(wstop.text, "waiter"), nonce_of(wstop.text)
+    wcode = code_of(wstop.text)
     has_cookie = any("toolyard_oauth_wait_" in c.name for c in a.cookies)
-    check("the stop page waits, with its waiter secret in the page body only (not in the copied link)",
-          rid and waiter and wnonce and has_cookie and waiter not in wconsent and wstop.text.count(waiter) == 1
+    in_cookies = wcode and any(wcode.replace("-", "") in (c.value or "") for c in a.cookies)
+    check("the stop page waits and shows a code, with its secrets in the page body only (not in the copied link or a cookie)",
+          rid and waiter and wnonce and wcode and has_cookie and waiter not in wconsent and wstop.text.count(waiter) == 1
+          and wcode.replace("-", "") not in wconsent and not in_cookies
           and "Keep this window open" in wstop.text and "/oauth/wait.js" in wstop.text,
-          {"request": bool(rid), "waiter": bool(waiter), "nonce_cookie": has_cookie})
+          {"request": bool(rid), "waiter": bool(waiter), "code": bool(wcode), "nonce_cookie": has_cookie})
     if not (rid and waiter and wnonce):
         return finish(t0)
     st = poll(a, rid, waiter)
@@ -191,7 +210,7 @@ def main():
     check("a wrong waiter gets the same answer as an unknown request", wrong == unknown == (200, "expired"),
           {"wrong": wrong, "unknown": unknown})
 
-    wret = allow_in_b(b, wconsent, "Handoff wait test")
+    wret = allow_in_b(b, wconsent, "Handoff wait test", wcode, refused_first=True)
     shown = b.get(wret, timeout=30)
     check("B's return page says the waiting window is ready", shown.status_code == 200 and "continue there: it is ready" in shown.text,
           shown.status_code)
@@ -222,7 +241,7 @@ def main():
     if not consent_url:
         return finish(t0)
     rid2, waiter2, wnonce2 = field_of(stop.text, "request"), field_of(stop.text, "waiter"), nonce_of(stop.text)
-    ret_url = allow_in_b(b, consent_url, "Handoff test")
+    ret_url = allow_in_b(b, consent_url, "Handoff test", code_of(stop.text))
     shown = b.get(ret_url, timeout=30)
     m = re.search(r'value="(' + re.escape(BASE) + r'/oauth/return/[^"]+)"', shown.text)
     check("profile B sees a one-time return link to copy", shown.status_code == 200 and m and "Copy return link" in shown.text,

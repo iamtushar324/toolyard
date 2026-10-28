@@ -336,6 +336,14 @@ code { background: var(--bg); padding: 1px 4px; border-radius: 3px; font-size: 1
 }
 .copy-btn:hover { border-color: var(--accent); color: var(--accent); }
 .copy-btn.copied { color: var(--accent); border-color: var(--accent); }
+/* The OAuth stop page's confirmation code (oauth_server_routes.go). */
+.oauth-code-line { font-size: 1.15em; }
+.oauth-code {
+  font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+  font-size: 2em;
+  letter-spacing: 0.08em;
+  white-space: nowrap;
+}
 .tabs {
   display: flex;
   flex-wrap: wrap;

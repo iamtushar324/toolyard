@@ -25,16 +25,20 @@ package api
 //
 // Only the stop page carries the waiter secret, in its body (a hidden form
 // field), never in a link: the consent link the person copies has the
-// request id alone. The secret travels in POST bodies only, so it stays out
-// of access logs. Without JavaScript the page works as before: copy the
-// consent link, and the return page in the other browser gives the return
-// link. The routes are outside /v1, so HardenAPI and RoleGuard do not
+// request id alone. The stop page's cookie (SameSite=Strict, its value
+// bound to the request by a MAC under the session key) also tells the
+// consent screen that this browser rendered the stop page, so it needs no
+// confirmation code there (mcpauth/code.go). The secret travels in POST
+// bodies only, so it stays out of access logs. Without JavaScript the page
+// works as before: copy the consent link, and the return page in the other
+// browser gives the return link. The routes are outside /v1, so HardenAPI and RoleGuard do not
 // apply; the Origin check of EnforceOriginOnMutations does, and per-address
 // limits bound the tries.
 
 import (
 	"crypto/hmac"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -48,8 +52,17 @@ import (
 	"github.com/tusharbhardwaj/toolyard/internal/mcpauth"
 )
 
-// waitNoncePrefix names the waiting page's nonce cookies, one per request.
+// waitNoncePrefix names the stop page's nonce cookies, one per request.
 const waitNoncePrefix = "toolyard_oauth_wait_"
+
+// waitCookiePath is the stop page cookie's path (without HTTPS; behind
+// HTTPS it is __Host- with path /): it reaches /oauth/wait/continue and
+// /oauth/consent.
+const waitCookiePath = "/oauth/"
+
+// stopPageMACLabel separates the stop page nonce's MAC from other uses of
+// the session key.
+const stopPageMACLabel = "toolyard.oauth-stop-page.v1|"
 
 // The page asks every waitPollEvery, for at most waitPollFor (the request's
 // lifetime and a margin: after that the server answers expired anyway).
@@ -69,11 +82,41 @@ func waitNonceName(requestID string) string {
 	return waitNoncePrefix + hex.EncodeToString(sum[:8])
 }
 
+// stopPageNonce is a fresh nonce for request requestID's stop page:
+// random, with a MAC under the session key that binds it to the request.
+func (s *Server) stopPageNonce(requestID string) (string, error) {
+	n, err := randomNonce()
+	if err != nil {
+		return "", err
+	}
+	return n + "." + s.stopPageMAC(requestID, n), nil
+}
+
+func (s *Server) stopPageMAC(requestID, n string) string {
+	m := hmac.New(sha256.New, s.sessionKey)
+	m.Write([]byte(stopPageMACLabel + requestID + "|" + n))
+	return base64.RawURLEncoding.EncodeToString(m.Sum(nil))
+}
+
+// renderedStopPage reports whether this browser rendered request
+// requestID's stop page: it sends that page's cookie (SameSite=Strict, so
+// only on a same-site request) with a value whose MAC binds it to this
+// request. The consent screen then needs no confirmation code.
+func (h *mcpOAuthHandlers) renderedStopPage(r *http.Request, requestID string) bool {
+	name, _ := h.s.hostCookie(r, waitNonceName(requestID), waitCookiePath)
+	c, err := r.Cookie(name)
+	if err != nil {
+		return false
+	}
+	n, mac, ok := strings.Cut(c.Value, ".")
+	return ok && n != "" && hmac.Equal([]byte(mac), []byte(h.s.stopPageMAC(requestID, n)))
+}
+
 // setWaitNonce sets the stop page's nonce cookie for requestID. It lives
 // as long as the request and its approval can (RequestTTL + ReturnTTL).
 // Behind HTTPS it is __Host- (see hostCookie).
 func (h *mcpOAuthHandlers) setWaitNonce(w http.ResponseWriter, r *http.Request, requestID, nonce string) {
-	name, path := h.s.hostCookie(r, waitNonceName(requestID), mcpauth.WaitPath)
+	name, path := h.s.hostCookie(r, waitNonceName(requestID), waitCookiePath)
 	http.SetCookie(w, &http.Cookie{Name: name, Value: nonce, Path: path, HttpOnly: true,
 		Secure: h.s.security.IsBehindHTTPS(r), SameSite: http.SameSiteStrictMode,
 		MaxAge: int((mcpauth.RequestTTL + mcpauth.ReturnTTL) / time.Second)})
@@ -106,7 +149,7 @@ func (h *mcpOAuthHandlers) waitSection(req *mcpauth.AuthorizeRequest, nonce stri
 		`<p>Nothing was connected. Tell ` + client + ` so it stops waiting: toolyard sends you back to <strong>` + host + `</strong>.</p>` +
 		`<p><a class="btn primary" href="` + e(h.svc.DenyLocation(req)) + `">Continue</a></p></div>`)
 	b.WriteString(`<div data-wait-state="expired" hidden><h2>This sign-in expired</h2>` +
-		`<p>It was not finished within ` + strconv.Itoa(int(mcpauth.RequestTTL/time.Minute)) + ` minutes, or a newer approval replaced it.</p>` + again + `</div>`)
+		`<p>It was not finished within ` + strconv.Itoa(int(mcpauth.RequestTTL/time.Minute)) + ` minutes, a newer approval replaced it, or a wrong code was typed too often.</p>` + again + `</div>`)
 	b.WriteString(`<div data-wait-state="used" hidden><h2>This sign-in was already finished</h2>` +
 		`<p>Its return link was used, in this browser or another. If ` + client + ` is still waiting, it did not get the sign-in.</p>` + again + `</div>`)
 	b.WriteString(`<noscript><p>After you allow the app, toolyard gives you a link back to this browser, where ` + client + ` waits.</p></noscript>`)
@@ -197,7 +240,7 @@ func (h *mcpOAuthHandlers) waitContinue(w http.ResponseWriter, r *http.Request) 
 		writeWaitRefusal(w, nil, mcpauth.ErrWaitUnknown)
 		return
 	}
-	name, path := h.s.hostCookie(r, waitNonceName(id), mcpauth.WaitPath)
+	name, path := h.s.hostCookie(r, waitNonceName(id), waitCookiePath)
 	cookie, err := r.Cookie(name)
 	if err != nil || nonce == "" || !hmac.Equal([]byte(cookie.Value), []byte(nonce)) {
 		writeConnectPage(w, http.StatusForbidden, "Start again",

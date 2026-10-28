@@ -124,7 +124,7 @@ func TestWaitRevealsNothingWithoutTheWaiter(t *testing.T) {
 	if info.Client == nil || info.Client.ID != f.clientID {
 		t.Fatalf("the right waiter does not learn its app: %+v", info)
 	}
-	if _, err := f.svc.Approve(ctx, req.ID, f.user, Consent{Nickname: "Waiting"}); err != nil {
+	if _, err := f.svc.Approve(ctx, req.ID, f.user, Consent{SameBrowser: true, Nickname: "Waiting"}); err != nil {
 		t.Fatal(err)
 	}
 	check("approved")
@@ -148,7 +148,7 @@ func TestWaitingPageContinuesOnce(t *testing.T) {
 	}
 
 	consentAt := f.clock.UnixMilli()
-	ticket, err := f.svc.Approve(ctx, req.ID, f.user, Consent{Nickname: "Popup"})
+	ticket, err := f.svc.Approve(ctx, req.ID, f.user, Consent{SameBrowser: true, Nickname: "Popup"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -209,7 +209,7 @@ func TestReturnLinkFirstRefusesTheWaitingPage(t *testing.T) {
 	f := newWaitFixture(t)
 	ctx := context.Background()
 	req := f.begin(t)
-	ticket, err := f.svc.Approve(ctx, req.ID, f.user, Consent{Nickname: "Tab"})
+	ticket, err := f.svc.Approve(ctx, req.ID, f.user, Consent{SameBrowser: true, Nickname: "Tab"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -260,7 +260,7 @@ func TestWaitAfterDenyExpiryOrRevocation(t *testing.T) {
 	t.Run("approval expired", func(t *testing.T) {
 		f := newWaitFixture(t)
 		req := f.begin(t)
-		if _, err := f.svc.Approve(ctx, req.ID, f.user, Consent{Nickname: "Slow"}); err != nil {
+		if _, err := f.svc.Approve(ctx, req.ID, f.user, Consent{SameBrowser: true, Nickname: "Slow"}); err != nil {
 			t.Fatal(err)
 		}
 		f.clock = f.clock.Add(ReturnTTL + time.Second)
@@ -275,10 +275,10 @@ func TestWaitAfterDenyExpiryOrRevocation(t *testing.T) {
 	t.Run("replaced", func(t *testing.T) {
 		f := newWaitFixture(t)
 		first, second := f.begin(t), f.begin(t)
-		if _, err := f.svc.Approve(ctx, first.ID, f.user, Consent{Nickname: "First"}); err != nil {
+		if _, err := f.svc.Approve(ctx, first.ID, f.user, Consent{SameBrowser: true, Nickname: "First"}); err != nil {
 			t.Fatal(err)
 		}
-		if _, err := f.svc.Approve(ctx, second.ID, f.user, Consent{Nickname: "Second"}); err != nil {
+		if _, err := f.svc.Approve(ctx, second.ID, f.user, Consent{SameBrowser: true, Nickname: "Second"}); err != nil {
 			t.Fatal(err)
 		}
 		f.wantStatus(t, first, WaitExpired)
@@ -293,7 +293,7 @@ func TestWaitAfterDenyExpiryOrRevocation(t *testing.T) {
 	t.Run("revoked", func(t *testing.T) {
 		f := newWaitFixture(t)
 		req := f.begin(t)
-		if _, err := f.svc.Approve(ctx, req.ID, f.user, Consent{Nickname: "Gone"}); err != nil {
+		if _, err := f.svc.Approve(ctx, req.ID, f.user, Consent{SameBrowser: true, Nickname: "Gone"}); err != nil {
 			t.Fatal(err)
 		}
 		apps, err := f.svc.ListApps(ctx, f.user.ID)
@@ -324,7 +324,7 @@ func TestRacingWaitingPageAndReturnLinkMintOneCode(t *testing.T) {
 	f := newWaitFixture(t)
 	ctx := context.Background()
 	req := f.begin(t)
-	ticket, err := f.svc.Approve(ctx, req.ID, f.user, Consent{Nickname: "Race"})
+	ticket, err := f.svc.Approve(ctx, req.ID, f.user, Consent{SameBrowser: true, Nickname: "Race"})
 	if err != nil {
 		t.Fatal(err)
 	}

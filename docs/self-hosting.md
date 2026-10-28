@@ -207,8 +207,9 @@ another profile):
    browser**: the consent step's address,
    `<public-url>/oauth/consent?request=<id>`. It works in any browser where
    the person signs in to toolyard, for the 10 minutes the request lives.
-   Under the link the page says "Keep this window open: after you allow the
-   app in the other browser, this window continues by itself."
+   Under the link the page shows the confirmation code to type there (see
+   "Confirmation code") and says "Keep this window open: after you allow
+   the app in the other browser, this window continues by itself."
 2. The stop page waits. Its script (`/oauth/wait.js`) asks
    `POST /oauth/wait` every 2 seconds, for up to 10 minutes, with the
    request id and the page's **waiter secret**, and gets `pending`,
@@ -260,11 +261,27 @@ bodies (never in a URL or an access log), only its SHA-256 is stored
 (`mcp_oauth_requests.waiter_hash`, with the answer in `verdict`), and a
 missing or wrong waiter gets the same answer as an unknown request.
 `/oauth/wait` allows 1200 questions per client IP per 10 minutes (four
-waiting pages), `/oauth/wait/continue` 60. Because the window where a
-connection started can finish it after an allow, the consent screen says
-to allow only a connection the person started themselves: someone who
-sends a person a consent link of their own and gets an allow would get
-the connection in their window.
+waiting pages), `/oauth/wait/continue` 60.
+
+**Confirmation code.** The window where a connection started can finish it
+after an allow, so someone who sends a person a consent link of their own
+would get the connection if that person only clicked **Allow**. The stop
+page therefore shows a code, "Your code: K7P-2QX. Type it on the consent
+page in the other browser." (six symbols without `0`, `O`, `1`, `I` and
+`L`). The consent screen asks for it, in the field "Code from the window
+where you started", only in a browser that did not render that stop page:
+the stop page's `SameSite=Strict` cookie, whose value carries a MAC under
+the session key that binds it to the request, marks the same browser,
+which needs no code. An allow from another browser needs the right code
+(compared in constant time); it guards every such approval, so both the
+waiting page and the return link. A wrong code shows "That code is not
+right" and counts an attempt; the fifth wrong code ends the request
+(`verdict` `locked`, an `mcp_oauth.code_locked` audit row) and the person
+starts again from the app. Deny never needs the code. Only an HMAC of the
+code keyed with the request id is stored (`mcp_oauth_requests.code_hash`,
+with `code_attempts`); the code is never in a link, a cookie or a log.
+Requests stored before this version have no code and are allowed as
+before; they live 10 minutes.
 
 **Security notes.**
 

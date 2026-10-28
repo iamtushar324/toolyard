@@ -35,17 +35,20 @@ const (
 	// WaitDenied: the person did not allow the app.
 	WaitDenied = "denied"
 	// WaitExpired: the request or its approval expired, a newer approval
-	// replaced it, or the request is unknown (or the waiter is wrong).
+	// replaced it, too many wrong confirmation codes ended it, or the
+	// request is unknown (or the waiter is wrong).
 	WaitExpired = "expired"
 	// WaitUsed: the approval was used, by its return link or by the
 	// waiting page.
 	WaitUsed = "used"
 )
 
-// Verdicts claimRequest records in mcp_oauth_requests.verdict.
+// Verdicts in mcp_oauth_requests.verdict: claimRequest records allow or
+// deny; checkCode records locked when too many wrong codes ended it.
 const (
-	verdictAllow = "allow"
-	verdictDeny  = "deny"
+	verdictAllow  = "allow"
+	verdictDeny   = "deny"
+	verdictLocked = "locked"
 )
 
 // waiterRE: waiterPrefix and 32 random bytes in base64url.
@@ -104,6 +107,8 @@ func (s *Service) waitStateOf(ctx context.Context, requestID, waiter string) (*w
 		st.status = WaitExpired
 	case verdict.String == verdictDeny:
 		st.status = WaitDenied
+	case verdict.String == verdictLocked:
+		st.status = WaitExpired // too many wrong codes ended it
 	case verdict.String != verdictAllow:
 		// Answered by an older binary, which records no verdict and links
 		// no return ticket to the request: this page cannot finish it, so

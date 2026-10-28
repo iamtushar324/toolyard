@@ -52,6 +52,15 @@ type AuthorizeRequest struct {
 	// BeginAuthorize sets it, once: only its SHA-256 is stored, and
 	// PendingRequest (the consent screen, in any browser) never has it.
 	Waiter string
+	// Code is the raw confirmation code the stop page shows (code.go; show
+	// it with FormatCode). Only BeginAuthorize sets it, once: only its HMAC
+	// is stored.
+	Code string
+	// HasCode: an allow from another browser needs the confirmation code.
+	// False only for a request stored before codes existed.
+	HasCode bool
+	// codeHash is the stored HMAC of the code (PendingRequest).
+	codeHash string
 }
 
 // AuthorizeError is a failed authorization request. With RedirectURI set
@@ -207,18 +216,24 @@ func (s *Service) BeginAuthorize(ctx context.Context, q url.Values, ip string) (
 	if err != nil {
 		return nil, show(http.StatusInternalServerError, "server_error", "Toolyard could not start the sign-in. Try again.")
 	}
-	// The stop page's waiter secret: only that page gets it (wait.go).
+	// The stop page's waiter secret (wait.go) and confirmation code
+	// (code.go): only that page gets them.
 	waiter, err := newSecret(waiterPrefix)
+	if err != nil {
+		return nil, show(http.StatusInternalServerError, "server_error", "Toolyard could not start the sign-in. Try again.")
+	}
+	code, err := newConfirmCode()
 	if err != nil {
 		return nil, show(http.StatusInternalServerError, "server_error", "Toolyard could not start the sign-in. Try again.")
 	}
 	now := s.now()
 	req := &AuthorizeRequest{ID: id, Client: client, RedirectURI: redirect, State: state, CodeChallenge: challenge,
-		Resource: s.Resource(), Scope: grantedScope(q.Get("scope")), ExpiresAt: now.Add(RequestTTL).UnixMilli(), Waiter: waiter}
+		Resource: s.Resource(), Scope: grantedScope(q.Get("scope")), ExpiresAt: now.Add(RequestTTL).UnixMilli(), Waiter: waiter,
+		Code: code, HasCode: true, codeHash: codeHash(id, code)}
 	if _, err := s.db.ExecContext(ctx,
-		`INSERT INTO mcp_oauth_requests(id, client_id, redirect_uri, state, code_challenge, resource, scope, created_at, expires_at, waiter_hash)
-         VALUES(?,?,?,?,?,?,?,?,?,?)`,
-		req.ID, client.ID, redirect, state, challenge, req.Resource, req.Scope, now.UnixMilli(), req.ExpiresAt, hashSecret(waiter)); err != nil {
+		`INSERT INTO mcp_oauth_requests(id, client_id, redirect_uri, state, code_challenge, resource, scope, created_at, expires_at, waiter_hash, code_hash)
+         VALUES(?,?,?,?,?,?,?,?,?,?,?)`,
+		req.ID, client.ID, redirect, state, challenge, req.Resource, req.Scope, now.UnixMilli(), req.ExpiresAt, hashSecret(waiter), req.codeHash); err != nil {
 		return nil, show(http.StatusInternalServerError, "server_error", "Toolyard could not start the sign-in. Try again.")
 	}
 	return req, nil
@@ -245,16 +260,18 @@ func (s *Service) PendingRequest(ctx context.Context, id string) (*AuthorizeRequ
 	}
 	var r AuthorizeRequest
 	var clientID string
+	var code sql.NullString
 	err := s.db.QueryRowContext(ctx,
-		`SELECT id, client_id, redirect_uri, state, code_challenge, resource, scope, expires_at
+		`SELECT id, client_id, redirect_uri, state, code_challenge, resource, scope, expires_at, code_hash
          FROM mcp_oauth_requests WHERE id = ? AND used_at IS NULL AND expires_at > ?`, id, s.now().UnixMilli()).
-		Scan(&r.ID, &clientID, &r.RedirectURI, &r.State, &r.CodeChallenge, &r.Resource, &r.Scope, &r.ExpiresAt)
+		Scan(&r.ID, &clientID, &r.RedirectURI, &r.State, &r.CodeChallenge, &r.Resource, &r.Scope, &r.ExpiresAt, &code)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrRequestNotFound
 	}
 	if err != nil {
 		return nil, err
 	}
+	r.codeHash, r.HasCode = code.String, code.Valid && code.String != ""
 	c, cerr := s.Client(ctx, clientID)
 	if cerr != nil {
 		return nil, cerr
@@ -307,6 +324,12 @@ type Consent struct {
 	// client shares one client_id across installs, so two devices of one
 	// person share the grant and must not sign each other out.
 	SignOutOthers bool
+	// SameBrowser: the answering browser rendered this request's stop page
+	// (the HTTP layer proves it with the stop page's cookie), so no
+	// confirmation code is needed. Otherwise an allow needs Code (code.go).
+	SameBrowser bool
+	// Code is the confirmation code the person typed.
+	Code string
 }
 
 // DefaultNickname turns a client name into a valid agent name.
@@ -383,6 +406,14 @@ func (s *Service) Approve(ctx context.Context, id string, u *identity.User, c Co
 	// the transaction holds the database.
 	pending, err := s.PendingRequest(ctx, id)
 	if err != nil {
+		return "", err
+	}
+	// From another browser, the confirmation code first (code.go).
+	if err := s.checkCode(ctx, pending, c); err != nil {
+		if errors.Is(err, ErrCodeLocked) {
+			_ = s.auditTx(ctx, s.db, auditRow{event: "mcp_oauth.code_locked", owner: u, decider: u, client: pending.Client,
+				details: map[string]any{"redirect_host": RedirectHost(pending.RedirectURI), "attempts": MaxCodeAttempts}})
+		}
 		return "", err
 	}
 	// Coming back from a revoke, a deleted or a disabled agent: cancel

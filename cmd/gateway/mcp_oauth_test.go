@@ -237,6 +237,7 @@ func (e *oauthEnv) form(path string, v url.Values) (*httptest.ResponseRecorder, 
 var (
 	nonceRE    = regexp.MustCompile(`name="nonce" value="([^"]+)"`)
 	stopLinkRE = regexp.MustCompile(`href="(/oauth/consent\?request=[A-Za-z0-9_-]{43})"`)
+	stopCodeRE = regexp.MustCompile(`class="oauth-code">([2-9A-HJKMNP-Z]{3}-[2-9A-HJKMNP-Z]{3})</strong>`)
 	denyLinkRE = regexp.MustCompile(`<a class="btn primary" href="([^"]+)">Continue in this browser</a>`)
 )
 
@@ -251,16 +252,17 @@ func (e *oauthEnv) consent(clientID, redirect, challenge string, form url.Values
 	// Without the session cookie (a cross-site navigation under SameSite=
 	// Strict) and with it, authorize stops on a page of ours: continue to
 	// the consent step here, or copy its link into another browser.
-	var consentURL string
+	var consentURL, code string
 	for _, cookies := range [][]*http.Cookie{nil, e.session} {
 		stop := e.do(http.MethodGet, "/oauth/authorize?"+q.Encode(), nil, nil, cookies...)
 		body := stop.Body.String()
 		m := stopLinkRE.FindStringSubmatch(body)
-		if stop.Code != http.StatusOK || stop.Header().Get("Location") != "" || m == nil || strings.Contains(body, `http-equiv="refresh"`) ||
+		c := stopCodeRE.FindStringSubmatch(body)
+		if stop.Code != http.StatusOK || stop.Header().Get("Location") != "" || m == nil || c == nil || strings.Contains(body, `http-equiv="refresh"`) ||
 			!strings.Contains(body, "Continue in this browser") || !strings.Contains(body, `value="`+oauthPublic+m[1]+`"`) {
 			e.t.Fatalf("authorize stop page (session cookies: %d): %d %s", len(cookies), stop.Code, body)
 		}
-		consentURL = m[1]
+		consentURL, code = m[1], c[1]
 	}
 	if anon := e.do(http.MethodGet, consentURL, nil, nil); anon.Code != http.StatusUnauthorized || !strings.Contains(anon.Body.String(), "/login?oauth_request=") {
 		e.t.Fatalf("consent without a session: %d %s", anon.Code, anon.Body)
@@ -290,6 +292,10 @@ func (e *oauthEnv) consent(clientID, redirect, challenge string, form url.Values
 	if !strings.Contains(body, `name="may_manage" value="1">`) {
 		e.t.Fatal("the admin's consent page lacks the manage switch, or it is on by default")
 	}
+	// This browser did not render the stop page: it is asked for the code.
+	if !strings.Contains(body, `name="code" required`) {
+		e.t.Fatal("the consent page in another browser does not ask for the code")
+	}
 	m := nonceRE.FindStringSubmatch(page.Body.String())
 	var nonceCookie *http.Cookie
 	for _, c := range page.Result().Cookies() {
@@ -305,6 +311,10 @@ func (e *oauthEnv) consent(clientID, redirect, challenge string, form url.Values
 			"Content-Type": "application/x-www-form-urlencoded", "Origin": origin, "Sec-Fetch-Site": site}, cookies...)
 	}
 	form.Set("nonce", m[1])
+	// Deny never needs the code; allow from this browser does.
+	if form.Get("verdict") == "allow" {
+		form.Set("code", code)
+	}
 	if bad := post(consentURL, form, "https://evil.example", "same-origin", append(e.session, nonceCookie)...); bad.Code != http.StatusForbidden {
 		e.t.Fatalf("cross-origin consent: %d", bad.Code)
 	}
@@ -713,13 +723,14 @@ func TestMCPOAuthWaitingStopPageFinishesWhereTheClientStarted(t *testing.T) {
 	link := stopLinkRE.FindStringSubmatch(body)
 	waiter := regexp.MustCompile(`name="waiter" value="([^"]+)"`).FindStringSubmatch(body)
 	nonce := nonceRE.FindStringSubmatch(body)
+	code := stopCodeRE.FindStringSubmatch(body)
 	var waitCookie *http.Cookie
 	for _, c := range stop.Result().Cookies() {
 		if strings.HasPrefix(c.Name, "toolyard_oauth_wait_") {
 			waitCookie = c
 		}
 	}
-	if stop.Code != http.StatusOK || link == nil || waiter == nil || nonce == nil || waitCookie == nil || waitCookie.SameSite != http.SameSiteStrictMode {
+	if stop.Code != http.StatusOK || link == nil || waiter == nil || nonce == nil || code == nil || waitCookie == nil || waitCookie.SameSite != http.SameSiteStrictMode {
 		t.Fatalf("waiting stop page: %d %s", stop.Code, body)
 	}
 	consentURL := link[1]
@@ -765,8 +776,26 @@ func TestMCPOAuthWaitingStopPageFinishesWhereTheClientStarted(t *testing.T) {
 		return e.do(http.MethodPost, target, strings.NewReader(v.Encode()), map[string]string{
 			"Content-Type": "application/x-www-form-urlencoded", "Origin": origin, "Sec-Fetch-Site": site}, cookies...)
 	}
-	done := post(consentURL, url.Values{"nonce": {m[1]}, "verdict": {"allow"}, "nickname": {"Popup client"}, "scope_mode": {"all"}},
-		oauthPublic, "same-origin", append(e.session, consentCookie)...)
+	// B did not render the stop page: without the code its allow is
+	// refused; with the code A shows, it goes through.
+	allow := url.Values{"nonce": {m[1]}, "verdict": {"allow"}, "nickname": {"Popup client"}, "scope_mode": {"all"}}
+	if bad := post(consentURL, allow, oauthPublic, "same-origin", append(e.session, consentCookie)...); bad.Code != http.StatusBadRequest ||
+		!strings.Contains(bad.Body.String(), "That code is not right") {
+		t.Fatalf("allow without the code: %d %s", bad.Code, bad.Body)
+	}
+	page = e.do(http.MethodGet, consentURL, nil, nil, e.session...)
+	m = nonceRE.FindStringSubmatch(page.Body.String())
+	for _, c := range page.Result().Cookies() {
+		if strings.HasPrefix(c.Name, "ty_oauth_") {
+			consentCookie = c
+		}
+	}
+	if page.Code != http.StatusOK || m == nil {
+		t.Fatalf("consent page again: %d %s", page.Code, page.Body)
+	}
+	allow.Set("nonce", m[1])
+	allow.Set("code", code[1])
+	done := post(consentURL, allow, oauthPublic, "same-origin", append(e.session, consentCookie)...)
 	returnURL := done.Header().Get("Location")
 	if done.Code != http.StatusSeeOther || !strings.HasPrefix(returnURL, mcpauth.ReturnPath) {
 		t.Fatalf("consent submit: %d %q", done.Code, returnURL)

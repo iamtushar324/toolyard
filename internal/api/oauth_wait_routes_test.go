@@ -44,6 +44,9 @@ func (f *oauthFlowEnv) waitingPage() *waitingPage {
 		f.t.Fatalf("waiting stop page: %d %s", rec.Code, p.body)
 	}
 	p.id, p.waiter, p.nonce = id[1], waiter[1], nonce[1]
+	if code := stopCodeRE.FindStringSubmatch(p.body); code != nil {
+		f.codes[p.id] = code[1]
+	}
 	if m := regexp.MustCompile(`id="oauth-consent-link"[^>]*value="([^"]+)"`).FindStringSubmatch(p.body); m != nil {
 		p.consentLinkInField = m[1]
 	}
@@ -138,7 +141,7 @@ func TestStopPageWaitsWithItsSecretOnlyInTheBody(t *testing.T) {
 		}
 	}
 	c := p.cookie
-	if c.Value != p.nonce || !c.HttpOnly || c.SameSite != http.SameSiteStrictMode || c.Path != mcpauth.WaitPath || c.MaxAge <= 0 ||
+	if c.Value != p.nonce || !c.HttpOnly || c.SameSite != http.SameSiteStrictMode || c.Path != waitCookiePath || c.MaxAge <= 0 ||
 		c.Name != waitNonceName(p.id) {
 		t.Fatalf("nonce cookie %+v", c)
 	}

@@ -32,7 +32,7 @@ func TestApproveStoresAReturnTicketNotACode(t *testing.T) {
 	verifier, challenge := pkcePair(t)
 	req := f.beginFor(t, c.ClientID, redirect, challenge)
 	consentAt := f.clock.UnixMilli()
-	ticket, err := f.svc.Approve(ctx, req.ID, f.user, Consent{Nickname: "Laptop"})
+	ticket, err := f.svc.Approve(ctx, req.ID, f.user, Consent{SameBrowser: true, Nickname: "Laptop"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -117,7 +117,7 @@ func TestReturnLinkWorksOnce(t *testing.T) {
 	c := f.register(t, "none", redirect)
 	_, challenge := pkcePair(t)
 
-	ticket, err := f.svc.Approve(ctx, f.beginFor(t, c.ClientID, redirect, challenge).ID, f.user, Consent{Nickname: "Once"})
+	ticket, err := f.svc.Approve(ctx, f.beginFor(t, c.ClientID, redirect, challenge).ID, f.user, Consent{SameBrowser: true, Nickname: "Once"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -135,7 +135,7 @@ func TestReturnLinkWorksOnce(t *testing.T) {
 		t.Fatalf("%d codes after two uses, want 1 (%v)", codes, err)
 	}
 
-	ticket, err = f.svc.Approve(ctx, f.beginFor(t, c.ClientID, redirect, challenge).ID, f.user, Consent{Nickname: "Late"})
+	ticket, err = f.svc.Approve(ctx, f.beginFor(t, c.ClientID, redirect, challenge).ID, f.user, Consent{SameBrowser: true, Nickname: "Late"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -167,11 +167,11 @@ func TestANewerConsentOrARevocationEndsTheReturnLink(t *testing.T) {
 	c := f.register(t, "none", redirect)
 	_, challenge := pkcePair(t)
 
-	first, err := f.svc.Approve(ctx, f.beginFor(t, c.ClientID, redirect, challenge).ID, f.user, Consent{Nickname: "First"})
+	first, err := f.svc.Approve(ctx, f.beginFor(t, c.ClientID, redirect, challenge).ID, f.user, Consent{SameBrowser: true, Nickname: "First"})
 	if err != nil {
 		t.Fatal(err)
 	}
-	second, err := f.svc.Approve(ctx, f.beginFor(t, c.ClientID, redirect, challenge).ID, f.user, Consent{Nickname: "Second"})
+	second, err := f.svc.Approve(ctx, f.beginFor(t, c.ClientID, redirect, challenge).ID, f.user, Consent{SameBrowser: true, Nickname: "Second"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -182,7 +182,7 @@ func TestANewerConsentOrARevocationEndsTheReturnLink(t *testing.T) {
 		t.Fatalf("the newest link: %v", err)
 	}
 
-	third, err := f.svc.Approve(ctx, f.beginFor(t, c.ClientID, redirect, challenge).ID, f.user, Consent{Nickname: "Third"})
+	third, err := f.svc.Approve(ctx, f.beginFor(t, c.ClientID, redirect, challenge).ID, f.user, Consent{SameBrowser: true, Nickname: "Third"})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -223,7 +223,7 @@ func TestRacingReturnLinkUsesMintOneCode(t *testing.T) {
 	redirect := "https://client.example/cb"
 	c := f.register(t, "none", redirect)
 	_, challenge := pkcePair(t)
-	ticket, err := f.svc.Approve(ctx, f.beginFor(t, c.ClientID, redirect, challenge).ID, f.user, Consent{Nickname: "Race"})
+	ticket, err := f.svc.Approve(ctx, f.beginFor(t, c.ClientID, redirect, challenge).ID, f.user, Consent{SameBrowser: true, Nickname: "Race"})
 	if err != nil {
 		t.Fatal(err)
 	}

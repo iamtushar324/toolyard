@@ -136,7 +136,7 @@ func (h *mcpOAuthHandlers) authorize(w http.ResponseWriter, r *http.Request) {
 	// to the client: browsers apply form-action to that redirect, so the CSP
 	// allows the client's redirect target. The nonce cookie, SameSite=Strict,
 	// proves the form came from this page in this browser.
-	nonce, err := randomNonce()
+	nonce, err := h.s.stopPageNonce(req.ID)
 	if err != nil {
 		writeConnectPage(w, http.StatusInternalServerError, "Something went wrong", "<h1>Something went wrong</h1><p>Try again in a moment.</p>")
 		return
@@ -153,6 +153,10 @@ func (h *mcpOAuthHandlers) authorize(w http.ResponseWriter, r *http.Request) {
 			`<h2>Copy link for another browser</h2>`+
 			`<p>To answer in another browser or Chrome profile, open this link there and sign in to toolyard. It works for `+minutes+` minutes.</p>`+
 			oauthCopyField("oauth-consent-link", h.svc.Issuer()+next, "Link for another browser")+
+			// The confirmation code (mcpauth/code.go): an allow in another
+			// browser needs it typed. It is only ever in this page's body.
+			`<p class="oauth-code-line">Your code: <strong class="oauth-code">`+htmlEscape(mcpauth.FormatCode(req.Code))+`</strong>. `+
+			`Type it on the consent page in the other browser.</p>`+
 			h.waitSection(req, nonce))
 }
 
@@ -399,10 +403,25 @@ func (h *mcpOAuthHandlers) consentSubmit(w http.ResponseWriter, r *http.Request,
 			// apps page sets it), so connecting again keeps the one chosen.
 			draft.scope.ToolList = prev.Scope.ToolList
 		}
+		// A browser that did not render this request's stop page must type
+		// its confirmation code; the stop page's cookie says which.
 		ticket, err = h.svc.Approve(r.Context(), pending.ID, u, mcpauth.Consent{Nickname: draft.nickname, Scope: draft.scope,
-			MayManage: draft.mayManage, SignOutOthers: draft.signOutOthers})
+			MayManage: draft.mayManage, SignOutOthers: draft.signOutOthers,
+			SameBrowser: h.renderedStopPage(r, pending.ID), Code: r.PostForm.Get("code")})
 		if errors.Is(err, mcpauth.ErrInvalidNickname) || errors.Is(err, access.ErrInvalidScope) {
 			h.renderConsent(w, r, pending, u, err.Error(), draft)
+			return
+		}
+		if errors.Is(err, mcpauth.ErrCodeWrong) {
+			h.renderConsent(w, r, pending, u, "That code is not right. Type the code shown in the window where you started this connection.", draft)
+			return
+		}
+		if errors.Is(err, mcpauth.ErrCodeLocked) {
+			clearNonce()
+			client := htmlEscape(pending.Client.DisplayName())
+			writeConnectPage(w, http.StatusForbidden, "Sign-in ended",
+				"<h1>Too many wrong codes</h1><p>A wrong code was typed "+strconv.Itoa(mcpauth.MaxCodeAttempts)+
+					" times, so this sign-in ended. Nothing was allowed.</p><p>Start again from "+client+": connect toolyard there once more.</p>")
 			return
 		}
 	default:
@@ -520,6 +539,15 @@ func (h *mcpOAuthHandlers) renderConsent(w http.ResponseWriter, r *http.Request,
 	}
 	b.WriteString(`<form method="post" action="` + e(mcpauth.ConsentPath+"?request="+url.QueryEscape(pending.ID)) + `">`)
 	b.WriteString(`<input type="hidden" name="nonce" value="` + e(nonce) + `">`)
+	// A browser that did not render the stop page types its confirmation
+	// code (mcpauth/code.go). The field never shows what was typed before.
+	// A request stored before codes existed needs none.
+	if pending.HasCode && !h.renderedStopPage(r, pending.ID) {
+		b.WriteString(`<fieldset><legend>Code from the window where you started</legend>` +
+			`<p>Type the code shown in the window where you started this connection. If you did not start a connection yourself just now, do not type a code: close this page.</p>` +
+			`<p><label for="code">Code from the window where you started</label><br><input id="code" name="code" required maxlength="16" placeholder="XXX-XXX" ` +
+			`autocomplete="off" autocapitalize="characters" spellcheck="false"></p></fieldset>`)
+	}
 	b.WriteString(`<p><label for="nickname">Nickname for this connection</label><br><input id="nickname" name="nickname" value="` + e(draft.nickname) +
 		`" maxlength="64" required></p><p class="meta">Letters, digits, spaces and . _ : ( ) - only.</p>`)
 	checked := func(ok bool) string {
