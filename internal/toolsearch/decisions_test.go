@@ -397,12 +397,12 @@ func TestDecisionsRankerBudgetCoversTheKeyRead(t *testing.T) {
 	}
 }
 
-// TestDecisionsRankerKeepsTheFirstRoundWhenTheSecondFails (review r1-3):
-// the first request already ranked every keyword candidate, so a failed
-// second request (the chosen server's other tools) keeps that ranking
-// (ranked_by jev) rather than throwing it away; it is not cached, so the
-// next search asks again.
-func TestDecisionsRankerKeepsTheFirstRoundWhenTheSecondFails(t *testing.T) {
+// TestDecisionsRankerFallsBackWhenTheSecondRoundFails (review r1-3): a
+// second request (the chosen server's other tools) that fails makes the
+// search fall back to keyword ranking with the reason, so ranked_by jev
+// always means Jev judged every tool it set out to judge; nothing is
+// cached, so the next search asks again.
+func TestDecisionsRankerFallsBackWhenTheSecondRoundFails(t *testing.T) {
 	const query = "tell the team in chat that the deploy finished"
 	first := judge(func(string) float64 { return 0.2 }, "Slack", 0.9)
 	api := newFakeAPI(t, func(n int, req seenRequest) (int, string) {
@@ -414,7 +414,7 @@ func TestDecisionsRankerKeepsTheFirstRoundWhenTheSecondFails(t *testing.T) {
 	o := &observed{}
 	e := New(Options{Semantic: newTestRanker(api, o)})
 	res := search(t, e, fixture(), Query{Text: query})
-	if res.RankedBy != RankedJev || res.Fallback != "" || len(res.Hits) == 0 || res.Hits[0].Score != 0.2 {
+	if res.RankedBy != RankedKeyword || res.Fallback != FallbackError || res.Mode != ModeKeyword || len(res.Hits) == 0 {
 		t.Fatalf("second round failed: %s %q %v", res.RankedBy, res.Fallback, names(res.Hits))
 	}
 	if got := o.list(); !reflect.DeepEqual(got, []string{"ok", "http_502"}) {
@@ -422,7 +422,7 @@ func TestDecisionsRankerKeepsTheFirstRoundWhenTheSecondFails(t *testing.T) {
 	}
 	search(t, e, fixture(), Query{Text: query})
 	if n := len(api.requests()); n != 4 {
-		t.Fatalf("%d requests: an incomplete ranking must not be cached", n)
+		t.Fatalf("%d requests: a failed ranking must not be cached", n)
 	}
 }
 
@@ -474,7 +474,7 @@ func TestDecisionsRankerRefusesMalformedAnswers(t *testing.T) {
 
 // TestDecisionsRankerCachesAnswers: the same query over the same catalog
 // is answered from the cache for 10 minutes and still reads as Jev's; a
-// changed catalog, an expired entry or an incomplete answer asks again.
+// changed catalog, an expired entry or a failed ranking asks again.
 func TestDecisionsRankerCachesAnswers(t *testing.T) {
 	const query = "create a linear issue"
 	tools := fixture()
@@ -506,8 +506,8 @@ func TestDecisionsRankerCachesAnswers(t *testing.T) {
 		t.Fatalf("an expired entry: %d requests, want 4", n)
 	}
 
-	// The second round fails: the first round's scores rank this search,
-	// and are not cached.
+	// The second round fails: the search falls back to keyword ranking,
+	// and nothing is cached.
 	flaky := newFakeAPI(t, func(n int, req seenRequest) (int, string) {
 		if n%2 == 0 {
 			return http.StatusInternalServerError, `{"error":{"code":500,"message":"x"}}`
@@ -517,12 +517,12 @@ func TestDecisionsRankerCachesAnswers(t *testing.T) {
 	o := &observed{}
 	e = New(Options{Semantic: newTestRanker(flaky, o)})
 	res := search(t, e, tools, Query{Text: "tell the team in chat that the deploy finished"})
-	if res.RankedBy != RankedJev || !reflect.DeepEqual(o.list(), []string{"ok", "http_500"}) {
-		t.Fatalf("a failed second round: %s %v", res.RankedBy, o.list())
+	if res.RankedBy != RankedKeyword || res.Fallback != FallbackError || !reflect.DeepEqual(o.list(), []string{"ok", "http_500"}) {
+		t.Fatalf("a failed second round: %s %q %v", res.RankedBy, res.Fallback, o.list())
 	}
 	search(t, e, tools, Query{Text: "tell the team in chat that the deploy finished"})
 	if n := len(flaky.requests()); n != 4 {
-		t.Fatalf("an incomplete answer was cached: %d requests, want 4", n)
+		t.Fatalf("a failed ranking was cached: %d requests, want 4", n)
 	}
 
 	// The cache stays bounded.

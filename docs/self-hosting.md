@@ -446,7 +446,9 @@ up to 30 candidate tools (the best keyword matches) their catalog name,
 server, description cut to 300 bytes and parameter names. When the caller's
 tools span several servers, also up to 25 server names, each with its tool
 count and a few tool names. When no candidate fits but a server does, a
-second request sends up to 30 more tools of that server the same way. Never
+second request sends up to 30 more tools of that server the same way (if it
+fails or the budget has no room left for it, the search falls back to keyword
+ranking). Never
 call arguments, results, secrets or the caller's identity. Only the tools the
 caller may use are sent.
 

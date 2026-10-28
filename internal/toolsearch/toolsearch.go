@@ -238,10 +238,8 @@ type SemanticProvider interface {
 // scorer is a SemanticProvider that judges the engine's keyword ranking
 // rather than ranking alone (DecisionsRanker): it returns a score for each
 // tool it judged, by name, and the engine orders, caches and falls back.
-// complete is false when the scores are good for this search but should
-// not be cached (a second round was skipped or failed).
 type scorer interface {
-	score(ctx context.Context, tools []Tool, query string, keyword []Hit) (scores map[string]float64, complete bool, err error)
+	score(ctx context.Context, tools []Tool, query string, keyword []Hit) (scores map[string]float64, err error)
 }
 
 // Options configure an Engine.
@@ -404,13 +402,11 @@ func (e *Engine) rank(ctx context.Context, tools []Tool, text string) ([]Hit, st
 	if scores, ok := e.cachedScores(key); ok {
 		return merge(tools, scores, keyword), ""
 	}
-	scores, complete, err := s.score(ctx, tools, text, keyword)
+	scores, err := s.score(ctx, tools, text, keyword)
 	if err != nil {
 		return keyword, fallbackReason(err)
 	}
-	if complete {
-		e.storeScores(key, scores)
-	}
+	e.storeScores(key, scores)
 	return merge(tools, scores, keyword), ""
 }
 

@@ -141,7 +141,7 @@ func NewDecisionsRanker(opts DecisionsOptions) *DecisionsRanker {
 // instead, with its cached keyword index.
 func (r *DecisionsRanker) Rank(ctx context.Context, tools []Tool, query string) ([]Hit, error) {
 	keyword := buildIndex(tools).search(query)
-	scores, _, err := r.score(ctx, tools, query, keyword)
+	scores, err := r.score(ctx, tools, query, keyword)
 	if err != nil {
 		return nil, err
 	}
@@ -150,9 +150,11 @@ func (r *DecisionsRanker) Rank(ctx context.Context, tools []Tool, query string) 
 
 // score asks the model about the keyword candidates (and the servers),
 // then, when that found nothing likely, about the likely server's other
-// tools. The second round is best effort: skipped or failed, the first
-// round's scores stand, marked incomplete.
-func (r *DecisionsRanker) score(ctx context.Context, tools []Tool, query string, keyword []Hit) (map[string]float64, bool, error) {
+// tools. Every round it asks must answer: a second round that fails or has
+// no time left fails the ranking, and the search falls back to keyword
+// ranking (fallback timeout or error), so ranked_by jev always means Jev
+// judged every tool it set out to judge.
+func (r *DecisionsRanker) score(ctx context.Context, tools []Tool, query string, keyword []Hit) (map[string]float64, error) {
 	// The budget covers reading the key too: a slow secret store must not
 	// hold the search past it.
 	ctx, cancel := context.WithTimeout(ctx, r.timeout)
@@ -165,7 +167,7 @@ func (r *DecisionsRanker) score(ctx context.Context, tools []Tool, query string,
 		} else {
 			r.note(FallbackNoKey, 0)
 		}
-		return nil, false, err
+		return nil, err
 	}
 
 	cands := make([]Tool, 0, min(len(keyword), decisionsCandidates))
@@ -188,7 +190,7 @@ func (r *DecisionsRanker) score(ctx context.Context, tools []Tool, query string,
 	if len(cands) > 0 || len(choices) > 0 {
 		ans, err := r.ask(ctx, key, query, cands, choices)
 		if err != nil {
-			return nil, false, err
+			return nil, err
 		}
 		for i, t := range cands {
 			scores[t.Name] = ans.nouls[i]
@@ -202,30 +204,24 @@ func (r *DecisionsRanker) score(ctx context.Context, tools []Tool, query string,
 		best = math.Max(best, p)
 	}
 	if chosen == "" || chosenP < decisionsLikely || best >= decisionsLikely {
-		return scores, true, nil
+		return scores, nil
 	}
 	more := serverTools(tools, keyword, chosen, scores)
 	if len(more) == 0 {
-		return scores, true, nil
+		return scores, nil
 	}
 	if dl, ok := ctx.Deadline(); ok && time.Until(dl) < decisionsSecondRoundMin {
-		if len(scores) == 0 {
-			r.note(FallbackTimeout, 0)
-			return nil, false, &rankError{outcome: FallbackTimeout, msg: "no time left for the server's tools"}
-		}
-		return scores, false, nil
+		r.note(FallbackTimeout, 0)
+		return nil, &rankError{outcome: FallbackTimeout, msg: "no time left for the server's tools"}
 	}
 	ans, err := r.ask(ctx, key, query, more, nil)
 	if err != nil {
-		if len(scores) == 0 {
-			return nil, false, err
-		}
-		return scores, false, nil
+		return nil, err
 	}
 	for i, t := range more {
 		scores[t.Name] = ans.nouls[i]
 	}
-	return scores, true, nil
+	return scores, nil
 }
 
 func (r *DecisionsRanker) note(outcome string, cost float64) {
