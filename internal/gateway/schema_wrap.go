@@ -194,27 +194,56 @@ func rawDefs(raw map[string]any, props map[string]any) map[string]any {
 	if !ok {
 		return nil
 	}
-	rewriteDefinitionRefs(d)
-	rewriteDefinitionRefs(props)
+	for _, sub := range d {
+		rewriteDefinitionRefs(sub)
+	}
+	for _, sub := range props {
+		rewriteDefinitionRefs(sub)
+	}
 	rewriteDefinitionRefs(raw["additionalProperties"])
 	return d
 }
 
-// rewriteDefinitionRefs turns every "#/definitions/X" $ref under node into
-// "#/$defs/X".
-func rewriteDefinitionRefs(node any) {
+// Schema keywords whose value is one schema (or, for items, a list of
+// them), a list of schemas, or a map of name to schema. Only these are
+// walked: a "$ref" inside const, enum, default or examples is data.
+var (
+	subschemaKeys = []string{"items", "additionalProperties", "additionalItems", "contains", "propertyNames",
+		"not", "if", "then", "else", "unevaluatedItems", "unevaluatedProperties"}
+	subschemaListKeys = []string{"anyOf", "oneOf", "allOf", "prefixItems"}
+	subschemaMapKeys  = []string{"properties", "patternProperties", "$defs", "definitions", "dependentSchemas"}
+)
+
+// rewriteDefinitionRefs turns every "#/definitions/X" $ref in schema and
+// its subschemas into "#/$defs/X".
+func rewriteDefinitionRefs(schema any) {
 	const prefix = "#/definitions/"
-	switch v := node.(type) {
+	switch v := schema.(type) {
+	case []any: // items in its list form
+		for _, sub := range v {
+			rewriteDefinitionRefs(sub)
+		}
+		return
 	case map[string]any:
 		if ref, ok := v["$ref"].(string); ok && strings.HasPrefix(ref, prefix) {
 			v["$ref"] = "#/$defs/" + strings.TrimPrefix(ref, prefix)
 		}
-		for _, child := range v {
-			rewriteDefinitionRefs(child)
+		for _, k := range subschemaKeys {
+			rewriteDefinitionRefs(v[k])
 		}
-	case []any:
-		for _, child := range v {
-			rewriteDefinitionRefs(child)
+		for _, k := range subschemaListKeys {
+			if subs, ok := v[k].([]any); ok {
+				for _, sub := range subs {
+					rewriteDefinitionRefs(sub)
+				}
+			}
+		}
+		for _, k := range subschemaMapKeys {
+			if subs, ok := v[k].(map[string]any); ok {
+				for _, sub := range subs {
+					rewriteDefinitionRefs(sub)
+				}
+			}
 		}
 	}
 }

@@ -123,7 +123,7 @@ func tsTool(srv *server, bd binding) string {
 	}
 	b.WriteString("\n")
 	writeDoc(&b, "", strings.TrimSpace(t.Description))
-	fmt.Fprintf(&b, "export interface Input %s\n\n", tsObjectBody(t.Properties, stringSet(t.Required), nil, "", 0))
+	fmt.Fprintf(&b, "export interface Input %s\n\n", tsObjectBody(t.Properties, stringSet(t.Required), nil, t.Defs, "", 0))
 	writeOutput(&b, t.OutputSchema)
 	fmt.Fprintf(&b, "\nexport type Call = (%s) => Promise<Output>;\n", tsArgs("Input", t.Required))
 	return b.String()
@@ -151,14 +151,18 @@ func writeOutput(b *strings.Builder, schema map[string]any) {
 		b.WriteString("export type Output = unknown;\n")
 		return
 	}
+	defs, _ := schema["$defs"].(map[string]any)
+	if defs == nil {
+		defs, _ = schema["definitions"].(map[string]any)
+	}
 	desc, _ := schema["description"].(string)
 	writeDoc(b, "", strings.TrimSpace(desc))
 	props, _ := schema["properties"].(map[string]any)
 	if len(props) > 0 && !hasType(schema, "array") {
-		fmt.Fprintf(b, "export interface Output %s\n", tsObjectBody(props, stringSet(schema["required"]), schema["additionalProperties"], "", 0))
+		fmt.Fprintf(b, "export interface Output %s\n", tsObjectBody(props, stringSet(schema["required"]), schema["additionalProperties"], defs, "", 0))
 		return
 	}
-	fmt.Fprintf(b, "export type Output = %s;\n", tsType(schema, "", 0))
+	fmt.Fprintf(b, "export type Output = %s;\n", tsTypeIn(schema, defs, "", 0))
 }
 
 // tsServer is servers/<Server>.d.ts.
@@ -320,7 +324,11 @@ func tsSample(v any) string {
 
 // tsType renders one schema as a type; indent is the indentation of the
 // line the type starts on.
-func tsType(v any, indent string, depth int) string {
+func tsType(v any, indent string, depth int) string { return tsTypeIn(v, nil, indent, depth) }
+
+// tsTypeIn is tsType with the schema's root $defs, so a local $ref
+// resolves; depth bounds a cyclic one.
+func tsTypeIn(v any, defs map[string]any, indent string, depth int) string {
 	p, ok := v.(map[string]any)
 	if !ok || depth > tsMaxDepth {
 		return "unknown"
@@ -329,10 +337,7 @@ func tsType(v any, indent string, depth int) string {
 		// A long enum is its base type here; propDoc lists its first
 		// values once.
 		if len(typeNames(p)) == 0 {
-			if _, ok := enum[0].(string); ok {
-				return "string"
-			}
-			return "unknown"
+			return tsEnumBaseType(enum)
 		}
 	} else if len(enum) > 0 {
 		parts := make([]string, len(enum))
@@ -345,13 +350,16 @@ func tsType(v any, indent string, depth int) string {
 		return tsLiteral(c)
 	}
 	if _, ok := p["$ref"]; ok {
+		if r := resolveRef(p, defs); r != nil {
+			return tsTypeIn(r, defs, indent, depth+1)
+		}
 		return "unknown"
 	}
 	for _, key := range []string{"anyOf", "oneOf"} {
 		if alts, ok := p[key].([]any); ok && len(alts) > 0 {
 			parts := make([]string, len(alts))
 			for i, a := range alts {
-				parts[i] = tsType(a, indent, depth+1)
+				parts[i] = tsTypeIn(a, defs, indent, depth+1)
 			}
 			return tsUnion(parts)
 		}
@@ -359,7 +367,7 @@ func tsType(v any, indent string, depth int) string {
 	if all, ok := p["allOf"].([]any); ok && len(all) > 0 {
 		parts := make([]string, len(all))
 		for i, a := range all {
-			parts[i] = tsParen(tsType(a, indent, depth+1))
+			parts[i] = tsParen(tsTypeIn(a, defs, indent, depth+1))
 		}
 		return strings.Join(parts, " & ")
 	}
@@ -382,9 +390,9 @@ func tsType(v any, indent string, depth int) string {
 		case "number", "integer":
 			parts = append(parts, "number")
 		case "array":
-			parts = append(parts, tsArray(p, indent, depth))
+			parts = append(parts, tsArray(p, defs, indent, depth))
 		case "object":
-			parts = append(parts, tsObject(p, indent, depth))
+			parts = append(parts, tsObject(p, defs, indent, depth))
 		default:
 			parts = append(parts, "unknown")
 		}
@@ -393,14 +401,14 @@ func tsType(v any, indent string, depth int) string {
 }
 
 // tsArray renders an array schema.
-func tsArray(p map[string]any, indent string, depth int) string {
+func tsArray(p map[string]any, defs map[string]any, indent string, depth int) string {
 	switch items := p["items"].(type) {
 	case map[string]any:
-		return tsParen(tsType(items, indent, depth+1)) + "[]"
+		return tsParen(tsTypeIn(items, defs, indent, depth+1)) + "[]"
 	case []any:
 		parts := make([]string, len(items))
 		for i, it := range items {
-			parts[i] = tsType(it, indent, depth+1)
+			parts[i] = tsTypeIn(it, defs, indent, depth+1)
 		}
 		return "[" + strings.Join(parts, ", ") + "]"
 	}
@@ -408,12 +416,12 @@ func tsArray(p map[string]any, indent string, depth int) string {
 }
 
 // tsObject renders an object schema.
-func tsObject(p map[string]any, indent string, depth int) string {
+func tsObject(p map[string]any, defs map[string]any, indent string, depth int) string {
 	props, _ := p["properties"].(map[string]any)
 	if len(props) == 0 {
 		switch addl := p["additionalProperties"].(type) {
 		case map[string]any:
-			return "Record<string, " + tsType(addl, indent, depth+1) + ">"
+			return "Record<string, " + tsTypeIn(addl, defs, indent, depth+1) + ">"
 		case bool:
 			if !addl {
 				return "Record<string, never>"
@@ -421,12 +429,12 @@ func tsObject(p map[string]any, indent string, depth int) string {
 		}
 		return "Record<string, unknown>"
 	}
-	return tsObjectBody(props, stringSet(p["required"]), p["additionalProperties"], indent, depth)
+	return tsObjectBody(props, stringSet(p["required"]), p["additionalProperties"], defs, indent, depth)
 }
 
 // tsObjectBody is an object type's braces and members, required members
 // first, each group alphabetical, each described by its JSDoc.
-func tsObjectBody(props map[string]any, required map[string]bool, addl any, indent string, depth int) string {
+func tsObjectBody(props map[string]any, required map[string]bool, addl any, defs map[string]any, indent string, depth int) string {
 	_, indexed := addl.(map[string]any)
 	if b, ok := addl.(bool); ok && b {
 		indexed = true
@@ -449,12 +457,12 @@ func tsObjectBody(props map[string]any, required map[string]bool, addl any, inde
 	b.WriteString("{\n")
 	for _, name := range append(req, opt...) {
 		ps, _ := props[name].(map[string]any)
-		writeDoc(&b, inner, propDoc(ps))
+		writeDoc(&b, inner, propDocIn(ps, defs))
 		mark := "?"
 		if required[name] {
 			mark = ""
 		}
-		fmt.Fprintf(&b, "%s%s%s: %s;\n", inner, tsKey(name), mark, tsType(props[name], inner, depth+1))
+		fmt.Fprintf(&b, "%s%s%s: %s;\n", inner, tsKey(name), mark, tsTypeIn(props[name], defs, inner, depth+1))
 	}
 	if indexed {
 		fmt.Fprintf(&b, "%s[key: string]: unknown;\n", inner)
@@ -463,11 +471,15 @@ func tsObjectBody(props map[string]any, required map[string]bool, addl any, inde
 	return b.String()
 }
 
-// propDoc is a property's JSDoc text: its description (else that of its
-// single non-null anyOf/oneOf branch), and its default.
-func propDoc(p map[string]any) string {
-	desc := schemaDescription(p, nil)
-	if enum := enumOf(p, nil); len(enum) > maxInlineEnum {
+// propDoc is propDoc in a schema without $defs.
+func propDoc(p map[string]any) string { return propDocIn(p, nil) }
+
+// propDocIn is a property's JSDoc text: its description (else that of its
+// $ref target or single non-null anyOf/oneOf branch), the first values of
+// a long enum, and its default.
+func propDocIn(p map[string]any, defs map[string]any) string {
+	desc := schemaDescription(p, defs)
+	if enum := enumOf(p, defs); len(enum) > maxInlineEnum {
 		if desc != "" {
 			desc += "\n"
 		}
@@ -505,6 +517,27 @@ func writeDoc(b *strings.Builder, indent, text string) {
 		}
 	}
 	fmt.Fprintf(b, "%s */\n", indent)
+}
+
+// tsEnumBaseType is the type of a long untyped enum's values: the union of
+// every value's kind, or unknown when one is not a JSON scalar.
+func tsEnumBaseType(enum []any) string {
+	var parts []string
+	for _, e := range enum {
+		switch e.(type) {
+		case string:
+			parts = appendDistinct(parts, "string")
+		case bool:
+			parts = appendDistinct(parts, "boolean")
+		case float64, float32, int, int64, int32:
+			parts = appendDistinct(parts, "number")
+		case nil:
+			parts = appendDistinct(parts, "null")
+		default:
+			return "unknown"
+		}
+	}
+	return tsUnion(parts)
 }
 
 // tsUnion joins alternatives, dropping repeats.

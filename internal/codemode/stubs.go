@@ -540,39 +540,58 @@ func writeNestedFields(b *strings.Builder, obj map[string]any, defs map[string]a
 			line += ": " + firstLine(d)
 		}
 		b.WriteString(line + "\n")
+		if enum := enumOf(props[n], defs); len(enum) > maxInlineEnum {
+			fmt.Fprintf(b, "                %s\n", longEnumText(enum, literal))
+		}
 	}
 	if extra := len(names) - len(shown); extra > 0 {
 		fmt.Fprintf(b, "            - ... and %d more fields\n", extra)
 	}
 }
 
-// enumOf is the enum a property stands for, directly or through its $ref
-// or single non-null branch; nil when it has none.
+// enumOf is the enum a property stands for, directly, through its $ref
+// or single non-null branch, or as its array items; nil when it has none.
 func enumOf(prop any, defs map[string]any) []any {
 	p, _ := prop.(map[string]any)
 	for depth := 0; p != nil && depth <= maxSchemaDepth; depth++ {
 		if enum := enumValues(p); len(enum) > 0 {
 			return enum
 		}
+		if items, ok := p["items"].(map[string]any); ok {
+			p = items
+			continue
+		}
 		p = innerSchema(p, defs)
 	}
 	return nil
 }
 
-// enumBaseType is the Python type of a long enum's values, which the
-// signature shows instead of a Literal of every value.
+// enumBaseType is the Python type of a long untyped enum's values, which
+// the signature shows instead of a Literal of every value: the union of
+// every value's kind, or Any when one is not a JSON scalar.
 func enumBaseType(enum []any) string {
-	switch enum[0].(type) {
-	case string:
-		return "str"
-	case bool:
-		return "bool"
-	case float64, float32:
-		return "float"
-	case int, int64, int32:
-		return "int"
+	var parts []string
+	nullable := false
+	for _, e := range enum {
+		switch e.(type) {
+		case string:
+			parts = appendDistinct(parts, "str")
+		case bool:
+			parts = appendDistinct(parts, "bool")
+		case float64, float32:
+			parts = appendDistinct(parts, "float")
+		case int, int64, int32:
+			parts = appendDistinct(parts, "int")
+		case nil:
+			nullable = true
+		default:
+			return "Any"
+		}
 	}
-	return "Any"
+	if len(parts) == 0 && nullable {
+		return "None"
+	}
+	return pyUnion(parts, nullable)
 }
 
 // longEnumText lists the first enumShown values of a long enum once, and

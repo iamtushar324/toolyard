@@ -607,6 +607,116 @@ func TestLongEnumIsListedOnceAndShort(t *testing.T) {
 	}
 }
 
+// tsStub renders one tool's .d.ts through a catalog of just that tool.
+func tsStub(t *testing.T, tool Tool) string {
+	t.Helper()
+	cat := buildCatalog([]Tool{tool})
+	srv := cat.byIdent(tool.Server)
+	if srv == nil {
+		t.Fatalf("no server %s", tool.Server)
+	}
+	b, _ := srv.lookup(tool.Name)
+	if b == nil {
+		t.Fatalf("no tool %s.%s", tool.Server, tool.Name)
+	}
+	return tsTool(srv, *b)
+}
+
+func TestTypeScriptResolvesRefsAndBranchDescriptions(t *testing.T) {
+	ts := tsStub(t, sessionBrief)
+	for _, want := range []string{
+		"  /** Session id or title */\n  session: string;\n",
+		"  /** Resume after this event */\n  cursor?: string | null;\n",
+		"  /** Which events to include */\n  filter?: {\n    /** Thread to read */\n    threadId: string;\n    kinds?: string[];\n",
+		"  } | null;\n",
+		"  /** Answer format */\n  format?: \"markdown\" | \"json\";\n",
+	} {
+		if !strings.Contains(ts, want) {
+			t.Errorf("TypeScript stub missing %q:\n%s", want, ts)
+		}
+	}
+	if strings.Contains(ts, ": unknown") {
+		t.Errorf("a $ref stayed unknown:\n%s", ts)
+	}
+}
+
+func longEnum(n int) []any {
+	enum := make([]any, n)
+	for i := range enum {
+		enum[i] = fmt.Sprintf("action_%03d", i)
+	}
+	return enum
+}
+
+// TestLongEnumInItemsAndNestedFields: a long enum shown as its base type
+// in array items or a nested field still lists its first values once.
+func TestLongEnumInItemsAndNestedFields(t *testing.T) {
+	enum := longEnum(260)
+	bulk := Tool{Server: "BkT3", Name: "bulk", Target: "BkT3.bulk", ReasonField: "_reason",
+		Properties: map[string]any{
+			"actions": map[string]any{"type": "array", "items": map[string]any{"type": "string", "enum": enum}},
+			"opts": map[string]any{"type": "object", "properties": map[string]any{
+				"mode": map[string]any{"type": "string", "enum": enum},
+			}},
+		}}
+	list := `"action_000", "action_001"`
+	more := "… and 240 more (see tools.search or the server's list tool)"
+
+	f := newFake()
+	f.tools = append(f.tools, bulk)
+	doc, ok := inProcess(f, Limits{}).GetToolDocs(context.Background(), "BkT3", "bulk")
+	if !ok {
+		t.Fatalf("docs: %s", doc)
+	}
+	for _, want := range []string{
+		"        actions (list[str]): actions parameter (optional)\n            Allowed values: " + list,
+		"            - mode (str, optional)\n                Allowed values: " + list,
+		more,
+	} {
+		if !strings.Contains(doc, want) {
+			t.Errorf("docs missing %q:\n%s", want, doc)
+		}
+	}
+	if n := strings.Count(doc, list); n != 2 || strings.Contains(doc, "action_020") {
+		t.Errorf("want each long enum listed once and capped, got %d lists:\n%s", n, doc)
+	}
+
+	ts := tsStub(t, bulk)
+	for _, want := range []string{"  actions?: string[];\n", "    mode?: string;\n", more} {
+		if !strings.Contains(ts, want) {
+			t.Errorf("TypeScript stub missing %q:\n%s", want, ts)
+		}
+	}
+	if n := strings.Count(ts, list); n != 2 || strings.Contains(ts, "action_020") {
+		t.Errorf("want each long enum listed once and capped in TypeScript, got %d lists:\n%s", n, ts)
+	}
+}
+
+// TestUntypedLongEnumOfMixedValues: the base type covers every value.
+func TestUntypedLongEnumOfMixedValues(t *testing.T) {
+	mixed := append(longEnum(30), 1.0)
+	withNull := append(longEnum(30), nil)
+	withObject := append(longEnum(30), map[string]any{"a": 1.0})
+	cases := []struct {
+		enum   []any
+		py, ts string
+	}{
+		{longEnum(30), "str", "string"},
+		{mixed, "Union[str, float]", "string | number"},
+		{withNull, "Optional[str]", "string | null"},
+		{withObject, "Any", "unknown"},
+	}
+	for _, c := range cases {
+		schema := map[string]any{"enum": c.enum}
+		if got := pythonType(schema); got != c.py {
+			t.Errorf("pythonType(%d values) = %q, want %q", len(c.enum), got, c.py)
+		}
+		if got := tsType(schema, "", 0); got != c.ts {
+			t.Errorf("tsType(%d values) = %q, want %q", len(c.enum), got, c.ts)
+		}
+	}
+}
+
 func TestPropDocFallsBackToBranchDescription(t *testing.T) {
 	p := map[string]any{"anyOf": []any{map[string]any{"type": "string", "description": "Resume after this event"}, map[string]any{"type": "null"}}}
 	if got := propDoc(p); got != "Resume after this event" {

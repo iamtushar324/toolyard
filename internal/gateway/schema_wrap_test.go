@@ -141,3 +141,36 @@ func TestWrapSchemaKeepsDefs(t *testing.T) {
 		t.Errorf("draft-07 refs not rewritten to $defs: %s", b)
 	}
 }
+
+// TestWrapSchemaRewritesOnlySchemaRefs: a draft-07 "$ref" inside const,
+// enum, default or examples is data and stays as it is.
+func TestWrapSchemaRewritesOnlySchemaRefs(t *testing.T) {
+	raw := mcp.Tool{
+		Name: "data_refs",
+		RawInputSchema: []byte(`{"type":"object","definitions":{"Filter":{"type":"object","properties":{"next":{"$ref":"#/definitions/Filter"}}}},
+			"properties":{
+				"filter":{"type":"array","items":{"$ref":"#/definitions/Filter"}},
+				"marker":{"const":{"$ref":"#/definitions/Filter"}},
+				"kind":{"enum":[{"$ref":"#/definitions/Filter"}],"default":{"$ref":"#/definitions/Filter"},"examples":[{"$ref":"#/definitions/Filter"}]}}}`),
+	}
+	out, _ := wrapSchema(raw)
+	props := out.InputSchema.Properties
+	if got := props["filter"].(map[string]any)["items"].(map[string]any)["$ref"]; got != "#/$defs/Filter" {
+		t.Errorf("schema ref not rewritten: %v", got)
+	}
+	next := out.InputSchema.Defs["Filter"].(map[string]any)["properties"].(map[string]any)["next"].(map[string]any)
+	if next["$ref"] != "#/$defs/Filter" {
+		t.Errorf("ref inside $defs not rewritten: %v", next["$ref"])
+	}
+	kind := props["kind"].(map[string]any)
+	for name, data := range map[string]any{
+		"const":    props["marker"].(map[string]any)["const"],
+		"enum":     kind["enum"].([]any)[0],
+		"default":  kind["default"],
+		"examples": kind["examples"].([]any)[0],
+	} {
+		if got := data.(map[string]any)["$ref"]; got != "#/definitions/Filter" {
+			t.Errorf("%s data changed to %v", name, got)
+		}
+	}
+}
