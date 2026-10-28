@@ -7,7 +7,7 @@ import (
 )
 
 func TestInboxAgentInstructionsDescribeDecisionAndRecovery(t *testing.T) {
-	text := buildInstructions(nil, time.Second)
+	text := buildInstructions(nil, time.Second, false)
 	for _, want := range []string{"_reason", "call_id", "task.objective", "material_risks", "callback_ref", "inbox.wait remains optional", "same still-valid unused token", "outcome_unknown", "Rejected calls receive no grant", "required is a planning hint", "_grant", "FALLBACK", "POST /v1/code/run", "TOOLYARD_TOKEN_FILE", "GET /v1/code/ty", "topic fallback"} {
 		if !strings.Contains(text, want) {
 			t.Errorf("missing %q", want)
@@ -25,7 +25,7 @@ func TestInboxAgentInstructionsDescribeDecisionAndRecovery(t *testing.T) {
 // tools and the flow (find, read, run, ask once per round, read the
 // decision), and still read true for an agent on the full tool list.
 func TestInstructionsTeachTheFiveToolFlow(t *testing.T) {
-	text := buildInstructions(nil, time.Second)
+	text := buildInstructions(nil, time.Second, false)
 	for _, name := range SmallToolList {
 		if !strings.Contains(text, name) {
 			t.Errorf("the instructions do not name %s", name)
@@ -46,11 +46,11 @@ func TestInstructionsTeachTheFiveToolFlow(t *testing.T) {
 			t.Errorf("missing %q", want)
 		}
 	}
-	if skills := buildInstructions(nil, time.Second) + " " + skillsInstructions; !strings.Contains(skills, "SKILLS:") || !strings.Contains(skills, "skills.search") ||
+	if skills := buildInstructions(nil, time.Second, false) + " " + skillsInstructions(false); !strings.Contains(skills, "SKILLS:") || !strings.Contains(skills, "skills.search") ||
 		!strings.Contains(skills, "tools.search") || !strings.Contains(skills, "toolyard.skills_get") {
-		t.Errorf("the skills paragraph does not point at tools.search and code mode: %q", skillsInstructions)
+		t.Errorf("the skills paragraph does not point at tools.search and code mode: %q", skillsInstructions(false))
 	}
-	if guide := skillsGuideInstructions("toolyard/toolyard-basics"); !strings.Contains(guide, `"toolyard/toolyard-basics"`) || !strings.Contains(guide, "toolyard.skills_get") {
+	if guide := skillsGuideInstructions("toolyard/toolyard-basics", false); !strings.Contains(guide, `"toolyard/toolyard-basics"`) || !strings.Contains(guide, "toolyard.skills_get") {
 		t.Errorf("the guide sentence: %q", guide)
 	}
 }

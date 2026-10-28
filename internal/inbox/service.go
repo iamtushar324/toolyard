@@ -1386,6 +1386,9 @@ func (s *Service) Check(ctx context.Context, agentID string, calls []CheckCall) 
 	}
 	out := make([]CheckResult, 0, len(calls))
 	for _, c := range calls {
+		// A listed (published) name checks, and matches grants, as the
+		// catalog name.
+		c.Tool = canonicalTool(s.opts.Catalog, c.Tool)
 		access := AccessUnknown
 		if s.opts.Catalog != nil {
 			access, _ = s.opts.Catalog.Access(ctx, agentID, c.Tool, c.Args)

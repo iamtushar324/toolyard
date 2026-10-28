@@ -36,7 +36,8 @@ The return link (a separate authorization):
     with the page's nonce), and only then gets a 303 to the client's
     redirect URI with code, state and iss;
   - the code works once at the token endpoint with the PKCE verifier, and
-    the access token lists the five tools over MCP;
+    the access token lists the five tools over MCP under OpenAI-safe names
+    (tools_search, inbox_request, ...);
   - a second use of the return link, and a POST without the nonce cookie,
     are refused; A's waiting page of that request reports used and its
     Continue is refused.
@@ -71,7 +72,9 @@ if not BASE:
 NS = os.environ.get("NAMESPACE", "toolyard-test")
 REPORT = os.environ.get("REPORT", "/tmp/oauth-handoff-e2e.json")
 REDIRECT = "http://127.0.0.1:43123/callback"
-FIVE = {"tools.search", "getToolDocs", "executeToolCode", "inbox.request", "inbox.status"}
+# The five tools as tools/list shows them: OpenAI-safe published names
+# (-mcp-safe-tool-names, the default).
+FIVE = {"tools_search", "getToolDocs", "executeToolCode", "inbox_request", "inbox_status"}
 
 results = []
 

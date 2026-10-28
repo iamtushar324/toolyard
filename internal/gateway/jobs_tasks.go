@@ -222,15 +222,17 @@ func (g *Gateway) taskToolCall(ctx context.Context, w http.ResponseWriter, req t
 		writeRPCError(w, req, mcp.INVALID_PARAMS, "invalid tools/call params: "+err.Error())
 		return
 	}
-	name := p.Name
-	args := exactArguments(ctx, name, p.Arguments)
+	// A published name (tool_names.go) runs its canonical tool, as on a
+	// plain tools/call; an unknown name is answered with the name sent.
+	name := g.resolveToolName(p.Name)
+	args := g.exactArguments(ctx, name, p.Arguments)
 	if args == nil {
 		args = map[string]any{}
 	}
 	g.mu.RLock()
 	entry, known := g.tools[name]
 	g.mu.RUnlock()
-	notFound := fmt.Sprintf("tool '%s' not found", name)
+	notFound := fmt.Sprintf("tool '%s' not found", p.Name)
 	if !known {
 		writeRPCError(w, req, mcp.INVALID_PARAMS, notFound)
 		return

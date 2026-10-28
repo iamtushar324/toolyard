@@ -24,12 +24,18 @@ const (
 
 // metaSearchSkillsSentence joins the tools.search description only while
 // the skills hub is registered (RegisterSkillHub): with the hub off the
-// description stays as it was before the hub existed.
-const metaSearchSkillsSentence = "When toolyard serves skills, the answer also names up to 3 matching skills under \"skills\" (playbooks: read one with skills.get). "
+// description stays as it was before the hub existed. It names skills.get
+// as the MCP list does (metaSearchDescription).
+func metaSearchSkillsSentence(safe bool) string {
+	return "When toolyard serves skills, the answer also names up to 3 matching skills under \"skills\" (playbooks: read one with " + listedToolName(safe, SkillsGetTool) + "). "
+}
 
 // metaSearchDescription is the tools.search description, with the skills
-// sentence when skills is set.
-func metaSearchDescription(skills bool) string {
+// sentence when skills is set. With safe tool names (safe) the MCP-listed
+// tools it names are named by their published names (inbox_request); the
+// code-mode examples keep their names.
+func metaSearchDescription(skills, safe bool) string {
+	n := func(canonical string) string { return listedToolName(safe, canonical) }
 	d := descriptionBanner + "Find the tools you may use, best first: your one way to discover tools. Describe the task in plain words. " +
 		"mode \"auto\" (default) ranks by meaning with Jev, a classification model, where the operator turned it on, and falls back to keyword ranking when it is off, slow or failing; " +
 		"\"semantic\" is Jev with the same fallback (refused where Jev is off); " +
@@ -38,12 +44,16 @@ func metaSearchDescription(skills bool) string {
 		"The answer's ranked_by says what ordered it (jev, keyword, regex or name) and fallback why Jev did not (off, no_key, timeout, error, empty, busy; \"\" when it did). " +
 		"With ranked_by jev, score is Jev's probability (0 to 1) that the tool fits; tools Jev did not judge follow without one. " +
 		"Each result's run says what a call gets now: \"now\" runs, \"needs_approval\" needs your owner's yes, \"blocked\" is denied by policy (do not call it). " +
-		"For tools that need approval, ask with inbox.request: put every restricted call and every question of this round into ONE request, and ask again only for what the answers open. " +
-		"detail \"full\" (default) returns name, upstream, description, the code-mode name, score, run and the input and output schemas; \"summary\" leaves out the schemas; \"name\" only names. "
-	if skills {
-		d += metaSearchSkillsSentence
+		"For tools that need approval, ask with " + n("inbox.request") + ": put every restricted call and every question of this round into ONE request, and ask again only for what the answers open. "
+	if safe {
+		d += "detail \"full\" (default) returns name (the catalog name), mcp_name (the name to call it by over MCP; the catalog name works too), upstream, description, the code-mode name, score, run and the input and output schemas; \"summary\" leaves out the schemas; \"name\" only names. "
+	} else {
+		d += "detail \"full\" (default) returns name, upstream, description, the code-mode name, score, run and the input and output schemas; \"summary\" leaves out the schemas; \"name\" only names. "
 	}
-	return d + "Use it before tools.execute, or in code mode: JavaScript `await tools.search(\"query\", { limit: 5 })`, Starlark `toolyard.tools_search(query=\"...\")`."
+	if skills {
+		d += metaSearchSkillsSentence(safe)
+	}
+	return d + "Use it before " + n(MetaExecuteTool) + ", or in code mode: JavaScript `await tools.search(\"query\", { limit: 5 })`, Starlark `toolyard.tools_search(query=\"...\")`."
 }
 
 // metaTools returns the search/execute meta-tools as toolEntry values ready to
@@ -51,7 +61,7 @@ func metaSearchDescription(skills bool) string {
 func (g *Gateway) metaTools() []toolEntry {
 	search := mcp.Tool{
 		Name:        MetaSearchTool,
-		Description: metaSearchDescription(false),
+		Description: metaSearchDescription(false, g.safeToolNames),
 		InputSchema: mcp.ToolInputSchema{
 			Type:     "object",
 			Required: []string{ReasonField},
@@ -172,6 +182,15 @@ func (g *Gateway) SearchTools(ctx context.Context, req SearchRequest) (map[strin
 	if detail != toolsearch.DetailName {
 		for i, run := range g.runStatuses(ctx, res.Hits) {
 			results[i].Run = run
+		}
+	}
+	// With safe tool names each result also gives the name tools/list
+	// shows for it, the one an MCP client calls; name stays the catalog
+	// name (policies, grants, audit), and both names work in a call.
+	if g.safeToolNames {
+		names := g.toolNames()
+		for i := range results {
+			results[i].MCPName = names.publish(results[i].Name)
 		}
 	}
 	body := map[string]any{
@@ -335,6 +354,9 @@ func (g *Gateway) handleExecuteTool() directHandler {
 		if strings.TrimSpace(target) == "" {
 			return mcp.NewToolResultError("tool is required"), nil
 		}
+		// The target may be a published name (tools_search); the checks
+		// below and RouteCall see the canonical one.
+		target = g.resolveToolName(target)
 		// A script may reach tools.execute (toolyard.tools_execute) but
 		// not code mode itself: a nested executeToolCode would only
 		// recurse, one worker slot per level. routeEntry refuses it at any

@@ -755,14 +755,14 @@ func TestToolsSearchNamesSkillsOnlyWithTheHub(t *testing.T) {
 	off.gw.mu.RLock()
 	desc := off.gw.tools[MetaSearchTool].tool.Description
 	off.gw.mu.RUnlock()
-	if strings.Contains(desc, "skills") || desc != metaSearchDescription(false) {
+	if strings.Contains(desc, "skills") || desc != metaSearchDescription(false, false) {
 		t.Fatalf("hub off: %q", desc)
 	}
 	on := newSkillsFixture(t)
 	on.gw.mu.RLock()
 	desc = on.gw.tools[MetaSearchTool].tool.Description
 	on.gw.mu.RUnlock()
-	if !strings.Contains(desc, metaSearchSkillsSentence) {
+	if !strings.Contains(desc, metaSearchSkillsSentence(false)) {
 		t.Fatalf("hub on: %q", desc)
 	}
 }

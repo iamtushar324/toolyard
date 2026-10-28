@@ -32,7 +32,9 @@ type toolListFixture struct {
 	calls atomic.Int32
 }
 
-func newToolListFixture(t *testing.T) *toolListFixture {
+// opts change the gateway's Options before New (tool_names_test.go turns
+// safe tool names on).
+func newToolListFixture(t *testing.T, opts ...func(*Options)) *toolListFixture {
 	t.Helper()
 	ctx := context.Background()
 	db := storetest.Open(t)
@@ -52,7 +54,11 @@ func newToolListFixture(t *testing.T) *toolListFixture {
 		t.Fatal(err)
 	}
 	f := &toolListFixture{acc: access.New(db)}
-	f.gw = New(Options{Policy: policy.New(db), Approval: bus, Audit: audit.New(db), Hub: realtime.NewHub(), Memory: memory.New(db), Access: f.acc})
+	gopts := Options{Policy: policy.New(db), Approval: bus, Audit: audit.New(db), Hub: realtime.NewHub(), Memory: memory.New(db), Access: f.acc}
+	for _, o := range opts {
+		o(&gopts)
+	}
+	f.gw = New(gopts)
 	f.gw.RegisterBuiltins()
 	t.Cleanup(func() { _ = f.gw.Close() })
 	svc, err := inbox.New(ctx, inbox.Options{DB: db, Catalog: f.gw})

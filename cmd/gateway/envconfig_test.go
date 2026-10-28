@@ -515,3 +515,45 @@ func TestToolSearchFlagsFromTheEnvironment(t *testing.T) {
 		t.Fatalf("the secret was read %d times in a minute, want 1", reads)
 	}
 }
+
+// -mcp-safe-tool-names (TEC-1807) is on by default and follows the
+// TOOLYARD_<FLAG> contract: TOOLYARD_MCP_SAFE_TOOL_NAMES=false turns it off
+// without a code change, the command line wins, a bad value is a
+// configuration error naming the variable, and the variable draws no
+// unknown-variable warning.
+func TestSafeToolNamesFlagFromTheEnvironment(t *testing.T) {
+	newFlags := func(args ...string) (*flag.FlagSet, *bool) {
+		t.Helper()
+		fs := flag.NewFlagSet("serve", flag.ContinueOnError)
+		fs.SetOutput(io.Discard)
+		on := registerSafeToolNamesFlag(fs)
+		if err := fs.Parse(args); err != nil {
+			t.Fatal(err)
+		}
+		return fs, on
+	}
+	if _, on := newFlags(); !*on {
+		t.Fatal("-mcp-safe-tool-names is off by default")
+	}
+	const key = "TOOLYARD_MCP_SAFE_TOOL_NAMES"
+	fs, on := newFlags()
+	layer := newEnvLayer(fs, envPrefix)
+	if err := layer.apply(mapLookup(map[string]string{key: "false"})); err != nil {
+		t.Fatal(err)
+	}
+	if *on || strings.Join(layer.variables(), ",") != key {
+		t.Fatalf("%s=false: on %v, variables %v", key, *on, layer.variables())
+	}
+	if w := unknownEnvWarnings(fs, []string{key + "=false"}); len(w) != 0 {
+		t.Fatalf("warnings: %v", w)
+	}
+	cli, cliOn := newFlags("-mcp-safe-tool-names=true")
+	if err := newEnvLayer(cli, envPrefix).apply(mapLookup(map[string]string{key: "false"})); err != nil || !*cliOn {
+		t.Fatalf("command line true, variable false: on %v, %v", *cliOn, err)
+	}
+	bad, _ := newFlags()
+	if err := newEnvLayer(bad, envPrefix).apply(mapLookup(map[string]string{key: "maybe"})); !errors.Is(err, keyguard.ErrConfig) ||
+		!strings.Contains(err.Error(), key) {
+		t.Fatalf("%s=maybe: %v", key, err)
+	}
+}

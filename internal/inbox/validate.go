@@ -64,6 +64,24 @@ type Catalog interface {
 	Access(ctx context.Context, agentID, tool string, args map[string]any) (access, upstream string)
 }
 
+// ToolNamer is the optional part of a Catalog that maps a name an agent
+// may use for a tool to the catalog name: the gateway lists tools under
+// OpenAI-safe names ("inbox_request" for "inbox.request") and accepts
+// both. Requests and checks keep the catalog name, so a grant names the
+// tool as policies and audit do. A name it does not know comes back
+// unchanged.
+type ToolNamer interface {
+	CanonicalTool(name string) string
+}
+
+// canonicalTool is name as the catalog names it, when cat is a ToolNamer.
+func canonicalTool(cat Catalog, name string) string {
+	if namer, ok := cat.(ToolNamer); ok && name != "" {
+		return namer.CanonicalTool(name)
+	}
+	return name
+}
+
 // Tool access values.
 const (
 	AccessOpen       = "open"
@@ -281,6 +299,7 @@ func Validate(ctx context.Context, cat Catalog, agentID string, s *Submission, o
 		for i, st := range s.Tools {
 			p := fmt.Sprintf("tools[%d]", i)
 			tr := ToolRequest{CallID: st.CallID, Target: strings.TrimSpace(st.Target), ExpectedEffects: strings.TrimSpace(st.ExpectedEffects), Operation: st.Operation, AffectedScope: strings.TrimSpace(st.AffectedScope), MaterialRisks: strings.TrimSpace(st.MaterialRisks), Undo: strings.TrimSpace(st.Undo), Tool: strings.TrimSpace(st.Tool), Required: st.Required, Summary: strings.TrimSpace(st.Summary), After: st.After, Params: map[string]Constraint{}}
+			tr.Tool = canonicalTool(cat, tr.Tool)
 			if tr.Tool == "" {
 				add(p+".tool", "missing")
 			} else if cat != nil {

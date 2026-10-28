@@ -7,13 +7,17 @@ toolyard. It signs in as the first admin (credentials from the
 checks:
 
   - tools/list shows exactly the five tools by default, every tool after the
-    agent is switched to the full list, and the five again after switching back;
+    agent is switched to the full list, and the five again after switching back,
+    every listed name OpenAI-safe (^[a-zA-Z0-9_-]{1,64}$: tools_search for
+    tools.search, -mcp-safe-tool-names, the default);
   - tools.search finds a tool that is not listed, says how it ranked
     (ranked_by, fallback), and gives every hit a run status that agrees with
     policies.explain;
-  - a tool that is not listed still runs: directly (tools/call) and from a
-    code-mode script that found it with tools.search;
-  - one inbox.request carries several calls and a question as one Inbox item
+  - a tool that is not listed still runs: directly (tools/call) by its
+    canonical name (access.whoami) and by its published name (access_whoami),
+    and from a code-mode script that found it with tools.search;
+  - one inbox.request carries several calls and a question as one Inbox item,
+    and keeps the canonical tool name for a call that named the published one
     (the request is cancelled at the end).
 
 Inputs (environment):
@@ -30,6 +34,7 @@ holds no token.
 import base64
 import json
 import os
+import re
 import subprocess
 import sys
 import time
@@ -44,7 +49,9 @@ NS = os.environ.get("NAMESPACE", "toolyard-test")
 EXPECT = os.environ.get("EXPECT_RANKED_BY", "")
 REPORT = os.environ.get("REPORT", "/tmp/small-tools-e2e.json")
 REASON = "five-tool list and tool search end-to-end test on the test deployment (TEC-1807)"
-FIVE = {"tools.search", "getToolDocs", "executeToolCode", "inbox.request", "inbox.status"}
+# The five tools as tools/list shows them: OpenAI-safe published names.
+FIVE = {"tools_search", "getToolDocs", "executeToolCode", "inbox_request", "inbox_status"}
+SAFE_NAME = re.compile(r"^[a-zA-Z0-9_-]{1,64}$")
 RUN_FOR_ACCESS = {"allow": "now", "ask": "needs_approval", "deny": "blocked"}
 
 results = []
@@ -178,6 +185,9 @@ def main():
         check("an agent switched to the full list lists every tool it may use",
               sc.get("tool_list") == "full" and len(full) > 5 and FIVE <= set(full),
               {"tool_list": sc.get("tool_list"), "count": len(full)})
+        bad = [n for n in small + full if not SAFE_NAME.match(n)]
+        check("every listed name matches ^[a-zA-Z0-9_-]{1,64}$ and none repeats",
+              not bad and len(set(full)) == len(full), bad[:10] or "%d names" % len(full))
         sc = set_tool_list(admin, agent_id, "small")
         again = agent.list_names()
         check("switching back shows the five again", sc.get("tool_list") in ("small", "", None) and set(again) == FIVE,
@@ -188,19 +198,24 @@ def main():
     # --- Done means 3 (text): permission and batching guidance -------------
     def guidance():
         low = instructions.lower()
-        check("instructions name inbox.request as the way to get permission and ask to batch",
-              "inbox.request" in instructions and "batch" in low and "tools.search" in instructions, instructions[:300])
+        check("instructions name inbox_request as the way to get permission and ask to batch",
+              "inbox_request" in instructions and "batch" in low and "tools_search" in instructions, instructions[:300])
+        check("instructions say the dotted names work too", "dotted names work" in low, instructions[:300])
         report["instructions"] = instructions
     step("instructions", guidance)
 
     # --- Done means 2 and 3: search, ranking and run status ----------------
     def search():
-        res = agent.tool("tools.search", {"query": "who am I and what may I use", "limit": 8})
+        res = agent.tool("tools_search", {"query": "who am I and what may I use", "limit": 8})
         hits = res.get("results", [])
         names = [x.get("name") for x in hits]
         report["search"] = {k: res.get(k) for k in ("mode", "ranked_by", "fallback", "matched")}
         report["search"]["top"] = [(x.get("name"), x.get("run"), x.get("score")) for x in hits]
         check("search finds access.whoami, which the list does not show", "access.whoami" in names, names)
+        mcp_names = {x.get("name"): x.get("mcp_name") for x in hits}
+        check("every hit gives its listed name (mcp_name)",
+              hits and all(SAFE_NAME.match(v or "") for v in mcp_names.values()) and mcp_names.get("access.whoami") == "access_whoami",
+              mcp_names)
         check("search says how it ranked", res.get("ranked_by") in ("jev", "keyword", "regex", "name"),
               report["search"])
         if EXPECT:
@@ -227,7 +242,7 @@ def main():
             want = {"memory.set": "needs_approval", "Context7.query-docs": "blocked"}
             got, mism = {}, []
             for name in want:
-                res = agent.tool("tools.search", {"query": name.replace(".", " ").replace("-", " "), "limit": 10})
+                res = agent.tool("tools_search", {"query": name.replace(".", " ").replace("-", " "), "limit": 10})
                 hit = next((x for x in res.get("results", []) if x.get("name") == name), None)
                 got[name] = hit and hit.get("run")
                 ex = agent.tool("policies.explain", {"tool": name})
@@ -246,7 +261,10 @@ def main():
     # --- Done means 4: a tool that is not listed still runs ----------------
     def hidden_calls():
         direct = agent.tool("access.whoami", {})
-        check("a tool that is not listed runs through tools/call", bool(direct.get("caller_id")), list(direct)[:6])
+        check("a tool that is not listed runs through tools/call by its canonical name", bool(direct.get("caller_id")), list(direct)[:6])
+        published = agent.tool("access_whoami", {})
+        check("the same tool runs by its published name", published.get("caller_id") == direct.get("caller_id"),
+              list(published)[:6])
         script = """
 const found = await tools.search("who am I", { limit: 3 });
 const hit = found.find(x => x.name === "access.whoami") || found[0];
@@ -287,12 +305,13 @@ return { top: found.map(x => [x.name, x.run]), caller: me.caller_id || null };
             "schema_version": 3,
             "tools": [dict(call, call_id="write_a", summary="Write test key A.",
                            params={"scope": "test", "key": key + "-a", "value": "a"}),
-                      dict(call, call_id="write_b", summary="Write test key B.",
+                      # The published name: the Inbox keeps the canonical one.
+                      dict(call, call_id="write_b", tool="memory_set", summary="Write test key B.",
                            params={"scope": "test", "key": key + "-b", "value": "b"})],
             "questions": [{"id": "q1", "type": "single_choice", "prompt": "Keep the test entries?",
                            "options": [{"id": "no", "label": "No"}, {"id": "yes", "label": "Yes"}]}],
         }
-        res = agent.tool("inbox.request", args)
+        res = agent.tool("inbox_request", args)
         rid = res.get("request_id")
         report["inbox_request"] = {k: res.get(k) for k in ("ok", "request_id", "problems", "preview")}
         if not check("one inbox.request with two calls and a question is accepted", res.get("ok") and rid, report["inbox_request"]):
@@ -300,11 +319,13 @@ return { top: found.map(x => [x.name, x.run]), caller: me.caller_id || null };
         pv = res.get("preview") or {}
         check("the one request is one Inbox card with both calls and the question",
               pv.get("tools") == 2 and pv.get("questions") == 1, pv)
-        st = agent.tool("inbox.status", {"ids": [rid]})
+        st = agent.tool("inbox_status", {"ids": [rid]})
         reqs = st.get("requests", [])
         tools_n = len(reqs[0].get("tools", [])) if reqs else 0
         check("inbox.status shows one item with both calls", len(reqs) == 1 and tools_n == 2,
               {"items": len(reqs), "calls": tools_n})
+        kept = [x.get("tool") for x in (reqs[0].get("tools", []) if reqs else [])]
+        check("the request keeps the canonical name for a call that named memory_set", kept == ["memory.set", "memory.set"], kept)
         report["inbox_request_id"] = rid
         if os.environ.get("KEEP_INBOX") != "1":
             agent.tool("inbox.cancel", {"request_id": rid})

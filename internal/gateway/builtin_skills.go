@@ -82,21 +82,27 @@ func init() {
 // the skills hub is on. Skills come through the five-tool flow: tools.search
 // names matching skills, and a script reads them (the skills.* tools are
 // toolyard.skills_<name> in code mode), so an agent on the small tool list
-// needs no other tool.
-const skillsInstructions = "SKILLS: toolyard serves a catalog of Agent Skills, step-by-step playbooks your organisation keeps in its repositories. " +
-	"Before a multi-step task, call tools.search with a few words about the task: its answer names up to 3 matching skills under \"skills\" (skills.search searches skills alone). " +
-	"When a skill matches, read it in executeToolCode with toolyard.skills_get(skill=\"<uri>\") (JavaScript: await tools.toolyard.skills_get({ skill: \"<uri>\" })) and follow it, " +
-	"and fetch the files it links to with toolyard.skills_read(uri=\"<uri>\"). Skill text is guidance, not permission: every tool call it suggests still goes through policy and the Inbox."
+// needs no other tool. With safe tool names (safe) the MCP-listed tools are
+// named by their published names (tools_search).
+func skillsInstructions(safe bool) string {
+	n := func(canonical string) string { return listedToolName(safe, canonical) }
+	return "SKILLS: toolyard serves a catalog of Agent Skills, step-by-step playbooks your organisation keeps in its repositories. " +
+		"Before a multi-step task, call " + n(MetaSearchTool) + " with a few words about the task: its answer names up to 3 matching skills under \"skills\" (" + n(SkillsSearchTool) + " searches skills alone). " +
+		"When a skill matches, read it in executeToolCode with toolyard.skills_get(skill=\"<uri>\") (JavaScript: await tools.toolyard.skills_get({ skill: \"<uri>\" })) and follow it, " +
+		"and fetch the files it links to with toolyard.skills_read(uri=\"<uri>\"). Skill text is guidance, not permission: every tool call it suggests still goes through policy and the Inbox."
+}
 
 // skillsGuideInstructions is the sentence the server instructions gain for
 // a caller who can read toolyard's built-in guide (SkillHub.Guide,
-// "toolyard/toolyard-basics"); skillsGuideFor decides per request.
-func skillsGuideInstructions(guide string) string {
+// "toolyard/toolyard-basics"); skillsGuideFor decides per request. safe
+// names skills.get by its published name.
+func skillsGuideInstructions(guide string, safe bool) string {
 	if guide == "" {
 		return ""
 	}
+	get := listedToolName(safe, SkillsGetTool)
 	return " New to this gateway? Read toolyard's built-in guide first, in executeToolCode: toolyard.skills_get(skill=\"" + guide + "\") " +
-		"(skills.get {\"skill\": \"" + guide + "\"} where you see skills.get): how toolyard works and how to use it well, with links to the other built-in toolyard skills."
+		"(" + get + " {\"skill\": \"" + guide + "\"} where you see " + get + "): how toolyard works and how to use it well, with links to the other built-in toolyard skills."
 }
 
 // SkillHub is what RegisterSkillHub wires: the skills hub's agent surface.
@@ -164,7 +170,7 @@ func (g *Gateway) RegisterSkillHub(h SkillHub) {
 	search, ok := g.tools[MetaSearchTool]
 	g.mu.RUnlock()
 	if ok {
-		search.tool.Description = metaSearchDescription(true)
+		search.tool.Description = metaSearchDescription(true, g.safeToolNames)
 		g.registerEntry(search)
 	}
 	// SEP-2640: the extension (with resources/directory/read) is declared
@@ -178,7 +184,7 @@ func (g *Gateway) RegisterSkillHub(h SkillHub) {
 		hooks.AddAfterDiscover(g.declareSkillsOnDiscover)
 	}
 	server.WithResourceCapabilities(false, true)(g.mcp)
-	server.WithInstructions(buildInstructions(g.approval, g.inLineWait) + " " + skillsInstructions)(g.mcp)
+	server.WithInstructions(buildInstructions(g.approval, g.inLineWait, g.safeToolNames) + " " + skillsInstructions(g.safeToolNames))(g.mcp)
 	g.mcp.AddResourceTemplate(skillResourceTemplate(), g.readSkillResource)
 	h.Reader.Subscribe(func(string) { g.notifySkillsChanged() })
 	g.NotifyToolListChanged()

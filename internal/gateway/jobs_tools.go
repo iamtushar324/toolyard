@@ -1197,6 +1197,9 @@ func (g *Gateway) handleJobsStart() directHandler {
 		if target == "" {
 			return mcp.NewToolResultError("tool is required"), nil
 		}
+		// A published name (jobs_status) is checked as its canonical
+		// name, so the guards below hold for either name.
+		target = g.resolveToolName(target)
 		if strings.HasPrefix(target, jobsUpstream+".") {
 			return mcp.NewToolResultErrorf("%s cannot run as a job", target), nil
 		}

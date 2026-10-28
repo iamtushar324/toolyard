@@ -221,6 +221,8 @@ export interface SearchOptions {
 export interface SearchResult {
   /** The catalog name. */
   name: string;
+  /** The name an MCP client's tools/list shows for it, where the gateway lists OpenAI-safe names (inbox_request for inbox.request); scripts keep using code. */
+  mcp_name?: string;
   upstream?: string;
   description?: string;
   /** The name to call it by: tools.<code>, or tools.call("<code>", args). */

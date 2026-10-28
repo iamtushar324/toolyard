@@ -535,6 +535,9 @@ func (g *Gateway) handlePoliciesExplain() directHandler {
 		if tool == "" {
 			return mcp.NewToolResultError("tool is required"), nil
 		}
+		// A published name (tools_search) explains its canonical tool,
+		// under the canonical name policies use.
+		tool = g.resolveToolName(tool)
 		g.mu.RLock()
 		e, ok := g.tools[tool]
 		g.mu.RUnlock()
@@ -599,6 +602,11 @@ func (g *Gateway) changePolicy(ctx context.Context, args map[string]any, clear b
 	}
 	if target == "" {
 		return mcp.NewToolResultError("target is required: a tool's catalog name (scope tool) or a server name (scope upstream)"), nil
+	}
+	// A tool rule is stored under the canonical name, the one routing
+	// matches: a published name (inbox_request) names the same tool.
+	if scope == policy.ScopeTool {
+		target = g.resolveToolName(target)
 	}
 	if !clear && want != AccessAllow && want != AccessAsk && want != AccessDeny {
 		return mcp.NewToolResultError("access must be allow, ask or deny"), nil

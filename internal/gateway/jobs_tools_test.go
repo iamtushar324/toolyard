@@ -98,6 +98,8 @@ type jobsFixtureConfig struct {
 	resolver access.Resolver
 	inbox    bool
 	jobOpts  func(*jobs.Options)
+	// safeNames turns on safe tool names (tool_names.go).
+	safeNames bool
 }
 
 func newJobsFixture(t *testing.T, opts ...func(*jobsFixtureConfig)) *jobsFixture {
@@ -124,6 +126,7 @@ func newJobsFixture(t *testing.T, opts ...func(*jobsFixtureConfig)) *jobsFixture
 	if cfg.resolver != nil {
 		gopts.Access = cfg.resolver
 	}
+	gopts.SafeToolNames = cfg.safeNames
 	f.gw = New(gopts)
 	f.gw.RegisterBuiltins()
 	f.gw.SetAsyncPolicy(f.rules)
