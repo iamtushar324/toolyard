@@ -107,6 +107,9 @@ type Tool struct {
 	// gateway's injected fields (_reason and friends) already removed.
 	Properties map[string]any
 	Required   []string
+	// Defs is the input schema's root $defs, so a property's local $ref
+	// ("#/$defs/X") resolves; nil when the schema has none.
+	Defs map[string]any
 	// OutputSchema is the tool's declared output JSON Schema, nil when it
 	// declares none; the TypeScript stubs type results from it.
 	OutputSchema map[string]any

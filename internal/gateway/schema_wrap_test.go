@@ -1,6 +1,7 @@
 package gateway
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 
@@ -97,5 +98,104 @@ func TestExtractReason(t *testing.T) {
 	// Missing
 	if _, _, _, err := extractReason(map[string]any{}, ReasonField); err == nil {
 		t.Error("expected error for missing reason")
+	}
+}
+
+func TestWrapSchemaKeepsDefs(t *testing.T) {
+	filter := map[string]any{"type": "object", "properties": map[string]any{"threadId": map[string]any{"type": "string"}}}
+	parsed := mcp.Tool{
+		Name: "brief",
+		InputSchema: mcp.ToolInputSchema{
+			Type:       "object",
+			Properties: map[string]any{"filter": map[string]any{"$ref": "#/$defs/Filter"}},
+			Defs:       map[string]any{"Filter": filter},
+		},
+	}
+	out, _ := wrapSchema(parsed)
+	if out.InputSchema.Defs["Filter"] == nil {
+		t.Fatalf("parsed schema lost $defs: %#v", out.InputSchema.Defs)
+	}
+
+	raw := mcp.Tool{
+		Name:           "brief_raw",
+		RawInputSchema: []byte(`{"type":"object","properties":{"filter":{"$ref":"#/$defs/Filter"}},"$defs":{"Filter":{"type":"object"}}}`),
+	}
+	out, _ = wrapSchema(raw)
+	if out.InputSchema.Defs["Filter"] == nil {
+		t.Fatalf("raw schema lost $defs: %#v", out.InputSchema.Defs)
+	}
+
+	draft07 := mcp.Tool{
+		Name:           "brief_draft07",
+		RawInputSchema: []byte(`{"type":"object","properties":{"filter":{"anyOf":[{"$ref":"#/definitions/Filter"},{"type":"null"}]}},"definitions":{"Filter":{"type":"object"}}}`),
+	}
+	out, _ = wrapSchema(draft07)
+	if out.InputSchema.Defs["Filter"] == nil {
+		t.Fatalf("draft-07 schema lost definitions: %#v", out.InputSchema.Defs)
+	}
+	b, err := json.Marshal(out.InputSchema)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(b), `"$ref":"#/$defs/Filter"`) || !strings.Contains(string(b), `"$defs":{"Filter"`) {
+		t.Errorf("draft-07 refs not rewritten to $defs: %s", b)
+	}
+}
+
+// TestWrapSchemaRewritesOnlySchemaRefs: a draft-07 "$ref" inside const,
+// enum, default or examples is data and stays as it is.
+func TestWrapSchemaRewritesOnlySchemaRefs(t *testing.T) {
+	raw := mcp.Tool{
+		Name: "data_refs",
+		RawInputSchema: []byte(`{"type":"object","definitions":{"Filter":{"type":"object","properties":{"next":{"$ref":"#/definitions/Filter"}}}},
+			"properties":{
+				"filter":{"type":"array","items":{"$ref":"#/definitions/Filter"}},
+				"marker":{"const":{"$ref":"#/definitions/Filter"}},
+				"kind":{"enum":[{"$ref":"#/definitions/Filter"}],"default":{"$ref":"#/definitions/Filter"},"examples":[{"$ref":"#/definitions/Filter"}]}}}`),
+	}
+	out, _ := wrapSchema(raw)
+	props := out.InputSchema.Properties
+	if got := props["filter"].(map[string]any)["items"].(map[string]any)["$ref"]; got != "#/$defs/Filter" {
+		t.Errorf("schema ref not rewritten: %v", got)
+	}
+	next := out.InputSchema.Defs["Filter"].(map[string]any)["properties"].(map[string]any)["next"].(map[string]any)
+	if next["$ref"] != "#/$defs/Filter" {
+		t.Errorf("ref inside $defs not rewritten: %v", next["$ref"])
+	}
+	kind := props["kind"].(map[string]any)
+	for name, data := range map[string]any{
+		"const":    props["marker"].(map[string]any)["const"],
+		"enum":     kind["enum"].([]any)[0],
+		"default":  kind["default"],
+		"examples": kind["examples"].([]any)[0],
+	} {
+		if got := data.(map[string]any)["$ref"]; got != "#/definitions/Filter" {
+			t.Errorf("%s data changed to %v", name, got)
+		}
+	}
+}
+
+// TestWrapSchemaRewritesDependencyRefs: draft-07 schema-valued
+// "dependencies" and 2019-09 "dependentSchemas" are schemas, so their refs
+// follow the definitions rename; a property-name list stays as it is.
+func TestWrapSchemaRewritesDependencyRefs(t *testing.T) {
+	raw := mcp.Tool{
+		Name: "deps",
+		RawInputSchema: []byte(`{"type":"object","definitions":{"F":{"type":"object"}},
+			"properties":{"card":{"type":"object",
+				"dependencies":{"a":{"$ref":"#/definitions/F"},"b":["c","#/definitions/F"]},
+				"dependentSchemas":{"d":{"$ref":"#/definitions/F"}}}}}`),
+	}
+	out, _ := wrapSchema(raw)
+	card := out.InputSchema.Properties["card"].(map[string]any)
+	deps := card["dependencies"].(map[string]any)
+	if got := deps["a"].(map[string]any)["$ref"]; got != "#/$defs/F" {
+		t.Errorf("dependencies schema ref not rewritten: %v", got)
+	}
+	if got := deps["b"].([]any); len(got) != 2 || got[0] != "c" || got[1] != "#/definitions/F" {
+		t.Errorf("dependencies name list changed: %v", got)
+	}
+	if got := card["dependentSchemas"].(map[string]any)["d"].(map[string]any)["$ref"]; got != "#/$defs/F" {
+		t.Errorf("dependentSchemas ref not rewritten: %v", got)
 	}
 }

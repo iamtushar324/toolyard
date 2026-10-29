@@ -395,7 +395,14 @@ func TestPythonTypes(t *testing.T) {
 		{map[string]any{"type": "string", "enum": []string{"allow", "ask", "deny"}}, `Literal["allow", "ask", "deny"]`},
 		{map[string]any{"enum": []any{1.0, 2.0}}, "Literal[1, 2]"},
 		{map[string]any{"const": "fixed"}, `Literal["fixed"]`},
-		{map[string]any{"type": []any{"string", "null"}}, "Any"},
+		{map[string]any{"type": []any{"string", "null"}}, "Optional[str]"},
+		{map[string]any{"type": []any{"string", "integer"}}, "Union[str, int]"},
+		// The shape bkt3 sends for every optional parameter.
+		{map[string]any{"anyOf": []any{prop("string", "Session id"), prop("null", "")}}, "Optional[str]"},
+		{map[string]any{"oneOf": []any{prop("string", ""), prop("integer", "")}}, "Union[str, int]"},
+		{map[string]any{"anyOf": []any{prop("string", ""), prop("integer", ""), prop("null", "")}}, "Optional[Union[str, int]]"},
+		{map[string]any{"type": "array", "items": map[string]any{"anyOf": []any{prop("string", ""), prop("null", "")}}}, "list[Optional[str]]"},
+		{map[string]any{"$ref": "#/$defs/Missing"}, "Any"},
 		{"not a schema", "Any"},
 	}
 	for _, c := range cases {
@@ -438,6 +445,286 @@ func TestGetToolDocs(t *testing.T) {
 	}
 	if miss, ok := rt.GetToolDocs(ctx, "Nope", "x"); ok || !strings.HasPrefix(miss, "Server 'Nope' not found. Available servers are:\n  - BkCoreServices\n  - memory") {
 		t.Fatalf("missing server: %s", miss)
+	}
+}
+
+func TestPythonTypeResolvesRefs(t *testing.T) {
+	defs := map[string]any{
+		"Mode":  map[string]any{"type": "string", "enum": []any{"fast", "slow"}},
+		"Loop":  map[string]any{"$ref": "#/$defs/Loop"},
+		"Old":   prop("integer", ""),
+		"a/b~c": prop("boolean", ""),
+	}
+	cases := []struct {
+		prop any
+		want string
+	}{
+		{map[string]any{"$ref": "#/$defs/Mode"}, `Literal["fast", "slow"]`},
+		{map[string]any{"$ref": "#/definitions/Old"}, "int"},
+		{map[string]any{"$ref": "#/$defs/a~1b~0c"}, "bool"},
+		{map[string]any{"anyOf": []any{map[string]any{"$ref": "#/$defs/Mode"}, prop("null", "")}}, `Optional[Literal["fast", "slow"]]`},
+		{map[string]any{"$ref": "#/$defs/Loop"}, "Any"},
+		{map[string]any{"$ref": "https://example.com/x.json"}, "Any"},
+	}
+	for _, c := range cases {
+		if got := pyType(c.prop, defs, 0); got != c.want {
+			t.Errorf("pyType(%v) = %q, want %q", c.prop, got, c.want)
+		}
+	}
+}
+
+// sessionBrief is bkt3's t3_session_brief as it reaches the gateway: a
+// required string, an optional one in the anyOf/null shape with the
+// description on the branch, a $ref parameter and a nested object.
+var sessionBrief = Tool{
+	Server: "BkT3", Name: "t3_session_brief", Target: "BkT3.t3_session_brief",
+	Description: "Read where a session stands.",
+	Properties: map[string]any{
+		"session": prop("string", "Session id or title"),
+		"cursor": map[string]any{"anyOf": []any{
+			map[string]any{"type": "string", "description": "Resume after this event"},
+			map[string]any{"type": "null"},
+		}},
+		"format": map[string]any{"$ref": "#/$defs/Format"},
+		"filter": map[string]any{"anyOf": []any{
+			map[string]any{"$ref": "#/$defs/Filter"},
+			map[string]any{"type": "null"},
+		}},
+	},
+	Required: []string{"session"},
+	Defs: map[string]any{
+		"Format": map[string]any{"type": "string", "enum": []any{"markdown", "json"}, "description": "Answer format"},
+		"Filter": map[string]any{
+			"type": "object", "description": "Which events to include", "required": []any{"threadId"},
+			"properties": map[string]any{
+				"threadId": prop("string", "Thread to read"),
+				"kinds":    map[string]any{"type": "array", "items": prop("string", "")},
+				"since":    map[string]any{"anyOf": []any{prop("string", "ISO time\nmore"), prop("null", "")}},
+			},
+		},
+	},
+	ReasonField: "_reason",
+}
+
+func TestGetToolDocsOptionalAndNestedParams(t *testing.T) {
+	f := newFake()
+	f.tools = append(f.tools, sessionBrief)
+	rt := inProcess(f, Limits{})
+	doc, ok := rt.GetToolDocs(context.Background(), "BkT3", "t3_session_brief")
+	if !ok {
+		t.Fatalf("docs: %s", doc)
+	}
+	for _, want := range []string{
+		`def t3_session_brief(session: str, cursor: Optional[str] = None, filter: Optional[dict] = None, format: Literal["markdown", "json"] = None) -> dict:`,
+		"        cursor (Optional[str]): Resume after this event (optional)\n",
+		"        filter (Optional[dict]): Which events to include (optional)\n" +
+			"            - threadId (str, required): Thread to read\n" +
+			"            - kinds (list[str], optional)\n" +
+			"            - since (Optional[str], optional): ISO time\n",
+		`        format (Literal["markdown", "json"]): Answer format (optional)` + "\n",
+		"        session (str): Session id or title (required)\n",
+	} {
+		if !strings.Contains(doc, want) {
+			t.Errorf("docs missing %q:\n%s", want, doc)
+		}
+	}
+	if strings.Contains(doc, "cursor parameter") || strings.Contains(doc, "(Any)") {
+		t.Errorf("docs still fall back to the defaults:\n%s", doc)
+	}
+}
+
+func TestGetToolDocsCapsNestedFields(t *testing.T) {
+	fields := map[string]any{}
+	for i := 0; i < maxNestedFields+3; i++ {
+		fields[fmt.Sprintf("f%02d", i)] = prop("string", "")
+	}
+	f := newFake()
+	f.tools = append(f.tools, Tool{Server: "BkT3", Name: "wide", Target: "BkT3.wide", ReasonField: "_reason",
+		Properties: map[string]any{"opts": map[string]any{"type": "object", "properties": fields}}})
+	doc, ok := inProcess(f, Limits{}).GetToolDocs(context.Background(), "BkT3", "wide")
+	if !ok {
+		t.Fatalf("docs: %s", doc)
+	}
+	if !strings.Contains(doc, "            - f19 (str, optional)\n            - ... and 3 more fields\n") || strings.Contains(doc, "- f20 ") {
+		t.Errorf("nested fields not capped at %d:\n%s", maxNestedFields, doc)
+	}
+}
+
+// TestLongEnumIsListedOnceAndShort: a 260-value enum (bkt3 t3_ui_call's
+// action) made getToolDocs about 17,000 characters, printed twice.
+func TestLongEnumIsListedOnceAndShort(t *testing.T) {
+	enum := make([]any, 260)
+	for i := range enum {
+		enum[i] = fmt.Sprintf("action_%03d", i)
+	}
+	uiCall := Tool{Server: "BkT3", Name: "t3_ui_call", Target: "BkT3.t3_ui_call", ReasonField: "_reason",
+		Description: "Call one action of the web app.",
+		Properties: map[string]any{
+			"action": map[string]any{"type": "string", "enum": enum, "description": "The action to run"},
+			"input":  prop("object", "The action's input"),
+		},
+		Required: []string{"action"}}
+	f := newFake()
+	f.tools = append(f.tools, uiCall)
+	doc, ok := inProcess(f, Limits{}).GetToolDocs(context.Background(), "BkT3", "t3_ui_call")
+	if !ok {
+		t.Fatalf("docs: %s", doc)
+	}
+	if len(doc) > 3000 {
+		t.Errorf("docs are %d bytes, want under 3000:\n%s", len(doc), doc)
+	}
+	for _, want := range []string{
+		"def t3_ui_call(action: str, input: dict = None) -> dict:",
+		"        action (str): The action to run (required)\n",
+		`            Allowed values: "action_000", "action_001",`,
+		`"action_019" … and 240 more (see tools.search or the server's list tool)`,
+	} {
+		if !strings.Contains(doc, want) {
+			t.Errorf("docs missing %q:\n%s", want, doc)
+		}
+	}
+	if n := strings.Count(doc, `"action_000"`); n != 1 {
+		t.Errorf("first enum value printed %d times, want once:\n%s", n, doc)
+	}
+	if strings.Contains(doc, "action_020") {
+		t.Errorf("docs list more than %d values:\n%s", enumShown, doc)
+	}
+
+	cat := buildCatalog([]Tool{uiCall})
+	srv := cat.byIdent("BkT3")
+	b, _ := srv.lookup("t3_ui_call")
+	if b == nil {
+		t.Fatal("no tool BkT3.t3_ui_call")
+	}
+	// The usage line may name one value as its example; the list itself
+	// appears once.
+	ts := tsTool(srv, *b)
+	if len(ts) > 3000 || strings.Count(ts, `"action_000", "action_001"`) != 1 || strings.Contains(ts, "action_020") || !strings.Contains(ts, "action: string;") {
+		t.Errorf("TypeScript stub (%d bytes) does not list the enum once and short:\n%s", len(ts), ts)
+	}
+	if got := pythonType(map[string]any{"enum": enum}); got != "str" {
+		t.Errorf("untyped long enum = %q, want str", got)
+	}
+}
+
+// tsStub renders one tool's .d.ts through a catalog of just that tool.
+func tsStub(t *testing.T, tool Tool) string {
+	t.Helper()
+	cat := buildCatalog([]Tool{tool})
+	srv := cat.byIdent(tool.Server)
+	if srv == nil {
+		t.Fatalf("no server %s", tool.Server)
+	}
+	b, _ := srv.lookup(tool.Name)
+	if b == nil {
+		t.Fatalf("no tool %s.%s", tool.Server, tool.Name)
+	}
+	return tsTool(srv, *b)
+}
+
+func TestTypeScriptResolvesRefsAndBranchDescriptions(t *testing.T) {
+	ts := tsStub(t, sessionBrief)
+	for _, want := range []string{
+		"  /** Session id or title */\n  session: string;\n",
+		"  /** Resume after this event */\n  cursor?: string | null;\n",
+		"  /** Which events to include */\n  filter?: {\n    /** Thread to read */\n    threadId: string;\n    kinds?: string[];\n",
+		"  } | null;\n",
+		"  /** Answer format */\n  format?: \"markdown\" | \"json\";\n",
+	} {
+		if !strings.Contains(ts, want) {
+			t.Errorf("TypeScript stub missing %q:\n%s", want, ts)
+		}
+	}
+	if strings.Contains(ts, ": unknown") {
+		t.Errorf("a $ref stayed unknown:\n%s", ts)
+	}
+}
+
+func longEnum(n int) []any {
+	enum := make([]any, n)
+	for i := range enum {
+		enum[i] = fmt.Sprintf("action_%03d", i)
+	}
+	return enum
+}
+
+// TestLongEnumInItemsAndNestedFields: a long enum shown as its base type
+// in array items or a nested field still lists its first values once.
+func TestLongEnumInItemsAndNestedFields(t *testing.T) {
+	enum := longEnum(260)
+	bulk := Tool{Server: "BkT3", Name: "bulk", Target: "BkT3.bulk", ReasonField: "_reason",
+		Properties: map[string]any{
+			"actions": map[string]any{"type": "array", "items": map[string]any{"type": "string", "enum": enum}},
+			"opts": map[string]any{"type": "object", "properties": map[string]any{
+				"mode": map[string]any{"type": "string", "enum": enum},
+			}},
+		}}
+	list := `"action_000", "action_001"`
+	more := "… and 240 more (see tools.search or the server's list tool)"
+
+	f := newFake()
+	f.tools = append(f.tools, bulk)
+	doc, ok := inProcess(f, Limits{}).GetToolDocs(context.Background(), "BkT3", "bulk")
+	if !ok {
+		t.Fatalf("docs: %s", doc)
+	}
+	for _, want := range []string{
+		"        actions (list[str]): actions parameter (optional)\n            Allowed values: " + list,
+		"            - mode (str, optional)\n                Allowed values: " + list,
+		more,
+	} {
+		if !strings.Contains(doc, want) {
+			t.Errorf("docs missing %q:\n%s", want, doc)
+		}
+	}
+	if n := strings.Count(doc, list); n != 2 || strings.Contains(doc, "action_020") {
+		t.Errorf("want each long enum listed once and capped, got %d lists:\n%s", n, doc)
+	}
+
+	ts := tsStub(t, bulk)
+	for _, want := range []string{"  actions?: string[];\n", "    mode?: string;\n", more} {
+		if !strings.Contains(ts, want) {
+			t.Errorf("TypeScript stub missing %q:\n%s", want, ts)
+		}
+	}
+	if n := strings.Count(ts, list); n != 2 || strings.Contains(ts, "action_020") {
+		t.Errorf("want each long enum listed once and capped in TypeScript, got %d lists:\n%s", n, ts)
+	}
+}
+
+// TestUntypedLongEnumOfMixedValues: the base type covers every value.
+func TestUntypedLongEnumOfMixedValues(t *testing.T) {
+	mixed := append(longEnum(30), 1.0)
+	withNull := append(longEnum(30), nil)
+	withObject := append(longEnum(30), map[string]any{"a": 1.0})
+	cases := []struct {
+		enum   []any
+		py, ts string
+	}{
+		{longEnum(30), "str", "string"},
+		{mixed, "Union[str, float]", "string | number"},
+		{withNull, "Optional[str]", "string | null"},
+		{withObject, "Any", "unknown"},
+	}
+	for _, c := range cases {
+		schema := map[string]any{"enum": c.enum}
+		if got := pythonType(schema); got != c.py {
+			t.Errorf("pythonType(%d values) = %q, want %q", len(c.enum), got, c.py)
+		}
+		if got := tsType(schema, "", 0); got != c.ts {
+			t.Errorf("tsType(%d values) = %q, want %q", len(c.enum), got, c.ts)
+		}
+	}
+}
+
+func TestPropDocFallsBackToBranchDescription(t *testing.T) {
+	p := map[string]any{"anyOf": []any{map[string]any{"type": "string", "description": "Resume after this event"}, map[string]any{"type": "null"}}}
+	if got := propDoc(p); got != "Resume after this event" {
+		t.Errorf("propDoc = %q", got)
+	}
+	both := map[string]any{"anyOf": []any{prop("string", "a"), prop("integer", "b")}}
+	if got := propDoc(both); got != "" {
+		t.Errorf("propDoc of a two-branch union = %q, want empty", got)
 	}
 }
 

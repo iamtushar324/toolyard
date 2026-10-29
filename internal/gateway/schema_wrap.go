@@ -91,6 +91,7 @@ func wrapSchema(t mcp.Tool) (mcp.Tool, string) {
 	props := map[string]any{}
 	required := []string{}
 	additional := any(nil)
+	var defs map[string]any
 
 	// Decide source schema: prefer InputSchema (parsed), fall back to
 	// RawInputSchema (json.RawMessage from upstream).
@@ -101,6 +102,7 @@ func wrapSchema(t mcp.Tool) (mcp.Tool, string) {
 		}
 		required = append([]string(nil), t.InputSchema.Required...)
 		additional = t.InputSchema.AdditionalProperties
+		defs = t.InputSchema.Defs
 	} else if len(t.RawInputSchema) > 0 {
 		var raw map[string]any
 		if err := json.Unmarshal(t.RawInputSchema, &raw); err == nil {
@@ -117,6 +119,7 @@ func wrapSchema(t mcp.Tool) (mcp.Tool, string) {
 				}
 			}
 			additional = raw["additionalProperties"]
+			defs = rawDefs(raw, props)
 		}
 	}
 
@@ -172,10 +175,79 @@ func wrapSchema(t mcp.Tool) (mcp.Tool, string) {
 		Properties:           props,
 		Required:             required,
 		AdditionalProperties: additional,
+		Defs:                 defs,
 	}
 	out.RawInputSchema = nil // we have a structured schema now
 	out.Description = descriptionBanner + t.Description
 	return out, field
+}
+
+// rawDefs is a raw input schema's root $defs, so a property's local $ref
+// stays resolvable once the schema is rebuilt. A draft-07 schema keeps
+// them under "definitions"; the rebuilt schema emits them as $defs, so
+// its "#/definitions/X" refs are rewritten in place to "#/$defs/X".
+func rawDefs(raw map[string]any, props map[string]any) map[string]any {
+	if d, ok := raw["$defs"].(map[string]any); ok {
+		return d
+	}
+	d, ok := raw["definitions"].(map[string]any)
+	if !ok {
+		return nil
+	}
+	for _, sub := range d {
+		rewriteDefinitionRefs(sub)
+	}
+	for _, sub := range props {
+		rewriteDefinitionRefs(sub)
+	}
+	rewriteDefinitionRefs(raw["additionalProperties"])
+	return d
+}
+
+// Schema keywords whose value is one schema (or, for items, a list of
+// them), a list of schemas, or a map of name to schema. Only these are
+// walked: a "$ref" inside const, enum, default or examples is data.
+// Draft-07 "dependencies" maps a name to a schema or to a list of
+// property names; a list holds strings, which the walk leaves alone.
+var (
+	subschemaKeys = []string{"items", "additionalProperties", "additionalItems", "contains", "propertyNames",
+		"not", "if", "then", "else", "unevaluatedItems", "unevaluatedProperties"}
+	subschemaListKeys = []string{"anyOf", "oneOf", "allOf", "prefixItems"}
+	subschemaMapKeys  = []string{"properties", "patternProperties", "$defs", "definitions", "dependentSchemas", "dependencies"}
+)
+
+// rewriteDefinitionRefs turns every "#/definitions/X" $ref in schema and
+// its subschemas into "#/$defs/X".
+func rewriteDefinitionRefs(schema any) {
+	const prefix = "#/definitions/"
+	switch v := schema.(type) {
+	case []any: // items in its list form
+		for _, sub := range v {
+			rewriteDefinitionRefs(sub)
+		}
+		return
+	case map[string]any:
+		if ref, ok := v["$ref"].(string); ok && strings.HasPrefix(ref, prefix) {
+			v["$ref"] = "#/$defs/" + strings.TrimPrefix(ref, prefix)
+		}
+		for _, k := range subschemaKeys {
+			rewriteDefinitionRefs(v[k])
+		}
+		for _, k := range subschemaListKeys {
+			if subs, ok := v[k].([]any); ok {
+				for _, sub := range subs {
+					rewriteDefinitionRefs(sub)
+				}
+			}
+		}
+		for _, k := range subschemaMapKeys {
+			if subs, ok := v[k].(map[string]any); ok {
+				for _, sub := range subs {
+					rewriteDefinitionRefs(sub)
+				}
+			}
+		}
+	}
 }
 
 func appendUnique(xs []string, s string) []string {
