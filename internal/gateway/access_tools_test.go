@@ -632,6 +632,53 @@ func TestAuditMineOnlyOwnRowsWithoutBodies(t *testing.T) {
 	}
 }
 
+// TestAuditMineDispatchID: a call's result names its dispatch, and
+// audit.mine dispatch_id=… returns that dispatch's rows only, each with
+// its dispatch id and outcome (TEC-1816).
+func TestAuditMineDispatchID(t *testing.T) {
+	f := newAccessFixture(t, nil)
+	first := f.call(t, f.member, "alpha.get_status", map[string]any{"n": 1})
+	if first.IsError || first.Meta == nil {
+		t.Fatalf("call: %+v", first)
+	}
+	id, _ := first.Meta.AdditionalFields[DispatchIDMarker].(string)
+	if !strings.HasPrefix(id, "dispatch_") {
+		t.Fatalf("no dispatch id in %v", first.Meta.AdditionalFields)
+	}
+	if res := f.call(t, f.member, "alpha.get_status", map[string]any{"n": 2}); res.IsError {
+		t.Fatal(textOf(res))
+	}
+	res := f.call(t, f.member, "audit.mine", map[string]any{"dispatch_id": id})
+	if res.IsError {
+		t.Fatalf("audit.mine: %s", textOf(res))
+	}
+	var out struct {
+		DispatchID string         `json:"dispatch_id"`
+		Count      int            `json:"count"`
+		Calls      []auditMineRow `json:"calls"`
+	}
+	if err := json.Unmarshal([]byte(textOf(res)), &out); err != nil {
+		t.Fatal(err)
+	}
+	outcomes := map[string]bool{}
+	for _, c := range out.Calls {
+		if c.DispatchID != id || c.Tool != "alpha.get_status" {
+			t.Fatalf("a row of another dispatch: %+v", c)
+		}
+		outcomes[c.Outcome] = true
+	}
+	if out.DispatchID != id || out.Count != 2 || !outcomes["started"] || !outcomes["succeeded"] {
+		t.Fatalf("dispatch rows = %+v", out)
+	}
+	// Another agent's dispatch id finds nothing.
+	other := f.call(t, f.admin, "alpha.get_status", nil)
+	otherID, _ := other.Meta.AdditionalFields[DispatchIDMarker].(string)
+	res = f.call(t, f.member, "audit.mine", map[string]any{"dispatch_id": otherID})
+	if err := json.Unmarshal([]byte(textOf(res)), &out); err != nil || otherID == "" || out.Count != 0 {
+		t.Fatalf("another agent's dispatch: %v %s", err, textOf(res))
+	}
+}
+
 func TestAccessWhoami(t *testing.T) {
 	f := newAccessFixture(t, nil)
 	whoami := func(ctx context.Context) map[string]any {

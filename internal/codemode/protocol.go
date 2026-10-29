@@ -125,6 +125,12 @@ type parentMsg struct {
 	Status string `json:"status,omitempty"`
 	// ApprovalID names the legacy approval a deferred call waits on.
 	ApprovalID string `json:"approvalId,omitempty"`
+	// DispatchID names the gateway dispatch that made the call ("" when
+	// the call never reached one), for audit.mine dispatch_id=… .
+	DispatchID string `json:"dispatchId,omitempty"`
+	// Warning is the gateway's warning about a call that otherwise
+	// answered normally (its audit row is missing).
+	Warning string `json:"warning,omitempty"`
 }
 
 // cut bounds s to max bytes (on a rune boundary), marking the cut.

@@ -515,6 +515,21 @@ func (s *session) perform(pc *preparedCall) (reply parentMsg) {
 
 	var res *mcp.CallToolResult
 	handled := false
+	// Every answer to a call that reached a dispatch names it, success or
+	// failure, so try_call can hand the id to the script.
+	// A read whose audit row is missing keeps its value; the warning goes
+	// to try_call and to the run's output, which echo none does not hide.
+	defer func() {
+		if reply.DispatchID == "" {
+			reply.DispatchID = dispatchIDOf(res)
+		}
+		if w := auditWarningOf(res); w != "" && !handled {
+			reply.Warning = w
+			// print, not echoLine: echo preview and none keep it, and a
+			// structured run's Logs carry it too.
+			s.print(fmt.Sprintf("[TOOL] %s warning: %s", label, w))
+		}
+	}()
 	if s.hooks != nil {
 		var herr error
 		res, handled, herr = s.beforeCall(&pcall)

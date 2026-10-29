@@ -2257,7 +2257,7 @@ func (g *Gateway) dispatch(ctx context.Context, entry toolEntry, args map[string
 	outcome.EventType = audit.EventCallSucceeded
 	if err != nil {
 		outcome.EventType = audit.EventCallFailed
-		outcome.ResultSummary = err.Error()
+		outcome.ResultSummary = auditText(err.Error(), summaryMaxBytes)
 	} else {
 		outcome.ResultSummary = summariseResult(res)
 		if res.IsError {
@@ -2270,9 +2270,30 @@ func (g *Gateway) dispatch(ctx context.Context, entry toolEntry, args map[string
 	auditCancel()
 	if auditErr != nil {
 		auditWriteFailed("outcome", dispatchID, entry, auditErr)
-		ev.Outcome = metrics.OutcomeError
-		ev.ErrorClass = "audit_outcome_unknown"
-		return outcomeUnknown(mcp.NewToolResultError("Tool outcome unknown: completion audit failed. Do not retry. Review dispatch " + dispatchID + " before another action.")), nil
+		// One retry with the smallest row: the same identifiers and event
+		// type, and a fixed marker instead of the summary, in case the
+		// summary is what the store refused.
+		minimal := outcome
+		minimal.ResultSummary = "(summary not saved)"
+		retryCtx, retryCancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		auditErr = g.audit.Write(retryCtx, minimal)
+		retryCancel()
+		if auditErr != nil {
+			auditWriteFailed("outcome_retry", dispatchID, entry, auditErr)
+		}
+	}
+	auditMissing := false
+	if auditErr != nil {
+		if !isReadOnlyTool(entry) {
+			// A write whose completion is not on record: the agent must not
+			// repeat it, but it learns what the upstream call itself said.
+			ev.Outcome = metrics.OutcomeError
+			ev.ErrorClass = "audit_outcome_unknown"
+			return withDispatchID(outcomeUnknown(mcp.NewToolResultError(auditMissingWriteText(dispatchID, res, err))), dispatchID), nil
+		}
+		// A read changes nothing, so its result is safe to hand back; it
+		// only carries a warning that the record is missing (TEC-1816).
+		auditMissing = true
 	}
 	if err != nil {
 		ev.Outcome = metrics.OutcomeError
@@ -2282,7 +2303,7 @@ func (g *Gateway) dispatch(ctx context.Context, entry toolEntry, args map[string
 				return result, nil
 			}
 		}
-		return outcomeUnknown(mcp.NewToolResultErrorFromErr("tool failed", err)), nil
+		return withDispatchID(outcomeUnknown(mcp.NewToolResultErrorFromErr("tool failed", err)), dispatchID), nil
 	}
 
 	if g.usage != nil && !res.IsError {
@@ -2298,7 +2319,68 @@ func (g *Gateway) dispatch(ctx context.Context, entry toolEntry, args map[string
 			ev.ErrorClass = "tool"
 		}
 	}
+	res = withDispatchID(res, dispatchID)
+	if auditMissing {
+		// Only the metadata carries the warning: the content and the
+		// structured content stay exactly as the upstream sent them, so
+		// code mode decodes the same value (it surfaces the warning itself).
+		res.Meta.AdditionalFields[AuditMissingMarker] = true
+		res.Meta.AdditionalFields[WarningMarker] = "Warning: the audit record for dispatch " + dispatchID + " was not saved. The result is complete."
+	}
 	return res, nil
+}
+
+// DispatchIDMarker is the result metadata key that names the dispatch a
+// result came from, so a caller (code mode's try_call) can look the call
+// up with audit.mine dispatch_id=… . AuditMissingMarker (value true) says
+// the completion audit row of a read-only call was not saved, and
+// WarningMarker carries the text that says so.
+const (
+	DispatchIDMarker   = codemode.DispatchIDMarker
+	AuditMissingMarker = codemode.AuditMissingMarker
+	WarningMarker      = codemode.WarningMarker
+)
+
+// withDispatchID is res with the dispatch id in its metadata. It copies
+// the result and its metadata map, so a handler that returns a shared
+// result never sees it changed.
+func withDispatchID(res *mcp.CallToolResult, dispatchID string) *mcp.CallToolResult {
+	if res == nil {
+		return nil
+	}
+	cp := *res
+	fields := map[string]any{}
+	meta := &mcp.Meta{AdditionalFields: fields}
+	if res.Meta != nil {
+		meta.ProgressToken = res.Meta.ProgressToken
+		for k, v := range res.Meta.AdditionalFields {
+			fields[k] = v
+		}
+	}
+	fields[DispatchIDMarker] = dispatchID
+	cp.Meta = meta
+	return &cp
+}
+
+// isReadOnlyTool reports a tool that declares itself read-only
+// (Annotations.ReadOnlyHint true). Every other tool counts as a write.
+func isReadOnlyTool(entry toolEntry) bool {
+	return entry.tool.Annotations.ReadOnlyHint != nil && *entry.tool.Annotations.ReadOnlyHint
+}
+
+// auditMissingWriteText is the answer to a write whose completion audit
+// row was not saved: the outcome stays unknown, but the text says what
+// the upstream call itself returned and how to check the dispatch.
+func auditMissingWriteText(dispatchID string, res *mcp.CallToolResult, err error) string {
+	upstream := "succeeded"
+	switch {
+	case err != nil:
+		upstream = "failed: " + auditText(err.Error(), summaryBlockBytes)
+	case res != nil && res.IsError:
+		upstream = "returned an error"
+	}
+	return "Tool outcome unknown: the upstream call " + upstream + ", but its audit record was not saved. " +
+		"Do not repeat the write. Check it with audit.mine dispatch_id=\"" + dispatchID + "\" or with the target system."
 }
 
 // forwardKey resolves the caller's identity key for an identity-forwarding
@@ -2509,27 +2591,69 @@ const (
 	minPollIntervalSeconds = 3
 )
 
+// Bounds of the result summary in a completion audit row: each text block
+// is cut at summaryBlockBytes and the whole summary at summaryMaxBytes, so
+// a result of thousands of blocks still makes a small row.
+const (
+	summaryBlockBytes = 200
+	summaryMaxBytes   = 4 << 10
+)
+
+// summariseResult is the short text of res that the completion audit row
+// keeps. It is always valid UTF-8 without NUL bytes: Postgres refuses both,
+// and a refused row turns a finished call into an unknown outcome.
 func summariseResult(res *mcp.CallToolResult) string {
 	if res == nil {
 		return ""
 	}
-	var b strings.Builder
-	for _, c := range res.Content {
-		if t, ok := mcp.AsTextContent(c); ok {
-			if b.Len() > 0 {
-				b.WriteString(" | ")
-			}
-			snippet := t.Text
-			if len(snippet) > 200 {
-				snippet = snippet[:200] + "…"
-			}
-			b.WriteString(snippet)
-		}
-	}
+	prefix := ""
 	if res.IsError {
-		return "ERROR: " + b.String()
+		prefix = "ERROR: "
+	}
+	var b strings.Builder
+	b.WriteString(prefix)
+	blocks, written, full := 0, 0, false
+	for _, c := range res.Content {
+		t, ok := mcp.AsTextContent(c)
+		if !ok {
+			continue
+		}
+		blocks++
+		if full {
+			continue
+		}
+		snippet := auditText(t.Text, summaryBlockBytes)
+		sep := ""
+		if written > 0 {
+			sep = " | "
+		}
+		if b.Len()+len(sep)+len(snippet) > summaryMaxBytes {
+			full = true
+			continue
+		}
+		b.WriteString(sep)
+		b.WriteString(snippet)
+		written++
+	}
+	if rest := blocks - written; rest > 0 {
+		fmt.Fprintf(&b, " … (+%d blocks)", rest)
 	}
 	return b.String()
+}
+
+// auditText is s cut to about n bytes on a rune boundary ("…" marks a
+// cut), as valid UTF-8 without NUL bytes. Only a bounded head of s is
+// cleaned, so a huge text costs no more than a short one.
+func auditText(s string, n int) string {
+	raw := s
+	if len(raw) > 4*n {
+		raw = raw[:4*n]
+	}
+	out := clipText(strings.ToValidUTF8(strings.ReplaceAll(raw, "\x00", ""), ""), n)
+	if len(raw) < len(s) && !strings.HasSuffix(out, "…") {
+		out += "…"
+	}
+	return out
 }
 
 // agentIDFromContext extracts the agent ID set by the HTTP transport's auth

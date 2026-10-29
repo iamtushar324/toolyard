@@ -187,8 +187,9 @@ func (g *Gateway) accessTools() []toolEntry {
 			obj([]string{"server"}, map[string]any{"server": map[string]any{"type": "string", "description": "Server name, as servers.list shows it."}}),
 			g.handleServersReconnect()),
 		accessEntry("audit.mine", auditUpstream,
-			"Your own recent calls and how toolyard decided them (tool, decision, reason, time). Only your rows, never another agent's; no arguments or result bodies. Read-only.",
+			"Your own recent calls and how toolyard decided them (tool, event, outcome, decision, reason, time, dispatch_id). Pass dispatch_id to see one dispatch: its start and, when it was saved, its outcome. Only your rows, never another agent's; no arguments or result bodies. Read-only.",
 			obj(nil, map[string]any{
+				"dispatch_id":   map[string]any{"type": "string", "description": "Only the rows of this dispatch (exact id, e.g. from an outcome_unknown answer or try_call's dispatch_id)."},
 				"limit":         map[string]any{"type": "integer", "minimum": 1, "maximum": auditMineMaxLimit, "description": "Default 50, max 200."},
 				"since":         map[string]any{"type": "string", "description": "Only rows at or after this RFC 3339 time (or unix milliseconds as a string)."},
 				"since_minutes": map[string]any{"type": "integer", "description": "Only rows from the last N minutes."},
@@ -936,10 +937,14 @@ const (
 )
 
 type auditMineRow struct {
-	TS         string `json:"ts"`
-	Tool       string `json:"tool,omitempty"`
-	Server     string `json:"server,omitempty"`
-	Event      string `json:"event"`
+	TS     string `json:"ts"`
+	Tool   string `json:"tool,omitempty"`
+	Server string `json:"server,omitempty"`
+	Event  string `json:"event"`
+	// Outcome is started, succeeded or failed for a dispatch row, "" for
+	// any other row.
+	Outcome    string `json:"outcome,omitempty"`
+	DispatchID string `json:"dispatch_id,omitempty"`
 	Decision   string `json:"decision,omitempty"`
 	Reason     string `json:"reason,omitempty"`
 	Via        string `json:"via,omitempty"`
@@ -994,8 +999,10 @@ func (g *Gateway) handleAuditMine() directHandler {
 		if err != nil {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
+		dispatchID, _ := args["dispatch_id"].(string)
+		dispatchID = strings.TrimSpace(dispatchID)
 		// The filter is the caller's own id: no argument can widen it.
-		evs, err := g.audit.Query(ctx, audit.Filter{AgentID: agentID, Since: since, Limit: limit})
+		evs, err := g.audit.Query(ctx, audit.Filter{AgentID: agentID, Since: since, DispatchID: dispatchID, Limit: limit})
 		if err != nil {
 			return mcp.NewToolResultErrorFromErr("audit.mine", err), nil
 		}
@@ -1015,6 +1022,17 @@ func (g *Gateway) handleAuditMine() directHandler {
 				TS: time.UnixMilli(e.TS).UTC().Format(time.RFC3339Nano), Tool: e.ToolName, Server: e.UpstreamName,
 				Event: e.EventType, Decision: e.Decision, Reason: e.Reason, Via: e.Via, ApprovalID: e.ApprovalID,
 				DecidedVia: e.DecidedVia, DecidedBy: e.DecidedByEmail,
+				DispatchID: audit.DispatchIDOf(e.ID),
+			}
+			if r.DispatchID != "" {
+				switch e.EventType {
+				case "call.dispatch":
+					r.Outcome = "started"
+				case audit.EventCallSucceeded:
+					r.Outcome = "succeeded"
+				case audit.EventCallFailed:
+					r.Outcome = "failed"
+				}
 			}
 			if r.DecidedBy == "" {
 				r.DecidedBy = e.DecidedByName
@@ -1022,6 +1040,9 @@ func (g *Gateway) handleAuditMine() directHandler {
 			rows = append(rows, r)
 		}
 		out := map[string]any{"agent_id": agentID, "count": len(rows), "calls": rows}
+		if dispatchID != "" {
+			out["dispatch_id"] = dispatchID
+		}
 		if since > 0 {
 			out["since"] = time.UnixMilli(since).UTC().Format(time.RFC3339)
 		}

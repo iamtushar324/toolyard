@@ -417,7 +417,7 @@ func TestRunOutcomeUnknown(t *testing.T) {
 		callStatus   string
 	}{
 		{"audit outcome unknown", "", func(map[string]any) (*mcp.CallToolResult, error) {
-			return mcp.NewToolResultError("Tool outcome unknown: completion audit failed. Do not retry. Review dispatch dispatch_1 before another action."), nil
+			return mcp.NewToolResultError(`Tool outcome unknown: the upstream call succeeded, but its audit record was not saved. Do not repeat the write. Check it with audit.mine dispatch_id="dispatch_1" or with the target system.`), nil
 		}, StatusOutcomeUnknown, ErrorOutcomeUnknown, StatusOutcomeUnknown},
 		{"marker", "", func(map[string]any) (*mcp.CallToolResult, error) {
 			res := mcp.NewToolResultError("tool failed: connection reset by peer")
@@ -465,7 +465,7 @@ func TestRunOutcomeUnknown(t *testing.T) {
 	f = newFake()
 	f.handlers[upsertTarget] = cases[0].handler
 	text, failed := inProcess(f, Limits{}).ExecuteToolCode(context.Background(), "r = BkCoreServices.upsert_bifrost_virtual_key_actor(email=\"a@b\", userId=\"u\", virtualKeyHash=\"h\")", "")
-	if !failed || !strings.Contains(text, "tool call failed for BkCoreServices.upsert_bifrost_virtual_key_actor: Tool outcome unknown: completion audit failed.") {
+	if !failed || !strings.Contains(text, "tool call failed for BkCoreServices.upsert_bifrost_virtual_key_actor: Tool outcome unknown: the upstream call succeeded") {
 		t.Fatalf("executeToolCode text:\n%s", text)
 	}
 }

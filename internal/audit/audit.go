@@ -334,7 +334,25 @@ type Filter struct {
 	RunID string
 	// OAuthClientID keeps the events of one OAuth client's agents.
 	OAuthClientID string
-	Limit         int
+	// DispatchID keeps the rows of one gateway dispatch: its intent
+	// (<id>.started) and its completion (<id>.completed). The dispatch id
+	// is part of the row id, so no column of its own is needed.
+	DispatchID string
+	Limit      int
+}
+
+// DispatchIDOf is the dispatch id of a row the gateway's dispatch wrote
+// (id "<dispatch id>.started" or ".completed"), "" for any other row.
+func DispatchIDOf(id string) string {
+	if !strings.HasPrefix(id, "dispatch_") {
+		return ""
+	}
+	for _, suffix := range []string{".started", ".completed"} {
+		if base, ok := strings.CutSuffix(id, suffix); ok {
+			return base
+		}
+	}
+	return ""
 }
 
 // Query returns events matching the filter, newest first. Backs both the
@@ -371,6 +389,10 @@ func (l *Logger) Query(ctx context.Context, f Filter) ([]Event, error) {
 			q += ` AND ` + eq.col + ` = ?`
 			args = append(args, eq.val)
 		}
+	}
+	if f.DispatchID != "" {
+		q += ` AND id IN (?, ?)`
+		args = append(args, f.DispatchID+".started", f.DispatchID+".completed")
 	}
 	q += ` ORDER BY ts DESC`
 	if f.Limit > 0 {

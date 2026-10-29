@@ -206,10 +206,10 @@ const tsIndexHead = `// toolyard code mode: what a JavaScript script sees (execu
 //   console.log("...");
 //   return { summary: "..." };
 
-/** The outcome of tools.tryCall: never a rejection. */
+/** The outcome of tools.tryCall: never a rejection. dispatch_id names the call's dispatch when it reached one: look it up with toolyard.audit_mine({ dispatch_id }). warning is set when the result is complete but its audit record was not saved. */
 export type TryResult<T = unknown> =
-  | { ok: true; status: "succeeded"; result: T }
-  | { ok: false; status: "failed" | "permission_required" | "deferred" | "outcome_unknown"; error: string; approval_id?: string };
+  | { ok: true; status: "succeeded"; result: T; dispatch_id?: string; warning?: string }
+  | { ok: false; status: "failed" | "permission_required" | "deferred" | "outcome_unknown"; error: string; approval_id?: string; dispatch_id?: string; warning?: string };
 
 export interface SearchOptions {
   /** auto (the default: by meaning with Jev where the operator turned it on, else keyword), semantic (Jev, refused where it is off; falls back to keyword when Jev fails), keyword (ranked words) or regex (an RE2 pattern of at most 200 characters, case-insensitive). */
