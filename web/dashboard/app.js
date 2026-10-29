@@ -3149,13 +3149,14 @@ function openServerEdit(s) {
     register: !!(id && id.register),
     auth_mode: s.auth_mode || 'shared',
     enabled: s.enabled !== false,
+    description: s.description || '',
     asyncMode: (s.async && s.async.mode) || 'off',
     asyncAfter: (s.async && s.async.after_ms) || 5000,
     asyncTools: asyncToolsAsText(s.async && s.async.tools),
     error: '',
     saving: false,
   };
-  m.orig = { url: m.url, headersText: m.headersText, identityOn: m.identityOn, header: m.header, register: m.register, auth_mode: m.auth_mode, enabled: m.enabled,
+  m.orig = { url: m.url, headersText: m.headersText, identityOn: m.identityOn, header: m.header, register: m.register, auth_mode: m.auth_mode, enabled: m.enabled, description: m.description,
     asyncMode: m.asyncMode, asyncAfter: m.asyncAfter, asyncTools: m.asyncTools };
   state.serverEditModal = m;
   render();
@@ -3195,6 +3196,9 @@ function serverEditBody(m) {
     if (m.auth_mode !== o.auth_mode) body.auth_mode = m.auth_mode;
   }
   if (m.enabled !== o.enabled) body.enabled = m.enabled;
+  const description = m.description.trim();
+  if (description.length > 500) return { error: 'The description must be at most 500 characters.' };
+  if (description !== o.description.trim()) body.description = description;
   return { body };
 }
 
@@ -3352,6 +3356,13 @@ function renderServerEditModal() {
         whoSignsInField(m, 'srv-edit-auth'),
         identityFields(m, 'srv-edit-id'),
       ] : el('div', { class: 'meta' }, 'URL, headers, who signs in and identity forwarding apply to HTTP servers only.'),
+      el('label', {},
+        el('div', { class: 'meta' }, 'Description for agents: what tells this server apart from the others (for example its host). Saving only this does not reconnect the server.'),
+        el('textarea', {
+          id: 'srv-edit-description', maxlength: '500', placeholder: 'bk t3 on the production server DS1', value: m.description,
+          on: { input: (e) => { m.description = e.target.value; } },
+        }),
+      ),
       asyncFields(m),
       el('label', { class: 'check-row' },
         el('input', {

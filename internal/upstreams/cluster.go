@@ -155,6 +155,9 @@ func (s *Service) applyRemote(ctx context.Context, m upstreamMsg) {
 		s.takeDownLocked(m.Name)
 		return
 	}
+	// The description is not part of the connection: it changes here even
+	// when nothing needs reconnecting.
+	s.gw.SetServerDescription(m.Name, srv.Description)
 	if m.Op != opReconnect && s.applied[m.Name] == configFingerprint(*srv) {
 		return
 	}
@@ -182,6 +185,7 @@ func (s *Service) resync(ctx context.Context) {
 			continue
 		}
 		stored[srv.Name] = true
+		s.gw.SetServerDescription(srv.Name, srv.Description)
 		cur, have := s.applied[srv.Name]
 		switch want := srv.Enabled && !s.stdioRefused(srv); {
 		case !want && have:

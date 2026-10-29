@@ -1,0 +1,15 @@
+-- 0077: a description for each upstream server (TEC-1817).
+--
+-- Two upstreams can serve the same tools (bkt3_ds1 and bkt3_usm are the
+-- same bk t3 on two hosts). The admin writes one or two sentences that
+-- tell them apart; servers.list shows it as description, tools.search as
+-- server_description, and the search ranker reads it. An empty value
+-- falls back to the instructions the upstream sends at initialize.
+--
+-- upstream_servers gains:
+--   description  the admin's text, at most 500 characters; '' for none.
+--
+-- Same column as migrations/sqlite/0077_upstream_descriptions.sql.
+-- Rollback: an older binary ignores the column. Drop it by hand after the
+-- rollback if wanted.
+ALTER TABLE upstream_servers ADD COLUMN IF NOT EXISTS description TEXT NOT NULL DEFAULT '';

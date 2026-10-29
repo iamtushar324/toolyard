@@ -12,7 +12,7 @@ import (
 // serversPatch edits a saved server in place: PATCH /v1/servers/{name}.
 // Admin-only. The body is a partial upstreams.Patch:
 //
-//	{"url"?, "headers"?, "env"?, "identity"?: {"header","register"} | null, "enabled"?}
+//	{"url"?, "headers"?, "env"?, "identity"?: {"header","register"} | null, "enabled"?, "description"?}
 //
 // A field that is absent stays as it is; "identity": null switches
 // forwarding off. The row is updated, never deleted and re-added, so the

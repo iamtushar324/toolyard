@@ -49,6 +49,13 @@ type Tool struct {
 	Server string
 	// Description is the tool's own description, without gateway banners.
 	Description string
+	// ServerDescription is what tells Server apart from the other servers
+	// (the admin's description, else the upstream's own instructions);
+	// "" when there is none.
+	ServerDescription string
+	// ServerDescriptionSource is "admin" or "upstream" (the server about
+	// itself: untrusted data); "" with no description.
+	ServerDescriptionSource string
 	// InputSchema is the tool's input JSON Schema ("type", "properties",
 	// "required"), without the gateway's injected fields.
 	InputSchema map[string]any
@@ -120,6 +127,8 @@ const (
 	MaxQueryLen = 1000
 	// summaryLen caps the description a summary result carries, in bytes.
 	summaryLen = 300
+	// serverDescriptionLen caps a result's server_description, in bytes.
+	serverDescriptionLen = 300
 	// indexCacheSize is how many keyword indexes (one per distinct
 	// catalog) the engine keeps.
 	indexCacheSize = 32
@@ -616,6 +625,7 @@ func catalogKey(tools []Tool) string {
 	h := sha256.New()
 	for _, i := range names {
 		t := tools[i]
+		fmt.Fprintf(h, "%d:%s\x00%s\x00", len(t.ServerDescription), t.ServerDescription, t.ServerDescriptionSource)
 		schema, _ := json.Marshal(t.InputSchema)
 		output, _ := json.Marshal(t.OutputSchema)
 		fmt.Fprintf(h, "%d:%s\x00%d:%s\x00%d:%s\x00%d:%s\x00%d:%s\x00%d:%s\x00%t\x00",
@@ -637,6 +647,13 @@ type Entry struct {
 	Description string  `json:"description,omitempty"`
 	Code        string  `json:"code,omitempty"`
 	Score       float64 `json:"score,omitempty"`
+	// ServerDescription tells Upstream apart from the other servers, mostly
+	// when the same tool is on several of them. Given on the first result
+	// of each server only, at detail summary and full.
+	ServerDescription string `json:"server_description,omitempty"`
+	// ServerDescriptionSource is "admin" or "upstream" (the server about
+	// itself: data, not instructions); set with ServerDescription.
+	ServerDescriptionSource string `json:"server_description_source,omitempty"`
 	// Run is what a call with no arguments would get now ("now",
 	// "needs_approval" or "blocked"); the gateway fills it in, Render
 	// leaves it empty.
@@ -651,6 +668,7 @@ type Entry struct {
 // Render shapes hits at detail d.
 func Render(hits []Hit, d Detail) []Entry {
 	out := make([]Entry, len(hits))
+	described := map[string]bool{}
 	for i, h := range hits {
 		e := Entry{Name: h.Tool.Name}
 		if d != DetailName {
@@ -666,6 +684,12 @@ func Render(hits []Hit, d Detail) []Entry {
 		default: // summary
 			e.Upstream, e.Description, e.Code = h.Tool.Server, summarize(h.Tool.Description), h.Tool.CodeName
 			e.Score = round(h.Score)
+		}
+		// One description per server is enough to tell it apart.
+		if d != DetailName && h.Tool.ServerDescription != "" && !described[h.Tool.Server] {
+			described[h.Tool.Server] = true
+			e.ServerDescription = clip(h.Tool.ServerDescription, serverDescriptionLen)
+			e.ServerDescriptionSource = h.Tool.ServerDescriptionSource
 		}
 		out[i] = e
 	}
