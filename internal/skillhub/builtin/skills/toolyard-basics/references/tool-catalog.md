@@ -5,8 +5,8 @@ turned the feature on (noted below). Upstream servers add their own tools as
 `<server>.<tool>`. Every call needs `_reason`. Read a tool's full schema with
 `getToolDocs` or `tools.search` (`detail: "full"`).
 
-By default your tool list shows five tools: `tools.search`, `getToolDocs`,
-`executeToolCode`, `inbox.request` and `inbox.status`. Every other tool here
+By default your tool list shows six tools: `tools.search`, `tools.execute`,
+`getToolDocs`, `executeToolCode`, `inbox.request` and `inbox.status`. Every other tool here
 still works: run it in `executeToolCode` as `toolyard.<group>_<name>` (for
 example `toolyard.inbox_guide(topic="requests")`), or call it directly where
 your client allows. An agent its owner switched to the full list sees them

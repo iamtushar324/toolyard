@@ -1,13 +1,13 @@
 #!/usr/bin/env python3
-"""End-to-end check of the five-tool list and tool search on a running deployment.
+"""End-to-end check of the six-tool list and tool search on a running deployment.
 
 Runs against the Kubernetes HA test deployment (two replicas, Postgres) or any
 toolyard. It signs in as the first admin (credentials from the
 `toolyard-admin` Secret through kubectl, or ADMIN_FILE), makes an agent key and
 checks:
 
-  - tools/list shows exactly the five tools by default, every tool after the
-    agent is switched to the full list, and the five again after switching back,
+  - tools/list shows exactly the six tools by default, every tool after the
+    agent is switched to the full list, and the six again after switching back,
     every listed name OpenAI-safe (^[a-zA-Z0-9_-]{1,64}$: tools_search for
     tools.search, -mcp-safe-tool-names, the default);
   - tools.search finds a tool that is not listed, says how it ranked
@@ -48,9 +48,9 @@ if not BASE:
 NS = os.environ.get("NAMESPACE", "toolyard-test")
 EXPECT = os.environ.get("EXPECT_RANKED_BY", "")
 REPORT = os.environ.get("REPORT", "/tmp/small-tools-e2e.json")
-REASON = "five-tool list and tool search end-to-end test on the test deployment (TEC-1807)"
-# The five tools as tools/list shows them: OpenAI-safe published names.
-FIVE = {"tools_search", "getToolDocs", "executeToolCode", "inbox_request", "inbox_status"}
+REASON = "six-tool list and tool search end-to-end test on the test deployment (TEC-1807)"
+# The six tools as tools/list shows them: OpenAI-safe published names.
+SIX = {"tools_search", "tools_execute", "getToolDocs", "executeToolCode", "inbox_request", "inbox_status"}
 SAFE_NAME = re.compile(r"^[a-zA-Z0-9_-]{1,64}$")
 RUN_FOR_ACCESS = {"allow": "now", "ask": "needs_approval", "deny": "blocked"}
 
@@ -176,21 +176,21 @@ def main():
     instructions = init.get("result", {}).get("instructions", "")
     report = {"base": BASE, "version": h.get("version")}
 
-    # --- Done means 1: the five-tool list and the full-list switch --------
+    # --- Done means 1: the six-tool list and the full-list switch --------
     def lists():
         small = agent.list_names()
-        check("default agent lists exactly the five tools", set(small) == FIVE and len(small) == 5, sorted(small))
+        check("default agent lists exactly the six tools", set(small) == SIX and len(small) == 6, sorted(small))
         sc = set_tool_list(admin, agent_id, "full")
         full = agent.list_names()
         check("an agent switched to the full list lists every tool it may use",
-              sc.get("tool_list") == "full" and len(full) > 5 and FIVE <= set(full),
+              sc.get("tool_list") == "full" and len(full) > 6 and SIX <= set(full),
               {"tool_list": sc.get("tool_list"), "count": len(full)})
         bad = [n for n in small + full if not SAFE_NAME.match(n)]
         check("every listed name matches ^[a-zA-Z0-9_-]{1,64}$ and none repeats",
               not bad and len(set(full)) == len(full), bad[:10] or "%d names" % len(full))
         sc = set_tool_list(admin, agent_id, "small")
         again = agent.list_names()
-        check("switching back shows the five again", sc.get("tool_list") in ("small", "", None) and set(again) == FIVE,
+        check("switching back shows the six again", sc.get("tool_list") in ("small", "", None) and set(again) == SIX,
               {"tool_list": sc.get("tool_list"), "count": len(again)})
         report["full_count"] = len(full)
     step("tool lists", lists)
@@ -299,7 +299,7 @@ return { top: found.map(x => [x.name, x.run]), caller: me.caller_id || null };
             "title": "Test: two memory writes and one question",
             "summary": "A test request; it is cancelled at the end of the run.",
             "message": "This is an automated test of batched permission requests. Nothing needs a decision.",
-            "facts": {"why_now": "End-to-end test of the five-tool list.", "if_it_goes_wrong": "Test data only.",
+            "facts": {"why_now": "End-to-end test of the six-tool list.", "if_it_goes_wrong": "Test data only.",
                       "undo": "The test cancels the request."},
             "urgency": "fyi",
             "schema_version": 3,

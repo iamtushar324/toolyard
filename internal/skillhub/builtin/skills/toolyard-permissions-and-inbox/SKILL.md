@@ -24,8 +24,8 @@ the `toolyard-github-writes` skill (`skills.get toolyard/toolyard-github-writes`
 ## The rule: one request per round
 
 `inbox.request` is the one way to get permission, and `inbox.status` reads the
-decision. Both are among the five tools you see by default (with
-`tools.search`, `getToolDocs` and `executeToolCode`). Plan the round first.
+decision. Both are among the six tools you see by default (with
+`tools.search`, `tools.execute`, `getToolDocs` and `executeToolCode`). Plan the round first.
 Then put every restricted call it needs, and every question you have for your
 owner, into ONE `inbox.request`: `tools[]`, and `questions[]` with
 `schema_version: 3`. Start another round only for what the answers open,

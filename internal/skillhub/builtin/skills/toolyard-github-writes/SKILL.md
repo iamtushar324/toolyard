@@ -24,9 +24,16 @@ decision.
 
 ## The tools
 
-The tool names start with the name the GitHub server has in your catalog;
-find them with `tools.search` (for example `{"query": "pull request review"}`).
-Below, `<server>` stands for that name.
+The GitHub server is named `GitHubForUsers` by default (an admin may rename
+it), so its tools are `GitHubForUsers.<tool>`. Find them with `tools.search`
+(for example `{"query": "pull request review"}`). Below, `<server>` stands for
+the name your catalog shows.
+
+**Prerequisite:** the server acts through your owner's own GitHub
+connection. If `tools.search` shows no GitHub tools, the server is not set up
+or not granted to your owner. If a GitHub call answers "connect your GitHub
+account in My connections", your owner has not connected GitHub. In both
+cases tell your owner; never ask for a token.
 
 | tool | kind | arguments besides `owner`, `repo`, `pull_number`, `_reason` |
 |---|---|---|

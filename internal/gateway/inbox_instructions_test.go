@@ -21,10 +21,12 @@ func TestInboxAgentInstructionsDescribeDecisionAndRecovery(t *testing.T) {
 	}
 }
 
-// TestInstructionsTeachTheFiveToolFlow: the instructions name the five
-// tools and the flow (find, read, run, ask once per round, read the
-// decision), and still read true for an agent on the full tool list.
-func TestInstructionsTeachTheFiveToolFlow(t *testing.T) {
+// TestInstructionsTeachTheSixToolFlow: the instructions open with the
+// first-contact contract, name the six tools and the flow (find, run one
+// call with tools.execute or several in a script, read the docs only when
+// the schema is unclear, ask once per round, read the decision), and still
+// read true for an agent on the full tool list.
+func TestInstructionsTeachTheSixToolFlow(t *testing.T) {
 	text := buildInstructions(nil, time.Second, false)
 	for _, name := range SmallToolList {
 		if !strings.Contains(text, name) {
@@ -32,7 +34,19 @@ func TestInstructionsTeachTheFiveToolFlow(t *testing.T) {
 		}
 	}
 	for _, want := range []string{
-		"by default you see five tools",
+		"by default you see six tools",
+		"FIRST CONTACT:",
+		"read_only flag",
+		"with dry_run: true first",
+		"One inbox.request per round",
+		"try_call (Starlark) or tools.tryCall (JavaScript)",
+		"RUN ONE CALL: call tools.execute",
+		"its input_schema",
+		"SEVERAL CALLS, LOOPS OR RESULT FILTERING: use executeToolCode",
+		"getToolDocs (server and tool: the two halves of a result's code) only when the schema is unclear",
+		"GitHubForUsers",
+		"the owner has not connected GitHub",
+		"its tools need the owner's own GitHub connection",
 		"run: now, needs_approval or blocked",
 		"inbox.request is the one way to get permission",
 		"ONE inbox.request with every restricted call (run: needs_approval) and every question",
@@ -50,8 +64,19 @@ func TestInstructionsTeachTheFiveToolFlow(t *testing.T) {
 		!strings.Contains(skills, "tools.search") || !strings.Contains(skills, "toolyard.skills_get") {
 		t.Errorf("the skills paragraph does not point at tools.search and code mode: %q", skillsInstructions(false))
 	}
-	if guide := skillsGuideInstructions("toolyard/toolyard-basics", false); !strings.Contains(guide, `"toolyard/toolyard-basics"`) || !strings.Contains(guide, "toolyard.skills_get") {
+	if guide := skillsGuideInstructions("toolyard/toolyard-basics", "", false); !strings.Contains(guide, `"toolyard/toolyard-basics"`) || !strings.Contains(guide, "toolyard.skills_get") || strings.Contains(guide, "permissions-and-inbox") {
 		t.Errorf("the guide sentence: %q", guide)
+	}
+	guide := skillsGuideInstructions("toolyard/toolyard-basics", "toolyard/toolyard-permissions-and-inbox", false)
+	for _, want := range []string{`"toolyard/toolyard-basics"`, `toolyard.skills_get(skill="toolyard/toolyard-permissions-and-inbox")`,
+		`toolyard.skills_read(uri="skill://toolyard/toolyard-permissions-and-inbox/references/request-fields.md")`, "Before your first inbox.request"} {
+		if !strings.Contains(guide, want) {
+			t.Errorf("the guide sentence lacks %q: %q", want, guide)
+		}
+	}
+	// The first-contact contract comes before the tool flow.
+	if i, j := strings.Index(text, "FIRST CONTACT:"), strings.Index(text, "TOOLS:"); i < 0 || i > j {
+		t.Errorf("the first-contact contract is not at the top: %d, %d", i, j)
 	}
 }
 

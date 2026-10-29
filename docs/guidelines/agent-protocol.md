@@ -14,10 +14,11 @@ How agents are taught this, and why it's layered, is in
 
 ## The short version
 
-By default your tool list shows five tools: `tools.search` (find a tool),
-`getToolDocs` (read its parameters), `executeToolCode` (run it),
-`inbox.request` (ask for permission) and `inbox.status` (read the
-decision). Every other tool you may use still works. The other toolyard
+By default your tool list shows six tools: `tools.search` (find a tool;
+each result carries its `input_schema`), `tools.execute` (run one call),
+`executeToolCode` (run several calls, loops or filtering), `getToolDocs`
+(read parameters when the schema is unclear), `inbox.request` (ask for
+permission) and `inbox.status` (read the decision). Every other tool you may use still works. The other toolyard
 tools named here (`inbox.guide`, `inbox.upload`, `inbox.wait`, `inbox.ask`,
 `inbox.post`, `inbox.cancel`, `inbox.check`, `session.start`, …) run inside
 `executeToolCode` as `toolyard.<group>_<name>`, for example

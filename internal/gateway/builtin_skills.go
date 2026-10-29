@@ -79,7 +79,7 @@ func init() {
 }
 
 // skillsInstructions is the paragraph the server instructions gain while
-// the skills hub is on. Skills come through the five-tool flow: tools.search
+// the skills hub is on. Skills come through the six-tool flow: tools.search
 // names matching skills, and a script reads them (the skills.* tools are
 // toolyard.skills_<name> in code mode), so an agent on the small tool list
 // needs no other tool. With safe tool names (safe) the MCP-listed tools are
@@ -94,15 +94,21 @@ func skillsInstructions(safe bool) string {
 
 // skillsGuideInstructions is the sentence the server instructions gain for
 // a caller who can read toolyard's built-in guide (SkillHub.Guide,
-// "toolyard/toolyard-basics"); skillsGuideFor decides per request. safe
-// names skills.get by its published name.
-func skillsGuideInstructions(guide string, safe bool) string {
+// "toolyard/toolyard-basics"); skillsGuideFor decides per request. inbox is
+// the built-in permissions skill ("toolyard/toolyard-permissions-and-inbox")
+// when the caller can read it too, else "". safe names skills.get by its
+// published name.
+func skillsGuideInstructions(guide, inbox string, safe bool) string {
 	if guide == "" {
 		return ""
 	}
 	get := listedToolName(safe, SkillsGetTool)
-	return " New to this gateway? Read toolyard's built-in guide first, in executeToolCode: toolyard.skills_get(skill=\"" + guide + "\") " +
+	out := " New to this gateway? Read toolyard's built-in guide first, in executeToolCode: toolyard.skills_get(skill=\"" + guide + "\") " +
 		"(" + get + " {\"skill\": \"" + guide + "\"} where you see " + get + "): how toolyard works and how to use it well, with links to the other built-in toolyard skills."
+	if inbox != "" {
+		out += " Before your first " + listedToolName(safe, "inbox.request") + ", read toolyard.skills_get(skill=\"" + inbox + "\") and its references/request-fields.md: toolyard.skills_read(uri=\"skill://" + inbox + "/references/request-fields.md\")."
+	}
+	return out
 }
 
 // SkillHub is what RegisterSkillHub wires: the skills hub's agent surface.

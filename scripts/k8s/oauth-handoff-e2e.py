@@ -36,7 +36,7 @@ The return link (a separate authorization):
     with the page's nonce), and only then gets a 303 to the client's
     redirect URI with code, state and iss;
   - the code works once at the token endpoint with the PKCE verifier, and
-    the access token lists the five tools over MCP under OpenAI-safe names
+    the access token lists the six tools over MCP under OpenAI-safe names
     (tools_search, inbox_request, ...);
   - a second use of the return link, and a POST without the nonce cookie,
     are refused; A's waiting page of that request reports used and its
@@ -72,9 +72,9 @@ if not BASE:
 NS = os.environ.get("NAMESPACE", "toolyard-test")
 REPORT = os.environ.get("REPORT", "/tmp/oauth-handoff-e2e.json")
 REDIRECT = "http://127.0.0.1:43123/callback"
-# The five tools as tools/list shows them: OpenAI-safe published names
+# The six tools as tools/list shows them: OpenAI-safe published names
 # (-mcp-safe-tool-names, the default).
-FIVE = {"tools_search", "getToolDocs", "executeToolCode", "inbox_request", "inbox_status"}
+SIX = {"tools_search", "tools_execute", "getToolDocs", "executeToolCode", "inbox_request", "inbox_status"}
 
 results = []
 
@@ -270,7 +270,7 @@ def main():
     check("after the return link, A's waiting page of that request reports used and its Continue is refused",
           st == (200, "used") and late.status_code == 410 and "Location" not in late.headers, {"poll": st, "continue": late.status_code})
 
-    # --- the client: token and five tools ---------------------------------------
+    # --- the client: token and six tools ---------------------------------------
     status, at = exchange(client_id, code, verifier)
     check("the code works at the token endpoint with the PKCE verifier", bool(at), status)
     if at:
@@ -287,7 +287,7 @@ def main():
         sid, _ = rpc("initialize", {"protocolVersion": "2025-11-25", "capabilities": {}, "clientInfo": {"name": "handoff-e2e", "version": "1"}})
         _, lst = rpc("tools/list", {}, sid)
         names = {t["name"] for t in lst.get("result", {}).get("tools", [])}
-        check("the connected client lists the five tools", names == FIVE, sorted(names))
+        check("the connected client lists the six tools", names == SIX, sorted(names))
     return finish(t0)
 
 

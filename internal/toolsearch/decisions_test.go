@@ -549,7 +549,7 @@ func TestDecisionsRankerCapsServerChoices(t *testing.T) {
 		tools = append(tools, Tool{Name: srv + ".do_thing", Server: srv, Description: desc})
 	}
 	api := newFakeAPI(t, judge(only("srv39.do_thing", 0.9), "srv39", 0.9))
-	res := search(t, New(Options{Semantic: newTestRanker(api, &observed{})}), tools, Query{Text: "thing"})
+	res := search(t, New(Options{Semantic: newTestRanker(api, &observed{})}), tools, Query{Text: "thing", Limit: MaxLimit})
 	reqs := api.requests()
 	if len(reqs) != 1 {
 		t.Fatalf("%d requests", len(reqs))

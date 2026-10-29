@@ -431,7 +431,7 @@ func (g *Gateway) inboxTools() []toolEntry {
 	svc := g.inbox
 	// n names an MCP-listed tool as tools/list does (its published name
 	// with safe tool names) in the descriptions of inbox.request and
-	// inbox.status, two of the five tools every agent sees.
+	// inbox.status, two of the six tools every agent sees.
 	n := g.mcpToolName
 	requestProps := commonProps()
 	requestProps["facts"] = schemaFacts

@@ -18,9 +18,13 @@ gateway work unchanged:
 
 `tools.search` finds tools by what they do (see [Finding tools](#finding-tools)).
 
-By default an agent's tool list shows five tools: `tools.search`,
-`getToolDocs`, `executeToolCode`, `inbox.request` and `inbox.status` (see
-[the tool list](access-tools.md#the-tool-list-five-tools-by-default)).
+By default an agent's tool list shows six tools: `tools.search`,
+`tools.execute`, `getToolDocs`, `executeToolCode`, `inbox.request` and
+`inbox.status` (see
+[the tool list](access-tools.md#the-tool-list-six-tools-by-default)).
+One call needs no script: `tools.search` returns the tool's `input_schema`,
+and `tools.execute` runs it. Code mode is for several calls, loops and
+result filtering.
 `listToolFiles` and `readToolFile` are not among them, but they still answer
 a direct call, and an agent its owner switched to the full list sees them.
 

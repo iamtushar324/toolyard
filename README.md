@@ -72,9 +72,10 @@ task, in their own words, with a voice note and evidence. You review it on
 your phone and allow some or all of the tools; each allowed tool gets a
 single-use permission (a grant) tied to the exact parameters you saw.
 
-- **Agents** see five tools by default: `tools.search` (whose `run` says
-  which tools run now, need approval or are blocked), `getToolDocs`,
-  `executeToolCode`, `inbox.request` and `inbox.status`. In each round an
+- **Agents** see six tools by default: `tools.search` (whose `run` says
+  which tools run now, need approval or are blocked, and whose
+  `input_schema` lets `tools.execute` run one call next), `tools.execute`,
+  `getToolDocs`, `executeToolCode`, `inbox.request` and `inbox.status`. In each round an
   agent sends one `inbox.request` with every restricted call and every
   question it has: a first-person message, a ≤75-word voice-note script,
   attachments (tables, charts, diffs, logs, links; images, video and files

@@ -120,7 +120,7 @@ func enrollAgentWithID(t *testing.T, h *httpClient, name string) (token, agentID
 }
 
 // useFullToolList switches one agent to the full tool list. By default an
-// agent's tools/list shows only the five tools of gateway.SmallToolList;
+// agent's tools/list shows only the six tools of gateway.SmallToolList;
 // a test that counts or names listed tools needs every tool listed. It
 // reads the agent's scope first and sends it back with tool_list "full",
 // because a POST replaces the whole scope.
@@ -776,7 +776,7 @@ func TestE2EUsageAndTopN(t *testing.T) {
 	// The pinned set, from a full-mode listing (it grows as features add
 	// always-visible tools).
 	// Both agents here list every tool they may use: the visibility modes
-	// under test shorten the full tool list, not the five-tool default.
+	// under test shorten the full tool list, not the six-tool default.
 	fullTok, fullID := enrollAgentWithID(t, h, "topn-full")
 	useFullToolList(t, h, fullID)
 	cf := mcpClient(t, *toolyardURL, fullTok)

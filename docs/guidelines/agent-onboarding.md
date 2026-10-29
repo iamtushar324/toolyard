@@ -72,16 +72,24 @@ layers 1–5 if the agent skips it.
 
 ## Layer 1: the connection instructions
 
-`buildInstructions` (`internal/gateway/server.go`) teaches the five-tool
-flow first, then the PERMISSIONS paragraph. By default an agent's tool list
-shows five tools (`tools.search`, `getToolDocs`, `executeToolCode`,
-`inbox.request`, `inbox.status`; see
-[access-tools.md](access-tools.md#the-tool-list-five-tools-by-default)), so
-the instructions name only what those five reach:
+`buildInstructions` (`internal/gateway/server.go`) opens with a short
+first-contact contract (`_reason` on every call, read or write follows the
+tool's `read_only` flag, `inbox.request` with `dry_run: true` first, one
+`inbox.request` per round, `try_call` / `tools.tryCall` in scripts), then
+teaches the six-tool flow, then the PERMISSIONS paragraph. By default an
+agent's tool list shows six tools (`tools.search`, `tools.execute`,
+`getToolDocs`, `executeToolCode`, `inbox.request`, `inbox.status`; see
+[access-tools.md](access-tools.md#the-tool-list-six-tools-by-default)), so
+the instructions name only what those six reach. When the skills hub serves
+the built-in guide, the instructions also name the two skills to read
+first: `toolyard/toolyard-basics` and `toolyard/toolyard-permissions-and-inbox`
+(with `references/request-fields.md`).
 
-> TOOLS: find a tool with `tools.search` (each result's `run` says whether it
-> runs now, needs approval or is blocked), read it with `getToolDocs`, run it
-> in `executeToolCode`. PERMISSIONS: `inbox.request` is the one way to get
+> FIND: call `tools.search` (each result's `run` says whether it runs now,
+> needs approval or is blocked, and its `input_schema` gives the
+> parameters). RUN ONE CALL: `tools.execute`. SEVERAL CALLS, LOOPS OR
+> RESULT FILTERING: `executeToolCode`. READ: `getToolDocs` only when the
+> schema is unclear. PERMISSIONS: `inbox.request` is the one way to get
 > permission. Plan the round first, then send ONE `inbox.request` with every
 > restricted call and every question you have for your owner; start another
 > round only for what the answers open (call `inbox.guide` first …). In a

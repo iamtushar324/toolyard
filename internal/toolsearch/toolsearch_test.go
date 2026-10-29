@@ -577,3 +577,19 @@ func TestRegexWorkIsBoundedBeforeItRuns(t *testing.T) {
 		t.Fatalf("running left behind: %v", e.running)
 	}
 }
+
+// TestDefaultLimitIsTen (TEC-1815): a search without a limit answers at
+// most 10 results; an explicit limit still reaches MaxLimit.
+func TestDefaultLimitIsTen(t *testing.T) {
+	var tools []Tool
+	for i := 0; i < 30; i++ {
+		tools = append(tools, Tool{Name: fmt.Sprintf("srv.read_item_%02d", i), Server: "srv", Description: "Read one item."})
+	}
+	e := New(Options{})
+	if res := search(t, e, tools, Query{Text: "item", Mode: ModeKeyword}); len(res.Hits) != 10 || res.Matched != 30 {
+		t.Fatalf("default limit: %d hits of %d matched, want 10 of 30", len(res.Hits), res.Matched)
+	}
+	if res := search(t, e, tools, Query{Text: "item", Mode: ModeKeyword, Limit: MaxLimit}); len(res.Hits) != 30 {
+		t.Fatalf("limit %d: %d hits, want 30", MaxLimit, len(res.Hits))
+	}
+}

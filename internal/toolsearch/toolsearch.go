@@ -112,7 +112,7 @@ func ParseDetail(s string) (Detail, error) {
 
 const (
 	// DefaultLimit and MaxLimit bound how many results a search returns.
-	DefaultLimit = 50
+	DefaultLimit = 10
 	MaxLimit     = 200
 	// MaxPatternLen caps a regex pattern, in characters.
 	MaxPatternLen = 200

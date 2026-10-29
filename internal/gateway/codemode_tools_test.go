@@ -864,7 +864,7 @@ func TestCodeModeWorkerDeathLeavesGatewayUp(t *testing.T) {
 }
 
 // TestCodeModeDescriptionsTeachTheFlow: getToolDocs and executeToolCode
-// teach the five-tool flow (search, read the docs, run) and the one
+// teach the six-tool flow (search, run, read the docs when unclear) and the one
 // inbox.request for every permission_required call of a script, with each
 // grant passed back as the call's _grant argument.
 func TestCodeModeDescriptionsTeachTheFlow(t *testing.T) {

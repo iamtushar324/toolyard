@@ -12,7 +12,7 @@ permission decision. New requests issue grants; the agent executes the calls.
 ## Prepare one concrete batch
 
 `inbox.request` is the one way to get permission, and `inbox.status` reads the
-decision; both are among the five tools you see by default. Other inbox tools
+decision; both are among the six tools you see by default. Other inbox tools
 named here run in `executeToolCode` as `toolyard.inbox_<name>`.
 
 1. Find the restricted calls: `tools.search` gives each tool's `run`

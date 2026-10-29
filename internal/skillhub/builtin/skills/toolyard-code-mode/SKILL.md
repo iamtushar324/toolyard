@@ -24,10 +24,11 @@ direct call (recorded with via `code_mode`).
   (see [REST fallback](references/rest-fallback.md); it needs `TOOLYARD_URL`,
   your toolyard's base URL, and `TOOLYARD_TOKEN_FILE`).
 
-By default your tool list shows five tools (`tools.search`, `getToolDocs`,
-`executeToolCode`, `inbox.request`, `inbox.status`), so a script is also how
-you run any other tool. Call a tool directly instead when you make one call
-and it is in your list.
+By default your tool list shows six tools (`tools.search`, `tools.execute`,
+`getToolDocs`, `executeToolCode`, `inbox.request`, `inbox.status`). For one
+call you need no script: `tools.search` returns the tool's `input_schema`,
+and `tools.execute` runs it. Use a script for several calls, loops or result
+filtering.
 
 ## Recipe
 
@@ -41,9 +42,10 @@ and it is in your list.
 
    Or list every stub: `listToolFiles` (`{"language": "javascript"}` for
    TypeScript stubs).
-2. Read its parameters with `getToolDocs` (`server` and `tool`: the two halves
-   of the hit's `code`), or its stub with `readToolFile` when your list shows
-   it. Never guess a name or a parameter.
+2. Read its parameters: the hit's `input_schema` (search with the default
+   `detail` `full`), or `getToolDocs` (`server` and `tool`: the two halves of
+   the hit's `code`) or its stub with `readToolFile` when the schema is
+   unclear. Never guess a name or a parameter.
 
    ```text
    readToolFile
