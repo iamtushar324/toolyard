@@ -757,7 +757,19 @@ write, the collection's per-file limit, paths inside the skill folder, no
 content that looks like a credential, a valid `SKILL.md` whose `name` is
 the skill's folder name, and no file inside another file or over a
 folder. A new skill's path is up to four folders of lowercase letters,
-digits and single hyphens; its last folder is its name.
+digits and single hyphens; its last folder is its name. A native
+collection keeps one skill per folder tree: a `SKILL.md` below a skill's
+own folder, or a new skill inside or around another skill's folder, is
+refused. A write never changes another skill.
+
+**Consistency.** A write runs under the collection's lock on every
+replica. Under the lock toolyard checks again what it checked first (the
+writer may still write the collection and see the skill, and the write
+still needs no approval), and the new version goes live in the same
+transaction that records the revision: a write is live with its history,
+or not at all. Revisions keep their bytes in a table of their own, so no
+cleanup of old versions, in this toolyard version or an older one after a
+rollback, removes them.
 
 **What cannot change.** A native collection has no repository: no branch,
 folder, excludes, pinned commit, credential, check interval or webhook

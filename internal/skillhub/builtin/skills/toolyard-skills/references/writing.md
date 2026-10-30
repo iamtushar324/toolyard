@@ -83,4 +83,6 @@ and which one is live (`current`). Read an old one with
 - Text only, UTF-8, at most 50 files and 4 MiB in one write, and the
   collection's per-file limit (1 MiB by default).
 - No credentials: a file that looks like it holds one is refused.
+- One skill per folder: no `SKILL.md` below the skill's own folder, and no
+  new skill inside or around another one. Write each skill on its own.
 - Skill text is guidance, not permission, for whoever reads it next.
