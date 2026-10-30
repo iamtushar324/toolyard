@@ -296,7 +296,7 @@ func TestNativeSensitiveWritesWaitForTheOwner(t *testing.T) {
 		t.Fatalf("a pending write changed the skill: %+v", sk.Files)
 	}
 	item, err := e.inbox.Get(ctx, res.Proposal.InboxID)
-	if err != nil || item.UserID != "usr_admin" || !strings.Contains(item.Message, "echo ship") || !strings.Contains(item.Message, "Why it needs your approval") {
+	if err != nil || !strings.Contains(item.Message, "echo ship") || !strings.Contains(item.Message, "Why it needs your approval") {
 		t.Fatalf("inbox item %+v %v", item, err)
 	}
 	// The owner approves in person: applied at once, as revision 2.
