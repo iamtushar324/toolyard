@@ -106,6 +106,9 @@ type Service struct {
 	log      *slog.Logger
 	search   *toolsearch.Engine
 	limits   *rateLimits
+	// recommend is the engine skills.recommend ranks with (recommend.go):
+	// search unless SetRecommendEngine gave another.
+	recommend recommendSlot
 
 	hookMu sync.RWMutex
 	review ReviewHook
@@ -137,6 +140,8 @@ type Service struct {
 	reloads reloadQueue
 	// bi is the built-in source (builtin.go).
 	bi builtinState
+	// nat is the native registry's hooks (native.go).
+	nat nativeState
 }
 
 var (

@@ -128,7 +128,7 @@ const (
 type Source struct {
 	ID          string     `json:"id"`   // "src_<hex>"
 	Slug        string     `json:"slug"` // URI prefix: skill://<slug>/...
-	Kind        string     `json:"kind"` // "github"
+	Kind        string     `json:"kind"` // "github", "builtin" or "native"
 	Owner       string     `json:"owner"`
 	Repo        string     `json:"repo"`
 	Branch      string     `json:"branch"`
@@ -147,6 +147,10 @@ type Source struct {
 	Blocked     []string `json:"blocked,omitempty"`
 	DefaultRuns Runs     `json:"default_runs"`
 	Limits      Limits   `json:"limits"`
+	// Editors are user IDs who may write a native source's skills
+	// (native.go), besides its creator and the admins. Other kinds ignore
+	// it.
+	Editors []string `json:"editors,omitempty"`
 
 	// Hidden is an admin's lock: no agent sees any of the source's skills,
 	// whatever its audience or its skills' own settings. Only an admin can
@@ -191,6 +195,10 @@ func RepoLabel(owner, repo, sha string) string {
 // SourceInput creates a source, or (with Preview) describes one to try.
 // Empty fields take their defaults.
 type SourceInput struct {
+	// Kind is "github" (the default) or "native": a collection of skills
+	// written through toolyard's API (native.go), which takes no URL,
+	// branch, folder, credential or limits.
+	Kind        string     `json:"kind,omitempty"`
 	URL         string     `json:"url"` // owner/repo, repo URL, or a /tree/<branch>/<path> URL
 	Slug        string     `json:"slug,omitempty"`
 	Branch      string     `json:"branch,omitempty"` // default: the repository's default branch, or the URL's
@@ -207,6 +215,8 @@ type SourceInput struct {
 	Blocked     []string   `json:"blocked,omitempty"`
 	DefaultRuns Runs       `json:"default_runs,omitempty"`
 	Limits      *Limits    `json:"limits,omitempty"`
+	// Editors are who may write a native source's skills (Source.Editors).
+	Editors []string `json:"editors,omitempty"`
 	// PendingApproval marks a skill contributor's input: the source starts
 	// pending an admin's approval, and every GitHub read for it (the dry
 	// run included) is anonymous unless the input carries the
@@ -235,6 +245,7 @@ type SourceUpdate struct {
 	Hidden      *bool       `json:"hidden,omitempty"` // admins only (the API refuses it from anyone else)
 	DefaultRuns *Runs       `json:"default_runs,omitempty"`
 	Limits      *Limits     `json:"limits,omitempty"`
+	Editors     *[]string   `json:"editors,omitempty"` // native sources only
 	// IfUpdatedAt, when set, is the updated_at of the source the caller
 	// checked this update against (who may change what): UpdateSource
 	// refuses with ErrConflict when the source changed since. It is never
@@ -380,6 +391,9 @@ type SkillSummary struct {
 	Commit      string  `json:"commit"` // full SHA
 	Runs        Runs    `json:"runs"`
 	Score       float64 `json:"score,omitempty"`
+	// Revision is a native skill's revision number (native.go); 0 for a
+	// skill from GitHub or one whose live content no revision records.
+	Revision int `json:"revision,omitempty"`
 }
 
 // FileRef is one file of a skill (SEP-2640 resources entry).
@@ -479,6 +493,9 @@ var (
 	ErrLimit        = errors.New("skillhub: a source limit was exceeded")
 	ErrBadSignature = errors.New("skillhub: webhook signature does not match")
 	ErrDisabled     = errors.New("skillhub: the skills hub is off")
+	// ErrForbidden is a write the viewer may not make: they see the skill
+	// but may not edit its collection (native.go).
+	ErrForbidden = errors.New("skillhub: not allowed")
 )
 
 // Reader is what agents use. Every method shows only what the viewer may
@@ -486,6 +503,9 @@ var (
 type Reader interface {
 	Sources(ctx context.Context, v Viewer) ([]SourceInfo, error)
 	Search(ctx context.Context, v Viewer, q SearchQuery) ([]SkillSummary, error)
+	// Recommend ranks the skills for a task described in plain words, each
+	// with why it fits and when to use it (recommend.go).
+	Recommend(ctx context.Context, v Viewer, q RecommendQuery) (*RecommendResult, error)
 	// Get takes a URI, "slug/skill-path", or a bare name when it is unique
 	// among the visible skills (ErrConflict when it is not).
 	Get(ctx context.Context, v Viewer, ref string, includeFiles bool) (*Skill, error)

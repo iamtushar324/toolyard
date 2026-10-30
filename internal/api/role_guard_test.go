@@ -158,8 +158,8 @@ func memberAllowlist() map[string]bool {
 		// Agent skills routes; a bundle download's ticket is its own
 		// credential. Of /v1/skills/sources only the GET (the agent
 		// listing) and the POST (a contributor's source), listed above.
-		"/v1/skills/search", "/v1/skills/get", "/v1/skills/read", "/v1/skills/grep", "/v1/skills/list", "/v1/skills/proposal",
-		"/v1/skills/bundle", "/v1/skills/bundle/x",
+		"/v1/skills/search", "/v1/skills/recommend", "/v1/skills/get", "/v1/skills/read", "/v1/skills/grep", "/v1/skills/list", "/v1/skills/proposal",
+		"/v1/skills/bundle", "/v1/skills/bundle/x", "/v1/skills/versions", "/v1/skills/create", "/v1/skills/update",
 	} {
 		for _, m := range guardMethods {
 			allowed[m+" "+p] = true

@@ -271,6 +271,9 @@ func (s *Server) skillFirstSync(ctx context.Context, id string) {
 // repository, branch and folder within skillCreateRetryWindow, or nil: a
 // retried create answers with it.
 func (s *Server) recentSkillSource(ctx context.Context, uid string, in skillhub.SourceInput) *skillhub.Source {
+	if strings.TrimSpace(in.Kind) == skillhub.KindNative {
+		return nil // the slug is unique: a retry answers 409 "taken"
+	}
 	ref, err := s.skillsAdmin.ParseURL(in.URL)
 	if err != nil {
 		return nil
@@ -499,6 +502,15 @@ func (s *Server) skillSourceInput(w http.ResponseWriter, r *http.Request, m *ski
 		return in, false
 	}
 	in.PendingApproval = !m.admin
+	if strings.TrimSpace(in.Kind) == skillhub.KindNative {
+		// A native collection has no repository to read and no approval
+		// path for contributors: admins create them.
+		if !m.admin {
+			writeJSON(w, http.StatusForbidden, map[string]string{"error": "only an admin can create a native skill collection", "code": "admin_only"})
+			return in, false
+		}
+		return in, true
+	}
 	if s.refuseGitHubConnectionUse(w, r, in.Auth) {
 		return in, false
 	}
@@ -825,6 +837,8 @@ func writeSkillAdminError(w http.ResponseWriter, err error, secrets ...string) {
 		status, code = http.StatusBadRequest, "invalid"
 	case errors.Is(err, skillhub.ErrConflict):
 		status, code = http.StatusConflict, "conflict"
+	case errors.Is(err, skillhub.ErrForbidden):
+		status, code = http.StatusForbidden, "admin_only"
 	case errors.Is(err, skillhub.ErrNeedsToken):
 		status, code = http.StatusUnprocessableEntity, "needs_token"
 	case errors.Is(err, skillhub.ErrLimit):
@@ -914,6 +928,11 @@ func skillUpdateSummary(in skillhub.SourceUpdate) string {
 	add(in.Blocked != nil, "blocked")
 	add(in.DefaultRuns != nil, "default_runs")
 	add(in.Limits != nil, "limits")
+	if in.Editors != nil {
+		// Who may write a native collection: the list itself, as sharing
+		// changes record their lists.
+		f = append(f, "editors ["+strings.Join(*in.Editors, " ")+"]")
+	}
 	return "changed: " + strings.Join(f, ", ")
 }
 

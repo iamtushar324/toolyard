@@ -29,10 +29,12 @@ type fakeSkillReader struct {
 	mu       sync.Mutex
 	viewers  []skillhub.Viewer
 	searches []skillhub.SearchQuery
-	greps    []skillhub.GrepQuery
-	lists    []skillhub.ListQuery
-	bundles  [][]string
-	subs     []func(string)
+	// recommends are the Recommend queries (skills_recommend_test.go).
+	recommends []skillhub.RecommendQuery
+	greps      []skillhub.GrepQuery
+	lists      []skillhub.ListQuery
+	bundles    [][]string
+	subs       []func(string)
 	// fail, when set for a method name, is returned by that method.
 	fail map[string]error
 	// content replaces a file's content (by URI) for Read; size replaces a
@@ -224,6 +226,48 @@ func (f *fakeSkillReader) Search(_ context.Context, v skillhub.Viewer, q skillhu
 		out = out[:q.Limit]
 	}
 	return out, nil
+}
+
+// Recommend names the visible, listed skills whose name or description
+// holds a word of the task, keyword-ranked, in source order.
+func (f *fakeSkillReader) Recommend(_ context.Context, v skillhub.Viewer, q skillhub.RecommendQuery) (*skillhub.RecommendResult, error) {
+	f.record(v)
+	f.mu.Lock()
+	f.recommends = append(f.recommends, q)
+	f.mu.Unlock()
+	if err := f.failure("Recommend"); err != nil {
+		return nil, err
+	}
+	if strings.TrimSpace(q.Task) == "" {
+		return nil, fmt.Errorf("%w: describe the task", skillhub.ErrInvalid)
+	}
+	res := &skillhub.RecommendResult{Task: q.Task, RankedBy: "keyword", Skills: []skillhub.Recommendation{}}
+	words := strings.Fields(strings.ToLower(q.Task))
+	for _, src := range fakeSkillSources {
+		if !src.visible(v) || (q.Source != "" && q.Source != src.slug) {
+			continue
+		}
+		for _, sk := range src.skills {
+			if !listed(sk, v, q.IncludeHost) {
+				continue
+			}
+			text := strings.ToLower(sk.name + " " + sk.description)
+			for _, w := range words {
+				if strings.Contains(text, w) {
+					res.Skills = append(res.Skills, skillhub.Recommendation{
+						URI: fakeSkillURI(src, sk, "SKILL.md"), Name: sk.name, Source: src.slug, Path: sk.path,
+						Description: sk.description, Runs: sk.runs, Score: 1, Rationale: "matches \"" + w + "\" in its name or description (keyword rank)",
+					})
+					break
+				}
+			}
+		}
+	}
+	res.Matched = len(res.Skills)
+	if q.Limit > 0 && len(res.Skills) > q.Limit {
+		res.Skills = res.Skills[:q.Limit]
+	}
+	return res, nil
 }
 
 // find resolves a skill reference among the sources v sees.

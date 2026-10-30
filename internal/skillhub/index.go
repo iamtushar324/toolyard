@@ -63,6 +63,9 @@ type skillEntry struct {
 	skillMD     string // digest
 	runs        Runs   // where it runs, after the override and defaults
 	override    Runs
+	// revision is a native skill's current revision (native.go), 0 for
+	// every other skill.
+	revision int
 }
 
 // skillShare is one skill's own sharing setting (SkillSharing), as sets.
@@ -412,6 +415,12 @@ func (s *Service) buildSrcIndex(ctx context.Context, row *sourceRow) (*srcIndex,
 	if err != nil {
 		return nil, err
 	}
+	var revisions map[string]int
+	if row.IsNative() {
+		if revisions, err = s.currentRevisions(ctx, row.ID, v.ID); err != nil {
+			return nil, err
+		}
+	}
 	for _, e := range entries {
 		if sh, ok := shares[e.path]; ok {
 			si.shares[e.path] = &skillShare{mode: sh.Mode, members: setOf(sh.Members), blocked: setOf(sh.Blocked)}
@@ -419,6 +428,7 @@ func (s *Service) buildSrcIndex(ctx context.Context, row *sourceRow) (*srcIndex,
 		se := &skillEntry{
 			path: e.path, name: e.name, description: e.description,
 			frontmatter: json.RawMessage(e.frontmatter), skillMD: e.skillMD, override: overrides[e.path],
+			revision: revisions[e.path],
 		}
 		se.runs = effectiveRuns(se.override, Runs(e.runs), row.DefaultRuns)
 		si.skills = append(si.skills, se)

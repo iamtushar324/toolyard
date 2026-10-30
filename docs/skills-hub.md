@@ -1,7 +1,8 @@
 # Skills hub
 
 toolyard serves [Agent Skills](https://agentskills.io/specification) from
-GitHub repositories to every client: MCP tools, code mode, REST and the MCP
+GitHub repositories, and from [native collections](#native-skills) that
+agents and people write through toolyard itself, to every client: MCP tools, code mode, REST and the MCP
 Skills extension ([SEP-2640](https://modelcontextprotocol.io/seps/2640-skills-extension)).
 An admin adds a repository and a branch once; toolyard copies the skills in
 it, at an exact commit, into its database, keeps that copy current, and
@@ -28,6 +29,10 @@ contract between the parts are in
   `staged` (built, not served), `active` (served; one per source),
   `retired` (was active), `rejected` (a reviewer said no) or `failed` (the
   commit broke a rule, such as a limit; nothing of it is served).
+- **Native collection**: a source of kind `native` whose skills live in
+  toolyard's database and are written through its API (`skills.create`,
+  `skills.update`) instead of a repository. See [Native skills](#native-skills).
+- **Revision**: one write of one native skill, numbered 1, 2, … per skill.
 - **Update mode**: `auto` (a new commit is checked and goes live), `review`
   (a new commit becomes a staged version that waits for an admin), or
   `pinned` (one commit, `pinned_sha`, is served; new commits are ignored).
@@ -421,6 +426,8 @@ answers them 403 `admin_only`. Errors are `{"error", "code"}` with the codes `in
 | `POST /v1/skills/sources/{id}/webhook` | GitHub's push webhook (public, signed) |
 | `GET /v1/skills/admin/github-token` | `{set, rate: {limit, remaining, used, reset}, paused_until?}`: the default read token's state, never the token |
 | `PUT /v1/skills/admin/github-token` | `{token}`: set the default read token (checked with GitHub first) or, with `""`, clear it; answers like the GET |
+| `POST /v1/skills/sources` with `{"kind": "native", ...}` | admin. Create a [native collection](#native-skills) `{kind: "native", slug, mode?, visibility?, members?, blocked?, editors?, default_runs?, limits?}`: `201 {source}`. No `url`, `branch`, `path`, `exclude`, `pinned_sha`, `auth`, `token` or `poll_seconds` (400 `invalid`); a contributor answers 403 `admin_only` |
+| `PATCH /v1/skills/sources/{id}` with `{editors}` | admin. Who may write a native collection's skills (user IDs; besides its creator and the admins). A native collection also takes `mode` (`auto` or `review`), the sharing fields, `hidden`, `default_runs` and `limits`; its repository settings answer 409 `conflict` |
 
 Every change is in the audit log (`skills.source_create`,
 `skills.source_update`, `skills.source_delete`, `skills.source_sync`,
@@ -431,7 +438,9 @@ and after), `skills.contributor_add`, `skills.contributor_remove`,
 `skills.source_approve`, `skills.source_reject`,
 `skills.source_propose`, `skills.source_proposal_reject`,
 `skills.change_propose`, `skills.change_proposal_reject`,
-`skills.change_pull_request`, `skills.change_proposal_fail`). No response and
+`skills.change_pull_request`, `skills.change_proposal_fail`, and for native
+collections `skills.native_create`, `skills.native_update`,
+`skills.native_propose` and `skills.native_apply`). No response and
 no audit row carries a token; the webhook secret appears only in the rotate
 response.
 
@@ -504,8 +513,9 @@ use `ty skills pull`.
 | Tool | Arguments | Answer |
 | --- | --- | --- |
 | `skills.search` | `query`, `mode` (`keyword` default, `regex`), `source`, `limit` (10, at most 50), `include_host` | matching skills: name, description, uri, source, repo, commit, runs |
-| `skills.get` | `skill` (URI, `source/path`, or a unique bare name), `include_files` (default true) | the SKILL.md body and frontmatter, `root`, and every file with its URI, `sha256:` digest and size |
-| `skills.read` | `uri`, `offset`, `limit` (lines) | the file's content, at most 2,000 lines and 256 KiB per call; when `truncated`, call again with `offset: next_offset` |
+| `skills.recommend` | `task` (plain words, at most 1,000 characters), `limit` (5, at most 20), `source`, `tags` (any of them, at most 10), `include_host`, `mode` (`auto` default, `keyword`, `semantic`) | the skills that fit the task, best first, each with its uri, a short description, when to use it, tags, a score and a one-line rationale; see [Recommendations](#recommendations) |
+| `skills.get` | `skill` (URI, `source/path`, or a unique bare name), `include_files` (default true), `revision` (native skills: an older revision) | the SKILL.md body and frontmatter, `root`, and every file with its URI, `sha256:` digest and size; a native skill also has its `revision` |
+| `skills.read` | `uri`, `offset`, `limit` (lines), `revision` (native skills; or a URI ending in `?revision=N`) | the file's content, at most 2,000 lines and 256 KiB per call; when `truncated`, call again with `offset: next_offset` |
 | `skills.grep` | `pattern` (RE2), `source`, `path` (glob), `ignore_case`, `limit` (50, at most 200), `include_host` | matching lines with their file URI, skill and line number |
 | `skills.sources` | none | the sources you see, with the commit each serves |
 | `skills.list` | `cursor`, `limit` (100, at most 500), `source`, `include_host` | a page of skills as MCP `skills/list` entries, plus `next_cursor` |
@@ -513,9 +523,13 @@ use `ty skills pull`.
 | `skills.proposal` | `id` | one of your proposals: `pending`, `approved`, `done` (with `result`: the new source's id, or a change proposal's pull request URL), `rejected` or `failed` (with `error`); poll this instead of proposing again |
 | `skills.propose_change` | `skill`, `files` (path → new content, `""` deletes), `title`, `summary` | a pending proposal against the version you see; after the source owner's approval toolyard opens a pull request |
 | `skills.bundle` | `skills` (1 to 50; no two with the same name; at most 64 MiB of files) | a `.tar.gz` download URL: one use, 10 minutes, no token needed |
+| `skills.create` | `collection`, and `name`, `description`, `instructions`, `triggers`, `tags` (or a whole `SKILL.md` in `files`), `path`, `files`, `note` | a new skill in a [native collection](#native-skills): `status` (`live` or `pending_approval`), `uri`, `revision`, `commit`, the files written, `approval_reasons` and `proposal` when it waits |
+| `skills.update` | `skill`, and what changes: `description`, `instructions`, `triggers`, `tags`, `files` (`""` deletes a file); `base_revision`, `note` | as `skills.create`, with the new revision |
+| `skills.versions` | `skill`, `limit` (20, at most 100) | a native skill's revisions, newest first: revision, operation, author, agent, note, proposal, time, files, digests, and which one is `current` |
 
 Before a multi-step task, call `skills.search` with a few words about the
-task; when a skill matches, read it with `skills.get` and follow it.
+task, or `skills.recommend` with the task in a sentence; when a skill
+matches, read it with `skills.get` and follow it.
 `tools.search` also names up to three matching skills under `skills`.
 
 To install skills in a local client such as Claude Code, run
@@ -525,6 +539,65 @@ To install skills in a local client such as Claude Code, run
 # url from skills.bundle (or POST /v1/skills/bundle); it is the credential
 curl -sf -o skills.tar.gz "$url" && mkdir -p ~/.claude/skills && tar -xzf skills.tar.gz -C ~/.claude/skills
 ```
+
+### Recommendations
+
+`skills.recommend` takes the task in plain words ("roll back yesterday's
+release and tell the team") and answers the skills that fit it, best
+first. In code mode it is `toolyard.skills_recommend(task="...")`. Each
+skill is ranked on its name and path, its description, when to use it and
+its tags, all read from its frontmatter:
+
+- When to use it: `metadata.triggers` (a list, or text split at `;` and
+  line breaks), `metadata.when-to-use` or `metadata.when_to_use`; without
+  those, the description's sentences that say when ("Use when ...", "Use
+  this when ...", "... when the user ...").
+- Tags: `metadata.tags`, a list or comma-separated text. The `tags`
+  argument keeps the skills that have any of the given tags
+  (case-insensitive).
+
+The candidates are exactly the skills `skills.search` would show the
+caller (the sharing rule and where a skill runs), narrowed by `source` and
+`tags`. A skill is recommended as soon as its version goes live.
+
+How it ranks:
+
+- `auto` (the default), with the server's tool-search ranker on (the
+  `-tool-search-ranker` that `tools.search` uses): hybrid. Keyword ranking
+  (BM25F) picks up to 30 candidates and Jev judges them, sometimes with a
+  second round of up to 30 more from the likely source; `ranked_by` is
+  `jev`. Skills Jev did not judge follow, without a score.
+- When the ranker is off, fails, times out or has no key, or the caller
+  already runs two ranked searches, the answer is the keyword ranking and
+  `fallback` says why (`off`, `error`, `timeout`, `no_key`, `busy`,
+  `empty`); `ranked_by` is `keyword`.
+- `keyword` never asks Jev. `semantic` is `auto` that is refused where no
+  ranker is configured.
+
+What goes to OpenRouter, only for `auto` and `semantic` with the ranker
+on: the task, and for up to 60 candidate skills their `source/path` name,
+source and text (the description, then when to use it and the tags) cut to
+300 bytes; for each source, its slug, its skill count and a few skill
+names. Never a skill's body or files, and never who asked. Nothing Jev
+answers reaches the answer except its scores.
+
+The answer is lean: `task`, `ranked_by`, `fallback` (only when it fell
+back), `matched` (skills that matched, before `limit`) and `skills`. Each
+skill has `uri` (load it with `skills.get`), `name`, `source`, `path`,
+`description` (cut to 240 bytes), up to three `triggers`, `tags`, `runs`,
+`score` (Jev's probability, or the keyword score) and `rationale`: one
+sentence built from the data only, never from the provider's text, such
+as `matches "deploy", "rollback" in its name and triggers; Jev rates it
+relevant (0.91)` or `Jev rates it relevant to the task (0.83); no shared
+words`.
+
+To measure the ranking, `internal/skillhub/testdata/recommend-eval` holds a
+corpus of generic skills and labelled tasks (some paraphrased, with few
+words in common with their skill). `TestRecommendEvalKeyword` logs the
+keyword ranking's recall@1, recall@3 and MRR@5 and holds it above floors;
+`scripts/skills-recommend-eval.py` measures the same tasks on a running
+server, Jev included (serve the corpus as a source and pass its slug as
+`SOURCE`).
 
 ### Change proposals (for agents)
 
@@ -568,8 +641,12 @@ the tool call, and the body is the tool's structured answer.
 | Route | Tool |
 | --- | --- |
 | `GET /v1/skills/search?query=&mode=&source=&limit=&include_host=` | `skills.search` |
-| `GET /v1/skills/get?skill=&include_files=` | `skills.get` |
-| `GET /v1/skills/read?uri=&offset=&limit=` | `skills.read` |
+| `GET /v1/skills/recommend?task=&limit=&source=&tags=&include_host=&mode=` (`tags` comma-separated) | `skills.recommend` |
+| `GET /v1/skills/get?skill=&include_files=&revision=` | `skills.get` |
+| `GET /v1/skills/read?uri=&offset=&limit=&revision=` | `skills.read` |
+| `GET /v1/skills/versions?skill=&limit=` | `skills.versions` |
+| `POST /v1/skills/create` `{"collection": ..., "name": ..., ..., "reason": "..."}` | `skills.create` |
+| `POST /v1/skills/update` `{"skill": ..., ..., "reason": "..."}` | `skills.update` |
 | `GET /v1/skills/grep?pattern=&source=&path=&ignore_case=&limit=&include_host=` | `skills.grep` |
 | `GET /v1/skills/sources` | `skills.sources` |
 | `GET /v1/skills/list?cursor=&limit=&source=&include_host=` | `skills.list` |
@@ -606,6 +683,91 @@ special file, or lies outside the skills the server named, and writes
 nothing then. A skill folder that already exists is replaced only with
 `--force` (the old folder is moved aside and removed once the new one is
 in place).
+
+## Native skills
+
+A native collection is a skill source that lives in toolyard's database
+instead of a GitHub repository. Agents and people write its skills through
+toolyard's API, and every other part of the hub serves them exactly like
+skills from GitHub: search, `skills.recommend`, get, read, grep, listings,
+bundles, sharing, the MCP Skills extension and `tools.search`. A write is
+live for every reader as soon as it answers `live`: the node that wrote it
+serves it at once, and the other nodes within moments.
+
+**Create a collection.** An admin creates it over the admin API
+(`POST /v1/skills/sources` with `kind: "native"`, a `slug`, and optionally
+`mode`, `visibility`, `members`, `blocked`, `editors`, `default_runs` and
+`limits`). Its skill URIs are `skill://<slug>/<path>/SKILL.md`, and its
+`repo` is `toolyard.native/<slug>@<12-hex digest>`. The Skills page lists
+it with a **Native** badge, and its sharing panel works as for any source;
+its repository fields there do not apply (sync and webhook answer 409).
+Editors are set over the API (`PATCH /v1/skills/sources/{id}` with
+`editors`).
+
+**Who reads.** The [sharing rule](#sharing) of every source: the
+collection's audience, block list, hide lock and per-skill sharing.
+
+**Who writes.** A person, or an agent for its owner, writes when they see
+the collection and are an admin, its creator, or one of its `editors`.
+Anyone else who sees a skill can propose a change with
+`skills.propose_change`; for a native skill the collection's creator
+decides in their Inbox, and the approval applies the change in toolyard (no
+GitHub connection needed).
+
+**Approvals.** An agent's write goes live at once, except when it is
+sensitive; then it becomes a change proposal for the collection's creator,
+and nothing changes before they approve it in person (dashboard,
+notification or passkey; never a batch, a rule, a grant or an operator
+token). A write is sensitive when:
+
+- the collection's `mode` is `review` (every agent change waits; `auto` is
+  the default);
+- it adds, changes or deletes code an agent may run: a file in a
+  `scripts/` or `bin/` folder, one with a code extension (`.sh`, `.py`,
+  `.js`, `.ts`, `.rb`, `.go`, `.sql`, …), or one that starts with `#!`;
+- it changes the skill's `allowed-tools`, or its `metadata.toolyard-runs`
+  (a new skill that runs on the host included);
+- the skill has `metadata.toolyard-protected: "true"`, or the write sets or
+  clears that key.
+
+People write directly: a person's write in the dashboard or with their own
+session is theirs, and it is audited. The Inbox item shows why the write
+needs approval, every file with its operation and its complete diff; a
+write too large to show in full is refused. An approval applies exactly
+those files on the revision they were based on: if the skill changed in
+between, nothing is applied and the proposal fails with the reason. An
+approval that toolyard could not finish (a restart) is retried by the
+Inbox sweep and applied once.
+
+**Revisions.** Every write is a revision of its skill: its number, who
+wrote it (the person and, for an agent's write, the agent), the note, the
+proposal it came from, and the skill's files. `skills.versions` lists them,
+and `skills.get` and `skills.read` with `revision` read an old one. The
+collection's versions follow the usual retention (the last ten), but the
+revisions keep their files: every revision stays readable until the
+collection is deleted. `base_revision` makes a write fail with `conflict`
+when someone changed the skill since the writer read it. An admin can
+still roll the whole collection back to an earlier version
+(**Activate** on the source page); a skill's `revision` then names the
+revision whose content is live, and the next write builds on it.
+
+**What a write may hold.** The same checks as a skill change proposal:
+text only (UTF-8, no NUL), at most 50 files and 4 MiB of new content in one
+write, the collection's per-file limit, paths inside the skill folder, no
+content that looks like a credential, a valid `SKILL.md` whose `name` is
+the skill's folder name, and no file inside another file or over a
+folder. A new skill's path is up to four folders of lowercase letters,
+digits and single hyphens; its last folder is its name.
+
+**What cannot change.** A native collection has no repository: no branch,
+folder, excludes, pinned commit, credential, check interval or webhook
+(409 `conflict`), and "Sync now" does nothing. Deleting a collection
+deletes its skills and their revisions.
+
+**Rollback of toolyard.** An older toolyard build ignores the editors and
+revisions, never fetches anything for a native collection (its fixed
+repository settings name no GitHub account, and its next check is in year
+9999), and serves its last version read-only.
 
 ## Built-in skills
 

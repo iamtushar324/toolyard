@@ -33,7 +33,7 @@ const sourceColumns = `s.id, s.slug, s.kind, s.owner, s.repo, s.branch, s.path, 
 	s.limits_json, s.webhook_secret_sealed, s.created_by, s.created_at, s.updated_at,
 	s.active_version_id, s.pending_version_id, s.head_sha, s.head_etag, s.last_checked_at,
 	s.next_check_at, s.last_error, s.failures, s.blocked_json, s.hidden, s.approval, s.approval_note, s.approval_by,
-	COALESCE(v.sha, ''), COALESCE(v.skill_count, 0), COALESCE(v.warning_count, 0)`
+	s.editors_json, COALESCE(v.sha, ''), COALESCE(v.skill_count, 0), COALESCE(v.warning_count, 0)`
 
 const sourceFrom = ` FROM skill_sources s LEFT JOIN skill_versions v ON v.id = s.active_version_id`
 
@@ -45,6 +45,7 @@ func scanSource(sc rowScanner) (*sourceRow, error) {
 	var (
 		r                                  sourceRow
 		exclude, members, limits, blocked  string
+		editors                            string
 		mode, auth, vis, runs, approval    string
 		poll, enabled, created, updated    int64
 		hidden                             int64
@@ -56,7 +57,7 @@ func scanSource(sc rowScanner) (*sourceRow, error) {
 		&limits, &r.webhookSealed, &r.CreatedBy, &created, &updated,
 		&r.ActiveVersionID, &r.PendingVersionID, &r.headSHA, &r.headETag, &lastChecked,
 		&nextCheck, &r.LastError, &failures, &blocked, &hidden, &approval, &r.ApprovalNote, &r.ApprovalBy,
-		&r.ActiveSHA, &skillCount, &warningCount)
+		&editors, &r.ActiveSHA, &skillCount, &warningCount)
 	if err != nil {
 		return nil, err
 	}
@@ -75,6 +76,7 @@ func scanSource(sc rowScanner) (*sourceRow, error) {
 	_ = json.Unmarshal([]byte(members), &r.Members)
 	_ = json.Unmarshal([]byte(blocked), &r.Blocked)
 	_ = json.Unmarshal([]byte(limits), &r.Limits)
+	_ = json.Unmarshal([]byte(editors), &r.Editors)
 	r.HasToken = r.tokenSealed != ""
 	r.HasWebhookSecret = r.webhookSealed != ""
 	r.WebhookURLPath = "/v1/skills/sources/" + r.ID + "/webhook"
@@ -146,15 +148,20 @@ func (s *Service) insertSource(ctx context.Context, r *sourceRow) error {
 	members, _ := json.Marshal(nonNil(r.Members))
 	blocked, _ := json.Marshal(nonNil(r.Blocked))
 	limits, _ := json.Marshal(r.Limits)
+	editors, _ := json.Marshal(nonNil(r.Editors))
 	now := s.now().UnixMilli()
+	next := now
+	if r.Kind == KindNative {
+		next = builtinNever // never synced (native.go)
+	}
 	_, err := s.db.ExecContext(ctx, `INSERT INTO skill_sources (id, slug, kind, owner, repo, branch, path, exclude_json,
 		mode, pinned_sha, auth, token_sealed, poll_seconds, enabled, visibility, members_json, default_runs,
-		limits_json, created_by, created_at, updated_at, next_check_at, blocked_json, approval)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		limits_json, created_by, created_at, updated_at, next_check_at, blocked_json, approval, editors_json)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		r.ID, r.Slug, r.Kind, r.Owner, r.Repo, r.Branch, r.Path, string(exclude),
 		string(r.Mode), r.PinnedSHA, string(r.Auth), r.tokenSealed, int64(r.PollSeconds), boolInt(r.Enabled),
 		string(r.Visibility), string(members), string(r.DefaultRuns),
-		string(limits), r.CreatedBy, now, now, now, string(blocked), string(r.Approval))
+		string(limits), r.CreatedBy, now, now, next, string(blocked), string(r.Approval), string(editors))
 	return err
 }
 
@@ -196,6 +203,7 @@ func (s *Service) updateSourceSettings(ctx context.Context, r *sourceRow, up Sou
 	set(up.Blocked != nil, "blocked_json", jsonOf(nonNil(r.Blocked)))
 	set(up.Hidden != nil, "hidden", boolInt(r.Hidden))
 	set(up.DefaultRuns != nil, "default_runs", string(r.DefaultRuns))
+	set(up.Editors != nil, "editors_json", jsonOf(nonNil(r.Editors)))
 	now := s.now().UnixMilli()
 	if due {
 		sets = append(sets, "next_check_at = ?", "head_sha = ''", "head_etag = ''", "failures = 0")
@@ -974,12 +982,13 @@ func (s *Service) deleteVersions(ctx context.Context, sourceID string, ids []any
 	return tx.Commit()
 }
 
-// purgeBlobs deletes the blobs no version references, except those a sync
-// touched within blobGrace.
+// purgeBlobs deletes the blobs no version and no native skill revision
+// references, except those a sync or a write touched within blobGrace.
 func (s *Service) purgeBlobs(ctx context.Context) error {
 	cutoff := s.now().Add(-blobGrace).UnixMilli()
 	_, err := s.db.ExecContext(ctx, `DELETE FROM skill_blobs WHERE touched_at < ?
-		AND NOT EXISTS (SELECT 1 FROM skill_files f WHERE f.sha256 = skill_blobs.sha256)`, cutoff)
+		AND NOT EXISTS (SELECT 1 FROM skill_files f WHERE f.sha256 = skill_blobs.sha256)
+		AND NOT EXISTS (SELECT 1 FROM skill_revision_files r WHERE r.sha256 = skill_blobs.sha256)`, cutoff)
 	if err != nil {
 		return fmt.Errorf("skillhub: purge unused file contents: %w", err)
 	}

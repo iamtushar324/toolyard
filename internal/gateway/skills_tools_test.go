@@ -38,6 +38,8 @@ type skillsFixture struct {
 	props   *fakeProposals
 	hosts   *fakeHosts
 	tickets *SkillBundleTickets
+	// registry is the native registry (skills_native_test.go).
+	registry *fakeRegistry
 
 	member, admin, host, oauth, limited, blocked context.Context
 }
@@ -53,7 +55,7 @@ func newSkillsFixture(t *testing.T) *skillsFixture {
 	limited := access.Scope{Groups: map[string]bool{}, Limits: &access.Limits{Listed: true, DenyServers: map[string]bool{"skills": true}}}
 	f := &skillsFixture{
 		db: db, aud: audit.New(db), pol: policy.New(db),
-		reader: &fakeSkillReader{}, props: &fakeProposals{}, hosts: &fakeHosts{on: map[string]bool{"ag_host": true, "ag_oauth": true}},
+		reader: &fakeSkillReader{}, props: &fakeProposals{}, registry: &fakeRegistry{}, hosts: &fakeHosts{on: map[string]bool{"ag_host": true, "ag_oauth": true}},
 		res: &fakeResolver{scopes: map[string]access.Scope{
 			"ag_member": groups(), "ag_admin": {All: true}, "ag_host": groups(), "ag_oauth": groups(),
 			"ag_lookup_fails": groups(), "ag_limited": limited, "ag_blocked": {Denied: true},
@@ -68,7 +70,7 @@ func newSkillsFixture(t *testing.T) *skillsFixture {
 	f.gw.RegisterBuiltins()
 	t.Cleanup(func() { _ = f.gw.Close() })
 	f.tickets = NewSkillBundleTickets(db)
-	f.gw.RegisterSkillHub(SkillHub{Reader: f.reader, Proposals: f.props, Tickets: f.tickets, OnHost: f.hosts.OnHost})
+	f.gw.RegisterSkillHub(SkillHub{Reader: f.reader, Proposals: f.props, Registry: f.registry, Tickets: f.tickets, OnHost: f.hosts.OnHost})
 	bg := context.Background()
 	f.member = WithAgentID(bg, "ag_member")
 	f.admin = WithAgentID(bg, "ag_admin")

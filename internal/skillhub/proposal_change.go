@@ -116,6 +116,9 @@ type ChangeOptions struct {
 type ChangeProposals struct {
 	o     ChangeOptions
 	store proposalStore
+	// native applies approved changes to native skills; set by
+	// Service.SetNativeApprovals.
+	native *Service
 	// limit counts each agent's change proposals per hour.
 	limit *cluster.Counter
 }
@@ -161,6 +164,15 @@ type changeInput struct {
 	HeadBranch string `json:"head_branch,omitempty"`
 	// Attempts counts the resumed attempts at the GitHub writes.
 	Attempts int `json:"attempts,omitempty"`
+	// Native marks a change to a native skill (proposal_native.go): the
+	// approval applies the files to the collection instead of opening a
+	// pull request. Create is a new skill; BaseRevision the revision the
+	// change is based on (0: none recorded); Reasons why it needs
+	// approval.
+	Native       bool     `json:"native,omitempty"`
+	Create       bool     `json:"create,omitempty"`
+	BaseRevision int      `json:"base_revision,omitempty"`
+	Reasons      []string `json:"reasons,omitempty"`
 }
 
 // changeFile is one file of a proposal.
@@ -220,6 +232,13 @@ func (c *ChangeProposals) ProposeChange(ctx context.Context, v Viewer, in Change
 		return nil, fmt.Errorf("%w: files: give at least one file (path in the skill folder → its new content)", ErrInvalid)
 	case len(in.Files) > MaxChangeFiles:
 		return nil, fmt.Errorf("%w: files: at most %d files in one proposal", ErrLimit, MaxChangeFiles)
+	}
+	// A native skill has no repository: its owner's approval applies the
+	// change in toolyard (proposal_native.go), no GitHub connection needed.
+	if p, ok, err := c.routeNative(ctx, v, in, title, summary); ok {
+		return p, err
+	}
+	switch {
 	case c.o.Tokens == nil:
 		return nil, needsConnection("change proposals need toolyard's GitHub connections, which this server does not have; tell your owner what should change")
 	}
@@ -701,6 +720,10 @@ func (c *ChangeProposals) resume(ctx context.Context, row *proposalRow) {
 	if c.o.Now().UnixMilli()-approvedAt > changeMaxAge.Milliseconds() || ci.Attempts >= changeMaxAttempts {
 		msg := fmt.Sprintf("toolyard gave up: GitHub did not confirm the pull request in %d attempts (toolyard stops after %d attempts or a day); look for the branch %s on GitHub, and ask the agent to propose again if it is not there",
 			ci.Attempts+1, changeMaxAttempts+1, ci.branchFor(row.ID))
+		if ci.Native {
+			msg = fmt.Sprintf("toolyard gave up: it could not apply the change in %d attempts (toolyard stops after %d attempts or a day); ask the agent to write again",
+				ci.Attempts+1, changeMaxAttempts+1)
+		}
 		if ok, _ := c.store.changeSetOutcome(ctx, row.ID, proposalApproved, proposalFailed, "", msg); ok {
 			c.audit(ctx, audit.Event{EventType: "skills.change_proposal_fail", AgentID: row.AgentID, Reason: msg, ApprovalID: row.ID,
 				DecidedByUserID: row.DecidedBy})
@@ -776,6 +799,10 @@ func (c *ChangeProposals) decide(ctx context.Context, r *inbox.Request) (string,
 // outcome: done with the pull request URL, failed with the reason, or
 // still approved when GitHub's answer was uncertain.
 func (c *ChangeProposals) finish(ctx context.Context, row *proposalRow) (string, error) {
+	var nci changeInput
+	if json.Unmarshal([]byte(row.Input), &nci) == nil && nci.Native {
+		return c.finishNative(ctx, row, &nci)
+	}
 	actx, cancel := context.WithTimeout(ctx, changeApplyTimeout)
 	defer cancel()
 	pr, err := c.apply(actx, row)
