@@ -15,7 +15,8 @@
 --
 -- skill_revisions is one write of one native skill: its number (1, 2, ...
 -- per source and skill path), the operation ('create' or 'update'), the
--- version the write made live, the digest of the skill's files and of its
+-- version the write made live and that version's tree digest (commit_sha,
+-- the provenance of the revision after the version is retained away), the digest of the skill's files and of its
 -- SKILL.md, who wrote it (the person, and the agent when an agent wrote it
 -- for them), their note, and the change proposal it came from when an
 -- owner approved it in the Inbox (proposal_id, '' for a direct write; one
@@ -42,6 +43,7 @@ CREATE TABLE IF NOT EXISTS skill_revisions (
     revision        INTEGER NOT NULL,
     op              TEXT NOT NULL,
     version_id      TEXT NOT NULL,
+    commit_sha      TEXT NOT NULL,
     name            TEXT NOT NULL,
     files_digest    TEXT NOT NULL,
     skill_md_sha256 TEXT NOT NULL,

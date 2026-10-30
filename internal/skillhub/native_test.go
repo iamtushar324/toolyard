@@ -624,3 +624,37 @@ func TestNativeRevisionHistoryIsAtomicAndRollbackSafe(t *testing.T) {
 		t.Fatalf("revision 1 SKILL.md %+v %v", sk, err)
 	}
 }
+
+func TestNativeRoundTwoRules(t *testing.T) {
+	e := newNativeEnv(t, SourceInput{Visibility: VisibleMembers, Members: []string{"usr_editor", "usr_reader"}})
+	ctx := context.Background()
+	// An empty collection is listed for its audience, with its kind, and
+	// for nobody else.
+	list, err := e.svc.Sources(ctx, readerAgent)
+	if err != nil || len(list) != 1 || list[0].Kind != KindNative || list[0].SkillCount != 0 {
+		t.Fatalf("sources %+v %v", list, err)
+	}
+	if list, _ := e.svc.Sources(ctx, Viewer{UserID: "usr_out", AgentID: "agt_out", Delegated: true}); len(list) != 0 {
+		t.Fatalf("an outsider lists %+v", list)
+	}
+	// Under the lock, a create checks the audience again.
+	outsider := Viewer{UserID: "usr_out", Admin: false}
+	if _, err := e.svc.applyNative(ctx, nativeApply{sourceID: e.src.ID, skillPath: "deploy", create: true, viewer: outsider, author: "usr_out",
+		files: []changeFile{{Path: skillFile, Op: changeOpAdd, Content: deploySkill(t, "Deploy")}}}); !errors.Is(err, ErrForbidden) && !errors.Is(err, ErrNotFound) {
+		t.Fatalf("outsider create under the lock: %v", err)
+	}
+	// A revision keeps the commit it made live.
+	first := e.write(t, editorPerson, SkillWrite{Collection: "team", Files: map[string]string{"SKILL.md": deploySkill(t, "Deploy")}})
+	e.advance(time.Second)
+	second := e.write(t, editorPerson, SkillWrite{Skill: "team/deploy", Files: map[string]string{"a.md": "a\n"}})
+	old, err := e.svc.GetRevision(ctx, readerAgent, "team/deploy", 1, false)
+	if err != nil || old.Commit != first.Commit || old.Commit == second.Commit || !strings.HasSuffix(old.Repo, "@"+first.Commit[:12]) {
+		t.Fatalf("revision 1 provenance %+v %v (first %s, second %s)", old.SkillSummary, err, first.Commit, second.Commit)
+	}
+	// A change of the source after the checks refuses the activation.
+	cur, _ := e.svc.GetSource(ctx, e.src.ID)
+	_, _, err = e.svc.activate(ctx, activation{by: "usr_admin", sourceID: e.src.ID, versionID: cur.ActiveVersionID, expectUpdated: cur.UpdatedAt.UnixMilli() - 1})
+	if !errors.Is(err, errSourceChanged) {
+		t.Fatalf("stale expectUpdated: %v", err)
+	}
+}

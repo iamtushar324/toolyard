@@ -667,6 +667,13 @@ func (s *Service) DeleteSource(ctx context.Context, by, id string) error {
 	if err := refuseBuiltin(id, "it cannot be deleted (hide it from everyone instead)"); err != nil {
 		return err
 	}
+	// The purge of revision contents below runs under the lock native
+	// writes take around theirs (native.go).
+	ctx, unlockBlobs, err := s.cluster.LockCtx(ctx, revisionBlobsLock)
+	if err != nil {
+		return fmt.Errorf("skillhub: delete source: %w", err)
+	}
+	defer unlockBlobs()
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("skillhub: delete source: %w", err)

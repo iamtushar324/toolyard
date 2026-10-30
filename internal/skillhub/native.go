@@ -67,6 +67,10 @@ import (
 // KindNative is a source of skills written through toolyard's API.
 const KindNative = "native"
 
+// revisionBlobsLock serializes a native write's revision contents with
+// the purge of a collection delete (skill_revision_blobs is shared).
+const revisionBlobsLock = "skillhub:revision-blobs"
+
 const (
 	// nativeOwner and nativeBranch are a native source's fixed repository
 	// settings: an owner with a dot names no GitHub account (see
@@ -154,9 +158,12 @@ type WrittenFile struct {
 
 // Revision is one write of a native skill.
 type Revision struct {
-	Revision    int       `json:"revision"`
-	Op          string    `json:"op"` // create | update
-	URI         string    `json:"uri"`
+	Revision int    `json:"revision"`
+	Op       string `json:"op"` // create | update
+	URI      string `json:"uri"`
+	// Commit is the collection's version this revision made live (its
+	// tree digest), kept after the version itself is retained away.
+	Commit      string    `json:"commit"`
 	Name        string    `json:"name"`
 	Author      string    `json:"author,omitempty"` // user ID
 	Agent       string    `json:"agent,omitempty"`  // agent ID, when an agent wrote it
@@ -505,7 +512,7 @@ func (s *Service) createTarget(v Viewer, w SkillWrite) (*srcIndex, string, error
 		return nil, "", fmt.Errorf("%w: collection is required for a new skill: the slug of a native collection (skills.sources lists those you see)", ErrInvalid)
 	}
 	si := s.idx.slug(slug)
-	if si == nil || !(si.visibleTo(v) || (si.src.IsNative() && si.versionID == "" && si.audienceAllows(v, nil))) {
+	if si == nil || !si.visibleTo(v) {
 		return nil, "", fmt.Errorf("%w: collection %s", ErrNotFound, slug)
 	}
 	if !si.src.IsNative() {
@@ -936,13 +943,25 @@ func (s *Service) applyNative(ctx context.Context, a nativeApply) (*nativeApplie
 		op = revisionCreate
 	}
 	rev := latest + 1
-	rf, err := s.revisionContent(lctx, sk, b)
+	// The revision blobs are shared by every collection: a collection
+	// delete purges the ones no revision holds, so the check of which
+	// bytes are stored and the commit that references them run under one
+	// lock with that purge.
+	bctx, unlockBlobs, err := s.cluster.LockCtx(lctx, revisionBlobsLock)
+	if err != nil {
+		return nil, fmt.Errorf("skillhub: lock the revision contents: %w", err)
+	}
+	defer unlockBlobs()
+	rf, err := s.revisionContent(bctx, sk, b)
 	if err != nil {
 		return nil, err
 	}
+	// The source as checked above: any change since (its editors, sharing,
+	// mode, a skill's sharing: each moves updated_at) refuses the write.
 	st := stateOf(row)
-	changed, _, err := s.activate(lctx, activation{by: a.author, sourceID: row.ID, versionID: versionID, fromSync: true, expect: &st,
-		inTx: func(tx *sql.Tx) error { return s.insertRevision(lctx, tx, row.ID, versionID, rev, op, sk, rf, a) }})
+	changed, _, err := s.activate(bctx, activation{by: a.author, sourceID: row.ID, versionID: versionID, fromSync: true, expect: &st,
+		expectUpdated: row.UpdatedAt.UnixMilli(),
+		inTx:          func(tx *sql.Tx) error { return s.insertRevision(bctx, tx, row.ID, versionID, sha, rev, op, sk, rf, a) }})
 	if err != nil {
 		if errors.Is(err, errSourceChanged) {
 			return nil, fmt.Errorf("%w: the collection changed during the write; try again", ErrConflict)
@@ -977,8 +996,11 @@ func (s *Service) recheckDirect(row *sourceRow, a nativeApply) error {
 		return fmt.Errorf("%w: you may no longer write the collection %s", ErrForbidden, row.Slug)
 	}
 	si := s.idx.get(row.ID)
+	if si == nil || !si.visibleTo(a.viewer) {
+		return fmt.Errorf("%w: collection %s", ErrNotFound, row.Slug)
+	}
 	var e *skillEntry
-	if si != nil && !a.create {
+	if !a.create {
 		e = si.byPath[a.skillPath]
 		if e == nil || !si.skillVisible(a.viewer, a.skillPath) {
 			return fmt.Errorf("%w: skill://%s/%s", ErrNotFound, row.Slug, a.skillPath)
@@ -1122,7 +1144,7 @@ func (s *Service) revisionContent(ctx context.Context, sk *builtSkill, b *built)
 
 // insertRevision records one write in tx (the activation's): the bytes the
 // revision blobs lack, the skill's own files and the revision.
-func (s *Service) insertRevision(ctx context.Context, tx *sql.Tx, sourceID, versionID string, rev int, op string, sk *builtSkill,
+func (s *Service) insertRevision(ctx context.Context, tx *sql.Tx, sourceID, versionID, commit string, rev int, op string, sk *builtSkill,
 	files []revisionFileData, a nativeApply) error {
 	var bytes int64
 	for _, rf := range files {
@@ -1139,10 +1161,10 @@ func (s *Service) insertRevision(ctx context.Context, tx *sql.Tx, sourceID, vers
 		}
 		bytes += f.size
 	}
-	if _, err := tx.ExecContext(ctx, `INSERT INTO skill_revisions (source_id, skill_path, revision, op, version_id, name, files_digest,
-		skill_md_sha256, file_count, total_bytes, author_user_id, author_agent_id, note, proposal_id, created_at)
-		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		sourceID, sk.path, int64(rev), op, versionID, sk.meta.name, sk.filesDigest, sk.skillMD.sha, int64(len(files)), bytes,
+	if _, err := tx.ExecContext(ctx, `INSERT INTO skill_revisions (source_id, skill_path, revision, op, version_id, commit_sha, name,
+		files_digest, skill_md_sha256, file_count, total_bytes, author_user_id, author_agent_id, note, proposal_id, created_at)
+		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		sourceID, sk.path, int64(rev), op, versionID, commit, sk.meta.name, sk.filesDigest, sk.skillMD.sha, int64(len(files)), bytes,
 		a.author, a.agent, a.note, a.proposalID, s.now().UnixMilli()); err != nil {
 		return fmt.Errorf("skillhub: record the revision: %w", err)
 	}
@@ -1208,13 +1230,13 @@ func (s *Service) currentRevisions(ctx context.Context, sourceID, versionID stri
 	return out, rows.Err()
 }
 
-const revisionColumns = `revision, op, name, files_digest, skill_md_sha256, file_count, total_bytes, author_user_id,
+const revisionColumns = `revision, op, commit_sha, name, files_digest, skill_md_sha256, file_count, total_bytes, author_user_id,
 	author_agent_id, note, proposal_id, created_at`
 
 func scanRevision(sc rowScanner) (*Revision, error) {
 	var r Revision
 	var rev, files, created int64
-	if err := sc.Scan(&rev, &r.Op, &r.Name, &r.FilesDigest, &r.SkillMD, &files, &r.TotalBytes, &r.Author,
+	if err := sc.Scan(&rev, &r.Op, &r.Commit, &r.Name, &r.FilesDigest, &r.SkillMD, &files, &r.TotalBytes, &r.Author,
 		&r.Agent, &r.Note, &r.ProposalID, &created); err != nil {
 		return nil, err
 	}
@@ -1350,6 +1372,8 @@ func (s *Service) GetRevision(ctx context.Context, v Viewer, ref string, revisio
 	desc, _ := fm["description"].(string)
 	sum := si.summary(e)
 	sum.Name, sum.Description, sum.Revision = r.Name, strings.TrimSpace(desc), r.Revision
+	// Provenance of the revision, not of what is live now.
+	sum.Commit, sum.Repo = r.Commit, RepoLabel(si.src.Owner, si.src.Repo, r.Commit)
 	sk := &Skill{SkillSummary: sum, Frontmatter: fm, Body: body, Raw: string(raw)}
 	if includeFiles {
 		for _, f := range files {
@@ -1400,7 +1424,7 @@ func (s *Service) ReadRevision(ctx context.Context, v Viewer, uri string, revisi
 	if !si.src.IsNative() {
 		return nil, fmt.Errorf("%w: %s comes from a repository; it has no revisions", ErrInvalid, uri)
 	}
-	_, files, err := s.revisionFiles(ctx, si, e.path, revision)
+	r, files, err := s.revisionFiles(ctx, si, e.path, revision)
 	if err != nil {
 		return nil, err
 	}
@@ -1416,7 +1440,7 @@ func (s *Service) ReadRevision(ctx context.Context, v Viewer, uri string, revisi
 		content, total, truncated := sliceLines(string(data), offset, limit)
 		return &File{
 			FileRef: FileRef{URI: revisionURI(si.fileURI(e.path, rest), revision), Path: rel, Digest: f.sha, Size: f.size, Type: f.media},
-			Skill:   si.skillURI(e.path), Repo: si.repoLabel(), Commit: si.sha, Content: content, Offset: offset,
+			Skill:   si.skillURI(e.path), Repo: RepoLabel(si.src.Owner, si.src.Repo, r.Commit), Commit: r.Commit, Content: content, Offset: offset,
 			TotalLines: total, Truncated: truncated,
 		}, nil
 	}

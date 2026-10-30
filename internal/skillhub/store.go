@@ -745,6 +745,10 @@ type activation struct {
 	// commits (a native write's revision, native.go): its error rolls the
 	// activation back.
 	inTx func(tx *sql.Tx) error
+	// expectUpdated, when set, is the source's updated_at the caller
+	// checked its rules against: any change since refuses with
+	// errSourceChanged.
+	expectUpdated int64
 }
 
 // activate makes a version active in one transaction: the old active one
@@ -761,7 +765,7 @@ func (s *Service) activate(ctx context.Context, a activation) (bool, int64, erro
 	if err != nil {
 		return false, 0, err
 	}
-	if a.expect != nil && st != *a.expect {
+	if (a.expect != nil && st != *a.expect) || (a.expectUpdated != 0 && updated != a.expectUpdated) {
 		return false, 0, errSourceChanged
 	}
 	v, err := s.getVersionRow(ctx, tx, a.sourceID, a.versionID)

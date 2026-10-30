@@ -130,3 +130,19 @@ func TestSkillsUpdateVersionsAndRevisions(t *testing.T) {
 		t.Fatalf("revision 0: %q", code)
 	}
 }
+
+func TestSkillsBaseRevisionMustBeAWholeNumber(t *testing.T) {
+	f := newSkillsFixture(t)
+	for _, bad := range []any{"1", 1.5, 0, -2} {
+		if code := f.refused(t, f.member, SkillsUpdateTool, map[string]any{"skill": "team/deploy", "base_revision": bad,
+			"files": map[string]any{"a.md": "a"}}); code != SkillsErrInvalid {
+			t.Errorf("base_revision %v: %q", bad, code)
+		}
+	}
+	if len(f.registry.writes) != 0 {
+		t.Fatalf("a refused base_revision wrote: %+v", f.registry.writes)
+	}
+	if n, ok := exactInt(2.0); !ok || n != 2 {
+		t.Fatalf("2.0 = %d %v", n, ok)
+	}
+}

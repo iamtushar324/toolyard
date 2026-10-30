@@ -2,7 +2,9 @@ package gateway
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"math"
 	"strings"
 
 	"github.com/mark3labs/mcp-go/mcp"
@@ -224,9 +226,10 @@ func (g *Gateway) handleSkillsUpdate(ctx context.Context, hub *skillHubConfig, v
 	patch := skillhub.SkillPatch{Description: skillsStringPtr(args, "description"), Body: skillsStringPtr(args, "instructions"),
 		Triggers: triggers, Tags: tags}
 	base := 0
-	if n, ok := asInt(args["base_revision"]); ok {
-		if n < 1 {
-			return skillsInvalid("base_revision must be 1 or more")
+	if raw, present := args["base_revision"]; present && raw != nil {
+		n, ok := exactInt(raw)
+		if !ok || n < 1 {
+			return skillsInvalid("base_revision must be a whole number, 1 or more: the revision skills.get showed")
 		}
 		base = n
 	}
@@ -297,15 +300,39 @@ func (g *Gateway) handleSkillsVersions(ctx context.Context, hub *skillHubConfig,
 	return skillsJSON(map[string]any{"skill": ref, "total": len(revs), "revisions": revs})
 }
 
+// exactInt reads a whole number: an integer type, a float64 with no
+// fraction, or a json.Number that is an integer. Anything else (a string,
+// 2.5) is not one, so a mistyped argument never turns a check off.
+func exactInt(v any) (int, bool) {
+	switch x := v.(type) {
+	case int:
+		return x, true
+	case int64:
+		return int(x), true
+	case float64:
+		if x != math.Trunc(x) || math.IsInf(x, 0) || x > math.MaxInt32 || x < math.MinInt32 {
+			return 0, false
+		}
+		return int(x), true
+	case json.Number:
+		n, err := x.Int64()
+		if err != nil || n > math.MaxInt32 || n < math.MinInt32 {
+			return 0, false
+		}
+		return int(n), true
+	}
+	return 0, false
+}
+
 // skillsRevisionArg reads an optional revision argument: 0 when absent.
 func skillsRevisionArg(args map[string]any) (int, *mcp.CallToolResult) {
 	raw, present := args["revision"]
 	if !present || raw == nil {
 		return 0, nil
 	}
-	n, ok := asInt(raw)
+	n, ok := exactInt(raw)
 	if !ok || n < 1 {
-		return 0, skillsInvalid("revision must be a number, 1 or more (skills.versions lists them)")
+		return 0, skillsInvalid("revision must be a whole number, 1 or more (skills.versions lists them)")
 	}
 	return n, nil
 }

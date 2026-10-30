@@ -474,7 +474,10 @@ type ListQuery struct {
 
 // SourceInfo is a source as agents see it.
 type SourceInfo struct {
-	Slug       string    `json:"slug"`
+	Slug string `json:"slug"`
+	// Kind is "github", "builtin" or "native" (a collection agents write
+	// with skills.create and skills.update).
+	Kind       string    `json:"kind"`
 	Repo       string    `json:"repo"` // owner/repo@<12-hex>
 	Branch     string    `json:"branch"`
 	Path       string    `json:"path,omitempty"`

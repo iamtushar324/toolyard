@@ -41,8 +41,10 @@ const (
 	recommendShownTriggers = 3
 	recommendRankTriggers  = 10
 	recommendTriggerLen    = 160
-	// recommendShownTags caps the tags an answer carries.
+	// recommendShownTags caps the tags an answer carries, and
+	// recommendTagLen each tag's bytes (filters match the whole tag).
 	recommendShownTags = 8
+	recommendTagLen    = 48
 	// recommendRationaleLen caps a rationale, in bytes.
 	recommendRationaleLen = 200
 	// recommendRationaleWords caps the matched words a rationale names.
@@ -210,7 +212,7 @@ func (s *Service) Recommend(ctx context.Context, v Viewer, q RecommendQuery) (*R
 			URI: c.si.skillURI(c.e.path), Name: c.e.name, Source: c.si.src.Slug, Path: c.e.path,
 			Description: recClip(c.e.description, recommendDescLen),
 			Triggers:    firstStrings(c.hints.triggers, recommendShownTriggers),
-			Tags:        firstStrings(c.hints.tags, recommendShownTags),
+			Tags:        clipEach(firstStrings(c.hints.tags, recommendShownTags), recommendTagLen),
 			Runs:        c.e.runs,
 			Revision:    c.e.revision,
 			Score:       math.Round(hit.Score*1000) / 1000,
@@ -401,6 +403,15 @@ func clipList(list []string, max, n int) []string {
 }
 
 // firstStrings is at most n items of list.
+// clipEach is list with each string cut to n bytes (recClip).
+func clipEach(list []string, n int) []string {
+	out := make([]string, 0, len(list))
+	for _, x := range list {
+		out = append(out, recClip(x, n))
+	}
+	return out
+}
+
 func firstStrings(list []string, n int) []string {
 	if len(list) > n {
 		return list[:n]

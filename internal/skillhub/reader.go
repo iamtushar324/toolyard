@@ -166,7 +166,7 @@ func (s *Service) Sources(_ context.Context, v Viewer) ([]SourceInfo, error) {
 			continue
 		}
 		out = append(out, SourceInfo{
-			Slug: si.src.Slug, Repo: si.repoLabel(), Branch: si.src.Branch, Path: si.src.Path,
+			Slug: si.src.Slug, Kind: si.src.Kind, Repo: si.repoLabel(), Branch: si.src.Branch, Path: si.src.Path,
 			Commit: si.sha, SyncedAt: si.syncedAt, SkillCount: si.visibleSkills(v), HTMLURL: si.htmlURL(""),
 		})
 	}

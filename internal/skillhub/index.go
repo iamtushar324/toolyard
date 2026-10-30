@@ -172,7 +172,10 @@ func (si *srcIndex) audienceAllows(v Viewer, sh *skillShare) bool {
 // (a source without skills: by its own audience).
 func (si *srcIndex) visibleTo(v Viewer) bool {
 	if si.versionID == "" {
-		return false
+		// A native collection with no skill yet is its audience's to
+		// list and write into (native.go); any other source without a
+		// served version is nobody's.
+		return si.src.IsNative() && si.audienceAllows(v, nil)
 	}
 	if len(si.shares) == 0 || len(si.skills) == 0 {
 		// Without per-skill settings every skill gets the same answer.
