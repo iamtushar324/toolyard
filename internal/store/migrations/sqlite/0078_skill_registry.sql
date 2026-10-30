@@ -22,8 +22,11 @@
 -- revision per proposal, so a retried approval never writes twice).
 -- Revisions outlive the collection's version retention: their files are
 -- kept in skill_revision_files (path in the skill folder, digest, size,
--- media type), whose digests keep the bytes in skill_blobs from the purge.
--- Times are Unix milliseconds.
+-- media type) and their bytes in skill_revision_blobs, once per digest,
+-- apart from skill_blobs: no blob purge of this build or of an older one
+-- (after a rollback) touches them. Deleting a collection deletes its
+-- revisions and the bytes no other revision holds. Times are Unix
+-- milliseconds.
 --
 -- Same schema as migrations/postgres/0078_skill_registry.sql.
 -- Rollback: an older binary ignores the column and the tables, and its
@@ -64,3 +67,9 @@ CREATE TABLE IF NOT EXISTS skill_revision_files (
     PRIMARY KEY (source_id, skill_path, revision, path)
 );
 CREATE INDEX IF NOT EXISTS idx_skill_revision_files_sha256 ON skill_revision_files (sha256);
+
+CREATE TABLE IF NOT EXISTS skill_revision_blobs (
+    sha256  TEXT PRIMARY KEY,
+    size    INTEGER NOT NULL,
+    content BLOB NOT NULL
+);

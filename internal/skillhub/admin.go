@@ -696,6 +696,12 @@ func (s *Service) DeleteSource(ctx context.Context, by, id string) error {
 			return fmt.Errorf("skillhub: delete source: %w", err)
 		}
 	}
+	// A deleted collection's revisions take their bytes with them, unless
+	// another collection's revision holds the same content.
+	if _, err := tx.ExecContext(ctx, `DELETE FROM skill_revision_blobs WHERE NOT EXISTS
+		(SELECT 1 FROM skill_revision_files r WHERE r.sha256 = skill_revision_blobs.sha256)`); err != nil {
+		return fmt.Errorf("skillhub: delete source: %w", err)
+	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("skillhub: delete source: %w", err)
 	}

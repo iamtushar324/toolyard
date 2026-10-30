@@ -2,6 +2,7 @@ package skillhub
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"strings"
 	"sync"
@@ -528,5 +529,98 @@ func TestSensitiveReasons(t *testing.T) {
 	}
 	if got := sensitiveReasons(&Source{Mode: ModeReview}, nil, nil); len(got) != 1 {
 		t.Errorf("review mode: %v", got)
+	}
+}
+
+func TestNativeKeepsOneSkillPerFolder(t *testing.T) {
+	e := newNativeEnv(t, SourceInput{Visibility: VisibleEveryone})
+	ctx := context.Background()
+	group := "---\nname: group\ndescription: A group skill\n---\nbody\n"
+	e.write(t, editorPerson, SkillWrite{Collection: "team", Files: map[string]string{"SKILL.md": group}})
+	for name, w := range map[string]SkillWrite{
+		"inside another skill": {Collection: "team", Path: "group/private", Files: map[string]string{"SKILL.md": "---\nname: private\ndescription: d\n---\n"}},
+		"a child manifest":     {Collection: "team", Path: "other", Files: map[string]string{"SKILL.md": "---\nname: other\ndescription: d\n---\n", "child/SKILL.md": "---\nname: child\ndescription: d\n---\n"}},
+		"a child on update":    {Skill: "team/group", Files: map[string]string{"child/SKILL.md": "---\nname: child\ndescription: d\nallowed-tools: Bash\n---\n"}},
+	} {
+		if _, err := e.svc.WriteSkill(ctx, editorAgent, w); !errors.Is(err, ErrInvalid) {
+			t.Errorf("%s: %v, want ErrInvalid", name, err)
+		}
+	}
+	// Under the lock too: an approved proposal cannot smuggle in a child.
+	_, err := e.svc.applyNative(ctx, nativeApply{sourceID: e.src.ID, skillPath: "group", proposalID: "skp_x",
+		files: []changeFile{{Path: "child/SKILL.md", Op: changeOpAdd, Content: "---\nname: child\ndescription: d\n---\n"}}})
+	if !errors.Is(err, ErrInvalid) {
+		t.Fatalf("apply with a child manifest: %v", err)
+	}
+	if sk, _ := e.svc.Get(ctx, readerAgent, "team/group", true); len(sk.Files) != 1 {
+		t.Fatalf("files %+v", sk.Files)
+	}
+}
+
+func TestNativeChecksAgainUnderTheLock(t *testing.T) {
+	e := newNativeEnv(t, SourceInput{Visibility: VisibleEveryone})
+	ctx := context.Background()
+	e.write(t, editorPerson, SkillWrite{Collection: "team", Files: map[string]string{"SKILL.md": deploySkill(t, "Deploy"), "run": "#!/bin/sh\necho a\n"}})
+	files := []changeFile{{Path: "notes.md", Op: changeOpAdd, Content: "n\n"}}
+	// The editor lost the right after WriteSkill checked it.
+	if _, err := e.svc.applyNative(ctx, nativeApply{sourceID: e.src.ID, skillPath: "deploy", files: files, viewer: readerAgent,
+		author: readerAgent.UserID}); !errors.Is(err, ErrForbidden) {
+		t.Fatalf("not an editor: %v", err)
+	}
+	// The collection switched to review after WriteSkill checked it.
+	review := ModeReview
+	if _, err := e.svc.UpdateSource(ctx, "usr_admin", e.src.ID, SourceUpdate{Mode: &review}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.svc.applyNative(ctx, nativeApply{sourceID: e.src.ID, skillPath: "deploy", files: files, viewer: editorAgent,
+		author: editorAgent.UserID}); !errors.Is(err, ErrConflict) {
+		t.Fatalf("now needs approval: %v", err)
+	}
+	auto := ModeAuto
+	if _, err := e.svc.UpdateSource(ctx, "usr_admin", e.src.ID, SourceUpdate{Mode: &auto}); err != nil {
+		t.Fatal(err)
+	}
+	// Dropping a script's #! line still changes the script.
+	res := e.write(t, editorAgent, SkillWrite{Skill: "team/deploy", Files: map[string]string{"run": "echo b\n"}})
+	if res.Status != WritePending || !strings.Contains(strings.Join(res.ApprovalReasons, ";"), "run") {
+		t.Fatalf("shebang removal %+v", res)
+	}
+}
+
+func TestNativeRevisionHistoryIsAtomicAndRollbackSafe(t *testing.T) {
+	e := newNativeEnv(t, SourceInput{Visibility: VisibleEveryone})
+	ctx := context.Background()
+	e.write(t, editorPerson, SkillWrite{Collection: "team", Files: map[string]string{"SKILL.md": deploySkill(t, "Deploy"), "v.md": "one\n"}})
+	first, _ := e.svc.GetSource(ctx, e.src.ID)
+	e.advance(time.Second)
+	e.write(t, editorPerson, SkillWrite{Skill: "team/deploy", Files: map[string]string{"v.md": "two\n"}})
+	second, _ := e.svc.GetSource(ctx, e.src.ID)
+	// A failure inside the activation's transaction leaves the live
+	// version as it was.
+	_, _, err := e.svc.activate(ctx, activation{by: "usr_admin", sourceID: e.src.ID, versionID: first.ActiveVersionID,
+		inTx: func(*sql.Tx) error { return errors.New("injected") }})
+	if err == nil {
+		t.Fatal("the injected failure did not stop the activation")
+	}
+	if now, _ := e.svc.GetSource(ctx, e.src.ID); now.ActiveVersionID != second.ActiveVersionID {
+		t.Fatalf("active %s, want %s", now.ActiveVersionID, second.ActiveVersionID)
+	}
+	// An older build's purge sees only skill_files: emptying skill_blobs
+	// of everything no version holds leaves every revision readable.
+	if _, err := e.svc.db.ExecContext(ctx, `DELETE FROM skill_versions WHERE id <> ?`, second.ActiveVersionID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.svc.db.ExecContext(ctx, `DELETE FROM skill_files WHERE version_id <> ?`, second.ActiveVersionID); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.svc.db.ExecContext(ctx, `DELETE FROM skill_blobs WHERE NOT EXISTS (SELECT 1 FROM skill_files f WHERE f.sha256 = skill_blobs.sha256)`); err != nil {
+		t.Fatal(err)
+	}
+	f, err := e.svc.ReadRevision(ctx, readerAgent, "skill://team/deploy/v.md?revision=1", 0, 0, 0)
+	if err != nil || f.Content != "one\n" {
+		t.Fatalf("revision 1 after an old purge %+v %v", f, err)
+	}
+	if sk, err := e.svc.GetRevision(ctx, readerAgent, "team/deploy", 1, false); err != nil || sk.Description != "Deploy" {
+		t.Fatalf("revision 1 SKILL.md %+v %v", sk, err)
 	}
 }

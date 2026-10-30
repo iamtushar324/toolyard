@@ -382,6 +382,9 @@ type nativeApply struct {
 	agent        string
 	note         string
 	proposalID   string // the approved proposal ("" for a direct write)
+	// viewer is who writes directly, checked again under the lock; a
+	// proposal's write is the owner's approval instead.
+	viewer Viewer
 }
 
 // nativeApplied is what an applied write made.
@@ -484,7 +487,7 @@ func (s *Service) WriteSkill(ctx context.Context, v Viewer, w SkillWrite) (*Writ
 		}
 	}
 	done, err := s.applyNative(ctx, nativeApply{sourceID: src.ID, skillPath: skillPath, create: create, files: files,
-		baseRevision: base, author: v.UserID, agent: v.AgentID, note: note})
+		baseRevision: base, author: v.UserID, agent: v.AgentID, note: note, viewer: v})
 	if err != nil {
 		return nil, err
 	}
@@ -536,6 +539,13 @@ func (s *Service) createTarget(v Viewer, w SkillWrite) (*srcIndex, string, error
 	if si.byPath[p] != nil {
 		return nil, "", fmt.Errorf("%w: %s already exists; update it with skills.update", ErrConflict, si.skillURI(p))
 	}
+	dirs := make(map[string]bool, len(si.byPath))
+	for d := range si.byPath {
+		dirs[d] = true
+	}
+	if nestedPath(p, dirs) {
+		return nil, "", errNestedSkill(p)
+	}
 	if _, ok := si.byFile[p]; ok {
 		return nil, "", fmt.Errorf("%w: path %q is a file of another skill", ErrConflict, p)
 	}
@@ -584,6 +594,9 @@ func (s *Service) nativeFiles(ctx context.Context, si *srcIndex, e *skillEntry, 
 		content := in[p]
 		if err := checkChangePath(p); err != nil {
 			return nil, fmt.Errorf("%w: files: %s: %v", ErrInvalid, reviewCode(changeLine(p)), err)
+		}
+		if path.Base(p) == skillFile && p != skillFile {
+			return nil, errNestedSkill(repoPath(skillPath, path.Dir(p)))
 		}
 		for n := range nested {
 			if p == n || inFolder(n, p) {
@@ -716,11 +729,9 @@ func sensitiveReasons(src *Source, e *skillEntry, files []changeFile) []string {
 	}
 	var scripts []string
 	for _, f := range files {
-		content := f.Content
-		if f.Op == changeOpDelete {
-			content = f.Old
-		}
-		if isScript(f.Path, content) {
+		// Old and new: a change that drops a script's #! line still
+		// changes the script.
+		if isScript(f.Path, f.Content) || (f.HasOld && isScript(f.Path, f.Old)) {
 			scripts = append(scripts, f.Path)
 		}
 	}
@@ -773,8 +784,13 @@ func truthy(v any) bool {
 
 // applyNative builds the collection with the write, makes it live and
 // records the revision, under the collection's sync lock (so writes of one
-// collection never overlap on any node). A proposal's write is applied
-// once: a retry finds its revision.
+// collection never overlap on any node). The activation and the revision
+// commit in one transaction: a write is live with its history, or not at
+// all. Under the lock it checks again what WriteSkill checked before it:
+// for a direct write, that the writer may still write the collection and
+// see the skill, and that the write still needs no approval (the editors,
+// the mode or the skill may have changed meanwhile). A proposal's write is
+// applied once: a retry finds its revision.
 func (s *Service) applyNative(ctx context.Context, a nativeApply) (*nativeApplied, error) {
 	ctx, cancel := context.WithTimeout(ctx, nativeWriteTimeout)
 	defer cancel()
@@ -791,12 +807,22 @@ func (s *Service) applyNative(ctx context.Context, a nativeApply) (*nativeApplie
 			return nil, err
 		}
 	}
+	// The index as of now: a sharing, editors or mode change made before
+	// the lock is in it.
+	if err := s.reloadSource(lctx, a.sourceID); err != nil {
+		return nil, err
+	}
 	row, err := s.getSourceRow(lctx, s.db, a.sourceID)
 	if err != nil {
 		return nil, err
 	}
 	if !row.IsNative() {
 		return nil, fmt.Errorf("%w: source %s is not a native collection", ErrInvalid, row.Slug)
+	}
+	if a.proposalID == "" {
+		if err := s.recheckDirect(row, a); err != nil {
+			return nil, err
+		}
 	}
 	lim := row.Limits.effective()
 	fs, dirs := newFileSet(lim), map[string]bool{}
@@ -814,6 +840,8 @@ func (s *Service) applyNative(ctx context.Context, a nativeApply) (*nativeApplie
 		return nil, fmt.Errorf("%w: skill://%s/%s already exists; update it instead", ErrConflict, row.Slug, a.skillPath)
 	case !a.create && !dirs[a.skillPath]:
 		return nil, fmt.Errorf("%w: skill://%s/%s is gone", ErrNotFound, row.Slug, a.skillPath)
+	case a.create && nestedPath(a.skillPath, dirs):
+		return nil, errNestedSkill(a.skillPath)
 	}
 	latest, err := s.latestRevision(lctx, row.ID, a.skillPath)
 	if err != nil {
@@ -833,6 +861,9 @@ func (s *Service) applyNative(ctx context.Context, a nativeApply) (*nativeApplie
 		}
 	}
 	for _, f := range a.files {
+		if path.Base(f.Path) == skillFile && f.Path != skillFile {
+			return nil, errNestedSkill(repoPath(a.skillPath, path.Dir(f.Path)))
+		}
 		full := repoPath(a.skillPath, f.Path)
 		fs.remove(full)
 		if f.Op == changeOpDelete {
@@ -853,10 +884,19 @@ func (s *Service) applyNative(ctx context.Context, a nativeApply) (*nativeApplie
 	if err != nil {
 		return nil, err
 	}
+	// Exactly the skills that were there, plus a new one: a write never
+	// makes, drops or renames another skill.
 	var sk *builtSkill
+	want := len(dirs)
+	if a.create {
+		want++
+	}
 	for _, x := range b.skills {
-		if x.path == a.skillPath {
+		switch {
+		case x.path == a.skillPath:
 			sk = x
+		case !dirs[x.path]:
+			return nil, errNestedSkill(x.path)
 		}
 	}
 	if sk == nil {
@@ -867,6 +907,9 @@ func (s *Service) applyNative(ctx context.Context, a nativeApply) (*nativeApplie
 			}
 		}
 		return nil, fmt.Errorf("%w: SKILL.md: %s", ErrInvalid, msg)
+	}
+	if len(b.skills) != want {
+		return nil, fmt.Errorf("%w: the write would change another skill of the collection; write each skill on its own", ErrInvalid)
 	}
 	sha := treeDigest(fs)
 	cfg := row.configHash()
@@ -888,22 +931,28 @@ func (s *Service) applyNative(ctx context.Context, a nativeApply) (*nativeApplie
 		}
 		versionID = v.ID
 	}
-	st := stateOf(row)
-	if _, _, err := s.activate(lctx, activation{by: a.author, sourceID: row.ID, versionID: versionID, fromSync: true, expect: &st}); err != nil {
-		if errors.Is(err, errSourceChanged) {
-			return nil, fmt.Errorf("%w: the collection changed during the write; try again", ErrConflict)
-		}
-		return nil, err
-	}
 	op := revisionUpdate
 	if a.create {
 		op = revisionCreate
 	}
 	rev := latest + 1
-	if err := s.insertRevision(context.WithoutCancel(lctx), row.ID, versionID, rev, op, sk, b, a); err != nil {
-		// The write is live; only its history entry is missing.
-		s.log.Warn("skillhub: recording a skill revision failed", "source", row.Slug, "skill", a.skillPath, "err", err.Error())
-		rev = 0
+	rf, err := s.revisionContent(lctx, sk, b)
+	if err != nil {
+		return nil, err
+	}
+	st := stateOf(row)
+	changed, _, err := s.activate(lctx, activation{by: a.author, sourceID: row.ID, versionID: versionID, fromSync: true, expect: &st,
+		inTx: func(tx *sql.Tx) error { return s.insertRevision(lctx, tx, row.ID, versionID, rev, op, sk, rf, a) }})
+	if err != nil {
+		if errors.Is(err, errSourceChanged) {
+			return nil, fmt.Errorf("%w: the collection changed during the write; try again", ErrConflict)
+		}
+		return nil, err
+	}
+	if !changed {
+		// The tree is live already (an identical write won the race):
+		// nothing new to record.
+		return &nativeApplied{revision: latest, commit: sha}, nil
 	}
 	s.changed(lctx, row.ID)
 	if err := s.retain(lctx, row.ID); err != nil {
@@ -918,6 +967,47 @@ func (s *Service) applyNative(ctx context.Context, a nativeApply) (*nativeApplie
 		}
 	}
 	return &nativeApplied{revision: rev, commit: sha, warnings: warns}, nil
+}
+
+// recheckDirect repeats WriteSkill's checks of a direct write against the
+// collection and the index as they are under the lock.
+func (s *Service) recheckDirect(row *sourceRow, a nativeApply) error {
+	src := row.Source
+	if !canEdit(a.viewer, &src) {
+		return fmt.Errorf("%w: you may no longer write the collection %s", ErrForbidden, row.Slug)
+	}
+	si := s.idx.get(row.ID)
+	var e *skillEntry
+	if si != nil && !a.create {
+		e = si.byPath[a.skillPath]
+		if e == nil || !si.skillVisible(a.viewer, a.skillPath) {
+			return fmt.Errorf("%w: skill://%s/%s", ErrNotFound, row.Slug, a.skillPath)
+		}
+	}
+	if a.viewer.Delegated {
+		if reasons := sensitiveReasons(&src, e, a.files); len(reasons) > 0 {
+			return fmt.Errorf("%w: the collection or the skill changed while you wrote: this change now needs the owner's approval (%s); write it again",
+				ErrConflict, strings.Join(reasons, "; "))
+		}
+	}
+	return nil
+}
+
+// nestedPath reports whether a new skill at p would sit inside another
+// skill's folder, or hold one: a native collection keeps one skill per
+// folder tree.
+func nestedPath(p string, dirs map[string]bool) bool {
+	for d := range dirs {
+		if d == "" || strings.HasPrefix(p, d+"/") || strings.HasPrefix(d, p+"/") {
+			return true
+		}
+	}
+	return false
+}
+
+func errNestedSkill(p string) error {
+	return fmt.Errorf("%w: %q would put a skill inside another skill's folder; a native collection keeps one skill per folder: write it as a skill of its own",
+		ErrInvalid, p)
 }
 
 // treeDigest is a native version's commit: the SHA-256 of every path and
@@ -955,35 +1045,121 @@ func (s *Service) auditWrite(ctx context.Context, row *sourceRow, a nativeApply,
 
 // ---- revisions -------------------------------------------------------------
 
-// insertRevision records one write: the revision and the skill's own files
-// (not a nested skill's).
-func (s *Service) insertRevision(ctx context.Context, sourceID, versionID string, rev int, op string, sk *builtSkill, b *built, a nativeApply) error {
-	tx, err := s.db.BeginTx(ctx, nil)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = tx.Rollback() }()
-	var count int
-	var bytes int64
+// revisionFileData is one file of a revision being recorded: its built
+// file, and its bytes when the revision blobs do not hold them yet.
+type revisionFileData struct {
+	f    builtFile
+	data []byte
+}
+
+// revisionContent is the skill's own files (not a nested skill's) with
+// the bytes the revision blobs still need. Revisions keep their bytes in
+// skill_revision_blobs, apart from the version blobs (skill_blobs): no
+// purge of this build or an older one (after a rollback) deletes them, so
+// every revision stays readable while its collection exists.
+func (s *Service) revisionContent(ctx context.Context, sk *builtSkill, b *built) ([]revisionFileData, error) {
+	var out []revisionFileData
+	var shas []string
 	for _, f := range b.files {
-		if f.skill != sk.path {
+		if f.skill == sk.path {
+			out = append(out, revisionFileData{f: f})
+			shas = append(shas, f.sha)
+		}
+	}
+	have := map[string]bool{}
+	for start := 0; start < len(shas); start += blobBatch {
+		batch := uniqueStrings(shas[start:min(start+blobBatch, len(shas))])
+		args := make([]any, len(batch))
+		for i, x := range batch {
+			args[i] = x
+		}
+		rows, err := s.db.QueryContext(ctx, `SELECT sha256 FROM skill_revision_blobs WHERE sha256 IN (`+placeholders(len(batch))+`)`, args...)
+		if err != nil {
+			return nil, fmt.Errorf("skillhub: read revision contents: %w", err)
+		}
+		for rows.Next() {
+			var x string
+			if err := rows.Scan(&x); err != nil {
+				rows.Close()
+				return nil, fmt.Errorf("skillhub: read revision contents: %w", err)
+			}
+			have[x] = true
+		}
+		err = rows.Err()
+		rows.Close()
+		if err != nil {
+			return nil, fmt.Errorf("skillhub: read revision contents: %w", err)
+		}
+	}
+	var missing []string
+	for i := range out {
+		if have[out[i].f.sha] {
 			continue
+		}
+		if out[i].f.data != nil {
+			out[i].data = out[i].f.data
+			continue
+		}
+		missing = append(missing, out[i].f.sha)
+	}
+	if len(missing) > 0 {
+		blobs, err := s.loadBlobs(ctx, missing)
+		if err != nil {
+			return nil, err
+		}
+		for i := range out {
+			if out[i].data == nil && !have[out[i].f.sha] {
+				data, ok := blobs[out[i].f.sha]
+				if !ok {
+					return nil, fmt.Errorf("skillhub: the stored copy of %s is missing", out[i].f.path)
+				}
+				out[i].data = data
+			}
+		}
+	}
+	return out, nil
+}
+
+// insertRevision records one write in tx (the activation's): the bytes the
+// revision blobs lack, the skill's own files and the revision.
+func (s *Service) insertRevision(ctx context.Context, tx *sql.Tx, sourceID, versionID string, rev int, op string, sk *builtSkill,
+	files []revisionFileData, a nativeApply) error {
+	var bytes int64
+	for _, rf := range files {
+		f := rf.f
+		if rf.data != nil {
+			if _, err := tx.ExecContext(ctx, `INSERT INTO skill_revision_blobs (sha256, size, content) VALUES (?, ?, ?)
+				ON CONFLICT (sha256) DO NOTHING`, f.sha, int64(len(rf.data)), rf.data); err != nil {
+				return fmt.Errorf("skillhub: store revision contents: %w", err)
+			}
 		}
 		if _, err := tx.ExecContext(ctx, `INSERT INTO skill_revision_files (source_id, skill_path, revision, path, sha256, size, media_type)
 			VALUES (?, ?, ?, ?, ?, ?, ?)`, sourceID, sk.path, int64(rev), relTo(sk.path, f.path), f.sha, f.size, f.media); err != nil {
-			return err
+			return fmt.Errorf("skillhub: record the revision: %w", err)
 		}
-		count++
 		bytes += f.size
 	}
 	if _, err := tx.ExecContext(ctx, `INSERT INTO skill_revisions (source_id, skill_path, revision, op, version_id, name, files_digest,
 		skill_md_sha256, file_count, total_bytes, author_user_id, author_agent_id, note, proposal_id, created_at)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		sourceID, sk.path, int64(rev), op, versionID, sk.meta.name, sk.filesDigest, sk.skillMD.sha, int64(count), bytes,
+		sourceID, sk.path, int64(rev), op, versionID, sk.meta.name, sk.filesDigest, sk.skillMD.sha, int64(len(files)), bytes,
 		a.author, a.agent, a.note, a.proposalID, s.now().UnixMilli()); err != nil {
-		return err
+		return fmt.Errorf("skillhub: record the revision: %w", err)
 	}
-	return tx.Commit()
+	return nil
+}
+
+// loadRevisionBlob reads one revision file's bytes.
+func (s *Service) loadRevisionBlob(ctx context.Context, sha string) ([]byte, error) {
+	var data []byte
+	err := s.db.QueryRowContext(ctx, `SELECT content FROM skill_revision_blobs WHERE sha256 = ?`, sha).Scan(&data)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, fmt.Errorf("skillhub: the stored copy of a revision file (%s) is missing", sha)
+	}
+	if err != nil {
+		return nil, fmt.Errorf("skillhub: read revision contents: %w", err)
+	}
+	return data, nil
 }
 
 // latestRevision is a skill's highest revision number (0: none).
@@ -1159,7 +1335,7 @@ func (s *Service) GetRevision(ctx context.Context, v Viewer, ref string, revisio
 	if err != nil {
 		return nil, err
 	}
-	raw, err := s.loadBlob(ctx, r.SkillMD)
+	raw, err := s.loadRevisionBlob(ctx, r.SkillMD)
 	if err != nil {
 		return nil, err
 	}
@@ -1233,7 +1409,7 @@ func (s *Service) ReadRevision(ctx context.Context, v Viewer, uri string, revisi
 		if f.path != rel {
 			continue
 		}
-		data, err := s.loadBlob(ctx, f.sha)
+		data, err := s.loadRevisionBlob(ctx, f.sha)
 		if err != nil {
 			return nil, err
 		}

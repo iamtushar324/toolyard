@@ -161,6 +161,23 @@ func (c *ChangeProposals) finishNative(ctx context.Context, row *proposalRow, ci
 		_, _ = c.store.changeSetOutcome(ctx, row.ID, proposalApproved, proposalFailed, "", msg)
 		return "", errors.New(msg)
 	}
+	// The approval is the collection owner's: it counts only while that
+	// person still owns the collection.
+	src, err := c.o.Admin.GetSource(ctx, row.SourceID)
+	switch {
+	case errors.Is(err, ErrNotFound):
+		msg := "the collection was deleted; nothing changed"
+		_, _ = c.store.changeSetOutcome(ctx, row.ID, proposalApproved, proposalFailed, "", msg)
+		return "", errors.New(msg)
+	case err != nil:
+		msg := reviewClip(err.Error()+"; toolyard tries again within a few minutes", 500)
+		_, _ = c.store.changeSetOutcome(ctx, row.ID, proposalApproved, proposalApproved, "", msg)
+		return "", errors.New(msg)
+	case src.CreatedBy != row.UserID || row.DecidedBy == "" || row.DecidedBy != row.UserID:
+		msg := "the collection has another owner now, or the approval is not its owner's; nothing changed, ask the agent to write again"
+		_, _ = c.store.changeSetOutcome(ctx, row.ID, proposalApproved, proposalFailed, "", msg)
+		return "", errors.New(msg)
+	}
 	base := ci.BaseRevision
 	if !ci.Create && base == 0 {
 		base = -1 // the skill had no recorded revision: it must still have none

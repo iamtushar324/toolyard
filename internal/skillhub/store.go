@@ -741,6 +741,10 @@ type activation struct {
 	// expect, when set, is the state the sync read: a different state
 	// refuses with errSourceChanged.
 	expect *sourceState
+	// inTx, when set, runs in the activation's transaction before it
+	// commits (a native write's revision, native.go): its error rolls the
+	// activation back.
+	inTx func(tx *sql.Tx) error
 }
 
 // activate makes a version active in one transaction: the old active one
@@ -790,6 +794,11 @@ func (s *Service) activate(ctx context.Context, a activation) (bool, int64, erro
 	if _, err := tx.ExecContext(ctx, `UPDATE skill_sources SET active_version_id = ?, pending_version_id = ?, updated_at = ? WHERE id = ?`,
 		a.versionID, pending, now, a.sourceID); err != nil {
 		return false, 0, fmt.Errorf("skillhub: activate: %w", err)
+	}
+	if a.inTx != nil {
+		if err := a.inTx(tx); err != nil {
+			return false, 0, err
+		}
 	}
 	if err := tx.Commit(); err != nil {
 		return false, 0, fmt.Errorf("skillhub: activate: %w", err)
@@ -982,13 +991,13 @@ func (s *Service) deleteVersions(ctx context.Context, sourceID string, ids []any
 	return tx.Commit()
 }
 
-// purgeBlobs deletes the blobs no version and no native skill revision
-// references, except those a sync or a write touched within blobGrace.
+// purgeBlobs deletes the blobs no version references, except those a sync
+// touched within blobGrace. Native skill revisions keep their own bytes
+// (skill_revision_blobs, native.go).
 func (s *Service) purgeBlobs(ctx context.Context) error {
 	cutoff := s.now().Add(-blobGrace).UnixMilli()
 	_, err := s.db.ExecContext(ctx, `DELETE FROM skill_blobs WHERE touched_at < ?
-		AND NOT EXISTS (SELECT 1 FROM skill_files f WHERE f.sha256 = skill_blobs.sha256)
-		AND NOT EXISTS (SELECT 1 FROM skill_revision_files r WHERE r.sha256 = skill_blobs.sha256)`, cutoff)
+		AND NOT EXISTS (SELECT 1 FROM skill_files f WHERE f.sha256 = skill_blobs.sha256)`, cutoff)
 	if err != nil {
 		return fmt.Errorf("skillhub: purge unused file contents: %w", err)
 	}
