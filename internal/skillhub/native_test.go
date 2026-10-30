@@ -266,7 +266,7 @@ func TestNativeWriteRule(t *testing.T) {
 	// Bad paths and contents.
 	for name, w := range map[string]SkillWrite{
 		"escape":          {Skill: "team/deploy", Files: map[string]string{"../x.md": "x"}},
-		"secret":          {Skill: "team/deploy", Files: map[string]string{"k.md": "aws_secret_access_key = AKIAIOSFODNN7EXAMPLE wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY"}},
+		"secret":          {Skill: "team/deploy", Files: map[string]string{"k.md": "token: " + "gh" + "p_" + strings.Repeat("a1B2", 9)}},
 		"delete SKILL.md": {Skill: "team/deploy", Files: map[string]string{"SKILL.md": ""}},
 		"rename skill":    {Skill: "team/deploy", Files: map[string]string{"SKILL.md": "---\nname: other\ndescription: d\n---\n"}},
 		"bad folder":      {Collection: "team", Path: "Bad_Name", Files: map[string]string{"SKILL.md": "---\nname: Bad_Name\ndescription: d\n---\n"}},
