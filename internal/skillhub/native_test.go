@@ -658,3 +658,24 @@ func TestNativeRoundTwoRules(t *testing.T) {
 		t.Fatalf("stale expectUpdated: %v", err)
 	}
 }
+
+func TestNativeChecksTheRowNotTheCachedIndex(t *testing.T) {
+	e := newNativeEnv(t, SourceInput{Visibility: VisibleEveryone})
+	ctx := context.Background()
+	e.write(t, editorPerson, SkillWrite{Collection: "team", Files: map[string]string{"SKILL.md": deploySkill(t, "Deploy")}})
+	// Another replica narrows the audience to nobody but an outsider; this
+	// node has not heard of it yet (no reload), so its index still says
+	// everyone.
+	if _, err := e.svc.db.ExecContext(ctx, `UPDATE skill_sources SET visibility = 'members', members_json = '["usr_other"]',
+		updated_at = updated_at + 1 WHERE id = ?`, e.src.ID); err != nil {
+		t.Fatal(err)
+	}
+	if si := e.svc.idx.get(e.src.ID); si == nil || si.src.Visibility != VisibleEveryone {
+		t.Fatalf("the cached index was reloaded: %+v", si)
+	}
+	_, err := e.svc.applyNative(ctx, nativeApply{sourceID: e.src.ID, skillPath: "deploy", viewer: editorAgent, author: editorAgent.UserID,
+		files: []changeFile{{Path: "notes.md", Op: changeOpAdd, Content: "n\n"}}})
+	if !errors.Is(err, ErrNotFound) {
+		t.Fatalf("a write after the audience was revoked elsewhere: %v", err)
+	}
+}

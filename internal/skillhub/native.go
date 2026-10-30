@@ -814,11 +814,6 @@ func (s *Service) applyNative(ctx context.Context, a nativeApply) (*nativeApplie
 			return nil, err
 		}
 	}
-	// The index as of now: a sharing, editors or mode change made before
-	// the lock is in it.
-	if err := s.reloadSource(lctx, a.sourceID); err != nil {
-		return nil, err
-	}
 	row, err := s.getSourceRow(lctx, s.db, a.sourceID)
 	if err != nil {
 		return nil, err
@@ -827,7 +822,16 @@ func (s *Service) applyNative(ctx context.Context, a nativeApply) (*nativeApplie
 		return nil, fmt.Errorf("%w: source %s is not a native collection", ErrInvalid, row.Slug)
 	}
 	if a.proposalID == "" {
-		if err := s.recheckDirect(row, a); err != nil {
+		// One snapshot for the checks and the activation: the rules are
+		// built from this row (not the node's cached index, which another
+		// replica's change may not have reached), and the activation
+		// refuses when the row's updated_at moved since (expectUpdated
+		// below), which every editors, sharing, hide or mode change does.
+		snap, err := s.buildSrcIndex(lctx, row)
+		if err != nil {
+			return nil, err
+		}
+		if err := recheckDirect(row, snap, a); err != nil {
 			return nil, err
 		}
 	}
@@ -989,13 +993,13 @@ func (s *Service) applyNative(ctx context.Context, a nativeApply) (*nativeApplie
 }
 
 // recheckDirect repeats WriteSkill's checks of a direct write against the
-// collection and the index as they are under the lock.
-func (s *Service) recheckDirect(row *sourceRow, a nativeApply) error {
+// collection as read under the lock (row) and the sharing built from it
+// (si).
+func recheckDirect(row *sourceRow, si *srcIndex, a nativeApply) error {
 	src := row.Source
 	if !canEdit(a.viewer, &src) {
 		return fmt.Errorf("%w: you may no longer write the collection %s", ErrForbidden, row.Slug)
 	}
-	si := s.idx.get(row.ID)
 	if si == nil || !si.visibleTo(a.viewer) {
 		return fmt.Errorf("%w: collection %s", ErrNotFound, row.Slug)
 	}
