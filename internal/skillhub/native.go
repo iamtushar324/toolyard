@@ -502,7 +502,7 @@ func (s *Service) createTarget(v Viewer, w SkillWrite) (*srcIndex, string, error
 		return nil, "", fmt.Errorf("%w: collection is required for a new skill: the slug of a native collection (skills.sources lists those you see)", ErrInvalid)
 	}
 	si := s.idx.slug(slug)
-	if si == nil || !si.visibleTo(v) {
+	if si == nil || !(si.visibleTo(v) || (si.src.IsNative() && si.versionID == "" && si.audienceAllows(v, nil))) {
 		return nil, "", fmt.Errorf("%w: collection %s", ErrNotFound, slug)
 	}
 	if !si.src.IsNative() {

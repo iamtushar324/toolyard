@@ -142,6 +142,13 @@ func (si *srcIndex) visibleWith(v Viewer, sh *skillShare) bool {
 	if si.versionID == "" {
 		return false
 	}
+	return si.audienceAllows(v, sh)
+}
+
+// audienceAllows is the sharing rule without the served version: a native
+// collection with no skill yet is open to its audience for the first
+// write (native.go), and to nobody else.
+func (si *srcIndex) audienceAllows(v Viewer, sh *skillShare) bool {
 	mode, members := si.sourceAudience()
 	if sh != nil && sh.mode != VisibleInherit && !si.locked() {
 		mode, members = sh.mode, sh.members
