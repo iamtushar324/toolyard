@@ -67,7 +67,7 @@ const (
 var SkillToolNames = []string{
 	SkillsSearchTool, SkillsGetTool, SkillsReadTool, SkillsGrepTool, SkillsSourcesTool, SkillsListTool,
 	SkillsProposeSourceTool, SkillsProposeChangeTool, SkillsProposalTool, SkillsBundleTool, SkillsRecommendTool,
-	SkillsCreateTool, SkillsUpdateTool, SkillsVersionsTool,
+	SkillsCreateTool, SkillsUpdateTool, SkillsVersionsTool, SkillsCreateCollectionTool,
 }
 
 // The read tools are pinned, like the inbox tools: an agent in router-only

@@ -194,6 +194,9 @@ type Registry interface {
 	// ReadRevision reads one file of a native skill as a revision wrote
 	// it; offset and limit are lines, as Read.
 	ReadRevision(ctx context.Context, v Viewer, uri string, revision, offset, limit int) (*File, error)
+	// CreateCollection creates a native collection for an admin, or an
+	// agent whose owner is an admin; the owner is its creator.
+	CreateCollection(ctx context.Context, v Viewer, in SourceInput) (*Source, error)
 }
 
 var _ Registry = (*Service)(nil)
@@ -262,6 +265,30 @@ func (s *Service) createNative(ctx context.Context, by string, in SourceInput) (
 	}
 	s.changed(ctx, r.ID)
 	return s.GetSource(ctx, r.ID)
+}
+
+// CreateCollection creates a native collection for an admin, or for an
+// agent whose owner is an admin (Viewer.Admin is the owner's role): the
+// owner is its creator, and decides its agents' sensitive writes. Anyone
+// else is refused with ErrForbidden. A collection holds no secret and
+// starts empty, so it needs no approval; the audit log records who made
+// it.
+func (s *Service) CreateCollection(ctx context.Context, v Viewer, in SourceInput) (*Source, error) {
+	if v.UserID == "" || !v.Admin {
+		return nil, fmt.Errorf("%w: only an admin, or an agent whose owner is an admin, can create a native skill collection", ErrForbidden)
+	}
+	in.Kind, in.PendingApproval = KindNative, false
+	src, err := s.createNative(ctx, v.UserID, in)
+	if err != nil {
+		return nil, err
+	}
+	if s.nat.audit != nil {
+		_ = s.nat.audit.Write(ctx, audit.Event{EventType: "skills.native_collection_create", AgentID: v.AgentID, DecidedByUserID: v.UserID,
+			Reason: "create native skill collection " + src.Slug,
+			ResultSummary: reviewClip(fmt.Sprintf("%s %s: mode %s, visibility %s, %d members, %d editors", src.ID, src.Slug, src.Mode,
+				src.Visibility, len(src.Members), len(src.Editors)), 1000)})
+	}
+	return src, nil
 }
 
 // normalizeNative checks a native source's settings.

@@ -525,6 +525,7 @@ use `ty skills pull`.
 | `skills.bundle` | `skills` (1 to 50; no two with the same name; at most 64 MiB of files) | a `.tar.gz` download URL: one use, 10 minutes, no token needed |
 | `skills.create` | `collection`, and `name`, `description`, `instructions`, `triggers`, `tags` (or a whole `SKILL.md` in `files`), `path`, `files`, `note` | a new skill in a [native collection](#native-skills): `status` (`live` or `pending_approval`), `uri`, `revision`, `commit`, the files written, `approval_reasons` and `proposal` when it waits |
 | `skills.update` | `skill`, and what changes: `description`, `instructions`, `triggers`, `tags`, `files` (`""` deletes a file); `base_revision`, `note` | as `skills.create`, with the new revision |
+| `skills.create_collection` | `slug`, `visibility`, `members`, `blocked`, `editors`, `mode` (`auto` or `review`), `default_runs` | a new empty [native collection](#native-skills), whose creator is the caller's owner; only for an agent whose owner is an admin (else `forbidden`) |
 | `skills.versions` | `skill`, `limit` (20, at most 100) | a native skill's revisions, newest first: revision, operation, author, agent, note, proposal, time, files, digests, and which one is `current` |
 
 Before a multi-step task, call `skills.search` with a few words about the
@@ -697,7 +698,11 @@ serves it at once, and the other nodes within moments.
 **Create a collection.** An admin creates it over the admin API
 (`POST /v1/skills/sources` with `kind: "native"`, a `slug`, and optionally
 `mode`, `visibility`, `members`, `blocked`, `editors`, `default_runs` and
-`limits`). Its skill URIs are `skill://<slug>/<path>/SKILL.md`, and its
+`limits`), or an agent whose owner is an admin calls
+`skills.create_collection` with the same fields (no limits). The owner is
+the collection's creator either way, and the audit log records it
+(`skills.native_collection_create`). Agents of other members are refused
+(`forbidden`). Its skill URIs are `skill://<slug>/<path>/SKILL.md`, and its
 `repo` is `toolyard.native/<slug>@<12-hex digest>`. The Skills page lists
 it with a **Native** badge, and its sharing panel works as for any source;
 its repository fields there do not apply (sync and webhook answer 409).

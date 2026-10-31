@@ -4,6 +4,20 @@ A native collection is a skill source kept in toolyard's database instead
 of a GitHub repository. `skills.sources` lists it like any other source;
 its `repo` is `toolyard.native/<collection>@<12-hex digest>`.
 
+## Make a collection
+
+When your owner is an admin and has no collection yet, make one:
+
+```text
+skills.create_collection
+{"slug": "team", "visibility": "everyone", "editors": ["<user id>"],
+ "_reason": "A place for the team's own playbooks, written by agents"}
+```
+
+Your owner becomes its creator and approves your sensitive writes. For
+anyone else's agent this answers `forbidden`: ask your owner to ask an
+admin.
+
 ## Who may write
 
 - You read a collection's skills when your owner may see them (its
