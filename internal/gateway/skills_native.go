@@ -25,6 +25,9 @@ const (
 	SkillsCreateTool   = "skills.create"
 	SkillsUpdateTool   = "skills.update"
 	SkillsVersionsTool = "skills.versions"
+	// SkillsCreateCollectionTool creates a native collection (admins'
+	// agents only).
+	SkillsCreateCollectionTool = "skills.create_collection"
 
 	skillsMaxListArg      = 20
 	skillsVersionsMax     = skillhub.MaxRevisionsList
@@ -79,7 +82,52 @@ func (g *Gateway) skillsNativeEntries() []toolEntry {
 				"description": fmt.Sprintf("Max revisions (default %d, at most %d).", skillsVersionsDefault, skillsVersionsMax)},
 		}, []string{"skill"}, g.handleSkillsVersions)
 	versions.tool.Annotations.ReadOnlyHint = mcp.ToBoolPtr(true)
-	return []toolEntry{create, update, versions}
+	collection := g.skillsEntry(SkillsCreateCollectionTool,
+		"Create a native skill collection (a skills source kept in toolyard) to write skills into with skills.create. "+
+			"Only an agent whose owner is an admin may; the owner becomes its creator and approves its agents' sensitive writes.",
+		map[string]any{
+			"slug":         str("The collection's name in every skill URI (skill://<slug>/...): lowercase letters, digits and hyphens."),
+			"visibility":   map[string]any{"type": "string", "enum": []string{"everyone", "members", "nobody"}, "description": "Who sees its skills (default everyone)."},
+			"members":      list("User IDs who see it, with visibility members."),
+			"blocked":      list("User IDs who never see it."),
+			"editors":      list("User IDs whose agents may write its skills (besides the creator and admins)."),
+			"mode":         map[string]any{"type": "string", "enum": []string{"auto", "review"}, "description": "auto (default): editors' safe writes go live at once; review: every agent write waits for the creator."},
+			"default_runs": map[string]any{"type": "string", "enum": []string{"anywhere", "host"}, "description": "Where its skills run by default (default anywhere)."},
+		}, []string{"slug"}, g.handleSkillsCreateCollection)
+	return []toolEntry{create, update, versions, collection}
+}
+
+func (g *Gateway) handleSkillsCreateCollection(ctx context.Context, hub *skillHubConfig, v skillhub.Viewer, args map[string]any) *mcp.CallToolResult {
+	if hub.registry == nil {
+		return skillsUnavailable("native skills are not available on this server")
+	}
+	in := skillhub.SourceInput{
+		Slug:        strings.TrimSpace(stringArg(args, "slug")),
+		Visibility:  skillhub.Visibility(strings.TrimSpace(stringArg(args, "visibility"))),
+		Mode:        skillhub.UpdateMode(strings.TrimSpace(stringArg(args, "mode"))),
+		DefaultRuns: skillhub.Runs(strings.TrimSpace(stringArg(args, "default_runs"))),
+	}
+	if in.Slug == "" {
+		return skillsInvalid("slug: give the collection's name, lowercase letters, digits and hyphens")
+	}
+	for key, dst := range map[string]*[]string{"members": &in.Members, "blocked": &in.Blocked, "editors": &in.Editors} {
+		l, bad := skillsListArg(args, key)
+		if bad != nil {
+			return bad
+		}
+		if l != nil {
+			*dst = *l
+		}
+	}
+	src, err := hub.registry.CreateCollection(ctx, v, in)
+	if err != nil {
+		return skillsErrorResult(err, in.Slug)
+	}
+	return skillsJSON(map[string]any{
+		"collection": map[string]any{"id": src.ID, "slug": src.Slug, "kind": src.Kind, "mode": src.Mode, "visibility": src.Visibility,
+			"members": src.Members, "blocked": src.Blocked, "editors": src.Editors, "default_runs": src.DefaultRuns, "created_by": src.CreatedBy},
+		"next": "Write its first skill with skills.create {\"collection\": \"" + src.Slug + "\", ...}.",
+	})
 }
 
 // skillsFilesArg reads an optional files object: path → content.

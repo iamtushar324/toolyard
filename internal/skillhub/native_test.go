@@ -679,3 +679,34 @@ func TestNativeChecksTheRowNotTheCachedIndex(t *testing.T) {
 		t.Fatalf("a write after the audience was revoked elsewhere: %v", err)
 	}
 }
+
+func TestNativeAdminsAgentCreatesACollection(t *testing.T) {
+	e := newNativeEnv(t, SourceInput{Visibility: VisibleEveryone})
+	ctx := context.Background()
+	adminAgent := Viewer{UserID: "usr_boss", AgentID: "agt_boss", Admin: true, Delegated: true}
+	src, err := e.svc.CreateCollection(ctx, adminAgent, SourceInput{Slug: "ops", Visibility: VisibleMembers, Members: []string{"usr_boss"},
+		Editors: []string{"usr_editor"}, URL: ""})
+	if err != nil || src.Kind != KindNative || src.CreatedBy != "usr_boss" || src.Visibility != VisibleMembers || len(src.Editors) != 1 {
+		t.Fatalf("admin's agent: %+v %v", src, err)
+	}
+	// Its first skill goes in at once, and the owner sees it.
+	if res := e.write(t, adminAgent, SkillWrite{Collection: "ops", Files: map[string]string{"SKILL.md": deploySkill(t, "Deploy")}}); res.Status != WriteLive {
+		t.Fatalf("first write %+v", res)
+	}
+	// A member's agent, a member in person and an anonymous caller may not.
+	for name, v := range map[string]Viewer{"member's agent": editorAgent, "member": editorPerson, "anonymous": {}} {
+		if _, err := e.svc.CreateCollection(ctx, v, SourceInput{Slug: "x-" + strings.ReplaceAll(name, " ", "-")}); !errors.Is(err, ErrForbidden) {
+			t.Errorf("%s: %v, want ErrForbidden", name, err)
+		}
+	}
+	// A repository setting or a taken slug is refused as for the admin API.
+	if _, err := e.svc.CreateCollection(ctx, adminAgent, SourceInput{Slug: "ops2", URL: "acme/skills"}); !errors.Is(err, ErrInvalid) {
+		t.Fatalf("URL: %v", err)
+	}
+	if _, err := e.svc.CreateCollection(ctx, adminAgent, SourceInput{Slug: "ops"}); !errors.Is(err, ErrConflict) {
+		t.Fatalf("taken slug: %v", err)
+	}
+	if n := e.auditCount(t, "skills.native_collection_create"); n != 1 {
+		t.Fatalf("audit rows %d", n)
+	}
+}

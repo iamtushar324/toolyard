@@ -18,8 +18,10 @@ type fakeRegistry struct {
 	viewers []skillhub.Viewer
 	gets    []int
 	reads   []string
-	pending bool
-	err     error
+	// collections are the CreateCollection inputs.
+	collections []skillhub.SourceInput
+	pending     bool
+	err         error
 }
 
 func (f *fakeRegistry) WriteSkill(_ context.Context, v skillhub.Viewer, w skillhub.SkillWrite) (*skillhub.WriteResult, error) {
@@ -46,6 +48,18 @@ func (f *fakeRegistry) GetRevision(_ context.Context, _ skillhub.Viewer, ref str
 	f.gets = append(f.gets, revision)
 	f.mu.Unlock()
 	return &skillhub.Skill{SkillSummary: skillhub.SkillSummary{URI: "skill://team/deploy/SKILL.md", Name: "deploy", Revision: revision}, Body: "old\n"}, nil
+}
+
+func (f *fakeRegistry) CreateCollection(_ context.Context, v skillhub.Viewer, in skillhub.SourceInput) (*skillhub.Source, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.collections = append(f.collections, in)
+	f.viewers = append(f.viewers, v)
+	if f.err != nil {
+		return nil, f.err
+	}
+	return &skillhub.Source{ID: "src_1", Slug: in.Slug, Kind: skillhub.KindNative, Mode: skillhub.ModeAuto, Visibility: in.Visibility,
+		Members: in.Members, Editors: in.Editors, CreatedBy: v.UserID}, nil
 }
 
 func (f *fakeRegistry) ReadRevision(_ context.Context, _ skillhub.Viewer, uri string, revision, _, _ int) (*skillhub.File, error) {
@@ -144,5 +158,26 @@ func TestSkillsBaseRevisionMustBeAWholeNumber(t *testing.T) {
 	}
 	if n, ok := exactInt(2.0); !ok || n != 2 {
 		t.Fatalf("2.0 = %d %v", n, ok)
+	}
+}
+
+func TestSkillsCreateCollectionTool(t *testing.T) {
+	f := newSkillsFixture(t)
+	out := f.ok(t, f.admin, SkillsCreateCollectionTool, map[string]any{"slug": "team", "visibility": "members",
+		"members": []any{"u_admin"}, "editors": []any{"u_member"}, "mode": "review"})
+	c, _ := out["collection"].(map[string]any)
+	if c["slug"] != "team" || c["kind"] != "native" || !strings.Contains(out["next"].(string), "skills.create") {
+		t.Fatalf("answer %v", out)
+	}
+	in := f.registry.collections[0]
+	if in.Slug != "team" || in.Visibility != "members" || in.Mode != "review" || len(in.Members) != 1 || in.Editors[0] != "u_member" {
+		t.Fatalf("input %+v", in)
+	}
+	if code := f.refused(t, f.admin, SkillsCreateCollectionTool, map[string]any{}); code != SkillsErrInvalid {
+		t.Fatalf("no slug: %q", code)
+	}
+	f.registry.err = skillhub.ErrForbidden
+	if code := f.refused(t, f.member, SkillsCreateCollectionTool, map[string]any{"slug": "mine"}); code != SkillsErrForbidden {
+		t.Fatalf("member: %q", code)
 	}
 }
