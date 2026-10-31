@@ -63,6 +63,9 @@ type skillEntry struct {
 	skillMD     string // digest
 	runs        Runs   // where it runs, after the override and defaults
 	override    Runs
+	// revision is a native skill's current revision (native.go), 0 for
+	// every other skill.
+	revision int
 }
 
 // skillShare is one skill's own sharing setting (SkillSharing), as sets.
@@ -139,6 +142,13 @@ func (si *srcIndex) visibleWith(v Viewer, sh *skillShare) bool {
 	if si.versionID == "" {
 		return false
 	}
+	return si.audienceAllows(v, sh)
+}
+
+// audienceAllows is the sharing rule without the served version: a native
+// collection with no skill yet is open to its audience for the first
+// write (native.go), and to nobody else.
+func (si *srcIndex) audienceAllows(v Viewer, sh *skillShare) bool {
 	mode, members := si.sourceAudience()
 	if sh != nil && sh.mode != VisibleInherit && !si.locked() {
 		mode, members = sh.mode, sh.members
@@ -162,7 +172,10 @@ func (si *srcIndex) visibleWith(v Viewer, sh *skillShare) bool {
 // (a source without skills: by its own audience).
 func (si *srcIndex) visibleTo(v Viewer) bool {
 	if si.versionID == "" {
-		return false
+		// A native collection with no skill yet is its audience's to
+		// list and write into (native.go); any other source without a
+		// served version is nobody's.
+		return si.src.IsNative() && si.audienceAllows(v, nil)
 	}
 	if len(si.shares) == 0 || len(si.skills) == 0 {
 		// Without per-skill settings every skill gets the same answer.
@@ -412,6 +425,12 @@ func (s *Service) buildSrcIndex(ctx context.Context, row *sourceRow) (*srcIndex,
 	if err != nil {
 		return nil, err
 	}
+	var revisions map[string]int
+	if row.IsNative() {
+		if revisions, err = s.currentRevisions(ctx, row.ID, v.ID); err != nil {
+			return nil, err
+		}
+	}
 	for _, e := range entries {
 		if sh, ok := shares[e.path]; ok {
 			si.shares[e.path] = &skillShare{mode: sh.Mode, members: setOf(sh.Members), blocked: setOf(sh.Blocked)}
@@ -419,6 +438,7 @@ func (s *Service) buildSrcIndex(ctx context.Context, row *sourceRow) (*srcIndex,
 		se := &skillEntry{
 			path: e.path, name: e.name, description: e.description,
 			frontmatter: json.RawMessage(e.frontmatter), skillMD: e.skillMD, override: overrides[e.path],
+			revision: revisions[e.path],
 		}
 		se.runs = effectiveRuns(se.override, Runs(e.runs), row.DefaultRuns)
 		si.skills = append(si.skills, se)

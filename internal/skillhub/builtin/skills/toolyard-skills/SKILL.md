@@ -1,6 +1,6 @@
 ---
 name: toolyard-skills
-description: "Find, read and follow the Agent Skills (step-by-step playbooks) that toolyard serves, and propose new skill sources or edits. Covers skills.search, skills.get, skills.read (offset, limit, truncated, next_offset), skills.grep, skills.sources, skills.list, skills.bundle and ty skills pull, skills.propose_source, skills.propose_change and skills.proposal; skill:// URIs, include_host and skills marked runs: host, repo and commit provenance, the /v1/skills REST routes, code-mode names, and the MCP Skills extension (skills/list, skills/get, resources/read, resources/directory/read). Use at the start of any multi-step task, when tools.search names matching skills, when you need a file a skill links to, when you want to install skills in a local client, when a skill is wrong or missing, or when a skills tool answers not_found, conflict, invalid, limit, rate_limited or unavailable."
+description: "Find, read and follow the Agent Skills (step-by-step playbooks) that toolyard serves, and propose new skill sources or edits. Covers skills.recommend, skills.search, skills.get, skills.read (offset, limit, truncated, next_offset), skills.grep, skills.sources, skills.list, skills.bundle and ty skills pull, skills.propose_source, skills.propose_change and skills.proposal, writing native skills (skills.create, skills.update, skills.versions); skill:// URIs, include_host and skills marked runs: host, repo and commit provenance, the /v1/skills REST routes, code-mode names, and the MCP Skills extension (skills/list, skills/get, resources/read, resources/directory/read). Use at the start of any multi-step task, when tools.search names matching skills, when you need a file a skill links to, when you want to install skills in a local client, when a skill is wrong or missing, or when a skills tool answers not_found, conflict, invalid, limit, rate_limited or unavailable."
 metadata:
   toolyard-runs: anywhere
 ---
@@ -43,12 +43,15 @@ answers exactly like one that does not exist.
 
 ## Recipe
 
-1. Search with a few words about the task:
+1. Describe the task and let toolyard rank the skills for it. Each result
+   says why it matched and when to use it; `uri` is what you load next:
 
    ```text
-   skills.search
-   {"query": "release rollback", "_reason": "Find a playbook before I roll back the failed release the user reported"}
+   skills.recommend
+   {"task": "roll back the release that broke checkout this morning", "limit": 3, "_reason": "Find a playbook before I roll back the failed release the user reported"}
    ```
+
+   `skills.search` with a few words works too (keyword or regex).
 
 2. Read the best match. The answer has the `SKILL.md` `body`, its
    `frontmatter`, `root` (the skill's folder URI) and `files` (each with
@@ -76,6 +79,17 @@ answers exactly like one that does not exist.
 
 No match? Try other words, `mode: "regex"`, or `skills.grep` over file
 contents. `skills.sources` shows which sources you see.
+
+## Writing skills
+
+Some sources are *native collections*: their skills live in toolyard
+itself (`repo` is `toolyard.native/<collection>@…`), and agents whose owner
+is an editor of the collection write them directly with `skills.create`
+and `skills.update`; `skills.versions` shows every revision. A write that
+runs code, changes `allowed-tools` or where the skill runs, touches a
+protected skill, or lands in a review-mode collection waits for the
+collection owner's approval. See [writing skills](references/writing.md).
+Skills from GitHub change through `skills.propose_change`.
 
 ## URIs and names
 

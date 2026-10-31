@@ -166,7 +166,7 @@ func (s *Service) Sources(_ context.Context, v Viewer) ([]SourceInfo, error) {
 			continue
 		}
 		out = append(out, SourceInfo{
-			Slug: si.src.Slug, Repo: si.repoLabel(), Branch: si.src.Branch, Path: si.src.Path,
+			Slug: si.src.Slug, Kind: si.src.Kind, Repo: si.repoLabel(), Branch: si.src.Branch, Path: si.src.Path,
 			Commit: si.sha, SyncedAt: si.syncedAt, SkillCount: si.visibleSkills(v), HTMLURL: si.htmlURL(""),
 		})
 	}
@@ -175,8 +175,8 @@ func (s *Service) Sources(_ context.Context, v Viewer) ([]SourceInfo, error) {
 
 // htmlURL links to a folder of the source at its commit.
 func (si *srcIndex) htmlURL(rel string) string {
-	if si.src.IsBuiltin() {
-		return "" // compiled into toolyard: no repository to link
+	if si.src.IsBuiltin() || si.src.IsNative() {
+		return "" // compiled into toolyard, or written through its API: no repository to link
 	}
 	u := "https://github.com/" + si.src.Owner + "/" + si.src.Repo + "/tree/" + si.sha
 	if p := repoPath(si.src.Path, rel); p != "" {
@@ -189,7 +189,7 @@ func (si *srcIndex) htmlURL(rel string) string {
 func (si *srcIndex) summary(e *skillEntry) SkillSummary {
 	return SkillSummary{
 		URI: si.skillURI(e.path), Name: e.name, Description: e.description,
-		Source: si.src.Slug, Path: e.path, Repo: si.repoLabel(), Commit: si.sha, Runs: e.runs,
+		Source: si.src.Slug, Path: e.path, Repo: si.repoLabel(), Commit: si.sha, Runs: e.runs, Revision: e.revision,
 	}
 }
 

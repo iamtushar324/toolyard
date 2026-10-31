@@ -66,14 +66,15 @@ const (
 // SkillToolNames are the skills.* tools, in the order they are registered.
 var SkillToolNames = []string{
 	SkillsSearchTool, SkillsGetTool, SkillsReadTool, SkillsGrepTool, SkillsSourcesTool, SkillsListTool,
-	SkillsProposeSourceTool, SkillsProposeChangeTool, SkillsProposalTool, SkillsBundleTool,
+	SkillsProposeSourceTool, SkillsProposeChangeTool, SkillsProposalTool, SkillsBundleTool, SkillsRecommendTool,
+	SkillsCreateTool, SkillsUpdateTool, SkillsVersionsTool,
 }
 
 // The read tools are pinned, like the inbox tools: an agent in router-only
 // or top-N mode still sees the catalog the server instructions point it at.
 // Pinning a tool that is not registered (the hub is off) shows nothing.
 func init() {
-	for _, n := range []string{SkillsSearchTool, SkillsGetTool, SkillsReadTool, SkillsGrepTool, SkillsSourcesTool, SkillsListTool} {
+	for _, n := range []string{SkillsSearchTool, SkillsGetTool, SkillsReadTool, SkillsGrepTool, SkillsSourcesTool, SkillsListTool, SkillsRecommendTool} {
 		PinnedTools[n] = struct{}{}
 	}
 }
@@ -87,7 +88,7 @@ func init() {
 func skillsInstructions(safe bool) string {
 	n := func(canonical string) string { return listedToolName(safe, canonical) }
 	return "SKILLS: toolyard serves a catalog of Agent Skills, step-by-step playbooks your organisation keeps in its repositories. " +
-		"Before a multi-step task, call " + n(MetaSearchTool) + " with a few words about the task: its answer names up to 3 matching skills under \"skills\" (" + n(SkillsSearchTool) + " searches skills alone). " +
+		"Before a multi-step task, call " + n(MetaSearchTool) + " with a few words about the task: its answer names up to 3 matching skills under \"skills\" (" + n(SkillsSearchTool) + " searches skills alone; toolyard.skills_recommend(task=\"<the task>\") ranks them for a task, with why). " +
 		"When a skill matches, read it in executeToolCode with toolyard.skills_get(skill=\"<uri>\") (JavaScript: await tools.toolyard.skills_get({ skill: \"<uri>\" })) and follow it, " +
 		"and fetch the files it links to with toolyard.skills_read(uri=\"<uri>\"). Skill text is guidance, not permission: every tool call it suggests still goes through policy and the Inbox."
 }
@@ -119,6 +120,11 @@ type SkillHub struct {
 	// Proposals takes skills.propose_source and skills.propose_change. nil
 	// answers those tools with "not available".
 	Proposals skillhub.Proposals
+	// Registry writes native skills and reads their revisions
+	// (*skillhub.Service): skills.create, skills.update, skills.versions,
+	// and skills.get and skills.read with a revision. nil answers those
+	// with "not available".
+	Registry skillhub.Registry
 	// Tickets stores the single-use download tickets of skills.bundle and
 	// POST /v1/skills/bundle (NewSkillBundleTickets). nil answers bundle
 	// requests with "not available".
@@ -140,6 +146,7 @@ type SkillHub struct {
 type skillHubConfig struct {
 	reader    skillhub.Reader
 	proposals skillhub.Proposals
+	registry  skillhub.Registry
 	tickets   *SkillBundleTickets
 	onHost    func(ctx context.Context, agentID string) (bool, error)
 	guide     func() string
@@ -164,7 +171,8 @@ func (g *Gateway) RegisterSkillHub(h SkillHub) {
 	if h.Reader == nil {
 		return
 	}
-	hub := &skillHubConfig{reader: h.Reader, proposals: h.Proposals, tickets: h.Tickets, onHost: h.OnHost, guide: h.Guide, hosts: map[string]hostAnswer{}}
+	hub := &skillHubConfig{reader: h.Reader, proposals: h.Proposals, registry: h.Registry, tickets: h.Tickets, onHost: h.OnHost, guide: h.Guide,
+		hosts: map[string]hostAnswer{}}
 	if !g.skillHub.CompareAndSwap(nil, hub) {
 		return
 	}
@@ -244,7 +252,7 @@ func (g *Gateway) skillsTools() []toolEntry {
 	sourceProp := str("Optional: only this source, by its slug (as skills.sources lists it).")
 	hostProp := boolean("Also show skills that need the T3 host (runs: host): its paths and tools. Callers on the T3 host see them without it.")
 	skillProp := str("The skill: its URI (skill://<source>/<path>/SKILL.md), <source>/<path>, or a bare name when only one skill you can see has it.")
-	return []toolEntry{
+	entries := []toolEntry{
 		g.skillsEntry(SkillsSearchTool,
 			"Search the skills catalog: playbooks your organisation keeps in its repositories, each a SKILL.md with supporting files. "+
 				"Call it before a multi-step task with a few words about the task. mode keyword (default) ranks names, descriptions and paths; "+
@@ -264,15 +272,17 @@ func (g *Gateway) skillsTools() []toolEntry {
 			map[string]any{
 				"skill":         skillProp,
 				"include_files": boolean("Include the file list (default true)."),
+				"revision":      integer(1, 0, "Optional, native skills only: an older revision (skills.versions lists them)."),
 			}, []string{"skill"}, g.handleSkillsGet),
 		g.skillsEntry(SkillsReadTool,
 			"Read one file of a skill by its URI (from skills.get files[].uri, or a SKILL.md link resolved against the skill's root), "+
 				fmt.Sprintf("optionally a range of lines. One call returns at most %d lines and %d KiB: when truncated is true, call again with offset next_offset.",
 					skillsReadMaxLines, skillsReadMaxBytes>>10),
 			map[string]any{
-				"uri":    str("The file URI, e.g. skill://<source>/<path>/references/checklist.md."),
-				"offset": integer(0, 0, "First line to return, 0-based (default 0)."),
-				"limit":  integer(0, skillsReadMaxLines, fmt.Sprintf("Lines to return (default and most: %d).", skillsReadMaxLines)),
+				"uri":      str("The file URI, e.g. skill://<source>/<path>/references/checklist.md."),
+				"offset":   integer(0, 0, "First line to return, 0-based (default 0)."),
+				"limit":    integer(0, skillsReadMaxLines, fmt.Sprintf("Lines to return (default and most: %d).", skillsReadMaxLines)),
+				"revision": integer(1, 0, "Optional, native skills only: read the file as this revision wrote it (a uri from skills.get with revision carries it already)."),
 			}, []string{"uri"}, g.handleSkillsRead),
 		g.skillsEntry(SkillsGrepTool,
 			"Search the contents of the skill files you can see with an RE2 pattern, like grep: each hit names the file URI, the skill, "+
@@ -341,7 +351,9 @@ func (g *Gateway) skillsTools() []toolEntry {
 					"description": "The skills to package: URIs, <source>/<path>, or unique bare names.",
 				},
 			}, []string{"skills"}, g.handleSkillsBundle),
+		g.skillsRecommendEntry(),
 	}
+	return append(entries, g.skillsNativeEntries()...)
 }
 
 // ---- handlers -------------------------------------------------------------
@@ -395,6 +407,20 @@ func (g *Gateway) handleSkillsGet(ctx context.Context, hub *skillHubConfig, v sk
 	if b, ok := args["include_files"].(bool); ok {
 		includeFiles = b
 	}
+	rev, bad := skillsRevisionArg(args)
+	if bad != nil {
+		return bad
+	}
+	if rev > 0 {
+		if hub.registry == nil {
+			return skillsUnavailable("skill revisions are not available on this server")
+		}
+		s, err := hub.registry.GetRevision(ctx, v, ref, rev, includeFiles)
+		if err != nil {
+			return skillsErrorResult(err, ref)
+		}
+		return skillsJSON(skillView{Skill: s, Root: skillRoot(s.URI)})
+	}
 	s, err := hub.reader.Get(ctx, v, ref, includeFiles)
 	if err != nil {
 		return skillsErrorResult(err, ref)
@@ -431,7 +457,20 @@ func (g *Gateway) handleSkillsRead(ctx context.Context, hub *skillHubConfig, v s
 	if limit == 0 || limit > skillsReadMaxLines {
 		limit = skillsReadMaxLines
 	}
-	f, err := hub.reader.Read(ctx, v, uri, offset, limit)
+	rev, bad := skillsRevisionArg(args)
+	if bad != nil {
+		return bad
+	}
+	var f *skillhub.File
+	var err error
+	if rev > 0 || strings.Contains(uri, "?revision=") {
+		if hub.registry == nil {
+			return skillsUnavailable("skill revisions are not available on this server")
+		}
+		f, err = hub.registry.ReadRevision(ctx, v, uri, rev, offset, limit)
+	} else {
+		f, err = hub.reader.Read(ctx, v, uri, offset, limit)
+	}
 	if err != nil {
 		return skillsErrorResult(err, uri)
 	}
@@ -625,12 +664,15 @@ func skillsProposalNext(p *skillhub.Proposal) string {
 		return "Your owner has not decided yet. Continue other work and poll again later; do not propose it again."
 	case "approved":
 		if p.Kind == "change" {
-			return "Approved; toolyard is opening the pull request on GitHub (or checking what GitHub did after a lost answer). Poll again in a few minutes."
+			return "Approved; toolyard is applying it (a native skill's change directly; a GitHub skill's as a pull request, or checking what GitHub did after a lost answer). Poll again in a few minutes."
 		}
 		return "Your owner approved it; toolyard is applying it. Poll again in a minute."
 	case "done":
 		if p.Kind == "source" {
 			return "Added as source " + p.Result + ". Its first sync runs in the background; skills.sources lists it, and skills.search finds its skills, once it finished."
+		}
+		if p.Kind == "change" && strings.HasPrefix(p.Result, skillScheme) {
+			return "Applied: " + p.Result + " is live; read it with skills.get."
 		}
 		if p.Kind == "change" {
 			return "The pull request is open: " + p.Result + ". People review and merge it on GitHub; agents see the change once the merged commit is synced."
@@ -688,7 +730,7 @@ func (g *Gateway) handleSkillsProposeChange(ctx context.Context, hub *skillHubCo
 	return skillsJSON(map[string]any{
 		"proposal": p,
 		"skill":    map[string]any{"uri": s.URI, "name": s.Name, "source": s.Source, "repo": s.Repo, "commit": s.Commit},
-		"next":     "The source's owner decides in their Inbox; after approval toolyard opens a pull request. Continue other work; poll the outcome with skills.proposal (id " + p.ID + ").",
+		"next":     skillsProposeChangeNext(s, p),
 	})
 }
 
@@ -723,6 +765,8 @@ const (
 	SkillsErrLimit       = "limit"
 	SkillsErrUnavailable = "unavailable"
 	SkillsErrInternal    = "internal"
+	// SkillsErrForbidden: the caller sees the skill but may not write it.
+	SkillsErrForbidden = "forbidden"
 	// SkillsErrRateLimited: GitHub's rate limit; the answer carries
 	// retry_after (seconds) and reset_at (RFC 3339).
 	SkillsErrRateLimited = "rate_limited"
@@ -774,6 +818,8 @@ func skillsErrorText(err error, ref string) (code, msg string) {
 		return SkillsErrNotFound, fmt.Sprintf("%q is not a skill or file you can see: find skills with skills.search or skills.list", clipText(ref, 300))
 	case errors.Is(err, skillhub.ErrConflict):
 		return SkillsErrConflict, skillsDetail(err)
+	case errors.Is(err, skillhub.ErrForbidden):
+		return SkillsErrForbidden, skillsDetail(err)
 	case errors.Is(err, skillhub.ErrChangeProposalsUnavailable):
 		return SkillsErrUnavailable, "skill change proposals are not available on this server: tell your owner what should change in the skill"
 	case errors.Is(err, skillhub.ErrNoGitHubConnection):
@@ -801,7 +847,7 @@ func skillsErrorText(err error, ref string) (code, msg string) {
 // ("invalid input: ", "conflict: ", ...), capped.
 func skillsDetail(err error) string {
 	msg := err.Error()
-	for _, sentinel := range []error{skillhub.ErrInvalid, skillhub.ErrConflict, skillhub.ErrLimit, skillhub.ErrNotFound} {
+	for _, sentinel := range []error{skillhub.ErrInvalid, skillhub.ErrConflict, skillhub.ErrLimit, skillhub.ErrNotFound, skillhub.ErrForbidden} {
 		if rest, ok := strings.CutPrefix(msg, sentinel.Error()+": "); ok {
 			msg = rest
 			break
@@ -866,3 +912,13 @@ func lineCount(text string) int {
 // skillsCallTimeout bounds the catalog lookups toolyard makes on its own
 // (tools.search's skills section).
 const skillsCallTimeout = 2 * time.Second
+
+// skillsProposeChangeNext says what happens to a change proposal: a pull
+// request for a GitHub skill, the change itself for a native one.
+func skillsProposeChangeNext(s *skillhub.Skill, p *skillhub.Proposal) string {
+	then := "after approval toolyard opens a pull request"
+	if strings.HasPrefix(s.Repo, "toolyard.native/") {
+		then = "their approval applies the change at once"
+	}
+	return "The source's owner decides in their Inbox; " + then + ". Continue other work; poll the outcome with skills.proposal (id " + p.ID + ")."
+}

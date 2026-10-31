@@ -66,9 +66,15 @@ function skillsCommitURL(src, sha) { return skillsRepoURL(src) + '/commit/' + en
 // run (docs/skills-hub.md#built-in-skills).
 function skillsBuiltin(src) { return !!src && src.kind === 'builtin'; }
 
+// skillsNative reports a native collection: skills written through
+// toolyard's API (skills.create, skills.update), with no repository
+// (docs/skills-hub.md#native-skills).
+function skillsNative(src) { return !!src && src.kind === 'native'; }
+
 // skillsRepoLabel is "owner/repo@branch", plus the folder when there is one.
 function skillsRepoLabel(src) {
   if (skillsBuiltin(src)) return 'built into toolyard';
+  if (skillsNative(src)) return 'native collection (written through toolyard)';
   const folder = (src.path || '').replace(/^\/+|\/+$/g, '');
   return (src.owner || '') + '/' + (src.repo || '') + '@' + (src.branch || '') + (folder ? ' · ' + folder : '');
 }
@@ -832,7 +838,8 @@ function renderSkillsList() {
           el('thead', {}, el('tr', {}, ['Source', 'Repository', 'Commit', 'Mode', 'Status', 'Skills', 'Last check'].map((h) => el('th', {}, h)))),
           el('tbody', {}, rows.map((src) => el('tr', { class: 'skills-row', tabindex: 0,
             on: { click: () => navigate('skills/' + src.id), keydown: (e) => { if (e.key === 'Enter') navigate('skills/' + src.id); } } },
-            el('td', {}, el('b', {}, src.slug), skillsBuiltin(src) ? [' ', el('span', { class: 'badge allowed' }, 'Built in')] : null),
+            el('td', {}, el('b', {}, src.slug), skillsBuiltin(src) ? [' ', el('span', { class: 'badge allowed' }, 'Built in')] : null,
+              skillsNative(src) ? [' ', el('span', { class: 'badge allowed' }, 'Native')] : null),
             el('td', { class: 'meta' }, skillsRepoLabel(src)),
             el('td', {}, src.active_sha ? el('code', {}, skillsShort(src.active_sha)) : el('span', { class: 'meta' }, '—')),
             el('td', {}, skillsBuiltin(src) ? 'with toolyard' : src.mode + (src.mode === 'pinned' && src.pinned_sha ? ' ' + skillsShort(src.pinned_sha) : '')),

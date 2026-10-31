@@ -1,0 +1,308 @@
+{
+  "note": "Labelled tasks for internal/skillhub/recommend_eval_test.go and scripts/skills-recommend-eval.py. paraphrase marks a task that shares few words with its skill.",
+  "queries": [
+    {
+      "task": "deploy the new release of the payments service to production",
+      "relevant": [
+        "deploy-service"
+      ]
+    },
+    {
+      "task": "roll back the release that broke production",
+      "relevant": [
+        "rollback-release"
+      ]
+    },
+    {
+      "task": "publish the static website build to the CDN",
+      "relevant": [
+        "deploy-static-site"
+      ]
+    },
+    {
+      "task": "we have a production incident, start the incident response",
+      "relevant": [
+        "incident-response"
+      ]
+    },
+    {
+      "task": "write a blameless postmortem for last night's incident",
+      "relevant": [
+        "postmortem-writeup"
+      ]
+    },
+    {
+      "task": "review this pull request",
+      "relevant": [
+        "pr-review"
+      ]
+    },
+    {
+      "task": "review the code change for security problems like injection",
+      "relevant": [
+        "code-review-security"
+      ]
+    },
+    {
+      "task": "write unit tests for the parser module",
+      "relevant": [
+        "write-unit-tests"
+      ]
+    },
+    {
+      "task": "fix a flaky test in the integration suite",
+      "relevant": [
+        "fix-flaky-test"
+      ]
+    },
+    {
+      "task": "the CI pipeline failed, find out why",
+      "relevant": [
+        "debug-ci-failure"
+      ]
+    },
+    {
+      "task": "apply a database schema migration",
+      "relevant": [
+        "database-migration"
+      ]
+    },
+    {
+      "task": "speed up a slow SQL query",
+      "relevant": [
+        "sql-query-tuning"
+      ]
+    },
+    {
+      "task": "restore the database from last night's backup",
+      "relevant": [
+        "backup-restore-db"
+      ]
+    },
+    {
+      "task": "rotate the API key for the billing integration",
+      "relevant": [
+        "rotate-api-keys"
+      ]
+    },
+    {
+      "task": "a secret was committed to the repository",
+      "relevant": [
+        "secret-leak-response"
+      ]
+    },
+    {
+      "task": "extract the tables from these PDF invoices",
+      "relevant": [
+        "pdf-extract-text"
+      ]
+    },
+    {
+      "task": "fill in the PDF form",
+      "relevant": [
+        "pdf-fill-form"
+      ]
+    },
+    {
+      "task": "clean up this messy spreadsheet with duplicate rows",
+      "relevant": [
+        "spreadsheet-cleanup"
+      ]
+    },
+    {
+      "task": "make a chart from a CSV file",
+      "relevant": [
+        "csv-to-chart"
+      ]
+    },
+    {
+      "task": "write the weekly status report",
+      "relevant": [
+        "weekly-status-report"
+      ]
+    },
+    {
+      "task": "turn the meeting transcript into notes with action items",
+      "relevant": [
+        "meeting-notes"
+      ]
+    },
+    {
+      "task": "draft release notes since the last tag",
+      "relevant": [
+        "release-notes"
+      ]
+    },
+    {
+      "task": "draft a reply to a customer support ticket",
+      "relevant": [
+        "customer-reply-draft"
+      ]
+    },
+    {
+      "task": "triage this new bug report",
+      "relevant": [
+        "triage-bug-report"
+      ]
+    },
+    {
+      "task": "upgrade the dependency to the next major version",
+      "relevant": [
+        "dependency-upgrade"
+      ]
+    },
+    {
+      "task": "patch the CVE vulnerability in our dependency",
+      "relevant": [
+        "vulnerability-patch"
+      ]
+    },
+    {
+      "task": "make the docker container image smaller",
+      "relevant": [
+        "docker-image-slim"
+      ]
+    },
+    {
+      "task": "the kubernetes pod keeps crashing",
+      "relevant": [
+        "kubernetes-pod-crash"
+      ]
+    },
+    {
+      "task": "change the DNS record for the api domain",
+      "relevant": [
+        "dns-change"
+      ]
+    },
+    {
+      "task": "renew the TLS certificate before it expires",
+      "relevant": [
+        "tls-cert-renewal"
+      ]
+    },
+    {
+      "task": "write an architecture decision record for the queue choice",
+      "relevant": [
+        "write-adr"
+      ]
+    },
+    {
+      "task": "run a load test on the checkout service",
+      "relevant": [
+        "load-test"
+      ]
+    },
+    {
+      "task": "search the logs for this error across services",
+      "relevant": [
+        "log-search"
+      ]
+    },
+    {
+      "task": "break down the cloud bill by team",
+      "relevant": [
+        "cost-report-cloud"
+      ]
+    },
+    {
+      "task": "our latest ship made things worse, go back to yesterday's version",
+      "relevant": [
+        "rollback-release"
+      ],
+      "paraphrase": true
+    },
+    {
+      "task": "everything is down and customers are complaining, coordinate the response",
+      "relevant": [
+        "incident-response"
+      ],
+      "paraphrase": true
+    },
+    {
+      "task": "someone pushed a password to github by mistake",
+      "relevant": [
+        "secret-leak-response",
+        "rotate-api-keys"
+      ],
+      "paraphrase": true
+    },
+    {
+      "task": "this check passes sometimes and fails other times",
+      "relevant": [
+        "fix-flaky-test"
+      ],
+      "paraphrase": true
+    },
+    {
+      "task": "the page that lists orders takes ten seconds to load",
+      "relevant": [
+        "sql-query-tuning"
+      ],
+      "paraphrase": true
+    },
+    {
+      "task": "get the words out of a scanned document",
+      "relevant": [
+        "pdf-extract-text"
+      ],
+      "paraphrase": true
+    },
+    {
+      "task": "a new hire joins on monday, get them ready",
+      "relevant": [
+        "onboarding-new-engineer"
+      ],
+      "paraphrase": true
+    },
+    {
+      "task": "how much are we spending on servers each month",
+      "relevant": [
+        "cost-report-cloud"
+      ],
+      "paraphrase": true
+    },
+    {
+      "task": "make our container start faster and weigh less",
+      "relevant": [
+        "docker-image-slim"
+      ],
+      "paraphrase": true
+    },
+    {
+      "task": "convert the user guide to spanish",
+      "relevant": [
+        "translate-docs"
+      ],
+      "paraphrase": true
+    },
+    {
+      "task": "tidy up my commits before I merge",
+      "relevant": [
+        "git-history-cleanup"
+      ],
+      "paraphrase": true
+    },
+    {
+      "task": "check whether the new endpoints follow good REST conventions",
+      "relevant": [
+        "api-design-review"
+      ],
+      "paraphrase": true
+    },
+    {
+      "task": "how many requests per second can the service handle",
+      "relevant": [
+        "load-test"
+      ],
+      "paraphrase": true
+    },
+    {
+      "task": "summarise what was decided in today's call",
+      "relevant": [
+        "meeting-notes"
+      ],
+      "paraphrase": true
+    }
+  ]
+}

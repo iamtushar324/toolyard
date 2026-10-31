@@ -366,6 +366,16 @@ func (s *Service) previewRow(ctx context.Context, r *sourceRow, gh *ghClient) (*
 // waiting: the count and the insert run under a cluster lock per
 // contributor, so parallel creates on any replica cannot pass the cap.
 func (s *Service) CreateSource(ctx context.Context, by string, in SourceInput) (*Source, error) {
+	switch strings.TrimSpace(in.Kind) {
+	case "", KindGitHub:
+	case KindNative:
+		return s.createNative(ctx, by, in)
+	default:
+		return nil, fmt.Errorf("%w: kind %q: use github or native", ErrInvalid, in.Kind)
+	}
+	if len(in.Editors) > 0 {
+		return nil, fmt.Errorf("%w: editors are for native skill collections; a GitHub source's skills change on GitHub", ErrInvalid)
+	}
 	r, gh, err := s.prepareSource(ctx, by, in)
 	if err != nil {
 		return nil, err
@@ -545,6 +555,12 @@ func (s *Service) applyUpdate(r *sourceRow, up SourceUpdate) (bool, error) {
 	if err := refuseBuiltinUpdate(r, up); err != nil {
 		return false, err
 	}
+	if err := refuseNativeUpdate(r, up); err != nil {
+		return false, err
+	}
+	if r.IsNative() {
+		return false, applyNativeUpdate(r, up)
+	}
 	due := false
 	set := func(dst *string, v *string) {
 		if v != nil && strings.TrimSpace(*v) != *dst {
@@ -651,6 +667,13 @@ func (s *Service) DeleteSource(ctx context.Context, by, id string) error {
 	if err := refuseBuiltin(id, "it cannot be deleted (hide it from everyone instead)"); err != nil {
 		return err
 	}
+	// The purge of revision contents below runs under the lock native
+	// writes take around theirs (native.go).
+	ctx, unlockBlobs, err := s.cluster.LockCtx(ctx, revisionBlobsLock)
+	if err != nil {
+		return fmt.Errorf("skillhub: delete source: %w", err)
+	}
+	defer unlockBlobs()
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return fmt.Errorf("skillhub: delete source: %w", err)
@@ -673,10 +696,18 @@ func (s *Service) DeleteSource(ctx context.Context, by, id string) error {
 		`DELETE FROM skill_usage WHERE source_id = ?`,
 		`DELETE FROM skill_runs_overrides WHERE source_id = ?`,
 		`DELETE FROM skill_sharing WHERE source_id = ?`,
+		`DELETE FROM skill_revision_files WHERE source_id = ?`,
+		`DELETE FROM skill_revisions WHERE source_id = ?`,
 	} {
 		if _, err := tx.ExecContext(ctx, q, id); err != nil {
 			return fmt.Errorf("skillhub: delete source: %w", err)
 		}
+	}
+	// A deleted collection's revisions take their bytes with them, unless
+	// another collection's revision holds the same content.
+	if _, err := tx.ExecContext(ctx, `DELETE FROM skill_revision_blobs WHERE NOT EXISTS
+		(SELECT 1 FROM skill_revision_files r WHERE r.sha256 = skill_revision_blobs.sha256)`); err != nil {
+		return fmt.Errorf("skillhub: delete source: %w", err)
 	}
 	if err := tx.Commit(); err != nil {
 		return fmt.Errorf("skillhub: delete source: %w", err)
@@ -757,6 +788,9 @@ func (s *Service) Activate(ctx context.Context, by, id, versionID string) error 
 // Reject marks a staged version rejected.
 func (s *Service) Reject(ctx context.Context, by, id, versionID, note string) error {
 	if err := refuseBuiltin(id, "it has no versions to review"); err != nil {
+		return err
+	}
+	if err := s.refuseNative(ctx, id, "it has no versions to review (agents' changes wait as change proposals)"); err != nil {
 		return err
 	}
 	v, err := s.getVersionRow(ctx, s.db, id, versionID)
@@ -890,6 +924,9 @@ func (s *Service) SetRuns(ctx context.Context, by, id, skillPath string, runs Ru
 // returns it once.
 func (s *Service) RotateWebhookSecret(ctx context.Context, by, id string) (string, error) {
 	if err := refuseBuiltin(id, "it has no repository and takes no webhook"); err != nil {
+		return "", err
+	}
+	if err := s.refuseNative(ctx, id, "it takes no webhook"); err != nil {
 		return "", err
 	}
 	if _, err := s.getSourceRow(ctx, s.db, id); err != nil {

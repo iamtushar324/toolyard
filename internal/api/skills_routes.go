@@ -29,18 +29,24 @@ import (
 // and the body is the tool's structured answer:
 //
 //	GET  /v1/skills/search   ?query=&mode=keyword|regex&source=&limit=&include_host=   skills.search
+//	GET  /v1/skills/recommend ?task=&limit=&source=&tags=a,b&include_host=&mode=auto|keyword|semantic
+//	                                                                                  skills.recommend
 //	GET  /v1/skills/get      ?skill=&include_files=                                   skills.get
 //	GET  /v1/skills/read     ?uri=&offset=&limit=                                     skills.read
 //	GET  /v1/skills/grep     ?pattern=&source=&path=&ignore_case=&limit=&include_host= skills.grep
 //	GET  /v1/skills/sources                                                           skills.sources
 //	GET  /v1/skills/list     ?cursor=&limit=&source=&include_host=                    skills.list
+//	GET  /v1/skills/versions ?skill=&limit=                                         skills.versions: a native skill's revisions
+//	POST /v1/skills/create   {collection, name, description, instructions, triggers, tags, path, files, note, reason}  skills.create
+//	POST /v1/skills/update   {skill, description, instructions, triggers, tags, files, base_revision, note, reason}   skills.update
 //	GET  /v1/skills/proposal ?id=                                                     skills.proposal: one of the caller's proposals
 //	POST /v1/skills/bundle   {skills, reason}                                         skills.bundle: {url, expires_at, skills}
 //	GET  /v1/skills/bundle/{ticket}                                                   the .tar.gz
 //
 // Each GET takes ?reason= for the audit record (20-2000 characters;
-// default: the route). An unknown query parameter is refused, so a typo
-// never silently widens a search. Refusals carry {error, code}: code
+// default: the route). A list parameter (tags) is comma-separated. An
+// unknown query parameter is refused, so a typo never silently widens a
+// search. Refusals carry {error, code}: code
 // not_found 404, conflict 409, invalid 400, limit 422, unavailable 503,
 // and a call the gateway refused (an explicit deny policy, the agent's own
 // limits) is 403.
@@ -72,6 +78,9 @@ const (
 	paramString skillsParamKind = iota
 	paramInt
 	paramBool
+	// paramList is a comma-separated list, passed on as an array of
+	// strings (empty items dropped).
+	paramList
 )
 
 // skillsReadRoute is one GET route: the tool it runs and its parameters.
@@ -84,10 +93,14 @@ type skillsReadRoute struct {
 var skillsReadRoutes = map[string]skillsReadRoute{
 	"/v1/skills/search": {gateway.SkillsSearchTool, map[string]skillsParamKind{
 		"query": paramString, "mode": paramString, "source": paramString, "limit": paramInt, "include_host": paramBool}},
+	"/v1/skills/recommend": {gateway.SkillsRecommendTool, map[string]skillsParamKind{
+		"task": paramString, "limit": paramInt, "source": paramString, "tags": paramList, "include_host": paramBool, "mode": paramString}},
 	"/v1/skills/get": {gateway.SkillsGetTool, map[string]skillsParamKind{
-		"skill": paramString, "include_files": paramBool}},
+		"skill": paramString, "include_files": paramBool, "revision": paramInt}},
 	"/v1/skills/read": {gateway.SkillsReadTool, map[string]skillsParamKind{
-		"uri": paramString, "offset": paramInt, "limit": paramInt}},
+		"uri": paramString, "offset": paramInt, "limit": paramInt, "revision": paramInt}},
+	"/v1/skills/versions": {gateway.SkillsVersionsTool, map[string]skillsParamKind{
+		"skill": paramString, "limit": paramInt}},
 	"/v1/skills/grep": {gateway.SkillsGrepTool, map[string]skillsParamKind{
 		"pattern": paramString, "source": paramString, "path": paramString, "ignore_case": paramBool, "limit": paramInt, "include_host": paramBool}},
 	"/v1/skills/sources": {gateway.SkillsSourcesTool, map[string]skillsParamKind{}},
@@ -100,11 +113,15 @@ var skillsReadRoutes = map[string]skillsReadRoute{
 // literals so the route scan in role_guard_test.go reads them.
 func (s *Server) registerSkillsRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/v1/skills/search", s.skillsRead)
+	mux.HandleFunc("/v1/skills/recommend", s.skillsRead)
 	mux.HandleFunc("/v1/skills/get", s.skillsRead)
 	mux.HandleFunc("/v1/skills/read", s.skillsRead)
 	mux.HandleFunc("/v1/skills/grep", s.skillsRead)
 	mux.HandleFunc("/v1/skills/list", s.skillsRead)
 	mux.HandleFunc("/v1/skills/proposal", s.skillsRead)
+	mux.HandleFunc("/v1/skills/versions", s.skillsRead)
+	mux.HandleFunc("/v1/skills/create", s.skillsWrite)
+	mux.HandleFunc("/v1/skills/update", s.skillsWrite)
 	mux.HandleFunc("/v1/skills/sources", s.skillsSources)
 	mux.HandleFunc("/v1/skills/bundle", s.skillsBundle)
 	mux.HandleFunc("/v1/skills/bundle/", s.skillsBundleDownload)
@@ -115,6 +132,9 @@ func (s *Server) registerSkillsRoutes(mux *http.ServeMux) {
 // /v1/skills/sources is left out: the admin surface shares it.
 func skillsAgentPath(path string) bool {
 	if _, ok := skillsReadRoutes[path]; ok && path != skillsSourcesPath {
+		return true
+	}
+	if _, ok := skillsWriteRoutes[path]; ok {
 		return true
 	}
 	return path == skillsBundlePath || skillsBundleDownloadPath(path)
@@ -154,7 +174,7 @@ func (s *Server) skillsSources(w http.ResponseWriter, r *http.Request) {
 	writeError(w, http.StatusNotFound, "not found")
 }
 
-// GET /v1/skills/{search,get,read,grep,sources,list,proposal}
+// GET /v1/skills/{search,recommend,get,read,grep,sources,list,proposal}
 func (s *Server) skillsRead(w http.ResponseWriter, r *http.Request) {
 	route, ok := skillsReadRoutes[r.URL.Path]
 	if !ok {
@@ -214,6 +234,14 @@ func skillsQueryArgs(q url.Values, params map[string]skillsParamKind) (map[strin
 				return nil, "", errors.New(name + " must be true or false")
 			}
 			args[name] = b
+		case paramList:
+			list := []any{}
+			for _, item := range strings.Split(v, ",") {
+				if item = strings.TrimSpace(item); item != "" {
+					list = append(list, item)
+				}
+			}
+			args[name] = list
 		}
 	}
 	return args, reason, nil
@@ -274,6 +302,8 @@ func writeSkillsResult(w http.ResponseWriter, res *mcp.CallToolResult) {
 		status = http.StatusConflict
 	case gateway.SkillsErrInvalid:
 		status = http.StatusBadRequest
+	case gateway.SkillsErrForbidden:
+		status = http.StatusForbidden
 	case gateway.SkillsErrLimit:
 		status = http.StatusUnprocessableEntity
 	case gateway.SkillsErrUnavailable:
@@ -429,4 +459,85 @@ func (b *bundleWriter) Write(p []byte) (int, error) {
 		b.w.WriteHeader(http.StatusOK)
 	}
 	return b.w.Write(p)
+}
+
+// maxSkillsWriteBody caps POST /v1/skills/create and /v1/skills/update: up
+// to 4 MiB of file contents (skillhub.MaxChangeBytes), JSON-escaped.
+const maxSkillsWriteBody = 9 << 20
+
+// skillsWriteRoutes are the POST routes that write native skills: the tool
+// each runs and the body fields it takes (reason is the audit reason).
+var skillsWriteRoutes = map[string]struct {
+	tool   string
+	fields []string
+}{
+	"/v1/skills/create": {gateway.SkillsCreateTool, []string{"collection", "name", "description", "instructions", "triggers", "tags", "path", "files", "note"}},
+	"/v1/skills/update": {gateway.SkillsUpdateTool, []string{"skill", "description", "instructions", "triggers", "tags", "files", "base_revision", "note"}},
+}
+
+// POST /v1/skills/{create,update}: the body is the tool's arguments plus
+// reason. An unknown field is refused, so a typo never writes something
+// else than meant.
+func (s *Server) skillsWrite(w http.ResponseWriter, r *http.Request) {
+	route, ok := skillsWriteRoutes[r.URL.Path]
+	if !ok {
+		writeError(w, http.StatusNotFound, "not found")
+		return
+	}
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "POST only")
+		return
+	}
+	ag, sessionID, viaSession, err := s.codeCaller(r)
+	if err != nil {
+		writeCallerError(w, err)
+		return
+	}
+	if !s.skillsReady(w) {
+		return
+	}
+	if mediaType(r) != "application/json" {
+		writeError(w, http.StatusUnsupportedMediaType, "only application/json is accepted")
+		return
+	}
+	raw, err := io.ReadAll(http.MaxBytesReader(w, r.Body, maxSkillsWriteBody))
+	if err != nil {
+		var mbe *http.MaxBytesError
+		if errors.As(err, &mbe) {
+			writeError(w, http.StatusRequestEntityTooLarge, "the body is over 9 MiB")
+			return
+		}
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	var body map[string]any
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.UseNumber()
+	if err := dec.Decode(&body); err != nil || dec.More() || body == nil {
+		msg := "the body must be one JSON object"
+		if err != nil {
+			msg += ": " + err.Error()
+		}
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": msg, "code": gateway.SkillsErrInvalid})
+		return
+	}
+	allowed := map[string]bool{"reason": true}
+	for _, f := range route.fields {
+		allowed[f] = true
+	}
+	reason := ""
+	args := map[string]any{}
+	for k, v := range body {
+		if !allowed[k] {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "unknown field " + strconv.Quote(k) + "; this route takes " +
+				strings.Join(route.fields, ", ") + " and reason", "code": gateway.SkillsErrInvalid})
+			return
+		}
+		if k == "reason" {
+			reason, _ = v.(string)
+			continue
+		}
+		args[k] = v
+	}
+	s.skillsCall(w, r, ag, sessionID, viaSession, route.tool, args, reason)
 }

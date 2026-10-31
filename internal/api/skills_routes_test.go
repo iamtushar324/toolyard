@@ -157,6 +157,53 @@ func (r *restSkills) Bundle(_ context.Context, v skillhub.Viewer, refs []string,
 
 func (r *restSkills) Subscribe(func(string)) func() { return func() {} }
 
+// Recommend answers every visible skill whose name is in the task, and
+// echoes the query's filters in the rationale.
+func (r *restSkills) Recommend(_ context.Context, v skillhub.Viewer, q skillhub.RecommendQuery) (*skillhub.RecommendResult, error) {
+	if strings.TrimSpace(q.Task) == "" {
+		return nil, fmt.Errorf("%w: describe the task", skillhub.ErrInvalid)
+	}
+	res := &skillhub.RecommendResult{Task: q.Task, RankedBy: "keyword", Skills: []skillhub.Recommendation{}}
+	for _, s := range r.visible(v) {
+		if strings.Contains(q.Task, s.Name) {
+			res.Skills = append(res.Skills, skillhub.Recommendation{URI: s.URI, Name: s.Name, Source: s.Source, Path: s.Path,
+				Rationale: fmt.Sprintf("tags=%s limit=%d mode=%s host=%t", strings.Join(q.Tags, "|"), q.Limit, q.Mode, q.IncludeHost)})
+		}
+	}
+	res.Matched = len(res.Skills)
+	return res, nil
+}
+
+// GET /v1/skills/recommend is skills.recommend: tags is comma-separated.
+func TestSkillsRecommendRoute(t *testing.T) {
+	e := newSkillsEnv(t, true)
+	q := url.Values{"task": {"deploy the api"}, "tags": {"ops, release,,"}, "limit": {"3"}, "mode": {"keyword"}, "include_host": {"true"}}
+	rec := e.do(t, http.MethodGet, "/v1/skills/recommend?"+q.Encode(), e.member, "")
+	if rec.Code != http.StatusOK {
+		t.Fatalf("recommend = %d %s", rec.Code, rec.Body)
+	}
+	out := decodeBody(t, rec)
+	skills, _ := out["skills"].([]any)
+	if out["ranked_by"] != "keyword" || len(skills) != 1 {
+		t.Fatalf("recommend body = %v", out)
+	}
+	first := skills[0].(map[string]any)
+	if first["uri"] != "skill://team/deploy/SKILL.md" || first["rationale"] != "tags=ops|release limit=3 mode=keyword host=true" {
+		t.Fatalf("recommend skill = %v", first)
+	}
+	if !skillsAgentPath("/v1/skills/recommend") {
+		t.Fatal("/v1/skills/recommend must be an agent (bearer-only) route")
+	}
+	for _, bad := range []string{"", "?task=deploy&tags=a&tags=b", "?task=deploy&limit=x", "?task=deploy&mode=regex", "?task=deploy&nope=1"} {
+		if rec := e.do(t, http.MethodGet, "/v1/skills/recommend"+bad, e.member, ""); rec.Code != http.StatusBadRequest {
+			t.Errorf("recommend%s = %d %s", bad, rec.Code, rec.Body)
+		}
+	}
+	if rec := e.do(t, http.MethodGet, "/v1/skills/recommend?task=deploy", e.opTok, ""); rec.Code != http.StatusForbidden {
+		t.Errorf("recommend with an operator token = %d", rec.Code)
+	}
+}
+
 // skillsResolver gives one agent the admin scope and every other caller a
 // member's (no grants).
 type skillsResolver struct{ admin string }

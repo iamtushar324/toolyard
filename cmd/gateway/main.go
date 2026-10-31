@@ -1124,8 +1124,12 @@ func runServe(argv []string) error {
 	// tools.search ranks by meaning (Jev) when -tool-search-ranker says so;
 	// its API key is a secret, read at search time, so the owner can set
 	// it on the dashboard without a restart.
+	// skills.recommend ranks with the same engine (set on the skills hub
+	// below), so both share its caches and its per-caller cap.
+	var rankedSearch *toolsearch.Engine
 	if toolSearchRanked {
-		gw.SetToolSearch(toolSearch.engine(secretsSvc.Resolve))
+		rankedSearch = toolSearch.engine(secretsSvc.Resolve)
+		gw.SetToolSearch(rankedSearch)
 		rootLog.Info("tool search ranker on: tools.search ranks by meaning, with keyword fallback",
 			"ranker", toolSearchRankerDecisions, "model", strings.TrimSpace(*toolSearch.model),
 			"key_secret", strings.TrimSpace(*toolSearch.keySecret), "timeout", toolSearch.timeout.String(), "zdr", *toolSearch.zdr)
@@ -1371,6 +1375,11 @@ func runServe(argv []string) error {
 		if err != nil {
 			return fmt.Errorf("skills hub: %w", err)
 		}
+		if rankedSearch != nil {
+			// skills.recommend: hybrid keyword + Jev ranking, with keyword
+			// fallback (docs/skills-hub.md#recommendations).
+			skillhubSvc.SetRecommendEngine(rankedSearch)
+		}
 		if err := skillhubSvc.Start(ctx); err != nil {
 			rootLog.Warn("skills hub: the first catalog load failed; it is retried in the background", "err", err.Error())
 		}
@@ -1567,6 +1576,9 @@ func runServe(argv []string) error {
 		if sp, ok := skillHubProposals.(*skillhub.SourceProposals); ok {
 			sp.SetChangeProposals(changes)
 		}
+		// Native skills (skillhub/native.go): an agent's sensitive write
+		// becomes a change proposal that the collection's owner approves.
+		skillhubSvc.SetNativeApprovals(changes)
 		skillHubSweepers = append(skillHubSweepers, changes)
 	}
 	// skillhub (slices C, D): settle the review, source-proposal and
@@ -1588,8 +1600,11 @@ func runServe(argv []string) error {
 	// request through. The Reader is set only while skillhubSvc is non-nil
 	// (never a typed nil in the interface).
 	if skillhubSvc != nil {
+		// Native writes are audited like the other skills changes.
+		skillhubSvc.SetAudit(auditSvc)
 		gw.RegisterSkillHub(gateway.SkillHub{
 			Reader:    skillhubSvc,
+			Registry:  skillhubSvc,       // native skills: skills.create, skills.update, skills.versions
 			Proposals: skillHubProposals, // slice C's SourceProposals
 			Tickets:   gateway.NewSkillBundleTickets(db),
 			OnHost:    federationSvc.OnHost,
