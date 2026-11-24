@@ -97,6 +97,8 @@ var operatorOwnerPrefixes = []string{
 	"/v1/insights/tools/",
 	"/v1/insights/purge-agent",
 	"/v1/users",
+	// Who from outside the organisation may sign in, and what they reach.
+	"/v1/guests",
 	"/v1/passkeys",
 	"/v1/push/subscribe",
 	"/v1/push/rotate-vapid",
@@ -209,6 +211,12 @@ func (s *Server) operatorGuard(w http.ResponseWriter, r *http.Request) (*http.Re
 			"required_scope": need,
 			"hint":           "ask the owner to run this from the dashboard, or to mint a token with this scope",
 		})
+		return nil, false
+	}
+	// A guest never holds a usable operator token: the guest sign-in
+	// revokes the person's tokens, and this refuses any left behind.
+	if u.Role == identity.RoleGuest {
+		writeError(w, http.StatusForbidden, "admin_only")
 		return nil, false
 	}
 	if u.Role != identity.RoleAdmin && !memberAllowed(r.Method, r.URL.Path) {
@@ -482,6 +490,8 @@ var operatorCatalog = []operatorCatalogEntry{
 	{"/v1/operator/guide", "GET", "operator guide (markdown)"},
 	{"/v1/users", "GET POST", "users: list, create"},
 	{"/v1/users/{id}", "GET PATCH DELETE POST", "one user: role (browser session only), status, access, identity key; POST /make-owner transfers ownership (the owner's browser session only)"},
+	{"/v1/guests", "GET POST", "guest invites: list, create or replace {email, servers, tools?, expires_at?, note?} (people outside the organisation)"},
+	{"/v1/guests/{id}", "DELETE", "remove the guest invite for /v1/guests/{email}; the guest is blocked at once"},
 	{"/v1/me/servers", "GET", "servers and data groups the caller may use"},
 	{"/v1/me/apps", "GET", "the caller's connected apps (OAuth clients); ?all=true lists everyone's for an admin"},
 	{"/v1/me/apps/config", "GET", "how to connect an MCP client by URL, and for an admin the OAuth settings"},

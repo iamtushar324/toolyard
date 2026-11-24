@@ -448,6 +448,13 @@ func (g *Gateway) taskResult(ctx context.Context, w http.ResponseWriter, req tas
 		default:
 		}
 	}
+	// The caller's access may have ended while it waited: the result
+	// goes out only if the job is still visible (jobVisible resolves the
+	// scope anew), else the task reads as unknown.
+	if !g.jobVisible(ctx, j) {
+		writeRPCError(w, req, mcp.INVALID_PARAMS, "task not found: "+j.ID)
+		return
+	}
 	writeRPCResult(w, req.id, g.taskToolResult(ctx, j))
 }
 
@@ -507,7 +514,8 @@ func (g *Gateway) taskList(ctx context.Context, w http.ResponseWriter, req taskR
 		}
 		f.BeforeCreated, f.BeforeID = n, jid
 	}
-	list, err := g.jobs.List(ctx, f)
+	// Only tasks the caller may still see (jobVisible), as jobs.list.
+	list, next, err := g.jobs.ListFiltered(ctx, f, func(j *jobs.Job) bool { return g.jobVisible(ctx, j) })
 	if err != nil {
 		writeRPCError(w, req, mcp.INTERNAL_ERROR, "list tasks: "+err.Error())
 		return
@@ -515,9 +523,8 @@ func (g *Gateway) taskList(ctx context.Context, w http.ResponseWriter, req taskR
 	for _, j := range list {
 		out.Tasks = append(out.Tasks, g.taskOf(j))
 	}
-	if len(list) == page {
-		last := list[len(list)-1]
-		out.NextCursor = mcp.Cursor(strconv.FormatInt(last.CreatedAt, 10) + ":" + last.ID)
+	if next != nil {
+		out.NextCursor = mcp.Cursor(strconv.FormatInt(next.CreatedAt, 10) + ":" + next.ID)
 	}
 	writeRPCResult(w, req.id, out)
 }

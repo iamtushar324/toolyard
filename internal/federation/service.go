@@ -34,7 +34,13 @@ var ErrTrustRevoked = errors.New("trust_revoked")
 var ErrNotMember = errors.New("not_org_member")
 var ErrConflict = errors.New("federation trust or credential version changed")
 
-type Profile struct{ Email, Name, Avatar string }
+type Profile struct {
+	Email, Name, Avatar string
+	// Guest: the person is not in the organisation and a guest invite
+	// admitted them (api.admitClerkSubject). The sign-in then records a
+	// guest (identity.ClerkProfile.Guest) and runs SyncGuest.
+	Guest bool
+}
 type Service struct {
 	db         *store.DB
 	identity   *identity.Service
@@ -46,6 +52,10 @@ type Service struct {
 	// OwnerOnly is personal sign-in (-clerk-owner-only): an assertion
 	// counts only for the owner.
 	OwnerOnly bool
+	// SyncGuest, when set, runs after a guest's sign-in upsert with the
+	// user's id: it mirrors the guest's invite into their grants. An
+	// error refuses the sign-in (ErrUnavailable).
+	SyncGuest func(context.Context, string) error
 	now       func() time.Time
 	// mu serializes the connection writes in this process; with a
 	// multi-node cluster a cluster lock replaces it (lock, cluster.go).
@@ -193,9 +203,19 @@ func (s *Service) verify(ctx context.Context, assertion string, cleanup bool) (*
 	// New users are members. This path never assigns an administrator role,
 	// never makes anyone the owner and never links an owner by email
 	// (NoBootstrap). Returning identity is matched by verified subject.
-	u, err := s.identity.UpsertClerkUser(ctx, identity.ClerkProfile{ClerkUserID: c.Subject, Email: profile.Email, DisplayName: profile.Name, AvatarURL: profile.Avatar, NoBootstrap: true}, "")
+	// A guest (Profile.Guest) is recorded as one: never an admin or the
+	// owner either. A member's sign-in clears a former guest's flag.
+	u, err := s.identity.UpsertClerkUser(ctx, identity.ClerkProfile{ClerkUserID: c.Subject, Email: profile.Email, DisplayName: profile.Name, AvatarURL: profile.Avatar, NoBootstrap: true, Guest: profile.Guest}, "")
+	if errors.Is(err, identity.ErrGuestAdmin) {
+		return nil, ErrNotMember
+	}
 	if err != nil {
 		return nil, err
+	}
+	if profile.Guest && s.SyncGuest != nil {
+		if err := s.SyncGuest(ctx, u.ID); err != nil {
+			return nil, ErrUnavailable
+		}
 	}
 	if u.Status != identity.StatusActive {
 		return nil, ErrRevoked

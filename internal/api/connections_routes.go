@@ -71,28 +71,23 @@ func (s *Server) connectionUser(w http.ResponseWriter, r *http.Request) (*identi
 }
 
 // perUserServersFor lists the per_user servers the user may use: every one
-// for an admin, the granted ones for a member.
+// for an admin, for anyone else the ones their live scope reaches
+// (mayUseServer).
 func (s *Server) perUserServersFor(ctx context.Context, u *identity.User) ([]upstreams.Server, error) {
 	all, err := s.upstreams.List(ctx)
 	if err != nil {
 		return nil, err
-	}
-	allowed := map[string]bool{}
-	if u.Role != identity.RoleAdmin {
-		granted, err := s.userGroups(ctx, u.ID)
-		if err != nil {
-			return nil, err
-		}
-		for _, g := range granted {
-			allowed[g] = true
-		}
 	}
 	var out []upstreams.Server
 	for _, sv := range all {
 		if sv.AuthMode != upstreams.AuthPerUser {
 			continue
 		}
-		if u.Role == identity.RoleAdmin || allowed[sv.Name] {
+		ok, err := s.mayUseServer(ctx, u, sv.Name)
+		if err != nil {
+			return nil, err
+		}
+		if ok {
 			out = append(out, sv)
 		}
 	}
@@ -100,22 +95,21 @@ func (s *Server) perUserServersFor(ctx context.Context, u *identity.User) ([]ups
 	return out, nil
 }
 
-// mayUseServer reports whether the user may connect sv: an admin always,
-// a member when the server is granted to them.
+// mayUseServer reports whether the user may connect a server: an admin
+// always, anyone else when their live access scope reaches it. The scope,
+// not the stored grants: a guest's reach is their invite, read on every
+// scope load, so an expired or removed invite (whose mirrored grants in
+// user_server_access stay until the hourly sync) stops a new sign-in at
+// once. For a member the scope is their grants, as before. Without access
+// control wired only an admin may.
 func (s *Server) mayUseServer(ctx context.Context, u *identity.User, name string) (bool, error) {
 	if u.Role == identity.RoleAdmin {
 		return true, nil
 	}
-	granted, err := s.userGroups(ctx, u.ID)
-	if err != nil {
-		return false, err
+	if s.access == nil {
+		return false, nil
 	}
-	for _, g := range granted {
-		if g == name {
-			return true, nil
-		}
-	}
-	return false, nil
+	return s.access.UserScope(ctx, u.ID).Allows(name), nil
 }
 
 func ms(t time.Time) int64 {

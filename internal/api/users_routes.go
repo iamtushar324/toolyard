@@ -247,6 +247,12 @@ func (s *Server) usersPatch(w http.ResponseWriter, r *http.Request, caller, targ
 		s.writeUserChangeError(w, identity.ErrOwner)
 		return
 	}
+	// A guest's role and servers come from their guest invite: change the
+	// invite (/v1/guests), or invite them to the organisation.
+	if target.Role == identity.RoleGuest && (changeRole || body.Servers != nil) {
+		writeError(w, http.StatusConflict, "guest_invite_managed")
+		return
+	}
 	var servers []string
 	if body.Servers != nil {
 		if s.access == nil {
@@ -483,6 +489,8 @@ func (s *Server) writeUserChangeError(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusConflict, "already_owner")
 	case errors.Is(err, identity.ErrUserBlocked):
 		writeError(w, http.StatusConflict, "user_blocked")
+	case errors.Is(err, identity.ErrGuest):
+		writeError(w, http.StatusConflict, "guest_invite_managed")
 	case errors.Is(err, identity.ErrNoUser):
 		writeError(w, http.StatusNotFound, "user not found")
 	case errors.Is(err, identity.ErrInvalidRole), errors.Is(err, identity.ErrInvalidStatus):

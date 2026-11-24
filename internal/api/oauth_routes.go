@@ -599,6 +599,15 @@ func (s *Server) oauthUserCallback(w http.ResponseWriter, r *http.Request, p *oa
 			return errors.New("the provider account could not be checked and no toolyard session vouches for the person")
 		}
 	}
+	// Access is checked again here, not only when the sign-in began: a
+	// grant withdrawn, or a guest invite removed or expired, in between
+	// stores nothing.
+	if allowed, err := s.mayUseServer(r.Context(), u, p.UpstreamName); err != nil || !allowed {
+		s.auditUserFlowNoAccess(r, u, p.UpstreamName)
+		s.userFlowError(w, p.ViaTicket, "You no longer have access to "+p.UpstreamName+". Nothing was stored.",
+			"You no longer have access to "+p.UpstreamName+", so nothing was stored. Ask a toolyard admin.")
+		return
+	}
 	rec, err := s.oauth.ExchangeCodeForUserChecked(r.Context(), p.UpstreamName, u.ID, code, p.CodeVerifier, accept)
 	if errors.Is(err, oauth.ErrAccountMismatch) {
 		if outcome == accountMismatch {
@@ -631,6 +640,16 @@ func (s *Server) oauthUserCallback(w http.ResponseWriter, r *http.Request, p *oa
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
 	_, _ = w.Write([]byte(oauthUserSuccessHTML(p.UpstreamName, rec.AccountLabel)))
+}
+
+// auditUserFlowNoAccess records a per-user sign-in that came back after
+// the person lost access to the server: nothing was stored.
+func (s *Server) auditUserFlowNoAccess(r *http.Request, u *identity.User, upstream string) {
+	_ = s.audit.Write(r.Context(), audit.Event{
+		EventType: "oauth.user_no_access", AgentID: "user:" + u.ID, UpstreamName: upstream, Decision: "denied",
+		ResultSummary: "sign-in for " + upstream + " came back after access to it ended; no token stored",
+		Raiser:        actor.Raiser{OwnerUserID: u.ID, OwnerEmail: u.Email, OwnerName: u.Label()},
+	})
 }
 
 func nonEmpty(s, fallback string) string {
@@ -713,6 +732,13 @@ func (s *Server) oauthPaste(w http.ResponseWriter, r *http.Request) {
 				}
 				return nil
 			}
+		}
+		// As in the callback: access is checked again before storing.
+		if allowed, err := s.mayUseServer(r.Context(), u, p.UpstreamName); err != nil || !allowed {
+			_ = s.oauth.DeletePending(r.Context(), state)
+			s.auditUserFlowNoAccess(r, u, p.UpstreamName)
+			writeError(w, http.StatusForbidden, "you no longer have access to this server; nothing was stored")
+			return
 		}
 		rec, err := s.oauth.ExchangeCodeForUserChecked(r.Context(), p.UpstreamName, u.ID, code, p.CodeVerifier, accept)
 		if errors.Is(err, oauth.ErrAccountMismatch) {

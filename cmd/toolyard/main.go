@@ -60,6 +60,8 @@ func main() {
 		err = runAdmin(args)
 	case "api":
 		err = runAPI(args)
+	case "guest":
+		err = runGuest(args)
 	case "version", "-v", "--version":
 		fmt.Println("toolyard", version)
 	case "help", "-h", "--help":
@@ -96,6 +98,7 @@ Asking your owner for permission (the toolyard inbox):
 Operating toolyard (operator token; see 'toolyard admin guide'):
   admin <command>                   servers, secrets, agents, tokens, tools, settings, audit
   api METHOD /v1/PATH [-d JSON]     call any dashboard API route
+  guest add|list|remove             guest invites: people outside the organisation
 
 Run 'toolyard <command> -h' for command-specific flags.
 

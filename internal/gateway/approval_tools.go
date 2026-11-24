@@ -301,7 +301,26 @@ func approvalVisibleTo(req *approval.Request, caller string) bool {
 	return req.AgentID == "" || req.AgentID == caller
 }
 
+// approvalVisible is approvalVisibleTo plus two checks on the ctx caller:
+// a personal approval belongs to its owner only, and the caller's CURRENT
+// scope must still reach the recorded tool. A row keeps the call's
+// arguments and, once run, its result; an agent whose owner lost the tool
+// since (a grant withdrawn, a member who became a guest with a narrower
+// invite, the agent's own limits) must not read them back. Every caller
+// gets this check, not only guests: a routed call raised every approval,
+// so its tool was in scope when the row was made, and a caller who still
+// has the tool sees no change. A lost tool reads as an unknown id, as a
+// tool outside the scope reads as unknown everywhere.
 func (g *Gateway) approvalVisible(ctx context.Context, req *approval.Request) bool {
+	return g.approvalOwned(ctx, req) && g.scopeFor(ctx, agentIDFromContext(ctx)).AllowsTool(req.UpstreamName, req.ToolName)
+}
+
+// approvalOwned is approvalVisible without the scope check: the row
+// belongs to the ctx caller. Only resumeViaExecute uses it alone, to route
+// a resume to its target tool, whose own access check then answers a lost
+// tool exactly as a direct call would ("not found"); nothing is read back
+// on that path before the target's check.
+func (g *Gateway) approvalOwned(ctx context.Context, req *approval.Request) bool {
 	if req == nil || !approvalVisibleTo(req, agentIDFromContext(ctx)) {
 		return false
 	}
@@ -468,8 +487,14 @@ func (g *Gateway) handleWaitForApproval() directHandler {
 		done:
 		}
 	settled:
-		// Re-fetch authoritative state.
+		// Re-fetch authoritative state, and check visibility again: the
+		// caller's access may have ended while it waited (a grant
+		// withdrawn, a guest invite removed or expired), and the snapshot
+		// carries the result.
 		req, err = g.approval.Get(ctx, id)
+		if errors.Is(err, approval.ErrNotFound) || (err == nil && !g.approvalVisible(ctx, req)) {
+			return mcp.NewToolResultError("unknown approval_id"), nil
+		}
 		if err != nil {
 			return mcp.NewToolResultErrorFromErr("lookup approval", err), nil
 		}

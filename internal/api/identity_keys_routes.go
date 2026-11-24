@@ -123,6 +123,8 @@ func writeIdentityKeyError(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusConflict, "already_revealed")
 	case errors.Is(err, identitykeys.ErrNoClerkIdentity):
 		writeError(w, http.StatusConflict, "no_clerk_identity")
+	case errors.Is(err, identitykeys.ErrGuest):
+		writeError(w, http.StatusConflict, "guest")
 	case errors.Is(err, identitykeys.ErrKeyExists):
 		writeError(w, http.StatusConflict, "key_exists")
 	case errors.Is(err, identitykeys.ErrKeyChanged):

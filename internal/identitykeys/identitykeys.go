@@ -113,6 +113,10 @@ var (
 	// ErrNoClerkIdentity: registration needs the person's Clerk user id
 	// and email, so the user must sign in with Google once first.
 	ErrNoClerkIdentity = errors.New("user has no Clerk identity; they must sign in with Google once")
+	// ErrGuest: identity keys are the organisation's own identities in its
+	// registries; a guest (identity.RoleGuest, someone outside the
+	// organisation) never gets, registers, reveals or forwards one.
+	ErrGuest = errors.New("a guest has no identity key")
 	// ErrNotWired: the registry caller isn't set.
 	ErrNotWired = errors.New("identity key registry not wired")
 	// ErrKeyChanged: a rotate lost to a concurrent rotate or revoke of the
@@ -353,13 +357,16 @@ type userInfo struct {
 	Email       string
 	ClerkUserID string
 	Status      string
+	Guest       bool
 }
 
 func (s *Service) user(ctx context.Context, userID string) (*userInfo, error) {
 	var u userInfo
+	var guest int64
 	err := s.db.QueryRowContext(ctx,
-		`SELECT username, COALESCE(email,''), COALESCE(clerk_user_id,''), status FROM users WHERE id = ?`, userID).
-		Scan(&u.Username, &u.Email, &u.ClerkUserID, &u.Status)
+		`SELECT username, COALESCE(email,''), COALESCE(clerk_user_id,''), status, COALESCE(is_guest,0) FROM users WHERE id = ?`, userID).
+		Scan(&u.Username, &u.Email, &u.ClerkUserID, &u.Status, &guest)
+	u.Guest = guest == 1
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, identity.ErrNoUser
 	}
@@ -375,6 +382,10 @@ func (s *Service) registrableUser(ctx context.Context, userID string) (*userInfo
 	u, err := s.user(ctx, userID)
 	if err != nil {
 		return nil, err
+	}
+	// Issue, Rotate and Register (so Provision too) all pass here.
+	if u.Guest {
+		return nil, ErrGuest
 	}
 	if u.ClerkUserID == "" || u.Email == "" {
 		return nil, ErrNoClerkIdentity
@@ -587,6 +598,13 @@ func (s *Service) lostRotate(ctx context.Context, actorID, userID string, u *use
 // finds the key unrevealed, and the other gets ErrAlreadyRevealed. A key
 // that fails to unseal rolls the claim back, so it stays unrevealed.
 func (s *Service) Reveal(ctx context.Context, userID string) (key, fingerprint string, err error) {
+	// A guest never sees a key: one left from before they became a guest
+	// is revoked at their guest sign-in, and this covers the moment before.
+	if u, err := s.user(ctx, userID); err != nil {
+		return "", "", err
+	} else if u.Guest {
+		return "", "", ErrGuest
+	}
 	tx, err := s.db.BeginTx(ctx, nil)
 	if err != nil {
 		return "", "", err
@@ -1022,20 +1040,23 @@ func (s *Service) ForwardKey(ctx context.Context, callerID string) (string, erro
 	return key, nil
 }
 
-// loadKey returns the raw key, or "" when the user has none or is not
-// active. Store errors are returned as such (never cached).
+// loadKey returns the raw key, or "" when the user has none, is not
+// active or is a guest (a key is never forwarded for someone outside the
+// organisation, even one not yet revoked). Store errors are returned as
+// such (never cached).
 func (s *Service) loadKey(ctx context.Context, userID string) (string, error) {
 	var sealed, status string
+	var guest int64
 	err := s.db.QueryRowContext(ctx,
-		`SELECT k.key_sealed, u.status FROM user_identity_keys k JOIN users u ON u.id = k.user_id
-         WHERE k.user_id = ?`, userID).Scan(&sealed, &status)
+		`SELECT k.key_sealed, u.status, COALESCE(u.is_guest,0) FROM user_identity_keys k JOIN users u ON u.id = k.user_id
+         WHERE k.user_id = ?`, userID).Scan(&sealed, &status, &guest)
 	if errors.Is(err, sql.ErrNoRows) {
 		return "", nil
 	}
 	if err != nil {
 		return "", err
 	}
-	if status != identity.StatusActive {
+	if status != identity.StatusActive || guest == 1 {
 		return "", nil
 	}
 	raw, err := s.cipher.Open(sealed, []byte(userID))

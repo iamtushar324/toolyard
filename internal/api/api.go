@@ -13,6 +13,7 @@
 //	GET  /v1/users                admin: every user + grantable groups
 //	PATCH /v1/users/{id}          admin: role / status / servers
 //	POST /v1/users/{id}/make-owner      the owner: transfer ownership
+//	GET POST /v1/guests, DELETE /v1/guests/{email}  admin: guest invites
 //	POST /v1/users/{id}/revoke-sessions
 //	GET  /v1/me/servers           groups the caller may use
 //	GET  /v1/me/connections       per_user servers the caller may connect, with state
@@ -356,15 +357,22 @@ func New(ctx context.Context, opts Options) *Server {
 			if s.clerk == nil {
 				return federation.Profile{}, federation.ErrUnavailable
 			}
-			member, err := s.clerk.OrgMembership(ctx, subject)
+			// The same decision as every Clerk sign-in: membership, or
+			// an unexpired guest invite (admitClerkSubject).
+			adm, err := s.admitClerkSubject(ctx, subject, s.clerk.OrgMembership)
 			if errors.Is(err, clerk.ErrNotMember) {
+				s.auditClerkDenied(ctx, "federation.sign_in", subject, err)
 				return federation.Profile{}, federation.ErrNotMember
 			}
 			if err != nil {
 				return federation.Profile{}, federation.ErrUnavailable
 			}
-			return federation.Profile{Email: member.Email, Name: clerkDisplayName(member), Avatar: member.ImageURL}, nil
+			if s.clerkOwnerOnly && adm.guest != nil {
+				return federation.Profile{}, federation.ErrNotMember
+			}
+			return federation.Profile{Email: adm.member.Email, Name: clerkDisplayName(adm.member), Avatar: adm.member.ImageURL, Guest: adm.guest != nil}, nil
 		}
+		s.federation.SyncGuest = s.syncGuestGrants
 	}
 	// Sweep stale throttle buckets periodically. Tied to ctx so the
 	// goroutine exits on shutdown instead of leaking (precedent:
@@ -410,6 +418,8 @@ func (s *Server) Routes(mux *http.ServeMux) {
 
 	mux.HandleFunc("/v1/users", s.usersList)
 	mux.HandleFunc("/v1/users/", s.usersItem)
+	mux.HandleFunc("/v1/guests", s.guestsCollection)
+	mux.HandleFunc("/v1/guests/", s.guestsItem)
 	mux.HandleFunc("/v1/me/servers", s.meServers)
 	s.connectionRoutes(mux)
 	mux.HandleFunc("/v1/github/setup/begin", s.githubSetupBegin)

@@ -115,8 +115,10 @@ func TestAuthClerkSessionErrors(t *testing.T) {
 
 	e.clerk.set(func(f *fakeClerk) { f.memberErr = clerk.ErrNotMember })
 	expect("not member", post(`{"token":"good-token"}`), http.StatusForbidden, "not_org_member")
-	if n := e.auditRows(t, "user.login", "not_org_member"); n != 1 {
-		t.Errorf("not_org_member audit rows = %d", n)
+	// The browser sees not_org_member; the audit row says why: no guest
+	// invite for the person's verified email (guest_signin.go).
+	if n := e.auditRows(t, "user.login", "not_invited"); n != 1 {
+		t.Errorf("not_invited audit rows = %d", n)
 	}
 	e.clerk.set(func(f *fakeClerk) { f.memberErr = clerk.ErrUnavailable })
 	expect("api down", post(`{"token":"good-token"}`), http.StatusServiceUnavailable, "clerk_unavailable")

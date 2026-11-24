@@ -2021,6 +2021,13 @@ func (g *Gateway) resumeDeferred(ctx context.Context, entry toolEntry, approvalI
 			ev.ErrorClass = "approval"
 			return mcp.NewToolResultErrorFromErr("approval lookup", err), nil
 		}
+		// The caller's access may have ended during the wait: check the
+		// current scope again before handing back the result.
+		if !g.approvalVisible(ctx, req) {
+			ev.Outcome = metrics.OutcomeError
+			ev.ErrorClass = "approval"
+			return mcp.NewToolResultErrorf("unknown approval %q", approvalID), nil
+		}
 	}
 	ev.Fingerprint = req.Fingerprint
 	ev.ReasonText = req.Reason
@@ -2086,7 +2093,7 @@ func approvalRaisedFor(req *approval.Request, entry toolEntry) bool {
 // agent's, which resumeDeferred answers as unknown.
 func (g *Gateway) resumeViaExecute(ctx context.Context, entry toolEntry, args map[string]any, approvalID string, ev *metrics.Event) (*mcp.CallToolResult, error) {
 	req, err := g.approval.Get(ctx, approvalID)
-	if err != nil || !g.approvalVisible(ctx, req) || approvalRaisedFor(req, entry) {
+	if err != nil || !g.approvalOwned(ctx, req) || approvalRaisedFor(req, entry) {
 		return g.resumeDeferred(ctx, entry, approvalID, ev)
 	}
 	target, _ := args["tool"].(string)

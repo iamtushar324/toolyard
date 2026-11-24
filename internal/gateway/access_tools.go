@@ -1075,6 +1075,8 @@ func (g *Gateway) handleAccessWhoami() directHandler {
 			role = "blocked"
 		case scope.OwnerIsAdmin():
 			role = "admin"
+		case scope.Guest:
+			role = "guest"
 		}
 		var granted any = "all"
 		if !scope.OwnerIsAdmin() {
@@ -1106,6 +1108,11 @@ func (g *Gateway) handleAccessWhoami() directHandler {
 		if scope.Limits != nil {
 			// The agent's own allow and deny lists narrow its owner's scope.
 			out["agent_limits"] = scope.Limits.Describe()
+		}
+		if tools := scope.GuestToolList(); tools != nil {
+			// A guest invite's tool list: only these tools of the granted
+			// servers, plus the always-on groups.
+			out["guest_tools"] = tools
 		}
 		switch {
 		case agentID == "":

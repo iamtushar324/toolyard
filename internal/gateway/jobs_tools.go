@@ -724,17 +724,26 @@ func jobEnvelope(job *jobs.Job) *mcp.CallToolResult {
 
 // jobVisible reports whether the ctx caller may read or cancel j: the
 // agent that started it, or a dashboard caller who owns that agent (an
-// admin: any). A mismatch answers exactly like an unknown id.
+// admin: any), and whose CURRENT scope still reaches the job's tool. A job
+// keeps its arguments and result; a caller who lost the tool since (a
+// grant withdrawn, a member who became a guest with a narrower invite)
+// must not read them back. As in approvalVisible this holds for every
+// caller, and a caller who still has the tool sees no change. A mismatch
+// answers exactly like an unknown id.
 func (g *Gateway) jobVisible(ctx context.Context, j *jobs.Job) bool {
 	if j == nil {
 		return false
 	}
 	caller := agentIDFromContext(ctx)
+	sc := g.scopeFor(ctx, caller)
+	if !sc.AllowsTool(j.Upstream, j.Tool) {
+		return false
+	}
 	if j.AgentID == caller {
 		return true
 	}
 	if uid, ok := strings.CutPrefix(caller, "dashboard:"); ok && uid != "" {
-		return j.OwnerUserID == uid || g.scopeFor(ctx, caller).All
+		return j.OwnerUserID == uid || sc.All
 	}
 	return false
 }
@@ -1062,9 +1071,24 @@ func (g *Gateway) handleJobsWait() directHandler {
 				return jobReadFailed(err), nil
 			}
 			timedOut = to
+			// Visibility is checked again on the rows the wait returns:
+			// the caller's access may have ended while it waited, and a
+			// snapshot carries the result. A job no longer visible reads
+			// as unknown, as before the wait.
 			for i, j := range list {
-				if j != nil {
+				if j == nil {
+					continue
+				}
+				if g.jobVisible(ctx, j) {
 					got[visible[i]] = j
+					continue
+				}
+				// A cancelled caller makes the scope lookup fail closed:
+				// that is not "unknown" (which could make the caller
+				// start the work again), so answer retryable, as
+				// visibleJob does; the result stays hidden.
+				if err := ctx.Err(); err != nil {
+					return jobReadFailed(err), nil
 				}
 			}
 		}
@@ -1155,7 +1179,10 @@ func (g *Gateway) handleJobsList() directHandler {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
 		f.Status, f.Limit = strings.TrimSpace(stringArg(args, "status")), limit
-		list, err := g.jobs.List(ctx, f)
+		// Only jobs the caller may still see (jobVisible: its current
+		// scope reaches the job's tool) are listed; ListFiltered reads on
+		// past the hidden ones so the page is still full.
+		list, _, err := g.jobs.ListFiltered(ctx, f, func(j *jobs.Job) bool { return g.jobVisible(ctx, j) })
 		if err != nil {
 			return mcp.NewToolResultErrorFromErr("list jobs", err), nil
 		}

@@ -54,6 +54,13 @@ var (
 	// ErrOAuthAgent: an OAuth client's agent (it has an mcp_oauth_grants
 	// row) signs in with OAuth tokens only; it never gets a static token.
 	ErrOAuthAgent = errors.New("oauth client agent: it signs in with OAuth; manage it on the Connected apps page")
+	// ErrGuest: a guest's role is fixed. A guest becomes a member only by
+	// joining the organisation (their next sign-in then clears the flag),
+	// and never an admin or the owner.
+	ErrGuest = errors.New("a guest cannot be made an admin, a member or the owner: invite them to the organisation instead")
+	// ErrGuestAdmin: a guest invite matched an admin or the owner. An admin
+	// is never quietly turned into a guest; demote them first.
+	ErrGuestAdmin = errors.New("an admin or the owner cannot sign in as a guest")
 )
 
 // Agent kinds, mirroring the CHECK constraint on agents.kind. An identity
@@ -69,8 +76,15 @@ const (
 
 // Roles and statuses, mirroring the CHECK constraints on users.
 const (
-	RoleAdmin     = "admin"
-	RoleMember    = "member"
+	RoleAdmin  = "admin"
+	RoleMember = "member"
+	// RoleGuest is a person outside the organisation whom an admin invited
+	// by email (guest_invites). It is not stored in users.role (that column
+	// stays 'member', so an older binary sees a plain member and its
+	// hourly sync blocks them as left_org): users.is_guest marks the row,
+	// and scanUser reports it as this role. A guest reaches only the
+	// servers, and the tools, of their invite (access.loadUserScope).
+	RoleGuest     = "guest"
 	StatusActive  = "active"
 	StatusBlocked = "blocked"
 	// Auth values reported on User: how the account signs in.
@@ -95,7 +109,8 @@ type User struct {
 	DisplayName string `json:"display_name,omitempty"`
 	AvatarURL   string `json:"avatar_url,omitempty"`
 	// Role: admin sees and manages everything; member manages only their
-	// own agents and uses only the tool groups granted to them.
+	// own agents and uses only the tool groups granted to them; guest is a
+	// member from outside the organisation, limited to their invite.
 	Role string `json:"role"`
 	// Status: blocked users can't sign in, their sessions are revoked and
 	// their agents stop authenticating.
@@ -140,6 +155,13 @@ type ClerkProfile struct {
 	// person's verified primary address. The sign-in then never links to
 	// the primary account and never claims the owner role by email.
 	EmailUnverified bool
+	// Guest: the person is not in the organisation and an unexpired guest
+	// invite for their verified primary Email admitted them. The row is
+	// made (or kept) a guest: never an admin, never the owner, never
+	// linked by email (as NoBootstrap). Without it a sign-in is an
+	// organisation member's, and a row that was a guest becomes a plain
+	// member: membership wins.
+	Guest bool
 }
 
 // IsOrgAdminRole reports whether a Clerk organisation role is an admin
@@ -159,7 +181,7 @@ type UserSummary struct {
 // reads it in the same order.
 const userColumns = `u.id, u.username, COALESCE(u.email,''), COALESCE(u.display_name,''), COALESCE(u.avatar_url,''),
 	u.role, u.status, COALESCE(u.blocked_reason,''), COALESCE(u.clerk_user_id,''), u.created_at, COALESCE(u.last_seen_at,0),
-	COALESCE(u.is_owner,0)`
+	COALESCE(u.is_owner,0), COALESCE(u.is_guest,0)`
 
 type rowScanner interface {
 	Scan(dest ...any) error
@@ -168,14 +190,21 @@ type rowScanner interface {
 // scanUser reads userColumns (plus any extra trailing columns) from row.
 func scanUser(row rowScanner, extra ...any) (*User, error) {
 	var u User
-	var owner int64
+	var owner, guest int64
 	dest := []any{&u.ID, &u.Username, &u.Email, &u.DisplayName, &u.AvatarURL,
-		&u.Role, &u.Status, &u.BlockedReason, &u.ClerkUserID, &u.CreatedAt, &u.LastSeenAt, &owner}
+		&u.Role, &u.Status, &u.BlockedReason, &u.ClerkUserID, &u.CreatedAt, &u.LastSeenAt, &owner, &guest}
 	dest = append(dest, extra...)
 	if err := row.Scan(dest...); err != nil {
 		return nil, err
 	}
 	u.Owner = owner == 1
+	// A guest row stores role 'member' (RoleGuest). The owner and an admin
+	// are never guests (UpsertClerkUser, SetRole and the transfers refuse),
+	// and should a row ever hold both, the guest role wins, as in
+	// access.loadUserScope: the smaller reach.
+	if guest == 1 {
+		u.Role = RoleGuest
+	}
 	u.Auth = AuthPassword
 	if u.ClerkUserID != "" {
 		u.Auth = AuthClerk
@@ -440,6 +469,11 @@ func (s *Service) UpsertClerkUser(ctx context.Context, p ClerkProfile, ownerEmai
 	if p.ClerkUserID == "" {
 		return nil, errors.New("clerk user id is required")
 	}
+	if p.Guest {
+		// A guest sign-in never bootstraps an admin or the owner and never
+		// links to the setup account by email.
+		p.NoBootstrap = true
+	}
 	p.Email = strings.TrimSpace(p.Email)
 	p.DisplayName = strings.TrimSpace(p.DisplayName)
 	p.AvatarURL = strings.TrimSpace(p.AvatarURL)
@@ -524,10 +558,19 @@ func (s *Service) upsertClerkUserOnce(ctx context.Context, p ClerkProfile, owner
 		return nil, err
 	}
 	if id != "" {
+		if p.Guest {
+			if err := guestRowTx(ctx, tx, id, now); err != nil {
+				return nil, err
+			}
+		}
+		guest := 0
+		if p.Guest {
+			guest = 1
+		}
 		if _, err := tx.ExecContext(ctx,
-			`UPDATE users SET email = ?, display_name = ?, avatar_url = ?, last_seen_at = ?, updated_at = ?
+			`UPDATE users SET email = ?, display_name = ?, avatar_url = ?, last_seen_at = ?, updated_at = ?, is_guest = ?
              WHERE id = ?`,
-			nullStr(p.Email), nullStr(p.DisplayName), nullStr(p.AvatarURL), now, now, id); err != nil {
+			nullStr(p.Email), nullStr(p.DisplayName), nullStr(p.AvatarURL), now, now, guest, id); err != nil {
 			return nil, err
 		}
 		// The configured owner signing in again (or linking to the setup
@@ -569,14 +612,19 @@ func (s *Service) upsertClerkUserOnce(ctx context.Context, p ClerkProfile, owner
 		if !p.NoBootstrap && vacant && (isSeed || (seed == "" && role == RoleAdmin)) {
 			role, owner = RoleAdmin, 1
 		}
+		guest := 0
+		if p.Guest {
+			// NoBootstrap above kept role member and owner 0.
+			guest = 1
+		}
 		id = "u_" + uuid.NewString()
 		if _, err := tx.ExecContext(ctx,
 			`INSERT INTO users(id, username, password_hash, created_at, updated_at,
-                               email, display_name, avatar_url, role, status, clerk_user_id, last_seen_at, is_owner)
-             VALUES(?,?,'',?,?,?,?,?,?,?,?,?,?)`,
+                               email, display_name, avatar_url, role, status, clerk_user_id, last_seen_at, is_owner, is_guest)
+             VALUES(?,?,'',?,?,?,?,?,?,?,?,?,?,?)`,
 			id, username, now, now,
 			nullStr(p.Email), nullStr(p.DisplayName), nullStr(p.AvatarURL),
-			role, StatusActive, p.ClerkUserID, now, owner); err != nil {
+			role, StatusActive, p.ClerkUserID, now, owner, guest); err != nil {
 			return nil, err
 		}
 		// Every automatic promotion and claim leaves an audit row, in the
@@ -693,6 +741,11 @@ func (s *Service) SetRole(ctx context.Context, id, role string) error {
 	if err != nil {
 		return err
 	}
+	if guest, err := isGuestTx(ctx, tx, id); err != nil {
+		return err
+	} else if guest {
+		return ErrGuest
+	}
 	if owner && role != RoleAdmin {
 		return ErrOwner
 	}
@@ -703,7 +756,7 @@ func (s *Service) SetRole(ctx context.Context, id, role string) error {
 	}
 	// A demotion matches only a row that is not the owner: a transfer to
 	// this user that committed after the read above makes it ErrOwner.
-	q := `UPDATE users SET role = ?, updated_at = ? WHERE id = ?`
+	q := `UPDATE users SET role = ?, updated_at = ? WHERE id = ? AND COALESCE(is_guest,0) = 0`
 	if role != RoleAdmin {
 		q += ` AND is_owner = 0`
 	}
@@ -772,6 +825,67 @@ func (s *Service) SetStatus(ctx context.Context, id, status, reason string) erro
 		}
 	}
 	return tx.Commit()
+}
+
+// guestBlockReasons are the blocks a guest sign-in lifts: the ones the
+// Clerk sync and the invite routes set themselves (the person left the
+// organisation, or their invite was removed or ran out). An admin's own
+// block ("manual" or their reason) stays until an admin lifts it.
+var guestBlockReasons = map[string]bool{"left_org": true, "invite_removed": true, "invite_expired": true}
+
+// guestRowTx prepares an existing row for a guest sign-in, in tx: an admin
+// or the owner is refused (ErrGuestAdmin); the person's operator tokens
+// are revoked (they act on the dashboard API as the person, and a guest
+// has no business there beyond their own page); and a row blocked for one
+// of guestBlockReasons is active again, since an admin's invite is what
+// let the person back in. The caller sets is_guest. The identity key is
+// revoked by the caller (identitykeys calls the key registries, outside
+// this transaction).
+func guestRowTx(ctx context.Context, tx *sql.Tx, id string, now int64) error {
+	var role, status, reason string
+	var owner int64
+	if err := tx.QueryRowContext(ctx,
+		`SELECT role, status, COALESCE(blocked_reason,''), COALESCE(is_owner,0) FROM users WHERE id = ?`, id).
+		Scan(&role, &status, &reason, &owner); err != nil {
+		return err
+	}
+	if owner == 1 || role == RoleAdmin {
+		return ErrGuestAdmin
+	}
+	res, err := tx.ExecContext(ctx, `UPDATE operator_tokens SET revoked_at = ? WHERE user_id = ? AND revoked_at IS NULL`, now, id)
+	if err != nil {
+		return err
+	}
+	if n, err := res.RowsAffected(); err != nil {
+		return err
+	} else if n > 0 {
+		if err := auditTx(ctx, tx, "operator_token.revoke", ActorSignIn, "guest",
+			fmt.Sprintf("%s: %d operator token(s) revoked", id, n), map[string]any{"user_id": id}); err != nil {
+			return err
+		}
+	}
+	if status != StatusActive && guestBlockReasons[reason] {
+		if _, err := tx.ExecContext(ctx,
+			`UPDATE users SET status = ?, blocked_reason = NULL, updated_at = ? WHERE id = ?`,
+			StatusActive, now, id); err != nil {
+			return err
+		}
+		if err := auditTx(ctx, tx, "user.status", ActorSignIn, "guest_invite",
+			fmt.Sprintf("%s status=active", id), map[string]any{"user_id": id}); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// isGuestTx reports whether id is a guest (users.is_guest), in tx.
+func isGuestTx(ctx context.Context, tx *sql.Tx, id string) (bool, error) {
+	var guest int64
+	err := tx.QueryRowContext(ctx, `SELECT COALESCE(is_guest,0) FROM users WHERE id = ?`, id).Scan(&guest)
+	if errors.Is(err, sql.ErrNoRows) {
+		return false, ErrNoUser
+	}
+	return guest == 1, err
 }
 
 func roleStatus(ctx context.Context, tx *sql.Tx, id string) (role, status string, owner bool, err error) {
