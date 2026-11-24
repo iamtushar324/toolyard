@@ -26,9 +26,10 @@ import (
 //	200 {"token":"<agent token>","email":"…","agent_id":"ag_…","user_id":"u_…"}
 //
 // verify (RS256, exp/nbf, iss, azp in -connect-azp, a fresh session
-// token) -> org membership -> local user upsert (as the dashboard sign-in
-// does) -> identity key issued if the person never had one -> create or
-// rotate the person's one "T3 Code (bkt3)" agent.
+// token) -> org membership, or a guest invite (admitClerkSubject) -> local
+// user upsert (as the dashboard sign-in does) -> identity key issued if
+// the person never had one (never for a guest) -> create or rotate the
+// person's one "T3 Code (bkt3)" agent.
 // Errors are {"error":"<code>"}: 400 bad_request, 401 invalid_token,
 // 403 not_org_member, 403 user_disabled, 403 agent_disabled (the person
 // disabled that agent), 429 rate_limited, 503 clerk_unavailable, 404
@@ -166,19 +167,26 @@ func (s *Server) connectT3(w http.ResponseWriter, r *http.Request) {
 		s.connectRefuse(ctx, w, at, http.StatusTooManyRequests, "rate_limited", nil)
 		return
 	}
-	member, err := cfg.clerk.OrgMembership(ctx, claims.Subject)
+	// Organisation membership, or a guest invite (admitClerkSubject): a
+	// refusal answers not_org_member either way, and the audit row keeps
+	// the reason (not_invited, invite_expired, ...).
+	adm, err := s.admitClerkSubject(ctx, claims.Subject, cfg.clerk.OrgMembership)
 	if err != nil {
 		if errors.Is(err, clerk.ErrNotMember) {
-			s.connectRefuse(ctx, w, at, http.StatusForbidden, "not_org_member", nil)
+			s.connectRefuseAs(ctx, w, at, http.StatusForbidden, "not_org_member", guestDenyReason(err), nil)
 			return
 		}
 		// ErrUnavailable and anything unexpected: fail closed.
 		s.connectRefuse(ctx, w, at, http.StatusServiceUnavailable, "clerk_unavailable", err)
 		return
 	}
-	u, err := s.upsertClerkMember(ctx, claims.Subject, member)
+	u, err := s.upsertClerkAdmitted(ctx, claims.Subject, adm)
 	if errors.Is(err, clerk.ErrUnavailable) {
 		s.connectRefuse(ctx, w, at, http.StatusServiceUnavailable, "clerk_unavailable", err)
+		return
+	}
+	if errors.Is(err, clerk.ErrNotMember) {
+		s.connectRefuseAs(ctx, w, at, http.StatusForbidden, "not_org_member", guestDenyReason(err), nil)
 		return
 	}
 	if err != nil {
@@ -206,7 +214,14 @@ func (s *Server) connectT3(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer unlock()
-	at.keyState, err = s.connectIdentityKey(ctx, u.ID)
+	if u.Role == identity.RoleGuest {
+		// A guest gets no Beknown identity key: the key is the person's
+		// identity in the organisation's own registries, and a guest is
+		// not in the organisation.
+		at.keyState = "guest"
+	} else {
+		at.keyState, err = s.connectIdentityKey(ctx, u.ID)
+	}
 	if err != nil {
 		s.connectRefuse(ctx, w, at, http.StatusInternalServerError, "internal_error", err)
 		return
@@ -308,8 +323,15 @@ func (s *Server) connectAgent(ctx context.Context, userID string) (token, agentI
 // cause is logged (it says why a token failed, e.g. an azp mismatch) but
 // never sent to the caller; it never contains the token.
 func (s *Server) connectRefuse(ctx context.Context, w http.ResponseWriter, at *connectAttempt, status int, code string, cause error) {
-	s.connectAudit(ctx, at, "denied", code)
-	args := []any{"reason", code, "status", status, "client_ip", at.ip}
+	s.connectRefuseAs(ctx, w, at, status, code, code, cause)
+}
+
+// connectRefuseAs is connectRefuse with an audit reason that may say more
+// than the code the caller gets: a guest refusal answers not_org_member,
+// and only the audit row tells not_invited from invite_expired.
+func (s *Server) connectRefuseAs(ctx context.Context, w http.ResponseWriter, at *connectAttempt, status int, code, reason string, cause error) {
+	s.connectAudit(ctx, at, "denied", reason)
+	args := []any{"reason", reason, "status", status, "client_ip", at.ip}
 	if at.azp != "" {
 		args = append(args, "azp", at.azp, "clerk_user", at.sub)
 	}

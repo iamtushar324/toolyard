@@ -71,6 +71,14 @@ func (s *Server) runClerkSync(ctx context.Context) int {
 		if _, ok := members[u.ClerkUserID]; ok {
 			continue
 		}
+		// A guest is never in the organisation: their invite, not the
+		// member list, decides whether they stay.
+		if u.Role == identity.RoleGuest {
+			if s.syncGuest(ctx, lg, u.User) {
+				blocked++
+			}
+			continue
+		}
 		if s.offboardLeaver(ctx, lg, u.User) {
 			blocked++
 		}
@@ -79,6 +87,50 @@ func (s *Server) runClerkSync(ctx context.Context) int {
 		lg.Info("blocked users who left the org", "count", blocked)
 	}
 	return blocked
+}
+
+// syncGuest checks one active guest against their invite and reports
+// whether it blocked them: a removed invite blocks them (invite_removed),
+// an expired one too (invite_expired); otherwise the invite's servers are
+// mirrored into their grants again, so an edited invite shows on the Users
+// page. A failed invite read changes nothing (their scope, read from the
+// invite on every call, fails closed anyway).
+func (s *Server) syncGuest(ctx context.Context, lg *slog.Logger, u identity.User) bool {
+	if s.access == nil {
+		return false
+	}
+	inv, err := s.access.GuestInvite(ctx, u.Email)
+	if err != nil {
+		lg.Warn("read guest invite failed; guest left as is", "user", u.Username, "err", err.Error())
+		return false
+	}
+	switch {
+	case inv == nil:
+		return s.blockGuest(ctx, lg, u, "invite_removed", identity.ActorClerkSync)
+	case inv.Expired(time.Now()):
+		return s.blockGuest(ctx, lg, u, "invite_expired", identity.ActorClerkSync)
+	}
+	if err := s.mirrorGuestServers(ctx, u.ID, inv); err != nil {
+		lg.Warn("mirror guest servers failed", "user", u.Username, "err", err.Error())
+	}
+	return false
+}
+
+// blockGuest blocks a guest for reason (invite_removed, invite_expired),
+// which revokes their sessions and stops their agents at once, as
+// offboardLeaver does, and audits it as actor. A guest is never the owner
+// or an admin, so the owner and last-admin rules do not apply.
+func (s *Server) blockGuest(ctx context.Context, lg *slog.Logger, u identity.User, reason, actor string) bool {
+	if err := s.identity.SetStatus(ctx, u.ID, identity.StatusBlocked, reason); err != nil {
+		lg.Warn("block guest failed", "user", u.Username, "reason", reason, "err", err.Error())
+		return false
+	}
+	s.dropUserCaches(u.ID)
+	_ = s.audit.Write(ctx, audit.Event{
+		EventType: "user.status", AgentID: actor, Reason: reason,
+		ResultSummary: u.Username + " status=blocked",
+	})
+	return true
 }
 
 // offboardLeaver blocks one Clerk-linked user who left the organisation,

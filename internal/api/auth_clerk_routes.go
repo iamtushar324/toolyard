@@ -66,8 +66,9 @@ func (s *Server) authConfig(w http.ResponseWriter, r *http.Request) {
 //
 //	POST /v1/auth/clerk/session {"token":"<clerk session JWT>"}
 //
-// verify (RS256, exp/nbf, iss, azp) -> org membership -> local user upsert
-// -> cookie. Errors are stable codes the login page switches on:
+// verify (RS256, exp/nbf, iss, azp) -> org membership, or a guest invite
+// for the verified primary email -> local user upsert -> cookie. Errors
+// are stable codes the login page switches on:
 // 401 invalid_token, 403 not_org_member, 403 blocked, 503 clerk_unavailable,
 // 404 when Clerk sign-in is off. Same-origin fetch from the dashboard, so
 // the CSRF header and JSON content-type rules in HardenAPI apply unchanged.
@@ -107,13 +108,13 @@ func (s *Server) authClerkSession(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusUnauthorized, "invalid_token")
 		return
 	}
-	member, err := s.clerk.OrgMembership(ctx, claims.Subject)
+	// Organisation membership, or else an unexpired guest invite for the
+	// verified primary email (admitClerkSubject). A refusal looks the same
+	// to the browser either way; the audit row says why.
+	adm, err := s.admitClerkSubject(ctx, claims.Subject, s.clerk.OrgMembership)
 	if err != nil {
 		if errors.Is(err, clerk.ErrNotMember) {
-			_ = s.audit.Write(ctx, audit.Event{
-				EventType: audit.EventUserLogin, Decision: "denied", Reason: "not_org_member",
-				ResultSummary: claims.Subject,
-			})
+			s.auditClerkDenied(ctx, audit.EventUserLogin, claims.Subject, err)
 			writeError(w, http.StatusForbidden, "not_org_member")
 			return
 		}
@@ -132,14 +133,19 @@ func (s *Server) authClerkSession(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusServiceUnavailable, "owner lookup failed")
 			return
 		}
-		if !identity.EmailEqual(member.Email, allowed) {
+		if adm.guest != nil || !identity.EmailEqual(adm.member.Email, allowed) {
 			writeError(w, http.StatusForbidden, "not_org_member")
 			return
 		}
 	}
-	u, err := s.upsertClerkMember(ctx, claims.Subject, member)
+	u, err := s.upsertClerkAdmitted(ctx, claims.Subject, adm)
 	if errors.Is(err, clerk.ErrUnavailable) {
 		writeError(w, http.StatusServiceUnavailable, "clerk_unavailable")
+		return
+	}
+	if errors.Is(err, clerk.ErrNotMember) {
+		s.auditClerkDenied(ctx, audit.EventUserLogin, claims.Subject, err)
+		writeError(w, http.StatusForbidden, "not_org_member")
 		return
 	}
 	if err != nil {
@@ -170,8 +176,12 @@ func (s *Server) authClerkSession(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusInternalServerError, err.Error())
 		return
 	}
+	reason := "clerk"
+	if adm.guest != nil {
+		reason = "guest_invite"
+	}
 	_ = s.audit.Write(ctx, audit.Event{
-		EventType: audit.EventUserLogin, AgentID: "user:" + u.ID, Reason: "clerk", ResultSummary: u.Username,
+		EventType: audit.EventUserLogin, AgentID: "user:" + u.ID, Reason: reason, ResultSummary: u.Username,
 	})
 	writeJSON(w, http.StatusOK, u)
 }

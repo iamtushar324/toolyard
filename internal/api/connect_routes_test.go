@@ -435,8 +435,10 @@ func TestConnectT3Refusals(t *testing.T) {
 	e.fc.set(func(f *connectClerkServer) { f.orgs["user_ada"] = []string{"org_other"} })
 	expectConnectError(t, "not a member", e.post(t, connectBody(e.fc.token(nil))), http.StatusForbidden, "not_org_member")
 	expectConnectError(t, "unknown clerk user", e.post(t, connectBody(e.fc.token(jwt.MapClaims{"sub": "user_ghost"}))), http.StatusForbidden, "not_org_member")
-	if n := e.auditRows(t, connectT3EventType, "not_org_member"); n != 2 {
-		t.Errorf("not_org_member rows = %d, want 2", n)
+	// Both answer not_org_member; the audit rows say no guest invite
+	// admitted them (guest_signin.go).
+	if n := e.auditRows(t, connectT3EventType, "not_invited"); n != 2 {
+		t.Errorf("not_invited rows = %d, want 2", n)
 	}
 	if users, _ := e.id.ListUsers(context.Background()); len(users) != 1 {
 		t.Errorf("users after refusals = %d, want only the admin", len(users))

@@ -4,8 +4,10 @@
 //
 // Admins reach everything. Members reach only the groups an admin granted
 // them in user_server_access, plus the always-on groups (the meta-tools and
-// the inbox/session tools an agent uses to ask for access). Blocked users and
-// unknown callers reach nothing.
+// the inbox/session tools an agent uses to ask for access). Guests (people
+// outside the organisation, guests.go) reach only their invite's servers,
+// and tools when it lists them. Blocked users and unknown callers reach
+// nothing.
 package access
 
 import (
@@ -114,6 +116,14 @@ type Scope struct {
 	// Limits are the agent's own allow and deny lists (agent_scopes), on
 	// top of its owner's scope. nil: no limits.
 	Limits *Limits
+	// Guest: the owner is a guest (identity.RoleGuest). Groups then holds
+	// their invite's servers, and the groups in guestNever stay closed
+	// even though some are always on for members.
+	Guest bool
+	// GuestTools is a guest invite's tool list (full tool names): when
+	// non-nil, only these tools of the granted servers, plus every tool of
+	// the always-on groups, are reachable. nil: every tool of the servers.
+	GuestTools map[string]bool
 }
 
 // ownerAllows reports whether the scope reaches group before any agent
@@ -122,7 +132,21 @@ func (s Scope) ownerAllows(group string) bool {
 	if s.Denied {
 		return false
 	}
+	if s.Guest && guestNever[group] {
+		return false
+	}
 	return s.All || s.OwnerAll || alwaysOn[group] || s.Groups[group]
+}
+
+// ownerAllowsTool reports whether the scope reaches one tool of group
+// before any agent limits: the group, and for a guest with a tool list,
+// the tool itself (an always-on group's tools stay reachable, so a guest's
+// agent can still search and ask).
+func (s Scope) ownerAllowsTool(group, toolName string) bool {
+	if !s.ownerAllows(group) {
+		return false
+	}
+	return s.GuestTools == nil || alwaysOn[group] || s.GuestTools[toolName]
 }
 
 // Allows reports whether the scope reaches group: the owner may use it and
@@ -135,7 +159,7 @@ func (s Scope) Allows(group string) bool {
 // upstream with the given full name.
 func (s Scope) AllowsTool(upstream, toolName string) bool {
 	group := GroupOf(upstream, toolName)
-	return s.ownerAllows(group) && s.Limits.allowsTool(group, toolName)
+	return s.ownerAllowsTool(group, toolName) && s.Limits.allowsTool(group, toolName)
 }
 
 // LimitedOut reports whether the owner may use the tool but the agent's
@@ -144,7 +168,7 @@ func (s Scope) AllowsTool(upstream, toolName string) bool {
 // the tool anyway.
 func (s Scope) LimitedOut(upstream, toolName string) bool {
 	group := GroupOf(upstream, toolName)
-	return s.ownerAllows(group) && !s.Limits.allowsTool(group, toolName)
+	return s.ownerAllowsTool(group, toolName) && !s.Limits.allowsTool(group, toolName)
 }
 
 // OwnerIsAdmin reports whether the caller's owner reaches everything
@@ -283,8 +307,10 @@ func (s *Service) UserScope(ctx context.Context, userID string) Scope {
 }
 
 func (s *Service) loadUserScope(ctx context.Context, userID string) (Scope, error) {
-	var role, status string
-	err := s.db.QueryRowContext(ctx, `SELECT role, status FROM users WHERE id = ?`, userID).Scan(&role, &status)
+	var role, status, email string
+	var guest int64
+	err := s.db.QueryRowContext(ctx, `SELECT role, status, COALESCE(is_guest,0), COALESCE(email,'') FROM users WHERE id = ?`, userID).
+		Scan(&role, &status, &guest, &email)
 	if errors.Is(err, sql.ErrNoRows) {
 		return Scope{Denied: true}, nil
 	}
@@ -293,6 +319,11 @@ func (s *Service) loadUserScope(ctx context.Context, userID string) (Scope, erro
 	}
 	if status != "active" {
 		return Scope{Denied: true}, nil
+	}
+	// A guest's scope is their invite, read live (guests.go); checked
+	// before the admin role so a row can never be both.
+	if guest == 1 {
+		return s.guestScope(ctx, email)
 	}
 	if role == "admin" {
 		return Scope{All: true}, nil

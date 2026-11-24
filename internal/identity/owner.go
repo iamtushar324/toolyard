@@ -327,6 +327,12 @@ func (s *Service) TransferOwnershipWith(ctx context.Context, fromID, toID string
 	if toStatus != StatusActive {
 		return out, ErrUserBlocked
 	}
+	// The owner is an admin, and a guest never becomes one.
+	if guest, err := isGuestTx(ctx, tx, toID); err != nil {
+		return out, err
+	} else if guest {
+		return out, ErrGuest
+	}
 	now := time.Now().UnixMilli()
 	// Clear first: the unique index allows one owner at any moment.
 	res, err := tx.ExecContext(ctx, `UPDATE users SET is_owner = 0, updated_at = ? WHERE id = ? AND is_owner = 1`, now, fromID)
@@ -459,6 +465,12 @@ func (s *Service) ForceTransferOwnership(ctx context.Context, toID, actorID stri
 	}
 	if fromID == toID && toStatus == StatusActive && toRole == RoleAdmin {
 		return "", ErrAlreadyOwner
+	}
+	// Not even break-glass makes a guest the owner (and so an admin).
+	if guest, err := isGuestTx(ctx, tx, toID); err != nil {
+		return "", err
+	} else if guest {
+		return "", ErrGuest
 	}
 	now := time.Now().UnixMilli()
 	if toStatus != StatusActive {
@@ -713,7 +725,7 @@ func claimOwnerTx(ctx context.Context, tx *sql.Tx, id string, now int64, actorID
 	}
 	res, err := tx.ExecContext(ctx,
 		`UPDATE users SET is_owner = 1, role = ?, updated_at = ?
-         WHERE id = ? AND status = ? AND NOT EXISTS (SELECT 1 FROM users o WHERE o.is_owner = 1)`,
+         WHERE id = ? AND status = ? AND COALESCE(is_guest,0) = 0 AND NOT EXISTS (SELECT 1 FROM users o WHERE o.is_owner = 1)`,
 		RoleAdmin, now, id, StatusActive)
 	if err != nil {
 		return false, err

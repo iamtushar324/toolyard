@@ -978,6 +978,56 @@ members; anyone who left is blocked (`left_org`), their dashboard sessions
 are revoked and their agents stop authenticating. A Clerk outage never
 blocks anyone: on any error the sync logs and changes nothing.
 
+### Guests: people outside the organisation
+
+An admin can let in a person who is not in the Clerk organisation by
+saving their email first. Nobody gets in by email domain or by asking:
+without a saved invite, a non-member is refused exactly as before
+(`not_org_member`), and the audit row says `not_invited`.
+
+```bash
+toolyard guest add guest@example.org --servers github,linear \
+  [--tools github.get_issue,linear.list_issues] [--expires 2026-12-31] [--note "contract"]
+toolyard guest list
+toolyard guest remove guest@example.org
+```
+
+The CLI uses an operator token (see `toolyard admin guide`); changing an
+invite needs the `owner` scope. The same is `GET` / `POST /v1/guests` and
+`DELETE /v1/guests/{email}` for an admin's dashboard session.
+
+- **Sign-in.** On every Clerk route (the dashboard, `/v1/connect/t3` and
+  the T3 federation) a non-member is checked against the invites by the
+  verified primary email that Clerk holds for them; an unverified address
+  never matches. An unexpired invite makes them a **guest** (status
+  active); an expired one is refused (`invite_expired` in the audit row).
+  A member of the organisation stays a member even with an invite. In
+  personal mode (`-clerk-owner-only`) no guest signs in.
+- **What a guest reaches.** Only the invite's servers. With `--tools`, only
+  those tools of them (full names, as tools/list shows them), plus the
+  always-on meta tools (search, inbox, session, …) that an agent needs.
+  Every agent of the guest, OAuth clients included, gets the same limit,
+  in tools/list, `tools.search`, `tools.execute` and code mode alike. A
+  guest never reaches the shared data groups (memory, events, notes) or
+  the skills hub; an invite that names memory, events or notes is
+  refused. A guest gets no identity key from `/v1/connect/t3`.
+- **Never an admin.** A guest cannot be made an admin, a member or the
+  owner (409 `guest_invite_managed`); their servers change only through
+  the invite. A guest who joins the organisation becomes a member at
+  their next sign-in.
+- **Changes take effect at once.** A guest's access is read from the
+  invite (within a few seconds on every replica). Removing an invite
+  blocks the guest immediately (`invite_removed`): sessions end and
+  agents stop. An expired invite stops their agents at once; the hourly
+  sync then blocks them (`invite_expired`). The hourly sync never blocks a
+  guest as `left_org`. A new invite for a guest blocked by one of these
+  reasons lets them sign in again; a block an admin set stays.
+
+Every invite create, update and delete writes a `guest.invite` audit row.
+Rollback: an older binary ignores the `guest_invites` table and the
+`users.is_guest` column (migration 0079); it refuses a guest's next
+sign-in and its hourly sync blocks them as `left_org`.
+
 ### Personal Google account only
 
 For a personal deployment, set the Clerk secret and publishable keys (an
