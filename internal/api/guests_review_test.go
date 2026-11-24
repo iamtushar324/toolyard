@@ -109,11 +109,11 @@ func TestGuestInviteDeleteDecodesOnce(t *testing.T) {
 	// "%2541" is "%41" after one decoding: no such invite, and a@ stays.
 	expectStatus(t, "escaped escape", e.do(t, admin, http.MethodDelete, "/v1/guests/%2541@example.org", ""), http.StatusNotFound, "")
 	if inv, _ := e.access.GuestInvite(context.Background(), "a@example.org"); inv == nil {
-		t.Fatal("deleting %2541@… removed a@example.org")
+		t.Fatalf("deleting %s removed a@example.org", "%2541@…")
 	}
 	// A literal % in the address, escaped once by the client.
 	expectStatus(t, "literal percent", e.do(t, admin, http.MethodDelete, "/v1/guests/guest%25ops@example.org", ""), http.StatusOK, "")
 	if inv, _ := e.access.GuestInvite(context.Background(), "guest%ops@example.org"); inv != nil {
-		t.Error("guest%ops@example.org still invited")
+		t.Errorf("%s still invited", "guest%ops@example.org")
 	}
 }
