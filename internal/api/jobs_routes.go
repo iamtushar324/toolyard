@@ -244,7 +244,10 @@ func (s *Server) jobsItem(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	j, err := s.jobs.Get(r.Context(), id)
-	if errors.Is(err, jobs.ErrNotFound) || (err == nil && j.AgentID != ag.ID) {
+	// Another agent's job, and one whose tool the agent's owner can no
+	// longer reach (it keeps the call's arguments and result; the
+	// gateway's jobVisible says the same on MCP), read as unknown.
+	if errors.Is(err, jobs.ErrNotFound) || (err == nil && (j.AgentID != ag.ID || !s.agentMayUse(r.Context(), ag.ID, restTool{j.Upstream, j.Tool}))) {
 		writeError(w, http.StatusNotFound, "job not found")
 		return
 	}

@@ -2086,7 +2086,7 @@ func approvalRaisedFor(req *approval.Request, entry toolEntry) bool {
 // agent's, which resumeDeferred answers as unknown.
 func (g *Gateway) resumeViaExecute(ctx context.Context, entry toolEntry, args map[string]any, approvalID string, ev *metrics.Event) (*mcp.CallToolResult, error) {
 	req, err := g.approval.Get(ctx, approvalID)
-	if err != nil || !g.approvalVisible(ctx, req) || approvalRaisedFor(req, entry) {
+	if err != nil || !g.approvalOwned(ctx, req) || approvalRaisedFor(req, entry) {
 		return g.resumeDeferred(ctx, entry, approvalID, ev)
 	}
 	target, _ := args["tool"].(string)

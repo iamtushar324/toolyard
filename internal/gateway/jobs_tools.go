@@ -724,17 +724,26 @@ func jobEnvelope(job *jobs.Job) *mcp.CallToolResult {
 
 // jobVisible reports whether the ctx caller may read or cancel j: the
 // agent that started it, or a dashboard caller who owns that agent (an
-// admin: any). A mismatch answers exactly like an unknown id.
+// admin: any), and whose CURRENT scope still reaches the job's tool. A job
+// keeps its arguments and result; a caller who lost the tool since (a
+// grant withdrawn, a member who became a guest with a narrower invite)
+// must not read them back. As in approvalVisible this holds for every
+// caller, and a caller who still has the tool sees no change. A mismatch
+// answers exactly like an unknown id.
 func (g *Gateway) jobVisible(ctx context.Context, j *jobs.Job) bool {
 	if j == nil {
 		return false
 	}
 	caller := agentIDFromContext(ctx)
+	sc := g.scopeFor(ctx, caller)
+	if !sc.AllowsTool(j.Upstream, j.Tool) {
+		return false
+	}
 	if j.AgentID == caller {
 		return true
 	}
 	if uid, ok := strings.CutPrefix(caller, "dashboard:"); ok && uid != "" {
-		return j.OwnerUserID == uid || g.scopeFor(ctx, caller).All
+		return j.OwnerUserID == uid || sc.All
 	}
 	return false
 }

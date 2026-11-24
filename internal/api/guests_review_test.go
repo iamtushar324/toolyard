@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http"
 	"testing"
+	"time"
 
 	"github.com/tusharbhardwaj/toolyard/internal/access"
 	"github.com/tusharbhardwaj/toolyard/internal/identity"
@@ -115,5 +116,56 @@ func TestGuestInviteDeleteDecodesOnce(t *testing.T) {
 	expectStatus(t, "literal percent", e.do(t, admin, http.MethodDelete, "/v1/guests/guest%25ops@example.org", ""), http.StatusOK, "")
 	if inv, _ := e.access.GuestInvite(context.Background(), "guest%ops@example.org"); inv != nil {
 		t.Errorf("%s still invited", "guest%ops@example.org")
+	}
+}
+
+// TestGuestConnectionsFollowLiveInvite: My connections, a sign-in start
+// and the OAuth callback follow the guest's live invite, not the grants
+// mirrored from it: once the invite has expired the list is empty, a new
+// start is refused, and a sign-in begun before the expiry stores nothing.
+func TestGuestConnectionsFollowLiveInvite(t *testing.T) {
+	e := guestEnv(t)
+	oe := withOAuth(t, e)
+	addPerUserServer(t, e, "notion", newPatchMCPServer(t))
+	oe.client(t, "notion")
+	e.invite(t, access.GuestInvite{Email: "ext@partner.com", Servers: []string{"notion"}})
+	rec := e.clerkSignIn(t)
+	expectStatus(t, "guest sign-in", rec, http.StatusOK, "")
+	guest := sessionCookie(t, rec)
+
+	if list := decodeConnections(t, e.do(t, guest, http.MethodGet, "/v1/me/connections", "")); len(list) != 1 || list[0].Server != "notion" {
+		t.Fatalf("guest's connections = %+v", list)
+	}
+	rec = e.do(t, guest, http.MethodPost, "/v1/me/connections/notion/begin", "{}")
+	expectStatus(t, "begin", rec, http.StatusOK, "")
+	state, _ := decodeJSON(t, rec)["state"].(string)
+	if state == "" {
+		t.Fatalf("begin body = %s", rec.Body.String())
+	}
+
+	// The invite expires; the mirrored grant is still on file.
+	if _, err := e.db.Exec(`UPDATE guest_invites SET expires_at = ?`, time.Now().Add(-time.Minute).UnixMilli()); err != nil {
+		t.Fatal(err)
+	}
+	e.access.Invalidate("")
+	if g, _ := e.access.Groups(context.Background(), decodeJSON(t, e.do(t, guest, http.MethodGet, "/v1/auth/me", ""))["id"].(string)); len(g) != 1 {
+		t.Fatalf("precondition: mirrored grants = %v", g)
+	}
+
+	rec = e.callback(t, guest, state, "ext")
+	if rec.Code == http.StatusOK {
+		t.Errorf("callback after expiry: %d %s", rec.Code, rec.Body.String())
+	}
+	if rows := userTokenRows(t, e, "notion"); len(rows) != 0 {
+		t.Errorf("token stored after the invite expired: %v", rows)
+	}
+	if e.auditRows(t, "oauth.user_no_access", "") != 1 {
+		t.Error("refused callback not audited")
+	}
+	if list := decodeConnections(t, e.do(t, guest, http.MethodGet, "/v1/me/connections", "")); len(list) != 0 {
+		t.Errorf("expired guest's connections = %+v", list)
+	}
+	if rec := e.do(t, guest, http.MethodPost, "/v1/me/connections/notion/begin", "{}"); rec.Code != http.StatusNotFound {
+		t.Errorf("begin after expiry: %d %s", rec.Code, rec.Body.String())
 	}
 }

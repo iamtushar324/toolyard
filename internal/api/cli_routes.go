@@ -93,6 +93,13 @@ func (s *Server) cliApprovalsOne(w http.ResponseWriter, r *http.Request) {
 		http.NotFound(w, r)
 		return
 	}
+	// The row carries the call's arguments and result: only an agent whose
+	// owner's CURRENT scope still reaches the tool reads it (the gateway's
+	// approvalVisible says the same on MCP). A lost tool reads as unknown.
+	if !s.agentMayUse(r.Context(), ag.ID, restTool{req.UpstreamName, req.ToolName}) {
+		http.NotFound(w, r)
+		return
+	}
 	// The decision token is the human's one-tap approval credential and
 	// decide-by-token is unauthenticated: never hand it to the agent.
 	out := *req
