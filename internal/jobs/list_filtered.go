@@ -45,7 +45,12 @@ func (s *Service) ListFiltered(ctx context.Context, f Filter, keep func(*Job) bo
 	scanned := 0
 	for {
 		page := f
+		// Never read past listFilteredMaxScan: the last batch asks only
+		// for the rows still allowed (at least one, checked below).
 		page.Limit = batch
+		if left := listFilteredMaxScan - scanned; page.Limit > left {
+			page.Limit = left
+		}
 		if last != nil {
 			page.BeforeCreated, page.BeforeID = last.CreatedAt, last.ID
 		}
@@ -66,7 +71,7 @@ func (s *Service) ListFiltered(ctx context.Context, f Filter, keep func(*Job) bo
 				return out, &ListCursor{CreatedAt: end.CreatedAt, ID: end.ID}, nil
 			}
 		}
-		if len(rows) < batch {
+		if len(rows) < page.Limit {
 			return out, nil, nil
 		}
 		if scanned >= listFilteredMaxScan {

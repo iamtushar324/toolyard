@@ -64,3 +64,38 @@ func TestListFilteredFillsPagesPastHiddenRows(t *testing.T) {
 		t.Fatalf("unfiltered = %v, %v", ids(page), err)
 	}
 }
+
+// TestListFilteredStopsAtTheScanCap: with every row hidden, one call reads
+// exactly listFilteredMaxScan (2000) rows, returns an empty page and a
+// cursor at the last row read; the next call reads the rest and gives no
+// cursor.
+func TestListFilteredStopsAtTheScanCap(t *testing.T) {
+	db := storetest.Open(t)
+	svc := newService(t, db, jobs.Options{})
+	ctx := context.Background()
+	now := time.Now().UnixMilli()
+	const total = 2005
+	for i := 1; i <= total; i++ {
+		if _, err := db.ExecContext(ctx, `INSERT INTO tool_jobs(id, agent_id, owner_user_id, tool, upstream, params_hash, reason, via,
+            status, owner_instance, lease_until, created_at, started_at, finished_at, updated_at)
+            VALUES(?, 'ag_1', 'u_1', 'alpha.hide', 'alpha', 'h', 'test the filtered job listing cap', 'direct', 'succeeded', 'node', 0, ?, ?, ?, ?)`,
+			fmt.Sprintf("job_%d", i), int64(10000+i), now, now, now); err != nil {
+			t.Fatal(err)
+		}
+	}
+	read := 0
+	keep := func(*jobs.Job) bool { read++; return false }
+	page, next, err := svc.ListFiltered(ctx, jobs.Filter{AgentID: "ag_1", Limit: 100}, keep)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Newest first, the 2000th row read is job_6.
+	if len(page) != 0 || read != 2000 || next == nil || next.ID != "job_6" {
+		t.Fatalf("capped call: page %d rows, read %d, next %+v; want 0, 2000, job_6", len(page), read, next)
+	}
+	read = 0
+	page, next, err = svc.ListFiltered(ctx, jobs.Filter{AgentID: "ag_1", Limit: 100, BeforeCreated: next.CreatedAt, BeforeID: next.ID}, keep)
+	if err != nil || len(page) != 0 || read != 5 || next != nil {
+		t.Fatalf("rest: page %d rows, read %d, next %+v, %v; want 0, 5, nil", len(page), read, next, err)
+	}
+}

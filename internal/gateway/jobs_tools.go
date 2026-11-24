@@ -1076,8 +1076,19 @@ func (g *Gateway) handleJobsWait() directHandler {
 			// snapshot carries the result. A job no longer visible reads
 			// as unknown, as before the wait.
 			for i, j := range list {
-				if j != nil && g.jobVisible(ctx, j) {
+				if j == nil {
+					continue
+				}
+				if g.jobVisible(ctx, j) {
 					got[visible[i]] = j
+					continue
+				}
+				// A cancelled caller makes the scope lookup fail closed:
+				// that is not "unknown" (which could make the caller
+				// start the work again), so answer retryable, as
+				// visibleJob does; the result stays hidden.
+				if err := ctx.Err(); err != nil {
+					return jobReadFailed(err), nil
 				}
 			}
 		}
