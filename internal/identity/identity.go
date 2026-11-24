@@ -834,9 +834,13 @@ func (s *Service) SetStatus(ctx context.Context, id, status, reason string) erro
 var guestBlockReasons = map[string]bool{"left_org": true, "invite_removed": true, "invite_expired": true}
 
 // guestRowTx prepares an existing row for a guest sign-in, in tx: an admin
-// or the owner is refused (ErrGuestAdmin), and a row blocked for one of
-// guestBlockReasons is active again, since an admin's invite is what let
-// the person back in. The caller sets is_guest.
+// or the owner is refused (ErrGuestAdmin); the person's operator tokens
+// are revoked (they act on the dashboard API as the person, and a guest
+// has no business there beyond their own page); and a row blocked for one
+// of guestBlockReasons is active again, since an admin's invite is what
+// let the person back in. The caller sets is_guest. The identity key is
+// revoked by the caller (identitykeys calls the key registries, outside
+// this transaction).
 func guestRowTx(ctx context.Context, tx *sql.Tx, id string, now int64) error {
 	var role, status, reason string
 	var owner int64
@@ -847,6 +851,18 @@ func guestRowTx(ctx context.Context, tx *sql.Tx, id string, now int64) error {
 	}
 	if owner == 1 || role == RoleAdmin {
 		return ErrGuestAdmin
+	}
+	res, err := tx.ExecContext(ctx, `UPDATE operator_tokens SET revoked_at = ? WHERE user_id = ? AND revoked_at IS NULL`, now, id)
+	if err != nil {
+		return err
+	}
+	if n, err := res.RowsAffected(); err != nil {
+		return err
+	} else if n > 0 {
+		if err := auditTx(ctx, tx, "operator_token.revoke", ActorSignIn, "guest",
+			fmt.Sprintf("%s: %d operator token(s) revoked", id, n), map[string]any{"user_id": id}); err != nil {
+			return err
+		}
 	}
 	if status != StatusActive && guestBlockReasons[reason] {
 		if _, err := tx.ExecContext(ctx,

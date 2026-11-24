@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
-	"net/url"
 	"strings"
 	"time"
 
@@ -78,9 +77,12 @@ func (s *Server) guestsItem(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusMethodNotAllowed, "DELETE only")
 		return
 	}
-	raw := strings.TrimPrefix(r.URL.Path, guestsPath+"/")
-	email, err := url.PathUnescape(raw)
-	if err != nil || email == "" || strings.Contains(email, "/") {
+	// r.URL.Path is already decoded once (net/url): decoding it again
+	// would turn a literal % in an address (guest%ops@…) into an error, or
+	// let "%2541" name the invite for "A…". The client escapes the email
+	// once (url.PathEscape), and that one decoding is all.
+	email := strings.TrimPrefix(r.URL.Path, guestsPath+"/")
+	if email == "" || strings.Contains(email, "/") {
 		writeError(w, http.StatusBadRequest, "the path must be /v1/guests/{email}")
 		return
 	}
@@ -188,7 +190,7 @@ func (s *Server) guestsPut(w http.ResponseWriter, r *http.Request, caller *ident
 	// A guest who signed in before sees the new servers on the Users page
 	// now; their scope already follows the invite.
 	for _, u := range users[saved.Email] {
-		if err := s.mirrorGuestServers(ctx, u.ID, &saved); err != nil {
+		if err := s.settleGuest(ctx, u.ID, &saved); err != nil {
 			writeError(w, http.StatusInternalServerError, err.Error())
 			return
 		}

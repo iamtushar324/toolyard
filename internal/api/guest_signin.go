@@ -10,6 +10,7 @@ import (
 	"github.com/tusharbhardwaj/toolyard/internal/audit"
 	"github.com/tusharbhardwaj/toolyard/internal/clerk"
 	"github.com/tusharbhardwaj/toolyard/internal/identity"
+	"github.com/tusharbhardwaj/toolyard/internal/identitykeys"
 )
 
 // Guest sign-in (TEC-2058). A verified Clerk user who is not in the
@@ -118,16 +119,39 @@ func (s *Server) upsertClerkGuest(ctx context.Context, subject string, inv *acce
 	if err != nil {
 		return nil, err
 	}
-	if err := s.mirrorGuestServers(ctx, u.ID, inv); err != nil {
+	if err := s.settleGuest(ctx, u.ID, inv); err != nil {
 		return nil, err
 	}
 	return u, nil
 }
 
-// mirrorGuestServers replaces userID's grants with the invite's servers
-// (only when they differ) and drops the user's cached scope.
-func (s *Server) mirrorGuestServers(ctx context.Context, userID string, inv *access.GuestInvite) error {
+// settleGuest brings a guest's account in line with their invite: it
+// revokes an identity key left from before they were a guest (the key is
+// the organisation's identity in its registries, and a forwarded key would
+// work outside the invite's limits), then replaces their grants with the
+// invite's servers (only when they differ) and drops their caches. The
+// revoke runs the same code path as an admin's revoke, as the admin who
+// last saved the invite; a registry that cannot be reached now keeps the
+// removal pending for the background retry, while the key itself is gone
+// at once.
+func (s *Server) settleGuest(ctx context.Context, userID string, inv *access.GuestInvite) error {
+	if s.identityKeys != nil {
+		has, err := s.identityKeys.HasKey(ctx, userID)
+		if err != nil {
+			return err
+		}
+		if has {
+			actor := inv.UpdatedBy
+			if actor == "" {
+				actor = inv.CreatedBy
+			}
+			if _, err := s.identityKeys.Revoke(ctx, actor, userID); err != nil && !errors.Is(err, identitykeys.ErrNoKey) {
+				return err
+			}
+		}
+	}
 	if s.access == nil {
+		s.dropUserCaches(userID)
 		return nil
 	}
 	have, err := s.access.Groups(ctx, userID)
@@ -175,7 +199,7 @@ func (s *Server) syncGuestGrants(ctx context.Context, userID string) error {
 	if err != nil || inv == nil {
 		return err
 	}
-	return s.mirrorGuestServers(ctx, u.ID, inv)
+	return s.settleGuest(ctx, u.ID, inv)
 }
 
 // auditClerkDenied writes the denial row of a refused Clerk sign-in with

@@ -97,7 +97,14 @@ func (s *Server) skillContributorAdmin() skillhub.ContributorsAdmin {
 
 // isSkillContributor reports whether uid is a skill contributor; a failed
 // read counts as no.
+//
+// A guest (identity.RoleGuest) is never one, whatever a stored row says:
+// a member named a contributor who later became a guest keeps the row,
+// and every caller of this check ignores it for them.
 func (s *Server) isSkillContributor(ctx context.Context, uid string) bool {
+	if u, err := s.identity.GetUserByID(ctx, uid); err != nil || u.Role == identity.RoleGuest {
+		return false
+	}
 	ca := s.skillContributorAdmin()
 	if ca == nil {
 		return false
@@ -395,6 +402,12 @@ func (s *Server) skillContributor(w http.ResponseWriter, r *http.Request) {
 		target, err := s.identity.GetUserByID(r.Context(), uid)
 		if err != nil || target.Status != identity.StatusActive {
 			writeJSON(w, http.StatusNotFound, map[string]string{"error": "no active person with that ID", "code": "not_found"})
+			return
+		}
+		// Skill sources are what every agent of the organisation reads:
+		// someone outside it never adds them.
+		if target.Role == identity.RoleGuest {
+			writeJSON(w, http.StatusConflict, map[string]string{"error": "a guest cannot be a skill contributor", "code": "guest"})
 			return
 		}
 	case http.MethodDelete:

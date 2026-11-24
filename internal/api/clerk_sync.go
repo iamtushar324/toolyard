@@ -110,8 +110,8 @@ func (s *Server) syncGuest(ctx context.Context, lg *slog.Logger, u identity.User
 	case inv.Expired(time.Now()):
 		return s.blockGuest(ctx, lg, u, "invite_expired", identity.ActorClerkSync)
 	}
-	if err := s.mirrorGuestServers(ctx, u.ID, inv); err != nil {
-		lg.Warn("mirror guest servers failed", "user", u.Username, "err", err.Error())
+	if err := s.settleGuest(ctx, u.ID, inv); err != nil {
+		lg.Warn("settle guest (identity key, grants) failed", "user", u.Username, "err", err.Error())
 	}
 	return false
 }

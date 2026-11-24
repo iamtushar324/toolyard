@@ -285,6 +285,8 @@ func (s *Server) connectIdentityKey(ctx context.Context, userID string) (string,
 		return "present", nil
 	case errors.Is(err, identitykeys.ErrNoClerkIdentity):
 		return "skipped_no_clerk_identity", nil
+	case errors.Is(err, identitykeys.ErrGuest):
+		return "guest", nil
 	}
 	return "", err
 }

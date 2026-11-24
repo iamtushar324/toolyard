@@ -213,6 +213,12 @@ func (s *Server) operatorGuard(w http.ResponseWriter, r *http.Request) (*http.Re
 		})
 		return nil, false
 	}
+	// A guest never holds a usable operator token: the guest sign-in
+	// revokes the person's tokens, and this refuses any left behind.
+	if u.Role == identity.RoleGuest {
+		writeError(w, http.StatusForbidden, "admin_only")
+		return nil, false
+	}
 	if u.Role != identity.RoleAdmin && !memberAllowed(r.Method, r.URL.Path) {
 		writeError(w, http.StatusForbidden, "admin_only")
 		return nil, false

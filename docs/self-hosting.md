@@ -1009,8 +1009,13 @@ invite needs the `owner` scope. The same is `GET` / `POST /v1/guests` and
   Every agent of the guest, OAuth clients included, gets the same limit,
   in tools/list, `tools.search`, `tools.execute` and code mode alike. A
   guest never reaches the shared data groups (memory, events, notes) or
-  the skills hub; an invite that names memory, events or notes is
-  refused. A guest gets no identity key from `/v1/connect/t3`.
+  the skills hub, nor MemPalace; an invite that names memory, events,
+  notes or mempalace is refused.
+- **No organisation credentials.** A guest has no identity key: none is
+  issued, registered, revealed or forwarded for them, and a key left from
+  when they were a member is revoked (and removed from the key
+  registries) at their guest sign-in. Their operator tokens are revoked
+  then too, and a guest is never a skill contributor.
 - **Never an admin.** A guest cannot be made an admin, a member or the
   owner (409 `guest_invite_managed`); their servers change only through
   the invite. A guest who joins the organisation becomes a member at

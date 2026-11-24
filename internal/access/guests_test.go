@@ -47,6 +47,13 @@ func TestGuestInviteNormalize(t *testing.T) {
 		{name: "events refused", in: GuestInvite{Email: "a@b.co", Servers: []string{"events"}}, wantErr: true},
 		{name: "notes refused", in: GuestInvite{Email: "a@b.co", Servers: []string{"notes"}}, wantErr: true},
 		{name: "skills refused", in: GuestInvite{Email: "a@b.co", Servers: []string{"skills"}}, wantErr: true},
+		{name: "mempalace refused", in: GuestInvite{Email: "a@b.co", Servers: []string{"github", "mempalace"}}, wantErr: true},
+		{name: "literal percent kept", in: GuestInvite{Email: "Guest%Ops@b.co", Servers: []string{"github"}},
+			check: func(t *testing.T, out GuestInvite) {
+				if out.Email != "guest%ops@b.co" {
+					t.Errorf("email = %q", out.Email)
+				}
+			}},
 		{name: "always-on refused", in: GuestInvite{Email: "a@b.co", Servers: []string{"tools"}}, wantErr: true},
 		{name: "retired refused", in: GuestInvite{Email: "a@b.co", Servers: []string{"lake"}}, wantErr: true},
 		{name: "bad server name", in: GuestInvite{Email: "a@b.co", Servers: []string{"git hub"}}, wantErr: true},
@@ -149,12 +156,12 @@ func TestGuestScopeFollowsInvite(t *testing.T) {
 
 	// A row naming a built-in group (written around the validation) still
 	// grants nothing of it.
-	if _, err := db.Exec(`UPDATE guest_invites SET servers = '["github","memory","notes"]' WHERE email = 'ext@partner.com'`); err != nil {
+	if _, err := db.Exec(`UPDATE guest_invites SET servers = '["github","memory","notes","mempalace"]' WHERE email = 'ext@partner.com'`); err != nil {
 		t.Fatal(err)
 	}
 	svc.Invalidate("")
 	sc = svc.ScopeFor(ctx, "dashboard:u_guest")
-	if sc.Allows("memory") || sc.Allows("notes") || !sc.Allows("github") {
+	if sc.Allows("memory") || sc.Allows("notes") || sc.Allows("mempalace") || sc.AllowsTool("mempalace", "mempalace.search") || !sc.Allows("github") {
 		t.Errorf("guest with a built-in group in the row: %+v", sc)
 	}
 

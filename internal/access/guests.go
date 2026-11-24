@@ -29,10 +29,14 @@ var ErrInvalidInvite = errors.New("invalid guest invite")
 const maxInviteNote = 500
 
 // guestNever are the groups a guest never reaches, even if an invite or a
-// stored grant names them: the built-in data groups hold data shared by
-// the whole organisation, and the skills hub shows the organisation's
-// skills (it is always on for members).
-var guestNever = map[string]bool{"memory": true, "events": true, "notes": true, "skills": true}
+// stored grant names them: the built-in data groups (memory, events,
+// notes) and the toolyard-managed upstreams (mempalace, and the notes
+// filesystem server; upstreams.isReservedBuiltin) hold data shared by the
+// whole organisation, and the skills hub shows the organisation's skills
+// (it is always on for members). Those managed upstreams are stored as
+// ordinary server rows, so a check against the server list alone would
+// accept them.
+var guestNever = map[string]bool{"memory": true, "events": true, "notes": true, "mempalace": true, "skills": true}
 
 // GuestInvite is one row of guest_invites, as stored and as the REST API
 // shows it. Times are Unix milliseconds; ExpiresAt 0 is "never".
