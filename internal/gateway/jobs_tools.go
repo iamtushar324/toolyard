@@ -1071,8 +1071,12 @@ func (g *Gateway) handleJobsWait() directHandler {
 				return jobReadFailed(err), nil
 			}
 			timedOut = to
+			// Visibility is checked again on the rows the wait returns:
+			// the caller's access may have ended while it waited, and a
+			// snapshot carries the result. A job no longer visible reads
+			// as unknown, as before the wait.
 			for i, j := range list {
-				if j != nil {
+				if j != nil && g.jobVisible(ctx, j) {
 					got[visible[i]] = j
 				}
 			}
@@ -1164,7 +1168,10 @@ func (g *Gateway) handleJobsList() directHandler {
 			return mcp.NewToolResultError(err.Error()), nil
 		}
 		f.Status, f.Limit = strings.TrimSpace(stringArg(args, "status")), limit
-		list, err := g.jobs.List(ctx, f)
+		// Only jobs the caller may still see (jobVisible: its current
+		// scope reaches the job's tool) are listed; ListFiltered reads on
+		// past the hidden ones so the page is still full.
+		list, _, err := g.jobs.ListFiltered(ctx, f, func(j *jobs.Job) bool { return g.jobVisible(ctx, j) })
 		if err != nil {
 			return mcp.NewToolResultErrorFromErr("list jobs", err), nil
 		}

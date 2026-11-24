@@ -208,7 +208,13 @@ func (s *Server) jobsList(w http.ResponseWriter, r *http.Request, agentID string
 		}
 		f.BeforeCreated, f.BeforeID = n, id
 	}
-	list, err := s.jobs.List(r.Context(), f)
+	// Only jobs whose tool the agent's owner can still reach are listed
+	// (as jobsItem answers): ListFiltered reads on past the hidden ones,
+	// so a page is full when more exist, and next is set only then.
+	ctx := r.Context()
+	list, next, err := s.jobs.ListFiltered(ctx, f, func(j *jobs.Job) bool {
+		return s.agentMayUse(ctx, agentID, restTool{j.Upstream, j.Tool})
+	})
 	if err != nil {
 		writeJobError(w, err)
 		return
@@ -218,9 +224,8 @@ func (s *Server) jobsList(w http.ResponseWriter, r *http.Request, agentID string
 		views = append(views, newJobView(j))
 	}
 	out := map[string]any{"jobs": views, "next": nil}
-	if len(list) == f.Limit {
-		last := list[len(list)-1]
-		out["next"] = strconv.FormatInt(last.CreatedAt, 10) + ":" + last.ID
+	if next != nil {
+		out["next"] = strconv.FormatInt(next.CreatedAt, 10) + ":" + next.ID
 	}
 	w.Header().Set("Cache-Control", "no-store")
 	writeJSON(w, http.StatusOK, out)
@@ -269,6 +274,10 @@ func (s *Server) jobsItem(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		j = s.waitJob(r.Context(), ag.ID, j, wait)
+		if !s.jobVisibleAfterWait(r.Context(), ag.ID, j) {
+			writeError(w, http.StatusNotFound, "job not found")
+			return
+		}
 		if !j.Final() {
 			writeJobView(w, j)
 			return
@@ -324,9 +333,23 @@ func (s *Server) waitJob(ctx context.Context, caller string, j *jobs.Job, wait t
 }
 
 // answerJob waits up to wait (counted against caller), then writes the
-// job view.
+// job view, or 404 when the caller lost the job's tool during the wait
+// (jobVisibleAfterWait).
 func (s *Server) answerJob(w http.ResponseWriter, ctx context.Context, caller string, j *jobs.Job, wait time.Duration) {
-	writeJobView(w, s.waitJob(ctx, caller, j, wait))
+	j = s.waitJob(ctx, caller, j, wait)
+	if !s.jobVisibleAfterWait(ctx, caller, j) {
+		writeError(w, http.StatusNotFound, "job not found")
+		return
+	}
+	writeJobView(w, j)
+}
+
+// jobVisibleAfterWait checks the caller's current scope again after a
+// wait, before a job view or result goes out: access can end while the
+// request blocks (a grant withdrawn, a guest invite removed or expired),
+// and the scope is resolved anew here, never reused from before the wait.
+func (s *Server) jobVisibleAfterWait(ctx context.Context, caller string, j *jobs.Job) bool {
+	return s.agentMayUse(ctx, caller, restTool{j.Upstream, j.Tool})
 }
 
 // jobView is the job view every job route answers.

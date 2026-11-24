@@ -2021,6 +2021,13 @@ func (g *Gateway) resumeDeferred(ctx context.Context, entry toolEntry, approvalI
 			ev.ErrorClass = "approval"
 			return mcp.NewToolResultErrorFromErr("approval lookup", err), nil
 		}
+		// The caller's access may have ended during the wait: check the
+		// current scope again before handing back the result.
+		if !g.approvalVisible(ctx, req) {
+			ev.Outcome = metrics.OutcomeError
+			ev.ErrorClass = "approval"
+			return mcp.NewToolResultErrorf("unknown approval %q", approvalID), nil
+		}
 	}
 	ev.Fingerprint = req.Fingerprint
 	ev.ReasonText = req.Reason

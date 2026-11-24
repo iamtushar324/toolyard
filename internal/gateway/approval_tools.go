@@ -487,8 +487,14 @@ func (g *Gateway) handleWaitForApproval() directHandler {
 		done:
 		}
 	settled:
-		// Re-fetch authoritative state.
+		// Re-fetch authoritative state, and check visibility again: the
+		// caller's access may have ended while it waited (a grant
+		// withdrawn, a guest invite removed or expired), and the snapshot
+		// carries the result.
 		req, err = g.approval.Get(ctx, id)
+		if errors.Is(err, approval.ErrNotFound) || (err == nil && !g.approvalVisible(ctx, req)) {
+			return mcp.NewToolResultError("unknown approval_id"), nil
+		}
 		if err != nil {
 			return mcp.NewToolResultErrorFromErr("lookup approval", err), nil
 		}
