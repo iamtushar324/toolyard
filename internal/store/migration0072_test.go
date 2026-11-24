@@ -142,5 +142,13 @@ func TestMigration0072UsersOwnerPostgres(t *testing.T) {
 	}
 	seed0072(t, func(q string, args ...any) error { _, err := db.ExecContext(ctx, q, args...); return err })
 	apply(migration0072)
+	// check0072 runs today's identity code, which reads later columns
+	// (users.is_guest, 0079): apply the rest, as store.Open does in the
+	// SQLite test.
+	for _, name := range names {
+		if name != store.PostgresBaseline && name > migration0072 {
+			apply(name)
+		}
+	}
 	check0072(t, db)
 }
