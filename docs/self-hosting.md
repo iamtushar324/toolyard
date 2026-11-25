@@ -1042,6 +1042,49 @@ Rollback: an older binary ignores the `guest_invites` table and the
 `users.is_guest` column (migration 0079); it refuses a guest's next
 sign-in and its hourly sync blocks them as `left_org`.
 
+**Guest-safe tools on an identity-forwarding server.** A server that
+names an identity header (`identity_header`) runs every call as the
+caller's key, so a guest, who has none, is refused there. The upstream
+can open single tools to guests: a tool whose definition carries the
+guest-safe marker in its `_meta` (the key in `gateway.GuestSafeMeta`,
+value `true`) is called for a guest with **no** identity header, under the
+server's shared credentials only. A guest's call to any other tool of that server is refused ("not
+open to guests"), and a member without a key is refused as before. The
+invite's servers and tools still apply first. toolyard reads the marker
+from the server's tool list (it follows a catalog refresh).
+
+### Daily caps on tool calls
+
+An admin can cap any tool by its full name: at most **N successful calls
+per person** and/or **M successful calls in total** (everyone together)
+per UTC day. 0 or empty means no cap of that kind. Only successful calls
+count (no transport error and no `isError` result). A call over a cap is
+refused before the server is contacted, until 00:00 UTC, with a message
+that names the tool, the limit and the reset time; the refusal is an
+audit row (`call.failed`, decision `refused`, summary `cap: …`) with the
+caller, and the metric's error class is `cap`. Successful calls are the
+usual `call.dispatch` and `call.succeeded` rows.
+
+- **Per person.** Every agent of one person shares the person's cap
+  (guests included); a caller with no person behind it counts by its
+  caller id.
+- **Exact across replicas.** A call takes its slot before it runs and
+  gives it back when it fails, in one conditional database update, so a
+  cap is never exceeded, on SQLite or on Postgres with several replicas.
+  A call in flight holds its slot; a replica that stops mid-call leaves
+  that one slot used until 00:00 UTC.
+- **Where.** The dashboard's **Policies** page, card **Daily caps** (with
+  today's use and the top callers); `GET` / `POST /v1/tool-caps`
+  (`{tool, per_caller_daily, total_daily, note}`) and
+  `DELETE /v1/tool-caps/{tool}` (admin; an operator token needs the
+  `owner` scope to change one); and the agent tools `policies.list_caps`,
+  `policies.set_cap` and `policies.clear_cap` (changes: an admin's agent
+  that may manage toolyard). Every change writes a `tool_cap.change` audit
+  row. A change applies at once on the replica that made it and within 5
+  seconds on the others.
+- **Storage.** `tool_caps` and `tool_cap_usage` (migration 0080). The
+  retention compactor keeps 35 days of counters.
+
 ### Personal Google account only
 
 For a personal deployment, set the Clerk secret and publishable keys (an

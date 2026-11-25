@@ -39,6 +39,9 @@ const state = {
   marketModal: null,
   agentModal: null,        // { stage: 'name'|'done', name, agent, snippetTab }
   toolFilter: '',
+  // Policies page: daily caps on successful tool calls (TEC-2060).
+  // form is the add/edit row; values stay strings until saved.
+  toolCaps: { day: '', reset_at: '', caps: [], loaded: false, error: '', form: { tool: '', per: '', total: '', note: '' } },
   // Audit tab: client-side filters + pagination cursor state. owner,
   // decided_by, client_kind and session also go to the server
   // (AUDIT_SERVER_FILTERS); sessionDraft is the session box while typing.
@@ -5356,6 +5359,7 @@ function navigate(route) {
     loadInsights();
   }
   if (route === 'users') loadUsers(true);
+  if (route === 'policies') loadToolCaps();
   if (route === 'myservers') loadMyServers();
   if (route === 'connections') loadConnections(true);
   if (route === 'agents' || route === 'myservers') loadMyKey();
@@ -5989,8 +5993,86 @@ function withSectionTabs(body) {
       class: state.route === key ? 'active' : '', 'aria-current': state.route === key ? 'page' : 'false', on: { click: () => navigate(key) }
     }, label))) : null, body);
 }
+// loadToolCaps reads the daily caps and today's use (admin only).
+async function loadToolCaps() {
+  try {
+    const r = await api('/v1/tool-caps');
+    Object.assign(state.toolCaps, { day: r.day || '', reset_at: r.reset_at || '', caps: r.caps || [], loaded: true, error: '' });
+  } catch (e) {
+    state.toolCaps.error = e.message;
+  }
+  render();
+}
+
+async function saveToolCap() {
+  const f = state.toolCaps.form;
+  const num = v => { const n = parseInt(String(v || '').trim() || '0', 10); return Number.isFinite(n) && n > 0 ? n : 0; };
+  if (!f.tool) { toast('Choose a tool first.', 'error'); return; }
+  try {
+    await api('/v1/tool-caps', { method: 'POST', body: { tool: f.tool, per_caller_daily: num(f.per), total_daily: num(f.total), note: f.note || '' } });
+    toast('Cap saved for ' + f.tool);
+    state.toolCaps.form = { tool: '', per: '', total: '', note: '' };
+    loadToolCaps();
+  } catch (e) { toast(e.message, 'error'); }
+}
+
+async function removeToolCap(tool) {
+  if (!confirm('Remove the daily cap on ' + tool + '?')) return;
+  try {
+    await api('/v1/tool-caps/' + encodeURIComponent(tool), { method: 'DELETE' });
+    toast('Cap removed from ' + tool);
+    loadToolCaps();
+  } catch (e) { toast(e.message, 'error'); }
+}
+
+// renderToolCapsCard is the Daily caps card: every capped tool with its
+// limits and today's use, and a row to add or change a cap.
+function renderToolCapsCard() {
+  const tc = state.toolCaps;
+  const f = tc.form;
+  const limit = n => (n > 0 ? String(n) : 'no cap');
+  const callers = c => (c.used_today || []).slice(0, 3).map(u => (u.username || u.caller) + (u.guest ? ' (guest)' : '') + ': ' + u.calls).join(', ');
+  const names = (state.tools || []).map(t => t.name).sort((a, b) => a.localeCompare(b));
+  const reset = tc.reset_at ? new Date(tc.reset_at).toUTCString() : '00:00 UTC';
+  const field = (key, attrs) => el('input', Object.assign({ value: f[key] || '', on: { input: (e) => { f[key] = e.target.value; } } }, attrs));
+  return el('div', { class: 'card', id: 'tool-caps' },
+    el('h2', {}, 'Daily caps'),
+    el('p', { class: 'meta' }, 'Limit how many successful calls of a tool one person, or everyone together, may make each UTC day. ' +
+      'A call over a cap is refused before the server is contacted, until 00:00 UTC. Failed calls do not count. Refusals appear in Activity.'),
+    tc.error ? el('div', { class: 'error' }, tc.error) : null,
+    tc.day ? el('p', { class: 'meta' }, 'Today (UTC): ' + tc.day + ' · resets ' + reset) : null,
+    (tc.caps || []).length === 0
+      ? el('div', { class: 'empty' }, tc.loaded ? 'No caps. Every tool may be called without a daily limit.' : 'Loading…')
+      : el('table', {},
+          el('thead', {}, el('tr', {}, el('th', {}, 'Tool'), el('th', {}, 'Per person'), el('th', {}, 'Total'), el('th', {}, 'Used today'), el('th', {}, 'Top callers'), el('th', {}, 'Note'), el('th', {}, ''))),
+          el('tbody', {}, (tc.caps || []).map(c => el('tr', {},
+            el('td', {}, el('code', {}, c.tool)),
+            el('td', {}, limit(c.per_caller_daily)),
+            el('td', {}, limit(c.total_daily)),
+            el('td', {}, String(c.used_today_total || 0) + (c.total_daily > 0 ? ' / ' + c.total_daily : '')),
+            el('td', { class: 'meta' }, callers(c) || '—'),
+            el('td', { class: 'meta' }, c.note || ''),
+            el('td', {},
+              el('button', { on: { click: () => { tc.form = { tool: c.tool, per: c.per_caller_daily ? String(c.per_caller_daily) : '', total: c.total_daily ? String(c.total_daily) : '', note: c.note || '' }; render(); } } }, 'Edit'),
+              ' ',
+              el('button', { class: 'danger', on: { click: () => removeToolCap(c.tool) } }, 'Remove')),
+          ))),
+        ),
+    el('h3', {}, f.tool && (tc.caps || []).some(c => c.tool === f.tool) ? 'Change a cap' : 'Add a cap'),
+    el('div', { class: 'row', style: 'display: flex; flex-wrap: wrap; gap: 8px; align-items: end;' },
+      el('label', {}, 'Tool ', el('select', { 'aria-label': 'Tool', on: { change: (e) => { f.tool = e.target.value; } } },
+        el('option', { value: '' }, 'Choose a tool…'),
+        ...names.map(n => el('option', { value: n, selected: n === f.tool }, n)))),
+      el('label', {}, 'Per person / day ', field('per', { type: 'number', min: '0', placeholder: 'no cap', 'aria-label': 'Per person per day' })),
+      el('label', {}, 'Total / day ', field('total', { type: 'number', min: '0', placeholder: 'no cap', 'aria-label': 'Total per day' })),
+      el('label', {}, 'Note ', field('note', { placeholder: 'why (optional)', 'aria-label': 'Note' })),
+      el('button', { class: 'primary', on: { click: saveToolCap } }, 'Save cap'),
+    ),
+  );
+}
+
 function viewPolicies() {
-  return el('div', {}, renderPolicyRulesCard(),
+  return el('div', {}, renderPolicyRulesCard(), renderToolCapsCard(),
     el('div', { class: 'card' }, el('h3', {}, 'Tool access'), el('p', { class: 'meta' }, 'An explicit policy takes priority over automatic approval rules.'),
       el('table', {}, el('thead', {}, el('tr', {}, el('th', {}, 'Tool'), el('th', {}, 'Service'), el('th', {}, 'Policy'))),
         el('tbody', {}, ...state.tools.map(t => el('tr', {}, el('td', {}, el('code', {}, t.name)), el('td', { class: 'meta' }, t.upstream || 'Built in'), el('td', {}, renderPolicyControl({ tool_name: t.name, ...(state.insights.tools.find(row => row.tool_name === t.name) || {}) }))))))));
@@ -8204,6 +8286,7 @@ Read the full rules with inbox.guide() (in executeToolCode: toolyard.inbox_guide
   } else if (state.user) {
     await loadAll(); startStream();
     if (state.route === 'users') loadUsers(true);
+    if (state.route === 'policies') loadToolCaps();
     if (state.route === 'myservers') loadMyServers();
     if (state.route === 'connections') loadConnections(true);
     if (deepInbox) openInboxRequest(deepInbox);
