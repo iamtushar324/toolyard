@@ -14,6 +14,7 @@
 //	PATCH /v1/users/{id}          admin: role / status / servers
 //	POST /v1/users/{id}/make-owner      the owner: transfer ownership
 //	GET POST /v1/guests, DELETE /v1/guests/{email}  admin: guest invites
+//	GET POST /v1/tool-caps, DELETE /v1/tool-caps/{tool}  admin: daily caps on tool calls
 //	POST /v1/users/{id}/revoke-sessions
 //	GET  /v1/me/servers           groups the caller may use
 //	GET  /v1/me/connections       per_user servers the caller may connect, with state
@@ -420,6 +421,8 @@ func (s *Server) Routes(mux *http.ServeMux) {
 	mux.HandleFunc("/v1/users/", s.usersItem)
 	mux.HandleFunc("/v1/guests", s.guestsCollection)
 	mux.HandleFunc("/v1/guests/", s.guestsItem)
+	mux.HandleFunc("/v1/tool-caps", s.toolCapsCollection)
+	mux.HandleFunc("/v1/tool-caps/", s.toolCapsItem)
 	mux.HandleFunc("/v1/me/servers", s.meServers)
 	s.connectionRoutes(mux)
 	mux.HandleFunc("/v1/github/setup/begin", s.githubSetupBegin)

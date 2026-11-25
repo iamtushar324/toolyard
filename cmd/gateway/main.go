@@ -85,6 +85,7 @@ import (
 	"github.com/tusharbhardwaj/toolyard/internal/settings"
 	"github.com/tusharbhardwaj/toolyard/internal/skillhub"
 	"github.com/tusharbhardwaj/toolyard/internal/store"
+	"github.com/tusharbhardwaj/toolyard/internal/toolcaps"
 	"github.com/tusharbhardwaj/toolyard/internal/toolsearch"
 	"github.com/tusharbhardwaj/toolyard/internal/upstreams"
 	usagepkg "github.com/tusharbhardwaj/toolyard/internal/usage"
@@ -689,7 +690,13 @@ func runServe(argv []string) error {
 	zScore := settingsSvc.GetFloat(settings.AnomalyRateZScore, 3)
 	leaderLoop(ctx, clusterSvc, loopAnomaly, time.Hour, metrics.NewAnomalyDetector(metricsReader, zScore).RunForever)
 	leaderLoop(ctx, clusterSvc, loopReasonScorer, time.Hour, func(ctx context.Context) { runReasonScorer(ctx, metricsReader) })
-	leaderLoop(ctx, clusterSvc, loopRetention, time.Hour, func(ctx context.Context) { runRetentionCompactor(ctx, metricsReader, settingsSvc) })
+	// Daily caps on successful tool calls (TEC-2060): the gateway takes a
+	// slot per call; the counters live in the database, so a cap holds
+	// across replicas. The retention compactor deletes old days.
+	toolCapsSvc := toolcaps.New(db)
+	leaderLoop(ctx, clusterSvc, loopRetention, time.Hour, func(ctx context.Context) {
+		runRetentionCompactor(ctx, metricsReader, settingsSvc, toolCapsSvc)
+	})
 
 	// Shared policy engine: the gateway evaluates with it, the API exposes
 	// CRUD on the same instance so cache updates are seen immediately.
@@ -805,6 +812,7 @@ func runServe(argv []string) error {
 		UpstreamProtocol:    upstreamProtocol,
 		Jobs:                jobsSvc,
 		SafeToolNames:       *safeToolNames,
+		ToolCaps:            toolCapsSvc,
 	})
 	// The kernel probe for the code-mode sandbox runs now, off the
 	// request path.
@@ -2136,10 +2144,21 @@ func runReasonScorer(ctx context.Context, r *metrics.Reader) {
 // runRetentionCompactor wakes daily and removes call_events older than the
 // configured retention window. This keeps the metrics DB from growing
 // unboundedly while still leaving plenty of history for analytics.
-func runRetentionCompactor(ctx context.Context, r *metrics.Reader, set *settings.Service) {
+// toolCapUsageKeepDays is how many UTC days of tool-cap counters the
+// retention compactor keeps (today included), for the usage view.
+const toolCapUsageKeepDays = 35
+
+func runRetentionCompactor(ctx context.Context, r *metrics.Reader, set *settings.Service, caps *toolcaps.Service) {
 	t := time.NewTicker(24 * time.Hour)
 	defer t.Stop()
 	step := func() {
+		if caps != nil {
+			if n, err := caps.Prune(ctx, toolCapUsageKeepDays); err != nil {
+				log.Printf("retention compactor: tool-cap counters: %v", err)
+			} else if n > 0 {
+				log.Printf("retention compactor: deleted %d tool-cap counter rows", n)
+			}
+		}
 		days := set.GetInt(settings.MetricsRetentionDays, 90)
 		if days <= 0 {
 			return

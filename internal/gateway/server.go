@@ -170,6 +170,9 @@ type Gateway struct {
 	access              access.Resolver
 	identity            IdentityResolver
 	upstreamProtocol    string
+	// toolCaps holds the admins' daily caps on successful tool calls
+	// (tool_caps.go); nil: no caps. Guarded by mu.
+	toolCaps ToolCaps
 
 	// safeToolNames publishes OpenAI-safe tool names in tools/list and
 	// the texts a client reads (tool_names.go). catalogGen counts changes
@@ -344,6 +347,9 @@ type Options struct {
 	// it from -mcp-safe-tool-names (default on); false lists the canonical
 	// (dotted) names, as before.
 	SafeToolNames bool
+	// ToolCaps, when set, enforces the admins' daily caps on successful
+	// tool calls (tool_caps.go). nil: no caps.
+	ToolCaps ToolCaps
 }
 
 // UsageRecorder is satisfied by *internal/usage.Service. The gateway only
@@ -403,6 +409,7 @@ func New(opts Options) *Gateway {
 		upstreamCallTimeout: opts.UpstreamCallTimeout,
 		access:              opts.Access,
 		identity:            opts.Identity,
+		toolCaps:            opts.ToolCaps,
 		owners:              opts.Owners,
 		publicURL:           opts.PublicURL,
 		upstreamProtocol:    opts.UpstreamProtocol,
@@ -817,6 +824,7 @@ func (g *Gateway) RegisterBuiltins() {
 	entries = append(entries, g.approvalMetaTools()...)
 	entries = append(entries, g.codeModeTools()...)
 	entries = append(entries, g.accessTools()...)
+	entries = append(entries, g.capTools()...)
 	entries = append(entries, g.connectionsTools()...)
 	entries = append(entries, g.jobsTools()...)
 	for _, e := range entries {
@@ -2230,12 +2238,40 @@ func (g *Gateway) dispatch(ctx context.Context, entry toolEntry, args map[string
 	// the one place the rule lives. The key travels on callCtx to the
 	// transport's per-request header function; only this tools/call sees
 	// it.
+	//
+	// The one exception (TEC-2060): a guest (someone outside the
+	// organisation, who never has a key) may call a tool whose upstream
+	// definition carries _meta "beknown/guestSafe": true. That call goes
+	// out with no identity header, under the upstream's shared
+	// credentials only. A guest's call to any other tool of such an
+	// upstream is refused, and so is a member's call without a key.
 	if cfg != nil && cfg.IdentityHeader != "" {
-		key, err := g.forwardKey(ctx, agentID)
-		if err != nil {
-			return g.refuseWithoutIdentity(ctx, entry, agentID, reason, approvalID, err, ev), nil
+		if g.access != nil && g.scopeFor(ctx, agentID).Guest {
+			if !GuestSafe(entry.tool) {
+				return g.refuseGuestNotOpen(ctx, entry, agentID, reason, approvalID, ev), nil
+			}
+			callCtx = withoutForwardedKey(callCtx)
+		} else {
+			key, err := g.forwardKey(ctx, agentID)
+			if err != nil {
+				return g.refuseWithoutIdentity(ctx, entry, agentID, reason, approvalID, err, ev), nil
+			}
+			callCtx = WithForwardedKey(callCtx, key)
 		}
-		callCtx = WithForwardedKey(callCtx, key)
+	}
+	// Daily caps (tool_caps.go): a slot is taken before the tool runs and
+	// given back unless the call succeeds, so only successful calls count.
+	release, capped := g.reserveCap(ctx, entry, agentID, reason, approvalID, ev)
+	if capped != nil {
+		return capped, nil
+	}
+	succeeded := false
+	if release != nil {
+		defer func() {
+			if !succeeded {
+				release()
+			}
+		}()
 	}
 	// The validated reason rides along for handlers that make calls of
 	// their own (tools.execute, executeToolCode): extractReason stripped it
@@ -2261,6 +2297,9 @@ func (g *Gateway) dispatch(ctx context.Context, entry toolEntry, args map[string
 	if res == nil && err == nil {
 		err = errors.New("upstream returned no result")
 	}
+	// A cap counts the call once the tool itself succeeded, whatever
+	// happens to the audit row below.
+	succeeded = err == nil && !res.IsError
 	outcome := intent
 	outcome.ID = dispatchID + ".completed"
 	outcome.Arguments = nil
