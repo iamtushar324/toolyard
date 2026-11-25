@@ -992,9 +992,18 @@ toolyard guest list
 toolyard guest remove guest@example.org
 ```
 
-The CLI uses an operator token (see `toolyard admin guide`); changing an
-invite needs the `owner` scope. The same is `GET` / `POST /v1/guests` and
-`DELETE /v1/guests/{email}` for an admin's dashboard session.
+In the dashboard, an admin manages invites on the **Users** page, in the
+**Guests** card: **Invite guest** takes the email, the servers, and for
+each server every tool or only chosen tools, an optional last day and a
+note; **Edit** and **Remove** change an invite, and a guest's row in the
+People table links to it (**Edit invite**). The CLI uses an operator token
+(see `toolyard admin guide`); changing an invite needs the `owner` scope.
+Both use `GET` / `POST /v1/guests` and `DELETE /v1/guests/{email}`.
+
+An invite keeps one tools list. When one server allows every tool and
+another only some, the dashboard lists every current tool of the first
+server too, so a tool that server adds later is not included until the
+invite is saved again.
 
 - **Sign-in.** On every Clerk route (the dashboard, `/v1/connect/t3` and
   the T3 federation) a non-member is checked against the invites by the
