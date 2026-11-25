@@ -1013,3 +1013,18 @@ a.btn.primary:hover { background: var(--accent-hover); }
 .skills-secret code { word-break: break-all; }
 .skills-members { margin-top: 6px; display: flex; flex-direction: column; gap: 6px; }
 details.card > summary { cursor: pointer; }
+
+/* ---- Guests (Users page): invite modal with per-server tool choice ---- */
+.guest-modal { max-width: 640px; }
+.guest-servers { display: flex; flex-direction: column; gap: 4px; margin-top: 6px; max-height: 52vh; overflow-y: auto; }
+.guest-server { border: 1px solid transparent; border-radius: 8px; }
+.guest-server.on { border-color: var(--border); background: var(--bg-elev-2); }
+.guest-mode { display: flex; flex-wrap: wrap; gap: 16px; padding: 0 8px 8px 34px; font-size: 13px; }
+.guest-mode input[type="radio"] { width: auto; min-height: 0; margin: 0 4px 0 0; }
+.guest-tools { padding: 0 8px 8px 34px; }
+.guest-tools-bar { flex-wrap: wrap; gap: 8px; align-items: center; }
+.guest-tools-bar input[type="search"] { flex: 1; min-width: 140px; }
+.guest-tools .access-list { max-height: 28vh; }
+/* The guests table has few columns: fit the card, wrap the note. */
+.users-table.guests-table, .table-scroll .users-table.guests-table { min-width: 0; width: 100%; }
+.guests-table td:nth-child(6) { word-break: break-word; }

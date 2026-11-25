@@ -19,8 +19,9 @@ const state = {
   handoff: null,
   serverConnectionsModal: null, // { name, loading, data, error } while an admin looks at who signed in to a server
   // Users page (admin): /v1/users rows + the grantable groups.
-  users: { rows: [], groups: [], loaded: false, loading: false, error: '', keyBusy: '', keyOpen: {} },
+  users: { rows: [], groups: [], guests: [], guestsError: '', loaded: false, loading: false, error: '', keyBusy: '', keyOpen: {} },
   userAccessModal: null,   // { id, name, selected: {group: bool}, dropped: [], error, saving } while editing access
+  guestModal: null,        // { isNew, email, servers: {name: bool}, mode: {name: 'all'|'some'}, tools: {name: bool}, expires, note, error, saving } while editing a guest invite
   ownerModal: null,        // { id, name, hint, expect: [names], google, typed, error, saving } while the owner transfers ownership
   // "Your Beknown key" card: /v1/me/identity-key status, plus the raw key
   // held only in memory from a reveal until the owner dismisses it.
@@ -2228,10 +2229,17 @@ async function loadUsers(clearError) {
   state.users.loading = true;
   if (clearError) state.users.error = '';
   try {
-    const r = await api('/v1/users');
+    // Guest invites load beside the users; a failure there (an older
+    // server without /v1/guests) only blanks the Guests card.
+    const [r, g] = await Promise.all([
+      api('/v1/users'),
+      api('/v1/guests').catch((e) => ({ error: e.message })),
+    ]);
     if (seq !== usersSeq) return; // a newer load owns the page
     state.users.rows = (r && r.users) || [];
     state.users.groups = (r && r.groups) || [];
+    state.users.guests = (g && g.invites) || [];
+    state.users.guestsError = (g && g.error) || '';
   } catch (e) {
     if (seq !== usersSeq) return;
     state.users.error = e.message;
@@ -2653,6 +2661,339 @@ function renderUserAccessModal() {
   );
 }
 
+// ---- Guests (Users page) ----
+//
+// A guest is a person outside the Clerk organisation whom an admin invited
+// by email (TEC-2058). The invite names the servers the guest reaches and,
+// per server, either every tool or only chosen tools. The server keeps one
+// tools list for the whole invite: a server with no chosen tool in it is
+// "every tool" only when the list is empty, so a mixed invite (one server
+// whole, one server in part) sends every tool of the whole server too.
+//
+//   GET    /v1/guests          -> {"invites":[…]}
+//   POST   /v1/guests          {"email","servers","tools","expires_at","note"}
+//   DELETE /v1/guests/{email}
+
+// guestServerGroups: the servers an invite may name (never the built-in
+// data groups: the server refuses memory, events, notes and mempalace).
+// The same names as access.guestNever: the server refuses an invite that
+// names one, whatever kind /v1/users gives it.
+const GUEST_NEVER = new Set(['memory', 'events', 'notes', 'mempalace', 'skills']);
+
+function guestServerGroups() {
+  return (state.users.groups || []).filter((g) => g.kind !== 'builtin' && !GUEST_NEVER.has(g.name));
+}
+
+function toolsOfServer(name) {
+  return (state.tools || []).filter((t) => t.upstream === name).map((t) => t.name).sort();
+}
+
+// guestToolsOf: the server's tools in the catalog plus any tool the open
+// invite already lists for it that the catalog does not show (a server
+// that is down now). Keeping them in the list keeps them ticked, so a save
+// never drops a stored grant without the admin seeing it; the server
+// then answers "unknown tool" if it is really gone.
+function guestToolsOf(m, name) {
+  const own = toolsOfServer(name);
+  const extra = (m.stored || []).filter((t) => t.startsWith(name + '.') && !own.includes(t));
+  return own.concat(extra).sort();
+}
+
+// expiryToDate turns expires_at (the next midnight UTC after the last
+// day, as the CLI writes it) back into the last day, YYYY-MM-DD.
+function expiryToDate(ms) {
+  if (!ms) return '';
+  return new Date(ms - 1).toISOString().slice(0, 10);
+}
+
+function dateToExpiry(s) {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(s || '');
+  if (!m) return 0;
+  return Date.UTC(+m[1], +m[2] - 1, +m[3] + 1);
+}
+
+async function openGuestModal(inv) {
+  // Always fresh: another admin may have added a server or tool since
+  // this page loaded.
+  try { state.tools = (await api('/v1/tools')) || []; } catch (_) { /* keep what the page has */ }
+  // Null-prototype maps: a server or tool named "constructor" must not
+  // read as chosen.
+  const servers = Object.create(null), mode = Object.create(null), tools = Object.create(null);
+  const invTools = (inv && inv.tools) || [];
+  for (const s of ((inv && inv.servers) || [])) {
+    servers[s] = true;
+    // An invite with a tools list keeps it: every server shows "only
+    // chosen tools" with its listed tools ticked, even when that is every
+    // tool it has now. Only the admin's own switch to "every tool" widens
+    // the invite to tools a server adds later.
+    mode[s] = invTools.length ? 'some' : 'all';
+  }
+  for (const t of invTools) tools[t] = true;
+  const expiresAt = (inv && inv.expires_at) || 0;
+  state.guestModal = {
+    isNew: !inv,
+    email: (inv && inv.email) || '',
+    servers, mode, tools,
+    filter: Object.create(null),
+    stored: invTools.slice(),
+    expires: expiryToDate(expiresAt),
+    // The stored time, kept as it is until the admin changes the date (the
+    // CLI also takes an exact RFC 3339 time).
+    expiresAt,
+    expiresOrig: expiryToDate(expiresAt),
+    note: (inv && inv.note) || '',
+    error: '',
+    saving: false,
+  };
+  render();
+  const input = document.getElementById('guest-email');
+  if (input && !inv) input.focus();
+}
+
+function openGuestModalFor(email) {
+  const e = (email || '').trim().toLowerCase();
+  openGuestModal((state.users.guests || []).find((g) => g.email === e) || null);
+}
+
+function closeGuestModal() {
+  if (state.guestModal && state.guestModal.saving) return;
+  state.guestModal = null;
+  render();
+}
+
+// guestPayload builds the POST body, or returns an error sentence.
+function guestPayload(m) {
+  const email = m.email.trim();
+  if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) return { error: 'Enter the guest\'s email address.' };
+  const servers = guestServerGroups().map((g) => g.name).filter((n) => m.servers[n]);
+  if (!servers.length) return { error: 'Choose at least one server.' };
+  const some = servers.filter((s) => m.mode[s] === 'some');
+  let tools = [];
+  if (some.length) {
+    // A server limited to chosen tools may have none chosen (the API takes
+    // that): the guest then reaches none of its tools. The whole list must
+    // not end up empty, which would mean every tool of every server.
+    for (const s of servers) {
+      const own = guestToolsOf(m, s);
+      const picked = m.mode[s] === 'some' ? own.filter((t) => m.tools[t]) : own;
+      if (m.mode[s] === 'all' && !own.length) return { error: `${s} shows no tools now (is it connected?), so it cannot be mixed with a server limited to some tools.` };
+      tools = tools.concat(picked);
+    }
+    if (!tools.length) return { error: 'Choose at least one tool, or allow every tool of a server.' };
+  }
+  let expires_at = 0;
+  if (m.expires && m.expiresAt && m.expires === m.expiresOrig) {
+    expires_at = m.expiresAt;
+    if (expires_at <= Date.now()) return { error: 'This invite has expired. Choose a new last day or clear it.' };
+  } else if (m.expires) {
+    expires_at = dateToExpiry(m.expires);
+    if (!expires_at) return { error: 'The last day must be a date.' };
+    if (expires_at <= Date.now()) return { error: 'The last day is in the past.' };
+  }
+  const body = { email, servers, tools, note: m.note.trim() };
+  if (expires_at) body.expires_at = expires_at;
+  return { body };
+}
+
+async function saveGuest() {
+  const m = state.guestModal;
+  if (!m || m.saving) return;
+  const p = guestPayload(m);
+  if (p.error) { m.error = p.error; render(); return; }
+  m.saving = true; m.error = ''; render();
+  try {
+    const saved = await api('/v1/guests', { method: 'POST', body: p.body });
+    if (state.guestModal === m) state.guestModal = null;
+    toast(m.isNew ? `Invited ${(saved && saved.email) || p.body.email}. They sign in with Google using that email.` : `Invite saved for ${p.body.email}`);
+    await loadUsers(true);
+  } catch (e) {
+    m.saving = false;
+    m.error = e.message;
+    render();
+  }
+}
+
+async function removeGuest(inv) {
+  if (!confirm(`Remove the invite for ${inv.email}?\n\nIf they signed in, they are blocked at once: their sessions end and their agents stop.`)) return;
+  try {
+    await api('/v1/guests/' + encodeURIComponent(inv.email), { method: 'DELETE' });
+    toast(`Invite removed for ${inv.email}`);
+  } catch (e) { usersFail(e); }
+  await loadUsers();
+}
+
+// guestMixed: one chosen server allows every tool and another only some.
+function guestMixed(m) {
+  const on = guestServerGroups().map((g) => g.name).filter((n) => m.servers[n]);
+  return on.some((s) => m.mode[s] === 'some') && on.some((s) => m.mode[s] !== 'some');
+}
+
+function renderGuestModal() {
+  const m = state.guestModal;
+  const groups = guestServerGroups();
+  // Tool checkboxes change only state and the counter, never a full
+  // render, so the list keeps its scroll and the filter its text.
+  const counter = (s) => {
+    const own = guestToolsOf(m, s);
+    return `${own.filter((t) => m.tools[t]).length} of ${own.length} chosen`;
+  };
+  const toolPicker = (s) => {
+    const own = guestToolsOf(m, s);
+    const inCatalog = new Set(toolsOfServer(s));
+    const countId = 'guest-count-' + s;
+    const listId = 'guest-tools-' + s;
+    const sync = () => { const c = document.getElementById(countId); if (c) c.textContent = counter(s); };
+    // The filter lives in the modal state, so a live render (audit or
+    // approval events) keeps it, and its stable id keeps the focus.
+    const q = (m.filter[s] || '').trim().toLowerCase();
+    const shown = (t) => !q || t.toLowerCase().includes(q);
+    return el('div', { class: 'guest-tools' },
+      el('div', { class: 'row guest-tools-bar' },
+        el('input', {
+          id: 'guest-filter-' + s,
+          type: 'search', placeholder: 'Filter tools', 'aria-label': 'Filter tools of ' + s, value: m.filter[s] || '',
+          on: { input: (e) => {
+            m.filter[s] = e.target.value;
+            const v = e.target.value.trim().toLowerCase();
+            const list = document.getElementById(listId);
+            if (list) for (const row of list.children) row.style.display = !v || row.dataset.tool.toLowerCase().includes(v) ? '' : 'none';
+          } },
+        }),
+        el('button', { type: 'button', on: { click: () => {
+          const list = document.getElementById(listId);
+          for (const row of (list ? list.children : [])) {
+            if (row.style.display === 'none') continue;
+            m.tools[row.dataset.tool] = true;
+            const cb = row.querySelector('input'); if (cb) cb.checked = true;
+          }
+          sync();
+        } } }, 'Select shown'),
+        el('button', { type: 'button', on: { click: () => {
+          for (const t of own) m.tools[t] = false;
+          const list = document.getElementById(listId);
+          for (const cb of (list ? list.querySelectorAll('input') : [])) cb.checked = false;
+          sync();
+        } } }, 'Clear'),
+        el('span', { class: 'meta', id: countId }, counter(s)),
+      ),
+      own.length
+        ? el('div', { class: 'access-list', id: listId }, own.map((t) => el('label', { class: 'access-opt', 'data-tool': t, style: shown(t) ? '' : 'display: none;' },
+            el('input', { type: 'checkbox', checked: !!m.tools[t], on: { change: (e) => { m.tools[t] = e.target.checked; sync(); } } }),
+            el('code', {}, t.startsWith(s + '.') ? t.slice(s.length + 1) : t),
+            inCatalog.has(t) ? null : el('span', { class: 'meta', title: 'In the invite, but the server does not show this tool now' }, ' not listed now'),
+          )))
+        : el('div', { class: 'meta' }, 'This server shows no tools now. Connect it first.'),
+    );
+  };
+  const serverRow = (g) => {
+    const on = !!m.servers[g.name];
+    const mode = m.mode[g.name] || 'all';
+    return el('div', { class: 'guest-server' + (on ? ' on' : '') },
+      el('label', { class: 'access-opt' },
+        el('input', {
+          type: 'checkbox', checked: on,
+          on: { change: (e) => { m.servers[g.name] = e.target.checked; if (!m.mode[g.name]) m.mode[g.name] = 'all'; render(); } },
+        }),
+        el('code', {}, g.name),
+        el('span', { class: 'grow' }),
+        el('span', { class: 'meta' }, g.tool_count != null ? `${g.tool_count} tools` : ''),
+      ),
+      on
+        ? el('div', { class: 'guest-mode' },
+            el('label', {}, el('input', { type: 'radio', name: 'guest-mode-' + g.name, checked: mode === 'all', on: { change: () => { m.mode[g.name] = 'all'; render(); } } }), ' Every tool'),
+            el('label', {}, el('input', { type: 'radio', name: 'guest-mode-' + g.name, checked: mode === 'some', on: { change: () => { m.mode[g.name] = 'some'; render(); } } }), ' Only chosen tools'),
+          )
+        : null,
+      on && mode === 'some' ? toolPicker(g.name) : null,
+    );
+  };
+  return el('div', { class: 'modal-bg', on: { click: (e) => { if (e.target === e.currentTarget) closeGuestModal(); } } },
+    el('div', { class: 'modal guest-modal', role: 'dialog', 'aria-label': m.isNew ? 'Invite a guest' : 'Edit guest invite' },
+      el('h3', {}, m.isNew ? 'Invite a guest' : 'Edit invite · ' + m.email),
+      el('p', { class: 'meta' },
+        'A guest is a person outside the organisation. They sign in with Google using this exact, verified email, and reach only what you choose here. ' +
+        'Guests never reach memory, events, notes or skills, have no Beknown key, and can never be an admin.'),
+      el('label', {},
+        el('div', { class: 'meta' }, 'Email'),
+        el('input', {
+          id: 'guest-email', type: 'email', autocomplete: 'off', value: m.email, disabled: !m.isNew,
+          placeholder: 'name@example.com',
+          on: { input: (e) => { m.email = e.target.value; } },
+        }),
+      ),
+      el('div', { class: 'access-section' },
+        el('h4', {}, 'Servers and tools'),
+        el('div', { class: 'meta' }, 'Choose each server, then every tool of it or only some tools.'),
+        groups.length
+          ? el('div', { class: 'guest-servers' }, groups.map(serverRow))
+          : el('div', { class: 'meta' }, 'No servers available.'),
+      ),
+      el('div', { class: 'row', style: 'margin-top: 14px; gap: 12px; align-items: flex-end;' },
+        el('label', { style: 'flex: 1;' },
+          el('div', { class: 'meta' }, 'Last day (optional, UTC)'),
+          el('input', { id: 'guest-expires', type: 'date', value: m.expires, on: { input: (e) => { m.expires = e.target.value; } } }),
+        ),
+        el('label', { style: 'flex: 2;' },
+          el('div', { class: 'meta' }, 'Note for other admins (optional)'),
+          el('input', { id: 'guest-note', value: m.note, maxLength: 500, on: { input: (e) => { m.note = e.target.value; } } }),
+        ),
+      ),
+      guestMixed(m)
+        ? el('div', { class: 'meta', style: 'margin-top: 12px;' },
+            'Some servers are limited to chosen tools, so the invite lists the tools of the other servers one by one too. ' +
+            'Tools those servers add later are not included until you save the invite again.')
+        : null,
+      m.error ? el('div', { class: 'err' }, m.error) : null,
+      el('div', { class: 'row', style: 'margin-top: 16px; justify-content: flex-end;' },
+        el('button', { disabled: m.saving, on: { click: closeGuestModal } }, 'Cancel'),
+        el('button', { class: 'primary', disabled: m.saving, on: { click: saveGuest } },
+          m.saving ? 'Saving…' : m.isNew ? 'Invite' : 'Save'),
+      ),
+    ),
+  );
+}
+
+function guestStatusBadge(inv) {
+  if (inv.expired) return el('span', { class: 'badge denied' }, 'expired');
+  if (!inv.user_id) return el('span', { class: 'badge pending', title: 'Invited; has not signed in yet' }, 'invited');
+  if (inv.user_status === 'blocked') return el('span', { class: 'badge denied' }, 'blocked');
+  return el('span', { class: 'badge allowed' }, 'signed in');
+}
+
+function viewGuests() {
+  const u = state.users;
+  const list = u.guests || [];
+  const table = list.length === 0
+    ? el('div', { class: 'empty' }, u.loaded ? 'No guests invited.' : 'Loading guests…')
+    : el('table', { class: 'users-table guests-table' },
+        el('thead', {}, el('tr', {},
+          el('th', {}, 'Email'), el('th', {}, 'Status'), el('th', {}, 'Servers'), el('th', {}, 'Tools'),
+          el('th', {}, 'Last day'), el('th', {}, 'Note'), el('th', {}, ''))),
+        el('tbody', {}, list.map((inv) => el('tr', {},
+          el('td', {}, inv.email),
+          el('td', {}, guestStatusBadge(inv)),
+          el('td', {}, el('div', { class: 'chips' }, (inv.servers || []).map((s) => el('span', { class: 'chip' }, s)))),
+          el('td', { class: 'meta', title: (inv.tools || []).join('\n') },
+            (inv.tools || []).length ? `${inv.tools.length} chosen` : 'every tool'),
+          el('td', { class: 'meta' }, inv.expires_at ? expiryToDate(inv.expires_at) : 'never'),
+          el('td', { class: 'meta' }, inv.note || ''),
+          el('td', {}, el('div', { class: 'stack' },
+            el('button', { on: { click: () => openGuestModal(inv) } }, 'Edit'),
+            el('button', { class: 'danger', on: { click: () => removeGuest(inv) } }, 'Remove'),
+          )),
+        ))));
+  return el('div', { class: 'card' },
+    el('div', { class: 'agent-add-bar' },
+      el('h2', { style: 'margin: 0;' }, 'Guests'),
+      el('button', { class: 'primary', disabled: !!u.guestsError, on: { click: () => openGuestModal(null) } }, 'Invite guest'),
+    ),
+    el('p', { class: 'meta', style: 'margin: 4px 0 12px;' },
+      'People outside the organisation who may sign in. Each guest reaches only the servers and tools of their invite. ' +
+      'Removing an invite blocks the guest at once.'),
+    u.guestsError ? el('div', { class: 'err', style: 'margin: 0 0 12px;' }, 'Guests are not available: ' + u.guestsError) : table,
+  );
+}
+
 function viewUsers() {
   const u = state.users;
   const me = state.user || {};
@@ -2667,6 +3008,7 @@ function viewUsers() {
           const admin = row.role === 'admin';
           const blocked = row.status === 'blocked';
           const owner = !!row.is_owner;
+          const guest = row.role === 'guest';
           const roleLock = self ? "You can't change your own role"
             : owner ? 'The owner is always an admin. Transfer ownership first.' : '';
           return el('tr', { style: blocked ? 'opacity: 0.75;' : '' },
@@ -2681,7 +3023,7 @@ function viewUsers() {
             )),
             el('td', { class: 'meta' }, row.email || '—'),
             el('td', {}, el('div', { class: 'stack' },
-              el('select', {
+              guest ? el('span', { class: 'badge', title: 'Outside the organisation; access comes from the guest invite' }, 'guest') : el('select', {
                 disabled: !!roleLock,
                 title: roleLock,
                 'aria-label': 'Role of ' + userLabel(row),
@@ -2691,7 +3033,7 @@ function viewUsers() {
                 el('option', { value: 'member', selected: !admin }, 'member'),
               ),
               // Only the owner hands the role on, to another active person.
-              me.is_owner && !self && !blocked
+              me.is_owner && !self && !blocked && !guest
                 ? el('button', { on: { click: () => openOwnerTransfer(row) } }, 'Make owner')
                 : null,
             )),
@@ -2712,13 +3054,15 @@ function viewUsers() {
                 : (row.servers || []).length
                   ? el('div', { class: 'chips' }, row.servers.map((s) => el('span', { class: 'chip' }, s)))
                   : el('span', { class: 'meta' }, 'No servers'),
-              el('button', {
-                disabled: admin,
-                title: admin ? 'Admins can use every server' : '',
-                on: { click: () => openUserAccess(row) },
-              }, 'Edit access'),
+              guest
+                ? el('button', { on: { click: () => openGuestModalFor(row.email) } }, 'Edit invite')
+                : el('button', {
+                    disabled: admin,
+                    title: admin ? 'Admins can use every server' : '',
+                    on: { click: () => openUserAccess(row) },
+                  }, 'Edit access'),
             )),
-            el('td', {}, userKeyCell(row)),
+            el('td', {}, guest ? el('span', { class: 'meta' }, 'Not available for guests') : userKeyCell(row)),
             el('td', { class: 'meta' }, String(row.agent_count || 0)),
             el('td', { class: 'meta' }, row.last_seen_at ? relTime(toMs(row.last_seen_at)) : 'never'),
             el('td', {}, el('button', { on: { click: () => revokeUserSessions(row) } }, 'Sign out everywhere')),
@@ -2728,6 +3072,7 @@ function viewUsers() {
   return el('div', {},
     state.userAccessModal ? renderUserAccessModal() : null,
     state.ownerModal ? renderOwnerTransferModal() : null,
+    state.guestModal ? renderGuestModal() : null,
     el('div', { class: 'card' },
       el('div', { class: 'agent-add-bar' },
         el('h2', { style: 'margin: 0;' }, 'People'),
@@ -2739,6 +3084,7 @@ function viewUsers() {
       u.error ? el('div', { class: 'err', style: 'margin: 0 0 12px;' }, u.error) : null,
       table,
     ),
+    viewGuests(),
   );
 }
 
@@ -5134,6 +5480,7 @@ function closeTopmostOverlay() {
   if (state.handoff) { closeHandoff(); return true; }
   if (state.agentModal) { state.agentModal = null; render(); return true; }
   if (state.userAccessModal) { closeUserAccess(); return true; }
+  if (state.guestModal) { closeGuestModal(); return true; }
   if (state.serverConnectionsModal) { state.serverConnectionsModal = null; render(); return true; }
   if (state.serverEditModal) { closeServerEdit(); return true; }
   if (state.marketModal) { state.marketModal = null; render(); return true; }
