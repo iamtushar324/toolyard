@@ -2965,7 +2965,7 @@ function viewGuests() {
   const list = u.guests || [];
   const table = list.length === 0
     ? el('div', { class: 'empty' }, u.loaded ? 'No guests invited.' : 'Loading guests…')
-    : el('table', { class: 'users-table' },
+    : el('table', { class: 'users-table guests-table' },
         el('thead', {}, el('tr', {},
           el('th', {}, 'Email'), el('th', {}, 'Status'), el('th', {}, 'Servers'), el('th', {}, 'Tools'),
           el('th', {}, 'Last day'), el('th', {}, 'Note'), el('th', {}, ''))),

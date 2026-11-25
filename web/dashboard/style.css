@@ -1025,3 +1025,6 @@ details.card > summary { cursor: pointer; }
 .guest-tools-bar { flex-wrap: wrap; gap: 8px; align-items: center; }
 .guest-tools-bar input[type="search"] { flex: 1; min-width: 140px; }
 .guest-tools .access-list { max-height: 28vh; }
+/* The guests table has few columns: fit the card, wrap the note. */
+.users-table.guests-table, .table-scroll .users-table.guests-table { min-width: 0; width: 100%; }
+.guests-table td:nth-child(6) { word-break: break-word; }
