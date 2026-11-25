@@ -2688,6 +2688,17 @@ function toolsOfServer(name) {
   return (state.tools || []).filter((t) => t.upstream === name).map((t) => t.name).sort();
 }
 
+// guestToolsOf: the server's tools in the catalog plus any tool the open
+// invite already lists for it that the catalog does not show (a server
+// that is down now). Keeping them in the list keeps them ticked, so a save
+// never drops a stored grant without the admin seeing it; the server
+// then answers "unknown tool" if it is really gone.
+function guestToolsOf(m, name) {
+  const own = toolsOfServer(name);
+  const extra = (m.stored || []).filter((t) => t.startsWith(name + '.') && !own.includes(t));
+  return own.concat(extra).sort();
+}
+
 // expiryToDate turns expires_at (the next midnight UTC after the last
 // day, as the CLI writes it) back into the last day, YYYY-MM-DD.
 function expiryToDate(ms) {
@@ -2702,9 +2713,9 @@ function dateToExpiry(s) {
 }
 
 async function openGuestModal(inv) {
-  if (!state.tools || !state.tools.length) {
-    try { state.tools = (await api('/v1/tools')) || []; } catch (_) { /* the tool lists stay empty */ }
-  }
+  // Always fresh: another admin may have added a server or tool since
+  // this page loaded.
+  try { state.tools = (await api('/v1/tools')) || []; } catch (_) { /* keep what the page has */ }
   // Null-prototype maps: a server or tool named "constructor" must not
   // read as chosen.
   const servers = Object.create(null), mode = Object.create(null), tools = Object.create(null);
@@ -2724,6 +2735,7 @@ async function openGuestModal(inv) {
     email: (inv && inv.email) || '',
     servers, mode, tools,
     filter: Object.create(null),
+    stored: invTools.slice(),
     expires: expiryToDate(expiresAt),
     // The stored time, kept as it is until the admin changes the date (the
     // CLI also takes an exact RFC 3339 time).
@@ -2758,13 +2770,16 @@ function guestPayload(m) {
   const some = servers.filter((s) => m.mode[s] === 'some');
   let tools = [];
   if (some.length) {
+    // A server limited to chosen tools may have none chosen (the API takes
+    // that): the guest then reaches none of its tools. The whole list must
+    // not end up empty, which would mean every tool of every server.
     for (const s of servers) {
-      const own = toolsOfServer(s);
+      const own = guestToolsOf(m, s);
       const picked = m.mode[s] === 'some' ? own.filter((t) => m.tools[t]) : own;
-      if (m.mode[s] === 'some' && !picked.length) return { error: `Choose at least one tool of ${s}, or allow every tool.` };
       if (m.mode[s] === 'all' && !own.length) return { error: `${s} shows no tools now (is it connected?), so it cannot be mixed with a server limited to some tools.` };
       tools = tools.concat(picked);
     }
+    if (!tools.length) return { error: 'Choose at least one tool, or allow every tool of a server.' };
   }
   let expires_at = 0;
   if (m.expires && m.expiresAt && m.expires === m.expiresOrig) {
@@ -2819,11 +2834,12 @@ function renderGuestModal() {
   // Tool checkboxes change only state and the counter, never a full
   // render, so the list keeps its scroll and the filter its text.
   const counter = (s) => {
-    const own = toolsOfServer(s);
+    const own = guestToolsOf(m, s);
     return `${own.filter((t) => m.tools[t]).length} of ${own.length} chosen`;
   };
   const toolPicker = (s) => {
-    const own = toolsOfServer(s);
+    const own = guestToolsOf(m, s);
+    const inCatalog = new Set(toolsOfServer(s));
     const countId = 'guest-count-' + s;
     const listId = 'guest-tools-' + s;
     const sync = () => { const c = document.getElementById(countId); if (c) c.textContent = counter(s); };
@@ -2864,6 +2880,7 @@ function renderGuestModal() {
         ? el('div', { class: 'access-list', id: listId }, own.map((t) => el('label', { class: 'access-opt', 'data-tool': t, style: shown(t) ? '' : 'display: none;' },
             el('input', { type: 'checkbox', checked: !!m.tools[t], on: { change: (e) => { m.tools[t] = e.target.checked; sync(); } } }),
             el('code', {}, t.startsWith(s + '.') ? t.slice(s.length + 1) : t),
+            inCatalog.has(t) ? null : el('span', { class: 'meta', title: 'In the invite, but the server does not show this tool now' }, ' not listed now'),
           )))
         : el('div', { class: 'meta' }, 'This server shows no tools now. Connect it first.'),
     );
