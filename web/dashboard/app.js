@@ -2676,8 +2676,12 @@ function renderUserAccessModal() {
 
 // guestServerGroups: the servers an invite may name (never the built-in
 // data groups: the server refuses memory, events, notes and mempalace).
+// The same names as access.guestNever: the server refuses an invite that
+// names one, whatever kind /v1/users gives it.
+const GUEST_NEVER = new Set(['memory', 'events', 'notes', 'mempalace', 'skills']);
+
 function guestServerGroups() {
-  return (state.users.groups || []).filter((g) => g.kind !== 'builtin');
+  return (state.users.groups || []).filter((g) => g.kind !== 'builtin' && !GUEST_NEVER.has(g.name));
 }
 
 function toolsOfServer(name) {
@@ -2701,22 +2705,30 @@ async function openGuestModal(inv) {
   if (!state.tools || !state.tools.length) {
     try { state.tools = (await api('/v1/tools')) || []; } catch (_) { /* the tool lists stay empty */ }
   }
-  const servers = {}, mode = {}, tools = {};
+  // Null-prototype maps: a server or tool named "constructor" must not
+  // read as chosen.
+  const servers = Object.create(null), mode = Object.create(null), tools = Object.create(null);
   const invTools = (inv && inv.tools) || [];
   for (const s of ((inv && inv.servers) || [])) {
     servers[s] = true;
-    const own = toolsOfServer(s);
-    const picked = invTools.filter((t) => own.includes(t));
-    // A server is "some" when the invite has a tools list and it does not
-    // hold every tool of that server.
-    mode[s] = invTools.length && picked.length < own.length ? 'some' : 'all';
-    if (mode[s] === 'some') for (const t of picked) tools[t] = true;
+    // An invite with a tools list keeps it: every server shows "only
+    // chosen tools" with its listed tools ticked, even when that is every
+    // tool it has now. Only the admin's own switch to "every tool" widens
+    // the invite to tools a server adds later.
+    mode[s] = invTools.length ? 'some' : 'all';
   }
+  for (const t of invTools) tools[t] = true;
+  const expiresAt = (inv && inv.expires_at) || 0;
   state.guestModal = {
     isNew: !inv,
     email: (inv && inv.email) || '',
     servers, mode, tools,
-    expires: expiryToDate(inv && inv.expires_at),
+    filter: Object.create(null),
+    expires: expiryToDate(expiresAt),
+    // The stored time, kept as it is until the admin changes the date (the
+    // CLI also takes an exact RFC 3339 time).
+    expiresAt,
+    expiresOrig: expiryToDate(expiresAt),
     note: (inv && inv.note) || '',
     error: '',
     saving: false,
@@ -2755,7 +2767,10 @@ function guestPayload(m) {
     }
   }
   let expires_at = 0;
-  if (m.expires) {
+  if (m.expires && m.expiresAt && m.expires === m.expiresOrig) {
+    expires_at = m.expiresAt;
+    if (expires_at <= Date.now()) return { error: 'This invite has expired. Choose a new last day or clear it.' };
+  } else if (m.expires) {
     expires_at = dateToExpiry(m.expires);
     if (!expires_at) return { error: 'The last day must be a date.' };
     if (expires_at <= Date.now()) return { error: 'The last day is in the past.' };
@@ -2812,14 +2827,20 @@ function renderGuestModal() {
     const countId = 'guest-count-' + s;
     const listId = 'guest-tools-' + s;
     const sync = () => { const c = document.getElementById(countId); if (c) c.textContent = counter(s); };
+    // The filter lives in the modal state, so a live render (audit or
+    // approval events) keeps it, and its stable id keeps the focus.
+    const q = (m.filter[s] || '').trim().toLowerCase();
+    const shown = (t) => !q || t.toLowerCase().includes(q);
     return el('div', { class: 'guest-tools' },
       el('div', { class: 'row guest-tools-bar' },
         el('input', {
-          type: 'search', placeholder: 'Filter tools', 'aria-label': 'Filter tools of ' + s,
+          id: 'guest-filter-' + s,
+          type: 'search', placeholder: 'Filter tools', 'aria-label': 'Filter tools of ' + s, value: m.filter[s] || '',
           on: { input: (e) => {
-            const q = e.target.value.trim().toLowerCase();
+            m.filter[s] = e.target.value;
+            const v = e.target.value.trim().toLowerCase();
             const list = document.getElementById(listId);
-            if (list) for (const row of list.children) row.style.display = !q || row.dataset.tool.toLowerCase().includes(q) ? '' : 'none';
+            if (list) for (const row of list.children) row.style.display = !v || row.dataset.tool.toLowerCase().includes(v) ? '' : 'none';
           } },
         }),
         el('button', { type: 'button', on: { click: () => {
@@ -2840,7 +2861,7 @@ function renderGuestModal() {
         el('span', { class: 'meta', id: countId }, counter(s)),
       ),
       own.length
-        ? el('div', { class: 'access-list', id: listId }, own.map((t) => el('label', { class: 'access-opt', 'data-tool': t },
+        ? el('div', { class: 'access-list', id: listId }, own.map((t) => el('label', { class: 'access-opt', 'data-tool': t, style: shown(t) ? '' : 'display: none;' },
             el('input', { type: 'checkbox', checked: !!m.tools[t], on: { change: (e) => { m.tools[t] = e.target.checked; sync(); } } }),
             el('code', {}, t.startsWith(s + '.') ? t.slice(s.length + 1) : t),
           )))
@@ -2893,11 +2914,11 @@ function renderGuestModal() {
       el('div', { class: 'row', style: 'margin-top: 14px; gap: 12px; align-items: flex-end;' },
         el('label', { style: 'flex: 1;' },
           el('div', { class: 'meta' }, 'Last day (optional, UTC)'),
-          el('input', { type: 'date', value: m.expires, on: { input: (e) => { m.expires = e.target.value; } } }),
+          el('input', { id: 'guest-expires', type: 'date', value: m.expires, on: { input: (e) => { m.expires = e.target.value; } } }),
         ),
         el('label', { style: 'flex: 2;' },
           el('div', { class: 'meta' }, 'Note for other admins (optional)'),
-          el('input', { value: m.note, maxLength: 500, on: { input: (e) => { m.note = e.target.value; } } }),
+          el('input', { id: 'guest-note', value: m.note, maxLength: 500, on: { input: (e) => { m.note = e.target.value; } } }),
         ),
       ),
       guestMixed(m)
@@ -3024,7 +3045,7 @@ function viewUsers() {
                     on: { click: () => openUserAccess(row) },
                   }, 'Edit access'),
             )),
-            el('td', {}, userKeyCell(row)),
+            el('td', {}, guest ? el('span', { class: 'meta' }, 'Not available for guests') : userKeyCell(row)),
             el('td', { class: 'meta' }, String(row.agent_count || 0)),
             el('td', { class: 'meta' }, row.last_seen_at ? relTime(toMs(row.last_seen_at)) : 'never'),
             el('td', {}, el('button', { on: { click: () => revokeUserSessions(row) } }, 'Sign out everywhere')),
