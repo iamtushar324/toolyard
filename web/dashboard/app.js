@@ -2960,7 +2960,7 @@ function viewGuests() {
             (inv.tools || []).length ? `${inv.tools.length} chosen` : 'every tool'),
           el('td', { class: 'meta' }, inv.expires_at ? expiryToDate(inv.expires_at) : 'never'),
           el('td', { class: 'meta' }, inv.note || ''),
-          el('td', {}, el('div', { class: 'row' },
+          el('td', {}, el('div', { class: 'stack' },
             el('button', { on: { click: () => openGuestModal(inv) } }, 'Edit'),
             el('button', { class: 'danger', on: { click: () => removeGuest(inv) } }, 'Remove'),
           )),
