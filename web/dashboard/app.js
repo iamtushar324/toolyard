@@ -5739,7 +5739,11 @@ function radio(label, value, current, onChange) {
 }
 
 function renderManualClient() {
+  const d = (state.oauthFlow || {}).discovered;
   return el('div', { style: 'margin-top: 8px;' },
+    d ? el('div', { class: 'meta' },
+      'This provider has no automatic client registration. Create an OAuth client in its console with this redirect URI, then paste its client_id and secret: ',
+      el('code', {}, d.redirect_uri || '')) : null,
     el('label', {},
       el('div', { class: 'meta' }, 'client_id'),
       el('input', { id: 'oa-cid' }),
@@ -5788,12 +5792,33 @@ async function oauthDiscoverClick() {
   const f = state.oauthFlow;
   f.busy = true; f.error = ''; render();
   try {
-    await api('/v1/servers/' + encodeURIComponent(f.name) + '/oauth/discover', {
+    const res = await api('/v1/servers/' + encodeURIComponent(f.name) + '/oauth/discover', {
       method: 'POST', body: {}
     });
+    if (res && !res.client_registered) {
+      // No dynamic registration (Google, for one): the server saved nothing,
+      // so keep the discovered endpoints and scopes for the manual client.
+      f.discovered = res;
+      f.showManual = true;
+    }
     await loadOAuthStatus(f.name);
   } catch (e) { f.error = e.message; }
   f.busy = false; render();
+}
+
+// manualClientBody: the pasted client plus what discovery found, because the
+// server needs the endpoints and has no stored client to take them from.
+function manualClientBody(f, cid, csec) {
+  const body = { client_id: cid.trim(), client_secret: csec };
+  const d = f.discovered;
+  if (d) {
+    for (const k of ['issuer', 'authorization_endpoint', 'token_endpoint',
+      'revocation_endpoint', 'device_authorization_endpoint', 'redirect_uri']) {
+      if (d[k]) body[k] = d[k];
+    }
+    if (Array.isArray(d.scopes) && d.scopes.length) body.scopes = d.scopes;
+  }
+  return body;
 }
 
 // oauthBeginClick: a browser sign-in (callback mode) stops first to ask
@@ -5873,10 +5898,11 @@ async function oauthSubmitManual() {
   f.busy = true; f.error = ''; render();
   try {
     await api('/v1/servers/' + encodeURIComponent(f.name) + '/oauth/manual-client', {
-      method: 'POST', body: { client_id: cid.trim(), client_secret: csec }
+      method: 'POST', body: manualClientBody(f, cid, csec)
     });
     await loadOAuthStatus(f.name);
     f.showManual = false;
+    f.discovered = null;
   } catch (e) { f.error = e.message; }
   f.busy = false; render();
 }

@@ -431,6 +431,13 @@ func (s *Service) Discover(ctx context.Context, mcpURL string) (*ASMetadata, err
 	if pr, err := s.fetchPR(ctx, u); err == nil && pr != nil && len(pr.AuthorizationServers) > 0 {
 		for _, asURL := range pr.AuthorizationServers {
 			if md, err := s.fetchAS(ctx, asURL); err == nil && md != nil && md.AuthorizationEndpoint != "" {
+				// A general-purpose AS (Google's accounts.google.com) does not
+				// list the resource's scopes; the protected-resource metadata
+				// does (drivemcp.googleapis.com lists the Drive scopes). Without
+				// them the authorize request carries no resource scope.
+				if len(md.ScopesSupported) == 0 && len(pr.ScopesSupported) > 0 {
+					md.ScopesSupported = append([]string{}, pr.ScopesSupported...)
+				}
 				return md, nil
 			}
 		}
@@ -443,11 +450,50 @@ func (s *Service) Discover(ctx context.Context, mcpURL string) (*ASMetadata, err
 	return nil, fmt.Errorf("oauth: could not discover AS metadata for %s", mcpURL)
 }
 
-func (s *Service) fetchPR(ctx context.Context, u *url.URL) (*PRMetadata, error) {
-	candidates := []string{
-		u.Scheme + "://" + u.Host + "/.well-known/oauth-protected-resource",
-		u.Scheme + "://" + u.Host + strings.TrimRight(u.Path, "/") + "/.well-known/oauth-protected-resource",
+// prCandidates lists where the protected-resource metadata of u can live.
+// RFC 9728 §3.1 inserts the well-known segment between the host and the
+// resource path, so https://drivemcp.googleapis.com/mcp/v1 publishes it at
+// /.well-known/oauth-protected-resource/mcp/v1 (and only there). The root
+// form and the older path-suffix form follow for servers that use them.
+func prCandidates(u *url.URL) []string {
+	origin := u.Scheme + "://" + u.Host
+	path := strings.TrimRight(u.Path, "/")
+	out := []string{}
+	if path != "" {
+		out = append(out, origin+"/.well-known/oauth-protected-resource"+path)
 	}
+	out = append(out, origin+"/.well-known/oauth-protected-resource")
+	if path != "" {
+		out = append(out, origin+path+"/.well-known/oauth-protected-resource")
+	}
+	return out
+}
+
+// asCandidates lists where the metadata of the authorization server asURL
+// can live: RFC 8414 §3.1 path insertion for an issuer with a path, then
+// the suffix forms (OIDC appends to the full issuer). A root issuer with
+// or without its trailing slash ("https://accounts.google.com/") gives the
+// plain origin forms.
+func asCandidates(asURL string) []string {
+	base := strings.TrimRight(asURL, "/")
+	out := []string{}
+	if u, err := url.Parse(base); err == nil && u.Host != "" {
+		if path := strings.TrimRight(u.Path, "/"); path != "" {
+			origin := u.Scheme + "://" + u.Host
+			out = append(out,
+				origin+"/.well-known/oauth-authorization-server"+path,
+				origin+"/.well-known/openid-configuration"+path,
+			)
+		}
+	}
+	return append(out,
+		base+"/.well-known/oauth-authorization-server",
+		base+"/.well-known/openid-configuration",
+	)
+}
+
+func (s *Service) fetchPR(ctx context.Context, u *url.URL) (*PRMetadata, error) {
+	candidates := prCandidates(u)
 	for _, c := range candidates {
 		if md, err := s.getJSON(ctx, c); err == nil {
 			out := &PRMetadata{}
@@ -460,10 +506,7 @@ func (s *Service) fetchPR(ctx context.Context, u *url.URL) (*PRMetadata, error) 
 }
 
 func (s *Service) fetchAS(ctx context.Context, asURL string) (*ASMetadata, error) {
-	candidates := []string{
-		strings.TrimRight(asURL, "/") + "/.well-known/oauth-authorization-server",
-		strings.TrimRight(asURL, "/") + "/.well-known/openid-configuration",
-	}
+	candidates := asCandidates(asURL)
 	for _, c := range candidates {
 		body, err := s.getJSON(ctx, c)
 		if err != nil {
