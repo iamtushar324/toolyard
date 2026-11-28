@@ -1021,10 +1021,19 @@ func pickScopes(md *oauth.ASMetadata, requested []string) []string {
 			hasOffline = true
 		}
 	}
-	if !hasOffline {
+	// Google is the exception: it rejects "offline_access" as an invalid
+	// scope and issues refresh tokens through access_type=offline, which
+	// beginFlow sends.
+	if !hasOffline && !isGoogleIssuer(md.Issuer) {
 		out = append(out, "offline_access")
 	}
 	return out
+}
+
+// isGoogleIssuer reports whether issuer is Google's authorization server.
+func isGoogleIssuer(issuer string) bool {
+	u, err := url.Parse(strings.TrimSpace(issuer))
+	return err == nil && strings.EqualFold(u.Host, "accounts.google.com")
 }
 
 func nullableMS(t time.Time) any {
